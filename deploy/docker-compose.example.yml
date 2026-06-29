@@ -1,0 +1,67 @@
+# ============================================================
+# QuantVista 容器编排示例（宝塔 / Docker Compose）
+# 用法：复制为 deploy/docker-compose.yml（已 gitignore），按需调整
+# 与 new-api 一致：宿主机 MySQL 通过 host.docker.internal / 172.18.0.1 访问，
+# Redis 由本编排内置，应用启动时自动建表与迁移（AutoMigrate）。
+# ============================================================
+services:
+  quantvista:
+    image: ${IMAGE:-raoczh/quantvista:custom-YYYYMMDD-01}
+    container_name: ${CONTAINER_NAME:-quantvista}
+    restart: always
+    command: --log-dir /app/logs
+    ports:
+      - "${WEB_HTTP_PORT:-3002}:${PORT:-3000}"
+    volumes:
+      - ${APP_PATH:-/www/wwwroot/quantvista}/data:/data
+      - ${APP_PATH:-/www/wwwroot/quantvista}/logs:/app/logs
+    environment:
+      PORT: ${PORT:-3000}
+      SQL_DSN: ${SQL_DSN}
+      REDIS_CONN_STRING: ${REDIS_CONN_STRING:-redis://quantvista-redis:6379/0}
+      SESSION_SECRET: ${SESSION_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET}
+      TUSHARE_TOKEN: ${TUSHARE_TOKEN}
+      DEFAULT_MARKET: ${DEFAULT_MARKET:-cn}
+      TZ: ${TZ:-Asia/Shanghai}
+      ERROR_LOG_ENABLED: ${ERROR_LOG_ENABLED:-true}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - quantvista-redis
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q -O - http://localhost:${PORT:-3000}/api/status | grep -o '\"success\":\\s*true' || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    labels:
+      createdBy: "bt_apps"
+    networks:
+      - baota_net
+
+  quantvista-redis:
+    image: redis:7-alpine
+    container_name: quantvista-redis
+    restart: always
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ${APP_PATH:-/www/wwwroot/quantvista}/redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    labels:
+      createdBy: "bt_apps"
+    networks:
+      - baota_net
+
+networks:
+  baota_net:
+    external: true
