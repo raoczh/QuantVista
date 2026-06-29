@@ -7,8 +7,11 @@
 - AI 分析报告和推荐记录必须持久化。
 - 短线推荐必须保存止盈、止损、有效期和状态。
 - 长线推荐必须保存复盘周期和关键跟踪指标。
-- LLM API Key 加密保存，不明文返回前端。
-- 金额、价格、收益率建议使用 decimal 类型，避免浮点误差。
+- LLM API Key 加密保存，不明文返回前端；主密钥独立管理。
+- 金额、价格、收益率使用 decimal 类型，避免浮点误差。
+- 价格序列与回撤计算依赖日线 OHLC（`daily_bars`），并结合公司行为（`corporate_actions`）做复权，不依赖单点快照。
+- 分析与推荐记录保存方法版本（prompt/策略/评分），保证历史可复现、可横比。
+- 多市场为多币种，金额字段需带币种语义。
 
 ## 2. 核心枚举
 
@@ -26,20 +29,33 @@
 
 ### horizon
 
+用户投资周期偏好（仅偏好语义）：
+
 - `short_term`
 - `mid_term`
 - `long_term`
 
 ### recommendation_type
 
+推荐只有短线/长线两套逻辑，无独立中线逻辑：
+
 - `short_term`
 - `long_term`
 
+> 说明：用户偏好 `mid_term` 不是独立推荐类型，需在业务层映射到 `short_term` 或 `long_term`（默认建议映射到 `long_term`），避免“中线推荐无处安放”。
+
+### currency
+
+- `CNY`
+- `USD`
+- `HKD`
+
 ### position_status
+
+持仓状态不含“观察中”（观察属于自选股/推荐，不属于持仓）：
 
 - `holding`
 - `closed`
-- `watching`
 
 ### short_tracking_status
 
@@ -50,6 +66,8 @@
 - `expired`
 - `needs_review`
 - `closed`
+
+> 状态机归属：`recommendation_status.tracking_status` 是短线追踪状态的**唯一来源**；`positions.status` 只表示持仓生命周期；`recommendation_records.status` 只表示推荐记录本身是否有效。三者各管一段，业务层负责同步，不重复定义同一含义。
 
 ## 3. 表设计
 
@@ -262,10 +280,15 @@
 | stock_id | bigint / uuid | 股票 ID |
 | recommendation_id | bigint / uuid | 来源推荐，可为空 |
 | position_type | string | short_term / long_term |
-| status | string | holding / closed / watching |
+| status | string | holding / closed |
+| currency | string | 交易币种，CNY / USD / HKD |
 | buy_price | decimal | 买入价格 |
 | buy_date | date | 买入日期 |
 | quantity | decimal | 数量 |
+| buy_fee | decimal | 买入手续费（佣金/过户费等） |
+| buy_tax | decimal | 买入税费 |
+| sell_fee | decimal | 卖出手续费 |
+| sell_tax | decimal | 卖出税费（如印花税） |
 | buy_reason | text | 买入理由 |
 | user_note | text | 用户备注 |
 | current_price_snapshot | decimal | 最近一次计算价格 |
@@ -289,15 +312,20 @@ AI 分析报告。
 | target_type | string | market / sector / stock / watchlist / position |
 | target_id | string | 目标 ID |
 | request_params_json | json | 请求参数 |
-| data_snapshot_json | json | 输入数据快照 |
+| data_snapshot_json | json | 输入数据快照（含数据时间范围与实际注入内容） |
 | result_json | json | 结构化结果 |
 | summary | text | 摘要 |
+| strategy_id | bigint / uuid | 使用的策略模板，可为空 |
+| prompt_version | string | Prompt 模板版本 |
+| strategy_version | string | 策略版本 |
+| scoring_version | string | 评分方法版本 |
 | llm_config_id | bigint / uuid | LLM 配置 |
 | model | string | 模型 |
 | prompt_tokens | int | 输入 token |
 | completion_tokens | int | 输出 token |
 | total_tokens | int | 总 token |
 | latency_ms | int | 耗时 |
+| validation_status | string | structured 校验：valid / repaired / partial |
 | status | string | success / failed |
 | error_message | text | 错误信息 |
 | created_at | timestamp | 创建时间 |
@@ -314,9 +342,14 @@ AI 推荐记录。
 | stock_id | bigint / uuid | 股票 ID |
 | recommendation_type | string | short_term / long_term |
 | strategy_id | bigint / uuid | 策略模板 |
+| strategy_version | string | 策略版本 |
+| scoring_version | string | 评分方法版本 |
+| currency | string | 计价币种 |
 | base_price | decimal | 推荐基准价 |
+| benchmark_symbol | string | 对比基准（指数）代码，用于 alpha |
+| benchmark_base_price | decimal | 推荐时基准指数点位 |
 | recommendation_time | timestamp | 推荐时间 |
-| valid_until | timestamp | 有效期 |
+| valid_until | timestamp | 有效期（按交易日计算） |
 | confidence | decimal | 置信度 |
 | reason | text | 推荐理由 |
 | data_points_json | json | 数据依据 |
@@ -327,28 +360,95 @@ AI 推荐记录。
 | created_at | timestamp | 创建时间 |
 | updated_at | timestamp | 更新时间 |
 
-### recommendation_tracking
+### recommendation_status
 
-推荐后追踪。
+推荐后追踪的**当前状态层**（与推荐 1:1，定时任务覆盖更新）。聚合值只存最新结果，价格序列另由 `daily_bars` 提供。
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | id | bigint / uuid | 主键 |
-| recommendation_id | bigint / uuid | 推荐 ID |
+| recommendation_id | bigint / uuid | 推荐 ID，唯一 |
 | stock_id | bigint / uuid | 股票 ID |
-| tracking_time | timestamp | 追踪时间 |
-| current_price | decimal | 当前价格 |
+| last_updated_at | timestamp | 最近一次计算时间 |
+| current_price | decimal | 当前价格（复权后） |
 | return_percent | decimal | 当前收益率 |
 | highest_price | decimal | 推荐后最高价 |
 | lowest_price | decimal | 推荐后最低价 |
 | max_gain_percent | decimal | 最大涨幅 |
 | max_drawdown_percent | decimal | 最大回撤 |
+| benchmark_return_percent | decimal | 同期基准收益率 |
+| alpha_percent | decimal | 超额收益（相对基准） |
 | take_profit_price | decimal | 止盈价，短线使用 |
 | stop_loss_price | decimal | 止损价，短线使用 |
-| tracking_status | string | 短线状态或通用状态 |
+| tracking_status | string | 短线状态或通用状态，唯一来源 |
 | triggered_reason | text | 触发原因 |
 | created_at | timestamp | 创建时间 |
 | updated_at | timestamp | 更新时间 |
+
+唯一索引：
+
+- `recommendation_id`
+
+> 说明：原 `recommendation_tracking` 把时序行与聚合值混在一张表里、语义冲突。现拆为：当前状态（本表，1:1）+ 价格序列（复用 `daily_bars`）。止盈/止损判断用当日 high/low，回撤/收益用复权序列。
+
+### daily_bars
+
+日线 OHLC，追踪、回撤、止盈止损判断的统一数据来源。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | bigint / uuid | 主键 |
+| stock_id | bigint / uuid | 股票 ID |
+| trade_date | date | 交易日 |
+| open | decimal | 开盘价 |
+| high | decimal | 最高价 |
+| low | decimal | 最低价 |
+| close | decimal | 收盘价 |
+| adj_close | decimal | 复权收盘价 |
+| volume | decimal | 成交量 |
+| turnover | decimal | 成交额 |
+| source | string | 数据源 |
+| created_at | timestamp | 创建时间 |
+
+唯一索引：
+
+- `stock_id + trade_date`
+
+### corporate_actions
+
+公司行为（拆股、分红、配股等），用于复权，避免价格序列断裂。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | bigint / uuid | 主键 |
+| stock_id | bigint / uuid | 股票 ID |
+| action_type | string | split / dividend / rights / bonus |
+| ex_date | date | 除权除息日 |
+| ratio | decimal | 拆股/送股比例 |
+| dividend_amount | decimal | 每股分红 |
+| adjustment_factor | decimal | 复权因子 |
+| source | string | 数据源 |
+| created_at | timestamp | 创建时间 |
+
+唯一索引：
+
+- `stock_id + action_type + ex_date`
+
+### trading_calendar
+
+交易日历，用于按交易日计算有效期、持有周期、数据新鲜度。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | bigint / uuid | 主键 |
+| market | string | 市场 |
+| trade_date | date | 日期 |
+| is_open | bool | 是否交易日 |
+| created_at | timestamp | 创建时间 |
+
+唯一索引：
+
+- `market + trade_date`
 
 ### strategy_templates
 
@@ -440,6 +540,50 @@ AI 调用日志。
 | error_message | text | 错误 |
 | created_at | timestamp | 创建时间 |
 
+### refresh_tokens
+
+刷新令牌，支持吊销与强制登出。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | bigint / uuid | 主键 |
+| user_id | bigint / uuid | 用户 ID |
+| token_hash | string | 令牌哈希，不存明文 |
+| expires_at | timestamp | 过期时间 |
+| revoked_at | timestamp | 吊销时间，可空 |
+| user_agent | string | 客户端信息 |
+| created_at | timestamp | 创建时间 |
+
+### user_token_quotas
+
+每用户 AI token 配额与消耗，用于成本控制与熔断。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | bigint / uuid | 主键 |
+| user_id | bigint / uuid | 用户 ID |
+| period | string | daily / monthly |
+| token_limit | bigint | 配额上限 |
+| token_used | bigint | 已用 token |
+| period_start | date | 周期开始 |
+| created_at | timestamp | 创建时间 |
+| updated_at | timestamp | 更新时间 |
+
+### audit_logs
+
+敏感操作审计（改 API Key、改数据源 URL 等）。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | bigint / uuid | 主键 |
+| user_id | bigint / uuid | 操作者 |
+| action | string | 操作类型 |
+| target_type | string | 对象类型 |
+| target_id | string | 对象 ID |
+| detail_json | json | 变更摘要（脱敏，不含明文密钥） |
+| ip | string | 来源 IP |
+| created_at | timestamp | 创建时间 |
+
 ## 4. 关键关系
 
 - `users` 1 对 1 `user_preferences`
@@ -450,9 +594,12 @@ AI 调用日志。
 - `stocks` 1 对多 `stock_quotes`
 - `stocks` 1 对多 `stock_fundamentals`
 - `ai_analysis_reports` 1 对多 `recommendation_records`
-- `recommendation_records` 1 对多 `recommendation_tracking`
+- `recommendation_records` 1 对 1 `recommendation_status`
 - `recommendation_records` 1 对多 `positions`
 - `strategy_templates` 1 对多 `recommendation_records`
+- `stocks` 1 对多 `daily_bars`
+- `stocks` 1 对多 `corporate_actions`
+- `users` 1 对多 `refresh_tokens`
 
 ## 5. MVP 必建表
 
@@ -460,16 +607,20 @@ AI 调用日志。
 
 - `users`
 - `user_preferences`
+- `refresh_tokens`
 - `llm_configs`
+- `user_token_quotas`
 - `stocks`
 - `stock_quotes`
+- `daily_bars`
+- `trading_calendar`
 - `market_snapshots`
 - `watchlists`
 - `watchlist_items`
 - `positions`
 - `ai_analysis_reports`
 - `recommendation_records`
-- `recommendation_tracking`
+- `recommendation_status`
 - `strategy_templates`
 - `ai_call_logs`
 
@@ -477,6 +628,10 @@ AI 调用日志。
 
 - `data_source_configs`
 - `stock_fundamentals`
+- `corporate_actions`
 - `stock_scores`
 - `alerts`
+- `audit_logs`
 - `data_sync_logs`
+
+> 注：`corporate_actions`（复权）在追踪长期价格序列时即需要；若 MVP 阶段已做短线/长线推荐追踪，建议提前到第一阶段，否则除权日的收益与回撤会出错。
