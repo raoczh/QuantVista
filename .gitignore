@@ -1,0 +1,35 @@
+# ===== 真实配置（含密钥，禁止提交）=====
+deploy/.env
+deploy/docker-compose.yml
+*.env
+!*.env.example
+.env
+
+# ===== Go 后端 =====
+server/quantvista
+server/*.exe
+server/data/
+server/logs/
+*.db
+*.db-journal
+
+# ===== 前端 =====
+web/node_modules/
+web/dist/
+web/.vite/
+node_modules/
+
+# ===== 构建产物 / 缓存 =====
+build/
+dist/
+.gocache/
+.gomodcache/
+
+# ===== IDE / 系统 =====
+.idea/
+.vscode/
+.DS_Store
+
+# ===== Claude / 工具 =====
+.claude/
+plans/
