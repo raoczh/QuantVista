@@ -29,10 +29,22 @@
 - 接口形态：`https://hq.sinajs.cn/list=sh600000,sz000001`
 - 注意：**必须带 `Referer: https://finance.sina.com.cn`**，否则可能被拒；返回是 GBK 文本，需转码。
 
-### 2.3 两源关系
+### 2.3 三源关系
 
-- 东财为主，新浪为辅。
-- 同一字段两源都能取时，优先东财；东财异常时回退新浪，并在数据上标注实际来源。
+- 行情链路优先级：**东财（数据最全）→ 腾讯（稳定）→ 新浪（兜底，且独有日线/指数/榜单）**。
+- 同一字段多源都能取时优先靠前的源；前源异常自动回退后源，并在数据上标注实际来源（`source` 字段）。
+- 东财对单只 `stock/get` 限流较狠（常 EOF），实战中腾讯/新浪兜底命中率更高。
+
+### 2.4 腾讯财经（qt.gtimg.cn）
+
+- 用途：实时行情快照（独立于东财/新浪的第三源，稳定性好）。
+- 接口：`https://qt.gtimg.cn/q=sh600000`（批量用逗号分隔），需带 `Referer`，返回 GBK 文本，`~` 分隔字段。
+- 已接入为行情链路第二源；日线腾讯接口字段不稳，未用，日线仍走新浪。
+
+### 2.5 东财负载节点（重要技巧）
+
+- 东财把接口分流到 `{1..99}.push2.eastmoney.com` / `{1..99}.push2his.eastmoney.com` 负载节点（来自 akshare 实现）。
+- 本项目对东财请求**轮询数字子域名**（而非裸 `push2.eastmoney.com`），分散单节点限流、降低 EOF 概率。
 
 ## 3. 按需启用：Tushare Pro（分档）
 
@@ -94,3 +106,20 @@
 - 东财/新浪均为**非官方公开接口**，无 SLA、字段可能变动、可能限流封 IP。**仅适合个人自用，禁止公开高频拉取。**
 - 需要稳定保障时，用 Tushare Pro 这类带 token 的正规 API，或考虑付费数据源。
 - 适配层要把"换源"成本降到最低：上层只依赖内部标准结构，单个源挂掉可整体切换。
+
+## 6. akshare 作为"接口字典"（调研结论）
+
+[akshare](https://github.com/akfamily/akshare) 是 Python 库，本项目**不引入**（后端 Go，不为它起 Python 服务），但把它当**公开接口字典**用——从其源码挖出真实 HTTP 接口，用 Go 直连。已采纳/候选：
+
+| 能力 | 来源 | 接口 | 状态 |
+| --- | --- | --- | --- |
+| 实时行情 | 腾讯 | `qt.gtimg.cn/q=` | ✅ 已接入（2.4） |
+| 东财负载节点 | 东财 | `{1..99}.push2.eastmoney.com` | ✅ 已采纳（2.5） |
+| 板块/榜单 | 东财 | `{n}.push2.eastmoney.com/api/qt/clist/get` | ✅ 已用（best-effort，限流时降级） |
+| 个股资金流 | 同花顺 | `data.10jqka.com.cn/funds/ggzjl/...` | ⏳ 待办：有 JS/cookie 反爬（hexin-v token），Go 复刻成本高，资金流卡片暂占位 |
+| 行业/概念资金流 | 同花顺 | `data.10jqka.com.cn/funds/hyzjl|gnzjl/...` | ⏳ 同上 |
+| 千股千评/市场情绪 | 东财 | `stock_comment_em` 系列 | ⏳ 候选，做市场情绪卡片时接 |
+| 热搜榜 | 百度 | `stock_hot_search_baidu` | ⏳ 候选 |
+| 个股榜单 | 腾讯 | `proxy.finance.qq.com/cgi/.../getBoardRankList` | ⏳ 候选（参数待调） |
+
+> 资金流的反爬（同花顺 hexin-v）是接入门槛最高的一项，做"资金流"卡片前需专门处理 cookie/token 流程，或改用东财资金流 clist 字段（`f62` 等）规避。

@@ -13,11 +13,12 @@ type Manager struct {
 	adapters []Adapter // 按优先级排列，[0] 为主源
 }
 
-// DefaultManager 默认编排：东财为主，新浪为辅。
+// DefaultManager 默认编排：东财为主（数据最全），腾讯次之（稳定），新浪兜底（含日线/指数/榜单）。
 func DefaultManager() *Manager {
 	return &Manager{
 		adapters: []Adapter{
 			NewEastMoneyAdapter(),
+			NewTencentAdapter(),
 			NewSinaAdapter(),
 		},
 	}
