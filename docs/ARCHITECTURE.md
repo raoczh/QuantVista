@@ -370,6 +370,8 @@ AI 结果：
 - `/positions`：已购入持仓
 - `/analysis`：AI 分析中心
 - `/recommendations`：推荐历史与追踪
+- `/compare`：个股横向对比
+- `/alerts`：提醒规则与待办/待复盘清单
 - `/strategies`：策略模板
 - `/reports`：分析历史
 - `/settings`：设置
