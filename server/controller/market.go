@@ -19,6 +19,16 @@ func NewMarketController(svc *service.MarketService) *MarketController {
 	return &MarketController{svc: svc}
 }
 
+// GetOverview GET /api/markets/:market/overview
+func (mc *MarketController) GetOverview(c *gin.Context) {
+	market := strings.ToLower(c.Param("market"))
+	if market == "" {
+		market = "cn"
+	}
+	ov := mc.svc.GetOverview(c.Request.Context(), market)
+	common.ApiSuccess(c, ov)
+}
+
 // GetQuote GET /api/markets/:market/stocks/:symbol/quote
 func (mc *MarketController) GetQuote(c *gin.Context) {
 	market := strings.ToLower(c.Param("market"))

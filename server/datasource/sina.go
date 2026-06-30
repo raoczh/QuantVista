@@ -101,7 +101,116 @@ func (s *SinaAdapter) GetQuote(ctx context.Context, market, symbol string) (*Quo
 	}, nil
 }
 
-// GetDailyBars 用新浪 money.finance 的 JSON 日线接口（东财 EOF 时的兜底日线源）。
+// GetIndices 用新浪批量接口一次拉取主要指数（市场首页指数概览）。
+func (s *SinaAdapter) GetIndices(ctx context.Context, market string) ([]Index, error) {
+	if market != "cn" {
+		return nil, ErrNotSupported
+	}
+	codes := make([]string, 0, len(CNIndices))
+	for _, ix := range CNIndices {
+		codes = append(codes, ix.Sina)
+	}
+	url := "https://hq.sinajs.cn/list=" + strings.Join(codes, ",")
+	raw, status, err := doGet(ctx, url, map[string]string{"Referer": "https://finance.sina.com.cn"})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
+	}
+	decoded, err := simplifiedchinese.GBK.NewDecoder().Bytes(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: 转码失败 %v", ErrUpstream, err)
+	}
+
+	// 每行：var hq_str_sh000001="上证指数,open,prevclose,price,high,low,...,date,time";
+	lines := strings.Split(string(decoded), "\n")
+	out := make([]Index, 0, len(CNIndices))
+	for i, ix := range CNIndices {
+		if i >= len(lines) {
+			break
+		}
+		l := lines[i]
+		a := strings.Index(l, "\"")
+		b := strings.LastIndex(l, "\"")
+		if a < 0 || b <= a {
+			continue
+		}
+		f := strings.Split(l[a+1:b], ",")
+		if len(f) < 6 {
+			continue
+		}
+		atof := func(idx int) float64 { v, _ := strconv.ParseFloat(strings.TrimSpace(f[idx]), 64); return v }
+		price := atof(3)
+		prevClose := atof(2)
+		if price == 0 {
+			continue
+		}
+		pct := 0.0
+		if prevClose != 0 {
+			pct = (price - prevClose) / prevClose * 100
+		}
+		out = append(out, Index{
+			Code: ix.Code, Name: ix.Name,
+			Price: price, ChangePct: pct,
+			Open: atof(1), High: atof(4), Low: atof(5), PrevClose: prevClose,
+			Source: s.Name(), DataTime: time.Now(),
+		})
+	}
+	if len(out) == 0 {
+		return nil, ErrNoData
+	}
+	return out, nil
+}
+
+// GetStockRanking 用新浪 Market_Center 榜单接口（sort: changepercent / amount）。
+func (s *SinaAdapter) GetStockRanking(ctx context.Context, market, sort string, limit int) ([]StockRank, error) {
+	if market != "cn" {
+		return nil, ErrNotSupported
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 10
+	}
+	if sort != "changepercent" && sort != "amount" {
+		sort = "changepercent"
+	}
+	url := fmt.Sprintf(
+		"https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?node=hs_a&sort=%s&asc=0&num=%d&page=1",
+		sort, limit,
+	)
+	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://finance.sina.com.cn"})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
+	}
+
+	var rows []struct {
+		Code          string  `json:"code"`
+		Name          string  `json:"name"`
+		Trade         string  `json:"trade"`
+		Changepercent float64 `json:"changepercent"`
+		Amount        float64 `json:"amount"`
+		Turnoverratio float64 `json:"turnoverratio"`
+	}
+	if err := json.Unmarshal(body, &rows); err != nil {
+		return nil, fmt.Errorf("%w: 解析失败 %v", ErrUpstream, err)
+	}
+	if len(rows) == 0 {
+		return nil, ErrNoData
+	}
+	out := make([]StockRank, 0, len(rows))
+	for _, r := range rows {
+		price, _ := strconv.ParseFloat(r.Trade, 64)
+		out = append(out, StockRank{
+			Symbol: r.Code, Name: r.Name, Price: price,
+			ChangePct: r.Changepercent, Amount: r.Amount, TurnoverRate: r.Turnoverratio,
+			Source: s.Name(),
+		})
+	}
+	return out, nil
+}
 // 返回按日期升序的前复权日线；该接口不提供成交额，Amount 置 0。
 func (s *SinaAdapter) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]Bar, error) {
 	if market != "cn" {

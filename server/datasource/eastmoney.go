@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -168,4 +169,72 @@ func (e *EastMoneyAdapter) GetDailyBars(ctx context.Context, market, symbol stri
 		return nil, ErrNoData
 	}
 	return bars, nil
+}
+
+// GetSectorRanking 东财 clist 行业板块涨跌榜（best-effort：东财限流时常返回空，调用方降级处理）。
+func (e *EastMoneyAdapter) GetSectorRanking(ctx context.Context, market string, limit int) ([]SectorRank, error) {
+	if market != "cn" {
+		return nil, ErrNotSupported
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 10
+	}
+	url := fmt.Sprintf(
+		"https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=%d&po=1&fid=f3&fltt=2&fs=m:90+t:2&fields=f12,f14,f3,f128",
+		limit,
+	)
+	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
+	}
+
+	// diff 可能是数组或以 "0","1" 为键的对象，两种都兼容。
+	var parsed struct {
+		Data struct {
+			Diff json.RawMessage `json:"diff"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("%w: 解析失败 %v", ErrUpstream, err)
+	}
+
+	type emSector struct {
+		F12 string  `json:"f12"`
+		F14 string  `json:"f14"`
+		F3  float64 `json:"f3"`
+		F128 string `json:"f128"`
+	}
+	var items []emSector
+	if len(parsed.Data.Diff) > 0 && parsed.Data.Diff[0] == '[' {
+		_ = json.Unmarshal(parsed.Data.Diff, &items)
+	} else if len(parsed.Data.Diff) > 0 {
+		m := map[string]emSector{}
+		if json.Unmarshal(parsed.Data.Diff, &m) == nil {
+			keys := make([]int, 0, len(m))
+			idx := map[int]string{}
+			for k := range m {
+				n, _ := strconv.Atoi(k)
+				keys = append(keys, n)
+				idx[n] = k
+			}
+			sort.Ints(keys)
+			for _, n := range keys {
+				items = append(items, m[idx[n]])
+			}
+		}
+	}
+	if len(items) == 0 {
+		return nil, ErrNoData
+	}
+
+	out := make([]SectorRank, 0, len(items))
+	for _, it := range items {
+		out = append(out, SectorRank{
+			Code: it.F12, Name: it.F14, ChangePct: it.F3, Leader: it.F128, Source: e.Name(),
+		})
+	}
+	return out, nil
 }

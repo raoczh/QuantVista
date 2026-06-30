@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"time"
 
 	"quantvista/common"
@@ -52,6 +53,78 @@ func (s *MarketService) GetQuote(ctx context.Context, market, symbol string) (*d
 // GetDailyBars 取日线序列（暂不缓存，数据量大且变动低频，后续可加）。
 func (s *MarketService) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]datasource.Bar, error) {
 	return s.mgr.GetDailyBars(ctx, market, symbol, limit)
+}
+
+// Overview 市场首页概览：各块独立获取，部分失败不影响整体（失败记入 Errors）。
+type Overview struct {
+	Indices  []datasource.Index      `json:"indices"`
+	Gainers  []datasource.StockRank  `json:"gainers"`  // 涨幅榜
+	Actives  []datasource.StockRank  `json:"actives"`  // 成交额/热门榜
+	Sectors  []datasource.SectorRank `json:"sectors"`  // 板块涨跌榜（best-effort）
+	Errors   map[string]string       `json:"errors"`   // 哪些块取数失败
+	DataTime time.Time               `json:"data_time"`
+}
+
+const overviewCacheTTL = 15 * time.Second
+
+// GetOverview 并行拉取首页各块，单块失败降级（前端对应卡片显示"暂不可用"）。
+func (s *MarketService) GetOverview(ctx context.Context, market string) *Overview {
+	cacheKey := "overview:" + market
+	if cached, ok := common.RedisGet(cacheKey); ok {
+		var ov Overview
+		if json.Unmarshal([]byte(cached), &ov) == nil {
+			return &ov
+		}
+	}
+
+	ov := &Overview{Errors: map[string]string{}, DataTime: time.Now()}
+	var mu sync.Mutex
+	setErr := func(k string, err error) {
+		mu.Lock()
+		ov.Errors[k] = err.Error()
+		mu.Unlock()
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		if r, err := s.mgr.GetIndices(ctx, market); err == nil {
+			ov.Indices = r
+		} else {
+			setErr("indices", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if r, err := s.mgr.GetStockRanking(ctx, market, "changepercent", 10); err == nil {
+			ov.Gainers = r
+		} else {
+			setErr("gainers", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if r, err := s.mgr.GetStockRanking(ctx, market, "amount", 10); err == nil {
+			ov.Actives = r
+		} else {
+			setErr("actives", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if r, err := s.mgr.GetSectorRanking(ctx, market, 10); err == nil {
+			ov.Sectors = r
+		} else {
+			setErr("sectors", err)
+		}
+	}()
+	wg.Wait()
+
+	if b, err := json.Marshal(ov); err == nil {
+		common.RedisSet(cacheKey, string(b), overviewCacheTTL)
+	}
+	return ov
 }
 
 func (s *MarketService) persist(q *datasource.Quote) {
