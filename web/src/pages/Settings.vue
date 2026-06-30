@@ -1,0 +1,311 @@
+<script setup lang="ts">
+import { onMounted, reactive, ref } from 'vue'
+import {
+  NTabs,
+  NTabPane,
+  NCard,
+  NButton,
+  NSpace,
+  NTable,
+  NTag,
+  NModal,
+  NForm,
+  NFormItem,
+  NInput,
+  NInputNumber,
+  NSelect,
+  NSwitch,
+  NPopconfirm,
+  NEmpty,
+  useMessage,
+} from 'naive-ui'
+import {
+  listLLMConfigs,
+  createLLMConfig,
+  updateLLMConfig,
+  deleteLLMConfig,
+  testLLMConfig,
+  testLLMDraft,
+  type LLMConfig,
+  type LLMConfigInput,
+} from '@/api/llm'
+import { getPreference, updatePreference, type UserPreference } from '@/api/user'
+
+const message = useMessage()
+
+/* ---------------- LLM 配置 ---------------- */
+const configs = ref<LLMConfig[]>([])
+const loadingConfigs = ref(false)
+const showModal = ref(false)
+const editingId = ref<number | null>(null)
+const testing = ref(false)
+const saving = ref(false)
+
+const blankForm = (): LLMConfigInput => ({
+  name: '',
+  provider: 'openai',
+  base_url: '',
+  api_key: '',
+  model: '',
+  temperature: 0.7,
+  max_tokens: 2048,
+  stream: true,
+  is_default: false,
+})
+const form = reactive<LLMConfigInput>(blankForm())
+
+const providerOptions = [
+  { label: 'OpenAI 兼容（OpenAI/DeepSeek/Moonshot/中转等）', value: 'openai' },
+  { label: '其他', value: 'other' },
+]
+
+async function loadConfigs() {
+  loadingConfigs.value = true
+  try {
+    configs.value = await listLLMConfigs()
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    loadingConfigs.value = false
+  }
+}
+
+function openCreate() {
+  editingId.value = null
+  Object.assign(form, blankForm())
+  showModal.value = true
+}
+
+function openEdit(cfg: LLMConfig) {
+  editingId.value = cfg.id
+  Object.assign(form, {
+    name: cfg.name,
+    provider: cfg.provider || 'openai',
+    base_url: cfg.base_url,
+    api_key: '', // 留空表示保留原密钥
+    model: cfg.model,
+    temperature: cfg.temperature,
+    max_tokens: cfg.max_tokens,
+    stream: cfg.stream,
+    is_default: cfg.is_default,
+  })
+  showModal.value = true
+}
+
+async function save() {
+  saving.value = true
+  try {
+    if (editingId.value) {
+      await updateLLMConfig(editingId.value, { ...form })
+      message.success('已更新')
+    } else {
+      await createLLMConfig({ ...form })
+      message.success('已创建')
+    }
+    showModal.value = false
+    await loadConfigs()
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    saving.value = false
+  }
+}
+
+async function remove(cfg: LLMConfig) {
+  try {
+    await deleteLLMConfig(cfg.id)
+    message.success('已删除')
+    await loadConfigs()
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+
+async function testSaved(cfg: LLMConfig) {
+  try {
+    const r = await testLLMConfig(cfg.id)
+    r.ok ? message.success(`连接成功（${r.latency_ms}ms）`) : message.error(`失败：${r.message}`)
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+
+async function testDraft() {
+  if (!form.api_key) return message.warning('即时测试需填写 API Key（保存后可对已存配置直接测试）')
+  testing.value = true
+  try {
+    const r = await testLLMDraft({ ...form })
+    r.ok ? message.success(`连接成功（${r.latency_ms}ms）`) : message.error(`失败：${r.message}`)
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    testing.value = false
+  }
+}
+
+/* ---------------- 用户偏好 ---------------- */
+const pref = ref<UserPreference | null>(null)
+const savingPref = ref(false)
+const riskOptions = [
+  { label: '保守', value: 'conservative' },
+  { label: '均衡', value: 'balanced' },
+  { label: '激进', value: 'aggressive' },
+]
+const marketOptions = [
+  { label: 'A 股', value: 'cn' },
+  { label: '美股', value: 'us' },
+  { label: '港股', value: 'hk' },
+]
+const horizonOptions = [
+  { label: '短线', value: 'short_term' },
+  { label: '长线', value: 'long_term' },
+]
+
+async function loadPref() {
+  try {
+    pref.value = await getPreference()
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+
+async function savePref() {
+  if (!pref.value) return
+  savingPref.value = true
+  try {
+    pref.value = await updatePreference(pref.value)
+    message.success('偏好已保存')
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    savingPref.value = false
+  }
+}
+
+onMounted(() => {
+  loadConfigs()
+  loadPref()
+})
+</script>
+
+<template>
+  <n-tabs type="line" animated>
+    <!-- LLM 配置 -->
+    <n-tab-pane name="llm" tab="LLM 配置">
+      <n-card>
+        <template #header-extra>
+          <n-button type="primary" size="small" @click="openCreate">新增配置</n-button>
+        </template>
+        <n-empty v-if="!loadingConfigs && configs.length === 0" description="还没有 LLM 配置" />
+        <n-table v-else :bordered="false" :single-line="false">
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>模型</th>
+              <th>Base URL</th>
+              <th>密钥</th>
+              <th>默认</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="c in configs" :key="c.id">
+              <td>{{ c.name }}</td>
+              <td>{{ c.model }}</td>
+              <td>{{ c.base_url }}</td>
+              <td>
+                <n-tag :type="c.has_api_key ? 'success' : 'warning'" size="small" round>
+                  {{ c.has_api_key ? '已设置' : '未设置' }}
+                </n-tag>
+              </td>
+              <td>
+                <n-tag v-if="c.is_default" type="info" size="small" round>默认</n-tag>
+              </td>
+              <td>
+                <n-space :size="6">
+                  <n-button size="tiny" @click="testSaved(c)">测试</n-button>
+                  <n-button size="tiny" @click="openEdit(c)">编辑</n-button>
+                  <n-popconfirm @positive-click="remove(c)">
+                    <template #trigger><n-button size="tiny" type="error">删除</n-button></template>
+                    确认删除「{{ c.name }}」？
+                  </n-popconfirm>
+                </n-space>
+              </td>
+            </tr>
+          </tbody>
+        </n-table>
+      </n-card>
+    </n-tab-pane>
+
+    <!-- 用户偏好 -->
+    <n-tab-pane name="pref" tab="偏好设置">
+      <n-card>
+        <n-form v-if="pref" label-placement="left" label-width="120" style="max-width: 480px">
+          <n-form-item label="风险等级">
+            <n-select v-model:value="pref.risk_level" :options="riskOptions" />
+          </n-form-item>
+          <n-form-item label="默认市场">
+            <n-select v-model:value="pref.default_market" :options="marketOptions" />
+          </n-form-item>
+          <n-form-item label="默认周期">
+            <n-select v-model:value="pref.horizon_pref" :options="horizonOptions" />
+          </n-form-item>
+          <n-form-item label="默认推荐数量">
+            <n-input-number v-model:value="pref.default_rec_count" :min="1" :max="20" />
+          </n-form-item>
+          <n-form-item label="开启提醒">
+            <n-switch v-model:value="pref.enable_notify" />
+          </n-form-item>
+          <n-button type="primary" :loading="savingPref" @click="savePref">保存偏好</n-button>
+        </n-form>
+      </n-card>
+    </n-tab-pane>
+  </n-tabs>
+
+  <!-- 新增/编辑配置弹窗 -->
+  <n-modal v-model:show="showModal" preset="card" :title="editingId ? '编辑 LLM 配置' : '新增 LLM 配置'" style="max-width: 520px">
+    <n-form label-placement="left" label-width="96">
+      <n-form-item label="名称">
+        <n-input v-model:value="form.name" placeholder="如 我的 DeepSeek" />
+      </n-form-item>
+      <n-form-item label="类型">
+        <n-select v-model:value="form.provider" :options="providerOptions" />
+      </n-form-item>
+      <n-form-item label="Base URL">
+        <n-input v-model:value="form.base_url" placeholder="如 https://api.deepseek.com/v1" />
+      </n-form-item>
+      <n-form-item label="API Key">
+        <n-input
+          v-model:value="form.api_key"
+          type="password"
+          show-password-on="click"
+          :placeholder="editingId ? '留空表示保留原密钥' : 'sk-...'"
+        />
+      </n-form-item>
+      <n-form-item label="模型">
+        <n-input v-model:value="form.model" placeholder="如 deepseek-chat" />
+      </n-form-item>
+      <n-form-item label="Temperature">
+        <n-input-number v-model:value="form.temperature" :min="0" :max="2" :step="0.1" />
+      </n-form-item>
+      <n-form-item label="Max Tokens">
+        <n-input-number v-model:value="form.max_tokens" :min="1" :max="200000" />
+      </n-form-item>
+      <n-form-item label="流式输出">
+        <n-switch v-model:value="form.stream" />
+      </n-form-item>
+      <n-form-item label="设为默认">
+        <n-switch v-model:value="form.is_default" />
+      </n-form-item>
+    </n-form>
+    <template #footer>
+      <n-space justify="space-between">
+        <n-button :loading="testing" @click="testDraft">测试连接</n-button>
+        <n-space>
+          <n-button @click="showModal = false">取消</n-button>
+          <n-button type="primary" :loading="saving" @click="save">保存</n-button>
+        </n-space>
+      </n-space>
+    </template>
+  </n-modal>
+</template>

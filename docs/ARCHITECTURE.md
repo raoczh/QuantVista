@@ -131,7 +131,8 @@ Go API Server
 - 用户资料同步。
 - 用户权限判断。
 
-> 与 new-api 的差异：本项目定位个人自用，GitHub OAuth 的 `client_id` / `client_secret` 直接从**环境变量**读取（`GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`，见 `deploy/.env`），不存数据库 option、不做运行时可改。因此 `oauth/github` 的凭证读取逻辑不能照搬 new-api（它存 DB 设置项），其余流程（换 token、拉用户、建号）可参考。
+> **凭证管理（阶段 1 落地后修订）**：GitHub OAuth 的 `client_id` / `client_secret` **存数据库系统设置**（`options` 表，secret 经 AES-256-GCM 加密），由管理员后台「GitHub 登录」运行时可配可改。`deploy/.env` 的 `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` 仅作**首启种子**（DB 无值且 env 有则回填），之后以 DB 为准。此处与最初"只走 env"的设计已调整——改为参照 new-api 的 DB 设置项做法（换 token、拉用户、建号流程同样可参考）。
+> 鉴权用 JWT：access token（HS256，2h，无状态）+ refresh token（`refresh_tokens` 表落库、可吊销、换发轮换）。首启无用户时走密码方式创建首个管理员（admin），解 GitHub 凭证配置前的"鸡生蛋"问题。
 
 接口示例：
 

@@ -9,6 +9,9 @@ func AllModels() []any {
 	return []any{
 		&User{},
 		&UserPreference{},
+		&RefreshToken{},
+		&Option{},
+		&UserQuota{},
 		&LLMConfig{},
 		&DataSourceConfig{},
 		&Stock{},
