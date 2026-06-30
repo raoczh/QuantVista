@@ -19,6 +19,13 @@ func SysLog(format string, args ...any)   { logf("INFO", format, args...) }
 func SysWarn(format string, args ...any)  { logf("WARN", format, args...) }
 func SysError(format string, args ...any) { logf("ERROR", format, args...) }
 
+// SysDebug 仅在 DEBUG=true 时输出，用于回退成功等不必常态刷屏的细节。
+func SysDebug(format string, args ...any) {
+	if DebugEnabled {
+		logf("DEBUG", format, args...)
+	}
+}
+
 // FatalLog 打印后退出，仅用于启动期不可恢复错误。
 func FatalLog(format string, args ...any) {
 	logf("FATAL", format, args...)

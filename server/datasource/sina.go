@@ -2,15 +2,14 @@ package datasource
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
-	"golang.org/x/text/transform"
 )
 
 // SinaAdapter 新浪财经 hq.sinajs.cn，作为东财的备份/交叉校验源。
@@ -31,28 +30,23 @@ func (s *SinaAdapter) GetQuote(ctx context.Context, market, symbol string) (*Quo
 	}
 
 	url := "https://hq.sinajs.cn/list=" + code
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	req.Header.Set("User-Agent", browserUA)
-	req.Header.Set("Referer", "https://finance.sina.com.cn") // 必须，否则被拒
-
-	resp, err := httpClient.Do(req)
+	// 新浪必须带 Referer，否则被拒；返回 GBK 文本。
+	raw, status, err := doGet(ctx, url, map[string]string{"Referer": "https://finance.sina.com.cn"})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: http %d", ErrUpstream, resp.StatusCode)
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
 	}
 
 	// GBK -> UTF-8
-	reader := transform.NewReader(io.LimitReader(resp.Body, 1<<20), simplifiedchinese.GBK.NewDecoder())
-	raw, err := io.ReadAll(reader)
+	decoded, err := simplifiedchinese.GBK.NewDecoder().Bytes(raw)
 	if err != nil {
 		return nil, fmt.Errorf("%w: 转码失败 %v", ErrUpstream, err)
 	}
 
 	// 形如：var hq_str_sh600000="浦发银行,9.98,9.95,10.04,10.10,9.90,...";
-	text := string(raw)
+	text := string(decoded)
 	idx := strings.Index(text, "\"")
 	if idx < 0 {
 		return nil, ErrNoData
@@ -107,7 +101,60 @@ func (s *SinaAdapter) GetQuote(ctx context.Context, market, symbol string) (*Quo
 	}, nil
 }
 
-// GetDailyBars 新浪日线接口格式杂乱，骨架阶段不实现，由 manager 回退到东财。
+// GetDailyBars 用新浪 money.finance 的 JSON 日线接口（东财 EOF 时的兜底日线源）。
+// 返回按日期升序的前复权日线；该接口不提供成交额，Amount 置 0。
 func (s *SinaAdapter) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]Bar, error) {
-	return nil, ErrNotSupported
+	if market != "cn" {
+		return nil, ErrNotSupported
+	}
+	code, ok := sinaCNSymbol(symbol)
+	if !ok {
+		return nil, ErrSymbolInvalid
+	}
+	if limit <= 0 {
+		limit = 120
+	}
+
+	// scale=240 表示日线（分钟数），ma=no 不返回均线。
+	url := fmt.Sprintf(
+		"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=%s&scale=240&ma=no&datalen=%d",
+		code, limit,
+	)
+	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://finance.sina.com.cn"})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
+	}
+
+	var rows []struct {
+		Day    string `json:"day"`
+		Open   string `json:"open"`
+		High   string `json:"high"`
+		Low    string `json:"low"`
+		Close  string `json:"close"`
+		Volume string `json:"volume"`
+	}
+	if err := json.Unmarshal(body, &rows); err != nil {
+		return nil, fmt.Errorf("%w: 解析失败 %v", ErrUpstream, err)
+	}
+	if len(rows) == 0 {
+		return nil, ErrNoData
+	}
+
+	atof := func(s string) float64 { f, _ := strconv.ParseFloat(s, 64); return f }
+	bars := make([]Bar, 0, len(rows))
+	for _, r := range rows {
+		bars = append(bars, Bar{
+			TradeDate: r.Day,
+			Open:      atof(r.Open),
+			High:      atof(r.High),
+			Low:       atof(r.Low),
+			Close:     atof(r.Close),
+			Volume:    int64(atof(r.Volume)),
+			Amount:    0, // 该接口不提供成交额
+		})
+	}
+	return bars, nil
 }

@@ -24,6 +24,7 @@ func DefaultManager() *Manager {
 }
 
 // GetQuote 依次尝试各源，返回首个成功结果（含实际命中的 Source）。
+// 单个源失败只记 DEBUG（有备源兜底不必刷屏）；全部失败才记 WARN。
 func (m *Manager) GetQuote(ctx context.Context, market, symbol string) (*Quote, error) {
 	var lastErr error
 	for _, a := range m.adapters {
@@ -36,13 +37,14 @@ func (m *Manager) GetQuote(ctx context.Context, market, symbol string) (*Quote, 
 			return nil, err
 		}
 		if !errors.Is(err, ErrNotSupported) {
-			common.SysWarn("数据源 %s 取行情失败 symbol=%s: %v", a.Name(), symbol, err)
+			common.SysDebug("数据源 %s 取行情失败 symbol=%s: %v", a.Name(), symbol, err)
 		}
 		lastErr = err
 	}
 	if lastErr == nil {
 		lastErr = ErrNoData
 	}
+	common.SysWarn("所有数据源取行情失败 symbol=%s: %v", symbol, lastErr)
 	return nil, lastErr
 }
 
@@ -58,12 +60,13 @@ func (m *Manager) GetDailyBars(ctx context.Context, market, symbol string, limit
 			return nil, err
 		}
 		if !errors.Is(err, ErrNotSupported) {
-			common.SysWarn("数据源 %s 取日线失败 symbol=%s: %v", a.Name(), symbol, err)
+			common.SysDebug("数据源 %s 取日线失败 symbol=%s: %v", a.Name(), symbol, err)
 		}
 		lastErr = err
 	}
 	if lastErr == nil {
 		lastErr = ErrNoData
 	}
+	common.SysWarn("所有数据源取日线失败 symbol=%s: %v", symbol, lastErr)
 	return nil, lastErr
 }
