@@ -487,6 +487,24 @@ AI 推荐记录。
 | details_json | json | 评分细节 |
 | created_at | timestamp | 创建时间 |
 
+### alert_rules
+
+用户自定义提醒条件（3.16）。命中后生成一条 `alerts` 记录。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | bigint / uuid | 主键 |
+| user_id | bigint / uuid | 用户 ID |
+| target_type | string | stock / position / recommendation |
+| target_id | bigint / uuid | 目标 ID |
+| rule_type | string | price / ma_cross / breakout / pullback / volume / limit / earnings / expiry / review |
+| condition_json | json | 条件参数（阈值、均线周期、区间等） |
+| enabled | bool | 是否启用 |
+| last_triggered_at | timestamp | 最近触发时间，可空 |
+| cooldown_seconds | int | 触发冷却，避免重复刷屏 |
+| created_at | timestamp | 创建时间 |
+| updated_at | timestamp | 更新时间 |
+
 ### alerts
 
 提醒记录。MVP 可先只用于页面提示，后续再扩展主动通知。
@@ -495,9 +513,10 @@ AI 推荐记录。
 | --- | --- | --- |
 | id | bigint / uuid | 主键 |
 | user_id | bigint / uuid | 用户 ID |
+| rule_id | bigint / uuid | 来源提醒规则，可空（系统触发如止盈止损可为空） |
 | target_type | string | stock / position / recommendation |
 | target_id | bigint / uuid | 目标 ID |
-| alert_type | string | price / take_profit / stop_loss / expired / review |
+| alert_type | string | price / ma_cross / breakout / volume / take_profit / stop_loss / expired / review / earnings |
 | title | string | 标题 |
 | message | text | 内容 |
 | status | string | unread / read / dismissed |
@@ -523,6 +542,38 @@ AI 调用日志。
 | status | string | success / failed |
 | error_message | text | 错误信息 |
 | created_at | timestamp | 创建时间 |
+
+### ai_conversations
+
+个股 / 报告多轮问答会话（3.17）。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | bigint / uuid | 主键 |
+| user_id | bigint / uuid | 用户 ID |
+| context_type | string | stock / report |
+| context_id | string | 绑定的股票 ID 或分析报告 ID |
+| data_snapshot_ref | bigint / uuid | 复用的数据快照来源（如 ai_analysis_reports.id），可空 |
+| title | string | 会话标题 |
+| created_at | timestamp | 创建时间 |
+| updated_at | timestamp | 更新时间 |
+
+### ai_conversation_messages
+
+会话消息。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | bigint / uuid | 主键 |
+| conversation_id | bigint / uuid | 会话 ID |
+| role | string | user / assistant |
+| content | text | 消息内容 |
+| total_tokens | int | 本条消耗 token，可空 |
+| created_at | timestamp | 创建时间 |
+
+索引：
+
+- `conversation_id + created_at`
 
 ### data_sync_logs
 
@@ -600,6 +651,9 @@ AI 调用日志。
 - `stocks` 1 对多 `daily_bars`
 - `stocks` 1 对多 `corporate_actions`
 - `users` 1 对多 `refresh_tokens`
+- `users` 1 对多 `alert_rules`
+- `alert_rules` 1 对多 `alerts`
+- `ai_conversations` 1 对多 `ai_conversation_messages`
 
 ## 5. MVP 必建表
 
@@ -630,8 +684,12 @@ AI 调用日志。
 - `stock_fundamentals`
 - `corporate_actions`
 - `stock_scores`
+- `alert_rules`
 - `alerts`
+- `ai_conversations`
+- `ai_conversation_messages`
 - `audit_logs`
 - `data_sync_logs`
 
 > 注：`corporate_actions`（复权）在追踪长期价格序列时即需要；若 MVP 阶段已做短线/长线推荐追踪，建议提前到第一阶段，否则除权日的收益与回撤会出错。
+> 注：`alert_rules` / `alerts` 与 `ai_conversations` 服务于个股选股增强功能（条件提醒、个股 AI 问答），随对应功能（路线图阶段 7 的前半部分）一起建。
