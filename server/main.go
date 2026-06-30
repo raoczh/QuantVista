@@ -9,6 +9,7 @@ import (
 	"quantvista/middleware"
 	"quantvista/model"
 	"quantvista/router"
+	"quantvista/setting"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
@@ -34,6 +35,9 @@ func main() {
 	}
 	if err := model.Migrate(); err != nil {
 		common.FatalLog("数据库迁移失败: %v", err)
+	}
+	if err := setting.Init(); err != nil {
+		common.FatalLog("系统设置初始化失败: %v", err)
 	}
 	if err := common.InitRedis(); err != nil {
 		// Redis 是可选项，失败仅告警不致命。

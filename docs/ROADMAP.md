@@ -4,7 +4,9 @@
 
 - **阶段 0：已完成 ✅**（commit `2c428c5`）。全栈骨架就位，后端 + 容器内均端到端拉到真实行情（东财主 / 新浪备，主备切换实测生效），单镜像 64MB 构建运行通过。
   - 唯一保留项：前端 Vue **运行时未在真实浏览器实测**（本机 node16 跑不了 vite dev，仅验证到构建+类型检查+容器静态托管）。低风险，建议人工开一次浏览器确认。
-- **下一步：阶段 1（用户与设置）**。开工前先清掉阶段 0 骨架 review 的两项 P1 前置：① 生产密钥 fail-fast；② API Key 加密（基于 ENCRYPTION_KEY，注意 base64-36 ≠ 32 字节需派生）。详见项目记忆 `phase0-skeleton-review`。
+- **阶段 0 前置（安全地基）：已完成 ✅**（commit `d364fde`）。生产密钥 fail-fast + API Key AES-256-GCM 加密（详见项目记忆 `phase0-skeleton-review`）。
+- **阶段 1：用户与设置：已完成 ✅**。GitHub OAuth + 密码登录、JWT(access) + refresh token 落库可吊销、首启建管理员引导、DB 系统设置(注册开关 + GitHub 凭证落库)、LLM 配置增删改查 + 测试连接(OpenAI 兼容)、用户偏好、每用户配额表、管理员后台。后端 API 全链路实测通过，前端 vue-tsc 类型检查通过、生产镜像(64.9MB)托管真实 SPA 实测。
+- **下一步：阶段 2 收尾（市场数据补全）或阶段 3（自选股/持仓）**。阶段 2 仍欠：日线/交易日历入库、市场快照表、涨跌家数情绪、资金流。
 
 > 进度标记约定：每完成一个阶段，更新本区块 + 给对应阶段标题打 ✅，便于新会话快速恢复。
 
@@ -33,9 +35,18 @@
 
 > 这一步如果走不通（数据拿不到、不实时、不稳定），后面所有 AI 分析/推荐/追踪都建立在空中，应先解决数据问题再继续。
 
-## 阶段 1：用户与设置 ⬅ 下一步
+## 阶段 1：用户与设置 ✅ 已完成
 
 目标：完成登录、用户持久化和 LLM 配置。
+
+> **实际实现要点（落地后补充）**：
+> - **双登录方式**：用户名+密码（bcrypt，主要给管理员）+ GitHub OAuth。
+> - **首启引导**：系统无用户时走 `/setup` 创建首个管理员（密码方式，解 GitHub 凭证"鸡生蛋"问题——凭证要登录后台才能配）。第一个账号强制 admin。
+> - **GitHub 凭证落库**：client_id/secret 存 DB 系统设置（`options` 表，secret 经 AES 加密），管理员后台可配；env 的 `GITHUB_CLIENT_ID/SECRET` 仅作首启种子。**与原计划"凭证只走 env"不同**。
+> - **JWT**：access token（HS256，2h，无状态）+ refresh token（落 `refresh_tokens` 表，存 sha256、可吊销、换发时轮换）。`/api/auth/refresh` 换发、`/api/auth/logout` 吊销、禁用用户即吊销其全部令牌（强制登出）。
+> - **OAuth 流程**：前端 `/login/callback` 回调页用 code 换 token；state 用 HMAC 无状态签名防 CSRF。GitHub OAuth App 回调地址填 `<站点>/login/callback`。
+> - **测试连接**：仅 OpenAI 兼容（`{base_url}/chat/completions` 最小请求），provider 留分支口子。
+> - **注册策略**：后台可开关 `registration_open`；关闭时仅已存在账号可登录。
 
 任务：
 
