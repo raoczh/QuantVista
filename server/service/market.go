@@ -1,0 +1,85 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"quantvista/common"
+	"quantvista/datasource"
+	"quantvista/model"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+// MarketService 行情业务：缓存 → 数据源适配层 → 落库快照。
+type MarketService struct {
+	mgr *datasource.Manager
+}
+
+func NewMarketService(mgr *datasource.Manager) *MarketService {
+	return &MarketService{mgr: mgr}
+}
+
+const quoteCacheTTL = 10 * time.Second
+
+// GetQuote 取实时行情：先查缓存，miss 则走数据源，成功后落库并回种缓存。
+func (s *MarketService) GetQuote(ctx context.Context, market, symbol string) (*datasource.Quote, error) {
+	cacheKey := "quote:" + market + ":" + symbol
+
+	if cached, ok := common.RedisGet(cacheKey); ok {
+		var q datasource.Quote
+		if json.Unmarshal([]byte(cached), &q) == nil {
+			return &q, nil
+		}
+	}
+
+	q, err := s.mgr.GetQuote(ctx, market, symbol)
+	if err != nil {
+		return nil, err
+	}
+
+	// 落库：股票基础信息 + 最新行情快照（按 symbol+market 覆盖更新）。
+	s.persist(q)
+
+	if b, err := json.Marshal(q); err == nil {
+		common.RedisSet(cacheKey, string(b), quoteCacheTTL)
+	}
+	return q, nil
+}
+
+// GetDailyBars 取日线序列（暂不缓存，数据量大且变动低频，后续可加）。
+func (s *MarketService) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]datasource.Bar, error) {
+	return s.mgr.GetDailyBars(ctx, market, symbol, limit)
+}
+
+func (s *MarketService) persist(q *datasource.Quote) {
+	if common.DB == nil {
+		return
+	}
+	// upsert stock
+	stock := model.Stock{Symbol: q.Symbol, Market: q.Market, Name: q.Name}
+	if err := common.DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "symbol"}, {Name: "market"}},
+		DoUpdates: clause.AssignmentColumns([]string{"name", "updated_at"}),
+	}).Create(&stock).Error; err != nil {
+		common.SysWarn("落库 stock 失败 %s: %v", q.Symbol, err)
+	}
+
+	// upsert quote 快照
+	quote := model.StockQuote{
+		Symbol: q.Symbol, Market: q.Market, Price: q.Price, ChangePct: q.ChangePct,
+		Open: q.Open, High: q.High, Low: q.Low, PrevClose: q.PrevClose,
+		Volume: q.Volume, Amount: q.Amount, Source: q.Source, DataTime: q.DataTime,
+	}
+	if err := common.DB.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "symbol"}, {Name: "market"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"price", "change_pct", "open", "high", "low", "prev_close",
+			"volume", "amount", "source", "data_time", "updated_at",
+		}),
+	}).Create(&quote).Error; err != nil && err != gorm.ErrEmptySlice {
+		common.SysWarn("落库 quote 失败 %s: %v", q.Symbol, err)
+	}
+}

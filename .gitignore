@@ -33,3 +33,10 @@ dist/
 # ===== Claude / 工具 =====
 .claude/
 plans/
+
+# ===== 前端 embed 产物 =====
+# 必须放在所有广义 dist 规则之后：先重新包含目录，再忽略其构建产物，仅保留占位 index.html。
+# （git 规则：父目录被忽略时无法用 negation 重新包含子文件，故顺序关键。）
+!/server/web/dist/
+/server/web/dist/*
+!/server/web/dist/index.html
