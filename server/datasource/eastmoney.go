@@ -57,8 +57,8 @@ func (e *EastMoneyAdapter) GetQuote(ctx context.Context, market, symbol string) 
 	}
 
 	url := fmt.Sprintf(
-		"https://push2.eastmoney.com/api/qt/stock/get?secid=%s&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60,f169,f170&invt=2&fltt=2",
-		secid,
+		"https://%d.push2.eastmoney.com/api/qt/stock/get?secid=%s&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60,f169,f170&invt=2&fltt=2",
+		emNode(), secid,
 	)
 	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
 	if err != nil {
@@ -131,8 +131,8 @@ func (e *EastMoneyAdapter) GetDailyBars(ctx context.Context, market, symbol stri
 
 	// klt=101 日线，fqt=1 前复权。
 	url := fmt.Sprintf(
-		"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1&fields2=f51,f52,f53,f54,f55,f56,f57&klt=101&fqt=1&end=20500101&lmt=%d",
-		secid, limit,
+		"https://%d.push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1&fields2=f51,f52,f53,f54,f55,f56,f57&klt=101&fqt=1&end=20500101&lmt=%d",
+		emNode(), secid, limit,
 	)
 	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
 	if err != nil {
@@ -180,8 +180,8 @@ func (e *EastMoneyAdapter) GetSectorRanking(ctx context.Context, market string, 
 		limit = 10
 	}
 	url := fmt.Sprintf(
-		"https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=%d&po=1&fid=f3&fltt=2&fs=m:90+t:2&fields=f12,f14,f3,f128",
-		limit,
+		"https://%d.push2.eastmoney.com/api/qt/clist/get?pn=1&pz=%d&po=1&fid=f3&fltt=2&fs=m:90+t:2&fields=f12,f14,f3,f128",
+		emNode(), limit,
 	)
 	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
 	if err != nil {
