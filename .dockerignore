@@ -1,0 +1,14 @@
+# 构建上下文裁剪：避免把依赖、产物、密钥拷进镜像层
+.git
+**/node_modules
+web/dist
+server/web/dist
+server/quantvista
+server/*.exe
+*.db
+*.db-journal
+deploy/.env
+docs
+*.md
+.claude
+plans
