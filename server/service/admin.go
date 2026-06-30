@@ -1,0 +1,106 @@
+package service
+
+import (
+	"errors"
+
+	"quantvista/common"
+	"quantvista/model"
+	"quantvista/setting"
+)
+
+type AdminService struct{}
+
+func NewAdminService() *AdminService { return &AdminService{} }
+
+// SystemSettingsView 后台系统设置视图（不泄露 GitHub secret 本身）。
+type SystemSettingsView struct {
+	RegistrationOpen   bool   `json:"registration_open"`
+	GitHubOAuthEnabled bool   `json:"github_oauth_enabled"`
+	GitHubClientID     string `json:"github_client_id"`
+	HasGitHubSecret    bool   `json:"has_github_secret"`
+}
+
+// GetSettings 读取当前系统设置。
+func (s *AdminService) GetSettings() SystemSettingsView {
+	return SystemSettingsView{
+		RegistrationOpen:   setting.RegistrationOpen(),
+		GitHubOAuthEnabled: setting.GitHubOAuthEnabled(),
+		GitHubClientID:     setting.GitHubClientID(),
+		HasGitHubSecret:    setting.HasGitHubSecret(),
+	}
+}
+
+// UpdateSettingsInput 部分更新；指针为 nil 表示该项不变。GitHubClientSecret 为空字符串表示保留原值。
+type UpdateSettingsInput struct {
+	RegistrationOpen   *bool   `json:"registration_open"`
+	GitHubOAuthEnabled *bool   `json:"github_oauth_enabled"`
+	GitHubClientID     *string `json:"github_client_id"`
+	GitHubClientSecret *string `json:"github_client_secret"`
+}
+
+// UpdateSettings 应用系统设置变更。
+func (s *AdminService) UpdateSettings(in UpdateSettingsInput) (SystemSettingsView, error) {
+	if in.RegistrationOpen != nil {
+		if err := setting.SetRegistrationOpen(*in.RegistrationOpen); err != nil {
+			return SystemSettingsView{}, err
+		}
+	}
+
+	// GitHub 凭证：任一项被提供则统一走 SetGitHubOAuth（secret 空串保留原值）。
+	if in.GitHubClientID != nil || in.GitHubClientSecret != nil || in.GitHubOAuthEnabled != nil {
+		clientID := setting.GitHubClientID()
+		if in.GitHubClientID != nil {
+			clientID = *in.GitHubClientID
+		}
+		secret := "" // 空表示保留原值
+		if in.GitHubClientSecret != nil {
+			secret = *in.GitHubClientSecret
+		}
+		enabled := setting.GitHubOAuthEnabled()
+		if in.GitHubOAuthEnabled != nil {
+			enabled = *in.GitHubOAuthEnabled
+		}
+		if enabled && clientID == "" {
+			return SystemSettingsView{}, errors.New("启用 GitHub 登录前必须配置 client_id")
+		}
+		if err := setting.SetGitHubOAuth(clientID, secret, enabled); err != nil {
+			return SystemSettingsView{}, err
+		}
+	}
+	return s.GetSettings(), nil
+}
+
+// ---- 用户管理 ----
+
+// ListUsers 列出全部用户（不含密码）。
+func (s *AdminService) ListUsers() ([]model.User, error) {
+	var users []model.User
+	if err := common.DB.Order("id asc").Find(&users).Error; err != nil {
+		return nil, err
+	}
+	for i := range users {
+		users[i].Password = ""
+	}
+	return users, nil
+}
+
+// SetUserStatus 启用/禁用用户。禁用时吊销其全部刷新令牌（强制登出）。
+func (s *AdminService) SetUserStatus(operatorID, targetID int64, status string) error {
+	if status != model.StatusEnabled && status != model.StatusDisabled {
+		return errors.New("非法的状态值")
+	}
+	if operatorID == targetID {
+		return errors.New("不能修改自己的账号状态")
+	}
+	var target model.User
+	if err := common.DB.First(&target, targetID).Error; err != nil {
+		return errors.New("用户不存在")
+	}
+	if err := common.DB.Model(&target).Update("status", status).Error; err != nil {
+		return err
+	}
+	if status == model.StatusDisabled {
+		_ = NewAuthService().RevokeAllForUser(targetID)
+	}
+	return nil
+}
