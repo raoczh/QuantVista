@@ -123,3 +123,13 @@
 | 个股榜单 | 腾讯 | `proxy.finance.qq.com/cgi/.../getBoardRankList` | ⏳ 候选（参数待调） |
 
 > 资金流的反爬（同花顺 hexin-v）是接入门槛最高的一项，做"资金流"卡片前需专门处理 cookie/token 流程，或改用东财资金流 clist 字段（`f62` 等）规避。
+
+### 6.1 稳定性分级（实测结论）
+
+按"是否无脑 Go 直连（免 token/cookie/反爬）"分三档：
+
+- **A 档·稳定免鉴权（已全部接入为行情链路）**：东财（`*.push2.eastmoney.com`）、腾讯（`qt.gtimg.cn`）、新浪（`hq.sinajs.cn` + `money.finance` 日线 + `Market_Center` 榜单）。三源互备，行情够用。
+- **B 档·同源免鉴权但限流（按需扩数据类型）**：**东财数据中心 `data.eastmoney.com` / `push2.eastmoney.com clist`** —— 北向资金、龙虎榜、资金流（`f62` 等字段）、财报、研报、板块全在这，**免 token、数据最全**，代价是扛东财限流（已用数字子域名轮询缓解）。扩"资金流/北向/龙虎榜/财报"优先走这。
+- **C 档·需鉴权/反爬（按需、非无脑）**：巨潮 `webapi.cninfo.com.cn`（财务/基本面，需 token，实测 451）、雪球 `stock.xueqiu.com`（需 `xq_a_token` cookie，会过期）、同花顺 `data.10jqka.com.cn`（hexin-v 反爬）。巨潮另有**公告披露** `www.cninfo.com.cn/new/disclosure`（免 token，做"公告/财报观察点"时可用）。
+
+> 一句话：**稳定免维护的只有东财/新浪/腾讯三个行情源（已接入）**；要扩更多数据类型，优先用同属东财、免 token 的 `data.eastmoney.com`，扛住限流即可；巨潮/雪球/同花顺都带鉴权门槛，按需再接。
