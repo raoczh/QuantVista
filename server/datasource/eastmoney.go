@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -60,20 +59,12 @@ func (e *EastMoneyAdapter) GetQuote(ctx context.Context, market, symbol string) 
 		"https://push2.eastmoney.com/api/qt/stock/get?secid=%s&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60,f169,f170&invt=2&fltt=2",
 		secid,
 	)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	req.Header.Set("User-Agent", browserUA)
-
-	resp, err := httpClient.Do(req)
+	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: http %d", ErrUpstream, resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
 	}
 
 	var parsed emQuoteResp
@@ -142,20 +133,12 @@ func (e *EastMoneyAdapter) GetDailyBars(ctx context.Context, market, symbol stri
 		"https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1&fields2=f51,f52,f53,f54,f55,f56,f57&klt=101&fqt=1&end=20500101&lmt=%d",
 		secid, limit,
 	)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	req.Header.Set("User-Agent", browserUA)
-
-	resp, err := httpClient.Do(req)
+	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: http %d", ErrUpstream, resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
 	}
 
 	var parsed emKlineResp
