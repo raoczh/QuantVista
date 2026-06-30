@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from 'vue'
+import { ref, onMounted, nextTick, watch } from 'vue'
 import {
   NCard,
   NSpace,
@@ -13,9 +13,12 @@ import {
   useMessage,
 } from 'naive-ui'
 import * as echarts from 'echarts'
+import { storeToRefs } from 'pinia'
 import { getQuote, getDailyBars, type Quote, type Bar } from '@/api/market'
+import { useThemeStore } from '@/stores/theme'
 
 const message = useMessage()
+const { isDark } = storeToRefs(useThemeStore())
 
 const market = ref('cn')
 const symbol = ref('600000')
@@ -23,6 +26,7 @@ const quote = ref<Quote | null>(null)
 const loading = ref(false)
 const chartEl = ref<HTMLDivElement | null>(null)
 let chart: echarts.ECharts | null = null
+const lastBars = ref<Bar[]>([])
 
 async function load() {
   if (!symbol.value.trim()) {
@@ -33,6 +37,7 @@ async function load() {
   try {
     quote.value = await getQuote(market.value, symbol.value.trim())
     const bars = await getDailyBars(market.value, symbol.value.trim(), 120)
+    lastBars.value = bars
     await nextTick()
     renderChart(bars)
   } catch (e) {
@@ -45,7 +50,12 @@ async function load() {
 
 function renderChart(bars: Bar[]) {
   if (!chartEl.value) return
-  if (!chart) chart = echarts.init(chartEl.value, 'dark')
+  // ECharts 主题在 init 时固定，主题切换需 dispose 后按当前明暗重建。
+  if (chart) {
+    chart.dispose()
+    chart = null
+  }
+  chart = echarts.init(chartEl.value, isDark.value ? 'dark' : undefined)
   chart.setOption({
     backgroundColor: 'transparent',
     tooltip: { trigger: 'axis' },
@@ -61,6 +71,11 @@ function renderChart(bars: Bar[]) {
     ],
   })
 }
+
+// 主题切换时用最近一次数据重建图表，保持与全局主题一致。
+watch(isDark, () => {
+  if (lastBars.value.length) renderChart(lastBars.value)
+})
 
 function fmt(n: number | undefined) {
   return n == null ? '-' : n.toFixed(2)
