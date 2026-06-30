@@ -20,7 +20,7 @@ Go API Server
   +-- Settings Service
   +-- Job Service
   |
-  +-- PostgreSQL / SQLite / MySQL
+  +-- MySQL（生产，宝塔托管）/ SQLite（开发）
   +-- Redis
   +-- 外部行情、新闻、财务、宏观数据源
   +-- 外部 LLM Provider
@@ -57,7 +57,7 @@ Go API Server
 - 语言：Go
 - Web 框架：Gin
 - ORM：GORM
-- 数据库：开发 SQLite，生产 PostgreSQL，兼容 MySQL
+- 数据库：开发 SQLite，生产 MySQL（宝塔托管，与 new-api 同实例不同库）；PostgreSQL 仅 GORM 兼容，不主推
 - 缓存：Redis
 - 认证：JWT + GitHub OAuth
 - 定时任务：Go 内部任务调度，后续可扩展队列
@@ -85,7 +85,7 @@ Go API Server
 - Pinia
 - Vue Router
 - ECharts
-- Naive UI 或 Element Plus
+- Naive UI
 - Axios 或 Fetch 封装
 
 页面风格：
@@ -105,6 +105,8 @@ Go API Server
 - JWT 签发与刷新。
 - 用户资料同步。
 - 用户权限判断。
+
+> 与 new-api 的差异：本项目定位个人自用，GitHub OAuth 的 `client_id` / `client_secret` 直接从**环境变量**读取（`GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`，见 `deploy/.env`），不存数据库 option、不做运行时可改。因此 `oauth/github` 的凭证读取逻辑不能照搬 new-api（它存 DB 设置项），其余流程（换 token、拉用户、建号）可参考。
 
 接口示例：
 
@@ -133,7 +135,7 @@ Go API Server
    DataSourceAdapter 接口
         ^
    +----+----+----+
-  akshare yfinance ...   <- MVP 只实现一个
+  东方财富  新浪 ...     <- MVP 先实现东财，新浪做备份/校验
 ```
 
 - 上层（缓存、AI、追踪）只依赖**内部标准结构**，不感知具体数据源。
