@@ -34,6 +34,50 @@ export interface Bar {
   amount: number
 }
 
+export interface Index {
+  code: string
+  name: string
+  price: number
+  change_pct: number
+  open: number
+  high: number
+  low: number
+  prev_close: number
+  source: string
+  data_time: string
+}
+
+export interface StockRank {
+  symbol: string
+  name: string
+  price: number
+  change_pct: number
+  amount: number
+  turnover_rate: number
+  source: string
+}
+
+export interface SectorRank {
+  code: string
+  name: string
+  change_pct: number
+  leader: string
+  source: string
+}
+
+export interface Overview {
+  indices: Index[]
+  gainers: StockRank[]
+  actives: StockRank[]
+  sectors: SectorRank[]
+  errors: Record<string, string>
+  data_time: string
+}
+
+export function getOverview(market = 'cn') {
+  return request<Overview>({ url: `/markets/${market}/overview`, method: 'get' })
+}
+
 export function getStatus() {
   return request<StatusInfo>({ url: '/status', method: 'get' })
 }

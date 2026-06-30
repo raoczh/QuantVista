@@ -70,3 +70,57 @@ func (m *Manager) GetDailyBars(ctx context.Context, market, symbol string, limit
 	common.SysWarn("所有数据源取日线失败 symbol=%s: %v", symbol, lastErr)
 	return nil, lastErr
 }
+
+// GetIndices 路由到实现 IndexProvider 的源（新浪批量优先）。
+func (m *Manager) GetIndices(ctx context.Context, market string) ([]Index, error) {
+	var lastErr error = ErrNotSupported
+	for _, a := range m.adapters {
+		p, ok := a.(IndexProvider)
+		if !ok {
+			continue
+		}
+		r, err := p.GetIndices(ctx, market)
+		if err == nil {
+			return r, nil
+		}
+		common.SysDebug("数据源 %s 取指数失败: %v", a.Name(), err)
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// GetStockRanking 路由到实现 RankingProvider 的源（新浪 Market_Center）。
+func (m *Manager) GetStockRanking(ctx context.Context, market, sort string, limit int) ([]StockRank, error) {
+	var lastErr error = ErrNotSupported
+	for _, a := range m.adapters {
+		p, ok := a.(RankingProvider)
+		if !ok {
+			continue
+		}
+		r, err := p.GetStockRanking(ctx, market, sort, limit)
+		if err == nil {
+			return r, nil
+		}
+		common.SysDebug("数据源 %s 取榜单失败 sort=%s: %v", a.Name(), sort, err)
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// GetSectorRanking 路由到实现 SectorProvider 的源（东财 clist，best-effort）。
+func (m *Manager) GetSectorRanking(ctx context.Context, market string, limit int) ([]SectorRank, error) {
+	var lastErr error = ErrNotSupported
+	for _, a := range m.adapters {
+		p, ok := a.(SectorProvider)
+		if !ok {
+			continue
+		}
+		r, err := p.GetSectorRanking(ctx, market, limit)
+		if err == nil {
+			return r, nil
+		}
+		common.SysDebug("数据源 %s 取板块榜失败: %v", a.Name(), err)
+		lastErr = err
+	}
+	return nil, lastErr
+}
