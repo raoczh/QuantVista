@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,6 +31,14 @@ var httpClient = &http.Client{
 
 const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 	"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+// 东财把行情接口分流到 {1..99}.push2(.his).eastmoney.com 这些负载节点。
+// 轮询节点可分散单节点限流（akshare 同款做法），比裸 push2.eastmoney.com 更不易被掐。
+var emNodeCounter uint32
+
+func emNode() int {
+	return int(atomic.AddUint32(&emNodeCounter, 1)%99) + 1
+}
 
 // doGet 统一 GET：注入浏览器头 + 调用方附加头，对网络瞬时错误(含 EOF)重试一次。
 // 返回原始字节（GBK 等解码交给调用方）。
