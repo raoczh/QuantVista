@@ -141,6 +141,7 @@ Go API Server
 - **MVP 只实现一个市场、一个源**，端到端跑通后再扩展（见 ROADMAP 阶段 0/1）。
 - 每条数据携带 `source` 与 `data_time`；同步失败写 `data_sync_logs`。
 - 日线行情写入 `daily_bars`（OHLC），供追踪与回撤计算使用；公司行为写 `corporate_actions` 用于复权。
+- **Tushare 分档接入**：第一阶段以东财 + 新浪为主，Tushare 非前置；免费档（120，股票清单/日线/交易日历）与低 cost 档（2000，财务三表/复权因子/指数日线，长线财务深度来源）按需启用，高级档（5000，分钟线/融资融券明细等）暂不实现。详见 [数据源选型](docs/DATA_SOURCES.md)。
 
 接口示例：
 

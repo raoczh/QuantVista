@@ -218,6 +218,8 @@
 | source | string | 数据源 |
 | created_at | timestamp | 创建时间 |
 
+> 注：`stock_fundamentals` 填充分两档——轻量版用东财实时估值（PE/PB/市值/股息率及部分实时指标），完整版用 Tushare 低 cost 档（2000 分，财务三表 + 多期财务指标，按需启用）。MVP 不依赖 Tushare，先用轻量版；启用 Tushare 后回填完整字段。
+
 ### market_snapshots
 
 市场快照。
