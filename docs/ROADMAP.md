@@ -282,10 +282,14 @@ AI 调用需要缓存、每用户配额/熔断、频率限制和 token 日志。
 ```text
 QuantVista/
   README.md
+  VERSION             # 版本号，构建时经 ldflags 注入（参照 new-api）
+  Dockerfile          # 单镜像多阶段：bun 构建 web → go:embed 前端产物 → 单二进制（参照 new-api）
   docs/
     PRODUCT_REQUIREMENTS.md
     ARCHITECTURE.md
     DATABASE_DESIGN.md
+    DATA_SOURCES.md
+    DEPLOYMENT.md
     ROADMAP.md
   server/
     main.go
@@ -308,8 +312,11 @@ QuantVista/
       pages/
       components/
       charts/
+    dist/            # 构建产物，由后端 go:embed 托管（单容器部署，不单独起 web 容器）
   deploy/
-    docker-compose.yml
-    Dockerfile.server
-    Dockerfile.web
+    docker-compose.yml      # 单 quantvista 服务 + quantvista-redis，MySQL 用宿主机宝塔
+    docker-compose.example.yml
+    .env.example
 ```
+
+> **embed 路径约束（实现时注意）**：`go:embed` 不能引用包目录之外或上层（`..`）路径。上面 `server/main.go` 与 `web/` 是兄弟目录，无法直接 embed `../web/dist`。两种解法二选一：(a) 构建时把 `web/dist` 拷进 server 包内的 embed 目标路径（new-api 的 Dockerfile 即这么做：`COPY --from=webbuilder .../dist ./web/dist`）；(b) 干脆照 new-api 把 `main.go` 放在仓库根、`web/` 作为根的子目录。阶段 0 搭骨架时定一种即可。
