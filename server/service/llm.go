@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -162,8 +163,8 @@ type TestResult struct {
 	Message   string `json:"message"`
 }
 
-// TestByID 测试已保存配置（解密存储的密钥）。
-func (s *LLMService) TestByID(userID, id int64) (*TestResult, error) {
+// TestByID 测试已保存配置（解密存储的密钥）。allowPrivate 由调用方按角色决定（管理员放行内网）。
+func (s *LLMService) TestByID(userID, id int64, allowPrivate bool) (*TestResult, error) {
 	cfg, err := s.getOwned(userID, id)
 	if err != nil {
 		return nil, err
@@ -172,27 +173,33 @@ func (s *LLMService) TestByID(userID, id int64) (*TestResult, error) {
 	if err != nil {
 		return nil, errors.New("密钥解密失败")
 	}
-	return s.testConnection(cfg.Provider, cfg.BaseURL, key, cfg.Model), nil
+	return s.testConnection(cfg.Provider, cfg.BaseURL, key, cfg.Model, allowPrivate), nil
 }
 
 // TestByInput 测试未保存的配置（前端表单即时测试）。
-func (s *LLMService) TestByInput(in LLMConfigInput) (*TestResult, error) {
+func (s *LLMService) TestByInput(in LLMConfigInput, allowPrivate bool) (*TestResult, error) {
 	if in.BaseURL == "" || in.Model == "" || in.APIKey == "" {
 		return nil, errors.New("测试需要 base_url、model 与 api_key")
 	}
-	return s.testConnection(in.Provider, strings.TrimRight(in.BaseURL, "/"), in.APIKey, in.Model), nil
+	return s.testConnection(in.Provider, strings.TrimRight(in.BaseURL, "/"), in.APIKey, in.Model, allowPrivate), nil
 }
 
 // testConnection 目前仅实现 OpenAI 兼容口径（/chat/completions 最小请求）。
 // 其他 provider（如 Anthropic 原生 /v1/messages）在此 switch 留口，后续按需补。
-func (s *LLMService) testConnection(provider, baseURL, apiKey, modelName string) *TestResult {
+func (s *LLMService) testConnection(provider, baseURL, apiKey, modelName string, allowPrivate bool) *TestResult {
 	switch strings.ToLower(provider) {
 	default: // openai 及各类 OpenAI 兼容中转
-		return s.testOpenAICompatible(baseURL, apiKey, modelName)
+		return s.testOpenAICompatible(baseURL, apiKey, modelName, allowPrivate)
 	}
 }
 
-func (s *LLMService) testOpenAICompatible(baseURL, apiKey, modelName string) *TestResult {
+func (s *LLMService) testOpenAICompatible(baseURL, apiKey, modelName string, allowPrivate bool) *TestResult {
+	// 校验 scheme：仅允许 http/https，防 file://、gopher:// 等被利用。
+	u, err := url.Parse(baseURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return &TestResult{OK: false, Message: "Base URL 非法（仅支持 http/https）"}
+	}
+
 	endpoint := baseURL
 	if !strings.HasSuffix(endpoint, "/chat/completions") {
 		endpoint += "/chat/completions"
@@ -213,8 +220,9 @@ func (s *LLMService) testOpenAICompatible(baseURL, apiKey, modelName string) *Te
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
+	client := common.SafeHTTPClient(20*time.Second, allowPrivate) // 防 SSRF（管理员可放行内网自建模型）
 	start := time.Now()
-	res, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	res, err := client.Do(req)
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
 		return &TestResult{OK: false, LatencyMs: latency, Message: "请求失败: " + err.Error()}

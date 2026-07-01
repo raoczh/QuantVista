@@ -69,10 +69,32 @@ func (s *AuthService) CreateAdmin(username, password, ua string) (*TokenPair, er
 		Role:        model.RoleAdmin,
 		Status:      model.StatusEnabled,
 	}
-	if err := common.DB.Create(user).Error; err != nil {
+	// 事务 + options["initialized"] 主键唯一做并发闸：并发首启只会有一个成功。
+	err = common.DB.Transaction(func(tx *gorm.DB) error {
+		var n int64
+		if err := tx.Model(&model.User{}).Count(&n).Error; err != nil {
+			return err
+		}
+		if n > 0 {
+			return errors.New("系统已初始化，禁止重复创建管理员")
+		}
+		if err := tx.Create(&model.Option{Key: "initialized", Value: "true"}).Error; err != nil {
+			return errors.New("系统已初始化，禁止重复创建管理员")
+		}
+		if err := tx.Create(user).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(&model.UserPreference{UserID: user.ID}).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(&model.UserQuota{UserID: user.ID}).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	s.ensurePrefAndQuota(user.ID)
 	return s.issueFor(user, ua)
 }
 
@@ -229,7 +251,7 @@ func StartRefreshTokenJanitor() {
 
 // issueFor 为用户签发 access + refresh，并更新最后登录时间。
 func (s *AuthService) issueFor(user *model.User, ua string) (*TokenPair, error) {
-	access, exp, err := common.IssueAccessToken(user.ID, user.Role)
+	access, exp, err := common.IssueAccessToken(user.ID, user.Role, user.TokenVersion)
 	if err != nil {
 		return nil, err
 	}
