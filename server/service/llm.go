@@ -272,6 +272,36 @@ func (s *LLMService) getOwned(userID, id int64) (*model.LLMConfig, error) {
 	return &cfg, nil
 }
 
+// ResolveForUse 取一份可用于实际调用的 LLM 配置并解密密钥。
+// id>0 取指定配置；id<=0 取默认配置（无默认则取最早一条）。均限本人。
+func (s *LLMService) ResolveForUse(userID, id int64) (*model.LLMConfig, string, error) {
+	var cfg model.LLMConfig
+	if id > 0 {
+		c, err := s.getOwned(userID, id)
+		if err != nil {
+			return nil, "", err
+		}
+		cfg = *c
+	} else {
+		err := common.DB.Where("user_id = ?", userID).
+			Order("is_default DESC, id ASC").First(&cfg).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, "", errors.New("尚未配置任何 LLM，请先在设置中添加")
+		}
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	key, err := common.Decrypt(cfg.APIKeyCipher)
+	if err != nil {
+		return nil, "", errors.New("密钥解密失败")
+	}
+	if strings.TrimSpace(key) == "" {
+		return nil, "", errors.New("该 LLM 配置缺少 API Key，请先补全")
+	}
+	return &cfg, key, nil
+}
+
 func (s *LLMService) clearOtherDefaults(userID, keepID int64) {
 	common.DB.Model(&model.LLMConfig{}).
 		Where("user_id = ? AND id <> ?", userID, keepID).

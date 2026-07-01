@@ -23,6 +23,7 @@ func AllModels() []any {
 		&Watchlist{},
 		&WatchlistItem{},
 		&Position{},
+		&AnalysisRecord{},
 	}
 }
 
