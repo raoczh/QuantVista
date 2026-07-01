@@ -8,7 +8,8 @@
 - **阶段 1：用户与设置：已完成 ✅**。GitHub OAuth + 密码登录、JWT(access) + refresh token 落库可吊销、首启建管理员引导、DB 系统设置(注册开关 + GitHub 凭证落库)、LLM 配置增删改查 + 测试连接(OpenAI 兼容)、用户偏好、每用户配额表、管理员后台。后端 API 全链路实测通过，前端 vue-tsc 类型检查通过、生产镜像(64.9MB)托管真实 SPA 实测。
 - **阶段 2：市场数据与首页：已完成 ✅**。市场看板（指数/涨幅/热门/板块 + 涨跌家数情绪 + 两市资金流），日线批量同步（已跟踪股票，节流 + data_sync_logs 审计）、完整交易日历回填（上证指数推导开市日 + 补休市日）、市场情绪快照表（去重落库形成历史）。涨跌家数(东财 getTopicZDFenBu)与资金流(东财 fflow/kline)均端到端实测 + fixture 单测；全部后台定时任务与管理员维护端点实测通过。
 - **阶段 3：自选股与持仓：已完成 ✅**。自选股分组增删改 + 条目增删改备注/关注原因/重点关注（置顶）+ 实时行情富化；已购入持仓增删改查 + 从自选一键建仓 + 短线/长线分类 + 实时盈亏（成本含买入费税，已平仓算已实现收益）+ 标记卖出与复盘。全部按 user_id 隔离，后端 CRUD/校验/盈亏计算端到端实测、前端 vue-tsc 通过、SPA 托管与鉴权保护实测。
-- **下一步：阶段 4（AI 分析中心）**。
+- **阶段 4：AI 分析中心：已完成 ✅**。五个分析模块（个股/全市场/板块/自选股/持仓），**分模块定制的精确提示词**（个股=技术面且明示无基本面数据、全市场=情绪+资金+风格、板块=轮动、自选=清单点评、持仓=组合风险）。数据上下文分级注入 + 软预算裁剪 + 可复现快照；调用用户 LLM 配置（JSON mode 优先，不支持则自动 fallback）；结构化输出校验 + 最多 2 次 repair + 校验始终不过时优雅降级为原文（不写脏结构化数据）；分析历史落库（含 data_snapshot 与 prompt/策略版本号，可复现）；token 统计 + 每用户配额熔断；发起分析限流 20/min。SSRF 防护复用 SafeHTTPClient（仅管理员可触达内网自建模型）。后端 build/vet/test 全绿（含 AI 客户端 mock 端到端、结构化解析、SSRF 拦截、JSON mode 降级、History 列名/用户隔离/配额落库集成测试），前端 vue-tsc + vite build 通过。
+- **下一步：阶段 5（短线/长线推荐）**。
 
 > 进度标记约定：每完成一个阶段，更新本区块 + 给对应阶段标题打 ✅，便于新会话快速恢复。
 
@@ -114,27 +115,29 @@
 - 用户可以将股票标记为已购入。✅
 - 持仓页面可以展示短线和长线分类。✅（类型筛选 + 类型标签）
 
-## 阶段 4：AI 分析中心
+## 阶段 4：AI 分析中心 ✅ 已完成
+
+> **实现要点（落地后补充）**：五模块（market/sector/stock/watchlist/position），**系统提示词严格分模块**（`service/analysis.go` 的 `moduleGuidance` 映射），每个模块的分析维度与实际注入的数据字段一一对应，个股明确声明「无财务/新闻数据、以技术面为主、不得虚构基本面」。数据上下文组装在 `service/analysis_context.go`（个股含 MA5/10/20、区间高低、近 5/20 日涨跌、近 30 根日线明细；软预算 8000 字符，超限先丢逐日明细再截断列表）。AI 调用 `service/ai_client.go` 走 OpenAI 兼容 `/chat/completions`，`response_format=json_object` 优先、服务端不支持（4xx 命中关键字）则去掉重试；复用 `common.SafeHTTPClient` 防 SSRF（仅 admin 放行内网）。结构化校验 `parseAnalysisResult`（容忍代码块包裹、中文枚举归一、confidence 钳制、数组兜底、disclaimer 回退），失败最多 repair 2 次，仍不过则降级存原文（status=degraded，不伪造结构化字段）。落库 `analysis_records`（重字段 result_json/data_snapshot 列表查询用 `Select` 排除）。配额在 `user_quota` 累计 token/request，`TokenLimit>0 且已用尽`则熔断（0=不限）。
 
 目标：完成可配置的 AI 分析。
 
 任务：
 
-- 分析请求接口。
-- 市场、板块、个股、自选股、持仓等分析模块。
-- 组装数据上下文（含上下文 token 预算与分级注入）。
-- 调用用户 LLM 配置（function calling / JSON mode 优先，不支持则 fallback）。
-- 结构化输出校验 + 有限次 repair 重试 + 优雅降级。
-- 保存分析历史（含 data_snapshot 与 prompt/策略/评分版本号）。
-- AI 调用日志和 token 统计、每用户配额熔断。
-- 前端分析中心页面。
+- 分析请求接口。✅（`POST /api/analysis`，限流 20/min）
+- 市场、板块、个股、自选股、持仓等分析模块。✅（五模块，分模块提示词）
+- 组装数据上下文（含上下文 token 预算与分级注入）。✅（`analysis_context.go`，软预算 + 分级裁剪）
+- 调用用户 LLM 配置（function calling / JSON mode 优先，不支持则 fallback）。✅（JSON mode + 自动 fallback；function calling 暂未用，JSON mode 已足够）
+- 结构化输出校验 + 有限次 repair 重试 + 优雅降级。✅（校验 + 2 次 repair + 降级存原文）
+- 保存分析历史（含 data_snapshot 与 prompt/策略/评分版本号）。✅（`data_snapshot` + `prompt_version`/`strategy_version`）
+- AI 调用日志和 token 统计、每用户配额熔断。✅（token/request 落 `user_quota`，额度用尽熔断）
+- 前端分析中心页面。✅（`Analysis.vue`：模块/标的/LLM 选择 + 结构化结果展示 + 历史 + 详情复现）
 
 验收：
 
-- 用户可以选择模块发起 AI 分析。
-- 分析结果持久化，且可凭版本号复现。
-- 分析历史可查询。
-- 失败时能看到明确错误；结构化校验失败时优雅降级而非写脏数据。
+- 用户可以选择模块发起 AI 分析。✅
+- 分析结果持久化，且可凭版本号复现。✅（快照 + 版本号落库，详情可回看）
+- 分析历史可查询。✅
+- 失败时能看到明确错误；结构化校验失败时优雅降级而非写脏数据。✅
 
 ## 阶段 5：短线/长线推荐
 

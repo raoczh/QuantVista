@@ -14,7 +14,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/', name: 'home', component: Home, meta: { title: '市场首页' } },
   { path: '/watchlist', name: 'watchlist', component: () => import('@/pages/Watchlist.vue'), meta: { title: '自选股' } },
   { path: '/positions', name: 'positions', component: () => import('@/pages/Positions.vue'), meta: { title: '持仓' } },
-  { path: '/analysis', name: 'analysis', component: Placeholder, meta: { title: 'AI 分析' } },
+  { path: '/analysis', name: 'analysis', component: () => import('@/pages/Analysis.vue'), meta: { title: 'AI 分析' } },
   { path: '/recommendations', name: 'recommendations', component: Placeholder, meta: { title: '推荐追踪' } },
   { path: '/settings', name: 'settings', component: () => import('@/pages/Settings.vue'), meta: { title: '设置' } },
   { path: '/admin', name: 'admin', component: () => import('@/pages/AdminSettings.vue'), meta: { title: '管理后台', admin: true } },

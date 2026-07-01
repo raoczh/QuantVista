@@ -21,6 +21,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	adminSvc := service.NewAdminService()
 	watchlistSvc := service.NewWatchlistService(marketSvc)
 	positionSvc := service.NewPositionService(marketSvc)
+	analysisSvc := service.NewAnalysisService(marketSvc, watchlistSvc, positionSvc, llmSvc)
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc)
@@ -31,6 +32,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	adminCtl := controller.NewAdminController(adminSvc)
 	watchlistCtl := controller.NewWatchlistController(watchlistSvc)
 	positionCtl := controller.NewPositionController(positionSvc)
+	analysisCtl := controller.NewAnalysisController(analysisSvc)
 
 	api := r.Group("/api")
 	{
@@ -112,6 +114,15 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				positions.PUT("/:id", positionCtl.Update)
 				positions.DELETE("/:id", positionCtl.Delete)
 				positions.POST("/:id/close", positionCtl.Close)
+			}
+
+			// AI 分析中心（按用户隔离；发起分析限流，防止刷爆 LLM 配额与费用）
+			analysis := authed.Group("/analysis")
+			{
+				analysis.POST("", middleware.RateLimit(20, time.Minute), analysisCtl.Create)
+				analysis.GET("", analysisCtl.List)
+				analysis.GET("/:id", analysisCtl.Get)
+				analysis.DELETE("/:id", analysisCtl.Delete)
 			}
 
 			// 管理员后台
