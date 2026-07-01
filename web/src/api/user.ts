@@ -5,7 +5,7 @@ export interface UserPreference {
   user_id: number
   risk_level: string // conservative/balanced/aggressive
   default_market: string // cn/us/hk
-  horizon_pref: string // short_term/long_term
+  horizon_pref: string // short_term/mid_term/long_term
   default_rec_count: number
   enable_notify: boolean
 }

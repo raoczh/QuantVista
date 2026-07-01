@@ -55,6 +55,11 @@ func (m *Manager) GetDailyBars(ctx context.Context, market, symbol string, limit
 	for _, a := range m.adapters {
 		bars, err := a.GetDailyBars(ctx, market, symbol, limit)
 		if err == nil {
+			for i := range bars {
+				if bars[i].Source == "" {
+					bars[i].Source = a.Name()
+				}
+			}
 			return bars, nil
 		}
 		if errors.Is(err, ErrSymbolInvalid) {

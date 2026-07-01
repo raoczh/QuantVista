@@ -17,6 +17,7 @@ func AllModels() []any {
 		&Stock{},
 		&StockQuote{},
 		&DailyBar{},
+		&TradingCalendar{},
 	}
 }
 
