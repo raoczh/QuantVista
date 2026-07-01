@@ -31,6 +31,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	scoreSvc := service.NewScoreService(marketSvc)
 	paperSvc := service.NewPaperService(marketSvc)
 	notifySvc := service.NewNotifyService()
+	promptSvc := service.NewPromptService()
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc, scoreSvc)
@@ -49,6 +50,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	compareCtl := controller.NewCompareController(compareSvc)
 	paperCtl := controller.NewPaperController(paperSvc)
 	notifyCtl := controller.NewNotifyController(notifySvc)
+	promptCtl := controller.NewPromptController(promptSvc)
 
 	api := r.Group("/api")
 	{
@@ -197,6 +199,15 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				notify.PUT("/:id", notifyCtl.Update)
 				notify.DELETE("/:id", notifyCtl.Delete)
 				notify.POST("/:id/test", middleware.RateLimit(10, time.Minute), notifyCtl.Test)
+			}
+
+			// 自定义分析提示词模板（启用后覆盖对应模块默认指引）
+			prompts := authed.Group("/prompt-templates")
+			{
+				prompts.GET("/modules", promptCtl.Modules)
+				prompts.GET("", promptCtl.List)
+				prompts.POST("", promptCtl.Upsert)
+				prompts.DELETE("/:id", promptCtl.Delete)
 			}
 
 			// 管理员后台
