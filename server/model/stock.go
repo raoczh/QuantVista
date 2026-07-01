@@ -28,8 +28,8 @@ type StockQuote struct {
 	PrevClose float64   `gorm:"type:decimal(20,4)" json:"prev_close"`
 	Volume    int64     `json:"volume"`
 	Amount    float64   `gorm:"type:decimal(24,4)" json:"amount"`
-	Source    string    `gorm:"size:16" json:"source"`    // 数据来源：eastmoney/sina
-	DataTime  time.Time `json:"data_time"`                // 数据时间，AI 分析需明确告知
+	Source    string    `gorm:"size:16" json:"source"` // 数据来源：eastmoney/sina
+	DataTime  time.Time `json:"data_time"`             // 数据时间，AI 分析需明确告知
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
@@ -46,5 +46,14 @@ type DailyBar struct {
 	Volume    int64     `json:"volume"`
 	Amount    float64   `gorm:"type:decimal(24,4)" json:"amount"`
 	Source    string    `gorm:"size:16" json:"source"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// TradingCalendar 交易日历，用于按交易日计算有效期、持有周期和数据新鲜度。
+type TradingCalendar struct {
+	ID        int64     `gorm:"primaryKey" json:"id"`
+	Market    string    `gorm:"size:8;index:idx_calendar_market_date,unique" json:"market"`
+	TradeDate string    `gorm:"size:10;index:idx_calendar_market_date,unique" json:"trade_date"` // YYYY-MM-DD
+	IsOpen    bool      `gorm:"default:true" json:"is_open"`
 	CreatedAt time.Time `json:"created_at"`
 }

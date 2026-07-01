@@ -34,26 +34,27 @@ type Bar struct {
 	Close     float64 `json:"close"`
 	Volume    int64   `json:"volume"`
 	Amount    float64 `json:"amount"`
+	Source    string  `json:"source"` // 实际命中的数据源
 }
 
 // Fundamental 基本面摘要（骨架占位，阶段 4/5 扩展）。
 type Fundamental struct {
-	Symbol   string    `json:"symbol"`
-	Market   string    `json:"market"`
-	PE       float64   `json:"pe"`
-	PB       float64   `json:"pb"`
-	MarketCap float64  `json:"market_cap"`
-	Source   string    `json:"source"`
-	DataTime time.Time `json:"data_time"`
+	Symbol    string    `json:"symbol"`
+	Market    string    `json:"market"`
+	PE        float64   `json:"pe"`
+	PB        float64   `json:"pb"`
+	MarketCap float64   `json:"market_cap"`
+	Source    string    `json:"source"`
+	DataTime  time.Time `json:"data_time"`
 }
 
 // News 新闻条目（骨架占位）。
 type News struct {
-	Title    string    `json:"title"`
-	URL      string    `json:"url"`
-	Summary  string    `json:"summary"`
-	Source   string    `json:"source"`
-	PubTime  time.Time `json:"pub_time"`
+	Title   string    `json:"title"`
+	URL     string    `json:"url"`
+	Summary string    `json:"summary"`
+	Source  string    `json:"source"`
+	PubTime time.Time `json:"pub_time"`
 }
 
 // Index 指数行情（市场首页指数概览用）。

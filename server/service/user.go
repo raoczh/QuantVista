@@ -41,11 +41,33 @@ type PreferenceInput struct {
 	EnableNotify    bool   `json:"enable_notify"`
 }
 
+const (
+	HorizonShortTerm = "short_term"
+	HorizonMidTerm   = "mid_term"
+	HorizonLongTerm  = "long_term"
+
+	RecommendationTypeShortTerm = "short_term"
+	RecommendationTypeLongTerm  = "long_term"
+)
+
 var (
 	validRisk    = map[string]bool{"conservative": true, "balanced": true, "aggressive": true}
 	validMarket  = map[string]bool{"cn": true, "us": true, "hk": true}
-	validHorizon = map[string]bool{"short_term": true, "mid_term": true, "long_term": true}
+	validHorizon = map[string]bool{HorizonShortTerm: true, HorizonMidTerm: true, HorizonLongTerm: true}
 )
+
+// RecommendationTypeForHorizon 将用户周期偏好映射到落库推荐类型。
+// mid_term 只作为偏好存在，推荐记录仍写入 short_term / long_term。
+func RecommendationTypeForHorizon(horizon string) string {
+	switch horizon {
+	case HorizonShortTerm:
+		return RecommendationTypeShortTerm
+	case HorizonMidTerm, HorizonLongTerm:
+		return RecommendationTypeLongTerm
+	default:
+		return RecommendationTypeLongTerm
+	}
+}
 
 // UpdatePreference 校验并更新用户偏好。
 func (s *UserService) UpdatePreference(userID int64, in PreferenceInput) (*model.UserPreference, error) {
