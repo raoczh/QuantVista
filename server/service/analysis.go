@@ -103,7 +103,7 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	snapshotJSON, _ := json.Marshal(actx.Snapshot)
 
 	// 4) 构造消息并调用 + 结构化校验/repair。
-	messages := s.buildMessages(req, actx, string(snapshotJSON))
+	messages := s.buildMessages(userID, req, actx, string(snapshotJSON))
 	rec := &model.AnalysisRecord{
 		UserID:          userID,
 		Module:          req.Module,
@@ -304,8 +304,8 @@ func (s *AnalysisService) addUsage(userID int64, tokens int) {
 
 // --- prompt 构造与结果校验 ---
 
-// buildMessages 组装系统提示 + 用户消息（含数据快照 JSON）。系统提示按模块定制。
-func (s *AnalysisService) buildMessages(req AnalyzeRequest, actx *analysisContext, snapshotJSON string) []chatMessage {
+// buildMessages 组装系统提示 + 用户消息（含数据快照 JSON）。系统提示按模块定制，且尊重用户自定义模板。
+func (s *AnalysisService) buildMessages(userID int64, req AnalyzeRequest, actx *analysisContext, snapshotJSON string) []chatMessage {
 	var b strings.Builder
 	fmt.Fprintf(&b, "请对以下【%s】进行分析。\n\n", s.title(req.Module, actx.Label))
 	if q := strings.TrimSpace(req.Question); q != "" {
@@ -316,14 +316,19 @@ func (s *AnalysisService) buildMessages(req AnalyzeRequest, actx *analysisContex
 	b.WriteString("\n\n请严格按系统要求的 JSON schema 输出，只依据以上数据分析。")
 
 	return []chatMessage{
-		{Role: "system", Content: analysisSystemPrompt(req.Module)},
+		{Role: "system", Content: analysisSystemPrompt(userID, req.Module)},
 		{Role: "user", Content: b.String()},
 	}
 }
 
 // analysisSystemPrompt 按模块拼接系统提示：通用身份 + 模块专属分析维度 + 通用输出/合规约束。
-func analysisSystemPrompt(module string) string {
-	return analysisRoleIntro + "\n\n" + moduleGuidance[module] + "\n\n" + analysisOutputSpec
+// 若用户为该模块启用了自定义模板，则用其替换默认分析维度指引。
+func analysisSystemPrompt(userID int64, module string) string {
+	guidance := moduleGuidance[module]
+	if custom := userPromptOverride(userID, module); custom != "" {
+		guidance = custom
+	}
+	return analysisRoleIntro + "\n\n" + guidance + "\n\n" + analysisOutputSpec
 }
 
 // analysisRoleIntro 通用身份与总纲。
