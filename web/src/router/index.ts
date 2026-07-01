@@ -16,6 +16,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/positions', name: 'positions', component: () => import('@/pages/Positions.vue'), meta: { title: '持仓' } },
   { path: '/analysis', name: 'analysis', component: () => import('@/pages/Analysis.vue'), meta: { title: 'AI 分析' } },
   { path: '/recommendations', name: 'recommendations', component: () => import('@/pages/Recommendations.vue'), meta: { title: '推荐追踪' } },
+  { path: '/alerts', name: 'alerts', component: () => import('@/pages/Alerts.vue'), meta: { title: '条件提醒' } },
   { path: '/settings', name: 'settings', component: () => import('@/pages/Settings.vue'), meta: { title: '设置' } },
   { path: '/admin', name: 'admin', component: () => import('@/pages/AdminSettings.vue'), meta: { title: '管理后台', admin: true } },
   { path: '/:pathMatch(.*)*', name: 'notfound', component: Placeholder, meta: { title: '未找到' } },

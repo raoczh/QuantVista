@@ -24,6 +24,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	analysisSvc := service.NewAnalysisService(marketSvc, watchlistSvc, positionSvc, llmSvc)
 	recommendationSvc := service.NewRecommendationService(marketSvc, watchlistSvc, llmSvc)
 	trackingSvc := service.NewTrackingService(marketSvc)
+	alertSvc := service.NewAlertService(marketSvc)
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc)
@@ -36,6 +37,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	positionCtl := controller.NewPositionController(positionSvc)
 	analysisCtl := controller.NewAnalysisController(analysisSvc)
 	recommendationCtl := controller.NewRecommendationController(recommendationSvc, trackingSvc)
+	alertCtl := controller.NewAlertController(alertSvc)
 
 	api := r.Group("/api")
 	{
@@ -138,6 +140,17 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				recommendations.GET("/:id", recommendationCtl.Get)
 				recommendations.POST("/:id/track", recommendationCtl.Track)
 				recommendations.DELETE("/:id", recommendationCtl.Delete)
+			}
+
+			// 条件提醒（按用户隔离；命中不推送，仅落库供待办/页面高亮）
+			alerts := authed.Group("/alerts")
+			{
+				alerts.GET("", alertCtl.List)
+				alerts.POST("", alertCtl.Create)
+				alerts.POST("/evaluate", middleware.RateLimit(20, time.Minute), alertCtl.Evaluate)
+				alerts.PUT("/:id", alertCtl.Update)
+				alerts.PUT("/:id/status", alertCtl.SetStatus)
+				alerts.DELETE("/:id", alertCtl.Delete)
 			}
 
 			// 管理员后台
