@@ -60,3 +60,22 @@ func (uc *UserController) GetQuota(c *gin.Context) {
 	}
 	common.ApiSuccess(c, q)
 }
+
+type changePasswordReq struct {
+	OldPassword string `json:"old_password"`
+	NewPassword string `json:"new_password"`
+}
+
+// ChangePassword PUT /api/user/password
+func (uc *UserController) ChangePassword(c *gin.Context) {
+	var req changePasswordReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ApiErrorMsg(c, "请求格式错误")
+		return
+	}
+	if err := uc.svc.ChangePassword(currentUserID(c), req.OldPassword, req.NewPassword); err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, gin.H{"ok": true})
+}

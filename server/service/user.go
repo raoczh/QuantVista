@@ -82,3 +82,30 @@ func (s *UserService) GetQuota(userID int64) (*model.UserQuota, error) {
 	}
 	return &q, nil
 }
+
+// ChangePassword 修改密码。已有密码的账号需校验旧密码；纯 OAuth 账号（无密码）允许首次设置。
+// 成功后吊销该用户全部刷新令牌，强制其它会话重新登录。
+func (s *UserService) ChangePassword(userID int64, oldPw, newPw string) error {
+	if len(newPw) < 8 {
+		return errors.New("新密码至少 8 个字符")
+	}
+	if len(newPw) > 72 {
+		return errors.New("新密码过长（bcrypt 上限 72 字节）")
+	}
+	var u model.User
+	if err := common.DB.First(&u, userID).Error; err != nil {
+		return errors.New("用户不存在")
+	}
+	if u.Password != "" && !common.CheckPassword(u.Password, oldPw) {
+		return errors.New("原密码不正确")
+	}
+	hash, err := common.HashPassword(newPw)
+	if err != nil {
+		return err
+	}
+	if err := common.DB.Model(&u).Update("password", hash).Error; err != nil {
+		return err
+	}
+	common.DB.Model(&model.RefreshToken{}).Where("user_id = ?", userID).Update("revoked", true)
+	return nil
+}

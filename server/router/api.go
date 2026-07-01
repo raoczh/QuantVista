@@ -1,6 +1,8 @@
 package router
 
 import (
+	"time"
+
 	"quantvista/controller"
 	"quantvista/datasource"
 	"quantvista/middleware"
@@ -34,20 +36,20 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 		setup := api.Group("/setup")
 		{
 			setup.GET("/status", setupCtl.Status)
-			setup.POST("/admin", setupCtl.CreateAdmin)
+			setup.POST("/admin", middleware.RateLimit(5, time.Minute), setupCtl.CreateAdmin)
 		}
 
 		// 认证（公开）
 		auth := api.Group("/auth")
 		{
-			auth.POST("/login", authCtl.Login)
-			auth.POST("/refresh", authCtl.Refresh)
+			auth.POST("/login", middleware.RateLimit(10, time.Minute), authCtl.Login)
+			auth.POST("/refresh", middleware.RateLimit(30, time.Minute), authCtl.Refresh)
 			auth.POST("/logout", authCtl.Logout)
 		}
 		gh := api.Group("/oauth/github")
 		{
 			gh.GET("/url", authCtl.GitHubURL)
-			gh.POST("", authCtl.GitHubCallback)
+			gh.POST("", middleware.RateLimit(20, time.Minute), authCtl.GitHubCallback)
 		}
 
 		// 市场行情（公开，公开市场数据）
@@ -68,6 +70,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				user.GET("/preference", userCtl.GetPreference)
 				user.PUT("/preference", userCtl.UpdatePreference)
 				user.GET("/quota", userCtl.GetQuota)
+				user.PUT("/password", userCtl.ChangePassword)
 			}
 
 			llm := authed.Group("/llm-configs")

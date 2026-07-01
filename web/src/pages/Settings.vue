@@ -29,7 +29,7 @@ import {
   type LLMConfig,
   type LLMConfigInput,
 } from '@/api/llm'
-import { getPreference, updatePreference, type UserPreference } from '@/api/user'
+import { getPreference, updatePreference, changePassword, type UserPreference } from '@/api/user'
 
 const message = useMessage()
 
@@ -182,6 +182,27 @@ async function savePref() {
   }
 }
 
+/* ---------------- 账号安全：修改密码 ---------------- */
+const pw = reactive({ old: '', next: '', confirm: '' })
+const savingPw = ref(false)
+
+async function submitChangePassword() {
+  if (pw.next.length < 8) return message.error('新密码至少 8 个字符')
+  if (pw.next !== pw.confirm) return message.error('两次输入的新密码不一致')
+  savingPw.value = true
+  try {
+    await changePassword(pw.old, pw.next)
+    message.success('密码已修改，其它设备将需重新登录')
+    pw.old = ''
+    pw.next = ''
+    pw.confirm = ''
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    savingPw.value = false
+  }
+}
+
 onMounted(() => {
   loadConfigs()
   loadPref()
@@ -257,6 +278,24 @@ onMounted(() => {
             <n-switch v-model:value="pref.enable_notify" />
           </n-form-item>
           <n-button type="primary" :loading="savingPref" @click="savePref">保存偏好</n-button>
+        </n-form>
+      </n-card>
+    </n-tab-pane>
+
+    <!-- 账号安全 -->
+    <n-tab-pane name="account" tab="账号安全">
+      <n-card title="修改密码">
+        <n-form label-placement="left" label-width="120" style="max-width: 480px">
+          <n-form-item label="原密码">
+            <n-input v-model:value="pw.old" type="password" show-password-on="click" placeholder="纯 GitHub 账号首次设密码可留空" />
+          </n-form-item>
+          <n-form-item label="新密码">
+            <n-input v-model:value="pw.next" type="password" show-password-on="click" placeholder="至少 8 个字符" />
+          </n-form-item>
+          <n-form-item label="确认新密码">
+            <n-input v-model:value="pw.confirm" type="password" show-password-on="click" @keyup.enter="submitChangePassword" />
+          </n-form-item>
+          <n-button type="primary" :loading="savingPw" @click="submitChangePassword">修改密码</n-button>
         </n-form>
       </n-card>
     </n-tab-pane>

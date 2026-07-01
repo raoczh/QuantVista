@@ -9,6 +9,7 @@ import (
 	"quantvista/middleware"
 	"quantvista/model"
 	"quantvista/router"
+	"quantvista/service"
 	"quantvista/setting"
 
 	"github.com/gin-gonic/gin"
@@ -39,6 +40,7 @@ func main() {
 	if err := setting.Init(); err != nil {
 		common.FatalLog("系统设置初始化失败: %v", err)
 	}
+	service.StartRefreshTokenJanitor()
 	if err := common.InitRedis(); err != nil {
 		// Redis 是可选项，失败仅告警不致命。
 		common.SysWarn("Redis 初始化失败（缓存关闭）: %v", err)
