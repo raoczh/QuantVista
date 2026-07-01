@@ -47,6 +47,8 @@ type CompareRow struct {
 	ChangePct5d  float64 `json:"change_pct_5d"`
 	ChangePct20d float64 `json:"change_pct_20d"`
 	AbovMA20     bool    `json:"above_ma20"` // 现价是否站上 MA20
+	Score        float64 `json:"score"`      // 综合评分 0-100
+	ScoreLabel   string  `json:"score_label"`
 	Error        string  `json:"error"`
 }
 
@@ -168,6 +170,10 @@ func (s *CompareService) buildRow(ctx context.Context, market, symbol string) Co
 		row.ChangePct5d = changeOverN(closes, 5)
 		row.ChangePct20d = changeOverN(closes, 20)
 		row.AbovMA20 = row.MA20 > 0 && row.Price >= row.MA20
+		// 综合评分（复用评分引擎，行情+技术指标口径一致）。
+		sc := computeScore(q.Price, bars)
+		row.Score = sc.Total
+		row.ScoreLabel = sc.Label
 	}
 	return row
 }
