@@ -28,3 +28,11 @@ export function updatePreference(p: Partial<UserPreference>) {
 export function getQuota() {
   return request<UserQuota>({ url: '/user/quota' })
 }
+
+export function changePassword(oldPassword: string, newPassword: string) {
+  return request<{ ok: boolean }>({
+    url: '/user/password',
+    method: 'put',
+    data: { old_password: oldPassword, new_password: newPassword },
+  })
+}

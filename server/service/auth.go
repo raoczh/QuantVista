@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"quantvista/common"
 	"quantvista/model"
@@ -48,11 +49,14 @@ func (s *AuthService) CreateAdmin(username, password, ua string) (*TokenPair, er
 		return nil, errors.New("系统已初始化，禁止重复创建管理员")
 	}
 	username = strings.TrimSpace(username)
-	if len(username) < 3 {
-		return nil, errors.New("用户名至少 3 个字符")
+	if n := utf8.RuneCountInString(username); n < 3 || n > 32 {
+		return nil, errors.New("用户名长度需在 3~32 个字符之间")
 	}
 	if len(password) < 8 {
 		return nil, errors.New("密码至少 8 个字符")
+	}
+	if len(password) > 72 {
+		return nil, errors.New("密码过长（bcrypt 上限 72 字节）")
 	}
 	hash, err := common.HashPassword(password)
 	if err != nil {
@@ -194,6 +198,33 @@ func (s *AuthService) RevokeAllForUser(userID int64) error {
 	return common.DB.Model(&model.RefreshToken{}).
 		Where("user_id = ? AND revoked = ?", userID, false).
 		Update("revoked", true).Error
+}
+
+// PruneRefreshTokens 删除已过期或已吊销的刷新令牌，防止表无界增长。返回删除条数。
+func (s *AuthService) PruneRefreshTokens() (int64, error) {
+	res := common.DB.Where("expires_at < ? OR revoked = ?", time.Now(), true).
+		Delete(&model.RefreshToken{})
+	return res.RowsAffected, res.Error
+}
+
+// StartRefreshTokenJanitor 启动即清理一次，之后每 6 小时清理一次过期/吊销令牌。
+func StartRefreshTokenJanitor() {
+	svc := NewAuthService()
+	run := func() {
+		if n, err := svc.PruneRefreshTokens(); err != nil {
+			common.SysWarn("清理刷新令牌失败: %v", err)
+		} else if n > 0 {
+			common.SysLog("清理过期/吊销刷新令牌 %d 条", n)
+		}
+	}
+	run()
+	go func() {
+		t := time.NewTicker(6 * time.Hour)
+		defer t.Stop()
+		for range t.C {
+			run()
+		}
+	}()
 }
 
 // issueFor 为用户签发 access + refresh，并更新最后登录时间。
