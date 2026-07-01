@@ -24,6 +24,8 @@ func AllModels() []any {
 		&WatchlistItem{},
 		&Position{},
 		&AnalysisRecord{},
+		&RecommendationBatch{},
+		&Recommendation{},
 	}
 }
 
