@@ -22,6 +22,11 @@ var (
 	TushareToken string
 
 	DebugEnabled bool
+
+	// Production 是否生产环境（非 debug 且连真实 MySQL），由 InitConfig 计算。
+	Production bool
+	// AllowedOrigins 生产环境 CORS 白名单（env ALLOWED_ORIGINS 逗号分隔）。
+	AllowedOrigins []string
 )
 
 // GetEnv 读取环境变量，缺省回退 fallback。
@@ -54,6 +59,8 @@ func InitConfig() {
 	GithubClientSecret = os.Getenv("GITHUB_CLIENT_SECRET")
 	TushareToken = os.Getenv("TUSHARE_TOKEN")
 	DebugEnabled = GetEnvBool("DEBUG", false)
+	Production = isProductionEnv()
+	AllowedOrigins = splitAndTrim(os.Getenv("ALLOWED_ORIGINS"))
 
 	// 生产环境必须显式设置强密钥，绝不允许用默认/占位值上线。
 	// 「生产」判定为：非 debug 且连接真实远程库（MySQL）。本地 SQLite 开发永远放行，
@@ -94,4 +101,19 @@ func isWeakSecret(v string) bool {
 		}
 	}
 	return false
+}
+
+// splitAndTrim 按逗号切分并去空白，过滤空项（用于 ALLOWED_ORIGINS 等列表配置）。
+func splitAndTrim(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }

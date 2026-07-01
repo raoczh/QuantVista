@@ -6,7 +6,7 @@ func TestAccessTokenRoundTrip(t *testing.T) {
 	SessionSecret = "test-session-secret"
 	defer func() { SessionSecret = "" }()
 
-	tok, exp, err := IssueAccessToken(42, RoleAdminForTest())
+	tok, exp, err := IssueAccessToken(42, "admin", 0)
 	if err != nil {
 		t.Fatalf("签发失败: %v", err)
 	}
@@ -27,7 +27,7 @@ func RoleAdminForTest() string { return "admin" }
 
 func TestParseRejectsTamperedToken(t *testing.T) {
 	SessionSecret = "k1"
-	tok, _, _ := IssueAccessToken(1, "user")
+	tok, _, _ := IssueAccessToken(1, "user", 0)
 	SessionSecret = "k2" // 换密钥后签名应失配
 	defer func() { SessionSecret = "" }()
 	if _, err := ParseAccessToken(tok); err == nil {

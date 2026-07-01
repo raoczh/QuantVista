@@ -3,15 +3,19 @@ package middleware
 import (
 	"net/http"
 
+	"quantvista/common"
+
 	"github.com/gin-gonic/gin"
 )
 
-// CORS 开发期跨域。骨架阶段前后端同源（后端 embed 前端），
-// 仅本地 vite dev server 跨域调试时需要；生产同源可不依赖。
+// CORS 跨域策略：
+//   - 开发环境（非生产）：反射任意 Origin，方便本地 vite dev server 调试。
+//   - 生产环境：仅放行 ALLOWED_ORIGINS 白名单中的 Origin；未配置则不发 CORS 头
+//     （前端与后端同源 embed，正常无需跨域）。
 func CORS() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		origin := c.Request.Header.Get("Origin")
-		if origin != "" {
+		if origin != "" && corsAllowed(origin) {
 			c.Header("Access-Control-Allow-Origin", origin)
 			c.Header("Access-Control-Allow-Credentials", "true")
 			c.Header("Access-Control-Allow-Headers",
@@ -24,4 +28,16 @@ func CORS() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+func corsAllowed(origin string) bool {
+	if !common.Production {
+		return true // 开发环境放行
+	}
+	for _, o := range common.AllowedOrigins {
+		if o == origin {
+			return true
+		}
+	}
+	return false
 }
