@@ -20,6 +20,9 @@ func AllModels() []any {
 		&TradingCalendar{},
 		&MarketSnapshot{},
 		&DataSyncLog{},
+		&Watchlist{},
+		&WatchlistItem{},
+		&Position{},
 	}
 }
 

@@ -19,6 +19,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	userSvc := service.NewUserService()
 	llmSvc := service.NewLLMService()
 	adminSvc := service.NewAdminService()
+	watchlistSvc := service.NewWatchlistService(marketSvc)
+	positionSvc := service.NewPositionService(marketSvc)
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc)
@@ -27,6 +29,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	userCtl := controller.NewUserController(userSvc)
 	llmCtl := controller.NewLLMController(llmSvc)
 	adminCtl := controller.NewAdminController(adminSvc)
+	watchlistCtl := controller.NewWatchlistController(watchlistSvc)
+	positionCtl := controller.NewPositionController(positionSvc)
 
 	api := r.Group("/api")
 	{
@@ -83,6 +87,32 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			}
 			// 草稿测试单独成路径，避免与 /llm-configs/:id 的参数段冲突。
 			authed.POST("/llm-config-test", llmCtl.TestDraft)
+
+			// 自选股（分组 + 条目，按用户隔离）
+			watchlists := authed.Group("/watchlists")
+			{
+				watchlists.GET("", watchlistCtl.List)
+				watchlists.POST("", watchlistCtl.CreateGroup)
+				watchlists.PUT("/:id", watchlistCtl.UpdateGroup)
+				watchlists.DELETE("/:id", watchlistCtl.DeleteGroup)
+				watchlists.POST("/:id/items", watchlistCtl.AddItem)
+			}
+			// 条目改删用独立前缀，避免与 /watchlists/:id 的参数段语义混淆。
+			wlItems := authed.Group("/watchlist-items")
+			{
+				wlItems.PUT("/:id", watchlistCtl.UpdateItem)
+				wlItems.DELETE("/:id", watchlistCtl.DeleteItem)
+			}
+
+			// 已购入持仓（按用户隔离）
+			positions := authed.Group("/positions")
+			{
+				positions.GET("", positionCtl.List)
+				positions.POST("", positionCtl.Create)
+				positions.PUT("/:id", positionCtl.Update)
+				positions.DELETE("/:id", positionCtl.Delete)
+				positions.POST("/:id/close", positionCtl.Close)
+			}
 
 			// 管理员后台
 			admin := authed.Group("/admin")
