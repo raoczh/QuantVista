@@ -26,6 +26,7 @@ func AllModels() []any {
 		&AnalysisRecord{},
 		&RecommendationBatch{},
 		&Recommendation{},
+		&RecommendationStatus{},
 	}
 }
 

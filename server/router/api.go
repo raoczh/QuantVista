@@ -23,6 +23,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	positionSvc := service.NewPositionService(marketSvc)
 	analysisSvc := service.NewAnalysisService(marketSvc, watchlistSvc, positionSvc, llmSvc)
 	recommendationSvc := service.NewRecommendationService(marketSvc, watchlistSvc, llmSvc)
+	trackingSvc := service.NewTrackingService(marketSvc)
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc)
@@ -34,7 +35,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	watchlistCtl := controller.NewWatchlistController(watchlistSvc)
 	positionCtl := controller.NewPositionController(positionSvc)
 	analysisCtl := controller.NewAnalysisController(analysisSvc)
-	recommendationCtl := controller.NewRecommendationController(recommendationSvc)
+	recommendationCtl := controller.NewRecommendationController(recommendationSvc, trackingSvc)
 
 	api := r.Group("/api")
 	{
@@ -131,9 +132,11 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			recommendations := authed.Group("/recommendations")
 			{
 				recommendations.GET("/strategies", recommendationCtl.Strategies)
+				recommendations.GET("/performance", recommendationCtl.Performance)
 				recommendations.POST("", middleware.RateLimit(15, time.Minute), recommendationCtl.Generate)
 				recommendations.GET("", recommendationCtl.List)
 				recommendations.GET("/:id", recommendationCtl.Get)
+				recommendations.POST("/:id/track", recommendationCtl.Track)
 				recommendations.DELETE("/:id", recommendationCtl.Delete)
 			}
 

@@ -12,11 +12,12 @@ import (
 
 // RecommendationController 短线/长线推荐（均限当前登录用户）。
 type RecommendationController struct {
-	svc *service.RecommendationService
+	svc      *service.RecommendationService
+	tracking *service.TrackingService
 }
 
-func NewRecommendationController(svc *service.RecommendationService) *RecommendationController {
-	return &RecommendationController{svc: svc}
+func NewRecommendationController(svc *service.RecommendationService, tracking *service.TrackingService) *RecommendationController {
+	return &RecommendationController{svc: svc, tracking: tracking}
 }
 
 // Strategies GET /api/recommendations/strategies?type=short_term|long_term
@@ -83,4 +84,33 @@ func (rc *RecommendationController) Delete(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, gin.H{"ok": true})
+}
+
+// Performance GET /api/recommendations/performance?type= —— 推荐历史表现统计（带样本量）。
+func (rc *RecommendationController) Performance(c *gin.Context) {
+	stats, err := rc.tracking.Performance(currentUserID(c), c.Query("type"))
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, stats)
+}
+
+// Track POST /api/recommendations/:id/track —— 手动刷新该批次的推荐追踪状态，返回最新详情。
+func (rc *RecommendationController) Track(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	uid := currentUserID(c)
+	if _, err := rc.tracking.RefreshBatch(c.Request.Context(), uid, id); err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	v, err := rc.svc.Get(uid, id)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, v)
 }

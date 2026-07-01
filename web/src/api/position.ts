@@ -30,6 +30,8 @@ export interface Position {
   profit_amount: number
   profit_pct: number
   realized: boolean
+  held_trade_days: number // 已持有交易日（按交易日历）
+  short_term_review: boolean // 短线持仓超阈值，建议复盘
 }
 
 export interface PositionInput {

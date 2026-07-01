@@ -184,3 +184,21 @@ func (m *Manager) GetTradingDays(ctx context.Context, market string, limit int) 
 	}
 	return nil, lastErr
 }
+
+// GetBenchmarkBars 路由到实现 BenchmarkBarsProvider 的源（新浪上证指数日线）。
+func (m *Manager) GetBenchmarkBars(ctx context.Context, market string, limit int) (string, []Bar, error) {
+	var lastErr error = ErrNotSupported
+	for _, a := range m.adapters {
+		p, ok := a.(BenchmarkBarsProvider)
+		if !ok {
+			continue
+		}
+		name, bars, err := p.GetBenchmarkBars(ctx, market, limit)
+		if err == nil {
+			return name, bars, nil
+		}
+		common.SysDebug("数据源 %s 取基准指数日线失败: %v", a.Name(), err)
+		lastErr = err
+	}
+	return "", nil, lastErr
+}
