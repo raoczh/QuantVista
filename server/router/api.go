@@ -29,6 +29,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	qaSvc := service.NewQaService(marketSvc, llmSvc)
 	compareSvc := service.NewCompareService(marketSvc, llmSvc)
 	scoreSvc := service.NewScoreService(marketSvc)
+	paperSvc := service.NewPaperService(marketSvc)
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc, scoreSvc)
@@ -45,6 +46,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	todoCtl := controller.NewTodoController(todoSvc)
 	qaCtl := controller.NewQaController(qaSvc)
 	compareCtl := controller.NewCompareController(compareSvc)
+	paperCtl := controller.NewPaperController(paperSvc)
 
 	api := r.Group("/api")
 	{
@@ -175,6 +177,15 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 
 			// 个股横向对比（多股并排 + 可选 AI 点评，走 LLM 限流）
 			authed.POST("/compare", middleware.RateLimit(20, time.Minute), compareCtl.Compare)
+
+			// 模拟交易（虚拟账户，用真实行情成交与估值）
+			paper := authed.Group("/paper")
+			{
+				paper.GET("/overview", paperCtl.Overview)
+				paper.POST("/trade", middleware.RateLimit(60, time.Minute), paperCtl.Trade)
+				paper.GET("/trades", paperCtl.Trades)
+				paper.POST("/reset", paperCtl.Reset)
+			}
 
 			// 管理员后台
 			admin := authed.Group("/admin")
