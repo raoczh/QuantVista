@@ -130,3 +130,57 @@ func (m *Manager) GetSectorRanking(ctx context.Context, market string, limit int
 	}
 	return nil, lastErr
 }
+
+// GetBreadth 路由到实现 BreadthProvider 的源（东财涨跌分布）。
+func (m *Manager) GetBreadth(ctx context.Context, market string) (*Breadth, error) {
+	var lastErr error = ErrNotSupported
+	for _, a := range m.adapters {
+		p, ok := a.(BreadthProvider)
+		if !ok {
+			continue
+		}
+		r, err := p.GetBreadth(ctx, market)
+		if err == nil {
+			return r, nil
+		}
+		common.SysDebug("数据源 %s 取涨跌家数失败: %v", a.Name(), err)
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// GetMarketFundFlow 路由到实现 FundFlowProvider 的源（东财两市资金流）。
+func (m *Manager) GetMarketFundFlow(ctx context.Context, market string) (*MarketFundFlow, error) {
+	var lastErr error = ErrNotSupported
+	for _, a := range m.adapters {
+		p, ok := a.(FundFlowProvider)
+		if !ok {
+			continue
+		}
+		r, err := p.GetMarketFundFlow(ctx, market)
+		if err == nil {
+			return r, nil
+		}
+		common.SysDebug("数据源 %s 取资金流失败: %v", a.Name(), err)
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+// GetTradingDays 路由到实现 TradingDaysProvider 的源（新浪上证指数日线）。
+func (m *Manager) GetTradingDays(ctx context.Context, market string, limit int) ([]string, error) {
+	var lastErr error = ErrNotSupported
+	for _, a := range m.adapters {
+		p, ok := a.(TradingDaysProvider)
+		if !ok {
+			continue
+		}
+		r, err := p.GetTradingDays(ctx, market, limit)
+		if err == nil {
+			return r, nil
+		}
+		common.SysDebug("数据源 %s 取交易日失败: %v", a.Name(), err)
+		lastErr = err
+	}
+	return nil, lastErr
+}

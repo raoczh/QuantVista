@@ -92,6 +92,15 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				admin.PUT("/settings", adminCtl.UpdateSettings)
 				admin.GET("/users", adminCtl.ListUsers)
 				admin.PUT("/users/:id/status", adminCtl.SetUserStatus)
+
+				// 市场数据维护（手动触发批量同步/日历回填/情绪快照）
+				adminMarket := admin.Group("/market")
+				{
+					adminMarket.POST("/sync-bars", marketCtl.SyncBars)
+					adminMarket.POST("/backfill-calendar", marketCtl.BackfillCalendar)
+					adminMarket.POST("/snapshot", marketCtl.Snapshot)
+					adminMarket.GET("/sync-logs", marketCtl.SyncLogs)
+				}
 			}
 		}
 	}

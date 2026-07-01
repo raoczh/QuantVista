@@ -62,12 +62,14 @@ func (s *MarketService) GetDailyBars(ctx context.Context, market, symbol string,
 
 // Overview 市场首页概览：各块独立获取，部分失败不影响整体（失败记入 Errors）。
 type Overview struct {
-	Indices  []datasource.Index      `json:"indices"`
-	Gainers  []datasource.StockRank  `json:"gainers"` // 涨幅榜
-	Actives  []datasource.StockRank  `json:"actives"` // 成交额/热门榜
-	Sectors  []datasource.SectorRank `json:"sectors"` // 板块涨跌榜（best-effort）
-	Errors   map[string]string       `json:"errors"`  // 哪些块取数失败
-	DataTime time.Time               `json:"data_time"`
+	Indices  []datasource.Index         `json:"indices"`
+	Gainers  []datasource.StockRank     `json:"gainers"`   // 涨幅榜
+	Actives  []datasource.StockRank     `json:"actives"`   // 成交额/热门榜
+	Sectors  []datasource.SectorRank    `json:"sectors"`   // 板块涨跌榜（best-effort）
+	Breadth  *datasource.Breadth        `json:"breadth"`   // 涨跌家数/涨跌停（市场情绪）
+	FundFlow *datasource.MarketFundFlow `json:"fund_flow"` // 两市资金流
+	Errors   map[string]string          `json:"errors"`    // 哪些块取数失败
+	DataTime time.Time                  `json:"data_time"`
 }
 
 const overviewCacheTTL = 15 * time.Second
@@ -91,7 +93,7 @@ func (s *MarketService) GetOverview(ctx context.Context, market string) *Overvie
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(6)
 	go func() {
 		defer wg.Done()
 		if r, err := s.mgr.GetIndices(ctx, market); err == nil {
@@ -122,6 +124,22 @@ func (s *MarketService) GetOverview(ctx context.Context, market string) *Overvie
 			ov.Sectors = r
 		} else {
 			setErr("sectors", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if r, err := s.mgr.GetBreadth(ctx, market); err == nil {
+			ov.Breadth = r
+		} else {
+			setErr("breadth", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if r, err := s.mgr.GetMarketFundFlow(ctx, market); err == nil {
+			ov.FundFlow = r
+		} else {
+			setErr("fund_flow", err)
 		}
 	}()
 	wg.Wait()

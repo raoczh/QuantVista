@@ -18,7 +18,7 @@ import RankList from '@/components/RankList.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
 
 const message = useMessage()
-const { vars, isDark, pctColor, upColor, downColor } = useUi()
+const { vars, isDark, pctColor, upColor, downColor, flatColor, withAlpha } = useUi()
 
 // ---------- 市场概览 ----------
 const overview = ref<Overview | null>(null)
@@ -108,8 +108,25 @@ function fmtVol(n: number) {
 function fmtTime(t: string | undefined) {
   return t ? new Date(t).toLocaleTimeString('zh-CN', { hour12: false }) : '-'
 }
+// 元 → 亿元，带符号（资金净流入正负）
+function fmtYi(n: number | undefined) {
+  if (n == null) return '-'
+  const yi = n / 1e8
+  return (yi >= 0 ? '+' : '') + yi.toFixed(2) + ' 亿'
+}
 
 const sectorsUnavailable = computed(() => !!overview.value?.errors?.sectors)
+const breadthUnavailable = computed(() => !!overview.value && !overview.value.breadth)
+const fundFlowUnavailable = computed(() => !!overview.value && !overview.value.fund_flow)
+
+// 涨跌家数占比（市场情绪条宽度）
+const breadthTotal = computed(() => {
+  const b = overview.value?.breadth
+  return b ? b.advances + b.declines + b.unchanged : 0
+})
+function breadthPct(n: number) {
+  return breadthTotal.value ? (n / breadthTotal.value) * 100 : 0
+}
 
 onMounted(() => {
   loadOverview()
@@ -213,7 +230,67 @@ onMounted(() => {
         </n-gi>
         <n-gi>
           <SectionCard title="市场情绪">
-            <n-empty description="涨跌家数 / 涨跌停 / 波动率 —— 待数据源接入（阶段 2+）" />
+            <template v-if="breadthUnavailable" #extra>
+              <n-tag size="small" type="warning" round :bordered="false">数据源繁忙</n-tag>
+            </template>
+            <div v-if="overview?.breadth" class="breadth">
+              <div class="breadth-summary">
+                <div class="bs-cell">
+                  <span class="bs-num qv-tnum" :style="{ color: upColor }">{{
+                    overview.breadth.advances
+                  }}</span>
+                  <span class="bs-label">上涨</span>
+                </div>
+                <div class="bs-cell">
+                  <span class="bs-num qv-tnum" :style="{ color: flatColor }">{{
+                    overview.breadth.unchanged
+                  }}</span>
+                  <span class="bs-label">平盘</span>
+                </div>
+                <div class="bs-cell">
+                  <span class="bs-num qv-tnum" :style="{ color: downColor }">{{
+                    overview.breadth.declines
+                  }}</span>
+                  <span class="bs-label">下跌</span>
+                </div>
+              </div>
+              <div class="breadth-bar">
+                <div
+                  class="seg"
+                  :style="{
+                    width: breadthPct(overview.breadth.advances) + '%',
+                    background: upColor,
+                  }"
+                ></div>
+                <div
+                  class="seg"
+                  :style="{
+                    width: breadthPct(overview.breadth.unchanged) + '%',
+                    background: flatColor,
+                  }"
+                ></div>
+                <div
+                  class="seg"
+                  :style="{
+                    width: breadthPct(overview.breadth.declines) + '%',
+                    background: downColor,
+                  }"
+                ></div>
+              </div>
+              <div class="breadth-limits">
+                <span class="bl" :style="{ background: withAlpha(upColor, 0.14), color: upColor }">
+                  涨停 {{ overview.breadth.limit_up }}
+                </span>
+                <span
+                  class="bl"
+                  :style="{ background: withAlpha(downColor, 0.14), color: downColor }"
+                >
+                  跌停 {{ overview.breadth.limit_down }}
+                </span>
+                <span class="bl-date">{{ overview.breadth.trade_date }}</span>
+              </div>
+            </div>
+            <n-empty v-else description="涨跌家数依赖东财接口，当前限流暂不可用，稍后重试" />
           </SectionCard>
         </n-gi>
       </n-grid>
@@ -271,10 +348,68 @@ onMounted(() => {
         <div ref="chartEl" class="quote-chart"></div>
       </SectionCard>
 
-      <!-- 占位 -->
-      <SectionCard title="资金流 / 财经新闻 / AI 今日观点">
-        <n-empty description="待阶段 4+ 接入（资金流向、新闻情绪、AI 市场摘要）" />
-      </SectionCard>
+      <!-- 资金流向 + 新闻/AI 占位 -->
+      <n-grid cols="1 m:2" :x-gap="16" :y-gap="16" responsive="screen">
+        <n-gi>
+          <SectionCard title="资金流向">
+            <template v-if="fundFlowUnavailable" #extra>
+              <n-tag size="small" type="warning" round :bordered="false">数据源繁忙</n-tag>
+            </template>
+            <div v-if="overview?.fund_flow" class="fundflow">
+              <div class="ff-hero">
+                <span class="ff-label">主力净流入</span>
+                <span
+                  class="ff-main qv-figure"
+                  :style="{ color: pctColor(overview.fund_flow.main_net) }"
+                >
+                  {{ fmtYi(overview.fund_flow.main_net) }}
+                </span>
+                <span class="ff-date">{{ overview.fund_flow.trade_date }} · 沪深两市</span>
+              </div>
+              <div class="ff-grid">
+                <div class="ff-cell">
+                  <span class="ff-k">超大单</span>
+                  <span
+                    class="ff-v qv-tnum"
+                    :style="{ color: pctColor(overview.fund_flow.super_net) }"
+                    >{{ fmtYi(overview.fund_flow.super_net) }}</span
+                  >
+                </div>
+                <div class="ff-cell">
+                  <span class="ff-k">大单</span>
+                  <span
+                    class="ff-v qv-tnum"
+                    :style="{ color: pctColor(overview.fund_flow.large_net) }"
+                    >{{ fmtYi(overview.fund_flow.large_net) }}</span
+                  >
+                </div>
+                <div class="ff-cell">
+                  <span class="ff-k">中单</span>
+                  <span
+                    class="ff-v qv-tnum"
+                    :style="{ color: pctColor(overview.fund_flow.medium_net) }"
+                    >{{ fmtYi(overview.fund_flow.medium_net) }}</span
+                  >
+                </div>
+                <div class="ff-cell">
+                  <span class="ff-k">小单</span>
+                  <span
+                    class="ff-v qv-tnum"
+                    :style="{ color: pctColor(overview.fund_flow.small_net) }"
+                    >{{ fmtYi(overview.fund_flow.small_net) }}</span
+                  >
+                </div>
+              </div>
+            </div>
+            <n-empty v-else description="两市资金流依赖东财接口，当前限流暂不可用，稍后重试" />
+          </SectionCard>
+        </n-gi>
+        <n-gi>
+          <SectionCard title="财经新闻 / AI 今日观点">
+            <n-empty description="待阶段 4+ 接入（新闻情绪、AI 市场摘要）" />
+          </SectionCard>
+        </n-gi>
+      </n-grid>
 
       <n-alert type="warning" title="风险提示" :bordered="false">
         本内容仅供研究参考，不构成投资建议。AI 可能出错，数据可能延迟或不完整，投资决策需由用户自行承担风险。
@@ -335,6 +470,103 @@ onMounted(() => {
 .sr-leader {
   font-size: 12px;
   opacity: 0.6;
+}
+
+/* 市场情绪：涨跌家数 */
+.breadth {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 4px 0;
+}
+.breadth-summary {
+  display: flex;
+  justify-content: space-around;
+  text-align: center;
+}
+.bs-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.bs-num {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1;
+}
+.bs-label {
+  font-size: 12px;
+  opacity: 0.6;
+}
+.breadth-bar {
+  display: flex;
+  height: 10px;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.breadth-bar .seg {
+  height: 100%;
+  transition: width 0.4s ease;
+}
+.breadth-limits {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.bl {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 10px;
+  border-radius: 999px;
+}
+.bl-date {
+  font-size: 12px;
+  opacity: 0.45;
+  margin-left: auto;
+}
+
+/* 资金流向 */
+.fundflow {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.ff-hero {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.ff-label {
+  font-size: 13px;
+  opacity: 0.6;
+}
+.ff-main {
+  font-size: 30px;
+  font-weight: 700;
+  line-height: 1;
+}
+.ff-date {
+  font-size: 12px;
+  opacity: 0.45;
+}
+.ff-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 10px 16px;
+}
+.ff-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.ff-k {
+  font-size: 12px;
+  opacity: 0.55;
+}
+.ff-v {
+  font-size: 16px;
+  font-weight: 600;
 }
 
 /* 个股速查 */

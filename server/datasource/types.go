@@ -91,6 +91,30 @@ type SectorRank struct {
 	Source    string  `json:"source"`
 }
 
+// Breadth 市场涨跌家数/涨跌停统计（市场情绪核心指标）。
+type Breadth struct {
+	Advances  int       `json:"advances"`   // 上涨家数
+	Declines  int       `json:"declines"`   // 下跌家数
+	Unchanged int       `json:"unchanged"`  // 平盘家数
+	LimitUp   int       `json:"limit_up"`   // 涨停家数
+	LimitDown int       `json:"limit_down"` // 跌停家数
+	TradeDate string    `json:"trade_date"` // YYYY-MM-DD
+	Source    string    `json:"source"`
+	DataTime  time.Time `json:"data_time"`
+}
+
+// MarketFundFlow 两市资金流（主力/超大单/大单/中单/小单净流入，单位元）。
+type MarketFundFlow struct {
+	TradeDate string    `json:"trade_date"` // YYYY-MM-DD
+	MainNet   float64   `json:"main_net"`   // 主力净流入 = 超大单 + 大单
+	SuperNet  float64   `json:"super_net"`  // 超大单净流入
+	LargeNet  float64   `json:"large_net"`  // 大单净流入
+	MediumNet float64   `json:"medium_net"` // 中单净流入
+	SmallNet  float64   `json:"small_net"`  // 小单净流入
+	Source    string    `json:"source"`
+	DataTime  time.Time `json:"data_time"`
+}
+
 // CNIndex A 股主要指数清单（code 用于展示，sina 为新浪批量代码）。
 type CNIndex struct {
 	Code string
@@ -135,4 +159,19 @@ type RankingProvider interface {
 // SectorProvider 板块涨跌榜能力。
 type SectorProvider interface {
 	GetSectorRanking(ctx context.Context, market string, limit int) ([]SectorRank, error)
+}
+
+// BreadthProvider 市场涨跌家数/涨跌停统计能力。
+type BreadthProvider interface {
+	GetBreadth(ctx context.Context, market string) (*Breadth, error)
+}
+
+// FundFlowProvider 两市资金流能力。
+type FundFlowProvider interface {
+	GetMarketFundFlow(ctx context.Context, market string) (*MarketFundFlow, error)
+}
+
+// TradingDaysProvider 交易日（开市日）序列能力，用于回填交易日历。
+type TradingDaysProvider interface {
+	GetTradingDays(ctx context.Context, market string, limit int) ([]string, error)
 }
