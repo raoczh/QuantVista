@@ -22,6 +22,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	watchlistSvc := service.NewWatchlistService(marketSvc)
 	positionSvc := service.NewPositionService(marketSvc)
 	analysisSvc := service.NewAnalysisService(marketSvc, watchlistSvc, positionSvc, llmSvc)
+	recommendationSvc := service.NewRecommendationService(marketSvc, watchlistSvc, llmSvc)
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc)
@@ -33,6 +34,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	watchlistCtl := controller.NewWatchlistController(watchlistSvc)
 	positionCtl := controller.NewPositionController(positionSvc)
 	analysisCtl := controller.NewAnalysisController(analysisSvc)
+	recommendationCtl := controller.NewRecommendationController(recommendationSvc)
 
 	api := r.Group("/api")
 	{
@@ -123,6 +125,16 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				analysis.GET("", analysisCtl.List)
 				analysis.GET("/:id", analysisCtl.Get)
 				analysis.DELETE("/:id", analysisCtl.Delete)
+			}
+
+			// 短线/长线推荐（按用户隔离；生成走 LLM，限流控成本）
+			recommendations := authed.Group("/recommendations")
+			{
+				recommendations.GET("/strategies", recommendationCtl.Strategies)
+				recommendations.POST("", middleware.RateLimit(15, time.Minute), recommendationCtl.Generate)
+				recommendations.GET("", recommendationCtl.List)
+				recommendations.GET("/:id", recommendationCtl.Get)
+				recommendations.DELETE("/:id", recommendationCtl.Delete)
 			}
 
 			// 管理员后台
