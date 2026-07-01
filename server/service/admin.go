@@ -6,6 +6,8 @@ import (
 	"quantvista/common"
 	"quantvista/model"
 	"quantvista/setting"
+
+	"gorm.io/gorm"
 )
 
 type AdminService struct{}
@@ -104,6 +106,8 @@ func (s *AdminService) SetUserStatus(operatorID, targetID int64, status string) 
 		return err
 	}
 	if status == model.StatusDisabled {
+		// 令牌版本 +1，令其旧 access token 即时失效；并吊销全部刷新令牌。
+		common.DB.Model(&target).UpdateColumn("token_version", gorm.Expr("token_version + 1"))
 		_ = NewAuthService().RevokeAllForUser(targetID)
 	}
 	return nil

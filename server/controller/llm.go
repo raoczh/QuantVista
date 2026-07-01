@@ -4,6 +4,7 @@ import (
 	"strconv"
 
 	"quantvista/common"
+	"quantvista/model"
 	"quantvista/service"
 
 	"github.com/gin-gonic/gin"
@@ -90,7 +91,7 @@ func (lc *LLMController) Test(c *gin.Context) {
 	if !ok {
 		return
 	}
-	res, err := lc.svc.TestByID(currentUserID(c), id)
+	res, err := lc.svc.TestByID(currentUserID(c), id, lc.allowPrivate(c))
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -105,10 +106,15 @@ func (lc *LLMController) TestDraft(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	res, err := lc.svc.TestByInput(in)
+	res, err := lc.svc.TestByInput(in, lc.allowPrivate(c))
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
 	}
 	common.ApiSuccess(c, res)
+}
+
+// allowPrivate 仅管理员可让测试连接触达内网/回环（本地自建模型），普通用户禁止（防 SSRF）。
+func (lc *LLMController) allowPrivate(c *gin.Context) bool {
+	return currentRole(c) == model.RoleAdmin
 }

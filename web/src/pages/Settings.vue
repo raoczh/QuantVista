@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import {
   NTabs,
   NTabPane,
@@ -30,8 +31,11 @@ import {
   type LLMConfigInput,
 } from '@/api/llm'
 import { getPreference, updatePreference, changePassword, type UserPreference } from '@/api/user'
+import { useAuthStore } from '@/stores/auth'
 
 const message = useMessage()
+const router = useRouter()
+const auth = useAuthStore()
 
 /* ---------------- LLM 配置 ---------------- */
 const configs = ref<LLMConfig[]>([])
@@ -158,6 +162,7 @@ const marketOptions = [
 ]
 const horizonOptions = [
   { label: '短线', value: 'short_term' },
+  { label: '中线', value: 'mid_term' },
   { label: '长线', value: 'long_term' },
 ]
 
@@ -192,10 +197,13 @@ async function submitChangePassword() {
   savingPw.value = true
   try {
     await changePassword(pw.old, pw.next)
-    message.success('密码已修改，其它设备将需重新登录')
+    message.success('密码已修改，请用新密码重新登录')
     pw.old = ''
     pw.next = ''
     pw.confirm = ''
+    // 改密后旧 access token 已失效，登出并跳转登录页。
+    await auth.logout()
+    router.replace('/login')
   } catch (e) {
     message.error((e as Error).message)
   } finally {
@@ -272,7 +280,7 @@ onMounted(() => {
             <n-select v-model:value="pref.horizon_pref" :options="horizonOptions" />
           </n-form-item>
           <n-form-item label="默认推荐数量">
-            <n-input-number v-model:value="pref.default_rec_count" :min="1" :max="20" />
+            <n-input-number v-model:value="pref.default_rec_count" :min="3" :max="5" />
           </n-form-item>
           <n-form-item label="开启提醒">
             <n-switch v-model:value="pref.enable_notify" />

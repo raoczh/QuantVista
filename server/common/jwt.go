@@ -23,15 +23,17 @@ func jwtSecret() []byte {
 type Claims struct {
 	UserID int64  `json:"uid"`
 	Role   string `json:"role"`
+	Ver    int    `json:"ver"` // 令牌版本，与 User.TokenVersion 比对，用于即时废止
 	jwt.RegisteredClaims
 }
 
 // IssueAccessToken 签发 HS256 access token，返回 token 串与过期时间。
-func IssueAccessToken(userID int64, role string) (string, time.Time, error) {
+func IssueAccessToken(userID int64, role string, ver int) (string, time.Time, error) {
 	exp := time.Now().Add(AccessTokenTTL)
 	claims := Claims{
 		UserID: userID,
 		Role:   role,
+		Ver:    ver,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(exp),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),

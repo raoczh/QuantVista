@@ -14,9 +14,12 @@ type User struct {
 	AvatarURL   string    `gorm:"size:256" json:"avatar_url"`
 	Role        string    `gorm:"size:16;default:user" json:"role"`        // user / admin
 	Status      string    `gorm:"size:16;default:enabled" json:"status"`   // enabled / disabled
-	LastLoginAt time.Time `json:"last_login_at"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	// TokenVersion 令牌版本号。签发的 access token 内嵌当时版本；禁用用户/改密码时 +1，
+	// 使 JWTAuth 能即时废止旧 access token（不必等其 2h 自然过期）。精确、无时间粒度问题。
+	TokenVersion int       `gorm:"default:0" json:"-"`
+	LastLoginAt  time.Time `json:"last_login_at"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 const (

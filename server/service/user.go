@@ -5,6 +5,8 @@ import (
 
 	"quantvista/common"
 	"quantvista/model"
+
+	"gorm.io/gorm"
 )
 
 type UserService struct{}
@@ -42,7 +44,7 @@ type PreferenceInput struct {
 var (
 	validRisk    = map[string]bool{"conservative": true, "balanced": true, "aggressive": true}
 	validMarket  = map[string]bool{"cn": true, "us": true, "hk": true}
-	validHorizon = map[string]bool{"short_term": true, "long_term": true}
+	validHorizon = map[string]bool{"short_term": true, "mid_term": true, "long_term": true}
 )
 
 // UpdatePreference 校验并更新用户偏好。
@@ -56,8 +58,8 @@ func (s *UserService) UpdatePreference(userID int64, in PreferenceInput) (*model
 	if !validHorizon[in.HorizonPref] {
 		return nil, errors.New("非法的默认周期")
 	}
-	if in.DefaultRecCount < 1 || in.DefaultRecCount > 20 {
-		return nil, errors.New("默认推荐数量需在 1~20 之间")
+	if in.DefaultRecCount < 3 || in.DefaultRecCount > 5 {
+		return nil, errors.New("默认推荐数量需在 3~5 之间")
 	}
 	p, err := s.GetPreference(userID)
 	if err != nil {
@@ -106,6 +108,8 @@ func (s *UserService) ChangePassword(userID int64, oldPw, newPw string) error {
 	if err := common.DB.Model(&u).Update("password", hash).Error; err != nil {
 		return err
 	}
+	// 改密后使旧 access token 即时失效（令牌版本 +1），并吊销该用户全部刷新令牌，强制所有会话重登。
+	common.DB.Model(&u).UpdateColumn("token_version", gorm.Expr("token_version + 1"))
 	common.DB.Model(&model.RefreshToken{}).Where("user_id = ?", userID).Update("revoked", true)
 	return nil
 }
