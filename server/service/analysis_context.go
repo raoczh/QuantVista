@@ -46,21 +46,31 @@ func (s *AnalysisService) buildContext(ctx context.Context, userID int64, req An
 // --- 个股 ---
 
 func (s *AnalysisService) buildStockContext(ctx context.Context, market, symbol string) (*analysisContext, error) {
-	symbol, market, err := normalizeSymbolMarket(symbol, market)
+	name, snap, err := buildStockSnapshot(ctx, s.market, symbol, market)
 	if err != nil {
 		return nil, err
 	}
-	q, err := s.market.GetQuote(ctx, market, symbol)
+	return &analysisContext{Label: name, Snapshot: fitBudget(snap)}, nil
+}
+
+// buildStockSnapshot 采集单只个股的数据快照（行情 + 技术指标 + 近 30 根日线明细）。
+// 供个股分析与个股 AI 问答共用，保证两处口径一致。返回 展示名、快照、错误。
+func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt string) (string, map[string]any, error) {
+	symbol, mkt, err := normalizeSymbolMarket(symbol, mkt)
+	if err != nil {
+		return "", nil, err
+	}
+	q, err := market.GetQuote(ctx, mkt, symbol)
 	if err != nil {
 		if errors.Is(err, datasource.ErrSymbolInvalid) {
-			return nil, errors.New("无法识别的股票代码")
+			return "", nil, errors.New("无法识别的股票代码")
 		}
-		return nil, fmt.Errorf("行情数据暂不可用：%w", err)
+		return "", nil, fmt.Errorf("行情数据暂不可用：%w", err)
 	}
 
 	snap := map[string]any{
 		"symbol": q.Symbol,
-		"market": market,
+		"market": mkt,
 		"name":   q.Name,
 		"quote": map[string]any{
 			"price":      round2(q.Price),
@@ -75,8 +85,8 @@ func (s *AnalysisService) buildStockContext(ctx context.Context, market, symbol 
 		},
 	}
 
-	// 日线：取近 60 根算技术指标，注入近 30 根明细（分级：指标必给，明细按预算裁剪）。
-	bars, berr := s.market.GetDailyBars(ctx, market, symbol, 60)
+	// 日线：取近 60 根算技术指标，注入近 30 根明细。
+	bars, berr := market.GetDailyBars(ctx, mkt, symbol, 60)
 	if berr == nil && len(bars) > 0 {
 		snap["technicals"] = computeTechnicals(bars)
 		snap["recent_bars"] = compactBars(bars, 30)
@@ -88,7 +98,7 @@ func (s *AnalysisService) buildStockContext(ctx context.Context, market, symbol 
 	if label == "" {
 		label = q.Symbol
 	}
-	return &analysisContext{Label: label, Snapshot: fitBudget(snap)}, nil
+	return label, snap, nil
 }
 
 // computeTechnicals 从升序日线（最新在末尾）算常用技术指标。
@@ -214,11 +224,11 @@ func (s *AnalysisService) buildWatchlistContext(ctx context.Context, userID int6
 	for _, g := range groups {
 		for _, it := range g.Items {
 			row := map[string]any{
-				"group":      g.Name,
-				"name":       it.Name,
-				"symbol":     it.Symbol,
-				"market":     it.Market,
-				"is_pinned":  it.IsPinned,
+				"group":     g.Name,
+				"name":      it.Name,
+				"symbol":    it.Symbol,
+				"market":    it.Market,
+				"is_pinned": it.IsPinned,
 			}
 			if it.QuoteOK {
 				row["price"] = round2(it.Price)
@@ -257,14 +267,14 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 	var totalCost, totalMV, totalPnL float64
 	for _, v := range views {
 		row := map[string]any{
-			"name":     v.Name,
-			"symbol":   v.Symbol,
-			"market":   v.Market,
-			"type":     v.PositionType,
-			"status":   v.Status,
+			"name":      v.Name,
+			"symbol":    v.Symbol,
+			"market":    v.Market,
+			"type":      v.PositionType,
+			"status":    v.Status,
 			"buy_price": round2(v.BuyPrice),
-			"quantity": round2(v.Quantity),
-			"cost":     round2(v.Cost),
+			"quantity":  round2(v.Quantity),
+			"cost":      round2(v.Cost),
 		}
 		if v.QuoteOK {
 			row["current_price"] = round2(v.CurrentPrice)

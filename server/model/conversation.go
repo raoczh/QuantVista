@@ -1,0 +1,47 @@
+package model
+
+import "time"
+
+// 个股 AI 问答会话。首轮注入一次个股数据快照，之后多轮追问复用该快照，不重复拉数据。
+const (
+	QaRoleUser      = "user"
+	QaRoleAssistant = "assistant"
+)
+
+// AiConversation 一个针对某只个股的问答会话。按 user_id 隔离。
+type AiConversation struct {
+	ID     int64  `gorm:"primaryKey" json:"id"`
+	UserID int64  `gorm:"index:idx_conv_user" json:"user_id"`
+	Symbol string `gorm:"size:16" json:"symbol"`
+	Market string `gorm:"size:8" json:"market"`
+	Name   string `gorm:"size:64" json:"name"`
+	Title  string `gorm:"size:128" json:"title"` // 会话标题（取首个问题）
+
+	LLMConfigID int64  `json:"llm_config_id"`
+	Provider    string `gorm:"size:32" json:"provider"`
+	Model       string `gorm:"size:64" json:"model"`
+
+	// 首轮采集的个股数据快照（JSON），后续追问复用，避免重复拉数据；列表查询不返回。
+	DataSnapshot string `gorm:"type:text" json:"data_snapshot,omitempty"`
+
+	MessageCount int `json:"message_count"`
+	TotalTokens  int `json:"total_tokens"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// AiConversationMessage 会话中的一条消息（user 提问 / assistant 回答）。
+type AiConversationMessage struct {
+	ID             int64  `gorm:"primaryKey" json:"id"`
+	ConversationID int64  `gorm:"index:idx_msg_conv" json:"conversation_id"`
+	UserID         int64  `gorm:"index:idx_msg_user" json:"user_id"`
+	Role           string `gorm:"size:16" json:"role"` // user / assistant
+	Content        string `gorm:"type:text" json:"content"`
+
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+
+	CreatedAt time.Time `json:"created_at"`
+}

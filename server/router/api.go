@@ -26,6 +26,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	trackingSvc := service.NewTrackingService(marketSvc)
 	alertSvc := service.NewAlertService(marketSvc)
 	todoSvc := service.NewTodoService(alertSvc, positionSvc)
+	qaSvc := service.NewQaService(marketSvc, llmSvc)
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc)
@@ -40,6 +41,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	recommendationCtl := controller.NewRecommendationController(recommendationSvc, trackingSvc)
 	alertCtl := controller.NewAlertController(alertSvc)
 	todoCtl := controller.NewTodoController(todoSvc)
+	qaCtl := controller.NewQaController(qaSvc)
 
 	api := r.Group("/api")
 	{
@@ -157,6 +159,15 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 
 			// 今日待办/待复盘（聚合命中提醒 + 推荐/持仓复盘信号）
 			authed.GET("/todos", todoCtl.List)
+
+			// 个股 AI 问答（多轮，复用数据快照；走 LLM，限流控成本）
+			qa := authed.Group("/qa")
+			{
+				qa.POST("/ask", middleware.RateLimit(20, time.Minute), qaCtl.Ask)
+				qa.GET("", qaCtl.List)
+				qa.GET("/:id", qaCtl.Get)
+				qa.DELETE("/:id", qaCtl.Delete)
+			}
 
 			// 管理员后台
 			admin := authed.Group("/admin")
