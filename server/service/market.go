@@ -52,16 +52,21 @@ func (s *MarketService) GetQuote(ctx context.Context, market, symbol string) (*d
 
 // GetDailyBars 取日线序列（暂不缓存，数据量大且变动低频，后续可加）。
 func (s *MarketService) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]datasource.Bar, error) {
-	return s.mgr.GetDailyBars(ctx, market, symbol, limit)
+	bars, err := s.mgr.GetDailyBars(ctx, market, symbol, limit)
+	if err != nil {
+		return nil, err
+	}
+	s.persistDailyBars(market, symbol, bars)
+	return bars, nil
 }
 
 // Overview 市场首页概览：各块独立获取，部分失败不影响整体（失败记入 Errors）。
 type Overview struct {
 	Indices  []datasource.Index      `json:"indices"`
-	Gainers  []datasource.StockRank  `json:"gainers"`  // 涨幅榜
-	Actives  []datasource.StockRank  `json:"actives"`  // 成交额/热门榜
-	Sectors  []datasource.SectorRank `json:"sectors"`  // 板块涨跌榜（best-effort）
-	Errors   map[string]string       `json:"errors"`   // 哪些块取数失败
+	Gainers  []datasource.StockRank  `json:"gainers"` // 涨幅榜
+	Actives  []datasource.StockRank  `json:"actives"` // 成交额/热门榜
+	Sectors  []datasource.SectorRank `json:"sectors"` // 板块涨跌榜（best-effort）
+	Errors   map[string]string       `json:"errors"`  // 哪些块取数失败
 	DataTime time.Time               `json:"data_time"`
 }
 
@@ -127,6 +132,65 @@ func (s *MarketService) GetOverview(ctx context.Context, market string) *Overvie
 	return ov
 }
 
+func (s *MarketService) persistDailyBars(market, symbol string, bars []datasource.Bar) {
+	if common.DB == nil || len(bars) == 0 {
+		return
+	}
+
+	dailyRows := make([]model.DailyBar, 0, len(bars))
+	calendarRows := make([]model.TradingCalendar, 0, len(bars))
+	seenTradeDates := make(map[string]struct{}, len(bars))
+
+	for _, b := range bars {
+		if b.TradeDate == "" {
+			continue
+		}
+		source := b.Source
+		if source == "" {
+			source = "unknown"
+		}
+		dailyRows = append(dailyRows, model.DailyBar{
+			Symbol:    symbol,
+			Market:    market,
+			TradeDate: b.TradeDate,
+			Open:      b.Open,
+			High:      b.High,
+			Low:       b.Low,
+			Close:     b.Close,
+			Volume:    b.Volume,
+			Amount:    b.Amount,
+			Source:    source,
+		})
+		if _, ok := seenTradeDates[b.TradeDate]; !ok {
+			calendarRows = append(calendarRows, model.TradingCalendar{
+				Market:    market,
+				TradeDate: b.TradeDate,
+				IsOpen:    true,
+			})
+			seenTradeDates[b.TradeDate] = struct{}{}
+		}
+	}
+
+	if len(dailyRows) > 0 {
+		if err := common.DB.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "trade_date"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"open", "high", "low", "close", "volume", "amount", "source",
+			}),
+		}).CreateInBatches(dailyRows, 200).Error; err != nil && err != gorm.ErrEmptySlice {
+			common.SysWarn("落库 daily_bars 失败 %s: %v", symbol, err)
+		}
+	}
+
+	if len(calendarRows) > 0 {
+		if err := common.DB.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "market"}, {Name: "trade_date"}},
+			DoUpdates: clause.AssignmentColumns([]string{"is_open"}),
+		}).CreateInBatches(calendarRows, 200).Error; err != nil && err != gorm.ErrEmptySlice {
+			common.SysWarn("落库 trading_calendar 失败 %s: %v", market, err)
+		}
+	}
+}
 func (s *MarketService) persist(q *datasource.Quote) {
 	if common.DB == nil {
 		return
