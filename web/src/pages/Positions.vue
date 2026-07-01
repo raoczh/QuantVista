@@ -47,8 +47,6 @@ const typeFilter = ref<'all' | 'short_term' | 'long_term'>('all')
 
 const marketOptions = [
   { label: 'A 股', value: 'cn' },
-  { label: '美股', value: 'us' },
-  { label: '港股', value: 'hk' },
 ]
 
 async function load() {

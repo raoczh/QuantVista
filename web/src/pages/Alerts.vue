@@ -48,8 +48,6 @@ const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const marketOptions = [
   { label: 'A 股', value: 'cn' },
-  { label: '美股', value: 'us' },
-  { label: '港股', value: 'hk' },
 ]
 const kindOptions = [
   { label: '到价提醒', value: 'price' },
@@ -197,9 +195,22 @@ function describe(r: AlertRule) {
       return ''
   }
 }
-function statusTag(s: string) {
-  if (s === 'triggered') return { text: '已命中', type: 'warning' as const }
-  if (s === 'paused') return { text: '已暂停', type: 'default' as const }
+function todayString() {
+  const d = new Date()
+  const mm = String(d.getMonth() + 1).padStart(2, '0')
+  const dd = String(d.getDate()).padStart(2, '0')
+  return `${d.getFullYear()}-${mm}-${dd}`
+}
+
+function isHitToday(r: AlertRule) {
+  if (r.status === 'triggered') return true
+  if (!r.triggered_at || !r.last_check_date) return false
+  return r.last_check_date === todayString()
+}
+
+function statusTag(r: AlertRule) {
+  if (isHitToday(r)) return { text: '已命中', type: 'warning' as const }
+  if (r.status === 'paused') return { text: '已暂停', type: 'default' as const }
   return { text: '生效中', type: 'success' as const }
 }
 function fmtTime(t: string | null) {
@@ -381,17 +392,17 @@ function channelKindLabel(k: string) {
           <n-spin :show="loading && !rules.length">
             <n-empty v-if="!rules.length" description="暂无提醒规则，在左侧添加一条" />
             <div v-else class="rules">
-              <div v-for="r in rules" :key="r.id" class="rule" :class="{ hit: r.status === 'triggered' }">
+              <div v-for="r in rules" :key="r.id" class="rule" :class="{ hit: isHitToday(r) }">
                 <div class="rule-main">
                   <div class="rule-title">
                     <span class="rule-name">{{ r.name || r.symbol }}</span>
                     <span class="rule-symbol qv-mono">{{ r.symbol }}</span>
-                    <n-tag size="tiny" round :bordered="false" :type="statusTag(r.status).type">{{
-                      statusTag(r.status).text
+                    <n-tag size="tiny" round :bordered="false" :type="statusTag(r).type">{{
+                      statusTag(r).text
                     }}</n-tag>
                   </div>
                   <div class="rule-cond">{{ describe(r) }}</div>
-                  <div v-if="r.status === 'triggered' && r.trigger_msg" class="rule-hit" :style="{ color: upColor }">
+                  <div v-if="isHitToday(r) && r.trigger_msg" class="rule-hit" :style="{ color: upColor }">
                     ⚡ {{ r.trigger_msg }}<span class="rule-hit-time"> · {{ fmtTime(r.triggered_at) }}</span>
                   </div>
                   <div v-else-if="r.last_check_date" class="rule-sub">

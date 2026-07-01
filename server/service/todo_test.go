@@ -21,6 +21,10 @@ func TestTodoBuild(t *testing.T) {
 	common.DB.Create(&model.AlertRule{UserID: 1, Symbol: "600000", Market: "cn", Name: "浦发银行",
 		Kind: model.AlertKindPrice, Op: model.AlertOpGTE, Threshold: 11,
 		Status: model.AlertStatusTriggered, TriggerMsg: "当日最高触及 ≥ 11", TriggeredAt: &now})
+	common.DB.Create(&model.AlertRule{UserID: 1, Symbol: "600519", Market: "cn", Name: "贵州茅台",
+		Kind: model.AlertKindPrice, Op: model.AlertOpGTE, Threshold: 1800,
+		Status: model.AlertStatusActive, TriggerMsg: "非一次性提醒今日命中", TriggeredAt: &now,
+		LastCheckDate: now.In(time.Local).Format("2006-01-02")})
 	// 他人命中（不应出现）。
 	common.DB.Create(&model.AlertRule{UserID: 2, Symbol: "000001", Market: "cn",
 		Kind: model.AlertKindPrice, Op: model.AlertOpGTE, Threshold: 1, Status: model.AlertStatusTriggered, TriggeredAt: &now})
@@ -41,14 +45,14 @@ func TestTodoBuild(t *testing.T) {
 		t.Fatalf("Build 失败: %v", err)
 	}
 
-	if res.Alerts != 1 {
-		t.Fatalf("命中提醒应为 1，得到 %d", res.Alerts)
+	if res.Alerts != 2 {
+		t.Fatalf("命中提醒应为 2，得到 %d", res.Alerts)
 	}
 	if res.Reviews != 2 {
 		t.Fatalf("推荐复盘应为 2，得到 %d", res.Reviews)
 	}
-	if res.Total != 3 {
-		t.Fatalf("待办合计应为 3，得到 %d", res.Total)
+	if res.Total != 4 {
+		t.Fatalf("待办合计应为 4，得到 %d", res.Total)
 	}
 	// 排序：优先级 1 的（提醒命中 + 止损复盘）排在过期复盘（优先级 2）之前。
 	if res.Items[len(res.Items)-1].Priority != 2 {

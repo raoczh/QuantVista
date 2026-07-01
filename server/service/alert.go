@@ -310,9 +310,15 @@ func (s *AlertService) Delete(userID, id int64) error {
 }
 
 // TriggeredForUser 返回用户当前已命中的规则（供待办聚合）。
+// once 规则命中后会进入 triggered；非 once 规则保持 active 继续评估，
+// 但只要当天触发过，也应进入今日待办。
 func (s *AlertService) TriggeredForUser(userID int64) ([]model.AlertRule, error) {
 	var rows []model.AlertRule
-	err := common.DB.Where("user_id = ? AND status = ?", userID, model.AlertStatusTriggered).
+	today := time.Now().In(time.Local).Format("2006-01-02")
+	err := common.DB.Where(
+		"user_id = ? AND (status = ? OR (triggered_at IS NOT NULL AND last_check_date = ?))",
+		userID, model.AlertStatusTriggered, today,
+	).
 		Order("triggered_at DESC").Find(&rows).Error
 	return rows, err
 }
