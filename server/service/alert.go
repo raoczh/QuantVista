@@ -309,18 +309,32 @@ func (s *AlertService) Delete(userID, id int64) error {
 	return nil
 }
 
-// TriggeredForUser 返回用户当前已命中的规则（供待办聚合）。
-// once 规则命中后会进入 triggered；非 once 规则保持 active 继续评估，
-// 但只要当天触发过，也应进入今日待办。
+// TriggeredForUser 返回用户当前应进入今日待办的命中规则。
+// once 规则命中后置 triggered，作为待处理项持续保留；
+// 非 once 规则保持 active，仅当 triggered_at 的日期为今天（今天确有命中）才纳入——
+// 不能用 last_check_date 判定，它每次评估都刷成今天，会让历史命中天天误报。
 func (s *AlertService) TriggeredForUser(userID int64) ([]model.AlertRule, error) {
 	var rows []model.AlertRule
-	today := time.Now().In(time.Local).Format("2006-01-02")
 	err := common.DB.Where(
-		"user_id = ? AND (status = ? OR (triggered_at IS NOT NULL AND last_check_date = ?))",
-		userID, model.AlertStatusTriggered, today,
+		"user_id = ? AND (status = ? OR triggered_at IS NOT NULL)",
+		userID, model.AlertStatusTriggered,
 	).
 		Order("triggered_at DESC").Find(&rows).Error
-	return rows, err
+	if err != nil {
+		return nil, err
+	}
+	today := time.Now().In(time.Local).Format("2006-01-02")
+	out := rows[:0]
+	for _, r := range rows {
+		if r.Status == model.AlertStatusTriggered {
+			out = append(out, r) // once 命中态：作为待处理项保留
+			continue
+		}
+		if r.TriggeredAt != nil && r.TriggeredAt.In(time.Local).Format("2006-01-02") == today {
+			out = append(out, r) // 非 once：今天确有命中才纳入
+		}
+	}
+	return out, nil
 }
 
 // --- 评估编排 ---
