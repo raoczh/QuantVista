@@ -65,7 +65,7 @@ func TestParseAndFilterPicks_Dedup(t *testing.T) {
 func TestNormalizePick_Clamps(t *testing.T) {
 	p := normalizePick(recPick{
 		Action: "STRONG_BUY", Confidence: 130, StopLoss: -5, TakeProfit: 12.345,
-	}, "600000")
+	}, "600000", candidate{Price: 10})
 	if p.Action != model.RecActionWatch {
 		t.Fatalf("非法 action 应回退 watch，得到 %s", p.Action)
 	}
@@ -83,6 +83,26 @@ func TestNormalizePick_Clamps(t *testing.T) {
 	}
 	if p.Reason == nil || p.Risks == nil || p.Evidence == nil || p.KeyMetrics == nil {
 		t.Fatalf("数组字段应兜底非 nil")
+	}
+}
+
+// TestNormalizePick_ShortPlan 校验短线计划价位关系、有效期和交易约束提示。
+func TestNormalizePick_ShortPlan(t *testing.T) {
+	p := normalizePick(recPick{
+		Action: "buy", Confidence: 80,
+		BuyZoneLow: 10, BuyZoneHigh: 10, TakeProfit: 11, StopLoss: 9, ValidDays: 30,
+	}, "600000", candidate{Price: 10.2})
+	if p.Action != model.RecActionWatch {
+		t.Fatalf("买入区间上下沿相等应降级为观察，得到 %s", p.Action)
+	}
+	if p.ValidDays != 10 {
+		t.Fatalf("短线有效期应限制到 10 个交易日，得到 %d", p.ValidDays)
+	}
+	if len(p.Risks) == 0 {
+		t.Fatalf("短线计划无效时应追加风险说明")
+	}
+	if len(p.Evidence) == 0 {
+		t.Fatalf("短线计划应追加 A 股交易约束提示")
 	}
 }
 

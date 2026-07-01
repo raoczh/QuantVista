@@ -2,6 +2,7 @@ package service
 
 import (
 	"testing"
+	"time"
 
 	"quantvista/common"
 	"quantvista/model"
@@ -119,30 +120,45 @@ func TestAlertCRUDIsolation(t *testing.T) {
 		Kind: model.AlertKindPrice, Op: model.AlertOpGTE, Threshold: 11, Status: model.AlertStatusActive}
 	r2 := &model.AlertRule{UserID: 1, Symbol: "000001", Market: "cn", Name: "平安银行",
 		Kind: model.AlertKindPctChange, Op: model.AlertOpLTE, Threshold: -5, Status: model.AlertStatusTriggered}
+	now := time.Now()
+	r3 := &model.AlertRule{UserID: 1, Symbol: "600519", Market: "cn", Name: "贵州茅台",
+		Kind: model.AlertKindPrice, Op: model.AlertOpGTE, Threshold: 1800, Status: model.AlertStatusActive,
+		LastCheckDate: now.In(time.Local).Format("2006-01-02"), TriggeredAt: &now, TriggerMsg: "盘中触及提醒"}
+	old := now.AddDate(0, 0, -1)
+	r4 := &model.AlertRule{UserID: 1, Symbol: "000002", Market: "cn", Name: "万科A",
+		Kind: model.AlertKindPrice, Op: model.AlertOpLTE, Threshold: 8, Status: model.AlertStatusActive,
+		LastCheckDate: old.In(time.Local).Format("2006-01-02"), TriggeredAt: &old, TriggerMsg: "昨日触及提醒"}
 	other := &model.AlertRule{UserID: 2, Symbol: "600000", Market: "cn",
 		Kind: model.AlertKindPrice, Op: model.AlertOpGTE, Threshold: 20, Status: model.AlertStatusActive}
-	for _, r := range []*model.AlertRule{r1, r2, other} {
+	for _, r := range []*model.AlertRule{r1, r2, r3, r4, other} {
 		if err := common.DB.Create(r).Error; err != nil {
 			t.Fatalf("插入失败: %v", err)
 		}
 	}
 
-	// List 用户1 → 2 条（隔离），triggered 排在前。
+	// List 用户1 → 4 条（隔离），triggered 排在前。
 	rows, err := svc.List(1, "")
 	if err != nil {
 		t.Fatalf("List 失败: %v", err)
 	}
-	if len(rows) != 2 {
-		t.Fatalf("用户1 应有 2 条，得到 %d", len(rows))
+	if len(rows) != 4 {
+		t.Fatalf("用户1 应有 4 条，得到 %d", len(rows))
 	}
 	if rows[0].Status != model.AlertStatusTriggered {
 		t.Fatalf("命中的规则应排在前，得到 %s", rows[0].Status)
 	}
 
-	// TriggeredForUser → 仅 r2。
+	// TriggeredForUser → once 触发态 + 今天命中过的非 once active；不含昨日 active 命中。
 	trig, _ := svc.TriggeredForUser(1)
-	if len(trig) != 1 || trig[0].ID != r2.ID {
-		t.Fatalf("命中列表应只含 r2: %+v", trig)
+	if len(trig) != 2 {
+		t.Fatalf("命中列表应含 2 条: %+v", trig)
+	}
+	hitIDs := map[int64]bool{}
+	for _, r := range trig {
+		hitIDs[r.ID] = true
+	}
+	if !hitIDs[r2.ID] || !hitIDs[r3.ID] || hitIDs[r4.ID] {
+		t.Fatalf("命中列表应含 r2/r3 且不含 r4: %+v", trig)
 	}
 
 	// 跨用户 Update/Delete 隔离。
@@ -168,7 +184,7 @@ func TestAlertCRUDIsolation(t *testing.T) {
 		t.Fatalf("本人删除失败: %v", err)
 	}
 	rows, _ = svc.List(1, "")
-	if len(rows) != 1 {
-		t.Fatalf("删除后应剩 1 条，得到 %d", len(rows))
+	if len(rows) != 3 {
+		t.Fatalf("删除后应剩 3 条，得到 %d", len(rows))
 	}
 }
