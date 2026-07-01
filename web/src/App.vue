@@ -52,6 +52,7 @@ const menuOptions = computed<MenuOption[]>(() => {
     { label: () => h(RouterLink, { to: '/positions' }, { default: () => '持仓' }), key: 'positions' },
     { label: () => h(RouterLink, { to: '/analysis' }, { default: () => 'AI 分析' }), key: 'analysis' },
     { label: () => h(RouterLink, { to: '/qa' }, { default: () => '问答' }), key: 'qa' },
+    { label: () => h(RouterLink, { to: '/compare' }, { default: () => '对比' }), key: 'compare' },
     { label: () => h(RouterLink, { to: '/recommendations' }, { default: () => '推荐追踪' }), key: 'recommendations' },
     { label: () => h(RouterLink, { to: '/alerts' }, { default: () => '提醒' }), key: 'alerts' },
     { label: () => h(RouterLink, { to: '/settings' }, { default: () => '设置' }), key: 'settings' },
