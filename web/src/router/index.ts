@@ -18,6 +18,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/analysis', name: 'analysis', component: () => import('@/pages/Analysis.vue'), meta: { title: 'AI 分析' } },
   { path: '/qa', name: 'qa', component: () => import('@/pages/Qa.vue'), meta: { title: '个股问答' } },
   { path: '/compare', name: 'compare', component: () => import('@/pages/Compare.vue'), meta: { title: '横向对比' } },
+  { path: '/paper', name: 'paper', component: () => import('@/pages/Paper.vue'), meta: { title: '模拟交易' } },
   { path: '/recommendations', name: 'recommendations', component: () => import('@/pages/Recommendations.vue'), meta: { title: '推荐追踪' } },
   { path: '/alerts', name: 'alerts', component: () => import('@/pages/Alerts.vue'), meta: { title: '条件提醒' } },
   { path: '/settings', name: 'settings', component: () => import('@/pages/Settings.vue'), meta: { title: '设置' } },
