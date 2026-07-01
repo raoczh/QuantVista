@@ -60,6 +60,45 @@ func (s *MarketService) GetDailyBars(ctx context.Context, market, symbol string,
 	return bars, nil
 }
 
+// QuoteRef 批量取行情的标的引用。
+type QuoteRef struct {
+	Market string
+	Symbol string
+}
+
+// QuoteKey 批量结果的 map 键。
+func QuoteKey(market, symbol string) string { return market + ":" + symbol }
+
+// QuotesFor 并发批量取行情（复用单只 GetQuote 的缓存），单只失败只是缺席不影响其余。
+// 用于自选/持仓列表富化现价；并发上限避免瞬时打爆数据源。
+func (s *MarketService) QuotesFor(ctx context.Context, refs []QuoteRef) map[string]*datasource.Quote {
+	out := make(map[string]*datasource.Quote, len(refs))
+	if len(refs) == 0 {
+		return out
+	}
+	var mu sync.Mutex
+	sem := make(chan struct{}, 8) // 并发上限 8
+	var wg sync.WaitGroup
+	for _, ref := range refs {
+		ref := ref
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			q, err := s.GetQuote(ctx, ref.Market, ref.Symbol)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			out[QuoteKey(ref.Market, ref.Symbol)] = q
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return out
+}
+
 // Overview 市场首页概览：各块独立获取，部分失败不影响整体（失败记入 Errors）。
 type Overview struct {
 	Indices  []datasource.Index         `json:"indices"`
