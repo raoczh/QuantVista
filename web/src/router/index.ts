@@ -12,6 +12,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/login/callback', name: 'oauth-callback', component: () => import('@/pages/OAuthCallback.vue'), meta: { bare: true, public: true, title: '登录中' } },
 
   { path: '/', name: 'home', component: Home, meta: { title: '市场首页' } },
+  { path: '/today', name: 'today', component: () => import('@/pages/Today.vue'), meta: { title: '今日待办' } },
   { path: '/watchlist', name: 'watchlist', component: () => import('@/pages/Watchlist.vue'), meta: { title: '自选股' } },
   { path: '/positions', name: 'positions', component: () => import('@/pages/Positions.vue'), meta: { title: '持仓' } },
   { path: '/analysis', name: 'analysis', component: () => import('@/pages/Analysis.vue'), meta: { title: 'AI 分析' } },

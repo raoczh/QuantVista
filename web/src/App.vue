@@ -47,6 +47,7 @@ const isBare = computed(() => route.meta.bare === true)
 const menuOptions = computed<MenuOption[]>(() => {
   const items: MenuOption[] = [
     { label: () => h(RouterLink, { to: '/' }, { default: () => '市场首页' }), key: 'home' },
+    { label: () => h(RouterLink, { to: '/today' }, { default: () => '待办' }), key: 'today' },
     { label: () => h(RouterLink, { to: '/watchlist' }, { default: () => '自选股' }), key: 'watchlist' },
     { label: () => h(RouterLink, { to: '/positions' }, { default: () => '持仓' }), key: 'positions' },
     { label: () => h(RouterLink, { to: '/analysis' }, { default: () => 'AI 分析' }), key: 'analysis' },
