@@ -27,6 +27,15 @@ import {
   type AlertRule,
   type AlertInput,
 } from '@/api/alert'
+import {
+  listChannels,
+  createChannel,
+  updateChannel,
+  deleteChannel,
+  testChannel,
+  type NotifyChannel,
+  type NotifyKind,
+} from '@/api/notify'
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
@@ -205,12 +214,75 @@ onMounted(async () => {
     form.value.name = String(route.query.name || '')
     router.replace({ name: 'alerts' })
   }
-  await load()
+  await Promise.all([load(), loadChannels()])
 })
+
+// ---------- 推送通道 ----------
+const channels = ref<NotifyChannel[]>([])
+const chForm = ref<{ kind: NotifyKind; name: string; target: string; enabled: boolean }>({
+  kind: 'serverchan',
+  name: '',
+  target: '',
+  enabled: true,
+})
+const kindNotifyOptions = [
+  { label: 'Server酱', value: 'serverchan' },
+  { label: '自定义 Webhook', value: 'webhook' },
+]
+async function loadChannels() {
+  try {
+    channels.value = await listChannels()
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+async function addChannel() {
+  if (!chForm.value.target.trim()) {
+    message.warning(chForm.value.kind === 'serverchan' ? '请输入 Server酱 SendKey' : '请输入 Webhook 地址')
+    return
+  }
+  try {
+    await createChannel({ ...chForm.value })
+    chForm.value.target = ''
+    chForm.value.name = ''
+    await loadChannels()
+    message.success('已添加推送通道')
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+async function toggleChannel(ch: NotifyChannel) {
+  try {
+    await updateChannel(ch.id, { kind: ch.kind, name: ch.name, enabled: !ch.enabled })
+    await loadChannels()
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+async function testCh(ch: NotifyChannel) {
+  try {
+    await testChannel(ch.id)
+    message.success('测试推送已发送，请查收')
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+async function removeChannel(ch: NotifyChannel) {
+  try {
+    await deleteChannel(ch.id)
+    await loadChannels()
+    message.success('已删除')
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+function channelKindLabel(k: string) {
+  return k === 'serverchan' ? 'Server酱' : 'Webhook'
+}
 </script>
 
 <template>
-  <PageContainer title="条件提醒" subtitle="到价 / 异动 / 均线 / 突破 · 命中按当日 OHLC 判定 · 仅页面提示不推送">
+  <PageContainer title="条件提醒" subtitle="到价 / 异动 / 均线 / 突破 · 命中按当日 OHLC 判定 · 可配推送通道主动通知">
     <template #actions>
       <n-button size="small" quaternary :loading="evaluating" @click="runEvaluate">立即检查</n-button>
       <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>
@@ -257,6 +329,49 @@ onMounted(async () => {
               <n-button type="primary" :loading="saving" @click="submit">{{ editingId ? '保存修改' : '添加提醒' }}</n-button>
             </div>
           </n-form>
+        </SectionCard>
+
+        <SectionCard title="推送通道">
+          <n-form label-placement="top" :show-feedback="false" class="form">
+            <n-form-item label="通道类型">
+              <n-select v-model:value="chForm.kind" :options="kindNotifyOptions" />
+            </n-form-item>
+            <n-form-item :label="chForm.kind === 'serverchan' ? 'SendKey' : 'Webhook 地址'">
+              <n-input
+                v-model:value="chForm.target"
+                :placeholder="chForm.kind === 'serverchan' ? 'Server酱 SendKey' : 'https://...'"
+              />
+            </n-form-item>
+            <n-button type="primary" ghost block @click="addChannel">添加通道</n-button>
+            <div class="hint">提醒命中时会主动推送到已启用的通道（同一提醒每天最多推一次）。密钥加密存储、不回显。</div>
+          </n-form>
+
+          <div v-if="channels.length" class="channels">
+            <div v-for="ch in channels" :key="ch.id" class="channel">
+              <div class="ch-main">
+                <div class="ch-title">
+                  <n-tag size="tiny" round :bordered="false" :type="ch.kind === 'serverchan' ? 'info' : 'default'">{{
+                    channelKindLabel(ch.kind)
+                  }}</n-tag>
+                  <span class="ch-name">{{ ch.name }}</span>
+                  <n-tag size="tiny" round :bordered="false" :type="ch.enabled ? 'success' : 'default'">{{
+                    ch.enabled ? '启用' : '停用'
+                  }}</n-tag>
+                </div>
+                <div v-if="ch.last_error" class="ch-err">上次推送失败：{{ ch.last_error }}</div>
+              </div>
+              <div class="ch-actions">
+                <n-button size="tiny" quaternary @click="testCh(ch)">测试</n-button>
+                <n-button size="tiny" quaternary @click="toggleChannel(ch)">{{ ch.enabled ? '停用' : '启用' }}</n-button>
+                <n-popconfirm @positive-click="removeChannel(ch)">
+                  <template #trigger>
+                    <n-button size="tiny" quaternary type="error">删</n-button>
+                  </template>
+                  删除该推送通道？
+                </n-popconfirm>
+              </div>
+            </div>
+          </div>
         </SectionCard>
       </div>
 
@@ -398,6 +513,47 @@ onMounted(async () => {
   margin-top: 3px;
 }
 .rule-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+/* 推送通道 */
+.channels {
+  display: flex;
+  flex-direction: column;
+  margin-top: 8px;
+  border-top: 1px solid var(--qv-divider);
+}
+.channel {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 4px;
+  border-bottom: 1px solid var(--qv-divider);
+}
+.channel:last-child {
+  border-bottom: none;
+}
+.ch-main {
+  flex: 1;
+  min-width: 0;
+}
+.ch-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ch-name {
+  font-size: 13px;
+  font-weight: 500;
+}
+.ch-err {
+  font-size: 11px;
+  color: v-bind('upColor');
+  margin-top: 3px;
+}
+.ch-actions {
   display: flex;
   align-items: center;
   gap: 4px;
