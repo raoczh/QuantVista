@@ -65,11 +65,35 @@ export interface SectorRank {
   source: string
 }
 
+export interface Breadth {
+  advances: number
+  declines: number
+  unchanged: number
+  limit_up: number
+  limit_down: number
+  trade_date: string
+  source: string
+  data_time: string
+}
+
+export interface MarketFundFlow {
+  trade_date: string
+  main_net: number
+  super_net: number
+  large_net: number
+  medium_net: number
+  small_net: number
+  source: string
+  data_time: string
+}
+
 export interface Overview {
   indices: Index[]
   gainers: StockRank[]
   actives: StockRank[]
   sectors: SectorRank[]
+  breadth: Breadth | null
+  fund_flow: MarketFundFlow | null
   errors: Record<string, string>
   data_time: string
 }

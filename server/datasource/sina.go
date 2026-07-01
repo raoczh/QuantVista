@@ -211,6 +211,7 @@ func (s *SinaAdapter) GetStockRanking(ctx context.Context, market, sort string, 
 	}
 	return out, nil
 }
+
 // 返回按日期升序的前复权日线；该接口不提供成交额，Amount 置 0。
 func (s *SinaAdapter) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]Bar, error) {
 	if market != "cn" {
@@ -266,4 +267,42 @@ func (s *SinaAdapter) GetDailyBars(ctx context.Context, market, symbol string, l
 		})
 	}
 	return bars, nil
+}
+
+// GetTradingDays 用上证指数（sh000001，指数不停牌）日线推导开市日序列，供交易日历回填。
+// 返回按日期升序的 YYYY-MM-DD 列表。
+func (s *SinaAdapter) GetTradingDays(ctx context.Context, market string, limit int) ([]string, error) {
+	if market != "cn" {
+		return nil, ErrNotSupported
+	}
+	if limit <= 0 || limit > 1023 {
+		limit = 1000
+	}
+	url := fmt.Sprintf(
+		"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=sh000001&scale=240&ma=no&datalen=%d",
+		limit,
+	)
+	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://finance.sina.com.cn"})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
+	}
+	var rows []struct {
+		Day string `json:"day"`
+	}
+	if err := json.Unmarshal(body, &rows); err != nil {
+		return nil, fmt.Errorf("%w: 解析失败 %v", ErrUpstream, err)
+	}
+	if len(rows) == 0 {
+		return nil, ErrNoData
+	}
+	days := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if r.Day != "" {
+			days = append(days, r.Day)
+		}
+	}
+	return days, nil
 }
