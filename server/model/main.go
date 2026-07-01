@@ -31,6 +31,9 @@ func AllModels() []any {
 		&AiConversation{},
 		&AiConversationMessage{},
 		&StockScore{},
+		&PaperAccount{},
+		&PaperHolding{},
+		&PaperTrade{},
 	}
 }
 
