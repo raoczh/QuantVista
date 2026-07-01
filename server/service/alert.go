@@ -13,13 +13,14 @@ import (
 )
 
 // AlertService 条件提醒：管理规则 + 按行情/日线评估命中（命中判定用当日 OHLC 避免漏判盘中触达）。
-// 不做主动推送，命中仅落库供待办/相关页面高亮。
+// 命中默认仅落库供待办/页面高亮；若用户配置了启用的推送通道，则额外主动推送（同日去重）。
 type AlertService struct {
 	market *MarketService
+	notify *NotifyService
 }
 
 func NewAlertService(market *MarketService) *AlertService {
-	return &AlertService{market: market}
+	return &AlertService{market: market, notify: NewNotifyService()}
 }
 
 const (
@@ -337,6 +338,13 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 	today := time.Now().In(time.Local).Format("2006-01-02")
 	hits := 0
 
+	// 用户是否配置了启用的推送通道（一批规则同属一个用户，只查一次）。
+	notifyOn := false
+	if s.notify != nil && len(rules) > 0 {
+		notifyOn = s.notify.HasEnabledChannel(rules[0].UserID)
+	}
+	var pushLines []string
+
 	for _, rule := range rules {
 		key := QuoteKey(rule.Market, rule.Symbol)
 		data, cached := cache[key]
@@ -383,8 +391,23 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 			if rule.Once {
 				updates["status"] = model.AlertStatusTriggered
 			}
+			// 同日去重：本规则今天尚未命中过才纳入推送。
+			if notifyOn && (rule.TriggeredAt == nil || rule.TriggeredAt.In(time.Local).Format("2006-01-02") != today) {
+				name := rule.Name
+				if name == "" {
+					name = rule.Symbol
+				}
+				pushLines = append(pushLines, name+"("+rule.Symbol+")："+msg)
+			}
 		}
 		common.DB.Model(&model.AlertRule{}).Where("id = ?", rule.ID).Updates(updates)
+	}
+
+	// 聚合推送本轮新命中（异步，不阻塞评估；失败不影响主流程）。
+	if notifyOn && len(pushLines) > 0 {
+		uid := rules[0].UserID
+		content := strings.Join(pushLines, "\n")
+		go s.notify.Send(uid, "QuantVista 提醒命中", content)
 	}
 	return hits
 }

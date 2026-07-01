@@ -30,6 +30,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	compareSvc := service.NewCompareService(marketSvc, llmSvc)
 	scoreSvc := service.NewScoreService(marketSvc)
 	paperSvc := service.NewPaperService(marketSvc)
+	notifySvc := service.NewNotifyService()
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc, scoreSvc)
@@ -47,6 +48,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	qaCtl := controller.NewQaController(qaSvc)
 	compareCtl := controller.NewCompareController(compareSvc)
 	paperCtl := controller.NewPaperController(paperSvc)
+	notifyCtl := controller.NewNotifyController(notifySvc)
 
 	api := r.Group("/api")
 	{
@@ -185,6 +187,16 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				paper.POST("/trade", middleware.RateLimit(60, time.Minute), paperCtl.Trade)
 				paper.GET("/trades", paperCtl.Trades)
 				paper.POST("/reset", paperCtl.Reset)
+			}
+
+			// 推送通道（Server酱/webhook；提醒命中时主动推送）
+			notify := authed.Group("/notify-channels")
+			{
+				notify.GET("", notifyCtl.List)
+				notify.POST("", notifyCtl.Create)
+				notify.PUT("/:id", notifyCtl.Update)
+				notify.DELETE("/:id", notifyCtl.Delete)
+				notify.POST("/:id/test", middleware.RateLimit(10, time.Minute), notifyCtl.Test)
 			}
 
 			// 管理员后台
