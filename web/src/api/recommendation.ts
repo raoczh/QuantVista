@@ -42,6 +42,38 @@ export interface RecDetail {
   disclaimer: string
 }
 
+export type RecOutcome =
+  | 'active'
+  | 'take_profit'
+  | 'stop_loss'
+  | 'expired'
+  | 'tracking'
+  | 'no_data'
+
+// 单条推荐的追踪状态（阶段6）。
+export interface RecTracking {
+  recommendation_id: number
+  ref_price: number
+  current_price: number
+  period_high: number
+  period_low: number
+  return_pct: number
+  max_gain_pct: number
+  max_drawdown_pct: number
+  bench_return_pct: number
+  alpha_pct: number
+  outcome: RecOutcome
+  review_needed: boolean
+  hit_take_profit: boolean
+  hit_stop_loss: boolean
+  elapsed_trade_days: number
+  valid_days: number
+  bars_count: number
+  last_eval_date: string
+  note: string
+  updated_at: string
+}
+
 export interface RecommendationItem {
   id: number
   batch_id: number
@@ -54,6 +86,23 @@ export interface RecommendationItem {
   ref_price: number
   sort_order: number
   detail: RecDetail | null
+  status: RecTracking | null
+}
+
+// 推荐历史表现统计（带样本量）。
+export interface PerformanceStats {
+  type: string
+  sample: number
+  win_rate: number
+  avg_return_pct: number
+  avg_alpha_pct: number
+  avg_max_gain_pct: number
+  avg_max_drawdown_pct: number
+  take_profit: number
+  stop_loss: number
+  expired: number
+  active: number
+  bench_sample: number
 }
 
 export interface RecommendationBatch {
@@ -101,4 +150,18 @@ export function getRecommendation(id: number) {
 
 export function deleteRecommendation(id: number) {
   return request<{ ok: boolean }>({ url: `/recommendations/${id}`, method: 'delete' })
+}
+
+// 手动刷新某批次的推荐追踪状态，返回最新详情（含 status）。
+export function trackRecommendation(id: number) {
+  return request<RecommendationView>({ url: `/recommendations/${id}/track`, method: 'post' })
+}
+
+// 推荐历史表现统计（带样本量）。
+export function getPerformance(type?: string) {
+  return request<PerformanceStats>({
+    url: '/recommendations/performance',
+    method: 'get',
+    params: { type },
+  })
 }

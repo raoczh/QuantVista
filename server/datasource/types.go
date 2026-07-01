@@ -175,3 +175,9 @@ type FundFlowProvider interface {
 type TradingDaysProvider interface {
 	GetTradingDays(ctx context.Context, market string, limit int) ([]string, error)
 }
+
+// BenchmarkBarsProvider 基准指数日线序列能力，用于推荐追踪的相对基准超额收益（alpha）。
+// 返回基准名称与按日期升序的日线（含收盘）。cn 基准为上证指数。
+type BenchmarkBarsProvider interface {
+	GetBenchmarkBars(ctx context.Context, market string, limit int) (string, []Bar, error)
+}

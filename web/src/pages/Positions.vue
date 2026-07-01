@@ -38,6 +38,7 @@ const route = useRoute()
 const router = useRouter()
 const { pctColor, vars } = useUi()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
+const warnColor = computed(() => vars.value.warningColor)
 
 const positions = ref<Position[]>([])
 const loading = ref(false)
@@ -318,7 +319,11 @@ onMounted(async () => {
                 <div class="r-sub">
                   买入 {{ fmt(p.buy_price) }} × {{ p.quantity }}
                   <span v-if="p.buy_date">· {{ p.buy_date }}</span>
+                  <span v-if="p.status === 'holding' && p.held_trade_days > 0">· 持有 {{ p.held_trade_days }} 交易日</span>
                   <span v-if="p.status === 'closed'"> · 卖出 {{ fmt(p.sell_price) }}</span>
+                </div>
+                <div v-if="p.short_term_review" class="r-hint" :style="{ color: warnColor }">
+                  ⚠ 短线已持有 {{ p.held_trade_days }} 交易日，建议复盘是否止盈/止损或转长线
                 </div>
                 <div v-if="p.status === 'closed' && p.review_note" class="r-review">
                   复盘：{{ p.review_note }}
@@ -546,6 +551,11 @@ onMounted(async () => {
   font-size: 12px;
   opacity: 0.55;
   margin-top: 2px;
+}
+.r-hint {
+  font-size: 12px;
+  font-weight: 500;
+  margin-top: 4px;
 }
 .r-figures {
   display: flex;

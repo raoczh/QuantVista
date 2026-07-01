@@ -48,6 +48,7 @@ func main() {
 
 	mgr := datasource.DefaultManager()
 	service.StartMarketJobs(mgr)
+	service.StartTrackingJobs(mgr)
 
 	if !common.DebugEnabled {
 		gin.SetMode(gin.ReleaseMode)

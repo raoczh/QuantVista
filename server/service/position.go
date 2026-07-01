@@ -35,7 +35,13 @@ type PositionView struct {
 	ProfitAmount float64 `json:"profit_amount"` // 盈亏额（已扣相关费税）
 	ProfitPct    float64 `json:"profit_pct"`    // 收益率 %
 	Realized     bool    `json:"realized"`      // 是否已实现（已平仓）
+
+	HeldTradeDays   int  `json:"held_trade_days"`   // 已持有交易日（按交易日历；持仓中且有买入日期时计算）
+	ShortTermReview bool `json:"short_term_review"` // 短线持仓持有超阈值，建议复盘
 }
+
+// shortHoldReviewDays 短线持仓超过该交易日数则提示复盘（短线一般不宜久拖）。
+const shortHoldReviewDays = 10
 
 // computeView 计算单条持仓的成本/现值/盈亏。price 为持仓中的实时现价，hasQuote 表示是否取到。
 func computeView(p model.Position, price float64, hasQuote bool) PositionView {
@@ -100,7 +106,18 @@ func (s *PositionService) List(ctx context.Context, userID int64, status string)
 		if q := quotes[QuoteKey(p.Market, p.Symbol)]; q != nil {
 			price, ok = q.Price, true
 		}
-		out = append(out, computeView(p, price, ok))
+		v := computeView(p, price, ok)
+		// 短线状态提示：持仓中且有买入日期时，按交易日历算已持有交易日，
+		// 短线持有超阈值给出复盘提示（阶段6：持仓页短线状态提示）。
+		if p.Status == model.PositionStatusHolding && p.BuyDate != "" {
+			if days, hasCal := countOpenTradeDaysAfter(p.Market, p.BuyDate); hasCal {
+				v.HeldTradeDays = days
+				if p.PositionType == model.PositionTypeShortTerm && days > shortHoldReviewDays {
+					v.ShortTermReview = true
+				}
+			}
+		}
+		out = append(out, v)
 	}
 	return out, nil
 }
