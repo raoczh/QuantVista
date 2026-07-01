@@ -28,9 +28,10 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	todoSvc := service.NewTodoService(alertSvc, positionSvc)
 	qaSvc := service.NewQaService(marketSvc, llmSvc)
 	compareSvc := service.NewCompareService(marketSvc, llmSvc)
+	scoreSvc := service.NewScoreService(marketSvc)
 
 	// controllers
-	marketCtl := controller.NewMarketController(marketSvc)
+	marketCtl := controller.NewMarketController(marketSvc, scoreSvc)
 	authCtl := controller.NewAuthController(authSvc)
 	setupCtl := controller.NewSetupController(authSvc)
 	userCtl := controller.NewUserController(userSvc)
@@ -75,6 +76,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			markets.GET("/:market/overview", marketCtl.GetOverview)
 			markets.GET("/:market/stocks/:symbol/quote", marketCtl.GetQuote)
 			markets.GET("/:market/stocks/:symbol/bars", marketCtl.GetDailyBars)
+			markets.GET("/:market/stocks/:symbol/score", marketCtl.GetScore)
 		}
 
 		// 需登录

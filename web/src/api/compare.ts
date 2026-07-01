@@ -16,6 +16,8 @@ export interface CompareRow {
   change_pct_5d: number
   change_pct_20d: number
   above_ma20: boolean
+  score: number
+  score_label: string
   error: string
 }
 

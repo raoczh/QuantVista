@@ -102,10 +102,27 @@ function bestIndex(key: 'change_pct' | 'change_pct_5d' | 'change_pct_20d') {
   })
   return idx
 }
+// 评分最高者。
+const bestScoreIndex = computed(() => {
+  let idx = -1
+  let best = -Infinity
+  rows.value.forEach((r, i) => {
+    if (r.score > best) {
+      best = r.score
+      idx = i
+    }
+  })
+  return idx
+})
+// 评分标签配色：越强越偏涨色。
+function scoreTagColor(score: number) {
+  const c = score >= 60 ? upColor.value : score >= 45 ? vars.value.textColor3 : vars.value.successColor
+  return { color: withAlpha(c, 0.14), textColor: c }
+}
 </script>
 
 <template>
-  <PageContainer title="个股横向对比" subtitle="多股并排 · 行情与技术指标 · 可选 AI 一句话点评">
+  <PageContainer title="个股横向对比" subtitle="多股并排 · 综合评分 + 行情与技术指标 · 可选 AI 一句话点评">
     <div class="cmp" :style="styleVars">
       <SectionCard title="选择标的">
         <div class="inputs">
@@ -147,6 +164,17 @@ function bestIndex(key: 'change_pct' | 'change_pct_5d' | 'change_pct_20d') {
                 </tr>
               </thead>
               <tbody>
+                <tr>
+                  <td class="metric-col">综合评分</td>
+                  <td
+                    v-for="(r, i) in rows"
+                    :key="r.symbol"
+                    :style="{ background: i === bestScoreIndex ? withAlpha(upColor, 0.12) : '' }"
+                  >
+                    <span class="score-val">{{ r.score.toFixed(0) }}</span>
+                    <n-tag size="tiny" :bordered="false" round :color="scoreTagColor(r.score)">{{ r.score_label }}</n-tag>
+                  </td>
+                </tr>
                 <tr>
                   <td class="metric-col">现价</td>
                   <td v-for="r in rows" :key="r.symbol">{{ fmt(r.price) }}</td>
@@ -276,6 +304,11 @@ function bestIndex(key: 'change_pct' | 'change_pct_5d' | 'change_pct_20d') {
 .th-symbol {
   font-size: 11px;
   opacity: 0.5;
+}
+.score-val {
+  font-size: 16px;
+  font-weight: 700;
+  margin-right: 6px;
 }
 .failed {
   font-size: 12px;

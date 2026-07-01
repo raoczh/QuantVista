@@ -15,11 +15,12 @@ import (
 
 // MarketController 行情相关接口。
 type MarketController struct {
-	svc *service.MarketService
+	svc   *service.MarketService
+	score *service.ScoreService
 }
 
-func NewMarketController(svc *service.MarketService) *MarketController {
-	return &MarketController{svc: svc}
+func NewMarketController(svc *service.MarketService, score *service.ScoreService) *MarketController {
+	return &MarketController{svc: svc, score: score}
 }
 
 // GetOverview GET /api/markets/:market/overview
@@ -68,6 +69,22 @@ func (mc *MarketController) GetDailyBars(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, bars)
+}
+
+// GetScore GET /api/markets/:market/stocks/:symbol/score
+func (mc *MarketController) GetScore(c *gin.Context) {
+	market := strings.ToLower(c.Param("market"))
+	symbol := strings.TrimSpace(c.Param("symbol"))
+	if symbol == "" {
+		common.ApiErrorMsg(c, "symbol 不能为空")
+		return
+	}
+	v, err := mc.score.Score(c.Request.Context(), market, symbol)
+	if err != nil {
+		common.ApiErrorMsg(c, "评分失败: "+err.Error())
+		return
+	}
+	common.ApiSuccess(c, v)
 }
 
 // --- 管理员：市场数据维护 ---

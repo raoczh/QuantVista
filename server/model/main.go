@@ -30,6 +30,7 @@ func AllModels() []any {
 		&AlertRule{},
 		&AiConversation{},
 		&AiConversationMessage{},
+		&StockScore{},
 	}
 }
 
