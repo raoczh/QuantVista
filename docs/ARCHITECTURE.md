@@ -120,6 +120,32 @@ Go API Server
 
 > 验收口径：任何新页面合并前，至少在 1 套亮色 + 1 套暗色主题下自检通过。
 
+### 4.2 UI 设计系统（全站统一，后续按此走）
+
+风格定位：**专业金融终端 × 现代高颜值站点**。信息密度够、层级清晰、数字对齐不跳动，同时有圆角/留白/主色点缀的现代观感。全站复用同一套基础层与组件，新页面**不再从零堆 `n-card` + 原始 `table`**。
+
+**基础层**
+
+- `web/src/styles/global.css`（在 `main.ts` 引入）：设计 token（`--qv-content-max: 1440px`、`--qv-radius-card: 14px`、字体栈）、`.qv-tnum`/`.qv-mono`/`.qv-figure` 等宽数字工具类、细滚动条。只放**与主题无关**的排版；颜色一律不写死。
+- `web/src/composables/useUi.ts`：全站取色入口，颜色全部来自 `useThemeVars()`，自动兼容 6 套主题。导出 `pctColor/pctBg`（涨红 `errorColor`/跌绿 `successColor`/平 `textColor3`）、`primaryAlpha(a)`、`withAlpha(color,a)`、`upColor/downColor`、`isDark`、`vars`。**任何涨跌/主色透明度需求走它，禁止硬编码 hex。**
+
+**通用组件**（`web/src/components/`）
+
+- `PageContainer`：页面外层，`max-width` 居中 + 标题/副标题 + `#actions` 插槽。**每个业务页最外层都用它。**
+- `SectionCard`：带主色标题条 + hover 抬升的卡片（包 `NCard`），`title` / `#extra` 插槽 / `:hoverable`。替代裸 `n-card`。
+- `StatCard`：指标卡（label + 大号数值 + 涨跌），数值色随涨跌。
+- `RankList` + `#row` 插槽：带名次徽标的榜单，替代原始 `<table>`。
+- `ChangeTag`：涨跌幅 pill（`:value` 百分比，自动 +号/配色）。
+- `BrandLogo`：主色渐变方块 + 折线 mark + 双色字标，顶栏/认证页共用。
+- `AuthShell`：认证页统一外壳（主题感知渐变背景 + 品牌 + 角落主题切换），登录/首启/回调复用。
+
+**约定**
+
+- 新页面骨架 = `PageContainer` → 若干 `SectionCard`；列表优先 `RankList`，指标优先 `StatCard`，涨跌用 `ChangeTag`/`useUi().pctColor`。
+- 数字加 `.qv-tnum`（或 `.qv-figure` 用于大号），保证对齐。
+- 图表主题感知照 §4.1（`isDark` 初始化 + `watch` 重建，语义色取 `vars.errorColor/successColor`）。
+- 仍受 §4.1 硬约束约束：组件内所有色值来自主题变量，中性描边/阴影可用 `rgba(128,128,128,…)` / `rgba(0,0,0,…)`。
+
 ## 5. 后端模块
 
 ### 5.1 Auth Service
