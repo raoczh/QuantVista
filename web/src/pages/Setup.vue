@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { NCard, NForm, NFormItem, NInput, NButton, NAlert, useMessage } from 'naive-ui'
+import { NForm, NFormItem, NInput, NButton, NAlert, useMessage } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
+import AuthShell from '@/components/AuthShell.vue'
 
 const router = useRouter()
 const message = useMessage()
@@ -31,33 +32,44 @@ async function submit() {
 </script>
 
 <template>
-  <div class="auth-wrap">
-    <n-card title="初始化 QuantVista" style="max-width: 420px; width: 100%">
-      <n-alert type="info" :show-icon="false" style="margin-bottom: 16px">
-        这是系统首次启动。请创建管理员账号——第一个账号即系统拥有者，后续可在后台开启 GitHub 登录与注册。
-      </n-alert>
-      <n-form>
-        <n-form-item label="管理员用户名">
-          <n-input v-model:value="username" placeholder="至少 3 个字符" />
-        </n-form-item>
-        <n-form-item label="密码">
-          <n-input v-model:value="password" type="password" show-password-on="click" placeholder="至少 8 个字符" />
-        </n-form-item>
-        <n-form-item label="确认密码">
-          <n-input v-model:value="confirm" type="password" show-password-on="click" @keyup.enter="submit" />
-        </n-form-item>
-        <n-button type="primary" block :loading="loading" @click="submit">创建并进入</n-button>
-      </n-form>
-    </n-card>
-  </div>
+  <AuthShell subtitle="首次启动 · 初始化系统">
+    <h2 class="auth-title">创建管理员</h2>
+    <n-alert type="info" :show-icon="false" :bordered="false" class="setup-note">
+      这是系统首次启动。第一个账号即系统拥有者，后续可在后台开启 GitHub 登录与注册。
+    </n-alert>
+    <n-form>
+      <n-form-item label="管理员用户名">
+        <n-input v-model:value="username" placeholder="至少 3 个字符" />
+      </n-form-item>
+      <n-form-item label="密码">
+        <n-input
+          v-model:value="password"
+          type="password"
+          show-password-on="click"
+          placeholder="至少 8 个字符"
+        />
+      </n-form-item>
+      <n-form-item label="确认密码">
+        <n-input
+          v-model:value="confirm"
+          type="password"
+          show-password-on="click"
+          @keyup.enter="submit"
+        />
+      </n-form-item>
+      <n-button type="primary" block :loading="loading" @click="submit">创建并进入</n-button>
+    </n-form>
+  </AuthShell>
 </template>
 
 <style scoped>
-.auth-wrap {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 100vh;
-  padding: 24px;
+.auth-title {
+  margin: 0 0 12px;
+  font-size: 20px;
+  font-weight: 700;
+}
+.setup-note {
+  margin-bottom: 16px;
+  border-radius: 10px;
 }
 </style>

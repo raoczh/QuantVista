@@ -9,11 +9,13 @@ import {
   NLayoutHeader,
   NLayoutContent,
   NMenu,
-  NTag,
   NSpace,
   NDropdown,
   NButton,
   NIcon,
+  NPopover,
+  NAvatar,
+  useThemeVars,
   zhCN,
   dateZhCN,
   type MenuOption,
@@ -24,6 +26,7 @@ import { storeToRefs } from 'pinia'
 import { useAppStore } from '@/stores/app'
 import { useThemeStore } from '@/stores/theme'
 import { useAuthStore } from '@/stores/auth'
+import BrandLogo from '@/components/BrandLogo.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -35,6 +38,8 @@ const { naiveTheme, themeOverrides, currentKey, preset } = storeToRefs(themeStor
 
 const authStore = useAuthStore()
 const { user, isAdmin, isLoggedIn } = storeToRefs(authStore)
+
+const vars = useThemeVars()
 
 // 登录/首启/回调页用整屏裸布局，不显示应用框架。
 const isBare = computed(() => route.meta.bare === true)
@@ -62,7 +67,7 @@ const themeOptions = computed<DropdownOption[]>(() =>
     label: p.label,
     icon: () =>
       h('span', {
-        style: `display:inline-block;width:14px;height:14px;border-radius:3px;background:${p.primary};border:1px solid rgba(128,128,128,.4)`,
+        style: `display:inline-block;width:14px;height:14px;border-radius:4px;background:${p.primary};border:1px solid rgba(128,128,128,.4)`,
       }),
   })),
 )
@@ -87,6 +92,17 @@ async function onSelectUser(key: string) {
   }
 }
 
+// 后端连接状态：正常/降级/不可达，收进一个圆点 + 悬浮详情。
+const health = computed(() => {
+  if (error.value || !status.value)
+    return { color: vars.value.errorColor, text: '后端不可达' }
+  if (!status.value.db) return { color: vars.value.warningColor, text: '数据库离线' }
+  return { color: vars.value.successColor, text: '运行正常' }
+})
+
+const displayName = computed(() => user.value?.display_name || user.value?.username || '')
+const avatarText = computed(() => displayName.value.slice(0, 1).toUpperCase() || 'U')
+
 onMounted(() => {
   appStore.refreshStatus()
 })
@@ -101,37 +117,129 @@ onMounted(() => {
 
       <!-- 应用主框架 -->
       <n-layout v-else style="height: 100vh">
-        <n-layout-header bordered style="display: flex; align-items: center; gap: 24px; padding: 0 24px; height: 56px">
-          <strong style="font-size: 18px">QuantVista</strong>
-          <n-menu mode="horizontal" :options="menuOptions" :value="activeKey" style="flex: 1" />
-          <n-space align="center" :size="8">
-            <n-tag v-if="status" :type="status.db ? 'success' : 'warning'" size="small" round>
-              DB {{ status.db ? 'ok' : 'off' }}
-            </n-tag>
-            <n-tag v-if="status" :type="status.redis ? 'success' : 'default'" size="small" round>
-              Redis {{ status.redis ? 'ok' : 'off' }}
-            </n-tag>
-            <n-tag v-if="status" size="small" round>v{{ status.version }}</n-tag>
-            <n-tag v-if="error" type="error" size="small" round>后端不可达</n-tag>
+        <n-layout-header bordered class="app-header">
+          <RouterLink to="/" class="logo-link">
+            <BrandLogo :size="30" />
+          </RouterLink>
+          <n-menu mode="horizontal" :options="menuOptions" :value="activeKey" class="app-menu" />
+          <n-space align="center" :size="10" class="header-right">
+            <!-- 后端状态：圆点 + 悬浮详情，替代原先一排调试标签 -->
+            <n-popover trigger="hover" placement="bottom">
+              <template #trigger>
+                <div class="health-dot-wrap">
+                  <span class="health-dot" :style="{ background: health.color }" />
+                </div>
+              </template>
+              <div class="health-detail">
+                <div class="health-row">
+                  <span class="health-label">状态</span>
+                  <span :style="{ color: health.color, fontWeight: 600 }">{{ health.text }}</span>
+                </div>
+                <div class="health-row">
+                  <span class="health-label">数据库</span>
+                  <span>{{ status?.db ? '已连接' : '离线' }}</span>
+                </div>
+                <div class="health-row">
+                  <span class="health-label">Redis</span>
+                  <span>{{ status?.redis ? '已连接' : '未启用' }}</span>
+                </div>
+                <div v-if="status?.version" class="health-row">
+                  <span class="health-label">版本</span>
+                  <span class="qv-mono">v{{ status.version }}</span>
+                </div>
+              </div>
+            </n-popover>
+
             <n-dropdown trigger="click" :options="themeOptions" :value="currentKey" @select="onSelectTheme">
               <n-button quaternary size="small">
                 <template #icon>
                   <n-icon>
-                    <span :style="`display:inline-block;width:14px;height:14px;border-radius:3px;background:${preset.primary}`" />
+                    <span :style="`display:inline-block;width:14px;height:14px;border-radius:4px;background:${preset.primary}`" />
                   </n-icon>
                 </template>
                 {{ preset.label }}
               </n-button>
             </n-dropdown>
+
             <n-dropdown v-if="isLoggedIn" trigger="click" :options="userOptions" @select="onSelectUser">
-              <n-button quaternary size="small">{{ user?.display_name || user?.username }}</n-button>
+              <div class="user-chip">
+                <n-avatar round :size="26" :style="{ background: vars.primaryColor, color: '#fff' }">
+                  {{ avatarText }}
+                </n-avatar>
+                <span class="user-name">{{ displayName }}</span>
+              </div>
             </n-dropdown>
           </n-space>
         </n-layout-header>
-        <n-layout-content content-style="padding: 24px" :native-scrollbar="false">
+        <n-layout-content content-style="padding: 24px 28px" :native-scrollbar="false">
           <RouterView />
         </n-layout-content>
       </n-layout>
     </n-message-provider>
   </n-config-provider>
 </template>
+
+<style scoped>
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  padding: 0 24px;
+  height: 60px;
+}
+.logo-link {
+  text-decoration: none;
+  flex-shrink: 0;
+}
+.app-menu {
+  flex: 1;
+}
+.header-right {
+  flex-shrink: 0;
+}
+.health-dot-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  cursor: default;
+}
+.health-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 3px rgba(128, 128, 128, 0.12);
+}
+.health-detail {
+  min-width: 168px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.health-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  font-size: 13px;
+}
+.health-label {
+  opacity: 0.6;
+}
+.user-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  padding: 3px 10px 3px 3px;
+  border-radius: 999px;
+  transition: background 0.15s ease;
+}
+.user-chip:hover {
+  background: rgba(128, 128, 128, 0.1);
+}
+.user-name {
+  font-size: 13px;
+  font-weight: 500;
+}
+</style>

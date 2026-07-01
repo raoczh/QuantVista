@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 import {
-  NCard,
   NSpace,
   NForm,
   NFormItem,
@@ -23,6 +22,8 @@ import {
 } from '@/api/admin'
 import type { AuthUser } from '@/api/auth'
 import { useAuthStore } from '@/stores/auth'
+import PageContainer from '@/components/PageContainer.vue'
+import SectionCard from '@/components/SectionCard.vue'
 
 const message = useMessage()
 const auth = useAuthStore()
@@ -106,80 +107,94 @@ onMounted(() => {
 </script>
 
 <template>
-  <n-space vertical :size="16">
-    <!-- 注册开关 -->
-    <n-card title="注册策略">
-      <n-space align="center">
-        <span>开放 GitHub 注册：</span>
-        <n-switch
-          :value="settings?.registration_open ?? false"
-          :loading="savingReg"
-          @update:value="toggleRegistration"
-        />
-        <span style="opacity: 0.7">关闭时，仅已存在的账号可登录，新 GitHub 用户无法注册。</span>
-      </n-space>
-    </n-card>
-
-    <!-- GitHub OAuth -->
-    <n-card title="GitHub 登录">
-      <n-alert type="info" :show-icon="false" style="margin-bottom: 16px">
-        在 GitHub OAuth App 中将「Authorization callback URL」设置为：<strong>{{ callbackHint }}</strong>
-      </n-alert>
-      <n-form label-placement="left" label-width="120" style="max-width: 560px">
-        <n-form-item label="Client ID">
-          <n-input v-model:value="gh.client_id" placeholder="GitHub OAuth App Client ID" />
-        </n-form-item>
-        <n-form-item label="Client Secret">
-          <n-input
-            v-model:value="gh.client_secret"
-            type="password"
-            show-password-on="click"
-            :placeholder="settings?.has_github_secret ? '已配置，留空表示保留原值' : '请输入 Client Secret'"
+  <PageContainer title="管理后台" subtitle="系统设置与用户管理">
+    <div class="admin-stack">
+      <!-- 注册开关 -->
+      <SectionCard title="注册策略" :hoverable="false">
+        <n-space align="center">
+          <span>开放 GitHub 注册：</span>
+          <n-switch
+            :value="settings?.registration_open ?? false"
+            :loading="savingReg"
+            @update:value="toggleRegistration"
           />
-        </n-form-item>
-        <n-form-item label="启用 GitHub 登录">
-          <n-switch v-model:value="gh.enabled" />
-        </n-form-item>
-        <n-button type="primary" :loading="savingGithub" @click="saveGithub">保存 GitHub 设置</n-button>
-      </n-form>
-    </n-card>
+          <span style="opacity: 0.6">关闭时，仅已存在的账号可登录，新 GitHub 用户无法注册。</span>
+        </n-space>
+      </SectionCard>
 
-    <!-- 用户管理 -->
-    <n-card title="用户管理">
-      <n-table :bordered="false" :single-line="false">
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>用户名</th>
-            <th>角色</th>
-            <th>状态</th>
-            <th>操作</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="u in users" :key="u.id">
-            <td>{{ u.id }}</td>
-            <td>{{ u.display_name || u.username }}</td>
-            <td>
-              <n-tag :type="u.role === 'admin' ? 'info' : 'default'" size="small" round>{{ u.role }}</n-tag>
-            </td>
-            <td>
-              <n-tag :type="u.status === 'enabled' ? 'success' : 'error'" size="small" round>{{ u.status }}</n-tag>
-            </td>
-            <td>
-              <n-popconfirm v-if="u.id !== auth.user?.id" @positive-click="toggleStatus(u)">
-                <template #trigger>
-                  <n-button size="tiny" :type="u.status === 'enabled' ? 'error' : 'primary'">
-                    {{ u.status === 'enabled' ? '禁用' : '启用' }}
-                  </n-button>
-                </template>
-                {{ u.status === 'enabled' ? '禁用该用户并强制登出？' : '重新启用该用户？' }}
-              </n-popconfirm>
-              <span v-else style="opacity: 0.5">当前账号</span>
-            </td>
-          </tr>
-        </tbody>
-      </n-table>
-    </n-card>
-  </n-space>
+      <!-- GitHub OAuth -->
+      <SectionCard title="GitHub 登录" :hoverable="false">
+        <n-alert type="info" :show-icon="false" :bordered="false" class="note">
+          在 GitHub OAuth App 中将「Authorization callback URL」设置为：<strong>{{ callbackHint }}</strong>
+        </n-alert>
+        <n-form label-placement="left" label-width="120" style="max-width: 560px">
+          <n-form-item label="Client ID">
+            <n-input v-model:value="gh.client_id" placeholder="GitHub OAuth App Client ID" />
+          </n-form-item>
+          <n-form-item label="Client Secret">
+            <n-input
+              v-model:value="gh.client_secret"
+              type="password"
+              show-password-on="click"
+              :placeholder="settings?.has_github_secret ? '已配置，留空表示保留原值' : '请输入 Client Secret'"
+            />
+          </n-form-item>
+          <n-form-item label="启用 GitHub 登录">
+            <n-switch v-model:value="gh.enabled" />
+          </n-form-item>
+          <n-button type="primary" :loading="savingGithub" @click="saveGithub">保存 GitHub 设置</n-button>
+        </n-form>
+      </SectionCard>
+
+      <!-- 用户管理 -->
+      <SectionCard title="用户管理" :hoverable="false">
+        <n-table :bordered="false" :single-line="false">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>用户名</th>
+              <th>角色</th>
+              <th>状态</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="u in users" :key="u.id">
+              <td>{{ u.id }}</td>
+              <td>{{ u.display_name || u.username }}</td>
+              <td>
+                <n-tag :type="u.role === 'admin' ? 'info' : 'default'" size="small" round>{{ u.role }}</n-tag>
+              </td>
+              <td>
+                <n-tag :type="u.status === 'enabled' ? 'success' : 'error'" size="small" round>{{ u.status }}</n-tag>
+              </td>
+              <td>
+                <n-popconfirm v-if="u.id !== auth.user?.id" @positive-click="toggleStatus(u)">
+                  <template #trigger>
+                    <n-button size="tiny" :type="u.status === 'enabled' ? 'error' : 'primary'">
+                      {{ u.status === 'enabled' ? '禁用' : '启用' }}
+                    </n-button>
+                  </template>
+                  {{ u.status === 'enabled' ? '禁用该用户并强制登出？' : '重新启用该用户？' }}
+                </n-popconfirm>
+                <span v-else style="opacity: 0.5">当前账号</span>
+              </td>
+            </tr>
+          </tbody>
+        </n-table>
+      </SectionCard>
+    </div>
+  </PageContainer>
 </template>
+
+<style scoped>
+.admin-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.note {
+  margin-bottom: 16px;
+  border-radius: 10px;
+}
+</style>

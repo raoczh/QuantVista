@@ -4,7 +4,6 @@ import { useRouter } from 'vue-router'
 import {
   NTabs,
   NTabPane,
-  NCard,
   NButton,
   NSpace,
   NTable,
@@ -32,6 +31,8 @@ import {
 } from '@/api/llm'
 import { getPreference, updatePreference, changePassword, type UserPreference } from '@/api/user'
 import { useAuthStore } from '@/stores/auth'
+import PageContainer from '@/components/PageContainer.vue'
+import SectionCard from '@/components/SectionCard.vue'
 
 const message = useMessage()
 const router = useRouter()
@@ -218,13 +219,15 @@ onMounted(() => {
 </script>
 
 <template>
-  <n-tabs type="line" animated>
+  <PageContainer title="设置" subtitle="模型 · 偏好 · 账号安全">
+    <n-tabs type="line" animated>
     <!-- LLM 配置 -->
     <n-tab-pane name="llm" tab="LLM 配置">
-      <n-card>
-        <template #header-extra>
+      <SectionCard :hoverable="false">
+        <div class="card-toolbar">
+          <span class="ct-title">已配置的模型服务</span>
           <n-button type="primary" size="small" @click="openCreate">新增配置</n-button>
-        </template>
+        </div>
         <n-empty v-if="!loadingConfigs && configs.length === 0" description="还没有 LLM 配置" />
         <n-table v-else :bordered="false" :single-line="false">
           <thead>
@@ -263,12 +266,12 @@ onMounted(() => {
             </tr>
           </tbody>
         </n-table>
-      </n-card>
+      </SectionCard>
     </n-tab-pane>
 
     <!-- 用户偏好 -->
     <n-tab-pane name="pref" tab="偏好设置">
-      <n-card>
+      <SectionCard :hoverable="false">
         <n-form v-if="pref" label-placement="left" label-width="120" style="max-width: 480px">
           <n-form-item label="风险等级">
             <n-select v-model:value="pref.risk_level" :options="riskOptions" />
@@ -287,12 +290,12 @@ onMounted(() => {
           </n-form-item>
           <n-button type="primary" :loading="savingPref" @click="savePref">保存偏好</n-button>
         </n-form>
-      </n-card>
+      </SectionCard>
     </n-tab-pane>
 
     <!-- 账号安全 -->
     <n-tab-pane name="account" tab="账号安全">
-      <n-card title="修改密码">
+      <SectionCard title="修改密码" :hoverable="false">
         <n-form label-placement="left" label-width="120" style="max-width: 480px">
           <n-form-item label="原密码">
             <n-input v-model:value="pw.old" type="password" show-password-on="click" placeholder="纯 GitHub 账号首次设密码可留空" />
@@ -305,9 +308,10 @@ onMounted(() => {
           </n-form-item>
           <n-button type="primary" :loading="savingPw" @click="submitChangePassword">修改密码</n-button>
         </n-form>
-      </n-card>
+      </SectionCard>
     </n-tab-pane>
-  </n-tabs>
+    </n-tabs>
+  </PageContainer>
 
   <!-- 新增/编辑配置弹窗 -->
   <n-modal v-model:show="showModal" preset="card" :title="editingId ? '编辑 LLM 配置' : '新增 LLM 配置'" style="max-width: 520px">
@@ -356,3 +360,16 @@ onMounted(() => {
     </template>
   </n-modal>
 </template>
+
+<style scoped>
+.card-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+.ct-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+</style>

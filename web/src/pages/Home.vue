@@ -1,23 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, nextTick, watch, computed } from 'vue'
-import {
-  NCard,
-  NSpace,
-  NInput,
-  NButton,
-  NStatistic,
-  NGrid,
-  NGi,
-  NText,
-  NAlert,
-  NTable,
-  NTag,
-  NEmpty,
-  NSpin,
-  useMessage,
-} from 'naive-ui'
+import { NInput, NButton, NGrid, NGi, NSpin, NEmpty, NAlert, NTag, useMessage } from 'naive-ui'
 import * as echarts from 'echarts'
-import { storeToRefs } from 'pinia'
 import {
   getQuote,
   getDailyBars,
@@ -26,10 +10,15 @@ import {
   type Bar,
   type Overview,
 } from '@/api/market'
-import { useThemeStore } from '@/stores/theme'
+import { useUi } from '@/composables/useUi'
+import PageContainer from '@/components/PageContainer.vue'
+import SectionCard from '@/components/SectionCard.vue'
+import StatCard from '@/components/StatCard.vue'
+import RankList from '@/components/RankList.vue'
+import ChangeTag from '@/components/ChangeTag.vue'
 
 const message = useMessage()
-const { isDark } = storeToRefs(useThemeStore())
+const { vars, isDark, pctColor, upColor, downColor } = useUi()
 
 // ---------- 市场概览 ----------
 const overview = ref<Overview | null>(null)
@@ -81,17 +70,20 @@ function renderChart(bars: Bar[]) {
     chart = null
   }
   chart = echarts.init(chartEl.value, isDark.value ? 'dark' : undefined)
+  // 涨红跌绿取自主题语义色，坐标轴/背景交给 echarts 主题跟随明暗。
+  const up = vars.value.errorColor
+  const down = vars.value.successColor
   chart.setOption({
     backgroundColor: 'transparent',
-    tooltip: { trigger: 'axis' },
-    grid: { left: 50, right: 20, top: 20, bottom: 40 },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
+    grid: { left: 52, right: 16, top: 16, bottom: 36 },
     xAxis: { type: 'category', data: bars.map((b) => b.trade_date), boundaryGap: false },
-    yAxis: { type: 'value', scale: true },
+    yAxis: { type: 'value', scale: true, splitLine: { lineStyle: { opacity: 0.4 } } },
     series: [
       {
         type: 'candlestick',
         data: bars.map((b) => [b.open, b.close, b.low, b.high]),
-        itemStyle: { color: '#ef4444', color0: '#22c55e', borderColor: '#ef4444', borderColor0: '#22c55e' },
+        itemStyle: { color: up, color0: down, borderColor: up, borderColor0: down },
       },
     ],
   })
@@ -101,19 +93,20 @@ watch(isDark, () => {
   if (lastBars.value.length) renderChart(lastBars.value)
 })
 
-// ---------- 展示辅助（涨红跌绿用语义色，跟随主题）----------
+// ---------- 展示辅助 ----------
 function fmt(n: number | undefined) {
   return n == null ? '-' : n.toFixed(2)
-}
-function fmtPct(n: number) {
-  return (n >= 0 ? '+' : '') + n.toFixed(2) + '%'
-}
-function pctType(n: number): 'error' | 'success' | 'default' {
-  return n > 0 ? 'error' : n < 0 ? 'success' : 'default'
 }
 function fmtAmount(n: number) {
   if (!n) return '-'
   return (n / 1e8).toFixed(2) + ' 亿'
+}
+function fmtVol(n: number) {
+  if (!n) return '-'
+  return n >= 1e4 ? (n / 1e4).toFixed(1) + ' 万手' : n + ' 手'
+}
+function fmtTime(t: string | undefined) {
+  return t ? new Date(t).toLocaleTimeString('zh-CN', { hour12: false }) : '-'
 }
 
 const sectorsUnavailable = computed(() => !!overview.value?.errors?.sectors)
@@ -126,142 +119,269 @@ onMounted(() => {
 </script>
 
 <template>
-  <n-space vertical :size="16">
-    <!-- 指数概览 -->
-    <n-card size="small">
-      <template #header>
-        <n-space align="center" :size="10">
-          <span>指数概览</span>
-          <n-text depth="3" style="font-size: 12px" v-if="overview">
-            更新 {{ new Date(overview.data_time).toLocaleTimeString() }}
-          </n-text>
-        </n-space>
-      </template>
-      <template #header-extra>
-        <n-button size="tiny" :loading="ovLoading" @click="loadOverview">刷新</n-button>
-      </template>
-      <n-spin :show="ovLoading && !overview">
-        <n-grid v-if="overview?.indices?.length" :cols="3" :x-gap="12" :y-gap="12" responsive="screen">
-          <n-gi v-for="ix in overview.indices" :key="ix.code">
-            <n-space vertical :size="2">
-              <n-text depth="2" style="font-size: 13px">{{ ix.name }}</n-text>
-              <n-space align="baseline" :size="8">
-                <n-text :type="pctType(ix.change_pct)" style="font-size: 20px; font-weight: 600">
-                  {{ fmt(ix.price) }}
-                </n-text>
-                <n-text :type="pctType(ix.change_pct)">{{ fmtPct(ix.change_pct) }}</n-text>
-              </n-space>
-            </n-space>
-          </n-gi>
-        </n-grid>
-        <n-empty v-else description="指数数据暂不可用" />
-      </n-spin>
-    </n-card>
+  <PageContainer title="市场首页" subtitle="A 股 · 实时概览与个股速查">
+    <template #actions>
+      <n-tag v-if="overview" size="small" round :bordered="false">
+        更新 {{ fmtTime(overview.data_time) }}
+      </n-tag>
+      <n-button size="small" secondary :loading="ovLoading" @click="loadOverview">刷新</n-button>
+    </template>
 
-    <!-- 涨幅榜 + 热门(成交额)榜 -->
-    <n-grid :cols="2" :x-gap="16" :y-gap="16" responsive="screen" item-responsive>
-      <n-gi span="2 m:1">
-        <n-card title="涨幅榜" size="small">
-          <n-table v-if="overview?.gainers?.length" size="small" :bordered="false" :single-line="false">
-            <thead>
-              <tr><th>名称</th><th style="text-align: right">现价</th><th style="text-align: right">涨跌幅</th><th style="text-align: right">成交额</th></tr>
-            </thead>
-            <tbody>
-              <tr v-for="s in overview.gainers" :key="s.symbol">
-                <td>{{ s.name }} <n-text depth="3" style="font-size: 12px">{{ s.symbol }}</n-text></td>
-                <td style="text-align: right">{{ fmt(s.price) }}</td>
-                <td style="text-align: right"><n-text :type="pctType(s.change_pct)">{{ fmtPct(s.change_pct) }}</n-text></td>
-                <td style="text-align: right">{{ fmtAmount(s.amount) }}</td>
-              </tr>
-            </tbody>
-          </n-table>
-          <n-empty v-else description="暂不可用" />
-        </n-card>
-      </n-gi>
-      <n-gi span="2 m:1">
-        <n-card title="热门榜（成交额）" size="small">
-          <n-table v-if="overview?.actives?.length" size="small" :bordered="false" :single-line="false">
-            <thead>
-              <tr><th>名称</th><th style="text-align: right">现价</th><th style="text-align: right">涨跌幅</th><th style="text-align: right">成交额</th></tr>
-            </thead>
-            <tbody>
-              <tr v-for="s in overview.actives" :key="s.symbol">
-                <td>{{ s.name }} <n-text depth="3" style="font-size: 12px">{{ s.symbol }}</n-text></td>
-                <td style="text-align: right">{{ fmt(s.price) }}</td>
-                <td style="text-align: right"><n-text :type="pctType(s.change_pct)">{{ fmtPct(s.change_pct) }}</n-text></td>
-                <td style="text-align: right">{{ fmtAmount(s.amount) }}</td>
-              </tr>
-            </tbody>
-          </n-table>
-          <n-empty v-else description="暂不可用" />
-        </n-card>
-      </n-gi>
-    </n-grid>
+    <div class="dashboard">
+      <!-- 指数概览 -->
+      <SectionCard title="指数概览">
+        <n-spin :show="ovLoading && !overview">
+          <n-grid
+            v-if="overview?.indices?.length"
+            cols="2 s:3 l:4"
+            :x-gap="14"
+            :y-gap="14"
+            responsive="screen"
+          >
+            <n-gi v-for="ix in overview.indices" :key="ix.code">
+              <StatCard :label="ix.name" :value="fmt(ix.price)" :change-pct="ix.change_pct" />
+            </n-gi>
+          </n-grid>
+          <n-empty v-else description="指数数据暂不可用" />
+        </n-spin>
+      </SectionCard>
 
-    <!-- 板块榜 + 市场情绪 -->
-    <n-grid :cols="2" :x-gap="16" :y-gap="16" responsive="screen" item-responsive>
-      <n-gi span="2 m:1">
-        <n-card title="板块涨跌榜" size="small">
-          <template #header-extra v-if="sectorsUnavailable">
-            <n-tag size="small" type="warning" round>数据源繁忙</n-tag>
-          </template>
-          <n-table v-if="overview?.sectors?.length" size="small" :bordered="false" :single-line="false">
-            <thead>
-              <tr><th>板块</th><th style="text-align: right">涨跌幅</th><th>领涨</th></tr>
-            </thead>
-            <tbody>
-              <tr v-for="s in overview.sectors" :key="s.code">
-                <td>{{ s.name }}</td>
-                <td style="text-align: right"><n-text :type="pctType(s.change_pct)">{{ fmtPct(s.change_pct) }}</n-text></td>
-                <td>{{ s.leader || '-' }}</td>
-              </tr>
-            </tbody>
-          </n-table>
-          <n-empty v-else description="板块榜依赖东财接口，当前限流暂不可用，稍后重试" />
-        </n-card>
-      </n-gi>
-      <n-gi span="2 m:1">
-        <n-card title="市场情绪" size="small">
-          <n-empty description="涨跌家数 / 涨跌停 / 波动率（待数据源接入，阶段 2+）" />
-        </n-card>
-      </n-gi>
-    </n-grid>
+      <!-- 涨幅榜 + 热门榜 -->
+      <n-grid cols="1 m:2" :x-gap="16" :y-gap="16" responsive="screen">
+        <n-gi>
+          <SectionCard title="涨幅榜">
+            <RankList v-if="overview?.gainers?.length" :items="overview.gainers">
+              <template #row="{ item }">
+                <div class="stock-row">
+                  <div class="sr-name">
+                    <span class="sr-title">{{ item.name }}</span>
+                    <span class="sr-symbol qv-mono">{{ item.symbol }}</span>
+                  </div>
+                  <div class="sr-figures">
+                    <span class="sr-price qv-tnum">{{ fmt(item.price) }}</span>
+                    <ChangeTag :value="item.change_pct" size="small" />
+                    <span class="sr-amount qv-tnum">{{ fmtAmount(item.amount) }}</span>
+                  </div>
+                </div>
+              </template>
+            </RankList>
+            <n-empty v-else description="暂不可用" />
+          </SectionCard>
+        </n-gi>
+        <n-gi>
+          <SectionCard title="热门榜（成交额）">
+            <RankList v-if="overview?.actives?.length" :items="overview.actives">
+              <template #row="{ item }">
+                <div class="stock-row">
+                  <div class="sr-name">
+                    <span class="sr-title">{{ item.name }}</span>
+                    <span class="sr-symbol qv-mono">{{ item.symbol }}</span>
+                  </div>
+                  <div class="sr-figures">
+                    <span class="sr-price qv-tnum">{{ fmt(item.price) }}</span>
+                    <ChangeTag :value="item.change_pct" size="small" />
+                    <span class="sr-amount qv-tnum">{{ fmtAmount(item.amount) }}</span>
+                  </div>
+                </div>
+              </template>
+            </RankList>
+            <n-empty v-else description="暂不可用" />
+          </SectionCard>
+        </n-gi>
+      </n-grid>
 
-    <!-- 个股速查 -->
-    <n-card title="个股速查" size="small">
-      <n-space vertical :size="12">
-        <n-space>
-          <n-input v-model:value="symbol" placeholder="股票代码，如 600000" style="width: 200px" @keyup.enter="loadStock" />
+      <!-- 板块榜 + 市场情绪 -->
+      <n-grid cols="1 m:2" :x-gap="16" :y-gap="16" responsive="screen">
+        <n-gi>
+          <SectionCard title="板块涨跌榜">
+            <template v-if="sectorsUnavailable" #extra>
+              <n-tag size="small" type="warning" round :bordered="false">数据源繁忙</n-tag>
+            </template>
+            <RankList v-if="overview?.sectors?.length" :items="overview.sectors">
+              <template #row="{ item }">
+                <div class="stock-row">
+                  <span class="sr-title">{{ item.name }}</span>
+                  <div class="sr-figures">
+                    <ChangeTag :value="item.change_pct" size="small" />
+                    <span class="sr-leader">领涨 {{ item.leader || '-' }}</span>
+                  </div>
+                </div>
+              </template>
+            </RankList>
+            <n-empty v-else description="板块榜依赖东财接口，当前限流暂不可用，稍后重试" />
+          </SectionCard>
+        </n-gi>
+        <n-gi>
+          <SectionCard title="市场情绪">
+            <n-empty description="涨跌家数 / 涨跌停 / 波动率 —— 待数据源接入（阶段 2+）" />
+          </SectionCard>
+        </n-gi>
+      </n-grid>
+
+      <!-- 个股速查 -->
+      <SectionCard title="个股速查">
+        <template #extra>
+          <span class="hint">东财（主）/ 新浪（备） · 仅 A 股已打通</span>
+        </template>
+        <div class="quote-search">
+          <n-input
+            v-model:value="symbol"
+            placeholder="股票代码，如 600000"
+            style="width: 200px"
+            @keyup.enter="loadStock"
+          />
           <n-button type="primary" :loading="loading" @click="loadStock">查询</n-button>
-          <n-text depth="3">数据源：东财（主）/ 新浪（备）· 仅 A 股已打通</n-text>
-        </n-space>
+        </div>
 
-        <n-grid v-if="quote" :cols="4" :x-gap="12" :y-gap="12">
-          <n-gi><n-statistic label="现价" :value="fmt(quote.price)" /></n-gi>
-          <n-gi>
-            <n-statistic label="涨跌幅(%)">
-              <n-text :type="pctType(quote.change_pct)">{{ fmt(quote.change_pct) }}</n-text>
-            </n-statistic>
-          </n-gi>
-          <n-gi><n-statistic label="今开" :value="fmt(quote.open)" /></n-gi>
-          <n-gi><n-statistic label="昨收" :value="fmt(quote.prev_close)" /></n-gi>
-          <n-gi><n-statistic label="最高" :value="fmt(quote.high)" /></n-gi>
-          <n-gi><n-statistic label="最低" :value="fmt(quote.low)" /></n-gi>
-          <n-gi><n-statistic label="成交量(手)" :value="quote.volume" /></n-gi>
-          <n-gi><n-statistic label="成交额" :value="fmtAmount(quote.amount)" /></n-gi>
-        </n-grid>
+        <div v-if="quote" class="quote-panel">
+          <div class="quote-hero">
+            <span class="qh-price qv-figure" :style="{ color: pctColor(quote.change_pct) }">
+              {{ fmt(quote.price) }}
+            </span>
+            <ChangeTag :value="quote.change_pct" />
+          </div>
+          <div class="quote-grid">
+            <div class="quote-cell">
+              <span class="qc-label">今开</span>
+              <span class="qc-value qv-tnum">{{ fmt(quote.open) }}</span>
+            </div>
+            <div class="quote-cell">
+              <span class="qc-label">昨收</span>
+              <span class="qc-value qv-tnum">{{ fmt(quote.prev_close) }}</span>
+            </div>
+            <div class="quote-cell">
+              <span class="qc-label">最高</span>
+              <span class="qc-value qv-tnum" :style="{ color: upColor }">{{ fmt(quote.high) }}</span>
+            </div>
+            <div class="quote-cell">
+              <span class="qc-label">最低</span>
+              <span class="qc-value qv-tnum" :style="{ color: downColor }">{{ fmt(quote.low) }}</span>
+            </div>
+            <div class="quote-cell">
+              <span class="qc-label">成交量</span>
+              <span class="qc-value qv-tnum">{{ fmtVol(quote.volume) }}</span>
+            </div>
+            <div class="quote-cell">
+              <span class="qc-label">成交额</span>
+              <span class="qc-value qv-tnum">{{ fmtAmount(quote.amount) }}</span>
+            </div>
+          </div>
+        </div>
 
-        <div ref="chartEl" style="width: 100%; height: 320px"></div>
-      </n-space>
-    </n-card>
+        <div ref="chartEl" class="quote-chart"></div>
+      </SectionCard>
 
-    <!-- 占位 -->
-    <n-card title="资金流 / 财经新闻 / AI 今日观点" size="small">
-      <n-empty description="待阶段 4+ 接入（资金流向、新闻情绪、AI 市场摘要）" />
-    </n-card>
+      <!-- 占位 -->
+      <SectionCard title="资金流 / 财经新闻 / AI 今日观点">
+        <n-empty description="待阶段 4+ 接入（资金流向、新闻情绪、AI 市场摘要）" />
+      </SectionCard>
 
-    <n-alert type="warning" title="风险提示">
-      本内容仅供研究参考，不构成投资建议。AI 可能出错，数据可能延迟或不完整，投资决策需由用户自行承担风险。
-    </n-alert>
-  </n-space>
+      <n-alert type="warning" title="风险提示" :bordered="false">
+        本内容仅供研究参考，不构成投资建议。AI 可能出错，数据可能延迟或不完整，投资决策需由用户自行承担风险。
+      </n-alert>
+    </div>
+  </PageContainer>
 </template>
+
+<style scoped>
+.dashboard {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* 榜单行 */
+.stock-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+}
+.sr-name {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.sr-title {
+  font-size: 14px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sr-symbol {
+  font-size: 12px;
+  opacity: 0.5;
+}
+.sr-figures {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.sr-price {
+  font-size: 14px;
+  min-width: 56px;
+  text-align: right;
+}
+.sr-amount {
+  font-size: 12px;
+  opacity: 0.6;
+  min-width: 64px;
+  text-align: right;
+}
+.sr-leader {
+  font-size: 12px;
+  opacity: 0.6;
+}
+
+/* 个股速查 */
+.hint {
+  font-size: 12px;
+  opacity: 0.55;
+}
+.quote-search {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.quote-panel {
+  margin-bottom: 12px;
+}
+.quote-hero {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.qh-price {
+  font-size: 34px;
+  font-weight: 700;
+  line-height: 1;
+}
+.quote-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 10px 16px;
+}
+.quote-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.qc-label {
+  font-size: 12px;
+  opacity: 0.55;
+}
+.qc-value {
+  font-size: 16px;
+  font-weight: 500;
+}
+.quote-chart {
+  width: 100%;
+  height: 340px;
+  margin-top: 8px;
+}
+</style>
