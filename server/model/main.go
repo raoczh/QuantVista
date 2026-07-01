@@ -34,6 +34,7 @@ func AllModels() []any {
 		&PaperAccount{},
 		&PaperHolding{},
 		&PaperTrade{},
+		&NotifyChannel{},
 	}
 }
 
