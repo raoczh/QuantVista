@@ -269,7 +269,53 @@ func (s *SinaAdapter) GetDailyBars(ctx context.Context, market, symbol string, l
 	return bars, nil
 }
 
-// GetTradingDays 用上证指数（sh000001，指数不停牌）日线推导开市日序列，供交易日历回填。
+// GetBenchmarkBars 取基准指数日线（cn=上证指数 sh000001），供推荐追踪计算超额收益/alpha。
+// 复用与 GetTradingDays 相同的上证指数 KLine 接口，但保留完整 OHLC；返回按日期升序。
+func (s *SinaAdapter) GetBenchmarkBars(ctx context.Context, market string, limit int) (string, []Bar, error) {
+	if market != "cn" {
+		return "", nil, ErrNotSupported
+	}
+	if limit <= 0 || limit > 1023 {
+		limit = 250
+	}
+	url := fmt.Sprintf(
+		"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=sh000001&scale=240&ma=no&datalen=%d",
+		limit,
+	)
+	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://finance.sina.com.cn"})
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: %v", ErrUpstream, err)
+	}
+	if status != http.StatusOK {
+		return "", nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
+	}
+	var rows []struct {
+		Day   string `json:"day"`
+		Open  string `json:"open"`
+		High  string `json:"high"`
+		Low   string `json:"low"`
+		Close string `json:"close"`
+	}
+	if err := json.Unmarshal(body, &rows); err != nil {
+		return "", nil, fmt.Errorf("%w: 解析失败 %v", ErrUpstream, err)
+	}
+	if len(rows) == 0 {
+		return "", nil, ErrNoData
+	}
+	atof := func(s string) float64 { f, _ := strconv.ParseFloat(s, 64); return f }
+	bars := make([]Bar, 0, len(rows))
+	for _, r := range rows {
+		bars = append(bars, Bar{
+			TradeDate: r.Day,
+			Open:      atof(r.Open),
+			High:      atof(r.High),
+			Low:       atof(r.Low),
+			Close:     atof(r.Close),
+			Source:    s.Name(),
+		})
+	}
+	return "上证指数", bars, nil
+}
 // 返回按日期升序的 YYYY-MM-DD 列表。
 func (s *SinaAdapter) GetTradingDays(ctx context.Context, market string, limit int) ([]string, error) {
 	if market != "cn" {

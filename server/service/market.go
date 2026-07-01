@@ -60,6 +60,12 @@ func (s *MarketService) GetDailyBars(ctx context.Context, market, symbol string,
 	return bars, nil
 }
 
+// GetBenchmarkBars 取基准指数日线（cn=上证指数），供推荐追踪的超额收益/alpha 计算。
+// 指数非 stocks 表标的，不落库。基准不可得（us/hk 无源）时返回错误，由调用方降级。
+func (s *MarketService) GetBenchmarkBars(ctx context.Context, market string, limit int) (string, []datasource.Bar, error) {
+	return s.mgr.GetBenchmarkBars(ctx, market, limit)
+}
+
 // QuoteRef 批量取行情的标的引用。
 type QuoteRef struct {
 	Market string

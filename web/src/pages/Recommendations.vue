@@ -22,11 +22,14 @@ import {
   listRecommendations,
   getRecommendation,
   deleteRecommendation,
+  trackRecommendation,
+  getPerformance,
   type Strategy,
   type RecommendRequest,
   type RecommendationView,
   type RecommendationBatch,
   type RecommendationItem,
+  type PerformanceStats,
 } from '@/api/recommendation'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
@@ -153,6 +156,61 @@ function buildPosition(item: RecommendationItem) {
   })
 }
 
+// ---------- 追踪 + 表现统计 ----------
+const performance = ref<PerformanceStats | null>(null)
+const tracking = ref(false)
+async function loadPerformance() {
+  try {
+    performance.value = await getPerformance(form.value.type)
+  } catch {
+    performance.value = null
+  }
+}
+watch(() => form.value.type, loadPerformance)
+
+async function refreshTracking() {
+  if (!current.value) return
+  tracking.value = true
+  try {
+    current.value = await trackRecommendation(current.value.id)
+    await loadPerformance()
+    message.success('追踪已刷新')
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    tracking.value = false
+  }
+}
+
+const OUTCOME_LABEL: Record<string, string> = {
+  active: '进行中',
+  take_profit: '已达止盈',
+  stop_loss: '已触止损',
+  expired: '已过有效期',
+  tracking: '跟踪中',
+  no_data: '暂无数据',
+}
+function outcomeLabel(o: string) {
+  return OUTCOME_LABEL[o] || o
+}
+function outcomeColor(o: string) {
+  if (o === 'take_profit') return upColor.value
+  if (o === 'stop_loss') return downColor.value
+  if (o === 'expired') return downColor.value
+  return flatColor.value
+}
+// 收益率着色：涨红跌绿（沿用全站口径）。
+function pctColorOf(n: number) {
+  if (n > 0) return upColor.value
+  if (n < 0) return downColor.value
+  return flatColor.value
+}
+function signedPct(n: number | undefined) {
+  if (n == null) return '—'
+  const s = n.toFixed(2)
+  return (n > 0 ? '+' : '') + s + '%'
+}
+
 // ---------- 展示辅助 ----------
 function typeLabel(t: string) {
   return t === 'short_term' ? '短线' : '长线'
@@ -174,7 +232,7 @@ function fmtTime(t: string) {
 }
 
 onMounted(async () => {
-  await Promise.all([loadStrategies(), loadLLM(), loadHistory()])
+  await Promise.all([loadStrategies(), loadLLM(), loadHistory(), loadPerformance()])
 })
 </script>
 
@@ -254,6 +312,46 @@ onMounted(async () => {
             </div>
           </n-spin>
         </SectionCard>
+
+        <SectionCard v-if="performance && performance.sample > 0" title="历史表现">
+          <template #extra>
+            <span class="perf-n">样本 n={{ performance.sample }}</span>
+          </template>
+          <div class="perf">
+            <div class="perf-row">
+              <span class="perf-label">胜率</span>
+              <span class="perf-val">{{ performance.win_rate.toFixed(1) }}%</span>
+            </div>
+            <div class="perf-row">
+              <span class="perf-label">平均收益</span>
+              <span class="perf-val" :style="{ color: pctColorOf(performance.avg_return_pct) }">{{
+                signedPct(performance.avg_return_pct)
+              }}</span>
+            </div>
+            <div class="perf-row">
+              <span class="perf-label">平均超额(alpha)</span>
+              <span class="perf-val" :style="{ color: pctColorOf(performance.avg_alpha_pct) }"
+                >{{ signedPct(performance.avg_alpha_pct) }}
+                <span class="perf-sub">n={{ performance.bench_sample }}</span></span
+              >
+            </div>
+            <div class="perf-row">
+              <span class="perf-label">平均最大回撤</span>
+              <span class="perf-val" :style="{ color: downColor }">-{{ performance.avg_max_drawdown_pct.toFixed(2) }}%</span>
+            </div>
+            <div class="perf-tags">
+              <n-tag size="tiny" :bordered="false" round :color="{ color: withAlpha(upColor, 0.14), textColor: upColor }"
+                >止盈 {{ performance.take_profit }}</n-tag
+              >
+              <n-tag size="tiny" :bordered="false" round :color="{ color: withAlpha(downColor, 0.14), textColor: downColor }"
+                >止损 {{ performance.stop_loss }}</n-tag
+              >
+              <n-tag size="tiny" :bordered="false" round>过期 {{ performance.expired }}</n-tag>
+              <n-tag size="tiny" :bordered="false" round>进行 {{ performance.active }}</n-tag>
+            </div>
+            <div class="perf-note">仅统计有价格数据的推荐；超额收益以上证指数为基准。</div>
+          </div>
+        </SectionCard>
       </div>
 
       <!-- 右：结果 -->
@@ -272,6 +370,15 @@ onMounted(async () => {
                 }}</n-tag>
                 <span class="res-strategy">{{ strategyName(current.strategy) }}</span>
                 <span class="res-meta">候选池 {{ current.candidate_count }} · {{ fmtTime(current.created_at) }}</span>
+                <n-button
+                  v-if="current.items.length"
+                  class="res-track"
+                  size="tiny"
+                  tertiary
+                  :loading="tracking"
+                  @click="refreshTracking"
+                  >刷新追踪</n-button
+                >
               </div>
 
               <n-alert v-if="current.status === 'degraded'" type="warning" :bordered="false" style="margin-bottom: 12px">
@@ -300,6 +407,53 @@ onMounted(async () => {
 
                   <div class="card-sub">
                     生成时现价 <b>{{ fmt(it.ref_price) }}</b>
+                  </div>
+
+                  <!-- 追踪状态（阶段6） -->
+                  <div v-if="it.status && it.status.outcome !== 'no_data'" class="track">
+                    <div class="track-head">
+                      <span
+                        class="track-outcome"
+                        :style="{
+                          color: outcomeColor(it.status.outcome),
+                          background: withAlpha(outcomeColor(it.status.outcome), 0.12),
+                        }"
+                        >{{ outcomeLabel(it.status.outcome) }}</span
+                      >
+                      <span v-if="it.status.review_needed" class="track-review" :style="{ color: downColor }"
+                        >建议复盘</span
+                      >
+                      <span class="track-updated">现价 {{ fmt(it.status.current_price) }}</span>
+                    </div>
+                    <div class="track-grid">
+                      <div class="tk">
+                        <span class="tk-label">收益</span>
+                        <span class="tk-val" :style="{ color: pctColorOf(it.status.return_pct) }">{{
+                          signedPct(it.status.return_pct)
+                        }}</span>
+                      </div>
+                      <div class="tk">
+                        <span class="tk-label">最大涨幅</span>
+                        <span class="tk-val" :style="{ color: upColor }">{{ signedPct(it.status.max_gain_pct) }}</span>
+                      </div>
+                      <div class="tk">
+                        <span class="tk-label">最大回撤</span>
+                        <span class="tk-val" :style="{ color: downColor }">-{{ it.status.max_drawdown_pct.toFixed(2) }}%</span>
+                      </div>
+                      <div class="tk">
+                        <span class="tk-label">超额(alpha)</span>
+                        <span class="tk-val" :style="{ color: pctColorOf(it.status.alpha_pct) }">{{
+                          signedPct(it.status.alpha_pct)
+                        }}</span>
+                      </div>
+                      <div v-if="current.type === 'short_term'" class="tk">
+                        <span class="tk-label">交易日</span>
+                        <span class="tk-val"
+                          >{{ it.status.elapsed_trade_days }}<template v-if="it.status.valid_days > 0">/{{ it.status.valid_days }}</template></span
+                        >
+                      </div>
+                    </div>
+                    <div v-if="it.status.note" class="track-note">{{ it.status.note }}</div>
                   </div>
 
                   <template v-if="it.detail">
@@ -524,6 +678,101 @@ onMounted(async () => {
   font-size: 12px;
   opacity: 0.7;
   margin: 6px 0 12px;
+}
+/* 追踪状态 */
+.track {
+  border: 1px solid var(--qv-divider);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: v-bind('withAlpha(vars.primaryColor, 0.04)');
+}
+.track-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.track-outcome {
+  font-size: 12px;
+  font-weight: 700;
+  padding: 2px 10px;
+  border-radius: 20px;
+}
+.track-review {
+  font-size: 12px;
+  font-weight: 600;
+}
+.track-updated {
+  font-size: 12px;
+  opacity: 0.6;
+  margin-left: auto;
+}
+.track-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+.tk {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.tk-label {
+  font-size: 11px;
+  opacity: 0.55;
+}
+.tk-val {
+  font-size: 14px;
+  font-weight: 600;
+}
+.track-note {
+  font-size: 11px;
+  opacity: 0.55;
+  margin-top: 8px;
+}
+/* 历史表现 */
+.perf {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.perf-n {
+  font-size: 12px;
+  opacity: 0.6;
+}
+.perf-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.perf-label {
+  font-size: 12px;
+  opacity: 0.6;
+}
+.perf-val {
+  font-size: 15px;
+  font-weight: 600;
+}
+.perf-sub {
+  font-size: 11px;
+  opacity: 0.5;
+  font-weight: 400;
+}
+.perf-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+.perf-note {
+  font-size: 11px;
+  opacity: 0.5;
+  line-height: 1.5;
+}
+.res-track {
+  margin-left: auto;
 }
 .levels {
   display: flex;

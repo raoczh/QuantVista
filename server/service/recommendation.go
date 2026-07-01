@@ -136,10 +136,11 @@ type RecommendationView struct {
 	Items []RecommendationItemView `json:"items"`
 }
 
-// RecommendationItemView 条目 + 解析后的明细。
+// RecommendationItemView 条目 + 解析后的明细 + 追踪状态（若已评估）。
 type RecommendationItemView struct {
 	model.Recommendation
-	Detail *recPick `json:"detail"`
+	Detail *recPick                     `json:"detail"`
+	Status *model.RecommendationStatus `json:"status"`
 }
 
 // Generate 生成一批推荐。allowPrivate 由调用方按角色决定（管理员可访问内网自建模型）。
@@ -251,7 +252,7 @@ func (s *RecommendationService) Generate(ctx context.Context, userID int64, allo
 		return nil, err
 	}
 
-	return s.assembleView(*batch, items), nil
+	return s.assembleView(*batch, items, nil), nil
 }
 
 // callWithRepair 调用 LLM，反编造校验（picks 必须∈候选池），失败有限次 repair，累计 token。
@@ -539,7 +540,14 @@ func (s *RecommendationService) Get(userID, id int64) (*RecommendationView, erro
 	if err := common.DB.Where("batch_id = ? AND user_id = ?", id, userID).Order("sort_order, id").Find(&items).Error; err != nil {
 		return nil, err
 	}
-	return s.assembleView(batch, items), nil
+	// 附追踪状态（若后台/手动已评估）。
+	statuses := map[int64]model.RecommendationStatus{}
+	var srows []model.RecommendationStatus
+	common.DB.Where("batch_id = ? AND user_id = ?", id, userID).Find(&srows)
+	for _, r := range srows {
+		statuses[r.RecommendationID] = r
+	}
+	return s.assembleView(batch, items, statuses), nil
 }
 
 // Delete 删除推荐批次及其条目（仅本人，事务）。
@@ -552,18 +560,25 @@ func (s *RecommendationService) Delete(userID, id int64) error {
 		if err := tx.Where("batch_id = ? AND user_id = ?", id, userID).Delete(&model.Recommendation{}).Error; err != nil {
 			return err
 		}
+		if err := tx.Where("batch_id = ? AND user_id = ?", id, userID).Delete(&model.RecommendationStatus{}).Error; err != nil {
+			return err
+		}
 		return tx.Delete(&batch).Error
 	})
 }
 
-// assembleView 组装批次视图（解析条目明细）。
-func (s *RecommendationService) assembleView(batch model.RecommendationBatch, items []model.Recommendation) *RecommendationView {
+// assembleView 组装批次视图（解析条目明细，附可选追踪状态）。
+func (s *RecommendationService) assembleView(batch model.RecommendationBatch, items []model.Recommendation, statuses map[int64]model.RecommendationStatus) *RecommendationView {
 	views := make([]RecommendationItemView, 0, len(items))
 	for _, it := range items {
 		iv := RecommendationItemView{Recommendation: it}
 		var d recPick
 		if it.DetailJSON != "" && json.Unmarshal([]byte(it.DetailJSON), &d) == nil {
 			iv.Detail = &d
+		}
+		if st, ok := statuses[it.ID]; ok {
+			s := st
+			iv.Status = &s
 		}
 		views = append(views, iv)
 	}
