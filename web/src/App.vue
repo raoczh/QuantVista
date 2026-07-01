@@ -82,7 +82,10 @@ function onSelectTheme(key: string) {
 }
 
 const userOptions = computed<DropdownOption[]>(() => {
-  const opts: DropdownOption[] = [{ label: '设置', key: 'settings' }]
+  const opts: DropdownOption[] = [
+    { label: '设置', key: 'settings' },
+    { label: '提示词模板', key: 'prompts' },
+  ]
   if (isAdmin.value) opts.push({ label: '管理后台', key: 'admin' })
   opts.push({ type: 'divider', key: 'd1' }, { label: '退出登录', key: 'logout' })
   return opts
@@ -90,6 +93,7 @@ const userOptions = computed<DropdownOption[]>(() => {
 
 async function onSelectUser(key: string) {
   if (key === 'settings') router.push('/settings')
+  else if (key === 'prompts') router.push('/prompt-templates')
   else if (key === 'admin') router.push('/admin')
   else if (key === 'logout') {
     await authStore.logout()
