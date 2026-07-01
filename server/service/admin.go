@@ -63,6 +63,10 @@ func (s *AdminService) UpdateSettings(in UpdateSettingsInput) (SystemSettingsVie
 		if enabled && clientID == "" {
 			return SystemSettingsView{}, errors.New("启用 GitHub 登录前必须配置 client_id")
 		}
+		// 启用时必须已有可用 secret（本次提交的 或 已存库的），否则会出现“看似启用实则不可用”。
+		if enabled && secret == "" && !setting.HasGitHubSecret() {
+			return SystemSettingsView{}, errors.New("启用 GitHub 登录前必须配置 client_secret")
+		}
 		if err := setting.SetGitHubOAuth(clientID, secret, enabled); err != nil {
 			return SystemSettingsView{}, err
 		}
