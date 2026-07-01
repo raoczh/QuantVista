@@ -38,8 +38,6 @@ const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const marketOptions = [
   { label: 'A 股', value: 'cn' },
-  { label: '美股', value: 'us' },
-  { label: '港股', value: 'hk' },
 ]
 
 const overview = ref<PaperOverview | null>(null)

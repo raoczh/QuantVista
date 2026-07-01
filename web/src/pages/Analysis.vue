@@ -45,8 +45,6 @@ const moduleOptions: { label: string; value: AnalysisModule }[] = [
 ]
 const marketOptions = [
   { label: 'A 股', value: 'cn' },
-  { label: '美股', value: 'us' },
-  { label: '港股', value: 'hk' },
 ]
 
 // ---------- 表单 ----------
