@@ -38,6 +38,27 @@ export interface Position {
   realized: boolean
   held_trade_days: number // 已持有交易日（按交易日历）
   short_term_review: boolean // 短线持仓超阈值，建议复盘
+  near_stop_loss: boolean // 现价距计划止损 ≤3%（未破）
+  below_stop_loss: boolean // 现价已跌破计划止损
+  last_analyzed_at: string | null // 该标的最近一次个股 AI 分析时间
+  analysis_stale: boolean // 持仓中从未分析或距上次分析超过 7 天
+}
+
+export interface PortfolioOverview {
+  holding_count: number
+  total_cost: number
+  total_value: number
+  total_profit: number
+  profit_pct: number
+  realized_profit: number // 已平仓累计已实现盈亏
+  win_count: number // 盈利仓数（持仓中）
+  lose_count: number // 亏损仓数（持仓中）
+  short_value: number // 短线市值
+  long_value: number // 长线市值
+  top_symbol: string
+  top_name: string
+  top_weight_pct: number // 最大单一持仓占比 %
+  signals: string[] // 风控信号（集中度/止损/未分析）
 }
 
 export interface PositionInput {
@@ -72,6 +93,10 @@ export interface CloseInput {
 
 export function listPositions(status: 'holding' | 'closed' | 'all' = 'all') {
   return request<Position[]>({ url: '/positions', params: { status } })
+}
+
+export function getPortfolioOverview() {
+  return request<PortfolioOverview>({ url: '/positions/overview' })
 }
 
 export function createPosition(input: PositionInput) {
