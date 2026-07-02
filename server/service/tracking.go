@@ -66,6 +66,10 @@ type trackResult struct {
 	BarsCount      int
 	HasBench       bool
 	LastDate       string
+
+	Return7d  *float64 // 第 7 交易日收盘相对 ref 收益 %（nil=未到节点）
+	Return14d *float64
+	Return30d *float64
 }
 
 // evaluateTracking 纯计算：给定基准价、止盈止损/有效期、升序日线与已过交易日，产出追踪结果。
@@ -119,6 +123,19 @@ func evaluateTracking(in trackInput) trackResult {
 	r.MaxGainPct = round2((high - in.RefPrice) / in.RefPrice * 100)
 	r.MaxDrawdownPct = round2(-worstDD * 100)
 	r.CurrentPrice = round2(r.CurrentPrice)
+
+	// 时间节点收益：第 N 交易日收盘相对 ref（bars[i] 为推荐日后第 i+1 个交易日；
+	// 已过节点且日线足够时记录，停牌缺 bar 时顺延到日线补齐后计入）。
+	nodeReturn := func(n int) *float64 {
+		if in.ElapsedTradeDays < n || len(in.Bars) < n || in.Bars[n-1].Close <= 0 {
+			return nil
+		}
+		v := round2((in.Bars[n-1].Close - in.RefPrice) / in.RefPrice * 100)
+		return &v
+	}
+	r.Return7d = nodeReturn(7)
+	r.Return14d = nodeReturn(14)
+	r.Return30d = nodeReturn(30)
 
 	// 基准超额收益。
 	if in.BenchStart > 0 && in.BenchEnd > 0 {
@@ -295,6 +312,9 @@ func (s *TrackingService) evaluateOne(ctx context.Context, batch model.Recommend
 	st.HitStopLoss = res.HitStopLoss
 	st.BarsCount = res.BarsCount
 	st.LastEvalDate = res.LastDate
+	st.Return7d = res.Return7d
+	st.Return14d = res.Return14d
+	st.Return30d = res.Return30d
 	if res.Outcome == model.RecOutcomeNoData {
 		st.Note = "暂无推荐日之后的日线数据，无法评估表现"
 	} else {
@@ -372,7 +392,8 @@ func (s *TrackingService) upsertStatus(st *model.RecommendationStatus) error {
 			"ref_price", "current_price", "period_high", "period_low",
 			"return_pct", "max_gain_pct", "max_drawdown_pct", "bench_return_pct", "alpha_pct",
 			"outcome", "review_needed", "hit_take_profit", "hit_stop_loss",
-			"elapsed_trade_days", "valid_days", "bars_count", "last_eval_date", "note", "updated_at",
+			"elapsed_trade_days", "valid_days", "bars_count", "last_eval_date", "note",
+			"return_7d", "return_14d", "return_30d", "updated_at",
 		}),
 	}).Create(st).Error
 }
@@ -405,6 +426,14 @@ type PerformanceStats struct {
 	Expired           int     `json:"expired"`
 	Active            int     `json:"active"`
 	BenchSample       int     `json:"bench_sample"` // 有基准数据、alpha 有效的样本量
+
+	// 时间节点均值：推荐后第 7/14/30 交易日的平均收益（仅统计已到节点的样本）。
+	Avg7dPct  float64 `json:"avg_7d_pct"`
+	Avg14dPct float64 `json:"avg_14d_pct"`
+	Avg30dPct float64 `json:"avg_30d_pct"`
+	Sample7d  int     `json:"sample_7d"`
+	Sample14d int     `json:"sample_14d"`
+	Sample30d int     `json:"sample_30d"`
 }
 
 const benchUnavailableNote = "基准指数数据不可得，超额收益(alpha)按 0 计"
@@ -430,6 +459,7 @@ func (s *TrackingService) Performance(userID int64, recType string) (*Performanc
 
 	stats := &PerformanceStats{Type: recType}
 	var sumRet, sumGain, sumDD, sumAlpha float64
+	var sum7, sum14, sum30 float64
 	var wins int
 	for _, r := range rows {
 		if r.Outcome == model.RecOutcomeNoData {
@@ -445,6 +475,18 @@ func (s *TrackingService) Performance(userID int64, recType string) (*Performanc
 		if !strings.Contains(r.Note, benchUnavailableNote) { // 基准有效才计入 alpha 样本
 			stats.BenchSample++
 			sumAlpha += r.AlphaPct
+		}
+		if r.Return7d != nil {
+			stats.Sample7d++
+			sum7 += *r.Return7d
+		}
+		if r.Return14d != nil {
+			stats.Sample14d++
+			sum14 += *r.Return14d
+		}
+		if r.Return30d != nil {
+			stats.Sample30d++
+			sum30 += *r.Return30d
 		}
 		switch r.Outcome {
 		case model.RecOutcomeTakeProfit:
@@ -465,6 +507,15 @@ func (s *TrackingService) Performance(userID int64, recType string) (*Performanc
 	}
 	if stats.BenchSample > 0 {
 		stats.AvgAlphaPct = round2(sumAlpha / float64(stats.BenchSample))
+	}
+	if stats.Sample7d > 0 {
+		stats.Avg7dPct = round2(sum7 / float64(stats.Sample7d))
+	}
+	if stats.Sample14d > 0 {
+		stats.Avg14dPct = round2(sum14 / float64(stats.Sample14d))
+	}
+	if stats.Sample30d > 0 {
+		stats.Avg30dPct = round2(sum30 / float64(stats.Sample30d))
 	}
 	return stats, nil
 }

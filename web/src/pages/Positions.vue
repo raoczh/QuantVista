@@ -173,7 +173,7 @@ const riskCalc = computed(() => {
   return out
 })
 
-function openCreate(prefill?: { symbol?: string; market?: string; name?: string }) {
+function openCreate(prefill?: { symbol?: string; market?: string; name?: string; recId?: number }) {
   editing.value = false
   form.value = {
     id: null,
@@ -190,6 +190,7 @@ function openCreate(prefill?: { symbol?: string; market?: string; name?: string 
     user_note: '',
     plan_stop_loss: undefined,
     plan_take_profit: undefined,
+    recommendation_id: prefill?.recId || 0,
   }
   checklistFromJSON('')
   editModal.value = true
@@ -255,6 +256,7 @@ async function submit() {
       plan_stop_loss: f.plan_stop_loss || 0,
       plan_take_profit: f.plan_take_profit || 0,
       checklist_json: checklistToJSON(),
+      recommendation_id: f.recommendation_id || 0,
     }
     if (editing.value && f.id) await updatePosition(f.id, payload)
     else await createPosition(payload)
@@ -360,12 +362,14 @@ function goThesis(p: Position) {
 }
 
 onMounted(async () => {
-  // 从自选「建仓」跳转而来：预填并打开建仓弹窗，然后清掉 query。
+  // 从自选/推荐「建仓」跳转而来：预填并打开建仓弹窗，然后清掉 query。
+  // rec_id 为来源推荐（血缘），落库后推荐详情可展示「已建仓」与价格对比。
   if (route.query.add === '1') {
     openCreate({
       symbol: String(route.query.symbol || ''),
       market: String(route.query.market || 'cn'),
       name: String(route.query.name || ''),
+      recId: Number(route.query.rec_id) || 0,
     })
     router.replace({ name: 'positions' })
   }

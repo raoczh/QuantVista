@@ -74,6 +74,22 @@ export interface RecTracking {
   updated_at: string
 }
 
+// 推荐对应的实际持仓（血缘：一键建仓时写入 positions.recommendation_id）。
+export interface RecPositionLink {
+  position_id: number
+  buy_price: number
+  buy_date: string
+  quantity: number
+  status: string // holding / closed
+}
+
+// 池内落选标的的一句话理由（「为什么没选它」）。
+export interface RecReject {
+  symbol: string
+  name?: string
+  reason: string
+}
+
 export interface RecommendationItem {
   id: number
   batch_id: number
@@ -87,6 +103,7 @@ export interface RecommendationItem {
   sort_order: number
   detail: RecDetail | null
   status: RecTracking | null
+  position: RecPositionLink | null
 }
 
 // 推荐历史表现统计（带样本量）。
@@ -103,6 +120,13 @@ export interface PerformanceStats {
   expired: number
   active: number
   bench_sample: number
+  // 时间节点均值（推荐后第 N 交易日）。
+  avg_7d_pct: number
+  avg_14d_pct: number
+  avg_30d_pct: number
+  sample_7d: number
+  sample_14d: number
+  sample_30d: number
 }
 
 export interface RecommendationBatch {
@@ -113,6 +137,7 @@ export interface RecommendationBatch {
   status: RecStatus
   error: string
   candidate_count: number
+  rejected_json?: string // 池内落选理由 JSON（详情接口返回，列表不含）
   provider: string
   model: string
   prompt_version: string

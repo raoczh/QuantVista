@@ -14,6 +14,8 @@ import {
   NEmpty,
   NPopconfirm,
   NAlert,
+  NCollapse,
+  NCollapseItem,
   useMessage,
 } from 'naive-ui'
 import {
@@ -30,6 +32,7 @@ import {
   type RecommendationBatch,
   type RecommendationItem,
   type PerformanceStats,
+  type RecReject,
 } from '@/api/recommendation'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
@@ -146,13 +149,31 @@ async function removeBatch(b: RecommendationBatch) {
   }
 }
 
-// 一键建仓：跳持仓页预填。
+// 一键建仓：跳持仓页预填（带 rec_id 血缘，落库后详情可见「已建仓」与价格对比）。
 function buildPosition(item: RecommendationItem) {
   router.push({
     name: 'positions',
-    query: { add: '1', symbol: item.symbol, market: item.market, name: item.name },
+    query: { add: '1', symbol: item.symbol, market: item.market, name: item.name, rec_id: String(item.id) },
   })
 }
+
+// 推荐参考价 vs 实际买入价 偏离 %。
+function buyDeviationPct(item: RecommendationItem) {
+  if (!item.position || !item.ref_price) return null
+  return ((item.position.buy_price - item.ref_price) / item.ref_price) * 100
+}
+
+// 「为什么没选它」：详情接口返回的池内落选理由。
+const rejectedList = computed<RecReject[]>(() => {
+  const raw = current.value?.rejected_json
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw) as RecReject[]
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+})
 
 // ---------- 追踪 + 表现统计 ----------
 const performance = ref<PerformanceStats | null>(null)
@@ -337,6 +358,24 @@ onMounted(async () => {
               <span class="perf-label">平均最大回撤</span>
               <span class="perf-val" :style="{ color: downColor }">-{{ performance.avg_max_drawdown_pct.toFixed(2) }}%</span>
             </div>
+            <div v-if="performance.sample_7d > 0" class="perf-row">
+              <span class="perf-label">7 交易日均值</span>
+              <span class="perf-val" :style="{ color: pctColorOf(performance.avg_7d_pct) }"
+                >{{ signedPct(performance.avg_7d_pct) }} <span class="perf-sub">n={{ performance.sample_7d }}</span></span
+              >
+            </div>
+            <div v-if="performance.sample_14d > 0" class="perf-row">
+              <span class="perf-label">14 交易日均值</span>
+              <span class="perf-val" :style="{ color: pctColorOf(performance.avg_14d_pct) }"
+                >{{ signedPct(performance.avg_14d_pct) }} <span class="perf-sub">n={{ performance.sample_14d }}</span></span
+              >
+            </div>
+            <div v-if="performance.sample_30d > 0" class="perf-row">
+              <span class="perf-label">30 交易日均值</span>
+              <span class="perf-val" :style="{ color: pctColorOf(performance.avg_30d_pct) }"
+                >{{ signedPct(performance.avg_30d_pct) }} <span class="perf-sub">n={{ performance.sample_30d }}</span></span
+              >
+            </div>
             <div class="perf-tags">
               <n-tag size="tiny" :bordered="false" round :color="{ color: withAlpha(upColor, 0.14), textColor: upColor }"
                 >止盈 {{ performance.take_profit }}</n-tag
@@ -393,6 +432,7 @@ onMounted(async () => {
                     <div class="card-title">
                       <span class="ct-name">{{ it.name || it.symbol }}</span>
                       <span class="ct-symbol qv-mono">{{ it.symbol }}</span>
+                      <n-tag v-if="it.position" size="tiny" type="success" :bordered="false" round>已建仓</n-tag>
                     </div>
                     <div class="card-badges">
                       <span
@@ -406,6 +446,14 @@ onMounted(async () => {
 
                   <div class="card-sub">
                     生成时现价 <b>{{ fmt(it.ref_price) }}</b>
+                    <template v-if="it.position">
+                      · 实际买入 <b>{{ fmt(it.position.buy_price) }}</b> × {{ it.position.quantity }}
+                      <span v-if="it.position.buy_date">（{{ it.position.buy_date }}）</span>
+                      <span v-if="buyDeviationPct(it) != null" :style="{ color: pctColorOf(buyDeviationPct(it)!) }">
+                        较推荐价 {{ signedPct(buyDeviationPct(it)!) }}
+                      </span>
+                      <n-tag v-if="it.position.status === 'closed'" size="tiny" :bordered="false">已卖出</n-tag>
+                    </template>
                   </div>
 
                   <!-- 追踪状态（阶段6） -->
@@ -524,10 +572,21 @@ onMounted(async () => {
                   </template>
 
                   <div class="card-actions">
-                    <n-button size="small" type="primary" ghost @click="buildPosition(it)">一键建仓</n-button>
+                    <n-button v-if="!it.position" size="small" type="primary" ghost @click="buildPosition(it)">一键建仓</n-button>
+                    <n-button v-else size="small" tertiary @click="router.push({ name: 'positions' })">查看持仓</n-button>
                   </div>
                 </div>
               </div>
+
+              <!-- 为什么没选它：池内落选标的的一句话理由（复盘筛选逻辑用） -->
+              <n-collapse v-if="rejectedList.length" class="rejected">
+                <n-collapse-item :title="`为什么没选它（${rejectedList.length}）`" name="rejected">
+                  <div v-for="(r, i) in rejectedList" :key="i" class="rej-row">
+                    <span class="rej-name">{{ r.name || r.symbol }}<span class="rej-symbol qv-mono"> {{ r.symbol }}</span></span>
+                    <span class="rej-reason">{{ r.reason }}</span>
+                  </div>
+                </n-collapse-item>
+              </n-collapse>
             </div>
           </n-spin>
         </SectionCard>
@@ -856,5 +915,32 @@ onMounted(async () => {
   display: flex;
   justify-content: flex-end;
   margin-top: 12px;
+}
+.rejected {
+  margin-top: 16px;
+}
+.rej-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--qv-divider);
+  font-size: 13px;
+}
+.rej-row:last-child {
+  border-bottom: none;
+}
+.rej-name {
+  font-weight: 500;
+  flex-shrink: 0;
+  min-width: 120px;
+}
+.rej-symbol {
+  font-size: 11px;
+  opacity: 0.5;
+}
+.rej-reason {
+  opacity: 0.75;
+  line-height: 1.5;
 }
 </style>

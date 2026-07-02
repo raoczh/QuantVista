@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"testing"
 
 	"quantvista/common"
@@ -22,7 +23,7 @@ func TestParseAndFilterPicks_DropsFabricated(t *testing.T) {
 		{"symbol":"999999","action":"buy","confidence":90,"reason":["编造的票"]},
 		{"symbol":"000001","action":"watch","confidence":55,"reason":["观察"]}
 	]}`
-	picks, err := parseAndFilterPicks(content, pool, 5)
+	picks, _, err := parseAndFilterPicks(content, pool, 5)
 	if err != nil {
 		t.Fatalf("期望成功: %v", err)
 	}
@@ -36,11 +37,48 @@ func TestParseAndFilterPicks_DropsFabricated(t *testing.T) {
 	}
 }
 
+// TestParseAndFilterPicks_Rejected 落选理由：仅认池内且未入选的标的，越池/已入选/空理由剔除。
+func TestParseAndFilterPicks_Rejected(t *testing.T) {
+	pool := testPool()
+	content := `{"picks":[
+		{"symbol":"600000","action":"buy","confidence":70}
+	],"rejected":[
+		{"symbol":"000001","reason":"量价背离，与动量策略不符"},
+		{"symbol":"600000","reason":"已入选不应出现在落选"},
+		{"symbol":"999999","reason":"池外杜撰"},
+		{"symbol":"000001","reason":"重复条目"},
+		{"symbol":"","reason":"空代码"}
+	]}`
+	_, rejected, err := parseAndFilterPicks(content, pool, 5)
+	if err != nil {
+		t.Fatalf("期望成功: %v", err)
+	}
+	if len(rejected) != 1 {
+		t.Fatalf("期望仅保留 1 条有效落选理由，得到 %d: %+v", len(rejected), rejected)
+	}
+	if rejected[0].Symbol != "000001" || rejected[0].Name != "平安银行" {
+		t.Fatalf("落选条目应为池内 000001 并补齐名称: %+v", rejected[0])
+	}
+}
+
+// TestParseAndFilterPicks_RejectedMissing 模型未给 rejected 不构成不合格（best-effort）。
+func TestParseAndFilterPicks_RejectedMissing(t *testing.T) {
+	pool := testPool()
+	content := `{"picks":[{"symbol":"600000","action":"buy","confidence":70}]}`
+	picks, rejected, err := parseAndFilterPicks(content, pool, 5)
+	if err != nil || len(picks) != 1 {
+		t.Fatalf("缺 rejected 不应报错: err=%v picks=%d", err, len(picks))
+	}
+	if len(rejected) != 0 {
+		t.Fatalf("无 rejected 时应为空，得到 %d", len(rejected))
+	}
+}
+
 // TestParseAndFilterPicks_AllFabricated 全部越池 → 返回错误（触发 repair/降级）。
 func TestParseAndFilterPicks_AllFabricated(t *testing.T) {
 	pool := testPool()
 	content := `{"picks":[{"symbol":"AAAAAA","action":"buy","confidence":80}]}`
-	if _, err := parseAndFilterPicks(content, pool, 5); err == nil {
+	if _, _, err := parseAndFilterPicks(content, pool, 5); err == nil {
 		t.Fatalf("全部越池时应返回错误")
 	}
 }
@@ -52,7 +90,7 @@ func TestParseAndFilterPicks_Dedup(t *testing.T) {
 		{"symbol":"600000","action":"buy","confidence":70},
 		{"symbol":"600000","action":"watch","confidence":40}
 	]}`
-	picks, err := parseAndFilterPicks(content, pool, 5)
+	picks, _, err := parseAndFilterPicks(content, pool, 5)
 	if err != nil {
 		t.Fatalf("期望成功: %v", err)
 	}
@@ -75,7 +113,7 @@ func TestParseAndFilterPicks_CountCap(t *testing.T) {
 		{"symbol":"600036","action":"buy","confidence":60},
 		{"symbol":"601318","action":"buy","confidence":55}
 	]}`
-	picks, err := parseAndFilterPicks(content, pool, 3)
+	picks, _, err := parseAndFilterPicks(content, pool, 3)
 	if err != nil {
 		t.Fatalf("期望成功: %v", err)
 	}
@@ -84,24 +122,32 @@ func TestParseAndFilterPicks_CountCap(t *testing.T) {
 	}
 }
 
-// TestCandidateEligible PRD 3.6 前置筛选：ST/退市/停牌/流动性不足剔除。
+// TestCandidateEligible PRD 3.6 前置筛选：ST/退市/停牌/流动性不足/黑名单剔除。
 func TestCandidateEligible(t *testing.T) {
+	def := defaultCandidateFilter()
 	cases := []struct {
 		name string
 		c    candidate
+		f    candidateFilter
 		want bool
 	}{
-		{"正常标的", candidate{Symbol: "600000", Name: "浦发银行", Price: 8.5}, true},
-		{"带成交额的活跃标的", candidate{Symbol: "600036", Name: "招商银行", Price: 35, Amount: 5e9}, true},
-		{"ST 股剔除", candidate{Symbol: "600001", Name: "ST某某", Price: 3.2}, false},
-		{"*ST 股剔除", candidate{Symbol: "600002", Name: "*ST某某", Price: 1.5}, false},
-		{"退市整理剔除", candidate{Symbol: "600003", Name: "某某退", Price: 0.8}, false},
-		{"停牌/无行情剔除", candidate{Symbol: "600004", Name: "某某股份", Price: 0}, false},
-		{"流动性不足剔除", candidate{Symbol: "600005", Name: "某某股份", Price: 5, Amount: 3e7}, false},
-		{"无成交额数据不按流动性剔除", candidate{Symbol: "600006", Name: "某某股份", Price: 5}, true},
+		{"正常标的", candidate{Symbol: "600000", Name: "浦发银行", Price: 8.5}, def, true},
+		{"带成交额的活跃标的", candidate{Symbol: "600036", Name: "招商银行", Price: 35, Amount: 5e9}, def, true},
+		{"ST 股剔除", candidate{Symbol: "600001", Name: "ST某某", Price: 3.2}, def, false},
+		{"*ST 股剔除", candidate{Symbol: "600002", Name: "*ST某某", Price: 1.5}, def, false},
+		{"退市整理剔除", candidate{Symbol: "600003", Name: "某某退", Price: 0.8}, def, false},
+		{"停牌/无行情剔除", candidate{Symbol: "600004", Name: "某某股份", Price: 0}, def, false},
+		{"流动性不足剔除", candidate{Symbol: "600005", Name: "某某股份", Price: 5, Amount: 3e7}, def, false},
+		{"无成交额数据不按流动性剔除", candidate{Symbol: "600006", Name: "某某股份", Price: 5}, def, true},
+		{"黑名单剔除", candidate{Symbol: "600007", Market: "cn", Name: "某某股份", Price: 5},
+			candidateFilter{blacklist: map[string]bool{"cn:600007": true}, minAmount: minCandidateAmount}, false},
+		{"用户调高门槛后剔除", candidate{Symbol: "600008", Name: "某某股份", Price: 5, Amount: 2e8},
+			candidateFilter{minAmount: 5e8}, false},
+		{"门槛 0 表示不过滤", candidate{Symbol: "600009", Name: "某某股份", Price: 5, Amount: 3e7},
+			candidateFilter{minAmount: 0}, true},
 	}
 	for _, tc := range cases {
-		if got := candidateEligible(tc.c); got != tc.want {
+		if got := candidateEligible(tc.c, tc.f); got != tc.want {
 			t.Errorf("%s: candidateEligible=%v, 期望 %v", tc.name, got, tc.want)
 		}
 	}
@@ -260,5 +306,121 @@ func TestRecommendationHistoryGetDelete(t *testing.T) {
 	common.DB.Model(&model.Recommendation{}).Where("batch_id = ?", batch.ID).Count(&itemCnt)
 	if itemCnt != 0 {
 		t.Fatalf("删除批次应级联删除条目，剩 %d", itemCnt)
+	}
+}
+
+// TestRecommendationPositionLink 血缘：一键建仓写入 recommendation_id 后，
+// Get 详情应附带对应持仓（仅本人可见；多笔取最早一笔）。
+func TestRecommendationPositionLink(t *testing.T) {
+	setupTestDB(t)
+	svc := &RecommendationService{}
+
+	batch := &model.RecommendationBatch{UserID: 1, Type: model.RecTypeShortTerm, Market: "cn", Status: model.RecStatusSuccess}
+	common.DB.Create(batch)
+	item := &model.Recommendation{BatchID: batch.ID, UserID: 1, Symbol: "600000", Market: "cn", Name: "浦发银行", RefPrice: 8.5}
+	common.DB.Create(item)
+
+	// 未建仓时无血缘。
+	v, err := svc.Get(1, batch.ID)
+	if err != nil {
+		t.Fatalf("Get 失败: %v", err)
+	}
+	if v.Items[0].Position != nil {
+		t.Fatalf("未建仓时不应附带持仓")
+	}
+
+	// 两笔建仓（先后），应取最早一笔；他人的同 recommendation_id 不可见。
+	common.DB.Create(&model.Position{UserID: 1, Symbol: "600000", Market: "cn", Status: model.PositionStatusHolding,
+		BuyPrice: 8.6, BuyDate: "2026-07-01", Quantity: 1000, RecommendationID: item.ID})
+	common.DB.Create(&model.Position{UserID: 1, Symbol: "600000", Market: "cn", Status: model.PositionStatusHolding,
+		BuyPrice: 8.8, BuyDate: "2026-07-02", Quantity: 500, RecommendationID: item.ID})
+	common.DB.Create(&model.Position{UserID: 2, Symbol: "600000", Market: "cn", Status: model.PositionStatusHolding,
+		BuyPrice: 9.9, Quantity: 100, RecommendationID: item.ID})
+
+	v, err = svc.Get(1, batch.ID)
+	if err != nil {
+		t.Fatalf("Get 失败: %v", err)
+	}
+	pl := v.Items[0].Position
+	if pl == nil {
+		t.Fatalf("建仓后应附带持仓血缘")
+	}
+	if pl.BuyPrice != 8.6 || pl.Quantity != 1000 {
+		t.Fatalf("多笔建仓应取最早一笔（8.6×1000），得到 %+v", pl)
+	}
+}
+
+// TestResolveRecommendationLink 建仓血缘归属校验：
+// 本人推荐落血缘；他人/不存在的推荐静默清零（不阻断建仓）。
+func TestResolveRecommendationLink(t *testing.T) {
+	setupTestDB(t)
+
+	rec := &model.Recommendation{BatchID: 1, UserID: 1, Symbol: "600000", Market: "cn"}
+	common.DB.Create(rec)
+
+	if got := resolveRecommendationLink(1, rec.ID); got != rec.ID {
+		t.Fatalf("本人推荐应保留血缘，得到 %d", got)
+	}
+	if got := resolveRecommendationLink(2, rec.ID); got != 0 {
+		t.Fatalf("他人推荐应清零，得到 %d", got)
+	}
+	if got := resolveRecommendationLink(1, 99999); got != 0 {
+		t.Fatalf("不存在的推荐应清零，得到 %d", got)
+	}
+	if got := resolveRecommendationLink(1, 0); got != 0 {
+		t.Fatalf("0 应原样返回 0，得到 %d", got)
+	}
+}
+
+// TestLoadCandidateFilter 用户偏好中的回避规则加载：黑名单与门槛生效、缺偏好回退默认。
+func TestLoadCandidateFilter(t *testing.T) {
+	setupTestDB(t)
+
+	// 无偏好行：回退默认（1e8 门槛、无黑名单）。
+	f := loadCandidateFilter(42)
+	if f.minAmount != minCandidateAmount || len(f.blacklist) != 0 {
+		t.Fatalf("缺偏好应回退默认: %+v", f)
+	}
+
+	common.DB.Create(&model.UserPreference{
+		UserID: 1, RiskLevel: "balanced", DefaultMarket: "cn", HorizonPref: "long_term", DefaultRecCount: 3,
+		BlacklistJSON: `[{"symbol":"600000","market":"cn","reason":"历史亏损严重"}]`, MinCandidateAmount: 5e8,
+	})
+	f = loadCandidateFilter(1)
+	if f.minAmount != 5e8 {
+		t.Fatalf("门槛应为用户配置 5e8，得到 %v", f.minAmount)
+	}
+	if !f.blacklist["cn:600000"] {
+		t.Fatalf("黑名单应含 cn:600000: %+v", f.blacklist)
+	}
+	if !candidateEligible(candidate{Symbol: "000001", Market: "cn", Name: "平安银行", Price: 11}, f) {
+		t.Fatalf("非黑名单标的应通过")
+	}
+	if candidateEligible(candidate{Symbol: "600000", Market: "cn", Name: "浦发银行", Price: 8.5}, f) {
+		t.Fatalf("黑名单标的应被剔除")
+	}
+}
+
+// TestNormalizeBlacklist 黑名单归一化：去空/去重/市场缺省/理由截断/坏格式报错。
+func TestNormalizeBlacklist(t *testing.T) {
+	if s, err := normalizeBlacklist(""); err != nil || s != "" {
+		t.Fatalf("空串应通过并存空: %v %q", err, s)
+	}
+	if s, err := normalizeBlacklist("[]"); err != nil || s != "" {
+		t.Fatalf("空数组应存空: %v %q", err, s)
+	}
+	if _, err := normalizeBlacklist("{bad"); err == nil {
+		t.Fatalf("坏格式应报错")
+	}
+	s, err := normalizeBlacklist(`[{"symbol":" 600000 ","reason":"r1"},{"symbol":"600000","market":"cn","reason":"dup"},{"symbol":""}]`)
+	if err != nil {
+		t.Fatalf("归一化失败: %v", err)
+	}
+	var entries []BlacklistEntry
+	if json.Unmarshal([]byte(s), &entries) != nil || len(entries) != 1 {
+		t.Fatalf("应去空去重剩 1 条: %s", s)
+	}
+	if entries[0].Symbol != "600000" || entries[0].Market != "cn" {
+		t.Fatalf("应 trim symbol 并缺省 market=cn: %+v", entries[0])
 	}
 }

@@ -211,6 +211,65 @@ func TestEvaluateTracking_NoBench(t *testing.T) {
 	}
 }
 
+// TestEvaluateTracking_NodeReturns 节点收益：已到节点按第 N 交易日收盘记录，未到为 nil。
+func TestEvaluateTracking_NodeReturns(t *testing.T) {
+	bars := make([]datasource.Bar, 0, 8)
+	dates := []string{"2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04", "2026-06-05", "2026-06-08", "2026-06-09", "2026-06-10"}
+	closes := []float64{10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.8}
+	for i, d := range dates {
+		bars = append(bars, bar(d, closes[i], closes[i]+0.1, closes[i]-0.1, closes[i]))
+	}
+	r := evaluateTracking(trackInput{
+		RefPrice: 10, IsShort: false, Bars: bars, ElapsedTradeDays: 8,
+	})
+	if r.Return7d == nil || *r.Return7d != 7 { // bars[6].Close=10.7 → +7%
+		t.Fatalf("第 7 交易日收益应 7%%，得到 %v", r.Return7d)
+	}
+	if r.Return14d != nil || r.Return30d != nil {
+		t.Fatalf("未到 14/30 节点应为 nil: %v %v", r.Return14d, r.Return30d)
+	}
+
+	// 已过节点但日线不足（停牌缺 bar）：顺延不记录。
+	r2 := evaluateTracking(trackInput{
+		RefPrice: 10, IsShort: false, Bars: bars[:5], ElapsedTradeDays: 9,
+	})
+	if r2.Return7d != nil {
+		t.Fatalf("日线不足 7 根时不应记节点收益: %v", r2.Return7d)
+	}
+}
+
+// TestPerformanceNodeAverages 节点均值：仅统计已到节点（非 NULL）的样本。
+func TestPerformanceNodeAverages(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Exec("DELETE FROM recommendation_statuses")
+	svc := &TrackingService{}
+
+	f := func(v float64) *float64 { return &v }
+	rows := []model.RecommendationStatus{
+		{RecommendationID: 11, UserID: 1, Type: model.RecTypeShortTerm, Outcome: model.RecOutcomeActive, Return7d: f(5), Return14d: f(8)},
+		{RecommendationID: 12, UserID: 1, Type: model.RecTypeShortTerm, Outcome: model.RecOutcomeActive, Return7d: f(-1)},
+		{RecommendationID: 13, UserID: 1, Type: model.RecTypeShortTerm, Outcome: model.RecOutcomeActive}, // 未到任何节点
+	}
+	for i := range rows {
+		if err := common.DB.Create(&rows[i]).Error; err != nil {
+			t.Fatalf("插入失败: %v", err)
+		}
+	}
+	p, err := svc.Performance(1, "")
+	if err != nil {
+		t.Fatalf("Performance 失败: %v", err)
+	}
+	if p.Sample7d != 2 || p.Avg7dPct != 2 { // (5-1)/2
+		t.Fatalf("7 日节点均值应 2%%（n=2），得到 %v (n=%d)", p.Avg7dPct, p.Sample7d)
+	}
+	if p.Sample14d != 1 || p.Avg14dPct != 8 {
+		t.Fatalf("14 日节点均值应 8%%（n=1），得到 %v (n=%d)", p.Avg14dPct, p.Sample14d)
+	}
+	if p.Sample30d != 0 || p.Avg30dPct != 0 {
+		t.Fatalf("无 30 日样本应为 0，得到 %v (n=%d)", p.Avg30dPct, p.Sample30d)
+	}
+}
+
 // TestUpsertStatusIdempotent 同一 recommendation_id 重复 upsert 只有一行且被覆盖。
 func TestUpsertStatusIdempotent(t *testing.T) {
 	setupTestDB(t)
