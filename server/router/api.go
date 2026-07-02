@@ -138,6 +138,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			positions := authed.Group("/positions")
 			{
 				positions.GET("", positionCtl.List)
+				positions.GET("/overview", positionCtl.Overview) // 静态段先于 :id
 				positions.POST("", positionCtl.Create)
 				positions.PUT("/:id", positionCtl.Update)
 				positions.DELETE("/:id", positionCtl.Delete)

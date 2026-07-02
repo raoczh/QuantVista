@@ -29,6 +29,16 @@ func (pc *PositionController) List(c *gin.Context) {
 	common.ApiSuccess(c, list)
 }
 
+// Overview GET /api/positions/overview —— 组合总览 + 个人风控信号。
+func (pc *PositionController) Overview(c *gin.Context) {
+	ov, err := pc.svc.Overview(c.Request.Context(), currentUserID(c))
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, ov)
+}
+
 // Create POST /api/positions
 func (pc *PositionController) Create(c *gin.Context) {
 	var in service.PositionInput
