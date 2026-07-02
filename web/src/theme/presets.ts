@@ -1,6 +1,6 @@
 import type { GlobalThemeOverrides } from 'naive-ui'
 
-// 一套主题预设：基色调（亮/暗）+ 主色及其衍生色。
+// 一套主题预设：基色调（亮/暗）+ 主色及其衍生色 + 全套背景分层。
 export interface ThemePreset {
   key: string
   label: string
@@ -9,14 +9,61 @@ export interface ThemePreset {
   overrides: GlobalThemeOverrides
 }
 
-// 由主色四件套生成 Naive 的 common 覆盖。
-function build(primary: string, hover: string, pressed: string, suppl: string): GlobalThemeOverrides {
+// 主色四件套：primary / hover / pressed / suppl。
+type Primaries = [string, string, string, string]
+
+// 与 global.css 的 --qv-font-sans 保持一致，覆盖 Naive 默认字体栈。
+const FONT_SANS =
+  "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif"
+
+// 6 套通用：控件圆角 8px（摆脱 Naive 默认 3px 的后台感）、加重强调字重。
+const SHARED = {
+  fontFamily: FONT_SANS,
+  borderRadius: '8px',
+  borderRadiusSmall: '6px',
+  fontWeightStrong: '600',
+}
+
+function primaryOverrides([primary, hover, pressed, suppl]: Primaries) {
+  return {
+    primaryColor: primary,
+    primaryColorHover: hover,
+    primaryColorPressed: pressed,
+    primaryColorSuppl: suppl,
+  }
+}
+
+// 亮色主题：页面底色带一点主色倾向的浅灰，卡片保持纯白 → 背景与卡片分层。
+function buildLight(p: Primaries, bodyColor: string): GlobalThemeOverrides {
   return {
     common: {
-      primaryColor: primary,
-      primaryColorHover: hover,
-      primaryColorPressed: pressed,
-      primaryColorSuppl: suppl,
+      ...SHARED,
+      ...primaryOverrides(p),
+      bodyColor,
+      cardColor: '#ffffff',
+      modalColor: '#ffffff',
+      popoverColor: '#ffffff',
+    },
+  }
+}
+
+// 暗色主题：底色带品牌色调（不再是中性灰黑），卡片比底色浮起一档。
+// Naive 暗色下 table/code 是固定灰黑，与带色调的卡片会打架，一并对齐。
+function buildDark(
+  p: Primaries,
+  colors: { body: string; card: string; popover: string },
+): GlobalThemeOverrides {
+  return {
+    common: {
+      ...SHARED,
+      ...primaryOverrides(p),
+      bodyColor: colors.body,
+      cardColor: colors.card,
+      modalColor: colors.card,
+      popoverColor: colors.popover,
+      tableColor: colors.card,
+      tableHeaderColor: colors.popover,
+      codeColor: 'rgba(255, 255, 255, 0.08)',
     },
   }
 }
@@ -29,42 +76,54 @@ export const THEME_PRESETS: ThemePreset[] = [
     label: '极简蓝（浅）',
     base: 'light',
     primary: '#2080f0',
-    overrides: build('#2080f0', '#4098fc', '#1060c9', '#4098fc'),
+    overrides: buildLight(['#2080f0', '#4098fc', '#1060c9', '#4098fc'], '#f3f5fa'),
   },
   {
     key: 'dark-blue',
     label: '深空蓝（深）',
     base: 'dark',
     primary: '#2080f0',
-    overrides: build('#2080f0', '#4098fc', '#1060c9', '#4098fc'),
+    overrides: buildDark(['#2080f0', '#4098fc', '#1060c9', '#4098fc'], {
+      body: '#0d1322',
+      card: '#141c30',
+      popover: '#1a2440',
+    }),
   },
   {
     key: 'dark-emerald',
     label: '极客绿（深）',
     base: 'dark',
     primary: '#18a058',
-    overrides: build('#18a058', '#36ad6a', '#0c7a43', '#36ad6a'),
+    overrides: buildDark(['#18a058', '#36ad6a', '#0c7a43', '#36ad6a'], {
+      body: '#0c1511',
+      card: '#122019',
+      popover: '#182a21',
+    }),
   },
   {
     key: 'light-violet',
     label: '典雅紫（浅）',
     base: 'light',
     primary: '#7c3aed',
-    overrides: build('#7c3aed', '#9560f0', '#6428d6', '#9560f0'),
+    overrides: buildLight(['#7c3aed', '#9560f0', '#6428d6', '#9560f0'], '#f7f5fb'),
   },
   {
     key: 'dark-amber',
     label: '暖夜橙（深）',
     base: 'dark',
     primary: '#f0a020',
-    overrides: build('#f0a020', '#fcb040', '#c97c10', '#fcb040'),
+    overrides: buildDark(['#f0a020', '#fcb040', '#c97c10', '#fcb040'], {
+      body: '#161009',
+      card: '#211a10',
+      popover: '#2b2216',
+    }),
   },
   {
     key: 'light-rose',
     label: '樱桃红（浅）',
     base: 'light',
     primary: '#d03050',
-    overrides: build('#d03050', '#de576d', '#ab1f3f', '#de576d'),
+    overrides: buildLight(['#d03050', '#de576d', '#ab1f3f', '#de576d'], '#faf5f6'),
   },
 ]
 

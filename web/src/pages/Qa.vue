@@ -248,6 +248,22 @@ onMounted(async () => {
 .col-chat {
   min-width: 0;
 }
+/* 整页滚动下会话栏固定跟随，过长时栏内滚动 */
+.col-side {
+  position: sticky;
+  top: 76px;
+  max-height: calc(100vh - 100px);
+  overflow-y: auto;
+  padding: 4px;
+  margin: -4px;
+}
+@media (max-width: 900px) {
+  .col-side {
+    position: static;
+    max-height: none;
+    overflow: visible;
+  }
+}
 .convs {
   display: flex;
   flex-direction: column;

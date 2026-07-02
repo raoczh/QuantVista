@@ -29,6 +29,7 @@ import {
   type PositionInput,
 } from '@/api/position'
 import { useUi } from '@/composables/useUi'
+import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import StatCard from '@/components/StatCard.vue'
@@ -49,16 +50,19 @@ const marketOptions = [
   { label: 'A 股', value: 'cn' },
 ]
 
-async function load() {
-  loading.value = true
+async function load(silent = false) {
+  if (!silent) loading.value = true
   try {
     positions.value = await listPositions(statusFilter.value)
   } catch (e) {
-    message.error((e as Error).message)
+    if (!silent) message.error((e as Error).message)
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
 }
+
+// 盘中自动刷新盈亏（60s，仅交易时段+页面可见，静默）。
+useAutoRefresh(() => load(true), 60_000)
 
 const filtered = computed(() =>
   typeFilter.value === 'all'
@@ -278,7 +282,7 @@ onMounted(async () => {
   <PageContainer title="持仓" subtitle="短线 / 长线 · 实时盈亏 · 卖出复盘">
     <template #actions>
       <n-button size="small" type="primary" @click="openCreate()">+ 新建持仓</n-button>
-      <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>
+      <n-button size="small" quaternary :loading="loading" @click="load()">刷新</n-button>
     </template>
 
     <div class="pos" :style="styleVars">

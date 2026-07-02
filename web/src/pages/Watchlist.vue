@@ -27,14 +27,16 @@ import {
   type WatchlistGroup,
   type WatchlistItem,
 } from '@/api/watchlist'
+import { getDailyBars, type Bar } from '@/api/market'
 import { useUi } from '@/composables/useUi'
+import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
 
 const message = useMessage()
 const router = useRouter()
-const { pctColor, vars } = useUi()
+const { pctColor, vars, withAlpha } = useUi()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const groups = ref<WatchlistGroup[]>([])
@@ -44,16 +46,19 @@ const marketOptions = [
   { label: 'A 股', value: 'cn' },
 ]
 
-async function load() {
-  loading.value = true
+async function load(silent = false) {
+  if (!silent) loading.value = true
   try {
     groups.value = await listWatchlists()
   } catch (e) {
-    message.error((e as Error).message)
+    if (!silent) message.error((e as Error).message)
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
 }
+
+// 盘中自动刷新行情（60s，仅交易时段+页面可见，静默）。
+useAutoRefresh(() => load(true), 60_000)
 
 // ---------- 分组增删改 ----------
 const groupModal = ref(false)
@@ -220,6 +225,56 @@ function fmt(n: number | undefined) {
   return n == null ? '-' : n.toFixed(2)
 }
 
+// ---------- 行展开迷你走势：按需加载单只近 60 日日线，避开数据源限流 ----------
+const expanded = ref<Record<number, boolean>>({})
+const sparkBars = ref<Record<number, Bar[]>>({})
+const sparkLoading = ref<Record<number, boolean>>({})
+
+async function toggleExpand(it: WatchlistItem) {
+  if (expanded.value[it.id]) {
+    expanded.value[it.id] = false
+    return
+  }
+  expanded.value[it.id] = true
+  if (sparkBars.value[it.id]?.length) return
+  sparkLoading.value[it.id] = true
+  try {
+    sparkBars.value[it.id] = await getDailyBars(it.market, it.symbol, 60)
+  } catch (e) {
+    expanded.value[it.id] = false
+    message.error((e as Error).message)
+  } finally {
+    sparkLoading.value[it.id] = false
+  }
+}
+
+// 近 60 日收盘价 → SVG 路径（viewBox 560x72，preserveAspectRatio=none 拉伸自适应）
+const SPARK_W = 560
+const SPARK_H = 72
+function sparkPaths(bars: Bar[]) {
+  const closes = bars.map((b) => b.close)
+  if (closes.length < 2) return null
+  const min = Math.min(...closes)
+  const max = Math.max(...closes)
+  const span = max - min || 1
+  const stepX = SPARK_W / (closes.length - 1)
+  const pts = closes.map(
+    (c, i) => `${(i * stepX).toFixed(1)},${(SPARK_H - 5 - ((c - min) / span) * (SPARK_H - 10)).toFixed(1)}`,
+  )
+  const line = 'M' + pts.join(' L')
+  return { line, area: `${line} L${SPARK_W},${SPARK_H} L0,${SPARK_H} Z` }
+}
+function sparkStats(bars: Bar[]) {
+  const first = bars[0]
+  const last = bars[bars.length - 1]
+  const chg = first?.close ? ((last.close - first.close) / first.close) * 100 : 0
+  return {
+    chg,
+    high: Math.max(...bars.map((b) => b.high)),
+    low: Math.min(...bars.map((b) => b.low)),
+  }
+}
+
 const totalCount = computed(() => groups.value.reduce((s, g) => s + g.items.length, 0))
 
 onMounted(load)
@@ -231,7 +286,7 @@ onMounted(load)
       <n-tag size="small" round :bordered="false">{{ totalCount }} 只</n-tag>
       <n-button size="small" secondary @click="openCreateGroup">新建分组</n-button>
       <n-button size="small" type="primary" @click="openAddItem()">+ 添加自选</n-button>
-      <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>
+      <n-button size="small" quaternary :loading="loading" @click="load()">刷新</n-button>
     </template>
 
     <n-spin :show="loading && !groups.length">
@@ -253,42 +308,80 @@ onMounted(load)
 
           <n-empty v-if="!g.items.length" description="该分组暂无自选，点击「添加」加入股票" />
           <div v-else class="items">
-            <div v-for="it in g.items" :key="it.id" class="item">
-              <div class="it-main">
-                <div class="it-name">
-                  <n-tag v-if="it.is_pinned" size="tiny" type="warning" round :bordered="false"
-                    >重点</n-tag
-                  >
-                  <span class="it-title">{{ it.name || it.symbol }}</span>
-                  <span class="it-symbol qv-mono">{{ it.symbol }}</span>
+            <div v-for="it in g.items" :key="it.id" class="item-wrap">
+              <div class="item" @click="toggleExpand(it)">
+                <span class="it-chevron" :class="{ 'is-open': expanded[it.id] }">▸</span>
+                <div class="it-main">
+                  <div class="it-name">
+                    <n-tag v-if="it.is_pinned" size="tiny" type="warning" round :bordered="false"
+                      >重点</n-tag
+                    >
+                    <span class="it-title">{{ it.name || it.symbol }}</span>
+                    <span class="it-symbol qv-mono">{{ it.symbol }}</span>
+                  </div>
+                  <div v-if="it.focus_reason || it.note" class="it-note">
+                    <span v-if="it.focus_reason">关注：{{ it.focus_reason }}</span>
+                    <span v-if="it.note" class="it-memo">· {{ it.note }}</span>
+                  </div>
                 </div>
-                <div v-if="it.focus_reason || it.note" class="it-note">
-                  <span v-if="it.focus_reason">关注：{{ it.focus_reason }}</span>
-                  <span v-if="it.note" class="it-memo">· {{ it.note }}</span>
+                <div class="it-quote">
+                  <span v-if="it.quote_ok" class="it-price qv-tnum" :style="{ color: pctColor(it.change_pct) }">
+                    {{ fmt(it.price) }}
+                  </span>
+                  <span v-else class="it-price muted">—</span>
+                  <ChangeTag v-if="it.quote_ok" :value="it.change_pct" size="small" />
+                </div>
+                <div class="it-actions" @click.stop>
+                  <n-button size="tiny" quaternary @click="togglePin(it)">{{
+                    it.is_pinned ? '取消重点' : '重点'
+                  }}</n-button>
+                  <n-button size="tiny" quaternary @click="goAnalysis(it)">分析</n-button>
+                  <n-button size="tiny" quaternary @click="goAlert(it)">提醒</n-button>
+                  <n-button size="tiny" quaternary @click="goQa(it)">问答</n-button>
+                  <n-button size="tiny" quaternary @click="buildPosition(it)">建仓</n-button>
+                  <n-button size="tiny" quaternary @click="openEditItem(it)">编辑</n-button>
+                  <n-popconfirm @positive-click="removeItem(it)">
+                    <template #trigger>
+                      <n-button size="tiny" quaternary type="error">移除</n-button>
+                    </template>
+                    从自选中移除「{{ it.name || it.symbol }}」？
+                  </n-popconfirm>
                 </div>
               </div>
-              <div class="it-quote">
-                <span v-if="it.quote_ok" class="it-price qv-tnum" :style="{ color: pctColor(it.change_pct) }">
-                  {{ fmt(it.price) }}
-                </span>
-                <span v-else class="it-price muted">—</span>
-                <ChangeTag v-if="it.quote_ok" :value="it.change_pct" size="small" />
-              </div>
-              <div class="it-actions">
-                <n-button size="tiny" quaternary @click="togglePin(it)">{{
-                  it.is_pinned ? '取消重点' : '重点'
-                }}</n-button>
-                <n-button size="tiny" quaternary @click="goAnalysis(it)">分析</n-button>
-                <n-button size="tiny" quaternary @click="goAlert(it)">提醒</n-button>
-                <n-button size="tiny" quaternary @click="goQa(it)">问答</n-button>
-                <n-button size="tiny" quaternary @click="buildPosition(it)">建仓</n-button>
-                <n-button size="tiny" quaternary @click="openEditItem(it)">编辑</n-button>
-                <n-popconfirm @positive-click="removeItem(it)">
-                  <template #trigger>
-                    <n-button size="tiny" quaternary type="error">移除</n-button>
+
+              <!-- 展开：近 60 日迷你走势（按需加载） -->
+              <div v-if="expanded[it.id]" class="item-spark">
+                <n-spin :show="!!sparkLoading[it.id]" size="small">
+                  <template v-if="sparkBars[it.id]?.length">
+                    <svg
+                      class="spark-svg"
+                      :viewBox="`0 0 ${SPARK_W} ${SPARK_H}`"
+                      preserveAspectRatio="none"
+                      aria-hidden="true"
+                    >
+                      <path
+                        :d="sparkPaths(sparkBars[it.id])!.area"
+                        :fill="withAlpha(pctColor(sparkStats(sparkBars[it.id]).chg), 0.12)"
+                      />
+                      <path
+                        :d="sparkPaths(sparkBars[it.id])!.line"
+                        fill="none"
+                        :stroke="pctColor(sparkStats(sparkBars[it.id]).chg)"
+                        stroke-width="1.5"
+                        vector-effect="non-scaling-stroke"
+                      />
+                    </svg>
+                    <div class="spark-meta qv-tnum">
+                      <span>近 {{ sparkBars[it.id].length }} 个交易日</span>
+                      <span :style="{ color: pctColor(sparkStats(sparkBars[it.id]).chg) }">
+                        区间 {{ sparkStats(sparkBars[it.id]).chg >= 0 ? '+' : '' }}{{ sparkStats(sparkBars[it.id]).chg.toFixed(2) }}%
+                      </span>
+                      <span>最高 {{ fmt(sparkStats(sparkBars[it.id]).high) }}</span>
+                      <span>最低 {{ fmt(sparkStats(sparkBars[it.id]).low) }}</span>
+                    </div>
                   </template>
-                  从自选中移除「{{ it.name || it.symbol }}」？
-                </n-popconfirm>
+                  <div v-else class="spark-placeholder" />
+                </n-spin>
               </div>
             </div>
           </div>
@@ -376,15 +469,53 @@ onMounted(load)
   display: flex;
   flex-direction: column;
 }
+.item-wrap {
+  border-bottom: 1px solid var(--qv-divider);
+}
+.item-wrap:last-child {
+  border-bottom: none;
+}
 .item {
   display: flex;
   align-items: center;
   gap: 12px;
   padding: 10px 4px;
-  border-bottom: 1px solid var(--qv-divider);
+  cursor: pointer;
+  border-radius: 8px;
+  transition: background-color 0.15s ease;
 }
-.item:last-child {
-  border-bottom: none;
+.item:hover {
+  background: rgba(128, 128, 128, 0.06);
+}
+.it-chevron {
+  flex-shrink: 0;
+  width: 14px;
+  font-size: 11px;
+  opacity: 0.4;
+  transition: transform 0.18s ease;
+}
+.it-chevron.is-open {
+  transform: rotate(90deg);
+}
+.item-spark {
+  padding: 2px 4px 12px 30px;
+}
+.spark-svg {
+  display: block;
+  width: 100%;
+  height: 72px;
+}
+.spark-placeholder {
+  height: 72px;
+}
+.spark-meta {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  font-size: 12px;
+  opacity: 0.72;
 }
 .it-main {
   flex: 1;

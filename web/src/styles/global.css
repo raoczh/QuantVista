@@ -50,6 +50,31 @@ body {
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
+/* 主题切换时背景平滑过渡（body 背景由 n-global-style 联动主题） */
+body {
+  transition: background-color 0.25s ease;
+}
+
+/* 文本选区：主色由 App.vue 注入到 :root（--qv-primary-selection），裸布局页回落中性灰 */
+::selection {
+  background: var(--qv-primary-selection, rgba(128, 128, 128, 0.3));
+}
+
+/* 入场动画：页头 / 卡片错落浮现用 */
+@keyframes qv-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.qv-anim-in {
+  animation: qv-fade-up 0.35s cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+
 /* 细滚动条：中性灰、不抢主题色，明暗皆可用 */
 * {
   scrollbar-width: thin;

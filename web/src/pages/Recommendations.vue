@@ -555,6 +555,22 @@ onMounted(async () => {
   gap: 16px;
   min-width: 0;
 }
+/* 整页滚动下左栏固定：长结果滚动时生成表单与历史始终可见，历史在栏内滚动 */
+.col-form {
+  position: sticky;
+  top: 76px;
+  max-height: calc(100vh - 100px);
+  overflow-y: auto;
+  padding: 4px;
+  margin: -4px;
+}
+@media (max-width: 900px) {
+  .col-form {
+    position: static;
+    max-height: none;
+    overflow: visible;
+  }
+}
 .form {
   display: flex;
   flex-direction: column;

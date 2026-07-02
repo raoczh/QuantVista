@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, nextTick, watch, computed } from 'vue'
+import { useRouter } from 'vue-router'
 import { NInput, NButton, NGrid, NGi, NSpin, NEmpty, NAlert, NTag, useMessage } from 'naive-ui'
 import * as echarts from 'echarts'
 import {
@@ -10,7 +11,13 @@ import {
   type Bar,
   type Overview,
 } from '@/api/market'
+import { listPositions } from '@/api/position'
+import { getTodos, type TodoResult } from '@/api/todo'
+import { listWatchlists } from '@/api/watchlist'
+import { listRecommendations, type RecommendationBatch } from '@/api/recommendation'
 import { useUi } from '@/composables/useUi'
+import { useAutoRefresh } from '@/composables/useAutoRefresh'
+import { useStockActions } from '@/composables/useStockActions'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import StatCard from '@/components/StatCard.vue'
@@ -18,22 +25,107 @@ import RankList from '@/components/RankList.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
 
 const message = useMessage()
+const router = useRouter()
 const { vars, isDark, pctColor, upColor, downColor, flatColor, withAlpha } = useUi()
+const { adding, goAnalysis, goQa, goCompare, goAlert, addToWatchlist } = useStockActions()
 
 // ---------- 市场概览 ----------
 const overview = ref<Overview | null>(null)
 const ovLoading = ref(false)
 
-async function loadOverview() {
-  ovLoading.value = true
+async function loadOverview(silent = false) {
+  if (!silent) ovLoading.value = true
   try {
     overview.value = await getOverview('cn')
   } catch (e) {
-    message.error('市场概览加载失败：' + (e as Error).message)
+    if (!silent) message.error('市场概览加载失败：' + (e as Error).message)
   } finally {
-    ovLoading.value = false
+    if (!silent) ovLoading.value = false
   }
 }
+
+// ---------- 我的概览：仓位 / 待办 / 自选 / 推荐，一屏知全局 ----------
+const minePos = ref<{ pnl: number; pct: number; n: number } | null>(null)
+const mineTodo = ref<TodoResult | null>(null)
+const mineWatch = ref<{ up: number; down: number; total: number } | null>(null)
+const mineRec = ref<RecommendationBatch | null>(null)
+const mineRecLoaded = ref(false)
+
+async function loadMine() {
+  const [pos, todos, wl, recs] = await Promise.allSettled([
+    listPositions('holding'),
+    getTodos(),
+    listWatchlists(),
+    listRecommendations(undefined, 1),
+  ])
+  if (pos.status === 'fulfilled') {
+    let cost = 0
+    let pnl = 0
+    let n = 0
+    for (const p of pos.value) {
+      if (p.status === 'holding' && p.quote_ok) {
+        cost += p.cost
+        pnl += p.profit_amount
+        n++
+      }
+    }
+    minePos.value = { pnl, pct: cost > 0 ? (pnl / cost) * 100 : 0, n }
+  }
+  if (todos.status === 'fulfilled') mineTodo.value = todos.value
+  if (wl.status === 'fulfilled') {
+    let up = 0
+    let down = 0
+    let total = 0
+    for (const g of wl.value) {
+      for (const it of g.items) {
+        total++
+        if (!it.quote_ok) continue
+        if (it.change_pct > 0) up++
+        else if (it.change_pct < 0) down++
+      }
+    }
+    mineWatch.value = { up, down, total }
+  }
+  if (recs.status === 'fulfilled') {
+    mineRec.value = recs.value[0] ?? null
+    mineRecLoaded.value = true
+  }
+}
+
+function recTypeText(t: string) {
+  return t.includes('short') ? '短线' : t.includes('long') ? '长线' : t
+}
+function relDay(iso: string) {
+  const d = new Date(iso)
+  const today = new Date()
+  const days = Math.floor((today.setHours(0, 0, 0, 0) - new Date(d).setHours(0, 0, 0, 0)) / 86400000)
+  if (days <= 0) return '今天'
+  if (days === 1) return '昨天'
+  return `${days} 天前`
+}
+function fmtSigned(n: number) {
+  return (
+    (n >= 0 ? '+' : '') +
+    n.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  )
+}
+
+// 我的概览卡样式变量（与 StatCard 同质感语言）
+const mineVars = computed(() => ({
+  '--mine-border': vars.value.borderColor,
+  '--mine-bg': vars.value.cardColor,
+  '--mine-primary': vars.value.primaryColor,
+  '--mine-shadow': isDark.value
+    ? 'inset 0 1px 0 rgba(255, 255, 255, 0.045)'
+    : '0 1px 2px rgba(0, 0, 0, 0.03), 0 3px 12px rgba(0, 0, 0, 0.04)',
+  '--mine-glow': withAlpha(vars.value.primaryColor, 0.14),
+}))
+
+// 盘中自动刷新：60s，仅交易时段 + 页面可见（见 useAutoRefresh），静默不闪 loading。
+useAutoRefresh(() => {
+  loadOverview(true)
+  loadMine()
+}, 60_000)
 
 // ---------- 个股速查 ----------
 const symbol = ref('600000')
@@ -130,6 +222,7 @@ function breadthPct(n: number) {
 
 onMounted(() => {
   loadOverview()
+  loadMine()
   loadStock()
   window.addEventListener('resize', onResize)
 })
@@ -149,10 +242,73 @@ function onResize() {
       <n-tag v-if="overview" size="small" round :bordered="false">
         更新 {{ fmtTime(overview.data_time) }}
       </n-tag>
-      <n-button size="small" secondary :loading="ovLoading" @click="loadOverview">刷新</n-button>
+      <n-button size="small" secondary :loading="ovLoading" @click="loadOverview()">刷新</n-button>
     </template>
 
     <div class="dashboard">
+      <!-- 我的概览：仓位 / 待办 / 自选 / 推荐，点击直达 -->
+      <n-grid cols="2 s:4" :x-gap="14" :y-gap="14" responsive="screen" :style="mineVars">
+        <n-gi>
+          <div class="mine-card" @click="router.push('/positions')">
+            <div class="mc-label">持仓浮动盈亏</div>
+            <div
+              class="mc-value qv-figure"
+              :style="minePos && minePos.n ? { color: pctColor(minePos.pnl) } : undefined"
+            >
+              {{ minePos ? (minePos.n ? fmtSigned(minePos.pnl) : '暂无持仓') : '—' }}
+            </div>
+            <div class="mc-sub">
+              <template v-if="minePos && minePos.n">
+                <ChangeTag :value="minePos.pct" size="small" />
+                <span>{{ minePos.n }} 笔持仓</span>
+              </template>
+              <span v-else>记一笔 →</span>
+            </div>
+          </div>
+        </n-gi>
+        <n-gi>
+          <div class="mine-card" @click="router.push('/today')">
+            <div class="mc-label">今日待办</div>
+            <div class="mc-value qv-figure" :class="{ 'mc-calm': mineTodo && !mineTodo.total }">
+              {{ mineTodo ? (mineTodo.total ? `${mineTodo.total} 项` : '无待办') : '—' }}
+            </div>
+            <div class="mc-sub">
+              <span v-if="mineTodo && mineTodo.total">提醒 {{ mineTodo.alerts }} · 复盘 {{ mineTodo.reviews }}</span>
+              <span v-else>一切都在轨道上</span>
+            </div>
+          </div>
+        </n-gi>
+        <n-gi>
+          <div class="mine-card" @click="router.push('/watchlist')">
+            <div class="mc-label">自选股</div>
+            <div class="mc-value qv-figure">
+              <template v-if="mineWatch && mineWatch.total">
+                <span :style="{ color: upColor }">{{ mineWatch.up }} 涨</span>
+                <span class="mc-slash">/</span>
+                <span :style="{ color: downColor }">{{ mineWatch.down }} 跌</span>
+              </template>
+              <template v-else>{{ mineWatch ? '还没有自选' : '—' }}</template>
+            </div>
+            <div class="mc-sub">
+              <span v-if="mineWatch && mineWatch.total">共 {{ mineWatch.total }} 只</span>
+              <span v-else>去添加 →</span>
+            </div>
+          </div>
+        </n-gi>
+        <n-gi>
+          <div class="mine-card" @click="router.push('/recommendations')">
+            <div class="mc-label">最新推荐</div>
+            <div class="mc-value qv-figure" :class="{ 'mc-calm': mineRecLoaded && !mineRec }">
+              {{ mineRec ? recTypeText(mineRec.type) + ' 策略' : mineRecLoaded ? '还没生成过' : '—' }}
+            </div>
+            <div class="mc-sub">
+              <span v-if="mineRec">{{ relDay(mineRec.created_at) }} · {{ mineRec.strategy }}</span>
+              <span v-else>去生成 →</span>
+            </div>
+          </div>
+        </n-gi>
+      </n-grid>
+
       <!-- 指数概览 -->
       <SectionCard title="指数概览">
         <n-spin :show="ovLoading && !overview">
@@ -351,6 +507,15 @@ function onResize() {
               <span class="qc-value qv-tnum">{{ fmtAmount(quote.amount) }}</span>
             </div>
           </div>
+
+          <!-- 快捷动作：查到即可直达，不用换页面重输代码 -->
+          <div class="quote-actions">
+            <n-button size="small" secondary @click="goAnalysis(quote)">AI 分析</n-button>
+            <n-button size="small" secondary @click="goQa(quote)">个股问答</n-button>
+            <n-button size="small" secondary @click="goCompare(quote)">横向对比</n-button>
+            <n-button size="small" secondary :loading="adding" @click="addToWatchlist(quote)">+ 自选</n-button>
+            <n-button size="small" secondary @click="goAlert(quote)">设提醒</n-button>
+          </div>
         </div>
 
         <div ref="chartEl" class="quote-chart"></div>
@@ -431,6 +596,65 @@ function onResize() {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+/* 我的概览卡：可点击直达，与 StatCard 同质感 */
+.mine-card {
+  padding: 14px 16px;
+  border-radius: 12px;
+  border: 1px solid var(--mine-border);
+  background: var(--mine-bg);
+  box-shadow: var(--mine-shadow);
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    box-shadow 0.2s ease,
+    transform 0.2s ease;
+}
+.mine-card:hover {
+  border-color: var(--mine-primary);
+  box-shadow: var(--mine-shadow), 0 6px 18px var(--mine-glow);
+  transform: translateY(-1px);
+}
+.mc-label {
+  font-size: 13px;
+  opacity: 0.7;
+  margin-bottom: 8px;
+}
+.mc-value {
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.15;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mc-value.mc-calm {
+  opacity: 0.55;
+  font-weight: 600;
+}
+.mc-slash {
+  opacity: 0.35;
+  margin: 0 4px;
+  font-weight: 400;
+}
+.mc-sub {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  min-height: 20px;
+  font-size: 12px;
+  opacity: 0.65;
+}
+
+/* 速查快捷动作条 */
+.quote-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 14px;
 }
 
 /* 榜单行 */
