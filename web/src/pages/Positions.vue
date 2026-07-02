@@ -17,16 +17,19 @@ import {
   NSpin,
   NGrid,
   NGi,
+  NAlert,
   useMessage,
 } from 'naive-ui'
 import {
   listPositions,
+  getPortfolioOverview,
   createPosition,
   updatePosition,
   closePosition,
   deletePosition,
   type Position,
   type PositionInput,
+  type PortfolioOverview,
 } from '@/api/position'
 import { useUi } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
@@ -42,6 +45,7 @@ const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 const warnColor = computed(() => vars.value.warningColor)
 
 const positions = ref<Position[]>([])
+const overview = ref<PortfolioOverview | null>(null)
 const loading = ref(false)
 const statusFilter = ref<'holding' | 'closed' | 'all'>('holding')
 const typeFilter = ref<'all' | 'short_term' | 'long_term'>('all')
@@ -53,7 +57,9 @@ const marketOptions = [
 async function load(silent = false) {
   if (!silent) loading.value = true
   try {
-    positions.value = await listPositions(statusFilter.value)
+    const [list, ov] = await Promise.all([listPositions(statusFilter.value), getPortfolioOverview()])
+    positions.value = list
+    overview.value = ov
   } catch (e) {
     if (!silent) message.error((e as Error).message)
   } finally {
@@ -70,22 +76,20 @@ const filtered = computed(() =>
     : positions.value.filter((p) => p.position_type === typeFilter.value),
 )
 
-// 汇总（仅持仓中且取到现价的部分）。
-const summary = computed(() => {
-  let cost = 0,
-    mv = 0,
-    pnl = 0
-  let n = 0
-  for (const p of filtered.value) {
-    if (p.status === 'holding' && p.quote_ok) {
-      cost += p.cost
-      mv += p.market_value
-      pnl += p.profit_amount
-      n++
-    }
-  }
-  return { cost, mv, pnl, pct: cost > 0 ? (pnl / cost) * 100 : 0, n }
+// 汇总改为后端组合总览（GET /positions/overview：全组合口径，不随筛选变化）。
+const mixLabel = computed(() => {
+  const ov = overview.value
+  if (!ov || ov.total_value <= 0) return '—'
+  const short = (ov.short_value / ov.total_value) * 100
+  return `${short.toFixed(0)}% / ${(100 - short).toFixed(0)}%`
 })
+
+// 持仓行「N 天未分析」提示文案（从未分析则不带天数）。
+function staleLabel(p: Position) {
+  if (!p.last_analyzed_at) return '未分析'
+  const days = Math.floor((Date.now() - new Date(p.last_analyzed_at).getTime()) / 86_400_000)
+  return `${days} 天未分析`
+}
 
 function typeLabel(t: string) {
   return t === 'short_term' ? '短线' : '长线'
@@ -377,21 +381,47 @@ onMounted(async () => {
     </template>
 
     <div class="pos" :style="styleVars">
-      <!-- 汇总 -->
+      <!-- 汇总（组合总览：全组合口径） -->
       <n-grid cols="2 s:4" :x-gap="14" :y-gap="14" responsive="screen">
         <n-gi>
-          <StatCard label="持仓成本" :value="fmtMoney(summary.cost)" />
+          <StatCard label="持仓成本" :value="fmtMoney(overview?.total_cost ?? 0)" />
         </n-gi>
         <n-gi>
-          <StatCard label="当前市值" :value="fmtMoney(summary.mv)" />
+          <StatCard label="当前市值" :value="fmtMoney(overview?.total_value ?? 0)" />
         </n-gi>
         <n-gi>
-          <StatCard label="浮动盈亏" :value="fmtMoney(summary.pnl)" :change-pct="summary.pct" />
+          <StatCard
+            label="浮动盈亏"
+            :value="fmtMoney(overview?.total_profit ?? 0)"
+            :change-pct="overview?.profit_pct ?? 0"
+          />
         </n-gi>
         <n-gi>
-          <StatCard label="持仓笔数" :value="String(summary.n)" />
+          <StatCard label="已实现盈亏" :value="fmtMoney(overview?.realized_profit ?? 0)" sub="已平仓累计" />
+        </n-gi>
+        <n-gi>
+          <StatCard
+            label="持仓笔数"
+            :value="String(overview?.holding_count ?? 0)"
+            :sub="`盈 ${overview?.win_count ?? 0} · 亏 ${overview?.lose_count ?? 0}`"
+          />
+        </n-gi>
+        <n-gi>
+          <StatCard label="短线 / 长线" :value="mixLabel" sub="按市值占比" />
+        </n-gi>
+        <n-gi>
+          <StatCard
+            label="最大持仓占比"
+            :value="overview?.top_weight_pct ? overview.top_weight_pct.toFixed(1) + '%' : '—'"
+            :sub="overview?.top_name || overview?.top_symbol || ''"
+          />
         </n-gi>
       </n-grid>
+
+      <!-- 组合风控信号（集中度/止损/未分析） -->
+      <n-alert v-if="overview?.signals?.length" type="warning" title="组合风控信号">
+        <div v-for="(s, i) in overview.signals" :key="i" class="signal-line">{{ s }}</div>
+      </n-alert>
 
       <SectionCard title="持仓明细">
         <template #extra>
@@ -425,6 +455,17 @@ onMounted(async () => {
                   <span class="r-title">{{ p.name || p.symbol }}</span>
                   <span class="r-symbol qv-mono">{{ p.symbol }}</span>
                   <n-tag v-if="p.status === 'closed'" size="tiny" :bordered="false">已卖出</n-tag>
+                  <n-tag v-if="p.below_stop_loss" size="tiny" type="error" :bordered="false">破止损</n-tag>
+                  <n-tag v-else-if="p.near_stop_loss" size="tiny" type="warning" :bordered="false">近止损</n-tag>
+                  <n-tag
+                    v-if="p.status === 'holding' && p.analysis_stale"
+                    size="tiny"
+                    :bordered="false"
+                    class="tag-click"
+                    title="点击发起个股分析"
+                    @click="goAnalysis(p)"
+                    >{{ staleLabel(p) }}</n-tag
+                  >
                 </div>
                 <div class="r-sub">
                   买入 {{ fmt(p.buy_price) }} × {{ p.quantity }}
@@ -728,6 +769,12 @@ onMounted(async () => {
   font-size: 12px;
   font-weight: 500;
   margin-top: 4px;
+}
+.tag-click {
+  cursor: pointer;
+}
+.signal-line {
+  line-height: 1.7;
 }
 .r-figures {
   display: flex;

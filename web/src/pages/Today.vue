@@ -31,6 +31,8 @@ function kindMeta(kind: string) {
   switch (kind) {
     case 'alert':
       return { label: '提醒', color: upColor.value }
+    case 'stop_loss':
+      return { label: '止损警示', color: vars.value.errorColor }
     case 'rec_review':
       return { label: '推荐复盘', color: downColor.value }
     case 'position_short':
