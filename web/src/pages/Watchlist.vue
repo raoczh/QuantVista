@@ -67,12 +67,15 @@ function openRenameGroup(g: WatchlistGroup) {
   groupForm.value = { id: g.id, name: g.name }
   groupModal.value = true
 }
+const groupSaving = ref(false)
 async function submitGroup() {
+  if (groupSaving.value) return
   const { id, name } = groupForm.value
   if (!name.trim()) {
     message.warning('请输入分组名称')
     return
   }
+  groupSaving.value = true
   try {
     if (id) await updateGroup(id, name.trim())
     else await createGroup(name.trim())
@@ -81,6 +84,8 @@ async function submitGroup() {
     message.success('已保存')
   } catch (e) {
     message.error((e as Error).message)
+  } finally {
+    groupSaving.value = false
   }
 }
 async function removeGroup(g: WatchlistGroup) {
@@ -136,12 +141,15 @@ function openEditItem(item: WatchlistItem) {
   }
   itemModal.value = true
 }
+const itemSaving = ref(false)
 async function submitItem() {
+  if (itemSaving.value) return
   const f = itemForm.value
   if (!itemEditing.value && !f.symbol.trim()) {
     message.warning('请输入股票代码')
     return
   }
+  itemSaving.value = true
   try {
     if (itemEditing.value && f.id) {
       await updateItem(f.id, {
@@ -164,6 +172,8 @@ async function submitItem() {
     message.success('已保存')
   } catch (e) {
     message.error((e as Error).message)
+  } finally {
+    itemSaving.value = false
   }
 }
 async function togglePin(item: WatchlistItem) {
@@ -194,6 +204,16 @@ function buildPosition(item: WatchlistItem) {
     name: 'positions',
     query: { add: '1', symbol: item.symbol, market: item.market, name: item.name },
   })
+}
+// 快捷入口：分析/提醒/问答页均已支持 query 预填（PRD 3.3/3.16/3.17 的跳转交互）。
+function goAnalysis(item: WatchlistItem) {
+  router.push({ name: 'analysis', query: { module: 'stock', symbol: item.symbol, market: item.market } })
+}
+function goAlert(item: WatchlistItem) {
+  router.push({ name: 'alerts', query: { add: '1', symbol: item.symbol, market: item.market, name: item.name } })
+}
+function goQa(item: WatchlistItem) {
+  router.push({ name: 'qa', query: { symbol: item.symbol, market: item.market } })
 }
 
 function fmt(n: number | undefined) {
@@ -258,6 +278,9 @@ onMounted(load)
                 <n-button size="tiny" quaternary @click="togglePin(it)">{{
                   it.is_pinned ? '取消重点' : '重点'
                 }}</n-button>
+                <n-button size="tiny" quaternary @click="goAnalysis(it)">分析</n-button>
+                <n-button size="tiny" quaternary @click="goAlert(it)">提醒</n-button>
+                <n-button size="tiny" quaternary @click="goQa(it)">问答</n-button>
                 <n-button size="tiny" quaternary @click="buildPosition(it)">建仓</n-button>
                 <n-button size="tiny" quaternary @click="openEditItem(it)">编辑</n-button>
                 <n-popconfirm @positive-click="removeItem(it)">
@@ -288,7 +311,7 @@ onMounted(load)
       <template #footer>
         <div class="modal-footer">
           <n-button @click="groupModal = false">取消</n-button>
-          <n-button type="primary" @click="submitGroup">保存</n-button>
+          <n-button type="primary" :loading="groupSaving" @click="submitGroup">保存</n-button>
         </div>
       </template>
     </n-modal>
@@ -329,7 +352,7 @@ onMounted(load)
       <template #footer>
         <div class="modal-footer">
           <n-button @click="itemModal = false">取消</n-button>
-          <n-button type="primary" @click="submitItem">保存</n-button>
+          <n-button type="primary" :loading="itemSaving" @click="submitItem">保存</n-button>
         </div>
       </template>
     </n-modal>

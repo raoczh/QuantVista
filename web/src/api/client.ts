@@ -13,6 +13,10 @@ const http: AxiosInstance = axios.create({
   timeout: 20000,
 })
 
+// AI 类接口（分析/推荐/问答/对比点评）服务端合法耗时可达数分钟（LLM 单次 90s、
+// 校验失败最多重试 2 次）；全局 20s 会把仍在执行并扣配额的任务在前端掐断。
+export const AI_TIMEOUT = 300000
+
 // 请求拦截：自动附带 access token。
 http.interceptors.request.use((config) => {
   const token = getAccessToken()
@@ -62,7 +66,8 @@ http.interceptors.response.use(
       }
       clearTokens()
       if (location.pathname !== '/login') {
-        location.href = '/login'
+        // 带上当前位置，登录后由路由守卫送回原页面。
+        location.href = '/login?redirect=' + encodeURIComponent(location.pathname + location.search)
       }
     }
     return Promise.reject(error)
@@ -71,7 +76,15 @@ http.interceptors.response.use(
 
 // 统一拆包：success=false 时抛出带 message 的错误，组件只处理 data。
 export async function request<T>(config: Parameters<AxiosInstance['request']>[0]): Promise<T> {
-  const resp = await http.request<ApiEnvelope<T>>(config)
+  let resp
+  try {
+    resp = await http.request<ApiEnvelope<T>>(config)
+  } catch (e) {
+    if (axios.isAxiosError(e) && e.code === 'ECONNABORTED') {
+      throw new Error('请求超时：任务可能仍在后台执行，请稍后刷新查看结果')
+    }
+    throw e
+  }
   const body = resp.data
   if (!body || body.success !== true) {
     throw new Error(body?.message || '请求失败')

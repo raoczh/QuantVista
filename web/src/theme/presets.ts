@@ -21,7 +21,7 @@ function build(primary: string, hover: string, pressed: string, suppl: string): 
   }
 }
 
-// 6 套主流主题：亮 3 / 暗 3，主色覆盖 蓝/绿/紫/橙/红/青。
+// 6 套主流主题：亮 3 / 暗 3，主色覆盖 蓝（亮/暗）/翠绿/紫/琥珀/玫红。
 // 衍生色尽量沿用 Naive 官方调色，自定义色按相近规律取 hover 提亮 / pressed 压暗。
 export const THEME_PRESETS: ThemePreset[] = [
   {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   NButton,
@@ -126,16 +126,23 @@ async function runAnalysis() {
 // ---------- 历史 ----------
 const history = ref<AnalysisRecord[]>([])
 const historyLoading = ref(false)
+// 历史模块筛选（PRD 3.14：按模块筛选历史，后端 History 已支持）。
+const historyModule = ref<string>('all')
+const historyFilterOptions: { label: string; value: string }[] = [
+  { label: '全部模块', value: 'all' },
+  ...moduleOptions,
+]
 async function loadHistory() {
   historyLoading.value = true
   try {
-    history.value = await listAnalysis('all', 30)
+    history.value = await listAnalysis(historyModule.value, 30)
   } catch (e) {
     message.error((e as Error).message)
   } finally {
     historyLoading.value = false
   }
 }
+watch(historyModule, () => loadHistory())
 async function openRecord(rec: AnalysisRecord) {
   try {
     current.value = await getAnalysis(rec.id)
@@ -239,6 +246,12 @@ onMounted(async () => {
 
         <SectionCard title="历史记录">
           <template #extra>
+            <n-select
+              v-model:value="historyModule"
+              size="tiny"
+              :options="historyFilterOptions"
+              style="width: 110px"
+            />
             <n-button size="tiny" quaternary :loading="historyLoading" @click="loadHistory"
               >刷新</n-button
             >

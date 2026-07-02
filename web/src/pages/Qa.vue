@@ -63,6 +63,7 @@ async function scrollToBottom() {
 }
 
 async function send() {
+  if (asking.value) return // 回车/连击防抖：请求在途时不重复提交
   const q = question.value.trim()
   if (!q) return
   if (!current.value && !symbol.value.trim()) {

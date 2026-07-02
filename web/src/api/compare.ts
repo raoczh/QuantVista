@@ -1,4 +1,4 @@
-import { request } from './client'
+import { request, AI_TIMEOUT } from './client'
 
 export interface CompareRow {
   symbol: string
@@ -34,5 +34,5 @@ export interface CompareRequest {
 }
 
 export function compareStocks(req: CompareRequest) {
-  return request<CompareResult>({ url: '/compare', method: 'post', data: req })
+  return request<CompareResult>({ url: '/compare', method: 'post', data: req, timeout: AI_TIMEOUT })
 }

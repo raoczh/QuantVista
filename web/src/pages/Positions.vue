@@ -150,7 +150,9 @@ function openEdit(p: Position) {
   }
   editModal.value = true
 }
+const submitting = ref(false)
 async function submit() {
+  if (submitting.value) return
   const f = form.value
   if (!editing.value && !f.symbol?.trim()) {
     message.warning('请输入股票代码')
@@ -164,6 +166,7 @@ async function submit() {
     message.warning('请输入买入数量')
     return
   }
+  submitting.value = true
   try {
     const payload: PositionInput = {
       symbol: f.symbol?.trim(),
@@ -184,6 +187,8 @@ async function submit() {
     message.success('已保存')
   } catch (e) {
     message.error((e as Error).message)
+  } finally {
+    submitting.value = false
   }
 }
 
@@ -210,12 +215,14 @@ function openClose(p: Position) {
   }
   closeModal.value = true
 }
+const closingSubmit = ref(false)
 async function submitClose() {
-  if (!closing.value) return
+  if (!closing.value || closingSubmit.value) return
   if (!closeForm.value.sell_price || closeForm.value.sell_price <= 0) {
     message.warning('请输入卖出价格')
     return
   }
+  closingSubmit.value = true
   try {
     await closePosition(closing.value.id, {
       sell_price: closeForm.value.sell_price,
@@ -230,6 +237,8 @@ async function submitClose() {
     message.success('已标记卖出')
   } catch (e) {
     message.error((e as Error).message)
+  } finally {
+    closingSubmit.value = false
   }
 }
 
@@ -241,6 +250,14 @@ async function remove(p: Position) {
   } catch (e) {
     message.error((e as Error).message)
   }
+}
+
+// 快捷入口：分析/提醒页均已支持 query 预填（PRD 3.3/3.16 的跳转交互）。
+function goAnalysis(p: Position) {
+  router.push({ name: 'analysis', query: { module: 'stock', symbol: p.symbol, market: p.market } })
+}
+function goAlert(p: Position) {
+  router.push({ name: 'alerts', query: { add: '1', symbol: p.symbol, market: p.market, name: p.name } })
 }
 
 onMounted(async () => {
@@ -351,6 +368,8 @@ onMounted(async () => {
                 <n-button v-if="p.status === 'holding'" size="tiny" type="primary" ghost @click="openClose(p)"
                   >卖出</n-button
                 >
+                <n-button size="tiny" quaternary @click="goAnalysis(p)">分析</n-button>
+                <n-button size="tiny" quaternary @click="goAlert(p)">提醒</n-button>
                 <n-button size="tiny" quaternary @click="openEdit(p)">编辑</n-button>
                 <n-popconfirm @positive-click="remove(p)">
                   <template #trigger>
@@ -436,7 +455,7 @@ onMounted(async () => {
       <template #footer>
         <div class="modal-footer">
           <n-button @click="editModal = false">取消</n-button>
-          <n-button type="primary" @click="submit">保存</n-button>
+          <n-button type="primary" :loading="submitting" @click="submit">保存</n-button>
         </div>
       </template>
     </n-modal>
@@ -490,7 +509,7 @@ onMounted(async () => {
       <template #footer>
         <div class="modal-footer">
           <n-button @click="closeModal = false">取消</n-button>
-          <n-button type="primary" @click="submitClose">确认卖出</n-button>
+          <n-button type="primary" :loading="closingSubmit" @click="submitClose">确认卖出</n-button>
         </div>
       </template>
     </n-modal>

@@ -348,6 +348,7 @@ onMounted(async () => {
               <n-tag size="tiny" :bordered="false" round>进行 {{ performance.active }}</n-tag>
             </div>
             <div class="perf-note">仅统计有价格数据的推荐；超额收益以上证指数为基准。</div>
+            <div v-if="performance.sample < 10" class="perf-note">样本较少（n&lt;10），统计结果波动大，仅供参考。</div>
           </div>
         </SectionCard>
       </div>

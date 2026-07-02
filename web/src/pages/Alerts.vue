@@ -204,8 +204,14 @@ function todayString() {
 
 function isHitToday(r: AlertRule) {
   if (r.status === 'triggered') return true
-  if (!r.triggered_at || !r.last_check_date) return false
-  return r.last_check_date === todayString()
+  // 与后端 TriggeredForUser 同口径：非 once 规则只看 triggered_at 是否为今天。
+  // 不能用 last_check_date——它每次评估（15 分钟一轮）都会刷成今天，
+  // 历史命中会永久显示「已命中」。已暂停的规则不再提示。
+  if (r.status === 'paused' || !r.triggered_at) return false
+  const d = new Date(r.triggered_at)
+  const mm = String(d.getMonth() + 1).padStart(2, '0')
+  const dd = String(d.getDate()).padStart(2, '0')
+  return `${d.getFullYear()}-${mm}-${dd}` === todayString()
 }
 
 function statusTag(r: AlertRule) {
@@ -247,11 +253,14 @@ async function loadChannels() {
     message.error((e as Error).message)
   }
 }
+const chAdding = ref(false)
 async function addChannel() {
+  if (chAdding.value) return
   if (!chForm.value.target.trim()) {
     message.warning(chForm.value.kind === 'serverchan' ? '请输入 Server酱 SendKey' : '请输入 Webhook 地址')
     return
   }
+  chAdding.value = true
   try {
     await createChannel({ ...chForm.value })
     chForm.value.target = ''
@@ -260,6 +269,8 @@ async function addChannel() {
     message.success('已添加推送通道')
   } catch (e) {
     message.error((e as Error).message)
+  } finally {
+    chAdding.value = false
   }
 }
 async function toggleChannel(ch: NotifyChannel) {
@@ -353,7 +364,7 @@ function channelKindLabel(k: string) {
                 :placeholder="chForm.kind === 'serverchan' ? 'Server酱 SendKey' : 'https://...'"
               />
             </n-form-item>
-            <n-button type="primary" ghost block @click="addChannel">添加通道</n-button>
+            <n-button type="primary" ghost block :loading="chAdding" @click="addChannel">添加通道</n-button>
             <div class="hint">提醒命中时会主动推送到已启用的通道（同一提醒每天最多推一次）。密钥加密存储、不回显。</div>
           </n-form>
 

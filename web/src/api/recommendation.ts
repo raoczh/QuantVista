@@ -1,4 +1,4 @@
-import { request } from './client'
+import { request, AI_TIMEOUT } from './client'
 
 export type RecType = 'short_term' | 'long_term'
 export type RecStatus = 'success' | 'degraded' | 'failed'
@@ -133,7 +133,7 @@ export function listStrategies(type: RecType) {
 }
 
 export function generateRecommendations(req: RecommendRequest) {
-  return request<RecommendationView>({ url: '/recommendations', method: 'post', data: req })
+  return request<RecommendationView>({ url: '/recommendations', method: 'post', data: req, timeout: AI_TIMEOUT })
 }
 
 export function listRecommendations(type?: string, limit = 30) {

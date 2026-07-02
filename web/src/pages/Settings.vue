@@ -29,7 +29,7 @@ import {
   type LLMConfig,
   type LLMConfigInput,
 } from '@/api/llm'
-import { getPreference, updatePreference, changePassword, type UserPreference } from '@/api/user'
+import { getPreference, updatePreference, changePassword, getQuota, type UserPreference, type UserQuota } from '@/api/user'
 import { useAuthStore } from '@/stores/auth'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
@@ -173,6 +173,16 @@ async function loadPref() {
   }
 }
 
+/* ---------------- AI 配额用量 ---------------- */
+const quota = ref<UserQuota | null>(null)
+async function loadQuota() {
+  try {
+    quota.value = await getQuota()
+  } catch {
+    /* 配额展示失败不打扰用户 */
+  }
+}
+
 async function savePref() {
   if (!pref.value) return
   savingPref.value = true
@@ -213,6 +223,7 @@ async function submitChangePassword() {
 onMounted(() => {
   loadConfigs()
   loadPref()
+  loadQuota()
 })
 </script>
 
@@ -284,10 +295,23 @@ onMounted(() => {
             <n-input-number v-model:value="pref.default_rec_count" :min="3" :max="5" />
           </n-form-item>
           <n-form-item label="开启提醒">
-            <n-switch v-model:value="pref.enable_notify" />
+            <div class="notify-switch">
+              <n-switch v-model:value="pref.enable_notify" />
+              <span class="notify-hint">推送总闸：关闭后提醒命中仅在站内展示，不再外推到 Server酱/Webhook</span>
+            </div>
           </n-form-item>
           <n-button type="primary" :loading="savingPref" @click="savePref">保存偏好</n-button>
         </n-form>
+      </SectionCard>
+      <SectionCard v-if="quota" title="AI 用量" :hoverable="false" style="margin-top: 16px">
+        <div class="quota">
+          <span>累计消耗 token：<b class="qv-tnum">{{ quota.token_used.toLocaleString() }}</b></span>
+          <span>调用次数：<b class="qv-tnum">{{ quota.request_count }}</b></span>
+          <span v-if="quota.token_limit > 0"
+            >额度：<b class="qv-tnum">{{ quota.token_limit.toLocaleString() }}</b>（用尽后 AI 功能将被熔断）</span
+          >
+          <span v-else>额度：不限</span>
+        </div>
       </SectionCard>
     </n-tab-pane>
 
@@ -369,5 +393,20 @@ onMounted(() => {
 .ct-title {
   font-size: 14px;
   font-weight: 600;
+}
+.notify-switch {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.notify-hint {
+  font-size: 12px;
+  opacity: 0.65;
+}
+.quota {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  font-size: 13px;
 }
 </style>
