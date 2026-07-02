@@ -23,6 +23,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/prompt-templates', name: 'prompts', component: () => import('@/pages/Prompts.vue'), meta: { title: '提示词模板' } },
   { path: '/recommendations', name: 'recommendations', component: () => import('@/pages/Recommendations.vue'), meta: { title: '推荐追踪' } },
   { path: '/alerts', name: 'alerts', component: () => import('@/pages/Alerts.vue'), meta: { title: '条件提醒' } },
+  { path: '/thesis', name: 'thesis', component: () => import('@/pages/ThesisCards.vue'), meta: { title: '投资逻辑卡' } },
   { path: '/settings', name: 'settings', component: () => import('@/pages/Settings.vue'), meta: { title: '设置' } },
   { path: '/admin', name: 'admin', component: () => import('@/pages/AdminSettings.vue'), meta: { title: '管理后台', admin: true } },
   { path: '/:pathMatch(.*)*', name: 'notfound', component: Placeholder, meta: { title: '未找到' } },

@@ -263,6 +263,9 @@ function goAnalysis(p: Position) {
 function goAlert(p: Position) {
   router.push({ name: 'alerts', query: { add: '1', symbol: p.symbol, market: p.market, name: p.name } })
 }
+function goThesis(p: Position) {
+  router.push({ name: 'thesis', query: { add: '1', symbol: p.symbol, market: p.market, name: p.name } })
+}
 
 onMounted(async () => {
   // 从自选「建仓」跳转而来：预填并打开建仓弹窗，然后清掉 query。
@@ -374,6 +377,7 @@ onMounted(async () => {
                 >
                 <n-button size="tiny" quaternary @click="goAnalysis(p)">分析</n-button>
                 <n-button size="tiny" quaternary @click="goAlert(p)">提醒</n-button>
+                <n-button size="tiny" quaternary @click="goThesis(p)">逻辑卡</n-button>
                 <n-button size="tiny" quaternary @click="openEdit(p)">编辑</n-button>
                 <n-popconfirm @positive-click="remove(p)">
                   <template #trigger>

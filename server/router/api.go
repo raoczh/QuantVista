@@ -25,7 +25,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	recommendationSvc := service.NewRecommendationService(marketSvc, watchlistSvc, llmSvc)
 	trackingSvc := service.NewTrackingService(marketSvc)
 	alertSvc := service.NewAlertService(marketSvc)
-	todoSvc := service.NewTodoService(alertSvc, positionSvc)
+	thesisSvc := service.NewThesisService(marketSvc)
+	todoSvc := service.NewTodoService(alertSvc, positionSvc, thesisSvc)
 	qaSvc := service.NewQaService(marketSvc, llmSvc)
 	compareSvc := service.NewCompareService(marketSvc, llmSvc)
 	scoreSvc := service.NewScoreService(marketSvc)
@@ -51,6 +52,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	paperCtl := controller.NewPaperController(paperSvc)
 	notifyCtl := controller.NewNotifyController(notifySvc)
 	promptCtl := controller.NewPromptController(promptSvc)
+	thesisCtl := controller.NewThesisController(thesisSvc)
 
 	api := r.Group("/api")
 	{
@@ -170,8 +172,18 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				alerts.DELETE("/:id", alertCtl.Delete)
 			}
 
-			// 今日待办/待复盘（聚合命中提醒 + 推荐/持仓复盘信号）
+			// 今日待办/待复盘（聚合命中提醒 + 推荐/持仓复盘信号 + 逻辑卡到期）
 			authed.GET("/todos", todoCtl.List)
+
+			// 投资逻辑卡片（结构化研究假设：核心逻辑/证据/风险/失效条件/复盘日期）
+			thesis := authed.Group("/thesis-cards")
+			{
+				thesis.GET("", thesisCtl.List)
+				thesis.GET("/checkup", thesisCtl.CheckUp)
+				thesis.POST("", thesisCtl.Upsert)
+				thesis.PUT("/:id/status", thesisCtl.SetStatus)
+				thesis.DELETE("/:id", thesisCtl.Delete)
+			}
 
 			// 个股 AI 问答（多轮，复用数据快照；走 LLM，限流控成本）
 			qa := authed.Group("/qa")

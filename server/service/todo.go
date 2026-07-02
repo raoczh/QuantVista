@@ -12,15 +12,16 @@ import (
 )
 
 // TodoService 今日待办/待复盘聚合：把分散在各处的「今天该看的」汇成一张清单，
-// 不生成新数据，只聚合已有信号——命中的条件提醒、需复盘的短线推荐、需复盘的持仓。
-// 与全局理念一致：不主动推送，查询即提示。
+// 不生成新数据，只聚合已有信号——命中的条件提醒、需复盘的短线推荐、需复盘的持仓、
+// 到期待复盘的投资逻辑卡。与全局理念一致：不主动推送，查询即提示。
 type TodoService struct {
 	alert    *AlertService
 	position *PositionService
+	thesis   *ThesisService
 }
 
-func NewTodoService(alert *AlertService, position *PositionService) *TodoService {
-	return &TodoService{alert: alert, position: position}
+func NewTodoService(alert *AlertService, position *PositionService, thesis *ThesisService) *TodoService {
+	return &TodoService{alert: alert, position: position, thesis: thesis}
 }
 
 // 待办类型。
@@ -29,6 +30,7 @@ const (
 	TodoKindRecReview     = "rec_review"     // 短线推荐触发止盈/止损/过期，需复盘
 	TodoKindPositionShort = "position_short" // 短线持仓持有超阈值，需复盘
 	TodoKindPositionLong  = "position_long"  // 长线持仓持有较久，建议定期复盘
+	TodoKindThesisDue     = "thesis_due"     // 投资逻辑卡到期待复盘
 )
 
 // longHoldReviewDays 长线持仓超过该交易日数提示定期复盘。
@@ -126,6 +128,22 @@ func (s *TodoService) Build(ctx context.Context, userID int64) (*TodoResult, err
 					Title:  "长线持仓定期复盘",
 					Detail: "已持有 " + strconv.Itoa(v.HeldTradeDays) + " 交易日，建议检查长期逻辑是否仍成立",
 					RefID:  v.ID, RefType: "positions",
+				})
+				res.Reviews++
+			}
+		}
+	}
+
+	// 4) 到期待复盘的投资逻辑卡。
+	if s.thesis != nil {
+		if cards, err := s.thesis.DueForUser(userID); err == nil {
+			for _, c := range cards {
+				res.Items = append(res.Items, TodoItem{
+					Kind: TodoKindThesisDue, Priority: 3,
+					Symbol: c.Symbol, Market: c.Market, Name: c.Name,
+					Title:  "投资逻辑卡到期复盘",
+					Detail: "计划复盘日 " + c.NextReviewDate + "，请检查核心逻辑与失效条件是否仍成立",
+					RefID:  c.ID, RefType: "thesis",
 				})
 				res.Reviews++
 			}

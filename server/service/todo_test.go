@@ -38,7 +38,7 @@ func TestTodoBuild(t *testing.T) {
 	common.DB.Create(&model.RecommendationStatus{RecommendationID: 3, BatchID: 12, UserID: 1, Symbol: "600004",
 		Type: model.RecTypeShortTerm, Outcome: model.RecOutcomeActive, ReviewNeeded: false})
 
-	svc := NewTodoService(&AlertService{}, &PositionService{market: nil})
+	svc := NewTodoService(&AlertService{}, &PositionService{market: nil}, nil)
 	// position.List 需要 market 富化；这里无持仓，List 返回空即可（跳过持仓分支）。
 	res, err := svc.Build(context.Background(), 1)
 	if err != nil {

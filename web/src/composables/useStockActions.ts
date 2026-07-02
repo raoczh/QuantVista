@@ -35,6 +35,9 @@ export function useStockActions(onNavigate?: () => void) {
   function goAlert(s: StockRef) {
     go('alerts', { add: '1', symbol: s.symbol, market: s.market, name: s.name })
   }
+  function goThesis(s: StockRef) {
+    go('thesis', { add: '1', symbol: s.symbol, market: s.market, name: s.name })
+  }
 
   /** 加入第一个自选分组（自用默认习惯，免选组打断） */
   async function addToWatchlist(s: StockRef) {
@@ -54,5 +57,5 @@ export function useStockActions(onNavigate?: () => void) {
     }
   }
 
-  return { adding, goAnalysis, goQa, goCompare, goAlert, addToWatchlist }
+  return { adding, goAnalysis, goQa, goCompare, goAlert, goThesis, addToWatchlist }
 }
