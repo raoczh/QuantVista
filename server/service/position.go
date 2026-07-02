@@ -136,6 +136,10 @@ type PositionInput struct {
 	BuyTax       float64 `json:"buy_tax"`
 	BuyReason    string  `json:"buy_reason"`
 	UserNote     string  `json:"user_note"`
+
+	PlanStopLoss   float64 `json:"plan_stop_loss"`   // 计划止损价（0=未设）
+	PlanTakeProfit float64 `json:"plan_take_profit"` // 计划止盈价（0=未设）
+	ChecklistJSON  string  `json:"checklist_json"`   // 买入前检查清单快照
 }
 
 // validCurrency 持仓币种枚举（DATABASE_DESIGN：CNY/USD/HKD）。
@@ -183,6 +187,19 @@ func validateBuy(in *PositionInput) error {
 	if !validPositionType[in.PositionType] {
 		return errors.New("持仓类型须为 short_term 或 long_term")
 	}
+	// 风险计划：给了就必须与买入价自洽（止损 < 买价 < 止盈），否则计划无意义。
+	if in.PlanStopLoss < 0 || in.PlanTakeProfit < 0 {
+		return errors.New("止损/止盈价不能为负")
+	}
+	if in.PlanStopLoss > 0 && in.PlanStopLoss >= in.BuyPrice {
+		return errors.New("计划止损价应低于买入价")
+	}
+	if in.PlanTakeProfit > 0 && in.PlanTakeProfit <= in.BuyPrice {
+		return errors.New("计划止盈价应高于买入价")
+	}
+	if len(in.ChecklistJSON) > 4000 {
+		return errors.New("检查清单数据过大")
+	}
 	return nil
 }
 
@@ -220,6 +237,10 @@ func (s *PositionService) Create(ctx context.Context, userID int64, in PositionI
 		BuyTax:       in.BuyTax,
 		BuyReason:    truncateRunes(strings.TrimSpace(in.BuyReason), 500),
 		UserNote:     truncateRunes(strings.TrimSpace(in.UserNote), 500),
+
+		PlanStopLoss:   in.PlanStopLoss,
+		PlanTakeProfit: in.PlanTakeProfit,
+		ChecklistJSON:  in.ChecklistJSON,
 	}
 	if err := common.DB.Create(p).Error; err != nil {
 		return nil, err
@@ -253,6 +274,11 @@ func (s *PositionService) Update(userID, id int64, in PositionInput) (*model.Pos
 	p.BuyTax = in.BuyTax
 	p.BuyReason = truncateRunes(strings.TrimSpace(in.BuyReason), 500)
 	p.UserNote = truncateRunes(strings.TrimSpace(in.UserNote), 500)
+	p.PlanStopLoss = in.PlanStopLoss
+	p.PlanTakeProfit = in.PlanTakeProfit
+	if in.ChecklistJSON != "" {
+		p.ChecklistJSON = in.ChecklistJSON
+	}
 	if c := strings.TrimSpace(in.Currency); c != "" {
 		currency, err := normalizeCurrency(c, p.Market)
 		if err != nil {
@@ -274,7 +300,14 @@ type CloseInput struct {
 	SellTax    float64 `json:"sell_tax"`
 	SellReason string  `json:"sell_reason"`
 	ReviewNote string  `json:"review_note"`
+
+	SellPlanned   string `json:"sell_planned"`   // yes/no/partial 是否按计划卖出
+	AiVerdict     string `json:"ai_verdict"`     // right/wrong/mixed/unused 当时 AI 判断对错
+	LessonLearned string `json:"lesson_learned"` // 下次策略调整点
 }
+
+var validSellPlanned = map[string]bool{"": true, "yes": true, "no": true, "partial": true}
+var validAiVerdict = map[string]bool{"": true, "right": true, "wrong": true, "mixed": true, "unused": true}
 
 // Close 标记持仓已卖出并填写复盘（仅本人；重复平仓报错）。
 func (s *PositionService) Close(userID, id int64, in CloseInput) (*model.Position, error) {
@@ -299,6 +332,12 @@ func (s *PositionService) Close(userID, id int64, in CloseInput) (*model.Positio
 			return nil, errors.New("卖出日期不能早于买入日期")
 		}
 	}
+	if !validSellPlanned[in.SellPlanned] {
+		return nil, errors.New("是否按计划卖出取值须为 yes/no/partial")
+	}
+	if !validAiVerdict[in.AiVerdict] {
+		return nil, errors.New("AI 判断对错取值须为 right/wrong/mixed/unused")
+	}
 	p.Status = model.PositionStatusClosed
 	p.SellPrice = in.SellPrice
 	p.SellDate = in.SellDate
@@ -306,6 +345,9 @@ func (s *PositionService) Close(userID, id int64, in CloseInput) (*model.Positio
 	p.SellTax = in.SellTax
 	p.SellReason = truncateRunes(strings.TrimSpace(in.SellReason), 500)
 	p.ReviewNote = truncateRunes(strings.TrimSpace(in.ReviewNote), 500)
+	p.SellPlanned = in.SellPlanned
+	p.AiVerdict = in.AiVerdict
+	p.LessonLearned = truncateRunes(strings.TrimSpace(in.LessonLearned), 500)
 	if err := common.DB.Save(&p).Error; err != nil {
 		return nil, err
 	}

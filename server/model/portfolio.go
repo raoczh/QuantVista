@@ -80,12 +80,22 @@ type Position struct {
 	BuyReason string `gorm:"size:512" json:"buy_reason"`
 	UserNote  string `gorm:"size:512" json:"user_note"`
 
+	// 买入前风险计划（建仓时的风险预算，供风险计算器与止损提示）。
+	PlanStopLoss   float64 `gorm:"type:decimal(20,4)" json:"plan_stop_loss"`   // 计划止损价
+	PlanTakeProfit float64 `gorm:"type:decimal(20,4)" json:"plan_take_profit"` // 计划止盈价
+	ChecklistJSON  string  `gorm:"type:text" json:"checklist_json"`            // 买入前检查清单快照（勾选状态）
+
 	SellPrice  float64 `gorm:"type:decimal(20,4)" json:"sell_price"`
 	SellDate   string  `gorm:"size:10" json:"sell_date"`
 	SellFee    float64 `gorm:"type:decimal(20,4)" json:"sell_fee"`
 	SellTax    float64 `gorm:"type:decimal(20,4)" json:"sell_tax"`
 	SellReason string  `gorm:"size:512" json:"sell_reason"`
 	ReviewNote string  `gorm:"size:512" json:"review_note"`
+
+	// 卖出结构化复盘（在自由文本 ReviewNote 之上的固定维度）。
+	SellPlanned   string `gorm:"size:16" json:"sell_planned"`    // yes/no/partial 是否按计划卖出
+	AiVerdict     string `gorm:"size:16" json:"ai_verdict"`      // right/wrong/mixed/unused 当时 AI 判断对错
+	LessonLearned string `gorm:"size:512" json:"lesson_learned"` // 下次策略调整点
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`

@@ -116,6 +116,57 @@ const form = ref<PositionInput & { id: number | null }>({
   buy_tax: 0,
   buy_reason: '',
   user_note: '',
+  plan_stop_loss: undefined,
+  plan_take_profit: undefined,
+})
+
+// 买入前检查清单（勾选状态随持仓落库，供卖出复盘对照）。
+const CHECKLIST = [
+  '买入理由已想清楚，能写下来（不是「感觉要涨」）',
+  '已设定止损价/失效条件，并能接受对应亏损',
+  '该仓位不会让单一标的占比过高',
+  '已检查近期事件风险（财报/解禁/减持/停复牌）',
+  '当前市场环境不明显逆风（趋势/情绪）',
+]
+const checklist = ref<boolean[]>(CHECKLIST.map(() => false))
+function checklistToJSON(): string {
+  if (!checklist.value.some(Boolean)) return ''
+  return JSON.stringify({ items: CHECKLIST.map((text, i) => ({ text, checked: checklist.value[i] })) })
+}
+function checklistFromJSON(s: string) {
+  checklist.value = CHECKLIST.map(() => false)
+  if (!s) return
+  try {
+    const parsed = JSON.parse(s) as { items?: { text: string; checked: boolean }[] }
+    parsed.items?.forEach((it, i) => {
+      if (i < checklist.value.length) checklist.value[i] = !!it.checked
+    })
+  } catch {
+    /* 兼容异常数据：忽略 */
+  }
+}
+const checklistDone = computed(() => checklist.value.filter(Boolean).length)
+
+// 仓位风险计算器：随表单实时计算（纯前端，无请求）。
+const riskCalc = computed(() => {
+  const price = form.value.buy_price || 0
+  const qty = form.value.quantity || 0
+  const stop = form.value.plan_stop_loss || 0
+  const cost = price * qty + (form.value.buy_fee || 0) + (form.value.buy_tax || 0)
+  if (price <= 0 || qty <= 0) return null
+  const out: { cost: number; maxLoss: number | null; maxLossPct: number | null; gain: number | null } = {
+    cost,
+    maxLoss: null,
+    maxLossPct: null,
+    gain: null,
+  }
+  if (stop > 0 && stop < price) {
+    out.maxLoss = (price - stop) * qty + (form.value.buy_fee || 0) + (form.value.buy_tax || 0)
+    out.maxLossPct = (out.maxLoss / cost) * 100
+  }
+  const tp = form.value.plan_take_profit || 0
+  if (tp > price) out.gain = (tp - price) * qty
+  return out
 })
 
 function openCreate(prefill?: { symbol?: string; market?: string; name?: string }) {
@@ -133,7 +184,10 @@ function openCreate(prefill?: { symbol?: string; market?: string; name?: string 
     buy_tax: 0,
     buy_reason: '',
     user_note: '',
+    plan_stop_loss: undefined,
+    plan_take_profit: undefined,
   }
+  checklistFromJSON('')
   editModal.value = true
 }
 function openEdit(p: Position) {
@@ -151,7 +205,10 @@ function openEdit(p: Position) {
     buy_tax: p.buy_tax,
     buy_reason: p.buy_reason,
     user_note: p.user_note,
+    plan_stop_loss: p.plan_stop_loss || undefined,
+    plan_take_profit: p.plan_take_profit || undefined,
   }
+  checklistFromJSON(p.checklist_json)
   editModal.value = true
 }
 const submitting = ref(false)
@@ -170,6 +227,14 @@ async function submit() {
     message.warning('请输入买入数量')
     return
   }
+  if (f.plan_stop_loss && f.buy_price && f.plan_stop_loss >= f.buy_price) {
+    message.warning('计划止损价应低于买入价')
+    return
+  }
+  if (f.plan_take_profit && f.buy_price && f.plan_take_profit <= f.buy_price) {
+    message.warning('计划止盈价应高于买入价')
+    return
+  }
   submitting.value = true
   try {
     const payload: PositionInput = {
@@ -183,6 +248,9 @@ async function submit() {
       buy_tax: f.buy_tax,
       buy_reason: f.buy_reason,
       user_note: f.user_note,
+      plan_stop_loss: f.plan_stop_loss || 0,
+      plan_take_profit: f.plan_take_profit || 0,
+      checklist_json: checklistToJSON(),
     }
     if (editing.value && f.id) await updatePosition(f.id, payload)
     else await createPosition(payload)
@@ -206,7 +274,21 @@ const closeForm = ref({
   sell_tax: 0,
   sell_reason: '',
   review_note: '',
+  sell_planned: '',
+  ai_verdict: '',
+  lesson_learned: '',
 })
+const sellPlannedOptions = [
+  { label: '按计划卖出', value: 'yes' },
+  { label: '未按计划（冲动/被动）', value: 'no' },
+  { label: '部分按计划', value: 'partial' },
+]
+const aiVerdictOptions = [
+  { label: 'AI 判断正确', value: 'right' },
+  { label: 'AI 判断错误', value: 'wrong' },
+  { label: '对错参半', value: 'mixed' },
+  { label: '未参考 AI', value: 'unused' },
+]
 function openClose(p: Position) {
   closing.value = p
   closeForm.value = {
@@ -216,6 +298,9 @@ function openClose(p: Position) {
     sell_tax: 0,
     sell_reason: '',
     review_note: '',
+    sell_planned: '',
+    ai_verdict: '',
+    lesson_learned: '',
   }
   closeModal.value = true
 }
@@ -235,6 +320,9 @@ async function submitClose() {
       sell_tax: closeForm.value.sell_tax,
       sell_reason: closeForm.value.sell_reason,
       review_note: closeForm.value.review_note,
+      sell_planned: closeForm.value.sell_planned,
+      ai_verdict: closeForm.value.ai_verdict,
+      lesson_learned: closeForm.value.lesson_learned,
     })
     closeModal.value = false
     await load()
@@ -459,6 +547,44 @@ onMounted(async () => {
         <n-form-item label="备注">
           <n-input v-model:value="form.user_note" placeholder="补充备注（可选）" maxlength="512" />
         </n-form-item>
+
+        <!-- 风险计划 + 仓位风险计算器（实时纯前端计算） -->
+        <n-grid cols="2" :x-gap="12">
+          <n-gi>
+            <n-form-item label="计划止损价（可选）">
+              <n-input-number v-model:value="form.plan_stop_loss" :min="0" :precision="4" style="width: 100%" />
+            </n-form-item>
+          </n-gi>
+          <n-gi>
+            <n-form-item label="计划止盈价（可选）">
+              <n-input-number v-model:value="form.plan_take_profit" :min="0" :precision="4" style="width: 100%" />
+            </n-form-item>
+          </n-gi>
+        </n-grid>
+        <div v-if="riskCalc" class="risk-calc qv-tnum">
+          <span>投入 {{ riskCalc.cost.toFixed(0) }} 元</span>
+          <template v-if="riskCalc.maxLoss != null">
+            <span :style="{ color: vars.errorColor }">
+              触发止损亏 {{ riskCalc.maxLoss.toFixed(0) }} 元（-{{ riskCalc.maxLossPct!.toFixed(1) }}%）
+            </span>
+          </template>
+          <span v-else class="risk-hint">填写止损价即可预估最大亏损</span>
+          <span v-if="riskCalc.gain != null && riskCalc.maxLoss" >
+            盈亏比 {{ (riskCalc.gain / riskCalc.maxLoss).toFixed(1) }}
+          </span>
+        </div>
+
+        <!-- 买入前检查清单 -->
+        <div class="checklist">
+          <div class="checklist-head">
+            <span>买入前检查（{{ checklistDone }}/{{ CHECKLIST.length }}）</span>
+            <span class="risk-hint">勾选状态会随持仓保存，卖出复盘时对照</span>
+          </div>
+          <label v-for="(text, i) in CHECKLIST" :key="i" class="check-item">
+            <input v-model="checklist[i]" type="checkbox" />
+            <span>{{ text }}</span>
+          </label>
+        </div>
       </n-form>
       <template #footer>
         <div class="modal-footer">
@@ -503,6 +629,27 @@ onMounted(async () => {
         </n-form-item>
         <n-form-item label="卖出原因">
           <n-input v-model:value="closeForm.sell_reason" placeholder="止盈 / 止损 / 逻辑变化…（可选）" maxlength="512" />
+        </n-form-item>
+
+        <!-- 结构化复盘：固定维度，供跨笔统计与自我校准 -->
+        <n-grid cols="2" :x-gap="12">
+          <n-gi>
+            <n-form-item label="是否按计划卖出">
+              <n-select v-model:value="closeForm.sell_planned" :options="sellPlannedOptions" placeholder="（可选）" clearable />
+            </n-form-item>
+          </n-gi>
+          <n-gi>
+            <n-form-item label="当时 AI 判断">
+              <n-select v-model:value="closeForm.ai_verdict" :options="aiVerdictOptions" placeholder="（可选）" clearable />
+            </n-form-item>
+          </n-gi>
+        </n-grid>
+        <n-form-item label="下次策略调整点">
+          <n-input
+            v-model:value="closeForm.lesson_learned"
+            placeholder="这笔交易教会了什么？下次怎么改？（可选）"
+            maxlength="512"
+          />
         </n-form-item>
         <n-form-item label="复盘">
           <n-input
@@ -610,5 +757,43 @@ onMounted(async () => {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+.risk-calc {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--qv-hover, rgba(128, 128, 128, 0.08));
+  margin-bottom: 12px;
+}
+.risk-hint {
+  opacity: 0.6;
+}
+.checklist {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12.5px;
+  border-top: 1px dashed var(--qv-divider);
+  padding-top: 10px;
+}
+.checklist-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 600;
+}
+.check-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  cursor: pointer;
+  line-height: 1.5;
+}
+.check-item input {
+  margin-top: 3px;
+  accent-color: v-bind('vars.primaryColor');
 }
 </style>
