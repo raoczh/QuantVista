@@ -48,6 +48,28 @@ type Fundamental struct {
 	DataTime  time.Time `json:"data_time"`
 }
 
+// Valuation 估值/盘面扩展快照。腾讯行情串自带 PE/PB/市值/换手/振幅/量比/涨跌停价，
+// 是免费可得的估值数据来源（快照指标，非三表财务明细）。字段缺失时为 0。
+type Valuation struct {
+	Symbol       string    `json:"symbol"`
+	Market       string    `json:"market"`
+	Name         string    `json:"name"`
+	PETTM        float64   `json:"pe_ttm"`        // 市盈率 TTM（亏损/无值时为 0 或负）
+	PEDynamic    float64   `json:"pe_dynamic"`    // 动态市盈率
+	PEStatic     float64   `json:"pe_static"`     // 静态市盈率
+	PB           float64   `json:"pb"`            // 市净率
+	TotalCap     float64   `json:"total_cap"`     // 总市值（元）
+	FloatCap     float64   `json:"float_cap"`     // 流通市值（元）
+	TurnoverRate float64   `json:"turnover_rate"` // 换手率 %
+	Amplitude    float64   `json:"amplitude"`     // 当日振幅 %
+	VolumeRatio  float64   `json:"volume_ratio"`  // 量比
+	LimitUp      float64   `json:"limit_up"`      // 涨停价
+	LimitDown    float64   `json:"limit_down"`    // 跌停价
+	IsST         bool      `json:"is_st"`         // 名称含 ST（风险警示）
+	Source       string    `json:"source"`
+	DataTime     time.Time `json:"data_time"`
+}
+
 // News 新闻条目（骨架占位）。
 type News struct {
 	Title   string    `json:"title"`
@@ -180,4 +202,9 @@ type TradingDaysProvider interface {
 // 返回基准名称与按日期升序的日线（含收盘）。cn 基准为上证指数。
 type BenchmarkBarsProvider interface {
 	GetBenchmarkBars(ctx context.Context, market string, limit int) (string, []Bar, error)
+}
+
+// ValuationProvider 估值/盘面扩展快照能力（腾讯行情自带估值字段）。
+type ValuationProvider interface {
+	GetValuation(ctx context.Context, market, symbol string) (*Valuation, error)
 }

@@ -49,6 +49,13 @@ type CompareRow struct {
 	AbovMA20     bool    `json:"above_ma20"` // 现价是否站上 MA20
 	Score        float64 `json:"score"`      // 综合评分 0-100
 	ScoreLabel   string  `json:"score_label"`
+	ValuationOK  bool    `json:"valuation_ok"`  // 估值快照是否可得（腾讯免费源 best-effort）
+	PETTM        float64 `json:"pe_ttm"`        // 市盈率 TTM（负值=亏损）
+	PB           float64 `json:"pb"`            // 市净率
+	TotalCap     float64 `json:"total_cap"`     // 总市值（元）
+	TurnoverRate float64 `json:"turnover_rate"` // 换手率 %
+	VolumeRatio  float64 `json:"volume_ratio"`  // 量比
+	IsST         bool    `json:"is_st"`
 	Error        string  `json:"error"`
 }
 
@@ -143,6 +150,17 @@ func (s *CompareService) buildRow(ctx context.Context, market, symbol string) Co
 	row.ChangePct = round2(q.ChangePct)
 	row.Amount = round2(q.Amount)
 
+	// 估值快照（腾讯免费源，best-effort：拿不到只是该维度缺席）。
+	if v, verr := s.market.GetValuation(ctx, market, symbol); verr == nil {
+		row.ValuationOK = true
+		row.PETTM = round2(v.PETTM)
+		row.PB = round2(v.PB)
+		row.TotalCap = round2(v.TotalCap)
+		row.TurnoverRate = round2(v.TurnoverRate)
+		row.VolumeRatio = round2(v.VolumeRatio)
+		row.IsST = v.IsST
+	}
+
 	bars, berr := s.market.GetDailyBars(ctx, market, symbol, 60)
 	if berr == nil && len(bars) > 0 {
 		closes := make([]float64, len(bars))
@@ -209,16 +227,20 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 
 	// 只把有行情的标的喂给模型。
 	var b strings.Builder
-	b.WriteString("请对下列股票做一次简明的横向对比点评（150 字以内，一段话）：指出相对强弱、趋势与均线位置差异、谁更值得关注及其理由；只依据给出的行情与技术指标，不得虚构财务/新闻；这是研究参考，不构成投资建议，末尾一句风险提示。\n\n数据：\n")
+	b.WriteString("请对下列股票做一次简明的横向对比点评（150 字以内，一段话）：指出相对强弱、趋势与均线位置差异、估值水位差异（如有 PE/PB 数据）、谁更值得关注及其理由；只依据给出的行情、估值快照与技术指标，不得虚构财务明细/新闻；这是研究参考，不构成投资建议，末尾一句风险提示。\n\n数据：\n")
 	valid := 0
 	for _, r := range rows {
 		if !r.QuoteOK {
 			continue
 		}
 		valid++
-		fmt.Fprintf(&b, "- %s(%s)：现价%.2f 涨跌%.2f%% 近5日%.2f%% 近20日%.2f%% MA20=%.2f %s，区间[%.2f,%.2f]\n",
+		fmt.Fprintf(&b, "- %s(%s)：现价%.2f 涨跌%.2f%% 近5日%.2f%% 近20日%.2f%% MA20=%.2f %s，区间[%.2f,%.2f]",
 			nameOr(r), r.Symbol, r.Price, r.ChangePct, r.ChangePct5d, r.ChangePct20d, r.MA20,
 			aboveText(r.AbovMA20), r.PeriodLow, r.PeriodHigh)
+		if r.ValuationOK {
+			fmt.Fprintf(&b, "，PE-TTM=%.2f PB=%.2f 总市值%.0f亿 换手%.2f%%", r.PETTM, r.PB, r.TotalCap/1e8, r.TurnoverRate)
+		}
+		b.WriteString("\n")
 	}
 	if valid < compareMinSymbols {
 		return "", "有效行情不足，无法生成 AI 点评"

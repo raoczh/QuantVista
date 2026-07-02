@@ -98,6 +98,26 @@ export interface Overview {
   data_time: string
 }
 
+export interface Valuation {
+  symbol: string
+  market: string
+  name: string
+  pe_ttm: number
+  pe_dynamic: number
+  pe_static: number
+  pb: number
+  total_cap: number
+  float_cap: number
+  turnover_rate: number
+  amplitude: number
+  volume_ratio: number
+  limit_up: number
+  limit_down: number
+  is_st: boolean
+  source: string
+  data_time: string
+}
+
 export function getOverview(market = 'cn') {
   return request<Overview>({ url: `/markets/${market}/overview`, method: 'get' })
 }
@@ -116,4 +136,8 @@ export function getDailyBars(market: string, symbol: string, limit = 120) {
     method: 'get',
     params: { limit },
   })
+}
+
+export function getValuation(market: string, symbol: string) {
+  return request<Valuation>({ url: `/markets/${market}/stocks/${symbol}/valuation`, method: 'get' })
 }

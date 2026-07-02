@@ -7,9 +7,11 @@ import {
   getQuote,
   getDailyBars,
   getOverview,
+  getValuation,
   type Quote,
   type Bar,
   type Overview,
+  type Valuation,
 } from '@/api/market'
 import { listPositions } from '@/api/position'
 import { getTodos, type TodoResult } from '@/api/todo'
@@ -130,6 +132,7 @@ useAutoRefresh(() => {
 // ---------- 个股速查 ----------
 const symbol = ref('600000')
 const quote = ref<Quote | null>(null)
+const valuation = ref<Valuation | null>(null)
 const loading = ref(false)
 const chartEl = ref<HTMLDivElement | null>(null)
 let chart: echarts.ECharts | null = null
@@ -142,13 +145,19 @@ async function loadStock() {
   }
   loading.value = true
   try {
-    quote.value = await getQuote('cn', symbol.value.trim())
-    const bars = await getDailyBars('cn', symbol.value.trim(), 120)
+    const sym = symbol.value.trim()
+    quote.value = await getQuote('cn', sym)
+    // 估值快照 best-effort：失败只是不显示估值行。
+    getValuation('cn', sym)
+      .then((v) => (valuation.value = v))
+      .catch(() => (valuation.value = null))
+    const bars = await getDailyBars('cn', sym, 120)
     lastBars.value = bars
     await nextTick()
     renderChart(bars)
   } catch (e) {
     quote.value = null
+    valuation.value = null
     message.error((e as Error).message)
   } finally {
     loading.value = false
@@ -505,6 +514,34 @@ function onResize() {
             <div class="quote-cell">
               <span class="qc-label">成交额</span>
               <span class="qc-value qv-tnum">{{ fmtAmount(quote.amount) }}</span>
+            </div>
+          </div>
+
+          <!-- 估值快照（腾讯免费源，best-effort） -->
+          <div v-if="valuation" class="quote-grid" style="margin-top: 8px">
+            <div class="quote-cell">
+              <span class="qc-label">PE-TTM</span>
+              <span class="qc-value qv-tnum">{{ valuation.pe_ttm < 0 ? '亏损' : fmt(valuation.pe_ttm) }}</span>
+            </div>
+            <div class="quote-cell">
+              <span class="qc-label">市净率</span>
+              <span class="qc-value qv-tnum">{{ fmt(valuation.pb) }}</span>
+            </div>
+            <div class="quote-cell">
+              <span class="qc-label">总市值</span>
+              <span class="qc-value qv-tnum">{{ valuation.total_cap > 0 ? (valuation.total_cap / 1e8).toFixed(0) + ' 亿' : '—' }}</span>
+            </div>
+            <div class="quote-cell">
+              <span class="qc-label">换手率</span>
+              <span class="qc-value qv-tnum">{{ fmt(valuation.turnover_rate) }}%</span>
+            </div>
+            <div class="quote-cell">
+              <span class="qc-label">量比</span>
+              <span class="qc-value qv-tnum">{{ fmt(valuation.volume_ratio) }}</span>
+            </div>
+            <div class="quote-cell">
+              <span class="qc-label">涨停 / 跌停</span>
+              <span class="qc-value qv-tnum">{{ fmt(valuation.limit_up) }} / {{ fmt(valuation.limit_down) }}</span>
             </div>
           </div>
 

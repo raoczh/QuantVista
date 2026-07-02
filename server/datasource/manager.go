@@ -203,3 +203,24 @@ func (m *Manager) GetBenchmarkBars(ctx context.Context, market string, limit int
 	}
 	return "", nil, lastErr
 }
+
+// GetValuation 路由到实现 ValuationProvider 的源（腾讯行情自带估值字段）。
+func (m *Manager) GetValuation(ctx context.Context, market, symbol string) (*Valuation, error) {
+	var lastErr error = ErrNotSupported
+	for _, a := range m.adapters {
+		p, ok := a.(ValuationProvider)
+		if !ok {
+			continue
+		}
+		r, err := p.GetValuation(ctx, market, symbol)
+		if err == nil {
+			return r, nil
+		}
+		if errors.Is(err, ErrSymbolInvalid) {
+			return nil, err
+		}
+		common.SysDebug("数据源 %s 取估值失败 symbol=%s: %v", a.Name(), symbol, err)
+		lastErr = err
+	}
+	return nil, lastErr
+}

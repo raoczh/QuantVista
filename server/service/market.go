@@ -60,6 +60,57 @@ func (s *MarketService) GetDailyBars(ctx context.Context, market, symbol string,
 	return bars, nil
 }
 
+const valuationCacheTTL = 60 * time.Second
+
+// GetValuation 估值/盘面扩展快照（PE/PB/市值/换手/涨跌停等，腾讯免费源）。
+// 变化低频，缓存 60s；读时取用不落库。
+func (s *MarketService) GetValuation(ctx context.Context, market, symbol string) (*datasource.Valuation, error) {
+	cacheKey := "valuation:" + market + ":" + symbol
+	if cached, ok := common.RedisGet(cacheKey); ok {
+		var v datasource.Valuation
+		if json.Unmarshal([]byte(cached), &v) == nil {
+			return &v, nil
+		}
+	}
+	v, err := s.mgr.GetValuation(ctx, market, symbol)
+	if err != nil {
+		return nil, err
+	}
+	if b, err := json.Marshal(v); err == nil {
+		common.RedisSet(cacheKey, string(b), valuationCacheTTL)
+	}
+	return v, nil
+}
+
+// ValuationsFor 并发批量取估值（复用单只缓存，best-effort：单只失败缺席不影响其余）。
+func (s *MarketService) ValuationsFor(ctx context.Context, refs []QuoteRef) map[string]*datasource.Valuation {
+	out := make(map[string]*datasource.Valuation, len(refs))
+	if len(refs) == 0 {
+		return out
+	}
+	var mu sync.Mutex
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for _, ref := range refs {
+		ref := ref
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			v, err := s.GetValuation(ctx, ref.Market, ref.Symbol)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			out[QuoteKey(ref.Market, ref.Symbol)] = v
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return out
+}
+
 // GetBenchmarkBars 取基准指数日线（cn=上证指数），供推荐追踪的超额收益/alpha 计算。
 // 指数非 stocks 表标的，不落库。基准不可得（us/hk 无源）时返回错误，由调用方降级。
 func (s *MarketService) GetBenchmarkBars(ctx context.Context, market string, limit int) (string, []datasource.Bar, error) {
