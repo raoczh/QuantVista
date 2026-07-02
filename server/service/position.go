@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -38,10 +39,21 @@ type PositionView struct {
 
 	HeldTradeDays   int  `json:"held_trade_days"`   // 已持有交易日（按交易日历；持仓中且有买入日期时计算）
 	ShortTermReview bool `json:"short_term_review"` // 短线持仓持有超阈值，建议复盘
+
+	NearStopLoss   bool       `json:"near_stop_loss"`   // 现价距计划止损 ≤3%（未破）
+	BelowStopLoss  bool       `json:"below_stop_loss"`  // 现价已跌破计划止损
+	LastAnalyzedAt *time.Time `json:"last_analyzed_at"` // 该标的最近一次个股 AI 分析时间
+	AnalysisStale  bool       `json:"analysis_stale"`   // 持仓中从未分析或距上次分析超过 7 天
 }
 
 // shortHoldReviewDays 短线持仓超过该交易日数则提示复盘（短线一般不宜久拖）。
 const shortHoldReviewDays = 10
+
+// nearStopLossPct 现价高于止损但差距在该比例内视为「接近止损」。
+const nearStopLossPct = 3.0
+
+// analysisStaleDays 持仓超过该天数未做个股分析则提示（AgentFloor 的「过期未分析」思路）。
+const analysisStaleDays = 7
 
 // computeView 计算单条持仓的成本/现值/盈亏。price 为持仓中的实时现价，hasQuote 表示是否取到。
 func computeView(p model.Position, price float64, hasQuote bool) PositionView {
@@ -100,7 +112,11 @@ func (s *PositionService) List(ctx context.Context, userID int64, status string)
 	}
 	quotes := s.market.QuotesFor(ctx, refs)
 
+	// 最近一次个股 AI 分析时间（一次分组查询，供「持仓过久未分析」提示）。
+	lastAnalyzed := lastStockAnalysisFor(userID, positions)
+
 	out := make([]PositionView, 0, len(positions))
+	now := time.Now()
 	for _, p := range positions {
 		price, ok := 0.0, false
 		if q := quotes[QuoteKey(p.Market, p.Symbol)]; q != nil {
@@ -117,9 +133,170 @@ func (s *PositionService) List(ctx context.Context, userID int64, status string)
 				}
 			}
 		}
+		// 止损计划信号：现价已破 / 接近计划止损（仅持仓中且有现价）。
+		if p.Status == model.PositionStatusHolding && ok && p.PlanStopLoss > 0 {
+			switch {
+			case price <= p.PlanStopLoss:
+				v.BelowStopLoss = true
+			case (price-p.PlanStopLoss)/p.PlanStopLoss*100 <= nearStopLossPct:
+				v.NearStopLoss = true
+			}
+		}
+		// 分析时效：持仓中从未做过个股分析、或距上次分析超过阈值。
+		if p.Status == model.PositionStatusHolding {
+			if t, exists := lastAnalyzed[p.Symbol]; exists {
+				tt := t
+				v.LastAnalyzedAt = &tt
+				v.AnalysisStale = now.Sub(t) > analysisStaleDays*24*time.Hour
+			} else {
+				v.AnalysisStale = true
+			}
+		}
 		out = append(out, v)
 	}
 	return out, nil
+}
+
+// lastStockAnalysisFor 一次分组查询取用户对这批持仓标的最近一次「个股分析」时间。
+func lastStockAnalysisFor(userID int64, positions []model.Position) map[string]time.Time {
+	out := map[string]time.Time{}
+	if common.DB == nil || len(positions) == 0 {
+		return out
+	}
+	symbols := make([]string, 0, len(positions))
+	seen := map[string]bool{}
+	for _, p := range positions {
+		if p.Status == model.PositionStatusHolding && !seen[p.Symbol] {
+			seen[p.Symbol] = true
+			symbols = append(symbols, p.Symbol)
+		}
+	}
+	if len(symbols) == 0 {
+		return out
+	}
+	var rows []struct {
+		Symbol string
+		Last   time.Time
+	}
+	if err := common.DB.Model(&model.AnalysisRecord{}).
+		Select("symbol, MAX(created_at) AS last").
+		Where("user_id = ? AND module = ? AND symbol IN ?", userID, model.AnalysisModuleStock, symbols).
+		Group("symbol").Scan(&rows).Error; err != nil {
+		return out
+	}
+	for _, r := range rows {
+		out[r.Symbol] = r.Last
+	}
+	return out
+}
+
+// PortfolioOverview 组合总览：持仓聚合 + 集中度/风控信号（Ghostfolio 的组合层视角）。
+type PortfolioOverview struct {
+	HoldingCount   int     `json:"holding_count"`
+	TotalCost      float64 `json:"total_cost"`
+	TotalValue     float64 `json:"total_value"`
+	TotalProfit    float64 `json:"total_profit"`
+	ProfitPct      float64 `json:"profit_pct"`
+	RealizedProfit float64 `json:"realized_profit"` // 已平仓累计已实现盈亏
+	WinCount       int     `json:"win_count"`       // 盈利仓数（持仓中）
+	LoseCount      int     `json:"lose_count"`      // 亏损仓数（持仓中）
+	ShortValue     float64 `json:"short_value"`     // 短线市值
+	LongValue      float64 `json:"long_value"`      // 长线市值
+	TopSymbol      string  `json:"top_symbol"`
+	TopName        string  `json:"top_name"`
+	TopWeightPct   float64 `json:"top_weight_pct"` // 最大单一持仓占比 %
+
+	Signals []string `json:"signals"` // 风控信号（集中度/止损/未分析）
+}
+
+// topWeightWarnPct 单一持仓市值占比超过该值提示集中度风险。
+const topWeightWarnPct = 40.0
+
+// Overview 组合总览与个人风控提示（基于 List 的富化结果聚合，读时计算不落库）。
+func (s *PositionService) Overview(ctx context.Context, userID int64) (*PortfolioOverview, error) {
+	views, err := s.List(ctx, userID, "all")
+	if err != nil {
+		return nil, err
+	}
+	ov := &PortfolioOverview{Signals: []string{}}
+	// 按标的聚合市值算集中度（同一标的可能分批多仓）。
+	valueBySymbol := map[string]float64{}
+	nameBySymbol := map[string]string{}
+	var nearStop, belowStop, stale int
+	for _, v := range views {
+		if v.Status == model.PositionStatusClosed {
+			ov.RealizedProfit += v.ProfitAmount
+			continue
+		}
+		ov.HoldingCount++
+		ov.TotalCost += v.Cost
+		if v.QuoteOK {
+			ov.TotalValue += v.MarketValue
+			ov.TotalProfit += v.ProfitAmount
+			if v.ProfitAmount > 0 {
+				ov.WinCount++
+			} else if v.ProfitAmount < 0 {
+				ov.LoseCount++
+			}
+			if v.PositionType == model.PositionTypeShortTerm {
+				ov.ShortValue += v.MarketValue
+			} else {
+				ov.LongValue += v.MarketValue
+			}
+			valueBySymbol[v.Symbol] += v.MarketValue
+			nameBySymbol[v.Symbol] = v.Name
+		}
+		if v.BelowStopLoss {
+			belowStop++
+		} else if v.NearStopLoss {
+			nearStop++
+		}
+		if v.AnalysisStale {
+			stale++
+		}
+	}
+	if ov.TotalCost > 0 {
+		ov.ProfitPct = round2(ov.TotalProfit / ov.TotalCost * 100)
+	}
+	ov.TotalCost = round2(ov.TotalCost)
+	ov.TotalValue = round2(ov.TotalValue)
+	ov.TotalProfit = round2(ov.TotalProfit)
+	ov.RealizedProfit = round2(ov.RealizedProfit)
+	ov.ShortValue = round2(ov.ShortValue)
+	ov.LongValue = round2(ov.LongValue)
+
+	for sym, val := range valueBySymbol {
+		if val > 0 && ov.TotalValue > 0 {
+			w := val / ov.TotalValue * 100
+			if w > ov.TopWeightPct {
+				ov.TopWeightPct = round2(w)
+				ov.TopSymbol = sym
+				ov.TopName = nameBySymbol[sym]
+			}
+		}
+	}
+
+	// 风控信号（个人风控提示：查询即提示，不推送）。
+	if ov.TopWeightPct > topWeightWarnPct {
+		ov.Signals = append(ov.Signals, fmt.Sprintf("%s 占持仓市值 %.1f%%，单一标的集中度偏高", orSymbol(ov.TopName, ov.TopSymbol), ov.TopWeightPct))
+	}
+	if belowStop > 0 {
+		ov.Signals = append(ov.Signals, fmt.Sprintf("%d 笔持仓已跌破计划止损价，请立即复核", belowStop))
+	}
+	if nearStop > 0 {
+		ov.Signals = append(ov.Signals, fmt.Sprintf("%d 笔持仓接近计划止损（3%%以内）", nearStop))
+	}
+	if stale > 0 {
+		ov.Signals = append(ov.Signals, fmt.Sprintf("%d 笔持仓超过 %d 天未做个股分析", stale, analysisStaleDays))
+	}
+	return ov, nil
+}
+
+func orSymbol(name, symbol string) string {
+	if name != "" {
+		return name
+	}
+	return symbol
 }
 
 // PositionInput 新建/编辑持仓入参。

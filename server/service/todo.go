@@ -31,6 +31,7 @@ const (
 	TodoKindPositionShort = "position_short" // 短线持仓持有超阈值，需复盘
 	TodoKindPositionLong  = "position_long"  // 长线持仓持有较久，建议定期复盘
 	TodoKindThesisDue     = "thesis_due"     // 投资逻辑卡到期待复盘
+	TodoKindStopLoss      = "stop_loss"      // 持仓现价接近/跌破计划止损
 )
 
 // longHoldReviewDays 长线持仓超过该交易日数提示定期复盘。
@@ -108,9 +109,30 @@ func (s *TodoService) Build(ctx context.Context, userID int64) (*TodoResult, err
 		}
 	}
 
-	// 3) 需复盘的持仓（短线超阈值 / 长线持有较久）。
+	// 3) 需复盘的持仓（短线超阈值 / 长线持有较久）+ 止损计划风控（最高优先级）。
 	if views, err := s.position.List(ctx, userID, model.PositionStatusHolding); err == nil {
 		for _, v := range views {
+			// 止损信号独立于复盘信号：破止损/近止损是当下要处理的风险。
+			switch {
+			case v.BelowStopLoss:
+				res.Items = append(res.Items, TodoItem{
+					Kind: TodoKindStopLoss, Priority: 1,
+					Symbol: v.Symbol, Market: v.Market, Name: v.Name,
+					Title:  "持仓已跌破计划止损",
+					Detail: fmt.Sprintf("现价 %.2f 已低于计划止损 %.2f，按纪律应复核是否离场", v.CurrentPrice, v.PlanStopLoss),
+					RefID:  v.ID, RefType: "positions",
+				})
+				res.Reviews++
+			case v.NearStopLoss:
+				res.Items = append(res.Items, TodoItem{
+					Kind: TodoKindStopLoss, Priority: 1,
+					Symbol: v.Symbol, Market: v.Market, Name: v.Name,
+					Title:  "持仓接近计划止损",
+					Detail: fmt.Sprintf("现价 %.2f 距计划止损 %.2f 不足 3%%，请提前想好应对", v.CurrentPrice, v.PlanStopLoss),
+					RefID:  v.ID, RefType: "positions",
+				})
+				res.Reviews++
+			}
 			switch {
 			case v.ShortTermReview:
 				res.Items = append(res.Items, TodoItem{
