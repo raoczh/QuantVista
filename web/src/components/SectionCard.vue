@@ -12,10 +12,25 @@ withDefaults(
   { hoverable: true, size: 'medium' },
 )
 
-const { vars, primaryAlpha } = useUi()
+const { vars, isDark, primaryAlpha } = useUi()
+
+// 静态质感：浅色用双层柔和阴影让卡片"浮"在底色上；深色用顶部 1px 内高光模拟受光面。
+const restShadow = computed(() =>
+  isDark.value
+    ? 'inset 0 1px 0 rgba(255, 255, 255, 0.045)'
+    : '0 1px 2px rgba(0, 0, 0, 0.04), 0 4px 16px rgba(0, 0, 0, 0.05)',
+)
+const hoverShadow = computed(() =>
+  isDark.value
+    ? `inset 0 1px 0 rgba(255, 255, 255, 0.045), 0 8px 24px ${primaryAlpha(0.2)}`
+    : `0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px ${primaryAlpha(0.16)}`,
+)
+
 const styleVars = computed(() => ({
   '--sc-primary': vars.value.primaryColor,
-  '--sc-shadow': primaryAlpha(0.16),
+  '--sc-primary-suppl': vars.value.primaryColorSuppl,
+  '--sc-shadow-rest': restShadow.value,
+  '--sc-shadow-hover': hoverShadow.value,
 }))
 </script>
 
@@ -43,6 +58,7 @@ const styleVars = computed(() => ({
 <style scoped>
 .section-card {
   border-radius: 14px;
+  box-shadow: var(--sc-shadow-rest);
   transition:
     border-color 0.2s ease,
     box-shadow 0.2s ease,
@@ -50,7 +66,7 @@ const styleVars = computed(() => ({
 }
 .section-card.is-hoverable:hover {
   border-color: var(--sc-primary);
-  box-shadow: 0 8px 24px var(--sc-shadow);
+  box-shadow: var(--sc-shadow-hover);
   transform: translateY(-2px);
 }
 .sc-header {
@@ -60,9 +76,9 @@ const styleVars = computed(() => ({
 }
 .sc-bar {
   width: 3px;
-  height: 14px;
+  height: 15px;
   border-radius: 2px;
-  background: var(--sc-primary);
+  background: linear-gradient(180deg, var(--sc-primary), var(--sc-primary-suppl));
 }
 .sc-title {
   font-weight: 600;

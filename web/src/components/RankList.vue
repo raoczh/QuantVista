@@ -5,8 +5,14 @@ defineProps<{ items: any[] }>()
 
 const { vars, primaryAlpha } = useUi()
 
+// 第 1 名主色渐变徽标（与 BrandLogo 同语言），2/3 名主色浅底，其余弱化。
 function badgeStyle(i: number) {
-  if (i === 0) return { background: vars.value.primaryColor, color: '#fff' }
+  if (i === 0)
+    return {
+      background: `linear-gradient(135deg, ${vars.value.primaryColor}, ${vars.value.primaryColorSuppl})`,
+      color: '#fff',
+      boxShadow: `0 2px 8px ${primaryAlpha(0.35)}`,
+    }
   if (i <= 2) return { background: primaryAlpha(0.16), color: vars.value.primaryColor }
   return { background: 'transparent', color: vars.value.textColor3 }
 }

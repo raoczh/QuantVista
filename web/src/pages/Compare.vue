@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
   NInput,
@@ -17,6 +18,8 @@ import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 
 const message = useMessage()
+const route = useRoute()
+const router = useRouter()
 const { pctColor, upColor, vars, withAlpha } = useUi()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
@@ -37,6 +40,23 @@ function removeRow(i: number) {
 }
 
 const withAI = ref(false)
+
+// 支持 ?symbols=600519,000001 预填（全局速查/首页速查跳转入口），填完即清 query。
+onMounted(() => {
+  const q = String(route.query.symbols || '')
+  if (!q) return
+  const syms = q
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, 6)
+  if (!syms.length) return
+  while (inputs.value.length < Math.max(2, syms.length)) inputs.value.push({ symbol: '', market: 'cn' })
+  syms.forEach((s, i) => {
+    inputs.value[i].symbol = s
+  })
+  router.replace({ name: 'compare' })
+})
 
 // ---------- LLM ----------
 const llmConfigs = ref<LLMConfig[]>([])

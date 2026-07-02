@@ -4,7 +4,7 @@ defineProps<{ title?: string; subtitle?: string }>()
 
 <template>
   <div class="page">
-    <header v-if="title || subtitle || $slots.actions" class="page-head">
+    <header v-if="title || subtitle || $slots.actions" class="page-head qv-anim-in">
       <div class="page-head-text">
         <h1 v-if="title" class="page-title">{{ title }}</h1>
         <p v-if="subtitle" class="page-sub">{{ subtitle }}</p>
@@ -28,19 +28,20 @@ defineProps<{ title?: string; subtitle?: string }>()
   align-items: flex-end;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 20px;
+  margin-bottom: 22px;
   flex-wrap: wrap;
 }
 .page-title {
-  font-size: 22px;
+  font-size: 24px;
   font-weight: 700;
   margin: 0;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
 }
 .page-sub {
-  margin: 4px 0 0;
+  margin: 5px 0 0;
   font-size: 13px;
-  opacity: 0.6;
+  opacity: 0.58;
 }
 .page-actions {
   display: flex;

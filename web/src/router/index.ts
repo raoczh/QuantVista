@@ -3,6 +3,7 @@ import Home from '@/pages/Home.vue'
 import Placeholder from '@/pages/Placeholder.vue'
 import { useAuthStore } from '@/stores/auth'
 import { getAccessToken } from '@/api/token'
+import { setPageTitle } from '@/lib/pageTitle'
 
 // meta.bare：无应用框架的整屏页（登录/首启/回调）。
 // meta.public：无需登录。meta.admin：需管理员。
@@ -76,7 +77,7 @@ router.beforeEach(async (to) => {
 })
 
 router.afterEach((to) => {
-  document.title = `QuantVista · ${(to.meta.title as string) || ''}`
+  setPageTitle((to.meta.title as string) || '')
 })
 
 export default router

@@ -108,7 +108,7 @@ Go API Server
 | `dark-amber` | 暖夜橙（深） | 暗 | `#f0a020` |
 | `light-rose` | 樱桃红（浅） | 亮 | `#d03050` |
 
-实现：主题预设集中在 `web/src/theme/presets.ts`，全局状态在 `stores/theme.ts`，由根部 `n-config-provider` 统一下发 `theme` + `theme-overrides`，并配 `n-global-style` 联动 body 背景。
+实现：主题预设集中在 `web/src/theme/presets.ts`，全局状态在 `stores/theme.ts`，由根部 `n-config-provider` 统一下发 `theme` + `theme-overrides`，并配 `n-global-style` 联动 body 背景。应用外壳在 `components/AppShell.vue`——**必须位于 `n-config-provider` 内部**（`useThemeVars()` 只在 provider 子树内能取到 override 后的变量，App.vue 顶层取不到）。每套预设除主色四件套外还定义**背景分层**：浅色 = 带主色倾向的浅灰底 + 纯白卡片，深色 = 品牌色调深底 + 浮起一档的卡片（同时对齐 `tableColor`/`tableHeaderColor`/`codeColor`，避免 Naive 暗色固定灰黑与带色调卡片打架）；另统一 `borderRadius: 8px` 控件圆角。
 
 **后续所有页面 / 组件样式必须兼容全部 6 套主题（强制规则）：**
 
@@ -126,18 +126,28 @@ Go API Server
 
 **基础层**
 
-- `web/src/styles/global.css`（在 `main.ts` 引入）：设计 token（`--qv-content-max: 1440px`、`--qv-radius-card: 14px`、字体栈）、`.qv-tnum`/`.qv-mono`/`.qv-figure` 等宽数字工具类、细滚动条。只放**与主题无关**的排版；颜色一律不写死。
+- `web/src/styles/global.css`（在 `main.ts` 引入）：设计 token（`--qv-content-max: 1440px`、`--qv-radius-card: 14px`、字体栈）、`.qv-tnum`/`.qv-mono`/`.qv-figure` 等宽数字工具类、细滚动条、`qv-fade-up` 入场动画与 `::selection`（主色由 AppShell 注入 `--qv-primary-selection`，裸布局回落中性灰）。只放**与主题无关**的排版；颜色一律不写死。
 - `web/src/composables/useUi.ts`：全站取色入口，颜色全部来自 `useThemeVars()`，自动兼容 6 套主题。导出 `pctColor/pctBg`（涨红 `errorColor`/跌绿 `successColor`/平 `textColor3`）、`primaryAlpha(a)`、`withAlpha(color,a)`、`upColor/downColor`、`isDark`、`vars`。**任何涨跌/主色透明度需求走它，禁止硬编码 hex。**
+- `web/src/composables/useAutoRefresh.ts`：盘中自动刷新（仅交易时段周一~五 09:15–15:05 + 页面可见时轮询，切后台暂停；数据源有限流，**间隔不得低于 60s**）。Home/Watchlist/Positions 已接入，行情类新页面照用。
+- `web/src/composables/useStockActions.ts`：个股快捷动作（跳 AI 分析/问答/对比/设提醒 query 预填、加自选到第一分组）。Home 速查、GlobalSearch 复用；新入口一律走它。
+- `web/src/lib/pageTitle.ts`：标签页标题统一拼装（页面名 + 大盘行情两段互不覆盖），router.afterEach 与 AppShell 轮询各自 set。
+
+**外壳与导航**（`components/AppShell.vue`）
+
+- 整页滚动 + sticky 毛玻璃顶栏（半透明 cardColor + backdrop-filter）+ 顶部主色氛围光晕 + 路由切换淡入上移过渡。
+- 导航收敛 7 项：市场首页 / 今日待办（数字徽标，`/todos` total）/ 自选 / 持仓 / 推荐追踪 / AI 研究▾（分析·问答·对比）/ 更多▾（模拟盘·条件提醒·提示词模板）；设置与管理后台只在右上角用户菜单。菜单激活态为主色胶囊。
+- 顶栏「搜代码」按钮 + `Ctrl/Cmd+K` 唤起 `GlobalSearch` 命令面板：精确代码查行情 + 快捷动作直达（后端无模糊搜索，仅精确代码）。
 
 **通用组件**（`web/src/components/`）
 
-- `PageContainer`：页面外层，`max-width` 居中 + 标题/副标题 + `#actions` 插槽。**每个业务页最外层都用它。**
-- `SectionCard`：带主色标题条 + hover 抬升的卡片（包 `NCard`），`title` / `#extra` 插槽 / `:hoverable`。替代裸 `n-card`。
-- `StatCard`：指标卡（label + 大号数值 + 涨跌），数值色随涨跌。
-- `RankList` + `#row` 插槽：带名次徽标的榜单，替代原始 `<table>`。
+- `PageContainer`：页面外层，`max-width` 居中 + 标题/副标题 + `#actions` 插槽 + 页头入场动画。**每个业务页最外层都用它。**
+- `SectionCard`：带主色渐变标题条 + 静态质感阴影（浅色柔和投影/深色顶部内高光）+ hover 抬升的卡片（包 `NCard`），`title` / `#extra` 插槽 / `:hoverable`。替代裸 `n-card`。
+- `StatCard`：指标卡（label + 大号数值 + 涨跌），数值色随涨跌，质感语言与 SectionCard 一致。
+- `RankList` + `#row` 插槽：带名次徽标的榜单（第 1 名主色渐变徽标），替代原始 `<table>`。
 - `ChangeTag`：涨跌幅 pill（`:value` 百分比，自动 +号/配色）。
 - `BrandLogo`：主色渐变方块 + 折线 mark + 双色字标，顶栏/认证页共用。
 - `AuthShell`：认证页统一外壳（主题感知渐变背景 + 品牌 + 角落主题切换），登录/首启/回调复用。
+- `GlobalSearch`：全局速查命令面板（Ctrl+K），挂在 AppShell。
 
 **约定**
 
