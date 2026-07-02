@@ -317,6 +317,8 @@ type PositionInput struct {
 	PlanStopLoss   float64 `json:"plan_stop_loss"`   // 计划止损价（0=未设）
 	PlanTakeProfit float64 `json:"plan_take_profit"` // 计划止盈价（0=未设）
 	ChecklistJSON  string  `json:"checklist_json"`   // 买入前检查清单快照
+
+	RecommendationID int64 `json:"recommendation_id"` // 来源推荐（一键建仓带入；0=手动建仓）
 }
 
 // validCurrency 持仓币种枚举（DATABASE_DESIGN：CNY/USD/HKD）。
@@ -380,6 +382,21 @@ func validateBuy(in *PositionInput) error {
 	return nil
 }
 
+// resolveRecommendationLink 校验推荐血缘归属：仅本人存在的推荐返回原 ID，
+// 否则返回 0（不存在/他人的推荐不落血缘，静默忽略、不阻断建仓）。
+func resolveRecommendationLink(userID, recID int64) int64 {
+	if recID <= 0 {
+		return 0
+	}
+	var n int64
+	common.DB.Model(&model.Recommendation{}).
+		Where("id = ? AND user_id = ?", recID, userID).Count(&n)
+	if n == 0 {
+		return 0
+	}
+	return recID
+}
+
 // Create 新建持仓。
 func (s *PositionService) Create(ctx context.Context, userID int64, in PositionInput) (*model.Position, error) {
 	symbol, market, err := normalizeSymbolMarket(in.Symbol, in.Market)
@@ -399,6 +416,8 @@ func (s *PositionService) Create(ctx context.Context, userID int64, in PositionI
 	if err != nil {
 		return nil, err
 	}
+	// 推荐血缘：校验归属（不存在/他人的推荐不落血缘，静默忽略、不阻断建仓）。
+	in.RecommendationID = resolveRecommendationLink(userID, in.RecommendationID)
 	p := &model.Position{
 		UserID:       userID,
 		Symbol:       symbol,
@@ -418,6 +437,8 @@ func (s *PositionService) Create(ctx context.Context, userID int64, in PositionI
 		PlanStopLoss:   in.PlanStopLoss,
 		PlanTakeProfit: in.PlanTakeProfit,
 		ChecklistJSON:  in.ChecklistJSON,
+
+		RecommendationID: in.RecommendationID,
 	}
 	if err := common.DB.Create(p).Error; err != nil {
 		return nil, err

@@ -27,9 +27,10 @@ type RecommendationBatch struct {
 	Status   string `gorm:"size:16" json:"status"`
 	Error    string `gorm:"size:512" json:"error"`
 
-	CandidateCount int    `json:"candidate_count"`                          // 候选池标的数
+	CandidateCount int    `json:"candidate_count"`                           // 候选池标的数
 	CandidatePool  string `gorm:"type:text" json:"candidate_pool,omitempty"` // 候选池快照 JSON（列表查询不返回）
 	DataSnapshot   string `gorm:"type:text" json:"data_snapshot,omitempty"`  // 喂给模型的数据 JSON（列表查询不返回）
+	RejectedJSON   string `gorm:"type:text" json:"rejected_json,omitempty"`  // 池内落选标的一句话理由 [{symbol,name,reason}]（列表查询不返回）
 
 	LLMConfigID     int64  `json:"llm_config_id"`
 	Provider        string `gorm:"size:32" json:"provider"`

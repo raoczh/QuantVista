@@ -97,6 +97,9 @@ type Position struct {
 	AiVerdict     string `gorm:"size:16" json:"ai_verdict"`      // right/wrong/mixed/unused 当时 AI 判断对错
 	LessonLearned string `gorm:"size:512" json:"lesson_learned"` // 下次策略调整点
 
+	// 来源推荐血缘（一键建仓时写入；0=手动建仓无来源）。供「AI 推荐 vs 实际买入」对比。
+	RecommendationID int64 `gorm:"index" json:"recommendation_id"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

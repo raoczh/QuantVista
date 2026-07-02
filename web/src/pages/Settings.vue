@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NTabs,
@@ -29,7 +29,7 @@ import {
   type LLMConfig,
   type LLMConfigInput,
 } from '@/api/llm'
-import { getPreference, updatePreference, changePassword, getQuota, type UserPreference, type UserQuota } from '@/api/user'
+import { getPreference, updatePreference, changePassword, getQuota, type UserPreference, type UserQuota, type BlacklistEntry } from '@/api/user'
 import { useAuthStore } from '@/stores/auth'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
@@ -168,10 +168,48 @@ const horizonOptions = [
 async function loadPref() {
   try {
     pref.value = await getPreference()
+    parseBlacklist(pref.value.blacklist_json)
   } catch (e) {
     message.error((e as Error).message)
   }
 }
+
+/* ---------------- 候选池回避规则（黑名单 + 成交额门槛） ---------------- */
+const blacklist = ref<BlacklistEntry[]>([])
+const newBlack = reactive({ symbol: '', reason: '' })
+
+function parseBlacklist(raw: string) {
+  try {
+    const arr = raw ? (JSON.parse(raw) as BlacklistEntry[]) : []
+    blacklist.value = Array.isArray(arr) ? arr : []
+  } catch {
+    blacklist.value = []
+  }
+}
+function addBlack() {
+  const sym = newBlack.symbol.trim()
+  if (!sym) {
+    message.warning('请输入股票代码')
+    return
+  }
+  if (blacklist.value.some((b) => b.symbol === sym)) {
+    message.warning('该代码已在黑名单中')
+    return
+  }
+  blacklist.value.push({ symbol: sym, market: 'cn', reason: newBlack.reason.trim() })
+  newBlack.symbol = ''
+  newBlack.reason = ''
+}
+function removeBlack(i: number) {
+  blacklist.value.splice(i, 1)
+}
+// 门槛以亿元展示，落库仍为元。
+const minAmountYi = computed({
+  get: () => (pref.value ? pref.value.min_candidate_amount / 1e8 : 0),
+  set: (v: number | null) => {
+    if (pref.value) pref.value.min_candidate_amount = Math.round((v || 0) * 1e8)
+  },
+})
 
 /* ---------------- AI 配额用量 ---------------- */
 const quota = ref<UserQuota | null>(null)
@@ -187,7 +225,9 @@ async function savePref() {
   if (!pref.value) return
   savingPref.value = true
   try {
+    pref.value.blacklist_json = blacklist.value.length ? JSON.stringify(blacklist.value) : ''
     pref.value = await updatePreference(pref.value)
+    parseBlacklist(pref.value.blacklist_json)
     message.success('偏好已保存')
   } catch (e) {
     message.error((e as Error).message)
@@ -300,6 +340,29 @@ onMounted(() => {
               <span class="notify-hint">推送总闸：关闭后提醒命中仅在站内展示，不再外推到 Server酱/Webhook</span>
             </div>
           </n-form-item>
+          <n-form-item label="成交额门槛">
+            <div class="notify-switch">
+              <n-input-number v-model:value="minAmountYi" :min="0" :max="10000" :precision="2" :step="0.5" style="width: 140px">
+                <template #suffix>亿元</template>
+              </n-input-number>
+              <span class="notify-hint">推荐候选池剔除日成交额低于该值的标的；0 = 不过滤</span>
+            </div>
+          </n-form-item>
+          <n-form-item label="候选池黑名单">
+            <div class="blacklist">
+              <div v-for="(b, i) in blacklist" :key="b.market + ':' + b.symbol" class="black-row">
+                <span class="qv-mono black-symbol">{{ b.symbol }}</span>
+                <span class="black-reason">{{ b.reason || '—' }}</span>
+                <n-button size="tiny" quaternary type="error" @click="removeBlack(i)">移除</n-button>
+              </div>
+              <div class="black-add">
+                <n-input v-model:value="newBlack.symbol" placeholder="代码，如 600000" size="small" style="width: 140px" />
+                <n-input v-model:value="newBlack.reason" placeholder="回避原因（可选）" size="small" style="flex: 1" @keyup.enter="addBlack" />
+                <n-button size="small" @click="addBlack">加入</n-button>
+              </div>
+              <span class="notify-hint">生成推荐时黑名单标的将从候选池剔除（随「保存偏好」生效）</span>
+            </div>
+          </n-form-item>
           <n-button type="primary" :loading="savingPref" @click="savePref">保存偏好</n-button>
         </n-form>
       </SectionCard>
@@ -402,6 +465,30 @@ onMounted(() => {
 .notify-hint {
   font-size: 12px;
   opacity: 0.65;
+}
+.blacklist {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+.black-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+}
+.black-symbol {
+  min-width: 70px;
+}
+.black-reason {
+  flex: 1;
+  opacity: 0.7;
+}
+.black-add {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 .quota {
   display: flex;

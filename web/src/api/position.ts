@@ -28,6 +28,7 @@ export interface Position {
   sell_planned: string // yes/no/partial
   ai_verdict: string // right/wrong/mixed/unused
   lesson_learned: string
+  recommendation_id: number // 来源推荐（0=手动建仓）
   // 富化字段
   current_price: number
   quote_ok: boolean
@@ -77,6 +78,7 @@ export interface PositionInput {
   plan_stop_loss?: number
   plan_take_profit?: number
   checklist_json?: string
+  recommendation_id?: number // 来源推荐（一键建仓带入）
 }
 
 export interface CloseInput {

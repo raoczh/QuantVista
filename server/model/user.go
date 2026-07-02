@@ -32,13 +32,19 @@ const (
 
 // UserPreference 用户偏好，1:1 关联 User。
 type UserPreference struct {
-	ID              int64     `gorm:"primaryKey" json:"id"`
-	UserID          int64     `gorm:"uniqueIndex" json:"user_id"`
-	RiskLevel       string    `gorm:"size:16;default:balanced" json:"risk_level"` // conservative/balanced/aggressive
-	DefaultMarket   string    `gorm:"size:8;default:cn" json:"default_market"`    // cn/us/hk
-	HorizonPref     string    `gorm:"size:16;default:long_term" json:"horizon_pref"`
-	DefaultRecCount int       `gorm:"default:3" json:"default_rec_count"`
-	EnableNotify    bool      `gorm:"default:false" json:"enable_notify"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	ID              int64  `gorm:"primaryKey" json:"id"`
+	UserID          int64  `gorm:"uniqueIndex" json:"user_id"`
+	RiskLevel       string `gorm:"size:16;default:balanced" json:"risk_level"` // conservative/balanced/aggressive
+	DefaultMarket   string `gorm:"size:8;default:cn" json:"default_market"`    // cn/us/hk
+	HorizonPref     string `gorm:"size:16;default:long_term" json:"horizon_pref"`
+	DefaultRecCount int    `gorm:"default:3" json:"default_rec_count"`
+	EnableNotify    bool   `gorm:"default:false" json:"enable_notify"`
+
+	// 候选池回避规则（批次G）：黑名单 [{symbol,market,reason}] + 最低日成交额门槛。
+	// MinCandidateAmount 单位元；0=不设流动性门槛（建新行时由服务层给默认 1e8）。
+	BlacklistJSON      string  `gorm:"type:text" json:"blacklist_json"`
+	MinCandidateAmount float64 `gorm:"type:decimal(20,2);default:100000000" json:"min_candidate_amount"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }

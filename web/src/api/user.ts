@@ -8,6 +8,15 @@ export interface UserPreference {
   horizon_pref: string // short_term/mid_term/long_term
   default_rec_count: number
   enable_notify: boolean
+  blacklist_json: string // 候选池黑名单 [{symbol,market,reason}]
+  min_candidate_amount: number // 候选池最低日成交额（元；0=不过滤）
+}
+
+// 候选池黑名单条目。
+export interface BlacklistEntry {
+  symbol: string
+  market: string
+  reason: string
 }
 
 export interface UserQuota {
