@@ -37,6 +37,7 @@ func AllModels() []any {
 		&NotifyChannel{},
 		&PromptTemplate{},
 		&ThesisCard{},
+		&ResearchNote{},
 	}
 }
 
