@@ -19,7 +19,7 @@ type Quote struct {
 	High      float64   `json:"high"`
 	Low       float64   `json:"low"`
 	PrevClose float64   `json:"prev_close"`
-	Volume    int64     `json:"volume"`
+	Volume    int64     `json:"volume"` // 成交量，单位：手（各源统一口径，新浪原始为股、解析时 /100）
 	Amount    float64   `json:"amount"`
 	Source    string    `json:"source"`    // 实际命中的数据源
 	DataTime  time.Time `json:"data_time"` // 数据时间，务必随数据透传
@@ -32,7 +32,7 @@ type Bar struct {
 	High      float64 `json:"high"`
 	Low       float64 `json:"low"`
 	Close     float64 `json:"close"`
-	Volume    int64   `json:"volume"`
+	Volume    int64   `json:"volume"` // 成交量，单位：手（各源统一口径，新浪原始为股、解析时 /100）
 	Amount    float64 `json:"amount"`
 	Source    string  `json:"source"` // 实际命中的数据源
 }

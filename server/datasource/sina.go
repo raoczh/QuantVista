@@ -94,7 +94,7 @@ func (s *SinaAdapter) GetQuote(ctx context.Context, market, symbol string) (*Quo
 		High:      atof(4),
 		Low:       atof(5),
 		PrevClose: prevClose,
-		Volume:    int64(atof(8)),
+		Volume:    int64(atof(8) / 100), // 新浪返回股，统一为手（与东财/腾讯口径一致）
 		Amount:    atof(9),
 		Source:    s.Name(),
 		DataTime:  dataTime,
@@ -124,20 +124,23 @@ func (s *SinaAdapter) GetIndices(ctx context.Context, market string) ([]Index, e
 	}
 
 	// 每行：var hq_str_sh000001="上证指数,open,prevclose,price,high,low,...,date,time";
-	lines := strings.Split(string(decoded), "\n")
-	out := make([]Index, 0, len(CNIndices))
-	for i, ix := range CNIndices {
-		if i >= len(lines) {
-			break
-		}
-		l := lines[i]
+	// 按行内 hq_str_<code> 与 CNIndices 匹配——不能按行号对位，响应漏行/插行时会
+	// 把深成指的数值标成上证指数。
+	byCode := map[string][]string{}
+	for _, l := range strings.Split(string(decoded), "\n") {
+		m := strings.Index(l, "hq_str_")
 		a := strings.Index(l, "\"")
 		b := strings.LastIndex(l, "\"")
-		if a < 0 || b <= a {
+		if m < 0 || a < 0 || b <= a {
 			continue
 		}
-		f := strings.Split(l[a+1:b], ",")
-		if len(f) < 6 {
+		code := strings.TrimSpace(strings.TrimSuffix(l[m+len("hq_str_"):a], "="))
+		byCode[code] = strings.Split(l[a+1:b], ",")
+	}
+	out := make([]Index, 0, len(CNIndices))
+	for _, ix := range CNIndices {
+		f, ok := byCode[ix.Sina]
+		if !ok || len(f) < 6 {
 			continue
 		}
 		atof := func(idx int) float64 { v, _ := strconv.ParseFloat(strings.TrimSpace(f[idx]), 64); return v }
@@ -212,7 +215,8 @@ func (s *SinaAdapter) GetStockRanking(ctx context.Context, market, sort string, 
 	return out, nil
 }
 
-// 返回按日期升序的前复权日线；该接口不提供成交额，Amount 置 0。
+// 返回按日期升序的日线。注意：该接口无复权参数（口径与东财 fqt=1 前复权不一定
+// 一致），仅作东财日线失败时的兜底；不提供成交额，Amount 置 0（落库时不覆盖已有值）。
 func (s *SinaAdapter) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]Bar, error) {
 	if market != "cn" {
 		return nil, ErrNotSupported
@@ -262,7 +266,7 @@ func (s *SinaAdapter) GetDailyBars(ctx context.Context, market, symbol string, l
 			High:      atof(r.High),
 			Low:       atof(r.Low),
 			Close:     atof(r.Close),
-			Volume:    int64(atof(r.Volume)),
+			Volume:    int64(atof(r.Volume) / 100), // 新浪返回股，统一为手（与东财口径一致）
 			Amount:    0, // 该接口不提供成交额
 		})
 	}

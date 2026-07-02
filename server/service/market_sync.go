@@ -31,6 +31,11 @@ var ErrSyncInProgress = errors.New("已有批量同步任务在进行中")
 // syncBarsRunning 保证同一时刻只有一轮批量日线同步（后台定时与手动触发共用）。
 var syncBarsRunning atomic.Bool
 
+// syncCursor 批量同步的轮转游标（进程内）：记录上一轮同步到的 stocks.id。
+// 无游标时每轮都取同一前缀，标的数超过 syncMaxStocks（或任务中途超时取消）时
+// 尾部标的永远轮不到；游标让各轮从上次断点继续、扫到尾自动回绕。
+var syncCursor atomic.Int64
+
 // SyncTrackedDailyBars 批量同步"已跟踪"股票（DB stocks 表内、即用户查过/持有的标的）的日线。
 // 这是"全市场日线批量同步"的个人自用版：不主动抓全 5000 只（会长时间打免费源），
 // 而是覆盖用户实际关心的标的；同步结果写入 data_sync_logs 供审计。
@@ -48,13 +53,25 @@ func (s *MarketService) SyncTrackedDailyBars(ctx context.Context, market string,
 	}
 	start := time.Now()
 
-	var stocks []model.Stock
-	q := common.DB.Model(&model.Stock{})
-	if market != "" {
-		q = q.Where("market = ?", market)
+	fetch := func(afterID int64, limit int) ([]model.Stock, error) {
+		var rows []model.Stock
+		q := common.DB.Model(&model.Stock{}).Where("id > ?", afterID).Order("id")
+		if market != "" {
+			q = q.Where("market = ?", market)
+		}
+		err := q.Limit(limit).Find(&rows).Error
+		return rows, err
 	}
-	if err := q.Limit(syncMaxStocks).Find(&stocks).Error; err != nil {
+	stocks, err := fetch(syncCursor.Load(), syncMaxStocks)
+	if err != nil {
 		return nil, err
+	}
+	// 到尾回绕：从头补齐剩余额度。
+	if len(stocks) < syncMaxStocks {
+		head, err := fetch(0, syncMaxStocks-len(stocks))
+		if err == nil {
+			stocks = append(stocks, head...)
+		}
 	}
 
 	log := &model.DataSyncLog{Task: "sync_daily_bars", Market: market, Total: len(stocks)}
@@ -77,6 +94,7 @@ func (s *MarketService) SyncTrackedDailyBars(ctx context.Context, market string,
 		} else {
 			log.Succeeded++
 		}
+		syncCursor.Store(st.ID) // 中途取消也从断点续跑
 		time.Sleep(syncThrottle)
 	}
 
@@ -289,11 +307,13 @@ func StartMarketJobs(mgr *datasource.Manager) {
 	}()
 
 	// 已跟踪股票日线批量同步：每 6 小时一次。
+	// 超时预算：800 只 × (300ms 节流 + 抓取) 最坏可到 20 分钟以上，给足 30 分钟；
+	// 即便中途取消，游标也保证下一轮从断点续跑。
 	go func() {
 		t := time.NewTicker(6 * time.Hour)
 		defer t.Stop()
 		for range t.C {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 			if log, err := svc.SyncTrackedDailyBars(ctx, market, 120); err != nil {
 				common.SysWarn("批量同步日线失败: %v", err)
 			} else if log.Total > 0 {

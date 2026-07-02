@@ -189,8 +189,12 @@ func (s *MarketService) GetOverview(ctx context.Context, market string) *Overvie
 	}()
 	wg.Wait()
 
-	if b, err := json.Marshal(ov); err == nil {
-		common.RedisSet(cacheKey, string(b), overviewCacheTTL)
+	// ctx 已取消（客户端断开/超时）时各块几乎必然带着失败结果返回，
+	// 此时回写会把残缺概览毒化缓存 15s，直接跳过。
+	if ctx.Err() == nil {
+		if b, err := json.Marshal(ov); err == nil {
+			common.RedisSet(cacheKey, string(b), overviewCacheTTL)
+		}
 	}
 	return ov
 }
@@ -235,11 +239,22 @@ func (s *MarketService) persistDailyBars(market, symbol string, bars []datasourc
 	}
 
 	if len(dailyRows) > 0 {
+		// 无成交额的源（新浪日线 Amount 恒 0）作兜底回退时，不得把东财已写入的
+		// 真实 amount 覆盖成 0——本批全为 0 时更新列表不含 amount。
+		updateCols := []string{"open", "high", "low", "close", "volume", "amount", "source"}
+		hasAmount := false
+		for _, r := range dailyRows {
+			if r.Amount > 0 {
+				hasAmount = true
+				break
+			}
+		}
+		if !hasAmount {
+			updateCols = []string{"open", "high", "low", "close", "volume", "source"}
+		}
 		if err := common.DB.Clauses(clause.OnConflict{
-			Columns: []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "trade_date"}},
-			DoUpdates: clause.AssignmentColumns([]string{
-				"open", "high", "low", "close", "volume", "amount", "source",
-			}),
+			Columns:   []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "trade_date"}},
+			DoUpdates: clause.AssignmentColumns(updateCols),
 		}).CreateInBatches(dailyRows, 200).Error; err != nil && err != gorm.ErrEmptySlice {
 			common.SysWarn("落库 daily_bars 失败 %s: %v", symbol, err)
 		}
