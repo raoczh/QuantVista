@@ -96,6 +96,34 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 		},
 	}
 
+	// 数据新鲜度：行情快照距采集时刻过久（休市/延迟）时显式标注，
+	// 避免模型把旧数据当实时盘面（PRD 数据新鲜度闸门的轻量实现）。
+	if !q.DataTime.IsZero() {
+		if age := time.Since(q.DataTime); age > 15*time.Minute {
+			snap["freshness_note"] = fmt.Sprintf("行情快照为 %d 分钟前的数据（可能处于休市或数据延迟），不代表实时盘面", int(age.Minutes()))
+		}
+	}
+
+	// 估值/盘面扩展（腾讯免费源 best-effort：拿不到不阻断，提示词已要求缺失时如实说明）。
+	if v, verr := market.GetValuation(ctx, mkt, symbol); verr == nil {
+		val := map[string]any{
+			"pe_ttm":        round2(v.PETTM),
+			"pe_dynamic":    round2(v.PEDynamic),
+			"pb":            round2(v.PB),
+			"total_cap":     round2(v.TotalCap),
+			"float_cap":     round2(v.FloatCap),
+			"turnover_rate": round2(v.TurnoverRate),
+			"amplitude":     round2(v.Amplitude),
+			"volume_ratio":  round2(v.VolumeRatio),
+			"limit_up":      round2(v.LimitUp),
+			"limit_down":    round2(v.LimitDown),
+		}
+		if v.IsST {
+			val["is_st"] = true
+		}
+		snap["valuation"] = val
+	}
+
 	// 日线：取近 60 根算技术指标，注入近 30 根明细。
 	bars, berr := market.GetDailyBars(ctx, mkt, symbol, 60)
 	if berr == nil && len(bars) > 0 {

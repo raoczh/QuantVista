@@ -28,7 +28,7 @@ func NewRecommendationService(market *MarketService, watchlist *WatchlistService
 }
 
 const (
-	recPromptVersion   = "p1"
+	recPromptVersion   = "p2" // p2: 候选池富化估值快照（PE/PB/市值/换手），长线 spec 同步
 	recStrategyVersion = "s1"
 	maxCandidates      = 24 // 候选池上限，控制上下文预算
 	recRepairAttempts  = 2
@@ -86,15 +86,19 @@ func strategyByKey(recType, key string) *strategyTemplate {
 	return &src[0] // 缺省用第一个
 }
 
-// candidate 候选池条目（均为真实行情数据）。
+// candidate 候选池条目（均为真实行情数据；估值字段为腾讯免费源 best-effort，缺失为 0）。
 type candidate struct {
-	Symbol    string  `json:"symbol"`
-	Market    string  `json:"market"`
-	Name      string  `json:"name"`
-	Price     float64 `json:"price"`
-	ChangePct float64 `json:"change_pct"`
-	Amount    float64 `json:"amount"` // 成交额（元）
-	Source    string  `json:"source"` // watchlist / gainer / active
+	Symbol       string  `json:"symbol"`
+	Market       string  `json:"market"`
+	Name         string  `json:"name"`
+	Price        float64 `json:"price"`
+	ChangePct    float64 `json:"change_pct"`
+	Amount       float64 `json:"amount"`                  // 成交额（元）
+	PETTM        float64 `json:"pe_ttm,omitempty"`        // 市盈率 TTM（负=亏损）
+	PB           float64 `json:"pb,omitempty"`            // 市净率
+	TotalCap     float64 `json:"total_cap,omitempty"`     // 总市值（元）
+	TurnoverRate float64 `json:"turnover_rate,omitempty"` // 换手率 %
+	Source       string  `json:"source"`                  // watchlist / gainer / active
 }
 
 // RecommendRequest 生成推荐入参。
@@ -463,6 +467,22 @@ func (s *RecommendationService) buildCandidatePool(ctx context.Context, userID i
 			break
 		}
 	}
+
+	// 估值富化（腾讯免费源 best-effort）：长线策略尤其需要 PE/PB/市值支撑估值判断，
+	// 短线可参考换手率；单只取不到只是该标的估值字段缺席，不阻断建池。
+	refs := make([]QuoteRef, 0, len(pool))
+	for _, c := range pool {
+		refs = append(refs, QuoteRef{Market: c.Market, Symbol: c.Symbol})
+	}
+	vals := s.market.ValuationsFor(ctx, refs)
+	for i := range pool {
+		if v := vals[QuoteKey(pool[i].Market, pool[i].Symbol)]; v != nil {
+			pool[i].PETTM = round2(v.PETTM)
+			pool[i].PB = round2(v.PB)
+			pool[i].TotalCap = round2(v.TotalCap)
+			pool[i].TurnoverRate = round2(v.TurnoverRate)
+		}
+	}
 	return pool, nil
 }
 
@@ -481,7 +501,7 @@ func (s *RecommendationService) buildMessages(recType string, strat *strategyTem
 	var u strings.Builder
 	fmt.Fprintf(&u, "请从以下【候选池】中，按「%s」策略精选 %d 个%s标的。\n", strat.Name, count, recTypeLabel(recType))
 	u.WriteString("硬性要求：只能从候选池里选，symbol 必须与候选池完全一致，严禁推荐池外或虚构的标的；若候选池中合适标的不足，可少于 " + fmt.Sprintf("%d", count) + " 个，但绝不编造。\n\n")
-	u.WriteString("【候选池】（JSON，price 为现价，amount 为成交额/元，change_pct 为当日涨跌幅%）：\n")
+	u.WriteString("【候选池】（JSON，price 为现价，amount 为成交额/元，change_pct 为当日涨跌幅%；pe_ttm 为市盈率TTM（负=亏损）、pb 为市净率、total_cap 为总市值/元、turnover_rate 为换手率%，这些估值字段缺失表示该标的估值数据暂不可得）：\n")
 	u.WriteString(poolJSON)
 	u.WriteString("\n\n请只输出 JSON：{\"picks\":[...]}。")
 
@@ -515,15 +535,15 @@ const shortTermSpec = `本次为【短线推荐】。每个 pick 需包含字段
 交易规则硬约束：当前数据源仅支持 A 股；A 股当日买入不可当日卖出(T+1)，止盈/止损最早次一交易日生效；必须考虑涨跌停限制，涨停可能买不进、跌停可能卖不出；最小交易单位为 100 股一手；有效期和持有周期都按交易日计算，不按自然日。
 要求止盈>买入区间上沿>买入区间下沿>止损，价格贴近现价合理设置。`
 
-const longTermSpec = `本次为【长线推荐】。当前数据以实时行情为主，缺少完整财务报表，请基于可得信息给出中长期视角，并明确指出财务数据的缺失。每个 pick 需包含字段：
+const longTermSpec = `本次为【长线推荐】。候选池含实时行情与估值快照（PE-TTM/PB/总市值，若有），但缺少财务三表明细（营收/利润/负债/现金流），请基于可得信息给出中长期视角，并明确指出财务明细的缺失。每个 pick 需包含字段：
 - symbol: 候选池中的代码
 - action: "buy"(可考虑逢低布局) 或 "watch"(观察等待)
 - confidence: 0-100 整数
 - reason: 字符串数组，长期看好/关注的理由
 - risks: 字符串数组，主要风险
-- evidence: 字符串数组，数据依据（引用候选池中的具体数值）
-- thesis: 基本面/投资逻辑（一段话）
-- valuation_low / valuation_high: 合理估值区间（若无财务数据无法给出可填 0 并在 thesis 说明）
+- evidence: 字符串数组，数据依据（引用候选池中的具体数值，含 PE/PB/市值等估值依据）
+- thesis: 基本面/投资逻辑（一段话；估值判断只能基于候选池给出的 PE/PB/市值绝对水位，不得虚构行业对比或财务明细）
+- valuation_low / valuation_high: 合理估值区间（若估值数据缺失无法给出可填 0 并在 thesis 说明）
 - key_metrics: 字符串数组，需持续跟踪的关键指标（如营收增速、毛利率、市占率）
 - review_cycle: 复盘周期（如"每季度财报后"）
 - disclaimer: 风险与免责提示`

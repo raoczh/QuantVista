@@ -87,6 +87,22 @@ func (mc *MarketController) GetScore(c *gin.Context) {
 	common.ApiSuccess(c, v)
 }
 
+// GetValuation GET /api/markets/:market/stocks/:symbol/valuation
+func (mc *MarketController) GetValuation(c *gin.Context) {
+	market := strings.ToLower(c.Param("market"))
+	symbol := strings.TrimSpace(c.Param("symbol"))
+	if symbol == "" {
+		common.ApiErrorMsg(c, "symbol 不能为空")
+		return
+	}
+	v, err := mc.svc.GetValuation(c.Request.Context(), market, symbol)
+	if err != nil {
+		common.ApiErrorMsg(c, "获取估值失败: "+err.Error())
+		return
+	}
+	common.ApiSuccess(c, v)
+}
+
 // --- 管理员：市场数据维护 ---
 
 // SyncBars POST /api/admin/market/sync-bars

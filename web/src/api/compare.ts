@@ -18,6 +18,13 @@ export interface CompareRow {
   above_ma20: boolean
   score: number
   score_label: string
+  valuation_ok: boolean
+  pe_ttm: number
+  pb: number
+  total_cap: number
+  turnover_rate: number
+  volume_ratio: number
+  is_st: boolean
   error: string
 }
 

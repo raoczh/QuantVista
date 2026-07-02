@@ -105,6 +105,15 @@ const failed = computed(() => result.value?.rows.filter((r) => !r.quote_ok) || [
 function fmt(n: number) {
   return n === 0 ? '—' : n.toFixed(2)
 }
+// PE 负值 = 亏损，显示为"亏损"更直观。
+function fmtPE(n: number) {
+  if (n === 0) return '—'
+  return n < 0 ? '亏损' : n.toFixed(2)
+}
+// 市值：元 → 亿元。
+function fmtCap(n: number) {
+  return n <= 0 ? '—' : (n / 1e8).toFixed(0) + ' 亿'
+}
 function pctText(n: number) {
   return (n > 0 ? '+' : '') + n.toFixed(2) + '%'
 }
@@ -176,7 +185,10 @@ function scoreTagColor(score: number) {
                 <tr>
                   <th class="metric-col">指标</th>
                   <th v-for="r in rows" :key="r.symbol">
-                    <div class="th-name">{{ r.name || r.symbol }}</div>
+                    <div class="th-name">
+                      {{ r.name || r.symbol }}
+                      <n-tag v-if="r.is_st" size="tiny" type="warning" :bordered="false">ST</n-tag>
+                    </div>
                     <div class="th-symbol qv-mono">{{ r.symbol }}</div>
                   </th>
                 </tr>
@@ -242,6 +254,24 @@ function scoreTagColor(score: number) {
                 <tr>
                   <td class="metric-col">区间高 / 低</td>
                   <td v-for="r in rows" :key="r.symbol">{{ fmt(r.period_high) }} / {{ fmt(r.period_low) }}</td>
+                </tr>
+                <tr>
+                  <td class="metric-col">PE-TTM / PB</td>
+                  <td v-for="r in rows" :key="r.symbol">
+                    <template v-if="r.valuation_ok">{{ fmtPE(r.pe_ttm) }} / {{ fmt(r.pb) }}</template>
+                    <template v-else>—</template>
+                  </td>
+                </tr>
+                <tr>
+                  <td class="metric-col">总市值</td>
+                  <td v-for="r in rows" :key="r.symbol">{{ r.valuation_ok ? fmtCap(r.total_cap) : '—' }}</td>
+                </tr>
+                <tr>
+                  <td class="metric-col">换手 / 量比</td>
+                  <td v-for="r in rows" :key="r.symbol">
+                    <template v-if="r.valuation_ok">{{ fmt(r.turnover_rate) }}% / {{ fmt(r.volume_ratio) }}</template>
+                    <template v-else>—</template>
+                  </td>
                 </tr>
               </tbody>
             </table>

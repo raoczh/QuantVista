@@ -85,6 +85,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			markets.GET("/:market/stocks/:symbol/quote", marketCtl.GetQuote)
 			markets.GET("/:market/stocks/:symbol/bars", marketCtl.GetDailyBars)
 			markets.GET("/:market/stocks/:symbol/score", marketCtl.GetScore)
+			markets.GET("/:market/stocks/:symbol/valuation", marketCtl.GetValuation)
 		}
 
 		// 需登录
