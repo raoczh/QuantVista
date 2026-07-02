@@ -284,3 +284,97 @@ func (s *WatchlistService) DeleteItem(userID, itemID int64) error {
 	}
 	return nil
 }
+
+// --- 机会池漏斗 ---
+
+var validResearchStage = map[string]bool{
+	"": true, // 清除标注
+	model.StageDiscovered:   true,
+	model.StageScreening:    true,
+	model.StageWatching:     true,
+	model.StageWaitingPrice: true,
+	model.StagePlanned:      true,
+	model.StageBought:       true,
+	model.StagePassed:       true,
+	model.StageReviewed:     true,
+}
+
+// SetItemStage 流转研究阶段。转 passed 时记录当时现价与原因（错过机会复盘的基准）；
+// 从 passed 转出时保留历史价格（复盘价值在于「当时放弃时的价」，覆盖即失真）。
+func (s *WatchlistService) SetItemStage(ctx context.Context, userID, itemID int64, stage, reason string) (*model.WatchlistItem, error) {
+	if !validResearchStage[stage] {
+		return nil, errors.New("无效的研究阶段")
+	}
+	var item model.WatchlistItem
+	if err := common.DB.Where("id = ? AND user_id = ?", itemID, userID).First(&item).Error; err != nil {
+		return nil, errors.New("自选条目不存在")
+	}
+	item.ResearchStage = stage
+	now := time.Now()
+	item.StageAt = &now
+	if stage == model.StagePassed {
+		item.PassedReason = truncateRunes(strings.TrimSpace(reason), 250)
+		// 放弃价 best-effort：行情不可用时记 0（复盘时显示"无基准价"）。
+		if q, err := s.market.GetQuote(ctx, item.Market, item.Symbol); err == nil {
+			item.PassedPrice = q.Price
+		}
+	}
+	if err := common.DB.Save(&item).Error; err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+// MissedOpportunityView 错过机会复盘行：放弃时价格 vs 现价。
+type MissedOpportunityView struct {
+	model.WatchlistItem
+	CurrentPrice   float64 `json:"current_price"`
+	QuoteOK        bool    `json:"quote_ok"`
+	ChangeSincePct float64 `json:"change_since_pct"` // 放弃后涨跌幅（现价 vs 放弃价）
+	Verdict        string  `json:"verdict"`          // avoided_loss / missed_gain / neutral / no_base
+}
+
+// 错过机会判定阈值：放弃后涨/跌超过该幅度（%）才计为「错过上涨/回避正确」。
+const missedVerdictPct = 5.0
+
+// missedVerdict 纯函数：按放弃价与现价判定复盘结论。
+func missedVerdict(passedPrice, currentPrice float64) (pct float64, verdict string) {
+	if passedPrice <= 0 || currentPrice <= 0 {
+		return 0, "no_base"
+	}
+	pct = round2((currentPrice - passedPrice) / passedPrice * 100)
+	switch {
+	case pct >= missedVerdictPct:
+		return pct, "missed_gain" // 放弃后上涨：错过机会
+	case pct <= -missedVerdictPct:
+		return pct, "avoided_loss" // 放弃后下跌：回避正确
+	default:
+		return pct, "neutral"
+	}
+}
+
+// MissedOpportunities 已放弃标的的复盘视图：验证「是正确回避风险，还是错过机会」。
+func (s *WatchlistService) MissedOpportunities(ctx context.Context, userID int64) ([]MissedOpportunityView, error) {
+	var items []model.WatchlistItem
+	if err := common.DB.Where("user_id = ? AND research_stage = ?", userID, model.StagePassed).
+		Order("stage_at DESC").Find(&items).Error; err != nil {
+		return nil, err
+	}
+	refs := make([]QuoteRef, 0, len(items))
+	for _, it := range items {
+		refs = append(refs, QuoteRef{Market: it.Market, Symbol: it.Symbol})
+	}
+	quotes := s.market.QuotesFor(ctx, refs)
+
+	out := make([]MissedOpportunityView, 0, len(items))
+	for _, it := range items {
+		v := MissedOpportunityView{WatchlistItem: it, Verdict: "no_base"}
+		if q := quotes[QuoteKey(it.Market, it.Symbol)]; q != nil {
+			v.CurrentPrice = q.Price
+			v.QuoteOK = true
+			v.ChangeSincePct, v.Verdict = missedVerdict(it.PassedPrice, q.Price)
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}

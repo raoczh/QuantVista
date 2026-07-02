@@ -11,6 +11,7 @@ import {
   NSwitch,
   NTag,
   NPopconfirm,
+  NPopselect,
   NEmpty,
   NSpin,
   NText,
@@ -24,8 +25,12 @@ import {
   addItem,
   updateItem,
   deleteItem,
+  setItemStage,
+  listMissed,
   type WatchlistGroup,
   type WatchlistItem,
+  type ResearchStage,
+  type MissedOpportunity,
 } from '@/api/watchlist'
 import { getDailyBars, type Bar } from '@/api/market'
 import { useUi } from '@/composables/useUi'
@@ -59,6 +64,75 @@ async function load(silent = false) {
 
 // 盘中自动刷新行情（60s，仅交易时段+页面可见，静默）。
 useAutoRefresh(() => load(true), 60_000)
+
+// ---------- 机会池漏斗 ----------
+const stageMeta: Record<string, { label: string; color: string }> = {
+  discovered: { label: '发现', color: '#8a8a8a' },
+  screening: { label: '初筛', color: '#5b8def' },
+  watching: { label: '观察', color: '#3f9eff' },
+  waiting_price: { label: '等价格', color: '#f0a020' },
+  planned: { label: '有计划', color: '#9a5fe0' },
+  bought: { label: '已买入', color: '#d03050' },
+  passed: { label: '已放弃', color: '#7a7a7a' },
+  reviewed: { label: '已复盘', color: '#18a058' },
+}
+const stageOptions = [
+  { label: '清除标注', value: '' },
+  ...Object.entries(stageMeta).map(([value, m]) => ({ label: m.label, value })),
+]
+// 转「已放弃」时先收集原因。
+const passModal = ref(false)
+const passReason = ref('')
+const passTarget = ref<WatchlistItem | null>(null)
+
+async function onStageSelect(it: WatchlistItem, stage: ResearchStage) {
+  if (stage === 'passed') {
+    passTarget.value = it
+    passReason.value = ''
+    passModal.value = true
+    return
+  }
+  try {
+    await setItemStage(it.id, stage)
+    await load(true)
+    message.success('研究阶段已更新')
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+async function confirmPass() {
+  if (!passTarget.value) return
+  try {
+    await setItemStage(passTarget.value.id, 'passed', passReason.value)
+    passModal.value = false
+    await load(true)
+    message.success('已标记放弃，进入「错过机会」复盘池')
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+
+// ---------- 错过机会复盘 ----------
+const missedModal = ref(false)
+const missedRows = ref<MissedOpportunity[]>([])
+const missedLoading = ref(false)
+const verdictMeta: Record<string, { label: string; type: 'success' | 'error' | 'default' | 'warning' }> = {
+  avoided_loss: { label: '回避正确', type: 'success' },
+  missed_gain: { label: '错过上涨', type: 'error' },
+  neutral: { label: '基本持平', type: 'default' },
+  no_base: { label: '无基准价', type: 'warning' },
+}
+async function openMissed() {
+  missedModal.value = true
+  missedLoading.value = true
+  try {
+    missedRows.value = await listMissed()
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    missedLoading.value = false
+  }
+}
 
 // ---------- 分组增删改 ----------
 const groupModal = ref(false)
@@ -289,6 +363,7 @@ onMounted(load)
       <n-tag size="small" round :bordered="false">{{ totalCount }} 只</n-tag>
       <n-button size="small" secondary @click="openCreateGroup">新建分组</n-button>
       <n-button size="small" type="primary" @click="openAddItem()">+ 添加自选</n-button>
+      <n-button size="small" secondary @click="openMissed">错过机会</n-button>
       <n-button size="small" quaternary :loading="loading" @click="load()">刷新</n-button>
     </template>
 
@@ -321,6 +396,25 @@ onMounted(load)
                     >
                     <span class="it-title">{{ it.name || it.symbol }}</span>
                     <span class="it-symbol qv-mono">{{ it.symbol }}</span>
+                    <n-popselect
+                      :value="it.research_stage"
+                      :options="stageOptions"
+                      trigger="click"
+                      @update:value="(v: ResearchStage) => onStageSelect(it, v)"
+                    >
+                      <n-tag
+                        size="tiny"
+                        round
+                        :bordered="false"
+                        style="cursor: pointer"
+                        :color="it.research_stage && stageMeta[it.research_stage]
+                          ? { color: withAlpha(stageMeta[it.research_stage].color, 0.15), textColor: stageMeta[it.research_stage].color }
+                          : undefined"
+                        @click.stop
+                      >
+                        {{ it.research_stage && stageMeta[it.research_stage] ? stageMeta[it.research_stage].label : '标阶段' }}
+                      </n-tag>
+                    </n-popselect>
                   </div>
                   <div v-if="it.focus_reason || it.note" class="it-note">
                     <span v-if="it.focus_reason">关注：{{ it.focus_reason }}</span>
@@ -411,6 +505,54 @@ onMounted(load)
           <n-button type="primary" :loading="groupSaving" @click="submitGroup">保存</n-button>
         </div>
       </template>
+    </n-modal>
+
+    <!-- 标记放弃：记录原因与当时价格 -->
+    <n-modal v-model:show="passModal" preset="card" title="标记放弃" style="max-width: 460px">
+      <p class="pass-hint">
+        将「{{ passTarget?.name || passTarget?.symbol }}」标记为已放弃。系统会记录当前价格，
+        之后可在「错过机会」中复盘：是正确回避了风险，还是错过了机会。
+      </p>
+      <n-input
+        v-model:value="passReason"
+        type="textarea"
+        :rows="2"
+        placeholder="放弃原因（建议填写）：如估值过高 / 逻辑存疑 / 仓位已满"
+      />
+      <template #footer>
+        <div class="modal-footer">
+          <n-button @click="passModal = false">取消</n-button>
+          <n-button type="warning" @click="confirmPass">确认放弃</n-button>
+        </div>
+      </template>
+    </n-modal>
+
+    <!-- 错过机会复盘 -->
+    <n-modal v-model:show="missedModal" preset="card" title="错过机会复盘" style="max-width: 720px">
+      <n-spin :show="missedLoading">
+        <n-empty v-if="!missedRows.length" description="还没有已放弃的标的——在自选条目上把阶段标为「已放弃」后，这里会记录并跟踪" />
+        <div v-else class="missed-list">
+          <div v-for="m in missedRows" :key="m.id" class="missed-row">
+            <div class="missed-main">
+              <div class="missed-name">
+                <span class="it-title">{{ m.name || m.symbol }}</span>
+                <span class="it-symbol qv-mono">{{ m.symbol }}</span>
+                <n-tag size="tiny" :type="verdictMeta[m.verdict]?.type" round :bordered="false">
+                  {{ verdictMeta[m.verdict]?.label }}
+                </n-tag>
+              </div>
+              <div v-if="m.passed_reason" class="missed-reason">放弃原因：{{ m.passed_reason }}</div>
+            </div>
+            <div class="missed-nums qv-tnum">
+              <span>放弃价 {{ m.passed_price > 0 ? m.passed_price.toFixed(2) : '—' }}</span>
+              <span>现价 {{ m.quote_ok ? m.current_price.toFixed(2) : '—' }}</span>
+              <span v-if="m.passed_price > 0 && m.quote_ok" :style="{ color: pctColor(m.change_since_pct) }">
+                {{ m.change_since_pct >= 0 ? '+' : '' }}{{ m.change_since_pct.toFixed(2) }}%
+              </span>
+            </div>
+          </div>
+        </div>
+      </n-spin>
     </n-modal>
 
     <!-- 条目添加/编辑 -->
@@ -573,5 +715,42 @@ onMounted(load)
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+.pass-hint {
+  margin: 0 0 10px;
+  font-size: 13px;
+  line-height: 1.6;
+  opacity: 0.8;
+}
+.missed-list {
+  display: flex;
+  flex-direction: column;
+}
+.missed-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 4px;
+  border-bottom: 1px solid var(--qv-divider);
+}
+.missed-row:last-child {
+  border-bottom: none;
+}
+.missed-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.missed-reason {
+  font-size: 12px;
+  opacity: 0.65;
+  margin-top: 2px;
+}
+.missed-nums {
+  display: flex;
+  gap: 12px;
+  font-size: 12.5px;
+  white-space: nowrap;
 }
 </style>

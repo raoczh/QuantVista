@@ -128,7 +128,9 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			// 条目改删用独立前缀，避免与 /watchlists/:id 的参数段语义混淆。
 			wlItems := authed.Group("/watchlist-items")
 			{
+				wlItems.GET("/missed", watchlistCtl.Missed) // 静态段先于 :id 注册
 				wlItems.PUT("/:id", watchlistCtl.UpdateItem)
+				wlItems.PUT("/:id/stage", watchlistCtl.SetItemStage)
 				wlItems.DELETE("/:id", watchlistCtl.DeleteItem)
 			}
 
