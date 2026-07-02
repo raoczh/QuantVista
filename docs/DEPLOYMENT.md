@@ -17,8 +17,10 @@
 ### 1.2 宿主机目录
 
 ```bash
-mkdir -p /www/wwwroot/quantvista/{data,logs,redis-data}
+mkdir -p /www/wwwroot/quantvista/{data,redis-data}
 ```
+
+> 应用日志走容器 stdout（`docker logs` / 宝塔容器日志查看），无文件日志目录。
 
 ### 1.3 GitHub OAuth App（可选，登录需要时再配）
 
@@ -36,6 +38,13 @@ openssl rand -base64 36   # 生成 SESSION_SECRET
 openssl rand -base64 36   # 再生成一个作 ENCRYPTION_KEY
 ```
 分别填进 `deploy/.env`。
+
+### 1.5 反向代理与真实 IP（用 nginx 反代时必配）
+
+登录限流、访问日志按客户端 IP 统计。若前面挂了宝塔/nginx 反向代理，需要在
+`deploy/.env` 设 `TRUSTED_PROXIES=<代理地址>`（如 `172.18.0.1`，逗号分隔可多个），
+应用才会采信代理传来的 `X-Forwarded-For`。**不设置时不信任任何代理头**——反代场景下
+所有请求会被视为来自代理 IP，限流会整体误伤；直连部署则保持留空即可。
 
 ## 2. 配置文件说明
 

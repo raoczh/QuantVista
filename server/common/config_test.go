@@ -36,14 +36,14 @@ func TestIsProductionEnv(t *testing.T) {
 	origDebug := DebugEnabled
 	defer func() { os.Setenv("SQL_DSN", orig); DebugEnabled = origDebug }()
 
-	// debug 永远视为非生产
+	// 安全判定与 DEBUG 解耦：误开 DEBUG 不得绕过生产密钥 fail-fast
 	DebugEnabled = true
 	os.Setenv("SQL_DSN", "user:pass@tcp(host:3306)/db")
-	if isProductionEnv() {
-		t.Error("DEBUG=true 时应视为非生产")
+	if !isProductionEnv() {
+		t.Error("连真实 MySQL 时即使 DEBUG=true 也应视为生产（不绕过密钥校验）")
 	}
 
-	// 非 debug + SQLite（空 / local）→ 开发
+	// SQLite（空 / local，容忍大小写与空白）→ 开发
 	DebugEnabled = false
 	for _, dsn := range []string{"", "local", "LOCAL", " local "} {
 		os.Setenv("SQL_DSN", dsn)
@@ -52,9 +52,23 @@ func TestIsProductionEnv(t *testing.T) {
 		}
 	}
 
-	// 非 debug + 真实 MySQL DSN → 生产
+	// 真实 MySQL DSN → 生产
 	os.Setenv("SQL_DSN", "user:pass@tcp(172.18.0.1:3306)/quantvista")
 	if !isProductionEnv() {
-		t.Error("非 debug + MySQL DSN 应视为生产")
+		t.Error("MySQL DSN 应视为生产")
+	}
+}
+
+func TestIsLocalDSN(t *testing.T) {
+	for _, dsn := range []string{"", "local", "LOCAL", " local ", "Local"} {
+		if !IsLocalDSN(dsn) {
+			t.Errorf("IsLocalDSN(%q) 应为 true", dsn)
+		}
+	}
+	// 以 local 开头的真实 MySQL DSN（如用户名 local_admin）不得误判为本地库
+	for _, dsn := range []string{"local_admin:pw@tcp(10.0.0.1:3306)/qv", "user:pass@tcp(host:3306)/db"} {
+		if IsLocalDSN(dsn) {
+			t.Errorf("IsLocalDSN(%q) 应为 false", dsn)
+		}
 	}
 }

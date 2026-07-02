@@ -30,6 +30,16 @@ type AuthService struct{}
 
 func NewAuthService() *AuthService { return &AuthService{} }
 
+// dummyPasswordHash 登录时用户不存在也执行一次同代价的 bcrypt 比较，
+// 抹平响应时间差，防止通过计时侧信道枚举已注册用户名。
+var dummyPasswordHash = func() string {
+	h, err := common.HashPassword("quantvista-timing-pad")
+	if err != nil {
+		return ""
+	}
+	return h
+}()
+
 // SetupNeeded 系统是否尚未初始化（无任何用户）。
 func (s *AuthService) SetupNeeded() (bool, error) {
 	var n int64
@@ -102,6 +112,7 @@ func (s *AuthService) CreateAdmin(username, password, ua string) (*TokenPair, er
 func (s *AuthService) LoginByPassword(username, password, ua string) (*TokenPair, error) {
 	var user model.User
 	if err := common.DB.Where("username = ?", username).First(&user).Error; err != nil {
+		common.CheckPassword(dummyPasswordHash, password) // 哑比较抹平计时差
 		return nil, errors.New("用户名或密码错误")
 	}
 	if !common.CheckPassword(user.Password, password) {
@@ -113,15 +124,17 @@ func (s *AuthService) LoginByPassword(username, password, ua string) (*TokenPair
 	return s.issueFor(&user, ua)
 }
 
-// GitHubAuthURL 构造 GitHub 授权地址（含签名 state）。
-func (s *AuthService) GitHubAuthURL(redirectURI string) (string, error) {
+// GitHubAuthURL 构造 GitHub 授权地址（含签名 state）。第二返回值为 state 的
+// nonce，调用方须种进 HttpOnly cookie，回调时 double-submit 比对（防登录 CSRF）。
+func (s *AuthService) GitHubAuthURL(redirectURI string) (string, string, error) {
 	if !setting.GitHubOAuthEnabled() {
-		return "", oauth.ErrOAuthDisabled
+		return "", "", oauth.ErrOAuthDisabled
 	}
 	if redirectURI == "" {
-		return "", errors.New("缺少 redirect_uri")
+		return "", "", errors.New("缺少 redirect_uri")
 	}
-	return oauth.AuthorizeURL(common.SignState(), redirectURI), nil
+	state := common.SignState()
+	return oauth.AuthorizeURL(state, redirectURI), common.StateNonce(state), nil
 }
 
 // LoginByGitHub OAuth 回调：校验 state、换 token、取用户、查或建。
@@ -159,28 +172,48 @@ func (s *AuthService) LoginByGitHub(ctx context.Context, code, state, redirectUR
 	if !need && !setting.RegistrationOpen() {
 		return nil, errors.New("当前未开放注册")
 	}
-	role := model.RoleUser
-	if need {
-		role = model.RoleAdmin
-	}
 	newUser := &model.User{
 		GithubID:    gu.GithubID,
 		Username:    s.uniqueUsername(gu.Username, gu.GithubID),
 		DisplayName: gu.DisplayName,
 		Email:       gu.Email,
 		AvatarURL:   gu.AvatarURL,
-		Role:        role,
+		Role:        model.RoleUser,
 		Status:      model.StatusEnabled,
 	}
 	if newUser.DisplayName == "" {
 		newUser.DisplayName = newUser.Username
 	}
-	if err := common.DB.Create(newUser).Error; err != nil {
+	if need {
+		// 首用户授予 admin 须过与 CreateAdmin 相同的并发闸（options["initialized"]
+		// 主键唯一）：两个并发的 GitHub 首登只允许一个成为管理员。
+		newUser.Role = model.RoleAdmin
+		err = common.DB.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Create(&model.Option{Key: "initialized", Value: "true"}).Error; err != nil {
+				return errInitialized
+			}
+			return tx.Create(newUser).Error
+		})
+		if errors.Is(err, errInitialized) {
+			// 竞争失败：系统已被并发请求初始化，按普通注册路径重试。
+			if !setting.RegistrationOpen() {
+				return nil, errors.New("当前未开放注册")
+			}
+			newUser.Role = model.RoleUser
+			err = common.DB.Create(newUser).Error
+		}
+		if err != nil {
+			return nil, err
+		}
+	} else if err := common.DB.Create(newUser).Error; err != nil {
 		return nil, err
 	}
 	s.ensurePrefAndQuota(newUser.ID)
 	return s.issueFor(newUser, ua)
 }
+
+// errInitialized 首用户闸竞争失败（系统已被并发请求初始化）。
+var errInitialized = errors.New("系统已初始化")
 
 // Refresh 用 refresh token 换发新令牌（轮换：吊销旧的、签发新的）。
 func (s *AuthService) Refresh(rawRefresh, ua string) (*TokenPair, error) {
@@ -201,7 +234,17 @@ func (s *AuthService) Refresh(rawRefresh, ua string) (*TokenPair, error) {
 	if user.Status != model.StatusEnabled {
 		return nil, errors.New("账号已被禁用")
 	}
-	common.DB.Model(&rt).Update("revoked", true) // 轮换吊销旧令牌
+	// 轮换吊销旧令牌：条件更新 + RowsAffected 校验，保证并发重放同一 refresh token
+	// 时只有一次换发成功（先查后改的 TOCTOU 窗口内，第二个请求在这里会失败）。
+	res := common.DB.Model(&model.RefreshToken{}).
+		Where("id = ? AND revoked = ?", rt.ID, false).
+		Update("revoked", true)
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	if res.RowsAffected != 1 {
+		return nil, errors.New("refresh token 已失效，请重新登录")
+	}
 	return s.issueFor(&user, ua)
 }
 

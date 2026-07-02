@@ -1,6 +1,7 @@
 package common
 
 import (
+	"crypto/rand"
 	"errors"
 	"time"
 
@@ -10,13 +11,25 @@ import (
 // AccessTokenTTL access token 有效期（短期，无状态）。refresh token 落库长期、可吊销。
 const AccessTokenTTL = 2 * time.Hour
 
-// jwtSecret 返回 JWT 签名密钥。生产环境 SessionSecret 已 fail-fast 保证非空；
-// 开发环境为空时退回固定不安全默认值，避免空密钥签名的隐性问题。
+// fallbackSecret SESSION_SECRET 未配置时的进程内随机密钥。
+// 必须是随机值而非固定字符串：固定默认值是公开的，任何拿到源码的人都能伪造 admin JWT；
+// 随机值即使在未配密钥的环境误上线，也无法被外部伪造。代价仅是重启后 access token
+// 全部失效（前端会用落库的 refresh token 自动换发），开发环境完全可接受。
+var fallbackSecret = func() []byte {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		panic("生成 JWT 临时密钥失败: " + err.Error())
+	}
+	return b
+}()
+
+// jwtSecret 返回 JWT/state 签名密钥。生产环境 SessionSecret 已 fail-fast 保证非空；
+// 未配置时退回进程内随机密钥（见 fallbackSecret）。
 func jwtSecret() []byte {
 	if SessionSecret != "" {
 		return []byte(SessionSecret)
 	}
-	return []byte("quantvista-dev-insecure-secret")
+	return fallbackSecret
 }
 
 // Claims access token 载荷。
