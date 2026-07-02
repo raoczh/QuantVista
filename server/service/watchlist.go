@@ -233,8 +233,8 @@ func (s *WatchlistService) AddItem(ctx context.Context, userID, groupID int64, i
 		Symbol:      symbol,
 		Market:      market,
 		Name:        name,
-		Note:        strings.TrimSpace(in.Note),
-		FocusReason: strings.TrimSpace(in.FocusReason),
+		Note:        truncateRunes(strings.TrimSpace(in.Note), 500),
+		FocusReason: truncateRunes(strings.TrimSpace(in.FocusReason), 500),
 		IsPinned:    in.IsPinned,
 	}
 	if err := common.DB.Create(item).Error; err != nil {
@@ -264,8 +264,8 @@ func (s *WatchlistService) UpdateItem(userID, itemID int64, in WatchlistItemInpu
 		}
 		item.WatchlistID = in.WatchlistID
 	}
-	item.Note = strings.TrimSpace(in.Note)
-	item.FocusReason = strings.TrimSpace(in.FocusReason)
+	item.Note = truncateRunes(strings.TrimSpace(in.Note), 500)
+	item.FocusReason = truncateRunes(strings.TrimSpace(in.FocusReason), 500)
 	item.IsPinned = in.IsPinned
 	if err := common.DB.Save(&item).Error; err != nil {
 		return nil, err

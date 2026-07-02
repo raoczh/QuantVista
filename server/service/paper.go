@@ -11,6 +11,7 @@ import (
 	"quantvista/model"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // round4 保留 4 位小数（均价列为 decimal(20,4)，用 round2 会丢精度导致盈亏漂移）。
@@ -42,6 +43,16 @@ func tradeFee(market, side string, amount float64) (fee, tax float64) {
 		tax = round2(amount * 0.0005)
 	}
 	return fee, tax
+}
+
+// lockedAccount 事务内按 user_id 重读账户；MySQL 加 FOR UPDATE 行锁串行化并发交易，
+// SQLite 不支持该子句（单写者天然串行），跳过。
+func lockedAccount(tx *gorm.DB, userID int64, acc *model.PaperAccount) error {
+	q := tx.Where("user_id = ?", userID)
+	if !common.UsingSQLite {
+		q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	return q.First(acc).Error
 }
 
 // GetOrCreateAccount 取用户模拟账户，无则以默认初始资金创建。
@@ -110,15 +121,22 @@ func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (
 	if err != nil {
 		return nil, err
 	}
-	amount := round2(price * in.Quantity)
-	fee, tax := tradeFee(market, side, amount)
 
 	trade := &model.PaperTrade{
 		UserID: userID, Symbol: symbol, Market: market, Name: name,
-		Side: side, Price: price, Quantity: in.Quantity, Amount: amount, Fee: fee, Tax: tax,
+		Side: side, Price: price, Quantity: in.Quantity,
 	}
 
 	err = common.DB.Transaction(func(tx *gorm.DB) error {
+		// 事务内重读账户（MySQL 加行锁；SQLite 单写者天然串行），
+		// 避免并发交易基于事务外的过期余额计算、互相覆盖丢失更新。
+		if err := lockedAccount(tx, userID, acc); err != nil {
+			return err
+		}
+		amount := round2(price * in.Quantity)
+		fee, tax := tradeFee(market, side, amount)
+		trade.Amount, trade.Fee, trade.Tax = amount, fee, tax
+
 		var holding model.PaperHolding
 		hErr := tx.Where("user_id = ? AND symbol = ? AND market = ?", userID, symbol, market).First(&holding).Error
 		hasHolding := hErr == nil
@@ -156,8 +174,9 @@ func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (
 			proceeds := round2(amount - fee - tax)
 			acc.Cash = round2(acc.Cash + proceeds)
 			trade.RealizedPnl = round2(proceeds - holding.AvgCost*in.Quantity)
-			holding.Quantity = round2(holding.Quantity - in.Quantity)
-			if holding.Quantity <= 0 {
+			// 数量按列精度 round4（round2 会把碎股残余清零/失真）；清仓判断用 epsilon。
+			holding.Quantity = round4(holding.Quantity - in.Quantity)
+			if holding.Quantity <= 1e-6 {
 				if err := tx.Delete(&holding).Error; err != nil {
 					return err
 				}
@@ -251,8 +270,11 @@ func (s *PaperService) Overview(ctx context.Context, userID int64) (*PaperOvervi
 
 // Trades 成交流水（倒序）。
 func (s *PaperService) Trades(userID int64, limit int) ([]model.PaperTrade, error) {
-	if limit <= 0 || limit > 200 {
+	if limit <= 0 {
 		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
 	}
 	var rows []model.PaperTrade
 	err := common.DB.Where("user_id = ?", userID).Order("id DESC").Limit(limit).Find(&rows).Error
@@ -273,6 +295,9 @@ func (s *PaperService) Reset(userID int64, initialCash float64) (*model.PaperAcc
 		return nil, err
 	}
 	err = common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockedAccount(tx, userID, acc); err != nil {
+			return err
+		}
 		if err := tx.Where("user_id = ?", userID).Delete(&model.PaperHolding{}).Error; err != nil {
 			return err
 		}

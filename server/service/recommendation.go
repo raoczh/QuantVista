@@ -110,7 +110,7 @@ type RecommendRequest struct {
 type recPick struct {
 	Symbol     string   `json:"symbol"`
 	Action     string   `json:"action"`
-	Confidence int      `json:"confidence"`
+	Confidence FlexInt  `json:"confidence"`
 	Reason     []string `json:"reason"`
 	Risks      []string `json:"risks"`
 	Evidence   []string `json:"evidence"`
@@ -180,6 +180,9 @@ func (s *RecommendationService) Generate(ctx context.Context, userID int64, allo
 		return nil, err
 	}
 	if len(pool) == 0 {
+		if market != "cn" {
+			return nil, errors.New("该市场暂无行情数据源支持，无法构建候选池（当前仅支持 A 股）")
+		}
 		return nil, errors.New("候选池为空：请先添加自选股，或稍后重试（榜单数据源繁忙）")
 	}
 	poolBySymbol := make(map[string]candidate, len(pool))
@@ -198,7 +201,7 @@ func (s *RecommendationService) Generate(ctx context.Context, userID int64, allo
 		PromptVersion: recPromptVersion, StrategyVersion: recStrategyVersion,
 	}
 
-	picks, usage, latency, callErr := s.callWithRepair(ctx, cfg, apiKey, allowPrivate, messages, poolBySymbol)
+	picks, usage, latency, callErr := s.callWithRepair(ctx, cfg, apiKey, allowPrivate, messages, poolBySymbol, count)
 	batch.PromptTokens = usage.PromptTokens
 	batch.CompletionTokens = usage.CompletionTokens
 	batch.TotalTokens = usage.TotalTokens
@@ -237,7 +240,7 @@ func (s *RecommendationService) Generate(ctx context.Context, userID int64, allo
 			detail, _ := json.Marshal(p)
 			rec := model.Recommendation{
 				BatchID: batch.ID, UserID: userID, Symbol: p.Symbol, Market: market,
-				Name: c.Name, Action: p.Action, Confidence: p.Confidence,
+				Name: c.Name, Action: p.Action, Confidence: int(p.Confidence),
 				Summary: truncateRunes(firstReason(p), 512), RefPrice: c.Price,
 				DetailJSON: string(detail), SortOrder: i,
 			}
@@ -256,7 +259,7 @@ func (s *RecommendationService) Generate(ctx context.Context, userID int64, allo
 }
 
 // callWithRepair 调用 LLM，反编造校验（picks 必须∈候选池），失败有限次 repair，累计 token。
-func (s *RecommendationService) callWithRepair(ctx context.Context, cfg *model.LLMConfig, apiKey string, allowPrivate bool, messages []chatMessage, pool map[string]candidate) ([]recPick, chatUsage, int64, error) {
+func (s *RecommendationService) callWithRepair(ctx context.Context, cfg *model.LLMConfig, apiKey string, allowPrivate bool, messages []chatMessage, pool map[string]candidate, count int) ([]recPick, chatUsage, int64, error) {
 	var acc chatUsage
 	var lastLatency int64
 	convo := append([]chatMessage(nil), messages...)
@@ -275,7 +278,7 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, cfg *model.L
 		acc.TotalTokens += res.Usage.TotalTokens
 		lastLatency = res.LatencyMs
 
-		picks, perr := parseAndFilterPicks(res.Content, pool)
+		picks, perr := parseAndFilterPicks(res.Content, pool, count)
 		if perr == nil {
 			return picks, acc, lastLatency, nil
 		}
@@ -291,9 +294,13 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, cfg *model.L
 	return nil, acc, lastLatency, nil // 降级
 }
 
-// parseAndFilterPicks 解析 picks 并执行反编造过滤（只保留∈候选池的标的）。
+// parseAndFilterPicks 解析 picks 并执行反编造过滤（只保留∈候选池的标的），
+// 输出条数不超过 maxCount（PRD 3.6：用户可选 3~5 个，模型多给的截断丢弃）。
 // 返回 error（触发 repair）当：JSON 解析失败、无 picks、或过滤后无任何有效标的。
-func parseAndFilterPicks(content string, pool map[string]candidate) ([]recPick, error) {
+func parseAndFilterPicks(content string, pool map[string]candidate, maxCount int) ([]recPick, error) {
+	if maxCount <= 0 || maxCount > 5 {
+		maxCount = 5
+	}
 	jsonStr := extractJSONObject(content)
 	if jsonStr == "" {
 		return nil, errors.New("未找到 JSON 对象")
@@ -320,7 +327,7 @@ func parseAndFilterPicks(content string, pool map[string]candidate) ([]recPick, 
 		}
 		seen[sym] = true
 		out = append(out, normalizePick(p, sym, pool[sym]))
-		if len(out) >= 5 {
+		if len(out) >= maxCount {
 			break
 		}
 	}
@@ -366,9 +373,11 @@ func normalizePick(p recPick, sym string, c candidate) recPick {
 		if p.ValidDays > 10 {
 			p.ValidDays = 10
 		}
-		if !shortPlanPricesValid(p) {
+		if !shortPlanPricesValid(p, c.Price) {
 			p.Action = model.RecActionWatch
-			p.Risks = append(p.Risks, "短线价位关系不满足止盈>买入区间上沿>下沿>止损，已降级为观察")
+			p.Risks = append(p.Risks, "短线价位关系不满足止盈>买入区间上沿>下沿>止损（或与现价明显脱节），已降级为观察")
+			// 清零价位：无效价位不得驱动阶段6 追踪的止盈/止损判定（tracking 视为未设价位）。
+			p.BuyZoneLow, p.BuyZoneHigh, p.TakeProfit, p.StopLoss = 0, 0, 0, 0
 		}
 		if c.Price > 0 {
 			p.Evidence = append(p.Evidence, "短线计划按交易日跟踪，A股需考虑T+1、涨跌停与100股一手约束")
@@ -384,13 +393,35 @@ func normalizePick(p recPick, sym string, c candidate) recPick {
 	return p
 }
 
-// buildCandidatePool 从真实数据构建候选池：自选∪涨幅榜∪活跃榜，去重富化，上限 maxCandidates。
+// minCandidateAmount PRD 3.6 流动性前置筛选：日成交额不足 1 亿元的标的剔除
+// （仅对带成交额的榜单项生效；自选项无成交额数据，以「能取到实时行情」为准入）。
+const minCandidateAmount = 1e8
+
+// candidateEligible PRD 3.6 推荐前置筛选：排除退市风险（ST/*ST/退市整理）、
+// 停牌或取不到行情、流动性不足的标的。候选池是反编造的根基——无行情数据的
+// 标的只会诱导 LLM 编造依据，一并拒之门外。
+func candidateEligible(c candidate) bool {
+	name := strings.ToUpper(c.Name)
+	if strings.Contains(name, "ST") || strings.Contains(name, "退") {
+		return false
+	}
+	if c.Price <= 0 {
+		return false
+	}
+	if c.Amount > 0 && c.Amount < minCandidateAmount {
+		return false
+	}
+	return true
+}
+
+// buildCandidatePool 从真实数据构建候选池：自选∪涨幅榜∪活跃榜，经 PRD 3.6
+// 前置筛选（candidateEligible）后去重富化，上限 maxCandidates。
 func (s *RecommendationService) buildCandidatePool(ctx context.Context, userID int64, market, recType string) ([]candidate, error) {
 	byKey := map[string]candidate{}
 	order := []string{} // 保序：自选优先，其次榜单
 
 	add := func(c candidate) {
-		if c.Symbol == "" {
+		if c.Symbol == "" || !candidateEligible(c) {
 			return
 		}
 		if _, ok := byKey[c.Symbol]; ok {
@@ -400,19 +431,16 @@ func (s *RecommendationService) buildCandidatePool(ctx context.Context, userID i
 		order = append(order, c.Symbol)
 	}
 
-	// 自选股（用户已研究的标的，优先纳入）——仅限当前 market。
+	// 自选股（用户已研究的标的，优先纳入）——仅限当前 market，且必须有实时行情
+	// （取不到行情可能是停牌，且无数据会诱导 LLM 编造依据）。
 	if groups, err := s.watchlist.List(ctx, userID); err == nil {
 		for _, g := range groups {
 			for _, it := range g.Items {
-				if it.Market != market {
+				if it.Market != market || !it.QuoteOK {
 					continue
 				}
-				if it.QuoteOK {
-					add(candidate{Symbol: it.Symbol, Market: market, Name: it.Name,
-						Price: round2(it.Price), ChangePct: round2(it.ChangePct), Source: "watchlist"})
-				} else {
-					add(candidate{Symbol: it.Symbol, Market: market, Name: it.Name, Source: "watchlist"})
-				}
+				add(candidate{Symbol: it.Symbol, Market: market, Name: it.Name,
+					Price: round2(it.Price), ChangePct: round2(it.ChangePct), Source: "watchlist"})
 			}
 		}
 	}
@@ -504,11 +532,20 @@ func hasShortPlan(p recPick) bool {
 	return p.BuyZoneLow > 0 || p.BuyZoneHigh > 0 || p.TakeProfit > 0 || p.StopLoss > 0 || p.ValidDays > 0
 }
 
-func shortPlanPricesValid(p recPick) bool {
+// shortPlanPricesValid 校验短线计划价位：四价关系 止盈>区间上沿>下沿>止损，
+// 且与现价锚定——现价必须落在 (止损, 止盈) 之间，否则整套计划悬空于现价
+// 之外（如现价 10 而止损 12），首日即会误触发追踪判定。
+func shortPlanPricesValid(p recPick, price float64) bool {
 	if p.BuyZoneLow <= 0 || p.BuyZoneHigh <= 0 || p.TakeProfit <= 0 || p.StopLoss <= 0 {
 		return false
 	}
-	return p.TakeProfit > p.BuyZoneHigh && p.BuyZoneHigh > p.BuyZoneLow && p.BuyZoneLow > p.StopLoss
+	if !(p.TakeProfit > p.BuyZoneHigh && p.BuyZoneHigh > p.BuyZoneLow && p.BuyZoneLow > p.StopLoss) {
+		return false
+	}
+	if price > 0 && (p.StopLoss >= price || p.TakeProfit <= price) {
+		return false
+	}
+	return true
 }
 func recTypeLabel(t string) string {
 	if t == model.RecTypeShortTerm {

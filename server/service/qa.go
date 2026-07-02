@@ -69,7 +69,8 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 
 	// 取得或新建会话。
 	var conv model.AiConversation
-	if req.ConversationID > 0 {
+	isNewConv := req.ConversationID <= 0
+	if !isNewConv {
 		if err := common.DB.Where("id = ? AND user_id = ?", req.ConversationID, userID).First(&conv).Error; err != nil {
 			return nil, errors.New("会话不存在")
 		}
@@ -107,6 +108,10 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 		Messages: messages, JSONMode: false, AllowPrivate: allowPrivate,
 	})
 	if callErr != nil {
+		// 新会话首问失败：删除刚建的空会话，避免列表堆积 0 消息的孤儿会话。
+		if isNewConv {
+			common.DB.Delete(&model.AiConversation{}, conv.ID)
+		}
 		return nil, callErr
 	}
 	answer := strings.TrimSpace(res.Content)

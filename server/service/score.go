@@ -234,10 +234,12 @@ func (s *ScoreService) persist(v *ScoreView) {
 		Total: v.Total, Trend: v.Trend, Momentum: v.Momentum, Position: v.Position,
 		Volume: v.Volume, Risk: v.Risk, Label: v.Label, Price: v.Price, BarCount: v.BarCount,
 	}
-	common.DB.Clauses(clause.OnConflict{
+	if err := common.DB.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "trade_date"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"total", "trend", "momentum", "position", "volume", "risk", "label", "price", "bar_count", "updated_at",
 		}),
-	}).Create(&row)
+	}).Create(&row).Error; err != nil {
+		common.SysWarn("评分快照落库失败 %s/%s: %v", v.Market, v.Symbol, err)
+	}
 }

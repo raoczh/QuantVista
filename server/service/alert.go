@@ -233,8 +233,8 @@ func (s *AlertService) Create(ctx context.Context, userID int64, in AlertInput) 
 	}
 	rule := &model.AlertRule{
 		UserID: userID, Symbol: symbol, Market: market, Name: name,
-		Kind: in.Kind, Op: in.Op, Threshold: round2(in.Threshold), Period: in.Period,
-		Once: in.Once, Note: strings.TrimSpace(in.Note), Status: model.AlertStatusActive,
+		Kind: in.Kind, Op: in.Op, Threshold: round4(in.Threshold), Period: in.Period,
+		Once: in.Once, Note: truncateRunes(strings.TrimSpace(in.Note), 250), Status: model.AlertStatusActive,
 	}
 	if err := common.DB.Create(rule).Error; err != nil {
 		return nil, err
@@ -264,10 +264,10 @@ func (s *AlertService) Update(userID, id int64, in AlertInput) (*model.AlertRule
 	}
 	rule.Kind = in.Kind
 	rule.Op = in.Op
-	rule.Threshold = round2(in.Threshold)
+	rule.Threshold = round4(in.Threshold)
 	rule.Period = in.Period
 	rule.Once = in.Once
-	rule.Note = strings.TrimSpace(in.Note)
+	rule.Note = truncateRunes(strings.TrimSpace(in.Note), 250)
 	rule.Status = model.AlertStatusActive
 	rule.TriggeredAt = nil
 	rule.TriggerMsg = ""
@@ -313,11 +313,12 @@ func (s *AlertService) Delete(userID, id int64) error {
 // once 规则命中后置 triggered，作为待处理项持续保留；
 // 非 once 规则保持 active，仅当 triggered_at 的日期为今天（今天确有命中）才纳入——
 // 不能用 last_check_date 判定，它每次评估都刷成今天，会让历史命中天天误报。
+// 已暂停（paused）的规则不纳入：用户主动暂停即表示不再关注其命中。
 func (s *AlertService) TriggeredForUser(userID int64) ([]model.AlertRule, error) {
 	var rows []model.AlertRule
 	err := common.DB.Where(
-		"user_id = ? AND (status = ? OR triggered_at IS NOT NULL)",
-		userID, model.AlertStatusTriggered,
+		"user_id = ? AND (status = ? OR (status = ? AND triggered_at IS NOT NULL))",
+		userID, model.AlertStatusTriggered, model.AlertStatusActive,
 	).
 		Order("triggered_at DESC").Find(&rows).Error
 	if err != nil {
@@ -358,10 +359,23 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 	today := time.Now().In(time.Local).Format("2006-01-02")
 	hits := 0
 
-	// 用户是否配置了启用的推送通道（一批规则同属一个用户，只查一次）。
+	// fillBars 组装 ma/breakout 的日线序列。breakout 的「前高/前低」窗口剔除当日
+	// 在途 bar（否则当日 high 与含自身的窗口比较恒成立，首日必误报「创新高」）；
+	// MA 序列保留当日（现价参与均线是常用口径）。
+	fillBars := func(e *alertEval, bars []datasource.Bar) {
+		for _, b := range bars {
+			e.Closes = append(e.Closes, b.Close)
+			if b.TradeDate != today {
+				e.Highs = append(e.Highs, b.High)
+				e.Lows = append(e.Lows, b.Low)
+			}
+		}
+	}
+
+	// 推送开关：用户配置了启用的通道，且偏好「开启提醒」打开（一批规则同属一个用户，只查一次）。
 	notifyOn := false
 	if s.notify != nil && len(rules) > 0 {
-		notifyOn = s.notify.HasEnabledChannel(rules[0].UserID)
+		notifyOn = s.notify.HasEnabledChannel(rules[0].UserID) && userNotifyEnabled(rules[0].UserID)
 	}
 	var pushLines []string
 
@@ -376,11 +390,7 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 				// ma/breakout 才需要日线。
 				if rule.Kind == model.AlertKindMA || rule.Kind == model.AlertKindBreakout {
 					if bars, berr := s.market.GetDailyBars(ctx, rule.Market, rule.Symbol, alertBarLimit); berr == nil {
-						for _, b := range bars {
-							data.eval.Closes = append(data.eval.Closes, b.Close)
-							data.eval.Highs = append(data.eval.Highs, b.High)
-							data.eval.Lows = append(data.eval.Lows, b.Low)
-						}
+						fillBars(&data.eval, bars)
 					}
 				}
 			}
@@ -392,11 +402,7 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 		// 若已缓存但缺日线而本规则需要，补拉一次。
 		if (rule.Kind == model.AlertKindMA || rule.Kind == model.AlertKindBreakout) && len(data.eval.Closes) == 0 {
 			if bars, berr := s.market.GetDailyBars(ctx, rule.Market, rule.Symbol, alertBarLimit); berr == nil {
-				for _, b := range bars {
-					data.eval.Closes = append(data.eval.Closes, b.Close)
-					data.eval.Highs = append(data.eval.Highs, b.High)
-					data.eval.Lows = append(data.eval.Lows, b.Low)
-				}
+				fillBars(&data.eval, bars)
 				cache[key] = data
 			}
 		}
