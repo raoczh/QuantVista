@@ -16,12 +16,18 @@ export interface Position {
   buy_tax: number
   buy_reason: string
   user_note: string
+  plan_stop_loss: number
+  plan_take_profit: number
+  checklist_json: string
   sell_price: number
   sell_date: string
   sell_fee: number
   sell_tax: number
   sell_reason: string
   review_note: string
+  sell_planned: string // yes/no/partial
+  ai_verdict: string // right/wrong/mixed/unused
+  lesson_learned: string
   // 富化字段
   current_price: number
   quote_ok: boolean
@@ -47,6 +53,9 @@ export interface PositionInput {
   buy_tax?: number
   buy_reason?: string
   user_note?: string
+  plan_stop_loss?: number
+  plan_take_profit?: number
+  checklist_json?: string
 }
 
 export interface CloseInput {
@@ -56,6 +65,9 @@ export interface CloseInput {
   sell_tax?: number
   sell_reason?: string
   review_note?: string
+  sell_planned?: string
+  ai_verdict?: string
+  lesson_learned?: string
 }
 
 export function listPositions(status: 'holding' | 'closed' | 'all' = 'all') {
