@@ -7,7 +7,7 @@ QuantVista 采用前后端分离的全栈架构：
 ```text
 Vue 前端
   |
-  | REST / SSE / WebSocket
+  | REST（当前全部为 REST；SSE/WebSocket 为可扩展方向，未使用）
   v
 Go API Server
   |
@@ -160,12 +160,12 @@ Go API Server
 > **凭证管理（阶段 1 落地后修订）**：GitHub OAuth 的 `client_id` / `client_secret` **存数据库系统设置**（`options` 表，secret 经 AES-256-GCM 加密），由管理员后台「GitHub 登录」运行时可配可改。`deploy/.env` 的 `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` 仅作**首启种子**（DB 无值且 env 有则回填），之后以 DB 为准。此处与最初"只走 env"的设计已调整——改为参照 new-api 的 DB 设置项做法（换 token、拉用户、建号流程同样可参考）。
 > 鉴权用 JWT：access token（HS256，2h，无状态）+ refresh token（`refresh_tokens` 表落库、可吊销、换发轮换）。首启无用户时走密码方式创建首个管理员（admin），解 GitHub 凭证配置前的"鸡生蛋"问题。
 
-接口示例：
+接口示例（与实际路由一致）：
 
-- `GET /api/oauth/github`
-- `GET /api/oauth/github/callback`
-- `GET /api/user/me`
-- `POST /api/auth/logout`
+- `GET /api/oauth/github/url`（返回授权地址，同时种 state cookie）
+- `POST /api/oauth/github`（前端回调页用 code 换令牌，double-submit 校验 state）
+- `GET /api/user/self`
+- `POST /api/auth/login` / `POST /api/auth/refresh` / `POST /api/auth/logout`
 
 ### 5.2 Market Data Service
 
@@ -174,7 +174,7 @@ Go API Server
 - 拉取行情、指数、板块、新闻、财务和宏观数据。
 - 标准化不同数据源格式。
 - 缓存热点行情。
-- 记录数据更新时间和数据源状态。
+- 记录数据更新时间和数据源状态（数据源健康状态落库为**规划项**：`data_source_configs` 表已建，manager 回写与管理端查询未接，当前排查靠日志）。
 
 **数据适配/标准化层（关键设计）**：
 
@@ -197,14 +197,13 @@ Go API Server
 - 日线行情写入 `daily_bars`（OHLC），供追踪与回撤计算使用；公司行为写 `corporate_actions` 用于复权。
 - **Tushare 分档接入**：第一阶段以东财 + 新浪为主，Tushare 非前置；免费档（120，股票清单/日线/交易日历）与低 cost 档（2000，财务三表/复权因子/指数日线，长线财务深度来源）按需启用，高级档（5000，分钟线/融资融券明细等）暂不实现。详见 [数据源选型](docs/DATA_SOURCES.md)。
 
-接口示例：
+接口示例（与实际路由一致；行情为公开端点、带宽松限流）：
 
-- `GET /api/markets/overview`
-- `GET /api/markets/:market/indices`
-- `GET /api/sectors/rankings`
-- `GET /api/stocks/:symbol/quote`
-- `GET /api/stocks/:symbol/fundamentals`
-- `GET /api/news`
+- `GET /api/markets/:market/overview`
+- `GET /api/markets/:market/stocks/:symbol/quote`
+- `GET /api/markets/:market/stocks/:symbol/bars`
+- `GET /api/markets/:market/stocks/:symbol/score`
+-（fundamentals / news 待外部数据源，未实现）
 
 ### 5.3 Watchlist Service
 
@@ -249,12 +248,12 @@ Go API Server
 - 保存分析历史。
 - 统计调用消耗。
 
-接口示例：
+接口示例（与实际路由一致）：
 
-- `POST /api/ai/analyze`
-- `GET /api/ai/reports`
-- `GET /api/ai/reports/:id`
-- `POST /api/ai/reports/:id/rerun`
+- `POST /api/analysis`（发起分析，限流 20/min）
+- `GET /api/analysis?module=&limit=`（历史，支持模块筛选）
+- `GET /api/analysis/:id` / `DELETE /api/analysis/:id`
+-（rerun / 从历史创建推荐为规划项，未实现）
 
 ### 5.6 Recommendation Service
 
@@ -265,12 +264,12 @@ Go API Server
 - 生成短线或长线推荐。
 - 保存推荐记录。
 
-接口示例：
+接口示例（与实际路由一致）：
 
-- `POST /api/recommendations/generate`
-- `GET /api/recommendations`
-- `GET /api/recommendations/:id`
-- `POST /api/recommendations/:id/add-to-position`
+- `POST /api/recommendations`（生成，限流 15/min）
+- `GET /api/recommendations?type=&limit=` / `GET /api/recommendations/:id`
+- `GET /api/recommendations/strategies?type=`
+-（add-to-position 为规划项：当前「一键建仓」由前端跳持仓页预填实现，`positions` 尚无 `recommendation_id` 血缘列）
 
 ### 5.7 Tracking Service
 
@@ -284,15 +283,14 @@ Go API Server
 
 - **当前状态层**（与推荐 1:1）：保存最新收益率、最高价、最低价、最大涨幅、最大回撤、当前状态，定时任务覆盖更新。
 - **价格序列层**：复用 `daily_bars`（按 stock + 日期），追踪只引用，不重复存全量行情。
-- 止盈/止损判断使用当日 **high/low**，而非单点收盘价，避免漏判盘中触达。
-- 收益/回撤计算使用**复权后**价格（结合 `corporate_actions`），避免除权导致序列断裂。
+- 止盈/止损判断使用当日 **high/low**，而非单点收盘价，避免漏判盘中触达；且**仅在有效期窗口内判定**，过期后触达不改写结局。
+- 收益/回撤计算的目标态为**复权后**价格（结合 `corporate_actions`）；当前实现基于东财前复权日线（重锚型，除权后历史重刷、与生成时点快照价可能错位，note 标注），复权因子表待补。
 - 表现统计同时计算**相对基准（指数）的超额收益**并附**样本量 n**。
 
-接口示例：
+接口示例（与实际路由一致）：
 
-- `GET /api/recommendations/tracking`
-- `GET /api/recommendations/performance`
-- `POST /api/recommendations/:id/recalculate`
+- `GET /api/recommendations/performance?type=`
+- `POST /api/recommendations/:id/track`（手动刷新单批追踪）
 
 ### 5.8 Settings Service
 
@@ -304,13 +302,12 @@ Go API Server
 - 策略模板。
 - 通知设置。
 
-接口示例：
+接口示例（与实际路由一致）：
 
-- `GET /api/settings/llm`
-- `POST /api/settings/llm`
-- `POST /api/settings/llm/test`
-- `GET /api/settings/data-sources`
-- `PATCH /api/settings/preferences`
+- `GET/POST /api/llm-configs`，`PUT/DELETE /api/llm-configs/:id`，`POST /api/llm-configs/:id/test`
+- `GET/PUT /api/user/preference`，`GET /api/user/quota`
+- `GET/POST /api/notify-channels`，`PUT/DELETE /api/notify-channels/:id`，`POST /api/notify-channels/:id/test`
+-（数据源配置管理端为规划项：`data_source_configs` 表已建、未接管理端）
 
 ### 5.9 Job Service
 
@@ -361,7 +358,8 @@ Go API Server
 
 1. 用户指定的本次调用配置。
 2. 用户默认 LLM 配置。
-3. 系统默认 LLM 配置。
+
+>（原设计的第 3 级「系统默认 LLM 配置」未实现：当前无系统级共享渠道，用户未配置任何 LLM 时直接提示先去设置。个人自用下可接受，多用户开放前再评估。）
 
 ### 6.4 上下文预算（硬约束）
 
@@ -412,25 +410,27 @@ AI 结果：
 - 用户配置 Base URL 时做 SSRF 防护（禁内网地址、协议白名单、解析后再校验）。
 - 数据源 URL 需要白名单或管理员审核。
 - AI 调用做频率限制、每用户配额和成本统计。
-- 敏感操作（改 API Key、改数据源 URL）写**审计日志**。
+- 敏感操作（改 API Key、改数据源 URL）写**审计日志**（`audit_logs` 未建，个人自用降级为规划项；多用户开放前须补）。
 - 股票推荐页面固定展示免责声明。
 
 ## 9. 前端页面结构
 
-推荐页面：
+实际路由（`web/src/router/index.ts`）：
 
 - `/`：市场首页
-- `/login`：登录页
+- `/login`（+ `/login/callback` OAuth 回调）、`/setup`：登录 / 首启建管理员
+- `/today`：今日待办/待复盘
 - `/watchlist`：自选股
 - `/positions`：已购入持仓
-- `/analysis`：AI 分析中心
-- `/recommendations`：推荐历史与追踪
+- `/analysis`：AI 分析中心（含历史，支持模块筛选）
+- `/recommendations`：推荐历史与追踪（策略模板为页内下拉，无独立页）
+- `/qa`：个股 AI 问答
 - `/compare`：个股横向对比
-- `/alerts`：提醒规则与待办/待复盘清单
-- `/strategies`：策略模板
-- `/reports`：分析历史
-- `/settings`：设置
-- `/admin`：管理员后台，后续实现
+- `/alerts`：提醒规则 + 推送通道
+- `/paper`：模拟交易
+- `/prompt-templates`：自定义分析提示词模板（用户菜单进入）
+- `/settings`：设置（LLM/偏好/AI 用量/账号安全）
+- `/admin`：管理员后台
 
 ## 10. MVP 边界
 

@@ -1,5 +1,26 @@
 # 数据库设计
 
+> **实现差异说明（2026-07-02 审查后补充）**：本文档为**目标态设计**；实际 schema 以
+> `server/model/*.go`（GORM AutoMigrate）为准。当前已知差异（多数属实现简化，
+> 详见 `ROADMAP.md`「当前实现边界」）：
+>
+> - **未建的表**：`corporate_actions`（复权，日线暂用东财前复权）、`alerts`（命中明细
+>   与 unread/read/dismissed 状态机——实现为 `alert_rules` 单表、命中状态写在规则行上）、
+>   `audit_logs`、`ai_call_logs`（个人自用降级）；`data_source_configs` 表已建但**无读写方**（死表，管理端未接）。
+> - **字段/结构差异**：`stock_quotes` 实现为 symbol+market 唯一的**最新快照单行覆盖**
+>   （非文档的 stock_id+quote_time 历史序列）；`market_snapshots` 实现为涨跌家数列
+>   （非 JSON 大字段）；`data_sync_logs` 实现为 Task/Market/Total/Succeeded/Failed/DurationMs；
+>   `daily_bars` 用 symbol+market 自然键、无 adj_close；`users.status` 枚举为
+>   `enabled/disabled`（非 active/disabled）；`positions` 无 `recommendation_id`（推荐血缘待补）；
+>   `user_preferences` 实现为 risk_level/default_market/horizon_pref/default_rec_count/enable_notify
+>   （无 default_llm_config_id——由 `llm_configs.is_default` 承担；无 simulation_enabled——模拟盘恒可用）；
+>   `user_token_quotas` 实现为终身累计（无 period/period_start 周期重置）；
+>   `alert_rules` 实现为 kind(price/pct_change/ma/breakout)+op+threshold+period+once
+>   （无 target_type/target_id/cooldown_seconds）；`stock_scores` 实现为五维技术面
+>   （trend/momentum/position/volume/risk，估值/成长/财务/情绪待财务数据源）。
+> - 短线追踪状态枚举实现为 `active/take_profit/stop_loss/expired/tracking/no_data`
+>   （无 watching/needs_review/closed——用户买卖联动未实现）。
+
 ## 1. 设计原则
 
 - 所有用户数据必须通过 `user_id` 隔离。
