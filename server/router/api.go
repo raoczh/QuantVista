@@ -76,8 +76,10 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			gh.POST("", middleware.RateLimit(20, time.Minute), authCtl.GitHubCallback)
 		}
 
-		// 市场行情（公开，公开市场数据）
+		// 市场行情（公开市场数据；宽松限流防外部脚本刷接口——缓存 miss 时会
+		// 直连上游并落库，被刷会导致服务器 IP 被数据源封禁 + stocks 表被灌满）
 		markets := api.Group("/markets")
+		markets.Use(middleware.RateLimit(120, time.Minute))
 		{
 			markets.GET("/:market/overview", marketCtl.GetOverview)
 			markets.GET("/:market/stocks/:symbol/quote", marketCtl.GetQuote)
@@ -156,7 +158,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				recommendations.DELETE("/:id", recommendationCtl.Delete)
 			}
 
-			// 条件提醒（按用户隔离；命中不推送，仅落库供待办/页面高亮）
+			// 条件提醒（按用户隔离；命中落库供待办/页面高亮，配置了推送通道则额外推送）
 			alerts := authed.Group("/alerts")
 			{
 				alerts.GET("", alertCtl.List)

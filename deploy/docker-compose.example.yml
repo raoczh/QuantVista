@@ -9,24 +9,23 @@ services:
     image: ${IMAGE:-raoczh/quantvista:custom-YYYYMMDD-01}
     container_name: ${CONTAINER_NAME:-quantvista}
     restart: always
-    command: --log-dir /app/logs
     ports:
       - "${WEB_HTTP_PORT:-3002}:${PORT:-3000}"
     volumes:
       - ${APP_PATH:-/www/wwwroot/quantvista}/data:/data
-      - ${APP_PATH:-/www/wwwroot/quantvista}/logs:/app/logs
     environment:
       PORT: ${PORT:-3000}
       SQL_DSN: ${SQL_DSN}
       REDIS_CONN_STRING: ${REDIS_CONN_STRING:-redis://quantvista-redis:6379/0}
       SESSION_SECRET: ${SESSION_SECRET}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET}
       TUSHARE_TOKEN: ${TUSHARE_TOKEN}
       DEFAULT_MARKET: ${DEFAULT_MARKET:-cn}
       TZ: ${TZ:-Asia/Shanghai}
-      ERROR_LOG_ENABLED: ${ERROR_LOG_ENABLED:-true}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

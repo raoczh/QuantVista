@@ -13,13 +13,23 @@ import (
 // stateTTL OAuth state 有效期。
 const stateTTL = 10 * time.Minute
 
-// SignState 生成无状态、防 CSRF 的 OAuth state：nonce.ts.hmac。
-// 无需服务端存储——回调时用 HMAC + 时效校验，攻击者无法伪造合法 state。
+// SignState 生成无状态、防篡改的 OAuth state：nonce.ts.hmac。
+// 无需服务端存储——回调时用 HMAC + 时效校验；防 CSRF 还需调用方把 nonce
+// 种进 HttpOnly cookie 并在回调时比对（见 controller 的 double-submit 校验）。
 func SignState() string {
 	nonce := RandomString(16)
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	payload := nonce + "." + ts
 	return payload + "." + stateMAC(payload)
+}
+
+// StateNonce 从 state 中取出 nonce 段（格式不符返回空串）。
+func StateNonce(state string) string {
+	parts := strings.Split(state, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	return parts[0]
 }
 
 // VerifyState 校验 state 的 HMAC 与时效。

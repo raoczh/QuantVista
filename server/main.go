@@ -55,6 +55,11 @@ func main() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	engine := gin.New()
+	// 反代（宝塔/nginx）场景通过 TRUSTED_PROXIES 显式声明可信代理；
+	// 默认不信任任何代理头，避免伪造 X-Forwarded-For 绕过按 IP 的限流。
+	if err := engine.SetTrustedProxies(common.TrustedProxies); err != nil {
+		common.FatalLog("TRUSTED_PROXIES 配置无效: %v", err)
+	}
 	engine.Use(middleware.Recovery(), middleware.Logger(), middleware.CORS())
 
 	router.SetApiRouter(engine, mgr)
