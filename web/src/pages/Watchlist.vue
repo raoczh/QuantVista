@@ -220,6 +220,9 @@ function goAlert(item: WatchlistItem) {
 function goQa(item: WatchlistItem) {
   router.push({ name: 'qa', query: { symbol: item.symbol, market: item.market } })
 }
+function goThesis(item: WatchlistItem) {
+  router.push({ name: 'thesis', query: { add: '1', symbol: item.symbol, market: item.market, name: item.name } })
+}
 
 function fmt(n: number | undefined) {
   return n == null ? '-' : n.toFixed(2)
@@ -338,6 +341,7 @@ onMounted(load)
                   <n-button size="tiny" quaternary @click="goAnalysis(it)">分析</n-button>
                   <n-button size="tiny" quaternary @click="goAlert(it)">提醒</n-button>
                   <n-button size="tiny" quaternary @click="goQa(it)">问答</n-button>
+                  <n-button size="tiny" quaternary @click="goThesis(it)">逻辑卡</n-button>
                   <n-button size="tiny" quaternary @click="buildPosition(it)">建仓</n-button>
                   <n-button size="tiny" quaternary @click="openEditItem(it)">编辑</n-button>
                   <n-popconfirm @positive-click="removeItem(it)">

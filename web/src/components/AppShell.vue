@@ -93,6 +93,7 @@ const menuOptions = computed<MenuOption[]>(() => [
     label: '更多',
     key: 'more-group',
     children: [
+      { label: navLink('/thesis', '投资逻辑卡'), key: 'thesis' },
       { label: navLink('/paper', '模拟交易'), key: 'paper' },
       { label: navLink('/alerts', '条件提醒'), key: 'alerts' },
       { label: navLink('/prompt-templates', '提示词模板'), key: 'prompts' },

@@ -37,6 +37,8 @@ function kindMeta(kind: string) {
       return { label: '短线持仓', color: vars.value.warningColor }
     case 'position_long':
       return { label: '长线持仓', color: flatColor.value }
+    case 'thesis_due':
+      return { label: '逻辑卡复盘', color: vars.value.infoColor }
     default:
       return { label: '待办', color: flatColor.value }
   }
@@ -53,6 +55,8 @@ function handle(item: TodoItem) {
     router.push({ name: 'recommendations' })
   } else if (item.ref_type === 'positions') {
     router.push({ name: 'positions' })
+  } else if (item.ref_type === 'thesis') {
+    router.push({ name: 'thesis' })
   }
 }
 

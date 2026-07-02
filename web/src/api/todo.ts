@@ -1,6 +1,6 @@
 import { request } from './client'
 
-export type TodoKind = 'alert' | 'rec_review' | 'position_short' | 'position_long'
+export type TodoKind = 'alert' | 'rec_review' | 'position_short' | 'position_long' | 'thesis_due'
 
 export interface TodoItem {
   kind: TodoKind
