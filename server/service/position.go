@@ -138,6 +138,32 @@ type PositionInput struct {
 	UserNote     string  `json:"user_note"`
 }
 
+// validCurrency 持仓币种枚举（DATABASE_DESIGN：CNY/USD/HKD）。
+var validCurrency = map[string]bool{"CNY": true, "USD": true, "HKD": true}
+
+// defaultCurrencyFor 按市场推导默认币种。
+func defaultCurrencyFor(market string) string {
+	switch market {
+	case "us":
+		return "USD"
+	case "hk":
+		return "HKD"
+	}
+	return "CNY"
+}
+
+// normalizeCurrency 归一并校验币种；空则按市场推导默认。
+func normalizeCurrency(currency, market string) (string, error) {
+	c := strings.ToUpper(strings.TrimSpace(currency))
+	if c == "" {
+		return defaultCurrencyFor(market), nil
+	}
+	if !validCurrency[c] {
+		return "", errors.New("币种须为 CNY / USD / HKD")
+	}
+	return c, nil
+}
+
 // validateBuy 校验买入核心字段。
 func validateBuy(in *PositionInput) error {
 	if in.BuyPrice <= 0 {
@@ -175,9 +201,9 @@ func (s *PositionService) Create(ctx context.Context, userID int64, in PositionI
 	} else if errors.Is(e, datasource.ErrSymbolInvalid) {
 		return nil, errors.New("无法识别的股票代码")
 	}
-	currency := strings.ToUpper(strings.TrimSpace(in.Currency))
-	if currency == "" {
-		currency = "CNY"
+	currency, err := normalizeCurrency(in.Currency, market)
+	if err != nil {
+		return nil, err
 	}
 	p := &model.Position{
 		UserID:       userID,
@@ -192,8 +218,8 @@ func (s *PositionService) Create(ctx context.Context, userID int64, in PositionI
 		Quantity:     in.Quantity,
 		BuyFee:       in.BuyFee,
 		BuyTax:       in.BuyTax,
-		BuyReason:    strings.TrimSpace(in.BuyReason),
-		UserNote:     strings.TrimSpace(in.UserNote),
+		BuyReason:    truncateRunes(strings.TrimSpace(in.BuyReason), 500),
+		UserNote:     truncateRunes(strings.TrimSpace(in.UserNote), 500),
 	}
 	if err := common.DB.Create(p).Error; err != nil {
 		return nil, err
@@ -202,10 +228,19 @@ func (s *PositionService) Create(ctx context.Context, userID int64, in PositionI
 }
 
 // Update 编辑持仓的买入信息与备注（仅本人；不在此改状态/卖出）。
+// 已平仓持仓的买入字段冻结（改动会直接改变已实现盈亏），仅允许改备注类字段。
 func (s *PositionService) Update(userID, id int64, in PositionInput) (*model.Position, error) {
 	var p model.Position
 	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&p).Error; err != nil {
 		return nil, errors.New("持仓不存在")
+	}
+	if p.Status == model.PositionStatusClosed {
+		p.BuyReason = truncateRunes(strings.TrimSpace(in.BuyReason), 500)
+		p.UserNote = truncateRunes(strings.TrimSpace(in.UserNote), 500)
+		if err := common.DB.Save(&p).Error; err != nil {
+			return nil, err
+		}
+		return &p, nil
 	}
 	if err := validateBuy(&in); err != nil {
 		return nil, err
@@ -216,10 +251,14 @@ func (s *PositionService) Update(userID, id int64, in PositionInput) (*model.Pos
 	p.Quantity = in.Quantity
 	p.BuyFee = in.BuyFee
 	p.BuyTax = in.BuyTax
-	p.BuyReason = strings.TrimSpace(in.BuyReason)
-	p.UserNote = strings.TrimSpace(in.UserNote)
-	if c := strings.ToUpper(strings.TrimSpace(in.Currency)); c != "" {
-		p.Currency = c
+	p.BuyReason = truncateRunes(strings.TrimSpace(in.BuyReason), 500)
+	p.UserNote = truncateRunes(strings.TrimSpace(in.UserNote), 500)
+	if c := strings.TrimSpace(in.Currency); c != "" {
+		currency, err := normalizeCurrency(c, p.Market)
+		if err != nil {
+			return nil, err
+		}
+		p.Currency = currency
 	}
 	if err := common.DB.Save(&p).Error; err != nil {
 		return nil, err
@@ -256,14 +295,17 @@ func (s *PositionService) Close(userID, id int64, in CloseInput) (*model.Positio
 		if _, err := time.Parse("2006-01-02", in.SellDate); err != nil {
 			return nil, errors.New("卖出日期格式应为 YYYY-MM-DD")
 		}
+		if p.BuyDate != "" && in.SellDate < p.BuyDate {
+			return nil, errors.New("卖出日期不能早于买入日期")
+		}
 	}
 	p.Status = model.PositionStatusClosed
 	p.SellPrice = in.SellPrice
 	p.SellDate = in.SellDate
 	p.SellFee = in.SellFee
 	p.SellTax = in.SellTax
-	p.SellReason = strings.TrimSpace(in.SellReason)
-	p.ReviewNote = strings.TrimSpace(in.ReviewNote)
+	p.SellReason = truncateRunes(strings.TrimSpace(in.SellReason), 500)
+	p.ReviewNote = truncateRunes(strings.TrimSpace(in.ReviewNote), 500)
 	if err := common.DB.Save(&p).Error; err != nil {
 		return nil, err
 	}

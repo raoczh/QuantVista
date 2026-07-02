@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"strings"
 	"time"
 
 	"quantvista/common"
@@ -29,6 +30,9 @@ const (
 	trackWindowDays = 90  // 只追踪近 90 天内生成的推荐，控制数据源调用量
 	trackBarLimit   = 250 // 拉取的日线条数（覆盖追踪窗口 + 缓冲）
 	benchBarLimit   = 250
+	// longRecReviewDays 长线推荐超过该交易日数提示复盘（时间型触发，与持仓
+	// longHoldReviewDays 同口径；财报/估值等数据型触发待外部数据源）。
+	longRecReviewDays = 60
 )
 
 // trackInput 追踪计算输入（纯函数，便于测试；bars 需按日期升序、且均为推荐日之后的日线）。
@@ -38,6 +42,7 @@ type trackInput struct {
 	StopLoss         float64 // 短线止损价（<=0 视为未设）
 	ValidDays        int     // 短线有效期（交易日；<=0 视为不过期）
 	IsShort          bool
+	ReviewAfterDays  int              // 长线：超过该交易日数提示复盘（<=0 不提示）
 	Bars             []datasource.Bar // 追踪期日线（升序）
 	ElapsedTradeDays int              // 从推荐日到今的已过交易日
 	BenchStart       float64          // 基准区间起点收盘（推荐日或其后首个交易日）
@@ -64,7 +69,8 @@ type trackResult struct {
 }
 
 // evaluateTracking 纯计算：给定基准价、止盈止损/有效期、升序日线与已过交易日，产出追踪结果。
-// 止盈/止损按当日 high/low 判断（避免漏判盘中触达），取最早触发者为主结局。
+// 止盈/止损按当日 high/low 判断（避免漏判盘中触达），取最早触发者为主结局；
+// 触发判定仅在有效期窗口内进行——过期后再触达价位不算止盈/止损（PRD 3.7 expired 为独立终态）。
 func evaluateTracking(in trackInput) trackResult {
 	var r trackResult
 	r.BarsCount = len(in.Bars)
@@ -76,7 +82,7 @@ func evaluateTracking(in trackInput) trackResult {
 	// 基本序列统计。
 	r.CurrentPrice = in.Bars[len(in.Bars)-1].Close
 	r.LastDate = in.Bars[len(in.Bars)-1].TradeDate
-	high, low := in.Bars[0].High, in.Bars[0].Low
+	high, low := in.Bars[0].High, 0.0
 	peak := in.RefPrice // 回撤相对追踪期内峰值（起点为 ref）
 	worstDD := 0.0      // 最负的 (low-peak)/peak
 	takeIdx, stopIdx := -1, -1
@@ -84,11 +90,12 @@ func evaluateTracking(in trackInput) trackResult {
 		if b.High > high {
 			high = b.High
 		}
-		if b.Low < low || low == 0 {
+		// Low<=0 视为坏数据（解析失败产 0），不参与低点/回撤/止损判定。
+		if b.Low > 0 && (low <= 0 || b.Low < low) {
 			low = b.Low
 		}
 		// 回撤：先用当日低点相对当前峰值，再用当日高点抬升峰值。
-		if peak > 0 {
+		if peak > 0 && b.Low > 0 {
 			if dd := (b.Low - peak) / peak; dd < worstDD {
 				worstDD = dd
 			}
@@ -96,12 +103,12 @@ func evaluateTracking(in trackInput) trackResult {
 		if b.High > peak {
 			peak = b.High
 		}
-		// 触发判定（仅短线且设了价位）。
-		if in.IsShort {
+		// 触发判定（仅短线、设了价位、且在有效期窗口内——bars[i] 为推荐日后第 i+1 个交易日）。
+		if in.IsShort && (in.ValidDays <= 0 || i < in.ValidDays) {
 			if in.TakeProfit > 0 && b.High >= in.TakeProfit && takeIdx < 0 {
 				takeIdx = i
 			}
-			if in.StopLoss > 0 && b.Low <= in.StopLoss && stopIdx < 0 {
+			if in.StopLoss > 0 && b.Low > 0 && b.Low <= in.StopLoss && stopIdx < 0 {
 				stopIdx = i
 			}
 		}
@@ -123,6 +130,10 @@ func evaluateTracking(in trackInput) trackResult {
 	// 结局。
 	if !in.IsShort {
 		r.Outcome = model.RecOutcomeTracking
+		// 长线时间型复盘触发：超过复盘周期提示复盘（PRD 3.8；财报/估值等数据型触发待外部源）。
+		if in.ReviewAfterDays > 0 && in.ElapsedTradeDays >= in.ReviewAfterDays {
+			r.ReviewNeeded = true
+		}
 		return r
 	}
 	r.HitTakeProfit = takeIdx >= 0
@@ -265,7 +276,8 @@ func (s *TrackingService) evaluateOne(ctx context.Context, batch model.Recommend
 	benchStart, benchEnd := benchRange(bench, recDate)
 	res := evaluateTracking(trackInput{
 		RefPrice: rec.RefPrice, TakeProfit: detail.TakeProfit, StopLoss: detail.StopLoss,
-		ValidDays: detail.ValidDays, IsShort: isShort, Bars: bars,
+		ValidDays: detail.ValidDays, IsShort: isShort, ReviewAfterDays: longRecReviewDays,
+		Bars:             bars,
 		ElapsedTradeDays: elapsed, BenchStart: benchStart, BenchEnd: benchEnd,
 	})
 
@@ -285,8 +297,13 @@ func (s *TrackingService) evaluateOne(ctx context.Context, batch model.Recommend
 	st.LastEvalDate = res.LastDate
 	if res.Outcome == model.RecOutcomeNoData {
 		st.Note = "暂无推荐日之后的日线数据，无法评估表现"
-	} else if !res.HasBench {
-		st.Note = benchUnavailableNote
+	} else {
+		// 无 corporate_actions 复权表，评估基于原始日线（PRD 3.9 要求复权，此为已知边界）。
+		notes := []string{nonAdjustedNote}
+		if !res.HasBench {
+			notes = append(notes, benchUnavailableNote)
+		}
+		st.Note = strings.Join(notes, "；")
 	}
 	return st
 }
@@ -392,6 +409,11 @@ type PerformanceStats struct {
 
 const benchUnavailableNote = "基准指数数据不可得，超额收益(alpha)按 0 计"
 
+// nonAdjustedNote 按 PRD 3.9 价格序列需处理除权除息；当前日线为前复权（东财 fqt=1，
+// 以最新价重锚），公司行为发生后历史序列会整体重刷，而 RefPrice/止盈止损是生成时点
+// 的快照价——两者可能错位，note 中如实标注。待复权因子表后彻底解决。
+const nonAdjustedNote = "基于前复权日线评估，除权除息后历史价格重锚，结果可能与生成时价位错位"
+
 // Performance 聚合某用户的推荐追踪表现（可按类型过滤）。样本仅计有价格数据（outcome != no_data）的条目。
 func (s *TrackingService) Performance(userID int64, recType string) (*PerformanceStats, error) {
 	if common.DB == nil {
@@ -420,7 +442,7 @@ func (s *TrackingService) Performance(userID int64, recType string) (*Performanc
 		if r.ReturnPct > 0 {
 			wins++
 		}
-		if r.Note != benchUnavailableNote { // 基准有效才计入 alpha 样本
+		if !strings.Contains(r.Note, benchUnavailableNote) { // 基准有效才计入 alpha 样本
 			stats.BenchSample++
 			sumAlpha += r.AlphaPct
 		}

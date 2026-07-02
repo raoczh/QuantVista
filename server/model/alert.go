@@ -18,7 +18,8 @@ const (
 )
 
 // AlertRule 用户设置的条件提醒规则。按 user_id 隔离。
-// 不做主动推送——命中仅落库并在待办/相关页面高亮提示（与阶段6 同一「查询即提示」理念）。
+// 命中落库并在待办/相关页面高亮提示；若用户配置了启用的推送通道且偏好
+// 「开启提醒」打开，则额外主动推送（阶段8-③，同日去重，见 service/alert.go）。
 type AlertRule struct {
 	ID     int64  `gorm:"primaryKey" json:"id"`
 	UserID int64  `gorm:"index:idx_alert_user" json:"user_id"`

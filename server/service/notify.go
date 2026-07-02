@@ -70,6 +70,15 @@ func (s *NotifyService) validate(in *NotifyChannelInput, requireTarget bool) err
 	return nil
 }
 
+// userNotifyEnabled 用户偏好「开启提醒」是否打开（推送总闸，见 Settings 页开关）。
+func userNotifyEnabled(userID int64) bool {
+	var pref model.UserPreference
+	if err := common.DB.Where("user_id = ?", userID).First(&pref).Error; err != nil {
+		return false
+	}
+	return pref.EnableNotify
+}
+
 // List 列出用户的推送通道（不含密文）。
 func (s *NotifyService) List(userID int64) ([]NotifyChannelView, error) {
 	var rows []model.NotifyChannel
@@ -106,6 +115,12 @@ func (s *NotifyService) Create(userID int64, in NotifyChannelInput) (*NotifyChan
 	}
 	if err := common.DB.Create(&ch).Error; err != nil {
 		return nil, err
+	}
+	// 新配置启用通道即视为明确的推送意愿，顺手打开偏好总闸
+	// （否则 enable_notify 默认 false，配好通道也收不到推送，易误判为故障）。
+	if ch.Enabled {
+		common.DB.Model(&model.UserPreference{}).Where("user_id = ?", userID).
+			Update("enable_notify", true)
 	}
 	v := toChannelView(ch)
 	return &v, nil
@@ -183,7 +198,10 @@ func (s *NotifyService) HasEnabledChannel(userID int64) bool {
 func (s *NotifyService) sendTo(ch model.NotifyChannel, title, content string) error {
 	target, err := common.Decrypt(ch.TargetCipher)
 	if err != nil || target == "" {
-		s.recordResult(ch.ID, errors.New("通道密钥缺失或解密失败"))
+		if err == nil {
+			err = errors.New("通道密钥缺失或解密失败")
+		}
+		s.recordResult(ch.ID, err)
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)

@@ -91,7 +91,9 @@ func (s *CompareService) Compare(ctx context.Context, userID int64, allowPrivate
 	if len(refs) < compareMinSymbols {
 		return nil, fmt.Errorf("请至少提供 %d 只有效股票进行对比", compareMinSymbols)
 	}
+	truncNote := ""
 	if len(refs) > compareMaxSymbols {
+		truncNote = fmt.Sprintf("最多同时对比 %d 只，已忽略多余标的；", compareMaxSymbols)
 		refs = refs[:compareMaxSymbols]
 	}
 
@@ -110,14 +112,14 @@ func (s *CompareService) Compare(ctx context.Context, userID int64, allowPrivate
 	}
 	wg.Wait()
 
-	res := &CompareResult{Rows: rows}
+	res := &CompareResult{Rows: rows, Note: truncNote}
 
 	// 可选 AI 一句话点评。
 	if req.WithAI {
 		comment, note := s.aiComment(ctx, userID, allowPrivate, req.LLMConfigID, rows)
 		res.AIComment = comment
 		if note != "" {
-			res.Note = note
+			res.Note = truncNote + note
 		}
 	}
 	return res, nil
@@ -197,7 +199,11 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 		return "", "AI 点评不可用：" + err.Error()
 	}
 	quota, err := s.getQuota(userID)
-	if err == nil && quota.TokenLimit > 0 && quota.TokenUsed >= quota.TokenLimit {
+	if err != nil {
+		// 与 analysis/qa/recommendation 一致 fail-closed：配额读不到时不放行调用。
+		return "", "AI 点评不可用：配额信息读取失败"
+	}
+	if quota.TokenLimit > 0 && quota.TokenUsed >= quota.TokenLimit {
 		return "", "AI 配额已用尽，仅展示指标对比"
 	}
 

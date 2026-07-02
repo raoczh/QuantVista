@@ -15,8 +15,11 @@ const (
 // RecommendationStatus 推荐追踪状态（与 Recommendation 一一对应，recommendation_id 唯一）。
 //
 // 设计要点：
-//   - 价格序列复用 daily_bars（原始不复权；本项目暂无 corporate_actions 复权表，短周期影响有限，note 中如实标注）。
-//   - 止盈/止损按当日 high/low 判断（避免只看收盘漏判盘中触达），取最早触发者为主结局。
+//   - 价格序列复用 daily_bars（主源东财为前复权 fqt=1，以最新价重锚：除权除息后历史
+//     整段重刷，与生成时点的 RefPrice/止盈止损快照价可能错位，note 中如实标注；
+//     彻底解决待 corporate_actions 复权因子表）。
+//   - 止盈/止损按当日 high/low 判断（避免只看收盘漏判盘中触达），取最早触发者为主结局；
+//     触发判定仅在有效期窗口内进行，过期后触达不改写结局。
 //   - 有效期按 trading_calendar 交易日计算，而非自然日。
 //   - 相对基准超额收益 alpha = 区间收益 - 基准（上证指数）同区间收益；基准不可得时 alpha 记 0 并在 note 说明。
 //   - 定时后台任务刷新；亦可按用户手动触发。冗余 type/action 便于历史表现统计聚合。

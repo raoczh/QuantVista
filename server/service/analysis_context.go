@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"quantvista/datasource"
 	"quantvista/model"
@@ -25,22 +26,32 @@ type analysisContext struct {
 	Snapshot map[string]any // 结构化数据快照
 }
 
-// buildContext 按模块采集数据上下文。
+// buildContext 按模块采集数据上下文。快照统一带 data_as_of（采集时刻），
+// 供 prompt 声明数据时间、避免模型把旧数据当实时数据（PRD 3.5/3.13）。
 func (s *AnalysisService) buildContext(ctx context.Context, userID int64, req AnalyzeRequest) (*analysisContext, error) {
+	var ac *analysisContext
+	var err error
 	switch req.Module {
 	case model.AnalysisModuleStock:
-		return s.buildStockContext(ctx, req.Market, req.Symbol)
+		ac, err = s.buildStockContext(ctx, req.Market, req.Symbol)
 	case model.AnalysisModuleMarket:
-		return s.buildMarketContext(ctx, req.Market)
+		ac, err = s.buildMarketContext(ctx, req.Market)
 	case model.AnalysisModuleSector:
-		return s.buildSectorContext(ctx, req.Market, req.Target)
+		ac, err = s.buildSectorContext(ctx, req.Market, req.Target)
 	case model.AnalysisModuleWatchlist:
-		return s.buildWatchlistContext(ctx, userID, req.Market)
+		ac, err = s.buildWatchlistContext(ctx, userID, req.Market)
 	case model.AnalysisModulePosition:
-		return s.buildPositionContext(ctx, userID)
+		ac, err = s.buildPositionContext(ctx, userID)
 	default:
 		return nil, errors.New("不支持的分析模块")
 	}
+	if err != nil {
+		return nil, err
+	}
+	if ac.Snapshot != nil {
+		ac.Snapshot["data_as_of"] = time.Now().In(time.Local).Format("2006-01-02 15:04:05")
+	}
+	return ac, nil
 }
 
 // --- 个股 ---
@@ -109,16 +120,6 @@ func computeTechnicals(bars []datasource.Bar) map[string]any {
 		closes[i] = b.Close
 	}
 	last := closes[n-1]
-	ma := func(w int) float64 {
-		if n < w {
-			return 0
-		}
-		sum := 0.0
-		for _, c := range closes[n-w:] {
-			sum += c
-		}
-		return round2(sum / float64(w))
-	}
 	// 区间高低与阶段涨跌。
 	hi, lo := bars[0].High, bars[0].Low
 	for _, b := range bars {
@@ -139,16 +140,27 @@ func computeTechnicals(bars []datasource.Bar) map[string]any {
 		}
 		return round2((last - prev) / prev * 100)
 	}
-	return map[string]any{
-		"ma5":            ma(5),
-		"ma10":           ma(10),
-		"ma20":           ma(20),
+	tech := map[string]any{
 		"period_high":    round2(hi),
 		"period_low":     round2(lo),
 		"change_pct_5d":  changeOver(5),
 		"change_pct_20d": changeOver(20),
 		"bar_count":      n,
 	}
+	// 均线：数据不足时省略该键而非注入 0——0 会被模型当成真实均价得出
+	// 「现价远高于 MA20」类幻觉结论。
+	for _, w := range []int{5, 10, 20} {
+		if n < w {
+			tech["ma_note"] = "日线不足，部分均线缺失"
+			continue
+		}
+		sum := 0.0
+		for _, c := range closes[n-w:] {
+			sum += c
+		}
+		tech[fmt.Sprintf("ma%d", w)] = round2(sum / float64(w))
+	}
+	return tech
 }
 
 // compactBars 取末尾 keep 根日线的精简字段（date/o/h/l/c/vol）。
@@ -216,13 +228,18 @@ func (s *AnalysisService) buildSectorContext(ctx context.Context, market, target
 // --- 自选股 ---
 
 func (s *AnalysisService) buildWatchlistContext(ctx context.Context, userID int64, market string) (*analysisContext, error) {
+	market = normalizeMarketOnly(market)
 	groups, err := s.watchlist.List(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
 	items := make([]map[string]any, 0, 40)
+outer:
 	for _, g := range groups {
 		for _, it := range g.Items {
+			if it.Market != market {
+				continue // 记录声明了 market，快照按同口径过滤
+			}
 			row := map[string]any{
 				"group":     g.Name,
 				"name":      it.Name,
@@ -242,7 +259,7 @@ func (s *AnalysisService) buildWatchlistContext(ctx context.Context, userID int6
 			}
 			items = append(items, row)
 			if len(items) >= 60 {
-				break
+				break outer
 			}
 		}
 	}

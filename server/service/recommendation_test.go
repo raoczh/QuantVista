@@ -22,7 +22,7 @@ func TestParseAndFilterPicks_DropsFabricated(t *testing.T) {
 		{"symbol":"999999","action":"buy","confidence":90,"reason":["编造的票"]},
 		{"symbol":"000001","action":"watch","confidence":55,"reason":["观察"]}
 	]}`
-	picks, err := parseAndFilterPicks(content, pool)
+	picks, err := parseAndFilterPicks(content, pool, 5)
 	if err != nil {
 		t.Fatalf("期望成功: %v", err)
 	}
@@ -40,7 +40,7 @@ func TestParseAndFilterPicks_DropsFabricated(t *testing.T) {
 func TestParseAndFilterPicks_AllFabricated(t *testing.T) {
 	pool := testPool()
 	content := `{"picks":[{"symbol":"AAAAAA","action":"buy","confidence":80}]}`
-	if _, err := parseAndFilterPicks(content, pool); err == nil {
+	if _, err := parseAndFilterPicks(content, pool, 5); err == nil {
 		t.Fatalf("全部越池时应返回错误")
 	}
 }
@@ -52,7 +52,7 @@ func TestParseAndFilterPicks_Dedup(t *testing.T) {
 		{"symbol":"600000","action":"buy","confidence":70},
 		{"symbol":"600000","action":"watch","confidence":40}
 	]}`
-	picks, err := parseAndFilterPicks(content, pool)
+	picks, err := parseAndFilterPicks(content, pool, 5)
 	if err != nil {
 		t.Fatalf("期望成功: %v", err)
 	}
@@ -61,7 +61,53 @@ func TestParseAndFilterPicks_Dedup(t *testing.T) {
 	}
 }
 
-// TestNormalizePick_Clamps action/confidence/负价 归一。
+// TestParseAndFilterPicks_CountCap 输出条数不得超过用户请求的 count（PRD 3.6）。
+func TestParseAndFilterPicks_CountCap(t *testing.T) {
+	pool := map[string]candidate{
+		"600000": {Symbol: "600000", Name: "浦发银行", Price: 8.5},
+		"000001": {Symbol: "000001", Name: "平安银行", Price: 11.2},
+		"600036": {Symbol: "600036", Name: "招商银行", Price: 35},
+		"601318": {Symbol: "601318", Name: "中国平安", Price: 50},
+	}
+	content := `{"picks":[
+		{"symbol":"600000","action":"buy","confidence":70},
+		{"symbol":"000001","action":"buy","confidence":65},
+		{"symbol":"600036","action":"buy","confidence":60},
+		{"symbol":"601318","action":"buy","confidence":55}
+	]}`
+	picks, err := parseAndFilterPicks(content, pool, 3)
+	if err != nil {
+		t.Fatalf("期望成功: %v", err)
+	}
+	if len(picks) != 3 {
+		t.Fatalf("用户请求 3 条时应截断到 3，得到 %d", len(picks))
+	}
+}
+
+// TestCandidateEligible PRD 3.6 前置筛选：ST/退市/停牌/流动性不足剔除。
+func TestCandidateEligible(t *testing.T) {
+	cases := []struct {
+		name string
+		c    candidate
+		want bool
+	}{
+		{"正常标的", candidate{Symbol: "600000", Name: "浦发银行", Price: 8.5}, true},
+		{"带成交额的活跃标的", candidate{Symbol: "600036", Name: "招商银行", Price: 35, Amount: 5e9}, true},
+		{"ST 股剔除", candidate{Symbol: "600001", Name: "ST某某", Price: 3.2}, false},
+		{"*ST 股剔除", candidate{Symbol: "600002", Name: "*ST某某", Price: 1.5}, false},
+		{"退市整理剔除", candidate{Symbol: "600003", Name: "某某退", Price: 0.8}, false},
+		{"停牌/无行情剔除", candidate{Symbol: "600004", Name: "某某股份", Price: 0}, false},
+		{"流动性不足剔除", candidate{Symbol: "600005", Name: "某某股份", Price: 5, Amount: 3e7}, false},
+		{"无成交额数据不按流动性剔除", candidate{Symbol: "600006", Name: "某某股份", Price: 5}, true},
+	}
+	for _, tc := range cases {
+		if got := candidateEligible(tc.c); got != tc.want {
+			t.Errorf("%s: candidateEligible=%v, 期望 %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestNormalizePick_Clamps action/confidence/负价 归一；无效价位组合被清零（不驱动追踪）。
 func TestNormalizePick_Clamps(t *testing.T) {
 	p := normalizePick(recPick{
 		Action: "STRONG_BUY", Confidence: 130, StopLoss: -5, TakeProfit: 12.345,
@@ -75,14 +121,45 @@ func TestNormalizePick_Clamps(t *testing.T) {
 	if p.StopLoss != 0 {
 		t.Fatalf("负价应归零，得到 %v", p.StopLoss)
 	}
-	if p.TakeProfit != 12.35 && p.TakeProfit != 12.34 {
-		t.Fatalf("价格应两位小数，得到 %v", p.TakeProfit)
+	if p.TakeProfit != 0 {
+		t.Fatalf("价位组合无效（缺买入区间/止损）时应整体清零，得到 %v", p.TakeProfit)
 	}
 	if p.Disclaimer == "" {
 		t.Fatalf("空 disclaimer 应回退默认")
 	}
 	if p.Reason == nil || p.Risks == nil || p.Evidence == nil || p.KeyMetrics == nil {
 		t.Fatalf("数组字段应兜底非 nil")
+	}
+}
+
+// TestNormalizePick_ValidShortPlan 合法短线计划保留价位并 round2。
+func TestNormalizePick_ValidShortPlan(t *testing.T) {
+	p := normalizePick(recPick{
+		Action: "buy", Confidence: 70,
+		BuyZoneLow: 9.8, BuyZoneHigh: 10.2, TakeProfit: 11.555, StopLoss: 9.2, ValidDays: 5,
+	}, "600000", candidate{Price: 10})
+	if p.Action != model.RecActionBuy {
+		t.Fatalf("合法计划不应降级，得到 %s", p.Action)
+	}
+	if p.TakeProfit != 11.56 && p.TakeProfit != 11.55 {
+		t.Fatalf("价格应两位小数，得到 %v", p.TakeProfit)
+	}
+	if p.StopLoss != 9.2 {
+		t.Fatalf("止损应保留，得到 %v", p.StopLoss)
+	}
+}
+
+// TestNormalizePick_DetachedPlan 价位次序合法但整体悬空于现价之外 → 降级并清零。
+func TestNormalizePick_DetachedPlan(t *testing.T) {
+	p := normalizePick(recPick{
+		Action: "buy", Confidence: 60,
+		BuyZoneLow: 12.5, BuyZoneHigh: 13, TakeProfit: 15, StopLoss: 12, ValidDays: 5,
+	}, "600000", candidate{Price: 10}) // 现价 10 < 止损 12：悬空计划
+	if p.Action != model.RecActionWatch {
+		t.Fatalf("悬空计划应降级为观察，得到 %s", p.Action)
+	}
+	if p.TakeProfit != 0 || p.StopLoss != 0 {
+		t.Fatalf("悬空计划价位应清零（否则追踪首日即误报止损），得到 TP=%v SL=%v", p.TakeProfit, p.StopLoss)
 	}
 }
 

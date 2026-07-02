@@ -123,6 +123,68 @@ func TestEvaluateTracking_NoData(t *testing.T) {
 	}
 }
 
+// TestEvaluateTracking_ExpiredThenHit 有效期过后才触达止盈价 → 结局应为过期，
+// 不得记为止盈（触发窗口受 ValidDays 约束，PRD 3.7 expired 为独立终态）。
+func TestEvaluateTracking_ExpiredThenHit(t *testing.T) {
+	r := evaluateTracking(trackInput{
+		RefPrice: 10, TakeProfit: 12, StopLoss: 8, ValidDays: 2, IsShort: true,
+		Bars: []datasource.Bar{
+			bar("2026-06-02", 10, 10.3, 9.9, 10.1),  // 窗口内第 1 日：未触发
+			bar("2026-06-03", 10.1, 10.4, 10, 10.2), // 窗口内第 2 日：未触发
+			bar("2026-06-10", 11, 12.5, 11, 12.2),   // 已过有效期后才碰到止盈价
+		},
+		ElapsedTradeDays: 6,
+	})
+	if r.Outcome != model.RecOutcomeExpired {
+		t.Fatalf("有效期后触达不应记止盈，应过期: %+v", r)
+	}
+	if r.HitTakeProfit {
+		t.Fatalf("有效期外的触达不应置 HitTakeProfit: %+v", r)
+	}
+}
+
+// TestEvaluateTracking_BadLowBar Low=0 的坏行不得误报止损，也不得算出 ~100% 回撤。
+func TestEvaluateTracking_BadLowBar(t *testing.T) {
+	r := evaluateTracking(trackInput{
+		RefPrice: 10, TakeProfit: 20, StopLoss: 9, ValidDays: 5, IsShort: true,
+		Bars: []datasource.Bar{
+			bar("2026-06-02", 10, 10.3, 0, 10.1), // 坏行：Low=0（解析失败）
+			bar("2026-06-03", 10.1, 10.4, 9.9, 10.2),
+		},
+		ElapsedTradeDays: 2,
+	})
+	if r.Outcome != model.RecOutcomeActive || r.HitStopLoss {
+		t.Fatalf("Low=0 坏行不应触发止损: %+v", r)
+	}
+	if r.PeriodLow != 9.9 {
+		t.Fatalf("区间低点应忽略坏行取 9.9，得到 %v", r.PeriodLow)
+	}
+	if r.MaxDrawdownPct > 5 {
+		t.Fatalf("坏行不应产生虚假深回撤，得到 %v%%", r.MaxDrawdownPct)
+	}
+}
+
+// TestEvaluateTracking_LongReview 长线超过复盘周期 → ReviewNeeded=true（时间型触发）。
+func TestEvaluateTracking_LongReview(t *testing.T) {
+	r := evaluateTracking(trackInput{
+		RefPrice: 10, IsShort: false, ReviewAfterDays: 60,
+		Bars:             []datasource.Bar{bar("2026-06-02", 10, 11, 10, 10.8)},
+		ElapsedTradeDays: 61,
+	})
+	if r.Outcome != model.RecOutcomeTracking || !r.ReviewNeeded {
+		t.Fatalf("长线超复盘周期应提示复盘: %+v", r)
+	}
+	// 未到周期不提示。
+	r2 := evaluateTracking(trackInput{
+		RefPrice: 10, IsShort: false, ReviewAfterDays: 60,
+		Bars:             []datasource.Bar{bar("2026-06-02", 10, 11, 10, 10.8)},
+		ElapsedTradeDays: 30,
+	})
+	if r2.ReviewNeeded {
+		t.Fatalf("未到复盘周期不应提示: %+v", r2)
+	}
+}
+
 // TestEvaluateTracking_Long 长线不做价格触发，结局为 tracking，但仍算收益/alpha。
 func TestEvaluateTracking_Long(t *testing.T) {
 	r := evaluateTracking(trackInput{

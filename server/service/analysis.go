@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 
 	"quantvista/common"
@@ -12,6 +14,24 @@ import (
 
 	"gorm.io/gorm"
 )
+
+// FlexInt 容忍模型把整数字段输出成小数或带引号字符串（如 "confidence": 72.5 / "80"），
+// 解析时四舍五入归一为整数，序列化仍输出普通数字（前端契约不变）。
+type FlexInt int
+
+func (f *FlexInt) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(b)), `"`)
+	if s == "" || s == "null" {
+		*f = 0
+		return nil
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return fmt.Errorf("期望数字，得到 %s", s)
+	}
+	*f = FlexInt(math.Round(v))
+	return nil
+}
 
 // AnalysisService AI 分析编排：加载 LLM 配置 → 配额熔断 → 组装数据上下文 →
 // 构造 prompt → 调用 LLM（JSON mode 优先）→ 结构化校验 + 有限次 repair → 优雅降级 → 落库历史 + 扣配额。
@@ -54,7 +74,7 @@ type AnalyzeRequest struct {
 // AnalysisResult 结构化分析结果（要求 LLM 严格按此 schema 输出 JSON）。
 type AnalysisResult struct {
 	Rating        string   `json:"rating"`        // bullish / neutral / bearish
-	Confidence    int      `json:"confidence"`    // 0-100
+	Confidence    FlexInt  `json:"confidence"`    // 0-100（容忍模型输出小数/字符串）
 	Summary       string   `json:"summary"`       // 一句话总览
 	Highlights    []string `json:"highlights"`    // 关键要点
 	Risks         []string `json:"risks"`         // 风险
@@ -104,6 +124,12 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 
 	// 4) 构造消息并调用 + 结构化校验/repair。
 	messages := s.buildMessages(userID, req, actx, string(snapshotJSON))
+	promptVersion := analysisPromptVersion
+	if userPromptOverride(userID, req.Module) != "" {
+		// 标记本次使用了用户自定义模板——否则历史记录声称 p1 却无法按 p1 复现。
+		// （模板内容可被用户随后编辑，完整快照留待 ai_call_logs，当前仅标记。）
+		promptVersion = analysisPromptVersion + "-custom"
+	}
 	rec := &model.AnalysisRecord{
 		UserID:          userID,
 		Module:          req.Module,
@@ -114,7 +140,7 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 		LLMConfigID:     cfg.ID,
 		Provider:        cfg.Provider,
 		Model:           cfg.Model,
-		PromptVersion:   analysisPromptVersion,
+		PromptVersion:   promptVersion,
 		StrategyVersion: analysisStrategyVersion,
 		DataSnapshot:    string(snapshotJSON),
 	}
@@ -143,7 +169,7 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	case result != nil:
 		rec.Status = model.AnalysisStatusSuccess
 		rec.Rating = result.Rating
-		rec.Confidence = result.Confidence
+		rec.Confidence = int(result.Confidence)
 		rec.Summary = truncateRunes(result.Summary, 1024)
 		b, _ := json.Marshal(result)
 		rec.ResultJSON = string(b)
@@ -313,7 +339,9 @@ func (s *AnalysisService) buildMessages(userID int64, req AnalyzeRequest, actx *
 	}
 	b.WriteString("【数据】（JSON，数值为近似值，价格为货币单位，金额单位为元）：\n")
 	b.WriteString(snapshotJSON)
-	b.WriteString("\n\n请严格按系统要求的 JSON schema 输出，只依据以上数据分析。")
+	b.WriteString("\n\n数据时间：以快照内 data_as_of 为采集时刻、各字段 data_time/trade_date（如有）为准；" +
+		"非交易时段采集的数据反映最近一个交易日，不代表实时状态，分析措辞须体现这一点。")
+	b.WriteString("\n请严格按系统要求的 JSON schema 输出，只依据以上数据分析。")
 
 	return []chatMessage{
 		{Role: "system", Content: analysisSystemPrompt(userID, req.Module)},
@@ -449,18 +477,27 @@ func normalizeRating(s string) string {
 }
 
 // extractJSONObject 从文本里抽出第一个平衡的 JSON 对象（容忍 ```json 包裹与前后噪声）。
+// 先尝试围栏内提取（fallback 模式下模型常用围栏包裹），围栏内无合法对象再回退
+// 全文扫描——避免「JSON 出现在 ``` 之前」时把正文误吞。
 func extractJSONObject(s string) string {
 	s = strings.TrimSpace(s)
-	// 去掉代码块围栏。
 	if i := strings.Index(s, "```"); i >= 0 {
-		s = s[i+3:]
-		if j := strings.Index(s, "\n"); j >= 0 && strings.HasPrefix(strings.ToLower(strings.TrimSpace(s[:j])), "json") {
-			s = s[j+1:]
+		inner := s[i+3:]
+		if j := strings.Index(inner, "\n"); j >= 0 && strings.HasPrefix(strings.ToLower(strings.TrimSpace(inner[:j])), "json") {
+			inner = inner[j+1:]
 		}
-		if k := strings.LastIndex(s, "```"); k >= 0 {
-			s = s[:k]
+		if k := strings.Index(inner, "```"); k >= 0 {
+			inner = inner[:k]
+		}
+		if obj := scanBalancedObject(inner); obj != "" && json.Valid([]byte(obj)) {
+			return obj
 		}
 	}
+	return scanBalancedObject(s)
+}
+
+// scanBalancedObject 返回 s 中第一个花括号平衡的对象子串（字符串字面量内的花括号不计）。
+func scanBalancedObject(s string) string {
 	start := strings.Index(s, "{")
 	if start < 0 {
 		return ""

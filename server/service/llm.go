@@ -100,11 +100,18 @@ func (s *LLMService) Create(userID int64, in LLMConfigInput) (*LLMConfigView, er
 		Stream:       in.Stream,
 		IsDefault:    in.IsDefault,
 	}
-	if err := common.DB.Create(&cfg).Error; err != nil {
+	// 设默认与清其他默认同一事务：中途失败不残留双默认。
+	err = common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&cfg).Error; err != nil {
+			return err
+		}
+		if cfg.IsDefault {
+			return clearOtherDefaultsTx(tx, userID, cfg.ID)
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
-	}
-	if cfg.IsDefault {
-		s.clearOtherDefaults(userID, cfg.ID)
 	}
 	v := toView(cfg)
 	return &v, nil
@@ -134,11 +141,17 @@ func (s *LLMService) Update(userID, id int64, in LLMConfigInput) (*LLMConfigView
 		}
 		cfg.APIKeyCipher = cipher
 	}
-	if err := common.DB.Save(cfg).Error; err != nil {
+	err = common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(cfg).Error; err != nil {
+			return err
+		}
+		if cfg.IsDefault {
+			return clearOtherDefaultsTx(tx, userID, cfg.ID)
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
-	}
-	if cfg.IsDefault {
-		s.clearOtherDefaults(userID, cfg.ID)
 	}
 	v := toView(*cfg)
 	return &v, nil
@@ -302,8 +315,9 @@ func (s *LLMService) ResolveForUse(userID, id int64) (*model.LLMConfig, string, 
 	return &cfg, key, nil
 }
 
-func (s *LLMService) clearOtherDefaults(userID, keepID int64) {
-	common.DB.Model(&model.LLMConfig{}).
+// clearOtherDefaultsTx 事务内把该用户其余配置的 is_default 清掉（与设默认原子执行）。
+func clearOtherDefaultsTx(tx *gorm.DB, userID, keepID int64) error {
+	return tx.Model(&model.LLMConfig{}).
 		Where("user_id = ? AND id <> ?", userID, keepID).
-		Update("is_default", false)
+		Update("is_default", false).Error
 }
