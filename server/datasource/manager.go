@@ -49,7 +49,8 @@ func (m *Manager) GetQuote(ctx context.Context, market, symbol string) (*Quote, 
 	return nil, lastErr
 }
 
-// GetDailyBars 依次尝试支持日线的源（新浪返回 ErrNotSupported 时回退东财）。
+// GetDailyBars 依次尝试支持日线的源：东财在前（fqt=1 前复权），腾讯不支持日线
+// 返回 ErrNotSupported 被跳过，新浪殿后兜底（无复权参数、无成交额）。
 func (m *Manager) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]Bar, error) {
 	var lastErr error
 	for _, a := range m.adapters {

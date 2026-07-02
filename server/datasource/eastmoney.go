@@ -21,7 +21,7 @@ func (e *EastMoneyAdapter) Name() string { return "eastmoney" }
 
 // 东财行情字段（部分需 /100 还原）：
 // f43 现价, f44 最高, f45 最低, f46 今开, f47 成交量(手), f48 成交额,
-// f58 名称, f60 昨收, f170 涨跌幅(%), f169 涨跌额。
+// f58 名称, f60 昨收, f86 行情时间(unix 秒), f170 涨跌幅(%), f169 涨跌额。
 type emQuoteResp struct {
 	Data map[string]json.RawMessage `json:"data"`
 }
@@ -57,7 +57,7 @@ func (e *EastMoneyAdapter) GetQuote(ctx context.Context, market, symbol string) 
 	}
 
 	url := fmt.Sprintf(
-		"https://%d.push2.eastmoney.com/api/qt/stock/get?secid=%s&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60,f169,f170&invt=2&fltt=2",
+		"https://%d.push2.eastmoney.com/api/qt/stock/get?secid=%s&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60,f86,f169,f170&invt=2&fltt=2",
 		emNode(), secid,
 	)
 	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
@@ -92,6 +92,12 @@ func (e *EastMoneyAdapter) GetQuote(ctx context.Context, market, symbol string) 
 	amount, _ := emNum(d["f48"])
 	prevClose, _ := emNum(d["f60"])
 	changePct, _ := emNum(d["f170"])
+	// f86 为行情时间戳（unix 秒）。types.go 契约要求数据时间随数据透传——
+	// 休市时段取到的旧价若打上「现在」的时间戳，会被 AI 上下文当成实时价。
+	dataTime := time.Now()
+	if ts, ok := emNum(d["f86"]); ok && ts > 0 {
+		dataTime = time.Unix(int64(ts), 0)
+	}
 
 	return &Quote{
 		Symbol:    symbol,
@@ -106,7 +112,7 @@ func (e *EastMoneyAdapter) GetQuote(ctx context.Context, market, symbol string) 
 		Volume:    int64(vol),
 		Amount:    amount,
 		Source:    e.Name(),
-		DataTime:  time.Now(),
+		DataTime:  dataTime,
 	}, nil
 }
 
