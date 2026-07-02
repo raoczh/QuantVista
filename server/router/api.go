@@ -26,6 +26,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	trackingSvc := service.NewTrackingService(marketSvc)
 	alertSvc := service.NewAlertService(marketSvc)
 	thesisSvc := service.NewThesisService(marketSvc)
+	noteSvc := service.NewNoteService(marketSvc)
 	todoSvc := service.NewTodoService(alertSvc, positionSvc, thesisSvc)
 	qaSvc := service.NewQaService(marketSvc, llmSvc)
 	compareSvc := service.NewCompareService(marketSvc, llmSvc)
@@ -53,6 +54,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	notifyCtl := controller.NewNotifyController(notifySvc)
 	promptCtl := controller.NewPromptController(promptSvc)
 	thesisCtl := controller.NewThesisController(thesisSvc)
+	noteCtl := controller.NewNoteController(noteSvc)
 
 	api := r.Group("/api")
 	{
@@ -183,6 +185,15 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				thesis.POST("", thesisCtl.Upsert)
 				thesis.PUT("/:id/status", thesisCtl.SetStatus)
 				thesis.DELETE("/:id", thesisCtl.Delete)
+			}
+
+			// 投资笔记/决策日志（自由笔记，可选绑定标的形成个股时间线）
+			notes := authed.Group("/notes")
+			{
+				notes.GET("", noteCtl.List)
+				notes.POST("", noteCtl.Create)
+				notes.PUT("/:id", noteCtl.Update)
+				notes.DELETE("/:id", noteCtl.Delete)
 			}
 
 			// 个股 AI 问答（多轮，复用数据快照；走 LLM，限流控成本）
