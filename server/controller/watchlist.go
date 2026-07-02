@@ -131,6 +131,38 @@ func (wc *WatchlistController) DeleteItem(c *gin.Context) {
 	common.ApiSuccess(c, gin.H{"ok": true})
 }
 
+// SetItemStage PUT /api/watchlist-items/:id/stage —— 机会池漏斗阶段流转。
+func (wc *WatchlistController) SetItemStage(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	var body struct {
+		Stage  string `json:"stage"`
+		Reason string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		common.ApiErrorMsg(c, "请求格式错误")
+		return
+	}
+	item, err := wc.svc.SetItemStage(c.Request.Context(), currentUserID(c), id, body.Stage, body.Reason)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, item)
+}
+
+// Missed GET /api/watchlist-items/missed —— 错过机会复盘（已放弃标的 vs 现价）。
+func (wc *WatchlistController) Missed(c *gin.Context) {
+	rows, err := wc.svc.MissedOpportunities(c.Request.Context(), currentUserID(c))
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, rows)
+}
+
 // parseIDParam 解析并校验路径 :param 为正整数 ID，失败时直接写错误响应并返回 false。
 func parseIDParam(c *gin.Context, name string) (int64, bool) {
 	id, err := strconv.ParseInt(c.Param(name), 10, 64)

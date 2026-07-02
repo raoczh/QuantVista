@@ -15,6 +15,20 @@ type Watchlist struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// 机会池漏斗阶段：自选条目的研究进度（空 = 未标注，兼容旧数据）。
+// 漏斗：发现 → 初筛 → 重点观察 → 等待价格 → 已生成计划 → 已买入；
+// 任一阶段可转 已放弃（记录当时价格与原因，供「错过机会」复盘）/ 已复盘。
+const (
+	StageDiscovered   = "discovered"
+	StageScreening    = "screening"
+	StageWatching     = "watching"
+	StageWaitingPrice = "waiting_price"
+	StagePlanned      = "planned"
+	StageBought       = "bought"
+	StagePassed       = "passed"
+	StageReviewed     = "reviewed"
+)
+
 // WatchlistItem 自选股条目。唯一约束 user_id+watchlist_id+symbol+market，避免同组重复添加。
 type WatchlistItem struct {
 	ID          int64     `gorm:"primaryKey" json:"id"`
@@ -26,8 +40,14 @@ type WatchlistItem struct {
 	Note        string    `gorm:"size:512" json:"note"`           // 备注
 	FocusReason string    `gorm:"size:512" json:"focus_reason"`   // 关注原因
 	IsPinned    bool      `gorm:"default:false" json:"is_pinned"` // 重点关注
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+
+	ResearchStage string     `gorm:"size:16;index:idx_wli_stage" json:"research_stage"` // 机会池漏斗阶段
+	PassedReason  string     `gorm:"size:255" json:"passed_reason"`                     // 放弃原因（stage=passed）
+	PassedPrice   float64    `gorm:"type:decimal(20,4)" json:"passed_price"`            // 放弃时价格（错过机会复盘基准）
+	StageAt       *time.Time `json:"stage_at"`                                          // 阶段变更时间
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // 持仓类型与状态。

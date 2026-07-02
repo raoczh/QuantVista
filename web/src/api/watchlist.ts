@@ -1,5 +1,16 @@
 import { request } from './client'
 
+export type ResearchStage =
+  | ''
+  | 'discovered'
+  | 'screening'
+  | 'watching'
+  | 'waiting_price'
+  | 'planned'
+  | 'bought'
+  | 'passed'
+  | 'reviewed'
+
 export interface WatchlistItem {
   id: number
   user_id: number
@@ -10,11 +21,21 @@ export interface WatchlistItem {
   note: string
   focus_reason: string
   is_pinned: boolean
+  research_stage: ResearchStage
+  passed_reason: string
+  passed_price: number
+  stage_at: string | null
   // 富化字段
   price: number
   change_pct: number
   quote_ok: boolean
   data_time: string
+}
+
+export interface MissedOpportunity extends WatchlistItem {
+  current_price: number
+  change_since_pct: number
+  verdict: 'missed_gain' | 'avoided_loss' | 'neutral' | 'no_base'
 }
 
 export interface WatchlistGroup {
@@ -73,4 +94,16 @@ export function updateItem(itemId: number, input: WatchlistItemInput) {
 
 export function deleteItem(itemId: number) {
   return request<{ ok: boolean }>({ url: `/watchlist-items/${itemId}`, method: 'delete' })
+}
+
+export function setItemStage(itemId: number, stage: ResearchStage, reason = '') {
+  return request<WatchlistItem>({
+    url: `/watchlist-items/${itemId}/stage`,
+    method: 'put',
+    data: { stage, reason },
+  })
+}
+
+export function listMissed() {
+  return request<MissedOpportunity[]>({ url: '/watchlist-items/missed' })
 }
