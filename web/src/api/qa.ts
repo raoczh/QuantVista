@@ -1,4 +1,4 @@
-import { request } from './client'
+import { request, AI_TIMEOUT } from './client'
 
 export interface QaMessage {
   id: number
@@ -36,7 +36,7 @@ export interface QaAskRequest {
 }
 
 export function askQa(req: QaAskRequest) {
-  return request<QaConversationView>({ url: '/qa/ask', method: 'post', data: req })
+  return request<QaConversationView>({ url: '/qa/ask', method: 'post', data: req, timeout: AI_TIMEOUT })
 }
 
 export function listConversations(limit = 30) {

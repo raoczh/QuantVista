@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, nextTick, watch, computed } from 'vue'
+import { ref, onMounted, onUnmounted, nextTick, watch, computed } from 'vue'
 import { NInput, NButton, NGrid, NGi, NSpin, NEmpty, NAlert, NTag, useMessage } from 'naive-ui'
 import * as echarts from 'echarts'
 import {
@@ -131,8 +131,16 @@ function breadthPct(n: number) {
 onMounted(() => {
   loadOverview()
   loadStock()
-  window.addEventListener('resize', () => chart?.resize())
+  window.addEventListener('resize', onResize)
 })
+onUnmounted(() => {
+  window.removeEventListener('resize', onResize)
+  chart?.dispose()
+  chart = null
+})
+function onResize() {
+  chart?.resize()
+}
 </script>
 
 <template>
@@ -298,7 +306,7 @@ onMounted(() => {
       <!-- 个股速查 -->
       <SectionCard title="个股速查">
         <template #extra>
-          <span class="hint">东财（主）/ 新浪（备） · 仅 A 股已打通</span>
+          <span class="hint">东财 → 腾讯 → 新浪 三源自动切换 · 仅 A 股已打通</span>
         </template>
         <div class="quote-search">
           <n-input

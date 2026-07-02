@@ -1,4 +1,4 @@
-import { request } from './client'
+import { request, AI_TIMEOUT } from './client'
 
 export type AnalysisModule = 'market' | 'sector' | 'stock' | 'watchlist' | 'position'
 export type AnalysisStatus = 'success' | 'degraded' | 'failed'
@@ -59,7 +59,7 @@ export interface AnalysisView extends AnalysisRecord {
 }
 
 export function createAnalysis(req: AnalyzeRequest) {
-  return request<AnalysisView>({ url: '/analysis', method: 'post', data: req })
+  return request<AnalysisView>({ url: '/analysis', method: 'post', data: req, timeout: AI_TIMEOUT })
 }
 
 export function listAnalysis(module?: string, limit = 30) {
