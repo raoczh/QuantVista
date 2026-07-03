@@ -112,3 +112,41 @@ func (s *AdminService) SetUserStatus(operatorID, targetID int64, status string) 
 	}
 	return nil
 }
+
+// GetUserQuota 查看某用户的 AI 配额（无记录则按默认建一条）。
+func (s *AdminService) GetUserQuota(userID int64) (*model.UserQuota, error) {
+	var target model.User
+	if err := common.DB.First(&target, userID).Error; err != nil {
+		return nil, errors.New("用户不存在")
+	}
+	var q model.UserQuota
+	if err := common.DB.FirstOrCreate(&q, model.UserQuota{UserID: userID}).Error; err != nil {
+		return nil, err
+	}
+	return &q, nil
+}
+
+// QuotaUpdateInput 配额调整入参。TokenLimit 0=不限；ResetUsed 清零已用量与请求数。
+type QuotaUpdateInput struct {
+	TokenLimit int64 `json:"token_limit"`
+	ResetUsed  bool  `json:"reset_used"`
+}
+
+// UpdateUserQuota 调整某用户的 token 上限，可选清零已用量（配额周期性手工重置的口子）。
+func (s *AdminService) UpdateUserQuota(userID int64, in QuotaUpdateInput) (*model.UserQuota, error) {
+	if in.TokenLimit < 0 {
+		return nil, errors.New("token_limit 不能为负（0 表示不限）")
+	}
+	if _, err := s.GetUserQuota(userID); err != nil {
+		return nil, err
+	}
+	updates := map[string]any{"token_limit": in.TokenLimit}
+	if in.ResetUsed {
+		updates["token_used"] = 0
+		updates["request_count"] = 0
+	}
+	if err := common.DB.Model(&model.UserQuota{}).Where("user_id = ?", userID).Updates(updates).Error; err != nil {
+		return nil, err
+	}
+	return s.GetUserQuota(userID)
+}

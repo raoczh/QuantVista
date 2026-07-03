@@ -90,3 +90,56 @@ openssl rand -base64 36   # 再生成一个作 ENCRYPTION_KEY
 - Redis：各自独立容器（`redis` vs `quantvista-redis`），不共用，避免 key 混淆。
 - 网络：共用宝塔的 `baota_net` 外部网络。
 - 数据库：同一个 MySQL 实例下不同库（`new-api` vs `quantvista`）。
+
+## 6. 数据备份与恢复
+
+个人自用部署，数据全在 MySQL 单库 `quantvista`；容器与镜像可随时重建，**只有数据库需要备份**。
+
+### 6.1 表的两类：必须备份 vs 可重建
+
+**用户数据表（必须备份——丢了无法找回）：**
+
+- 账号与配置：`users`、`user_preferences`、`user_quotas`、`refresh_tokens`（可不备，重新登录即可）、`options`（系统设置，GitHub secret 为密文）、`llm_configs`（API Key 为密文，恢复后需同一 `ENCRYPTION_KEY` 才能解密）、`prompt_templates`、`notify_channels`（target 为密文，同上）
+- 研究与交易记录：`watchlists`、`watchlist_items`、`positions`、`thesis_cards`、`research_notes`
+- AI 产出：`analysis_records`、`recommendation_batches`、`recommendations`、`recommendation_statuses`、`ai_conversations`、`ai_conversation_messages`
+- 提醒：`alert_rules`、`alert_events`
+- 模拟盘：`paper_accounts`、`paper_holdings`、`paper_trades`
+
+**行情缓存表（可不备份——均能从数据源重建）：**
+
+- `stocks`、`stock_quotes`、`daily_bars`（个股查询/批量同步自动回填）
+- `trading_calendar`（管理端「回填交易日历」一键重建）
+- `market_snapshots`、`data_sync_logs`、`stock_scores`（后台任务自动再生）
+- `data_source_configs`（当前无读写方）
+
+### 6.2 备份命令
+
+```bash
+# 全库备份（最简单，推荐；行情缓存表体积有限，一起备份省心）
+docker exec mysql mysqldump -uquantvista -p'密码' --single-transaction quantvista | gzip > qv-$(date +%F).sql.gz
+
+# 只备用户数据表（体积敏感时）
+docker exec mysql mysqldump -uquantvista -p'密码' --single-transaction quantvista \
+  users user_preferences user_quotas options llm_configs prompt_templates notify_channels \
+  watchlists watchlist_items positions thesis_cards research_notes \
+  analysis_records recommendation_batches recommendations recommendation_statuses \
+  ai_conversations ai_conversation_messages alert_rules alert_events \
+  paper_accounts paper_holdings paper_trades | gzip > qv-user-$(date +%F).sql.gz
+```
+
+宝塔用户也可直接用面板的「数据库 → 备份」定时任务（等效全库 dump）。
+
+### 6.3 恢复
+
+```bash
+gunzip < qv-2026-07-03.sql.gz | docker exec -i mysql mysql -uquantvista -p'密码' quantvista
+```
+
+恢复后启动应用，`AutoMigrate` 会补齐缺的表/列（只备了用户数据表时，行情缓存表自动重建）。
+
+**两个密钥必须与备份时一致，否则密文字段作废：**
+
+- `ENCRYPTION_KEY`：解密 `llm_configs.api_key`、`notify_channels.target`、`options` 里的 GitHub secret。丢失则需在页面重新录入这些密钥。
+- `SESSION_SECRET`：影响 JWT 与 OAuth state 签名，换掉只是让所有人重新登录，无数据损失。
+
+另：页面内的「设置 → 数据导出」可随时导出持仓/自选/推荐/分析历史为 CSV，作为轻量的二级备份（人可读，但不含账号/密钥，不能替代 SQL 备份）。

@@ -5,12 +5,16 @@ import {
   NForm,
   NFormItem,
   NInput,
+  NInputNumber,
   NSwitch,
   NButton,
   NTable,
   NTag,
   NAlert,
   NPopconfirm,
+  NModal,
+  NCheckbox,
+  NEmpty,
   useMessage,
 } from 'naive-ui'
 import {
@@ -18,7 +22,11 @@ import {
   updateSystemSettings,
   listUsers,
   setUserStatus,
+  getUserQuota,
+  updateUserQuota,
+  listSyncLogs,
   type SystemSettings,
+  type SyncLog,
 } from '@/api/admin'
 import type { AuthUser } from '@/api/auth'
 import { useAuthStore } from '@/stores/auth'
@@ -100,9 +108,78 @@ async function toggleStatus(u: AuthUser) {
 
 const callbackHint = `${location.origin}/login/callback`
 
+/* 用户 AI 配额管理（批次 J） */
+const quotaModal = ref(false)
+const quotaUser = ref<AuthUser | null>(null)
+const quotaLoading = ref(false)
+const quotaSaving = ref(false)
+const quotaForm = reactive({ token_limit: 0, token_used: 0, request_count: 0, reset_used: false })
+async function openQuota(u: AuthUser) {
+  quotaUser.value = u
+  quotaForm.reset_used = false
+  quotaModal.value = true
+  quotaLoading.value = true
+  try {
+    const q = await getUserQuota(u.id)
+    quotaForm.token_limit = q.token_limit
+    quotaForm.token_used = q.token_used
+    quotaForm.request_count = q.request_count
+  } catch (e) {
+    message.error((e as Error).message)
+    quotaModal.value = false
+  } finally {
+    quotaLoading.value = false
+  }
+}
+async function saveQuota() {
+  if (!quotaUser.value) return
+  quotaSaving.value = true
+  try {
+    const q = await updateUserQuota(quotaUser.value.id, {
+      token_limit: quotaForm.token_limit || 0,
+      reset_used: quotaForm.reset_used,
+    })
+    quotaForm.token_used = q.token_used
+    quotaForm.request_count = q.request_count
+    quotaForm.reset_used = false
+    message.success('配额已更新')
+    quotaModal.value = false
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    quotaSaving.value = false
+  }
+}
+
+/* 数据源同步日志（批次 J：现有 sync-logs 端点接入后台页） */
+const logs = ref<SyncLog[]>([])
+const logsLoading = ref(false)
+async function loadLogs() {
+  logsLoading.value = true
+  try {
+    logs.value = await listSyncLogs(50)
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    logsLoading.value = false
+  }
+}
+function logStatusType(s: string) {
+  return s === 'success' ? 'success' : s === 'failed' ? 'error' : 'warning'
+}
+const taskLabel: Record<string, string> = {
+  sync_daily_bars: '日线批量同步',
+  backfill_calendar: '交易日历回填',
+  snapshot_market: '市场情绪快照',
+}
+function fmtLogTime(t: string) {
+  return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : ''
+}
+
 onMounted(() => {
   load()
   loadUsers()
+  loadLogs()
 })
 </script>
 
@@ -169,21 +246,81 @@ onMounted(() => {
                 <n-tag :type="u.status === 'enabled' ? 'success' : 'error'" size="small" round>{{ u.status }}</n-tag>
               </td>
               <td>
-                <n-popconfirm v-if="u.id !== auth.user?.id" @positive-click="toggleStatus(u)">
-                  <template #trigger>
-                    <n-button size="tiny" :type="u.status === 'enabled' ? 'error' : 'primary'">
-                      {{ u.status === 'enabled' ? '禁用' : '启用' }}
-                    </n-button>
-                  </template>
-                  {{ u.status === 'enabled' ? '禁用该用户并强制登出？' : '重新启用该用户？' }}
-                </n-popconfirm>
-                <span v-else style="opacity: 0.5">当前账号</span>
+                <n-space size="small">
+                  <n-button size="tiny" quaternary @click="openQuota(u)">配额</n-button>
+                  <n-popconfirm v-if="u.id !== auth.user?.id" @positive-click="toggleStatus(u)">
+                    <template #trigger>
+                      <n-button size="tiny" :type="u.status === 'enabled' ? 'error' : 'primary'">
+                        {{ u.status === 'enabled' ? '禁用' : '启用' }}
+                      </n-button>
+                    </template>
+                    {{ u.status === 'enabled' ? '禁用该用户并强制登出？' : '重新启用该用户？' }}
+                  </n-popconfirm>
+                  <span v-else style="opacity: 0.5">当前账号</span>
+                </n-space>
               </td>
             </tr>
           </tbody>
         </n-table>
       </SectionCard>
+
+      <!-- 数据源同步日志 -->
+      <SectionCard title="数据源同步日志" :hoverable="false">
+        <template #extra>
+          <n-button size="tiny" quaternary :loading="logsLoading" @click="loadLogs">刷新</n-button>
+        </template>
+        <n-empty v-if="!logs.length" description="暂无同步记录" size="small" style="padding: 20px 0" />
+        <n-table v-else :bordered="false" :single-line="false" size="small">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>任务</th>
+              <th>状态</th>
+              <th>成功/总数</th>
+              <th>耗时</th>
+              <th>摘要</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="lg in logs" :key="lg.id">
+              <td class="log-time">{{ fmtLogTime(lg.created_at) }}</td>
+              <td>{{ taskLabel[lg.task] || lg.task }}</td>
+              <td>
+                <n-tag :type="logStatusType(lg.status)" size="small" round>{{ lg.status }}</n-tag>
+              </td>
+              <td>{{ lg.succeeded }}/{{ lg.total }}<span v-if="lg.failed"> · 失败 {{ lg.failed }}</span></td>
+              <td>{{ (lg.duration_ms / 1000).toFixed(1) }}s</td>
+              <td class="log-msg">{{ lg.message }}</td>
+            </tr>
+          </tbody>
+        </n-table>
+      </SectionCard>
     </div>
+
+    <!-- 用户配额编辑 -->
+    <n-modal v-model:show="quotaModal" preset="card" :title="`AI 配额 · ${quotaUser?.display_name || quotaUser?.username || ''}`" style="max-width: 460px">
+      <n-form label-placement="left" label-width="110" :show-feedback="false">
+        <n-form-item label="已用 token">
+          <span class="qv-tnum">{{ quotaForm.token_used.toLocaleString() }}</span>
+          <span style="opacity: 0.5; margin-left: 8px">（调用 {{ quotaForm.request_count }} 次）</span>
+        </n-form-item>
+        <n-form-item label="token 上限">
+          <n-input-number v-model:value="quotaForm.token_limit" :min="0" :step="100000" style="width: 100%" />
+        </n-form-item>
+        <n-form-item label=" ">
+          <span style="font-size: 12px; opacity: 0.55">0 表示不限；用尽后该用户的 AI 功能将被熔断。</span>
+        </n-form-item>
+        <n-form-item label="清零已用量">
+          <n-checkbox v-model:checked="quotaForm.reset_used">同时清零已用 token 与调用次数（周期性重置）</n-checkbox>
+        </n-form-item>
+      </n-form>
+      <template #footer>
+        <div style="display: flex; justify-content: flex-end; gap: 10px">
+          <n-button @click="quotaModal = false">取消</n-button>
+          <n-button type="primary" :loading="quotaSaving || quotaLoading" @click="saveQuota">保存</n-button>
+        </div>
+      </template>
+    </n-modal>
   </PageContainer>
 </template>
 
@@ -196,5 +333,17 @@ onMounted(() => {
 .note {
   margin-bottom: 16px;
   border-radius: 10px;
+}
+.log-time {
+  white-space: nowrap;
+  font-size: 12px;
+}
+.log-msg {
+  font-size: 12px;
+  opacity: 0.75;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>

@@ -242,11 +242,13 @@ Go API Server
 
 接口示例：
 
-- `GET /api/positions`
+- `GET /api/positions`（含止损/分析时效富化）/ `GET /api/positions/overview`（组合总览+风控信号）
 - `POST /api/positions`
-- `PATCH /api/positions/:id`
+- `POST /api/positions/import`（CSV 批量导入，multipart，逐行校验+错误行报告，上限 500 行，限流 10/min）
+- `PUT /api/positions/:id`
 - `POST /api/positions/:id/close`
-- `GET /api/positions/:id/review`
+- `DELETE /api/positions/:id`
+-（复盘内容随 close 落库，无独立 review 端点）
 
 ### 5.5 AI Analysis Service
 
@@ -260,9 +262,10 @@ Go API Server
 
 接口示例（与实际路由一致）：
 
-- `POST /api/analysis`（发起分析，限流 20/min）
+- `POST /api/analysis`（发起分析，限流 20/min；`mode=panel` 为个股多角色观点——technical/momentum/risk/contrarian 四角色独立评级+共识+分歧）
 - `GET /api/analysis?module=&limit=`（历史，支持模块筛选）
 - `GET /api/analysis/:id` / `DELETE /api/analysis/:id`
+- `GET /api/analysis/:id/diff`（变化检测：与上一份同对象成功分析对比 rating/confidence/summary/highlights/risks）
 -（rerun / 从历史创建推荐为规划项，未实现）
 
 ### 5.6 Recommendation Service
@@ -279,7 +282,7 @@ Go API Server
 - `POST /api/recommendations`（生成，限流 15/min）
 - `GET /api/recommendations?type=&limit=` / `GET /api/recommendations/:id`
 - `GET /api/recommendations/strategies?type=`
--（add-to-position 为规划项：当前「一键建仓」由前端跳持仓页预填实现，`positions` 尚无 `recommendation_id` 血缘列）
+-（「一键建仓」由前端跳持仓页预填并带 `rec_id`，落库 `positions.recommendation_id` 血缘；推荐详情回显「已建仓」与推荐价 vs 实际买价对比）
 
 ### 5.7 Tracking Service
 
@@ -317,7 +320,16 @@ Go API Server
 - `GET/POST /api/llm-configs`，`PUT/DELETE /api/llm-configs/:id`，`POST /api/llm-configs/:id/test`
 - `GET/PUT /api/user/preference`，`GET /api/user/quota`
 - `GET/POST /api/notify-channels`，`PUT/DELETE /api/notify-channels/:id`，`POST /api/notify-channels/:id/test`
+- `GET/PUT /api/admin/users/:id/quota`（管理员查看/调整用户 token 上限、手工清零已用量）
+- `GET /api/export/:kind`（kind=positions|watchlist|recommendations|analyses，CSV 带 BOM，限流 10/min）
 -（数据源配置管理端为规划项：`data_source_configs` 表已建、未接管理端）
+
+### 5.8.1 条件提醒与命中事件（阶段 7 + 批次 H）
+
+- `GET/POST /api/alerts`，`PUT/DELETE /api/alerts/:id`，`PUT /api/alerts/:id/status`（暂停/恢复），`POST /api/alerts/evaluate`（手动评估，限流 20/min）
+- 提醒类型 kind：price（到价）/ pct_change（异动）/ ma（均线）/ breakout（突破）/ **volume_surge**（当日量≥N 倍 20 日均量）/ **amplitude**（当日振幅，优先腾讯估值源、缺则 (high-low)/prev_close 回退）
+- 命中明细状态机（`alert_events`，unread/read/dismissed）：`GET /api/alerts/events?status=&limit=`，`PUT /api/alerts/events/:id/status`，`PUT /api/alerts/events/read-all`
+- 今日待办（`GET /api/todos`）的提醒条目即 unread 事件，`ref_id` 为事件 id，可就地标记已读/忽略「完成待办」
 
 ### 5.9 Job Service
 

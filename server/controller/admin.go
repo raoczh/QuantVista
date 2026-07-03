@@ -70,3 +70,36 @@ func (ac *AdminController) SetUserStatus(c *gin.Context) {
 	}
 	common.ApiSuccess(c, gin.H{"ok": true})
 }
+
+// GetUserQuota GET /api/admin/users/:id/quota —— 查看用户 AI 配额。
+func (ac *AdminController) GetUserQuota(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	q, err := ac.svc.GetUserQuota(id)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, q)
+}
+
+// UpdateUserQuota PUT /api/admin/users/:id/quota —— 调整 token 上限 / 清零已用量。
+func (ac *AdminController) UpdateUserQuota(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	var in service.QuotaUpdateInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		common.ApiErrorMsg(c, "请求格式错误")
+		return
+	}
+	q, err := ac.svc.UpdateUserQuota(id, in)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, q)
+}

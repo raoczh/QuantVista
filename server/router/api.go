@@ -55,6 +55,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	promptCtl := controller.NewPromptController(promptSvc)
 	thesisCtl := controller.NewThesisController(thesisSvc)
 	noteCtl := controller.NewNoteController(noteSvc)
+	exportCtl := controller.NewExportController(service.NewExportService())
 
 	api := r.Group("/api")
 	{
@@ -140,6 +141,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				positions.GET("", positionCtl.List)
 				positions.GET("/overview", positionCtl.Overview) // 静态段先于 :id
 				positions.POST("", positionCtl.Create)
+				positions.POST("/import", middleware.RateLimit(10, time.Minute), exportCtl.ImportPositions)
 				positions.PUT("/:id", positionCtl.Update)
 				positions.DELETE("/:id", positionCtl.Delete)
 				positions.POST("/:id/close", positionCtl.Close)
@@ -183,6 +185,9 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 
 			// 今日待办/待复盘（聚合命中提醒 + 推荐/持仓复盘信号 + 逻辑卡到期）
 			authed.GET("/todos", todoCtl.List)
+
+			// 用户数据 CSV 导出（positions/watchlist/recommendations/analyses）
+			authed.GET("/export/:kind", middleware.RateLimit(10, time.Minute), exportCtl.Export)
 
 			// 投资逻辑卡片（结构化研究假设：核心逻辑/证据/风险/失效条件/复盘日期）
 			thesis := authed.Group("/thesis-cards")
@@ -251,6 +256,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				admin.PUT("/settings", adminCtl.UpdateSettings)
 				admin.GET("/users", adminCtl.ListUsers)
 				admin.PUT("/users/:id/status", adminCtl.SetUserStatus)
+				admin.GET("/users/:id/quota", adminCtl.GetUserQuota)
+				admin.PUT("/users/:id/quota", adminCtl.UpdateUserQuota)
 
 				// 市场数据维护（手动触发批量同步/日历回填/情绪快照）
 				adminMarket := admin.Group("/market")
