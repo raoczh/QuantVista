@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
   NInput,
@@ -13,6 +13,8 @@ import {
   NPopconfirm,
   NAlert,
   NSpace,
+  NSwitch,
+  NModal,
   useMessage,
 } from 'naive-ui'
 import {
@@ -20,11 +22,14 @@ import {
   listAnalysis,
   getAnalysis,
   deleteAnalysis,
+  getAnalysisDiff,
   type AnalyzeRequest,
   type AnalysisModule,
   type AnalysisView,
   type AnalysisRecord,
   type AnalysisRating,
+  type AnalysisDiff,
+  type PanelRoleKind,
 } from '@/api/analysis'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
@@ -33,6 +38,7 @@ import SectionCard from '@/components/SectionCard.vue'
 
 const message = useMessage()
 const route = useRoute()
+const router = useRouter()
 const { upColor, downColor, flatColor, vars, withAlpha } = useUi()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
@@ -61,6 +67,8 @@ const needMarket = computed(() =>
   form.value.module === 'stock' || form.value.module === 'market' || form.value.module === 'sector',
 )
 const needTarget = computed(() => form.value.module === 'sector')
+// 多角色观点（仅个股模块）：一次调用输出技术面/动量/风控/反方四个立场的独立结论。
+const panelMode = ref(false)
 
 // ---------- LLM 配置 ----------
 const llmConfigs = ref<LLMConfig[]>([])
@@ -107,8 +115,10 @@ async function runAnalysis() {
     if (needMarket.value) payload.market = form.value.market
     if (needSymbol.value) payload.symbol = form.value.symbol?.trim()
     if (needTarget.value) payload.target = form.value.target?.trim() || undefined
+    if (form.value.module === 'stock' && panelMode.value) payload.mode = 'panel'
     const view = await createAnalysis(payload)
     current.value = view
+    diff.value = null
     if (view.status === 'degraded') {
       message.warning('模型输出未通过结构化校验，已降级为原文展示')
     } else {
@@ -146,6 +156,7 @@ watch(historyModule, () => loadHistory())
 async function openRecord(rec: AnalysisRecord) {
   try {
     current.value = await getAnalysis(rec.id)
+    diff.value = null
   } catch (e) {
     message.error((e as Error).message)
   }
@@ -183,6 +194,58 @@ function fmtTime(t: string) {
   if (!t) return ''
   return new Date(t).toLocaleString('zh-CN', { hour12: false })
 }
+const panelRoleMeta: Record<PanelRoleKind, { label: string; desc: string }> = {
+  technical: { label: '技术面研究员', desc: '趋势 · 均线 · 支撑压力' },
+  momentum: { label: '动量交易者', desc: '短期动能 · 量比换手' },
+  risk: { label: '风控经理', desc: '波动回撤 · 宁可错过' },
+  contrarian: { label: '反方唱空者', desc: '刻意反驳主流叙事' },
+}
+function panelRoleLabel(r: string) {
+  return panelRoleMeta[r as PanelRoleKind]?.label || r
+}
+function panelRoleDesc(r: string) {
+  return panelRoleMeta[r as PanelRoleKind]?.desc || ''
+}
+
+// ---------- 变化检测（与上次对比） ----------
+const diff = ref<AnalysisDiff | null>(null)
+const diffShow = ref(false)
+const diffLoading = ref(false)
+async function openDiff() {
+  if (!current.value) return
+  diffLoading.value = true
+  try {
+    diff.value = await getAnalysisDiff(current.value.id)
+    diffShow.value = true
+  } catch (e) {
+    message.warning((e as Error).message)
+  } finally {
+    diffLoading.value = false
+  }
+}
+const canDiff = computed(
+  () => current.value?.status === 'success' && current.value.mode !== 'panel',
+)
+
+// ---------- 继续问答（复用本次分析的数据快照） ----------
+const canAskQa = computed(
+  () =>
+    current.value?.module === 'stock' &&
+    !!current.value.symbol &&
+    (current.value.status === 'success' || current.value.status === 'degraded'),
+)
+function askFromAnalysis() {
+  if (!current.value) return
+  router.push({
+    name: 'qa',
+    query: {
+      from_analysis: String(current.value.id),
+      symbol: current.value.symbol,
+      market: current.value.market || 'cn',
+      name: current.value.target || current.value.symbol,
+    },
+  })
+}
 
 onMounted(async () => {
   // 从个股页/自选跳转带参：预填模块与标的。
@@ -211,6 +274,10 @@ onMounted(async () => {
             </n-form-item>
             <n-form-item v-if="needTarget" label="关注板块（可选）">
               <n-input v-model:value="form.target" placeholder="如 半导体 / 银行" />
+            </n-form-item>
+            <n-form-item v-if="form.module === 'stock'" label="多角色观点">
+              <n-switch v-model:value="panelMode" />
+              <span class="switch-hint">技术面 / 动量 / 风控 / 反方四视角独立评判</span>
             </n-form-item>
             <n-form-item label="LLM 配置">
               <n-select
@@ -269,6 +336,7 @@ onMounted(async () => {
                 <div class="hist-main">
                   <div class="hist-title">
                     <n-tag size="tiny" round :bordered="false">{{ moduleText(h.module) }}</n-tag>
+                    <n-tag v-if="h.mode === 'panel'" size="tiny" round :bordered="false" type="info">多角色</n-tag>
                     <span class="hist-target">{{ h.target || h.title }}</span>
                   </div>
                   <div class="hist-sub">{{ fmtTime(h.created_at) }}</div>
@@ -306,22 +374,39 @@ onMounted(async () => {
               style="padding: 40px 0"
             />
             <div v-else class="result">
-              <!-- 头部：模块 + 评级 + 置信度 -->
+              <!-- 头部：模块 + 评级 + 置信度 + 操作 -->
               <div class="res-head">
                 <div class="res-title">
                   <n-tag size="small" round :bordered="false">{{ moduleText(current.module) }}</n-tag>
+                  <n-tag v-if="current.mode === 'panel'" size="small" round :bordered="false" type="info">多角色</n-tag>
                   <span class="res-target">{{ current.target || current.title }}</span>
                 </div>
-                <div v-if="current.status === 'success' && current.result" class="res-rating">
-                  <span
-                    class="rating-badge"
-                    :style="{
-                      color: ratingColor(current.result.rating),
-                      background: withAlpha(ratingColor(current.result.rating), 0.12),
-                    }"
-                    >{{ ratingText(current.result.rating) }}</span
+                <div class="res-side">
+                  <n-button v-if="canDiff" size="tiny" quaternary :loading="diffLoading" @click="openDiff"
+                    >与上次对比</n-button
                   >
-                  <span class="confidence">置信度 {{ current.result.confidence }}</span>
+                  <n-button v-if="canAskQa" size="tiny" quaternary @click="askFromAnalysis">继续问答</n-button>
+                  <div v-if="current.status === 'success' && current.result" class="res-rating">
+                    <span
+                      class="rating-badge"
+                      :style="{
+                        color: ratingColor(current.result.rating),
+                        background: withAlpha(ratingColor(current.result.rating), 0.12),
+                      }"
+                      >{{ ratingText(current.result.rating) }}</span
+                    >
+                    <span class="confidence">置信度 {{ current.result.confidence }}</span>
+                  </div>
+                  <div v-else-if="current.status === 'success' && current.panel" class="res-rating">
+                    <span
+                      class="rating-badge"
+                      :style="{
+                        color: ratingColor(current.rating),
+                        background: withAlpha(ratingColor(current.rating), 0.12),
+                      }"
+                      >多数 {{ ratingText(current.rating) }}</span
+                    >
+                  </div>
                 </div>
               </div>
 
@@ -371,7 +456,65 @@ onMounted(async () => {
                     <li v-for="(x, i) in current.result.suggestions" :key="i">{{ x }}</li>
                   </ul>
                 </div>
+                <div
+                  v-if="current.result.anti_thesis?.length"
+                  class="block anti-block"
+                  :style="{
+                    background: withAlpha(vars.warningColor, 0.08),
+                    borderColor: withAlpha(vars.warningColor, 0.35),
+                  }"
+                >
+                  <div class="block-title" :style="{ color: vars.warningColor }">反方观点 · 为什么可能是错的</div>
+                  <ul>
+                    <li v-for="(x, i) in current.result.anti_thesis" :key="i">{{ x }}</li>
+                  </ul>
+                </div>
+                <div v-if="current.result.kill_switches?.length" class="block">
+                  <div class="block-title">结论失效条件</div>
+                  <ul>
+                    <li v-for="(x, i) in current.result.kill_switches" :key="i">{{ x }}</li>
+                  </ul>
+                </div>
+                <div v-if="current.result.unknowns?.length" class="block">
+                  <div class="block-title">数据盲区</div>
+                  <ul>
+                    <li v-for="(x, i) in current.result.unknowns" :key="i">{{ x }}</li>
+                  </ul>
+                </div>
                 <p class="disclaimer">{{ current.result.disclaimer }}</p>
+              </template>
+
+              <!-- 多角色观点 -->
+              <template v-else-if="current.status === 'success' && current.panel">
+                <div class="panel-roles">
+                  <div v-for="r in current.panel.roles" :key="r.role" class="panel-role">
+                    <div class="pr-head">
+                      <span class="pr-name">{{ panelRoleLabel(r.role) }}</span>
+                      <span
+                        class="pr-rating"
+                        :style="{ color: ratingColor(r.rating), background: withAlpha(ratingColor(r.rating), 0.12) }"
+                        >{{ ratingText(r.rating) }}</span
+                      >
+                    </div>
+                    <div class="pr-desc">{{ panelRoleDesc(r.role) }}</div>
+                    <div class="pr-summary">{{ r.summary }}</div>
+                  </div>
+                </div>
+                <div class="block" style="margin-top: 14px">
+                  <div class="block-title">共识</div>
+                  <p class="panel-text">{{ current.panel.consensus }}</p>
+                </div>
+                <div
+                  v-if="current.panel.disagreement"
+                  class="block anti-block"
+                  :style="{
+                    background: withAlpha(vars.warningColor, 0.08),
+                    borderColor: withAlpha(vars.warningColor, 0.35),
+                  }"
+                >
+                  <div class="block-title" :style="{ color: vars.warningColor }">主要分歧</div>
+                  <p class="panel-text">{{ current.panel.disagreement }}</p>
+                </div>
               </template>
 
               <!-- 降级原文 -->
@@ -392,6 +535,69 @@ onMounted(async () => {
         </SectionCard>
       </div>
     </div>
+
+    <!-- 与上次对比：差异卡 -->
+    <n-modal v-model:show="diffShow" preset="card" title="与上次分析对比" style="max-width: 640px">
+      <div v-if="diff" class="diff" :style="styleVars">
+        <div class="diff-row">
+          <span class="diff-label">上次分析</span>
+          <span>{{ diff.prev_title }} · {{ fmtTime(diff.prev_at) }}</span>
+        </div>
+        <div class="diff-row">
+          <span class="diff-label">评级变化</span>
+          <span class="diff-rating">
+            <span :style="{ color: ratingColor(diff.rating_from) }">{{ ratingText(diff.rating_from) }}</span>
+            <span class="diff-arrow">→</span>
+            <span :style="{ color: ratingColor(diff.rating_to), fontWeight: 600 }">{{ ratingText(diff.rating_to) }}</span>
+            <n-tag v-if="diff.rating_from !== diff.rating_to" size="tiny" type="warning" :bordered="false" round
+              >评级转向</n-tag
+            >
+          </span>
+        </div>
+        <div class="diff-row">
+          <span class="diff-label">置信度</span>
+          <span>
+            {{ diff.confidence_from }} → {{ diff.confidence_to }}
+            <span
+              v-if="diff.confidence_delta !== 0"
+              :style="{ color: diff.confidence_delta > 0 ? upColor : downColor }"
+            >
+              （{{ diff.confidence_delta > 0 ? '+' : '' }}{{ diff.confidence_delta }}）
+            </span>
+          </span>
+        </div>
+        <div class="diff-block">
+          <div class="diff-label">上次结论</div>
+          <p class="diff-summary">{{ diff.summary_prev }}</p>
+          <div class="diff-label">本次结论</div>
+          <p class="diff-summary now">{{ diff.summary_now }}</p>
+        </div>
+        <div v-if="diff.highlights_added.length" class="diff-block">
+          <div class="diff-label" :style="{ color: upColor }">新增要点</div>
+          <ul>
+            <li v-for="(x, i) in diff.highlights_added" :key="i">{{ x }}</li>
+          </ul>
+        </div>
+        <div v-if="diff.highlights_removed.length" class="diff-block">
+          <div class="diff-label" :style="{ color: flatColor }">不再提及的要点</div>
+          <ul>
+            <li v-for="(x, i) in diff.highlights_removed" :key="i">{{ x }}</li>
+          </ul>
+        </div>
+        <div v-if="diff.risks_added.length" class="diff-block">
+          <div class="diff-label" :style="{ color: downColor }">新增风险</div>
+          <ul>
+            <li v-for="(x, i) in diff.risks_added" :key="i">{{ x }}</li>
+          </ul>
+        </div>
+        <div v-if="diff.risks_removed.length" class="diff-block">
+          <div class="diff-label" :style="{ color: flatColor }">解除的风险</div>
+          <ul>
+            <li v-for="(x, i) in diff.risks_removed" :key="i">{{ x }}</li>
+          </ul>
+        </div>
+      </div>
+    </n-modal>
   </PageContainer>
 </template>
 
@@ -510,10 +716,120 @@ onMounted(async () => {
   font-size: 16px;
   font-weight: 600;
 }
+.res-side {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 .res-rating {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+.switch-hint {
+  font-size: 12px;
+  opacity: 0.5;
+  margin-left: 10px;
+}
+/* 反方观点等强调块 */
+.anti-block {
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+/* 多角色 */
+.panel-roles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 12px;
+}
+.panel-role {
+  border: 1px solid var(--qv-divider);
+  border-radius: 10px;
+  padding: 12px;
+}
+.pr-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.pr-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+.pr-rating {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 10px;
+  border-radius: 14px;
+}
+.pr-desc {
+  font-size: 11px;
+  opacity: 0.5;
+  margin-top: 3px;
+}
+.pr-summary {
+  font-size: 13px;
+  line-height: 1.6;
+  margin-top: 8px;
+  opacity: 0.9;
+}
+.panel-text {
+  font-size: 13px;
+  line-height: 1.7;
+  margin: 0;
+  opacity: 0.9;
+}
+/* 差异卡 */
+.diff {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.diff-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+}
+.diff-label {
+  font-size: 12px;
+  font-weight: 600;
+  opacity: 0.7;
+  flex-shrink: 0;
+  min-width: 64px;
+}
+.diff-rating {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.diff-arrow {
+  opacity: 0.4;
+}
+.diff-block {
+  border-top: 1px solid var(--qv-divider);
+  padding-top: 10px;
+}
+.diff-block ul {
+  margin: 6px 0 0;
+  padding-left: 20px;
+}
+.diff-block li {
+  font-size: 13px;
+  line-height: 1.7;
+}
+.diff-summary {
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 4px 0 10px;
+  opacity: 0.75;
+}
+.diff-summary.now {
+  opacity: 1;
+  font-weight: 500;
 }
 .rating-badge {
   font-size: 14px;

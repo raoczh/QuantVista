@@ -67,6 +67,20 @@ func (ac *AnalysisController) Get(c *gin.Context) {
 	common.ApiSuccess(c, v)
 }
 
+// Diff GET /api/analysis/:id/diff —— 与上一份同对象成功分析对比（变化检测）。
+func (ac *AnalysisController) Diff(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	d, err := ac.svc.Diff(currentUserID(c), id)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, d)
+}
+
 // Delete DELETE /api/analysis/:id
 func (ac *AnalysisController) Delete(c *gin.Context) {
 	id, ok := parseIDParam(c, "id")

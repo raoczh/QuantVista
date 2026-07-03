@@ -151,6 +151,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				analysis.POST("", middleware.RateLimit(20, time.Minute), analysisCtl.Create)
 				analysis.GET("", analysisCtl.List)
 				analysis.GET("/:id", analysisCtl.Get)
+				analysis.GET("/:id/diff", analysisCtl.Diff)
 				analysis.DELETE("/:id", analysisCtl.Delete)
 			}
 

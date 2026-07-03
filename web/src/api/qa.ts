@@ -33,6 +33,7 @@ export interface QaAskRequest {
   market?: string
   llm_config_id?: number
   question: string
+  analysis_record_id?: number // 新会话时复用该分析记录的数据快照（从分析结果「继续问答」）
 }
 
 export function askQa(req: QaAskRequest) {

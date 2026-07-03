@@ -7,6 +7,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"quantvista/common"
+	"quantvista/model"
 )
 
 func TestParseAnalysisResult_Valid(t *testing.T) {
@@ -38,6 +41,125 @@ func TestParseAnalysisResult_CodeFenceAndChineseRating(t *testing.T) {
 	// nil 数组应兜底为非 nil，前端无需判空。
 	if r.Highlights == nil || r.Risks == nil || r.Opportunities == nil || r.Suggestions == nil {
 		t.Fatalf("数组字段未兜底为非 nil: %+v", r)
+	}
+	// 批次 I 新增的三个数组同样兜底。
+	if r.AntiThesis == nil || r.KillSwitches == nil || r.Unknowns == nil {
+		t.Fatalf("anti_thesis/kill_switches/unknowns 未兜底为非 nil: %+v", r)
+	}
+}
+
+// TestParsePanelResult 多角色观点解析：合法通过、角色去重归一、不足 3 角色/空共识拒绝。
+func TestParsePanelResult(t *testing.T) {
+	ok := `{"roles":[
+		{"role":"technical","rating":"bullish","summary":"均线多头"},
+		{"role":"momentum","rating":"看多","summary":"量比放大"},
+		{"role":"risk","rating":"neutral","summary":"回撤可控"},
+		{"role":"contrarian","rating":"bearish","summary":"涨幅透支"}],
+		"consensus":"短期趋势向上但涨幅已大","disagreement":"能否放量决定延续性"}`
+	p, err := parsePanelResult(ok)
+	if err != nil {
+		t.Fatalf("合法 panel 应通过: %v", err)
+	}
+	if len(p.Roles) != 4 {
+		t.Fatalf("应保留 4 个角色，得到 %d", len(p.Roles))
+	}
+	if p.Roles[1].Rating != "bullish" {
+		t.Fatalf("中文 rating 未归一: %s", p.Roles[1].Rating)
+	}
+
+	// 角色重复 + 非法角色被剔除后不足 3 个 → 拒绝。
+	bad := `{"roles":[
+		{"role":"technical","rating":"bullish","summary":"a"},
+		{"role":"technical","rating":"bearish","summary":"b"},
+		{"role":"boss","rating":"neutral","summary":"c"}],
+		"consensus":"x","disagreement":""}`
+	if _, err := parsePanelResult(bad); err == nil {
+		t.Fatalf("合法角色不足应拒绝")
+	}
+
+	// 空 consensus 拒绝。
+	noCons := `{"roles":[
+		{"role":"technical","rating":"bullish","summary":"a"},
+		{"role":"momentum","rating":"bullish","summary":"b"},
+		{"role":"risk","rating":"neutral","summary":"c"}],
+		"consensus":"  ","disagreement":"y"}`
+	if _, err := parsePanelResult(noCons); err == nil {
+		t.Fatalf("空 consensus 应拒绝")
+	}
+}
+
+// TestPanelMajorityRating 多数投票：多数胜出、平票中性。
+func TestPanelMajorityRating(t *testing.T) {
+	mk := func(ratings ...string) []PanelRole {
+		out := make([]PanelRole, len(ratings))
+		for i, r := range ratings {
+			out[i] = PanelRole{Role: "technical", Rating: r, Summary: "x"}
+		}
+		return out
+	}
+	if got := panelMajorityRating(mk("bullish", "bullish", "neutral", "bearish")); got != "bullish" {
+		t.Fatalf("多数 bullish 应胜出，得到 %s", got)
+	}
+	if got := panelMajorityRating(mk("bullish", "bullish", "bearish", "bearish")); got != "neutral" {
+		t.Fatalf("平票应取中性，得到 %s", got)
+	}
+}
+
+// TestAnalysisDiff 变化检测：找上一份同对象成功记录、算差异；panel/他人/无前次的边界（DB 集成）。
+func TestAnalysisDiff(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Exec("DELETE FROM analysis_records")
+	svc := &AnalysisService{}
+
+	mkJSON := func(highlights, risks []string) string {
+		b, _ := json.Marshal(map[string]any{"highlights": highlights, "risks": risks})
+		return string(b)
+	}
+	older := &model.AnalysisRecord{UserID: 1, Module: model.AnalysisModuleStock, Market: "cn", Symbol: "600000",
+		Status: model.AnalysisStatusSuccess, Rating: model.AnalysisRatingBearish, Confidence: 40,
+		Summary: "空头排列", Title: "个股分析 · 浦发银行",
+		ResultJSON: mkJSON([]string{"跌破MA20", "缩量"}, []string{"下行风险"})}
+	common.DB.Create(older)
+	// 中间插一条 panel（不应被选为对比基线）。
+	common.DB.Create(&model.AnalysisRecord{UserID: 1, Module: model.AnalysisModuleStock, Market: "cn", Symbol: "600000",
+		Status: model.AnalysisStatusSuccess, Mode: model.AnalysisModePanel, Rating: model.AnalysisRatingNeutral,
+		ResultJSON: `{"panel":{"roles":[],"consensus":"x"}}`})
+	newer := &model.AnalysisRecord{UserID: 1, Module: model.AnalysisModuleStock, Market: "cn", Symbol: "600000",
+		Status: model.AnalysisStatusSuccess, Rating: model.AnalysisRatingBullish, Confidence: 70,
+		Summary: "重新站上均线", Title: "个股分析 · 浦发银行",
+		ResultJSON: mkJSON([]string{"缩量", "站上MA20"}, []string{"下行风险", "追高风险"})}
+	common.DB.Create(newer)
+
+	d, err := svc.Diff(1, newer.ID)
+	if err != nil {
+		t.Fatalf("Diff 失败: %v", err)
+	}
+	if d.PrevID != older.ID {
+		t.Fatalf("对比基线应为最早那条标准记录 %d，得到 %d（panel 不应入选）", older.ID, d.PrevID)
+	}
+	if d.RatingFrom != model.AnalysisRatingBearish || d.RatingTo != model.AnalysisRatingBullish {
+		t.Fatalf("评级变化错误: %s → %s", d.RatingFrom, d.RatingTo)
+	}
+	if d.ConfidenceDelta != 30 {
+		t.Fatalf("置信度差应为 30，得到 %d", d.ConfidenceDelta)
+	}
+	if len(d.HighlightsAdded) != 1 || d.HighlightsAdded[0] != "站上MA20" {
+		t.Fatalf("新增要点错误: %v", d.HighlightsAdded)
+	}
+	if len(d.HighlightsRemoved) != 1 || d.HighlightsRemoved[0] != "跌破MA20" {
+		t.Fatalf("消失要点错误: %v", d.HighlightsRemoved)
+	}
+	if len(d.RisksAdded) != 1 || d.RisksAdded[0] != "追高风险" {
+		t.Fatalf("新增风险错误: %v", d.RisksAdded)
+	}
+
+	// 最早一条没有更早的可比。
+	if _, err := svc.Diff(1, older.ID); err == nil {
+		t.Fatalf("无前次记录应报错")
+	}
+	// 跨用户不可见。
+	if _, err := svc.Diff(2, newer.ID); err == nil {
+		t.Fatalf("跨用户 Diff 应失败")
 	}
 }
 
