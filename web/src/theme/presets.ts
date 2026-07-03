@@ -127,7 +127,7 @@ export const THEME_PRESETS: ThemePreset[] = [
   },
 ]
 
-export const DEFAULT_THEME_KEY = 'dark-blue'
+export const DEFAULT_THEME_KEY = 'light-rose'
 
 export function findPreset(key: string): ThemePreset {
   return THEME_PRESETS.find((p) => p.key === key) ?? THEME_PRESETS.find((p) => p.key === DEFAULT_THEME_KEY)!
