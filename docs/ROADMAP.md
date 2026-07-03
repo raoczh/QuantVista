@@ -15,11 +15,11 @@
 - **阶段 8：完整度与可信度增强：进行中（5/9 已完成，其中「管理员后台」系阶段 1/2 既有能力）**。已完成四项新功能、各自提交：①**股票评分系统**（`stock_scores`：趋势/动量/位置/量能/风险 5 维加权 0-100 + 强弱标签，纯技术面量化，集成到横向对比每行）；②**模拟交易**（`paper_*`：虚拟账户默认 10 万，真实行情成交与估值，佣金+印花税，成本基含买入费、卖出算真实净已实现盈亏，可重置）；③**主动推送**（`notify_channels`：Server酱/自定义 webhook，target 加密、SafeHTTPClient 防 SSRF，提醒命中时聚合推送、同日去重、受偏好「开启提醒」总闸控制）；④**Prompt 模板管理**（`prompt_templates`：每用户每模块自定义分析系统提示，启用后覆盖默认 moduleGuidance，可恢复默认；启用时分析记录 prompt_version 标记 `-custom`）。后端 build/vet/test 全绿，前端 vue-tsc + vite（Node16 需 crypto 垫片）通过。**未做（需外部数据源，暂缺）**：新闻情绪（无新闻源）、财务数据详情（需 Tushare）、回测模块；多数据源系统级切换（`data_source_configs` 表已建，管理端未接）。
 - **2026-07-02 全项目审查修复 ✅**：分模块审查（基础设施/数据源、用户域/组合域、AI 链路、前端/文档）后集中修复约 40 项——安全（SESSION_SECRET 随机回退+生产判定与 DEBUG 解耦、refresh 轮换防重放、登录计时侧信道、OAuth state cookie 绑定防登录 CSRF、TRUSTED_PROXIES 支持、公开行情限流、熵源失败 fail-fast、Recovery 记堆栈返 500）；数据正确性（成交量统一为手、新浪日线兜底不覆盖成交额、东财行情时间用 f86、指数解析按代码对位、overview 缓存不被取消请求毒化、批量同步游标轮转防饿死）；业务逻辑（止盈/止损判定限有效期窗口内、坏 Low 数据防护、长线 60 交易日复盘提示、短线价位与现价锚定+无效清零、候选池 ST/停牌/流动性前置筛选、推荐条数尊重用户选择、模拟交易行锁+碎股精度、提醒 breakout 剔当日、暂停规则不进待办、前端命中判定与后端对齐）；体验（AI 请求超时放宽至 5 分钟、提交按钮防连击、自选/持仓行内「分析/提醒/问答」快捷入口、分析历史模块筛选、设置页 AI 用量展示、登录跳转带回跳、ECharts 释放）。
 
-## 2026-07-02 无新数据源功能扩展（B 档落地 + 免费估值源），批次 A~J
+## 2026-07-02 无新数据源功能扩展（B 档落地 + 免费估值源），批次 A~J ✅ 全部完成（2026-07-03 收官）
 
-> 本轮目标：不接付费数据源，把 REFERENCE_PROJECTS.md 借鉴点 + 待办储备 B/C 档中无外部依赖的功能全部落地，并利用**腾讯行情免费自带的估值字段**（qt.gtimg.cn 行情串 38~53 号字段：换手率/PE-TTM/振幅/流通与总市值/PB/涨停价/跌停价/量比/PE 动静）补上估值维度。共 10 个批次，每批次一个 commit。
+> 本轮目标：不接付费数据源，把 REFERENCE_PROJECTS.md 借鉴点 + 待办储备 B/C 档中无外部依赖的功能全部落地，并利用**腾讯行情免费自带的估值字段**（qt.gtimg.cn 行情串 38~53 号字段：换手率/PE-TTM/振幅/流通与总市值/PB/涨停价/跌停价/量比/PE 动静）补上估值维度。共 10 个批次，每批次一个 commit，后端 go build/vet/test 全绿、前端 npm run build 零错误。
 
-**已完成（A~E 全量 + F 后端）：**
+**批次清单（全部完成）：**
 
 - **批次 A ✅（`4ad4943`）估值数据地基**：`datasource.Valuation` + `ValuationProvider` 能力接口（腾讯实现，fixture 单测）；`MarketService.GetValuation`（60s 缓存）+ `ValuationsFor` 并发批量；公开端点 `GET /markets/:market/stocks/:symbol/valuation`；接入横向对比（PE/PB/市值/换手/量比行 + ST 标记 + AI 点评喂估值）、个股分析与问答快照（`valuation` 块 + `freshness_note` 数据新鲜度标注，个股 moduleGuidance 加估值水位维度，**prompt_version p1→p2**）、推荐候选池富化（pe_ttm/pb/total_cap/turnover_rate，长线 spec 同步，**rec prompt p1→p2**）；前端对比表 3 行 + Home 个股速查估值 6 格。
 - **批次 B ✅（`306f6b0`）投资逻辑卡片**：`thesis_cards`（user+symbol+market 唯一；thesis/key_evidence/risks/kill_switches/track_metrics/next_review_date；状态机 active|invalidated|archived 失效带原因）；到期进今日待办（`thesis_due`，pri 3）；一键体检 `GET /thesis-cards/checkup`（行情富化 + 近20日回撤≤-15% 警示 + 到期标记）；前端 ThesisCards.vue（`/thesis`）+ 自选/持仓行内「逻辑卡」入口 + 导航「更多」组。
@@ -28,14 +28,14 @@
 - **批次 E ✅（`4b0880e`）风险计划 + 检查清单 + 结构化复盘**：Position 加 plan_stop_loss/plan_take_profit/checklist_json + sell_planned/ai_verdict/lesson_learned；校验止损<买价<止盈；前端建仓弹窗实时风险计算（投入/触发止损亏损额与占比/盈亏比）+ 5 项买入前检查清单（勾选随持仓落库），平仓弹窗三维结构化复盘。
 - **批次 F 后端 ✅（`abdd7c4`）组合总览/风控/分析时效**：PositionView 富化 near/below_stop_loss（3% 阈值）+ last_analyzed_at/analysis_stale（>7 天，一次分组查询）；`PositionService.Overview`（总市值/成本/盈亏/已实现/盈亏仓数/短长线分布/最大单一持仓占比/信号：集中度>40%、破/近止损、未分析计数）；`GET /positions/overview`；待办加 `stop_loss` 类型（pri 1）。
 
-**待做（新会话从这里继续，按批次顺序）：**
+**待做（新会话从这里继续，按批次顺序）：** —— 已无待做项，以下为各批次落地记录。
 
-- **批次 F 前端（收尾）**：①`web/src/api/position.ts` 加 PortfolioOverview 类型 + getPortfolioOverview() + Position 富化字段（near_stop_loss/below_stop_loss/last_analyzed_at/analysis_stale）；②Positions.vue 顶部汇总区改为调 /positions/overview（保留现有 StatCard 风格，加 已实现盈亏/短长线分布/最大持仓占比 + signals 警示条 NAlert）；③持仓行内加警示 tag：破止损（error）/近止损（warning）/N 天未分析（默认色，点击即走既有「分析」按钮）；④Today.vue kindMeta 加 `stop_loss`（label 止损警示，error 色）；api/todo.ts TodoKind 加 'stop_loss'。
-- **批次 G 推荐↔持仓血缘 + 追踪节点 + 回避规则 + 落选理由**：①Position 加 `recommendation_id int64`（可空 index），PositionInput 透传，一键建仓跳转链接补 `&rec_id=`，Positions.vue onMounted 读取 query 传入；推荐详情卡若有对应持仓显示「已建仓」（`GET /recommendations/:id` 时查 positions.recommendation_id 附带）+ 推荐 ref_price vs 实际 buy_price 对比行；②`RecommendationStatus` 加 `return_7d/return_14d/return_30d`（decimal，NULL=未到节点），`evaluateTracking` 遍历日线时若 ElapsedTradeDays≥N 且未记录则以第 N 交易日收盘价记节点收益，performance 统计各节点均值；③UserPreference 加 `blacklist_json`（[]{symbol,market,reason}）与 `min_candidate_amount`（默认 1e8），候选池 `candidateEligible` 应用用户配置，Settings.vue 偏好区加黑名单管理；④推荐 prompt 要求输出 `rejected:[{symbol,reason}]`（池内未选标的一句话理由），batch 存 `rejected_json`，前端推荐结果尾部「为什么没选它」折叠块。
-- **批次 H 提醒命中明细/状态机 + 放量振幅类型 + 待办完成**：①新表 `alert_events`（rule_id/user_id/symbol/market/name/kind/message/triggered_at/status unread|read|dismissed，index user+status）；`evaluateRules` 命中时同日去重后写明细；`GET /alerts/events?status=` + `PUT /alerts/events/:id/status` + `PUT /alerts/events/read-all`；②AlertRule kind 加 `volume_surge`（当日量 ≥ N 倍 20 日均量，threshold=倍数）与 `amplitude`（当日振幅 ≥ x%，用 (high-low)/prev_close），`evaluateAlert` 补两分支（数据源：日线 volume + 估值 Valuation.Amplitude 或日线算）；③待办 alert 类条目 RefID 换 alert_event id，Today.vue 加「标记已读/忽略」按钮（调 events status），alerts 计数用 unread；④Alerts.vue 加「命中历史」区（events 列表 + 状态筛选 + 已读/忽略操作）。**注意**：TriggeredForUser 现有逻辑改为基于 alert_events unread，todo_test 同步更新。
-- **批次 I AI 增强**：①分析 schema 加 `anti_thesis`（反方观点：为什么可能不该买/结论可能错）+ `kill_switches`（结论失效条件）+ `unknowns`（数据盲区）——analysisOutputSpec + parseAnalysisResult 数组兜底 + moduleGuidance 各模块提反方要求 + 前端 Analysis.vue 展示三块（反方观点用 warning 色卡）+ **prompt_version p2→p3**；②变化检测：`GET /api/analysis/:id/diff` 找同 user+module+symbol 的上一份 success 记录，对比 rating/confidence/summary/highlights 差异返回 {prev_id,prev_at,rating_from,rating_to,confidence_delta,...}，前端结果头「与上次对比」按钮弹差异卡；③多角色观点：AnalyzeRequest 加 `mode:"panel"`（仅 stock 模块），panel 模式换 systemPrompt 要求单次输出 {roles:[{role:technical|momentum|risk|contrarian,rating,summary},...],consensus,disagreement}，落库 result_json.panel，前端四角色卡+共识分歧；④Qa 从分析进入：QaAskRequest 加 `analysis_record_id`，首轮快照复用该记录 data_snapshot（校验归属），Analysis.vue 结果头加「继续问答」按钮带 id 跳转。
-- **批次 J 导出/配额/同步日志/备份文档**：①CSV 导出：`GET /api/export/positions|watchlist|recommendations|analyses`（text/csv, BOM 头 Excel 兼容，限流），前端 Settings.vue「数据导出」区四按钮；②持仓 CSV 导入：`POST /api/positions/import`（multipart，模板列 symbol,market,type,buy_price,buy_date,quantity,buy_fee,buy_tax,reason；逐行校验、错误行报告、上限 500 行），Positions.vue「导入」按钮+模板下载；③配额管理：`GET/PUT /api/admin/users/:id/quota`（查看/调整 token_limit/清零 token_used），AdminSettings.vue 用户行加配额编辑；④AdminSettings.vue 加「数据源同步日志」区（现有 GET /api/admin/market/sync-logs）；⑤docs/DEPLOYMENT.md 补「数据备份与恢复」节（MySQL dump 表清单：用户数据表 vs 可重建行情缓存表）；⑥全部完成后：ROADMAP 本区块勾稿 + ARCHITECTURE.md §API 补新端点 + DATABASE_DESIGN.md 补新表列。
-- **收尾核对（全批次完成后）**：`cd server && go build ./... && go vet ./... && go test ./...` 全绿；`cd web && npm run build` 零错误；浏览器目验 6 主题中至少 1 亮 1 暗（含新页面 /thesis /notes）；更新记忆 quantvista-progress。
+- **批次 F 前端 ✅（`1504bfe`）持仓页收尾**：api/position.ts 加 PortfolioOverview/getPortfolioOverview + 富化字段；Positions.vue 汇总区接 /positions/overview（已实现盈亏/短长线分布/最大持仓占比 + signals 警示条）；持仓行内破止损（error）/近止损（warning）/N 天未分析 tag；Today.vue kindMeta 加 stop_loss。
+- **批次 G ✅（`934aef7`）推荐↔持仓血缘 + 追踪节点 + 回避规则 + 落选理由**：Position 加 `recommendation_id`（一键建仓带 `&rec_id=` 落血缘，推荐详情回显「已建仓」+ 推荐价 vs 实际买价对比）；RecommendationStatus 加 `return_7d/14d/30d` 节点收益（evaluateTracking 按第 N 交易日收盘记录，performance 统计各节点均值）；UserPreference 加 `blacklist_json` 黑名单与 `min_candidate_amount` 流动性门槛（候选池 candidateEligible 应用，Settings.vue 偏好区管理）；推荐 prompt 输出 `rejected:[{symbol,reason}]` 落 batch.rejected_json，前端「为什么没选它」折叠块。
+- **批次 H ✅（`1286a59`）提醒命中明细/状态机 + 放量振幅类型 + 待办完成**：新表 `alert_events`（unread/read/dismissed 状态机，命中同日去重落明细，删规则时未读事件转 dismissed）；`GET /alerts/events?status=` + `PUT /alerts/events/:id/status` + `PUT /alerts/events/read-all`；AlertRule kind 加 `volume_surge`（当日量≥N 倍 20 日均量，均量窗口剔当日）与 `amplitude`（优先腾讯估值源振幅、缺则 (high-low)/prev_close 回退）；TriggeredForUser 改基于 unread 事件，待办 alert 条目 RefID 换事件 id、可就地已读/忽略；Alerts.vue「命中历史」区（状态筛选/全部已读）。
+- **批次 I ✅（`fddae75`）AI 增强**：分析 schema 加 `anti_thesis/kill_switches/unknowns`（moduleGuidance 五模块各加反方视角要求，**prompt_version p2→p3**，前端反方观点 warning 色卡三块）；`GET /analysis/:id/diff` 变化检测（同 user+module+market+symbol、sector 加 target 的上一份 success 对比 rating/confidence/summary/highlights/risks 差异，前端「与上次对比」弹窗）；`mode=panel` 多角色观点（仅 stock：technical/momentum/risk/contrarian 四角色独立评级+共识+分歧，rating 多数投票，落 result_json.panel，AnalysisRecord 加 mode 列，前端四角色卡）；QaAskRequest 加 `analysis_record_id` 复用分析快照（校验归属，分析结果头「继续问答」深链）。
+- **批次 J ✅（本提交）导出/导入/配额/同步日志/备份文档**：`GET /api/export/:kind`（positions/watchlist/recommendations/analyses，CSV 带 UTF-8 BOM，限流 10/min，Settings.vue「数据导出」四按钮）；`POST /api/positions/import`（multipart，模板列 symbol,market,type,buy_price,buy_date,quantity,buy_fee,buy_tax,reason，逐行校验+错误行报告+上限 500 行+超限整体拒绝，Positions.vue 导入弹窗+模板下载）；`GET/PUT /api/admin/users/:id/quota`（调整 token_limit/清零已用量，AdminSettings.vue 用户行「配额」弹窗）；AdminSettings.vue「数据源同步日志」区（接现有 sync-logs）；DEPLOYMENT.md 补「数据备份与恢复」节（用户数据表 vs 可重建行情缓存表清单 + mysqldump/恢复 + 密钥一致性）；ARCHITECTURE/DATABASE_DESIGN 同步新端点与新表列。
+- **收尾核对 ✅**：`go build/vet/test` 全绿；`npm run build` 零错误；ROADMAP 本区块勾稿 + 记忆更新。**浏览器目验 6 主题（至少 1 亮 1 暗，含 /thesis /notes）仍欠人工确认**。
 
 - **下一步：阶段 8 剩余项按数据源可得性推进**，或进入待办储备 B 档（逻辑卡片/买入前检查清单/仓位风险计算器等，多数复用现有结构、无外部依赖）。
 - **当前实现边界（代码审查后补充）**：
@@ -44,9 +44,9 @@
   - 追踪复权：`daily_bars` 主源为东财**前复权**（fqt=1，以最新价重锚），除权除息后历史序列会整体重刷、与生成时点的 RefPrice/止盈止损快照价错位（追踪 note 已如实标注）；新浪日线兜底无复权参数，两源口径不保证一致。彻底解决需复权因子表（`corporate_actions`）。
   - 新闻/财务/宏观：当前分析、问答、对比、推荐均已要求模型不得虚构未提供数据；新闻情绪、财务详情、财报提醒仍依赖后续数据源。
   - 短线计划：已在提示词和后处理里加入 A 股 T+1、涨跌停、100 股一手、交易日有效期约束；仍未做完整订单可执行性模拟。
-  - 推荐↔持仓血缘：`positions` 无 `recommendation_id` 关联（PRD 3.4/3.9 的「来源推荐展示」「AI 推荐 vs 实际买入对比」暂无数据基础），一键建仓仅预填不落血缘；待后续补列与联动。
-  - 提醒状态机：实现为规则单表（命中状态写在规则行上、同日去重），无 PRD 3.16 的 `alerts` 命中明细表与 unread/read/dismissed 状态机；待办暂无「标记完成」，靠命中条件自然消失或暂停规则近似。
-  - 审计与调用日志：`audit_logs`、`ai_call_logs` 未建（个人自用降级）；配额为终身累计（无周期重置），额度仅手工管理。
+  - 推荐↔持仓血缘：~~已解决（批次 G）~~ `positions.recommendation_id` 已落地，一键建仓带 `rec_id` 落血缘，推荐详情回显「已建仓」与推荐价 vs 实际买价对比。
+  - 提醒状态机：~~已解决（批次 H）~~ `alert_events` 命中明细表与 unread/read/dismissed 状态机已落地，待办可标记完成；规则行仍保留最近命中快照（同日去重依据）。
+  - 审计与调用日志：`audit_logs`、`ai_call_logs` 未建（个人自用降级）；配额为终身累计（无自动周期重置），但管理员可经 `PUT /api/admin/users/:id/quota` 调整上限并手工清零已用量（批次 J）。
   - LLM：单一默认配置（无「分析/推荐」双默认）；`stream` 字段存而未用（当前恒非流式）；仅 OpenAI 兼容 provider。
 
 > 进度标记约定：每完成一个阶段，更新本区块 + 给对应阶段标题打 ✅，便于新会话快速恢复。

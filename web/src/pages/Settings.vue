@@ -30,6 +30,7 @@ import {
   type LLMConfigInput,
 } from '@/api/llm'
 import { getPreference, updatePreference, changePassword, getQuota, type UserPreference, type UserQuota, type BlacklistEntry } from '@/api/user'
+import { downloadExport, type ExportKind } from '@/api/export'
 import { useAuthStore } from '@/stores/auth'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
@@ -265,6 +266,26 @@ onMounted(() => {
   loadPref()
   loadQuota()
 })
+
+/* 数据导出（批次 J）：四类数据一键导出 CSV。 */
+const exportOptions: { kind: ExportKind; label: string }[] = [
+  { kind: 'positions', label: '导出持仓' },
+  { kind: 'watchlist', label: '导出自选' },
+  { kind: 'recommendations', label: '导出推荐' },
+  { kind: 'analyses', label: '导出分析历史' },
+]
+const exporting = ref<ExportKind | null>(null)
+async function doExport(kind: ExportKind) {
+  exporting.value = kind
+  try {
+    await downloadExport(kind)
+    message.success('已开始下载')
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    exporting.value = null
+  }
+}
 </script>
 
 <template>
@@ -394,6 +415,19 @@ onMounted(() => {
           <n-button type="primary" :loading="savingPw" @click="submitChangePassword">修改密码</n-button>
         </n-form>
       </SectionCard>
+      <SectionCard title="数据导出" :hoverable="false" style="margin-top: 16px">
+        <div class="export-row">
+          <n-button
+            v-for="opt in exportOptions"
+            :key="opt.kind"
+            ghost
+            :loading="exporting === opt.kind"
+            @click="doExport(opt.kind)"
+            >{{ opt.label }}</n-button
+          >
+        </div>
+        <div class="export-hint">导出为 CSV（带 BOM，Excel 双击可读中文），仅含当前账号数据。</div>
+      </SectionCard>
     </n-tab-pane>
     </n-tabs>
   </PageContainer>
@@ -447,6 +481,16 @@ onMounted(() => {
 </template>
 
 <style scoped>
+.export-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.export-hint {
+  font-size: 12px;
+  opacity: 0.55;
+  margin-top: 10px;
+}
 .card-toolbar {
   display: flex;
   align-items: center;

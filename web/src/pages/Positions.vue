@@ -31,6 +31,7 @@ import {
   type PositionInput,
   type PortfolioOverview,
 } from '@/api/position'
+import { importPositions, downloadPositionTemplate, type ImportResult } from '@/api/export'
 import { useUi } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import PageContainer from '@/components/PageContainer.vue'
@@ -361,6 +362,42 @@ function goThesis(p: Position) {
   router.push({ name: 'thesis', query: { add: '1', symbol: p.symbol, market: p.market, name: p.name } })
 }
 
+// ---------- CSV 导入（批次 J） ----------
+const importModal = ref(false)
+const importFile = ref<File | null>(null)
+const importing = ref(false)
+const importResult = ref<ImportResult | null>(null)
+function openImport() {
+  importFile.value = null
+  importResult.value = null
+  importModal.value = true
+}
+function onImportFileChange(e: Event) {
+  const files = (e.target as HTMLInputElement).files
+  importFile.value = files && files.length ? files[0] : null
+  importResult.value = null
+}
+async function submitImport() {
+  if (!importFile.value) {
+    message.warning('请选择 CSV 文件')
+    return
+  }
+  importing.value = true
+  try {
+    importResult.value = await importPositions(importFile.value)
+    if (importResult.value.imported > 0) {
+      message.success(`成功导入 ${importResult.value.imported} 条持仓`)
+      await load()
+    } else if (!importResult.value.failed.length) {
+      message.warning('文件中没有可导入的数据行')
+    }
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    importing.value = false
+  }
+}
+
 onMounted(async () => {
   // 从自选/推荐「建仓」跳转而来：预填并打开建仓弹窗，然后清掉 query。
   // rec_id 为来源推荐（血缘），落库后推荐详情可展示「已建仓」与价格对比。
@@ -381,6 +418,7 @@ onMounted(async () => {
   <PageContainer title="持仓" subtitle="短线 / 长线 · 实时盈亏 · 卖出复盘">
     <template #actions>
       <n-button size="small" type="primary" @click="openCreate()">+ 新建持仓</n-button>
+      <n-button size="small" quaternary @click="openImport">导入</n-button>
       <n-button size="small" quaternary :loading="loading" @click="load()">刷新</n-button>
     </template>
 
@@ -713,10 +751,68 @@ onMounted(async () => {
         </div>
       </template>
     </n-modal>
+
+    <!-- CSV 批量导入 -->
+    <n-modal v-model:show="importModal" preset="card" title="导入持仓（CSV）" style="max-width: 560px">
+      <div class="import-body">
+        <div class="import-tip">
+          模板列：<code>symbol,market,type,buy_price,buy_date,quantity,buy_fee,buy_tax,reason</code>。
+          type 支持 short_term/long_term（或 短线/长线），market 留空默认 cn，日期格式 YYYY-MM-DD，单次最多 500 行。
+          <n-button size="tiny" quaternary type="primary" @click="downloadPositionTemplate">下载模板</n-button>
+        </div>
+        <input type="file" accept=".csv,text/csv" @change="onImportFileChange" />
+        <n-alert
+          v-if="importResult && importResult.failed.length"
+          type="warning"
+          :bordered="false"
+          style="margin-top: 12px"
+        >
+          {{ importResult.imported }} 条成功，{{ importResult.failed.length }} 条失败：
+          <ul class="import-errors">
+            <li v-for="f in importResult.failed" :key="f.row">第 {{ f.row }} 行：{{ f.error }}</li>
+          </ul>
+        </n-alert>
+        <n-alert
+          v-else-if="importResult && importResult.imported > 0"
+          type="success"
+          :bordered="false"
+          style="margin-top: 12px"
+        >
+          全部 {{ importResult.imported }} 条导入成功。
+        </n-alert>
+      </div>
+      <template #footer>
+        <div class="modal-footer">
+          <n-button @click="importModal = false">关闭</n-button>
+          <n-button type="primary" :loading="importing" :disabled="!importFile" @click="submitImport">开始导入</n-button>
+        </div>
+      </template>
+    </n-modal>
   </PageContainer>
 </template>
 
 <style scoped>
+.import-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.import-tip {
+  font-size: 12px;
+  opacity: 0.75;
+  line-height: 1.7;
+}
+.import-tip code {
+  font-size: 11px;
+  opacity: 0.9;
+}
+.import-errors {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  max-height: 180px;
+  overflow-y: auto;
+}
 .pos {
   display: flex;
   flex-direction: column;

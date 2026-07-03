@@ -31,3 +31,40 @@ export function listUsers() {
 export function setUserStatus(id: number, status: string) {
   return request<{ ok: boolean }>({ url: `/admin/users/${id}/status`, method: 'put', data: { status } })
 }
+
+// ---------- 用户 AI 配额管理 ----------
+
+export interface AdminUserQuota {
+  user_id: number
+  token_limit: number // 0 = 不限
+  token_used: number
+  request_count: number
+  updated_at: string
+}
+
+export function getUserQuota(id: number) {
+  return request<AdminUserQuota>({ url: `/admin/users/${id}/quota` })
+}
+
+export function updateUserQuota(id: number, data: { token_limit: number; reset_used?: boolean }) {
+  return request<AdminUserQuota>({ url: `/admin/users/${id}/quota`, method: 'put', data })
+}
+
+// ---------- 数据源同步日志 ----------
+
+export interface SyncLog {
+  id: number
+  task: string
+  market: string
+  status: string // success / partial / failed
+  total: number
+  succeeded: number
+  failed: number
+  duration_ms: number
+  message: string
+  created_at: string
+}
+
+export function listSyncLogs(limit = 50) {
+  return request<SyncLog[]>({ url: '/admin/market/sync-logs', params: { limit } })
+}
