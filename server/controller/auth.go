@@ -71,6 +71,39 @@ func (ac *AuthController) Logout(c *gin.Context) {
 	common.ApiSuccess(c, gin.H{"ok": true})
 }
 
+// GitHubBind POST /api/user/github/bind —— 已登录用户把 GitHub 绑到当前账号。
+// state 校验与登录回调同一套 double-submit cookie（发起时同样走 GET /oauth/github/url）。
+func (ac *AuthController) GitHubBind(c *gin.Context) {
+	var req githubCallbackReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ApiErrorMsg(c, "请求格式错误")
+		return
+	}
+	cookieNonce, cErr := c.Cookie(oauthStateCookie)
+	if cErr != nil || cookieNonce == "" || cookieNonce != common.StateNonce(req.State) {
+		common.ApiErrorMsg(c, "绑定会话校验失败，请从设置页重新发起 GitHub 绑定")
+		return
+	}
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(oauthStateCookie, "", -1, "/", "", false, true)
+	user, err := ac.svc.BindGitHub(c.Request.Context(), currentUserID(c), req.Code, req.State, req.RedirectURI)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, user)
+}
+
+// GitHubUnbind DELETE /api/user/github/bind —— 解绑 GitHub（须已设密码）。
+func (ac *AuthController) GitHubUnbind(c *gin.Context) {
+	user, err := ac.svc.UnbindGitHub(currentUserID(c))
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, user)
+}
+
 // GitHubURL GET /api/oauth/github/url?redirect_uri=... —— 返回 GitHub 授权跳转地址。
 func (ac *AuthController) GitHubURL(c *gin.Context) {
 	redirectURI := c.Query("redirect_uri")

@@ -174,6 +174,7 @@ Go API Server
 
 - `GET /api/oauth/github/url`（返回授权地址，同时种 state cookie）
 - `POST /api/oauth/github`（前端回调页用 code 换令牌，double-submit 校验 state）
+- `POST /api/user/github/bind` / `DELETE /api/user/github/bind`（已登录用户绑定/解绑 GitHub，2026-07-03；绑定复用同一授权地址与回调页，前端 sessionStorage 标记区分意图；github_id 被他人占用拒绝；未设密码的纯 OAuth 账号拒绝解绑防锁死）
 - `GET /api/user/self`
 - `POST /api/auth/login` / `POST /api/auth/refresh` / `POST /api/auth/logout`
 

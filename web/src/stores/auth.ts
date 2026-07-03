@@ -7,6 +7,8 @@ import {
   logout as apiLogout,
   getGithubAuthURL,
   githubCallback,
+  bindGithub,
+  unbindGithub,
   getSelf,
   type AuthUser,
   type TokenPair,
@@ -73,6 +75,28 @@ export const useAuthStore = defineStore('auth', () => {
     applyPair(await githubCallback(code, state, redirectURI()))
   }
 
+  // GitHub 绑定：与登录共用回调页 /login/callback，用 sessionStorage 标记区分意图。
+  const BIND_FLAG = 'qv_oauth_bind'
+
+  async function startGithubBind() {
+    const { url } = await getGithubAuthURL(redirectURI())
+    sessionStorage.setItem(BIND_FLAG, '1')
+    location.href = url
+  }
+
+  function pendingGithubBind() {
+    return sessionStorage.getItem(BIND_FLAG) === '1'
+  }
+
+  async function finishGithubBind(code: string, state: string) {
+    sessionStorage.removeItem(BIND_FLAG)
+    user.value = await bindGithub(code, state, redirectURI())
+  }
+
+  async function removeGithubBind() {
+    user.value = await unbindGithub()
+  }
+
   async function logout() {
     try {
       await apiLogout(getRefreshToken())
@@ -97,6 +121,10 @@ export const useAuthStore = defineStore('auth', () => {
     loginPassword,
     startGithubLogin,
     finishGithubLogin,
+    startGithubBind,
+    pendingGithubBind,
+    finishGithubBind,
+    removeGithubBind,
     logout,
   }
 })

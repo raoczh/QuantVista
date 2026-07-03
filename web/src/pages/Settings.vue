@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import {
   NTabs,
   NTabPane,
@@ -37,7 +37,34 @@ import SectionCard from '@/components/SectionCard.vue'
 
 const message = useMessage()
 const router = useRouter()
+const route = useRoute()
 const auth = useAuthStore()
+
+// 深链 ?tab=account 直达指定页签（GitHub 绑定回调后跳回账号安全）。
+const initialTab = ['llm', 'pref', 'account'].includes(String(route.query.tab)) ? String(route.query.tab) : 'llm'
+
+/* ---------------- GitHub 绑定 ---------------- */
+const ghBusy = ref(false)
+async function doBindGithub() {
+  ghBusy.value = true
+  try {
+    await auth.startGithubBind() // 成功即整页跳转 GitHub，无需复位 loading
+  } catch (e) {
+    message.error((e as Error).message)
+    ghBusy.value = false
+  }
+}
+async function doUnbindGithub() {
+  ghBusy.value = true
+  try {
+    await auth.removeGithubBind()
+    message.success('已解绑 GitHub')
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    ghBusy.value = false
+  }
+}
 
 /* ---------------- LLM 配置 ---------------- */
 const configs = ref<LLMConfig[]>([])
@@ -265,6 +292,7 @@ onMounted(() => {
   loadConfigs()
   loadPref()
   loadQuota()
+  if (!auth.statusLoaded) auth.fetchSetupStatus().catch(() => {}) // GitHub 绑定按钮需要知道 OAuth 是否启用
 })
 
 /* 数据导出（批次 J）：四类数据一键导出 CSV。 */
@@ -290,7 +318,7 @@ async function doExport(kind: ExportKind) {
 
 <template>
   <PageContainer title="设置" subtitle="模型 · 偏好 · 账号安全">
-    <n-tabs type="line" animated>
+    <n-tabs type="line" animated :default-value="initialTab">
     <!-- LLM 配置 -->
     <n-tab-pane name="llm" tab="LLM 配置">
       <SectionCard :hoverable="false">
@@ -415,6 +443,28 @@ async function doExport(kind: ExportKind) {
           <n-button type="primary" :loading="savingPw" @click="submitChangePassword">修改密码</n-button>
         </n-form>
       </SectionCard>
+      <SectionCard title="GitHub 绑定" :hoverable="false" style="margin-top: 16px">
+        <div v-if="auth.user?.github_id" class="gh-bind">
+          <n-tag type="success" round :bordered="false">已绑定</n-tag>
+          <span class="gh-hint">此 GitHub 账号可直接登录本账号，不会再创建新账号。</span>
+          <n-popconfirm @positive-click="doUnbindGithub">
+            <template #trigger>
+              <n-button size="small" ghost type="error" :loading="ghBusy">解绑</n-button>
+            </template>
+            解绑后该 GitHub 将无法登录本账号（需已设密码才能解绑），确定？
+          </n-popconfirm>
+        </div>
+        <div v-else class="gh-bind">
+          <n-tag round :bordered="false">未绑定</n-tag>
+          <span class="gh-hint"
+            >绑定后可用 GitHub 一键登录当前账号；未绑定时用 GitHub 登录会按新用户处理（开放注册时会创建另一个账号）。</span
+          >
+          <n-button size="small" type="primary" ghost :loading="ghBusy" :disabled="!auth.githubEnabled" @click="doBindGithub"
+            >绑定 GitHub</n-button
+          >
+          <span v-if="!auth.githubEnabled" class="gh-hint">（管理员尚未启用 GitHub 登录）</span>
+        </div>
+      </SectionCard>
       <SectionCard title="数据导出" :hoverable="false" style="margin-top: 16px">
         <div class="export-row">
           <n-button
@@ -481,6 +531,16 @@ async function doExport(kind: ExportKind) {
 </template>
 
 <style scoped>
+.gh-bind {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.gh-hint {
+  font-size: 12px;
+  opacity: 0.55;
+}
 .export-row {
   display: flex;
   gap: 10px;

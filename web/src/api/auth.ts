@@ -56,3 +56,16 @@ export function githubCallback(code: string, state: string, redirectURI: string)
 export function getSelf() {
   return request<AuthUser>({ url: '/user/self' })
 }
+
+// GitHub 绑定/解绑（authed）。绑定的授权地址复用 getGithubAuthURL。
+export function bindGithub(code: string, state: string, redirectURI: string) {
+  return request<AuthUser>({
+    url: '/user/github/bind',
+    method: 'post',
+    data: { code, state, redirect_uri: redirectURI },
+  })
+}
+
+export function unbindGithub() {
+  return request<AuthUser>({ url: '/user/github/bind', method: 'delete' })
+}
