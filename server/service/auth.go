@@ -215,6 +215,72 @@ func (s *AuthService) LoginByGitHub(ctx context.Context, code, state, redirectUR
 // errInitialized 首用户闸竞争失败（系统已被并发请求初始化）。
 var errInitialized = errors.New("系统已初始化")
 
+// BindGitHub 已登录用户绑定 GitHub：校验 state、换 token、取 GitHub 用户，
+// 该 GitHub 账号未被其他用户占用时写入当前用户（解决"密码登录的管理员再用
+// GitHub 登录会开出第二个账号"的问题——绑定后同一 GitHub 直接登录本账号）。
+func (s *AuthService) BindGitHub(ctx context.Context, userID int64, code, state, redirectURI string) (*model.User, error) {
+	if !common.VerifyState(state) {
+		return nil, errors.New("state 校验失败（可能过期或被篡改）")
+	}
+	accessToken, err := oauth.ExchangeToken(ctx, code, redirectURI)
+	if err != nil {
+		return nil, err
+	}
+	gu, err := oauth.GetUser(ctx, accessToken)
+	if err != nil {
+		return nil, err
+	}
+	var user model.User
+	if err := common.DB.First(&user, userID).Error; err != nil {
+		return nil, errors.New("用户不存在")
+	}
+	if user.GithubID == gu.GithubID {
+		user.Password = ""
+		return &user, nil // 幂等：重复绑定同一 GitHub 直接成功
+	}
+	var n int64
+	common.DB.Model(&model.User{}).Where("github_id = ? AND id <> ?", gu.GithubID, userID).Count(&n)
+	if n > 0 {
+		return nil, errors.New("该 GitHub 账号已绑定其他用户，请先在对方账号解绑")
+	}
+	updates := map[string]any{"github_id": gu.GithubID}
+	// 空缺信息用 GitHub 资料补齐，不覆盖已有值。
+	if user.AvatarURL == "" && gu.AvatarURL != "" {
+		updates["avatar_url"] = gu.AvatarURL
+	}
+	if user.Email == "" && gu.Email != "" {
+		updates["email"] = gu.Email
+	}
+	if err := common.DB.Model(&user).Updates(updates).Error; err != nil {
+		return nil, err
+	}
+	if err := common.DB.First(&user, userID).Error; err != nil {
+		return nil, err
+	}
+	user.Password = ""
+	return &user, nil
+}
+
+// UnbindGitHub 解绑 GitHub。未设密码的纯 OAuth 账号拒绝解绑（会失去唯一登录方式）。
+func (s *AuthService) UnbindGitHub(userID int64) (*model.User, error) {
+	var user model.User
+	if err := common.DB.First(&user, userID).Error; err != nil {
+		return nil, errors.New("用户不存在")
+	}
+	if user.GithubID == "" {
+		return nil, errors.New("当前未绑定 GitHub")
+	}
+	if user.Password == "" {
+		return nil, errors.New("该账号未设置密码，解绑 GitHub 将无法登录；请先设置密码")
+	}
+	if err := common.DB.Model(&user).Update("github_id", "").Error; err != nil {
+		return nil, err
+	}
+	user.GithubID = ""
+	user.Password = ""
+	return &user, nil
+}
+
 // Refresh 用 refresh token 换发新令牌（轮换：吊销旧的、签发新的）。
 func (s *AuthService) Refresh(rawRefresh, ua string) (*TokenPair, error) {
 	if rawRefresh == "" {

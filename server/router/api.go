@@ -104,6 +104,9 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				user.PUT("/preference", userCtl.UpdatePreference)
 				user.GET("/quota", userCtl.GetQuota)
 				user.PUT("/password", userCtl.ChangePassword)
+				// GitHub 绑定/解绑（发起绑定复用公开的 GET /oauth/github/url 拿授权地址）
+				user.POST("/github/bind", middleware.RateLimit(10, time.Minute), authCtl.GitHubBind)
+				user.DELETE("/github/bind", authCtl.GitHubUnbind)
 			}
 
 			llm := authed.Group("/llm-configs")
