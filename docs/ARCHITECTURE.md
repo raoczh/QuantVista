@@ -444,6 +444,7 @@ AI 结果：
 
 - `/`：市场首页
 - `/stocks/:market/:symbol`：个股详情（行情/日K/估值/评分 + 快捷动作，2026-07-03；首页榜单行与个股速查可点击进入，`useStockActions.goDetail` 供各处复用）
+- `/daily-report`：收盘日报（今日复盘 + 明日推荐，2026-07-03；`GET/POST /api/daily-reports*` 端点，交易日 15:35 后 `StartDailyReportJobs` 自动生成、手动重生成限流 5/min；首页「AI 今日观点」卡展示最新摘要）
 - `/login`（+ `/login/callback` OAuth 回调）、`/setup`：登录 / 首启建管理员
 - `/today`：今日待办/待复盘
 - `/watchlist`：自选股

@@ -39,6 +39,7 @@ func AllModels() []any {
 		&PromptTemplate{},
 		&ThesisCard{},
 		&ResearchNote{},
+		&DailyReport{},
 	}
 }
 

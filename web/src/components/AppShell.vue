@@ -85,6 +85,7 @@ const menuOptions = computed<MenuOption[]>(() => [
     key: 'ai-group',
     children: [
       { label: navLink('/analysis', 'AI 分析'), key: 'analysis' },
+      { label: navLink('/daily-report', '收盘日报'), key: 'daily-report' },
       { label: navLink('/qa', '个股问答'), key: 'qa' },
       { label: navLink('/compare', '横向对比'), key: 'compare' },
     ],

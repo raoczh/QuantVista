@@ -15,6 +15,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/', name: 'home', component: Home, meta: { title: '市场首页' } },
   { path: '/stocks/:market/:symbol', name: 'stock-detail', component: () => import('@/pages/StockDetail.vue'), meta: { title: '个股详情' } },
   { path: '/today', name: 'today', component: () => import('@/pages/Today.vue'), meta: { title: '今日待办' } },
+  { path: '/daily-report', name: 'daily-report', component: () => import('@/pages/DailyReport.vue'), meta: { title: '收盘日报' } },
   { path: '/watchlist', name: 'watchlist', component: () => import('@/pages/Watchlist.vue'), meta: { title: '自选股' } },
   { path: '/positions', name: 'positions', component: () => import('@/pages/Positions.vue'), meta: { title: '持仓' } },
   { path: '/analysis', name: 'analysis', component: () => import('@/pages/Analysis.vue'), meta: { title: 'AI 分析' } },

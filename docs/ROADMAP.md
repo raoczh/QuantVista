@@ -15,6 +15,18 @@
 - **阶段 8：完整度与可信度增强：进行中（5/9 已完成，其中「管理员后台」系阶段 1/2 既有能力）**。已完成四项新功能、各自提交：①**股票评分系统**（`stock_scores`：趋势/动量/位置/量能/风险 5 维加权 0-100 + 强弱标签，纯技术面量化，集成到横向对比每行）；②**模拟交易**（`paper_*`：虚拟账户默认 10 万，真实行情成交与估值，佣金+印花税，成本基含买入费、卖出算真实净已实现盈亏，可重置）；③**主动推送**（`notify_channels`：Server酱/自定义 webhook，target 加密、SafeHTTPClient 防 SSRF，提醒命中时聚合推送、同日去重、受偏好「开启提醒」总闸控制）；④**Prompt 模板管理**（`prompt_templates`：每用户每模块自定义分析系统提示，启用后覆盖默认 moduleGuidance，可恢复默认；启用时分析记录 prompt_version 标记 `-custom`）。后端 build/vet/test 全绿，前端 vue-tsc + vite（Node16 需 crypto 垫片）通过。**未做（需外部数据源，暂缺）**：新闻情绪（无新闻源）、财务数据详情（需 Tushare）、回测模块；多数据源系统级切换（`data_source_configs` 表已建，管理端未接）。
 - **2026-07-02 全项目审查修复 ✅**：分模块审查（基础设施/数据源、用户域/组合域、AI 链路、前端/文档）后集中修复约 40 项——安全（SESSION_SECRET 随机回退+生产判定与 DEBUG 解耦、refresh 轮换防重放、登录计时侧信道、OAuth state cookie 绑定防登录 CSRF、TRUSTED_PROXIES 支持、公开行情限流、熵源失败 fail-fast、Recovery 记堆栈返 500）；数据正确性（成交量统一为手、新浪日线兜底不覆盖成交额、东财行情时间用 f86、指数解析按代码对位、overview 缓存不被取消请求毒化、批量同步游标轮转防饿死）；业务逻辑（止盈/止损判定限有效期窗口内、坏 Low 数据防护、长线 60 交易日复盘提示、短线价位与现价锚定+无效清零、候选池 ST/停牌/流动性前置筛选、推荐条数尊重用户选择、模拟交易行锁+碎股精度、提醒 breakout 剔当日、暂停规则不进待办、前端命中判定与后端对齐）；体验（AI 请求超时放宽至 5 分钟、提交按钮防连击、自选/持仓行内「分析/提醒/问答」快捷入口、分析历史模块筛选、设置页 AI 用量展示、登录跳转带回跳、ECharts 释放）。
 
+## 2026-07-03 体验与闭环增强（7 项） ✅ 全部完成
+
+> 用户提出的批量需求：日报闭环 / 个股详情 / AI 链路加固 / 账号绑定 / 配额口径 / 占位清理 / 默认主题。每项独立 commit，后端 build/vet/test 全绿、前端 vue-tsc + build 零错误。
+
+- **默认主题樱桃红 ✅**：`DEFAULT_THEME_KEY` 改 `light-rose`（已保存主题的浏览器不受影响）。
+- **Tushare 占位隐藏 ✅**：首页「财经新闻 / AI 今日观点」占位卡撤下；DATA_SOURCES.md §7 集中登记「待 Tushare/新闻源解锁」清单（财务详情/财报日历/复权因子/回测/新闻情绪），约定接入前 UI 不留占位。
+- **配额次数制 ✅**：`user_quota` 改 action_limit/action_used 熔断（一次手动动作=1 次，repair/panel 多轮请求不重复计，后台任务不计次），token_used/request_count 转审计；四入口统一走 `service/quota.go`；admin 端点与设置页/后台弹窗同步。
+- **GitHub 绑定 ✅**：`POST/DELETE /api/user/github/bind`，设置页账号安全区绑定/解绑（github_id 占用校验、纯 OAuth 账号禁解绑防锁死）；绑定与登录共用回调页（sessionStorage 标记 + 路由守卫放行）。**答疑**：绑定前密码登录+GitHub 登录确实是两个账号（注册开放时）；普通用户无密码注册入口，GitHub OAuth 是唯一注册途径。
+- **个股详情页 ✅**：`/stocks/:market/:symbol`（行情头/日K/估值快照/技术评分五维条 + 分析/问答/对比/提醒/逻辑卡/自选/建仓快捷动作）；首页涨幅榜/热门榜行与速查按钮可点击进入；`useStockActions.goDetail` 全站复用；api/market.ts 补 `getScore`。
+- **AI 请求加固（参考 new-api）✅**：ai_client 连接池复用（allowPrivate 两态包级 client）、瞬时错误单次重试（未达上游网络错误 + 429/500/502/503，504 不重试，退避 800ms，SSRF 拦截不重试）、状态码中文归类提示、usage 缺失字符粗估兜底；新增 3 个 httptest 用例。
+- **收盘日报 ✅（最大项）**：新表 `daily_reports`（user+trade_date 唯一）+ 偏好 `enable_daily_report`（默认关）；`StartDailyReportJobs` 交易日 15:35~20:00 每 10min 检查补生成（交易日历判定、无日历回退周一~五、失败落 failed 防反复烧 token、atomic 防重入）；复盘=市场概览+持仓当日涨跌+自选异动 top8+今日命中提醒 快照 → LLM 结构化总结（1 次 repair，快照落库可复现）；明日推荐=复用推荐域 `GenerateAuto`（短线买点/止盈/止损/有效期，不计次）；**卖点提醒**=每条推荐自动建止盈/止损到价规则（note「收盘日报 <date>」，21 天未命中自动 paused，重生成先清当日旧规则）；生成后按推送总闸推送摘要。前端 `/daily-report` 页（历史下拉/手动重生成限流 5/min）+ 首页「AI 今日观点」卡接最新日报 + 设置页开关；导航入「AI 研究」组。
+
 ## 2026-07-02 无新数据源功能扩展（B 档落地 + 免费估值源），批次 A~J ✅ 全部完成（2026-07-03 收官）
 
 > 本轮目标：不接付费数据源，把 REFERENCE_PROJECTS.md 借鉴点 + 待办储备 B/C 档中无外部依赖的功能全部落地，并利用**腾讯行情免费自带的估值字段**（qt.gtimg.cn 行情串 38~53 号字段：换手率/PE-TTM/振幅/流通与总市值/PB/涨停价/跌停价/量比/PE 动静）补上估值维度。共 10 个批次，每批次一个 commit，后端 go build/vet/test 全绿、前端 npm run build 零错误。

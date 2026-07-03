@@ -46,6 +46,8 @@ type PreferenceInput struct {
 
 	BlacklistJSON      string  `json:"blacklist_json"`       // 候选池黑名单 [{symbol,market,reason}]
 	MinCandidateAmount float64 `json:"min_candidate_amount"` // 候选池最低日成交额（元；0=不过滤）
+
+	EnableDailyReport bool `json:"enable_daily_report"` // 收盘日报（今日复盘+明日推荐）自动生成
 }
 
 // BlacklistEntry 候选池黑名单条目（用户配置的回避规则）。
@@ -163,6 +165,7 @@ func (s *UserService) UpdatePreference(userID int64, in PreferenceInput) (*model
 	p.EnableNotify = in.EnableNotify
 	p.BlacklistJSON = blacklist
 	p.MinCandidateAmount = in.MinCandidateAmount
+	p.EnableDailyReport = in.EnableDailyReport
 	if err := common.DB.Save(p).Error; err != nil {
 		return nil, err
 	}
