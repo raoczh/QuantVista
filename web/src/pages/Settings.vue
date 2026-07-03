@@ -389,6 +389,14 @@ async function doExport(kind: ExportKind) {
               <span class="notify-hint">推送总闸：关闭后提醒命中仅在站内展示，不再外推到 Server酱/Webhook</span>
             </div>
           </n-form-item>
+          <n-form-item label="收盘日报">
+            <div class="notify-switch">
+              <n-switch v-model:value="pref.enable_daily_report" />
+              <span class="notify-hint"
+                >交易日 15:35 后自动生成今日复盘 + 明日选股推荐（消耗你的 LLM token，不占次数配额；含自动卖点提醒）</span
+              >
+            </div>
+          </n-form-item>
           <n-form-item label="成交额门槛">
             <div class="notify-switch">
               <n-input-number v-model:value="minAmountYi" :min="0" :max="10000" :precision="2" :step="0.5" style="width: 140px">

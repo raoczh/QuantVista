@@ -8,6 +8,7 @@ export interface UserPreference {
   horizon_pref: string // short_term/mid_term/long_term
   default_rec_count: number
   enable_notify: boolean
+  enable_daily_report: boolean
   blacklist_json: string // 候选池黑名单 [{symbol,market,reason}]
   min_candidate_amount: number // 候选池最低日成交额（元；0=不过滤）
 }

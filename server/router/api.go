@@ -34,6 +34,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	paperSvc := service.NewPaperService(marketSvc)
 	notifySvc := service.NewNotifyService()
 	promptSvc := service.NewPromptService()
+	dailyReportSvc := service.NewDailyReportService(marketSvc, watchlistSvc, positionSvc, alertSvc, recommendationSvc, llmSvc, notifySvc)
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc, scoreSvc)
@@ -56,6 +57,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	thesisCtl := controller.NewThesisController(thesisSvc)
 	noteCtl := controller.NewNoteController(noteSvc)
 	exportCtl := controller.NewExportController(service.NewExportService())
+	dailyReportCtl := controller.NewDailyReportController(dailyReportSvc)
 
 	api := r.Group("/api")
 	{
@@ -188,6 +190,15 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 
 			// 今日待办/待复盘（聚合命中提醒 + 推荐/持仓复盘信号 + 逻辑卡到期）
 			authed.GET("/todos", todoCtl.List)
+
+			// 收盘日报（今日复盘 + 明日推荐；后台任务自动生成，手动重生成限流防连击烧 token）
+			reports := authed.Group("/daily-reports")
+			{
+				reports.GET("", dailyReportCtl.List)
+				reports.GET("/latest", dailyReportCtl.Latest)
+				reports.GET("/:id", dailyReportCtl.Get)
+				reports.POST("/generate", middleware.RateLimit(5, time.Minute), dailyReportCtl.Generate)
+			}
 
 			// 用户数据 CSV 导出（positions/watchlist/recommendations/analyses）
 			authed.GET("/export/:kind", middleware.RateLimit(10, time.Minute), exportCtl.Export)

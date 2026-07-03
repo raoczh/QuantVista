@@ -47,3 +47,10 @@ func consumeQuota(userID int64, tokens int, manualAction bool) {
 	}
 	common.DB.Model(&model.UserQuota{}).Where("user_id = ?", userID).Updates(updates)
 }
+
+// chargeAction 仅计 1 次手动动作，不动 token/请求轮次审计。
+// 用于「一次动作内部的 LLM 记账已由各环节以 manualAction=false 完成」的场景（如手动重生成日报）。
+func chargeAction(userID int64) {
+	common.DB.Model(&model.UserQuota{}).Where("user_id = ?", userID).
+		Update("action_used", gorm.Expr("action_used + 1"))
+}

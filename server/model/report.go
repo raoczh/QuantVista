@@ -1,0 +1,35 @@
+package model
+
+import "time"
+
+// DailyReport 收盘后自动生成的每日报告：今日复盘 + 明日选股推荐。
+// 每用户每交易日一份（user_id+trade_date 唯一）；由后台任务在交易日
+// 15:35 后为开启偏好 enable_daily_report 的用户生成，也可手动重生成。
+// 推荐部分直接关联 recommendation_batches（复用推荐域的展示与追踪闭环）。
+type DailyReport struct {
+	ID        int64  `gorm:"primaryKey" json:"id"`
+	UserID    int64  `gorm:"index:idx_report_user_date,unique" json:"user_id"`
+	TradeDate string `gorm:"size:10;index:idx_report_user_date,unique" json:"trade_date"` // YYYY-MM-DD
+	Market    string `gorm:"size:8;default:cn" json:"market"`
+
+	Status string `gorm:"size:16" json:"status"` // success / partial / failed
+
+	// 今日复盘：LLM 结构化输出 + 输入数据快照（可复现）。列表查询时排除大字段。
+	ReviewJSON   string `gorm:"type:text" json:"review_json"`
+	SnapshotJSON string `gorm:"type:text" json:"snapshot_json"`
+
+	// 明日推荐批次（0=未生成/失败）；卖点提醒规则以 note 前缀「收盘日报」标记。
+	RecommendationBatchID int64 `gorm:"index" json:"recommendation_batch_id"`
+
+	Error       string    `gorm:"size:500" json:"error"`
+	TotalTokens int       `json:"total_tokens"`
+	LatencyMs   int64     `json:"latency_ms"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+const (
+	ReportStatusSuccess = "success"
+	ReportStatusPartial = "partial" // 复盘/推荐一方失败
+	ReportStatusFailed  = "failed"
+)

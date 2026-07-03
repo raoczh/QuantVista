@@ -165,8 +165,17 @@ type RecommendationItemView struct {
 	Position *RecPositionLink            `json:"position"`
 }
 
-// Generate 生成一批推荐。allowPrivate 由调用方按角色决定（管理员可访问内网自建模型）。
+// Generate 生成一批推荐（用户手动发起，计 1 次配额）。allowPrivate 由调用方按角色决定（管理员可访问内网自建模型）。
 func (s *RecommendationService) Generate(ctx context.Context, userID int64, allowPrivate bool, req RecommendRequest) (*RecommendationView, error) {
+	return s.generate(ctx, userID, allowPrivate, req, true)
+}
+
+// GenerateAuto 后台任务（收盘日报）代用户生成：token 照记审计，但不消耗次数配额。
+func (s *RecommendationService) GenerateAuto(ctx context.Context, userID int64, allowPrivate bool, req RecommendRequest) (*RecommendationView, error) {
+	return s.generate(ctx, userID, allowPrivate, req, false)
+}
+
+func (s *RecommendationService) generate(ctx context.Context, userID int64, allowPrivate bool, req RecommendRequest, manualAction bool) (*RecommendationView, error) {
 	req.Type = strings.ToLower(strings.TrimSpace(req.Type))
 	if req.Type != model.RecTypeShortTerm && req.Type != model.RecTypeLongTerm {
 		return nil, errors.New("推荐类型须为 short_term 或 long_term")
@@ -225,7 +234,7 @@ func (s *RecommendationService) Generate(ctx context.Context, userID int64, allo
 	batch.TotalTokens = usage.TotalTokens
 	batch.LatencyMs = latency
 	if usage.TotalTokens > 0 {
-		consumeQuota(userID, usage.TotalTokens, true)
+		consumeQuota(userID, usage.TotalTokens, manualAction)
 	}
 
 	if callErr != nil {

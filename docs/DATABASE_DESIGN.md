@@ -648,6 +648,23 @@ AI 调用日志。
 
 > 历史列 `token_limit` 已废弃（模型不再映射，遗留列无害）；无 period/period_start 周期重置，管理员可手工清零。
 
+### daily_reports（2026-07-03）
+
+收盘日报：交易日 15:35 后为开启偏好 `enable_daily_report` 的用户自动生成（每 10min 后台检查，20:00 后不再补），也可手动重生成（计 1 次配额；自动生成不计次）。每用户每交易日一份。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | bigint | 主键 |
+| user_id + trade_date | — | 复合唯一（idx_report_user_date） |
+| market | string | 当前恒 cn |
+| status | string | success / partial（复盘或推荐一方失败）/ failed |
+| review_json | text | LLM 结构化复盘 {summary, market_review, position_review, watch_review, risk_warnings[], tomorrow_plan}（列表查询排除） |
+| snapshot_json | text | 复盘输入快照（市场概览+持仓当日涨跌+自选异动 top8+今日命中提醒），可复现（列表排除） |
+| recommendation_batch_id | bigint | 明日推荐批次（复用 recommendation_batches 全链路；0=未生成） |
+| error / total_tokens / latency_ms | — | 失败原因与用量审计 |
+
+> 推荐生成同时为每条 pick 自动创建止盈(gte)/止损(lte)到价提醒（`alert_rules.note` 前缀「收盘日报 <date>」，21 自然日未命中自动 paused；手动重生成先删当日旧规则防重复）。`user_preferences` 新增 `enable_daily_report`（默认 false）。
+
 ### audit_logs
 
 敏感操作审计（改 API Key、改数据源 URL 等）。
