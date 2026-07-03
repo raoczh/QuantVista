@@ -558,68 +558,60 @@ function onResize() {
         <div ref="chartEl" class="quote-chart"></div>
       </SectionCard>
 
-      <!-- 资金流向 + 新闻/AI 占位 -->
-      <n-grid cols="1 m:2" :x-gap="16" :y-gap="16" responsive="screen">
-        <n-gi>
-          <SectionCard title="资金流向">
-            <template v-if="fundFlowUnavailable" #extra>
-              <n-tag size="small" type="warning" round :bordered="false">数据源繁忙</n-tag>
-            </template>
-            <div v-if="overview?.fund_flow" class="fundflow">
-              <div class="ff-hero">
-                <span class="ff-label">主力净流入</span>
-                <span
-                  class="ff-main qv-figure"
-                  :style="{ color: pctColor(overview.fund_flow.main_net) }"
-                >
-                  {{ fmtYi(overview.fund_flow.main_net) }}
-                </span>
-                <span class="ff-date">{{ overview.fund_flow.trade_date }} · 沪深两市</span>
-              </div>
-              <div class="ff-grid">
-                <div class="ff-cell">
-                  <span class="ff-k">超大单</span>
-                  <span
-                    class="ff-v qv-tnum"
-                    :style="{ color: pctColor(overview.fund_flow.super_net) }"
-                    >{{ fmtYi(overview.fund_flow.super_net) }}</span
-                  >
-                </div>
-                <div class="ff-cell">
-                  <span class="ff-k">大单</span>
-                  <span
-                    class="ff-v qv-tnum"
-                    :style="{ color: pctColor(overview.fund_flow.large_net) }"
-                    >{{ fmtYi(overview.fund_flow.large_net) }}</span
-                  >
-                </div>
-                <div class="ff-cell">
-                  <span class="ff-k">中单</span>
-                  <span
-                    class="ff-v qv-tnum"
-                    :style="{ color: pctColor(overview.fund_flow.medium_net) }"
-                    >{{ fmtYi(overview.fund_flow.medium_net) }}</span
-                  >
-                </div>
-                <div class="ff-cell">
-                  <span class="ff-k">小单</span>
-                  <span
-                    class="ff-v qv-tnum"
-                    :style="{ color: pctColor(overview.fund_flow.small_net) }"
-                    >{{ fmtYi(overview.fund_flow.small_net) }}</span
-                  >
-                </div>
-              </div>
+      <!-- 资金流向（原并排的「财经新闻 / AI 今日观点」占位卡已隐藏：新闻情绪依赖新闻源/Tushare，
+           接入后恢复两列布局，见 docs/DATA_SOURCES.md「待 Tushare / 新闻源解锁」清单） -->
+      <SectionCard title="资金流向">
+        <template v-if="fundFlowUnavailable" #extra>
+          <n-tag size="small" type="warning" round :bordered="false">数据源繁忙</n-tag>
+        </template>
+        <div v-if="overview?.fund_flow" class="fundflow">
+          <div class="ff-hero">
+            <span class="ff-label">主力净流入</span>
+            <span
+              class="ff-main qv-figure"
+              :style="{ color: pctColor(overview.fund_flow.main_net) }"
+            >
+              {{ fmtYi(overview.fund_flow.main_net) }}
+            </span>
+            <span class="ff-date">{{ overview.fund_flow.trade_date }} · 沪深两市</span>
+          </div>
+          <div class="ff-grid">
+            <div class="ff-cell">
+              <span class="ff-k">超大单</span>
+              <span
+                class="ff-v qv-tnum"
+                :style="{ color: pctColor(overview.fund_flow.super_net) }"
+                >{{ fmtYi(overview.fund_flow.super_net) }}</span
+              >
             </div>
-            <n-empty v-else description="两市资金流依赖东财接口，当前限流暂不可用，稍后重试" />
-          </SectionCard>
-        </n-gi>
-        <n-gi>
-          <SectionCard title="财经新闻 / AI 今日观点">
-            <n-empty description="待阶段 4+ 接入（新闻情绪、AI 市场摘要）" />
-          </SectionCard>
-        </n-gi>
-      </n-grid>
+            <div class="ff-cell">
+              <span class="ff-k">大单</span>
+              <span
+                class="ff-v qv-tnum"
+                :style="{ color: pctColor(overview.fund_flow.large_net) }"
+                >{{ fmtYi(overview.fund_flow.large_net) }}</span
+              >
+            </div>
+            <div class="ff-cell">
+              <span class="ff-k">中单</span>
+              <span
+                class="ff-v qv-tnum"
+                :style="{ color: pctColor(overview.fund_flow.medium_net) }"
+                >{{ fmtYi(overview.fund_flow.medium_net) }}</span
+              >
+            </div>
+            <div class="ff-cell">
+              <span class="ff-k">小单</span>
+              <span
+                class="ff-v qv-tnum"
+                :style="{ color: pctColor(overview.fund_flow.small_net) }"
+                >{{ fmtYi(overview.fund_flow.small_net) }}</span
+              >
+            </div>
+          </div>
+        </div>
+        <n-empty v-else description="两市资金流依赖东财接口，当前限流暂不可用，稍后重试" />
+      </SectionCard>
 
       <n-alert type="warning" title="风险提示" :bordered="false">
         本内容仅供研究参考，不构成投资建议。AI 可能出错，数据可能延迟或不完整，投资决策需由用户自行承担风险。
