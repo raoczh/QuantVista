@@ -118,6 +118,23 @@ export interface Valuation {
   data_time: string
 }
 
+export interface StockScore {
+  symbol: string
+  market: string
+  name: string
+  price: number
+  trade_date: string
+  total: number
+  trend: number
+  momentum: number
+  position: number
+  volume: number
+  risk: number
+  label: string
+  bar_count: number
+  data_limited: boolean
+}
+
 export function getOverview(market = 'cn') {
   return request<Overview>({ url: `/markets/${market}/overview`, method: 'get' })
 }
@@ -140,4 +157,8 @@ export function getDailyBars(market: string, symbol: string, limit = 120) {
 
 export function getValuation(market: string, symbol: string) {
   return request<Valuation>({ url: `/markets/${market}/stocks/${symbol}/valuation`, method: 'get' })
+}
+
+export function getScore(market: string, symbol: string) {
+  return request<StockScore>({ url: `/markets/${market}/stocks/${symbol}/score`, method: 'get' })
 }
