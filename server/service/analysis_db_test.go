@@ -90,22 +90,33 @@ func TestAnalysisHistoryAndGet(t *testing.T) {
 	}
 }
 
-// TestAddUsageAndQuota 验证配额扣减累计正确。
-func TestAddUsageAndQuota(t *testing.T) {
+// TestConsumeQuota 验证次数制配额记账：手动动作扣次、后台任务只记 token；熔断按次数判定。
+func TestConsumeQuota(t *testing.T) {
 	setupTestDB(t)
-	svc := &AnalysisService{}
 
-	q, err := svc.getQuota(7)
+	q, err := getUserQuota(7)
 	if err != nil {
-		t.Fatalf("getQuota 失败: %v", err)
+		t.Fatalf("getUserQuota 失败: %v", err)
 	}
-	if q.TokenUsed != 0 || q.RequestCount != 0 {
+	if q.ActionUsed != 0 || q.TokenUsed != 0 || q.RequestCount != 0 {
 		t.Fatalf("新配额应为 0: %+v", q)
 	}
-	svc.addUsage(7, 120)
-	svc.addUsage(7, 30)
-	q2, _ := svc.getQuota(7)
+	consumeQuota(7, 120, true)  // 用户手动动作
+	consumeQuota(7, 30, false) // 后台任务：只记 token 不扣次
+	q2, _ := getUserQuota(7)
 	if q2.TokenUsed != 150 || q2.RequestCount != 2 {
-		t.Fatalf("配额累计错误: used=%d req=%d", q2.TokenUsed, q2.RequestCount)
+		t.Fatalf("token 审计累计错误: used=%d req=%d", q2.TokenUsed, q2.RequestCount)
+	}
+	if q2.ActionUsed != 1 {
+		t.Fatalf("手动动作应只计 1 次，实际 %d", q2.ActionUsed)
+	}
+
+	// 熔断按次数：上限 1 且已用 1 → 拒绝；0 = 不限。
+	if err := checkQuota(7); err != nil {
+		t.Fatalf("未设上限不应熔断: %v", err)
+	}
+	common.DB.Model(&model.UserQuota{}).Where("user_id = ?", 7).Update("action_limit", 1)
+	if err := checkQuota(7); err == nil {
+		t.Fatalf("次数用尽应熔断")
 	}
 }

@@ -21,9 +21,10 @@ export interface BlacklistEntry {
 
 export interface UserQuota {
   user_id: number
-  token_limit: number
-  token_used: number
-  request_count: number
+  action_limit: number // 次数上限，0 = 不限
+  action_used: number // 已用次数（手动触发的 AI 动作）
+  token_used: number // 累计 token（审计参考）
+  request_count: number // LLM 调用轮次（审计参考）
 }
 
 export function getPreference() {

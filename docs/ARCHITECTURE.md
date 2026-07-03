@@ -320,7 +320,7 @@ Go API Server
 - `GET/POST /api/llm-configs`，`PUT/DELETE /api/llm-configs/:id`，`POST /api/llm-configs/:id/test`
 - `GET/PUT /api/user/preference`，`GET /api/user/quota`
 - `GET/POST /api/notify-channels`，`PUT/DELETE /api/notify-channels/:id`，`POST /api/notify-channels/:id/test`
-- `GET/PUT /api/admin/users/:id/quota`（管理员查看/调整用户 token 上限、手工清零已用量）
+- `GET/PUT /api/admin/users/:id/quota`（管理员查看/调整用户 AI 次数上限、手工清零已用量；2026-07-03 起配额为次数制，token 仅审计）
 - `GET /api/export/:kind`（kind=positions|watchlist|recommendations|analyses，CSV 带 BOM，限流 10/min）
 -（数据源配置管理端为规划项：`data_source_configs` 表已建、未接管理端）
 
@@ -401,7 +401,7 @@ Go API Server
 
 ### 6.7 成本控制
 
-- **每用户 token 配额与熔断**：超额拒绝调用，避免系统默认 LLM 被滥用。
+- **每用户 AI 次数配额与熔断**：按用户手动动作计次（一次分析/推荐/问答/点评=1 次，内部 repair/panel 多轮请求不重复计，后台任务不计次），超额拒绝调用；token 消耗仍全量累计作审计。
 - AI 调用做频率限制；首页等高频页面不得每次刷新触发 LLM（走缓存）。
 
 ## 7. 数据缓存策略

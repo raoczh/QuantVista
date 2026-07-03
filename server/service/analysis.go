@@ -133,13 +133,9 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 		return nil, err
 	}
 
-	// 2) 配额熔断：额度用尽直接拒绝（不发起调用）。
-	quota, err := s.getQuota(userID)
-	if err != nil {
+	// 2) 配额熔断：次数额度用尽直接拒绝（不发起调用）。
+	if err := checkQuota(userID); err != nil {
 		return nil, err
-	}
-	if quota.TokenLimit > 0 && quota.TokenUsed >= quota.TokenLimit {
-		return nil, errors.New("AI 分析配额已用尽，请联系管理员调整额度")
 	}
 
 	// 3) 组装数据上下文（失败即返回，不产生空记录）。
@@ -203,9 +199,9 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	rec.TotalTokens = usage.TotalTokens
 	rec.LatencyMs = latency
 
-	// 消耗了 token 就扣配额（无论成功/降级）。
+	// 消耗了 token 就记账（无论成功/降级）；一次分析动作计 1 次配额。
 	if usage.TotalTokens > 0 {
-		s.addUsage(userID, usage.TotalTokens)
+		consumeQuota(userID, usage.TotalTokens, true)
 	}
 
 	switch {
@@ -476,22 +472,6 @@ func (s *AnalysisService) title(module, mode, label string) string {
 		return base + " · " + label
 	}
 	return base
-}
-
-// getQuota / addUsage：配额读取与扣减。
-func (s *AnalysisService) getQuota(userID int64) (*model.UserQuota, error) {
-	var q model.UserQuota
-	if err := common.DB.FirstOrCreate(&q, model.UserQuota{UserID: userID}).Error; err != nil {
-		return nil, err
-	}
-	return &q, nil
-}
-
-func (s *AnalysisService) addUsage(userID int64, tokens int) {
-	common.DB.Model(&model.UserQuota{}).Where("user_id = ?", userID).Updates(map[string]any{
-		"token_used":    gorm.Expr("token_used + ?", tokens),
-		"request_count": gorm.Expr("request_count + 1"),
-	})
 }
 
 // --- prompt 构造与结果校验 ---

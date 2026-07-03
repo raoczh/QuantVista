@@ -16,8 +16,8 @@
 >   `enabled/disabled`（非 active/disabled）；`positions` 已加 `recommendation_id`（推荐↔持仓血缘，批次 G）；
 >   `user_preferences` 实现为 risk_level/default_market/horizon_pref/default_rec_count/enable_notify
 >   /blacklist_json/min_candidate_amount（无 default_llm_config_id——由 `llm_configs.is_default` 承担；无 simulation_enabled——模拟盘恒可用）；
->   `user_token_quotas` 实现为终身累计（无 period/period_start 周期重置；管理员可经
->   `PUT /api/admin/users/:id/quota` 调整上限并手工清零已用量，批次 J）；
+>   `user_token_quotas` 实现为**次数制终身累计**（action_limit/action_used 熔断，token 仅审计；无 period/period_start 周期重置；管理员可经
+>   `PUT /api/admin/users/:id/quota` 调整次数上限并手工清零已用量，2026-07-03 标准化）；
 >   `alert_rules` 实现为 kind(price/pct_change/ma/breakout/volume_surge/amplitude)+op+threshold+period+once
 >   （无 target_type/target_id/cooldown_seconds；同日去重经 triggered_at 实现）；`stock_scores` 实现为五维技术面
 >   （trend/momentum/position/volume/risk，估值/成长/财务/情绪待财务数据源）；
@@ -635,18 +635,18 @@ AI 调用日志。
 
 ### user_token_quotas
 
-每用户 AI token 配额与消耗，用于成本控制与熔断。
+每用户 AI 配额与消耗。**2026-07-03 起标准化为次数制**：一次用户手动动作（发起分析/推荐/问答/对比点评）计 1 次，内部 repair/panel 多轮 LLM 请求不重复计；后台自动任务只记 token 审计、不计次。实际表名 `user_quota`。
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| id | bigint / uuid | 主键 |
-| user_id | bigint / uuid | 用户 ID |
-| period | string | daily / monthly |
-| token_limit | bigint | 配额上限 |
-| token_used | bigint | 已用 token |
-| period_start | date | 周期开始 |
-| created_at | timestamp | 创建时间 |
+| user_id | bigint | 主键（每用户一行） |
+| action_limit | bigint | 次数上限，0=不限（熔断依据） |
+| action_used | bigint | 已用次数（仅用户手动动作） |
+| token_used | bigint | 累计 token（审计参考，不参与熔断） |
+| request_count | bigint | LLM 调用轮次（审计参考） |
 | updated_at | timestamp | 更新时间 |
+
+> 历史列 `token_limit` 已废弃（模型不再映射，遗留列无害）；无 period/period_start 周期重置，管理员可手工清零。
 
 ### audit_logs
 

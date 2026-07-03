@@ -389,12 +389,12 @@ async function doExport(kind: ExportKind) {
       </SectionCard>
       <SectionCard v-if="quota" title="AI 用量" :hoverable="false" style="margin-top: 16px">
         <div class="quota">
-          <span>累计消耗 token：<b class="qv-tnum">{{ quota.token_used.toLocaleString() }}</b></span>
-          <span>调用次数：<b class="qv-tnum">{{ quota.request_count }}</b></span>
-          <span v-if="quota.token_limit > 0"
-            >额度：<b class="qv-tnum">{{ quota.token_limit.toLocaleString() }}</b>（用尽后 AI 功能将被熔断）</span
+          <span>已用次数：<b class="qv-tnum">{{ quota.action_used }}</b>（按手动发起的分析/推荐/问答/点评计次）</span>
+          <span v-if="quota.action_limit > 0"
+            >次数上限：<b class="qv-tnum">{{ quota.action_limit }}</b>（用尽后 AI 功能将被熔断）</span
           >
-          <span v-else>额度：不限</span>
+          <span v-else>次数上限：不限</span>
+          <span>累计消耗 token：<b class="qv-tnum">{{ quota.token_used.toLocaleString() }}</b>（参考）</span>
         </div>
       </SectionCard>
     </n-tab-pane>

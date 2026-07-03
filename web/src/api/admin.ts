@@ -36,7 +36,8 @@ export function setUserStatus(id: number, status: string) {
 
 export interface AdminUserQuota {
   user_id: number
-  token_limit: number // 0 = 不限
+  action_limit: number // 次数上限，0 = 不限
+  action_used: number // 已用次数（手动触发的 AI 动作）
   token_used: number
   request_count: number
   updated_at: string
@@ -46,7 +47,7 @@ export function getUserQuota(id: number) {
   return request<AdminUserQuota>({ url: `/admin/users/${id}/quota` })
 }
 
-export function updateUserQuota(id: number, data: { token_limit: number; reset_used?: boolean }) {
+export function updateUserQuota(id: number, data: { action_limit: number; reset_used?: boolean }) {
   return request<AdminUserQuota>({ url: `/admin/users/${id}/quota`, method: 'put', data })
 }
 

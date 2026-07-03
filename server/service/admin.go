@@ -126,22 +126,23 @@ func (s *AdminService) GetUserQuota(userID int64) (*model.UserQuota, error) {
 	return &q, nil
 }
 
-// QuotaUpdateInput 配额调整入参。TokenLimit 0=不限；ResetUsed 清零已用量与请求数。
+// QuotaUpdateInput 配额调整入参（次数制）。ActionLimit 0=不限；ResetUsed 清零已用次数与 token/请求数审计。
 type QuotaUpdateInput struct {
-	TokenLimit int64 `json:"token_limit"`
-	ResetUsed  bool  `json:"reset_used"`
+	ActionLimit int64 `json:"action_limit"`
+	ResetUsed   bool  `json:"reset_used"`
 }
 
-// UpdateUserQuota 调整某用户的 token 上限，可选清零已用量（配额周期性手工重置的口子）。
+// UpdateUserQuota 调整某用户的次数上限，可选清零已用量（配额周期性手工重置的口子）。
 func (s *AdminService) UpdateUserQuota(userID int64, in QuotaUpdateInput) (*model.UserQuota, error) {
-	if in.TokenLimit < 0 {
-		return nil, errors.New("token_limit 不能为负（0 表示不限）")
+	if in.ActionLimit < 0 {
+		return nil, errors.New("action_limit 不能为负（0 表示不限）")
 	}
 	if _, err := s.GetUserQuota(userID); err != nil {
 		return nil, err
 	}
-	updates := map[string]any{"token_limit": in.TokenLimit}
+	updates := map[string]any{"action_limit": in.ActionLimit}
 	if in.ResetUsed {
+		updates["action_used"] = 0
 		updates["token_used"] = 0
 		updates["request_count"] = 0
 	}
