@@ -61,12 +61,8 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 	if err != nil {
 		return nil, err
 	}
-	quota, err := s.getQuota(userID)
-	if err != nil {
+	if err := checkQuota(userID); err != nil {
 		return nil, err
-	}
-	if quota.TokenLimit > 0 && quota.TokenUsed >= quota.TokenLimit {
-		return nil, errors.New("AI 配额已用尽，请联系管理员调整额度")
 	}
 
 	// 取得或新建会话。
@@ -149,7 +145,7 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 		return nil, err
 	}
 	if res.Usage.TotalTokens > 0 {
-		s.addUsage(userID, res.Usage.TotalTokens)
+		consumeQuota(userID, res.Usage.TotalTokens, true)
 	}
 
 	return s.Get(userID, conv.ID)
@@ -256,20 +252,5 @@ func (s *QaService) Delete(userID, id int64) error {
 			return err
 		}
 		return tx.Delete(&conv).Error
-	})
-}
-
-func (s *QaService) getQuota(userID int64) (*model.UserQuota, error) {
-	var q model.UserQuota
-	if err := common.DB.FirstOrCreate(&q, model.UserQuota{UserID: userID}).Error; err != nil {
-		return nil, err
-	}
-	return &q, nil
-}
-
-func (s *QaService) addUsage(userID int64, tokens int) {
-	common.DB.Model(&model.UserQuota{}).Where("user_id = ?", userID).Updates(map[string]any{
-		"token_used":    gorm.Expr("token_used + ?", tokens),
-		"request_count": gorm.Expr("request_count + 1"),
 	})
 }

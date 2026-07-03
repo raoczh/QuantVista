@@ -113,7 +113,7 @@ const quotaModal = ref(false)
 const quotaUser = ref<AuthUser | null>(null)
 const quotaLoading = ref(false)
 const quotaSaving = ref(false)
-const quotaForm = reactive({ token_limit: 0, token_used: 0, request_count: 0, reset_used: false })
+const quotaForm = reactive({ action_limit: 0, action_used: 0, token_used: 0, request_count: 0, reset_used: false })
 async function openQuota(u: AuthUser) {
   quotaUser.value = u
   quotaForm.reset_used = false
@@ -121,7 +121,8 @@ async function openQuota(u: AuthUser) {
   quotaLoading.value = true
   try {
     const q = await getUserQuota(u.id)
-    quotaForm.token_limit = q.token_limit
+    quotaForm.action_limit = q.action_limit
+    quotaForm.action_used = q.action_used
     quotaForm.token_used = q.token_used
     quotaForm.request_count = q.request_count
   } catch (e) {
@@ -136,9 +137,10 @@ async function saveQuota() {
   quotaSaving.value = true
   try {
     const q = await updateUserQuota(quotaUser.value.id, {
-      token_limit: quotaForm.token_limit || 0,
+      action_limit: quotaForm.action_limit || 0,
       reset_used: quotaForm.reset_used,
     })
+    quotaForm.action_used = q.action_used
     quotaForm.token_used = q.token_used
     quotaForm.request_count = q.request_count
     quotaForm.reset_used = false
@@ -300,18 +302,22 @@ onMounted(() => {
     <!-- 用户配额编辑 -->
     <n-modal v-model:show="quotaModal" preset="card" :title="`AI 配额 · ${quotaUser?.display_name || quotaUser?.username || ''}`" style="max-width: 460px">
       <n-form label-placement="left" label-width="110" :show-feedback="false">
-        <n-form-item label="已用 token">
-          <span class="qv-tnum">{{ quotaForm.token_used.toLocaleString() }}</span>
-          <span style="opacity: 0.5; margin-left: 8px">（调用 {{ quotaForm.request_count }} 次）</span>
+        <n-form-item label="已用次数">
+          <span class="qv-tnum">{{ quotaForm.action_used }}</span>
+          <span style="opacity: 0.5; margin-left: 8px"
+            >（累计 {{ quotaForm.token_used.toLocaleString() }} token / {{ quotaForm.request_count }} 轮调用）</span
+          >
         </n-form-item>
-        <n-form-item label="token 上限">
-          <n-input-number v-model:value="quotaForm.token_limit" :min="0" :step="100000" style="width: 100%" />
+        <n-form-item label="次数上限">
+          <n-input-number v-model:value="quotaForm.action_limit" :min="0" :step="50" style="width: 100%" />
         </n-form-item>
         <n-form-item label=" ">
-          <span style="font-size: 12px; opacity: 0.55">0 表示不限；用尽后该用户的 AI 功能将被熔断。</span>
+          <span style="font-size: 12px; opacity: 0.55"
+            >0 表示不限；按用户手动发起的 AI 动作计次（分析/推荐/问答/点评各 1 次，内部多轮请求不重复计），用尽后熔断。</span
+          >
         </n-form-item>
         <n-form-item label="清零已用量">
-          <n-checkbox v-model:checked="quotaForm.reset_used">同时清零已用 token 与调用次数（周期性重置）</n-checkbox>
+          <n-checkbox v-model:checked="quotaForm.reset_used">同时清零已用次数与 token 审计（周期性重置）</n-checkbox>
         </n-form-item>
       </n-form>
       <template #footer>

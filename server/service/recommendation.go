@@ -188,12 +188,8 @@ func (s *RecommendationService) Generate(ctx context.Context, userID int64, allo
 	}
 
 	// 2) 配额熔断。
-	quota, err := s.getQuota(userID)
-	if err != nil {
+	if err := checkQuota(userID); err != nil {
 		return nil, err
-	}
-	if quota.TokenLimit > 0 && quota.TokenUsed >= quota.TokenLimit {
-		return nil, errors.New("AI 配额已用尽，请联系管理员调整额度")
 	}
 
 	// 3) 候选池（真实数据；空池直接拒绝，避免无依据编造）。
@@ -229,7 +225,7 @@ func (s *RecommendationService) Generate(ctx context.Context, userID int64, allo
 	batch.TotalTokens = usage.TotalTokens
 	batch.LatencyMs = latency
 	if usage.TotalTokens > 0 {
-		s.addUsage(userID, usage.TotalTokens)
+		consumeQuota(userID, usage.TotalTokens, true)
 	}
 
 	if callErr != nil {
@@ -785,20 +781,4 @@ func (s *RecommendationService) assembleView(batch model.RecommendationBatch, it
 		views = append(views, iv)
 	}
 	return &RecommendationView{RecommendationBatch: batch, Items: views}
-}
-
-// 配额（与分析共用 user_quota）。
-func (s *RecommendationService) getQuota(userID int64) (*model.UserQuota, error) {
-	var q model.UserQuota
-	if err := common.DB.FirstOrCreate(&q, model.UserQuota{UserID: userID}).Error; err != nil {
-		return nil, err
-	}
-	return &q, nil
-}
-
-func (s *RecommendationService) addUsage(userID int64, tokens int) {
-	common.DB.Model(&model.UserQuota{}).Where("user_id = ?", userID).Updates(map[string]any{
-		"token_used":    gorm.Expr("token_used + ?", tokens),
-		"request_count": gorm.Expr("request_count + 1"),
-	})
 }
