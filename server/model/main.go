@@ -28,6 +28,7 @@ func AllModels() []any {
 		&Recommendation{},
 		&RecommendationStatus{},
 		&AlertRule{},
+		&AlertEvent{},
 		&AiConversation{},
 		&AiConversationMessage{},
 		&StockScore{},

@@ -24,15 +24,24 @@ func NewAlertService(market *MarketService) *AlertService {
 }
 
 const (
-	alertBarLimit    = 90 // 评估 ma/breakout 需要的日线条数
-	maxAlertsPerUser = 200
+	alertBarLimit     = 90  // 评估 ma/breakout/volume_surge 需要的日线条数
+	maxAlertsPerUser  = 200
+	volumeAvgWindow   = 20  // 放量判定的均量窗口（交易日）
+	alertEventMaxList = 500 // 命中历史单次最多返回条数
 )
 
 var validAlertKind = map[string]bool{
-	model.AlertKindPrice:     true,
-	model.AlertKindPctChange: true,
-	model.AlertKindMA:        true,
-	model.AlertKindBreakout:  true,
+	model.AlertKindPrice:       true,
+	model.AlertKindPctChange:   true,
+	model.AlertKindMA:          true,
+	model.AlertKindBreakout:    true,
+	model.AlertKindVolumeSurge: true,
+	model.AlertKindAmplitude:   true,
+}
+
+// alertKindNeedsBars 该类型评估是否需要日线序列。
+func alertKindNeedsBars(kind string) bool {
+	return kind == model.AlertKindMA || kind == model.AlertKindBreakout || kind == model.AlertKindVolumeSurge
 }
 
 // alertEval 评估的输入观测值（纯函数便于测试）。
@@ -41,9 +50,12 @@ type alertEval struct {
 	DayHigh   float64
 	DayLow    float64
 	ChangePct float64
+	DayVolume int64     // 当日成交量（手），volume_surge 用
+	Amplitude float64   // 当日振幅 %，amplitude 用（估值源缺失时由 quote 计算）
 	Closes    []float64 // 升序日线收盘（最新在末尾），供 ma/breakout
 	Highs     []float64
 	Lows      []float64
+	Volumes   []int64 // 升序日线成交量（手，剔除当日在途 bar），供 volume_surge 均量
 }
 
 // evaluateAlert 纯函数判定规则是否命中，返回（命中、观测值、命中说明）。
@@ -125,6 +137,40 @@ func evaluateAlert(rule model.AlertRule, in alertEval) (bool, float64, string) {
 			}
 		}
 		return false, in.Price, ""
+
+	case model.AlertKindVolumeSurge:
+		// 当日量 vs 近 20 日均量的倍数（threshold=倍数）。均量窗口剔除当日在途 bar。
+		avg, ok := volumeAverage(in.Volumes, volumeAvgWindow)
+		if !ok || in.DayVolume <= 0 {
+			return false, 0, ""
+		}
+		ratio := round2(float64(in.DayVolume) / avg)
+		if rule.Op == model.AlertOpGTE {
+			if ratio >= rule.Threshold {
+				return true, ratio, fmt.Sprintf("当日量达 %d 日均量的 %.2f 倍 ≥ %.2f 倍（放量）", volumeAvgWindow, ratio, rule.Threshold)
+			}
+		} else {
+			if ratio <= rule.Threshold {
+				return true, ratio, fmt.Sprintf("当日量仅为 %d 日均量的 %.2f 倍 ≤ %.2f 倍（缩量）", volumeAvgWindow, ratio, rule.Threshold)
+			}
+		}
+		return false, ratio, ""
+
+	case model.AlertKindAmplitude:
+		// 当日振幅 %（(high-low)/prev_close，优先取估值源自带值）。缺数据（0）不判定。
+		if in.Amplitude <= 0 {
+			return false, 0, ""
+		}
+		if rule.Op == model.AlertOpGTE {
+			if in.Amplitude >= rule.Threshold {
+				return true, in.Amplitude, fmt.Sprintf("当日振幅 %.2f%% ≥ %.2f%%", in.Amplitude, rule.Threshold)
+			}
+		} else {
+			if in.Amplitude <= rule.Threshold {
+				return true, in.Amplitude, fmt.Sprintf("当日振幅 %.2f%% ≤ %.2f%%", in.Amplitude, rule.Threshold)
+			}
+		}
+		return false, in.Amplitude, ""
 	}
 	return false, in.Price, ""
 }
@@ -174,6 +220,21 @@ func windowMin(lows []float64, period int) (float64, bool) {
 	return round2(m), true
 }
 
+// volumeAverage 取末尾 period 个成交量的均值（不足或均量为 0 则 false）。
+func volumeAverage(volumes []int64, period int) (float64, bool) {
+	if period <= 0 || len(volumes) < period {
+		return 0, false
+	}
+	sum := int64(0)
+	for _, v := range volumes[len(volumes)-period:] {
+		sum += v
+	}
+	if sum <= 0 {
+		return 0, false
+	}
+	return float64(sum) / float64(period), true
+}
+
 // --- 校验 / CRUD ---
 
 // AlertInput 新建/编辑规则入参。
@@ -206,6 +267,14 @@ func (s *AlertService) validate(in *AlertInput) error {
 	case model.AlertKindMA, model.AlertKindBreakout:
 		if in.Period < 2 || in.Period > 250 {
 			return errors.New("周期须在 2~250 之间")
+		}
+	case model.AlertKindVolumeSurge:
+		if in.Threshold <= 0 || in.Threshold > 100 {
+			return errors.New("量比倍数须在 0~100 之间")
+		}
+	case model.AlertKindAmplitude:
+		if in.Threshold <= 0 || in.Threshold > 100 {
+			return errors.New("振幅阈值须在 0~100 之间（%）")
 		}
 	}
 	return nil
@@ -297,7 +366,8 @@ func (s *AlertService) SetStatus(userID, id int64, status string) (*model.AlertR
 	return &rule, nil
 }
 
-// Delete 删除规则（仅本人）。
+// Delete 删除规则（仅本人）。其未读命中事件一并置为已忽略——
+// 用户删规则即不再关注，不应残留在今日待办；历史事件保留可追溯。
 func (s *AlertService) Delete(userID, id int64) error {
 	res := common.DB.Where("id = ? AND user_id = ?", id, userID).Delete(&model.AlertRule{})
 	if res.Error != nil {
@@ -306,36 +376,78 @@ func (s *AlertService) Delete(userID, id int64) error {
 	if res.RowsAffected == 0 {
 		return errors.New("提醒规则不存在")
 	}
+	common.DB.Model(&model.AlertEvent{}).
+		Where("rule_id = ? AND user_id = ? AND status = ?", id, userID, model.AlertEventUnread).
+		Update("status", model.AlertEventDismissed)
 	return nil
 }
 
-// TriggeredForUser 返回用户当前应进入今日待办的命中规则。
-// once 规则命中后置 triggered，作为待处理项持续保留；
-// 非 once 规则保持 active，仅当 triggered_at 的日期为今天（今天确有命中）才纳入——
-// 不能用 last_check_date 判定，它每次评估都刷成今天，会让历史命中天天误报。
-// 已暂停（paused）的规则不纳入：用户主动暂停即表示不再关注其命中。
-func (s *AlertService) TriggeredForUser(userID int64) ([]model.AlertRule, error) {
-	var rows []model.AlertRule
-	err := common.DB.Where(
-		"user_id = ? AND (status = ? OR (status = ? AND triggered_at IS NOT NULL))",
-		userID, model.AlertStatusTriggered, model.AlertStatusActive,
-	).
-		Order("triggered_at DESC").Find(&rows).Error
-	if err != nil {
+// TriggeredForUser 返回用户未读的命中事件（进入今日待办的提醒条目）。
+// 批次 H 起以 alert_events 明细为准：每次命中（同日去重）落一条事件，
+// 用户标记已读/忽略即从待办消失——替代旧的「按规则行 triggered_at 推断」口径。
+func (s *AlertService) TriggeredForUser(userID int64) ([]model.AlertEvent, error) {
+	var rows []model.AlertEvent
+	err := common.DB.Where("user_id = ? AND status = ?", userID, model.AlertEventUnread).
+		Order("triggered_at DESC").Limit(alertEventMaxList).Find(&rows).Error
+	return rows, err
+}
+
+// --- 命中事件（明细/状态机） ---
+
+// ListEvents 命中历史（可按状态过滤，倒序）。
+func (s *AlertService) ListEvents(userID int64, status string, limit int) ([]model.AlertEvent, error) {
+	if limit <= 0 || limit > alertEventMaxList {
+		limit = 100
+	}
+	q := common.DB.Where("user_id = ?", userID)
+	if status == model.AlertEventUnread || status == model.AlertEventRead || status == model.AlertEventDismissed {
+		q = q.Where("status = ?", status)
+	}
+	var rows []model.AlertEvent
+	err := q.Order("id DESC").Limit(limit).Find(&rows).Error
+	return rows, err
+}
+
+// SetEventStatus 标记事件已读/忽略（也允许恢复未读，仅本人）。
+func (s *AlertService) SetEventStatus(userID, id int64, status string) (*model.AlertEvent, error) {
+	if status != model.AlertEventUnread && status != model.AlertEventRead && status != model.AlertEventDismissed {
+		return nil, errors.New("非法状态")
+	}
+	var ev model.AlertEvent
+	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&ev).Error; err != nil {
+		return nil, errors.New("命中记录不存在")
+	}
+	ev.Status = status
+	if err := common.DB.Save(&ev).Error; err != nil {
 		return nil, err
 	}
-	today := time.Now().In(time.Local).Format("2006-01-02")
-	out := rows[:0]
-	for _, r := range rows {
-		if r.Status == model.AlertStatusTriggered {
-			out = append(out, r) // once 命中态：作为待处理项保留
-			continue
-		}
-		if r.TriggeredAt != nil && r.TriggeredAt.In(time.Local).Format("2006-01-02") == today {
-			out = append(out, r) // 非 once：今天确有命中才纳入
-		}
+	return &ev, nil
+}
+
+// MarkAllEventsRead 全部未读事件标记已读，返回影响条数。
+func (s *AlertService) MarkAllEventsRead(userID int64) (int64, error) {
+	res := common.DB.Model(&model.AlertEvent{}).
+		Where("user_id = ? AND status = ?", userID, model.AlertEventUnread).
+		Update("status", model.AlertEventRead)
+	return res.RowsAffected, res.Error
+}
+
+// recordEvent 命中时落明细事件。同日去重与推送同口径：该规则今天已命中过
+//（旧 triggered_at 为今天）则不重复落——手动「立即检查」一日多轮不会刷屏。
+func recordEvent(rule model.AlertRule, msg, today string, now time.Time) bool {
+	if rule.TriggeredAt != nil && rule.TriggeredAt.In(time.Local).Format("2006-01-02") == today {
+		return false
 	}
-	return out, nil
+	ev := model.AlertEvent{
+		RuleID: rule.ID, UserID: rule.UserID,
+		Symbol: rule.Symbol, Market: rule.Market, Name: rule.Name, Kind: rule.Kind,
+		Message: truncateRunes(msg, 256), TriggeredAt: now, Status: model.AlertEventUnread,
+	}
+	if err := common.DB.Create(&ev).Error; err != nil {
+		common.SysWarn("落提醒命中事件失败: %v", err)
+		return false
+	}
+	return true
 }
 
 // --- 评估编排 ---
@@ -349,25 +461,27 @@ func (s *AlertService) EvaluateUser(ctx context.Context, userID int64) (int, err
 	return s.evaluateRules(ctx, rules), nil
 }
 
-// evaluateRules 评估一批规则，按 symbol 缓存行情/日线，避免重复请求。
+// evaluateRules 评估一批规则，按 symbol 缓存行情/日线/估值，避免重复请求。
 func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRule) int {
 	type md struct {
-		eval alertEval
-		ok   bool
+		eval     alertEval
+		ok       bool
+		valTried bool // 估值源振幅是否已尝试拉取（失败不重试）
 	}
 	cache := map[string]md{}
 	today := time.Now().In(time.Local).Format("2006-01-02")
 	hits := 0
 
-	// fillBars 组装 ma/breakout 的日线序列。breakout 的「前高/前低」窗口剔除当日
-	// 在途 bar（否则当日 high 与含自身的窗口比较恒成立，首日必误报「创新高」）；
-	// MA 序列保留当日（现价参与均线是常用口径）。
+	// fillBars 组装 ma/breakout/volume_surge 的日线序列。breakout 的「前高/前低」与
+	// volume_surge 的「均量」窗口剔除当日在途 bar（否则当日 high 与含自身的窗口比较
+	// 恒成立、当日量参与均量会稀释放量信号）；MA 序列保留当日（现价参与均线是常用口径）。
 	fillBars := func(e *alertEval, bars []datasource.Bar) {
 		for _, b := range bars {
 			e.Closes = append(e.Closes, b.Close)
 			if b.TradeDate != today {
 				e.Highs = append(e.Highs, b.High)
 				e.Lows = append(e.Lows, b.Low)
+				e.Volumes = append(e.Volumes, b.Volume)
 			}
 		}
 	}
@@ -385,10 +499,14 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 		if !cached {
 			data = md{}
 			if q, err := s.market.GetQuote(ctx, rule.Market, rule.Symbol); err == nil && q.Price > 0 {
-				data.eval = alertEval{Price: q.Price, DayHigh: q.High, DayLow: q.Low, ChangePct: q.ChangePct}
+				data.eval = alertEval{Price: q.Price, DayHigh: q.High, DayLow: q.Low, ChangePct: q.ChangePct, DayVolume: q.Volume}
+				// 振幅回退基线：(high-low)/prev_close（估值源自带值优先，见下方按需覆盖）。
+				if q.PrevClose > 0 && q.High > 0 && q.High >= q.Low {
+					data.eval.Amplitude = round2((q.High - q.Low) / q.PrevClose * 100)
+				}
 				data.ok = true
-				// ma/breakout 才需要日线。
-				if rule.Kind == model.AlertKindMA || rule.Kind == model.AlertKindBreakout {
+				// ma/breakout/volume_surge 才需要日线。
+				if alertKindNeedsBars(rule.Kind) {
 					if bars, berr := s.market.GetDailyBars(ctx, rule.Market, rule.Symbol, alertBarLimit); berr == nil {
 						fillBars(&data.eval, bars)
 					}
@@ -400,11 +518,19 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 			continue
 		}
 		// 若已缓存但缺日线而本规则需要，补拉一次。
-		if (rule.Kind == model.AlertKindMA || rule.Kind == model.AlertKindBreakout) && len(data.eval.Closes) == 0 {
+		if alertKindNeedsBars(rule.Kind) && len(data.eval.Closes) == 0 {
 			if bars, berr := s.market.GetDailyBars(ctx, rule.Market, rule.Symbol, alertBarLimit); berr == nil {
 				fillBars(&data.eval, bars)
 				cache[key] = data
 			}
+		}
+		// 振幅规则优先用估值源自带振幅（腾讯行情串），每 symbol 只试一次，失败保留 quote 回退值。
+		if rule.Kind == model.AlertKindAmplitude && !data.valTried {
+			data.valTried = true
+			if v, verr := s.market.GetValuation(ctx, rule.Market, rule.Symbol); verr == nil && v.Amplitude > 0 {
+				data.eval.Amplitude = v.Amplitude
+			}
+			cache[key] = data
 		}
 
 		triggered, value, msg := evaluateAlert(rule, data.eval)
@@ -417,6 +543,8 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 			if rule.Once {
 				updates["status"] = model.AlertStatusTriggered
 			}
+			// 命中明细落库（同日去重，用旧 triggered_at 判断——须在规则行更新前）。
+			recordEvent(rule, msg, today, now)
 			// 同日去重：本规则今天尚未命中过才纳入推送。
 			if notifyOn && (rule.TriggeredAt == nil || rule.TriggeredAt.In(time.Local).Format("2006-01-02") != today) {
 				name := rule.Name

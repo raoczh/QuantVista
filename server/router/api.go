@@ -166,12 +166,15 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				recommendations.DELETE("/:id", recommendationCtl.Delete)
 			}
 
-			// 条件提醒（按用户隔离；命中落库供待办/页面高亮，配置了推送通道则额外推送）
+			// 条件提醒（按用户隔离；命中落明细事件供待办/命中历史，配置了推送通道则额外推送）
 			alerts := authed.Group("/alerts")
 			{
 				alerts.GET("", alertCtl.List)
 				alerts.POST("", alertCtl.Create)
 				alerts.POST("/evaluate", middleware.RateLimit(20, time.Minute), alertCtl.Evaluate)
+				alerts.GET("/events", alertCtl.ListEvents)
+				alerts.PUT("/events/read-all", alertCtl.ReadAllEvents)
+				alerts.PUT("/events/:id/status", alertCtl.SetEventStatus)
 				alerts.PUT("/:id", alertCtl.Update)
 				alerts.PUT("/:id/status", alertCtl.SetStatus)
 				alerts.DELETE("/:id", alertCtl.Delete)

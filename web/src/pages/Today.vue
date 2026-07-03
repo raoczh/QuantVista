@@ -3,6 +3,7 @@ import { ref, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { NButton, NSpin, NEmpty, NTag, NGrid, NGi, useMessage } from 'naive-ui'
 import { getTodos, type TodoItem, type TodoResult } from '@/api/todo'
+import { setAlertEventStatus } from '@/api/alert'
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
@@ -62,6 +63,22 @@ function handle(item: TodoItem) {
   }
 }
 
+// 提醒命中待办可就地完成：已读/忽略后从清单消失（ref_id 即 alert_event id）。
+const marking = ref<number | null>(null)
+async function markAlert(item: TodoItem, status: 'read' | 'dismissed') {
+  if (marking.value) return
+  marking.value = item.ref_id
+  try {
+    await setAlertEventStatus(item.ref_id, status)
+    message.success(status === 'read' ? '已标记已读' : '已忽略')
+    await load()
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    marking.value = null
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -109,7 +126,15 @@ onMounted(load)
                 <div class="item-detail">{{ it.detail }}</div>
                 <div v-if="it.time" class="item-time">{{ fmtTime(it.time) }}</div>
               </div>
-              <n-button size="small" tertiary @click="handle(it)">去处理</n-button>
+              <div class="item-actions">
+                <template v-if="it.kind === 'alert'">
+                  <n-button size="small" quaternary :loading="marking === it.ref_id" @click="markAlert(it, 'read')"
+                    >已读</n-button
+                  >
+                  <n-button size="small" quaternary @click="markAlert(it, 'dismissed')">忽略</n-button>
+                </template>
+                <n-button size="small" tertiary @click="handle(it)">去处理</n-button>
+              </div>
             </div>
           </div>
         </n-spin>
@@ -175,5 +200,11 @@ onMounted(load)
   font-size: 11px;
   opacity: 0.5;
   margin-top: 3px;
+}
+.item-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
 }
 </style>

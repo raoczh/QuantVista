@@ -13,21 +13,22 @@ import (
 func TestTodoBuild(t *testing.T) {
 	setupTestDB(t)
 	common.DB.Exec("DELETE FROM alert_rules")
+	common.DB.Exec("DELETE FROM alert_events")
 	common.DB.Exec("DELETE FROM recommendation_statuses")
 	common.DB.Exec("DELETE FROM positions")
 
-	// 命中的提醒（用户1）。
+	// 未读的提醒命中事件（用户1）——批次 H 起待办以 alert_events unread 为准。
 	now := time.Now()
-	common.DB.Create(&model.AlertRule{UserID: 1, Symbol: "600000", Market: "cn", Name: "浦发银行",
-		Kind: model.AlertKindPrice, Op: model.AlertOpGTE, Threshold: 11,
-		Status: model.AlertStatusTriggered, TriggerMsg: "当日最高触及 ≥ 11", TriggeredAt: &now})
-	common.DB.Create(&model.AlertRule{UserID: 1, Symbol: "600519", Market: "cn", Name: "贵州茅台",
-		Kind: model.AlertKindPrice, Op: model.AlertOpGTE, Threshold: 1800,
-		Status: model.AlertStatusActive, TriggerMsg: "非一次性提醒今日命中", TriggeredAt: &now,
-		LastCheckDate: now.In(time.Local).Format("2006-01-02")})
-	// 他人命中（不应出现）。
-	common.DB.Create(&model.AlertRule{UserID: 2, Symbol: "000001", Market: "cn",
-		Kind: model.AlertKindPrice, Op: model.AlertOpGTE, Threshold: 1, Status: model.AlertStatusTriggered, TriggeredAt: &now})
+	common.DB.Create(&model.AlertEvent{RuleID: 1, UserID: 1, Symbol: "600000", Market: "cn", Name: "浦发银行",
+		Kind: model.AlertKindPrice, Message: "当日最高触及 ≥ 11", TriggeredAt: now, Status: model.AlertEventUnread})
+	common.DB.Create(&model.AlertEvent{RuleID: 2, UserID: 1, Symbol: "600519", Market: "cn", Name: "贵州茅台",
+		Kind: model.AlertKindVolumeSurge, Message: "当日量达 20 日均量的 2.50 倍", TriggeredAt: now, Status: model.AlertEventUnread})
+	// 已读事件不进待办。
+	common.DB.Create(&model.AlertEvent{RuleID: 3, UserID: 1, Symbol: "000002", Market: "cn", Name: "万科A",
+		Kind: model.AlertKindPrice, Message: "已处理过的命中", TriggeredAt: now, Status: model.AlertEventRead})
+	// 他人事件（不应出现）。
+	common.DB.Create(&model.AlertEvent{RuleID: 4, UserID: 2, Symbol: "000001", Market: "cn",
+		Kind: model.AlertKindPrice, Message: "他人命中", TriggeredAt: now, Status: model.AlertEventUnread})
 
 	// 需复盘的短线推荐：止损（priority 1）+ 过期（priority 2）。
 	common.DB.Create(&model.RecommendationStatus{RecommendationID: 1, BatchID: 10, UserID: 1, Symbol: "600519",
@@ -46,7 +47,7 @@ func TestTodoBuild(t *testing.T) {
 	}
 
 	if res.Alerts != 2 {
-		t.Fatalf("命中提醒应为 2，得到 %d", res.Alerts)
+		t.Fatalf("命中提醒应为 2（未读事件，已读不计），得到 %d", res.Alerts)
 	}
 	if res.Reviews != 2 {
 		t.Fatalf("推荐复盘应为 2，得到 %d", res.Reviews)
@@ -57,6 +58,12 @@ func TestTodoBuild(t *testing.T) {
 	// 排序：优先级 1 的（提醒命中 + 止损复盘）排在过期复盘（优先级 2）之前。
 	if res.Items[len(res.Items)-1].Priority != 2 {
 		t.Fatalf("最后一项应为优先级 2（过期），得到 %d", res.Items[len(res.Items)-1].Priority)
+	}
+	// alert 条目的 RefID 应为事件 id（供前端标记已读/忽略）。
+	for _, it := range res.Items {
+		if it.Kind == TodoKindAlert && it.RefID == 0 {
+			t.Fatalf("alert 待办应携带事件 id: %+v", it)
+		}
 	}
 
 	// 用户隔离：用户2 只见自己的 1 条命中提醒。
