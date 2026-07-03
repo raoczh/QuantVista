@@ -13,6 +13,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/login/callback', name: 'oauth-callback', component: () => import('@/pages/OAuthCallback.vue'), meta: { bare: true, public: true, title: '登录中' } },
 
   { path: '/', name: 'home', component: Home, meta: { title: '市场首页' } },
+  { path: '/stocks/:market/:symbol', name: 'stock-detail', component: () => import('@/pages/StockDetail.vue'), meta: { title: '个股详情' } },
   { path: '/today', name: 'today', component: () => import('@/pages/Today.vue'), meta: { title: '今日待办' } },
   { path: '/watchlist', name: 'watchlist', component: () => import('@/pages/Watchlist.vue'), meta: { title: '自选股' } },
   { path: '/positions', name: 'positions', component: () => import('@/pages/Positions.vue'), meta: { title: '持仓' } },
@@ -62,6 +63,8 @@ router.beforeEach(async (to) => {
   // 公开页：已登录则跳离登录页。
   if (to.meta.public) {
     if (auth.isLoggedIn && (to.name === 'login' || to.name === 'oauth-callback')) {
+      // GitHub 绑定与登录共用回调页：已登录且带绑定标记时放行，让回调页完成绑定。
+      if (to.name === 'oauth-callback' && auth.pendingGithubBind()) return true
       return { name: 'home' }
     }
     return true

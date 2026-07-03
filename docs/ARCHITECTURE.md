@@ -441,6 +441,7 @@ AI 结果：
 实际路由（`web/src/router/index.ts`）：
 
 - `/`：市场首页
+- `/stocks/:market/:symbol`：个股详情（行情/日K/估值/评分 + 快捷动作，2026-07-03；首页榜单行与个股速查可点击进入，`useStockActions.goDetail` 供各处复用）
 - `/login`（+ `/login/callback` OAuth 回调）、`/setup`：登录 / 首启建管理员
 - `/today`：今日待办/待复盘
 - `/watchlist`：自选股

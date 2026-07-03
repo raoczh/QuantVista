@@ -38,6 +38,11 @@ export function useStockActions(onNavigate?: () => void) {
   function goThesis(s: StockRef) {
     go('thesis', { add: '1', symbol: s.symbol, market: s.market, name: s.name })
   }
+  /** 个股详情页（行情/K线/估值/评分一页看全） */
+  function goDetail(s: StockRef) {
+    onNavigate?.()
+    router.push({ name: 'stock-detail', params: { market: s.market || 'cn', symbol: s.symbol } })
+  }
 
   /** 加入第一个自选分组（自用默认习惯，免选组打断） */
   async function addToWatchlist(s: StockRef) {
@@ -57,5 +62,5 @@ export function useStockActions(onNavigate?: () => void) {
     }
   }
 
-  return { adding, goAnalysis, goQa, goCompare, goAlert, goThesis, addToWatchlist }
+  return { adding, goAnalysis, goQa, goCompare, goAlert, goThesis, goDetail, addToWatchlist }
 }

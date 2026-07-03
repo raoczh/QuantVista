@@ -29,7 +29,7 @@ import ChangeTag from '@/components/ChangeTag.vue'
 const message = useMessage()
 const router = useRouter()
 const { vars, isDark, pctColor, upColor, downColor, flatColor, withAlpha } = useUi()
-const { adding, goAnalysis, goQa, goCompare, goAlert, addToWatchlist } = useStockActions()
+const { adding, goAnalysis, goQa, goCompare, goAlert, goDetail, addToWatchlist } = useStockActions()
 
 // ---------- 市场概览 ----------
 const overview = ref<Overview | null>(null)
@@ -342,7 +342,7 @@ function onResize() {
           <SectionCard title="涨幅榜">
             <RankList v-if="overview?.gainers?.length" :items="overview.gainers">
               <template #row="{ item }">
-                <div class="stock-row">
+                <div class="stock-row stock-row-link" @click="goDetail({ symbol: item.symbol, market: 'cn', name: item.name })">
                   <div class="sr-name">
                     <span class="sr-title">{{ item.name }}</span>
                     <span class="sr-symbol qv-mono">{{ item.symbol }}</span>
@@ -362,7 +362,7 @@ function onResize() {
           <SectionCard title="热门榜（成交额）">
             <RankList v-if="overview?.actives?.length" :items="overview.actives">
               <template #row="{ item }">
-                <div class="stock-row">
+                <div class="stock-row stock-row-link" @click="goDetail({ symbol: item.symbol, market: 'cn', name: item.name })">
                   <div class="sr-name">
                     <span class="sr-title">{{ item.name }}</span>
                     <span class="sr-symbol qv-mono">{{ item.symbol }}</span>
@@ -547,6 +547,7 @@ function onResize() {
 
           <!-- 快捷动作：查到即可直达，不用换页面重输代码 -->
           <div class="quote-actions">
+            <n-button size="small" secondary type="primary" @click="goDetail(quote)">个股详情</n-button>
             <n-button size="small" secondary @click="goAnalysis(quote)">AI 分析</n-button>
             <n-button size="small" secondary @click="goQa(quote)">个股问答</n-button>
             <n-button size="small" secondary @click="goCompare(quote)">横向对比</n-button>
@@ -693,6 +694,9 @@ function onResize() {
   justify-content: space-between;
   gap: 12px;
   width: 100%;
+}
+.stock-row-link {
+  cursor: pointer;
 }
 .sr-name {
   display: flex;
