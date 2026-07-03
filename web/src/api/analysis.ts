@@ -11,6 +11,7 @@ export interface AnalyzeRequest {
   target?: string
   llm_config_id?: number
   question?: string
+  mode?: 'panel' // 缺省=标准分析；panel=多角色观点（仅个股）
 }
 
 // 结构化分析结果。
@@ -22,7 +23,41 @@ export interface AnalysisResult {
   risks: string[]
   opportunities: string[]
   suggestions: string[]
+  anti_thesis: string[] // 反方观点：为什么结论可能是错的
+  kill_switches: string[] // 结论失效条件
+  unknowns: string[] // 数据盲区
   disclaimer: string
+}
+
+// 多角色观点（mode=panel）。
+export type PanelRoleKind = 'technical' | 'momentum' | 'risk' | 'contrarian'
+export interface PanelRole {
+  role: PanelRoleKind
+  rating: AnalysisRating
+  summary: string
+}
+export interface PanelResult {
+  roles: PanelRole[]
+  consensus: string
+  disagreement: string
+}
+
+// 与上一份同对象成功分析的差异（变化检测）。
+export interface AnalysisDiff {
+  prev_id: number
+  prev_at: string
+  prev_title: string
+  rating_from: AnalysisRating | ''
+  rating_to: AnalysisRating | ''
+  confidence_from: number
+  confidence_to: number
+  confidence_delta: number
+  summary_prev: string
+  summary_now: string
+  highlights_added: string[]
+  highlights_removed: string[]
+  risks_added: string[]
+  risks_removed: string[]
 }
 
 // 分析记录（列表项不含 result_json/data_snapshot）。
@@ -34,6 +69,7 @@ export interface AnalysisRecord {
   target: string
   title: string
   status: AnalysisStatus
+  mode: '' | 'panel'
   rating: AnalysisRating | ''
   confidence: number
   summary: string
@@ -55,6 +91,7 @@ export interface AnalysisRecord {
 // 详情/发起返回的视图。
 export interface AnalysisView extends AnalysisRecord {
   result: AnalysisResult | null
+  panel: PanelResult | null
   raw: string
 }
 
@@ -76,4 +113,8 @@ export function getAnalysis(id: number) {
 
 export function deleteAnalysis(id: number) {
   return request<{ ok: boolean }>({ url: `/analysis/${id}`, method: 'delete' })
+}
+
+export function getAnalysisDiff(id: number) {
+  return request<AnalysisDiff>({ url: `/analysis/${id}/diff`, method: 'get' })
 }

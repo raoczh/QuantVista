@@ -17,6 +17,9 @@ const (
 	AnalysisRatingBullish = "bullish"
 	AnalysisRatingNeutral = "neutral"
 	AnalysisRatingBearish = "bearish"
+
+	AnalysisModeStandard = ""      // 标准单视角分析
+	AnalysisModePanel    = "panel" // 多角色观点（仅个股模块）
 )
 
 // AnalysisRecord 一次 AI 分析的完整档案。按 user_id 隔离。
@@ -32,10 +35,11 @@ type AnalysisRecord struct {
 	Title  string `gorm:"size:128" json:"title"`
 
 	Status     string `gorm:"size:16" json:"status"`
-	Rating     string `gorm:"size:16" json:"rating"`     // 抽取到列，便于列表快速展示
-	Confidence int    `json:"confidence"`                // 0-100
-	Summary    string `gorm:"size:1024" json:"summary"`  // 一句话总览（降级时为截断原文）
-	Error      string `gorm:"size:512" json:"error"`     // 失败/降级原因
+	Mode       string `gorm:"size:16" json:"mode"`      // ""=标准 / "panel"=多角色观点
+	Rating     string `gorm:"size:16" json:"rating"`    // 抽取到列，便于列表快速展示
+	Confidence int    `json:"confidence"`               // 0-100
+	Summary    string `gorm:"size:1024" json:"summary"` // 一句话总览（降级时为截断原文）
+	Error      string `gorm:"size:512" json:"error"`    // 失败/降级原因
 
 	// 重字段：列表不返回，仅详情返回。
 	ResultJSON   string `gorm:"type:text" json:"result_json,omitempty"`   // 结构化结果 JSON（降级存原文）

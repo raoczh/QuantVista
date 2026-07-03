@@ -29,13 +29,15 @@ const (
 	qaMaxMessages      = 100 // 单会话消息上限
 )
 
-// QaAskRequest 提问入参。ConversationID=0 表示新建会话（需 Symbol/Market）。
+// QaAskRequest 提问入参。ConversationID=0 表示新建会话（需 Symbol/Market，
+// 或给 AnalysisRecordID 复用该分析记录的数据快照——从分析结果一键「继续问答」）。
 type QaAskRequest struct {
-	ConversationID int64  `json:"conversation_id"`
-	Symbol         string `json:"symbol"`
-	Market         string `json:"market"`
-	LLMConfigID    int64  `json:"llm_config_id"`
-	Question       string `json:"question"`
+	ConversationID   int64  `json:"conversation_id"`
+	Symbol           string `json:"symbol"`
+	Market           string `json:"market"`
+	LLMConfigID      int64  `json:"llm_config_id"`
+	Question         string `json:"question"`
+	AnalysisRecordID int64  `json:"analysis_record_id"` // >0：新会话复用该分析记录快照（须本人的个股分析）
 }
 
 // QaConversationView 会话 + 消息列表。
@@ -77,6 +79,12 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 		if conv.MessageCount >= qaMaxMessages {
 			return nil, errors.New("该会话消息已达上限，请新建会话")
 		}
+	} else if req.AnalysisRecordID > 0 {
+		c, cerr := qaConversationFromAnalysis(userID, req.AnalysisRecordID, cfg, question)
+		if cerr != nil {
+			return nil, cerr
+		}
+		conv = *c
 	} else {
 		name, snap, err := buildStockSnapshot(ctx, s.market, req.Symbol, req.Market)
 		if err != nil {
@@ -145,6 +153,34 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 	}
 
 	return s.Get(userID, conv.ID)
+}
+
+// qaConversationFromAnalysis 从分析记录新建问答会话：复用其数据快照（已 fitBudget），
+// 不重复拉数——问答的上下文与分析所见完全一致，追问「刚才的结论」才有据可依。
+// 校验归属（仅本人）且必须是带快照的个股分析。落库后返回。
+func qaConversationFromAnalysis(userID, recordID int64, cfg *model.LLMConfig, question string) (*model.AiConversation, error) {
+	var rec model.AnalysisRecord
+	if err := common.DB.Select("id", "user_id", "module", "market", "symbol", "target", "data_snapshot").
+		Where("id = ? AND user_id = ?", recordID, userID).First(&rec).Error; err != nil {
+		return nil, errors.New("分析记录不存在")
+	}
+	if rec.Module != model.AnalysisModuleStock || rec.Symbol == "" || rec.DataSnapshot == "" {
+		return nil, errors.New("仅带数据快照的个股分析可发起问答")
+	}
+	name := rec.Target
+	if name == "" {
+		name = rec.Symbol
+	}
+	conv := &model.AiConversation{
+		UserID: userID, Symbol: rec.Symbol, Market: rec.Market, Name: name,
+		Title:       truncateRunes(question, 128),
+		LLMConfigID: cfg.ID, Provider: cfg.Provider, Model: cfg.Model,
+		DataSnapshot: rec.DataSnapshot,
+	}
+	if err := common.DB.Create(conv).Error; err != nil {
+		return nil, err
+	}
+	return conv, nil
 }
 
 // buildMessages 组装发送给 LLM 的消息序列。系统提示含个股数据快照，历史仅取最近若干条。

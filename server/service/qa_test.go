@@ -95,3 +95,38 @@ func TestQaListGetDelete(t *testing.T) {
 		t.Fatalf("删除会话应级联删消息，剩 %d", msgCnt)
 	}
 }
+
+// TestQaConversationFromAnalysis 从分析记录发起问答：快照复用、归属校验、模块校验（DB 集成）。
+func TestQaConversationFromAnalysis(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Exec("DELETE FROM analysis_records")
+	common.DB.Exec("DELETE FROM ai_conversations")
+	cfg := &model.LLMConfig{ID: 9, Provider: "openai", Model: "gpt-x"}
+
+	rec := &model.AnalysisRecord{UserID: 1, Module: model.AnalysisModuleStock, Market: "cn", Symbol: "600519",
+		Target: "贵州茅台", Status: model.AnalysisStatusSuccess, DataSnapshot: `{"quote":{"price":1700}}`}
+	common.DB.Create(rec)
+	nonStock := &model.AnalysisRecord{UserID: 1, Module: model.AnalysisModuleMarket, Market: "cn",
+		Status: model.AnalysisStatusSuccess, DataSnapshot: `{"x":1}`}
+	common.DB.Create(nonStock)
+
+	conv, err := qaConversationFromAnalysis(1, rec.ID, cfg, "现在的估值贵吗")
+	if err != nil {
+		t.Fatalf("从个股分析发起问答失败: %v", err)
+	}
+	if conv.DataSnapshot != rec.DataSnapshot {
+		t.Fatalf("会话快照应复用分析快照")
+	}
+	if conv.Symbol != "600519" || conv.Name != "贵州茅台" {
+		t.Fatalf("标的信息应取自分析记录: %+v", conv)
+	}
+
+	// 非个股模块拒绝。
+	if _, err := qaConversationFromAnalysis(1, nonStock.ID, cfg, "q"); err == nil {
+		t.Fatalf("非个股分析应拒绝")
+	}
+	// 跨用户拒绝。
+	if _, err := qaConversationFromAnalysis(2, rec.ID, cfg, "q"); err == nil {
+		t.Fatalf("跨用户应拒绝")
+	}
+}

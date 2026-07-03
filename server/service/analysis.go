@@ -8,6 +8,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	"quantvista/common"
 	"quantvista/model"
@@ -48,7 +49,7 @@ func NewAnalysisService(market *MarketService, watchlist *WatchlistService, posi
 
 // 版本号：数据快照 + 这两个版本号共同保证「凭版本号复现」。改 prompt/策略时递增。
 const (
-	analysisPromptVersion   = "p2" // p2: 个股模块加入估值/盘面快照维度与数据新鲜度标注
+	analysisPromptVersion   = "p3" // p3: 输出 schema 加入反方观点/失效条件/数据盲区；p2: 个股模块加入估值/盘面快照维度
 	analysisStrategyVersion = "s1"
 	maxRepairAttempts       = 2 // 结构化校验失败后的额外重试次数（总调用 = 1 + maxRepairAttempts）
 )
@@ -69,6 +70,7 @@ type AnalyzeRequest struct {
 	Target      string `json:"target"`        // 板块名 / 自由标签（可选）
 	LLMConfigID int64  `json:"llm_config_id"` // 0 = 用默认配置
 	Question    string `json:"question"`      // 用户附加问题（可选）
+	Mode        string `json:"mode"`          // ""=标准 / "panel"=多角色观点（仅 stock 模块）
 }
 
 // AnalysisResult 结构化分析结果（要求 LLM 严格按此 schema 输出 JSON）。
@@ -80,13 +82,31 @@ type AnalysisResult struct {
 	Risks         []string `json:"risks"`         // 风险
 	Opportunities []string `json:"opportunities"` // 机会
 	Suggestions   []string `json:"suggestions"`   // 关注点/操作参考（非投资建议）
+	AntiThesis    []string `json:"anti_thesis"`   // 反方观点：为什么这个结论可能是错的
+	KillSwitches  []string `json:"kill_switches"` // 结论失效条件：出现什么信号说明判断已不成立
+	Unknowns      []string `json:"unknowns"`      // 数据盲区：本次数据看不到、但对结论重要的信息
 	Disclaimer    string   `json:"disclaimer"`    // 免责声明
+}
+
+// PanelRole 多角色观点中的单个角色结论。
+type PanelRole struct {
+	Role    string `json:"role"`    // technical / momentum / risk / contrarian
+	Rating  string `json:"rating"`  // bullish / neutral / bearish
+	Summary string `json:"summary"` // 该角色核心观点
+}
+
+// PanelResult 多角色观点结果（mode=panel 时落库 result_json.panel）。
+type PanelResult struct {
+	Roles        []PanelRole `json:"roles"`
+	Consensus    string      `json:"consensus"`    // 四角色共识
+	Disagreement string      `json:"disagreement"` // 主要分歧与取决条件
 }
 
 // AnalysisView 返回给前端：记录 + 解析后的结构化结果。
 type AnalysisView struct {
 	model.AnalysisRecord
 	Result *AnalysisResult `json:"result"` // 结构化结果；degraded/failed 时可能为 nil
+	Panel  *PanelResult    `json:"panel"`  // 多角色观点（mode=panel 且 success 时非 nil）
 	Raw    string          `json:"raw"`    // 降级时的模型原文
 }
 
@@ -95,6 +115,13 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	req.Module = strings.ToLower(strings.TrimSpace(req.Module))
 	if !validAnalysisModule[req.Module] {
 		return nil, errors.New("不支持的分析模块")
+	}
+	req.Mode = strings.ToLower(strings.TrimSpace(req.Mode))
+	if req.Mode != model.AnalysisModeStandard && req.Mode != model.AnalysisModePanel {
+		return nil, errors.New("不支持的分析模式")
+	}
+	if req.Mode == model.AnalysisModePanel && req.Module != model.AnalysisModuleStock {
+		return nil, errors.New("多角色观点仅支持个股模块")
 	}
 	if len([]rune(req.Question)) > 500 {
 		return nil, errors.New("附加问题过长（最多 500 字）")
@@ -125,7 +152,7 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	// 4) 构造消息并调用 + 结构化校验/repair。
 	messages := s.buildMessages(userID, req, actx, string(snapshotJSON))
 	promptVersion := analysisPromptVersion
-	if userPromptOverride(userID, req.Module) != "" {
+	if req.Mode == model.AnalysisModeStandard && userPromptOverride(userID, req.Module) != "" {
 		// 标记本次使用了用户自定义模板——否则历史记录声称 p1 却无法按 p1 复现。
 		// （模板内容可被用户随后编辑，完整快照留待 ai_call_logs，当前仅标记。）
 		promptVersion = analysisPromptVersion + "-custom"
@@ -133,10 +160,11 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	rec := &model.AnalysisRecord{
 		UserID:          userID,
 		Module:          req.Module,
+		Mode:            req.Mode,
 		Market:          normalizeMarketOnly(req.Market),
 		Symbol:          strings.TrimSpace(req.Symbol),
 		Target:          actx.Label,
-		Title:           s.title(req.Module, actx.Label),
+		Title:           s.title(req.Module, req.Mode, actx.Label),
 		LLMConfigID:     cfg.ID,
 		Provider:        cfg.Provider,
 		Model:           cfg.Model,
@@ -145,7 +173,31 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 		DataSnapshot:    string(snapshotJSON),
 	}
 
-	result, raw, usage, latency, callErr := s.callWithRepair(ctx, cfg, apiKey, allowPrivate, messages)
+	// 解析器按模式分流：标准 → AnalysisResult；panel → PanelResult。
+	var result *AnalysisResult
+	var panel *PanelResult
+	parse := func(content string) error {
+		if req.Mode == model.AnalysisModePanel {
+			p, perr := parsePanelResult(content)
+			if perr != nil {
+				return perr
+			}
+			panel = p
+			return nil
+		}
+		r, perr := parseAnalysisResult(content)
+		if perr != nil {
+			return perr
+		}
+		result = r
+		return nil
+	}
+	repairHint := analysisRepairHint
+	if req.Mode == model.AnalysisModePanel {
+		repairHint = panelRepairHint
+	}
+
+	raw, usage, latency, callErr := s.callWithRepair(ctx, cfg, apiKey, allowPrivate, messages, parse, repairHint)
 	rec.PromptTokens = usage.PromptTokens
 	rec.CompletionTokens = usage.CompletionTokens
 	rec.TotalTokens = usage.TotalTokens
@@ -173,6 +225,13 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 		rec.Summary = truncateRunes(result.Summary, 1024)
 		b, _ := json.Marshal(result)
 		rec.ResultJSON = string(b)
+	case panel != nil:
+		// panel：rating 取多数投票（平票中性），summary 存共识。
+		rec.Status = model.AnalysisStatusSuccess
+		rec.Rating = panelMajorityRating(panel.Roles)
+		rec.Summary = truncateRunes(panel.Consensus, 1024)
+		b, _ := json.Marshal(map[string]any{"panel": panel})
+		rec.ResultJSON = string(b)
 	default:
 		// 有原文但结构化校验始终不过：优雅降级，保留原文供人看，不伪造结构化字段。
 		rec.Status = model.AnalysisStatusDegraded
@@ -188,9 +247,15 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	return s.toView(*rec), nil
 }
 
-// callWithRepair 调用 LLM 并在结构化校验失败时有限次 repair。累计各次调用的 token。
-// 返回：解析成功的结果（失败为 nil）、最后一次原文、累计 usage、最后一次延迟、调用错误（网络/鉴权等，非校验失败）。
-func (s *AnalysisService) callWithRepair(ctx context.Context, cfg *model.LLMConfig, apiKey string, allowPrivate bool, messages []chatMessage) (*AnalysisResult, string, chatUsage, int64, error) {
+// analysisRepairHint / panelRepairHint 结构化校验失败后的修复指令。
+const analysisRepairHint = "请只输出一个合法 JSON 对象，严格包含字段 rating(bullish/neutral/bearish)、confidence(0-100 整数)、summary、highlights、risks、opportunities、suggestions、anti_thesis、kill_switches、unknowns、disclaimer，不要任何解释或代码块标记。"
+
+const panelRepairHint = "请只输出一个合法 JSON 对象，严格包含字段 roles（恰好 4 个元素的数组，每个元素含 role(technical/momentum/risk/contrarian)、rating(bullish/neutral/bearish)、summary）、consensus、disagreement，不要任何解释或代码块标记。"
+
+// callWithRepair 调用 LLM 并在结构化校验失败时有限次 repair（parse 由调用方按模式提供）。
+// 累计各次调用的 token。返回：最后一次原文、累计 usage、最后一次延迟、调用错误（网络/鉴权等，非校验失败）。
+// parse 返回 nil 即视为成功（解析结果由闭包带出）。
+func (s *AnalysisService) callWithRepair(ctx context.Context, cfg *model.LLMConfig, apiKey string, allowPrivate bool, messages []chatMessage, parse func(string) error, repairHint string) (string, chatUsage, int64, error) {
 	var acc chatUsage
 	var lastRaw string
 	var lastLatency int64
@@ -209,7 +274,7 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, cfg *model.LLMConf
 		})
 		if err != nil {
 			// 网络/鉴权/服务端错误：若已有过成功响应文本则不再重试，直接返回错误。
-			return nil, lastRaw, acc, lastLatency, err
+			return lastRaw, acc, lastLatency, err
 		}
 		acc.PromptTokens += res.Usage.PromptTokens
 		acc.CompletionTokens += res.Usage.CompletionTokens
@@ -217,18 +282,17 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, cfg *model.LLMConf
 		lastRaw = res.Content
 		lastLatency = res.LatencyMs
 
-		parsed, perr := parseAnalysisResult(res.Content)
+		perr := parse(res.Content)
 		if perr == nil {
-			return parsed, lastRaw, acc, lastLatency, nil
+			return lastRaw, acc, lastLatency, nil
 		}
 		// 校验失败：追加 repair 指令再试。
 		convo = append(convo,
 			chatMessage{Role: "assistant", Content: res.Content},
-			chatMessage{Role: "user", Content: "上一条输出不符合要求：" + perr.Error() +
-				"。请只输出一个合法 JSON 对象，严格包含字段 rating(bullish/neutral/bearish)、confidence(0-100 整数)、summary、highlights、risks、opportunities、suggestions、disclaimer，不要任何解释或代码块标记。"},
+			chatMessage{Role: "user", Content: "上一条输出不符合要求：" + perr.Error() + "。" + repairHint},
 		)
 	}
-	return nil, lastRaw, acc, lastLatency, nil // 降级
+	return lastRaw, acc, lastLatency, nil // 降级
 }
 
 // History 列出分析历史（不返回重字段 result_json/data_snapshot）。
@@ -246,7 +310,7 @@ func (s *AnalysisService) History(userID int64, module string, limit int) ([]mod
 	var rows []model.AnalysisRecord
 	// 显式选列，避免把大字段 result_json/data_snapshot 拉进列表。
 	err := q.Select("id", "user_id", "module", "market", "symbol", "target", "title",
-		"status", "rating", "confidence", "summary", "error",
+		"status", "mode", "rating", "confidence", "summary", "error",
 		"llm_config_id", "provider", "model", "prompt_version", "strategy_version",
 		"prompt_tokens", "completion_tokens", "total_tokens", "latency_ms",
 		"created_at", "updated_at").
@@ -282,11 +346,110 @@ func (s *AnalysisService) Delete(userID, id int64) error {
 	return nil
 }
 
-// toView 把落库记录还原为前端视图（解析结构化结果 / 降级原文）。
+// AnalysisDiff 与上一份同对象成功分析的差异（变化检测）。
+type AnalysisDiff struct {
+	PrevID            int64     `json:"prev_id"`
+	PrevAt            time.Time `json:"prev_at"`
+	PrevTitle         string    `json:"prev_title"`
+	RatingFrom        string    `json:"rating_from"`
+	RatingTo          string    `json:"rating_to"`
+	ConfidenceFrom    int       `json:"confidence_from"`
+	ConfidenceTo      int       `json:"confidence_to"`
+	ConfidenceDelta   int       `json:"confidence_delta"`
+	SummaryPrev       string    `json:"summary_prev"`
+	SummaryNow        string    `json:"summary_now"`
+	HighlightsAdded   []string  `json:"highlights_added"`   // 本次新增的要点
+	HighlightsRemoved []string  `json:"highlights_removed"` // 上次有、本次消失的要点
+	RisksAdded        []string  `json:"risks_added"`
+	RisksRemoved      []string  `json:"risks_removed"`
+}
+
+// Diff 变化检测：找同 user+module+market+symbol（sector 模块再限定同 target）的上一份
+// 成功分析，对比 rating/confidence/summary/highlights/risks。多角色（panel）记录无标准
+// 字段，不参与对比（两侧都限定标准模式）。
+func (s *AnalysisService) Diff(userID, id int64) (*AnalysisDiff, error) {
+	var cur model.AnalysisRecord
+	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&cur).Error; err != nil {
+		return nil, errors.New("分析记录不存在")
+	}
+	if cur.Status != model.AnalysisStatusSuccess {
+		return nil, errors.New("仅成功的分析可对比")
+	}
+	if cur.Mode == model.AnalysisModePanel {
+		return nil, errors.New("多角色观点暂不支持对比")
+	}
+
+	q := common.DB.Where(
+		"user_id = ? AND module = ? AND market = ? AND symbol = ? AND status = ? AND mode = ? AND id < ?",
+		userID, cur.Module, cur.Market, cur.Symbol, model.AnalysisStatusSuccess, model.AnalysisModeStandard, cur.ID,
+	)
+	if cur.Module == model.AnalysisModuleSector {
+		q = q.Where("target = ?", cur.Target)
+	}
+	var prev model.AnalysisRecord
+	if err := q.Order("id DESC").First(&prev).Error; err != nil {
+		return nil, errors.New("没有更早的同对象成功分析可对比")
+	}
+
+	var curRes, prevRes AnalysisResult
+	_ = json.Unmarshal([]byte(cur.ResultJSON), &curRes)
+	_ = json.Unmarshal([]byte(prev.ResultJSON), &prevRes)
+
+	d := &AnalysisDiff{
+		PrevID:          prev.ID,
+		PrevAt:          prev.CreatedAt,
+		PrevTitle:       prev.Title,
+		RatingFrom:      prev.Rating,
+		RatingTo:        cur.Rating,
+		ConfidenceFrom:  prev.Confidence,
+		ConfidenceTo:    cur.Confidence,
+		ConfidenceDelta: cur.Confidence - prev.Confidence,
+		SummaryPrev:     prev.Summary,
+		SummaryNow:      cur.Summary,
+	}
+	d.HighlightsAdded, d.HighlightsRemoved = diffStringSets(prevRes.Highlights, curRes.Highlights)
+	d.RisksAdded, d.RisksRemoved = diffStringSets(prevRes.Risks, curRes.Risks)
+	return d, nil
+}
+
+// diffStringSets 返回（cur 相对 prev 新增的、prev 有而 cur 没有的），按原顺序，精确匹配。
+func diffStringSets(prev, cur []string) (added, removed []string) {
+	added, removed = []string{}, []string{}
+	prevSet := make(map[string]bool, len(prev))
+	for _, s := range prev {
+		prevSet[strings.TrimSpace(s)] = true
+	}
+	curSet := make(map[string]bool, len(cur))
+	for _, s := range cur {
+		curSet[strings.TrimSpace(s)] = true
+	}
+	for _, s := range cur {
+		if !prevSet[strings.TrimSpace(s)] {
+			added = append(added, s)
+		}
+	}
+	for _, s := range prev {
+		if !curSet[strings.TrimSpace(s)] {
+			removed = append(removed, s)
+		}
+	}
+	return added, removed
+}
+
+// toView 把落库记录还原为前端视图（解析结构化结果 / 多角色结果 / 降级原文）。
 func (s *AnalysisService) toView(rec model.AnalysisRecord) *AnalysisView {
 	v := &AnalysisView{AnalysisRecord: rec}
 	switch rec.Status {
 	case model.AnalysisStatusSuccess:
+		if rec.Mode == model.AnalysisModePanel {
+			var wrap struct {
+				Panel *PanelResult `json:"panel"`
+			}
+			if json.Unmarshal([]byte(rec.ResultJSON), &wrap) == nil {
+				v.Panel = wrap.Panel
+			}
+			return v
+		}
 		var r AnalysisResult
 		if json.Unmarshal([]byte(rec.ResultJSON), &r) == nil {
 			v.Result = &r
@@ -297,7 +460,7 @@ func (s *AnalysisService) toView(rec model.AnalysisRecord) *AnalysisView {
 	return v
 }
 
-func (s *AnalysisService) title(module, label string) string {
+func (s *AnalysisService) title(module, mode, label string) string {
 	names := map[string]string{
 		model.AnalysisModuleMarket:    "全市场分析",
 		model.AnalysisModuleSector:    "板块分析",
@@ -306,6 +469,9 @@ func (s *AnalysisService) title(module, label string) string {
 		model.AnalysisModulePosition:  "持仓分析",
 	}
 	base := names[module]
+	if mode == model.AnalysisModePanel {
+		base = "个股多角色观点"
+	}
 	if label != "" && module != model.AnalysisModuleMarket {
 		return base + " · " + label
 	}
@@ -330,10 +496,11 @@ func (s *AnalysisService) addUsage(userID int64, tokens int) {
 
 // --- prompt 构造与结果校验 ---
 
-// buildMessages 组装系统提示 + 用户消息（含数据快照 JSON）。系统提示按模块定制，且尊重用户自定义模板。
+// buildMessages 组装系统提示 + 用户消息（含数据快照 JSON）。系统提示按模块定制，且尊重用户自定义模板；
+// panel 模式使用专属多角色系统提示（不套用用户模板——panel 是固定编排）。
 func (s *AnalysisService) buildMessages(userID int64, req AnalyzeRequest, actx *analysisContext, snapshotJSON string) []chatMessage {
 	var b strings.Builder
-	fmt.Fprintf(&b, "请对以下【%s】进行分析。\n\n", s.title(req.Module, actx.Label))
+	fmt.Fprintf(&b, "请对以下【%s】进行分析。\n\n", s.title(req.Module, req.Mode, actx.Label))
 	if q := strings.TrimSpace(req.Question); q != "" {
 		fmt.Fprintf(&b, "用户特别关注的问题（请在分析中优先回应）：%s\n\n", q)
 	}
@@ -343,8 +510,12 @@ func (s *AnalysisService) buildMessages(userID int64, req AnalyzeRequest, actx *
 		"非交易时段采集的数据反映最近一个交易日，不代表实时状态，分析措辞须体现这一点。")
 	b.WriteString("\n请严格按系统要求的 JSON schema 输出，只依据以上数据分析。")
 
+	sysPrompt := analysisSystemPrompt(userID, req.Module)
+	if req.Mode == model.AnalysisModePanel {
+		sysPrompt = analysisRoleIntro + "\n\n" + panelGuidance + "\n\n" + panelOutputSpec
+	}
 	return []chatMessage{
-		{Role: "system", Content: analysisSystemPrompt(userID, req.Module)},
+		{Role: "system", Content: sysPrompt},
 		{Role: "user", Content: b.String()},
 	}
 }
@@ -376,7 +547,8 @@ var moduleGuidance = map[string]string{
 - 位置与空间：现价相对区间高低点的位置，可能的支撑位与压力位；
 - 短中期动能：近 5 日、近 20 日涨跌幅反映的动能强弱与超买超卖倾向；
 - 估值水位：若提供了 valuation，结合 PE/PB/市值说明估值的绝对水位与含义（无行业对比数据，须说明这是绝对水位而非行业相对水位；PE 为负表示亏损）；标注 is_st 的标的必须提示退市/风险警示。
-重要限制：估值仅为快照指标，不含财务三表明细（营收/利润/负债）、机构持仓、个股资金流与新闻公告。若结论依赖这些，必须说明「数据缺失、无法判断」，绝不虚构。若快照带 freshness_note，措辞必须体现数据非实时。rating 以技术面为主、估值水位为辅给出。`,
+重要限制：估值仅为快照指标，不含财务三表明细（营收/利润/负债）、机构持仓、个股资金流与新闻公告。若结论依赖这些，必须说明「数据缺失、无法判断」，绝不虚构。若快照带 freshness_note，措辞必须体现数据非实时。rating 以技术面为主、估值水位为辅给出。
+反方视角（必填）：anti_thesis 针对你给出的 rating 论证相反情形（看多时论证为什么现在买入可能是错的，看空/中性亦然）；kill_switches 给出可观察的失效信号（价格/均线/量能等具体条件）；unknowns 列出财务、新闻、资金流等本次数据看不到但影响结论的盲区。`,
 
 	model.AnalysisModuleMarket: `本次分析对象是【整个市场】。可用数据：主要指数行情、涨跌家数与涨停/跌停数（市场情绪核心）、两市资金流（主力/超大/大/中/小单净流入）、涨幅榜、成交活跃榜、板块涨跌榜。
 请从以下维度研判：
@@ -384,7 +556,8 @@ var moduleGuidance = map[string]string{
 - 赚钱效应：用涨跌家数对比、涨停/跌停数量判断市场情绪冷热与普涨/普跌/分化；
 - 资金动向：主力与超大单净流入方向及规模，判断增量资金意愿；
 - 领涨方向：涨幅榜、活跃榜、领涨板块反映的市场热点与风格切换。
-若某些数据块标注为不可用(unavailable)，请指出该维度暂缺、结论相应保留。`,
+若某些数据块标注为不可用(unavailable)，请指出该维度暂缺、结论相应保留。
+反方视角（必填）：anti_thesis 论证与你主结论相反的市场情形（如判断偏暖时论证情绪可能只是脉冲）；kill_switches 用指数关键位、涨跌家数逆转、资金流转向等可观察信号描述结论何时失效；unknowns 指出宏观政策、外盘、增量资金来源等数据盲区。`,
 
 	model.AnalysisModuleSector: `本次分析对象是【板块轮动】。可用数据：板块涨跌榜（含领涨股）、主要指数、市场涨跌家数情绪。
 请从以下维度分析：
@@ -392,7 +565,8 @@ var moduleGuidance = map[string]string{
 - 轮动方向：结合板块涨跌与领涨股，判断资金在向哪些方向切换；
 - 相对大盘：强势板块相对指数的超额表现；
 - 持续性提示：仅凭单日数据能说到什么程度要如实说明，不夸大趋势延续性。
-若用户指定了关注板块(focus)，请重点围绕它、并与榜单上其他板块横向对比；若榜单中没有该板块数据，请明确指出无法定位并只做大盘层面的板块结构分析。`,
+若用户指定了关注板块(focus)，请重点围绕它、并与榜单上其他板块横向对比；若榜单中没有该板块数据，请明确指出无法定位并只做大盘层面的板块结构分析。
+反方视角（必填）：anti_thesis 论证当日强势板块为何可能只是一日游、轮动判断可能错在哪；kill_switches 给出板块相对大盘走弱等失效信号；unknowns 指出板块内个股资金明细、板块基本面与消息面等盲区。`,
 
 	model.AnalysisModuleWatchlist: `本次分析对象是【用户的自选股清单】。数据：每个标的的名称、代码、所属分组、是否重点关注、实时现价与涨跌幅，以及用户填写的关注原因与备注。
 请从以下维度分析：
@@ -400,7 +574,8 @@ var moduleGuidance = map[string]string{
 - 重点标的：结合 is_pinned 与关注原因，指出当前最值得留意的标的及理由；
 - 风险提示：指出其中走弱或需要警惕的标的；
 - 结合用户视角：呼应用户填写的关注原因给出研究性看法。
-注意：数据仅含行情，不含个股财务与新闻，不要虚构基本面；无现价(缺 price)的标的说明数据缺失。`,
+注意：数据仅含行情，不含个股财务与新闻，不要虚构基本面；无现价(缺 price)的标的说明数据缺失。
+反方视角（必填）：anti_thesis 指出对这批自选的整体判断可能错在哪（如共性走强可能只是板块 beta）；kill_switches 给出应移出关注或警惕的信号；unknowns 指出个股基本面、消息面等盲区。`,
 
 	model.AnalysisModulePosition: `本次分析对象是【用户的实际持仓】。数据：每笔持仓的标的、类型(短线/长线)、状态(持仓中/已卖出)、买入价、数量、成本、现价、盈亏额与收益率、买入理由，以及持仓中汇总盈亏。
 请从以下维度分析：
@@ -408,7 +583,8 @@ var moduleGuidance = map[string]string{
 - 集中度风险：是否过度集中于单一标的或单一市场/风格；
 - 结构评估：短线与长线仓位的比例与各自表现是否符合其定位；
 - 需复盘的仓位：结合买入理由与当前盈亏，指出哪些仓位偏离预期、值得重新审视。
-所有涉及加仓/减仓/止盈止损的表述，一律作为研究参考与风险提示，不是操作指令。不要虚构未提供的成本或价格。`,
+所有涉及加仓/减仓/止盈止损的表述，一律作为研究参考与风险提示，不是操作指令。不要虚构未提供的成本或价格。
+反方视角（必填）：anti_thesis 对你的组合评估给出相反论证（如认为结构合理时，论证它何时会变得脆弱）；kill_switches 给出组合层面的风险信号（回撤、集中度、亏损仓扩大等）；unknowns 指出持仓个股基本面、市场环境等本次数据看不到的盲区。`,
 }
 
 // analysisOutputSpec 通用输出格式与合规约束。
@@ -421,7 +597,28 @@ const analysisOutputSpec = `输出要求：
 - risks: 字符串数组，主要风险
 - opportunities: 字符串数组，潜在机会
 - suggestions: 字符串数组，需关注的点或研究方向（表述为研究参考，非操作指令）
+- anti_thesis: 字符串数组，反方观点——针对你给出的结论论证「为什么它可能是错的」，至少 1 条，须言之有物
+- kill_switches: 字符串数组，结论失效条件——出现什么可观察信号说明本次判断已不成立
+- unknowns: 字符串数组，数据盲区——本次数据看不到、但对结论重要的信息
 - disclaimer: 字符串，风险与免责提示`
+
+// panelGuidance 多角色观点（mode=panel，仅个股模块）：一次调用同时输出四个立场角色的独立结论。
+const panelGuidance = `本次任务是【个股多角色观点】：你需要同时扮演四位立场不同的研究员，对同一只个股各自独立给出观点，再总结共识与分歧。可用数据与个股分析相同：实时行情快照、估值与盘面快照 valuation（缺失表示估值数据暂不可得）、技术指标（MA5/MA10/MA20、区间高低、近 5/20 日涨跌幅）与近期日 K 明细；不含财务三表、新闻与个股资金流，任何角色都不得虚构这些数据。
+
+四个角色与视角（各自独立判断，不得互相妥协、允许结论矛盾）：
+- technical（技术面研究员）：只看趋势、均线排列、支撑压力与量价配合；
+- momentum（动量交易者）：只看短期动能、换手/量比与市场活跃度，偏好强者恒强，反感阴跌；
+- risk（风控经理）：专挑风险——波动与回撤、估值透支、流动性、ST/涨跌停约束，宁可错过不可做错；
+- contrarian（反方唱空者）：刻意站在主流叙事对立面，论证「为什么现在买入可能是错的」。
+
+consensus 提炼四人都认可的事实与结论；disagreement 点明最大分歧及其取决条件。数据缺失时各角色都须如实说明。`
+
+// panelOutputSpec 多角色输出格式。
+const panelOutputSpec = `输出要求：
+只输出一个 JSON 对象，不要任何解释文字，也不要 Markdown 代码块标记。字段：
+- roles: 数组，恰好 4 个元素，每个元素为 {"role": "technical"|"momentum"|"risk"|"contrarian", "rating": "bullish"|"neutral"|"bearish", "summary": "该角色核心观点（60 字以内）"}
+- consensus: 字符串，四个角色的共识结论
+- disagreement: 字符串，主要分歧点与取决条件`
 
 var validRating = map[string]bool{
 	model.AnalysisRatingBullish: true,
@@ -457,10 +654,74 @@ func parseAnalysisResult(content string) (*AnalysisResult, error) {
 	r.Risks = orEmpty(r.Risks)
 	r.Opportunities = orEmpty(r.Opportunities)
 	r.Suggestions = orEmpty(r.Suggestions)
+	r.AntiThesis = orEmpty(r.AntiThesis)
+	r.KillSwitches = orEmpty(r.KillSwitches)
+	r.Unknowns = orEmpty(r.Unknowns)
 	if strings.TrimSpace(r.Disclaimer) == "" {
 		r.Disclaimer = "本分析由 AI 基于公开数据生成，仅供研究参考，不构成投资建议，据此操作风险自负。"
 	}
 	return &r, nil
+}
+
+// 多角色观点的合法角色。
+var validPanelRole = map[string]bool{
+	"technical":  true,
+	"momentum":   true,
+	"risk":       true,
+	"contrarian": true,
+}
+
+// parsePanelResult 解析并校验多角色观点输出。角色去重、rating 归一，至少 3 个合法角色才算通过
+//（允许模型偶发漏一个角色，不因此整体降级）。
+func parsePanelResult(content string) (*PanelResult, error) {
+	jsonStr := extractJSONObject(content)
+	if jsonStr == "" {
+		return nil, errors.New("未找到 JSON 对象")
+	}
+	var p PanelResult
+	if err := json.Unmarshal([]byte(jsonStr), &p); err != nil {
+		return nil, fmt.Errorf("JSON 解析失败: %v", err)
+	}
+	seen := map[string]bool{}
+	roles := make([]PanelRole, 0, len(p.Roles))
+	for _, r := range p.Roles {
+		r.Role = strings.ToLower(strings.TrimSpace(r.Role))
+		r.Rating = normalizeRating(r.Rating)
+		if !validPanelRole[r.Role] || seen[r.Role] || !validRating[r.Rating] || strings.TrimSpace(r.Summary) == "" {
+			continue
+		}
+		seen[r.Role] = true
+		roles = append(roles, r)
+	}
+	if len(roles) < 3 {
+		return nil, fmt.Errorf("合法角色不足（需≥3 个，得到 %d）", len(roles))
+	}
+	p.Roles = roles
+	if strings.TrimSpace(p.Consensus) == "" {
+		return nil, errors.New("consensus 不能为空")
+	}
+	return &p, nil
+}
+
+// panelMajorityRating 多角色评级的多数投票（平票取中性）。
+func panelMajorityRating(roles []PanelRole) string {
+	counts := map[string]int{}
+	for _, r := range roles {
+		counts[r.Rating]++
+	}
+	best, bestN, tie := model.AnalysisRatingNeutral, 0, false
+	for rating, n := range counts {
+		switch {
+		case n > bestN:
+			best, bestN, tie = rating, n, false
+		case n == bestN:
+			tie = true
+		}
+	}
+	if tie {
+		return model.AnalysisRatingNeutral
+	}
+	return best
 }
 
 // normalizeRating 把常见中文/英文变体归一到枚举。

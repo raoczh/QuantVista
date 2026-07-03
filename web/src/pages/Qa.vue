@@ -8,6 +8,7 @@ import {
   NSpin,
   NEmpty,
   NPopconfirm,
+  NAlert,
   useMessage,
 } from 'naive-ui'
 import {
@@ -40,6 +41,9 @@ const market = ref('cn')
 const question = ref('')
 const asking = ref(false)
 const scrollBox = ref<HTMLElement | null>(null)
+// 从分析结果「继续问答」进入：新会话复用该分析记录的数据快照（不重复拉数）。
+const fromAnalysisId = ref<number | null>(null)
+const fromAnalysisName = ref('')
 
 // ---------- LLM ----------
 const llmConfigs = ref<LLMConfig[]>([])
@@ -82,8 +86,11 @@ async function send() {
       market: current.value ? undefined : market.value,
       llm_config_id: llmId.value,
       question: q,
+      analysis_record_id: !current.value && fromAnalysisId.value ? fromAnalysisId.value : undefined,
     })
     question.value = ''
+    fromAnalysisId.value = null
+    fromAnalysisName.value = ''
     await scrollToBottom()
     await loadHistory()
   } catch (e) {
@@ -97,6 +104,8 @@ function newChat() {
   current.value = null
   symbol.value = ''
   question.value = ''
+  fromAnalysisId.value = null
+  fromAnalysisName.value = ''
 }
 
 // ---------- 历史 ----------
@@ -136,7 +145,16 @@ function fmtTime(t: string) {
 }
 
 onMounted(async () => {
-  if (route.query.symbol) {
+  if (route.query.from_analysis) {
+    const id = Number(route.query.from_analysis)
+    if (Number.isFinite(id) && id > 0) {
+      fromAnalysisId.value = id
+      fromAnalysisName.value = String(route.query.name || route.query.symbol || '')
+    }
+    symbol.value = String(route.query.symbol || '')
+    market.value = String(route.query.market || 'cn')
+    router.replace({ name: 'qa' })
+  } else if (route.query.symbol) {
     symbol.value = String(route.query.symbol)
     market.value = String(route.query.market || 'cn')
     router.replace({ name: 'qa' })
@@ -191,11 +209,20 @@ onMounted(async () => {
           <!-- 新会话：选择标的 -->
           <div v-if="!current" class="starter">
             <div class="starter-row">
-              <n-input v-model:value="symbol" placeholder="股票代码，如 600000" style="max-width: 200px" />
-              <n-select v-model:value="market" :options="marketOptions" style="width: 110px" />
+              <n-input
+                v-model:value="symbol"
+                placeholder="股票代码，如 600000"
+                style="max-width: 200px"
+                :disabled="!!fromAnalysisId"
+              />
+              <n-select v-model:value="market" :options="marketOptions" style="width: 110px" :disabled="!!fromAnalysisId" />
               <n-select v-model:value="llmId" :options="llmOptions" placeholder="LLM 配置" style="width: 180px" />
             </div>
-            <div class="starter-hint">
+            <n-alert v-if="fromAnalysisId" type="info" :bordered="false" style="margin-top: 10px">
+              将基于「{{ fromAnalysisName || symbol }}」分析记录 #{{ fromAnalysisId }}
+              的数据快照提问——问答所见与分析所见完全一致，可直接追问分析结论。
+            </n-alert>
+            <div v-else class="starter-hint">
               首次提问会固定采集一次该股的行情与技术指标快照，之后多轮追问都基于这份快照，不重复拉数据。
             </div>
           </div>
