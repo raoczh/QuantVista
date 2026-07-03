@@ -73,14 +73,15 @@ func (s *TodoService) Build(ctx context.Context, userID int64) (*TodoResult, err
 		Items: []TodoItem{},
 	}
 
-	// 1) 命中的条件提醒。
-	if alerts, err := s.alert.TriggeredForUser(userID); err == nil {
-		for _, a := range alerts {
+	// 1) 未读的提醒命中事件（alert_events 状态机，标记已读/忽略即完成待办）。
+	if events, err := s.alert.TriggeredForUser(userID); err == nil {
+		for _, e := range events {
+			t := e.TriggeredAt
 			res.Items = append(res.Items, TodoItem{
 				Kind: TodoKindAlert, Priority: 1,
-				Symbol: a.Symbol, Market: a.Market, Name: a.Name,
-				Title: "条件提醒命中", Detail: a.TriggerMsg,
-				RefID: a.ID, RefType: "alerts", Time: a.TriggeredAt,
+				Symbol: e.Symbol, Market: e.Market, Name: e.Name,
+				Title: "条件提醒命中", Detail: e.Message,
+				RefID: e.ID, RefType: "alerts", Time: &t,
 			})
 			res.Alerts++
 		}

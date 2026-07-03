@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"strconv"
+
 	"quantvista/common"
 	"quantvista/service"
 
@@ -102,4 +104,46 @@ func (ac *AlertController) Evaluate(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, gin.H{"hits": n})
+}
+
+// ListEvents GET /api/alerts/events?status=&limit= —— 命中历史（明细事件）。
+func (ac *AlertController) ListEvents(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	rows, err := ac.svc.ListEvents(currentUserID(c), c.Query("status"), limit)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, rows)
+}
+
+// SetEventStatus PUT /api/alerts/events/:id/status —— 标记已读/忽略/恢复未读。
+func (ac *AlertController) SetEventStatus(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	var body struct {
+		Status string `json:"status"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		common.ApiErrorMsg(c, "请求格式错误")
+		return
+	}
+	ev, err := ac.svc.SetEventStatus(currentUserID(c), id, body.Status)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, ev)
+}
+
+// ReadAllEvents PUT /api/alerts/events/read-all —— 全部未读标记已读。
+func (ac *AlertController) ReadAllEvents(c *gin.Context) {
+	n, err := ac.svc.MarkAllEventsRead(currentUserID(c))
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, gin.H{"updated": n})
 }

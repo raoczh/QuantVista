@@ -15,6 +15,8 @@ import {
   NPopconfirm,
   NGrid,
   NGi,
+  NRadioGroup,
+  NRadioButton,
   useMessage,
 } from 'naive-ui'
 import {
@@ -24,8 +26,13 @@ import {
   setAlertStatus,
   deleteAlert,
   evaluateAlerts,
+  listAlertEvents,
+  setAlertEventStatus,
+  readAllAlertEvents,
   type AlertRule,
   type AlertInput,
+  type AlertEvent,
+  type AlertEventStatus,
 } from '@/api/alert'
 import {
   listChannels,
@@ -54,6 +61,8 @@ const kindOptions = [
   { label: '涨跌幅异动', value: 'pct_change' },
   { label: '均线（站上/跌破）', value: 'ma' },
   { label: '突破（新高/新低）', value: 'breakout' },
+  { label: '放量（vs 20 日均量）', value: 'volume_surge' },
+  { label: '振幅异动', value: 'amplitude' },
 ]
 // op 选项随 kind 变化，文案更贴切。
 const opOptions = computed(() => {
@@ -68,6 +77,16 @@ const opOptions = computed(() => {
         { label: '创新高', value: 'gte' },
         { label: '创新低', value: 'lte' },
       ]
+    case 'volume_surge':
+      return [
+        { label: '放量达到倍数', value: 'gte' },
+        { label: '缩量低于倍数', value: 'lte' },
+      ]
+    case 'amplitude':
+      return [
+        { label: '振幅达到', value: 'gte' },
+        { label: '振幅低于', value: 'lte' },
+      ]
     default:
       return [
         { label: '大于等于 ≥', value: 'gte' },
@@ -75,8 +94,28 @@ const opOptions = computed(() => {
       ]
   }
 })
-const needThreshold = computed(() => form.value.kind === 'price' || form.value.kind === 'pct_change')
+const needThreshold = computed(
+  () =>
+    form.value.kind === 'price' ||
+    form.value.kind === 'pct_change' ||
+    form.value.kind === 'volume_surge' ||
+    form.value.kind === 'amplitude',
+)
 const needPeriod = computed(() => form.value.kind === 'ma' || form.value.kind === 'breakout')
+const thresholdLabel = computed(() => {
+  switch (form.value.kind) {
+    case 'price':
+      return '目标价'
+    case 'pct_change':
+      return '涨跌幅阈值（%）'
+    case 'volume_surge':
+      return '量比倍数（如 2 = 2 倍 20 日均量）'
+    case 'amplitude':
+      return '振幅阈值（%，(最高-最低)/昨收）'
+    default:
+      return '阈值'
+  }
+})
 
 // ---------- 表单 ----------
 const editingId = ref<number | null>(null)
@@ -116,8 +155,8 @@ async function submit() {
     message.warning('请输入股票代码')
     return
   }
-  if (needThreshold.value && (form.value.threshold == null || (form.value.kind === 'price' && form.value.threshold <= 0))) {
-    message.warning(form.value.kind === 'price' ? '请输入目标价' : '请输入涨跌幅阈值')
+  if (needThreshold.value && (form.value.threshold == null || (form.value.kind !== 'pct_change' && form.value.threshold <= 0))) {
+    message.warning(`请输入${thresholdLabel.value}`)
     return
   }
   saving.value = true
@@ -153,7 +192,7 @@ async function runEvaluate() {
   try {
     const { hits } = await evaluateAlerts()
     message.success(hits > 0 ? `本次命中 ${hits} 条` : '暂无命中')
-    await load()
+    await Promise.all([load(), loadEvents()])
   } catch (e) {
     message.error((e as Error).message)
   } finally {
@@ -191,6 +230,10 @@ function describe(r: AlertRule) {
       return `${r.op === 'gte' ? '站上' : '跌破'} MA${r.period}`
     case 'breakout':
       return `创近 ${r.period} 日${r.op === 'gte' ? '新高' : '新低'}`
+    case 'volume_surge':
+      return `当日量${r.op === 'gte' ? ' ≥ ' : ' ≤ '}${p(r.threshold)} 倍 20 日均量`
+    case 'amplitude':
+      return `当日振幅 ${r.op === 'gte' ? '≥' : '≤'} ${p(r.threshold)}%`
     default:
       return ''
   }
@@ -231,8 +274,63 @@ onMounted(async () => {
     form.value.name = String(route.query.name || '')
     router.replace({ name: 'alerts' })
   }
-  await Promise.all([load(), loadChannels()])
+  await Promise.all([load(), loadChannels(), loadEvents()])
 })
+
+// ---------- 命中历史（明细事件状态机） ----------
+const events = ref<AlertEvent[]>([])
+const eventsLoading = ref(false)
+const eventFilter = ref<'unread' | 'all' | 'read' | 'dismissed'>('unread')
+const eventFilterOptions = [
+  { label: '未读', value: 'unread' },
+  { label: '全部', value: 'all' },
+  { label: '已读', value: 'read' },
+  { label: '已忽略', value: 'dismissed' },
+]
+async function loadEvents() {
+  eventsLoading.value = true
+  try {
+    events.value = await listAlertEvents(eventFilter.value === 'all' ? undefined : eventFilter.value)
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    eventsLoading.value = false
+  }
+}
+async function markEvent(ev: AlertEvent, status: AlertEventStatus) {
+  try {
+    await setAlertEventStatus(ev.id, status)
+    await loadEvents()
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+const readingAll = ref(false)
+async function markAllRead() {
+  readingAll.value = true
+  try {
+    const { updated } = await readAllAlertEvents()
+    message.success(updated > 0 ? `已标记 ${updated} 条为已读` : '没有未读命中')
+    await loadEvents()
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    readingAll.value = false
+  }
+}
+function eventStatusTag(s: AlertEventStatus) {
+  if (s === 'unread') return { text: '未读', type: 'warning' as const }
+  if (s === 'read') return { text: '已读', type: 'success' as const }
+  return { text: '已忽略', type: 'default' as const }
+}
+const kindLabelMap: Record<string, string> = {
+  price: '到价',
+  pct_change: '异动',
+  ma: '均线',
+  breakout: '突破',
+  volume_surge: '放量',
+  amplitude: '振幅',
+}
 
 // ---------- 推送通道 ----------
 const channels = ref<NotifyChannel[]>([])
@@ -333,7 +431,7 @@ function channelKindLabel(k: string) {
             <n-form-item label="条件方向">
               <n-select v-model:value="form.op" :options="opOptions" />
             </n-form-item>
-            <n-form-item v-if="needThreshold" :label="form.kind === 'price' ? '目标价' : '涨跌幅阈值（%）'">
+            <n-form-item v-if="needThreshold" :label="thresholdLabel">
               <n-input-number v-model:value="form.threshold" :precision="2" style="width: 100%" />
             </n-form-item>
             <n-form-item v-if="needPeriod" label="周期（交易日）">
@@ -397,7 +495,7 @@ function channelKindLabel(k: string) {
         </SectionCard>
       </div>
 
-      <!-- 右：规则列表 -->
+      <!-- 右：规则列表 + 命中历史 -->
       <div class="col-list">
         <SectionCard title="我的提醒">
           <n-spin :show="loading && !rules.length">
@@ -430,6 +528,49 @@ function channelKindLabel(k: string) {
                     </template>
                     删除提醒「{{ r.name || r.symbol }}」？
                   </n-popconfirm>
+                </div>
+              </div>
+            </div>
+          </n-spin>
+        </SectionCard>
+
+        <SectionCard title="命中历史">
+          <template #extra>
+            <div class="ev-toolbar">
+              <n-radio-group v-model:value="eventFilter" size="small" @update:value="loadEvents">
+                <n-radio-button v-for="opt in eventFilterOptions" :key="opt.value" :value="opt.value">{{
+                  opt.label
+                }}</n-radio-button>
+              </n-radio-group>
+              <n-button size="small" quaternary :loading="readingAll" @click="markAllRead">全部已读</n-button>
+            </div>
+          </template>
+          <n-spin :show="eventsLoading && !events.length">
+            <n-empty
+              v-if="!events.length"
+              :description="eventFilter === 'unread' ? '没有未读命中，规则命中后会在这里留档' : '暂无命中记录'"
+              style="padding: 24px 0"
+            />
+            <div v-else class="events">
+              <div v-for="ev in events" :key="ev.id" class="event" :class="{ unread: ev.status === 'unread' }">
+                <div class="ev-main">
+                  <div class="ev-title">
+                    <n-tag size="tiny" round :bordered="false">{{ kindLabelMap[ev.kind] || ev.kind }}</n-tag>
+                    <span class="ev-name">{{ ev.name || ev.symbol }}</span>
+                    <span class="ev-symbol qv-mono">{{ ev.symbol }}</span>
+                    <n-tag size="tiny" round :bordered="false" :type="eventStatusTag(ev.status).type">{{
+                      eventStatusTag(ev.status).text
+                    }}</n-tag>
+                  </div>
+                  <div class="ev-msg">{{ ev.message }}</div>
+                  <div class="ev-time">{{ fmtTime(ev.triggered_at) }}</div>
+                </div>
+                <div class="ev-actions">
+                  <template v-if="ev.status === 'unread'">
+                    <n-button size="tiny" quaternary @click="markEvent(ev, 'read')">已读</n-button>
+                    <n-button size="tiny" quaternary @click="markEvent(ev, 'dismissed')">忽略</n-button>
+                  </template>
+                  <n-button v-else size="tiny" quaternary @click="markEvent(ev, 'unread')">恢复未读</n-button>
                 </div>
               </div>
             </div>
@@ -576,6 +717,64 @@ function channelKindLabel(k: string) {
   margin-top: 3px;
 }
 .ch-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+/* 命中历史 */
+.ev-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.events {
+  display: flex;
+  flex-direction: column;
+}
+.event {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 6px;
+  border-bottom: 1px solid var(--qv-divider);
+}
+.event:last-child {
+  border-bottom: none;
+}
+.event.unread {
+  background: v-bind('withAlpha(upColor, 0.05)');
+  border-radius: 8px;
+}
+.ev-main {
+  flex: 1;
+  min-width: 0;
+}
+.ev-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ev-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+.ev-symbol {
+  font-size: 12px;
+  opacity: 0.5;
+}
+.ev-msg {
+  font-size: 13px;
+  margin-top: 3px;
+  opacity: 0.85;
+}
+.ev-time {
+  font-size: 11px;
+  opacity: 0.5;
+  margin-top: 3px;
+}
+.ev-actions {
   display: flex;
   align-items: center;
   gap: 4px;
