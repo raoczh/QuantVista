@@ -271,6 +271,58 @@ func TestChatCompletion_BlocksPrivateWhenNotAllowed(t *testing.T) {
 	}
 }
 
+func TestChatCompletion_RetriesTransient5xx(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			// 首次 503：应触发单次重试。
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"message":"upstream busy"}}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": "ok"}}},
+			"usage":   map[string]any{"total_tokens": 3},
+		})
+	}))
+	defer srv.Close()
+
+	res, err := chatCompletion(context.Background(), chatParams{
+		BaseURL: srv.URL, APIKey: "k", Model: "m",
+		Messages: []chatMessage{{Role: "user", Content: "hi"}},
+		AllowPrivate: true,
+	})
+	if err != nil {
+		t.Fatalf("期望重试后成功: %v", err)
+	}
+	if calls != 2 || res.Content != "ok" {
+		t.Fatalf("重试行为不符: calls=%d content=%q", calls, res.Content)
+	}
+}
+
+func TestChatCompletion_EstimatesUsageWhenMissing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// 不返回 usage 字段：应按字符粗估兜底。
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": "四个字啊"}}},
+		})
+	}))
+	defer srv.Close()
+
+	res, err := chatCompletion(context.Background(), chatParams{
+		BaseURL: srv.URL, APIKey: "k", Model: "m",
+		Messages: []chatMessage{{Role: "user", Content: "你好世界"}}, // 4 字 → 估 2
+		AllowPrivate: true,
+	})
+	if err != nil {
+		t.Fatalf("期望成功: %v", err)
+	}
+	if res.Usage.TotalTokens != 4 || res.Usage.PromptTokens != 2 || res.Usage.CompletionTokens != 2 {
+		t.Fatalf("usage 估算不符: %+v", res.Usage)
+	}
+}
+
 func TestFitBudget_TrimsWhenOversize(t *testing.T) {
 	// 构造超预算快照：带 recent_bars 和大列表。
 	bars := make([]map[string]any, 40)

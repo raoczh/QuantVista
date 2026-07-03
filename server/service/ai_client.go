@@ -11,14 +11,34 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"quantvista/common"
 )
 
 // AI 调用客户端：OpenAI 兼容 /chat/completions。与 llm.go 的测试连接同源（复用 SafeHTTPClient 防 SSRF），
 // 但这里是真正的分析调用——带 usage token 统计、JSON mode 优先且不支持时优雅 fallback。
+// 2026-07-03 参照 new-api 的中继实践加固：连接池复用、瞬时错误单次重试（429/500/502/503 与
+// 未达上游的网络错误；504 视为真超时不重试）、状态码分类提示、usage 缺失时字符粗估兜底。
 
-const aiCallTimeout = 90 * time.Second
+const (
+	aiCallTimeout  = 90 * time.Second
+	aiRetryBackoff = 800 * time.Millisecond
+)
+
+// 包级复用两个 client（allowPrivate 两态），避免每次调用重建 Transport——
+// repair/panel 会对同一上游连发多次请求，复用连接池省去反复 TLS 握手。
+var (
+	aiClientPublic  = common.SafeHTTPClient(aiCallTimeout, false)
+	aiClientPrivate = common.SafeHTTPClient(aiCallTimeout, true)
+)
+
+func aiHTTPClient(allowPrivate bool) *http.Client {
+	if allowPrivate {
+		return aiClientPrivate
+	}
+	return aiClientPublic
+}
 
 // chatMessage 一条对话消息。
 type chatMessage struct {
@@ -72,10 +92,14 @@ func chatCompletion(ctx context.Context, p chatParams) (*chatResult, error) {
 		}
 	}
 	if status != http.StatusOK {
-		return nil, fmt.Errorf("LLM 返回 HTTP %d：%s", status, extractErr(raw))
+		return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", status, statusHint(status), extractErr(raw))
 	}
 	if strings.TrimSpace(res.Content) == "" {
 		return nil, errors.New("LLM 返回空内容")
+	}
+	// 部分兼容端点不回 usage：按字符粗估兜底（≈2 字符/token），仅作用量审计、不影响次数配额。
+	if res.Usage.TotalTokens == 0 {
+		res.Usage = estimateUsage(p.Messages, res.Content)
 	}
 	res.LatencyMs = latency
 	return res, nil
@@ -109,9 +133,32 @@ func doChat(ctx context.Context, p chatParams, jsonMode bool) (*chatResult, int,
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+p.APIKey)
 
-	client := common.SafeHTTPClient(aiCallTimeout, p.AllowPrivate)
+	client := aiHTTPClient(p.AllowPrivate)
+	send := func() (*http.Response, error) {
+		r, rerr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if rerr != nil {
+			return nil, rerr
+		}
+		r.Header = req.Header.Clone()
+		return client.Do(r)
+	}
+
 	start := time.Now()
-	resp, err := client.Do(req)
+	resp, err := send()
+	if err != nil && transientNetErr(ctx, err) {
+		// 未达上游的瞬时网络错误（连接被拒/复位等）重试一次；超时/取消不重试。
+		time.Sleep(aiRetryBackoff)
+		resp, err = send()
+	}
+	if err == nil && retryableStatus(resp.StatusCode) && ctx.Err() == nil {
+		// 429/500/502/503 多为上游瞬时抖动，重试一次；504 视为真超时不重试（new-api 同款经验）。
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		time.Sleep(aiRetryBackoff)
+		if r2, e2 := send(); e2 == nil {
+			resp = r2
+		}
+	}
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
 		return nil, 0, nil, latency, fmt.Errorf("请求失败: %w", err)
@@ -152,4 +199,62 @@ func looksLikeUnsupportedJSONMode(status int, raw []byte) bool {
 		strings.Contains(msg, "json_object") ||
 		strings.Contains(msg, "json mode") ||
 		strings.Contains(msg, "not support")
+}
+
+// transientNetErr 是否为值得重试的瞬时网络错误：排除调用方取消、
+// 整体超时（client.Timeout / context deadline）——这类重试只会白等。
+func transientNetErr(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Timeout() {
+		return false
+	}
+	// SafeHTTPClient 的 SSRF 拦截（dialer Control 拒绝内网地址）是确定性失败，重试无意义。
+	if strings.Contains(err.Error(), "目标地址不允许") {
+		return false
+	}
+	return true
+}
+
+// retryableStatus 上游瞬时抖动状态码（504 除外：网关超时重试多半再等一整轮）。
+func retryableStatus(status int) bool {
+	return status == http.StatusTooManyRequests ||
+		status == http.StatusInternalServerError ||
+		status == http.StatusBadGateway ||
+		status == http.StatusServiceUnavailable
+}
+
+// statusHint 给常见状态码一个中文归类，用户不用翻上游文档。
+func statusHint(status int) string {
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return "（API Key 无效或无权限）"
+	case status == http.StatusNotFound:
+		return "（接口路径或模型名不存在，请检查 Base URL 与模型）"
+	case status == http.StatusTooManyRequests:
+		return "（上游限流或额度不足）"
+	case status >= 500:
+		return "（上游服务异常）"
+	default:
+		return ""
+	}
+}
+
+// estimateUsage usage 缺失时的字符粗估（中英混合 ≈2 字符/token）。仅审计展示用。
+func estimateUsage(messages []chatMessage, content string) chatUsage {
+	promptChars := 0
+	for _, m := range messages {
+		promptChars += utf8.RuneCountInString(m.Content)
+	}
+	u := chatUsage{
+		PromptTokens:     (promptChars + 1) / 2,
+		CompletionTokens: (utf8.RuneCountInString(content) + 1) / 2,
+	}
+	u.TotalTokens = u.PromptTokens + u.CompletionTokens
+	return u
 }
