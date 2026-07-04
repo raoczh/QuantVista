@@ -32,6 +32,7 @@ import {
 import { getPreference, updatePreference, changePassword, getQuota, type UserPreference, type UserQuota, type BlacklistEntry } from '@/api/user'
 import { downloadExport, type ExportKind } from '@/api/export'
 import { useAuthStore } from '@/stores/auth'
+import { useIsMobile } from '@/composables/useIsMobile'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 
@@ -39,6 +40,8 @@ const message = useMessage()
 const router = useRouter()
 const route = useRoute()
 const auth = useAuthStore()
+// 手机上左标签表单太挤，切换为上下堆叠。
+const { isMobile } = useIsMobile()
 
 // 深链 ?tab=account 直达指定页签（GitHub 绑定回调后跳回账号安全）。
 const initialTab = ['llm', 'pref', 'account'].includes(String(route.query.tab)) ? String(route.query.tab) : 'llm'
@@ -370,7 +373,7 @@ async function doExport(kind: ExportKind) {
     <!-- 用户偏好 -->
     <n-tab-pane name="pref" tab="偏好设置">
       <SectionCard :hoverable="false">
-        <n-form v-if="pref" label-placement="left" label-width="120" style="max-width: 480px">
+        <n-form v-if="pref" :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 480px">
           <n-form-item label="风险等级">
             <n-select v-model:value="pref.risk_level" :options="riskOptions" />
           </n-form-item>
@@ -438,7 +441,7 @@ async function doExport(kind: ExportKind) {
     <!-- 账号安全 -->
     <n-tab-pane name="account" tab="账号安全">
       <SectionCard title="修改密码" :hoverable="false">
-        <n-form label-placement="left" label-width="120" style="max-width: 480px">
+        <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 480px">
           <n-form-item label="原密码">
             <n-input v-model:value="pw.old" type="password" show-password-on="click" placeholder="纯 GitHub 账号首次设密码可留空" />
           </n-form-item>
@@ -488,57 +491,58 @@ async function doExport(kind: ExportKind) {
       </SectionCard>
     </n-tab-pane>
     </n-tabs>
-  </PageContainer>
 
-  <!-- 新增/编辑配置弹窗 -->
-  <n-modal v-model:show="showModal" preset="card" :title="editingId ? '编辑 LLM 配置' : '新增 LLM 配置'" style="max-width: 520px">
-    <n-form label-placement="left" label-width="96">
-      <n-form-item label="名称">
-        <n-input v-model:value="form.name" placeholder="如 我的 DeepSeek" />
-      </n-form-item>
-      <n-form-item label="类型">
-        <n-select v-model:value="form.provider" :options="providerOptions" />
-      </n-form-item>
-      <n-form-item label="Base URL">
-        <div style="width: 100%">
-          <n-input v-model:value="form.base_url" placeholder="如 https://api.deepseek.com 或中转站根地址" />
-          <div class="field-hint">填根地址即可，请求时自动补全 /v1/chat/completions；以 /v1 结尾或填完整端点也支持。</div>
-        </div>
-      </n-form-item>
-      <n-form-item label="API Key">
-        <n-input
-          v-model:value="form.api_key"
-          type="password"
-          show-password-on="click"
-          :placeholder="editingId ? '留空表示保留原密钥' : 'sk-...'"
-        />
-      </n-form-item>
-      <n-form-item label="模型">
-        <n-input v-model:value="form.model" placeholder="如 deepseek-chat" />
-      </n-form-item>
-      <n-form-item label="Temperature">
-        <n-input-number v-model:value="form.temperature" :min="0" :max="2" :step="0.1" />
-      </n-form-item>
-      <n-form-item label="Max Tokens">
-        <n-input-number v-model:value="form.max_tokens" :min="1" :max="200000" />
-      </n-form-item>
-      <n-form-item label="流式输出">
-        <n-switch v-model:value="form.stream" />
-      </n-form-item>
-      <n-form-item label="设为默认">
-        <n-switch v-model:value="form.is_default" />
-      </n-form-item>
-    </n-form>
-    <template #footer>
-      <n-space justify="space-between">
-        <n-button :loading="testing" @click="testDraft">测试连接</n-button>
-        <n-space>
-          <n-button @click="showModal = false">取消</n-button>
-          <n-button type="primary" :loading="saving" @click="save">保存</n-button>
+    <!-- 新增/编辑配置弹窗。注意：必须放在 PageContainer 内部保持页面单根——
+         外壳 Transition mode="out-in" 遇到多根组件时 leave 过渡无法执行，会卡成白屏。 -->
+    <n-modal v-model:show="showModal" preset="card" :title="editingId ? '编辑 LLM 配置' : '新增 LLM 配置'" style="max-width: 520px">
+      <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 96">
+        <n-form-item label="名称">
+          <n-input v-model:value="form.name" placeholder="如 我的 DeepSeek" />
+        </n-form-item>
+        <n-form-item label="类型">
+          <n-select v-model:value="form.provider" :options="providerOptions" />
+        </n-form-item>
+        <n-form-item label="Base URL">
+          <div style="width: 100%">
+            <n-input v-model:value="form.base_url" placeholder="如 https://api.deepseek.com 或中转站根地址" />
+            <div class="field-hint">填根地址即可，请求时自动补全 /v1/chat/completions；以 /v1 结尾或填完整端点也支持。</div>
+          </div>
+        </n-form-item>
+        <n-form-item label="API Key">
+          <n-input
+            v-model:value="form.api_key"
+            type="password"
+            show-password-on="click"
+            :placeholder="editingId ? '留空表示保留原密钥' : 'sk-...'"
+          />
+        </n-form-item>
+        <n-form-item label="模型">
+          <n-input v-model:value="form.model" placeholder="如 deepseek-chat" />
+        </n-form-item>
+        <n-form-item label="Temperature">
+          <n-input-number v-model:value="form.temperature" :min="0" :max="2" :step="0.1" />
+        </n-form-item>
+        <n-form-item label="Max Tokens">
+          <n-input-number v-model:value="form.max_tokens" :min="1" :max="200000" />
+        </n-form-item>
+        <n-form-item label="流式输出">
+          <n-switch v-model:value="form.stream" />
+        </n-form-item>
+        <n-form-item label="设为默认">
+          <n-switch v-model:value="form.is_default" />
+        </n-form-item>
+      </n-form>
+      <template #footer>
+        <n-space justify="space-between">
+          <n-button :loading="testing" @click="testDraft">测试连接</n-button>
+          <n-space>
+            <n-button @click="showModal = false">取消</n-button>
+            <n-button type="primary" :loading="saving" @click="save">保存</n-button>
+          </n-space>
         </n-space>
-      </n-space>
-    </template>
-  </n-modal>
+      </template>
+    </n-modal>
+  </PageContainer>
 </template>
 
 <style scoped>

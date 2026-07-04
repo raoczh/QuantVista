@@ -28,6 +28,26 @@ body {
   text-rendering: optimizeLegibility;
 }
 
+/* iOS 横竖屏切换时禁止自动放大字号 */
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+/* 通用横向滚动容器：移动端包住宽表格/宽内容（卡片外场景用，卡内 SectionCard 已内置） */
+.qv-scroll-x {
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* 移动端弹窗：不超出屏幕（各页 n-modal 多为内联 max-width: 520px 之类，窄屏统一压到视口内） */
+@media (max-width: 768px) {
+  .n-modal {
+    max-width: calc(100vw - 24px) !important;
+  }
+}
+
 /* 数字用等宽字形，涨跌/价格对齐不跳动 */
 .qv-tnum {
   font-variant-numeric: tabular-nums;

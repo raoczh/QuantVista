@@ -158,7 +158,7 @@ onMounted(load)
                 <n-radio-button value="sell">卖出</n-radio-button>
               </n-radio-group>
             </n-form-item>
-            <n-grid cols="2" :x-gap="10">
+            <n-grid cols="1 s:2" responsive="screen" :x-gap="10">
               <n-gi>
                 <n-form-item label="代码">
                   <n-input v-model:value="form.symbol" placeholder="如 600000" />
@@ -170,7 +170,7 @@ onMounted(load)
                 </n-form-item>
               </n-gi>
             </n-grid>
-            <n-grid cols="2" :x-gap="10">
+            <n-grid cols="1 s:2" responsive="screen" :x-gap="10">
               <n-gi>
                 <n-form-item label="价格（留空按市价）">
                   <n-input-number v-model:value="form.price" :min="0" :precision="2" style="width: 100%" placeholder="市价" />

@@ -72,4 +72,13 @@ const styleVars = computed(() => ({
   font-size: 12px;
   opacity: 0.6;
 }
+
+@media (max-width: 768px) {
+  .stat-card {
+    padding: 12px 14px;
+  }
+  .stat-value {
+    font-size: 22px;
+  }
+}
 </style>

@@ -571,7 +571,7 @@ onMounted(async () => {
       style="max-width: 520px"
     >
       <n-form label-placement="top">
-        <n-grid cols="2" :x-gap="12">
+        <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
           <n-gi>
             <n-form-item label="股票代码">
               <n-input v-model:value="form.symbol" placeholder="如 600000" :disabled="editing" />
@@ -589,7 +589,7 @@ onMounted(async () => {
             <n-radio-button value="long_term">长线</n-radio-button>
           </n-radio-group>
         </n-form-item>
-        <n-grid cols="3" :x-gap="12">
+        <n-grid cols="1 s:3" responsive="screen" :x-gap="12">
           <n-gi>
             <n-form-item label="买入价">
               <n-input-number v-model:value="form.buy_price" :min="0" :precision="4" style="width: 100%" />
@@ -606,7 +606,7 @@ onMounted(async () => {
             </n-form-item>
           </n-gi>
         </n-grid>
-        <n-grid cols="2" :x-gap="12">
+        <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
           <n-gi>
             <n-form-item label="买入手续费">
               <n-input-number v-model:value="form.buy_fee" :min="0" :precision="2" style="width: 100%" />
@@ -632,7 +632,7 @@ onMounted(async () => {
         </n-form-item>
 
         <!-- 风险计划 + 仓位风险计算器（实时纯前端计算） -->
-        <n-grid cols="2" :x-gap="12">
+        <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
           <n-gi>
             <n-form-item label="计划止损价（可选）">
               <n-input-number v-model:value="form.plan_stop_loss" :min="0" :precision="4" style="width: 100%" />
@@ -685,7 +685,7 @@ onMounted(async () => {
       style="max-width: 480px"
     >
       <n-form label-placement="top">
-        <n-grid cols="3" :x-gap="12">
+        <n-grid cols="1 s:3" responsive="screen" :x-gap="12">
           <n-gi>
             <n-form-item label="卖出价">
               <n-input-number
@@ -715,7 +715,7 @@ onMounted(async () => {
         </n-form-item>
 
         <!-- 结构化复盘：固定维度，供跨笔统计与自我校准 -->
-        <n-grid cols="2" :x-gap="12">
+        <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
           <n-gi>
             <n-form-item label="是否按计划卖出">
               <n-select v-model:value="closeForm.sell_planned" :options="sellPlannedOptions" placeholder="（可选）" clearable />
@@ -846,6 +846,7 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 .r-title {
   font-size: 14px;

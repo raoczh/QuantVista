@@ -413,7 +413,7 @@ function channelKindLabel(k: string) {
       <div class="col-form">
         <SectionCard :title="editingId ? '编辑提醒' : '新建提醒'">
           <n-form label-placement="top" :show-feedback="false" class="form">
-            <n-grid cols="2" :x-gap="12">
+            <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
               <n-gi>
                 <n-form-item label="股票代码">
                   <n-input v-model:value="form.symbol" placeholder="如 600000" :disabled="!!editingId" />
@@ -626,6 +626,16 @@ function channelKindLabel(k: string) {
   gap: 12px;
   padding: 12px 6px;
   border-bottom: 1px solid var(--qv-divider);
+}
+@media (max-width: 768px) {
+  .rule {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+  .rule-actions {
+    flex-basis: 100%;
+    justify-content: flex-end;
+  }
 }
 .rule:last-child {
   border-bottom: none;

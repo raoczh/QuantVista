@@ -711,6 +711,25 @@ onMounted(load)
   gap: 2px;
   flex-shrink: 0;
 }
+
+@media (max-width: 768px) {
+  .item {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+  .it-name {
+    flex-wrap: wrap;
+  }
+  .it-quote {
+    min-width: 0;
+  }
+  /* 操作按钮整行换到下一行，与内容左对齐 */
+  .it-actions {
+    flex-basis: 100%;
+    flex-wrap: wrap;
+    padding-left: 18px;
+  }
+}
 .modal-footer {
   display: flex;
   justify-content: flex-end;

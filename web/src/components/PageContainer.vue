@@ -48,4 +48,19 @@ defineProps<{ title?: string; subtitle?: string }>()
   align-items: center;
   gap: 8px;
 }
+
+@media (max-width: 768px) {
+  .page-head {
+    margin-bottom: 16px;
+  }
+  .page-title {
+    font-size: 20px;
+  }
+  .page-sub {
+    font-size: 12px;
+  }
+  .page-actions {
+    flex-wrap: wrap;
+  }
+}
 </style>

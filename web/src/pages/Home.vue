@@ -190,7 +190,7 @@ function renderChart(bars: Bar[]) {
   const down = vars.value.successColor
   chart.setOption({
     backgroundColor: 'transparent',
-    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' }, confine: true },
     grid: { left: 52, right: 16, top: 16, bottom: 36 },
     xAxis: { type: 'category', data: bars.map((b) => b.trade_date), boundaryGap: false },
     yAxis: { type: 'value', scale: true, splitLine: { lineStyle: { opacity: 0.4 } } },
