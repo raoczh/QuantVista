@@ -213,14 +213,13 @@ func (s *LLMService) testOpenAICompatible(baseURL, apiKey, modelName string, all
 		return &TestResult{OK: false, Message: "Base URL 非法（仅支持 http/https）"}
 	}
 
-	endpoint := baseURL
-	if !strings.HasSuffix(endpoint, "/chat/completions") {
-		endpoint += "/chat/completions"
-	}
+	// 与真实分析调用（ai_client.go doChat）同一拼接逻辑：测试通过 = 实际可用，不再各拼各的。
+	endpoint := chatCompletionsURL(baseURL)
 	body, _ := json.Marshal(map[string]any{
-		"model":      modelName,
-		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
-		"max_tokens": 1,
+		"model":    modelName,
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+		// 16 对齐 new-api 的渠道测试请求；max_tokens=1 部分上游会拒绝或回空（推理模型尤甚）。
+		"max_tokens": 16,
 		"stream":     false,
 	})
 
@@ -241,16 +240,33 @@ func (s *LLMService) testOpenAICompatible(baseURL, apiKey, modelName string, all
 		return &TestResult{OK: false, LatencyMs: latency, Message: "请求失败: " + err.Error()}
 	}
 	defer res.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+	raw, _ := io.ReadAll(io.LimitReader(res.Body, 64<<10))
 
-	if res.StatusCode == http.StatusOK {
-		return &TestResult{OK: true, LatencyMs: latency, Message: "连接成功"}
+	if res.StatusCode != http.StatusOK {
+		return &TestResult{
+			OK:        false,
+			LatencyMs: latency,
+			Message:   fmt.Sprintf("HTTP %d: %s", res.StatusCode, extractErr(raw)),
+		}
 	}
-	return &TestResult{
-		OK:        false,
-		LatencyMs: latency,
-		Message:   fmt.Sprintf("HTTP %d: %s", res.StatusCode, extractErr(raw)),
+	// 200 也要能解析出 chat completion 结构才算通过——SPA fallback / 网关拦截页会 200 + HTML，
+	// 只看状态码会"测试成功、实际分析失败"（json: invalid character '<'）。
+	var parsed struct {
+		Choices []json.RawMessage `json:"choices"`
 	}
+	if jsonErr := json.Unmarshal(raw, &parsed); jsonErr != nil {
+		msg := "服务返回的不是 JSON"
+		if looksLikeHTML(raw) {
+			msg = "服务返回了网页而非 API 响应"
+		}
+		return &TestResult{OK: false, LatencyMs: latency,
+			Message: fmt.Sprintf("%s：请检查 Base URL 是否为 API 地址（实际请求 %s，根地址会自动补 /v1/chat/completions）", msg, endpoint)}
+	}
+	if len(parsed.Choices) == 0 {
+		return &TestResult{OK: false, LatencyMs: latency,
+			Message: "连通但响应不含 choices（" + extractErr(raw) + "），可能不是 OpenAI 兼容接口"}
+	}
+	return &TestResult{OK: true, LatencyMs: latency, Message: "连接成功"}
 }
 
 // extractErr 从 OpenAI 风格错误体里抽取 message，抽不到则返回截断原文。
@@ -262,6 +278,9 @@ func extractErr(raw []byte) string {
 	}
 	if json.Unmarshal(raw, &parsed) == nil && parsed.Error.Message != "" {
 		return parsed.Error.Message
+	}
+	if looksLikeHTML(raw) {
+		return "返回了 HTML 页面而非 API 响应（通常是 Base URL 路径不对或被网关拦截）"
 	}
 	s := strings.TrimSpace(string(raw))
 	if len(s) > 200 {
