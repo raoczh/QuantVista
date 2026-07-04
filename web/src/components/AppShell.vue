@@ -8,6 +8,8 @@ import {
   NIcon,
   NPopover,
   NAvatar,
+  NDrawer,
+  NDrawerContent,
   useThemeVars,
   type MenuOption,
   type DropdownOption,
@@ -157,6 +159,17 @@ const avatarText = computed(() => displayName.value.slice(0, 1).toUpperCase() ||
 // ---------- 全局速查 ----------
 const showSearch = ref(false)
 
+// ---------- 移动端抽屉导航 ----------
+// ≤768px 时顶部水平菜单放不下，收进左侧抽屉（汉堡按钮唤起）。
+const showNav = ref(false)
+// 抽屉内点击菜单项（RouterLink）完成导航后自动收起。
+watch(
+  () => route.fullPath,
+  () => {
+    showNav.value = false
+  },
+)
+
 // ---------- 标签页标题带大盘：挂后台也能瞟一眼盘面 ----------
 async function refreshMarketTitle() {
   if (!isLoggedIn.value) return
@@ -203,10 +216,15 @@ onMounted(() => {
     <div class="app-glow" aria-hidden="true" />
 
     <header class="app-header">
+      <button class="nav-burger" type="button" aria-label="打开导航菜单" @click="showNav = true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <path d="M4 7h16M4 12h16M4 17h16" />
+        </svg>
+      </button>
       <RouterLink to="/" class="logo-link">
         <BrandLogo :size="30" />
       </RouterLink>
-      <n-menu mode="horizontal" :options="menuOptions" :value="activeKey" class="app-menu" />
+      <n-menu mode="horizontal" responsive :options="menuOptions" :value="activeKey" class="app-menu" />
       <div class="header-right">
         <!-- 全局速查入口（Ctrl+K） -->
         <button class="search-trigger" type="button" @click="showSearch = true">
@@ -252,7 +270,7 @@ onMounted(() => {
                 <span :style="`display:inline-block;width:14px;height:14px;border-radius:4px;background:${preset.primary}`" />
               </n-icon>
             </template>
-            {{ preset.label }}
+            <span class="theme-label">{{ preset.label }}</span>
           </n-button>
         </n-dropdown>
 
@@ -276,6 +294,22 @@ onMounted(() => {
     </main>
 
     <GlobalSearch v-model:show="showSearch" />
+
+    <!-- 移动端抽屉导航：与顶部菜单同一份 options，分组默认展开 -->
+    <n-drawer v-model:show="showNav" placement="left" width="min(82vw, 300px)">
+      <n-drawer-content :body-content-style="{ padding: '10px 6px' }">
+        <template #header>
+          <BrandLogo :size="26" />
+        </template>
+        <n-menu
+          mode="vertical"
+          :options="menuOptions"
+          :value="activeKey"
+          :default-expanded-keys="['ai-group', 'more-group']"
+          :indent="24"
+        />
+      </n-drawer-content>
+    </n-drawer>
   </div>
 </template>
 
@@ -467,5 +501,78 @@ onMounted(() => {
 }
 .page-leave-to {
   opacity: 0;
+}
+
+/* ---------- 移动端（≤768px）：菜单收进抽屉，顶栏只留图标 ---------- */
+.nav-burger {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+.nav-burger svg {
+  width: 20px;
+  height: 20px;
+}
+.nav-burger:hover,
+.nav-burger:active {
+  background: var(--qv-menu-hover);
+}
+
+@media (max-width: 768px) {
+  .app-header {
+    padding: 0 10px;
+    gap: 8px;
+  }
+  .nav-burger {
+    display: inline-flex;
+  }
+  .app-menu {
+    display: none;
+  }
+  /* logo 靠左，右侧操作组自然靠右 */
+  .logo-link {
+    margin-right: auto;
+  }
+  .header-right {
+    gap: 4px;
+  }
+  /* 搜索入口只留放大镜图标 */
+  .st-text,
+  .st-kbd {
+    display: none;
+  }
+  .search-trigger {
+    gap: 0;
+    padding: 0 8px;
+    border-color: transparent;
+    background: transparent;
+  }
+  .st-icon {
+    width: 17px;
+    height: 17px;
+  }
+  /* 主题按钮只留色块，用户菜单只留头像 */
+  .theme-label {
+    display: none;
+  }
+  .user-name {
+    display: none;
+  }
+  .user-chip {
+    padding: 3px;
+  }
+  .app-main {
+    padding: 16px 12px 44px;
+  }
 }
 </style>

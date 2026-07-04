@@ -30,10 +30,13 @@ import {
 } from '@/api/admin'
 import type { AuthUser } from '@/api/auth'
 import { useAuthStore } from '@/stores/auth'
+import { useIsMobile } from '@/composables/useIsMobile'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 
 const message = useMessage()
+// 手机上左标签表单太挤，切换为上下堆叠。
+const { isMobile } = useIsMobile()
 const auth = useAuthStore()
 
 const settings = ref<SystemSettings | null>(null)
@@ -206,7 +209,7 @@ onMounted(() => {
         <n-alert type="info" :show-icon="false" :bordered="false" class="note">
           在 GitHub OAuth App 中将「Authorization callback URL」设置为：<strong>{{ callbackHint }}</strong>
         </n-alert>
-        <n-form label-placement="left" label-width="120" style="max-width: 560px">
+        <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 560px">
           <n-form-item label="Client ID">
             <n-input v-model:value="gh.client_id" placeholder="GitHub OAuth App Client ID" />
           </n-form-item>
@@ -301,7 +304,7 @@ onMounted(() => {
 
     <!-- 用户配额编辑 -->
     <n-modal v-model:show="quotaModal" preset="card" :title="`AI 配额 · ${quotaUser?.display_name || quotaUser?.username || ''}`" style="max-width: 460px">
-      <n-form label-placement="left" label-width="110" :show-feedback="false">
+      <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 110" :show-feedback="false">
         <n-form-item label="已用次数">
           <span class="qv-tnum">{{ quotaForm.action_used }}</span>
           <span style="opacity: 0.5; margin-left: 8px"

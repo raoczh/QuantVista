@@ -84,4 +84,17 @@ const styleVars = computed(() => ({
   font-weight: 600;
   font-size: 15px;
 }
+
+/* 移动端：卡片内容区可横向滚动，宽表格不撑破整页布局；
+ * 表格单元格不折行（挤压成一列一字反而没法看），滚动查看。 */
+@media (max-width: 768px) {
+  .section-card :deep(.n-card__content) {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .section-card :deep(.n-table th),
+  .section-card :deep(.n-table td) {
+    white-space: nowrap;
+  }
+}
 </style>

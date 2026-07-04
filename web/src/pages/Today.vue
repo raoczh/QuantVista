@@ -160,6 +160,16 @@ onMounted(load)
   padding: 12px 4px;
   border-bottom: 1px solid var(--qv-divider);
 }
+@media (max-width: 768px) {
+  .item {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+  .item-actions {
+    flex-basis: 100%;
+    justify-content: flex-end;
+  }
+}
 .item:last-child {
   border-bottom: none;
 }

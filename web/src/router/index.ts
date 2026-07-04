@@ -37,6 +37,15 @@ const router = createRouter({
   routes,
 })
 
+// 懒加载 chunk 拉取失败（多为部署更新后旧页面持有过期 hash）：整页跳转目标路由，
+// 让浏览器拿到新的 index.html 与资源清单，避免点菜单无响应/白屏。
+router.onError((error, to) => {
+  const msg = String((error as Error)?.message || '')
+  if (/Failed to fetch dynamically imported module|Importing a module script failed|error loading dynamically imported module/i.test(msg)) {
+    window.location.assign(to.fullPath)
+  }
+})
+
 router.beforeEach(async (to) => {
   const auth = useAuthStore()
 

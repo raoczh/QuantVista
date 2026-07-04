@@ -83,7 +83,7 @@ function renderChart() {
   const down = vars.value.successColor
   chart.setOption({
     backgroundColor: 'transparent',
-    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'cross' }, confine: true },
     grid: { left: 52, right: 16, top: 16, bottom: 36 },
     xAxis: { type: 'category', data: bars.value.map((b) => b.trade_date), boundaryGap: false },
     yAxis: { type: 'value', scale: true, splitLine: { lineStyle: { opacity: 0.4 } } },
@@ -105,11 +105,18 @@ watch([market, symbol], () => {
   load()
 })
 
-onMounted(() => load())
+onMounted(() => {
+  load()
+  window.addEventListener('resize', onResize)
+})
 onBeforeUnmount(() => {
+  window.removeEventListener('resize', onResize)
   chart?.dispose()
   chart = null
 })
+function onResize() {
+  chart?.resize()
+}
 useAutoRefresh(() => load(true), 60_000)
 
 function goPosition() {

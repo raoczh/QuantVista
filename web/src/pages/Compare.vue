@@ -307,6 +307,15 @@ function scoreTagColor(score: number) {
   gap: 10px;
   align-items: center;
 }
+@media (max-width: 768px) {
+  .in-row {
+    flex-wrap: wrap;
+  }
+  .in-row :deep(.n-input) {
+    flex: 1;
+    min-width: 140px;
+  }
+}
 .opts {
   display: flex;
   align-items: center;

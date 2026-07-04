@@ -244,4 +244,13 @@ function fmt(n: number) {
 .gs-empty {
   padding: 18px 0;
 }
+
+@media (max-width: 480px) {
+  .gs-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .gs-kbd {
+    display: none;
+  }
+}
 </style>
