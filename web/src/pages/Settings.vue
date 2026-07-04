@@ -500,7 +500,10 @@ async function doExport(kind: ExportKind) {
         <n-select v-model:value="form.provider" :options="providerOptions" />
       </n-form-item>
       <n-form-item label="Base URL">
-        <n-input v-model:value="form.base_url" placeholder="如 https://api.deepseek.com/v1" />
+        <div style="width: 100%">
+          <n-input v-model:value="form.base_url" placeholder="如 https://api.deepseek.com 或中转站根地址" />
+          <div class="field-hint">填根地址即可，请求时自动补全 /v1/chat/completions；以 /v1 结尾或填完整端点也支持。</div>
+        </div>
       </n-form-item>
       <n-form-item label="API Key">
         <n-input
@@ -558,6 +561,12 @@ async function doExport(kind: ExportKind) {
   font-size: 12px;
   opacity: 0.55;
   margin-top: 10px;
+}
+.field-hint {
+  font-size: 12px;
+  opacity: 0.55;
+  margin-top: 6px;
+  line-height: 1.5;
 }
 .card-toolbar {
   display: flex;

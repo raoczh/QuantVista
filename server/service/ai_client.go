@@ -107,10 +107,7 @@ func chatCompletion(ctx context.Context, p chatParams) (*chatResult, error) {
 
 // doChat 执行单次 HTTP 调用，返回解析后的结果、HTTP 状态码、原始响应体、耗时。
 func doChat(ctx context.Context, p chatParams, jsonMode bool) (*chatResult, int, []byte, int64, error) {
-	endpoint := strings.TrimRight(p.BaseURL, "/")
-	if !strings.HasSuffix(endpoint, "/chat/completions") {
-		endpoint += "/chat/completions"
-	}
+	endpoint := chatCompletionsURL(p.BaseURL)
 
 	payload := map[string]any{
 		"model":       p.Model,
@@ -180,7 +177,13 @@ func doChat(ctx context.Context, p chatParams, jsonMode bool) (*chatResult, int,
 		Usage chatUsage `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil, resp.StatusCode, raw, latency, fmt.Errorf("解析 LLM 响应失败: %w", err)
+		if looksLikeHTML(raw) {
+			// 典型场景：Base URL 指向 new-api/one-api 等站点的非 API 路径，命中前端 SPA fallback
+			// 返回 200 + index.html。裸报 invalid character '<' 用户无从下手，这里直接指出端点。
+			return nil, resp.StatusCode, raw, latency, fmt.Errorf(
+				"LLM 返回了网页而非 JSON（HTTP %d）：%s 不是有效的 API 端点，请检查 Base URL——填服务根地址（自动补 /v1/chat/completions）或以 /v1 结尾的地址均可", resp.StatusCode, endpoint)
+		}
+		return nil, resp.StatusCode, raw, latency, fmt.Errorf("解析 LLM 响应失败: %w（响应开头: %s）", err, bodySnippet(raw))
 	}
 	content := ""
 	if len(parsed.Choices) > 0 {
@@ -243,6 +246,56 @@ func statusHint(status int) string {
 	default:
 		return ""
 	}
+}
+
+// chatCompletionsURL 由 Base URL 构造 /chat/completions 端点，对齐 new-api / OpenAI SDK 的填写惯例：
+// 根地址（https://xxx.com）自动补 /v1/chat/completions；以版本段结尾（/v1、/api/v3 等）只补 /chat/completions；
+// 已是完整端点则原样使用。这样按 new-api 习惯填根地址、按 SDK 习惯填 /v1、直接填完整端点三种写法都能打对路径。
+func chatCompletionsURL(baseURL string) string {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if strings.HasSuffix(base, "/chat/completions") {
+		return base
+	}
+	if endsWithVersionSegment(base) {
+		return base + "/chat/completions"
+	}
+	return base + "/v1/chat/completions"
+}
+
+// endsWithVersionSegment 路径最后一段是否形如 v1/v2/v3（火山方舟 /api/v3 这类也算）。
+func endsWithVersionSegment(base string) bool {
+	i := strings.LastIndexByte(base, '/')
+	if i < 0 || i == len(base)-1 {
+		return false
+	}
+	seg := base[i+1:]
+	if len(seg) < 2 || (seg[0] != 'v' && seg[0] != 'V') {
+		return false
+	}
+	for _, c := range seg[1:] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// looksLikeHTML 响应体形似网页而非 JSON——SPA fallback、网关登录页、CDN 拦截页的典型形态
+//（合法 JSON 不会以 '<' 开头）。
+func looksLikeHTML(raw []byte) bool {
+	return strings.HasPrefix(strings.TrimSpace(string(raw)), "<")
+}
+
+// bodySnippet 取响应体开头一小段用于报错展示（压平空白，按 rune 截断避免切碎中文）。
+func bodySnippet(raw []byte) string {
+	s := strings.Join(strings.Fields(string(raw)), " ")
+	if s == "" {
+		return "(空)"
+	}
+	if r := []rune(s); len(r) > 120 {
+		return string(r[:120]) + "…"
+	}
+	return s
 }
 
 // estimateUsage usage 缺失时的字符粗估（中英混合 ≈2 字符/token）。仅审计展示用。
