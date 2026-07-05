@@ -35,6 +35,7 @@ import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import TrustBadges from '@/components/TrustBadges.vue'
 
 const message = useMessage()
 const route = useRoute()
@@ -69,6 +70,8 @@ const needMarket = computed(() =>
 const needTarget = computed(() => form.value.module === 'sector')
 // 多角色观点（仅个股模块）：一次调用输出技术面/动量/风控/反方四个立场的独立结论。
 const panelMode = ref(false)
+// AI 复核：额外一次独立复核员调用逐项挑刺（panel/降级不复核）。
+const verifyMode = ref(false)
 
 // ---------- LLM 配置 ----------
 const llmConfigs = ref<LLMConfig[]>([])
@@ -116,6 +119,7 @@ async function runAnalysis() {
     if (needSymbol.value) payload.symbol = form.value.symbol?.trim()
     if (needTarget.value) payload.target = form.value.target?.trim() || undefined
     if (form.value.module === 'stock' && panelMode.value) payload.mode = 'panel'
+    else if (verifyMode.value) payload.verify = true // 复核仅对标准模式生效（panel 无标准结论字段）
     const view = await createAnalysis(payload)
     current.value = view
     diff.value = null
@@ -207,6 +211,25 @@ function panelRoleDesc(r: string) {
   return panelRoleMeta[r as PanelRoleKind]?.desc || ''
 }
 
+// AI 复核结论 → n-alert 类型。
+function reviewAlertType(v: string): 'success' | 'warning' | 'error' {
+  if (v === 'pass') return 'success'
+  if (v === 'reject') return 'error'
+  return 'warning'
+}
+
+// ---------- 数据快照透明面板（Get 已回传 data_snapshot） ----------
+const snapshotShow = ref(false)
+const snapshotText = computed(() => {
+  const raw = current.value?.data_snapshot
+  if (!raw) return ''
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2)
+  } catch {
+    return raw
+  }
+})
+
 // ---------- 变化检测（与上次对比） ----------
 const diff = ref<AnalysisDiff | null>(null)
 const diffShow = ref(false)
@@ -278,6 +301,10 @@ onMounted(async () => {
             <n-form-item v-if="form.module === 'stock'" label="多角色观点">
               <n-switch v-model:value="panelMode" />
               <span class="switch-hint">技术面 / 动量 / 风控 / 反方四视角独立评判</span>
+            </n-form-item>
+            <n-form-item v-if="!(form.module === 'stock' && panelMode)" label="AI 复核（更可信，多一次调用）">
+              <n-switch v-model:value="verifyMode" />
+              <span class="switch-hint">独立复核员对照数据快照逐项挑刺，可否决并压低置信度</span>
             </n-form-item>
             <n-form-item label="LLM 配置">
               <n-select
@@ -410,6 +437,16 @@ onMounted(async () => {
                 </div>
               </div>
 
+              <!-- 信任徽章：证据核验 · 综合置信 · AI 复核（仅标准成功结果） -->
+              <TrustBadges
+                v-if="current.status === 'success' && current.result"
+                class="trust-mb"
+                :evidence-check="current.result.evidence_check"
+                :sys-confidence="current.result.sys_confidence"
+                :sys-confidence-why="current.result.sys_confidence_why"
+                :review="current.result.review"
+              />
+
               <!-- 降级/失败提示 -->
               <n-alert
                 v-if="current.status === 'degraded'"
@@ -430,6 +467,14 @@ onMounted(async () => {
 
               <!-- 结构化结果 -->
               <template v-if="current.status === 'success' && current.result">
+                <n-alert
+                  v-if="current.result.review"
+                  :type="reviewAlertType(current.result.review.verdict)"
+                  :bordered="false"
+                  style="margin-bottom: 12px"
+                >
+                  AI 复核：{{ current.result.review.comment || '（无补充说明）' }}
+                </n-alert>
                 <p class="summary">{{ current.result.summary }}</p>
 
                 <div v-if="current.result.highlights.length" class="block">
@@ -522,12 +567,13 @@ onMounted(async () => {
 
               <!-- 元信息 -->
               <div class="meta">
-                <n-space size="small" :wrap="true">
+                <n-space size="small" :wrap="true" align="center">
                   <span>模型 {{ current.model || '—' }}</span>
                   <span v-if="current.total_tokens">· token {{ current.total_tokens }}</span>
                   <span v-if="current.latency_ms">· 耗时 {{ (current.latency_ms / 1000).toFixed(1) }}s</span>
                   <span>· 版本 {{ current.prompt_version }}/{{ current.strategy_version }}</span>
                   <span>· {{ fmtTime(current.created_at) }}</span>
+                  <n-button v-if="snapshotText" size="tiny" quaternary @click="snapshotShow = true">数据快照</n-button>
                 </n-space>
               </div>
             </div>
@@ -597,6 +643,11 @@ onMounted(async () => {
           </ul>
         </div>
       </div>
+    </n-modal>
+
+    <!-- 数据快照：本次分析所依据的结构化数据（凭它复现结论） -->
+    <n-modal v-model:show="snapshotShow" preset="card" title="数据快照" style="max-width: 720px">
+      <pre class="snapshot-pre">{{ snapshotText }}</pre>
     </n-modal>
   </PageContainer>
 </template>
@@ -887,5 +938,17 @@ onMounted(async () => {
   margin-top: 16px;
   padding-top: 12px;
   border-top: 1px solid var(--qv-divider);
+}
+.trust-mb {
+  margin-bottom: 14px;
+}
+.snapshot-pre {
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 60vh;
+  overflow: auto;
+  margin: 0;
 }
 </style>

@@ -5,6 +5,7 @@ export interface QaMessage {
   conversation_id: number
   role: 'user' | 'assistant'
   content: string
+  check_json?: string // assistant 回答的证据核验结果 JSON（服务端回填，旧消息无）
   total_tokens: number
   created_at: string
 }
@@ -46,6 +47,11 @@ export function listConversations(limit = 30) {
 
 export function getConversation(id: number) {
   return request<QaConversationView>({ url: `/qa/${id}`, method: 'get' })
+}
+
+// 会话固定的数据快照原文（透明面板；详情接口刻意不带快照，按需单取）。
+export function getQaSnapshot(id: number) {
+  return request<{ data_snapshot: string }>({ url: `/qa/${id}/snapshot`, method: 'get' })
 }
 
 export function deleteConversation(id: number) {

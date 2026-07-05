@@ -1,5 +1,6 @@
 import { request, AI_TIMEOUT } from './client'
 import type { RecommendationView } from './recommendation'
+import type { EvidenceCheck } from './trust'
 
 // 收盘日报：交易日 15:35 后自动生成的「今日复盘 + 明日选股推荐」。
 
@@ -10,6 +11,7 @@ export interface DailyReview {
   watch_review: string
   risk_warnings: string[]
   tomorrow_plan: string
+  evidence_check?: EvidenceCheck // 复盘文本引用数字与快照的核验（服务端回填）
 }
 
 export interface DailyReportRow {

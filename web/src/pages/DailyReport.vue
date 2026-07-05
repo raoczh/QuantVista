@@ -4,10 +4,12 @@ import { useRouter } from 'vue-router'
 import {
   NButton,
   NEmpty,
+  NModal,
   NPopconfirm,
   NSelect,
   NSpin,
   NTag,
+  NTooltip,
   useMessage,
 } from 'naive-ui'
 import {
@@ -21,10 +23,11 @@ import { useUi } from '@/composables/useUi'
 import { useStockActions } from '@/composables/useStockActions'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import TrustBadges from '@/components/TrustBadges.vue'
 
 const message = useMessage()
 const router = useRouter()
-const { pctColor } = useUi()
+const { pctColor, upColor, vars, withAlpha } = useUi()
 const { goDetail } = useStockActions()
 
 const rows = ref<DailyReportRow[]>([])
@@ -92,6 +95,27 @@ async function doGenerate() {
 
 const recItems = computed(() => current.value?.recommendation?.items ?? [])
 
+// 复盘证据核验（复盘 JSON 内 evidence_check）。
+const reviewCheck = computed(() => {
+  const c = current.value?.review?.evidence_check
+  return c && c.total > 0 ? c : null
+})
+const reviewCheckColor = computed(() =>
+  reviewCheck.value && reviewCheck.value.matched === reviewCheck.value.total ? upColor.value : vars.value.warningColor,
+)
+
+// ---------- 数据快照透明面板（详情已带 snapshot_json） ----------
+const snapshotShow = ref(false)
+const snapshotText = computed(() => {
+  const raw = current.value?.snapshot_json
+  if (!raw) return ''
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2)
+  } catch {
+    return raw
+  }
+})
+
 onMounted(load)
 </script>
 
@@ -128,12 +152,29 @@ onMounted(load)
             <span class="head-date qv-figure">{{ current.trade_date }}</span>
             <n-tag :type="statusType(current.status)" round :bordered="false">{{ statusText(current.status) }}</n-tag>
             <span class="meta">耗时 {{ (current.latency_ms / 1000).toFixed(1) }}s · {{ current.total_tokens }} tokens</span>
+            <n-button v-if="snapshotText" size="tiny" quaternary @click="snapshotShow = true">数据快照</n-button>
           </div>
           <div v-if="current.error" class="err">{{ current.error }}</div>
         </SectionCard>
 
         <!-- 今日复盘 -->
         <SectionCard v-if="current.review" title="今日复盘">
+          <template v-if="reviewCheck" #extra>
+            <n-tooltip trigger="hover">
+              <template #trigger>
+                <span
+                  class="check-chip"
+                  :style="{ background: withAlpha(reviewCheckColor, 0.12), color: reviewCheckColor }"
+                >
+                  数据核验 {{ reviewCheck.matched }}/{{ reviewCheck.total }}
+                </span>
+              </template>
+              <span v-if="reviewCheck.unmatched?.length">
+                复盘里这些数字未能与快照吻合，可能是推算值或幻觉，建议人工核对：{{ reviewCheck.unmatched.join('、') }}
+              </span>
+              <span v-else>复盘引用的数字已逐一与数据快照程序化比对，全部吻合</span>
+            </n-tooltip>
+          </template>
           <div class="review">
             <p class="summary">{{ current.review.summary }}</p>
             <div class="block"><span class="bk">大盘</span><p>{{ current.review.market_review }}</p></div>
@@ -182,6 +223,18 @@ onMounted(load)
                 >
                 <span>有效期 {{ it.detail.valid_days }} 交易日</span>
               </div>
+              <TrustBadges
+                v-if="it.detail"
+                class="rec-trust"
+                :quant-score="it.detail.quant_score"
+                :quant-rank="it.detail.quant_rank"
+                :pool-size="it.detail.pool_size"
+                :lot-cost="it.detail.lot_cost"
+                :evidence-check="it.detail.evidence_check"
+                :sys-confidence="it.detail.sys_confidence"
+                :sys-confidence-why="it.detail.sys_confidence_why"
+                :review="it.detail.review"
+              />
               <p class="rec-summary">{{ it.summary }}</p>
             </div>
             <p class="sell-hint">
@@ -194,6 +247,11 @@ onMounted(load)
         <p class="disclaimer">本内容为 AI 生成的研究参考，不构成投资建议；数据可能延迟或不完整，决策风险自担。</p>
       </div>
     </n-spin>
+
+    <!-- 数据快照：本日复盘所依据的聚合数据 -->
+    <n-modal v-model:show="snapshotShow" preset="card" title="数据快照" style="max-width: 720px">
+      <pre class="snapshot-pre">{{ snapshotText }}</pre>
+    </n-modal>
   </PageContainer>
 </template>
 
@@ -292,6 +350,25 @@ onMounted(load)
   font-size: 13px;
   line-height: 1.6;
   opacity: 0.85;
+}
+.rec-trust {
+  margin: 2px 0;
+}
+.check-chip {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 12px;
+  cursor: default;
+}
+.snapshot-pre {
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 60vh;
+  overflow: auto;
+  margin: 0;
 }
 .sell-hint {
   font-size: 12px;

@@ -1,6 +1,9 @@
 package service
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestChangeOverN 近 N 日涨跌幅计算与边界。
 func TestChangeOverN(t *testing.T) {
@@ -33,5 +36,23 @@ func TestCompareHelpers(t *testing.T) {
 	}
 	if nameOr(CompareRow{Symbol: "600000", Name: "浦发银行"}) != "浦发银行" {
 		t.Fatalf("有名称应用名称")
+	}
+}
+
+// TestCompareRowLine ETF 行不得携带估值段（腾讯源对基金 PE/PB 为 0，喂给模型是噪声），
+// 且须显式标注基金身份；个股行有估值时正常拼入。
+func TestCompareRowLine(t *testing.T) {
+	fund := CompareRow{Symbol: "510300", Name: "沪深300ETF", QuoteOK: true, Price: 4.037, IsFund: true}
+	line := compareRowLine(fund)
+	if !strings.Contains(line, "ETF/场内基金") {
+		t.Fatalf("基金行应带标注：%s", line)
+	}
+	if strings.Contains(line, "PE-TTM") {
+		t.Fatalf("基金行不应携带估值段：%s", line)
+	}
+	stock := CompareRow{Symbol: "600000", Name: "浦发银行", QuoteOK: true, Price: 8.5, ValuationOK: true, PETTM: 5.2, PB: 0.4, TotalCap: 2500e8, TurnoverRate: 0.8}
+	sline := compareRowLine(stock)
+	if !strings.Contains(sline, "PE-TTM=5.20") || strings.Contains(sline, "ETF/场内基金") {
+		t.Fatalf("个股行应带估值段且无基金标注：%s", sline)
 	}
 }

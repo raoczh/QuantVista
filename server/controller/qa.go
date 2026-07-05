@@ -65,6 +65,20 @@ func (qc *QaController) Get(c *gin.Context) {
 	common.ApiSuccess(c, v)
 }
 
+// Snapshot GET /api/qa/:id/snapshot —— 会话固定数据快照原文（透明面板）。
+func (qc *QaController) Snapshot(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	snap, err := qc.svc.Snapshot(currentUserID(c), id)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, gin.H{"data_snapshot": snap})
+}
+
 // Delete DELETE /api/qa/:id
 func (qc *QaController) Delete(c *gin.Context) {
 	id, ok := parseIDParam(c, "id")

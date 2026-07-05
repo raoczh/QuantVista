@@ -1,4 +1,5 @@
 import { request, AI_TIMEOUT } from './client'
+import type { EvidenceCheck, TrustReview, SysConfidence } from './trust'
 
 export type AnalysisModule = 'market' | 'sector' | 'stock' | 'watchlist' | 'position'
 export type AnalysisStatus = 'success' | 'degraded' | 'failed'
@@ -12,6 +13,7 @@ export interface AnalyzeRequest {
   llm_config_id?: number
   question?: string
   mode?: 'panel' // 缺省=标准分析；panel=多角色观点（仅个股）
+  verify?: boolean // AI 复核（独立复核员逐项挑刺；panel/降级不复核）
 }
 
 // 结构化分析结果。
@@ -27,6 +29,11 @@ export interface AnalysisResult {
   kill_switches: string[] // 结论失效条件
   unknowns: string[] // 数据盲区
   disclaimer: string
+  // 信任层（服务端回填）
+  evidence_check?: EvidenceCheck
+  sys_confidence?: SysConfidence
+  sys_confidence_why?: string
+  review?: TrustReview
 }
 
 // 多角色观点（mode=panel）。

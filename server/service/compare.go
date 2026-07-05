@@ -46,6 +46,7 @@ type CompareRow struct {
 	Score        float64 `json:"score"`      // 综合评分 0-100
 	ScoreLabel   string  `json:"score_label"`
 	ValuationOK  bool    `json:"valuation_ok"`  // 估值快照是否可得（腾讯免费源 best-effort）
+	IsFund       bool    `json:"is_fund"`       // ETF/场内基金（无个股估值指标，估值段跳过）
 	PETTM        float64 `json:"pe_ttm"`        // 市盈率 TTM（负值=亏损）
 	PB           float64 `json:"pb"`            // 市净率
 	TotalCap     float64 `json:"total_cap"`     // 总市值（元）
@@ -69,9 +70,10 @@ type CompareSymbol struct {
 
 // CompareResult 对比结果 + 可选 AI 点评。
 type CompareResult struct {
-	Rows      []CompareRow `json:"rows"`
-	AIComment string       `json:"ai_comment"`
-	Note      string       `json:"note"`
+	Rows           []CompareRow   `json:"rows"`
+	AIComment      string         `json:"ai_comment"`
+	AICommentCheck *evidenceCheck `json:"ai_comment_check,omitempty"` // 服务端回填：AI 点评引用数字与各行指标的核验
+	Note           string         `json:"note"`
 }
 
 // Compare 并发采集各标的指标，去重后组装；WithAI 时追加一句话点评。
@@ -121,6 +123,10 @@ func (s *CompareService) Compare(ctx context.Context, userID int64, allowPrivate
 	if req.WithAI {
 		comment, note := s.aiComment(ctx, userID, allowPrivate, req.LLMConfigID, rows)
 		res.AIComment = comment
+		if comment != "" {
+			// 证据核验：点评引用的数字与全部对比行的指标值域比对（点评无 K 线明细，全量收集即可）。
+			res.AICommentCheck = verifyEvidenceValues([]string{comment}, snapshotValueSet(rows))
+		}
 		if note != "" {
 			res.Note = truncNote + note
 		}
@@ -147,7 +153,11 @@ func (s *CompareService) buildRow(ctx context.Context, market, symbol string) Co
 	row.Amount = round2(q.Amount)
 
 	// 估值快照（腾讯免费源，best-effort：拿不到只是该维度缺席）。
-	if v, verr := s.market.GetValuation(ctx, market, symbol); verr == nil {
+	// ETF/场内基金无个股估值指标（腾讯源 PE/PB 为空→0），跳过以免把全 0 当真值
+	// 喂给 AI 点评——与 analysis_context.go 的 ETF 分支同口径。
+	if market == "cn" && isCNFund(symbol) {
+		row.IsFund = true
+	} else if v, verr := s.market.GetValuation(ctx, market, symbol); verr == nil {
 		row.ValuationOK = true
 		row.PETTM = round2(v.PETTM)
 		row.PB = round2(v.PB)
@@ -222,25 +232,14 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 
 	// 只把有行情的标的喂给模型（含已算好的五维量化评分——此前算了却没喂给模型）。
 	var b strings.Builder
-	b.WriteString("请对下列股票做一次简明的横向对比点评（180 字以内，一段话）：指出相对强弱、趋势与均线位置差异、估值水位差异（如有 PE/PB 数据）、谁更值得关注及其理由。要求：只依据给出的数据，关键判断引用具体数值（如「A 综合分 78 高于 B 的 52」）；禁止使用你记忆中关于这些公司的信息，不得虚构财务明细/新闻；这是研究参考，不构成投资建议，末尾一句风险提示。\n\n数据（score 为本站五维技术评分 0-100，仅供参考锚点）：\n")
+	b.WriteString("请对下列股票做一次简明的横向对比点评（180 字以内，一段话）：指出相对强弱、趋势与均线位置差异、估值水位差异（如有 PE/PB 数据）、谁更值得关注及其理由。要求：只依据给出的数据，关键判断引用具体数值（如「A 综合分 78 高于 B 的 52」）；系统会程序化核对你引用的数字，与数据不符的会被标记展示给用户，故不得编造或凭印象填数；禁止使用你记忆中关于这些公司的信息，不得虚构财务明细/新闻；这是研究参考，不构成投资建议，末尾一句风险提示。\n\n数据（score 为本站五维技术评分 0-100，仅供参考锚点）：\n")
 	valid := 0
 	for _, r := range rows {
 		if !r.QuoteOK {
 			continue
 		}
 		valid++
-		fmt.Fprintf(&b, "- %s(%s)：现价%.2f 涨跌%.2f%% 近5日%.2f%% 近20日%.2f%% MA20=%.2f %s，区间[%.2f,%.2f]",
-			nameOr(r), r.Symbol, r.Price, r.ChangePct, r.ChangePct5d, r.ChangePct20d, r.MA20,
-			aboveText(r.AbovMA20), r.PeriodLow, r.PeriodHigh)
-		if r.Score > 0 {
-			fmt.Fprintf(&b, "，综合分%.0f(%s)", r.Score, r.ScoreLabel)
-		}
-		if r.ValuationOK {
-			fmt.Fprintf(&b, "，PE-TTM=%.2f PB=%.2f 总市值%.0f亿 换手%.2f%%", r.PETTM, r.PB, r.TotalCap/1e8, r.TurnoverRate)
-			if r.VolumeRatio > 0 {
-				fmt.Fprintf(&b, " 量比%.2f", r.VolumeRatio)
-			}
-		}
+		b.WriteString(compareRowLine(r))
 		b.WriteString("\n")
 	}
 	if valid < compareMinSymbols {
@@ -276,4 +275,26 @@ func aboveText(above bool) string {
 		return "站上MA20"
 	}
 	return "位于MA20下方"
+}
+
+// compareRowLine 拼装单只标的的数据行供 AI 点评 prompt 使用（抽成纯函数便于单测）。
+// ETF/场内基金行不带估值段并显式标注，防止模型臆测估值。
+func compareRowLine(r CompareRow) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "- %s(%s)：现价%.2f 涨跌%.2f%% 近5日%.2f%% 近20日%.2f%% MA20=%.2f %s，区间[%.2f,%.2f]",
+		nameOr(r), r.Symbol, r.Price, r.ChangePct, r.ChangePct5d, r.ChangePct20d, r.MA20,
+		aboveText(r.AbovMA20), r.PeriodLow, r.PeriodHigh)
+	if r.Score > 0 {
+		fmt.Fprintf(&b, "，综合分%.0f(%s)", r.Score, r.ScoreLabel)
+	}
+	if r.ValuationOK {
+		fmt.Fprintf(&b, "，PE-TTM=%.2f PB=%.2f 总市值%.0f亿 换手%.2f%%", r.PETTM, r.PB, r.TotalCap/1e8, r.TurnoverRate)
+		if r.VolumeRatio > 0 {
+			fmt.Fprintf(&b, " 量比%.2f", r.VolumeRatio)
+		}
+	}
+	if r.IsFund {
+		b.WriteString("，ETF/场内基金（无 PE/PB 个股估值指标，勿臆测估值）")
+	}
+	return b.String()
 }
