@@ -67,6 +67,9 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   async function startGithubLogin() {
+    // 清除历史绑定流程残留的意图标记（如在 GitHub 授权页取消后返回），
+    // 避免本次登录在回调页被误判为绑定而打 authed 接口 401 弹回登录页。
+    sessionStorage.removeItem(BIND_FLAG)
     const { url } = await getGithubAuthURL(redirectURI())
     location.href = url
   }
@@ -88,6 +91,12 @@ export const useAuthStore = defineStore('auth', () => {
     return sessionStorage.getItem(BIND_FLAG) === '1'
   }
 
+  // 清除绑定意图标记。回调页在标记不成立（未登录）或 GitHub 授权失败时调用，
+  // 防止残留标记把后续的「登录」误判成「绑定」。
+  function clearGithubBindFlag() {
+    sessionStorage.removeItem(BIND_FLAG)
+  }
+
   async function finishGithubBind(code: string, state: string) {
     sessionStorage.removeItem(BIND_FLAG)
     user.value = await bindGithub(code, state, redirectURI())
@@ -104,6 +113,7 @@ export const useAuthStore = defineStore('auth', () => {
       /* 忽略：本地清票即可 */
     }
     clearTokens()
+    sessionStorage.removeItem(BIND_FLAG) // 退出后不存在合法的进行中绑定流程
     user.value = null
   }
 
@@ -123,6 +133,7 @@ export const useAuthStore = defineStore('auth', () => {
     finishGithubLogin,
     startGithubBind,
     pendingGithubBind,
+    clearGithubBindFlag,
     finishGithubBind,
     removeGithubBind,
     logout,

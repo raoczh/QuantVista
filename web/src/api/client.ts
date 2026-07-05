@@ -65,7 +65,9 @@ http.interceptors.response.use(
         return http.request(original)
       }
       clearTokens()
-      if (location.pathname !== '/login') {
+      // /login 前缀（含 /login/callback）豁免整页跳转：登录页自身无需跳；回调页
+      // 正在用 code 换令牌，整页跳转会取消飞行中的 OAuth 请求，导致 GitHub 登录失败。
+      if (!location.pathname.startsWith('/login')) {
         // 带上当前位置，登录后由路由守卫送回原页面。
         location.href = '/login?redirect=' + encodeURIComponent(location.pathname + location.search)
       }

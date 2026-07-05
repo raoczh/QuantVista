@@ -170,7 +170,9 @@ func (s *AuthService) LoginByGitHub(ctx context.Context, code, state, redirectUR
 		return nil, err
 	}
 	if !need && !setting.RegistrationOpen() {
-		return nil, errors.New("当前未开放注册")
+		// 明确指出「查无绑定」而非笼统的未开放注册：绑定过却走到这里，
+		// 说明本库中无该 GitHub 账号的绑定关系（换了 GitHub 账号 / 换了环境库）。
+		return nil, errors.New("该 GitHub 账号未绑定任何已有用户，且当前未开放注册；若你绑定过，请确认授权的是同一个 GitHub 账号")
 	}
 	newUser := &model.User{
 		GithubID:    gu.GithubID,
