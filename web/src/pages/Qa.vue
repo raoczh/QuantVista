@@ -9,6 +9,8 @@ import {
   NEmpty,
   NPopconfirm,
   NAlert,
+  NModal,
+  NTooltip,
   useMessage,
 } from 'naive-ui'
 import {
@@ -16,9 +18,12 @@ import {
   listConversations,
   getConversation,
   deleteConversation,
+  getQaSnapshot,
   type QaConversation,
   type QaConversationView,
+  type QaMessage,
 } from '@/api/qa'
+import type { EvidenceCheck } from '@/api/trust'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
@@ -27,7 +32,7 @@ import SectionCard from '@/components/SectionCard.vue'
 const message = useMessage()
 const route = useRoute()
 const router = useRouter()
-const { vars, withAlpha } = useUi()
+const { upColor, vars, withAlpha } = useUi()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const marketOptions = [
@@ -144,6 +149,38 @@ function fmtTime(t: string) {
   return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : ''
 }
 
+// 回答的证据核验（check_json 解析；旧消息无此字段则不渲染徽章）。
+function msgCheck(m: QaMessage): EvidenceCheck | null {
+  if (!m.check_json) return null
+  try {
+    const c = JSON.parse(m.check_json) as EvidenceCheck
+    return c && c.total > 0 ? c : null
+  } catch {
+    return null
+  }
+}
+function checkColor(c: EvidenceCheck) {
+  return c.matched === c.total ? upColor.value : vars.value.warningColor
+}
+
+// ---------- 数据快照透明面板（按需单取，详情不带） ----------
+const snapshotShow = ref(false)
+const snapshotText = ref('')
+async function openSnapshot() {
+  if (!current.value) return
+  try {
+    const res = await getQaSnapshot(current.value.id)
+    try {
+      snapshotText.value = JSON.stringify(JSON.parse(res.data_snapshot), null, 2)
+    } catch {
+      snapshotText.value = res.data_snapshot || '（无快照）'
+    }
+    snapshotShow.value = true
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+
 onMounted(async () => {
   if (route.query.from_analysis) {
     const id = Number(route.query.from_analysis)
@@ -203,7 +240,10 @@ onMounted(async () => {
       <div class="col-chat">
         <SectionCard :title="current ? `${current.name || current.symbol}（${current.symbol}）` : '新问答'">
           <template v-if="current" #extra>
-            <span class="chat-meta">{{ current.model }} · {{ current.total_tokens }} tokens</span>
+            <div class="extra-row">
+              <n-button size="tiny" quaternary @click="openSnapshot">数据快照</n-button>
+              <span class="chat-meta">{{ current.model }} · {{ current.total_tokens }} tokens</span>
+            </div>
           </template>
 
           <!-- 新会话：选择标的 -->
@@ -231,7 +271,23 @@ onMounted(async () => {
           <div ref="scrollBox" class="messages" :class="{ compact: !current }">
             <div v-if="current" class="msg-list">
               <div v-for="m in current.messages" :key="m.id" class="msg" :class="m.role">
-                <div class="bubble">{{ m.content }}</div>
+                <div class="bubble-wrap">
+                  <div class="bubble">{{ m.content }}</div>
+                  <n-tooltip v-if="m.role === 'assistant' && msgCheck(m)" trigger="hover">
+                    <template #trigger>
+                      <span
+                        class="check-chip"
+                        :style="{ background: withAlpha(checkColor(msgCheck(m)!), 0.12), color: checkColor(msgCheck(m)!) }"
+                      >
+                        数据核验 {{ msgCheck(m)!.matched }}/{{ msgCheck(m)!.total }}
+                      </span>
+                    </template>
+                    <span v-if="msgCheck(m)!.unmatched?.length">
+                      这些数字未能与数据快照吻合，可能是推算值或幻觉，建议人工核对：{{ msgCheck(m)!.unmatched!.join('、') }}
+                    </span>
+                    <span v-else>回答引用的数字已逐一与数据快照程序化比对，全部吻合</span>
+                  </n-tooltip>
+                </div>
               </div>
               <div v-if="asking" class="msg assistant">
                 <div class="bubble thinking">思考中…</div>
@@ -256,6 +312,11 @@ onMounted(async () => {
         </SectionCard>
       </div>
     </div>
+
+    <!-- 数据快照：本会话固定、多轮问答复用的结构化数据 -->
+    <n-modal v-model:show="snapshotShow" preset="card" title="数据快照" style="max-width: 720px">
+      <pre class="snapshot-pre">{{ snapshotText }}</pre>
+    </n-modal>
   </PageContainer>
 </template>
 
@@ -375,14 +436,41 @@ onMounted(async () => {
 .msg.user {
   justify-content: flex-end;
 }
-.bubble {
+.bubble-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
   max-width: 76%;
+}
+.bubble {
   padding: 10px 14px;
   border-radius: 12px;
   font-size: 14px;
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
+}
+.check-chip {
+  align-self: flex-start;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 12px;
+  cursor: default;
+}
+.extra-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.snapshot-pre {
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 60vh;
+  overflow: auto;
+  margin: 0;
 }
 .msg.user .bubble {
   background: v-bind('withAlpha(vars.primaryColor, 0.14)');

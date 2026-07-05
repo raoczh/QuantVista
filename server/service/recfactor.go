@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"quantvista/datasource"
@@ -337,11 +336,10 @@ func candidateValueSet(c candidate) []float64 {
 }
 
 // verifyEvidence 核验一条推荐的 evidence 数字与快照的吻合度。
-// 数字提取排除窗口参数噪声（无小数点整数：常用参数集合、年份、六位代码、≤99 小整数——
-// 「池内第 11」「第 2/38」类 rank/池大小引用是 prompt 自己示范的格式，核验它属信任层自伤）；
-// 容差 = max(0.02, 2%)。extra 为快照之外的合法引用值域（模型自身计划价、用户筛选阈值），
-// 由调用方按上下文传入。这是启发式核对：matched 高说明模型确在引用真实数据；
-// unmatched 交给用户肉眼复核。
+// 数字提取/噪声跳过/容差规则统一在 trust.go 的 verifyEvidenceValues（全模块共用口径）：
+// 无小数点整数（常用参数集合、年份、六位代码、≤99 小整数——「池内第 11」「第 2/38」类
+// rank/池大小引用是 prompt 自己示范的格式，核验它属信任层自伤）不参与核验。
+// extra 为快照之外的合法引用值域（模型自身计划价、用户筛选阈值），由调用方按上下文传入。
 func verifyEvidence(evidence []string, c candidate, extra ...float64) *evidenceCheck {
 	vals := candidateValueSet(c)
 	for _, v := range extra {
@@ -349,39 +347,7 @@ func verifyEvidence(evidence []string, c candidate, extra ...float64) *evidenceC
 			vals = append(vals, v)
 		}
 	}
-	check := &evidenceCheck{}
-	for _, line := range evidence {
-		for _, tok := range evidenceNumRe.FindAllString(line, -1) {
-			num, err := strconv.ParseFloat(tok, 64)
-			if err != nil {
-				continue
-			}
-			// 无小数点的窗口参数/年份/股票代码/小整数不核验（「MA20」「近5日」「2026」
-			// 「600000」「池内第 11」）。阈值 1e5：六位股票代码 ≥100000，而市值（亿）/
-			// 成交额（亿）等真实引用值远小于它；≤99 的整数几乎总是 rank/池大小/天数。
-			if !strings.Contains(tok, ".") {
-				abs := math.Abs(num)
-				if abs <= 99 || evidenceNoiseInts[abs] || (abs >= 1900 && abs <= 2100) || abs >= 1e5 {
-					continue
-				}
-			}
-			check.Total++
-			matched := false
-			for _, v := range vals {
-				tol := math.Max(0.02, math.Abs(v)*0.02)
-				if math.Abs(num-v) <= tol || math.Abs(math.Abs(num)-math.Abs(v)) <= tol {
-					matched = true
-					break
-				}
-			}
-			if matched {
-				check.Matched++
-			} else if len(check.Unmatched) < 10 {
-				check.Unmatched = append(check.Unmatched, tok)
-			}
-		}
-	}
-	return check
+	return verifyEvidenceValues(evidence, vals)
 }
 
 // systemConfidence 程序合成置信度（高/中/低三档）：LLM 口头置信度系统性过度自信，

@@ -39,6 +39,9 @@ type AiConversationMessage struct {
 	Role           string `gorm:"size:16" json:"role"` // user / assistant
 	Content        string `gorm:"type:text" json:"content"`
 
+	// assistant 回答的证据数字核验结果（服务端回填，JSON；user 消息为空）。旧消息无此列，前端 v-if 兜底。
+	CheckJSON string `gorm:"type:text" json:"check_json,omitempty"`
+
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`

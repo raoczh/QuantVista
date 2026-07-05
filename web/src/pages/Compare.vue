@@ -9,6 +9,7 @@ import {
   NSpin,
   NEmpty,
   NTag,
+  NTooltip,
   useMessage,
 } from 'naive-ui'
 import { compareStocks, type CompareResult } from '@/api/compare'
@@ -146,6 +147,14 @@ function scoreTagColor(score: number) {
   const c = score >= 60 ? upColor.value : score >= 45 ? vars.value.textColor3 : vars.value.successColor
   return { color: withAlpha(c, 0.14), textColor: c }
 }
+// AI 点评证据核验。
+const aiCheck = computed(() => {
+  const c = result.value?.ai_comment_check
+  return c && c.total > 0 ? c : null
+})
+const aiCheckColor = computed(() =>
+  aiCheck.value && aiCheck.value.matched === aiCheck.value.total ? upColor.value : vars.value.warningColor,
+)
 </script>
 
 <template>
@@ -259,17 +268,21 @@ function scoreTagColor(score: number) {
                   <td class="metric-col">PE-TTM / PB</td>
                   <td v-for="r in rows" :key="r.symbol">
                     <template v-if="r.valuation_ok">{{ fmtPE(r.pe_ttm) }} / {{ fmt(r.pb) }}</template>
+                    <template v-else-if="r.is_fund">基金无估值</template>
                     <template v-else>—</template>
                   </td>
                 </tr>
                 <tr>
                   <td class="metric-col">总市值</td>
-                  <td v-for="r in rows" :key="r.symbol">{{ r.valuation_ok ? fmtCap(r.total_cap) : '—' }}</td>
+                  <td v-for="r in rows" :key="r.symbol">
+                    {{ r.valuation_ok ? fmtCap(r.total_cap) : r.is_fund ? '基金无估值' : '—' }}
+                  </td>
                 </tr>
                 <tr>
                   <td class="metric-col">换手 / 量比</td>
                   <td v-for="r in rows" :key="r.symbol">
                     <template v-if="r.valuation_ok">{{ fmt(r.turnover_rate) }}% / {{ fmt(r.volume_ratio) }}</template>
+                    <template v-else-if="r.is_fund">基金无估值</template>
                     <template v-else>—</template>
                   </td>
                 </tr>
@@ -282,7 +295,20 @@ function scoreTagColor(score: number) {
           </div>
 
           <div v-if="result.ai_comment" class="ai">
-            <div class="ai-title">AI 点评</div>
+            <div class="ai-title">
+              <span>AI 点评</span>
+              <n-tooltip v-if="aiCheck" trigger="hover">
+                <template #trigger>
+                  <span class="check-chip" :style="{ background: withAlpha(aiCheckColor, 0.12), color: aiCheckColor }">
+                    数据核验 {{ aiCheck.matched }}/{{ aiCheck.total }}
+                  </span>
+                </template>
+                <span v-if="aiCheck.unmatched?.length">
+                  点评里这些数字未能与指标对上，可能是推算值或幻觉，建议人工核对：{{ aiCheck.unmatched.join('、') }}
+                </span>
+                <span v-else>点评引用的数字已逐一与上表指标程序化比对，全部吻合</span>
+              </n-tooltip>
+            </div>
             <p class="ai-body">{{ result.ai_comment }}</p>
           </div>
         </n-spin>
@@ -382,6 +408,16 @@ function scoreTagColor(score: number) {
   font-size: 13px;
   font-weight: 600;
   margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.check-chip {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 12px;
+  cursor: default;
 }
 .ai-body {
   margin: 0;

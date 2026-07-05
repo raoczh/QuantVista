@@ -52,6 +52,9 @@ type dailyReview struct {
 	WatchReview    string   `json:"watch_review"`
 	RiskWarnings   []string `json:"risk_warnings"`
 	TomorrowPlan   string   `json:"tomorrow_plan"`
+
+	// 服务端回填（非 LLM 输出）：复盘文本引用数字与快照值域的程序化核验。
+	EvidenceCheck *evidenceCheck `json:"evidence_check,omitempty"`
 }
 
 // inReportWindow 是否处于日报生成窗口（收盘后 15:35 ~ 20:00，本地时区）。纯函数可测。
@@ -169,6 +172,7 @@ func (s *DailyReportService) GenerateFor(ctx context.Context, userID int64, manu
 	review, reviewTokens, reviewErr := s.callReview(ctx, cfg, apiKey, allowPrivate, string(snapJSON))
 	report.TotalTokens += reviewTokens
 	if reviewErr == nil {
+		review.EvidenceCheck = dailyReviewEvidence(review, snapshot) // 信任层回填后随 ReviewJSON 一起落库
 		b, _ := json.Marshal(review)
 		report.ReviewJSON = string(b)
 	}
@@ -402,12 +406,24 @@ func (s *DailyReportService) userPref(userID int64) model.UserPreference {
 
 const dailyReviewSystem = `你是个人股票研究助手，为用户生成当日收盘复盘。规则：
 1. 只依据用户消息中提供的数据（市场概览/持仓/自选异动/今日提醒），不得编造任何未提供的数据（无财务、无新闻）；数据缺失就如实说明。禁止使用你记忆中的公司/板块信息。
-2. 关键判断必须引用数据中的具体数字佐证（如「上涨 3120 家 vs 下跌 1890 家」「主力净流入 23.5 亿」「某持仓今日 -4.2% 已接近计划止损」），让用户可核对。
+2. 关键判断必须引用数据中的具体数字佐证（如「上涨 3120 家 vs 下跌 1890 家」「主力净流入 23.5 亿」「某持仓今日 -4.2% 已接近计划止损」），让用户可核对。系统会程序化核对你引用的数字，与数据不符的会被标记展示给用户，故不得编造或凭印象填数。
 3. 表述为研究参考，不构成投资建议；语气客观，指出风险。
 4. 输出严格 JSON（不要 markdown 代码块），schema：
 {"summary":"3~5 句当日总结","market_review":"大盘复盘（涨跌家数/资金流向解读）","position_review":"持仓点评（无持仓则一句说明）","watch_review":"自选异动点评（无自选则一句说明）","risk_warnings":["风险提示，1~3 条"],"tomorrow_plan":"明日盘前关注计划（2~4 句）"}`
 
 const dailyReviewRepairHint = `你上一条输出不是合法 JSON 或缺少必填字段。请只输出符合 schema 的 JSON 对象，不要任何解释或代码块包裹。`
+
+// dailyReviewEvidence 核验复盘各段文本引用的数字与复盘快照值域的吻合度（纯计算，可测）。
+// 复盘快照无 K 线明细，全量收集即可。提醒文案是 []string（含触发价/MA 值等，由 alert
+// 模块拼装）——它们确实作为快照喂给了模型但不是 JSON 数值叶子，必须并入值域，
+// 否则模型忠实引用提醒里的价格会被误报为幻觉。
+func dailyReviewEvidence(rv *dailyReview, snap *reportSnapshot) *evidenceCheck {
+	texts := []string{rv.Summary, rv.MarketReview, rv.PositionReview, rv.WatchReview, rv.TomorrowPlan}
+	texts = append(texts, rv.RiskWarnings...)
+	vals := snapshotValueSet(snap)
+	vals = append(vals, decimalNumbersIn(snap.Alerts)...)
+	return verifyEvidenceValues(texts, vals)
+}
 
 // callReview 调用 LLM 生成复盘，解析失败 repair 一次。返回（复盘, 总 token, 错误）。
 func (s *DailyReportService) callReview(ctx context.Context, cfg *model.LLMConfig, apiKey string, allowPrivate bool, snapshotJSON string) (*dailyReview, int, error) {

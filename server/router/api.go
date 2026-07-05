@@ -230,6 +230,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				qa.POST("/ask", middleware.RateLimit(20, time.Minute), qaCtl.Ask)
 				qa.GET("", qaCtl.List)
 				qa.GET("/:id", qaCtl.Get)
+				qa.GET("/:id/snapshot", qaCtl.Snapshot)
 				qa.DELETE("/:id", qaCtl.Delete)
 			}
 

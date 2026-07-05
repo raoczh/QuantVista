@@ -1,4 +1,11 @@
 import { request, AI_TIMEOUT } from './client'
+import type { EvidenceCheck, TrustReview } from './trust'
+
+// 信任层类型统一收敛到 trust.ts；此处 re-export 保持既有 import 路径不炸。
+export type { EvidenceCheck } from './trust'
+// 推荐域历史别名：PickReview = TrustReview（含可选 symbol，按标的复核）。
+export type PickReview = TrustReview
+export type { TrustReview }
 
 export type RecType = 'short_term' | 'long_term'
 export type RecStatus = 'success' | 'degraded' | 'failed'
@@ -87,20 +94,7 @@ export interface PoolCandidate {
   score_dims?: { trend: number; momentum: number; position: number; volume: number; risk: number }
 }
 
-// 证据数字核验结果（服务端程序化比对 LLM 引用的数字与数据快照）。
-export interface EvidenceCheck {
-  total: number
-  matched: number
-  unmatched?: string[]
-}
-
-// AI 复核员对单条推荐的结论（verify 模式）。
-export interface PickReview {
-  symbol: string
-  verdict: 'pass' | 'warn' | 'reject'
-  comment: string
-  confidence: number
-}
+// 证据数字核验结果与 AI 复核结论类型统一由 trust.ts 提供（见文件顶部 re-export）。
 
 // 单条推荐的结构化明细（短线/长线字段并存）。
 export interface RecDetail {

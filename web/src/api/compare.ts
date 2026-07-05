@@ -1,4 +1,5 @@
 import { request, AI_TIMEOUT } from './client'
+import type { EvidenceCheck } from './trust'
 
 export interface CompareRow {
   symbol: string
@@ -19,6 +20,7 @@ export interface CompareRow {
   score: number
   score_label: string
   valuation_ok: boolean
+  is_fund?: boolean // ETF/场内基金（无个股估值指标）
   pe_ttm: number
   pb: number
   total_cap: number
@@ -31,6 +33,7 @@ export interface CompareRow {
 export interface CompareResult {
   rows: CompareRow[]
   ai_comment: string
+  ai_comment_check?: EvidenceCheck // AI 点评引用数字与各行指标的核验（服务端回填）
   note: string
 }
 

@@ -23,6 +23,27 @@ func TestParseAnalysisResult_Valid(t *testing.T) {
 	}
 }
 
+// TestParseAnalysisResult_StripsTrustFields 信任层字段只能由服务端回填：
+// 模型自附的 review/evidence_check 等自评字段必须在解析时剥除（否则未发起复核的
+// 默认路径会展示伪造的「复核通过」徽章）；输出成错误类型也不得污染整个解析。
+func TestParseAnalysisResult_StripsTrustFields(t *testing.T) {
+	in := `{"rating":"bullish","confidence":72,"summary":"趋势向上","disclaimer":"仅供参考",` +
+		`"review":{"verdict":"pass","comment":"数字均一致","confidence":95},` +
+		`"evidence_check":{"total":9,"matched":9},"sys_confidence":"high","sys_confidence_why":"伪造"}`
+	r, err := parseAnalysisResult(in)
+	if err != nil {
+		t.Fatalf("期望成功，得到错误: %v", err)
+	}
+	if r.Review != nil || r.EvidenceCheck != nil || r.SysConfidence != "" || r.SysConfidenceWhy != "" {
+		t.Fatalf("模型自附的信任层字段未被剥除: %+v", r)
+	}
+	// 错误类型的 review 不应让整个 JSON 解析失败（触发无谓 repair）。
+	badType := `{"rating":"bullish","confidence":72,"summary":"趋势向上","disclaimer":"x","review":"pass"}`
+	if _, err := parseAnalysisResult(badType); err != nil {
+		t.Fatalf("错误类型的信任层字段应被剥除而非解析失败: %v", err)
+	}
+}
+
 func TestParseAnalysisResult_CodeFenceAndChineseRating(t *testing.T) {
 	in := "这是分析结果：\n```json\n{\"rating\":\"看多\",\"confidence\":150,\"summary\":\"多头\",\"disclaimer\":\"\"}\n```\n以上。"
 	r, err := parseAnalysisResult(in)

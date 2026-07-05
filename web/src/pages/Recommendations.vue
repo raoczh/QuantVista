@@ -17,7 +17,6 @@ import {
   NCollapse,
   NCollapseItem,
   NSwitch,
-  NTooltip,
   useMessage,
 } from 'naive-ui'
 import {
@@ -44,6 +43,7 @@ import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import TrustBadges from '@/components/TrustBadges.vue'
 
 const message = useMessage()
 const router = useRouter()
@@ -371,20 +371,6 @@ function actionText(a: string) {
 function actionColor(a: string) {
   return a === 'buy' ? upColor.value : flatColor.value
 }
-// 程序合成置信度徽章。
-const SYS_CONF_LABEL: Record<string, string> = { high: '综合置信 高', medium: '综合置信 中', low: '综合置信 低' }
-function sysConfColor(level: string | undefined) {
-  if (level === 'high') return upColor.value
-  if (level === 'low') return downColor.value
-  return flatColor.value
-}
-// AI 复核结论徽章。
-const VERDICT_LABEL: Record<string, string> = { pass: '复核通过', warn: '复核提示', reject: '复核否决' }
-function verdictColor(v: string) {
-  if (v === 'pass') return upColor.value
-  if (v === 'reject') return downColor.value
-  return vars.value.warningColor
-}
 function fmt(n: number | undefined) {
   return n == null || n === 0 ? '—' : n.toFixed(2)
 }
@@ -704,63 +690,18 @@ function signedPct(n: number | undefined) {
                   </div>
 
                   <!-- 信任徽章：量化分/排名 · 一手成本 · 证据核验 · 综合置信 · AI 复核 -->
-                  <div v-if="it.detail" class="trust-row">
-                    <span
-                      v-if="it.detail.quant_score"
-                      class="trust-chip"
-                      :style="{ background: withAlpha(vars.primaryColor, 0.1), color: vars.primaryColor }"
-                    >
-                      量化分 {{ it.detail.quant_score.toFixed(1)
-                      }}<template v-if="it.detail.quant_rank"> · 第{{ it.detail.quant_rank }}/{{ it.detail.pool_size }}</template>
-                    </span>
-                    <span class="trust-chip trust-plain">一手约 ¥{{ ((it.detail.lot_cost || it.ref_price * 100) || 0).toFixed(0) }}</span>
-                    <n-tooltip v-if="it.detail.evidence_check && it.detail.evidence_check.total > 0" trigger="hover">
-                      <template #trigger>
-                        <span
-                          class="trust-chip"
-                          :style="{
-                            background: withAlpha(
-                              it.detail.evidence_check.matched === it.detail.evidence_check.total ? upColor : vars.warningColor,
-                              0.12,
-                            ),
-                            color: it.detail.evidence_check.matched === it.detail.evidence_check.total ? upColor : vars.warningColor,
-                          }"
-                        >
-                          数据核验 {{ it.detail.evidence_check.matched }}/{{ it.detail.evidence_check.total }}
-                        </span>
-                      </template>
-                      <span v-if="it.detail.evidence_check.unmatched?.length">
-                        AI 证据里这些数字未能与数据快照对上：{{ it.detail.evidence_check.unmatched.join('、') }}——可能是推算值或幻觉，建议人工核对
-                      </span>
-                      <span v-else>AI 证据引用的数字已逐一与数据快照程序化比对，全部吻合</span>
-                    </n-tooltip>
-                    <n-tooltip v-if="it.detail.sys_confidence" trigger="hover">
-                      <template #trigger>
-                        <span
-                          class="trust-chip"
-                          :style="{
-                            background: withAlpha(sysConfColor(it.detail.sys_confidence), 0.12),
-                            color: sysConfColor(it.detail.sys_confidence),
-                          }"
-                          >{{ SYS_CONF_LABEL[it.detail.sys_confidence] || it.detail.sys_confidence }}</span
-                        >
-                      </template>
-                      由程序合成（量化排名×证据核验×数据完备度），与 AI 口头置信度相互独立：{{ it.detail.sys_confidence_why || '—' }}
-                    </n-tooltip>
-                    <n-tooltip v-if="it.detail.review" trigger="hover">
-                      <template #trigger>
-                        <span
-                          class="trust-chip"
-                          :style="{
-                            background: withAlpha(verdictColor(it.detail.review.verdict), 0.12),
-                            color: verdictColor(it.detail.review.verdict),
-                          }"
-                          >{{ VERDICT_LABEL[it.detail.review.verdict] || it.detail.review.verdict }}</span
-                        >
-                      </template>
-                      {{ it.detail.review.comment || '复核未给出说明' }}
-                    </n-tooltip>
-                  </div>
+                  <TrustBadges
+                    v-if="it.detail"
+                    class="trust-mb"
+                    :quant-score="it.detail.quant_score"
+                    :quant-rank="it.detail.quant_rank"
+                    :pool-size="it.detail.pool_size"
+                    :lot-cost="it.detail.lot_cost || it.ref_price * 100"
+                    :evidence-check="it.detail.evidence_check"
+                    :sys-confidence="it.detail.sys_confidence"
+                    :sys-confidence-why="it.detail.sys_confidence_why"
+                    :review="it.detail.review"
+                  />
 
                   <!-- 追踪状态（阶段6） -->
                   <div v-if="it.status && it.status.outcome !== 'no_data'" class="track">
@@ -1063,24 +1004,8 @@ function signedPct(n: number | undefined) {
   opacity: 0.55;
 }
 /* 信任徽章 */
-.trust-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
+.trust-mb {
   margin-bottom: 12px;
-}
-.trust-chip {
-  font-size: 12px;
-  font-weight: 600;
-  padding: 2px 10px;
-  border-radius: 20px;
-  cursor: default;
-}
-.trust-plain {
-  border: 1px solid var(--qv-divider);
-  opacity: 0.85;
-  font-weight: 500;
 }
 /* 候选池全景 */
 .pool-scroll {
