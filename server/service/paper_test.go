@@ -8,22 +8,46 @@ import (
 	"quantvista/model"
 )
 
-// TestTradeFee 佣金最低 5 元 + A 股卖出印花税。
+// TestTradeFee 佣金最低 5 元 + A 股股票卖出印花税；ETF/基金免印花税。
 func TestTradeFee(t *testing.T) {
 	// 小额买入走最低佣金 5，无税。
-	fee, tax := tradeFee("cn", model.PaperSideBuy, 1000)
+	fee, tax := tradeFee("cn", model.PaperSideBuy, "600000", 1000)
 	if fee != 5 || tax != 0 {
 		t.Fatalf("小额买入应佣金5无税，得到 fee=%v tax=%v", fee, tax)
 	}
 	// 大额卖出：佣金万2.5 + 印花税万5。
-	fee, tax = tradeFee("cn", model.PaperSideSell, 100000)
+	fee, tax = tradeFee("cn", model.PaperSideSell, "600000", 100000)
 	if fee != 25 || tax != 50 {
 		t.Fatalf("大额卖出 fee 应25 tax应50，得到 fee=%v tax=%v", fee, tax)
 	}
+	// ETF/场内基金卖出免印花税（佣金照收）。
+	fee, tax = tradeFee("cn", model.PaperSideSell, "510300", 100000)
+	if fee != 25 || tax != 0 {
+		t.Fatalf("沪 ETF 卖出应佣金25无税，得到 fee=%v tax=%v", fee, tax)
+	}
+	if _, tax = tradeFee("cn", model.PaperSideSell, "159915", 100000); tax != 0 {
+		t.Fatalf("深 ETF 卖出不应有印花税，得到 %v", tax)
+	}
 	// 美股卖出无印花税。
-	_, tax = tradeFee("us", model.PaperSideSell, 100000)
+	_, tax = tradeFee("us", model.PaperSideSell, "AAPL", 100000)
 	if tax != 0 {
 		t.Fatalf("美股卖出不应有印花税，得到 %v", tax)
+	}
+}
+
+// TestIsCNFund 场内基金前缀判定：沪 50/51/56/58、深 15/16/18 为基金；个股/可转债不是。
+func TestIsCNFund(t *testing.T) {
+	funds := []string{"510300", "512880", "588000", "159915", "159949", "160106", "184688", "501018", "508056"}
+	for _, s := range funds {
+		if !isCNFund(s) {
+			t.Errorf("%s 应判为场内基金", s)
+		}
+	}
+	notFunds := []string{"600000", "000001", "300750", "688981", "110038", "113050", "51030"}
+	for _, s := range notFunds {
+		if isCNFund(s) {
+			t.Errorf("%s 不应判为场内基金", s)
+		}
 	}
 }
 
@@ -95,6 +119,18 @@ func TestPaperTradeFlow(t *testing.T) {
 	ov2, _ := svc.Overview(ctx, 2)
 	if ov2.Account.Cash != model.PaperDefaultCash || len(ov2.Holdings) != 0 {
 		t.Fatalf("用户2 应为默认新账户")
+	}
+
+	// ETF 三位小数限价保真（最小变动价位 0.001，round2 会抹掉第三位）。
+	etfTr, err := svc.Trade(ctx, 2, TradeInput{Symbol: "159915", Market: "cn", Side: "buy", Price: 2.345, Quantity: 100})
+	if err != nil {
+		t.Fatalf("ETF 买入失败: %v", err)
+	}
+	if etfTr.Price != 2.345 {
+		t.Fatalf("ETF 成交价应保留三位小数 2.345，得到 %v", etfTr.Price)
+	}
+	if etfTr.Tax != 0 {
+		t.Fatalf("ETF 买入不应有印花税，得到 %v", etfTr.Tax)
 	}
 
 	// 重置。

@@ -174,6 +174,11 @@ func isAtLimitUp(c candidate) bool {
 // 返回排除原因；空串=通过。近 5 日涨幅条件依赖日线，在阶段③评分后判（applyGainFilter）。
 // 估值字段缺失（=0）时对应条件跳过不判（不惩罚数据缺口，保持透明由前端标注）。
 func applyQuoteFilters(c candidate, f RecFilters) string {
+	// ETF/场内基金不适用个股推荐逻辑（无个股估值、涨停幅按代码前缀会被误判）：
+	// 透明标记排除，仅经自选进入的基金会走到这里（榜单源 hs_a 只含个股）。
+	if isCNFund(c.Symbol) {
+		return "ETF/基金不参与个股推荐"
+	}
 	if f.PriceMin > 0 && c.Price < f.PriceMin {
 		return fmt.Sprintf("股价 %.2f 低于下限 %s", c.Price, trimFloat(f.PriceMin))
 	}

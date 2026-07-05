@@ -99,6 +99,7 @@ const menuOptions = computed<MenuOption[]>(() => [
       { label: navLink('/thesis', '投资逻辑卡'), key: 'thesis' },
       { label: navLink('/notes', '投资笔记'), key: 'notes' },
       { label: navLink('/paper', '模拟交易'), key: 'paper' },
+      { label: navLink('/etf', '指数ETF'), key: 'etf' },
       { label: navLink('/alerts', '条件提醒'), key: 'alerts' },
       { label: navLink('/prompt-templates', '提示词模板'), key: 'prompts' },
     ],
