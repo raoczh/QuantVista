@@ -101,7 +101,7 @@ openssl rand -base64 36   # 再生成一个作 ENCRYPTION_KEY
 
 - 账号与配置：`users`、`user_preferences`、`user_quotas`、`refresh_tokens`（可不备，重新登录即可）、`options`（系统设置，GitHub secret 为密文）、`llm_configs`（API Key 为密文，恢复后需同一 `ENCRYPTION_KEY` 才能解密）、`prompt_templates`、`notify_channels`（target 为密文，同上）
 - 研究与交易记录：`watchlists`、`watchlist_items`、`positions`、`thesis_cards`、`research_notes`
-- AI 产出：`analysis_records`、`recommendation_batches`、`recommendations`、`recommendation_statuses`、`ai_conversations`、`ai_conversation_messages`
+- AI 产出：`analysis_records`、`recommendation_batches`、`recommendations`、`recommendation_statuses`、`ai_conversations`、`ai_conversation_messages`、`daily_reports`
 - 提醒：`alert_rules`、`alert_events`
 - 模拟盘：`paper_accounts`、`paper_holdings`、`paper_trades`
 
@@ -123,7 +123,7 @@ docker exec mysql mysqldump -uquantvista -p'密码' --single-transaction quantvi
   users user_preferences user_quotas options llm_configs prompt_templates notify_channels \
   watchlists watchlist_items positions thesis_cards research_notes \
   analysis_records recommendation_batches recommendations recommendation_statuses \
-  ai_conversations ai_conversation_messages alert_rules alert_events \
+  ai_conversations ai_conversation_messages daily_reports alert_rules alert_events \
   paper_accounts paper_holdings paper_trades | gzip > qv-user-$(date +%F).sql.gz
 ```
 
