@@ -10,12 +10,96 @@ export interface Strategy {
   desc: string
 }
 
+// 候选筛选条件（阶段②用户硬过滤；0 = 不限）。
+export interface RecFilters {
+  price_min: number
+  price_max: number
+  float_cap_min_yi: number
+  float_cap_max_yi: number
+  turnover_min: number
+  turnover_max: number
+  max_gain_5d_pct: number
+  exclude_limit_up: boolean
+}
+
+export function emptyRecFilters(): RecFilters {
+  return {
+    price_min: 0,
+    price_max: 0,
+    float_cap_min_yi: 0,
+    float_cap_max_yi: 0,
+    turnover_min: 0,
+    turnover_max: 0,
+    max_gain_5d_pct: 25,
+    exclude_limit_up: true,
+  }
+}
+
 export interface RecommendRequest {
   type: RecType
   market?: string
   strategy?: string
   llm_config_id?: number
   count?: number
+  filters?: RecFilters // 不传 = 用偏好默认
+  verify?: boolean // AI 复核员二次调用
+}
+
+// 候选池条目（透明化：来源/被筛原因/因子/量化分/排名全落库）。
+export interface PoolCandidate {
+  symbol: string
+  market: string
+  name: string
+  price: number
+  change_pct: number
+  amount?: number
+  pe_ttm?: number
+  pb?: number
+  total_cap?: number
+  float_cap?: number
+  turnover_rate?: number
+  volume_ratio?: number
+  amplitude?: number
+  source?: string // 旧记录单来源
+  sources?: string[]
+  excluded?: string
+  score?: number
+  rank?: number
+  bonus?: string[]
+  sent_to_llm?: boolean
+  factors?: {
+    ma5?: number
+    ma10?: number
+    ma20?: number
+    ma60?: number
+    chg_5d: number
+    chg_20d: number
+    high_20d?: boolean
+    bull_align?: boolean
+    above_ma20?: boolean
+    vol_boost?: number
+    bias_20?: number
+    volatility_20?: number
+    drawdown_20?: number
+    pos_60: number
+    bar_count: number
+  }
+  score_dims?: { trend: number; momentum: number; position: number; volume: number; risk: number }
+}
+
+// 证据数字核验结果（服务端程序化比对 LLM 引用的数字与数据快照）。
+export interface EvidenceCheck {
+  total: number
+  matched: number
+  unmatched?: string[]
+}
+
+// AI 复核员对单条推荐的结论（verify 模式）。
+export interface PickReview {
+  symbol: string
+  verdict: 'pass' | 'warn' | 'reject'
+  comment: string
+  confidence: number
 }
 
 // 单条推荐的结构化明细（短线/长线字段并存）。
@@ -40,6 +124,15 @@ export interface RecDetail {
   key_metrics: string[]
   review_cycle: string
   disclaimer: string
+  // 信任层（服务端回填）
+  quant_score?: number
+  quant_rank?: number
+  pool_size?: number
+  lot_cost?: number
+  evidence_check?: EvidenceCheck
+  sys_confidence?: 'high' | 'medium' | 'low'
+  sys_confidence_why?: string
+  review?: PickReview
 }
 
 export type RecOutcome =
@@ -134,10 +227,14 @@ export interface RecommendationBatch {
   type: RecType
   market: string
   strategy: string
+  title?: string // 生成时由筛选条件组合固化（旧记录为空，前端回退策略名）
   status: RecStatus
   error: string
   candidate_count: number
+  candidate_pool?: string // 候选池快照 JSON（详情接口返回，列表不含）
   rejected_json?: string // 池内落选理由 JSON（详情接口返回，列表不含）
+  filters_json?: string // 本次生效筛选条件快照（详情接口返回）
+  review_json?: string // AI 复核结论 JSON（verify 模式，详情接口返回）
   provider: string
   model: string
   prompt_version: string

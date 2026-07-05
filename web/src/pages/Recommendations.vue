@@ -16,6 +16,8 @@ import {
   NAlert,
   NCollapse,
   NCollapseItem,
+  NSwitch,
+  NTooltip,
   useMessage,
 } from 'naive-ui'
 import {
@@ -26,6 +28,7 @@ import {
   deleteRecommendation,
   trackRecommendation,
   getPerformance,
+  emptyRecFilters,
   type Strategy,
   type RecommendRequest,
   type RecommendationView,
@@ -33,7 +36,10 @@ import {
   type RecommendationItem,
   type PerformanceStats,
   type RecReject,
+  type RecFilters,
+  type PoolCandidate,
 } from '@/api/recommendation'
+import { getPreference, updatePreference, type UserPreference } from '@/api/user'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
@@ -55,8 +61,107 @@ const form = ref<RecommendRequest>({
   strategy: '',
   llm_config_id: undefined,
   count: 5,
+  verify: false,
 })
 const isShort = computed(() => form.value.type === 'short_term')
+
+// ---------- 筛选条件（阶段②用户硬过滤，默认从偏好读，可临时改随请求提交） ----------
+const filters = ref<RecFilters>(emptyRecFilters())
+const pref = ref<UserPreference | null>(null)
+const savingFilters = ref(false)
+
+// 价格快捷档（解决「资金少买不起高价股」的一键入口）。
+const pricePresets = [
+  { label: '价格不限', value: 0 },
+  { label: '≤10元', value: 10 },
+  { label: '≤20元', value: 20 },
+  { label: '≤30元', value: 30 },
+  { label: '≤50元', value: 50 },
+]
+const priceCustom = ref(false)
+const pricePreset = computed({
+  get: () => {
+    if (priceCustom.value) return -1
+    if (filters.value.price_min === 0 && pricePresets.some((p) => p.value === filters.value.price_max)) {
+      return filters.value.price_max
+    }
+    return -1 // 当前值不属于任何快捷档 → 显示自定义
+  },
+  set: (v: number) => {
+    if (v === -1) {
+      priceCustom.value = true
+      return
+    }
+    priceCustom.value = false
+    filters.value.price_min = 0
+    filters.value.price_max = v
+  },
+})
+const pricePresetOptions = [...pricePresets.map((p) => ({ label: p.label, value: p.value })), { label: '自定义区间', value: -1 }]
+
+// 市值快捷档（解决「觉得推的都是大票」）。
+const capPresets = [
+  { label: '市值不限', min: 0, max: 0 },
+  { label: '≤50亿(小盘)', min: 0, max: 50 },
+  { label: '30~200亿(中小盘)', min: 30, max: 200 },
+  { label: '200~800亿', min: 200, max: 800 },
+  { label: '≥800亿(大盘)', min: 800, max: 0 },
+]
+const capCustom = ref(false)
+const capPreset = computed({
+  get: () => {
+    if (capCustom.value) return -1
+    const i = capPresets.findIndex((p) => p.min === filters.value.float_cap_min_yi && p.max === filters.value.float_cap_max_yi)
+    return i >= 0 ? i : -1
+  },
+  set: (i: number) => {
+    if (i === -1) {
+      capCustom.value = true
+      return
+    }
+    capCustom.value = false
+    filters.value.float_cap_min_yi = capPresets[i].min
+    filters.value.float_cap_max_yi = capPresets[i].max
+  },
+})
+const capPresetOptions = [...capPresets.map((p, i) => ({ label: p.label, value: i })), { label: '自定义区间', value: -1 }]
+
+function parseFiltersJSON(raw: string | undefined | null): RecFilters | null {
+  if (!raw) return null
+  try {
+    const f = JSON.parse(raw)
+    return { ...emptyRecFilters(), ...f }
+  } catch {
+    return null
+  }
+}
+
+async function loadPrefFilters() {
+  try {
+    pref.value = await getPreference()
+    const f = parseFiltersJSON(pref.value.rec_filters_json)
+    if (f) filters.value = f
+  } catch {
+    /* 偏好读取失败用默认，不打扰 */
+  }
+}
+
+// 把当前筛选保存为默认（写入偏好 rec_filters_json，之后日报的自动推荐也走同一筛选）。
+async function saveFiltersDefault() {
+  if (!pref.value) {
+    message.warning('偏好未加载，请稍后重试')
+    return
+  }
+  savingFilters.value = true
+  try {
+    pref.value = await updatePreference({ ...pref.value, rec_filters_json: JSON.stringify(filters.value) })
+    message.success('已保存为默认筛选（收盘日报的自动推荐同样生效）')
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    savingFilters.value = false
+  }
+}
 
 // 策略随类型联动。
 const strategies = ref<Strategy[]>([])
@@ -102,9 +207,11 @@ async function generate() {
     message.warning('请先在「设置」中添加并测试 LLM 配置')
     return
   }
+  // 偏好接口慢/失败时表单仍是内置默认——生成前补一次加载，避免用户以为提交的是自己保存的偏好。
+  if (!pref.value) await loadPrefFilters()
   running.value = true
   try {
-    current.value = await generateRecommendations({ ...form.value })
+    current.value = await generateRecommendations({ ...form.value, filters: { ...filters.value } })
     if (current.value.status === 'degraded') {
       message.warning('模型未给出候选池内的有效推荐，请调整策略或稍后重试')
     } else if (current.value.items.length) {
@@ -175,6 +282,120 @@ const rejectedList = computed<RecReject[]>(() => {
   }
 })
 
+// ---------- 候选池全景（透明化核心：来源/量化分/排名/被筛原因全可见） ----------
+const poolList = computed<PoolCandidate[]>(() => {
+  const raw = current.value?.candidate_pool
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw) as PoolCandidate[]
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+})
+// 参与排名的（未被筛掉）按 rank 升序；被筛掉的排后面。
+const poolRanked = computed(() =>
+  poolList.value
+    .filter((c) => !c.excluded)
+    .sort((a, b) => (a.rank || 999) - (b.rank || 999)),
+)
+const poolExcluded = computed(() => poolList.value.filter((c) => !!c.excluded))
+
+const SOURCE_LABEL: Record<string, string> = {
+  watchlist: '自选',
+  gainer: '涨幅榜',
+  active: '成交额榜',
+  turnover: '换手率榜',
+}
+function sourceText(c: PoolCandidate) {
+  const arr = c.sources && c.sources.length ? c.sources : c.source ? [c.source] : []
+  return arr.map((s) => SOURCE_LABEL[s] || s).join('+') || '—'
+}
+function fmtCapYi(v: number | undefined) {
+  return v && v > 0 ? (v / 1e8).toFixed(0) : '—'
+}
+
+// 详情接口 filters_json：生效条件回显 + 池快照容量保护的省略计数，同源解析。
+const filtersPayload = computed<{ applied?: string[]; pool_omitted?: number }>(() => {
+  const raw = current.value?.filters_json
+  if (!raw) return {}
+  try {
+    return JSON.parse(raw) as { applied?: string[]; pool_omitted?: number }
+  } catch {
+    return {}
+  }
+})
+// 本次生效的筛选条件。
+const appliedFilters = computed<string[]>(() =>
+  Array.isArray(filtersPayload.value.applied) ? filtersPayload.value.applied : [],
+)
+// 池快照被省略的条数（快照 >150 时的容量保护，被筛掉者按序截断）。
+const poolOmitted = computed<number>(() => filtersPayload.value.pool_omitted || 0)
+
+// AI 复核整体点评（verify 模式）。
+const reviewOverall = computed<string>(() => {
+  const raw = current.value?.review_json
+  if (!raw) return ''
+  try {
+    const parsed = JSON.parse(raw) as { overall?: string }
+    return parsed.overall || ''
+  } catch {
+    return ''
+  }
+})
+
+// ---------- 展示辅助 ----------
+function typeLabel(t: string) {
+  return t === 'short_term' ? '短线' : '长线'
+}
+// 全量静态字典：历史列表两种类型混排，绝不能用「当前所选类型的策略列表」查名
+// （旧版跨类型批次会显示原始 key 如 "value"，且随类型切换变化）。
+const STRATEGY_NAME: Record<string, string> = {
+  momentum: '动量突破',
+  pullback: '强势回踩',
+  active: '热点活跃',
+  value: '价值低估',
+  growth: '成长趋势',
+  leader: '龙头优选',
+}
+function strategyName(key: string) {
+  return STRATEGY_NAME[key] || strategies.value.find((s) => s.key === key)?.name || key
+}
+// 历史/结果标题：后端固化的 title 优先（含筛选条件），旧记录回退策略名。
+function batchTitle(b: { title?: string; strategy: string }) {
+  return b.title || strategyName(b.strategy)
+}
+function actionText(a: string) {
+  return a === 'buy' ? '可考虑' : '观察'
+}
+function actionColor(a: string) {
+  return a === 'buy' ? upColor.value : flatColor.value
+}
+// 程序合成置信度徽章。
+const SYS_CONF_LABEL: Record<string, string> = { high: '综合置信 高', medium: '综合置信 中', low: '综合置信 低' }
+function sysConfColor(level: string | undefined) {
+  if (level === 'high') return upColor.value
+  if (level === 'low') return downColor.value
+  return flatColor.value
+}
+// AI 复核结论徽章。
+const VERDICT_LABEL: Record<string, string> = { pass: '复核通过', warn: '复核提示', reject: '复核否决' }
+function verdictColor(v: string) {
+  if (v === 'pass') return upColor.value
+  if (v === 'reject') return downColor.value
+  return vars.value.warningColor
+}
+function fmt(n: number | undefined) {
+  return n == null || n === 0 ? '—' : n.toFixed(2)
+}
+function fmtTime(t: string) {
+  return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : ''
+}
+
+onMounted(async () => {
+  await Promise.all([loadStrategies(), loadLLM(), loadHistory(), loadPerformance(), loadPrefFilters()])
+})
+
 // ---------- 追踪 + 表现统计 ----------
 const performance = ref<PerformanceStats | null>(null)
 const tracking = ref(false)
@@ -230,29 +451,6 @@ function signedPct(n: number | undefined) {
   return (n > 0 ? '+' : '') + s + '%'
 }
 
-// ---------- 展示辅助 ----------
-function typeLabel(t: string) {
-  return t === 'short_term' ? '短线' : '长线'
-}
-function strategyName(key: string) {
-  return strategies.value.find((s) => s.key === key)?.name || key
-}
-function actionText(a: string) {
-  return a === 'buy' ? '可考虑' : '观察'
-}
-function actionColor(a: string) {
-  return a === 'buy' ? upColor.value : flatColor.value
-}
-function fmt(n: number | undefined) {
-  return n == null || n === 0 ? '—' : n.toFixed(2)
-}
-function fmtTime(t: string) {
-  return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : ''
-}
-
-onMounted(async () => {
-  await Promise.all([loadStrategies(), loadLLM(), loadHistory(), loadPerformance()])
-})
 </script>
 
 <template>
@@ -277,6 +475,45 @@ onMounted(async () => {
             <n-form-item label="数量（3-5）">
               <n-input-number v-model:value="form.count" :min="3" :max="5" style="width: 100%" />
             </n-form-item>
+            <n-form-item label="筛选条件（硬过滤，被筛掉的股票会在结果页列出原因）">
+              <div class="filters">
+                <n-select v-model:value="pricePreset" :options="pricePresetOptions" size="small" />
+                <div v-if="pricePreset === -1" class="filters-row">
+                  <n-input-number v-model:value="filters.price_min" :min="0" size="small" placeholder="价格下限" style="width: 100%" />
+                  <span class="filters-sep">~</span>
+                  <n-input-number v-model:value="filters.price_max" :min="0" size="small" placeholder="上限，0=不限" style="width: 100%" />
+                </div>
+                <n-select v-model:value="capPreset" :options="capPresetOptions" size="small" />
+                <div v-if="capPreset === -1" class="filters-row">
+                  <n-input-number v-model:value="filters.float_cap_min_yi" :min="0" size="small" placeholder="流通市值下限(亿)" style="width: 100%" />
+                  <span class="filters-sep">~</span>
+                  <n-input-number v-model:value="filters.float_cap_max_yi" :min="0" size="small" placeholder="上限(亿)，0=不限" style="width: 100%" />
+                </div>
+                <div class="filters-row">
+                  <n-input-number v-model:value="filters.turnover_min" :min="0" :max="20" size="small" placeholder="换手%下限" style="width: 100%" />
+                  <span class="filters-sep">~</span>
+                  <n-input-number v-model:value="filters.turnover_max" :min="0" :max="20" size="small" placeholder="换手%上限" style="width: 100%" />
+                </div>
+                <div class="filters-hint">换手区间上限 20%：>20% 为「死亡换手」，系统已硬性排除</div>
+                <div class="filters-switch">
+                  <span>排除已涨停（买不进）</span>
+                  <n-switch v-model:value="filters.exclude_limit_up" size="small" />
+                </div>
+                <div class="filters-switch">
+                  <span>追高保护：近5日涨幅上限%（0=不限）</span>
+                  <n-input-number v-model:value="filters.max_gain_5d_pct" :min="0" :max="100" size="small" style="width: 90px" />
+                </div>
+                <n-button size="tiny" tertiary :loading="savingFilters" @click="saveFiltersDefault">
+                  保存为默认筛选（日报自动推荐同样生效）
+                </n-button>
+              </div>
+            </n-form-item>
+            <n-form-item label="AI 复核（更可信，多一次调用）">
+              <div class="filters-switch">
+                <n-switch v-model:value="form.verify" size="small" />
+                <span class="verify-hint">开启后由独立「风控复核员」逐条核对证据与价位，可否决推荐</span>
+              </div>
+            </n-form-item>
             <n-form-item label="LLM 配置">
               <n-select v-model:value="form.llm_config_id" :options="llmOptions" placeholder="选择模型配置" />
             </n-form-item>
@@ -284,7 +521,8 @@ onMounted(async () => {
               {{ running ? '生成中…' : '生成推荐' }}
             </n-button>
             <div class="hint">
-              候选池 = 自选股 ∪ 涨幅榜 ∪ 活跃榜；AI 只能从池中选，不会编造池外标的。
+              流水线：自选∪涨幅榜∪成交额榜∪换手率榜 → 你的筛选 → 本地量化评分排序（零 AI 成本）→ AI 只在
+              Top12 里精选并强制引用数据 → 程序核验证据数字。候选池全程透明，可在结果页展开查看每只股为什么进/为什么被筛掉。
             </div>
           </n-form>
         </SectionCard>
@@ -308,7 +546,7 @@ onMounted(async () => {
                     <n-tag size="tiny" round :bordered="false" :type="h.type === 'short_term' ? 'warning' : 'info'">{{
                       typeLabel(h.type)
                     }}</n-tag>
-                    <span class="hist-name">{{ strategyName(h.strategy) }}</span>
+                    <span class="hist-name">{{ batchTitle(h) }}</span>
                   </div>
                   <div class="hist-sub">{{ fmtTime(h.created_at) }} · 候选 {{ h.candidate_count }}</div>
                 </div>
@@ -406,7 +644,7 @@ onMounted(async () => {
                 <n-tag size="small" round :bordered="false" :type="current.type === 'short_term' ? 'warning' : 'info'">{{
                   typeLabel(current.type)
                 }}</n-tag>
-                <span class="res-strategy">{{ strategyName(current.strategy) }}</span>
+                <span class="res-strategy">{{ batchTitle(current) }}</span>
                 <span class="res-meta">候选池 {{ current.candidate_count }} · {{ fmtTime(current.created_at) }}</span>
                 <n-button
                   v-if="current.items.length"
@@ -418,6 +656,15 @@ onMounted(async () => {
                   >刷新追踪</n-button
                 >
               </div>
+
+              <div v-if="appliedFilters.length" class="applied-filters">
+                <span class="af-label">本次筛选</span>
+                <n-tag v-for="(f, i) in appliedFilters" :key="i" size="tiny" round :bordered="false">{{ f }}</n-tag>
+              </div>
+
+              <n-alert v-if="reviewOverall" type="info" :bordered="false" style="margin-bottom: 12px">
+                AI 复核员：{{ reviewOverall }}
+              </n-alert>
 
               <n-alert v-if="current.status === 'degraded'" type="warning" :bordered="false" style="margin-bottom: 12px">
                 {{ current.error || '模型未给出候选池内的有效推荐' }}
@@ -454,6 +701,65 @@ onMounted(async () => {
                       </span>
                       <n-tag v-if="it.position.status === 'closed'" size="tiny" :bordered="false">已卖出</n-tag>
                     </template>
+                  </div>
+
+                  <!-- 信任徽章：量化分/排名 · 一手成本 · 证据核验 · 综合置信 · AI 复核 -->
+                  <div v-if="it.detail" class="trust-row">
+                    <span
+                      v-if="it.detail.quant_score"
+                      class="trust-chip"
+                      :style="{ background: withAlpha(vars.primaryColor, 0.1), color: vars.primaryColor }"
+                    >
+                      量化分 {{ it.detail.quant_score.toFixed(1)
+                      }}<template v-if="it.detail.quant_rank"> · 第{{ it.detail.quant_rank }}/{{ it.detail.pool_size }}</template>
+                    </span>
+                    <span class="trust-chip trust-plain">一手约 ¥{{ ((it.detail.lot_cost || it.ref_price * 100) || 0).toFixed(0) }}</span>
+                    <n-tooltip v-if="it.detail.evidence_check && it.detail.evidence_check.total > 0" trigger="hover">
+                      <template #trigger>
+                        <span
+                          class="trust-chip"
+                          :style="{
+                            background: withAlpha(
+                              it.detail.evidence_check.matched === it.detail.evidence_check.total ? upColor : vars.warningColor,
+                              0.12,
+                            ),
+                            color: it.detail.evidence_check.matched === it.detail.evidence_check.total ? upColor : vars.warningColor,
+                          }"
+                        >
+                          数据核验 {{ it.detail.evidence_check.matched }}/{{ it.detail.evidence_check.total }}
+                        </span>
+                      </template>
+                      <span v-if="it.detail.evidence_check.unmatched?.length">
+                        AI 证据里这些数字未能与数据快照对上：{{ it.detail.evidence_check.unmatched.join('、') }}——可能是推算值或幻觉，建议人工核对
+                      </span>
+                      <span v-else>AI 证据引用的数字已逐一与数据快照程序化比对，全部吻合</span>
+                    </n-tooltip>
+                    <n-tooltip v-if="it.detail.sys_confidence" trigger="hover">
+                      <template #trigger>
+                        <span
+                          class="trust-chip"
+                          :style="{
+                            background: withAlpha(sysConfColor(it.detail.sys_confidence), 0.12),
+                            color: sysConfColor(it.detail.sys_confidence),
+                          }"
+                          >{{ SYS_CONF_LABEL[it.detail.sys_confidence] || it.detail.sys_confidence }}</span
+                        >
+                      </template>
+                      由程序合成（量化排名×证据核验×数据完备度），与 AI 口头置信度相互独立：{{ it.detail.sys_confidence_why || '—' }}
+                    </n-tooltip>
+                    <n-tooltip v-if="it.detail.review" trigger="hover">
+                      <template #trigger>
+                        <span
+                          class="trust-chip"
+                          :style="{
+                            background: withAlpha(verdictColor(it.detail.review.verdict), 0.12),
+                            color: verdictColor(it.detail.review.verdict),
+                          }"
+                          >{{ VERDICT_LABEL[it.detail.review.verdict] || it.detail.review.verdict }}</span
+                        >
+                      </template>
+                      {{ it.detail.review.comment || '复核未给出说明' }}
+                    </n-tooltip>
                   </div>
 
                   <!-- 追踪状态（阶段6） -->
@@ -578,6 +884,75 @@ onMounted(async () => {
                 </div>
               </div>
 
+              <!-- 候选池全景：每只股为什么进、为什么被筛掉、量化分排第几，全透明 -->
+              <n-collapse v-if="poolList.length" class="rejected">
+                <n-collapse-item
+                  :title="`候选池全景（参与排名 ${poolRanked.length} 只 · 被筛掉 ${poolExcluded.length} 只）`"
+                  name="pool"
+                >
+                  <div class="pool-scroll">
+                    <table class="pool-table">
+                      <thead>
+                        <tr>
+                          <th>#</th>
+                          <th>名称</th>
+                          <th>现价</th>
+                          <th>涨跌%</th>
+                          <th>换手%</th>
+                          <th>量比</th>
+                          <th>流通市值(亿)</th>
+                          <th>量化分</th>
+                          <th>来源</th>
+                          <th>状态</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="c in poolRanked" :key="c.symbol">
+                          <td class="qv-tnum">{{ c.rank || '—' }}</td>
+                          <td>
+                            <span class="pool-name">{{ c.name || c.symbol }}</span>
+                            <span class="pool-symbol qv-mono">{{ c.symbol }}</span>
+                          </td>
+                          <td class="qv-tnum">{{ c.price.toFixed(2) }}</td>
+                          <td class="qv-tnum" :style="{ color: pctColorOf(c.change_pct) }">{{ signedPct(c.change_pct) }}</td>
+                          <td class="qv-tnum">{{ c.turnover_rate ? c.turnover_rate.toFixed(1) : '—' }}</td>
+                          <td class="qv-tnum">{{ c.volume_ratio ? c.volume_ratio.toFixed(1) : '—' }}</td>
+                          <td class="qv-tnum">{{ fmtCapYi(c.float_cap) }}</td>
+                          <td class="qv-tnum pool-score" :title="(c.bonus || []).join('；') || '无策略加分项'">
+                            {{ c.score ? c.score.toFixed(1) : '—' }}
+                          </td>
+                          <td>{{ sourceText(c) }}</td>
+                          <td>
+                            <n-tag v-if="c.sent_to_llm" size="tiny" type="primary" :bordered="false" round>AI 名单</n-tag>
+                            <span v-else class="pool-dim">已评分</span>
+                          </td>
+                        </tr>
+                        <tr v-for="c in poolExcluded" :key="'x-' + c.symbol" class="pool-excluded">
+                          <td>—</td>
+                          <td>
+                            <span class="pool-name">{{ c.name || c.symbol }}</span>
+                            <span class="pool-symbol qv-mono">{{ c.symbol }}</span>
+                          </td>
+                          <td class="qv-tnum">{{ c.price.toFixed(2) }}</td>
+                          <td class="qv-tnum">{{ signedPct(c.change_pct) }}</td>
+                          <td class="qv-tnum">{{ c.turnover_rate ? c.turnover_rate.toFixed(1) : '—' }}</td>
+                          <td class="qv-tnum">{{ c.volume_ratio ? c.volume_ratio.toFixed(1) : '—' }}</td>
+                          <td class="qv-tnum">{{ fmtCapYi(c.float_cap) }}</td>
+                          <td>—</td>
+                          <td>{{ sourceText(c) }}</td>
+                          <td class="pool-reason">{{ c.excluded }}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                  <div class="pool-note">
+                    来源=进池原因（自选/涨幅榜/成交额榜/换手率榜，可叠加）；量化分=五维技术评分+策略加分（0-100，悬停查看加分明细，仅排序参考不代表预期收益）；「AI
+                    名单」=量化排序 Top12 交给 AI 精选，其余仅参与排名对照。
+                    <template v-if="poolOmitted > 0">另有 {{ poolOmitted }} 只被筛掉的标的未展示（快照容量保护）。</template>
+                  </div>
+                </n-collapse-item>
+              </n-collapse>
+
               <!-- 为什么没选它：池内落选标的的一句话理由（复盘筛选逻辑用） -->
               <n-collapse v-if="rejectedList.length" class="rejected">
                 <n-collapse-item :title="`为什么没选它（${rejectedList.length}）`" name="rejected">
@@ -640,6 +1015,125 @@ onMounted(async () => {
   opacity: 0.55;
   margin-top: 8px;
   line-height: 1.5;
+}
+/* 筛选条件区 */
+.filters {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+.filters-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.filters-sep {
+  opacity: 0.5;
+  flex-shrink: 0;
+}
+.filters-switch {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  opacity: 0.85;
+}
+.filters-hint {
+  font-size: 12px;
+  opacity: 0.55;
+  line-height: 1.4;
+}
+.verify-hint {
+  font-size: 12px;
+  opacity: 0.6;
+  line-height: 1.4;
+}
+/* 本次筛选回显 */
+.applied-filters {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.af-label {
+  font-size: 12px;
+  opacity: 0.55;
+}
+/* 信任徽章 */
+.trust-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.trust-chip {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 10px;
+  border-radius: 20px;
+  cursor: default;
+}
+.trust-plain {
+  border: 1px solid var(--qv-divider);
+  opacity: 0.85;
+  font-weight: 500;
+}
+/* 候选池全景 */
+.pool-scroll {
+  overflow-x: auto;
+}
+.pool-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  min-width: 720px;
+}
+.pool-table th {
+  text-align: left;
+  font-weight: 600;
+  opacity: 0.6;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--qv-divider);
+  white-space: nowrap;
+}
+.pool-table td {
+  padding: 6px 8px;
+  border-bottom: 1px dashed var(--qv-divider);
+  white-space: nowrap;
+}
+.pool-name {
+  font-weight: 500;
+}
+.pool-symbol {
+  font-size: 11px;
+  opacity: 0.5;
+  margin-left: 4px;
+}
+.pool-score {
+  font-weight: 600;
+  cursor: help;
+}
+.pool-dim {
+  opacity: 0.45;
+  font-size: 11px;
+}
+.pool-excluded td {
+  opacity: 0.5;
+}
+.pool-reason {
+  font-size: 11px;
+  white-space: normal;
+  min-width: 160px;
+}
+.pool-note {
+  font-size: 11px;
+  opacity: 0.5;
+  line-height: 1.6;
+  margin-top: 8px;
 }
 /* 历史 */
 .hist {

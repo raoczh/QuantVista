@@ -200,6 +200,7 @@ async function loadPref() {
   try {
     pref.value = await getPreference()
     parseBlacklist(pref.value.blacklist_json)
+    parseRecFilters(pref.value.rec_filters_json)
   } catch (e) {
     message.error((e as Error).message)
   }
@@ -242,6 +243,27 @@ const minAmountYi = computed({
   },
 })
 
+/* ---------------- 推荐筛选默认值（股价/市值/换手/追高保护/排除涨停） ---------------- */
+const recFilters = reactive({
+  price_min: 0,
+  price_max: 0,
+  float_cap_min_yi: 0,
+  float_cap_max_yi: 0,
+  turnover_min: 0,
+  turnover_max: 0,
+  max_gain_5d_pct: 25,
+  exclude_limit_up: true,
+})
+function parseRecFilters(raw: string) {
+  if (!raw) return
+  try {
+    const f = JSON.parse(raw)
+    if (f && typeof f === 'object') Object.assign(recFilters, f)
+  } catch {
+    /* 坏数据用默认 */
+  }
+}
+
 /* ---------------- AI 配额用量 ---------------- */
 const quota = ref<UserQuota | null>(null)
 async function loadQuota() {
@@ -257,8 +279,10 @@ async function savePref() {
   savingPref.value = true
   try {
     pref.value.blacklist_json = blacklist.value.length ? JSON.stringify(blacklist.value) : ''
+    pref.value.rec_filters_json = JSON.stringify(recFilters)
     pref.value = await updatePreference(pref.value)
     parseBlacklist(pref.value.blacklist_json)
+    parseRecFilters(pref.value.rec_filters_json)
     message.success('偏好已保存')
   } catch (e) {
     message.error((e as Error).message)
@@ -421,6 +445,39 @@ async function doExport(kind: ExportKind) {
                 <n-button size="small" @click="addBlack">加入</n-button>
               </div>
               <span class="notify-hint">生成推荐时黑名单标的将从候选池剔除（随「保存偏好」生效）</span>
+            </div>
+          </n-form-item>
+          <n-form-item label="推荐筛选默认">
+            <div class="recf">
+              <div class="recf-row">
+                <span class="recf-label">股价区间(元)</span>
+                <n-input-number v-model:value="recFilters.price_min" :min="0" size="small" style="width: 110px" placeholder="下限" />
+                <span class="recf-sep">~</span>
+                <n-input-number v-model:value="recFilters.price_max" :min="0" size="small" style="width: 110px" placeholder="0=不限" />
+              </div>
+              <div class="recf-row">
+                <span class="recf-label">流通市值(亿)</span>
+                <n-input-number v-model:value="recFilters.float_cap_min_yi" :min="0" size="small" style="width: 110px" placeholder="下限" />
+                <span class="recf-sep">~</span>
+                <n-input-number v-model:value="recFilters.float_cap_max_yi" :min="0" size="small" style="width: 110px" placeholder="0=不限" />
+              </div>
+              <div class="recf-row">
+                <span class="recf-label">换手率(%)</span>
+                <n-input-number v-model:value="recFilters.turnover_min" :min="0" :max="20" size="small" style="width: 110px" placeholder="下限" />
+                <span class="recf-sep">~</span>
+                <n-input-number v-model:value="recFilters.turnover_max" :min="0" :max="20" size="small" style="width: 110px" placeholder="0=不限" />
+              </div>
+              <div class="recf-row">
+                <span class="recf-label">近5日涨幅上限(%)</span>
+                <n-input-number v-model:value="recFilters.max_gain_5d_pct" :min="0" :max="100" size="small" style="width: 110px" placeholder="0=不限" />
+                <span class="recf-sep" />
+                <span class="recf-label">排除已涨停</span>
+                <n-switch v-model:value="recFilters.exclude_limit_up" size="small" />
+              </div>
+              <span class="notify-hint"
+                >短线/长线推荐与收盘日报的候选池默认筛选（股价上限直接解决「推荐太贵买不起」；推荐页可临时覆盖）。被筛掉的标的会在推荐结果的「候选池全景」中列出原因。换手区间上限
+                20%：>20% 为「死亡换手」，系统已硬性排除。</span
+              >
             </div>
           </n-form-item>
           <n-button type="primary" :loading="savingPref" @click="savePref">保存偏好</n-button>
@@ -590,6 +647,27 @@ async function doExport(kind: ExportKind) {
 .notify-hint {
   font-size: 12px;
   opacity: 0.65;
+}
+/* 推荐筛选默认值 */
+.recf {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+.recf-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.recf-label {
+  font-size: 12px;
+  opacity: 0.75;
+  min-width: 88px;
+}
+.recf-sep {
+  opacity: 0.5;
 }
 .blacklist {
   display: flex;

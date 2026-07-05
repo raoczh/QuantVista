@@ -24,13 +24,19 @@ type RecommendationBatch struct {
 	Type     string `gorm:"size:16;index:idx_rb_user" json:"type"` // short_term / long_term
 	Market   string `gorm:"size:8" json:"market"`
 	Strategy string `gorm:"size:32" json:"strategy"` // 策略模板 key
-	Status   string `gorm:"size:16" json:"status"`
-	Error    string `gorm:"size:512" json:"error"`
+	// Title 生成时由筛选条件组合固化（如「短线·动量突破·≤30元·3只」）。
+	// 历史列表直接展示，不再依赖前端用「当前所选类型的策略列表」动态查名
+	//（旧做法导致跨类型批次显示原始 key 如 "value"，且随类型切换变化）。
+	Title  string `gorm:"size:128" json:"title"`
+	Status string `gorm:"size:16" json:"status"`
+	Error  string `gorm:"size:512" json:"error"`
 
-	CandidateCount int    `json:"candidate_count"`                           // 候选池标的数
-	CandidatePool  string `gorm:"type:text" json:"candidate_pool,omitempty"` // 候选池快照 JSON（列表查询不返回）
+	CandidateCount int    `json:"candidate_count"`                                 // 候选池标的数（未被过滤的）
+	CandidatePool  string `gorm:"type:mediumtext" json:"candidate_pool,omitempty"` // 候选池快照 JSON，含被过滤标的与原因、量化因子与评分（列表查询不返回；mediumtext——全景快照含因子明细，TEXT 64KB 会被大池撑爆）
 	DataSnapshot   string `gorm:"type:text" json:"data_snapshot,omitempty"`  // 喂给模型的数据 JSON（列表查询不返回）
 	RejectedJSON   string `gorm:"type:text" json:"rejected_json,omitempty"`  // 池内落选标的一句话理由 [{symbol,name,reason}]（列表查询不返回）
+	FiltersJSON    string `gorm:"type:text" json:"filters_json,omitempty"`   // 本次生效的筛选条件快照（透明可回显）
+	ReviewJSON     string `gorm:"type:text" json:"review_json,omitempty"`    // AI 复核员结论 JSON（verify 模式；列表查询不返回）
 
 	LLMConfigID     int64  `json:"llm_config_id"`
 	Provider        string `gorm:"size:32" json:"provider"`

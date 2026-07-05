@@ -166,7 +166,7 @@ func (s *SinaAdapter) GetIndices(ctx context.Context, market string) ([]Index, e
 	return out, nil
 }
 
-// GetStockRanking 用新浪 Market_Center 榜单接口（sort: changepercent / amount）。
+// GetStockRanking 用新浪 Market_Center 榜单接口（sort: changepercent / amount / turnoverratio）。
 func (s *SinaAdapter) GetStockRanking(ctx context.Context, market, sort string, limit int) ([]StockRank, error) {
 	if market != "cn" {
 		return nil, ErrNotSupported
@@ -174,7 +174,8 @@ func (s *SinaAdapter) GetStockRanking(ctx context.Context, market, sort string, 
 	if limit <= 0 || limit > 100 {
 		limit = 10
 	}
-	if sort != "changepercent" && sort != "amount" {
+	// 白名单钳制：上游同一接口还支持更多排序字段，按需扩枚举即可（非新数据源）。
+	if sort != "changepercent" && sort != "amount" && sort != "turnoverratio" {
 		sort = "changepercent"
 	}
 	url := fmt.Sprintf(
