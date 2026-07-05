@@ -27,6 +27,7 @@ import {
   type PaperHolding,
   type PaperTrade,
 } from '@/api/paper'
+import { isEtfSymbol } from '@/api/etf'
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
@@ -173,7 +174,7 @@ onMounted(load)
             <n-grid cols="1 s:2" responsive="screen" :x-gap="10">
               <n-gi>
                 <n-form-item label="价格（留空按市价）">
-                  <n-input-number v-model:value="form.price" :min="0" :precision="2" style="width: 100%" placeholder="市价" />
+                  <n-input-number v-model:value="form.price" :min="0" :precision="3" style="width: 100%" placeholder="市价" />
                 </n-form-item>
               </n-gi>
               <n-gi>
@@ -190,7 +191,7 @@ onMounted(load)
             >
               {{ form.side === 'buy' ? '模拟买入' : '模拟卖出' }}
             </n-button>
-            <div class="hint">佣金万 2.5（最低 5 元），A 股卖出另计印花税万 5；留空价格按最新行情成交。</div>
+            <div class="hint">佣金万 2.5（最低 5 元），A 股股票卖出另计印花税万 5；ETF/基金卖出免印花税；留空价格按最新行情成交。</div>
           </n-form>
         </SectionCard>
 
@@ -204,6 +205,7 @@ onMounted(load)
                   <div class="hold-title">
                     <span class="hold-name">{{ h.name || h.symbol }}</span>
                     <span class="hold-symbol qv-mono">{{ h.symbol }}</span>
+                    <n-tag v-if="isEtfSymbol(h.symbol)" size="tiny" round :bordered="false" type="info">ETF</n-tag>
                   </div>
                   <div class="hold-sub">{{ h.quantity }} 股 · 成本 {{ fmt(h.avg_cost) }} · 现价 {{ h.quote_ok ? fmt(h.price) : '—' }}</div>
                 </div>
@@ -227,6 +229,7 @@ onMounted(load)
               t.side === 'buy' ? '买' : '卖'
             }}</n-tag>
             <span class="tr-name">{{ t.name || t.symbol }}</span>
+            <n-tag v-if="isEtfSymbol(t.symbol)" size="tiny" round :bordered="false" type="info">ETF</n-tag>
             <span class="tr-detail">{{ t.quantity }} 股 @ {{ fmt(t.price) }}</span>
             <span class="tr-amount">{{ fmtMoney(t.amount) }}</span>
             <span v-if="t.side === 'sell'" class="tr-pnl" :style="{ color: pctColor(t.realized_pnl) }">

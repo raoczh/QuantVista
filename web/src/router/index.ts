@@ -22,6 +22,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/qa', name: 'qa', component: () => import('@/pages/Qa.vue'), meta: { title: '个股问答' } },
   { path: '/compare', name: 'compare', component: () => import('@/pages/Compare.vue'), meta: { title: '横向对比' } },
   { path: '/paper', name: 'paper', component: () => import('@/pages/Paper.vue'), meta: { title: '模拟交易' } },
+  { path: '/etf', name: 'etf', component: () => import('@/pages/Etf.vue'), meta: { title: '指数ETF' } },
   { path: '/prompt-templates', name: 'prompts', component: () => import('@/pages/Prompts.vue'), meta: { title: '提示词模板' } },
   { path: '/recommendations', name: 'recommendations', component: () => import('@/pages/Recommendations.vue'), meta: { title: '推荐追踪' } },
   { path: '/alerts', name: 'alerts', component: () => import('@/pages/Alerts.vue'), meta: { title: '条件提醒' } },

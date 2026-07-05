@@ -16,6 +16,7 @@ import {
 import { useUi } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import { useStockActions } from '@/composables/useStockActions'
+import { isEtfSymbol } from '@/api/etf'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
@@ -27,6 +28,8 @@ const { adding, goAnalysis, goQa, goCompare, goAlert, goThesis, addToWatchlist }
 
 const market = computed(() => String(route.params.market || 'cn'))
 const symbol = computed(() => String(route.params.symbol || ''))
+// ETF/场内基金无 PE/PB 个股估值指标（腾讯源返回 0 值），估值卡对基金隐藏不适用项。
+const isFund = computed(() => market.value === 'cn' && isEtfSymbol(symbol.value))
 
 const quote = ref<Quote | null>(null)
 const valuation = ref<Valuation | null>(null)
@@ -220,11 +223,14 @@ function scoreType(total: number) {
                 <span class="src-hint">{{ valuation.source }}</span>
               </template>
               <div v-if="valuation" class="quote-grid">
-                <div class="qc"><span class="qc-k">PE-TTM</span><span class="qc-v qv-tnum">{{ fmt(valuation.pe_ttm) }}</span></div>
-                <div class="qc"><span class="qc-k">PE(动)</span><span class="qc-v qv-tnum">{{ fmt(valuation.pe_dynamic) }}</span></div>
-                <div class="qc"><span class="qc-k">市净率</span><span class="qc-v qv-tnum">{{ fmt(valuation.pb) }}</span></div>
-                <div class="qc"><span class="qc-k">总市值</span><span class="qc-v qv-tnum">{{ fmtCap(valuation.total_cap) }}</span></div>
-                <div class="qc"><span class="qc-k">流通市值</span><span class="qc-v qv-tnum">{{ fmtCap(valuation.float_cap) }}</span></div>
+                <template v-if="!isFund">
+                  <div class="qc"><span class="qc-k">PE-TTM</span><span class="qc-v qv-tnum">{{ fmt(valuation.pe_ttm) }}</span></div>
+                  <div class="qc"><span class="qc-k">PE(动)</span><span class="qc-v qv-tnum">{{ fmt(valuation.pe_dynamic) }}</span></div>
+                  <div class="qc"><span class="qc-k">市净率</span><span class="qc-v qv-tnum">{{ fmt(valuation.pb) }}</span></div>
+                  <div class="qc"><span class="qc-k">总市值</span><span class="qc-v qv-tnum">{{ fmtCap(valuation.total_cap) }}</span></div>
+                  <div class="qc"><span class="qc-k">流通市值</span><span class="qc-v qv-tnum">{{ fmtCap(valuation.float_cap) }}</span></div>
+                </template>
+                <div v-else class="qc qc-wide"><span class="qc-k">类型</span><span class="qc-v">ETF/场内基金（无 PE/PB 个股估值指标）</span></div>
                 <div class="qc"><span class="qc-k">换手率</span><span class="qc-v qv-tnum">{{ fmt(valuation.turnover_rate) }}%</span></div>
                 <div class="qc"><span class="qc-k">振幅</span><span class="qc-v qv-tnum">{{ fmt(valuation.amplitude) }}%</span></div>
                 <div class="qc"><span class="qc-k">量比</span><span class="qc-v qv-tnum">{{ fmt(valuation.volume_ratio) }}</span></div>
@@ -301,6 +307,9 @@ function scoreType(total: number) {
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+.qc-wide {
+  grid-column: 1 / -1;
 }
 .qc-k {
   font-size: 12px;

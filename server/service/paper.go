@@ -32,14 +32,15 @@ func NewPaperService(market *MarketService) *PaperService {
 	return &PaperService{market: market}
 }
 
-// tradeFee 简化券商费用模型：佣金万 2.5（最低 5 元）+ A 股卖出印花税万 5。
-func tradeFee(market, side string, amount float64) (fee, tax float64) {
+// tradeFee 简化券商费用模型：佣金万 2.5（最低 5 元）+ A 股股票卖出印花税万 5。
+// ETF/场内基金（isCNFund）卖出免征印花税，故 cn 卖出仅对非基金标的计税。
+func tradeFee(market, side, symbol string, amount float64) (fee, tax float64) {
 	comm := amount * 0.00025
 	if comm < 5 {
 		comm = 5
 	}
 	fee = round2(comm)
-	if market == "cn" && side == model.PaperSideSell {
+	if market == "cn" && side == model.PaperSideSell && !isCNFund(symbol) {
 		tax = round2(amount * 0.0005)
 	}
 	return fee, tax
@@ -97,7 +98,8 @@ func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (
 	}
 
 	// 成交价：给定则用给定（跳过行情，便于离线/指定价成交）；否则取实时行情价。
-	price := round2(in.Price)
+	// 精度用 round4（列为 decimal(20,4)）：ETF/基金最小变动价位 0.001 元，round2 会抹掉限价第三位小数。
+	price := round4(in.Price)
 	name := ""
 	if price <= 0 {
 		q, e := s.market.GetQuote(ctx, market, symbol)
@@ -107,7 +109,7 @@ func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (
 			}
 			return nil, errors.New("无法获取成交价，请手动指定价格")
 		}
-		price = round2(q.Price)
+		price = round4(q.Price)
 		name = q.Name
 	}
 	if price <= 0 {
@@ -134,7 +136,7 @@ func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (
 			return err
 		}
 		amount := round2(price * in.Quantity)
-		fee, tax := tradeFee(market, side, amount)
+		fee, tax := tradeFee(market, side, symbol, amount)
 		trade.Amount, trade.Fee, trade.Tax = amount, fee, tax
 
 		var holding model.PaperHolding
@@ -239,7 +241,7 @@ func (s *PaperService) Overview(ctx context.Context, userID int64) (*PaperOvervi
 	for _, h := range holdings {
 		v := PaperHoldingView{PaperHolding: h, Cost: round2(h.AvgCost * h.Quantity)}
 		if q := quotes[QuoteKey(h.Market, h.Symbol)]; q != nil {
-			v.Price = round2(q.Price)
+			v.Price = round4(q.Price) // ETF 持仓现价保留 0.001 最小变动价位（个股两位小数不受影响）
 			v.QuoteOK = true
 			v.MarketValue = round2(q.Price * h.Quantity)
 			v.ProfitAmount = round2(v.MarketValue - v.Cost)

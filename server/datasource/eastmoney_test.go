@@ -70,3 +70,41 @@ func TestParseMarketFundFlowEmpty(t *testing.T) {
 		t.Errorf("空 klines 应返回 ErrNoData, 得到 %v", err)
 	}
 }
+
+// TestCNSymbolMapping 代码映射：个股沪深 + 场内基金（深 15/16/18 放行），可转债（10/11）拒绝。
+func TestCNSymbolMapping(t *testing.T) {
+	cases := []struct {
+		symbol    string
+		wantSecid string // "" 表示应 false
+		wantSina  string
+	}{
+		{"600000", "1.600000", "sh600000"}, // 沪主板
+		{"000001", "0.000001", "sz000001"}, // 深主板
+		{"510300", "1.510300", "sh510300"}, // 沪 ETF（5 开头，天然可用）
+		{"588000", "1.588000", "sh588000"}, // 科创50 ETF（沪）
+		{"159915", "0.159915", "sz159915"}, // 深 ETF（15 开头，本次放行）
+		{"160106", "0.160106", "sz160106"}, // 深 LOF（16）
+		{"184688", "0.184688", "sz184688"}, // 封闭基金（18）
+		{"110038", "", ""},                 // 沪可转债（11）——不得误当基金放行
+		{"123120", "", ""},                 // 深可转债（12）
+		{"12345", "", ""},                  // 长度非 6
+	}
+	for _, tc := range cases {
+		gotSecid, ok := cnSecid(tc.symbol)
+		if tc.wantSecid == "" {
+			if ok {
+				t.Errorf("cnSecid(%s) 应 false，得到 %q", tc.symbol, gotSecid)
+			}
+		} else if !ok || gotSecid != tc.wantSecid {
+			t.Errorf("cnSecid(%s) = %q,%v，期望 %q,true", tc.symbol, gotSecid, ok, tc.wantSecid)
+		}
+		gotSina, ok := sinaCNSymbol(tc.symbol)
+		if tc.wantSina == "" {
+			if ok {
+				t.Errorf("sinaCNSymbol(%s) 应 false，得到 %q", tc.symbol, gotSina)
+			}
+		} else if !ok || gotSina != tc.wantSina {
+			t.Errorf("sinaCNSymbol(%s) = %q,%v，期望 %q,true", tc.symbol, gotSina, ok, tc.wantSina)
+		}
+	}
+}

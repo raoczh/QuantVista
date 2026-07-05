@@ -74,6 +74,8 @@ func doGet(ctx context.Context, url string, headers map[string]string) ([]byte, 
 
 // cnSecid 把 A 股代码转换为东财 secid（沪市 1.、深市 0.）。
 // 规则（社区惯例）：6/5/9 开头 -> 沪市；0/2/3 开头 -> 深市。
+// 深市基金（15x ETF / 16x LOF / 18x 封闭基金）也以 '1' 开头，单独放行 -> 深市；
+// 不放开整个 '1' 前缀：10x/11x 为沪深可转债，代码规则不同，须排除（否则误当基金查行情）。
 func cnSecid(symbol string) (string, bool) {
 	s := strings.TrimSpace(symbol)
 	if len(s) != 6 {
@@ -84,12 +86,18 @@ func cnSecid(symbol string) (string, bool) {
 		return "1." + s, true
 	case '0', '2', '3':
 		return "0." + s, true
+	case '1':
+		if p := s[:2]; p == "15" || p == "16" || p == "18" {
+			return "0." + s, true // 深市基金
+		}
+		return "", false
 	default:
 		return "", false
 	}
 }
 
 // sinaCNSymbol 把 A 股代码转换为新浪前缀代码（sh/sz）。
+// 深市基金 15x/16x/18x 同 cnSecid：放行为深市（sz），排除 10x/11x 可转债。
 func sinaCNSymbol(symbol string) (string, bool) {
 	s := strings.TrimSpace(symbol)
 	if len(s) != 6 {
@@ -100,6 +108,11 @@ func sinaCNSymbol(symbol string) (string, bool) {
 		return "sh" + s, true
 	case '0', '2', '3':
 		return "sz" + s, true
+	case '1':
+		if p := s[:2]; p == "15" || p == "16" || p == "18" {
+			return "sz" + s, true // 深市基金
+		}
+		return "", false
 	default:
 		return "", false
 	}

@@ -60,6 +60,8 @@ func TestApplyQuoteFilters(t *testing.T) {
 		{"死亡换手硬拦", candidate{Symbol: "600002", Name: "x", Price: 8, TurnoverRate: 25}, RecFilters{}, true, "死亡换手"},
 		{"已涨停排除", candidate{Symbol: "600003", Name: "x", Price: 11, LimitUp: 11, ChangePct: 10.0}, RecFilters{ExcludeLimitUp: true}, true, "涨停"},
 		{"涨停但未开启排除", candidate{Symbol: "600003", Name: "x", Price: 11, LimitUp: 11, ChangePct: 10.0}, RecFilters{}, false, ""},
+		{"ETF不参与个股推荐", candidate{Symbol: "510300", Name: "沪深300ETF", Price: 4}, RecFilters{}, true, "ETF"},
+		{"深ETF也排除", candidate{Symbol: "159915", Name: "创业板ETF", Price: 2}, RecFilters{}, true, "基金"},
 	}
 	for _, tc := range cases {
 		reason := applyQuoteFilters(tc.c, tc.f)

@@ -32,6 +32,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	compareSvc := service.NewCompareService(marketSvc, llmSvc)
 	scoreSvc := service.NewScoreService(marketSvc)
 	paperSvc := service.NewPaperService(marketSvc)
+	etfSvc := service.NewEtfService(marketSvc)
 	notifySvc := service.NewNotifyService()
 	promptSvc := service.NewPromptService()
 	dailyReportSvc := service.NewDailyReportService(marketSvc, watchlistSvc, positionSvc, alertSvc, recommendationSvc, llmSvc, notifySvc)
@@ -52,6 +53,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	qaCtl := controller.NewQaController(qaSvc)
 	compareCtl := controller.NewCompareController(compareSvc)
 	paperCtl := controller.NewPaperController(paperSvc)
+	etfCtl := controller.NewEtfController(etfSvc)
 	notifyCtl := controller.NewNotifyController(notifySvc)
 	promptCtl := controller.NewPromptController(promptSvc)
 	thesisCtl := controller.NewThesisController(thesisSvc)
@@ -242,6 +244,9 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				paper.GET("/trades", paperCtl.Trades)
 				paper.POST("/reset", paperCtl.Reset)
 			}
+
+			// 指数 ETF 清单（精选宽基/行业/跨境，实时行情富化；交易复用 /paper/trade）
+			authed.GET("/etf/list", etfCtl.List)
 
 			// 推送通道（Server酱/webhook；提醒命中时主动推送）
 			notify := authed.Group("/notify-channels")

@@ -105,7 +105,12 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 	}
 
 	// 估值/盘面扩展（腾讯免费源 best-effort：拿不到不阻断，提示词已要求缺失时如实说明）。
-	if v, verr := market.GetValuation(ctx, mkt, symbol); verr == nil {
+	// ETF/场内基金无个股估值指标（PE/PB/市值来自个股口径，喂给基金全 0 是噪声），
+	// 直接标注资产类型并以说明替代估值段。
+	if isCNFund(symbol) {
+		snap["asset_type"] = "etf"
+		snap["valuation"] = map[string]any{"note": "ETF/基金无个股估值指标（PE/PB/市值不适用）"}
+	} else if v, verr := market.GetValuation(ctx, mkt, symbol); verr == nil {
 		val := map[string]any{
 			"pe_ttm":        round2(v.PETTM),
 			"pe_dynamic":    round2(v.PEDynamic),
