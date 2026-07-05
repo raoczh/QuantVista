@@ -46,6 +46,7 @@ type PreferenceInput struct {
 
 	BlacklistJSON      string  `json:"blacklist_json"`       // 候选池黑名单 [{symbol,market,reason}]
 	MinCandidateAmount float64 `json:"min_candidate_amount"` // 候选池最低日成交额（元；0=不过滤）
+	RecFiltersJSON     string  `json:"rec_filters_json"`     // 推荐筛选默认值（RecFilters JSON；空=类型默认）
 
 	EnableDailyReport bool `json:"enable_daily_report"` // 收盘日报（今日复盘+明日推荐）自动生成
 }
@@ -154,6 +155,10 @@ func (s *UserService) UpdatePreference(userID int64, in PreferenceInput) (*model
 	if err != nil {
 		return nil, err
 	}
+	recFilters, err := normalizeRecFiltersJSON(in.RecFiltersJSON)
+	if err != nil {
+		return nil, err
+	}
 	p, err := s.GetPreference(userID)
 	if err != nil {
 		return nil, err
@@ -165,11 +170,31 @@ func (s *UserService) UpdatePreference(userID int64, in PreferenceInput) (*model
 	p.EnableNotify = in.EnableNotify
 	p.BlacklistJSON = blacklist
 	p.MinCandidateAmount = in.MinCandidateAmount
+	p.RecFiltersJSON = recFilters
 	p.EnableDailyReport = in.EnableDailyReport
 	if err := common.DB.Save(p).Error; err != nil {
 		return nil, err
 	}
 	return p, nil
+}
+
+// normalizeRecFiltersJSON 校验并归一化推荐筛选默认值 JSON：空串通过（用类型默认）、
+// 坏格式报错、合法则 sanitize 后重新序列化（去掉未知字段与越界值）。
+func normalizeRecFiltersJSON(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	var f RecFilters
+	if err := json.Unmarshal([]byte(raw), &f); err != nil {
+		return "", errors.New("推荐筛选条件格式错误")
+	}
+	f = sanitizeRecFilters(f)
+	b, err := json.Marshal(f)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
 // GetQuota 取用户配额，不存在则建默认。

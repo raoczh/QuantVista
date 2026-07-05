@@ -220,9 +220,9 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 		return "", "AI 点评不可用：配额信息读取失败"
 	}
 
-	// 只把有行情的标的喂给模型。
+	// 只把有行情的标的喂给模型（含已算好的五维量化评分——此前算了却没喂给模型）。
 	var b strings.Builder
-	b.WriteString("请对下列股票做一次简明的横向对比点评（150 字以内，一段话）：指出相对强弱、趋势与均线位置差异、估值水位差异（如有 PE/PB 数据）、谁更值得关注及其理由；只依据给出的行情、估值快照与技术指标，不得虚构财务明细/新闻；这是研究参考，不构成投资建议，末尾一句风险提示。\n\n数据：\n")
+	b.WriteString("请对下列股票做一次简明的横向对比点评（180 字以内，一段话）：指出相对强弱、趋势与均线位置差异、估值水位差异（如有 PE/PB 数据）、谁更值得关注及其理由。要求：只依据给出的数据，关键判断引用具体数值（如「A 综合分 78 高于 B 的 52」）；禁止使用你记忆中关于这些公司的信息，不得虚构财务明细/新闻；这是研究参考，不构成投资建议，末尾一句风险提示。\n\n数据（score 为本站五维技术评分 0-100，仅供参考锚点）：\n")
 	valid := 0
 	for _, r := range rows {
 		if !r.QuoteOK {
@@ -232,8 +232,14 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 		fmt.Fprintf(&b, "- %s(%s)：现价%.2f 涨跌%.2f%% 近5日%.2f%% 近20日%.2f%% MA20=%.2f %s，区间[%.2f,%.2f]",
 			nameOr(r), r.Symbol, r.Price, r.ChangePct, r.ChangePct5d, r.ChangePct20d, r.MA20,
 			aboveText(r.AbovMA20), r.PeriodLow, r.PeriodHigh)
+		if r.Score > 0 {
+			fmt.Fprintf(&b, "，综合分%.0f(%s)", r.Score, r.ScoreLabel)
+		}
 		if r.ValuationOK {
 			fmt.Fprintf(&b, "，PE-TTM=%.2f PB=%.2f 总市值%.0f亿 换手%.2f%%", r.PETTM, r.PB, r.TotalCap/1e8, r.TurnoverRate)
+			if r.VolumeRatio > 0 {
+				fmt.Fprintf(&b, " 量比%.2f", r.VolumeRatio)
+			}
 		}
 		b.WriteString("\n")
 	}

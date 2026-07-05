@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 
@@ -50,14 +51,49 @@ func (s *MarketService) GetQuote(ctx context.Context, market, symbol string) (*d
 	return q, nil
 }
 
-// GetDailyBars 取日线序列（暂不缓存，数据量大且变动低频，后续可加）。
+const dailyBarsCacheTTL = 10 * time.Minute
+
+// GetDailyBars 取日线序列。加 10 分钟缓存：推荐评分/个股分析/对比/评分卡会在短时间内
+// 反复拉同一批标的的日线（收盘后日线不变、盘中仅末根在动），缓存显著降低对免费源的压力。
 func (s *MarketService) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]datasource.Bar, error) {
+	cacheKey := fmt.Sprintf("bars:%s:%s:%d", market, symbol, limit)
+	if cached, ok := common.RedisGet(cacheKey); ok {
+		var bars []datasource.Bar
+		if json.Unmarshal([]byte(cached), &bars) == nil && len(bars) > 0 {
+			return bars, nil
+		}
+	}
 	bars, err := s.mgr.GetDailyBars(ctx, market, symbol, limit)
 	if err != nil {
 		return nil, err
 	}
 	s.persistDailyBars(market, symbol, bars)
+	if b, err := json.Marshal(bars); err == nil {
+		common.RedisSet(cacheKey, string(b), dailyBarsCacheTTL)
+	}
 	return bars, nil
+}
+
+const rankingCacheTTL = 60 * time.Second
+
+// GetRanking 取个股榜单（sort: changepercent/amount/turnoverratio），60s 缓存。
+// 供推荐候选池多源建池使用（首页概览走 GetOverview 的 10 条口径，互不影响）。
+func (s *MarketService) GetRanking(ctx context.Context, market, sort string, limit int) ([]datasource.StockRank, error) {
+	cacheKey := fmt.Sprintf("ranking:%s:%s:%d", market, sort, limit)
+	if cached, ok := common.RedisGet(cacheKey); ok {
+		var rows []datasource.StockRank
+		if json.Unmarshal([]byte(cached), &rows) == nil && len(rows) > 0 {
+			return rows, nil
+		}
+	}
+	rows, err := s.mgr.GetStockRanking(ctx, market, sort, limit)
+	if err != nil {
+		return nil, err
+	}
+	if b, err := json.Marshal(rows); err == nil {
+		common.RedisSet(cacheKey, string(b), rankingCacheTTL)
+	}
+	return rows, nil
 }
 
 const valuationCacheTTL = 60 * time.Second

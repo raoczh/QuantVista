@@ -124,11 +124,23 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 		snap["valuation"] = val
 	}
 
-	// 日线：取近 60 根算技术指标，注入近 30 根明细。
+	// 日线：取近 60 根算技术指标，注入近 30 根明细；顺手算五维量化评分
+	// （与个股详情页/对比/推荐同一 computeScore 口径），给 LLM 一个确定性的量化锚点，
+	// 降低「模型在一坨数字里自由发挥」的空间。
 	bars, berr := market.GetDailyBars(ctx, mkt, symbol, 60)
 	if berr == nil && len(bars) > 0 {
 		snap["technicals"] = computeTechnicals(bars)
 		snap["recent_bars"] = compactBars(bars, 30)
+		sc := computeScore(q.Price, bars)
+		snap["quant_score"] = map[string]any{
+			"total": sc.Total, "label": sc.Label,
+			"trend": sc.Trend, "momentum": sc.Momentum, "position": sc.Position,
+			"volume": sc.Volume, "risk": sc.Risk,
+			"note": "纯技术面五维加权评分(0-100)，数据不足维度取中性50，仅供参考锚点，非买卖信号",
+		}
+		if sc.DataLimited {
+			snap["quant_score"].(map[string]any)["data_limited"] = true
+		}
 	} else if berr != nil {
 		snap["bars_note"] = "日线数据暂不可用"
 	}

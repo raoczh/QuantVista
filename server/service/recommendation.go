@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"quantvista/common"
+	"quantvista/datasource"
 	"quantvista/model"
 
 	"gorm.io/gorm"
@@ -28,11 +30,19 @@ func NewRecommendationService(market *MarketService, watchlist *WatchlistService
 }
 
 const (
-	recPromptVersion   = "p3" // p3: 要求输出池内落选标的一句话理由(rejected)；p2: 候选池富化估值快照
-	recStrategyVersion = "s1"
-	maxCandidates      = 24 // 候选池上限，控制上下文预算
+	recPromptVersion   = "p4" // p4: 四阶段流水线——多源建池/用户筛选/量化评分排序，LLM 降级为「精选+解读」并强制引用字段数值；p3: 落选理由；p2: 估值富化
+	recStrategyVersion = "s2" // s2: 引入本地量化评分与策略加分项；s1: 纯 prompt 导向
+	maxScanCandidates  = 36   // 进入量化评分的候选上限（约束日线拉取量：36 只 × 1 次 HTTP）
+	maxLLMCandidates   = 12   // 量化排序后进入 LLM 精选的名单上限（控上下文与位置偏差面）
+	factorBarLimit     = 90   // 因子计算的日线根数（MA60 需 ≥60，留余量）
+	rankFetchLimit     = 20   // 每个榜单来源取多少条进池
+	maxPoolIntake      = 200  // 建池总量护栏（自选无上限，防极端用户打爆估值批量请求）
+	poolSnapshotMax    = 150  // 候选池快照落库条目上限（MySQL TEXT 64KB 容量保护，超出部分只记数量）
 	recRepairAttempts  = 2
 )
+
+// poolFullPrefix 「评分名额已满」排除原因前缀（scorePool 补位时按它识别可回补的标的）。
+const poolFullPrefix = "候选池已满"
 
 // strategyTemplate 策略模板。
 type strategyTemplate struct {
@@ -73,20 +83,28 @@ func StrategiesFor(recType string) []strategyTemplate {
 	return out
 }
 
-func strategyByKey(recType, key string) *strategyTemplate {
+// strategyByKey 按类型查策略模板：空 key 用第一个缺省；非空但查不到报错
+// （旧版静默回退第一个，用户传跨类型 key 时会无感知地跑错策略）。
+func strategyByKey(recType, key string) (*strategyTemplate, error) {
 	src := longStrategies
 	if recType == model.RecTypeShortTerm {
 		src = shortStrategies
 	}
+	if key == "" {
+		return &src[0], nil
+	}
 	for i := range src {
 		if src[i].Key == key {
-			return &src[i]
+			return &src[i], nil
 		}
 	}
-	return &src[0] // 缺省用第一个
+	return nil, fmt.Errorf("策略 %s 与推荐类型不匹配，请重新选择", key)
 }
 
 // candidate 候选池条目（均为真实行情数据；估值字段为腾讯免费源 best-effort，缺失为 0）。
+// 阶段②③会补充：Sources 来源、Excluded 被过滤原因、Factors 技术因子、Score/Rank 量化评分与排名、
+// Bonus 策略加分项说明、SentToLLM 是否进入 LLM 精选名单。全量（含被过滤者）落库 candidate_pool——
+// 池子完全透明，用户能看到每只股为什么进、为什么被筛掉、排第几。
 type candidate struct {
 	Symbol       string  `json:"symbol"`
 	Market       string  `json:"market"`
@@ -97,20 +115,44 @@ type candidate struct {
 	PETTM        float64 `json:"pe_ttm,omitempty"`        // 市盈率 TTM（负=亏损）
 	PB           float64 `json:"pb,omitempty"`            // 市净率
 	TotalCap     float64 `json:"total_cap,omitempty"`     // 总市值（元）
+	FloatCap     float64 `json:"float_cap,omitempty"`     // 流通市值（元）
 	TurnoverRate float64 `json:"turnover_rate,omitempty"` // 换手率 %
-	Source       string  `json:"source"`                  // watchlist / gainer / active
+	VolumeRatio  float64 `json:"volume_ratio,omitempty"`  // 量比（腾讯实时口径）
+	Amplitude    float64 `json:"amplitude,omitempty"`     // 当日振幅 %
+	LimitUp      float64 `json:"limit_up,omitempty"`      // 涨停价（判「已涨停买不进」）
+	Source       string  `json:"source,omitempty"`        // 兼容旧记录的单来源字段（新记录用 Sources）
+
+	Sources   []string     `json:"sources,omitempty"`    // watchlist / gainer / active / turnover（可多来源）
+	Excluded  string       `json:"excluded,omitempty"`   // 非空=被用户筛选/风控排除的原因（透明可查）
+	Factors   *candFactors `json:"factors,omitempty"`    // 技术因子快照（90 日线派生）
+	ScoreDims *scoreDims   `json:"score_dims,omitempty"` // 五维评分明细
+	Score     float64      `json:"score,omitempty"`      // 量化综合分 0-100（五维基础分 + 策略加分）
+	Rank      int          `json:"rank,omitempty"`       // 未被排除者中的排名（1=最高）
+	Bonus     []string     `json:"bonus,omitempty"`      // 策略加分/扣分明细（可解释）
+	SentToLLM bool         `json:"sent_to_llm,omitempty"`
+}
+
+// sourceLabelCN 候选来源的中文标签（落库英文 key，前端映射展示）。
+var sourceLabelCN = map[string]string{
+	"watchlist": "自选",
+	"gainer":    "涨幅榜",
+	"active":    "成交额榜",
+	"turnover":  "换手率榜",
 }
 
 // RecommendRequest 生成推荐入参。
 type RecommendRequest struct {
-	Type        string `json:"type"` // short_term / long_term
-	Market      string `json:"market"`
-	Strategy    string `json:"strategy"`
-	LLMConfigID int64  `json:"llm_config_id"`
-	Count       int    `json:"count"` // 期望 3-5
+	Type        string      `json:"type"` // short_term / long_term
+	Market      string      `json:"market"`
+	Strategy    string      `json:"strategy"`
+	LLMConfigID int64       `json:"llm_config_id"`
+	Count       int         `json:"count"`   // 期望 3-5
+	Filters     *RecFilters `json:"filters"` // 候选筛选条件；nil = 用用户偏好（无偏好则按类型默认）
+	Verify      bool        `json:"verify"`  // AI 复核：额外一次「风控复核员」调用逐条挑刺（多耗一次 LLM 请求）
 }
 
 // recPick LLM 输出的单条推荐（短线/长线字段并存，按类型取用）。
+// QuantScore/Rank/LotCost/EvidenceCheck/SysConfidence/Review 为服务端生成后回填（非 LLM 输出）。
 type recPick struct {
 	Symbol     string   `json:"symbol"`
 	Action     string   `json:"action"`
@@ -132,6 +174,25 @@ type recPick struct {
 	KeyMetrics    []string `json:"key_metrics"`
 	ReviewCycle   string   `json:"review_cycle"`
 	Disclaimer    string   `json:"disclaimer"`
+
+	// --- 服务端回填（信任层）---
+	QuantScore       float64        `json:"quant_score,omitempty"`        // 量化综合分
+	QuantRank        int            `json:"quant_rank,omitempty"`         // 池内排名
+	PoolSize         int            `json:"pool_size,omitempty"`          // 参与排名的标的数
+	LotCost          float64        `json:"lot_cost,omitempty"`           // 一手(100股)成本（元）
+	EvidenceCheck    *evidenceCheck `json:"evidence_check,omitempty"`     // 证据数字核验结果
+	SysConfidence    string         `json:"sys_confidence,omitempty"`     // 程序合成置信度 high/medium/low
+	SysConfidenceWhy string         `json:"sys_confidence_why,omitempty"` // 置信度依据说明
+	Review           *pickReview    `json:"review,omitempty"`             // AI 复核员结论（verify 模式）
+}
+
+// pickReview AI 复核员对单条推荐的结论。Confidence 用 FlexInt——模型常把整数字段
+// 输出成 72.5 或 "80"，裸 int 会让整个复核 JSON 反序列化失败、结论被静默丢弃。
+type pickReview struct {
+	Symbol     string  `json:"symbol"`
+	Verdict    string  `json:"verdict"` // pass / warn / reject
+	Comment    string  `json:"comment"`
+	Confidence FlexInt `json:"confidence"` // 复核后的建议置信度（0-100；0=不调整）
 }
 
 // recReject 池内落选标的的一句话理由（批次G「为什么没选它」，帮助复盘筛选逻辑）。
@@ -181,7 +242,10 @@ func (s *RecommendationService) generate(ctx context.Context, userID int64, allo
 		return nil, errors.New("推荐类型须为 short_term 或 long_term")
 	}
 	market := normalizeMarketOnly(req.Market)
-	strat := strategyByKey(req.Type, strings.TrimSpace(req.Strategy))
+	strat, serr := strategyByKey(req.Type, strings.TrimSpace(req.Strategy))
+	if serr != nil {
+		return nil, serr
+	}
 	count := req.Count
 	if count < 3 {
 		count = 3
@@ -201,8 +265,16 @@ func (s *RecommendationService) generate(ctx context.Context, userID int64, allo
 		return nil, err
 	}
 
-	// 3) 候选池（真实数据；空池直接拒绝，避免无依据编造）。
-	pool, err := s.buildCandidatePool(ctx, userID, market, req.Type)
+	// 3) 筛选条件：请求携带 > 用户偏好 > 类型默认。全程落库可回显。
+	var filters RecFilters
+	if req.Filters != nil {
+		filters = sanitizeRecFilters(*req.Filters)
+	} else {
+		filters = loadUserRecFilters(userID, req.Type)
+	}
+
+	// 4) 阶段①②：多源建池 + 基础准入 + 用户筛选（被筛掉的保留原因）。
+	pool, err := s.buildPool(ctx, userID, market, filters)
 	if err != nil {
 		return nil, err
 	}
@@ -212,23 +284,62 @@ func (s *RecommendationService) generate(ctx context.Context, userID int64, allo
 		}
 		return nil, errors.New("候选池为空：请先添加自选股，或稍后重试（榜单数据源繁忙）")
 	}
-	poolBySymbol := make(map[string]candidate, len(pool))
+
+	// 5) 阶段③：量化评分排序（拉日线算因子，追高保护在此判定），Top N 进入 LLM 名单。
+	s.scorePool(ctx, req.Type, strat, pool, filters)
+	kept, llmCands := 0, make([]candidate, 0, maxLLMCandidates)
 	for _, c := range pool {
+		if c.Excluded == "" {
+			kept++
+		}
+		if c.SentToLLM {
+			llmCands = append(llmCands, c)
+		}
+	}
+	if len(llmCands) == 0 {
+		excluded := len(pool) - kept
+		return nil, fmt.Errorf("筛选后候选池为空（共扫描 %d 只，%d 只被筛掉）：请放宽股价/市值/换手等筛选条件后重试", len(pool), excluded)
+	}
+	poolBySymbol := make(map[string]candidate, len(llmCands))
+	for _, c := range llmCands {
 		poolBySymbol[c.Symbol] = c
 	}
-	poolJSON, _ := json.Marshal(pool)
+	poolJSON, poolOmitted := marshalPoolSnapshot(pool)
+	filtersPayload := map[string]any{"filters": filters, "applied": filters.Describe()}
+	if poolOmitted > 0 {
+		filtersPayload["pool_omitted"] = poolOmitted
+	}
+	filtersJSON, _ := json.Marshal(filtersPayload)
 
-	// 4) 调用 + 反编造校验 + repair。
-	messages := s.buildMessages(req.Type, strat, market, count, string(poolJSON))
+	// 6) 阶段④：LLM 精选 + 反编造校验 + repair。
+	mktCtx := s.buildMarketContext(ctx, market)
+	messages := s.buildMessages(req.Type, strat, market, count, llmCands, filters, mktCtx)
+	llmInput, _ := json.Marshal(map[string]any{"market_context": mktCtx, "candidates": compactForLLM(req.Type, llmCands)})
 	batch := &model.RecommendationBatch{
 		UserID: userID, Type: req.Type, Market: market, Strategy: strat.Key,
-		CandidateCount: len(pool), CandidatePool: string(poolJSON),
-		DataSnapshot: string(poolJSON),
-		LLMConfigID:  cfg.ID, Provider: cfg.Provider, Model: cfg.Model,
+		Title:          composeBatchTitle(req.Type, strat, filters, count),
+		CandidateCount: kept, CandidatePool: poolJSON,
+		DataSnapshot: string(llmInput), FiltersJSON: string(filtersJSON),
+		LLMConfigID: cfg.ID, Provider: cfg.Provider, Model: cfg.Model,
 		PromptVersion: recPromptVersion, StrategyVersion: recStrategyVersion,
 	}
 
 	picks, rejected, usage, latency, callErr := s.callWithRepair(ctx, cfg, apiKey, allowPrivate, messages, poolBySymbol, count)
+
+	// 7) 可选 AI 复核（verify）：风控复核员逐条挑刺，reject 降级为观察。
+	if callErr == nil && len(picks) > 0 && req.Verify {
+		reviews, overall, rvUsage := s.reviewPicks(ctx, cfg, apiKey, allowPrivate, req.Type, picks, poolBySymbol)
+		usage.PromptTokens += rvUsage.PromptTokens
+		usage.CompletionTokens += rvUsage.CompletionTokens
+		usage.TotalTokens += rvUsage.TotalTokens
+		if len(reviews) > 0 {
+			picks = applyReviews(picks, reviews)
+			if b, err := json.Marshal(map[string]any{"reviews": reviews, "overall": overall}); err == nil {
+				batch.ReviewJSON = string(b)
+			}
+		}
+	}
+
 	batch.PromptTokens = usage.PromptTokens
 	batch.CompletionTokens = usage.CompletionTokens
 	batch.TotalTokens = usage.TotalTokens
@@ -246,13 +357,37 @@ func (s *RecommendationService) generate(ctx context.Context, userID int64, allo
 		return nil, errors.New(callErr.Error())
 	}
 	if len(picks) == 0 {
-		// 有响应但无一标的通过校验/在池中：降级（不落脏数据）。
+		// 两种情形都不落脏数据：①模型行使「宁缺毋滥」拒选（合法，落选理由照存）；
+		// ②repair 后仍无有效输出。均降级展示，文案区分开，不把正确拒选误报为故障。
 		batch.Status = model.RecStatusDegraded
-		batch.Error = "模型未给出候选池内的有效推荐，请调整策略或稍后重试"
+		if len(rejected) > 0 {
+			if b, err := json.Marshal(rejected); err == nil {
+				batch.RejectedJSON = string(b)
+			}
+			batch.Error = "模型判断当前无足够合适的标的，未强行凑数（宁缺毋滥）；各候选的落选理由见「为什么没选它」"
+		} else {
+			batch.Error = "模型未给出候选池内的有效推荐，请调整策略或稍后重试"
+		}
 		if err := common.DB.Create(batch).Error; err != nil {
 			return nil, err
 		}
 		return &RecommendationView{RecommendationBatch: *batch, Items: []RecommendationItemView{}}, nil
+	}
+
+	// 8) 信任层回填：量化分/排名/一手成本/证据核验/程序合成置信度。
+	for i := range picks {
+		c := poolBySymbol[picks[i].Symbol]
+		picks[i].QuantScore = c.Score
+		picks[i].QuantRank = c.Rank
+		picks[i].PoolSize = kept
+		picks[i].LotCost = round2(c.Price * 100)
+		// 计划价与用户筛选阈值并入证据核验值域：模型在 evidence 里复述自己给出的
+		// 止盈/止损/买入区间、或用户设定的价格/换手/市值/追高阈值，均为合法引用而非幻觉。
+		picks[i].EvidenceCheck = verifyEvidence(picks[i].Evidence, c,
+			picks[i].BuyZoneLow, picks[i].BuyZoneHigh, picks[i].TakeProfit, picks[i].StopLoss,
+			filters.PriceMin, filters.PriceMax, filters.MaxGain5dPct,
+			filters.TurnoverMin, filters.TurnoverMax, filters.FloatCapMinYi, filters.FloatCapMaxYi)
+		picks[i].SysConfidence, picks[i].SysConfidenceWhy = systemConfidence(c, picks[i].EvidenceCheck, kept)
 	}
 
 	// 落选理由（池内未入选标的的一句话说明；best-effort，模型未给则为空）。
@@ -262,7 +397,7 @@ func (s *RecommendationService) generate(ctx context.Context, userID int64, allo
 		}
 	}
 
-	// 5) 事务落库批次 + 条目。
+	// 9) 事务落库批次 + 条目。
 	batch.Status = model.RecStatusSuccess
 	items := make([]model.Recommendation, 0, len(picks))
 	err = common.DB.Transaction(func(tx *gorm.DB) error {
@@ -329,10 +464,132 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, cfg *model.L
 	return nil, nil, acc, lastLatency, nil // 降级
 }
 
+// reviewPicks AI 复核（verify 模式）：以「风控复核员」独立视角逐条挑刺——核对证据与数据
+// 是否一致、风险是否被低估、价位是否合理，输出 pass/warn/reject 与建议置信度。
+// best-effort：失败只是没有复核结论，不影响主结果。1 次 repair。
+func (s *RecommendationService) reviewPicks(ctx context.Context, cfg *model.LLMConfig, apiKey string, allowPrivate bool, recType string, picks []recPick, pool map[string]candidate) ([]pickReview, string, chatUsage) {
+	var usage chatUsage
+	rows := make([]map[string]any, 0, len(picks))
+	for _, p := range picks {
+		c := pool[p.Symbol]
+		rows = append(rows, map[string]any{
+			"pick": p,
+			"data": map[string]any{
+				"price": c.Price, "change_pct": c.ChangePct, "turnover_rate": c.TurnoverRate,
+				"volume_ratio": c.VolumeRatio, "pe_ttm": c.PETTM, "pb": c.PB,
+				"float_cap_yi": round2(c.FloatCap / 1e8), "score": c.Score, "rank": c.Rank,
+				"factors": c.Factors, "score_dims": c.ScoreDims,
+			},
+		})
+	}
+	inputJSON, err := json.Marshal(rows)
+	if err != nil {
+		return nil, "", usage
+	}
+
+	sys := `你是一名独立的风控复核员，逐条审查另一位研究员给出的股票推荐。你不重新选股，只挑刺。审查维度：
+1. 证据核对：推荐理由/evidence 引用的数字与 data 中的真实数据是否一致，有没有夸大或想象的成分；
+2. 风险完整性：主要风险是否被低估或遗漏（乖离过高、爆量、亏损股、流动性、大盘环境）；
+3. 价位合理性（短线）：买入区间是否贴近现价、止损止盈是否合理、盈亏比是否 ≥1.5；
+4. 置信度校准：原 confidence 是否过度自信。
+每条给出 verdict：pass（无实质问题）/ warn（有值得注意的问题但不至于否决）/ reject（证据与数据明显不符或风险被严重低估，应降级为观察）。
+只输出 JSON：{"reviews":[{"symbol":"...","verdict":"pass|warn|reject","comment":"一两句中文说明","confidence":0-100 的复核后建议置信度}],"overall":"整体点评一两句"}，不要任何解释或代码块标记。confidence 给具体数值（reject 时给你认为的真实低值，如 5~25）；填 0 表示维持原置信度不调整。`
+
+	convo := []chatMessage{
+		{Role: "system", Content: sys},
+		{Role: "user", Content: "推荐与对应真实数据如下（JSON 数组，每项含 pick 与 data）：\n" + string(inputJSON)},
+	}
+	type reviewOut struct {
+		Reviews []pickReview `json:"reviews"`
+		Overall string       `json:"overall"`
+	}
+	for attempt := 0; attempt <= 1; attempt++ {
+		res, err := chatCompletion(ctx, chatParams{
+			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model,
+			Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
+			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
+		})
+		if err != nil {
+			return nil, "", usage
+		}
+		usage.PromptTokens += res.Usage.PromptTokens
+		usage.CompletionTokens += res.Usage.CompletionTokens
+		usage.TotalTokens += res.Usage.TotalTokens
+
+		var out reviewOut
+		if jerr := json.Unmarshal([]byte(extractJSONObject(res.Content)), &out); jerr == nil && len(out.Reviews) > 0 {
+			valid := make([]pickReview, 0, len(out.Reviews))
+			seen := map[string]bool{}
+			for _, r := range out.Reviews {
+				r.Symbol = strings.TrimSpace(r.Symbol)
+				r.Verdict = strings.ToLower(strings.TrimSpace(r.Verdict))
+				if r.Verdict != "pass" && r.Verdict != "warn" && r.Verdict != "reject" {
+					continue
+				}
+				if _, ok := pool[r.Symbol]; !ok || seen[r.Symbol] {
+					continue
+				}
+				if r.Confidence < 0 {
+					r.Confidence = 0
+				}
+				if r.Confidence > 100 {
+					r.Confidence = 100
+				}
+				r.Comment = truncateRunes(strings.TrimSpace(r.Comment), 300)
+				seen[r.Symbol] = true
+				valid = append(valid, r)
+			}
+			if len(valid) > 0 {
+				return valid, truncateRunes(strings.TrimSpace(out.Overall), 500), usage
+			}
+		}
+		convo = append(convo,
+			chatMessage{Role: "assistant", Content: res.Content},
+			chatMessage{Role: "user", Content: "上一条输出不合格。请只输出 JSON：{\"reviews\":[{\"symbol\",\"verdict\":\"pass|warn|reject\",\"comment\",\"confidence\"}],\"overall\":\"...\"}，symbol 必须来自被审推荐。"},
+		)
+	}
+	return nil, "", usage
+}
+
+// applyReviews 把复核结论回填到推荐：reject 降级为观察并追加风险；复核置信度非 0 时覆盖。
+// reject 无论复核员是否给出置信度，最终置信度强制压到 ≤25——否则「复核否决」徽章
+// 与原有的高置信度（如 85）并排展示，自相矛盾误导用户。
+func applyReviews(picks []recPick, reviews []pickReview) []recPick {
+	bySym := make(map[string]pickReview, len(reviews))
+	for _, r := range reviews {
+		bySym[r.Symbol] = r
+	}
+	for i := range picks {
+		r, ok := bySym[picks[i].Symbol]
+		if !ok {
+			continue
+		}
+		rc := r
+		picks[i].Review = &rc
+		if r.Confidence > 0 {
+			picks[i].Confidence = r.Confidence
+		}
+		if r.Verdict == "reject" {
+			picks[i].Action = model.RecActionWatch
+			if picks[i].Confidence > 25 {
+				picks[i].Confidence = 25
+			}
+			note := "AI 复核员否决：" + r.Comment
+			if r.Comment == "" {
+				note = "AI 复核员否决，建议仅观察"
+			}
+			picks[i].Risks = append(picks[i].Risks, note)
+		}
+	}
+	return picks
+}
+
 // parseAndFilterPicks 解析 picks 并执行反编造过滤（只保留∈候选池的标的），
 // 输出条数不超过 maxCount（PRD 3.6：用户可选 3~5 个，模型多给的截断丢弃）。
 // 同时解析 rejected（池内落选理由）：仅保留∈候选池且未入选的标的，best-effort、
-// 缺失不构成不合格。返回 error（触发 repair）当：JSON 解析失败、无 picks、或过滤后无任何有效标的。
+// 缺失不构成不合格。返回 error（触发 repair）当：JSON 解析失败、缺 picks 字段、
+// 或非空 picks 过滤后无任何有效标的。**显式空数组是合法结果**——p4 prompt 明示
+// 「宁缺毋滥、picks 可为空」，模型行使拒选权时不得触发 repair 强迫其硬凑标的。
 func parseAndFilterPicks(content string, pool map[string]candidate, maxCount int) ([]recPick, []recReject, error) {
 	if maxCount <= 0 || maxCount > 5 {
 		maxCount = 5
@@ -342,19 +599,19 @@ func parseAndFilterPicks(content string, pool map[string]candidate, maxCount int
 		return nil, nil, errors.New("未找到 JSON 对象")
 	}
 	var parsed struct {
-		Picks    []recPick   `json:"picks"`
+		Picks    *[]recPick  `json:"picks"` // 指针区分「字段缺失」（repair）与「显式空数组」（合法拒选）
 		Rejected []recReject `json:"rejected"`
 	}
 	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
 		return nil, nil, fmt.Errorf("JSON 解析失败: %v", err)
 	}
-	if len(parsed.Picks) == 0 {
-		return nil, nil, errors.New("picks 为空")
+	if parsed.Picks == nil {
+		return nil, nil, errors.New("缺少 picks 字段")
 	}
 
-	out := make([]recPick, 0, len(parsed.Picks))
+	out := make([]recPick, 0, len(*parsed.Picks))
 	seen := map[string]bool{}
-	for _, p := range parsed.Picks {
+	for _, p := range *parsed.Picks {
 		sym := strings.TrimSpace(p.Symbol)
 		if sym == "" || seen[sym] {
 			continue
@@ -368,7 +625,7 @@ func parseAndFilterPicks(content string, pool map[string]candidate, maxCount int
 			break
 		}
 	}
-	if len(out) == 0 {
+	if len(out) == 0 && len(*parsed.Picks) > 0 {
 		return nil, nil, errors.New("推荐的标的均不在候选池内")
 	}
 
@@ -445,7 +702,7 @@ func normalizePick(p recPick, sym string, c candidate) recPick {
 	p.Evidence = orEmpty(p.Evidence)
 	p.KeyMetrics = orEmpty(p.KeyMetrics)
 	if strings.TrimSpace(p.Disclaimer) == "" {
-		p.Disclaimer = "本推荐由 AI 基于候选池内公开行情生成，仅供研究参考，不构成投资建议，据此操作风险自负。"
+		p.Disclaimer = "本推荐由 AI 模型基于候选池内公开行情与量化因子自动生成，可能存在数字与事实偏差，仅供研究参考，不构成投资建议，历史表现不代表未来，据此操作风险自负。"
 	}
 	return p
 }
@@ -511,22 +768,41 @@ func candidateEligible(c candidate, f candidateFilter) bool {
 	return true
 }
 
-// buildCandidatePool 从真实数据构建候选池：自选∪涨幅榜∪活跃榜，经 PRD 3.6
-// 前置筛选（candidateEligible，含用户回避规则）后去重富化，上限 maxCandidates。
-func (s *RecommendationService) buildCandidatePool(ctx context.Context, userID int64, market, recType string) ([]candidate, error) {
-	filter := loadCandidateFilter(userID)
-	byKey := map[string]candidate{}
-	order := []string{} // 保序：自选优先，其次榜单
+// buildPool 阶段①②：多源建池（自选∪涨幅榜∪成交额榜∪换手率榜，来源可叠加）→
+// 基础准入（candidateEligible：ST/退市/无行情/流动性/黑名单，不合格不进池）→
+// 估值富化 → 用户筛选（applyQuoteFilters，不合格保留并标注 excluded 原因）。
+// 返回全量池（含被筛掉者），未被筛掉的数量超过 maxScanCandidates 时后来者标注「池满」。
+func (s *RecommendationService) buildPool(ctx context.Context, userID int64, market string, filters RecFilters) ([]candidate, error) {
+	base := loadCandidateFilter(userID)
+	byKey := map[string]int{} // symbol → pool 下标
+	pool := make([]candidate, 0, 64)
 
-	add := func(c candidate) {
-		if c.Symbol == "" || !candidateEligible(c, filter) {
+	add := func(c candidate, source string) {
+		if c.Symbol == "" {
 			return
 		}
-		if _, ok := byKey[c.Symbol]; ok {
+		if i, ok := byKey[c.Symbol]; ok {
+			// 已在池中：叠加来源，补齐榜单独有的字段（如换手率）。
+			if !hasSource(pool[i].Sources, source) {
+				pool[i].Sources = append(pool[i].Sources, source)
+			}
+			if pool[i].Amount == 0 && c.Amount > 0 {
+				pool[i].Amount = c.Amount
+			}
+			if pool[i].TurnoverRate == 0 && c.TurnoverRate > 0 {
+				pool[i].TurnoverRate = c.TurnoverRate
+			}
 			return
 		}
-		byKey[c.Symbol] = c
-		order = append(order, c.Symbol)
+		if len(pool) >= maxPoolIntake {
+			return // 总量护栏：极端规模的自选不再扩池（估值批量请求与快照体积都有界）
+		}
+		if !candidateEligible(c, base) {
+			return // 基础准入不合格（ST/退市/停牌/流动性/黑名单）：噪声，不进池快照
+		}
+		c.Sources = []string{source}
+		byKey[c.Symbol] = len(pool)
+		pool = append(pool, c)
 	}
 
 	// 自选股（用户已研究的标的，优先纳入）——仅限当前 market，且必须有实时行情
@@ -538,32 +814,32 @@ func (s *RecommendationService) buildCandidatePool(ctx context.Context, userID i
 					continue
 				}
 				add(candidate{Symbol: it.Symbol, Market: market, Name: it.Name,
-					Price: round2(it.Price), ChangePct: round2(it.ChangePct), Source: "watchlist"})
+					Price: round2(it.Price), ChangePct: round2(it.ChangePct)}, "watchlist")
 			}
 		}
 	}
 
-	// 榜单（真实行情）。短线更看重活跃/涨幅，长线也纳入以扩池，靠 prompt 导向区分。
-	ov := s.market.GetOverview(ctx, market)
-	for _, r := range ov.Actives {
-		add(candidate{Symbol: r.Symbol, Market: market, Name: r.Name,
-			Price: round2(r.Price), ChangePct: round2(r.ChangePct), Amount: round2(r.Amount), Source: "active"})
-	}
-	for _, r := range ov.Gainers {
-		add(candidate{Symbol: r.Symbol, Market: market, Name: r.Name,
-			Price: round2(r.Price), ChangePct: round2(r.ChangePct), Amount: round2(r.Amount), Source: "gainer"})
-	}
-
-	pool := make([]candidate, 0, len(order))
-	for _, sym := range order {
-		pool = append(pool, byKey[sym])
-		if len(pool) >= maxCandidates {
-			break
+	// 三个榜单来源（真实行情）：涨幅/成交额/换手率。换手率榜天然偏中小盘活跃票，
+	// 对冲成交额榜的大市值偏向（用户痛点「推的都是大票」）。单榜失败降级不阻断。
+	for _, src := range []struct{ sort, label string }{
+		{"changepercent", "gainer"}, {"amount", "active"}, {"turnoverratio", "turnover"},
+	} {
+		rows, err := s.market.GetRanking(ctx, market, src.sort, rankFetchLimit)
+		if err != nil {
+			continue
+		}
+		for _, r := range rows {
+			add(candidate{Symbol: r.Symbol, Market: market, Name: r.Name,
+				Price: round2(r.Price), ChangePct: round2(r.ChangePct),
+				Amount: round2(r.Amount), TurnoverRate: round2(r.TurnoverRate)}, src.label)
 		}
 	}
+	if len(pool) == 0 {
+		return pool, nil
+	}
 
-	// 估值富化（腾讯免费源 best-effort）：长线策略尤其需要 PE/PB/市值支撑估值判断，
-	// 短线可参考换手率；单只取不到只是该标的估值字段缺席，不阻断建池。
+	// 估值富化（腾讯免费源 best-effort）：PE/PB/市值/换手/量比/涨停价，
+	// 既供筛选与评分，也是「已涨停买不进」的判定依据。单只取不到不阻断。
 	refs := make([]QuoteRef, 0, len(pool))
 	for _, c := range pool {
 		refs = append(refs, QuoteRef{Market: c.Market, Symbol: c.Symbol})
@@ -574,14 +850,290 @@ func (s *RecommendationService) buildCandidatePool(ctx context.Context, userID i
 			pool[i].PETTM = round2(v.PETTM)
 			pool[i].PB = round2(v.PB)
 			pool[i].TotalCap = round2(v.TotalCap)
-			pool[i].TurnoverRate = round2(v.TurnoverRate)
+			pool[i].FloatCap = round2(v.FloatCap)
+			if v.TurnoverRate > 0 {
+				pool[i].TurnoverRate = round2(v.TurnoverRate)
+			}
+			pool[i].VolumeRatio = round2(v.VolumeRatio)
+			pool[i].Amplitude = round2(v.Amplitude)
+			pool[i].LimitUp = round2(v.LimitUp)
+		}
+	}
+
+	// 用户筛选（透明标记式排除）+ 评分名额控制。
+	scanned := 0
+	for i := range pool {
+		if reason := applyQuoteFilters(pool[i], filters); reason != "" {
+			pool[i].Excluded = reason
+			continue
+		}
+		scanned++
+		if scanned > maxScanCandidates {
+			pool[i].Excluded = fmt.Sprintf("%s（评分名额 %d），未进入量化评分", poolFullPrefix, maxScanCandidates)
 		}
 	}
 	return pool, nil
 }
 
-// buildMessages 组装系统提示 + 用户消息（含候选池 JSON）。分短线/长线定制。
-func (s *RecommendationService) buildMessages(recType string, strat *strategyTemplate, market string, count int, poolJSON string) []chatMessage {
+func hasSource(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// marshalPoolSnapshot 候选池快照序列化：条目超上限时优先保留参与排名/评分的标的，
+// 被排除者按序截断（MySQL TEXT 列 64KB 容量保护——大自选用户全量落库会使批次
+// INSERT 失败，而 token 已消耗）。返回 JSON 与被省略的条目数（记入 filters_json 供前端提示）。
+func marshalPoolSnapshot(pool []candidate) (string, int) {
+	if len(pool) <= poolSnapshotMax {
+		b, _ := json.Marshal(pool)
+		return string(b), 0
+	}
+	keep := make([]candidate, 0, poolSnapshotMax)
+	var excluded []candidate
+	for _, c := range pool {
+		if c.Excluded == "" {
+			keep = append(keep, c)
+		} else {
+			excluded = append(excluded, c)
+		}
+	}
+	omitted := 0
+	for _, c := range excluded {
+		if len(keep) >= poolSnapshotMax {
+			omitted++
+			continue
+		}
+		keep = append(keep, c)
+	}
+	b, _ := json.Marshal(keep)
+	return string(b), omitted
+}
+
+// scorePool 阶段③：对未被排除的候选拉日线算技术因子，五维评分 + 策略加分合成量化分，
+// 追高保护在此判定（需要近 5 日涨幅），最后按分排名、Top maxLLMCandidates 标记进入 LLM。
+// 日线拉取失败的标的**透明排除**（"日线数据获取失败"）而非按中性 50 分混入排名——
+// 否则既能挤占名单名额、又静默绕过近 5 日涨幅追高保护。追高/无日线剔除释放的名额
+// 会从「池满」标的中按进池顺序补评一轮（只补一轮，拉取总量仍有界）。
+func (s *RecommendationService) scorePool(ctx context.Context, recType string, strat *strategyTemplate, pool []candidate, filters RecFilters) {
+	// scoreRound 对给定下标拉日线并评分；返回本轮存活（未被排除）的数量。
+	scoreRound := func(idxs []int) int {
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 6) // 并发上限：36 只 × 90 根日线约 2~6s，免费源经不起更狠的并发
+		var mu sync.Mutex
+		barsBy := map[int][]datasource.Bar{}
+		for _, i := range idxs {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				bars, err := s.market.GetDailyBars(ctx, pool[i].Market, pool[i].Symbol, factorBarLimit)
+				if err != nil {
+					return
+				}
+				mu.Lock()
+				barsBy[i] = bars
+				mu.Unlock()
+			}(i)
+		}
+		wg.Wait()
+
+		alive := 0
+		for _, i := range idxs {
+			bars := barsBy[i]
+			if len(bars) == 0 {
+				pool[i].Excluded = "日线数据获取失败，未参与量化评分（避免以中性分混入排名并绕过追高保护）"
+				continue
+			}
+			sc := computeScore(pool[i].Price, bars)
+			pool[i].ScoreDims = &scoreDims{Trend: sc.Trend, Momentum: sc.Momentum, Position: sc.Position, Volume: sc.Volume, Risk: sc.Risk}
+			pool[i].Factors = computeCandFactors(pool[i].Price, bars)
+
+			// 追高保护（依赖近 5 日涨幅因子）。
+			if reason := applyGainFilter(pool[i], pool[i].Factors, filters); reason != "" {
+				pool[i].Excluded = reason
+				continue
+			}
+
+			delta, notes := strategyAdjust(recType, strat.Key, pool[i], pool[i].Factors)
+			pool[i].Score = round2(clamp0100(sc.Total + delta))
+			pool[i].Bonus = notes
+			alive++
+		}
+		return alive
+	}
+
+	first := make([]int, 0, maxScanCandidates)
+	for i := range pool {
+		if pool[i].Excluded == "" {
+			first = append(first, i)
+		}
+	}
+	alive := scoreRound(first)
+
+	// 名额补位：被追高/无日线剔除的名额还给「池满」标的（按原进池顺序），补评一轮。
+	if freed := maxScanCandidates - alive; freed > 0 {
+		refill := make([]int, 0, freed)
+		for i := range pool {
+			if strings.HasPrefix(pool[i].Excluded, poolFullPrefix) {
+				pool[i].Excluded = ""
+				refill = append(refill, i)
+				if len(refill) >= freed {
+					break
+				}
+			}
+		}
+		if len(refill) > 0 {
+			scoreRound(refill)
+		}
+	}
+
+	type scored struct {
+		idx   int
+		score float64
+	}
+	ranked := make([]scored, 0, len(pool))
+	for i := range pool {
+		if pool[i].Excluded == "" && pool[i].ScoreDims != nil {
+			ranked = append(ranked, scored{idx: i, score: pool[i].Score})
+		}
+	}
+	sort.SliceStable(ranked, func(a, b int) bool { return ranked[a].score > ranked[b].score })
+	for rank, r := range ranked {
+		pool[r.idx].Rank = rank + 1
+		if rank < maxLLMCandidates {
+			pool[r.idx].SentToLLM = true
+		}
+	}
+}
+
+// recMarketContext LLM 精选时的市场环境锚点（给模型「今天是什么行情」的客观参照，
+// 防止脱离大盘环境给出激进判断）。全部真实数据，缺失块置空。
+type recMarketContext struct {
+	Indices    []map[string]any `json:"indices,omitempty"`
+	Breadth    map[string]any   `json:"breadth,omitempty"`
+	MainNetYi  float64          `json:"main_fund_net_yi,omitempty"` // 两市主力净流入（亿元）
+	BenchTrend string           `json:"bench_trend,omitempty"`      // 基准指数与长均线的位置关系
+}
+
+func (s *RecommendationService) buildMarketContext(ctx context.Context, market string) *recMarketContext {
+	mc := &recMarketContext{}
+	if ov := s.market.GetOverview(ctx, market); ov != nil {
+		for i, ix := range ov.Indices {
+			if i >= 3 {
+				break
+			}
+			mc.Indices = append(mc.Indices, map[string]any{"name": ix.Name, "change_pct": round2(ix.ChangePct)})
+		}
+		if ov.Breadth != nil {
+			mc.Breadth = map[string]any{
+				"advances": ov.Breadth.Advances, "declines": ov.Breadth.Declines,
+				"limit_up": ov.Breadth.LimitUp, "limit_down": ov.Breadth.LimitDown,
+			}
+		}
+		if ov.FundFlow != nil {
+			mc.MainNetYi = round2(ov.FundFlow.MainNet / 1e8)
+		}
+	}
+	// 基准趋势（上证 vs MA60/MA200）：大盘弱势时模型应更保守。失败静默缺席。
+	if _, bars, err := s.market.GetBenchmarkBars(ctx, market, 250); err == nil && len(bars) > 0 {
+		closes := make([]float64, len(bars))
+		for i, b := range bars {
+			closes[i] = b.Close
+		}
+		last := closes[len(closes)-1]
+		parts := []string{}
+		if ma60, ok := movingAverage(closes, 60); ok {
+			if last >= ma60 {
+				parts = append(parts, "上证收于MA60上方")
+			} else {
+				parts = append(parts, "上证收于MA60下方（中期趋势偏弱）")
+			}
+		}
+		if ma200, ok := movingAverage(closes, 200); ok {
+			if last >= ma200 {
+				parts = append(parts, "MA200上方")
+			} else {
+				parts = append(parts, "MA200下方（长期弱势，建议整体保守）")
+			}
+		}
+		mc.BenchTrend = strings.Join(parts, "，")
+	}
+	return mc
+}
+
+// compactForLLM 生成喂给 LLM 的候选行（仅入选名单、按 rank 升序、字段紧凑）。
+func compactForLLM(recType string, cands []candidate) []map[string]any {
+	sorted := append([]candidate(nil), cands...)
+	sort.SliceStable(sorted, func(a, b int) bool { return sorted[a].Rank < sorted[b].Rank })
+	rows := make([]map[string]any, 0, len(sorted))
+	for _, c := range sorted {
+		row := map[string]any{
+			"symbol": c.Symbol, "name": c.Name, "price": c.Price, "change_pct": c.ChangePct,
+			"score": c.Score, "rank": c.Rank, "sources": c.Sources,
+		}
+		if c.Amount > 0 {
+			row["amount_yi"] = round2(c.Amount / 1e8)
+		}
+		if c.TurnoverRate > 0 {
+			row["turnover_rate"] = c.TurnoverRate
+		}
+		if c.VolumeRatio > 0 {
+			row["volume_ratio"] = c.VolumeRatio
+		}
+		if c.FloatCap > 0 {
+			row["float_cap_yi"] = round2(c.FloatCap / 1e8)
+		}
+		if c.PETTM != 0 {
+			row["pe_ttm"] = c.PETTM
+		}
+		if c.PB != 0 {
+			row["pb"] = c.PB
+		}
+		if c.ScoreDims != nil {
+			row["score_dims"] = c.ScoreDims
+		}
+		if c.Factors != nil {
+			row["factors"] = c.Factors
+		}
+		if len(c.Bonus) > 0 {
+			row["strategy_notes"] = c.Bonus
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// composeBatchTitle 用筛选条件组合生成批次标题（落库固化，历史列表稳定展示）。
+// 形如「短线·动量突破 · ≤30元 · 3只」；条件多时只取最关键的一项（价格 > 市值）。
+func composeBatchTitle(recType string, strat *strategyTemplate, filters RecFilters, count int) string {
+	parts := []string{recTypeLabel(recType) + "·" + strat.Name}
+	desc := filters.Describe()
+	for _, d := range desc {
+		if strings.HasPrefix(d, "股价") {
+			parts = append(parts, strings.TrimPrefix(d, "股价"))
+			break
+		}
+	}
+	if len(parts) == 1 {
+		for _, d := range desc {
+			if strings.HasPrefix(d, "流通市值") {
+				parts = append(parts, strings.TrimPrefix(d, "流通市值"))
+				break
+			}
+		}
+	}
+	parts = append(parts, fmt.Sprintf("%d只", count))
+	return truncateRunes(strings.Join(parts, " · "), 128)
+}
+
+// buildMessages 组装系统提示 + 用户消息。p4：候选已由量化系统筛选评分排序，
+// LLM 的角色是「精选 + 解读 + 否决」而非海选；强制引用字段数值、禁用先验记忆、允许少选。
+func (s *RecommendationService) buildMessages(recType string, strat *strategyTemplate, market string, count int, llmCands []candidate, filters RecFilters, mktCtx *recMarketContext) []chatMessage {
 	var sys strings.Builder
 	sys.WriteString(recRoleIntro)
 	sys.WriteString("\n\n")
@@ -593,11 +1145,28 @@ func (s *RecommendationService) buildMessages(recType string, strat *strategyTem
 	sys.WriteString("\n\n【本次策略】" + strat.Name + "：" + strat.guide)
 
 	var u strings.Builder
-	fmt.Fprintf(&u, "请从以下【候选池】中，按「%s」策略精选 %d 个%s标的。\n", strat.Name, count, recTypeLabel(recType))
-	u.WriteString("硬性要求：只能从候选池里选，symbol 必须与候选池完全一致，严禁推荐池外或虚构的标的；若候选池中合适标的不足，可少于 " + fmt.Sprintf("%d", count) + " 个，但绝不编造。\n")
-	u.WriteString("同时请在 rejected 数组中，对候选池内未入选的标的各给一句话落选理由（如流动性/趋势/估值/与策略不符），只解释池内标的。\n\n")
-	u.WriteString("【候选池】（JSON，price 为现价，amount 为成交额/元，change_pct 为当日涨跌幅%；pe_ttm 为市盈率TTM（负=亏损）、pb 为市净率、total_cap 为总市值/元、turnover_rate 为换手率%，这些估值字段缺失表示该标的估值数据暂不可得）：\n")
-	u.WriteString(poolJSON)
+	if mktCtx != nil {
+		if b, err := json.Marshal(mktCtx); err == nil {
+			u.WriteString("【市场环境】（真实数据，作为整体判断的锚点；大盘弱势时应整体保守、可少选）：\n")
+			u.Write(b)
+			u.WriteString("\n\n")
+		}
+	}
+	if desc := filters.Describe(); len(desc) > 0 {
+		u.WriteString("【用户约束】" + strings.Join(desc, "；") + "。名单已按这些条件过滤。")
+		if filters.PriceMax > 0 {
+			fmt.Fprintf(&u, " 用户资金有限（A股一手=100股，一手成本=价格×100），价位越贴近其预算越实用。")
+		}
+		u.WriteString("\n\n")
+	}
+	fmt.Fprintf(&u, "请从以下【量化初选名单】中，按「%s」策略精选至多 %d 个%s标的。\n", strat.Name, count, recTypeLabel(recType))
+	u.WriteString("名单已按量化综合分（score，0-100）降序排列，rank=1 为最高分。score 由五维技术评分（趋势/动量/位置/量能/风险，score_dims）加策略加分项（strategy_notes）合成，仅有排序意义、不代表预期收益。\n")
+	u.WriteString("硬性要求：只能从名单里选，symbol 必须与名单完全一致，严禁名单外或虚构的标的；合适标的不足时宁可少选甚至不选（picks 可为空数组），绝不硬凑。你可以不同意量化排序（例如否决 rank 靠前者），但必须用名单中的数据说明理由。\n")
+	u.WriteString("同时请在 rejected 数组中，对名单内未入选的标的各给一句话落选理由，只解释名单内标的。\n\n")
+	u.WriteString("【量化初选名单】（JSON；price 现价、change_pct 当日涨跌%、amount_yi 成交额亿元、turnover_rate 换手%、volume_ratio 量比、float_cap_yi 流通市值亿元、pe_ttm 市盈率TTM（负=亏损）、pb 市净率；factors：ma5/ma10/ma20/ma60 均线、chg_5d/chg_20d 近5/20日涨跌%、high_20d 创20日新高、bull_align 多头排列、vol_boost 今日量/5日均量、bias_20 MA20乖离%、volatility_20 波动率%、drawdown_20 近20日最大回撤%、pos_60 60日区间位置；估值字段缺失表示该数据暂不可得，不得臆测）：\n")
+	if b, err := json.Marshal(compactForLLM(recType, llmCands)); err == nil {
+		u.Write(b)
+	}
 	u.WriteString("\n\n请只输出 JSON：{\"picks\":[...],\"rejected\":[{\"symbol\":\"...\",\"reason\":\"一句话\"}]}。")
 
 	return []chatMessage{
@@ -606,22 +1175,23 @@ func (s *RecommendationService) buildMessages(recType string, strat *strategyTem
 	}
 }
 
-const recRoleIntro = `你是一名严谨的证券研究助理，服务于个人投资研究工具。你的输出仅供研究参考，不构成任何投资建议或买卖指令。
+const recRoleIntro = `你是一名严谨的证券研究员，服务于个人投资研究工具。量化系统已完成候选筛选、技术因子计算与评分排序，你的任务是在此基础上精选、解读与否决——不是重新海选。你的输出仅供研究参考，不构成任何投资建议或买卖指令。
 
-总则：
-1. 只能从用户提供的【候选池】中挑选标的，symbol 必须与候选池完全一致；严禁推荐池外标的或杜撰任何代码/数据。
-2. 只依据候选池给出的真实行情数据分析，数据不足处要如实说明局限，不臆测未提供的财务/新闻。
-3. 每个标的必须给出：理由(reason)、风险(risks)、数据依据(evidence，引用候选池中的具体数值)、免责声明(disclaimer)。
-4. 候选池内未入选的标的，在 rejected 数组中各给一句话落选理由（{"symbol","reason"}），只解释池内标的。
-5. 全程简体中文。只输出一个 JSON 对象 {"picks":[...],"rejected":[...]}，不要任何解释文字或 Markdown 代码块标记。`
+铁律：
+1. 只能从【量化初选名单】中挑选，symbol 必须与名单完全一致；严禁推荐名单外标的或杜撰任何代码/数据。
+2. 只依据名单与市场环境中给出的数据分析。禁止使用你记忆中关于任何公司的信息——名气、行业地位、历史印象、新闻记忆都不算数据，只看本次给出的数字。数据不足处如实说明局限，不臆测未提供的财务/消息。
+3. 每个标的必须给出：理由(reason)、风险(risks)、数据依据(evidence)。evidence 每条都要引用具体字段名与数值（如「score=78.5 池内第1」「换手率6.3%、量比2.1 温和放量」「bias_20=+4.2% 未超买」）。系统会程序化核对你引用的数字，与数据不符的证据会被标记出来展示给用户。
+4. 宁缺毋滥：证据不足或与策略不符时明确不选，picks 可以少于要求数量甚至为空。
+5. 名单内未入选的标的，在 rejected 数组中各给一句话落选理由（{"symbol","reason"}）。
+6. 全程简体中文。只输出一个 JSON 对象 {"picks":[...],"rejected":[...]}，不要任何解释文字或 Markdown 代码块标记。`
 
 const shortTermSpec = `本次为【短线推荐】。每个 pick 需包含字段：
-- symbol: 候选池中的代码
+- symbol: 名单中的代码
 - action: "buy"(可考虑买入) 或 "watch"(观察等待)
 - confidence: 0-100 整数
 - reason: 字符串数组，选择理由（技术面/量价/热点）
 - risks: 字符串数组，主要风险
-- evidence: 字符串数组，数据依据（引用候选池中的 price/change_pct/amount 等）
+- evidence: 字符串数组，数据依据（引用名单中的具体字段与数值）
 - buy_zone_low / buy_zone_high: 买入观察区间（下沿/上沿价格）
 - take_profit: 止盈目标价
 - stop_loss: 止损价
@@ -629,16 +1199,16 @@ const shortTermSpec = `本次为【短线推荐】。每个 pick 需包含字段
 - invalidation: 失效条件（一句话，如"跌破止损价或放量破位"）
 - disclaimer: 风险与免责提示
 交易规则硬约束：当前数据源仅支持 A 股；A 股当日买入不可当日卖出(T+1)，止盈/止损最早次一交易日生效；必须考虑涨跌停限制，涨停可能买不进、跌停可能卖不出；最小交易单位为 100 股一手；有效期和持有周期都按交易日计算，不按自然日。
-要求止盈>买入区间上沿>买入区间下沿>止损，价格贴近现价合理设置。`
+价位纪律：要求止盈>买入区间上沿>买入区间下沿>止损，价格贴近现价合理设置；止损建议参考 MA20 附近或现价-5%~-7%（可用名单中 factors.ma20 锚定）；止盈到止损的距离比（盈亏比）至少 1.5，不足时降为 watch 并说明。`
 
-const longTermSpec = `本次为【长线推荐】。候选池含实时行情与估值快照（PE-TTM/PB/总市值，若有），但缺少财务三表明细（营收/利润/负债/现金流），请基于可得信息给出中长期视角，并明确指出财务明细的缺失。每个 pick 需包含字段：
-- symbol: 候选池中的代码
+const longTermSpec = `本次为【长线推荐】。名单含实时行情、估值快照（PE-TTM/PB/市值）与技术因子，但缺少财务三表明细（营收/利润/负债/现金流），请基于可得信息给出中长期视角，并明确指出财务明细的缺失。每个 pick 需包含字段：
+- symbol: 名单中的代码
 - action: "buy"(可考虑逢低布局) 或 "watch"(观察等待)
 - confidence: 0-100 整数
 - reason: 字符串数组，长期看好/关注的理由
 - risks: 字符串数组，主要风险
-- evidence: 字符串数组，数据依据（引用候选池中的具体数值，含 PE/PB/市值等估值依据）
-- thesis: 基本面/投资逻辑（一段话；估值判断只能基于候选池给出的 PE/PB/市值绝对水位，不得虚构行业对比或财务明细）
+- evidence: 字符串数组，数据依据（引用名单中的具体字段与数值，含 PE/PB/市值等估值依据）
+- thesis: 基本面/投资逻辑（一段话；估值判断只能基于名单给出的 PE/PB/市值绝对水位，不得虚构行业对比或财务明细）
 - valuation_low / valuation_high: 合理估值区间（若估值数据缺失无法给出可填 0 并在 thesis 说明）
 - key_metrics: 字符串数组，需持续跟踪的关键指标（如营收增速、毛利率、市占率）
 - review_cycle: 复盘周期（如"每季度财报后"）
@@ -701,7 +1271,7 @@ func (s *RecommendationService) History(userID int64, recType string, limit int)
 		q = q.Where("type = ?", recType)
 	}
 	var rows []model.RecommendationBatch
-	err := q.Select("id", "user_id", "type", "market", "strategy", "status", "error",
+	err := q.Select("id", "user_id", "type", "market", "strategy", "title", "status", "error",
 		"candidate_count", "llm_config_id", "provider", "model", "prompt_version", "strategy_version",
 		"prompt_tokens", "completion_tokens", "total_tokens", "latency_ms", "created_at", "updated_at").
 		Order("id DESC").Limit(limit).Find(&rows).Error

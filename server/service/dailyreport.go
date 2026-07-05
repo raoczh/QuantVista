@@ -177,8 +177,13 @@ func (s *DailyReportService) GenerateFor(ctx context.Context, userID int64, manu
 	}
 
 	// 2) 明日推荐：复用推荐域（短线：买点/止盈/止损/有效期）。失败不阻断复盘落库。
+	// 策略按当日市场环境动态选择（旧版恒为第一个策略「动量突破」，弱市里追动量不合理）；
+	// 筛选条件走用户偏好（Filters=nil 时推荐域自动加载）。
 	pref := s.userPref(userID)
-	recReq := RecommendRequest{Type: model.RecTypeShortTerm, Market: "cn", Count: pref.DefaultRecCount}
+	recReq := RecommendRequest{
+		Type: model.RecTypeShortTerm, Market: "cn", Count: pref.DefaultRecCount,
+		Strategy: pickDailyStrategy(snapshot),
+	}
 	recView, recErr := s.rec.GenerateAuto(ctx, userID, allowPrivate, recReq)
 	if recErr == nil && recView != nil {
 		report.RecommendationBatchID = recView.ID
@@ -341,6 +346,29 @@ func (s *DailyReportService) buildSnapshot(ctx context.Context, userID int64, da
 	return snap
 }
 
+// pickDailyStrategy 按当日涨跌家数为明日推荐选短线策略：
+// 强势（涨:跌 ≥ 1.3）追动量、弱势（≤ 0.75）等强势股回踩低吸、中性做热点活跃。
+// 无涨跌家数数据时回退动量（与旧行为一致）。
+func pickDailyStrategy(snap *reportSnapshot) string {
+	if snap == nil || snap.Market == nil || snap.Market.Breadth == nil {
+		return "momentum"
+	}
+	adv, _ := snap.Market.Breadth["advances"].(int)
+	dec, _ := snap.Market.Breadth["declines"].(int)
+	if dec <= 0 || adv <= 0 {
+		return "momentum"
+	}
+	ratio := float64(adv) / float64(dec)
+	switch {
+	case ratio >= 1.3:
+		return "momentum"
+	case ratio <= 0.75:
+		return "pullback"
+	default:
+		return "active"
+	}
+}
+
 // abs 浮点绝对值（避免为一处调用引入 math 依赖歧义——本包多处自带小工具）。
 func abs(f float64) float64 {
 	if f < 0 {
@@ -373,9 +401,10 @@ func (s *DailyReportService) userPref(userID int64) model.UserPreference {
 // ---- LLM 复盘 ----
 
 const dailyReviewSystem = `你是个人股票研究助手，为用户生成当日收盘复盘。规则：
-1. 只依据用户消息中提供的数据（市场概览/持仓/自选异动/今日提醒），不得编造任何未提供的数据（无财务、无新闻）；数据缺失就如实说明。
-2. 表述为研究参考，不构成投资建议；语气客观，指出风险。
-3. 输出严格 JSON（不要 markdown 代码块），schema：
+1. 只依据用户消息中提供的数据（市场概览/持仓/自选异动/今日提醒），不得编造任何未提供的数据（无财务、无新闻）；数据缺失就如实说明。禁止使用你记忆中的公司/板块信息。
+2. 关键判断必须引用数据中的具体数字佐证（如「上涨 3120 家 vs 下跌 1890 家」「主力净流入 23.5 亿」「某持仓今日 -4.2% 已接近计划止损」），让用户可核对。
+3. 表述为研究参考，不构成投资建议；语气客观，指出风险。
+4. 输出严格 JSON（不要 markdown 代码块），schema：
 {"summary":"3~5 句当日总结","market_review":"大盘复盘（涨跌家数/资金流向解读）","position_review":"持仓点评（无持仓则一句说明）","watch_review":"自选异动点评（无自选则一句说明）","risk_warnings":["风险提示，1~3 条"],"tomorrow_plan":"明日盘前关注计划（2~4 句）"}`
 
 const dailyReviewRepairHint = `你上一条输出不是合法 JSON 或缺少必填字段。请只输出符合 schema 的 JSON 对象，不要任何解释或代码块包裹。`

@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"quantvista/common"
@@ -119,6 +120,79 @@ func TestParseAndFilterPicks_CountCap(t *testing.T) {
 	}
 	if len(picks) != 3 {
 		t.Fatalf("用户请求 3 条时应截断到 3，得到 %d", len(picks))
+	}
+}
+
+// TestParseAndFilterPicks_EmptyPicksLegal 显式空 picks = 模型行使「宁缺毋滥」拒选权：
+// 不报错（不得触发 repair 强迫硬凑标的），rejected 照常保留供展示落选理由。
+func TestParseAndFilterPicks_EmptyPicksLegal(t *testing.T) {
+	pool := testPool()
+	content := `{"picks":[],"rejected":[{"symbol":"000001","reason":"量价背离，短线无安全买点"}]}`
+	picks, rejected, err := parseAndFilterPicks(content, pool, 5)
+	if err != nil {
+		t.Fatalf("显式空 picks 是合法拒选，不应报错: %v", err)
+	}
+	if len(picks) != 0 {
+		t.Fatalf("picks 应为空，得到 %d", len(picks))
+	}
+	if len(rejected) != 1 || rejected[0].Symbol != "000001" {
+		t.Fatalf("拒选时落选理由应保留: %+v", rejected)
+	}
+}
+
+// TestParseAndFilterPicks_MissingPicksField 缺 picks 字段 ≠ 显式空数组：
+// 模型没按 schema 输出，应报错触发 repair（指针语义区分两者）。
+func TestParseAndFilterPicks_MissingPicksField(t *testing.T) {
+	pool := testPool()
+	if _, _, err := parseAndFilterPicks(`{"rejected":[]}`, pool, 5); err == nil {
+		t.Fatalf("缺 picks 字段应报错（区别于显式空数组的合法拒选）")
+	}
+}
+
+// TestMarshalPoolSnapshot 池快照容量保护：≤上限原样序列化；超限时参与排名者
+// 全保留、被排除者按序补位截断并计数（防大自选用户批次 INSERT 超 TEXT 容量失败）。
+func TestMarshalPoolSnapshot(t *testing.T) {
+	mk := func(n, excludedFrom int) []candidate {
+		pool := make([]candidate, 0, n)
+		for i := 0; i < n; i++ {
+			c := candidate{Symbol: fmt.Sprintf("6%05d", i), Name: "x", Price: 10}
+			if i >= excludedFrom {
+				c.Excluded = "测试排除"
+			}
+			pool = append(pool, c)
+		}
+		return pool
+	}
+
+	// ≤150：原样序列化，无省略。
+	small := mk(3, 2)
+	gotJSON, omitted := marshalPoolSnapshot(small)
+	wantJSON, _ := json.Marshal(small)
+	if gotJSON != string(wantJSON) || omitted != 0 {
+		t.Fatalf("池 ≤%d 应原样序列化且无省略: omitted=%d", poolSnapshotMax, omitted)
+	}
+
+	// >150（100 参与排名 + 60 被排除）：排名者全保留，排除者补位到上限，省略 10。
+	big := mk(160, 100)
+	gotJSON, omitted = marshalPoolSnapshot(big)
+	if omitted != 10 {
+		t.Fatalf("160 条（100 排名+60 排除）应省略 10 条，得到 %d", omitted)
+	}
+	var kept []candidate
+	if err := json.Unmarshal([]byte(gotJSON), &kept); err != nil {
+		t.Fatalf("快照应为合法 JSON: %v", err)
+	}
+	if len(kept) != poolSnapshotMax {
+		t.Fatalf("快照条数应为上限 %d，得到 %d", poolSnapshotMax, len(kept))
+	}
+	keptRanked := 0
+	for _, c := range kept {
+		if c.Excluded == "" {
+			keptRanked++
+		}
+	}
+	if keptRanked != 100 {
+		t.Fatalf("参与排名的 100 只应全部保留，得到 %d", keptRanked)
 	}
 }
 

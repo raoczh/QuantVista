@@ -45,6 +45,10 @@ type UserPreference struct {
 	BlacklistJSON      string  `gorm:"type:text" json:"blacklist_json"`
 	MinCandidateAmount float64 `gorm:"type:decimal(20,2);default:100000000" json:"min_candidate_amount"`
 
+	// RecFiltersJSON 推荐候选筛选默认值（service.RecFilters 的 JSON：股价区间/流通市值/
+	// 换手率/追高保护/排除涨停）。空 = 按推荐类型的保护性默认。每次生成可临时覆盖。
+	RecFiltersJSON string `gorm:"type:text" json:"rec_filters_json"`
+
 	// 收盘日报（2026-07-03）：交易日 15:35 后自动生成今日复盘 + 明日选股推荐。
 	// 默认关闭——自动生成消耗 LLM token（不计次数配额，但走用户自己的 LLM）。
 	EnableDailyReport bool `gorm:"default:false" json:"enable_daily_report"`
