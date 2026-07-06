@@ -36,6 +36,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	notifySvc := service.NewNotifyService()
 	promptSvc := service.NewPromptService()
 	dailyReportSvc := service.NewDailyReportService(marketSvc, watchlistSvc, positionSvc, alertSvc, recommendationSvc, llmSvc, notifySvc)
+	newsSvc := service.NewNewsService()
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc, scoreSvc)
@@ -60,6 +61,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	noteCtl := controller.NewNoteController(noteSvc)
 	exportCtl := controller.NewExportController(service.NewExportService())
 	dailyReportCtl := controller.NewDailyReportController(dailyReportSvc)
+	newsCtl := controller.NewNewsController(newsSvc)
 
 	api := r.Group("/api")
 	{
@@ -201,6 +203,9 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				reports.GET("/:id", dailyReportCtl.Get)
 				reports.POST("/generate", middleware.RateLimit(5, time.Minute), dailyReportCtl.Generate)
 			}
+
+			// 新闻/快讯（后台任务采集入库，此处只读查询）
+			authed.GET("/news", newsCtl.List)
 
 			// 用户数据 CSV 导出（positions/watchlist/recommendations/analyses）
 			authed.GET("/export/:kind", middleware.RateLimit(10, time.Minute), exportCtl.Export)

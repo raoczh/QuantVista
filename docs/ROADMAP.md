@@ -44,6 +44,7 @@
 - 前端 `STRATEGY_NAME` 静态字典是历史批次标题（"value"）bug 的兜底，别删；新记录走后端固化的 `batch.title`。
 - 日报明日推荐与手动推荐完全同链路（GenerateAuto→generate），筛选偏好 `rec_filters_json` 对两者同时生效；自动链路不触发 AI 复核、不计次数配额。
 - prompt/策略改动须递增版本号（分析 `analysisPromptVersion`、推荐 prompt/strategy 版本），保证历史记录可复现可归因。
+- **新闻采集（N1）上游口径**（2026-07-06 实测）：财联社只有 `/v1/roll/get_roll_list` 活着，`sign = md5hex(sha1hex(按参数名字典序的 querystring))`，老 nodeapi 已死；东财快讯 `req_trace`（uuid hex）缺失返回空，`stockList` 是**字符串数组**（"1.688035"/"90.BK1175"，别按对象数组解析）；东财个股新闻 search-api 标准 Go client 实测**可用**（无需 utls，但保留「单只失败整轮降级」逻辑防日后被指纹拦截）。去重 Dice 阈值 0.85 是「尾部增删判重、改动较大放行」的实测锚点，调低会误杀无关新闻。
 
 ## 4. 未完成项与储备（按数据源可得性推进）
 
