@@ -463,9 +463,9 @@ async function doExport(kind: ExportKind) {
               </div>
               <div class="recf-row">
                 <span class="recf-label">换手率(%)</span>
-                <n-input-number v-model:value="recFilters.turnover_min" :min="0" :max="20" size="small" style="width: 110px" placeholder="下限" />
+                <n-input-number v-model:value="recFilters.turnover_min" :min="0" :max="25" size="small" style="width: 110px" placeholder="下限" />
                 <span class="recf-sep">~</span>
-                <n-input-number v-model:value="recFilters.turnover_max" :min="0" :max="20" size="small" style="width: 110px" placeholder="0=不限" />
+                <n-input-number v-model:value="recFilters.turnover_max" :min="0" :max="30" size="small" style="width: 110px" placeholder="0=不限" />
               </div>
               <div class="recf-row">
                 <span class="recf-label">近5日涨幅上限(%)</span>
@@ -475,8 +475,8 @@ async function doExport(kind: ExportKind) {
                 <n-switch v-model:value="recFilters.exclude_limit_up" size="small" />
               </div>
               <span class="notify-hint"
-                >短线/长线推荐与收盘日报的候选池默认筛选（股价上限直接解决「推荐太贵买不起」；推荐页可临时覆盖）。被筛掉的标的会在推荐结果的「候选池全景」中列出原因。换手区间上限
-                20%：>20% 为「死亡换手」，系统已硬性排除。</span
+                >短线/长线推荐与收盘日报的候选池默认筛选（股价上限直接解决「推荐太贵买不起」；推荐页可临时覆盖）。被筛掉的标的会在推荐结果的「候选池全景」中列出原因。换手
+                >30% 一律排除；20~30% 仅高位判「死亡换手」排除，低位保留并标注风险。</span
               >
             </div>
           </n-form-item>

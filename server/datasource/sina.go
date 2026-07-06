@@ -166,8 +166,11 @@ func (s *SinaAdapter) GetIndices(ctx context.Context, market string) ([]Index, e
 	return out, nil
 }
 
-// GetStockRanking 用新浪 Market_Center 榜单接口（sort: changepercent / amount / turnoverratio）。
-func (s *SinaAdapter) GetStockRanking(ctx context.Context, market, sort string, limit int) ([]StockRank, error) {
+// GetStockRanking 用新浪 Market_Center 榜单接口。
+// sort: changepercent / amount / turnoverratio / pb；asc=true 升序（跌幅榜、低PB榜）。
+// 实测注意：per 升序时负 PE（亏损股）整段排在最前无法翻越，故不放行 per；
+// pb 升序前排仅个别退市股为负值，由调用方本地过滤 pb>0。
+func (s *SinaAdapter) GetStockRanking(ctx context.Context, market, sort string, asc bool, limit int) ([]StockRank, error) {
 	if market != "cn" {
 		return nil, ErrNotSupported
 	}
@@ -175,12 +178,18 @@ func (s *SinaAdapter) GetStockRanking(ctx context.Context, market, sort string, 
 		limit = 10
 	}
 	// 白名单钳制：上游同一接口还支持更多排序字段，按需扩枚举即可（非新数据源）。
-	if sort != "changepercent" && sort != "amount" && sort != "turnoverratio" {
+	switch sort {
+	case "changepercent", "amount", "turnoverratio", "pb":
+	default:
 		sort = "changepercent"
 	}
+	ascFlag := 0
+	if asc {
+		ascFlag = 1
+	}
 	url := fmt.Sprintf(
-		"https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?node=hs_a&sort=%s&asc=0&num=%d&page=1",
-		sort, limit,
+		"https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?node=hs_a&sort=%s&asc=%d&num=%d&page=1",
+		sort, ascFlag, limit,
 	)
 	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://finance.sina.com.cn"})
 	if err != nil {
@@ -197,6 +206,9 @@ func (s *SinaAdapter) GetStockRanking(ctx context.Context, market, sort string, 
 		Changepercent float64 `json:"changepercent"`
 		Amount        float64 `json:"amount"`
 		Turnoverratio float64 `json:"turnoverratio"`
+		PER           float64 `json:"per"`
+		PB            float64 `json:"pb"`
+		NMC           float64 `json:"nmc"` // 流通市值（万元）
 	}
 	if err := json.Unmarshal(body, &rows); err != nil {
 		return nil, fmt.Errorf("%w: 解析失败 %v", ErrUpstream, err)
@@ -210,6 +222,7 @@ func (s *SinaAdapter) GetStockRanking(ctx context.Context, market, sort string, 
 		out = append(out, StockRank{
 			Symbol: r.Code, Name: r.Name, Price: price,
 			ChangePct: r.Changepercent, Amount: r.Amount, TurnoverRate: r.Turnoverratio,
+			PE: r.PER, PB: r.PB, FloatCap: r.NMC * 1e4, // 万元 → 元
 			Source: s.Name(),
 		})
 	}

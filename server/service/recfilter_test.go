@@ -1,9 +1,11 @@
 package service
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
+	"quantvista/datasource"
 	"quantvista/model"
 )
 
@@ -18,14 +20,19 @@ func TestSanitizeRecFilters(t *testing.T) {
 	if f.PriceMin != 5 || f.PriceMax != 30 {
 		t.Fatalf("价格区间应交换为 [5,30]，得到 [%v,%v]", f.PriceMin, f.PriceMax)
 	}
-	if f.TurnoverMin != 0 || f.TurnoverMax != 20 {
-		t.Fatalf("换手区间应钳在死亡换手硬顶内 [0,20]，得到 [%v,%v]", f.TurnoverMin, f.TurnoverMax)
+	if f.TurnoverMin != 0 || f.TurnoverMax != 30 {
+		t.Fatalf("换手区间应钳在绝对硬顶内 [0,30]，得到 [%v,%v]", f.TurnoverMin, f.TurnoverMax)
 	}
 	if f.FloatCapMinYi != 100 || f.FloatCapMaxYi != 500 {
 		t.Fatalf("市值区间应交换为 [100,500]，得到 [%v,%v]", f.FloatCapMinYi, f.FloatCapMaxYi)
 	}
 	if f.MaxGain5dPct != 0 {
 		t.Fatalf("负的追高上限应归零，得到 %v", f.MaxGain5dPct)
+	}
+	// 换手下限额外钳到 25（给 [min,30] 留可行带，min=30 会退化成测度零区间）。
+	f2 := sanitizeRecFilters(RecFilters{TurnoverMin: 28, TurnoverMax: 29})
+	if f2.TurnoverMin != 25 || f2.TurnoverMax != 29 {
+		t.Fatalf("换手下限应钳到 25，得到 [%v,%v]", f2.TurnoverMin, f2.TurnoverMax)
 	}
 }
 
@@ -57,7 +64,8 @@ func TestApplyQuoteFilters(t *testing.T) {
 		{"市值超上限", base, RecFilters{FloatCapMaxYi: 50}, true, "流通市值"},
 		{"市值缺失不判", candidate{Symbol: "600001", Name: "x", Price: 8, TurnoverRate: 5}, RecFilters{FloatCapMaxYi: 50}, false, ""},
 		{"换手低于下限", base, RecFilters{TurnoverMin: 8}, true, "换手率"},
-		{"死亡换手硬拦", candidate{Symbol: "600002", Name: "x", Price: 8, TurnoverRate: 25}, RecFilters{}, true, "死亡换手"},
+		{"换手20~30放行待阶段③位置判定", candidate{Symbol: "600002", Name: "x", Price: 8, TurnoverRate: 25}, RecFilters{}, false, ""},
+		{"极端换手硬拦", candidate{Symbol: "600004", Name: "x", Price: 8, TurnoverRate: 35}, RecFilters{}, true, "极端换手"},
 		{"已涨停排除", candidate{Symbol: "600003", Name: "x", Price: 11, LimitUp: 11, ChangePct: 10.0}, RecFilters{ExcludeLimitUp: true}, true, "涨停"},
 		{"涨停但未开启排除", candidate{Symbol: "600003", Name: "x", Price: 11, LimitUp: 11, ChangePct: 10.0}, RecFilters{}, false, ""},
 		{"ETF不参与个股推荐", candidate{Symbol: "510300", Name: "沪深300ETF", Price: 4}, RecFilters{}, true, "ETF"},
@@ -119,6 +127,162 @@ func TestGainCapFor(t *testing.T) {
 	}
 	if got := gainCapFor(0, "600000"); got != 0 {
 		t.Fatalf("0=不限应保持 0，得到 %v", got)
+	}
+}
+
+// TestApplyTurnoverPosFilter 换手 20~30% 区间的位置分档：高位死亡换手排除、低位放行。
+func TestApplyTurnoverPosFilter(t *testing.T) {
+	high := &candFactors{Pos60: 80}
+	low := &candFactors{Pos60: 30}
+	if r := applyTurnoverPosFilter(candidate{TurnoverRate: 25}, high); !strings.Contains(r, "高位死亡换手") {
+		t.Fatalf("高位+高换手应排除，得到 %q", r)
+	}
+	if r := applyTurnoverPosFilter(candidate{TurnoverRate: 25}, low); r != "" {
+		t.Fatalf("低位+高换手应放行（由评分扣分标注），得到 %q", r)
+	}
+	if r := applyTurnoverPosFilter(candidate{TurnoverRate: 15}, high); r != "" {
+		t.Fatalf("换手 ≤20%% 不参与位置判定，得到 %q", r)
+	}
+	if r := applyTurnoverPosFilter(candidate{TurnoverRate: 25}, nil); r != "" {
+		t.Fatalf("无因子（日线缺失路径）不判，得到 %q", r)
+	}
+}
+
+// TestStrategySources 策略-来源映射：回踩带回调路（活跃榜×温和回调）、价值带低PB榜、行级过滤生效。
+func TestStrategySources(t *testing.T) {
+	srcs := strategySources(model.RecTypeShortTerm, "pullback")
+	var hasDipper bool
+	for _, s := range srcs {
+		if s.label == "dipper" {
+			hasDipper = true
+			if s.asc || s.keep == nil {
+				t.Fatalf("回调路应为热度榜降序深捞+行级过滤（升序跌幅榜前100永远是深跌段）: %+v", s)
+			}
+			if s.keep(datasource.StockRank{ChangePct: -8}) {
+				t.Fatalf("深跌 -8%% 应被行级过滤")
+			}
+			if !s.keep(datasource.StockRank{ChangePct: -3}) {
+				t.Fatalf("温和回调 -3%% 应保留")
+			}
+			if s.keep(datasource.StockRank{ChangePct: -0.2}) {
+				t.Fatalf("近乎平盘 -0.2%% 不算回调")
+			}
+			if s.keep(datasource.StockRank{ChangePct: 1}) {
+				t.Fatalf("上涨不算回调")
+			}
+		}
+	}
+	if !hasDipper {
+		t.Fatalf("pullback 应含回调路来源: %+v", srcs)
+	}
+	srcs = strategySources(model.RecTypeLongTerm, "value")
+	var hasLowPB bool
+	for _, s := range srcs {
+		if s.label == "lowpb" {
+			hasLowPB = true
+			if s.keep(datasource.StockRank{PB: -0.5, PE: 8}) {
+				t.Fatalf("负 PB（资不抵债/退市）应被行级过滤")
+			}
+			if s.keep(datasource.StockRank{PB: 0.4, PE: -6}) {
+				t.Fatalf("破净但亏损（价值陷阱）应被行级过滤")
+			}
+			if s.keep(datasource.StockRank{PB: 0.6, PE: 55}) {
+				t.Fatalf("破净但 PE 55 与价值策略不符，应被行级过滤")
+			}
+			if !s.keep(datasource.StockRank{PB: 0.6, PE: 6}) {
+				t.Fatalf("破净盈利低估值应保留")
+			}
+		}
+	}
+	if !hasLowPB {
+		t.Fatalf("value 应含低PB榜来源: %+v", srcs)
+	}
+	// momentum 的换手路应深捞+温和带过滤（榜单前排极端换手大多被硬拦，直接取温和带）。
+	for _, s := range strategySources(model.RecTypeShortTerm, "momentum") {
+		if s.label == "turnover" {
+			if s.keep == nil {
+				t.Fatalf("换手路应带温和带过滤: %+v", s)
+			}
+			if s.keep(datasource.StockRank{TurnoverRate: 28}) || !s.keep(datasource.StockRank{TurnoverRate: 8}) {
+				t.Fatalf("换手温和带应保留 8%%、过滤 28%%")
+			}
+		}
+	}
+	// 所有策略的来源标签都必须有中文映射（前端展示依赖）。
+	for _, rt := range []string{model.RecTypeShortTerm, model.RecTypeLongTerm} {
+		for _, st := range StrategiesFor(rt) {
+			for _, s := range strategySources(rt, st.Key) {
+				if sourceLabelCN[s.label] == "" {
+					t.Errorf("来源 %q 缺少中文标签", s.label)
+				}
+				if s.limit <= 0 || s.limit > 100 {
+					t.Errorf("来源 %q limit 越界: %d", s.label, s.limit)
+				}
+			}
+		}
+	}
+}
+
+// TestAssignScanQuota 评分名额轮转：自选整组优先，其余来源逐轮各出一只，防单路垄断。
+func TestAssignScanQuota(t *testing.T) {
+	pool := make([]candidate, 0, 60)
+	// 2 只自选 + 单一来源 A 55 只 + 来源 B 3 只（B 排池尾，旧的先到先得下全灭）。
+	for i := 0; i < 2; i++ {
+		pool = append(pool, candidate{Symbol: fmt.Sprintf("W%02d", i), Sources: []string{"watchlist"}})
+	}
+	for i := 0; i < 55; i++ {
+		pool = append(pool, candidate{Symbol: fmt.Sprintf("A%02d", i), Sources: []string{"gainer"}})
+	}
+	for i := 0; i < 3; i++ {
+		pool = append(pool, candidate{Symbol: fmt.Sprintf("B%02d", i), Sources: []string{"active"}})
+	}
+	assignScanQuota(pool)
+	var wOK, aOK, bOK, full int
+	for _, c := range pool {
+		switch {
+		case c.Excluded == "" && c.Sources[0] == "watchlist":
+			wOK++
+		case c.Excluded == "" && c.Sources[0] == "gainer":
+			aOK++
+		case c.Excluded == "" && c.Sources[0] == "active":
+			bOK++
+		case strings.HasPrefix(c.Excluded, poolFullPrefix):
+			full++
+		}
+	}
+	if wOK != 2 {
+		t.Fatalf("自选应整组优先拿名额，得到 %d", wOK)
+	}
+	if bOK != 3 {
+		t.Fatalf("池尾小来源应经轮转拿到名额（防单路垄断），得到 %d", bOK)
+	}
+	if aOK+bOK+wOK != maxScanCandidates {
+		t.Fatalf("总发放应为 %d，得到 %d", maxScanCandidates, aOK+bOK+wOK)
+	}
+	if full != 60-maxScanCandidates {
+		t.Fatalf("落选者应标池满，得到 %d", full)
+	}
+	// 已被用户筛选排除者不占名额。
+	pool2 := []candidate{
+		{Symbol: "X", Sources: []string{"gainer"}, Excluded: "股价超上限"},
+		{Symbol: "Y", Sources: []string{"gainer"}},
+	}
+	assignScanQuota(pool2)
+	if pool2[0].Excluded != "股价超上限" || pool2[1].Excluded != "" {
+		t.Fatalf("已排除者不参与名额分配: %+v", pool2)
+	}
+}
+
+// TestCandidateEligibleBJ 北交所前缀（43/83/87/920）不进池（数据源不支持，挤占名额）。
+func TestCandidateEligibleBJ(t *testing.T) {
+	f := defaultCandidateFilter()
+	for _, sym := range []string{"430047", "830799", "870357", "920193"} {
+		if candidateEligible(candidate{Symbol: sym, Name: "北交某股", Price: 10, Amount: 5e8}, f) {
+			t.Errorf("北交所 %s 应被基础准入排除", sym)
+		}
+	}
+	if !candidateEligible(candidate{Symbol: "600000", Name: "浦发银行", Price: 8, Amount: 5e8}, f) {
+		t.Fatalf("沪市正常标的应通过")
 	}
 }
 

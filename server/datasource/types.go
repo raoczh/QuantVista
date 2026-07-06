@@ -101,6 +101,9 @@ type StockRank struct {
 	ChangePct    float64 `json:"change_pct"`
 	Amount       float64 `json:"amount"`
 	TurnoverRate float64 `json:"turnover_rate"`
+	PE           float64 `json:"pe,omitempty"`        // 市盈率（新浪 per 口径，仅作行级过滤，不落 candidate 展示）
+	PB           float64 `json:"pb,omitempty"`        // 市净率（新浪榜单自带；0=缺失）
+	FloatCap     float64 `json:"float_cap,omitempty"` // 流通市值（元；新浪 nmc 万元已换算；0=缺失）
 	Source       string  `json:"source"`
 }
 
@@ -173,9 +176,10 @@ type IndexProvider interface {
 	GetIndices(ctx context.Context, market string) ([]Index, error)
 }
 
-// RankingProvider 个股榜单能力（sort: "changepercent" / "amount"）。
+// RankingProvider 个股榜单能力。sort: "changepercent"/"amount"/"turnoverratio"/"pb"；
+// asc=true 升序（跌幅榜/低PB榜等「不热」方向），false 降序（传统热度榜）。
 type RankingProvider interface {
-	GetStockRanking(ctx context.Context, market, sort string, limit int) ([]StockRank, error)
+	GetStockRanking(ctx context.Context, market, sort string, asc bool, limit int) ([]StockRank, error)
 }
 
 // SectorProvider 板块涨跌榜能力。

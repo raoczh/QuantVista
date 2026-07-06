@@ -97,14 +97,14 @@ func (m *Manager) GetIndices(ctx context.Context, market string) ([]Index, error
 }
 
 // GetStockRanking 路由到实现 RankingProvider 的源（新浪 Market_Center）。
-func (m *Manager) GetStockRanking(ctx context.Context, market, sort string, limit int) ([]StockRank, error) {
+func (m *Manager) GetStockRanking(ctx context.Context, market, sort string, asc bool, limit int) ([]StockRank, error) {
 	var lastErr error = ErrNotSupported
 	for _, a := range m.adapters {
 		p, ok := a.(RankingProvider)
 		if !ok {
 			continue
 		}
-		r, err := p.GetStockRanking(ctx, market, sort, limit)
+		r, err := p.GetStockRanking(ctx, market, sort, asc, limit)
 		if err == nil {
 			return r, nil
 		}
