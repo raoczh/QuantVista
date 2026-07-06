@@ -13,6 +13,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/login/callback', name: 'oauth-callback', component: () => import('@/pages/OAuthCallback.vue'), meta: { bare: true, public: true, title: '登录中' } },
 
   { path: '/', name: 'home', component: Home, meta: { title: '市场首页' } },
+  { path: '/news', name: 'news', component: () => import('@/pages/News.vue'), meta: { title: '市场快讯' } },
   { path: '/stocks/:market/:symbol', name: 'stock-detail', component: () => import('@/pages/StockDetail.vue'), meta: { title: '个股详情' } },
   { path: '/today', name: 'today', component: () => import('@/pages/Today.vue'), meta: { title: '今日待办' } },
   { path: '/daily-report', name: 'daily-report', component: () => import('@/pages/DailyReport.vue'), meta: { title: '收盘日报' } },

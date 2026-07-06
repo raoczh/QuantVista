@@ -67,6 +67,7 @@ function navLink(to: string, text: string) {
 
 const menuOptions = computed<MenuOption[]>(() => [
   { label: navLink('/', '市场首页'), key: 'home' },
+  { label: navLink('/news', '快讯'), key: 'news' },
   {
     label: () =>
       h(RouterLink, { to: '/today', class: 'nav-today' }, {
