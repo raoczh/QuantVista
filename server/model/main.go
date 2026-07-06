@@ -40,6 +40,7 @@ func AllModels() []any {
 		&ThesisCard{},
 		&ResearchNote{},
 		&DailyReport{},
+		&News{},
 	}
 }
 
