@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { NButton, NEmpty, NGi, NGrid, NResult, NSpin, NTag } from 'naive-ui'
 import * as echarts from 'echarts'
 import {
@@ -13,6 +13,7 @@ import {
   type Valuation,
   type StockScore,
 } from '@/api/market'
+import { getNews, newsSourceLabel, type NewsItem } from '@/api/news'
 import { useUi } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import { useStockActions } from '@/composables/useStockActions'
@@ -35,6 +36,7 @@ const quote = ref<Quote | null>(null)
 const valuation = ref<Valuation | null>(null)
 const score = ref<StockScore | null>(null)
 const bars = ref<Bar[]>([])
+const news = ref<NewsItem[]>([])
 const loading = ref(false)
 const loadError = ref('')
 
@@ -55,13 +57,16 @@ async function load(silent = false) {
   }
   try {
     quote.value = await getQuote(market.value, symbol.value)
-    // 估值 / 评分 best-effort：失败只是不显示对应卡片。
+    // 估值 / 评分 / 相关新闻 best-effort：失败只是不显示对应卡片。
     getValuation(market.value, symbol.value)
       .then((v) => (valuation.value = v))
       .catch(() => (valuation.value = null))
     getScore(market.value, symbol.value)
       .then((s) => (score.value = s))
       .catch(() => (score.value = null))
+    getNews({ symbol: symbol.value, limit: 15 })
+      .then((r) => (news.value = r))
+      .catch(() => (news.value = []))
     const b = await getDailyBars(market.value, symbol.value, 120)
     bars.value = b
     renderChart()
@@ -105,6 +110,7 @@ watch(isDark, () => renderChart())
 watch([market, symbol], () => {
   valuation.value = null
   score.value = null
+  news.value = []
   load()
 })
 
@@ -147,6 +153,11 @@ function fmtCap(n: number | undefined) {
 }
 function fmtTime(t: string | undefined) {
   return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : '-'
+}
+function fmtNewsTime(t: string) {
+  const d = new Date(t)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
 const scoreDims = computed(() => {
@@ -265,6 +276,28 @@ function scoreType(total: number) {
             </SectionCard>
           </n-gi>
         </n-grid>
+
+        <!-- 相关新闻（N1）：按代码关联财联社电报与东财个股新闻，best-effort -->
+        <SectionCard title="相关新闻">
+          <template #extra>
+            <RouterLink :to="{ name: 'news', query: { symbol } }" class="news-more">更多快讯 →</RouterLink>
+          </template>
+          <div v-if="news.length" class="news-list">
+            <div v-for="n in news" :key="n.id" class="news-row">
+              <span class="news-time qv-tnum">{{ fmtNewsTime(n.publish_time) }}</span>
+              <a
+                v-if="n.url"
+                :href="n.url"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="news-title"
+              >{{ n.title }}</a>
+              <span v-else class="news-title">{{ n.title }}</span>
+              <span class="news-src">{{ newsSourceLabel(n) }}</span>
+            </div>
+          </div>
+          <n-empty v-else description="暂无相关新闻（覆盖财联社电报与东财个股新闻，A 股标的）" />
+        </SectionCard>
       </div>
     </n-spin>
   </PageContainer>
@@ -375,5 +408,62 @@ function scoreType(total: number) {
   width: 28px;
   text-align: right;
   font-size: 12px;
+}
+
+/* ---------- 相关新闻 ---------- */
+.news-more {
+  font-size: 12px;
+  color: var(--qv-primary);
+  text-decoration: none;
+  opacity: 0.85;
+}
+.news-more:hover {
+  opacity: 1;
+}
+.news-list {
+  display: flex;
+  flex-direction: column;
+}
+.news-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 0;
+}
+.news-row + .news-row {
+  border-top: 1px dashed rgba(128, 128, 128, 0.22);
+}
+.news-time {
+  flex-shrink: 0;
+  font-size: 12px;
+  opacity: 0.55;
+}
+.news-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: inherit;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+a.news-title:hover {
+  color: var(--qv-primary);
+}
+.news-src {
+  flex-shrink: 0;
+  font-size: 11px;
+  opacity: 0.5;
+}
+
+@media (max-width: 768px) {
+  .news-row {
+    flex-wrap: wrap;
+    gap: 4px 10px;
+  }
+  .news-title {
+    flex-basis: 100%;
+    order: 3;
+  }
 }
 </style>
