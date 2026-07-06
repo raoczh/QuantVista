@@ -306,6 +306,8 @@ const SOURCE_LABEL: Record<string, string> = {
   gainer: '涨幅榜',
   active: '成交额榜',
   turnover: '换手率榜',
+  dipper: '回调榜',
+  lowpb: '低PB榜',
 }
 function sourceText(c: PoolCandidate) {
   const arr = c.sources && c.sources.length ? c.sources : c.source ? [c.source] : []
@@ -476,11 +478,11 @@ function signedPct(n: number | undefined) {
                   <n-input-number v-model:value="filters.float_cap_max_yi" :min="0" size="small" placeholder="上限(亿)，0=不限" style="width: 100%" />
                 </div>
                 <div class="filters-row">
-                  <n-input-number v-model:value="filters.turnover_min" :min="0" :max="20" size="small" placeholder="换手%下限" style="width: 100%" />
+                  <n-input-number v-model:value="filters.turnover_min" :min="0" :max="25" size="small" placeholder="换手%下限" style="width: 100%" />
                   <span class="filters-sep">~</span>
-                  <n-input-number v-model:value="filters.turnover_max" :min="0" :max="20" size="small" placeholder="换手%上限" style="width: 100%" />
+                  <n-input-number v-model:value="filters.turnover_max" :min="0" :max="30" size="small" placeholder="换手%上限" style="width: 100%" />
                 </div>
-                <div class="filters-hint">换手区间上限 20%：>20% 为「死亡换手」，系统已硬性排除</div>
+                <div class="filters-hint">换手 >30% 一律排除；20~30% 仅高位（60日区间 ≥65%）判「死亡换手」排除，低位保留并标注风险</div>
                 <div class="filters-switch">
                   <span>排除已涨停（买不进）</span>
                   <n-switch v-model:value="filters.exclude_limit_up" size="small" />
@@ -507,8 +509,8 @@ function signedPct(n: number | undefined) {
               {{ running ? '生成中…' : '生成推荐' }}
             </n-button>
             <div class="hint">
-              流水线：自选∪涨幅榜∪成交额榜∪换手率榜 → 你的筛选 → 本地量化评分排序（零 AI 成本）→ AI 只在
-              Top12 里精选并强制引用数据 → 程序核验证据数字。候选池全程透明，可在结果页展开查看每只股为什么进/为什么被筛掉。
+              流水线：自选 + 随策略组合的榜单（涨幅/成交额/换手率/回调/低PB，深度取数并补「不热」方向）→ 你的筛选 →
+              本地量化评分排序（零 AI 成本）→ AI 只在 Top16 里精选并强制引用数据 → 程序核验证据数字。候选池全程透明，可在结果页展开查看每只股为什么进/为什么被筛掉。
             </div>
           </n-form>
         </SectionCard>
@@ -887,8 +889,8 @@ function signedPct(n: number | undefined) {
                     </table>
                   </div>
                   <div class="pool-note">
-                    来源=进池原因（自选/涨幅榜/成交额榜/换手率榜，可叠加）；量化分=五维技术评分+策略加分（0-100，悬停查看加分明细，仅排序参考不代表预期收益）；「AI
-                    名单」=量化排序 Top12 交给 AI 精选，其余仅参与排名对照。
+                    来源=进池原因（自选/涨幅榜/成交额榜/换手率榜/回调榜/低PB榜，随策略组合、可叠加）；量化分=五维技术评分+策略加分（0-100，悬停查看加分明细，仅排序参考不代表预期收益）；「AI
+                    名单」=量化排序 Top16 交给 AI 精选，其余仅参与排名对照。
                     <template v-if="poolOmitted > 0">另有 {{ poolOmitted }} 只被筛掉的标的未展示（快照容量保护）。</template>
                   </div>
                 </n-collapse-item>

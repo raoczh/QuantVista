@@ -76,17 +76,17 @@ func (s *MarketService) GetDailyBars(ctx context.Context, market, symbol string,
 
 const rankingCacheTTL = 60 * time.Second
 
-// GetRanking 取个股榜单（sort: changepercent/amount/turnoverratio），60s 缓存。
+// GetRanking 取个股榜单（sort: changepercent/amount/turnoverratio/pb；asc=true 升序），60s 缓存。
 // 供推荐候选池多源建池使用（首页概览走 GetOverview 的 10 条口径，互不影响）。
-func (s *MarketService) GetRanking(ctx context.Context, market, sort string, limit int) ([]datasource.StockRank, error) {
-	cacheKey := fmt.Sprintf("ranking:%s:%s:%d", market, sort, limit)
+func (s *MarketService) GetRanking(ctx context.Context, market, sort string, asc bool, limit int) ([]datasource.StockRank, error) {
+	cacheKey := fmt.Sprintf("ranking:%s:%s:%v:%d", market, sort, asc, limit)
 	if cached, ok := common.RedisGet(cacheKey); ok {
 		var rows []datasource.StockRank
 		if json.Unmarshal([]byte(cached), &rows) == nil && len(rows) > 0 {
 			return rows, nil
 		}
 	}
-	rows, err := s.mgr.GetStockRanking(ctx, market, sort, limit)
+	rows, err := s.mgr.GetStockRanking(ctx, market, sort, asc, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +236,7 @@ func (s *MarketService) GetOverview(ctx context.Context, market string) *Overvie
 	}()
 	go func() {
 		defer wg.Done()
-		if r, err := s.mgr.GetStockRanking(ctx, market, "changepercent", 10); err == nil {
+		if r, err := s.mgr.GetStockRanking(ctx, market, "changepercent", false, 10); err == nil {
 			ov.Gainers = r
 		} else {
 			setErr("gainers", err)
@@ -244,7 +244,7 @@ func (s *MarketService) GetOverview(ctx context.Context, market string) *Overvie
 	}()
 	go func() {
 		defer wg.Done()
-		if r, err := s.mgr.GetStockRanking(ctx, market, "amount", 10); err == nil {
+		if r, err := s.mgr.GetStockRanking(ctx, market, "amount", false, 10); err == nil {
 			ov.Actives = r
 		} else {
 			setErr("actives", err)

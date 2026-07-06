@@ -22,7 +22,7 @@ type RecFilters struct {
 	FloatCapMinYi float64 `json:"float_cap_min_yi"` // 流通市值下限（亿元）
 	FloatCapMaxYi float64 `json:"float_cap_max_yi"` // 流通市值上限（亿元）——排除超大盘「大票」
 	TurnoverMin   float64 `json:"turnover_min"`     // 换手率下限（%）
-	TurnoverMax   float64 `json:"turnover_max"`     // 换手率上限（%）；>20% 为「死亡换手」惯例
+	TurnoverMax   float64 `json:"turnover_max"`     // 换手率上限（%）；系统另有两级硬规则：>30% 一律排除、20~30% 高位排除
 	MaxGain5dPct  float64 `json:"max_gain_5d_pct"`  // 近 5 日累计涨幅上限（%，追高保护；0=不限）
 	ExcludeLimitUp bool   `json:"exclude_limit_up"` // 排除当日已封涨停（涨停买不进）
 }
@@ -51,10 +51,10 @@ func sanitizeRecFilters(f RecFilters) RecFilters {
 	clampNonNeg(&f.PriceMax, 100000)
 	clampNonNeg(&f.FloatCapMinYi, 1e6)
 	clampNonNeg(&f.FloatCapMaxYi, 1e6)
-	// 换手区间钳在死亡换手硬顶之内：applyQuoteFilters 无条件排除 >20% 的标的，
-	// 若允许用户把下限配到 20 以上，构成「必然空池」的数学死局且报错文案误导。
-	clampNonNeg(&f.TurnoverMin, deadTurnoverPct)
-	clampNonNeg(&f.TurnoverMax, deadTurnoverPct)
+	// 换手区间钳制：上限=绝对硬顶 30%（防「必然空池」死局）；下限额外钳到 25%，
+	// 给 [min,30] 留至少 5 个百分点的可行带（min=30 会退化成测度零区间）。
+	clampNonNeg(&f.TurnoverMin, 25)
+	clampNonNeg(&f.TurnoverMax, deadTurnoverHardPct)
 	clampNonNeg(&f.MaxGain5dPct, 1000)
 	if f.PriceMin > 0 && f.PriceMax > 0 && f.PriceMin > f.PriceMax {
 		f.PriceMin, f.PriceMax = f.PriceMax, f.PriceMin
@@ -202,8 +202,8 @@ func applyQuoteFilters(c candidate, f RecFilters) string {
 			return fmt.Sprintf("换手率 %.2f%% 超出上限 %s%%（换手过热）", c.TurnoverRate, trimFloat(f.TurnoverMax))
 		}
 	}
-	if c.TurnoverRate > deadTurnoverPct {
-		return fmt.Sprintf("换手率 %.2f%% 超过 %v%%（「死亡换手」惯例，高位大概率出货）", c.TurnoverRate, deadTurnoverPct)
+	if c.TurnoverRate > deadTurnoverHardPct {
+		return fmt.Sprintf("换手率 %.2f%% 超过 %v%%（极端换手，无论位置高低大概率异常）", c.TurnoverRate, deadTurnoverHardPct)
 	}
 	if f.ExcludeLimitUp && isAtLimitUp(c) {
 		return "当日已封涨停，实际无法买入"
@@ -211,8 +211,27 @@ func applyQuoteFilters(c candidate, f RecFilters) string {
 	return ""
 }
 
-// deadTurnoverPct 换手率硬上限（无论用户是否配置）：>20% 为散户/游资共识的「死亡换手」。
-const deadTurnoverPct = 20.0
+// 换手率两级阈值：>30% 无条件硬拦（极端换手）；20~30% 推迟到阶段③结合 60 日
+// 区间位置判定——高位放量是「死亡换手」出货形态要排除，低位放量可能是启动，
+// 一刀切会把换手率榜来源几乎清空（该榜前排常年 20%+），保留但评分标注风险。
+// sanitizeRecFilters 的用户区间钳制上限必须等于 deadTurnoverHardPct（防空池死局）。
+const (
+	deadTurnoverPct     = 20.0
+	deadTurnoverHardPct = 30.0
+)
+
+// applyTurnoverPosFilter 阶段③补充：换手 20~30% 区间的位置判定（依赖 pos_60 因子）。
+// 空串=通过。高位（60 日区间位置 ≥65%）+高换手=经典出货形态，排除并给透明原因；
+// 低位高换手保留，由 scorePool 统一扣分标注（放量启动与对倒出货并存，交给 LLM 与用户权衡）。
+func applyTurnoverPosFilter(c candidate, factors *candFactors) string {
+	if factors == nil || c.TurnoverRate <= deadTurnoverPct {
+		return ""
+	}
+	if factors.Pos60 >= 65 {
+		return fmt.Sprintf("换手率 %.1f%% 且处 60 日区间 %.0f%% 高位（高位死亡换手，大概率出货）", c.TurnoverRate, factors.Pos60)
+	}
+	return ""
+}
 
 // applyGainFilter 阶段③补充：近 5 日涨幅追高保护（依赖日线因子）。空串=通过。
 func applyGainFilter(c candidate, factors *candFactors, f RecFilters) string {

@@ -142,9 +142,14 @@ func computeCandFactors(price float64, bars []datasource.Bar) *candFactors {
 	}
 	f.Drawdown20 = round2(-worst * 100)
 
-	// 60 日区间位置。
-	hi, lo := bars[0].High, bars[0].Low
-	for _, b := range bars {
+	// 60 日区间位置（严格取尾部 60 根——bars 总量为 factorBarLimit=90，
+	// 全窗遍历会把口径悄悄变成 90 日，而 Pos60 已是高位换手硬排除的判定依据）。
+	win60 := bars
+	if len(win60) > 60 {
+		win60 = win60[len(win60)-60:]
+	}
+	hi, lo := win60[0].High, win60[0].Low
+	for _, b := range win60 {
 		if b.High > hi {
 			hi = b.High
 		}
@@ -239,7 +244,9 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 	}
 
 	// 长线：估值与稳定性导向（估值缺失只是不加分，不虚构）。
-	if c.PETTM <= 0 && c.PB > 0 {
+	// 严格 <0 才判亏损：PETTM==0 是「估值缺失」而非亏损（腾讯估值失败但新浪
+	// 榜单 PB 兜底存在时，旧条件 <=0 && PB>0 会把缺失误标成「PE 为负」假证据）。
+	if c.PETTM < 0 {
 		add(-5, "PE 为负（亏损）")
 	}
 	switch stratKey {
