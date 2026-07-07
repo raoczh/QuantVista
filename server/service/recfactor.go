@@ -311,6 +311,11 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 	if c.PETTM < 0 {
 		add(-5, "PE 为负（亏损）")
 	}
+	// F2 财务因子（有数据才动分，缺失不惩罚——c.Fin=nil 表示无缓存且预算耗尽）。
+	// 业绩恶化是长线通用扣分；ROE/增速加分随策略在下方分派。
+	if fin := c.Fin; fin != nil && fin.NetProfitYoY <= -30 {
+		add(-5, fmt.Sprintf("净利同比 %.1f%% 业绩恶化（%s）", fin.NetProfitYoY, fin.Report))
+	}
 	switch stratKey {
 	case "value":
 		switch {
@@ -335,6 +340,18 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 		if f.RSI14 > 0 && f.RSI14 <= 35 {
 			add(3, fmt.Sprintf("RSI %.0f 超卖区（左侧）", f.RSI14))
 		}
+		// F2：低估值 + 高 ROE 是价值策略的黄金组合；净利正增长确认盈利质量。
+		if fin := c.Fin; fin != nil {
+			switch {
+			case fin.ROE >= 12:
+				add(5, fmt.Sprintf("ROE %.1f%% 优秀（%s）", fin.ROE, fin.Report))
+			case fin.ROE >= 8:
+				add(3, fmt.Sprintf("ROE %.1f%% 良好（%s）", fin.ROE, fin.Report))
+			}
+			if fin.NetProfitYoY >= 10 {
+				add(3, fmt.Sprintf("净利同比 +%.1f%%", fin.NetProfitYoY))
+			}
+		}
 	case "growth":
 		if f.MA60 > 0 && c.Price > f.MA60 {
 			add(5, "站上 MA60 中期趋势向上")
@@ -352,6 +369,21 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 		if f.MACDGold && f.MACDDif > 0 {
 			add(3, "MACD 多头（DIF>DEA 且水上）")
 		}
+		// F2：营收/净利双增速是成长策略的核心证据（高增速给更高档加分）。
+		if fin := c.Fin; fin != nil {
+			switch {
+			case fin.RevenueYoY >= 20:
+				add(5, fmt.Sprintf("营收同比 +%.1f%% 高增长（%s）", fin.RevenueYoY, fin.Report))
+			case fin.RevenueYoY >= 10:
+				add(3, fmt.Sprintf("营收同比 +%.1f%%（%s）", fin.RevenueYoY, fin.Report))
+			}
+			switch {
+			case fin.NetProfitYoY >= 30:
+				add(5, fmt.Sprintf("净利同比 +%.1f%% 高增长", fin.NetProfitYoY))
+			case fin.NetProfitYoY >= 15:
+				add(3, fmt.Sprintf("净利同比 +%.1f%%", fin.NetProfitYoY))
+			}
+		}
 	case "leader":
 		if c.TotalCap >= 500e8 {
 			add(5, fmt.Sprintf("总市值 %.0f 亿龙头体量", c.TotalCap/1e8))
@@ -364,6 +396,15 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 		}
 		if c.TurnoverRate > 0 && c.TurnoverRate <= 8 {
 			add(2, fmt.Sprintf("换手 %.1f%% 不过热", c.TurnoverRate))
+		}
+		// F2：龙头看盈利质量与业绩稳健。
+		if fin := c.Fin; fin != nil {
+			if fin.ROE >= 15 {
+				add(4, fmt.Sprintf("ROE %.1f%% 盈利质量高（%s）", fin.ROE, fin.Report))
+			}
+			if fin.NetProfitYoY >= 10 {
+				add(2, fmt.Sprintf("净利同比 +%.1f%%", fin.NetProfitYoY))
+			}
 		}
 	}
 	return delta, notes
@@ -407,6 +448,11 @@ func candidateValueSet(c candidate) []float64 {
 	if c.ScoreDims != nil {
 		vals = append(vals, c.ScoreDims.Trend, c.ScoreDims.Momentum, c.ScoreDims.Position,
 			c.ScoreDims.Volume, c.ScoreDims.Risk)
+	}
+	// F2 财务摘要：喂给 LLM 的 fin 字段同步进核验值域（值域同步铁律，T1 前例）。
+	if c.Fin != nil {
+		vals = append(vals, c.Fin.ROE, c.Fin.RevenueYoY, c.Fin.NetProfitYoY,
+			c.Fin.GrossMargin, c.Fin.NetMargin, c.Fin.DebtRatio)
 	}
 	out := vals[:0]
 	for _, v := range vals {

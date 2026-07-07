@@ -232,8 +232,10 @@ func (s *FinanceService) upsertExpressRows(rows []datasource.DcRow, period strin
 			ROE: r.Float("WEIGHTAVG_ROE"), DataType: r.String("DATATYPE"),
 		})
 	}
-	return upsertFinanceRows(recs, []string{"name", "notice_date", "eps", "revenue", "revenue_yoy",
-		"net_profit", "net_profit_yoy", "roe", "data_type", "updated_at"})
+	// 注意物理列名：GORM 把 YoY 转成 yo_y（revenue_yo_y/net_profit_yo_y），
+	// 此处必须用物理列名，否则冲突更新路径 SQL 报错、快报修正永远覆盖不进去。
+	return upsertFinanceRows(recs, []string{"name", "notice_date", "eps", "revenue", "revenue_yo_y",
+		"net_profit", "net_profit_yo_y", "roe", "data_type", "updated_at"})
 }
 
 func (s *FinanceService) upsertAppointRows(rows []datasource.DcRow, period string) (int, error) {
