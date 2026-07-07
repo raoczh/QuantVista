@@ -63,7 +63,11 @@ const kindOptions = [
   { label: '突破（新高/新低）', value: 'breakout' },
   { label: '放量（vs 20 日均量）', value: 'volume_surge' },
   { label: '振幅异动', value: 'amplitude' },
+  { label: '财报披露临近', value: 'earn_date' },
+  { label: '新业绩预告', value: 'earn_fcst' },
 ]
+// 财报日历类：无条件方向语义，且不走盘中行情评估（每日盘后财报数据刷新时评估一次）。
+const isEarnKind = computed(() => form.value.kind === 'earn_date' || form.value.kind === 'earn_fcst')
 // op 选项随 kind 变化，文案更贴切。
 const opOptions = computed(() => {
   switch (form.value.kind) {
@@ -99,7 +103,8 @@ const needThreshold = computed(
     form.value.kind === 'price' ||
     form.value.kind === 'pct_change' ||
     form.value.kind === 'volume_surge' ||
-    form.value.kind === 'amplitude',
+    form.value.kind === 'amplitude' ||
+    form.value.kind === 'earn_date',
 )
 const needPeriod = computed(() => form.value.kind === 'ma' || form.value.kind === 'breakout')
 const thresholdLabel = computed(() => {
@@ -112,6 +117,8 @@ const thresholdLabel = computed(() => {
       return '量比倍数（如 2 = 2 倍 20 日均量）'
     case 'amplitude':
       return '振幅阈值（%，(最高-最低)/昨收）'
+    case 'earn_date':
+      return '提前天数（距预约披露日 ≤N 天提醒）'
     default:
       return '阈值'
   }
@@ -234,6 +241,10 @@ function describe(r: AlertRule) {
       return `当日量${r.op === 'gte' ? ' ≥ ' : ' ≤ '}${p(r.threshold)} 倍 20 日均量`
     case 'amplitude':
       return `当日振幅 ${r.op === 'gte' ? '≥' : '≤'} ${p(r.threshold)}%`
+    case 'earn_date':
+      return `距财报预约披露日 ≤ ${r.threshold.toFixed(0)} 天`
+    case 'earn_fcst':
+      return '发布新业绩预告（预增/预亏等）'
     default:
       return ''
   }
@@ -330,6 +341,8 @@ const kindLabelMap: Record<string, string> = {
   breakout: '突破',
   volume_surge: '放量',
   amplitude: '振幅',
+  earn_date: '财报披露',
+  earn_fcst: '业绩预告',
 }
 
 // ---------- 推送通道 ----------
@@ -428,12 +441,21 @@ function channelKindLabel(k: string) {
             <n-form-item label="提醒类型">
               <n-select v-model:value="form.kind" :options="kindOptions" />
             </n-form-item>
-            <n-form-item label="条件方向">
+            <n-form-item v-if="!isEarnKind" label="条件方向">
               <n-select v-model:value="form.op" :options="opOptions" />
             </n-form-item>
             <n-form-item v-if="needThreshold" :label="thresholdLabel">
-              <n-input-number v-model:value="form.threshold" :precision="2" style="width: 100%" />
+              <n-input-number
+                v-model:value="form.threshold"
+                :precision="form.kind === 'earn_date' ? 0 : 2"
+                :min="form.kind === 'earn_date' ? 1 : undefined"
+                :max="form.kind === 'earn_date' ? 30 : undefined"
+                style="width: 100%"
+              />
             </n-form-item>
+            <div v-if="isEarnKind" class="hint" style="margin: -4px 0 4px">
+              财报提醒按每日盘后刷新的披露/预告数据评估（每天一次），不占用盘中行情检查。
+            </div>
             <n-form-item v-if="needPeriod" label="周期（交易日）">
               <n-input-number v-model:value="form.period" :min="2" :max="250" style="width: 100%" />
             </n-form-item>

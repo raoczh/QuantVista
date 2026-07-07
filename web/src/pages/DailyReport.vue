@@ -151,6 +151,18 @@ function sentiColor(s?: string) {
   return ''
 }
 
+// ---------- F1 明日披露名单（自选∪持仓中次日预约披露财报的标的，随快照落库） ----------
+const disclosures = computed<string[]>(() => {
+  const raw = current.value?.snapshot_json
+  if (!raw) return []
+  try {
+    const snap = JSON.parse(raw)
+    return Array.isArray(snap?.disclosures_tomorrow) ? (snap.disclosures_tomorrow as string[]) : []
+  } catch {
+    return []
+  }
+})
+
 onMounted(load)
 </script>
 
@@ -239,6 +251,12 @@ onMounted(load)
               <span class="bk">风险</span>
               <ul>
                 <li v-for="(w, i) in current.review.risk_warnings" :key="i">{{ w }}</li>
+              </ul>
+            </div>
+            <div v-if="disclosures.length" class="block">
+              <span class="bk">明日披露</span>
+              <ul>
+                <li v-for="(d, i) in disclosures" :key="i">{{ d }}</li>
               </ul>
             </div>
             <div class="block plan"><span class="bk">明日计划</span><p>{{ current.review.tomorrow_plan }}</p></div>

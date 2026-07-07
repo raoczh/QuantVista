@@ -42,6 +42,10 @@ func AllModels() []any {
 		&DailyReport{},
 		&News{},
 		&StockSentiment{},
+		&EarningsForecast{},
+		&EarningsExpress{},
+		&DisclosureSchedule{},
+		&Announcement{},
 	}
 }
 

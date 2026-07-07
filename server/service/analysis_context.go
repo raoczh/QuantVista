@@ -171,6 +171,14 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 				"market_signals": fallbackMarketSignals(q.ChangePct, bars, turnover),
 			}
 		}
+		// F1 公告段：最近 5 条公告标题+类型+日期（公告 > 新闻报道的证据权重；
+		// 覆盖面为已采集库存，best-effort；无公告不注入，prompt 已声明覆盖有限）。
+		if anns := latestAnnouncementBriefs(symbol, 5); len(anns) > 0 {
+			snap["announcements"] = map[string]any{
+				"items": anns,
+				"note":  "该股最近的交易所公告（标题与类型；引用只能复述标题，不得臆测公告正文细节）",
+			}
+		}
 	}
 
 	label := q.Name
