@@ -13,7 +13,6 @@ func AllModels() []any {
 		&Option{},
 		&UserQuota{},
 		&LLMConfig{},
-		&DataSourceConfig{},
 		&Stock{},
 		&StockQuote{},
 		&DailyBar{},

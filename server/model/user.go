@@ -53,6 +53,10 @@ type UserPreference struct {
 	// 默认关闭——自动生成消耗 LLM token（不计次数配额，但走用户自己的 LLM）。
 	EnableDailyReport bool `gorm:"default:false" json:"enable_daily_report"`
 
+	// TotalCapital 总投资资金（元，S1 风险闸门配套）：持仓 AI 分析注入的资金上下文，
+	// 供「割/守/补」判断参考仓位水平。0=未设置不注入。
+	TotalCapital float64 `gorm:"type:decimal(20,2);default:0" json:"total_capital"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

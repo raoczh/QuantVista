@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"quantvista/common"
 	"quantvista/datasource"
 	"quantvista/model"
 )
@@ -107,10 +108,12 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 	// 估值/盘面扩展（腾讯免费源 best-effort：拿不到不阻断，提示词已要求缺失时如实说明）。
 	// ETF/场内基金无个股估值指标（PE/PB/市值来自个股口径，喂给基金全 0 是噪声），
 	// 直接标注资产类型并以说明替代估值段。
+	var valuation *datasource.Valuation
 	if isCNFund(symbol) {
 		snap["asset_type"] = "etf"
 		snap["valuation"] = map[string]any{"note": "ETF/基金无个股估值指标（PE/PB/市值不适用）"}
 	} else if v, verr := market.GetValuation(ctx, mkt, symbol); verr == nil {
+		valuation = v
 		val := map[string]any{
 			"pe_ttm":        round2(v.PETTM),
 			"pe_dynamic":    round2(v.PEDynamic),
@@ -128,6 +131,10 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 		}
 		snap["valuation"] = val
 	}
+
+	// 风险闸门（S1）：ST/退市、一字板、流动性、小市值的程序化前置判定，注入 prompt
+	// 且随快照透传前端展示；未接入的数据维度（质押/解禁）恒带「请自行核查」声明。
+	snap["risk_gate"] = riskGateBlock(computeRiskGate(q, valuation))
 
 	// 日线：取近 60 根算技术指标，注入近 30 根明细；顺手算五维量化评分
 	// （与个股详情页/对比/推荐同一 computeScore 口径），给 LLM 一个确定性的量化锚点，
@@ -400,6 +407,20 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 			"profit_pct":   round2(pnlPct),
 		},
 		"positions": rows,
+	}
+	// 资金上下文（S1）：用户在设置里填了总投资资金才注入——持仓占总资金的比例
+	// 决定「割/守/补」的容错空间（满仓亏损与三成仓亏损是两种处境）。
+	var pref model.UserPreference
+	if err := common.DB.Where("user_id = ?", userID).First(&pref).Error; err == nil && pref.TotalCapital > 0 {
+		ratio := 0.0
+		if pref.TotalCapital > 0 {
+			ratio = totalMV / pref.TotalCapital * 100
+		}
+		snap["capital_context"] = map[string]any{
+			"total_capital":     round2(pref.TotalCapital),
+			"holding_ratio_pct": round2(ratio),
+			"note":              "total_capital 为用户设定的总投资资金（元）；holding_ratio_pct 为当前持仓市值占总资金比例(%)，反映仓位水平与补仓余地",
+		}
 	}
 	return &analysisContext{Label: "持仓", Snapshot: fitBudget(snap)}, nil
 }

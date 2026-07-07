@@ -18,3 +18,10 @@ export interface TrustReview {
 
 // 程序合成置信度档位。
 export type SysConfidence = 'high' | 'medium' | 'low'
+
+// 风险闸门标志（S1：ST/退市 block、一字板/流动性 warn、小市值 info；服务端程序化判定）。
+export interface RiskFlag {
+  level: 'block' | 'warn' | 'info'
+  code: string
+  text: string
+}

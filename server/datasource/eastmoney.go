@@ -13,9 +13,15 @@ import (
 
 // EastMoneyAdapter 东方财富公开接口（push2 / push2his）。
 // 免费、无需 key、覆盖最全。注意：非官方接口，字段可能变动，仅个人自用。
-type EastMoneyAdapter struct{}
+// push2 族请求经实例级断路器（breaker.go）：限流时降级 push2delay / 连续限流熔断快速失败。
+type EastMoneyAdapter struct {
+	br    *emBreaker
+	fetch func(ctx context.Context, url string, headers map[string]string) ([]byte, int, error) // 可注入假实现（单测）
+}
 
-func NewEastMoneyAdapter() *EastMoneyAdapter { return &EastMoneyAdapter{} }
+func NewEastMoneyAdapter() *EastMoneyAdapter {
+	return &EastMoneyAdapter{br: newEmBreaker(), fetch: doGet}
+}
 
 func (e *EastMoneyAdapter) Name() string { return "eastmoney" }
 
@@ -60,7 +66,7 @@ func (e *EastMoneyAdapter) GetQuote(ctx context.Context, market, symbol string) 
 		"https://%d.push2.eastmoney.com/api/qt/stock/get?secid=%s&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60,f86,f169,f170&invt=2&fltt=2",
 		emNode(), secid,
 	)
-	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
+	body, status, err := e.get(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
 	}
@@ -142,7 +148,7 @@ func (e *EastMoneyAdapter) GetDailyBars(ctx context.Context, market, symbol stri
 		"https://%d.push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt=101&fqt=1&end=20500101&lmt=%d",
 		emNode(), secid, limit,
 	)
-	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
+	body, status, err := e.get(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
 	}
@@ -196,7 +202,7 @@ func (e *EastMoneyAdapter) GetSectorRanking(ctx context.Context, market string, 
 		"https://%d.push2.eastmoney.com/api/qt/clist/get?pn=1&pz=%d&po=1&fid=f3&fltt=2&fs=m:90+t:2&fields=f12,f14,f3,f128",
 		emNode(), limit,
 	)
-	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
+	body, status, err := e.get(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
 	}
@@ -259,7 +265,7 @@ func (e *EastMoneyAdapter) GetBreadth(ctx context.Context, market string) (*Brea
 		return nil, ErrNotSupported
 	}
 	url := "https://push2ex.eastmoney.com/getTopicZDFenBu?ut=7eea3edcaed734bea9cbfc24409ed989&dpt=wz.ztzt"
-	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
+	body, status, err := e.get(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
 	}
@@ -332,7 +338,7 @@ func (e *EastMoneyAdapter) GetMarketFundFlow(ctx context.Context, market string)
 	}
 	url := "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?lmt=5&klt=101&secid=1.000001&secid2=0.399001" +
 		"&fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56"
-	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
+	body, status, err := e.get(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
 	}

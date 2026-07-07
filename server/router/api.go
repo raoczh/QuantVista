@@ -242,6 +242,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			qa := authed.Group("/qa")
 			{
 				qa.POST("/ask", middleware.RateLimit(20, time.Minute), qaCtl.Ask)
+				qa.POST("/ask-stream", middleware.RateLimit(20, time.Minute), qaCtl.AskStream)
 				qa.GET("", qaCtl.List)
 				qa.GET("/:id", qaCtl.Get)
 				qa.GET("/:id/snapshot", qaCtl.Snapshot)
@@ -292,6 +293,9 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				admin.PUT("/users/:id/status", adminCtl.SetUserStatus)
 				admin.GET("/users/:id/quota", adminCtl.GetUserQuota)
 				admin.PUT("/users/:id/quota", adminCtl.UpdateUserQuota)
+
+				// 数据源健康端点（S1 健康滑窗：每 (源,能力) success/empty/error 与冷却状态）
+				admin.GET("/datasources", marketCtl.DataSources)
 
 				// 市场数据维护（手动触发批量同步/日历回填/情绪快照）
 				adminMarket := admin.Group("/market")

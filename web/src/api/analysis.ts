@@ -1,5 +1,5 @@
 import { request, AI_TIMEOUT } from './client'
-import type { EvidenceCheck, TrustReview, SysConfidence } from './trust'
+import type { EvidenceCheck, TrustReview, SysConfidence, RiskFlag } from './trust'
 
 export type AnalysisModule = 'market' | 'sector' | 'stock' | 'watchlist' | 'position'
 export type AnalysisStatus = 'success' | 'degraded' | 'failed'
@@ -100,6 +100,7 @@ export interface AnalysisView extends AnalysisRecord {
   result: AnalysisResult | null
   panel: PanelResult | null
   raw: string
+  risk_flags?: RiskFlag[] // 快照 risk_gate 程序化风险标志（S1，个股模块）
 }
 
 export function createAnalysis(req: AnalyzeRequest) {

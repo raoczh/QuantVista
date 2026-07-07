@@ -3,15 +3,26 @@ package datasource
 import (
 	"context"
 	"errors"
+	"strings"
+	"time"
 
 	"quantvista/common"
 )
 
 // Manager 按优先级编排多个 Adapter：主源失败时回退到下一个，
 // 上层只依赖内部标准结构，单源挂掉可整体切换（见 docs/DATA_SOURCES.md）。
+// S1 起各能力路由入口统一走 routeCap：健康滑窗踢源 + 两层超时预算 + 错误归一日志。
 type Manager struct {
 	adapters []Adapter // 按优先级排列，[0] 为主源
+	health   *HealthTracker
 }
+
+// 两层超时预算：总预算兜底（调用方自带 deadline 时尊重调用方），单源短预算超时即换源。
+// 单源预算须小于 doGet 的「2 次尝试 × 8s」最坏耗时，否则一个挂死的源会吃光总预算。
+const (
+	mgrTotalBudget  = 15 * time.Second
+	mgrSourceBudget = 6 * time.Second
+)
 
 // DefaultManager 默认编排：东财为主（数据最全），腾讯次之（稳定），新浪兜底（含日线/指数/榜单）。
 func DefaultManager() *Manager {
@@ -21,206 +32,229 @@ func DefaultManager() *Manager {
 			NewTencentAdapter(),
 			NewSinaAdapter(),
 		},
+		health: NewHealthTracker(),
 	}
 }
 
-// GetQuote 依次尝试各源，返回首个成功结果（含实际命中的 Source）。
-// 单个源失败只记 DEBUG（有备源兜底不必刷屏）；全部失败才记 WARN。
-func (m *Manager) GetQuote(ctx context.Context, market, symbol string) (*Quote, error) {
+// HealthSnapshot 各 (源,能力) 健康快照（GET /api/admin/datasources）。
+func (m *Manager) HealthSnapshot() []HealthStat { return m.health.Snapshot() }
+
+// classifyErr 错误归一：{code, outcome}。code 进日志，outcome 进健康滑窗。
+func classifyErr(err error) (string, callOutcome) {
+	switch {
+	case errors.Is(err, ErrNoData):
+		return "EMPTY", outcomeEmpty
+	case errors.Is(err, context.DeadlineExceeded) ||
+		strings.Contains(err.Error(), "context deadline exceeded") ||
+		strings.Contains(err.Error(), "Client.Timeout"):
+		return "UPSTREAM_TIMEOUT", outcomeError
+	case strings.Contains(err.Error(), "解析失败"):
+		return "PARSE_ERROR", outcomeError
+	default:
+		return "UPSTREAM_ERROR", outcomeError
+	}
+}
+
+// routeCap 能力路由通用骨架：
+//  1. 无 deadline 的调用补总预算，单源再包一层短预算（超预算即换下一源）；
+//  2. 冷却中的源先跳过；若一轮下来全军覆没，再对被跳过的源补跑一轮（宁可试坏源也不无脑报错）；
+//  3. ErrNotSupported 静默跳过（能力缺失非健康问题）；ErrSymbolInvalid 立即终止（换源无意义）；
+//  4. 其余错误归一为 {code, source, latency} 记 DEBUG 日志，并作为滑窗输入。
+//
+// 单源失败只记 DEBUG（有备源兜底不必刷屏）；全部失败由各入口记一条 WARN。
+func routeCap[T any](m *Manager, ctx context.Context, capability string, call func(ctx context.Context, a Adapter) (T, error)) (T, error) {
+	var zero T
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, mgrTotalBudget)
+		defer cancel()
+	}
+
 	var lastErr error
-	for _, a := range m.adapters {
-		q, err := a.GetQuote(ctx, market, symbol)
+	trySource := func(a Adapter) (T, bool, error) {
+		sctx, cancel := context.WithTimeout(ctx, mgrSourceBudget)
+		defer cancel()
+		start := time.Now()
+		r, err := call(sctx, a)
+		latency := time.Since(start).Milliseconds()
 		if err == nil {
-			return q, nil
+			m.health.Record(a.Name(), capability, outcomeSuccess, latency)
+			return r, true, nil
 		}
-		// 代码非法/不支持该市场无需换源重试。
+		if errors.Is(err, ErrNotSupported) || errors.Is(err, ErrSymbolInvalid) {
+			return zero, false, err // 不记滑窗：非源健康问题
+		}
+		code, outcome := classifyErr(err)
+		m.health.Record(a.Name(), capability, outcome, latency)
+		common.SysDebug("[datasource] code=%s source=%s cap=%s latency=%dms err=%v", code, a.Name(), capability, latency, err)
+		return zero, false, err
+	}
+
+	var cooled []Adapter
+	for _, a := range m.adapters {
+		if ctx.Err() != nil {
+			break
+		}
+		if !m.health.Available(a.Name(), capability) {
+			cooled = append(cooled, a)
+			continue
+		}
+		r, ok, err := trySource(a)
+		if ok {
+			return r, nil
+		}
 		if errors.Is(err, ErrSymbolInvalid) {
-			return nil, err
+			return zero, err
 		}
 		if !errors.Is(err, ErrNotSupported) {
-			common.SysDebug("数据源 %s 取行情失败 symbol=%s: %v", a.Name(), symbol, err)
+			lastErr = err
 		}
-		lastErr = err
+	}
+	// 补跑轮：健康源全部失败/缺席时，冷却中的源作为最后手段仍然一试。
+	for _, a := range cooled {
+		if ctx.Err() != nil {
+			break
+		}
+		r, ok, err := trySource(a)
+		if ok {
+			return r, nil
+		}
+		if errors.Is(err, ErrSymbolInvalid) {
+			return zero, err
+		}
+		if !errors.Is(err, ErrNotSupported) {
+			lastErr = err
+		}
 	}
 	if lastErr == nil {
 		lastErr = ErrNoData
 	}
-	common.SysWarn("所有数据源取行情失败 symbol=%s: %v", symbol, lastErr)
-	return nil, lastErr
+	return zero, lastErr
+}
+
+// GetQuote 依次尝试各源，返回首个成功结果（含实际命中的 Source）。
+func (m *Manager) GetQuote(ctx context.Context, market, symbol string) (*Quote, error) {
+	q, err := routeCap(m, ctx, "quote", func(ctx context.Context, a Adapter) (*Quote, error) {
+		return a.GetQuote(ctx, market, symbol)
+	})
+	if err != nil && !errors.Is(err, ErrSymbolInvalid) {
+		common.SysWarn("所有数据源取行情失败 symbol=%s: %v", symbol, err)
+	}
+	return q, err
 }
 
 // GetDailyBars 依次尝试支持日线的源：东财在前（fqt=1 前复权），腾讯不支持日线
 // 返回 ErrNotSupported 被跳过，新浪殿后兜底（无复权参数、无成交额）。
 func (m *Manager) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]Bar, error) {
-	var lastErr error
-	for _, a := range m.adapters {
-		bars, err := a.GetDailyBars(ctx, market, symbol, limit)
-		if err == nil {
-			for i := range bars {
-				if bars[i].Source == "" {
-					bars[i].Source = a.Name()
+	bars, err := routeCap(m, ctx, "daily_bars", func(ctx context.Context, a Adapter) ([]Bar, error) {
+		bs, berr := a.GetDailyBars(ctx, market, symbol, limit)
+		if berr == nil {
+			for i := range bs {
+				if bs[i].Source == "" {
+					bs[i].Source = a.Name()
 				}
 			}
-			return bars, nil
 		}
-		if errors.Is(err, ErrSymbolInvalid) {
-			return nil, err
-		}
-		if !errors.Is(err, ErrNotSupported) {
-			common.SysDebug("数据源 %s 取日线失败 symbol=%s: %v", a.Name(), symbol, err)
-		}
-		lastErr = err
+		return bs, berr
+	})
+	if err != nil && !errors.Is(err, ErrSymbolInvalid) {
+		common.SysWarn("所有数据源取日线失败 symbol=%s: %v", symbol, err)
 	}
-	if lastErr == nil {
-		lastErr = ErrNoData
-	}
-	common.SysWarn("所有数据源取日线失败 symbol=%s: %v", symbol, lastErr)
-	return nil, lastErr
+	return bars, err
 }
 
 // GetIndices 路由到实现 IndexProvider 的源（新浪批量优先）。
 func (m *Manager) GetIndices(ctx context.Context, market string) ([]Index, error) {
-	var lastErr error = ErrNotSupported
-	for _, a := range m.adapters {
+	return routeCap(m, ctx, "indices", func(ctx context.Context, a Adapter) ([]Index, error) {
 		p, ok := a.(IndexProvider)
 		if !ok {
-			continue
+			return nil, ErrNotSupported
 		}
-		r, err := p.GetIndices(ctx, market)
-		if err == nil {
-			return r, nil
-		}
-		common.SysDebug("数据源 %s 取指数失败: %v", a.Name(), err)
-		lastErr = err
-	}
-	return nil, lastErr
+		return p.GetIndices(ctx, market)
+	})
 }
 
 // GetStockRanking 路由到实现 RankingProvider 的源（新浪 Market_Center）。
 func (m *Manager) GetStockRanking(ctx context.Context, market, sort string, asc bool, limit int) ([]StockRank, error) {
-	var lastErr error = ErrNotSupported
-	for _, a := range m.adapters {
+	return routeCap(m, ctx, "ranking", func(ctx context.Context, a Adapter) ([]StockRank, error) {
 		p, ok := a.(RankingProvider)
 		if !ok {
-			continue
+			return nil, ErrNotSupported
 		}
-		r, err := p.GetStockRanking(ctx, market, sort, asc, limit)
-		if err == nil {
-			return r, nil
-		}
-		common.SysDebug("数据源 %s 取榜单失败 sort=%s: %v", a.Name(), sort, err)
-		lastErr = err
-	}
-	return nil, lastErr
+		return p.GetStockRanking(ctx, market, sort, asc, limit)
+	})
 }
 
 // GetSectorRanking 路由到实现 SectorProvider 的源（东财 clist，best-effort）。
 func (m *Manager) GetSectorRanking(ctx context.Context, market string, limit int) ([]SectorRank, error) {
-	var lastErr error = ErrNotSupported
-	for _, a := range m.adapters {
+	return routeCap(m, ctx, "sector", func(ctx context.Context, a Adapter) ([]SectorRank, error) {
 		p, ok := a.(SectorProvider)
 		if !ok {
-			continue
+			return nil, ErrNotSupported
 		}
-		r, err := p.GetSectorRanking(ctx, market, limit)
-		if err == nil {
-			return r, nil
-		}
-		common.SysDebug("数据源 %s 取板块榜失败: %v", a.Name(), err)
-		lastErr = err
-	}
-	return nil, lastErr
+		return p.GetSectorRanking(ctx, market, limit)
+	})
 }
 
 // GetBreadth 路由到实现 BreadthProvider 的源（东财涨跌分布）。
 func (m *Manager) GetBreadth(ctx context.Context, market string) (*Breadth, error) {
-	var lastErr error = ErrNotSupported
-	for _, a := range m.adapters {
+	return routeCap(m, ctx, "breadth", func(ctx context.Context, a Adapter) (*Breadth, error) {
 		p, ok := a.(BreadthProvider)
 		if !ok {
-			continue
+			return nil, ErrNotSupported
 		}
-		r, err := p.GetBreadth(ctx, market)
-		if err == nil {
-			return r, nil
-		}
-		common.SysDebug("数据源 %s 取涨跌家数失败: %v", a.Name(), err)
-		lastErr = err
-	}
-	return nil, lastErr
+		return p.GetBreadth(ctx, market)
+	})
 }
 
 // GetMarketFundFlow 路由到实现 FundFlowProvider 的源（东财两市资金流）。
 func (m *Manager) GetMarketFundFlow(ctx context.Context, market string) (*MarketFundFlow, error) {
-	var lastErr error = ErrNotSupported
-	for _, a := range m.adapters {
+	return routeCap(m, ctx, "fundflow", func(ctx context.Context, a Adapter) (*MarketFundFlow, error) {
 		p, ok := a.(FundFlowProvider)
 		if !ok {
-			continue
+			return nil, ErrNotSupported
 		}
-		r, err := p.GetMarketFundFlow(ctx, market)
-		if err == nil {
-			return r, nil
-		}
-		common.SysDebug("数据源 %s 取资金流失败: %v", a.Name(), err)
-		lastErr = err
-	}
-	return nil, lastErr
+		return p.GetMarketFundFlow(ctx, market)
+	})
 }
 
 // GetTradingDays 路由到实现 TradingDaysProvider 的源（新浪上证指数日线）。
 func (m *Manager) GetTradingDays(ctx context.Context, market string, limit int) ([]string, error) {
-	var lastErr error = ErrNotSupported
-	for _, a := range m.adapters {
+	return routeCap(m, ctx, "trading_days", func(ctx context.Context, a Adapter) ([]string, error) {
 		p, ok := a.(TradingDaysProvider)
 		if !ok {
-			continue
+			return nil, ErrNotSupported
 		}
-		r, err := p.GetTradingDays(ctx, market, limit)
-		if err == nil {
-			return r, nil
-		}
-		common.SysDebug("数据源 %s 取交易日失败: %v", a.Name(), err)
-		lastErr = err
-	}
-	return nil, lastErr
+		return p.GetTradingDays(ctx, market, limit)
+	})
+}
+
+// benchmarkResult GetBenchmarkBars 的双返回值打包（routeCap 单泛型参数）。
+type benchmarkResult struct {
+	name string
+	bars []Bar
 }
 
 // GetBenchmarkBars 路由到实现 BenchmarkBarsProvider 的源（新浪上证指数日线）。
 func (m *Manager) GetBenchmarkBars(ctx context.Context, market string, limit int) (string, []Bar, error) {
-	var lastErr error = ErrNotSupported
-	for _, a := range m.adapters {
+	r, err := routeCap(m, ctx, "benchmark", func(ctx context.Context, a Adapter) (benchmarkResult, error) {
 		p, ok := a.(BenchmarkBarsProvider)
 		if !ok {
-			continue
+			return benchmarkResult{}, ErrNotSupported
 		}
-		name, bars, err := p.GetBenchmarkBars(ctx, market, limit)
-		if err == nil {
-			return name, bars, nil
-		}
-		common.SysDebug("数据源 %s 取基准指数日线失败: %v", a.Name(), err)
-		lastErr = err
-	}
-	return "", nil, lastErr
+		name, bars, berr := p.GetBenchmarkBars(ctx, market, limit)
+		return benchmarkResult{name: name, bars: bars}, berr
+	})
+	return r.name, r.bars, err
 }
 
 // GetValuation 路由到实现 ValuationProvider 的源（腾讯行情自带估值字段）。
 func (m *Manager) GetValuation(ctx context.Context, market, symbol string) (*Valuation, error) {
-	var lastErr error = ErrNotSupported
-	for _, a := range m.adapters {
+	return routeCap(m, ctx, "valuation", func(ctx context.Context, a Adapter) (*Valuation, error) {
 		p, ok := a.(ValuationProvider)
 		if !ok {
-			continue
+			return nil, ErrNotSupported
 		}
-		r, err := p.GetValuation(ctx, market, symbol)
-		if err == nil {
-			return r, nil
-		}
-		if errors.Is(err, ErrSymbolInvalid) {
-			return nil, err
-		}
-		common.SysDebug("数据源 %s 取估值失败 symbol=%s: %v", a.Name(), symbol, err)
-		lastErr = err
-	}
-	return nil, lastErr
+		return p.GetValuation(ctx, market, symbol)
+	})
 }

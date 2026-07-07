@@ -1,4 +1,6 @@
-import { request, AI_TIMEOUT } from './client'
+import { request, AI_TIMEOUT, refreshAccessToken } from './client'
+import { getAccessToken } from './token'
+import type { RiskFlag } from './trust'
 
 export interface QaMessage {
   id: number
@@ -26,6 +28,7 @@ export interface QaConversation {
 
 export interface QaConversationView extends QaConversation {
   messages: QaMessage[]
+  risk_flags?: RiskFlag[] // 快照 risk_gate 程序化风险标志（S1）
 }
 
 export interface QaAskRequest {
@@ -39,6 +42,85 @@ export interface QaAskRequest {
 
 export function askQa(req: QaAskRequest) {
   return request<QaConversationView>({ url: '/qa/ask', method: 'post', data: req, timeout: AI_TIMEOUT })
+}
+
+// 流式问答 NDJSON 协议行（与后端 qaStreamLine 对齐；code 为批量场景预留、单标的恒空）。
+interface QaStreamLine {
+  module: string
+  code: string
+  status: 'streaming' | 'done' | 'error'
+  chunk?: string
+  message?: string
+  data?: QaConversationView
+}
+
+// askQaStream 流式提问（S1）：fetch + getReader 逐行读 application/x-ndjson，
+// 每个增量经 onChunk 回调；status=done 行携带最终会话视图（含后置核验徽章数据）。
+// axios 不支持浏览器端流式读取，此处单独走 fetch，401 时复用 client 的单飞刷新重试一次。
+export async function askQaStream(
+  req: QaAskRequest,
+  onChunk: (text: string) => void,
+): Promise<QaConversationView> {
+  const doFetch = () =>
+    fetch('/api/qa/ask-stream', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${getAccessToken() || ''}`,
+      },
+      body: JSON.stringify(req),
+    })
+
+  let resp = await doFetch()
+  if (resp.status === 401 && (await refreshAccessToken())) {
+    resp = await doFetch()
+  }
+  // 建流前的失败（参数绑定/鉴权）走标准 JSON 包络而非 NDJSON。
+  const ctype = resp.headers.get('content-type') || ''
+  if (!ctype.includes('x-ndjson')) {
+    let msg = `请求失败（HTTP ${resp.status}）`
+    try {
+      const body = (await resp.json()) as { success?: boolean; message?: string }
+      if (body?.message) msg = body.message
+    } catch {
+      /* 保留默认消息 */
+    }
+    throw new Error(msg)
+  }
+  if (!resp.body) throw new Error('当前浏览器不支持流式读取')
+
+  // 行缓冲状态机：网络分片与 NDJSON 行边界无关，按 \n 切分、残行滚入下一轮。
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  let final: QaConversationView | null = null
+  const handleLine = (raw: string) => {
+    const line = raw.trim()
+    if (!line) return
+    let parsed: QaStreamLine
+    try {
+      parsed = JSON.parse(line) as QaStreamLine
+    } catch {
+      return // 坏行容错跳过
+    }
+    if (parsed.status === 'streaming' && parsed.chunk) onChunk(parsed.chunk)
+    else if (parsed.status === 'error') throw new Error(parsed.message || '流式问答失败')
+    else if (parsed.status === 'done' && parsed.data) final = parsed.data
+  }
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (value) buf += decoder.decode(value, { stream: true })
+    const lines = buf.split('\n')
+    buf = lines.pop() || ''
+    for (const l of lines) handleLine(l)
+    if (done) {
+      buf += decoder.decode()
+      if (buf) handleLine(buf)
+      break
+    }
+  }
+  if (!final) throw new Error('流式响应异常中断，请重试（若已扣费可在会话列表查看是否已落库）')
+  return final
 }
 
 export function listConversations(limit = 30) {

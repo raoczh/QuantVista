@@ -26,6 +26,11 @@ func NewMarketService(mgr *datasource.Manager) *MarketService {
 
 const quoteCacheTTL = 10 * time.Second
 
+// DataSourceHealth 各 (数据源,能力) 健康滑窗快照（管理端 GET /api/admin/datasources）。
+func (s *MarketService) DataSourceHealth() []datasource.HealthStat {
+	return s.mgr.HealthSnapshot()
+}
+
 // GetQuote 取实时行情：先查缓存，miss 则走数据源，成功后落库并回种缓存。
 func (s *MarketService) GetQuote(ctx context.Context, market, symbol string) (*datasource.Quote, error) {
 	cacheKey := "quote:" + market + ":" + symbol

@@ -12,6 +12,7 @@ export interface UserPreference {
   blacklist_json: string // 候选池黑名单 [{symbol,market,reason}]
   min_candidate_amount: number // 候选池最低日成交额（元；0=不过滤）
   rec_filters_json: string // 推荐筛选默认值（RecFilters JSON；空=按类型默认）
+  total_capital: number // 总投资资金（元；0=未设置，持仓 AI 不注入资金上下文）
 }
 
 // 候选池黑名单条目。
