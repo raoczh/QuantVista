@@ -116,6 +116,41 @@ const snapshotText = computed(() => {
   }
 })
 
+// ---------- N2 今日重要事件（硬规则筛出，打分明细随快照落库） ----------
+interface ReportEvent {
+  title: string
+  source: string
+  time: string
+  score: number
+  src_level: number
+  impact: number
+  fund_sens: number
+  major?: boolean
+  sectors?: string[]
+  merged?: number
+  sentiment?: string
+}
+const events = computed<ReportEvent[]>(() => {
+  const raw = current.value?.snapshot_json
+  if (!raw) return []
+  try {
+    const snap = JSON.parse(raw)
+    return Array.isArray(snap?.events_today) ? (snap.events_today as ReportEvent[]) : []
+  } catch {
+    return []
+  }
+})
+function eventScoreTip(e: ReportEvent) {
+  return `打分 ${e.score} = 来源级别 ${e.src_level} + 影响范围 ${e.impact} + 资金敏感度 ${e.fund_sens}${
+    e.merged ? `；同主线合并 ${e.merged} 条` : ''
+  }`
+}
+function sentiColor(s?: string) {
+  if (s === '利好') return pctColor(1)
+  if (s === '利空') return pctColor(-1)
+  return ''
+}
+
 onMounted(load)
 </script>
 
@@ -178,6 +213,26 @@ onMounted(load)
           <div class="review">
             <p class="summary">{{ current.review.summary }}</p>
             <div class="block"><span class="bk">大盘</span><p>{{ current.review.market_review }}</p></div>
+            <div v-if="events.length || current.review.events_review" class="block">
+              <span class="bk">事件</span>
+              <div class="events">
+                <p v-if="current.review.events_review">{{ current.review.events_review }}</p>
+                <div v-for="(e, i) in events" :key="i" class="event-row">
+                  <span class="ev-time qv-tnum">{{ e.time }}</span>
+                  <n-tag v-if="e.major" size="tiny" round :bordered="false" type="error">重磅</n-tag>
+                  <span class="ev-title">{{ e.title }}</span>
+                  <span v-if="e.sentiment && sentiColor(e.sentiment)" class="ev-senti" :style="{ color: sentiColor(e.sentiment) }">{{
+                    e.sentiment
+                  }}</span>
+                  <n-tooltip trigger="hover">
+                    <template #trigger>
+                      <span class="ev-score qv-tnum">{{ e.score }}</span>
+                    </template>
+                    {{ eventScoreTip(e) }}
+                  </n-tooltip>
+                </div>
+              </div>
+            </div>
             <div class="block"><span class="bk">持仓</span><p>{{ current.review.position_review }}</p></div>
             <div class="block"><span class="bk">自选</span><p>{{ current.review.watch_review }}</p></div>
             <div v-if="current.review.risk_warnings?.length" class="block warn">
@@ -311,6 +366,42 @@ onMounted(load)
   font-weight: 600;
   opacity: 0.6;
   padding-top: 3px;
+}
+.events {
+  flex: 1;
+  min-width: 0;
+}
+.events > p {
+  margin: 0 0 8px;
+  line-height: 1.7;
+}
+.event-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.ev-time {
+  flex-shrink: 0;
+  font-size: 12px;
+  opacity: 0.5;
+}
+.ev-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.ev-senti {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 600;
+}
+.ev-score {
+  flex-shrink: 0;
+  font-size: 12px;
+  opacity: 0.55;
+  cursor: help;
 }
 .recs {
   display: flex;

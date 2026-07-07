@@ -45,6 +45,7 @@
 - 日报明日推荐与手动推荐完全同链路（GenerateAuto→generate），筛选偏好 `rec_filters_json` 对两者同时生效；自动链路不触发 AI 复核、不计次数配额。
 - prompt/策略改动须递增版本号（分析 `analysisPromptVersion`、推荐 prompt/strategy 版本），保证历史记录可复现可归因。
 - **新闻采集（N1）上游口径**（2026-07-06 实测）：财联社只有 `/v1/roll/get_roll_list` 活着，`sign = md5hex(sha1hex(按参数名字典序的 querystring))`，老 nodeapi 已死；东财快讯 `req_trace`（uuid hex）缺失返回空，`stockList` 是**字符串数组**（"1.688035"/"90.BK1175"，别按对象数组解析）；东财个股新闻 search-api 标准 Go client 实测**可用**（无需 utls，但保留「单只失败整轮降级」逻辑防日后被指纹拦截）。去重 Dice 阈值 0.85 是「尾部增删判重、改动较大放行」的实测锚点，调低会误杀无关新闻。
+- **新闻→AI 信号（N2）防回归**（2026-07-07）：①`News.Sentiment` 空串=未增强、增强后恒为 positive/negative/neutral——增强失败也要走规则兜底落枚举值，别留空串（会被每轮重挑反复烧 token）；②两个幂等键分清：逐条增强按 news.id、个股聚合情绪分按 (symbol,date) 唯一索引+包级 mutex+map 合并（stock_sentiments 一天一行，当日后来的新闻不改已落库分——有意设计，保证推荐批次内证据可复现）；③LLM 增强挂**首个管理员默认配置**、consumeQuota(adminID, tokens, false) 只记审计不扣次；成本分级（P1/P2 全量、P3 规则先行缺板块才简化 LLM 且每轮≤10 条）别拉平；④related_sectors 必须过 `newsSectorWhitelist` 白名单（防幻觉板块），LLM 输出方向与分数矛盾时以方向为准分数归 0；⑤新闻标题是「文本型合法来源」：分析 fillAnalysisTrust / 问答 Ask / 日报 dailyReviewEvidence 三处都已把标题 decimalNumbersIn 并入核验值域，新增消费方照此办理（否则忠实引用标题里的数字会被误报幻觉）；⑥日报事件段 4 步硬规则在 `newsevent.go`（LLM 只写 events_review 摘要），黑名单/打分/合并/TopN 都是纯函数有单测，调阈值先跑 `TestSelectReportEvents*`；⑦推荐 senti 因子只在 SentiNews>0 时动分（无新闻≠中性 0 分证据），senti_score 已进 candidateValueSet 核验值域；本批版本号：分析 p6、问答 q4、推荐 p6/s4。
 
 ## 4. 未完成项与储备（按数据源可得性推进）
 

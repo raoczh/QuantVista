@@ -7,6 +7,7 @@ import type { EvidenceCheck } from './trust'
 export interface DailyReview {
   summary: string
   market_review: string
+  events_review?: string // N2 今日重要事件解读（事件由硬规则筛出、LLM 只写摘要；旧日报无此字段）
   position_review: string
   watch_review: string
   risk_warnings: string[]

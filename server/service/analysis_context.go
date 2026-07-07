@@ -150,6 +150,29 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 		snap["bars_note"] = "日线数据暂不可用"
 	}
 
+	// N2 舆情段：最近 5 条相关新闻标题+情绪标签；无新闻时注入程序算好的
+	// 涨跌五档/量能三档/换手率并明示「暂无直接相关新闻」（fallback 让模型
+	// 有确定性的市场信号可依，而不是围绕消息面自由发挥）。仅 A 股 6 位代码口径。
+	if mkt == "cn" && len(symbol) == 6 && !isCNFund(symbol) {
+		if briefs := latestNewsBriefs(symbol, 5); len(briefs) > 0 {
+			snap["news"] = map[string]any{
+				"items": briefs,
+				"note":  "该股最近相关新闻的标题与情绪标签（利好/利空/中性为程序化预判，仅供参考，不保证完整覆盖）",
+			}
+		} else {
+			turnover := 0.0
+			if val, ok := snap["valuation"].(map[string]any); ok {
+				if t, ok := val["turnover_rate"].(float64); ok {
+					turnover = t
+				}
+			}
+			snap["news"] = map[string]any{
+				"note":           "暂无直接相关新闻，请按以下市场信号判断，不得臆测消息面",
+				"market_signals": fallbackMarketSignals(q.ChangePct, bars, turnover),
+			}
+		}
+	}
+
 	label := q.Name
 	if label == "" {
 		label = q.Symbol
@@ -461,4 +484,47 @@ func snapSize(snap map[string]any) int {
 		return 0
 	}
 	return len([]rune(string(b)))
+}
+
+// fallbackMarketSignals 无新闻时的程序化市场信号（N2 舆情段 fallback，纯函数可测）：
+// 涨跌五档 + 量能三档（今日量/前5日均量）+ 换手率。分档标签为定性文字，
+// 数值字段留给 snapshotValueSet 自动进核验值域。
+func fallbackMarketSignals(changePct float64, bars []datasource.Bar, turnoverRate float64) map[string]any {
+	band := "平稳(±1%)"
+	switch {
+	case changePct >= 5:
+		band = "大涨(≥5%)"
+	case changePct >= 1:
+		band = "上涨(1%~5%)"
+	case changePct <= -5:
+		band = "大跌(≤-5%)"
+	case changePct <= -1:
+		band = "下跌(-5%~-1%)"
+	}
+	out := map[string]any{"change_band": band}
+
+	// 量能三档：今日量 / 前 5 日均量（与 recfactor 的 VolBoost 同口径）。
+	if n := len(bars); n >= 6 {
+		var prev5 float64
+		for _, b := range bars[n-6 : n-1] {
+			prev5 += float64(b.Volume)
+		}
+		prev5 /= 5
+		if prev5 > 0 {
+			ratio := round2(float64(bars[n-1].Volume) / prev5)
+			vb := "平量"
+			switch {
+			case ratio >= 1.5:
+				vb = "放量"
+			case ratio < 0.7:
+				vb = "缩量"
+			}
+			out["volume_band"] = vb
+			out["volume_vs_5d_avg"] = ratio
+		}
+	}
+	if turnoverRate > 0 {
+		out["turnover_rate"] = round2(turnoverRate)
+	}
+	return out
 }

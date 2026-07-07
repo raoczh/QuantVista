@@ -13,8 +13,8 @@ import {
   type Valuation,
   type StockScore,
 } from '@/api/market'
-import { getNews, newsSourceLabel, type NewsItem } from '@/api/news'
-import { useUi } from '@/composables/useUi'
+import { getNews, newsSourceLabel, sentimentTag, type NewsItem } from '@/api/news'
+import { useUi, withAlpha } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import { useStockActions } from '@/composables/useStockActions'
 import { isEtfSymbol } from '@/api/etf'
@@ -37,6 +37,12 @@ const valuation = ref<Valuation | null>(null)
 const score = ref<StockScore | null>(null)
 const bars = ref<Bar[]>([])
 const news = ref<NewsItem[]>([])
+
+// 情绪标签（N2）：利好/利空才渲染，颜色随涨跌色主题。
+function sentiView(n: NewsItem): { text: string; color: string } | null {
+  const t = sentimentTag(n)
+  return t ? { text: t.text, color: pctColor(t.dir) } : null
+}
 const loading = ref(false)
 const loadError = ref('')
 
@@ -293,6 +299,11 @@ function scoreType(total: number) {
                 class="news-title"
               >{{ n.title }}</a>
               <span v-else class="news-title">{{ n.title }}</span>
+              <span
+                v-if="sentiView(n)"
+                class="news-senti"
+                :style="{ color: sentiView(n)!.color, background: withAlpha(sentiView(n)!.color, isDark ? 0.16 : 0.1) }"
+              >{{ sentiView(n)!.text }}</span>
               <span class="news-src">{{ newsSourceLabel(n) }}</span>
             </div>
           </div>
@@ -454,6 +465,14 @@ a.news-title:hover {
   flex-shrink: 0;
   font-size: 11px;
   opacity: 0.5;
+}
+.news-senti {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 0 7px;
+  border-radius: 999px;
+  line-height: 18px;
 }
 
 @media (max-width: 768px) {
