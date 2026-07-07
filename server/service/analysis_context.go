@@ -178,6 +178,12 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 				"market_signals": fallbackMarketSignals(q.ChangePct, bars, turnover),
 			}
 		}
+		// F2 财务段：F10 主要财务指标最新一期 + 近 8 期趋势（缓存优先，缺失按需拉一次）。
+		// 数值叶子会被 snapshotValueSet 自动并入证据核验值域。无数据不注入，
+		// prompt 已声明缺失时如实说明。
+		if fin := financeBrief(ctx, symbol); fin != nil {
+			snap["finance"] = fin
+		}
 		// F1 公告段：最近 5 条公告标题+类型+日期（公告 > 新闻报道的证据权重；
 		// 覆盖面为已采集库存，best-effort；无公告不注入，prompt 已声明覆盖有限）。
 		if anns := latestAnnouncementBriefs(symbol, 5); len(anns) > 0 {

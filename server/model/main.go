@@ -45,6 +45,8 @@ func AllModels() []any {
 		&EarningsExpress{},
 		&DisclosureSchedule{},
 		&Announcement{},
+		&FinanceIndicator{},
+		&FinanceStatement{},
 	}
 }
 

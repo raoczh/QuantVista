@@ -85,3 +85,58 @@ type Announcement struct {
 
 	CreatedAt time.Time `json:"created_at"`
 }
+
+// FinanceIndicator F10 主要财务指标（F2，RPT_F10_FINANCE_MAINFINADATA，单请求 200 期）。
+// 按需拉取+缓存（个股详情/推荐候选首次访问触发，不做全市场普查），可由上游重建。
+// 金额单位：元；比率单位：%。上游 null 落 0（消费方按 0=缺失处理，与估值快照惯例一致）。
+type FinanceIndicator struct {
+	ID         int64  `gorm:"primaryKey" json:"id"`
+	Symbol     string `gorm:"size:16;uniqueIndex:idx_finind_key" json:"symbol"`
+	Market     string `gorm:"size:8;uniqueIndex:idx_finind_key" json:"market"`
+	ReportDate string `gorm:"size:10;uniqueIndex:idx_finind_key" json:"report_date"`
+	ReportName string `gorm:"size:16" json:"report_name"` // 「2026一季报」（REPORT_DATE_NAME）
+	NoticeDate string `gorm:"size:10" json:"notice_date"`
+
+	EPS             float64 `json:"eps"`               // 基本每股收益（EPSJB，元）
+	BPS             float64 `json:"bps"`               // 每股净资产
+	OCFPS           float64 `gorm:"column:ocf_ps" json:"ocf_ps"` // 每股经营现金流（MGJYXJJE）
+	Revenue         float64 `json:"revenue"`                                             // 营业总收入（元）
+	RevenueYoY      float64 `gorm:"column:revenue_yoy" json:"revenue_yoy"`               // 营收同比 %
+	NetProfit       float64 `json:"net_profit"`                                          // 归母净利润（元）
+	NetProfitYoY    float64 `gorm:"column:net_profit_yoy" json:"net_profit_yoy"`         // 净利同比 %
+	DeductProfit    float64 `json:"deduct_profit"`                                       // 扣非净利润（元）
+	DeductProfitYoY float64 `gorm:"column:deduct_profit_yoy" json:"deduct_profit_yoy"`   // 扣非同比 %
+	ROE             float64 `json:"roe"`               // 加权平均 ROE %
+	GrossMargin     float64 `json:"gross_margin"`      // 销售毛利率 %
+	NetMargin       float64 `json:"net_margin"`        // 销售净利率 %
+	DebtRatio       float64 `json:"debt_ratio"`        // 资产负债率 %
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// FinanceStatement 三大报表关键科目（F2 二阶段：emweb 三表按报告期合并为一行，
+// 最近 8 期，供 AI 上下文与详情页；全表明细后置）。金额单位：元。
+type FinanceStatement struct {
+	ID         int64  `gorm:"primaryKey" json:"id"`
+	Symbol     string `gorm:"size:16;uniqueIndex:idx_finstmt_key" json:"symbol"`
+	Market     string `gorm:"size:8;uniqueIndex:idx_finstmt_key" json:"market"`
+	ReportDate string `gorm:"size:10;uniqueIndex:idx_finstmt_key" json:"report_date"`
+
+	MonetaryFunds    float64 `json:"monetary_funds"`    // 货币资金
+	AccountsRece     float64 `json:"accounts_rece"`     // 应收账款
+	Inventory        float64 `json:"inventory"`         // 存货
+	TotalAssets      float64 `json:"total_assets"`
+	TotalLiabilities float64 `json:"total_liabilities"`
+	TotalEquity      float64 `json:"total_equity"`
+	OperateIncome    float64 `json:"operate_income"`  // 营业总收入
+	OperateCost      float64 `json:"operate_cost"`    // 营业成本
+	OperateProfit    float64 `json:"operate_profit"`  // 营业利润
+	RDExpense        float64 `json:"rd_expense"`      // 研发费用
+	NetcashOperate   float64 `json:"netcash_operate"` // 经营现金流净额
+	NetcashInvest    float64 `json:"netcash_invest"`
+	NetcashFinance   float64 `json:"netcash_finance"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}

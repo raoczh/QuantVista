@@ -19,6 +19,7 @@ import {
 } from '@/api/market'
 import { getNews, newsSourceLabel, sentimentTag, type NewsItem } from '@/api/news'
 import { getAnnouncements, type AnnouncementItem } from '@/api/announcement'
+import { getStockFinance, type StockFinance } from '@/api/finance'
 import { useUi, withAlpha } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import { useStockActions } from '@/composables/useStockActions'
@@ -45,6 +46,7 @@ const indicators = ref<IndicatorSeries | null>(null)
 const chips = ref<ChipDist | null>(null)
 const news = ref<NewsItem[]>([])
 const announcements = ref<AnnouncementItem[]>([])
+const finance = ref<StockFinance | null>(null)
 
 // 情绪标签（N2）：利好/利空才渲染，颜色随涨跌色主题。
 function sentiView(n: NewsItem): { text: string; color: string } | null {
@@ -66,6 +68,8 @@ const chipEl = ref<HTMLDivElement | null>(null)
 let chipChart: echarts.ECharts | null = null
 const chipTrendEl = ref<HTMLDivElement | null>(null)
 let chipTrendChart: echarts.ECharts | null = null
+const finEl = ref<HTMLDivElement | null>(null)
+let finChart: echarts.ECharts | null = null
 
 async function load(silent = false) {
   if (!symbol.value) return
@@ -88,6 +92,15 @@ async function load(silent = false) {
     getAnnouncements(symbol.value, 15)
       .then((r) => (announcements.value = r))
       .catch(() => (announcements.value = []))
+    // 财务摘要（F2）best-effort：A 股非基金才有；容器在 v-if 内，等 DOM 后挂图。
+    if (market.value === 'cn' && !isFund.value) {
+      getStockFinance(market.value, symbol.value)
+        .then((r) => {
+          finance.value = r
+          nextTick(() => renderFinanceChart())
+        })
+        .catch(() => (finance.value = null))
+    }
     // 指标副图 / 筹码分布 best-effort：失败时 K 线退回单图、筹码卡显示占位。
     getIndicators(market.value, symbol.value, 120)
       .then((r) => {
@@ -293,9 +306,50 @@ function renderChipCharts() {
   }
 }
 
+// 财务摘要图（F2）：近 8 期营收/净利柱（左轴，亿元）+ ROE/毛利率线（右轴，%）。
+function renderFinanceChart() {
+  const inds = finance.value?.indicators
+  if (!finEl.value || !inds?.length) return
+  finChart?.dispose()
+  finChart = echarts.init(finEl.value, isDark.value ? 'dark' : undefined)
+  const up = vars.value.errorColor
+  const primary = vars.value.primaryColor
+  const warn = vars.value.warningColor
+  const labels = inds.map((r) => r.report_name || r.report_date)
+  finChart.setOption({
+    backgroundColor: 'transparent',
+    tooltip: { trigger: 'axis', confine: true },
+    legend: {
+      top: 0,
+      data: ['营收(亿)', '净利(亿)', 'ROE%', '毛利率%'],
+      textStyle: { color: vars.value.textColor3, fontSize: 11 },
+      itemWidth: 14,
+      itemHeight: 8,
+    },
+    grid: { left: 56, right: 48, top: 30, bottom: 28 },
+    xAxis: { type: 'category', data: labels, axisLabel: { fontSize: 10, interval: 0, rotate: labels.length > 5 ? 30 : 0 } },
+    yAxis: [
+      { type: 'value', scale: true, splitLine: { lineStyle: { opacity: 0.3 } }, axisLabel: { fontSize: 10 } },
+      { type: 'value', scale: true, splitLine: { show: false }, axisLabel: { formatter: '{value}%', fontSize: 10 } },
+    ],
+    series: [
+      { type: 'bar', name: '营收(亿)', data: inds.map((r) => Math.round(r.revenue / 1e6) / 100), itemStyle: { color: withAlpha(primary, 0.75) }, barMaxWidth: 22 },
+      { type: 'bar', name: '净利(亿)', data: inds.map((r) => Math.round(r.net_profit / 1e6) / 100), itemStyle: { color: withAlpha(up, 0.75) }, barMaxWidth: 22 },
+      { type: 'line', name: 'ROE%', yAxisIndex: 1, data: inds.map((r) => r.roe), symbolSize: 5, lineStyle: { width: 2, color: warn }, itemStyle: { color: warn } },
+      { type: 'line', name: '毛利率%', yAxisIndex: 1, data: inds.map((r) => r.gross_margin), symbolSize: 5, lineStyle: { width: 2, type: 'dashed', color: vars.value.infoColor }, itemStyle: { color: vars.value.infoColor } },
+    ],
+  })
+}
+
+const finLatest = computed(() => {
+  const inds = finance.value?.indicators
+  return inds?.length ? inds[inds.length - 1] : null
+})
+
 watch(isDark, () => {
   renderChart()
   renderChipCharts()
+  renderFinanceChart()
 })
 // 同页跳转到另一只个股（如从对比/搜索进来）时整页重载。
 watch([market, symbol], () => {
@@ -303,6 +357,7 @@ watch([market, symbol], () => {
   score.value = null
   indicators.value = null
   chips.value = null
+  finance.value = null
   news.value = []
   announcements.value = []
   load()
@@ -320,11 +375,14 @@ onBeforeUnmount(() => {
   chipChart = null
   chipTrendChart?.dispose()
   chipTrendChart = null
+  finChart?.dispose()
+  finChart = null
 })
 function onResize() {
   chart?.resize()
   chipChart?.resize()
   chipTrendChart?.resize()
+  finChart?.resize()
 }
 useAutoRefresh(() => load(true), 60_000)
 
@@ -514,6 +572,29 @@ function scoreType(total: number) {
           </n-gi>
         </n-grid>
 
+        <!-- 财务摘要（F2）：F10 主要指标近 8 期，营收/净利柱 + ROE/毛利率线 -->
+        <SectionCard v-if="market === 'cn' && !isFund" title="财务摘要（近 8 期）">
+          <template #extra>
+            <span class="src-hint">东财 F10 · 季报口径</span>
+          </template>
+          <div v-if="finance && finance.indicators.length" class="fin-wrap">
+            <div v-if="finLatest" class="quote-grid fin-grid">
+              <div class="qc"><span class="qc-k">报告期</span><span class="qc-v">{{ finLatest.report_name }}</span></div>
+              <div class="qc"><span class="qc-k">EPS</span><span class="qc-v qv-tnum">{{ finLatest.eps.toFixed(2) }}</span></div>
+              <div class="qc"><span class="qc-k">ROE</span><span class="qc-v qv-tnum">{{ finLatest.roe.toFixed(2) }}%</span></div>
+              <div class="qc"><span class="qc-k">营收同比</span><span class="qc-v qv-tnum" :style="{ color: pctColor(finLatest.revenue_yoy) }">{{ finLatest.revenue_yoy.toFixed(1) }}%</span></div>
+              <div class="qc"><span class="qc-k">净利同比</span><span class="qc-v qv-tnum" :style="{ color: pctColor(finLatest.net_profit_yoy) }">{{ finLatest.net_profit_yoy.toFixed(1) }}%</span></div>
+              <div class="qc"><span class="qc-k">毛利率</span><span class="qc-v qv-tnum">{{ finLatest.gross_margin.toFixed(1) }}%</span></div>
+              <div class="qc"><span class="qc-k">净利率</span><span class="qc-v qv-tnum">{{ finLatest.net_margin.toFixed(1) }}%</span></div>
+              <div class="qc"><span class="qc-k">资产负债率</span><span class="qc-v qv-tnum">{{ finLatest.debt_ratio.toFixed(1) }}%</span></div>
+              <div class="qc"><span class="qc-k">每股经营现金流</span><span class="qc-v qv-tnum">{{ finLatest.ocf_ps.toFixed(2) }}</span></div>
+            </div>
+            <div ref="finEl" class="fin-chart"></div>
+            <div class="src-hint">季报为累计口径且有披露滞后；0 值可能表示上游数据缺失；仅研究参考。</div>
+          </div>
+          <n-empty v-else description="暂无财务数据（东财 F10，A 股标的；首次访问自动拉取，可稍后刷新）" />
+        </SectionCard>
+
         <!-- 公告（F1）：东财公告源，标题链到原文；采集范围外的股查询时按需补拉 -->
         <SectionCard title="公告">
           <div v-if="announcements.length" class="news-list">
@@ -667,6 +748,25 @@ function scoreType(total: number) {
 .src-hint {
   font-size: 12px;
   opacity: 0.55;
+}
+
+/* ---------- 财务摘要 ---------- */
+.fin-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.fin-grid {
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+}
+.fin-chart {
+  width: 100%;
+  height: 300px;
+}
+@media (max-width: 768px) {
+  .fin-chart {
+    height: 240px;
+  }
 }
 .score {
   display: flex;

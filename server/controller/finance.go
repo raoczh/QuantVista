@@ -39,3 +39,15 @@ func (fc *FinanceController) Announcements(c *gin.Context) {
 	}
 	common.ApiSuccess(c, rows)
 }
+
+// StockFinance GET /api/markets/:market/stocks/:symbol/finance
+// 个股详情「财务」块：最近 8 期主要指标与三表关键科目（升序）。首次访问触发
+// 按需同步（F10 单请求 + 三表约 7 次上游请求，冷却 1h），非 A 股口径返回空集。
+func (fc *FinanceController) StockFinance(c *gin.Context) {
+	out, err := fc.svc.FinanceOverview(c.Request.Context(), c.Param("symbol"))
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, out)
+}
