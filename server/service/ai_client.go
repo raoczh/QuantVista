@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -310,4 +311,120 @@ func estimateUsage(messages []chatMessage, content string) chatUsage {
 	}
 	u.TotalTokens = u.PromptTokens + u.CompletionTokens
 	return u
+}
+
+// --- 流式补全（S1）---
+
+// chatCompletionStream 发起一次流式补全（SSE）：逐行剥 "data: " 前缀解析 delta.content，
+// 每个增量经 onDelta 回调吐出（调用方负责推给前端）；[DONE] 或 finish_reason 终止。
+// 返回聚合后的完整内容与 usage（部分兼容端点会在最后一个 chunk 带 usage，缺失则字符粗估）。
+// 不做 JSON mode（流式只用于自由文本模块），不做状态码重试（流一旦建立，中断即失败——
+// 半截内容重试会让用户看到重复文本）；建立连接前的错误分类与非流式一致。
+func chatCompletionStream(ctx context.Context, p chatParams, onDelta func(string)) (*chatResult, error) {
+	u, err := url.Parse(p.BaseURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, errors.New("Base URL 非法（仅支持 http/https）")
+	}
+	endpoint := chatCompletionsURL(p.BaseURL)
+
+	payload := map[string]any{
+		"model":       p.Model,
+		"messages":    p.Messages,
+		"temperature": p.Temperature,
+		"stream":      true,
+	}
+	if p.MaxTokens > 0 {
+		payload["max_tokens"] = p.MaxTokens
+	}
+	body, _ := json.Marshal(payload)
+
+	client := aiHTTPClient(p.AllowPrivate)
+	send := func() (*http.Response, error) {
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if rerr != nil {
+			return nil, rerr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+		req.Header.Set("Accept", "text/event-stream")
+		return client.Do(req)
+	}
+
+	start := time.Now()
+	resp, err := send()
+	if err != nil && transientNetErr(ctx, err) {
+		time.Sleep(aiRetryBackoff)
+		resp, err = send()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", resp.StatusCode, statusHint(resp.StatusCode), extractErr(raw))
+	}
+
+	// SSE 逐行状态机：每行形如 "data: {...}"；空行为事件分隔；"data: [DONE]" 结束。
+	var sb strings.Builder
+	var usage chatUsage
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 64<<10), 1<<20) // 单行上限 1MB（长 delta/大 usage 容错）
+	done := false
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, ":") { // 空行/注释行
+			continue
+		}
+		data, ok := strings.CutPrefix(line, "data:")
+		if !ok {
+			continue
+		}
+		data = strings.TrimSpace(data)
+		if data == "[DONE]" {
+			done = true
+			break
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+			Usage *chatUsage `json:"usage"`
+		}
+		if json.Unmarshal([]byte(data), &chunk) != nil {
+			continue // 单个坏 chunk 容错跳过
+		}
+		if chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
+			usage = *chunk.Usage
+		}
+		for _, c := range chunk.Choices {
+			if c.Delta.Content != "" {
+				sb.WriteString(c.Delta.Content)
+				if onDelta != nil {
+					onDelta(c.Delta.Content)
+				}
+			}
+			if c.FinishReason != nil && *c.FinishReason != "" {
+				done = true
+			}
+		}
+		if done {
+			break
+		}
+	}
+	if err := sc.Err(); err != nil && !done {
+		// 流中断且未正常收尾：已有内容也判失败（半截回答不落库，让调用方决定重试）。
+		return nil, fmt.Errorf("流式响应中断: %w", err)
+	}
+	content := sb.String()
+	if strings.TrimSpace(content) == "" {
+		return nil, errors.New("LLM 返回空内容")
+	}
+	if usage.TotalTokens == 0 {
+		usage = estimateUsage(p.Messages, content)
+	}
+	return &chatResult{Content: content, Usage: usage, LatencyMs: time.Since(start).Milliseconds()}, nil
 }

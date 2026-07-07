@@ -40,14 +40,76 @@ type QaAskRequest struct {
 	AnalysisRecordID int64  `json:"analysis_record_id"` // >0：新会话复用该分析记录快照（须本人的个股分析）
 }
 
-// QaConversationView 会话 + 消息列表。
+// QaConversationView 会话 + 消息列表。RiskFlags 为快照 risk_gate 的程序化风险标志
+//（S1：详情不回传大快照，风险标志单独解析回传供 UI 展示）。
 type QaConversationView struct {
 	model.AiConversation
-	Messages []model.AiConversationMessage `json:"messages"`
+	Messages  []model.AiConversationMessage `json:"messages"`
+	RiskFlags []riskFlag                    `json:"risk_flags,omitempty"`
 }
 
-// Ask 提问：新建会话（首轮采集快照）或在已有会话上追问。返回会话全量视图。
+// qaAskContext 一次提问的准备产物：prepare 与 finalize 之间的共享状态
+//（流式与非流式两条路径共用同一套准备/收尾，保证快照、核验、落库口径完全一致）。
+type qaAskContext struct {
+	conv     model.AiConversation
+	isNew    bool
+	question string
+	history  []model.AiConversationMessage
+	messages []chatMessage
+	cfg      *model.LLMConfig
+	apiKey   string
+}
+
+// Ask 提问（非流式）：新建会话（首轮采集快照）或在已有会话上追问。返回会话全量视图。
 func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, req QaAskRequest) (*QaConversationView, error) {
+	ac, err := s.prepareAsk(ctx, userID, req)
+	if err != nil {
+		return nil, err
+	}
+	res, callErr := chatCompletion(ctx, chatParams{
+		BaseURL: ac.cfg.BaseURL, APIKey: ac.apiKey, Model: ac.cfg.Model,
+		Temperature: ac.cfg.Temperature, MaxTokens: ac.cfg.MaxTokens,
+		Messages: ac.messages, JSONMode: false, AllowPrivate: allowPrivate,
+	})
+	if callErr != nil {
+		s.abortNewConv(ac)
+		return nil, callErr
+	}
+	return s.finalizeAsk(userID, ac, res)
+}
+
+// AskStream 流式提问（S1）：delta 增量经 onDelta 回调吐给调用方（controller 逐行推 NDJSON），
+// 流结束后走与非流式完全相同的收尾（证据核验落 CheckJSON → 落库 → 配额），核验徽章由
+// 最终返回的会话视图后置更新。LLM 配置关闭了 stream 时退回非流式调用、整段作为单个增量吐出。
+func (s *QaService) AskStream(ctx context.Context, userID int64, allowPrivate bool, req QaAskRequest, onDelta func(string)) (*QaConversationView, error) {
+	ac, err := s.prepareAsk(ctx, userID, req)
+	if err != nil {
+		return nil, err
+	}
+	params := chatParams{
+		BaseURL: ac.cfg.BaseURL, APIKey: ac.apiKey, Model: ac.cfg.Model,
+		Temperature: ac.cfg.Temperature, MaxTokens: ac.cfg.MaxTokens,
+		Messages: ac.messages, JSONMode: false, AllowPrivate: allowPrivate,
+	}
+	var res *chatResult
+	var callErr error
+	if ac.cfg.Stream {
+		res, callErr = chatCompletionStream(ctx, params, onDelta)
+	} else {
+		res, callErr = chatCompletion(ctx, params)
+		if callErr == nil && onDelta != nil {
+			onDelta(res.Content)
+		}
+	}
+	if callErr != nil {
+		s.abortNewConv(ac)
+		return nil, callErr
+	}
+	return s.finalizeAsk(userID, ac, res)
+}
+
+// prepareAsk 校验入参、解析 LLM 配置与配额、取得/新建会话、组装消息序列。
+func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskRequest) (*qaAskContext, error) {
 	question := strings.TrimSpace(req.Question)
 	if question == "" {
 		return nil, errors.New("问题不能为空")
@@ -104,20 +166,22 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 	if err != nil {
 		return nil, err
 	}
-	messages := s.buildMessages(conv, history, question)
+	return &qaAskContext{
+		conv: conv, isNew: isNewConv, question: question, history: history,
+		messages: s.buildMessages(conv, history, question),
+		cfg:      cfg, apiKey: apiKey,
+	}, nil
+}
 
-	res, callErr := chatCompletion(ctx, chatParams{
-		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model,
-		Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
-		Messages: messages, JSONMode: false, AllowPrivate: allowPrivate,
-	})
-	if callErr != nil {
-		// 新会话首问失败：删除刚建的空会话，避免列表堆积 0 消息的孤儿会话。
-		if isNewConv {
-			common.DB.Delete(&model.AiConversation{}, conv.ID)
-		}
-		return nil, callErr
+// abortNewConv 调用失败时清理刚建的空会话，避免列表堆积 0 消息的孤儿会话。
+func (s *QaService) abortNewConv(ac *qaAskContext) {
+	if ac.isNew && ac.conv.ID > 0 {
+		common.DB.Delete(&model.AiConversation{}, ac.conv.ID)
 	}
+}
+
+// finalizeAsk 调用成功后的统一收尾：证据核验 → 事务落库两条消息 → 配额 → 返回会话视图。
+func (s *QaService) finalizeAsk(userID int64, ac *qaAskContext, res *chatResult) (*QaConversationView, error) {
 	answer := strings.TrimSpace(res.Content)
 	if answer == "" {
 		answer = "（模型未返回内容，请重试或调整问题）"
@@ -129,14 +193,15 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 	// 假设价位/成本不是幻觉，并入值域（同推荐域 verifyEvidence extra 变参口径）。
 	checkJSON := ""
 	var snap map[string]any
-	if json.Unmarshal([]byte(conv.DataSnapshot), &snap) == nil {
+	if json.Unmarshal([]byte(ac.conv.DataSnapshot), &snap) == nil {
 		vals := snapshotValueSet(snap, "recent_bars")
 		// 快照 news 舆情段的新闻标题是文本型合法来源，标题里的小数并入值域（N2）；
-		// announcements 公告段标题同理（F1）。
+		// announcements 公告段标题（F1）与 risk_gate 提示文本（S1）同理。
 		vals = append(vals, decimalNumbersIn(newsTitleTexts(snap))...)
 		vals = append(vals, decimalNumbersIn(announcementTitleTexts(snap))...)
-		userTexts := []string{question}
-		for _, m := range history {
+		vals = append(vals, decimalNumbersIn(riskGateTexts(snap))...)
+		userTexts := []string{ac.question}
+		for _, m := range ac.history {
 			if m.Role == model.QaRoleUser {
 				userTexts = append(userTexts, m.Content)
 			}
@@ -149,19 +214,19 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 	}
 
 	// 事务落库：user 提问 + assistant 回答，并更新会话计数/token。
-	err = common.DB.Transaction(func(tx *gorm.DB) error {
-		um := model.AiConversationMessage{ConversationID: conv.ID, UserID: userID, Role: model.QaRoleUser, Content: question}
+	err := common.DB.Transaction(func(tx *gorm.DB) error {
+		um := model.AiConversationMessage{ConversationID: ac.conv.ID, UserID: userID, Role: model.QaRoleUser, Content: ac.question}
 		if err := tx.Create(&um).Error; err != nil {
 			return err
 		}
 		am := model.AiConversationMessage{
-			ConversationID: conv.ID, UserID: userID, Role: model.QaRoleAssistant, Content: answer, CheckJSON: checkJSON,
+			ConversationID: ac.conv.ID, UserID: userID, Role: model.QaRoleAssistant, Content: answer, CheckJSON: checkJSON,
 			PromptTokens: res.Usage.PromptTokens, CompletionTokens: res.Usage.CompletionTokens, TotalTokens: res.Usage.TotalTokens,
 		}
 		if err := tx.Create(&am).Error; err != nil {
 			return err
 		}
-		return tx.Model(&model.AiConversation{}).Where("id = ?", conv.ID).Updates(map[string]any{
+		return tx.Model(&model.AiConversation{}).Where("id = ?", ac.conv.ID).Updates(map[string]any{
 			"message_count": gorm.Expr("message_count + 2"),
 			"total_tokens":  gorm.Expr("total_tokens + ?", res.Usage.TotalTokens),
 		}).Error
@@ -173,7 +238,7 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 		consumeQuota(userID, res.Usage.TotalTokens, true)
 	}
 
-	return s.Get(userID, conv.ID)
+	return s.Get(userID, ac.conv.ID)
 }
 
 // qaConversationFromAnalysis 从分析记录新建问答会话：复用其数据快照（已 fitBudget），
@@ -226,16 +291,17 @@ func (s *QaService) buildMessages(conv model.AiConversation, history []model.AiC
 }
 
 // qaPromptVersion 问答系统提示版本（会话不落库版本列，仅供代码内追溯）。
-// q4: 快照新增 news 舆情段（最近相关新闻标题+情绪标签）；q3: 回答引用的数字会被程序化核验，威慑幻觉；q2: 快照含五维量化评分锚点、要求引用数值、禁用先验记忆。
-const qaPromptVersion = "q5"
+// q6: 快照新增 risk_gate 风险闸门段（ST/退市 block、一字板/流动性 warn+未接入数据声明）、允许轻量 Markdown（流式渲染配套）；q5: announcements 公告段；q4: news 舆情段；q3: 回答引用的数字会被程序化核验，威慑幻觉；q2: 快照含五维量化评分锚点、要求引用数值、禁用先验记忆。
+const qaPromptVersion = "q6"
 
 const qaRoleIntro = `你是一名严谨的证券研究助理，正在就某只个股与用户进行多轮问答。你的回答仅供研究参考，不构成投资建议。
 
 要求：
 1. 只依据【个股数据快照】中的事实回答，严禁编造未提供的财务、消息、评级或价格；数据不足时明确说明局限，不臆测。禁止使用你记忆中关于该公司的信息（名气/行业地位/历史印象都不算数据）。
 2. 该快照仅含实时行情、技术指标、五维量化评分 quant_score（纯技术面 0-100 参考锚点）与可能存在的 news 舆情段（最近相关新闻标题+情绪标签，覆盖面有限），无财务报表与资金流，涉及缺失维度时如实告知。引用新闻只能复述给出的标题，不得臆测正文细节；news 标注「暂无直接相关新闻」时按 market_signals 判断并明示消息面缺失。
-3. 关键判断引用快照中的具体字段与数值（如「现价 12.34 高于 MA20=11.98」），让用户可以核对。系统会程序化核对你回答中引用的数字，与快照不符的会被标记展示给用户，因此不要编造或凭印象填写数字。
-4. 回答简明、聚焦用户问题，使用简体中文；必要时给出研究性看法，但不下达买卖指令。`
+3. 风险闸门（快照 risk_gate 块，必须遵守）：level=block（ST/退市警示）为硬约束——不得给出任何买入倾向的回答，先讲退市/警示风险；level=warn（一字板/流动性不足）须在回答中主动提示并约束结论（一字板不得按可正常成交分析）。risk_gate.note 声明的未接入维度（质押/解禁等），涉及时照实说「未接入数据，请自行核查」，严禁装作已核查。
+4. 关键判断引用快照中的具体字段与数值（如「现价 12.34 高于 MA20=11.98」），让用户可以核对。系统会程序化核对你回答中引用的数字，与快照不符的会被标记展示给用户，因此不要编造或凭印象填写数字。
+5. 回答简明、聚焦用户问题，使用简体中文；必要时给出研究性看法，但不下达买卖指令。可用轻量 Markdown 排版（短列表、**加粗**关键结论），不要输出表格、图片与链接。`
 
 // loadMessages 取会话的全部消息（升序）。仅本人。
 func (s *QaService) loadMessages(userID, convID int64) ([]model.AiConversationMessage, error) {
@@ -267,8 +333,9 @@ func (s *QaService) Get(userID, id int64) (*QaConversationView, error) {
 	if err != nil {
 		return nil, err
 	}
+	flags := parseRiskFlagsFromSnapshot(conv.DataSnapshot)
 	conv.DataSnapshot = "" // 详情不必回传大快照
-	return &QaConversationView{AiConversation: conv, Messages: msgs}, nil
+	return &QaConversationView{AiConversation: conv, Messages: msgs, RiskFlags: flags}, nil
 }
 
 // Snapshot 返回会话固定的数据快照原文（供前端「数据快照」透明面板展示）。仅本人。

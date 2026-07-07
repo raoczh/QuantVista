@@ -45,6 +45,16 @@ async function tryRefresh(): Promise<boolean> {
   return false
 }
 
+// refreshAccessToken 供 axios 之外的调用方（如流式 fetch）复用同一单飞刷新。
+export function refreshAccessToken(): Promise<boolean> {
+  if (!refreshing) {
+    refreshing = tryRefresh().finally(() => {
+      refreshing = null
+    })
+  }
+  return refreshing
+}
+
 // 响应拦截：401 时尝试刷新一次并重放原请求；刷新失败则清票并跳登录。
 http.interceptors.response.use(
   (resp) => resp,

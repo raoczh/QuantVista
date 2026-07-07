@@ -49,7 +49,7 @@ func NewAnalysisService(market *MarketService, watchlist *WatchlistService, posi
 
 // 版本号：数据快照 + 这两个版本号共同保证「凭版本号复现」。改 prompt/策略时递增。
 const (
-	analysisPromptVersion   = "p7" // p7: 个股快照新增 announcements 公告段（最近5条公告标题+类型，证据权重 公告>新闻报道）；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
+	analysisPromptVersion   = "p8" // p8: risk_gate 风险闸门段（ST/退市 block、一字板/流动性/小市值提示+未接入数据声明）+ 持仓模块资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
 	analysisStrategyVersion = "s1"
 	maxRepairAttempts       = 2 // 结构化校验失败后的额外重试次数（总调用 = 1 + maxRepairAttempts）
 )
@@ -120,9 +120,10 @@ type PanelResult struct {
 // AnalysisView 返回给前端：记录 + 解析后的结构化结果。
 type AnalysisView struct {
 	model.AnalysisRecord
-	Result *AnalysisResult `json:"result"` // 结构化结果；degraded/failed 时可能为 nil
-	Panel  *PanelResult    `json:"panel"`  // 多角色观点（mode=panel 且 success 时非 nil）
-	Raw    string          `json:"raw"`    // 降级时的模型原文
+	Result    *AnalysisResult `json:"result"`               // 结构化结果；degraded/failed 时可能为 nil
+	Panel     *PanelResult    `json:"panel"`                // 多角色观点（mode=panel 且 success 时非 nil）
+	Raw       string          `json:"raw"`                  // 降级时的模型原文
+	RiskFlags []riskFlag      `json:"risk_flags,omitempty"` // 快照 risk_gate 程序化风险标志（S1，个股模块）
 }
 
 // Analyze 执行一次分析。allowPrivate 由调用方按角色决定（管理员可访问内网自建模型）。
@@ -333,9 +334,11 @@ func (s *AnalysisService) fillAnalysisTrust(ctx context.Context, cfg *model.LLMC
 	texts = append(texts, result.KillSwitches...)
 	vals := snapshotValueSet(snapshot, "recent_bars")
 	// 新闻标题是喂给模型的文本型合法来源（N2 舆情段）：标题里的小数并入值域，
-	// 忠实引用不算幻觉（同日报 Alerts 前例）。公告标题同理（F1 公告段）。
+	// 忠实引用不算幻觉（同日报 Alerts 前例）。公告标题（F1）与风险闸门提示文本
+	//（S1，含 9.5/3000 等阈值数字）同理。
 	vals = append(vals, decimalNumbersIn(newsTitleTexts(snapshot))...)
 	vals = append(vals, decimalNumbersIn(announcementTitleTexts(snapshot))...)
+	vals = append(vals, decimalNumbersIn(riskGateTexts(snapshot))...)
 	result.EvidenceCheck = verifyEvidenceValues(texts, vals)
 	result.SysConfidence, result.SysConfidenceWhy = analysisSystemConfidence(result.EvidenceCheck, snapshot)
 
@@ -615,6 +618,9 @@ func diffStringSets(prev, cur []string) (added, removed []string) {
 // toView 把落库记录还原为前端视图（解析结构化结果 / 多角色结果 / 降级原文）。
 func (s *AnalysisService) toView(rec model.AnalysisRecord) *AnalysisView {
 	v := &AnalysisView{AnalysisRecord: rec}
+	if rec.Module == model.AnalysisModuleStock {
+		v.RiskFlags = parseRiskFlagsFromSnapshot(rec.DataSnapshot)
+	}
 	switch rec.Status {
 	case model.AnalysisStatusSuccess:
 		if rec.Mode == model.AnalysisModePanel {
@@ -726,6 +732,7 @@ var moduleGuidance = map[string]string{
 - 量化锚点：quant_score 是确定性算出的技术面综合分，你的定性判断若与其明显相悖（如评分 30 弱势而你看多），必须专门解释分歧原因，不可无视。
 - 消息面（若快照含 news 块）：news.items 是该股最近相关新闻的标题与情绪标签（利好/利空/中性为程序化预判），结合技术面判断消息驱动的持续性；权重纪律：公告>政策>报道>传闻，旧闻与已充分定价的消息不加分；引用新闻只能复述给出的标题，不得展开臆测正文细节。若 news 标注「暂无直接相关新闻」，请依据 market_signals（涨跌五档/量能三档/换手率）判断，并在措辞中明示消息面数据缺失。
 - 公告（若快照含 announcements 块）：announcements.items 是该股最近的交易所公告（标题/类型/日期），证据权重高于新闻报道；关注业绩类、股权变动类、重大合同类公告对结论的影响；引用公告只能复述给出的标题与类型，不得臆测公告正文细节；无 announcements 块表示暂未采集到该股公告，不代表没有公告。
+- 风险闸门（快照 risk_gate 块，程序化前置判定，必须遵守）：flags 中 level=block 的条目（ST/退市风险警示）为硬约束——rating 不得为 bullish、不得给出任何买入倾向的表述，并把该风险放在 risks 首条；level=warn（一字板/流动性不足）必须在 risks 中原样提示并约束相关结论（一字板不得按可正常成交分析）；level=info（小市值）在风险中带一句提示。risk_gate.note 声明了未接入的数据维度（质押/解禁等），涉及时照实说「未接入数据，请自行核查」，严禁装作已核查。
 重要限制：估值仅为快照指标，不含财务三表明细（营收/利润/负债）、机构持仓与个股资金流。news 块的覆盖面有限（快讯与个股新闻采集），没有新闻不代表没有消息。若结论依赖未提供的数据，必须说明「数据缺失、无法判断」，绝不虚构。若快照带 freshness_note，措辞必须体现数据非实时。rating 以技术面为主、估值水位与消息面为辅给出。
 反方视角（必填）：anti_thesis 针对你给出的 rating 论证相反情形（看多时论证为什么现在买入可能是错的，看空/中性亦然）；kill_switches 给出可观察的失效信号（价格/均线/量能等具体条件）；unknowns 列出财务、新闻、资金流等本次数据看不到但影响结论的盲区。`,
 
@@ -756,12 +763,13 @@ var moduleGuidance = map[string]string{
 注意：数据仅含行情，不含个股财务与新闻，不要虚构基本面；无现价(缺 price)的标的说明数据缺失。
 反方视角（必填）：anti_thesis 指出对这批自选的整体判断可能错在哪（如共性走强可能只是板块 beta）；kill_switches 给出应移出关注或警惕的信号；unknowns 指出个股基本面、消息面等盲区。`,
 
-	model.AnalysisModulePosition: `本次分析对象是【用户的实际持仓】。数据：每笔持仓的标的、类型(短线/长线)、状态(持仓中/已卖出)、买入价、数量、成本、现价、盈亏额与收益率、买入理由，以及持仓中汇总盈亏。
+	model.AnalysisModulePosition: `本次分析对象是【用户的实际持仓】。数据：每笔持仓的标的、类型(短线/长线)、状态(持仓中/已卖出)、买入价、数量、成本、现价、盈亏额与收益率、买入理由，以及持仓中汇总盈亏；若含 capital_context 块，则 total_capital 为用户设定的总投资资金、holding_ratio_pct 为当前仓位占比。
 请从以下维度分析：
 - 组合整体：汇总盈亏与收益率，当前组合的盈亏结构（盈利仓 vs 亏损仓分布）；
 - 集中度风险：是否过度集中于单一标的或单一市场/风格；
 - 结构评估：短线与长线仓位的比例与各自表现是否符合其定位；
-- 需复盘的仓位：结合买入理由与当前盈亏，指出哪些仓位偏离预期、值得重新审视。
+- 需复盘的仓位：结合买入理由与当前盈亏，指出哪些仓位偏离预期、值得重新审视；
+- 逐仓倾向（强制三选一）：对每笔持仓中的仓位，在 suggestions 中明确给出「割（认错离场）/守（持有观察）/补（逢低加仓）」三选一的研究倾向及依据，格式如「XX(600000)：守——现价仍在 MA20 上方，亏损 3% 未破买入逻辑」；不允许「可割可守」的骑墙表述，拿不准就选守并说明拿不准的原因。若有 capital_context，判断须结合仓位占比（重仓浮亏与轻仓浮亏的容错不同；补仓建议必须核对剩余资金空间，holding_ratio_pct 已接近 100% 时不得建议补仓）；无 capital_context 则声明「未设置总资金，仓位占比未知」并趋保守。
 所有涉及加仓/减仓/止盈止损的表述，一律作为研究参考与风险提示，不是操作指令。不要虚构未提供的成本或价格。
 反方视角（必填）：anti_thesis 对你的组合评估给出相反论证（如认为结构合理时，论证它何时会变得脆弱）；kill_switches 给出组合层面的风险信号（回撤、集中度、亏损仓扩大等）；unknowns 指出持仓个股基本面、市场环境等本次数据看不到的盲区。`,
 }

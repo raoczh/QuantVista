@@ -235,6 +235,13 @@ function addBlack() {
 function removeBlack(i: number) {
   blacklist.value.splice(i, 1)
 }
+// 总投资资金以万元展示，落库为元（S1：持仓 AI 的割/守/补资金上下文）。
+const totalCapitalWan = computed({
+  get: () => (pref.value ? pref.value.total_capital / 1e4 : 0),
+  set: (v: number | null) => {
+    if (pref.value) pref.value.total_capital = Math.round((v || 0) * 1e4)
+  },
+})
 // 门槛以亿元展示，落库仍为元。
 const minAmountYi = computed({
   get: () => (pref.value ? pref.value.min_candidate_amount / 1e8 : 0),
@@ -422,6 +429,14 @@ async function doExport(kind: ExportKind) {
               <span class="notify-hint"
                 >交易日 15:35 后自动生成今日复盘 + 明日选股推荐（消耗你的 LLM token，不占次数配额；含自动卖点提醒）</span
               >
+            </div>
+          </n-form-item>
+          <n-form-item label="总投资资金">
+            <div class="notify-switch">
+              <n-input-number v-model:value="totalCapitalWan" :min="0" :max="100000000" :precision="1" :step="1" style="width: 140px">
+                <template #suffix>万元</template>
+              </n-input-number>
+              <span class="notify-hint">持仓 AI 分析将注入资金上下文（仓位占比），用于「割/守/补」判断；0 = 不注入</span>
             </div>
           </n-form-item>
           <n-form-item label="成交额门槛">

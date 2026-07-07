@@ -15,6 +15,7 @@ import {
   NSpace,
   NSwitch,
   NModal,
+  NTooltip,
   useMessage,
 } from 'naive-ui'
 import {
@@ -36,6 +37,7 @@ import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
+import type { RiskFlag } from '@/api/trust'
 
 const message = useMessage()
 const route = useRoute()
@@ -185,6 +187,23 @@ const ratingMeta: Record<AnalysisRating, { text: string; color: () => string }> 
 function ratingText(r: string) {
   return ratingMeta[r as AnalysisRating]?.text || '—'
 }
+// 风险闸门标签（S1）。
+function riskTagType(f: RiskFlag): 'error' | 'warning' | 'default' {
+  if (f.level === 'block') return 'error'
+  if (f.level === 'warn') return 'warning'
+  return 'default'
+}
+function riskTagLabel(f: RiskFlag): string {
+  const names: Record<string, string> = {
+    st: 'ST/风险警示',
+    delist: '退市风险',
+    limit_board: '一字板',
+    low_liquidity: '流动性不足',
+    small_cap: '小市值',
+  }
+  return names[f.code] || f.code
+}
+
 function ratingColor(r: string) {
   return ratingMeta[r as AnalysisRating]?.color() || flatColor.value
 }
@@ -435,6 +454,18 @@ onMounted(async () => {
                     >
                   </div>
                 </div>
+              </div>
+
+              <!-- 风险闸门标签（S1：快照 risk_gate 程序化判定，与注入 prompt 同源） -->
+              <div v-if="current.risk_flags?.length" class="risk-flags">
+                <n-tooltip v-for="f in current.risk_flags" :key="f.code" trigger="hover" style="max-width: 340px">
+                  <template #trigger>
+                    <n-tag size="small" :type="riskTagType(f)" :bordered="false">
+                      {{ f.level === 'block' ? '⛔' : f.level === 'warn' ? '⚠' : 'ⓘ' }} {{ riskTagLabel(f) }}
+                    </n-tag>
+                  </template>
+                  {{ f.text }}
+                </n-tooltip>
               </div>
 
               <!-- 信任徽章：证据核验 · 综合置信 · AI 复核（仅标准成功结果） -->
@@ -938,6 +969,12 @@ onMounted(async () => {
   margin-top: 16px;
   padding-top: 12px;
   border-top: 1px solid var(--qv-divider);
+}
+.risk-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
 }
 .trust-mb {
   margin-bottom: 14px;

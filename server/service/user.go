@@ -49,6 +49,8 @@ type PreferenceInput struct {
 	RecFiltersJSON     string  `json:"rec_filters_json"`     // 推荐筛选默认值（RecFilters JSON；空=类型默认）
 
 	EnableDailyReport bool `json:"enable_daily_report"` // 收盘日报（今日复盘+明日推荐）自动生成
+
+	TotalCapital float64 `json:"total_capital"` // 总投资资金（元；0=未设置，持仓 AI 不注入资金上下文）
 }
 
 // BlacklistEntry 候选池黑名单条目（用户配置的回避规则）。
@@ -172,6 +174,10 @@ func (s *UserService) UpdatePreference(userID int64, in PreferenceInput) (*model
 	p.MinCandidateAmount = in.MinCandidateAmount
 	p.RecFiltersJSON = recFilters
 	p.EnableDailyReport = in.EnableDailyReport
+	if in.TotalCapital < 0 || in.TotalCapital > 1e12 {
+		return nil, errors.New("总投资资金需在 0~1万亿 之间（0=未设置）")
+	}
+	p.TotalCapital = in.TotalCapital
 	if err := common.DB.Save(p).Error; err != nil {
 		return nil, err
 	}

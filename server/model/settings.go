@@ -19,16 +19,7 @@ type LLMConfig struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-// DataSourceConfig 数据源配置与健康状态。
-type DataSourceConfig struct {
-	ID            int64     `gorm:"primaryKey" json:"id"`
-	Kind          string    `gorm:"size:32;index" json:"kind"`   // quote/fundamental/news/macro
-	Provider      string    `gorm:"size:32" json:"provider"`     // eastmoney/sina/tushare
-	Enabled       bool      `gorm:"default:true" json:"enabled"`
-	RefreshSec    int       `gorm:"default:60" json:"refresh_sec"`
-	LastSyncAt    time.Time `json:"last_sync_at"`
-	LastStatus    string    `gorm:"size:16" json:"last_status"` // ok/error
-	LastError     string    `gorm:"size:256" json:"last_error"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
-}
+// DataSourceConfig 已删除（S1）：该表自骨架期建立后从未接线（死表）。数据源健康
+// 现由 datasource.HealthTracker 进程内滑窗承担（GET /api/admin/datasources），
+// 无需落库。旧库中残留的 data_source_configs 物理表无害，可手工 DROP。
+

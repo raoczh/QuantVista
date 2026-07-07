@@ -205,3 +205,9 @@ func (mc *MarketController) SyncLogs(c *gin.Context) {
 	}
 	common.ApiSuccess(c, logs)
 }
+
+// DataSources GET /api/admin/datasources —— 数据源健康端点：每 (源,能力) 的
+// 滑窗统计（success/empty/error/平均延迟）与冷却状态（S1 健康滑窗）。
+func (mc *MarketController) DataSources(c *gin.Context) {
+	common.ApiSuccess(c, gin.H{"health": mc.svc.DataSourceHealth()})
+}

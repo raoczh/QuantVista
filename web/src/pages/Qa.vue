@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, nextTick } from 'vue'
+import { ref, onMounted, computed, nextTick, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -11,10 +11,11 @@ import {
   NAlert,
   NModal,
   NTooltip,
+  NTag,
   useMessage,
 } from 'naive-ui'
 import {
-  askQa,
+  askQaStream,
   listConversations,
   getConversation,
   deleteConversation,
@@ -23,9 +24,10 @@ import {
   type QaConversationView,
   type QaMessage,
 } from '@/api/qa'
-import type { EvidenceCheck } from '@/api/trust'
+import type { EvidenceCheck, RiskFlag } from '@/api/trust'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
+import { renderMarkdown } from '@/lib/markdown'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 
@@ -49,6 +51,38 @@ const scrollBox = ref<HTMLElement | null>(null)
 // 从分析结果「继续问答」进入：新会话复用该分析记录的数据快照（不重复拉数）。
 const fromAnalysisId = ref<number | null>(null)
 const fromAnalysisName = ref('')
+
+// ---------- 流式渲染（S1）----------
+// 增量先进 streamRaw 缓冲，100ms 节流转 markdown（renderMarkdown 已 DOMPurify 消毒），
+// 避免每个 token 都重排。核验徽章在 done 行替换 current 后自然后置出现。
+const pendingQuestion = ref('')
+const streamHtml = ref('')
+let streamRaw = ''
+let renderTimer: number | null = null
+
+function flushStreamRender() {
+  renderTimer = null
+  streamHtml.value = renderMarkdown(streamRaw)
+  void scrollToBottom()
+}
+function onStreamChunk(text: string) {
+  streamRaw += text
+  if (renderTimer === null) {
+    renderTimer = window.setTimeout(flushStreamRender, 100)
+  }
+}
+function resetStream() {
+  if (renderTimer !== null) {
+    window.clearTimeout(renderTimer)
+    renderTimer = null
+  }
+  streamRaw = ''
+  streamHtml.value = ''
+  pendingQuestion.value = ''
+}
+onBeforeUnmount(() => {
+  if (renderTimer !== null) window.clearTimeout(renderTimer)
+})
 
 // ---------- LLM ----------
 const llmConfigs = ref<LLMConfig[]>([])
@@ -84,15 +118,22 @@ async function send() {
     return
   }
   asking.value = true
+  pendingQuestion.value = q
+  streamRaw = ''
+  streamHtml.value = ''
+  await scrollToBottom()
   try {
-    current.value = await askQa({
-      conversation_id: current.value?.id,
-      symbol: current.value ? undefined : symbol.value.trim(),
-      market: current.value ? undefined : market.value,
-      llm_config_id: llmId.value,
-      question: q,
-      analysis_record_id: !current.value && fromAnalysisId.value ? fromAnalysisId.value : undefined,
-    })
+    current.value = await askQaStream(
+      {
+        conversation_id: current.value?.id,
+        symbol: current.value ? undefined : symbol.value.trim(),
+        market: current.value ? undefined : market.value,
+        llm_config_id: llmId.value,
+        question: q,
+        analysis_record_id: !current.value && fromAnalysisId.value ? fromAnalysisId.value : undefined,
+      },
+      onStreamChunk,
+    )
     question.value = ''
     fromAnalysisId.value = null
     fromAnalysisName.value = ''
@@ -102,6 +143,7 @@ async function send() {
     message.error((e as Error).message)
   } finally {
     asking.value = false
+    resetStream()
   }
 }
 
@@ -111,6 +153,23 @@ function newChat() {
   question.value = ''
   fromAnalysisId.value = null
   fromAnalysisName.value = ''
+}
+
+// ---------- 风险闸门标签（S1）----------
+function riskTagType(f: RiskFlag): 'error' | 'warning' | 'default' {
+  if (f.level === 'block') return 'error'
+  if (f.level === 'warn') return 'warning'
+  return 'default'
+}
+function riskTagLabel(f: RiskFlag): string {
+  const names: Record<string, string> = {
+    st: 'ST/风险警示',
+    delist: '退市风险',
+    limit_board: '一字板',
+    low_liquidity: '流动性不足',
+    small_cap: '小市值',
+  }
+  return names[f.code] || f.code
 }
 
 // ---------- 历史 ----------
@@ -246,6 +305,18 @@ onMounted(async () => {
             </div>
           </template>
 
+          <!-- 风险闸门标签（S1：快照程序化判定，与注入 prompt 同源） -->
+          <div v-if="current?.risk_flags?.length" class="risk-flags">
+            <n-tooltip v-for="f in current.risk_flags" :key="f.code" trigger="hover" style="max-width: 340px">
+              <template #trigger>
+                <n-tag size="small" :type="riskTagType(f)" :bordered="false">
+                  {{ f.level === 'block' ? '⛔' : f.level === 'warn' ? '⚠' : 'ⓘ' }} {{ riskTagLabel(f) }}
+                </n-tag>
+              </template>
+              {{ f.text }}
+            </n-tooltip>
+          </div>
+
           <!-- 新会话：选择标的 -->
           <div v-if="!current" class="starter">
             <div class="starter-row">
@@ -269,31 +340,44 @@ onMounted(async () => {
 
           <!-- 对话流 -->
           <div ref="scrollBox" class="messages" :class="{ compact: !current }">
-            <div v-if="current" class="msg-list">
-              <div v-for="m in current.messages" :key="m.id" class="msg" :class="m.role">
-                <div class="bubble-wrap">
-                  <div class="bubble">{{ m.content }}</div>
-                  <n-tooltip v-if="m.role === 'assistant' && msgCheck(m)" trigger="hover">
-                    <template #trigger>
-                      <span
-                        class="check-chip"
-                        :style="{ background: withAlpha(checkColor(msgCheck(m)!), 0.12), color: checkColor(msgCheck(m)!) }"
-                      >
-                        数据核验 {{ msgCheck(m)!.matched }}/{{ msgCheck(m)!.total }}
+            <div v-if="current || asking" class="msg-list">
+              <template v-if="current">
+                <div v-for="m in current.messages" :key="m.id" class="msg" :class="m.role">
+                  <div class="bubble-wrap">
+                    <!-- assistant 内容经 renderMarkdown（marked+DOMPurify 消毒）后渲染 -->
+                    <div v-if="m.role === 'assistant'" class="bubble md" v-html="renderMarkdown(m.content)"></div>
+                    <div v-else class="bubble">{{ m.content }}</div>
+                    <n-tooltip v-if="m.role === 'assistant' && msgCheck(m)" trigger="hover">
+                      <template #trigger>
+                        <span
+                          class="check-chip"
+                          :style="{ background: withAlpha(checkColor(msgCheck(m)!), 0.12), color: checkColor(msgCheck(m)!) }"
+                        >
+                          数据核验 {{ msgCheck(m)!.matched }}/{{ msgCheck(m)!.total }}
+                        </span>
+                      </template>
+                      <span v-if="msgCheck(m)!.unmatched?.length">
+                        这些数字未能与数据快照吻合，可能是推算值或幻觉，建议人工核对：{{ msgCheck(m)!.unmatched!.join('、') }}
                       </span>
-                    </template>
-                    <span v-if="msgCheck(m)!.unmatched?.length">
-                      这些数字未能与数据快照吻合，可能是推算值或幻觉，建议人工核对：{{ msgCheck(m)!.unmatched!.join('、') }}
-                    </span>
-                    <span v-else>回答引用的数字已逐一与数据快照程序化比对，全部吻合</span>
-                  </n-tooltip>
+                      <span v-else>回答引用的数字已逐一与数据快照程序化比对，全部吻合</span>
+                    </n-tooltip>
+                  </div>
                 </div>
-              </div>
-              <div v-if="asking" class="msg assistant">
-                <div class="bubble thinking">思考中…</div>
-              </div>
+              </template>
+              <!-- 流式中的本轮问答（done 后被 current 的正式消息替换，核验徽章随之后置出现） -->
+              <template v-if="asking">
+                <div class="msg user">
+                  <div class="bubble-wrap"><div class="bubble">{{ pendingQuestion }}</div></div>
+                </div>
+                <div class="msg assistant">
+                  <div class="bubble-wrap">
+                    <div v-if="streamHtml" class="bubble md streaming" v-html="streamHtml"></div>
+                    <div v-else class="bubble thinking">思考中…</div>
+                  </div>
+                </div>
+              </template>
             </div>
-            <n-empty v-else-if="!current" description="选择标的并提问，开始一段多轮问答" style="padding: 24px 0" />
+            <n-empty v-else description="选择标的并提问，开始一段多轮问答" style="padding: 24px 0" />
           </div>
 
           <!-- 输入 -->
@@ -308,7 +392,7 @@ onMounted(async () => {
             />
             <n-button type="primary" :loading="asking" @click="send">发送</n-button>
           </div>
-          <div class="composer-hint">仅依据行情与技术指标（无财务/新闻）回答，不构成投资建议。Enter 发送。</div>
+          <div class="composer-hint">仅依据行情/技术指标与已采集的新闻公告快照回答（流式输出），不构成投资建议。Enter 发送。</div>
         </SectionCard>
       </div>
     </div>
@@ -449,6 +533,67 @@ onMounted(async () => {
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
+}
+/* markdown 气泡：块级元素自带间距，关闭 pre-wrap 防双重换行 */
+.bubble.md {
+  white-space: normal;
+}
+.bubble.md :deep(p) {
+  margin: 0 0 6px;
+}
+.bubble.md :deep(p:last-child) {
+  margin-bottom: 0;
+}
+.bubble.md :deep(ul),
+.bubble.md :deep(ol) {
+  margin: 4px 0;
+  padding-left: 20px;
+}
+.bubble.md :deep(li) {
+  margin: 2px 0;
+}
+.bubble.md :deep(h1),
+.bubble.md :deep(h2),
+.bubble.md :deep(h3),
+.bubble.md :deep(h4) {
+  font-size: 14px;
+  margin: 8px 0 4px;
+}
+.bubble.md :deep(code) {
+  font-family: var(--qv-mono, monospace);
+  font-size: 13px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: v-bind('withAlpha(vars.textColor3, 0.12)');
+}
+.bubble.md :deep(pre) {
+  overflow-x: auto;
+  padding: 8px;
+  border-radius: 8px;
+  background: v-bind('withAlpha(vars.textColor3, 0.1)');
+}
+.bubble.md :deep(blockquote) {
+  margin: 4px 0;
+  padding-left: 10px;
+  border-left: 3px solid var(--qv-divider);
+  opacity: 0.8;
+}
+/* 流式中的气泡尾部光标 */
+.bubble.streaming::after {
+  content: '▍';
+  opacity: 0.5;
+  animation: qv-blink 1s step-start infinite;
+}
+@keyframes qv-blink {
+  50% {
+    opacity: 0;
+  }
+}
+.risk-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
 }
 .check-chip {
   align-self: flex-start;
