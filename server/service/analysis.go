@@ -49,7 +49,7 @@ func NewAnalysisService(market *MarketService, watchlist *WatchlistService, posi
 
 // 版本号：数据快照 + 这两个版本号共同保证「凭版本号复现」。改 prompt/策略时递增。
 const (
-	analysisPromptVersion   = "p6" // p6: 个股快照新增 news 舆情段（最近5条标题+情绪标签，无新闻注入程序化市场信号）；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
+	analysisPromptVersion   = "p7" // p7: 个股快照新增 announcements 公告段（最近5条公告标题+类型，证据权重 公告>新闻报道）；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
 	analysisStrategyVersion = "s1"
 	maxRepairAttempts       = 2 // 结构化校验失败后的额外重试次数（总调用 = 1 + maxRepairAttempts）
 )
@@ -333,8 +333,9 @@ func (s *AnalysisService) fillAnalysisTrust(ctx context.Context, cfg *model.LLMC
 	texts = append(texts, result.KillSwitches...)
 	vals := snapshotValueSet(snapshot, "recent_bars")
 	// 新闻标题是喂给模型的文本型合法来源（N2 舆情段）：标题里的小数并入值域，
-	// 忠实引用不算幻觉（同日报 Alerts 前例）。
+	// 忠实引用不算幻觉（同日报 Alerts 前例）。公告标题同理（F1 公告段）。
 	vals = append(vals, decimalNumbersIn(newsTitleTexts(snapshot))...)
+	vals = append(vals, decimalNumbersIn(announcementTitleTexts(snapshot))...)
 	result.EvidenceCheck = verifyEvidenceValues(texts, vals)
 	result.SysConfidence, result.SysConfidenceWhy = analysisSystemConfidence(result.EvidenceCheck, snapshot)
 
@@ -724,6 +725,7 @@ var moduleGuidance = map[string]string{
 - 估值水位：若提供了 valuation，结合 PE/PB/市值说明估值的绝对水位与含义（无行业对比数据，须说明这是绝对水位而非行业相对水位；PE 为负表示亏损）；标注 is_st 的标的必须提示退市/风险警示；
 - 量化锚点：quant_score 是确定性算出的技术面综合分，你的定性判断若与其明显相悖（如评分 30 弱势而你看多），必须专门解释分歧原因，不可无视。
 - 消息面（若快照含 news 块）：news.items 是该股最近相关新闻的标题与情绪标签（利好/利空/中性为程序化预判），结合技术面判断消息驱动的持续性；权重纪律：公告>政策>报道>传闻，旧闻与已充分定价的消息不加分；引用新闻只能复述给出的标题，不得展开臆测正文细节。若 news 标注「暂无直接相关新闻」，请依据 market_signals（涨跌五档/量能三档/换手率）判断，并在措辞中明示消息面数据缺失。
+- 公告（若快照含 announcements 块）：announcements.items 是该股最近的交易所公告（标题/类型/日期），证据权重高于新闻报道；关注业绩类、股权变动类、重大合同类公告对结论的影响；引用公告只能复述给出的标题与类型，不得臆测公告正文细节；无 announcements 块表示暂未采集到该股公告，不代表没有公告。
 重要限制：估值仅为快照指标，不含财务三表明细（营收/利润/负债）、机构持仓与个股资金流。news 块的覆盖面有限（快讯与个股新闻采集），没有新闻不代表没有消息。若结论依赖未提供的数据，必须说明「数据缺失、无法判断」，绝不虚构。若快照带 freshness_note，措辞必须体现数据非实时。rating 以技术面为主、估值水位与消息面为辅给出。
 反方视角（必填）：anti_thesis 针对你给出的 rating 论证相反情形（看多时论证为什么现在买入可能是错的，看空/中性亦然）；kill_switches 给出可观察的失效信号（价格/均线/量能等具体条件）；unknowns 列出财务、新闻、资金流等本次数据看不到但影响结论的盲区。`,
 

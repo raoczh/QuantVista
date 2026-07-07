@@ -1,6 +1,6 @@
 import { request } from './client'
 
-export type AlertKind = 'price' | 'pct_change' | 'ma' | 'breakout' | 'volume_surge' | 'amplitude'
+export type AlertKind = 'price' | 'pct_change' | 'ma' | 'breakout' | 'volume_surge' | 'amplitude' | 'earn_date' | 'earn_fcst'
 export type AlertOp = 'gte' | 'lte'
 export type AlertStatus = 'active' | 'triggered' | 'paused'
 export type AlertEventStatus = 'unread' | 'read' | 'dismissed'

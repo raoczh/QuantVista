@@ -131,8 +131,10 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 	var snap map[string]any
 	if json.Unmarshal([]byte(conv.DataSnapshot), &snap) == nil {
 		vals := snapshotValueSet(snap, "recent_bars")
-		// 快照 news 舆情段的新闻标题是文本型合法来源，标题里的小数并入值域（N2）。
+		// 快照 news 舆情段的新闻标题是文本型合法来源，标题里的小数并入值域（N2）；
+		// announcements 公告段标题同理（F1）。
 		vals = append(vals, decimalNumbersIn(newsTitleTexts(snap))...)
+		vals = append(vals, decimalNumbersIn(announcementTitleTexts(snap))...)
 		userTexts := []string{question}
 		for _, m := range history {
 			if m.Role == model.QaRoleUser {
@@ -225,7 +227,7 @@ func (s *QaService) buildMessages(conv model.AiConversation, history []model.AiC
 
 // qaPromptVersion 问答系统提示版本（会话不落库版本列，仅供代码内追溯）。
 // q4: 快照新增 news 舆情段（最近相关新闻标题+情绪标签）；q3: 回答引用的数字会被程序化核验，威慑幻觉；q2: 快照含五维量化评分锚点、要求引用数值、禁用先验记忆。
-const qaPromptVersion = "q4"
+const qaPromptVersion = "q5"
 
 const qaRoleIntro = `你是一名严谨的证券研究助理，正在就某只个股与用户进行多轮问答。你的回答仅供研究参考，不构成投资建议。
 

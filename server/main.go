@@ -52,6 +52,7 @@ func main() {
 	service.StartAlertJobs(mgr)
 	service.StartDailyReportJobs(mgr)
 	service.StartNewsJobs()
+	service.StartFinanceJobs(mgr)
 
 	if !common.DebugEnabled {
 		gin.SetMode(gin.ReleaseMode)

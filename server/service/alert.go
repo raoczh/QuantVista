@@ -37,6 +37,16 @@ var validAlertKind = map[string]bool{
 	model.AlertKindBreakout:    true,
 	model.AlertKindVolumeSurge: true,
 	model.AlertKindAmplitude:   true,
+	model.AlertKindEarnDate:    true,
+	model.AlertKindEarnFcst:    true,
+}
+
+// earnAlertKinds 财报日历类 kind：盘中 15min 行情评估显式排除（否则会被拉去每
+// symbol 拉行情空转），由财报刷新 job 每日一评 + 手动「立即检查」时顺带评估（查本地表零上游成本）。
+var earnAlertKinds = []string{model.AlertKindEarnDate, model.AlertKindEarnFcst}
+
+func isEarnAlertKind(kind string) bool {
+	return kind == model.AlertKindEarnDate || kind == model.AlertKindEarnFcst
 }
 
 // alertKindNeedsBars 该类型评估是否需要日线序列。
@@ -256,6 +266,9 @@ func (s *AlertService) validate(in *AlertInput) error {
 	if !validAlertKind[in.Kind] {
 		return errors.New("不支持的提醒类型")
 	}
+	if isEarnAlertKind(in.Kind) {
+		in.Op = model.AlertOpGTE // 财报类无比较方向语义，统一存 gte（前端可不传）
+	}
 	if in.Op != model.AlertOpGTE && in.Op != model.AlertOpLTE {
 		return errors.New("比较方向须为 gte 或 lte")
 	}
@@ -276,6 +289,13 @@ func (s *AlertService) validate(in *AlertInput) error {
 		if in.Threshold <= 0 || in.Threshold > 100 {
 			return errors.New("振幅阈值须在 0~100 之间（%）")
 		}
+	case model.AlertKindEarnDate:
+		if in.Threshold < 1 || in.Threshold > 30 {
+			return errors.New("披露提前天数须在 1~30 之间")
+		}
+		in.Threshold = float64(int(in.Threshold))
+	case model.AlertKindEarnFcst:
+		in.Threshold = 0
 	}
 	return nil
 }
@@ -452,10 +472,23 @@ func recordEvent(rule model.AlertRule, msg, today string, now time.Time) bool {
 
 // --- 评估编排 ---
 
-// EvaluateUser 评估某用户全部 active 规则；命中则落库（once 规则命中后置 triggered）。返回命中数。
+// EvaluateUser 手动「立即检查」入口：行情类 + 财报日历类全量评估。
+// 财报类查本地表（零上游成本），让用户手动检查能当场验证财报提醒。
 func (s *AlertService) EvaluateUser(ctx context.Context, userID int64) (int, error) {
+	hits, err := s.evaluateUserMarket(ctx, userID)
+	if err != nil {
+		return 0, err
+	}
+	hits += s.evaluateEarnRulesForUser(userID)
+	return hits, nil
+}
+
+// evaluateUserMarket 盘中口径：只评行情类规则，显式排除财报日历类 kind——
+// 否则 15min 一轮会被财报规则拉去每 symbol 拉行情空转（财报类由财报刷新 job 每日一评）。
+func (s *AlertService) evaluateUserMarket(ctx context.Context, userID int64) (int, error) {
 	var rules []model.AlertRule
-	if err := common.DB.Where("user_id = ? AND status = ?", userID, model.AlertStatusActive).Find(&rules).Error; err != nil {
+	if err := common.DB.Where("user_id = ? AND status = ? AND kind NOT IN ?",
+		userID, model.AlertStatusActive, earnAlertKinds).Find(&rules).Error; err != nil {
 		return 0, err
 	}
 	return s.evaluateRules(ctx, rules), nil
@@ -567,6 +600,7 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 }
 
 // StartAlertJobs 后台评估提醒：启动延迟 60s 一次 + 每 15 分钟一次，遍历有 active 规则的用户。
+// 只做行情类（财报日历类由 service/finance.go 的每日 job 调 EvaluateEarningsAll）。
 func StartAlertJobs(mgr *datasource.Manager) {
 	svc := NewAlertService(NewMarketService(mgr))
 	run := func() {
@@ -575,14 +609,14 @@ func StartAlertJobs(mgr *datasource.Manager) {
 		}
 		var userIDs []int64
 		if err := common.DB.Model(&model.AlertRule{}).
-			Where("status = ?", model.AlertStatusActive).
+			Where("status = ? AND kind NOT IN ?", model.AlertStatusActive, earnAlertKinds).
 			Distinct().Pluck("user_id", &userIDs).Error; err != nil {
 			common.SysWarn("提醒评估列举用户失败: %v", err)
 			return
 		}
 		for _, uid := range userIDs {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-			if n, err := svc.EvaluateUser(ctx, uid); err != nil {
+			if n, err := svc.evaluateUserMarket(ctx, uid); err != nil {
 				common.SysWarn("评估用户 %d 提醒失败: %v", uid, err)
 			} else if n > 0 {
 				common.SysLog("用户 %d 提醒命中 %d 条", uid, n)
@@ -599,4 +633,149 @@ func StartAlertJobs(mgr *datasource.Manager) {
 			run()
 		}
 	}()
+}
+
+// --- 财报日历类评估（earn_date / earn_fcst，每日一评） ---
+
+// evaluateEarnDate 纯函数：距预约披露日 ≤N 自然日（N=threshold）命中。
+// 防重（Once=false 时窗口内每天评估都会满足条件）：本披露窗口内已提醒过
+//（TriggeredAt 晚于「披露日-N 天」）则不再命中。返回（命中、观测值=剩余天数、说明）。
+func evaluateEarnDate(rule model.AlertRule, appointDate, reportTypeName string, now time.Time) (bool, float64, string) {
+	ad, err := time.ParseInLocation("2006-01-02", appointDate, time.Local)
+	if err != nil {
+		return false, 0, ""
+	}
+	n := int(rule.Threshold)
+	if n <= 0 {
+		n = 3
+	}
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+	days := int(ad.Sub(today).Hours() / 24)
+	if days < 0 || days > n {
+		return false, float64(days), ""
+	}
+	windowStart := ad.AddDate(0, 0, -n)
+	if rule.TriggeredAt != nil && !rule.TriggeredAt.Before(windowStart) {
+		return false, float64(days), "" // 本窗口已提醒过
+	}
+	label := reportTypeName
+	if label == "" {
+		label = "财报"
+	}
+	when := fmt.Sprintf("%d 天后", days)
+	if days == 0 {
+		when = "今日"
+	}
+	return true, float64(days), fmt.Sprintf("将于 %s 披露 %s（%s）", ad.Format("01-02"), label, when)
+}
+
+// evaluateEarnFcst 纯函数：出现新业绩预告（发布日在近 forecastFreshDays 自然日内）命中。
+// 防重：该预告发布日当天或之后已提醒过（TriggeredAt 日期 >= NoticeDate）则不再命中——
+// 同一份预告只提醒一次，新报告期的新预告（更新的 NoticeDate）会再次命中。
+func evaluateEarnFcst(rule model.AlertRule, fc *model.EarningsForecast, now time.Time) (bool, float64, string) {
+	if fc == nil || fc.NoticeDate == "" {
+		return false, 0, ""
+	}
+	nd, err := time.ParseInLocation("2006-01-02", fc.NoticeDate, time.Local)
+	if err != nil {
+		return false, 0, ""
+	}
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+	age := int(today.Sub(nd).Hours() / 24)
+	if age < 0 || age > forecastFreshDays {
+		return false, 0, ""
+	}
+	if rule.TriggeredAt != nil && rule.TriggeredAt.In(time.Local).Format("2006-01-02") >= fc.NoticeDate {
+		return false, 0, "" // 这份预告已提醒过
+	}
+	typ := fc.PredictType
+	if typ == "" {
+		typ = "业绩预告"
+	}
+	detail := ""
+	switch {
+	case fc.AmpLower != 0 || fc.AmpUpper != 0:
+		detail = fmt.Sprintf("，%s变动 %.2f%%~%.2f%%", fc.PredictFinance, fc.AmpLower, fc.AmpUpper)
+	case fc.Content != "":
+		detail = "：" + truncateRunes(fc.Content, 60)
+	}
+	return true, fc.AmpLower, fmt.Sprintf("%s 发布业绩预告【%s】%s", fc.NoticeDate, typ, detail)
+}
+
+// evaluateEarnRulesForUser 评估某用户全部 active 财报类规则（查本地表，不打上游）。
+// 命中口径与行情类同：recordEvent 落明细（同日去重）、更新规则行、聚合推送。
+func (s *AlertService) evaluateEarnRulesForUser(userID int64) int {
+	var rules []model.AlertRule
+	if err := common.DB.Where("user_id = ? AND status = ? AND kind IN ?",
+		userID, model.AlertStatusActive, earnAlertKinds).Find(&rules).Error; err != nil || len(rules) == 0 {
+		return 0
+	}
+	now := time.Now()
+	today := now.In(time.Local).Format("2006-01-02")
+	notifyOn := false
+	if s.notify != nil {
+		notifyOn = s.notify.HasEnabledChannel(userID) && userNotifyEnabled(userID)
+	}
+	var pushLines []string
+	hits := 0
+
+	for _, rule := range rules {
+		var triggered bool
+		var value float64
+		var msg string
+		switch rule.Kind {
+		case model.AlertKindEarnDate:
+			if sched := UpcomingDisclosure(rule.Symbol, today); sched != nil {
+				triggered, value, msg = evaluateEarnDate(rule, sched.AppointDate, sched.ReportTypeName, now)
+			}
+		case model.AlertKindEarnFcst:
+			triggered, value, msg = evaluateEarnFcst(rule, LatestForecast(rule.Symbol), now)
+		}
+
+		updates := map[string]any{"last_value": round2(value), "last_check_date": today}
+		if triggered {
+			hits++
+			ts := time.Now()
+			updates["triggered_at"] = &ts
+			updates["trigger_msg"] = truncateRunes(msg, 256)
+			if rule.Once {
+				updates["status"] = model.AlertStatusTriggered
+			}
+			recordEvent(rule, msg, today, ts)
+			if notifyOn && (rule.TriggeredAt == nil || rule.TriggeredAt.In(time.Local).Format("2006-01-02") != today) {
+				name := rule.Name
+				if name == "" {
+					name = rule.Symbol
+				}
+				pushLines = append(pushLines, name+"("+rule.Symbol+")："+msg)
+			}
+		}
+		common.DB.Model(&model.AlertRule{}).Where("id = ?", rule.ID).Updates(updates)
+	}
+
+	if notifyOn && len(pushLines) > 0 {
+		content := strings.Join(pushLines, "\n")
+		go s.notify.Send(userID, "QuantVista 财报提醒", content)
+	}
+	return hits
+}
+
+// EvaluateEarningsAll 财报类提醒每日一评：遍历有 active 财报规则的用户。
+// 由 service/finance.go 的每日刷新 job 在数据更新后调用（数据新才评，避免旧数据空评）。
+func (s *AlertService) EvaluateEarningsAll() int {
+	if common.DB == nil {
+		return 0
+	}
+	var userIDs []int64
+	if err := common.DB.Model(&model.AlertRule{}).
+		Where("status = ? AND kind IN ?", model.AlertStatusActive, earnAlertKinds).
+		Distinct().Pluck("user_id", &userIDs).Error; err != nil {
+		common.SysWarn("财报提醒列举用户失败: %v", err)
+		return 0
+	}
+	total := 0
+	for _, uid := range userIDs {
+		total += s.evaluateEarnRulesForUser(uid)
+	}
+	return total
 }

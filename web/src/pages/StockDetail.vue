@@ -14,6 +14,7 @@ import {
   type StockScore,
 } from '@/api/market'
 import { getNews, newsSourceLabel, sentimentTag, type NewsItem } from '@/api/news'
+import { getAnnouncements, type AnnouncementItem } from '@/api/announcement'
 import { useUi, withAlpha } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import { useStockActions } from '@/composables/useStockActions'
@@ -37,6 +38,7 @@ const valuation = ref<Valuation | null>(null)
 const score = ref<StockScore | null>(null)
 const bars = ref<Bar[]>([])
 const news = ref<NewsItem[]>([])
+const announcements = ref<AnnouncementItem[]>([])
 
 // 情绪标签（N2）：利好/利空才渲染，颜色随涨跌色主题。
 function sentiView(n: NewsItem): { text: string; color: string } | null {
@@ -73,6 +75,9 @@ async function load(silent = false) {
     getNews({ symbol: symbol.value, limit: 15 })
       .then((r) => (news.value = r))
       .catch(() => (news.value = []))
+    getAnnouncements(symbol.value, 15)
+      .then((r) => (announcements.value = r))
+      .catch(() => (announcements.value = []))
     const b = await getDailyBars(market.value, symbol.value, 120)
     bars.value = b
     renderChart()
@@ -117,6 +122,7 @@ watch([market, symbol], () => {
   valuation.value = null
   score.value = null
   news.value = []
+  announcements.value = []
   load()
 })
 
@@ -282,6 +288,18 @@ function scoreType(total: number) {
             </SectionCard>
           </n-gi>
         </n-grid>
+
+        <!-- 公告（F1）：东财公告源，标题链到原文；采集范围外的股查询时按需补拉 -->
+        <SectionCard title="公告">
+          <div v-if="announcements.length" class="news-list">
+            <div v-for="a in announcements" :key="a.art_code" class="news-row">
+              <span class="news-time qv-tnum">{{ a.notice_date }}</span>
+              <a :href="a.url" target="_blank" rel="noopener noreferrer" class="news-title">{{ a.title }}</a>
+              <span v-if="a.notice_type" class="news-src">{{ a.notice_type }}</span>
+            </div>
+          </div>
+          <n-empty v-else description="暂无公告数据（东财公告源，A 股标的）" />
+        </SectionCard>
 
         <!-- 相关新闻（N1）：按代码关联财联社电报与东财个股新闻，best-effort -->
         <SectionCard title="相关新闻">

@@ -11,6 +11,12 @@ const (
 	AlertKindVolumeSurge = "volume_surge" // 放量：当日量达到 N 倍 20 日均量（threshold=倍数）
 	AlertKindAmplitude   = "amplitude"    // 振幅：当日振幅达到 x%（(high-low)/prev_close）
 
+	// F1 财报日历类（注意 Kind 列宽 size:16，新增 kind 必须 ≤16 字符）。
+	// 不走盘中 15min 行情评估（无 high/low 判定、避免空转拉行情），
+	// 由财报数据刷新后每日一评（service/finance.go job → EvaluateEarningsAll）。
+	AlertKindEarnDate = "earn_date" // 财报披露临近：距预约披露日 ≤N 自然日（threshold=N）
+	AlertKindEarnFcst = "earn_fcst" // 新业绩预告发布（带预增/预亏类型）
+
 	AlertOpGTE = "gte" // >=（到价/涨幅向上、站上均线、新高突破）
 	AlertOpLTE = "lte" // <=（到价/跌幅向下、跌破均线、新低破位）
 
