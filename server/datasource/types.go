@@ -34,7 +34,10 @@ type Bar struct {
 	Close     float64 `json:"close"`
 	Volume    int64   `json:"volume"` // 成交量，单位：手（各源统一口径，新浪原始为股、解析时 /100）
 	Amount    float64 `json:"amount"`
-	Source    string  `json:"source"` // 实际命中的数据源
+	// TurnoverRate 当日换手率 %（筹码分布累积模型的核心输入）。仅东财日线自带（f61），
+	// 新浪兜底恒 0；0=缺失，消费方（chip.go）需按流通股本推断兜底。
+	TurnoverRate float64 `json:"turnover_rate,omitempty"`
+	Source       string  `json:"source"` // 实际命中的数据源
 }
 
 // Fundamental 基本面摘要（骨架占位，阶段 4/5 扩展）。

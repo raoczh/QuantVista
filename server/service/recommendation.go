@@ -31,11 +31,11 @@ func NewRecommendationService(market *MarketService, watchlist *WatchlistService
 }
 
 const (
-	recPromptVersion   = "p6" // p6: 名单新增 senti_score/senti_news 消息面字段说明；p5: 来源随策略组合+「合格标的充足时给足数量」平衡宁缺毋滥；p4: 四阶段流水线；p3: 落选理由；p2: 估值富化
-	recStrategyVersion = "s4" // s4: 消息面情绪因子加/扣分（当日聚合情绪分）；s3: 策略-来源映射（跌幅/低PB「不热」方向）+ 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
+	recPromptVersion   = "p7" // p7: 名单新增 T1 技术指标（RSI/MACD/BOLL/ATR）与筹码（获利盘/平均成本）字段说明；p6: senti 消息面字段；p5: 来源随策略组合；p4: 四阶段流水线；p3: 落选理由；p2: 估值富化
+	recStrategyVersion = "s5" // s5: T1 指标加分项（水上金叉/RSI 分区/布林位置）+ 筹码超跌加分 + 五维动量/风险维升级（RSI 凹形、ATR）；s4: 消息面情绪因子；s3: 策略-来源映射 + 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
 	maxScanCandidates  = 48   // 进入量化评分的候选上限（约束日线拉取量：48 只 × 1 次 HTTP，并发 6 约 3~8s）
 	maxLLMCandidates   = 16   // 量化排序后进入 LLM 精选的名单上限（控上下文与位置偏差面）
-	factorBarLimit     = 90   // 因子计算的日线根数（MA60 需 ≥60，留余量）
+	factorBarLimit     = 90   // 五维评分/窗口因子的日线口径（MA60 需 ≥60，留余量）；实际拉取按 chipBarLimit=210，评分前截尾
 	maxPoolIntake      = 240  // 建池总量护栏（自选无上限，防极端用户打爆估值批量请求）
 	poolSnapshotMax    = 150  // 候选池快照落库条目上限（MySQL TEXT 64KB 容量保护，超出部分只记数量）
 	recRepairAttempts  = 2
@@ -124,7 +124,7 @@ type candidate struct {
 
 	Sources   []string     `json:"sources,omitempty"`    // watchlist / gainer / active / turnover（可多来源）
 	Excluded  string       `json:"excluded,omitempty"`   // 非空=被用户筛选/风控排除的原因（透明可查）
-	Factors   *candFactors `json:"factors,omitempty"`    // 技术因子快照（90 日线派生）
+	Factors   *candFactors `json:"factors,omitempty"`    // 技术因子快照（210 根日线派生：窗口因子尾窗口径、指标递推、筹码累积）
 	ScoreDims *scoreDims   `json:"score_dims,omitempty"` // 五维评分明细
 	SentiScore float64     `json:"senti_score,omitempty"` // N2 当日聚合情绪分 -1~1（新闻加权合成）
 	SentiNews  int         `json:"senti_news,omitempty"`  // 参与聚合的新闻条数（0=当日无相关新闻）
@@ -1054,7 +1054,7 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 	// scoreRound 对给定下标拉日线并评分；返回本轮存活（未被排除）的数量。
 	scoreRound := func(idxs []int) int {
 		var wg sync.WaitGroup
-		sem := make(chan struct{}, 6) // 并发上限：48 只 × 90 根日线约 3~8s，免费源经不起更狠的并发
+		sem := make(chan struct{}, 6) // 并发上限：48 只 × 210 根日线约 3~8s，免费源经不起更狠的并发
 		var mu sync.Mutex
 		barsBy := map[int][]datasource.Bar{}
 		for _, i := range idxs {
@@ -1063,7 +1063,9 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 			go func(i int) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				bars, err := s.market.GetDailyBars(ctx, pool[i].Market, pool[i].Symbol, factorBarLimit)
+				// 拉 chipBarLimit=210 根：同一个上游请求（仅行数差异），一次取数
+				// 同时满足筹码累积窗口（210）与技术因子窗口（尾部 90）。
+				bars, err := s.market.GetDailyBars(ctx, pool[i].Market, pool[i].Symbol, chipBarLimit)
 				if err != nil {
 					return
 				}
@@ -1081,9 +1083,25 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 				pool[i].Excluded = "日线数据获取失败，未参与量化评分（避免以中性分混入排名并绕过追高保护）"
 				continue
 			}
-			sc := computeScore(pool[i].Price, bars)
+			// 五维评分必须用尾部 factorBarLimit=90 根：positionScore 是全窗口径，
+			// 直接喂 210 根会把「90 日区间位置」悄悄漂成 210 日（Pos60 同类前科）。
+			// computeCandFactors 内部全部是尾窗/递推口径，吃全长只会让 RSI/MACD
+			// 的递推 seed 误差更小，不漂移。
+			barsScore := bars
+			if len(barsScore) > factorBarLimit {
+				barsScore = barsScore[len(barsScore)-factorBarLimit:]
+			}
+			sc := computeScore(pool[i].Price, barsScore)
 			pool[i].ScoreDims = &scoreDims{Trend: sc.Trend, Momentum: sc.Momentum, Position: sc.Position, Volume: sc.Volume, Risk: sc.Risk}
 			pool[i].Factors = computeCandFactors(pool[i].Price, bars)
+
+			// T1 筹码分布（零上游成本本地复算）：获利盘进因子与评分。
+			// 失败（次新股不足 120 根/换手缺失）静默缺席——ChipBars=0 即「未算」。
+			if chip, err := computeChipDistribution(bars, 0); err == nil {
+				pool[i].Factors.ChipProfit = chip.Profit
+				pool[i].Factors.ChipAvgCost = chip.AvgCost
+				pool[i].Factors.ChipBars = chip.BarCount
+			}
 
 			// 追高保护（依赖近 5 日涨幅因子）。
 			if reason := applyGainFilter(pool[i], pool[i].Factors, filters); reason != "" {
@@ -1321,7 +1339,7 @@ func (s *RecommendationService) buildMessages(recType string, strat *strategyTem
 	u.WriteString("名单已按量化综合分（score，0-100）降序排列，rank=1 为最高分。score 由五维技术评分（趋势/动量/位置/量能/风险，score_dims）加策略加分项（strategy_notes）合成，仅有排序意义、不代表预期收益。\n")
 	fmt.Fprintf(&u, "硬性要求：只能从名单里选，symbol 必须与名单完全一致，严禁名单外或虚构的标的；名单中符合策略的合格标的充足时应给足 %d 个，确实不足时宁可少选甚至不选（picks 可为空数组），绝不硬凑。你可以不同意量化排序（例如否决 rank 靠前者），但必须用名单中的数据说明理由。\n", count)
 	u.WriteString("同时请在 rejected 数组中，对名单内未入选的标的各给一句话落选理由，只解释名单内标的。\n\n")
-	u.WriteString("【量化初选名单】（JSON；price 现价、change_pct 当日涨跌%、amount_yi 成交额亿元、turnover_rate 换手%、volume_ratio 量比、float_cap_yi 流通市值亿元、pe_ttm 市盈率TTM（负=亏损）、pb 市净率、senti_score 当日新闻聚合情绪分-1~1（senti_news 为条数，字段缺失=当日无相关新闻，不得臆测消息面）；factors：ma5/ma10/ma20/ma60 均线、chg_5d/chg_20d 近5/20日涨跌%、high_20d 创20日新高、bull_align 多头排列、vol_boost 今日量/5日均量、bias_20 MA20乖离%、volatility_20 波动率%、drawdown_20 近20日最大回撤%、pos_60 60日区间位置；估值字段缺失表示该数据暂不可得，不得臆测）：\n")
+	u.WriteString("【量化初选名单】（JSON；price 现价、change_pct 当日涨跌%、amount_yi 成交额亿元、turnover_rate 换手%、volume_ratio 量比、float_cap_yi 流通市值亿元、pe_ttm 市盈率TTM（负=亏损）、pb 市净率、senti_score 当日新闻聚合情绪分-1~1（senti_news 为条数，字段缺失=当日无相关新闻，不得臆测消息面）；factors：ma5/ma10/ma20/ma60 均线、chg_5d/chg_20d 近5/20日涨跌%、high_20d 创20日新高、bull_align 多头排列、vol_boost 今日量/5日均量、bias_20 MA20乖离%、volatility_20 波动率%、drawdown_20 近20日最大回撤%、pos_60 60日区间位置、rsi_14 RSI(14,Wilder)、macd_dif/macd_dea/macd_hist MACD(12,26,9)（柱=2×(DIF−DEA)）、macd_gold DIF在DEA上方、macd_cross_up 近3日金叉、boll_up/boll_mid/boll_low 布林带(20,2σ)、boll_pos 布林带内位置%、atr_14/atr_pct 真实波幅及其占现价%、chip_profit 获利盘%（收盘价下方筹码占比）、chip_avg_cost 筹码平均成本（chip_bars 为筹码窗口根数，缺失=未计算，不得臆测筹码面）；指标/估值字段缺失表示该数据暂不可得，不得臆测）：\n")
 	if b, err := json.Marshal(compactForLLM(recType, llmCands)); err == nil {
 		u.Write(b)
 	}

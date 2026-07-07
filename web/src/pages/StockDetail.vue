@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { NButton, NEmpty, NGi, NGrid, NResult, NSpin, NTag } from 'naive-ui'
 import * as echarts from 'echarts'
@@ -8,10 +8,14 @@ import {
   getDailyBars,
   getValuation,
   getScore,
+  getIndicators,
+  getChips,
   type Quote,
   type Bar,
   type Valuation,
   type StockScore,
+  type IndicatorSeries,
+  type ChipDist,
 } from '@/api/market'
 import { getNews, newsSourceLabel, sentimentTag, type NewsItem } from '@/api/news'
 import { getAnnouncements, type AnnouncementItem } from '@/api/announcement'
@@ -37,6 +41,8 @@ const quote = ref<Quote | null>(null)
 const valuation = ref<Valuation | null>(null)
 const score = ref<StockScore | null>(null)
 const bars = ref<Bar[]>([])
+const indicators = ref<IndicatorSeries | null>(null)
+const chips = ref<ChipDist | null>(null)
 const news = ref<NewsItem[]>([])
 const announcements = ref<AnnouncementItem[]>([])
 
@@ -56,6 +62,10 @@ const stockRef = computed(() => ({
 
 const chartEl = ref<HTMLDivElement | null>(null)
 let chart: echarts.ECharts | null = null
+const chipEl = ref<HTMLDivElement | null>(null)
+let chipChart: echarts.ECharts | null = null
+const chipTrendEl = ref<HTMLDivElement | null>(null)
+let chipTrendChart: echarts.ECharts | null = null
 
 async function load(silent = false) {
   if (!symbol.value) return
@@ -78,6 +88,20 @@ async function load(silent = false) {
     getAnnouncements(symbol.value, 15)
       .then((r) => (announcements.value = r))
       .catch(() => (announcements.value = []))
+    // 指标副图 / 筹码分布 best-effort：失败时 K 线退回单图、筹码卡显示占位。
+    getIndicators(market.value, symbol.value, 120)
+      .then((r) => {
+        indicators.value = r
+        renderChart()
+      })
+      .catch(() => (indicators.value = null))
+    getChips(market.value, symbol.value)
+      .then((r) => {
+        chips.value = r
+        // 筹码卡容器在 v-if 内，等 DOM 渲染后再挂图。
+        nextTick(() => renderChipCharts())
+      })
+      .catch(() => (chips.value = null))
     const b = await getDailyBars(market.value, symbol.value, 120)
     bars.value = b
     renderChart()
@@ -91,6 +115,15 @@ async function load(silent = false) {
   }
 }
 
+// alignByDate 把指标序列按交易日对齐到 K 线（两次独立请求可能相差末根，按日期匹配防画歪）。
+function alignByDate(vals: (number | null)[]): (number | null)[] {
+  const ind = indicators.value
+  if (!ind) return []
+  const m = new Map<string, number | null>()
+  ind.dates.forEach((d, i) => m.set(d, vals[i] ?? null))
+  return bars.value.map((b) => m.get(b.trade_date) ?? null)
+}
+
 function renderChart() {
   if (!chartEl.value || !bars.value.length) return
   if (chart) {
@@ -100,27 +133,176 @@ function renderChart() {
   chart = echarts.init(chartEl.value, isDark.value ? 'dark' : undefined)
   const up = vars.value.errorColor
   const down = vars.value.successColor
+  const dates = bars.value.map((b) => b.trade_date)
+  const kline = {
+    type: 'candlestick' as const,
+    name: '日K',
+    data: bars.value.map((b) => [b.open, b.close, b.low, b.high]),
+    itemStyle: { color: up, color0: down, borderColor: up, borderColor0: down },
+  }
+
+  // 指标未就绪/失败：退回单图 K 线。
+  if (!indicators.value) {
+    chart.setOption({
+      backgroundColor: 'transparent',
+      tooltip: { trigger: 'axis', axisPointer: { type: 'cross' }, confine: true },
+      grid: { left: 52, right: 16, top: 16, bottom: 36 },
+      xAxis: { type: 'category', data: dates, boundaryGap: false },
+      yAxis: { type: 'value', scale: true, splitLine: { lineStyle: { opacity: 0.4 } } },
+      series: [kline],
+    })
+    return
+  }
+
+  // 主图 K 线 + BOLL(20,2σ) 叠加，副图 MACD(12,26,9)（柱=2×(DIF−DEA) A 股口径）。
+  const bollColor = vars.value.warningColor
+  const midColor = vars.value.primaryColor
+  const difColor = vars.value.primaryColor
+  const deaColor = vars.value.warningColor
+  const line = (name: string, data: (number | null)[], color: string, opacity = 1, extra: object = {}) => ({
+    type: 'line' as const,
+    name,
+    data,
+    symbol: 'none',
+    lineStyle: { width: 1, color, opacity },
+    itemStyle: { color },
+    emphasis: { disabled: true },
+    ...extra,
+  })
   chart.setOption({
     backgroundColor: 'transparent',
     tooltip: { trigger: 'axis', axisPointer: { type: 'cross' }, confine: true },
-    grid: { left: 52, right: 16, top: 16, bottom: 36 },
-    xAxis: { type: 'category', data: bars.value.map((b) => b.trade_date), boundaryGap: false },
-    yAxis: { type: 'value', scale: true, splitLine: { lineStyle: { opacity: 0.4 } } },
-    series: [
+    axisPointer: { link: [{ xAxisIndex: 'all' }] },
+    legend: {
+      top: 0,
+      type: 'scroll',
+      data: ['上轨', '中轨', '下轨', 'DIF', 'DEA', 'MACD'],
+      textStyle: { color: vars.value.textColor3, fontSize: 11 },
+      itemWidth: 14,
+      itemHeight: 8,
+    },
+    grid: [
+      { left: 52, right: 16, top: 26, height: '58%' },
+      { left: 52, right: 16, top: '76%', height: '18%' },
+    ],
+    xAxis: [
+      { type: 'category', data: dates, boundaryGap: false },
       {
-        type: 'candlestick',
-        data: bars.value.map((b) => [b.open, b.close, b.low, b.high]),
-        itemStyle: { color: up, color0: down, borderColor: up, borderColor0: down },
+        type: 'category',
+        gridIndex: 1,
+        data: dates,
+        boundaryGap: false,
+        axisLabel: { show: false },
+        axisTick: { show: false },
       },
+    ],
+    yAxis: [
+      { type: 'value', scale: true, splitLine: { lineStyle: { opacity: 0.4 } } },
+      { type: 'value', gridIndex: 1, scale: true, splitNumber: 2, splitLine: { show: false } },
+    ],
+    series: [
+      kline,
+      line('上轨', alignByDate(indicators.value.boll_up), bollColor, 0.65),
+      line('中轨', alignByDate(indicators.value.boll_mid), midColor, 0.85),
+      line('下轨', alignByDate(indicators.value.boll_low), bollColor, 0.65),
+      {
+        type: 'bar',
+        name: 'MACD',
+        xAxisIndex: 1,
+        yAxisIndex: 1,
+        data: alignByDate(indicators.value.hist),
+        itemStyle: {
+          color: (p: { value: number | null }) => ((p.value ?? 0) >= 0 ? up : down),
+        },
+        barWidth: '60%',
+      },
+      line('DIF', alignByDate(indicators.value.dif), difColor, 1, { xAxisIndex: 1, yAxisIndex: 1 }),
+      line('DEA', alignByDate(indicators.value.dea), deaColor, 1, { xAxisIndex: 1, yAxisIndex: 1 }),
     ],
   })
 }
 
-watch(isDark, () => renderChart())
+// 筹码峰：横向分布（获利/套牢按现价分色）+ 获利比例近 90 日趋势迷你图。
+function renderChipCharts() {
+  const c = chips.value
+  if (!c) return
+  const up = vars.value.errorColor
+  const down = vars.value.successColor
+  if (chipEl.value) {
+    chipChart?.dispose()
+    chipChart = echarts.init(chipEl.value, isDark.value ? 'dark' : undefined)
+    const profit: (number | null)[] = []
+    const trapped: (number | null)[] = []
+    c.prices.forEach((p, i) => {
+      const v = Math.round(c.chips[i] * 10000) / 100 // 占比 %
+      profit.push(p <= c.last_close ? v : null)
+      trapped.push(p > c.last_close ? v : null)
+    })
+    chipChart.setOption({
+      backgroundColor: 'transparent',
+      tooltip: {
+        trigger: 'axis',
+        confine: true,
+        formatter: (ps: { axisValue: string; value: number | null }[]) => {
+          const row = ps.find((x) => x.value != null)
+          return row ? `价位 ${row.axisValue}<br/>筹码占比 ${row.value}%` : ''
+        },
+      },
+      grid: { left: 56, right: 12, top: 8, bottom: 22 },
+      xAxis: {
+        type: 'value',
+        axisLabel: { formatter: '{value}%', fontSize: 10 },
+        splitLine: { lineStyle: { opacity: 0.3 } },
+      },
+      yAxis: {
+        type: 'category',
+        data: c.prices.map((p) => p.toFixed(2)),
+        axisLabel: { interval: 29, fontSize: 10 },
+        axisTick: { show: false },
+      },
+      series: [
+        { type: 'bar', name: '获利', stack: 'chip', data: profit, barCategoryGap: '0%', itemStyle: { color: up, opacity: 0.85 } },
+        { type: 'bar', name: '套牢', stack: 'chip', data: trapped, barCategoryGap: '0%', itemStyle: { color: down, opacity: 0.85 } },
+      ],
+    })
+  }
+  if (chipTrendEl.value) {
+    chipTrendChart?.dispose()
+    chipTrendChart = echarts.init(chipTrendEl.value, isDark.value ? 'dark' : undefined)
+    chipTrendChart.setOption({
+      backgroundColor: 'transparent',
+      tooltip: {
+        trigger: 'axis',
+        confine: true,
+        formatter: (ps: { axisValue: string; value: number }[]) =>
+          ps.length ? `${ps[0].axisValue}<br/>获利比例 ${ps[0].value}%` : '',
+      },
+      grid: { left: 4, right: 4, top: 4, bottom: 4 },
+      xAxis: { type: 'category', data: c.days.map((d) => d.date), show: false },
+      yAxis: { type: 'value', min: 0, max: 100, show: false },
+      series: [
+        {
+          type: 'line',
+          data: c.days.map((d) => d.profit),
+          symbol: 'none',
+          lineStyle: { width: 1.5, color: vars.value.primaryColor },
+          areaStyle: { color: withAlpha(vars.value.primaryColor, 0.12) },
+        },
+      ],
+    })
+  }
+}
+
+watch(isDark, () => {
+  renderChart()
+  renderChipCharts()
+})
 // 同页跳转到另一只个股（如从对比/搜索进来）时整页重载。
 watch([market, symbol], () => {
   valuation.value = null
   score.value = null
+  indicators.value = null
+  chips.value = null
   news.value = []
   announcements.value = []
   load()
@@ -134,9 +316,15 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
   chart?.dispose()
   chart = null
+  chipChart?.dispose()
+  chipChart = null
+  chipTrendChart?.dispose()
+  chipTrendChart = null
 })
 function onResize() {
   chart?.resize()
+  chipChart?.resize()
+  chipTrendChart?.resize()
 }
 useAutoRefresh(() => load(true), 60_000)
 
@@ -232,10 +420,47 @@ function scoreType(total: number) {
           </div>
         </SectionCard>
 
-        <!-- 日 K -->
+        <!-- 日 K + MACD/BOLL 副图 -->
         <SectionCard title="日 K（近 120 交易日）">
+          <template #extra>
+            <span class="src-hint">BOLL(20,2σ) · MACD(12,26,9)</span>
+          </template>
           <div ref="chartEl" class="kchart"></div>
           <n-empty v-if="!bars.length" description="日线数据暂不可用" />
+        </SectionCard>
+
+        <!-- 筹码分布（T1）：日K+换手率三角衰减本地复算，与东财展示或有复权口径差异 -->
+        <SectionCard title="筹码分布">
+          <template #extra>
+            <span class="src-hint">本地复算 · 前复权口径</span>
+          </template>
+          <div v-if="chips" class="chip-wrap">
+            <div ref="chipEl" class="chip-chart"></div>
+            <div class="chip-side">
+              <div class="chip-hero">
+                <span class="qc-k">获利比例</span>
+                <span class="chip-profit qv-figure" :style="{ color: pctColor(chips.profit >= 50 ? 1 : -1) }">
+                  {{ chips.profit.toFixed(1) }}%
+                </span>
+              </div>
+              <div class="quote-grid chip-grid">
+                <div class="qc"><span class="qc-k">平均成本</span><span class="qc-v qv-tnum">{{ chips.avg_cost.toFixed(2) }}</span></div>
+                <div class="qc"><span class="qc-k">现价</span><span class="qc-v qv-tnum">{{ chips.last_close.toFixed(2) }}</span></div>
+                <div class="qc"><span class="qc-k">90% 成本区间</span><span class="qc-v qv-tnum">{{ chips.c90_low.toFixed(2) }} ~ {{ chips.c90_high.toFixed(2) }}</span></div>
+                <div class="qc"><span class="qc-k">90% 集中度</span><span class="qc-v qv-tnum">{{ chips.conc_90.toFixed(1) }}%</span></div>
+                <div class="qc"><span class="qc-k">70% 成本区间</span><span class="qc-v qv-tnum">{{ chips.c70_low.toFixed(2) }} ~ {{ chips.c70_high.toFixed(2) }}</span></div>
+                <div class="qc"><span class="qc-k">70% 集中度</span><span class="qc-v qv-tnum">{{ chips.conc_70.toFixed(1) }}%</span></div>
+              </div>
+              <div class="chip-trend-block">
+                <span class="qc-k">获利比例 · 近 {{ chips.days.length }} 交易日</span>
+                <div ref="chipTrendEl" class="chip-trend"></div>
+              </div>
+              <div class="src-hint">
+                基于近 {{ chips.bar_count }} 根日K与换手率的三角分布衰减模型本地复算<span v-if="chips.data_limited">（上市时间较短，窗口不足 210 根，精度受限）</span>；仅研究参考。
+              </div>
+            </div>
+          </div>
+          <n-empty v-else description="筹码数据暂不可用（需 ≥120 根日线与换手率，A 股标的）" />
         </SectionCard>
 
         <!-- 估值 + 评分 -->
@@ -388,7 +613,56 @@ function scoreType(total: number) {
 }
 .kchart {
   width: 100%;
-  height: 360px;
+  height: 460px;
+}
+
+/* ---------- 筹码分布 ---------- */
+.chip-wrap {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  gap: 16px;
+  align-items: stretch;
+}
+.chip-chart {
+  width: 100%;
+  height: 320px;
+  min-width: 0;
+}
+.chip-side {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.chip-hero {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.chip-profit {
+  font-size: 30px;
+  font-weight: 700;
+  line-height: 1;
+}
+.chip-grid {
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+}
+.chip-trend-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.chip-trend {
+  width: 100%;
+  height: 64px;
+}
+@media (max-width: 768px) {
+  .chip-wrap {
+    grid-template-columns: 1fr;
+  }
+  .chip-chart {
+    height: 260px;
+  }
 }
 .src-hint {
   font-size: 12px;

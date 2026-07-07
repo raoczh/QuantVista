@@ -15,12 +15,15 @@ import (
 
 // MarketController 行情相关接口。
 type MarketController struct {
-	svc   *service.MarketService
-	score *service.ScoreService
+	svc       *service.MarketService
+	score     *service.ScoreService
+	indicator *service.IndicatorService
+	chip      *service.ChipService
 }
 
-func NewMarketController(svc *service.MarketService, score *service.ScoreService) *MarketController {
-	return &MarketController{svc: svc, score: score}
+func NewMarketController(svc *service.MarketService, score *service.ScoreService,
+	indicator *service.IndicatorService, chip *service.ChipService) *MarketController {
+	return &MarketController{svc: svc, score: score, indicator: indicator, chip: chip}
 }
 
 // GetOverview GET /api/markets/:market/overview
@@ -101,6 +104,46 @@ func (mc *MarketController) GetValuation(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, v)
+}
+
+// GetIndicators GET /api/markets/:market/stocks/:symbol/indicators?limit=120
+// 返回与 K 线对齐的 MACD/BOLL/RSI/ATR 序列（详情页副图；后端统一口径计算）。
+func (mc *MarketController) GetIndicators(c *gin.Context) {
+	market := strings.ToLower(c.Param("market"))
+	symbol := strings.TrimSpace(c.Param("symbol"))
+	if symbol == "" {
+		common.ApiErrorMsg(c, "symbol 不能为空")
+		return
+	}
+	limit := 120
+	if v := c.Query("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 250 {
+			limit = n
+		}
+	}
+	view, err := mc.indicator.Series(c.Request.Context(), market, symbol, limit)
+	if err != nil {
+		common.ApiErrorMsg(c, "获取指标失败: "+err.Error())
+		return
+	}
+	common.ApiSuccess(c, view)
+}
+
+// GetChips GET /api/markets/:market/stocks/:symbol/chips
+// 筹码分布本地复算（210 根日线 + 换手率三角衰减模型）。
+func (mc *MarketController) GetChips(c *gin.Context) {
+	market := strings.ToLower(c.Param("market"))
+	symbol := strings.TrimSpace(c.Param("symbol"))
+	if symbol == "" {
+		common.ApiErrorMsg(c, "symbol 不能为空")
+		return
+	}
+	view, err := mc.chip.Distribution(c.Request.Context(), market, symbol)
+	if err != nil {
+		common.ApiErrorMsg(c, "获取筹码分布失败: "+err.Error())
+		return
+	}
+	common.ApiSuccess(c, view)
 }
 
 // --- 管理员：市场数据维护 ---
