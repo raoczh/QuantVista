@@ -41,6 +41,7 @@ func AllModels() []any {
 		&ResearchNote{},
 		&DailyReport{},
 		&News{},
+		&StockSentiment{},
 	}
 }
 

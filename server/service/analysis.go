@@ -49,7 +49,7 @@ func NewAnalysisService(market *MarketService, watchlist *WatchlistService, posi
 
 // 版本号：数据快照 + 这两个版本号共同保证「凭版本号复现」。改 prompt/策略时递增。
 const (
-	analysisPromptVersion   = "p5" // p5: 证据数字程序化核验威慑条款（引用数字会被系统核对，不符将标记展示）；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
+	analysisPromptVersion   = "p6" // p6: 个股快照新增 news 舆情段（最近5条标题+情绪标签，无新闻注入程序化市场信号）；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
 	analysisStrategyVersion = "s1"
 	maxRepairAttempts       = 2 // 结构化校验失败后的额外重试次数（总调用 = 1 + maxRepairAttempts）
 )
@@ -332,6 +332,9 @@ func (s *AnalysisService) fillAnalysisTrust(ctx context.Context, cfg *model.LLMC
 	texts = append(texts, result.AntiThesis...)
 	texts = append(texts, result.KillSwitches...)
 	vals := snapshotValueSet(snapshot, "recent_bars")
+	// 新闻标题是喂给模型的文本型合法来源（N2 舆情段）：标题里的小数并入值域，
+	// 忠实引用不算幻觉（同日报 Alerts 前例）。
+	vals = append(vals, decimalNumbersIn(newsTitleTexts(snapshot))...)
 	result.EvidenceCheck = verifyEvidenceValues(texts, vals)
 	result.SysConfidence, result.SysConfidenceWhy = analysisSystemConfidence(result.EvidenceCheck, snapshot)
 
@@ -385,6 +388,11 @@ func analysisSystemConfidence(ev *evidenceCheck, snapshot map[string]any) (strin
 		if !hasTech || !hasQuant {
 			level--
 			reasons = append(reasons, "技术指标或量化评分缺失，个股判断精度受限")
+		}
+		// N2 舆情段数据完备度：有相关新闻是加分信息（不升档——覆盖面有限），
+		// 无新闻属常态不扣分，只在依据里如实说明。
+		if n := len(newsTitleTexts(snapshot)); n > 0 {
+			reasons = append(reasons, fmt.Sprintf("含 %d 条相关新闻舆情", n))
 		}
 	}
 	if _, ok := snapshot["freshness_note"]; ok {
@@ -715,7 +723,8 @@ var moduleGuidance = map[string]string{
 - 短中期动能：近 5 日、近 20 日涨跌幅反映的动能强弱与超买超卖倾向；
 - 估值水位：若提供了 valuation，结合 PE/PB/市值说明估值的绝对水位与含义（无行业对比数据，须说明这是绝对水位而非行业相对水位；PE 为负表示亏损）；标注 is_st 的标的必须提示退市/风险警示；
 - 量化锚点：quant_score 是确定性算出的技术面综合分，你的定性判断若与其明显相悖（如评分 30 弱势而你看多），必须专门解释分歧原因，不可无视。
-重要限制：估值仅为快照指标，不含财务三表明细（营收/利润/负债）、机构持仓、个股资金流与新闻公告。若结论依赖这些，必须说明「数据缺失、无法判断」，绝不虚构。若快照带 freshness_note，措辞必须体现数据非实时。rating 以技术面为主、估值水位为辅给出。
+- 消息面（若快照含 news 块）：news.items 是该股最近相关新闻的标题与情绪标签（利好/利空/中性为程序化预判），结合技术面判断消息驱动的持续性；权重纪律：公告>政策>报道>传闻，旧闻与已充分定价的消息不加分；引用新闻只能复述给出的标题，不得展开臆测正文细节。若 news 标注「暂无直接相关新闻」，请依据 market_signals（涨跌五档/量能三档/换手率）判断，并在措辞中明示消息面数据缺失。
+重要限制：估值仅为快照指标，不含财务三表明细（营收/利润/负债）、机构持仓与个股资金流。news 块的覆盖面有限（快讯与个股新闻采集），没有新闻不代表没有消息。若结论依赖未提供的数据，必须说明「数据缺失、无法判断」，绝不虚构。若快照带 freshness_note，措辞必须体现数据非实时。rating 以技术面为主、估值水位与消息面为辅给出。
 反方视角（必填）：anti_thesis 针对你给出的 rating 论证相反情形（看多时论证为什么现在买入可能是错的，看空/中性亦然）；kill_switches 给出可观察的失效信号（价格/均线/量能等具体条件）；unknowns 列出财务、新闻、资金流等本次数据看不到但影响结论的盲区。`,
 
 	model.AnalysisModuleMarket: `本次分析对象是【整个市场】。可用数据：主要指数行情、涨跌家数与涨停/跌停数（市场情绪核心）、两市资金流（主力/超大/大/中/小单净流入）、涨幅榜、成交活跃榜、板块涨跌榜。
@@ -771,7 +780,7 @@ const analysisOutputSpec = `输出要求：
 - disclaimer: 字符串，风险与免责提示`
 
 // panelGuidance 多角色观点（mode=panel，仅个股模块）：一次调用同时输出四个立场角色的独立结论。
-const panelGuidance = `本次任务是【个股多角色观点】：你需要同时扮演四位立场不同的研究员，对同一只个股各自独立给出观点，再总结共识与分歧。可用数据与个股分析相同：实时行情快照、估值与盘面快照 valuation（缺失表示估值数据暂不可得）、技术指标（MA5/MA10/MA20、区间高低、近 5/20 日涨跌幅）与近期日 K 明细；不含财务三表、新闻与个股资金流，任何角色都不得虚构这些数据。
+const panelGuidance = `本次任务是【个股多角色观点】：你需要同时扮演四位立场不同的研究员，对同一只个股各自独立给出观点，再总结共识与分歧。可用数据与个股分析相同：实时行情快照、估值与盘面快照 valuation（缺失表示估值数据暂不可得）、技术指标（MA5/MA10/MA20、区间高低、近 5/20 日涨跌幅）、近期日 K 明细，以及 news 舆情段（最近相关新闻标题+情绪标签，标注「暂无直接相关新闻」时按 market_signals 判断）；不含财务三表与个股资金流，任何角色都不得虚构这些数据，引用新闻只能复述给出的标题。
 
 四个角色与视角（各自独立判断，不得互相妥协、允许结论矛盾）：
 - technical（技术面研究员）：只看趋势、均线排列、支撑压力与量价配合；

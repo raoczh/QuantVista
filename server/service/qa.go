@@ -131,6 +131,8 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 	var snap map[string]any
 	if json.Unmarshal([]byte(conv.DataSnapshot), &snap) == nil {
 		vals := snapshotValueSet(snap, "recent_bars")
+		// 快照 news 舆情段的新闻标题是文本型合法来源，标题里的小数并入值域（N2）。
+		vals = append(vals, decimalNumbersIn(newsTitleTexts(snap))...)
 		userTexts := []string{question}
 		for _, m := range history {
 			if m.Role == model.QaRoleUser {
@@ -222,14 +224,14 @@ func (s *QaService) buildMessages(conv model.AiConversation, history []model.AiC
 }
 
 // qaPromptVersion 问答系统提示版本（会话不落库版本列，仅供代码内追溯）。
-// q3: 回答引用的数字会被程序化核验，威慑幻觉；q2: 快照含五维量化评分锚点、要求引用数值、禁用先验记忆。
-const qaPromptVersion = "q3"
+// q4: 快照新增 news 舆情段（最近相关新闻标题+情绪标签）；q3: 回答引用的数字会被程序化核验，威慑幻觉；q2: 快照含五维量化评分锚点、要求引用数值、禁用先验记忆。
+const qaPromptVersion = "q4"
 
 const qaRoleIntro = `你是一名严谨的证券研究助理，正在就某只个股与用户进行多轮问答。你的回答仅供研究参考，不构成投资建议。
 
 要求：
 1. 只依据【个股数据快照】中的事实回答，严禁编造未提供的财务、消息、评级或价格；数据不足时明确说明局限，不臆测。禁止使用你记忆中关于该公司的信息（名气/行业地位/历史印象都不算数据）。
-2. 该快照仅含实时行情、技术指标与五维量化评分 quant_score（纯技术面 0-100 参考锚点），无财务报表/新闻/资金流，涉及这些维度时如实告知数据缺失。
+2. 该快照仅含实时行情、技术指标、五维量化评分 quant_score（纯技术面 0-100 参考锚点）与可能存在的 news 舆情段（最近相关新闻标题+情绪标签，覆盖面有限），无财务报表与资金流，涉及缺失维度时如实告知。引用新闻只能复述给出的标题，不得臆测正文细节；news 标注「暂无直接相关新闻」时按 market_signals 判断并明示消息面缺失。
 3. 关键判断引用快照中的具体字段与数值（如「现价 12.34 高于 MA20=11.98」），让用户可以核对。系统会程序化核对你回答中引用的数字，与快照不符的会被标记展示给用户，因此不要编造或凭印象填写数字。
 4. 回答简明、聚焦用户问题，使用简体中文；必要时给出研究性看法，但不下达买卖指令。`
 

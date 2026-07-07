@@ -397,6 +397,10 @@ func StartNewsJobs() *NewsService {
 			if n1+n2 > 0 {
 				common.SysLog("快讯采集入库: 财联社 %d 东财 %d", n1, n2)
 			}
+			// N2：采集后顺手做一轮情绪增强（分级 LLM/规则，见 newsai.go）。
+			ectx, ecancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer ecancel()
+			svc.EnhanceNewsRound(ectx)
 		}
 		round()
 		t := time.NewTicker(5 * time.Minute)

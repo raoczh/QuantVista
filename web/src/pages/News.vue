@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { NButton, NEmpty, NInput, NRadioButton, NRadioGroup, NSpin, NTag } from 'naive-ui'
-import { getNews, newsSourceLabel, parseRelatedSymbols, type NewsItem } from '@/api/news'
+import { getNews, newsSourceLabel, parseRelatedSymbols, sentimentTag, type NewsItem } from '@/api/news'
 import { useUi, withAlpha } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import { useStockActions } from '@/composables/useStockActions'
@@ -10,8 +10,14 @@ import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 
 const route = useRoute()
-const { vars, isDark } = useUi()
+const { vars, isDark, pctColor } = useUi()
 const { goDetail } = useStockActions()
+
+// 情绪标签（N2）：利好/利空才渲染，颜色随涨跌色主题。
+function sentiView(n: NewsItem): { text: string; color: string } | null {
+  const t = sentimentTag(n)
+  return t ? { text: t.text, color: pctColor(t.dir) } : null
+}
 
 // ---------- 筛选 ----------
 const sourceOptions = [
@@ -213,6 +219,11 @@ const feedVars = computed(() => ({
                 <p v-if="showSummary(n)" class="fi-summary">{{ n.summary }}</p>
                 <div class="fi-meta">
                   <span class="fi-src">{{ newsSourceLabel(n) }}</span>
+                  <span
+                    v-if="sentiView(n)"
+                    class="fi-senti"
+                    :style="{ color: sentiView(n)!.color, background: withAlpha(sentiView(n)!.color, isDark ? 0.16 : 0.1) }"
+                  >{{ sentiView(n)!.text }}</span>
                   <button
                     v-for="s in parseRelatedSymbols(n.related_symbols).slice(0, 4)"
                     :key="s"
@@ -364,6 +375,12 @@ a.fi-title:hover {
   border-radius: 999px;
   background: var(--nf-tag-bg);
   opacity: 0.75;
+}
+.fi-senti {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 999px;
 }
 .fi-sym {
   font-size: 11px;

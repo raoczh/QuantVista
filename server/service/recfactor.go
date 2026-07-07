@@ -200,6 +200,17 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 		notes = append(notes, fmt.Sprintf("%s（%s%.0f）", note, sign, d))
 	}
 
+	// N2 消息面因子（短线/长线通用）：当日聚合情绪分显著偏向时加/扣分。
+	// 利空扣得比利好加得重（消息面上「坏消息更真」的不对称性）；|score|<0.3 视为噪声不动分。
+	if c.SentiNews > 0 {
+		switch {
+		case c.SentiScore >= 0.3:
+			add(3, fmt.Sprintf("当日利好情绪 %.2f（%d 条新闻）", c.SentiScore, c.SentiNews))
+		case c.SentiScore <= -0.3:
+			add(-4, fmt.Sprintf("当日利空情绪 %.2f（%d 条新闻）", c.SentiScore, c.SentiNews))
+		}
+	}
+
 	if recType == model.RecTypeShortTerm {
 		// 短线共用风险扣分。
 		if f.Bias20 > 12 {
@@ -322,7 +333,7 @@ func candidateValueSet(c candidate) []float64 {
 	vals := []float64{
 		c.Price, c.ChangePct, c.Amount, c.Amount / 1e8,
 		c.PETTM, c.PB, c.TotalCap, c.TotalCap / 1e8, c.FloatCap, c.FloatCap / 1e8,
-		c.TurnoverRate, c.VolumeRatio, c.Amplitude, c.Score,
+		c.TurnoverRate, c.VolumeRatio, c.Amplitude, c.Score, c.SentiScore,
 	}
 	if c.Factors != nil {
 		f := c.Factors
