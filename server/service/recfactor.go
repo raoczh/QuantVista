@@ -33,6 +33,26 @@ type candFactors struct {
 	Bias20       float64 `json:"bias_20,omitempty"`       // (现价/MA20-1)% 乖离率
 	Pos60        float64 `json:"pos_60"`                  // 60 日区间位置 0-100
 	BarCount     int     `json:"bar_count"`
+
+	// T1 经典指标（indicator.go 口径：RSI/ATR Wilder 平滑、MACD 柱 2 倍、BOLL 2σ）。
+	// 全部 omitempty：样本不足时缺席，LLM/前端见不到即不会引用。
+	RSI14     float64 `json:"rsi_14,omitempty"`
+	MACDDif   float64 `json:"macd_dif,omitempty"`
+	MACDDea   float64 `json:"macd_dea,omitempty"`
+	MACDHist  float64 `json:"macd_hist,omitempty"`     // 2×(DIF−DEA) A 股柱口径
+	MACDGold  bool    `json:"macd_gold,omitempty"`     // DIF>DEA 多头状态
+	MACDXUp   bool    `json:"macd_cross_up,omitempty"` // 近 3 日 DIF 上穿 DEA（金叉）
+	BollUp    float64 `json:"boll_up,omitempty"`
+	BollMid   float64 `json:"boll_mid,omitempty"`
+	BollLow   float64 `json:"boll_low,omitempty"`
+	BollPos   float64 `json:"boll_pos,omitempty"` // 带内位置 %（<0 破下轨、>100 破上轨）
+	ATR14     float64 `json:"atr_14,omitempty"`
+	ATRPct    float64 `json:"atr_pct,omitempty"` // ATR/现价 %
+
+	// T1 筹码分布（chip.go 三角衰减模型，需 210 根日线；ChipBars=0 表示未算/不足）。
+	ChipProfit  float64 `json:"chip_profit,omitempty"`   // 获利盘 %（收盘价下方筹码占比）
+	ChipAvgCost float64 `json:"chip_avg_cost,omitempty"` // 筹码平均成本
+	ChipBars    int     `json:"chip_bars,omitempty"`     // 参与筹码计算的日线根数
 }
 
 // scoreDims 五维评分明细（透传 computeScore 结果，前端展示雷达/分项）。
@@ -162,6 +182,16 @@ func computeCandFactors(price float64, bars []datasource.Bar) *candFactors {
 	} else {
 		f.Pos60 = 50
 	}
+
+	// T1 经典指标快照（各指标按样本量独立可用；筹码字段由调用方另行填充——
+	// 它需要 210 根窗口与换手率，见 scorePool）。
+	if snap := computeIndicatorSnapshot(price, bars); snap != nil {
+		f.RSI14 = snap.RSI14
+		f.MACDDif, f.MACDDea, f.MACDHist = snap.MACDDif, snap.MACDDea, snap.MACDHist
+		f.MACDGold, f.MACDXUp = snap.MACDGold, snap.MACDXUp
+		f.BollUp, f.BollMid, f.BollLow, f.BollPos = snap.BollUp, snap.BollMid, snap.BollLow, snap.BollPos
+		f.ATR14, f.ATRPct = snap.ATR14, snap.ATRPct
+	}
 	return f
 }
 
@@ -211,6 +241,13 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 		}
 	}
 
+	// T1 筹码超跌信号（短线/长线通用）：获利盘极低=几乎全员套牢，抛压趋于枯竭的
+	// 左侧关注区。仅在筹码窗口完备（210 根，ChipBars 达标）时给分——次新股累积
+	// 不足会系统性失真，宁可不加。
+	if f.ChipBars >= chipBarLimit && f.ChipProfit < 10 {
+		add(4, fmt.Sprintf("获利盘仅 %.1f%% 超跌区（抛压趋于枯竭）", f.ChipProfit))
+	}
+
 	if recType == model.RecTypeShortTerm {
 		// 短线共用风险扣分。
 		if f.Bias20 > 12 {
@@ -230,6 +267,13 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 			if f.VolBoost >= 1.5 && f.VolBoost <= 5 {
 				add(4, fmt.Sprintf("放量健康（%.1f 倍）", f.VolBoost))
 			}
+			// T1：水上金叉是动量策略最经典的确认信号；RSI 强势区不过热再确认。
+			if f.MACDXUp && f.MACDDif > 0 {
+				add(4, "MACD 水上金叉（近3日）")
+			}
+			if f.RSI14 >= 55 && f.RSI14 <= 70 {
+				add(3, fmt.Sprintf("RSI %.0f 强势区未过热", f.RSI14))
+			}
 		case "pullback":
 			if f.Chg20d >= 15 {
 				add(5, fmt.Sprintf("近20日涨 %.1f%% 前期强势", f.Chg20d))
@@ -239,6 +283,13 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 			}
 			if f.Vol5v20 > 0 && f.Vol5v20 < 0.9 {
 				add(3, "回调缩量（供给衰竭）")
+			}
+			// T1：RSI 回落至中低位=回调充分未超卖；回踩至布林中轨下方（带内下半区）。
+			if f.RSI14 >= 30 && f.RSI14 <= 45 {
+				add(3, fmt.Sprintf("RSI %.0f 回调充分未超卖", f.RSI14))
+			}
+			if f.BollMid > 0 && f.BollPos >= 10 && f.BollPos <= 50 {
+				add(3, fmt.Sprintf("回踩布林带下半区（带内 %.0f%%）", f.BollPos))
 			}
 		case "active":
 			if c.TurnoverRate >= 5 && c.TurnoverRate <= 15 {
@@ -280,6 +331,10 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 		if f.Volatility20 > 0 && f.Volatility20 <= 2 {
 			add(3, fmt.Sprintf("波动率 %.1f%% 偏低", f.Volatility20))
 		}
+		// T1：RSI 超卖区=价值策略的左侧买点参照。
+		if f.RSI14 > 0 && f.RSI14 <= 35 {
+			add(3, fmt.Sprintf("RSI %.0f 超卖区（左侧）", f.RSI14))
+		}
 	case "growth":
 		if f.MA60 > 0 && c.Price > f.MA60 {
 			add(5, "站上 MA60 中期趋势向上")
@@ -292,6 +347,10 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 		}
 		if f.Bias20 > 20 {
 			add(-6, fmt.Sprintf("MA20乖离 %.1f%% 追高风险", f.Bias20))
+		}
+		// T1：MACD 水上多头=中期趋势的动量确认。
+		if f.MACDGold && f.MACDDif > 0 {
+			add(3, "MACD 多头（DIF>DEA 且水上）")
 		}
 	case "leader":
 		if c.TotalCap >= 500e8 {
@@ -338,7 +397,12 @@ func candidateValueSet(c candidate) []float64 {
 	if c.Factors != nil {
 		f := c.Factors
 		vals = append(vals, f.MA5, f.MA10, f.MA20, f.MA60, f.Chg5d, f.Chg20d,
-			f.VolBoost, f.Vol5v20, f.Volatility20, f.Drawdown20, f.Bias20, f.Pos60)
+			f.VolBoost, f.Vol5v20, f.Volatility20, f.Drawdown20, f.Bias20, f.Pos60,
+			// T1 指标与筹码：喂给 LLM 的字段必须同步进核验值域，
+			// 否则模型忠实引用 RSI/MACD/获利盘数字会被误报幻觉（信任层自伤）。
+			f.RSI14, f.MACDDif, f.MACDDea, f.MACDHist,
+			f.BollUp, f.BollMid, f.BollLow, f.BollPos, f.ATR14, f.ATRPct,
+			f.ChipProfit, f.ChipAvgCost)
 	}
 	if c.ScoreDims != nil {
 		vals = append(vals, c.ScoreDims.Trend, c.ScoreDims.Momentum, c.ScoreDims.Position,

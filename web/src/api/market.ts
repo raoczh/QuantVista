@@ -135,6 +135,45 @@ export interface StockScore {
   data_limited: boolean
 }
 
+// T1 指标序列（与 K 线按日期对齐；null=该位置无值，如 BOLL 前 19 根）。
+export interface IndicatorSeries {
+  symbol: string
+  market: string
+  dates: string[]
+  dif: (number | null)[]
+  dea: (number | null)[]
+  hist: (number | null)[] // 2×(DIF−DEA)，A 股柱口径
+  boll_up: (number | null)[]
+  boll_mid: (number | null)[]
+  boll_low: (number | null)[]
+  rsi: (number | null)[]
+  atr: (number | null)[]
+}
+
+// T1 筹码分布（本地复算：210 根日线 + 换手率三角衰减）。
+export interface ChipDay {
+  date: string
+  profit: number
+  avg_cost: number
+  c90_low: number
+  c90_high: number
+  conc_90: number
+  c70_low: number
+  c70_high: number
+  conc_70: number
+}
+
+export interface ChipDist extends ChipDay {
+  symbol: string
+  market: string
+  days: ChipDay[]
+  prices: number[]
+  chips: number[]
+  last_close: number
+  bar_count: number
+  data_limited: boolean
+}
+
 export function getOverview(market = 'cn') {
   return request<Overview>({ url: `/markets/${market}/overview`, method: 'get' })
 }
@@ -161,4 +200,16 @@ export function getValuation(market: string, symbol: string) {
 
 export function getScore(market: string, symbol: string) {
   return request<StockScore>({ url: `/markets/${market}/stocks/${symbol}/score`, method: 'get' })
+}
+
+export function getIndicators(market: string, symbol: string, limit = 120) {
+  return request<IndicatorSeries>({
+    url: `/markets/${market}/stocks/${symbol}/indicators`,
+    method: 'get',
+    params: { limit },
+  })
+}
+
+export function getChips(market: string, symbol: string) {
+  return request<ChipDist>({ url: `/markets/${market}/stocks/${symbol}/chips`, method: 'get' })
 }

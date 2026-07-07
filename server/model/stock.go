@@ -35,18 +35,21 @@ type StockQuote struct {
 
 // DailyBar 日线 OHLC，供追踪/回撤/复权计算复用。
 type DailyBar struct {
-	ID        int64     `gorm:"primaryKey" json:"id"`
-	Symbol    string    `gorm:"size:16;index:idx_bar_symbol_date,unique" json:"symbol"`
-	Market    string    `gorm:"size:8;index:idx_bar_symbol_date,unique" json:"market"`
-	TradeDate string    `gorm:"size:10;index:idx_bar_symbol_date,unique" json:"trade_date"` // YYYY-MM-DD
-	Open      float64   `gorm:"type:decimal(20,4)" json:"open"`
-	High      float64   `gorm:"type:decimal(20,4)" json:"high"`
-	Low       float64   `gorm:"type:decimal(20,4)" json:"low"`
-	Close     float64   `gorm:"type:decimal(20,4)" json:"close"`
-	Volume    int64     `json:"volume"`
-	Amount    float64   `gorm:"type:decimal(24,4)" json:"amount"`
-	Source    string    `gorm:"size:16" json:"source"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        int64   `gorm:"primaryKey" json:"id"`
+	Symbol    string  `gorm:"size:16;index:idx_bar_symbol_date,unique" json:"symbol"`
+	Market    string  `gorm:"size:8;index:idx_bar_symbol_date,unique" json:"market"`
+	TradeDate string  `gorm:"size:10;index:idx_bar_symbol_date,unique" json:"trade_date"` // YYYY-MM-DD
+	Open      float64 `gorm:"type:decimal(20,4)" json:"open"`
+	High      float64 `gorm:"type:decimal(20,4)" json:"high"`
+	Low       float64 `gorm:"type:decimal(20,4)" json:"low"`
+	Close     float64 `gorm:"type:decimal(20,4)" json:"close"`
+	Volume    int64   `json:"volume"`
+	Amount    float64 `gorm:"type:decimal(24,4)" json:"amount"`
+	// TurnoverRate 当日换手率 %（东财日线 f61 自带；新浪兜底无此字段，0=缺失）。
+	// 供筹码分布离线复算与 M1 因子宽表使用。
+	TurnoverRate float64   `gorm:"type:decimal(10,4)" json:"turnover_rate"`
+	Source       string    `gorm:"size:16" json:"source"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // TradingCalendar 交易日历，用于按交易日计算有效期、持有周期和数据新鲜度。

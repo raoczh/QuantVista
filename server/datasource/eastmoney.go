@@ -135,9 +135,11 @@ func (e *EastMoneyAdapter) GetDailyBars(ctx context.Context, market, symbol stri
 		limit = 120
 	}
 
-	// klt=101 日线，fqt=1 前复权。
+	// klt=101 日线，fqt=1 前复权。fields2 取全 11 列（f51~f61，与 akshare 同口径）：
+	// 日期,开,收,高,低,量,额,振幅,涨跌幅,涨跌额,换手率——换手率（f61）是筹码分布
+	// 累积模型的核心输入。用全列而非子集，避免押注上游对稀疏字段列表的兼容性。
 	url := fmt.Sprintf(
-		"https://%d.push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1&fields2=f51,f52,f53,f54,f55,f56,f57&klt=101&fqt=1&end=20500101&lmt=%d",
+		"https://%d.push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&fields1=f1&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt=101&fqt=1&end=20500101&lmt=%d",
 		emNode(), secid, limit,
 	)
 	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
@@ -155,13 +157,13 @@ func (e *EastMoneyAdapter) GetDailyBars(ctx context.Context, market, symbol stri
 
 	bars := make([]Bar, 0, len(parsed.Data.Klines))
 	for _, line := range parsed.Data.Klines {
-		// 格式：date,open,close,high,low,volume,amount
+		// 格式：date,open,close,high,low,volume,amount,amplitude,pct,chg,turnover
 		parts := strings.Split(line, ",")
 		if len(parts) < 7 {
 			continue
 		}
 		atof := func(s string) float64 { f, _ := strconv.ParseFloat(s, 64); return f }
-		bars = append(bars, Bar{
+		b := Bar{
 			TradeDate: parts[0],
 			Open:      atof(parts[1]),
 			Close:     atof(parts[2]),
@@ -169,7 +171,12 @@ func (e *EastMoneyAdapter) GetDailyBars(ctx context.Context, market, symbol stri
 			Low:       atof(parts[4]),
 			Volume:    int64(atof(parts[5])),
 			Amount:    atof(parts[6]),
-		})
+		}
+		// 换手率在第 11 列（f61）；上游对部分标的（指数等）可能仍返回 7 列，容错为 0=缺失。
+		if len(parts) >= 11 {
+			b.TurnoverRate = atof(parts[10])
+		}
+		bars = append(bars, b)
 	}
 	if len(bars) == 0 {
 		return nil, ErrNoData

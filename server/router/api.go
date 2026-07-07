@@ -31,6 +31,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	qaSvc := service.NewQaService(marketSvc, llmSvc)
 	compareSvc := service.NewCompareService(marketSvc, llmSvc)
 	scoreSvc := service.NewScoreService(marketSvc)
+	indicatorSvc := service.NewIndicatorService(marketSvc)
+	chipSvc := service.NewChipService(marketSvc)
 	paperSvc := service.NewPaperService(marketSvc)
 	etfSvc := service.NewEtfService(marketSvc)
 	notifySvc := service.NewNotifyService()
@@ -40,7 +42,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	financeSvc := service.NewFinanceService()
 
 	// controllers
-	marketCtl := controller.NewMarketController(marketSvc, scoreSvc)
+	marketCtl := controller.NewMarketController(marketSvc, scoreSvc, indicatorSvc, chipSvc)
 	authCtl := controller.NewAuthController(authSvc)
 	setupCtl := controller.NewSetupController(authSvc)
 	userCtl := controller.NewUserController(userSvc)
@@ -99,6 +101,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			markets.GET("/:market/stocks/:symbol/bars", marketCtl.GetDailyBars)
 			markets.GET("/:market/stocks/:symbol/score", marketCtl.GetScore)
 			markets.GET("/:market/stocks/:symbol/valuation", marketCtl.GetValuation)
+			markets.GET("/:market/stocks/:symbol/indicators", marketCtl.GetIndicators)
+			markets.GET("/:market/stocks/:symbol/chips", marketCtl.GetChips)
 		}
 
 		// 需登录

@@ -304,16 +304,17 @@ func (s *MarketService) persistDailyBars(market, symbol string, bars []datasourc
 			source = "unknown"
 		}
 		dailyRows = append(dailyRows, model.DailyBar{
-			Symbol:    symbol,
-			Market:    market,
-			TradeDate: b.TradeDate,
-			Open:      b.Open,
-			High:      b.High,
-			Low:       b.Low,
-			Close:     b.Close,
-			Volume:    b.Volume,
-			Amount:    b.Amount,
-			Source:    source,
+			Symbol:       symbol,
+			Market:       market,
+			TradeDate:    b.TradeDate,
+			Open:         b.Open,
+			High:         b.High,
+			Low:          b.Low,
+			Close:        b.Close,
+			Volume:       b.Volume,
+			Amount:       b.Amount,
+			TurnoverRate: b.TurnoverRate,
+			Source:       source,
 		})
 		if _, ok := seenTradeDates[b.TradeDate]; !ok {
 			calendarRows = append(calendarRows, model.TradingCalendar{
@@ -327,17 +328,26 @@ func (s *MarketService) persistDailyBars(market, symbol string, bars []datasourc
 
 	if len(dailyRows) > 0 {
 		// 无成交额的源（新浪日线 Amount 恒 0）作兜底回退时，不得把东财已写入的
-		// 真实 amount 覆盖成 0——本批全为 0 时更新列表不含 amount。
-		updateCols := []string{"open", "high", "low", "close", "volume", "amount", "source"}
-		hasAmount := false
+		// 真实 amount 覆盖成 0——本批全为 0 时更新列表不含 amount；换手率（新浪
+		// 日线同样没有）照此办理。
+		updateCols := []string{"open", "high", "low", "close", "volume", "source"}
+		hasAmount, hasTurnover := false, false
 		for _, r := range dailyRows {
 			if r.Amount > 0 {
 				hasAmount = true
+			}
+			if r.TurnoverRate > 0 {
+				hasTurnover = true
+			}
+			if hasAmount && hasTurnover {
 				break
 			}
 		}
-		if !hasAmount {
-			updateCols = []string{"open", "high", "low", "close", "volume", "source"}
+		if hasAmount {
+			updateCols = append(updateCols, "amount")
+		}
+		if hasTurnover {
+			updateCols = append(updateCols, "turnover_rate")
 		}
 		if err := common.DB.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "trade_date"}},

@@ -87,3 +87,16 @@ func TestScoreLabel(t *testing.T) {
 		}
 	}
 }
+
+// TestRsiMomentumScore 凹形映射表：55~70 满分平台，≥70 过热陡降，≤30 超卖低分。
+func TestRsiMomentumScore(t *testing.T) {
+	cases := map[float64]float64{
+		20: 30, 30: 30, 42.5: 65, 55: 100, 62: 100, 70: 100,
+		75: 80, 85: 40, 95: 20, 100: 20,
+	}
+	for rsi, want := range cases {
+		if got := rsiMomentumScore(rsi); !almostEq(got, want, 1e-9) {
+			t.Fatalf("rsiMomentumScore(%v)=%v，期望 %v", rsi, got, want)
+		}
+	}
+}

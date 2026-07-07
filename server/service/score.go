@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"math"
 	"time"
 
 	"quantvista/common"
@@ -122,11 +123,40 @@ func trendScore(price float64, closes []float64) float64 {
 	return clamp0100(score)
 }
 
-// momentumScore 近 5/20 日涨跌幅映射到 0-100（50 为中性）。
+// momentumScore 近 5/20 日涨跌幅映射（50 为中性）与 RSI14 凹形分的加权合成。
+// RSI 凹形逻辑（T1）：55~70 是健康强势区给满分，≥70 过热显著降分（追高保护）、
+// ≤30 超卖动量弱——「越大越好」的线性映射会奖励过热，凹形才符合右侧交易纪律。
+// 样本不足 rsiMinBars 时退回纯涨幅口径（不臆测）。
 func momentumScore(closes []float64) float64 {
 	m5 := clamp0100(50 + changeOverN(closes, 5)*3)
 	m20 := clamp0100(50 + changeOverN(closes, 20)*2)
-	return 0.5*m5 + 0.5*m20
+	chg := 0.5*m5 + 0.5*m20
+	if len(closes) < rsiMinBars {
+		return chg
+	}
+	rsi := rsiSeries(closes, 14)
+	last := rsi[len(rsi)-1]
+	if math.IsNaN(last) {
+		return chg
+	}
+	return 0.6*chg + 0.4*rsiMomentumScore(last)
+}
+
+// rsiMomentumScore RSI → 动量分的凹形映射：
+// ≤30 超卖 30 分；30~55 线性升至满分；55~70 满分平台；70~85 陡降至 40；>85 续降、下限 20。
+func rsiMomentumScore(rsi float64) float64 {
+	switch {
+	case rsi <= 30:
+		return 30
+	case rsi < 55:
+		return 30 + (rsi-30)/25*70
+	case rsi <= 70:
+		return 100
+	case rsi <= 85:
+		return 100 - (rsi-70)*4
+	default:
+		return math.Max(20, 40-(rsi-85)*2)
+	}
 }
 
 // positionScore 现价在区间高低中的位置（越高越强，0-100）。
@@ -168,7 +198,9 @@ func volumeScore(bars []datasource.Bar) float64 {
 	return clamp0100(50 + (a5/a20-1)*50)
 }
 
-// riskScore 近 20 日最大回撤的反向映射（回撤越小越稳，分越高）。
+// riskScore 回撤反向分与 ATR/价百分比反向分的加权合成（T1 加入 ATR 维度：
+// 回撤度量「已跌多少」，ATR 度量「日常波动多大」——高 ATR 意味着止损空间被迫放大）。
+// ATR% ≤1% 满分，每 +1% 扣 25 分，≥5% 为 0；样本不足时退回纯回撤口径。
 func riskScore(bars []datasource.Bar) float64 {
 	n := 20
 	if n > len(bars) {
@@ -188,7 +220,15 @@ func riskScore(bars []datasource.Bar) float64 {
 		}
 	}
 	ddPct := -worst * 100 // 正数
-	return clamp0100(100 - ddPct*3)
+	ddScore := clamp0100(100 - ddPct*3)
+	last := bars[len(bars)-1].Close
+	if len(bars) < atrMinBars || last <= 0 {
+		return ddScore
+	}
+	atr := atrSeries(bars, 14)
+	atrPct := atr[len(atr)-1] / last * 100
+	atrScore := clamp0100(100 - (atrPct-1)*25)
+	return 0.6*ddScore + 0.4*atrScore
 }
 
 // ScoreView 评分 + 标的信息。
