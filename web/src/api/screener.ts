@@ -1,0 +1,129 @@
+import { request } from './client'
+
+// M1 条件树选股：因子宽表扫描 + 策略广场 + 自定义策略。
+
+/** 因子元数据（自定义编辑器的因子选择与格式化）。 */
+export interface FactorDef {
+  key: string
+  name: string
+  group: string
+  kind: 'price' | 'pct' | 'ratio' | 'int' | 'bool'
+  desc: string
+}
+
+/** 条件树节点：all/any 组或 {factor,op,value/value2/ref} 叶子。 */
+export interface CondNode {
+  all?: CondNode[]
+  any?: CondNode[]
+  factor?: string
+  op?: string
+  value?: number
+  value2?: number
+  ref?: string
+}
+
+export interface BuiltinStrategy {
+  key: string
+  name: string
+  desc: string
+  period: 'short' | 'swing' | 'mid'
+  risk: 'low' | 'mid' | 'high'
+  conditions: string[]
+}
+
+export interface CustomStrategy {
+  id: number
+  name: string
+  desc: string
+  period: string
+  risk: string
+  tree: CondNode | null
+  conditions: string[]
+}
+
+export interface StrategiesView {
+  builtin: BuiltinStrategy[]
+  custom: CustomStrategy[] | null
+  factors: FactorDef[]
+}
+
+export interface ScanRequest {
+  strategy_key?: string
+  strategy_id?: number
+  tree?: CondNode
+  include_st?: boolean
+  include_stale?: boolean
+  limit?: number
+}
+
+export interface ScanHit {
+  symbol: string
+  name: string
+  price: number
+  chg_pct: number
+  amount_yi: number
+  turnover_rate?: number
+  pos_60?: number
+  reasons: string[]
+}
+
+export interface ScanResult {
+  strategy: string
+  trade_date: string
+  universe: number
+  scanned: number
+  stale_skipped: number
+  st_skipped: number
+  matched: number
+  truncated: boolean
+  items: ScanHit[] | null
+  build_ms: number
+  conditions: string[]
+}
+
+export interface FactorTableStatus {
+  ready: boolean
+  building: boolean
+  trade_date?: string
+  built_at?: string
+  build_ms?: number
+  universe: number
+  factors: number
+}
+
+export interface SaveStrategyRequest {
+  id?: number
+  name: string
+  desc?: string
+  period?: string
+  risk?: string
+  tree: CondNode
+}
+
+export function getScreenerStrategies() {
+  return request<StrategiesView>({ url: '/screener/strategies', method: 'get' })
+}
+
+export function screenerScan(req: ScanRequest) {
+  return request<ScanResult>({ url: '/screener/scan', method: 'post', data: req })
+}
+
+export function saveScreenerStrategy(req: SaveStrategyRequest) {
+  return request<CustomStrategy>({ url: '/screener/strategies', method: 'post', data: req })
+}
+
+export function deleteScreenerStrategy(id: number) {
+  return request<{ deleted: boolean }>({ url: `/screener/strategies/${id}`, method: 'delete' })
+}
+
+export function getScreenerStatus() {
+  return request<FactorTableStatus>({ url: '/screener/status', method: 'get' })
+}
+
+export const PERIOD_LABEL: Record<string, string> = { short: '短线', swing: '波段', mid: '中线' }
+export const RISK_LABEL: Record<string, string> = { low: '低风险', mid: '中风险', high: '高风险' }
+export const RISK_TAG_TYPE: Record<string, 'success' | 'warning' | 'error'> = {
+  low: 'success',
+  mid: 'warning',
+  high: 'error',
+}

@@ -137,12 +137,13 @@ type candidate struct {
 
 // sourceLabelCN 候选来源的中文标签（落库英文 key，前端映射展示）。
 var sourceLabelCN = map[string]string{
-	"watchlist": "自选",
-	"gainer":    "涨幅榜",
-	"active":    "成交额榜",
-	"turnover":  "换手率榜",
-	"dipper":    "回调榜",
-	"lowpb":     "低PB榜",
+	"watchlist":       "自选",
+	"gainer":          "涨幅榜",
+	"active":          "成交额榜",
+	"turnover":        "换手率榜",
+	"dipper":          "回调榜",
+	"lowpb":           "低PB榜",
+	"strategy_signal": "策略信号",
 }
 
 // sourceSpec 一路榜单来源的取数规格。
@@ -918,6 +919,35 @@ func (s *RecommendationService) buildPool(ctx context.Context, userID int64, mar
 				Price: round2(r.Price), ChangePct: round2(r.ChangePct),
 				Amount: round2(r.Amount), TurnoverRate: round2(r.TurnoverRate),
 				PB: round2(r.PB), FloatCap: round2(r.FloatCap)}, src.label)
+		}
+	}
+
+	// M1 策略信号来源：因子宽表按推荐策略对应的内置选股策略全市场扫描，命中进池
+	//（榜单只见「当天最热/最冷」，策略信号补上「形态对但不在榜上」的全市场供给）。
+	// 宽表行情是最近收盘日口径，盘中生成会滞后——对新增标的批量拉实时行情覆盖，
+	// 拉不到时保留收盘口径（best-effort；涨停判定等用户筛选按可得数据判）。
+	if market == "cn" {
+		if hits := strategySignalHits(ctx, recType, strat.Key, strategySignalPoolLimit); len(hits) > 0 {
+			refs := make([]QuoteRef, 0, len(hits))
+			for _, h := range hits {
+				if _, exists := byKey[h.Symbol]; !exists {
+					refs = append(refs, QuoteRef{Market: market, Symbol: h.Symbol})
+				}
+			}
+			quotes := s.market.QuotesFor(ctx, refs)
+			for _, h := range hits {
+				c := candidate{Symbol: h.Symbol, Market: market, Name: h.Name,
+					Price: round2(h.Price), ChangePct: round2(h.ChgPct),
+					Amount: round2(h.AmountYi * 1e8), TurnoverRate: round2(h.TurnoverRate)}
+				if q := quotes[QuoteKey(market, h.Symbol)]; q != nil && q.Price > 0 {
+					c.Price = round2(q.Price)
+					c.ChangePct = round2(q.ChangePct)
+					if q.Amount > 0 {
+						c.Amount = round2(q.Amount)
+					}
+				}
+				add(c, "strategy_signal")
+			}
 		}
 	}
 	if len(pool) == 0 {

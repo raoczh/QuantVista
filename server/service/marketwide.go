@@ -329,6 +329,10 @@ func (s *MarketService) SyncMarketWide(ctx context.Context) (*model.DataSyncLog,
 	log.Message = truncate(fmt.Sprintf("%s：快照 %d 只，落 bar %d，除权重锚 %d/%d", tradeDate, len(rows), len(bars), rebased, suspects), 512)
 	log.DurationMs = time.Since(start).Milliseconds()
 	s.recordSyncLog(log)
+	// M1 第二部分：增量落库完成后异步重建因子宽表（选股/推荐策略信号的数据地基）。
+	if log.Succeeded > 0 {
+		RebuildFactorTableAsync("每日增量完成")
+	}
 	return log, nil
 }
 
@@ -579,6 +583,10 @@ loop:
 	}
 	log.DurationMs = time.Since(start).Milliseconds()
 	s.recordSyncLog(log)
+	// 本轮有新建史标的即重建宽表（含暂停中断的部分进度——尽快让选股覆盖它们）。
+	if log.Succeeded > 0 {
+		RebuildFactorTableAsync("历史初始化推进")
+	}
 	if canceled {
 		return log, context.Canceled
 	}

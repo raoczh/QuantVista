@@ -81,6 +81,7 @@ const menuOptions = computed<MenuOption[]>(() => [
     key: 'today',
   },
   { label: navLink('/watchlist', '自选'), key: 'watchlist' },
+  { label: navLink('/screener', '选股'), key: 'screener' },
   { label: navLink('/positions', '持仓'), key: 'positions' },
   { label: navLink('/recommendations', '推荐追踪'), key: 'recommendations' },
   {
