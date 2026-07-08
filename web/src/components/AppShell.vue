@@ -98,6 +98,7 @@ const menuOptions = computed<MenuOption[]>(() => [
     label: '更多',
     key: 'more-group',
     children: [
+      { label: navLink('/backtest', '回测时光机'), key: 'backtest' },
       { label: navLink('/thesis', '投资逻辑卡'), key: 'thesis' },
       { label: navLink('/notes', '投资笔记'), key: 'notes' },
       { label: navLink('/paper', '模拟交易'), key: 'paper' },

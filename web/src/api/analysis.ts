@@ -14,6 +14,7 @@ export interface AnalyzeRequest {
   question?: string
   mode?: 'panel' // 缺省=标准分析；panel=多角色观点（仅个股）
   verify?: boolean // AI 复核（独立复核员逐项挑刺；panel/降级不复核）
+  as_of?: string // M2 回溯诊断日期（YYYY-MM-DD，仅个股标准模式）：截断日线组装 prompt 无未来泄露
 }
 
 // 结构化分析结果。
@@ -77,6 +78,7 @@ export interface AnalysisRecord {
   title: string
   status: AnalysisStatus
   mode: '' | 'panel'
+  as_of?: string // 回溯诊断日期（空=实时分析）
   rating: AnalysisRating | ''
   confidence: number
   summary: string
@@ -125,4 +127,46 @@ export function deleteAnalysis(id: number) {
 
 export function getAnalysisDiff(id: number) {
   return request<AnalysisDiff>({ url: `/analysis/${id}/diff`, method: 'get' })
+}
+
+// ---------- M2 回溯诊断：事后核验 ----------
+
+export interface HindsightNode {
+  return_pct: number
+  date: string
+}
+
+export interface HindsightTouch {
+  price: number
+  date: string
+  day_index: number
+}
+
+export interface HindsightView {
+  record_id: number
+  symbol: string
+  name: string
+  as_of: string
+  base_date: string
+  base_price: number
+  rating: AnalysisRating | ''
+  elapsed_bars: number
+  returns: Record<'d5' | 'd10' | 'd20' | 'd60', HindsightNode | null>
+  max_gain_pct: number
+  max_drawdown_pct: number
+  bench_return_pct?: number
+  alpha_pct?: number
+  target_touch?: HindsightTouch
+  stop_touch?: HindsightTouch
+  rating_hit?: boolean
+  note: string
+}
+
+// 个股分析的事后核验：回溯分析按 as_of、实时分析按创建日，对照之后的真实走势。
+export function getAnalysisHindsight(id: number, targetPrice?: number, stopPrice?: number) {
+  return request<HindsightView>({
+    url: `/analysis/${id}/hindsight`,
+    method: 'get',
+    params: { target_price: targetPrice || undefined, stop_price: stopPrice || undefined },
+  })
 }

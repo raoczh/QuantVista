@@ -177,6 +177,14 @@ type wideStockMeta struct {
 // computeWideRow 由升序日线算一行因子（按 factorDefs 序）。bars 需 ≥1 根。
 // 布尔列 1/0，条件性缺失（样本不足）为 NaN。
 func computeWideRow(symbol string, meta wideStockMeta, bars []datasource.Bar) []float64 {
+	return computeWideRowOpts(symbol, meta, bars, true)
+}
+
+// computeWideRowOpts withChip=false 跳过筹码三角衰减复算（M2 回测热路径：
+// 条件树未引用 chip_* 因子时，省掉对每个信号日切片重算 150 价格档 × 250 根的
+// 大头开销，筹码列保持 NaN）。其余因子与全量口径完全一致，
+// TestComputeWideRowOptsParity 锁定两者除筹码列外逐列相等。
+func computeWideRowOpts(symbol string, meta wideStockMeta, bars []datasource.Bar, withChip bool) []float64 {
 	nan := math.NaN()
 	vals := make([]float64, len(factorDefs))
 	for i := range vals {
@@ -454,10 +462,12 @@ func computeWideRow(symbol string, meta wideStockMeta, bars []datasource.Bar) []
 	}
 
 	// 筹码（<120 根或换手不可得时 err → 保持 NaN）
-	if chip, err := computeChipDistribution(bars, 0); err == nil {
-		set("chip_profit", chip.Profit)
-		set("chip_avg_cost", chip.AvgCost)
-		set("chip_bars", float64(chip.BarCount))
+	if withChip {
+		if chip, err := computeChipDistribution(bars, 0); err == nil {
+			set("chip_profit", chip.Profit)
+			set("chip_avg_cost", chip.AvgCost)
+			set("chip_bars", float64(chip.BarCount))
+		}
 	}
 
 	setBool("is_st", meta.ST)

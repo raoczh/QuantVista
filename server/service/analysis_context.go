@@ -34,7 +34,11 @@ func (s *AnalysisService) buildContext(ctx context.Context, userID int64, req An
 	var err error
 	switch req.Module {
 	case model.AnalysisModuleStock:
-		ac, err = s.buildStockContext(ctx, req.Market, req.Symbol)
+		if req.AsOf != "" {
+			ac, err = s.buildStockContextAsOf(req)
+		} else {
+			ac, err = s.buildStockContext(ctx, req.Market, req.Symbol)
+		}
 	case model.AnalysisModuleMarket:
 		ac, err = s.buildMarketContext(ctx, req.Market)
 	case model.AnalysisModuleSector:

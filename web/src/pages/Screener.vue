@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import {
   NButton,
   NTag,
@@ -46,6 +47,7 @@ import SectionCard from '@/components/SectionCard.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
 
 const message = useMessage()
+const router = useRouter()
 const { vars } = useUi()
 const { isMobile } = useIsMobile()
 const actions = useStockActions()
@@ -454,6 +456,7 @@ async function removeCustom(id: number) {
                     @click="runScan({ strategy_key: b.key }, b.key)"
                     >一键扫描</n-button
                   >
+                  <n-button size="small" quaternary @click="router.push(`/backtest?strategy_key=${b.key}`)">回测</n-button>
                 </div>
               </div>
             </n-gi>

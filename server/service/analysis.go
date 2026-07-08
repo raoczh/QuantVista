@@ -49,7 +49,7 @@ func NewAnalysisService(market *MarketService, watchlist *WatchlistService, posi
 
 // 版本号：数据快照 + 这两个版本号共同保证「凭版本号复现」。改 prompt/策略时递增。
 const (
-	analysisPromptVersion   = "p9" // p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
+	analysisPromptVersion   = "p10" // p10: M2 回溯诊断 as_of 模式（截断快照+回溯声明段）；p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
 	analysisStrategyVersion = "s1"
 	maxRepairAttempts       = 2 // 结构化校验失败后的额外重试次数（总调用 = 1 + maxRepairAttempts）
 )
@@ -72,6 +72,9 @@ type AnalyzeRequest struct {
 	Question    string `json:"question"`      // 用户附加问题（可选）
 	Mode        string `json:"mode"`          // ""=标准 / "panel"=多角色观点（仅 stock 模块）
 	Verify      bool   `json:"verify"`        // AI 复核：额外一次「独立复核员」调用逐项挑刺（多耗一次 LLM 请求；panel/降级不复核）
+	// AsOf 回溯诊断日期（YYYY-MM-DD，仅 stock+标准模式）：日线截断到该日组装 prompt，
+	// 估值/新闻/财务等无历史快照的证据声明缺失；事后用 hindsight 端点对照真实走势。
+	AsOf string `json:"as_of"`
 }
 
 // AnalysisResult 结构化分析结果（要求 LLM 严格按此 schema 输出 JSON）。
@@ -142,6 +145,18 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	if len([]rune(req.Question)) > 500 {
 		return nil, errors.New("附加问题过长（最多 500 字）")
 	}
+	// M2 回溯诊断：仅个股+标准模式；日期规整为 YYYY-MM-DD 且早于今天。
+	req.AsOf = strings.TrimSpace(req.AsOf)
+	if req.AsOf != "" {
+		if req.Module != model.AnalysisModuleStock || req.Mode != model.AnalysisModeStandard {
+			return nil, errors.New("回溯诊断仅支持个股模块的标准分析")
+		}
+		d, derr := asOfDate(req.AsOf)
+		if derr != nil {
+			return nil, derr
+		}
+		req.AsOf = d
+	}
 
 	// 1) LLM 配置（含解密密钥）。
 	cfg, apiKey, err := s.llm.ResolveForUse(userID, req.LLMConfigID)
@@ -173,6 +188,7 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 		UserID:          userID,
 		Module:          req.Module,
 		Mode:            req.Mode,
+		AsOf:            req.AsOf,
 		Market:          normalizeMarketOnly(req.Market),
 		Symbol:          strings.TrimSpace(req.Symbol),
 		Target:          actx.Label,
@@ -183,6 +199,9 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 		PromptVersion:   promptVersion,
 		StrategyVersion: analysisStrategyVersion,
 		DataSnapshot:    string(snapshotJSON),
+	}
+	if req.AsOf != "" {
+		rec.Title += " · 回溯@" + req.AsOf
 	}
 
 	// 解析器按模式分流：标准 → AnalysisResult；panel → PanelResult。
@@ -489,7 +508,7 @@ func (s *AnalysisService) History(userID int64, module string, limit int) ([]mod
 	var rows []model.AnalysisRecord
 	// 显式选列，避免把大字段 result_json/data_snapshot 拉进列表。
 	err := q.Select("id", "user_id", "module", "market", "symbol", "target", "title",
-		"status", "mode", "rating", "confidence", "summary", "error",
+		"status", "mode", "as_of", "rating", "confidence", "summary", "error",
 		"llm_config_id", "provider", "model", "prompt_version", "strategy_version",
 		"prompt_tokens", "completion_tokens", "total_tokens", "latency_ms",
 		"created_at", "updated_at").
@@ -688,6 +707,11 @@ func (s *AnalysisService) buildMessages(userID int64, req AnalyzeRequest, actx *
 	b.WriteString(snapshotJSON)
 	b.WriteString("\n\n数据时间：以快照内 data_as_of 为采集时刻、各字段 data_time/trade_date（如有）为准；" +
 		"非交易时段采集的数据反映最近一个交易日，不代表实时状态，分析措辞须体现这一点。")
+	if req.AsOf != "" {
+		fmt.Fprintf(&b, "\n\n【回溯声明】本次为历史回溯分析，数据截至 %s：快照仅含该日及之前的日线衍生数据，"+
+			"估值/新闻/公告/财务/实时盘面均不可得，不得臆测。严禁使用你训练记忆中该日期之后的任何行情、"+
+			"事件或结果信息，严禁任何「事后视角」表述——请完全以 %s 当天所能看到的信息作判断。", req.AsOf, req.AsOf)
+	}
 	b.WriteString("\n请严格按系统要求的 JSON schema 输出，只依据以上数据分析。")
 
 	sysPrompt := analysisSystemPrompt(userID, req.Module)

@@ -19,6 +19,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/daily-report', name: 'daily-report', component: () => import('@/pages/DailyReport.vue'), meta: { title: '收盘日报' } },
   { path: '/watchlist', name: 'watchlist', component: () => import('@/pages/Watchlist.vue'), meta: { title: '自选股' } },
   { path: '/screener', name: 'screener', component: () => import('@/pages/Screener.vue'), meta: { title: '策略选股' } },
+  { path: '/backtest', name: 'backtest', component: () => import('@/pages/Backtest.vue'), meta: { title: '回测时光机' } },
   { path: '/positions', name: 'positions', component: () => import('@/pages/Positions.vue'), meta: { title: '持仓' } },
   { path: '/analysis', name: 'analysis', component: () => import('@/pages/Analysis.vue'), meta: { title: 'AI 分析' } },
   { path: '/qa', name: 'qa', component: () => import('@/pages/Qa.vue'), meta: { title: '个股问答' } },
