@@ -308,6 +308,7 @@ const SOURCE_LABEL: Record<string, string> = {
   turnover: '换手率榜',
   dipper: '回调榜',
   lowpb: '低PB榜',
+  strategy_signal: '策略信号',
 }
 function sourceText(c: PoolCandidate) {
   const arr = c.sources && c.sources.length ? c.sources : c.source ? [c.source] : []
@@ -889,7 +890,7 @@ function signedPct(n: number | undefined) {
                     </table>
                   </div>
                   <div class="pool-note">
-                    来源=进池原因（自选/涨幅榜/成交额榜/换手率榜/回调榜/低PB榜，随策略组合、可叠加）；量化分=五维技术评分+策略加分（0-100，悬停查看加分明细，仅排序参考不代表预期收益）；「AI
+                    来源=进池原因（自选/涨幅榜/成交额榜/换手率榜/回调榜/低PB榜/策略信号[全市场因子扫描命中]，随策略组合、可叠加）；量化分=五维技术评分+策略加分（0-100，悬停查看加分明细，仅排序参考不代表预期收益）；「AI
                     名单」=量化排序 Top16 交给 AI 精选，其余仅参与排名对照。
                     <template v-if="poolOmitted > 0">另有 {{ poolOmitted }} 只被筛掉的标的未展示（快照容量保护）。</template>
                   </div>

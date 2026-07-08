@@ -40,6 +40,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	dailyReportSvc := service.NewDailyReportService(marketSvc, watchlistSvc, positionSvc, alertSvc, recommendationSvc, llmSvc, notifySvc)
 	newsSvc := service.NewNewsService()
 	financeSvc := service.NewFinanceService()
+	screenerSvc := service.NewScreenerService()
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc, scoreSvc, indicatorSvc, chipSvc)
@@ -66,6 +67,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	dailyReportCtl := controller.NewDailyReportController(dailyReportSvc)
 	newsCtl := controller.NewNewsController(newsSvc)
 	financeCtl := controller.NewFinanceController(financeSvc)
+	screenerCtl := controller.NewScreenerController(screenerSvc)
 
 	api := r.Group("/api")
 	{
@@ -253,6 +255,17 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			// 个股横向对比（多股并排 + 可选 AI 点评，走 LLM 限流）
 			authed.POST("/compare", middleware.RateLimit(20, time.Minute), compareCtl.Compare)
 
+			// 条件树选股（M1：策略广场 + 全市场因子扫描 + 自定义策略；纯本地计算无 LLM。
+			// 扫描限流：宽表过期时首个请求触发同步重建（3~10s 重活），防连击）
+			screener := authed.Group("/screener")
+			{
+				screener.GET("/strategies", screenerCtl.Strategies)
+				screener.POST("/strategies", screenerCtl.SaveStrategy)
+				screener.DELETE("/strategies/:id", screenerCtl.DeleteStrategy)
+				screener.POST("/scan", middleware.RateLimit(20, time.Minute), screenerCtl.Scan)
+				screener.GET("/status", screenerCtl.Status)
+			}
+
 			// 模拟交易（虚拟账户，用真实行情成交与估值）
 			paper := authed.Group("/paper")
 			{
@@ -310,6 +323,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 					adminMarket.POST("/wide-init", marketCtl.WideInitStart)
 					adminMarket.POST("/wide-init/pause", marketCtl.WideInitPause)
 					adminMarket.GET("/wide-status", marketCtl.WideStatus)
+					// M1 因子宽表手动重建（异步；常态由每日增量自动触发）
+					adminMarket.POST("/factor-rebuild", screenerCtl.FactorRebuild)
 				}
 			}
 		}
