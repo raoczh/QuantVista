@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
   NInput,
+  NInputNumber,
   NSelect,
   NForm,
   NFormItem,
@@ -16,6 +17,7 @@ import {
   NSwitch,
   NModal,
   NTooltip,
+  NDatePicker,
   useMessage,
 } from 'naive-ui'
 import {
@@ -24,6 +26,7 @@ import {
   getAnalysis,
   deleteAnalysis,
   getAnalysisDiff,
+  getAnalysisHindsight,
   type AnalyzeRequest,
   type AnalysisModule,
   type AnalysisView,
@@ -31,6 +34,7 @@ import {
   type AnalysisRating,
   type AnalysisDiff,
   type PanelRoleKind,
+  type HindsightView,
 } from '@/api/analysis'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
@@ -42,7 +46,7 @@ import type { RiskFlag } from '@/api/trust'
 const message = useMessage()
 const route = useRoute()
 const router = useRouter()
-const { upColor, downColor, flatColor, vars, withAlpha } = useUi()
+const { upColor, downColor, flatColor, vars, withAlpha, pctColor } = useUi()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const moduleOptions: { label: string; value: AnalysisModule }[] = [
@@ -74,6 +78,20 @@ const needTarget = computed(() => form.value.module === 'sector')
 const panelMode = ref(false)
 // AI 复核：额外一次独立复核员调用逐项挑刺（panel/降级不复核）。
 const verifyMode = ref(false)
+// M2 回溯诊断日期（时间戳；null=实时分析）。仅个股标准模式；选了回溯日期则 panel 不可用。
+const asOfTs = ref<number | null>(null)
+const asOfStr = computed(() => {
+  if (!asOfTs.value) return ''
+  const d = new Date(asOfTs.value)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+})
+// 回溯日期只能选过去（当天与未来禁用；后端同样校验）。
+function asOfDisabled(ts: number) {
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  return ts >= today.getTime()
+}
 
 // ---------- LLM 配置 ----------
 const llmConfigs = ref<LLMConfig[]>([])
@@ -120,8 +138,9 @@ async function runAnalysis() {
     if (needMarket.value) payload.market = form.value.market
     if (needSymbol.value) payload.symbol = form.value.symbol?.trim()
     if (needTarget.value) payload.target = form.value.target?.trim() || undefined
-    if (form.value.module === 'stock' && panelMode.value) payload.mode = 'panel'
+    if (form.value.module === 'stock' && panelMode.value && !asOfStr.value) payload.mode = 'panel'
     else if (verifyMode.value) payload.verify = true // 复核仅对标准模式生效（panel 无标准结论字段）
+    if (form.value.module === 'stock' && !payload.mode && asOfStr.value) payload.as_of = asOfStr.value
     const view = await createAnalysis(payload)
     current.value = view
     diff.value = null
@@ -289,6 +308,48 @@ function askFromAnalysis() {
   })
 }
 
+// ---------- 回溯校验（M2 hindsight：当时怎么看 → 后来怎么走） ----------
+const hindsightShow = ref(false)
+const hindsightLoading = ref(false)
+const hindsight = ref<HindsightView | null>(null)
+const hsTargetPrice = ref<number | null>(null)
+const hsStopPrice = ref<number | null>(null)
+const canHindsight = computed(
+  () => current.value?.module === 'stock' && (current.value.market || 'cn') === 'cn' && !!current.value.symbol,
+)
+async function openHindsight(refresh = false) {
+  if (!current.value) return
+  hindsightLoading.value = true
+  if (!refresh) {
+    hindsight.value = null
+    hsTargetPrice.value = null
+    hsStopPrice.value = null
+    hindsightShow.value = true
+  }
+  try {
+    hindsight.value = await getAnalysisHindsight(
+      current.value.id,
+      hsTargetPrice.value ?? undefined,
+      hsStopPrice.value ?? undefined,
+    )
+  } catch (e) {
+    message.warning((e as Error).message)
+    if (!refresh) hindsightShow.value = false
+  } finally {
+    hindsightLoading.value = false
+  }
+}
+const hindsightNodes: { key: 'd5' | 'd10' | 'd20' | 'd60'; label: string }[] = [
+  { key: 'd5', label: '+5 交易日' },
+  { key: 'd10', label: '+10 交易日' },
+  { key: 'd20', label: '+20 交易日' },
+  { key: 'd60', label: '+60 交易日' },
+]
+function fmtSignedPct(v: number | undefined | null): string {
+  if (v === undefined || v === null) return '—'
+  return `${v > 0 ? '+' : ''}${v.toFixed(2)}%`
+}
+
 onMounted(async () => {
   // 从个股页/自选跳转带参：预填模块与标的。
   if (route.query.module) form.value.module = String(route.query.module) as AnalysisModule
@@ -317,7 +378,21 @@ onMounted(async () => {
             <n-form-item v-if="needTarget" label="关注板块（可选）">
               <n-input v-model:value="form.target" placeholder="如 半导体 / 银行" />
             </n-form-item>
-            <n-form-item v-if="form.module === 'stock'" label="多角色观点">
+            <n-form-item v-if="form.module === 'stock'" label="回溯日期（可选 · 历史诊断）">
+              <n-date-picker
+                v-model:value="asOfTs"
+                type="date"
+                clearable
+                :is-date-disabled="asOfDisabled"
+                placeholder="留空=实时分析"
+                style="width: 100%"
+              />
+            </n-form-item>
+            <div v-if="form.module === 'stock' && asOfStr" class="hint" style="margin-bottom: 8px">
+              回溯模式：日线截断至 {{ asOfStr }} 组装数据（无未来泄露），估值/新闻/财务不可得会如实声明；
+              完成后可用「回溯校验」对照真实走势。
+            </div>
+            <n-form-item v-if="form.module === 'stock' && !asOfStr" label="多角色观点">
               <n-switch v-model:value="panelMode" />
               <span class="switch-hint">技术面 / 动量 / 风控 / 反方四视角独立评判</span>
             </n-form-item>
@@ -383,6 +458,7 @@ onMounted(async () => {
                   <div class="hist-title">
                     <n-tag size="tiny" round :bordered="false">{{ moduleText(h.module) }}</n-tag>
                     <n-tag v-if="h.mode === 'panel'" size="tiny" round :bordered="false" type="info">多角色</n-tag>
+                    <n-tag v-if="h.as_of" size="tiny" round :bordered="false" type="warning">回溯</n-tag>
                     <span class="hist-target">{{ h.target || h.title }}</span>
                   </div>
                   <div class="hist-sub">{{ fmtTime(h.created_at) }}</div>
@@ -425,12 +501,14 @@ onMounted(async () => {
                 <div class="res-title">
                   <n-tag size="small" round :bordered="false">{{ moduleText(current.module) }}</n-tag>
                   <n-tag v-if="current.mode === 'panel'" size="small" round :bordered="false" type="info">多角色</n-tag>
+                  <n-tag v-if="current.as_of" size="small" round :bordered="false" type="warning">回溯@{{ current.as_of }}</n-tag>
                   <span class="res-target">{{ current.target || current.title }}</span>
                 </div>
                 <div class="res-side">
                   <n-button v-if="canDiff" size="tiny" quaternary :loading="diffLoading" @click="openDiff"
                     >与上次对比</n-button
                   >
+                  <n-button v-if="canHindsight" size="tiny" quaternary @click="openHindsight()">回溯校验</n-button>
                   <n-button v-if="canAskQa" size="tiny" quaternary @click="askFromAnalysis">继续问答</n-button>
                   <div v-if="current.status === 'success' && current.result" class="res-rating">
                     <span
@@ -679,6 +757,71 @@ onMounted(async () => {
     <!-- 数据快照：本次分析所依据的结构化数据（凭它复现结论） -->
     <n-modal v-model:show="snapshotShow" preset="card" title="数据快照" style="max-width: 720px">
       <pre class="snapshot-pre">{{ snapshotText }}</pre>
+    </n-modal>
+
+    <!-- 回溯校验（M2 hindsight）：当时怎么看 → 后来怎么走 -->
+    <n-modal v-model:show="hindsightShow" preset="card" title="回溯校验 · 事后走势对照" style="max-width: 620px">
+      <n-spin :show="hindsightLoading">
+        <n-empty v-if="!hindsight" description="加载中…" />
+        <div v-else class="hs">
+          <div class="hs-meta">
+            <span class="hs-name">{{ hindsight.name || hindsight.symbol }}</span>
+            <span class="dim qv-tnum">{{ hindsight.symbol }}</span>
+            <n-tag size="small" :bordered="false" type="warning">基准日 {{ hindsight.base_date }}</n-tag>
+            <span class="dim">基准价 {{ hindsight.base_price.toFixed(2) }}（当日收盘）</span>
+          </div>
+          <div class="hs-grid">
+            <div v-for="n in hindsightNodes" :key="n.key" class="hs-node">
+              <div class="hs-node-label">{{ n.label }}</div>
+              <div
+                class="hs-node-value qv-figure"
+                :style="{ color: hindsight.returns[n.key] ? pctColor(hindsight.returns[n.key]!.return_pct) : undefined }"
+              >
+                {{ hindsight.returns[n.key] ? fmtSignedPct(hindsight.returns[n.key]!.return_pct) : '未到期' }}
+              </div>
+              <div v-if="hindsight.returns[n.key]" class="hs-node-sub dim qv-tnum">{{ hindsight.returns[n.key]!.date }}</div>
+            </div>
+          </div>
+          <div class="hs-line">
+            区间最大上涨
+            <span class="qv-tnum" :style="{ color: pctColor(hindsight.max_gain_pct) }">{{ fmtSignedPct(hindsight.max_gain_pct) }}</span>
+            · 最大下跌
+            <span class="qv-tnum" :style="{ color: pctColor(-hindsight.max_drawdown_pct) }">-{{ hindsight.max_drawdown_pct.toFixed(2) }}%</span>
+            <template v-if="hindsight.alpha_pct !== undefined">
+              · 同期上证 {{ fmtSignedPct(hindsight.bench_return_pct) }} · 超额(α)
+              <span class="qv-tnum" :style="{ color: pctColor(hindsight.alpha_pct) }">{{ fmtSignedPct(hindsight.alpha_pct) }}</span>
+            </template>
+          </div>
+          <div v-if="hindsight.rating" class="hs-line">
+            当时评级 <n-tag size="small" :bordered="false">{{ ratingText(hindsight.rating) }}</n-tag>
+            <template v-if="hindsight.rating_hit !== undefined && hindsight.rating_hit !== null">
+              → 按 +20 交易日方向
+              <n-tag size="small" :bordered="false" :type="hindsight.rating_hit ? 'success' : 'error'">
+                {{ hindsight.rating_hit ? '命中' : '未命中' }}
+              </n-tag>
+            </template>
+            <span v-else class="dim">（中性评级或未到 +20 日，不判方向命中）</span>
+          </div>
+          <div class="hs-touch">
+            <div class="hs-touch-form">
+              <n-input-number v-model:value="hsTargetPrice" size="small" :min="0" placeholder="目标价" style="width: 130px" />
+              <n-input-number v-model:value="hsStopPrice" size="small" :min="0" placeholder="止损价" style="width: 130px" />
+              <n-button size="small" :loading="hindsightLoading" @click="openHindsight(true)">验证价位首触</n-button>
+            </div>
+            <div v-if="hindsight.target_touch" class="hs-line">
+              目标价 {{ hindsight.target_touch.price }} 于 {{ hindsight.target_touch.date }}（第
+              {{ hindsight.target_touch.day_index }} 个交易日）盘中上穿
+            </div>
+            <div v-else-if="hsTargetPrice" class="hs-line dim">目标价 {{ hsTargetPrice }} 窗口内未触及</div>
+            <div v-if="hindsight.stop_touch" class="hs-line">
+              止损价 {{ hindsight.stop_touch.price }} 于 {{ hindsight.stop_touch.date }}（第
+              {{ hindsight.stop_touch.day_index }} 个交易日）盘中下破
+            </div>
+            <div v-else-if="hsStopPrice" class="hs-line dim">止损价 {{ hsStopPrice }} 窗口内未触及</div>
+          </div>
+          <div class="hs-note dim">{{ hindsight.note }}</div>
+        </div>
+      </n-spin>
     </n-modal>
   </PageContainer>
 </template>
@@ -987,5 +1130,74 @@ onMounted(async () => {
   max-height: 60vh;
   overflow: auto;
   margin: 0;
+}
+
+/* 回溯校验面板 */
+.hs {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.hs-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.hs-name {
+  font-weight: 600;
+  font-size: 15px;
+}
+.hs-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+@media (max-width: 640px) {
+  .hs-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+.hs-node {
+  border: 1px solid var(--qv-divider);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.hs-node-label {
+  font-size: 12px;
+  opacity: 0.65;
+  margin-bottom: 4px;
+}
+.hs-node-value {
+  font-size: 18px;
+  font-weight: 700;
+}
+.hs-node-sub {
+  margin-top: 2px;
+  font-size: 11px;
+}
+.hs-line {
+  font-size: 13px;
+  line-height: 1.7;
+}
+.hs-touch {
+  border-top: 1px dashed var(--qv-divider);
+  padding-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.hs-touch-form {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.hs-note {
+  font-size: 12px;
+}
+.dim {
+  opacity: 0.6;
+  font-size: 12px;
 }
 </style>

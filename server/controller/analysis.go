@@ -81,6 +81,24 @@ func (ac *AnalysisController) Diff(c *gin.Context) {
 	common.ApiSuccess(c, d)
 }
 
+// Hindsight GET /api/analysis/:id/hindsight —— 个股分析的事后核验（M2 回溯诊断）：
+// as_of（回溯分析）或创建日（普通分析）之后的真实收益/最大涨跌幅/基准 alpha/评级命中；
+// 可选 query target_price/stop_price 验证价位首触日。
+func (ac *AnalysisController) Hindsight(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	target, _ := strconv.ParseFloat(c.Query("target_price"), 64)
+	stop, _ := strconv.ParseFloat(c.Query("stop_price"), 64)
+	v, err := ac.svc.Hindsight(c.Request.Context(), currentUserID(c), id, target, stop)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, v)
+}
+
 // Delete DELETE /api/analysis/:id
 func (ac *AnalysisController) Delete(c *gin.Context) {
 	id, ok := parseIDParam(c, "id")

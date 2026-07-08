@@ -41,6 +41,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	newsSvc := service.NewNewsService()
 	financeSvc := service.NewFinanceService()
 	screenerSvc := service.NewScreenerService()
+	backtestSvc := service.NewBacktestService(marketSvc)
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc, scoreSvc, indicatorSvc, chipSvc)
@@ -68,6 +69,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	newsCtl := controller.NewNewsController(newsSvc)
 	financeCtl := controller.NewFinanceController(financeSvc)
 	screenerCtl := controller.NewScreenerController(screenerSvc)
+	backtestCtl := controller.NewBacktestController(backtestSvc)
 
 	api := r.Group("/api")
 	{
@@ -172,6 +174,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				analysis.GET("", analysisCtl.List)
 				analysis.GET("/:id", analysisCtl.Get)
 				analysis.GET("/:id/diff", analysisCtl.Diff)
+				analysis.GET("/:id/hindsight", analysisCtl.Hindsight)
 				analysis.DELETE("/:id", analysisCtl.Delete)
 			}
 
@@ -264,6 +267,14 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				screener.DELETE("/strategies/:id", screenerCtl.DeleteStrategy)
 				screener.POST("/scan", middleware.RateLimit(20, time.Minute), screenerCtl.Scan)
 				screener.GET("/status", screenerCtl.Status)
+			}
+
+			// 回测时光机（M2：条件树策略历史回测 + 推荐批次回验；纯本地计算无 LLM。
+			// 回测是数秒级重活且有全局互斥，限流从紧防连击）
+			backtest := authed.Group("/backtest")
+			{
+				backtest.POST("/run", middleware.RateLimit(6, time.Minute), backtestCtl.Run)
+				backtest.POST("/recommendations", middleware.RateLimit(10, time.Minute), backtestCtl.Recommendations)
 			}
 
 			// 模拟交易（虚拟账户，用真实行情成交与估值）

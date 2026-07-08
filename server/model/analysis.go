@@ -35,7 +35,10 @@ type AnalysisRecord struct {
 	Title  string `gorm:"size:128" json:"title"`
 
 	Status     string `gorm:"size:16" json:"status"`
-	Mode       string `gorm:"size:16" json:"mode"`      // ""=标准 / "panel"=多角色观点
+	Mode       string `gorm:"size:16" json:"mode"` // ""=标准 / "panel"=多角色观点
+	// AsOf 回溯诊断日期（YYYY-MM-DD，空=实时分析）。M2：个股模块支持按历史日期
+	// 截断日线组装 prompt（无未来泄露），事后用 hindsight 端点对照真实走势。
+	AsOf       string `gorm:"size:10" json:"as_of"`
 	Rating     string `gorm:"size:16" json:"rating"`    // 抽取到列，便于列表快速展示
 	Confidence int    `json:"confidence"`               // 0-100
 	Summary    string `gorm:"size:1024" json:"summary"` // 一句话总览（降级时为截断原文）
