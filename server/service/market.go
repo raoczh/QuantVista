@@ -18,10 +18,20 @@ import (
 // MarketService 行情业务：缓存 → 数据源适配层 → 落库快照。
 type MarketService struct {
 	mgr *datasource.Manager
+	// wide 全市场日线链路（M1）专用源：clist 快照只有东财有；历史初始化/除权重锚的
+	// kline 必须与增量同为东财前复权口径，不走 mgr 路由（防新浪不复权兜底毒化基准）。
+	// 独立实例（自带断路器）：长任务的限流状态不与在线路径互相影响。测试可注入假实现。
+	wide wideSource
+}
+
+// wideSource 全市场日线链路依赖的数据源能力子集（东财实现；单测注入假实现）。
+type wideSource interface {
+	GetCNSpotSnapshot(ctx context.Context) ([]datasource.SpotRow, error)
+	GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]datasource.Bar, error)
 }
 
 func NewMarketService(mgr *datasource.Manager) *MarketService {
-	return &MarketService{mgr: mgr}
+	return &MarketService{mgr: mgr, wide: datasource.NewEastMoneyAdapter()}
 }
 
 const quoteCacheTTL = 10 * time.Second
@@ -293,6 +303,14 @@ func (s *MarketService) GetOverview(ctx context.Context, market string) *Overvie
 
 func (s *MarketService) persistDailyBars(market, symbol string, bars []datasource.Bar) {
 	if common.DB == nil || len(bars) == 0 {
+		return
+	}
+
+	// M1 除权检测（防"部分窗口重写"漏检）：本次拉取若与 DB 内已有窗口的 close 多点
+	// 比对出现偏差，说明发生了除权/送转（东财前复权序列整体重锚）——此时只 upsert
+	// 本窗会留下"窗口内新基准、窗口外旧基准"的断层。检测命中即全量重锚（250 根删+插）
+	// 后直接返回。仅东财源检测：新浪日线不复权，与前复权基准比对必然偏差，会误判。
+	if market == "cn" && bars[0].Source == "eastmoney" && s.detectAndRebase(market, symbol, bars) {
 		return
 	}
 

@@ -211,3 +211,46 @@ func (mc *MarketController) SyncLogs(c *gin.Context) {
 func (mc *MarketController) DataSources(c *gin.Context) {
 	common.ApiSuccess(c, gin.H{"health": mc.svc.DataSourceHealth()})
 }
+
+// --- 管理员：全市场日线（M1） ---
+
+// WideSync POST /api/admin/market/wide-sync
+// 手动触发全市场日线增量（clist 快照落当日 bar + 除权初筛）。异步执行，立即返回。
+func (mc *MarketController) WideSync(c *gin.Context) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		if _, err := mc.svc.SyncMarketWide(ctx); err != nil &&
+			!errors.Is(err, service.ErrSyncInProgress) {
+			common.SysWarn("手动全市场增量失败: %v", err)
+		}
+	}()
+	common.ApiSuccess(c, gin.H{"started": true, "task": "sync_market_wide"})
+}
+
+// WideInitStart POST /api/admin/market/wide-init
+// 启动/续跑全市场历史初始化（断点续传，已在跑则报错）。
+func (mc *MarketController) WideInitStart(c *gin.Context) {
+	if err := mc.svc.StartMarketWideInit(); err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, gin.H{"started": true, "task": "init_market_history"})
+}
+
+// WideInitPause POST /api/admin/market/wide-init/pause
+// 暂停历史初始化（进度在表内，再次启动即从断点续跑）。
+func (mc *MarketController) WideInitPause(c *gin.Context) {
+	common.ApiSuccess(c, gin.H{"paused": mc.svc.PauseMarketWideInit()})
+}
+
+// WideStatus GET /api/admin/market/wide-status
+// 全市场覆盖状态：宇宙内 pending/done/failed 计数、任务运行标志、最近增量/初始化日志。
+func (mc *MarketController) WideStatus(c *gin.Context) {
+	v, err := mc.svc.MarketWideStatus()
+	if err != nil {
+		common.ApiErrorMsg(c, "查询全市场状态失败: "+err.Error())
+		return
+	}
+	common.ApiSuccess(c, v)
+}
