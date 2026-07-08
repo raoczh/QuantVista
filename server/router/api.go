@@ -305,6 +305,11 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 					adminMarket.POST("/backfill-calendar", marketCtl.BackfillCalendar)
 					adminMarket.POST("/snapshot", marketCtl.Snapshot)
 					adminMarket.GET("/sync-logs", marketCtl.SyncLogs)
+					// M1 全市场日线：增量同步 / 历史初始化（断点续传，可暂停）/ 覆盖状态
+					adminMarket.POST("/wide-sync", marketCtl.WideSync)
+					adminMarket.POST("/wide-init", marketCtl.WideInitStart)
+					adminMarket.POST("/wide-init/pause", marketCtl.WideInitPause)
+					adminMarket.GET("/wide-status", marketCtl.WideStatus)
 				}
 			}
 		}

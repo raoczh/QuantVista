@@ -322,4 +322,39 @@ func StartMarketJobs(mgr *datasource.Manager) {
 			cancel()
 		}
 	}()
+
+	// M1 全市场日线：每日 16:10（交易日）clist 增量落当日 bar + 除权初筛；
+	// 增量后若宇宙内仍有 pending（首轮部署/新股/重锚失败回退），自动推进历史初始化
+	//（异步、防重入、断点续传）。16:10 避开收盘竞价尾流，且与 19:05 finance job 错峰。
+	go func() {
+		if common.DB == nil {
+			return
+		}
+		for {
+			now := time.Now()
+			next := time.Date(now.Year(), now.Month(), now.Day(), 16, 10, 0, 0, now.Location())
+			if !next.After(now) {
+				next = next.AddDate(0, 0, 1)
+			}
+			time.Sleep(next.Sub(now))
+			if !isTradingDayToday(time.Now()) {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			if log, err := svc.SyncMarketWide(ctx); err != nil && !errors.Is(err, ErrSyncInProgress) {
+				common.SysWarn("全市场日线增量失败: %v", err)
+			} else if log != nil {
+				common.SysLog("全市场日线增量完成: %s", log.Message)
+			}
+			cancel()
+			var pending int64
+			common.DB.Model(&model.MarketSyncState{}).
+				Where("market = ? AND init_status = ?", market, "pending").Count(&pending)
+			if pending > 0 {
+				if err := svc.StartMarketWideInit(); err == nil {
+					common.SysLog("宇宙内尚有 %d 只待建史，已自动启动历史初始化", pending)
+				}
+			}
+		}
+	}()
 }

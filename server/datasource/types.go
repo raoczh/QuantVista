@@ -40,6 +40,24 @@ type Bar struct {
 	Source       string  `json:"source"` // 实际命中的数据源
 }
 
+// SpotRow 全市场行情快照单行（东财 clist，M1 全市场日线的每日增量源）。
+// 停牌股价格字段上游返回 "-"：解析为 0，但行保留（宇宙字典需要知道它存在），
+// 消费方按 Price>0 && Volume>0 判定当日是否落 bar。
+type SpotRow struct {
+	Symbol       string  `json:"symbol"`
+	Name         string  `json:"name"`
+	Price        float64 `json:"price"` // 最新价（盘后=当日收盘）
+	ChangePct    float64 `json:"change_pct"`
+	Open         float64 `json:"open"`
+	High         float64 `json:"high"`
+	Low          float64 `json:"low"`
+	PrevClose    float64 `json:"prev_close"` // f18 昨收（除权初筛锚点；停牌股也有值）
+	Volume       int64   `json:"volume"`     // 手
+	Amount       float64 `json:"amount"`
+	TurnoverRate float64 `json:"turnover_rate"` // %
+	DataTime     int64   `json:"data_time"`     // f124 行情时间戳（unix 秒；停牌股为旧值）
+}
+
 // Fundamental 基本面摘要（骨架占位，阶段 4/5 扩展）。
 type Fundamental struct {
 	Symbol    string    `json:"symbol"`

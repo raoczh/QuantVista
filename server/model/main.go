@@ -47,6 +47,7 @@ func AllModels() []any {
 		&Announcement{},
 		&FinanceIndicator{},
 		&FinanceStatement{},
+		&MarketSyncState{},
 	}
 }
 
