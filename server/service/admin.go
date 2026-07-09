@@ -16,34 +16,50 @@ func NewAdminService() *AdminService { return &AdminService{} }
 
 // SystemSettingsView 后台系统设置视图（不泄露 GitHub secret 本身）。
 type SystemSettingsView struct {
-	RegistrationOpen   bool   `json:"registration_open"`
-	GitHubOAuthEnabled bool   `json:"github_oauth_enabled"`
-	GitHubClientID     string `json:"github_client_id"`
-	HasGitHubSecret    bool   `json:"has_github_secret"`
+	RegistrationOpen       bool   `json:"registration_open"`
+	GitHubOAuthEnabled     bool   `json:"github_oauth_enabled"`
+	GitHubClientID         string `json:"github_client_id"`
+	HasGitHubSecret        bool   `json:"has_github_secret"`
+	NewsCollectIntervalMin int    `json:"news_collect_interval_min"`
+	NewsAutoLLM            bool   `json:"news_auto_llm"`
 }
 
 // GetSettings 读取当前系统设置。
 func (s *AdminService) GetSettings() SystemSettingsView {
 	return SystemSettingsView{
-		RegistrationOpen:   setting.RegistrationOpen(),
-		GitHubOAuthEnabled: setting.GitHubOAuthEnabled(),
-		GitHubClientID:     setting.GitHubClientID(),
-		HasGitHubSecret:    setting.HasGitHubSecret(),
+		RegistrationOpen:       setting.RegistrationOpen(),
+		GitHubOAuthEnabled:     setting.GitHubOAuthEnabled(),
+		GitHubClientID:         setting.GitHubClientID(),
+		HasGitHubSecret:        setting.HasGitHubSecret(),
+		NewsCollectIntervalMin: setting.NewsCollectIntervalMin(),
+		NewsAutoLLM:            setting.NewsAutoLLM(),
 	}
 }
 
 // UpdateSettingsInput 部分更新；指针为 nil 表示该项不变。GitHubClientSecret 为空字符串表示保留原值。
 type UpdateSettingsInput struct {
-	RegistrationOpen   *bool   `json:"registration_open"`
-	GitHubOAuthEnabled *bool   `json:"github_oauth_enabled"`
-	GitHubClientID     *string `json:"github_client_id"`
-	GitHubClientSecret *string `json:"github_client_secret"`
+	RegistrationOpen       *bool   `json:"registration_open"`
+	GitHubOAuthEnabled     *bool   `json:"github_oauth_enabled"`
+	GitHubClientID         *string `json:"github_client_id"`
+	GitHubClientSecret     *string `json:"github_client_secret"`
+	NewsCollectIntervalMin *int    `json:"news_collect_interval_min"`
+	NewsAutoLLM            *bool   `json:"news_auto_llm"`
 }
 
 // UpdateSettings 应用系统设置变更。
 func (s *AdminService) UpdateSettings(in UpdateSettingsInput) (SystemSettingsView, error) {
 	if in.RegistrationOpen != nil {
 		if err := setting.SetRegistrationOpen(*in.RegistrationOpen); err != nil {
+			return SystemSettingsView{}, err
+		}
+	}
+	if in.NewsCollectIntervalMin != nil {
+		if err := setting.SetNewsCollectIntervalMin(*in.NewsCollectIntervalMin); err != nil {
+			return SystemSettingsView{}, err
+		}
+	}
+	if in.NewsAutoLLM != nil {
+		if err := setting.SetNewsAutoLLM(*in.NewsAutoLLM); err != nil {
 			return SystemSettingsView{}, err
 		}
 	}

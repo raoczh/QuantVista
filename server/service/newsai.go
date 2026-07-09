@@ -12,6 +12,7 @@ import (
 
 	"quantvista/common"
 	"quantvista/model"
+	"quantvista/setting"
 
 	"gorm.io/gorm/clause"
 )
@@ -299,6 +300,10 @@ func (s *NewsService) EnhanceNewsRound(ctx context.Context) {
 	}
 
 	cfg, apiKey, adminID, llmErr := resolveNewsLLM()
+	// 管理后台总闸：关闭自动 LLM 时等价于"LLM 不可用"，走既有的纯规则降级通路。
+	if llmErr == nil && !setting.NewsAutoLLM() {
+		llmErr = errors.New("已关闭自动 LLM 新闻分析")
+	}
 	allowPrivate := llmErr == nil && isAdminUser(adminID)
 
 	// 分流：P1/P2 全量 LLM；P3 规则先行、缺板块的进简化 LLM 队列；P4/P5 纯规则。

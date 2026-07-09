@@ -13,6 +13,7 @@ import (
 	"quantvista/common"
 	"quantvista/datasource"
 	"quantvista/model"
+	"quantvista/setting"
 
 	"gorm.io/gorm/clause"
 )
@@ -382,7 +383,8 @@ func (s *NewsService) ListNews(symbol, source string, limit int) ([]model.News, 
 }
 
 // StartNewsJobs 新闻后台任务：
-//   - 快讯类（财联社电报 + 东财 7×24）每 5 分钟一轮，启动即跑一次；
+//   - 快讯类（财联社电报 + 东财 7×24）按管理后台配置的间隔轮询（默认 5 分钟，
+//     setting.NewsCollectIntervalMin，每轮结束重读、下一轮生效），启动即跑一次；
 //   - 个股新闻每 60 分钟一轮（TLS 指纹风险源，失败整轮降级）；
 //   - 每日 03:10 TTL 清理。
 func StartNewsJobs() *NewsService {
@@ -403,9 +405,9 @@ func StartNewsJobs() *NewsService {
 			svc.EnhanceNewsRound(ectx)
 		}
 		round()
-		t := time.NewTicker(5 * time.Minute)
-		defer t.Stop()
-		for range t.C {
+		// 自调度循环：每轮结束重读配置的间隔，改配置无需重启（getter 已钳制 ≥1 分钟）。
+		for {
+			time.Sleep(time.Duration(setting.NewsCollectIntervalMin()) * time.Minute)
 			round()
 		}
 	}()

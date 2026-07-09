@@ -52,8 +52,30 @@ async function load() {
     gh.client_id = settings.value.github_client_id
     gh.enabled = settings.value.github_oauth_enabled
     gh.client_secret = ''
+    news.interval = settings.value.news_collect_interval_min
+    news.auto_llm = settings.value.news_auto_llm
   } catch (e) {
     message.error((e as Error).message)
+  }
+}
+
+/* 新闻采集配置：间隔分钟数 + 自动 LLM 情绪分析开关 */
+const savingNews = ref(false)
+const news = reactive({ interval: 5, auto_llm: true })
+async function saveNews() {
+  savingNews.value = true
+  try {
+    settings.value = await updateSystemSettings({
+      news_collect_interval_min: news.interval || 5,
+      news_auto_llm: news.auto_llm,
+    })
+    news.interval = settings.value.news_collect_interval_min
+    news.auto_llm = settings.value.news_auto_llm
+    message.success('新闻采集设置已保存，间隔在下一轮采集生效')
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    savingNews.value = false
   }
 }
 
@@ -202,6 +224,25 @@ onMounted(() => {
           />
           <span style="opacity: 0.6">关闭时，仅已存在的账号可登录，新 GitHub 用户无法注册。</span>
         </n-space>
+      </SectionCard>
+
+      <!-- 新闻采集 -->
+      <SectionCard title="新闻采集" :hoverable="false">
+        <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 560px" :show-feedback="false">
+          <n-form-item label="采集间隔">
+            <n-input-number v-model:value="news.interval" :min="1" :max="120" :step="1" style="width: 140px">
+              <template #suffix>分钟</template>
+            </n-input-number>
+            <span style="opacity: 0.6; margin-left: 12px; font-size: 12px">快讯轮询间隔（1~120），改动在下一轮采集生效，无需重启。</span>
+          </n-form-item>
+          <n-form-item label="自动 LLM 分析">
+            <n-switch v-model:value="news.auto_llm" />
+            <span style="opacity: 0.6; margin-left: 12px; font-size: 12px">
+              开启：采集后自动调用管理员 LLM 做新闻情绪增强；关闭：只做关键词规则分析，不消耗 token。
+            </span>
+          </n-form-item>
+          <n-button type="primary" :loading="savingNews" style="margin-top: 8px" @click="saveNews">保存新闻设置</n-button>
+        </n-form>
       </SectionCard>
 
       <!-- GitHub OAuth -->
