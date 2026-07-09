@@ -7,6 +7,7 @@ export interface LLMConfig {
   provider: string
   base_url: string
   model: string
+  endpoint_type: string // chat_completions（默认）/ responses
   temperature: number
   max_tokens: number
   stream: boolean
@@ -23,6 +24,7 @@ export interface LLMConfigInput {
   base_url: string
   api_key: string
   model: string
+  endpoint_type: string
   temperature: number
   max_tokens: number
   stream: boolean

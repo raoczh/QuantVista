@@ -523,7 +523,7 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, cfg *model.L
 
 	for attempt := 0; attempt <= recRepairAttempts; attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
-			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model,
+			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 		})
@@ -592,7 +592,7 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, cfg *model.LLMC
 	}
 	for attempt := 0; attempt <= 1; attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
-			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model,
+			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 		})

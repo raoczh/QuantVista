@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"quantvista/common"
+	"quantvista/model"
 )
 
 // AI 调用客户端：OpenAI 兼容 /chat/completions。与 llm.go 的测试连接同源（复用 SafeHTTPClient 防 SSRF），
@@ -52,11 +53,17 @@ type chatParams struct {
 	BaseURL      string
 	APIKey       string
 	Model        string
+	EndpointType string // model.LLMEndpointChat（默认，空值同）/ model.LLMEndpointResponses
 	Temperature  float64
 	MaxTokens    int
 	Messages     []chatMessage
 	JSONMode     bool // 请求 response_format=json_object（不支持则由调用逻辑 fallback）
 	AllowPrivate bool // 管理员可放行内网自建模型
+}
+
+// isResponsesEndpoint 该次调用是否走 /v1/responses（空值按 chat/completions）。
+func (p chatParams) isResponsesEndpoint() bool {
+	return p.EndpointType == model.LLMEndpointResponses
 }
 
 // chatUsage token 统计。
@@ -75,7 +82,11 @@ type chatResult struct {
 
 // chatCompletion 发起一次补全。JSONMode=true 时先带 response_format 请求；
 // 若服务端因不支持该字段返回 4xx，则去掉 response_format 重试一次（fallback，靠 prompt 约束 JSON）。
+// EndpointType=responses 时分流到 /v1/responses 适配（ai_client_responses.go），返回语义一致。
 func chatCompletion(ctx context.Context, p chatParams) (*chatResult, error) {
+	if p.isResponsesEndpoint() {
+		return responsesCompletion(ctx, p)
+	}
 	u, err := url.Parse(p.BaseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, errors.New("Base URL 非法（仅支持 http/https）")
@@ -174,6 +185,7 @@ func doChat(ctx context.Context, p chatParams, jsonMode bool) (*chatResult, int,
 			Message struct {
 				Content string `json:"content"`
 			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage chatUsage `json:"usage"`
 	}
@@ -189,17 +201,22 @@ func doChat(ctx context.Context, p chatParams, jsonMode bool) (*chatResult, int,
 	content := ""
 	if len(parsed.Choices) > 0 {
 		content = parsed.Choices[0].Message.Content
+		// 上游安全策略拦截（finish_reason=content_filter）且无内容：给明确文案而非笼统"空内容"。
+		if content == "" && parsed.Choices[0].FinishReason == "content_filter" {
+			return nil, resp.StatusCode, raw, latency, errors.New("内容被上游安全策略拦截（finish_reason=content_filter）")
+		}
 	}
 	return &chatResult{Content: content, Usage: parsed.Usage}, resp.StatusCode, raw, latency, nil
 }
 
-// looksLikeUnsupportedJSONMode 粗略判断 4xx 是否因不支持 response_format 引起。
+// looksLikeUnsupportedJSONMode 粗略判断 4xx 是否因不支持 response_format / text.format 引起。
 func looksLikeUnsupportedJSONMode(status int, raw []byte) bool {
 	if status < 400 || status >= 500 {
 		return false
 	}
 	msg := strings.ToLower(string(raw))
 	return strings.Contains(msg, "response_format") ||
+		strings.Contains(msg, "text.format") ||
 		strings.Contains(msg, "json_object") ||
 		strings.Contains(msg, "json mode") ||
 		strings.Contains(msg, "not support")
@@ -317,26 +334,38 @@ func estimateUsage(messages []chatMessage, content string) chatUsage {
 
 // chatCompletionStream 发起一次流式补全（SSE）：逐行剥 "data: " 前缀解析 delta.content，
 // 每个增量经 onDelta 回调吐出（调用方负责推给前端）；[DONE] 或 finish_reason 终止。
-// 返回聚合后的完整内容与 usage（部分兼容端点会在最后一个 chunk 带 usage，缺失则字符粗估）。
+// 返回聚合后的完整内容与 usage（请求带 stream_options.include_usage 让上游在末 chunk 回
+// usage——new-api 同款；不支持该字段的 4xx 会去掉重试一次，仍缺失则字符粗估）。
 // 不做 JSON mode（流式只用于自由文本模块），不做状态码重试（流一旦建立，中断即失败——
 // 半截内容重试会让用户看到重复文本）；建立连接前的错误分类与非流式一致。
+// EndpointType=responses 时分流到 /v1/responses 适配。
 func chatCompletionStream(ctx context.Context, p chatParams, onDelta func(string)) (*chatResult, error) {
+	if p.isResponsesEndpoint() {
+		return responsesCompletionStream(ctx, p, onDelta)
+	}
 	u, err := url.Parse(p.BaseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, errors.New("Base URL 非法（仅支持 http/https）")
 	}
 	endpoint := chatCompletionsURL(p.BaseURL)
 
-	payload := map[string]any{
-		"model":       p.Model,
-		"messages":    p.Messages,
-		"temperature": p.Temperature,
-		"stream":      true,
+	buildBody := func(withUsageOpt bool) []byte {
+		payload := map[string]any{
+			"model":       p.Model,
+			"messages":    p.Messages,
+			"temperature": p.Temperature,
+			"stream":      true,
+		}
+		if p.MaxTokens > 0 {
+			payload["max_tokens"] = p.MaxTokens
+		}
+		if withUsageOpt {
+			payload["stream_options"] = map[string]bool{"include_usage": true}
+		}
+		b, _ := json.Marshal(payload)
+		return b
 	}
-	if p.MaxTokens > 0 {
-		payload["max_tokens"] = p.MaxTokens
-	}
-	body, _ := json.Marshal(payload)
+	body := buildBody(true)
 
 	client := aiHTTPClient(p.AllowPrivate)
 	send := func() (*http.Response, error) {
@@ -358,6 +387,21 @@ func chatCompletionStream(ctx context.Context, p chatParams, onDelta func(string
 	}
 	if err != nil {
 		return nil, fmt.Errorf("请求失败: %w", err)
+	}
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		// 部分兼容端点不认识 stream_options：识别后去掉该字段重试一次（照 JSON mode fallback 模式）。
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if strings.Contains(strings.ToLower(string(raw)), "stream_options") && ctx.Err() == nil {
+			body = buildBody(false)
+			if r2, e2 := send(); e2 == nil {
+				resp = r2
+			} else {
+				return nil, fmt.Errorf("请求失败: %w", e2)
+			}
+		} else {
+			return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", resp.StatusCode, statusHint(resp.StatusCode), extractErr(raw))
+		}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

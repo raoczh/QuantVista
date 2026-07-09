@@ -482,7 +482,7 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 	}
 
 	res, err := chatCompletion(ctx, chatParams{
-		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model,
+		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 		Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
 		Messages: messages, JSONMode: true, AllowPrivate: allowPrivate,
 	})
@@ -500,7 +500,7 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 		chatMessage{Role: "user", Content: dailyReviewRepairHint},
 	)
 	res2, err := chatCompletion(ctx, chatParams{
-		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model,
+		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 		Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
 		Messages: messages, JSONMode: true, AllowPrivate: allowPrivate,
 	})
