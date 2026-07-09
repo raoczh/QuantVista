@@ -32,8 +32,8 @@ func NewRecommendationService(market *MarketService, watchlist *WatchlistService
 }
 
 const (
-	recPromptVersion   = "p9" // p9: M3a 龙虎榜/机构/人气榜/主力资金流字段说明；p8: F2 长线名单新增 fin 财务摘要（ROE/营收净利增速/毛利率）字段说明、longTermSpec 撤「缺财务明细」声明；p7: T1 技术指标与筹码字段说明；p6: senti 消息面字段；p5: 来源随策略组合；p4: 四阶段流水线；p3: 落选理由；p2: 估值富化
-	recStrategyVersion = "s7" // s7: M3a 龙虎榜净买/机构席位/人气跃升/主力连续净流入加分项 + 量能维融合主力资金分；s6: F2 财务加分项（value ROE/growth 双增速/leader 盈利质量 + 业绩恶化通用扣分）；s5: T1 指标加分项 + 筹码超跌 + 五维动量/风险维升级；s4: 消息面情绪因子；s3: 策略-来源映射 + 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
+	recPromptVersion   = "p10" // p10: M3b 盘中因子字段说明（尾盘涨幅/量占比/早盘/VWAP）；p9: M3a 龙虎榜/机构/人气榜/主力资金流字段说明；p8: F2 长线名单新增 fin 财务摘要（ROE/营收净利增速/毛利率）字段说明、longTermSpec 撤「缺财务明细」声明；p7: T1 技术指标与筹码字段说明；p6: senti 消息面字段；p5: 来源随策略组合；p4: 四阶段流水线；p3: 落选理由；p2: 估值富化
+	recStrategyVersion = "s8" // s8: M3b 盘中因子短线加分项（尾盘放量拉升/跳水/收盘vs VWAP/午后重心上移/早盘强势）；s7: M3a 龙虎榜净买/机构席位/人气跃升/主力连续净流入加分项 + 量能维融合主力资金分；s6: F2 财务加分项（value ROE/growth 双增速/leader 盈利质量 + 业绩恶化通用扣分）；s5: T1 指标加分项 + 筹码超跌 + 五维动量/风险维升级；s4: 消息面情绪因子；s3: 策略-来源映射 + 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
 	maxScanCandidates  = 48   // 进入量化评分的候选上限（约束日线拉取量：48 只 × 1 次 HTTP，并发 6 约 3~8s）
 	maxLLMCandidates   = 16   // 量化排序后进入 LLM 精选的名单上限（控上下文与位置偏差面）
 	factorBarLimit     = 90   // 五维评分/窗口因子的日线口径（MA60 需 ≥60，留余量）；实际拉取按 chipBarLimit=210，评分前截尾
@@ -1106,6 +1106,9 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 		}
 		lhbSigs := lhbSignalsFor(syms)
 		popSigs := popSignalsFor(syms)
+		// M3b 盘中因子批量注入（本地表一次查询，最近已同步交易日 T-1 口径）；
+		// 写回点在下方 Factors 创建之后。
+		intraSigs := intradaySignalsFor(syms)
 		for _, i := range idxs {
 			if sig, ok := lhbSigs[pool[i].Symbol]; ok {
 				pool[i].LhbNetYi = sig.NetBuyYi
@@ -1166,6 +1169,15 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 				sc = applyFlowScore(sc, flows)
 				pool[i].Factors.MainNetDays = mainNetStreakDays(flows)
 				pool[i].Factors.MainNet5dYi = round2(mainNetSum(flows, 5) / 1e8)
+			}
+			// M3b 盘中因子写回（T-1 盘中形态，进短线策略加分与 LLM 名单）。
+			if sig, ok := intraSigs[pool[i].Symbol]; ok {
+				pool[i].Factors.IntradayDate = sig.TradeDate
+				pool[i].Factors.Tail30Chg = sig.Tail30Chg
+				pool[i].Factors.Tail30VolPct = sig.Tail30VolPct
+				pool[i].Factors.MorningChg = sig.MorningChg
+				pool[i].Factors.CloseVsVwap = sig.CloseVsVwap
+				pool[i].Factors.PmVwapUp = sig.PmVwapUp
 			}
 			pool[i].ScoreDims = &scoreDims{Trend: sc.Trend, Momentum: sc.Momentum, Position: sc.Position, Volume: sc.Volume, Risk: sc.Risk}
 
@@ -1438,7 +1450,7 @@ func (s *RecommendationService) buildMessages(recType string, strat *strategyTem
 	u.WriteString("名单已按量化综合分（score，0-100）降序排列，rank=1 为最高分。score 由五维技术评分（趋势/动量/位置/量能/风险，score_dims）加策略加分项（strategy_notes）合成，仅有排序意义、不代表预期收益。\n")
 	fmt.Fprintf(&u, "硬性要求：只能从名单里选，symbol 必须与名单完全一致，严禁名单外或虚构的标的；名单中符合策略的合格标的充足时应给足 %d 个，确实不足时宁可少选甚至不选（picks 可为空数组），绝不硬凑。你可以不同意量化排序（例如否决 rank 靠前者），但必须用名单中的数据说明理由。\n", count)
 	u.WriteString("同时请在 rejected 数组中，对名单内未入选的标的各给一句话落选理由，只解释名单内标的。\n\n")
-	u.WriteString("【量化初选名单】（JSON；price 现价、change_pct 当日涨跌%、amount_yi 成交额亿元、turnover_rate 换手%、volume_ratio 量比、float_cap_yi 流通市值亿元、pe_ttm 市盈率TTM（负=亏损）、pb 市净率、senti_score 当日新闻聚合情绪分-1~1（senti_news 为条数，字段缺失=当日无相关新闻，不得臆测消息面）；lhb_net_yi 最近一次上龙虎榜的净买额亿元（负=净卖出，lhb_reason 为上榜原因，缺失=近期未上榜）、org_net_yi 机构席位净买额亿元（org_buys 为机构买入次数）、pop_rank 股吧人气榜名次（pop_new=true 新上榜；人气是关注度信号非基本面，高人气也意味着拥挤与情绪退潮风险）；factors：ma5/ma10/ma20/ma60 均线、chg_5d/chg_20d 近5/20日涨跌%、high_20d 创20日新高、bull_align 多头排列、vol_boost 今日量/5日均量、bias_20 MA20乖离%、volatility_20 波动率%、drawdown_20 近20日最大回撤%、pos_60 60日区间位置、rsi_14 RSI(14,Wilder)、macd_dif/macd_dea/macd_hist MACD(12,26,9)（柱=2×(DIF−DEA)）、macd_gold DIF在DEA上方、macd_cross_up 近3日金叉、boll_up/boll_mid/boll_low 布林带(20,2σ)、boll_pos 布林带内位置%、atr_14/atr_pct 真实波幅及其占现价%、chip_profit 获利盘%（收盘价下方筹码占比）、chip_avg_cost 筹码平均成本（chip_bars 为筹码窗口根数，缺失=未计算，不得臆测筹码面）、main_net_days 主力资金连续净流入天数（负=连续净流出，main_net_5d_yi 为近5日主力净额亿元，缺失=资金流数据暂不可得，不得臆测资金面）；fin 财务摘要（长线名单）：roe 加权ROE%、revenue_yoy/net_profit_yoy 营收/净利同比%、gross_margin/net_margin 毛利率/净利率%、debt_ratio 资产负债率%、report 报告期（fin 缺失=财务数据暂不可得，不得臆测）；指标/估值字段缺失表示该数据暂不可得，不得臆测）：\n")
+	u.WriteString("【量化初选名单】（JSON；price 现价、change_pct 当日涨跌%、amount_yi 成交额亿元、turnover_rate 换手%、volume_ratio 量比、float_cap_yi 流通市值亿元、pe_ttm 市盈率TTM（负=亏损）、pb 市净率、senti_score 当日新闻聚合情绪分-1~1（senti_news 为条数，字段缺失=当日无相关新闻，不得臆测消息面）；lhb_net_yi 最近一次上龙虎榜的净买额亿元（负=净卖出，lhb_reason 为上榜原因，缺失=近期未上榜）、org_net_yi 机构席位净买额亿元（org_buys 为机构买入次数）、pop_rank 股吧人气榜名次（pop_new=true 新上榜；人气是关注度信号非基本面，高人气也意味着拥挤与情绪退潮风险）；factors：ma5/ma10/ma20/ma60 均线、chg_5d/chg_20d 近5/20日涨跌%、high_20d 创20日新高、bull_align 多头排列、vol_boost 今日量/5日均量、bias_20 MA20乖离%、volatility_20 波动率%、drawdown_20 近20日最大回撤%、pos_60 60日区间位置、rsi_14 RSI(14,Wilder)、macd_dif/macd_dea/macd_hist MACD(12,26,9)（柱=2×(DIF−DEA)）、macd_gold DIF在DEA上方、macd_cross_up 近3日金叉、boll_up/boll_mid/boll_low 布林带(20,2σ)、boll_pos 布林带内位置%、atr_14/atr_pct 真实波幅及其占现价%、chip_profit 获利盘%（收盘价下方筹码占比）、chip_avg_cost 筹码平均成本（chip_bars 为筹码窗口根数，缺失=未计算，不得臆测筹码面）、main_net_days 主力资金连续净流入天数（负=连续净流出，main_net_5d_yi 为近5日主力净额亿元，缺失=资金流数据暂不可得，不得臆测资金面）、盘中因子（intraday_date 为归属交易日的 T-1 盘中形态，缺失=盘中数据暂不可得，不得臆测盘中走势）：tail30_chg 尾盘30分钟涨幅%、tail30_vol_pct 尾盘30分钟量占全天%（均匀线12.5，>20 为尾盘异常放量）、morning_chg 早盘1小时涨幅%、close_vs_vwap 收盘相对全天均价偏离%（正=收在均价上方买方主导）、pm_vwap_up=true 下午均价高于上午（日内重心上移）；fin 财务摘要（长线名单）：roe 加权ROE%、revenue_yoy/net_profit_yoy 营收/净利同比%、gross_margin/net_margin 毛利率/净利率%、debt_ratio 资产负债率%、report 报告期（fin 缺失=财务数据暂不可得，不得臆测）；指标/估值字段缺失表示该数据暂不可得，不得臆测）：\n")
 	if b, err := json.Marshal(compactForLLM(recType, llmCands)); err == nil {
 		u.Write(b)
 	}

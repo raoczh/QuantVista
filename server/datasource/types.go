@@ -40,6 +40,18 @@ type Bar struct {
 	Source       string  `json:"source"` // 实际命中的数据源
 }
 
+// Min5Bar 5 分钟线单根（腾讯 mkline，M3b 盘中因子的数据源）。
+// Time 为 bar 结束时刻（一天 48 根：0935 首根含集合竞价、1500 末根含收盘竞价）。
+// 上游无成交额列，消费方以 量×典型价((O+H+L+C)/4) 估算。
+type Min5Bar struct {
+	Time   string  `json:"time"` // YYYYMMDDHHmm
+	Open   float64 `json:"open"`
+	High   float64 `json:"high"`
+	Low    float64 `json:"low"`
+	Close  float64 `json:"close"`
+	Volume int64   `json:"volume"` // 手
+}
+
 // SpotRow 全市场行情快照单行（东财 clist，M1 全市场日线的每日增量源）。
 // 停牌股价格字段上游返回 "-"：解析为 0，但行保留（宇宙字典需要知道它存在），
 // 消费方按 Price>0 && Volume>0 判定当日是否落 bar。
