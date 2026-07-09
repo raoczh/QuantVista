@@ -6,6 +6,8 @@ export interface SystemSettings {
   github_oauth_enabled: boolean
   github_client_id: string
   has_github_secret: boolean
+  news_collect_interval_min: number
+  news_auto_llm: boolean
 }
 
 // 部分更新：仅传需要改的字段。github_client_secret 留空表示保留原值。
@@ -14,6 +16,8 @@ export interface SystemSettingsUpdate {
   github_oauth_enabled?: boolean
   github_client_id?: string
   github_client_secret?: string
+  news_collect_interval_min?: number
+  news_auto_llm?: boolean
 }
 
 export function getSystemSettings() {

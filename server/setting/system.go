@@ -17,6 +17,15 @@ const (
 	keyGitHubOAuthEnabled = "github_oauth_enabled"
 	keyGitHubClientID     = "github_client_id"
 	keyGitHubClientSecret = "github_client_secret" // 密文存储
+	keyNewsInterval       = "news_collect_interval_min"
+	keyNewsAutoLLM        = "news_auto_llm"
+)
+
+// 新闻快讯采集间隔（分钟）的默认值与钳制范围：下限防打爆免费上游，上限防配成"实际不采集"。
+const (
+	NewsIntervalDefault = 5
+	NewsIntervalMin     = 1
+	NewsIntervalMax     = 120
 )
 
 var (
@@ -25,6 +34,10 @@ var (
 	gitHubOAuthEnabled bool
 	gitHubClientID     string
 	gitHubClientSecret string // 内存明文，由密文解密而来
+	// 新闻两项初始值即默认行为：Init 之前被读（如测试环境）也不会出现
+	// 间隔 0 空转或静默关闭 LLM 的意外。
+	newsIntervalMin = NewsIntervalDefault // 新闻快讯采集间隔（分钟）
+	newsAutoLLM     = true                // 是否允许采集后自动调 LLM 做新闻情绪分析
 )
 
 // Init 从 DB 加载系统配置；首启时若 DB 缺 GitHub 凭证而 env 提供了，则种子回填到 DB。
@@ -78,6 +91,25 @@ func apply(opts map[string]string) {
 	} else {
 		gitHubOAuthEnabled = gitHubClientID != "" && gitHubClientSecret != ""
 	}
+
+	newsIntervalMin = clampNewsInterval(opts[keyNewsInterval])
+	// 默认允许（!= "false"）：升级到本版本前该 key 不存在，不能静默关掉既有的自动 LLM 行为。
+	newsAutoLLM = opts[keyNewsAutoLLM] != "false"
+}
+
+// clampNewsInterval 解析并钳制采集间隔：缺失/非法回默认 5，越界钳到 [1,120]。
+func clampNewsInterval(raw string) int {
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return NewsIntervalDefault
+	}
+	if n < NewsIntervalMin {
+		return NewsIntervalMin
+	}
+	if n > NewsIntervalMax {
+		return NewsIntervalMax
+	}
+	return n
 }
 
 // ---- 读取 ----
@@ -92,6 +124,12 @@ func GitHubClientSecret() string { mu.RLock(); defer mu.RUnlock(); return gitHub
 // HasGitHubSecret 用于后台展示「是否已配置」而不泄露密钥本身。
 func HasGitHubSecret() bool { mu.RLock(); defer mu.RUnlock(); return gitHubClientSecret != "" }
 
+// NewsCollectIntervalMin 新闻快讯采集间隔（分钟），已钳制在 [1,120]。
+func NewsCollectIntervalMin() int { mu.RLock(); defer mu.RUnlock(); return newsIntervalMin }
+
+// NewsAutoLLM 是否允许采集后自动调 LLM 做新闻情绪增强；关闭时只做规则分析。
+func NewsAutoLLM() bool { mu.RLock(); defer mu.RUnlock(); return newsAutoLLM }
+
 // ---- 写入（持久化 + 刷新内存）----
 
 // SetRegistrationOpen 设置是否开放注册。
@@ -101,6 +139,35 @@ func SetRegistrationOpen(v bool) error {
 	}
 	mu.Lock()
 	registrationOpen = v
+	mu.Unlock()
+	return nil
+}
+
+// SetNewsCollectIntervalMin 设置新闻快讯采集间隔（分钟），越界钳制到 [1,120]。
+// 变更在采集 job 的下一轮生效（job 每轮结束重读本值）。
+func SetNewsCollectIntervalMin(v int) error {
+	if v < NewsIntervalMin {
+		v = NewsIntervalMin
+	}
+	if v > NewsIntervalMax {
+		v = NewsIntervalMax
+	}
+	if err := model.UpsertOption(keyNewsInterval, strconv.Itoa(v)); err != nil {
+		return err
+	}
+	mu.Lock()
+	newsIntervalMin = v
+	mu.Unlock()
+	return nil
+}
+
+// SetNewsAutoLLM 设置是否允许自动调 LLM 处理新闻。
+func SetNewsAutoLLM(v bool) error {
+	if err := model.UpsertOption(keyNewsAutoLLM, strconv.FormatBool(v)); err != nil {
+		return err
+	}
+	mu.Lock()
+	newsAutoLLM = v
 	mu.Unlock()
 	return nil
 }
