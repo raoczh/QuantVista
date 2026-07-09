@@ -153,7 +153,7 @@ func (s *DailyReportService) GenerateFor(ctx context.Context, userID int64, manu
 	if err := checkQuota(userID); err != nil {
 		return nil, err
 	}
-	allowPrivate := isAdminUser(userID)
+	allowPrivate := llmAllowPrivate(isAdminUser(userID), cfg) // 回退到管理员配置时按配置所有者放行内网
 
 	// 手动重生成：清掉当日旧报告与旧卖点提醒规则，避免重复。
 	if exists && manual {

@@ -343,6 +343,7 @@ func (s *RecommendationService) generate(ctx context.Context, userID int64, allo
 	if err != nil {
 		return nil, err
 	}
+	allowPrivate = llmAllowPrivate(allowPrivate, cfg) // 回退到管理员配置时按配置所有者放行内网
 
 	// 2) 配额熔断。
 	if err := checkQuota(userID); err != nil {

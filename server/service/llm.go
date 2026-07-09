@@ -305,7 +305,9 @@ func (s *LLMService) getOwned(userID, id int64) (*model.LLMConfig, error) {
 }
 
 // ResolveForUse 取一份可用于实际调用的 LLM 配置并解密密钥。
-// id>0 取指定配置；id<=0 取默认配置（无默认则取最早一条）。均限本人。
+// id>0 取指定配置（限本人）；id<=0 取默认配置（无默认则取最早一条）。
+// 本人一条配置都没有时，回退到首个启用管理员的默认配置——管理员代付 key，
+// 次数/token 配额仍按发起用户记（consumeQuota 在各调用方按发起 userID）。
 func (s *LLMService) ResolveForUse(userID, id int64) (*model.LLMConfig, string, error) {
 	var cfg model.LLMConfig
 	if id > 0 {
@@ -318,7 +320,7 @@ func (s *LLMService) ResolveForUse(userID, id int64) (*model.LLMConfig, string, 
 		err := common.DB.Where("user_id = ?", userID).
 			Order("is_default DESC, id ASC").First(&cfg).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, "", errors.New("尚未配置任何 LLM，请先在设置中添加")
+			err = s.adminFallback(userID, &cfg)
 		}
 		if err != nil {
 			return nil, "", err
@@ -332,6 +334,40 @@ func (s *LLMService) ResolveForUse(userID, id int64) (*model.LLMConfig, string, 
 		return nil, "", errors.New("该 LLM 配置缺少 API Key，请先补全")
 	}
 	return &cfg, key, nil
+}
+
+// adminFallback 无自有配置时回退首个启用管理员的默认配置；发起者本人就是该管理员
+// 或管理员也未配置时，保持"请先在设置中添加"的引导语义。
+func (s *LLMService) adminFallback(userID int64, cfg *model.LLMConfig) error {
+	adminID, err := firstEnabledAdminID()
+	if err != nil || adminID == userID {
+		return errors.New("尚未配置任何 LLM，请先在设置中添加")
+	}
+	err = common.DB.Where("user_id = ?", adminID).
+		Order("is_default DESC, id ASC").First(cfg).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return errors.New("尚未配置任何 LLM，请先在设置中添加")
+	}
+	return err
+}
+
+// firstEnabledAdminID 首个启用状态的管理员 ID（新闻情绪增强与 LLM 配置回退共用）。
+func firstEnabledAdminID() (int64, error) {
+	var admin model.User
+	if err := common.DB.Select("id").Where("role = ? AND status = ?", model.RoleAdmin, model.StatusEnabled).
+		Order("id ASC").First(&admin).Error; err != nil {
+		return 0, errors.New("无可用管理员账号")
+	}
+	return admin.ID, nil
+}
+
+// llmAllowPrivate 内网地址放行判定：发起者是管理员，或配置本身属于管理员
+//（普通用户回退用管理员配置时，内网 URL 是管理员配的、非用户可控输入，放行安全）。
+func llmAllowPrivate(callerAllow bool, cfg *model.LLMConfig) bool {
+	if callerAllow {
+		return true
+	}
+	return cfg != nil && isAdminUser(cfg.UserID)
 }
 
 // clearOtherDefaultsTx 事务内把该用户其余配置的 is_default 清掉（与设默认原子执行）。
