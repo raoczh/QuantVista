@@ -36,15 +36,15 @@ func TestSanitizeRecFilters(t *testing.T) {
 	}
 }
 
-// TestDefaultRecFilters 短线默认带追高保护与排除涨停，长线不带追高限制。
+// TestDefaultRecFilters 短线默认带追高保护与排除涨停，长线不带追高限制；两者股价默认 ≤50 元。
 func TestDefaultRecFilters(t *testing.T) {
 	s := defaultRecFilters(model.RecTypeShortTerm)
-	if s.MaxGain5dPct != 25 || !s.ExcludeLimitUp {
-		t.Fatalf("短线默认应为 追高25%%+排除涨停: %+v", s)
+	if s.MaxGain5dPct != 25 || !s.ExcludeLimitUp || s.PriceMax != 50 {
+		t.Fatalf("短线默认应为 追高25%%+排除涨停+股价≤50: %+v", s)
 	}
 	l := defaultRecFilters(model.RecTypeLongTerm)
-	if l.MaxGain5dPct != 0 || !l.ExcludeLimitUp {
-		t.Fatalf("长线默认应为 无追高限制+排除涨停: %+v", l)
+	if l.MaxGain5dPct != 0 || !l.ExcludeLimitUp || l.PriceMax != 50 {
+		t.Fatalf("长线默认应为 无追高限制+排除涨停+股价≤50: %+v", l)
 	}
 }
 

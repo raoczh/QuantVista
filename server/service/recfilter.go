@@ -28,9 +28,9 @@ type RecFilters struct {
 }
 
 // defaultRecFilters 各类型的保护性默认：短线带追高保护，长线宽松。
-// 价格/市值默认不限（个人偏好差异大，由用户在偏好或表单里配置）。
+// 股价默认 ≤50 元（资金约束友好默认，用户可在偏好/表单改为 0 不限）；市值默认不限。
 func defaultRecFilters(recType string) RecFilters {
-	f := RecFilters{ExcludeLimitUp: true}
+	f := RecFilters{ExcludeLimitUp: true, PriceMax: 50}
 	if recType == model.RecTypeShortTerm {
 		f.MaxGain5dPct = 25 // 散户实战共识：近5日涨幅>25% 追高风险大（20cm 板另计，见 gainCapFor）
 	}

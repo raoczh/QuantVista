@@ -251,9 +251,10 @@ const minAmountYi = computed({
 })
 
 /* ---------------- 推荐筛选默认值（股价/市值/换手/追高保护/排除涨停） ---------------- */
+// 初值须与后端 defaultRecFilters 对齐（股价默认 ≤50 元），偏好里存过则被 parseRecFilters 覆盖。
 const recFilters = reactive({
   price_min: 0,
-  price_max: 0,
+  price_max: 50,
   float_cap_min_yi: 0,
   float_cap_max_yi: 0,
   turnover_min: 0,
