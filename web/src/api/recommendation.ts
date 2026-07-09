@@ -32,7 +32,7 @@ export interface RecFilters {
 export function emptyRecFilters(): RecFilters {
   return {
     price_min: 0,
-    price_max: 0,
+    price_max: 50,
     float_cap_min_yi: 0,
     float_cap_max_yi: 0,
     turnover_min: 0,
