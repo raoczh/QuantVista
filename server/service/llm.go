@@ -14,6 +14,7 @@ import (
 
 	"quantvista/common"
 	"quantvista/model"
+	"quantvista/setting"
 
 	"gorm.io/gorm"
 )
@@ -336,22 +337,45 @@ func (s *LLMService) ResolveForUse(userID, id int64) (*model.LLMConfig, string, 
 	return &cfg, key, nil
 }
 
-// adminFallback 无自有配置时回退首个启用管理员的默认配置；发起者本人就是该管理员
-// 或管理员也未配置时，保持"请先在设置中添加"的引导语义。
+// adminFallback 无自有配置时的用户回退入口：受管理后台"LLM 回退"开关控制，
+// 关闭时保持"请先在设置中添加"的引导语义；发起者本人就是候选管理员时同样引导
+//（自己都没配置，回退到自己没有意义）。
 func (s *LLMService) adminFallback(userID int64, cfg *model.LLMConfig) error {
+	errGuide := errors.New("尚未配置任何 LLM，请先在设置中添加")
+	if !setting.LLMFallbackEnabled() {
+		return errGuide
+	}
+	if err := resolveSystemFallbackConfig(cfg); err != nil || cfg.UserID == userID {
+		return errGuide
+	}
+	return nil
+}
+
+// resolveSystemFallbackConfig 解析"系统默认 LLM"：管理后台指定的回退配置优先
+//（须仍存在且所有者是启用管理员，失效则静默回落），否则取首个启用管理员的默认配置。
+// 供用户回退（adminFallback）与新闻情绪分析（resolveNewsLLM）共用，不受回退开关控制。
+func resolveSystemFallbackConfig(cfg *model.LLMConfig) error {
+	if id := setting.LLMFallbackConfigID(); id > 0 {
+		var c model.LLMConfig
+		if err := common.DB.First(&c, id).Error; err == nil && isEnabledAdmin(c.UserID) {
+			*cfg = c
+			return nil
+		}
+		// 指定配置已删/所有者被禁用或降级：回落自动逻辑，不让系统 AI 能力瘫在死引用上。
+	}
 	adminID, err := firstEnabledAdminID()
-	if err != nil || adminID == userID {
-		return errors.New("尚未配置任何 LLM，请先在设置中添加")
+	if err != nil {
+		return err
 	}
 	err = common.DB.Where("user_id = ?", adminID).
 		Order("is_default DESC, id ASC").First(cfg).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return errors.New("尚未配置任何 LLM，请先在设置中添加")
+		return errors.New("管理员尚未配置默认 LLM")
 	}
 	return err
 }
 
-// firstEnabledAdminID 首个启用状态的管理员 ID（新闻情绪增强与 LLM 配置回退共用）。
+// firstEnabledAdminID 首个启用状态的管理员 ID。
 func firstEnabledAdminID() (int64, error) {
 	var admin model.User
 	if err := common.DB.Select("id").Where("role = ? AND status = ?", model.RoleAdmin, model.StatusEnabled).
@@ -359,6 +383,16 @@ func firstEnabledAdminID() (int64, error) {
 		return 0, errors.New("无可用管理员账号")
 	}
 	return admin.ID, nil
+}
+
+// isEnabledAdmin 是否为启用状态的管理员（isAdminUser 只看角色，这里连状态一起校验，
+// 供回退配置的所有者合法性判断——被禁用管理员的配置不应继续被系统使用）。
+func isEnabledAdmin(userID int64) bool {
+	var u model.User
+	if err := common.DB.Select("role, status").First(&u, userID).Error; err != nil {
+		return false
+	}
+	return u.Role == model.RoleAdmin && u.Status == model.StatusEnabled
 }
 
 // llmAllowPrivate 内网地址放行判定：发起者是管理员，或配置本身属于管理员

@@ -22,6 +22,8 @@ type SystemSettingsView struct {
 	HasGitHubSecret        bool   `json:"has_github_secret"`
 	NewsCollectIntervalMin int    `json:"news_collect_interval_min"`
 	NewsAutoLLM            bool   `json:"news_auto_llm"`
+	LLMFallbackEnabled     bool   `json:"llm_fallback_enabled"`
+	LLMFallbackConfigID    int64  `json:"llm_fallback_config_id"`
 }
 
 // GetSettings 读取当前系统设置。
@@ -33,6 +35,8 @@ func (s *AdminService) GetSettings() SystemSettingsView {
 		HasGitHubSecret:        setting.HasGitHubSecret(),
 		NewsCollectIntervalMin: setting.NewsCollectIntervalMin(),
 		NewsAutoLLM:            setting.NewsAutoLLM(),
+		LLMFallbackEnabled:     setting.LLMFallbackEnabled(),
+		LLMFallbackConfigID:    setting.LLMFallbackConfigID(),
 	}
 }
 
@@ -44,6 +48,8 @@ type UpdateSettingsInput struct {
 	GitHubClientSecret     *string `json:"github_client_secret"`
 	NewsCollectIntervalMin *int    `json:"news_collect_interval_min"`
 	NewsAutoLLM            *bool   `json:"news_auto_llm"`
+	LLMFallbackEnabled     *bool   `json:"llm_fallback_enabled"`
+	LLMFallbackConfigID    *int64  `json:"llm_fallback_config_id"`
 }
 
 // UpdateSettings 应用系统设置变更。
@@ -60,6 +66,29 @@ func (s *AdminService) UpdateSettings(in UpdateSettingsInput) (SystemSettingsVie
 	}
 	if in.NewsAutoLLM != nil {
 		if err := setting.SetNewsAutoLLM(*in.NewsAutoLLM); err != nil {
+			return SystemSettingsView{}, err
+		}
+	}
+	if in.LLMFallbackEnabled != nil || in.LLMFallbackConfigID != nil {
+		enabled := setting.LLMFallbackEnabled()
+		if in.LLMFallbackEnabled != nil {
+			enabled = *in.LLMFallbackEnabled
+		}
+		configID := setting.LLMFallbackConfigID()
+		if in.LLMFallbackConfigID != nil {
+			configID = *in.LLMFallbackConfigID
+		}
+		// 指定配置必须真实存在且所有者是启用管理员——防手工 PUT 塞进普通用户/已删配置的 id。
+		if configID > 0 {
+			var cfg model.LLMConfig
+			if err := common.DB.Select("id, user_id").First(&cfg, configID).Error; err != nil {
+				return SystemSettingsView{}, errors.New("指定的回退 LLM 配置不存在")
+			}
+			if !isEnabledAdmin(cfg.UserID) {
+				return SystemSettingsView{}, errors.New("回退 LLM 配置必须属于启用状态的管理员")
+			}
+		}
+		if err := setting.SetLLMFallback(enabled, configID); err != nil {
 			return SystemSettingsView{}, err
 		}
 	}

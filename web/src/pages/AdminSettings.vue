@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import {
   NSpace,
   NForm,
@@ -7,6 +7,7 @@ import {
   NInput,
   NInputNumber,
   NSwitch,
+  NSelect,
   NButton,
   NTable,
   NTag,
@@ -28,6 +29,7 @@ import {
   type SystemSettings,
   type SyncLog,
 } from '@/api/admin'
+import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import type { AuthUser } from '@/api/auth'
 import { useAuthStore } from '@/stores/auth'
 import { useIsMobile } from '@/composables/useIsMobile'
@@ -54,8 +56,49 @@ async function load() {
     gh.client_secret = ''
     news.interval = settings.value.news_collect_interval_min
     news.auto_llm = settings.value.news_auto_llm
+    fb.enabled = settings.value.llm_fallback_enabled
+    fb.config_id = settings.value.llm_fallback_config_id
   } catch (e) {
     message.error((e as Error).message)
+  }
+}
+
+/* LLM 回退：开关 + 指定回退配置（下拉列出当前管理员自己的 LLM 配置） */
+const savingFb = ref(false)
+const fb = reactive({ enabled: true, config_id: 0 })
+const myConfigs = ref<LLMConfig[]>([])
+const fbOptions = computed(() => {
+  const opts: { label: string; value: number }[] = [{ label: '自动（首个管理员的默认配置）', value: 0 }]
+  for (const c of myConfigs.value) {
+    opts.push({ label: `${c.name}（${c.model}${c.is_default ? ' · 默认' : ''}）`, value: c.id })
+  }
+  // 指定的配置不在本人列表里（其他管理员的）也要能回显，避免下拉显示成裸数字。
+  if (fb.config_id > 0 && !opts.some((o) => o.value === fb.config_id)) {
+    opts.push({ label: `配置 #${fb.config_id}（其他管理员的）`, value: fb.config_id })
+  }
+  return opts
+})
+async function loadMyConfigs() {
+  try {
+    myConfigs.value = await listLLMConfigs()
+  } catch {
+    /* 列表拉不到时仍可保存"自动" */
+  }
+}
+async function saveFallback() {
+  savingFb.value = true
+  try {
+    settings.value = await updateSystemSettings({
+      llm_fallback_enabled: fb.enabled,
+      llm_fallback_config_id: fb.config_id || 0,
+    })
+    fb.enabled = settings.value.llm_fallback_enabled
+    fb.config_id = settings.value.llm_fallback_config_id
+    message.success('LLM 回退设置已保存')
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    savingFb.value = false
   }
 }
 
@@ -207,6 +250,7 @@ onMounted(() => {
   load()
   loadUsers()
   loadLogs()
+  loadMyConfigs()
 })
 </script>
 
@@ -242,6 +286,27 @@ onMounted(() => {
             </span>
           </n-form-item>
           <n-button type="primary" :loading="savingNews" style="margin-top: 8px" @click="saveNews">保存新闻设置</n-button>
+        </n-form>
+      </SectionCard>
+
+      <!-- LLM 回退 -->
+      <SectionCard title="LLM 回退" :hoverable="false">
+        <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 620px" :show-feedback="false">
+          <n-form-item label="允许回退">
+            <n-switch v-model:value="fb.enabled" />
+            <span style="opacity: 0.6; margin-left: 12px; font-size: 12px">
+              开启：未配置 LLM 的用户自动使用下方指定的配置（次数配额仍按其本人计）；关闭：用户必须自己配置 LLM 才能使用 AI 功能。
+            </span>
+          </n-form-item>
+          <n-form-item label="回退配置">
+            <n-select v-model:value="fb.config_id" :options="fbOptions" :disabled="!fb.enabled" style="max-width: 340px" />
+          </n-form-item>
+          <n-form-item label=" ">
+            <span style="font-size: 12px; opacity: 0.55">
+              该配置同时作为系统后台任务（新闻情绪分析等）的默认 LLM；后台任务不受"允许回退"开关影响。指定配置失效时自动回落"首个管理员的默认配置"。
+            </span>
+          </n-form-item>
+          <n-button type="primary" :loading="savingFb" @click="saveFallback">保存回退设置</n-button>
         </n-form>
       </SectionCard>
 

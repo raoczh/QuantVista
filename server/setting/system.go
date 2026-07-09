@@ -19,6 +19,8 @@ const (
 	keyGitHubClientSecret = "github_client_secret" // 密文存储
 	keyNewsInterval       = "news_collect_interval_min"
 	keyNewsAutoLLM        = "news_auto_llm"
+	keyLLMFallbackEnabled = "llm_fallback_enabled"
+	keyLLMFallbackID      = "llm_fallback_config_id"
 )
 
 // 新闻快讯采集间隔（分钟）的默认值与钳制范围：下限防打爆免费上游，上限防配成"实际不采集"。
@@ -38,6 +40,9 @@ var (
 	// 间隔 0 空转或静默关闭 LLM 的意外。
 	newsIntervalMin = NewsIntervalDefault // 新闻快讯采集间隔（分钟）
 	newsAutoLLM     = true                // 是否允许采集后自动调 LLM 做新闻情绪分析
+	// LLM 回退：默认开（无自有配置的用户走管理员配置）；指定配置 0 = 自动取首个管理员的默认配置。
+	llmFallbackEnabled = true
+	llmFallbackID      int64
 )
 
 // Init 从 DB 加载系统配置；首启时若 DB 缺 GitHub 凭证而 env 提供了，则种子回填到 DB。
@@ -95,6 +100,13 @@ func apply(opts map[string]string) {
 	newsIntervalMin = clampNewsInterval(opts[keyNewsInterval])
 	// 默认允许（!= "false"）：升级到本版本前该 key 不存在，不能静默关掉既有的自动 LLM 行为。
 	newsAutoLLM = opts[keyNewsAutoLLM] != "false"
+
+	// LLM 回退开关同款 != "false" 语义（缺省开）；指定配置 id 非法/缺失归 0（自动）。
+	llmFallbackEnabled = opts[keyLLMFallbackEnabled] != "false"
+	llmFallbackID = 0
+	if v, err := strconv.ParseInt(opts[keyLLMFallbackID], 10, 64); err == nil && v > 0 {
+		llmFallbackID = v
+	}
 }
 
 // clampNewsInterval 解析并钳制采集间隔：缺失/非法回默认 5，越界钳到 [1,120]。
@@ -129,6 +141,14 @@ func NewsCollectIntervalMin() int { mu.RLock(); defer mu.RUnlock(); return newsI
 
 // NewsAutoLLM 是否允许采集后自动调 LLM 做新闻情绪增强；关闭时只做规则分析。
 func NewsAutoLLM() bool { mu.RLock(); defer mu.RUnlock(); return newsAutoLLM }
+
+// LLMFallbackEnabled 是否允许无自有 LLM 配置的用户回退使用管理员的配置；
+// 关闭后用户必须自己配置 LLM 才能使用 AI 功能（新闻情绪分析等系统后台任务不受此开关影响）。
+func LLMFallbackEnabled() bool { mu.RLock(); defer mu.RUnlock(); return llmFallbackEnabled }
+
+// LLMFallbackConfigID 指定的回退 LLM 配置 id；0 = 自动取首个管理员的默认配置。
+// 同时作为新闻情绪分析等系统后台任务的默认 LLM。
+func LLMFallbackConfigID() int64 { mu.RLock(); defer mu.RUnlock(); return llmFallbackID }
 
 // ---- 写入（持久化 + 刷新内存）----
 
@@ -168,6 +188,25 @@ func SetNewsAutoLLM(v bool) error {
 	}
 	mu.Lock()
 	newsAutoLLM = v
+	mu.Unlock()
+	return nil
+}
+
+// SetLLMFallback 设置 LLM 回退开关与指定配置 id（负数归 0=自动）。
+// 配置 id 的合法性（存在且属于启用管理员）由调用方（AdminService）校验。
+func SetLLMFallback(enabled bool, configID int64) error {
+	if configID < 0 {
+		configID = 0
+	}
+	if err := model.UpsertOption(keyLLMFallbackEnabled, strconv.FormatBool(enabled)); err != nil {
+		return err
+	}
+	if err := model.UpsertOption(keyLLMFallbackID, strconv.FormatInt(configID, 10)); err != nil {
+		return err
+	}
+	mu.Lock()
+	llmFallbackEnabled = enabled
+	llmFallbackID = configID
 	mu.Unlock()
 	return nil
 }
