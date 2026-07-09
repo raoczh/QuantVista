@@ -69,7 +69,7 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 	res, callErr := chatCompletion(ctx, chatParams{
 		BaseURL: ac.cfg.BaseURL, APIKey: ac.apiKey, Model: ac.cfg.Model,
 		Temperature: ac.cfg.Temperature, MaxTokens: ac.cfg.MaxTokens,
-		Messages: ac.messages, JSONMode: false, AllowPrivate: allowPrivate,
+		Messages: ac.messages, JSONMode: false, AllowPrivate: llmAllowPrivate(allowPrivate, ac.cfg),
 	})
 	if callErr != nil {
 		s.abortNewConv(ac)
@@ -89,7 +89,7 @@ func (s *QaService) AskStream(ctx context.Context, userID int64, allowPrivate bo
 	params := chatParams{
 		BaseURL: ac.cfg.BaseURL, APIKey: ac.apiKey, Model: ac.cfg.Model,
 		Temperature: ac.cfg.Temperature, MaxTokens: ac.cfg.MaxTokens,
-		Messages: ac.messages, JSONMode: false, AllowPrivate: allowPrivate,
+		Messages: ac.messages, JSONMode: false, AllowPrivate: llmAllowPrivate(allowPrivate, ac.cfg),
 	}
 	var res *chatResult
 	var callErr error

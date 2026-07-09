@@ -222,6 +222,7 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 	if err != nil {
 		return "", "AI 点评不可用：" + err.Error()
 	}
+	allowPrivate = llmAllowPrivate(allowPrivate, cfg) // 回退到管理员配置时按配置所有者放行内网
 	if err := checkQuota(userID); err != nil {
 		if errors.Is(err, errQuotaExhausted) {
 			return "", "AI 次数配额已用尽，仅展示指标对比"

@@ -361,7 +361,11 @@ async function doExport(kind: ExportKind) {
           <span class="ct-title">已配置的模型服务</span>
           <n-button type="primary" size="small" @click="openCreate">新增配置</n-button>
         </div>
-        <n-empty v-if="!loadingConfigs && configs.length === 0" description="还没有 LLM 配置" />
+        <n-empty v-if="!loadingConfigs && configs.length === 0" description="还没有 LLM 配置">
+          <template #extra>
+            <span style="font-size: 12px; opacity: 0.6">未配置时，AI 功能将自动使用管理员的默认 LLM 配置（次数配额仍按你的账号计）。</span>
+          </template>
+        </n-empty>
         <n-table v-else :bordered="false" :single-line="false">
           <thead>
             <tr>
