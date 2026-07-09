@@ -248,7 +248,7 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 	}
 
 	res, err := chatCompletion(ctx, chatParams{
-		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model,
+		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 		Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
 		Messages: []chatMessage{
 			{Role: "system", Content: "你是严谨的证券研究助理，输出仅供研究参考，不构成投资建议。"},

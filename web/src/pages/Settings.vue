@@ -83,6 +83,7 @@ const blankForm = (): LLMConfigInput => ({
   base_url: '',
   api_key: '',
   model: '',
+  endpoint_type: 'chat_completions',
   temperature: 0.7,
   max_tokens: 2048,
   stream: true,
@@ -93,6 +94,11 @@ const form = reactive<LLMConfigInput>(blankForm())
 const providerOptions = [
   { label: 'OpenAI 兼容（OpenAI/DeepSeek/Moonshot/中转等）', value: 'openai' },
   { label: '其他', value: 'other' },
+]
+
+const endpointOptions = [
+  { label: 'Chat Completions（/v1/chat/completions，默认）', value: 'chat_completions' },
+  { label: 'Responses（/v1/responses，OpenAI 新端点）', value: 'responses' },
 ]
 
 async function loadConfigs() {
@@ -120,6 +126,7 @@ function openEdit(cfg: LLMConfig) {
     base_url: cfg.base_url,
     api_key: '', // 留空表示保留原密钥
     model: cfg.model,
+    endpoint_type: cfg.endpoint_type || 'chat_completions',
     temperature: cfg.temperature,
     max_tokens: cfg.max_tokens,
     stream: cfg.stream,
@@ -582,7 +589,13 @@ async function doExport(kind: ExportKind) {
         <n-form-item label="Base URL">
           <div style="width: 100%">
             <n-input v-model:value="form.base_url" placeholder="如 https://api.deepseek.com 或中转站根地址" />
-            <div class="field-hint">填根地址即可，请求时自动补全 /v1/chat/completions；以 /v1 结尾或填完整端点也支持。</div>
+            <div class="field-hint">填根地址即可，请求时按下方端点类型自动补全路径；以 /v1 结尾或填完整端点也支持。</div>
+          </div>
+        </n-form-item>
+        <n-form-item label="接口端点">
+          <div style="width: 100%">
+            <n-select v-model:value="form.endpoint_type" :options="endpointOptions" />
+            <div class="field-hint">普通中转/兼容服务选 Chat Completions；仅在上游明确支持 OpenAI Responses API 时选 Responses。</div>
           </div>
         </n-form-item>
         <n-form-item label="API Key">

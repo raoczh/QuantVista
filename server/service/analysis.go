@@ -321,6 +321,7 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, cfg *model.LLMConf
 			BaseURL:      cfg.BaseURL,
 			APIKey:       apiKey,
 			Model:        cfg.Model,
+			EndpointType: cfg.EndpointType,
 			Temperature:  cfg.Temperature,
 			MaxTokens:    cfg.MaxTokens,
 			Messages:     convo,
@@ -492,7 +493,7 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 	}
 	for attempt := 0; attempt <= 1; attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
-			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model,
+			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 		})

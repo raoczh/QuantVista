@@ -2,6 +2,12 @@ package model
 
 import "time"
 
+// LLM 请求端点类型：OpenAI 兼容 /v1/chat/completions（默认）或 /v1/responses。
+const (
+	LLMEndpointChat      = "chat_completions"
+	LLMEndpointResponses = "responses"
+)
+
 // LLMConfig 用户级 LLM 连接配置。API Key 加密保存，不明文返回前端。
 type LLMConfig struct {
 	ID           int64     `gorm:"primaryKey" json:"id"`
@@ -11,6 +17,7 @@ type LLMConfig struct {
 	BaseURL      string    `gorm:"size:256" json:"base_url"`
 	APIKeyCipher string    `gorm:"size:512" json:"-"` // 加密后存储，json 永不输出
 	Model        string    `gorm:"size:64" json:"model"`
+	EndpointType string    `gorm:"size:24;default:chat_completions" json:"endpoint_type"` // 空值按 chat_completions
 	Temperature  float64   `gorm:"default:0.7" json:"temperature"`
 	MaxTokens    int       `gorm:"default:2048" json:"max_tokens"`
 	Stream       bool      `gorm:"default:true" json:"stream"`

@@ -209,7 +209,7 @@ func enhanceBatchLLM(ctx context.Context, cfg *model.LLMConfig, apiKey string, a
 		"\n\n【待标注新闻】（JSON 数组）：\n" + string(inJSON)
 
 	res, err := chatCompletion(ctx, chatParams{
-		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model,
+		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 		Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
 		Messages: []chatMessage{
 			{Role: "system", Content: newsEnhanceSystem},

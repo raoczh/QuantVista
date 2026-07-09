@@ -31,15 +31,24 @@ type LLMConfigView struct {
 
 // LLMConfigInput 增改入参。APIKey 为明文；更新时留空表示保留原密钥。
 type LLMConfigInput struct {
-	Name        string  `json:"name"`
-	Provider    string  `json:"provider"`
-	BaseURL     string  `json:"base_url"`
-	APIKey      string  `json:"api_key"`
-	Model       string  `json:"model"`
-	Temperature float64 `json:"temperature"`
-	MaxTokens   int     `json:"max_tokens"`
-	Stream      bool    `json:"stream"`
-	IsDefault   bool    `json:"is_default"`
+	Name         string  `json:"name"`
+	Provider     string  `json:"provider"`
+	BaseURL      string  `json:"base_url"`
+	APIKey       string  `json:"api_key"`
+	Model        string  `json:"model"`
+	EndpointType string  `json:"endpoint_type"` // chat_completions（默认）/ responses
+	Temperature  float64 `json:"temperature"`
+	MaxTokens    int     `json:"max_tokens"`
+	Stream       bool    `json:"stream"`
+	IsDefault    bool    `json:"is_default"`
+}
+
+// normalizeEndpointType 空值归默认 chat_completions；非法值报错由 validate 负责。
+func normalizeEndpointType(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return model.LLMEndpointChat
+	}
+	return v
 }
 
 func toView(cfg model.LLMConfig) LLMConfigView {
@@ -77,6 +86,11 @@ func (s *LLMService) validate(in LLMConfigInput) error {
 	if in.MaxTokens < 1 || in.MaxTokens > 200000 {
 		return errors.New("max_tokens 取值不合理")
 	}
+	switch normalizeEndpointType(in.EndpointType) {
+	case model.LLMEndpointChat, model.LLMEndpointResponses:
+	default:
+		return errors.New("端点类型仅支持 chat_completions / responses")
+	}
 	return nil
 }
 
@@ -96,6 +110,7 @@ func (s *LLMService) Create(userID int64, in LLMConfigInput) (*LLMConfigView, er
 		BaseURL:      strings.TrimRight(in.BaseURL, "/"),
 		APIKeyCipher: cipher,
 		Model:        in.Model,
+		EndpointType: normalizeEndpointType(in.EndpointType),
 		Temperature:  in.Temperature,
 		MaxTokens:    in.MaxTokens,
 		Stream:       in.Stream,
@@ -131,6 +146,7 @@ func (s *LLMService) Update(userID, id int64, in LLMConfigInput) (*LLMConfigView
 	cfg.Provider = in.Provider
 	cfg.BaseURL = strings.TrimRight(in.BaseURL, "/")
 	cfg.Model = in.Model
+	cfg.EndpointType = normalizeEndpointType(in.EndpointType)
 	cfg.Temperature = in.Temperature
 	cfg.MaxTokens = in.MaxTokens
 	cfg.Stream = in.Stream
@@ -187,7 +203,7 @@ func (s *LLMService) TestByID(userID, id int64, allowPrivate bool) (*TestResult,
 	if err != nil {
 		return nil, errors.New("密钥解密失败")
 	}
-	return s.testConnection(cfg.Provider, cfg.BaseURL, key, cfg.Model, allowPrivate), nil
+	return s.testConnection(cfg.Provider, cfg.EndpointType, cfg.BaseURL, key, cfg.Model, allowPrivate), nil
 }
 
 // TestByInput 测试未保存的配置（前端表单即时测试）。
@@ -195,34 +211,47 @@ func (s *LLMService) TestByInput(in LLMConfigInput, allowPrivate bool) (*TestRes
 	if in.BaseURL == "" || in.Model == "" || in.APIKey == "" {
 		return nil, errors.New("测试需要 base_url、model 与 api_key")
 	}
-	return s.testConnection(in.Provider, strings.TrimRight(in.BaseURL, "/"), in.APIKey, in.Model, allowPrivate), nil
+	return s.testConnection(in.Provider, in.EndpointType, strings.TrimRight(in.BaseURL, "/"), in.APIKey, in.Model, allowPrivate), nil
 }
 
-// testConnection 目前仅实现 OpenAI 兼容口径（/chat/completions 最小请求）。
+// testConnection 目前仅实现 OpenAI 兼容口径（chat/completions 或 responses 最小请求）。
 // 其他 provider（如 Anthropic 原生 /v1/messages）在此 switch 留口，后续按需补。
-func (s *LLMService) testConnection(provider, baseURL, apiKey, modelName string, allowPrivate bool) *TestResult {
+func (s *LLMService) testConnection(provider, endpointType, baseURL, apiKey, modelName string, allowPrivate bool) *TestResult {
 	switch strings.ToLower(provider) {
 	default: // openai 及各类 OpenAI 兼容中转
-		return s.testOpenAICompatible(baseURL, apiKey, modelName, allowPrivate)
+		return s.testOpenAICompatible(endpointType, baseURL, apiKey, modelName, allowPrivate)
 	}
 }
 
-func (s *LLMService) testOpenAICompatible(baseURL, apiKey, modelName string, allowPrivate bool) *TestResult {
+func (s *LLMService) testOpenAICompatible(endpointType, baseURL, apiKey, modelName string, allowPrivate bool) *TestResult {
 	// 校验 scheme：仅允许 http/https，防 file://、gopher:// 等被利用。
 	u, err := url.Parse(baseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return &TestResult{OK: false, Message: "Base URL 非法（仅支持 http/https）"}
 	}
 
-	// 与真实分析调用（ai_client.go doChat）同一拼接逻辑：测试通过 = 实际可用，不再各拼各的。
-	endpoint := chatCompletionsURL(baseURL)
-	body, _ := json.Marshal(map[string]any{
-		"model":    modelName,
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
-		// 16 对齐 new-api 的渠道测试请求；max_tokens=1 部分上游会拒绝或回空（推理模型尤甚）。
-		"max_tokens": 16,
-		"stream":     false,
-	})
+	// 与真实分析调用（ai_client.go doChat/doResponses）同一拼接逻辑：测试通过 = 实际可用。
+	isResponses := normalizeEndpointType(endpointType) == model.LLMEndpointResponses
+	var endpoint string
+	var body []byte
+	if isResponses {
+		endpoint = responsesURL(baseURL)
+		body, _ = json.Marshal(map[string]any{
+			"model": modelName,
+			"input": []map[string]string{{"role": "user", "content": "hi"}},
+			// 16 对齐 new-api 的渠道测试请求；过小部分上游会拒绝或回空（推理模型尤甚）。
+			"max_output_tokens": 16,
+			"stream":            false,
+		})
+	} else {
+		endpoint = chatCompletionsURL(baseURL)
+		body, _ = json.Marshal(map[string]any{
+			"model":      modelName,
+			"messages":   []map[string]string{{"role": "user", "content": "hi"}},
+			"max_tokens": 16,
+			"stream":     false,
+		})
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -250,8 +279,26 @@ func (s *LLMService) testOpenAICompatible(baseURL, apiKey, modelName string, all
 			Message:   fmt.Sprintf("HTTP %d: %s", res.StatusCode, extractErr(raw)),
 		}
 	}
-	// 200 也要能解析出 chat completion 结构才算通过——SPA fallback / 网关拦截页会 200 + HTML，
+	// 200 也要能解析出对应端点的结构才算通过——SPA fallback / 网关拦截页会 200 + HTML，
 	// 只看状态码会"测试成功、实际分析失败"（json: invalid character '<'）。
+	if isResponses {
+		var parsed struct {
+			Output []json.RawMessage `json:"output"`
+		}
+		if jsonErr := json.Unmarshal(raw, &parsed); jsonErr != nil {
+			msg := "服务返回的不是 JSON"
+			if looksLikeHTML(raw) {
+				msg = "服务返回了网页而非 API 响应"
+			}
+			return &TestResult{OK: false, LatencyMs: latency,
+				Message: fmt.Sprintf("%s：请检查 Base URL 是否为 API 地址（实际请求 %s，根地址会自动补 /v1/responses）", msg, endpoint)}
+		}
+		if len(parsed.Output) == 0 {
+			return &TestResult{OK: false, LatencyMs: latency,
+				Message: "连通但响应不含 output（" + extractErr(raw) + "），可能不支持 Responses 端点"}
+		}
+		return &TestResult{OK: true, LatencyMs: latency, Message: "连接成功"}
+	}
 	var parsed struct {
 		Choices []json.RawMessage `json:"choices"`
 	}
@@ -270,15 +317,26 @@ func (s *LLMService) testOpenAICompatible(baseURL, apiKey, modelName string, all
 	return &TestResult{OK: true, LatencyMs: latency, Message: "连接成功"}
 }
 
-// extractErr 从 OpenAI 风格错误体里抽取 message，抽不到则返回截断原文。
+// extractErr 从上游错误体里抽取 message：兼容 OpenAI 风格 {"error":{"message":...}}、
+// error 为裸字符串、以及各类网关的顶层 message/msg/error_msg/detail 字段
+//（new-api GeneralErrorResponse 同款宽容解析）；全抽不到则返回截断原文。
 func extractErr(raw []byte) string {
-	var parsed struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
+	var generic struct {
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
+		Msg     string          `json:"msg"`
+		ErrMsg  string          `json:"error_msg"`
+		Detail  string          `json:"detail"`
 	}
-	if json.Unmarshal(raw, &parsed) == nil && parsed.Error.Message != "" {
-		return parsed.Error.Message
+	if json.Unmarshal(raw, &generic) == nil {
+		if m := errorMessageFromRaw(generic.Error); m != "" {
+			return m
+		}
+		for _, v := range []string{generic.Message, generic.Msg, generic.ErrMsg, generic.Detail} {
+			if strings.TrimSpace(v) != "" {
+				return v
+			}
+		}
 	}
 	if looksLikeHTML(raw) {
 		return "返回了 HTML 页面而非 API 响应（通常是 Base URL 路径不对或被网关拦截）"

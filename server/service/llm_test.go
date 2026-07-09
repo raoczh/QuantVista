@@ -16,7 +16,7 @@ func TestTestOpenAICompatible_HTMLNotOK(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := (&LLMService{}).testOpenAICompatible(srv.URL, "sk-x", "m", true)
+	r := (&LLMService{}).testOpenAICompatible("", srv.URL, "sk-x", "m", true)
 	if r.OK {
 		t.Fatalf("200+HTML 不应判为连接成功: %+v", r)
 	}
@@ -35,7 +35,7 @@ func TestTestOpenAICompatible_OKAndEndpoint(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := (&LLMService{}).testOpenAICompatible(srv.URL, "sk-x", "m", true)
+	r := (&LLMService{}).testOpenAICompatible("", srv.URL, "sk-x", "m", true)
 	if !r.OK {
 		t.Fatalf("合法响应应判成功: %+v", r)
 	}
@@ -51,7 +51,7 @@ func TestTestOpenAICompatible_JSONWithoutChoices(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := (&LLMService{}).testOpenAICompatible(srv.URL, "sk-x", "m", true)
+	r := (&LLMService{}).testOpenAICompatible("", srv.URL, "sk-x", "m", true)
 	if r.OK {
 		t.Fatalf("无 choices 不应判成功: %+v", r)
 	}
