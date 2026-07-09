@@ -247,6 +247,8 @@ type reportMarket struct {
 	Indices  []map[string]any `json:"indices,omitempty"`
 	Breadth  map[string]any   `json:"breadth,omitempty"`
 	FundFlow map[string]any   `json:"fund_flow,omitempty"`
+	// Mood M3a 情绪温度计（涨停池盘后聚合）：连板高度分布/炸板率/昨涨停溢价。
+	Mood map[string]any `json:"mood,omitempty"`
 }
 
 type reportPosition struct {
@@ -286,6 +288,10 @@ func (s *DailyReportService) buildSnapshot(ctx context.Context, userID int64, da
 		if ov.FundFlow != nil {
 			m.FundFlow = map[string]any{"main_net_yi": round2(ov.FundFlow.MainNet / 1e8)}
 		}
+		// M3a 情绪温度计：16:35 涨停池 job 先于日报窗口（15:35 起）么？不——日报窗口
+		// 15:35~20:00 早段可能取到上一交易日的 mood（trade_date 标注归属日，prompt
+		// 已要求按归属日解读）；16:35 采集完成后的日报自然引用当日数据。
+		m.Mood = moodBrief()
 		snap.Market = m
 	}
 
@@ -420,10 +426,11 @@ func (s *DailyReportService) userPref(userID int64) model.UserPreference {
 const dailyReviewSystem = `你是个人股票研究助手，为用户生成当日收盘复盘。规则：
 1. 只依据用户消息中提供的数据（市场概览/持仓/自选异动/今日提醒/今日重要事件），不得编造任何未提供的数据（无财务）；数据缺失就如实说明。禁止使用你记忆中的公司/板块信息。
 2. 关键判断必须引用数据中的具体数字佐证（如「上涨 3120 家 vs 下跌 1890 家」「主力净流入 23.5 亿」「某持仓今日 -4.2% 已接近计划止损」），让用户可核对。系统会程序化核对你引用的数字，与数据不符的会被标记展示给用户，故不得编造或凭印象填数。
-3. events_today 是程序按来源级别/影响范围/资金敏感度硬规则筛出的今日重要事件（含情绪标签，major=true 为重磅）。events_review 只做解读串联：点出最重要的 2~4 条主线及其对明日盘面的可能影响，引用事件只能复述给出的标题要点，不得展开臆测细节；无事件则一句说明「今日无入选重要事件」。
-4. disclosures_tomorrow 是用户自选/持仓中明日预约披露财报的标的名单（程序从预约披露数据筛出）。若非空，tomorrow_plan 中必须提示这些标的明日披露财报、注意业绩波动风险；只能复述名单给出的标的与报告类型，不得预测业绩内容。
-5. 表述为研究参考，不构成投资建议；语气客观，指出风险。
-6. 输出严格 JSON（不要 markdown 代码块），schema：
+3. market.mood（若有）是涨停池盘后聚合的情绪温度计：limit_up_count 涨停家数、broken_count/broken_rate 炸板家数与炸板率、streak_dist 连板高度分布（键=连板数）、max_streak 最高连板、yzt_avg_chg/yzt_up_ratio 昨日涨停股今日平均涨跌幅与红盘比例（打板情绪溢价）。market_review 中必须包含一段连板/炸板情绪解读（情绪周期位置、分歧程度、打板赚钱效应），引用具体数字；mood.trade_date 早于今日时注明是上一交易日口径；无 mood 块则跳过这一段，不得臆测。
+4. events_today 是程序按来源级别/影响范围/资金敏感度硬规则筛出的今日重要事件（含情绪标签，major=true 为重磅）。events_review 只做解读串联：点出最重要的 2~4 条主线及其对明日盘面的可能影响，引用事件只能复述给出的标题要点，不得展开臆测细节；无事件则一句说明「今日无入选重要事件」。
+5. disclosures_tomorrow 是用户自选/持仓中明日预约披露财报的标的名单（程序从预约披露数据筛出）。若非空，tomorrow_plan 中必须提示这些标的明日披露财报、注意业绩波动风险；只能复述名单给出的标的与报告类型，不得预测业绩内容。
+6. 表述为研究参考，不构成投资建议；语气客观，指出风险。
+7. 输出严格 JSON（不要 markdown 代码块），schema：
 {"summary":"3~5 句当日总结","market_review":"大盘复盘（涨跌家数/资金流向解读）","events_review":"今日重要事件解读（2~4 句）","position_review":"持仓点评（无持仓则一句说明）","watch_review":"自选异动点评（无自选则一句说明）","risk_warnings":["风险提示，1~3 条"],"tomorrow_plan":"明日盘前关注计划（2~4 句）"}`
 
 const dailyReviewRepairHint = `你上一条输出不是合法 JSON 或缺少必填字段。请只输出符合 schema 的 JSON 对象，不要任何解释或代码块包裹。`

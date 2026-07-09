@@ -49,6 +49,12 @@ func AllModels() []any {
 		&FinanceStatement{},
 		&MarketSyncState{},
 		&ScreenerStrategy{},
+		&LhbEntry{},
+		&LhbOrgDaily{},
+		&PopularityRank{},
+		&LimitUpStock{},
+		&MarketMoodDaily{},
+		&FundFlowDaily{},
 	}
 }
 

@@ -290,6 +290,13 @@ func (s *AnalysisService) buildMarketContext(ctx context.Context, market string)
 		"actives":   compactRanks(ov.Actives, 6),
 		"sectors":   compactSectors(ov.Sectors, 10),
 	}
+	// M3a 情绪温度计：涨停池盘后聚合（连板高度分布/炸板率/昨涨停溢价）。
+	// 库中无数据（首日部署/采集失败）自然缺席，guidance 已声明按缺失处理。
+	if market == "cn" {
+		if mood := moodBrief(); mood != nil {
+			snap["mood"] = mood
+		}
+	}
 	if len(ov.Errors) > 0 {
 		snap["unavailable"] = ov.Errors // 透传缺失块，供模型知悉数据不全
 	}

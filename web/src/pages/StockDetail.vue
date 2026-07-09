@@ -10,12 +10,16 @@ import {
   getScore,
   getIndicators,
   getChips,
+  getStockFundFlow,
+  getStockLhb,
   type Quote,
   type Bar,
   type Valuation,
   type StockScore,
   type IndicatorSeries,
   type ChipDist,
+  type StockFundFlow,
+  type LhbRecord,
 } from '@/api/market'
 import { getNews, newsSourceLabel, sentimentTag, type NewsItem } from '@/api/news'
 import { getAnnouncements, type AnnouncementItem } from '@/api/announcement'
@@ -47,6 +51,8 @@ const chips = ref<ChipDist | null>(null)
 const news = ref<NewsItem[]>([])
 const announcements = ref<AnnouncementItem[]>([])
 const finance = ref<StockFinance | null>(null)
+const fundflow = ref<StockFundFlow | null>(null)
+const lhbRecords = ref<LhbRecord[]>([])
 
 // 情绪标签（N2）：利好/利空才渲染，颜色随涨跌色主题。
 function sentiView(n: NewsItem): { text: string; color: string } | null {
@@ -70,6 +76,8 @@ const chipTrendEl = ref<HTMLDivElement | null>(null)
 let chipTrendChart: echarts.ECharts | null = null
 const finEl = ref<HTMLDivElement | null>(null)
 let finChart: echarts.ECharts | null = null
+const ffEl = ref<HTMLDivElement | null>(null)
+let ffChart: echarts.ECharts | null = null
 
 async function load(silent = false) {
   if (!symbol.value) return
@@ -100,6 +108,17 @@ async function load(silent = false) {
           nextTick(() => renderFinanceChart())
         })
         .catch(() => (finance.value = null))
+      // 主力资金（M3a）：按需拉取+缓存，首次访问可能为空（下轮自动刷新补上）。
+      getStockFundFlow(market.value, symbol.value, 90)
+        .then((r) => {
+          fundflow.value = r
+          nextTick(() => renderFundFlowChart())
+        })
+        .catch(() => (fundflow.value = null))
+      // 龙虎榜上榜记录（M3a）：本地缓存表，近 30 天回填 + 每日盘后采集。
+      getStockLhb(market.value, symbol.value, 10)
+        .then((r) => (lhbRecords.value = r))
+        .catch(() => (lhbRecords.value = []))
     }
     // 指标副图 / 筹码分布 best-effort：失败时 K 线退回单图、筹码卡显示占位。
     getIndicators(market.value, symbol.value, 120)
@@ -346,10 +365,77 @@ const finLatest = computed(() => {
   return inds?.length ? inds[inds.length - 1] : null
 })
 
+// 主力资金图（M3a）：逐日主力净额柱（红入绿出，亿元）+ 累计净额线（右轴）。
+function renderFundFlowChart() {
+  const ff = fundflow.value
+  if (!ffEl.value || !ff?.days.length) return
+  ffChart?.dispose()
+  ffChart = echarts.init(ffEl.value, isDark.value ? 'dark' : undefined)
+  const up = vars.value.errorColor
+  const down = vars.value.successColor
+  let acc = 0
+  const cum = ff.days.map((d) => {
+    acc += d.main_net_yi
+    return Math.round(acc * 100) / 100
+  })
+  ffChart.setOption({
+    backgroundColor: 'transparent',
+    tooltip: {
+      trigger: 'axis',
+      confine: true,
+      formatter: (ps: { axisValue: string; seriesName: string; value: number }[]) =>
+        ps.length
+          ? `${ps[0].axisValue}<br/>` + ps.map((p) => `${p.seriesName} ${p.value} 亿`).join('<br/>')
+          : '',
+    },
+    legend: {
+      top: 0,
+      data: ['主力净额(亿)', '区间累计(亿)'],
+      textStyle: { color: vars.value.textColor3, fontSize: 11 },
+      itemWidth: 14,
+      itemHeight: 8,
+    },
+    grid: { left: 52, right: 52, top: 28, bottom: 24 },
+    xAxis: { type: 'category', data: ff.days.map((d) => d.date), axisLabel: { fontSize: 10 } },
+    yAxis: [
+      { type: 'value', scale: true, splitLine: { lineStyle: { opacity: 0.3 } }, axisLabel: { fontSize: 10 } },
+      { type: 'value', scale: true, splitLine: { show: false }, axisLabel: { fontSize: 10 } },
+    ],
+    series: [
+      {
+        type: 'bar',
+        name: '主力净额(亿)',
+        data: ff.days.map((d) => d.main_net_yi),
+        itemStyle: { color: (p: { value: number }) => (p.value >= 0 ? up : down) },
+        barMaxWidth: 8,
+      },
+      {
+        type: 'line',
+        name: '区间累计(亿)',
+        yAxisIndex: 1,
+        data: cum,
+        symbol: 'none',
+        lineStyle: { width: 1.5, color: vars.value.primaryColor },
+      },
+    ],
+  })
+}
+
+/* 龙虎榜展示辅助 */
+function fmtNetYi(n: number) {
+  return (n / 1e8).toFixed(2)
+}
+function streakText(ff: StockFundFlow) {
+  if (ff.streak_days > 0) return `连续净流入 ${ff.streak_days} 天`
+  if (ff.streak_days < 0) return `连续净流出 ${-ff.streak_days} 天`
+  return '—'
+}
+
 watch(isDark, () => {
   renderChart()
   renderChipCharts()
   renderFinanceChart()
+  renderFundFlowChart()
 })
 // 同页跳转到另一只个股（如从对比/搜索进来）时整页重载。
 watch([market, symbol], () => {
@@ -358,6 +444,8 @@ watch([market, symbol], () => {
   indicators.value = null
   chips.value = null
   finance.value = null
+  fundflow.value = null
+  lhbRecords.value = []
   news.value = []
   announcements.value = []
   load()
@@ -377,12 +465,15 @@ onBeforeUnmount(() => {
   chipTrendChart = null
   finChart?.dispose()
   finChart = null
+  ffChart?.dispose()
+  ffChart = null
 })
 function onResize() {
   chart?.resize()
   chipChart?.resize()
   chipTrendChart?.resize()
   finChart?.resize()
+  ffChart?.resize()
 }
 useAutoRefresh(() => load(true), 60_000)
 
@@ -519,6 +610,44 @@ function scoreType(total: number) {
             </div>
           </div>
           <n-empty v-else description="筹码数据暂不可用（需 ≥120 根日线与换手率，A 股标的）" />
+        </SectionCard>
+
+        <!-- 主力资金（M3a）：逐日主力净额 + 累计线，汇总格；按需拉取首访可能为空 -->
+        <SectionCard v-if="market === 'cn' && !isFund" title="主力资金（近 90 交易日）">
+          <template #extra>
+            <span class="src-hint">东财资金流 · 主力=超大单+大单</span>
+          </template>
+          <div v-if="fundflow && fundflow.days.length" class="ff-wrap">
+            <div class="quote-grid ff-grid">
+              <div class="qc"><span class="qc-k">最新一日</span><span class="qc-v qv-tnum" :style="{ color: pctColor(fundflow.main_net_1d_yi) }">{{ fundflow.main_net_1d_yi.toFixed(2) }} 亿</span></div>
+              <div class="qc"><span class="qc-k">近 5 日</span><span class="qc-v qv-tnum" :style="{ color: pctColor(fundflow.main_net_5d_yi) }">{{ fundflow.main_net_5d_yi.toFixed(2) }} 亿</span></div>
+              <div class="qc"><span class="qc-k">近 10 日</span><span class="qc-v qv-tnum" :style="{ color: pctColor(fundflow.main_net_10d_yi) }">{{ fundflow.main_net_10d_yi.toFixed(2) }} 亿</span></div>
+              <div class="qc"><span class="qc-k">近 20 日</span><span class="qc-v qv-tnum" :style="{ color: pctColor(fundflow.main_net_20d_yi) }">{{ fundflow.main_net_20d_yi.toFixed(2) }} 亿</span></div>
+              <div class="qc"><span class="qc-k">连续方向</span><span class="qc-v" :style="{ color: pctColor(fundflow.streak_days) }">{{ streakText(fundflow) }}</span></div>
+            </div>
+            <div ref="ffEl" class="ff-chart"></div>
+            <div class="src-hint">
+              主力净额=超大单+大单口径（东财），资金流向≠股价必然方向；数据截至 {{ fundflow.last_date }}<span v-if="!fundflow.fresh">（缓存偏旧，稍后自动刷新）</span>；仅研究参考。
+            </div>
+          </div>
+          <n-empty v-else description="暂无资金流数据（东财源，A 股标的；首次访问自动拉取，可稍后刷新）" />
+        </SectionCard>
+
+        <!-- 龙虎榜上榜记录（M3a）：本地缓存表（近 30 天回填 + 每日盘后采集） -->
+        <SectionCard v-if="market === 'cn' && !isFund" title="龙虎榜上榜记录">
+          <template #extra>
+            <span class="src-hint">近 10 次 · 同日多原因各自成行</span>
+          </template>
+          <div v-if="lhbRecords.length" class="lhb-list">
+            <div v-for="(r, i) in lhbRecords" :key="i" class="lhb-row">
+              <span class="news-time qv-tnum">{{ r.trade_date }}</span>
+              <span class="lhb-reason">{{ r.reason }}<span v-if="r.note" class="lhb-note">（{{ r.note }}）</span></span>
+              <span class="lhb-num qv-tnum">当日 <ChangeTag :value="r.change_pct" /></span>
+              <span class="lhb-num qv-tnum" :style="{ color: pctColor(r.net_buy) }">净买 {{ fmtNetYi(r.net_buy) }} 亿</span>
+              <span v-if="r.org_net_buy" class="lhb-num qv-tnum" :style="{ color: pctColor(r.org_net_buy) }">机构 {{ fmtNetYi(r.org_net_buy) }} 亿</span>
+            </div>
+          </div>
+          <n-empty v-else description="近期无上榜记录（覆盖近 30 天龙虎榜采集）" />
         </SectionCard>
 
         <!-- 估值 + 评分 -->
@@ -748,6 +877,61 @@ function scoreType(total: number) {
 .src-hint {
   font-size: 12px;
   opacity: 0.55;
+}
+
+/* ---------- 主力资金 / 龙虎榜 ---------- */
+.ff-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.ff-grid {
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+}
+.ff-chart {
+  width: 100%;
+  height: 280px;
+}
+.lhb-list {
+  display: flex;
+  flex-direction: column;
+}
+.lhb-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 0;
+  flex-wrap: wrap;
+}
+.lhb-row + .lhb-row {
+  border-top: 1px dashed rgba(128, 128, 128, 0.22);
+}
+.lhb-reason {
+  flex: 1;
+  min-width: 200px;
+  font-size: 13px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.lhb-note {
+  opacity: 0.6;
+  font-size: 12px;
+}
+.lhb-num {
+  flex-shrink: 0;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+@media (max-width: 768px) {
+  .ff-chart {
+    height: 220px;
+  }
+  .lhb-reason {
+    flex-basis: 100%;
+    order: 3;
+  }
 }
 
 /* ---------- 财务摘要 ---------- */

@@ -17,10 +17,11 @@ import (
 // 纯技术面量化，非投资建议；快照按 symbol+market+交易日落库。
 type ScoreService struct {
 	market *MarketService
+	em     *datasource.EastMoneyAdapter // M3a 资金流历史按需补拉（量能维融合主力资金分）
 }
 
 func NewScoreService(market *MarketService) *ScoreService {
-	return &ScoreService{market: market}
+	return &ScoreService{market: market, em: datasource.NewEastMoneyAdapter()}
 }
 
 const scoreBarLimit = 60
@@ -256,6 +257,13 @@ func (s *ScoreService) Score(ctx context.Context, market, symbol string) (*Score
 	}
 	bars, _ := s.market.GetDailyBars(ctx, market, symbol, scoreBarLimit)
 	res := computeScore(q.Price, bars)
+	// M3a 量能维融合主力资金分（A 股非基金；缓存优先按需补拉，缺失时评分原样）。
+	// computeScore 纯函数不动——融合是外层包装，既有对拍/单测口径不受影响。
+	if market == "cn" && !isCNFund(symbol) {
+		if flows, _ := ensureStockFundFlow(ctx, s.em, market, symbol, nil); len(flows) > 0 {
+			res = applyFlowScore(res, flows)
+		}
+	}
 
 	view := &ScoreView{
 		Symbol: symbol, Market: market, Name: q.Name, Price: round2(q.Price),
