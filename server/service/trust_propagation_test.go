@@ -27,7 +27,7 @@ func TestAnalysisEvidenceBackfill(t *testing.T) {
 		Summary:    "现价 12.34 站上 MA20=11.98",
 		Highlights: []string{"quant_score 78.5 偏强"},
 	}
-	usage := svc.fillAnalysisTrust(context.Background(), &model.LLMConfig{}, "", false, AnalyzeRequest{Verify: false}, snapshot, result)
+	usage := svc.fillAnalysisTrust(context.Background(), 1, &model.LLMConfig{}, "", false, AnalyzeRequest{Verify: false}, snapshot, result)
 	if usage.TotalTokens != 0 {
 		t.Fatalf("Verify=false 不应发起复核，usage=%+v", usage)
 	}
@@ -89,7 +89,7 @@ func TestAnalysisReviewRejectCascade(t *testing.T) {
 	snapshot := map[string]any{"quote": map[string]any{"price": 10.0}, "technicals": map[string]any{}, "quant_score": map[string]any{}}
 	result := &AnalysisResult{Rating: model.AnalysisRatingBullish, Confidence: 80, Summary: "现价 10 强势"}
 
-	usage := svc.fillAnalysisTrust(context.Background(), cfg, "k", true, AnalyzeRequest{Verify: true}, snapshot, result)
+	usage := svc.fillAnalysisTrust(context.Background(), 1, cfg, "k", true, AnalyzeRequest{Verify: true}, snapshot, result)
 	if usage.TotalTokens != 15 {
 		t.Fatalf("复核 token 应累计 15，得到 %d", usage.TotalTokens)
 	}

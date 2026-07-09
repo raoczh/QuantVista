@@ -4,6 +4,7 @@ export interface PromptModuleInfo {
   module: string
   label: string
   default: string
+  placeholders?: string[] // 模板可用占位符（{{name}} 形式，未提供值时原样保留）
 }
 
 export interface PromptTemplate {

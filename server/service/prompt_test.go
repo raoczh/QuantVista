@@ -44,7 +44,7 @@ func TestPromptUpsertAndOverride(t *testing.T) {
 	}
 
 	// analysisSystemPrompt 应包含自定义内容 + 通用身份与输出规范。
-	sys := analysisSystemPrompt(1, model.AnalysisModuleStock)
+	sys := analysisSystemPrompt(1, model.AnalysisModuleStock, nil)
 	if !containsStr(sys, "只看均线与量能。") || !containsStr(sys, "证券研究助理") {
 		t.Fatalf("系统提示应含自定义指引与通用身份")
 	}
@@ -64,10 +64,10 @@ func TestPromptUpsertAndOverride(t *testing.T) {
 		t.Fatalf("删除后应回退默认")
 	}
 
-	// Modules 返回 5 个模块且带默认指引。
+	// Modules 返回 9 个模块（5 分析 + 推荐/日报/问答/复核）且带默认指引。
 	mods := svc.Modules()
-	if len(mods) != 5 {
-		t.Fatalf("应有 5 个模块，得到 %d", len(mods))
+	if len(mods) != 9 {
+		t.Fatalf("应有 9 个模块，得到 %d", len(mods))
 	}
 	for _, m := range mods {
 		if m.Default == "" || m.Label == "" {

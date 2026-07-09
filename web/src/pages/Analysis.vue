@@ -635,6 +635,86 @@ onMounted(async () => {
                     <li v-for="(x, i) in current.result.unknowns" :key="i">{{ x }}</li>
                   </ul>
                 </div>
+                <!-- M3c 交易员阶段：交易计划 + 量化仓位 -->
+                <div
+                  v-if="current.result.trade_plan && !current.result.trade_plan.no_plan"
+                  class="block plan-block"
+                  :style="{
+                    background: withAlpha(vars.primaryColor, 0.06),
+                    borderColor: withAlpha(vars.primaryColor, 0.3),
+                  }"
+                >
+                  <div class="block-title" :style="{ color: vars.primaryColor }">交易计划（研究参考，非操作指令）</div>
+                  <div class="plan-grid">
+                    <div class="plan-cell">
+                      <div class="pc-label">买入区间</div>
+                      <div class="pc-value">{{ current.result.trade_plan.buy_low }} ~ {{ current.result.trade_plan.buy_high }}</div>
+                    </div>
+                    <div class="plan-cell">
+                      <div class="pc-label">目标价</div>
+                      <div class="pc-value" :style="{ color: upColor }">{{ current.result.trade_plan.target_price }}</div>
+                    </div>
+                    <div class="plan-cell">
+                      <div class="pc-label">止损价</div>
+                      <div class="pc-value" :style="{ color: downColor }">{{ current.result.trade_plan.stop_price }}</div>
+                    </div>
+                    <div class="plan-cell">
+                      <div class="pc-label">持有周期</div>
+                      <div class="pc-value">{{ current.result.trade_plan.horizon_days }} 交易日</div>
+                    </div>
+                    <div class="plan-cell">
+                      <div class="pc-label">盈亏比</div>
+                      <div class="pc-value">{{ current.result.trade_plan.rr_ratio }}</div>
+                    </div>
+                    <div v-if="current.result.trade_plan.position" class="plan-cell">
+                      <div class="pc-label">
+                        建议仓位
+                        <n-tooltip trigger="hover" placement="top">
+                          <template #trigger>
+                            <span class="pc-help">?</span>
+                          </template>
+                          仓位% = 100 × clip(2.5/20日波动率, 0.3, 1.0) × 择时系数。 20日波动率
+                          {{ current.result.trade_plan.position.vol_20d }}% → 波动系数
+                          {{ current.result.trade_plan.position.vol_coef }}；择时系数
+                          {{ current.result.trade_plan.position.timing_coef
+                          }}<template v-if="current.result.trade_plan.position.advance_ratio">
+                            （涨家占比
+                            {{ Math.round(current.result.trade_plan.position.advance_ratio * 100) }}%）</template
+                          >。<template v-if="current.result.trade_plan.discipline_notes?.length"
+                            >盈亏比不足 2:1，展示值已按纪律减半。</template
+                          >{{ current.result.trade_plan.position.note }}
+                        </n-tooltip>
+                      </div>
+                      <div class="pc-value">
+                        <template v-if="current.result.trade_plan.position.position_pct > 0"
+                          >{{ current.result.trade_plan.position.position_pct }}%</template
+                        >
+                        <template v-else>—</template>
+                      </div>
+                    </div>
+                  </div>
+                  <p v-if="current.result.trade_plan.plan_note" class="plan-note">
+                    {{ current.result.trade_plan.plan_note }}
+                  </p>
+                  <div
+                    v-for="(d, i) in current.result.trade_plan.discipline_notes || []"
+                    :key="i"
+                    class="plan-discipline"
+                    :style="{ color: vars.warningColor }"
+                  >
+                    ⚠ {{ d }}
+                  </div>
+                  <div v-if="current.result.trade_plan.checklist?.length" class="plan-checklist">
+                    <div class="pc-label">操作清单（买入前逐项核对）</div>
+                    <ul>
+                      <li v-for="(c, i) in current.result.trade_plan.checklist" :key="i">{{ c }}</li>
+                    </ul>
+                  </div>
+                </div>
+                <div v-else-if="current.result.trade_plan?.no_plan" class="block">
+                  <div class="block-title">交易计划</div>
+                  <p class="panel-text">未生成：{{ current.result.trade_plan.no_plan_reason }}</p>
+                </div>
                 <p class="disclaimer">{{ current.result.disclaimer }}</p>
               </template>
 
@@ -1097,6 +1177,53 @@ onMounted(async () => {
   margin: 16px 0 0;
   padding-top: 12px;
   border-top: 1px solid var(--qv-divider);
+}
+.plan-block {
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.plan-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 10px 14px;
+  margin-bottom: 8px;
+}
+.pc-label {
+  font-size: 12px;
+  opacity: 0.65;
+  margin-bottom: 2px;
+}
+.pc-value {
+  font-size: 15px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.pc-help {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  line-height: 14px;
+  text-align: center;
+  border-radius: 50%;
+  border: 1px solid var(--qv-divider);
+  font-size: 10px;
+  opacity: 0.7;
+  cursor: help;
+  margin-left: 2px;
+}
+.plan-note {
+  font-size: 13px;
+  line-height: 1.7;
+  margin: 4px 0;
+  opacity: 0.9;
+}
+.plan-discipline {
+  font-size: 12px;
+  line-height: 1.7;
+}
+.plan-checklist {
+  margin-top: 8px;
 }
 .raw {
   font-size: 13px;

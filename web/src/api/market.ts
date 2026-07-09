@@ -263,3 +263,54 @@ export function getStockLhb(market: string, symbol: string, limit = 10) {
     params: { limit },
   })
 }
+
+// M3c 行业/概念板块热力图（面积=成交额、颜色=涨跌幅）。
+export interface BoardHeat {
+  code: string
+  name: string
+  change_pct: number
+  amount: number // 成交额（元）
+  advances: number
+  declines: number
+  leader: string
+  leader_code: string
+  source: string
+}
+
+export type BoardKind = 'industry' | 'concept'
+
+export function getBoardHeatmap(market: string, kind: BoardKind = 'industry') {
+  return request<BoardHeat[]>({
+    url: `/markets/${market}/boards`,
+    method: 'get',
+    params: { kind },
+  })
+}
+
+// M3c 板块成分股（is_leader=成交额龙头，is_top_gainer=涨幅第一）。
+export interface BoardStock {
+  symbol: string
+  name: string
+  price: number
+  change_pct: number
+  amount: number // 成交额（元）
+  turnover_rate: number
+  total_cap: number // 总市值（元）
+  float_cap: number // 流通市值（元）
+  is_leader: boolean
+  is_top_gainer: boolean
+  source: string
+}
+
+// M3c 板块详情：指数日线 + 成分股（各块可缺，errors 记录哪块失败）。
+export interface BoardDetail {
+  code: string
+  bars: Bar[]
+  stocks: BoardStock[]
+  errors: Record<string, string>
+  data_time: string
+}
+
+export function getBoardDetail(market: string, code: string) {
+  return request<BoardDetail>({ url: `/markets/${market}/boards/${code}`, method: 'get' })
+}

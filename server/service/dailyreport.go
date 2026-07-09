@@ -82,7 +82,7 @@ func (s *DailyReportService) List(userID int64, limit int) ([]model.DailyReport,
 		limit = 20
 	}
 	var rows []model.DailyReport
-	err := common.DB.Select("id", "user_id", "trade_date", "market", "status",
+	err := common.DB.Select("id", "user_id", "trade_date", "market", "status", "prompt_version",
 		"recommendation_batch_id", "error", "total_tokens", "latency_ms", "created_at", "updated_at").
 		Where("user_id = ?", userID).Order("trade_date DESC, id DESC").Limit(limit).Find(&rows).Error
 	return rows, err
@@ -170,7 +170,9 @@ func (s *DailyReportService) GenerateFor(ctx context.Context, userID int64, manu
 	snapJSON, _ := json.Marshal(snapshot)
 	report.SnapshotJSON = string(snapJSON)
 
-	review, reviewTokens, reviewErr := s.callReview(ctx, cfg, apiKey, allowPrivate, string(snapJSON))
+	review, reviewTokens, reviewErr := s.callReview(ctx, userID, date, cfg, apiKey, allowPrivate, string(snapJSON))
+	// M3c：复盘 prompt 版本落库（启用 daily 自定义模板时 -custom 后缀，历史可归因）。
+	report.PromptVersion = promptVersionFor(userID, model.PromptModuleDaily, dailyReviewPromptVersion)
 	report.TotalTokens += reviewTokens
 	if reviewErr == nil {
 		review.EvidenceCheck = dailyReviewEvidence(review, snapshot) // 信任层回填后随 ReviewJSON 一起落库
@@ -453,10 +455,18 @@ func dailyReviewEvidence(rv *dailyReview, snap *reportSnapshot) *evidenceCheck {
 	return verifyEvidenceValues(texts, vals)
 }
 
+// dailyReviewPromptVersion 复盘系统提示版本（M3c 起随报告落库；改 dailyReviewSystem 时递增）。
+const dailyReviewPromptVersion = "d1"
+
 // callReview 调用 LLM 生成复盘，解析失败 repair 一次。返回（复盘, 总 token, 错误）。
-func (s *DailyReportService) callReview(ctx context.Context, cfg *model.LLMConfig, apiKey string, allowPrivate bool, snapshotJSON string) (*dailyReview, int, error) {
+// M3c：module=daily 的自定义模板整段替换默认复盘系统提示（占位符 {{date}} 宽容渲染）。
+func (s *DailyReportService) callReview(ctx context.Context, userID int64, date string, cfg *model.LLMConfig, apiKey string, allowPrivate bool, snapshotJSON string) (*dailyReview, int, error) {
+	sys := dailyReviewSystem
+	if custom, ok := promptOverrideFor(userID, model.PromptModuleDaily, map[string]string{"date": date}); ok {
+		sys = custom
+	}
 	messages := []chatMessage{
-		{Role: "system", Content: dailyReviewSystem},
+		{Role: "system", Content: sys},
 		{Role: "user", Content: fmt.Sprintf("今日收盘数据如下（JSON）：\n%s", truncateRunes(snapshotJSON, contextBudgetChars))},
 	}
 	total := 0

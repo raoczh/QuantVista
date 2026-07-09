@@ -21,6 +21,9 @@ type AiConversation struct {
 	Provider    string `gorm:"size:32" json:"provider"`
 	Model       string `gorm:"size:64" json:"model"`
 
+	// 问答 prompt 版本（M3c 起落库，会话创建时固化；-custom 后缀=启用了自定义模板）。
+	PromptVersion string `gorm:"size:16" json:"prompt_version"`
+
 	// 首轮采集的个股数据快照（JSON），后续追问复用，避免重复拉数据；列表查询不返回。
 	DataSnapshot string `gorm:"type:text" json:"data_snapshot,omitempty"`
 
