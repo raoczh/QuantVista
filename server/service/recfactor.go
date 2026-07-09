@@ -53,6 +53,10 @@ type candFactors struct {
 	ChipProfit  float64 `json:"chip_profit,omitempty"`   // 获利盘 %（收盘价下方筹码占比）
 	ChipAvgCost float64 `json:"chip_avg_cost,omitempty"` // 筹码平均成本
 	ChipBars    int     `json:"chip_bars,omitempty"`     // 参与筹码计算的日线根数
+
+	// M3a 主力资金流因子（fund_flow_daily 缓存派生；缺失=资金流数据暂不可得）。
+	MainNetDays int     `json:"main_net_days,omitempty"` // 连续净流入天数（负=连续净流出）
+	MainNet5dYi float64 `json:"main_net_5d_yi,omitempty"` // 近 5 日主力净额（亿元）
 }
 
 // scoreDims 五维评分明细（透传 computeScore 结果，前端展示雷达/分项）。
@@ -248,6 +252,35 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 		add(4, fmt.Sprintf("获利盘仅 %.1f%% 超跌区（抛压趋于枯竭）", f.ChipProfit))
 	}
 
+	// M3a 龙虎榜/机构/人气/主力资金因子（短线/长线通用；全部为「最近有数据交易日」
+	// 口径的 T-1 信号，缺失不动分）。机构席位方向权重最高（信息含量>游资席位）；
+	// 龙虎榜净卖出与机构净卖出对称扣分（涨停上榜出货是经典陷阱，只加不扣会系统性乐观）。
+	if c.OrgNetYi >= 0.1 && c.OrgBuys > 0 {
+		add(5, fmt.Sprintf("龙虎榜机构净买入 %.2f 亿（%d 家次买入）", c.OrgNetYi, c.OrgBuys))
+	} else if c.OrgNetYi <= -0.1 {
+		add(-4, fmt.Sprintf("龙虎榜机构净卖出 %.2f 亿", -c.OrgNetYi))
+	} else if c.LhbNetYi >= 0.3 {
+		reason := c.LhbReason
+		if reason == "" {
+			reason = "上榜"
+		}
+		add(3, fmt.Sprintf("龙虎榜净买入 %.2f 亿（%s）", c.LhbNetYi, reason))
+	} else if c.LhbNetYi <= -0.3 {
+		add(-3, fmt.Sprintf("龙虎榜净卖出 %.2f 亿", -c.LhbNetYi))
+	}
+	if c.PopRank > 0 && c.PopRank <= 50 {
+		if c.PopNew {
+			add(3, fmt.Sprintf("股吧人气榜新上榜第 %d 名（关注度骤升，注意情绪拥挤风险）", c.PopRank))
+		} else if c.PopPrev-c.PopRank >= 30 {
+			add(2, fmt.Sprintf("股吧人气榜跃升至第 %d 名（昨日第 %d）", c.PopRank, c.PopPrev))
+		}
+	}
+	if f.MainNetDays >= 3 {
+		add(4, fmt.Sprintf("主力资金连续净流入 %d 天（近5日 %.2f 亿）", f.MainNetDays, f.MainNet5dYi))
+	} else if f.MainNetDays <= -4 {
+		add(-3, fmt.Sprintf("主力资金连续净流出 %d 天", -f.MainNetDays))
+	}
+
 	if recType == model.RecTypeShortTerm {
 		// 短线共用风险扣分。
 		if f.Bias20 > 12 {
@@ -434,6 +467,8 @@ func candidateValueSet(c candidate) []float64 {
 		c.Price, c.ChangePct, c.Amount, c.Amount / 1e8,
 		c.PETTM, c.PB, c.TotalCap, c.TotalCap / 1e8, c.FloatCap, c.FloatCap / 1e8,
 		c.TurnoverRate, c.VolumeRatio, c.Amplitude, c.Score, c.SentiScore,
+		// M3a 龙虎榜/机构/人气信号（喂给 LLM 的数值同步进值域）。
+		c.LhbNetYi, c.OrgNetYi, float64(c.PopRank), float64(c.PopPrev), float64(c.OrgBuys),
 	}
 	if c.Factors != nil {
 		f := c.Factors
@@ -443,7 +478,9 @@ func candidateValueSet(c candidate) []float64 {
 			// 否则模型忠实引用 RSI/MACD/获利盘数字会被误报幻觉（信任层自伤）。
 			f.RSI14, f.MACDDif, f.MACDDea, f.MACDHist,
 			f.BollUp, f.BollMid, f.BollLow, f.BollPos, f.ATR14, f.ATRPct,
-			f.ChipProfit, f.ChipAvgCost)
+			f.ChipProfit, f.ChipAvgCost,
+			// M3a 主力资金流因子（值域同步铁律，T1/F2 前例）。
+			f.MainNet5dYi, float64(f.MainNetDays))
 	}
 	if c.ScoreDims != nil {
 		vals = append(vals, c.ScoreDims.Trend, c.ScoreDims.Momentum, c.ScoreDims.Position,

@@ -23,6 +23,12 @@ func NewEastMoneyAdapter() *EastMoneyAdapter {
 	return &EastMoneyAdapter{br: newEmBreaker(), fetch: doGet}
 }
 
+// SetFetchForTest 注入假 HTTP 实现（跨包单测用，生产代码勿调）。
+// 注意 datacenter 系（emdatacenter.go）走包级 doGet 不经此钩子。
+func (e *EastMoneyAdapter) SetFetchForTest(f func(ctx context.Context, url string, headers map[string]string) ([]byte, int, error)) {
+	e.fetch = f
+}
+
 func (e *EastMoneyAdapter) Name() string { return "eastmoney" }
 
 // 东财行情字段（部分需 /100 还原）：

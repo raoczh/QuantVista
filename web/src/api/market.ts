@@ -213,3 +213,53 @@ export function getIndicators(market: string, symbol: string, limit = 120) {
 export function getChips(market: string, symbol: string) {
   return request<ChipDist>({ url: `/markets/${market}/stocks/${symbol}/chips`, method: 'get' })
 }
+
+// M3a 个股资金流（主力净额逐日 + 汇总；金额单位亿元）。
+export interface FundFlowDay {
+  date: string
+  main_net_yi: number
+  main_pct: number
+  close: number
+  change_pct: number
+}
+
+export interface StockFundFlow {
+  symbol: string
+  market: string
+  days: FundFlowDay[]
+  main_net_1d_yi: number
+  main_net_5d_yi: number
+  main_net_10d_yi: number
+  main_net_20d_yi: number
+  streak_days: number // 正=连续净流入天数，负=连续净流出
+  fresh: boolean
+  last_date?: string
+}
+
+export function getStockFundFlow(market: string, symbol: string, days = 90) {
+  return request<StockFundFlow>({
+    url: `/markets/${market}/stocks/${symbol}/fundflow`,
+    method: 'get',
+    params: { days },
+  })
+}
+
+// M3a 龙虎榜上榜记录（金额单位元）。
+export interface LhbRecord {
+  trade_date: string
+  reason: string
+  note?: string
+  change_pct: number
+  net_buy: number
+  deal_amt: number
+  org_net_buy: number
+  org_buys?: number
+}
+
+export function getStockLhb(market: string, symbol: string, limit = 10) {
+  return request<LhbRecord[]>({
+    url: `/markets/${market}/stocks/${symbol}/lhb`,
+    method: 'get',
+    params: { limit },
+  })
+}
