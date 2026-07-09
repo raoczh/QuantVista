@@ -35,6 +35,33 @@ export interface AnalysisResult {
   sys_confidence?: SysConfidence
   sys_confidence_why?: string
   review?: TrustReview
+  trade_plan?: TradePlan // M3c 交易员阶段（个股标准模式）
+}
+
+// 量化仓位建议（纯 Go 公式，可复现）：仓位% = 100×clip(2.5/vol20,0.3,1.0)×择时系数。
+export interface PositionAdvice {
+  position_pct: number
+  vol_20d: number
+  vol_coef: number
+  timing_coef: number
+  advance_ratio?: number // 市场涨家占比（0=不可得）
+  note?: string
+}
+
+// 交易计划（二次 LLM + 服务端纪律校验）。
+export interface TradePlan {
+  no_plan?: boolean
+  no_plan_reason?: string
+  buy_low?: number
+  buy_high?: number
+  target_price?: number
+  stop_price?: number
+  horizon_days?: number
+  plan_note?: string
+  checklist?: string[]
+  rr_ratio?: number // 盈亏比（服务端计算）
+  position?: PositionAdvice
+  discipline_notes?: string[] // 纪律校验说明（盈亏比不足降仓等）
 }
 
 // 多角色观点（mode=panel）。

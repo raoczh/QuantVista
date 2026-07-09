@@ -149,6 +149,36 @@ type SectorRank struct {
 	Source    string  `json:"source"`
 }
 
+// BoardHeat 板块热度条目（东财 clist 行业/概念板块，M3c 热力图数据源）。
+// 面积语义取 Amount（成交额）、颜色语义取 ChangePct；上涨/下跌家数与领涨股供 tooltip。
+type BoardHeat struct {
+	Code       string  `json:"code"`        // 板块代码，如 BK1201
+	Name       string  `json:"name"`        // 板块名称
+	ChangePct  float64 `json:"change_pct"`  // 涨跌幅 %
+	Amount     float64 `json:"amount"`      // 成交额（元）
+	Advances   int     `json:"advances"`    // 上涨家数
+	Declines   int     `json:"declines"`    // 下跌家数
+	Leader     string  `json:"leader"`      // 领涨股名
+	LeaderCode string  `json:"leader_code"` // 领涨股代码（6 位）
+	Source     string  `json:"source"`
+}
+
+// BoardStock 板块成分股条目（东财 clist，M3c 板块详情页成分表）。
+// IsLeader/IsTopGainer 由 service 层按成交额/涨幅第一名标注，数据源解析时恒 false。
+type BoardStock struct {
+	Symbol       string  `json:"symbol"`
+	Name         string  `json:"name"`
+	Price        float64 `json:"price"`
+	ChangePct    float64 `json:"change_pct"`
+	Amount       float64 `json:"amount"`        // 成交额（元）
+	TurnoverRate float64 `json:"turnover_rate"` // 换手率 %
+	TotalCap     float64 `json:"total_cap"`     // 总市值（元）
+	FloatCap     float64 `json:"float_cap"`     // 流通市值（元）
+	IsLeader     bool    `json:"is_leader"`     // 成交额第一名（板块龙头）
+	IsTopGainer  bool    `json:"is_top_gainer"` // 涨幅第一名
+	Source       string  `json:"source"`
+}
+
 // Breadth 市场涨跌家数/涨跌停统计（市场情绪核心指标）。
 type Breadth struct {
 	Advances  int       `json:"advances"`   // 上涨家数

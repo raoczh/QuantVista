@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -396,7 +397,9 @@ func (s *RecommendationService) generate(ctx context.Context, userID int64, allo
 
 	// 6) 阶段④：LLM 精选 + 反编造校验 + repair。
 	mktCtx := s.buildMarketContext(ctx, market)
-	messages := s.buildMessages(req.Type, strat, market, count, llmCands, filters, mktCtx)
+	messages := s.buildMessages(userID, req.Type, strat, market, count, llmCands, filters, mktCtx)
+	// M3c：启用 recommend 自定义模板时版本号加 -custom 后缀（同分析域前例，历史可归因）。
+	recPV := promptVersionFor(userID, model.PromptModuleRecommend, recPromptVersion)
 	llmInput, _ := json.Marshal(map[string]any{"market_context": mktCtx, "candidates": compactForLLM(req.Type, llmCands)})
 	batch := &model.RecommendationBatch{
 		UserID: userID, Type: req.Type, Market: market, Strategy: strat.Key,
@@ -404,7 +407,7 @@ func (s *RecommendationService) generate(ctx context.Context, userID int64, allo
 		CandidateCount: kept, CandidatePool: poolJSON,
 		DataSnapshot: string(llmInput), FiltersJSON: string(filtersJSON),
 		LLMConfigID: cfg.ID, Provider: cfg.Provider, Model: cfg.Model,
-		PromptVersion: recPromptVersion, StrategyVersion: recStrategyVersion,
+		PromptVersion: recPV, StrategyVersion: recStrategyVersion,
 	}
 
 	picks, rejected, usage, latency, callErr := s.callWithRepair(ctx, cfg, apiKey, allowPrivate, messages, poolBySymbol, count)
@@ -1420,9 +1423,18 @@ func composeBatchTitle(recType string, strat *strategyTemplate, filters RecFilte
 
 // buildMessages 组装系统提示 + 用户消息。p4：候选已由量化系统筛选评分排序，
 // LLM 的角色是「精选 + 解读 + 否决」而非海选；强制引用字段数值、禁用先验记忆、允许少选。
-func (s *RecommendationService) buildMessages(recType string, strat *strategyTemplate, market string, count int, llmCands []candidate, filters RecFilters, mktCtx *recMarketContext) []chatMessage {
+func (s *RecommendationService) buildMessages(userID int64, recType string, strat *strategyTemplate, market string, count int, llmCands []candidate, filters RecFilters, mktCtx *recMarketContext) []chatMessage {
 	var sys strings.Builder
-	sys.WriteString(recRoleIntro)
+	// M3c：module=recommend 的自定义模板整段替换默认角色与铁律段（占位符宽容渲染）。
+	// 反编造由 parseAndFilterPicks 程序化兜底，自定义文本弱化纪律也放不进池外标的。
+	intro := recRoleIntro
+	if custom, ok := promptOverrideFor(userID, model.PromptModuleRecommend, map[string]string{
+		"type": recTypeLabel(recType), "strategy": strat.Name,
+		"market": market, "count": strconv.Itoa(count),
+	}); ok {
+		intro = custom
+	}
+	sys.WriteString(intro)
 	sys.WriteString("\n\n")
 	if recType == model.RecTypeShortTerm {
 		sys.WriteString(shortTermSpec)

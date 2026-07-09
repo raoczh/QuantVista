@@ -102,8 +102,12 @@ onMounted(load)
           <n-button size="tiny" quaternary :loading="loading" @click="load">刷新</n-button>
         </template>
         <p class="tip">
-          每个分析模块可写一段自定义指引，替换系统默认的分析维度说明；「启用」后该模块的 AI 分析将使用你的模板。
-          通用的合规身份与 JSON 输出规范仍由系统保证。留空并保存无效，如需恢复默认请点「恢复默认」。
+          每个模块可写一段自定义指引，替换系统默认的提示词段；「启用」后该模块的 AI
+          调用即时使用你的模板（无需重启）。分析 5 模块替换分析维度指引，推荐/日报/问答/复核替换各自的角色与规则段。
+          通用的合规身份与 JSON 输出规范仍由系统保证（例外：「收盘日报」与「AI 复核」的模板是整段系统提示，
+          自带 JSON 输出 schema——自定义时请保留默认模板末尾的输出格式要求，否则解析会失败降级）。模板里可用占位符（如
+          <code>{{ '\{\{symbol\}\}' }}</code>）注入运行时上下文，写错或未提供值的占位符会原样保留。
+          留空并保存无效，如需恢复默认请点「恢复默认」。
         </p>
         <n-spin :show="loading && !modules.length">
           <n-collapse>
@@ -123,6 +127,12 @@ onMounted(load)
                 </div>
               </template>
               <div v-if="drafts[m.module]" class="mod-body">
+                <div v-if="m.placeholders?.length" class="mod-placeholders">
+                  可用占位符：
+                  <n-tag v-for="p in m.placeholders" :key="p" size="tiny" :bordered="false" class="ph-tag">
+                    {{ '{{' + p + '}' + '}' }}
+                  </n-tag>
+                </div>
                 <div class="mod-default">
                   <div class="mod-default-title">默认指引（参考）</div>
                   <pre class="mod-default-text">{{ m.default }}</pre>
@@ -180,6 +190,17 @@ onMounted(load)
   flex-direction: column;
   gap: 12px;
   padding: 4px 0 8px;
+}
+.mod-placeholders {
+  font-size: 12px;
+  opacity: 0.75;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.ph-tag {
+  font-family: monospace;
 }
 .mod-default {
   background: v-bind('vars.actionColor');

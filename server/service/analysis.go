@@ -49,7 +49,7 @@ func NewAnalysisService(market *MarketService, watchlist *WatchlistService, posi
 
 // 版本号：数据快照 + 这两个版本号共同保证「凭版本号复现」。改 prompt/策略时递增。
 const (
-	analysisPromptVersion   = "p11" // p11: M3a 市场模块情绪温度计 mood 段（连板分布/炸板率/昨涨停溢价）；p10: M2 回溯诊断 as_of 模式（截断快照+回溯声明段）；p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
+	analysisPromptVersion   = "p12" // p12: M3c 交易员阶段（个股标准分析追加交易计划二次调用+量化仓位公式，计划价位与仓位数字进核验值域）；p11: M3a 市场模块情绪温度计 mood 段（连板分布/炸板率/昨涨停溢价）；p10: M2 回溯诊断 as_of 模式（截断快照+回溯声明段）；p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
 	analysisStrategyVersion = "s1"
 	maxRepairAttempts       = 2 // 结构化校验失败后的额外重试次数（总调用 = 1 + maxRepairAttempts）
 )
@@ -96,6 +96,7 @@ type AnalysisResult struct {
 	SysConfidence    string          `json:"sys_confidence,omitempty"`     // 程序合成置信度 high/medium/low
 	SysConfidenceWhy string          `json:"sys_confidence_why,omitempty"` // 置信度依据说明
 	Review           *analysisReview `json:"review,omitempty"`             // AI 复核员结论（verify 模式）
+	TradePlan        *tradePlan      `json:"trade_plan,omitempty"`         // 交易员阶段：交易计划+量化仓位（M3c，个股标准模式）
 }
 
 // analysisReview AI 复核员对一份分析的结论。Confidence 用 FlexInt——模型常把整数字段
@@ -179,9 +180,11 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	// 4) 构造消息并调用 + 结构化校验/repair。
 	messages := s.buildMessages(userID, req, actx, string(snapshotJSON))
 	promptVersion := analysisPromptVersion
-	if req.Mode == model.AnalysisModeStandard && userPromptOverride(userID, req.Module) != "" {
-		// 标记本次使用了用户自定义模板——否则历史记录声称 p1 却无法按 p1 复现。
-		// （模板内容可被用户随后编辑，完整快照留待 ai_call_logs，当前仅标记。）
+	if req.Mode == model.AnalysisModeStandard &&
+		(userPromptOverride(userID, req.Module) != "" ||
+			(req.Verify && userPromptOverride(userID, model.PromptModuleReview) != "")) {
+		// 标记本次使用了用户自定义模板（模块指引或复核员模板任一）——否则历史记录
+		// 声称 p12 却无法按 p12 复现。（模板内容可被用户随后编辑，当前仅标记。）
 		promptVersion = analysisPromptVersion + "-custom"
 	}
 	rec := &model.AnalysisRecord{
@@ -234,7 +237,14 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	// （panel 无标准结论字段、degraded 无合法结构，都不做）。复核在配额记账前完成，
 	// 其 token 折入本次动作一起累计与扣费（一次分析动作仍只计 1 次配额）。
 	if callErr == nil && result != nil {
-		rvUsage := s.fillAnalysisTrust(ctx, cfg, apiKey, allowPrivate, req, actx.Snapshot, result)
+		// 交易员阶段（M3c）：先生成交易计划，再做证据核验——计划价位与仓位数字随后
+		// 会并入核验值域（模型自己输出的计划价是合法来源，同推荐 verifyEvidence extra 前例）。
+		tpUsage := s.attachTradePlan(ctx, cfg, apiKey, allowPrivate, req, actx.Snapshot, result)
+		usage.PromptTokens += tpUsage.PromptTokens
+		usage.CompletionTokens += tpUsage.CompletionTokens
+		usage.TotalTokens += tpUsage.TotalTokens
+
+		rvUsage := s.fillAnalysisTrust(ctx, userID, cfg, apiKey, allowPrivate, req, actx.Snapshot, result)
 		usage.PromptTokens += rvUsage.PromptTokens
 		usage.CompletionTokens += rvUsage.CompletionTokens
 		usage.TotalTokens += rvUsage.TotalTokens
@@ -342,7 +352,7 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, cfg *model.LLMConf
 // fillAnalysisTrust 回填一份成功分析的信任层字段（就地修改 result），返回 AI 复核消耗的 token。
 // 证据核验值域排除 recent_bars（30 根 OHLCV 密度过大，纳入后几乎任何数字都能撞上容差）。
 // unknowns 是「缺什么数据」的陈述、disclaimer 是套话，均不参与核验。
-func (s *AnalysisService) fillAnalysisTrust(ctx context.Context, cfg *model.LLMConfig, apiKey string, allowPrivate bool, req AnalyzeRequest, snapshot map[string]any, result *AnalysisResult) chatUsage {
+func (s *AnalysisService) fillAnalysisTrust(ctx context.Context, userID int64, cfg *model.LLMConfig, apiKey string, allowPrivate bool, req AnalyzeRequest, snapshot map[string]any, result *AnalysisResult) chatUsage {
 	texts := make([]string, 0, 8)
 	texts = append(texts, result.Summary)
 	texts = append(texts, result.Highlights...)
@@ -358,13 +368,25 @@ func (s *AnalysisService) fillAnalysisTrust(ctx context.Context, cfg *model.LLMC
 	vals = append(vals, decimalNumbersIn(newsTitleTexts(snapshot))...)
 	vals = append(vals, decimalNumbersIn(announcementTitleTexts(snapshot))...)
 	vals = append(vals, decimalNumbersIn(riskGateTexts(snapshot))...)
+	// 交易计划（M3c）：plan_note/checklist 参与核验；计划价位/盈亏比/仓位公式因子并入
+	// 合法值域——它们是模型自身结论与确定性公式输出，复述不算幻觉（同推荐计划价前例）。
+	if tp := result.TradePlan; tp != nil && !tp.NoPlan {
+		texts = append(texts, tp.PlanNote)
+		texts = append(texts, tp.Checklist...)
+		vals = append(vals, tp.BuyLow, tp.BuyHigh, tp.TargetPrice, tp.StopPrice,
+			tp.RRRatio, float64(tp.HorizonDays))
+		if tp.Position != nil {
+			vals = append(vals, tp.Position.PositionPct, tp.Position.Vol20,
+				tp.Position.VolCoef, tp.Position.TimingCoef, tp.Position.AdvanceRatio)
+		}
+	}
 	result.EvidenceCheck = verifyEvidenceValues(texts, vals)
 	result.SysConfidence, result.SysConfidenceWhy = analysisSystemConfidence(result.EvidenceCheck, snapshot)
 
 	if !req.Verify {
 		return chatUsage{}
 	}
-	review, usage := s.reviewAnalysis(ctx, cfg, apiKey, allowPrivate, snapshot, result)
+	review, usage := s.reviewAnalysis(ctx, userID, cfg, apiKey, allowPrivate, req.Module, snapshot, result)
 	if review != nil {
 		result.Review = review
 		// reject 级联：程序置信度强制压低，与「AI 复核员否决」徽章保持一致，不并排展示高置信度。
@@ -433,21 +455,31 @@ func analysisSystemConfidence(ev *evidenceCheck, snapshot map[string]any) (strin
 	return labels[level], strings.Join(reasons, "；")
 }
 
-// reviewAnalysis AI 复核（verify 模式）：以独立复核员视角对照数据快照审查一份分析，
-// 只挑刺不重写，输出 pass/warn/reject 与建议置信度。best-effort：失败只是没有复核结论，
-// 不影响主结果。1 次 repair。
-func (s *AnalysisService) reviewAnalysis(ctx context.Context, cfg *model.LLMConfig, apiKey string, allowPrivate bool, snapshot map[string]any, result *AnalysisResult) (*analysisReview, chatUsage) {
-	var usage chatUsage
-	snapJSON, _ := json.Marshal(snapshot)
-	resJSON, _ := json.Marshal(result)
-
-	sys := `你是一名独立的分析复核员，对照数据快照审查另一位研究员给出的分析。你不重新分析，只挑刺。审查维度：
+// analysisReviewSystem 分析复核员默认系统提示（module=review 的自定义模板可整段替换）。
+const analysisReviewSystem = `你是一名独立的分析复核员，对照数据快照审查另一位研究员给出的分析。你不重新分析，只挑刺。审查维度：
 1. 数字一致：分析中引用的数字是否与数据快照一致，有没有夸大、张冠李戴或凭空捏造；
 2. 风险完整：主要风险是否说够，有没有被淡化或遗漏；
 3. 评级自洽：rating（偏多/中性/偏空）与快照里的数据是否自洽，有没有明显相悖；
 4. 置信校准：结论的置信度是否过度自信。
 给出 verdict：pass（无实质问题）/ warn（有值得注意的问题但不至于否决）/ reject（数字与数据明显不符或风险被严重低估，应降级）。
 只输出 JSON：{"verdict":"pass|warn|reject","comment":"一两句中文说明","confidence":0-100 的复核后建议置信度整数}，不要任何解释或代码块标记。confidence 给具体数值（reject 时给你认为的真实低值）；填 0 表示维持原置信度不调整。`
+
+// reviewAnalysis AI 复核（verify 模式）：以独立复核员视角对照数据快照审查一份分析，
+// 只挑刺不重写，输出 pass/warn/reject 与建议置信度。best-effort：失败只是没有复核结论，
+// 不影响主结果。1 次 repair。
+func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg *model.LLMConfig, apiKey string, allowPrivate bool, module string, snapshot map[string]any, result *AnalysisResult) (*analysisReview, chatUsage) {
+	var usage chatUsage
+	snapJSON, _ := json.Marshal(snapshot)
+	// 交易计划（M3c）不喂给复核员：计划价位/仓位是模型结论与公式输出而非快照引用，
+	// 复核员按「数字必须与快照一致」审查会把它们误判为凭空捏造触发错误 reject。
+	resForReview := *result
+	resForReview.TradePlan = nil
+	resJSON, _ := json.Marshal(resForReview)
+
+	sys := analysisReviewSystem
+	if custom, ok := promptOverrideFor(userID, model.PromptModuleReview, map[string]string{"module": module}); ok {
+		sys = custom
+	}
 
 	convo := []chatMessage{
 		{Role: "system", Content: sys},
@@ -714,7 +746,11 @@ func (s *AnalysisService) buildMessages(userID int64, req AnalyzeRequest, actx *
 	}
 	b.WriteString("\n请严格按系统要求的 JSON schema 输出，只依据以上数据分析。")
 
-	sysPrompt := analysisSystemPrompt(userID, req.Module)
+	sysPrompt := analysisSystemPrompt(userID, req.Module, map[string]string{
+		"market": normalizeMarketOnly(req.Market),
+		"symbol": strings.TrimSpace(req.Symbol),
+		"target": actx.Label,
+	})
 	if req.Mode == model.AnalysisModePanel {
 		sysPrompt = analysisRoleIntro + "\n\n" + panelGuidance + "\n\n" + panelOutputSpec
 	}
@@ -725,10 +761,10 @@ func (s *AnalysisService) buildMessages(userID int64, req AnalyzeRequest, actx *
 }
 
 // analysisSystemPrompt 按模块拼接系统提示：通用身份 + 模块专属分析维度 + 通用输出/合规约束。
-// 若用户为该模块启用了自定义模板，则用其替换默认分析维度指引。
-func analysisSystemPrompt(userID int64, module string) string {
+// 若用户为该模块启用了自定义模板，则用其替换默认分析维度指引（占位符宽容渲染）。
+func analysisSystemPrompt(userID int64, module string, vars map[string]string) string {
 	guidance := moduleGuidance[module]
-	if custom := userPromptOverride(userID, module); custom != "" {
+	if custom, ok := promptOverrideFor(userID, module, vars); ok {
 		guidance = custom
 	}
 	return analysisRoleIntro + "\n\n" + guidance + "\n\n" + analysisOutputSpec
@@ -853,7 +889,7 @@ func parseAnalysisResult(content string) (*AnalysisResult, error) {
 	if err := json.Unmarshal([]byte(jsonStr), &raw); err != nil {
 		return nil, fmt.Errorf("JSON 解析失败: %v", err)
 	}
-	for _, k := range []string{"evidence_check", "sys_confidence", "sys_confidence_why", "review"} {
+	for _, k := range []string{"evidence_check", "sys_confidence", "sys_confidence_why", "review", "trade_plan"} {
 		delete(raw, k)
 	}
 	cleaned, err := json.Marshal(raw)

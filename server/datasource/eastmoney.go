@@ -167,9 +167,19 @@ func (e *EastMoneyAdapter) GetDailyBars(ctx context.Context, market, symbol stri
 		return nil, fmt.Errorf("%w: 解析失败 %v", ErrUpstream, err)
 	}
 
-	bars := make([]Bar, 0, len(parsed.Data.Klines))
-	for _, line := range parsed.Data.Klines {
-		// 格式：date,open,close,high,low,volume,amount,amplitude,pct,chg,turnover
+	bars := parseEMKlines(parsed.Data.Klines)
+	if len(bars) == 0 {
+		return nil, ErrNoData
+	}
+	return bars, nil
+}
+
+// parseEMKlines 解析 push2his kline 行序列为 Bar（个股与板块指数同口径，抽出便于复用/单测）。
+// 每行格式：date,open,close,high,low,volume,amount,amplitude,pct,chg,turnover。
+// 换手率在第 11 列（f61）；板块指数等标的可能只返回 7 列，容错为 0=缺失。
+func parseEMKlines(klines []string) []Bar {
+	bars := make([]Bar, 0, len(klines))
+	for _, line := range klines {
 		parts := strings.Split(line, ",")
 		if len(parts) < 7 {
 			continue
@@ -184,16 +194,12 @@ func (e *EastMoneyAdapter) GetDailyBars(ctx context.Context, market, symbol stri
 			Volume:    int64(atof(parts[5])),
 			Amount:    atof(parts[6]),
 		}
-		// 换手率在第 11 列（f61）；上游对部分标的（指数等）可能仍返回 7 列，容错为 0=缺失。
 		if len(parts) >= 11 {
 			b.TurnoverRate = atof(parts[10])
 		}
 		bars = append(bars, b)
 	}
-	if len(bars) == 0 {
-		return nil, ErrNoData
-	}
-	return bars, nil
+	return bars
 }
 
 // GetSectorRanking 东财 clist 行业板块涨跌榜（best-effort：东财限流时常返回空，调用方降级处理）。

@@ -152,9 +152,10 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 		symbol, market, _ := normalizeSymbolMarket(req.Symbol, req.Market)
 		conv = model.AiConversation{
 			UserID: userID, Symbol: symbol, Market: market, Name: name,
-			Title:       truncateRunes(question, 128),
-			LLMConfigID: cfg.ID, Provider: cfg.Provider, Model: cfg.Model,
-			DataSnapshot: string(snapJSON),
+			Title:         truncateRunes(question, 128),
+			LLMConfigID:   cfg.ID, Provider: cfg.Provider, Model: cfg.Model,
+			PromptVersion: qaPromptVersionFor(userID),
+			DataSnapshot:  string(snapJSON),
 		}
 		if err := common.DB.Create(&conv).Error; err != nil {
 			return nil, err
@@ -227,8 +228,9 @@ func (s *QaService) finalizeAsk(userID int64, ac *qaAskContext, res *chatResult)
 			return err
 		}
 		return tx.Model(&model.AiConversation{}).Where("id = ?", ac.conv.ID).Updates(map[string]any{
-			"message_count": gorm.Expr("message_count + 2"),
-			"total_tokens":  gorm.Expr("total_tokens + ?", res.Usage.TotalTokens),
+			"message_count":  gorm.Expr("message_count + 2"),
+			"total_tokens":   gorm.Expr("total_tokens + ?", res.Usage.TotalTokens),
+			"prompt_version": qaPromptVersionFor(userID),
 		}).Error
 	})
 	if err != nil {
@@ -259,9 +261,10 @@ func qaConversationFromAnalysis(userID, recordID int64, cfg *model.LLMConfig, qu
 	}
 	conv := &model.AiConversation{
 		UserID: userID, Symbol: rec.Symbol, Market: rec.Market, Name: name,
-		Title:       truncateRunes(question, 128),
-		LLMConfigID: cfg.ID, Provider: cfg.Provider, Model: cfg.Model,
-		DataSnapshot: rec.DataSnapshot,
+		Title:         truncateRunes(question, 128),
+		LLMConfigID:   cfg.ID, Provider: cfg.Provider, Model: cfg.Model,
+		PromptVersion: qaPromptVersionFor(userID),
+		DataSnapshot:  rec.DataSnapshot,
 	}
 	if err := common.DB.Create(conv).Error; err != nil {
 		return nil, err
@@ -269,10 +272,23 @@ func qaConversationFromAnalysis(userID, recordID int64, cfg *model.LLMConfig, qu
 	return conv, nil
 }
 
+// qaPromptVersionFor 本次问答实际使用的 prompt 版本（启用 qa 自定义模板加 -custom 后缀归因）。
+// 会话创建时固化一份；此后每次 ask 随消息落库前刷新会话字段——模板中途启停时记录跟随实际用量。
+func qaPromptVersionFor(userID int64) string {
+	return promptVersionFor(userID, model.PromptModuleQa, qaPromptVersion)
+}
+
 // buildMessages 组装发送给 LLM 的消息序列。系统提示含个股数据快照，历史仅取最近若干条。
+// M3c：module=qa 的自定义模板整段替换默认角色段（占位符宽容渲染），快照注入不变。
 func (s *QaService) buildMessages(conv model.AiConversation, history []model.AiConversationMessage, question string) []chatMessage {
 	var sys strings.Builder
-	sys.WriteString(qaRoleIntro)
+	intro := qaRoleIntro
+	if custom, ok := promptOverrideFor(conv.UserID, model.PromptModuleQa, map[string]string{
+		"symbol": conv.Symbol, "name": conv.Name, "market": conv.Market,
+	}); ok {
+		intro = custom
+	}
+	sys.WriteString(intro)
 	sys.WriteString("\n\n【个股数据快照】（本次会话固定，供多轮问答复用；JSON，价格为货币单位、金额单位为元）：\n")
 	sys.WriteString(conv.DataSnapshot)
 	sys.WriteString("\n\n对象：" + conv.Name + "（" + conv.Symbol + "）。请只依据以上数据回答，缺失的数据如实说明。")
@@ -318,7 +334,7 @@ func (s *QaService) List(userID int64, limit int) ([]model.AiConversation, error
 	var rows []model.AiConversation
 	err := common.DB.Where("user_id = ?", userID).
 		Select("id", "user_id", "symbol", "market", "name", "title",
-			"llm_config_id", "provider", "model", "message_count", "total_tokens", "created_at", "updated_at").
+			"llm_config_id", "provider", "model", "prompt_version", "message_count", "total_tokens", "created_at", "updated_at").
 		Order("updated_at DESC").Limit(limit).Find(&rows).Error
 	return rows, err
 }

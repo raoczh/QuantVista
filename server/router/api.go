@@ -43,6 +43,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	screenerSvc := service.NewScreenerService()
 	backtestSvc := service.NewBacktestService(marketSvc)
 	moodSvc := service.NewMoodService()
+	boardSvc := service.NewBoardService()
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc, scoreSvc, indicatorSvc, chipSvc)
@@ -72,6 +73,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	screenerCtl := controller.NewScreenerController(screenerSvc)
 	backtestCtl := controller.NewBacktestController(backtestSvc)
 	moodCtl := controller.NewMoodController(moodSvc)
+	boardCtl := controller.NewBoardController(boardSvc)
 
 	api := r.Group("/api")
 	{
@@ -113,6 +115,9 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			// M3a：个股资金流图（按需拉取+缓存）与龙虎榜上榜记录（盘后 job 采集）
 			markets.GET("/:market/stocks/:symbol/fundflow", moodCtl.StockFundFlow)
 			markets.GET("/:market/stocks/:symbol/lhb", moodCtl.StockLhb)
+			// M3c：行业/概念板块热力图 + 板块详情（指数日线 + 成分股）
+			markets.GET("/:market/boards", boardCtl.Heatmap)
+			markets.GET("/:market/boards/:code", boardCtl.Detail)
 		}
 
 		// 需登录
