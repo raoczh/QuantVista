@@ -55,6 +55,7 @@ func AllModels() []any {
 		&LimitUpStock{},
 		&MarketMoodDaily{},
 		&FundFlowDaily{},
+		&IntradayFactorDaily{},
 	}
 }
 

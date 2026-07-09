@@ -57,6 +57,15 @@ type candFactors struct {
 	// M3a 主力资金流因子（fund_flow_daily 缓存派生；缺失=资金流数据暂不可得）。
 	MainNetDays int     `json:"main_net_days,omitempty"` // 连续净流入天数（负=连续净流出）
 	MainNet5dYi float64 `json:"main_net_5d_yi,omitempty"` // 近 5 日主力净额（亿元）
+
+	// M3b 盘中因子（腾讯 5 分钟线盘后聚合；T-1 信号——最近一个已同步交易日的
+	// 盘中形态，IntradayDate 声明归属日，缺失=盘中数据暂不可得）。
+	IntradayDate string  `json:"intraday_date,omitempty"`  // 因子归属交易日
+	Tail30Chg    float64 `json:"tail30_chg,omitempty"`     // 尾盘30分钟涨幅 %
+	Tail30VolPct float64 `json:"tail30_vol_pct,omitempty"` // 尾盘30分钟量占全天 %（均匀线 12.5%）
+	MorningChg   float64 `json:"morning_chg,omitempty"`    // 早盘1小时涨幅 %
+	CloseVsVwap  float64 `json:"close_vs_vwap,omitempty"`  // 收盘 vs 全天VWAP 偏离 %
+	PmVwapUp     bool    `json:"pm_vwap_up,omitempty"`     // 下午VWAP>上午（日内重心上移）
 }
 
 // scoreDims 五维评分明细（透传 computeScore 结果，前端展示雷达/分项）。
@@ -289,6 +298,33 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 		if f.VolBoost > 5 {
 			add(-4, fmt.Sprintf("量比近似 %.1f 爆量警惕", f.VolBoost))
 		}
+		// M3b 盘中因子（短线专属：日内资金行为对隔日走势的预测力集中在短周期；
+		// T-1 信号，IntradayDate 非空才有数据，缺失不动分）。尾盘方向对称加扣
+		//（尾盘拉升可能是抢筹也可能是尾盘偷袭出货前的诱多，放量才升档）；
+		// 收盘 vs VWAP 是全天买卖力量的总结算，弱于均价的扣分轻于跳水（常态回落）。
+		if f.IntradayDate != "" {
+			switch {
+			case f.Tail30Chg >= 1.5 && f.Tail30VolPct >= 20:
+				add(4, fmt.Sprintf("尾盘30分放量拉升 %.1f%%（量占全天 %.0f%%，资金抢筹迹象）", f.Tail30Chg, f.Tail30VolPct))
+			case f.Tail30Chg >= 1.5:
+				add(3, fmt.Sprintf("尾盘30分拉升 %.1f%%", f.Tail30Chg))
+			case f.Tail30Chg <= -1.5 && f.Tail30VolPct >= 20:
+				add(-4, fmt.Sprintf("尾盘30分放量跳水 %.1f%%（量占全天 %.0f%%，资金出逃迹象）", f.Tail30Chg, f.Tail30VolPct))
+			case f.Tail30Chg <= -1.5:
+				add(-3, fmt.Sprintf("尾盘30分跳水 %.1f%%", f.Tail30Chg))
+			}
+			if f.CloseVsVwap >= 1 {
+				add(3, fmt.Sprintf("收盘强于全天均价 %.1f%%（买方主导）", f.CloseVsVwap))
+			} else if f.CloseVsVwap <= -1.5 {
+				add(-2, fmt.Sprintf("收盘弱于全天均价 %.1f%%", f.CloseVsVwap))
+			}
+			if f.PmVwapUp && f.MorningChg >= 0 {
+				add(2, "午后重心上移（下午VWAP>上午）")
+			}
+			if f.MorningChg >= 2 && f.Tail30Chg >= 0 {
+				add(2, fmt.Sprintf("早盘1小时强势 %.1f%% 且尾盘未回吐", f.MorningChg))
+			}
+		}
 		switch stratKey {
 		case "momentum":
 			if f.High20d {
@@ -480,7 +516,9 @@ func candidateValueSet(c candidate) []float64 {
 			f.BollUp, f.BollMid, f.BollLow, f.BollPos, f.ATR14, f.ATRPct,
 			f.ChipProfit, f.ChipAvgCost,
 			// M3a 主力资金流因子（值域同步铁律，T1/F2 前例）。
-			f.MainNet5dYi, float64(f.MainNetDays))
+			f.MainNet5dYi, float64(f.MainNetDays),
+			// M3b 盘中因子（值域同步铁律；PmVwapUp 布尔、IntradayDate 日期不参与）。
+			f.Tail30Chg, f.Tail30VolPct, f.MorningChg, f.CloseVsVwap)
 	}
 	if c.ScoreDims != nil {
 		vals = append(vals, c.ScoreDims.Trend, c.ScoreDims.Momentum, c.ScoreDims.Position,
