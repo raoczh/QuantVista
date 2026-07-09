@@ -153,15 +153,17 @@ func filterSectors(in []string) []string {
 // resolveNewsLLM 新闻增强用的系统级 LLM：首个管理员的默认配置。
 // 返回 (cfg, key, adminID, error)。无管理员/无配置时报错，调用方降级规则表。
 func resolveNewsLLM() (*model.LLMConfig, string, int64, error) {
-	adminID, err := firstEnabledAdminID()
-	if err != nil {
+	// 系统默认 LLM：管理后台指定的回退配置优先，否则首个启用管理员的默认配置。
+	// 不受"LLM 回退"用户开关控制（新闻分析是系统后台任务，由 news_auto_llm 总闸管）。
+	var cfg model.LLMConfig
+	if err := resolveSystemFallbackConfig(&cfg); err != nil {
 		return nil, "", 0, err
 	}
-	cfg, key, err := NewLLMService().ResolveForUse(adminID, 0)
-	if err != nil {
-		return nil, "", 0, err
+	key, err := common.Decrypt(cfg.APIKeyCipher)
+	if err != nil || strings.TrimSpace(key) == "" {
+		return nil, "", 0, errors.New("系统默认 LLM 配置缺少可用 API Key")
 	}
-	return cfg, key, adminID, nil
+	return &cfg, key, cfg.UserID, nil
 }
 
 // newsEnhanceItem LLM 增强的单条输出。
