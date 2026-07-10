@@ -35,6 +35,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/notes', name: 'notes', component: () => import('@/pages/Notes.vue'), meta: { title: '投资笔记' } },
   { path: '/settings', name: 'settings', component: () => import('@/pages/Settings.vue'), meta: { title: '设置' } },
   { path: '/admin', name: 'admin', component: () => import('@/pages/AdminSettings.vue'), meta: { title: '管理后台', admin: true } },
+  { path: '/admin/llm-calls', name: 'admin-llm-calls', component: () => import('@/pages/AdminLlmCalls.vue'), meta: { title: 'LLM 调用记录', admin: true } },
   { path: '/:pathMatch(.*)*', name: 'notfound', component: Placeholder, meta: { title: '未找到' } },
 ]
 

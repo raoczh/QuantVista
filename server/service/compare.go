@@ -255,6 +255,7 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 			{Role: "user", Content: b.String()},
 		},
 		JSONMode: false, AllowPrivate: allowPrivate,
+		Meta: chatMeta{CallerUserID: userID, Module: "compare", ConfigID: cfg.ID, Provider: cfg.Provider},
 	})
 	if err != nil {
 		return "", "AI 点评生成失败：" + err.Error()

@@ -203,27 +203,47 @@ func (s *LLMService) TestByID(userID, id int64, allowPrivate bool) (*TestResult,
 	if err != nil {
 		return nil, errors.New("密钥解密失败")
 	}
-	return s.testConnection(cfg.Provider, cfg.EndpointType, cfg.BaseURL, key, cfg.Model, allowPrivate), nil
+	return s.testConnection(userID, cfg.ID, cfg.Provider, cfg.EndpointType, cfg.BaseURL, key, cfg.Model, allowPrivate), nil
 }
 
 // TestByInput 测试未保存的配置（前端表单即时测试）。
-func (s *LLMService) TestByInput(in LLMConfigInput, allowPrivate bool) (*TestResult, error) {
+func (s *LLMService) TestByInput(userID int64, in LLMConfigInput, allowPrivate bool) (*TestResult, error) {
 	if in.BaseURL == "" || in.Model == "" || in.APIKey == "" {
 		return nil, errors.New("测试需要 base_url、model 与 api_key")
 	}
-	return s.testConnection(in.Provider, in.EndpointType, strings.TrimRight(in.BaseURL, "/"), in.APIKey, in.Model, allowPrivate), nil
+	return s.testConnection(userID, 0, in.Provider, in.EndpointType, strings.TrimRight(in.BaseURL, "/"), in.APIKey, in.Model, allowPrivate), nil
 }
 
 // testConnection 目前仅实现 OpenAI 兼容口径（chat/completions 或 responses 最小请求）。
 // 其他 provider（如 Anthropic 原生 /v1/messages）在此 switch 留口，后续按需补。
-func (s *LLMService) testConnection(provider, endpointType, baseURL, apiKey, modelName string, allowPrivate bool) *TestResult {
+func (s *LLMService) testConnection(userID, configID int64, provider, endpointType, baseURL, apiKey, modelName string, allowPrivate bool) *TestResult {
 	switch strings.ToLower(provider) {
 	default: // openai 及各类 OpenAI 兼容中转
-		return s.testOpenAICompatible(endpointType, baseURL, apiKey, modelName, allowPrivate)
+		return s.testOpenAICompatibleForUser(userID, configID, provider, endpointType, baseURL, apiKey, modelName, allowPrivate)
 	}
 }
 
 func (s *LLMService) testOpenAICompatible(endpointType, baseURL, apiKey, modelName string, allowPrivate bool) *TestResult {
+	return s.testOpenAICompatibleForUser(0, 0, "openai", endpointType, baseURL, apiKey, modelName, allowPrivate)
+}
+
+func (s *LLMService) testOpenAICompatibleForUser(userID, configID int64, provider, endpointType, baseURL, apiKey, modelName string, allowPrivate bool) (result *TestResult) {
+	started := time.Now()
+	params := chatParams{
+		Model: modelName, EndpointType: endpointType,
+		Messages: []chatMessage{{Role: "user", Content: "hi"}},
+		Meta:     chatMeta{CallerUserID: userID, Module: "test", ConfigID: configID, Provider: provider},
+	}
+	defer func() {
+		var res *chatResult
+		var callErr error
+		if result != nil && result.OK {
+			res = &chatResult{Content: result.Message, LatencyMs: result.LatencyMs}
+		} else if result != nil {
+			callErr = errors.New(result.Message)
+		}
+		writeLLMCallLog(params, false, res, callErr, time.Since(started))
+	}()
 	// 校验 scheme：仅允许 http/https，防 file://、gopher:// 等被利用。
 	u, err := url.Parse(baseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
@@ -319,7 +339,7 @@ func (s *LLMService) testOpenAICompatible(endpointType, baseURL, apiKey, modelNa
 
 // extractErr 从上游错误体里抽取 message：兼容 OpenAI 风格 {"error":{"message":...}}、
 // error 为裸字符串、以及各类网关的顶层 message/msg/error_msg/detail 字段
-//（new-api GeneralErrorResponse 同款宽容解析）；全抽不到则返回截断原文。
+// （new-api GeneralErrorResponse 同款宽容解析）；全抽不到则返回截断原文。
 func extractErr(raw []byte) string {
 	var generic struct {
 		Error   json.RawMessage `json:"error"`
@@ -397,7 +417,7 @@ func (s *LLMService) ResolveForUse(userID, id int64) (*model.LLMConfig, string, 
 
 // adminFallback 无自有配置时的用户回退入口：受管理后台"LLM 回退"开关控制，
 // 关闭时保持"请先在设置中添加"的引导语义；发起者本人就是候选管理员时同样引导
-//（自己都没配置，回退到自己没有意义）。
+// （自己都没配置，回退到自己没有意义）。
 func (s *LLMService) adminFallback(userID int64, cfg *model.LLMConfig) error {
 	errGuide := errors.New("尚未配置任何 LLM，请先在设置中添加")
 	if !setting.LLMFallbackEnabled() {
@@ -410,7 +430,7 @@ func (s *LLMService) adminFallback(userID int64, cfg *model.LLMConfig) error {
 }
 
 // resolveSystemFallbackConfig 解析"系统默认 LLM"：管理后台指定的回退配置优先
-//（须仍存在且所有者是启用管理员，失效则静默回落），否则取首个启用管理员的默认配置。
+// （须仍存在且所有者是启用管理员，失效则静默回落），否则取首个启用管理员的默认配置。
 // 供用户回退（adminFallback）与新闻情绪分析（resolveNewsLLM）共用，不受回退开关控制。
 func resolveSystemFallbackConfig(cfg *model.LLMConfig) error {
 	if id := setting.LLMFallbackConfigID(); id > 0 {
@@ -454,7 +474,7 @@ func isEnabledAdmin(userID int64) bool {
 }
 
 // llmAllowPrivate 内网地址放行判定：发起者是管理员，或配置本身属于管理员
-//（普通用户回退用管理员配置时，内网 URL 是管理员配的、非用户可控输入，放行安全）。
+// （普通用户回退用管理员配置时，内网 URL 是管理员配的、非用户可控输入，放行安全）。
 func llmAllowPrivate(callerAllow bool, cfg *model.LLMConfig) bool {
 	if callerAllow {
 		return true

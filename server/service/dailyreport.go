@@ -21,8 +21,8 @@ import (
 // 后台自动生成不消耗次数配额（token 照记审计）；手动重生成计 1 次。
 
 const (
-	reportWindowStartMin = 15*60 + 35 // 15:35，收盘数据已稳定
-	reportWindowEndMin   = 20 * 60    // 20:00 后不再补生成
+	reportWindowStartMin  = 15*60 + 35 // 15:35，收盘数据已稳定
+	reportWindowEndMin    = 20 * 60    // 20:00 后不再补生成
 	reportAlertNotePrefix = "收盘日报"
 	reportAlertExpireDays = 21 // 卖点提醒规则超过该自然日数自动暂停（覆盖短线最长有效期）
 )
@@ -485,6 +485,7 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 		Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
 		Messages: messages, JSONMode: true, AllowPrivate: allowPrivate,
+		Meta: chatMeta{CallerUserID: userID, Module: "daily_report", ConfigID: cfg.ID, Provider: cfg.Provider},
 	})
 	if err != nil {
 		return nil, total, err
@@ -503,6 +504,7 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 		Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
 		Messages: messages, JSONMode: true, AllowPrivate: allowPrivate,
+		Meta: chatMeta{CallerUserID: userID, Module: "daily_report", ConfigID: cfg.ID, Provider: cfg.Provider},
 	})
 	if err != nil {
 		return nil, total, err

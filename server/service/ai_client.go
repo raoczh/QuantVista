@@ -59,6 +59,7 @@ type chatParams struct {
 	Messages     []chatMessage
 	JSONMode     bool // 请求 response_format=json_object（不支持则由调用逻辑 fallback）
 	AllowPrivate bool // 管理员可放行内网自建模型
+	Meta         chatMeta
 }
 
 // isResponsesEndpoint 该次调用是否走 /v1/responses（空值按 chat/completions）。
@@ -83,7 +84,13 @@ type chatResult struct {
 // chatCompletion 发起一次补全。JSONMode=true 时先带 response_format 请求；
 // 若服务端因不支持该字段返回 4xx，则去掉 response_format 重试一次（fallback，靠 prompt 约束 JSON）。
 // EndpointType=responses 时分流到 /v1/responses 适配（ai_client_responses.go），返回语义一致。
-func chatCompletion(ctx context.Context, p chatParams) (*chatResult, error) {
+func chatCompletion(ctx context.Context, p chatParams) (res *chatResult, err error) {
+	started := time.Now()
+	defer func() { writeLLMCallLog(p, false, res, err, time.Since(started)) }()
+	return chatCompletionInner(ctx, p)
+}
+
+func chatCompletionInner(ctx context.Context, p chatParams) (*chatResult, error) {
 	if p.isResponsesEndpoint() {
 		return responsesCompletion(ctx, p)
 	}
@@ -299,7 +306,7 @@ func endsWithVersionSegment(base string) bool {
 }
 
 // looksLikeHTML 响应体形似网页而非 JSON——SPA fallback、网关登录页、CDN 拦截页的典型形态
-//（合法 JSON 不会以 '<' 开头）。
+// （合法 JSON 不会以 '<' 开头）。
 func looksLikeHTML(raw []byte) bool {
 	return strings.HasPrefix(strings.TrimSpace(string(raw)), "<")
 }
@@ -339,7 +346,13 @@ func estimateUsage(messages []chatMessage, content string) chatUsage {
 // 不做 JSON mode（流式只用于自由文本模块），不做状态码重试（流一旦建立，中断即失败——
 // 半截内容重试会让用户看到重复文本）；建立连接前的错误分类与非流式一致。
 // EndpointType=responses 时分流到 /v1/responses 适配。
-func chatCompletionStream(ctx context.Context, p chatParams, onDelta func(string)) (*chatResult, error) {
+func chatCompletionStream(ctx context.Context, p chatParams, onDelta func(string)) (res *chatResult, err error) {
+	started := time.Now()
+	defer func() { writeLLMCallLog(p, true, res, err, time.Since(started)) }()
+	return chatCompletionStreamInner(ctx, p, onDelta)
+}
+
+func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(string)) (*chatResult, error) {
 	if p.isResponsesEndpoint() {
 		return responsesCompletionStream(ctx, p, onDelta)
 	}

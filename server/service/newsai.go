@@ -40,7 +40,7 @@ const (
 	newsAIRoundCap      = 40 // 每轮最多处理的待增强新闻数
 	newsAISimplifiedCap = 10 // 每轮 P3 简化版 LLM 调用的新闻条数上限
 	newsAIWindow        = 48 * time.Hour
-	sentiAggMaxNews     = 12 // 个股当日聚合最多采样的新闻条数
+	sentiAggMaxNews     = 12   // 个股当日聚合最多采样的新闻条数
 	sentiPromptVersion  = "n1" // 情绪增强 prompt 版本
 )
 
@@ -216,6 +216,7 @@ func enhanceBatchLLM(ctx context.Context, cfg *model.LLMConfig, apiKey string, a
 			{Role: "user", Content: user},
 		},
 		JSONMode: true, AllowPrivate: allowPrivate,
+		Meta: chatMeta{CallerUserID: adminID, Module: "news", ConfigID: cfg.ID, Provider: cfg.Provider},
 	})
 	if err != nil {
 		return nil, err
@@ -368,7 +369,7 @@ func (s *NewsService) EnhanceNewsRound(ctx context.Context) {
 // --- 个股当日聚合情绪分 ---
 
 // sentiAggMu/sentiAggInflight (symbol,date) 并发合并：同 key 只算一次，其余等待复用
-//（mutex+map 写的 singleflight 等价实现，项目无 x/sync 依赖）。
+// （mutex+map 写的 singleflight 等价实现，项目无 x/sync 依赖）。
 var (
 	sentiAggMu       sync.Mutex
 	sentiAggInflight = map[string]*sync.WaitGroup{}

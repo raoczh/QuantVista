@@ -106,7 +106,7 @@ func (lc *LLMController) TestDraft(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	res, err := lc.svc.TestByInput(in, lc.allowPrivate(c))
+	res, err := lc.svc.TestByInput(currentUserID(c), in, lc.allowPrivate(c))
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return

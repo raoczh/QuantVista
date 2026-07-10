@@ -34,12 +34,12 @@ func NewRecommendationService(market *MarketService, watchlist *WatchlistService
 
 const (
 	recPromptVersion   = "p10" // p10: M3b 盘中因子字段说明（尾盘涨幅/量占比/早盘/VWAP）；p9: M3a 龙虎榜/机构/人气榜/主力资金流字段说明；p8: F2 长线名单新增 fin 财务摘要（ROE/营收净利增速/毛利率）字段说明、longTermSpec 撤「缺财务明细」声明；p7: T1 技术指标与筹码字段说明；p6: senti 消息面字段；p5: 来源随策略组合；p4: 四阶段流水线；p3: 落选理由；p2: 估值富化
-	recStrategyVersion = "s8" // s8: M3b 盘中因子短线加分项（尾盘放量拉升/跳水/收盘vs VWAP/午后重心上移/早盘强势）；s7: M3a 龙虎榜净买/机构席位/人气跃升/主力连续净流入加分项 + 量能维融合主力资金分；s6: F2 财务加分项（value ROE/growth 双增速/leader 盈利质量 + 业绩恶化通用扣分）；s5: T1 指标加分项 + 筹码超跌 + 五维动量/风险维升级；s4: 消息面情绪因子；s3: 策略-来源映射 + 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
-	maxScanCandidates  = 48   // 进入量化评分的候选上限（约束日线拉取量：48 只 × 1 次 HTTP，并发 6 约 3~8s）
-	maxLLMCandidates   = 16   // 量化排序后进入 LLM 精选的名单上限（控上下文与位置偏差面）
-	factorBarLimit     = 90   // 五维评分/窗口因子的日线口径（MA60 需 ≥60，留余量）；实际拉取按 chipBarLimit=210，评分前截尾
-	maxPoolIntake      = 240  // 建池总量护栏（自选无上限，防极端用户打爆估值批量请求）
-	poolSnapshotMax    = 150  // 候选池快照落库条目上限（MySQL TEXT 64KB 容量保护，超出部分只记数量）
+	recStrategyVersion = "s8"  // s8: M3b 盘中因子短线加分项（尾盘放量拉升/跳水/收盘vs VWAP/午后重心上移/早盘强势）；s7: M3a 龙虎榜净买/机构席位/人气跃升/主力连续净流入加分项 + 量能维融合主力资金分；s6: F2 财务加分项（value ROE/growth 双增速/leader 盈利质量 + 业绩恶化通用扣分）；s5: T1 指标加分项 + 筹码超跌 + 五维动量/风险维升级；s4: 消息面情绪因子；s3: 策略-来源映射 + 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
+	maxScanCandidates  = 48    // 进入量化评分的候选上限（约束日线拉取量：48 只 × 1 次 HTTP，并发 6 约 3~8s）
+	maxLLMCandidates   = 16    // 量化排序后进入 LLM 精选的名单上限（控上下文与位置偏差面）
+	factorBarLimit     = 90    // 五维评分/窗口因子的日线口径（MA60 需 ≥60，留余量）；实际拉取按 chipBarLimit=210，评分前截尾
+	maxPoolIntake      = 240   // 建池总量护栏（自选无上限，防极端用户打爆估值批量请求）
+	poolSnapshotMax    = 150   // 候选池快照落库条目上限（MySQL TEXT 64KB 容量保护，超出部分只记数量）
 	recRepairAttempts  = 2
 )
 
@@ -124,25 +124,25 @@ type candidate struct {
 	LimitUp      float64 `json:"limit_up,omitempty"`      // 涨停价（判「已涨停买不进」）
 	Source       string  `json:"source,omitempty"`        // 兼容旧记录的单来源字段（新记录用 Sources）
 
-	Sources   []string     `json:"sources,omitempty"`    // watchlist / gainer / active / turnover（可多来源）
-	Excluded  string       `json:"excluded,omitempty"`   // 非空=被用户筛选/风控排除的原因（透明可查）
-	Factors   *candFactors `json:"factors,omitempty"`    // 技术因子快照（210 根日线派生：窗口因子尾窗口径、指标递推、筹码累积）
-	Fin       *candFin     `json:"fin,omitempty"`        // F2 财务摘要（长线：最新一期 ROE/增速/毛利率；缺失=无缓存且预算耗尽）
-	ScoreDims *scoreDims   `json:"score_dims,omitempty"` // 五维评分明细
-	SentiScore float64     `json:"senti_score,omitempty"` // N2 当日聚合情绪分 -1~1（新闻加权合成）
-	SentiNews  int         `json:"senti_news,omitempty"`  // 参与聚合的新闻条数（0=当日无相关新闻）
+	Sources    []string     `json:"sources,omitempty"`     // watchlist / gainer / active / turnover（可多来源）
+	Excluded   string       `json:"excluded,omitempty"`    // 非空=被用户筛选/风控排除的原因（透明可查）
+	Factors    *candFactors `json:"factors,omitempty"`     // 技术因子快照（210 根日线派生：窗口因子尾窗口径、指标递推、筹码累积）
+	Fin        *candFin     `json:"fin,omitempty"`         // F2 财务摘要（长线：最新一期 ROE/增速/毛利率；缺失=无缓存且预算耗尽）
+	ScoreDims  *scoreDims   `json:"score_dims,omitempty"`  // 五维评分明细
+	SentiScore float64      `json:"senti_score,omitempty"` // N2 当日聚合情绪分 -1~1（新闻加权合成）
+	SentiNews  int          `json:"senti_news,omitempty"`  // 参与聚合的新闻条数（0=当日无相关新闻）
 	// M3a 扩展信号（最近有数据交易日的口径，通常为 T-1 信息；缺失=未上榜/无快照）。
-	LhbNetYi  float64 `json:"lhb_net_yi,omitempty"`  // 龙虎榜净买额（亿元，负=净卖出）
-	LhbReason string  `json:"lhb_reason,omitempty"`  // 上榜原因
-	OrgNetYi  float64 `json:"org_net_yi,omitempty"`  // 机构席位净买额（亿元，负=净卖出）
-	OrgBuys   int     `json:"org_buys,omitempty"`    // 机构席位买入次数
-	PopRank   int     `json:"pop_rank,omitempty"`    // 股吧人气榜名次（1~100）
-	PopPrev   int     `json:"pop_prev,omitempty"`    // 昨日名次（<=0=新上榜）
-	PopNew    bool    `json:"pop_new,omitempty"`     // 人气榜新上榜
-	Score     float64      `json:"score,omitempty"`      // 量化综合分 0-100（五维基础分 + 策略加分）
-	Rank      int          `json:"rank,omitempty"`       // 未被排除者中的排名（1=最高）
-	Bonus     []string     `json:"bonus,omitempty"`      // 策略加分/扣分明细（可解释）
-	SentToLLM bool         `json:"sent_to_llm,omitempty"`
+	LhbNetYi  float64  `json:"lhb_net_yi,omitempty"` // 龙虎榜净买额（亿元，负=净卖出）
+	LhbReason string   `json:"lhb_reason,omitempty"` // 上榜原因
+	OrgNetYi  float64  `json:"org_net_yi,omitempty"` // 机构席位净买额（亿元，负=净卖出）
+	OrgBuys   int      `json:"org_buys,omitempty"`   // 机构席位买入次数
+	PopRank   int      `json:"pop_rank,omitempty"`   // 股吧人气榜名次（1~100）
+	PopPrev   int      `json:"pop_prev,omitempty"`   // 昨日名次（<=0=新上榜）
+	PopNew    bool     `json:"pop_new,omitempty"`    // 人气榜新上榜
+	Score     float64  `json:"score,omitempty"`      // 量化综合分 0-100（五维基础分 + 策略加分）
+	Rank      int      `json:"rank,omitempty"`       // 未被排除者中的排名（1=最高）
+	Bonus     []string `json:"bonus,omitempty"`      // 策略加分/扣分明细（可解释）
+	SentToLLM bool     `json:"sent_to_llm,omitempty"`
 }
 
 // sourceLabelCN 候选来源的中文标签（落库英文 key，前端映射展示）。
@@ -411,11 +411,11 @@ func (s *RecommendationService) generate(ctx context.Context, userID int64, allo
 		PromptVersion: recPV, StrategyVersion: recStrategyVersion,
 	}
 
-	picks, rejected, usage, latency, callErr := s.callWithRepair(ctx, cfg, apiKey, allowPrivate, messages, poolBySymbol, count)
+	picks, rejected, usage, latency, callErr := s.callWithRepair(ctx, userID, cfg, apiKey, allowPrivate, messages, poolBySymbol, count)
 
 	// 7) 可选 AI 复核（verify）：风控复核员逐条挑刺，reject 降级为观察。
 	if callErr == nil && len(picks) > 0 && req.Verify {
-		reviews, overall, rvUsage := s.reviewPicks(ctx, cfg, apiKey, allowPrivate, req.Type, picks, poolBySymbol)
+		reviews, overall, rvUsage := s.reviewPicks(ctx, userID, cfg, apiKey, allowPrivate, req.Type, picks, poolBySymbol)
 		usage.PromptTokens += rvUsage.PromptTokens
 		usage.CompletionTokens += rvUsage.CompletionTokens
 		usage.TotalTokens += rvUsage.TotalTokens
@@ -516,7 +516,7 @@ func (s *RecommendationService) generate(ctx context.Context, userID int64, allo
 
 // callWithRepair 调用 LLM，反编造校验（picks 必须∈候选池），失败有限次 repair，累计 token。
 // 同时收集池内落选标的的一句话理由（rejected，best-effort 不参与合格判定）。
-func (s *RecommendationService) callWithRepair(ctx context.Context, cfg *model.LLMConfig, apiKey string, allowPrivate bool, messages []chatMessage, pool map[string]candidate, count int) ([]recPick, []recReject, chatUsage, int64, error) {
+func (s *RecommendationService) callWithRepair(ctx context.Context, userID int64, cfg *model.LLMConfig, apiKey string, allowPrivate bool, messages []chatMessage, pool map[string]candidate, count int) ([]recPick, []recReject, chatUsage, int64, error) {
 	var acc chatUsage
 	var lastLatency int64
 	convo := append([]chatMessage(nil), messages...)
@@ -526,6 +526,7 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, cfg *model.L
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
+			Meta: chatMeta{CallerUserID: userID, Module: "recommendation", ConfigID: cfg.ID, Provider: cfg.Provider},
 		})
 		if err != nil {
 			return nil, nil, acc, lastLatency, err
@@ -554,7 +555,7 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, cfg *model.L
 // reviewPicks AI 复核（verify 模式）：以「风控复核员」独立视角逐条挑刺——核对证据与数据
 // 是否一致、风险是否被低估、价位是否合理，输出 pass/warn/reject 与建议置信度。
 // best-effort：失败只是没有复核结论，不影响主结果。1 次 repair。
-func (s *RecommendationService) reviewPicks(ctx context.Context, cfg *model.LLMConfig, apiKey string, allowPrivate bool, recType string, picks []recPick, pool map[string]candidate) ([]pickReview, string, chatUsage) {
+func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, cfg *model.LLMConfig, apiKey string, allowPrivate bool, recType string, picks []recPick, pool map[string]candidate) ([]pickReview, string, chatUsage) {
 	var usage chatUsage
 	rows := make([]map[string]any, 0, len(picks))
 	for _, p := range picks {
@@ -595,6 +596,7 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, cfg *model.LLMC
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
+			Meta: chatMeta{CallerUserID: userID, Module: "rec_review", ConfigID: cfg.ID, Provider: cfg.Provider},
 		})
 		if err != nil {
 			return nil, "", usage
