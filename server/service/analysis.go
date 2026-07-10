@@ -49,7 +49,7 @@ func NewAnalysisService(market *MarketService, watchlist *WatchlistService, posi
 
 // 版本号：数据快照 + 这两个版本号共同保证「凭版本号复现」。改 prompt/策略时递增。
 const (
-	analysisPromptVersion   = "p12" // p12: M3c 交易员阶段（个股标准分析追加交易计划二次调用+量化仓位公式，计划价位与仓位数字进核验值域）；p11: M3a 市场模块情绪温度计 mood 段（连板分布/炸板率/昨涨停溢价）；p10: M2 回溯诊断 as_of 模式（截断快照+回溯声明段）；p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
+	analysisPromptVersion   = "p13" // p13: P3a 机构观点 org_view 段（评级分布/评级变动/目标价偏离/调研密度）进个股 guidance + trade_plan 机构目标价对照锚；p12: M3c 交易员阶段（个股标准分析追加交易计划二次调用+量化仓位公式，计划价位与仓位数字进核验值域）；p11: M3a 市场模块情绪温度计 mood 段（连板分布/炸板率/昨涨停溢价）；p10: M2 回溯诊断 as_of 模式（截断快照+回溯声明段）；p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
 	analysisStrategyVersion = "s1"
 	maxRepairAttempts       = 2 // 结构化校验失败后的额外重试次数（总调用 = 1 + maxRepairAttempts）
 )
@@ -798,6 +798,7 @@ var moduleGuidance = map[string]string{
 - 公告（若快照含 announcements 块）：announcements.items 是该股最近的交易所公告（标题/类型/日期），证据权重高于新闻报道；关注业绩类、股权变动类、重大合同类公告对结论的影响；引用公告只能复述给出的标题与类型，不得臆测公告正文细节；无 announcements 块表示暂未采集到该股公告，不代表没有公告。
 - 风险闸门（快照 risk_gate 块，程序化前置判定，必须遵守）：flags 中 level=block 的条目（ST/退市风险警示）为硬约束——rating 不得为 bullish、不得给出任何买入倾向的表述，并把该风险放在 risks 首条；level=warn（一字板/流动性不足）必须在 risks 中原样提示并约束相关结论（一字板不得按可正常成交分析）；level=info（小市值）在风险中带一句提示。risk_gate.note 声明了未接入的数据维度（质押/解禁等），涉及时照实说「未接入数据，请自行核查」，严禁装作已核查。
 - 财务面（若快照含 finance 块）：finance.latest 是最新一期 F10 主要财务指标（EPS/ROE/营收与净利同比/毛利率/净利率/资产负债率，report 标注报告期），finance.trend 为近几期概要（最早在前），statement_latest（若有）为最新一期三表关键科目（货币资金/存货/总资产/经营现金流净额等，单位亿元）；结合估值水位判断基本面质量与业绩趋势（如高 ROE+低 PE、增速拐点、现金流与净利的背离）；财务为季报口径有滞后性，不代表当下经营；引用只能用给出的数字，值为 0 可能表示上游缺失，不得据此下「归零」结论。无 finance 块表示财务数据暂不可得，如实说明。
+- 机构观点（若快照含 org_view 块）：rating_dist 是近 90/180 天卖方研报评级分布，rating_changes_90d 与 latest_rating_change 是评级变动，target_price 是机构目标价统计（median_vs_price_pct 为中位目标价相对现价的偏离%），survey 是机构调研密度。解读纪律：卖方评级普遍乐观（九成为买入/增持），「多少家买入」本身几乎无信息量，不得以买入家数论证看多；真正有信息量的是评级下调（卖方极少下调，出现即强信号）、目标价中位数与现价的偏离方向、调研批次的环比变化（关注度升温/降温）。目标价样本 count 很小时（1~2 份）须说明代表性有限。无 org_view 块表示该股暂无研报覆盖或数据不可得，不代表机构不看好，如实说明。
 重要限制：财务仅为 F10 摘要与三表关键科目，不含全表明细、机构持仓与个股资金流。news 块的覆盖面有限（快讯与个股新闻采集），没有新闻不代表没有消息。若结论依赖未提供的数据，必须说明「数据缺失、无法判断」，绝不虚构。若快照带 freshness_note，措辞必须体现数据非实时。rating 以技术面为主、财务/估值水位与消息面为辅给出。
 反方视角（必填）：anti_thesis 针对你给出的 rating 论证相反情形（看多时论证为什么现在买入可能是错的，看空/中性亦然）；kill_switches 给出可观察的失效信号（价格/均线/量能等具体条件）；unknowns 列出财务明细、新闻、资金流等本次数据看不到但影响结论的盲区。`,
 

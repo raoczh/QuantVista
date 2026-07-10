@@ -196,6 +196,11 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 				"note":  "该股最近的交易所公告（标题与类型；引用只能复述标题，不得臆测公告正文细节）",
 			}
 		}
+		// P3a 机构观点段：研报评级分布/评级变动/目标价偏离/调研密度（缓存优先，
+		// 缺失按需拉一次）。数值叶子经 snapshotValueSet 自动进核验值域；无数据不注入。
+		if ov := orgViewBrief(ctx, symbol, q.Price); ov != nil {
+			snap["org_view"] = ov
+		}
 	}
 
 	label := q.Name

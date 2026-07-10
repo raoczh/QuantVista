@@ -57,6 +57,8 @@ func AllModels() []any {
 		&MarketMoodDaily{},
 		&FundFlowDaily{},
 		&IntradayFactorDaily{},
+		&ReportRating{},
+		&OrgSurvey{},
 	}
 }
 

@@ -120,7 +120,7 @@ openssl rand -base64 36   # 再生成一个作 ENCRYPTION_KEY
 - `stocks`、`stock_quotes`、`daily_bars`（个股查询/批量同步自动回填）
 - `trading_calendar`（管理端「回填交易日历」一键重建）
 - `market_snapshots`、`data_sync_logs`、`stock_scores`（后台任务自动再生）
-- N/F/M 批次的采集与派生表：新闻（`news_items` 等）、财报/财务（`earnings_*`/`finance_*`）、全市场宽表与状态（`factor_tables`/`market_sync_states`）、龙虎榜/涨停池/人气/资金流/盘中因子（`lhb_*`/`zt_*`/`popularity_*`/`fund_flows`/`intraday_factor_dailies`）——均由每日 job 或按需拉取重建；注意涨停池/盘中因子上游**不可回溯**，重建只能从当天起积累，历史断档是诚实缺失
+- N/F/M 批次的采集与派生表：新闻（`news_items` 等）、财报/财务（`earnings_*`/`finance_*`）、全市场宽表与状态（`factor_tables`/`market_sync_states`）、龙虎榜/涨停池/人气/资金流/盘中因子（`lhb_*`/`zt_*`/`popularity_*`/`fund_flows`/`intraday_factor_dailies`）、机构观点（`report_ratings`/`org_surveys`，P3a 按需拉取缓存）——均由每日 job 或按需拉取重建；注意涨停池/盘中因子上游**不可回溯**，重建只能从当天起积累，历史断档是诚实缺失
 - `llm_call_logs`（LLM 调用审计，90 天滚动自清理；如需长期留存审计证据则纳入备份）
 
 ### 7.2 备份命令

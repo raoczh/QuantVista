@@ -24,6 +24,7 @@ import {
 import { getNews, newsSourceLabel, sentimentTag, type NewsItem } from '@/api/news'
 import { getAnnouncements, type AnnouncementItem } from '@/api/announcement'
 import { getStockFinance, type StockFinance } from '@/api/finance'
+import { getStockOrgView, type StockOrgView } from '@/api/orgview'
 import { useUi, withAlpha } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import { useStockActions } from '@/composables/useStockActions'
@@ -53,6 +54,7 @@ const announcements = ref<AnnouncementItem[]>([])
 const finance = ref<StockFinance | null>(null)
 const fundflow = ref<StockFundFlow | null>(null)
 const lhbRecords = ref<LhbRecord[]>([])
+const orgview = ref<StockOrgView | null>(null)
 
 // 情绪标签（N2）：利好/利空才渲染，颜色随涨跌色主题。
 function sentiView(n: NewsItem): { text: string; color: string } | null {
@@ -119,6 +121,11 @@ async function load(silent = false) {
       getStockLhb(market.value, symbol.value, 10)
         .then((r) => (lhbRecords.value = r))
         .catch(() => (lhbRecords.value = []))
+      // 机构观点（P3a）：按需拉取+缓存，首次访问可能为空（下轮自动刷新补上）；
+      // 现价随行情带过去用于目标价偏离计算。
+      getStockOrgView(market.value, symbol.value, quote.value?.price)
+        .then((r) => (orgview.value = r))
+        .catch(() => (orgview.value = null))
     }
     // 指标副图 / 筹码分布 best-effort：失败时 K 线退回单图、筹码卡显示占位。
     getIndicators(market.value, symbol.value, 120)
@@ -431,6 +438,40 @@ function streakText(ff: StockFundFlow) {
   return '—'
 }
 
+/* 机构观点展示辅助（P3a） */
+const ovTp = computed(() => orgview.value?.summary?.target_price || null)
+const ovSv = computed(() => orgview.value?.summary?.survey || null)
+const ovLc = computed(() => orgview.value?.summary?.latest_rating_change || null)
+const ovDistText = computed(() => {
+  const d = orgview.value?.summary?.rating_dist_90d
+  if (!d || !d.total) return ''
+  const names: Array<[string, string]> = [
+    ['buy', '买入'],
+    ['overweight', '增持'],
+    ['neutral', '中性'],
+    ['reduce', '减持'],
+    ['sell', '卖出'],
+    ['other', '其他'],
+  ]
+  return names
+    .filter(([k]) => d[k])
+    .map(([k, label]) => `${label} ${d[k]}`)
+    .join(' · ')
+})
+const ovChgText = computed(() => {
+  const c = orgview.value?.summary?.rating_changes_90d
+  if (!c) return ''
+  return `上调 ${c.upgrades} · 下调 ${c.downgrades} · 首次 ${c.first_covers}`
+})
+function ratingChangeMark(rc: number): { text: string; dir: number } | null {
+  if (rc === 0) return { text: '上调', dir: 1 }
+  if (rc === 1) return { text: '下调', dir: -1 }
+  return null
+}
+function fmtSignedPct(v: number) {
+  return (v > 0 ? '+' : '') + v.toFixed(1)
+}
+
 watch(isDark, () => {
   renderChart()
   renderChipCharts()
@@ -446,6 +487,7 @@ watch([market, symbol], () => {
   finance.value = null
   fundflow.value = null
   lhbRecords.value = []
+  orgview.value = null
   news.value = []
   announcements.value = []
   load()
@@ -724,6 +766,52 @@ function scoreType(total: number) {
           <n-empty v-else description="暂无财务数据（东财 F10，A 股标的；首次访问自动拉取，可稍后刷新）" />
         </SectionCard>
 
+        <!-- 机构观点（P3a）：研报评级分布/变动/目标价 + 机构调研；按需拉取首访可能为空 -->
+        <SectionCard v-if="market === 'cn' && !isFund" title="机构观点">
+          <template #extra>
+            <span class="src-hint">东财研报/调研 · 汇总窗口 90/180 天</span>
+          </template>
+          <div v-if="orgview && (orgview.reports.length || orgview.surveys.length)" class="ov-wrap">
+            <div v-if="orgview.summary" class="quote-grid ov-grid">
+              <div v-if="ovDistText" class="qc"><span class="qc-k">评级分布(90天)</span><span class="qc-v">{{ ovDistText }}</span></div>
+              <div v-if="ovChgText" class="qc"><span class="qc-k">评级变动(90天)</span><span class="qc-v">{{ ovChgText }}</span></div>
+              <div v-if="ovTp" class="qc">
+                <span class="qc-k">目标价中位({{ ovTp.count }}份)</span>
+                <span class="qc-v qv-tnum">{{ ovTp.median.toFixed(2) }}<span v-if="ovTp.median_vs_price_pct != null" :style="{ color: pctColor(ovTp.median_vs_price_pct) }">（{{ fmtSignedPct(ovTp.median_vs_price_pct) }}%）</span></span>
+              </div>
+              <div v-if="ovSv" class="qc"><span class="qc-k">调研批次(30/90天)</span><span class="qc-v qv-tnum">{{ ovSv.batches_30d }} / {{ ovSv.batches_90d }}</span></div>
+            </div>
+            <div v-if="ovLc" class="ov-change">
+              最近评级变动：<span class="qv-tnum">{{ ovLc.date }}</span> {{ ovLc.org }}
+              <span :style="{ color: pctColor(ovLc.kind === '上调' ? 1 : -1), fontWeight: 600 }">{{ ovLc.kind }}</span>
+              （{{ ovLc.from }} → {{ ovLc.to }}）
+            </div>
+            <div v-if="orgview.reports.length" class="lhb-list">
+              <div v-for="(r, i) in orgview.reports" :key="i" class="lhb-row">
+                <span class="news-time qv-tnum">{{ r.report_date }}</span>
+                <span class="ov-org">{{ r.org_name }}</span>
+                <span class="ov-rating">
+                  {{ r.rating || '未评级' }}<template v-if="ratingChangeMark(r.rating_change)"><span :style="{ color: pctColor(ratingChangeMark(r.rating_change)!.dir) }">（{{ ratingChangeMark(r.rating_change)!.text }}）</span></template><span v-else-if="r.rating_change === 2" class="lhb-note">（首次）</span>
+                </span>
+                <span v-if="r.target_price" class="lhb-num qv-tnum">目标 {{ r.target_price.toFixed(2) }}</span>
+                <span class="ov-title" :title="r.title">{{ r.title }}</span>
+              </div>
+            </div>
+            <div v-if="orgview.surveys.length" class="ov-svy">
+              <div class="ov-svy-head">机构调研</div>
+              <div v-for="(s, i) in orgview.surveys" :key="i" class="lhb-row">
+                <span class="news-time qv-tnum">{{ s.survey_date }}</span>
+                <span class="lhb-num qv-tnum">{{ s.org_count }} 家机构</span>
+                <span class="ov-title" :title="s.org_names">{{ s.org_names }}<span v-if="s.receive_way" class="lhb-note">（{{ s.receive_way }}）</span></span>
+              </div>
+            </div>
+            <div class="src-hint">
+              卖方研报评级普遍乐观（九成为买入/增持），更有参考价值的是评级下调、目标价与现价的偏离、调研密度变化；目标价样本少时代表性有限；仅研究参考。
+            </div>
+          </div>
+          <n-empty v-else description="暂无机构观点数据（研报/调研覆盖 A 股，首次访问自动拉取，可稍后刷新）" />
+        </SectionCard>
+
         <!-- 公告（F1）：东财公告源，标题链到原文；采集范围外的股查询时按需补拉 -->
         <SectionCard title="公告">
           <div v-if="announcements.length" class="news-list">
@@ -950,6 +1038,47 @@ function scoreType(total: number) {
 @media (max-width: 768px) {
   .fin-chart {
     height: 240px;
+  }
+}
+
+/* ---------- 机构观点 ---------- */
+.ov-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.ov-grid {
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+}
+.ov-change {
+  font-size: 13px;
+}
+.ov-org {
+  flex-shrink: 0;
+  font-size: 13px;
+  min-width: 72px;
+}
+.ov-rating {
+  flex-shrink: 0;
+  font-size: 13px;
+}
+.ov-title {
+  flex: 1;
+  min-width: 200px;
+  font-size: 13px;
+  line-height: 1.55;
+  opacity: 0.85;
+  overflow-wrap: anywhere;
+}
+.ov-svy-head {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+@media (max-width: 768px) {
+  .ov-title {
+    flex-basis: 100%;
+    order: 5;
   }
 }
 .score {
