@@ -119,13 +119,20 @@
 | 实时行情 | 腾讯 | `qt.gtimg.cn/q=` | ✅ 已接入（2.4） |
 | 东财负载节点 | 东财 | `{1..99}.push2.eastmoney.com` | ✅ 已采纳（2.5） |
 | 板块/榜单 | 东财 | `{n}.push2.eastmoney.com/api/qt/clist/get` | ✅ 已用（best-effort，限流时降级） |
-| 个股资金流 | 同花顺 | `data.10jqka.com.cn/funds/ggzjl/...` | ⏳ 待办：有 JS/cookie 反爬（hexin-v token），Go 复刻成本高，资金流卡片暂占位 |
-| 行业/概念资金流 | 同花顺 | `data.10jqka.com.cn/funds/hyzjl|gnzjl/...` | ⏳ 同上 |
-| 千股千评/市场情绪 | 东财 | `stock_comment_em` 系列 | ⏳ 候选，做市场情绪卡片时接 |
+| 5 分钟线（盘中因子） | 腾讯 | `ifzq.gtimg.cn/appstock/app/kline/mkline` | ✅ 已接入（M3b，`tencent_mkline.go`，count≤800≈18 交易日） |
+| 财务三表/F10/财报日历/公告 | 东财 | `datacenter.eastmoney.com`（RPT_* 报表族） | ✅ 已接入（F1/F2，`emdatacenter.go` 网关 QPS≤2） |
+| 龙虎榜/机构席位 | 东财 | datacenter `RPT_DAILYBILLBOARD_DETAILSNEW` 等 | ✅ 已接入（M3a，`emlhb.go`） |
+| 涨停池/连板/炸板情绪 | 东财 | `push2ex.eastmoney.com/getTopicZTPool` 族 | ✅ 已接入（M3a，`eastmoney_ztpool.go`，不可回溯靠每日快照积累） |
+| 股吧人气榜 | 东财 | `emappdata.eastmoney.com` 人气榜 | ✅ 已接入（M3a） |
+| 个股/两市资金流 | 东财 | clist f62 族排行 + `push2his` fflow/daykline 单股历史 | ✅ 已接入（M3a，`eastmoney_fflow.go`，规避了同花顺反爬） |
+| 板块热度榜/成分股/板块指数 | 东财 | clist fs=m:90 + secid=90.BKxxxx kline | ✅ 已接入（M3b/M3c，`eastmoney_board.go`） |
+| 快讯/个股新闻 | 财联社 + 东财 | `/v1/roll/get_roll_list`（sign 双哈希）+ 东财快讯/search-api | ✅ 已接入（N1，`cls.go`/`eastmoney_news.go`） |
+| 个股资金流 | 同花顺 | `data.10jqka.com.cn/funds/ggzjl/...` | ❌ 放弃：hexin-v 反爬成本高，已改走东财 f62 族（上行） |
+| 千股千评 | 东财 | `stock_comment_em` 系列 | ⏳ 候选（市场情绪已由涨停池/人气榜覆盖大半，边际收益低） |
 | 热搜榜 | 百度 | `stock_hot_search_baidu` | ⏳ 候选 |
 | 个股榜单 | 腾讯 | `proxy.finance.qq.com/cgi/.../getBoardRankList` | ⏳ 候选（参数待调） |
 
-> 资金流的反爬（同花顺 hexin-v）是接入门槛最高的一项，做"资金流"卡片前需专门处理 cookie/token 流程，或改用东财资金流 clist 字段（`f62` 等）规避。
+> 资金流的反爬（同花顺 hexin-v）已绕开：M3a 用东财资金流（clist `f62` 族 + push2his fflow 单股历史）实现，同花顺路线放弃。
 
 ### 6.1 稳定性分级（实测结论）
 
@@ -137,16 +144,16 @@
 
 > 一句话：**稳定免维护的只有东财/新浪/腾讯三个行情源（已接入）**；要扩更多数据类型，优先用同属东财、免 token 的 `data.eastmoney.com`，扛住限流即可；巨潮/雪球/同花顺都带鉴权门槛，按需再接。
 
-## 7. 待 Tushare / 新闻源解锁的功能清单（2026-07-03 起 UI 一律隐藏，不留占位）
+## 7. 待 Tushare / 新闻源解锁的功能清单（2026-07-09 更新：多数已由东财/财联社免 token 路线实现）
 
-> 约定：**凡必须 Tushare（或稳定新闻源）才能做的功能，接入前不在前端展示任何占位/敬请期待**，避免"看得见用不了"。接入后按本清单逐项恢复。当前唯一曾可见的占位——首页「财经新闻 / AI 今日观点」卡——已于 2026-07-03 隐藏（`web/src/pages/Home.vue` 资金流向卡上方注释处，恢复时改回两列布局）。
+> 原约定：**凡必须 Tushare（或稳定新闻源）才能做的功能，接入前不在前端展示任何占位/敬请期待**。2026-07 起 N/F/M 批次用东财 datacenter + 财联社免 token 路线实现了原清单大部分项，Tushare 至今未成为任何功能的前置依赖。
 
-| 功能 | 依赖 | 恢复位置 |
+| 功能 | 原依赖 | 状态 |
 | --- | --- | --- |
-| 财经新闻 / 新闻情绪分析 | 稳定新闻源（或 Tushare 资讯类接口） | 首页两列布局第二列（Home.vue 资金流向卡注释处）；阶段 8「新闻情绪分析」 |
-| 财务数据详情（PE/PB/三表） | Tushare 低 cost 档（2000 分） | 个股详情/横向对比加财务行；长线推荐候选池基本面富化 |
-| 财报日历 / 临近财报待办 | Tushare 财报披露日期 | 今日待办「临近财报」类型；自选/持仓行财报临近标记 |
-| 复权因子（corporate_actions） | Tushare 复权因子接口 | 推荐追踪/评分改用后复权序列（见 ROADMAP 边界区「追踪复权」） |
-| 回测模块 | 依赖复权后 daily_bars（同上） | 阶段 8 回测 |
+| 财经新闻 / 新闻情绪分析 | 稳定新闻源 | ✅ 已实现（N1/N2：财联社+东财源，`/news` 页 + LLM 情绪增强，免 Tushare） |
+| 财务数据详情（三表/F10） | Tushare 低 cost 档 | ✅ 已实现（F1/F2：东财 datacenter + emweb 三表，个股详情财务块 + 长线推荐 fin 富化） |
+| 财报日历 / 临近财报待办 | Tushare 财报披露日期 | ✅ 已实现（F1：东财预约披露/业绩预告/快报，earn_date/earn_fcst 提醒类型） |
+| 回测模块 | 复权后 daily_bars | ✅ 已实现（M2 时光机：东财前复权 + 复权自洽校验 adjustSuspect 剔除断层股） |
+| 复权因子（corporate_actions） | Tushare 复权因子接口 | ⏳ 仍未建：现行方案为东财前复权 + 除权检测整股重锚（M1），彻底解法仍需复权因子表（见 ROADMAP 边界区「追踪复权」） |
 
 > 注意：AI 提示词层面的数据边界声明（如问答页"仅依据行情与技术指标（无财务/新闻）回答"）**不是占位、不隐藏**——那是反编造的如实标注，接入财务数据后同步更新措辞。

@@ -352,9 +352,27 @@ Go API Server
 - 清理过期缓存。
 - 生成每日市场摘要，后续可选。
 
+### 5.10 扩展模块（N/F/T/S/M 批次 + 2026-07 杂项批）
+
+M3c 前各批次陆续落地的独立 service 模块（详细交付记录见 [DEVELOPMENT_PLAN](DEVELOPMENT_PLAN.md)，接口速查见 REFERENCE_ANALYSIS §6）：
+
+- **news / newsai / newsevent**（N1/N2）：7×24 快讯采集（采集间隔管理后台可配 1~120 分钟，自调度循环下一轮生效）+ LLM 情绪增强（个股关联/利好利空/当日聚合情绪分；「自动 LLM 分析」总闸关闭时走纯关键词规则零 token）+ 事件抽取；`/news` 页与个股详情消息面卡。
+- **finance / finance_f10**（F1/F2）：东财财务三表摘要（ROE/营收净利增速/毛利率）+ F10 公告列表，入推荐长线候选与个股详情。
+- **factortable / 指标计算**（T1）：MACD/BOLL/KDJ 等指标递推、筹码峰分布（成本分布累积）、五维技术评分，供个股详情图与推荐量化评分。
+- **screener**（S1）：21 个内置策略选股（均线/突破/超跌/财务质量等可组合），`/screener` 页。
+- **backtest**（S1）：策略历史时点选股回测（时光机），`/backtest` 页。
+- **mood / marketwide**（M1）：市场情绪快照（涨跌家数/涨停池/炸板率）与全市场宽度数据。
+- **fundflow / emlhb**（M3a）：主力资金流（个股+两市）、龙虎榜（净买额/机构席位）、股吧人气榜，入推荐加分项与个股详情。
+- **intraday**（M3b）：腾讯 5 分钟线盘中因子（尾盘拉升/跳水/VWAP 偏离/重心上移），入短线推荐加分。
+- **board**（M3b/M3c）：东财板块热度榜与板块详情（成分股联动），`/heatmap` 与 `/boards/:code` 页。
+- **analysis_trader**（M3c）：个股标准分析自动附加交易计划（买点/止盈/止损/仓位，评级偏空与风险闸门 block 零成本拒绝）。
+- **llm_call_log**（2026-07 杂项批）：全用户 LLM 调用审计，见 §6.9。
+
 ## 6. AI 调用设计
 
 > **HTTP 客户端加固（2026-07-03，参照 new-api 中继实践）**：`service/ai_client.go` 复用包级连接池（allowPrivate 两态各一个 client，repair/panel 连发请求不再重复 TLS 握手）；瞬时失败单次重试（未达上游的网络错误、429/500/502/503；504 视为真超时不重试，退避 800ms）；错误按状态码归类中文提示（401/403 密钥无效、404 路径或模型不存在、429 限流、5xx 上游异常）并透传上游 error.message；上游不回 usage 时按字符粗估（≈2 字符/token）兜底作审计。单次调用超时 90s，与前端 AI 请求 5 分钟窗口配合（最多 1+2 次 repair）。
+>
+> **双端点类型（2026-07-09）**：LLM 配置新增 `endpoint_type`（`chat_completions` 默认 / `responses`）。`responses` 走 `ai_client_responses.go` 按 new-api relayconvert 口径适配 `/v1/responses`（system→instructions 合并、messages→input、max_tokens→max_output_tokens、response_format→text.format、output 取 message+assistant 的 output_text、usage input/output_tokens 映射；流式按事件 type 分派）。两端点共用 `chatCompletion`/`chatCompletionStream` 入口，对 caller 透明。
 
 ### 6.1 推荐流程（四阶段流水线，2026-07-04 重构；2026-07-06 来源随策略组合）
 
@@ -397,8 +415,8 @@ value=**低PB榜**(升序滤负PB)+成交额；growth=涨幅+换手+成交额；
 
 1. 用户指定的本次调用配置。
 2. 用户默认 LLM 配置。
-
->（原设计的第 3 级「系统默认 LLM 配置」未实现：当前无系统级共享渠道，用户未配置任何 LLM 时直接提示先去设置。个人自用下可接受，多用户开放前再评估。）
+3. 系统回退配置（2026-07-09 落地）：用户一个配置都没有时，回退到管理后台指定的回退配置（`llm_fallback_config_id`，0=自动取首个启用管理员的默认配置）。受「LLM 回退」总闸（`llm_fallback_enabled`，缺省开）控制，关闸时保持「请先在设置中添加」引导；次数配额仍按发起用户计；内网放行按配置所有者判定（`llmAllowPrivate`）。
+   - `resolveSystemFallbackConfig` 统一「系统默认 LLM」语义：用户回退与新闻情绪分析等后台任务共用；指定配置须仍存在且所有者为启用管理员，失效静默回落自动档。后台任务不受回退总闸控制（新闻有自己的 `news_auto_llm` 总闸），token 记账归配置所有者。
 
 ### 6.4 上下文预算（硬约束）
 
@@ -410,7 +428,7 @@ value=**低PB榜**(升序滤负PB)+成交额；growth=涨幅+换手+成交额；
 
 - 优先 provider 的 **function calling / JSON mode / response schema**；不支持的 provider fallback 到“prompt 约束 + 文本解析”。
 - 统一 **JSON Schema 校验**；失败做**有限次 repair 重试**（错误回灌），仍失败则**优雅降级**（文本可读、recommendations 置空、标记 `partial`），不写脏数据。
-- 校验结果、重试次数、降级状态写 `ai_call_logs`。
+- 每次真实上游调用（含 repair 各轮）落 `llm_call_logs` 审计（见 §6.9）。
 
 ### 6.6 版本与可复现
 
@@ -431,6 +449,15 @@ value=**低PB榜**(升序滤负PB)+成交额；growth=涨幅+换手+成交额；
 - **数据透明**：喂给模型的数据快照落库（`data_snapshot`/`candidate_pool`/`filters_json`），前端提供透明面板（候选池全景/分析快照查看），用户可肉眼对照模型引用。
 - **prompt 三件套**：①强制 evidence 引用字段名+数值并明示「系统会程序化核对」（威慑）；②禁先验记忆条款（名气/行业地位/新闻记忆都不算数据）；③允许拒选/如实说明数据不足（解析层用指针语义区分「缺字段」与「显式空」，空≠错误）。
 - **工程约定**：LLM 输出的整数字段一律 `FlexInt`（容忍 72.5/"80"）；prompt/策略改动递增版本号落库；新旧记录兼容靠 `omitempty` + 前端逐字段 `v-if` 兜底。
+
+### 6.9 调用审计（2026-07 杂项批）
+
+全用户 LLM 调用明细落 `llm_call_logs` 表：`chatCompletion`/`chatCompletionStream` 是全链路仅有的两个上游出口，defer 埋点全覆盖（responses 端点走同两个入口天然覆盖）。每行记录发起用户/模块（analysis、analysis_review、trade_plan、recommendation、rec_review、qa、compare、daily_report、news、test）/配置与 provider/model/端点类型/流式标记/成功失败与错误信息/token 三项/耗时/**请求与响应全文**（TEXT，>60KB UTF-8 安全截断）。
+
+- repair/panel 的每轮真实调用各落一行（真实调用次数审计，特性而非重复）；新闻等后台任务记配置所有者；测试连接（`module=test`）不走 chat 出口、自行埋点。
+- 写失败仅 SysWarn 不影响主流程；`common.DB` 为空直接跳过（直调 ai_client 的单测不受影响）。
+- 管理端 `GET /api/admin/llm-calls`（列表显式排除两 TEXT 列防大响应，user/module/status 筛选+分页）与 `/api/admin/llm-calls/:id`（全文详情），仅 AdminAuth；前端 `/admin/llm-calls` 页。**请求正文含用户数据（持仓、自选等），仅管理员可见。**
+- 每日 03:25 清理 90 天前记录。
 
 ## 7. 数据缓存策略
 
@@ -459,8 +486,8 @@ AI 结果：
 - API Key 加密保存；加密**主密钥**独立管理（环境变量/KMS），支持轮换。
 - 用户配置 Base URL 时做 SSRF 防护（禁内网地址、协议白名单、解析后再校验）。
 - 数据源 URL 需要白名单或管理员审核。
-- AI 调用做频率限制、每用户配额和成本统计。
-- 敏感操作（改 API Key、改数据源 URL）写**审计日志**（`audit_logs` 未建，个人自用降级为规划项；多用户开放前须补）。
+- AI 调用做频率限制、每用户配额和成本统计；全量调用审计（`llm_call_logs`，§6.9）仅管理员可见。
+- 敏感操作（改 API Key、改数据源 URL）写**审计日志**（操作类 `audit_logs` 未建，个人自用降级为规划项；LLM 调用审计已落地，多用户开放前须补操作审计）。
 - 股票推荐页面固定展示免责声明。
 
 ## 9. 前端页面结构
@@ -468,7 +495,12 @@ AI 结果：
 实际路由（`web/src/router/index.ts`）：
 
 - `/`：市场首页
+- `/news`：市场快讯（新闻情绪流，N1/N2）
 - `/stocks/:market/:symbol`：个股详情（行情/日K/估值/评分 + 快捷动作，2026-07-03；首页榜单行与个股速查可点击进入，`useStockActions.goDetail` 供各处复用）
+- `/screener`：策略选股（21 策略组合筛选，S1）
+- `/backtest`：回测时光机（S1）
+- `/heatmap`：行业热力图（M3b）
+- `/boards/:code`：板块详情（M3c）
 - `/daily-report`：收盘日报（今日复盘 + 明日推荐，2026-07-03；`GET/POST /api/daily-reports*` 端点，交易日 15:35 后 `StartDailyReportJobs` 自动生成、手动重生成限流 5/min；首页「AI 今日观点」卡展示最新摘要）
 - `/login`（+ `/login/callback` OAuth 回调）、`/setup`：登录 / 首启建管理员
 - `/today`：今日待办/待复盘
@@ -485,7 +517,8 @@ AI 结果：
 - `/notes`：投资笔记
 - `/prompt-templates`：自定义分析提示词模板（用户菜单进入）
 - `/settings`：设置（LLM/偏好/AI 用量/账号安全）
-- `/admin`：管理员后台
+- `/admin`：管理员后台（注册开关/新闻采集/LLM 回退/GitHub 凭证/用户与配额/同步日志）
+- `/admin/llm-calls`：LLM 调用审计记录（筛选+分页+全文详情，2026-07 杂项批）
 
 ## 10. MVP 边界
 
