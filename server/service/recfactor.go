@@ -491,10 +491,10 @@ type evidenceCheck struct {
 
 var evidenceNumRe = regexp.MustCompile(`[-+]?\d+(?:\.\d+)?`)
 
-// 惯用窗口/参数整数中 >99 的部分（MA120、250 日年线、百分位 100）；
+// 惯用窗口/参数整数中 >99 的部分（MA120、180 日机构观点窗、250 日年线、百分位 100）；
 // ≤99 的整数已由 verifyEvidence 的小整数规则整体跳过。
 var evidenceNoiseInts = map[float64]bool{
-	100: true, 120: true, 250: true,
+	100: true, 120: true, 180: true, 250: true,
 }
 
 // candidateValueSet 汇总一只候选可被引用的全部数值（含亿元换算），供证据核验比对。
