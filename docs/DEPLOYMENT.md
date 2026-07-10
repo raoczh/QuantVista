@@ -84,18 +84,28 @@ openssl rand -base64 36   # 再生成一个作 ENCRYPTION_KEY
 
 所以日常加字段/加表 = 改好 model 代码、构建、重启即可，**无需手动动数据库**。涉及改类型/删列这类，才需要在代码里补一段迁移逻辑。
 
-## 5. 与 new-api 并存注意
+## 5. 系统配置（管理后台，运行时可改）
+
+以下配置存 `options` 表、管理后台改动即时生效，**不需要改环境变量或重启**：
+
+- **注册策略**：开放/关闭 GitHub 新用户注册。
+- **GitHub 登录**：Client ID / Secret（secret 加密落库；`deploy/.env` 里的同名变量仅作首启种子）。
+- **新闻采集**：快讯轮询间隔（1~120 分钟，默认 5，下一轮生效）；「自动 LLM 分析」总闸（关闭时新闻情绪走纯关键词规则，零 token）。
+- **LLM 回退**：「允许回退」总闸（未配置 LLM 的用户自动用系统回退配置，次数配额仍记本人）；指定回退配置（0=自动取首个启用管理员的默认配置；该配置同时是新闻情绪分析等后台任务的系统默认 LLM，后台任务不受总闸影响）。
+- **LLM 调用审计**：无开关，全量落 `llm_call_logs`（请求/响应全文，仅管理员经 `/admin/llm-calls` 可见），每日 03:25 自动清理 90 天前记录。
+
+## 6. 与 new-api 并存注意
 
 - 端口：new-api 用 `3001`，QuantVista 用 `3002`，不冲突。
 - Redis：各自独立容器（`redis` vs `quantvista-redis`），不共用，避免 key 混淆。
 - 网络：共用宝塔的 `baota_net` 外部网络。
 - 数据库：同一个 MySQL 实例下不同库（`new-api` vs `quantvista`）。
 
-## 6. 数据备份与恢复
+## 7. 数据备份与恢复
 
 个人自用部署，数据全在 MySQL 单库 `quantvista`；容器与镜像可随时重建，**只有数据库需要备份**。
 
-### 6.1 表的两类：必须备份 vs 可重建
+### 7.1 表的两类：必须备份 vs 可重建
 
 **用户数据表（必须备份——丢了无法找回）：**
 
@@ -110,9 +120,10 @@ openssl rand -base64 36   # 再生成一个作 ENCRYPTION_KEY
 - `stocks`、`stock_quotes`、`daily_bars`（个股查询/批量同步自动回填）
 - `trading_calendar`（管理端「回填交易日历」一键重建）
 - `market_snapshots`、`data_sync_logs`、`stock_scores`（后台任务自动再生）
-- `data_source_configs`（当前无读写方）
+- N/F/M 批次的采集与派生表：新闻（`news_items` 等）、财报/财务（`earnings_*`/`finance_*`）、全市场宽表与状态（`factor_tables`/`market_sync_states`）、龙虎榜/涨停池/人气/资金流/盘中因子（`lhb_*`/`zt_*`/`popularity_*`/`fund_flows`/`intraday_factor_dailies`）——均由每日 job 或按需拉取重建；注意涨停池/盘中因子上游**不可回溯**，重建只能从当天起积累，历史断档是诚实缺失
+- `llm_call_logs`（LLM 调用审计，90 天滚动自清理；如需长期留存审计证据则纳入备份）
 
-### 6.2 备份命令
+### 7.2 备份命令
 
 ```bash
 # 全库备份（最简单，推荐；行情缓存表体积有限，一起备份省心）
@@ -129,7 +140,7 @@ docker exec mysql mysqldump -uquantvista -p'密码' --single-transaction quantvi
 
 宝塔用户也可直接用面板的「数据库 → 备份」定时任务（等效全库 dump）。
 
-### 6.3 恢复
+### 7.3 恢复
 
 ```bash
 gunzip < qv-2026-07-03.sql.gz | docker exec -i mysql mysql -uquantvista -p'密码' quantvista
