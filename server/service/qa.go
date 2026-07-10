@@ -41,7 +41,7 @@ type QaAskRequest struct {
 }
 
 // QaConversationView 会话 + 消息列表。RiskFlags 为快照 risk_gate 的程序化风险标志
-//（S1：详情不回传大快照，风险标志单独解析回传供 UI 展示）。
+// （S1：详情不回传大快照，风险标志单独解析回传供 UI 展示）。
 type QaConversationView struct {
 	model.AiConversation
 	Messages  []model.AiConversationMessage `json:"messages"`
@@ -49,7 +49,7 @@ type QaConversationView struct {
 }
 
 // qaAskContext 一次提问的准备产物：prepare 与 finalize 之间的共享状态
-//（流式与非流式两条路径共用同一套准备/收尾，保证快照、核验、落库口径完全一致）。
+// （流式与非流式两条路径共用同一套准备/收尾，保证快照、核验、落库口径完全一致）。
 type qaAskContext struct {
 	conv     model.AiConversation
 	isNew    bool
@@ -70,6 +70,7 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 		BaseURL: ac.cfg.BaseURL, APIKey: ac.apiKey, Model: ac.cfg.Model, EndpointType: ac.cfg.EndpointType,
 		Temperature: ac.cfg.Temperature, MaxTokens: ac.cfg.MaxTokens,
 		Messages: ac.messages, JSONMode: false, AllowPrivate: llmAllowPrivate(allowPrivate, ac.cfg),
+		Meta: chatMeta{CallerUserID: userID, Module: "qa", ConfigID: ac.cfg.ID, Provider: ac.cfg.Provider},
 	})
 	if callErr != nil {
 		s.abortNewConv(ac)
@@ -90,6 +91,7 @@ func (s *QaService) AskStream(ctx context.Context, userID int64, allowPrivate bo
 		BaseURL: ac.cfg.BaseURL, APIKey: ac.apiKey, Model: ac.cfg.Model, EndpointType: ac.cfg.EndpointType,
 		Temperature: ac.cfg.Temperature, MaxTokens: ac.cfg.MaxTokens,
 		Messages: ac.messages, JSONMode: false, AllowPrivate: llmAllowPrivate(allowPrivate, ac.cfg),
+		Meta: chatMeta{CallerUserID: userID, Module: "qa", ConfigID: ac.cfg.ID, Provider: ac.cfg.Provider},
 	}
 	var res *chatResult
 	var callErr error
@@ -152,8 +154,8 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 		symbol, market, _ := normalizeSymbolMarket(req.Symbol, req.Market)
 		conv = model.AiConversation{
 			UserID: userID, Symbol: symbol, Market: market, Name: name,
-			Title:         truncateRunes(question, 128),
-			LLMConfigID:   cfg.ID, Provider: cfg.Provider, Model: cfg.Model,
+			Title:       truncateRunes(question, 128),
+			LLMConfigID: cfg.ID, Provider: cfg.Provider, Model: cfg.Model,
 			PromptVersion: qaPromptVersionFor(userID),
 			DataSnapshot:  string(snapJSON),
 		}
@@ -261,8 +263,8 @@ func qaConversationFromAnalysis(userID, recordID int64, cfg *model.LLMConfig, qu
 	}
 	conv := &model.AiConversation{
 		UserID: userID, Symbol: rec.Symbol, Market: rec.Market, Name: name,
-		Title:         truncateRunes(question, 128),
-		LLMConfigID:   cfg.ID, Provider: cfg.Provider, Model: cfg.Model,
+		Title:       truncateRunes(question, 128),
+		LLMConfigID: cfg.ID, Provider: cfg.Provider, Model: cfg.Model,
 		PromptVersion: qaPromptVersionFor(userID),
 		DataSnapshot:  rec.DataSnapshot,
 	}

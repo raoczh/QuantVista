@@ -328,6 +328,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				admin.PUT("/users/:id/status", adminCtl.SetUserStatus)
 				admin.GET("/users/:id/quota", adminCtl.GetUserQuota)
 				admin.PUT("/users/:id/quota", adminCtl.UpdateUserQuota)
+				admin.GET("/llm-calls", adminCtl.ListLLMCalls)
+				admin.GET("/llm-calls/:id", adminCtl.GetLLMCall)
 
 				// 数据源健康端点（S1 健康滑窗：每 (源,能力) success/empty/error 与冷却状态）
 				admin.GET("/datasources", marketCtl.DataSources)

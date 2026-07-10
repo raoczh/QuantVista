@@ -55,6 +55,7 @@ func main() {
 	service.StartFinanceJobs(mgr)
 	service.StartMoodJobs()
 	service.StartIntradayJobs()
+	service.StartLLMLogJobs()
 
 	if !common.DebugEnabled {
 		gin.SetMode(gin.ReleaseMode)

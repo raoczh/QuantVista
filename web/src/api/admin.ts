@@ -77,3 +77,39 @@ export interface SyncLog {
 export function listSyncLogs(limit = 50) {
   return request<SyncLog[]>({ url: '/admin/market/sync-logs', params: { limit } })
 }
+
+// ---------- LLM 调用审计 ----------
+
+export interface LLMCallLogItem {
+  id: number
+  user_id: number
+  username: string
+  module: string
+  llm_config_id: number
+  provider: string
+  model: string
+  endpoint_type: string
+  stream: boolean
+  status: string // success / error
+  error_msg: string
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  latency_ms: number
+  request_body: string // 仅详情接口返回，列表恒为空
+  response_body: string
+  created_at: string
+}
+
+export interface LLMCallLogList {
+  items: LLMCallLogItem[]
+  total: number
+}
+
+export function listLlmCalls(params: { user_id?: number; module?: string; status?: string; page?: number; page_size?: number }) {
+  return request<LLMCallLogList>({ url: '/admin/llm-calls', params })
+}
+
+export function getLlmCall(id: number) {
+  return request<LLMCallLogItem>({ url: `/admin/llm-calls/${id}` })
+}
