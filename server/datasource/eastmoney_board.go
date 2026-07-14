@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // 东财板块（clist）——M3c 行业热力图 + 板块详情页数据源。
@@ -19,6 +20,8 @@ const (
 	boardHeatFields   = "f12,f14,f3,f6,f104,f105,f128,f140"
 	boardHeatPageSize = 100
 	boardStockFields  = "f12,f14,f2,f3,f6,f8,f20,f21"
+	boardListMaxPages = 10 // 行业/概念各约 496 个 ≈ 5 页，留余量防上游 total 异常翻页失控
+	boardListPageGap  = 200 * time.Millisecond
 )
 
 // boardFS 板块种类白名单 → clist fs 过滤串。
@@ -120,6 +123,120 @@ func (e *EastMoneyAdapter) GetBoardKline(ctx context.Context, code string, limit
 		bars[i].Source = e.Name()
 	}
 	return bars, nil
+}
+
+// GetBoardFundFlow 板块资金流逐日历史（升序，P3b）。与个股 fflow/daykline 同一接口、
+// 同 15 列结构（2026-07-10 实测 secid=90.BK1036：date,主力,小,中,大,超大,5×占比%,
+// Close=板块指数点位,涨跌幅,0,0），直接复用 parseStockFundFlow（同包，勿复制粘贴）。
+// 走 push2his（无备用域，断路器熔断纪律同个股；本机限流属常态，LIVE 冒烟留部署环境）。
+func (e *EastMoneyAdapter) GetBoardFundFlow(ctx context.Context, code string, limit int) ([]StockFundFlowBar, error) {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	if !bkCodeRe.MatchString(code) {
+		return nil, ErrSymbolInvalid
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 250
+	}
+	url := fmt.Sprintf(
+		"https://%d.push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?secid=90.%s&lmt=%d&klt=101&fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65&ut=%s",
+		emNode(), code, limit, fflowUT,
+	)
+	body, status, err := e.get(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
+	}
+	return parseStockFundFlow(body)
+}
+
+// BoardListItem 板块清单轻行（P3b 估值聚合的行业名→BK 码映射用）。
+type BoardListItem struct {
+	Code string `json:"code"`
+	Name string `json:"name"`
+}
+
+// GetBoardList 拉全某类板块的代码与名称（f12,f14 轻字段；fid=f12 升序稳定翻页，
+// 行业约 496 个 ≈ 5 页）。翻页纪律同 GetCNSpotSnapshot：半截清单拒收（估值聚合
+// 用它建行业名→BK 码映射，缺一半会让一半行业静默跳过）。
+func (e *EastMoneyAdapter) GetBoardList(ctx context.Context, kind string) ([]BoardListItem, error) {
+	fs, ok := boardFS[kind]
+	if !ok {
+		return nil, ErrSymbolInvalid
+	}
+	all := make([]BoardListItem, 0, 512)
+	total := 0
+	for pn := 1; pn <= boardListMaxPages; pn++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		url := fmt.Sprintf(
+			"https://%d.push2.eastmoney.com/api/qt/clist/get?pn=%d&pz=%d&po=0&np=1&fid=f12&fltt=2&invt=2&ut=%s&fs=%s&fields=f12,f14",
+			emNode(), pn, boardHeatPageSize, clistUT, fs,
+		)
+		body, status, err := e.get(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
+		}
+		if status != http.StatusOK {
+			return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
+		}
+		rows, pageTotal, err := parseBoardList(body)
+		if err != nil {
+			return nil, err
+		}
+		if pageTotal > 0 {
+			total = pageTotal
+		}
+		if len(rows) == 0 {
+			break // 空页=翻完
+		}
+		all = append(all, rows...)
+		if total > 0 && len(all) >= total {
+			break
+		}
+		time.Sleep(boardListPageGap)
+	}
+	if len(all) == 0 {
+		return nil, ErrNoData
+	}
+	if total > 0 && len(all) < total*9/10 {
+		return nil, fmt.Errorf("%w: 板块清单不完整 %d/%d", ErrUpstream, len(all), total)
+	}
+	return all, nil
+}
+
+// parseBoardList 解析板块清单一页（抽出便于单测）。返回 (rows, total, err)。
+func parseBoardList(body []byte) ([]BoardListItem, int, error) {
+	var parsed struct {
+		Data struct {
+			Total int `json:"total"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, 0, fmt.Errorf("%w: 解析失败 %v", ErrUpstream, err)
+	}
+	items, err := clistDiffItems(body)
+	if err != nil {
+		return nil, 0, err
+	}
+	rows := make([]BoardListItem, 0, len(items))
+	for _, it := range items {
+		var b struct {
+			F12 string `json:"f12"`
+			F14 string `json:"f14"`
+		}
+		if json.Unmarshal(it, &b) != nil {
+			continue
+		}
+		code := strings.TrimSpace(b.F12)
+		if code == "" {
+			continue
+		}
+		rows = append(rows, BoardListItem{Code: code, Name: strings.TrimSpace(b.F14)})
+	}
+	return rows, parsed.Data.Total, nil
 }
 
 // clistDiffItems 解析 clist 的 data.diff 为原始 map 序列（兼容数组与 {"0":{...}} 对象两形态，

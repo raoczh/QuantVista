@@ -21,7 +21,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	adminSvc := service.NewAdminService()
 	watchlistSvc := service.NewWatchlistService(marketSvc)
 	positionSvc := service.NewPositionService(marketSvc)
-	analysisSvc := service.NewAnalysisService(marketSvc, watchlistSvc, positionSvc, llmSvc)
+	boardSvc := service.NewBoardService() // 在 analysisSvc 之前创建（P3b：板块分析注入板块资金流）
+	analysisSvc := service.NewAnalysisService(marketSvc, watchlistSvc, positionSvc, llmSvc, boardSvc)
 	recommendationSvc := service.NewRecommendationService(marketSvc, watchlistSvc, llmSvc)
 	trackingSvc := service.NewTrackingService(marketSvc)
 	alertSvc := service.NewAlertService(marketSvc)
@@ -43,7 +44,6 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	screenerSvc := service.NewScreenerService()
 	backtestSvc := service.NewBacktestService(marketSvc)
 	moodSvc := service.NewMoodService()
-	boardSvc := service.NewBoardService()
 	orgViewSvc := service.NewOrgViewService()
 
 	// controllers
@@ -119,9 +119,11 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			markets.GET("/:market/stocks/:symbol/lhb", moodCtl.StockLhb)
 			// P3a：机构观点（研报评级/机构调研，按需拉取+缓存）
 			markets.GET("/:market/stocks/:symbol/orgview", orgViewCtl.StockOrgView)
-			// M3c：行业/概念板块热力图 + 板块详情（指数日线 + 成分股）
+			// M3c：行业/概念板块热力图 + 板块详情（指数日线 + 成分股 + 估值）
 			markets.GET("/:market/boards", boardCtl.Heatmap)
 			markets.GET("/:market/boards/:code", boardCtl.Detail)
+			// P3b：板块资金流历史（上游透传+短缓存不落库）
+			markets.GET("/:market/boards/:code/fundflow", boardCtl.FundFlow)
 		}
 
 		// 需登录

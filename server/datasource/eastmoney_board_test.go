@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -141,6 +142,92 @@ func TestGetBoardKlineParse(t *testing.T) {
 	}
 }
 
+// P3b：板块资金流复用 parseStockFundFlow（15 列与个股同构，Close=板块指数点位），
+// 这里对拍列序 + 校验 secid=90.<code> 拼接与 BK 码拒绝路径。
+func TestGetBoardFundFlow(t *testing.T) {
+	e := NewEastMoneyAdapter()
+	var gotURL string
+	e.SetFetchForTest(func(ctx context.Context, url string, h map[string]string) ([]byte, int, error) {
+		gotURL = url
+		return []byte(`{"data":{"klines":[
+"2026-07-09,1230000000.0,-340000000.0,-890000000.0,450000000.0,780000000.0,3.21,-0.89,-2.32,1.17,2.04,1687.45,1.25,0.0,0.0",
+"2026-07-10,-560000000.0,120000000.0,440000000.0,-260000000.0,-300000000.0,-1.55,0.33,1.22,-0.72,-0.83,1671.02,-0.97,0.0,0.0"
+]}}`), 200, nil
+	})
+	bars, err := e.GetBoardFundFlow(context.Background(), "BK1036", 250)
+	if err != nil {
+		t.Fatalf("GetBoardFundFlow: %v", err)
+	}
+	if !strings.Contains(gotURL, "secid=90.BK1036") {
+		t.Fatalf("secid 拼接错误: %s", gotURL)
+	}
+	if len(bars) != 2 {
+		t.Fatalf("bars = %d, want 2", len(bars))
+	}
+	b0 := bars[0]
+	if b0.TradeDate != "2026-07-09" || b0.MainNet != 1230000000.0 || b0.SmallNet != -340000000.0 ||
+		b0.MediumNet != -890000000.0 || b0.LargeNet != 450000000.0 || b0.SuperNet != 780000000.0 ||
+		b0.MainPct != 3.21 || b0.Close != 1687.45 || b0.ChangePct != 1.25 {
+		t.Fatalf("15 列列序对拍失败: %+v", b0)
+	}
+}
+
+func TestGetBoardFundFlowRejectsBadCode(t *testing.T) {
+	e := NewEastMoneyAdapter()
+	e.SetFetchForTest(func(ctx context.Context, url string, h map[string]string) ([]byte, int, error) {
+		t.Fatal("非法 code 不应触网")
+		return nil, 0, nil
+	})
+	for _, bad := range []string{"", "BK123", "90.BK1036", "SZ1036"} {
+		if _, err := e.GetBoardFundFlow(context.Background(), bad, 250); !errors.Is(err, ErrSymbolInvalid) {
+			t.Errorf("code=%q 应 ErrSymbolInvalid, got %v", bad, err)
+		}
+	}
+}
+
+// P3b：板块清单翻页（估值聚合的行业名→BK 码映射源）。
+func TestGetBoardListPaged(t *testing.T) {
+	e := NewEastMoneyAdapter()
+	pages := map[string]string{
+		"pn=1": `{"data":{"total":3,"diff":[{"f12":"BK1036","f14":"半导体"},{"f12":"BK0447","f14":"银行"}]}}`,
+		"pn=2": `{"data":{"total":3,"diff":[{"f12":"BK0428","f14":"电力行业"}]}}`,
+	}
+	e.SetFetchForTest(func(ctx context.Context, url string, h map[string]string) ([]byte, int, error) {
+		for k, v := range pages {
+			if strings.Contains(url, k+"&") {
+				return []byte(v), 200, nil
+			}
+		}
+		return []byte(`{"data":{"total":3,"diff":[]}}`), 200, nil
+	})
+	rows, err := e.GetBoardList(context.Background(), "industry")
+	if err != nil {
+		t.Fatalf("GetBoardList: %v", err)
+	}
+	if len(rows) != 3 || rows[0].Code != "BK1036" || rows[2].Name != "电力行业" {
+		t.Fatalf("翻页聚合错误: %+v", rows)
+	}
+}
+
+// 半截清单拒收：total=100 只拿到 2 条 → 整轮失败（映射缺一半会静默丢行业）。
+func TestGetBoardListRejectsPartial(t *testing.T) {
+	e := NewEastMoneyAdapter()
+	calls := 0
+	e.SetFetchForTest(func(ctx context.Context, url string, h map[string]string) ([]byte, int, error) {
+		calls++
+		if calls == 1 {
+			return []byte(`{"data":{"total":100,"diff":[{"f12":"BK1036","f14":"半导体"},{"f12":"BK0447","f14":"银行"}]}}`), 200, nil
+		}
+		return []byte(`{"data":{"total":100,"diff":[]}}`), 200, nil
+	})
+	if _, err := e.GetBoardList(context.Background(), "industry"); err == nil {
+		t.Fatal("半截清单应整轮拒收")
+	}
+	if _, err := e.GetBoardList(context.Background(), "sector"); !errors.Is(err, ErrSymbolInvalid) {
+		t.Fatalf("非法 kind 应 ErrSymbolInvalid, got %v", err)
+	}
+}
+
 // LIVE_BOARD=1 真实冒烟（push2his 本机常被限流，默认跳过；照 LIVE_MOOD/LIVE_INTRADAY 门控）。
 func TestLiveBoard(t *testing.T) {
 	if os.Getenv("LIVE_BOARD") != "1" {
@@ -167,4 +254,16 @@ func TestLiveBoard(t *testing.T) {
 		t.Fatalf("GetBoardKline(%s): %v", code, err)
 	}
 	t.Logf("%s 指数日线 %d 根，末根 %s 收 %.2f", code, len(bars), bars[len(bars)-1].TradeDate, bars[len(bars)-1].Close)
+	// P3b：板块清单 + 板块资金流。
+	list, err := e.GetBoardList(context.Background(), "industry")
+	if err != nil {
+		t.Fatalf("GetBoardList: %v", err)
+	}
+	t.Logf("行业板块清单 %d 个", len(list))
+	flows, err := e.GetBoardFundFlow(context.Background(), code, 30)
+	if err != nil {
+		t.Fatalf("GetBoardFundFlow(%s): %v", code, err)
+	}
+	last := flows[len(flows)-1]
+	t.Logf("%s 资金流 %d 根，末根 %s 主力 %.2f 亿 收 %.2f", code, len(flows), last.TradeDate, last.MainNet/1e8, last.Close)
 }

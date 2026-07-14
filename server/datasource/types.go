@@ -67,7 +67,14 @@ type SpotRow struct {
 	Volume       int64   `json:"volume"`     // 手
 	Amount       float64 `json:"amount"`
 	TurnoverRate float64 `json:"turnover_rate"` // %
-	DataTime     int64   `json:"data_time"`     // f124 行情时间戳（unix 秒；停牌股为旧值）
+	// 估值与行业（P3b 扩展，f9/f115/f23/f100，2026-07-10 实测锚定）：估值字段亏损为负、
+	// 缺失/停牌为 0，消费方按 >0 过滤；Industry 为东财行业板块名（与 m:90+t:2 行业板块
+	// f14 名精确匹配），退市壳票上游给 "-" 已归一为空串。
+	PE       float64 `json:"pe"`     // 市盈率（动，f9）
+	PETTM    float64 `json:"pe_ttm"` // 市盈率（TTM，f115）
+	PB       float64 `json:"pb"`     // 市净率（f23）
+	Industry string  `json:"industry"`
+	DataTime int64   `json:"data_time"` // f124 行情时间戳（unix 秒；停牌股为旧值）
 }
 
 // Fundamental 基本面摘要（骨架占位，阶段 4/5 扩展）。

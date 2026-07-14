@@ -16,9 +16,12 @@ import (
 // 不含北交所（cnSecid 不识别、日线拉不了、推荐链路也排除，见 DEVELOPMENT_PLAN M1）。
 // 上游把 pz 硬钳制在 100（2026-07-08 实测：pz=6000 只回 100 行），必须按页翻：
 // 约 5500 只 ≈ 56 页；fid=f12 按代码升序保证翻页稳定（涨跌幅序盘中会漂移导致重复/漏行）。
+// 估值字段（P3b 板块估值聚合，2026-07-10 实测锚定）：f9=市盈率(动) / f115=市盈率(TTM) /
+// f23=市净率 / f100=东财行业板块名（与 m:90+t:2 行业板块 f14 名精确匹配，抽样 110/110；
+// 退市壳票 f100 与估值字段全为 "-"，emNum 容错为 0，聚合侧按 >0 过滤自然排除）。
 const (
 	clistSpotFS     = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
-	clistSpotFields = "f12,f14,f2,f3,f5,f6,f8,f15,f16,f17,f18,f124"
+	clistSpotFields = "f12,f14,f2,f3,f5,f6,f8,f9,f15,f16,f17,f18,f23,f100,f115,f124"
 	clistPageSize   = 100
 	clistMaxPages   = 80 // 5535/100=56 页，留余量；防上游 total 异常时翻页失控
 	clistPageGap    = 200 * time.Millisecond
@@ -105,10 +108,14 @@ func parseClistSpot(body []byte) ([]SpotRow, int, error) {
 		F5   json.RawMessage `json:"f5"`
 		F6   json.RawMessage `json:"f6"`
 		F8   json.RawMessage `json:"f8"`
+		F9   json.RawMessage `json:"f9"`
 		F15  json.RawMessage `json:"f15"`
 		F16  json.RawMessage `json:"f16"`
 		F17  json.RawMessage `json:"f17"`
 		F18  json.RawMessage `json:"f18"`
+		F23  json.RawMessage `json:"f23"`
+		F100 string          `json:"f100"`
+		F115 json.RawMessage `json:"f115"`
 		F124 json.RawMessage `json:"f124"`
 	}
 	var items []emSpot
@@ -148,11 +155,18 @@ func parseClistSpot(body []byte) ([]SpotRow, int, error) {
 		vol, _ := emNum(it.F5)
 		amount, _ := emNum(it.F6)
 		turnover, _ := emNum(it.F8)
+		pe, _ := emNum(it.F9)
 		high, _ := emNum(it.F15)
 		low, _ := emNum(it.F16)
 		open, _ := emNum(it.F17)
 		prevClose, _ := emNum(it.F18)
+		pb, _ := emNum(it.F23)
+		peTTM, _ := emNum(it.F115)
 		ts, _ := emNum(it.F124)
+		industry := strings.TrimSpace(it.F100)
+		if industry == "-" {
+			industry = "" // 退市壳票行业名占位符归一为空（同价格字段容错语义）
+		}
 		rows = append(rows, SpotRow{
 			Symbol:       sym,
 			Name:         strings.TrimSpace(it.F14),
@@ -165,6 +179,10 @@ func parseClistSpot(body []byte) ([]SpotRow, int, error) {
 			Volume:       int64(vol),
 			Amount:       amount,
 			TurnoverRate: turnover,
+			PE:           pe,
+			PETTM:        peTTM,
+			PB:           pb,
+			Industry:     industry,
 			DataTime:     int64(ts),
 		})
 	}

@@ -41,15 +41,16 @@ type AnalysisService struct {
 	watchlist *WatchlistService
 	position  *PositionService
 	llm       *LLMService
+	board     *BoardService // P3b：板块模块注入 board_flow 段（估值段直接查库）
 }
 
-func NewAnalysisService(market *MarketService, watchlist *WatchlistService, position *PositionService, llm *LLMService) *AnalysisService {
-	return &AnalysisService{market: market, watchlist: watchlist, position: position, llm: llm}
+func NewAnalysisService(market *MarketService, watchlist *WatchlistService, position *PositionService, llm *LLMService, board *BoardService) *AnalysisService {
+	return &AnalysisService{market: market, watchlist: watchlist, position: position, llm: llm, board: board}
 }
 
 // 版本号：数据快照 + 这两个版本号共同保证「凭版本号复现」。改 prompt/策略时递增。
 const (
-	analysisPromptVersion   = "p13" // p13: P3a 机构观点 org_view 段（评级分布/评级变动/目标价偏离/调研密度）进个股 guidance + trade_plan 机构目标价对照锚；p12: M3c 交易员阶段（个股标准分析追加交易计划二次调用+量化仓位公式，计划价位与仓位数字进核验值域）；p11: M3a 市场模块情绪温度计 mood 段（连板分布/炸板率/昨涨停溢价）；p10: M2 回溯诊断 as_of 模式（截断快照+回溯声明段）；p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
+	analysisPromptVersion   = "p14" // p14: P3b 板块模块 board_valuation（中位 PE/PB+横截面/时序分位+积累天数）与 board_flow（板块主力资金）两段进 sector guidance；p13: P3a 机构观点 org_view 段（评级分布/评级变动/目标价偏离/调研密度）进个股 guidance + trade_plan 机构目标价对照锚；p12: M3c 交易员阶段（个股标准分析追加交易计划二次调用+量化仓位公式，计划价位与仓位数字进核验值域）；p11: M3a 市场模块情绪温度计 mood 段（连板分布/炸板率/昨涨停溢价）；p10: M2 回溯诊断 as_of 模式（截断快照+回溯声明段）；p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
 	analysisStrategyVersion = "s1"
 	maxRepairAttempts       = 2 // 结构化校验失败后的额外重试次数（总调用 = 1 + maxRepairAttempts）
 )
@@ -812,14 +813,16 @@ var moduleGuidance = map[string]string{
 若某些数据块标注为不可用(unavailable)或缺失（如无 mood 块），请指出该维度暂缺、结论相应保留。
 反方视角（必填）：anti_thesis 论证与你主结论相反的市场情形（如判断偏暖时论证情绪可能只是脉冲）；kill_switches 用指数关键位、涨跌家数逆转、资金流转向、连板高度断层等可观察信号描述结论何时失效；unknowns 指出宏观政策、外盘、增量资金来源等数据盲区。`,
 
-	model.AnalysisModuleSector: `本次分析对象是【板块轮动】。可用数据：板块涨跌榜（含领涨股）、主要指数、市场涨跌家数情绪。
+	model.AnalysisModuleSector: `本次分析对象是【板块轮动】。可用数据：板块涨跌榜（含领涨股）、主要指数、市场涨跌家数情绪；若用户指定的关注板块匹配到行业板块，还会提供 board_valuation（板块估值聚合）与 board_flow（板块主力资金）两块数据。
 请从以下维度分析：
 - 板块强弱排序：当日领涨与领跌板块，强弱分化程度；
 - 轮动方向：结合板块涨跌与领涨股，判断资金在向哪些方向切换；
 - 相对大盘：强势板块相对指数的超额表现；
+- 板块估值（若有 board_valuation 块）：median_pe_ttm/median_pb 是板块内正样本中位市盈率(TTM)/市净率（pos_pe_count 为 PE 样本数、stock_count 为板块总数），pct_rank 是当日该板块中位 PE 在全部行业板块中的横截面百分位（越高越贵，-1 表示算不出），hist_pct_rank 是其在自身近 hist_days 日历史中的时序百分位——hist_days 少（如 <60）时时序分位无代表性，必须声明积累天数不足、只用横截面分位；估值是静态水位不是买卖依据，高估值板块可能因高景气而合理；
+- 板块资金（若有 board_flow 块）：main_net_1d/5d/10d/20d_yi 为板块主力净额（亿元），streak_days 正=连续净流入天数、负=连续净流出，days 为近 10 日逐日明细（close 为板块指数点位）；主力净额与涨跌配合判断资金驱动还是情绪驱动，背离（涨但主力持续流出）须提示；
 - 持续性提示：仅凭单日数据能说到什么程度要如实说明，不夸大趋势延续性。
-若用户指定了关注板块(focus)，请重点围绕它、并与榜单上其他板块横向对比；若榜单中没有该板块数据，请明确指出无法定位并只做大盘层面的板块结构分析。
-反方视角（必填）：anti_thesis 论证当日强势板块为何可能只是一日游、轮动判断可能错在哪；kill_switches 给出板块相对大盘走弱等失效信号；unknowns 指出板块内个股资金明细、板块基本面与消息面等盲区。`,
+若用户指定了关注板块(focus)，请重点围绕它、并与榜单上其他板块横向对比；若榜单中没有该板块数据，请明确指出无法定位并只做大盘层面的板块结构分析；无 board_valuation/board_flow 块表示该板块非行业板块（概念板块暂无估值聚合）或数据未积累，如实说明该维度缺失，严禁虚构板块估值或资金数字。
+反方视角（必填）：anti_thesis 论证当日强势板块为何可能只是一日游、轮动判断可能错在哪；kill_switches 给出板块相对大盘走弱、主力资金转向流出等失效信号；unknowns 指出板块内个股资金明细、板块基本面与消息面等盲区。`,
 
 	model.AnalysisModuleWatchlist: `本次分析对象是【用户的自选股清单】。数据：每个标的的名称、代码、所属分组、是否重点关注、实时现价与涨跌幅，以及用户填写的关注原因与备注。
 请从以下维度分析：

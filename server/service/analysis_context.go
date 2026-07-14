@@ -324,6 +324,20 @@ func (s *AnalysisService) buildSectorContext(ctx context.Context, market, target
 		"indices": compactIndices(ov.Indices),
 		"breadth": ov.Breadth,
 	}
+	// P3b：focus 名精确匹配到行业板块（估值聚合表 board_name）时注入两段板块级数据。
+	// 概念板块/未匹配自然缺席，guidance 已声明按缺失处理；数值叶子经 snapshotValueSet
+	// 自动进核验值域，无需手工登记。
+	if bv, code := boardValuationByName(strings.TrimSpace(target)); bv != nil {
+		snap["board_valuation"] = bv
+		if s.board != nil {
+			// 资金流只取近 10 日 + 汇总（板块级证据足够，控制快照预算）。
+			fctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+			if ff, err := s.board.FundFlow(fctx, code, 10); err == nil && len(ff.Days) > 0 {
+				snap["board_flow"] = ff
+			}
+			cancel()
+		}
+	}
 	if len(ov.Sectors) == 0 {
 		return nil, errors.New("板块数据暂不可用（数据源繁忙），请稍后重试")
 	}
