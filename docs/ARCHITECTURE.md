@@ -7,7 +7,7 @@ QuantVista 采用前后端分离的全栈架构：
 ```text
 Vue 前端
   |
-  | REST（当前全部为 REST；SSE/WebSocket 为可扩展方向，未使用）
+  | REST 为主；个股问答走 NDJSON 流式（S1），推荐/日报生成为异步任务+轮询（§6.10）
   v
 Go API Server
   |
@@ -26,33 +26,11 @@ Go API Server
   +-- 外部 LLM Provider
 ```
 
-## 2. 参考 new-api 的结论
+## 2. 参考 new-api 的结论（历史决策记录）
 
-`new-api` 参考项目当前是 Go 后端项目，核心技术包括：
+后端工程组织（Controller/Service/Model 分层、`router`/`middleware`/`setting`/`common` 划分）、鉴权、系统设置、任务、AI 渠道管理均参照 `new-api`（Go + Gin + GORM + Redis + JWT/OAuth）落地；前端未复用其 React 组件，独立建 Vue 3 项目（API 契约框架无关）。此节仅存档立项决策，当前结构以仓库代码为准。
 
-- Gin
-- GORM
-- Redis
-- JWT / OAuth
-- Controller / Service / Model 分层
-- 配置管理
-- 日志
-- 中间件
-- AI Provider / Channel 管理
-- 前端静态资源托管
-
-它的新前端位于 `web/default`，技术栈是 React + Rsbuild + TanStack Router，不是 Vue。
-
-本项目建议：
-
-- 后端工程组织、鉴权、设置、日志、任务、缓存、AI 渠道管理参考 `new-api`。
-- 前端重新建立 Vue 3 项目，不直接复用 React 组件。
-- API 契约保持框架无关，因此 Vue 前端没有技术栈兼容问题。
-- 如果后端沿用 Go + Gin，只要返回 JSON / SSE，Vue、React 或其他前端都可以正常接入。
-
-## 3. 后端技术栈
-
-推荐：
+## 3. 后端技术栈（已定型）
 
 - 语言：Go
 - Web 框架：Gin
@@ -64,20 +42,7 @@ Go API Server
 - 日志：结构化日志
 - 配置：环境变量 + 数据库配置
 
-可从 `new-api` 借鉴：
-
-- `router/`：路由组织
-- `middleware/`：鉴权、限流、日志、CORS
-- `controller/`：请求处理
-- `service/`：业务逻辑
-- `model/`：GORM 模型
-- `setting/`：系统配置
-- `oauth/`：OAuth Provider 设计
-- `common/`：缓存、工具、校验、HTTP 客户端
-
-## 4. 前端技术栈
-
-推荐：
+## 4. 前端技术栈（已定型）
 
 - Vue 3
 - Vite
@@ -195,7 +160,7 @@ Go API Server
 - 拉取行情、指数、板块、新闻、财务和宏观数据。
 - 标准化不同数据源格式。
 - 缓存热点行情。
-- 记录数据更新时间和数据源状态（数据源健康状态落库为**规划项**：`data_source_configs` 表已建，manager 回写与管理端查询未接，当前排查靠日志）。
+- 记录数据更新时间和数据源健康状态（S1 落地：每（源,能力）健康滑窗，empty/error 超阈值冷却踢出轮询，`GET /api/admin/datasources` 查看；早期规划的 `data_source_configs` 配置表已确认为死表删除）。
 
 **数据适配/标准化层（关键设计）**：
 
@@ -215,16 +180,15 @@ Go API Server
 - 新增数据源 = 新增一个 Adapter 实现，不改上层。
 - **MVP 只实现一个市场、一个源**的原则已按此落地：当前东财→腾讯→新浪三源互备，仅覆盖 A 股沪深（含沪深 ETF/LOF 场内基金）。
 - 每条数据携带 `source` 与 `data_time`；同步失败写 `data_sync_logs`。
-- 日线行情写入 `daily_bars`（OHLC），供追踪与回撤计算使用；公司行为写 `corporate_actions` 用于复权。
+- 日线行情写入 `daily_bars`（OHLC，东财前复权主源），供追踪、因子宽表与回撤计算使用；`corporate_actions` 复权因子表未建，现行方案为除权检测+整股重锚（见 ROADMAP 边界区）。
 - **Tushare 分档接入**：第一阶段以东财 + 新浪为主，Tushare 非前置；免费档（120，股票清单/日线/交易日历）与低 cost 档（2000，财务三表/复权因子/指数日线，长线财务深度来源）按需启用，高级档（5000，分钟线/融资融券明细等）暂不实现。详见 [数据源选型](docs/DATA_SOURCES.md)。
 
 接口示例（与实际路由一致；行情为公开端点、带宽松限流）：
 
 - `GET /api/markets/:market/overview`
-- `GET /api/markets/:market/stocks/:symbol/quote`
-- `GET /api/markets/:market/stocks/:symbol/bars`
-- `GET /api/markets/:market/stocks/:symbol/score`
--（fundamentals / news 待外部数据源，未实现）
+- `GET /api/markets/:market/stocks/:symbol/{quote,bars,score,indicators,chips,finance,fundflow,lhb,orgview}`（行情/日线/评分/技术指标/筹码/财务/主力资金/龙虎榜/机构观点）
+- `GET /api/markets/:market/boards`、`GET /api/markets/:market/boards/:code{,/fundflow}`（板块热度/详情/资金流）
+- `GET /api/news?symbol=&source=&limit=`、`GET /api/announcements`（新闻与公告）
 
 ### 5.3 Watchlist Service
 
@@ -239,7 +203,7 @@ Go API Server
 - `GET /api/watchlists`
 - `POST /api/watchlists`
 - `POST /api/watchlists/:id/items`
-- `PATCH /api/watchlist-items/:id`
+- `PUT /api/watchlist-items/:id`（另有 `/:id/stage` 研究阶段、`/missed` 错过复盘）
 - `DELETE /api/watchlist-items/:id`
 
 ### 5.4 Portfolio Service
@@ -333,12 +297,12 @@ Go API Server
 - `GET/POST /api/notify-channels`，`PUT/DELETE /api/notify-channels/:id`，`POST /api/notify-channels/:id/test`
 - `GET/PUT /api/admin/users/:id/quota`（管理员查看/调整用户 AI 次数上限、手工清零已用量；2026-07-03 起配额为次数制，token 仅审计）
 - `GET /api/export/:kind`（kind=positions|watchlist|recommendations|analyses，CSV 带 BOM，限流 10/min）
--（数据源配置管理端为规划项：`data_source_configs` 表已建、未接管理端）
+- `GET /api/admin/datasources`（数据源健康滑窗状态，S1；`data_source_configs` 死表已删，数据源无用户级配置）
 
 ### 5.8.1 条件提醒与命中事件（阶段 7 + 批次 H）
 
 - `GET/POST /api/alerts`，`PUT/DELETE /api/alerts/:id`，`PUT /api/alerts/:id/status`（暂停/恢复），`POST /api/alerts/evaluate`（手动评估，限流 20/min）
-- 提醒类型 kind：price（到价）/ pct_change（异动）/ ma（均线）/ breakout（突破）/ **volume_surge**（当日量≥N 倍 20 日均量）/ **amplitude**（当日振幅，优先腾讯估值源、缺则 (high-low)/prev_close 回退）
+- 提醒类型 kind：price（到价）/ pct_change（异动）/ ma（均线）/ breakout（突破）/ **volume_surge**（当日量≥N 倍 20 日均量）/ **amplitude**（当日振幅，优先腾讯估值源、缺则 (high-low)/prev_close 回退）/ **earn_date**（财报披露临近 ≤N 日，F1）/ **earn_fcst**（新业绩预告发布，F1）——财报两类不走盘中 15min 评估，由 finance job 每日一评
 - 命中明细状态机（`alert_events`，unread/read/dismissed）：`GET /api/alerts/events?status=&limit=`，`PUT /api/alerts/events/:id/status`，`PUT /api/alerts/events/read-all`
 - 今日待办（`GET /api/todos`）的提醒条目即 unread 事件，`ref_id` 为事件 id，可就地标记已读/忽略「完成待办」
 
@@ -352,20 +316,22 @@ Go API Server
 - 清理过期缓存。
 - 生成每日市场摘要，后续可选。
 
-### 5.10 扩展模块（N/F/T/S/M 批次 + 2026-07 杂项批）
+### 5.10 扩展模块（N/F/T/S/M/P3 批次 + 2026-07 杂项批）
 
-M3c 前各批次陆续落地的独立 service 模块（详细交付记录见 [DEVELOPMENT_PLAN](DEVELOPMENT_PLAN.md)，接口速查见 REFERENCE_ANALYSIS §6）：
+各批次陆续落地的独立 service 模块（批次交付记录见 [DEVELOPMENT_PLAN](DEVELOPMENT_PLAN.md)，接口速查见 REFERENCE_ANALYSIS §6）：
 
 - **news / newsai / newsevent**（N1/N2）：7×24 快讯采集（采集间隔管理后台可配 1~120 分钟，自调度循环下一轮生效）+ LLM 情绪增强（个股关联/利好利空/当日聚合情绪分；「自动 LLM 分析」总闸关闭时走纯关键词规则零 token）+ 事件抽取；`/news` 页与个股详情消息面卡。
-- **finance / finance_f10**（F1/F2）：东财财务三表摘要（ROE/营收净利增速/毛利率）+ F10 公告列表，入推荐长线候选与个股详情。
-- **factortable / 指标计算**（T1）：MACD/BOLL/KDJ 等指标递推、筹码峰分布（成本分布累积）、五维技术评分，供个股详情图与推荐量化评分。
-- **screener**（S1）：21 个内置策略选股（均线/突破/超跌/财务质量等可组合），`/screener` 页。
-- **backtest**（S1）：策略历史时点选股回测（时光机），`/backtest` 页。
-- **mood / marketwide**（M1）：市场情绪快照（涨跌家数/涨停池/炸板率）与全市场宽度数据。
-- **fundflow / emlhb**（M3a）：主力资金流（个股+两市）、龙虎榜（净买额/机构席位）、股吧人气榜，入推荐加分项与个股详情。
+- **finance / finance_f10**（F1/F2）：财报日历/业绩预告/快报增量刷新 + F10 主要财务指标与三大报表关键科目按需缓存 + 公告采集，入个股详情财务块、长线推荐 fin 因子、财报提醒。
+- **indicator / chip**（T1）：MACD/BOLL/RSI/ATR 纯函数指标库（Wilder 口径）、筹码峰三角衰减复算、五维技术评分升级，供个股详情副图与推荐量化评分。
+- **riskgate / breaker / health**（S1）：风险闸门（ST/一字板/流动性/小市值进 AI prompt 与前端标签）、东财 push2 族域名断路器、数据源健康滑窗；问答流式输出同批。
+- **marketwide / factortable / screener**（M1）：全市场日线地基（宇宙字典/历史初始化/除权双层检测重锚）、52 因子列式宽表、条件树 DSL 选股（21 内置白话策略+自定义策略），`/screener` 页；策略信号进推荐候选池。
+- **backtest / analysis_asof**（M2）：回测时光机（A 股约束五件套/无未来泄露切片复算）、历史推荐批次回验 α 分布、分析 as_of 回溯诊断与 hindsight 事后核验，`/backtest` 页。
+- **mood / fundflow / emlhb**（M3a）：龙虎榜、涨停池/炸板率情绪聚合、股吧人气榜、主力资金流（排行+单股历史），入推荐加分项、市场分析情绪段与个股详情。
 - **intraday**（M3b）：腾讯 5 分钟线盘中因子（尾盘拉升/跳水/VWAP 偏离/重心上移），入短线推荐加分。
-- **board**（M3b/M3c）：东财板块热度榜与板块详情（成分股联动），`/heatmap` 与 `/boards/:code` 页。
+- **board**（M3c/P3b）：东财板块热度榜/成分股/板块指数日线（`/heatmap` 与 `/boards/:code` 页）+ 板块资金流历史透传 + 行业估值聚合（中位 PE/PB 与横截面/时序分位），入板块 AI 分析两段。
 - **analysis_trader**（M3c）：个股标准分析自动附加交易计划（买点/止盈/止损/仓位，评级偏空与风险闸门 block 零成本拒绝）。
+- **orgview**（P3a）：卖方研报评级（分布/变动检测/目标价偏离）与机构调研密度按需缓存，入个股详情与分析/问答证据链。
+- **screener_ai**（P3c）：AI 白话建策略——自然语言解析为条件树（因子字典程序生成、unmatched 兜底禁硬凑、用户确认才落编辑器）。
 - **llm_call_log**（2026-07 杂项批）：全用户 LLM 调用审计，见 §6.9。
 
 ## 6. AI 调用设计
@@ -454,7 +420,7 @@ value=**低PB榜**(升序滤负PB)+成交额；growth=涨幅+换手+成交额；
 
 ### 6.9 调用审计（2026-07 杂项批）
 
-全用户 LLM 调用明细落 `llm_call_logs` 表：`chatCompletion`/`chatCompletionStream` 是全链路仅有的两个上游出口，defer 埋点全覆盖（responses 端点走同两个入口天然覆盖）。每行记录发起用户/模块（analysis、analysis_review、trade_plan、recommendation、rec_review、qa、compare、daily_report、news、test）/配置与 provider/model/端点类型/流式标记/成功失败与错误信息/token 三项/耗时/**请求与响应全文**（TEXT，>60KB UTF-8 安全截断）。
+全用户 LLM 调用明细落 `llm_call_logs` 表：`chatCompletion`/`chatCompletionStream` 是全链路仅有的两个上游出口，defer 埋点全覆盖（responses 端点走同两个入口天然覆盖）。每行记录发起用户/模块（analysis、analysis_review、trade_plan、recommendation、rec_review、qa、compare、daily_report、news、screener_parse、test）/配置与 provider/model/端点类型/流式标记/成功失败与错误信息/token 三项/耗时/**请求与响应全文**（TEXT，>60KB UTF-8 安全截断）。
 
 - repair/panel 的每轮真实调用各落一行（真实调用次数审计，特性而非重复）；新闻等后台任务记配置所有者；测试连接（`module=test`）不走 chat 出口、自行埋点。
 - 写失败仅 SysWarn 不影响主流程；`common.DB` 为空直接跳过（直调 ai_client 的单测不受影响）。
@@ -530,26 +496,3 @@ AI 结果：
 - `/settings`：设置（LLM/偏好/AI 用量/账号安全）
 - `/admin`：管理员后台（注册开关/新闻采集/LLM 回退/GitHub 凭证/用户与配额/同步日志）
 - `/admin/llm-calls`：LLM 调用审计记录（筛选+分页+全文详情，2026-07 杂项批）
-
-## 10. MVP 边界
-
-第一阶段必须实现：
-
-- Vue 前端骨架。
-- Go 后端骨架。
-- GitHub 登录。
-- 用户、设置、自选股、已购入持仓持久化。
-- 市场首页基础数据。
-- LLM 配置和测试连接。
-- AI 分析。
-- 短线/长线推荐。
-- 推荐历史。
-- 用户查询时显示短线止盈、止损、过期状态。
-
-第一阶段暂不强制实现：
-
-- 主动推送提醒。
-- 完整回测系统。
-- 模拟交易排行榜。
-- 多租户计费。
-- 复杂管理员权限系统。
