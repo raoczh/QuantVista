@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,7 +21,10 @@ func resetLLMCallLogs(t *testing.T) {
 	}
 }
 
-// TestLLMCallLog_NonStream 非流式成功/失败各落一行，字段（module/token/正文）完整。
+// TestLLMCallLog_NonStream chatCompletion 出口审计：成功/失败各落一行，字段完整；
+// stream 列必须记录实际请求形态——chatCompletion 默认流式优先（2026-07-14 起），
+// 上游整包返回（假流式）时请求仍是 stream=true 且 first_chunk_ms≈latency_ms 可识别；
+// 上游明确拒绝 stream 时回落非流式，审计记 stream=false。
 func TestLLMCallLog_NonStream(t *testing.T) {
 	setupTestDB(t)
 	resetLLMCallLogs(t)
@@ -45,8 +49,12 @@ func TestLLMCallLog_NonStream(t *testing.T) {
 	if row.UserID != 42 || row.Module != "qa" || row.LLMConfigID != 9 || row.Provider != "openai" || row.Model != "m1" {
 		t.Fatalf("归属字段不符: %+v", row)
 	}
-	if row.EndpointType != model.LLMEndpointChat || row.Stream {
-		t.Fatalf("端点/流式标记不符: endpoint=%q stream=%v", row.EndpointType, row.Stream)
+	// 上游忽略 stream 整包返回：实际请求形态仍是流式，first_chunk_ms 记整包到达时刻。
+	if row.EndpointType != model.LLMEndpointChat || !row.Stream {
+		t.Fatalf("端点/流式标记不符（应记实际请求形态 stream=true）: endpoint=%q stream=%v", row.EndpointType, row.Stream)
+	}
+	if row.FirstChunkMs <= 0 {
+		t.Fatalf("假流式整包返回应记 first_chunk_ms: %+v", row)
 	}
 	if row.Status != model.LLMCallStatusSuccess || row.ErrorMsg != "" {
 		t.Fatalf("成功行状态不符: %+v", row)
@@ -56,6 +64,35 @@ func TestLLMCallLog_NonStream(t *testing.T) {
 	}
 	if !strings.Contains(row.RequestBody, "审计埋点测试") || row.ResponseBody != "ok" {
 		t.Fatalf("请求/响应正文不符: req=%q resp=%q", row.RequestBody, row.ResponseBody)
+	}
+
+	// 上游明确拒绝 stream（4xx 文案含 stream）：回落非流式成功，审计必须记 stream=false。
+	noStreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), `"stream":true`) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"stream mode is not supported"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"plain"}}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`))
+	}))
+	defer noStreamSrv.Close()
+
+	res, err := chatCompletion(context.Background(), chatParams{
+		BaseURL: noStreamSrv.URL, APIKey: "k", Model: "m1",
+		Messages:     []chatMessage{{Role: "user", Content: "hi"}},
+		AllowPrivate: true,
+		Meta:         chatMeta{CallerUserID: 42, Module: "qa", ConfigID: 9, Provider: "openai"},
+	})
+	if err != nil || res.Content != "plain" {
+		t.Fatalf("拒绝 stream 的上游应回落非流式成功: res=%+v err=%v", res, err)
+	}
+	var plainRow model.LLMCallLog
+	if err := common.DB.Order("id desc").First(&plainRow).Error; err != nil {
+		t.Fatalf("回落调用应落审计行: %v", err)
+	}
+	if plainRow.Stream || plainRow.FirstChunkMs != 0 {
+		t.Fatalf("回落非流式应记 stream=false 且无 first_chunk: %+v", plainRow)
 	}
 
 	errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

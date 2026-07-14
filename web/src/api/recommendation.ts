@@ -1,4 +1,4 @@
-import { request, AI_TIMEOUT } from './client'
+import { request } from './client'
 import type { EvidenceCheck, TrustReview } from './trust'
 
 // 信任层类型统一收敛到 trust.ts；此处 re-export 保持既有 import 路径不炸。
@@ -8,7 +8,8 @@ export type PickReview = TrustReview
 export type { TrustReview }
 
 export type RecType = 'short_term' | 'long_term'
-export type RecStatus = 'success' | 'degraded' | 'failed'
+// processing：异步任务化（2026-07-14）——生成接口立即返回任务批次，后台完成后回写。
+export type RecStatus = 'processing' | 'success' | 'degraded' | 'failed'
 export type RecAction = 'buy' | 'watch'
 
 export interface Strategy {
@@ -127,6 +128,8 @@ export interface RecDetail {
   sys_confidence?: 'high' | 'medium' | 'low'
   sys_confidence_why?: string
   review?: PickReview
+  // 非空 = 降级生成（quant_fallback：AI 精选超时后按量化排名规则合成，未经 AI 解读）
+  degraded_source?: string
 }
 
 export type RecOutcome =
@@ -248,8 +251,10 @@ export function listStrategies(type: RecType) {
   return request<Strategy[]>({ url: '/recommendations/strategies', method: 'get', params: { type } })
 }
 
+// 生成推荐。2026-07-14 异步任务化：接口立即返回 processing 批次（建池/评分/AI 精选
+// 在服务端后台执行），轮询 getRecommendation 直到脱离 processing——不再需要超长前端超时。
 export function generateRecommendations(req: RecommendRequest) {
-  return request<RecommendationView>({ url: '/recommendations', method: 'post', data: req, timeout: AI_TIMEOUT })
+  return request<RecommendationView>({ url: '/recommendations', method: 'post', data: req })
 }
 
 export function listRecommendations(type?: string, limit = 30) {
@@ -269,8 +274,9 @@ export function deleteRecommendation(id: number) {
 }
 
 // 手动刷新某批次的推荐追踪状态，返回最新详情（含 status）。
+// 独立 60s 超时：逐条拉日线+实时行情（服务端已并发 4），全局 20s 对多标的批次不够。
 export function trackRecommendation(id: number) {
-  return request<RecommendationView>({ url: `/recommendations/${id}/track`, method: 'post' })
+  return request<RecommendationView>({ url: `/recommendations/${id}/track`, method: 'post', timeout: 60000 })
 }
 
 // 推荐历史表现统计（带样本量）。

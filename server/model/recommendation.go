@@ -7,9 +7,10 @@ const (
 	RecTypeShortTerm = "short_term"
 	RecTypeLongTerm  = "long_term"
 
-	RecStatusSuccess  = "success"  // 生成并校验通过
-	RecStatusDegraded = "degraded" // 有输出但结构化/反编造校验后无有效标的，降级
-	RecStatusFailed   = "failed"   // 调用失败
+	RecStatusProcessing = "processing" // 任务已创建，后台生成中（异步任务化：生成接口立即返回，前端轮询详情）
+	RecStatusSuccess    = "success"    // 生成并校验通过
+	RecStatusDegraded   = "degraded"   // 有输出但校验后无有效标的（宁缺毋滥拒选），或 AI 超时后的量化降级（items 带 degraded_source）
+	RecStatusFailed     = "failed"     // 调用失败
 
 	RecActionBuy   = "buy"   // 可考虑买入
 	RecActionWatch = "watch" // 观察等待

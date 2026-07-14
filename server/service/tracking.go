@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"quantvista/common"
@@ -183,8 +184,10 @@ func (s *TrackingService) RefreshUser(ctx context.Context, userID int64) (int, e
 	}
 	cutoff := time.Now().AddDate(0, 0, -trackWindowDays)
 	var batches []model.RecommendationBatch
-	if err := common.DB.Where("user_id = ? AND status = ? AND created_at >= ?",
-		userID, model.RecStatusSuccess, cutoff).Find(&batches).Error; err != nil {
+	// degraded 一并追踪：AI 超时量化降级的批次同样有条目与规则计划价（老式 degraded
+	// 无条目，读到空列表自然跳过）。
+	if err := common.DB.Where("user_id = ? AND status IN ? AND created_at >= ?",
+		userID, []string{model.RecStatusSuccess, model.RecStatusDegraded}, cutoff).Find(&batches).Error; err != nil {
 		return 0, err
 	}
 	return s.refreshBatches(ctx, batches), nil
@@ -199,8 +202,8 @@ func (s *TrackingService) RefreshBatch(ctx context.Context, userID, batchID int6
 	if err := common.DB.Where("id = ? AND user_id = ?", batchID, userID).First(&batch).Error; err != nil {
 		return 0, errors.New("推荐记录不存在")
 	}
-	if batch.Status != model.RecStatusSuccess {
-		return 0, nil // 无条目可追踪
+	if batch.Status != model.RecStatusSuccess && batch.Status != model.RecStatusDegraded {
+		return 0, nil // 无条目可追踪（processing/failed；老式 degraded 空条目由下游自然跳过）
 	}
 	return s.refreshBatches(ctx, []model.RecommendationBatch{batch}), nil
 }
@@ -232,10 +235,28 @@ func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.Re
 		}
 		recDate := b.CreatedAt.In(time.Local).Format("2006-01-02")
 		bench := getBench(b.Market)
-		for _, rec := range recs {
-			st := s.evaluateOne(ctx, b, rec, recDate, bench)
+		// 条目受控并发评估（2026-07-14）：手动刷新是前端同步等待的操作，逐条串行时
+		// 5 只 × 每只(日线+实时行情)两次上游请求很容易顶到前端超时；并发 4 与数据源
+		// 免费额度平衡。upsert 收集后串行落库（SQLite 测试库不吃写并发）。
+		sem := make(chan struct{}, 4)
+		var wg sync.WaitGroup
+		results := make([]*model.RecommendationStatus, len(recs))
+		for i, rec := range recs {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int, rec model.Recommendation) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				results[i] = s.evaluateOne(ctx, b, rec, recDate, bench)
+			}(i, rec)
+		}
+		wg.Wait()
+		for _, st := range results {
+			if st == nil {
+				continue
+			}
 			if err := s.upsertStatus(st); err != nil {
-				common.SysWarn("追踪落库失败 rec=%d: %v", rec.ID, err)
+				common.SysWarn("追踪落库失败 rec=%d: %v", st.RecommendationID, err)
 				continue
 			}
 			count++

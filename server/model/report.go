@@ -32,7 +32,8 @@ type DailyReport struct {
 }
 
 const (
-	ReportStatusSuccess = "success"
-	ReportStatusPartial = "partial" // 复盘/推荐一方失败
-	ReportStatusFailed  = "failed"
+	ReportStatusProcessing = "processing" // 任务已创建，后台生成中（异步任务化：生成接口立即返回，前端轮询）
+	ReportStatusSuccess    = "success"
+	ReportStatusPartial    = "partial" // 复盘/推荐一方失败
+	ReportStatusFailed     = "failed"
 )

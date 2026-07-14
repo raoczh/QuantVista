@@ -33,13 +33,45 @@ const (
 var (
 	aiClientPublic  = common.SafeHTTPClient(aiCallTimeout, false)
 	aiClientPrivate = common.SafeHTTPClient(aiCallTimeout, true)
+	// 流式专用 client：流式总时长由内容长度决定，client.Timeout（读完 body 才算结束）
+	// 会切断长回答，故不设整体超时；改设 ResponseHeaderTimeout 防连接挂死，
+	// 读取阶段由调用方 context（或 ensureDeadline 兜底）控制。
+	aiStreamClientPublic  = newAIStreamClient(false)
+	aiStreamClientPrivate = newAIStreamClient(true)
 )
+
+func newAIStreamClient(allowPrivate bool) *http.Client {
+	c := common.SafeHTTPClient(0, allowPrivate)
+	if tr, ok := c.Transport.(*http.Transport); ok {
+		tr.ResponseHeaderTimeout = aiCallTimeout
+	}
+	return c
+}
 
 func aiHTTPClient(allowPrivate bool) *http.Client {
 	if allowPrivate {
 		return aiClientPrivate
 	}
 	return aiClientPublic
+}
+
+func aiStreamHTTPClient(allowPrivate bool) *http.Client {
+	if allowPrivate {
+		return aiStreamClientPrivate
+	}
+	return aiStreamClientPublic
+}
+
+// aiStreamMaxDuration 流式调用无 client.Timeout 兜底，若 ctx 也没带 deadline，
+// 由 ensureDeadline 补这个上限，防止对端停止发数据后连接无限悬挂。
+const aiStreamMaxDuration = 10 * time.Minute
+
+// ensureDeadline ctx 无 deadline 时补一个流式上限（有 deadline 则原样返回）。
+func ensureDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, aiStreamMaxDuration)
 }
 
 // chatMessage 一条对话消息。
@@ -79,6 +111,24 @@ type chatResult struct {
 	Content   string
 	Usage     chatUsage
 	LatencyMs int64
+	// FirstChunkMs 流式路径首个 data 块到达耗时（非流式恒 0）。
+	// ≈LatencyMs 说明上游忽略 stream 整包返回（假流式），是区分
+	// 「模型生成慢」与「网关不透传流」的关键观测。
+	FirstChunkMs int64
+}
+
+// capModuleTokens 模块级输出预算：上游普遍存在 60s 级整包超时，单次生成时长
+// 主要由输出 token 数决定——内部 JSON 任务（日报复盘/推荐/复核）按模块钳制
+// 输出上限，避免用户全局 max_tokens 过大拖死单次调用。用户配置更小时以用户
+// 配置为准；未配置（0）时用模块上限。
+func capModuleTokens(userMax, moduleCap int) int {
+	if moduleCap <= 0 {
+		return userMax
+	}
+	if userMax > 0 && userMax < moduleCap {
+		return userMax
+	}
+	return moduleCap
 }
 
 // chatCompletion 发起一次补全。JSONMode=true 时先带 response_format 请求；
@@ -86,11 +136,41 @@ type chatResult struct {
 // EndpointType=responses 时分流到 /v1/responses 适配（ai_client_responses.go），返回语义一致。
 func chatCompletion(ctx context.Context, p chatParams) (res *chatResult, err error) {
 	started := time.Now()
-	defer func() { writeLLMCallLog(p, false, res, err, time.Since(started)) }()
-	return chatCompletionInner(ctx, p)
+	streamed := true // 默认先走流式；回落非流式时置 false——审计必须记录实际请求形态而非入口意图
+	defer func() { writeLLMCallLog(p, streamed, res, err, time.Since(started)) }()
+	return chatCompletionInner(ctx, p, &streamed)
 }
 
-func chatCompletionInner(ctx context.Context, p chatParams) (*chatResult, error) {
+func chatCompletionInner(ctx context.Context, p chatParams, streamed *bool) (*chatResult, error) {
+	// 流式优先（2026-07-10）：非流式要等模型全部生成完才返回首字节，生成一旦超过
+	// 上游网关的整包超时（部分中转站为 60s 且不可调）连接就被掐断；流式期间 chunk
+	// 持续到达可绕开该限制。这里 onDelta=nil 仅在本端聚合，对调用方语义不变。
+	// 注意：流式只解决「空闲/整包超时」，上游若是绝对总时长限制则只能靠输出预算
+	//（capModuleTokens）把单次生成压进窗口内。
+	res, err := chatCompletionStreamInner(ctx, p, nil)
+	if err == nil {
+		return res, nil
+	}
+	if !looksLikeStreamUnsupported(err) {
+		return nil, err
+	}
+	// 少数端点不支持 stream：回落非流式一次（此时仍受上游整包超时约束，无能为力）。
+	if streamed != nil {
+		*streamed = false
+	}
+	return chatCompletionPlain(ctx, p)
+}
+
+// looksLikeStreamUnsupported 流式请求的失败是否因上游不支持 stream（此时值得回落
+// 非流式）。仅匹配 4xx 错误文案中的 stream 字样；"流式响应中断"等中途失败不回落
+// ——半截内容不可续，且非流式重发会让调用方等两轮。
+func looksLikeStreamUnsupported(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "http 4") && strings.Contains(msg, "stream")
+}
+
+// chatCompletionPlain 非流式补全（流式不可用时的回落路径，原 chatCompletionInner 主体）。
+func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error) {
 	if p.isResponsesEndpoint() {
 		return responsesCompletion(ctx, p)
 	}
@@ -187,6 +267,15 @@ func doChat(ctx context.Context, p chatParams, jsonMode bool) (*chatResult, int,
 		return nil, resp.StatusCode, raw, latency, nil
 	}
 
+	res, perr := parseChatResponse(raw, resp.StatusCode, endpoint)
+	if perr != nil {
+		return nil, resp.StatusCode, raw, latency, perr
+	}
+	return res, resp.StatusCode, raw, latency, nil
+}
+
+// parseChatResponse 解析 chat/completions 的 200 响应体（非流式整包形态）。
+func parseChatResponse(raw []byte, status int, endpoint string) (*chatResult, error) {
 	var parsed struct {
 		Choices []struct {
 			Message struct {
@@ -200,20 +289,20 @@ func doChat(ctx context.Context, p chatParams, jsonMode bool) (*chatResult, int,
 		if looksLikeHTML(raw) {
 			// 典型场景：Base URL 指向 new-api/one-api 等站点的非 API 路径，命中前端 SPA fallback
 			// 返回 200 + index.html。裸报 invalid character '<' 用户无从下手，这里直接指出端点。
-			return nil, resp.StatusCode, raw, latency, fmt.Errorf(
-				"LLM 返回了网页而非 JSON（HTTP %d）：%s 不是有效的 API 端点，请检查 Base URL——填服务根地址（自动补 /v1/chat/completions）或以 /v1 结尾的地址均可", resp.StatusCode, endpoint)
+			return nil, fmt.Errorf(
+				"LLM 返回了网页而非 JSON（HTTP %d）：%s 不是有效的 API 端点，请检查 Base URL——填服务根地址（自动补 /v1/chat/completions）或以 /v1 结尾的地址均可", status, endpoint)
 		}
-		return nil, resp.StatusCode, raw, latency, fmt.Errorf("解析 LLM 响应失败: %w（响应开头: %s）", err, bodySnippet(raw))
+		return nil, fmt.Errorf("解析 LLM 响应失败: %w（响应开头: %s）", err, bodySnippet(raw))
 	}
 	content := ""
 	if len(parsed.Choices) > 0 {
 		content = parsed.Choices[0].Message.Content
 		// 上游安全策略拦截（finish_reason=content_filter）且无内容：给明确文案而非笼统"空内容"。
 		if content == "" && parsed.Choices[0].FinishReason == "content_filter" {
-			return nil, resp.StatusCode, raw, latency, errors.New("内容被上游安全策略拦截（finish_reason=content_filter）")
+			return nil, errors.New("内容被上游安全策略拦截（finish_reason=content_filter）")
 		}
 	}
-	return &chatResult{Content: content, Usage: parsed.Usage}, resp.StatusCode, raw, latency, nil
+	return &chatResult{Content: content, Usage: parsed.Usage}, nil
 }
 
 // looksLikeUnsupportedJSONMode 粗略判断 4xx 是否因不支持 response_format / text.format 引起。
@@ -343,8 +432,9 @@ func estimateUsage(messages []chatMessage, content string) chatUsage {
 // 每个增量经 onDelta 回调吐出（调用方负责推给前端）；[DONE] 或 finish_reason 终止。
 // 返回聚合后的完整内容与 usage（请求带 stream_options.include_usage 让上游在末 chunk 回
 // usage——new-api 同款；不支持该字段的 4xx 会去掉重试一次，仍缺失则字符粗估）。
-// 不做 JSON mode（流式只用于自由文本模块），不做状态码重试（流一旦建立，中断即失败——
-// 半截内容重试会让用户看到重复文本）；建立连接前的错误分类与非流式一致。
+// JSONMode 同非流式：带 response_format，遇不支持的 4xx 去掉重试一次靠 prompt 约束。
+// 不做状态码重试（流一旦建立，中断即失败——半截内容重试会让用户看到重复文本）；
+// 建立连接前的错误分类与非流式一致。上游忽略 stream 参数返回整包 JSON 时按非流式解析兼容。
 // EndpointType=responses 时分流到 /v1/responses 适配。
 func chatCompletionStream(ctx context.Context, p chatParams, onDelta func(string)) (res *chatResult, err error) {
 	started := time.Now()
@@ -353,6 +443,8 @@ func chatCompletionStream(ctx context.Context, p chatParams, onDelta func(string
 }
 
 func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(string)) (*chatResult, error) {
+	ctx, cancel := ensureDeadline(ctx)
+	defer cancel()
 	if p.isResponsesEndpoint() {
 		return responsesCompletionStream(ctx, p, onDelta)
 	}
@@ -362,7 +454,7 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 	}
 	endpoint := chatCompletionsURL(p.BaseURL)
 
-	buildBody := func(withUsageOpt bool) []byte {
+	buildBody := func(withUsageOpt, withJSON bool) []byte {
 		payload := map[string]any{
 			"model":       p.Model,
 			"messages":    p.Messages,
@@ -375,12 +467,16 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 		if withUsageOpt {
 			payload["stream_options"] = map[string]bool{"include_usage": true}
 		}
+		if withJSON {
+			payload["response_format"] = map[string]string{"type": "json_object"}
+		}
 		b, _ := json.Marshal(payload)
 		return b
 	}
-	body := buildBody(true)
+	usageOpt, jsonOn := true, p.JSONMode
+	body := buildBody(usageOpt, jsonOn)
 
-	client := aiHTTPClient(p.AllowPrivate)
+	client := aiStreamHTTPClient(p.AllowPrivate)
 	send := func() (*http.Response, error) {
 		req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if rerr != nil {
@@ -401,12 +497,26 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 	if err != nil {
 		return nil, fmt.Errorf("请求失败: %w", err)
 	}
+	if retryableStatus(resp.StatusCode) && ctx.Err() == nil {
+		// 建流前的瞬时抖动状态码（429/500/502/503）重试一次——此时尚无任何内容，
+		// 无重复文本之虞，与非流式的重试纪律一致。
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		time.Sleep(aiRetryBackoff)
+		if r2, e2 := send(); e2 == nil {
+			resp = r2
+		}
+	}
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		// 部分兼容端点不认识 stream_options：识别后去掉该字段重试一次（照 JSON mode fallback 模式）。
+		// 部分兼容端点不认识 stream_options / response_format：识别后去掉命中字段重试一次。
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		if strings.Contains(strings.ToLower(string(raw)), "stream_options") && ctx.Err() == nil {
-			body = buildBody(false)
+		dropUsage := strings.Contains(strings.ToLower(string(raw)), "stream_options")
+		dropJSON := jsonOn && looksLikeUnsupportedJSONMode(resp.StatusCode, raw)
+		if (dropUsage || dropJSON) && ctx.Err() == nil {
+			usageOpt = usageOpt && !dropUsage
+			jsonOn = jsonOn && !dropJSON
+			body = buildBody(usageOpt, jsonOn)
 			if r2, e2 := send(); e2 == nil {
 				resp = r2
 			} else {
@@ -421,11 +531,22 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", resp.StatusCode, statusHint(resp.StatusCode), extractErr(raw))
 	}
+	br := bufio.NewReader(resp.Body)
+	if !isSSEResponse(resp, br) {
+		// 上游忽略 stream 参数直接返回整包 JSON（部分网关形态）：按非流式解析。
+		raw, _ := io.ReadAll(io.LimitReader(br, 1<<20))
+		res, perr := parseChatResponse(raw, resp.StatusCode, endpoint)
+		if perr != nil {
+			return nil, perr
+		}
+		return finishStreamResult(p, res.Content, res.Usage, start, onDelta)
+	}
 
 	// SSE 逐行状态机：每行形如 "data: {...}"；空行为事件分隔；"data: [DONE]" 结束。
 	var sb strings.Builder
 	var usage chatUsage
-	sc := bufio.NewScanner(resp.Body)
+	var firstChunkMs int64
+	sc := bufio.NewScanner(br)
 	sc.Buffer(make([]byte, 64<<10), 1<<20) // 单行上限 1MB（长 delta/大 usage 容错）
 	done := false
 	for sc.Scan() {
@@ -436,6 +557,12 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 		data, ok := strings.CutPrefix(line, "data:")
 		if !ok {
 			continue
+		}
+		if firstChunkMs == 0 {
+			// 首个 data 行到达时刻（含 role 前导块）：诊断上游首 token 延迟的观测锚点。
+			if firstChunkMs = time.Since(start).Milliseconds(); firstChunkMs == 0 {
+				firstChunkMs = 1 // 亚毫秒（本地假服务）与「未记录」区分
+			}
 		}
 		data = strings.TrimSpace(data)
 		if data == "[DONE]" {
@@ -483,5 +610,36 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 	if usage.TotalTokens == 0 {
 		usage = estimateUsage(p.Messages, content)
 	}
-	return &chatResult{Content: content, Usage: usage, LatencyMs: time.Since(start).Milliseconds()}, nil
+	return &chatResult{Content: content, Usage: usage, LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs}, nil
+}
+
+// finishStreamResult 流式路径拿到整包内容（上游忽略 stream）时的统一收尾：
+// 空内容校验、usage 粗估兜底、onDelta 一次性吐出全文（保持流式调用方能看到内容）。
+// FirstChunkMs 记为整包到达时刻（≈总耗时）——审计里两值几乎相等即可识别假流式网关。
+func finishStreamResult(p chatParams, content string, usage chatUsage, start time.Time, onDelta func(string)) (*chatResult, error) {
+	if strings.TrimSpace(content) == "" {
+		return nil, errors.New("LLM 返回空内容")
+	}
+	if usage.TotalTokens == 0 {
+		usage = estimateUsage(p.Messages, content)
+	}
+	if onDelta != nil {
+		onDelta(content)
+	}
+	ms := time.Since(start).Milliseconds()
+	if ms == 0 {
+		ms = 1
+	}
+	return &chatResult{Content: content, Usage: usage, LatencyMs: ms, FirstChunkMs: ms}, nil
+}
+
+// isSSEResponse 判断 200 响应是否为 SSE 流：优先看 Content-Type；部分网关不回标准
+// Content-Type，再 peek 响应体开头——SSE 以 "data:"/"event:"/":" 行开头，整包 JSON 以 '{' 开头。
+func isSSEResponse(resp *http.Response, br *bufio.Reader) bool {
+	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		return true
+	}
+	b, _ := br.Peek(64)
+	s := strings.TrimLeft(string(b), " \t\r\n")
+	return strings.HasPrefix(s, "data:") || strings.HasPrefix(s, "event:") || strings.HasPrefix(s, ":")
 }

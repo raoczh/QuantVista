@@ -192,17 +192,26 @@ func doResponses(ctx context.Context, p chatParams, jsonMode bool) (*chatResult,
 		return nil, resp.StatusCode, raw, latency, nil
 	}
 
+	res, perr := parseResponsesBody(raw, resp.StatusCode, endpoint)
+	if perr != nil {
+		return nil, resp.StatusCode, raw, latency, perr
+	}
+	return res, resp.StatusCode, raw, latency, nil
+}
+
+// parseResponsesBody 解析 /responses 的 200 响应体（非流式整包形态）。
+func parseResponsesBody(raw []byte, status int, endpoint string) (*chatResult, error) {
 	var parsed responsesResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		if looksLikeHTML(raw) {
-			return nil, resp.StatusCode, raw, latency, fmt.Errorf(
-				"LLM 返回了网页而非 JSON（HTTP %d）：%s 不是有效的 API 端点，请检查 Base URL——填服务根地址（自动补 /v1/responses）或以 /v1 结尾的地址均可", resp.StatusCode, endpoint)
+			return nil, fmt.Errorf(
+				"LLM 返回了网页而非 JSON（HTTP %d）：%s 不是有效的 API 端点，请检查 Base URL——填服务根地址（自动补 /v1/responses）或以 /v1 结尾的地址均可", status, endpoint)
 		}
-		return nil, resp.StatusCode, raw, latency, fmt.Errorf("解析 LLM 响应失败: %w（响应开头: %s）", err, bodySnippet(raw))
+		return nil, fmt.Errorf("解析 LLM 响应失败: %w（响应开头: %s）", err, bodySnippet(raw))
 	}
 	// 200 但响应体带 error 对象（部分网关形态）：按错误处理。
 	if msg := errorMessageFromRaw(parsed.Error); msg != "" {
-		return nil, resp.StatusCode, raw, latency, fmt.Errorf("LLM 返回错误：%s", msg)
+		return nil, fmt.Errorf("LLM 返回错误：%s", msg)
 	}
 	content := extractResponsesText(parsed.Output)
 	if parsed.Status == "incomplete" && strings.TrimSpace(content) == "" {
@@ -210,13 +219,13 @@ func doResponses(ctx context.Context, p chatParams, jsonMode bool) (*chatResult,
 		if parsed.IncompleteDetails != nil {
 			reason = parsed.IncompleteDetails.Reason
 		}
-		return nil, resp.StatusCode, raw, latency, fmt.Errorf("LLM 响应未完成（%s）且无内容，可尝试调大 max_tokens", reason)
+		return nil, fmt.Errorf("LLM 响应未完成（%s）且无内容，可尝试调大 max_tokens", reason)
 	}
 	res := &chatResult{Content: content}
 	if parsed.Usage != nil {
 		res.Usage = parsed.Usage.toChatUsage()
 	}
-	return res, resp.StatusCode, raw, latency, nil
+	return res, nil
 }
 
 // errorMessageFromRaw 从 error 字段（对象 {message:...} 或裸字符串）里抽 message。
@@ -240,15 +249,17 @@ func errorMessageFromRaw(rawErr json.RawMessage) string {
 // responsesCompletionStream 流式补全：SSE data 行按事件 type 分派——
 // response.output_text.delta 取 delta 追加、response.completed/incomplete 取最终 usage、
 // response.failed/error 判失败。流中断即失败不落半截，与 chat 端纪律一致。
+// JSONMode 带 text.format，遇不支持的 4xx 去掉重试一次；上游忽略 stream 返回整包 JSON 时按非流式解析兼容。
 func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(string)) (*chatResult, error) {
 	u, err := url.Parse(p.BaseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, errors.New("Base URL 非法（仅支持 http/https）")
 	}
 	endpoint := responsesURL(p.BaseURL)
-	body, _ := json.Marshal(buildResponsesPayload(p, false, true))
+	jsonOn := p.JSONMode
+	body, _ := json.Marshal(buildResponsesPayload(p, jsonOn, true))
 
-	client := aiHTTPClient(p.AllowPrivate)
+	client := aiStreamHTTPClient(p.AllowPrivate)
 	send := func() (*http.Response, error) {
 		req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if rerr != nil {
@@ -269,15 +280,51 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	if err != nil {
 		return nil, fmt.Errorf("请求失败: %w", err)
 	}
+	if retryableStatus(resp.StatusCode) && ctx.Err() == nil {
+		// 建流前的瞬时抖动状态码重试一次（尚无内容，与非流式重试纪律一致）。
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		time.Sleep(aiRetryBackoff)
+		if r2, e2 := send(); e2 == nil {
+			resp = r2
+		}
+	}
+	if jsonOn && resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		// 不支持 text.format 的端点：去掉后重试一次（与非流式 fallback 同款）。
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if looksLikeUnsupportedJSONMode(resp.StatusCode, raw) && ctx.Err() == nil {
+			jsonOn = false
+			body, _ = json.Marshal(buildResponsesPayload(p, false, true))
+			if r2, e2 := send(); e2 == nil {
+				resp = r2
+			} else {
+				return nil, fmt.Errorf("请求失败: %w", e2)
+			}
+		} else {
+			return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", resp.StatusCode, statusHint(resp.StatusCode), extractErr(raw))
+		}
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", resp.StatusCode, statusHint(resp.StatusCode), extractErr(raw))
 	}
+	br := bufio.NewReader(resp.Body)
+	if !isSSEResponse(resp, br) {
+		// 上游忽略 stream 参数直接返回整包 JSON：按非流式解析。
+		raw, _ := io.ReadAll(io.LimitReader(br, 1<<20))
+		res, perr := parseResponsesBody(raw, resp.StatusCode, endpoint)
+		if perr != nil {
+			return nil, perr
+		}
+		return finishStreamResult(p, res.Content, res.Usage, start, onDelta)
+	}
 
 	var sb strings.Builder
 	var usage chatUsage
-	sc := bufio.NewScanner(resp.Body)
+	var firstChunkMs int64
+	sc := bufio.NewScanner(br)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	done := false
 	for sc.Scan() {
@@ -288,6 +335,11 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 		data, ok := strings.CutPrefix(line, "data:")
 		if !ok {
 			continue
+		}
+		if firstChunkMs == 0 {
+			if firstChunkMs = time.Since(start).Milliseconds(); firstChunkMs == 0 {
+				firstChunkMs = 1
+			}
 		}
 		data = strings.TrimSpace(data)
 		if data == "[DONE]" {
@@ -339,5 +391,5 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	if usage.TotalTokens == 0 {
 		usage = estimateUsage(p.Messages, content)
 	}
-	return &chatResult{Content: content, Usage: usage, LatencyMs: time.Since(start).Milliseconds()}, nil
+	return &chatResult{Content: content, Usage: usage, LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs}, nil
 }

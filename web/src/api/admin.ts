@@ -96,6 +96,7 @@ export interface LLMCallLogItem {
   completion_tokens: number
   total_tokens: number
   latency_ms: number
+  first_chunk_ms: number // 流式首个 data 块耗时；0=非流式；≈latency_ms 说明上游整包返回（假流式）
   request_body: string // 仅详情接口返回，列表恒为空
   response_body: string
   created_at: string

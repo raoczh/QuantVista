@@ -135,7 +135,23 @@ const columns = computed<DataTableColumns<LLMCallLogItem>>(() => [
         row.total_tokens ? row.total_tokens.toLocaleString() : '-',
       ),
   },
-  { title: '耗时', key: 'latency_ms', width: 80, align: 'right', render: (row) => h('span', { class: 'qv-tnum' }, fmtLatency(row.latency_ms)) },
+  {
+    title: '耗时',
+    key: 'latency_ms',
+    width: 110,
+    align: 'right',
+    render: (row) =>
+      h(
+        'span',
+        {
+          class: 'qv-tnum',
+          // 首块耗时（流式首个 data 块到达）：≈总耗时说明上游整包返回（假流式），
+          // 是区分「模型生成慢」与「网关不透传流」的关键观测。
+          title: row.first_chunk_ms ? `首块 ${fmtLatency(row.first_chunk_ms)} / 总 ${fmtLatency(row.latency_ms)}` : undefined,
+        },
+        row.first_chunk_ms ? `${fmtLatency(row.first_chunk_ms)} / ${fmtLatency(row.latency_ms)}` : fmtLatency(row.latency_ms),
+      ),
+  },
   {
     title: '状态',
     key: 'status',
