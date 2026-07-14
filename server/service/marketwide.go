@@ -332,6 +332,8 @@ func (s *MarketService) SyncMarketWide(ctx context.Context) (*model.DataSyncLog,
 	// M1 第二部分：增量落库完成后异步重建因子宽表（选股/推荐策略信号的数据地基）。
 	if log.Succeeded > 0 {
 		RebuildFactorTableAsync("每日增量完成")
+		// P3b：快照已带 f9/f115/f23/f100 估值字段，顺手按行业聚合板块估值（best-effort）。
+		AggregateBoardValuationAsync(rows, tradeDate)
 	}
 	return log, nil
 }

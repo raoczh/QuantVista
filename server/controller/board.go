@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"strconv"
 	"strings"
 
 	"quantvista/common"
@@ -49,4 +50,25 @@ func (bc *BoardController) Detail(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, bc.svc.Detail(c.Request.Context(), code))
+}
+
+// FundFlow GET /api/markets/:market/boards/:code/fundflow?days=90
+// 板块资金流历史（P3b：上游透传+短缓存不落库）。
+func (bc *BoardController) FundFlow(c *gin.Context) {
+	if strings.ToLower(c.Param("market")) != "cn" {
+		common.ApiErrorMsg(c, "板块资金流仅支持 A 股（cn）")
+		return
+	}
+	code := strings.TrimSpace(c.Param("code"))
+	if code == "" {
+		common.ApiErrorMsg(c, "板块代码不能为空")
+		return
+	}
+	days, _ := strconv.Atoi(c.DefaultQuery("days", "90"))
+	view, err := bc.svc.FundFlow(c.Request.Context(), code, days)
+	if err != nil {
+		common.ApiErrorMsg(c, "获取板块资金流失败: "+err.Error())
+		return
+	}
+	common.ApiSuccess(c, view)
 }

@@ -302,15 +302,50 @@ export interface BoardStock {
   source: string
 }
 
-// M3c 板块详情：指数日线 + 成分股（各块可缺，errors 记录哪块失败）。
+// P3b 板块估值（行业板块聚合表最新行；分位 -1=算不出，hist_days 为时序分位积累天数）。
+export interface BoardValuation {
+  trade_date: string
+  board_name: string
+  median_pe_ttm: number
+  median_pb: number
+  pos_pe_count: number
+  stock_count: number
+  pct_rank: number // 横截面分位（当日全行业，越高越贵）
+  hist_pct_rank: number // 时序分位（自身近 ≤250 日）
+  hist_days: number
+}
+
+// M3c 板块详情：指数日线 + 成分股 + 估值（各块可缺，errors 记录哪块失败；
+// valuation 概念板块自然缺席）。
 export interface BoardDetail {
   code: string
   bars: Bar[]
   stocks: BoardStock[]
+  valuation?: BoardValuation
   errors: Record<string, string>
   data_time: string
 }
 
 export function getBoardDetail(market: string, code: string) {
   return request<BoardDetail>({ url: `/markets/${market}/boards/${code}`, method: 'get' })
+}
+
+// P3b 板块资金流历史（上游透传+短缓存；结构对齐个股 StockFundFlow，close 为板块指数点位）。
+export interface BoardFundFlow {
+  code: string
+  days: FundFlowDay[]
+  main_net_1d_yi: number
+  main_net_5d_yi: number
+  main_net_10d_yi: number
+  main_net_20d_yi: number
+  streak_days: number // 正=连续净流入天数，负=连续净流出
+  last_date?: string
+}
+
+export function getBoardFundFlow(market: string, code: string, days = 90) {
+  return request<BoardFundFlow>({
+    url: `/markets/${market}/boards/${code}/fundflow`,
+    method: 'get',
+    params: { days },
+  })
 }
