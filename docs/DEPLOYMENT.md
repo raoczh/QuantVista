@@ -110,7 +110,7 @@ openssl rand -base64 36   # 再生成一个作 ENCRYPTION_KEY
 **用户数据表（必须备份——丢了无法找回）：**
 
 - 账号与配置：`users`、`user_preferences`、`user_quotas`、`refresh_tokens`（可不备，重新登录即可）、`options`（系统设置，GitHub secret 为密文）、`llm_configs`（API Key 为密文，恢复后需同一 `ENCRYPTION_KEY` 才能解密）、`prompt_templates`、`notify_channels`（target 为密文，同上）
-- 研究与交易记录：`watchlists`、`watchlist_items`、`positions`、`thesis_cards`、`research_notes`
+- 研究与交易记录：`watchlists`、`watchlist_items`、`positions`、`thesis_cards`、`research_notes`、`screener_strategies`（自定义选股策略）
 - AI 产出：`analysis_records`、`recommendation_batches`、`recommendations`、`recommendation_statuses`、`ai_conversations`、`ai_conversation_messages`、`daily_reports`
 - 提醒：`alert_rules`、`alert_events`
 - 模拟盘：`paper_accounts`、`paper_holdings`、`paper_trades`
@@ -120,7 +120,7 @@ openssl rand -base64 36   # 再生成一个作 ENCRYPTION_KEY
 - `stocks`、`stock_quotes`、`daily_bars`（个股查询/批量同步自动回填）
 - `trading_calendar`（管理端「回填交易日历」一键重建）
 - `market_snapshots`、`data_sync_logs`、`stock_scores`（后台任务自动再生）
-- N/F/M 批次的采集与派生表：新闻（`news_items` 等）、财报/财务（`earnings_*`/`finance_*`）、全市场宽表与状态（`factor_tables`/`market_sync_states`）、龙虎榜/涨停池/人气/资金流/盘中因子（`lhb_*`/`zt_*`/`popularity_*`/`fund_flows`/`intraday_factor_dailies`）、机构观点（`report_ratings`/`org_surveys`，P3a 按需拉取缓存）——均由每日 job 或按需拉取重建；注意涨停池/盘中因子上游**不可回溯**，重建只能从当天起积累，历史断档是诚实缺失
+- N/F/M/P3 批次的采集与派生表：新闻与情绪（`news_items`/`stock_sentiments` 等）、财报/财务（`earnings_*`/`finance_*`）、全市场宽表与状态（`factor_tables`/`market_sync_states`）、龙虎榜/涨停池/人气/资金流/盘中因子（`lhb_*`/`zt_*`/`popularity_*`/`fund_flows`/`intraday_factor_dailies`）、机构观点（`report_ratings`/`org_surveys`，P3a 按需拉取缓存）、板块估值聚合（`board_valuation_dailies`，P3b 每日聚合）——均由每日 job 或按需拉取重建；注意涨停池/盘中因子上游**不可回溯**，重建只能从当天起积累，历史断档是诚实缺失
 - `llm_call_logs`（LLM 调用审计，90 天滚动自清理；如需长期留存审计证据则纳入备份）
 
 ### 7.2 备份命令
@@ -132,7 +132,7 @@ docker exec mysql mysqldump -uquantvista -p'密码' --single-transaction quantvi
 # 只备用户数据表（体积敏感时）
 docker exec mysql mysqldump -uquantvista -p'密码' --single-transaction quantvista \
   users user_preferences user_quotas options llm_configs prompt_templates notify_channels \
-  watchlists watchlist_items positions thesis_cards research_notes \
+  watchlists watchlist_items positions thesis_cards research_notes screener_strategies \
   analysis_records recommendation_batches recommendations recommendation_statuses \
   ai_conversations ai_conversation_messages daily_reports alert_rules alert_events \
   paper_accounts paper_holdings paper_trades | gzip > qv-user-$(date +%F).sql.gz

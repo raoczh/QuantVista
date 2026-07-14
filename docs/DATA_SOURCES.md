@@ -125,10 +125,12 @@
 | 涨停池/连板/炸板情绪 | 东财 | `push2ex.eastmoney.com/getTopicZTPool` 族 | ✅ 已接入（M3a，`eastmoney_ztpool.go`，不可回溯靠每日快照积累） |
 | 股吧人气榜 | 东财 | `emappdata.eastmoney.com` 人气榜 | ✅ 已接入（M3a） |
 | 个股/两市资金流 | 东财 | clist f62 族排行 + `push2his` fflow/daykline 单股历史 | ✅ 已接入（M3a，`eastmoney_fflow.go`，规避了同花顺反爬） |
-| 板块热度榜/成分股/板块指数 | 东财 | clist fs=m:90 + secid=90.BKxxxx kline | ✅ 已接入（M3b/M3c，`eastmoney_board.go`） |
+| 板块热度榜/成分股/板块指数 | 东财 | clist fs=m:90 + secid=90.BKxxxx kline | ✅ 已接入（M3c，`eastmoney_board.go`） |
+| 板块资金流历史/行业估值聚合 | 东财 | fflow/daykline secid=90.BKxxxx + clist 扩 f9/f115/f23/f100 估值字段 | ✅ 已接入（P3b，板块资金流纯透传；行业估值按 f100 聚合中位数+分位落库） |
+| 研报评级/机构调研 | 东财 | `reportapi.eastmoney.com/report/list` + datacenter `RPT_ORG_SURVEYNEW` | ✅ 已接入（P3a，`emorgview.go`，按需拉取缓存禁普查） |
 | 快讯/个股新闻 | 财联社 + 东财 | `/v1/roll/get_roll_list`（sign 双哈希）+ 东财快讯/search-api | ✅ 已接入（N1，`cls.go`/`eastmoney_news.go`） |
 | 个股资金流 | 同花顺 | `data.10jqka.com.cn/funds/ggzjl/...` | ❌ 放弃：hexin-v 反爬成本高，已改走东财 f62 族（上行） |
-| 千股千评 | 东财 | `stock_comment_em` 系列 | ⏳ 候选（市场情绪已由涨停池/人气榜覆盖大半，边际收益低） |
+| 千股千评 | 东财 | `stock_comment_em` 系列 | ❌ 砍掉（P3a 评估：东财机器生成参考价值薄，市场情绪已由涨停池/人气榜覆盖） |
 | 热搜榜 | 百度 | `stock_hot_search_baidu` | ⏳ 候选 |
 | 个股榜单 | 腾讯 | `proxy.finance.qq.com/cgi/.../getBoardRankList` | ⏳ 候选（参数待调） |
 
