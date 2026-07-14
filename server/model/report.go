@@ -17,6 +17,11 @@ type DailyReport struct {
 	// 复盘 prompt 版本（M3c 起落库；-custom 后缀=当时启用了用户自定义模板，供归因）。
 	PromptVersion string `gorm:"size:16" json:"prompt_version"`
 
+	// 生成时使用的 LLM（复盘链路；明日推荐批次自带同款字段）。旧行为空，前端兜底。
+	LLMConfigID int64  `json:"llm_config_id"`
+	Provider    string `gorm:"size:32" json:"provider"`
+	Model       string `gorm:"size:64" json:"model"`
+
 	// 今日复盘：LLM 结构化输出 + 输入数据快照（可复现）。列表查询时排除大字段。
 	ReviewJSON   string `gorm:"type:text" json:"review_json"`
 	SnapshotJSON string `gorm:"type:text" json:"snapshot_json"`

@@ -128,6 +128,10 @@ export interface ParseStrategyResult {
   conditions: string[] | null
   prompt_version: string
   total_tokens: number
+  // 实际使用的 LLM。
+  llm_config_id?: number
+  provider?: string
+  model?: string
 }
 
 /** 白话描述 → 条件树（消耗 1 次 AI 配额；生成树需用户确认后才落编辑器）。 */

@@ -67,3 +67,16 @@ func (dc *DailyReportController) Generate(c *gin.Context) {
 	}
 	common.ApiSuccess(c, v)
 }
+
+// Delete DELETE /api/daily-reports/:id —— 删除一份日报（生成中的任务拒删）。
+func (dc *DailyReportController) Delete(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	if err := dc.svc.Delete(currentUserID(c), id); err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, gin.H{"ok": true})
+}

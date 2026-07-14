@@ -25,6 +25,9 @@ type RecFilters struct {
 	TurnoverMax   float64 `json:"turnover_max"`     // 换手率上限（%）；系统另有两级硬规则：>30% 一律排除、20~30% 高位排除
 	MaxGain5dPct  float64 `json:"max_gain_5d_pct"`  // 近 5 日累计涨幅上限（%，追高保护；0=不限）
 	ExcludeLimitUp bool   `json:"exclude_limit_up"` // 排除当日已封涨停（涨停买不进）
+	// ExcludeGemStar 排除创业板(30)/科创板(68)，仅推荐主板普通个股（20cm 波动大、
+	// 科创板有权限门槛）。北交所(4/8/92)在基础准入已排除，不归这个开关管。
+	ExcludeGemStar bool `json:"exclude_gem_star"`
 }
 
 // defaultRecFilters 各类型的保护性默认：短线带追高保护，长线宽松。
@@ -121,6 +124,9 @@ func (f RecFilters) Describe() []string {
 	if f.ExcludeLimitUp {
 		out = append(out, "排除已涨停")
 	}
+	if f.ExcludeGemStar {
+		out = append(out, "排除创业板/科创板")
+	}
 	return out
 }
 
@@ -178,6 +184,9 @@ func applyQuoteFilters(c candidate, f RecFilters) string {
 	// 透明标记排除，仅经自选进入的基金会走到这里（榜单源 hs_a 只含个股）。
 	if isCNFund(c.Symbol) {
 		return "ETF/基金不参与个股推荐"
+	}
+	if f.ExcludeGemStar && (strings.HasPrefix(c.Symbol, "30") || strings.HasPrefix(c.Symbol, "68")) {
+		return "创业板/科创板（按偏好仅推荐主板个股）"
 	}
 	if f.PriceMin > 0 && c.Price < f.PriceMin {
 		return fmt.Sprintf("股价 %.2f 低于下限 %s", c.Price, trimFloat(f.PriceMin))

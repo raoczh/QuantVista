@@ -26,6 +26,10 @@ export interface DailyReportRow {
   total_tokens: number
   latency_ms: number
   created_at: string
+  // 生成时使用的 LLM（复盘链路；旧日报为空）。
+  llm_config_id?: number
+  provider?: string
+  model?: string
 }
 
 export interface DailyReportView extends DailyReportRow {
@@ -53,4 +57,9 @@ export function getLatestDailyReport() {
 // processing（lib/poll.ts 的 pollUntil），不再需要超长前端超时。
 export function generateDailyReport() {
   return request<DailyReportView>({ url: '/daily-reports/generate', method: 'post' })
+}
+
+// 删除一份日报（生成中的任务拒删；关联推荐批次与卖点提醒不级联删）。
+export function deleteDailyReport(id: number) {
+  return request<{ ok: boolean }>({ url: `/daily-reports/${id}`, method: 'delete' })
 }

@@ -110,6 +110,7 @@ export interface AnalysisRecord {
   confidence: number
   summary: string
   error: string
+  llm_config_id?: number // 生成时使用的 LLM 配置 id（配置名前端按自己的清单解析）
   provider: string
   model: string
   prompt_version: string

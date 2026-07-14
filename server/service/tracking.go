@@ -419,6 +419,24 @@ func (s *TrackingService) upsertStatus(st *model.RecommendationStatus) error {
 	}).Create(st).Error
 }
 
+// AckReview 标记某条推荐复盘提示为已读（今日待办就地消项）。仅本人；
+// review_ack 不在 upsertStatus 覆盖列中，后台追踪刷新不会打回未读。
+func (s *TrackingService) AckReview(userID, statusID int64) error {
+	if common.DB == nil {
+		return errors.New("数据库不可用")
+	}
+	res := common.DB.Model(&model.RecommendationStatus{}).
+		Where("id = ? AND user_id = ?", statusID, userID).
+		Update("review_ack", true)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return errors.New("复盘提示不存在")
+	}
+	return nil
+}
+
 // StatusesForBatch 取某批次全部条目的追踪状态，按 recommendation_id 索引（供视图拼装）。
 func (s *TrackingService) StatusesForBatch(userID, batchID int64) map[int64]model.RecommendationStatus {
 	out := map[int64]model.RecommendationStatus{}

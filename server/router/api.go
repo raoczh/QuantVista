@@ -200,6 +200,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			{
 				recommendations.GET("/strategies", recommendationCtl.Strategies)
 				recommendations.GET("/performance", recommendationCtl.Performance)
+				recommendations.PUT("/review-ack/:id", recommendationCtl.AckReview)
 				recommendations.POST("", middleware.RateLimit(15, time.Minute), recommendationCtl.Generate)
 				recommendations.GET("", recommendationCtl.List)
 				recommendations.GET("/:id", recommendationCtl.Get)
@@ -230,6 +231,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				reports.GET("", dailyReportCtl.List)
 				reports.GET("/latest", dailyReportCtl.Latest)
 				reports.GET("/:id", dailyReportCtl.Get)
+				reports.DELETE("/:id", dailyReportCtl.Delete)
 				reports.POST("/generate", middleware.RateLimit(5, time.Minute), dailyReportCtl.Generate)
 			}
 

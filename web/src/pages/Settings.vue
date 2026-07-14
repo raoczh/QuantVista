@@ -268,6 +268,7 @@ const recFilters = reactive({
   turnover_max: 0,
   max_gain_5d_pct: 25,
   exclude_limit_up: true,
+  exclude_gem_star: false, // 排除创业板(30)/科创板(68)，仅推荐主板普通个股
 })
 function parseRecFilters(raw: string) {
   if (!raw) return
@@ -500,6 +501,11 @@ async function doExport(kind: ExportKind) {
                 <span class="recf-sep" />
                 <span class="recf-label">排除已涨停</span>
                 <n-switch v-model:value="recFilters.exclude_limit_up" size="small" />
+              </div>
+              <div class="recf-row">
+                <span class="recf-label">排除创业板/科创板</span>
+                <n-switch v-model:value="recFilters.exclude_gem_star" size="small" />
+                <span class="notify-hint">开启后各类推荐（含收盘日报的自动推荐）只推主板普通个股</span>
               </div>
               <span class="notify-hint"
                 >短线/长线推荐与收盘日报的候选池默认筛选（股价上限直接解决「推荐太贵买不起」；推荐页可临时覆盖）。被筛掉的标的会在推荐结果的「候选池全景」中列出原因。换手

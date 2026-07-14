@@ -16,10 +16,12 @@ import {
   listDailyReports,
   getDailyReport,
   generateDailyReport,
+  deleteDailyReport,
   type DailyReportRow,
   type DailyReportView,
 } from '@/api/report'
 import { useUi } from '@/composables/useUi'
+import { useLlmLabel } from '@/composables/useLlmLabel'
 import { useStockActions } from '@/composables/useStockActions'
 import { pollUntil } from '@/lib/poll'
 import PageContainer from '@/components/PageContainer.vue'
@@ -29,6 +31,7 @@ import TrustBadges from '@/components/TrustBadges.vue'
 const message = useMessage()
 const router = useRouter()
 const { pctColor, upColor, vars, withAlpha } = useUi()
+const { llmLabel } = useLlmLabel()
 const { goDetail } = useStockActions()
 
 const rows = ref<DailyReportRow[]>([])
@@ -130,6 +133,24 @@ async function doGenerate() {
   }
 }
 
+// 删除当前展示的日报（生成中的任务后端会拒删）。
+const deleting = ref(false)
+async function doDelete() {
+  if (!current.value) return
+  deleting.value = true
+  try {
+    await deleteDailyReport(current.value.id)
+    message.success('已删除')
+    current.value = null
+    selectedId.value = null
+    await load()
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    deleting.value = false
+  }
+}
+
 const recItems = computed(() => current.value?.recommendation?.items ?? [])
 
 // 复盘证据核验（复盘 JSON 内 evidence_check）。
@@ -221,6 +242,12 @@ onMounted(load)
           </template>
           将调用你的 LLM 生成当日复盘与明日推荐（计 1 次配额），已有今日日报会被覆盖，继续？
         </n-popconfirm>
+        <n-popconfirm @positive-click="doDelete">
+          <template #trigger>
+            <n-button size="small" quaternary type="error" :loading="deleting" :disabled="!current">删除</n-button>
+          </template>
+          删除当前展示的这份日报？关联的推荐批次与卖点提醒不受影响；若删的是今日日报且开着自动生成，收盘窗口内可能会自动重新生成。
+        </n-popconfirm>
       </div>
     </template>
 
@@ -236,7 +263,11 @@ onMounted(load)
             <span class="head-date qv-figure">{{ current.trade_date }}</span>
             <n-tag :type="statusType(current.status)" round :bordered="false">{{ statusText(current.status) }}</n-tag>
             <span v-if="current.status !== 'processing'" class="meta"
-              >耗时 {{ (current.latency_ms / 1000).toFixed(1) }}s · {{ current.total_tokens }} tokens</span
+              >耗时 {{ (current.latency_ms / 1000).toFixed(1) }}s · {{ current.total_tokens }} tokens<template
+                v-if="llmLabel(current)"
+              >
+                · {{ llmLabel(current) }}</template
+              ></span
             >
             <span v-else class="meta">复盘与推荐正在后台并行生成，关闭或刷新页面不影响任务…</span>
             <n-button v-if="snapshotText" size="tiny" quaternary @click="snapshotShow = true">数据快照</n-button>

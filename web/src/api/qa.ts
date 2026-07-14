@@ -18,6 +18,7 @@ export interface QaConversation {
   market: string
   name: string
   title: string
+  llm_config_id?: number // 会话创建时固化的 LLM 配置 id
   provider: string
   model: string
   message_count: number

@@ -38,6 +38,9 @@ func TestTodoBuild(t *testing.T) {
 	// 不需复盘的（进行中）不计入。
 	common.DB.Create(&model.RecommendationStatus{RecommendationID: 3, BatchID: 12, UserID: 1, Symbol: "600004",
 		Type: model.RecTypeShortTerm, Outcome: model.RecOutcomeActive, ReviewNeeded: false})
+	// 已读的复盘提示不再进清单（review_ack 人工标记，追踪刷新不覆盖）。
+	common.DB.Create(&model.RecommendationStatus{RecommendationID: 4, BatchID: 13, UserID: 1, Symbol: "600005",
+		Type: model.RecTypeShortTerm, Outcome: model.RecOutcomeExpired, ReviewNeeded: true, ReviewAck: true})
 
 	svc := NewTodoService(&AlertService{}, &PositionService{market: nil}, nil)
 	// position.List 需要 market 富化；这里无持仓，List 返回空即可（跳过持仓分支）。
@@ -59,11 +62,32 @@ func TestTodoBuild(t *testing.T) {
 	if res.Items[len(res.Items)-1].Priority != 2 {
 		t.Fatalf("最后一项应为优先级 2（过期），得到 %d", res.Items[len(res.Items)-1].Priority)
 	}
-	// alert 条目的 RefID 应为事件 id（供前端标记已读/忽略）。
+	// alert 条目的 RefID 应为事件 id（供前端标记已读/忽略）；rec_review 条目的
+	// RefID 应为追踪状态行 id（供前端「已读」消项）。
 	for _, it := range res.Items {
 		if it.Kind == TodoKindAlert && it.RefID == 0 {
 			t.Fatalf("alert 待办应携带事件 id: %+v", it)
 		}
+		if it.Kind == TodoKindRecReview && it.RefID == 0 {
+			t.Fatalf("rec_review 待办应携带追踪状态 id: %+v", it)
+		}
+	}
+
+	// AckReview 标记已读后从清单消失；他人不可标记。
+	var st model.RecommendationStatus
+	if err := common.DB.Where("recommendation_id = ?", 1).First(&st).Error; err != nil {
+		t.Fatalf("读取追踪状态失败: %v", err)
+	}
+	tracking := NewTrackingService(nil)
+	if err := tracking.AckReview(2, st.ID); err == nil {
+		t.Fatalf("他人标记已读应被拒绝")
+	}
+	if err := tracking.AckReview(1, st.ID); err != nil {
+		t.Fatalf("AckReview 失败: %v", err)
+	}
+	resAck, _ := svc.Build(context.Background(), 1)
+	if resAck.Reviews != 1 {
+		t.Fatalf("已读后推荐复盘应剩 1，得到 %d", resAck.Reviews)
 	}
 
 	// 用户隔离：用户2 只见自己的 1 条命中提醒。

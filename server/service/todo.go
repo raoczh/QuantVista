@@ -87,9 +87,9 @@ func (s *TodoService) Build(ctx context.Context, userID int64) (*TodoResult, err
 		}
 	}
 
-	// 2) 需复盘的短线推荐（阶段6 追踪：触发止盈/止损/过期）。
+	// 2) 需复盘的短线推荐（阶段6 追踪：触发止盈/止损/过期；已读的不再进清单）。
 	var statuses []model.RecommendationStatus
-	if err := common.DB.Where("user_id = ? AND review_needed = ?", userID, true).
+	if err := common.DB.Where("user_id = ? AND review_needed = ? AND review_ack = ?", userID, true, false).
 		Order("updated_at DESC").Find(&statuses).Error; err == nil {
 		for _, st := range statuses {
 			title := recReviewTitle[st.Outcome]
@@ -100,11 +100,13 @@ func (s *TodoService) Build(ctx context.Context, userID int64) (*TodoResult, err
 			if st.Outcome == model.RecOutcomeStopLoss {
 				pri = 1 // 止损最紧急
 			}
+			// RefID=追踪状态行 id，供前端「已读」就地消项（与 alert 条目 ref_id=事件 id 同款）；
+			// 跳转不依赖 ref_id（去处理仍整页跳推荐页）。
 			res.Items = append(res.Items, TodoItem{
 				Kind: TodoKindRecReview, Priority: pri,
 				Symbol: st.Symbol, Market: st.Market, Name: st.Symbol,
 				Title: title, Detail: recReviewDetail(st),
-				RefID: st.BatchID, RefType: "recommendations",
+				RefID: st.ID, RefType: "recommendations",
 			})
 			res.Reviews++
 		}

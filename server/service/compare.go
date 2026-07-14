@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"quantvista/datasource"
+	"quantvista/model"
 )
 
 // CompareService 个股横向对比：多只股票并排比较行情与技术指标，可选 AI 一句话点评。
@@ -74,6 +75,10 @@ type CompareResult struct {
 	AIComment      string         `json:"ai_comment"`
 	AICommentCheck *evidenceCheck `json:"ai_comment_check,omitempty"` // 服务端回填：AI 点评引用数字与各行指标的核验
 	Note           string         `json:"note"`
+	// AI 点评实际使用的 LLM（对比不落库，随响应回传供前端展示；无点评时为零值）。
+	AIConfigID int64  `json:"ai_llm_config_id,omitempty"`
+	AIProvider string `json:"ai_provider,omitempty"`
+	AIModel    string `json:"ai_model,omitempty"`
 }
 
 // Compare 并发采集各标的指标，去重后组装；WithAI 时追加一句话点评。
@@ -121,11 +126,16 @@ func (s *CompareService) Compare(ctx context.Context, userID int64, allowPrivate
 
 	// 可选 AI 一句话点评。
 	if req.WithAI {
-		comment, note := s.aiComment(ctx, userID, allowPrivate, req.LLMConfigID, rows)
+		comment, note, usedCfg := s.aiComment(ctx, userID, allowPrivate, req.LLMConfigID, rows)
 		res.AIComment = comment
 		if comment != "" {
 			// 证据核验：点评引用的数字与全部对比行的指标值域比对（点评无 K 线明细，全量收集即可）。
 			res.AICommentCheck = verifyEvidenceValues([]string{comment}, snapshotValueSet(rows))
+		}
+		if comment != "" && usedCfg != nil {
+			res.AIConfigID = usedCfg.ID
+			res.AIProvider = usedCfg.Provider
+			res.AIModel = usedCfg.Model
 		}
 		if note != "" {
 			res.Note = truncNote + note
@@ -216,19 +226,20 @@ func changeOverN(closes []float64, n int) float64 {
 	return round2((closes[len(closes)-1] - prev) / prev * 100)
 }
 
-// aiComment 生成一段横向对比点评。返回（点评, 说明）；失败或配额不足时点评为空、说明解释原因。
-func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPrivate bool, llmConfigID int64, rows []CompareRow) (string, string) {
+// aiComment 生成一段横向对比点评。返回（点评, 说明, 实际使用的 LLM 配置）；
+// 失败或配额不足时点评为空、说明解释原因、配置为 nil。
+func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPrivate bool, llmConfigID int64, rows []CompareRow) (string, string, *model.LLMConfig) {
 	cfg, apiKey, err := s.llm.ResolveForUse(userID, llmConfigID)
 	if err != nil {
-		return "", "AI 点评不可用：" + err.Error()
+		return "", "AI 点评不可用：" + err.Error(), nil
 	}
 	allowPrivate = llmAllowPrivate(allowPrivate, cfg) // 回退到管理员配置时按配置所有者放行内网
 	if err := checkQuota(userID); err != nil {
 		if errors.Is(err, errQuotaExhausted) {
-			return "", "AI 次数配额已用尽，仅展示指标对比"
+			return "", "AI 次数配额已用尽，仅展示指标对比", nil
 		}
 		// 与 analysis/qa/recommendation 一致 fail-closed：配额读不到时不放行调用。
-		return "", "AI 点评不可用：配额信息读取失败"
+		return "", "AI 点评不可用：配额信息读取失败", nil
 	}
 
 	// 只把有行情的标的喂给模型（含已算好的五维量化评分——此前算了却没喂给模型）。
@@ -244,7 +255,7 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 		b.WriteString("\n")
 	}
 	if valid < compareMinSymbols {
-		return "", "有效行情不足，无法生成 AI 点评"
+		return "", "有效行情不足，无法生成 AI 点评", nil
 	}
 
 	res, err := chatCompletion(ctx, chatParams{
@@ -258,12 +269,12 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 		Meta: chatMeta{CallerUserID: userID, Module: "compare", ConfigID: cfg.ID, Provider: cfg.Provider},
 	})
 	if err != nil {
-		return "", "AI 点评生成失败：" + err.Error()
+		return "", "AI 点评生成失败：" + err.Error(), nil
 	}
 	if res.Usage.TotalTokens > 0 {
 		consumeQuota(userID, res.Usage.TotalTokens, true)
 	}
-	return strings.TrimSpace(res.Content), ""
+	return strings.TrimSpace(res.Content), "", cfg
 }
 
 func nameOr(r CompareRow) string {
