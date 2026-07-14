@@ -2,18 +2,20 @@ package controller
 
 import (
 	"quantvista/common"
+	"quantvista/model"
 	"quantvista/service"
 
 	"github.com/gin-gonic/gin"
 )
 
-// ScreenerController M1 条件树选股：策略广场 / 全市场扫描 / 自定义策略管理。
+// ScreenerController M1 条件树选股：策略广场 / 全市场扫描 / 自定义策略管理 / AI 白话建策略（P3c）。
 type ScreenerController struct {
 	svc *service.ScreenerService
+	ai  *service.ScreenerAIService
 }
 
-func NewScreenerController(svc *service.ScreenerService) *ScreenerController {
-	return &ScreenerController{svc: svc}
+func NewScreenerController(svc *service.ScreenerService, ai *service.ScreenerAIService) *ScreenerController {
+	return &ScreenerController{svc: svc, ai: ai}
 }
 
 // Strategies GET /api/screener/strategies —— 内置策略 + 当前用户自定义 + 因子字典。
@@ -68,6 +70,24 @@ func (sc *ScreenerController) DeleteStrategy(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, gin.H{"deleted": true})
+}
+
+// Parse POST /api/screener/parse —— AI 白话建策略：自然语言解析为条件树（P3c）。
+// 只生成不执行：树由用户在前端确认后才落编辑器/保存/扫描。
+func (sc *ScreenerController) Parse(c *gin.Context) {
+	var req service.ParseStrategyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ApiErrorMsg(c, "请求格式错误")
+		return
+	}
+	// allowPrivate：仅管理员可触达内网自建模型（与分析/问答一致，防 SSRF）。
+	allowPrivate := currentRole(c) == model.RoleAdmin
+	res, err := sc.ai.ParseStrategy(c.Request.Context(), currentUserID(c), allowPrivate, req)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, res)
 }
 
 // Status GET /api/screener/status —— 因子宽表状态（数据日期/覆盖数/是否构建中）。
