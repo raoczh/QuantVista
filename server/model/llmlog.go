@@ -24,7 +24,10 @@ type LLMCallLog struct {
 	CompletionTokens int       `json:"completion_tokens"`
 	TotalTokens      int       `json:"total_tokens"`
 	LatencyMs        int64     `json:"latency_ms"`
-	RequestBody      string    `gorm:"type:text" json:"request_body"`
-	ResponseBody     string    `gorm:"type:text" json:"response_body"`
-	CreatedAt        time.Time `gorm:"index" json:"created_at"`
+	// FirstChunkMs 流式请求首个 data 块到达耗时（非流式恒 0）。
+	// ≈latency_ms 说明上游忽略 stream 整包返回（假流式网关），排查 60s 超时归属层时先看它。
+	FirstChunkMs int64     `json:"first_chunk_ms"`
+	RequestBody  string    `gorm:"type:text" json:"request_body"`
+	ResponseBody string    `gorm:"type:text" json:"response_body"`
+	CreatedAt    time.Time `gorm:"index" json:"created_at"`
 }

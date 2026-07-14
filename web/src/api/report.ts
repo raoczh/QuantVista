@@ -1,4 +1,4 @@
-import { request, AI_TIMEOUT } from './client'
+import { request } from './client'
 import type { RecommendationView } from './recommendation'
 import type { EvidenceCheck } from './trust'
 
@@ -20,7 +20,7 @@ export interface DailyReportRow {
   user_id: number
   trade_date: string
   market: string
-  status: 'success' | 'partial' | 'failed'
+  status: 'processing' | 'success' | 'partial' | 'failed'
   recommendation_batch_id: number
   error: string
   total_tokens: number
@@ -48,7 +48,9 @@ export function getLatestDailyReport() {
   return request<DailyReportView | null>({ url: '/daily-reports/latest' })
 }
 
-// 手动生成/重生成当日日报（计 1 次配额；AI 耗时较长）。
+// 手动生成/重生成当日日报（计 1 次配额）。2026-07-14 异步任务化：接口立即返回
+// processing 记录，复盘+推荐在服务端后台并行执行——轮询 getDailyReport 直到脱离
+// processing（lib/poll.ts 的 pollUntil），不再需要超长前端超时。
 export function generateDailyReport() {
-  return request<DailyReportView>({ url: '/daily-reports/generate', method: 'post', timeout: AI_TIMEOUT })
+  return request<DailyReportView>({ url: '/daily-reports/generate', method: 'post' })
 }

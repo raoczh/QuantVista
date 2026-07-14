@@ -21,6 +21,7 @@ import {
 } from '@/api/report'
 import { useUi } from '@/composables/useUi'
 import { useStockActions } from '@/composables/useStockActions'
+import { pollUntil } from '@/lib/poll'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
@@ -44,10 +45,10 @@ const historyOptions = computed(() =>
 )
 
 function statusText(s: string) {
-  return s === 'success' ? '完整' : s === 'partial' ? '部分成功' : '失败'
+  return s === 'success' ? '完整' : s === 'partial' ? '部分成功' : s === 'processing' ? '生成中' : '失败'
 }
-function statusType(s: string): 'success' | 'warning' | 'error' {
-  return s === 'success' ? 'success' : s === 'partial' ? 'warning' : 'error'
+function statusType(s: string): 'success' | 'warning' | 'error' | 'info' {
+  return s === 'success' ? 'success' : s === 'partial' ? 'warning' : s === 'processing' ? 'info' : 'error'
 }
 
 async function load() {
@@ -57,6 +58,10 @@ async function load() {
     if (rows.value.length) {
       selectedId.value = rows.value[0].id
       current.value = await getDailyReport(rows.value[0].id)
+      // 页面刷新恢复：最新报告仍在后台生成中，继续轮询跟踪。
+      if (current.value.status === 'processing') {
+        void trackProcessing(current.value.id)
+      }
     } else {
       current.value = null
     }
@@ -79,13 +84,45 @@ async function pick(id: number | null) {
   }
 }
 
+// trackProcessing 轮询后台任务直到脱离 processing（生成接口现在立即返回任务，
+// 复盘+推荐在服务端后台并行执行——关闭/刷新页面都不影响任务本身）。
+async function trackProcessing(id: number) {
+  generating.value = true
+  try {
+    const v = await pollUntil(
+      () => getDailyReport(id),
+      (r) => r.status !== 'processing',
+    )
+    if (selectedId.value === id || !selectedId.value) {
+      current.value = v
+      selectedId.value = id
+    }
+    rows.value = await listDailyReports(30)
+    if (v.status === 'failed') {
+      message.error(v.error || '日报生成失败')
+    } else {
+      message.success('日报已生成')
+    }
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    generating.value = false
+  }
+}
+
 async function doGenerate() {
   generating.value = true
   try {
-    current.value = await generateDailyReport()
-    message.success('日报已生成')
+    const v = await generateDailyReport()
+    selectedId.value = v.id
+    current.value = v
     rows.value = await listDailyReports(30)
-    selectedId.value = current.value.id
+    if (v.status === 'processing') {
+      message.info('任务已创建，正在后台生成（刷新或关闭页面不影响任务）')
+      await trackProcessing(v.id)
+      return
+    }
+    message.success('日报已生成')
   } catch (e) {
     message.error((e as Error).message)
   } finally {
@@ -198,7 +235,10 @@ onMounted(load)
           <div class="head">
             <span class="head-date qv-figure">{{ current.trade_date }}</span>
             <n-tag :type="statusType(current.status)" round :bordered="false">{{ statusText(current.status) }}</n-tag>
-            <span class="meta">耗时 {{ (current.latency_ms / 1000).toFixed(1) }}s · {{ current.total_tokens }} tokens</span>
+            <span v-if="current.status !== 'processing'" class="meta"
+              >耗时 {{ (current.latency_ms / 1000).toFixed(1) }}s · {{ current.total_tokens }} tokens</span
+            >
+            <span v-else class="meta">复盘与推荐正在后台并行生成，关闭或刷新页面不影响任务…</span>
             <n-button v-if="snapshotText" size="tiny" quaternary @click="snapshotShow = true">数据快照</n-button>
           </div>
           <div v-if="current.error" class="err">{{ current.error }}</div>
@@ -263,7 +303,10 @@ onMounted(load)
           </div>
         </SectionCard>
         <SectionCard v-else title="今日复盘">
-          <n-empty description="复盘生成失败（见上方错误），可点「生成 / 重生成今日」重试" />
+          <n-spin v-if="current.status === 'processing'" size="small" style="width: 100%; padding: 24px 0">
+            <template #description>AI 复盘生成中…</template>
+          </n-spin>
+          <n-empty v-else description="复盘生成失败（见上方错误），可点「生成 / 重生成今日」重试" />
         </SectionCard>
 
         <!-- 明日推荐 -->
@@ -314,6 +357,9 @@ onMounted(load)
               已按止盈/止损价自动创建到价卖点提醒（见「条件提醒」，note 标注「收盘日报」；命中即进今日待办并推送）。
             </p>
           </div>
+          <n-spin v-else-if="current.status === 'processing'" size="small" style="width: 100%; padding: 24px 0">
+            <template #description>明日推荐生成中…</template>
+          </n-spin>
           <n-empty v-else description="推荐未生成（候选池为空或 LLM 失败），可重生成重试" />
         </SectionCard>
 

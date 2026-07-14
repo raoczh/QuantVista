@@ -37,12 +37,14 @@ func writeLLMCallLog(p chatParams, stream bool, res *chatResult, callErr error, 
 	responseBody := ""
 	usage := chatUsage{}
 	latencyMs := elapsed.Milliseconds()
+	firstChunkMs := int64(0)
 	if res != nil {
 		responseBody = res.Content
 		usage = res.Usage
 		if res.LatencyMs > 0 {
 			latencyMs = res.LatencyMs
 		}
+		firstChunkMs = res.FirstChunkMs
 	}
 	if callErr != nil {
 		status = model.LLMCallStatusError
@@ -68,6 +70,7 @@ func writeLLMCallLog(p chatParams, stream bool, res *chatResult, callErr error, 
 		CompletionTokens: usage.CompletionTokens,
 		TotalTokens:      usage.TotalTokens,
 		LatencyMs:        latencyMs,
+		FirstChunkMs:     firstChunkMs,
 		RequestBody:      truncateAuditText(string(requestJSON), llmCallBodyLimit),
 		ResponseBody:     truncateAuditText(responseBody, llmCallBodyLimit),
 	}
@@ -127,7 +130,7 @@ func (s *AdminService) ListLLMCalls(userID int64, module, status string, page, p
 		return nil, err
 	}
 	var logs []model.LLMCallLog
-	if err := q.Select("id,user_id,module,llm_config_id,provider,model,endpoint_type,stream,status,error_msg,prompt_tokens,completion_tokens,total_tokens,latency_ms,created_at").
+	if err := q.Select("id,user_id,module,llm_config_id,provider,model,endpoint_type,stream,status,error_msg,prompt_tokens,completion_tokens,total_tokens,latency_ms,first_chunk_ms,created_at").
 		Order("id desc").Offset((page - 1) * pageSize).Limit(pageSize).Find(&logs).Error; err != nil {
 		return nil, err
 	}

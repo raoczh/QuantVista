@@ -41,6 +41,7 @@ import {
 import { getPreference, updatePreference, type UserPreference } from '@/api/user'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
+import { pollUntil } from '@/lib/poll'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
@@ -63,7 +64,6 @@ const form = ref<RecommendRequest>({
   count: 5,
   verify: false,
 })
-const isShort = computed(() => form.value.type === 'short_term')
 
 // ---------- 筛选条件（阶段②用户硬过滤，默认从偏好读，可临时改随请求提交） ----------
 const filters = ref<RecFilters>(emptyRecFilters())
@@ -211,17 +211,54 @@ async function generate() {
   if (!pref.value) await loadPrefFilters()
   running.value = true
   try {
-    current.value = await generateRecommendations({ ...form.value, filters: { ...filters.value } })
-    if (current.value.status === 'degraded') {
-      message.warning('模型未给出候选池内的有效推荐，请调整策略或稍后重试')
-    } else if (current.value.items.length) {
-      message.success(`已生成 ${current.value.items.length} 个${isShort.value ? '短线' : '长线'}标的`)
+    // 2026-07-14 异步任务化：接口立即返回 processing 批次（建池/评分/AI 精选在服务端
+    // 后台执行），轮询详情直到脱离 processing——浏览器超时/刷新不再中断任务。
+    const v = await generateRecommendations({ ...form.value, filters: { ...filters.value } })
+    current.value = v
+    if (v.status === 'processing') {
+      message.info('任务已创建，正在后台生成（刷新或关闭页面不影响任务）')
+      await loadHistory()
+      await trackBatch(v.id)
+      return
     }
+    notifyResult(v)
   } catch (e) {
     message.error((e as Error).message)
   } finally {
     running.value = false
     await loadHistory()
+  }
+}
+
+// trackBatch 轮询后台任务直到脱离 processing；页面刷新后凭历史里的 processing 批次恢复跟踪。
+async function trackBatch(id: number) {
+  running.value = true
+  try {
+    const v = await pollUntil(
+      () => getRecommendation(id),
+      (r) => r.status !== 'processing',
+    )
+    if (!current.value || current.value.id === id) current.value = v
+    notifyResult(v)
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    running.value = false
+    await loadHistory()
+  }
+}
+
+function notifyResult(v: RecommendationView) {
+  if (v.status === 'failed') {
+    message.error(v.error || '生成失败')
+  } else if (v.status === 'degraded') {
+    message.warning(
+      v.items.length
+        ? 'AI 精选超时，已生成量化降级推荐（规则生成，未经 AI 解读）'
+        : '模型未给出候选池内的有效推荐，请调整策略或稍后重试',
+    )
+  } else if (v.items.length) {
+    message.success(`已生成 ${v.items.length} 个${v.type === 'short_term' ? '短线' : '长线'}标的`)
   }
 }
 
@@ -383,6 +420,12 @@ function fmtTime(t: string) {
 
 onMounted(async () => {
   await Promise.all([loadStrategies(), loadLLM(), loadHistory(), loadPerformance(), loadPrefFilters()])
+  // 页面刷新恢复：仍在后台生成中的批次自动恢复跟踪（后端对陈旧 processing 会惰性判 failed）。
+  const processing = history.value.find((h) => h.status === 'processing')
+  if (processing) {
+    current.value = await getRecommendation(processing.id).catch(() => null)
+    void trackBatch(processing.id)
+  }
 })
 
 // ---------- 追踪 + 表现统计 ----------
@@ -543,9 +586,9 @@ function signedPct(n: number | undefined) {
                   <n-tag
                     v-if="h.status !== 'success'"
                     size="tiny"
-                    :type="h.status === 'failed' ? 'error' : 'warning'"
+                    :type="h.status === 'failed' ? 'error' : h.status === 'processing' ? 'info' : 'warning'"
                     :bordered="false"
-                    >{{ h.status === 'failed' ? '失败' : '降级' }}</n-tag
+                    >{{ h.status === 'failed' ? '失败' : h.status === 'processing' ? '生成中' : '降级' }}</n-tag
                   >
                   <n-popconfirm @positive-click="removeBatch(h)">
                     <template #trigger>
@@ -655,11 +698,18 @@ function signedPct(n: number | undefined) {
                 AI 复核员：{{ reviewOverall }}
               </n-alert>
 
+              <n-alert v-if="current.status === 'processing'" type="info" :bordered="false" style="margin-bottom: 12px">
+                正在后台生成（建池 → 量化评分 → AI 精选）…… 关闭或刷新页面不影响任务，完成后自动展示。
+              </n-alert>
+
               <n-alert v-if="current.status === 'degraded'" type="warning" :bordered="false" style="margin-bottom: 12px">
                 {{ current.error || '模型未给出候选池内的有效推荐' }}
               </n-alert>
 
-              <n-empty v-if="!current.items.length && current.status !== 'degraded'" description="本批无有效标的" />
+              <n-empty
+                v-if="!current.items.length && current.status !== 'degraded' && current.status !== 'processing'"
+                description="本批无有效标的"
+              />
 
               <div class="cards">
                 <div v-for="it in current.items" :key="it.id" class="card">
@@ -668,6 +718,9 @@ function signedPct(n: number | undefined) {
                     <div class="card-title">
                       <span class="ct-name">{{ it.name || it.symbol }}</span>
                       <span class="ct-symbol qv-mono">{{ it.symbol }}</span>
+                      <n-tag v-if="it.detail?.degraded_source" size="tiny" type="warning" :bordered="false" round
+                        >量化降级</n-tag
+                      >
                       <n-tag v-if="it.position" size="tiny" type="success" :bordered="false" round>已建仓</n-tag>
                     </div>
                     <div class="card-badges">

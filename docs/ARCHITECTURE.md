@@ -391,12 +391,14 @@ LLM 的角色从「海选者」降级为「解释者/否决者」（listwise 海
 3. 本地量化评分（零 LLM 成本）：Top48 拉 90 根日线算技术因子 + 五维评分 + 策略加分，池内排名；
   |   换手 20~30% 在此按位置分档：60日区间 ≥65% 高位＝死亡换手排除，低位保留并扣分标注风险
   |
-4. LLM 精选：只见量化 Top16，强制引用字段名+数值、禁先验记忆、合格标的充足时给足数量/不足可 0 只；越池/非 Top16 标的一律丢弃
+4. LLM 精选：只见量化 Top10，强制引用字段名+数值、禁先验记忆、合格标的充足时给足数量/不足可 0 只；越池/非 Top10 标的一律丢弃
   |
 校验结构化输出（有限次 repair）→ 信任层回填（见 §6.8）→ 批次+条目事务落库 → 初始化追踪
 ```
 
-关键常量：`maxScanCandidates=48 / maxLLMCandidates=16 / maxPoolIntake=240 / poolSnapshotMax=150`。
+关键常量：`maxScanCandidates=48 / maxLLMCandidates=10 / maxPoolIntake=240 / poolSnapshotMax=150`。
+
+推荐/日报生成为**异步任务**（2026-07-14）：生成接口先落 `processing` 批次/报告立即返回，建池→评分→LLM 精选在服务端后台独立 Context（`context.Background()`+总 deadline）执行完成后回写，前端轮询详情直到脱离 processing——浏览器超时、反代 60s 掐断、页面刷新都不再中断任务；AI 精选超时时按量化排名生成**降级推荐**（规则计划价、条目带 `degraded_source` 标记、置信度恒 low）。
 
 策略-来源映射（`strategySources`，对冲「热度榜供给的票恰是风控规则最想排除的票」的结构性矛盾）：
 momentum=涨幅+换手+成交额；pullback=**回调榜**(跌幅升序过滤温和回调)+成交额+涨幅；active=成交额+换手+涨幅；
@@ -458,6 +460,15 @@ value=**低PB榜**(升序滤负PB)+成交额；growth=涨幅+换手+成交额；
 - 写失败仅 SysWarn 不影响主流程；`common.DB` 为空直接跳过（直调 ai_client 的单测不受影响）。
 - 管理端 `GET /api/admin/llm-calls`（列表显式排除两 TEXT 列防大响应，user/module/status 筛选+分页）与 `/api/admin/llm-calls/:id`（全文详情），仅 AdminAuth；前端 `/admin/llm-calls` 页。**请求正文含用户数据（持仓、自选等），仅管理员可见。**
 - 每日 03:25 清理 90 天前记录。
+- **stream 列记录实际请求形态**（2026-07-14）：`chatCompletion` 内部流式优先、上游拒绝 stream 时回落非流式——审计按实际发出的请求记 stream 值，不按入口意图；`first_chunk_ms` 记流式首个 data 块到达耗时（非流式恒 0），**≈latency_ms 即上游忽略 stream 整包返回（假流式网关）**，是排查 60s 超时归属层的第一观测。
+
+### 6.10 生成类任务异步化与超时预算（2026-07-14）
+
+背景：部分 LLM 中转站对单次请求有 **60s 绝对整包超时**（不可调），且浏览器/反代链路也存在同量级超时——同步整包接口一次串行 2~5 次 LLM 调用必然被掐断。三层组合解法：
+
+1. **异步任务化**：不建通用 jobs 表，直接复用业务表状态——`recommendation_batches`/`daily_reports` 新增 `processing` 状态；生成接口同步段只做校验/LLM 配置解析/配额熔断并落 processing 行立即返回，后台 goroutine 用 `context.Background()`+总 deadline（推荐 6min/日报 8min）执行后回写。前端 `pollUntil`（`web/src/lib/poll.ts`）2.5s 轮询详情；页面刷新凭列表里的 processing 记录恢复跟踪。幂等防重：同用户存在 15min 内的 processing 记录直接复用；超过 15min 的视为死任务（进程重启遗留）惰性判 failed。
+2. **单次调用瘦身**：模块级输出预算 `capModuleTokens(用户 max_tokens, 模块上限)`——复盘 1500/推荐主调与 repair 2500/复核 1500（输出 token 数是生成时长的主导项）；LLM 名单 Top16→10；prompt 输出纪律（reason/risks/evidence 条数与单条字数上限、落选理由 ≤20 字）；repair 次数 2→1 且坏输出只回灌开头片段（推荐 600 字/日报 800 字）。
+3. **可靠降级**：AI 主调用**超时/网络/5xx/流中断**类失败时按量化排名生成降级推荐（`buildQuantFallbackPicks`：ATR 规则计划价、action 恒 watch、置信度恒 low、`degraded_source=quant_fallback` 标记）；鉴权/路径/配额类确定性错误不降级直接失败。日报复盘与推荐两路 goroutine **并行**（互不阻断，单方失败 partial 语义不变）；重生成不再「先删后生成」——旧行原地置 processing、内容字段保留，双败回滚旧状态（旧报告不丢）。
 
 ## 7. 数据缓存策略
 
