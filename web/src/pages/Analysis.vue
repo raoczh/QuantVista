@@ -38,6 +38,7 @@ import {
 } from '@/api/analysis'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
+import { useLlmLabel } from '@/composables/useLlmLabel'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
@@ -47,6 +48,7 @@ const message = useMessage()
 const route = useRoute()
 const router = useRouter()
 const { upColor, downColor, flatColor, vars, withAlpha, pctColor } = useUi()
+const { llmLabel } = useLlmLabel()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const moduleOptions: { label: string; value: AnalysisModule }[] = [
@@ -757,7 +759,7 @@ onMounted(async () => {
               <!-- 元信息 -->
               <div class="meta">
                 <n-space size="small" :wrap="true" align="center">
-                  <span>模型 {{ current.model || '—' }}</span>
+                  <span>模型 {{ llmLabel(current) || current.model || '—' }}</span>
                   <span v-if="current.total_tokens">· token {{ current.total_tokens }}</span>
                   <span v-if="current.latency_ms">· 耗时 {{ (current.latency_ms / 1000).toFixed(1) }}s</span>
                   <span>· 版本 {{ current.prompt_version }}/{{ current.strategy_version }}</span>

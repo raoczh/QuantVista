@@ -54,6 +54,10 @@ type ParseStrategyResult struct {
 	Conditions    []string  `json:"conditions"` // describeCondTree 人话条件清单（前端预览）
 	PromptVersion string    `json:"prompt_version"`
 	TotalTokens   int       `json:"total_tokens"`
+	// 实际使用的 LLM（解析不落库，随响应回传供前端展示）。
+	LLMConfigID int64  `json:"llm_config_id"`
+	Provider    string `json:"provider"`
+	Model       string `json:"model"`
 }
 
 // ParseStrategy 把白话选股描述解析为条件树。校验失败 repair 一次，仍不过则报错
@@ -129,6 +133,9 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 		Explain:       truncateRunes(strings.TrimSpace(parsed.Explain), 200),
 		PromptVersion: screenerParsePromptVersion,
 		TotalTokens:   acc.TotalTokens,
+		LLMConfigID:   cfg.ID,
+		Provider:      cfg.Provider,
+		Model:         cfg.Model,
 	}
 	if out.Unmatched == nil {
 		out.Unmatched = []string{}

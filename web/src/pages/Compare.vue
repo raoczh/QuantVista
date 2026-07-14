@@ -15,6 +15,7 @@ import {
 import { compareStocks, type CompareResult } from '@/api/compare'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
+import { useLlmLabel } from '@/composables/useLlmLabel'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 
@@ -22,6 +23,7 @@ const message = useMessage()
 const route = useRoute()
 const router = useRouter()
 const { pctColor, upColor, vars, withAlpha } = useUi()
+const { llmLabel } = useLlmLabel()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const marketOptions = [
@@ -297,6 +299,11 @@ const aiCheckColor = computed(() =>
           <div v-if="result.ai_comment" class="ai">
             <div class="ai-title">
               <span>AI 点评</span>
+              <span
+                v-if="llmLabel({ llm_config_id: result.ai_llm_config_id, provider: result.ai_provider, model: result.ai_model })"
+                class="ai-model"
+                >{{ llmLabel({ llm_config_id: result.ai_llm_config_id, provider: result.ai_provider, model: result.ai_model }) }}</span
+              >
               <n-tooltip v-if="aiCheck" trigger="hover">
                 <template #trigger>
                   <span class="check-chip" :style="{ background: withAlpha(aiCheckColor, 0.12), color: aiCheckColor }">
@@ -411,6 +418,11 @@ const aiCheckColor = computed(() =>
   display: flex;
   align-items: center;
   gap: 10px;
+}
+.ai-model {
+  font-size: 12px;
+  font-weight: 400;
+  opacity: 0.55;
 }
 .check-chip {
   font-size: 12px;

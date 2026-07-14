@@ -28,6 +28,7 @@ export interface RecFilters {
   turnover_max: number
   max_gain_5d_pct: number
   exclude_limit_up: boolean
+  exclude_gem_star: boolean // 排除创业板(30)/科创板(68)，仅推荐主板普通个股
 }
 
 export function emptyRecFilters(): RecFilters {
@@ -40,6 +41,7 @@ export function emptyRecFilters(): RecFilters {
     turnover_max: 0,
     max_gain_5d_pct: 25,
     exclude_limit_up: true,
+    exclude_gem_star: false,
   }
 }
 
@@ -232,6 +234,7 @@ export interface RecommendationBatch {
   rejected_json?: string // 池内落选理由 JSON（详情接口返回，列表不含）
   filters_json?: string // 本次生效筛选条件快照（详情接口返回）
   review_json?: string // AI 复核结论 JSON（verify 模式，详情接口返回）
+  llm_config_id?: number // 生成时使用的 LLM 配置 id（配置名前端按自己的清单解析）
   provider: string
   model: string
   prompt_version: string
@@ -286,4 +289,9 @@ export function getPerformance(type?: string) {
     method: 'get',
     params: { type },
   })
+}
+
+// 标记推荐复盘提示已读（今日待办 rec_review 条目就地消项；statusId=追踪状态行 id）。
+export function ackRecommendationReview(statusId: number) {
+  return request<{ ok: boolean }>({ url: `/recommendations/review-ack/${statusId}`, method: 'put' })
 }

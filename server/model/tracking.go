@@ -45,6 +45,9 @@ type RecommendationStatus struct {
 
 	Outcome          string `gorm:"size:16" json:"outcome"`
 	ReviewNeeded     bool   `json:"review_needed"` // 是否需要复盘（触发止盈/止损/过期）
+	// ReviewAck 用户已读/处理复盘提示（今日待办可就地标记消项）。人工标记，
+	// 必须不在追踪 upsert 的覆盖列里——否则每 2h 后台刷新会把已读打回未读。
+	ReviewAck bool `json:"review_ack"`
 	HitTakeProfit    bool   `json:"hit_take_profit"`
 	HitStopLoss      bool   `json:"hit_stop_loss"`
 	ElapsedTradeDays int    `json:"elapsed_trade_days"`            // 从推荐日到今的已过交易日

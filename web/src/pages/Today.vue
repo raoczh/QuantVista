@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { NButton, NSpin, NEmpty, NTag, NGrid, NGi, useMessage } from 'naive-ui'
 import { getTodos, type TodoItem, type TodoResult } from '@/api/todo'
 import { setAlertEventStatus } from '@/api/alert'
+import { ackRecommendationReview } from '@/api/recommendation'
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
@@ -79,6 +80,21 @@ async function markAlert(item: TodoItem, status: 'read' | 'dismissed') {
   }
 }
 
+// 推荐复盘待办可就地已读消项（ref_id 即追踪状态行 id；后台追踪刷新不会打回未读）。
+async function markRecReview(item: TodoItem) {
+  if (marking.value) return
+  marking.value = item.ref_id
+  try {
+    await ackRecommendationReview(item.ref_id)
+    message.success('已标记已读')
+    await load()
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    marking.value = null
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -132,6 +148,11 @@ onMounted(load)
                     >已读</n-button
                   >
                   <n-button size="small" quaternary @click="markAlert(it, 'dismissed')">忽略</n-button>
+                </template>
+                <template v-else-if="it.kind === 'rec_review'">
+                  <n-button size="small" quaternary :loading="marking === it.ref_id" @click="markRecReview(it)"
+                    >已读</n-button
+                  >
                 </template>
                 <n-button size="small" tertiary @click="handle(it)">去处理</n-button>
               </div>

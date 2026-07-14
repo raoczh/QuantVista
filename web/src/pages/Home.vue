@@ -19,6 +19,7 @@ import { listWatchlists } from '@/api/watchlist'
 import { listRecommendations, type RecommendationBatch } from '@/api/recommendation'
 import { getLatestDailyReport, type DailyReportView } from '@/api/report'
 import { useUi } from '@/composables/useUi'
+import { useLlmLabel } from '@/composables/useLlmLabel'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import { useStockActions } from '@/composables/useStockActions'
 import PageContainer from '@/components/PageContainer.vue'
@@ -30,6 +31,7 @@ import ChangeTag from '@/components/ChangeTag.vue'
 const message = useMessage()
 const router = useRouter()
 const { vars, isDark, pctColor, upColor, downColor, flatColor, withAlpha } = useUi()
+const { llmLabel } = useLlmLabel()
 const { adding, goAnalysis, goQa, goCompare, goAlert, goDetail, addToWatchlist } = useStockActions()
 
 // ---------- 市场概览 ----------
@@ -636,7 +638,7 @@ function onResize() {
               <n-button size="tiny" quaternary type="primary" @click="router.push('/daily-report')">查看日报 →</n-button>
             </template>
             <div v-if="latestReport?.review" class="report-brief">
-              <div class="rb-date">{{ latestReport.trade_date }} 收盘日报</div>
+              <div class="rb-date">{{ latestReport.trade_date }} 收盘日报<template v-if="llmLabel(latestReport)"> · {{ llmLabel(latestReport) }}</template></div>
               <p class="rb-summary">{{ latestReport.review.summary }}</p>
               <p v-if="latestReport.review.tomorrow_plan" class="rb-plan">明日：{{ latestReport.review.tomorrow_plan }}</p>
             </div>

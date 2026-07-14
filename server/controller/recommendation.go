@@ -86,6 +86,20 @@ func (rc *RecommendationController) Delete(c *gin.Context) {
 	common.ApiSuccess(c, gin.H{"ok": true})
 }
 
+// AckReview PUT /api/recommendations/review-ack/:id —— 标记推荐复盘提示已读
+//（:id 为追踪状态行 id，今日待办 rec_review 条目的 ref_id）。
+func (rc *RecommendationController) AckReview(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	if err := rc.tracking.AckReview(currentUserID(c), id); err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, gin.H{"ok": true})
+}
+
 // Performance GET /api/recommendations/performance?type= —— 推荐历史表现统计（带样本量）。
 func (rc *RecommendationController) Performance(c *gin.Context) {
 	stats, err := rc.tracking.Performance(currentUserID(c), c.Query("type"))

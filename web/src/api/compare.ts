@@ -35,6 +35,10 @@ export interface CompareResult {
   ai_comment: string
   ai_comment_check?: EvidenceCheck // AI 点评引用数字与各行指标的核验（服务端回填）
   note: string
+  // AI 点评实际使用的 LLM（无点评时缺席）。
+  ai_llm_config_id?: number
+  ai_provider?: string
+  ai_model?: string
 }
 
 export interface CompareRequest {

@@ -94,9 +94,24 @@ func (s *DailyReportService) List(userID int64, limit int) ([]model.DailyReport,
 	}
 	var rows []model.DailyReport
 	err := common.DB.Select("id", "user_id", "trade_date", "market", "status", "prompt_version",
+		"llm_config_id", "provider", "model",
 		"recommendation_batch_id", "error", "total_tokens", "latency_ms", "created_at", "updated_at").
 		Where("user_id = ?", userID).Order("trade_date DESC, id DESC").Limit(limit).Find(&rows).Error
 	return rows, err
+}
+
+// Delete 删除一份日报（仅本人）。生成中的新鲜任务拒删——后台 goroutine 完成后的
+// 回写会让删除名存实亡（Save 按主键 UPDATE 落空即静默丢失，行为不可预期）。
+// 关联的推荐批次与卖点提醒不级联删（推荐历史独立可见，提醒有自身过期清理）。
+func (s *DailyReportService) Delete(userID, id int64) error {
+	var r model.DailyReport
+	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&r).Error; err != nil {
+		return errors.New("日报不存在")
+	}
+	if r.Status == model.ReportStatusProcessing && time.Since(r.UpdatedAt) < reportProcessingStale {
+		return errors.New("日报正在生成中，请等任务结束后再删除")
+	}
+	return common.DB.Delete(&r).Error
 }
 
 // Get 日报详情（含复盘全文与推荐批次视图）。
@@ -281,6 +296,10 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 	report.SnapshotJSON = string(snapJSON)
 	// M3c：复盘 prompt 版本落库（启用 daily 自定义模板时 -custom 后缀，历史可归因）。
 	report.PromptVersion = promptVersionFor(userID, model.PromptModuleDaily, dailyReviewPromptVersion)
+	// 生成时使用的 LLM 落库（配置名前端按 llm_config_id 查自己的配置清单解析）。
+	report.LLMConfigID = plan.cfg.ID
+	report.Provider = plan.cfg.Provider
+	report.Model = plan.cfg.Model
 	report.TotalTokens = reviewTokens
 	if reviewErr == nil {
 		review.EvidenceCheck = dailyReviewEvidence(review, snapshot) // 信任层回填后随 ReviewJSON 一起落库

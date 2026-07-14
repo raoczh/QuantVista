@@ -27,6 +27,7 @@ import {
 import type { EvidenceCheck, RiskFlag } from '@/api/trust'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
+import { useLlmLabel } from '@/composables/useLlmLabel'
 import { renderMarkdown } from '@/lib/markdown'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
@@ -35,6 +36,7 @@ const message = useMessage()
 const route = useRoute()
 const router = useRouter()
 const { upColor, vars, withAlpha } = useUi()
+const { llmLabel } = useLlmLabel()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const marketOptions = [
@@ -301,7 +303,7 @@ onMounted(async () => {
           <template v-if="current" #extra>
             <div class="extra-row">
               <n-button size="tiny" quaternary @click="openSnapshot">数据快照</n-button>
-              <span class="chat-meta">{{ current.model }} · {{ current.total_tokens }} tokens</span>
+              <span class="chat-meta">{{ llmLabel(current) || current.model }} · {{ current.total_tokens }} tokens</span>
             </div>
           </template>
 

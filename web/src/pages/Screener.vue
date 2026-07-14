@@ -42,6 +42,7 @@ import {
   type ParseStrategyResult,
 } from '@/api/screener'
 import { useUi } from '@/composables/useUi'
+import { useLlmLabel } from '@/composables/useLlmLabel'
 import { useIsMobile } from '@/composables/useIsMobile'
 import { useStockActions } from '@/composables/useStockActions'
 import PageContainer from '@/components/PageContainer.vue'
@@ -51,6 +52,7 @@ import ChangeTag from '@/components/ChangeTag.vue'
 const message = useMessage()
 const router = useRouter()
 const { vars } = useUi()
+const { llmLabel } = useLlmLabel()
 const { isMobile } = useIsMobile()
 const actions = useStockActions()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
@@ -638,6 +640,7 @@ async function removeCustom(id: number) {
           </div>
           <div v-if="aiResult" class="ai-preview">
             <p v-if="aiResult.explain" class="ai-explain">AI 理解：{{ aiResult.explain }}</p>
+            <p v-if="llmLabel(aiResult)" class="ai-explain">解析模型：{{ llmLabel(aiResult) }}</p>
             <div v-if="aiResult.conditions?.length" class="sc-conds">
               <n-tag v-for="c in aiResult.conditions" :key="c" size="small" :bordered="false" class="cond-tag">{{ c }}</n-tag>
             </div>

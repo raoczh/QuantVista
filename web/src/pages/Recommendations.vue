@@ -41,6 +41,7 @@ import {
 import { getPreference, updatePreference, type UserPreference } from '@/api/user'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
+import { useLlmLabel } from '@/composables/useLlmLabel'
 import { pollUntil } from '@/lib/poll'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
@@ -49,6 +50,7 @@ import TrustBadges from '@/components/TrustBadges.vue'
 const message = useMessage()
 const router = useRouter()
 const { upColor, downColor, flatColor, vars, withAlpha } = useUi()
+const { llmLabel } = useLlmLabel()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const marketOptions = [
@@ -301,6 +303,15 @@ function buildPosition(item: RecommendationItem) {
   })
 }
 
+// 点击推荐标的名/代码：新窗口打开个股详情（保留本页的生成/追踪上下文）。
+function openStockDetail(item: RecommendationItem) {
+  const href = router.resolve({
+    name: 'stock-detail',
+    params: { market: item.market || 'cn', symbol: item.symbol },
+  }).href
+  window.open(href, '_blank')
+}
+
 // 推荐参考价 vs 实际买入价 偏离 %。
 function buyDeviationPct(item: RecommendationItem) {
   if (!item.position || !item.ref_price) return null
@@ -532,6 +543,10 @@ function signedPct(n: number | undefined) {
                   <n-switch v-model:value="filters.exclude_limit_up" size="small" />
                 </div>
                 <div class="filters-switch">
+                  <span>排除创业板/科创板（仅主板个股）</span>
+                  <n-switch v-model:value="filters.exclude_gem_star" size="small" />
+                </div>
+                <div class="filters-switch">
                   <span>追高保护：近5日涨幅上限%（0=不限）</span>
                   <n-input-number v-model:value="filters.max_gain_5d_pct" :min="0" :max="100" size="small" style="width: 90px" />
                 </div>
@@ -580,7 +595,9 @@ function signedPct(n: number | undefined) {
                     }}</n-tag>
                     <span class="hist-name">{{ batchTitle(h) }}</span>
                   </div>
-                  <div class="hist-sub">{{ fmtTime(h.created_at) }} · 候选 {{ h.candidate_count }}</div>
+                  <div class="hist-sub">
+                    {{ fmtTime(h.created_at) }} · 候选 {{ h.candidate_count }}<template v-if="llmLabel(h)"> · {{ llmLabel(h) }}</template>
+                  </div>
                 </div>
                 <div class="hist-side">
                   <n-tag
@@ -677,7 +694,10 @@ function signedPct(n: number | undefined) {
                   typeLabel(current.type)
                 }}</n-tag>
                 <span class="res-strategy">{{ batchTitle(current) }}</span>
-                <span class="res-meta">候选池 {{ current.candidate_count }} · {{ fmtTime(current.created_at) }}</span>
+                <span class="res-meta"
+                  >候选池 {{ current.candidate_count }} · {{ fmtTime(current.created_at)
+                  }}<template v-if="llmLabel(current)"> · {{ llmLabel(current) }}</template></span
+                >
                 <n-button
                   v-if="current.items.length"
                   class="res-track"
@@ -716,8 +736,10 @@ function signedPct(n: number | undefined) {
                   <!-- 头 -->
                   <div class="card-head">
                     <div class="card-title">
-                      <span class="ct-name">{{ it.name || it.symbol }}</span>
-                      <span class="ct-symbol qv-mono">{{ it.symbol }}</span>
+                      <span class="ct-name ct-link" title="新窗口打开个股详情" @click="openStockDetail(it)">{{
+                        it.name || it.symbol
+                      }}</span>
+                      <span class="ct-symbol qv-mono ct-link" @click="openStockDetail(it)">{{ it.symbol }}</span>
                       <n-tag v-if="it.detail?.degraded_source" size="tiny" type="warning" :bordered="false" round
                         >量化降级</n-tag
                       >
@@ -1207,6 +1229,13 @@ function signedPct(n: number | undefined) {
 .ct-symbol {
   font-size: 12px;
   opacity: 0.5;
+}
+.ct-link {
+  cursor: pointer;
+}
+.ct-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 .card-badges {
   display: flex;
