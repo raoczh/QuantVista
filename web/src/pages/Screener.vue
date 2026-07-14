@@ -28,6 +28,7 @@ import {
   saveScreenerStrategy,
   deleteScreenerStrategy,
   getScreenerStatus,
+  parseScreenerStrategy,
   PERIOD_LABEL,
   RISK_LABEL,
   RISK_TAG_TYPE,
@@ -38,6 +39,7 @@ import {
   type FactorTableStatus,
   type FactorDef,
   type CondNode,
+  type ParseStrategyResult,
 } from '@/api/screener'
 import { useUi } from '@/composables/useUi'
 import { useIsMobile } from '@/composables/useIsMobile'
@@ -255,6 +257,7 @@ function flattenTree(tree: CondNode | null): CondRow[] | null {
 function openCreate() {
   editorForm.value = { id: 0, name: '', desc: '', period: 'swing', risk: 'mid' }
   editorRows.value = [{ factor: 'chg_pct', op: 'between', value: 1, value2: 6 }]
+  resetAiGen()
   editorShow.value = true
 }
 function openEdit(cs: CustomStrategy) {
@@ -265,11 +268,81 @@ function openEdit(cs: CustomStrategy) {
   }
   editorForm.value = { id: cs.id, name: cs.name, desc: cs.desc, period: cs.period || 'swing', risk: cs.risk || 'mid' }
   editorRows.value = rows
+  resetAiGen()
   editorShow.value = true
 }
 
+// ---------- AI 白话生成（P3c）----------
+// AI 只负责生成：预览（人话条件 + unmatched 警示）→ 用户点「套用」才落编辑器，
+// 不直接执行扫描。嵌套 any 树无法行式编辑，以只读条件清单形态套用（可保存/试扫）。
+
+const aiText = ref('')
+const aiParsing = ref(false)
+const aiResult = ref<ParseStrategyResult | null>(null)
+// 套用的嵌套树（行式编辑器只支持一层 all 的既有约束）：非空时行编辑区切只读展示。
+const aiAdvancedTree = ref<CondNode | null>(null)
+const aiAdvancedConditions = ref<string[]>([])
+
+function resetAiGen() {
+  aiText.value = ''
+  aiParsing.value = false
+  aiResult.value = null
+  aiAdvancedTree.value = null
+  aiAdvancedConditions.value = []
+}
+
+async function runAiParse() {
+  const text = aiText.value.trim()
+  if (!text) {
+    message.warning('请先用白话描述选股条件')
+    return
+  }
+  aiParsing.value = true
+  aiResult.value = null
+  try {
+    aiResult.value = await parseScreenerStrategy(text)
+    if (!aiResult.value.tree) {
+      message.warning('AI 未能映射出任何条件（因子库没有对应数据，详见提示）')
+    }
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    aiParsing.value = false
+  }
+}
+
+function adoptAiResult() {
+  const r = aiResult.value
+  if (!r?.tree) return
+  const rows = flattenTree(r.tree)
+  if (rows) {
+    editorRows.value = rows
+    aiAdvancedTree.value = null
+    aiAdvancedConditions.value = []
+  } else {
+    aiAdvancedTree.value = r.tree
+    aiAdvancedConditions.value = r.conditions ?? []
+    message.info('AI 生成了嵌套条件组（满足其一），已按只读方式套用，可直接保存或试扫')
+  }
+  if (!editorForm.value.desc && r.explain) {
+    editorForm.value.desc = r.explain.slice(0, 120)
+  }
+  message.success('已套用到编辑器，请确认后保存')
+}
+
+function clearAdvancedTree() {
+  aiAdvancedTree.value = null
+  aiAdvancedConditions.value = []
+  if (!editorRows.value.length) addRow()
+}
+
+// 编辑器当前生效的条件树：AI 嵌套树优先，否则由编辑行构造。
+function editorTree(): CondNode | null {
+  return aiAdvancedTree.value ?? rowsToTree(editorRows.value)
+}
+
 async function saveEditor() {
-  const tree = rowsToTree(editorRows.value)
+  const tree = editorTree()
   if (!editorForm.value.name.trim()) {
     message.warning('请填写策略名称')
     return
@@ -299,7 +372,7 @@ async function saveEditor() {
 }
 
 async function tryScanEditor() {
-  const tree = rowsToTree(editorRows.value)
+  const tree = editorTree()
   if (!tree) {
     message.warning('请补全条件后再试扫')
     return
@@ -547,7 +620,48 @@ async function removeCustom(id: number) {
             </n-gi>
           </n-grid>
         </n-form>
-        <div class="editor-rows">
+        <!-- AI 白话生成（P3c）：预览确认后才落编辑器，AI 不直接执行扫描 -->
+        <div class="ai-gen">
+          <p class="rows-hint">
+            AI 生成：用白话描述选股条件（如「缩量回踩 20 日线且获利盘低于 15%」），生成后先预览，点「套用」才会写入下方编辑器（消耗 1 次 AI 配额）。
+          </p>
+          <div class="ai-input-row">
+            <n-input
+              v-model:value="aiText"
+              type="textarea"
+              :rows="2"
+              maxlength="300"
+              show-count
+              placeholder="例：量比 2 以上放量突破 20 日新高，换手率别超过 20%"
+            />
+            <n-button size="small" type="primary" secondary :loading="aiParsing" @click="runAiParse">AI 生成</n-button>
+          </div>
+          <div v-if="aiResult" class="ai-preview">
+            <p v-if="aiResult.explain" class="ai-explain">AI 理解：{{ aiResult.explain }}</p>
+            <div v-if="aiResult.conditions?.length" class="sc-conds">
+              <n-tag v-for="c in aiResult.conditions" :key="c" size="small" :bordered="false" class="cond-tag">{{ c }}</n-tag>
+            </div>
+            <div v-if="aiResult.unmatched?.length" class="ai-unmatched">
+              <p class="ai-unmatched-hint">以下表述在因子库中没有对应数据，未纳入条件（AI 不会硬凑相近因子）：</p>
+              <n-tag v-for="u in aiResult.unmatched" :key="u" size="small" type="warning" :bordered="false" class="cond-tag"
+                >⚠ {{ u }}</n-tag
+              >
+            </div>
+            <div v-if="aiResult.tree" class="ai-adopt">
+              <n-button size="small" type="primary" @click="adoptAiResult">套用到编辑器</n-button>
+            </div>
+          </div>
+        </div>
+        <div v-if="aiAdvancedTree" class="editor-rows">
+          <p class="rows-hint">
+            AI 生成的条件含嵌套组（满足其一），不支持逐行编辑，以下为只读条件清单——可直接保存或试扫。
+          </p>
+          <div class="sc-conds">
+            <n-tag v-for="c in aiAdvancedConditions" :key="c" size="small" :bordered="false" class="cond-tag">{{ c }}</n-tag>
+          </div>
+          <n-button size="small" quaternary @click="clearAdvancedTree">放弃嵌套条件，改用逐行编辑</n-button>
+        </div>
+        <div v-else class="editor-rows">
           <p class="rows-hint">条件之间为「且」（全部满足才命中）；布尔因子选「为是/为否」，数值因子可与固定值或另一因子比较。</p>
           <div v-for="(row, i) in editorRows" :key="i" class="cond-row">
             <n-select
@@ -760,6 +874,49 @@ async function removeCustom(id: number) {
   align-items: flex-start;
 }
 /* 编辑器 */
+.ai-gen {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px dashed var(--qv-divider);
+  border-radius: 10px;
+}
+.ai-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+.ai-input-row .n-input {
+  flex: 1;
+}
+.ai-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ai-explain {
+  margin: 0;
+  font-size: 12px;
+  opacity: 0.8;
+}
+.ai-unmatched {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+.ai-unmatched-hint {
+  margin: 0;
+  font-size: 12px;
+  opacity: 0.7;
+  flex-basis: 100%;
+}
+.ai-adopt {
+  display: flex;
+  justify-content: flex-end;
+}
 .editor-rows {
   display: flex;
   flex-direction: column;
@@ -794,6 +951,10 @@ async function removeCustom(id: number) {
   gap: 8px;
 }
 @media (max-width: 768px) {
+  .ai-input-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
   .cr-actions {
     flex-basis: 100%;
     justify-content: flex-end;

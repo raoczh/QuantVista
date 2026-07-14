@@ -42,6 +42,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	newsSvc := service.NewNewsService()
 	financeSvc := service.NewFinanceService()
 	screenerSvc := service.NewScreenerService()
+	screenerAISvc := service.NewScreenerAIService(llmSvc)
 	backtestSvc := service.NewBacktestService(marketSvc)
 	moodSvc := service.NewMoodService()
 	orgViewSvc := service.NewOrgViewService()
@@ -71,7 +72,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	dailyReportCtl := controller.NewDailyReportController(dailyReportSvc)
 	newsCtl := controller.NewNewsController(newsSvc)
 	financeCtl := controller.NewFinanceController(financeSvc)
-	screenerCtl := controller.NewScreenerController(screenerSvc)
+	screenerCtl := controller.NewScreenerController(screenerSvc, screenerAISvc)
 	backtestCtl := controller.NewBacktestController(backtestSvc)
 	moodCtl := controller.NewMoodController(moodSvc)
 	boardCtl := controller.NewBoardController(boardSvc)
@@ -282,6 +283,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				screener.POST("/strategies", screenerCtl.SaveStrategy)
 				screener.DELETE("/strategies/:id", screenerCtl.DeleteStrategy)
 				screener.POST("/scan", middleware.RateLimit(20, time.Minute), screenerCtl.Scan)
+				screener.POST("/parse", middleware.RateLimit(10, time.Minute), screenerCtl.Parse)
 				screener.GET("/status", screenerCtl.Status)
 			}
 

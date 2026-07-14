@@ -120,6 +120,21 @@ export function getScreenerStatus() {
   return request<FactorTableStatus>({ url: '/screener/status', method: 'get' })
 }
 
+/** P3c AI 白话建策略：解析结果（tree 可为 null——全部表述都无法映射时）。 */
+export interface ParseStrategyResult {
+  tree: CondNode | null
+  unmatched: string[] | null
+  explain: string
+  conditions: string[] | null
+  prompt_version: string
+  total_tokens: number
+}
+
+/** 白话描述 → 条件树（消耗 1 次 AI 配额；生成树需用户确认后才落编辑器）。 */
+export function parseScreenerStrategy(text: string) {
+  return request<ParseStrategyResult>({ url: '/screener/parse', method: 'post', data: { text } })
+}
+
 export const PERIOD_LABEL: Record<string, string> = { short: '短线', swing: '波段', mid: '中线' }
 export const RISK_LABEL: Record<string, string> = { low: '低风险', mid: '中风险', high: '高风险' }
 export const RISK_TAG_TYPE: Record<string, 'success' | 'warning' | 'error'> = {
