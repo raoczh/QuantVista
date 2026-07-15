@@ -209,6 +209,7 @@ async function loadPref() {
     pref.value = await getPreference()
     parseBlacklist(pref.value.blacklist_json)
     parseRecFilters(pref.value.rec_filters_json)
+    parseGuardConfig(pref.value.guard_config_json)
   } catch (e) {
     message.error((e as Error).message)
   }
@@ -281,6 +282,25 @@ function parseRecFilters(raw: string) {
   }
 }
 
+/* ---------------- 智能守护（持仓止损止盈/异动 + 重点自选异动主动推送） ---------------- */
+// 初值须与后端 defaultGuardConfig 对齐（默认全开、pos±5%/watch±7%、止损止盈子开关开）。
+const guardCfg = reactive({
+  enabled: true,
+  pos_pct: 5,
+  watch_pct: 7,
+  stop_loss: true,
+  take_profit: true,
+})
+function parseGuardConfig(raw: string) {
+  if (!raw) return
+  try {
+    const c = JSON.parse(raw)
+    if (c && typeof c === 'object') Object.assign(guardCfg, c)
+  } catch {
+    /* 坏数据用默认 */
+  }
+}
+
 /* ---------------- AI 配额用量 ---------------- */
 const quota = ref<UserQuota | null>(null)
 async function loadQuota() {
@@ -297,9 +317,11 @@ async function savePref() {
   try {
     pref.value.blacklist_json = blacklist.value.length ? JSON.stringify(blacklist.value) : ''
     pref.value.rec_filters_json = JSON.stringify(recFilters)
+    pref.value.guard_config_json = JSON.stringify(guardCfg)
     pref.value = await updatePreference(pref.value)
     parseBlacklist(pref.value.blacklist_json)
     parseRecFilters(pref.value.rec_filters_json)
+    parseGuardConfig(pref.value.guard_config_json)
     message.success('偏好已保存')
   } catch (e) {
     message.error((e as Error).message)
@@ -443,6 +465,40 @@ async function doExport(kind: ExportKind) {
               <span class="notify-hint"
                 >交易日 15:35 后自动生成今日复盘 + 明日选股推荐（消耗你的 LLM token，不占次数配额；含自动卖点提醒）</span
               >
+            </div>
+          </n-form-item>
+          <n-form-item label="智能守护">
+            <div class="guard">
+              <div class="guard-row">
+                <n-switch v-model:value="guardCfg.enabled" size="small" />
+                <span class="notify-hint"
+                  >交易时段（09:30~15:05）每 15 分钟自动盯持仓与重点自选，触发止损/止盈或异动时主动推送（同日同标的去重，仅推到已启用的推送通道，受上方「开启提醒」总闸控制）</span
+                >
+              </div>
+              <template v-if="guardCfg.enabled">
+                <div class="guard-row">
+                  <span class="guard-label">持仓异动阈值</span>
+                  <n-input-number v-model:value="guardCfg.pos_pct" :min="1" :max="30" :precision="1" :step="0.5" size="small" style="width: 120px">
+                    <template #suffix>%</template>
+                  </n-input-number>
+                  <span class="notify-hint">持仓当日|涨跌幅|达此值推送</span>
+                </div>
+                <div class="guard-row">
+                  <span class="guard-label">自选异动阈值</span>
+                  <n-input-number v-model:value="guardCfg.watch_pct" :min="1" :max="30" :precision="1" :step="0.5" size="small" style="width: 120px">
+                    <template #suffix>%</template>
+                  </n-input-number>
+                  <span class="notify-hint">重点自选（重点关注或等待价格/已生成计划）当日|涨跌幅|达此值或涨跌停推送</span>
+                </div>
+                <div class="guard-row">
+                  <span class="guard-label">止损触达</span>
+                  <n-switch v-model:value="guardCfg.stop_loss" size="small" />
+                  <span class="guard-sep" />
+                  <span class="guard-label">止盈触达</span>
+                  <n-switch v-model:value="guardCfg.take_profit" size="small" />
+                  <span class="notify-hint">按持仓建仓时填写的计划止损/止盈价（当日最低/最高触及即推）</span>
+                </div>
+              </template>
             </div>
           </n-form-item>
           <n-form-item label="总投资资金">
@@ -713,6 +769,27 @@ async function doExport(kind: ExportKind) {
 }
 .recf-sep {
   opacity: 0.5;
+}
+/* 智能守护 */
+.guard {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+}
+.guard-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.guard-label {
+  font-size: 12px;
+  opacity: 0.75;
+  min-width: 88px;
+}
+.guard-sep {
+  width: 8px;
 }
 .blacklist {
   display: flex;

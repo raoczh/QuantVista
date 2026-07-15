@@ -57,6 +57,12 @@ type UserPreference struct {
 	// 供「割/守/补」判断参考仓位水平。0=未设置不注入。
 	TotalCapital float64 `gorm:"type:decimal(20,2);default:0" json:"total_capital"`
 
+	// GuardConfigJSON 智能守护配置（阶段 D，service.GuardConfig 的 JSON）：
+	// 持仓止损/止盈触达 + 持仓/重点自选异动阈值的主动推送开关。
+	// 空串 = 服务层给默认值（默认开、pos_pct±5%/watch_pct±7%、止损止盈子开关均开），
+	// 风格对齐 RecFiltersJSON 先例。
+	GuardConfigJSON string `gorm:"type:text" json:"guard_config_json"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

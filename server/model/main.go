@@ -60,6 +60,7 @@ func AllModels() []any {
 		&ReportRating{},
 		&OrgSurvey{},
 		&BoardValuationDaily{},
+		&GuardEvent{},
 	}
 }
 

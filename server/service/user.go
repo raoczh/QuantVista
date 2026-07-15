@@ -50,7 +50,8 @@ type PreferenceInput struct {
 
 	EnableDailyReport bool `json:"enable_daily_report"` // 收盘日报（今日复盘+明日推荐）自动生成
 
-	TotalCapital float64 `json:"total_capital"` // 总投资资金（元；0=未设置，持仓 AI 不注入资金上下文）
+	TotalCapital    float64 `json:"total_capital"`     // 总投资资金（元；0=未设置，持仓 AI 不注入资金上下文）
+	GuardConfigJSON string  `json:"guard_config_json"` // 智能守护配置（guardConfig JSON；空=默认全开）
 }
 
 // BlacklistEntry 候选池黑名单条目（用户配置的回避规则）。
@@ -161,6 +162,10 @@ func (s *UserService) UpdatePreference(userID int64, in PreferenceInput) (*model
 	if err != nil {
 		return nil, err
 	}
+	guardCfg, err := normalizeGuardConfigJSON(in.GuardConfigJSON)
+	if err != nil {
+		return nil, err
+	}
 	p, err := s.GetPreference(userID)
 	if err != nil {
 		return nil, err
@@ -174,6 +179,7 @@ func (s *UserService) UpdatePreference(userID int64, in PreferenceInput) (*model
 	p.MinCandidateAmount = in.MinCandidateAmount
 	p.RecFiltersJSON = recFilters
 	p.EnableDailyReport = in.EnableDailyReport
+	p.GuardConfigJSON = guardCfg
 	if in.TotalCapital < 0 || in.TotalCapital > 1e12 {
 		return nil, errors.New("总投资资金需在 0~1万亿 之间（0=未设置）")
 	}
@@ -197,6 +203,25 @@ func normalizeRecFiltersJSON(raw string) (string, error) {
 	}
 	f = sanitizeRecFilters(f)
 	b, err := json.Marshal(f)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// normalizeGuardConfigJSON 校验并归一化智能守护配置 JSON：空串通过（服务层用默认全开）、
+// 坏格式报错、合法则 sanitize（阈值钳制）后重新序列化。
+func normalizeGuardConfigJSON(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	var c guardConfig
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		return "", errors.New("智能守护配置格式错误")
+	}
+	c = sanitizeGuardConfig(c)
+	b, err := json.Marshal(c)
 	if err != nil {
 		return "", err
 	}
