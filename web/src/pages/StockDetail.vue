@@ -347,6 +347,8 @@ function renderFinanceChart() {
     tooltip: { trigger: 'axis', confine: true },
     legend: {
       top: 0,
+      // 窄屏四项一行放不下，scroll 防换行压住柱顶（K 线 legend 同款）
+      type: 'scroll',
       data: ['营收(亿)', '净利(亿)', 'ROE%', '毛利率%'],
       textStyle: { color: vars.value.textColor3, fontSize: 11 },
       itemWidth: 14,
@@ -571,6 +573,10 @@ function scoreType(total: number) {
 
 <template>
   <PageContainer :title="quote ? `${quote.name} ${symbol}` : `个股详情 ${symbol}`" subtitle="行情 · K线 · 估值 · 评分一页看全">
+    <template #actions>
+      <!-- 壳内无下拉刷新：60s 自动轮询之外给显式刷新入口 -->
+      <n-button size="small" quaternary :loading="loading" @click="load()">刷新</n-button>
+    </template>
     <n-result v-if="loadError" status="warning" title="行情获取失败" :description="loadError">
       <template #footer>
         <n-button @click="load()">重试</n-button>
@@ -912,6 +918,12 @@ function scoreType(total: number) {
 .kchart {
   width: 100%;
   height: 460px;
+}
+@media (max-width: 768px) {
+  /* 小屏 460px ≈ 72vh 占满一屏还多，与 chip/ff/fin 图同做降高 */
+  .kchart {
+    height: 360px;
+  }
 }
 
 /* ---------- 筹码分布 ---------- */

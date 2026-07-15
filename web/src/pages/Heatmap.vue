@@ -52,6 +52,9 @@ function renderChart() {
     chart = null
   }
   chart = echarts.init(chartEl.value, isDark.value ? 'dark' : undefined)
+  // 窄屏格子小（Top100 挤 ~360×460）：标签只出名称单行、字号降档、缝隙收窄，
+  // 涨跌幅靠色深与 tooltip（confine 已开）承载。
+  const isNarrow = window.matchMedia('(max-width: 768px)').matches
   const data = boards.value.map((b) => ({
     name: b.name,
     value: Math.max(b.amount, 1), // 面积=成交额（0 值兜底防不显示）
@@ -91,17 +94,18 @@ function renderChart() {
           formatter: (info: { data?: { raw?: BoardHeat } }) => {
             const b = info.data?.raw
             if (!b) return ''
+            if (isNarrow) return b.name
             const sign = b.change_pct >= 0 ? '+' : ''
             return `${b.name}\n${sign}${b.change_pct.toFixed(2)}%`
           },
-          fontSize: 12,
-          lineHeight: 16,
+          fontSize: isNarrow ? 10 : 12,
+          lineHeight: isNarrow ? 12 : 16,
           color: vars.value.textColor1,
         },
         itemStyle: {
           borderColor: vars.value.bodyColor,
-          borderWidth: 2,
-          gapWidth: 2,
+          borderWidth: isNarrow ? 1 : 2,
+          gapWidth: isNarrow ? 1 : 2,
         },
         emphasis: { itemStyle: { borderColor: vars.value.primaryColor } },
         data,

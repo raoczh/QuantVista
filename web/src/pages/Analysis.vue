@@ -671,7 +671,7 @@ onMounted(async () => {
                     <div v-if="current.result.trade_plan.position" class="plan-cell">
                       <div class="pc-label">
                         建议仓位
-                        <n-tooltip trigger="hover" placement="top">
+                        <n-tooltip trigger="hover" placement="top" style="max-width: 340px">
                           <template #trigger>
                             <span class="pc-help">?</span>
                           </template>
@@ -941,6 +941,11 @@ onMounted(async () => {
     position: static;
     max-height: none;
     overflow: visible;
+  }
+  /* 折叠单列后历史列表（最多 30 条）横亘在表单与结果之间，限高栏内滚动 */
+  .hist {
+    max-height: 40vh;
+    overflow-y: auto;
   }
 }
 .form {

@@ -268,6 +268,7 @@ onMounted(async () => {
       <div class="col-side">
         <SectionCard title="会话">
           <template #extra>
+            <n-button size="tiny" quaternary :loading="historyLoading" @click="loadHistory">刷新</n-button>
             <n-button size="tiny" type="primary" ghost @click="newChat">＋ 新会话</n-button>
           </template>
           <n-spin :show="historyLoading && !history.length">
@@ -436,6 +437,8 @@ onMounted(async () => {
     position: static;
     max-height: none;
     overflow: visible;
+    /* 折叠单列后对话区优先展示，会话列表沉底（纯 CSS 调序，DOM 不动） */
+    order: 2;
   }
 }
 .convs {
@@ -527,6 +530,12 @@ onMounted(async () => {
   flex-direction: column;
   gap: 4px;
   max-width: 76%;
+}
+/* 窄屏气泡放宽：长篇 markdown 回答在 ~300px 容器里再限 76% 太窄 */
+@media (max-width: 768px) {
+  .bubble-wrap {
+    max-width: 92%;
+  }
 }
 .bubble {
   padding: 10px 14px;

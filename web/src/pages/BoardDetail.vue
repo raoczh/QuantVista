@@ -98,8 +98,8 @@ function renderFundFlowChart() {
   if (!ffEl.value || !ff?.days.length) return
   ffChart?.dispose()
   ffChart = echarts.init(ffEl.value, isDark.value ? 'dark' : undefined)
-  const up = vars.value.errorColor
-  const down = vars.value.successColor
+  const up = upColor.value
+  const down = downColor.value
   let acc = 0
   const cum = ff.days.map((d) => {
     acc += d.main_net_yi
@@ -291,6 +291,8 @@ onUnmounted(() => {
         </SectionCard>
 
         <SectionCard title="成分股（成交额降序）">
+          <!-- scroll-x 让 6 列宽表在窄屏走 n-data-table 自带横滚（SectionCard 兜底不覆盖
+               NDataTable：其表宽恒 100% + word-break 会把数值列拦腰折行） -->
           <n-data-table
             v-if="!stocksUnavailable"
             :columns="columns"
@@ -298,6 +300,7 @@ onUnmounted(() => {
             :row-props="rowProps"
             :bordered="false"
             size="small"
+            :scroll-x="640"
           />
           <n-empty
             v-else

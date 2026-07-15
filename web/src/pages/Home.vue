@@ -772,6 +772,15 @@ function onResize() {
   min-width: 64px;
   text-align: right;
 }
+/* 超窄屏：右侧价格+涨跌+成交额三段不可收缩，名称列会被挤到 2~3 字，隐藏次要的成交额 */
+@media (max-width: 480px) {
+  .sr-figures {
+    gap: 8px;
+  }
+  .sr-amount {
+    display: none;
+  }
+}
 .sr-leader {
   font-size: 12px;
   opacity: 0.6;

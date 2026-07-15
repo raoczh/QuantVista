@@ -791,6 +791,9 @@ function channelKindLabel(k: string) {
   display: flex;
   align-items: center;
   gap: 8px;
+  /* 卡头 extra 无横滚兜底：radio 组+按钮 ~280px 在 360px 卡头必溢出，允许换行 */
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 .events {
   display: flex;

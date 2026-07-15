@@ -324,6 +324,9 @@ onMounted(() => {
   display: flex;
   gap: 10px;
   align-items: center;
+  /* 卡头 extra 无横滚兜底，360px 下下拉会被两个按钮挤到不可用 */
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 .form {
   display: flex;

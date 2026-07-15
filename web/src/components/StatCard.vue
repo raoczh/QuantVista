@@ -60,6 +60,10 @@ const styleVars = computed(() => ({
   font-size: 26px;
   font-weight: 700;
   line-height: 1.1;
+  /* 大额金额（7 位数含千分位）在移动端 2 列网格下会超出卡宽，截断优于溢出压邻卡 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .stat-foot {
   display: flex;
