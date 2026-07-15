@@ -100,6 +100,9 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 		{
 			gh.GET("/url", authCtl.GitHubURL)
 			gh.POST("", middleware.RateLimit(20, time.Minute), authCtl.GitHubCallback)
+			// 移动流（App 系统浏览器授权，阶段 B）：回调换一次性短码、短码+PKCE 换 token。
+			gh.POST("/mobile-callback", middleware.RateLimit(20, time.Minute), authCtl.GitHubMobileCallback)
+			gh.POST("/mobile-exchange", middleware.RateLimit(20, time.Minute), authCtl.GitHubMobileExchange)
 		}
 
 		// 市场行情（公开市场数据；宽松限流防外部脚本刷接口——缓存 miss 时会

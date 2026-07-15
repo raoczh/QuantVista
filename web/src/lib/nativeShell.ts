@@ -33,10 +33,22 @@ export async function setupNativeShell(router: Router): Promise<void> {
     void App.minimizeApp()
   })
 
-  // 深链进入：https App Links（阶段 C 通知点击）直达站内路由。
-  // quantvista:// OAuth 回跳（阶段 B）届时在此扩展分支处理。
-  await App.addListener('appUrlOpen', ({ url }) => {
+  // 深链进入：
+  //   quantvista://oauth/callback?code=<一次性短码> —— GitHub 授权回跳（阶段 B），
+  //     翻译进回调页 mobile-exchange 分支，兑换逻辑与错误 UI 全复用 OAuthCallback.vue；
+  //   https —— App Links（阶段 C 通知点击）直达站内路由。
+  // appUrlOpen（热启动）与 getLaunchUrl（冷启动兜底：授权期间壳被系统回收，
+  // 深链重新拉起 App 时监听注册晚于事件）可能双投递同一 URL，Set 去重。
+  const handled = new Set<string>()
+  const handleUrl = (url: string) => {
+    if (!url || handled.has(url)) return
+    handled.add(url)
     try {
+      if (url.startsWith('quantvista://oauth/callback')) {
+        const code = new URL(url).searchParams.get('code') || ''
+        void router.push({ path: '/login/callback', query: { mode: 'mobile-exchange', code } })
+        return
+      }
       const target = new URL(url)
       if (target.protocol === 'https:') {
         void router.push(target.pathname + target.search + target.hash)
@@ -44,5 +56,9 @@ export async function setupNativeShell(router: Router): Promise<void> {
     } catch {
       /* 非法深链忽略 */
     }
-  })
+  }
+
+  await App.addListener('appUrlOpen', ({ url }) => handleUrl(url))
+  const launch = await App.getLaunchUrl()
+  if (launch?.url) handleUrl(launch.url)
 }

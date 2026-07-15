@@ -105,8 +105,19 @@ func (ac *AuthController) GitHubUnbind(c *gin.Context) {
 }
 
 // GitHubURL GET /api/oauth/github/url?redirect_uri=... —— 返回 GitHub 授权跳转地址。
+// mode=mobile 时（App 移动流）另需 code_challenge：state 不种 cookie，改走服务端
+// 一次性存储并绑定 PKCE challenge（发起在 App、回调落系统浏览器，cookie 不共享）。
 func (ac *AuthController) GitHubURL(c *gin.Context) {
 	redirectURI := c.Query("redirect_uri")
+	if c.Query("mode") == "mobile" {
+		url, err := ac.svc.GitHubAuthURLMobile(redirectURI, c.Query("code_challenge"))
+		if err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+		common.ApiSuccess(c, gin.H{"url": url})
+		return
+	}
 	url, nonce, err := ac.svc.GitHubAuthURL(redirectURI)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
@@ -142,6 +153,44 @@ func (ac *AuthController) GitHubCallback(c *gin.Context) {
 	c.SetSameSite(http.SameSiteLaxMode)
 	c.SetCookie(oauthStateCookie, "", -1, "/", "", false, true)
 	pair, err := ac.svc.LoginByGitHub(c.Request.Context(), req.Code, req.State, req.RedirectURI, clientUA(c))
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, pair)
+}
+
+// GitHubMobileCallback POST /api/oauth/github/mobile-callback —— 移动流回调
+// （系统浏览器里的回调页调用）：{code,state,redirect_uri} 换一次性短码。
+// 不做 cookie 校验——state 防重放由服务端一次性消费承担（见 service 层）。
+func (ac *AuthController) GitHubMobileCallback(c *gin.Context) {
+	var req githubCallbackReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ApiErrorMsg(c, "请求格式错误")
+		return
+	}
+	authCode, err := ac.svc.MobileGitHubCallback(c.Request.Context(), req.Code, req.State, req.RedirectURI)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, gin.H{"auth_code": authCode})
+}
+
+type mobileExchangeReq struct {
+	AuthCode     string `json:"auth_code"`
+	CodeVerifier string `json:"code_verifier"`
+}
+
+// GitHubMobileExchange POST /api/oauth/github/mobile-exchange —— App 深链
+// 收到短码后：{auth_code,code_verifier} 换现有 JWT 双 token（PKCE 校验）。
+func (ac *AuthController) GitHubMobileExchange(c *gin.Context) {
+	var req mobileExchangeReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ApiErrorMsg(c, "请求格式错误")
+		return
+	}
+	pair, err := ac.svc.MobileGitHubExchange(req.AuthCode, req.CodeVerifier, clientUA(c))
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
