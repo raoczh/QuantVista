@@ -13,9 +13,10 @@ func newWebTestEngine() *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	SetWebRouter(r, fstest.MapFS{
-		"web/dist/index.html":         {Data: []byte("<html>index-marker</html>")},
-		"web/dist/favicon.ico":        {Data: []byte("icon-bytes")},
-		"web/dist/assets/app.1a2b.js": {Data: []byte("console.log('hashed')")},
+		"web/dist/index.html":                  {Data: []byte("<html>index-marker</html>")},
+		"web/dist/favicon.ico":                 {Data: []byte("icon-bytes")},
+		"web/dist/assets/app.1a2b.js":          {Data: []byte("console.log('hashed')")},
+		"web/dist/.well-known/assetlinks.json": {Data: []byte(`[{"relation":["handle_all_urls"]}]`)},
 	})
 	return r
 }
@@ -77,5 +78,22 @@ func TestWebApiNotFoundStaysJSON(t *testing.T) {
 	}
 	if !strings.Contains(w.Header().Get("Content-Type"), "application/json") {
 		t.Fatalf("/api 未命中应返回 JSON, got Content-Type=%s", w.Header().Get("Content-Type"))
+	}
+}
+
+// App Links 契约：/.well-known/assetlinks.json 必须以 200 + application/json 原样返回
+//（Android 验证器要求），不得落 SPA 回退返回 HTML。
+func TestWebAssetlinksServedAsJSON(t *testing.T) {
+	r := newWebTestEngine()
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/.well-known/assetlinks.json", nil))
+	if w.Code != 200 {
+		t.Fatalf("assetlinks.json 状态码 = %d, 期望 200", w.Code)
+	}
+	if !strings.Contains(w.Header().Get("Content-Type"), "application/json") {
+		t.Fatalf("assetlinks.json 应为 application/json, got %s", w.Header().Get("Content-Type"))
+	}
+	if !strings.Contains(w.Body.String(), "handle_all_urls") {
+		t.Fatalf("assetlinks.json 应原样返回文件内容，得到：%s", w.Body.String())
 	}
 }

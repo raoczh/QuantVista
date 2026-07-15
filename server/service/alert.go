@@ -594,7 +594,10 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 	if notifyOn && len(pushLines) > 0 {
 		uid := rules[0].UserID
 		content := strings.Join(pushLines, "\n")
-		go s.notify.Send(uid, "QuantVista 提醒命中", content)
+		go s.notify.SendMsg(uid, NotifyMessage{
+			Title: "QuantVista 提醒命中", Content: content,
+			Route: "/alerts", Kind: NotifyMsgKindAlert,
+		})
 	}
 	return hits
 }
@@ -755,7 +758,10 @@ func (s *AlertService) evaluateEarnRulesForUser(userID int64) int {
 
 	if notifyOn && len(pushLines) > 0 {
 		content := strings.Join(pushLines, "\n")
-		go s.notify.Send(userID, "QuantVista 财报提醒", content)
+		go s.notify.SendMsg(userID, NotifyMessage{
+			Title: "QuantVista 财报提醒", Content: content,
+			Route: "/alerts", Kind: NotifyMsgKindEarn,
+		})
 	}
 	return hits
 }

@@ -47,3 +47,29 @@ func TestApplyNewsOptions(t *testing.T) {
 	// 恢复默认，防止内存状态污染同包其他测试。
 	apply(map[string]string{})
 }
+
+// TestSiteBaseURLNormalize 站点基础 URL 规范化：去空白与尾斜杠（推送 click 拼接依赖无尾斜杠形态）；
+// key 缺失 = 空串（通知不带跳转）。
+func TestSiteBaseURLNormalize(t *testing.T) {
+	cases := []struct{ raw, want string }{
+		{"", ""},
+		{"  ", ""},
+		{"https://app.example.com", "https://app.example.com"},
+		{" https://app.example.com/ ", "https://app.example.com"},
+		{"https://app.example.com//", "https://app.example.com"},
+	}
+	for _, c := range cases {
+		if got := normalizeSiteBaseURL(c.raw); got != c.want {
+			t.Fatalf("normalizeSiteBaseURL(%q) = %q, want %q", c.raw, got, c.want)
+		}
+	}
+
+	apply(map[string]string{"site_base_url": "https://app.example.com/"})
+	if SiteBaseURL() != "https://app.example.com" {
+		t.Fatalf("apply 应规范化站点 URL，得到 %q", SiteBaseURL())
+	}
+	apply(map[string]string{})
+	if SiteBaseURL() != "" {
+		t.Fatalf("key 缺失应为空串，得到 %q", SiteBaseURL())
+	}
+}

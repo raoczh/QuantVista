@@ -434,7 +434,7 @@ async function doExport(kind: ExportKind) {
           <n-form-item label="开启提醒">
             <div class="notify-switch">
               <n-switch v-model:value="pref.enable_notify" />
-              <span class="notify-hint">推送总闸：关闭后提醒命中仅在站内展示，不再外推到 Server酱/Webhook</span>
+              <span class="notify-hint">推送总闸：关闭后提醒命中仅在站内展示，不再外推到 Server酱/Webhook/ntfy</span>
             </div>
           </n-form-item>
           <n-form-item label="收盘日报">
