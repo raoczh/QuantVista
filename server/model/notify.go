@@ -6,6 +6,7 @@ import "time"
 const (
 	NotifyKindServerChan = "serverchan" // Server酱：target 为 sendkey
 	NotifyKindWebhook    = "webhook"    // 自定义 webhook：target 为完整 URL，POST JSON {title,content}
+	NotifyKindNtfy       = "ntfy"       // 自建 ntfy：target 为 JSON {"url","topic","token"}，App 系统级推送
 )
 
 // NotifyChannel 用户配置的推送通道。target（sendkey/url）加密落库，不回传前端明文。

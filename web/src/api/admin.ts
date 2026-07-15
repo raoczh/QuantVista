@@ -10,6 +10,7 @@ export interface SystemSettings {
   news_auto_llm: boolean
   llm_fallback_enabled: boolean
   llm_fallback_config_id: number
+  site_base_url: string
 }
 
 // 部分更新：仅传需要改的字段。github_client_secret 留空表示保留原值。
@@ -22,6 +23,7 @@ export interface SystemSettingsUpdate {
   news_auto_llm?: boolean
   llm_fallback_enabled?: boolean
   llm_fallback_config_id?: number
+  site_base_url?: string
 }
 
 export function getSystemSettings() {

@@ -61,6 +61,30 @@ services:
     networks:
       - baota_net
 
+  # 自建 ntfy 推送服务（Android App 系统级推送，见 docs/DEPLOYMENT.md §8 与 docs/ANDROID_APP_PLAN.md §6）。
+  # 首次启动后需进容器初始化用户/授权/token（deny-all 默认拒绝一切匿名访问）。
+  quantvista-ntfy:
+    image: binwiederhier/ntfy
+    container_name: quantvista-ntfy
+    restart: always
+    command: serve
+    environment:
+      NTFY_BASE_URL: ${NTFY_BASE_URL:-https://ntfy.example.com}
+      NTFY_BEHIND_PROXY: "true"
+      NTFY_AUTH_FILE: /var/lib/ntfy/auth.db
+      NTFY_AUTH_DEFAULT_ACCESS: deny-all # 私有实例：默认全拒，显式授权
+      NTFY_CACHE_FILE: /var/lib/ntfy/cache.db
+      NTFY_ATTACHMENT_CACHE_DIR: /var/lib/ntfy/attachments
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "3003:80" # 避开 3001(new-api)/3002(quantvista)
+    volumes:
+      - ${APP_PATH:-/www/wwwroot/quantvista}/ntfy:/var/lib/ntfy
+    labels:
+      createdBy: "bt_apps"
+    networks:
+      - baota_net
+
 networks:
   baota_net:
     external: true

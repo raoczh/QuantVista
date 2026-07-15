@@ -3,8 +3,11 @@
 package setting
 
 import (
+	"errors"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 
 	"quantvista/common"
@@ -21,6 +24,7 @@ const (
 	keyNewsAutoLLM        = "news_auto_llm"
 	keyLLMFallbackEnabled = "llm_fallback_enabled"
 	keyLLMFallbackID      = "llm_fallback_config_id"
+	keySiteBaseURL        = "site_base_url"
 )
 
 // 新闻快讯采集间隔（分钟）的默认值与钳制范围：下限防打爆免费上游，上限防配成"实际不采集"。
@@ -43,6 +47,8 @@ var (
 	// LLM 回退：默认开（无自有配置的用户走管理员配置）；指定配置 0 = 自动取首个管理员的默认配置。
 	llmFallbackEnabled = true
 	llmFallbackID      int64
+	// 站点对外基础 URL（如 https://app.example.com）：推送通知拼点击跳转链接用；空 = 通知不带跳转。
+	siteBaseURL string
 )
 
 // Init 从 DB 加载系统配置；首启时若 DB 缺 GitHub 凭证而 env 提供了，则种子回填到 DB。
@@ -107,6 +113,13 @@ func apply(opts map[string]string) {
 	if v, err := strconv.ParseInt(opts[keyLLMFallbackID], 10, 64); err == nil && v > 0 {
 		llmFallbackID = v
 	}
+
+	siteBaseURL = normalizeSiteBaseURL(opts[keySiteBaseURL])
+}
+
+// normalizeSiteBaseURL 去空白与尾部斜杠（拼路由时统一 base+/path 形态）。
+func normalizeSiteBaseURL(raw string) string {
+	return strings.TrimRight(strings.TrimSpace(raw), "/")
 }
 
 // clampNewsInterval 解析并钳制采集间隔：缺失/非法回默认 5，越界钳到 [1,120]。
@@ -149,6 +162,9 @@ func LLMFallbackEnabled() bool { mu.RLock(); defer mu.RUnlock(); return llmFallb
 // LLMFallbackConfigID 指定的回退 LLM 配置 id；0 = 自动取首个管理员的默认配置。
 // 同时作为新闻情绪分析等系统后台任务的默认 LLM。
 func LLMFallbackConfigID() int64 { mu.RLock(); defer mu.RUnlock(); return llmFallbackID }
+
+// SiteBaseURL 站点对外基础 URL（无尾部斜杠）；空表示未配置（推送通知不带点击跳转）。
+func SiteBaseURL() string { mu.RLock(); defer mu.RUnlock(); return siteBaseURL }
 
 // ---- 写入（持久化 + 刷新内存）----
 
@@ -207,6 +223,25 @@ func SetLLMFallback(enabled bool, configID int64) error {
 	mu.Lock()
 	llmFallbackEnabled = enabled
 	llmFallbackID = configID
+	mu.Unlock()
+	return nil
+}
+
+// SetSiteBaseURL 设置站点对外基础 URL；空串 = 清除（推送通知不再带点击跳转）。
+// 非空时必须是合法的 http/https 地址；存储与内存值均规范化为无尾部斜杠。
+func SetSiteBaseURL(v string) error {
+	v = normalizeSiteBaseURL(v)
+	if v != "" {
+		u, err := url.Parse(v)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return errors.New("站点基础 URL 非法（须为 http/https 完整地址）")
+		}
+	}
+	if err := model.UpsertOption(keySiteBaseURL, v); err != nil {
+		return err
+	}
+	mu.Lock()
+	siteBaseURL = v
 	mu.Unlock()
 	return nil
 }

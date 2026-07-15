@@ -18,10 +18,11 @@ mobile/
 
 | 位置 | 内容 |
 |---|---|
-| `mobile/capacitor.config.ts` → `server.url` | 壳加载的线上站点，**唯一必改处** |
+| `mobile/capacitor.config.ts` → `server.url` | 壳加载的线上站点 |
+| `mobile/android/app/src/main/AndroidManifest.xml` → https intent-filter 的 `android:host` | App Links 通知点击直达（阶段 C），与 `server.url` 同域 |
 
 替换后执行 `npm run sync` 将配置同步进 android 工程再构建。
-后续阶段会新增域名相关配置（阶段 C：`web/public/.well-known/assetlinks.json`、ntfy 子域），以 `docs/ANDROID_APP_PLAN.md` 各阶段说明为准。
+ntfy 推送另需服务端部署（`docs/DEPLOYMENT.md` §8）与下文「App Links 指纹」「手机端 ntfy 配置」两步。
 
 ## 前置条件
 
@@ -63,6 +64,40 @@ keytool -genkeypair -v -keystore quantvista-release.keystore -alias quantvista \
 ```bash
 keytool -list -v -keystore quantvista-release.keystore -alias quantvista | grep SHA256
 ```
+
+## App Links 指纹（阶段 C，通知点击直达）
+
+ntfy 通知点击的是 `https://<域名>/<路由>` 链接；Android 校验通过 App Links 才会直达壳 App，否则降级浏览器打开。两处配置：
+
+1. **站点声明**：`web/public/.well-known/assetlinks.json` 里的
+   `REPLACE_WITH_RELEASE_KEYSTORE_SHA256_FINGERPRINT` 替换为上节 `keytool -list -v` 输出的
+   SHA256 指纹（形如 `AA:BB:...` 冒号分隔大写十六进制，保留冒号）。改完随 web 正常构建发布
+   （vite 原样拷贝，Go embed 托管，`https://<域名>/.well-known/assetlinks.json` 可访问即生效）；
+2. **壳声明**：`AndroidManifest.xml` 的 https intent-filter（`android:autoVerify`）的 host
+   已随「域名替换」改为正式域名。
+
+验证：装 release 包后 `adb shell pm get-app-links com.quantvista.app` 应显示 domain `verified`；
+或系统设置 → 应用 → QuantVista → 默认打开。**debug 包签名与 release 不同，App Links 验证不过是预期行为**——
+要么临时把 debug 指纹也加进 assetlinks.json 数组，要么用 release 包验收。
+
+## 手机端 ntfy 配置（推送接收，一次性）
+
+系统级推送由伴生 **ntfy App** 承担（服务端部署见 `docs/DEPLOYMENT.md` §8；为什么不用 FCM 见
+`docs/ANDROID_APP_PLAN.md` §2.3）。手机上装两个 App：QuantVista 壳 + ntfy 接收器。
+
+1. **安装 ntfy Android App**：[GitHub Releases APK](https://github.com/binwiederhier/ntfy-android/releases)
+   或 F-Droid 版（纯 WebSocket 长连接 instant delivery，不依赖 GMS；**不要装 Play 版**——对无 GMS 场景无意义）；
+2. **添加自建服务器**：ntfy App → 设置 → Default server 填 `https://ntfy.<域名>`；
+   Manage users 添加用户 `quantvista` + 密码（服务端 `ntfy user add` 设置的那个）；
+3. **订阅 topic**：Subscribe to topic，填你在 QuantVista「条件提醒 → 推送通道」里配置的 topic
+   （如 `qv-u1`，须 `qv-` 前缀，服务端仅授权该前缀）；
+4. **开启 instant delivery**：订阅详情 → Instant delivery 打开（常驻前台服务，锁屏/杀 App 均可达）；
+5. **国产 ROM 保活（必做，否则长连接被杀）**：
+   - 电池优化：给 ntfy App 设「无限制/不优化」（MIUI：省电策略→无限制；ColorOS/OriginOS 类似）；
+   - 自启动/后台运行权限：允许；
+   - 最近任务里锁定 ntfy（部分 ROM 上划清理会杀前台服务）；
+6. **验收**：QuantVista 推送通道点「测试」，前台/后台/锁屏/杀掉 QuantVista 壳四种状态均应收到；
+   点击通知直达壳内对应页面（需 App Links 验证通过 + 管理后台已配「站点地址」）。
 
 ## 发布纪律
 

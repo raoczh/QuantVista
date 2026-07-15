@@ -353,9 +353,12 @@ const chForm = ref<{ kind: NotifyKind; name: string; target: string; enabled: bo
   target: '',
   enabled: true,
 })
+// ntfy 通道三字段（提交时拼 JSON 作 target，整串加密落库）。
+const ntfyForm = ref({ url: '', topic: '', token: '' })
 const kindNotifyOptions = [
   { label: 'Server酱', value: 'serverchan' },
   { label: '自定义 Webhook', value: 'webhook' },
+  { label: 'ntfy（App 推送）', value: 'ntfy' },
 ]
 async function loadChannels() {
   try {
@@ -367,15 +370,24 @@ async function loadChannels() {
 const chAdding = ref(false)
 async function addChannel() {
   if (chAdding.value) return
-  if (!chForm.value.target.trim()) {
+  let target = chForm.value.target.trim()
+  if (chForm.value.kind === 'ntfy') {
+    const { url, topic, token } = ntfyForm.value
+    if (!url.trim() || !topic.trim()) {
+      message.warning('请填写 ntfy 服务地址与 topic')
+      return
+    }
+    target = JSON.stringify({ url: url.trim(), topic: topic.trim(), token: token.trim() })
+  } else if (!target) {
     message.warning(chForm.value.kind === 'serverchan' ? '请输入 Server酱 SendKey' : '请输入 Webhook 地址')
     return
   }
   chAdding.value = true
   try {
-    await createChannel({ ...chForm.value })
+    await createChannel({ ...chForm.value, target })
     chForm.value.target = ''
     chForm.value.name = ''
+    ntfyForm.value = { url: '', topic: '', token: '' }
     await loadChannels()
     message.success('已添加推送通道')
   } catch (e) {
@@ -410,7 +422,9 @@ async function removeChannel(ch: NotifyChannel) {
   }
 }
 function channelKindLabel(k: string) {
-  return k === 'serverchan' ? 'Server酱' : 'Webhook'
+  if (k === 'serverchan') return 'Server酱'
+  if (k === 'ntfy') return 'ntfy'
+  return 'Webhook'
 }
 </script>
 
@@ -478,23 +492,41 @@ function channelKindLabel(k: string) {
             <n-form-item label="通道类型">
               <n-select v-model:value="chForm.kind" :options="kindNotifyOptions" />
             </n-form-item>
-            <n-form-item :label="chForm.kind === 'serverchan' ? 'SendKey' : 'Webhook 地址'">
+            <template v-if="chForm.kind === 'ntfy'">
+              <n-form-item label="ntfy 服务地址">
+                <n-input v-model:value="ntfyForm.url" placeholder="https://ntfy.example.com（自建，必须 https）" />
+              </n-form-item>
+              <n-form-item label="Topic">
+                <n-input v-model:value="ntfyForm.topic" placeholder="如 qv-u1（与手机 ntfy App 订阅一致）" />
+              </n-form-item>
+              <n-form-item label="访问令牌 Token">
+                <n-input v-model:value="ntfyForm.token" placeholder="tk_xxx（服务端 ntfy token add 生成，可空）" />
+              </n-form-item>
+            </template>
+            <n-form-item v-else :label="chForm.kind === 'serverchan' ? 'SendKey' : 'Webhook 地址'">
               <n-input
                 v-model:value="chForm.target"
                 :placeholder="chForm.kind === 'serverchan' ? 'Server酱 SendKey' : 'https://...'"
               />
             </n-form-item>
             <n-button type="primary" ghost block :loading="chAdding" @click="addChannel">添加通道</n-button>
-            <div class="hint">提醒命中时会主动推送到已启用的通道（同一提醒每天最多推一次）。密钥加密存储、不回显。</div>
+            <div class="hint">
+              提醒命中时会主动推送到已启用的通道（同一提醒每天最多推一次）。密钥加密存储、不回显。ntfy
+              为自建 App 系统级推送，服务端部署与手机配置见 mobile/README.md。
+            </div>
           </n-form>
 
           <div v-if="channels.length" class="channels">
             <div v-for="ch in channels" :key="ch.id" class="channel">
               <div class="ch-main">
                 <div class="ch-title">
-                  <n-tag size="tiny" round :bordered="false" :type="ch.kind === 'serverchan' ? 'info' : 'default'">{{
-                    channelKindLabel(ch.kind)
-                  }}</n-tag>
+                  <n-tag
+                    size="tiny"
+                    round
+                    :bordered="false"
+                    :type="ch.kind === 'serverchan' ? 'info' : ch.kind === 'ntfy' ? 'success' : 'default'"
+                    >{{ channelKindLabel(ch.kind) }}</n-tag
+                  >
                   <span class="ch-name">{{ ch.name }}</span>
                   <n-tag size="tiny" round :bordered="false" :type="ch.enabled ? 'success' : 'default'">{{
                     ch.enabled ? '启用' : '停用'

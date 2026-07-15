@@ -58,8 +58,25 @@ async function load() {
     news.auto_llm = settings.value.news_auto_llm
     fb.enabled = settings.value.llm_fallback_enabled
     fb.config_id = settings.value.llm_fallback_config_id
+    siteBaseURL.value = settings.value.site_base_url
   } catch (e) {
     message.error((e as Error).message)
+  }
+}
+
+/* 站点地址：推送通知（ntfy）拼点击跳转链接用；空 = 通知不带跳转 */
+const savingSite = ref(false)
+const siteBaseURL = ref('')
+async function saveSite() {
+  savingSite.value = true
+  try {
+    settings.value = await updateSystemSettings({ site_base_url: siteBaseURL.value.trim() })
+    siteBaseURL.value = settings.value.site_base_url
+    message.success('站点地址已保存')
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    savingSite.value = false
   }
 }
 
@@ -331,6 +348,21 @@ onMounted(() => {
             <n-switch v-model:value="gh.enabled" />
           </n-form-item>
           <n-button type="primary" :loading="savingGithub" @click="saveGithub">保存 GitHub 设置</n-button>
+        </n-form>
+      </SectionCard>
+
+      <!-- 站点地址（推送通知点击跳转） -->
+      <SectionCard title="站点地址" :hoverable="false">
+        <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 560px" :show-feedback="false">
+          <n-form-item label="站点基础 URL">
+            <n-input v-model:value="siteBaseURL" placeholder="https://app.example.com（本站对外访问地址）" />
+          </n-form-item>
+          <n-form-item label=" ">
+            <span style="font-size: 12px; opacity: 0.55">
+              App 推送通知（ntfy 通道）的点击跳转链接 = 该地址 + 站内路由；留空则通知不带跳转链接。须为 http/https 完整地址，尾部斜杠自动去除。
+            </span>
+          </n-form-item>
+          <n-button type="primary" :loading="savingSite" @click="saveSite">保存站点地址</n-button>
         </n-form>
       </SectionCard>
 

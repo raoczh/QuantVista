@@ -23,13 +23,24 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- quantvista:// 自定义 scheme 深链：阶段 B GitHub OAuth 系统浏览器授权后回跳 App。
-                 阶段 C 的 https App Links intent-filter（autoVerify）等 release keystore 指纹就绪后再加。 -->
+            <!-- quantvista:// 自定义 scheme 深链：阶段 B GitHub OAuth 系统浏览器授权后回跳 App。 -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="quantvista" />
+            </intent-filter>
+
+            <!-- https App Links（阶段 C）：ntfy 通知点击直达壳内对应页面。
+                 android:autoVerify 依赖站点 /.well-known/assetlinks.json 与 release 签名指纹匹配
+                 （web/public/.well-known/assetlinks.json，指纹替换说明见 mobile/README.md）；
+                 host 与 capacitor.config.ts 的 server.url 同域，替换占位符时两处一起改。
+                 验证失败仅降级为浏览器打开，不影响其他功能。 -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="app.example.com" />
             </intent-filter>
 
         </activity>

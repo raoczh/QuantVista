@@ -1,6 +1,6 @@
 import { request } from './client'
 
-export type NotifyKind = 'serverchan' | 'webhook'
+export type NotifyKind = 'serverchan' | 'webhook' | 'ntfy'
 
 export interface NotifyChannel {
   id: number

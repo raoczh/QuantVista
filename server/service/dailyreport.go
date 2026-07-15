@@ -358,7 +358,10 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 
 	// 推送摘要（best-effort，受推送通道与偏好总闸控制）。
 	if review != nil && pref.EnableNotify && s.notify.HasEnabledChannel(userID) {
-		go s.notify.Send(userID, fmt.Sprintf("收盘日报 %s", date), review.Summary)
+		go s.notify.SendMsg(userID, NotifyMessage{
+			Title: fmt.Sprintf("收盘日报 %s", date), Content: review.Summary,
+			Route: "/daily-reports", Kind: NotifyMsgKindReport,
+		})
 	}
 	if report.Status == model.ReportStatusFailed {
 		return nil, errors.New(strings.Join(errParts, "；"))
