@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>QuantVista</title>
+  <style>
+    /* 本地兜底错误页：远程站点加载失败（断网/DNS/服务不可达）时由 Capacitor errorPath 呈现。
+       无法读取线上主题，只能自带极简样式；跟随系统深浅色。 */
+    :root {
+      color-scheme: light dark;
+      --fg: #1f2329;
+      --fg-dim: #6b7280;
+      --bg: #f7f8fa;
+      --card: #ffffff;
+      --primary: #e0506e;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --fg: #e5e7eb;
+        --fg-dim: #9ca3af;
+        --bg: #101014;
+        --card: #1b1c22;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+      padding: 24px;
+    }
+    .card {
+      width: 100%;
+      max-width: 420px;
+      background: var(--card);
+      border-radius: 16px;
+      padding: 36px 28px;
+      text-align: center;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.08);
+    }
+    .icon { font-size: 44px; line-height: 1; }
+    h1 { font-size: 18px; margin: 18px 0 8px; }
+    p { font-size: 14px; color: var(--fg-dim); margin: 0 0 26px; line-height: 1.7; }
+    button {
+      appearance: none;
+      border: none;
+      border-radius: 999px;
+      background: var(--primary);
+      color: #fff;
+      font-size: 15px;
+      font-weight: 600;
+      padding: 12px 40px;
+      min-height: 44px;
+      cursor: pointer;
+    }
+    button:active { opacity: 0.85; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">📡</div>
+    <h1>无法连接到 QuantVista</h1>
+    <p>网络不可用或服务暂时无法访问。<br />请检查网络连接后重试。</p>
+    <button type="button" onclick="location.reload()">重新加载</button>
+  </div>
+</body>
+</html>

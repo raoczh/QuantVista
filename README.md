@@ -114,6 +114,7 @@ docker push <你的镜像名>:tag
 - [技术架构设计](docs/ARCHITECTURE.md) —— 分层结构、主题/UI 硬约束、AI 调用设计
 - [数据源选型](docs/DATA_SOURCES.md) —— 三源互备策略、能力矩阵、扩展清单
 - [部署说明](docs/DEPLOYMENT.md) —— Docker/宝塔部署、迁移、备份恢复
+- [Android 壳应用实施方案](docs/ANDROID_APP_PLAN.md) —— Capacitor 壳（`mobile/`）、移动 GitHub OAuth、自建 ntfy 推送、守护推送与发布流程
 - [项目现状与实现边界](docs/ROADMAP.md) —— 当前状态、防回归认知、待验证清单
 - [开发计划存档](docs/DEVELOPMENT_PLAN.md) —— 历史批次交付记录
 

@@ -1,0 +1,6 @@
+# 真实签名材料绝不入库（丢失 keystore = 已装设备永远无法覆盖升级，见 README「签名」节）
+android/key.properties
+*.keystore
+*.jks
+
+node_modules/

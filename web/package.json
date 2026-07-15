@@ -10,6 +10,8 @@
     "type-check": "vue-tsc --noEmit"
   },
   "dependencies": {
+    "@capacitor/app": "^8.1.0",
+    "@capacitor/core": "^8.4.2",
     "axios": "^1.7.7",
     "dompurify": "^3.4.11",
     "echarts": "^5.5.1",
