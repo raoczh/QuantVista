@@ -32,6 +32,7 @@ import {
 import { getPreference, updatePreference, changePassword, getQuota, type UserPreference, type UserQuota, type BlacklistEntry } from '@/api/user'
 import { downloadExport, type ExportKind } from '@/api/export'
 import { useAuthStore } from '@/stores/auth'
+import { isNativeApp } from '@/config/runtime'
 import { useIsMobile } from '@/composables/useIsMobile'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
@@ -545,7 +546,12 @@ async function doExport(kind: ExportKind) {
         </n-form>
       </SectionCard>
       <SectionCard title="GitHub 绑定" :hoverable="false" style="margin-top: 16px">
-        <div v-if="auth.user?.github_id" class="gh-bind">
+        <!-- App 内隐藏绑定/解绑操作：绑定流需要已登录态跨浏览器传递，第一版不做
+             （docs/ANDROID_APP_PLAN.md §5.6）。密码登录与 GitHub 登录不受影响。 -->
+        <div v-if="isNativeApp" class="gh-bind">
+          <span class="gh-hint">App 内暂不支持 GitHub 绑定/解绑，请在电脑浏览器打开本站，于「设置 → 账号安全」操作。</span>
+        </div>
+        <div v-else-if="auth.user?.github_id" class="gh-bind">
           <n-tag type="success" round :bordered="false">已绑定</n-tag>
           <span class="gh-hint">此 GitHub 账号可直接登录本账号，不会再创建新账号。</span>
           <n-popconfirm @positive-click="doUnbindGithub">

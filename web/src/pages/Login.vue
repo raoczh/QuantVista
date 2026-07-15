@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { NForm, NFormItem, NInput, NButton, NDivider, NIcon, useMessage } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
+import { isNativeApp } from '@/config/runtime'
 import AuthShell from '@/components/AuthShell.vue'
 
 const router = useRouter()
@@ -35,7 +36,8 @@ async function submit() {
 
 async function github() {
   try {
-    await auth.startGithubLogin()
+    // App 内走移动流（系统浏览器授权 + 深链回跳，阶段 B）；浏览器走原 Web 流。
+    await (isNativeApp ? auth.startMobileGithubLogin() : auth.startGithubLogin())
   } catch (e) {
     message.error((e as Error).message)
   }

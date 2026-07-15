@@ -7,6 +7,8 @@ import {
   logout as apiLogout,
   getGithubAuthURL,
   githubCallback,
+  getGithubAuthURLMobile,
+  githubMobileExchange,
   bindGithub,
   unbindGithub,
   getSelf,
@@ -14,6 +16,7 @@ import {
   type TokenPair,
 } from '@/api/auth'
 import { getAccessToken, getRefreshToken, setTokens, clearTokens } from '@/api/token'
+import { generateCodeVerifier, codeChallengeS256 } from '@/lib/pkce'
 
 // 认证 store：登录态、首启状态、各登录方式。
 export const useAuthStore = defineStore('auth', () => {
@@ -78,6 +81,40 @@ export const useAuthStore = defineStore('auth', () => {
     applyPair(await githubCallback(code, state, redirectURI()))
   }
 
+  // ---- 移动流（App 内发起，阶段 B；流程见 docs/ANDROID_APP_PLAN.md §5.2）----
+  // 授权发起在 App WebView、回调落在系统浏览器，cookie 不共享——state 由服务端
+  // 一次性消费；回 App 用一次性短码 + PKCE。@capacitor/* 一律动态 import。
+
+  // redirect_uri 追加 ?mode=mobile（GitHub 原样保留该 query 并附加 code/state），
+  // 授权与换短码两端必须字节一致。
+  function mobileRedirectURI() {
+    return `${location.origin}/login/callback?mode=mobile`
+  }
+
+  const VERIFIER_KEY = 'qv_pkce_verifier'
+
+  // App 内发起 GitHub 登录：verifier 存原生 Preferences（跨系统浏览器往返仍在），
+  // 授权页开系统浏览器（Custom Tabs），绝不内嵌 WebView。
+  async function startMobileGithubLogin() {
+    const verifier = generateCodeVerifier()
+    const challenge = await codeChallengeS256(verifier)
+    const { Preferences } = await import('@capacitor/preferences')
+    await Preferences.set({ key: VERIFIER_KEY, value: verifier })
+    const { url } = await getGithubAuthURLMobile(mobileRedirectURI(), challenge)
+    const { Browser } = await import('@capacitor/browser')
+    await Browser.open({ url })
+  }
+
+  // App 深链收到一次性短码后：取 verifier 兑换现有 JWT 双 token。
+  // 短码单次消费，任何失败都须整个流程重来（重新发起会覆盖 verifier）。
+  async function finishMobileExchange(authCode: string) {
+    const { Preferences } = await import('@capacitor/preferences')
+    const { value: verifier } = await Preferences.get({ key: VERIFIER_KEY })
+    if (!verifier) throw new Error('登录会话丢失，请回到登录页重新发起 GitHub 登录')
+    applyPair(await githubMobileExchange(authCode, verifier))
+    await Preferences.remove({ key: VERIFIER_KEY })
+  }
+
   // GitHub 绑定：与登录共用回调页 /login/callback，用 sessionStorage 标记区分意图。
   const BIND_FLAG = 'qv_oauth_bind'
 
@@ -131,6 +168,8 @@ export const useAuthStore = defineStore('auth', () => {
     loginPassword,
     startGithubLogin,
     finishGithubLogin,
+    startMobileGithubLogin,
+    finishMobileExchange,
     startGithubBind,
     pendingGithubBind,
     clearGithubBindFlag,

@@ -53,6 +53,32 @@ export function githubCallback(code: string, state: string, redirectURI: string)
   })
 }
 
+// ---- 移动流（App 内发起 GitHub 登录，阶段 B）----
+// state 走服务端一次性存储 + PKCE；回调换一次性短码，深链回 App 后凭 verifier 兑换。
+
+export function getGithubAuthURLMobile(redirectURI: string, codeChallenge: string) {
+  return request<{ url: string }>({
+    url: '/oauth/github/url',
+    params: { redirect_uri: redirectURI, mode: 'mobile', code_challenge: codeChallenge },
+  })
+}
+
+export function githubMobileCallback(code: string, state: string, redirectURI: string) {
+  return request<{ auth_code: string }>({
+    url: '/oauth/github/mobile-callback',
+    method: 'post',
+    data: { code, state, redirect_uri: redirectURI },
+  })
+}
+
+export function githubMobileExchange(authCode: string, codeVerifier: string) {
+  return request<TokenPair>({
+    url: '/oauth/github/mobile-exchange',
+    method: 'post',
+    data: { auth_code: authCode, code_verifier: codeVerifier },
+  })
+}
+
 export function getSelf() {
   return request<AuthUser>({ url: '/user/self' })
 }

@@ -138,6 +138,7 @@ func (s *AuthService) GitHubAuthURL(redirectURI string) (string, string, error) 
 }
 
 // LoginByGitHub OAuth 回调：校验 state、换 token、取用户、查或建。
+// state 防重放由 controller 层 cookie double-submit 承担（Web 流）。
 func (s *AuthService) LoginByGitHub(ctx context.Context, code, state, redirectURI, ua string) (*TokenPair, error) {
 	if !common.VerifyState(state) {
 		return nil, errors.New("state 校验失败（可能过期或被篡改）")
@@ -150,15 +151,25 @@ func (s *AuthService) LoginByGitHub(ctx context.Context, code, state, redirectUR
 	if err != nil {
 		return nil, err
 	}
+	user, err := s.userForGitHub(gu)
+	if err != nil {
+		return nil, err
+	}
+	return s.issueFor(user, ua)
+}
 
+// userForGitHub 「GitHub 用户→本地用户」公共段：已绑定直登，未绑定按
+// 首用户 admin 闸/开放注册规则建号。Web 流（LoginByGitHub）与移动流
+// （MobileGitHubCallback）共用，改注册/绑定规则只改这里。
+func (s *AuthService) userForGitHub(gu *oauth.GitHubUser) (*model.User, error) {
 	// 已绑定的 GitHub 用户：直接登录。
 	var user model.User
-	err = common.DB.Where("github_id = ?", gu.GithubID).First(&user).Error
+	err := common.DB.Where("github_id = ?", gu.GithubID).First(&user).Error
 	if err == nil {
 		if user.Status != model.StatusEnabled {
 			return nil, errors.New("账号已被禁用")
 		}
-		return s.issueFor(&user, ua)
+		return &user, nil
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
@@ -211,7 +222,7 @@ func (s *AuthService) LoginByGitHub(ctx context.Context, code, state, redirectUR
 		return nil, err
 	}
 	s.ensurePrefAndQuota(newUser.ID)
-	return s.issueFor(newUser, ua)
+	return newUser, nil
 }
 
 // errInitialized 首用户闸竞争失败（系统已被并发请求初始化）。
