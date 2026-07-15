@@ -66,19 +66,31 @@ async function load(silent = false) {
 useAutoRefresh(() => load(true), 60_000)
 
 // ---------- 机会池漏斗 ----------
-const stageMeta: Record<string, { label: string; color: string }> = {
-  discovered: { label: '发现', color: '#8a8a8a' },
-  screening: { label: '初筛', color: '#5b8def' },
-  watching: { label: '观察', color: '#3f9eff' },
-  waiting_price: { label: '等价格', color: '#f0a020' },
-  planned: { label: '有计划', color: '#9a5fe0' },
-  bought: { label: '已买入', color: '#d03050' },
-  passed: { label: '已放弃', color: '#7a7a7a' },
-  reviewed: { label: '已复盘', color: '#18a058' },
+// 文案静态；颜色取主题语义色（§4.1 禁硬编码色，随 6 套明暗主题自适应）。
+// 8 阶段映射 6 个语义变量，保证漏斗相邻阶段不同色即可。
+const stageLabels: Record<string, string> = {
+  discovered: '发现',
+  screening: '初筛',
+  watching: '观察',
+  waiting_price: '等价格',
+  planned: '有计划',
+  bought: '已买入',
+  passed: '已放弃',
+  reviewed: '已复盘',
 }
+const stageMeta = computed<Record<string, { label: string; color: string }>>(() => ({
+  discovered: { label: stageLabels.discovered, color: vars.value.textColor3 },
+  screening: { label: stageLabels.screening, color: vars.value.infoColor },
+  watching: { label: stageLabels.watching, color: vars.value.primaryColor },
+  waiting_price: { label: stageLabels.waiting_price, color: vars.value.warningColor },
+  planned: { label: stageLabels.planned, color: vars.value.infoColor },
+  bought: { label: stageLabels.bought, color: vars.value.errorColor },
+  passed: { label: stageLabels.passed, color: vars.value.textColor3 },
+  reviewed: { label: stageLabels.reviewed, color: vars.value.successColor },
+}))
 const stageOptions = [
   { label: '清除标注', value: '' },
-  ...Object.entries(stageMeta).map(([value, m]) => ({ label: m.label, value })),
+  ...Object.entries(stageLabels).map(([value, label]) => ({ label, value })),
 ]
 // 转「已放弃」时先收集原因。
 const passModal = ref(false)
@@ -723,11 +735,29 @@ onMounted(load)
   .it-quote {
     min-width: 0;
   }
-  /* 操作按钮整行换到下一行，与内容左对齐 */
+  /* 操作按钮整行换到下一行，与内容左对齐；加大触摸目标（tiny 按钮 22px 太小） */
   .it-actions {
     flex-basis: 100%;
     flex-wrap: wrap;
     padding-left: 18px;
+    gap: 6px;
+    row-gap: 4px;
+  }
+  .it-actions :deep(.n-button),
+  .group-actions :deep(.n-button) {
+    height: 30px;
+    padding: 0 10px;
+  }
+  /* 错过机会弹窗：名称与数字并排 nowrap 会溢出 360px 弹窗，改上下两行 */
+  .missed-row {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+  .missed-nums {
+    flex-basis: 100%;
+    flex-wrap: wrap;
+    white-space: normal;
+    justify-content: flex-start;
   }
 }
 .modal-footer {

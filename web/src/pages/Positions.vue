@@ -901,6 +901,23 @@ onMounted(async () => {
   align-items: center;
   gap: 4px;
 }
+
+@media (max-width: 768px) {
+  /* 行操作区（卖出/分析/复盘/删除等 6 个 tiny 按钮）加大触摸目标 */
+  .r-actions {
+    flex-wrap: wrap;
+    gap: 6px;
+    row-gap: 4px;
+  }
+  .r-actions :deep(.n-button) {
+    height: 30px;
+    padding: 0 10px;
+  }
+  .r-figures {
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+}
 .modal-footer {
   display: flex;
   justify-content: flex-end;

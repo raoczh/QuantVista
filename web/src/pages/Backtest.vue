@@ -422,7 +422,7 @@ onMounted(() => {
             </SectionCard>
 
             <SectionCard title="alpha 分布">
-              <template #header-extra>
+              <template #extra>
                 <n-radio-group v-model:value="recHold" size="small">
                   <n-radio-button v-for="st in recResult.stats" :key="st.hold_days" :value="String(st.hold_days)">
                     {{ st.hold_days }}日

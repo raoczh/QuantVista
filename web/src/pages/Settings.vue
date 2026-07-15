@@ -814,6 +814,8 @@ async function doExport(kind: ExportKind) {
   display: flex;
   align-items: center;
   gap: 8px;
+  /* 360px 下代码输入 140px + 原因输入 + 按钮同行会把原因挤到 80px，允许换行 */
+  flex-wrap: wrap;
 }
 .quota {
   display: flex;

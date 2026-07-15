@@ -238,7 +238,7 @@ onMounted(load)
       style="max-width: 400px"
     >
       <n-form label-placement="top" :show-feedback="false" class="trade-form">
-        <n-grid cols="2" :x-gap="10">
+        <n-grid cols="1 s:2" responsive="screen" :x-gap="10">
           <n-gi>
             <n-form-item label="代码">
               <n-input :value="form.symbol" readonly />
@@ -256,7 +256,7 @@ onMounted(load)
             <n-radio-button value="sell">卖出</n-radio-button>
           </n-radio-group>
         </n-form-item>
-        <n-grid cols="2" :x-gap="10">
+        <n-grid cols="1 s:2" responsive="screen" :x-gap="10">
           <n-gi>
             <n-form-item label="价格（留空按市价）">
               <n-input-number v-model:value="form.price" :min="0" :precision="3" style="width: 100%" placeholder="市价" />

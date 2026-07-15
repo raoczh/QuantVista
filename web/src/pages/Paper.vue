@@ -312,6 +312,8 @@ onMounted(load)
   display: flex;
   align-items: baseline;
   gap: 8px;
+  /* 长名 ETF（名称+代码+标签 >200px）在移动端 150px 主列里换行而非溢出压到盈亏列 */
+  flex-wrap: wrap;
 }
 .hold-name {
   font-size: 14px;

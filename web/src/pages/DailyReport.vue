@@ -233,7 +233,7 @@ onMounted(load)
           :options="historyOptions"
           placeholder="历史日报"
           size="small"
-          style="width: 220px"
+          style="width: min(220px, 100%)"
           @update:value="pick"
         />
         <n-popconfirm @positive-click="doGenerate">
@@ -410,6 +410,8 @@ onMounted(load)
   display: flex;
   gap: 10px;
   align-items: center;
+  /* 220px 下拉+两按钮合计 ~425px，360px 页头必换行否则整页横滚 */
+  flex-wrap: wrap;
 }
 .report {
   display: flex;
@@ -420,6 +422,8 @@ onMounted(load)
   display: flex;
   align-items: center;
   gap: 12px;
+  /* 窄屏日期+状态+meta 长文本同行会把 22px 日期在连字符处折断，换行更自然 */
+  flex-wrap: wrap;
 }
 .head-date {
   font-size: 22px;
