@@ -50,6 +50,7 @@ func main() {
 	service.StartMarketJobs(mgr)
 	service.StartTrackingJobs(mgr)
 	service.StartAlertJobs(mgr)
+	service.StartGuardJobs(mgr)
 	service.StartDailyReportJobs(mgr)
 	service.StartNewsJobs()
 	service.StartFinanceJobs(mgr)
