@@ -1,0 +1,21 @@
+{
+  "name": "quantvista-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "description": "QuantVista Android 壳（Capacitor 远程加载线上站点，构建/签名说明见 README.md）",
+  "scripts": {
+    "sync": "cap sync android",
+    "open": "cap open android"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.4.2",
+    "@capacitor/app": "^8.1.0",
+    "@capacitor/browser": "^8.0.3",
+    "@capacitor/cli": "^8.4.2",
+    "@capacitor/core": "^8.4.2",
+    "@capacitor/preferences": "^8.0.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}
