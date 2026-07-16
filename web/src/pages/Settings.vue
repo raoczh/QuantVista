@@ -282,14 +282,15 @@ function parseRecFilters(raw: string) {
   }
 }
 
-/* ---------------- 智能守护（持仓止损止盈/异动 + 重点自选异动主动推送） ---------------- */
-// 初值须与后端 defaultGuardConfig 对齐（默认全开、pos±5%/watch±7%、止损止盈子开关开）。
+/* ---------------- 智能守护（持仓止损止盈/异动 + 重点自选异动 + 持仓盘后事件主动推送） ---------------- */
+// 初值须与后端 defaultGuardConfig 对齐（默认全开、pos±5%/watch±7%、止损止盈与盘后事件子开关开）。
 const guardCfg = reactive({
   enabled: true,
   pos_pct: 5,
   watch_pct: 7,
   stop_loss: true,
   take_profit: true,
+  evening: true,
 })
 function parseGuardConfig(raw: string) {
   if (!raw) return
@@ -397,6 +398,28 @@ async function doExport(kind: ExportKind) {
             <span style="font-size: 12px; opacity: 0.6">未配置时，AI 功能将自动使用管理员的默认 LLM 配置（次数配额仍按你的账号计）。</span>
           </template>
         </n-empty>
+        <!-- 手机（≤768px）上 6 列表格即使横滚也看不全操作列，切换为卡片式列表。 -->
+        <div v-else-if="isMobile" class="llm-cards">
+          <div v-for="c in configs" :key="c.id" class="llm-card">
+            <div class="llm-head">
+              <span class="llm-name">{{ c.name }}</span>
+              <n-tag v-if="c.is_default" type="info" size="small" round>默认</n-tag>
+              <n-tag :type="c.has_api_key ? 'success' : 'warning'" size="small" round>
+                {{ c.has_api_key ? '密钥已设置' : '密钥未设置' }}
+              </n-tag>
+            </div>
+            <div class="llm-model qv-mono">{{ c.model }}</div>
+            <div class="llm-url">{{ c.base_url }}</div>
+            <div class="llm-ops">
+              <n-button size="small" @click="testSaved(c)">测试</n-button>
+              <n-button size="small" @click="openEdit(c)">编辑</n-button>
+              <n-popconfirm @positive-click="remove(c)">
+                <template #trigger><n-button size="small" type="error">删除</n-button></template>
+                确认删除「{{ c.name }}」？
+              </n-popconfirm>
+            </div>
+          </div>
+        </div>
         <n-table v-else :bordered="false" :single-line="false">
           <thead>
             <tr>
@@ -497,6 +520,13 @@ async function doExport(kind: ExportKind) {
                   <span class="guard-label">止盈触达</span>
                   <n-switch v-model:value="guardCfg.take_profit" size="small" />
                   <span class="notify-hint">按持仓建仓时填写的计划止损/止盈价（当日最低/最高触及即推）</span>
+                </div>
+                <div class="guard-row">
+                  <span class="guard-label">持仓盘后事件</span>
+                  <n-switch v-model:value="guardCfg.evening" size="small" />
+                  <span class="notify-hint"
+                    >每日 19:35 推送持仓股的当日公告、龙虎榜上榜、财报披露临近（3 天内）、新业绩预告（同一事件只推一次；盘中涨跌幅达阈值或涨跌停由上方异动即时推送）</span
+                  >
                 </div>
               </template>
             </div>
@@ -739,6 +769,44 @@ async function doExport(kind: ExportKind) {
 .ct-title {
   font-size: 14px;
   font-weight: 600;
+}
+/* LLM 配置移动端卡片（≤768px 由 isMobile 切换，桌面仍为表格） */
+.llm-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.llm-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid rgba(128, 128, 128, 0.18);
+  border-radius: 10px;
+}
+.llm-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.llm-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+.llm-model {
+  font-size: 12px;
+  opacity: 0.75;
+}
+.llm-url {
+  font-size: 12px;
+  opacity: 0.55;
+  word-break: break-all;
+}
+.llm-ops {
+  display: flex;
+  gap: 10px;
+  margin-top: 4px;
 }
 .notify-switch {
   display: flex;
