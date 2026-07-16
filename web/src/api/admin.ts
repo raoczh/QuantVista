@@ -116,3 +116,39 @@ export function listLlmCalls(params: { user_id?: number; module?: string; status
 export function getLlmCall(id: number) {
   return request<LLMCallLogItem>({ url: `/admin/llm-calls/${id}` })
 }
+
+// S3-4 因子 RankIC 验证报表（管理端只读）。
+export interface ICHorizonAgg {
+  mean_ic: number
+  icir: number
+  win_rate_pct: number
+  days: number
+}
+
+export interface FactorICStat {
+  key: string
+  name: string
+  group: string
+  horizons: Record<string, ICHorizonAgg>
+}
+
+export interface FactorICReport {
+  trade_date: string
+  dates: string[]
+  universe: number
+  st_skipped: number
+  adjust_suspect: number
+  min_cross: number
+  stats: FactorICStat[] | null
+  notes: string[]
+  elapsed_ms: number
+  generated_at: string
+}
+
+// 默认取进程内缓存；refresh=true 全量重算（数秒级，服务端全局互斥）。
+export function getFactorIC(refresh = false) {
+  return request<FactorICReport>({
+    url: '/admin/market/factor-ic',
+    params: refresh ? { refresh: 1 } : undefined,
+  })
+}

@@ -145,6 +145,30 @@ func (rc *RecommendationController) ShadowReport(c *gin.Context) {
 	common.ApiSuccess(c, rep)
 }
 
+// RecallReport GET /api/recommendations/recall-report?type=&horizon=&k= —— S3-2 候选池
+// 召回评估（Recall@K/来源消融/错失机会率/机会集 vs 池收益分布）。数秒级重活，
+// 全局互斥；纯程序计算零 LLM 调用。
+func (rc *RecommendationController) RecallReport(c *gin.Context) {
+	horizon := 10
+	if s := c.Query("horizon"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			horizon = n
+		}
+	}
+	k := 0
+	if s := c.Query("k"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			k = n
+		}
+	}
+	rep, err := rc.svc.RecRecallReport(c.Request.Context(), currentUserID(c), c.Query("type"), horizon, k)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, rep)
+}
+
 // StopLossAlert POST /api/recommendations/items/:id/stop-alert —— S1-4 执行纪律：
 // 对推荐条目的止损价一键创建到价提醒。
 func (rc *RecommendationController) StopLossAlert(c *gin.Context) {

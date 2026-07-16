@@ -404,3 +404,63 @@ export function getShadowReport(type?: string, horizon = 10) {
     params: { type, horizon },
   })
 }
+
+// S3-2 收益分布摘要。
+export interface RecallDist {
+  n: number
+  mean_pct: number
+  median_pct: number
+  p10_pct: number
+  p90_pct: number
+}
+
+// S3-2 来源消融行。
+export interface RecallSourceAblation {
+  source: string
+  label: string
+  pool_count: number
+  recall_pct: number
+  ablated_pct: number
+  drop_pct: number
+}
+
+// S3-2 单批次召回明细行。
+export interface RecallBatchRow {
+  batch_id: number
+  signal_date: string
+  opp_size: number
+  pool_size: number
+  k_eff: number
+  hit_pool: number
+  hit_llm: number
+  hit_picked: number
+}
+
+// S3-2 候选池召回评估报表（Recall@K / 来源消融 / 错失机会率 / 收益分布对比）。
+export interface RecallReport {
+  type: string
+  horizon_days: number
+  k: number
+  batches: number
+  recall_pool_pct: number
+  recall_llm_pct: number
+  recall_picked_pct: number
+  topk_stage_counts: Record<string, number>
+  missed_rate_pct: number
+  missed_labels?: RecallDist
+  opp_dist: RecallDist
+  pool_dist: RecallDist
+  source_ablation: RecallSourceAblation[] | null
+  batch_rows: RecallBatchRow[] | null
+  notes: string[]
+  elapsed_ms: number
+}
+
+// S3-2 候选池召回评估（数秒级重活，服务端全局互斥）。
+export function getRecallReport(type?: string, horizon = 10, k = 50) {
+  return request<RecallReport>({
+    url: '/recommendations/recall-report',
+    method: 'get',
+    params: { type, horizon, k },
+  })
+}

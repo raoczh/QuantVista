@@ -65,6 +65,7 @@ func AllModels() []any {
 		&RecommendationCandidateEvent{},
 		&RecommendationReflection{},
 		&StockUniverseDaily{},
+		&FactorSnapshotDaily{},
 	}
 }
 

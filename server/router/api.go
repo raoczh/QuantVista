@@ -205,6 +205,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				recommendations.GET("/performance", recommendationCtl.Performance)
 				recommendations.GET("/attribution", recommendationCtl.Attribution)
 				recommendations.GET("/shadow-report", recommendationCtl.ShadowReport)
+				recommendations.GET("/recall-report", recommendationCtl.RecallReport)
 				recommendations.PUT("/review-ack/:id", recommendationCtl.AckReview)
 				recommendations.POST("", middleware.RateLimit(15, time.Minute), recommendationCtl.Generate)
 				recommendations.GET("", recommendationCtl.List)
@@ -364,6 +365,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 					adminMarket.GET("/wide-status", marketCtl.WideStatus)
 					// M1 因子宽表手动重建（异步；常态由每日增量自动触发）
 					adminMarket.POST("/factor-rebuild", screenerCtl.FactorRebuild)
+					// S3-4 因子 RankIC 验证报表（只读，refresh=1 重算）
+					adminMarket.GET("/factor-ic", marketCtl.FactorIC)
 				}
 			}
 		}

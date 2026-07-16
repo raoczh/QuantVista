@@ -31,6 +31,7 @@ import {
   getPerformance,
   getAttribution,
   getShadowReport,
+  getRecallReport,
   createStopLossAlert,
   emptyRecFilters,
   type Strategy,
@@ -41,6 +42,7 @@ import {
   type PerformanceStats,
   type AttributionReport,
   type ShadowReport,
+  type RecallReport,
   type RecReject,
   type RecFilters,
   type PoolCandidate,
@@ -610,6 +612,47 @@ watch(shadowHorizon, () => {
   if (showShadow.value) void loadShadow()
 })
 
+// ---------- S3-2 候选池召回评估 ----------
+const showRecall = ref(false)
+const recallLoading = ref(false)
+const recallReport = ref<RecallReport | null>(null)
+const recallHorizon = ref(10)
+const recallK = ref(50)
+const recallHorizonOptions = [5, 10, 20].map((h) => ({ label: `${h} 交易日`, value: h }))
+const recallKOptions = [20, 50, 100].map((k) => ({ label: `Top ${k}`, value: k }))
+const RECALL_STAGE_LABEL: Record<string, string> = {
+  picked: '最终入选',
+  llm_list: '进 LLM 名单未选',
+  scored: '完成评分未进名单',
+  pool_full: '评分名额已满',
+  filtered: '被筛选排除',
+  absent: '从未进池',
+}
+const recallStages = computed(() => {
+  const counts = recallReport.value?.topk_stage_counts || {}
+  return Object.keys(RECALL_STAGE_LABEL)
+    .filter((k) => counts[k] > 0)
+    .map((k) => ({ key: k, label: RECALL_STAGE_LABEL[k], count: counts[k] }))
+})
+async function loadRecall() {
+  recallLoading.value = true
+  try {
+    recallReport.value = await getRecallReport(form.value.type, recallHorizon.value, recallK.value)
+  } catch (e) {
+    recallReport.value = null
+    message.error((e as Error).message)
+  } finally {
+    recallLoading.value = false
+  }
+}
+function openRecall() {
+  showRecall.value = true
+  void loadRecall()
+}
+watch([recallHorizon, recallK], () => {
+  if (showRecall.value) void loadRecall()
+})
+
 // S2-2/S2-3 severity 与缺失面展示辅助。
 function bearSeverityColor(sev: string): string {
   if (sev === 'high') return downColor.value
@@ -851,6 +894,7 @@ function qgFieldLabels(fields?: string[]): string {
             </div>
             <n-button size="tiny" tertiary block @click="openAttribution">错误归因报表（按持有期/特征分组）</n-button>
             <n-button size="tiny" tertiary block style="margin-top: 6px" @click="openShadow">影子门控对照（闸门/反方/质量转正评审）</n-button>
+            <n-button size="tiny" tertiary block style="margin-top: 6px" @click="openRecall">召回评估（好股票有没有进池）</n-button>
             <div class="perf-note">
               仅统计有价格数据的推荐（量化降级批次单独剔除）；超额收益以上证指数为基准；买入胜率只计已成熟样本（短线终态/长线超复盘周期）。
             </div>
@@ -1346,6 +1390,114 @@ function qgFieldLabels(fields?: string[]): string {
           </div>
           <div class="pool-note">
             <div v-for="(n, i) in shadowReport.notes" :key="i">{{ n }}</div>
+          </div>
+        </div>
+      </n-spin>
+    </n-modal>
+
+    <!-- S3-2 候选池召回评估：Recall@K / 来源消融 / 错失机会率 / 机会集 vs 池收益分布 -->
+    <n-modal v-model:show="showRecall" preset="card" title="候选池召回评估" class="attr-modal" :style="{ maxWidth: '860px', width: 'calc(100vw - 32px)' }">
+      <div class="attr-toolbar">
+        <n-select v-model:value="recallHorizon" :options="recallHorizonOptions" size="small" style="width: 120px" />
+        <n-select v-model:value="recallK" :options="recallKOptions" size="small" style="width: 110px" />
+        <span class="attr-meta" v-if="recallReport">评估 {{ recallReport.batches }} 个批次 · 耗时 {{ recallReport.elapsed_ms }}ms</span>
+      </div>
+      <n-spin :show="recallLoading">
+        <n-empty v-if="!recallLoading && !recallReport" description="暂无可评估批次：需要已走完持有期的成功推荐批次" />
+        <div v-else-if="recallReport" class="attr-body">
+          <div class="attr-dim">
+            <div class="attr-dim-title">Recall@{{ recallReport.k }}（未来 {{ recallReport.horizon_days }} 日全市场 Top-{{ recallReport.k }} 净收益股）</div>
+            <div class="pool-scroll">
+              <table class="pool-table attr-table">
+                <thead>
+                  <tr><th>进过候选池</th><th>进过 LLM 名单</th><th>被最终入选</th><th>错失机会率</th><th>错失影子收益（已成熟）</th></tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="qv-tnum">{{ recallReport.recall_pool_pct.toFixed(1) }}%</td>
+                    <td class="qv-tnum">{{ recallReport.recall_llm_pct.toFixed(1) }}%</td>
+                    <td class="qv-tnum">{{ recallReport.recall_picked_pct.toFixed(1) }}%</td>
+                    <td class="qv-tnum">{{ recallReport.missed_rate_pct.toFixed(1) }}%</td>
+                    <td class="qv-tnum">
+                      <template v-if="recallReport.missed_labels">
+                        均值 <span :style="{ color: pctColorOf(recallReport.missed_labels.mean_pct) }">{{ signedPct(recallReport.missed_labels.mean_pct) }}</span>
+                        （{{ recallReport.missed_labels.n }} 条）
+                      </template>
+                      <template v-else>—</template>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="recall-stages" v-if="recallStages.length">
+              <n-tag v-for="s in recallStages" :key="s.key" size="small" :bordered="false" round>
+                {{ s.label }} {{ s.count }}
+              </n-tag>
+            </div>
+          </div>
+          <div class="attr-dim" v-if="recallReport.source_ablation?.length">
+            <div class="attr-dim-title">来源消融（去掉该路来源后池召回掉多少）</div>
+            <div class="pool-scroll">
+              <table class="pool-table attr-table">
+                <thead>
+                  <tr><th>来源</th><th>池内候选数</th><th>基线召回</th><th>去掉后</th><th>召回损失</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="a in recallReport.source_ablation" :key="a.source">
+                    <td>{{ a.label }}</td>
+                    <td class="qv-tnum">{{ a.pool_count }}</td>
+                    <td class="qv-tnum">{{ a.recall_pct.toFixed(1) }}%</td>
+                    <td class="qv-tnum">{{ a.ablated_pct.toFixed(1) }}%</td>
+                    <td class="qv-tnum" :style="{ color: a.drop_pct > 0 ? downColor : undefined }">−{{ a.drop_pct.toFixed(1) }}pt</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="attr-dim">
+            <div class="attr-dim-title">净收益分布：全市场机会集 vs 候选池</div>
+            <div class="pool-scroll">
+              <table class="pool-table attr-table">
+                <thead>
+                  <tr><th>组</th><th>样本</th><th>均值</th><th>中位</th><th>P10</th><th>P90</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in [{ label: '机会集（可交易+流动性达标）', d: recallReport.opp_dist }, { label: '候选池', d: recallReport.pool_dist }]" :key="row.label">
+                    <td>{{ row.label }}</td>
+                    <td class="qv-tnum">{{ row.d.n }}</td>
+                    <td class="qv-tnum" :style="{ color: pctColorOf(row.d.mean_pct) }">{{ signedPct(row.d.mean_pct) }}</td>
+                    <td class="qv-tnum" :style="{ color: pctColorOf(row.d.median_pct) }">{{ signedPct(row.d.median_pct) }}</td>
+                    <td class="qv-tnum" :style="{ color: pctColorOf(row.d.p10_pct) }">{{ signedPct(row.d.p10_pct) }}</td>
+                    <td class="qv-tnum" :style="{ color: pctColorOf(row.d.p90_pct) }">{{ signedPct(row.d.p90_pct) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="attr-dim" v-if="recallReport.batch_rows?.length">
+            <div class="attr-dim-title">批次明细</div>
+            <div class="pool-scroll">
+              <table class="pool-table attr-table">
+                <thead>
+                  <tr><th>批次</th><th>信号日</th><th>机会集</th><th>池</th><th>K</th><th>进池</th><th>进名单</th><th>入选</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="r in recallReport.batch_rows" :key="r.batch_id">
+                    <td class="qv-tnum">#{{ r.batch_id }}</td>
+                    <td>{{ r.signal_date }}</td>
+                    <td class="qv-tnum">{{ r.opp_size }}</td>
+                    <td class="qv-tnum">{{ r.pool_size }}</td>
+                    <td class="qv-tnum">{{ r.k_eff }}</td>
+                    <td class="qv-tnum">{{ r.hit_pool }}</td>
+                    <td class="qv-tnum">{{ r.hit_llm }}</td>
+                    <td class="qv-tnum">{{ r.hit_picked }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="pool-note">
+            <div v-for="(n, i) in recallReport.notes" :key="i">{{ n }}</div>
           </div>
         </div>
       </n-spin>
@@ -1850,6 +2002,13 @@ function qgFieldLabels(fields?: string[]): string {
 .attr-meta {
   font-size: 12px;
   opacity: 0.6;
+}
+/* S3-2 召回评估：Top-K 去向分桶 tag 行 */
+.recall-stages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
 }
 .attr-body {
   display: flex;

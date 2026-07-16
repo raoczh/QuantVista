@@ -134,7 +134,12 @@ const userOptions = computed<DropdownOption[]>(() => {
     { label: '设置', key: 'settings' },
     { label: '提示词模板', key: 'prompts' },
   ]
-  if (isAdmin.value) opts.push({ label: '管理后台', key: 'admin' }, { label: 'LLM 调用记录', key: 'admin-llm-calls' })
+  if (isAdmin.value)
+    opts.push(
+      { label: '管理后台', key: 'admin' },
+      { label: 'LLM 调用记录', key: 'admin-llm-calls' },
+      { label: '因子 IC 排行', key: 'admin-factor-ic' },
+    )
   opts.push({ type: 'divider', key: 'd1' }, { label: '退出登录', key: 'logout' })
   return opts
 })
@@ -144,6 +149,7 @@ async function onSelectUser(key: string) {
   else if (key === 'prompts') router.push('/prompt-templates')
   else if (key === 'admin') router.push('/admin')
   else if (key === 'admin-llm-calls') router.push('/admin/llm-calls')
+  else if (key === 'admin-factor-ic') router.push('/admin/factor-ic')
   else if (key === 'logout') {
     setMarketTitle('')
     await authStore.logout()
