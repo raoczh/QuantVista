@@ -367,6 +367,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 					adminMarket.POST("/factor-rebuild", screenerCtl.FactorRebuild)
 					// S3-4 因子 RankIC 验证报表（只读，refresh=1 重算）
 					adminMarket.GET("/factor-ic", marketCtl.FactorIC)
+					// S3-5 walk-forward 评估基线报表（只读，refresh=1 重算）
+					adminMarket.GET("/walk-forward", marketCtl.WalkForward)
 				}
 			}
 		}
