@@ -204,6 +204,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				recommendations.GET("/strategies", recommendationCtl.Strategies)
 				recommendations.GET("/performance", recommendationCtl.Performance)
 				recommendations.GET("/attribution", recommendationCtl.Attribution)
+				recommendations.GET("/shadow-report", recommendationCtl.ShadowReport)
 				recommendations.PUT("/review-ack/:id", recommendationCtl.AckReview)
 				recommendations.POST("", middleware.RateLimit(15, time.Minute), recommendationCtl.Generate)
 				recommendations.GET("", recommendationCtl.List)

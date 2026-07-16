@@ -128,6 +128,23 @@ func (rc *RecommendationController) Attribution(c *gin.Context) {
 	common.ApiSuccess(c, rep)
 }
 
+// ShadowReport GET /api/recommendations/shadow-report?type=&horizon= —— S2-4 影子门控
+// 对照报表（gated vs ungated 成熟收益分布 + 覆盖率，闸门/反方/质量门控转正评审地基）。
+func (rc *RecommendationController) ShadowReport(c *gin.Context) {
+	horizon := 10
+	if s := c.Query("horizon"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			horizon = n
+		}
+	}
+	rep, err := service.RecShadowReport(currentUserID(c), c.Query("type"), horizon)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, rep)
+}
+
 // StopLossAlert POST /api/recommendations/items/:id/stop-alert —— S1-4 执行纪律：
 // 对推荐条目的止损价一键创建到价提醒。
 func (rc *RecommendationController) StopLossAlert(c *gin.Context) {

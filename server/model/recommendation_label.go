@@ -106,9 +106,11 @@ const (
 
 // 门控类型（gate_type，影子门控记录）。
 const (
-	GateRegimeShadow = "regime_shadow" // S1-1 大盘闸门影子：defense 档「若强制会 buy→watch」
-	GateCorrelation  = "correlation"   // S1-3 相关性去重（名单阶段生效）
-	GateIndustryCap  = "industry_cap"  // S1-3 同行业名额上限（名单阶段生效）
+	GateRegimeShadow  = "regime_shadow"  // S1-1 大盘闸门影子：defense 档「若强制会 buy→watch」
+	GateCorrelation   = "correlation"    // S1-3 相关性去重（名单阶段生效）
+	GateIndustryCap   = "industry_cap"   // S1-3 同行业名额上限（名单阶段生效）
+	GateBearShadow    = "bear_shadow"    // S2-2 反方研究员影子：severity=high「若强制会 buy→watch」
+	GateQualityShadow = "quality_shadow" // S2-3 数据质量门控影子：would_be_confidence_cap 只记不封顶
 )
 
 // RecommendationCandidateEvent 反事实事件表（S0-5）：候选池内每只标的在本批次的

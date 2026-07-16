@@ -30,6 +30,7 @@ import {
   trackRecommendation,
   getPerformance,
   getAttribution,
+  getShadowReport,
   createStopLossAlert,
   emptyRecFilters,
   type Strategy,
@@ -39,6 +40,7 @@ import {
   type RecommendationItem,
   type PerformanceStats,
   type AttributionReport,
+  type ShadowReport,
   type RecReject,
   type RecFilters,
   type PoolCandidate,
@@ -70,7 +72,15 @@ const form = ref<RecommendRequest>({
   llm_config_id: undefined,
   count: 5,
   verify: false,
+  bear_check: false,
 })
+// 反方研究员默认关联复核开关（后端 bear_check 未传时同款语义；这里显式联动便于用户单独调整）。
+watch(
+  () => form.value.verify,
+  (v) => {
+    form.value.bear_check = v
+  },
+)
 
 // ---------- 筛选条件（阶段②用户硬过滤，默认从偏好读，可临时改随请求提交） ----------
 const filters = ref<RecFilters>(emptyRecFilters())
@@ -577,6 +587,50 @@ watch(attrHorizon, () => {
   if (showAttribution.value) void loadAttribution()
 })
 
+// ---------- S2-4 影子门控对照报表 ----------
+const showShadow = ref(false)
+const shadowLoading = ref(false)
+const shadowReport = ref<ShadowReport | null>(null)
+const shadowHorizon = ref(10)
+async function loadShadow() {
+  shadowLoading.value = true
+  try {
+    shadowReport.value = await getShadowReport(form.value.type, shadowHorizon.value)
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    shadowLoading.value = false
+  }
+}
+function openShadow() {
+  showShadow.value = true
+  void loadShadow()
+}
+watch(shadowHorizon, () => {
+  if (showShadow.value) void loadShadow()
+})
+
+// S2-2/S2-3 severity 与缺失面展示辅助。
+function bearSeverityColor(sev: string): string {
+  if (sev === 'high') return downColor.value
+  if (sev === 'med') return vars.value.warningColor
+  return flatColor.value
+}
+function bearSeverityLabel(sev: string): string {
+  return sev === 'high' ? '高危' : sev === 'med' ? '中危' : '低危'
+}
+const QG_FIELD_LABEL: Record<string, string> = {
+  quote: '实时行情',
+  daily_bars: '日线数据',
+  daily_bars_stale: '日线过期',
+  daily_bars_short: '日线样本不足',
+  amount: '成交额',
+  fin: '财务数据',
+}
+function qgFieldLabels(fields?: string[]): string {
+  return (fields || []).map((f) => QG_FIELD_LABEL[f] || f).join('、')
+}
+
 </script>
 
 <template>
@@ -642,6 +696,12 @@ watch(attrHorizon, () => {
               <div class="filters-switch">
                 <n-switch v-model:value="form.verify" size="small" />
                 <span class="verify-hint">开启后由独立「风控复核员」逐条核对证据与价位，可否决推荐</span>
+              </div>
+            </n-form-item>
+            <n-form-item label="反方研究员（影子，多一次调用）">
+              <div class="filters-switch">
+                <n-switch v-model:value="form.bear_check" size="small" />
+                <span class="verify-hint">对每只 buy 独立构建最强反方论证（bear case）。影子期只展示、不改写结论；默认随 AI 复核联动</span>
               </div>
             </n-form-item>
             <n-form-item label="LLM 配置">
@@ -790,6 +850,7 @@ watch(attrHorizon, () => {
               >
             </div>
             <n-button size="tiny" tertiary block @click="openAttribution">错误归因报表（按持有期/特征分组）</n-button>
+            <n-button size="tiny" tertiary block style="margin-top: 6px" @click="openShadow">影子门控对照（闸门/反方/质量转正评审）</n-button>
             <div class="perf-note">
               仅统计有价格数据的推荐（量化降级批次单独剔除）；超额收益以上证指数为基准；买入胜率只计已成熟样本（短线终态/长线超复盘周期）。
             </div>
@@ -1038,6 +1099,25 @@ watch(attrHorizon, () => {
                         <li v-for="(x, i) in it.detail.risks" :key="i">{{ x }}</li>
                       </ul>
                     </div>
+                    <!-- S2-2 反方研究员（影子）：最强 bear case 只展示，不改写结论 -->
+                    <div v-if="it.detail.bear" class="block bear-block" :style="{ borderColor: withAlpha(bearSeverityColor(it.detail.bear.severity), 0.35) }">
+                      <div class="block-title bear-title">
+                        <span :style="{ color: bearSeverityColor(it.detail.bear.severity) }">反方论证</span>
+                        <n-tag size="tiny" :bordered="false" :color="{ color: withAlpha(bearSeverityColor(it.detail.bear.severity), 0.14), textColor: bearSeverityColor(it.detail.bear.severity) }">
+                          {{ bearSeverityLabel(it.detail.bear.severity) }}
+                        </n-tag>
+                        <span class="bear-shadow-note">影子：不改写结论{{ it.detail.bear.severity === 'high' && it.detail.action === 'buy' ? '（若转正将降为观察）' : '' }}</span>
+                      </div>
+                      <p class="bear-case">{{ it.detail.bear.bear_case }}</p>
+                    </div>
+                    <!-- S2-3 数据质量门控（影子）：缺失面与 would-be 封顶只读展示 -->
+                    <div v-if="it.detail.quality_gate" class="qg-note">
+                      <template v-if="it.detail.quality_gate.missing_critical_fields?.length">
+                        数据质量（影子）：缺失 {{ qgFieldLabels(it.detail.quality_gate.missing_critical_fields) }}，若门控转正置信度将封顶至
+                        {{ it.detail.quality_gate.would_be_confidence_cap }}（当前未封顶）。
+                      </template>
+                      <template v-if="it.detail.quality_gate.senti_missing">当日无相关新闻（情绪数据缺失，不代表情绪中性）。</template>
+                    </div>
                     <div v-if="it.detail.evidence.length" class="block">
                       <div class="block-title">数据依据</div>
                       <ul>
@@ -1206,6 +1286,66 @@ watch(attrHorizon, () => {
           </div>
           <div class="pool-note">
             <div v-for="(n, i) in attrReport.notes" :key="i">{{ n }}</div>
+          </div>
+        </div>
+      </n-spin>
+    </n-modal>
+
+    <!-- S2-4 影子门控对照：gated vs ungated 成熟收益分布 + 覆盖率（门控转正评审的数据地基） -->
+    <n-modal v-model:show="showShadow" preset="card" title="影子门控对照报表" class="attr-modal" :style="{ maxWidth: '860px', width: 'calc(100vw - 32px)' }">
+      <div class="attr-toolbar">
+        <n-select v-model:value="shadowHorizon" :options="attrHorizonOptions" size="small" style="width: 140px" />
+        <span class="attr-meta" v-if="shadowReport"
+          >入选 buy {{ shadowReport.picked_buy }} · 已成熟 {{ shadowReport.picked_buy_matured }}</span
+        >
+      </div>
+      <n-spin :show="shadowLoading">
+        <n-empty
+          v-if="shadowReport && !shadowReport.groups?.length"
+          description="暂无门控标记样本：影子事件自第一批功能上线起积累（防守档/反方高危/数据缺失场景才会产生标记）"
+        />
+        <div v-else-if="shadowReport" class="attr-body">
+          <div v-for="g in shadowReport.groups" :key="g.gate_type" class="attr-dim">
+            <div class="attr-dim-title">
+              {{ g.gate_label }}
+              <span class="shadow-cover">标记 {{ g.marked }} · 若强制损失 buy {{ g.would_rewrite }} / {{ shadowReport.picked_buy }}</span>
+            </div>
+            <div class="pool-scroll">
+              <table class="pool-table attr-table">
+                <thead>
+                  <tr>
+                    <th>组</th>
+                    <th>成熟样本</th>
+                    <th>胜率(净)</th>
+                    <th>净收益均值</th>
+                    <th>中位</th>
+                    <th>P10(尾部)</th>
+                    <th>严重亏损&lt;-5%</th>
+                    <th>均alpha</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="c in [g.gated, g.ungated]" :key="c.key" :class="{ 'attr-thin': c.sample < 5 }">
+                    <td>
+                      {{ c.key === 'gated' ? '被门控标记' : '未标记入选（对照）' }}
+                      <span v-if="c.sample < 5" class="pool-dim">（样本不足）</span>
+                    </td>
+                    <td class="qv-tnum">{{ c.sample }}</td>
+                    <td class="qv-tnum">{{ c.win_rate.toFixed(0) }}%</td>
+                    <td class="qv-tnum" :style="{ color: pctColorOf(c.avg_net_pct) }">{{ signedPct(c.avg_net_pct) }}</td>
+                    <td class="qv-tnum" :style="{ color: pctColorOf(c.median_net_pct) }">{{ signedPct(c.median_net_pct) }}</td>
+                    <td class="qv-tnum" :style="{ color: pctColorOf(c.p10_net_pct) }">{{ signedPct(c.p10_net_pct) }}</td>
+                    <td class="qv-tnum">{{ c.severe_loss_pct.toFixed(0) }}%</td>
+                    <td class="qv-tnum" :style="{ color: pctColorOf(c.avg_alpha_pct) }">
+                      {{ c.alpha_sample > 0 ? signedPct(c.avg_alpha_pct) : '—' }}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="pool-note">
+            <div v-for="(n, i) in shadowReport.notes" :key="i">{{ n }}</div>
           </div>
         </div>
       </n-spin>
@@ -1639,6 +1779,45 @@ watch(attrHorizon, () => {
   border-radius: 8px;
   background: v-bind('withAlpha(vars.warningColor, 0.08)');
   margin: 8px 0;
+}
+/* S2-2 反方研究员（影子） */
+.bear-block {
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.bear-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.bear-shadow-note {
+  font-size: 11px;
+  font-weight: 400;
+  opacity: 0.55;
+}
+.bear-case {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+/* S2-3 数据质量门控（影子） */
+.qg-note {
+  font-size: 12px;
+  opacity: 0.75;
+  line-height: 1.6;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: v-bind('withAlpha(flatColor, 0.1)');
+  margin: 8px 0;
+}
+/* S2-4 影子对照 */
+.shadow-cover {
+  font-size: 12px;
+  font-weight: 400;
+  opacity: 0.6;
+  margin-left: 8px;
 }
 /* S1-1 regime tooltip 与 S1-2 仓位 tooltip */
 .regime-tip,
