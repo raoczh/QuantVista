@@ -24,6 +24,26 @@ mobile/
 替换后执行 `npm run sync` 将配置同步进 android 工程再构建。
 ntfy 推送另需服务端部署（`docs/DEPLOYMENT.md` §8）与下文「App Links 指纹」「手机端 ntfy 配置」两步。
 
+### 本地改动不入库（skip-worktree）
+
+仓库保持占位符入库，真实域名/指纹只留在本地工作区（docker build 与 gradle 用工作区状态，
+未提交的改动照样进镜像/APK）。给这些文件打上 skip-worktree 标记后，本地改动不再出现在
+`git status`/`git diff`，也不会被误提交：
+
+```bash
+git update-index --skip-worktree \
+  mobile/capacitor.config.ts \
+  mobile/android/app/src/main/AndroidManifest.xml \
+  mobile/android/app/build.gradle \
+  web/public/.well-known/assetlinks.json
+```
+
+- 查看已标记的文件：`git ls-files -v | grep ^S`；
+- 解除标记（需要提交该文件的上游改动时）：`git update-index --no-skip-worktree <file>`；
+- **拉取冲突**：若远端更新了被标记的文件，`git pull`/`checkout` 会报错拒绝覆盖——先解除标记、
+  `git stash` 暂存本地改动、拉取后 `git stash pop` 恢复、再重新打标记；
+- 换新机器克隆后本地改动不存在，需按上表重新替换并重新打标记。
+
 ## 前置条件
 
 - Node ≥ 20（本仓库基线 v24）；
