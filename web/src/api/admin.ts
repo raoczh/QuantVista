@@ -152,3 +152,96 @@ export function getFactorIC(refresh = false) {
     params: refresh ? { refresh: 1 } : undefined,
   })
 }
+
+// S3-5 walk-forward 评估基线报表（管理端只读）。
+export interface WFSpec {
+  train: number
+  val: number
+  test: number
+  step: number
+  purge: number
+  embargo: number
+}
+
+export interface WFMetricFields {
+  signals: number
+  picked: number
+  trades: number
+  skipped: number
+  pending: number
+  precision_net_pct: number
+  median_net_pct: number
+  avg_net_pct: number
+  severe_loss_pct: number
+  alpha_sample: number
+  precision_alpha_pct: number
+  median_alpha_pct: number
+}
+
+export interface WFSegRow extends WFMetricFields {
+  fold: number // 0=全折合并
+  segment: string // val / test
+  strategy: string
+  strategy_name: string
+  hold: number
+}
+
+export interface WFFoldView {
+  fold: number
+  train_range: [string, string]
+  val_range: [string, string]
+  test_range: [string, string]
+  val_signals: number
+  test_signals: number
+}
+
+export interface WFMonthlyItem {
+  symbol: string
+  name: string
+  score: number
+  status: string
+  net_pct?: number
+  alpha_pct?: number
+}
+
+export interface WFMonthlyRow extends WFMetricFields {
+  month: string
+  signal_date: string
+  strategy: string
+  strategy_name: string
+  hold: number
+  items: WFMonthlyItem[] | null
+}
+
+export interface WFSectionReport {
+  rec_type: string // short_term / long_term
+  holds: number[]
+  strategies: string[] | null
+  spec: WFSpec
+  target_spec: WFSpec
+  adapted: boolean
+  spec_note: string
+  folds: WFFoldView[] | null
+  rows: WFSegRow[] | null
+  monthly: WFMonthlyRow[] | null
+}
+
+export interface WalkForwardReport {
+  trade_date: string
+  top_k: number
+  universe: number
+  st_skipped: number
+  adjust_suspect: number
+  sections: WFSectionReport[] | null
+  notes: string[]
+  elapsed_ms: number
+  generated_at: string
+}
+
+// 默认取进程内缓存；refresh=true 全量重算（每信号日一次全市场 as-of 重算，数十秒级）。
+export function getWalkForward(refresh = false) {
+  return request<WalkForwardReport>({
+    url: '/admin/market/walk-forward',
+    params: refresh ? { refresh: 1 } : undefined,
+  })
+}

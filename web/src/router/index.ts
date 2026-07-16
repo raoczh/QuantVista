@@ -37,6 +37,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/admin', name: 'admin', component: () => import('@/pages/AdminSettings.vue'), meta: { title: '管理后台', admin: true } },
   { path: '/admin/llm-calls', name: 'admin-llm-calls', component: () => import('@/pages/AdminLlmCalls.vue'), meta: { title: 'LLM 调用记录', admin: true } },
   { path: '/admin/factor-ic', name: 'admin-factor-ic', component: () => import('@/pages/AdminFactorIc.vue'), meta: { title: '因子 IC 排行', admin: true } },
+  { path: '/admin/walk-forward', name: 'admin-walk-forward', component: () => import('@/pages/AdminWalkForward.vue'), meta: { title: 'Walk-Forward 基线', admin: true } },
   { path: '/:pathMatch(.*)*', name: 'notfound', component: Placeholder, meta: { title: '未找到' } },
 ]
 
