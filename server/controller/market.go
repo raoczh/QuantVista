@@ -254,3 +254,21 @@ func (mc *MarketController) WideStatus(c *gin.Context) {
 	}
 	common.ApiSuccess(c, v)
 }
+
+// FactorIC GET /api/admin/market/factor-ic?refresh=1 —— S3-4 因子 RankIC 验证报表
+//（管理端只读页）。默认返回进程内缓存；无缓存或 refresh=1 时全量重算（数秒级，
+// 全局互斥）。纯程序计算零 LLM 调用。
+func (mc *MarketController) FactorIC(c *gin.Context) {
+	if c.Query("refresh") != "1" {
+		if rep := service.CachedFactorICReport(); rep != nil {
+			common.ApiSuccess(c, rep)
+			return
+		}
+	}
+	rep, err := service.RunFactorIC(c.Request.Context(), mc.svc)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, rep)
+}
