@@ -39,6 +39,11 @@ type RecommendationBatch struct {
 	FiltersJSON    string `gorm:"type:text" json:"filters_json,omitempty"`   // 本次生效的筛选条件快照（透明可回显）
 	ReviewJSON     string `gorm:"type:text" json:"review_json,omitempty"`    // AI 复核员结论 JSON（verify 模式；列表查询不返回）
 
+	// Regime S1-1 大盘闸门三档判定（offense/neutral/defense；空=未判定，如旧记录/数据缺失）。
+	// 影子模式：只落库与展示，不改写 action；强制降级由 feature flag 控制（默认关）。
+	Regime     string `gorm:"size:16" json:"regime"`
+	RegimeJSON string `gorm:"type:text" json:"regime_json,omitempty"` // 判定依据明细 + 仓位模型参数快照（可回溯）
+
 	LLMConfigID     int64  `json:"llm_config_id"`
 	Provider        string `gorm:"size:32" json:"provider"`
 	Model           string `gorm:"size:64" json:"model"`
@@ -68,6 +73,10 @@ type Recommendation struct {
 	Confidence int     `json:"confidence"`            // 0-100
 	Summary    string  `gorm:"size:512" json:"summary"`
 	RefPrice   float64 `gorm:"type:decimal(20,4)" json:"ref_price"`
+	// 价格版本（S0-4 防前复权重锚）：生成时点最近收盘日与该日收盘价。追踪/标签结算时
+	// 与 daily_bars 同日收盘比对，偏差超容差判定序列已重锚，价位按复权因子调整。
+	RefDate  string  `gorm:"size:10" json:"ref_date"`
+	RefClose float64 `gorm:"type:decimal(20,4)" json:"ref_close"`
 
 	DetailJSON string `gorm:"type:text" json:"detail_json,omitempty"` // 结构化明细 JSON
 

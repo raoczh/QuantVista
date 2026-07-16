@@ -17,6 +17,8 @@ import {
   NCollapse,
   NCollapseItem,
   NSwitch,
+  NModal,
+  NTooltip,
   useMessage,
 } from 'naive-ui'
 import {
@@ -27,6 +29,8 @@ import {
   deleteRecommendation,
   trackRecommendation,
   getPerformance,
+  getAttribution,
+  createStopLossAlert,
   emptyRecFilters,
   type Strategy,
   type RecommendRequest,
@@ -34,6 +38,7 @@ import {
   type RecommendationBatch,
   type RecommendationItem,
   type PerformanceStats,
+  type AttributionReport,
   type RecReject,
   type RecFilters,
   type PoolCandidate,
@@ -494,6 +499,84 @@ function signedPct(n: number | undefined) {
   return (n > 0 ? '+' : '') + s + '%'
 }
 
+// ---------- S1-1 市场状态（regime，影子模式只展示不改写） ----------
+const REGIME_LABEL: Record<string, string> = { offense: '进攻', neutral: '中性', defense: '防守' }
+function regimeLabel(r: string | undefined) {
+  return r ? REGIME_LABEL[r] || r : ''
+}
+function regimeTagType(r: string | undefined): 'success' | 'warning' | 'error' | 'default' {
+  if (r === 'offense') return 'success'
+  if (r === 'defense') return 'error'
+  if (r === 'neutral') return 'warning'
+  return 'default'
+}
+// regime 判定依据明细（详情接口 regime_json）。
+const regimeSignals = computed<string[]>(() => {
+  const raw = current.value?.regime_json
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw) as { signals?: string[] }
+    return Array.isArray(parsed.signals) ? parsed.signals : []
+  } catch {
+    return []
+  }
+})
+
+// ---------- S1-4 一键挂止损提醒 ----------
+const stopAlerting = ref<Record<number, boolean>>({})
+async function addStopAlert(it: RecommendationItem) {
+  stopAlerting.value[it.id] = true
+  try {
+    await createStopLossAlert(it.id)
+    message.success(`已创建止损提醒：${it.name || it.symbol} ≤ ${it.detail?.stop_loss?.toFixed(2)}（命中自动暂停，可在「提醒」页管理）`)
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    stopAlerting.value[it.id] = false
+  }
+}
+
+// ---------- S0-6 归因报表 ----------
+const showAttribution = ref(false)
+const attrLoading = ref(false)
+const attrReport = ref<AttributionReport | null>(null)
+const attrHorizon = ref(10)
+const attrHorizonOptions = [1, 5, 10, 20, 60].map((h) => ({ label: `${h} 交易日`, value: h }))
+const ATTR_DIM_LABEL: Record<string, string> = {
+  action: '动作',
+  chg5d_bucket: '入场特征（近5日涨幅）',
+  regime: '市场状态',
+  strategy: '策略',
+  source: '来源',
+  industry: '行业',
+}
+const attrDims = computed(() => {
+  const groups = attrReport.value?.groups || []
+  const byDim = new Map<string, typeof groups>()
+  for (const g of groups) {
+    if (!byDim.has(g.dim)) byDim.set(g.dim, [])
+    byDim.get(g.dim)!.push(g)
+  }
+  return [...byDim.entries()].map(([dim, cells]) => ({ dim, label: ATTR_DIM_LABEL[dim] || dim, cells }))
+})
+async function loadAttribution() {
+  attrLoading.value = true
+  try {
+    attrReport.value = await getAttribution(form.value.type, attrHorizon.value)
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    attrLoading.value = false
+  }
+}
+function openAttribution() {
+  showAttribution.value = true
+  void loadAttribution()
+}
+watch(attrHorizon, () => {
+  if (showAttribution.value) void loadAttribution()
+})
+
 </script>
 
 <template>
@@ -624,9 +707,39 @@ function signedPct(n: number | undefined) {
             <span class="perf-n">样本 n={{ performance.sample }}</span>
           </template>
           <div class="perf">
+            <!-- S0-4 买入成熟口径（主指标）：只统计 action=buy 且已成熟（止盈/止损/过期）的样本，
+                 watch 与未成熟不再混入分母虚增胜率。 -->
             <div class="perf-row">
-              <span class="perf-label">胜率</span>
-              <span class="perf-val">{{ performance.win_rate.toFixed(1) }}%</span>
+              <span class="perf-label">买入胜率（已成熟）</span>
+              <span class="perf-val"
+                >{{ performance.buy_matured > 0 ? performance.buy_win_rate.toFixed(1) + '%' : '—' }}
+                <span class="perf-sub">n={{ performance.buy_matured }}</span></span
+              >
+            </div>
+            <div v-if="performance.buy_matured > 0" class="perf-row">
+              <span class="perf-label">买入平均/中位收益</span>
+              <span class="perf-val" :style="{ color: pctColorOf(performance.buy_avg_return_pct) }">
+                {{ signedPct(performance.buy_avg_return_pct) }}
+                <span class="perf-sub">中位 {{ signedPct(performance.buy_median_pct) }}</span>
+              </span>
+            </div>
+            <div v-if="performance.buy_bench_sample > 0" class="perf-row">
+              <span class="perf-label">买入平均超额(alpha)</span>
+              <span class="perf-val" :style="{ color: pctColorOf(performance.buy_avg_alpha_pct) }"
+                >{{ signedPct(performance.buy_avg_alpha_pct) }}
+                <span class="perf-sub">n={{ performance.buy_bench_sample }}</span></span
+              >
+            </div>
+            <div v-if="performance.watch_sample > 0" class="perf-row">
+              <span class="perf-label">观察(watch)后续上涨占比</span>
+              <span class="perf-val"
+                >{{ performance.watch_win_rate.toFixed(1) }}%
+                <span class="perf-sub">n={{ performance.watch_sample }}</span></span
+              >
+            </div>
+            <div class="perf-row">
+              <span class="perf-label">全样本胜率（含未成熟，参考）</span>
+              <span class="perf-val perf-secondary">{{ performance.win_rate.toFixed(1) }}%</span>
             </div>
             <div class="perf-row">
               <span class="perf-label">平均收益</span>
@@ -672,9 +785,15 @@ function signedPct(n: number | undefined) {
               >
               <n-tag size="tiny" :bordered="false" round>过期 {{ performance.expired }}</n-tag>
               <n-tag size="tiny" :bordered="false" round>进行 {{ performance.active }}</n-tag>
+              <n-tag v-if="performance.degraded_excluded > 0" size="tiny" :bordered="false" round
+                >降级批次剔除 {{ performance.degraded_excluded }}</n-tag
+              >
             </div>
-            <div class="perf-note">仅统计有价格数据的推荐；超额收益以上证指数为基准。</div>
-            <div v-if="performance.sample < 10" class="perf-note">样本较少（n&lt;10），统计结果波动大，仅供参考。</div>
+            <n-button size="tiny" tertiary block @click="openAttribution">错误归因报表（按持有期/特征分组）</n-button>
+            <div class="perf-note">
+              仅统计有价格数据的推荐（量化降级批次单独剔除）；超额收益以上证指数为基准；买入胜率只计已成熟样本（短线终态/长线超复盘周期）。
+            </div>
+            <div v-if="performance.buy_matured < 10" class="perf-note">成熟买入样本较少（n&lt;10），统计结果波动大，仅供参考。</div>
           </div>
         </SectionCard>
       </div>
@@ -693,6 +812,19 @@ function signedPct(n: number | undefined) {
                 <n-tag size="small" round :bordered="false" :type="current.type === 'short_term' ? 'warning' : 'info'">{{
                   typeLabel(current.type)
                 }}</n-tag>
+                <n-tooltip v-if="current.regime" trigger="hover" placement="bottom">
+                  <template #trigger>
+                    <n-tag size="small" round :bordered="false" :type="regimeTagType(current.regime)"
+                      >市场状态：{{ regimeLabel(current.regime) }}</n-tag
+                    >
+                  </template>
+                  <div class="regime-tip">
+                    <div v-for="(s, i) in regimeSignals" :key="i">{{ s }}</div>
+                    <div class="regime-tip-note">
+                      三档判定为影子模式：仅提示，不改写推荐动作；防守档建议整体保守、降低仓位。
+                    </div>
+                  </div>
+                </n-tooltip>
                 <span class="res-strategy">{{ batchTitle(current) }}</span>
                 <span class="res-meta"
                   >候选池 {{ current.candidate_count }} · {{ fmtTime(current.created_at)
@@ -804,6 +936,12 @@ function signedPct(n: number | undefined) {
                           signedPct(it.status.return_pct)
                         }}</span>
                       </div>
+                      <div v-if="it.status.actual_return_pct != null" class="tk">
+                        <span class="tk-label">实际收益（按你的买入价）</span>
+                        <span class="tk-val" :style="{ color: pctColorOf(it.status.actual_return_pct) }">{{
+                          signedPct(it.status.actual_return_pct)
+                        }}</span>
+                      </div>
                       <div class="tk">
                         <span class="tk-label">最大涨幅</span>
                         <span class="tk-val" :style="{ color: upColor }">{{ signedPct(it.status.max_gain_pct) }}</span>
@@ -847,6 +985,17 @@ function signedPct(n: number | undefined) {
                         <span class="lv-label">有效期</span>
                         <span class="lv-val">{{ it.detail.valid_days || '—' }} 交易日</span>
                       </div>
+                      <div v-if="it.detail.position_pct" class="lv">
+                        <span class="lv-label">建议仓位</span>
+                        <n-tooltip trigger="hover" placement="top">
+                          <template #trigger>
+                            <span class="lv-val lv-help">{{ it.detail.position_pct.toFixed(1) }}%</span>
+                          </template>
+                          <div class="pos-tip">
+                            目标波动模型（程序计算，非 AI 输出）：{{ it.detail.position_why }}
+                          </div>
+                        </n-tooltip>
+                      </div>
                     </div>
                     <!-- 长线关键信息 -->
                     <div v-else class="levels">
@@ -859,6 +1008,17 @@ function signedPct(n: number | undefined) {
                       <div class="lv">
                         <span class="lv-label">复盘周期</span>
                         <span class="lv-val">{{ it.detail.review_cycle || '—' }}</span>
+                      </div>
+                      <div v-if="it.detail.position_pct" class="lv">
+                        <span class="lv-label">建议仓位</span>
+                        <n-tooltip trigger="hover" placement="top">
+                          <template #trigger>
+                            <span class="lv-val lv-help">{{ it.detail.position_pct.toFixed(1) }}%</span>
+                          </template>
+                          <div class="pos-tip">
+                            目标波动模型（程序计算，非 AI 输出）：{{ it.detail.position_why }}
+                          </div>
+                        </n-tooltip>
                       </div>
                     </div>
 
@@ -893,10 +1053,23 @@ function signedPct(n: number | undefined) {
                     <div v-if="current.type === 'short_term' && it.detail.invalidation" class="invalid">
                       失效条件：{{ it.detail.invalidation }}
                     </div>
+                    <!-- S1-4 执行纪律三条（固定展示：截住「推荐胜率」与「用户执行」的偏差） -->
+                    <div v-if="current.type === 'short_term' && it.detail.buy_zone_high > 0" class="discipline">
+                      执行纪律：① 买入区间外不追（高于 {{ fmt(it.detail.buy_zone_high) }} 放弃本次机会）；②
+                      止损价一键挂提醒，触达坚决执行；③ T+1 首日不满仓（建议首日 ≤ 建议仓位的一半）。
+                    </div>
                     <p class="disclaimer">{{ it.detail.disclaimer }}</p>
                   </template>
 
                   <div class="card-actions">
+                    <n-button
+                      v-if="current.type === 'short_term' && it.detail && it.detail.stop_loss > 0"
+                      size="small"
+                      tertiary
+                      :loading="stopAlerting[it.id]"
+                      @click="addStopAlert(it)"
+                      >挂止损提醒</n-button
+                    >
                     <n-button v-if="!it.position" size="small" type="primary" ghost @click="buildPosition(it)">一键建仓</n-button>
                     <n-button v-else size="small" tertiary @click="router.push({ name: 'positions' })">查看持仓</n-button>
                   </div>
@@ -986,6 +1159,57 @@ function signedPct(n: number | undefined) {
         </SectionCard>
       </div>
     </div>
+
+    <!-- S0-6 确定性错误归因报表：成熟标签按维度分组的胜率/中位/尾部亏损 -->
+    <n-modal v-model:show="showAttribution" preset="card" title="错误归因报表" class="attr-modal" :style="{ maxWidth: '860px', width: 'calc(100vw - 32px)' }">
+      <div class="attr-toolbar">
+        <n-select v-model:value="attrHorizon" :options="attrHorizonOptions" size="small" style="width: 140px" />
+        <span class="attr-meta" v-if="attrReport"
+          >成熟样本 {{ attrReport.sample }} · 未成熟 {{ attrReport.pending }} · 无法成交 {{ attrReport.skipped }}</span
+        >
+      </div>
+      <n-spin :show="attrLoading">
+        <n-empty v-if="attrReport && attrReport.sample === 0" description="暂无成熟样本：标签自本批功能上线起积累，需等推荐走完持有期" />
+        <div v-else-if="attrReport" class="attr-body">
+          <div v-for="d in attrDims" :key="d.dim" class="attr-dim">
+            <div class="attr-dim-title">{{ d.label }}</div>
+            <div class="pool-scroll">
+              <table class="pool-table attr-table">
+                <thead>
+                  <tr>
+                    <th>分组</th>
+                    <th>样本</th>
+                    <th>胜率(净)</th>
+                    <th>净收益均值</th>
+                    <th>中位</th>
+                    <th>P10(尾部)</th>
+                    <th>严重亏损&lt;-5%</th>
+                    <th>均alpha</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="c in d.cells" :key="c.key" :class="{ 'attr-thin': c.sample < 5 }">
+                    <td>{{ c.key }}<span v-if="c.sample < 5" class="pool-dim">（样本不足）</span></td>
+                    <td class="qv-tnum">{{ c.sample }}</td>
+                    <td class="qv-tnum">{{ c.win_rate.toFixed(0) }}%</td>
+                    <td class="qv-tnum" :style="{ color: pctColorOf(c.avg_net_pct) }">{{ signedPct(c.avg_net_pct) }}</td>
+                    <td class="qv-tnum" :style="{ color: pctColorOf(c.median_net_pct) }">{{ signedPct(c.median_net_pct) }}</td>
+                    <td class="qv-tnum" :style="{ color: pctColorOf(c.p10_net_pct) }">{{ signedPct(c.p10_net_pct) }}</td>
+                    <td class="qv-tnum">{{ c.severe_loss_pct.toFixed(0) }}%</td>
+                    <td class="qv-tnum" :style="{ color: pctColorOf(c.avg_alpha_pct) }">
+                      {{ c.alpha_sample > 0 ? signedPct(c.avg_alpha_pct) : '—' }}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="pool-note">
+            <div v-for="(n, i) in attrReport.notes" :key="i">{{ n }}</div>
+          </div>
+        </div>
+      </n-spin>
+    </n-modal>
   </PageContainer>
 </template>
 
@@ -1406,6 +1630,63 @@ function signedPct(n: number | undefined) {
   font-size: 12px;
   opacity: 0.7;
   margin: 8px 0;
+}
+/* S1-4 执行纪律 */
+.discipline {
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: v-bind('withAlpha(vars.warningColor, 0.08)');
+  margin: 8px 0;
+}
+/* S1-1 regime tooltip 与 S1-2 仓位 tooltip */
+.regime-tip,
+.pos-tip {
+  max-width: 320px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.regime-tip-note {
+  opacity: 0.7;
+  margin-top: 6px;
+}
+.lv-help {
+  cursor: help;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+.perf-secondary {
+  opacity: 0.6;
+  font-weight: 500;
+}
+/* S0-6 归因报表 */
+.attr-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.attr-meta {
+  font-size: 12px;
+  opacity: 0.6;
+}
+.attr-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.attr-dim-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.attr-table {
+  min-width: 620px;
+}
+.attr-thin td {
+  opacity: 0.55;
 }
 .disclaimer {
   font-size: 11px;

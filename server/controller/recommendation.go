@@ -14,10 +14,11 @@ import (
 type RecommendationController struct {
 	svc      *service.RecommendationService
 	tracking *service.TrackingService
+	alerts   *service.AlertService
 }
 
-func NewRecommendationController(svc *service.RecommendationService, tracking *service.TrackingService) *RecommendationController {
-	return &RecommendationController{svc: svc, tracking: tracking}
+func NewRecommendationController(svc *service.RecommendationService, tracking *service.TrackingService, alerts *service.AlertService) *RecommendationController {
+	return &RecommendationController{svc: svc, tracking: tracking, alerts: alerts}
 }
 
 // Strategies GET /api/recommendations/strategies?type=short_term|long_term
@@ -108,6 +109,38 @@ func (rc *RecommendationController) Performance(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, stats)
+}
+
+// Attribution GET /api/recommendations/attribution?type=&horizon= —— S0-6 确定性错误
+// 归因报表（成熟标签按入场特征桶×regime×策略×来源×行业分组）。
+func (rc *RecommendationController) Attribution(c *gin.Context) {
+	horizon := 10
+	if s := c.Query("horizon"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			horizon = n
+		}
+	}
+	rep, err := service.RecAttribution(currentUserID(c), c.Query("type"), horizon)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, rep)
+}
+
+// StopLossAlert POST /api/recommendations/items/:id/stop-alert —— S1-4 执行纪律：
+// 对推荐条目的止损价一键创建到价提醒。
+func (rc *RecommendationController) StopLossAlert(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	rule, err := rc.svc.CreateStopLossAlert(c.Request.Context(), currentUserID(c), id, rc.alerts)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, rule)
 }
 
 // Track POST /api/recommendations/:id/track —— 手动刷新该批次的推荐追踪状态，返回最新详情。

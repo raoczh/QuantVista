@@ -147,109 +147,10 @@ type BacktestResult struct {
 	ElapsedMs     int64              `json:"elapsed_ms"`
 }
 
-// ---------- 单笔持有期模拟（纯函数，五件套都在这里） ----------
-
-// holdOutcome 单标的单持有期的模拟结局。
-type holdOutcome struct {
-	Status    string // traded / skip_limit_up / skip_cash / skip_suspend / pending
-	BuyDate   string
-	SellDate  string
-	BuyPrice  float64
-	SellPrice float64
-	ReturnPct float64
-	Deferred  int
-	Forced    bool
-}
-
-const (
-	btTraded      = "traded"
-	btSkipLimitUp = "skip_limit_up"
-	btSkipCash    = "skip_cash"
-	btSkipSuspend = "skip_suspend"
-	btPending     = "pending"
-)
-
-// isOneWordLimitDown 一字跌停（无法卖出）：全天无波动（high==low）且收盘跌幅达到
-// 板块跌停阈值−0.5。仅收盘跌停但盘中有波动的日子可以卖出（按收盘成交，偏保守）。
-func isOneWordLimitDown(b, prev datasource.Bar, limitPct float64) bool {
-	if prev.Close <= 0 || b.High <= 0 {
-		return false
-	}
-	return b.High == b.Low && (b.Close/prev.Close-1)*100 <= -(limitPct - 0.5)
-}
-
-// simulateHold 从信号日下标 i 起模拟一笔「次日开盘买入、持有 holdN 交易日收盘卖出」。
-// bars 为该股升序日线全序列；nextDate 为市场日轴上的次一交易日（非空时校验个股
-// 次日是否停牌——停牌期无法按计划买入，跳过而非用复牌远期价格假装成交）。
-func simulateHold(bars []datasource.Bar, i int, symbol, name string, holdN int, perCap float64, nextDate string) holdOutcome {
-	if i+1 >= len(bars) {
-		return holdOutcome{Status: btSkipSuspend} // 信号日后无数据（停牌到末尾）
-	}
-	sig, buy := bars[i], bars[i+1]
-	if buy.Open <= 0 || sig.Close <= 0 {
-		return holdOutcome{Status: btSkipSuspend} // 坏数据不假装成交
-	}
-	if nextDate != "" && buy.TradeDate != nextDate {
-		return holdOutcome{Status: btSkipSuspend} // 次日停牌（个股缺市场次日的 bar）
-	}
-	limitPct := limitUpPctFor(symbol, name)
-	// 五件套②：开盘涨幅 ≥ 涨停阈值−0.5 判一字板买不进。
-	if (buy.Open/sig.Close-1)*100 >= limitPct-0.5 {
-		return holdOutcome{Status: btSkipLimitUp}
-	}
-	// 五件套④：整百股取整，钱不够一手放弃。
-	qty := math.Floor(perCap/(buy.Open*100)) * 100
-	if qty < 100 {
-		return holdOutcome{Status: btSkipCash}
-	}
-	buyAmount := buy.Open * qty
-	buyFee, buyTax := tradeFee("cn", model.PaperSideBuy, symbol, buyAmount)
-	cost := buyAmount + buyFee + buyTax
-
-	// 卖出目标：买入日为持有第 1 日，第 holdN 日收盘卖出 → bars[i+holdN]。
-	j := i + holdN
-	if j >= len(bars) {
-		return holdOutcome{Status: btPending, BuyDate: buy.TradeDate, BuyPrice: buy.Open}
-	}
-	// 五件套③：一字跌停卖不出，顺延重试。
-	out := holdOutcome{Status: btTraded, BuyDate: buy.TradeDate, BuyPrice: buy.Open}
-	for j < len(bars) && isOneWordLimitDown(bars[j], bars[j-1], limitPct) {
-		out.Deferred++
-		j++
-	}
-	if j >= len(bars) {
-		j = len(bars) - 1 // 顺延到末尾仍一字跌停：按末根收盘强平（真实中卖不出，如实标注）
-		out.Forced = true
-	}
-	sell := bars[j]
-	sellAmount := sell.Close * qty
-	sellFee, sellTax := tradeFee("cn", model.PaperSideSell, symbol, sellAmount)
-	proceeds := sellAmount - sellFee - sellTax
-	out.SellDate = sell.TradeDate
-	out.SellPrice = sell.Close
-	out.ReturnPct = round2((proceeds - cost) / cost * 100)
-	return out
-}
-
-// adjustSuspect 复权自洽校验：相邻收盘涨跌超越板块涨停幅 ×1.5（前复权序列不应出现
-// 的断层）判可疑。跳过头部 btAdjustSanityHeadSkip 根（新股上市初期无涨跌幅限制）。
-func adjustSuspect(bars []datasource.Bar, symbol, name string) bool {
-	tol := limitUpPctFor(symbol, name) * 1.5
-	start := btAdjustSanityHeadSkip + 1
-	if start < 1 {
-		start = 1
-	}
-	for i := start; i < len(bars); i++ {
-		prev := bars[i-1].Close
-		if prev <= 0 || bars[i].Close <= 0 {
-			continue
-		}
-		if math.Abs((bars[i].Close/prev-1)*100) > tol {
-			return true
-		}
-	}
-	return false
-}
+// ---------- 单笔持有期模拟 ----------
+// 五件套执行语义已抽至 execution_sim.go（S0-2 统一执行模拟器）：holdOutcome、
+// simulateHold、isOneWordLimitDown、adjustSuspect、cnDailyBarsAsc——tracking 标签
+// 结算与回测共用同一套函数，严禁在此另写一份「回测版」执行逻辑。
 
 // ---------- 条件树的单行求值复用 ----------
 
@@ -1003,21 +904,4 @@ func (s *BacktestService) BatchBacktest(ctx context.Context, userID int64, req B
 		res.Notes = append(res.Notes, "基准指数数据不可得，本次回验无 alpha")
 	}
 	return res, nil
-}
-
-// cnDailyBarsAsc 读单只 A 股的 daily_bars 全序列（升序；全市场地基每股约 250 根）。
-func cnDailyBarsAsc(symbol string) []datasource.Bar {
-	var rows []model.DailyBar
-	if err := common.DB.Where("market = ? AND symbol = ?", "cn", symbol).
-		Order("trade_date").Find(&rows).Error; err != nil {
-		return nil
-	}
-	out := make([]datasource.Bar, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, datasource.Bar{
-			TradeDate: r.TradeDate, Open: r.Open, High: r.High, Low: r.Low, Close: r.Close,
-			Volume: r.Volume, Amount: r.Amount, TurnoverRate: r.TurnoverRate, Source: r.Source,
-		})
-	}
-	return out
 }

@@ -61,6 +61,9 @@ func AllModels() []any {
 		&OrgSurvey{},
 		&BoardValuationDaily{},
 		&GuardEvent{},
+		&RecommendationLabel{},
+		&RecommendationCandidateEvent{},
+		&StockUniverseDaily{},
 	}
 }
 

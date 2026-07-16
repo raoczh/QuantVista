@@ -321,6 +321,12 @@ func (s *MarketService) SyncMarketWide(ctx context.Context) (*model.DataSyncLog,
 		return fail(fmt.Errorf("维护宇宙字典失败: %w", err))
 	}
 
+	// 2b. S0-3 PIT 宇宙快照：全市场当日状态逐日固化（退市/ST/停牌/行业/估值），
+	// 历史回放的候选宇宙按 as_of 日重建的地基。best-effort：失败只记日志。
+	if err := s.upsertUniverseDaily(rows, tradeDate); err != nil {
+		common.SysWarn("宇宙快照落库失败 %s: %v", tradeDate, err)
+	}
+
 	// 3. 除权初筛 + 重锚。
 	rebased, suspects := s.rebaseSuspects(ctx, rows, tradeDate)
 	log.Failed = suspects - rebased // 初筛命中但重锚失败的（已标 pending 由初始化任务兜底）
@@ -420,6 +426,33 @@ func (s *MarketService) rebaseSuspects(ctx context.Context, rows []datasource.Sp
 		common.SysLog("除权初筛：疑似 %d 只，重锚成功 %d", suspects, rebased)
 	}
 	return rebased, suspects
+}
+
+// upsertUniverseDaily S0-3 每日宇宙快照：clist 全市场行原样固化（同一次上游请求
+// 零额外成本）。唯一键 (trade_date, symbol) upsert 幂等，盘中重跑覆盖为最新快照。
+func (s *MarketService) upsertUniverseDaily(rows []datasource.SpotRow, tradeDate string) error {
+	snap := make([]model.StockUniverseDaily, 0, len(rows))
+	for _, r := range rows {
+		snap = append(snap, model.StockUniverseDaily{
+			TradeDate: tradeDate, Symbol: r.Symbol, Market: "cn", Name: r.Name,
+			IsST:      isSTName(r.Name),
+			Suspended: r.Price <= 0 || r.Volume <= 0,
+			Close:     r.Price, PrevClose: r.PrevClose,
+			Amount: r.Amount, TurnoverRate: r.TurnoverRate,
+			PE: r.PE, PETTM: r.PETTM, PB: r.PB, Industry: r.Industry,
+		})
+	}
+	err := common.DB.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "trade_date"}, {Name: "symbol"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"name", "is_st", "suspended", "close", "prev_close",
+			"amount", "turnover_rate", "pe", "pe_ttm", "pb", "industry",
+		}),
+	}).CreateInBatches(snap, 500).Error
+	if err != nil && err != gorm.ErrEmptySlice {
+		return err
+	}
+	return nil
 }
 
 // ---------- 历史初始化（断点续传/暂停恢复） ----------

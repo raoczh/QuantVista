@@ -57,7 +57,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	watchlistCtl := controller.NewWatchlistController(watchlistSvc)
 	positionCtl := controller.NewPositionController(positionSvc)
 	analysisCtl := controller.NewAnalysisController(analysisSvc)
-	recommendationCtl := controller.NewRecommendationController(recommendationSvc, trackingSvc)
+	recommendationCtl := controller.NewRecommendationController(recommendationSvc, trackingSvc, alertSvc)
 	alertCtl := controller.NewAlertController(alertSvc)
 	todoCtl := controller.NewTodoController(todoSvc)
 	qaCtl := controller.NewQaController(qaSvc)
@@ -203,11 +203,13 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			{
 				recommendations.GET("/strategies", recommendationCtl.Strategies)
 				recommendations.GET("/performance", recommendationCtl.Performance)
+				recommendations.GET("/attribution", recommendationCtl.Attribution)
 				recommendations.PUT("/review-ack/:id", recommendationCtl.AckReview)
 				recommendations.POST("", middleware.RateLimit(15, time.Minute), recommendationCtl.Generate)
 				recommendations.GET("", recommendationCtl.List)
 				recommendations.GET("/:id", recommendationCtl.Get)
 				recommendations.POST("/:id/track", recommendationCtl.Track)
+				recommendations.POST("/items/:id/stop-alert", recommendationCtl.StopLossAlert)
 				recommendations.DELETE("/:id", recommendationCtl.Delete)
 			}
 
