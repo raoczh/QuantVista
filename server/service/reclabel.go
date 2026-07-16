@@ -34,10 +34,43 @@ const (
 
 // gateNote 阶段③/④产生的门控记录（影子或名单裁剪），随事件落库。
 type gateNote struct {
-	Symbol        string
-	GateType      string // model.GateRegimeShadow / GateCorrelation / GateIndustryCap
-	Reason        string
-	WouldBeAction string // 影子门控「若强制会改写成」；名单裁剪类为空
+	Symbol      string
+	GateType    string // model.GateRegimeShadow / GateBearShadow / GateQualityShadow / GateCorrelation / GateIndustryCap
+	GateVersion string // 产生该门控的判定版本（空=沿用 regimeVersion，兼容第一批落库口径）
+	Reason      string
+	WouldBeAction string // 影子门控「若强制会改写成」；名单裁剪/质量封顶类为空
+}
+
+// gatePriority 同一标的命中多个门控时的主 gate_type 选择优先级（值小者优先）：
+// 会改写动作的影子门控（regime/bear）强于只封顶置信度的质量门控，强于名单裁剪。
+var gatePriority = map[string]int{
+	model.GateRegimeShadow:  0,
+	model.GateBearShadow:    1,
+	model.GateQualityShadow: 2,
+	model.GateCorrelation:   3,
+	model.GateIndustryCap:   4,
+}
+
+// mergeGateNotes 按 symbol 归并门控记录：事件表每候选恰一行（影子标签唯一键依赖此
+// 约束，同一标的多行事件会让 picked 条目生成重复标签撞唯一索引），主 gate_type 按
+// 优先级取最强，其余门控说明并入 Reason 透明保留。
+func mergeGateNotes(gates []gateNote) map[string]gateNote {
+	out := make(map[string]gateNote, len(gates))
+	for _, g := range gates {
+		cur, ok := out[g.Symbol]
+		if !ok {
+			out[g.Symbol] = g
+			continue
+		}
+		if gatePriority[g.GateType] < gatePriority[cur.GateType] {
+			g.Reason = g.Reason + "；另有[" + cur.GateType + "] " + cur.Reason
+			out[g.Symbol] = g
+		} else {
+			cur.Reason = cur.Reason + "；另有[" + g.GateType + "] " + g.Reason
+			out[g.Symbol] = cur
+		}
+	}
+	return out
 }
 
 // recordBatchFacts 批次落库后记录反事实事件 + 创建 pending 标签（best-effort：
@@ -58,10 +91,7 @@ func recordBatchFacts(batch *model.RecommendationBatch, pool []candidate, items 
 	for _, r := range rejected {
 		rejReason[r.Symbol] = r.Reason
 	}
-	gateBySym := make(map[string]gateNote, len(gates))
-	for _, g := range gates {
-		gateBySym[g.Symbol] = g
-	}
+	gateBySym := mergeGateNotes(gates)
 
 	events := make([]model.RecommendationCandidateEvent, 0, len(pool))
 	for _, c := range pool {
@@ -92,7 +122,10 @@ func recordBatchFacts(batch *model.RecommendationBatch, pool []candidate, items 
 		}
 		if g, ok := gateBySym[c.Symbol]; ok {
 			ev.GateType = g.GateType
-			ev.GateVersion = regimeVersion
+			ev.GateVersion = g.GateVersion
+			if ev.GateVersion == "" {
+				ev.GateVersion = regimeVersion // 第一批门控（regime/correlation/industry_cap）落库口径
+			}
 			ev.WouldBeAction = g.WouldBeAction
 			if ev.RejectionReason == "" {
 				ev.RejectionReason = truncateRunes(g.Reason, 250)

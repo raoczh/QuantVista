@@ -250,6 +250,9 @@ type RecommendRequest struct {
 	Count       int         `json:"count"`   // 期望 3-5
 	Filters     *RecFilters `json:"filters"` // 候选筛选条件；nil = 用用户偏好（无偏好则按类型默认）
 	Verify      bool        `json:"verify"`  // AI 复核：额外一次「风控复核员」调用逐条挑刺（多耗一次 LLM 请求）
+	// BearCheck S2-2 反方研究员（影子）：对每只 buy 额外一次独立调用构建最强 bear case，
+	// 只展示不改写。nil = 默认关联 Verify（复核开则反方也开）；显式 true/false 覆盖。
+	BearCheck *bool `json:"bear_check"`
 }
 
 // recPick LLM 输出的单条推荐（短线/长线字段并存，按类型取用）。
@@ -289,6 +292,11 @@ type recPick struct {
 	SysConfidence    string         `json:"sys_confidence,omitempty"`     // 程序合成置信度 high/medium/low
 	SysConfidenceWhy string         `json:"sys_confidence_why,omitempty"` // 置信度依据说明
 	Review           *pickReview    `json:"review,omitempty"`             // AI 复核员结论（verify 模式）
+	// Bear S2-2 反方研究员结论（影子：只展示，不改写 action/置信度；severity=high 的
+	// buy 另记 gate_type=bear_shadow 反事实事件供影子收益对照）。
+	Bear *pickBear `json:"bear,omitempty"`
+	// QualityGate S2-3 数据质量门控影子输出（只记录 would-be 封顶与缺失面，不实际封顶）。
+	QualityGate *qualityGateResult `json:"quality_gate,omitempty"`
 	// DegradedSource 非空 = 该条为降级生成（"quant_fallback"：AI 精选超时后按量化排名
 	// 规则合成，计划价为 ATR 规则价、未经 AI 解读）。前端据此展示降级标签。
 	DegradedSource string `json:"degraded_source,omitempty"`
@@ -395,6 +403,7 @@ type recGenPlan struct {
 	strat        *strategyTemplate
 	filters      RecFilters
 	verify       bool
+	bear         bool // S2-2 反方研究员（未显式指定时关联 verify）
 	cfg          *model.LLMConfig
 	apiKey       string
 }
@@ -436,10 +445,16 @@ func (s *RecommendationService) prepareGeneration(userID int64, allowPrivate boo
 	} else {
 		filters = loadUserRecFilters(userID, req.Type)
 	}
+	// S2-2 反方研究员开关：未显式指定时关联 verify（复核开则反方也开），
+	// 调用预算 = 主调 1 + 复核 1 + 反方 1 ≤ 3 次上限。
+	bear := req.Verify
+	if req.BearCheck != nil {
+		bear = *req.BearCheck
+	}
 	return &recGenPlan{
 		userID: userID, allowPrivate: allowPrivate, manualAction: manualAction,
 		recType: req.Type, market: market, count: count, strat: strat,
-		filters: filters, verify: req.Verify, cfg: cfg, apiKey: apiKey,
+		filters: filters, verify: req.Verify, bear: bear, cfg: cfg, apiKey: apiKey,
 	}, nil
 }
 
@@ -573,6 +588,18 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		}
 	}
 
+	// S2-2 反方研究员（影子，默认关联 verify）：对复核后仍为 buy 的条目独立构建最强
+	// bear case。只展示不改写 action/置信度；severity=high 记 bear_shadow 反事实事件。
+	// 放在复核之后——被复核否决降为 watch 的条目不再消耗反方论证篇幅。
+	var bearGates []gateNote
+	if callErr == nil && len(picks) > 0 && plan.bear {
+		bears, bUsage := s.bearReview(ctx, userID, cfg, apiKey, allowPrivate, picks, poolBySymbol)
+		usage.PromptTokens += bUsage.PromptTokens
+		usage.CompletionTokens += bUsage.CompletionTokens
+		usage.TotalTokens += bUsage.TotalTokens
+		bearGates = applyBearShadow(picks, bears)
+	}
+
 	batch.PromptTokens = usage.PromptTokens
 	batch.CompletionTokens = usage.CompletionTokens
 	batch.TotalTokens = usage.TotalTokens
@@ -642,6 +669,11 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	// 仅当 feature flag（recRegimeEnforce，默认关）打开才真正改写 action——转正须凭
 	// 影子配对数据评审，防「少发 buy 做高表面胜率」。
 	gates = append(gates, applyRegimeGate(picks, regime.Regime, recRegimeEnforce)...)
+	// S2-2 反方研究员影子事件（severity=high 的 buy）。
+	gates = append(gates, bearGates...)
+	// S2-3 数据质量门控（影子）：would-be 封顶写入明细，构成约束时记 quality_shadow
+	// 事件（不实际封顶——放在置信度终值确定之后，cap 与最终 confidence 比较才有意义）。
+	gates = append(gates, applyQualityGateShadow(recType, picks, poolBySymbol)...)
 
 	// S1-2 仓位建议（服务端目标波动模型，非 LLM 输出）：公式与参数快照随 RegimeJSON
 	// 落库可回溯。相关性系数用同批次入选标的间的真实收益相关性。
@@ -1030,6 +1062,11 @@ func parseAndFilterPicks(content string, pool map[string]candidate, maxCount int
 // normalizePick 规整单条推荐的字段（action/confidence/数值/免责兜底）。
 func normalizePick(p recPick, sym string, c candidate) recPick {
 	p.Symbol = sym
+	// 服务端专属字段先清零（防模型伪造）：Review/Bear/QualityGate 只能由服务端复核、
+	// 反方与质量门控链路回填——模型在输出 JSON 里自附这些字段会被 Unmarshal 吃进来，
+	// verify/bear 关闭时无人覆盖就会以「复核通过/反方低危」的假面落库展示。
+	// DegradedSource 不在此清（quant_fallback 构造路径先设值再过本函数）。
+	p.Review, p.Bear, p.QualityGate = nil, nil, nil
 	p.Action = strings.ToLower(strings.TrimSpace(p.Action))
 	if p.Action != model.RecActionBuy && p.Action != model.RecActionWatch {
 		p.Action = model.RecActionWatch

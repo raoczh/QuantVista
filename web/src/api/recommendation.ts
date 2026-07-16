@@ -53,6 +53,7 @@ export interface RecommendRequest {
   count?: number
   filters?: RecFilters // 不传 = 用偏好默认
   verify?: boolean // AI 复核员二次调用
+  bear_check?: boolean // S2-2 反方研究员（影子）：不传时后端默认关联 verify
 }
 
 // 候选池条目（透明化：来源/被筛原因/因子/量化分/排名全落库）。
@@ -133,8 +134,28 @@ export interface RecDetail {
   // S1-2 建议仓位（占总资金 %，服务端目标波动模型程序计算；0/缺失=无法给出）
   position_pct?: number
   position_why?: string
+  // S2-2 反方研究员结论（影子：只展示，不改写动作/置信度）
+  bear?: PickBear
+  // S2-3 数据质量门控影子输出（只记录 would-be 封顶与缺失面，不实际封顶）
+  quality_gate?: QualityGateShadow
   // 非空 = 降级生成（quant_fallback：AI 精选超时后按量化排名规则合成，未经 AI 解读）
   degraded_source?: string
+}
+
+// S2-2 反方研究员对单条 buy 的最强 bear case。
+export interface PickBear {
+  symbol: string
+  bear_case: string
+  severity: 'high' | 'med' | 'low'
+}
+
+// S2-3 数据质量门控影子输出。
+export interface QualityGateShadow {
+  would_be_confidence_cap: number
+  missing_critical_fields?: string[]
+  senti_missing?: boolean // 情绪数据缺失（≠情绪中性）
+  data_age_days: number
+  quality_gate_version: string
 }
 
 export type RecOutcome =
@@ -350,6 +371,35 @@ export function createStopLossAlert(itemId: number) {
 export function getAttribution(type?: string, horizon = 10) {
   return request<AttributionReport>({
     url: '/recommendations/attribution',
+    method: 'get',
+    params: { type, horizon },
+  })
+}
+
+// S2-4 影子门控对照：单一 gate_type 的 gated vs ungated 统计。
+export interface ShadowGateGroup {
+  gate_type: string
+  gate_label: string
+  marked: number
+  would_rewrite: number
+  gated: AttributionCell
+  ungated: AttributionCell
+}
+
+// S2-4 影子门控对照报表（闸门/反方/质量门控转正评审的数据地基）。
+export interface ShadowReport {
+  type: string
+  horizon_days: number
+  picked_buy: number
+  picked_buy_matured: number
+  groups: ShadowGateGroup[] | null
+  notes: string[]
+}
+
+// S2-4 影子门控对照报表（gated vs ungated 成熟收益分布 + 覆盖率）。
+export function getShadowReport(type?: string, horizon = 10) {
+  return request<ShadowReport>({
+    url: '/recommendations/shadow-report',
     method: 'get',
     params: { type, horizon },
   })
