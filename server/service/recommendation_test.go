@@ -205,14 +205,18 @@ func TestCandidateEligible(t *testing.T) {
 		f    candidateFilter
 		want bool
 	}{
-		{"正常标的", candidate{Symbol: "600000", Name: "浦发银行", Price: 8.5}, def, true},
+		{"正常标的", candidate{Symbol: "600000", Name: "浦发银行", Price: 8.5, Amount: 2e8}, def, true},
 		{"带成交额的活跃标的", candidate{Symbol: "600036", Name: "招商银行", Price: 35, Amount: 5e9}, def, true},
 		{"ST 股剔除", candidate{Symbol: "600001", Name: "ST某某", Price: 3.2}, def, false},
 		{"*ST 股剔除", candidate{Symbol: "600002", Name: "*ST某某", Price: 1.5}, def, false},
 		{"退市整理剔除", candidate{Symbol: "600003", Name: "某某退", Price: 0.8}, def, false},
 		{"停牌/无行情剔除", candidate{Symbol: "600004", Name: "某某股份", Price: 0}, def, false},
 		{"流动性不足剔除", candidate{Symbol: "600005", Name: "某某股份", Price: 5, Amount: 3e7}, def, false},
-		{"无成交额数据不按流动性剔除", candidate{Symbol: "600006", Name: "某某股份", Price: 5}, def, true},
+		// S0-4：Amount=0 不再绕过流动性门槛（自选进池前已按近 20 日日线中位数补齐，
+		// 补不到=无日线数据，与流动性不足同等拒绝——无数据只会诱导 LLM 编造依据）。
+		{"无成交额数据不再绕过门槛", candidate{Symbol: "600006", Name: "某某股份", Price: 5}, def, false},
+		{"门槛 0 时无成交额也放行", candidate{Symbol: "600010", Name: "某某股份", Price: 5},
+			candidateFilter{minAmount: 0}, true},
 		{"黑名单剔除", candidate{Symbol: "600007", Market: "cn", Name: "某某股份", Price: 5},
 			candidateFilter{blacklist: map[string]bool{"cn:600007": true}, minAmount: minCandidateAmount}, false},
 		{"用户调高门槛后剔除", candidate{Symbol: "600008", Name: "某某股份", Price: 5, Amount: 2e8},
@@ -467,10 +471,10 @@ func TestLoadCandidateFilter(t *testing.T) {
 	if !f.blacklist["cn:600000"] {
 		t.Fatalf("黑名单应含 cn:600000: %+v", f.blacklist)
 	}
-	if !candidateEligible(candidate{Symbol: "000001", Market: "cn", Name: "平安银行", Price: 11}, f) {
+	if !candidateEligible(candidate{Symbol: "000001", Market: "cn", Name: "平安银行", Price: 11, Amount: 8e9}, f) {
 		t.Fatalf("非黑名单标的应通过")
 	}
-	if candidateEligible(candidate{Symbol: "600000", Market: "cn", Name: "浦发银行", Price: 8.5}, f) {
+	if candidateEligible(candidate{Symbol: "600000", Market: "cn", Name: "浦发银行", Price: 8.5, Amount: 8e9}, f) {
 		t.Fatalf("黑名单标的应被剔除")
 	}
 }

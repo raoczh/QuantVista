@@ -56,6 +56,11 @@ type RecommendationStatus struct {
 	LastEvalDate     string `gorm:"size:10" json:"last_eval_date"` // 最后评估对应的交易日
 	Note             string `gorm:"size:256" json:"note"`          // 数据缺口/降级说明
 
+	// 用户执行事实（S0-4）：持仓血缘存在时的实际买入价与实际收益——与模拟口径的
+	// ReturnPct **并列展示不混算**（实际跟买含用户选择偏差，不作训练标签）。
+	ActualBuyPrice  float64  `gorm:"type:decimal(20,4)" json:"actual_buy_price"`
+	ActualReturnPct *float64 `gorm:"type:decimal(12,4)" json:"actual_return_pct"` // NULL=无持仓血缘
+
 	// 时间节点收益：第 N 交易日收盘价相对 RefPrice 的收益率 %（NULL=尚未到达该节点）。
 	// 固化节点表现供跨批次统计「推荐后 7/14/30 交易日平均表现」。
 	// GORM 默认把 Return7d 蛇形化为 return7d，显式指定列名保持 _7d 口径。

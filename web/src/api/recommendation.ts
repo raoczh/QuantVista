@@ -130,6 +130,9 @@ export interface RecDetail {
   sys_confidence?: 'high' | 'medium' | 'low'
   sys_confidence_why?: string
   review?: PickReview
+  // S1-2 建议仓位（占总资金 %，服务端目标波动模型程序计算；0/缺失=无法给出）
+  position_pct?: number
+  position_why?: string
   // 非空 = 降级生成（quant_fallback：AI 精选超时后按量化排名规则合成，未经 AI 解读）
   degraded_source?: string
 }
@@ -163,6 +166,9 @@ export interface RecTracking {
   bars_count: number
   last_eval_date: string
   note: string
+  // S0-4 用户执行事实（持仓血缘）：实际买入价与实际收益，与模拟口径并列不混算。
+  actual_buy_price?: number
+  actual_return_pct?: number | null
   updated_at: string
 }
 
@@ -212,6 +218,17 @@ export interface PerformanceStats {
   expired: number
   active: number
   bench_sample: number
+  // S0-4 买入成熟口径（主指标）：胜率只统计 action=buy 且已成熟的样本。
+  buy_matured: number
+  buy_win_rate: number
+  buy_avg_return_pct: number
+  buy_median_pct: number
+  buy_avg_alpha_pct: number
+  buy_bench_sample: number
+  buy_active: number
+  watch_sample: number
+  watch_win_rate: number
+  degraded_excluded: number
   // 时间节点均值（推荐后第 N 交易日）。
   avg_7d_pct: number
   avg_14d_pct: number
@@ -219,6 +236,30 @@ export interface PerformanceStats {
   sample_7d: number
   sample_14d: number
   sample_30d: number
+}
+
+// S0-6 确定性错误归因报表。
+export interface AttributionCell {
+  dim: string
+  key: string
+  sample: number
+  win_rate: number
+  avg_net_pct: number
+  median_net_pct: number
+  p10_net_pct: number
+  severe_loss_pct: number
+  avg_alpha_pct: number
+  alpha_sample: number
+}
+
+export interface AttributionReport {
+  type: string
+  horizon_days: number
+  sample: number
+  skipped: number
+  pending: number
+  groups: AttributionCell[] | null
+  notes: string[]
 }
 
 export interface RecommendationBatch {
@@ -230,6 +271,10 @@ export interface RecommendationBatch {
   status: RecStatus
   error: string
   candidate_count: number
+  // S1-1 市场状态三档判定（offense/neutral/defense；空=旧记录/数据不足）。影子模式：
+  // 只展示不改写 action；regime_json 含判定依据明细与仓位模型参数（详情接口返回）。
+  regime?: string
+  regime_json?: string
   candidate_pool?: string // 候选池快照 JSON（详情接口返回，列表不含）
   rejected_json?: string // 池内落选理由 JSON（详情接口返回，列表不含）
   filters_json?: string // 本次生效筛选条件快照（详情接口返回）
@@ -294,4 +339,18 @@ export function getPerformance(type?: string) {
 // 标记推荐复盘提示已读（今日待办 rec_review 条目就地消项；statusId=追踪状态行 id）。
 export function ackRecommendationReview(statusId: number) {
   return request<{ ok: boolean }>({ url: `/recommendations/review-ack/${statusId}`, method: 'put' })
+}
+
+// S1-4 执行纪律：对推荐条目的止损价一键创建到价提醒（price/lte，命中自动暂停）。
+export function createStopLossAlert(itemId: number) {
+  return request<{ id: number }>({ url: `/recommendations/items/${itemId}/stop-alert`, method: 'post' })
+}
+
+// S0-6 确定性错误归因报表（成熟标签按入场特征桶×regime×策略×来源×行业分组）。
+export function getAttribution(type?: string, horizon = 10) {
+  return request<AttributionReport>({
+    url: '/recommendations/attribution',
+    method: 'get',
+    params: { type, horizon },
+  })
 }
