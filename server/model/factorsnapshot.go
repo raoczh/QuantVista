@@ -20,8 +20,10 @@ import "time"
 // 实测约 0.8KB/行 × 5150 行/日 ≈ 4MB/日、约 1GB/年，个人库可承受；
 // 列式建 52 物理列会锁死因子演进（加因子要 DDL），故取行 JSON。
 //
-// 不可变纪律：同一 trade_date 只写一次（首写胜），重建/重跑不覆盖——
+// 不可变纪律：已落库的 (trade_date, symbol) 行只写一次，重建/重跑不覆盖——
 // 覆盖会把「除权重写后」的值伪装成当时快照，正是本表要防的泄漏。
+// 同一 trade_date 允许**补缺失的 symbol**（分批历史初始化时首批先落一部分，
+// 后续批次补齐；整日跳过会让补齐股票永久缺席，形成不完整快照）。
 type FactorSnapshotDaily struct {
 	ID        int64  `gorm:"primaryKey" json:"id"`
 	TradeDate string `gorm:"size:10;uniqueIndex:idx_fsd_key" json:"trade_date"`

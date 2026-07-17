@@ -34,11 +34,12 @@ type AttributionCell struct {
 
 // AttributionReport 归因报表（单一持有期口径；不同 horizon 分别请求，不混算）。
 type AttributionReport struct {
-	Type        string            `json:"type"`
-	HorizonDays int               `json:"horizon_days"`
-	Sample      int               `json:"sample"` // 成熟样本总数（本口径）
-	Skipped     int               `json:"skipped"`
-	Pending     int               `json:"pending"`
+	Type        string `json:"type"`
+	HorizonDays int    `json:"horizon_days"`
+	Sample      int    `json:"sample"`     // 成熟样本总数（buy+watch，action 维度的分母）
+	SampleBuy   int    `json:"sample_buy"` // 其中 buy 样本数（除 action 外各维度的分母）
+	Skipped     int    `json:"skipped"`
+	Pending     int    `json:"pending"`
 	Groups      []AttributionCell `json:"groups"`
 	Notes       []string          `json:"notes"`
 }
@@ -73,11 +74,14 @@ func RecAttribution(userID int64, recType string, horizon int) (*AttributionRepo
 	}
 
 	rep := &AttributionReport{Type: recType, HorizonDays: horizon}
-	var matured []model.RecommendationLabel
+	var matured, maturedBuy []model.RecommendationLabel
 	for _, r := range rows {
 		switch r.MaturityStatus {
 		case model.LabelMatured:
 			matured = append(matured, r)
+			if r.Action == model.RecActionBuy {
+				maturedBuy = append(maturedBuy, r)
+			}
 		case model.LabelSkipped:
 			rep.Skipped++
 		case model.LabelPending:
@@ -85,22 +89,26 @@ func RecAttribution(userID int64, recType string, horizon int) (*AttributionRepo
 		}
 	}
 	rep.Sample = len(matured)
+	rep.SampleBuy = len(maturedBuy)
 
+	// action 维度用全量（buy vs watch 对照本身就是一组归因）；其余维度限定 buy——
+	// 本报表回答「买入建议的错误集中在哪」，watch 混入会稀释买入胜率与错误归因。
 	dims := []struct {
-		dim string
-		key func(model.RecommendationLabel) string
+		dim  string
+		rows []model.RecommendationLabel
+		key  func(model.RecommendationLabel) string
 	}{
-		{"action", func(l model.RecommendationLabel) string { return l.Action }},
-		{"chg5d_bucket", func(l model.RecommendationLabel) string { return chg5dBucket(l.EntryChg5dPct) }},
-		{"regime", func(l model.RecommendationLabel) string { return orDash(l.Regime) }},
-		{"strategy", func(l model.RecommendationLabel) string { return orDash(l.Strategy) }},
-		{"source", func(l model.RecommendationLabel) string { return orDash(l.Source) }},
-		{"industry", func(l model.RecommendationLabel) string { return orDash(l.Industry) }},
+		{"action", matured, func(l model.RecommendationLabel) string { return l.Action }},
+		{"chg5d_bucket", maturedBuy, func(l model.RecommendationLabel) string { return chg5dBucket(l.EntryChg5dPct) }},
+		{"regime", maturedBuy, func(l model.RecommendationLabel) string { return orDash(l.Regime) }},
+		{"strategy", maturedBuy, func(l model.RecommendationLabel) string { return orDash(l.Strategy) }},
+		{"source", maturedBuy, func(l model.RecommendationLabel) string { return orDash(l.Source) }},
+		{"industry", maturedBuy, func(l model.RecommendationLabel) string { return orDash(l.Industry) }},
 	}
 	for _, d := range dims {
 		groups := map[string][]model.RecommendationLabel{}
 		var order []string
-		for _, l := range matured {
+		for _, l := range d.rows {
 			k := d.key(l)
 			if _, ok := groups[k]; !ok {
 				order = append(order, k)
@@ -115,6 +123,7 @@ func RecAttribution(userID int64, recType string, horizon int) (*AttributionRepo
 	rep.Notes = append(rep.Notes,
 		"口径：统一执行模拟（次日开盘/涨停买不到/T+1/整百股/费率），净收益=扣佣金印花税；Alpha=净收益−上证同区间",
 		"只统计真实入选且成熟的样本；影子标签（门控/落选对照）与用户实际成交不混入本报表",
+		"action 维度并列展示 buy/watch；其余维度只统计 buy（买入准确性归因，watch 不稀释分组）",
 		fmt.Sprintf("单分组样本 <%d 时统计不稳定，仅供方向参考", attributionMinBucket),
 	)
 	return rep, nil

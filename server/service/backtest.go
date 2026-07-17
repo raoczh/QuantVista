@@ -326,8 +326,9 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 						continue
 					}
 					nextDate := ""
-					if ai, ok := axisIndex[d]; ok && ai+1 < len(axis) {
-						nextDate = axis[ai+1]
+					aiIdx, onAxis := axisIndex[d]
+					if onAxis && aiIdx+1 < len(axis) {
+						nextDate = axis[aiIdx+1]
 					}
 					cand := btCandidate{
 						Symbol: j.symbol, Name: meta.Name, SignalDate: d,
@@ -335,7 +336,11 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 						Holds:    make(map[int]holdOutcome, len(holds)),
 					}
 					for _, h := range holds {
-						cand.Holds[h] = simulateHold(j.bars, i, j.symbol, meta.Name, h, perCap, nextDate)
+						sellDate := ""
+						if onAxis && aiIdx+h < len(axis) {
+							sellDate = axis[aiIdx+h] // 市场轴到期日：个股中途停牌不拉长持有跨度
+						}
+						cand.Holds[h] = simulateHold(j.bars, i, j.symbol, meta.Name, h, perCap, nextDate, sellDate)
 					}
 					candCh <- cand
 				}
@@ -459,10 +464,11 @@ func (s *BacktestService) fetchBench(ctx context.Context) []datasource.Bar {
 	return bars
 }
 
-// sampleSignalDates 在日轴内采样信号日：右边界收缩 maxHold+1（保证最长持有期走完），
-// 回看 lookback 个交易日为窗口，窗口内等距取 signalCount 个（含首尾附近）。
+// sampleSignalDates 在日轴内采样信号日：右边界收缩 maxHold（信号日 i 需 i+maxHold ≤
+// 轴末，恰好能走完最长持有期的最后一个信号日也参与），回看 lookback 个交易日为窗口，
+// 窗口内等距取 signalCount 个（含首尾附近）。
 func sampleSignalDates(axis []string, lookback, signalCount, maxHold int) ([]string, error) {
-	eligible := len(axis) - (maxHold + 1)
+	eligible := len(axis) - maxHold
 	if eligible < 1 {
 		return nil, errors.New("历史数据不足以覆盖最长持有期")
 	}
@@ -793,13 +799,9 @@ func (s *BacktestService) BatchBacktest(ctx context.Context, userID int64, req B
 	}
 
 	holds := []int{5, 10, 20}
-	bench := s.fetchBench(ctx)
-	benchClose := make(map[string]float64, len(bench))
-	for _, b := range bench {
-		if b.Close > 0 {
-			benchClose[b.TradeDate] = b.Close
-		}
-	}
+	// 市场日轴 + 基准收盘（基准优先、回退日历）：轴供「推荐日次日停牌判 skip_suspend」
+	// 与「到期日按市场交易日定位」（个股中途停牌不拉长持有跨度），与标签结算同口径。
+	axis, benchClose, _ := s.marketAxis(ctx, time.Now().Format("2006-01-02"))
 
 	res := &BatchBacktestResult{Batches: len(batches)}
 	type acc struct {
@@ -844,7 +846,8 @@ func (s *BacktestService) BatchBacktest(ctx context.Context, userID int64, req B
 			} else {
 				row.SignalDate = bars[i].TradeDate
 				for _, h := range holds {
-					o := simulateHold(bars, i, rec.Symbol, rec.Name, h, perCap, "")
+					nextDate, sellDate := labelAxisDates(axis, recDate, h)
+					o := simulateHold(bars, i, rec.Symbol, rec.Name, h, perCap, nextDate, sellDate)
 					cell := BatchHoldCell{Status: o.Status, ReturnPct: o.ReturnPct}
 					a := accBy[h]
 					switch o.Status {

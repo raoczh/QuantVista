@@ -80,6 +80,29 @@ func TestSnapshotFactorTable(t *testing.T) {
 		t.Fatal("不可变纪律被破坏：快照被覆盖")
 	}
 
+	// 同日补缺：分批初始化场景——新表比已有快照多出 600003，只补缺失行、
+	// 已有行仍不可覆盖（旧的「首写胜整日跳过」会让补齐股票永久缺席）。
+	ft3 := buildSnapshotFixtureTable()
+	ft3.Symbols = append(ft3.Symbols, "600003")
+	ft3.Names = append(ft3.Names, "丙股份")
+	ft3.LastDates = append(ft3.LastDates, "2026-07-15")
+	for _, d := range factorDefs {
+		ft3.cols[d.Key] = append(ft3.cols[d.Key], math.NaN())
+	}
+	ft3.cols["close"][0] = 77.7 // 已有行的新值：不得覆盖
+	ft3.cols["close"][2] = 6.6
+	if n, err := SnapshotFactorTable(ft3); err != nil || n != 1 {
+		t.Fatalf("同日应只补缺失的 1 行: n=%d err=%v", n, err)
+	}
+	var added model.FactorSnapshotDaily
+	if err := common.DB.Where("trade_date = ? AND symbol = ?", "2026-07-15", "600003").First(&added).Error; err != nil {
+		t.Fatalf("补缺行应落库: %v", err)
+	}
+	common.DB.Where("trade_date = ? AND symbol = ?", "2026-07-15", "600001").First(&again)
+	if again.FactorsJSON != row.FactorsJSON {
+		t.Fatal("补缺时已有行被覆盖")
+	}
+
 	// 新交易日正常落库；天数统计=2。
 	ft2 := buildSnapshotFixtureTable()
 	ft2.TradeDate = "2026-07-16"

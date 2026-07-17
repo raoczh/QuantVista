@@ -235,6 +235,13 @@ func TestSyncMarketWideEndToEnd(t *testing.T) {
 	if err := common.DB.Where("market = ? AND trade_date = ?", "cn", tradeDate).First(&cal).Error; err != nil || !cal.IsOpen {
 		t.Fatalf("日历未补当日: %v %+v", err, cal)
 	}
+	// S0-3 宇宙快照必须整批落库（回归锚：AssignmentColumns 列名与 GORM 蛇形化不符
+	//（如 PETTM→pettm 写成 pe_ttm）会让整条 upsert SQL 无效、快照一行都落不了）。
+	var uniN int64
+	common.DB.Model(&model.StockUniverseDaily{}).Where("trade_date = ?", tradeDate).Count(&uniN)
+	if uniN != 3 {
+		t.Fatalf("宇宙快照应落 3 行（含停牌股），得到 %d", uniN)
+	}
 
 	// 幂等：重跑一遍 bars/states 不翻倍。
 	if _, err := svc.SyncMarketWide(context.Background()); err != nil {
@@ -247,6 +254,11 @@ func TestSyncMarketWideEndToEnd(t *testing.T) {
 	common.DB.Model(&model.MarketSyncState{}).Count(&stN)
 	if stN != 3 {
 		t.Fatalf("重跑后 states = %d, want 3", stN)
+	}
+	// 快照 upsert 幂等（重跑覆盖为最新，不翻倍）。
+	common.DB.Model(&model.StockUniverseDaily{}).Where("trade_date = ?", tradeDate).Count(&uniN)
+	if uniN != 3 {
+		t.Fatalf("重跑后宇宙快照 = %d, want 3（upsert 幂等）", uniN)
 	}
 }
 

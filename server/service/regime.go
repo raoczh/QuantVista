@@ -398,6 +398,8 @@ const sqrt252 = 15.874507866387544
 // ---------- S1-3 组合去相关（纯函数部分） ----------
 
 // pairwiseCorr 两条收盘序列的日收益 Pearson 相关（按尾部对齐，样本 <20 返回 0 不判）。
+// 注意：按数组位置对齐仅在两股无停牌错位时成立——生产路径应使用 pairwiseCorrAligned
+//（按交易日交集对齐），本函数保留给无日期序列的调用方与既有测试。
 func pairwiseCorr(a, b []float64) float64 {
 	n := len(a)
 	if len(b) < n {
@@ -408,6 +410,36 @@ func pairwiseCorr(a, b []float64) float64 {
 	}
 	ra := dailyReturns(a[len(a)-n:])
 	rb := dailyReturns(b[len(b)-n:])
+	return corrOfReturns(ra, rb)
+}
+
+// pairwiseCorrAligned 两条带交易日的收盘序列按日期交集对齐后的日收益 Pearson 相关。
+// 任一股停牌造成的位置错位在此消除（相邻交集日的收益是跨停牌累计收益，如实）；
+// 交集不足 21 个交易日返回 0 不判。dates 与 closes 等长升序。
+func pairwiseCorrAligned(datesA []string, a []float64, datesB []string, b []float64) float64 {
+	if len(datesA) != len(a) || len(datesB) != len(b) {
+		return 0
+	}
+	byB := make(map[string]float64, len(datesB))
+	for i, d := range datesB {
+		byB[d] = b[i]
+	}
+	ca := make([]float64, 0, len(a))
+	cb := make([]float64, 0, len(a))
+	for i, d := range datesA {
+		if vb, ok := byB[d]; ok {
+			ca = append(ca, a[i])
+			cb = append(cb, vb)
+		}
+	}
+	if len(ca) < 21 {
+		return 0
+	}
+	return corrOfReturns(dailyReturns(ca), dailyReturns(cb))
+}
+
+// corrOfReturns 两条日收益序列（尾部截齐）的 Pearson 相关；样本 <20 返回 0。
+func corrOfReturns(ra, rb []float64) float64 {
 	m := len(ra)
 	if len(rb) < m {
 		m = len(rb)

@@ -210,8 +210,9 @@ func RunFactorIC(ctx context.Context, market *MarketService) (*FactorICReport, e
 	}
 	bt := NewBacktestService(market)
 	axis, _, _ := bt.marketAxis(ctx, freshDate)
-	// 右边界收缩最长收益窗口 +1，从尾部按步长回采横截面日期。
-	eligible := len(axis) - (icHorizonMax + 1)
+	// 右边界收缩最长收益窗口（横截面日 i 的最远收益终点 i+20 须 ≤ 轴末），
+	// 从尾部按步长回采横截面日期。
+	eligible := len(axis) - icHorizonMax
 	if eligible < 1 {
 		return nil, errors.New("交易日轴数据不足，无法计算 IC")
 	}
@@ -224,6 +225,25 @@ func RunFactorIC(ctx context.Context, market *MarketService) (*FactorICReport, e
 	for i, d := range dates {
 		dateIdxOf[d] = i
 	}
+	// 各横截面各窗口的收益终点（市场轴对齐）：个股停牌不再把收益窗口顺延到复牌后
+	// 第 N 根 K 线——目标日无该股 bar（停牌）记 NaN 剔除该观测。
+	axisIdxOf := make(map[string]int, len(axis))
+	for i, d := range axis {
+		axisIdxOf[d] = i
+	}
+	retDates := make([][]string, len(dates))
+	for i, d := range dates {
+		retDates[i] = make([]string, len(icHorizons))
+		ai := axisIdxOf[d]
+		for hi, h := range icHorizons {
+			if ai+h < len(axis) {
+				retDates[i][hi] = axis[ai+h]
+			}
+		}
+	}
+	// ST as-of（防前视/幸存者偏差）：与 walk-forward 同款，快照未覆盖回退当前名称。
+	stByDate := universeSTByDates(dates)
+	stFallback := len(stByDate) < len(dates)
 
 	// 宇宙元数据（同 buildFactorTable）。
 	var states []model.MarketSyncState
@@ -263,7 +283,20 @@ func RunFactorIC(ctx context.Context, market *MarketService) (*FactorICReport, e
 			defer wg.Done()
 			for j := range jobs {
 				meta := metaBy[j.symbol]
-				if meta.ST {
+				stAt := func(d string) bool {
+					if set, ok := stByDate[d]; ok {
+						return set[j.symbol]
+					}
+					return meta.ST
+				}
+				allST := true
+				for _, d := range dates {
+					if !stAt(d) {
+						allST = false
+						break
+					}
+				}
+				if allST {
 					stSkipped.Add(1)
 					continue
 				}
@@ -272,11 +305,17 @@ func RunFactorIC(ctx context.Context, market *MarketService) (*FactorICReport, e
 					continue
 				}
 				universe.Add(1)
-				n := len(j.bars)
+				barIdx := make(map[string]int, len(j.bars))
+				for i, b := range j.bars {
+					barIdx[b.TradeDate] = i
+				}
 				for i, b := range j.bars {
 					di, ok := dateIdxOf[b.TradeDate]
 					if !ok || b.Close <= 0 {
 						continue
+					}
+					if stAt(b.TradeDate) {
+						continue // 该横截面日为 ST（as-of）：仅排除当日观测
 					}
 					// as-of 切片重算因子行（跳筹码，见白名单注释）。
 					vals := computeWideRowOpts(j.symbol, meta, j.bars[:i+1], false)
@@ -285,10 +324,15 @@ func RunFactorIC(ctx context.Context, market *MarketService) (*FactorICReport, e
 						fv[k] = vals[vi]
 					}
 					rets := make([]float64, len(icHorizons))
-					for hi, h := range icHorizons {
+					for hi := range icHorizons {
 						rets[hi] = math.NaN()
-						if i+h < n && j.bars[i+h].Close > 0 {
-							rets[hi] = (j.bars[i+h].Close/b.Close - 1) * 100
+						// 收益终点按市场轴对齐：目标日停牌（无 bar）的观测剔除。
+						td := retDates[di][hi]
+						if td == "" {
+							continue
+						}
+						if ti, ok := barIdx[td]; ok && j.bars[ti].Close > 0 {
+							rets[hi] = (j.bars[ti].Close/b.Close - 1) * 100
 						}
 					}
 					obsCh <- icObservation{dateIdx: di, fvals: fv, rets: rets}
@@ -412,11 +456,14 @@ func RunFactorIC(ctx context.Context, market *MarketService) (*FactorICReport, e
 	sort.SliceStable(rep.Stats, func(a, b int) bool { return rank(rep.Stats[a]) > rank(rep.Stats[b]) })
 	rep.ElapsedMs = time.Since(start).Milliseconds()
 	rep.Notes = append(rep.Notes,
-		"口径：A 类因子按历史日线 as-of 切片重建（无未来泄露）；收益=因子日收盘→N 交易日后收盘（不扣费，测区分度非可执行收益）",
-		"宇宙：剔除 ST 与复权断层股，与推荐候选宇宙一致；单横截面有效样本 <"+strconv.Itoa(icMinCross)+" 不计当日 IC",
+		"口径：A 类因子按历史日线 as-of 切片重建（无未来泄露）；收益=因子日收盘→N 交易日后收盘（市场轴对齐，停牌观测剔除；不扣费，测区分度非可执行收益）",
+		"宇宙：剔除 ST（优先宇宙快照按横截面日 as-of 判定）与复权断层股，与推荐候选宇宙一致；单横截面有效样本 <"+strconv.Itoa(icMinCross)+" 不计当日 IC",
 		"防过拟合纪律：权重与加分项调整只以样本外结果为准；本报表只出数，不设「必须删几个因子」的指标（规划 §5 S3-4）",
 		"历史窗口有限（每股约 250 根日线）：越早的横截面长窗因子（年线/250日位置）缺失越多，属数据现实非 bug",
 	)
+	if stFallback {
+		rep.Notes = append(rep.Notes, "部分横截面日早于宇宙快照（S0-3）积累起点，ST 判定回退当前名称——存在轻微幸存者偏差，随快照积累自动消失")
+	}
 
 	icReportMu.Lock()
 	icReportCur = rep

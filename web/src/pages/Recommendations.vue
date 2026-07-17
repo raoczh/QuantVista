@@ -1289,7 +1289,7 @@ function qgFieldLabels(fields?: string[]): string {
       <div class="attr-toolbar">
         <n-select v-model:value="attrHorizon" :options="attrHorizonOptions" size="small" style="width: 140px" />
         <span class="attr-meta" v-if="attrReport"
-          >成熟样本 {{ attrReport.sample }} · 未成熟 {{ attrReport.pending }} · 无法成交 {{ attrReport.skipped }}</span
+          >成熟样本 {{ attrReport.sample }}（买入 {{ attrReport.sample_buy }}） · 未成熟 {{ attrReport.pending }} · 无法成交 {{ attrReport.skipped }}</span
         >
       </div>
       <n-spin :show="attrLoading">
