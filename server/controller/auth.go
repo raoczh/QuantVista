@@ -127,7 +127,9 @@ func (ac *AuthController) GitHubURL(c *gin.Context) {
 	// 仅验 HMAC 防不了登录 CSRF——攻击者可用自己申请的合法 state+code 诱导
 	// 受害者浏览器完成回调、静默登进攻击者账号；cookie 绑定发起浏览器后不可行。
 	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie(oauthStateCookie, nonce, 600, "/", "", false, true)
+	// 生产（HTTPS）下置 Secure，禁止明文 http 回传 state cookie；本地 http 调试
+	// （common.Production=false）保持 Secure=false 不受影响。
+	c.SetCookie(oauthStateCookie, nonce, 600, "/", "", common.Production, true)
 	common.ApiSuccess(c, gin.H{"url": url})
 }
 

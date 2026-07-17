@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
+import { isAxiosError } from 'axios'
 import {
   getSetupStatus,
   createAdmin as apiCreateAdmin,
@@ -53,9 +54,13 @@ export const useAuthStore = defineStore('auth', () => {
     if (!getAccessToken()) return
     try {
       user.value = await getSelf()
-    } catch {
-      clearTokens()
-      user.value = null
+    } catch (e) {
+      // 仅在确认凭证失效（401，且已走过 client 拦截器的单飞刷新仍失败）时清票；
+      // 网络错误 / 5xx 不清票，保留会话让下次进入重试，避免瞬时抖动把用户踢下线。
+      if (isAxiosError(e) && e.response?.status === 401) {
+        clearTokens()
+        user.value = null
+      }
     }
   }
 

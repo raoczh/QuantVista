@@ -1,5 +1,5 @@
 import { request, AI_TIMEOUT, refreshAccessToken } from './client'
-import { getAccessToken } from './token'
+import { getAccessToken, clearTokens } from './token'
 import type { RiskFlag } from './trust'
 
 export interface QaMessage {
@@ -73,8 +73,18 @@ export async function askQaStream(
     })
 
   let resp = await doFetch()
-  if (resp.status === 401 && (await refreshAccessToken())) {
-    resp = await doFetch()
+  if (resp.status === 401) {
+    if (await refreshAccessToken()) {
+      resp = await doFetch()
+    } else {
+      // 刷新失败即凭证彻底失效：与 axios 拦截器保持一致——清票并整页跳登录，
+      // 否则流式路径会停留在“请求失败”文案、登录态残留不一致。/login 前缀豁免防循环。
+      clearTokens()
+      if (!location.pathname.startsWith('/login')) {
+        location.href = '/login?redirect=' + encodeURIComponent(location.pathname + location.search)
+      }
+      throw new Error('登录已过期，请重新登录')
+    }
   }
   // 建流前的失败（参数绑定/鉴权）走标准 JSON 包络而非 NDJSON。
   const ctype = resp.headers.get('content-type') || ''

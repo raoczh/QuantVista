@@ -31,6 +31,14 @@ var ErrSyncInProgress = errors.New("已有批量同步任务在进行中")
 // syncBarsRunning 保证同一时刻只有一轮批量日线同步（后台定时与手动触发共用）。
 var syncBarsRunning atomic.Bool
 
+// IsSyncingBars 当前是否已有一轮批量日线同步在跑，供 controller 触发前预检——否则
+// 手动重复触发时 ErrSyncInProgress 被后台 goroutine 吞掉、响应恒 started:true，用户以为
+// 又起了一轮。存在极小 TOCTOU 窗口（预检通过到 SyncTrackedDailyBars 内部 CAS 之间），
+// 真正的并发重入仍由该 CAS 兜底，此处只为把「已在跑」如实反馈给前端。
+func IsSyncingBars() bool {
+	return syncBarsRunning.Load()
+}
+
 // syncCursor 批量同步的轮转游标（进程内）：记录上一轮同步到的 stocks.id。
 // 无游标时每轮都取同一前缀，标的数超过 syncMaxStocks（或任务中途超时取消）时
 // 尾部标的永远轮不到；游标让各轮从上次断点继续、扫到尾自动回绕。

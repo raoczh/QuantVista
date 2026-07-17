@@ -85,6 +85,8 @@ func (s *TodoService) Build(ctx context.Context, userID int64) (*TodoResult, err
 			})
 			res.Alerts++
 		}
+	} else {
+		common.SysWarn("待办聚合读取提醒命中失败 user=%d: %v", userID, err)
 	}
 
 	// 2) 需复盘的短线推荐（阶段6 追踪：触发止盈/止损/过期；已读的不再进清单）。
@@ -110,6 +112,8 @@ func (s *TodoService) Build(ctx context.Context, userID int64) (*TodoResult, err
 			})
 			res.Reviews++
 		}
+	} else {
+		common.SysWarn("待办聚合读取推荐复盘失败 user=%d: %v", userID, err)
 	}
 
 	// 3) 需复盘的持仓（短线超阈值 / 长线持有较久）+ 止损计划风控（最高优先级）。
@@ -157,6 +161,9 @@ func (s *TodoService) Build(ctx context.Context, userID int64) (*TodoResult, err
 				res.Reviews++
 			}
 		}
+	} else {
+		// 止损信号来源于此块，读取失败必须留痕（静默吞错会让「破止损」待办凭空消失）。
+		common.SysWarn("待办聚合读取持仓失败 user=%d: %v", userID, err)
 	}
 
 	// 4) 到期待复盘的投资逻辑卡。
@@ -172,6 +179,8 @@ func (s *TodoService) Build(ctx context.Context, userID int64) (*TodoResult, err
 				})
 				res.Reviews++
 			}
+		} else {
+			common.SysWarn("待办聚合读取逻辑卡失败 user=%d: %v", userID, err)
 		}
 	}
 

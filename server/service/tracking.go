@@ -218,6 +218,9 @@ func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.Re
 		}
 		benchTried[market] = true
 		if _, bars, err := s.market.GetBenchmarkBars(ctx, market, benchBarLimit); err == nil {
+			// 缓存前一次性升序排序：4 路并发 goroutine 共享该 slice，benchRange 不得再
+			// 原地 sort——原地排序共享数组是真数据竞争（#27d）。
+			sort.Slice(bars, func(i, j int) bool { return bars[i].TradeDate < bars[j].TradeDate })
 			benchCache[market] = bars
 		}
 		return benchCache[market]
@@ -233,14 +236,35 @@ func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.Re
 		if len(recs) == 0 {
 			continue
 		}
-		recDate := b.CreatedAt.In(time.Local).Format("2006-01-02")
-		bench := getBench(b.Market)
+		// 终态冻结（#6）：预载已有追踪状态，止盈/止损/过期终态行不再重算不 upsert——
+		// 成熟结局一旦定格，后续行情不得改写其收益（Performance 的 buyWins 曾按漂移
+		// 后的 ReturnPct 算错成熟胜率）。no_data 不冻结：它可能只是「日线尚未同步」的
+		// 暂态（新推荐当天必落此态），冻结会让其永远停在无数据。active/tracking 照旧重算。
+		frozen := map[int64]bool{}
+		var srows []model.RecommendationStatus
+		common.DB.Select("recommendation_id", "outcome").
+			Where("batch_id = ? AND user_id = ?", b.ID, b.UserID).Find(&srows)
+		for _, sr := range srows {
+			if frozenTerminal(sr.Outcome) {
+				frozen[sr.RecommendationID] = true
+			}
+		}
 		// S0-4 用户执行事实：批量查持仓血缘（同一推荐多笔建仓取最早一笔），实际买入价
-		// 与实际收益随状态并列落库（与模拟口径不混算）。
+		// 与实际收益随状态并列落库（与模拟口径不混算）。仅对未冻结条目查询。
+		active := make([]model.Recommendation, 0, len(recs))
 		recIDs := make([]int64, 0, len(recs))
 		for _, r := range recs {
+			if frozen[r.ID] {
+				continue
+			}
+			active = append(active, r)
 			recIDs = append(recIDs, r.ID)
 		}
+		if len(active) == 0 {
+			continue // 全部终态冻结，跳过整批（含基准/持仓查询与上游请求）
+		}
+		recDate := b.CreatedAt.In(time.Local).Format("2006-01-02")
+		bench := getBench(b.Market)
 		posByRec := map[int64]model.Position{}
 		var prows []model.Position
 		common.DB.Where("user_id = ? AND recommendation_id IN ? AND buy_price > 0", b.UserID, recIDs).
@@ -255,8 +279,8 @@ func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.Re
 		// 免费额度平衡。upsert 收集后串行落库（SQLite 测试库不吃写并发）。
 		sem := make(chan struct{}, 4)
 		var wg sync.WaitGroup
-		results := make([]*model.RecommendationStatus, len(recs))
-		for i, rec := range recs {
+		results := make([]*model.RecommendationStatus, len(active))
+		for i, rec := range active {
 			wg.Add(1)
 			sem <- struct{}{}
 			go func(i int, rec model.Recommendation) {
@@ -283,6 +307,17 @@ func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.Re
 		}
 	}
 	return count
+}
+
+// frozenTerminal 终态冻结判定（#6）：短线止盈/止损/过期是已闭合的成熟结局，其收益
+// 不得随后续行情漂移。no_data 不算终态（可能只是日线尚未同步的暂态），active/tracking
+// 亦不冻结（长线持有期内收益本应继续演进）。
+func frozenTerminal(outcome string) bool {
+	switch outcome {
+	case model.RecOutcomeTakeProfit, model.RecOutcomeStopLoss, model.RecOutcomeExpired:
+		return true
+	}
+	return false
 }
 
 // evaluateOne 评估单条推荐：拉日线（落库）+ 追加当日实时行情 + 交易日历计过期 + 基准 → 状态。
@@ -325,8 +360,9 @@ func (s *TrackingService) evaluateOne(ctx context.Context, batch model.Recommend
 
 	// 追加当日实时行情为一根 bar（用于盘中触达判定与最新价刷新）。
 	if q, err := s.market.GetQuote(ctx, rec.Market, rec.Symbol); err == nil && q.Price > 0 {
-		today := time.Now().In(time.Local).Format("2006-01-02")
-		if today > recDate && (len(bars) == 0 || bars[len(bars)-1].TradeDate < today) {
+		now := time.Now().In(time.Local)
+		if shouldAppendQuoteBar(now, recDate, bars) {
+			today := now.Format("2006-01-02")
 			high, low := q.High, q.Low
 			if high <= 0 {
 				high = q.Price
@@ -371,11 +407,16 @@ func (s *TrackingService) evaluateOne(ctx context.Context, batch model.Recommend
 	st.Return7d = res.Return7d
 	st.Return14d = res.Return14d
 	st.Return30d = res.Return30d
-	// 用户执行事实并列（S0-4）：有持仓血缘时记实际买入价与实际收益。
-	if pos != nil && pos.BuyPrice > 0 && res.CurrentPrice > 0 {
+	// 用户执行事实并列（S0-4）：有持仓血缘时记实际买入价与实际收益。已平仓持仓按
+	// 真实卖出价定格，不随最新行情漂移（#13a）；未平仓仍用最新价。费税口径与现状
+	// 一致（纯价格收益，不扣费税）。
+	if pos != nil && pos.BuyPrice > 0 {
 		st.ActualBuyPrice = pos.BuyPrice
-		v := round2((res.CurrentPrice - pos.BuyPrice) / pos.BuyPrice * 100)
-		st.ActualReturnPct = &v
+		endPrice := actualReturnEndPrice(*pos, res.CurrentPrice)
+		if endPrice > 0 {
+			v := round2((endPrice - pos.BuyPrice) / pos.BuyPrice * 100)
+			st.ActualReturnPct = &v
+		}
 	}
 	if res.Outcome == model.RecOutcomeNoData {
 		st.Note = "暂无推荐日之后的日线数据，无法评估表现"
@@ -392,6 +433,29 @@ func (s *TrackingService) evaluateOne(ctx context.Context, batch model.Recommend
 		st.Note = strings.Join(notes, "；")
 	}
 	return st
+}
+
+// shouldAppendQuoteBar 是否把当日实时行情追加为一根 bar：仅在今天是交易日、今天晚于
+// 推荐日、且日线尚无今日根时追加。周末/节假日 GetQuote 返回的是上一收盘，无交易日
+// 判断会把它追加成周六/日的假 bar（#27b）；交易日历缺失时回退「周一~五」判断。
+func shouldAppendQuoteBar(now time.Time, recDate string, bars []datasource.Bar) bool {
+	today := now.Format("2006-01-02")
+	if today <= recDate {
+		return false
+	}
+	if len(bars) > 0 && bars[len(bars)-1].TradeDate >= today {
+		return false
+	}
+	return isTradingDayToday(now)
+}
+
+// actualReturnEndPrice 用户执行事实实际收益的终点价：已平仓持仓按真实卖出价定格
+// （不随最新行情漂移 #13a），未平仓（或已平仓但缺卖出价）回退最新价。
+func actualReturnEndPrice(pos model.Position, currentPrice float64) float64 {
+	if pos.Status == model.PositionStatusClosed && pos.SellPrice > 0 {
+		return pos.SellPrice
+	}
+	return currentPrice
 }
 
 // symbolBarsAfter 拉取标的日线（落库），返回按日期升序、trade_date > afterDate 的部分，
@@ -416,11 +480,12 @@ func (s *TrackingService) symbolBarsAfter(ctx context.Context, market, symbol, a
 }
 
 // benchRange 返回基准区间起点（推荐日或其后首个交易日收盘）与最新收盘。
+// 输入 bench 须按 trade_date 升序（getBench 缓存时已排序）——此处不再原地排序，
+// 避免 4 路并发 goroutine 竞争共享 slice（#27d）。
 func benchRange(bench []datasource.Bar, recDate string) (start, end float64) {
 	if len(bench) == 0 {
 		return 0, 0
 	}
-	sort.Slice(bench, func(i, j int) bool { return bench[i].TradeDate < bench[j].TradeDate })
 	for _, b := range bench {
 		if b.TradeDate >= recDate {
 			start = b.Close
@@ -523,11 +588,11 @@ type PerformanceStats struct {
 	BenchSample       int     `json:"bench_sample"` // 有基准数据、alpha 有效的样本量
 
 	// 买入成熟口径（主指标）。
-	BuyMatured      int     `json:"buy_matured"`        // action=buy 且已成熟
-	BuyWinRate      float64 `json:"buy_win_rate"`       // 成熟买入样本中收益>0 比例
+	BuyMatured      int     `json:"buy_matured"`  // action=buy 且已成熟
+	BuyWinRate      float64 `json:"buy_win_rate"` // 成熟买入样本中收益>0 比例
 	BuyAvgReturnPct float64 `json:"buy_avg_return_pct"`
-	BuyMedianPct    float64 `json:"buy_median_pct"`     // 成熟买入收益中位数
-	BuyAvgAlphaPct  float64 `json:"buy_avg_alpha_pct"`  // 基准有效的成熟买入样本
+	BuyMedianPct    float64 `json:"buy_median_pct"`    // 成熟买入收益中位数
+	BuyAvgAlphaPct  float64 `json:"buy_avg_alpha_pct"` // 基准有效的成熟买入样本
 	BuyBenchSample  int     `json:"buy_bench_sample"`
 	BuyActive       int     `json:"buy_active"` // 未成熟买入（不进胜率分母，透明计数）
 
@@ -695,8 +760,20 @@ func (s *TrackingService) Performance(userID int64, recType string) (*Performanc
 	return stats, nil
 }
 
+// trackableUserIDs 列举近 trackWindowDays 天内有可追踪批次的用户。status 纳入
+// success 与 degraded——RefreshUser 语义本就含 degraded（降级批次有条目与规则计划价），
+// 后台枚举若只取 success 会漏掉「只有降级批次」的用户，其追踪永不刷新（#27c）。
+func trackableUserIDs(cutoff time.Time) ([]int64, error) {
+	var userIDs []int64
+	err := common.DB.Model(&model.RecommendationBatch{}).
+		Where("status IN ? AND created_at >= ?",
+			[]string{model.RecStatusSuccess, model.RecStatusDegraded}, cutoff).
+		Distinct().Pluck("user_id", &userIDs).Error
+	return userIDs, err
+}
+
 // StartTrackingJobs 后台推荐追踪：启动后延迟一次全量刷新，之后每 2 小时刷新一次。
-// 遍历所有有近 90 天成功批次的用户；失败仅记日志，不影响主流程。
+// 遍历所有有近 90 天成功/降级批次的用户；失败仅记日志，不影响主流程。
 func StartTrackingJobs(mgr *datasource.Manager) {
 	svc := NewTrackingService(NewMarketService(mgr))
 	refreshAll := func() {
@@ -704,10 +781,8 @@ func StartTrackingJobs(mgr *datasource.Manager) {
 			return
 		}
 		cutoff := time.Now().AddDate(0, 0, -trackWindowDays)
-		var userIDs []int64
-		if err := common.DB.Model(&model.RecommendationBatch{}).
-			Where("status = ? AND created_at >= ?", model.RecStatusSuccess, cutoff).
-			Distinct().Pluck("user_id", &userIDs).Error; err != nil {
+		userIDs, err := trackableUserIDs(cutoff)
+		if err != nil {
 			common.SysWarn("追踪任务列举用户失败: %v", err)
 			return
 		}
@@ -727,6 +802,13 @@ func StartTrackingJobs(mgr *datasource.Manager) {
 			common.SysWarn("推荐标签推进失败: %v", err)
 		}
 		lcancel()
+
+		// #10 事实账本完整性巡检：success/degraded 批次的候选事件+影子标签本应在生成时
+		// 同步落库（recordBatchFacts 已进程内重试）。仍 facts_recorded=false 的是生成时
+		// DB 长时间不可用或进程崩溃遗留——无法可靠持久化补建（快照丢失价格版本锚、
+		// gates 未持久化、事件表无唯一索引重跑会重复），此处只统计并告警供人工排查，
+		// 不自动重建以免写入降级/重复事实污染影子评估。age 过滤避开刚落库的在途批次。
+		scanBatchFactsHealth()
 	}
 
 	go func() {
@@ -738,4 +820,50 @@ func StartTrackingJobs(mgr *datasource.Manager) {
 			refreshAll()
 		}
 	}()
+}
+
+// factsHealthStaleMin 事实账本巡检的批次年龄下限（分钟）：新落库批次的 facts 写入
+// 与批次 Save 是相邻语句，留足窗口避开在途批次误报。
+const factsHealthStaleMin = 10
+
+// scanBatchFactsHealth #10 事实账本完整性巡检：统计 success/degraded 且 facts_recorded=false
+// 的批次并告警。只读只记，不自动重建（原因见 recordBatchFacts 注释）。
+//
+// 关键：facts_recorded 列上线前的历史批次默认 false，但其事实其实已按旧代码落库——
+// 不能一律当失败告警。故对候选批次再查 candidate_events 是否存在，仅「零事件」者才是
+// 真正的落库失败（success/degraded ⇒ 池非空 ⇒ 正常必有事件），避免刷屏历史批次。
+func scanBatchFactsHealth() {
+	if common.DB == nil {
+		return
+	}
+	cutoff := time.Now().Add(-factsHealthStaleMin * time.Minute)
+	var ids []int64
+	if err := common.DB.Model(&model.RecommendationBatch{}).
+		Where("status IN ? AND facts_recorded = ? AND updated_at < ?",
+			[]string{model.RecStatusSuccess, model.RecStatusDegraded}, false, cutoff).
+		Order("id").Pluck("id", &ids).Error; err != nil {
+		common.SysWarn("事实账本完整性巡检查询失败: %v", err)
+		return
+	}
+	if len(ids) == 0 {
+		return
+	}
+	// 有事件的批次视为「旧代码已落库、仅无 facts_recorded 标记」，不告警。
+	var withEvents []int64
+	common.DB.Model(&model.RecommendationCandidateEvent{}).
+		Where("batch_id IN ?", ids).Distinct().Pluck("batch_id", &withEvents)
+	has := make(map[int64]bool, len(withEvents))
+	for _, id := range withEvents {
+		has[id] = true
+	}
+	var missing []int64
+	for _, id := range ids {
+		if !has[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		common.SysWarn("事实账本完整性巡检：%d 个 success/degraded 批次无候选事件（生成时落库失败），"+
+			"影子标签缺失，需人工排查后重建 batch_ids=%v", len(missing), missing)
+	}
 }

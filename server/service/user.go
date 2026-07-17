@@ -257,11 +257,16 @@ func (s *UserService) ChangePassword(userID int64, oldPw, newPw string) error {
 	if err != nil {
 		return err
 	}
-	if err := common.DB.Model(&u).Update("password", hash).Error; err != nil {
-		return err
-	}
-	// 改密后使旧 access token 即时失效（令牌版本 +1），并吊销该用户全部刷新令牌，强制所有会话重登。
-	common.DB.Model(&u).UpdateColumn("token_version", gorm.Expr("token_version + 1"))
-	common.DB.Model(&model.RefreshToken{}).Where("user_id = ?", userID).Update("revoked", true)
-	return nil
+	// 改密三步须原子且逐步检查错误：写新密码 + token_version+1（旧 access token 即时失效）
+	// + 吊销全部刷新令牌（强制所有会话重登）。任一步失败整体回滚，避免「密码已改但旧会话/
+	// 旧刷新令牌仍有效」的安全裂缝（原实现后两步在事务外且吞错）。
+	return common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&u).Update("password", hash).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&u).UpdateColumn("token_version", gorm.Expr("token_version + 1")).Error; err != nil {
+			return err
+		}
+		return tx.Model(&model.RefreshToken{}).Where("user_id = ?", userID).Update("revoked", true).Error
+	})
 }

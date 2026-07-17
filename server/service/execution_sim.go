@@ -83,13 +83,18 @@ func simEntry(bars []datasource.Bar, i int, symbol, name string, perCap float64,
 }
 
 // simulateHold 从信号日下标 i 起模拟一笔「次日开盘买入、持有 holdN 交易日收盘卖出」。
+// 持有语义（A 股 T+1）：卖出根 = 买入根 + holdN，即买入根之后第 holdN 个交易日收盘
+// 卖出（holdN=1 即买入次日卖出，绝不当日买卖）。
 // bars 为该股升序日线全序列；nextDate 为市场日轴上的次一交易日（非空时校验个股
 // 次日是否停牌——停牌期无法按计划买入，跳过而非用复牌远期价格假装成交）；
-// sellDate 为市场日轴上的到期卖出日（信号日后第 holdN 个交易日）——非空时按市场
+// sellDate 为市场日轴上的到期卖出日（信号日后第 holdN+1 个交易日）——非空时按市场
 // 日期定位出场根，个股中途停牌不再拉长实际持有跨度（旧的按个股第 N 根 K 线推进会
 // 让停牌股顺延到复牌后第 N 根，不同股票的持有天数不可比）；到期日个股停牌视同
-// 卖不出，顺延到复牌首根收盘卖出。空 sellDate 回退按个股 K 线数推进（无轴调用方）。
-func simulateHold(bars []datasource.Bar, i int, symbol, name string, holdN int, perCap float64, nextDate, sellDate string) holdOutcome {
+// 卖不出，顺延到复牌首根收盘卖出。marketLastDate 为市场日轴末日（非空时区分「真未
+// 成熟」与「个股已退市/长停」——个股末根 < sellDate 但市场轴已过 sellDate = 个股停更，
+// 按末根收盘强平计成交，不静默判 pending 让坏结局的高分股虚高 Precision）。
+// 空 sellDate 回退按个股 K 线数推进（无轴调用方）。
+func simulateHold(bars []datasource.Bar, i int, symbol, name string, holdN int, perCap float64, nextDate, sellDate, marketLastDate string) holdOutcome {
 	buyIdx, qty, cost, skip := simEntry(bars, i, symbol, name, perCap, nextDate)
 	if skip != "" {
 		return holdOutcome{Status: skip}
@@ -98,21 +103,28 @@ func simulateHold(bars []datasource.Bar, i int, symbol, name string, holdN int, 
 	limitPct := limitUpPctFor(symbol, name)
 	out := holdOutcome{Status: btTraded, BuyDate: buy.TradeDate, BuyPrice: buy.Open}
 
-	// 卖出目标：买入日为持有第 1 日，第 holdN 日收盘卖出。
+	// 卖出目标：卖出根 = 买入根 + holdN（买入根之后第 holdN 个交易日收盘卖出）。
 	var j int
 	if sellDate != "" {
 		if bars[len(bars)-1].TradeDate < sellDate {
-			return holdOutcome{Status: btPending, BuyDate: buy.TradeDate, BuyPrice: buy.Open}
-		}
-		j = buyIdx
-		for j < len(bars) && bars[j].TradeDate < sellDate {
-			j++
-		}
-		if j < len(bars) && bars[j].TradeDate != sellDate {
-			out.Deferred++ // 到期日个股停牌：顺延到复牌首根（记一次顺延，不精确到天数）
+			// 个股末根未达市场到期日。区分个股退市/长停与真未成熟。
+			if marketLastDate != "" && marketLastDate >= sellDate {
+				j = len(bars) - 1 // 市场已过到期日、个股停更 → 退市/长停：末根收盘强平
+				out.Forced = true
+			} else {
+				return holdOutcome{Status: btPending, BuyDate: buy.TradeDate, BuyPrice: buy.Open}
+			}
+		} else {
+			j = buyIdx
+			for j < len(bars) && bars[j].TradeDate < sellDate {
+				j++
+			}
+			if j < len(bars) && bars[j].TradeDate != sellDate {
+				out.Deferred++ // 到期日个股停牌：顺延到复牌首根（记一次顺延，不精确到天数）
+			}
 		}
 	} else {
-		j = i + holdN
+		j = i + holdN + 1
 		if j >= len(bars) {
 			return holdOutcome{Status: btPending, BuyDate: buy.TradeDate, BuyPrice: buy.Open}
 		}
@@ -127,6 +139,11 @@ func simulateHold(bars []datasource.Bar, i int, symbol, name string, holdN int, 
 		out.Forced = true
 	}
 	sell := bars[j]
+	if sell.Close <= 0 {
+		// 出场根坏数据（停牌/未同步的 0 价）：不伪造成熟收益，返回 pending 等待（与
+		// simEntry 买入侧 Open<=0 判 skip_suspend 对称，出场侧保守取 pending）。
+		return holdOutcome{Status: btPending, BuyDate: buy.TradeDate, BuyPrice: buy.Open}
+	}
 	sellAmount := sell.Close * qty
 	sellFee, sellTax := tradeFee("cn", model.PaperSideSell, symbol, sellAmount)
 	proceeds := sellAmount - sellFee - sellTax
@@ -155,13 +172,15 @@ type labelOutcome struct {
 	Forced        bool
 }
 
-// simulateLabelHold 标签结算：信号日下标 i 次日开盘买入，持有 horizon 交易日收盘卖出；
+// simulateLabelHold 标签结算：信号日下标 i 次日开盘买入，卖出根 = 买入根 + horizon
+//（买入根之后第 horizon 个交易日收盘卖出，horizon=1 即买入次日卖出，满足 A 股 T+1）；
 // takeProfit/stopLoss > 0 时启用三重障碍——自买入次日（T+1）起按当日 high/low 判盘中
 // 触达，先触者出场、同日双触保守取止损、成交按障碍价（不取更优的 high/low）。
 // 止损出场日若一字跌停按五件套③顺延。horizon 未走完且数据未覆盖返回 pending。
 // sellDate 语义同 simulateHold：市场日轴上的到期卖出日（个股停牌不拉长持有跨度，
-// 到期日停牌顺延复牌卖出）；空串回退按个股 K 线数推进。
-func simulateLabelHold(bars []datasource.Bar, i int, symbol, name string, horizon int, perCap, takeProfit, stopLoss float64, nextDate, sellDate string) labelOutcome {
+// 到期日停牌顺延复牌卖出）；marketLastDate 为市场轴末日（非空时个股末根 < sellDate
+// 但市场已过 sellDate = 退市/长停，按末根收盘强平）；空 sellDate 回退按个股 K 线数推进。
+func simulateLabelHold(bars []datasource.Bar, i int, symbol, name string, horizon int, perCap, takeProfit, stopLoss float64, nextDate, sellDate, marketLastDate string) labelOutcome {
 	buyIdx, qty, cost, skip := simEntry(bars, i, symbol, name, perCap, nextDate)
 	if skip != "" {
 		return labelOutcome{Status: skip}
@@ -174,6 +193,7 @@ func simulateLabelHold(bars []datasource.Bar, i int, symbol, name string, horizo
 	// 到期卖出根定位（endOK=false 表示数据未覆盖到期日，障碍扫描到末根后 pending）。
 	end, endOK := 0, false
 	endDeferred := 0
+	forcedEnd := false // 个股退市/长停：到期出场按末根收盘强平
 	if sellDate != "" {
 		if bars[len(bars)-1].TradeDate >= sellDate {
 			end = buyIdx
@@ -184,11 +204,16 @@ func simulateLabelHold(bars []datasource.Bar, i int, symbol, name string, horizo
 			if bars[end].TradeDate != sellDate {
 				endDeferred = 1 // 到期日个股停牌：顺延到复牌首根
 			}
+		} else if marketLastDate != "" && marketLastDate >= sellDate {
+			// 市场已过到期日、个股停更 → 退市/长停：末根收盘强平（无障碍时）。
+			end = len(bars) - 1
+			endOK = true
+			forcedEnd = true
 		} else {
 			end = len(bars) // 未覆盖：障碍扫描扫完已有窗口
 		}
 	} else {
-		end = i + horizon // 到期卖出根（买入日为持有第 1 日）
+		end = i + horizon + 1 // 到期卖出根 = 买入根(i+1) + horizon
 		endOK = end < len(bars)
 		if !endOK {
 			end = len(bars)
@@ -226,6 +251,9 @@ func simulateLabelHold(bars []datasource.Bar, i int, symbol, name string, horizo
 			return out
 		}
 		out.Deferred += endDeferred
+		if forcedEnd {
+			out.Forced = true // 个股退市/长停，末根收盘强平
+		}
 		j := end
 		for j < len(bars) && isOneWordLimitDown(bars[j], bars[j-1], limitPct) {
 			out.Deferred++
@@ -250,6 +278,13 @@ func simulateLabelHold(bars []datasource.Bar, i int, symbol, name string, horizo
 		exitIdx, exitPrice = j, bars[j].Close
 	}
 
+	if exitPrice <= 0 {
+		// 出场根坏数据（停牌/未同步的 0 价）：不伪造成熟收益，返回 pending 等待（与
+		// simEntry 买入侧 Open<=0 判 skip_suspend 对称，出场侧保守取 pending）。
+		out.Status = btPending
+		out.SellDate, out.SellPrice = "", 0
+		return out
+	}
 	sellAmount := exitPrice * qty
 	sellFee, sellTax := tradeFee("cn", model.PaperSideSell, symbol, sellAmount)
 	proceeds := sellAmount - sellFee - sellTax

@@ -80,8 +80,9 @@ func RecShadowReport(userID int64, recType string, horizon int) (*ShadowReport, 
 		return nil, fmt.Errorf("持有期须为 %v 之一", model.LabelHorizons)
 	}
 
-	q := common.DB.Where("user_id = ? AND horizon_days = ? AND entry_mode = ?",
-		userID, horizon, model.EntryModeNextOpen)
+	// label_version 过滤与归因报表同款：新旧执行结算语义（l1 的 T+0 缺陷）不混池。
+	q := common.DB.Where("user_id = ? AND horizon_days = ? AND entry_mode = ? AND label_version = ?",
+		userID, horizon, model.EntryModeNextOpen, labelVersion)
 	if recType == model.RecTypeShortTerm || recType == model.RecTypeLongTerm {
 		q = q.Where("type = ?", recType)
 	}
@@ -178,10 +179,12 @@ func RecShadowReport(userID int64, recType string, horizon int) (*ShadowReport, 
 
 	rep.Notes = append(rep.Notes,
 		"口径：统一执行模拟标签（next_open）；gated 与对照组统一限定 buy（入选类门控），名单阶段被挤出者（相关性/行业）吃影子标签；对照组=未被任何门控标记的入选 buy",
+		"correlation/industry_cap 组的影子侧为无止盈止损的固定持有，对照侧为带障碍的入选 buy，该两组对照同时反映选股与退出策略差异，仅作方向参考",
 		"覆盖率语义：would_rewrite=若强制执行会失去的 buy 数（只计会改写动作的 regime/反方门控；质量门控只封顶置信度恒 0）；picked_buy 为分母",
 		"同一标的命中多个门控时各门控分别归组（事件行 gate_types 全量），样本可在多组重复出现——组间不可加总",
 		"防回归纪律：影子门控转正凭本报表 gated vs ungated 配对评审——覆盖率下降但收益不改善即回退；评价协议须预注册，不允许看完结果再换阈值",
 		fmt.Sprintf("单组成熟样本 <%d 时统计不稳定，仅供方向参考", attributionMinBucket),
+		fmt.Sprintf("仅统计当前执行结算语义（label_version=%s）的标签，旧口径样本不混入", labelVersion),
 	)
 	return rep, nil
 }

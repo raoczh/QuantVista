@@ -115,20 +115,20 @@ func bigramDice(a, b string) float64 {
 	return 2 * float64(inter) / float64(len(ra)-1+len(rb)-1)
 }
 
-// dedupeCheck 进程内两层去重：source:id / title_hash 缓存 + 72h 标题相似度。
-// 返回 true 表示重复应跳过；不重复则登记进缓存。调用方持有锁责任在本函数内。
-func (s *NewsService) dedupeCheck(source, sourceID, title string, at time.Time) bool {
+// dedupeSeen 进程内两层去重判定（source:id / title_hash 缓存 + 72h 标题相似度），
+// **只读不登记**——登记推迟到 insertNews 成功之后（写库失败的条目不占去重名额、
+// 也不推游标，靠轮询重叠窗重试）。顺带剪枝过期标题（读侧幂等）。
+func (s *NewsService) dedupeSeen(source, sourceID, title string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	idKey := source + ":" + sourceID
 	norm := normalizeNewsTitle(title)
-	titleKey := "t:" + norm
 	if _, ok := s.seen[idKey]; ok {
 		return true
 	}
 	if norm != "" {
-		if _, ok := s.seen[titleKey]; ok {
+		if _, ok := s.seen["t:"+norm]; ok {
 			return true
 		}
 	}
@@ -147,11 +147,17 @@ func (s *NewsService) dedupeCheck(source, sourceID, title string, at time.Time) 
 		}
 	}
 	s.titles = kept
-	if dup {
-		return true
-	}
+	return dup
+}
 
-	// 登记。缓存超限砍半（map 迭代序随机，等价随机淘汰）。
+// dedupeRegister 登记进去重缓存（source:id / title_hash / 标题池）。
+// 仅在 insertNews 成功后调用；缓存超限砍半（map 迭代序随机，等价随机淘汰）。
+func (s *NewsService) dedupeRegister(source, sourceID, title string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	idKey := source + ":" + sourceID
+	norm := normalizeNewsTitle(title)
 	if len(s.seen) >= newsSeenCap {
 		drop := len(s.seen) / 2
 		for k := range s.seen {
@@ -164,9 +170,18 @@ func (s *NewsService) dedupeCheck(source, sourceID, title string, at time.Time) 
 	}
 	s.seen[idKey] = struct{}{}
 	if norm != "" {
-		s.seen[titleKey] = struct{}{}
+		s.seen["t:"+norm] = struct{}{}
 		s.titles = append(s.titles, titleEntry{norm: norm, at: at})
 	}
+}
+
+// dedupeCheck 判重并在不重复时立即登记（原子语义）。保留供单测与不区分写库成败的
+// 场景使用；采集链路已改用 dedupeSeen + insertNews 成功后 dedupeRegister。
+func (s *NewsService) dedupeCheck(source, sourceID, title string, at time.Time) bool {
+	if s.dedupeSeen(source, sourceID, title) {
+		return true
+	}
+	s.dedupeRegister(source, sourceID, title, at)
 	return false
 }
 
@@ -208,13 +223,14 @@ func (s *NewsService) collectCls(ctx context.Context) (inserted int) {
 	maxTs := cursor
 	for _, it := range items {
 		ts := it.PublishTime.Unix()
-		if ts > maxTs {
-			maxTs = ts
-		}
 		if cursor > 0 && ts < cursor-300 {
-			continue
+			continue // 重叠窗外：往轮已处理，不参与游标
 		}
-		if s.dedupeCheck(newsSourceCls, it.SourceID, it.Title, it.PublishTime) {
+		if s.dedupeSeen(newsSourceCls, it.SourceID, it.Title) {
+			// 确认重复跳过：算「已处理」，可推进游标。
+			if ts > maxTs {
+				maxTs = ts
+			}
 			continue
 		}
 		content := []rune(it.Content)
@@ -229,8 +245,13 @@ func (s *NewsService) collectCls(ctx context.Context) (inserted int) {
 			SourcePriority: 1, ContentHash: newsContentHash(it.Title, it.Content),
 			ImportantMark: it.Important,
 		}
-		if insertNews(n) {
-			inserted++
+		if !insertNews(n) {
+			continue // 写库失败：不登记去重、不推游标，靠下轮重叠窗重采
+		}
+		s.dedupeRegister(newsSourceCls, it.SourceID, it.Title, it.PublishTime)
+		inserted++
+		if ts > maxTs {
+			maxTs = ts
 		}
 	}
 	if maxTs > cursor {
@@ -250,13 +271,13 @@ func (s *NewsService) collectEMFast(ctx context.Context) (inserted int) {
 	maxTs := cursor
 	for _, it := range items {
 		ts := it.PublishTime.Unix()
-		if ts > maxTs {
-			maxTs = ts
-		}
 		if cursor > 0 && ts < cursor-300 {
-			continue
+			continue // 重叠窗外：往轮已处理，不参与游标
 		}
-		if s.dedupeCheck(newsSourceEM, it.SourceID, it.Title, it.PublishTime) {
+		if s.dedupeSeen(newsSourceEM, it.SourceID, it.Title) {
+			if ts > maxTs {
+				maxTs = ts
+			}
 			continue
 		}
 		n := &model.News{
@@ -266,8 +287,13 @@ func (s *NewsService) collectEMFast(ctx context.Context) (inserted int) {
 			CollectTime: time.Now(), RelatedSymbols: marshalSymbols(it.Symbols),
 			SourcePriority: 2, ContentHash: newsContentHash(it.Title, it.Summary),
 		}
-		if insertNews(n) {
-			inserted++
+		if !insertNews(n) {
+			continue // 写库失败：不登记去重、不推游标，靠下轮重叠窗重采
+		}
+		s.dedupeRegister(newsSourceEM, it.SourceID, it.Title, it.PublishTime)
+		inserted++
+		if ts > maxTs {
+			maxTs = ts
 		}
 	}
 	if maxTs > cursor {
@@ -283,9 +309,12 @@ func (s *NewsService) collectStockNews(ctx context.Context) (inserted int) {
 		return 0
 	}
 	var syms []string
+	// 已平仓持仓不再是「在跟的标的」，排除避免占用 LIMIT 名额挤掉在持/自选股；
+	// 稳定排序保证 LIMIT 截断可复现。
 	common.DB.Raw(`SELECT DISTINCT symbol FROM (
-		SELECT symbol FROM watchlist_items UNION SELECT symbol FROM positions
-	) t LIMIT 50`).Scan(&syms)
+		SELECT symbol FROM watchlist_items
+		UNION SELECT symbol FROM positions WHERE status = 'holding'
+	) t ORDER BY symbol LIMIT 50`).Scan(&syms)
 	for _, sym := range syms {
 		if len(sym) != 6 { // 只做 A 股 6 位代码口径
 			continue
@@ -296,7 +325,7 @@ func (s *NewsService) collectStockNews(ctx context.Context) (inserted int) {
 			return inserted
 		}
 		for _, it := range items {
-			if s.dedupeCheck(newsSourceEM, "stock:"+it.SourceID, it.Title, it.PublishTime) {
+			if s.dedupeSeen(newsSourceEM, "stock:"+it.SourceID, it.Title) {
 				continue
 			}
 			n := &model.News{
@@ -306,9 +335,11 @@ func (s *NewsService) collectStockNews(ctx context.Context) (inserted int) {
 				CollectTime: time.Now(), RelatedSymbols: marshalSymbols(it.Symbols),
 				SourcePriority: 3, ContentHash: newsContentHash(it.Title, it.Summary),
 			}
-			if insertNews(n) {
-				inserted++
+			if !insertNews(n) {
+				continue // 写库失败：不登记去重，下轮重采
 			}
+			s.dedupeRegister(newsSourceEM, "stock:"+it.SourceID, it.Title, it.PublishTime)
+			inserted++
 		}
 		select {
 		case <-ctx.Done():

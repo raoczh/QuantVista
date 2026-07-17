@@ -25,8 +25,9 @@ import (
 //     测试）。手工评分是固定规则无参数可拟合——训练/验证段对 baseline 只是占位，
 //     框架完整性为 S4 模型换入准备（届时训练段拟合、验证段调参、测试段验收）；
 //   - 窗口自适应：目标 24~36 月训练窗（480/90/60），当前全市场地基每股仅约 250 根
-//     日线远不可得——按比例缩窗到实际可得数据并在报告声明（快照/日线积累后自动
-//     趋近目标窗），连最小窗都放不下时 0 折是合法输出；
+//     日线远不可得——按比例缩窗到实际可得数据并在报告声明；**市场轴受基准轴取数上限
+//     benchBarLimit(250) 封顶，不随 daily_bars 增长而自动趋近目标窗**，放宽需同时上调
+//     取数上限，连最小窗都放不下时 0 折是合法输出；
 //   - 评分复刻（A 类第一版，§5 S3-3b 分层）：五维分（尾 90 根）+ 策略加分 + 低位
 //     高换手扣分 + 系统级换手排除（>30% 硬拦、20~30% 高位死亡换手），与 scorePool
 //     同款；C 类数据（估值/情绪/龙虎榜/人气/资金流/盘中/财务）无法可靠回填——相关
@@ -67,8 +68,9 @@ const (
 	wfMonthlyMonths = 12
 )
 
-// wfShortHolds / wfLongHolds 各段评估持有期。长线 60 日：purge=60 时 250 根历史
-// 连最小窗都放不下（60+2×65+15+15>250），等日线/快照积累后再加入，报告声明。
+// wfShortHolds / wfLongHolds 各段评估持有期。长线 60 日未纳入（硬编码 {20}）：purge=60
+// 时 250 根历史连最小窗都放不下（60+2×65+15+15>250），且市场轴受基准取数上限 250 封顶
+// 不随日线增长——需数据积累且**上调基准轴取数上限后手动加入** wfLongHolds，报告声明。
 var (
 	wfShortHolds = []int{5, 10}
 	wfLongHolds  = []int{20}
@@ -321,8 +323,9 @@ func wfScoreStock(symbol, name string, sub []datasource.Bar, defs []wfStrategyDe
 type WFMetric struct {
 	Signals int `json:"signals"` // 参与的信号日数
 	Picked  int `json:"picked"`  // Top-K 名额总数（signals×K 上限）
-	Trades  int `json:"trades"`  // 实际成交样本数
+	Trades  int `json:"trades"`  // 实际成交样本数（不含 Forced）
 	Skipped int `json:"skipped"` // 防御计数：Top-K 已限定可成交机会集，正常恒 0
+	Forced  int `json:"forced"`  // 退市/长停末根强平：收益不可靠，不进 Precision/收益主统计
 	Pending int `json:"pending"` // 持有期未走完（月度走查近月的常态）
 
 	PrecisionNetPct float64 `json:"precision_net_pct"` // net>0 占比（Precision_net@K）
@@ -422,6 +425,7 @@ func CachedWalkForwardReport() *WalkForwardReport {
 type wfHoldRes struct {
 	status   string
 	netPct   float64
+	forced   bool
 	buyDate  string
 	sellDate string
 }
@@ -451,9 +455,12 @@ type wfSection struct {
 
 func buildWFSection(recType string, holds []int, axisLen int) wfSection {
 	sec := wfSection{recType: recType, holds: holds, maxHold: holds[len(holds)-1]}
-	// 信号日 i 的到期卖出根为 i+maxHold（须 ≤ 轴末）→ 可用信号位 axisLen−maxHold
-	//（恰好能走完最长持有期的最后一个信号日也参与）。
-	sec.eligible = axisLen - sec.maxHold
+	// 信号日 i 的卖出根 = 买入根(i+1)+maxHold = i+maxHold+1（须 ≤ 轴末）→ 可用信号位
+	// axisLen−maxHold−1（恰好能走完最长持有期的最后一个信号日也参与）。
+	sec.eligible = axisLen - sec.maxHold - 1
+	if sec.eligible < 1 {
+		sec.eligible = 0
+	}
 	if sec.eligible < 1 {
 		sec.eligible = 0
 	}
@@ -490,6 +497,7 @@ func RunWalkForward(ctx context.Context, market *MarketService) (*WalkForwardRep
 	if len(axis) < wfMinTrain {
 		return nil, errors.New("交易日轴数据不足，无法评估")
 	}
+	marketLast := axis[len(axis)-1] // 市场轴末日：区分个股退市/长停与真未成熟
 
 	// 两段切分（短线/长线各自 purge）+ 月度走查信号日（每月首个交易日，两段共用）。
 	sections := []wfSection{
@@ -604,11 +612,11 @@ func RunWalkForward(ctx context.Context, market *MarketService) (*WalkForwardRep
 					holds := make([]wfHoldRes, len(allHolds))
 					for hi, hd := range allHolds {
 						sellDate := labelFarFuture // 到期日在轴外（未来）：必 pending
-						if sigIdx+hd < len(axis) {
-							sellDate = axis[sigIdx+hd] // 市场轴到期日：停牌不拉长持有跨度
+						if sigIdx+hd+1 < len(axis) {
+							sellDate = axis[sigIdx+hd+1] // 卖出根=买入根(sigIdx+1)+hd；停牌不拉长持有跨度
 						}
-						o := simulateHold(j.bars, i, j.symbol, meta.Name, hd, wfPerCap, nextDate, sellDate)
-						holds[hi] = wfHoldRes{status: o.Status, netPct: o.ReturnPct,
+						o := simulateHold(j.bars, i, j.symbol, meta.Name, hd, wfPerCap, nextDate, sellDate, marketLast)
+						holds[hi] = wfHoldRes{status: o.Status, netPct: o.ReturnPct, forced: o.Forced,
 							buyDate: o.BuyDate, sellDate: o.SellDate}
 					}
 					obsCh <- &wfObs{sigIdx: sigIdx, symbol: j.symbol, name: meta.Name,
@@ -701,6 +709,10 @@ func RunWalkForward(ctx context.Context, market *MarketService) (*WalkForwardRep
 				r := o.holds[hi]
 				switch r.status {
 				case btTraded:
+					if r.forced {
+						m.Forced++ // 退市/长停末根强平：不进 Trades/Precision/收益主统计
+						continue
+					}
 					m.Trades++
 					nets = append(nets, r.netPct)
 					if r.netPct < wfSevereLoss {
@@ -762,16 +774,16 @@ func RunWalkForward(ctx context.Context, market *MarketService) (*WalkForwardRep
 		}
 		switch {
 		case !sec.specOK:
-			view.SpecNote = fmt.Sprintf("历史数据不足（可用信号位 %d 个，最小窗需 %d 个），本段 0 折——等日线/快照积累后自动可用",
+			view.SpecNote = fmt.Sprintf("历史数据不足（可用信号位 %d 个，最小窗需 %d 个），本段 0 折——受基准轴取数上限 250 限制，放宽需同时上调取数上限",
 				sec.eligible, wfMinTrain+wfMinVal+wfMinTest+2*(sec.maxHold+wfEmbargoDays))
 		case sec.adapted:
-			view.SpecNote = fmt.Sprintf("窗口已按实际数据缩放（目标 24~36 月训练窗需 %d 个信号位，当前可用 %d 个）；测试段只用于最终验收",
+			view.SpecNote = fmt.Sprintf("窗口已按实际数据缩放（目标 24~36 月训练窗需 %d 个信号位，当前可用 %d 个，受基准轴取数上限 250 封顶不随日线增长）；测试段只用于最终验收",
 				view.TargetSpec.need(), sec.eligible)
 		default:
 			view.SpecNote = "已达目标窗口（24~36 月训练窗）"
 		}
 		if sec.recType == model.RecTypeLongTerm {
-			view.SpecNote += "；60 日持有期在当前历史下连一折都切不出，等数据积累后加入"
+			view.SpecNote += "；60 日持有期需数据积累且上调基准轴取数上限后手动加入 wfLongHolds"
 		}
 		for fi, f := range sec.folds {
 			view.Folds = append(view.Folds, WFFoldView{

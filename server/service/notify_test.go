@@ -162,6 +162,56 @@ func TestNotifyNtfyChannel(t *testing.T) {
 	}
 }
 
+// TestNotifyChannelSwitchKind 换通道类型时必须重填 target（#4）：旧密文是旧类型的地址，
+// 留空会被当新类型解析。kind 不变留空保留旧密文的既有语义不动。
+func TestNotifyChannelSwitchKind(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Exec("DELETE FROM notify_channels")
+	common.EncryptionKey = "test-encryption-key-1234567890"
+	svc := &NotifyService{}
+
+	v, err := svc.Create(1, NotifyChannelInput{Kind: model.NotifyKindWebhook, Target: "https://hook.example.com/old", Enabled: true})
+	if err != nil {
+		t.Fatalf("创建 webhook 失败: %v", err)
+	}
+
+	// 换 kind 到 ntfy 但 target 留空 → 报错。
+	if _, err := svc.Update(1, v.ID, NotifyChannelInput{Kind: model.NotifyKindNtfy, Enabled: true}); err == nil {
+		t.Fatal("切换类型且留空 target 应报错")
+	}
+	// 报错路径不应改动旧密文。
+	var raw model.NotifyChannel
+	common.DB.First(&raw, v.ID)
+	if raw.Kind != model.NotifyKindWebhook {
+		t.Fatalf("报错后 kind 不应变动，得到 %s", raw.Kind)
+	}
+	if dec, _ := common.Decrypt(raw.TargetCipher); dec != "https://hook.example.com/old" {
+		t.Fatalf("报错路径不应改动旧密文，得到 %q", dec)
+	}
+
+	// 带新 target 换 kind → 成功且落新密文。
+	newTgt := `{"url":"https://ntfy.example.com","topic":"qv-u1"}`
+	if _, err := svc.Update(1, v.ID, NotifyChannelInput{Kind: model.NotifyKindNtfy, Target: newTgt, Enabled: true}); err != nil {
+		t.Fatalf("带新 target 切换应成功: %v", err)
+	}
+	common.DB.First(&raw, v.ID)
+	if raw.Kind != model.NotifyKindNtfy {
+		t.Fatalf("kind 应更新为 ntfy，得到 %s", raw.Kind)
+	}
+	if dec, _ := common.Decrypt(raw.TargetCipher); dec != newTgt {
+		t.Fatalf("应落新密文，得到 %q", dec)
+	}
+
+	// kind 不变留空 target → 保留旧密文（零回归）。
+	if _, err := svc.Update(1, v.ID, NotifyChannelInput{Kind: model.NotifyKindNtfy, Name: "手机", Enabled: false}); err != nil {
+		t.Fatalf("同 kind 留空更新应成功: %v", err)
+	}
+	common.DB.First(&raw, v.ID)
+	if dec, _ := common.Decrypt(raw.TargetCipher); dec != newTgt {
+		t.Fatalf("同 kind 留空应保留密文，得到 %q", dec)
+	}
+}
+
 // TestParseNtfyTarget 解析规范化：url 尾斜杠去除、字段 trim。
 func TestParseNtfyTarget(t *testing.T) {
 	tgt, err := parseNtfyTarget(`{"url":" https://ntfy.example.com/ ","topic":" qv-u1 ","token":" tk_x "}`)

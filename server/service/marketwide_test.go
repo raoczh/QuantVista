@@ -1,4 +1,4 @@
-﻿package service
+package service
 
 import (
 	"context"
@@ -519,5 +519,34 @@ func TestInitMarketWideHistoryScatteredNetFail(t *testing.T) {
 	}
 	if st := stateOf(t, "600022"); st.InitStatus != "pending" || st.FailCount != 1 {
 		t.Fatalf("零散网络失败应记一次尝试并保持 pending: %+v", st)
+	}
+}
+
+// 落库失败不标 done：拉取成功但 persistDailyBars 落库失败（daily_bars 表缺失模拟 DB 故障）
+// 时，必须走 recordFail 保持 pending，不能标 done 留永久缺口。
+func TestInitMarketWideHistoryPersistFailNotDone(t *testing.T) {
+	setupTestDB(t)
+	cleanWideTables(t)
+	end := time.Date(2026, 7, 7, 0, 0, 0, 0, time.Local)
+	dates := wideGenDates(250, end)
+	common.DB.Create(&model.MarketSyncState{Symbol: "600055", Market: "cn", InitStatus: "pending"})
+	fake := &fakeWideSource{bars: map[string][]datasource.Bar{"600055": wideGenBars(dates, 8.0)}}
+	svc := &MarketService{wide: fake}
+
+	// 删掉 daily_bars 表 → persistDailyBars 的 upsert 必失败（返回 error）。
+	if err := common.DB.Migrator().DropTable(&model.DailyBar{}); err != nil {
+		t.Fatalf("drop daily_bars: %v", err)
+	}
+	t.Cleanup(func() { common.DB.AutoMigrate(&model.DailyBar{}) })
+
+	log, err := svc.initMarketWideHistory(context.Background())
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if log.Succeeded != 0 || log.Failed != 1 {
+		t.Fatalf("落库失败应记失败不记成功: log = %d/%d, want 0/1", log.Succeeded, log.Failed)
+	}
+	if st := stateOf(t, "600055"); st.InitStatus != "pending" || st.FailCount != 1 {
+		t.Fatalf("落库失败不应标 done，应保持 pending 计一次尝试: %+v", st)
 	}
 }

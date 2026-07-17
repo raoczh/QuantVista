@@ -74,6 +74,15 @@ function resetForm() {
   editingId.value = null
   form.value = { symbol: '', kind: '', title: '', content: '' }
 }
+// 顶部按钮切换：收起时无条件清空编辑态，再点开即为新建，不会残留上次的“保存修改”态。
+function toggleForm() {
+  if (showForm.value) {
+    showForm.value = false
+    resetForm()
+  } else {
+    showForm.value = true
+  }
+}
 function editNote(n: ResearchNote) {
   editingId.value = n.id
   form.value = { symbol: n.symbol, kind: n.kind, title: n.title, content: n.content }
@@ -149,7 +158,7 @@ onMounted(() => {
             <n-input v-model:value="filterSymbol" size="small" placeholder="按代码筛选" style="width: 130px" clearable @keyup.enter="load" @clear="load()" />
             <n-input v-model:value="keyword" size="small" placeholder="搜标题/内容" style="width: 150px" clearable @keyup.enter="load" @clear="load()" />
             <n-button size="small" secondary @click="load">筛选</n-button>
-            <n-button size="small" type="primary" @click="showForm = !showForm; if (showForm && !editingId) resetForm()">
+            <n-button size="small" type="primary" @click="toggleForm">
               {{ showForm ? '收起' : '＋ 记一笔' }}
             </n-button>
           </div>

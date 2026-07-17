@@ -116,6 +116,10 @@ func (s *ThesisService) SetStatus(userID, id int64, status, reason string) (*mod
 	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&card).Error; err != nil {
 		return nil, errors.New("逻辑卡不存在")
 	}
+	// 作废（invalidated）必须带失效原因：逻辑卡的价值在于「为何不再成立」的留痕，空原因等于丢失复盘依据。
+	if status == model.ThesisStatusInvalidated && strings.TrimSpace(reason) == "" {
+		return nil, errors.New("作废逻辑卡需填写失效原因")
+	}
 	card.Status = status
 	if status == model.ThesisStatusInvalidated {
 		card.InvalidReason = strings.TrimSpace(reason)

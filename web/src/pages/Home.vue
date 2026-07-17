@@ -50,7 +50,7 @@ async function loadOverview(silent = false) {
 }
 
 // ---------- 我的概览：仓位 / 待办 / 自选 / 推荐，一屏知全局 ----------
-const minePos = ref<{ pnl: number; pct: number; n: number } | null>(null)
+const minePos = ref<{ pnl: number; pct: number; n: number; priced: number } | null>(null)
 const mineTodo = ref<TodoResult | null>(null)
 const mineWatch = ref<{ up: number; down: number; total: number } | null>(null)
 const mineRec = ref<RecommendationBatch | null>(null)
@@ -66,15 +66,18 @@ async function loadMine() {
   if (pos.status === 'fulfilled') {
     let cost = 0
     let pnl = 0
-    let n = 0
+    let n = 0 // 持仓总笔数（不依赖行情，用于判断是否真的“暂无持仓”）
+    let priced = 0 // 其中行情可用、能计入盈亏的笔数
     for (const p of pos.value) {
-      if (p.status === 'holding' && p.quote_ok) {
+      if (p.status !== 'holding') continue
+      n++
+      if (p.quote_ok) {
         cost += p.cost
         pnl += p.profit_amount
-        n++
+        priced++
       }
     }
-    minePos.value = { pnl, pct: cost > 0 ? (pnl / cost) * 100 : 0, n }
+    minePos.value = { pnl, pct: cost > 0 ? (pnl / cost) * 100 : 0, n, priced }
   }
   if (todos.status === 'fulfilled') mineTodo.value = todos.value
   if (wl.status === 'fulfilled') {
@@ -279,13 +282,13 @@ function onResize() {
             <div class="mc-label">持仓浮动盈亏</div>
             <div
               class="mc-value qv-figure"
-              :style="minePos && minePos.n ? { color: pctColor(minePos.pnl) } : undefined"
+              :style="minePos && minePos.priced ? { color: pctColor(minePos.pnl) } : undefined"
             >
-              {{ minePos ? (minePos.n ? fmtSigned(minePos.pnl) : '暂无持仓') : '—' }}
+              {{ minePos ? (minePos.n ? (minePos.priced ? fmtSigned(minePos.pnl) : '—') : '暂无持仓') : '—' }}
             </div>
             <div class="mc-sub">
               <template v-if="minePos && minePos.n">
-                <ChangeTag :value="minePos.pct" size="small" />
+                <ChangeTag v-if="minePos.priced" :value="minePos.pct" size="small" />
                 <span>{{ minePos.n }} 笔持仓</span>
               </template>
               <span v-else>记一笔 →</span>

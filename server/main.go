@@ -62,6 +62,10 @@ func main() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	engine := gin.New()
+	// multipart 表单最多进内存的字节数（超出落临时盘）。默认 32MiB 偏大——本项目唯一
+	// 上传是持仓 CSV 导入（service 侧 importMaxSize=1MiB），压到 2MiB 足够且省内存；
+	// controller 侧另用 MaxBytesReader 对整包封顶做硬限流。
+	engine.MaxMultipartMemory = 2 << 20
 	// 反代（宝塔/nginx）场景通过 TRUSTED_PROXIES 显式声明可信代理；
 	// 默认不信任任何代理头，避免伪造 X-Forwarded-For 绕过按 IP 的限流。
 	if err := engine.SetTrustedProxies(common.TrustedProxies); err != nil {

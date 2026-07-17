@@ -583,7 +583,12 @@ loop:
 			default:
 				flushSrcFails()
 				srcFailStreak = 0
-				s.persistDailyBars("cn", st.Symbol, bars) // 内部含除权检测：有旧基准数据时自动全量重锚
+				// 落库失败不标 done：否则该股永久缺口（宽表/因子/回测都读不到）。
+				// 保持 pending，走 recordFail 计一次尝试，下一轮 job/手动重试。
+				if perr := s.persistDailyBars("cn", st.Symbol, bars); perr != nil { // 内部含除权检测：有旧基准数据时自动全量重锚
+					recordFail(st, perr.Error())
+					break
+				}
 				last := bars[len(bars)-1]
 				common.DB.Model(st).Updates(map[string]any{
 					"init_status": "done", "fail_count": 0, "last_error": "",

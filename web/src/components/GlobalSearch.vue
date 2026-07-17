@@ -49,17 +49,22 @@ function onKeydown(e: KeyboardEvent) {
 onMounted(() => window.addEventListener('keydown', onKeydown))
 onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
+let searchSeq = 0
 async function search() {
   const code = keyword.value.trim()
   if (!code) return
+  const mySeq = ++searchSeq
   loading.value = true
   quote.value = null
   try {
-    quote.value = await getQuote('cn', code)
+    const q = await getQuote('cn', code)
+    if (mySeq !== searchSeq) return
+    quote.value = q
   } catch (e) {
+    if (mySeq !== searchSeq) return
     message.error((e as Error).message)
   } finally {
-    loading.value = false
+    if (mySeq === searchSeq) loading.value = false
   }
 }
 

@@ -23,6 +23,13 @@ const factorSnapshotVersion = "fv1"
 // 前复权重锚会整股重写，覆盖=把重写后的值伪装成当时快照，PIT 泄漏）；同一 trade_date
 // 只**补缺失的 symbol**：分批历史初始化会让首批先落一部分快照，后续批次补齐的股票
 // 若被「首写胜整日跳过」将永久缺席，形成不完整的全市场快照。返回本次实际落库行数。
+//
+// 落库门槛：只落 market_sync_states.init_status=done 的 symbol。首次部署当天
+// SyncMarketWide 先给每股落 1 根当日 bar → rebuild → 此时全股仅 1 根短史、因子几乎全
+// NaN，若当场落快照会因「同日已有行不可覆盖」把这份低质量快照永久冻结；历史初始化补齐
+// 250 根后再 rebuild 也补不进去。故只固化历史已初始化完成（done）的 symbol，pending 股
+// 待其 init done 后由后续 rebuild 的「补缺失 symbol」逻辑自然补上（IPO 新股 init done
+// 后天然短史，属可接受的缺席）。
 func SnapshotFactorTable(t *FactorTable) (int, error) {
 	if common.DB == nil {
 		return 0, errors.New("数据库不可用")
@@ -40,10 +47,24 @@ func SnapshotFactorTable(t *FactorTable) (int, error) {
 		seen[s] = true
 	}
 
+	// 只固化历史初始化完成的 symbol（一次查询建 set）。
+	var doneSyms []string
+	if err := common.DB.Model(&model.MarketSyncState{}).
+		Where("market = ? AND init_status = ?", "cn", "done").Pluck("symbol", &doneSyms).Error; err != nil {
+		return 0, err
+	}
+	initDone := make(map[string]bool, len(doneSyms))
+	for _, s := range doneSyms {
+		initDone[s] = true
+	}
+
 	rows := make([]model.FactorSnapshotDaily, 0, t.Len())
 	for i := 0; i < t.Len(); i++ {
 		if seen[t.Symbols[i]] {
 			continue // 不可变：已有行不覆盖（值已变也不覆盖）
+		}
+		if !initDone[t.Symbols[i]] {
+			continue // 历史未初始化完成：短史低质量因子不冻结，待 done 后由后续 rebuild 补上
 		}
 		vals := make(map[string]float64, len(factorDefs))
 		for _, d := range factorDefs {

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,21 +32,22 @@ func flatBars(n int, price float64) []datasource.Bar {
 // ---------- simulateHold 五件套 ----------
 
 // TestSimulateHoldNormalWithFee 正常成交：收益必须与 tradeFee 手算严格对齐。
-// 信号日收盘 10，次日开盘 10.10 买入（涨 1% 非一字板），第 5 日收盘 11.00 卖出。
+// 信号日收盘 10，次日开盘 10.10 买入（涨 1% 非一字板）；持有 5 交易日=卖出根=买入根
+// (bars[1])+5=bars[6]，收盘 11.00 卖出。
 // qty=floor(20000/1010)×100=1900；买 19190+5=19195；卖 20900−5.23−10.45=20884.32；
 // ret=(20884.32−19195)/19195=8.80%。
 func TestSimulateHoldNormalWithFee(t *testing.T) {
 	bars := flatBars(10, 10)
 	bars[1].Open = 10.10
-	bars[5].Close = 11.00
-	o := simulateHold(bars, 0, "600001", "普通股", 5, 20000, bars[1].TradeDate, "")
+	bars[6].Close = 11.00 // 卖出根=买入根(bars[1])+5=bars[6]
+	o := simulateHold(bars, 0, "600001", "普通股", 5, 20000, bars[1].TradeDate, "", "")
 	if o.Status != btTraded {
 		t.Fatalf("期望成交，得到 %s", o.Status)
 	}
 	if o.BuyPrice != 10.10 || o.SellPrice != 11.00 {
 		t.Fatalf("买卖价错误: buy=%v sell=%v", o.BuyPrice, o.SellPrice)
 	}
-	if o.BuyDate != bars[1].TradeDate || o.SellDate != bars[5].TradeDate {
+	if o.BuyDate != bars[1].TradeDate || o.SellDate != bars[6].TradeDate {
 		t.Fatalf("买卖日错误: %s → %s", o.BuyDate, o.SellDate)
 	}
 	if math.Abs(o.ReturnPct-8.8) > 0.01 {
@@ -70,7 +72,7 @@ func TestSimulateHoldLimitUpSkip(t *testing.T) {
 	for _, c := range cases {
 		bars := flatBars(10, 10)
 		bars[1].Open = round2(10 * (1 + c.openPct/100))
-		o := simulateHold(bars, 0, c.symbol, c.name, 5, 20000, bars[1].TradeDate, "")
+		o := simulateHold(bars, 0, c.symbol, c.name, 5, 20000, bars[1].TradeDate, "", "")
 		if o.Status != c.want {
 			t.Errorf("%s %s 开盘+%v%%: 期望 %s 得到 %s", c.symbol, c.name, c.openPct, c.want, o.Status)
 		}
@@ -80,32 +82,32 @@ func TestSimulateHoldLimitUpSkip(t *testing.T) {
 // TestSimulateHoldDeferSell 跌停顺延：卖出日一字跌停卖不出顺延重试；
 // 顺延到数据末尾仍一字跌停按末根收盘强平并标 forced。
 func TestSimulateHoldDeferSell(t *testing.T) {
-	// bars[2] 为卖出目标日（hold=2），设为一字跌停（10 → 9.0，high==low）。
+	// 卖出根=买入根(bars[1])+2=bars[3]，设为一字跌停（10→9.0，high==low）。
 	bars := flatBars(6, 10)
-	bars[2].Open, bars[2].High, bars[2].Low, bars[2].Close = 9, 9, 9, 9
-	bars[3].Close = 8.8 // 顺延日正常波动可卖
-	bars[3].High, bars[3].Low = 8.9, 8.7
-	o := simulateHold(bars, 0, "600001", "普通股", 2, 20000, bars[1].TradeDate, "")
+	bars[3].Open, bars[3].High, bars[3].Low, bars[3].Close = 9, 9, 9, 9
+	bars[4].Close = 8.8 // 顺延日正常波动可卖
+	bars[4].High, bars[4].Low = 8.9, 8.7
+	o := simulateHold(bars, 0, "600001", "普通股", 2, 20000, bars[1].TradeDate, "", "")
 	if o.Status != btTraded || o.Deferred != 1 || o.Forced {
 		t.Fatalf("期望顺延 1 次成交: %+v", o)
 	}
-	if o.SellDate != bars[3].TradeDate || o.SellPrice != 8.8 {
-		t.Fatalf("顺延后应在 bars[3] 收盘卖出: %+v", o)
+	if o.SellDate != bars[4].TradeDate || o.SellPrice != 8.8 {
+		t.Fatalf("顺延后应在 bars[4] 收盘卖出: %+v", o)
 	}
 
-	// 从卖出日到末尾全为一字跌停 → 末根强平。
-	bars2 := flatBars(5, 10)
+	// 从卖出根(bars[3])到末尾全为一字跌停 → 末根强平。
+	bars2 := flatBars(6, 10)
 	p := 10.0
-	for i := 2; i < 5; i++ { // 每日一字跌停 10%
+	for i := 3; i < 6; i++ { // bars[3]/[4]/[5] 每日一字跌停 10%
 		p = round2(p * 0.9)
 		bars2[i].Open, bars2[i].High, bars2[i].Low, bars2[i].Close = p, p, p, p
 	}
-	o2 := simulateHold(bars2, 0, "600001", "普通股", 2, 20000, bars2[1].TradeDate, "")
-	// j=2/3/4 三根均一字跌停各顺延一次，越界后按末根收盘强平。
+	o2 := simulateHold(bars2, 0, "600001", "普通股", 2, 20000, bars2[1].TradeDate, "", "")
+	// j=3/4/5 三根均一字跌停各顺延一次，越界后按末根收盘强平。
 	if o2.Status != btTraded || !o2.Forced || o2.Deferred != 3 {
 		t.Fatalf("期望顺延 3 次后末根强平: %+v", o2)
 	}
-	if o2.SellDate != bars2[4].TradeDate {
+	if o2.SellDate != bars2[5].TradeDate {
 		t.Fatalf("强平应在末根: %+v", o2)
 	}
 }
@@ -114,13 +116,13 @@ func TestSimulateHoldDeferSell(t *testing.T) {
 func TestSimulateHoldLotAndCash(t *testing.T) {
 	// 股价 199：20000/(199×100)=1.005 → 100 股。
 	bars := flatBars(10, 199)
-	o := simulateHold(bars, 0, "600001", "普通股", 5, 20000, bars[1].TradeDate, "")
+	o := simulateHold(bars, 0, "600001", "普通股", 5, 20000, bars[1].TradeDate, "", "")
 	if o.Status != btTraded {
 		t.Fatalf("199 元股 2 万拨款应能买一手: %+v", o)
 	}
 	// 股价 201：20000/(201×100)<1 → 一手都买不起。
 	bars2 := flatBars(10, 201)
-	o2 := simulateHold(bars2, 0, "600001", "普通股", 5, 20000, bars2[1].TradeDate, "")
+	o2 := simulateHold(bars2, 0, "600001", "普通股", 5, 20000, bars2[1].TradeDate, "", "")
 	if o2.Status != btSkipCash {
 		t.Fatalf("201 元股 2 万拨款应 skip_cash: %+v", o2)
 	}
@@ -130,17 +132,17 @@ func TestSimulateHoldLotAndCash(t *testing.T) {
 func TestSimulateHoldSuspendAndPending(t *testing.T) {
 	// 次日停牌：个股缺市场次日 bar（nextDate 与 bars[i+1] 不符）。
 	bars := flatBars(10, 10)
-	o := simulateHold(bars, 0, "600001", "普通股", 5, 20000, "2024-12-31", "")
+	o := simulateHold(bars, 0, "600001", "普通股", 5, 20000, "2024-12-31", "", "")
 	if o.Status != btSkipSuspend {
 		t.Fatalf("次日日期不符应 skip_suspend: %+v", o)
 	}
 	// 信号日就是末根 → 次日数据未到（当晚结算的新标签）：pending 等待，不是停牌。
-	o2 := simulateHold(bars, len(bars)-1, "600001", "普通股", 5, 20000, "", "")
+	o2 := simulateHold(bars, len(bars)-1, "600001", "普通股", 5, 20000, "", "", "")
 	if o2.Status != btPending {
 		t.Fatalf("末根信号数据未到应 pending: %+v", o2)
 	}
 	// 买入后数据不足持有期 → pending。
-	o3 := simulateHold(bars, 7, "600001", "普通股", 5, 20000, bars[8].TradeDate, "")
+	o3 := simulateHold(bars, 7, "600001", "普通股", 5, 20000, bars[8].TradeDate, "", "")
 	if o3.Status != btPending {
 		t.Fatalf("持有期未走完应 pending: %+v", o3)
 	}
@@ -160,24 +162,31 @@ func TestSimulateHoldMarketAxisSellDate(t *testing.T) {
 		bars = append(bars, b)
 	}
 	// bars: 下标 0,1,5,6,7,8,9（原日期）。信号=0，hold=5 → 市场到期日=full[5].TradeDate。
-	o := simulateHold(bars, 0, "600001", "普通股", 5, 20000, full[1].TradeDate, full[5].TradeDate)
+	o := simulateHold(bars, 0, "600001", "普通股", 5, 20000, full[1].TradeDate, full[5].TradeDate, "")
 	if o.Status != btTraded || o.SellDate != full[5].TradeDate {
 		t.Fatalf("市场轴口径应在 %s 卖出（停牌不顺延持有天数）: %+v", full[5].TradeDate, o)
 	}
-	// 旧格子口径对照：第 5 根个股 K 线是 full[8]——持有跨度被停牌拉长（这正是要修的）。
-	oLegacy := simulateHold(bars, 0, "600001", "普通股", 5, 20000, full[1].TradeDate, "")
-	if oLegacy.SellDate != full[8].TradeDate {
-		t.Fatalf("旧格子口径应顺延到 %s: %+v", full[8].TradeDate, oLegacy)
+	// 旧格子口径对照：卖出根=买入根(bars[1])+5=bars 第 6 根=full[9]——持有跨度被停牌
+	// 拉长（这正是市场轴口径要修的）。
+	oLegacy := simulateHold(bars, 0, "600001", "普通股", 5, 20000, full[1].TradeDate, "", "")
+	if oLegacy.SellDate != full[9].TradeDate {
+		t.Fatalf("旧格子口径应顺延到 %s: %+v", full[9].TradeDate, oLegacy)
 	}
 	// 到期日恰逢个股停牌：顺延复牌首根收盘卖出并记 Deferred。
-	o2 := simulateHold(bars, 0, "600001", "普通股", 2, 20000, full[1].TradeDate, full[2].TradeDate)
+	o2 := simulateHold(bars, 0, "600001", "普通股", 2, 20000, full[1].TradeDate, full[2].TradeDate, "")
 	if o2.Status != btTraded || o2.SellDate != full[5].TradeDate || o2.Deferred != 1 {
 		t.Fatalf("到期日停牌应顺延到复牌首根 %s 且 Deferred=1: %+v", full[5].TradeDate, o2)
 	}
-	// 到期日在数据末尾之后 → pending。
-	o3 := simulateHold(bars, 0, "600001", "普通股", 5, 20000, full[1].TradeDate, "2025-02-01")
+	// 到期日在数据末尾之后、市场轴也未到 → 真未成熟 pending。
+	o3 := simulateHold(bars, 0, "600001", "普通股", 5, 20000, full[1].TradeDate, "2025-02-01", "")
 	if o3.Status != btPending {
 		t.Fatalf("到期日未到应 pending: %+v", o3)
+	}
+	// 市场轴已过到期日但个股末根更早（退市/长停）：按末根收盘强平计成交（不静默 pending
+	// 让坏结局的高分股虚高 Precision）。
+	o4 := simulateHold(bars, 0, "600001", "普通股", 5, 20000, full[1].TradeDate, "2025-02-01", "2025-02-01")
+	if o4.Status != btTraded || !o4.Forced || o4.SellDate != full[9].TradeDate {
+		t.Fatalf("市场已过到期日、个股停更应末根强平: %+v", o4)
 	}
 }
 
@@ -299,14 +308,14 @@ func TestSampleSignalDates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// eligible=35（尾部留 maxHold=5——信号日 i 需 i+5 ≤ 轴末），窗口=axis[25:35]，
-	// 等距 3 个=25/30/34。
-	want := []string{axis[25], axis[30], axis[34]}
+	// eligible=34（尾部留 maxHold+1=6——信号日 i 的卖出根 i+maxHold+1 须 ≤ 轴末），
+	// 窗口=axis[24:34]，等距 3 个：round(k×4.5) → 0/5/9 → 24/29/33。
+	want := []string{axis[24], axis[29], axis[33]}
 	if len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
 		t.Fatalf("采样错误: got %v want %v", got, want)
 	}
-	// 最晚信号日后必须恰有 maxHold 个轴日（i+maxHold 恰为轴末——边界日不再少算）。
-	if got[2] != axis[len(axis)-1-5] {
+	// 最晚信号日的卖出根 i+maxHold+1 恰为轴末（边界日不再少算）。
+	if got[2] != axis[len(axis)-2-5] {
 		t.Fatalf("右边界收缩错误: %v", got[2])
 	}
 	// 数据不足报错。
@@ -421,6 +430,102 @@ func TestBacktestRunEndToEnd(t *testing.T) {
 	}
 	if len(st.BestTrades) != 2 || st.BestTrades[0].Symbol != "600001" {
 		t.Fatalf("样本明细缺失: %+v", st.BestTrades)
+	}
+}
+
+// TestBacktestSTAsOf #8①：ST 按宇宙快照 as-of 各信号日判定——当前名称已戴 ST 帽但
+// 早期信号日 as-of 健康的股票，其健康期信号日不被整只剔除（防幸存者偏差）；始终 ST
+// 的股票仍整只剔除。对照旧口径（按当前名称整只剔）：本用例的「后来才 ST」股会被误剔、
+// StSkipped 会是 2、健康期零成交。
+func TestBacktestSTAsOf(t *testing.T) {
+	setupTestDB(t)
+	for _, tbl := range []string{"daily_bars", "market_sync_states", "stock_universe_dailies",
+		"recommendation_batches", "recommendations", "trading_calendars"} {
+		common.DB.Exec("DELETE FROM " + tbl)
+	}
+	t.Cleanup(func() {
+		for _, tbl := range []string{"daily_bars", "market_sync_states", "stock_universe_dailies",
+			"recommendation_batches", "recommendations", "trading_calendars"} {
+			common.DB.Exec("DELETE FROM " + tbl)
+		}
+	})
+
+	bars := flatBars(40, 10) // 恒 10 元，40 根；命中 close>5
+	var axis []string
+	for _, b := range bars {
+		axis = append(axis, b.TradeDate)
+	}
+	// 信号日采样与 Run 内一致：LookbackDays=10/SignalCount=2/maxHold=2 → axis[27]、axis[36]。
+	sig, err := sampleSignalDates(axis, 10, 2, 2)
+	if err != nil || len(sig) != 2 {
+		t.Fatalf("信号日采样异常: %v %v", sig, err)
+	}
+	earlyDate, lateDate := sig[0], sig[1]
+
+	// 两只股：600008 始终 ST；600009 当前名称戴 ST 帽但 as-of 早信号日健康、晚信号日才 ST。
+	stocks := []struct {
+		symbol, name        string
+		stEarly, stLate     bool
+	}{
+		{"600008", "ST老树", true, true},   // 全程 ST → 整只剔除
+		{"600009", "ST科技", false, true},  // 后来才 ST → 健康期信号日不得剔除
+	}
+	for _, s := range stocks {
+		for _, b := range bars {
+			row := model.DailyBar{Symbol: s.symbol, Market: "cn", TradeDate: b.TradeDate,
+				Open: b.Open, High: b.High, Low: b.Low, Close: b.Close,
+				Volume: b.Volume, Amount: b.Amount, TurnoverRate: b.TurnoverRate, Source: "eastmoney"}
+			if err := common.DB.Create(&row).Error; err != nil {
+				t.Fatalf("铺日线失败: %v", err)
+			}
+		}
+		common.DB.Create(&model.MarketSyncState{Symbol: s.symbol, Market: "cn", Name: s.name,
+			InitStatus: "done", LastBarDate: axis[len(axis)-1], BarsCount: 40})
+		// 宇宙快照 as-of 两个信号日。
+		common.DB.Create(&model.StockUniverseDaily{TradeDate: earlyDate, Symbol: s.symbol, Market: "cn",
+			Name: s.name, IsST: s.stEarly, Amount: 1e7, Close: 10})
+		common.DB.Create(&model.StockUniverseDaily{TradeDate: lateDate, Symbol: s.symbol, Market: "cn",
+			Name: s.name, IsST: s.stLate, Amount: 1e7, Close: 10})
+	}
+
+	svc := &BacktestService{benchFn: func(ctx context.Context) []datasource.Bar { return fakeBench(axis) }}
+	tree := allOf(leafV("close", ">", 5))
+	res, err := svc.Run(context.Background(), 1, BacktestRequest{
+		Tree: &tree, LookbackDays: 10, SignalCount: 2, HoldDays: []int{2}, PerStockCap: 20000,
+	})
+	if err != nil {
+		t.Fatalf("回测失败: %v", err)
+	}
+	// 只有始终 ST 的 600008 被整只剔除；600009（后来才 ST）不整只剔除（旧口径会是 2）。
+	if res.StSkipped != 1 {
+		t.Fatalf("StSkipped 应为 1（仅始终 ST 者），得到 %d——后来才 ST 的股被误剔即为前视偏差", res.StSkipped)
+	}
+	if res.Universe != 2 {
+		t.Fatalf("宇宙应含 2 只处理过的标的，得到 %d", res.Universe)
+	}
+	// 600009 只在健康信号日（earlyDate）成交，晚信号日 as-of ST 被当日排除。
+	if len(res.Stats) != 1 || res.Stats[0].Trades != 1 {
+		t.Fatalf("应仅健康期 1 笔成交，得到 %+v", res.Stats)
+	}
+	byDate := map[string]BacktestDayStat{}
+	for _, d := range res.Days {
+		byDate[d.Date] = d
+	}
+	if byDate[earlyDate].Matched != 1 {
+		t.Fatalf("健康信号日应命中 1（600009 未被剔）: %+v", byDate[earlyDate])
+	}
+	if byDate[lateDate].Matched != 0 {
+		t.Fatalf("as-of ST 信号日应命中 0（当日排除）: %+v", byDate[lateDate])
+	}
+	found := false
+	for _, n := range res.Notes {
+		if strings.Contains(n, "as-of") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Notes 应声明 ST as-of 口径: %v", res.Notes)
 	}
 }
 

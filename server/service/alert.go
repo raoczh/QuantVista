@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"quantvista/common"
@@ -452,6 +453,18 @@ func (s *AlertService) MarkAllEventsRead(userID int64) (int64, error) {
 	return res.RowsAffected, res.Error
 }
 
+// alertEvalLocks 用户级评估互斥：recordEvent「先查后建」不是原子的——手动「立即检查」
+// 走 API 侧 AlertService 实例，后台轮询走 StartAlertJobs 自建的另一实例，两者是不同的
+// 结构体实例，故实例字段锁无法互斥；用包级 per-user 锁把同一用户的整轮评估串行化，
+// 杜绝并发重复落事件+重复推送。单实例个人部署，进程内锁足够；多实例才需 DB 唯一
+// 索引 (rule_id, 命中日) 兜底，本项目无此部署形态故不引入。key=userID。
+var alertEvalLocks sync.Map // int64 -> *sync.Mutex
+
+func alertEvalLock(userID int64) *sync.Mutex {
+	m, _ := alertEvalLocks.LoadOrStore(userID, &sync.Mutex{})
+	return m.(*sync.Mutex)
+}
+
 // recordEvent 命中时落明细事件。同日去重与推送同口径：该规则今天已命中过
 //（旧 triggered_at 为今天）则不重复落——手动「立即检查」一日多轮不会刷屏。
 func recordEvent(rule model.AlertRule, msg, today string, now time.Time) bool {
@@ -486,6 +499,9 @@ func (s *AlertService) EvaluateUser(ctx context.Context, userID int64) (int, err
 // evaluateUserMarket 盘中口径：只评行情类规则，显式排除财报日历类 kind——
 // 否则 15min 一轮会被财报规则拉去每 symbol 拉行情空转（财报类由财报刷新 job 每日一评）。
 func (s *AlertService) evaluateUserMarket(ctx context.Context, userID int64) (int, error) {
+	mu := alertEvalLock(userID)
+	mu.Lock()
+	defer mu.Unlock()
 	var rules []model.AlertRule
 	if err := common.DB.Where("user_id = ? AND status = ? AND kind NOT IN ?",
 		userID, model.AlertStatusActive, earnAlertKinds).Find(&rules).Error; err != nil {
@@ -708,6 +724,9 @@ func evaluateEarnFcst(rule model.AlertRule, fc *model.EarningsForecast, now time
 // evaluateEarnRulesForUser 评估某用户全部 active 财报类规则（查本地表，不打上游）。
 // 命中口径与行情类同：recordEvent 落明细（同日去重）、更新规则行、聚合推送。
 func (s *AlertService) evaluateEarnRulesForUser(userID int64) int {
+	mu := alertEvalLock(userID)
+	mu.Lock()
+	defer mu.Unlock()
 	var rules []model.AlertRule
 	if err := common.DB.Where("user_id = ? AND status = ? AND kind IN ?",
 		userID, model.AlertStatusActive, earnAlertKinds).Find(&rules).Error; err != nil || len(rules) == 0 {

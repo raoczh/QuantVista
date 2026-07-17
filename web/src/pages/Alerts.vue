@@ -149,7 +149,7 @@ function editRule(r: AlertRule) {
     name: r.name,
     kind: r.kind,
     op: r.op,
-    threshold: r.threshold || undefined,
+    threshold: r.threshold ?? undefined,
     period: r.period || 20,
     once: r.once,
     note: r.note,

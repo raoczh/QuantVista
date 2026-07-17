@@ -126,10 +126,6 @@ async function runAnalysis() {
     message.warning('请输入股票代码')
     return
   }
-  if (!llmConfigs.value.length) {
-    message.warning('请先在「设置」中添加并测试 LLM 配置')
-    return
-  }
   running.value = true
   try {
     const payload: AnalyzeRequest = {
@@ -407,7 +403,7 @@ onMounted(async () => {
                 v-model:value="form.llm_config_id"
                 :options="llmOptions"
                 :loading="llmLoading"
-                placeholder="选择模型配置"
+                :placeholder="llmConfigs.length ? '选择模型配置' : '未配置将使用系统默认配置'"
               />
             </n-form-item>
             <n-form-item label="附加问题（可选）">
@@ -429,7 +425,7 @@ onMounted(async () => {
               {{ running ? '分析中…' : '开始分析' }}
             </n-button>
             <div v-if="!llmLoading && !llmConfigs.length" class="hint">
-              尚未配置 LLM，请先到「设置」添加并测试连接。
+              未配置 LLM，将使用系统默认配置（若管理员未开启回退，提交后会提示）。
             </div>
           </n-form>
         </SectionCard>

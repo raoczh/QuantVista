@@ -2,6 +2,7 @@ package controller
 
 import (
 	"strconv"
+	"strings"
 
 	"quantvista/common"
 	"quantvista/service"
@@ -39,6 +40,11 @@ func (mc *MoodController) StockFundFlow(c *gin.Context) {
 // StockLhb GET /api/markets/:market/stocks/:symbol/lhb?limit=
 // 个股详情「龙虎榜上榜记录」块（本地缓存表查询，盘后 job 采集+近 30 天回填）。
 func (mc *MoodController) StockLhb(c *gin.Context) {
+	// 路由声明 :market 但龙虎榜只有 A 股：显式校验（诚实拒绝而非静默把任何 market 当 cn）。
+	if strings.ToLower(c.Param("market")) != "cn" {
+		common.ApiErrorMsg(c, "龙虎榜仅支持 A 股（market=cn）")
+		return
+	}
 	limit := 0
 	if s := c.Query("limit"); s != "" {
 		if n, err := strconv.Atoi(s); err == nil {

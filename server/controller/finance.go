@@ -2,6 +2,7 @@ package controller
 
 import (
 	"strconv"
+	"strings"
 
 	"quantvista/common"
 	"quantvista/service"
@@ -44,6 +45,11 @@ func (fc *FinanceController) Announcements(c *gin.Context) {
 // 个股详情「财务」块：最近 8 期主要指标与三表关键科目（升序）。首次访问触发
 // 按需同步（F10 单请求 + 三表约 7 次上游请求，冷却 1h），非 A 股口径返回空集。
 func (fc *FinanceController) StockFinance(c *gin.Context) {
+	// 路由声明 :market 但数据源只支持 A 股：显式校验（诚实拒绝而非静默把任何 market 当 cn）。
+	if strings.ToLower(c.Param("market")) != "cn" {
+		common.ApiErrorMsg(c, "财务数据仅支持 A 股（market=cn）")
+		return
+	}
 	out, err := fc.svc.FinanceOverview(c.Request.Context(), c.Param("symbol"))
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())

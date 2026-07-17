@@ -24,10 +24,12 @@ const moduleLabel: Record<string, string> = {
   trade_plan: '交易计划',
   recommendation: '股票推荐',
   rec_review: '推荐复核',
+  rec_bear: '反方研究员',
   qa: '个股问答',
   compare: '横向对比',
   daily_report: '收盘日报',
   news: '新闻情绪',
+  screener_parse: '白话建策略',
   test: '测试连接',
 }
 const moduleOptions = [

@@ -82,7 +82,9 @@ func (s *MarketService) GetDailyBars(ctx context.Context, market, symbol string,
 	if err != nil {
 		return nil, err
 	}
-	s.persistDailyBars(market, symbol, bars)
+	// 在线读路径 best-effort 落库：拉取成功即向调用方返回行情，落库失败只告警
+	//（persistDailyBars 内部已 SysWarn），不因缓存回种失败阻断读。
+	_ = s.persistDailyBars(market, symbol, bars)
 	if b, err := json.Marshal(bars); err == nil {
 		common.RedisSet(cacheKey, string(b), dailyBarsCacheTTL)
 	}
@@ -301,9 +303,9 @@ func (s *MarketService) GetOverview(ctx context.Context, market string) *Overvie
 	return ov
 }
 
-func (s *MarketService) persistDailyBars(market, symbol string, bars []datasource.Bar) {
+func (s *MarketService) persistDailyBars(market, symbol string, bars []datasource.Bar) error {
 	if common.DB == nil || len(bars) == 0 {
-		return
+		return nil
 	}
 
 	// M1 除权检测（防"部分窗口重写"漏检）：本次拉取若与 DB 内已有窗口的 close 多点
@@ -311,7 +313,7 @@ func (s *MarketService) persistDailyBars(market, symbol string, bars []datasourc
 	// 本窗会留下"窗口内新基准、窗口外旧基准"的断层。检测命中即全量重锚（250 根删+插）
 	// 后直接返回。仅东财源检测：新浪日线不复权，与前复权基准比对必然偏差，会误判。
 	if market == "cn" && bars[0].Source == "eastmoney" && s.detectAndRebase(market, symbol, bars) {
-		return
+		return nil
 	}
 
 	dailyRows := make([]model.DailyBar, 0, len(bars))
@@ -376,7 +378,10 @@ func (s *MarketService) persistDailyBars(market, symbol string, bars []datasourc
 			Columns:   []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "trade_date"}},
 			DoUpdates: clause.AssignmentColumns(updateCols),
 		}).CreateInBatches(dailyRows, 200).Error; err != nil && err != gorm.ErrEmptySlice {
+			// 关键失败：daily_bars 落库失败必须上抛，否则历史初始化调用点会误把
+			// 这只标 done、留下永久缺口（宽表/因子/回测都读不到它）。
 			common.SysWarn("落库 daily_bars 失败 %s: %v", symbol, err)
+			return fmt.Errorf("落库 daily_bars 失败 %s: %w", symbol, err)
 		}
 	}
 
@@ -385,9 +390,11 @@ func (s *MarketService) persistDailyBars(market, symbol string, bars []datasourc
 			Columns:   []clause.Column{{Name: "market"}, {Name: "trade_date"}},
 			DoUpdates: clause.AssignmentColumns([]string{"is_open"}),
 		}).CreateInBatches(calendarRows, 200).Error; err != nil && err != gorm.ErrEmptySlice {
+			// 日历是派生副产品（快照日历另有权威补写），失败不阻断标的落库判定，仅告警。
 			common.SysWarn("落库 trading_calendar 失败 %s: %v", market, err)
 		}
 	}
+	return nil
 }
 func (s *MarketService) persist(q *datasource.Quote) {
 	if common.DB == nil {

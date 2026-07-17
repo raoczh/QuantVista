@@ -68,6 +68,9 @@ type RecommendationLabel struct {
 
 	HitTakeProfit bool `json:"hit_take_profit"` // 止盈障碍先触（仅带计划价的条目）
 	HitStopLoss   bool `json:"hit_stop_loss"`
+	// Forced 顺延到末根强平 / 已入场后长停退市按末根收盘强平——收益偏保守（真实中卖
+	// 不出），归因与评估主统计单列剔除。显式 column 防蛇形化坑（PETTM→pettm 前科）。
+	Forced bool `gorm:"column:forced" json:"forced"`
 
 	MaturityStatus string `gorm:"size:16;index:idx_rl_status" json:"maturity_status"` // pending/matured/no_data/skipped
 	SkipReason     string `gorm:"size:64" json:"skip_reason"`

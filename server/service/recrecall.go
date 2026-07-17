@@ -95,6 +95,8 @@ type RecallReport struct {
 	OppDist  RecallDist `json:"opp_dist"`  // 机会集净收益分布（各批日期合并）
 	PoolDist RecallDist `json:"pool_dist"` // 池内候选净收益分布
 
+	Forced int `json:"forced"` // 退市/长停末根强平的观测数（收益不可靠，已排除出机会集）
+
 	SourceAblation []RecallSourceAblation `json:"source_ablation"`
 	BatchRows      []RecallBatchRow       `json:"batch_rows"`
 	Notes          []string               `json:"notes"`
@@ -154,16 +156,17 @@ func (s *RecommendationService) RecRecallReport(ctx context.Context, userID int6
 	}
 	bt := NewBacktestService(s.market)
 	axis, _, _ := bt.marketAxis(ctx, freshDate)
-	if len(axis) < horizon+2 {
+	if len(axis) < horizon+3 {
 		return nil, errors.New("交易日轴数据不足，无法评估")
 	}
+	marketLast := axis[len(axis)-1] // 市场轴末日：区分个股退市/长停与真未成熟
 	axisIndex := make(map[string]int, len(axis))
 	for i, d := range axis {
 		axisIndex[d] = i
 	}
-	// 信号日=批次日期（或其前最近交易日）；且须留足 horizon 根走完持有期
-	//（信号日 i 的到期卖出根为 i+horizon，须 ≤ 轴末）。
-	lastEligible := len(axis) - (horizon + 1)
+	// 信号日=批次日期（或其前最近交易日）；且须留足持有期走完
+	//（信号日 i 的卖出根 = 买入根(i+1)+horizon = i+horizon+1，须 ≤ 轴末）。
+	lastEligible := len(axis) - (horizon + 2)
 	if lastEligible < 0 {
 		return nil, errors.New("交易日轴数据不足，无法评估")
 	}
@@ -264,6 +267,7 @@ func (s *RecommendationService) RecRecallReport(ctx context.Context, userID int6
 	for _, d := range dates {
 		retByDate[d] = map[string]float64{}
 	}
+	forcedCount := 0 // 退市/长停末根强平的观测数（不进机会集，单独计数；streamCNDailyBars 顺序执行）
 	process := func(symbol string, bars []datasource.Bar) {
 		if ctx.Err() != nil {
 			return
@@ -297,13 +301,17 @@ func (s *RecommendationService) RecRecallReport(ctx context.Context, userID int6
 				if ai+1 < len(axis) {
 					nextDate = axis[ai+1]
 				}
-				if ai+horizon < len(axis) {
-					sellDate = axis[ai+horizon] // 市场轴到期日：个股中途停牌不拉长持有跨度
+				if ai+horizon+1 < len(axis) {
+					sellDate = axis[ai+horizon+1] // 卖出根=买入根(ai+1)+horizon；停牌不拉长持有跨度
 				}
 			}
-			o := simulateHold(bars, i, symbol, name, horizon, recallPerCap, nextDate, sellDate)
+			o := simulateHold(bars, i, symbol, name, horizon, recallPerCap, nextDate, sellDate, marketLast)
 			if o.Status != btTraded {
 				continue // 一字板买不进/停牌/坏数据：不属可交易机会集
+			}
+			if o.Forced {
+				forcedCount++ // 退市/长停末根强平：收益不可靠，不进机会集收益主统计与 Top-K
+				continue
 			}
 			retByDate[d][symbol] = o.ReturnPct
 		}
@@ -314,12 +322,14 @@ func (s *RecommendationService) RecRecallReport(ctx context.Context, userID int6
 
 	// 6. 逐批次 Recall@K + 分桶 + 消融。
 	rep := &RecallReport{Type: recType, HorizonDays: horizon, K: k, TopKStageCounts: map[string]int{}}
+	rep.Forced = forcedCount
 	sourceCount := map[string]int{}
 	// 消融：去掉来源 s 后的池召回命中 = 总命中 − 首来源为 s 的命中。
 	var basePoolHits, baseKTotal float64
 	hitsBySource := map[string]float64{}
 	var oppRets, poolRets, missedRets []float64
 	missedTotal := 0
+	skippedNoPool := 0 // 无候选事件的批次（S0-5 部署前旧批次 / 事实写入失败）：非未召回，排除
 
 	for _, b := range batches {
 		d, ok := batchDate[b.ID]
@@ -349,6 +359,13 @@ func (s *RecommendationService) RecRecallReport(ctx context.Context, userID int6
 			kEff = len(all)
 		}
 		pool := poolBy[b.ID]
+		if len(pool) == 0 {
+			// 无候选事件（S0-5 部署前旧批次 / 事实写入失败）：poolBy 空时每个 Top-K 都记
+			// absent、贡献满额 baseKTotal 但 0 命中，把「数据缺失」当「全量未召回」拉低
+			// Recall。整批排除并声明——与 recrecall 诚实缺失原则一致。
+			skippedNoPool++
+			continue
+		}
 		row := RecallBatchRow{BatchID: b.ID, SignalDate: d, OppSize: len(all), PoolSize: len(pool), KEff: kEff}
 		for sym, e := range pool {
 			sourceCount[e.source]++
@@ -429,8 +446,14 @@ func (s *RecommendationService) RecRecallReport(ctx context.Context, userID int6
 		"错失收益吃 S0-5 影子标签账本（已成熟 next_open 净收益）；样本随标签积累增长",
 		fmt.Sprintf("评估最近 %d 个成功批次（持有期未走完的批次自动跳过）", recallMaxBatches),
 	)
+	if skippedNoPool > 0 {
+		rep.Notes = append(rep.Notes, fmt.Sprintf("%d 个批次无候选事件（S0-5 部署前旧批次或事实落库失败）已整批排除，非未召回——未计入 Recall 分母", skippedNoPool))
+	}
 	for d := range fallbackDates {
 		rep.Notes = append(rep.Notes, fmt.Sprintf("%s 无宇宙快照（S0-3 部署前），机会集回退日线口径（ST 按当前名称判定，存在轻微幸存者偏差）", d))
+	}
+	if rep.Forced > 0 {
+		rep.Notes = append(rep.Notes, fmt.Sprintf("%d 个观测因退市/长停按末根收盘强平（真实中卖不出，收益不可靠）——已排除出机会集与收益分布，单独计数", rep.Forced))
 	}
 	rep.ElapsedMs = time.Since(start).Milliseconds()
 	common.SysLog("召回评估完成: %d 批次，%d 评估日，Recall@%d 池 %.1f%%/名单 %.1f%%/入选 %.1f%%，耗时 %dms",

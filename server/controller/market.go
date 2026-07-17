@@ -152,6 +152,12 @@ func (mc *MarketController) GetChips(c *gin.Context) {
 // 批量同步已跟踪股票日线。耗时较长，异步执行，立即返回"已启动"。
 func (mc *MarketController) SyncBars(c *gin.Context) {
 	market := strings.ToLower(c.DefaultQuery("market", "cn"))
+	// 预检：已有一轮在跑就如实返回 started:false（原实现无条件 started:true，把后台被吞的
+	// ErrSyncInProgress 掩盖成「又启动了」）。
+	if service.IsSyncingBars() {
+		common.ApiSuccess(c, gin.H{"started": false, "task": "sync_daily_bars", "market": market})
+		return
+	}
 	// 用后台上下文，避免请求结束即取消这个长任务。
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)

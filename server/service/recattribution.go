@@ -40,6 +40,7 @@ type AttributionReport struct {
 	SampleBuy   int    `json:"sample_buy"` // 其中 buy 样本数（除 action 外各维度的分母）
 	Skipped     int    `json:"skipped"`
 	Pending     int    `json:"pending"`
+	ForcedExcluded int  `json:"forced_excluded"` // 退市/长停末根强平剔除数（收益不可靠，不进主统计）
 	Groups      []AttributionCell `json:"groups"`
 	Notes       []string          `json:"notes"`
 }
@@ -63,8 +64,8 @@ func RecAttribution(userID int64, recType string, horizon int) (*AttributionRepo
 		return nil, fmt.Errorf("持有期须为 %v 之一", model.LabelHorizons)
 	}
 
-	q := common.DB.Where("user_id = ? AND horizon_days = ? AND entry_mode = ? AND recommendation_id > 0",
-		userID, horizon, model.EntryModeNextOpen)
+	q := common.DB.Where("user_id = ? AND horizon_days = ? AND entry_mode = ? AND recommendation_id > 0 AND label_version = ?",
+		userID, horizon, model.EntryModeNextOpen, labelVersion)
 	if recType == model.RecTypeShortTerm || recType == model.RecTypeLongTerm {
 		q = q.Where("type = ?", recType)
 	}
@@ -78,6 +79,11 @@ func RecAttribution(userID int64, recType string, horizon int) (*AttributionRepo
 	for _, r := range rows {
 		switch r.MaturityStatus {
 		case model.LabelMatured:
+			if r.Forced {
+				// 退市/长停末根强平：收益偏保守（真实中卖不出），不进主统计单列计数。
+				rep.ForcedExcluded++
+				continue
+			}
 			matured = append(matured, r)
 			if r.Action == model.RecActionBuy {
 				maturedBuy = append(maturedBuy, r)
@@ -124,6 +130,7 @@ func RecAttribution(userID int64, recType string, horizon int) (*AttributionRepo
 		"口径：统一执行模拟（次日开盘/涨停买不到/T+1/整百股/费率），净收益=扣佣金印花税；Alpha=净收益−上证同区间",
 		"只统计真实入选且成熟的样本；影子标签（门控/落选对照）与用户实际成交不混入本报表",
 		"action 维度并列展示 buy/watch；其余维度只统计 buy（买入准确性归因，watch 不稀释分组）",
+		fmt.Sprintf("只统计当前执行语义版本 %s 的样本（旧口径标签不混池）；退市/长停末根强平样本单列剔除（收益不可靠）", labelVersion),
 		fmt.Sprintf("单分组样本 <%d 时统计不稳定，仅供方向参考", attributionMinBucket),
 	)
 	return rep, nil

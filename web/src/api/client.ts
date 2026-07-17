@@ -17,6 +17,10 @@ const http: AxiosInstance = axios.create({
 // 校验失败最多重试 2 次）；全局 20s 会把仍在执行并扣配额的任务在前端掐断。
 export const AI_TIMEOUT = 300000
 
+// 全市场重算类接口（walk-forward / 因子 IC / 召回评估）合法耗时数十秒，
+// 远超默认 20s 但不涉及 LLM，用独立的中等超时。
+export const HEAVY_TIMEOUT = 120000
+
 // 请求拦截：自动附带 access token。
 http.interceptors.request.use((config) => {
   const token = getAccessToken()
@@ -92,8 +96,16 @@ export async function request<T>(config: Parameters<AxiosInstance['request']>[0]
   try {
     resp = await http.request<ApiEnvelope<T>>(config)
   } catch (e) {
-    if (axios.isAxiosError(e) && e.code === 'ECONNABORTED') {
-      throw new Error('请求超时：任务可能仍在后台执行，请稍后刷新查看结果')
+    if (axios.isAxiosError(e)) {
+      if (e.code === 'ECONNABORTED') {
+        throw new Error('请求超时：任务可能仍在后台执行，请稍后刷新查看结果')
+      }
+      // 后端统一包络在 4xx/5xx 时仍带 message；优先透传真实原因（如 LLM 回退被关、
+      // 配额不足等），否则保留原始 axios 错误供上层判断 status/code。
+      const backendMsg = (e.response?.data as ApiEnvelope<unknown> | undefined)?.message
+      if (backendMsg) {
+        throw new Error(backendMsg)
+      }
     }
     throw e
   }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch, watchEffect, h } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch, watchEffect, h } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NMenu,
@@ -218,10 +218,17 @@ const shellVars = computed(() => ({
   '--qv-badge-bg': vars.value.errorColor,
 }))
 
+// 健康状态低频轮询：不随交易时段限制（数据库/Redis 掉线任何时段都要感知），
+// 独立 90s 定时器，卸载时清理。
+let healthTimer: number | undefined
 onMounted(() => {
   appStore.refreshStatus()
   refreshTodoCount()
   refreshMarketTitle()
+  healthTimer = window.setInterval(() => appStore.refreshStatus(), 90_000)
+})
+onUnmounted(() => {
+  if (healthTimer !== undefined) clearInterval(healthTimer)
 })
 </script>
 
