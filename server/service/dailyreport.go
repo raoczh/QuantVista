@@ -204,10 +204,24 @@ func (s *DailyReportService) GenerateFor(ctx context.Context, userID int64, manu
 		if plan.oldStatus == model.ReportStatusProcessing {
 			plan.oldStatus = model.ReportStatusFailed // 接管的死任务：失败时没有更好的可回滚状态
 		}
+		// 乐观接管：两个并发请求可能同时越过上面的「新鲜 processing 直接返回」判断
+		// （旧报告为 failed/success，或 processing 已 stale），无条件 Update 会双双建任务
+		// 重复烧 token。用 (id, status, updated_at) 条件更新，RowsAffected==0 视为已被
+		// 另一请求接管——回读当前行按「已在生成中」返回，不再重复起后台任务。
+		prevStatus, prevUpdatedAt := existing.Status, existing.UpdatedAt
 		report.Status = model.ReportStatusProcessing
-		if err := common.DB.Model(&model.DailyReport{}).Where("id = ?", report.ID).
-			Update("status", model.ReportStatusProcessing).Error; err != nil {
-			return nil, err
+		res := common.DB.Model(&model.DailyReport{}).
+			Where("id = ? AND status = ? AND updated_at = ?", report.ID, prevStatus, prevUpdatedAt).
+			Update("status", model.ReportStatusProcessing)
+		if res.Error != nil {
+			return nil, res.Error
+		}
+		if res.RowsAffected == 0 {
+			var cur model.DailyReport
+			if err := common.DB.Where("id = ?", report.ID).First(&cur).Error; err != nil {
+				return nil, err
+			}
+			return s.assembleView(&cur), nil
 		}
 	} else if err := common.DB.Create(report).Error; err != nil {
 		return nil, err // 并发生成的兜底：user+trade_date 唯一索引拒绝第二行
@@ -360,7 +374,7 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 	if review != nil && pref.EnableNotify && s.notify.HasEnabledChannel(userID) {
 		go s.notify.SendMsg(userID, NotifyMessage{
 			Title: fmt.Sprintf("收盘日报 %s", date), Content: review.Summary,
-			Route: "/daily-reports", Kind: NotifyMsgKindReport,
+			Route: "/daily-report", Kind: NotifyMsgKindReport,
 		})
 	}
 	if report.Status == model.ReportStatusFailed {

@@ -189,6 +189,12 @@ func (s *NotifyService) Update(userID, id int64, in NotifyChannelInput) (*Notify
 	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&ch).Error; err != nil {
 		return nil, errors.New("推送通道不存在")
 	}
+	// kind 变化时旧密文是「旧类型」的地址（如 webhook URL），留空会被当新类型（如 ntfy
+	// topic）解析——强制要求随类型切换一并提供新地址；kind 不变时留空保留原密文的语义不变。
+	kindChanged := in.Kind != ch.Kind
+	if kindChanged && in.Target == "" {
+		return nil, errors.New("切换推送类型时必须重新填写推送地址")
+	}
 	ch.Kind = in.Kind
 	ch.Name = strings.TrimSpace(in.Name)
 	if ch.Name == "" {

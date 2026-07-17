@@ -125,7 +125,7 @@ async function submit() {
       risks: form.value.risks,
       kill_switches: form.value.kill_switches,
       track_metrics: form.value.track_metrics,
-      next_review_date: d ? new Date(d).toISOString().slice(0, 10) : '',
+      next_review_date: d ? localDate(d) : '',
     })
     message.success('逻辑卡已保存')
     showForm.value = false
@@ -166,7 +166,16 @@ async function doDelete(c: ThesisCard) {
 function lines(s: string): string[] {
   return s ? s.split('\n').map((l) => l.trim()).filter(Boolean) : []
 }
-const today = new Date().toISOString().slice(0, 10)
+// 本地日历日 YYYY-MM-DD：toISOString 走 UTC，在 UTC+8 深夜/清晨会整体退一天，
+// 逻辑卡复盘日按本地日历判断，必须用本地年月日拼接。
+function localDate(d: string | number | Date): string {
+  const dt = new Date(d)
+  const y = dt.getFullYear()
+  const mm = String(dt.getMonth() + 1).padStart(2, '0')
+  const dd = String(dt.getDate()).padStart(2, '0')
+  return `${y}-${mm}-${dd}`
+}
+const today = localDate(new Date())
 function isDue(c: ThesisCard) {
   return c.status === 'active' && !!c.next_review_date && c.next_review_date <= today
 }

@@ -1,7 +1,9 @@
 package service
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"quantvista/common"
 	"quantvista/datasource"
@@ -345,5 +347,155 @@ func TestPerformanceStats(t *testing.T) {
 	p2, _ := svc.Performance(2, "")
 	if p2.Sample != 1 {
 		t.Fatalf("用户2 应只见自己 1 条，得到 %d", p2.Sample)
+	}
+}
+
+// TestFrozenTerminal 终态冻结判定（#6）：止盈/止损/过期冻结；active/tracking/no_data 不冻结。
+func TestFrozenTerminal(t *testing.T) {
+	for _, o := range []string{model.RecOutcomeTakeProfit, model.RecOutcomeStopLoss, model.RecOutcomeExpired} {
+		if !frozenTerminal(o) {
+			t.Fatalf("%s 应为终态冻结", o)
+		}
+	}
+	for _, o := range []string{model.RecOutcomeActive, model.RecOutcomeTracking, model.RecOutcomeNoData, ""} {
+		if frozenTerminal(o) {
+			t.Fatalf("%s 不应冻结（no_data 是暂态、tracking 收益应继续演进）", o)
+		}
+	}
+}
+
+// TestActualReturnEndPrice 已平仓持仓实际收益按真实卖出价定格（#13a），未平仓/缺卖出价用最新价。
+func TestActualReturnEndPrice(t *testing.T) {
+	closed := model.Position{Status: model.PositionStatusClosed, SellPrice: 13.5}
+	if p := actualReturnEndPrice(closed, 20); p != 13.5 {
+		t.Fatalf("已平仓应按卖出价 13.5 定格，得到 %v", p)
+	}
+	holding := model.Position{Status: model.PositionStatusHolding}
+	if p := actualReturnEndPrice(holding, 20); p != 20 {
+		t.Fatalf("持有中应用最新价 20，得到 %v", p)
+	}
+	closedNoSell := model.Position{Status: model.PositionStatusClosed, SellPrice: 0}
+	if p := actualReturnEndPrice(closedNoSell, 20); p != 20 {
+		t.Fatalf("已平仓缺卖出价应回退最新价 20，得到 %v", p)
+	}
+}
+
+// TestShouldAppendQuoteBar 周末/节假日不追加实时 bar（#27b）：优先交易日历，缺失回退周一~五。
+func TestShouldAppendQuoteBar(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
+	t.Cleanup(func() { common.DB.Where("1 = 1").Delete(&model.TradingCalendar{}) })
+
+	sat := time.Date(2026, 7, 18, 10, 0, 0, 0, time.Local) // 周六
+	fri := time.Date(2026, 7, 17, 10, 0, 0, 0, time.Local) // 周五
+	recDate := "2026-07-01"
+
+	// 交易日历标注周六休市：不追加（显式 Select 强制写 is_open=false）。
+	common.DB.Select("Market", "TradeDate", "IsOpen").
+		Create(&model.TradingCalendar{Market: "cn", TradeDate: "2026-07-18", IsOpen: false})
+	if shouldAppendQuoteBar(sat, recDate, nil) {
+		t.Fatalf("周六休市不应追加实时 bar")
+	}
+	// 交易日历标注周五开市：追加。
+	common.DB.Select("Market", "TradeDate", "IsOpen").
+		Create(&model.TradingCalendar{Market: "cn", TradeDate: "2026-07-17", IsOpen: true})
+	if !shouldAppendQuoteBar(fri, recDate, nil) {
+		t.Fatalf("周五开市应追加实时 bar")
+	}
+	// 已有今日日线根：不重复追加。
+	if shouldAppendQuoteBar(fri, recDate, []datasource.Bar{bar("2026-07-17", 10, 10, 10, 10)}) {
+		t.Fatalf("已有今日日线不应再追加")
+	}
+	// 今天不晚于推荐日：不追加。
+	if shouldAppendQuoteBar(fri, "2026-07-17", nil) {
+		t.Fatalf("今天不晚于推荐日不应追加")
+	}
+	// 无日历回退周一~五：周六不追加、周五追加。
+	common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
+	if shouldAppendQuoteBar(sat, recDate, nil) {
+		t.Fatalf("无日历回退：周六不应追加")
+	}
+	if !shouldAppendQuoteBar(fri, recDate, nil) {
+		t.Fatalf("无日历回退：周五应追加")
+	}
+}
+
+// TestRefreshBatchesFreezeTerminal 终态行二次刷新不被重算改写（#6），且不触碰上游
+// （svc.market 为 nil，全部终态冻结时应在拉取基准/上游前提前返回）。
+func TestRefreshBatchesFreezeTerminal(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Exec("DELETE FROM recommendation_batches")
+	common.DB.Exec("DELETE FROM recommendations")
+	common.DB.Exec("DELETE FROM recommendation_statuses")
+
+	batch := model.RecommendationBatch{UserID: 1, Type: model.RecTypeShortTerm, Market: "cn", Status: model.RecStatusSuccess}
+	if err := common.DB.Create(&batch).Error; err != nil {
+		t.Fatalf("插入批次失败: %v", err)
+	}
+	rec := model.Recommendation{BatchID: batch.ID, UserID: 1, Symbol: "600000", Market: "cn", Action: model.RecActionBuy, RefPrice: 10}
+	if err := common.DB.Create(&rec).Error; err != nil {
+		t.Fatalf("插入推荐失败: %v", err)
+	}
+	// 已止盈终态，收益定格 15%、现价 11.5。
+	st := model.RecommendationStatus{
+		RecommendationID: rec.ID, BatchID: batch.ID, UserID: 1, Symbol: "600000", Market: "cn",
+		Type: model.RecTypeShortTerm, Action: model.RecActionBuy, RefPrice: 10,
+		Outcome: model.RecOutcomeTakeProfit, ReturnPct: 15, CurrentPrice: 11.5,
+	}
+	if err := common.DB.Create(&st).Error; err != nil {
+		t.Fatalf("插入状态失败: %v", err)
+	}
+
+	svc := &TrackingService{} // nil market：终态冻结路径不得触碰上游，否则会 panic
+	n := svc.refreshBatches(context.Background(), []model.RecommendationBatch{batch})
+	if n != 0 {
+		t.Fatalf("全部终态冻结应处理 0 条，得到 %d", n)
+	}
+	var got model.RecommendationStatus
+	common.DB.Where("recommendation_id = ?", rec.ID).First(&got)
+	if got.ReturnPct != 15 || got.Outcome != model.RecOutcomeTakeProfit || got.CurrentPrice != 11.5 {
+		t.Fatalf("终态行不应被重算改写: %+v", got)
+	}
+}
+
+// TestTrackableUserIDsIncludesDegraded 后台枚举纳入 degraded 用户（#27c）：只有降级批次
+// 的用户也应被刷新；失败批次与超窗批次不计。
+func TestTrackableUserIDsIncludesDegraded(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Exec("DELETE FROM recommendation_batches")
+	now := time.Now()
+	cutoff := now.AddDate(0, 0, -trackWindowDays)
+
+	rows := []model.RecommendationBatch{
+		{UserID: 10, Status: model.RecStatusDegraded, CreatedAt: now},                                   // 仅降级：应枚举
+		{UserID: 20, Status: model.RecStatusSuccess, CreatedAt: now},                                    // 成功：应枚举
+		{UserID: 30, Status: model.RecStatusFailed, CreatedAt: now},                                     // 失败：不枚举
+		{UserID: 40, Status: model.RecStatusDegraded, CreatedAt: now.AddDate(0, 0, -trackWindowDays-5)}, // 超窗降级：不枚举
+	}
+	for i := range rows {
+		if err := common.DB.Create(&rows[i]).Error; err != nil {
+			t.Fatalf("插入批次失败: %v", err)
+		}
+	}
+
+	ids, err := trackableUserIDs(cutoff)
+	if err != nil {
+		t.Fatalf("trackableUserIDs 失败: %v", err)
+	}
+	set := map[int64]bool{}
+	for _, id := range ids {
+		set[id] = true
+	}
+	if !set[10] {
+		t.Fatalf("仅降级批次的用户 10 应被枚举，得到 %v", ids)
+	}
+	if !set[20] {
+		t.Fatalf("成功批次的用户 20 应被枚举，得到 %v", ids)
+	}
+	if set[30] {
+		t.Fatalf("仅失败批次的用户 30 不应枚举，得到 %v", ids)
+	}
+	if set[40] {
+		t.Fatalf("超窗降级的用户 40 不应枚举，得到 %v", ids)
 	}
 }

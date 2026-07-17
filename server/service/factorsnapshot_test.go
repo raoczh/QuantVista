@@ -35,7 +35,15 @@ func buildSnapshotFixtureTable() *FactorTable {
 func TestSnapshotFactorTable(t *testing.T) {
 	setupTestDB(t)
 	common.DB.Exec("DELETE FROM factor_snapshot_dailies")
-	t.Cleanup(func() { common.DB.Exec("DELETE FROM factor_snapshot_dailies") })
+	common.DB.Where("1 = 1").Delete(&model.MarketSyncState{})
+	t.Cleanup(func() {
+		common.DB.Exec("DELETE FROM factor_snapshot_dailies")
+		common.DB.Where("1 = 1").Delete(&model.MarketSyncState{})
+	})
+	// 快照只落 init_status=done 的 symbol：先把 fixture 三只标记为 done。
+	for _, sym := range []string{"600001", "600002", "600003"} {
+		common.DB.Create(&model.MarketSyncState{Symbol: sym, Market: "cn", InitStatus: "done"})
+	}
 
 	ft := buildSnapshotFixtureTable()
 	n, err := SnapshotFactorTable(ft)
@@ -116,5 +124,66 @@ func TestSnapshotFactorTable(t *testing.T) {
 	// 空表/nil 安全。
 	if n, err := SnapshotFactorTable(nil); err != nil || n != 0 {
 		t.Fatalf("nil 表应 0 行: n=%d err=%v", n, err)
+	}
+}
+
+// TestSnapshotInitDoneFilter 落库门槛：只固化 init_status=done 的 symbol；pending 股
+// 不落（避免首部署当天短史低质量因子被首写胜永久冻结），其 init 完成后由后续 rebuild
+// 的「补缺失 symbol」逻辑自然补上。
+func TestSnapshotInitDoneFilter(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Exec("DELETE FROM factor_snapshot_dailies")
+	common.DB.Where("1 = 1").Delete(&model.MarketSyncState{})
+	t.Cleanup(func() {
+		common.DB.Exec("DELETE FROM factor_snapshot_dailies")
+		common.DB.Where("1 = 1").Delete(&model.MarketSyncState{})
+	})
+
+	// 600501 已初始化完成、600502 仍 pending（历史未补齐）。
+	common.DB.Create(&model.MarketSyncState{Symbol: "600501", Market: "cn", InitStatus: "done"})
+	common.DB.Create(&model.MarketSyncState{Symbol: "600502", Market: "cn", InitStatus: "pending"})
+
+	ft := &FactorTable{
+		TradeDate: "2026-07-20", BuiltAt: time.Now(),
+		Symbols:   []string{"600501", "600502"},
+		Names:     []string{"甲", "乙"},
+		LastDates: []string{"2026-07-20", "2026-07-20"},
+		cols:      make(map[string][]float64, len(factorDefs)),
+	}
+	for _, d := range factorDefs {
+		ft.cols[d.Key] = []float64{math.NaN(), math.NaN()}
+	}
+	ft.cols["close"][0] = 12.3
+	ft.cols["close"][1] = 4.5
+
+	// 首轮：只落 done 的 600501，pending 的 600502 缺席。
+	if n, err := SnapshotFactorTable(ft); err != nil || n != 1 {
+		t.Fatalf("首轮应只落 done 的 1 行: n=%d err=%v", n, err)
+	}
+	var pendingN int64
+	common.DB.Model(&model.FactorSnapshotDaily{}).
+		Where("trade_date = ? AND symbol = ?", "2026-07-20", "600502").Count(&pendingN)
+	if pendingN != 0 {
+		t.Fatalf("pending 股不应落快照, got %d", pendingN)
+	}
+
+	// 600502 历史初始化完成后再 rebuild：同日「补缺失 symbol」把它补上，
+	// 已有的 600501 仍不可覆盖。
+	common.DB.Model(&model.MarketSyncState{}).
+		Where("symbol = ?", "600502").Update("init_status", "done")
+	ft.cols["close"][0] = 99.9 // 已有行的新值：不得覆盖
+	if n, err := SnapshotFactorTable(ft); err != nil || n != 1 {
+		t.Fatalf("done 后应补上缺失的 1 行: n=%d err=%v", n, err)
+	}
+	var added model.FactorSnapshotDaily
+	if err := common.DB.Where("trade_date = ? AND symbol = ?", "2026-07-20", "600502").First(&added).Error; err != nil {
+		t.Fatalf("done 后补缺行应落库: %v", err)
+	}
+	var kept model.FactorSnapshotDaily
+	common.DB.Where("trade_date = ? AND symbol = ?", "2026-07-20", "600501").First(&kept)
+	var vals map[string]float64
+	json.Unmarshal([]byte(kept.FactorsJSON), &vals)
+	if vals["close"] != 12.3 {
+		t.Fatalf("补缺时已有行被覆盖: close=%v", vals["close"])
 	}
 }

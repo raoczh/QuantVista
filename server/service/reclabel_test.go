@@ -25,28 +25,29 @@ func labelBarsFixture() []datasource.Bar {
 }
 
 // TestSimulateLabelHold_Fixed 固定持有期：毛/净收益与 MFE/MAE 手工验算。
+// 持有 3 交易日 = 卖出根 = 买入根(bars[1])+3 = bars[4]，收盘 11.3。
 // entry=10.00×2000 股：buyAmount=20000、佣金 5（万2.5 最低5）、cost=20005；
-// horizon=3 出场 bars[3] close=11.0：sellAmount=22000、佣金 5.5+印花税 11（万5），
-// net=(21983.5-20005)/20005=9.89%；gross=10%；MFE=(11.2-10)/10=12%、MAE=(9.8-10)/10=-2%。
+// 出场 bars[4] close=11.3：sellAmount=22600、佣金 5.65+印花税 11.3（万5），
+// net=(22583.05-20005)/20005=12.89%；gross=13%；MFE=(11.5-10)/10=15%、MAE=(9.8-10)/10=-2%。
 func TestSimulateLabelHold_Fixed(t *testing.T) {
-	out := simulateLabelHold(labelBarsFixture(), 0, "600000", "某某股份", 3, 20000, 0, 0, "", "")
+	out := simulateLabelHold(labelBarsFixture(), 0, "600000", "某某股份", 3, 20000, 0, 0, "", "", "")
 	if out.Status != btTraded {
 		t.Fatalf("应成交，得到 %s", out.Status)
 	}
 	if out.BuyDate != "2026-06-02" || out.BuyPrice != 10.0 {
 		t.Fatalf("入场应 2026-06-02@10.0: %+v", out)
 	}
-	if out.SellDate != "2026-06-04" || out.SellPrice != 11.0 {
-		t.Fatalf("出场应 2026-06-04@11.0: %+v", out)
+	if out.SellDate != "2026-06-05" || out.SellPrice != 11.3 {
+		t.Fatalf("出场应 2026-06-05@11.3: %+v", out)
 	}
-	if out.GrossPct != 10.0 {
-		t.Fatalf("毛收益应 10%%，得到 %v", out.GrossPct)
+	if out.GrossPct != 13.0 {
+		t.Fatalf("毛收益应 13%%，得到 %v", out.GrossPct)
 	}
-	if out.NetPct != 9.89 {
-		t.Fatalf("净收益应 9.89%%，得到 %v", out.NetPct)
+	if out.NetPct != 12.89 {
+		t.Fatalf("净收益应 12.89%%，得到 %v", out.NetPct)
 	}
-	if out.MfePct != 12.0 || out.MaePct != -2.0 {
-		t.Fatalf("MFE/MAE 应 12/-2，得到 %v/%v", out.MfePct, out.MaePct)
+	if out.MfePct != 15.0 || out.MaePct != -2.0 {
+		t.Fatalf("MFE/MAE 应 15/-2，得到 %v/%v", out.MfePct, out.MaePct)
 	}
 }
 
@@ -55,7 +56,7 @@ func TestSimulateLabelHold_Fixed(t *testing.T) {
 func TestSimulateLabelHold_Barriers(t *testing.T) {
 	bars := labelBarsFixture()
 	// 止盈 10.7：买入日 high=10.9 不判（T+1），06-03 high=10.8≥10.7 触发。
-	out := simulateLabelHold(bars, 0, "600000", "某某股份", 3, 20000, 10.7, 0, "", "")
+	out := simulateLabelHold(bars, 0, "600000", "某某股份", 3, 20000, 10.7, 0, "", "", "")
 	if !out.HitTakeProfit || out.SellDate != "2026-06-03" || out.SellPrice != 10.7 {
 		t.Fatalf("应 06-03 触止盈@10.7: %+v", out)
 	}
@@ -69,7 +70,7 @@ func TestSimulateLabelHold_Barriers(t *testing.T) {
 	}
 
 	// 同日双触（06-03 low=10.1、high=10.8；止损 10.15、止盈 10.75）→ 保守取止损。
-	out = simulateLabelHold(bars, 0, "600000", "某某股份", 3, 20000, 10.75, 10.15, "", "")
+	out = simulateLabelHold(bars, 0, "600000", "某某股份", 3, 20000, 10.75, 10.15, "", "", "")
 	if !out.HitStopLoss || out.HitTakeProfit || out.SellPrice != 10.15 {
 		t.Fatalf("同日双触应取止损@10.15: %+v", out)
 	}
@@ -81,19 +82,19 @@ func TestSimulateLabelHold_Skips(t *testing.T) {
 	// 次日开盘涨幅 ≥ 涨停阈值−0.5 判一字板：开盘 11.0（+10%）。
 	limitUp := append([]datasource.Bar{}, bars...)
 	limitUp[1] = datasource.Bar{TradeDate: "2026-06-02", Open: 11.0, High: 11.0, Low: 11.0, Close: 11.0}
-	if out := simulateLabelHold(limitUp, 0, "600000", "某某股份", 3, 20000, 0, 0, "", ""); out.Status != btSkipLimitUp {
+	if out := simulateLabelHold(limitUp, 0, "600000", "某某股份", 3, 20000, 0, 0, "", "", ""); out.Status != btSkipLimitUp {
 		t.Fatalf("一字板应 skip_limit_up，得到 %s", out.Status)
 	}
 	// 拨款 900 元买不起一手（10 元×100 股）。
-	if out := simulateLabelHold(bars, 0, "600000", "某某股份", 3, 900, 0, 0, "", ""); out.Status != btSkipCash {
+	if out := simulateLabelHold(bars, 0, "600000", "某某股份", 3, 900, 0, 0, "", "", ""); out.Status != btSkipCash {
 		t.Fatalf("不足一手应 skip_cash，得到 %s", out.Status)
 	}
 	// horizon=60 数据未覆盖 → pending。
-	if out := simulateLabelHold(bars, 0, "600000", "某某股份", 60, 20000, 0, 0, "", ""); out.Status != btPending {
+	if out := simulateLabelHold(bars, 0, "600000", "某某股份", 60, 20000, 0, 0, "", "", ""); out.Status != btPending {
 		t.Fatalf("数据未覆盖应 pending，得到 %s", out.Status)
 	}
 	// 信号根=末根（当晚结算的新标签）：数据未到是 pending 不是 skip_suspend。
-	if out := simulateLabelHold(bars, len(bars)-1, "600000", "某某股份", 3, 20000, 0, 0, "", ""); out.Status != btPending {
+	if out := simulateLabelHold(bars, len(bars)-1, "600000", "某某股份", 3, 20000, 0, 0, "", "", ""); out.Status != btPending {
 		t.Fatalf("次日数据未到应 pending，得到 %s", out.Status)
 	}
 }
@@ -107,7 +108,7 @@ func TestSimulateLabelHold_MarketAxis(t *testing.T) {
 		{TradeDate: "2026-06-03", Open: 10.3, High: 10.8, Low: 10.1, Close: 10.6},
 		{TradeDate: "2026-06-04", Open: 10.7, High: 11.2, Low: 10.4, Close: 11.0},
 	}
-	if out := simulateLabelHold(gap, 0, "600000", "某某股份", 3, 20000, 0, 0, "2026-06-02", "2026-06-04"); out.Status != btSkipSuspend {
+	if out := simulateLabelHold(gap, 0, "600000", "某某股份", 3, 20000, 0, 0, "2026-06-02", "2026-06-04", ""); out.Status != btSkipSuspend {
 		t.Fatalf("推荐日次日停牌应 skip_suspend，得到 %s", out.Status)
 	}
 	// 中途停牌（06-03 缺）：horizon=3 市场到期日=06-04，按市场轴当日出场——
@@ -118,7 +119,7 @@ func TestSimulateLabelHold_MarketAxis(t *testing.T) {
 		{TradeDate: "2026-06-04", Open: 10.7, High: 11.2, Low: 10.4, Close: 11.0},
 		{TradeDate: "2026-06-05", Open: 11.0, High: 11.5, Low: 10.9, Close: 11.3},
 	}
-	out := simulateLabelHold(mid, 0, "600000", "某某股份", 3, 20000, 0, 0, "2026-06-02", "2026-06-04")
+	out := simulateLabelHold(mid, 0, "600000", "某某股份", 3, 20000, 0, 0, "2026-06-02", "2026-06-04", "")
 	if out.Status != btTraded || out.SellDate != "2026-06-04" || out.SellPrice != 11.0 {
 		t.Fatalf("中途停牌应仍在市场到期日 06-04 出场: %+v", out)
 	}
@@ -129,7 +130,7 @@ func TestSimulateLabelHold_MarketAxis(t *testing.T) {
 		{TradeDate: "2026-06-03", Open: 10.3, High: 10.8, Low: 10.1, Close: 10.6},
 		{TradeDate: "2026-06-05", Open: 11.0, High: 11.5, Low: 10.9, Close: 11.3},
 	}
-	out = simulateLabelHold(expSusp, 0, "600000", "某某股份", 3, 20000, 0, 0, "2026-06-02", "2026-06-04")
+	out = simulateLabelHold(expSusp, 0, "600000", "某某股份", 3, 20000, 0, 0, "2026-06-02", "2026-06-04", "")
 	if out.Status != btTraded || out.SellDate != "2026-06-05" || out.Deferred != 1 {
 		t.Fatalf("到期日停牌应顺延复牌首根且 Deferred=1: %+v", out)
 	}
@@ -145,7 +146,7 @@ func TestSimulateLabelHold_ExcursionToExit(t *testing.T) {
 		{TradeDate: "2026-06-03", Open: 9.8, High: 12.0, Low: 9.4, Close: 11.8},
 		{TradeDate: "2026-06-04", Open: 11.8, High: 12.5, Low: 11.5, Close: 12.2},
 	}
-	out := simulateLabelHold(bars, 0, "600000", "某某股份", 3, 20000, 0, 9.5, "", "")
+	out := simulateLabelHold(bars, 0, "600000", "某某股份", 3, 20000, 0, 9.5, "", "", "")
 	if !out.HitStopLoss || out.SellPrice != 9.5 {
 		t.Fatalf("应触止损@9.5: %+v", out)
 	}
@@ -158,6 +159,175 @@ func TestSimulateLabelHold_ExcursionToExit(t *testing.T) {
 	// 出场日 low=9.4（−6%）在触发时点之后与否不可知，保守不计。
 	if out.MaePct != -5.0 {
 		t.Fatalf("MAE 应 -5%%，得到 %v", out.MaePct)
+	}
+}
+
+// TestSimulateLabelHold_T1 h=1 标签必须买入次日卖出（卖出根=买入根+1），绝不当日买卖（A 股 T+1）。
+func TestSimulateLabelHold_T1(t *testing.T) {
+	bars := labelBarsFixture() // 06-01 信号 / 06-02 买入 / 06-03 收盘 10.6 / ...
+	out := simulateLabelHold(bars, 0, "600000", "某某股份", 1, 20000, 0, 0, "", "", "")
+	if out.Status != btTraded {
+		t.Fatalf("应成交: %+v", out)
+	}
+	// 买入根=06-02，卖出根=买入根+1=06-03（绝不 06-02 当日卖出）。
+	if out.BuyDate != "2026-06-02" || out.SellDate != "2026-06-03" || out.SellPrice != 10.6 {
+		t.Fatalf("h=1 应买入次日(06-03)卖出 T+1: %+v", out)
+	}
+}
+
+// TestSimulateLabelHold_ZeroExitGuard 出场根坏数据（close<=0）：不伪造 ≈-100% 成熟收益，
+// 返回 pending（与 simEntry 买入侧 Open<=0 判 skip_suspend 对称）。simulateHold 家族同款守卫。
+func TestSimulateLabelHold_ZeroExitGuard(t *testing.T) {
+	bars := labelBarsFixture()
+	bars[2].Close = 0 // h=1 的出场根（06-03）坏数据
+	if out := simulateLabelHold(bars, 0, "600000", "某某股份", 1, 20000, 0, 0, "", "", ""); out.Status != btPending {
+		t.Fatalf("出场根 close=0 应 pending（不伪造成熟收益），得到 %s net=%v", out.Status, out.NetPct)
+	}
+	hb := labelBarsFixture()
+	hb[2].Close = 0
+	if o := simulateHold(hb, 0, "600000", "某某股份", 1, 20000, "", "", ""); o.Status != btPending {
+		t.Fatalf("simulateHold 出场根 close=0 应 pending，得到 %s", o.Status)
+	}
+}
+
+// TestSimulateLabelHold_MarketDelisted 市场轴已过到期日但个股停更（退市/长停）：末根收盘
+// 强平（Forced），不静默 pending 让坏结局的高分股虚高 Precision；市场轴也未到期日 → 真 pending。
+func TestSimulateLabelHold_MarketDelisted(t *testing.T) {
+	bars := labelBarsFixture() // 个股末根 06-05
+	// 到期日 06-30 在个股数据外，市场轴末日 07-10 ≥ 06-30 → 退市/长停，末根强平。
+	out := simulateLabelHold(bars, 0, "600000", "某某股份", 3, 20000, 0, 0, "2026-06-02", "2026-06-30", "2026-07-10")
+	if out.Status != btTraded || !out.Forced || out.SellDate != "2026-06-05" || out.SellPrice != 11.3 {
+		t.Fatalf("市场已过到期日、个股停更应末根(06-05)强平: %+v", out)
+	}
+	// 对照：市场轴也未到期日 → 真未成熟 pending。
+	out2 := simulateLabelHold(bars, 0, "600000", "某某股份", 3, 20000, 0, 0, "2026-06-02", "2026-06-30", "2026-06-06")
+	if out2.Status != btPending {
+		t.Fatalf("市场轴未到期日应 pending: %+v", out2)
+	}
+}
+
+// TestRecordBatchFactsRawActionPreserved #11：verify reject 把 pick 的 Action 由 buy 改写
+// 为 watch 后，事件 RawAction 须仍记复核前的 buy（rawActionBySym 快照），PostGateAction
+// 记复核后终值 watch——二者相异才使门控前后对照有意义。
+func TestRecordBatchFactsRawActionPreserved(t *testing.T) {
+	setupTestDB(t)
+	cleanLabelTables(t)
+
+	created, _ := time.Parse("2006-01-02 15:04", "2026-06-01 15:30")
+	batch := &model.RecommendationBatch{UserID: 1, Type: model.RecTypeShortTerm, Market: "cn",
+		Status: model.RecStatusSuccess, CreatedAt: created}
+	common.DB.Create(batch)
+	rec := model.Recommendation{BatchID: batch.ID, UserID: 1, Symbol: "600100", Market: "cn",
+		Name: "甲", Action: model.RecActionWatch, RefPrice: 10}
+	common.DB.Create(&rec)
+
+	pool := []candidate{{Symbol: "600100", Market: "cn", Name: "甲", Price: 10, SentToLLM: true}}
+	// 复核后 pick.Action=watch（reject 降级）；快照记复核前 buy。
+	picks := []recPick{{Symbol: "600100", Action: model.RecActionWatch}}
+	raw := map[string]string{"600100": model.RecActionBuy}
+	if err := recordBatchFacts(batch, pool, []model.Recommendation{rec}, picks, nil, nil, nil, raw); err != nil {
+		t.Fatalf("recordBatchFacts 失败: %v", err)
+	}
+	var ev model.RecommendationCandidateEvent
+	common.DB.Where("symbol = ?", "600100").First(&ev)
+	if ev.CandidateStage != model.CandStagePicked {
+		t.Fatalf("应 picked 事件: %+v", ev)
+	}
+	if ev.RawAction != model.RecActionBuy {
+		t.Fatalf("RawAction 应保留复核前 buy，得到 %s", ev.RawAction)
+	}
+	if ev.PostGateAction != model.RecActionWatch {
+		t.Fatalf("PostGateAction 应为复核后 watch，得到 %s", ev.PostGateAction)
+	}
+}
+
+// TestRecordBatchFactsZeroPicks #9：零推荐批次（无 picks/items）仍落全池事件 + 影子标签，
+// picked 分支自动跳过不伪造入选，只落 llm_list/filtered/scored + 每候选影子标签。
+func TestRecordBatchFactsZeroPicks(t *testing.T) {
+	setupTestDB(t)
+	cleanLabelTables(t)
+
+	created, _ := time.Parse("2006-01-02 15:04", "2026-06-01 15:30")
+	batch := &model.RecommendationBatch{UserID: 1, Type: model.RecTypeShortTerm, Market: "cn",
+		Status: model.RecStatusDegraded, CreatedAt: created}
+	common.DB.Create(batch)
+
+	pool := []candidate{
+		{Symbol: "600100", Market: "cn", Name: "甲", Price: 10, Score: 80, SentToLLM: true, Sources: []string{"gainer"}},
+		{Symbol: "600200", Market: "cn", Name: "乙", Price: 20, Score: 70, Sources: []string{"active"}},
+		{Symbol: "600300", Market: "cn", Name: "丙", Price: 30, Sources: []string{"turnover"}, Excluded: "换手率超限"},
+	}
+	rejected := []recReject{{Symbol: "600100", Reason: "量价背离"}}
+	if err := recordBatchFacts(batch, pool, nil, nil, rejected, nil, nil, nil); err != nil {
+		t.Fatalf("零推荐 recordBatchFacts 失败: %v", err)
+	}
+
+	var events []model.RecommendationCandidateEvent
+	common.DB.Order("symbol").Find(&events)
+	if len(events) != 3 {
+		t.Fatalf("应 3 条事件，得到 %d", len(events))
+	}
+	// 无 picks：SentToLLM 的 600100 落 llm_list（非 picked）、600200 scored、600300 filtered。
+	if events[0].CandidateStage != model.CandStageLLMList || events[0].RejectionReason != "量价背离" {
+		t.Fatalf("600100 应 llm_list 带落选理由: %+v", events[0])
+	}
+	if events[1].CandidateStage != model.CandStageScored {
+		t.Fatalf("600200 应 scored: %+v", events[1])
+	}
+	if events[2].CandidateStage != model.CandStageFiltered {
+		t.Fatalf("600300 应 filtered: %+v", events[2])
+	}
+	// 无 picked 事件（不伪造入选）。
+	var picked int64
+	common.DB.Model(&model.RecommendationCandidateEvent{}).
+		Where("candidate_stage = ?", model.CandStagePicked).Count(&picked)
+	if picked != 0 {
+		t.Fatalf("零推荐不应有 picked 事件，得到 %d", picked)
+	}
+	// 影子标签：3 候选 × 5 持有期 = 15 行，全部挂事件（RecommendationID=0）。
+	var labels []model.RecommendationLabel
+	common.DB.Find(&labels)
+	if len(labels) != 15 {
+		t.Fatalf("应 15 条影子标签，得到 %d", len(labels))
+	}
+	for _, l := range labels {
+		if l.RecommendationID != 0 || l.CandidateEventID == 0 || l.MaturityStatus != model.LabelPending {
+			t.Fatalf("零推荐标签应全为 pending 影子标签: %+v", l)
+		}
+	}
+	// 批次落库成功（facts_recorded 由 runGeneration 的 withRetry 包装置位，此处直调不置）。
+	if batch.FactsRecorded {
+		t.Fatalf("直调 recordBatchFacts 不应改 FactsRecorded")
+	}
+}
+
+// TestApplyBuyPositionSizing #21：watch 条目 PositionPct=0 且不参与 Σ/归一化，
+// buy 条目按目标波动模型分仓——watch 的存在不稀释 buy 仓位。
+func TestApplyBuyPositionSizing(t *testing.T) {
+	poolBySymbol := map[string]candidate{
+		"A": {Symbol: "A", Factors: &candFactors{Volatility20: 1}}, // 年化 15.87%→上限 20；base=113→20；neutral×0.6=12
+		"B": {Symbol: "B", Factors: &candFactors{Volatility20: 1}},
+		"W": {Symbol: "W", Factors: &candFactors{Volatility20: 1}}, // watch：不给仓位
+	}
+	picks := []recPick{
+		{Symbol: "A", Action: model.RecActionBuy},
+		{Symbol: "W", Action: model.RecActionWatch},
+		{Symbol: "B", Action: model.RecActionBuy},
+	}
+	applyBuyPositionSizing(picks, poolBySymbol, RegimeNeutral, defaultSizingParams())
+	if picks[0].PositionPct != 12 {
+		t.Fatalf("buy A 应 12%%（watch 不稀释、不触发归一化），得到 %v（%s）", picks[0].PositionPct, picks[0].PositionWhy)
+	}
+	if picks[2].PositionPct != 12 {
+		t.Fatalf("buy B 应 12%%，得到 %v", picks[2].PositionPct)
+	}
+	if picks[1].PositionPct != 0 || picks[1].PositionWhy == "" {
+		t.Fatalf("watch W 应 PositionPct=0 且有说明: %+v", picks[1])
+	}
+	// buy 合计 24% ≤ neutral 预算 60%：未归一化，若把 watch 误计入（3×12=36 仍 ≤60）也不缩，
+	// 故再验相关性：watch 不得成为 buy 的相关性对手（此处无序列，MaxCorr=0，corrNote 为空）。
+	if picks[0].PositionWhy == "" {
+		t.Fatalf("buy 应有仓位说明")
 	}
 }
 
@@ -435,7 +605,9 @@ func TestRecordBatchFactsAndAdvance(t *testing.T) {
 	}
 	picks := []recPick{{Symbol: "600100", Action: model.RecActionBuy}}
 	gates := []gateNote{{Symbol: "600100", GateType: model.GateRegimeShadow, WouldBeAction: model.RecActionWatch, Reason: "防守档影子"}}
-	recordBatchFacts(batch, pool, []model.Recommendation{rec}, picks, []recReject{{Symbol: "600200", Reason: "量价背离"}}, gates, map[string]string{"600100": "银行"})
+	if err := recordBatchFacts(batch, pool, []model.Recommendation{rec}, picks, []recReject{{Symbol: "600200", Reason: "量价背离"}}, gates, map[string]string{"600100": "银行"}, nil); err != nil {
+		t.Fatalf("recordBatchFacts 失败: %v", err)
+	}
 
 	// 事件断言：3 只候选各一行，stage 与门控正确。
 	var events []model.RecommendationCandidateEvent
@@ -546,6 +718,48 @@ func TestAdvanceLabelsNextDaySuspend(t *testing.T) {
 		t.Fatalf("次日停牌应 skipped/skip_suspend（不得用复牌远期价格成交）: %+v", got)
 	}
 }
+
+// TestAdvanceLabelForcedStaleClose 已入场后长停/退市：无市场轴可判到期，超 90 自然日仍
+// pending → 按个股末根收盘强平（Forced、matured、收益字段完整），不永久滞留；旧 l1 行结算
+// 后回写当前版本 l2。
+func TestAdvanceLabelForcedStaleClose(t *testing.T) {
+	setupTestDB(t)
+	cleanLabelTables(t) // 清空交易日历 → 无市场轴 → 走个股 K 线格子口径 + 90 日兜底
+
+	signalDate := time.Now().AddDate(0, 0, -100).Format("2006-01-02") // 超 labelNoDataAfterDays=90
+	// 个股仅信号日 + 2 根日线（horizon=5 走不完；此后停更=长停/退市）。
+	seedLabelBars(t, "600100", signalDate, 3, 10)
+
+	batch := &model.RecommendationBatch{UserID: 1, Type: model.RecTypeShortTerm, Market: "cn",
+		Status: model.RecStatusSuccess, CreatedAt: time.Now().AddDate(0, 0, -100)}
+	common.DB.Create(batch)
+	rec := model.Recommendation{BatchID: batch.ID, UserID: 1, Symbol: "600100", Market: "cn",
+		Action: model.RecActionBuy, RefPrice: 10}
+	common.DB.Create(&rec)
+	label := model.RecommendationLabel{
+		RecommendationID: rec.ID, HorizonDays: 5, EntryMode: model.EntryModeNextOpen,
+		BatchID: batch.ID, UserID: 1, Symbol: "600100", Market: "cn",
+		Type: model.RecTypeShortTerm, Action: model.RecActionBuy,
+		SignalDate: signalDate, MaturityStatus: model.LabelPending, LabelVersion: "l1", // 旧口径行
+	}
+	common.DB.Create(&label)
+
+	if _, err := AdvanceRecommendationLabels(context.Background(), nil); err != nil {
+		t.Fatalf("推进失败: %v", err)
+	}
+	var got model.RecommendationLabel
+	common.DB.First(&got, label.ID)
+	if got.MaturityStatus != model.LabelMatured || !got.Forced {
+		t.Fatalf("已入场超 90 日应末根强平 matured/forced: %+v", got)
+	}
+	if got.EntryDate == "" || got.ExitDate == "" || got.NetReturnPct == 0 {
+		t.Fatalf("强平应有完整入出场与收益: %+v", got)
+	}
+	if got.LabelVersion != labelVersion {
+		t.Fatalf("旧 l1 行结算后应回写版本 %s，得到 %s", labelVersion, got.LabelVersion)
+	}
+}
+
 // TestBackfillActualLabels 持仓血缘存在时补建 actual_position 行并按实际买入价结算。
 func TestBackfillActualLabels(t *testing.T) {
 	setupTestDB(t)
@@ -560,8 +774,10 @@ func TestBackfillActualLabels(t *testing.T) {
 		Action: model.RecActionBuy, RefPrice: 10}
 	common.DB.Create(&rec)
 	pool := []candidate{{Symbol: "600100", Market: "cn", Name: "甲", Price: 10, SentToLLM: true}}
-	recordBatchFacts(batch, pool, []model.Recommendation{rec},
-		[]recPick{{Symbol: "600100", Action: model.RecActionBuy}}, nil, nil, nil)
+	if err := recordBatchFacts(batch, pool, []model.Recommendation{rec},
+		[]recPick{{Symbol: "600100", Action: model.RecActionBuy}}, nil, nil, nil, nil); err != nil {
+		t.Fatalf("recordBatchFacts 失败: %v", err)
+	}
 
 	// 用户以 10.30 实际建仓（次日追高买入）。
 	pos := model.Position{UserID: 1, Symbol: "600100", Market: "cn", Status: "holding",
@@ -736,6 +952,10 @@ func TestRecAttribution(t *testing.T) {
 	})
 	rows = append(rows, mk(5, "momentum", 0, 0))
 	rows[len(rows)-1].MaturityStatus = model.LabelPending
+	// 退市/长停末根强平的成熟买入：收益不可靠，从主统计剔除单列计数（不进 Sample/momentum）。
+	forcedRow := mk(7, "momentum", -95, 20)
+	forcedRow.Forced = true
+	rows = append(rows, forcedRow)
 	for i := range rows {
 		if err := common.DB.Create(&rows[i]).Error; err != nil {
 			t.Fatalf("插入失败: %v", err)
@@ -748,6 +968,9 @@ func TestRecAttribution(t *testing.T) {
 	}
 	if rep.Sample != 5 || rep.SampleBuy != 4 || rep.Pending != 1 {
 		t.Fatalf("成熟样本应 5（buy 4）、pending 1，得到 %d/%d/%d", rep.Sample, rep.SampleBuy, rep.Pending)
+	}
+	if rep.ForcedExcluded != 1 {
+		t.Fatalf("强平样本应单列剔除 1，得到 %d", rep.ForcedExcluded)
 	}
 	var momentum, actionBuy, actionWatch *AttributionCell
 	for i := range rep.Groups {

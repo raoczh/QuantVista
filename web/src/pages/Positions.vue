@@ -108,6 +108,8 @@ function todayStr() {
 // ---------- 建仓 / 编辑 ----------
 const editModal = ref(false)
 const editing = ref(false)
+// 编辑已平仓持仓：后端仅接受 buy_reason/user_note，其余字段隐藏，避免“保存成功”误导。
+const editingClosed = ref(false)
 const form = ref<PositionInput & { id: number | null }>({
   id: null,
   symbol: '',
@@ -176,6 +178,7 @@ const riskCalc = computed(() => {
 
 function openCreate(prefill?: { symbol?: string; market?: string; name?: string; recId?: number }) {
   editing.value = false
+  editingClosed.value = false
   form.value = {
     id: null,
     symbol: prefill?.symbol || '',
@@ -198,6 +201,7 @@ function openCreate(prefill?: { symbol?: string; market?: string; name?: string;
 }
 function openEdit(p: Position) {
   editing.value = true
+  editingClosed.value = p.status === 'closed'
   form.value = {
     id: p.id,
     symbol: p.symbol,
@@ -243,22 +247,26 @@ async function submit() {
   }
   submitting.value = true
   try {
-    const payload: PositionInput = {
-      symbol: f.symbol?.trim(),
-      market: f.market,
-      position_type: f.position_type,
-      buy_price: f.buy_price,
-      buy_date: f.buy_date,
-      quantity: f.quantity,
-      buy_fee: f.buy_fee,
-      buy_tax: f.buy_tax,
-      buy_reason: f.buy_reason,
-      user_note: f.user_note,
-      plan_stop_loss: f.plan_stop_loss || 0,
-      plan_take_profit: f.plan_take_profit || 0,
-      checklist_json: checklistToJSON(),
-      recommendation_id: f.recommendation_id || 0,
-    }
+    // 已平仓持仓：后端仅接受 buy_reason/user_note，只提交这两项，避免误导用户以为改了成交数据。
+    const payload: PositionInput =
+      editing.value && editingClosed.value
+        ? { buy_reason: f.buy_reason, user_note: f.user_note }
+        : {
+            symbol: f.symbol?.trim(),
+            market: f.market,
+            position_type: f.position_type,
+            buy_price: f.buy_price,
+            buy_date: f.buy_date,
+            quantity: f.quantity,
+            buy_fee: f.buy_fee,
+            buy_tax: f.buy_tax,
+            buy_reason: f.buy_reason,
+            user_note: f.user_note,
+            plan_stop_loss: f.plan_stop_loss || 0,
+            plan_take_profit: f.plan_take_profit || 0,
+            checklist_json: checklistToJSON(),
+            recommendation_id: f.recommendation_id || 0,
+          }
     if (editing.value && f.id) await updatePosition(f.id, payload)
     else await createPosition(payload)
     editModal.value = false
@@ -571,53 +579,58 @@ onMounted(async () => {
       style="max-width: 520px"
     >
       <n-form label-placement="top">
-        <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
-          <n-gi>
-            <n-form-item label="股票代码">
-              <n-input v-model:value="form.symbol" placeholder="如 600000" :disabled="editing" />
-            </n-form-item>
-          </n-gi>
-          <n-gi>
-            <n-form-item label="市场">
-              <n-select v-model:value="form.market" :options="marketOptions" :disabled="editing" />
-            </n-form-item>
-          </n-gi>
-        </n-grid>
-        <n-form-item label="类型">
-          <n-radio-group v-model:value="form.position_type">
-            <n-radio-button value="short_term">短线</n-radio-button>
-            <n-radio-button value="long_term">长线</n-radio-button>
-          </n-radio-group>
-        </n-form-item>
-        <n-grid cols="1 s:3" responsive="screen" :x-gap="12">
-          <n-gi>
-            <n-form-item label="买入价">
-              <n-input-number v-model:value="form.buy_price" :min="0" :precision="4" style="width: 100%" />
-            </n-form-item>
-          </n-gi>
-          <n-gi>
-            <n-form-item label="数量">
-              <n-input-number v-model:value="form.quantity" :min="0" style="width: 100%" />
-            </n-form-item>
-          </n-gi>
-          <n-gi>
-            <n-form-item label="买入日期">
-              <n-input v-model:value="form.buy_date" placeholder="YYYY-MM-DD" />
-            </n-form-item>
-          </n-gi>
-        </n-grid>
-        <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
-          <n-gi>
-            <n-form-item label="买入手续费">
-              <n-input-number v-model:value="form.buy_fee" :min="0" :precision="2" style="width: 100%" />
-            </n-form-item>
-          </n-gi>
-          <n-gi>
-            <n-form-item label="买入税费">
-              <n-input-number v-model:value="form.buy_tax" :min="0" :precision="2" style="width: 100%" />
-            </n-form-item>
-          </n-gi>
-        </n-grid>
+        <n-alert v-if="editingClosed" type="info" :bordered="false" style="margin-bottom: 14px">
+          已平仓持仓仅可修改「买入理由」与「备注」，其余成交数据不可再更改。
+        </n-alert>
+        <template v-if="!editingClosed">
+          <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
+            <n-gi>
+              <n-form-item label="股票代码">
+                <n-input v-model:value="form.symbol" placeholder="如 600000" :disabled="editing" />
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item label="市场">
+                <n-select v-model:value="form.market" :options="marketOptions" :disabled="editing" />
+              </n-form-item>
+            </n-gi>
+          </n-grid>
+          <n-form-item label="类型">
+            <n-radio-group v-model:value="form.position_type">
+              <n-radio-button value="short_term">短线</n-radio-button>
+              <n-radio-button value="long_term">长线</n-radio-button>
+            </n-radio-group>
+          </n-form-item>
+          <n-grid cols="1 s:3" responsive="screen" :x-gap="12">
+            <n-gi>
+              <n-form-item label="买入价">
+                <n-input-number v-model:value="form.buy_price" :min="0" :precision="4" style="width: 100%" />
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item label="数量">
+                <n-input-number v-model:value="form.quantity" :min="0" style="width: 100%" />
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item label="买入日期">
+                <n-input v-model:value="form.buy_date" placeholder="YYYY-MM-DD" />
+              </n-form-item>
+            </n-gi>
+          </n-grid>
+          <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
+            <n-gi>
+              <n-form-item label="买入手续费">
+                <n-input-number v-model:value="form.buy_fee" :min="0" :precision="2" style="width: 100%" />
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item label="买入税费">
+                <n-input-number v-model:value="form.buy_tax" :min="0" :precision="2" style="width: 100%" />
+              </n-form-item>
+            </n-gi>
+          </n-grid>
+        </template>
         <n-form-item label="买入理由">
           <n-input
             v-model:value="form.buy_reason"
@@ -632,42 +645,44 @@ onMounted(async () => {
         </n-form-item>
 
         <!-- 风险计划 + 仓位风险计算器（实时纯前端计算） -->
-        <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
-          <n-gi>
-            <n-form-item label="计划止损价（可选）">
-              <n-input-number v-model:value="form.plan_stop_loss" :min="0" :precision="4" style="width: 100%" />
-            </n-form-item>
-          </n-gi>
-          <n-gi>
-            <n-form-item label="计划止盈价（可选）">
-              <n-input-number v-model:value="form.plan_take_profit" :min="0" :precision="4" style="width: 100%" />
-            </n-form-item>
-          </n-gi>
-        </n-grid>
-        <div v-if="riskCalc" class="risk-calc qv-tnum">
-          <span>投入 {{ riskCalc.cost.toFixed(0) }} 元</span>
-          <template v-if="riskCalc.maxLoss != null">
-            <span :style="{ color: vars.errorColor }">
-              触发止损亏 {{ riskCalc.maxLoss.toFixed(0) }} 元（-{{ riskCalc.maxLossPct!.toFixed(1) }}%）
+        <template v-if="!editingClosed">
+          <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
+            <n-gi>
+              <n-form-item label="计划止损价（可选）">
+                <n-input-number v-model:value="form.plan_stop_loss" :min="0" :precision="4" style="width: 100%" />
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item label="计划止盈价（可选）">
+                <n-input-number v-model:value="form.plan_take_profit" :min="0" :precision="4" style="width: 100%" />
+              </n-form-item>
+            </n-gi>
+          </n-grid>
+          <div v-if="riskCalc" class="risk-calc qv-tnum">
+            <span>投入 {{ riskCalc.cost.toFixed(0) }} 元</span>
+            <template v-if="riskCalc.maxLoss != null">
+              <span :style="{ color: vars.errorColor }">
+                触发止损亏 {{ riskCalc.maxLoss.toFixed(0) }} 元（-{{ riskCalc.maxLossPct!.toFixed(1) }}%）
+              </span>
+            </template>
+            <span v-else class="risk-hint">填写止损价即可预估最大亏损</span>
+            <span v-if="riskCalc.gain != null && riskCalc.maxLoss" >
+              盈亏比 {{ (riskCalc.gain / riskCalc.maxLoss).toFixed(1) }}
             </span>
-          </template>
-          <span v-else class="risk-hint">填写止损价即可预估最大亏损</span>
-          <span v-if="riskCalc.gain != null && riskCalc.maxLoss" >
-            盈亏比 {{ (riskCalc.gain / riskCalc.maxLoss).toFixed(1) }}
-          </span>
-        </div>
-
-        <!-- 买入前检查清单 -->
-        <div class="checklist">
-          <div class="checklist-head">
-            <span>买入前检查（{{ checklistDone }}/{{ CHECKLIST.length }}）</span>
-            <span class="risk-hint">勾选状态会随持仓保存，卖出复盘时对照</span>
           </div>
-          <label v-for="(text, i) in CHECKLIST" :key="i" class="check-item">
-            <input v-model="checklist[i]" type="checkbox" />
-            <span>{{ text }}</span>
-          </label>
-        </div>
+
+          <!-- 买入前检查清单 -->
+          <div class="checklist">
+            <div class="checklist-head">
+              <span>买入前检查（{{ checklistDone }}/{{ CHECKLIST.length }}）</span>
+              <span class="risk-hint">勾选状态会随持仓保存，卖出复盘时对照</span>
+            </div>
+            <label v-for="(text, i) in CHECKLIST" :key="i" class="check-item">
+              <input v-model="checklist[i]" type="checkbox" />
+              <span>{{ text }}</span>
+            </label>
+          </div>
+        </template>
       </n-form>
       <template #footer>
         <div class="modal-footer">

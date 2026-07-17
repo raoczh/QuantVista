@@ -329,7 +329,7 @@ func TestRunWalkForwardEndToEnd(t *testing.T) {
 	// 指标不变式 + alpha 如实缺席（基准不可得）。
 	for _, sec := range rep.Sections {
 		for _, r := range sec.Rows {
-			if r.Trades+r.Skipped+r.Pending != r.Picked {
+			if r.Trades+r.Skipped+r.Forced+r.Pending != r.Picked {
 				t.Fatalf("名额守恒破裂：%+v", r)
 			}
 			if r.Picked > r.Signals*rep.TopK {

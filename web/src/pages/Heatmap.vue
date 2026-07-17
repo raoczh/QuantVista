@@ -19,17 +19,24 @@ const loading = ref(false)
 const chartEl = ref<HTMLDivElement | null>(null)
 let chart: echarts.ECharts | null = null
 
+// 板块切换（industry/concept）竞态守卫：快速来回切时旧响应不覆盖新选择。
+let loadSeq = 0
+
 async function load(silent = false) {
+  const mySeq = ++loadSeq
   if (!silent) loading.value = true
   try {
-    boards.value = await getBoardHeatmap('cn', kind.value)
+    const data = await getBoardHeatmap('cn', kind.value)
+    if (mySeq !== loadSeq) return
+    boards.value = data
     await nextTick()
     renderChart()
   } catch (e) {
+    if (mySeq !== loadSeq) return
     boards.value = []
     if (!silent) message.error('板块热度加载失败：' + (e as Error).message)
   } finally {
-    if (!silent) loading.value = false
+    if (mySeq === loadSeq && !silent) loading.value = false
   }
 }
 

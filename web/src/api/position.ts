@@ -93,6 +93,24 @@ export interface CloseInput {
   lesson_learned?: string
 }
 
+// 写接口（建仓/改仓/平仓）返回裸持仓模型，不含列表接口才回填的行情/收益富化字段。
+export type PositionBase = Omit<
+  Position,
+  | 'current_price'
+  | 'quote_ok'
+  | 'cost'
+  | 'market_value'
+  | 'profit_amount'
+  | 'profit_pct'
+  | 'realized'
+  | 'held_trade_days'
+  | 'short_term_review'
+  | 'near_stop_loss'
+  | 'below_stop_loss'
+  | 'last_analyzed_at'
+  | 'analysis_stale'
+>
+
 export function listPositions(status: 'holding' | 'closed' | 'all' = 'all') {
   return request<Position[]>({ url: '/positions', params: { status } })
 }
@@ -102,15 +120,15 @@ export function getPortfolioOverview() {
 }
 
 export function createPosition(input: PositionInput) {
-  return request<Position>({ url: '/positions', method: 'post', data: input })
+  return request<PositionBase>({ url: '/positions', method: 'post', data: input })
 }
 
 export function updatePosition(id: number, input: PositionInput) {
-  return request<Position>({ url: `/positions/${id}`, method: 'put', data: input })
+  return request<PositionBase>({ url: `/positions/${id}`, method: 'put', data: input })
 }
 
 export function closePosition(id: number, input: CloseInput) {
-  return request<Position>({ url: `/positions/${id}/close`, method: 'post', data: input })
+  return request<PositionBase>({ url: `/positions/${id}/close`, method: 'post', data: input })
 }
 
 export function deletePosition(id: number) {

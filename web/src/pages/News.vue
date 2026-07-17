@@ -39,19 +39,28 @@ const loading = ref(false)
 const loadingMore = ref(false)
 const loadError = ref('')
 
-async function refresh(silent = false) {
+// 筛选切换/自动刷新竞态守卫：快速切来源或改代码时旧响应不覆盖新结果。
+// 返回是否成功，供 loadMore 感知刷新失败以回滚分页。
+let refreshSeq = 0
+async function refresh(silent = false): Promise<boolean> {
+  const mySeq = ++refreshSeq
   if (!silent) loading.value = true
   try {
-    items.value = await getNews({
+    const data = await getNews({
       symbol: symbol.value || undefined,
       source: source.value || undefined,
       limit: limit.value,
     })
+    if (mySeq !== refreshSeq) return false
+    items.value = data
     loadError.value = ''
+    return true
   } catch (e) {
+    if (mySeq !== refreshSeq) return false
     if (!silent) loadError.value = (e as Error).message
+    return false
   } finally {
-    loading.value = false
+    if (mySeq === refreshSeq) loading.value = false
   }
 }
 
@@ -78,9 +87,13 @@ function clearSymbol() {
 const hasMore = computed(() => items.value.length >= limit.value && limit.value < MAX_LIMIT)
 async function loadMore() {
   loadingMore.value = true
+  const prevLimit = limit.value
+  const prevCount = items.value.length
   limit.value = Math.min(limit.value + PAGE_SIZE, MAX_LIMIT)
   try {
-    await refresh(true)
+    const ok = await refresh(true)
+    // 刷新失败且未拿到更多条目：回滚 limit，让“加载更多”按钮保留、下次可重试。
+    if (!ok && items.value.length <= prevCount) limit.value = prevLimit
   } finally {
     loadingMore.value = false
   }

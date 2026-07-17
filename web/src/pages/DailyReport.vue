@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NButton,
@@ -23,7 +23,7 @@ import {
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
 import { useStockActions } from '@/composables/useStockActions'
-import { pollUntil } from '@/lib/poll'
+import { pollUntil, isPollCancelled } from '@/lib/poll'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
@@ -89,12 +89,19 @@ async function pick(id: number | null) {
 
 // trackProcessing 轮询后台任务直到脱离 processing（生成接口现在立即返回任务，
 // 复盘+推荐在服务端后台并行执行——关闭/刷新页面都不影响任务本身）。
+// 页面卸载时取消轮询，避免后台请求空转与已销毁组件的状态回填。
+let pollAbort: AbortController | null = null
+onBeforeUnmount(() => pollAbort?.abort())
+
 async function trackProcessing(id: number) {
   generating.value = true
+  pollAbort?.abort()
+  pollAbort = new AbortController()
   try {
     const v = await pollUntil(
       () => getDailyReport(id),
       (r) => r.status !== 'processing',
+      { signal: pollAbort.signal },
     )
     if (selectedId.value === id || !selectedId.value) {
       current.value = v
@@ -107,6 +114,7 @@ async function trackProcessing(id: number) {
       message.success('日报已生成')
     }
   } catch (e) {
+    if (isPollCancelled(e)) return
     message.error((e as Error).message)
   } finally {
     generating.value = false

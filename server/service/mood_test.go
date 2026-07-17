@@ -231,3 +231,42 @@ func TestMoodTargetDate(t *testing.T) {
 		t.Errorf("周一早应取上周五，got %s", got)
 	}
 }
+
+// runMoodPools 双游标拆分：涨停池成功推进池游标、人气榜未跑时人气游标独立保持为空
+// （早前共用一个游标，人气榜失败会被涨停池成功带过、当天不再重试）；池游标已达标不重采。
+func TestRunMoodPoolsSplitCursors(t *testing.T) {
+	setupTestDB(t)
+	cleanMoodTables(t)
+	common.DB.Where("`key` IN ?", []string{optMoodPoolDay, optMoodPopDay}).Delete(&model.Option{})
+	t.Cleanup(func() {
+		common.DB.Where("`key` IN ?", []string{optMoodPoolDay, optMoodPopDay}).Delete(&model.Option{})
+	})
+
+	svc := NewMoodService()
+	ztCalls := 0
+	svc.em.SetFetchForTest(func(ctx context.Context, url string, headers map[string]string) ([]byte, int, error) {
+		if strings.Contains(url, "getTopicZTPool") {
+			ztCalls++
+			return []byte(`{"rc":0,"data":{"tc":1,"qdate":20260708,"pool":[{"c":"002841","n":"视源股份","p":43080,"zdp":10.01,"amount":238093079,"ltsz":22459561813,"hs":1.06,"lbc":1,"fbt":92500,"lbt":92500,"fund":520606032,"zbc":0,"hybk":"消费电子","zttj":{"days":1,"ct":1}}]}}`), 200, nil
+		}
+		return []byte(`{"rc":102,"data":null}`), 200, nil // 炸板/昨涨停 ErrNoData（正常态）
+	})
+
+	target := "2026-07-08"
+	// target != today（今传 07-09）→ 人气榜跳过；涨停池成功推进池游标。
+	svc.runMoodPools(context.Background(), target, "2026-07-09")
+	if optionValue(optMoodPoolDay) != target {
+		t.Fatalf("涨停池成功应推进池游标, got %q", optionValue(optMoodPoolDay))
+	}
+	if optionValue(optMoodPopDay) != "" {
+		t.Fatalf("人气榜未跑，人气游标应独立保持空（游标已拆分，不再被涨停池带过）, got %q", optionValue(optMoodPopDay))
+	}
+	if ztCalls != 1 {
+		t.Fatalf("涨停池应采一次, got %d", ztCalls)
+	}
+	// 再跑同日：池游标已达 target，涨停池不再重采（各自游标独立判断）。
+	svc.runMoodPools(context.Background(), target, "2026-07-09")
+	if ztCalls != 1 {
+		t.Fatalf("池游标已达标不应重采, got %d", ztCalls)
+	}
+}

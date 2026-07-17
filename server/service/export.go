@@ -54,13 +54,38 @@ func (s *ExportService) Export(userID int64, kind string) ([]byte, string, error
 }
 
 // writeCSV 编码为带 UTF-8 BOM 的 CSV（Excel 双击打开不乱码）。
+// 每个单元格过 sanitizeCSVCell 防公式注入（用户可控文本如 buy_reason/name 可能以 = + - @
+// 开头，被 Excel/WPS 当公式执行）。
 func writeCSV(rows [][]string) []byte {
 	var buf bytes.Buffer
 	buf.WriteString("\xEF\xBB\xBF")
 	w := csv.NewWriter(&buf)
-	_ = w.WriteAll(rows)
+	for _, row := range rows {
+		cells := make([]string, len(row))
+		for i, c := range row {
+			cells[i] = sanitizeCSVCell(c)
+		}
+		_ = w.Write(cells)
+	}
 	w.Flush()
 	return buf.Bytes()
+}
+
+// sanitizeCSVCell 防 CSV 公式注入：Excel/WPS 会把以 = + - @ Tab 回车开头的单元格当公式执行。
+// 对这类前缀的单元格前置单引号强制按纯文本处理；但合法数值（含负号/正号/科学计数）本身
+// 就以 - + 开头且不是公式，直接放行以免污染数字列（buy_price 等），只对非数值文本加固。
+func sanitizeCSVCell(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		if _, err := strconv.ParseFloat(s, 64); err == nil {
+			return s // 纯数值不是公式，保持数字列原样
+		}
+		return "'" + s
+	}
+	return s
 }
 
 func f2(v float64) string {

@@ -25,7 +25,8 @@ import (
 //   - 游标（options）记「已成功同步的交易日」，启动补跑按目标日与游标比对，幂等。
 
 const (
-	optMoodPoolDay = "mood_pool_day" // 涨停池+人气榜 已成功同步的交易日
+	optMoodPoolDay = "mood_pool_day" // 涨停池 已成功同步的交易日（沿用旧 key 保兼容）
+	optMoodPopDay  = "mood_pop_day"  // 人气榜 已成功同步的交易日（与涨停池各自独立推进）
 	optMoodLhbDay  = "mood_lhb_day"  // 龙虎榜+机构统计 已成功同步的交易日
 
 	moodPoolCutoffMin = 16*60 + 35 // 16:35 后当日涨停池数据视为可采
@@ -135,7 +136,7 @@ func prevOpenTradeDate(before string) string {
 
 // SyncZTPools 采集某交易日涨停池快照并聚合情绪温度计。tradeDate 形如 2026-07-08。
 // 涨停池失败整轮失败（聚合缺主体无意义）；炸板/昨日涨停池 ErrNoData 是正常态
-//（情绪冰点日可为空），按 0 家/缺失聚合；网络类失败则整轮失败防半截聚合。
+// （情绪冰点日可为空），按 0 家/缺失聚合；网络类失败则整轮失败防半截聚合。
 func (s *MoodService) SyncZTPools(ctx context.Context, tradeDate string) error {
 	if common.DB == nil {
 		return errors.New("数据库不可用")
@@ -498,18 +499,12 @@ func (s *MoodService) StockLhbRecords(symbol string, limit int) []LhbRecordView 
 
 // ---------- 后台任务 ----------
 
-// StartMoodJobs 盘后错峰采集：16:35 涨停池+人气榜、18:45 龙虎榜+机构统计。
-// 启动 3 分钟后按游标补跑缺口（涨停池上游不可回溯，补跑失败即诚实缺失该日）。
-func StartMoodJobs() *MoodService {
-	svc := NewMoodService()
-	runPools := func() {
-		target := moodTargetDate(time.Now(), moodPoolCutoffMin)
-		if optionValue(optMoodPoolDay) == target {
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-		if err := svc.SyncZTPools(ctx, target); err != nil {
+// runMoodPools 执行当日涨停池 + 人气榜采集，两者各自游标独立推进（抽出供测试）。
+// 涨停池与人气榜早前共用一个游标：人气榜是实时榜（不可回溯，错过=真丢失），失败会被
+// 涨停池成功带过、当天不再重试。拆成两个 option key 后各自成功才推进、各自判断是否需跑。
+func (s *MoodService) runMoodPools(ctx context.Context, target, today string) {
+	if optionValue(optMoodPoolDay) != target {
+		if err := s.SyncZTPools(ctx, target); err != nil {
 			// 涨停池上游不可回溯：错过采集窗口后（如次日盘中补跑昨日）该日数据
 			// 已翻页，ErrNoData 是预期的诚实缺失，不当故障刷警告。
 			if errors.Is(err, datasource.ErrNoData) {
@@ -517,16 +512,30 @@ func StartMoodJobs() *MoodService {
 			} else {
 				common.SysWarn("涨停池采集失败 %s: %v", target, err)
 			}
-			return
+		} else {
+			_ = model.UpsertOption(optMoodPoolDay, target)
+			common.SysLog("涨停池情绪数据采集完成 %s", target)
 		}
-		// 人气榜是实时榜（无历史），仅当目标日=今天时采集；补昨日无意义。
-		if target == time.Now().Format("2006-01-02") {
-			if err := svc.SyncPopularity(ctx, target); err != nil {
-				common.SysWarn("人气榜采集失败: %v", err)
-			}
+	}
+	// 人气榜是实时榜（无历史），仅当目标日=今天时采集；补昨日无意义。
+	if target == today && optionValue(optMoodPopDay) != target {
+		if err := s.SyncPopularity(ctx, target); err != nil {
+			common.SysWarn("人气榜采集失败: %v", err)
+		} else {
+			_ = model.UpsertOption(optMoodPopDay, target)
+			common.SysLog("人气榜采集完成 %s", target)
 		}
-		_ = model.UpsertOption(optMoodPoolDay, target)
-		common.SysLog("市场情绪数据采集完成 %s", target)
+	}
+}
+
+// StartMoodJobs 盘后错峰采集：16:35 涨停池+人气榜、18:45 龙虎榜+机构统计。
+// 启动 3 分钟后按游标补跑缺口（涨停池上游不可回溯，补跑失败即诚实缺失该日）。
+func StartMoodJobs() *MoodService {
+	svc := NewMoodService()
+	runPools := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		svc.runMoodPools(ctx, moodTargetDate(time.Now(), moodPoolCutoffMin), time.Now().Format("2006-01-02"))
 	}
 	runLhb := func() {
 		target := moodTargetDate(time.Now(), moodLhbCutoffMin)

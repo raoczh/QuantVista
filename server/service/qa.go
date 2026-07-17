@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 
 	"quantvista/common"
 	"quantvista/model"
@@ -60,8 +61,24 @@ type qaAskContext struct {
 	apiKey   string
 }
 
+// qaConvLocks 会话级进程内互斥：同一会话的并发追问必须串行，否则两问会各自
+// loadMessages 到相同历史（上下文重复）、消息落库交错倒序、并各自通过 qaMaxMessages
+// 检查后 +2 突破上限。个人自用单实例，进程内锁足够，无需 DB 锁。key=conversationID。
+// 新会话（ConversationID<=0）不加锁：其 ID 未返回前无第二个请求能引用它，天然无竞争。
+var qaConvLocks sync.Map // int64 -> *sync.Mutex
+
+func qaConvLock(convID int64) *sync.Mutex {
+	m, _ := qaConvLocks.LoadOrStore(convID, &sync.Mutex{})
+	return m.(*sync.Mutex)
+}
+
 // Ask 提问（非流式）：新建会话（首轮采集快照）或在已有会话上追问。返回会话全量视图。
 func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, req QaAskRequest) (*QaConversationView, error) {
+	if req.ConversationID > 0 {
+		mu := qaConvLock(req.ConversationID)
+		mu.Lock()
+		defer mu.Unlock()
+	}
 	ac, err := s.prepareAsk(ctx, userID, req)
 	if err != nil {
 		return nil, err
@@ -83,6 +100,11 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 // 流结束后走与非流式完全相同的收尾（证据核验落 CheckJSON → 落库 → 配额），核验徽章由
 // 最终返回的会话视图后置更新。LLM 配置关闭了 stream 时退回非流式调用、整段作为单个增量吐出。
 func (s *QaService) AskStream(ctx context.Context, userID int64, allowPrivate bool, req QaAskRequest, onDelta func(string)) (*QaConversationView, error) {
+	if req.ConversationID > 0 {
+		mu := qaConvLock(req.ConversationID)
+		mu.Lock()
+		defer mu.Unlock()
+	}
 	ac, err := s.prepareAsk(ctx, userID, req)
 	if err != nil {
 		return nil, err

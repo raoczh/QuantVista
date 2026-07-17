@@ -45,7 +45,8 @@ const etfProfit = computed(() => etfHoldings.value.reduce((s, h) => s + h.profit
 
 async function loadQuotes() {
   try {
-    etfs.value = await getEtfList()
+    // 同时刷新 ETF 行情与模拟盘概览，否则汇总（持仓市值/盈亏）盘中不动。
+    ;[etfs.value, overview.value] = await Promise.all([getEtfList(), getPaperOverview()])
   } catch (e) {
     message.error((e as Error).message)
   }

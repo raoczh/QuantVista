@@ -81,76 +81,120 @@ let finChart: echarts.ECharts | null = null
 const ffEl = ref<HTMLDivElement | null>(null)
 let ffChart: echarts.ECharts | null = null
 
+// 切换标的的竞态守卫：每次 load 领一个自增序号，所有 best-effort 回填落地前比对，
+// 旧标的的迟到响应不再覆盖新标的数据。
+let loadSeq = 0
+
 async function load(silent = false) {
   if (!symbol.value) return
+  const mySeq = ++loadSeq
   if (!silent) {
     loading.value = true
     loadError.value = ''
   }
   try {
-    quote.value = await getQuote(market.value, symbol.value)
+    const q = await getQuote(market.value, symbol.value)
+    if (mySeq !== loadSeq) return
+    quote.value = q
     // 估值 / 评分 / 相关新闻 best-effort：失败只是不显示对应卡片。
     getValuation(market.value, symbol.value)
-      .then((v) => (valuation.value = v))
-      .catch(() => (valuation.value = null))
+      .then((v) => {
+        if (mySeq === loadSeq) valuation.value = v
+      })
+      .catch(() => {
+        if (mySeq === loadSeq) valuation.value = null
+      })
     getScore(market.value, symbol.value)
-      .then((s) => (score.value = s))
-      .catch(() => (score.value = null))
+      .then((s) => {
+        if (mySeq === loadSeq) score.value = s
+      })
+      .catch(() => {
+        if (mySeq === loadSeq) score.value = null
+      })
     getNews({ symbol: symbol.value, limit: 15 })
-      .then((r) => (news.value = r))
-      .catch(() => (news.value = []))
+      .then((r) => {
+        if (mySeq === loadSeq) news.value = r
+      })
+      .catch(() => {
+        if (mySeq === loadSeq) news.value = []
+      })
     getAnnouncements(symbol.value, 15)
-      .then((r) => (announcements.value = r))
-      .catch(() => (announcements.value = []))
+      .then((r) => {
+        if (mySeq === loadSeq) announcements.value = r
+      })
+      .catch(() => {
+        if (mySeq === loadSeq) announcements.value = []
+      })
     // 财务摘要（F2）best-effort：A 股非基金才有；容器在 v-if 内，等 DOM 后挂图。
     if (market.value === 'cn' && !isFund.value) {
       getStockFinance(market.value, symbol.value)
         .then((r) => {
+          if (mySeq !== loadSeq) return
           finance.value = r
           nextTick(() => renderFinanceChart())
         })
-        .catch(() => (finance.value = null))
+        .catch(() => {
+          if (mySeq === loadSeq) finance.value = null
+        })
       // 主力资金（M3a）：按需拉取+缓存，首次访问可能为空（下轮自动刷新补上）。
       getStockFundFlow(market.value, symbol.value, 90)
         .then((r) => {
+          if (mySeq !== loadSeq) return
           fundflow.value = r
           nextTick(() => renderFundFlowChart())
         })
-        .catch(() => (fundflow.value = null))
+        .catch(() => {
+          if (mySeq === loadSeq) fundflow.value = null
+        })
       // 龙虎榜上榜记录（M3a）：本地缓存表，近 30 天回填 + 每日盘后采集。
       getStockLhb(market.value, symbol.value, 10)
-        .then((r) => (lhbRecords.value = r))
-        .catch(() => (lhbRecords.value = []))
+        .then((r) => {
+          if (mySeq === loadSeq) lhbRecords.value = r
+        })
+        .catch(() => {
+          if (mySeq === loadSeq) lhbRecords.value = []
+        })
       // 机构观点（P3a）：按需拉取+缓存，首次访问可能为空（下轮自动刷新补上）；
       // 现价随行情带过去用于目标价偏离计算。
       getStockOrgView(market.value, symbol.value, quote.value?.price)
-        .then((r) => (orgview.value = r))
-        .catch(() => (orgview.value = null))
+        .then((r) => {
+          if (mySeq === loadSeq) orgview.value = r
+        })
+        .catch(() => {
+          if (mySeq === loadSeq) orgview.value = null
+        })
     }
     // 指标副图 / 筹码分布 best-effort：失败时 K 线退回单图、筹码卡显示占位。
     getIndicators(market.value, symbol.value, 120)
       .then((r) => {
+        if (mySeq !== loadSeq) return
         indicators.value = r
         renderChart()
       })
-      .catch(() => (indicators.value = null))
+      .catch(() => {
+        if (mySeq === loadSeq) indicators.value = null
+      })
     getChips(market.value, symbol.value)
       .then((r) => {
+        if (mySeq !== loadSeq) return
         chips.value = r
         // 筹码卡容器在 v-if 内，等 DOM 渲染后再挂图。
         nextTick(() => renderChipCharts())
       })
-      .catch(() => (chips.value = null))
+      .catch(() => {
+        if (mySeq === loadSeq) chips.value = null
+      })
     const b = await getDailyBars(market.value, symbol.value, 120)
+    if (mySeq !== loadSeq) return
     bars.value = b
     renderChart()
   } catch (e) {
-    if (!silent) {
+    if (!silent && mySeq === loadSeq) {
       loadError.value = (e as Error).message
       quote.value = null
     }
   } finally {
-    loading.value = false
+    if (mySeq === loadSeq) loading.value = false
   }
 }
 

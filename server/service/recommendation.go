@@ -577,6 +577,14 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 
 	picks, rejected, usage, latency, callErr := s.callWithRepair(ctx, userID, cfg, apiKey, allowPrivate, messages, poolBySymbol, count)
 
+	// #11 原始 LLM 动作快照（复核前）：applyReviews 对 reject 会把 p.Action 强制改写为
+	// watch，事件表 RawAction 须记复核前值才能与 PostGateAction 构成门控前后对照。此处
+	// 在复核之前快照 Symbol→Action；降级兜底路径下方另行重建。
+	rawActionBySym := make(map[string]string, len(picks))
+	for _, p := range picks {
+		rawActionBySym[p.Symbol] = p.Action
+	}
+
 	// 可选 AI 复核（verify）：风控复核员逐条挑刺，reject 降级为观察。
 	if callErr == nil && len(picks) > 0 && plan.verify {
 		reviews, overall, rvUsage := s.reviewPicks(ctx, userID, cfg, apiKey, allowPrivate, recType, picks, poolBySymbol)
@@ -618,6 +626,12 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		if quantFallbackEligible(callErr) {
 			if fb := buildQuantFallbackPicks(recType, llmCands, count); len(fb) > 0 {
 				picks, rejected = fb, nil
+				// 降级兜底 picks 全新构造（AI 未产出任何原始动作）：RawAction 快照按兜底
+				// 动作重建，picked 事件 RawAction==PostGateAction（本就无门控前后差异）。
+				rawActionBySym = make(map[string]string, len(fb))
+				for _, p := range fb {
+					rawActionBySym[p.Symbol] = p.Action
+				}
 				degradedNote = "AI 精选未完成（" + callErr.Error() + "）；已按量化排名生成降级推荐——规则生成，未经 AI 解读，请自行核查"
 				callErr = nil
 			}
@@ -642,6 +656,11 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		if err := common.DB.Save(batch).Error; err != nil {
 			return nil, err
 		}
+		// #9 零推荐批次同样落全池候选事件 + 影子标签：无 picks/items（picked 分支自动
+		// 跳过，不伪造入选），只落 llm_list/filtered/scored/pool_full + 各候选影子标签，
+		// 供「拒选是否正确」的错失机会/召回评估验证。gates 为名单阶段（相关性/同行业）
+		// 门控；无 buy 故无 regime/bear/quality 影子门控。
+		s.recordBatchFactsWithRetry(batch, pool, nil, nil, rejected, gates, industryBy, nil)
 		return &RecommendationView{RecommendationBatch: *batch, Items: []RecommendationItemView{}}, nil
 	}
 
@@ -681,29 +700,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	// S1-2 仓位建议（服务端目标波动模型，非 LLM 输出）：公式与参数快照随 RegimeJSON
 	// 落库可回溯。相关性系数用同批次入选标的间的真实收益相关性。
 	sizingParams := defaultSizingParams()
-	sizingIns := make([]sizingInput, len(picks))
-	for i := range picks {
-		c := poolBySymbol[picks[i].Symbol]
-		in := sizingInput{Symbol: picks[i].Symbol}
-		if c.Factors != nil {
-			in.Vol20Daily = c.Factors.Volatility20
-		}
-		for j := range picks {
-			if j == i {
-				continue
-			}
-			co := poolBySymbol[picks[j].Symbol]
-			if corr := pairwiseCorrAligned(c.closeDates, c.closes, co.closeDates, co.closes); corr > in.MaxCorr {
-				in.MaxCorr = corr
-			}
-		}
-		sizingIns[i] = in
-	}
-	sizingOuts := computePositionPcts(sizingIns, regime.Regime, sizingParams)
-	for i := range picks {
-		picks[i].PositionPct = sizingOuts[i].PositionPct
-		picks[i].PositionWhy = sizingOuts[i].Why
-	}
+	applyBuyPositionSizing(picks, poolBySymbol, regime.Regime, sizingParams)
 	regime.Sizing = &sizingParams
 	batch.RegimeJSON = marshalRegimeJSON(regime)
 
@@ -750,10 +747,76 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		return nil, err
 	}
 
-	// S0-5 反事实事件 + 标签事实（含影子标签）：best-effort，不影响主结果返回。
-	recordBatchFacts(batch, pool, items, picks, rejected, gates, industryBy)
+	// S0-5 反事实事件 + 标签事实（含影子标签）：进程内同步重试覆盖瞬时 DB 抖动，
+	// 全部成功置 facts_recorded=true；用尽仍失败保持 false 供人工排查（不影响主结果返回）。
+	s.recordBatchFactsWithRetry(batch, pool, items, picks, rejected, gates, industryBy, rawActionBySym)
 
 	return s.assembleView(*batch, items, nil, nil), nil
+}
+
+// recFactsRetries 事实账本落库进程内同步重试次数（覆盖瞬时 DB 抖动；recordBatchFacts
+// 已同事务原子化，重试重跑不会残留半成品）。
+const recFactsRetries = 3
+
+// recordBatchFactsWithRetry 事实账本落库 + 完整性标记（#10）：同步重试 recordBatchFacts，
+// 全部成功后把批次 FactsRecorded 置 true；重试用尽仍失败保持 false 并 SysWarn——
+// 无法可靠跨进程持久化补建（快照丢失价格版本锚、gates 未持久化、事件表无唯一索引
+// 重跑会重复，见 reclabel.go recordBatchFacts 注释），失败批次交 tracking 扫描与人工排查。
+func (s *RecommendationService) recordBatchFactsWithRetry(batch *model.RecommendationBatch, pool []candidate, items []model.Recommendation, picks []recPick, rejected []recReject, gates []gateNote, industryBy map[string]string, rawActionBySym map[string]string) {
+	if common.DB == nil || len(pool) == 0 {
+		return
+	}
+	var err error
+	for attempt := 0; attempt < recFactsRetries; attempt++ {
+		if err = recordBatchFacts(batch, pool, items, picks, rejected, gates, industryBy, rawActionBySym); err == nil {
+			break
+		}
+	}
+	if err != nil {
+		common.SysWarn("批次事实账本落库失败（重试 %d 次仍失败），facts_recorded 保持 false 待人工排查 batch=%d: %v", recFactsRetries, batch.ID, err)
+		return
+	}
+	batch.FactsRecorded = true
+	if uerr := common.DB.Model(batch).Update("facts_recorded", true).Error; uerr != nil {
+		common.SysWarn("批次 facts_recorded 标记回写失败 batch=%d: %v", batch.ID, uerr)
+	}
+}
+
+// applyBuyPositionSizing S1-2 仓位回填（#21）：只对 action=buy 条目算仓位——watch 不参与
+// 买入仓位预算，否则 watch 得非零建议仓位并计入 Σ、归一化时按比例挤占真实 buy 的仓位，
+// 且前端对 watch 展示建议仓位语义矛盾。相关性也只在 buy 之间对齐（watch 不入组合）。
+// 与「买入胜率只统计 buy」口径一致。picks 就地回填 PositionPct/PositionWhy。
+func applyBuyPositionSizing(picks []recPick, poolBySymbol map[string]candidate, regime string, params positionSizingParams) {
+	sizingIns := make([]sizingInput, 0, len(picks))
+	sizingIdx := make([]int, 0, len(picks)) // sizingIns[k] → picks 下标
+	for i := range picks {
+		if picks[i].Action != model.RecActionBuy {
+			picks[i].PositionPct = 0
+			picks[i].PositionWhy = "观察标的不计入买入仓位预算，不给出建议仓位"
+			continue
+		}
+		c := poolBySymbol[picks[i].Symbol]
+		in := sizingInput{Symbol: picks[i].Symbol}
+		if c.Factors != nil {
+			in.Vol20Daily = c.Factors.Volatility20
+		}
+		for j := range picks {
+			if j == i || picks[j].Action != model.RecActionBuy {
+				continue
+			}
+			co := poolBySymbol[picks[j].Symbol]
+			if corr := pairwiseCorrAligned(c.closeDates, c.closes, co.closeDates, co.closes); corr > in.MaxCorr {
+				in.MaxCorr = corr
+			}
+		}
+		sizingIns = append(sizingIns, in)
+		sizingIdx = append(sizingIdx, i)
+	}
+	sizingOuts := computePositionPcts(sizingIns, regime, params)
+	for k, out := range sizingOuts {
+		picks[sizingIdx[k]].PositionPct = out.PositionPct
+		picks[sizingIdx[k]].PositionWhy = out.Why
+	}
 }
 
 // quantFallbackEligible AI 主调用失败后是否值得量化降级：超时/取消/网络/上游 5xx/

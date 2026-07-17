@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, nextTick, onBeforeUnmount } from 'vue'
+import { ref, onMounted, computed, nextTick, onBeforeUnmount, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -115,19 +115,17 @@ async function send() {
     message.warning('请输入要提问的股票代码')
     return
   }
-  if (!llmConfigs.value.length) {
-    message.warning('请先在「设置」中添加并测试 LLM 配置')
-    return
-  }
   asking.value = true
   pendingQuestion.value = q
   streamRaw = ''
   streamHtml.value = ''
+  // 记录发起时的会话身份：流式期间用户可能切到别的会话，落地前比对以防旧回答覆盖新界面。
+  const startConvId = current.value?.id
   await scrollToBottom()
   try {
-    current.value = await askQaStream(
+    const view = await askQaStream(
       {
-        conversation_id: current.value?.id,
+        conversation_id: startConvId,
         symbol: current.value ? undefined : symbol.value.trim(),
         market: current.value ? undefined : market.value,
         llm_config_id: llmId.value,
@@ -136,6 +134,9 @@ async function send() {
       },
       onStreamChunk,
     )
+    // 期间会话已被切走（打开别的会话/新会话/删除）则丢弃本次回答，不切回旧会话。
+    if (current.value?.id !== startConvId) return
+    current.value = view
     question.value = ''
     fromAnalysisId.value = null
     fromAnalysisName.value = ''
@@ -242,7 +243,9 @@ async function openSnapshot() {
   }
 }
 
-onMounted(async () => {
+// 深链快捷入口：从个股详情/分析结果带 symbol 或 from_analysis 进入。
+// 用 watch 而非仅在 onMounted 读取——已停留在 /qa 时再次深链（query 变化）也能生效。
+function applyRouteQuery() {
   if (route.query.from_analysis) {
     const id = Number(route.query.from_analysis)
     if (Number.isFinite(id) && id > 0) {
@@ -251,12 +254,20 @@ onMounted(async () => {
     }
     symbol.value = String(route.query.symbol || '')
     market.value = String(route.query.market || 'cn')
+    current.value = null // 深链进入新会话上下文
     router.replace({ name: 'qa' })
   } else if (route.query.symbol) {
     symbol.value = String(route.query.symbol)
     market.value = String(route.query.market || 'cn')
+    current.value = null
     router.replace({ name: 'qa' })
   }
+}
+
+watch(() => route.query, applyRouteQuery)
+
+onMounted(async () => {
+  applyRouteQuery()
   await Promise.all([loadLLM(), loadHistory()])
 })
 </script>
@@ -330,7 +341,7 @@ onMounted(async () => {
                 :disabled="!!fromAnalysisId"
               />
               <n-select v-model:value="market" :options="marketOptions" style="width: 110px" :disabled="!!fromAnalysisId" />
-              <n-select v-model:value="llmId" :options="llmOptions" placeholder="LLM 配置" style="width: 180px" />
+              <n-select v-model:value="llmId" :options="llmOptions" :placeholder="llmConfigs.length ? 'LLM 配置' : '默认配置'" style="width: 180px" />
             </div>
             <n-alert v-if="fromAnalysisId" type="info" :bordered="false" style="margin-top: 10px">
               将基于「{{ fromAnalysisName || symbol }}」分析记录 #{{ fromAnalysisId }}

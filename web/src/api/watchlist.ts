@@ -32,6 +32,12 @@ export interface WatchlistItem {
   data_time: string
 }
 
+// 写接口（新增/编辑自选项）返回裸模型，不含列表接口才回填的行情富化字段。
+export type WatchlistItemBase = Omit<
+  WatchlistItem,
+  'price' | 'change_pct' | 'quote_ok' | 'data_time'
+>
+
 export interface MissedOpportunity extends WatchlistItem {
   current_price: number
   change_since_pct: number
@@ -77,7 +83,7 @@ export function deleteGroup(id: number) {
 }
 
 export function addItem(groupId: number, input: WatchlistItemInput) {
-  return request<WatchlistItem>({
+  return request<WatchlistItemBase>({
     url: `/watchlists/${groupId}/items`,
     method: 'post',
     data: input,
@@ -85,7 +91,7 @@ export function addItem(groupId: number, input: WatchlistItemInput) {
 }
 
 export function updateItem(itemId: number, input: WatchlistItemInput) {
-  return request<WatchlistItem>({
+  return request<WatchlistItemBase>({
     url: `/watchlist-items/${itemId}`,
     method: 'put',
     data: input,

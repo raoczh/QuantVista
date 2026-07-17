@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -160,5 +161,54 @@ func TestRecRecallReportEndToEnd(t *testing.T) {
 	// 非法持有期。
 	if _, err := svc.RecRecallReport(context.Background(), 7, "", 7, 10); err == nil {
 		t.Fatal("持有期 7 应被拒绝")
+	}
+}
+
+// TestRecRecallSkipsNoPoolBatch #23：无候选事件的批次（S0-5 部署前/事实落库失败）整批
+// 排除，不把「数据缺失」当「全量未召回」拉低 Recall——Recall 仍由有池批次决定，
+// 且 Notes 声明排除数。
+func TestRecRecallSkipsNoPoolBatch(t *testing.T) {
+	setupTestDB(t)
+	seedRecallFixture(t) // 一个有 3 只候选事件的批次（Recall 池 30%）
+	factorFreshMu.Lock()
+	factorFreshVal = ""
+	factorFreshMu.Unlock()
+
+	// 追加一个「无候选事件」批次，落在同一信号日（第 10 个交易日中午）。
+	base := time.Date(2026, 6, 1, 0, 0, 0, 0, time.Local)
+	created := base.AddDate(0, 0, 9).Add(12 * time.Hour)
+	noPool := model.RecommendationBatch{UserID: 7, Type: model.RecTypeShortTerm, Market: "cn",
+		Status: model.RecStatusSuccess}
+	if err := common.DB.Create(&noPool).Error; err != nil {
+		t.Fatalf("建无池批次失败: %v", err)
+	}
+	common.DB.Model(&model.RecommendationBatch{}).Where("id = ?", noPool.ID).Update("created_at", created)
+
+	svc := &RecommendationService{}
+	rep, err := svc.RecRecallReport(context.Background(), 7, model.RecTypeShortTerm, 5, 10)
+	if err != nil {
+		t.Fatalf("RecRecallReport 失败: %v", err)
+	}
+	// 只评估有池批次；无池批次被排除。
+	if rep.Batches != 1 || len(rep.BatchRows) != 1 {
+		t.Fatalf("无池批次应被排除，仅评 1 批: batches=%d rows=%d", rep.Batches, len(rep.BatchRows))
+	}
+	if rep.BatchRows[0].BatchID == noPool.ID {
+		t.Fatalf("被评估的不应是无池批次")
+	}
+	// Recall 未被 10 个 absent 稀释（仍 30/20/10）。
+	if rep.RecallPoolPct != 30 || rep.MissedRatePct != 90 {
+		t.Fatalf("Recall 不应被无池批次稀释: pool=%v missed=%v", rep.RecallPoolPct, rep.MissedRatePct)
+	}
+	// Notes 声明排除。
+	found := false
+	for _, n := range rep.Notes {
+		if strings.Contains(n, "无候选事件") && strings.Contains(n, "已整批排除") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Notes 应声明无池批次排除: %v", rep.Notes)
 	}
 }

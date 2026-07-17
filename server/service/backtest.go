@@ -249,9 +249,10 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 		return nil, err
 	}
 	axis, benchClose, benchNote := s.marketAxis(ctx, freshDate)
-	if len(axis) < maxHold+2 {
+	if len(axis) < maxHold+3 {
 		return nil, errors.New("交易日轴数据不足（基准指数与交易日历均不可用或过短），无法回测")
 	}
+	marketLast := axis[len(axis)-1] // 市场轴末日：区分个股退市/长停与真未成熟
 	signalDates, err := sampleSignalDates(axis, lookback, signalCount, maxHold)
 	if err != nil {
 		return nil, err
@@ -270,6 +271,12 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 	for _, st := range states {
 		metaBy[st.Symbol] = wideStockMeta{Name: st.Name, ST: isSTName(st.Name)}
 	}
+
+	// #8① ST as-of（防幸存者偏差）：优先宇宙快照（S0-3）按信号日判定——后来才变 ST 的
+	// 股票不得在其健康期历史信号日被剔除；快照未覆盖的信号日回退当前名称并 Notes 声明。
+	// 与 walkforward.go 同款（每信号日一次快照查询，非逐股，共 len(signalDates) 次）。
+	stByDate := universeSTByDates(signalDates)
+	stFallback := len(stByDate) < len(signalDates)
 
 	withChip := treeUsesChipFactor(tree)
 
@@ -300,9 +307,27 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 			for j := range jobs {
 				meta := metaBy[j.symbol]
 				universe.Add(1)
-				if !req.IncludeST && meta.ST {
-					stSkipped.Add(1)
-					continue
+				// ST as-of：快照命中按快照，缺失回退当前名称。
+				stAt := func(d string) bool {
+					if set, ok := stByDate[d]; ok {
+						return set[j.symbol]
+					}
+					return meta.ST
+				}
+				// 整只剔除只在「所有信号日 as-of 均为 ST」时（后来才变 ST 的股票其健康期
+				// 信号日不受影响，仅在下方按信号日逐日排除）。
+				if !req.IncludeST {
+					allST := true
+					for _, d := range signalDates {
+						if !stAt(d) {
+							allST = false
+							break
+						}
+					}
+					if allST {
+						stSkipped.Add(1)
+						continue
+					}
 				}
 				// 复权自洽校验：断层股整只剔除（结果透明计数）。
 				if adjustSuspect(j.bars, j.symbol, meta.Name) {
@@ -315,6 +340,9 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 					dateIdx[b.TradeDate] = i
 				}
 				for _, d := range signalDates {
+					if !req.IncludeST && stAt(d) {
+						continue // 该信号日 as-of 为 ST：仅排除当日观测
+					}
 					i, ok := dateIdx[d]
 					if !ok {
 						continue // 信号日停牌：无信号
@@ -337,10 +365,10 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 					}
 					for _, h := range holds {
 						sellDate := ""
-						if onAxis && aiIdx+h < len(axis) {
-							sellDate = axis[aiIdx+h] // 市场轴到期日：个股中途停牌不拉长持有跨度
+						if onAxis && aiIdx+h+1 < len(axis) {
+							sellDate = axis[aiIdx+h+1] // 卖出根=买入根(aiIdx+1)+h；个股中途停牌不拉长持有跨度
 						}
-						cand.Holds[h] = simulateHold(j.bars, i, j.symbol, meta.Name, h, perCap, nextDate, sellDate)
+						cand.Holds[h] = simulateHold(j.bars, i, j.symbol, meta.Name, h, perCap, nextDate, sellDate, marketLast)
 					}
 					candCh <- cand
 				}
@@ -414,6 +442,12 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 	if res.AdjustSuspect > 0 {
 		res.Notes = append(res.Notes, fmt.Sprintf("复权自洽校验剔除 %d 只存在收盘断层的标的（疑似除权未重锚、ST 状态变更或坏数据）", res.AdjustSuspect))
 	}
+	if !req.IncludeST {
+		res.Notes = append(res.Notes, "ST 判定按宇宙快照 as-of 各信号日——后来才变 ST 的股票在其健康期历史信号日不被剔除（防幸存者偏差）")
+		if stFallback {
+			res.Notes = append(res.Notes, "部分信号日无宇宙快照（S0-3 部署前），ST 回退当前名称判定，存在轻微幸存者偏差")
+		}
+	}
 	if benchNote != "" {
 		res.Notes = append(res.Notes, benchNote)
 	}
@@ -464,11 +498,11 @@ func (s *BacktestService) fetchBench(ctx context.Context) []datasource.Bar {
 	return bars
 }
 
-// sampleSignalDates 在日轴内采样信号日：右边界收缩 maxHold（信号日 i 需 i+maxHold ≤
-// 轴末，恰好能走完最长持有期的最后一个信号日也参与），回看 lookback 个交易日为窗口，
-// 窗口内等距取 signalCount 个（含首尾附近）。
+// sampleSignalDates 在日轴内采样信号日：右边界收缩 maxHold+1（信号日 i 的卖出根
+// = 买入根(i+1)+maxHold = i+maxHold+1，须 ≤ 轴末，恰好能走完最长持有期的最后一个
+// 信号日也参与），回看 lookback 个交易日为窗口，窗口内等距取 signalCount 个（含首尾附近）。
 func sampleSignalDates(axis []string, lookback, signalCount, maxHold int) ([]string, error) {
-	eligible := len(axis) - maxHold
+	eligible := len(axis) - maxHold - 1
 	if eligible < 1 {
 		return nil, errors.New("历史数据不足以覆盖最长持有期")
 	}
@@ -567,11 +601,14 @@ func (s *BacktestService) aggregate(tree *CondNode, name string, cands []btCandi
 				st.Pending++
 				continue
 			}
-			st.Trades++
 			st.Deferred += o.Deferred
 			if o.Forced {
+				// 末根强平收益偏保守（真实中卖不出），单列计数、不进 Trades/胜率/均值
+				// 主统计（否则少量强平坏结局会污染排序质量评估）。
 				st.Forced++
+				continue
 			}
+			st.Trades++
 			rets = append(rets, o.ReturnPct)
 			sumRet += o.ReturnPct
 			tr := BacktestTrade{
@@ -802,6 +839,10 @@ func (s *BacktestService) BatchBacktest(ctx context.Context, userID int64, req B
 	// 市场日轴 + 基准收盘（基准优先、回退日历）：轴供「推荐日次日停牌判 skip_suspend」
 	// 与「到期日按市场交易日定位」（个股中途停牌不拉长持有跨度），与标签结算同口径。
 	axis, benchClose, _ := s.marketAxis(ctx, time.Now().Format("2006-01-02"))
+	marketLast := ""
+	if len(axis) > 0 {
+		marketLast = axis[len(axis)-1] // 市场轴末日：区分个股退市/长停与真未成熟
+	}
 
 	res := &BatchBacktestResult{Batches: len(batches)}
 	type acc struct {
@@ -847,7 +888,7 @@ func (s *BacktestService) BatchBacktest(ctx context.Context, userID int64, req B
 				row.SignalDate = bars[i].TradeDate
 				for _, h := range holds {
 					nextDate, sellDate := labelAxisDates(axis, recDate, h)
-					o := simulateHold(bars, i, rec.Symbol, rec.Name, h, perCap, nextDate, sellDate)
+					o := simulateHold(bars, i, rec.Symbol, rec.Name, h, perCap, nextDate, sellDate, marketLast)
 					cell := BatchHoldCell{Status: o.Status, ReturnPct: o.ReturnPct}
 					a := accBy[h]
 					switch o.Status {

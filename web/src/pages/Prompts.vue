@@ -33,20 +33,28 @@ const loading = ref(false)
 // 每模块的本地编辑态。
 const drafts = ref<Record<string, { content: string; enabled: boolean; id: number | null }>>({})
 
-function syncDrafts() {
+// 按模块合并刷新：保存/恢复某模块后重新拉取模板，但只把「刚操作的模块」重置为
+// 服务器值，其余模块保留用户尚未保存的本地编辑（避免全量重建冲掉别处草稿）。
+function syncDrafts(resetModule?: string) {
+  const prev = drafts.value
   const map: Record<string, { content: string; enabled: boolean; id: number | null }> = {}
   for (const m of modules.value) {
+    const existing = prev[m.module]
+    if (existing && m.module !== resetModule) {
+      map[m.module] = existing // 保留未保存的本地编辑
+      continue
+    }
     const tpl = templates.value.find((t) => t.module === m.module)
     map[m.module] = { content: tpl?.content ?? '', enabled: tpl?.enabled ?? false, id: tpl?.id ?? null }
   }
   drafts.value = map
 }
 
-async function load() {
+async function load(resetModule?: string) {
   loading.value = true
   try {
     ;[modules.value, templates.value] = await Promise.all([listPromptModules(), listPromptTemplates()])
-    syncDrafts()
+    syncDrafts(resetModule)
   } catch (e) {
     message.error((e as Error).message)
   } finally {
@@ -64,7 +72,7 @@ async function save(m: PromptModuleInfo) {
   saving.value = m.module
   try {
     await upsertPromptTemplate({ module: m.module, content: d.content, enabled: d.enabled })
-    await load()
+    await load(m.module)
     message.success('已保存')
   } catch (e) {
     message.error((e as Error).message)
@@ -81,7 +89,7 @@ async function reset(m: PromptModuleInfo) {
   }
   try {
     await deletePromptTemplate(d.id)
-    await load()
+    await load(m.module)
     message.success('已恢复默认')
   } catch (e) {
     message.error((e as Error).message)
@@ -99,7 +107,7 @@ onMounted(load)
     <div class="prompts" :style="styleVars">
       <SectionCard title="按模块自定义">
         <template #extra>
-          <n-button size="tiny" quaternary :loading="loading" @click="load">刷新</n-button>
+          <n-button size="tiny" quaternary :loading="loading" @click="load()">刷新</n-button>
         </template>
         <p class="tip">
           每个模块可写一段自定义指引，替换系统默认的提示词段；「启用」后该模块的 AI

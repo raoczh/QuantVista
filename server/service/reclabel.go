@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -11,6 +12,8 @@ import (
 	"quantvista/common"
 	"quantvista/datasource"
 	"quantvista/model"
+
+	"gorm.io/gorm"
 )
 
 // S0-1/S0-5 标签事实服务：批次生成后创建 pending 标签（含影子标签），由后台任务
@@ -24,7 +27,10 @@ import (
 // 评估一切门控/复核/候选来源的地基（错失机会率、gated vs ungated 配对、risk-coverage）。
 
 const (
-	labelVersion = "l1"
+	// labelVersion 执行结算语义版本。l2（2026-07）：持有期按「卖出根=买入根+horizon」
+	// 修正（原 l1 的 buyIdx+horizon-1 在 horizon=1 时同日买卖违反 T+1）+ 退市/长停市场
+	// 轴强平 + 退出价守卫。旧 l1 pending 行用新逻辑结算后回写 l2；消费方按版本过滤防混池。
+	labelVersion = "l2"
 	// labelPerCap 标签结算的每标的拨款（与回测默认一致，元）。
 	labelPerCap = float64(btDefaultPerCap)
 	// labelNoDataAfterDays 信号日之后超过该自然日仍无任何日线 → no_data（退市/长停）。
@@ -100,11 +106,21 @@ func mergeGateTypes(primary, other gateNote) []string {
 	return all
 }
 
-// recordBatchFacts 批次落库后记录反事实事件 + 创建 pending 标签（best-effort：
-// 失败只记日志，不影响推荐主流程）。picks 为最终入选（items 已带 ID）。
-func recordBatchFacts(batch *model.RecommendationBatch, pool []candidate, items []model.Recommendation, picks []recPick, rejected []recReject, gates []gateNote, industryBy map[string]string) {
+// recordBatchFacts 批次落库后记录反事实事件 + 创建 pending 标签。返回 error 供调用方
+// 判定完整性（成功后置 RecommendationBatch.FactsRecorded=true）：事件/标签 CreateInBatches
+// 任一失败上抛，调用方按需重试并如实标记 facts_recorded 供人工排查。
+//
+// picks 为最终入选（items 已带 ID）；rawActionBySym 为复核前的 LLM 原始动作快照
+// （Symbol→Action，#11）：picked 事件 RawAction 记该原始值，PostGateAction 记复核后终值，
+// 二者才能构成真正的门控前后对照（verify reject 的 buy→watch 差异得以体现）。
+//
+// ⚠️ 幂等性：candidate_events 表无唯一索引、影子标签以每次新生成的 candidate_event_id
+// 为唯一键——同批次重跑会产生重复事件与重复影子标签（只有 picked 标签受
+// idx_rl_key 保护）。故本函数不为跨进程「持久化补建」设计；失败批次靠调用方进程内
+// 同步重试恢复，无法恢复的标 facts_recorded=false 人工排查（tracking 扫描只记录不重建）。
+func recordBatchFacts(batch *model.RecommendationBatch, pool []candidate, items []model.Recommendation, picks []recPick, rejected []recReject, gates []gateNote, industryBy map[string]string, rawActionBySym map[string]string) error {
 	if common.DB == nil || len(pool) == 0 {
-		return
+		return nil
 	}
 	pickBySym := make(map[string]recPick, len(picks))
 	for _, p := range picks {
@@ -132,7 +148,14 @@ func recordBatchFacts(batch *model.RecommendationBatch, pool []candidate, items 
 		case c.SentToLLM:
 			if p, ok := pickBySym[c.Symbol]; ok {
 				ev.CandidateStage = model.CandStagePicked
-				ev.RawAction = p.Action
+				// RawAction 用复核前快照（#11）：p.Action 已被 applyReviews 的 reject 强制
+				// 改写为 watch，直接用它会让 RawAction==PostGateAction 恒等、门控前后对照
+				// 失效。缺快照（旧调用点/降级路径）回退 p.Action。
+				raw := rawActionBySym[c.Symbol]
+				if raw == "" {
+					raw = p.Action
+				}
+				ev.RawAction = raw
 				ev.PostGateAction = p.Action
 			} else {
 				ev.CandidateStage = model.CandStageLLMList
@@ -161,51 +184,57 @@ func recordBatchFacts(batch *model.RecommendationBatch, pool []candidate, items 
 		}
 		events = append(events, ev)
 	}
-	if err := common.DB.CreateInBatches(events, 200).Error; err != nil {
-		common.SysWarn("反事实事件落库失败 batch=%d: %v", batch.ID, err)
-		return
-	}
 
-	// 标签行：picked 条目挂 recommendation_id；其余候选挂事件行（影子标签）。
-	signalDate := batch.CreatedAt.In(time.Local).Format("2006-01-02")
-	labels := make([]model.RecommendationLabel, 0, len(events)*len(model.LabelHorizons))
-	candBySym := make(map[string]candidate, len(pool))
-	for _, c := range pool {
-		candBySym[c.Symbol] = c
-	}
-	for _, ev := range events {
-		c := candBySym[ev.Symbol]
-		recID := int64(0)
-		evID := ev.ID
-		action := ev.PostGateAction
-		if ev.CandidateStage == model.CandStagePicked {
-			it, ok := itemBySym[ev.Symbol]
-			if !ok {
-				continue
+	// 事件 + 标签同事务原子落库：任一失败整体回滚，杜绝「事件写入成功但标签失败」的
+	// 半成品——调用方进程内同步重试重跑本函数时不会因半成品残留而重复插入事件
+	// （candidate_events 无唯一索引，重复插入无从去重）。
+	return common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.CreateInBatches(events, 200).Error; err != nil {
+			return fmt.Errorf("反事实事件落库失败: %w", err)
+		}
+
+		// 标签行：picked 条目挂 recommendation_id；其余候选挂事件行（影子标签）。
+		signalDate := batch.CreatedAt.In(time.Local).Format("2006-01-02")
+		labels := make([]model.RecommendationLabel, 0, len(events)*len(model.LabelHorizons))
+		candBySym := make(map[string]candidate, len(pool))
+		for _, c := range pool {
+			candBySym[c.Symbol] = c
+		}
+		for _, ev := range events {
+			c := candBySym[ev.Symbol]
+			recID := int64(0)
+			evID := ev.ID
+			action := ev.PostGateAction
+			if ev.CandidateStage == model.CandStagePicked {
+				it, ok := itemBySym[ev.Symbol]
+				if !ok {
+					continue
+				}
+				recID, evID = it.ID, 0
+			} else if action == "" {
+				action = "shadow" // 未入选标的无 LLM 动作，影子口径统一标记
 			}
-			recID, evID = it.ID, 0
-		} else if action == "" {
-			action = "shadow" // 未入选标的无 LLM 动作，影子口径统一标记
+			for _, h := range model.LabelHorizons {
+				labels = append(labels, model.RecommendationLabel{
+					RecommendationID: recID, CandidateEventID: evID,
+					HorizonDays: h, EntryMode: model.EntryModeNextOpen,
+					BatchID: batch.ID, UserID: batch.UserID,
+					Symbol: ev.Symbol, Market: ev.Market, Type: batch.Type, Action: action,
+					SignalDate: signalDate, SignalAsOf: batch.CreatedAt,
+					MaturityStatus: model.LabelPending,
+					Strategy:       batch.Strategy, Source: ev.Source,
+					Industry: industryBy[ev.Symbol], Regime: batch.Regime,
+					EntryChg5dPct: candChg5d(c), EntryTurnover: c.TurnoverRate, EntryScore: c.Score,
+					RefDate: c.lastBarDate, RefClose: c.lastBarClose,
+					LabelVersion: labelVersion,
+				})
+			}
 		}
-		for _, h := range model.LabelHorizons {
-			labels = append(labels, model.RecommendationLabel{
-				RecommendationID: recID, CandidateEventID: evID,
-				HorizonDays: h, EntryMode: model.EntryModeNextOpen,
-				BatchID: batch.ID, UserID: batch.UserID,
-				Symbol: ev.Symbol, Market: ev.Market, Type: batch.Type, Action: action,
-				SignalDate: signalDate, SignalAsOf: batch.CreatedAt,
-				MaturityStatus: model.LabelPending,
-				Strategy:       batch.Strategy, Source: ev.Source,
-				Industry: industryBy[ev.Symbol], Regime: batch.Regime,
-				EntryChg5dPct: candChg5d(c), EntryTurnover: c.TurnoverRate, EntryScore: c.Score,
-				RefDate: c.lastBarDate, RefClose: c.lastBarClose,
-				LabelVersion: labelVersion,
-			})
+		if err := tx.CreateInBatches(labels, 200).Error; err != nil {
+			return fmt.Errorf("标签事实落库失败: %w", err)
 		}
-	}
-	if err := common.DB.CreateInBatches(labels, 200).Error; err != nil {
-		common.SysWarn("标签事实落库失败 batch=%d: %v", batch.ID, err)
-	}
+		return nil
+	})
 }
 
 func firstSource(c candidate) string {
@@ -258,15 +287,6 @@ func AdvanceRecommendationLabels(ctx context.Context, market *MarketService) (in
 	}
 	backfillActualLabels()
 
-	var pending []model.RecommendationLabel
-	if err := common.DB.Where("maturity_status = ?", model.LabelPending).
-		Order("symbol, id").Limit(labelAdvanceBatch).Find(&pending).Error; err != nil {
-		return 0, err
-	}
-	if len(pending) == 0 {
-		return 0, nil
-	}
-
 	today := time.Now().Format("2006-01-02")
 	// 市场日轴 + 基准收盘（基准优先、回退交易日历，与回测同源）：
 	// 轴用于定位「信号日的市场次日」（推荐日次日停牌须判 skip_suspend，不得用复牌
@@ -274,35 +294,50 @@ func AdvanceRecommendationLabels(ctx context.Context, market *MarketService) (in
 	// 轴不可得时回退按个股 K 线数推进（历史兼容口径）。
 	axis, benchClose, _ := NewBacktestService(market).marketAxis(ctx, today)
 
-	// 按 symbol 分组：一只股读一次日线。
-	bySym := map[string][]*model.RecommendationLabel{}
-	var syms []string
-	for i := range pending {
-		if ctx.Err() != nil {
-			break
-		}
-		l := &pending[i]
-		if _, ok := bySym[l.Symbol]; !ok {
-			syms = append(syms, l.Symbol)
-		}
-		bySym[l.Symbol] = append(bySym[l.Symbol], l)
-	}
-	sort.Strings(syms)
-
-	nameBy := stateNamesFor(syms)
+	// keyset 分页（按 id 游标）遍历全部 pending：单批上限 labelAdvanceBatch 只控单页
+	// 内存/耗时，不再是「pending 总数 >4000 时字母序靠后的成熟标签永远饿死」的天花板
+	//（旧的一次性 LIMIT 4000 会漏结算）。幂等：下轮从 id=0 重扫只挑仍 pending 的行。
 	settled := 0
-	for _, sym := range syms {
+	var lastID int64
+	for {
 		if ctx.Err() != nil {
 			break
 		}
-		bars := cnDailyBarsAsc(sym)
-		for _, l := range bySym[sym] {
-			if advanceOneLabel(l, bars, nameBy[sym], axis, benchClose, today) {
-				if err := common.DB.Save(l).Error; err != nil {
-					common.SysWarn("标签结算落库失败 label=%d: %v", l.ID, err)
-					continue
+		var page []model.RecommendationLabel
+		if err := common.DB.Where("maturity_status = ? AND id > ?", model.LabelPending, lastID).
+			Order("id").Limit(labelAdvanceBatch).Find(&page).Error; err != nil {
+			return settled, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		lastID = page[len(page)-1].ID
+
+		// 页内按 symbol 分组：一只股读一次日线。
+		bySym := map[string][]*model.RecommendationLabel{}
+		var syms []string
+		for i := range page {
+			l := &page[i]
+			if _, ok := bySym[l.Symbol]; !ok {
+				syms = append(syms, l.Symbol)
+			}
+			bySym[l.Symbol] = append(bySym[l.Symbol], l)
+		}
+		sort.Strings(syms)
+		nameBy := stateNamesFor(syms)
+		for _, sym := range syms {
+			if ctx.Err() != nil {
+				break
+			}
+			bars := cnDailyBarsAsc(sym)
+			for _, l := range bySym[sym] {
+				if advanceOneLabel(l, bars, nameBy[sym], axis, benchClose, today) {
+					if err := common.DB.Save(l).Error; err != nil {
+						common.SysWarn("标签结算落库失败 label=%d: %v", l.ID, err)
+						continue
+					}
+					settled++
 				}
-				settled++
 			}
 		}
 	}
@@ -315,9 +350,9 @@ func AdvanceRecommendationLabels(ctx context.Context, market *MarketService) (in
 // labelFarFuture 到期日尚未到来的哨兵日期（比任何真实交易日都晚，令模拟器返回 pending）。
 const labelFarFuture = "9999-12-31"
 
-// labelAxisDates 市场轴定位：signalDate 之后第 1 个交易日（计划买入日）与第 horizon
-// 个交易日（到期卖出日）。轴为空返回两个空串（回退旧口径）；轴覆盖不足时到期日
-// 返回哨兵（数据未到，必 pending）。
+// labelAxisDates 市场轴定位：signalDate 之后第 1 个交易日（计划买入日）与卖出日
+//（卖出根 = 买入根 + horizon，即买入根之后第 horizon 个交易日）。轴为空返回两个空串
+//（回退旧口径）；轴覆盖不足时到期日返回哨兵（数据未到，必 pending）。
 func labelAxisDates(axis []string, signalDate string, horizon int) (nextDate, sellDate string) {
 	if len(axis) == 0 {
 		return "", ""
@@ -330,7 +365,7 @@ func labelAxisDates(axis []string, signalDate string, horizon int) (nextDate, se
 	if nextIdx < len(axis) {
 		nextDate = axis[nextIdx]
 	}
-	if sellIdx := nextIdx + horizon - 1; sellIdx < len(axis) {
+	if sellIdx := nextIdx + horizon; sellIdx < len(axis) {
 		sellDate = axis[sellIdx]
 	} else {
 		sellDate = labelFarFuture
@@ -353,6 +388,7 @@ func advanceOneLabel(l *model.RecommendationLabel, bars []datasource.Bar, name s
 		// 无信号日及之前的日线：超过窗口仍无数据判 no_data，否则继续等。
 		if daysBetween(l.SignalDate, today) > labelNoDataAfterDays {
 			l.MaturityStatus = model.LabelNoData
+			l.LabelVersion = labelVersion
 			return true
 		}
 		return false
@@ -373,26 +409,39 @@ func advanceOneLabel(l *model.RecommendationLabel, bars []datasource.Bar, name s
 		}
 	}
 
+	// 市场轴末日：供结算区分「个股退市/长停」（末根 < 到期日但市场已过）与「真未成熟」。
+	marketLast := ""
+	if len(axis) > 0 {
+		marketLast = axis[len(axis)-1]
+	}
 	var out labelOutcome
 	if l.EntryMode == model.EntryModeActual {
-		out = settleFromActualEntry(bars, l.EntryDate, l.ActualBuyPrice, l.HorizonDays, actualSellDate(axis, l.EntryDate, l.HorizonDays))
+		out = settleFromActualEntry(bars, l.EntryDate, l.ActualBuyPrice, l.HorizonDays, actualSellDate(axis, l.EntryDate, l.HorizonDays), marketLast)
 	} else {
 		nextDate, sellDate := labelAxisDates(axis, l.SignalDate, l.HorizonDays)
-		out = simulateLabelHold(bars, i, l.Symbol, name, l.HorizonDays, labelPerCap, tp, sl, nextDate, sellDate)
+		out = simulateLabelHold(bars, i, l.Symbol, name, l.HorizonDays, labelPerCap, tp, sl, nextDate, sellDate, marketLast)
 	}
 	switch out.Status {
 	case btPending:
-		// 从未完成入场（数据未到/长期停牌）且超窗：判 no_data 终态防永久滞留。
-		if out.BuyDate == "" && daysBetween(l.SignalDate, today) > labelNoDataAfterDays {
-			l.MaturityStatus = model.LabelNoData
-			return true
+		if daysBetween(l.SignalDate, today) > labelNoDataAfterDays {
+			// 超窗仍 pending：已入场（BuyDate 非空）且无市场轴可判到期 → 用个股末根
+			// 收盘强平（Forced），落入下方成熟写回；从未入场或补不出 → no_data 终态。
+			if out.BuyDate != "" && forceCloseStaleLabel(l, &out, bars) {
+				l.MaturityStatus = model.LabelMatured
+			} else {
+				l.MaturityStatus = model.LabelNoData
+				l.LabelVersion = labelVersion
+				return true
+			}
+		} else {
+			return false // 持有期未走完，下轮再看
 		}
-		return false // 持有期未走完，下轮再看
 	case btTraded:
 		l.MaturityStatus = model.LabelMatured
 	default:
 		l.MaturityStatus = model.LabelSkipped
 		l.SkipReason = out.Status
+		l.LabelVersion = labelVersion
 		return true
 	}
 	l.EntryDate, l.EntryPrice = out.BuyDate, round2(out.BuyPrice)
@@ -400,6 +449,8 @@ func advanceOneLabel(l *model.RecommendationLabel, bars []datasource.Bar, name s
 	l.GrossReturnPct, l.NetReturnPct = out.GrossPct, out.NetPct
 	l.MfePct, l.MaePct = out.MfePct, out.MaePct
 	l.HitTakeProfit, l.HitStopLoss = out.HitTakeProfit, out.HitStopLoss
+	l.Forced = out.Forced
+	l.LabelVersion = labelVersion // 旧 l1 pending 行用新逻辑结算后回写当前版本
 	if b0, ok0 := benchClose[out.BuyDate]; ok0 && b0 > 0 {
 		if b1, ok1 := benchClose[out.SellDate]; ok1 {
 			l.BenchReturnPct = round2((b1 - b0) / b0 * 100)
@@ -407,6 +458,39 @@ func advanceOneLabel(l *model.RecommendationLabel, bars []datasource.Bar, name s
 			l.HasBench = true
 		}
 	}
+	return true
+}
+
+// forceCloseStaleLabel 已入场但长期停牌/退市（无市场轴可判到期）超窗：按个股末根收盘
+// 强平结算 out（Forced=true）。out 为 simulateLabelHold/settleFromActualEntry 返回的
+// pending（已带 BuyDate/BuyPrice 与已有窗口 MFE/MAE）。末根坏数据/买不起一手返回 false
+// 交上层 no_data。qty 口径随 EntryMode（next_open 按拨款、actual 名义一手，各自与结算同源）。
+func forceCloseStaleLabel(l *model.RecommendationLabel, out *labelOutcome, bars []datasource.Bar) bool {
+	if out.BuyPrice <= 0 || len(bars) == 0 {
+		return false
+	}
+	last := bars[len(bars)-1]
+	if last.Close <= 0 {
+		return false
+	}
+	qty := float64(int(labelPerCap/(out.BuyPrice*100))) * 100 // 整百股（正数 int 截断=向下取整）
+	if l.EntryMode == model.EntryModeActual {
+		qty = 100 // 名义一手（与 settleFromActualEntry 同口径）
+	}
+	if qty < 100 {
+		return false
+	}
+	buyAmount := out.BuyPrice * qty
+	buyFee, buyTax := tradeFee("cn", model.PaperSideBuy, l.Symbol, buyAmount)
+	cost := buyAmount + buyFee + buyTax
+	sellAmount := last.Close * qty
+	sellFee, sellTax := tradeFee("cn", model.PaperSideSell, l.Symbol, sellAmount)
+	out.Status = btTraded
+	out.Forced = true
+	out.SellDate, out.SellPrice = last.TradeDate, last.Close
+	out.GrossPct = round2((last.Close - out.BuyPrice) / out.BuyPrice * 100)
+	out.NetPct = round2((sellAmount - sellFee - sellTax - cost) / cost * 100)
+	// MFE/MAE 已在 pending 返回时算到末根（excursion），保留 out.MfePct/MaePct。
 	return true
 }
 
@@ -426,14 +510,15 @@ func labelBarriers(l *model.RecommendationLabel) (tp, sl float64) {
 	return d.TakeProfit, d.StopLoss
 }
 
-// actualSellDate 实际建仓行的市场轴到期日：建仓日（或其后首个交易日）为持有第 1 日，
-// 第 horizon 个交易日收盘卖出。轴空返回空串（回退按个股 K 线数推进）。
+// actualSellDate 实际建仓行的市场轴到期日：建仓日（或其后首个交易日）为买入根，
+// 卖出根 = 买入根 + horizon（第 horizon 个交易日收盘卖出）。轴空返回空串（回退按个股
+// K 线数推进）。
 func actualSellDate(axis []string, entryDate string, horizon int) string {
 	if len(axis) == 0 || entryDate == "" {
 		return ""
 	}
-	p := sort.SearchStrings(axis, entryDate) // 第一个 ≥ entryDate（建仓日为持有第 1 日）
-	if sellIdx := p + horizon - 1; sellIdx < len(axis) {
+	p := sort.SearchStrings(axis, entryDate) // 第一个 ≥ entryDate（建仓日为买入根）
+	if sellIdx := p + horizon; sellIdx < len(axis) {
 		return axis[sellIdx]
 	}
 	return labelFarFuture
@@ -442,8 +527,9 @@ func actualSellDate(axis []string, entryDate string, horizon int) string {
 // settleFromActualEntry 用户执行事实结算：从实际建仓日/价起持有 horizon 交易日按收盘
 // 卖出（不判障碍——用户实际操作自主，本口径只量化「按固定周期持有」的执行结果，
 // 用于与统一模拟并列对比，禁作训练标签）。sellDate 语义同 simulateHold（市场轴到期
-// 日，个股停牌不拉长持有跨度；空串回退按个股 K 线数推进）。
-func settleFromActualEntry(bars []datasource.Bar, entryDate string, entryPrice float64, horizon int, sellDate string) labelOutcome {
+// 日，个股停牌不拉长持有跨度；空串回退按个股 K 线数推进）；marketLastDate 为市场轴
+// 末日（非空时个股末根 < sellDate 但市场已过 = 退市/长停，末根收盘强平）。
+func settleFromActualEntry(bars []datasource.Bar, entryDate string, entryPrice float64, horizon int, sellDate, marketLastDate string) labelOutcome {
 	if entryPrice <= 0 || entryDate == "" {
 		return labelOutcome{Status: btSkipSuspend}
 	}
@@ -457,24 +543,35 @@ func settleFromActualEntry(bars []datasource.Bar, entryDate string, entryPrice f
 	if e < 0 {
 		return labelOutcome{Status: btPending}
 	}
-	// 建仓日为持有第 1 日 → 出场下标 e+horizon-1（与统一模拟 buyIdx+holdN-1 同口径）。
+	// 建仓根为买入根 → 卖出根 = e + horizon（建仓根之后第 horizon 个交易日，与统一
+	// 模拟 buyIdx+holdN 同口径）。
 	var j int
+	forced := false
 	if sellDate != "" {
 		if bars[len(bars)-1].TradeDate < sellDate {
-			return labelOutcome{Status: btPending}
-		}
-		j = e
-		for j < len(bars) && bars[j].TradeDate < sellDate {
-			j++
+			if marketLastDate != "" && marketLastDate >= sellDate {
+				j = len(bars) - 1 // 市场已过到期日、个股停更 → 退市/长停：末根收盘强平
+				forced = true
+			} else {
+				return labelOutcome{Status: btPending}
+			}
+		} else {
+			j = e
+			for j < len(bars) && bars[j].TradeDate < sellDate {
+				j++
+			}
 		}
 	} else {
-		j = e + horizon - 1
+		j = e + horizon
 		if j >= len(bars) {
 			return labelOutcome{Status: btPending}
 		}
 	}
-	out := labelOutcome{Status: btTraded, BuyDate: entryDate, BuyPrice: entryPrice}
 	sell := bars[j]
+	if sell.Close <= 0 {
+		return labelOutcome{Status: btPending} // 出场根坏数据：不伪造成熟收益
+	}
+	out := labelOutcome{Status: btTraded, BuyDate: entryDate, BuyPrice: entryPrice, Forced: forced}
 	qty := 100.0 // 名义一手：净收益率与股数无关（费率含最低佣金 5 元，按一手口径计）
 	buyAmount := entryPrice * qty
 	buyFee, buyTax := tradeFee("cn", model.PaperSideBuy, "", buyAmount)

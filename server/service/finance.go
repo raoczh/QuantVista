@@ -40,12 +40,12 @@ const (
 	optFinCursorExpress  = "fin_cursor_express"
 	optFinRefreshDay     = "fin_last_refresh_day"
 
-	finPageSize        = 500
-	finMaxPages        = 40              // 单类单期页数护栏（全市场预约披露约 12 页）
-	annPageSize        = 30              // 每股公告单轮拉取条数
-	annFetchCooldown   = time.Hour       // 详情页按需补拉冷却
-	annSymbolsMax      = 80              // 每日公告采集的标的上限（自选∪持仓）
-	forecastFreshDays  = 7               // earn_fcst：预告发布后多少自然日内算「新预告」
+	finPageSize       = 500
+	finMaxPages       = 40        // 单类单期页数护栏（全市场预约披露约 12 页）
+	annPageSize       = 30        // 每股公告单轮拉取条数
+	annFetchCooldown  = time.Hour // 详情页按需补拉冷却
+	annSymbolsMax     = 80        // 每日公告采集的标的上限（自选∪持仓）
+	forecastFreshDays = 7         // earn_fcst：预告发布后多少自然日内算「新预告」
 )
 
 // reportPeriodsAsOf 最近两个已结束的季度末（降序）。同时刷两期是为覆盖
@@ -151,8 +151,8 @@ func (s *FinanceService) refreshAppoint(ctx context.Context, periods []string) (
 	total := 0
 	for _, period := range periods {
 		n, err := s.pullReport(ctx, datasource.DataCenterQuery{
-			ReportName: finReportAppoint,
-			Filter:     fmt.Sprintf("(REPORT_DATE='%s')", period),
+			ReportName:  finReportAppoint,
+			Filter:      fmt.Sprintf("(REPORT_DATE='%s')", period),
 			SortColumns: "SECURITY_CODE", SortTypes: "1", PageSize: finPageSize,
 		}, period, s.upsertAppointRows)
 		if err != nil {
@@ -202,8 +202,8 @@ func (s *FinanceService) upsertForecastRows(rows []datasource.DcRow, period stri
 		}
 		recs = append(recs, model.EarningsForecast{
 			Symbol: sym, Market: "cn", ReportDate: r.Date("REPORT_DATE"),
-			Name:       r.String("SECURITY_NAME_ABBR"),
-			NoticeDate: r.Date("NOTICE_DATE"),
+			Name:        r.String("SECURITY_NAME_ABBR"),
+			NoticeDate:  r.Date("NOTICE_DATE"),
 			PredictType: r.String("PREDICT_TYPE"), PredictFinance: r.String("PREDICT_FINANCE"),
 			AmtLower: r.Float("PREDICT_AMT_LOWER"), AmtUpper: r.Float("PREDICT_AMT_UPPER"),
 			AmpLower: r.Float("ADD_AMP_LOWER"), AmpUpper: r.Float("ADD_AMP_UPPER"),
@@ -247,10 +247,10 @@ func (s *FinanceService) upsertAppointRows(rows []datasource.DcRow, period strin
 		}
 		recs = append(recs, model.DisclosureSchedule{
 			Symbol: sym, Market: "cn", ReportDate: r.Date("REPORT_DATE"),
-			Name:        r.String("SECURITY_NAME_ABBR"),
-			AppointDate: r.Date("APPOINT_PUBLISH_DATE"),
-			FirstDate:   r.Date("FIRST_APPOINT_DATE"),
-			ActualDate:  r.Date("ACTUAL_PUBLISH_DATE"),
+			Name:           r.String("SECURITY_NAME_ABBR"),
+			AppointDate:    r.Date("APPOINT_PUBLISH_DATE"),
+			FirstDate:      r.Date("FIRST_APPOINT_DATE"),
+			ActualDate:     r.Date("ACTUAL_PUBLISH_DATE"),
 			ReportTypeName: r.String("REPORT_TYPE_NAME"),
 			IsPublished:    r.String("IS_PUBLISH") == "1",
 		})
@@ -304,9 +304,11 @@ func (s *FinanceService) CollectAnnouncements(ctx context.Context) (inserted int
 		return 0
 	}
 	var syms []string
+	// 已平仓持仓排除（不再采其公告）；稳定排序保证 LIMIT 截断可复现。
 	common.DB.Raw(`SELECT DISTINCT symbol FROM (
-		SELECT symbol FROM watchlist_items UNION SELECT symbol FROM positions
-	) t LIMIT ?`, annSymbolsMax).Scan(&syms)
+		SELECT symbol FROM watchlist_items
+		UNION SELECT symbol FROM positions WHERE status = 'holding'
+	) t ORDER BY symbol LIMIT ?`, annSymbolsMax).Scan(&syms)
 	for _, sym := range syms {
 		if !isSixDigits(sym) {
 			continue
@@ -471,9 +473,10 @@ func TomorrowDisclosures(userID int64, tomorrow string) []string {
 		return nil
 	}
 	var syms []string
+	// 已平仓持仓排除：明日披露名单直接面向用户，不该出现已清仓标的。
 	common.DB.Raw(`SELECT DISTINCT symbol FROM (
 		SELECT symbol FROM watchlist_items WHERE user_id = ?
-		UNION SELECT symbol FROM positions WHERE user_id = ?
+		UNION SELECT symbol FROM positions WHERE user_id = ? AND status = 'holding'
 	) t`, userID, userID).Scan(&syms)
 	if len(syms) == 0 {
 		return nil
@@ -497,7 +500,7 @@ func TomorrowDisclosures(userID int64, tomorrow string) []string {
 // --- 后台任务 ---
 
 // StartFinanceJobs 每日盘后 19:05 刷新三类财报数据 + 采集公告 + 财报类提醒每日一评
-//（盘中 15min 行情评估显式排除财报类 kind，见 alert.go）。启动 2 分钟后若当日尚未
+// （盘中 15min 行情评估显式排除财报类 kind，见 alert.go）。启动 2 分钟后若当日尚未
 // 跑过则补一轮（首次部署全量建库；重启幂等靠游标与 upsert）。
 func StartFinanceJobs(mgr *datasource.Manager) *FinanceService {
 	svc := NewFinanceService()
@@ -508,8 +511,9 @@ func StartFinanceJobs(mgr *datasource.Manager) *FinanceService {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 		defer cancel()
-		if err := svc.RefreshAll(ctx); err != nil {
-			common.SysWarn("财报数据刷新部分失败: %v", err)
+		refreshErr := svc.RefreshAll(ctx)
+		if refreshErr != nil {
+			common.SysWarn("财报数据刷新部分失败: %v", refreshErr)
 		}
 		if n := svc.CollectAnnouncements(ctx); n > 0 {
 			common.SysLog("公告采集入库: %d", n)
@@ -517,7 +521,11 @@ func StartFinanceJobs(mgr *datasource.Manager) *FinanceService {
 		if n := alertSvc.EvaluateEarningsAll(); n > 0 {
 			common.SysLog("财报类提醒命中 %d 条", n)
 		}
-		_ = model.UpsertOption(optFinRefreshDay, time.Now().Format("2006-01-02"))
+		// 仅在三类财报刷新全部成功才推进「今日已刷新」游标：部分失败时不写，
+		// 当天重启/下轮补跑守卫自然放行重试（每类游标本身也只在成功时推进）。
+		if refreshErr == nil {
+			_ = model.UpsertOption(optFinRefreshDay, time.Now().Format("2006-01-02"))
+		}
 	}
 	go func() {
 		time.Sleep(2 * time.Minute)

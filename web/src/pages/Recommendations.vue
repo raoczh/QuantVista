@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NButton,
@@ -51,7 +51,7 @@ import { getPreference, updatePreference, type UserPreference } from '@/api/user
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
-import { pollUntil } from '@/lib/poll'
+import { pollUntil, isPollCancelled } from '@/lib/poll'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
@@ -222,10 +222,6 @@ const running = ref(false)
 const current = ref<RecommendationView | null>(null)
 
 async function generate() {
-  if (!llmConfigs.value.length) {
-    message.warning('请先在「设置」中添加并测试 LLM 配置')
-    return
-  }
   // 偏好接口慢/失败时表单仍是内置默认——生成前补一次加载，避免用户以为提交的是自己保存的偏好。
   if (!pref.value) await loadPrefFilters()
   running.value = true
@@ -250,16 +246,24 @@ async function generate() {
 }
 
 // trackBatch 轮询后台任务直到脱离 processing；页面刷新后凭历史里的 processing 批次恢复跟踪。
+// 页面卸载时取消轮询，避免后台请求空转与已销毁组件的状态回填。
+let pollAbort: AbortController | null = null
+onBeforeUnmount(() => pollAbort?.abort())
+
 async function trackBatch(id: number) {
   running.value = true
+  pollAbort?.abort()
+  pollAbort = new AbortController()
   try {
     const v = await pollUntil(
       () => getRecommendation(id),
       (r) => r.status !== 'processing',
+      { signal: pollAbort.signal },
     )
     if (!current.value || current.value.id === id) current.value = v
     notifyResult(v)
   } catch (e) {
+    if (isPollCancelled(e)) return
     message.error((e as Error).message)
   } finally {
     running.value = false
@@ -748,7 +752,7 @@ function qgFieldLabels(fields?: string[]): string {
               </div>
             </n-form-item>
             <n-form-item label="LLM 配置">
-              <n-select v-model:value="form.llm_config_id" :options="llmOptions" placeholder="选择模型配置" />
+              <n-select v-model:value="form.llm_config_id" :options="llmOptions" :placeholder="llmConfigs.length ? '选择模型配置' : '未配置将使用系统默认配置'" />
             </n-form-item>
             <n-button type="primary" block :loading="running" :disabled="running" @click="generate">
               {{ running ? '生成中…' : '生成推荐' }}

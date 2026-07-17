@@ -51,7 +51,53 @@ func TestExportPositionsCSV(t *testing.T) {
 	}
 }
 
-// TestImportPositions 导入：合法行入库、坏行报告、缺列拒绝、上限保护（DB 集成）。
+// TestSanitizeCSVCell 公式注入防护：危险前缀文本加单引号，合法数值/普通文本放行。
+func TestSanitizeCSVCell(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"=SUM(A1:A2)", "'=SUM(A1:A2)"},
+		{"+cmd", "'+cmd"},
+		{"-cmd|calc", "'-cmd|calc"},
+		{"@import", "'@import"},
+		{"\tTAB", "'\tTAB"},
+		{"\rCR", "'\rCR"},
+		{"-4.2", "-4.2"},   // 合法负数：不污染数字列
+		{"+8.5", "+8.5"},   // 合法正号数值
+		{"1.5e3", "1.5e3"}, // 科学计数
+		{"8.50", "8.50"},
+		{"浦发银行", "浦发银行"},
+		{"normal reason", "normal reason"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := sanitizeCSVCell(c.in); got != c.want {
+			t.Fatalf("sanitizeCSVCell(%q)=%q, 期望 %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestExportCSVFormulaInjection 端到端：以危险字符开头的 buy_reason 导出后被加固为纯文本。
+func TestExportCSVFormulaInjection(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Exec("DELETE FROM positions")
+	svc := NewExportService()
+	common.DB.Create(&model.Position{UserID: 1, Symbol: "600000", Market: "cn", Name: "浦发银行",
+		PositionType: model.PositionTypeShortTerm, Status: model.PositionStatusHolding,
+		BuyPrice: 8.5, BuyDate: "2026-06-01", Quantity: 1000,
+		BuyReason: "=HYPERLINK(\"http://evil\")"})
+
+	data, _, err := svc.Export(1, "positions")
+	if err != nil {
+		t.Fatalf("导出失败: %v", err)
+	}
+	body := string(data)
+	if strings.Contains(body, ",=HYPERLINK") {
+		t.Fatalf("危险公式字段未被加固: %s", body)
+	}
+	if !strings.Contains(body, "'=HYPERLINK") {
+		t.Fatalf("危险公式字段应被前置单引号: %s", body)
+	}
+}
+
 func TestImportPositions(t *testing.T) {
 	setupTestDB(t)
 	common.DB.Exec("DELETE FROM positions")

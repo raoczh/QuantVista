@@ -55,6 +55,12 @@ type RecommendationBatch struct {
 	TotalTokens      int   `json:"total_tokens"`
 	LatencyMs        int64 `json:"latency_ms"`
 
+	// FactsRecorded S0-5 事实账本完整性状态：candidate_events + 影子标签全部落库成功后置 true。
+	// 显式 column tag 防 GORM 蛇形化坑；旧行/落库失败批次为 false，供 tracking 扫描排查
+	// （持久化补建不可靠——快照丢失未导出的价格版本锚、gates 未持久化、事件表无唯一键
+	// 重跑会重复，故失败批次仅标记不自动重建，见 reclabel.go recordBatchFacts 注释）。
+	FactsRecorded bool `gorm:"column:facts_recorded" json:"facts_recorded"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

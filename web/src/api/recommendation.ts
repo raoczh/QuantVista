@@ -1,4 +1,4 @@
-import { request } from './client'
+import { request, HEAVY_TIMEOUT } from './client'
 import type { EvidenceCheck, TrustReview } from './trust'
 
 // 信任层类型统一收敛到 trust.ts；此处 re-export 保持既有 import 路径不炸。
@@ -463,5 +463,6 @@ export function getRecallReport(type?: string, horizon = 10, k = 50) {
     url: '/recommendations/recall-report',
     method: 'get',
     params: { type, horizon, k },
+    timeout: HEAVY_TIMEOUT,
   })
 }

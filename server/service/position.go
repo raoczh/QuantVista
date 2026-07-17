@@ -206,6 +206,8 @@ type PortfolioOverview struct {
 	TopName        string  `json:"top_name"`
 	TopWeightPct   float64 `json:"top_weight_pct"` // 最大单一持仓占比 %
 
+	QuoteFailedCount int `json:"quote_failed_count"` // 行情拉取失败、未计入市值/收益的持仓数（前端可提示口径）
+
 	Signals []string `json:"signals"` // 风控信号（集中度/止损/未分析）
 }
 
@@ -223,6 +225,7 @@ func (s *PositionService) Overview(ctx context.Context, userID int64) (*Portfoli
 	valueBySymbol := map[string]float64{}
 	nameBySymbol := map[string]string{}
 	var nearStop, belowStop, stale int
+	var pricedCost float64 // 已定价（行情成功）持仓的成本合计，作 ProfitPct 分母
 	for _, v := range views {
 		if v.Status == model.PositionStatusClosed {
 			ov.RealizedProfit += v.ProfitAmount
@@ -231,6 +234,7 @@ func (s *PositionService) Overview(ctx context.Context, userID int64) (*Portfoli
 		ov.HoldingCount++
 		ov.TotalCost += v.Cost
 		if v.QuoteOK {
+			pricedCost += v.Cost
 			ov.TotalValue += v.MarketValue
 			ov.TotalProfit += v.ProfitAmount
 			if v.ProfitAmount > 0 {
@@ -245,6 +249,8 @@ func (s *PositionService) Overview(ctx context.Context, userID int64) (*Portfoli
 			}
 			valueBySymbol[v.Symbol] += v.MarketValue
 			nameBySymbol[v.Symbol] = v.Name
+		} else {
+			ov.QuoteFailedCount++
 		}
 		if v.BelowStopLoss {
 			belowStop++
@@ -255,8 +261,11 @@ func (s *PositionService) Overview(ctx context.Context, userID int64) (*Portfoli
 			stale++
 		}
 	}
-	if ov.TotalCost > 0 {
-		ov.ProfitPct = round2(ov.TotalProfit / ov.TotalCost * 100)
+	// ProfitPct 分母用「已定价成本」而非全量 TotalCost：TotalProfit 只累加了行情成功的
+	// 持仓，若拿全量成本作分母，行情失败的持仓成本会稀释收益率（分子无对应盈亏、分母却含其成本）。
+	// TotalCost 字段本身保持全量语义不变（前端展示的总投入）。
+	if pricedCost > 0 {
+		ov.ProfitPct = round2(ov.TotalProfit / pricedCost * 100)
 	}
 	ov.TotalCost = round2(ov.TotalCost)
 	ov.TotalValue = round2(ov.TotalValue)
@@ -316,9 +325,19 @@ type PositionInput struct {
 
 	PlanStopLoss   float64 `json:"plan_stop_loss"`   // 计划止损价（0=未设）
 	PlanTakeProfit float64 `json:"plan_take_profit"` // 计划止盈价（0=未设）
-	ChecklistJSON  string  `json:"checklist_json"`   // 买入前检查清单快照
+	// ChecklistJSON 买入前检查清单快照。指针以区分「未传」(nil，保持原值不动) 与「清空全部
+	// 勾选」(空串，显式写入)——旧的 string 空值判断把清空当作不更新，用户取消所有勾选无法保存。
+	ChecklistJSON *string `json:"checklist_json"`
 
 	RecommendationID int64 `json:"recommendation_id"` // 来源推荐（一键建仓带入；0=手动建仓）
+}
+
+// strDeref 解引用字符串指针，nil 返回空串（*string 入参落库时的空值兜底）。
+func strDeref(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // validCurrency 持仓币种枚举（DATABASE_DESIGN：CNY/USD/HKD）。
@@ -376,7 +395,7 @@ func validateBuy(in *PositionInput) error {
 	if in.PlanTakeProfit > 0 && in.PlanTakeProfit <= in.BuyPrice {
 		return errors.New("计划止盈价应高于买入价")
 	}
-	if len(in.ChecklistJSON) > 4000 {
+	if in.ChecklistJSON != nil && len(*in.ChecklistJSON) > 4000 {
 		return errors.New("检查清单数据过大")
 	}
 	return nil
@@ -436,7 +455,7 @@ func (s *PositionService) Create(ctx context.Context, userID int64, in PositionI
 
 		PlanStopLoss:   in.PlanStopLoss,
 		PlanTakeProfit: in.PlanTakeProfit,
-		ChecklistJSON:  in.ChecklistJSON,
+		ChecklistJSON:  strDeref(in.ChecklistJSON),
 
 		RecommendationID: in.RecommendationID,
 	}
@@ -474,8 +493,8 @@ func (s *PositionService) Update(userID, id int64, in PositionInput) (*model.Pos
 	p.UserNote = truncateRunes(strings.TrimSpace(in.UserNote), 500)
 	p.PlanStopLoss = in.PlanStopLoss
 	p.PlanTakeProfit = in.PlanTakeProfit
-	if in.ChecklistJSON != "" {
-		p.ChecklistJSON = in.ChecklistJSON
+	if in.ChecklistJSON != nil {
+		p.ChecklistJSON = *in.ChecklistJSON
 	}
 	if c := strings.TrimSpace(in.Currency); c != "" {
 		currency, err := normalizeCurrency(c, p.Market)

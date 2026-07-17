@@ -44,25 +44,35 @@ const barsUnavailable = computed(() => !!detail.value && !detail.value.bars?.len
 const stocksUnavailable = computed(() => !!detail.value && !detail.value.stocks?.length)
 const valuation = computed(() => detail.value?.valuation || null)
 
+// 板块切换（路由 code 变化）竞态守卫：快速切板块时旧响应不覆盖新板块。
+let loadSeq = 0
+
 async function load(silent = false) {
   if (!code.value) return
+  const mySeq = ++loadSeq
   if (!silent) loading.value = true
   // 板块资金流 best-effort：push2his 限流属常态，失败只留空卡不打断详情页。
   getBoardFundFlow('cn', code.value, 90)
     .then((r) => {
+      if (mySeq !== loadSeq) return
       fundflow.value = r
       nextTick(() => renderFundFlowChart())
     })
-    .catch(() => (fundflow.value = null))
+    .catch(() => {
+      if (mySeq === loadSeq) fundflow.value = null
+    })
   try {
-    detail.value = await getBoardDetail('cn', code.value)
+    const d = await getBoardDetail('cn', code.value)
+    if (mySeq !== loadSeq) return
+    detail.value = d
     await nextTick()
     if (detail.value.bars?.length) renderChart(detail.value.bars)
   } catch (e) {
+    if (mySeq !== loadSeq) return
     detail.value = null
     if (!silent) message.error('板块详情加载失败：' + (e as Error).message)
   } finally {
-    if (!silent) loading.value = false
+    if (mySeq === loadSeq && !silent) loading.value = false
   }
 }
 

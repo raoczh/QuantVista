@@ -55,6 +55,10 @@ func TestThesisCRUDAndIsolation(t *testing.T) {
 	if err != nil || got.InvalidReason != "" {
 		t.Fatalf("恢复 active 应清空原因: %v %q", err, got.InvalidReason)
 	}
+	// 失效必须带原因：空/纯空白原因应报错（#5）。
+	if _, err := svc.SetStatus(1, c1.ID, model.ThesisStatusInvalidated, "   "); err == nil {
+		t.Fatal("失效缺原因应报错")
+	}
 	if _, err := svc.SetStatus(2, c1.ID, model.ThesisStatusArchived, ""); err == nil {
 		t.Fatal("跨用户改状态应失败")
 	}

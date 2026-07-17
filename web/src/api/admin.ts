@@ -1,4 +1,4 @@
-import { request } from './client'
+import { request, HEAVY_TIMEOUT } from './client'
 import type { AuthUser } from './auth'
 
 export interface SystemSettings {
@@ -150,6 +150,7 @@ export function getFactorIC(refresh = false) {
   return request<FactorICReport>({
     url: '/admin/market/factor-ic',
     params: refresh ? { refresh: 1 } : undefined,
+    timeout: HEAVY_TIMEOUT,
   })
 }
 
@@ -243,5 +244,6 @@ export function getWalkForward(refresh = false) {
   return request<WalkForwardReport>({
     url: '/admin/market/walk-forward',
     params: refresh ? { refresh: 1 } : undefined,
+    timeout: HEAVY_TIMEOUT,
   })
 }
