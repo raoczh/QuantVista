@@ -29,7 +29,7 @@ func labelBarsFixture() []datasource.Bar {
 // horizon=3 出场 bars[3] close=11.0：sellAmount=22000、佣金 5.5+印花税 11（万5），
 // net=(21983.5-20005)/20005=9.89%；gross=10%；MFE=(11.2-10)/10=12%、MAE=(9.8-10)/10=-2%。
 func TestSimulateLabelHold_Fixed(t *testing.T) {
-	out := simulateLabelHold(labelBarsFixture(), 0, "600000", "某某股份", 3, 20000, 0, 0, "")
+	out := simulateLabelHold(labelBarsFixture(), 0, "600000", "某某股份", 3, 20000, 0, 0, "", "")
 	if out.Status != btTraded {
 		t.Fatalf("应成交，得到 %s", out.Status)
 	}
@@ -55,20 +55,21 @@ func TestSimulateLabelHold_Fixed(t *testing.T) {
 func TestSimulateLabelHold_Barriers(t *testing.T) {
 	bars := labelBarsFixture()
 	// 止盈 10.7：买入日 high=10.9 不判（T+1），06-03 high=10.8≥10.7 触发。
-	out := simulateLabelHold(bars, 0, "600000", "某某股份", 3, 20000, 10.7, 0, "")
+	out := simulateLabelHold(bars, 0, "600000", "某某股份", 3, 20000, 10.7, 0, "", "")
 	if !out.HitTakeProfit || out.SellDate != "2026-06-03" || out.SellPrice != 10.7 {
 		t.Fatalf("应 06-03 触止盈@10.7: %+v", out)
 	}
 	if out.GrossPct != 7.0 {
 		t.Fatalf("止盈毛收益应 7%%，得到 %v", out.GrossPct)
 	}
-	// MFE 只统计到出场日：max(10.9,10.8)=10.9 → 9%。
+	// MFE 只统计到出场日，且出场日只计入确定经历的价位（开盘 10.3 与障碍价 10.7，
+	// 触发后的当日 high=10.8 不再计入）：max(买入日 10.9) → 9%。
 	if out.MfePct != 9.0 {
 		t.Fatalf("MFE 应 9%%，得到 %v", out.MfePct)
 	}
 
 	// 同日双触（06-03 low=10.1、high=10.8；止损 10.15、止盈 10.75）→ 保守取止损。
-	out = simulateLabelHold(bars, 0, "600000", "某某股份", 3, 20000, 10.75, 10.15, "")
+	out = simulateLabelHold(bars, 0, "600000", "某某股份", 3, 20000, 10.75, 10.15, "", "")
 	if !out.HitStopLoss || out.HitTakeProfit || out.SellPrice != 10.15 {
 		t.Fatalf("同日双触应取止损@10.15: %+v", out)
 	}
@@ -80,16 +81,83 @@ func TestSimulateLabelHold_Skips(t *testing.T) {
 	// 次日开盘涨幅 ≥ 涨停阈值−0.5 判一字板：开盘 11.0（+10%）。
 	limitUp := append([]datasource.Bar{}, bars...)
 	limitUp[1] = datasource.Bar{TradeDate: "2026-06-02", Open: 11.0, High: 11.0, Low: 11.0, Close: 11.0}
-	if out := simulateLabelHold(limitUp, 0, "600000", "某某股份", 3, 20000, 0, 0, ""); out.Status != btSkipLimitUp {
+	if out := simulateLabelHold(limitUp, 0, "600000", "某某股份", 3, 20000, 0, 0, "", ""); out.Status != btSkipLimitUp {
 		t.Fatalf("一字板应 skip_limit_up，得到 %s", out.Status)
 	}
 	// 拨款 900 元买不起一手（10 元×100 股）。
-	if out := simulateLabelHold(bars, 0, "600000", "某某股份", 3, 900, 0, 0, ""); out.Status != btSkipCash {
+	if out := simulateLabelHold(bars, 0, "600000", "某某股份", 3, 900, 0, 0, "", ""); out.Status != btSkipCash {
 		t.Fatalf("不足一手应 skip_cash，得到 %s", out.Status)
 	}
 	// horizon=60 数据未覆盖 → pending。
-	if out := simulateLabelHold(bars, 0, "600000", "某某股份", 60, 20000, 0, 0, ""); out.Status != btPending {
+	if out := simulateLabelHold(bars, 0, "600000", "某某股份", 60, 20000, 0, 0, "", ""); out.Status != btPending {
 		t.Fatalf("数据未覆盖应 pending，得到 %s", out.Status)
+	}
+	// 信号根=末根（当晚结算的新标签）：数据未到是 pending 不是 skip_suspend。
+	if out := simulateLabelHold(bars, len(bars)-1, "600000", "某某股份", 3, 20000, 0, 0, "", ""); out.Status != btPending {
+		t.Fatalf("次日数据未到应 pending，得到 %s", out.Status)
+	}
+}
+
+// TestSimulateLabelHold_MarketAxis 市场轴口径：推荐日次日停牌判 skip_suspend（不得用
+// 复牌远期价格假装成交）；个股中途停牌不拉长实际持有跨度。
+func TestSimulateLabelHold_MarketAxis(t *testing.T) {
+	// 次日（06-02）停牌：个股信号根后第一根是 06-03，与市场次日 06-02 不符。
+	gap := []datasource.Bar{
+		{TradeDate: "2026-06-01", Open: 9.9, High: 10.1, Low: 9.8, Close: 10.0},
+		{TradeDate: "2026-06-03", Open: 10.3, High: 10.8, Low: 10.1, Close: 10.6},
+		{TradeDate: "2026-06-04", Open: 10.7, High: 11.2, Low: 10.4, Close: 11.0},
+	}
+	if out := simulateLabelHold(gap, 0, "600000", "某某股份", 3, 20000, 0, 0, "2026-06-02", "2026-06-04"); out.Status != btSkipSuspend {
+		t.Fatalf("推荐日次日停牌应 skip_suspend，得到 %s", out.Status)
+	}
+	// 中途停牌（06-03 缺）：horizon=3 市场到期日=06-04，按市场轴当日出场——
+	// 旧的按个股第 N 根 K 线推进会顺延到 06-05（把持有期拉长）。
+	mid := []datasource.Bar{
+		{TradeDate: "2026-06-01", Open: 9.9, High: 10.1, Low: 9.8, Close: 10.0},
+		{TradeDate: "2026-06-02", Open: 10.0, High: 10.9, Low: 9.8, Close: 10.2},
+		{TradeDate: "2026-06-04", Open: 10.7, High: 11.2, Low: 10.4, Close: 11.0},
+		{TradeDate: "2026-06-05", Open: 11.0, High: 11.5, Low: 10.9, Close: 11.3},
+	}
+	out := simulateLabelHold(mid, 0, "600000", "某某股份", 3, 20000, 0, 0, "2026-06-02", "2026-06-04")
+	if out.Status != btTraded || out.SellDate != "2026-06-04" || out.SellPrice != 11.0 {
+		t.Fatalf("中途停牌应仍在市场到期日 06-04 出场: %+v", out)
+	}
+	// 到期日（06-04）个股停牌：顺延复牌首根（06-05）收盘卖出并记 Deferred。
+	expSusp := []datasource.Bar{
+		{TradeDate: "2026-06-01", Open: 9.9, High: 10.1, Low: 9.8, Close: 10.0},
+		{TradeDate: "2026-06-02", Open: 10.0, High: 10.9, Low: 9.8, Close: 10.2},
+		{TradeDate: "2026-06-03", Open: 10.3, High: 10.8, Low: 10.1, Close: 10.6},
+		{TradeDate: "2026-06-05", Open: 11.0, High: 11.5, Low: 10.9, Close: 11.3},
+	}
+	out = simulateLabelHold(expSusp, 0, "600000", "某某股份", 3, 20000, 0, 0, "2026-06-02", "2026-06-04")
+	if out.Status != btTraded || out.SellDate != "2026-06-05" || out.Deferred != 1 {
+		t.Fatalf("到期日停牌应顺延复牌首根且 Deferred=1: %+v", out)
+	}
+}
+
+// TestSimulateLabelHold_ExcursionToExit 障碍出场日的 MFE/MAE 只计入确定经历的价位
+//（开盘价与障碍成交价）——触发后的同日行情未经历，不得夸大。
+func TestSimulateLabelHold_ExcursionToExit(t *testing.T) {
+	bars := []datasource.Bar{
+		{TradeDate: "2026-06-01", Open: 9.9, High: 10.1, Low: 9.8, Close: 10.0},  // 信号日
+		{TradeDate: "2026-06-02", Open: 10.0, High: 10.2, Low: 9.95, Close: 10.1}, // 买入日
+		// 出场日：低开触止损 9.5，随后全天暴力拉升 high=12（出场后的行情）。
+		{TradeDate: "2026-06-03", Open: 9.8, High: 12.0, Low: 9.4, Close: 11.8},
+		{TradeDate: "2026-06-04", Open: 11.8, High: 12.5, Low: 11.5, Close: 12.2},
+	}
+	out := simulateLabelHold(bars, 0, "600000", "某某股份", 3, 20000, 0, 9.5, "", "")
+	if !out.HitStopLoss || out.SellPrice != 9.5 {
+		t.Fatalf("应触止损@9.5: %+v", out)
+	}
+	// MFE：买入日 high=10.2（+2%）、出场日只计 open=9.8 与 exit=9.5 → MFE=2%。
+	// 旧口径会把出场日 high=12（+20%）计入，夸大成 20%。
+	if out.MfePct != 2.0 {
+		t.Fatalf("MFE 应 2%%（出场日拉升不计入），得到 %v", out.MfePct)
+	}
+	// MAE：min(买入日 9.95−0.5%，出场日 open 9.8=−2%、exit 9.5=−5%) → −5%；
+	// 出场日 low=9.4（−6%）在触发时点之后与否不可知，保守不计。
+	if out.MaePct != -5.0 {
+		t.Fatalf("MAE 应 -5%%，得到 %v", out.MaePct)
 	}
 }
 
@@ -253,17 +321,61 @@ func TestPairwiseCorr(t *testing.T) {
 	}
 }
 
+// TestPairwiseCorrAligned 停牌错位场景：两条完全同向的序列，其中一条中途停牌 5 天——
+// 位置对齐会把不同交易日的收益配对（相关性失真），日期交集对齐仍应 ≈1。
+func TestPairwiseCorrAligned(t *testing.T) {
+	day := time.Date(2026, 3, 2, 0, 0, 0, 0, time.UTC)
+	var datesA, datesB []string
+	var a, b []float64
+	pa, pb := 10.0, 20.0
+	for i := 0; i < 70; i++ {
+		d := 0.01
+		if i%3 == 0 {
+			d = -0.02
+		}
+		pa *= 1 + d
+		pb *= 1 + d // 与 a 完全同向
+		td := day.AddDate(0, 0, i).Format("2006-01-02")
+		datesA = append(datesA, td)
+		a = append(a, pa)
+		if i >= 20 && i < 25 {
+			continue // B 股停牌 5 天：B 序列缺这 5 根
+		}
+		datesB = append(datesB, td)
+		b = append(b, pb)
+	}
+	if corr := pairwiseCorrAligned(datesA, a, datesB, b); corr < 0.99 {
+		t.Fatalf("日期对齐后同向序列相关应≈1，得到 %v", corr)
+	}
+	// 对照：位置对齐（尾部截齐）把错位的交易日配对，相关性明显失真。
+	if corr := pairwiseCorr(a, b); corr > 0.99 {
+		t.Fatalf("位置对齐在停牌错位下不应仍≈1（否则本用例失去意义），得到 %v", corr)
+	}
+	// 交集不足 21 个交易日返回 0 不判。
+	if corr := pairwiseCorrAligned(datesA[:10], a[:10], datesB[:10], b[:10]); corr != 0 {
+		t.Fatalf("交集样本不足应返回 0，得到 %v", corr)
+	}
+	// 长度不一致的防御路径。
+	if corr := pairwiseCorrAligned(datesA, a[:5], datesB, b); corr != 0 {
+		t.Fatalf("dates 与 closes 长度不符应返回 0，得到 %v", corr)
+	}
+}
+
 // ---------- S0-5 事件 + 标签端到端（DB） ----------
 
 func cleanLabelTables(t *testing.T) {
 	t.Helper()
+	// trading_calendars 一并清空：标签结算的市场轴（marketAxis 回退日历）若吃到其他
+	// 测试残留的日历，会让本文件的固定日期 fixture 走市场轴口径而非旧格子口径。
 	for _, tbl := range []string{"recommendation_labels", "recommendation_candidate_events",
-		"recommendation_batches", "recommendations", "daily_bars", "market_sync_states", "positions"} {
+		"recommendation_batches", "recommendations", "daily_bars", "market_sync_states", "positions",
+		"trading_calendars"} {
 		common.DB.Exec("DELETE FROM " + tbl)
 	}
 	t.Cleanup(func() {
 		for _, tbl := range []string{"recommendation_labels", "recommendation_candidate_events",
-			"recommendation_batches", "recommendations", "daily_bars", "market_sync_states", "positions"} {
+			"recommendation_batches", "recommendations", "daily_bars", "market_sync_states", "positions",
+			"trading_calendars"} {
 			common.DB.Exec("DELETE FROM " + tbl)
 		}
 	})
@@ -393,6 +505,47 @@ func TestRecordBatchFactsAndAdvance(t *testing.T) {
 	}
 }
 
+// TestAdvanceLabelsNextDaySuspend 端到端：推荐日次日个股停牌——市场轴（回退交易
+// 日历）给出真实次日，标签必须判 skip_suspend，不得用复牌后的远期 K 线假装成交。
+func TestAdvanceLabelsNextDaySuspend(t *testing.T) {
+	setupTestDB(t)
+	cleanLabelTables(t)
+
+	signalDate := "2026-06-01"
+	// 市场日历：06-01 ~ 06-12 每日开市（cleanLabelTables 已清空日历，本用例自建轴）。
+	d, _ := time.Parse("2006-01-02", signalDate)
+	for i := 0; i < 12; i++ {
+		common.DB.Exec("INSERT INTO trading_calendars (market, trade_date, is_open) VALUES ('cn', ?, 1)",
+			d.AddDate(0, 0, i).Format("2006-01-02"))
+	}
+	// 个股：信号日有 bar，次日（06-02）停牌缺失，06-03 起复牌连续。
+	seedLabelBars(t, "600100", signalDate, 1, 10)
+	seedLabelBars(t, "600100", "2026-06-03", 10, 10)
+
+	created, _ := time.Parse("2006-01-02 15:04", "2026-06-01 15:30")
+	batch := &model.RecommendationBatch{UserID: 1, Type: model.RecTypeShortTerm, Market: "cn",
+		Status: model.RecStatusSuccess, CreatedAt: created}
+	common.DB.Create(batch)
+	rec := model.Recommendation{BatchID: batch.ID, UserID: 1, Symbol: "600100", Market: "cn",
+		Action: model.RecActionBuy, RefPrice: 10}
+	common.DB.Create(&rec)
+	label := model.RecommendationLabel{
+		RecommendationID: rec.ID, HorizonDays: 5, EntryMode: model.EntryModeNextOpen,
+		BatchID: batch.ID, UserID: 1, Symbol: "600100", Market: "cn",
+		Type: model.RecTypeShortTerm, Action: model.RecActionBuy,
+		SignalDate: signalDate, MaturityStatus: model.LabelPending, LabelVersion: labelVersion,
+	}
+	common.DB.Create(&label)
+
+	if _, err := AdvanceRecommendationLabels(context.Background(), nil); err != nil {
+		t.Fatalf("推进失败: %v", err)
+	}
+	var got model.RecommendationLabel
+	common.DB.First(&got, label.ID)
+	if got.MaturityStatus != model.LabelSkipped || got.SkipReason != btSkipSuspend {
+		t.Fatalf("次日停牌应 skipped/skip_suspend（不得用复牌远期价格成交）: %+v", got)
+	}
+}
 // TestBackfillActualLabels 持仓血缘存在时补建 actual_position 行并按实际买入价结算。
 func TestBackfillActualLabels(t *testing.T) {
 	setupTestDB(t)
@@ -571,6 +724,10 @@ func TestRecAttribution(t *testing.T) {
 		mk(3, "pullback", 2, -2),  // chg5d -5~0%
 		mk(4, "pullback", -1, 1),  // chg5d 0~5%
 	}
+	// watch 条目：action 维度单独统计，其余维度（策略/来源等）不得混入稀释买入归因。
+	watchRow := mk(6, "momentum", 50, 0)
+	watchRow.Action = model.RecActionWatch
+	rows = append(rows, watchRow)
 	// 影子标签与 pending 不进报表。
 	rows = append(rows, model.RecommendationLabel{
 		CandidateEventID: 99, HorizonDays: 10, EntryMode: model.EntryModeNextOpen,
@@ -589,23 +746,35 @@ func TestRecAttribution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("报表失败: %v", err)
 	}
-	if rep.Sample != 4 || rep.Pending != 1 {
-		t.Fatalf("成熟样本应 4、pending 1，得到 %d/%d", rep.Sample, rep.Pending)
+	if rep.Sample != 5 || rep.SampleBuy != 4 || rep.Pending != 1 {
+		t.Fatalf("成熟样本应 5（buy 4）、pending 1，得到 %d/%d/%d", rep.Sample, rep.SampleBuy, rep.Pending)
 	}
-	var momentum *AttributionCell
+	var momentum, actionBuy, actionWatch *AttributionCell
 	for i := range rep.Groups {
-		if rep.Groups[i].Dim == "strategy" && rep.Groups[i].Key == "momentum" {
-			momentum = &rep.Groups[i]
+		g := &rep.Groups[i]
+		switch {
+		case g.Dim == "strategy" && g.Key == "momentum":
+			momentum = g
+		case g.Dim == "action" && g.Key == model.RecActionBuy:
+			actionBuy = g
+		case g.Dim == "action" && g.Key == model.RecActionWatch:
+			actionWatch = g
 		}
 	}
 	if momentum == nil {
 		t.Fatalf("应有 momentum 分组")
 	}
+	// 策略维度只统计 buy：momentum 的 watch(+50) 不得混入（旧口径 Sample 会是 3、
+	// 胜率被 watch 拉高）。
 	if momentum.Sample != 2 || momentum.WinRate != 50 || momentum.AvgNetPct != 1 || momentum.MedianNetPct != 1 {
-		t.Fatalf("momentum 统计不符: %+v", momentum)
+		t.Fatalf("momentum 统计不符（watch 不得混入）: %+v", momentum)
 	}
 	if momentum.SevereLossPct != 50 { // -6 一条
 		t.Fatalf("严重亏损率应 50，得到 %v", momentum.SevereLossPct)
+	}
+	// action 维度：buy/watch 并列对照。
+	if actionBuy == nil || actionBuy.Sample != 4 || actionWatch == nil || actionWatch.Sample != 1 {
+		t.Fatalf("action 维度应 buy 4/watch 1: %+v %+v", actionBuy, actionWatch)
 	}
 	// 非法 horizon 拒绝。
 	if _, err := RecAttribution(9, "", 7); err == nil {

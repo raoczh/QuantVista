@@ -277,6 +277,7 @@ export interface AttributionReport {
   type: string
   horizon_days: number
   sample: number
+  sample_buy: number
   skipped: number
   pending: number
   groups: AttributionCell[] | null

@@ -759,7 +759,8 @@ func RebuildFactorTableAsync(reason string) {
 		factorTableMu.Unlock()
 		common.SysLog("因子宽表重建完成（%s）: %s，%d 只，耗时 %dms（DB 读 %dms）",
 			reason, t.TradeDate, t.Len(), t.BuildMs, t.ScanMs)
-		// S3-1 每日因子快照：新表发布后固化落库（首写胜幂等；同日已有快照零成本跳过）。
+		// S3-1 每日因子快照：新表发布后固化落库（已有行不可变；同日只补缺失 symbol，
+		// 分批初始化不冻结不完整快照）。
 		if n, err := SnapshotFactorTable(t); err != nil {
 			common.SysWarn("因子快照落库失败 %s: %v", t.TradeDate, err)
 		} else if n > 0 {

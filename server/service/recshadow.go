@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"quantvista/common"
 	"quantvista/model"
@@ -96,14 +97,26 @@ func RecShadowReport(userID int64, recType string, horizon int) (*ShadowReport, 
 
 	key := func(batchID int64, symbol string) string { return fmt.Sprintf("%d|%s", batchID, symbol) }
 	// 门控标记集合：gate_type → key 集合；anyGate 供对照组排除「被任何门控标记者」。
+	// 一条事件可能命中多个门控（GateTypes 逗号全量，旧行回退单值 GateType）——
+	// 每个命中门控都各自归组，任何门控不因合并折叠丢失样本。
 	gatedBy := map[string]map[string]model.RecommendationCandidateEvent{}
 	anyGate := map[string]bool{}
 	for _, ev := range events {
 		k := key(ev.BatchID, ev.Symbol)
-		if gatedBy[ev.GateType] == nil {
-			gatedBy[ev.GateType] = map[string]model.RecommendationCandidateEvent{}
+		types := strings.Split(ev.GateTypes, ",")
+		if ev.GateTypes == "" {
+			types = []string{ev.GateType}
 		}
-		gatedBy[ev.GateType][k] = ev
+		for _, gt := range types {
+			gt = strings.TrimSpace(gt)
+			if gt == "" {
+				continue
+			}
+			if gatedBy[gt] == nil {
+				gatedBy[gt] = map[string]model.RecommendationCandidateEvent{}
+			}
+			gatedBy[gt][k] = ev
+		}
 		anyGate[k] = true
 	}
 
@@ -117,7 +130,10 @@ func RecShadowReport(userID int64, recType string, horizon int) (*ShadowReport, 
 				rep.PickedBuyMatured++
 			}
 		}
-		if l.RecommendationID > 0 && !anyGate[k] && l.MaturityStatus == model.LabelMatured {
+		// 对照组限定 buy：入选 watch 的成熟收益与「被门控标记的 buy」不可比（watch
+		// 本就是更弱的信号），混入会让 gated vs ungated 的转正判断失真。
+		if l.RecommendationID > 0 && l.Action == model.RecActionBuy &&
+			!anyGate[k] && l.MaturityStatus == model.LabelMatured {
 			ungatedMatured = append(ungatedMatured, l)
 		}
 	}
@@ -128,6 +144,10 @@ func RecShadowReport(userID int64, recType string, horizon int) (*ShadowReport, 
 		if len(marks) == 0 {
 			continue
 		}
+		// 入选类影子门控（regime/bear/quality）标记的是 picked 条目：gated 侧同样
+		// 限定 buy 与对照组同口径；名单裁剪类（correlation/industry_cap）标记的是
+		// 未入选者（影子标签 action=shadow），无动作概念不过滤。
+		pickedGate := gt == model.GateRegimeShadow || gt == model.GateBearShadow || gt == model.GateQualityShadow
 		grp := ShadowGateGroup{GateType: gt, GateLabel: shadowGateLabelCN[gt], Ungated: ungatedCell}
 		var gatedMatured []model.RecommendationLabel
 		for _, l := range labels {
@@ -135,8 +155,14 @@ func RecShadowReport(userID int64, recType string, horizon int) (*ShadowReport, 
 			if !ok {
 				continue
 			}
+			if pickedGate && l.Action != model.RecActionBuy {
+				continue // watch 被门控标记不进对照口径（分母分子一致排除）
+			}
 			grp.Marked++
-			if ev.WouldBeAction != "" {
+			// would_rewrite=若强制执行会失去的 buy：只有会改写动作的门控（regime/bear)
+			// 才计——quality 只封顶置信度，同一事件携带的 would_be_action 属于主门控，
+			// 不得记到 quality 组头上。
+			if ev.WouldBeAction != "" && (gt == model.GateRegimeShadow || gt == model.GateBearShadow) {
 				grp.WouldRewrite++
 			}
 			if l.MaturityStatus == model.LabelMatured {
@@ -144,15 +170,16 @@ func RecShadowReport(userID int64, recType string, horizon int) (*ShadowReport, 
 			}
 		}
 		if grp.Marked == 0 {
-			continue // 该门控的标记都不在本报表口径（类型/持有期）内
+			continue // 该门控的标记都不在本报表口径（类型/持有期/动作）内
 		}
 		grp.Gated = summarizeCell("shadow", "gated", gatedMatured)
 		rep.Groups = append(rep.Groups, grp)
 	}
 
 	rep.Notes = append(rep.Notes,
-		"口径：统一执行模拟标签（next_open）；被标记标的含入选（regime/反方/质量影子）与名单阶段被挤出者（相关性/行业），对照组=未被任何门控标记的入选标的",
-		"覆盖率语义：would_rewrite=若强制执行会失去的 buy 数（质量门控只封顶置信度不改动作，恒 0）；picked_buy 为分母",
+		"口径：统一执行模拟标签（next_open）；gated 与对照组统一限定 buy（入选类门控），名单阶段被挤出者（相关性/行业）吃影子标签；对照组=未被任何门控标记的入选 buy",
+		"覆盖率语义：would_rewrite=若强制执行会失去的 buy 数（只计会改写动作的 regime/反方门控；质量门控只封顶置信度恒 0）；picked_buy 为分母",
+		"同一标的命中多个门控时各门控分别归组（事件行 gate_types 全量），样本可在多组重复出现——组间不可加总",
 		"防回归纪律：影子门控转正凭本报表 gated vs ungated 配对评审——覆盖率下降但收益不改善即回退；评价协议须预注册，不允许看完结果再换阈值",
 		fmt.Sprintf("单组成熟样本 <%d 时统计不稳定，仅供方向参考", attributionMinBucket),
 	)

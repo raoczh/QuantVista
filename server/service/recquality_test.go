@@ -26,7 +26,7 @@ func TestComputeQualityGate(t *testing.T) {
 	today := "2026-06-12" // 距 lastBarDate 2 天（新鲜）
 
 	t.Run("数据齐全返回 nil 不落明细", func(t *testing.T) {
-		if got := computeQualityGate(model.RecTypeShortTerm, qgFullCandidate(), today); got != nil {
+		if got := computeQualityGate(model.RecTypeShortTerm, qgFullCandidate(), today, nil); got != nil {
 			t.Fatalf("齐全应 nil: %+v", got)
 		}
 	})
@@ -34,7 +34,7 @@ func TestComputeQualityGate(t *testing.T) {
 	t.Run("长线缺财务=严重 cap 40", func(t *testing.T) {
 		c := qgFullCandidate()
 		c.Fin = nil
-		got := computeQualityGate(model.RecTypeLongTerm, c, today)
+		got := computeQualityGate(model.RecTypeLongTerm, c, today, nil)
 		if got == nil || got.WouldBeConfidenceCap != qgCapLongNoFin {
 			t.Fatalf("长线缺 fin 应 cap %d: %+v", qgCapLongNoFin, got)
 		}
@@ -46,7 +46,7 @@ func TestComputeQualityGate(t *testing.T) {
 	t.Run("短线缺财务不标记", func(t *testing.T) {
 		c := qgFullCandidate()
 		c.Fin = nil
-		if got := computeQualityGate(model.RecTypeShortTerm, c, today); got != nil {
+		if got := computeQualityGate(model.RecTypeShortTerm, c, today, nil); got != nil {
 			t.Fatalf("短线缺 fin 不严重，应 nil: %+v", got)
 		}
 	})
@@ -54,7 +54,7 @@ func TestComputeQualityGate(t *testing.T) {
 	t.Run("日线过期属通用严重", func(t *testing.T) {
 		c := qgFullCandidate()
 		c.lastBarDate = "2026-06-01" // 距今 11 天 > 5
-		got := computeQualityGate(model.RecTypeShortTerm, c, today)
+		got := computeQualityGate(model.RecTypeShortTerm, c, today, nil)
 		if got == nil || got.WouldBeConfidenceCap != qgCapStaleBars || got.DataAgeDays != 11 {
 			t.Fatalf("过期应 cap %d 且 data_age=11: %+v", qgCapStaleBars, got)
 		}
@@ -66,7 +66,7 @@ func TestComputeQualityGate(t *testing.T) {
 	t.Run("日线样本不足", func(t *testing.T) {
 		c := qgFullCandidate()
 		c.Factors.BarCount = 30
-		got := computeQualityGate(model.RecTypeShortTerm, c, today)
+		got := computeQualityGate(model.RecTypeShortTerm, c, today, nil)
 		if got == nil || got.WouldBeConfidenceCap != qgCapShortBars {
 			t.Fatalf("样本不足应 cap %d: %+v", qgCapShortBars, got)
 		}
@@ -75,7 +75,7 @@ func TestComputeQualityGate(t *testing.T) {
 	t.Run("因子缺席=最低档", func(t *testing.T) {
 		c := qgFullCandidate()
 		c.Factors = nil
-		got := computeQualityGate(model.RecTypeShortTerm, c, today)
+		got := computeQualityGate(model.RecTypeShortTerm, c, today, nil)
 		if got == nil || got.WouldBeConfidenceCap != qgCapNoFactors || got.DataAgeDays != -1 {
 			t.Fatalf("无因子应 cap %d 且 data_age=-1: %+v", qgCapNoFactors, got)
 		}
@@ -86,7 +86,7 @@ func TestComputeQualityGate(t *testing.T) {
 		c.Fin = nil                  // 长线 40
 		c.Amount = 0                 // 50
 		c.Factors.BarCount = 30      // 60
-		got := computeQualityGate(model.RecTypeLongTerm, c, today)
+		got := computeQualityGate(model.RecTypeLongTerm, c, today, nil)
 		if got == nil || got.WouldBeConfidenceCap != qgCapLongNoFin {
 			t.Fatalf("多项命中应取最小 cap %d: %+v", qgCapLongNoFin, got)
 		}
@@ -101,7 +101,7 @@ func TestComputeQualityGate(t *testing.T) {
 	t.Run("情绪缺失≠情绪中性：独立标记不降 cap", func(t *testing.T) {
 		c := qgFullCandidate()
 		c.SentiNews = 0 // 当日无相关新闻=数据缺失
-		got := computeQualityGate(model.RecTypeShortTerm, c, today)
+		got := computeQualityGate(model.RecTypeShortTerm, c, today, nil)
 		if got == nil || !got.SentiMissing {
 			t.Fatalf("情绪缺失应标记 senti_missing: %+v", got)
 		}
@@ -111,8 +111,36 @@ func TestComputeQualityGate(t *testing.T) {
 		// 有新闻且情绪分为 0（真中性）不标缺失。
 		c2 := qgFullCandidate()
 		c2.SentiScore = 0
-		if got := computeQualityGate(model.RecTypeShortTerm, c2, today); got != nil {
+		if got := computeQualityGate(model.RecTypeShortTerm, c2, today, nil); got != nil {
 			t.Fatalf("情绪中性（有新闻）不是缺失: %+v", got)
+		}
+	})
+
+	t.Run("交易日口径：长假期间不误判过期（qg2）", func(t *testing.T) {
+		// 春节场景：节前最后交易日 02-13 收盘，节后首个交易日 02-24 生成——
+		// 自然日差 11（旧口径 >5 误判过期），开市日差 1（正常 T+1）不过期。
+		openDays := []string{"2026-02-11", "2026-02-12", "2026-02-13", "2026-02-24", "2026-02-25", "2026-02-26"}
+		c := qgFullCandidate()
+		c.lastBarDate = "2026-02-13"
+		got := computeQualityGate(model.RecTypeShortTerm, c, "2026-02-24", openDays)
+		if got != nil {
+			t.Fatalf("长假后首个交易日不应误判过期: %+v", got)
+		}
+		// 真错过多个开市日（个股停牌）→ 过期：(02-11, 02-26] 内开市日
+		// 02-12/13/24/25/26 共 5 个 > 阈值 3。
+		c2 := qgFullCandidate()
+		c2.lastBarDate = "2026-02-11"
+		got = computeQualityGate(model.RecTypeShortTerm, c2, "2026-02-26", openDays)
+		if got == nil || got.WouldBeConfidenceCap != qgCapStaleBars {
+			t.Fatalf("错过 5 个开市日应过期 cap %d: %+v", qgCapStaleBars, got)
+		}
+		if got.DataAgeTradeDays != 5 {
+			t.Fatalf("开市日差应 5，得到 %d", got.DataAgeTradeDays)
+		}
+		// 无日历回退自然日口径：11 天 >5 判过期（旧行为兜底）。
+		got = computeQualityGate(model.RecTypeShortTerm, c, "2026-02-24", nil)
+		if got == nil || got.WouldBeConfidenceCap != qgCapStaleBars || got.DataAgeTradeDays != -1 {
+			t.Fatalf("无日历应回退自然日口径判过期: %+v", got)
 		}
 	})
 }

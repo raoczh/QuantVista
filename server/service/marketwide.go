@@ -445,8 +445,10 @@ func (s *MarketService) upsertUniverseDaily(rows []datasource.SpotRow, tradeDate
 	err := common.DB.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "trade_date"}, {Name: "symbol"}},
 		DoUpdates: clause.AssignmentColumns([]string{
+			// PETTM 的 GORM 蛇形化列名是 pettm（连续大写视为一词，F1 YoY→yo_y 同款坑）；
+			// 写 pe_ttm 会让整条 upsert SQL 无效——快照整批落库失败而非单列失败。
 			"name", "is_st", "suspended", "close", "prev_close",
-			"amount", "turnover_rate", "pe", "pe_ttm", "pb", "industry",
+			"amount", "turnover_rate", "pe", "pettm", "pb", "industry",
 		}),
 	}).CreateInBatches(snap, 500).Error
 	if err != nil && err != gorm.ErrEmptySlice {

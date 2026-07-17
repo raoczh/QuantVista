@@ -154,10 +154,13 @@ type candidate struct {
 	Bonus     []string `json:"bonus,omitempty"`      // 策略加分/扣分明细（可解释）
 	SentToLLM bool     `json:"sent_to_llm,omitempty"`
 
-	// 进程内工作字段（小写不序列化，不进池快照）：closes 尾部收盘序列（S1-3 相关性
-	// 去重与 S1-2 相关性系数）；lastBar* 生成时点最近收盘日与收盘价（S0-4 价格版本，
-	// 防前复权重锚——落库进 Recommendation.RefDate/RefClose 与标签行）。
+	// 进程内工作字段（小写不序列化，不进池快照）：closes/closeDates 尾部收盘序列及
+	// 其交易日（S1-3 相关性去重与 S1-2 相关性系数——按交易日交集对齐，任一股停牌
+	// 时相同下标对应不同交易日，位置对齐会失真）；lastBar* 生成时点最近收盘日与
+	// 收盘价（S0-4 价格版本，防前复权重锚——落库进 Recommendation.RefDate/RefClose
+	// 与标签行）。
 	closes       []float64
+	closeDates   []string
 	lastBarDate  string
 	lastBarClose float64
 }
@@ -690,7 +693,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 				continue
 			}
 			co := poolBySymbol[picks[j].Symbol]
-			if corr := pairwiseCorr(c.closes, co.closes); corr > in.MaxCorr {
+			if corr := pairwiseCorrAligned(c.closeDates, c.closes, co.closeDates, co.closes); corr > in.MaxCorr {
 				in.MaxCorr = corr
 			}
 		}
@@ -1534,17 +1537,21 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 			}
 			sc := computeScore(pool[i].Price, barsScore)
 			pool[i].Factors = computeCandFactors(pool[i].Price, bars)
-			// S0-4 价格版本 + S1-3 相关性序列：保存尾部收盘（61 根足够 60 日收益相关）
-			// 与最近收盘日锚点（防前复权重锚的比对基准）。
+			// S0-4 价格版本 + S1-3 相关性序列：保存尾部收盘与交易日（61 根足够 60 日
+			// 收益相关；日期供停牌错位下的交集对齐）与最近收盘日锚点（防前复权重锚
+			// 的比对基准）。
 			tail := bars
 			if len(tail) > 61 {
 				tail = tail[len(tail)-61:]
 			}
 			closes := make([]float64, len(tail))
+			closeDates := make([]string, len(tail))
 			for k, b := range tail {
 				closes[k] = b.Close
+				closeDates[k] = b.TradeDate
 			}
 			pool[i].closes = closes
+			pool[i].closeDates = closeDates
 			pool[i].lastBarDate = bars[len(bars)-1].TradeDate
 			pool[i].lastBarClose = bars[len(bars)-1].Close
 
@@ -1681,7 +1688,7 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 		}
 		if !blocked && len(pool[r.idx].closes) > 0 {
 			for _, ci := range chosen {
-				if corr := pairwiseCorr(pool[r.idx].closes, pool[ci].closes); corr >= recCorrThreshold {
+				if corr := pairwiseCorrAligned(pool[r.idx].closeDates, pool[r.idx].closes, pool[ci].closeDates, pool[ci].closes); corr >= recCorrThreshold {
 					gates = append(gates, gateNote{
 						Symbol: pool[r.idx].Symbol, GateType: model.GateCorrelation,
 						Reason: fmt.Sprintf("与 %s 近60日收益相关性 %.2f≥%.2f，仅保留分高者", pool[ci].Symbol, corr, recCorrThreshold),

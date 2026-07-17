@@ -161,8 +161,9 @@ func (s *RecommendationService) RecRecallReport(ctx context.Context, userID int6
 	for i, d := range axis {
 		axisIndex[d] = i
 	}
-	// 信号日=批次日期（或其前最近交易日）；且须留足 horizon+1 根走完持有期。
-	lastEligible := len(axis) - (horizon + 2)
+	// 信号日=批次日期（或其前最近交易日）；且须留足 horizon 根走完持有期
+	//（信号日 i 的到期卖出根为 i+horizon，须 ≤ 轴末）。
+	lastEligible := len(axis) - (horizon + 1)
 	if lastEligible < 0 {
 		return nil, errors.New("交易日轴数据不足，无法评估")
 	}
@@ -291,11 +292,16 @@ func (s *RecommendationService) RecRecallReport(ctx context.Context, userID int6
 			if fallbackDates[d] && bars[i].Amount < recallMinAmount {
 				continue
 			}
-			nextDate := ""
-			if ai, ok := axisIndex[d]; ok && ai+1 < len(axis) {
-				nextDate = axis[ai+1]
+			nextDate, sellDate := "", ""
+			if ai, ok := axisIndex[d]; ok {
+				if ai+1 < len(axis) {
+					nextDate = axis[ai+1]
+				}
+				if ai+horizon < len(axis) {
+					sellDate = axis[ai+horizon] // 市场轴到期日：个股中途停牌不拉长持有跨度
+				}
 			}
-			o := simulateHold(bars, i, symbol, name, horizon, recallPerCap, nextDate)
+			o := simulateHold(bars, i, symbol, name, horizon, recallPerCap, nextDate, sellDate)
 			if o.Status != btTraded {
 				continue // 一字板买不进/停牌/坏数据：不属可交易机会集
 			}

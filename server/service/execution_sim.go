@@ -53,9 +53,12 @@ func isOneWordLimitDown(b, prev datasource.Bar, limitPct float64) bool {
 
 // simEntry 统一入场段：信号日下标 i，次日开盘买入。返回买入根下标、股数与总成本；
 // 不可成交时 outcome.Status 非空（skip_*）。
+// 信号根之后个股暂无数据返回 pending 而非 skip_suspend——纯函数无法区分「停牌中」
+// 与「数据未同步到」（当晚结算的新标签必然落在这里），交给调用方等待：复牌/次日
+// 数据落库后，bars[i+1] 与 nextDate 的比对自然给出 skip_suspend 或正常成交。
 func simEntry(bars []datasource.Bar, i int, symbol, name string, perCap float64, nextDate string) (buyIdx int, qty, cost float64, skip string) {
 	if i+1 >= len(bars) {
-		return 0, 0, 0, btSkipSuspend // 信号日后无数据（停牌到末尾）
+		return 0, 0, 0, btPending // 信号日后暂无数据（数据未到/停牌中，等下一轮）
 	}
 	sig, buy := bars[i], bars[i+1]
 	if buy.Open <= 0 || sig.Close <= 0 {
@@ -81,22 +84,40 @@ func simEntry(bars []datasource.Bar, i int, symbol, name string, perCap float64,
 
 // simulateHold 从信号日下标 i 起模拟一笔「次日开盘买入、持有 holdN 交易日收盘卖出」。
 // bars 为该股升序日线全序列；nextDate 为市场日轴上的次一交易日（非空时校验个股
-// 次日是否停牌——停牌期无法按计划买入，跳过而非用复牌远期价格假装成交）。
-func simulateHold(bars []datasource.Bar, i int, symbol, name string, holdN int, perCap float64, nextDate string) holdOutcome {
+// 次日是否停牌——停牌期无法按计划买入，跳过而非用复牌远期价格假装成交）；
+// sellDate 为市场日轴上的到期卖出日（信号日后第 holdN 个交易日）——非空时按市场
+// 日期定位出场根，个股中途停牌不再拉长实际持有跨度（旧的按个股第 N 根 K 线推进会
+// 让停牌股顺延到复牌后第 N 根，不同股票的持有天数不可比）；到期日个股停牌视同
+// 卖不出，顺延到复牌首根收盘卖出。空 sellDate 回退按个股 K 线数推进（无轴调用方）。
+func simulateHold(bars []datasource.Bar, i int, symbol, name string, holdN int, perCap float64, nextDate, sellDate string) holdOutcome {
 	buyIdx, qty, cost, skip := simEntry(bars, i, symbol, name, perCap, nextDate)
 	if skip != "" {
 		return holdOutcome{Status: skip}
 	}
 	buy := bars[buyIdx]
 	limitPct := limitUpPctFor(symbol, name)
+	out := holdOutcome{Status: btTraded, BuyDate: buy.TradeDate, BuyPrice: buy.Open}
 
-	// 卖出目标：买入日为持有第 1 日，第 holdN 日收盘卖出 → bars[i+holdN]。
-	j := i + holdN
-	if j >= len(bars) {
-		return holdOutcome{Status: btPending, BuyDate: buy.TradeDate, BuyPrice: buy.Open}
+	// 卖出目标：买入日为持有第 1 日，第 holdN 日收盘卖出。
+	var j int
+	if sellDate != "" {
+		if bars[len(bars)-1].TradeDate < sellDate {
+			return holdOutcome{Status: btPending, BuyDate: buy.TradeDate, BuyPrice: buy.Open}
+		}
+		j = buyIdx
+		for j < len(bars) && bars[j].TradeDate < sellDate {
+			j++
+		}
+		if j < len(bars) && bars[j].TradeDate != sellDate {
+			out.Deferred++ // 到期日个股停牌：顺延到复牌首根（记一次顺延，不精确到天数）
+		}
+	} else {
+		j = i + holdN
+		if j >= len(bars) {
+			return holdOutcome{Status: btPending, BuyDate: buy.TradeDate, BuyPrice: buy.Open}
+		}
 	}
 	// 五件套③：一字跌停卖不出，顺延重试。
-	out := holdOutcome{Status: btTraded, BuyDate: buy.TradeDate, BuyPrice: buy.Open}
 	for j < len(bars) && isOneWordLimitDown(bars[j], bars[j-1], limitPct) {
 		out.Deferred++
 		j++
@@ -138,7 +159,9 @@ type labelOutcome struct {
 // takeProfit/stopLoss > 0 时启用三重障碍——自买入次日（T+1）起按当日 high/low 判盘中
 // 触达，先触者出场、同日双触保守取止损、成交按障碍价（不取更优的 high/low）。
 // 止损出场日若一字跌停按五件套③顺延。horizon 未走完且数据未覆盖返回 pending。
-func simulateLabelHold(bars []datasource.Bar, i int, symbol, name string, horizon int, perCap, takeProfit, stopLoss float64, nextDate string) labelOutcome {
+// sellDate 语义同 simulateHold：市场日轴上的到期卖出日（个股停牌不拉长持有跨度，
+// 到期日停牌顺延复牌卖出）；空串回退按个股 K 线数推进。
+func simulateLabelHold(bars []datasource.Bar, i int, symbol, name string, horizon int, perCap, takeProfit, stopLoss float64, nextDate, sellDate string) labelOutcome {
 	buyIdx, qty, cost, skip := simEntry(bars, i, symbol, name, perCap, nextDate)
 	if skip != "" {
 		return labelOutcome{Status: skip}
@@ -148,9 +171,33 @@ func simulateLabelHold(bars []datasource.Bar, i int, symbol, name string, horizo
 	limitPct := limitUpPctFor(symbol, name)
 	out := labelOutcome{Status: btTraded, BuyDate: buy.TradeDate, BuyPrice: buyPrice}
 
+	// 到期卖出根定位（endOK=false 表示数据未覆盖到期日，障碍扫描到末根后 pending）。
+	end, endOK := 0, false
+	endDeferred := 0
+	if sellDate != "" {
+		if bars[len(bars)-1].TradeDate >= sellDate {
+			end = buyIdx
+			for end < len(bars) && bars[end].TradeDate < sellDate {
+				end++
+			}
+			endOK = true
+			if bars[end].TradeDate != sellDate {
+				endDeferred = 1 // 到期日个股停牌：顺延到复牌首根
+			}
+		} else {
+			end = len(bars) // 未覆盖：障碍扫描扫完已有窗口
+		}
+	} else {
+		end = i + horizon // 到期卖出根（买入日为持有第 1 日）
+		endOK = end < len(bars)
+		if !endOK {
+			end = len(bars)
+		}
+	}
+
 	// 障碍扫描：T+1——买入日（buyIdx）当日不可卖出，从 buyIdx+1 起判。
-	end := i + horizon // 到期卖出根（买入日为持有第 1 日）
 	exitIdx, exitPrice := -1, 0.0
+	barrierIdx := -1 // 障碍触发根（未被顺延时出场日=触发日，MFE/MAE 须截断到出场价）
 	if takeProfit > 0 || stopLoss > 0 {
 		for k := buyIdx + 1; k <= end && k < len(bars); k++ {
 			b := bars[k]
@@ -166,17 +213,19 @@ func simulateLabelHold(bars []datasource.Bar, i int, symbol, name string, horizo
 				out.HitTakeProfit = true
 				exitIdx, exitPrice = k, takeProfit
 			}
+			barrierIdx = k
 			break
 		}
 	}
 	if exitIdx < 0 {
 		// 无障碍触发：到期收盘卖出（含一字跌停顺延）。
-		if end >= len(bars) {
+		if !endOK {
 			// 数据未覆盖到期日：MFE/MAE 记录已有窗口后返回 pending。
 			out.Status = btPending
 			out.MfePct, out.MaePct = excursion(bars, buyIdx, len(bars)-1, buyPrice)
 			return out
 		}
+		out.Deferred += endDeferred
 		j := end
 		for j < len(bars) && isOneWordLimitDown(bars[j], bars[j-1], limitPct) {
 			out.Deferred++
@@ -208,7 +257,13 @@ func simulateLabelHold(bars []datasource.Bar, i int, symbol, name string, horizo
 	out.SellPrice = exitPrice
 	out.GrossPct = round2((exitPrice - buyPrice) / buyPrice * 100)
 	out.NetPct = round2((proceeds - cost) / cost * 100)
-	out.MfePct, out.MaePct = excursion(bars, buyIdx, exitIdx, buyPrice)
+	if barrierIdx >= 0 && exitIdx == barrierIdx {
+		// 障碍出场日盘中离场：出场后的同日行情未经历，当日只计入确定经历的价位
+		//（开盘价与障碍成交价），不得用整根 High/Low 夸大 MFE/MAE。
+		out.MfePct, out.MaePct = excursionToExit(bars, buyIdx, exitIdx, buyPrice, exitPrice)
+	} else {
+		out.MfePct, out.MaePct = excursion(bars, buyIdx, exitIdx, buyPrice)
+	}
 	return out
 }
 
@@ -227,6 +282,40 @@ func excursion(bars []datasource.Bar, from, to int, entry float64) (mfe, mae flo
 			if v := (bars[k].Low - entry) / entry * 100; v < mae {
 				mae = v
 			}
+		}
+	}
+	return round2(mfe), round2(mae)
+}
+
+// excursionToExit 障碍出场（出场日=触发日）的 MFE/MAE：[from, exitIdx-1] 按整根
+// 计入；出场日只计入确定经历的价位——开盘价与障碍成交价（盘中离场后的行情不属于
+// 本笔持有，日线粒度下无法还原触发前的真实高低点，保守取已知点）。
+func excursionToExit(bars []datasource.Bar, from, exitIdx int, entry, exitPrice float64) (mfe, mae float64) {
+	if entry <= 0 {
+		return 0, 0
+	}
+	for k := from; k < exitIdx && k < len(bars); k++ {
+		if bars[k].High > 0 {
+			if v := (bars[k].High - entry) / entry * 100; v > mfe {
+				mfe = v
+			}
+		}
+		if bars[k].Low > 0 {
+			if v := (bars[k].Low - entry) / entry * 100; v < mae {
+				mae = v
+			}
+		}
+	}
+	for _, p := range []float64{bars[exitIdx].Open, exitPrice} {
+		if p <= 0 {
+			continue
+		}
+		v := (p - entry) / entry * 100
+		if v > mfe {
+			mfe = v
+		}
+		if v < mae {
+			mae = v
 		}
 	}
 	return round2(mfe), round2(mae)

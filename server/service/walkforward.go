@@ -320,9 +320,9 @@ func wfScoreStock(symbol, name string, sub []datasource.Bar, defs []wfStrategyDe
 // WFMetric 一组样本（若干信号日 × Top-K 名额）的评估指标（S3-3 口径落地）。
 type WFMetric struct {
 	Signals int `json:"signals"` // 参与的信号日数
-	Picked  int `json:"picked"`  // Top-K 名额总数（signals×K 上限，含买不进者）
+	Picked  int `json:"picked"`  // Top-K 名额总数（signals×K 上限）
 	Trades  int `json:"trades"`  // 实际成交样本数
-	Skipped int `json:"skipped"` // 一字板/次日停牌/不足一手买不进
+	Skipped int `json:"skipped"` // 防御计数：Top-K 已限定可成交机会集，正常恒 0
 	Pending int `json:"pending"` // 持有期未走完（月度走查近月的常态）
 
 	PrecisionNetPct float64 `json:"precision_net_pct"` // net>0 占比（Precision_net@K）
@@ -451,7 +451,9 @@ type wfSection struct {
 
 func buildWFSection(recType string, holds []int, axisLen int) wfSection {
 	sec := wfSection{recType: recType, holds: holds, maxHold: holds[len(holds)-1]}
-	sec.eligible = axisLen - (sec.maxHold + 1)
+	// 信号日 i 的到期卖出根为 i+maxHold（须 ≤ 轴末）→ 可用信号位 axisLen−maxHold
+	//（恰好能走完最长持有期的最后一个信号日也参与）。
+	sec.eligible = axisLen - sec.maxHold
 	if sec.eligible < 1 {
 		sec.eligible = 0
 	}
@@ -531,6 +533,10 @@ func RunWalkForward(ctx context.Context, market *MarketService) (*WalkForwardRep
 	for _, st := range states {
 		metaBy[st.Symbol] = wideStockMeta{Name: st.Name, ST: isSTName(st.Name)}
 	}
+	// ST as-of（防前视/幸存者偏差）：优先宇宙快照（S0-3）按信号日判定——后来才变
+	// ST 的股票不得被提前从历史样本剔除；快照未覆盖的日期回退当前名称并在 Notes 声明。
+	stByDate := universeSTByDates(sigDates)
+	stFallback := len(stByDate) < len(sigDates)
 	defs := wfStrategyList()
 	allHolds := wfAllHolds()
 
@@ -552,7 +558,20 @@ func RunWalkForward(ctx context.Context, market *MarketService) (*WalkForwardRep
 				if isCNFund(j.symbol) {
 					continue // 全市场地基理论上无基金，自选来源残留防御
 				}
-				if meta.ST {
+				stAt := func(d string) bool {
+					if set, ok := stByDate[d]; ok {
+						return set[j.symbol]
+					}
+					return meta.ST // 快照未覆盖：回退当前名称
+				}
+				allST := true
+				for _, d := range sigDates {
+					if !stAt(d) {
+						allST = false
+						break
+					}
+				}
+				if allST {
 					stSkipped.Add(1)
 					continue
 				}
@@ -566,6 +585,9 @@ func RunWalkForward(ctx context.Context, market *MarketService) (*WalkForwardRep
 					dateIdx[b.TradeDate] = i
 				}
 				for k, d := range sigDates {
+					if stAt(d) {
+						continue // 该信号日为 ST（as-of）：仅排除当日观测
+					}
 					i, ok := dateIdx[d]
 					if !ok {
 						continue // 信号日停牌：无信号
@@ -581,7 +603,11 @@ func RunWalkForward(ctx context.Context, market *MarketService) (*WalkForwardRep
 					}
 					holds := make([]wfHoldRes, len(allHolds))
 					for hi, hd := range allHolds {
-						o := simulateHold(j.bars, i, j.symbol, meta.Name, hd, wfPerCap, nextDate)
+						sellDate := labelFarFuture // 到期日在轴外（未来）：必 pending
+						if sigIdx+hd < len(axis) {
+							sellDate = axis[sigIdx+hd] // 市场轴到期日：停牌不拉长持有跨度
+						}
+						o := simulateHold(j.bars, i, j.symbol, meta.Name, hd, wfPerCap, nextDate, sellDate)
 						holds[hi] = wfHoldRes{status: o.Status, netPct: o.ReturnPct,
 							buyDate: o.BuyDate, sellDate: o.SellDate}
 					}
@@ -614,15 +640,26 @@ func RunWalkForward(ctx context.Context, market *MarketService) (*WalkForwardRep
 	}
 
 	// 每（信号日, 策略）预排 Top-K（score 降序、并列按代码升序稳定可复现）。
+	// 机会集限定当日可成交（§184 口径，与召回评估一致）：入场判定 skip_*（一字板
+	// 买不进/次日停牌/不足一手）的观测不参与 Top-K——否则「推了一堆买不进的涨停票、
+	// 只成交 1 只且盈利」会显示 100% Precision。skip 状态由入场段决定与持有期无关，
+	// 取任一持有期判定即可；pending（持有期未走完）保留。
 	holdIdxOf := map[int]int{}
 	for hi, h := range allHolds {
 		holdIdxOf[h] = hi
 	}
 	topOf := make(map[int][][]*wfObs, len(byDate)) // sigIdx → [策略下标] → TopK 观测
 	for sigIdx, list := range byDate {
+		tradable := make([]*wfObs, 0, len(list))
+		for _, o := range list {
+			switch o.holds[0].status {
+			case btTraded, btPending:
+				tradable = append(tradable, o)
+			}
+		}
 		tops := make([][]*wfObs, len(defs))
 		for si := range defs {
-			sorted := append([]*wfObs(nil), list...)
+			sorted := append([]*wfObs(nil), tradable...)
 			sort.Slice(sorted, func(a, b int) bool {
 				if sorted[a].scores[si] != sorted[b].scores[si] {
 					return sorted[a].scores[si] > sorted[b].scores[si]
@@ -745,11 +782,14 @@ func RunWalkForward(ctx context.Context, market *MarketService) (*WalkForwardRep
 				ValSignals: len(sec.valIdxs[fi]), TestSignals: len(sec.testIdxs[fi]),
 			})
 		}
-		// 指标行：各折 val/test + 全折 test 合并（Fold=0）。
+		// 指标行：各折 val/test + 全折 test 合并（Fold=0）。滚动窗口的测试段可能重叠，
+		// 合并前按信号日去重——同一信号日重复计入会虚高 Signals/Trades 并让重复样本
+		// 加权汇总指标。
 		for _, si := range secDefIdx {
 			def := defs[si]
 			for _, hold := range sec.holds {
 				var allTest []int
+				seenTest := map[int]bool{}
 				for fi := range sec.folds {
 					view.Rows = append(view.Rows, WFSegRow{Fold: fi + 1, Segment: "val",
 						Strategy: def.key, StrategyName: def.name, Hold: hold,
@@ -757,7 +797,12 @@ func RunWalkForward(ctx context.Context, market *MarketService) (*WalkForwardRep
 					view.Rows = append(view.Rows, WFSegRow{Fold: fi + 1, Segment: "test",
 						Strategy: def.key, StrategyName: def.name, Hold: hold,
 						WFMetric: aggregate(sec.testIdxs[fi], si, hold)})
-					allTest = append(allTest, sec.testIdxs[fi]...)
+					for _, idx := range sec.testIdxs[fi] {
+						if !seenTest[idx] {
+							seenTest[idx] = true
+							allTest = append(allTest, idx)
+						}
+					}
 				}
 				if len(sec.folds) > 1 {
 					view.Rows = append(view.Rows, WFSegRow{Fold: 0, Segment: "test",
@@ -804,12 +849,16 @@ func RunWalkForward(ctx context.Context, market *MarketService) (*WalkForwardRep
 	rep.ElapsedMs = time.Since(start).Milliseconds()
 	rep.Notes = append(rep.Notes,
 		"baseline=手工评分（五维分+策略加分+换手扣分），A 类因子按历史日线 as-of 切片复刻（无未来泄露）；手工评分无参数可拟合——训练/验证段为 S4 模型化排序占位，对 baseline 而言全部段均是样本外",
-		"收益=统一执行模拟净收益（次日开盘成交、扣费、一字板买不进跳过、一字跌停顺延）；alpha=净收益−上证基准区间收益（close→close）",
+		"收益=统一执行模拟净收益（次日开盘成交、扣费、持有期按市场交易日推进）；alpha=净收益−上证基准区间收益（close→close）",
+		"Top-K 组合从当日可成交机会集中选出（一字板买不进/次日停牌/不足一手先剔除，§184 口径与召回评估一致）——Precision 分母不被不可成交标的虚高",
 		"Precision_net@K 与 Precision_alpha@K 分开报告；净收益中位数与严重亏损率（net<-5%）并列——不许靠少量大涨样本拉均值（S3-3 口径）",
 		"C 类数据（估值/情绪/龙虎榜/人气/资金流/盘中/财务）无法可靠回填，相关策略加分历史缺席——长线策略在本报表退化为纯技术面，与线上实际评分存在已声明的口径差",
 		"评分宇宙：剔除 ST/复权断层/成交额中位数 <3000 万/极端与高位死亡换手，与推荐候选宇宙方向一致；用户个性化筛选（股价/市值/追高保护偏好）不进 baseline",
-		"Purge=各段最大持有期、Embargo="+fmt.Sprint(wfEmbargoDays)+" 交易日；折右对齐保证最新数据被测试；单折样本极少时指标波动大，凭多折与样本量判读",
+		"Purge=各段最大持有期、Embargo="+fmt.Sprint(wfEmbargoDays)+" 交易日；折右对齐保证最新数据被测试；重叠测试段合并前按信号日去重；单折样本极少时指标波动大，凭多折与样本量判读",
 	)
+	if stFallback {
+		rep.Notes = append(rep.Notes, "部分信号日早于宇宙快照（S0-3）积累起点，ST 判定回退当前名称——后来才变 ST 的股票会被提前剔除（轻微幸存者偏差），随快照积累自动消失")
+	}
 	if benchNote != "" {
 		rep.Notes = append(rep.Notes, benchNote)
 	}
@@ -833,5 +882,33 @@ func wfAllHolds() []int {
 		}
 	}
 	sort.Ints(out)
+	return out
+}
+
+// universeSTByDates 各评估日的 ST 集合（宇宙快照 as-of：取 ≤ 该日的最近快照日）。
+// 返回 date → ST symbol 集合；快照未覆盖的日期不出现在结果里——调用方回退当前
+// 名称判定并声明偏差（后来才变 ST 的股票会被提前剔除）。walk-forward 与因子 IC
+// 的历史评估共用。
+func universeSTByDates(dates []string) map[string]map[string]bool {
+	out := map[string]map[string]bool{}
+	if common.DB == nil {
+		return out
+	}
+	for _, d := range dates {
+		var snapDay string
+		common.DB.Model(&model.StockUniverseDaily{}).
+			Where("trade_date <= ?", d).Select("MAX(trade_date)").Scan(&snapDay)
+		if snapDay == "" {
+			continue
+		}
+		var syms []string
+		common.DB.Model(&model.StockUniverseDaily{}).
+			Where("trade_date = ? AND is_st = ?", snapDay, true).Pluck("symbol", &syms)
+		set := make(map[string]bool, len(syms))
+		for _, s := range syms {
+			set[s] = true
+		}
+		out[d] = set
+	}
 	return out
 }

@@ -19,8 +19,10 @@ import (
 // factorSnapshotVersion 因子快照版本（factorDefs 清单/口径变更时递增）。
 const factorSnapshotVersion = "fv1"
 
-// SnapshotFactorTable 把宽表 t 固化落库。同一 trade_date 已有快照则跳过（首写胜，
-// 幂等且不可变），返回本次实际落库的行数。
+// SnapshotFactorTable 把宽表 t 固化落库。已有行不可变（重建/重跑不覆盖——daily_bars
+// 前复权重锚会整股重写，覆盖=把重写后的值伪装成当时快照，PIT 泄漏）；同一 trade_date
+// 只**补缺失的 symbol**：分批历史初始化会让首批先落一部分快照，后续批次补齐的股票
+// 若被「首写胜整日跳过」将永久缺席，形成不完整的全市场快照。返回本次实际落库行数。
 func SnapshotFactorTable(t *FactorTable) (int, error) {
 	if common.DB == nil {
 		return 0, errors.New("数据库不可用")
@@ -28,17 +30,21 @@ func SnapshotFactorTable(t *FactorTable) (int, error) {
 	if t == nil || t.Len() == 0 || t.TradeDate == "" {
 		return 0, nil
 	}
-	var exists int64
+	var existing []string
 	if err := common.DB.Model(&model.FactorSnapshotDaily{}).
-		Where("trade_date = ?", t.TradeDate).Limit(1).Count(&exists).Error; err != nil {
+		Where("trade_date = ?", t.TradeDate).Pluck("symbol", &existing).Error; err != nil {
 		return 0, err
 	}
-	if exists > 0 {
-		return 0, nil // 不可变：当日快照已存在，重建/重跑不覆盖
+	seen := make(map[string]bool, len(existing))
+	for _, s := range existing {
+		seen[s] = true
 	}
 
 	rows := make([]model.FactorSnapshotDaily, 0, t.Len())
 	for i := 0; i < t.Len(); i++ {
+		if seen[t.Symbols[i]] {
+			continue // 不可变：已有行不覆盖（值已变也不覆盖）
+		}
 		vals := make(map[string]float64, len(factorDefs))
 		for _, d := range factorDefs {
 			v := t.cols[d.Key][i]
@@ -55,6 +61,9 @@ func SnapshotFactorTable(t *FactorTable) (int, error) {
 			Name: t.Names[i], LastBarDate: t.LastDates[i],
 			FactorsJSON: string(buf), FactorVersion: factorSnapshotVersion,
 		})
+	}
+	if len(rows) == 0 {
+		return 0, nil
 	}
 	if err := common.DB.CreateInBatches(rows, 500).Error; err != nil {
 		return 0, err
