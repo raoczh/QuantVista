@@ -68,14 +68,15 @@ func tencentAtof(f []string, i int) float64 {
 	return v
 }
 
-// tencentDataTime 解析字段 30 的行情时间（yyyyMMddHHmmss），失败回退当前时间。
+// tencentDataTime 解析字段 30 的行情时间（yyyyMMddHHmmss）。解析失败返回零值
+// （timestamp_unknown）：回填当前时间会把旧价伪装成实时价，零值由新鲜度判定恒判 stale。
 func tencentDataTime(f []string) time.Time {
 	if len(f) > 30 {
 		if tm, err := time.ParseInLocation("20060102150405", f[30], time.Local); err == nil {
 			return tm
 		}
 	}
-	return time.Now()
+	return time.Time{}
 }
 
 func (t *TencentAdapter) GetQuote(ctx context.Context, market, symbol string) (*Quote, error) {

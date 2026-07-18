@@ -53,6 +53,13 @@ function reasonLabel(r?: string) {
   if (r === 'direction_mismatch') return '方向与快照相反（涨跌/流入流出不一致）'
   return '快照中未找到对应数值'
 }
+// 命中值域来源标注：区分「被数据快照佐证」与「模型复述自身计划价 / 用户阈值」，
+// 后者不得展示成「已被数据证明」。
+function originLabel(o?: string) {
+  if (o === 'plan') return 'AI 计划价'
+  if (o === 'user') return '用户阈值'
+  return ''
+}
 
 // 全部徽章缺省时整行不渲染：旧记录（信任层上线前）无这些字段，空 flex 容器会留出多余空隙。
 const hasAny = computed(
@@ -158,10 +165,20 @@ const hasAny = computed(
               >
               <span v-if="it.count && it.count > 1" class="ev-count">×{{ it.count }}</span>
               <span v-if="it.module" class="ev-mod">{{ it.module }}</span>
+              <span
+                v-if="originLabel(it.origin)"
+                class="ev-origin"
+                :style="{ color: vars.warningColor, borderColor: withAlpha(vars.warningColor, 0.5) }"
+                >{{ originLabel(it.origin) }}</span
+              >
             </div>
             <div class="ev-match">
               {{ it.path }} = {{ it.snap_value }}<template v-if="it.tolerance"> （±{{ it.tolerance }}）</template
               ><template v-if="it.as_of"> · 数据时间 {{ it.as_of }}</template>
+              <template v-if="it.origin === 'plan'">
+                · 该数字来自 AI 自身给出的计划价/公式输出，属合法复述，但并非被数据快照佐证</template
+              >
+              <template v-else-if="it.origin === 'user'"> · 该数字来自用户设定的筛选阈值</template>
             </div>
             <div v-if="it.sentence" class="ev-sent">「{{ it.sentence }}」</div>
           </div>
@@ -224,6 +241,14 @@ const hasAny = computed(
   font-size: 12px;
   color: v-bind('vars.textColor2');
   margin-top: 2px;
+}
+.ev-origin {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 0 6px;
+  border: 1px solid;
+  border-radius: 10px;
+  line-height: 16px;
 }
 .ev-sent {
   font-size: 12px;

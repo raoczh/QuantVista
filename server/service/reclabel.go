@@ -59,6 +59,7 @@ var gatePriority = map[string]int{
 	model.GateQualityShadow: 2,
 	model.GateCorrelation:   3,
 	model.GateIndustryCap:   4,
+	model.GateQuoteStale:    5, // 硬门排除的候选不会 picked，优先级仅在与名单裁剪同现时兜底
 }
 
 // mergeGateNotes 按 symbol 归并门控记录：事件表每候选恰一行（影子标签唯一键依赖此

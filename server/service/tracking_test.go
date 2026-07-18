@@ -389,33 +389,43 @@ func TestShouldAppendQuoteBar(t *testing.T) {
 	sat := time.Date(2026, 7, 18, 10, 0, 0, 0, time.Local) // 周六
 	fri := time.Date(2026, 7, 17, 10, 0, 0, 0, time.Local) // 周五
 	recDate := "2026-07-01"
+	// 行情数据时间与「今天」同日（时效有效）的基准入参；各用例按需替换。
+	satDT := time.Date(2026, 7, 18, 9, 59, 0, 0, time.Local)
+	friDT := time.Date(2026, 7, 17, 9, 59, 0, 0, time.Local)
 
 	// 交易日历标注周六休市：不追加（显式 Select 强制写 is_open=false）。
 	common.DB.Select("Market", "TradeDate", "IsOpen").
 		Create(&model.TradingCalendar{Market: "cn", TradeDate: "2026-07-18", IsOpen: false})
-	if shouldAppendQuoteBar(sat, recDate, nil) {
+	if shouldAppendQuoteBar(sat, recDate, nil, satDT) {
 		t.Fatalf("周六休市不应追加实时 bar")
 	}
 	// 交易日历标注周五开市：追加。
 	common.DB.Select("Market", "TradeDate", "IsOpen").
 		Create(&model.TradingCalendar{Market: "cn", TradeDate: "2026-07-17", IsOpen: true})
-	if !shouldAppendQuoteBar(fri, recDate, nil) {
+	if !shouldAppendQuoteBar(fri, recDate, nil, friDT) {
 		t.Fatalf("周五开市应追加实时 bar")
 	}
+	// fail-closed：行情数据时间是昨日（旧价）或零值（timestamp_unknown）不得追加为今日 bar。
+	if shouldAppendQuoteBar(fri, recDate, nil, time.Date(2026, 7, 16, 15, 0, 0, 0, time.Local)) {
+		t.Fatalf("昨日旧价不应追加为今日 bar")
+	}
+	if shouldAppendQuoteBar(fri, recDate, nil, time.Time{}) {
+		t.Fatalf("零值数据时间不应追加实时 bar")
+	}
 	// 已有今日日线根：不重复追加。
-	if shouldAppendQuoteBar(fri, recDate, []datasource.Bar{bar("2026-07-17", 10, 10, 10, 10)}) {
+	if shouldAppendQuoteBar(fri, recDate, []datasource.Bar{bar("2026-07-17", 10, 10, 10, 10)}, friDT) {
 		t.Fatalf("已有今日日线不应再追加")
 	}
 	// 今天不晚于推荐日：不追加。
-	if shouldAppendQuoteBar(fri, "2026-07-17", nil) {
+	if shouldAppendQuoteBar(fri, "2026-07-17", nil, friDT) {
 		t.Fatalf("今天不晚于推荐日不应追加")
 	}
 	// 无日历回退周一~五：周六不追加、周五追加。
 	common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
-	if shouldAppendQuoteBar(sat, recDate, nil) {
+	if shouldAppendQuoteBar(sat, recDate, nil, satDT) {
 		t.Fatalf("无日历回退：周六不应追加")
 	}
-	if !shouldAppendQuoteBar(fri, recDate, nil) {
+	if !shouldAppendQuoteBar(fri, recDate, nil, friDT) {
 		t.Fatalf("无日历回退：周五应追加")
 	}
 }

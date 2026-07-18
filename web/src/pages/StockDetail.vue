@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
-import { NButton, NEmpty, NGi, NGrid, NResult, NSpin, NTag } from 'naive-ui'
+import { NButton, NEmpty, NGi, NGrid, NResult, NSpin, NTag, NTooltip } from 'naive-ui'
 import * as echarts from 'echarts'
 import {
   getQuote,
@@ -640,6 +640,12 @@ function scoreType(total: number) {
             </div>
             <div class="head-meta">
               <span>{{ quote.source }} · {{ fmtTime(quote.data_time) }}</span>
+              <n-tooltip v-if="quote.freshness?.freshness_status === 'stale'" trigger="hover">
+                <template #trigger>
+                  <n-tag type="warning" size="small" round :bordered="false">行情过期</n-tag>
+                </template>
+                {{ quote.freshness?.stale_reason || '全部数据源均未取到当前有效行情，价格非实时盘面' }}
+              </n-tooltip>
             </div>
           </div>
           <div class="quote-grid">

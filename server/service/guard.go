@@ -334,7 +334,9 @@ func (s *GuardService) evaluateGuardUser(ctx context.Context, userID int64, cfg 
 		return 0
 	}
 
-	// 批量行情：去重 symbol 后一次 QuotesFor（并发上限内部限流，绝不逐 symbol 重调）。
+	// 批量行情：去重 symbol 后一次 FreshQuotesFor（并发上限内部限流，绝不逐 symbol 重调）。
+	// fail-closed：stale 行情不参与守护评估——旧价触发止损推送是误报（昨日击穿今日已回升），
+	// 该标的本轮跳过，下一轮行情恢复再评。
 	held := map[string]bool{}
 	seen := map[string]bool{}
 	var refs []QuoteRef
@@ -356,12 +358,19 @@ func (s *GuardService) evaluateGuardUser(ctx context.Context, userID int64, cfg 
 		}
 		addRef(it.Market, it.Symbol)
 	}
-	quotes := s.market.QuotesFor(ctx, refs)
+	quotes := s.market.FreshQuotesFor(ctx, refs)
+	freshQuote := func(market, symbol string) *datasource.Quote {
+		fq, ok := quotes[QuoteKey(market, symbol)]
+		if !ok || fq.Quote == nil || fq.Quote.Price <= 0 || fq.Fresh.Status == freshStatusStale {
+			return nil
+		}
+		return fq.Quote
+	}
 
 	var newHits []guardHit
 	for _, p := range positions {
-		q := quotes[QuoteKey(p.Market, p.Symbol)]
-		if q == nil || q.Price <= 0 {
+		q := freshQuote(p.Market, p.Symbol)
+		if q == nil {
 			continue
 		}
 		obs := guardObs{Price: q.Price, DayHigh: q.High, DayLow: q.Low, ChangePct: q.ChangePct}
@@ -375,8 +384,8 @@ func (s *GuardService) evaluateGuardUser(ctx context.Context, userID int64, cfg 
 		if held[it.Symbol] {
 			continue // 持仓侧已覆盖，不重复自选异动
 		}
-		q := quotes[QuoteKey(it.Market, it.Symbol)]
-		if q == nil || q.Price <= 0 {
+		q := freshQuote(it.Market, it.Symbol)
+		if q == nil {
 			continue
 		}
 		obs := guardObs{Price: q.Price, DayHigh: q.High, DayLow: q.Low, ChangePct: q.ChangePct}

@@ -547,7 +547,10 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 		data, cached := cache[key]
 		if !cached {
 			data = md{}
-			if q, err := s.market.GetQuote(ctx, rule.Market, rule.Symbol); err == nil && q.Price > 0 {
+			// fail-closed：走新鲜行情链路（主源旧价不当成功，逐源找当前有效行情），
+			// 全源仍 stale 时本轮跳过该标的——旧价触发条件提醒是误报（如昨日价击穿
+			// 今日已回升的阈值），宁可这轮不评也不拿旧价评。
+			if q, fi, err := s.market.GetFreshQuote(ctx, rule.Market, rule.Symbol); err == nil && q != nil && q.Price > 0 && fi.Status != freshStatusStale {
 				data.eval = alertEval{Price: q.Price, DayHigh: q.High, DayLow: q.Low, ChangePct: q.ChangePct, DayVolume: q.Volume}
 				// 振幅回退基线：(high-low)/prev_close（估值源自带值优先，见下方按需覆盖）。
 				if q.PrevClose > 0 && q.High > 0 && q.High >= q.Low {

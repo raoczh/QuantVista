@@ -992,7 +992,9 @@ function qgFieldLabels(fields?: string[]): string {
                         :style="{ color: actionColor(it.action), background: withAlpha(actionColor(it.action), 0.12) }"
                         >{{ actionText(it.action) }}</span
                       >
-                      <span class="confidence">置信度 {{ it.confidence }}</span>
+                      <!-- 「AI 自评」而非「置信度」：避免与综合置信（程序合成）并列成两个主指标
+                           被普通用户误读为胜率——AI 口头置信度系统性过度自信，仅作参考。 -->
+                      <span class="confidence">AI 自评 {{ it.confidence }}</span>
                     </div>
                   </div>
 

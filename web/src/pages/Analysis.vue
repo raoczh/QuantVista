@@ -540,7 +540,8 @@ onMounted(async () => {
                       }"
                       >{{ ratingText(current.result.rating) }}</span
                     >
-                    <span class="confidence">置信度 {{ current.result.confidence }}</span>
+                    <!-- 「AI 自评」而非「置信度」：与综合置信（程序合成）区分主次，防误读为胜率。 -->
+                    <span class="confidence">AI 自评 {{ current.result.confidence }}</span>
                   </div>
                   <div v-else-if="current.status === 'success' && current.panel" class="res-rating">
                     <span

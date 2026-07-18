@@ -79,4 +79,21 @@ func TestQuoteFreshness(t *testing.T) {
 	if fi := quoteFreshness(time.Time{}, tm("11:00"), marketStateTrading, exp); fi.Status != freshStatusStale {
 		t.Errorf("零值应 stale，got %s", fi.Status)
 	}
+	// 时段内停滞校验：同日 09:31 停滞行情在午休/盘后仅日期一致不放行。
+	if fi := quoteFreshness(tm("09:31"), tm("12:00"), marketStateBreak, exp); fi.Status != freshStatusStale {
+		t.Errorf("午休收到同日早盘停滞行情应 stale，got %s", fi.Status)
+	}
+	if fi := quoteFreshness(tm("11:28"), tm("12:00"), marketStateBreak, exp); fi.Status != freshStatusFresh {
+		t.Errorf("午休收到上午末价应 fresh，got %s", fi.Status)
+	}
+	if fi := quoteFreshness(tm("09:31"), tm("15:30"), marketStatePostClose, exp); fi.Status != freshStatusStale {
+		t.Errorf("盘后收到同日早盘停滞行情应 stale，got %s", fi.Status)
+	}
+	if fi := quoteFreshness(tm("14:35"), tm("15:30"), marketStatePostClose, exp); fi.Status != freshStatusFresh {
+		t.Errorf("盘后收到尾盘口径行情应 fresh，got %s", fi.Status)
+	}
+	// 休市日拿到「上一开市日上午」的停滞行情同样 stale（收盘口径校验对 closed 生效）。
+	if fi := quoteFreshness(time.Date(2026, 7, 17, 10, 0, 0, 0, time.Local), closedNow, marketStateClosed, "2026-07-17"); fi.Status != freshStatusStale {
+		t.Errorf("休市日上一开市早盘停滞行情应 stale，got %s", fi.Status)
+	}
 }

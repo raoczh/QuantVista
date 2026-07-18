@@ -88,6 +88,18 @@
   - **⑮ 前端**：LLM 配置为空时**不再前端硬拦截**（后端 ResolveForUse 有管理员回退，llm_config_id 传空由后端兜底）；白话建策略/walk-forward/factor-ic/recall 补 AI_TIMEOUT/HEAVY_TIMEOUT（20s 默认超时会掐断合法长任务）；StockDetail/Heatmap/BoardDetail/News 加请求序号 seq 守卫（防旧响应覆盖）；loadSelf 仅 401 清票（网络/5xx 保留会话）、流式 401 与拦截器一致清票跳登录；Qa 深链改 watch(route.query)+send 会话身份守卫；poll.ts 加 AbortSignal 取消（离页停轮询）；Prompts 草稿按模块合并（不冲掉他模块未保存编辑）；ETF 自动刷新并刷 overview；首页有持仓但行情全失败显示「—」非「暂无持仓」；Alerts 0% 阈值 `??`；axios 错误提取后端 message；逻辑卡日期本地拼接（不走 toISOString 防 UTC 偏移退一天）；News 加载更多失败回滚 limit；AppShell 健康状态独立轮询；Notes 收起无条件 resetForm；AdminLlmCalls 补 screener_parse/rec_bear 模块；自动刷新排除 11:30~13:00 午休；已平仓持仓编辑只留备注；写接口返回类型改裸模型（Position/WatchlistItem 富化视图字段实为空）。
   - **明确不改（有意设计/已承认边界）**：情绪一天一算当日不刷新（批次内证据可复现，senti 因子只在 SentiNews>0 时动分）；追踪 RefPrice 双口径（展示口径 vs 标签 next_open 训练口径，note 已标注）；actual_position 标签名义一手（禁作训练标签的反事实对照）；IC 目标日停牌记 NaN 剔除（RankIC 学术惯例）；adjustSuspect 全序列断层剔除（数据质量过滤非按未来收益选样，宁可少算不可算错）；配额先查后增 TOCTOU（个人自用+限流可接受）；模拟账户 Reset 吞 JSON 错（本意就是清空）；Android allowBackup（已 skip-worktree，留部署自决）；hindsight 事后诊断按个股 bar 定位（不进训练/评估链路，低危）。
 
+- **行情时效性 fail-closed 批（2026-07-18，codex 外部审查 P0 全修 + P1 选做）防回归**（改新鲜度判定/消费链路前先读）：
+  - **① 数据源禁伪造行情时间**：东财/腾讯/新浪个股行情时间字段缺失或解析失败一律**零值**（timestamp_unknown），严禁回填 `time.Now()`——旧价打上「现在」的时间戳会被全链路当实时价。零值在 quoteFreshness 恒判 stale；stock_quotes 落库零值用 epoch 哨兵（`time.Unix(0,0)`，防 MySQL 严格模式拒绝零日期，1970 显然非真实时间不会误判 fresh）。Breadth/资金流/指数等聚合接口 DataTime 仍是采集时刻语义（遗留见下）。
+  - **② quoteFreshness 时段内校验**（sessionTailSlackMin=30）：非交易时段仅「日期一致」不放行——午休要求行情时刻 ≥11:00、盘后/休市/盘前昨收要求 ≥14:30，拦「同日 09:30 停滞行情在 12:30/15:30 仍判 fresh」；宽容 30 分钟是给低流动性标的的尾盘末笔成交留余地，别收得更紧（收盘集合竞价 14:57~15:00 才产收盘价）。
+  - **③ 统一新鲜度入口**（market.go）：`QuoteFreshnessOf(market, dataTime)`（任意行情的时效判定）、`FreshQuotesFor`（批量全源新鲜行情）、`FreshnessView`（API 响应 freshness 块：captured_at/source_data_time/expected_as_of/source/market_state/freshness_status/stale_reason）。**新增旧价敏感消费方一律用这些入口，别自行比对日期**。个股行情端点 GET quote 已改走 GetFreshQuote 并带 freshness 块（前端 StockDetail stale 徽标）。
+  - **④ stale 禁精确交易计划**（attachTradePlan）：freshness_status 非 fresh 或带 freshness_note 一律确定性 NoPlan（零 token）——stale 行情可作「截至某时的历史解释」（正文分析仍生成），**买入区间/目标价/止损价/仓位必须建立在当前有效行情上**。注意：快照缺 freshness_status 键也拒绝（fail-closed），测试快照须显式带 `"freshness_status":"fresh"`。
+  - **⑤ 推荐行情时效硬门**（applyQuoteFreshGate，qf1）：LLM 终选名单喂模型前逐只 FreshQuotesFor 核验——fresh 刷新 Price/ChangePct 并记 QuoteAsOf（随池快照与 pick 明细落库）；stale/取不到透明排除（Excluded+gate_type=quote_stale 事件，影子标签自然结算可回验误伤）；全过期宁可失败不基于旧价推荐。**这是数据有效性硬检查（同「日线拉取失败=透明排除」先例），不属于质量门控影子评审范畴**——qg2 影子纪律（预测质量门控转正须凭对照数据）不因此动摇。pick.QuoteAsOf 为服务端回填，normalizePick 剥除模型自附值。s.market==nil（单测）跳过硬门。
+  - **⑥ 提醒/守护/模拟成交/追踪 fail-closed**：alert evaluateRules 与 guard 改走新鲜行情（stale 跳过该标的本轮不评，防旧价误触发）；paper 市价成交 stale 拒绝（提示手动指定价格）；tracking `shouldAppendQuoteBar` 加 dataTime 参数——行情数据时间非今天（含零值）不得追加为今日 bar（旧价 bar 会驱动止盈止损触达误判）。
+  - **⑦ 日报收盘门槛**：手动生成在交易日 15:35（reportWindowStartMin，同自动窗口起点）前拒绝——早盘生成会以盘中数据冒充收盘口径并占用当天唯一记录（自动任务不再重建）。
+  - **⑧ 持仓部分估值透明化**：持仓 AI 快照带 quote_failed_count+valuation_note（行情缺失仓位禁虚构现价、不强行割/守/补三选一——禁骑墙纪律只约束有行情的仓）；前端市值卡显示「已定价 X/Y 笔」；页面副标题去掉「实时盈亏」措辞。
+  - **⑨ 数值核验来源区分**（ev2 items 增 origin）：labeledValue/evidenceItem 加 Origin——空=数据快照佐证、plan=模型自身计划价/公式输出、user=用户设定阈值；matchLabeled **快照来源优先命中**（同一数字快照与计划价都含时按被数据佐证记）；前端明细对 plan 项标「AI 计划价」并声明「合法复述但非快照佐证」。前端「置信度 N」改「AI 自评 N」（防与综合置信并列被当胜率）。
+  - **本批遗留（P1 未修，动手前从这里挑）**：批量 AI 快照（市场/板块/自选/持仓）compact 时丢逐项行情 DataTime（analysis_context）；marketwide/factortable 新鲜度只与库内自身最大日期比较（整库落后仍判新鲜，应对照应有交易日）；newsai 情绪当日首算后冻结、公告有旧记录不按需刷新、龙虎榜/人气/盘中因子只取库内最大日期；管理端缺数据健康总览与手动补跑入口；日报核心块数据水位检查（指数/涨跌家数/资金流缺失时不得称完整）；Breadth/资金流/指数聚合接口 DataTime=采集时刻语义未拆分（前端已改「采集于」措辞）。
+
 ## 4. 未完成项与储备（按数据源可得性推进）
 
 > **2026-07-06 起后续开发按 `DEVELOPMENT_PLAN.md` 的批次（N1→N2→F1→T1→S1→F2→M1→M2→M3）推进**——它是面向执行的施工图（每批含方案锚点/依赖/验收）；分析依据与上游接口速查表在 `REFERENCE_ANALYSIS.md`。以下原有储备多数已并入该计划：

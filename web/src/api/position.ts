@@ -59,6 +59,7 @@ export interface PortfolioOverview {
   top_symbol: string
   top_name: string
   top_weight_pct: number // 最大单一持仓占比 %
+  quote_failed_count: number // 行情拉取失败、未计入市值/收益的持仓数（部分估值口径）
   signals: string[] // 风控信号（集中度/止损/未分析）
 }
 

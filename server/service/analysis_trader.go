@@ -73,6 +73,17 @@ func (s *AnalysisService) attachTradePlan(ctx context.Context, userID int64, cfg
 		result.TradePlan = &tradePlan{NoPlan: true, NoPlanReason: "风险闸门禁止买入（ST/退市风险警示），不生成交易计划"}
 		return chatUsage{}
 	}
+	// 行情时效确定性拒绝（零 token）：stale/unknown 行情上给出的买入区间/目标价/止损价/
+	// 仓位是对着旧盘面定价——分析正文可作「截至 quote_as_of 的历史解释」，但精确交易
+	// 计划必须建立在当前有效行情上。freshness_status 由 buildStockSnapshot 统一判定。
+	if fs, _ := snapshot["freshness_status"].(string); fs != freshStatusFresh {
+		result.TradePlan = &tradePlan{NoPlan: true, NoPlanReason: "行情数据非当前有效口径（过期或无法确认时效），不生成精确交易计划；分析正文仅为截至行情时间的历史解释"}
+		return chatUsage{}
+	}
+	if _, hasNote := snapshot["freshness_note"]; hasNote {
+		result.TradePlan = &tradePlan{NoPlan: true, NoPlanReason: "行情仅更新至历史时点（全部数据源均未取到更新数据），不生成精确交易计划"}
+		return chatUsage{}
+	}
 	px := quotePriceFromSnapshot(snapshot)
 	if px <= 0 {
 		result.TradePlan = &tradePlan{NoPlan: true, NoPlanReason: "现价不可得，无法定价位"}

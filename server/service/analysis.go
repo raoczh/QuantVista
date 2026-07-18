@@ -381,14 +381,16 @@ func (s *AnalysisService) fillAnalysisTrust(ctx context.Context, userID int64, c
 	vals = append(vals, textLabeledValues("风险提示", riskGateTexts(snapshot))...)
 	// 交易计划（M3c）：plan_note/checklist 参与核验；计划价位/盈亏比/仓位公式因子并入
 	// 合法值域——它们是模型自身结论与确定性公式输出，复述不算幻觉（同推荐计划价前例）。
+	// Origin=plan 标注：前端区分「被快照数据佐证」与「模型复述自身结论」，后者不得
+	// 展示成「已被数据证明」。
 	if tp := result.TradePlan; tp != nil && !tp.NoPlan {
 		addSec("交易计划", tp.PlanNote)
 		addSec("操作清单", tp.Checklist...)
-		vals = append(vals, labeledVals("交易计划", tp.BuyLow, tp.BuyHigh, tp.TargetPrice, tp.StopPrice,
-			tp.RRRatio, float64(tp.HorizonDays))...)
+		vals = append(vals, markValueOrigin(labeledVals("交易计划", tp.BuyLow, tp.BuyHigh, tp.TargetPrice, tp.StopPrice,
+			tp.RRRatio, float64(tp.HorizonDays)), "plan")...)
 		if tp.Position != nil {
-			vals = append(vals, labeledVals("仓位", tp.Position.PositionPct, tp.Position.Vol20,
-				tp.Position.VolCoef, tp.Position.TimingCoef, tp.Position.AdvanceRatio)...)
+			vals = append(vals, markValueOrigin(labeledVals("仓位", tp.Position.PositionPct, tp.Position.Vol20,
+				tp.Position.VolCoef, tp.Position.TimingCoef, tp.Position.AdvanceRatio), "plan")...)
 		}
 	}
 	result.EvidenceCheck = verifyEvidenceLabeled(sections, vals)
