@@ -130,7 +130,9 @@ func (s *CompareService) Compare(ctx context.Context, userID int64, allowPrivate
 		res.AIComment = comment
 		if comment != "" {
 			// 证据核验：点评引用的数字与全部对比行的指标值域比对（点评无 K 线明细，全量收集即可）。
-			res.AICommentCheck = verifyEvidenceValues([]string{comment}, snapshotValueSet(rows))
+			res.AICommentCheck = verifyEvidenceLabeled(
+				[]evidenceSection{{Module: "AI点评", Text: comment}},
+				snapshotLabeledValues(rows, nil))
 		}
 		if comment != "" && usedCfg != nil {
 			res.AIConfigID = usedCfg.ID

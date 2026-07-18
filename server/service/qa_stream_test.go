@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -73,12 +74,19 @@ func TestQaAskStreamEndToEnd(t *testing.T) {
 	if ans.Role != model.QaRoleAssistant || ans.Content != "现价 10 高于 MA20=9.5，短线偏强。" {
 		t.Fatalf("回答落库不符: %+v", ans)
 	}
-	// 核验后置：CheckJSON 已随流结束写入，且 9.5 命中快照值域。
+	// 核验后置：CheckJSON 已随流结束写入，且 9.5 命中快照值域（不在 unmatched 列表）。
 	if ans.CheckJSON == "" || !strings.Contains(ans.CheckJSON, `"total"`) {
 		t.Fatalf("CheckJSON 应已落库: %q", ans.CheckJSON)
 	}
-	if strings.Contains(ans.CheckJSON, "9.5") {
-		t.Fatalf("9.5 在快照值域内，不应出现在 unmatched: %s", ans.CheckJSON)
+	var streamCheck evidenceCheck
+	if err := json.Unmarshal([]byte(ans.CheckJSON), &streamCheck); err != nil {
+		t.Fatalf("CheckJSON 解析失败: %v", err)
+	}
+	if streamCheck.Matched != streamCheck.Total || streamCheck.Total == 0 {
+		t.Fatalf("9.5 在快照值域内应全部吻合: %s", ans.CheckJSON)
+	}
+	if len(streamCheck.Unmatched) != 0 {
+		t.Fatalf("不应有未吻合项: %s", ans.CheckJSON)
 	}
 	if view.TotalTokens != 30 || view.MessageCount != 2 {
 		t.Fatalf("会话计数/token 应更新: tokens=%d count=%d", view.TotalTokens, view.MessageCount)

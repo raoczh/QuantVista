@@ -31,11 +31,12 @@ import { useLlmLabel } from '@/composables/useLlmLabel'
 import { renderMarkdown } from '@/lib/markdown'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import TrustBadges from '@/components/TrustBadges.vue'
 
 const message = useMessage()
 const route = useRoute()
 const router = useRouter()
-const { upColor, vars, withAlpha } = useUi()
+const { vars, withAlpha } = useUi()
 const { llmLabel } = useLlmLabel()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
@@ -158,6 +159,17 @@ function newChat() {
   fromAnalysisName.value = ''
 }
 
+// 用当前会话的标的开新会话：首次提问会按最新行情采集新快照（新 ID），不覆盖旧会话。
+function newChatFromCurrent() {
+  const c = current.value
+  if (!c) return
+  const sym = c.symbol
+  const mkt = c.market || 'cn'
+  newChat()
+  symbol.value = sym
+  market.value = mkt
+}
+
 // ---------- 风险闸门标签（S1）----------
 function riskTagType(f: RiskFlag): 'error' | 'warning' | 'default' {
   if (f.level === 'block') return 'error'
@@ -221,9 +233,6 @@ function msgCheck(m: QaMessage): EvidenceCheck | null {
     return null
   }
 }
-function checkColor(c: EvidenceCheck) {
-  return c.matched === c.total ? upColor.value : vars.value.warningColor
-}
 
 // ---------- 数据快照透明面板（按需单取，详情不带） ----------
 const snapshotShow = ref(false)
@@ -279,7 +288,7 @@ onMounted(async () => {
       <div class="col-side">
         <SectionCard title="会话">
           <template #extra>
-            <n-button size="tiny" quaternary :loading="historyLoading" @click="loadHistory">刷新</n-button>
+            <n-button size="tiny" quaternary :loading="historyLoading" @click="loadHistory">刷新列表</n-button>
             <n-button size="tiny" type="primary" ghost @click="newChat">＋ 新会话</n-button>
           </template>
           <n-spin :show="historyLoading && !history.length">
@@ -314,10 +323,31 @@ onMounted(async () => {
         <SectionCard :title="current ? `${current.name || current.symbol}（${current.symbol}）` : '新问答'">
           <template v-if="current" #extra>
             <div class="extra-row">
+              <n-button size="tiny" quaternary @click="newChatFromCurrent">按最新数据新建会话</n-button>
               <n-button size="tiny" quaternary @click="openSnapshot">数据快照</n-button>
               <span class="chat-meta">{{ llmLabel(current) || current.model }} · {{ current.total_tokens }} tokens</span>
             </div>
           </template>
+
+          <!-- 行情新鲜度（q9：快照采集时点/行情数据时间/来源/状态） -->
+          <div v-if="current?.snapshot_meta" class="fresh-row">
+            <n-tooltip v-if="current.snapshot_meta.freshness_status === 'stale'" trigger="hover" style="max-width: 340px">
+              <template #trigger>
+                <n-tag size="small" type="warning" :bordered="false">⚠ 行情非最新</n-tag>
+              </template>
+              该会话快照的行情已尝试全部数据源仍非最新（可能停牌、休市或数据源延迟）；回答涉及价格以「行情截至时间」为准。
+            </n-tooltip>
+            <span class="fresh-text">
+              行情截至 {{ current.snapshot_meta.quote_as_of || '—' }} · 技术指标截至
+              {{ current.snapshot_meta.bars_as_of || '—' }} · 来源 {{ current.snapshot_meta.quote_source || '—' }}
+              <template v-if="current.snapshot_meta.market_state && current.snapshot_meta.market_state !== 'trading'">
+                （非交易时段，最近收盘口径）
+              </template>
+            </span>
+            <span v-if="current.snapshot_meta.captured_at" class="fresh-text fresh-dim">
+              · 快照采集于 {{ current.snapshot_meta.captured_at }}
+            </span>
+          </div>
 
           <!-- 风险闸门标签（S1：快照程序化判定，与注入 prompt 同源） -->
           <div v-if="current?.risk_flags?.length" class="risk-flags">
@@ -348,7 +378,7 @@ onMounted(async () => {
               的数据快照提问——问答所见与分析所见完全一致，可直接追问分析结论。
             </n-alert>
             <div v-else class="starter-hint">
-              首次提问会固定采集一次该股的行情与技术指标快照，之后多轮追问都基于这份快照，不重复拉数据。
+              首次提问会按最新行情采集一次该股的行情与技术指标快照（数据过期会自动换源并如实标注），之后多轮追问都基于这份快照，不重复拉数据。
             </div>
           </div>
 
@@ -361,20 +391,9 @@ onMounted(async () => {
                     <!-- assistant 内容经 renderMarkdown（marked+DOMPurify 消毒）后渲染 -->
                     <div v-if="m.role === 'assistant'" class="bubble md" v-html="renderMarkdown(m.content)"></div>
                     <div v-else class="bubble">{{ m.content }}</div>
-                    <n-tooltip v-if="m.role === 'assistant' && msgCheck(m)" trigger="hover">
-                      <template #trigger>
-                        <span
-                          class="check-chip"
-                          :style="{ background: withAlpha(checkColor(msgCheck(m)!), 0.12), color: checkColor(msgCheck(m)!) }"
-                        >
-                          数据核验 {{ msgCheck(m)!.matched }}/{{ msgCheck(m)!.total }}
-                        </span>
-                      </template>
-                      <span v-if="msgCheck(m)!.unmatched?.length">
-                        这些数字未能与数据快照吻合，可能是推算值或幻觉，建议人工核对：{{ msgCheck(m)!.unmatched!.join('、') }}
-                      </span>
-                      <span v-else>回答引用的数字已逐一与数据快照程序化比对，全部吻合</span>
-                    </n-tooltip>
+                    <div v-if="m.role === 'assistant' && msgCheck(m)" class="check-badge">
+                      <TrustBadges :evidence-check="msgCheck(m)!" />
+                    </div>
                   </div>
                 </div>
               </template>
@@ -617,13 +636,20 @@ onMounted(async () => {
   gap: 6px;
   margin-bottom: 10px;
 }
-.check-chip {
-  align-self: flex-start;
+.fresh-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
   font-size: 12px;
-  font-weight: 600;
-  padding: 1px 8px;
-  border-radius: 12px;
-  cursor: default;
+  color: v-bind('vars.textColor3');
+}
+.fresh-dim {
+  opacity: 0.75;
+}
+.check-badge {
+  margin-top: 4px;
 }
 .extra-row {
   display: flex;

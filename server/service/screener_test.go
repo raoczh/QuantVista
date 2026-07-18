@@ -347,6 +347,9 @@ func TestScreenerScanEndToEnd(t *testing.T) {
 	seedWideStock(t, "600100", "甲股", up)
 	seedWideStock(t, "600200", "乙股", genTrendBars(80, 20, -0.5))
 	seedWideStock(t, "600300", "ST丙股", genTrendBars(80, 5, 0.4))
+	// 复刻生产存量态：后加列 turnover_rate 的存量行为 NULL，锁定 buildFactorTable
+	// 流式读的 COALESCE 兜底。挑 600300 注入——本策略树不含换手因子，命中断言不受影响。
+	common.DB.Exec("UPDATE daily_bars SET turnover_rate = NULL WHERE symbol = '600300'")
 
 	svc := NewScreenerService()
 	res, err := svc.Scan(context.Background(), 1, ScanRequest{StrategyKey: "bull-align-trend"})

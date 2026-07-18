@@ -497,6 +497,14 @@ type factorRowResult struct {
 	vals     []float64
 }
 
+// dailyBarScanCols daily_bars 全表流式读的统一列清单（buildFactorTable / RunFactorIC /
+// streamCNDailyBars / M2 回测四处共用），列序与各调用点 rows.Scan 的变量序一一耦合——
+// 别改列序。turnover_rate 是后加列（2026-07-07，AutoMigrate 只加列不回填），此前初始化
+// 的存量行该列为 NULL——必须 COALESCE 归一为 0（0=缺失 是 DailyBar.TurnoverRate 的既有
+// 约定），否则裸 float64 扫描遇 NULL 直接中断整个流式读。
+var dailyBarScanCols = []string{"symbol", "trade_date", "open", "high", "low", "close",
+	"volume", "amount", "COALESCE(turnover_rate, 0) AS turnover_rate"}
+
 // buildFactorTable 全量构建宽表：流式读 daily_bars（ORDER BY symbol 分组连续）→
 // 并行算行 → 按 symbol 排序 → 转列。
 func buildFactorTable(ctx context.Context) (*FactorTable, error) {
@@ -521,7 +529,7 @@ func buildFactorTable(ctx context.Context) (*FactorTable, error) {
 
 	// 流式读 + 并行计算。
 	rows, err := common.DB.Model(&model.DailyBar{}).
-		Select("symbol", "trade_date", "open", "high", "low", "close", "volume", "amount", "turnover_rate").
+		Select(dailyBarScanCols).
 		Where("market = ?", "cn").
 		Order("symbol, trade_date").Rows()
 	if err != nil {

@@ -9,7 +9,6 @@ import {
   NSpin,
   NEmpty,
   NTag,
-  NTooltip,
   useMessage,
 } from 'naive-ui'
 import { compareStocks, type CompareResult } from '@/api/compare'
@@ -18,6 +17,7 @@ import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import TrustBadges from '@/components/TrustBadges.vue'
 
 const message = useMessage()
 const route = useRoute()
@@ -154,9 +154,6 @@ const aiCheck = computed(() => {
   const c = result.value?.ai_comment_check
   return c && c.total > 0 ? c : null
 })
-const aiCheckColor = computed(() =>
-  aiCheck.value && aiCheck.value.matched === aiCheck.value.total ? upColor.value : vars.value.warningColor,
-)
 </script>
 
 <template>
@@ -304,17 +301,7 @@ const aiCheckColor = computed(() =>
                 class="ai-model"
                 >{{ llmLabel({ llm_config_id: result.ai_llm_config_id, provider: result.ai_provider, model: result.ai_model }) }}</span
               >
-              <n-tooltip v-if="aiCheck" trigger="hover">
-                <template #trigger>
-                  <span class="check-chip" :style="{ background: withAlpha(aiCheckColor, 0.12), color: aiCheckColor }">
-                    数据核验 {{ aiCheck.matched }}/{{ aiCheck.total }}
-                  </span>
-                </template>
-                <span v-if="aiCheck.unmatched?.length">
-                  点评里这些数字未能与指标对上，可能是推算值或幻觉，建议人工核对：{{ aiCheck.unmatched.join('、') }}
-                </span>
-                <span v-else>点评引用的数字已逐一与上表指标程序化比对，全部吻合</span>
-              </n-tooltip>
+              <TrustBadges v-if="aiCheck" :evidence-check="aiCheck" />
             </div>
             <p class="ai-body">{{ result.ai_comment }}</p>
           </div>

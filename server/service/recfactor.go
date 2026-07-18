@@ -481,12 +481,17 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 
 // --- 程序化证据核验（防幻觉最便宜的一招）---
 
-// evidenceCheck 单条推荐的证据数字核验结果：LLM evidence 里引用的数字逐一与
-// 该标的的数据快照（行情/估值/因子/评分）容差比对，不吻合的列出来。
+// evidenceCheck 数值存在性核验结果：AI 文本里引用的数字规范化（单位/方向）后与带路径的
+// 数据快照值域比对。Total/Matched 为去重后的可核验数字计数；Items 为逐项明细（新增，旧行无）。
 type evidenceCheck struct {
-	Total     int      `json:"total"`               // 提取到的数字个数
-	Matched   int      `json:"matched"`             // 与快照吻合的个数
-	Unmatched []string `json:"unmatched,omitempty"` // 未能吻合的数字（原样，供人工核对）
+	Total          int            `json:"total"`                     // 可核验数字个数（去重后）
+	Matched        int            `json:"matched"`                   // 在快照找到对应数值的个数
+	Unmatched      []string       `json:"unmatched,omitempty"`       // 未吻合数字原样（≤10，legacy 兼容）
+	Version        string         `json:"version,omitempty"`         // 核验引擎版本（ev2 起带 items）
+	SkippedCount   int            `json:"skipped_count,omitempty"`   // 跳过的非核验对象个数（小整数/年份/代码）
+	UnmatchedTotal int            `json:"unmatched_total,omitempty"` // 未吻合总数（Total-Matched）
+	Truncated      bool           `json:"truncated,omitempty"`       // items 是否被截断至 50
+	Items          []evidenceItem `json:"items,omitempty"`           // 逐项明细
 }
 
 var evidenceNumRe = regexp.MustCompile(`[-+]?\d+(?:\.\d+)?`)
@@ -497,60 +502,107 @@ var evidenceNoiseInts = map[float64]bool{
 	100: true, 120: true, 180: true, 250: true,
 }
 
-// candidateValueSet 汇总一只候选可被引用的全部数值（含亿元换算），供证据核验比对。
-func candidateValueSet(c candidate) []float64 {
-	vals := []float64{
-		c.Price, c.ChangePct, c.Amount, c.Amount / 1e8,
-		c.PETTM, c.PB, c.TotalCap, c.TotalCap / 1e8, c.FloatCap, c.FloatCap / 1e8,
-		c.TurnoverRate, c.VolumeRatio, c.Amplitude, c.Score, c.SentiScore,
-		// M3a 龙虎榜/机构/人气信号（喂给 LLM 的数值同步进值域）。
-		c.LhbNetYi, c.OrgNetYi, float64(c.PopRank), float64(c.PopPrev), float64(c.OrgBuys),
+// candidateLabeledValues 汇总一只候选可被引用的全部数值（带字段路径，含亿元衍生），供核验比对。
+func candidateLabeledValues(c candidate) []labeledValue {
+	out := labeledVals("现价", c.Price)
+	out = append(out, labeledVals("涨跌幅%", c.ChangePct)...)
+	out = append(out, labeledValue{Path: "成交额", Value: c.Amount})
+	if math.Abs(c.Amount) >= 1e8 {
+		out = append(out, labeledValue{Path: "成交额(亿)", Value: c.Amount / 1e8, Unit: "亿", Derived: true})
 	}
+	out = append(out, labeledVals("PE-TTM", c.PETTM)...)
+	out = append(out, labeledVals("市净率", c.PB)...)
+	out = append(out, labeledValue{Path: "总市值", Value: c.TotalCap})
+	if math.Abs(c.TotalCap) >= 1e8 {
+		out = append(out, labeledValue{Path: "总市值(亿)", Value: c.TotalCap / 1e8, Unit: "亿", Derived: true})
+	}
+	out = append(out, labeledValue{Path: "流通市值", Value: c.FloatCap})
+	if math.Abs(c.FloatCap) >= 1e8 {
+		out = append(out, labeledValue{Path: "流通市值(亿)", Value: c.FloatCap / 1e8, Unit: "亿", Derived: true})
+	}
+	out = append(out, labeledVals("换手率%", c.TurnoverRate)...)
+	out = append(out, labeledVals("量比", c.VolumeRatio)...)
+	out = append(out, labeledVals("振幅%", c.Amplitude)...)
+	out = append(out, labeledVals("量化分", c.Score)...)
+	out = append(out, labeledVals("情绪分", c.SentiScore)...)
+	out = append(out, labeledVals("龙虎榜净买(亿)", c.LhbNetYi)...)
+	out = append(out, labeledVals("机构净买(亿)", c.OrgNetYi)...)
+	out = append(out, labeledVals("人气排名", float64(c.PopRank))...)
+	out = append(out, labeledVals("人气前值", float64(c.PopPrev))...)
+	out = append(out, labeledVals("机构买入家数", float64(c.OrgBuys))...)
 	if c.Factors != nil {
 		f := c.Factors
-		vals = append(vals, f.MA5, f.MA10, f.MA20, f.MA60, f.Chg5d, f.Chg20d,
-			f.VolBoost, f.Vol5v20, f.Volatility20, f.Drawdown20, f.Bias20, f.Pos60,
-			// T1 指标与筹码：喂给 LLM 的字段必须同步进核验值域，
-			// 否则模型忠实引用 RSI/MACD/获利盘数字会被误报幻觉（信任层自伤）。
-			f.RSI14, f.MACDDif, f.MACDDea, f.MACDHist,
-			f.BollUp, f.BollMid, f.BollLow, f.BollPos, f.ATR14, f.ATRPct,
-			f.ChipProfit, f.ChipAvgCost,
-			// M3a 主力资金流因子（值域同步铁律，T1/F2 前例）。
-			f.MainNet5dYi, float64(f.MainNetDays),
-			// M3b 盘中因子（值域同步铁律；PmVwapUp 布尔、IntradayDate 日期不参与）。
-			f.Tail30Chg, f.Tail30VolPct, f.MorningChg, f.CloseVsVwap)
+		out = append(out, labeledVals("factors.ma5", f.MA5)...)
+		out = append(out, labeledVals("factors.ma10", f.MA10)...)
+		out = append(out, labeledVals("factors.ma20", f.MA20)...)
+		out = append(out, labeledVals("factors.ma60", f.MA60)...)
+		out = append(out, labeledVals("factors.chg5d", f.Chg5d)...)
+		out = append(out, labeledVals("factors.chg20d", f.Chg20d)...)
+		out = append(out, labeledVals("factors.vol_boost", f.VolBoost)...)
+		out = append(out, labeledVals("factors.vol5v20", f.Vol5v20)...)
+		out = append(out, labeledVals("factors.volatility20", f.Volatility20)...)
+		out = append(out, labeledVals("factors.drawdown20", f.Drawdown20)...)
+		out = append(out, labeledVals("factors.bias20", f.Bias20)...)
+		out = append(out, labeledVals("factors.pos60", f.Pos60)...)
+		out = append(out, labeledVals("factors.rsi14", f.RSI14)...)
+		out = append(out, labeledVals("factors.macd_dif", f.MACDDif)...)
+		out = append(out, labeledVals("factors.macd_dea", f.MACDDea)...)
+		out = append(out, labeledVals("factors.macd_hist", f.MACDHist)...)
+		out = append(out, labeledVals("factors.boll_up", f.BollUp)...)
+		out = append(out, labeledVals("factors.boll_mid", f.BollMid)...)
+		out = append(out, labeledVals("factors.boll_low", f.BollLow)...)
+		out = append(out, labeledVals("factors.boll_pos", f.BollPos)...)
+		out = append(out, labeledVals("factors.atr14", f.ATR14)...)
+		out = append(out, labeledVals("factors.atr_pct", f.ATRPct)...)
+		out = append(out, labeledVals("factors.chip_profit", f.ChipProfit)...)
+		out = append(out, labeledVals("factors.chip_avg_cost", f.ChipAvgCost)...)
+		out = append(out, labeledVals("factors.main_net_5d_yi", f.MainNet5dYi)...)
+		out = append(out, labeledVals("factors.main_net_days", float64(f.MainNetDays))...)
+		out = append(out, labeledVals("factors.tail30_chg", f.Tail30Chg)...)
+		out = append(out, labeledVals("factors.tail30_vol_pct", f.Tail30VolPct)...)
+		out = append(out, labeledVals("factors.morning_chg", f.MorningChg)...)
+		out = append(out, labeledVals("factors.close_vs_vwap", f.CloseVsVwap)...)
 	}
 	if c.ScoreDims != nil {
-		vals = append(vals, c.ScoreDims.Trend, c.ScoreDims.Momentum, c.ScoreDims.Position,
-			c.ScoreDims.Volume, c.ScoreDims.Risk)
+		out = append(out, labeledVals("score.trend", c.ScoreDims.Trend)...)
+		out = append(out, labeledVals("score.momentum", c.ScoreDims.Momentum)...)
+		out = append(out, labeledVals("score.position", c.ScoreDims.Position)...)
+		out = append(out, labeledVals("score.volume", c.ScoreDims.Volume)...)
+		out = append(out, labeledVals("score.risk", c.ScoreDims.Risk)...)
 	}
-	// F2 财务摘要：喂给 LLM 的 fin 字段同步进核验值域（值域同步铁律，T1 前例）。
 	if c.Fin != nil {
-		vals = append(vals, c.Fin.ROE, c.Fin.RevenueYoY, c.Fin.NetProfitYoY,
-			c.Fin.GrossMargin, c.Fin.NetMargin, c.Fin.DebtRatio)
+		out = append(out, labeledVals("fin.roe", c.Fin.ROE)...)
+		out = append(out, labeledVals("fin.revenue_yoy", c.Fin.RevenueYoY)...)
+		out = append(out, labeledVals("fin.net_profit_yoy", c.Fin.NetProfitYoY)...)
+		out = append(out, labeledVals("fin.gross_margin", c.Fin.GrossMargin)...)
+		out = append(out, labeledVals("fin.net_margin", c.Fin.NetMargin)...)
+		out = append(out, labeledVals("fin.debt_ratio", c.Fin.DebtRatio)...)
 	}
-	out := vals[:0]
-	for _, v := range vals {
+	return out
+}
+
+// labeledVals 构造带同一路径的值域项，剔除零值（0 多为缺失，纳入会造假证据）。
+func labeledVals(path string, vs ...float64) []labeledValue {
+	var out []labeledValue
+	for _, v := range vs {
 		if v != 0 {
-			out = append(out, v)
+			out = append(out, labeledValue{Path: path, Value: v})
 		}
 	}
 	return out
 }
 
-// verifyEvidence 核验一条推荐的 evidence 数字与快照的吻合度。
-// 数字提取/噪声跳过/容差规则统一在 trust.go 的 verifyEvidenceValues（全模块共用口径）：
-// 无小数点整数（常用参数集合、年份、六位代码、≤99 小整数——「池内第 11」「第 2/38」类
-// rank/池大小引用是 prompt 自己示范的格式，核验它属信任层自伤）不参与核验。
+// verifyEvidence 核验一条推荐的 evidence 数字与快照的吻合度。数字提取/单位规范化/方向规则/
+// 去重计数统一在 trust.go 的 verifyEvidenceLabeled（全模块共用口径）。
 // extra 为快照之外的合法引用值域（模型自身计划价、用户筛选阈值），由调用方按上下文传入。
-func verifyEvidence(evidence []string, c candidate, extra ...float64) *evidenceCheck {
-	vals := candidateValueSet(c)
-	for _, v := range extra {
-		if v != 0 {
-			vals = append(vals, v)
-		}
+func verifyEvidence(evidence []string, c candidate, extra ...labeledValue) *evidenceCheck {
+	vals := candidateLabeledValues(c)
+	vals = append(vals, extra...)
+	sections := make([]evidenceSection, 0, len(evidence))
+	for _, e := range evidence {
+		sections = append(sections, evidenceSection{Module: "推荐依据", Text: e})
 	}
-	return verifyEvidenceValues(evidence, vals)
+	return verifyEvidenceLabeled(sections, vals)
 }
 
 // systemConfidence 程序合成置信度（高/中/低三档）：LLM 口头置信度系统性过度自信，

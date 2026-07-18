@@ -76,7 +76,7 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 	if err != nil {
 		return "", nil, err
 	}
-	q, err := market.GetQuote(ctx, mkt, symbol)
+	q, fresh, err := market.GetFreshQuote(ctx, mkt, symbol)
 	if err != nil {
 		if errors.Is(err, datasource.ErrSymbolInvalid) {
 			return "", nil, errors.New("无法识别的股票代码")
@@ -84,6 +84,7 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 		return "", nil, fmt.Errorf("行情数据暂不可用：%w", err)
 	}
 
+	now := time.Now().In(time.Local)
 	snap := map[string]any{
 		"symbol": q.Symbol,
 		"market": mkt,
@@ -99,14 +100,22 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 			"data_time":  q.DataTime,
 			"source":     q.Source,
 		},
+		// 新鲜度元数据（全字符串值，不进 snapshotLabeledValues 的数值值域）。
+		"captured_at":      now.Format("2006-01-02 15:04:05"),
+		"quote_source":     q.Source,
+		"market_state":     fresh.MarketState,
+		"freshness_status": fresh.Status,
+	}
+	if !q.DataTime.IsZero() {
+		snap["quote_as_of"] = q.DataTime.In(time.Local).Format("2006-01-02 15:04:05")
 	}
 
-	// 数据新鲜度：行情快照距采集时刻过久（休市/延迟）时显式标注，
-	// 避免模型把旧数据当实时盘面（PRD 数据新鲜度闸门的轻量实现）。
-	if !q.DataTime.IsZero() {
-		if age := time.Since(q.DataTime); age > 15*time.Minute {
-			snap["freshness_note"] = fmt.Sprintf("行情快照为 %d 分钟前的数据（可能处于休市或数据延迟），不代表实时盘面", int(age.Minutes()))
-		}
+	// 数据新鲜度提示：stale（交易时段内全源过期/停牌）写 freshness_note（会压 sys_confidence
+	// 并要求模型声明行情截至时间）；非交易时段的正常收盘/午间口径写 market_session_note（不扣档）。
+	if note, sessionNote := stockFreshnessNote(fresh, q.DataTime); note != "" {
+		snap["freshness_note"] = note
+	} else if sessionNote != "" {
+		snap["market_session_note"] = sessionNote
 	}
 
 	// 估值/盘面扩展（腾讯免费源 best-effort：拿不到不阻断，提示词已要求缺失时如实说明）。
@@ -147,6 +156,13 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 	if berr == nil && len(bars) > 0 {
 		snap["technicals"] = computeTechnicals(bars)
 		snap["recent_bars"] = compactBars(bars, 30)
+		barsAsOf := bars[len(bars)-1].TradeDate
+		snap["bars_as_of"] = barsAsOf
+		// 日线截止日校验：非交易时段应等于期望交易日；盘中当日 bar 可能尚未生成，宽容。
+		if mkt == "cn" && fresh.ExpectedDate != "" && barsAsOf != "" &&
+			fresh.MarketState != marketStateTrading && barsAsOf < fresh.ExpectedDate {
+			snap["bars_note"] = fmt.Sprintf("日线仅更新至 %s（期望 %s），技术指标可能滞后", barsAsOf, fresh.ExpectedDate)
+		}
 		sc := computeScore(q.Price, bars)
 		snap["quant_score"] = map[string]any{
 			"total": sc.Total, "label": sc.Label,
@@ -183,7 +199,7 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 			}
 		}
 		// F2 财务段：F10 主要财务指标最新一期 + 近 8 期趋势（缓存优先，缺失按需拉一次）。
-		// 数值叶子会被 snapshotValueSet 自动并入证据核验值域。无数据不注入，
+		// 数值叶子会被 snapshotLabeledValues 自动并入证据核验值域。无数据不注入，
 		// prompt 已声明缺失时如实说明。
 		if fin := financeBrief(ctx, symbol); fin != nil {
 			snap["finance"] = fin
@@ -197,7 +213,7 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 			}
 		}
 		// P3a 机构观点段：研报评级分布/评级变动/目标价偏离/调研密度（缓存优先，
-		// 缺失按需拉一次）。数值叶子经 snapshotValueSet 自动进核验值域；无数据不注入。
+		// 缺失按需拉一次）。数值叶子经 snapshotLabeledValues 自动进核验值域；无数据不注入。
 		if ov := orgViewBrief(ctx, symbol, q.Price); ov != nil {
 			snap["org_view"] = ov
 		}
@@ -325,7 +341,7 @@ func (s *AnalysisService) buildSectorContext(ctx context.Context, market, target
 		"breadth": ov.Breadth,
 	}
 	// P3b：focus 名精确匹配到行业板块（估值聚合表 board_name）时注入两段板块级数据。
-	// 概念板块/未匹配自然缺席，guidance 已声明按缺失处理；数值叶子经 snapshotValueSet
+	// 概念板块/未匹配自然缺席，guidance 已声明按缺失处理；数值叶子经 snapshotLabeledValues
 	// 自动进核验值域，无需手工登记。
 	if bv, code := boardValuationByName(strings.TrimSpace(target)); bv != nil {
 		snap["board_valuation"] = bv
@@ -553,7 +569,7 @@ func snapSize(snap map[string]any) int {
 
 // fallbackMarketSignals 无新闻时的程序化市场信号（N2 舆情段 fallback，纯函数可测）：
 // 涨跌五档 + 量能三档（今日量/前5日均量）+ 换手率。分档标签为定性文字，
-// 数值字段留给 snapshotValueSet 自动进核验值域。
+// 数值字段留给 snapshotLabeledValues 自动进核验值域。
 func fallbackMarketSignals(changePct float64, bars []datasource.Bar, turnoverRate float64) map[string]any {
 	band := "平稳(±1%)"
 	switch {

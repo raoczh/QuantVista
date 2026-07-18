@@ -232,19 +232,12 @@ func TestUpsertExpressRowsIdempotent(t *testing.T) {
 	}
 }
 
-// candidateValueSet 必须含 fin 数字（值域同步铁律）。
+// candidateLabeledValues 必须含 fin 数字（值域同步铁律）。
 func TestCandidateValueSetFin(t *testing.T) {
 	c := candidate{Price: 100, Fin: &candFin{ROE: 34.2, RevenueYoY: 15.66, NetProfitYoY: 15.38, GrossMargin: 91.9}}
-	vals := candidateValueSet(c)
+	vals := candidateLabeledValues(c)
 	for _, want := range []float64{34.2, 15.66, 15.38, 91.9} {
-		found := false
-		for _, v := range vals {
-			if v == want {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !labeledHas(vals, want) {
 			t.Errorf("值域缺 %v", want)
 		}
 	}

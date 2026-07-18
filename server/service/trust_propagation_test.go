@@ -113,17 +113,9 @@ func TestCompareValueSetContainsRows(t *testing.T) {
 		{Symbol: "600000", QuoteOK: true, Price: 12.34, Score: 78, ChangePct5d: 3.21},
 		{Symbol: "000001", QuoteOK: true, Price: 45.67, Score: 52},
 	}
-	vals := snapshotValueSet(rows)
-	has := func(x float64) bool {
-		for _, v := range vals {
-			if v == x {
-				return true
-			}
-		}
-		return false
-	}
+	vals := snapshotLabeledValues(rows, nil)
 	for _, want := range []float64{12.34, 78, 3.21, 45.67, 52} {
-		if !has(want) {
+		if !labeledHas(vals, want) {
 			t.Fatalf("值域缺少 %v，got %v", want, vals)
 		}
 	}
