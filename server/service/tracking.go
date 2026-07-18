@@ -361,7 +361,7 @@ func (s *TrackingService) evaluateOne(ctx context.Context, batch model.Recommend
 	// 追加当日实时行情为一根 bar（用于盘中触达判定与最新价刷新）。
 	if q, err := s.market.GetQuote(ctx, rec.Market, rec.Symbol); err == nil && q.Price > 0 {
 		now := time.Now().In(time.Local)
-		if shouldAppendQuoteBar(now, recDate, bars) {
+		if shouldAppendQuoteBar(now, recDate, bars, q.DataTime) {
 			today := now.Format("2006-01-02")
 			high, low := q.High, q.Low
 			if high <= 0 {
@@ -438,8 +438,13 @@ func (s *TrackingService) evaluateOne(ctx context.Context, batch model.Recommend
 // shouldAppendQuoteBar 是否把当日实时行情追加为一根 bar：仅在今天是交易日、今天晚于
 // 推荐日、且日线尚无今日根时追加。周末/节假日 GetQuote 返回的是上一收盘，无交易日
 // 判断会把它追加成周六/日的假 bar（#27b）；交易日历缺失时回退「周一~五」判断。
-func shouldAppendQuoteBar(now time.Time, recDate string, bars []datasource.Bar) bool {
+func shouldAppendQuoteBar(now time.Time, recDate string, bars []datasource.Bar, dataTime time.Time) bool {
 	today := now.Format("2006-01-02")
+	// fail-closed：行情数据时间不是今天（旧价/停牌残留/timestamp_unknown 零值）不得
+	// 伪装成今日 bar——旧价 bar 会驱动止盈止损触达误判并把「今日已检查」建立在旧数据上。
+	if dataTime.IsZero() || dataTime.Format("2006-01-02") != today {
+		return false
+	}
 	if today <= recDate {
 		return false
 	}

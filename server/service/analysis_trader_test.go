@@ -202,9 +202,29 @@ func TestAttachTradePlan_DeterministicSkips(t *testing.T) {
 	}
 	// 现价缺失。
 	r = &AnalysisResult{Rating: model.AnalysisRatingNeutral}
-	s.attachTradePlan(context.Background(), 0, nil, "", true, req, map[string]any{}, r)
+	s.attachTradePlan(context.Background(), 0, nil, "", true, req, map[string]any{"freshness_status": "fresh"}, r)
 	if r.TradePlan == nil || !r.TradePlan.NoPlan {
 		t.Fatal("现价缺失应 NoPlan")
+	}
+	// 行情过期（stale）/时效未知（缺 freshness_status）：不生成精确交易计划。
+	r = &AnalysisResult{Rating: model.AnalysisRatingBullish}
+	s.attachTradePlan(context.Background(), 0, nil, "", true, req,
+		map[string]any{"quote": map[string]any{"price": 10.0}, "freshness_status": "stale"}, r)
+	if r.TradePlan == nil || !r.TradePlan.NoPlan || !strings.Contains(r.TradePlan.NoPlanReason, "行情") {
+		t.Fatalf("stale 行情应 NoPlan: %+v", r.TradePlan)
+	}
+	r = &AnalysisResult{Rating: model.AnalysisRatingBullish}
+	s.attachTradePlan(context.Background(), 0, nil, "", true, req,
+		map[string]any{"quote": map[string]any{"price": 10.0}}, r)
+	if r.TradePlan == nil || !r.TradePlan.NoPlan {
+		t.Fatal("缺 freshness_status（时效未知）应 NoPlan")
+	}
+	// 有 freshness_note（全源过期仍带旧价返回）同样拒绝。
+	r = &AnalysisResult{Rating: model.AnalysisRatingBullish}
+	s.attachTradePlan(context.Background(), 0, nil, "", true, req,
+		map[string]any{"quote": map[string]any{"price": 10.0}, "freshness_status": "fresh", "freshness_note": "行情仅更新至…"}, r)
+	if r.TradePlan == nil || !r.TradePlan.NoPlan {
+		t.Fatal("带 freshness_note 应 NoPlan")
 	}
 	// 非个股/回溯模式不追加。
 	r = &AnalysisResult{Rating: model.AnalysisRatingBullish}
@@ -237,8 +257,9 @@ func TestAttachTradePlan_EndToEnd(t *testing.T) {
 		bars = append(bars, map[string]any{"c": c})
 	}
 	snap := map[string]any{
-		"quote":       map[string]any{"price": 10.0},
-		"recent_bars": bars,
+		"quote":            map[string]any{"price": 10.0},
+		"recent_bars":      bars,
+		"freshness_status": "fresh",
 	}
 	s := &AnalysisService{} // market=nil → breadth 缺失走中性 0.6
 	cfg := &model.LLMConfig{BaseURL: srv.URL, Model: "m"}

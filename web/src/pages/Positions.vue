@@ -85,6 +85,16 @@ const mixLabel = computed(() => {
   return `${short.toFixed(0)}% / ${(100 - short).toFixed(0)}%`
 })
 
+// 部分估值透明化：行情失败的仓位被排除出市值/盈亏汇总，不能默不作声地伪装成完整组合。
+const pricedLabel = computed(() => {
+  const ov = overview.value
+  if (!ov) return ''
+  const failed = ov.quote_failed_count ?? 0
+  if (failed <= 0) return ''
+  const total = ov.holding_count
+  return `已定价 ${total - failed}/${total} 笔（${failed} 笔行情缺失，未计入市值与盈亏）`
+})
+
 // 持仓行「N 天未分析」提示文案（从未分析则不带天数）。
 function staleLabel(p: Position) {
   if (!p.last_analyzed_at) return '未分析'
@@ -423,7 +433,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <PageContainer title="持仓" subtitle="短线 / 长线 · 实时盈亏 · 卖出复盘">
+  <PageContainer title="持仓" subtitle="短线 / 长线 · 盈亏跟踪 · 卖出复盘">
     <template #actions>
       <n-button size="small" type="primary" @click="openCreate()">+ 新建持仓</n-button>
       <n-button size="small" quaternary @click="openImport">导入</n-button>
@@ -437,7 +447,11 @@ onMounted(async () => {
           <StatCard label="持仓成本" :value="fmtMoney(overview?.total_cost ?? 0)" />
         </n-gi>
         <n-gi>
-          <StatCard label="当前市值" :value="fmtMoney(overview?.total_value ?? 0)" />
+          <StatCard
+            label="当前市值"
+            :value="fmtMoney(overview?.total_value ?? 0)"
+            :sub="pricedLabel"
+          />
         </n-gi>
         <n-gi>
           <StatCard

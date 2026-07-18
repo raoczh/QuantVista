@@ -131,6 +131,93 @@ func (s *MarketService) GetFreshQuote(ctx context.Context, market, symbol string
 	return q, info(q), nil
 }
 
+// QuoteFreshnessOf 对一条已取得的行情按当前时刻做时效判定——提醒/守护/模拟成交/追踪/
+// 推荐等「旧价会造成误动作」的消费链路共用此入口（统一新鲜度判定，别再各自比对日期）。
+// cn 按交易日历+交易时段判定；其余市场无日历，返回 unknown（调用方按现状放行）。
+func (s *MarketService) QuoteFreshnessOf(market string, dataTime time.Time) quoteFreshInfo {
+	if market != "cn" {
+		return quoteFreshInfo{Status: freshStatusUnknown, MarketState: marketStateClosed}
+	}
+	now := time.Now().In(time.Local)
+	isTrading := isTradingDayToday(now)
+	state := cnMarketState(now, isTrading)
+	expected := expectedQuoteDate(now, isTrading, prevOpenTradeDate(now.Format("2006-01-02")))
+	return quoteFreshness(dataTime, now, state, expected)
+}
+
+// FreshQuoteResult 批量新鲜行情的单只结果（Quote 可为 nil=拉取失败）。
+type FreshQuoteResult struct {
+	Quote *datasource.Quote
+	Fresh quoteFreshInfo
+}
+
+// FreshQuotesFor 并发批量取「新鲜行情」：单只走 GetFreshQuote 的全源换源逻辑（主源
+// 旧价不当成功，逐源找当前有效行情），stale 候选照常返回并带状态，由调用方决定
+// fail-closed 策略。守护/推荐终选名单等高风险链路用它替代 QuotesFor。
+func (s *MarketService) FreshQuotesFor(ctx context.Context, refs []QuoteRef) map[string]FreshQuoteResult {
+	out := make(map[string]FreshQuoteResult, len(refs))
+	if len(refs) == 0 {
+		return out
+	}
+	var mu sync.Mutex
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for _, ref := range refs {
+		ref := ref
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			q, fi, err := s.GetFreshQuote(ctx, ref.Market, ref.Symbol)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			out[QuoteKey(ref.Market, ref.Symbol)] = FreshQuoteResult{Quote: q, Fresh: fi}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return out
+}
+
+// QuoteFreshnessView 行情响应统一携带的新鲜度块（全项目契约字段）：采集时刻、数据源
+// 行情时刻、期望交易日、时段、状态与过期原因。前端/AI 消费方据此区分「刚请求成功」
+// 与「数据仍然有效」。
+type QuoteFreshnessView struct {
+	CapturedAt      string `json:"captured_at"`                // 本次采集（请求）时刻
+	SourceDataTime  string `json:"source_data_time,omitempty"` // 数据源行情时刻；空=源未返回时间（timestamp_unknown）
+	ExpectedAsOf    string `json:"expected_as_of,omitempty"`   // 期望的最近有效行情交易日
+	Source          string `json:"source,omitempty"`
+	MarketState     string `json:"market_state"`
+	FreshnessStatus string `json:"freshness_status"` // fresh | stale | unknown
+	StaleReason     string `json:"stale_reason,omitempty"`
+}
+
+// FreshnessView 组装一条行情的新鲜度视图（q 为 nil 时按 stale 组装）。
+func (s *MarketService) FreshnessView(market string, q *datasource.Quote) *QuoteFreshnessView {
+	v := &QuoteFreshnessView{CapturedAt: time.Now().In(time.Local).Format("2006-01-02 15:04:05")}
+	var dataTime time.Time
+	if q != nil {
+		dataTime = q.DataTime
+		v.Source = q.Source
+	}
+	fi := s.QuoteFreshnessOf(market, dataTime)
+	v.ExpectedAsOf = fi.ExpectedDate
+	v.MarketState = fi.MarketState
+	v.FreshnessStatus = fi.Status
+	if !dataTime.IsZero() {
+		v.SourceDataTime = dataTime.In(time.Local).Format("2006-01-02 15:04:05")
+	}
+	if fi.Status == freshStatusStale {
+		if note, _ := stockFreshnessNote(fi, dataTime); note != "" {
+			v.StaleReason = note
+		}
+	}
+	return v
+}
+
 // GetDailyBars 取日线序列。加 10 分钟缓存：推荐评分/个股分析/对比/评分卡会在短时间内
 // 反复拉同一批标的的日线（收盘后日线不变、盘中仅末根在动），缓存显著降低对免费源的压力。
 func (s *MarketService) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]datasource.Bar, error) {
@@ -243,7 +330,9 @@ type QuoteRef struct {
 func QuoteKey(market, symbol string) string { return market + ":" + symbol }
 
 // QuotesFor 并发批量取行情（复用单只 GetQuote 的缓存），单只失败只是缺席不影响其余。
-// 用于自选/持仓列表富化现价；并发上限避免瞬时打爆数据源。
+// 用于自选/持仓列表富化现价等**展示场景**（行携带 data_time 供用户自判）；提醒/守护/
+// 模拟成交/推荐等旧价会造成误动作的链路必须改用 FreshQuotesFor + 新鲜度判定 fail-closed。
+// 并发上限避免瞬时打爆数据源。
 func (s *MarketService) QuotesFor(ctx context.Context, refs []QuoteRef) map[string]*datasource.Quote {
 	out := make(map[string]*datasource.Quote, len(refs))
 	if len(refs) == 0 {
@@ -472,11 +561,17 @@ func (s *MarketService) persist(q *datasource.Quote) {
 		common.SysWarn("落库 stock 失败 %s: %v", q.Symbol, err)
 	}
 
-	// upsert quote 快照
+	// upsert quote 快照。DataTime 零值（三源都未返回行情时间，timestamp_unknown）时以
+	// epoch 哨兵落库：列非空且 MySQL 严格模式拒绝零日期；1970 显然非真实行情时间，任何
+	// 日期比对都会按过期处理，不会像回填「现在」那样被伪装成实时价。
+	dataTime := q.DataTime
+	if dataTime.IsZero() {
+		dataTime = time.Unix(0, 0)
+	}
 	quote := model.StockQuote{
 		Symbol: q.Symbol, Market: q.Market, Price: q.Price, ChangePct: q.ChangePct,
 		Open: q.Open, High: q.High, Low: q.Low, PrevClose: q.PrevClose,
-		Volume: q.Volume, Amount: q.Amount, Source: q.Source, DataTime: q.DataTime,
+		Volume: q.Volume, Amount: q.Amount, Source: q.Source, DataTime: dataTime,
 	}
 	if err := common.DB.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "symbol"}, {Name: "market"}},

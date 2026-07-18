@@ -78,8 +78,9 @@ func (s *SinaAdapter) GetQuote(ctx context.Context, market, symbol string) (*Quo
 		changePct = (price - prevClose) / prevClose * 100
 	}
 
-	// 字段 30/31 为日期/时间（北京时间）。
-	dataTime := time.Now()
+	// 字段 30/31 为日期/时间（北京时间）。解析失败保持零值（timestamp_unknown）：
+	// 回填当前时间会把旧价伪装成实时价，零值由新鲜度判定恒判 stale。
+	var dataTime time.Time
 	if t, err := time.ParseInLocation("2006-01-02 15:04:05", fields[30]+" "+fields[31], time.Local); err == nil {
 		dataTime = t
 	}

@@ -417,6 +417,7 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 	}
 	rows := make([]map[string]any, 0, len(views))
 	var totalCost, totalMV, totalPnL float64
+	quoteFailed := 0 // 行情拉取失败、未计入市值/盈亏的持仓数（部分估值透明化）
 	for _, v := range views {
 		row := map[string]any{
 			"name":      v.Name,
@@ -432,6 +433,9 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 			row["current_price"] = round2(v.CurrentPrice)
 			row["profit_amount"] = round2(v.ProfitAmount)
 			row["profit_pct"] = round2(v.ProfitPct)
+		} else if v.Status == model.PositionStatusHolding {
+			quoteFailed++
+			row["quote_note"] = "当前行情获取失败（可能停牌/数据源故障），现价与盈亏未知"
 		}
 		if v.BuyReason != "" {
 			row["buy_reason"] = v.BuyReason
@@ -459,6 +463,14 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 			"profit_pct":   round2(pnlPct),
 		},
 		"positions": rows,
+	}
+	// 部分估值透明化：行情失败的仓位被排除在汇总之外——组合并非完整定价时必须告知
+	// 模型，禁止其对现价未知的仓位强行给出割/守/补结论（禁骑墙纪律只约束有行情的仓）。
+	if quoteFailed > 0 {
+		snap["quote_failed_count"] = quoteFailed
+		snap["valuation_note"] = fmt.Sprintf(
+			"注意：%d 笔持仓行情获取失败，holding_summary 仅覆盖已定价仓位（部分估值，非完整组合）。对行情缺失的仓位不得虚构现价，也不要强行给出割/守/补三选一，明确说明数据不足即可",
+			quoteFailed)
 	}
 	// 资金上下文（S1）：用户在设置里填了总投资资金才注入——持仓占总资金的比例
 	// 决定「割/守/补」的容错空间（满仓亏损与三成仓亏损是两种处境）。

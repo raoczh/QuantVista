@@ -22,6 +22,18 @@ export interface Quote {
   amount: number
   source: string
   data_time: string
+  freshness?: QuoteFreshness
+}
+
+// 行情响应统一携带的新鲜度块：区分「请求成功」与「数据仍然有效」。
+export interface QuoteFreshness {
+  captured_at: string
+  source_data_time?: string // 空=数据源未返回行情时间
+  expected_as_of?: string // 期望的最近有效行情交易日
+  source?: string
+  market_state: string // trading | break | pre_open | post_close | closed
+  freshness_status: string // fresh | stale | unknown
+  stale_reason?: string
 }
 
 export interface Bar {

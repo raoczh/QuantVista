@@ -98,16 +98,21 @@ func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (
 	}
 
 	// 成交价：给定则用给定（跳过行情，便于离线/指定价成交）；否则取实时行情价。
+	// fail-closed：市价成交走新鲜行情链路，全源 stale（停牌/数据源延迟）时拒绝按旧价
+	// 成交——旧价成交会让模拟盘账面凭空盈亏，用户可手动指定价格明确担责。
 	// 精度用 round4（列为 decimal(20,4)）：ETF/基金最小变动价位 0.001 元，round2 会抹掉限价第三位小数。
 	price := round4(in.Price)
 	name := ""
 	if price <= 0 {
-		q, e := s.market.GetQuote(ctx, market, symbol)
+		q, fi, e := s.market.GetFreshQuote(ctx, market, symbol)
 		if e != nil {
 			if errors.Is(e, datasource.ErrSymbolInvalid) {
 				return nil, errors.New("无法识别的股票代码")
 			}
 			return nil, errors.New("无法获取成交价，请手动指定价格")
+		}
+		if fi.Status == freshStatusStale {
+			return nil, errors.New("实时行情已过期（可能停牌或数据源延迟），拒绝按旧价成交；请手动指定价格或稍后重试")
 		}
 		price = round4(q.Price)
 		name = q.Name

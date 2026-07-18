@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"quantvista/common"
+	"quantvista/datasource"
 	"quantvista/service"
 
 	"github.com/gin-gonic/gin"
@@ -37,6 +38,9 @@ func (mc *MarketController) GetOverview(c *gin.Context) {
 }
 
 // GetQuote GET /api/markets/:market/stocks/:symbol/quote
+// 走新鲜行情链路（主源旧价不当成功，逐源找当前有效行情），响应统一携带 freshness 块
+// （captured_at/source_data_time/expected_as_of/market_state/freshness_status/stale_reason），
+// 前端据此区分「请求成功」与「数据仍然有效」。
 func (mc *MarketController) GetQuote(c *gin.Context) {
 	market := strings.ToLower(c.Param("market"))
 	symbol := strings.TrimSpace(c.Param("symbol"))
@@ -44,12 +48,15 @@ func (mc *MarketController) GetQuote(c *gin.Context) {
 		common.ApiErrorMsg(c, "symbol 不能为空")
 		return
 	}
-	q, err := mc.svc.GetQuote(c.Request.Context(), market, symbol)
+	q, _, err := mc.svc.GetFreshQuote(c.Request.Context(), market, symbol)
 	if err != nil {
 		common.ApiErrorMsg(c, "获取行情失败: "+err.Error())
 		return
 	}
-	common.ApiSuccess(c, q)
+	common.ApiSuccess(c, struct {
+		*datasource.Quote
+		Freshness *service.QuoteFreshnessView `json:"freshness"`
+	}{q, mc.svc.FreshnessView(market, q)})
 }
 
 // GetDailyBars GET /api/markets/:market/stocks/:symbol/bars?limit=120

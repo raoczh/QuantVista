@@ -269,7 +269,8 @@ function onResize() {
   <PageContainer title="市场首页" subtitle="A 股 · 实时概览与个股速查">
     <template #actions>
       <n-tag v-if="overview" size="small" round :bordered="false">
-        更新 {{ fmtTime(overview.data_time) }}
+        <!-- data_time 是服务端采集时刻而非各源行情时间，措辞用「采集」避免冒充实时更新时间 -->
+        采集于 {{ fmtTime(overview.data_time) }}
       </n-tag>
       <n-button size="small" secondary :loading="ovLoading" @click="loadOverview()">刷新</n-button>
     </template>

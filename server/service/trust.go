@@ -18,13 +18,17 @@ import (
 // 改动跳过规则/容差/方向规则时只改这里，各模块自动同步。
 
 // labeledValue 带字段路径的快照数值（值域的一员）。Path 供 items 明示命中来源；
-// Unit 记规范化口径；AsOf 为该字段的数据时间（尽力而为）；Derived 标记亿元衍生值。
+// Unit 记规范化口径；AsOf 为该字段的数据时间（尽力而为）；Derived 标记亿元衍生值；
+// Origin 区分值域来源："" = 数据快照（被数据佐证）、"plan" = 模型自身给出的计划价
+// （合法复述但非快照佐证）、"user" = 用户设定阈值。前端据此避免把「模型复述自己的
+// 结论」展示成「已被数据证明」。
 type labeledValue struct {
 	Path    string
 	Value   float64
 	Unit    string
 	AsOf    string
 	Derived bool
+	Origin  string
 }
 
 // evidenceSection 一段待核验文本及其所属模块（供 items 标注数字出处）。
@@ -47,6 +51,7 @@ type evidenceItem struct {
 	SnapValue float64 `json:"snap_value,omitempty"` // 命中的快照值
 	Tolerance float64 `json:"tolerance,omitempty"`  // 使用的容差
 	AsOf      string  `json:"as_of,omitempty"`      // 命中字段的数据时间
+	Origin    string  `json:"origin,omitempty"`     // 命中值域来源：空=数据快照 | plan=模型自身计划价 | user=用户设定阈值
 	Reason    string  `json:"reason,omitempty"`     // 未命中原因：not_found | direction_mismatch
 }
 
@@ -162,30 +167,47 @@ func verifyEvidenceLabeled(sections []evidenceSection, vals []labeledValue) *evi
 }
 
 // matchLabeled 在值域中为一个规范化数字找命中项，回填明细。cands 为候选值（换算值 + 原值）。
+// 快照来源（Origin 空）优先于 plan/user 来源：同一数字既在快照又在计划价中时按「被数据
+// 佐证」记，避免把有数据支撑的引用错标成「模型自述」。
 func matchLabeled(it *evidenceItem, cands []float64, dir string, vals []labeledValue) {
-	var oppo *labeledValue // 仅差符号的候选（用于 direction_mismatch 说明）
+	var oppo *labeledValue     // 仅差符号的候选（用于 direction_mismatch 说明）
+	var nonSnap *labeledValue  // 首个命中的非快照来源候选（快照候选未命中时回退）
+	fill := func(v labeledValue, tol float64) {
+		it.Matched = true
+		it.Path = v.Path
+		it.SnapValue = round2(v.Value)
+		it.Tolerance = round2(tol)
+		it.AsOf = v.AsOf
+		it.Origin = v.Origin
+	}
 	for i := range vals {
 		v := vals[i]
 		tol := math.Max(0.02, math.Abs(v.Value)*0.02)
 		for _, scaled := range cands {
 			// 带符号直配恒允许。
 			if math.Abs(scaled-v.Value) <= tol {
-				it.Matched = true
-				it.Path = v.Path
-				it.SnapValue = round2(v.Value)
-				it.Tolerance = round2(tol)
-				it.AsOf = v.AsOf
-				return
+				if v.Origin == "" {
+					fill(v, tol)
+					return
+				}
+				if nonSnap == nil {
+					vv := v
+					nonSnap = &vv
+				}
+				continue
 			}
 			// 绝对值相等但符号相反：仅当方向词与快照符号一致时才放行。
 			if math.Abs(math.Abs(scaled)-math.Abs(v.Value)) <= tol {
 				if dir != "" && directionMatchesSign(dir, v.Value) {
-					it.Matched = true
-					it.Path = v.Path
-					it.SnapValue = round2(v.Value)
-					it.Tolerance = round2(tol)
-					it.AsOf = v.AsOf
-					return
+					if v.Origin == "" {
+						fill(v, tol)
+						return
+					}
+					if nonSnap == nil {
+						vv := v
+						nonSnap = &vv
+					}
+					continue
 				}
 				if oppo == nil {
 					vv := v
@@ -193,6 +215,10 @@ func matchLabeled(it *evidenceItem, cands []float64, dir string, vals []labeledV
 				}
 			}
 		}
+	}
+	if nonSnap != nil {
+		fill(*nonSnap, math.Max(0.02, math.Abs(nonSnap.Value)*0.02))
+		return
 	}
 	if oppo != nil {
 		it.Reason = "direction_mismatch"
@@ -242,6 +268,14 @@ func directionOf(runes []rune, byteStart int, text, tok string, num float64) str
 		}
 	}
 	return ""
+}
+
+// markValueOrigin 给一组值域项统一标注来源（"plan"=模型自身计划价、"user"=用户设定阈值）。
+func markValueOrigin(vals []labeledValue, origin string) []labeledValue {
+	for i := range vals {
+		vals[i].Origin = origin
+	}
+	return vals
 }
 
 // normalizeUnit 单位口径归一（亿元→亿、万元→万、％→%）。

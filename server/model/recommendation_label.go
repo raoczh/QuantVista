@@ -114,6 +114,7 @@ const (
 	GateIndustryCap   = "industry_cap"   // S1-3 同行业名额上限（名单阶段生效）
 	GateBearShadow    = "bear_shadow"    // S2-2 反方研究员影子：severity=high「若强制会 buy→watch」
 	GateQualityShadow = "quality_shadow" // S2-3 数据质量门控影子：would_be_confidence_cap 只记不封顶
+	GateQuoteStale    = "quote_stale"    // 行情时效硬门（数据有效性，非影子）：终选名单行情过期透明排除
 )
 
 // RecommendationCandidateEvent 反事实事件表（S0-5）：候选池内每只标的在本批次的

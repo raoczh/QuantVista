@@ -56,12 +56,13 @@ var shadowGateLabelCN = map[string]string{
 	model.GateQualityShadow: "数据质量门控（影子）",
 	model.GateCorrelation:   "相关性去重",
 	model.GateIndustryCap:   "行业名额上限",
+	model.GateQuoteStale:    "行情时效硬门",
 }
 
 // shadowGateOrder 报表分组展示顺序（有事件才出组）。
 var shadowGateOrder = []string{
 	model.GateRegimeShadow, model.GateBearShadow, model.GateQualityShadow,
-	model.GateCorrelation, model.GateIndustryCap,
+	model.GateCorrelation, model.GateIndustryCap, model.GateQuoteStale,
 }
 
 // RecShadowReport 生成影子对照报表。recType 可空（全部）；horizon ∈ LabelHorizons。

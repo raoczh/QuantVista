@@ -15,6 +15,7 @@ export interface EvidenceItem {
   snap_value?: number
   tolerance?: number
   as_of?: string
+  origin?: string // 命中值域来源：空=数据快照 | plan=模型自身计划价 | user=用户设定阈值
   reason?: string // not_found | direction_mismatch
 }
 

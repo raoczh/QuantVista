@@ -26,6 +26,11 @@ const (
 // quoteStaleAfter 交易时段内行情数据时间与当前时刻的最大容忍延迟。
 const quoteStaleAfter = 10 * time.Minute
 
+// sessionTailSlackMin 非交易时段（午休/盘后/休市/盘前昨收）行情时刻下限的宽容分钟数。
+// 收盘价由 14:57~15:00 集合竞价产生、上午末价在 11:30 前成交，低流动性标的末笔成交
+// 可能更早——宽容 30 分钟；再早的同日行情（如 09:30 后数据停滞到午休/盘后）判 stale。
+const sessionTailSlackMin = 30
+
 // 市场时段常量。
 const (
 	marketStateTrading   = "trading"
@@ -86,7 +91,9 @@ func expectedQuoteDate(now time.Time, isTradingDay bool, prevOpen string) string
 //   - 零值 → stale（解析失败或缺时间戳，无法确认）；
 //   - 日期须与 expected 一致（pre_open 额外宽容「今天」——09:15~09:30 竞价期两态并存）；
 //   - trading 态还要求距今 ≤ quoteStaleAfter，午休恢复期（13:00~13:10）宽容 11:25 后的午盘末价；
-//   - break/post_close/closed 态：日期一致即视为新鲜（收盘/午间的最新价就是当下最新）。
+//   - break/post_close/closed/pre_open 态：日期一致之外还要求行情时刻达到该时段应有的
+//     尾盘口径（午休 ≥11:00、其余 ≥14:30）——同日 09:30 后停滞的行情在 12:30/15:30
+//     依旧是旧价，只看日期会误判 fresh。
 func quoteFreshness(dataTime, now time.Time, state, expected string) quoteFreshInfo {
 	info := quoteFreshInfo{Status: freshStatusStale, MarketState: state, ExpectedDate: expected}
 	if dataTime.IsZero() {
@@ -114,7 +121,19 @@ func quoteFreshness(dataTime, now time.Time, state, expected string) quoteFreshI
 		}
 		return info
 	default:
-		info.Status = freshStatusFresh
+		// 盘前竞价期（09:15~09:30）取到今天的行情：竞价出价即当日最新口径。
+		if state == marketStatePreOpen && d == today {
+			info.Status = freshStatusFresh
+			return info
+		}
+		// 午休应为上午末价（≥11:00）；盘后/休市/盘前昨收应为收盘口径（≥14:30）。
+		minOK := sessionCloseMin - sessionTailSlackMin
+		if state == marketStateBreak {
+			minOK = sessionAmBreakMin - sessionTailSlackMin
+		}
+		if dataTime.Hour()*60+dataTime.Minute() >= minOK {
+			info.Status = freshStatusFresh
+		}
 		return info
 	}
 }

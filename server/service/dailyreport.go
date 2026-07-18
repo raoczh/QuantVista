@@ -166,6 +166,12 @@ func (s *DailyReportService) GenerateFor(ctx context.Context, userID int64, manu
 	if !isTradingDayToday(now) {
 		return nil, errors.New("今日休市，无日报可生成")
 	}
+	// 收盘数据就绪门槛：正式日报承诺「当日收盘口径」（复盘/涨跌家数/资金流/明日推荐
+	// 均按收盘数据组织）。15:35（收盘增量落定，同自动窗口起点）之前手动生成会拿盘中
+	// 半截数据占用当天唯一记录，且 15:35 自动任务发现已存在便不再重建——直接拒绝。
+	if manual && now.Hour()*60+now.Minute() < reportWindowStartMin {
+		return nil, errors.New("收盘日报需在 15:35 收盘数据就绪后生成（当前为盘前/盘中时段，早盘生成会以盘中数据冒充收盘口径）")
+	}
 	date := now.Format("2006-01-02")
 
 	var existing model.DailyReport

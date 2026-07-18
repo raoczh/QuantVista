@@ -105,8 +105,9 @@ func (e *EastMoneyAdapter) GetQuote(ctx context.Context, market, symbol string) 
 	prevClose, _ := emNum(d["f60"])
 	changePct, _ := emNum(d["f170"])
 	// f86 为行情时间戳（unix 秒）。types.go 契约要求数据时间随数据透传——
-	// 休市时段取到的旧价若打上「现在」的时间戳，会被 AI 上下文当成实时价。
-	dataTime := time.Now()
+	// 缺失/解析失败时保持零值（timestamp_unknown）：回填「现在」会把旧价伪装成实时价，
+	// 零值在新鲜度判定侧恒判 stale，宁可换源/降级也不猜时间。
+	var dataTime time.Time
 	if ts, ok := emNum(d["f86"]); ok && ts > 0 {
 		dataTime = time.Unix(int64(ts), 0)
 	}

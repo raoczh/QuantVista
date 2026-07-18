@@ -153,6 +153,10 @@ type candidate struct {
 	Rank      int      `json:"rank,omitempty"`       // 未被排除者中的排名（1=最高）
 	Bonus     []string `json:"bonus,omitempty"`      // 策略加分/扣分明细（可解释）
 	SentToLLM bool     `json:"sent_to_llm,omitempty"`
+	// QuoteAsOf 行情时效硬门通过时的数据源行情时刻（YYYY-MM-DD HH:MM）：终选名单喂
+	// LLM 前逐只全源核验并刷新现价，此字段随池快照/pick 明细落库，标明推荐建立在
+	// 哪个时点的行情上（字符串不进数值核验值域）。
+	QuoteAsOf string `json:"quote_as_of,omitempty"`
 
 	// 进程内工作字段（小写不序列化，不进池快照）：closes/closeDates 尾部收盘序列及
 	// 其交易日（S1-3 相关性去重与 S1-2 相关性系数——按交易日交集对齐，任一股停牌
@@ -303,6 +307,8 @@ type recPick struct {
 	// DegradedSource 非空 = 该条为降级生成（"quant_fallback"：AI 精选超时后按量化排名
 	// 规则合成，计划价为 ATR 规则价、未经 AI 解读）。前端据此展示降级标签。
 	DegradedSource string `json:"degraded_source,omitempty"`
+	// QuoteAsOf 该条推荐所依据行情的数据源时刻（服务端从候选回填，模型无权自附）。
+	QuoteAsOf string `json:"quote_as_of,omitempty"`
 }
 
 // pickReview AI 复核员对单条推荐的结论。Confidence 用 FlexInt——模型常把整数字段
@@ -543,7 +549,19 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 			llmCands = append(llmCands, c)
 		}
 	}
+	// 行情时效硬门（数据有效性检查，非预测质量门控——影子评审纪律不适用于「数据本身
+	// 已失效」）：终选名单喂 LLM 前逐只走全源新鲜行情核验。fresh→刷新现价/涨跌幅并记
+	// quote_as_of；stale/取不到→透明排除（gate_type=quote_stale 记反事实事件，影子标签
+	// 自然结算可回验此门是否误伤）。全部过期时宁可零推荐也不基于旧价精选。
+	staleGates := s.applyQuoteFreshGate(ctx, market, pool, &llmCands)
+	gates = append(gates, staleGates...)
+	kept -= len(staleGates)
 	if len(llmCands) == 0 {
+		if len(staleGates) > 0 {
+			msg := "候选行情已全部过期（可能停牌、休市异常或数据源故障）：为避免基于旧价推荐，本次不生成，请稍后重试"
+			s.failBatch(batch, chatUsage{}, 0, msg)
+			return nil, errors.New(msg)
+		}
 		excluded := len(pool) - kept
 		msg := fmt.Sprintf("筛选后候选池为空（共扫描 %d 只，%d 只被筛掉）：请放宽股价/市值/换手等筛选条件后重试", len(pool), excluded)
 		s.failBatch(batch, chatUsage{}, 0, msg)
@@ -671,13 +689,15 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		picks[i].QuantRank = c.Rank
 		picks[i].PoolSize = kept
 		picks[i].LotCost = round2(c.Price * 100)
+		picks[i].QuoteAsOf = c.QuoteAsOf // 行情时效硬门核验过的数据源行情时刻
 		// 计划价与用户筛选阈值并入证据核验值域：模型在 evidence 里复述自己给出的
 		// 止盈/止损/买入区间、或用户设定的价格/换手/市值/追高阈值，均为合法引用而非幻觉。
+		// Origin 标注（plan/user）让前端区分「被快照数据佐证」与「模型复述自身结论」。
 		picks[i].EvidenceCheck = verifyEvidence(picks[i].Evidence, c,
 			append(
-				labeledVals("交易计划", picks[i].BuyZoneLow, picks[i].BuyZoneHigh, picks[i].TakeProfit, picks[i].StopLoss),
-				labeledVals("筛选阈值", filters.PriceMin, filters.PriceMax, filters.MaxGain5dPct,
-					filters.TurnoverMin, filters.TurnoverMax, filters.FloatCapMinYi, filters.FloatCapMaxYi)...,
+				markValueOrigin(labeledVals("交易计划", picks[i].BuyZoneLow, picks[i].BuyZoneHigh, picks[i].TakeProfit, picks[i].StopLoss), "plan"),
+				markValueOrigin(labeledVals("筛选阈值", filters.PriceMin, filters.PriceMax, filters.MaxGain5dPct,
+					filters.TurnoverMin, filters.TurnoverMax, filters.FloatCapMinYi, filters.FloatCapMaxYi), "user")...,
 			)...)
 		if picks[i].DegradedSource != "" {
 			// 量化降级条目：核验照跑（证明引用数字真实），但置信度必须如实标 low——
@@ -1135,6 +1155,7 @@ func normalizePick(p recPick, sym string, c candidate) recPick {
 	// verify/bear 关闭时无人覆盖就会以「复核通过/反方低危」的假面落库展示。
 	// DegradedSource 不在此清（quant_fallback 构造路径先设值再过本函数）。
 	p.Review, p.Bear, p.QualityGate = nil, nil, nil
+	p.QuoteAsOf = "" // 服务端回填字段，模型自附一律剥除
 	p.Action = strings.ToLower(strings.TrimSpace(p.Action))
 	if p.Action != model.RecActionBuy && p.Action != model.RecActionWatch {
 		p.Action = model.RecActionWatch
@@ -1281,6 +1302,67 @@ func medianAmountsFor(market string, symbols []string) map[string]float64 {
 		out[sym] = median(list)
 	}
 	return out
+}
+
+// quoteFreshGateVersion 行情时效硬门判定版本（判定规则/口径变更时递增）。
+const quoteFreshGateVersion = "qf1"
+
+// applyQuoteFreshGate 行情时效硬门：对已进入 LLM 终选名单的候选逐只走全源新鲜行情
+// 核验（FreshQuotesFor：主源旧价不当成功、逐源找当前有效行情）。
+//   - fresh：用核验行情刷新 Price/ChangePct（终选价格锚定当前盘面），记 QuoteAsOf；
+//   - stale/取不到：从名单剔除并在池内透明标注 Excluded（gate_type=quote_stale 事件行
+//     随批次落库，影子标签自然结算——若这些票后来表现好，报表会暴露此门误伤）。
+// 这是数据有效性硬检查（同「日线拉取失败=透明排除」先例），不属于质量门控影子评审
+// 的范畴——预测质量门控转正须凭影子对照数据，数据本身失效则必须 fail closed。
+// s.market 为 nil（单测注入环境）时跳过。
+func (s *RecommendationService) applyQuoteFreshGate(ctx context.Context, market string, pool []candidate, llmCands *[]candidate) []gateNote {
+	if s.market == nil || len(*llmCands) == 0 {
+		return nil
+	}
+	refs := make([]QuoteRef, 0, len(*llmCands))
+	for _, c := range *llmCands {
+		refs = append(refs, QuoteRef{Market: market, Symbol: c.Symbol})
+	}
+	fresh := s.market.FreshQuotesFor(ctx, refs)
+	idxBySym := make(map[string]int, len(pool))
+	for i := range pool {
+		idxBySym[pool[i].Symbol] = i
+	}
+	var gates []gateNote
+	keptCands := (*llmCands)[:0]
+	for _, c := range *llmCands {
+		fq, ok := fresh[QuoteKey(market, c.Symbol)]
+		if !ok || fq.Quote == nil || fq.Quote.Price <= 0 || fq.Fresh.Status == freshStatusStale {
+			reason := "行情时效硬门：全部数据源均未取到当前有效行情（可能停牌/退市/数据源故障），为避免基于旧价精选与定价，透明排除"
+			if ok && fq.Quote != nil && !fq.Quote.DataTime.IsZero() {
+				reason = fmt.Sprintf("行情时效硬门：行情仅更新至 %s（期望交易日 %s），基于旧价的精选与价位不可信，透明排除",
+					fq.Quote.DataTime.In(time.Local).Format("2006-01-02 15:04"), fq.Fresh.ExpectedDate)
+			}
+			if i, ok := idxBySym[c.Symbol]; ok {
+				pool[i].Excluded = reason
+				pool[i].SentToLLM = false
+			}
+			gates = append(gates, gateNote{
+				Symbol:      c.Symbol,
+				GateType:    model.GateQuoteStale,
+				GateVersion: quoteFreshGateVersion,
+				Reason:      reason,
+			})
+			continue
+		}
+		asOf := fq.Quote.DataTime.In(time.Local).Format("2006-01-02 15:04")
+		c.Price = round2(fq.Quote.Price)
+		c.ChangePct = round2(fq.Quote.ChangePct)
+		c.QuoteAsOf = asOf
+		if i, ok := idxBySym[c.Symbol]; ok {
+			pool[i].Price = c.Price
+			pool[i].ChangePct = c.ChangePct
+			pool[i].QuoteAsOf = asOf
+		}
+		keptCands = append(keptCands, c)
+	}
+	*llmCands = keptCands
+	return gates
 }
 
 // buildPool 阶段①②：多源建池（自选 ∪ 按策略组合的榜单来源，来源可叠加）→
