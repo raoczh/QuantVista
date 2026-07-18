@@ -274,6 +274,10 @@ func seedWFFixture(t *testing.T) []string {
 	if err := common.DB.CreateInBatches(bars, 500).Error; err != nil {
 		t.Fatalf("seed bars 失败: %v", err)
 	}
+	// 复刻生产存量态：后加列 turnover_rate 的存量行为 NULL。挑 ST 股注入——它会被
+	// 宇宙剔除但一定先被 streamCNDailyBars 扫到，锁定 COALESCE 兜底且不碰其余股票
+	// 的换手排除/评分语义。
+	common.DB.Exec("UPDATE daily_bars SET turnover_rate = NULL WHERE symbol = '600102'")
 	if err := common.DB.CreateInBatches(states, 100).Error; err != nil {
 		t.Fatalf("seed states 失败: %v", err)
 	}

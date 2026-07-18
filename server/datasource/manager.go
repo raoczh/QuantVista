@@ -36,6 +36,11 @@ func DefaultManager() *Manager {
 	}
 }
 
+// NewManagerWithAdapters 用指定源顺序构造 Manager（供测试注入假源）。
+func NewManagerWithAdapters(adapters ...Adapter) *Manager {
+	return &Manager{adapters: adapters, health: NewHealthTracker()}
+}
+
 // HealthSnapshot 各 (源,能力) 健康快照（GET /api/admin/datasources）。
 func (m *Manager) HealthSnapshot() []HealthStat { return m.health.Snapshot() }
 
@@ -72,22 +77,7 @@ func routeCap[T any](m *Manager, ctx context.Context, capability string, call fu
 
 	var lastErr error
 	trySource := func(a Adapter) (T, bool, error) {
-		sctx, cancel := context.WithTimeout(ctx, mgrSourceBudget)
-		defer cancel()
-		start := time.Now()
-		r, err := call(sctx, a)
-		latency := time.Since(start).Milliseconds()
-		if err == nil {
-			m.health.Record(a.Name(), capability, outcomeSuccess, latency)
-			return r, true, nil
-		}
-		if errors.Is(err, ErrNotSupported) || errors.Is(err, ErrSymbolInvalid) {
-			return zero, false, err // 不记滑窗：非源健康问题
-		}
-		code, outcome := classifyErr(err)
-		m.health.Record(a.Name(), capability, outcome, latency)
-		common.SysDebug("[datasource] code=%s source=%s cap=%s latency=%dms err=%v", code, a.Name(), capability, latency, err)
-		return zero, false, err
+		return attemptSource(m, ctx, capability, a, call)
 	}
 
 	var cooled []Adapter
@@ -130,6 +120,116 @@ func routeCap[T any](m *Manager, ctx context.Context, capability string, call fu
 		lastErr = ErrNoData
 	}
 	return zero, lastErr
+}
+
+// attemptSource 对单个源发起一次能力调用（含单源短预算、错误归一、健康滑窗记录、DEBUG 日志）。
+// 从 routeCap 内联闭包提取，供 routeCap 与 GetQuoteFresh 复用；行为与原闭包完全一致。
+func attemptSource[T any](m *Manager, ctx context.Context, capability string, a Adapter, call func(ctx context.Context, a Adapter) (T, error)) (T, bool, error) {
+	var zero T
+	sctx, cancel := context.WithTimeout(ctx, mgrSourceBudget)
+	defer cancel()
+	start := time.Now()
+	r, err := call(sctx, a)
+	latency := time.Since(start).Milliseconds()
+	if err == nil {
+		m.health.Record(a.Name(), capability, outcomeSuccess, latency)
+		return r, true, nil
+	}
+	if errors.Is(err, ErrNotSupported) || errors.Is(err, ErrSymbolInvalid) {
+		return zero, false, err // 不记滑窗：非源健康问题
+	}
+	code, outcome := classifyErr(err)
+	m.health.Record(a.Name(), capability, outcome, latency)
+	common.SysDebug("[datasource] code=%s source=%s cap=%s latency=%dms err=%v", code, a.Name(), capability, latency, err)
+	return zero, false, err
+}
+
+// QuoteAccept 判定一个行情是否「足够新鲜」可直接采用。由 service 层按交易日历/时段闭包注入
+// （datasource 层不依赖 DB/日历）。
+type QuoteAccept func(*Quote) bool
+
+// GetQuoteFresh 取「新鲜行情」：遍历各源，成功但未通过 accept（数据过期）时不当成功，
+// 保留 DataTime 最新的候选继续尝试下一源；任一源通过 accept 立即返回 fresh=true。
+// 全部源都不新鲜时返回最新候选（fresh=false，err=nil，由调用方按候选自行降级并诚实标注）；
+// 全部源取数失败才返回 err。
+//
+// 与 routeCap 的差异：成功恒记 outcomeSuccess（数据旧不是源健康问题）；且仅在「零候选」
+// （全部取数失败/跳过）时才补跑冷却源——已有过期候选时不打扰冷却源（停牌/休市场景三源必然
+// 同旧，补跑只白烧总预算换不来新数据）。
+func (m *Manager) GetQuoteFresh(ctx context.Context, market, symbol string, accept QuoteAccept) (*Quote, bool, error) {
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, mgrTotalBudget)
+		defer cancel()
+	}
+	call := func(ctx context.Context, a Adapter) (*Quote, error) {
+		return a.GetQuote(ctx, market, symbol)
+	}
+
+	var best *Quote
+	var lastErr error
+	consider := func(q *Quote) bool { // 返回 true 表示已找到新鲜行情，可终止
+		if accept != nil && accept(q) {
+			best = q
+			return true
+		}
+		if best == nil || (q != nil && q.DataTime.After(best.DataTime)) {
+			best = q
+		}
+		return false
+	}
+
+	var cooled []Adapter
+	for _, a := range m.adapters {
+		if ctx.Err() != nil {
+			break
+		}
+		if !m.health.Available(a.Name(), "quote") {
+			cooled = append(cooled, a)
+			continue
+		}
+		q, ok, err := attemptSource(m, ctx, "quote", a, call)
+		if ok {
+			if consider(q) {
+				return best, true, nil
+			}
+			continue
+		}
+		if errors.Is(err, ErrSymbolInvalid) {
+			return nil, false, err
+		}
+		if !errors.Is(err, ErrNotSupported) {
+			lastErr = err
+		}
+	}
+	// 仅当零候选（全失败/跳过）时才补跑冷却源；已有过期候选则不打扰。
+	if best == nil {
+		for _, a := range cooled {
+			if ctx.Err() != nil {
+				break
+			}
+			q, ok, err := attemptSource(m, ctx, "quote", a, call)
+			if ok {
+				if consider(q) {
+					return best, true, nil
+				}
+				continue
+			}
+			if errors.Is(err, ErrSymbolInvalid) {
+				return nil, false, err
+			}
+			if !errors.Is(err, ErrNotSupported) {
+				lastErr = err
+			}
+		}
+	}
+	if best != nil {
+		return best, false, nil
+	}
+	if lastErr == nil {
+		lastErr = ErrNoData
+	}
+	return nil, false, lastErr
 }
 
 // GetQuote 依次尝试各源，返回首个成功结果（含实际命中的 Source）。

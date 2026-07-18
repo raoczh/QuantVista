@@ -231,22 +231,15 @@ func TestEnsureOrgViewCaching(t *testing.T) {
 	}
 }
 
-// 值域同步铁律：org_view 段的数值叶子（目标价中位/偏离%）必须被 snapshotValueSet
+// 值域同步铁律：org_view 段的数值叶子（目标价中位/偏离%）必须被 snapshotLabeledValues
 // 自动收集——模型忠实引用机构目标价不得被误报幻觉。
 func TestOrgViewValueSet(t *testing.T) {
 	ov := computeOrgView([]model.ReportRating{
 		{ReportDate: orgDay(5), OrgName: "甲证券", Rating: "买入", RatingChange: ratingChangeKeep, TargetPrice: 512.5},
 	}, nil, 400, orgNow)
-	vals := snapshotValueSet(map[string]any{"org_view": ov}, "recent_bars")
+	vals := snapshotLabeledValues(map[string]any{"org_view": ov}, nil, "recent_bars")
 	for _, want := range []float64{512.5, 28.13} { // median 与 (512.5-400)/400×100 的 round2
-		found := false
-		for _, v := range vals {
-			if v == want {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !labeledHas(vals, want) {
 			t.Errorf("org_view 值域缺 %v（值域同步铁律）", want)
 		}
 	}

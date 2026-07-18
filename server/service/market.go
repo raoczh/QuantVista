@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -67,6 +68,68 @@ func (s *MarketService) GetQuote(ctx context.Context, market, symbol string) (*d
 }
 
 const dailyBarsCacheTTL = 10 * time.Minute
+
+// freshMissTTL 全源过期候选的短标记 TTL：停牌股每次新建会话都会判 stale 触发全源遍历，
+// 用此标记在 60s 内复用候选，避免同标的重复扫源打满 15s 预算。
+const freshMissTTL = 60 * time.Second
+
+// GetFreshQuote 取「新鲜行情」：读缓存/上游结果后按交易日历与交易时段校验 DataTime，
+// 交易时段内过期则继续尝试下一数据源（不把旧行情当成功），全部源都过期则返回最新候选并
+// 标注 stale。返回 行情、新鲜度信息、错误。仅个股快照采集（buildStockSnapshot）走此链路。
+// 非 cn 市场无交易日历判定，降级为普通 GetQuote 并标 unknown。
+func (s *MarketService) GetFreshQuote(ctx context.Context, market, symbol string) (*datasource.Quote, quoteFreshInfo, error) {
+	if market != "cn" {
+		q, err := s.GetQuote(ctx, market, symbol)
+		return q, quoteFreshInfo{Status: freshStatusUnknown, MarketState: marketStateClosed}, err
+	}
+
+	now := time.Now().In(time.Local)
+	isTrading := isTradingDayToday(now)
+	state := cnMarketState(now, isTrading)
+	expected := expectedQuoteDate(now, isTrading, prevOpenTradeDate(now.Format("2006-01-02")))
+	accept := func(q *datasource.Quote) bool {
+		return quoteFreshness(q.DataTime, now, state, expected).Status == freshStatusFresh
+	}
+	info := func(q *datasource.Quote) quoteFreshInfo {
+		if q == nil {
+			return quoteFreshInfo{Status: freshStatusStale, MarketState: state, ExpectedDate: expected}
+		}
+		return quoteFreshness(q.DataTime, now, state, expected)
+	}
+
+	cacheKey := "quote:" + market + ":" + symbol
+	if cached, ok := common.RedisGet(cacheKey); ok {
+		var q datasource.Quote
+		if json.Unmarshal([]byte(cached), &q) == nil && accept(&q) {
+			return &q, info(&q), nil
+		}
+	}
+	// 全源过期短标记：命中即复用候选，跳过重复扫源。
+	missKey := "quote:freshmiss:" + market + ":" + symbol
+	if cached, ok := common.RedisGet(missKey); ok {
+		var q datasource.Quote
+		if json.Unmarshal([]byte(cached), &q) == nil {
+			return &q, info(&q), nil
+		}
+	}
+
+	q, fresh, err := s.mgr.GetQuoteFresh(ctx, market, symbol, accept)
+	if err != nil {
+		if errors.Is(err, datasource.ErrSymbolInvalid) {
+			return nil, quoteFreshInfo{Status: freshStatusStale, MarketState: state, ExpectedDate: expected}, err
+		}
+		common.SysWarn("取新鲜行情失败 symbol=%s: %v", symbol, err)
+		return nil, quoteFreshInfo{Status: freshStatusStale, MarketState: state, ExpectedDate: expected}, err
+	}
+	s.persist(q)
+	if b, err := json.Marshal(q); err == nil {
+		common.RedisSet(cacheKey, string(b), quoteCacheTTL)
+		if !fresh {
+			common.RedisSet(missKey, string(b), freshMissTTL)
+		}
+	}
+	return q, info(q), nil
+}
 
 // GetDailyBars 取日线序列。加 10 分钟缓存：推荐评分/个股分析/对比/评分卡会在短时间内
 // 反复拉同一批标的的日线（收盘后日线不变、盘中仅末根在动），缓存显著降低对免费源的压力。

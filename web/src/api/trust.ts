@@ -1,11 +1,33 @@
 // 全站信任层共享类型：证据核验 / 程序合成置信度 / AI 复核结论。
 // 推荐、分析、问答、对比、日报五处 LLM 链路共用同一套契约与展示（TrustBadges.vue）。
 
+// 数值存在性核验：单个被核验数字的明细。
+export interface EvidenceItem {
+  raw: string
+  value: number
+  unit?: string
+  direction?: string // up | down
+  sentence?: string
+  module?: string
+  count?: number
+  matched: boolean
+  path?: string
+  snap_value?: number
+  tolerance?: number
+  as_of?: string
+  reason?: string // not_found | direction_mismatch
+}
+
 // 证据数字核验结果（服务端程序化比对 LLM 引用的数字与数据快照）。
 export interface EvidenceCheck {
   total: number
   matched: number
   unmatched?: string[]
+  version?: string // ev2 起带 items 明细
+  skipped_count?: number
+  unmatched_total?: number
+  truncated?: boolean
+  items?: EvidenceItem[]
 }
 
 // AI 复核结论（verify 模式；symbol 仅推荐域按标的复核时使用）。

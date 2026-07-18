@@ -674,9 +674,11 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		// 计划价与用户筛选阈值并入证据核验值域：模型在 evidence 里复述自己给出的
 		// 止盈/止损/买入区间、或用户设定的价格/换手/市值/追高阈值，均为合法引用而非幻觉。
 		picks[i].EvidenceCheck = verifyEvidence(picks[i].Evidence, c,
-			picks[i].BuyZoneLow, picks[i].BuyZoneHigh, picks[i].TakeProfit, picks[i].StopLoss,
-			filters.PriceMin, filters.PriceMax, filters.MaxGain5dPct,
-			filters.TurnoverMin, filters.TurnoverMax, filters.FloatCapMinYi, filters.FloatCapMaxYi)
+			append(
+				labeledVals("交易计划", picks[i].BuyZoneLow, picks[i].BuyZoneHigh, picks[i].TakeProfit, picks[i].StopLoss),
+				labeledVals("筛选阈值", filters.PriceMin, filters.PriceMax, filters.MaxGain5dPct,
+					filters.TurnoverMin, filters.TurnoverMax, filters.FloatCapMinYi, filters.FloatCapMaxYi)...,
+			)...)
 		if picks[i].DegradedSource != "" {
 			// 量化降级条目：核验照跑（证明引用数字真实），但置信度必须如实标 low——
 			// AI 未参与，「核验全绿」不等于研究结论可信。

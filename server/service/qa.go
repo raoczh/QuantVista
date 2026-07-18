@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 
 	"quantvista/common"
 	"quantvista/model"
@@ -45,8 +46,20 @@ type QaAskRequest struct {
 // （S1：详情不回传大快照，风险标志单独解析回传供 UI 展示）。
 type QaConversationView struct {
 	model.AiConversation
-	Messages  []model.AiConversationMessage `json:"messages"`
-	RiskFlags []riskFlag                    `json:"risk_flags,omitempty"`
+	Messages     []model.AiConversationMessage `json:"messages"`
+	RiskFlags    []riskFlag                    `json:"risk_flags,omitempty"`
+	SnapshotMeta *qaSnapshotMeta               `json:"snapshot_meta,omitempty"`
+}
+
+// qaSnapshotMeta 会话快照的行情新鲜度元数据，从固定快照 JSON 解析回传前端头部展示。
+// 旧会话快照无这些顶层键时按 quote.data_time/source + 会话创建时间兜底。
+type qaSnapshotMeta struct {
+	CapturedAt      string `json:"captured_at,omitempty"`
+	QuoteAsOf       string `json:"quote_as_of,omitempty"`
+	BarsAsOf        string `json:"bars_as_of,omitempty"`
+	QuoteSource     string `json:"quote_source,omitempty"`
+	FreshnessStatus string `json:"freshness_status,omitempty"`
+	MarketState     string `json:"market_state,omitempty"`
 }
 
 // qaAskContext 一次提问的准备产物：prepare 与 finalize 之间的共享状态
@@ -219,26 +232,28 @@ func (s *QaService) finalizeAsk(userID int64, ac *qaAskContext, res *chatResult)
 	checkJSON := ""
 	var snap map[string]any
 	if json.Unmarshal([]byte(ac.conv.DataSnapshot), &snap) == nil {
-		vals := snapshotValueSet(snap, "recent_bars")
+		vals := snapshotLabeledValues(snap, stockAsOfHints(snap), "recent_bars")
 		// 快照 news 舆情段的新闻标题是文本型合法来源，标题里的小数并入值域（N2）；
 		// announcements 公告段标题（F1）与 risk_gate 提示文本（S1）同理。
-		vals = append(vals, decimalNumbersIn(newsTitleTexts(snap))...)
-		vals = append(vals, decimalNumbersIn(announcementTitleTexts(snap))...)
-		vals = append(vals, decimalNumbersIn(riskGateTexts(snap))...)
+		vals = append(vals, textLabeledValues("新闻标题", newsTitleTexts(snap))...)
+		vals = append(vals, textLabeledValues("公告标题", announcementTitleTexts(snap))...)
+		vals = append(vals, textLabeledValues("风险提示", riskGateTexts(snap))...)
 		userTexts := []string{ac.question}
 		for _, m := range ac.history {
 			if m.Role == model.QaRoleUser {
 				userTexts = append(userTexts, m.Content)
 			}
 		}
-		vals = append(vals, decimalNumbersIn(userTexts)...)
-		check := verifyEvidenceValues([]string{answer}, vals)
+		vals = append(vals, textLabeledValues("用户提问", userTexts)...)
+		check := verifyEvidenceLabeled([]evidenceSection{{Module: "回答", Text: answer}}, vals)
 		if b, err := json.Marshal(check); err == nil {
 			checkJSON = string(b)
 		}
 	}
 
 	// 事务落库：user 提问 + assistant 回答，并更新会话计数/token。
+	// 不变式：conv.DataSnapshot 永不回写——旧会话快照原地覆盖会让历史回答与核验结果
+	// 失去可复现性；「按最新数据」一律以新会话（新快照新 ID）承载。
 	err := common.DB.Transaction(func(tx *gorm.DB) error {
 		um := model.AiConversationMessage{ConversationID: ac.conv.ID, UserID: userID, Role: model.QaRoleUser, Content: ac.question}
 		if err := tx.Create(&um).Error; err != nil {
@@ -331,17 +346,18 @@ func (s *QaService) buildMessages(conv model.AiConversation, history []model.AiC
 }
 
 // qaPromptVersion 问答系统提示版本（会话不落库版本列，仅供代码内追溯）。
-// q8: P3a org_view 机构观点段进快照说明（卖方乐观偏差纪律）；q7: F2 finance 财务段（F10 最新期+趋势）进快照说明；q6: risk_gate 风险闸门段、允许轻量 Markdown（流式渲染配套）；q5: announcements 公告段；q4: news 舆情段；q3: 回答引用的数字会被程序化核验，威慑幻觉；q2: 快照含五维量化评分锚点、要求引用数值、禁用先验记忆。
-const qaPromptVersion = "q8"
+// q9: 快照新鲜度元数据（captured_at/quote_as_of/bars_as_of/quote_source/freshness_status/market_state），stale 时必须声明行情截至时间、非交易时段按收盘口径表述；q8: P3a org_view 机构观点段进快照说明（卖方乐观偏差纪律）；q7: F2 finance 财务段（F10 最新期+趋势）进快照说明；q6: risk_gate 风险闸门段、允许轻量 Markdown（流式渲染配套）；q5: announcements 公告段；q4: news 舆情段；q3: 回答引用的数字会被程序化核验，威慑幻觉；q2: 快照含五维量化评分锚点、要求引用数值、禁用先验记忆。
+const qaPromptVersion = "q9"
 
 const qaRoleIntro = `你是一名严谨的证券研究助理，正在就某只个股与用户进行多轮问答。你的回答仅供研究参考，不构成投资建议。
 
 要求：
 1. 只依据【个股数据快照】中的事实回答，严禁编造未提供的财务、消息、评级或价格；数据不足时明确说明局限，不臆测。禁止使用你记忆中关于该公司的信息（名气/行业地位/历史印象都不算数据）。
-2. 该快照仅含实时行情、技术指标、五维量化评分 quant_score（纯技术面 0-100 参考锚点）、可能存在的 news 舆情段（最近相关新闻标题+情绪标签，覆盖面有限）、可能存在的 finance 财务段（F10 最新期主要指标与近几期趋势，季报口径有滞后；值为 0 可能表示上游缺失，不得据此下「归零」结论）与可能存在的 org_view 机构观点段（卖方研报评级分布/评级变动/目标价统计/调研密度；解读纪律：卖方评级普遍乐观，不得以「多少家买入」论证看多，有信息量的是评级下调、目标价与现价的偏离、调研密度变化），无财务全表明细与资金流，涉及缺失维度时如实告知。引用新闻只能复述给出的标题，不得臆测正文细节；news 标注「暂无直接相关新闻」时按 market_signals 判断并明示消息面缺失。
-3. 风险闸门（快照 risk_gate 块，必须遵守）：level=block（ST/退市警示）为硬约束——不得给出任何买入倾向的回答，先讲退市/警示风险；level=warn（一字板/流动性不足）须在回答中主动提示并约束结论（一字板不得按可正常成交分析）。risk_gate.note 声明的未接入维度（质押/解禁等），涉及时照实说「未接入数据，请自行核查」，严禁装作已核查。
-4. 关键判断引用快照中的具体字段与数值（如「现价 12.34 高于 MA20=11.98」），让用户可以核对。系统会程序化核对你回答中引用的数字，与快照不符的会被标记展示给用户，因此不要编造或凭印象填写数字。
-5. 回答简明、聚焦用户问题，使用简体中文；必要时给出研究性看法，但不下达买卖指令。可用轻量 Markdown 排版（短列表、**加粗**关键结论），不要输出表格、图片与链接。`
+2. 该快照仅含采集时点的行情（quote_as_of 为行情数据时间、quote_source 为来源、freshness_status 为新鲜度状态、market_state 为市场时段、captured_at 为采集时刻）、技术指标、五维量化评分 quant_score（纯技术面 0-100 参考锚点）、可能存在的 news 舆情段（最近相关新闻标题+情绪标签，覆盖面有限）、可能存在的 finance 财务段（F10 最新期主要指标与近几期趋势，季报口径有滞后；值为 0 可能表示上游缺失，不得据此下「归零」结论）与可能存在的 org_view 机构观点段（卖方研报评级分布/评级变动/目标价统计/调研密度；解读纪律：卖方评级普遍乐观，不得以「多少家买入」论证看多，有信息量的是评级下调、目标价与现价的偏离、调研密度变化），无财务全表明细与资金流，涉及缺失维度时如实告知。引用新闻只能复述给出的标题，不得臆测正文细节；news 标注「暂无直接相关新闻」时按 market_signals 判断并明示消息面缺失。
+3. 行情新鲜度（必须遵守）：freshness_status=stale 或快照带 freshness_note 时，回答涉及价格/涨跌必须先声明「行情仅更新至 quote_as_of」，严禁以「实时/当前盘面」口径表述；market_state 非 trading（休市/午间/盘前）时按最近交易日收盘（或阶段）口径措辞，不得暗示实时成交。
+4. 风险闸门（快照 risk_gate 块，必须遵守）：level=block（ST/退市警示）为硬约束——不得给出任何买入倾向的回答，先讲退市/警示风险；level=warn（一字板/流动性不足）须在回答中主动提示并约束结论（一字板不得按可正常成交分析）。risk_gate.note 声明的未接入维度（质押/解禁等），涉及时照实说「未接入数据，请自行核查」，严禁装作已核查。
+5. 关键判断引用快照中的具体字段与数值（如「现价 12.34 高于 MA20=11.98」），让用户可以核对。系统会程序化核对你回答中引用的数字，与快照不符的会被标记展示给用户，因此不要编造或凭印象填写数字。
+6. 回答简明、聚焦用户问题，使用简体中文；必要时给出研究性看法，但不下达买卖指令。可用轻量 Markdown 排版（短列表、**加粗**关键结论），不要输出表格、图片与链接。`
 
 // loadMessages 取会话的全部消息（升序）。仅本人。
 func (s *QaService) loadMessages(userID, convID int64) ([]model.AiConversationMessage, error) {
@@ -374,8 +390,61 @@ func (s *QaService) Get(userID, id int64) (*QaConversationView, error) {
 		return nil, err
 	}
 	flags := parseRiskFlagsFromSnapshot(conv.DataSnapshot)
+	meta := parseSnapshotMeta(conv.DataSnapshot, conv.CreatedAt)
 	conv.DataSnapshot = "" // 详情不必回传大快照
-	return &QaConversationView{AiConversation: conv, Messages: msgs, RiskFlags: flags}, nil
+	return &QaConversationView{AiConversation: conv, Messages: msgs, RiskFlags: flags, SnapshotMeta: meta}, nil
+}
+
+// parseSnapshotMeta 从会话固定快照 JSON 解析行情新鲜度元数据。新快照直接读顶层键；
+// 旧会话快照（无这些键）按 quote.data_time/source 与会话创建时间兜底。全空返回 nil。
+func parseSnapshotMeta(snapshotJSON string, createdAt time.Time) *qaSnapshotMeta {
+	if snapshotJSON == "" {
+		return nil
+	}
+	var snap map[string]any
+	if json.Unmarshal([]byte(snapshotJSON), &snap) != nil {
+		return nil
+	}
+	str := func(v any) string { s, _ := v.(string); return s }
+	m := &qaSnapshotMeta{
+		CapturedAt:      str(snap["captured_at"]),
+		QuoteAsOf:       str(snap["quote_as_of"]),
+		BarsAsOf:        str(snap["bars_as_of"]),
+		QuoteSource:     str(snap["quote_source"]),
+		FreshnessStatus: str(snap["freshness_status"]),
+		MarketState:     str(snap["market_state"]),
+	}
+	// 兜底：captured_at ← data_as_of（分析派生快照有）← 会话创建时间。
+	if m.CapturedAt == "" {
+		if m.CapturedAt = str(snap["data_as_of"]); m.CapturedAt == "" && !createdAt.IsZero() {
+			m.CapturedAt = createdAt.In(time.Local).Format("2006-01-02 15:04:05")
+		}
+	}
+	if quote, ok := snap["quote"].(map[string]any); ok {
+		if m.QuoteAsOf == "" {
+			// quote.data_time 序列化为 RFC3339，重排为统一格式。
+			if raw := str(quote["data_time"]); raw != "" {
+				if t, err := time.Parse(time.RFC3339, raw); err == nil && !t.IsZero() {
+					m.QuoteAsOf = t.In(time.Local).Format("2006-01-02 15:04:05")
+				}
+			}
+		}
+		if m.QuoteSource == "" {
+			m.QuoteSource = str(quote["source"])
+		}
+	}
+	if m.BarsAsOf == "" {
+		if bars, ok := snap["recent_bars"].([]any); ok && len(bars) > 0 {
+			if last, ok := bars[len(bars)-1].(map[string]any); ok {
+				m.BarsAsOf = str(last["d"])
+			}
+		}
+	}
+	if m.CapturedAt == "" && m.QuoteAsOf == "" && m.QuoteSource == "" &&
+		m.BarsAsOf == "" && m.FreshnessStatus == "" && m.MarketState == "" {
+		return nil
+	}
+	return m
 }
 
 // Snapshot 返回会话固定的数据快照原文（供前端「数据快照」透明面板展示）。仅本人。

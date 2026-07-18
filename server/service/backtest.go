@@ -281,9 +281,10 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 	withChip := treeUsesChipFactor(tree)
 
 	// 流式读 daily_bars（与 buildFactorTable 同款：ORDER BY symbol, trade_date 恰合
-	// 唯一索引序免 filesort，别改列序）→ 逐股 worker 处理，内存 O(单股)。
+	// 唯一索引序免 filesort，列清单共用 dailyBarScanCols 别改列序）→ 逐股 worker
+	// 处理，内存 O(单股)。
 	rows, err := common.DB.Model(&model.DailyBar{}).
-		Select("symbol", "trade_date", "open", "high", "low", "close", "volume", "amount", "turnover_rate").
+		Select(dailyBarScanCols).
 		Where("market = ?", "cn").
 		Order("symbol, trade_date").Rows()
 	if err != nil {

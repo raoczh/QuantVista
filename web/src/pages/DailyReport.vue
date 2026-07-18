@@ -30,7 +30,7 @@ import TrustBadges from '@/components/TrustBadges.vue'
 
 const message = useMessage()
 const router = useRouter()
-const { pctColor, upColor, vars, withAlpha } = useUi()
+const { pctColor } = useUi()
 const { llmLabel } = useLlmLabel()
 const { goDetail } = useStockActions()
 
@@ -166,9 +166,6 @@ const reviewCheck = computed(() => {
   const c = current.value?.review?.evidence_check
   return c && c.total > 0 ? c : null
 })
-const reviewCheckColor = computed(() =>
-  reviewCheck.value && reviewCheck.value.matched === reviewCheck.value.total ? upColor.value : vars.value.warningColor,
-)
 
 // ---------- 数据快照透明面板（详情已带 snapshot_json） ----------
 const snapshotShow = ref(false)
@@ -286,20 +283,7 @@ onMounted(load)
         <!-- 今日复盘 -->
         <SectionCard v-if="current.review" title="今日复盘">
           <template v-if="reviewCheck" #extra>
-            <n-tooltip trigger="hover">
-              <template #trigger>
-                <span
-                  class="check-chip"
-                  :style="{ background: withAlpha(reviewCheckColor, 0.12), color: reviewCheckColor }"
-                >
-                  数据核验 {{ reviewCheck.matched }}/{{ reviewCheck.total }}
-                </span>
-              </template>
-              <span v-if="reviewCheck.unmatched?.length">
-                复盘里这些数字未能与快照吻合，可能是推算值或幻觉，建议人工核对：{{ reviewCheck.unmatched.join('、') }}
-              </span>
-              <span v-else>复盘引用的数字已逐一与数据快照程序化比对，全部吻合</span>
-            </n-tooltip>
+            <TrustBadges :evidence-check="reviewCheck" />
           </template>
           <div class="review">
             <p class="summary">{{ current.review.summary }}</p>

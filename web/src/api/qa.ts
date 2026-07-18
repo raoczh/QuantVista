@@ -27,9 +27,19 @@ export interface QaConversation {
   updated_at: string
 }
 
+export interface QaSnapshotMeta {
+  captured_at?: string
+  quote_as_of?: string
+  bars_as_of?: string
+  quote_source?: string
+  freshness_status?: string // fresh | stale | unknown
+  market_state?: string // trading | break | pre_open | post_close | closed
+}
+
 export interface QaConversationView extends QaConversation {
   messages: QaMessage[]
   risk_flags?: RiskFlag[] // 快照 risk_gate 程序化风险标志（S1）
+  snapshot_meta?: QaSnapshotMeta // 快照行情新鲜度元数据（q9）
 }
 
 export interface QaAskRequest {

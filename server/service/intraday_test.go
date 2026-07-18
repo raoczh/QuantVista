@@ -379,23 +379,15 @@ func TestStrategyAdjustIntraday(t *testing.T) {
 	}
 }
 
-// 值域同步铁律：盘中数值因子必须进 candidateValueSet（LLM 忠实引用不被误报幻觉）。
+// 值域同步铁律：盘中数值因子必须进 candidateLabeledValues（LLM 忠实引用不被误报幻觉）。
 func TestCandidateValueSetIntraday(t *testing.T) {
 	c := candidate{Factors: &candFactors{
 		IntradayDate: "2026-07-08",
 		Tail30Chg:    2.1, Tail30VolPct: 25.3, MorningChg: 1.7, CloseVsVwap: -1.2,
 	}}
-	vals := candidateValueSet(c)
-	has := func(want float64) bool {
-		for _, v := range vals {
-			if v == want {
-				return true
-			}
-		}
-		return false
-	}
+	vals := candidateLabeledValues(c)
 	for _, want := range []float64{2.1, 25.3, 1.7, -1.2} {
-		if !has(want) {
+		if !labeledHas(vals, want) {
 			t.Errorf("值域缺少盘中因子 %v", want)
 		}
 	}

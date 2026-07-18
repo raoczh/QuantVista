@@ -111,6 +111,10 @@ func seedICFixture(t *testing.T) {
 	if err := common.DB.CreateInBatches(bars, 500).Error; err != nil {
 		t.Fatalf("seed bars 失败: %v", err)
 	}
+	// 复刻生产存量态：turnover_rate 是后加列（AutoMigrate 只加列不回填），此前初始化
+	// 的行该列为 NULL——锁定 dailyBarScanCols 的 COALESCE 兜底（裸 float64 扫描遇
+	// NULL 会中断整个流式读）。本 fixture 的断言只依赖 chg_5d，与换手无关。
+	common.DB.Exec("UPDATE daily_bars SET turnover_rate = NULL")
 	t.Cleanup(func() {
 		common.DB.Exec("DELETE FROM daily_bars")
 		common.DB.Exec("DELETE FROM trading_calendars")

@@ -182,7 +182,7 @@ const (
 
 // computeOrgView 机构观点数据组织纯函数（本批价值核心）。
 // reports 按 report_date 降序、surveys 按 survey_date 降序；price<=0 时不算目标价偏离。
-// 输出为 AI 快照 org_view 段（数值叶子经 snapshotValueSet 自动进核验值域，
+// 输出为 AI 快照 org_view 段（数值叶子经 snapshotLabeledValues 自动进核验值域，
 // 文本字段刻意不含小数数字）。
 func computeOrgView(reports []model.ReportRating, surveys []model.OrgSurvey, price float64, now time.Time) map[string]any {
 	if len(reports) == 0 && len(surveys) == 0 {

@@ -17,6 +17,7 @@ import {
   NSwitch,
   NModal,
   NTooltip,
+  NDropdown,
   NDatePicker,
   useMessage,
 } from 'naive-ui'
@@ -305,6 +306,26 @@ function askFromAnalysis() {
     },
   })
 }
+// 按最新数据提问：只带标的深链，Qa 页首问按最新行情采集新快照（不沿用分析快照）。
+function askFromAnalysisFresh() {
+  if (!current.value) return
+  router.push({
+    name: 'qa',
+    query: {
+      symbol: current.value.symbol,
+      market: current.value.market || 'cn',
+      name: current.value.target || current.value.symbol,
+    },
+  })
+}
+const askQaOptions = [
+  { label: '沿用本次分析快照', key: 'snapshot' },
+  { label: '按最新数据提问', key: 'fresh' },
+]
+function onAskQaSelect(key: string) {
+  if (key === 'fresh') askFromAnalysisFresh()
+  else askFromAnalysis()
+}
 
 // ---------- 回溯校验（M2 hindsight：当时怎么看 → 后来怎么走） ----------
 const hindsightShow = ref(false)
@@ -507,7 +528,9 @@ onMounted(async () => {
                     >与上次对比</n-button
                   >
                   <n-button v-if="canHindsight" size="tiny" quaternary @click="openHindsight()">回溯校验</n-button>
-                  <n-button v-if="canAskQa" size="tiny" quaternary @click="askFromAnalysis">继续问答</n-button>
+                  <n-dropdown v-if="canAskQa" trigger="click" :options="askQaOptions" @select="onAskQaSelect">
+                    <n-button size="tiny" quaternary>继续问答</n-button>
+                  </n-dropdown>
                   <div v-if="current.status === 'success' && current.result" class="res-rating">
                     <span
                       class="rating-badge"

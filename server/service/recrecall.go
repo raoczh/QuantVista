@@ -499,7 +499,7 @@ func summarizeRecallDist(rets []float64) RecallDist {
 // 索引序免 filesort），逐股回调 process。召回评估等轻计算消费方共用。
 func streamCNDailyBars(ctx context.Context, process func(symbol string, bars []datasource.Bar)) error {
 	rows, err := common.DB.Model(&model.DailyBar{}).
-		Select("symbol", "trade_date", "open", "high", "low", "close", "volume", "amount", "turnover_rate").
+		Select(dailyBarScanCols).
 		Where("market = ?", "cn").
 		Order("symbol, trade_date").Rows()
 	if err != nil {

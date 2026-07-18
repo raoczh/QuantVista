@@ -259,9 +259,10 @@ func RunFactorIC(ctx context.Context, market *MarketService) (*FactorICReport, e
 		icKeyIdx[i] = factorIndex[k]
 	}
 
-	// 流式读 daily_bars（与 buildFactorTable 同款读法）→ 并行按股重算横截面观测。
+	// 流式读 daily_bars（与 buildFactorTable 同款读法，列清单共用 dailyBarScanCols）
+	// → 并行按股重算横截面观测。
 	rows, err := common.DB.Model(&model.DailyBar{}).
-		Select("symbol", "trade_date", "open", "high", "low", "close", "volume", "amount", "turnover_rate").
+		Select(dailyBarScanCols).
 		Where("market = ?", "cn").
 		Order("symbol, trade_date").Rows()
 	if err != nil {

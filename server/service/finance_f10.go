@@ -177,7 +177,7 @@ func reverseSlice[T any](s []T) {
 // financeBrief 个股 AI 快照的财务段（分析/问答共用）：最新一期关键指标 + 近 8 期趋势。
 // F10 缓存缺失时按需拉一次（单请求，interactive 路径可承受）；三表科目只读缓存。
 // 无数据返回 nil（prompt 已声明缺失时如实说明）。数值经 round2 后是 JSON 数值叶子，
-// snapshotValueSet 会自动并入证据核验值域。
+// snapshotLabeledValues 会自动并入证据核验值域。
 func financeBrief(ctx context.Context, symbol string) map[string]any {
 	if common.DB == nil || !isSixDigits(symbol) {
 		return nil

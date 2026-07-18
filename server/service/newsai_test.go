@@ -152,14 +152,8 @@ func TestStrategyAdjustSentiment(t *testing.T) {
 		t.Errorf("无新闻不应动分: d4=%v d3=%v", d4, d3)
 	}
 	// 情绪分进证据核验值域。
-	vals := candidateValueSet(pos)
-	hit := false
-	for _, v := range vals {
-		if v == 0.72 {
-			hit = true
-		}
-	}
-	if !hit {
+	vals := candidateLabeledValues(pos)
+	if !labeledHas(vals, 0.72) {
 		t.Errorf("senti_score 未进核验值域")
 	}
 }
