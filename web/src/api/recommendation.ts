@@ -127,6 +127,7 @@ export interface RecDetail {
   quant_rank?: number
   pool_size?: number
   lot_cost?: number
+  quote_as_of?: string // 该条推荐所依据行情的数据源时刻（行情时效硬门核验，服务端回填）
   evidence_check?: EvidenceCheck
   sys_confidence?: 'high' | 'medium' | 'low'
   sys_confidence_why?: string

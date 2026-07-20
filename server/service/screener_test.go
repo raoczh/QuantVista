@@ -571,7 +571,11 @@ func TestStrategySignalHits(t *testing.T) {
 		t.Fatalf("无数据应返回 nil, got %d", len(hits))
 	}
 	// 有数据：leader → bull-align-trend 命中上升趋势股。
-	seedWideStock(t, "600100", "甲股", genTrendBars(80, 10, 0.4))
+	// 宽表水位 fail-closed 后（LagOpenDays<0 拒供推荐池），seed 数据末根日期须钉进
+	// 日历成为期望交易日，否则「时效无法判定」被正确拒绝。
+	trendBars := genTrendBars(80, 10, 0.4)
+	seedWideStock(t, "600100", "甲股", trendBars)
+	pinCalendarTo(t, trendBars[len(trendBars)-1].TradeDate)
 	resetFreshCacheOnly()
 	hits := strategySignalHits(context.Background(), model.RecTypeLongTerm, "leader", 10)
 	if len(hits) != 1 || hits[0].Symbol != "600100" {

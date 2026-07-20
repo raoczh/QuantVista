@@ -225,6 +225,7 @@ func TestMin5CountForDays(t *testing.T) {
 func TestSyncIntradayFactorsE2E(t *testing.T) {
 	setupTestDB(t)
 	cleanIntradayTables(t)
+	pinCalendarTo(t, "2026-07-08") // 水位 fail-closed：seed 日期须与日历期望齐平（intradaySignalsFor）
 	// 宇宙 3 只：000001/600519 正常，300750 上游无数据（ErrNoData 静默跳过）。
 	for _, sym := range []string{"000001", "600519", "300750"} {
 		common.DB.Create(&model.MarketSyncState{Symbol: sym, Market: "cn", InitStatus: "done"})

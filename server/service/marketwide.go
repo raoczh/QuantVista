@@ -647,6 +647,11 @@ type MarketWideStatusView struct {
 	InitRunning bool               `json:"init_running"`
 	LastSync    *model.DataSyncLog `json:"last_sync"`
 	LastInit    *model.DataSyncLog `json:"last_init"`
+
+	// P1 数据水位（对照交易日历，非库内自身 MAX）。
+	ObservedDate string `json:"observed_date"` // 库内最新交易日（states/daily_bars MAX）
+	ExpectedDate string `json:"expected_date"` // 按交易日历应有的最新交易日
+	LagOpenDays  int    `json:"lag_open_days"` // 落后开市日数（0=齐平，-1=日历不可用）
 }
 
 // MarketWideStatus 聚合宇宙字典状态与最近任务日志。
@@ -687,5 +692,10 @@ func (s *MarketService) MarketWideStatus() (*MarketWideStatusView, error) {
 	}
 	v.LastSync = lastLog("sync_market_wide")
 	v.LastInit = lastLog("init_market_history")
+	if d, err := wideFreshDate(); err == nil {
+		v.ObservedDate = d
+	}
+	v.ExpectedDate = wideExpectedDate(time.Now())
+	v.LagOpenDays = openDaysBehind(v.ObservedDate, v.ExpectedDate)
 	return v, nil
 }

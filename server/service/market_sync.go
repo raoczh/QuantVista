@@ -115,6 +115,10 @@ func (s *MarketService) SyncTrackedDailyBars(ctx context.Context, market string,
 
 // BackfillCalendar 回填交易日历：用上证指数日线得到开市日集合，
 // 再把区间内其余日期（周末/节假日）补为休市日（is_open=false），形成完整日历。
+// 未来覆盖：指数日线只到最近已收盘交易日，未来的开市/节假日无公开数据源可回填——
+// 仅把未来 45 天内的周六/周日预写为休市（A 股周末恒不开市，即使调休工作日），
+// 未来工作日不写行（保持「无日历按周一~五近似」的诚实退化，预写开市会把未来
+// 节假日误判为交易日、放大 stale 误报）。
 func (s *MarketService) BackfillCalendar(ctx context.Context, market string) (*model.DataSyncLog, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
@@ -158,6 +162,15 @@ func (s *MarketService) BackfillCalendar(ctx context.Context, market string) (*m
 		_, isOpen := open[ds]
 		rows = append(rows, model.TradingCalendar{Market: market, TradeDate: ds, IsOpen: isOpen})
 	}
+	// 未来周末预写休市（maxDate 之后 45 天内）：周末不开市是确定事实，预写后跨周末
+	// 的新鲜度判定（isTradingDayToday/prevOpenTradeDate）不必依赖周一~五近似；
+	// 工作日节假日无数据源，不预写（见函数头注释）。
+	weekendEnd := time.Now().AddDate(0, 0, 45)
+	for d := to.AddDate(0, 0, 1); !d.After(weekendEnd); d = d.AddDate(0, 0, 1) {
+		if wd := d.Weekday(); wd == time.Saturday || wd == time.Sunday {
+			rows = append(rows, model.TradingCalendar{Market: market, TradeDate: d.Format("2006-01-02"), IsOpen: false})
+		}
+	}
 
 	// 显式 Select 强制写入 is_open，即使历史 DB 列上仍残留 default:true 也不会漏写休市日。
 	if err := common.DB.
@@ -176,7 +189,8 @@ func (s *MarketService) BackfillCalendar(ctx context.Context, market string) (*m
 	log.Total = len(rows)
 	log.Succeeded = len(days) // 开市日数
 	log.Status = "success"
-	log.Message = truncate(minDate+" ~ "+maxDate+" 共 "+strconv.Itoa(len(rows))+" 天（开市 "+strconv.Itoa(len(days))+"）", 512)
+	futureWeekends := len(rows) - int(to.Sub(from).Hours()/24) - 1
+	log.Message = truncate(minDate+" ~ "+maxDate+" 共 "+strconv.Itoa(len(rows)-futureWeekends)+" 天（开市 "+strconv.Itoa(len(days))+"）；另预写未来周末休市 "+strconv.Itoa(futureWeekends)+" 天（工作日节假日无数据源，跨长假仍按周一~五近似）", 512)
 	log.DurationMs = time.Since(start).Milliseconds()
 	s.recordSyncLog(log)
 	return log, nil
@@ -314,40 +328,40 @@ func StartMarketJobs(mgr *datasource.Manager) {
 		}
 	}()
 
-	// 已跟踪股票日线批量同步：每 6 小时一次。
+	// 已跟踪股票日线批量同步：启动 5 分钟后先跑一次，之后每 6 小时一次。
+	// 首跑不等 6 小时——频繁部署/重启的进程可能永远等不到第一轮 ticker，
+	// 已跟踪标的的日线会长期停更（5 分钟缓冲避开启动期抢资源）。
 	// 超时预算：800 只 × (300ms 节流 + 抓取) 最坏可到 20 分钟以上，给足 30 分钟；
 	// 即便中途取消，游标也保证下一轮从断点续跑。
 	go func() {
-		t := time.NewTicker(6 * time.Hour)
-		defer t.Stop()
-		for range t.C {
+		runSync := func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			defer cancel()
 			if log, err := svc.SyncTrackedDailyBars(ctx, market, 120); err != nil {
 				common.SysWarn("批量同步日线失败: %v", err)
 			} else if log.Total > 0 {
 				common.SysLog("批量同步日线完成: 共 %d 成功 %d 失败 %d", log.Total, log.Succeeded, log.Failed)
 			}
-			cancel()
+		}
+		time.Sleep(5 * time.Minute)
+		runSync()
+		t := time.NewTicker(6 * time.Hour)
+		defer t.Stop()
+		for range t.C {
+			runSync()
 		}
 	}()
 
 	// M1 全市场日线：每日 16:10（交易日）clist 增量落当日 bar + 除权初筛；
 	// 增量后若宇宙内仍有 pending（首轮部署/新股/重锚失败回退），自动推进历史初始化
 	//（异步、防重入、断点续传）。16:10 避开收盘竞价尾流，且与 19:05 finance job 错峰。
+	// 启动补跑：进程在 16:10 后启动（当日部署/重启）会睡到次日 16:10、当天增量被
+	// 静默错过——启动时若「交易日且已过 16:10 且今日无成功增量记录」先补跑一次。
 	go func() {
 		if common.DB == nil {
 			return
 		}
-		for {
-			now := time.Now()
-			next := time.Date(now.Year(), now.Month(), now.Day(), 16, 10, 0, 0, now.Location())
-			if !next.After(now) {
-				next = next.AddDate(0, 0, 1)
-			}
-			time.Sleep(next.Sub(now))
-			if !isTradingDayToday(time.Now()) {
-				continue
-			}
+		runWide := func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			if log, err := svc.SyncMarketWide(ctx); err != nil && !errors.Is(err, ErrSyncInProgress) {
 				common.SysWarn("全市场日线增量失败: %v", err)
@@ -363,6 +377,28 @@ func StartMarketJobs(mgr *datasource.Manager) {
 					common.SysLog("宇宙内尚有 %d 只待建史，已自动启动历史初始化", pending)
 				}
 			}
+		}
+		if now := time.Now(); isTradingDayToday(now) && now.Hour()*60+now.Minute() >= 16*60+10 {
+			var n int64
+			common.DB.Model(&model.DataSyncLog{}).
+				Where("task = ? AND status <> ? AND created_at >= ?", "sync_market_wide", "failed",
+					now.Format("2006-01-02")+" 00:00:00").Count(&n)
+			if n == 0 {
+				common.SysLog("启动补跑：今日 16:10 全市场日线增量未执行，现在补跑")
+				runWide()
+			}
+		}
+		for {
+			now := time.Now()
+			next := time.Date(now.Year(), now.Month(), now.Day(), 16, 10, 0, 0, now.Location())
+			if !next.After(now) {
+				next = next.AddDate(0, 0, 1)
+			}
+			time.Sleep(next.Sub(now))
+			if !isTradingDayToday(time.Now()) {
+				continue
+			}
+			runWide()
 		}
 	}()
 }

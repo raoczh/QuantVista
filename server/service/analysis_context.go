@@ -106,6 +106,9 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 		"market_state":     fresh.MarketState,
 		"freshness_status": fresh.Status,
 	}
+	if fresh.ExpectedDate != "" {
+		snap["expected_as_of"] = fresh.ExpectedDate
+	}
 	if !q.DataTime.IsZero() {
 		snap["quote_as_of"] = q.DataTime.In(time.Local).Format("2006-01-02 15:04:05")
 	}
@@ -120,7 +123,8 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 
 	// 估值/盘面扩展（腾讯免费源 best-effort：拿不到不阻断，提示词已要求缺失时如实说明）。
 	// ETF/场内基金无个股估值指标（PE/PB/市值来自个股口径，喂给基金全 0 是噪声），
-	// 直接标注资产类型并以说明替代估值段。
+	// 直接标注资产类型并以说明替代估值段。估值随附 source_data_time（采集与源数据
+	// 时间不得混用），过期时带 valuation_stale 标注（换手/量比/振幅为旧口径）。
 	var valuation *datasource.Valuation
 	if isCNFund(symbol) {
 		snap["asset_type"] = "etf"
@@ -141,6 +145,12 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 		}
 		if v.IsST {
 			val["is_st"] = true
+		}
+		if !v.DataTime.IsZero() {
+			val["source_data_time"] = v.DataTime.In(time.Local).Format("2006-01-02 15:04")
+		}
+		if market.QuoteFreshnessOf(mkt, v.DataTime).Status != freshStatusFresh {
+			val["valuation_stale"] = "估值/盘面快照非当前有效口径（换手率/量比/振幅为截至 source_data_time 的旧值），引用须声明时点"
 		}
 		snap["valuation"] = val
 	}
@@ -310,6 +320,10 @@ func (s *AnalysisService) buildMarketContext(ctx context.Context, market string)
 		"gainers":   compactRanks(ov.Gainers, 6),
 		"actives":   compactRanks(ov.Actives, 6),
 		"sectors":   compactSectors(ov.Sectors, 10),
+		// 聚合块时间语义（P0-5 透明化）：指数/涨跌家数/资金流为聚合接口采集口径，
+		// 各块时间为「采集于」而非上游业务时间——非交易时段为最近有效收盘口径。
+		"captured_at":   time.Now().In(time.Local).Format("2006-01-02 15:04:05"),
+		"captured_note": "indices/breadth/fund_flow 为采集时刻口径（captured_at），非逐块上游业务时间；非交易时段为最近交易日收盘口径，表述时不得称实时",
 	}
 	// M3a 情绪温度计：涨停池盘后聚合（连板高度分布/炸板率/昨涨停溢价）。
 	// 库中无数据（首日部署/采集失败）自然缺席，guidance 已声明按缺失处理。
@@ -339,6 +353,9 @@ func (s *AnalysisService) buildSectorContext(ctx context.Context, market, target
 		"sectors": compactSectors(ov.Sectors, 20),
 		"indices": compactIndices(ov.Indices),
 		"breadth": ov.Breadth,
+		// 同市场模块：聚合块为采集时刻口径（详见 captured_note）。
+		"captured_at":   time.Now().In(time.Local).Format("2006-01-02 15:04:05"),
+		"captured_note": "sectors/indices/breadth 为采集时刻口径（captured_at），非逐块上游业务时间；非交易时段为最近交易日收盘口径，表述时不得称实时",
 	}
 	// P3b：focus 名精确匹配到行业板块（估值聚合表 board_name）时注入两段板块级数据。
 	// 概念板块/未匹配自然缺席，guidance 已声明按缺失处理；数值叶子经 snapshotLabeledValues
@@ -369,6 +386,7 @@ func (s *AnalysisService) buildWatchlistContext(ctx context.Context, userID int6
 		return nil, err
 	}
 	items := make([]map[string]any, 0, 40)
+	staleCount := 0
 outer:
 	for _, g := range groups {
 		for _, it := range g.Items {
@@ -382,9 +400,21 @@ outer:
 				"market":    it.Market,
 				"is_pinned": it.IsPinned,
 			}
+			// 逐项行情时效（P0-5）：fresh 才给现价/涨跌；stale/unknown 的旧价不进
+			// 「当前组合怎么看」的证据（fail-closed），改为最近已知价+截至时刻标注。
 			if it.QuoteOK {
-				row["price"] = round2(it.Price)
-				row["change_pct"] = round2(it.ChangePct)
+				row["freshness_status"] = orStr(it.FreshnessStatus, freshStatusUnknown)
+				if !it.DataTime.IsZero() {
+					row["quote_as_of"] = it.DataTime.In(time.Local).Format("2006-01-02 15:04")
+				}
+				if it.FreshnessStatus == freshStatusFresh {
+					row["price"] = round2(it.Price)
+					row["change_pct"] = round2(it.ChangePct)
+				} else {
+					staleCount++
+					row["last_known_price"] = round2(it.Price)
+					row["quote_note"] = "行情已过期或时效无法核验：现价与当日涨跌未知，last_known_price 仅为最近已知价，不得当作当前价格参与结论"
+				}
 			}
 			if it.FocusReason != "" {
 				row["focus_reason"] = it.FocusReason
@@ -402,6 +432,10 @@ outer:
 		return nil, errors.New("自选股为空，请先添加自选后再分析")
 	}
 	snap := map[string]any{"count": len(items), "items": items}
+	if staleCount > 0 {
+		snap["quote_stale_count"] = staleCount
+		snap["freshness_note"] = fmt.Sprintf("注意：%d 只自选的行情已过期或时效无法核验（见各行 quote_note），对这些标的不得给出基于「当前价格」的结论，整体判断须声明覆盖不完整", staleCount)
+	}
 	return &analysisContext{Label: "自选股", Snapshot: fitBudget(snap)}, nil
 }
 
@@ -417,7 +451,8 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 	}
 	rows := make([]map[string]any, 0, len(views))
 	var totalCost, totalMV, totalPnL float64
-	quoteFailed := 0 // 行情拉取失败、未计入市值/盈亏的持仓数（部分估值透明化）
+	quoteFailed := 0 // 行情失败/过期、未计入市值/盈亏的持仓数（部分估值透明化）
+	quoteStale := 0  // 其中「取到但已过期」的仓数（fail-closed：旧价不参与当前汇总）
 	for _, v := range views {
 		row := map[string]any{
 			"name":      v.Name,
@@ -429,13 +464,30 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 			"quantity":  round2(v.Quantity),
 			"cost":      round2(v.Cost),
 		}
+		// 逐仓行情时效元数据（字符串值不进数值核验值域）：AI 必须能区分
+		// 「当前有效行情」与「最近已知的过期行情」。
+		if v.Status == model.PositionStatusHolding && v.FreshnessStatus != "" {
+			row["freshness_status"] = v.FreshnessStatus
+			if v.QuoteAsOf != "" {
+				row["quote_as_of"] = v.QuoteAsOf
+			}
+		}
 		if v.QuoteOK {
 			row["current_price"] = round2(v.CurrentPrice)
 			row["profit_amount"] = round2(v.ProfitAmount)
 			row["profit_pct"] = round2(v.ProfitPct)
 		} else if v.Status == model.PositionStatusHolding {
 			quoteFailed++
-			row["quote_note"] = "当前行情获取失败（可能停牌/数据源故障），现价与盈亏未知"
+			if v.LastPrice > 0 {
+				quoteStale++
+				row["last_known_price"] = round2(v.LastPrice)
+				row["quote_note"] = "行情已过期（数据失效，非当前盘面）：现价与盈亏未知，last_known_price 仅为最近已知价，禁止据此计算当前盈亏或给出割/守/补结论"
+				if v.StaleReason != "" {
+					row["stale_reason"] = v.StaleReason
+				}
+			} else {
+				row["quote_note"] = "当前行情获取失败（可能停牌/数据源故障），现价与盈亏未知"
+			}
 		}
 		if v.BuyReason != "" {
 			row["buy_reason"] = v.BuyReason
@@ -464,13 +516,19 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 		},
 		"positions": rows,
 	}
-	// 部分估值透明化：行情失败的仓位被排除在汇总之外——组合并非完整定价时必须告知
-	// 模型，禁止其对现价未知的仓位强行给出割/守/补结论（禁骑墙纪律只约束有行情的仓）。
+	// 部分估值透明化：行情失败/过期的仓位被排除在汇总之外——组合并非完整定价时必须
+	// 告知模型，禁止其对现价未知的仓位强行给出割/守/补结论（禁骑墙纪律只约束有当前
+	// 有效行情的仓）。过期仓单独说明（不是「拉不到」而是「拿到的是旧数据」）。
 	if quoteFailed > 0 {
 		snap["quote_failed_count"] = quoteFailed
-		snap["valuation_note"] = fmt.Sprintf(
-			"注意：%d 笔持仓行情获取失败，holding_summary 仅覆盖已定价仓位（部分估值，非完整组合）。对行情缺失的仓位不得虚构现价，也不要强行给出割/守/补三选一，明确说明数据不足即可",
+		note := fmt.Sprintf(
+			"注意：%d 笔持仓无当前有效行情，holding_summary 仅覆盖已定价仓位（部分估值，非完整组合）。对这些仓位不得虚构现价，也不要强行给出割/守/补三选一，明确说明数据不足即可",
 			quoteFailed)
+		if quoteStale > 0 {
+			note += fmt.Sprintf("；其中 %d 笔为行情已过期（最近已知价非当前盘面，见 last_known_price 与 quote_as_of），只可作历史参考，不得当作当前价格", quoteStale)
+			snap["quote_stale_count"] = quoteStale
+		}
+		snap["valuation_note"] = note
 	}
 	// 资金上下文（S1）：用户在设置里填了总投资资金才注入——持仓占总资金的比例
 	// 决定「割/守/补」的容错空间（满仓亏损与三成仓亏损是两种处境）。

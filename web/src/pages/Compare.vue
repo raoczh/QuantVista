@@ -290,7 +290,7 @@ const aiCheck = computed(() => {
           </div>
 
           <div v-if="failed.length" class="failed">
-            未取到行情：{{ failed.map((f) => `${f.symbol}（${f.error}）`).join('、') }}
+            未参与对比：{{ failed.map((f) => `${f.symbol}（${f.error || '行情暂不可用'}）`).join('、') }}
           </div>
 
           <div v-if="result.ai_comment" class="ai">

@@ -225,6 +225,13 @@ func (mc *MarketController) DataSources(c *gin.Context) {
 	common.ApiSuccess(c, gin.H{"health": mc.svc.DataSourceHealth()})
 }
 
+// DataHealth GET /api/admin/data-health —— P1 数据健康总览：各数据域的
+// expected/observed 日期、落后开市日数、覆盖率与最近任务日志（对账入口，
+// 补跑走既有 wide-sync/wide-init/sync-bars/snapshot/factor-rebuild 接口）。
+func (mc *MarketController) DataHealth(c *gin.Context) {
+	common.ApiSuccess(c, service.BuildDataHealthReport())
+}
+
 // --- 管理员：全市场日线（M1） ---
 
 // WideSync POST /api/admin/market/wide-sync

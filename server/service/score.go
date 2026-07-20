@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"time"
 
@@ -240,20 +241,35 @@ type ScoreView struct {
 	Price  float64 `json:"price"`
 	Date   string  `json:"trade_date"`
 	ScoreResult
+
+	QuoteAsOf       string `json:"quote_as_of,omitempty"`      // 行情数据源时刻
+	FreshnessStatus string `json:"freshness_status,omitempty"` // fresh | unknown（stale 不出评分）
 }
 
 // Score 计算某只个股当日评分并落库快照。
+// fail-closed：走 GetFreshQuote，行情非 fresh（停牌/数据源停滞/过期）时拒绝出分——
+// 评分含现价位置维且按 trade_date 永久落库，旧价评分会以「当日评分」之名冻结失真值。
 func (s *ScoreService) Score(ctx context.Context, market, symbol string) (*ScoreView, error) {
 	symbol, market, err := normalizeSymbolMarket(symbol, market)
 	if err != nil {
 		return nil, err
 	}
-	q, err := s.market.GetQuote(ctx, market, symbol)
-	if err != nil {
+	q, fi, err := s.market.GetFreshQuote(ctx, market, symbol)
+	if err != nil || q == nil || q.Price <= 0 {
 		if errors.Is(err, datasource.ErrSymbolInvalid) {
 			return nil, errors.New("无法识别的股票代码")
 		}
 		return nil, errors.New("行情数据暂不可用")
+	}
+	if fi.Status != freshStatusFresh {
+		if fi.Status == freshStatusUnknown {
+			return nil, errors.New("该市场无交易日历，无法核验行情时效；为避免用无法确认时效的价格计算并落库当日评分，本次不出分")
+		}
+		asOf := "未知时间"
+		if !q.DataTime.IsZero() {
+			asOf = q.DataTime.In(time.Local).Format("2006-01-02 15:04")
+		}
+		return nil, fmt.Errorf("行情已过期（仅更新至 %s，可能停牌或数据源故障），为避免用旧价计算并落库当日评分，本次不出分", asOf)
 	}
 	bars, _ := s.market.GetDailyBars(ctx, market, symbol, scoreBarLimit)
 	res := computeScore(q.Price, bars)
@@ -268,6 +284,10 @@ func (s *ScoreService) Score(ctx context.Context, market, symbol string) (*Score
 	view := &ScoreView{
 		Symbol: symbol, Market: market, Name: q.Name, Price: round2(q.Price),
 		Date: q.DataTime.In(time.Local).Format("2006-01-02"), ScoreResult: res,
+		FreshnessStatus: fi.Status,
+	}
+	if !q.DataTime.IsZero() {
+		view.QuoteAsOf = q.DataTime.In(time.Local).Format("2006-01-02 15:04")
 	}
 	s.persist(view)
 	return view, nil

@@ -402,8 +402,14 @@ func stockDailySentiment(symbol, date string) (float64, int, bool) {
 		sentiAggMu.Unlock()
 
 		score, count, detail := computeDailySentiment(symbol, date)
-		row = model.StockSentiment{Symbol: symbol, Date: date, Score: score, NewsCount: count, DetailJSON: detail}
-		common.DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&row)
+		// P1 水位修复：仅在算到新闻（count>0）时才落缓存行——早晨新闻尚未采集时算出的
+		// 「0 条」若落库，(symbol,date) 幂等会把「无新闻」冻结成全天结论，之后采集到的
+		// 新闻永远进不了当日情绪。空结果不落库、每次现算（轻查询），新闻到位自然生效；
+		// 非空结果照旧当日冻结（批次内证据可复现纪律不变）。
+		if count > 0 {
+			row = model.StockSentiment{Symbol: symbol, Date: date, Score: score, NewsCount: count, DetailJSON: detail}
+			common.DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&row)
+		}
 
 		sentiAggMu.Lock()
 		delete(sentiAggInflight, key)

@@ -27,21 +27,31 @@ var validPositionType = map[string]bool{
 }
 
 // PositionView 持仓 + 实时盈亏（成本含买入费税；已平仓用卖出价，持仓中用现价）。
+// 行情时效契约（fail-closed）：QuoteOK 仅在取到 **fresh** 行情时为 true——盈亏、
+// 现价、止损状态只建立在当前有效行情上；stale/取不到时不计算（QuoteOK=false），
+// 最近已知价放 LastPrice 供展示（须随 QuoteAsOf/StaleReason 标注，不冒充实时）。
 type PositionView struct {
 	model.Position
-	CurrentPrice float64 `json:"current_price"` // 持仓中的现价（已平仓为卖出价）
-	QuoteOK      bool    `json:"quote_ok"`      // 现价是否取到
+	CurrentPrice float64 `json:"current_price"` // 持仓中的现价（已平仓为卖出价）；仅 fresh 时有值
+	QuoteOK      bool    `json:"quote_ok"`      // 是否取到当前有效（fresh）行情
 	Cost         float64 `json:"cost"`          // 买入总成本 = 买入价*数量 + 买入费 + 买入税
 	MarketValue  float64 `json:"market_value"`  // 现值
 	ProfitAmount float64 `json:"profit_amount"` // 盈亏额（已扣相关费税）
 	ProfitPct    float64 `json:"profit_pct"`    // 收益率 %
 	Realized     bool    `json:"realized"`      // 是否已实现（已平仓）
+	DayChangePct float64 `json:"day_change_pct"` // 当日涨跌幅 %（仅 fresh 时有值）
+
+	// 行情新鲜度（fail-closed 契约块）：
+	QuoteAsOf       string  `json:"quote_as_of,omitempty"`      // 行情数据源时刻（最近已知，含 stale）
+	FreshnessStatus string  `json:"freshness_status,omitempty"` // fresh | stale | unknown（持仓中才有）
+	StaleReason     string  `json:"stale_reason,omitempty"`     // 非 fresh 的原因说明
+	LastPrice       float64 `json:"last_price,omitempty"`       // 最近已知价（stale/unknown 展示用，不参与盈亏）
 
 	HeldTradeDays   int  `json:"held_trade_days"`   // 已持有交易日（按交易日历；持仓中且有买入日期时计算）
 	ShortTermReview bool `json:"short_term_review"` // 短线持仓持有超阈值，建议复盘
 
-	NearStopLoss   bool       `json:"near_stop_loss"`   // 现价距计划止损 ≤3%（未破）
-	BelowStopLoss  bool       `json:"below_stop_loss"`  // 现价已跌破计划止损
+	NearStopLoss   bool       `json:"near_stop_loss"`   // 现价距计划止损 ≤3%（未破）；仅 fresh 时判定
+	BelowStopLoss  bool       `json:"below_stop_loss"`  // 现价已跌破计划止损；仅 fresh 时判定
 	LastAnalyzedAt *time.Time `json:"last_analyzed_at"` // 该标的最近一次个股 AI 分析时间
 	AnalysisStale  bool       `json:"analysis_stale"`   // 持仓中从未分析或距上次分析超过 7 天
 }
@@ -97,7 +107,9 @@ func (s *PositionService) List(ctx context.Context, userID int64, status string)
 		return nil, err
 	}
 
-	// 仅持仓中的需要现价。
+	// 仅持仓中的需要现价。行情时效 fail-closed：走 FreshQuotesFor（全源换源找当前
+	// 有效行情），旧价不再被当作「取到现价」——盈亏/止损状态建立在 stale 价上会产生
+	// 「请立即复核」类误导结论。
 	refs := make([]QuoteRef, 0, len(positions))
 	seen := map[string]bool{}
 	for _, p := range positions {
@@ -110,7 +122,7 @@ func (s *PositionService) List(ctx context.Context, userID int64, status string)
 			refs = append(refs, QuoteRef{Market: p.Market, Symbol: p.Symbol})
 		}
 	}
-	quotes := s.market.QuotesFor(ctx, refs)
+	quotes := s.market.FreshQuotesFor(ctx, refs)
 
 	// 最近一次个股 AI 分析时间（一次分组查询，供「持仓过久未分析」提示）。
 	lastAnalyzed := lastStockAnalysisFor(userID, positions)
@@ -119,10 +131,39 @@ func (s *PositionService) List(ctx context.Context, userID int64, status string)
 	now := time.Now()
 	for _, p := range positions {
 		price, ok := 0.0, false
-		if q := quotes[QuoteKey(p.Market, p.Symbol)]; q != nil {
-			price, ok = q.Price, true
+		var fq FreshQuoteResult
+		var hasQuote bool
+		if fq, hasQuote = quotes[QuoteKey(p.Market, p.Symbol)]; hasQuote && fq.Quote != nil && fq.Quote.Price > 0 {
+			// 仅 fresh 视为「取到现价」；stale/unknown 一律 fail-closed 不参与盈亏与止损判定。
+			if fq.Fresh.Status == freshStatusFresh {
+				price, ok = fq.Quote.Price, true
+			}
 		}
 		v := computeView(p, price, ok)
+		// 新鲜度契约块（仅持仓中）：QuoteAsOf/FreshnessStatus/StaleReason 无论 fresh
+		// 与否都填，前端与 AI 快照据此展示「截至时间/过期原因」；stale 的最近已知价
+		// 放 LastPrice（仅展示，不冒充现价）。
+		if p.Status == model.PositionStatusHolding {
+			if hasQuote && fq.Quote != nil {
+				v.FreshnessStatus = fq.Fresh.Status
+				if !fq.Quote.DataTime.IsZero() {
+					v.QuoteAsOf = fq.Quote.DataTime.In(time.Local).Format("2006-01-02 15:04")
+				}
+				if ok {
+					v.DayChangePct = round2(fq.Quote.ChangePct)
+				} else if fq.Quote.Price > 0 {
+					v.LastPrice = round2(fq.Quote.Price)
+					if note, _ := stockFreshnessNote(fq.Fresh, fq.Quote.DataTime); note != "" {
+						v.StaleReason = note
+					} else if fq.Fresh.Status == freshStatusUnknown {
+						v.StaleReason = "该市场无交易日历，无法核验行情时效（数据可能滞后）"
+					}
+				}
+			} else {
+				v.FreshnessStatus = freshStatusStale
+				v.StaleReason = "行情获取失败（可能停牌/数据源故障），现价未知"
+			}
+		}
 		// 短线状态提示：持仓中且有买入日期时，按交易日历算已持有交易日，
 		// 短线持有超阈值给出复盘提示（阶段6：持仓页短线状态提示）。
 		if p.Status == model.PositionStatusHolding && p.BuyDate != "" {
@@ -207,6 +248,7 @@ type PortfolioOverview struct {
 	TopWeightPct   float64 `json:"top_weight_pct"` // 最大单一持仓占比 %
 
 	QuoteFailedCount int `json:"quote_failed_count"` // 行情拉取失败、未计入市值/收益的持仓数（前端可提示口径）
+	QuoteStaleCount  int `json:"quote_stale_count"`  // 行情已过期（取到但非当前有效）、未计入市值/收益的持仓数
 
 	Signals []string `json:"signals"` // 风控信号（集中度/止损/未分析）
 }
@@ -250,7 +292,13 @@ func (s *PositionService) Overview(ctx context.Context, userID int64) (*Portfoli
 			valueBySymbol[v.Symbol] += v.MarketValue
 			nameBySymbol[v.Symbol] = v.Name
 		} else {
-			ov.QuoteFailedCount++
+			// fail-closed：非 fresh（stale/unknown/拉取失败）一律不计入市值与收益。
+			// 有最近已知价的记「过期」，完全取不到的记「失败」，前端分别提示口径。
+			if v.LastPrice > 0 {
+				ov.QuoteStaleCount++
+			} else {
+				ov.QuoteFailedCount++
+			}
 		}
 		if v.BelowStopLoss {
 			belowStop++
@@ -297,6 +345,12 @@ func (s *PositionService) Overview(ctx context.Context, userID int64) (*Portfoli
 	}
 	if stale > 0 {
 		ov.Signals = append(ov.Signals, fmt.Sprintf("%d 笔持仓超过 %d 天未做个股分析", stale, analysisStaleDays))
+	}
+	if ov.QuoteStaleCount > 0 {
+		ov.Signals = append(ov.Signals, fmt.Sprintf("%d 笔持仓行情已过期（非当前有效数据），市值与盈亏未计入汇总", ov.QuoteStaleCount))
+	}
+	if ov.QuoteFailedCount > 0 {
+		ov.Signals = append(ov.Signals, fmt.Sprintf("%d 笔持仓行情获取失败，市值与盈亏未计入汇总", ov.QuoteFailedCount))
 	}
 	return ov, nil
 }

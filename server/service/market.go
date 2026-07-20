@@ -133,16 +133,27 @@ func (s *MarketService) GetFreshQuote(ctx context.Context, market, symbol string
 
 // QuoteFreshnessOf 对一条已取得的行情按当前时刻做时效判定——提醒/守护/模拟成交/追踪/
 // 推荐等「旧价会造成误动作」的消费链路共用此入口（统一新鲜度判定，别再各自比对日期）。
-// cn 按交易日历+交易时段判定；其余市场无日历，返回 unknown（调用方按现状放行）。
+// cn 按交易日历+交易时段判定；其余市场无日历，返回 unknown（调用方 fail-closed 处理）。
 func (s *MarketService) QuoteFreshnessOf(market string, dataTime time.Time) quoteFreshInfo {
+	return s.FreshnessJudge(market)(dataTime)
+}
+
+// FreshnessJudge 返回某市场的批量时效判定函数：日历/时段只查一次，逐条判定为纯计算
+// ——列表富化（自选/ETF/持仓等展示行统一过期徽标）对每行打 freshness_status 用它，
+// 避免每行重复查交易日历。
+func (s *MarketService) FreshnessJudge(market string) func(dataTime time.Time) quoteFreshInfo {
 	if market != "cn" {
-		return quoteFreshInfo{Status: freshStatusUnknown, MarketState: marketStateClosed}
+		return func(time.Time) quoteFreshInfo {
+			return quoteFreshInfo{Status: freshStatusUnknown, MarketState: marketStateClosed}
+		}
 	}
 	now := time.Now().In(time.Local)
 	isTrading := isTradingDayToday(now)
 	state := cnMarketState(now, isTrading)
 	expected := expectedQuoteDate(now, isTrading, prevOpenTradeDate(now.Format("2006-01-02")))
-	return quoteFreshness(dataTime, now, state, expected)
+	return func(dataTime time.Time) quoteFreshInfo {
+		return quoteFreshness(dataTime, now, state, expected)
+	}
 }
 
 // FreshQuoteResult 批量新鲜行情的单只结果（Quote 可为 nil=拉取失败）。

@@ -51,13 +51,16 @@ type TodoItem struct {
 	Time     *time.Time `json:"time"`
 }
 
-// TodoResult 聚合结果 + 分类计数。
+// TodoResult 聚合结果 + 分类计数。Complete=false 表示至少一个数据块读取失败，
+// 清单可能不完整——前端不得据此显示「一切都在轨道上」，须提示状态不明。
 type TodoResult struct {
-	Date    string     `json:"date"`
-	Total   int        `json:"total"`
-	Alerts  int        `json:"alerts"`
-	Reviews int        `json:"reviews"` // 推荐复盘 + 持仓复盘
-	Items   []TodoItem `json:"items"`
+	Date     string     `json:"date"`
+	Total    int        `json:"total"`
+	Alerts   int        `json:"alerts"`
+	Reviews  int        `json:"reviews"` // 推荐复盘 + 持仓复盘
+	Items    []TodoItem `json:"items"`
+	Complete bool       `json:"complete"`         // 全部数据块读取成功才为 true
+	Errors   []string   `json:"errors,omitempty"` // 读取失败的数据块说明（清单不完整的原因）
 }
 
 var recReviewTitle = map[string]string{
@@ -66,11 +69,19 @@ var recReviewTitle = map[string]string{
 	model.RecOutcomeExpired:    "短线推荐已过有效期，需复盘",
 }
 
-// Build 聚合某用户当前的待办清单。
+// Build 聚合某用户当前的待办清单。任何数据块读取失败都会登记进 Errors 并置
+// Complete=false（fail-closed：不能吞错后返回空清单，让前端把「读不到止损信号」
+// 显示成「一切都在轨道上」）。
 func (s *TodoService) Build(ctx context.Context, userID int64) (*TodoResult, error) {
 	res := &TodoResult{
-		Date:  time.Now().In(time.Local).Format("2006-01-02"),
-		Items: []TodoItem{},
+		Date:     time.Now().In(time.Local).Format("2006-01-02"),
+		Items:    []TodoItem{},
+		Complete: true,
+	}
+	fail := func(block string, err error) {
+		res.Complete = false
+		res.Errors = append(res.Errors, block+"读取失败，相关待办可能缺失")
+		common.SysWarn("待办聚合读取%s失败 user=%d: %v", block, userID, err)
 	}
 
 	// 1) 未读的提醒命中事件（alert_events 状态机，标记已读/忽略即完成待办）。
@@ -86,7 +97,7 @@ func (s *TodoService) Build(ctx context.Context, userID int64) (*TodoResult, err
 			res.Alerts++
 		}
 	} else {
-		common.SysWarn("待办聚合读取提醒命中失败 user=%d: %v", userID, err)
+		fail("提醒命中", err)
 	}
 
 	// 2) 需复盘的短线推荐（阶段6 追踪：触发止盈/止损/过期；已读的不再进清单）。
@@ -113,12 +124,16 @@ func (s *TodoService) Build(ctx context.Context, userID int64) (*TodoResult, err
 			res.Reviews++
 		}
 	} else {
-		common.SysWarn("待办聚合读取推荐复盘失败 user=%d: %v", userID, err)
+		fail("推荐复盘", err)
 	}
 
 	// 3) 需复盘的持仓（短线超阈值 / 长线持有较久）+ 止损计划风控（最高优先级）。
 	if views, err := s.position.List(ctx, userID, model.PositionStatusHolding); err == nil {
+		unknownStop := 0 // 行情非 fresh、止损状态无法判定的仓数（fail-closed：状态不明必须显式提示）
 		for _, v := range views {
+			if !v.QuoteOK && v.PlanStopLoss > 0 {
+				unknownStop++
+			}
 			// 止损信号独立于复盘信号：破止损/近止损是当下要处理的风险。
 			switch {
 			case v.BelowStopLoss:
@@ -161,9 +176,15 @@ func (s *TodoService) Build(ctx context.Context, userID int64) (*TodoResult, err
 				res.Reviews++
 			}
 		}
+		// 止损待办的判定依赖当前有效行情：行情过期/失败的仓无法判「破/近止损」，
+		// 状态不明必须显式提示，不能静默当作「一切正常」。
+		if unknownStop > 0 {
+			res.Complete = false
+			res.Errors = append(res.Errors, fmt.Sprintf("%d 笔设有止损计划的持仓无当前有效行情，止损状态未知（非「未触发」）", unknownStop))
+		}
 	} else {
 		// 止损信号来源于此块，读取失败必须留痕（静默吞错会让「破止损」待办凭空消失）。
-		common.SysWarn("待办聚合读取持仓失败 user=%d: %v", userID, err)
+		fail("持仓", err)
 	}
 
 	// 4) 到期待复盘的投资逻辑卡。
@@ -180,7 +201,7 @@ func (s *TodoService) Build(ctx context.Context, userID int64) (*TodoResult, err
 				res.Reviews++
 			}
 		} else {
-			common.SysWarn("待办聚合读取逻辑卡失败 user=%d: %v", userID, err)
+			fail("逻辑卡", err)
 		}
 	}
 

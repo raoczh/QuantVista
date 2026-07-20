@@ -20,6 +20,7 @@ import {
   NDropdown,
   NDatePicker,
   useMessage,
+  useDialog,
 } from 'naive-ui'
 import {
   createAnalysis,
@@ -46,6 +47,7 @@ import TrustBadges from '@/components/TrustBadges.vue'
 import type { RiskFlag } from '@/api/trust'
 
 const message = useMessage()
+const dialog = useDialog()
 const route = useRoute()
 const router = useRouter()
 const { upColor, downColor, flatColor, vars, withAlpha, pctColor } = useUi()
@@ -122,7 +124,7 @@ async function loadLLM() {
 const running = ref(false)
 const current = ref<AnalysisView | null>(null)
 
-async function runAnalysis() {
+async function runAnalysis(allowStale = false) {
   if (form.value.module === 'stock' && !form.value.symbol?.trim()) {
     message.warning('请输入股票代码')
     return
@@ -140,6 +142,7 @@ async function runAnalysis() {
     if (form.value.module === 'stock' && panelMode.value && !asOfStr.value) payload.mode = 'panel'
     else if (verifyMode.value) payload.verify = true // 复核仅对标准模式生效（panel 无标准结论字段）
     if (form.value.module === 'stock' && !payload.mode && asOfStr.value) payload.as_of = asOfStr.value
+    if (allowStale) payload.allow_stale = true // 用户已确认：行情过期，按截至时刻的历史数据解释
     const view = await createAnalysis(payload)
     current.value = view
     diff.value = null
@@ -149,7 +152,22 @@ async function runAnalysis() {
       message.success('分析完成')
     }
   } catch (e) {
-    message.error((e as Error).message)
+    const msg = (e as Error).message || ''
+    // 行情时效 fail-closed：后端拒绝当前评级时给用户显式降级选择（历史数据解释模式），
+    // 不悄悄放行——确认后带 allow_stale 重试。
+    if (!allowStale && msg.includes('历史数据解释')) {
+      dialog.warning({
+        title: '行情已过期，无法给出当前评级',
+        content: msg + '。是否按「截至行情时刻的历史数据解释」模式继续？该模式不代表当前盘面判断，也不会给出当前买卖行动建议。',
+        positiveText: '按历史数据解释',
+        negativeText: '取消',
+        onPositiveClick: () => {
+          void runAnalysis(true)
+        },
+      })
+    } else {
+      message.error(msg)
+    }
   } finally {
     running.value = false
     // 无论成功/降级/失败都刷新历史（失败记录服务端已落库，便于用户看到）。
@@ -441,7 +459,7 @@ onMounted(async () => {
               block
               :loading="running"
               :disabled="running"
-              @click="runAnalysis"
+              @click="runAnalysis()"
             >
               {{ running ? '分析中…' : '开始分析' }}
             </n-button>
@@ -521,6 +539,7 @@ onMounted(async () => {
                   <n-tag size="small" round :bordered="false">{{ moduleText(current.module) }}</n-tag>
                   <n-tag v-if="current.mode === 'panel'" size="small" round :bordered="false" type="info">多角色</n-tag>
                   <n-tag v-if="current.as_of" size="small" round :bordered="false" type="warning">回溯@{{ current.as_of }}</n-tag>
+                  <n-tag v-if="current.stale_mode" size="small" round :bordered="false" type="warning">历史解释</n-tag>
                   <span class="res-target">{{ current.target || current.title }}</span>
                 </div>
                 <div class="res-side">
@@ -538,7 +557,7 @@ onMounted(async () => {
                         color: ratingColor(current.result.rating),
                         background: withAlpha(ratingColor(current.result.rating), 0.12),
                       }"
-                      >{{ ratingText(current.result.rating) }}</span
+                      >{{ current.stale_mode ? '历史解读·' : '' }}{{ ratingText(current.result.rating) }}</span
                     >
                     <!-- 「AI 自评」而非「置信度」：与综合置信（程序合成）区分主次，防误读为胜率。 -->
                     <span class="confidence">AI 自评 {{ current.result.confidence }}</span>
@@ -555,6 +574,14 @@ onMounted(async () => {
                   </div>
                 </div>
               </div>
+
+              <!-- 历史解释模式横幅：结果不是当前盘面判断，禁按普通评级消费 -->
+              <n-alert v-if="current.stale_mode" type="warning" :bordered="false" class="stale-mode-banner">
+                {{
+                  current.stale_mode_note ||
+                  '行情已过期，本次为截至行情时刻的历史数据解释：评级与结论只反映对该时点数据的解读，不代表当前盘面判断，不含当前买卖参考。'
+                }}
+              </n-alert>
 
               <!-- 风险闸门标签（S1：快照 risk_gate 程序化判定，与注入 prompt 同源） -->
               <div v-if="current.risk_flags?.length" class="risk-flags">
@@ -1266,6 +1293,9 @@ onMounted(async () => {
   margin-top: 16px;
   padding-top: 12px;
   border-top: 1px solid var(--qv-divider);
+}
+.stale-mode-banner {
+  margin-bottom: 12px;
 }
 .risk-flags {
   display: flex;

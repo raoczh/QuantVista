@@ -28,6 +28,8 @@ export interface CompareRow {
   volume_ratio: number
   is_st: boolean
   error: string
+  quote_as_of?: string // 行情数据源时刻
+  freshness_status?: string // fresh | stale | unknown（非 fresh 行不参与对比结论与 AI 点评）
 }
 
 export interface CompareResult {

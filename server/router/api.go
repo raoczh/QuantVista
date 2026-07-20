@@ -350,6 +350,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 
 				// 数据源健康端点（S1 健康滑窗：每 (源,能力) success/empty/error 与冷却状态）
 				admin.GET("/datasources", marketCtl.DataSources)
+				// P1 数据健康总览：各数据域 expected/observed 日期、落后开市日数、覆盖率
+				admin.GET("/data-health", marketCtl.DataHealth)
 
 				// 市场数据维护（手动触发批量同步/日历回填/情绪快照）
 				adminMarket := admin.Group("/market")

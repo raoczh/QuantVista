@@ -31,16 +31,22 @@ export interface Position {
   recommendation_id: number // 来源推荐（0=手动建仓）
   // 富化字段
   current_price: number
-  quote_ok: boolean
+  quote_ok: boolean // 仅取到当前有效（fresh）行情时为 true
   cost: number
   market_value: number
   profit_amount: number
   profit_pct: number
   realized: boolean
+  day_change_pct: number // 当日涨跌幅 %（仅 fresh 时有值）
+  // 行情时效契约块（fail-closed）
+  quote_as_of?: string // 行情数据源时刻（含 stale 的最近已知）
+  freshness_status?: string // fresh | stale | unknown
+  stale_reason?: string // 非 fresh 的原因说明
+  last_price?: number // 最近已知价（stale 展示用，不参与盈亏）
   held_trade_days: number // 已持有交易日（按交易日历）
   short_term_review: boolean // 短线持仓超阈值，建议复盘
-  near_stop_loss: boolean // 现价距计划止损 ≤3%（未破）
-  below_stop_loss: boolean // 现价已跌破计划止损
+  near_stop_loss: boolean // 现价距计划止损 ≤3%（未破）；仅 fresh 时判定
+  below_stop_loss: boolean // 现价已跌破计划止损；仅 fresh 时判定
   last_analyzed_at: string | null // 该标的最近一次个股 AI 分析时间
   analysis_stale: boolean // 持仓中从未分析或距上次分析超过 7 天
 }
@@ -60,6 +66,7 @@ export interface PortfolioOverview {
   top_name: string
   top_weight_pct: number // 最大单一持仓占比 %
   quote_failed_count: number // 行情拉取失败、未计入市值/收益的持仓数（部分估值口径）
+  quote_stale_count: number // 行情已过期（非当前有效）、未计入市值/收益的持仓数
   signals: string[] // 风控信号（集中度/止损/未分析）
 }
 
@@ -104,6 +111,11 @@ export type PositionBase = Omit<
   | 'profit_amount'
   | 'profit_pct'
   | 'realized'
+  | 'day_change_pct'
+  | 'quote_as_of'
+  | 'freshness_status'
+  | 'stale_reason'
+  | 'last_price'
   | 'held_trade_days'
   | 'short_term_review'
   | 'near_stop_loss'

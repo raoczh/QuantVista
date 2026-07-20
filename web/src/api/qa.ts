@@ -32,8 +32,11 @@ export interface QaSnapshotMeta {
   quote_as_of?: string
   bars_as_of?: string
   quote_source?: string
-  freshness_status?: string // fresh | stale | unknown
+  freshness_status?: string // fresh | stale | unknown（快照创建时的判定，历史事实）
   market_state?: string // trading | break | pre_open | post_close | closed
+  // 按读取时刻重判的当前时效（旧会话跨天后以它为准展示，而非创建时的 freshness_status）
+  current_status?: string // fresh | stale | unknown
+  current_note?: string
 }
 
 export interface QaConversationView extends QaConversation {
@@ -49,6 +52,7 @@ export interface QaAskRequest {
   llm_config_id?: number
   question: string
   analysis_record_id?: number // 新会话时复用该分析记录的数据快照（从分析结果「继续问答」）
+  allow_stale?: boolean // 行情过期时的显式降级确认：按截至行情时刻的历史数据解释继续提问
 }
 
 export function askQa(req: QaAskRequest) {

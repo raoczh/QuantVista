@@ -35,7 +35,21 @@ function verdictColor(v: string) {
 
 const ev = computed(() => props.evidenceCheck)
 const evAllMatched = computed(() => !!ev.value && ev.value.matched === ev.value.total)
-const evColor = computed(() => (evAllMatched.value ? upColor.value : vars.value.warningColor))
+// ev3 起主徽章「全绿」只认快照佐证：全部命中但 snapshot_matched=0（引用的数字全是
+// AI 计划价/用户输入/上下文复述）不算「被数据证明」，配中性色而非绿色——防「快照
+// 佐证为 0 但核验全绿」误导。旧记录（无 snapshot_matched 字段）保持旧口径。
+const evAllRestated = computed(
+  () =>
+    evAllMatched.value &&
+    ev.value?.snapshot_matched !== undefined &&
+    (ev.value.snapshot_matched ?? 0) === 0 &&
+    (ev.value.matched ?? 0) > 0,
+)
+const evColor = computed(() => {
+  if (!evAllMatched.value) return vars.value.warningColor
+  if (evAllRestated.value) return flatColor.value
+  return upColor.value
+})
 // 有 items 明细（ev2 起）才可点击展开；旧记录只显示 tooltip。
 const evHasItems = computed(() => !!ev.value?.items?.length)
 const evMatchedItems = computed(() => (ev.value?.items || []).filter((i) => i.matched))
@@ -53,13 +67,25 @@ function reasonLabel(r?: string) {
   if (r === 'direction_mismatch') return '方向与快照相反（涨跌/流入流出不一致）'
   return '快照中未找到对应数值'
 }
-// 命中值域来源标注：区分「被数据快照佐证」与「模型复述自身计划价 / 用户阈值」，
-// 后者不得展示成「已被数据证明」。
+// 命中值域来源标注：区分「被数据快照佐证」与「模型复述自身计划价 / 用户输入 /
+// 上下文文本」，后三者不得展示成「已被数据证明」。
 function originLabel(o?: string) {
   if (o === 'plan') return 'AI 计划价'
-  if (o === 'user') return '用户阈值'
+  if (o === 'user') return '用户输入'
+  if (o === 'context') return '上下文文本'
   return ''
 }
+// ev3 来源分类汇总（旧记录无分类字段时回退：不显示分类，不冒充快照佐证数）。
+const evHasOriginSplit = computed(() => ev.value?.snapshot_matched !== undefined)
+const evOriginSummary = computed(() => {
+  const e = ev.value
+  if (!e || !evHasOriginSplit.value) return ''
+  const parts: string[] = [`数据快照佐证 ${e.snapshot_matched ?? 0}`]
+  if (e.plan_matched) parts.push(`AI 计划价复述 ${e.plan_matched}`)
+  if (e.user_matched) parts.push(`用户输入复述 ${e.user_matched}`)
+  if (e.context_matched) parts.push(`上下文文本复述 ${e.context_matched}`)
+  return parts.join(' · ')
+})
 
 // 全部徽章缺省时整行不渲染：旧记录（信任层上线前）无这些字段，空 flex 容器会留出多余空隙。
 const hasAny = computed(
@@ -94,11 +120,17 @@ const hasAny = computed(
         </span>
       </template>
       <div style="max-width: 320px">
-        数值存在性核验：AI 文本提取到 {{ ev.total }} 个可核验数值（去重），{{ ev.matched }} 个在快照中找到对应数值（±2% 容差）。<template
-          v-if="ev.skipped_count"
+        数值存在性核验：AI 文本提取到 {{ ev.total }} 个可核验数值（去重），{{ ev.matched }} 个找到对应来源（±2%
+        容差）<template v-if="evOriginSummary">——{{ evOriginSummary }}</template
+        >。<template v-if="evAllRestated"
+          >⚠ 本次命中全部为合法复述（AI 计划价/用户输入/上下文），没有任何数字被数据快照佐证，请勿当作「已被数据证明」。</template
+        ><template v-if="ev.skipped_count"
           >另跳过 {{ ev.skipped_count }} 个（小整数/年份/代码等非核验对象）。</template
         >
-        只验证数值是否存在，不代表字段语义与整段结论正确。<template v-if="evHasItems">点击查看逐项明细。</template>
+        仅「数据快照佐证」表示数字有数据支撑；「AI 计划价/用户输入/上下文文本复述」只是合法引用，并非被快照数据证明。只验证数值是否存在，不代表字段语义与整段结论正确。<template
+          v-if="evHasItems"
+          >点击查看逐项明细。</template
+        >
       </div>
     </n-tooltip>
     <n-tooltip v-if="sysConfidence" trigger="hover">
@@ -131,9 +163,11 @@ const hasAny = computed(
       class="ev-modal"
     >
       <div class="ev-summary">
-        共 {{ ev?.total }} 个可核验数值，{{ ev?.matched }} 个找到对应快照字段<template v-if="ev?.skipped_count"
+        共 {{ ev?.total }} 个可核验数值，{{ ev?.matched }} 个找到对应来源<template v-if="evOriginSummary"
+          >（{{ evOriginSummary }}）</template
+        ><template v-if="ev?.skipped_count"
           >；另跳过 {{ ev?.skipped_count }} 个（小整数/年份/代码等）</template
-        >。这是数值存在性核验，不代表字段语义与整段结论正确。
+        >。仅「数据快照佐证」有数据支撑，「AI 计划价/用户输入/上下文文本」为合法复述而非快照佐证。这是数值存在性核验，不代表字段语义与整段结论正确。
       </div>
       <n-collapse :default-expanded-names="['unmatched']">
         <n-collapse-item
@@ -178,7 +212,13 @@ const hasAny = computed(
               <template v-if="it.origin === 'plan'">
                 · 该数字来自 AI 自身给出的计划价/公式输出，属合法复述，但并非被数据快照佐证</template
               >
-              <template v-else-if="it.origin === 'user'"> · 该数字来自用户设定的筛选阈值</template>
+              <template v-else-if="it.origin === 'user'">
+                · 该数字来自用户输入（提问/设定阈值）的复述，并非被数据快照佐证</template
+              >
+              <template v-else-if="it.origin === 'context'">
+                · 该数字来自新闻/公告标题等上下文文本的复述，并非数值快照佐证</template
+              >
+              <template v-else-if="!it.origin"> · 数据快照佐证</template>
             </div>
             <div v-if="it.sentence" class="ev-sent">「{{ it.sentence }}」</div>
           </div>

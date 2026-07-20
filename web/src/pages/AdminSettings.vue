@@ -26,8 +26,16 @@ import {
   getUserQuota,
   updateUserQuota,
   listSyncLogs,
+  getDataHealth,
+  triggerWideSync,
+  triggerWideInit,
+  triggerSyncBars,
+  triggerSnapshot,
+  triggerFactorRebuild,
+  triggerBackfillCalendar,
   type SystemSettings,
   type SyncLog,
+  type DataHealthReport,
 } from '@/api/admin'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import type { AuthUser } from '@/api/auth'
@@ -263,11 +271,44 @@ function fmtLogTime(t: string) {
   return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : ''
 }
 
+/* P1 数据健康总览：各数据域 expected/observed 对账 + 补跑入口 */
+const health = ref<DataHealthReport | null>(null)
+const healthLoading = ref(false)
+async function loadHealth() {
+  healthLoading.value = true
+  try {
+    health.value = await getDataHealth()
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    healthLoading.value = false
+  }
+}
+const healthStatusMeta: Record<string, { label: string; type: 'success' | 'error' | 'warning' | 'default' }> = {
+  ok: { label: '正常', type: 'success' },
+  behind: { label: '落后', type: 'error' },
+  empty: { label: '无数据', type: 'warning' },
+  unknown: { label: '无法判定', type: 'default' },
+}
+const rerunning = ref('')
+async function rerun(key: string, fn: () => Promise<unknown>) {
+  rerunning.value = key
+  try {
+    await fn()
+    message.success('已触发，稍后刷新查看结果')
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    rerunning.value = ''
+  }
+}
+
 onMounted(() => {
   load()
   loadUsers()
   loadLogs()
   loadMyConfigs()
+  loadHealth()
 })
 </script>
 
@@ -407,6 +448,86 @@ onMounted(() => {
         </n-table>
       </SectionCard>
 
+      <!-- P1 数据健康总览：expected/observed 对账 + 补跑入口 -->
+      <SectionCard title="数据健康" :hoverable="false">
+        <template #extra>
+          <n-button size="tiny" quaternary :loading="healthLoading" @click="loadHealth">刷新</n-button>
+        </template>
+        <div class="health-actions">
+          <n-button size="tiny" tertiary :loading="rerunning === 'wide'" @click="rerun('wide', triggerWideSync)"
+            >全市场增量同步</n-button
+          >
+          <n-button size="tiny" tertiary :loading="rerunning === 'init'" @click="rerun('init', triggerWideInit)"
+            >历史初始化</n-button
+          >
+          <n-button size="tiny" tertiary :loading="rerunning === 'bars'" @click="rerun('bars', triggerSyncBars)"
+            >日线批量同步</n-button
+          >
+          <n-button size="tiny" tertiary :loading="rerunning === 'snap'" @click="rerun('snap', triggerSnapshot)"
+            >情绪快照</n-button
+          >
+          <n-button
+            size="tiny"
+            tertiary
+            :loading="rerunning === 'factor'"
+            @click="rerun('factor', triggerFactorRebuild)"
+            >重建因子宽表</n-button
+          >
+          <n-button
+            size="tiny"
+            tertiary
+            :loading="rerunning === 'cal'"
+            @click="rerun('cal', triggerBackfillCalendar)"
+            >回填日历</n-button
+          >
+        </div>
+        <n-empty v-if="!health?.items?.length" description="暂无数据" size="small" style="padding: 20px 0" />
+        <n-table v-else :bordered="false" :single-line="false" size="small">
+          <thead>
+            <tr>
+              <th>数据域</th>
+              <th>状态</th>
+              <th>库内最新</th>
+              <th>应有日期</th>
+              <th>落后</th>
+              <th>覆盖</th>
+              <th>最近任务</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="it in health.items" :key="it.key">
+              <td>{{ it.name }}</td>
+              <td>
+                <n-tag :type="healthStatusMeta[it.status]?.type || 'default'" size="small" round>{{
+                  healthStatusMeta[it.status]?.label || it.status
+                }}</n-tag>
+              </td>
+              <td class="qv-tnum">{{ it.observed_date || '—' }}</td>
+              <td class="qv-tnum">{{ it.expected_date || '—' }}</td>
+              <td class="qv-tnum">
+                <template v-if="it.lag_open_days > 0">{{ it.lag_open_days }} 开市日</template>
+                <template v-else-if="it.lag_open_days < 0">?</template>
+                <template v-else>—</template>
+              </td>
+              <td>{{ it.coverage || '—' }}</td>
+              <td class="log-time">
+                <template v-if="it.last_run"
+                  >{{ fmtLogTime(it.last_run.created_at) }}
+                  <n-tag :type="logStatusType(it.last_run.status)" size="tiny" round>{{ it.last_run.status }}</n-tag>
+                  <span v-if="it.last_run.status !== 'success'" class="log-msg">{{ it.last_run.message }}</span>
+                </template>
+                <template v-else>—</template>
+              </td>
+              <td class="log-msg">{{ it.note }}</td>
+            </tr>
+          </tbody>
+        </n-table>
+        <div style="font-size: 12px; opacity: 0.55; margin-top: 8px">
+          生成于 {{ health?.generated_at || '—' }}。「落后」按交易日历对照应有日期计算（不与库内自身最大日期比较）；超过容忍值的域会以「落后」标红，请用上方补跑入口处理。
+        </div>
+      </SectionCard>
+
       <!-- 数据源同步日志 -->
       <SectionCard title="数据源同步日志" :hoverable="false">
         <template #extra>
@@ -492,5 +613,11 @@ onMounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.health-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
 }
 </style>

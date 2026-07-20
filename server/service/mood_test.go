@@ -132,6 +132,9 @@ func TestSyncZTPools(t *testing.T) {
 func TestSyncLhbAndSignals(t *testing.T) {
 	setupTestDB(t)
 	cleanMoodTables(t)
+	// 信号水位 fail-closed 后（openDaysBehind 区间无日历记录返回 -1），seed 固定旧日期
+	// 的数据必须钉日历与之齐平，否则 lhbSignalsFor 按「时效无法判定」正确拒绝。
+	pinCalendarTo(t, "2026-07-07")
 	svc := NewMoodService()
 	lhbRows := []datasource.LhbRow{
 		{Symbol: "002185", Name: "华天科技", TradeDate: "2026-07-07", ChangeType: "137001",
@@ -190,6 +193,7 @@ func TestSyncLhbAndSignals(t *testing.T) {
 func TestPopularitySignals(t *testing.T) {
 	setupTestDB(t)
 	cleanMoodTables(t)
+	pinCalendarTo(t, "2026-07-08") // 水位 fail-closed：seed 日期须与日历期望齐平
 	rows := []model.PopularityRank{
 		{Symbol: "000725", Market: "cn", TradeDate: "2026-07-08", Rank: 1, PrevRank: 4},
 		{Symbol: "002185", Market: "cn", TradeDate: "2026-07-08", Rank: 4, PrevRank: -3, IsNew: true},

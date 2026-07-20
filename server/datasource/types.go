@@ -193,21 +193,21 @@ type Breadth struct {
 	Unchanged int       `json:"unchanged"`  // 平盘家数
 	LimitUp   int       `json:"limit_up"`   // 涨停家数
 	LimitDown int       `json:"limit_down"` // 跌停家数
-	TradeDate string    `json:"trade_date"` // YYYY-MM-DD
+	TradeDate string    `json:"trade_date"` // YYYY-MM-DD（上游真实业务日期，QDate 解析）
 	Source    string    `json:"source"`
-	DataTime  time.Time `json:"data_time"`
+	DataTime  time.Time `json:"data_time"` // 采集时刻（captured_at 语义；业务时间见 TradeDate）
 }
 
 // MarketFundFlow 两市资金流（主力/超大单/大单/中单/小单净流入，单位元）。
 type MarketFundFlow struct {
-	TradeDate string    `json:"trade_date"` // YYYY-MM-DD
+	TradeDate string    `json:"trade_date"` // YYYY-MM-DD（上游真实业务日期，kline 行首解析）
 	MainNet   float64   `json:"main_net"`   // 主力净流入 = 超大单 + 大单
 	SuperNet  float64   `json:"super_net"`  // 超大单净流入
 	LargeNet  float64   `json:"large_net"`  // 大单净流入
 	MediumNet float64   `json:"medium_net"` // 中单净流入
 	SmallNet  float64   `json:"small_net"`  // 小单净流入
 	Source    string    `json:"source"`
-	DataTime  time.Time `json:"data_time"`
+	DataTime  time.Time `json:"data_time"` // 采集时刻（captured_at 语义；业务时间见 TradeDate）
 }
 
 // CNIndex A 股主要指数清单（code 用于展示，sina 为新浪批量代码）。

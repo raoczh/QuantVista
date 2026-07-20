@@ -15,6 +15,7 @@ export interface AnalyzeRequest {
   mode?: 'panel' // 缺省=标准分析；panel=多角色观点（仅个股）
   verify?: boolean // AI 复核（独立复核员逐项挑刺；panel/降级不复核）
   as_of?: string // M2 回溯诊断日期（YYYY-MM-DD，仅个股标准模式）：截断日线组装 prompt 无未来泄露
+  allow_stale?: boolean // 行情过期时的显式降级：按「截至行情时刻的历史数据解释」模式生成（默认拒绝）
 }
 
 // 结构化分析结果。
@@ -131,6 +132,10 @@ export interface AnalysisView extends AnalysisRecord {
   panel: PanelResult | null
   raw: string
   risk_flags?: RiskFlag[] // 快照 risk_gate 程序化风险标志（S1，个股模块）
+  // 历史解释模式（快照 stale_mode 透传）：非空时结果不是当前盘面判断，前端必须
+  // 醒目标注且不得按普通「当前评级」展示。
+  stale_mode?: string // historical_explanation
+  stale_mode_note?: string
 }
 
 export function createAnalysis(req: AnalyzeRequest) {

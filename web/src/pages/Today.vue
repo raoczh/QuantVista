@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
-import { NButton, NSpin, NEmpty, NTag, NGrid, NGi, useMessage } from 'naive-ui'
+import { NButton, NSpin, NEmpty, NTag, NGrid, NGi, NAlert, useMessage } from 'naive-ui'
 import { getTodos, type TodoItem, type TodoResult } from '@/api/todo'
 import { setAlertEventStatus } from '@/api/alert'
 import { ackRecommendationReview } from '@/api/recommendation'
@@ -119,9 +119,23 @@ onMounted(load)
 
       <SectionCard :title="`清单${data?.date ? ' · ' + data.date : ''}`">
         <n-spin :show="loading && !data">
+          <n-alert
+            v-if="data && data.complete === false"
+            type="warning"
+            :bordered="false"
+            style="margin-bottom: 12px"
+            title="待办清单可能不完整"
+          >
+            <div v-for="(e, i) in data.errors || []" :key="i">{{ e }}</div>
+            <div v-if="!data.errors?.length">部分数据读取失败，状态不明的事项未列出，请稍后刷新重试。</div>
+          </n-alert>
           <n-empty
             v-if="data && !data.items.length"
-            description="今天没有需要处理的事项，一切都在轨道上 👍"
+            :description="
+              data.complete === false
+                ? '暂未取到待办事项，但部分数据读取失败，状态不明——不代表一切正常'
+                : '今天没有需要处理的事项，一切都在轨道上 👍'
+            "
             style="padding: 40px 0"
           />
           <div v-else class="items">

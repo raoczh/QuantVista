@@ -381,6 +381,8 @@ func StartIntradayJobs() *IntradayService {
 
 // intradaySignalsFor 批量查询候选的最近一日盘中因子（T-1 口径：盘中生成推荐时
 // 今日 job 未跑，按 MAX(trade_date) 查询最近已同步交易日，与 lhbSignalsFor 同款）。
+// P1 水位：库内最新日期落后应有交易日超过容忍值时按无信号处理（signalDateUsable），
+// 旧盘中形态不冒充近期信号。
 func intradaySignalsFor(symbols []string) map[string]model.IntradayFactorDaily {
 	out := map[string]model.IntradayFactorDaily{}
 	if common.DB == nil || len(symbols) == 0 {
@@ -389,7 +391,7 @@ func intradaySignalsFor(symbols []string) map[string]model.IntradayFactorDaily {
 	var latest string
 	common.DB.Model(&model.IntradayFactorDaily{}).Where("market = ?", "cn").
 		Select("MAX(trade_date)").Scan(&latest)
-	if latest == "" {
+	if !signalDateUsable(latest) {
 		return out
 	}
 	var rows []model.IntradayFactorDaily

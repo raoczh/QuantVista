@@ -50,13 +50,27 @@ func seedReportEnv(t *testing.T, userID int64, baseURL string) {
 	}
 }
 
-// fakeReportSvc 组装带注入点的日报服务：快照假实现（零上游）、推荐假实现。
+// fakeReportSvc 组装带注入点的日报服务：快照假实现（零上游）、推荐假实现、
+// 固定时钟（今天 16:00，处于 15:35 收盘门槛之后）——不注入时钟的话这批测试的结果
+// 取决于执行时刻是上午还是下午（15:35 门槛直接读真实时钟，上午必被拒）。
 func fakeReportSvc(recFn func(ctx context.Context, userID int64, allowPrivate bool, req RecommendRequest) (*RecommendationView, error)) *DailyReportService {
+	return fakeReportSvcAt(recFn, todayAt(16, 0))
+}
+
+// todayAt 今天某时某分的本地时刻（测试日历按 time.Now 的今天建，固定时钟须同日）。
+func todayAt(hour, min int) time.Time {
+	n := time.Now()
+	return time.Date(n.Year(), n.Month(), n.Day(), hour, min, 0, 0, time.Local)
+}
+
+// fakeReportSvcAt 同 fakeReportSvc 但指定固定时钟。
+func fakeReportSvcAt(recFn func(ctx context.Context, userID int64, allowPrivate bool, req RecommendRequest) (*RecommendationView, error), at time.Time) *DailyReportService {
 	svc := NewDailyReportService(nil, nil, nil, nil, nil, NewLLMService(), NewNotifyService())
 	svc.snapshotFn = func(ctx context.Context, userID int64, date string) *reportSnapshot {
 		return &reportSnapshot{TradeDate: date, Positions: []reportPosition{}, Watch: []reportWatchItem{}, Alerts: []string{}}
 	}
 	svc.recFn = recFn
+	svc.nowFn = func() time.Time { return at }
 	return svc
 }
 
@@ -212,5 +226,56 @@ func TestDailyReportProcessingIdempotent(t *testing.T) {
 	common.DB.Model(&model.DailyReport{}).Where("user_id = ?", 53).Count(&cnt)
 	if cnt != 1 {
 		t.Fatalf("不应创建第二行: %d", cnt)
+	}
+}
+
+// TestDailyReportManualBefore1535Rejected 收盘门槛（固定时钟，不依赖执行时刻）：
+// 15:34 手动生成被拒且不落任何报告行；15:35 整放行（同自动窗口起点）。
+func TestDailyReportManualBefore1535Rejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(reportOKReview))
+	}))
+	defer srv.Close()
+	seedReportEnv(t, 54, srv.URL)
+
+	rec := func(ctx context.Context, userID int64, allowPrivate bool, req RecommendRequest) (*RecommendationView, error) {
+		return nil, errors.New("推荐失败（模拟）")
+	}
+	// 15:34：拒绝，错误须说明门槛，且不建报告行。
+	svc := fakeReportSvcAt(rec, todayAt(15, 34))
+	if _, err := svc.GenerateFor(context.Background(), 54, true); err == nil || !strings.Contains(err.Error(), "15:35") {
+		t.Fatalf("15:34 手动生成应被拒并说明门槛: err=%v", err)
+	}
+	var cnt int64
+	common.DB.Model(&model.DailyReport{}).Where("user_id = ?", 54).Count(&cnt)
+	if cnt != 0 {
+		t.Fatalf("被拒时不应落报告行: %d", cnt)
+	}
+	// 15:35 整：放行（返回 processing 任务）。
+	svc = fakeReportSvcAt(rec, todayAt(15, 35))
+	v, err := svc.GenerateFor(context.Background(), 54, true)
+	if err != nil {
+		t.Fatalf("15:35 应放行: %v", err)
+	}
+	waitReportStatus(t, v.ID)
+}
+
+// TestDailyReportNonTradingDayRejected 非交易日（日历 is_open=false）固定时钟拒绝，
+// 与执行时刻无关。
+func TestDailyReportNonTradingDayRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(reportOKReview))
+	}))
+	defer srv.Close()
+	seedReportEnv(t, 55, srv.URL)
+	today := time.Now().Format("2006-01-02")
+	common.DB.Model(&model.TradingCalendar{}).Where("market = ? AND trade_date = ?", "cn", today).
+		Update("is_open", false)
+
+	svc := fakeReportSvcAt(func(ctx context.Context, userID int64, allowPrivate bool, req RecommendRequest) (*RecommendationView, error) {
+		return nil, errors.New("不应被调用")
+	}, todayAt(16, 0))
+	if _, err := svc.GenerateFor(context.Background(), 55, true); err == nil || !strings.Contains(err.Error(), "休市") {
+		t.Fatalf("非交易日应被拒: err=%v", err)
 	}
 }

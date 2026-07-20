@@ -38,6 +38,7 @@ import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
+import FreshnessTag from '@/components/FreshnessTag.vue'
 
 const message = useMessage()
 const router = useRouter()
@@ -133,6 +134,7 @@ const verdictMeta: Record<string, { label: string; type: 'success' | 'error' | '
   missed_gain: { label: '错过上涨', type: 'error' },
   neutral: { label: '基本持平', type: 'default' },
   no_base: { label: '无基准价', type: 'warning' },
+  stale_quote: { label: '行情过期，暂无法判定', type: 'warning' },
 }
 async function openMissed() {
   missedModal.value = true
@@ -370,7 +372,7 @@ onMounted(load)
 </script>
 
 <template>
-  <PageContainer title="自选股" subtitle="分组管理 · 重点关注 · 实时行情">
+  <PageContainer title="自选股" subtitle="分组管理 · 重点关注 · 行情带时效标注">
     <template #actions>
       <n-tag size="small" round :bordered="false">{{ totalCount }} 只</n-tag>
       <n-button size="small" secondary @click="openCreateGroup">新建分组</n-button>
@@ -439,6 +441,10 @@ onMounted(load)
                   </span>
                   <span v-else class="it-price muted">—</span>
                   <ChangeTag v-if="it.quote_ok" :value="it.change_pct" size="small" />
+                  <FreshnessTag
+                    :status="it.freshness_status"
+                    :as-of="it.data_time ? String(it.data_time).slice(0, 16).replace('T', ' ') : ''"
+                  />
                 </div>
                 <div class="it-actions" @click.stop>
                   <n-button size="tiny" quaternary @click="togglePin(it)">{{
@@ -558,6 +564,11 @@ onMounted(load)
             <div class="missed-nums qv-tnum">
               <span>放弃价 {{ m.passed_price > 0 ? m.passed_price.toFixed(2) : '—' }}</span>
               <span>现价 {{ m.quote_ok ? m.current_price.toFixed(2) : '—' }}</span>
+              <span
+                v-if="!m.quote_ok && m.verdict === 'stale_quote' && m.last_price"
+                :title="`最近已知价（截至 ${m.quote_as_of || '未知'}，已过期，不参与结论）`"
+                >旧 {{ m.last_price.toFixed(2) }}</span
+              >
               <span v-if="m.passed_price > 0 && m.quote_ok" :style="{ color: pctColor(m.change_since_pct) }">
                 {{ m.change_since_pct >= 0 ? '+' : '' }}{{ m.change_since_pct.toFixed(2) }}%
               </span>

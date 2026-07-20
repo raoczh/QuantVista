@@ -15,11 +15,15 @@ export interface PaperHolding {
   quantity: number
   avg_cost: number
   price: number
-  quote_ok: boolean
+  quote_ok: boolean // 仅取到当前有效（fresh）行情时为 true；否则按成本估值
   cost: number
   market_value: number
   profit_amount: number
   profit_pct: number
+  quote_as_of?: string // 行情数据源时刻（含 stale 的最近已知）
+  freshness_status?: string // fresh | stale | unknown
+  stale_reason?: string
+  last_price?: number // 最近已知价（stale 展示用，不参与估值）
 }
 
 export interface PaperOverview {
@@ -30,6 +34,8 @@ export interface PaperOverview {
   total_profit: number
   total_profit_pct: number
   realized_pnl: number
+  quote_stale_count?: number // 无当前有效行情、按成本估值的持仓数
+  valuation_note?: string // 部分估值说明（总资产非全实时市值）
 }
 
 export interface PaperTrade {

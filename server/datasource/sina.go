@@ -154,11 +154,21 @@ func (s *SinaAdapter) GetIndices(ctx context.Context, market string) ([]Index, e
 		if prevClose != 0 {
 			pct = (price - prevClose) / prevClose * 100
 		}
+		// P1 拆分采集/源数据时间：指数完整串与个股同格式，30/31 为日期/时间（北京时间）
+		// ——解析上游真实业务时间；解析失败保持零值（timestamp_unknown），禁回填
+		// time.Now() 把旧指数值伪装成实时（同个股行情纪律）。
+		var dataTime time.Time
+		if len(f) >= 32 {
+			if t, err := time.ParseInLocation("2006-01-02 15:04:05",
+				strings.TrimSpace(f[30])+" "+strings.TrimSpace(f[31]), time.Local); err == nil {
+				dataTime = t
+			}
+		}
 		out = append(out, Index{
 			Code: ix.Code, Name: ix.Name,
 			Price: price, ChangePct: pct,
 			Open: atof(1), High: atof(4), Low: atof(5), PrevClose: prevClose,
-			Source: s.Name(), DataTime: time.Now(),
+			Source: s.Name(), DataTime: dataTime,
 		})
 	}
 	if len(out) == 0 {
