@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute, RouterView } from 'vue-router'
-import { NConfigProvider, NMessageProvider, NGlobalStyle, zhCN, dateZhCN } from 'naive-ui'
+import { NConfigProvider, NMessageProvider, NDialogProvider, NGlobalStyle, zhCN, dateZhCN } from 'naive-ui'
 import { storeToRefs } from 'pinia'
 import { useThemeStore } from '@/stores/theme'
 import AppShell from '@/components/AppShell.vue'
@@ -20,8 +20,10 @@ const isBare = computed(() => route.meta.bare === true)
   <n-config-provider :theme="naiveTheme" :theme-overrides="themeOverrides" :locale="zhCN" :date-locale="dateZhCN">
     <n-global-style />
     <n-message-provider>
-      <RouterView v-if="isBare" />
-      <AppShell v-else />
+      <n-dialog-provider>
+        <RouterView v-if="isBare" />
+        <AppShell v-else />
+      </n-dialog-provider>
     </n-message-provider>
   </n-config-provider>
 </template>
