@@ -359,7 +359,10 @@ func (s *TrackingService) evaluateOne(ctx context.Context, batch model.Recommend
 	}
 
 	// 追加当日实时行情为一根 bar（用于盘中触达判定与最新价刷新）。
-	if q, err := s.market.GetQuote(ctx, rec.Market, rec.Symbol); err == nil && q.Price > 0 {
+	// fail-closed：走 GetFreshQuote 并要求 freshness_status==fresh——只查「DataTime
+	// 是今天」不够（同日 09:30 停滞价在 14:00 依旧是旧价，quoteFreshness 的时段内
+	// 时刻下限才拦得住），旧价 bar 会驱动止盈止损触达误判。
+	if q, fi, err := s.market.GetFreshQuote(ctx, rec.Market, rec.Symbol); err == nil && q != nil && q.Price > 0 && fi.Status == freshStatusFresh {
 		now := time.Now().In(time.Local)
 		if shouldAppendQuoteBar(now, recDate, bars, q.DataTime) {
 			today := now.Format("2006-01-02")

@@ -3,8 +3,10 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"quantvista/common"
 	"quantvista/datasource"
@@ -111,8 +113,8 @@ func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (
 			}
 			return nil, errors.New("无法获取成交价，请手动指定价格")
 		}
-		if fi.Status == freshStatusStale {
-			return nil, errors.New("实时行情已过期（可能停牌或数据源延迟），拒绝按旧价成交；请手动指定价格或稍后重试")
+		if fi.Status != freshStatusFresh {
+			return nil, errors.New("实时行情已过期或时效无法核验（可能停牌或数据源延迟），拒绝按旧价成交；请手动指定价格或稍后重试")
 		}
 		price = round4(q.Price)
 		name = q.Name
@@ -203,7 +205,8 @@ func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (
 	return trade, nil
 }
 
-// PaperHoldingView 持仓 + 实时估值。
+// PaperHoldingView 持仓 + 估值。行情时效契约（fail-closed）：QuoteOK 仅在取到
+// fresh 行情时为 true；非 fresh 时按成本估值、浮盈记 0，并带 freshness 块说明。
 type PaperHoldingView struct {
 	model.PaperHolding
 	Price        float64 `json:"price"`
@@ -212,6 +215,11 @@ type PaperHoldingView struct {
 	MarketValue  float64 `json:"market_value"`  // 市值 = 现价*数量
 	ProfitAmount float64 `json:"profit_amount"` // 浮动盈亏
 	ProfitPct    float64 `json:"profit_pct"`
+
+	QuoteAsOf       string  `json:"quote_as_of,omitempty"`      // 行情数据源时刻（含 stale 的最近已知）
+	FreshnessStatus string  `json:"freshness_status,omitempty"` // fresh | stale | unknown
+	StaleReason     string  `json:"stale_reason,omitempty"`     // 非 fresh 的原因
+	LastPrice       float64 `json:"last_price,omitempty"`       // 最近已知价（stale 展示用，不参与估值）
 }
 
 // PaperOverview 账户总览。
@@ -223,9 +231,14 @@ type PaperOverview struct {
 	TotalProfit    float64             `json:"total_profit"` // 总资产 - 初始资金
 	TotalProfitPct float64             `json:"total_profit_pct"`
 	RealizedPnl    float64             `json:"realized_pnl"` // 累计已实现盈亏
+
+	QuoteStaleCount int    `json:"quote_stale_count"` // 无当前有效行情、按成本估值的持仓数
+	ValuationNote   string `json:"valuation_note,omitempty"`
 }
 
-// Overview 账户总览：持仓按实时行情估值，汇总总资产与盈亏。
+// Overview 账户总览：持仓按当前有效行情估值，汇总总资产与盈亏。
+// fail-closed：非 fresh（stale/unknown/失败）的持仓按成本估值、浮盈记 0 并透明计数
+// ——旧价市值冒充「实时资产」会让总资产与盈亏虚高/虚低。
 func (s *PaperService) Overview(ctx context.Context, userID int64) (*PaperOverview, error) {
 	acc, err := s.GetOrCreateAccount(userID)
 	if err != nil {
@@ -240,14 +253,20 @@ func (s *PaperService) Overview(ctx context.Context, userID int64) (*PaperOvervi
 	for _, h := range holdings {
 		refs = append(refs, QuoteRef{Market: h.Market, Symbol: h.Symbol})
 	}
-	quotes := s.market.QuotesFor(ctx, refs)
+	quotes := s.market.FreshQuotesFor(ctx, refs)
 
 	ov := &PaperOverview{Account: acc, Holdings: make([]PaperHoldingView, 0, len(holdings))}
 	for _, h := range holdings {
 		v := PaperHoldingView{PaperHolding: h, Cost: round2(h.AvgCost * h.Quantity)}
-		if q := quotes[QuoteKey(h.Market, h.Symbol)]; q != nil {
+		fq, ok := quotes[QuoteKey(h.Market, h.Symbol)]
+		if ok && fq.Quote != nil && fq.Quote.Price > 0 && fq.Fresh.Status == freshStatusFresh {
+			q := fq.Quote
 			v.Price = round4(q.Price) // ETF 持仓现价保留 0.001 最小变动价位（个股两位小数不受影响）
 			v.QuoteOK = true
+			v.FreshnessStatus = freshStatusFresh
+			if !q.DataTime.IsZero() {
+				v.QuoteAsOf = q.DataTime.In(time.Local).Format("2006-01-02 15:04")
+			}
 			v.MarketValue = round2(q.Price * h.Quantity)
 			v.ProfitAmount = round2(v.MarketValue - v.Cost)
 			if v.Cost > 0 {
@@ -255,11 +274,32 @@ func (s *PaperService) Overview(ctx context.Context, userID int64) (*PaperOvervi
 			}
 			ov.MarketValue = round2(ov.MarketValue + v.MarketValue)
 		} else {
-			// 无行情：用成本估值，盈亏记 0。
+			// 无当前有效行情：用成本估值，盈亏记 0，带过期标注（不冒充实时估值）。
+			ov.QuoteStaleCount++
 			v.MarketValue = v.Cost
 			ov.MarketValue = round2(ov.MarketValue + v.Cost)
+			if ok && fq.Quote != nil {
+				v.FreshnessStatus = fq.Fresh.Status
+				if fq.Quote.Price > 0 {
+					v.LastPrice = round4(fq.Quote.Price)
+				}
+				if !fq.Quote.DataTime.IsZero() {
+					v.QuoteAsOf = fq.Quote.DataTime.In(time.Local).Format("2006-01-02 15:04")
+				}
+				if note, _ := stockFreshnessNote(fq.Fresh, fq.Quote.DataTime); note != "" {
+					v.StaleReason = note
+				} else if fq.Fresh.Status == freshStatusUnknown {
+					v.StaleReason = "该市场无交易日历，无法核验行情时效"
+				}
+			} else {
+				v.FreshnessStatus = freshStatusStale
+				v.StaleReason = "行情获取失败（可能停牌/数据源故障）"
+			}
 		}
 		ov.Holdings = append(ov.Holdings, v)
+	}
+	if ov.QuoteStaleCount > 0 {
+		ov.ValuationNote = fmt.Sprintf("%d 笔持仓无当前有效行情，按成本估值计入总资产（非实时市值），浮动盈亏未知", ov.QuoteStaleCount)
 	}
 	ov.TotalAssets = round2(acc.Cash + ov.MarketValue)
 	ov.TotalProfit = round2(ov.TotalAssets - acc.InitialCash)

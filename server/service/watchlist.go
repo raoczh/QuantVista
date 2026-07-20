@@ -58,13 +58,16 @@ func (s *WatchlistService) resolveName(ctx context.Context, market, symbol, fall
 
 // --- 分组 ---
 
-// WatchlistItemView 条目 + 实时行情富化。
+// WatchlistItemView 条目 + 实时行情富化。展示行保留最近已知价（QuotesFor 展示链路），
+// FreshnessStatus 标注时效——stale 行须由前端按「截至 DataTime」展示，不冒充实时；
+// 推荐/分析等敏感消费方另行走 FreshQuotesFor（不依赖本视图的价）。
 type WatchlistItemView struct {
 	model.WatchlistItem
-	Price     float64   `json:"price"`
-	ChangePct float64   `json:"change_pct"`
-	QuoteOK   bool      `json:"quote_ok"`
-	DataTime  time.Time `json:"data_time"`
+	Price           float64   `json:"price"`
+	ChangePct       float64   `json:"change_pct"`
+	QuoteOK         bool      `json:"quote_ok"`
+	DataTime        time.Time `json:"data_time"`
+	FreshnessStatus string    `json:"freshness_status,omitempty"` // fresh | stale | unknown
 }
 
 // WatchlistGroupView 分组 + 其条目。
@@ -116,6 +119,7 @@ func (s *WatchlistService) List(ctx context.Context, userID int64) ([]WatchlistG
 		}
 	}
 	quotes := s.market.QuotesFor(ctx, refs)
+	judge := s.market.FreshnessJudge("cn")
 
 	byGroup := make(map[int64][]WatchlistItemView, len(groups))
 	for _, it := range items {
@@ -125,6 +129,11 @@ func (s *WatchlistService) List(ctx context.Context, userID int64) ([]WatchlistG
 			v.ChangePct = q.ChangePct
 			v.QuoteOK = true
 			v.DataTime = q.DataTime
+			if it.Market == "cn" {
+				v.FreshnessStatus = judge(q.DataTime).Status
+			} else {
+				v.FreshnessStatus = freshStatusUnknown
+			}
 		}
 		byGroup[it.WatchlistID] = append(byGroup[it.WatchlistID], v)
 	}
@@ -314,8 +323,10 @@ func (s *WatchlistService) SetItemStage(ctx context.Context, userID, itemID int6
 	item.StageAt = &now
 	if stage == model.StagePassed {
 		item.PassedReason = truncateRunes(strings.TrimSpace(reason), 250)
-		// 放弃价 best-effort：行情不可用时记 0（复盘时显示"无基准价"）。
-		if q, err := s.market.GetQuote(ctx, item.Market, item.Symbol); err == nil {
+		// 放弃价 fail-closed：只记当前有效（fresh）行情——旧价会成为永久落库的错误
+		// 复盘基准（后续「错过机会」结论整体失真）；取不到 fresh 记 0（显示"无基准价"）。
+		if q, fi, err := s.market.GetFreshQuote(ctx, item.Market, item.Symbol); err == nil &&
+			q != nil && q.Price > 0 && fi.Status == freshStatusFresh {
 			item.PassedPrice = q.Price
 		}
 	}
@@ -331,7 +342,10 @@ type MissedOpportunityView struct {
 	CurrentPrice   float64 `json:"current_price"`
 	QuoteOK        bool    `json:"quote_ok"`
 	ChangeSincePct float64 `json:"change_since_pct"` // 放弃后涨跌幅（现价 vs 放弃价）
-	Verdict        string  `json:"verdict"`          // avoided_loss / missed_gain / neutral / no_base
+	Verdict        string  `json:"verdict"`          // avoided_loss / missed_gain / neutral / no_base / stale_quote
+
+	QuoteAsOf string  `json:"quote_as_of,omitempty"` // 行情数据源时刻（stale 时为最近已知）
+	LastPrice float64 `json:"last_price,omitempty"`  // 最近已知价（stale 展示用，不参与结论）
 }
 
 // 错过机会判定阈值：放弃后涨/跌超过该幅度（%）才计为「错过上涨/回避正确」。
@@ -354,6 +368,8 @@ func missedVerdict(passedPrice, currentPrice float64) (pct float64, verdict stri
 }
 
 // MissedOpportunities 已放弃标的的复盘视图：验证「是正确回避风险，还是错过机会」。
+// fail-closed：结论只建立在当前有效行情上——stale 行情的「错过上涨/回避正确」是
+// 建立在旧价上的假结论，标 stale_quote 并保留最近已知价供参考。
 func (s *WatchlistService) MissedOpportunities(ctx context.Context, userID int64) ([]MissedOpportunityView, error) {
 	var items []model.WatchlistItem
 	if err := common.DB.Where("user_id = ? AND research_stage = ?", userID, model.StagePassed).
@@ -364,15 +380,23 @@ func (s *WatchlistService) MissedOpportunities(ctx context.Context, userID int64
 	for _, it := range items {
 		refs = append(refs, QuoteRef{Market: it.Market, Symbol: it.Symbol})
 	}
-	quotes := s.market.QuotesFor(ctx, refs)
+	quotes := s.market.FreshQuotesFor(ctx, refs)
 
 	out := make([]MissedOpportunityView, 0, len(items))
 	for _, it := range items {
 		v := MissedOpportunityView{WatchlistItem: it, Verdict: "no_base"}
-		if q := quotes[QuoteKey(it.Market, it.Symbol)]; q != nil {
-			v.CurrentPrice = q.Price
-			v.QuoteOK = true
-			v.ChangeSincePct, v.Verdict = missedVerdict(it.PassedPrice, q.Price)
+		if fq, ok := quotes[QuoteKey(it.Market, it.Symbol)]; ok && fq.Quote != nil && fq.Quote.Price > 0 {
+			if !fq.Quote.DataTime.IsZero() {
+				v.QuoteAsOf = fq.Quote.DataTime.In(time.Local).Format("2006-01-02 15:04")
+			}
+			if fq.Fresh.Status == freshStatusFresh {
+				v.CurrentPrice = fq.Quote.Price
+				v.QuoteOK = true
+				v.ChangeSincePct, v.Verdict = missedVerdict(it.PassedPrice, fq.Quote.Price)
+			} else {
+				v.Verdict = "stale_quote"
+				v.LastPrice = fq.Quote.Price
+			}
 		}
 		out = append(out, v)
 	}

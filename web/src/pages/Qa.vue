@@ -12,6 +12,7 @@ import {
   NModal,
   NTooltip,
   NTag,
+  useDialog,
   useMessage,
 } from 'naive-ui'
 import {
@@ -34,6 +35,7 @@ import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
 
 const message = useMessage()
+const dialog = useDialog()
 const route = useRoute()
 const router = useRouter()
 const { vars, withAlpha } = useUi()
@@ -108,7 +110,10 @@ async function scrollToBottom() {
   if (scrollBox.value) scrollBox.value.scrollTop = scrollBox.value.scrollHeight
 }
 
-async function send() {
+// allowStale 显式比较 === true：模板 @click/@keydown 直接绑 send 时首参是 Event 对象，
+// 不得被误当成「已确认历史解释模式」。
+async function send(allowStale?: boolean | Event) {
+  const staleOk = allowStale === true
   if (asking.value) return // 回车/连击防抖：请求在途时不重复提交
   const q = question.value.trim()
   if (!q) return
@@ -132,6 +137,7 @@ async function send() {
         llm_config_id: llmId.value,
         question: q,
         analysis_record_id: !current.value && fromAnalysisId.value ? fromAnalysisId.value : undefined,
+        allow_stale: staleOk || undefined,
       },
       onStreamChunk,
     )
@@ -144,7 +150,22 @@ async function send() {
     await scrollToBottom()
     await loadHistory()
   } catch (e) {
-    message.error((e as Error).message)
+    const msg = (e as Error).message || ''
+    // 行情时效 fail-closed：后端拒绝按最新行情首答时给用户显式降级选择（历史数据解释
+    // 模式），不悄悄放行——确认后带 allow_stale 重试（与个股分析同款交互）。
+    if (!staleOk && msg.includes('历史数据解释')) {
+      dialog.warning({
+        title: '行情非最新，无法按最新行情回答',
+        content: msg + '。是否按「截至行情时刻的历史数据解释」模式继续？该模式下回答不代表当前盘面，也不会给出当前买卖参考。',
+        positiveText: '按历史数据解释提问',
+        negativeText: '取消',
+        onPositiveClick: () => {
+          void send(true)
+        },
+      })
+    } else {
+      message.error(msg)
+    }
   } finally {
     asking.value = false
     resetStream()
@@ -171,6 +192,13 @@ function newChatFromCurrent() {
 }
 
 // ---------- 风险闸门标签（S1）----------
+// 会话快照的展示用时效：按读取时刻重判的 current_status 优先（后端 Get 回填），
+// 旧记录无该字段时回退快照创建时的 freshness_status。
+const qaFreshStatus = computed(() => {
+  const m = current.value?.snapshot_meta
+  return m?.current_status || m?.freshness_status || ''
+})
+
 function riskTagType(f: RiskFlag): 'error' | 'warning' | 'default' {
   if (f.level === 'block') return 'error'
   if (f.level === 'warn') return 'warning'
@@ -329,13 +357,23 @@ onMounted(async () => {
             </div>
           </template>
 
-          <!-- 行情新鲜度（q9：快照采集时点/行情数据时间/来源/状态） -->
+          <!-- 行情新鲜度（q10）：以按读取时刻重判的 current_status 为准展示——快照内的
+               freshness_status 是创建时的历史事实，昨天 fresh 的会话今天必须能亮「行情非最新」。 -->
           <div v-if="current?.snapshot_meta" class="fresh-row">
-            <n-tooltip v-if="current.snapshot_meta.freshness_status === 'stale'" trigger="hover" style="max-width: 340px">
+            <n-tooltip
+              v-if="qaFreshStatus === 'stale' || qaFreshStatus === 'unknown'"
+              trigger="hover"
+              style="max-width: 340px"
+            >
               <template #trigger>
-                <n-tag size="small" type="warning" :bordered="false">⚠ 行情非最新</n-tag>
+                <n-tag size="small" :type="qaFreshStatus === 'stale' ? 'warning' : 'default'" :bordered="false">
+                  ⚠ {{ qaFreshStatus === 'stale' ? '行情非最新' : '行情时效未核验' }}
+                </n-tag>
               </template>
-              该会话快照的行情已尝试全部数据源仍非最新（可能停牌、休市或数据源延迟）；回答涉及价格以「行情截至时间」为准。
+              {{
+                current.snapshot_meta.current_note ||
+                '该会话快照的行情已非当前有效口径（可能停牌、休市、跨天或数据源延迟）；回答涉及价格以「行情截至时间」为准，不代表当前盘面。'
+              }}
             </n-tooltip>
             <span class="fresh-text">
               行情截至 {{ current.snapshot_meta.quote_as_of || '—' }} · 技术指标截至
@@ -378,7 +416,7 @@ onMounted(async () => {
               的数据快照提问——问答所见与分析所见完全一致，可直接追问分析结论。
             </n-alert>
             <div v-else class="starter-hint">
-              首次提问会按最新行情采集一次该股的行情与技术指标快照（数据过期会自动换源并如实标注），之后多轮追问都基于这份快照，不重复拉数据。
+              首次提问会采集一次该股的行情与技术指标快照并核验时效：行情非最新（停牌/休市异常/数据源故障）时会先征求你的确认，确认后按「截至行情时刻的历史数据解释」回答；之后多轮追问都基于这份快照（跨天后会重新标注时效），不重复拉数据。
             </div>
           </div>
 

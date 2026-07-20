@@ -25,6 +25,7 @@ import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import StatCard from '@/components/StatCard.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
+import FreshnessTag from '@/components/FreshnessTag.vue'
 
 const message = useMessage()
 const { pctColor, vars } = useUi()
@@ -42,6 +43,15 @@ const etfMarketValue = computed(() =>
   etfHoldings.value.reduce((s, h) => s + (h.quote_ok ? h.market_value : h.cost), 0),
 )
 const etfProfit = computed(() => etfHoldings.value.reduce((s, h) => s + h.profit_amount, 0))
+// 行情非 fresh 的持仓：后端按成本估值、盈亏记 0（fail-closed）。前端必须如实标注，
+// 不得把成本冒充「市值」、把 0 冒充「盈亏」。
+const etfStaleCount = computed(() => etfHoldings.value.filter((h) => !h.quote_ok).length)
+const etfValueSub = computed(() =>
+  etfStaleCount.value > 0 ? `${etfStaleCount.value} 笔行情非最新，按成本计入（非实时市值）` : undefined,
+)
+const etfProfitSub = computed(() =>
+  etfStaleCount.value > 0 ? `不含 ${etfStaleCount.value} 笔行情非最新持仓（盈亏未知）` : undefined,
+)
 
 async function loadQuotes() {
   try {
@@ -120,7 +130,7 @@ onMounted(load)
 </script>
 
 <template>
-  <PageContainer title="指数 ETF" subtitle="精选宽基/行业/跨境 ETF · 一键模拟买卖 · 真实行情成交">
+  <PageContainer title="指数 ETF" subtitle="精选宽基/行业/跨境 ETF · 一键模拟买卖 · 行情带时效标注">
     <template #actions>
       <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>
     </template>
@@ -132,10 +142,10 @@ onMounted(load)
           <StatCard label="模拟盘现金" :value="fmtMoney(overview?.account.cash ?? 0)" />
         </n-gi>
         <n-gi>
-          <StatCard label="ETF 持仓市值" :value="fmtMoney(etfMarketValue)" />
+          <StatCard label="ETF 持仓市值" :value="fmtMoney(etfMarketValue)" :sub="etfValueSub" />
         </n-gi>
         <n-gi>
-          <StatCard label="ETF 持仓盈亏" :value="fmtMoney(etfProfit)" />
+          <StatCard label="ETF 持仓盈亏" :value="fmtMoney(etfProfit)" :sub="etfProfitSub" />
         </n-gi>
       </n-grid>
 
@@ -163,9 +173,12 @@ onMounted(load)
                 <td class="qv-mono">{{ e.symbol }}</td>
                 <td>{{ e.name }}</td>
                 <td class="etf-index">{{ e.index }}</td>
-                <td class="qv-tnum">{{ e.quote_ok ? fmt(e.price) : '—' }}</td>
+                <td class="qv-tnum">
+                  {{ e.quote_ok ? fmt(e.price) : '—' }}
+                  <FreshnessTag :status="e.freshness_status" :as-of="e.quote_as_of" />
+                </td>
                 <td>
-                  <ChangeTag v-if="e.quote_ok" :value="e.change_pct" size="small" />
+                  <ChangeTag v-if="e.quote_ok && e.freshness_status === 'fresh'" :value="e.change_pct" size="small" />
                   <span v-else class="etf-index">—</span>
                 </td>
                 <td>
@@ -203,11 +216,32 @@ onMounted(load)
               </td>
               <td class="qv-tnum">{{ h.quantity }}</td>
               <td class="qv-tnum">{{ fmt(h.avg_cost) }}</td>
-              <td class="qv-tnum">{{ h.quote_ok ? fmt(h.price) : '—' }}</td>
-              <td class="qv-tnum">{{ fmtMoney(h.market_value) }}</td>
-              <td class="qv-tnum" :style="{ color: pctColor(h.profit_amount) }">
+              <td class="qv-tnum">
+                <template v-if="h.quote_ok">{{ fmt(h.price) }}</template>
+                <template v-else>
+                  <span v-if="h.last_price" class="hold-last">{{ fmt(h.last_price) }}</span>
+                  <span v-else>—</span>
+                  <FreshnessTag
+                    :status="h.freshness_status || 'stale'"
+                    :as-of="h.quote_as_of"
+                    :reason="h.stale_reason"
+                  />
+                </template>
+              </td>
+              <!-- 行情非最新：后端用成本代市值、盈亏置 0——如实标「≈成本」与「未知」，
+                   不冒充实时市值/真实盈亏。 -->
+              <td class="qv-tnum">
+                <template v-if="h.quote_ok">{{ fmtMoney(h.market_value) }}</template>
+                <template v-else>
+                  {{ fmtMoney(h.cost) }}<span class="hold-approx">（按成本，非实时）</span>
+                </template>
+              </td>
+              <td v-if="h.quote_ok" class="qv-tnum" :style="{ color: pctColor(h.profit_amount) }">
                 {{ fmtMoney(h.profit_amount) }}
                 <span class="hold-pct">({{ h.profit_pct.toFixed(2) }}%)</span>
+              </td>
+              <td v-else class="qv-tnum">
+                <span class="hold-approx">未知（行情非最新）</span>
               </td>
               <td>
                 <div class="etf-ops">
@@ -305,6 +339,15 @@ onMounted(load)
 }
 .hold-pct {
   font-size: 12px;
+}
+/* 行情非最新的降级展示：最近已知价（非现价）与「按成本/未知」说明 */
+.hold-last {
+  opacity: 0.65;
+  margin-right: 4px;
+}
+.hold-approx {
+  font-size: 12px;
+  opacity: 0.65;
 }
 .etf-notes {
   margin: 0;

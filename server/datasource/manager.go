@@ -153,9 +153,11 @@ type QuoteAccept func(*Quote) bool
 // 全部源都不新鲜时返回最新候选（fresh=false，err=nil，由调用方按候选自行降级并诚实标注）；
 // 全部源取数失败才返回 err。
 //
-// 与 routeCap 的差异：成功恒记 outcomeSuccess（数据旧不是源健康问题）；且仅在「零候选」
-// （全部取数失败/跳过）时才补跑冷却源——已有过期候选时不打扰冷却源（停牌/休市场景三源必然
-// 同旧，补跑只白烧总预算换不来新数据）。
+// 与 routeCap 的差异：成功恒记 outcomeSuccess（数据旧不是源健康问题）。冷却源在健康源
+// 之后**有界探测**（每源至多一次、共享 ctx 总预算）：健康源全 stale 时冷却源可能恰是
+// 唯一有新数据的（如主源限流被冷却、其余源数据停滞），跳过它却对外声称「已尝试全部
+// 数据源」是撒谎；停牌/休市场景确实白试一轮，由 service 层 freshMissTTL 短标记兜住
+// 重复扫源成本。
 func (m *Manager) GetQuoteFresh(ctx context.Context, market, symbol string, accept QuoteAccept) (*Quote, bool, error) {
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
@@ -202,25 +204,25 @@ func (m *Manager) GetQuoteFresh(ctx context.Context, market, symbol string, acce
 			lastErr = err
 		}
 	}
-	// 仅当零候选（全失败/跳过）时才补跑冷却源；已有过期候选则不打扰。
-	if best == nil {
-		for _, a := range cooled {
-			if ctx.Err() != nil {
-				break
+	// 冷却源有界探测：健康源没找到 fresh（候选缺席或仅有 stale）时，冷却中的源也各试
+	// 一次——健康源全 stale 不代表冷却源没有新数据（主源限流冷却场景），且只有真正试过
+	// 才配得上「已尝试全部可用数据源」的对外声明。预算由 ctx 总超时约束。
+	for _, a := range cooled {
+		if ctx.Err() != nil {
+			break
+		}
+		q, ok, err := attemptSource(m, ctx, "quote", a, call)
+		if ok {
+			if consider(q) {
+				return best, true, nil
 			}
-			q, ok, err := attemptSource(m, ctx, "quote", a, call)
-			if ok {
-				if consider(q) {
-					return best, true, nil
-				}
-				continue
-			}
-			if errors.Is(err, ErrSymbolInvalid) {
-				return nil, false, err
-			}
-			if !errors.Is(err, ErrNotSupported) {
-				lastErr = err
-			}
+			continue
+		}
+		if errors.Is(err, ErrSymbolInvalid) {
+			return nil, false, err
+		}
+		if !errors.Is(err, ErrNotSupported) {
+			lastErr = err
 		}
 	}
 	if best != nil {

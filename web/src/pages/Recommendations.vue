@@ -446,6 +446,9 @@ function actionColor(a: string) {
 function fmt(n: number | undefined) {
   return n == null || n === 0 ? '—' : n.toFixed(2)
 }
+// 本地日期（YYYY-MM-DD）：追踪价归属日早于它 = 后端拿不到当日 fresh 行情、回退末根
+// 日线收盘，展示须标「X 收盘价」而非「现价」。
+const todayStr = new Date().toLocaleDateString('sv-SE')
 function fmtTime(t: string) {
   return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : ''
 }
@@ -667,7 +670,7 @@ function bearSeverityLabel(sev: string): string {
   return sev === 'high' ? '高危' : sev === 'med' ? '中危' : '低危'
 }
 const QG_FIELD_LABEL: Record<string, string> = {
-  quote: '实时行情',
+  quote: '有效行情',
   daily_bars: '日线数据',
   daily_bars_stale: '日线过期',
   daily_bars_short: '日线样本不足',
@@ -1000,6 +1003,12 @@ function qgFieldLabels(fields?: string[]): string {
 
                   <div class="card-sub">
                     生成时现价 <b>{{ fmt(it.ref_price) }}</b>
+                    <span
+                      v-if="it.detail?.quote_as_of"
+                      class="quote-asof"
+                      title="该条推荐所依据行情的数据源时刻（行情时效硬门核验通过）"
+                      >（行情时点 {{ it.detail.quote_as_of.slice(5) }}）</span
+                    >
                     <template v-if="it.position">
                       · 实际买入 <b>{{ fmt(it.position.buy_price) }}</b> × {{ it.position.quantity }}
                       <span v-if="it.position.buy_date">（{{ it.position.buy_date }}）</span>
@@ -1038,7 +1047,14 @@ function qgFieldLabels(fields?: string[]): string {
                       <span v-if="it.status.review_needed" class="track-review" :style="{ color: downColor }"
                         >建议复盘</span
                       >
-                      <span class="track-updated">现价 {{ fmt(it.status.current_price) }}</span>
+                      <!-- 追踪价的归属日（last_eval_date）非今日=后端拿不到当日 fresh 行情、
+                           回退末根日线收盘——如实标「收盘价」而非「现价」。 -->
+                      <span class="track-updated">
+                        <template v-if="it.status.last_eval_date && it.status.last_eval_date < todayStr">
+                          {{ it.status.last_eval_date.slice(5) }} 收盘价 {{ fmt(it.status.current_price) }}
+                        </template>
+                        <template v-else>现价 {{ fmt(it.status.current_price) }}</template>
+                      </span>
                     </div>
                     <div class="track-grid">
                       <div class="tk">

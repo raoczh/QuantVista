@@ -147,14 +147,21 @@ func factorByKey(key string) (factorDef, bool) {
 // FactorTable 列式因子宽表：Symbols 为行索引，cols 按因子 key 存列（NaN=缺失）。
 // 构建完成后只读，多请求并发扫描无锁。
 type FactorTable struct {
-	TradeDate string // 全市场最新交易日（表数据的"新鲜"基准）
-	BuiltAt   time.Time
-	BuildMs   int64
-	ScanMs    int64 // DB 流式读耗时（含在 BuildMs 内，供性能观察）
-	Symbols   []string
-	Names     []string
-	LastDates []string // 各股末根交易日（= TradeDate 为 fresh）
-	cols      map[string][]float64
+	TradeDate string // 全市场最新交易日（库内 MAX，表数据的"新鲜"基准）
+	// ExpectedDate 按交易日历应有的最新交易日（P1：不能只和库内自身 MAX 比较——
+	// 整库落后时 MAX 仍判「新鲜」）；LagOpenDays 为 TradeDate 落后 ExpectedDate 的
+	// 开市日数（0=齐平，-1=日历不可用无法判定）；FreshCoverage 为末根=TradeDate 的
+	// 行占比（0~1，停牌/滞后股拉低覆盖率）。
+	ExpectedDate  string
+	LagOpenDays   int
+	FreshCoverage float64
+	BuiltAt       time.Time
+	BuildMs       int64
+	ScanMs        int64 // DB 流式读耗时（含在 BuildMs 内，供性能观察）
+	Symbols       []string
+	Names         []string
+	LastDates     []string // 各股末根交易日（= TradeDate 为 fresh）
+	cols          map[string][]float64
 }
 
 // Len 行数（宇宙内标的数）。
@@ -635,7 +642,55 @@ func buildFactorTable(ctx context.Context) (*FactorTable, error) {
 		}
 	}
 	t.BuildMs = time.Since(start).Milliseconds()
+	// P1 新鲜度对照：与「按交易日历应有的交易日」比较（库内 MAX 只反映自身进度），
+	// 并统计 fresh 行覆盖率——消费方（选股/策略信号/状态页）据此判断与提示滞后。
+	t.ExpectedDate = wideExpectedDate(time.Now())
+	t.LagOpenDays = openDaysBehind(t.TradeDate, t.ExpectedDate)
+	if n := len(t.LastDates); n > 0 {
+		freshRows := 0
+		for _, d := range t.LastDates {
+			if d == t.TradeDate {
+				freshRows++
+			}
+		}
+		t.FreshCoverage = float64(freshRows) / float64(n)
+	}
 	return t, nil
+}
+
+// wideExpectedDate 全市场日线「应有交易日」（按交易日历，非库内自身 MAX）：
+// 交易日 16:30（16:10 增量 job 完成余量）后应有今日 bar；其余时刻应有最近上一开市日。
+func wideExpectedDate(now time.Time) string {
+	today := now.Format("2006-01-02")
+	if isTradingDayToday(now) && now.Hour()*60+now.Minute() >= 16*60+30 {
+		return today
+	}
+	return prevOpenTradeDate(today)
+}
+
+// openDaysBehind dbMax 相对 expected 落后的开市日数（0=齐平或超前；-1=日历不可用，
+// 无法判定——消费方一律 fail-closed 处理，不得当 0 用）。
+// dbMax < expected 而区间内日历无开市日记录时返回 -1 而非 0：日历缺失时把「明明落后」
+// 判成「齐平」，会让真正落后的数据（旧因子表/旧信号）永久冒充新鲜。
+func openDaysBehind(dbMax, expected string) int {
+	if dbMax == "" || expected == "" || dbMax >= expected {
+		return 0
+	}
+	if common.DB == nil {
+		return -1
+	}
+	var n int64
+	if err := common.DB.Model(&model.TradingCalendar{}).
+		Where("market = ? AND is_open = ? AND trade_date > ? AND trade_date <= ?", "cn", true, dbMax, expected).
+		Count(&n).Error; err != nil {
+		return -1
+	}
+	if n == 0 {
+		// dbMax 严格早于 expected 却数不出开市日 = 该区间日历缺失（expected 若来自
+		// 日历必有自身一行）。诚实返回「无法判定」。
+		return -1
+	}
+	return int(n)
 }
 
 // isSTName 名称含 ST（含 *ST）或退市警示。

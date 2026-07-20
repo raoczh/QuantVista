@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,10 @@ type QaAskRequest struct {
 	LLMConfigID      int64  `json:"llm_config_id"`
 	Question         string `json:"question"`
 	AnalysisRecordID int64  `json:"analysis_record_id"` // >0：新会话复用该分析记录快照（须本人的个股分析）
+	// AllowStale 行情过期时的显式降级选择（与个股分析 allow_stale 同语义 fail-closed）：
+	// 默认 false——新会话采集快照时全源无 fresh 行情则拒绝生成首答（前端弹确认）；
+	// 显式置 true 才按「截至行情时刻的历史数据解释」口径创建会话（快照打 stale_mode）。
+	AllowStale bool `json:"allow_stale"`
 }
 
 // QaConversationView 会话 + 消息列表。RiskFlags 为快照 risk_gate 的程序化风险标志
@@ -58,8 +63,12 @@ type qaSnapshotMeta struct {
 	QuoteAsOf       string `json:"quote_as_of,omitempty"`
 	BarsAsOf        string `json:"bars_as_of,omitempty"`
 	QuoteSource     string `json:"quote_source,omitempty"`
-	FreshnessStatus string `json:"freshness_status,omitempty"`
+	FreshnessStatus string `json:"freshness_status,omitempty"` // 快照创建时的判定（历史事实，不随时间变化）
 	MarketState     string `json:"market_state,omitempty"`
+	// 按「读取时刻」重判的当前时效（P0 第二轮：旧会话不会随时间重新判定过期——
+	// 昨天创建时 fresh 的会话今天仍声明 fresh）。前端展示以 current_status 优先。
+	CurrentStatus string `json:"current_status,omitempty"` // fresh | stale | unknown
+	CurrentNote   string `json:"current_note,omitempty"`
 }
 
 // qaAskContext 一次提问的准备产物：prepare 与 finalize 之间的共享状态
@@ -185,6 +194,21 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 		if err != nil {
 			return nil, err
 		}
+		// 首答新鲜度门（P0 第二轮，与个股分析 allow_stale 同语义 fail-closed）：
+		// 全源无 fresh 行情（stale/unknown）时默认拒绝创建会话——「按最新行情采集」
+		// 的承诺不能建立在旧行情上；用户显式 allow_stale 才按历史解释口径创建，
+		// 快照打 stale_mode 标（buildMessages 会注入硬约束段）。
+		if st, _ := snap["freshness_status"].(string); st != "" && st != freshStatusFresh {
+			asOf, _ := snap["quote_as_of"].(string)
+			if !req.AllowStale {
+				if st == freshStatusUnknown {
+					return nil, errors.New("该市场无交易日历，无法核验行情时效；可选择「按截至行情时刻的历史数据解释」模式继续提问")
+				}
+				return nil, fmt.Errorf("行情已过期（仅更新至 %s，可能停牌、休市异常或数据源故障），无法按最新行情回答；可选择「按截至该时刻的历史数据解释」模式继续提问", orStr(asOf, "未知时间"))
+			}
+			snap["stale_mode"] = "historical_explanation"
+			snap["stale_mode_note"] = "用户已确认行情过期，本会话回答为「截至 " + orStr(asOf, "未知时间") + " 的历史数据解释」，非当前盘面判断"
+		}
 		snapJSON, _ := json.Marshal(fitBudget(snap))
 		symbol, market, _ := normalizeSymbolMarket(req.Symbol, req.Market)
 		conv = model.AiConversation{
@@ -235,16 +259,18 @@ func (s *QaService) finalizeAsk(userID int64, ac *qaAskContext, res *chatResult)
 		vals := snapshotLabeledValues(snap, stockAsOfHints(snap), "recent_bars")
 		// 快照 news 舆情段的新闻标题是文本型合法来源，标题里的小数并入值域（N2）；
 		// announcements 公告段标题（F1）与 risk_gate 提示文本（S1）同理。
-		vals = append(vals, textLabeledValues("新闻标题", newsTitleTexts(snap))...)
-		vals = append(vals, textLabeledValues("公告标题", announcementTitleTexts(snap))...)
-		vals = append(vals, textLabeledValues("风险提示", riskGateTexts(snap))...)
+		vals = append(vals, textLabeledValues("新闻标题", "context", newsTitleTexts(snap))...)
+		vals = append(vals, textLabeledValues("公告标题", "context", announcementTitleTexts(snap))...)
+		vals = append(vals, textLabeledValues("风险提示", "context", riskGateTexts(snap))...)
 		userTexts := []string{ac.question}
 		for _, m := range ac.history {
 			if m.Role == model.QaRoleUser {
 				userTexts = append(userTexts, m.Content)
 			}
 		}
-		vals = append(vals, textLabeledValues("用户提问", userTexts)...)
+		// Origin=user：用户提问里的数字命中只是「复述用户输入」，ev3 分类汇总与前端
+		// 均不得把它冒充「数据快照佐证」。
+		vals = append(vals, textLabeledValues("用户提问", "user", userTexts)...)
 		check := verifyEvidenceLabeled([]evidenceSection{{Module: "回答", Text: answer}}, vals)
 		if b, err := json.Marshal(check); err == nil {
 			checkJSON = string(b)
@@ -317,6 +343,32 @@ func qaPromptVersionFor(userID int64) string {
 	return promptVersionFor(userID, model.PromptModuleQa, qaPromptVersion)
 }
 
+// qaCurrentFreshness 按「当前时刻」重判会话固定快照的行情时效（P0 第二轮：会话快照
+// 固化不回写，但时效声明必须随时间演进——昨天 fresh 的快照今天不能继续声明 fresh）。
+// 返回 状态（fresh/stale/unknown；空=快照无行情时间或无法判定）与人话说明。
+func (s *QaService) qaCurrentFreshness(market string, meta *qaSnapshotMeta) (string, string) {
+	if s.market == nil || meta == nil || meta.QuoteAsOf == "" {
+		return "", ""
+	}
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", meta.QuoteAsOf, time.Local)
+	if err != nil {
+		return "", ""
+	}
+	fi := s.market.QuoteFreshnessOf(orStr(market, "cn"), t)
+	switch fi.Status {
+	case freshStatusFresh:
+		return freshStatusFresh, ""
+	case freshStatusUnknown:
+		return freshStatusUnknown, "该市场无交易日历，无法核验快照行情时效"
+	default:
+		note := fmt.Sprintf("快照行情截至 %s，按当前时刻核验已过期", meta.QuoteAsOf)
+		if fi.ExpectedDate != "" {
+			note += fmt.Sprintf("（期望交易日 %s）", fi.ExpectedDate)
+		}
+		return freshStatusStale, note
+	}
+}
+
 // buildMessages 组装发送给 LLM 的消息序列。系统提示含个股数据快照，历史仅取最近若干条。
 // M3c：module=qa 的自定义模板整段替换默认角色段（占位符宽容渲染），快照注入不变。
 func (s *QaService) buildMessages(conv model.AiConversation, history []model.AiConversationMessage, question string) []chatMessage {
@@ -330,6 +382,14 @@ func (s *QaService) buildMessages(conv model.AiConversation, history []model.AiC
 	sys.WriteString(intro)
 	sys.WriteString("\n\n【个股数据快照】（本次会话固定，供多轮问答复用；JSON，价格为货币单位、金额单位为元）：\n")
 	sys.WriteString(conv.DataSnapshot)
+	// 快照时效按「本轮提问时刻」重判注入（q10）：快照内的 freshness_status 是创建时的
+	// 历史事实，续问跨午休/收盘/隔天后必须以当前重判为准声明——否则昨天 fresh 的会话
+	// 今天仍向模型声明 fresh。
+	if st, note := s.qaCurrentFreshness(conv.Market, parseSnapshotMeta(conv.DataSnapshot, conv.CreatedAt)); st != "" && st != freshStatusFresh {
+		sys.WriteString("\n\n【行情时效（按本轮提问时刻重新核验，优先级高于快照内 freshness_status）】" + note +
+			"。本轮回答涉及价格/涨跌/盘面必须先声明「行情截至 " + orStr(quoteAsOfOf(conv), "快照采集时刻") +
+			"」，一律按历史数据解释口径表述，严禁以「当前/现在/实时」口径描述该快照行情，严禁给出基于当前盘面的买入/卖出/加减仓行动参考。")
+	}
 	sys.WriteString("\n\n对象：" + conv.Name + "（" + conv.Symbol + "）。请只依据以上数据回答，缺失的数据如实说明。")
 
 	msgs := []chatMessage{{Role: "system", Content: sys.String()}}
@@ -345,9 +405,17 @@ func (s *QaService) buildMessages(conv model.AiConversation, history []model.AiC
 	return msgs
 }
 
+// quoteAsOfOf 会话快照的行情数据时刻（buildMessages 时效段展示用）。
+func quoteAsOfOf(conv model.AiConversation) string {
+	if m := parseSnapshotMeta(conv.DataSnapshot, conv.CreatedAt); m != nil {
+		return m.QuoteAsOf
+	}
+	return ""
+}
+
 // qaPromptVersion 问答系统提示版本（会话不落库版本列，仅供代码内追溯）。
-// q9: 快照新鲜度元数据（captured_at/quote_as_of/bars_as_of/quote_source/freshness_status/market_state），stale 时必须声明行情截至时间、非交易时段按收盘口径表述；q8: P3a org_view 机构观点段进快照说明（卖方乐观偏差纪律）；q7: F2 finance 财务段（F10 最新期+趋势）进快照说明；q6: risk_gate 风险闸门段、允许轻量 Markdown（流式渲染配套）；q5: announcements 公告段；q4: news 舆情段；q3: 回答引用的数字会被程序化核验，威慑幻觉；q2: 快照含五维量化评分锚点、要求引用数值、禁用先验记忆。
-const qaPromptVersion = "q9"
+// q10: 首答新鲜度门（全源无 fresh 默认拒绝、allow_stale 才生成且快照打 stale_mode）+ 快照时效按每轮提问时刻重判注入（旧会话跨天不再向模型声明 fresh）；q9: 快照新鲜度元数据（captured_at/quote_as_of/bars_as_of/quote_source/freshness_status/market_state），stale 时必须声明行情截至时间、非交易时段按收盘口径表述；q8: P3a org_view 机构观点段进快照说明（卖方乐观偏差纪律）；q7: F2 finance 财务段（F10 最新期+趋势）进快照说明；q6: risk_gate 风险闸门段、允许轻量 Markdown（流式渲染配套）；q5: announcements 公告段；q4: news 舆情段；q3: 回答引用的数字会被程序化核验，威慑幻觉；q2: 快照含五维量化评分锚点、要求引用数值、禁用先验记忆。
+const qaPromptVersion = "q10"
 
 const qaRoleIntro = `你是一名严谨的证券研究助理，正在就某只个股与用户进行多轮问答。你的回答仅供研究参考，不构成投资建议。
 
@@ -391,6 +459,14 @@ func (s *QaService) Get(userID, id int64) (*QaConversationView, error) {
 	}
 	flags := parseRiskFlagsFromSnapshot(conv.DataSnapshot)
 	meta := parseSnapshotMeta(conv.DataSnapshot, conv.CreatedAt)
+	// 详情读取时按当前时刻重判快照时效（P0 第二轮）：快照内 freshness_status 是创建时
+	// 的历史事实，昨天 fresh 的会话今天必须能显示「行情非最新」。
+	if meta != nil {
+		if st, note := s.qaCurrentFreshness(conv.Market, meta); st != "" {
+			meta.CurrentStatus = st
+			meta.CurrentNote = note
+		}
+	}
 	conv.DataSnapshot = "" // 详情不必回传大快照
 	return &QaConversationView{AiConversation: conv, Messages: msgs, RiskFlags: flags, SnapshotMeta: meta}, nil
 }

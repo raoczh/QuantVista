@@ -80,6 +80,51 @@ export function listSyncLogs(limit = 50) {
   return request<SyncLog[]>({ url: '/admin/market/sync-logs', params: { limit } })
 }
 
+// ---------- P1 数据健康总览与补跑 ----------
+
+export interface DataHealthItem {
+  key: string
+  name: string
+  expected_date: string // 按交易日历应有的最新日期
+  observed_date: string // 库内实际最新日期（空=无数据）
+  lag_open_days: number // 落后开市日数（-1=日历不可用无法判定）
+  tolerance_open_days: number
+  status: string // ok / behind / empty / unknown
+  coverage?: string
+  last_run?: SyncLog
+  note?: string
+}
+
+export interface DataHealthReport {
+  generated_at: string
+  items: DataHealthItem[]
+}
+
+export function getDataHealth() {
+  return request<DataHealthReport>({ url: '/admin/data-health' })
+}
+
+// 补跑入口（既有管理端接口）：全市场增量 / 历史初始化 / 日线批量同步 / 情绪快照 /
+// 因子宽表重建 / 日历回填。均异步或幂等，返回启动标志。
+export function triggerWideSync() {
+  return request<{ started: boolean }>({ url: '/admin/market/wide-sync', method: 'post' })
+}
+export function triggerWideInit() {
+  return request<{ started: boolean }>({ url: '/admin/market/wide-init', method: 'post' })
+}
+export function triggerSyncBars() {
+  return request<{ started: boolean }>({ url: '/admin/market/sync-bars', method: 'post', timeout: HEAVY_TIMEOUT })
+}
+export function triggerSnapshot() {
+  return request<unknown>({ url: '/admin/market/snapshot', method: 'post', timeout: HEAVY_TIMEOUT })
+}
+export function triggerFactorRebuild() {
+  return request<{ started: boolean }>({ url: '/admin/market/factor-rebuild', method: 'post' })
+}
+export function triggerBackfillCalendar() {
+  return request<unknown>({ url: '/admin/market/backfill-calendar', method: 'post', timeout: HEAVY_TIMEOUT })
+}
+
 // ---------- LLM 调用审计 ----------
 
 export interface LLMCallLogItem {

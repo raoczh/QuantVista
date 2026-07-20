@@ -15,20 +15,26 @@ export interface EvidenceItem {
   snap_value?: number
   tolerance?: number
   as_of?: string
-  origin?: string // 命中值域来源：空=数据快照 | plan=模型自身计划价 | user=用户设定阈值
+  origin?: string // 命中值域来源：空=数据快照 | plan=模型自身计划价 | user=用户输入 | context=新闻/公告标题等上下文文本
   reason?: string // not_found | direction_mismatch
 }
 
 // 证据数字核验结果（服务端程序化比对 LLM 引用的数字与数据快照）。
+// ev3 起 matched 拆分来源：snapshot_matched 才是「被数据快照佐证」；plan/user/context
+// 命中只是合法复述（模型计划价/用户输入/上下文文本），展示时不得混称「快照命中」。
 export interface EvidenceCheck {
   total: number
-  matched: number
+  matched: number // 总命中（legacy：含复述命中）
   unmatched?: string[]
-  version?: string // ev2 起带 items 明细
+  version?: string // ev2 起带 items 明细；ev3 起带来源分类计数
   skipped_count?: number
   unmatched_total?: number
   truncated?: boolean
   items?: EvidenceItem[]
+  snapshot_matched?: number // 被数据快照佐证
+  plan_matched?: number // AI 计划价复述
+  user_matched?: number // 用户输入复述
+  context_matched?: number // 上下文文本（新闻/公告标题、提醒文案）复述
 }
 
 // AI 复核结论（verify 模式；symbol 仅推荐域按标的复核时使用）。

@@ -483,15 +483,23 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 
 // evidenceCheck 数值存在性核验结果：AI 文本里引用的数字规范化（单位/方向）后与带路径的
 // 数据快照值域比对。Total/Matched 为去重后的可核验数字计数；Items 为逐项明细（新增，旧行无）。
+// Matched 是总命中数（legacy 兼容）——ev3 起按值域来源拆分：snapshot_matched 才是
+// 「被数据快照佐证」，plan/user/context 命中只是「合法复述」（模型复述自身计划价、
+// 用户输入、新闻标题等），不得混称「快照命中」。
 type evidenceCheck struct {
 	Total          int            `json:"total"`                     // 可核验数字个数（去重后）
-	Matched        int            `json:"matched"`                   // 在快照找到对应数值的个数
+	Matched        int            `json:"matched"`                   // 总命中数（legacy：含 plan/user/context 复述命中）
 	Unmatched      []string       `json:"unmatched,omitempty"`       // 未吻合数字原样（≤10，legacy 兼容）
-	Version        string         `json:"version,omitempty"`         // 核验引擎版本（ev2 起带 items）
+	Version        string         `json:"version,omitempty"`         // 核验引擎版本（ev2 起带 items；ev3 起带来源分类计数）
 	SkippedCount   int            `json:"skipped_count,omitempty"`   // 跳过的非核验对象个数（小整数/年份/代码）
 	UnmatchedTotal int            `json:"unmatched_total,omitempty"` // 未吻合总数（Total-Matched）
 	Truncated      bool           `json:"truncated,omitempty"`       // items 是否被截断至 50
 	Items          []evidenceItem `json:"items,omitempty"`           // 逐项明细
+
+	SnapshotMatched int `json:"snapshot_matched"`           // 被数据快照佐证的个数（origin 空）
+	PlanMatched     int `json:"plan_matched,omitempty"`     // 命中模型自身计划价/公式输出（复述，非快照佐证）
+	UserMatched     int `json:"user_matched,omitempty"`     // 命中用户输入/设定阈值（复述，非快照佐证）
+	ContextMatched  int `json:"context_matched,omitempty"`  // 命中新闻/公告标题、提醒文案等上下文文本
 }
 
 var evidenceNumRe = regexp.MustCompile(`[-+]?\d+(?:\.\d+)?`)
@@ -626,16 +634,12 @@ func systemConfidence(c candidate, ev *evidenceCheck, poolSize int) (string, str
 		}
 	}
 	if ev != nil && ev.Total > 0 {
-		ratio := float64(ev.Matched) / float64(ev.Total)
-		switch {
-		case ratio >= 0.7:
-			level++
-			reasons = append(reasons, fmt.Sprintf("证据核验 %d/%d 吻合", ev.Matched, ev.Total))
-		case ratio < 0.4:
-			level--
-			reasons = append(reasons, fmt.Sprintf("证据核验仅 %d/%d 吻合", ev.Matched, ev.Total))
-		default:
-			reasons = append(reasons, fmt.Sprintf("证据核验 %d/%d 吻合", ev.Matched, ev.Total))
+		// ev3：升档只认快照佐证（复述命中剔出分母）、降档看总命中率——口径在
+		// evidenceConfidenceSignal（与分析 analysisSystemConfidence 共用）。
+		delta, reason := evidenceConfidenceSignal(ev)
+		level += delta
+		if reason != "" {
+			reasons = append(reasons, reason)
 		}
 	}
 	if c.Factors == nil || c.Factors.BarCount < 20 {

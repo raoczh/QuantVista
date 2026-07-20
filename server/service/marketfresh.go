@@ -147,7 +147,7 @@ func stockFreshnessNote(fi quoteFreshInfo, dataTime time.Time) (note, sessionNot
 		dt = dataTime.Format("2006-01-02 15:04")
 	}
 	if fi.Status == freshStatusStale {
-		note = fmt.Sprintf("行情仅更新至 %s（期望交易日 %s），已尝试全部数据源仍未取到更新数据，可能停牌、休市或数据源延迟，不代表实时盘面", dt, fi.ExpectedDate)
+		note = fmt.Sprintf("行情仅更新至 %s（期望交易日 %s），已尝试全部可用数据源（含冷却源有界探测）仍未取到更新数据，可能停牌、休市或数据源延迟，不代表实时盘面", dt, fi.ExpectedDate)
 		return note, ""
 	}
 	if fi.MarketState != marketStateTrading {

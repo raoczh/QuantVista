@@ -361,7 +361,9 @@ func (s *GuardService) evaluateGuardUser(ctx context.Context, userID int64, cfg 
 	quotes := s.market.FreshQuotesFor(ctx, refs)
 	freshQuote := func(market, symbol string) *datasource.Quote {
 		fq, ok := quotes[QuoteKey(market, symbol)]
-		if !ok || fq.Quote == nil || fq.Quote.Price <= 0 || fq.Fresh.Status == freshStatusStale {
+		// fail-closed：仅 fresh 放行（unknown 同样不评——无法核验时效的行情驱动
+		// 守护推送与旧价误触发同责）。
+		if !ok || fq.Quote == nil || fq.Quote.Price <= 0 || fq.Fresh.Status != freshStatusFresh {
 			return nil
 		}
 		return fq.Quote

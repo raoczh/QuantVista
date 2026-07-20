@@ -8,6 +8,8 @@ export interface EtfItem {
   price: number
   change_pct: number
   quote_ok: boolean
+  quote_as_of?: string // 行情数据源时刻
+  freshness_status?: string // fresh | stale（展示行统一过期徽标）
 }
 
 export function getEtfList() {

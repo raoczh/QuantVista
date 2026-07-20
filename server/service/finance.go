@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -44,6 +45,7 @@ const (
 	finMaxPages       = 40        // 单类单期页数护栏（全市场预约披露约 12 页）
 	annPageSize       = 30        // 每股公告单轮拉取条数
 	annFetchCooldown  = time.Hour // 详情页按需补拉冷却
+	annStaleDays      = 7         // P1 公告水位：最新公告老于该天数时允许按需补拉（旧记录不永久阻止更新）
 	annSymbolsMax     = 80        // 每日公告采集的标的上限（自选∪持仓）
 	forecastFreshDays = 7         // earn_fcst：预告发布后多少自然日内算「新预告」
 )
@@ -347,8 +349,9 @@ func (s *FinanceService) fetchAnnouncements(ctx context.Context, symbol string) 
 	return inserted
 }
 
-// ListAnnouncements 个股公告查询（详情页「公告」块）。库中该股无记录时按需实时补拉
-// 一次（冷却 1h，防详情页被刷打上游），采集范围外的股也能看到公告。
+// ListAnnouncements 个股公告查询（详情页「公告」块）。库中该股无记录、或最新公告已老于
+// annStaleDays（P1：有旧记录不能永久阻止更新——一年前的旧公告会让该股公告面永远停更）
+// 时按需实时补拉一次（冷却 1h，防详情页被刷打上游），采集范围外的股也能看到公告。
 func (s *FinanceService) ListAnnouncements(ctx context.Context, symbol string, limit int) ([]model.Announcement, error) {
 	symbol = strings.TrimSpace(symbol)
 	if !isSixDigits(symbol) {
@@ -359,7 +362,17 @@ func (s *FinanceService) ListAnnouncements(ctx context.Context, symbol string, l
 	}
 	var cnt int64
 	common.DB.Model(&model.Announcement{}).Where("symbol = ?", symbol).Count(&cnt)
-	if cnt == 0 && s.annFetchAllowed(symbol) {
+	needFetch := cnt == 0
+	if !needFetch {
+		var latest sql.NullString
+		common.DB.Model(&model.Announcement{}).Where("symbol = ?", symbol).
+			Select("MAX(notice_date)").Scan(&latest)
+		if latest.Valid && latest.String != "" &&
+			latest.String < time.Now().AddDate(0, 0, -annStaleDays).Format("2006-01-02") {
+			needFetch = true
+		}
+	}
+	if needFetch && s.annFetchAllowed(symbol) {
 		fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		s.fetchAnnouncements(fctx, symbol)
 		cancel()

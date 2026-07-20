@@ -52,12 +52,18 @@ func TestAnalysisSystemConfidence(t *testing.T) {
 		}
 		return s
 	}
-	// high：证据高吻合(+1)、锚点齐全、无偏旧 → 2。
-	if lvl, _ := analysisSystemConfidence(&evidenceCheck{Total: 10, Matched: 9}, stock(nil)); lvl != "high" {
+	// high：证据高吻合(+1)、锚点齐全、无偏旧 → 2。（手工构造须与真实 ev3 形态一致：
+	// Matched 全为快照命中时 SnapshotMatched==Matched——升档口径只认快照佐证。）
+	if lvl, _ := analysisSystemConfidence(&evidenceCheck{Total: 10, Matched: 9, SnapshotMatched: 9}, stock(nil)); lvl != "high" {
 		t.Fatalf("期望 high，得到 %s", lvl)
 	}
+	// 全绿但全是复述（快照佐证 0）：不升档，medium——「AI 复述自己计划价全命中」
+	// 不得冒充被数据证明（P0 第二轮：主口径只认 snapshot_matched）。
+	if lvl, why := analysisSystemConfidence(&evidenceCheck{Total: 6, Matched: 6, PlanMatched: 4, UserMatched: 2}, stock(nil)); lvl != "medium" {
+		t.Fatalf("全复述不应升档，期望 medium，得到 %s（%s）", lvl, why)
+	}
 	// low：证据低吻合(-1) + 缺技术因子(-1) → -1 clamp 0。
-	if lvl, _ := analysisSystemConfidence(&evidenceCheck{Total: 10, Matched: 2},
+	if lvl, _ := analysisSystemConfidence(&evidenceCheck{Total: 10, Matched: 2, SnapshotMatched: 2},
 		map[string]any{"quote": map[string]any{"price": 10.0}}); lvl != "low" {
 		t.Fatalf("期望 low，得到 %s", lvl)
 	}
@@ -66,7 +72,7 @@ func TestAnalysisSystemConfidence(t *testing.T) {
 		t.Fatalf("期望 medium，得到 %s", lvl)
 	}
 	// 数据偏旧扣一档：high 基线(+1) 遇 freshness_note(-1) → medium。
-	if lvl, _ := analysisSystemConfidence(&evidenceCheck{Total: 10, Matched: 9},
+	if lvl, _ := analysisSystemConfidence(&evidenceCheck{Total: 10, Matched: 9, SnapshotMatched: 9},
 		stock(map[string]any{"freshness_note": "偏旧"})); lvl != "medium" {
 		t.Fatalf("偏旧应降一档到 medium，得到 %s", lvl)
 	}

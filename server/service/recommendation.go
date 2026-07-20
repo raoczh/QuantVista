@@ -289,8 +289,8 @@ type recPick struct {
 	// --- 服务端回填（信任层）---
 	// PositionPct S1-2 建议仓位（占总资金 %，目标波动模型程序计算，非 LLM 输出；
 	// 0=无法给出，PositionWhy 说明公式因子与原因）。
-	PositionPct float64 `json:"position_pct,omitempty"`
-	PositionWhy string  `json:"position_why,omitempty"`
+	PositionPct      float64        `json:"position_pct,omitempty"`
+	PositionWhy      string         `json:"position_why,omitempty"`
 	QuantScore       float64        `json:"quant_score,omitempty"`        // 量化综合分
 	QuantRank        int            `json:"quant_rank,omitempty"`         // 池内排名
 	PoolSize         int            `json:"pool_size,omitempty"`          // 参与排名的标的数
@@ -472,8 +472,8 @@ func (s *RecommendationService) prepareGeneration(userID int64, allowPrivate boo
 func (p *recGenPlan) newProcessingBatch() *model.RecommendationBatch {
 	return &model.RecommendationBatch{
 		UserID: p.userID, Type: p.recType, Market: p.market, Strategy: p.strat.Key,
-		Title:  composeBatchTitle(p.recType, p.strat, p.filters, p.count),
-		Status: model.RecStatusProcessing,
+		Title:       composeBatchTitle(p.recType, p.strat, p.filters, p.count),
+		Status:      model.RecStatusProcessing,
 		LLMConfigID: p.cfg.ID, Provider: p.cfg.Provider, Model: p.cfg.Model,
 		// M3c：启用 recommend 自定义模板时版本号加 -custom 后缀（同分析域前例，历史可归因）。
 		PromptVersion:   promptVersionFor(p.userID, model.PromptModuleRecommend, recPromptVersion),
@@ -517,8 +517,9 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	recType, market, strat, filters, count := plan.recType, plan.market, plan.strat, plan.filters, plan.count
 	cfg, apiKey, allowPrivate := plan.cfg, plan.apiKey, plan.allowPrivate
 
-	// 阶段①②：多源建池（来源随策略组合）+ 基础准入 + 用户筛选（被筛掉的保留原因）。
-	pool, err := s.buildPool(ctx, userID, market, recType, strat, filters)
+	// 阶段①②：多源建池（来源随策略组合）+ 基础准入 + 行情时效刷新（qf3 前置）+
+	// 用户筛选（基于刷新后行情，被筛掉的保留原因）。
+	pool, freshGates, err := s.buildPool(ctx, userID, market, recType, strat, filters)
 	if err != nil {
 		s.failBatch(batch, chatUsage{}, 0, err.Error())
 		return nil, err
@@ -540,6 +541,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	}
 	industryBy := industriesFor(poolSyms)
 	gates := s.scorePool(ctx, recType, strat, pool, filters, industryBy)
+	gates = append(freshGates, gates...)
 	kept, llmCands := 0, make([]candidate, 0, maxLLMCandidates)
 	for _, c := range pool {
 		if c.Excluded == "" {
@@ -549,23 +551,15 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 			llmCands = append(llmCands, c)
 		}
 	}
-	// 行情时效硬门（数据有效性检查，非预测质量门控——影子评审纪律不适用于「数据本身
-	// 已失效」）：终选名单喂 LLM 前逐只走全源新鲜行情核验。fresh→刷新现价/涨跌幅并记
-	// quote_as_of；stale/取不到→透明排除（gate_type=quote_stale 记反事实事件，影子标签
-	// 自然结算可回验此门是否误伤）。全部过期时宁可零推荐也不基于旧价精选。
+	// 终选兜底门：评分期间（数秒~数十秒）行情可能失效，喂 LLM 前再核验一次
+	//（freshenPool 刚拉过、大概率命中缓存）。fresh 刷新现价/涨跌幅并记 quote_as_of；
+	// stale/取不到透明排除。全部过期时宁可零推荐也不基于旧价精选。
 	staleGates := s.applyQuoteFreshGate(ctx, market, pool, &llmCands)
 	gates = append(gates, staleGates...)
 	kept -= len(staleGates)
 	if len(llmCands) == 0 {
-		if len(staleGates) > 0 {
-			msg := "候选行情已全部过期（可能停牌、休市异常或数据源故障）：为避免基于旧价推荐，本次不生成，请稍后重试"
-			s.failBatch(batch, chatUsage{}, 0, msg)
-			return nil, errors.New(msg)
-		}
-		excluded := len(pool) - kept
-		msg := fmt.Sprintf("筛选后候选池为空（共扫描 %d 只，%d 只被筛掉）：请放宽股价/市值/换手等筛选条件后重试", len(pool), excluded)
-		s.failBatch(batch, chatUsage{}, 0, msg)
-		return nil, errors.New(msg)
+		return nil, s.failEmptyShortlist(batch, pool, filters, gates, industryBy, kept,
+			len(staleGates) > 0 || len(freshGates) > 0)
 	}
 	poolBySymbol := make(map[string]candidate, len(llmCands))
 	for _, c := range llmCands {
@@ -774,6 +768,33 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	s.recordBatchFactsWithRetry(batch, pool, items, picks, rejected, gates, industryBy, rawActionBySym)
 
 	return s.assembleView(*batch, items, nil, nil), nil
+}
+
+// failEmptyShortlist 名单为空时的失败收尾（P0-3）：提前失败也必须落可复核快照与事实
+// 账本——回填池快照/筛选参数 → failBatch → recordBatchFactsWithRetry。quote_stale
+// 反事实事件、影子标签、池内透明排除原因都依赖 recordBatchFacts，不能在它之前直接
+// return（否则「全 stale 拒绝生成」既无法回验误伤、也无从复核当时的池面貌）。
+func (s *RecommendationService) failEmptyShortlist(batch *model.RecommendationBatch, pool []candidate,
+	filters RecFilters, gates []gateNote, industryBy map[string]string, kept int, hasStale bool) error {
+	poolJSON, poolOmitted := marshalPoolSnapshot(pool)
+	filtersPayload := map[string]any{"filters": filters, "applied": filters.Describe()}
+	if poolOmitted > 0 {
+		filtersPayload["pool_omitted"] = poolOmitted
+	}
+	filtersJSON, _ := json.Marshal(filtersPayload)
+	batch.CandidatePool = poolJSON
+	batch.FiltersJSON = string(filtersJSON)
+	batch.CandidateCount = kept
+	var msg string
+	if hasStale {
+		msg = "候选行情已全部过期（可能停牌、休市异常或数据源故障）：为避免基于旧价推荐，本次不生成，请稍后重试"
+	} else {
+		excluded := len(pool) - kept
+		msg = fmt.Sprintf("筛选后候选池为空（共扫描 %d 只，%d 只被筛掉）：请放宽股价/市值/换手等筛选条件后重试", len(pool), excluded)
+	}
+	s.failBatch(batch, chatUsage{}, 0, msg)
+	s.recordBatchFactsWithRetry(batch, pool, nil, nil, nil, gates, industryBy, nil)
+	return errors.New(msg)
 }
 
 // recFactsRetries 事实账本落库进程内同步重试次数（覆盖瞬时 DB 抖动；recordBatchFacts
@@ -1305,15 +1326,97 @@ func medianAmountsFor(market string, symbols []string) map[string]float64 {
 }
 
 // quoteFreshGateVersion 行情时效硬门判定版本（判定规则/口径变更时递增）。
-const quoteFreshGateVersion = "qf1"
+// qf3：刷新前置到用户筛选**终判**之前（buildPool 内：静态筛选 → 刷新 → 用户筛选 →
+// 名额分配）——qf2 的刷新发生在旧价筛选与名额分配之后，被旧价误排除的候选（旧价 9 元
+// 撞「最低 10 元」而新价已达标）永远失去翻案机会，排除原因也是基于旧价的假账。
+// qf2：核验从「终选名单喂 LLM 前」前置到「用户筛选复核/评分/排名之前」（qf1 只对
+// Top 名单刷新 Price/ChangePct，评分与筛选仍建立在建池旧价上，新旧数据混合）。
+const quoteFreshGateVersion = "qf3"
 
-// applyQuoteFreshGate 行情时效硬门：对已进入 LLM 终选名单的候选逐只走全源新鲜行情
-// 核验（FreshQuotesFor：主源旧价不当成功、逐源找当前有效行情）。
-//   - fresh：用核验行情刷新 Price/ChangePct（终选价格锚定当前盘面），记 QuoteAsOf；
-//   - stale/取不到：从名单剔除并在池内透明标注 Excluded（gate_type=quote_stale 事件行
-//     随批次落库，影子标签自然结算——若这些票后来表现好，报表会暴露此门误伤）。
-// 这是数据有效性硬检查（同「日线拉取失败=透明排除」先例），不属于质量门控影子评审
-// 的范畴——预测质量门控转正须凭影子对照数据，数据本身失效则必须 fail closed。
+// applyFreshQuoteToCand 把一条已核验为 fresh 的行情应用到候选（纯函数，便于单测）：
+// 刷新 Price/ChangePct/Amount 等 quote 派生字段并记 QuoteAsOf，随后复筛用户价格/涨停
+// 条件（applyQuoteFilters，基于新价与当日涨停价）。返回复筛排除原因（空=存活）。
+func applyFreshQuoteToCand(c *candidate, q *datasource.Quote, filters RecFilters) string {
+	c.Price = round2(q.Price)
+	c.ChangePct = round2(q.ChangePct)
+	if q.Amount > 0 {
+		c.Amount = round2(q.Amount)
+	}
+	if !q.DataTime.IsZero() {
+		c.QuoteAsOf = q.DataTime.In(time.Local).Format("2006-01-02 15:04")
+	}
+	return applyQuoteFilters(*c, filters)
+}
+
+// freshenCandidates 对 pool 中给定下标的候选批量核验并刷新「当前有效行情」（P0-3：
+// 前置到筛选/评分/排名之前）：
+//   - fresh：刷新 quote 派生字段并复筛（applyFreshQuoteToCand）——旧价通过、新价不过
+//     的在此透明淘汰（涨停判定用刷新后的价与当日涨停价）；
+//   - stale/取不到：Excluded + gate_type=quote_stale 事件（影子标签自然结算可回验误伤）。
+//
+// 返回存活（可参与评分）的下标与门控记录。s.market==nil（单测注入环境）原样放行。
+func (s *RecommendationService) freshenCandidates(ctx context.Context, pool []candidate, idxs []int, filters RecFilters) ([]int, []gateNote) {
+	if s.market == nil || len(idxs) == 0 {
+		return idxs, nil
+	}
+	refs := make([]QuoteRef, 0, len(idxs))
+	for _, i := range idxs {
+		refs = append(refs, QuoteRef{Market: pool[i].Market, Symbol: pool[i].Symbol})
+	}
+	fresh := s.market.FreshQuotesFor(ctx, refs)
+	alive := make([]int, 0, len(idxs))
+	var gates []gateNote
+	for _, i := range idxs {
+		fq, ok := fresh[QuoteKey(pool[i].Market, pool[i].Symbol)]
+		if !ok || fq.Quote == nil || fq.Quote.Price <= 0 || fq.Fresh.Status != freshStatusFresh {
+			reason := "行情时效硬门：全部数据源均未取到当前有效行情（可能停牌/退市/数据源故障），为避免基于旧价筛选、评分与定价，透明排除"
+			if ok && fq.Quote != nil && !fq.Quote.DataTime.IsZero() {
+				reason = fmt.Sprintf("行情时效硬门：行情仅更新至 %s（期望交易日 %s），基于旧价的筛选、评分与价位不可信，透明排除",
+					fq.Quote.DataTime.In(time.Local).Format("2006-01-02 15:04"), fq.Fresh.ExpectedDate)
+			}
+			pool[i].Excluded = reason
+			pool[i].SentToLLM = false
+			gates = append(gates, gateNote{
+				Symbol:      pool[i].Symbol,
+				GateType:    model.GateQuoteStale,
+				GateVersion: quoteFreshGateVersion,
+				Reason:      reason,
+			})
+			continue
+		}
+		if reason := applyFreshQuoteToCand(&pool[i], fq.Quote, filters); reason != "" {
+			pool[i].Excluded = reason
+			continue
+		}
+		alive = append(alive, i)
+	}
+	return alive, gates
+}
+
+// freshenPool P0-3/qf3 行情时效核验前置：在用户筛选终判与名额分配**之前**，对全部
+// 未被静态排除的候选核验并刷新「当前有效行情」——建池旧价从此只决定「谁进池」，
+// 用户筛选终判、涨停判断、computeScore/computeCandFactors 与排名一律建立在刷新后
+// 的行情上。stale/取不到 → 透明排除 + quote_stale 事件（影子标签自然结算可回验误伤）。
+// 名额分配（assignScanQuota）在此之后进行，天然只发给存活者，无需补位轮
+//（qf2 的「先发名额再刷新参评者+池满补位」顺序漏洞由此根治）。
+func (s *RecommendationService) freshenPool(ctx context.Context, pool []candidate, filters RecFilters) []gateNote {
+	if s.market == nil {
+		return nil
+	}
+	idxs := make([]int, 0, len(pool))
+	for i := range pool {
+		if pool[i].Excluded == "" {
+			idxs = append(idxs, i)
+		}
+	}
+	_, gates := s.freshenCandidates(ctx, pool, idxs, filters)
+	return gates
+}
+
+// applyQuoteFreshGate 终选兜底门：LLM 名单在 freshenPool 之后还要经历数秒级的日线
+// 拉取与评分，喂模型前再核验一次（大概率命中行情缓存，零上游成本）——评分期间行情
+// 失效（跨入午休/收盘停滞等）的候选在此透明剔除。fresh 的刷新 Price/ChangePct 与
+// QuoteAsOf（与评分价的差异为数秒内的正常盘面演进，非「旧价」）。
 // s.market 为 nil（单测注入环境）时跳过。
 func (s *RecommendationService) applyQuoteFreshGate(ctx context.Context, market string, pool []candidate, llmCands *[]candidate) []gateNote {
 	if s.market == nil || len(*llmCands) == 0 {
@@ -1332,7 +1435,7 @@ func (s *RecommendationService) applyQuoteFreshGate(ctx context.Context, market 
 	keptCands := (*llmCands)[:0]
 	for _, c := range *llmCands {
 		fq, ok := fresh[QuoteKey(market, c.Symbol)]
-		if !ok || fq.Quote == nil || fq.Quote.Price <= 0 || fq.Fresh.Status == freshStatusStale {
+		if !ok || fq.Quote == nil || fq.Quote.Price <= 0 || fq.Fresh.Status != freshStatusFresh {
 			reason := "行情时效硬门：全部数据源均未取到当前有效行情（可能停牌/退市/数据源故障），为避免基于旧价精选与定价，透明排除"
 			if ok && fq.Quote != nil && !fq.Quote.DataTime.IsZero() {
 				reason = fmt.Sprintf("行情时效硬门：行情仅更新至 %s（期望交易日 %s），基于旧价的精选与价位不可信，透明排除",
@@ -1367,9 +1470,11 @@ func (s *RecommendationService) applyQuoteFreshGate(ctx context.Context, market 
 
 // buildPool 阶段①②：多源建池（自选 ∪ 按策略组合的榜单来源，来源可叠加）→
 // 基础准入（candidateEligible：ST/退市/北交所/无行情/流动性/黑名单，不合格不进池）→
-// 估值富化 → 用户筛选（applyQuoteFilters，不合格保留并标注 excluded 原因）。
-// 返回全量池（含被筛掉者），未被筛掉的数量超过 maxScanCandidates 时后来者标注「池满」。
-func (s *RecommendationService) buildPool(ctx context.Context, userID int64, market, recType string, strat *strategyTemplate, filters RecFilters) ([]candidate, error) {
+// 估值富化 → 静态筛选 → 行情时效核验刷新（freshenPool，qf3）→ 用户筛选
+//（applyQuoteFilters 基于刷新后行情，不合格保留并标注 excluded 原因）→ 评分名额分配。
+// 返回 全量池（含被筛掉者）、quote_stale 门控记录；未被筛掉的数量超过
+// maxScanCandidates 时后来者标注「池满」。
+func (s *RecommendationService) buildPool(ctx context.Context, userID int64, market, recType string, strat *strategyTemplate, filters RecFilters) ([]candidate, []gateNote, error) {
 	base := loadCandidateFilter(userID)
 	byKey := map[string]int{} // symbol → pool 下标
 	pool := make([]candidate, 0, 64)
@@ -1481,7 +1586,7 @@ func (s *RecommendationService) buildPool(ctx context.Context, userID int64, mar
 		}
 	}
 	if len(pool) == 0 {
-		return pool, nil
+		return pool, nil, nil
 	}
 
 	// 估值富化（腾讯免费源 best-effort）：PE/PB/市值/换手/量比/涨停价，
@@ -1494,6 +1599,12 @@ func (s *RecommendationService) buildPool(ctx context.Context, userID int64, mar
 	vals := s.market.ValuationsFor(ctx, refs)
 	for i := range pool {
 		if v := vals[QuoteKey(pool[i].Market, pool[i].Symbol)]; v != nil {
+			// P0-3 估值时效校验：换手/量比/振幅/涨停价随行情时刻变化，DataTime 过期
+			//（昨日口径/解析失败零值）时丢弃本次富化、保留榜单兜底值——用昨日涨停价判
+			// 「今日已涨停」或用旧换手做用户筛选都会失真（fail-closed，宁缺毋假）。
+			if s.market.QuoteFreshnessOf(pool[i].Market, v.DataTime).Status != freshStatusFresh {
+				continue
+			}
 			pool[i].PETTM = round2(v.PETTM)
 			if v.PB > 0 {
 				pool[i].PB = round2(v.PB)
@@ -1511,14 +1622,28 @@ func (s *RecommendationService) buildPool(ctx context.Context, userID int64, mar
 		}
 	}
 
-	// 用户筛选（透明标记式排除），随后按来源轮转发放评分名额。
+	// 静态筛选先行（ETF/基金、板块前缀偏好）：排除结果与行情无关、永不翻案，
+	// 先筛掉省得为它们拉取行情。
 	for i := range pool {
-		if reason := applyQuoteFilters(pool[i], filters); reason != "" {
+		if reason := applyStaticFilters(pool[i], filters); reason != "" {
 			pool[i].Excluded = reason
 		}
 	}
+	// P0-3/qf3 行情时效核验前置到用户筛选终判之前：建池旧价只决定「谁进池」，价格/
+	// 换手/涨停等用户筛选与后续评分排名一律建立在刷新后的当前有效行情上——qf2 把
+	// 刷新放在旧价筛选之后，旧价 9 元被「最低 10 元」排除的候选即使新价已达标也
+	// 永远失去翻案机会（排除原因还是基于旧价的假账）。stale 透明排除记事件。
+	freshGates := s.freshenPool(ctx, pool, filters)
+	// 用户筛选（透明标记式排除，基于刷新后行情），随后按来源轮转发放评分名额。
+	for i := range pool {
+		if pool[i].Excluded == "" {
+			if reason := applyQuoteFilters(pool[i], filters); reason != "" {
+				pool[i].Excluded = reason
+			}
+		}
+	}
 	assignScanQuota(pool)
-	return pool, nil
+	return pool, freshGates, nil
 }
 
 // assignScanQuota 评分名额分配：通过用户筛选的候选按「首来源」分组（保池序），
@@ -1607,7 +1732,7 @@ func marshalPoolSnapshot(pool []candidate) (string, int) {
 
 // scorePool 阶段③：对未被排除的候选拉日线算技术因子，五维评分 + 策略加分合成量化分，
 // 追高保护在此判定（需要近 5 日涨幅），最后按分排名、去相关贪心选出 LLM 名单
-//（S1-3：相关性去重 + 同行业名额上限，返回被挤出者的门控记录供事件表落库）。
+// （S1-3：相关性去重 + 同行业名额上限，返回被挤出者的门控记录供事件表落库）。
 // 日线拉取失败的标的**透明排除**（"日线数据获取失败"）而非按中性 50 分混入排名——
 // 否则既能挤占名单名额、又静默绕过近 5 日涨幅追高保护。追高/无日线剔除释放的名额
 // 会从「池满」标的中按进池顺序补评一轮（只补一轮，拉取总量仍有界）。
@@ -1778,6 +1903,10 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 	alive := scoreRound(first)
 
 	// 名额补位：被追高/无日线剔除的名额还给「池满」标的（按原进池顺序），补评一轮。
+	// qf3：池满候选在 buildPool 已核验过一次行情，但评分是分钟级过程（拉日线 3~8s/批
+	// ×多轮），补位发生在中途，行情可能已跨入午休/收盘停滞——进评分前再核验+复筛
+	//（大概率命中行情缓存，零上游成本；旧价评分与旧价涨停判定在补位路径复活就前功尽弃）。
+	var gates []gateNote
 	if freed := maxScanCandidates - alive; freed > 0 {
 		refill := make([]int, 0, freed)
 		for i := range pool {
@@ -1790,7 +1919,11 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 			}
 		}
 		if len(refill) > 0 {
-			scoreRound(refill)
+			aliveRefill, g2 := s.freshenCandidates(ctx, pool, refill, filters)
+			gates = append(gates, g2...)
+			if len(aliveRefill) > 0 {
+				scoreRound(aliveRefill)
+			}
 		}
 	}
 
@@ -1810,7 +1943,6 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 	// 标的近 60 日收益相关性超阈值只保留分高者；同行业（宇宙快照口径，未积累时该
 	// 约束缺席）最多 recIndustryCap 只。被挤出者保留池内排名（透明），事件表记录
 	// gate_type 供影子收益对照。
-	var gates []gateNote
 	chosen := make([]int, 0, maxLLMCandidates)
 	for rank, r := range ranked {
 		pool[r.idx].Rank = rank + 1
@@ -1936,6 +2068,9 @@ func compactForLLM(recType string, cands []candidate) []map[string]any {
 		row := map[string]any{
 			"symbol": c.Symbol, "name": c.Name, "price": c.Price, "change_pct": c.ChangePct,
 			"score": c.Score, "rank": c.Rank, "sources": c.Sources,
+		}
+		if c.QuoteAsOf != "" {
+			row["quote_as_of"] = c.QuoteAsOf // 现价的行情时刻（时效硬门核验过），模型据此声明数据时点
 		}
 		if c.Amount > 0 {
 			row["amount_yi"] = round2(c.Amount / 1e8)

@@ -341,17 +341,25 @@ type ScanHit struct {
 
 // ScanResult 扫描结果：命中列表 + 全景计数（引擎排除了什么全透明）。
 type ScanResult struct {
-	Strategy      string    `json:"strategy"` // 展示名
-	TradeDate     string    `json:"trade_date"`
-	Universe      int       `json:"universe"`       // 宽表内标的总数
-	Scanned       int       `json:"scanned"`        // 参与条件判定的行数
-	StaleSkipped  int       `json:"stale_skipped"`  // 停牌/数据滞后跳过
-	StSkipped     int       `json:"st_skipped"`     // ST/退市警示跳过
-	Matched       int       `json:"matched"`        // 命中总数
-	Truncated     bool      `json:"truncated"`      // 命中超出 limit 截断
-	Items         []ScanHit `json:"items"`
-	BuildMs       int64     `json:"build_ms"`     // 宽表构建耗时（缓存命中时为历史值）
-	Conditions    []string  `json:"conditions"`   // 本次策略的静态条件清单
+	Strategy     string    `json:"strategy"` // 展示名
+	TradeDate    string    `json:"trade_date"`
+	Universe     int       `json:"universe"`      // 宽表内标的总数
+	Scanned      int       `json:"scanned"`       // 参与条件判定的行数
+	StaleSkipped int       `json:"stale_skipped"` // 停牌/数据滞后跳过
+	StSkipped    int       `json:"st_skipped"`    // ST/退市警示跳过
+	Matched      int       `json:"matched"`       // 命中总数
+	Truncated    bool      `json:"truncated"`     // 命中超出 limit 截断
+	Items        []ScanHit `json:"items"`
+	BuildMs      int64     `json:"build_ms"`   // 宽表构建耗时（缓存命中时为历史值）
+	Conditions   []string  `json:"conditions"` // 本次策略的静态条件清单
+
+	// P1 数据水位（对照交易日历，非库内自身 MAX）：ExpectedDate 应有交易日、
+	// LagOpenDays 库数据落后开市日数、FreshCoverage fresh 行覆盖率（0~1）、
+	// StaleNote 滞后时的用户提示（命中结果基于旧形态，非当日口径）。
+	ExpectedDate  string  `json:"expected_date,omitempty"`
+	LagOpenDays   int     `json:"lag_open_days,omitempty"`
+	FreshCoverage float64 `json:"fresh_coverage,omitempty"`
+	StaleNote     string  `json:"stale_note,omitempty"`
 }
 
 // Scan 全市场扫描。宽表构建有互斥防抖（并发请求等待同一次构建，见 ensureFactorTable），
@@ -386,6 +394,15 @@ func (s *ScreenerService) Scan(ctx context.Context, userID int64, req ScanReques
 		Universe:   t.Len(),
 		BuildMs:    t.BuildMs,
 		Conditions: describeCondTree(tree),
+
+		ExpectedDate:  t.ExpectedDate,
+		LagOpenDays:   t.LagOpenDays,
+		FreshCoverage: t.FreshCoverage,
+	}
+	if t.LagOpenDays > 0 {
+		res.StaleNote = fmt.Sprintf("全市场日线仅更新至 %s，落后应有交易日 %s 共 %d 个开市日——命中结果基于旧形态，请先在管理端补跑全市场同步", t.TradeDate, t.ExpectedDate, t.LagOpenDays)
+	} else if t.LagOpenDays < 0 {
+		res.StaleNote = fmt.Sprintf("交易日历不可用，无法核验全市场日线（截至 %s）是否落后应有交易日 %s——命中结果时效未知，请先在管理端回填日历", t.TradeDate, t.ExpectedDate)
 	}
 	stCol := t.Col("is_st")
 	var matchedIdx []int
@@ -632,12 +649,21 @@ const strategySignalPoolLimit = 30
 //（recStrategySignalKey）做全市场扫描，返回成交额降序的前 n 只命中。
 // 宽表未就绪/全市场日线未初始化时返回 nil——best-effort，不阻断建池
 //（与榜单来源单路失败降级同款纪律）。
+// P1 fail-closed：宽表数据落后应有交易日超过 1 个开市日时放弃本路来源——
+// 旧形态命中的「策略信号」会把过期技术形态当最新供给喂进推荐池。
 func strategySignalHits(ctx context.Context, recType, stratKey string, n int) []ScanHit {
 	key := recStrategySignalKey(recType, stratKey)
 	svc := ScreenerService{}
 	res, err := svc.Scan(ctx, 0, ScanRequest{StrategyKey: key, Limit: n})
 	if err != nil {
 		common.SysDebug("策略信号来源跳过（%s）: %v", key, err)
+		return nil
+	}
+	// fail-closed：落后超 1 个开市日或日历不可用（-1 无法判定）都不作推荐供给——
+	// 「无法判定新鲜度」当 0 用会让旧形态在日历缺失时冒充最新信号。
+	if res.LagOpenDays > 1 || res.LagOpenDays < 0 {
+		common.SysWarn("策略信号来源跳过：全市场日线时效不达标（lag=%d，数据截至 %s，应有 %s；-1=日历不可用），旧形态不作推荐供给",
+			res.LagOpenDays, res.TradeDate, res.ExpectedDate)
 		return nil
 	}
 	return res.Items

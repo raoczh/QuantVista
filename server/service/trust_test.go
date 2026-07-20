@@ -168,7 +168,7 @@ func TestSnapshotLabeledSymbolPath(t *testing.T) {
 }
 
 func TestTextLabeledValues(t *testing.T) {
-	vals := textLabeledValues("新闻标题", []string{"现价 12.34（12.10）", "回调到 11.5 加仓", "净流入 3000 万", "近5日 涨停 2026"})
+	vals := textLabeledValues("新闻标题", "context", []string{"现价 12.34（12.10）", "回调到 11.5 加仓", "净流入 3000 万", "近5日 涨停 2026"})
 	// 12.34/12.10/11.5 三个小数 + 3000万整数（换算 3e7）；2026 整数无单位不取。
 	for _, want := range []float64{12.34, 12.10, 11.5, 3e7} {
 		if !labeledHas(vals, want) {
@@ -177,5 +177,10 @@ func TestTextLabeledValues(t *testing.T) {
 	}
 	if labeledHas(vals, 2026) {
 		t.Fatalf("无单位整数 2026 不应进入值域")
+	}
+	for _, v := range vals {
+		if v.Origin != "context" {
+			t.Fatalf("文本值域应带 origin=context，got %+v", v)
+		}
 	}
 }

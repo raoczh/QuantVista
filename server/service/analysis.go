@@ -50,7 +50,7 @@ func NewAnalysisService(market *MarketService, watchlist *WatchlistService, posi
 
 // 版本号：数据快照 + 这两个版本号共同保证「凭版本号复现」。改 prompt/策略时递增。
 const (
-	analysisPromptVersion   = "p15" // p15: 个股快照行情新鲜度元数据（captured_at/quote_as_of/quote_source/bars_as_of/market_state/freshness_status），stale 必须声明行情截至时间、非交易时段按收盘口径；p14: P3b 板块模块 board_valuation（中位 PE/PB+横截面/时序分位+积累天数）与 board_flow（板块主力资金）两段进 sector guidance；p13: P3a 机构观点 org_view 段（评级分布/评级变动/目标价偏离/调研密度）进个股 guidance + trade_plan 机构目标价对照锚；p12: M3c 交易员阶段（个股标准分析追加交易计划二次调用+量化仓位公式，计划价位与仓位数字进核验值域）；p11: M3a 市场模块情绪温度计 mood 段（连板分布/炸板率/昨涨停溢价）；p10: M2 回溯诊断 as_of 模式（截断快照+回溯声明段）；p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
+	analysisPromptVersion   = "p17" // p17: 历史解释模式程序化硬约束（enforceStaleModeResult：summary 强制「截至 X 的历史数据解释」前缀、suggestions 剔除当前买卖行动词；panel 模式非 fresh 直接拒绝不接受 allow_stale）；p16: 行情时效 fail-closed——持仓割/守/补三选一仅限有当前有效行情的仓（stale/失败仓禁三选一）、个股 stale 禁当前评级（改历史解释模式或数据不足）、快照逐项 freshness 元数据；p15: 个股快照行情新鲜度元数据（captured_at/quote_as_of/quote_source/bars_as_of/market_state/freshness_status），stale 必须声明行情截至时间、非交易时段按收盘口径；p14: P3b 板块模块 board_valuation（中位 PE/PB+横截面/时序分位+积累天数）与 board_flow（板块主力资金）两段进 sector guidance；p13: P3a 机构观点 org_view 段（评级分布/评级变动/目标价偏离/调研密度）进个股 guidance + trade_plan 机构目标价对照锚；p12: M3c 交易员阶段（个股标准分析追加交易计划二次调用+量化仓位公式，计划价位与仓位数字进核验值域）；p11: M3a 市场模块情绪温度计 mood 段（连板分布/炸板率/昨涨停溢价）；p10: M2 回溯诊断 as_of 模式（截断快照+回溯声明段）；p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
 	analysisStrategyVersion = "s1"
 	maxRepairAttempts       = 2 // 结构化校验失败后的额外重试次数（总调用 = 1 + maxRepairAttempts）
 )
@@ -76,6 +76,10 @@ type AnalyzeRequest struct {
 	// AsOf 回溯诊断日期（YYYY-MM-DD，仅 stock+标准模式）：日线截断到该日组装 prompt，
 	// 估值/新闻/财务等无历史快照的证据声明缺失；事后用 hindsight 端点对照真实走势。
 	AsOf string `json:"as_of"`
+	// AllowStale 行情过期时的显式降级选择（仅 stock 模块）：默认 false——全源拿不到
+	// fresh 行情时「当前分析/当前评级」直接拒绝（数据不足，fail-closed）；用户显式
+	// 置 true 才按「截至行情时刻的历史数据解释」模式生成（禁当前行动建议）。
+	AllowStale bool `json:"allow_stale"`
 }
 
 // AnalysisResult 结构化分析结果（要求 LLM 严格按此 schema 输出 JSON）。
@@ -129,6 +133,10 @@ type AnalysisView struct {
 	Panel     *PanelResult    `json:"panel"`                // 多角色观点（mode=panel 且 success 时非 nil）
 	Raw       string          `json:"raw"`                  // 降级时的模型原文
 	RiskFlags []riskFlag      `json:"risk_flags,omitempty"` // 快照 risk_gate 程序化风险标志（S1，个股模块）
+	// 历史解释模式标识（快照 stale_mode 透传）：前端据此把结果头从「当前评级」展示
+	// 切为「历史解读」形态（醒目横幅 + 评级语义改写），不得按普通评级展示。
+	StaleMode     string `json:"stale_mode,omitempty"`
+	StaleModeNote string `json:"stale_mode_note,omitempty"`
 }
 
 // Analyze 执行一次分析。allowPrivate 由调用方按角色决定（管理员可访问内网自建模型）。
@@ -176,6 +184,34 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	actx, err := s.buildContext(ctx, userID, req)
 	if err != nil {
 		return nil, err
+	}
+	// 行情时效 fail-closed（P0-5）：个股「当前分析/当前评级」不得建立在过期或无法核验
+	// 时效的行情上——全源无 fresh 时默认拒绝（数据不足）；用户显式 allow_stale 才按
+	// 「截至行情时刻的历史数据解释」模式生成（快照打标 + guidance 提示 + 解析后
+	// enforceStaleModeResult 程序化硬约束；交易计划已由 attachTradePlan 对非 fresh
+	// 确定性 NoPlan）。回溯诊断（AsOf）本就是历史解释语义，不受此门约束。
+	staleMode := false
+	staleAsOf := ""
+	if req.Module == model.AnalysisModuleStock && req.AsOf == "" && actx.Snapshot != nil {
+		if st, _ := actx.Snapshot["freshness_status"].(string); st != "" && st != freshStatusFresh {
+			asOf, _ := actx.Snapshot["quote_as_of"].(string)
+			if req.Mode == model.AnalysisModePanel {
+				// panel 是「四角色对当下盘面表态」的编排，输出 schema（roles/consensus）
+				// 没有历史解释形态的改写点，且专属提示词不含历史解释约束——非 fresh
+				// 一律拒绝，不接受 allow_stale（标准分析的历史解释模式可用）。
+				return nil, errors.New("行情已过期或时效无法核验，多角色观点不支持历史解释模式；请改用标准分析（可选「按历史数据解释」）或待行情恢复后重试")
+			}
+			if !req.AllowStale {
+				if st == freshStatusUnknown {
+					return nil, errors.New("该市场无交易日历，无法核验行情时效，无法给出当前评级；可选择「按截至行情时刻的历史数据解释」模式重试")
+				}
+				return nil, fmt.Errorf("行情已过期（仅更新至 %s，可能停牌、休市异常或数据源故障），无法给出当前评级；可选择「按截至该时刻的历史数据解释」模式重试", orStr(asOf, "未知时间"))
+			}
+			staleMode = true
+			staleAsOf = asOf
+			actx.Snapshot["stale_mode"] = "historical_explanation"
+			actx.Snapshot["stale_mode_note"] = "用户已确认行情过期，本次为「截至 " + orStr(asOf, "未知时间") + " 的历史数据解释」，非当前盘面判断"
+		}
 	}
 	snapshotJSON, _ := json.Marshal(actx.Snapshot)
 
@@ -239,6 +275,13 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	// （panel 无标准结论字段、degraded 无合法结构，都不做）。复核在配额记账前完成，
 	// 其 token 折入本次动作一起累计与扣费（一次分析动作仍只计 1 次配额）。
 	if callErr == nil && result != nil {
+		// 历史解释模式程序化硬约束（先于核验与交易计划）：summary 强制历史解释前缀、
+		// suggestions 剔除当前买卖行动条目——提示词约束（guidance）只是软引导，模型
+		// 不遵守时由这里兜底保证输出形态（说明在信任层回填后并入 sys_confidence_why）。
+		staleEnforceNote := ""
+		if staleMode {
+			staleEnforceNote = enforceStaleModeResult(result, staleAsOf)
+		}
 		// 交易员阶段（M3c）：先生成交易计划，再做证据核验——计划价位与仓位数字随后
 		// 会并入核验值域（模型自己输出的计划价是合法来源，同推荐 verifyEvidence extra 前例）。
 		tpUsage := s.attachTradePlan(ctx, userID, cfg, apiKey, allowPrivate, req, actx.Snapshot, result)
@@ -250,6 +293,13 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 		usage.PromptTokens += rvUsage.PromptTokens
 		usage.CompletionTokens += rvUsage.CompletionTokens
 		usage.TotalTokens += rvUsage.TotalTokens
+		if staleEnforceNote != "" {
+			if result.SysConfidenceWhy != "" {
+				result.SysConfidenceWhy += "；" + staleEnforceNote
+			} else {
+				result.SysConfidenceWhy = staleEnforceNote
+			}
+		}
 	}
 
 	rec.PromptTokens = usage.PromptTokens
@@ -376,9 +426,9 @@ func (s *AnalysisService) fillAnalysisTrust(ctx context.Context, userID int64, c
 	// 新闻标题是喂给模型的文本型合法来源（N2 舆情段）：标题里的小数并入值域，
 	// 忠实引用不算幻觉（同日报 Alerts 前例）。公告标题（F1）与风险闸门提示文本
 	//（S1，含 9.5/3000 等阈值数字）同理。
-	vals = append(vals, textLabeledValues("新闻标题", newsTitleTexts(snapshot))...)
-	vals = append(vals, textLabeledValues("公告标题", announcementTitleTexts(snapshot))...)
-	vals = append(vals, textLabeledValues("风险提示", riskGateTexts(snapshot))...)
+	vals = append(vals, textLabeledValues("新闻标题", "context", newsTitleTexts(snapshot))...)
+	vals = append(vals, textLabeledValues("公告标题", "context", announcementTitleTexts(snapshot))...)
+	vals = append(vals, textLabeledValues("风险提示", "context", riskGateTexts(snapshot))...)
 	// 交易计划（M3c）：plan_note/checklist 参与核验；计划价位/盈亏比/仓位公式因子并入
 	// 合法值域——它们是模型自身结论与确定性公式输出，复述不算幻觉（同推荐计划价前例）。
 	// Origin=plan 标注：前端区分「被快照数据佐证」与「模型复述自身结论」，后者不得
@@ -426,16 +476,13 @@ func analysisSystemConfidence(ev *evidenceCheck, snapshot map[string]any) (strin
 	level := 1 // 0=低 1=中 2=高
 
 	if ev != nil && ev.Total > 0 {
-		ratio := float64(ev.Matched) / float64(ev.Total)
-		switch {
-		case ratio >= 0.7:
-			level++
-			reasons = append(reasons, fmt.Sprintf("证据核验 %d/%d 吻合", ev.Matched, ev.Total))
-		case ratio < 0.4:
-			level--
-			reasons = append(reasons, fmt.Sprintf("证据核验仅 %d/%d 吻合", ev.Matched, ev.Total))
-		default:
-			reasons = append(reasons, fmt.Sprintf("证据核验 %d/%d 吻合", ev.Matched, ev.Total))
+		// ev3：升档只认快照佐证（复述命中剔出分母）、降档看总命中率——口径在
+		// evidenceConfidenceSignal（与推荐 systemConfidence 共用），防「快照佐证 0
+		// 但全绿复述」错误升档。
+		delta, reason := evidenceConfidenceSignal(ev)
+		level += delta
+		if reason != "" {
+			reasons = append(reasons, reason)
 		}
 	}
 	// 个股快照（含 quote 块）才有技术因子/量化评分锚点；缺失则定性判断精度受限。
@@ -685,6 +732,18 @@ func (s *AnalysisService) toView(rec model.AnalysisRecord) *AnalysisView {
 	v := &AnalysisView{AnalysisRecord: rec}
 	if rec.Module == model.AnalysisModuleStock {
 		v.RiskFlags = parseRiskFlagsFromSnapshot(rec.DataSnapshot)
+		// 历史解释模式标识：从快照解析透传（列表接口不带 data_snapshot，仅详情/生成
+		// 返回时可见——历史列表点开详情即得）。
+		if rec.DataSnapshot != "" {
+			var meta struct {
+				StaleMode     string `json:"stale_mode"`
+				StaleModeNote string `json:"stale_mode_note"`
+			}
+			if json.Unmarshal([]byte(rec.DataSnapshot), &meta) == nil {
+				v.StaleMode = meta.StaleMode
+				v.StaleModeNote = meta.StaleModeNote
+			}
+		}
 	}
 	switch rec.Status {
 	case model.AnalysisStatusSuccess:
@@ -810,6 +869,7 @@ var moduleGuidance = map[string]string{
 - 财务面（若快照含 finance 块）：finance.latest 是最新一期 F10 主要财务指标（EPS/ROE/营收与净利同比/毛利率/净利率/资产负债率，report 标注报告期），finance.trend 为近几期概要（最早在前），statement_latest（若有）为最新一期三表关键科目（货币资金/存货/总资产/经营现金流净额等，单位亿元）；结合估值水位判断基本面质量与业绩趋势（如高 ROE+低 PE、增速拐点、现金流与净利的背离）；财务为季报口径有滞后性，不代表当下经营；引用只能用给出的数字，值为 0 可能表示上游缺失，不得据此下「归零」结论。无 finance 块表示财务数据暂不可得，如实说明。
 - 机构观点（若快照含 org_view 块）：rating_dist 是近 90/180 天卖方研报评级分布，rating_changes_90d 与 latest_rating_change 是评级变动，target_price 是机构目标价统计（median_vs_price_pct 为中位目标价相对现价的偏离%），survey 是机构调研密度。解读纪律：卖方评级普遍乐观（九成为买入/增持），「多少家买入」本身几乎无信息量，不得以买入家数论证看多；真正有信息量的是评级下调（卖方极少下调，出现即强信号）、目标价中位数与现价的偏离方向、调研批次的环比变化（关注度升温/降温）。目标价样本 count 很小时（1~2 份）须说明代表性有限。无 org_view 块表示该股暂无研报覆盖或数据不可得，不代表机构不看好，如实说明。
 重要限制：财务仅为 F10 摘要与三表关键科目，不含全表明细、机构持仓与个股资金流。news 块的覆盖面有限（快讯与个股新闻采集），没有新闻不代表没有消息。若结论依赖未提供的数据，必须说明「数据缺失、无法判断」，绝不虚构。freshness_status=stale 或快照带 freshness_note 时，涉及价格/涨跌必须先声明「行情仅更新至 quote_as_of」，不得以实时口径表述；market_state 非 trading（休市/午间/盘前）时按最近交易日收盘（或阶段）口径措辞。rating 以技术面为主、财务/估值水位与消息面为辅给出。
+历史解释模式（若快照含 stale_mode=historical_explanation，最高优先级硬约束）：行情已过期且用户已确认按历史数据解释——本次输出**不是当前盘面判断**：summary 必须以「截至 <quote_as_of> 的历史数据解释：」开头；rating/confidence 仅表示对截至该时刻数据的解读，不得表述为当前评级；suggestions 中**禁止任何当前买入/卖出/加减仓行动建议**，只允许「待行情恢复后再评估」类表述与研究方向；全程不得使用「当前/现在/实时」指代已过期的行情数据。
 反方视角（必填）：anti_thesis 针对你给出的 rating 论证相反情形（看多时论证为什么现在买入可能是错的，看空/中性亦然）；kill_switches 给出可观察的失效信号（价格/均线/量能等具体条件）；unknowns 列出财务明细、新闻、资金流等本次数据看不到但影响结论的盲区。`,
 
 	model.AnalysisModuleMarket: `本次分析对象是【整个市场】。可用数据：主要指数行情、涨跌家数与涨停/跌停数（市场情绪核心）、两市资金流（主力/超大/大/中/小单净流入）、涨幅榜、成交活跃榜、板块涨跌榜，以及情绪温度计 mood 块（若有）：涨停家数、炸板家数与炸板率、连板高度分布 streak_dist（键=连板数、值=家数）、最高连板 max_streak、昨日涨停股今日平均涨跌幅 yzt_avg_chg 与红盘比例 yzt_up_ratio（打板情绪溢价）。
@@ -848,7 +908,7 @@ var moduleGuidance = map[string]string{
 - 集中度风险：是否过度集中于单一标的或单一市场/风格；
 - 结构评估：短线与长线仓位的比例与各自表现是否符合其定位；
 - 需复盘的仓位：结合买入理由与当前盈亏，指出哪些仓位偏离预期、值得重新审视；
-- 逐仓倾向（强制三选一）：对每笔持仓中的仓位，在 suggestions 中明确给出「割（认错离场）/守（持有观察）/补（逢低加仓）」三选一的研究倾向及依据，格式如「XX(600000)：守——现价仍在 MA20 上方，亏损 3% 未破买入逻辑」；不允许「可割可守」的骑墙表述，拿不准就选守并说明拿不准的原因。若有 capital_context，判断须结合仓位占比（重仓浮亏与轻仓浮亏的容错不同；补仓建议必须核对剩余资金空间，holding_ratio_pct 已接近 100% 时不得建议补仓）；无 capital_context 则声明「未设置总资金，仓位占比未知」并趋保守。
+- 逐仓倾向（强制三选一，仅限有当前有效行情的仓位）：对每笔**有现价数据（current_price）**的持仓中仓位，在 suggestions 中明确给出「割（认错离场）/守（持有观察）/补（逢低加仓）」三选一的研究倾向及依据，格式如「XX(600000)：守——现价仍在 MA20 上方，亏损 3% 未破买入逻辑」；不允许「可割可守」的骑墙表述，拿不准就选守并说明拿不准的原因。带 quote_note（行情已过期或获取失败）的仓位**禁止三选一**：现价与盈亏未知，任何割/守/补结论都是无据猜测，只能说明「行情数据缺失/已过期（截至 quote_as_of），暂无法评估」；last_known_price 是过期的最近已知价，禁止当作现价计算盈亏。若有 capital_context，判断须结合仓位占比（重仓浮亏与轻仓浮亏的容错不同；补仓建议必须核对剩余资金空间，holding_ratio_pct 已接近 100% 时不得建议补仓）；无 capital_context 则声明「未设置总资金，仓位占比未知」并趋保守。
 所有涉及加仓/减仓/止盈止损的表述，一律作为研究参考与风险提示，不是操作指令。不要虚构未提供的成本或价格。
 反方视角（必填）：anti_thesis 对你的组合评估给出相反论证（如认为结构合理时，论证它何时会变得脆弱）；kill_switches 给出组合层面的风险信号（回撤、集中度、亏损仓扩大等）；unknowns 指出持仓个股基本面、市场环境等本次数据看不到的盲区。`,
 }
@@ -890,6 +950,50 @@ var validRating = map[string]bool{
 	model.AnalysisRatingBullish: true,
 	model.AnalysisRatingNeutral: true,
 	model.AnalysisRatingBearish: true,
+}
+
+// staleModeActionWords 历史解释模式下禁止出现在 suggestions 里的「当前行动」词：
+// stale 行情上的买卖动作参考等于把旧盘面当现在。宁误杀不漏放（命中即剔除该条，
+// 「待恢复后评估是否卖出」这类合法表述被误杀的代价远小于漏放行动建议）。
+var staleModeActionWords = []string{
+	"买入", "加仓", "建仓", "补仓", "卖出", "减仓", "清仓", "止盈", "止损",
+	"逢低吸", "逢高减", "追涨", "抄底", "介入", "入场", "离场", "上车",
+}
+
+// enforceStaleModeResult 历史解释模式的程序化硬约束（P0-5 第二轮：guidance 提示词
+// 只是软引导，模型不遵守时由这里兜底保证输出形态，不依赖模型自觉）：
+//   - summary 强制以「截至 <quote_as_of> 的历史数据解释：」开头（模型没写就补写）；
+//   - suggestions 剔除含当前买卖行动词的条目，剔空后补固定「待行情恢复」句。
+// 返回给 sys_confidence_why 的说明（无剔除返回空）。
+func enforceStaleModeResult(r *AnalysisResult, asOf string) string {
+	prefix := "截至 " + orStr(asOf, "未知时间") + " 的历史数据解释："
+	if !(strings.HasPrefix(r.Summary, "截至") && strings.Contains(r.Summary, "历史数据解释")) {
+		r.Summary = prefix + r.Summary
+	}
+	kept := make([]string, 0, len(r.Suggestions))
+	removed := 0
+	for _, sg := range r.Suggestions {
+		hit := false
+		for _, w := range staleModeActionWords {
+			if strings.Contains(sg, w) {
+				hit = true
+				break
+			}
+		}
+		if hit {
+			removed++
+			continue
+		}
+		kept = append(kept, sg)
+	}
+	if removed > 0 && len(kept) == 0 {
+		kept = append(kept, "行情恢复（复牌/数据源恢复）后重新评估；本次为历史数据解释，不含当前操作参考")
+	}
+	r.Suggestions = kept
+	if removed > 0 {
+		return fmt.Sprintf("历史解释模式：已程序化剔除 %d 条含当前买卖行动的建议", removed)
+	}
+	return ""
 }
 
 // parseAnalysisResult 从模型输出中解析并校验结构化结果。容忍代码块包裹与中文枚举。

@@ -16,6 +16,7 @@ import {
   NModal,
   NForm,
   NFormItem,
+  NAlert,
   useMessage,
 } from 'naive-ui'
 import {
@@ -32,6 +33,7 @@ import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import StatCard from '@/components/StatCard.vue'
+import FreshnessTag from '@/components/FreshnessTag.vue'
 
 const message = useMessage()
 const { pctColor, vars } = useUi()
@@ -122,7 +124,7 @@ onMounted(load)
 </script>
 
 <template>
-  <PageContainer title="模拟交易" subtitle="虚拟账户 · 真实行情成交与估值 · 练手不担风险">
+  <PageContainer title="模拟交易" subtitle="虚拟账户 · 按当前有效行情成交与估值 · 练手不担风险">
     <template #actions>
       <n-button size="small" quaternary @click="resetModal = true">重置账户</n-button>
       <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>
@@ -198,6 +200,13 @@ onMounted(load)
         <!-- 持仓 -->
         <SectionCard title="模拟持仓">
           <n-spin :show="loading && !overview">
+            <n-alert
+              v-if="overview?.valuation_note"
+              type="warning"
+              :bordered="false"
+              style="margin-bottom: 10px"
+              >{{ overview.valuation_note }}</n-alert
+            >
             <n-empty v-if="!overview?.holdings.length" description="暂无持仓，在左侧下单买入" />
             <div v-else class="holdings">
               <div v-for="h in overview.holdings" :key="h.id" class="hold">
@@ -206,12 +215,21 @@ onMounted(load)
                     <span class="hold-name">{{ h.name || h.symbol }}</span>
                     <span class="hold-symbol qv-mono">{{ h.symbol }}</span>
                     <n-tag v-if="isEtfSymbol(h.symbol)" size="tiny" round :bordered="false" type="info">ETF</n-tag>
+                    <FreshnessTag :status="h.freshness_status" :as-of="h.quote_as_of" :reason="h.stale_reason" />
                   </div>
-                  <div class="hold-sub">{{ h.quantity }} 股 · 成本 {{ fmt(h.avg_cost) }} · 现价 {{ h.quote_ok ? fmt(h.price) : '—' }}</div>
+                  <div class="hold-sub">
+                    {{ h.quantity }} 股 · 成本 {{ fmt(h.avg_cost) }} · 现价
+                    {{ h.quote_ok ? fmt(h.price) : '—' }}
+                    <template v-if="!h.quote_ok">（按成本估值，浮盈未知）</template>
+                  </div>
                 </div>
                 <div class="hold-pnl">
-                  <div class="pnl-val" :style="{ color: pctColor(h.profit_amount) }">{{ fmtMoney(h.profit_amount) }}</div>
-                  <div class="pnl-pct" :style="{ color: pctColor(h.profit_pct) }">{{ h.profit_pct.toFixed(2) }}%</div>
+                  <div class="pnl-val" :style="{ color: pctColor(h.profit_amount) }">
+                    {{ h.quote_ok ? fmtMoney(h.profit_amount) : '—' }}
+                  </div>
+                  <div class="pnl-pct" :style="{ color: pctColor(h.profit_pct) }">
+                    {{ h.quote_ok ? h.profit_pct.toFixed(2) + '%' : '—' }}
+                  </div>
                 </div>
                 <n-button size="tiny" tertiary @click="sellFrom(h)">卖出</n-button>
               </div>

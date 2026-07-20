@@ -30,18 +30,21 @@ export interface WatchlistItem {
   change_pct: number
   quote_ok: boolean
   data_time: string
+  freshness_status?: string // fresh | stale | unknown（展示行统一过期徽标）
 }
 
 // 写接口（新增/编辑自选项）返回裸模型，不含列表接口才回填的行情富化字段。
 export type WatchlistItemBase = Omit<
   WatchlistItem,
-  'price' | 'change_pct' | 'quote_ok' | 'data_time'
+  'price' | 'change_pct' | 'quote_ok' | 'data_time' | 'freshness_status'
 >
 
 export interface MissedOpportunity extends WatchlistItem {
   current_price: number
   change_since_pct: number
-  verdict: 'missed_gain' | 'avoided_loss' | 'neutral' | 'no_base'
+  verdict: 'missed_gain' | 'avoided_loss' | 'neutral' | 'no_base' | 'stale_quote'
+  quote_as_of?: string // 行情数据源时刻（stale 时为最近已知）
+  last_price?: number // 最近已知价（stale 展示用，不参与结论）
 }
 
 export interface WatchlistGroup {

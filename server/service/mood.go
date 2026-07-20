@@ -372,6 +372,22 @@ type lhbSignal struct {
 	OrgBuys   int     // 机构买入次数
 }
 
+// signalStaleMaxOpenDays M3a/M3b 信号消费水位：库内最新交易日落后应有交易日超过该
+// 开市日数时视为过期，不再作「最近信号」喂给推荐加分（这类信号本就是 T-1 口径，
+// 容忍 2 个开市日；再旧的龙虎榜/人气/盘中形态冒充近期信号会污染加分项）。
+const signalStaleMaxOpenDays = 2
+
+// signalDateUsable 库内最新信号日期是否仍在可用水位内（P1：不能只取库内 MAX——
+// 采集停摆时旧记录会永远冒充「最近信号」）。
+func signalDateUsable(latest string) bool {
+	if latest == "" {
+		return false
+	}
+	expected := prevOpenTradeDate(time.Now().Format("2006-01-02"))
+	lag := openDaysBehind(latest, expected)
+	return lag >= 0 && lag <= signalStaleMaxOpenDays
+}
+
 // lhbSignalsFor 批量查询候选的最近龙虎榜信号。
 func lhbSignalsFor(symbols []string) map[string]lhbSignal {
 	out := map[string]lhbSignal{}
@@ -381,7 +397,7 @@ func lhbSignalsFor(symbols []string) map[string]lhbSignal {
 	var latest string
 	common.DB.Model(&model.LhbEntry{}).Where("market = ?", "cn").
 		Select("MAX(trade_date)").Scan(&latest)
-	if latest == "" {
+	if !signalDateUsable(latest) {
 		return out
 	}
 	var rows []model.LhbEntry
@@ -426,7 +442,7 @@ func popSignalsFor(symbols []string) map[string]popSignal {
 	var latest string
 	common.DB.Model(&model.PopularityRank{}).Where("market = ?", "cn").
 		Select("MAX(trade_date)").Scan(&latest)
-	if latest == "" {
+	if !signalDateUsable(latest) {
 		return out
 	}
 	var rows []model.PopularityRank

@@ -176,10 +176,10 @@ func isAtLimitUp(c candidate) bool {
 	return c.ChangePct >= lim-0.3
 }
 
-// applyQuoteFilters 阶段②：对候选执行用户筛选（仅依赖行情/估值快照的条件），
-// 返回排除原因；空串=通过。近 5 日涨幅条件依赖日线，在阶段③评分后判（applyGainFilter）。
-// 估值字段缺失（=0）时对应条件跳过不判（不惩罚数据缺口，保持透明由前端标注）。
-func applyQuoteFilters(c candidate, f RecFilters) string {
+// applyStaticFilters 与行情无关的确定性排除（ETF/基金、板块前缀偏好）：结果不随价格
+// 变化、永不翻案——qf3 行情刷新前先筛掉，省得为它们拉取行情。applyQuoteFilters 开头
+// 同样执行（保持其完整语义，供复筛与既有调用方不变）。
+func applyStaticFilters(c candidate, f RecFilters) string {
 	// ETF/场内基金不适用个股推荐逻辑（无个股估值、涨停幅按代码前缀会被误判）：
 	// 透明标记排除，仅经自选进入的基金会走到这里（榜单源 hs_a 只含个股）。
 	if isCNFund(c.Symbol) {
@@ -187,6 +187,17 @@ func applyQuoteFilters(c candidate, f RecFilters) string {
 	}
 	if f.ExcludeGemStar && (strings.HasPrefix(c.Symbol, "30") || strings.HasPrefix(c.Symbol, "68")) {
 		return "创业板/科创板（按偏好仅推荐主板个股）"
+	}
+	return ""
+}
+
+// applyQuoteFilters 阶段②：对候选执行用户筛选（仅依赖行情/估值快照的条件），
+// 返回排除原因；空串=通过。近 5 日涨幅条件依赖日线，在阶段③评分后判（applyGainFilter）。
+// 估值字段缺失（=0）时对应条件跳过不判（不惩罚数据缺口，保持透明由前端标注）。
+// qf3：调用时机在 freshenPool 之后——价格/涨停判断建立在刷新后的当前有效行情上。
+func applyQuoteFilters(c candidate, f RecFilters) string {
+	if reason := applyStaticFilters(c, f); reason != "" {
+		return reason
 	}
 	if f.PriceMin > 0 && c.Price < f.PriceMin {
 		return fmt.Sprintf("股价 %.2f 低于下限 %s", c.Price, trimFloat(f.PriceMin))

@@ -158,6 +158,8 @@ func (s *ThesisService) DueForUser(userID int64) ([]model.ThesisCard, error) {
 // ThesisCheckItem 体检结果单项：卡片 + 行情富化 + 提示信号。
 // 失效条件是自由文本，系统不解析语义——体检给出现价/涨跌/回撤事实 + 到期标记，
 // 由用户对照 kill_switches 自查（轻量体检，深入判断走 AI 分析）。
+// 行情时效契约：QuoteOK 仅 fresh；非 fresh 的现价/当日涨跌不出（最近已知价放
+// LastPrice 并带截至时刻），近 20 日回撤基于历史日线照算（收盘序列与实时价无关）。
 type ThesisCheckItem struct {
 	Card         model.ThesisCard `json:"card"`
 	QuoteOK      bool             `json:"quote_ok"`
@@ -166,6 +168,10 @@ type ThesisCheckItem struct {
 	ChangePct20d float64          `json:"change_pct_20d"` // 近 20 日涨跌幅（体检时计算）
 	ReviewDue    bool             `json:"review_due"`     // 复盘日期已到
 	Signals      []string         `json:"signals"`        // 需要注意的信号（如大幅回撤）
+
+	QuoteAsOf       string  `json:"quote_as_of,omitempty"`      // 行情数据源时刻
+	FreshnessStatus string  `json:"freshness_status,omitempty"` // fresh | stale | unknown
+	LastPrice       float64 `json:"last_price,omitempty"`       // 最近已知价（非 fresh 展示用）
 }
 
 // thesisDrawdownWarn 近 20 日跌幅超过该值（%）时提示重检逻辑。
@@ -182,7 +188,7 @@ func (s *ThesisService) CheckUp(ctx context.Context, userID int64) ([]ThesisChec
 	for _, c := range cards {
 		refs = append(refs, QuoteRef{Market: c.Market, Symbol: c.Symbol})
 	}
-	quotes := s.market.QuotesFor(ctx, refs)
+	quotes := s.market.FreshQuotesFor(ctx, refs)
 
 	items := make([]ThesisCheckItem, 0, len(cards))
 	for _, c := range cards {
@@ -191,11 +197,8 @@ func (s *ThesisService) CheckUp(ctx context.Context, userID int64) ([]ThesisChec
 			item.ReviewDue = true
 			item.Signals = append(item.Signals, "复盘日期已到，请检查逻辑是否仍成立")
 		}
-		if q := quotes[QuoteKey(c.Market, c.Symbol)]; q != nil {
-			item.QuoteOK = true
-			item.Price = round2(q.Price)
-			item.ChangePct = round2(q.ChangePct)
-			// 近 20 日表现：日线已被高频功能落库，这里逐只轻取（体检为手动低频操作）。
+		// 近 20 日表现：历史收盘序列与实时价无关，行情过期也照算（体检为手动低频操作）。
+		checkBars := func() {
 			if bars, berr := s.market.GetDailyBars(ctx, c.Market, c.Symbol, 25); berr == nil && len(bars) > 0 {
 				closes := make([]float64, len(bars))
 				for i, b := range bars {
@@ -206,8 +209,26 @@ func (s *ThesisService) CheckUp(ctx context.Context, userID int64) ([]ThesisChec
 					item.Signals = append(item.Signals, "近 20 日回撤较大，请对照失效条件自查")
 				}
 			}
+		}
+		if fq, ok := quotes[QuoteKey(c.Market, c.Symbol)]; ok && fq.Quote != nil && fq.Quote.Price > 0 {
+			item.FreshnessStatus = fq.Fresh.Status
+			if !fq.Quote.DataTime.IsZero() {
+				item.QuoteAsOf = fq.Quote.DataTime.In(time.Local).Format("2006-01-02 15:04")
+			}
+			if fq.Fresh.Status == freshStatusFresh {
+				item.QuoteOK = true
+				item.Price = round2(fq.Quote.Price)
+				item.ChangePct = round2(fq.Quote.ChangePct)
+			} else {
+				// fail-closed：过期行情不冒充现价（旧价对照失效条件会得出假「未触发」）。
+				item.LastPrice = round2(fq.Quote.Price)
+				item.Signals = append(item.Signals, "行情已过期（截至 "+orStr(item.QuoteAsOf, "未知时间")+"），现价与当日涨跌未知，请勿按最近已知价对照失效条件")
+			}
+			checkBars()
 		} else {
+			item.FreshnessStatus = freshStatusStale
 			item.Signals = append(item.Signals, "行情暂不可用（可能停牌），请留意")
+			checkBars()
 		}
 		items = append(items, item)
 	}

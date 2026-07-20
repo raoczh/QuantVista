@@ -37,6 +37,7 @@ import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import StatCard from '@/components/StatCard.vue'
+import FreshnessTag from '@/components/FreshnessTag.vue'
 
 const message = useMessage()
 const route = useRoute()
@@ -85,14 +86,18 @@ const mixLabel = computed(() => {
   return `${short.toFixed(0)}% / ${(100 - short).toFixed(0)}%`
 })
 
-// 部分估值透明化：行情失败的仓位被排除出市值/盈亏汇总，不能默不作声地伪装成完整组合。
+// 部分估值透明化：行情失败/过期的仓位被排除出市值/盈亏汇总，不能默不作声地伪装成完整组合。
 const pricedLabel = computed(() => {
   const ov = overview.value
   if (!ov) return ''
   const failed = ov.quote_failed_count ?? 0
-  if (failed <= 0) return ''
+  const stale = ov.quote_stale_count ?? 0
+  if (failed + stale <= 0) return ''
   const total = ov.holding_count
-  return `已定价 ${total - failed}/${total} 笔（${failed} 笔行情缺失，未计入市值与盈亏）`
+  const parts: string[] = []
+  if (stale > 0) parts.push(`${stale} 笔行情已过期`)
+  if (failed > 0) parts.push(`${failed} 笔行情缺失`)
+  return `已定价 ${total - failed - stale}/${total} 笔（${parts.join('、')}，未计入市值与盈亏）`
 })
 
 // 持仓行「N 天未分析」提示文案（从未分析则不带天数）。
@@ -521,6 +526,12 @@ onMounted(async () => {
                   <n-tag v-if="p.status === 'closed'" size="tiny" :bordered="false">已卖出</n-tag>
                   <n-tag v-if="p.below_stop_loss" size="tiny" type="error" :bordered="false">破止损</n-tag>
                   <n-tag v-else-if="p.near_stop_loss" size="tiny" type="warning" :bordered="false">近止损</n-tag>
+                  <FreshnessTag
+                    v-if="p.status === 'holding'"
+                    :status="p.freshness_status"
+                    :as-of="p.quote_as_of"
+                    :reason="p.stale_reason"
+                  />
                   <n-tag
                     v-if="p.status === 'holding' && p.analysis_stale"
                     size="tiny"
@@ -549,6 +560,12 @@ onMounted(async () => {
                 <div class="r-fig">
                   <span class="r-fig-label">{{ p.status === 'closed' ? '卖出价' : '现价' }}</span>
                   <span class="r-fig-val qv-tnum">{{ p.quote_ok ? fmt(p.current_price) : '—' }}</span>
+                  <span
+                    v-if="!p.quote_ok && p.status === 'holding' && p.last_price"
+                    class="r-fig-stale qv-tnum"
+                    :title="`最近已知价（截至 ${p.quote_as_of || '未知'}，已过期，不代表当前价格）`"
+                    >旧 {{ fmt(p.last_price) }}</span
+                  >
                 </div>
                 <div class="r-fig">
                   <span class="r-fig-label">盈亏</span>
@@ -920,6 +937,11 @@ onMounted(async () => {
 .r-fig-label {
   font-size: 11px;
   opacity: 0.5;
+}
+.r-fig-stale {
+  font-size: 11px;
+  opacity: 0.55;
+  text-decoration: line-through dotted;
 }
 .r-fig-val {
   font-size: 14px;

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"quantvista/datasource"
 	"quantvista/model"
@@ -27,7 +28,9 @@ const (
 	compareMaxSymbols = 6
 )
 
-// CompareRow 单只标的的对比指标。
+// CompareRow 单只标的的对比指标。行情时效契约：QuoteOK 仅在取到 fresh 行情时为
+// true（stale/unknown 的最近已知价仍填 Price 供表格展示，但带 FreshnessStatus/
+// QuoteAsOf/Error 标注，且不参与评分与 AI 点评）。
 type CompareRow struct {
 	Symbol       string  `json:"symbol"`
 	Market       string  `json:"market"`
@@ -46,7 +49,7 @@ type CompareRow struct {
 	AbovMA20     bool    `json:"above_ma20"` // 现价是否站上 MA20
 	Score        float64 `json:"score"`      // 综合评分 0-100
 	ScoreLabel   string  `json:"score_label"`
-	ValuationOK  bool    `json:"valuation_ok"`  // 估值快照是否可得（腾讯免费源 best-effort）
+	ValuationOK  bool    `json:"valuation_ok"`  // 估值快照是否可得且时效有效（腾讯免费源 best-effort）
 	IsFund       bool    `json:"is_fund"`       // ETF/场内基金（无个股估值指标，估值段跳过）
 	PETTM        float64 `json:"pe_ttm"`        // 市盈率 TTM（负值=亏损）
 	PB           float64 `json:"pb"`            // 市净率
@@ -55,6 +58,9 @@ type CompareRow struct {
 	VolumeRatio  float64 `json:"volume_ratio"`  // 量比
 	IsST         bool    `json:"is_st"`
 	Error        string  `json:"error"`
+
+	QuoteAsOf       string `json:"quote_as_of,omitempty"`      // 行情数据源时刻
+	FreshnessStatus string `json:"freshness_status,omitempty"` // fresh | stale | unknown
 }
 
 // CompareRequest 对比入参。
@@ -147,10 +153,12 @@ func (s *CompareService) Compare(ctx context.Context, userID int64, allowPrivate
 }
 
 // buildRow 采集单只标的的对比指标（行情 + 技术指标）。
+// fail-closed：走 GetFreshQuote，仅 fresh 记 QuoteOK（stale/unknown 的最近已知价
+// 保留展示但带状态与截至时刻，不参与评分与 AI 点评——旧价对比会得出假强弱）。
 func (s *CompareService) buildRow(ctx context.Context, market, symbol string) CompareRow {
 	row := CompareRow{Symbol: symbol, Market: market}
-	q, err := s.market.GetQuote(ctx, market, symbol)
-	if err != nil {
+	q, fi, err := s.market.GetFreshQuote(ctx, market, symbol)
+	if err != nil || q == nil || q.Price <= 0 {
 		if errors.Is(err, datasource.ErrSymbolInvalid) {
 			row.Error = "代码无效"
 		} else {
@@ -159,17 +167,31 @@ func (s *CompareService) buildRow(ctx context.Context, market, symbol string) Co
 		return row
 	}
 	row.Name = q.Name
-	row.QuoteOK = true
+	row.FreshnessStatus = fi.Status
+	if !q.DataTime.IsZero() {
+		row.QuoteAsOf = q.DataTime.In(time.Local).Format("2006-01-02 15:04")
+	}
 	row.Price = round2(q.Price)
 	row.ChangePct = round2(q.ChangePct)
 	row.Amount = round2(q.Amount)
+	if fi.Status != freshStatusFresh {
+		if fi.Status == freshStatusUnknown {
+			row.Error = "行情时效无法核验（该市场无交易日历），未参与对比结论"
+		} else {
+			row.Error = "行情已过期（截至 " + orStr(row.QuoteAsOf, "未知时间") + "），未参与对比结论"
+		}
+		return row
+	}
+	row.QuoteOK = true
 
 	// 估值快照（腾讯免费源，best-effort：拿不到只是该维度缺席）。
 	// ETF/场内基金无个股估值指标（腾讯源 PE/PB 为空→0），跳过以免把全 0 当真值
 	// 喂给 AI 点评——与 analysis_context.go 的 ETF 分支同口径。
+	// 估值 DataTime 须 fresh：过期估值的换手/量比会当作今日值混进对比。
 	if market == "cn" && isCNFund(symbol) {
 		row.IsFund = true
-	} else if v, verr := s.market.GetValuation(ctx, market, symbol); verr == nil {
+	} else if v, verr := s.market.GetValuation(ctx, market, symbol); verr == nil &&
+		s.market.QuoteFreshnessOf(market, v.DataTime).Status == freshStatusFresh {
 		row.ValuationOK = true
 		row.PETTM = round2(v.PETTM)
 		row.PB = round2(v.PB)
@@ -299,6 +321,9 @@ func compareRowLine(r CompareRow) string {
 	fmt.Fprintf(&b, "- %s(%s)：现价%.2f 涨跌%.2f%% 近5日%.2f%% 近20日%.2f%% MA20=%.2f %s，区间[%.2f,%.2f]",
 		nameOr(r), r.Symbol, r.Price, r.ChangePct, r.ChangePct5d, r.ChangePct20d, r.MA20,
 		aboveText(r.AbovMA20), r.PeriodLow, r.PeriodHigh)
+	if r.QuoteAsOf != "" {
+		fmt.Fprintf(&b, "（行情时点 %s）", r.QuoteAsOf)
+	}
 	if r.Score > 0 {
 		fmt.Fprintf(&b, "，综合分%.0f(%s)", r.Score, r.ScoreLabel)
 	}

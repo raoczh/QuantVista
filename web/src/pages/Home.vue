@@ -27,6 +27,7 @@ import SectionCard from '@/components/SectionCard.vue'
 import StatCard from '@/components/StatCard.vue'
 import RankList from '@/components/RankList.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
+import FreshnessTag from '@/components/FreshnessTag.vue'
 
 const message = useMessage()
 const router = useRouter()
@@ -266,7 +267,7 @@ function onResize() {
 </script>
 
 <template>
-  <PageContainer title="市场首页" subtitle="A 股 · 实时概览与个股速查">
+  <PageContainer title="市场首页" subtitle="A 股 · 行情概览与个股速查（数据带采集时点）">
     <template #actions>
       <n-tag v-if="overview" size="small" round :bordered="false">
         <!-- data_time 是服务端采集时刻而非各源行情时间，措辞用「采集」避免冒充实时更新时间 -->
@@ -510,6 +511,11 @@ function onResize() {
               {{ fmt(quote.price) }}
             </span>
             <ChangeTag :value="quote.change_pct" />
+            <FreshnessTag
+              :status="quote.freshness?.freshness_status"
+              :as-of="quote.freshness?.source_data_time"
+              :reason="quote.freshness?.stale_reason"
+            />
           </div>
           <div class="quote-grid">
             <div class="quote-cell">

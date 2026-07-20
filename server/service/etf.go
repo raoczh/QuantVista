@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"strings"
+	"time"
 )
 
 // isCNFund 按 A 股基金代码前缀判定是否为场内基金（ETF/LOF/封闭基金/REITs）。
@@ -32,6 +33,9 @@ type EtfItem struct {
 	Price     float64 `json:"price"`
 	ChangePct float64 `json:"change_pct"`
 	QuoteOK   bool    `json:"quote_ok"`
+
+	QuoteAsOf       string `json:"quote_as_of,omitempty"`      // 行情数据源时刻
+	FreshnessStatus string `json:"freshness_status,omitempty"` // fresh | stale（展示行统一过期徽标）
 }
 
 // etfCatalog 精选主流指数 ETF（全部沪深市场）。顺序即前端展示顺序：宽基→行业主题→商品跨境。
@@ -76,11 +80,16 @@ func (s *EtfService) List(ctx context.Context) []EtfItem {
 		refs = append(refs, QuoteRef{Market: "cn", Symbol: it.Symbol})
 	}
 	quotes := s.market.QuotesFor(ctx, refs)
+	judge := s.market.FreshnessJudge("cn")
 	for i := range items {
 		if q := quotes[QuoteKey("cn", items[i].Symbol)]; q != nil {
 			items[i].Price = round4(q.Price) // ETF 最小变动价位 0.001，round2 会抹掉第三位小数
 			items[i].ChangePct = round2(q.ChangePct)
 			items[i].QuoteOK = true
+			items[i].FreshnessStatus = judge(q.DataTime).Status
+			if !q.DataTime.IsZero() {
+				items[i].QuoteAsOf = q.DataTime.In(time.Local).Format("2006-01-02 15:04")
+			}
 		}
 	}
 	return items
