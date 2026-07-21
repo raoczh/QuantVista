@@ -84,7 +84,7 @@ func (sc *ScreenerController) Parse(c *gin.Context) {
 	allowPrivate := currentRole(c) == model.RoleAdmin
 	res, err := sc.ai.ParseStrategy(c.Request.Context(), currentUserID(c), allowPrivate, req)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiError(c, err)
 		return
 	}
 	common.ApiSuccess(c, res)

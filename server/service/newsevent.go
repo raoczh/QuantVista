@@ -26,9 +26,9 @@ type reportEvent struct {
 	Source   string   `json:"source"`
 	Time     string   `json:"time"` // HH:MM
 	Score    int      `json:"score"`
-	SrcLevel int      `json:"src_level"`  // 来源级别：中央5/部委4/交易所3/重要电报3/一般1~2
-	Impact   int      `json:"impact"`     // 影响范围：全市场5/板块3/个股1
-	FundSens int      `json:"fund_sens"`  // 资金敏感度：直接5/间接3/弱1
+	SrcLevel int      `json:"src_level"` // 来源级别：中央5/部委4/交易所3/重要电报3/一般1~2
+	Impact   int      `json:"impact"`    // 影响范围：全市场5/板块3/个股1
+	FundSens int      `json:"fund_sens"` // 资金敏感度：直接5/间接3/弱1
 	Major    bool     `json:"major,omitempty"`
 	Sectors  []string `json:"sectors,omitempty"`
 	Merged   int      `json:"merged,omitempty"` // 同主线被合并掉的条数
@@ -48,15 +48,15 @@ var eventNoiseWords = []string{
 
 // 来源级别关键词（政策层级；policy_level 已由情绪增强判定时优先用它）。
 var (
-	eventCentralWords = []string{"国务院", "中共中央", "中央政治局", "国常会", "央行", "中国人民银行", "习近平", "总理"}
+	eventCentralWords  = []string{"国务院", "中共中央", "中央政治局", "国常会", "央行", "中国人民银行", "习近平", "总理"}
 	eventMinistryWords = []string{"证监会", "发改委", "财政部", "工信部", "商务部", "住建部", "金融监管总局", "国家统计局", "部委", "税务总局"}
 	eventExchangeWords = []string{"上交所", "深交所", "北交所", "交易所", "中金所", "中登"}
 )
 
 // 全市场影响关键词 / 资金敏感关键词。
 var (
-	eventMarketWideWords = []string{"A股", "股市", "大盘", "指数", "宏观", "GDP", "CPI", "PMI", "货币政策", "财政政策", "美联储", "加息", "汇率"}
-	eventFundDirectWords = []string{"降准", "降息", "利率", "印花税", "IPO", "再融资", "回购", "减持", "增持", "社保基金", "养老金", "险资", "汇金", "平准基金", "流动性", "逆回购", "LPR"}
+	eventMarketWideWords   = []string{"A股", "股市", "大盘", "指数", "宏观", "GDP", "CPI", "PMI", "货币政策", "财政政策", "美联储", "加息", "汇率"}
+	eventFundDirectWords   = []string{"降准", "降息", "利率", "印花税", "IPO", "再融资", "回购", "减持", "增持", "社保基金", "养老金", "险资", "汇金", "平准基金", "流动性", "逆回购", "LPR"}
 	eventFundIndirectWords = []string{"政策", "规划", "试点", "补贴", "关税", "出口管制", "方案", "意见", "条例", "准入"}
 )
 
@@ -153,6 +153,10 @@ func sameMainline(a, b reportEvent) bool {
 
 // buildTodayEvents 当日事件流水线（DB 读 + 纯规则）。date 为 2006-01-02。
 func buildTodayEvents(date string) []reportEvent {
+	return buildTodayEventsAt(date, time.Now())
+}
+
+func buildTodayEventsAt(date string, now time.Time) []reportEvent {
 	if common.DB == nil {
 		return nil
 	}
@@ -160,11 +164,18 @@ func buildTodayEvents(date string) []reportEvent {
 	if err != nil {
 		return nil
 	}
+	dayEnd := dayStart.Add(24 * time.Hour)
+	if now.Before(dayEnd) {
+		dayEnd = now
+	}
+	if !dayEnd.After(dayStart) {
+		return nil
+	}
 	var rows []model.News
 	if err := common.DB.
 		Select("id, title, summary, source, category, publish_time, related_symbols, related_sectors, source_priority, sentiment, impact_scope, policy_level, important_mark").
 		Where("category IN ? AND publish_time >= ? AND publish_time < ?",
-			[]string{"telegraph", "flash"}, dayStart, dayStart.Add(24*time.Hour)).
+			[]string{"telegraph", "flash"}, dayStart, dayEnd).
 		Order("publish_time DESC").Limit(300).Find(&rows).Error; err != nil {
 		return nil
 	}
@@ -186,7 +197,7 @@ func selectReportEvents(rows []model.News) []reportEvent {
 		}
 		kept = append(kept, reportEvent{
 			Title: truncateRunes(n.Title, 120), Source: n.Source,
-			Time: n.PublishTime.Format("15:04"),
+			Time:  n.PublishTime.Format("15:04"),
 			Score: total, SrcLevel: src, Impact: impact, FundSens: fund,
 			Major: total >= eventMajorScore, Sectors: eventSectors(n),
 			Senti: sentimentCN(n.Sentiment),

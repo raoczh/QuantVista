@@ -9,8 +9,21 @@ import (
 	"testing"
 
 	"quantvista/common"
+	"quantvista/datasource"
 	"quantvista/model"
 )
+
+type refusalTestAdapter struct{}
+
+func (refusalTestAdapter) Name() string { return "refusal-test" }
+
+func (refusalTestAdapter) GetQuote(context.Context, string, string) (*datasource.Quote, error) {
+	return nil, datasource.ErrNotSupported
+}
+
+func (refusalTestAdapter) GetDailyBars(context.Context, string, string, int) ([]datasource.Bar, error) {
+	return nil, datasource.ErrNotSupported
+}
 
 func TestParseAnalysisResult_Valid(t *testing.T) {
 	in := `{"rating":"bullish","confidence":72,"summary":"趋势向上","highlights":["站上MA20"],"risks":["量能不足"],"opportunities":["回踩支撑"],"suggestions":["观察成交量"],"disclaimer":"仅供参考"}`
@@ -187,9 +200,9 @@ func TestAnalysisDiff(t *testing.T) {
 func TestParseAnalysisResult_Invalid(t *testing.T) {
 	cases := map[string]string{
 		"非法 rating": `{"rating":"buy strong","confidence":50,"summary":"x"}`,
-		"空 summary":  `{"rating":"neutral","confidence":50,"summary":"   "}`,
-		"无 JSON":     `完全没有 JSON 的一段话`,
-		"坏 JSON":     `{"rating":"neutral", bad}`,
+		"空 summary": `{"rating":"neutral","confidence":50,"summary":"   "}`,
+		"无 JSON":    `完全没有 JSON 的一段话`,
+		"坏 JSON":    `{"rating":"neutral", bad}`,
 	}
 	for name, in := range cases {
 		if _, err := parseAnalysisResult(in); err == nil {
@@ -284,7 +297,7 @@ func TestChatCompletion_BlocksPrivateWhenNotAllowed(t *testing.T) {
 	// allowPrivate=false 时，SafeHTTPClient 应拦截 127.0.0.1，返回错误（防 SSRF）。
 	_, err := chatCompletion(context.Background(), chatParams{
 		BaseURL: srv.URL, APIKey: "k", Model: "m",
-		Messages: []chatMessage{{Role: "user", Content: "hi"}},
+		Messages:     []chatMessage{{Role: "user", Content: "hi"}},
 		AllowPrivate: false,
 	})
 	if err == nil {
@@ -311,7 +324,7 @@ func TestChatCompletion_RetriesTransient5xx(t *testing.T) {
 
 	res, err := chatCompletion(context.Background(), chatParams{
 		BaseURL: srv.URL, APIKey: "k", Model: "m",
-		Messages: []chatMessage{{Role: "user", Content: "hi"}},
+		Messages:     []chatMessage{{Role: "user", Content: "hi"}},
 		AllowPrivate: true,
 	})
 	if err != nil {
@@ -336,7 +349,7 @@ func TestChatCompletion_EstimatesUsageWhenMissing(t *testing.T) {
 
 	res, err := chatCompletion(context.Background(), chatParams{
 		BaseURL: srv.URL, APIKey: "k", Model: "m",
-		Messages: []chatMessage{{Role: "user", Content: "你好世界"}}, // 4 字 → 估 2
+		Messages:     []chatMessage{{Role: "user", Content: "你好世界"}}, // 4 字 → 估 2
 		AllowPrivate: true,
 	})
 	if err != nil {
@@ -344,6 +357,41 @@ func TestChatCompletion_EstimatesUsageWhenMissing(t *testing.T) {
 	}
 	if res.Usage.TotalTokens != 4 || res.Usage.PromptTokens != 2 || res.Usage.CompletionTokens != 2 {
 		t.Fatalf("usage 估算不符: %+v", res.Usage)
+	}
+}
+
+// TestModuleCallFailurePreservesRefusalCode 覆盖中央客户端错误穿过模块编排后的类型信息：
+// Analysis 对外返回不得把 RefusalError 重建为普通 errors.New；Recommendation 的主调
+// callWithRepair 同样须保留机器码，供上层失败/降级分支继续识别。
+func TestModuleCallFailurePreservesRefusalCode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"bad key"}}`))
+	}))
+	defer srv.Close()
+
+	const userID int64 = 74
+	seedReportEnv(t, userID, srv.URL)
+	market := NewMarketService(datasource.NewManagerWithAdapters(refusalTestAdapter{}))
+	analysisSvc := NewAnalysisService(market, nil, nil, NewLLMService(), nil)
+	_, err := analysisSvc.Analyze(context.Background(), userID, true, AnalyzeRequest{
+		Module: model.AnalysisModuleMarket,
+		Market: "cn",
+	})
+	if got := RefusalCodeOf(err); got != RefusalLLMCallFailed {
+		t.Fatalf("Analysis 编排不得丢失 LLM 调用拒答码: got %q, err=%v", got, err)
+	}
+
+	recommendationSvc := &RecommendationService{}
+	_, _, _, _, err = recommendationSvc.callWithRepair(
+		context.Background(), userID,
+		&model.LLMConfig{BaseURL: srv.URL, Model: "m"}, "sk-test", true,
+		[]chatMessage{{Role: "user", Content: "x"}},
+		map[string]candidate{"600001": {Symbol: "600001", Name: "甲", Price: 10}},
+		3,
+	)
+	if got := RefusalCodeOf(err); got != RefusalLLMCallFailed {
+		t.Fatalf("Recommendation 主调不得丢失 LLM 调用拒答码: got %q, err=%v", got, err)
 	}
 }
 

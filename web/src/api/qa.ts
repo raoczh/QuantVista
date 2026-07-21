@@ -1,4 +1,4 @@
-import { request, AI_TIMEOUT, refreshAccessToken } from './client'
+import { request, AI_TIMEOUT, refreshAccessToken, ApiRequestError } from './client'
 import { getAccessToken, clearTokens } from './token'
 import type { RiskFlag } from './trust'
 
@@ -106,13 +106,15 @@ export async function askQaStream(
   const ctype = resp.headers.get('content-type') || ''
   if (!ctype.includes('x-ndjson')) {
     let msg = `请求失败（HTTP ${resp.status}）`
+    let code: string | undefined
     try {
-      const body = (await resp.json()) as { success?: boolean; message?: string }
+      const body = (await resp.json()) as { success?: boolean; message?: string; code?: string }
       if (body?.message) msg = body.message
+      code = body?.code
     } catch {
       /* 保留默认消息 */
     }
-    throw new Error(msg)
+    throw new ApiRequestError(msg, code, resp.status)
   }
   if (!resp.body) throw new Error('当前浏览器不支持流式读取')
 
@@ -131,7 +133,9 @@ export async function askQaStream(
       return // 坏行容错跳过
     }
     if (parsed.status === 'streaming' && parsed.chunk) onChunk(parsed.chunk)
-    else if (parsed.status === 'error') throw new Error(parsed.message || '流式问答失败')
+    else if (parsed.status === 'error') {
+      throw new ApiRequestError(parsed.message || '流式问答失败', parsed.refusal_code || parsed.code)
+    }
     else if (parsed.status === 'done' && parsed.data) final = parsed.data
   }
   for (;;) {

@@ -12,6 +12,10 @@ import (
 )
 
 const (
+	// llmCallBodyLimit 单字段正文上限：仅做长度截断防库膨胀，**不做内容脱敏**。
+	// 管理端 LLM 调用审计面向管理员排障，请求/响应原文（含用户问题、持仓上下文）
+	// 原样保留；API key 本就不进 messages（走 Authorization 头），勿把「截断」当「脱敏」。
+	// 计划文档 P0-8 的「审计脱敏」项已按产品决策取消（见 LLM_ACCURACY_OPTIMIZATION_PLAN）。
 	llmCallBodyLimit = 60 << 10
 	llmCallRetention = 90 * 24 * time.Hour
 )
@@ -23,6 +27,8 @@ type chatMeta struct {
 	Provider     string
 }
 
+// writeLLMCallLog 落一条调用审计。正文为管理员排障用原文：messages + 响应 content 仅
+// truncateAuditText 限长，不做敏感字段打码/哈希替换（与 P0-8 取消脱敏的产品决策一致）。
 func writeLLMCallLog(p chatParams, stream bool, res *chatResult, callErr error, elapsed time.Duration) {
 	if common.DB == nil {
 		return

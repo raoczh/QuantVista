@@ -39,6 +39,7 @@ import {
   type HindsightView,
 } from '@/api/analysis'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
+import { getApiErrorCode } from '@/api/client'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
 import PageContainer from '@/components/PageContainer.vue'
@@ -153,9 +154,15 @@ async function runAnalysis(allowStale = false) {
     }
   } catch (e) {
     const msg = (e as Error).message || ''
+    const refusalCode = getApiErrorCode(e)
     // 行情时效 fail-closed：后端拒绝当前评级时给用户显式降级选择（历史数据解释模式），
     // 不悄悄放行——确认后带 allow_stale 重试。
-    if (!allowStale && msg.includes('历史数据解释')) {
+    const canRetryAsHistorical = form.value.module === 'stock' && !panelMode.value && !asOfStr.value
+    if (
+      !allowStale &&
+      canRetryAsHistorical &&
+      (refusalCode === 'stale_quote' || (!refusalCode && msg.includes('历史数据解释')))
+    ) {
       dialog.warning({
         title: '行情已过期，无法给出当前评级',
         content: msg + '。是否按「截至行情时刻的历史数据解释」模式继续？该模式不代表当前盘面判断，也不会给出当前买卖行动建议。',

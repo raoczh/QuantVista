@@ -65,10 +65,16 @@ type emFastResp struct {
 			Code      string   `json:"code"`
 			Title     string   `json:"title"`
 			Summary   string   `json:"summary"`
-			ShowTime  string   `json:"showTime"` // 2026-07-06 16:56:06（北京时间）
+			ShowTime  string   `json:"showTime"`  // 2026-07-06 16:56:06（北京时间）
 			StockList []string `json:"stockList"` // 元素形如 "1.688035" / "90.BK1175"
 		} `json:"fastNewsList"`
 	} `json:"data"`
+}
+
+func parseEMPublishTime(value string) (time.Time, bool) {
+	loc := time.FixedZone("CST", 8*3600)
+	pt, err := time.ParseInLocation("2006-01-02 15:04:05", strings.TrimSpace(value), loc)
+	return pt, err == nil
 }
 
 // GetEMFastNews 拉取东财 7×24 快讯一页；返回条目与下一页游标 sortEnd。
@@ -94,12 +100,11 @@ func GetEMFastNews(ctx context.Context, sortEnd string, pageSize int) ([]EMNewsI
 	if resp.Code != "1" {
 		return nil, "", fmt.Errorf("em fastnews code=%s", resp.Code)
 	}
-	loc := time.FixedZone("CST", 8*3600)
 	items := make([]EMNewsItem, 0, len(resp.Data.FastNewsList))
 	for _, r := range resp.Data.FastNewsList {
-		pt, perr := time.ParseInLocation("2006-01-02 15:04:05", r.ShowTime, loc)
-		if perr != nil {
-			pt = time.Now()
+		pt, ok := parseEMPublishTime(r.ShowTime)
+		if !ok {
+			continue
 		}
 		var syms []string
 		for _, st := range r.StockList {
@@ -161,12 +166,11 @@ func GetEMStockNews(ctx context.Context, symbol string, pageSize int) ([]EMNewsI
 	if err := json.Unmarshal([]byte(payload), &resp); err != nil {
 		return nil, fmt.Errorf("em stocknews 解析失败: %w", err)
 	}
-	loc := time.FixedZone("CST", 8*3600)
 	items := make([]EMNewsItem, 0, len(resp.Result.CmsArticleWebOld))
 	for _, r := range resp.Result.CmsArticleWebOld {
-		pt, perr := time.ParseInLocation("2006-01-02 15:04:05", r.Date, loc)
-		if perr != nil {
-			pt = time.Now()
+		pt, ok := parseEMPublishTime(r.Date)
+		if !ok {
+			continue
 		}
 		items = append(items, EMNewsItem{
 			SourceID:    r.Code,

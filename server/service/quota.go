@@ -1,8 +1,6 @@
 package service
 
 import (
-	"errors"
-
 	"gorm.io/gorm"
 
 	"quantvista/common"
@@ -12,7 +10,12 @@ import (
 // 配额共用逻辑（次数制）：分析/推荐/问答/对比四个入口统一走这里，
 // 语义见 model.UserQuota 注释。之前四个 service 各自的 getQuota/addUsage 已收敛到此。
 
-var errQuotaExhausted = errors.New("AI 次数配额已用尽，请联系管理员调整额度")
+// errQuotaExhausted 次数用尽：机读码 quota_exhausted，文案保持既有中文（前端/运维文案锚点）。
+// 指针常量便于 errors.Is 与 compare 等调用方分支。
+var errQuotaExhausted = &RefusalError{
+	Code: RefusalQuotaExhausted,
+	Msg:  "AI 次数配额已用尽，请联系管理员调整额度",
+}
 
 func getUserQuota(userID int64) (*model.UserQuota, error) {
 	var q model.UserQuota
@@ -22,11 +25,11 @@ func getUserQuota(userID int64) (*model.UserQuota, error) {
 	return &q, nil
 }
 
-// checkQuota 熔断检查：次数额度用尽即拒绝（0 = 不限）。
+// checkQuota 熔断检查：次数额度用尽即拒绝（0 = 不限）。用尽时返回 *RefusalError（code=quota_exhausted）。
 func checkQuota(userID int64) error {
 	q, err := getUserQuota(userID)
 	if err != nil {
-		return err
+		return refusalErr(RefusalQuotaUnavailable, "AI 配额信息读取失败，请稍后重试")
 	}
 	if q.ActionLimit > 0 && q.ActionUsed >= q.ActionLimit {
 		return errQuotaExhausted
