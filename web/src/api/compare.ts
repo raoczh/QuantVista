@@ -37,6 +37,8 @@ export interface CompareResult {
   ai_comment: string
   ai_comment_check?: EvidenceCheck // AI 点评引用数字与各行指标的核验（服务端回填）
   note: string
+  // AI 点评未生成时的机读拒答码（P0-7：insufficient_fresh_quotes/quota_exhausted/llm_unavailable）。
+  ai_refusal_code?: string
   // AI 点评实际使用的 LLM（无点评时缺席）。
   ai_llm_config_id?: number
   ai_provider?: string

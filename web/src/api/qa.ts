@@ -65,6 +65,8 @@ interface QaStreamLine {
   code: string
   status: 'streaming' | 'done' | 'error'
   chunk?: string
+  // 机读拒答码（P0-7）：error 行上透出（如 stale_quote），供按 code 分支替代解析中文文案。
+  refusal_code?: string
   message?: string
   data?: QaConversationView
 }

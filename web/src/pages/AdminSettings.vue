@@ -66,6 +66,7 @@ async function load() {
     news.auto_llm = settings.value.news_auto_llm
     fb.enabled = settings.value.llm_fallback_enabled
     fb.config_id = settings.value.llm_fallback_config_id
+    acEnabled.value = settings.value.llm_accuracy_contract
     siteBaseURL.value = settings.value.site_base_url
   } catch (e) {
     message.error((e as Error).message)
@@ -124,6 +125,23 @@ async function saveFallback() {
     message.error((e as Error).message)
   } finally {
     savingFb.value = false
+  }
+}
+
+/* LLM 准确性契约（P0-1 ac1）：中央契约注入/低温钳制/repair 归零/流式完整性门禁的总开关 */
+const savingAc = ref(false)
+const acEnabled = ref(true)
+async function toggleAccuracy(v: boolean) {
+  savingAc.value = true
+  try {
+    settings.value = await updateSystemSettings({ llm_accuracy_contract: v })
+    acEnabled.value = settings.value.llm_accuracy_contract
+    message.success('已保存，下一次 AI 调用生效')
+  } catch (e) {
+    message.error((e as Error).message)
+    await load()
+  } finally {
+    savingAc.value = false
   }
 }
 
@@ -366,6 +384,17 @@ onMounted(() => {
           </n-form-item>
           <n-button type="primary" :loading="savingFb" @click="saveFallback">保存回退设置</n-button>
         </n-form>
+      </SectionCard>
+
+      <!-- LLM 准确性契约（P0-1 ac1） -->
+      <SectionCard title="LLM 准确性契约" :hoverable="false">
+        <n-space align="center">
+          <span>启用准确性契约：</span>
+          <n-switch :value="acEnabled" :loading="savingAc" @update:value="toggleAccuracy" />
+          <span style="opacity: 0.6; font-size: 12px">
+            开启：所有 AI 调用注入不可覆盖的准确性契约（ac1）、结构化调用低温钳制、repair 温度归零、拒收被截断或无终止标记的半截响应。仅当上游网关兼容性异常（正常请求被误判拒收）时才临时关闭回退旧路径。
+          </span>
+        </n-space>
       </SectionCard>
 
       <!-- GitHub OAuth -->

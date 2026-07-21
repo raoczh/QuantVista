@@ -98,6 +98,7 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 			Messages:     convo,
 			JSONMode:     true,
 			AllowPrivate: allowPrivate,
+			Repair:       attempt > 0, // repair 轮：契约开启时温度固定 0
 			Meta:         chatMeta{CallerUserID: userID, Module: "screener_parse", ConfigID: cfg.ID, Provider: cfg.Provider},
 		})
 		if callErr != nil {

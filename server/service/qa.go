@@ -202,9 +202,9 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 			asOf, _ := snap["quote_as_of"].(string)
 			if !req.AllowStale {
 				if st == freshStatusUnknown {
-					return nil, errors.New("该市场无交易日历，无法核验行情时效；可选择「按截至行情时刻的历史数据解释」模式继续提问")
+					return nil, refusalErr(RefusalStaleQuote, "该市场无交易日历，无法核验行情时效；可选择「按截至行情时刻的历史数据解释」模式继续提问")
 				}
-				return nil, fmt.Errorf("行情已过期（仅更新至 %s，可能停牌、休市异常或数据源故障），无法按最新行情回答；可选择「按截至该时刻的历史数据解释」模式继续提问", orStr(asOf, "未知时间"))
+				return nil, refusalErrf(RefusalStaleQuote, "行情已过期（仅更新至 %s，可能停牌、休市异常或数据源故障），无法按最新行情回答；可选择「按截至该时刻的历史数据解释」模式继续提问", orStr(asOf, "未知时间"))
 			}
 			snap["stale_mode"] = "historical_explanation"
 			snap["stale_mode_note"] = "用户已确认行情过期，本会话回答为「截至 " + orStr(asOf, "未知时间") + " 的历史数据解释」，非当前盘面判断"

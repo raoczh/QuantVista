@@ -199,13 +199,13 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 				// panel 是「四角色对当下盘面表态」的编排，输出 schema（roles/consensus）
 				// 没有历史解释形态的改写点，且专属提示词不含历史解释约束——非 fresh
 				// 一律拒绝，不接受 allow_stale（标准分析的历史解释模式可用）。
-				return nil, errors.New("行情已过期或时效无法核验，多角色观点不支持历史解释模式；请改用标准分析（可选「按历史数据解释」）或待行情恢复后重试")
+				return nil, refusalErr(RefusalStaleQuote, "行情已过期或时效无法核验，多角色观点不支持历史解释模式；请改用标准分析（可选「按历史数据解释」）或待行情恢复后重试")
 			}
 			if !req.AllowStale {
 				if st == freshStatusUnknown {
-					return nil, errors.New("该市场无交易日历，无法核验行情时效，无法给出当前评级；可选择「按截至行情时刻的历史数据解释」模式重试")
+					return nil, refusalErr(RefusalStaleQuote, "该市场无交易日历，无法核验行情时效，无法给出当前评级；可选择「按截至行情时刻的历史数据解释」模式重试")
 				}
-				return nil, fmt.Errorf("行情已过期（仅更新至 %s，可能停牌、休市异常或数据源故障），无法给出当前评级；可选择「按截至该时刻的历史数据解释」模式重试", orStr(asOf, "未知时间"))
+				return nil, refusalErrf(RefusalStaleQuote, "行情已过期（仅更新至 %s，可能停牌、休市异常或数据源故障），无法给出当前评级；可选择「按截至该时刻的历史数据解释」模式重试", orStr(asOf, "未知时间"))
 			}
 			staleMode = true
 			staleAsOf = asOf
@@ -378,6 +378,7 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, audi
 			Messages:     convo,
 			JSONMode:     true,
 			AllowPrivate: allowPrivate,
+			Repair:       attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）
 			Meta:         chatMeta{CallerUserID: userID, Module: auditModule, ConfigID: cfg.ID, Provider: cfg.Provider},
 		})
 		if err != nil {

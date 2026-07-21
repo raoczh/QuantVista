@@ -25,6 +25,7 @@ const (
 	keyLLMFallbackEnabled = "llm_fallback_enabled"
 	keyLLMFallbackID      = "llm_fallback_config_id"
 	keySiteBaseURL        = "site_base_url"
+	keyLLMAccuracy        = "llm_accuracy_contract"
 )
 
 // 新闻快讯采集间隔（分钟）的默认值与钳制范围：下限防打爆免费上游，上限防配成"实际不采集"。
@@ -49,6 +50,9 @@ var (
 	llmFallbackID      int64
 	// 站点对外基础 URL（如 https://app.example.com）：推送通知拼点击跳转链接用；空 = 通知不带跳转。
 	siteBaseURL string
+	// LLM 准确性契约（P0-1，ac1）：中央出口注入不可覆盖契约 + 结构化低温钳制 +
+	// repair 温度归零 + 流式完整性门禁。默认开；上游网关兼容性异常时可关闭回退旧路径。
+	llmAccuracyContract = true
 )
 
 // Init 从 DB 加载系统配置；首启时若 DB 缺 GitHub 凭证而 env 提供了，则种子回填到 DB。
@@ -115,6 +119,9 @@ func apply(opts map[string]string) {
 	}
 
 	siteBaseURL = normalizeSiteBaseURL(opts[keySiteBaseURL])
+
+	// 准确性契约同款 != "false" 缺省开语义（新门禁的回滚开关，而非默认停用的实验位）。
+	llmAccuracyContract = opts[keyLLMAccuracy] != "false"
 }
 
 // normalizeSiteBaseURL 去空白与尾部斜杠（拼路由时统一 base+/path 形态）。
@@ -166,6 +173,10 @@ func LLMFallbackConfigID() int64 { mu.RLock(); defer mu.RUnlock(); return llmFal
 // SiteBaseURL 站点对外基础 URL（无尾部斜杠）；空表示未配置（推送通知不带点击跳转）。
 func SiteBaseURL() string { mu.RLock(); defer mu.RUnlock(); return siteBaseURL }
 
+// LLMAccuracyContract LLM 准确性契约总开关（ac1 注入/低温钳制/repair 归零/流式完整性门禁）。
+// 关闭 = 全部回退旧路径（回滚开关，见 docs/LLM_ACCURACY_OPTIMIZATION_PLAN.md §10.1）。
+func LLMAccuracyContract() bool { mu.RLock(); defer mu.RUnlock(); return llmAccuracyContract }
+
 // ---- 写入（持久化 + 刷新内存）----
 
 // SetRegistrationOpen 设置是否开放注册。
@@ -193,6 +204,17 @@ func SetNewsCollectIntervalMin(v int) error {
 	}
 	mu.Lock()
 	newsIntervalMin = v
+	mu.Unlock()
+	return nil
+}
+
+// SetLLMAccuracyContract 设置 LLM 准确性契约开关。
+func SetLLMAccuracyContract(v bool) error {
+	if err := model.UpsertOption(keyLLMAccuracy, strconv.FormatBool(v)); err != nil {
+		return err
+	}
+	mu.Lock()
+	llmAccuracyContract = v
 	mu.Unlock()
 	return nil
 }

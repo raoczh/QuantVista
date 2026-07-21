@@ -90,7 +90,8 @@ func (s *RecommendationService) bearReview(ctx context.Context, userID int64, cf
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			Temperature: cfg.Temperature, MaxTokens: capModuleTokens(cfg.MaxTokens, recBearTokensCap),
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
-			Meta: chatMeta{CallerUserID: userID, Module: "rec_bear", ConfigID: cfg.ID, Provider: cfg.Provider},
+			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0
+			Meta:   chatMeta{CallerUserID: userID, Module: "rec_bear", ConfigID: cfg.ID, Provider: cfg.Provider},
 		})
 		if err != nil {
 			return nil, usage

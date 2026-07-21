@@ -214,14 +214,19 @@ func parseResponsesBody(raw []byte, status int, endpoint string) (*chatResult, e
 		return nil, fmt.Errorf("LLM 返回错误：%s", msg)
 	}
 	content := extractResponsesText(parsed.Output)
-	if parsed.Status == "incomplete" && strings.TrimSpace(content) == "" {
-		reason := ""
-		if parsed.IncompleteDetails != nil {
-			reason = parsed.IncompleteDetails.Reason
-		}
-		return nil, fmt.Errorf("LLM 响应未完成（%s）且无内容，可尝试调大 max_tokens", reason)
+	incompleteReason := ""
+	if parsed.IncompleteDetails != nil {
+		incompleteReason = parsed.IncompleteDetails.Reason
 	}
-	res := &chatResult{Content: content}
+	// 完整性门禁（契约开启时）：仅 status=completed 算成功，incomplete/failed/空一律拒收
+	//（incomplete 带部分内容也是半截，responses 是显式端点选择、标准实现必回 status）。
+	if rerr := responsesStatusReject(parsed.Status, incompleteReason); rerr != nil {
+		return nil, rerr
+	}
+	if parsed.Status == "incomplete" && strings.TrimSpace(content) == "" {
+		return nil, fmt.Errorf("LLM 响应未完成（%s）且无内容，可尝试调大 max_tokens", incompleteReason)
+	}
+	res := &chatResult{Content: content, FinishReason: parsed.Status}
 	if parsed.Usage != nil {
 		res.Usage = parsed.Usage.toChatUsage()
 	}
@@ -324,6 +329,8 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	var sb strings.Builder
 	var usage chatUsage
 	var firstChunkMs int64
+	doneStatus := ""       // 完成事件携带的状态：completed / incomplete；空=仅 [DONE] 收尾
+	incompleteReason := "" // incomplete 事件的截断原因（如 max_output_tokens）
 	sc := bufio.NewScanner(br)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	done := false
@@ -362,9 +369,21 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 					onDelta(ev.Delta)
 				}
 			}
-		case "response.completed", "response.done", "response.incomplete":
+		case "response.completed", "response.done":
+			doneStatus = "completed"
 			if ev.Response != nil && ev.Response.Usage != nil {
 				usage = ev.Response.Usage.toChatUsage()
+			}
+			done = true
+		case "response.incomplete":
+			doneStatus = "incomplete"
+			if ev.Response != nil {
+				if ev.Response.Usage != nil {
+					usage = ev.Response.Usage.toChatUsage()
+				}
+				if ev.Response.IncompleteDetails != nil {
+					incompleteReason = ev.Response.IncompleteDetails.Reason
+				}
 			}
 			done = true
 		case "response.failed", "response.error", "error":
@@ -384,6 +403,18 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	if err := sc.Err(); err != nil && !done {
 		return nil, fmt.Errorf("流式响应中断: %w", err)
 	}
+	if !done {
+		// 正常 EOF 但从未收到完成事件/[DONE]：契约开启时拒收（eof_without_marker）。
+		if rerr := streamEOFReject(); rerr != nil {
+			return nil, rerr
+		}
+	}
+	if doneStatus == "incomplete" {
+		// incomplete 完成事件=输出被截断（多为 max_output_tokens）：契约开启时拒收半截。
+		if rerr := responsesStatusReject(doneStatus, incompleteReason); rerr != nil {
+			return nil, rerr
+		}
+	}
 	content := sb.String()
 	if strings.TrimSpace(content) == "" {
 		return nil, errors.New("LLM 返回空内容")
@@ -391,5 +422,5 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	if usage.TotalTokens == 0 {
 		usage = estimateUsage(p.Messages, content)
 	}
-	return &chatResult{Content: content, Usage: usage, LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs}, nil
+	return &chatResult{Content: content, Usage: usage, LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs, FinishReason: doneStatus}, nil
 }

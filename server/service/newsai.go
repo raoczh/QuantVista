@@ -487,15 +487,21 @@ func sentimentCN(s string) string {
 	return ""
 }
 
-// latestNewsBriefs 某标的最近 limit 条新闻（标题+情绪标签），供个股分析/问答 prompt 注入。
-// best-effort：无 DB / 无新闻返回空。
+// newsBriefMaxAge 注入 AI 上下文的新闻最大时龄（P0-7 news 链路 stale fail-closed）：
+// 「最近 N 条」无时间下限会让数月前的旧闻冒充近期消息面（Time 无年份更无从辨别），
+// 7 天覆盖「近期消息面」语义；窗口内无新闻时 news 块如实缺席（分析/问答 prompt 已有
+// 无新闻的处理口径），不许放宽窗口硬凑条数。
+const newsBriefMaxAge = 7 * 24 * time.Hour
+
+// latestNewsBriefs 某标的近 7 天内最新 limit 条新闻（标题+情绪标签），供个股分析/问答
+// prompt 注入。best-effort：无 DB / 窗口内无新闻返回空。
 func latestNewsBriefs(symbol string, limit int) []newsBrief {
 	if common.DB == nil || len(symbol) != 6 {
 		return nil
 	}
 	var rows []model.News
 	if err := common.DB.Select("title, sentiment, publish_time, source").
-		Where("related_symbols LIKE ?", "%\""+symbol+"\"%").
+		Where("related_symbols LIKE ? AND publish_time > ?", "%\""+symbol+"\"%", time.Now().Add(-newsBriefMaxAge)).
 		Order("publish_time DESC").Limit(limit).Find(&rows).Error; err != nil {
 		return nil
 	}
@@ -503,7 +509,8 @@ func latestNewsBriefs(symbol string, limit int) []newsBrief {
 	for _, n := range rows {
 		out = append(out, newsBrief{
 			Title: n.Title, Sentiment: sentimentCN(n.Sentiment),
-			Time: n.PublishTime.Format("01-02 15:04"), Source: n.Source,
+			// 带年份的完整时点（旧格式 "01-02 15:04" 跨年会误导模型把去年当今年）。
+			Time: n.PublishTime.Format("2006-01-02 15:04"), Source: n.Source,
 		})
 	}
 	return out

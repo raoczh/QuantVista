@@ -100,6 +100,15 @@
   - **⑨ 数值核验来源区分**（ev2 items 增 origin）：labeledValue/evidenceItem 加 Origin——空=数据快照佐证、plan=模型自身计划价/公式输出、user=用户设定阈值；matchLabeled **快照来源优先命中**（同一数字快照与计划价都含时按被数据佐证记）；前端明细对 plan 项标「AI 计划价」并声明「合法复述但非快照佐证」。前端「置信度 N」改「AI 自评 N」（防与综合置信并列被当胜率）。
   - **本批遗留（P1 未修，动手前从这里挑）**：批量 AI 快照（市场/板块/自选/持仓）compact 时丢逐项行情 DataTime（analysis_context）；marketwide/factortable 新鲜度只与库内自身最大日期比较（整库落后仍判新鲜，应对照应有交易日）；newsai 情绪当日首算后冻结、公告有旧记录不按需刷新、龙虎榜/人气/盘中因子只取库内最大日期；管理端缺数据健康总览与手动补跑入口；日报核心块数据水位检查（指数/涨跌家数/资金流缺失时不得称完整）；Breadth/资金流/指数聚合接口 DataTime=采集时刻语义未拆分（前端已改「采集于」措辞）。
 
+- **LLM 准确性 P0 第一批（P0-1 ac1 契约 + P0-7 机读拒答码，2026-07-21）防回归**（权威计划 `docs/LLM_ACCURACY_OPTIMIZATION_PLAN.md` §7.1，改 ai_client/llm_contract/拒答文案前先读）：
+  - **① ac1 契约出口注入**（`llm_contract.go` applyAccuracyContract）：只在 `chatCompletion`/`chatCompletionStream` 两个**公开出口**各调一次（内部 chatCompletionInner 复用 streamInner 不会二次注入），且必须在审计 defer 注册**之前**——RequestBody 要记录上游真实收到的形态（含契约）；`llm.go` 探针（module=test）直发 HTTP 不走这两个出口，**永不注入业务契约**（探针通过≠业务推理可用）。改 `llmAccuracyContractText` 措辞必须递增版本（ac1→ac2）。
+  - **② 温度语义**：Repair=true 恒 0（无条件）；JSONMode 且非 repair 钳 ≤0.2（llmStructuredTempCap）；自由文本（qa/compare，JSONMode=false）不钳。**新增 repair 循环必须在 attempt>0 时置 `chatParams.Repair`**（现有五处：analysis/recommendation/dailyreport/screener_ai/recbear），漏标=repair 轮跑高温。
+  - **③ 流式完整性门禁语义**：chat SSE 正常 EOF 无 [DONE]/finish_reason=拒收（eof_without_marker）；finish_reason 只黑名单拒收 `length`/`content_filter`（**未知网关自定义枚举放行**——终止标记门禁才是半截防护主力，白名单会误杀）；整包回落路径（假流式）JSON 完整解析即结构完整，finish_reason 缺失放行、在黑名单仍拒收；**Responses 严格仅 status=completed 成功（空 status 也拒）**——responses 是显式端点选择，标准实现必回 status；responses 流式仅 [DONE] 无完成事件=放行（[DONE] 是明确终止标记）。`chatResult.FinishReason` 装原始值（chat=finish_reason / responses=status），P0-2 元数据将消费它。
+  - **④ flag 回滚开关**：`llm_accuracy_contract` **缺省开**（`!= "false"` 语义），管理后台「LLM 准确性契约」卡可关——关=①②③全部回退旧路径；上游网关兼容性误杀（正常请求被拒收）时先关 flag 再排查，**不得为兼容某网关直接放宽门禁判定**。
+  - **⑤ RefusalError 文案纪律**：机读拒答码（stale_quote/market_closed/report_window_not_open/report_processing/insufficient_fresh_quotes/quota_exhausted/llm_unavailable）只**附加** code，**拒绝文案一字不动**——分析/QA 的「历史数据解释」关键词仍是前端确认弹窗的识别锚点（Analysis.vue/Qa.vue 两处），前端迁移到按 code 判断之前改文案必炸确认流。透出通道：标准包络 `common.ApiError` 的 code 字段（接口探测，common 不 import service）、qa 流式 NDJSON error 行 `refusal_code`、compare 结果体 `ai_refusal_code`；新增拒答场景先在 llm_contract.go 登记常量。
+  - **⑥ news 注入窗口**：`latestNewsBriefs` 只取近 7 天（newsBriefMaxAge），窗口外旧闻**不注入不冒充**（旧格式 "01-02 15:04" 无年份跨年会误导，已改带年份）；窗口内无新闻=news 块走既有 fallback（market_signals），**别为凑条数放宽窗口**；快照 news 块带 window 声明字段。
+  - **⑦ 测试兼容**：assert 上游请求体的测试注意 ac1 会 prepend 首条 system（Contains 断言不受影响、精确断言会炸——TestResponsesCompletion 的 instructions 已改 HasPrefix+Contains）；依赖 prompt 字符数的精确断言（estimateUsage 粗估）应 `setContractFlag(t, false)` 关掉契约再测；切 flag 的测试必须 Cleanup 恢复 true（options 表写库，内存库共享）。
+
 ## 4. 未完成项与储备（按数据源可得性推进）
 
 > **2026-07-06 起后续开发按 `DEVELOPMENT_PLAN.md` 的批次（N1→N2→F1→T1→S1→F2→M1→M2→M3）推进**——它是面向执行的施工图（每批含方案锚点/依赖/验收）；分析依据与上游接口速查表在 `REFERENCE_ANALYSIS.md`。以下原有储备多数已并入该计划：
