@@ -91,6 +91,32 @@ func TestQaAskStreamEndToEnd(t *testing.T) {
 	if view.TotalTokens != 30 || view.MessageCount != 2 {
 		t.Fatalf("会话计数/token 应更新: tokens=%d count=%d", view.TotalTokens, view.MessageCount)
 	}
+	// P0-2 调用关联：旧会话（无 trace）首次提问补写 trace_id；assistant 消息带 run_id；
+	// llm_call_logs 落同一 trace/run（attempt=1、qa 模块、free_text）。
+	var convRow model.AiConversation
+	if err := common.DB.First(&convRow, conv.ID).Error; err != nil || convRow.TraceID == "" {
+		t.Fatalf("旧会话应补写 trace_id: %+v err=%v", convRow.TraceID, err)
+	}
+	if ans.RunID == "" {
+		t.Fatalf("assistant 消息应带 run_id: %+v", ans)
+	}
+	var logRow model.LLMCallLog
+	if err := common.DB.Where("module = ?", "qa").Order("id desc").First(&logRow).Error; err != nil {
+		t.Fatalf("qa 调用应落审计: %v", err)
+	}
+	if logRow.TraceID != convRow.TraceID || logRow.RunID != ans.RunID || logRow.Attempt != 1 || logRow.Repair {
+		t.Fatalf("审计关联元数据不符: log{trace=%s run=%s attempt=%d repair=%v} conv.trace=%s msg.run=%s",
+			logRow.TraceID, logRow.RunID, logRow.Attempt, logRow.Repair, convRow.TraceID, ans.RunID)
+	}
+	if logRow.StructuredMethod != model.LLMStructuredFreeText || logRow.SchemaVersion != "qa.free_text.v1" {
+		t.Fatalf("qa 应记 free_text/qa.free_text.v1: %+v", logRow)
+	}
+	if logRow.FinishState != "stop" || logRow.FinishStateRaw != "stop" {
+		t.Fatalf("finish_state 应为 stop: state=%q raw=%q", logRow.FinishState, logRow.FinishStateRaw)
+	}
+	if !strings.HasPrefix(logRow.PromptHash, "sha256:") || !strings.HasPrefix(logRow.DataHash, "sha256:") {
+		t.Fatalf("prompt/data hash 应带 sha256 前缀: %q %q", logRow.PromptHash, logRow.DataHash)
+	}
 }
 
 // TestQaAskStreamErrorNoOrphan 流式调用失败（上游 401）时不留孤儿消息，错误透出。

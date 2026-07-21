@@ -50,6 +50,11 @@ type RecommendationBatch struct {
 	PromptVersion   string `gorm:"size:16" json:"prompt_version"`
 	StrategyVersion string `gorm:"size:16" json:"strategy_version"`
 
+	// P0-2 调用关联：批次 trace_id（llm_call_logs 同值，串联主调/repair/复核/反方/降级）
+	// 与运行元数据 manifest 数组。旧记录为空；llm_run_json 列表查询不返回。
+	TraceID    string `gorm:"size:40;index" json:"trace_id"`
+	LlmRunJSON string `gorm:"type:text" json:"llm_run_json,omitempty"`
+
 	PromptTokens     int   `json:"prompt_tokens"`
 	CompletionTokens int   `json:"completion_tokens"`
 	TotalTokens      int   `json:"total_tokens"`

@@ -128,6 +128,8 @@ export interface ParseStrategyResult {
   conditions: string[] | null
   prompt_version: string
   total_tokens: number
+  // P0-2 调用追溯 ID。
+  trace_id?: string
   // 实际使用的 LLM。
   llm_config_id?: number
   provider?: string

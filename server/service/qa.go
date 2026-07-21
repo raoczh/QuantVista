@@ -81,6 +81,7 @@ type qaAskContext struct {
 	messages []chatMessage
 	cfg      *model.LLMConfig
 	apiKey   string
+	run      *llmRun // P0-2：本轮提问的调用组（会话级 trace + 每问一个 run）
 }
 
 // qaConvLocks 会话级进程内互斥：同一会话的并发追问必须串行，否则两问会各自
@@ -109,8 +110,9 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 		BaseURL: ac.cfg.BaseURL, APIKey: ac.apiKey, Model: ac.cfg.Model, EndpointType: ac.cfg.EndpointType,
 		Temperature: ac.cfg.Temperature, MaxTokens: ac.cfg.MaxTokens,
 		Messages: ac.messages, JSONMode: false, AllowPrivate: llmAllowPrivate(allowPrivate, ac.cfg),
-		Meta: chatMeta{CallerUserID: userID, Module: "qa", ConfigID: ac.cfg.ID, Provider: ac.cfg.Provider},
+		Meta: ac.run.chatMeta(userID, ac.cfg, 1),
 	})
+	ac.run.record(res, callErr)
 	if callErr != nil {
 		s.abortNewConv(ac)
 		return nil, callErr
@@ -135,7 +137,7 @@ func (s *QaService) AskStream(ctx context.Context, userID int64, allowPrivate bo
 		BaseURL: ac.cfg.BaseURL, APIKey: ac.apiKey, Model: ac.cfg.Model, EndpointType: ac.cfg.EndpointType,
 		Temperature: ac.cfg.Temperature, MaxTokens: ac.cfg.MaxTokens,
 		Messages: ac.messages, JSONMode: false, AllowPrivate: llmAllowPrivate(allowPrivate, ac.cfg),
-		Meta: chatMeta{CallerUserID: userID, Module: "qa", ConfigID: ac.cfg.ID, Provider: ac.cfg.Provider},
+		Meta: ac.run.chatMeta(userID, ac.cfg, 1),
 	}
 	var res *chatResult
 	var callErr error
@@ -147,6 +149,7 @@ func (s *QaService) AskStream(ctx context.Context, userID int64, allowPrivate bo
 			onDelta(res.Content)
 		}
 	}
+	ac.run.record(res, callErr)
 	if callErr != nil {
 		s.abortNewConv(ac)
 		return nil, callErr
@@ -216,6 +219,7 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 			Title:       truncateRunes(question, 128),
 			LLMConfigID: cfg.ID, Provider: cfg.Provider, Model: cfg.Model,
 			PromptVersion: qaPromptVersionFor(userID),
+			TraceID:       newLLMTraceID(), // P0-2：会话级 trace，本会话全部调用共享
 			DataSnapshot:  string(snapJSON),
 		}
 		if err := common.DB.Create(&conv).Error; err != nil {
@@ -223,15 +227,26 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 		}
 	}
 
+	// P0-2：旧会话（trace 列上线前创建）首次新提问时补写 trace_id——此后该会话的
+	// 调用都能按 trace 关联；补写失败不阻断提问（只是缺关联）。
+	if conv.TraceID == "" {
+		conv.TraceID = newLLMTraceID()
+		common.DB.Model(&model.AiConversation{}).Where("id = ?", conv.ID).Update("trace_id", conv.TraceID)
+	}
+
 	// 组装消息：系统提示（角色 + 数据快照）+ 历史 + 本轮提问。
 	history, err := s.loadMessages(userID, conv.ID)
 	if err != nil {
 		return nil, err
 	}
+	messages := s.buildMessages(conv, history, question)
+	run := newLLMRun(conv.TraceID, "", "qa", "qa.free_text.v1", qaPromptVersionFor(userID))
+	run.hashData(conv.DataSnapshot)
+	run.hashPrompt(messages)
 	return &qaAskContext{
 		conv: conv, isNew: isNewConv, question: question, history: history,
-		messages: s.buildMessages(conv, history, question),
-		cfg:      cfg, apiKey: apiKey,
+		messages: messages,
+		cfg:      cfg, apiKey: apiKey, run: run,
 	}, nil
 }
 
@@ -287,6 +302,7 @@ func (s *QaService) finalizeAsk(userID int64, ac *qaAskContext, res *chatResult)
 		}
 		am := model.AiConversationMessage{
 			ConversationID: ac.conv.ID, UserID: userID, Role: model.QaRoleAssistant, Content: answer, CheckJSON: checkJSON,
+			RunID:        ac.run.RunID, // P0-2：本轮回答 ↔ llm_call_logs.run_id
 			PromptTokens: res.Usage.PromptTokens, CompletionTokens: res.Usage.CompletionTokens, TotalTokens: res.Usage.TotalTokens,
 		}
 		if err := tx.Create(&am).Error; err != nil {
@@ -329,6 +345,7 @@ func qaConversationFromAnalysis(userID, recordID int64, cfg *model.LLMConfig, qu
 		Title:       truncateRunes(question, 128),
 		LLMConfigID: cfg.ID, Provider: cfg.Provider, Model: cfg.Model,
 		PromptVersion: qaPromptVersionFor(userID),
+		TraceID:       newLLMTraceID(), // P0-2：独立会话独立 trace（与源分析记录经快照复用间接关联）
 		DataSnapshot:  rec.DataSnapshot,
 	}
 	if err := common.DB.Create(conv).Error; err != nil {
@@ -442,7 +459,7 @@ func (s *QaService) List(userID int64, limit int) ([]model.AiConversation, error
 	var rows []model.AiConversation
 	err := common.DB.Where("user_id = ?", userID).
 		Select("id", "user_id", "symbol", "market", "name", "title",
-			"llm_config_id", "provider", "model", "prompt_version", "message_count", "total_tokens", "created_at", "updated_at").
+			"llm_config_id", "provider", "model", "prompt_version", "trace_id", "message_count", "total_tokens", "created_at", "updated_at").
 		Order("updated_at DESC").Limit(limit).Find(&rows).Error
 	return rows, err
 }

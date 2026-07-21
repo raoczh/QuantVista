@@ -13,7 +13,7 @@ func (ac *AdminController) ListLLMCalls(c *gin.Context) {
 	userID, _ := strconv.ParseInt(c.Query("user_id"), 10, 64)
 	page, _ := strconv.Atoi(c.Query("page"))
 	pageSize, _ := strconv.Atoi(c.Query("page_size"))
-	result, err := ac.svc.ListLLMCalls(userID, c.Query("module"), c.Query("status"), page, pageSize)
+	result, err := ac.svc.ListLLMCalls(userID, c.Query("module"), c.Query("status"), c.Query("trace"), page, pageSize)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return

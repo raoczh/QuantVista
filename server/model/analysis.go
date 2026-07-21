@@ -54,6 +54,12 @@ type AnalysisRecord struct {
 	PromptVersion   string `gorm:"size:16" json:"prompt_version"`
 	StrategyVersion string `gorm:"size:16" json:"strategy_version"`
 
+	// P0-2 调用关联：本次分析的 trace_id（llm_call_logs 同值，双向可查）与运行元数据
+	// manifest 数组（主调/交易计划/复核各一条：attempt_count/repair_count/finish_state/
+	// prompt&data hash 等）。旧记录为空，读取兼容；llm_run_json 列表查询不返回。
+	TraceID    string `gorm:"size:40;index" json:"trace_id"`
+	LlmRunJSON string `gorm:"type:text" json:"llm_run_json,omitempty"`
+
 	PromptTokens     int   `json:"prompt_tokens"`
 	CompletionTokens int   `json:"completion_tokens"`
 	TotalTokens      int   `json:"total_tokens"`

@@ -84,6 +84,8 @@ type CompareResult struct {
 	// AIRefusalCode AI 点评未生成时的机读拒答码（行情不足、配额/配置、调用/完整性等，
 	// 空=已生成或未请求 AI）；Note 保持人类可读说明。
 	AIRefusalCode string `json:"ai_refusal_code,omitempty"`
+	// AITraceID P0-2 调用追溯 ID（对比不落库，随响应回传；管理端 llm-calls 按 trace 可查）。
+	AITraceID string `json:"ai_trace_id,omitempty"`
 	// AI 点评实际使用的 LLM（对比不落库，随响应回传供前端展示；无点评时为零值）。
 	AIConfigID int64  `json:"ai_llm_config_id,omitempty"`
 	AIProvider string `json:"ai_provider,omitempty"`
@@ -135,9 +137,10 @@ func (s *CompareService) Compare(ctx context.Context, userID int64, allowPrivate
 
 	// 可选 AI 一句话点评。
 	if req.WithAI {
-		comment, note, refusalCode, usedCfg := s.aiComment(ctx, userID, allowPrivate, req.LLMConfigID, rows)
+		comment, note, refusalCode, usedCfg, aiTrace := s.aiComment(ctx, userID, allowPrivate, req.LLMConfigID, rows)
 		res.AIComment = comment
 		res.AIRefusalCode = refusalCode
+		res.AITraceID = aiTrace
 		if comment != "" {
 			// 证据核验：点评引用的数字与全部对比行的指标值域比对（点评无 K 线明细，全量收集即可）。
 			res.AICommentCheck = verifyEvidenceLabeled(
@@ -254,9 +257,10 @@ func changeOverN(closes []float64, n int) float64 {
 	return round2((closes[len(closes)-1] - prev) / prev * 100)
 }
 
-// aiComment 生成一段横向对比点评。返回（点评, 说明, 机读拒答码, 实际使用的 LLM 配置）；
+// aiComment 生成一段横向对比点评。返回（点评, 说明, 机读拒答码, 实际使用的 LLM 配置, trace_id）；
 // 失败或配额不足时点评为空、说明解释原因、code 供前端程序化分支、配置为 nil。
-func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPrivate bool, llmConfigID int64, rows []CompareRow) (string, string, string, *model.LLMConfig) {
+// trace_id 仅在实际发起过 LLM 调用时非空（P0-2；对比不落库，随响应回传）。
+func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPrivate bool, llmConfigID int64, rows []CompareRow) (string, string, string, *model.LLMConfig, string) {
 	// 数据充分性是业务安全门，应先于配置和配额解析。否则同一批 fresh<2 的数据会因
 	// 用户是否配置 LLM 而返回不同拒答码，掩盖真正的 fail-closed 原因。
 	var b strings.Builder
@@ -273,45 +277,51 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 	if valid < compareMinSymbols {
 		// P0-7 fail-closed：fresh 行情不足 2 只时对比结论无从谈起（旧价比强弱是假强弱），
 		// 拒绝调 AI；stale 行已在表格带状态展示。
-		return "", "有效行情不足，无法生成 AI 点评", RefusalFreshQuotesInsufficient, nil
+		return "", "有效行情不足，无法生成 AI 点评", RefusalFreshQuotesInsufficient, nil, ""
 	}
 
 	cfg, apiKey, err := s.llm.ResolveForUse(userID, llmConfigID)
 	if err != nil {
-		return "", "AI 点评不可用：" + err.Error(), RefusalLLMUnavailable, nil
+		return "", "AI 点评不可用：" + err.Error(), RefusalLLMUnavailable, nil, ""
 	}
 	allowPrivate = llmAllowPrivate(allowPrivate, cfg) // 回退到管理员配置时按配置所有者放行内网
 	if err := checkQuota(userID); err != nil {
 		if code := RefusalCodeOf(err); code != "" {
 			if code == RefusalQuotaExhausted {
-				return "", "AI 次数配额已用尽，仅展示指标对比", code, nil
+				return "", "AI 次数配额已用尽，仅展示指标对比", code, nil, ""
 			}
-			return "", "AI 点评不可用：配额信息读取失败", code, nil
+			return "", "AI 点评不可用：配额信息读取失败", code, nil, ""
 		}
-		return "", "AI 点评不可用：配额信息读取失败", RefusalQuotaUnavailable, nil
+		return "", "AI 点评不可用：配额信息读取失败", RefusalQuotaUnavailable, nil, ""
 	}
 
+	// P0-2：对比无业务落库行，trace 随响应回传（管理端审计按 trace_id 可查本次调用）。
+	run := newLLMRun(newLLMTraceID(), "", "compare", "compare.free_text.v1", "")
+	messages := []chatMessage{
+		{Role: "system", Content: "你是严谨的证券研究助理，输出仅供研究参考，不构成投资建议。"},
+		{Role: "user", Content: b.String()},
+	}
+	run.hashData(b.String())
+	run.hashPrompt(messages)
 	res, err := chatCompletion(ctx, chatParams{
 		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 		Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
-		Messages: []chatMessage{
-			{Role: "system", Content: "你是严谨的证券研究助理，输出仅供研究参考，不构成投资建议。"},
-			{Role: "user", Content: b.String()},
-		},
+		Messages: messages,
 		JSONMode: false, AllowPrivate: allowPrivate,
-		Meta: chatMeta{CallerUserID: userID, Module: "compare", ConfigID: cfg.ID, Provider: cfg.Provider},
+		Meta: run.chatMeta(userID, cfg, 1),
 	})
+	run.record(res, err)
 	if err != nil {
 		code := RefusalCodeOf(err)
 		if code == "" {
 			code = RefusalLLMCallFailed
 		}
-		return "", "AI 点评生成失败：" + err.Error(), code, nil
+		return "", "AI 点评生成失败：" + err.Error(), code, nil, run.TraceID
 	}
 	if res.Usage.TotalTokens > 0 {
 		consumeQuota(userID, res.Usage.TotalTokens, true)
 	}
-	return strings.TrimSpace(res.Content), "", "", cfg
+	return strings.TrimSpace(res.Content), "", "", cfg, run.TraceID
 }
 
 func nameOr(r CompareRow) string {

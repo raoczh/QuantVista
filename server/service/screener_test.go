@@ -573,9 +573,13 @@ func TestStrategySignalHits(t *testing.T) {
 	// 有数据：leader → bull-align-trend 命中上升趋势股。
 	// 宽表水位 fail-closed 后（LagOpenDays<0 拒供推荐池），seed 数据末根日期须钉进
 	// 日历成为期望交易日，否则「时效无法判定」被正确拒绝。
+	// 今日也须钉入日历：16:30 后 wideExpectedDate 切到「今日」，日历无今日行时
+	// openDaysBehind 数不出区间开市日返回 -1 被拒——旧写法只钉 bar 末日，本测试
+	// 下午 16:30 后运行必挂（时刻依赖）。两行齐钉后：16:30 前 expected=bar 末日
+	// lag=0、16:30 后 expected=今日 lag=1，均在放行阈值（≤1）内，任意时刻确定性通过。
 	trendBars := genTrendBars(80, 10, 0.4)
 	seedWideStock(t, "600100", "甲股", trendBars)
-	pinCalendarTo(t, trendBars[len(trendBars)-1].TradeDate)
+	pinCalendarTo(t, trendBars[len(trendBars)-1].TradeDate, time.Now().Format("2006-01-02"))
 	resetFreshCacheOnly()
 	hits := strategySignalHits(context.Background(), model.RecTypeLongTerm, "leader", 10)
 	if len(hits) != 1 || hits[0].Symbol != "600100" {

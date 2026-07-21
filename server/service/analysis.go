@@ -244,6 +244,21 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	if req.AsOf != "" {
 		rec.Title += " · 回溯@" + req.AsOf
 	}
+	// P0-2 调用关联：本次分析一个 trace；主调/交易计划/复核各一个 run（repair 同 run
+	// 靠 attempt 区分）。manifest 数组随记录落库，llm_call_logs 凭 trace_id 双向可查。
+	trace := newLLMTraceID()
+	rec.TraceID = trace
+	schemaVer := "analysis.v1"
+	if req.Mode == model.AnalysisModePanel {
+		schemaVer = "analysis_panel.v1"
+	}
+	mainRun := newLLMRun(trace, "", "analysis", schemaVer, promptVersion)
+	mainRun.hashData(string(snapshotJSON))
+	var tpRun, rvRun *llmRun
+	fillRunMeta := func() {
+		rec.LlmRunJSON = marshalLLMRunManifests(cfg,
+			runEntry(mainRun, true), runEntry(tpRun, true), runEntry(rvRun, true))
+	}
 
 	// 解析器按模式分流：标准 → AnalysisResult；panel → PanelResult。
 	var result *AnalysisResult
@@ -269,7 +284,7 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 		repairHint = panelRepairHint
 	}
 
-	raw, usage, latency, callErr := s.callWithRepair(ctx, userID, "analysis", cfg, apiKey, allowPrivate, messages, parse, repairHint)
+	raw, usage, latency, callErr := s.callWithRepair(ctx, userID, mainRun, cfg, apiKey, allowPrivate, messages, parse, repairHint)
 
 	// 信任层：仅当成功解析出标准结构化结果时做证据核验 + 程序合成置信度 + 可选 AI 复核
 	// （panel 无标准结论字段、degraded 无合法结构，都不做）。复核在配额记账前完成，
@@ -284,12 +299,14 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 		}
 		// 交易员阶段（M3c）：先生成交易计划，再做证据核验——计划价位与仓位数字随后
 		// 会并入核验值域（模型自己输出的计划价是合法来源，同推荐 verifyEvidence extra 前例）。
-		tpUsage := s.attachTradePlan(ctx, userID, cfg, apiKey, allowPrivate, req, actx.Snapshot, result)
+		tpUsage, tpR := s.attachTradePlan(ctx, userID, cfg, apiKey, allowPrivate, req, actx.Snapshot, result, trace, mainRun.RunID)
+		tpRun = tpR
 		usage.PromptTokens += tpUsage.PromptTokens
 		usage.CompletionTokens += tpUsage.CompletionTokens
 		usage.TotalTokens += tpUsage.TotalTokens
 
-		rvUsage := s.fillAnalysisTrust(ctx, userID, cfg, apiKey, allowPrivate, req, actx.Snapshot, result)
+		rvUsage, rvR := s.fillAnalysisTrust(ctx, userID, cfg, apiKey, allowPrivate, req, actx.Snapshot, result, trace, mainRun.RunID)
+		rvRun = rvR
 		usage.PromptTokens += rvUsage.PromptTokens
 		usage.CompletionTokens += rvUsage.CompletionTokens
 		usage.TotalTokens += rvUsage.TotalTokens
@@ -318,6 +335,7 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 		rec.Status = model.AnalysisStatusFailed
 		rec.Error = truncateRunes(callErr.Error(), 500)
 		rec.Summary = "分析失败"
+		fillRunMeta()
 		if err := common.DB.Create(rec).Error; err != nil {
 			return nil, err
 		}
@@ -348,8 +366,10 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 		rec.Summary = truncateRunes(firstLine(raw), 1024)
 		rec.Error = "结构化输出校验失败，已降级为原文展示"
 		rec.ResultJSON = raw // 存原文（非合法 schema）
+		mainRun.DegradedReason = "llm_output_invalid"
 	}
 
+	fillRunMeta()
 	if err := common.DB.Create(rec).Error; err != nil {
 		return nil, err
 	}
@@ -364,10 +384,13 @@ const panelRepairHint = "请只输出一个合法 JSON 对象，严格包含字�
 // callWithRepair 调用 LLM 并在结构化校验失败时有限次 repair（parse 由调用方按模式提供）。
 // 累计各次调用的 token。返回：最后一次原文、累计 usage、最后一次延迟、调用错误（网络/鉴权等，非校验失败）。
 // parse 返回 nil 即视为成功（解析结果由闭包带出）。
-func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, auditModule string, cfg *model.LLMConfig, apiKey string, allowPrivate bool, messages []chatMessage, parse func(string) error, repairHint string) (string, chatUsage, int64, error) {
+// run 承载 P0-2 关联元数据：审计 module 取 run.Module，attempt 1 基递增，prompt hash
+// 在此按初始消息统一计算，最终终态由 run.record 固化供 manifest 落库。
+func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, run *llmRun, cfg *model.LLMConfig, apiKey string, allowPrivate bool, messages []chatMessage, parse func(string) error, repairHint string) (string, chatUsage, int64, error) {
 	var acc chatUsage
 	var lastRaw string
 	var lastLatency int64
+	run.hashPrompt(messages)
 
 	convo := append([]chatMessage(nil), messages...)
 	for attempt := 0; attempt <= maxRepairAttempts; attempt++ {
@@ -382,8 +405,9 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, audi
 			JSONMode:     true,
 			AllowPrivate: allowPrivate,
 			Repair:       attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）
-			Meta:         chatMeta{CallerUserID: userID, Module: auditModule, ConfigID: cfg.ID, Provider: cfg.Provider},
+			Meta:         run.chatMeta(userID, cfg, attempt+1),
 		})
+		run.record(res, err)
 		if err != nil {
 			// 网络/鉴权/服务端错误：若已有过成功响应文本则不再重试，直接返回错误。
 			return lastRaw, acc, lastLatency, err
@@ -407,10 +431,11 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, audi
 	return lastRaw, acc, lastLatency, nil // 降级
 }
 
-// fillAnalysisTrust 回填一份成功分析的信任层字段（就地修改 result），返回 AI 复核消耗的 token。
+// fillAnalysisTrust 回填一份成功分析的信任层字段（就地修改 result），返回 AI 复核消耗的
+// token 与复核 run 元数据（未发起复核时为 nil）。
 // 证据核验值域排除 recent_bars（30 根 OHLCV 密度过大，纳入后几乎任何数字都能撞上容差）。
 // unknowns 是「缺什么数据」的陈述、disclaimer 是套话，均不参与核验。
-func (s *AnalysisService) fillAnalysisTrust(ctx context.Context, userID int64, cfg *model.LLMConfig, apiKey string, allowPrivate bool, req AnalyzeRequest, snapshot map[string]any, result *AnalysisResult) chatUsage {
+func (s *AnalysisService) fillAnalysisTrust(ctx context.Context, userID int64, cfg *model.LLMConfig, apiKey string, allowPrivate bool, req AnalyzeRequest, snapshot map[string]any, result *AnalysisResult, traceID, parentRunID string) (chatUsage, *llmRun) {
 	sections := make([]evidenceSection, 0, 8)
 	addSec := func(module string, texts ...string) {
 		for _, t := range texts {
@@ -451,9 +476,9 @@ func (s *AnalysisService) fillAnalysisTrust(ctx context.Context, userID int64, c
 	result.SysConfidence, result.SysConfidenceWhy = analysisSystemConfidence(result.EvidenceCheck, snapshot)
 
 	if !req.Verify {
-		return chatUsage{}
+		return chatUsage{}, nil
 	}
-	review, usage := s.reviewAnalysis(ctx, userID, cfg, apiKey, allowPrivate, req.Module, snapshot, result)
+	review, usage, rvRun := s.reviewAnalysis(ctx, userID, cfg, apiKey, allowPrivate, req.Module, snapshot, result, traceID, parentRunID)
 	if review != nil {
 		result.Review = review
 		// reject 级联：程序置信度强制压低，与「AI 复核员否决」徽章保持一致，不并排展示高置信度。
@@ -469,7 +494,7 @@ func (s *AnalysisService) fillAnalysisTrust(ctx context.Context, userID int64, c
 			result.Confidence = review.Confidence
 		}
 	}
-	return usage
+	return usage, rvRun
 }
 
 // analysisSystemConfidence 程序合成置信度（high/medium/low）：由证据核验吻合率、
@@ -530,8 +555,8 @@ const analysisReviewSystem = `你是一名独立的分析复核员，对照数�
 
 // reviewAnalysis AI 复核（verify 模式）：以独立复核员视角对照数据快照审查一份分析，
 // 只挑刺不重写，输出 pass/warn/reject 与建议置信度。best-effort：失败只是没有复核结论，
-// 不影响主结果。1 次 repair。
-func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg *model.LLMConfig, apiKey string, allowPrivate bool, module string, snapshot map[string]any, result *AnalysisResult) (*analysisReview, chatUsage) {
+// 不影响主结果。1 次 repair。第三返回值为复核 run 元数据（parent 回指主调）。
+func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg *model.LLMConfig, apiKey string, allowPrivate bool, module string, snapshot map[string]any, result *AnalysisResult, traceID, parentRunID string) (*analysisReview, chatUsage, *llmRun) {
 	var usage chatUsage
 	snapJSON, _ := json.Marshal(snapshot)
 	// 交易计划（M3c）不喂给复核员：计划价位/仓位是模型结论与公式输出而非快照引用，
@@ -541,9 +566,13 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 	resJSON, _ := json.Marshal(resForReview)
 
 	sys := analysisReviewSystem
+	reviewPromptVersion := analysisPromptVersion
 	if custom, ok := promptOverrideFor(userID, model.PromptModuleReview, map[string]string{"module": module}); ok {
 		sys = custom
+		reviewPromptVersion += "-custom"
 	}
+	run := newLLMRun(traceID, parentRunID, "analysis_review", "analysis_review.v1", reviewPromptVersion)
+	run.hashData(string(snapJSON))
 
 	convo := []chatMessage{
 		{Role: "system", Content: sys},
@@ -553,16 +582,18 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 		{Role: "user", Content: "【数据快照】（JSON）：\n" + string(snapJSON) +
 			"\n\n【待复核的分析结果】（JSON）：\n" + string(resJSON)},
 	}
+	run.hashPrompt(convo)
 	for attempt := 0; attempt <= 1; attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）
-			Meta:   chatMeta{CallerUserID: userID, Module: "analysis_review", ConfigID: cfg.ID, Provider: cfg.Provider},
+			Meta:   run.chatMeta(userID, cfg, attempt+1),
 		})
+		run.record(res, err)
 		if err != nil {
-			return nil, usage
+			return nil, usage, run
 		}
 		usage.PromptTokens += res.Usage.PromptTokens
 		usage.CompletionTokens += res.Usage.CompletionTokens
@@ -580,7 +611,7 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 					rv.Confidence = 100
 				}
 				rv.Comment = truncateRunes(strings.TrimSpace(rv.Comment), 300)
-				return &rv, usage
+				return &rv, usage, run
 			}
 		}
 		convo = append(convo,
@@ -588,7 +619,8 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 			chatMessage{Role: "user", Content: `上一条输出不合格。请只输出 JSON：{"verdict":"pass|warn|reject","comment":"...","confidence":0-100 整数}。`},
 		)
 	}
-	return nil, usage
+	run.DegradedReason = "llm_output_invalid"
+	return nil, usage, run
 }
 
 // History 列出分析历史（不返回重字段 result_json/data_snapshot）。

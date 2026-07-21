@@ -43,6 +43,8 @@ export interface CompareResult {
   ai_llm_config_id?: number
   ai_provider?: string
   ai_model?: string
+  // P0-2 调用追溯 ID（管理端 LLM 调用记录页按 trace 可查本次调用）。
+  ai_trace_id?: string
 }
 
 export interface CompareRequest {

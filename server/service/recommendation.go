@@ -478,6 +478,8 @@ func (p *recGenPlan) newProcessingBatch() *model.RecommendationBatch {
 		// M3c：启用 recommend 自定义模板时版本号加 -custom 后缀（同分析域前例，历史可归因）。
 		PromptVersion:   promptVersionFor(p.userID, model.PromptModuleRecommend, recPromptVersion),
 		StrategyVersion: recStrategyVersion,
+		// P0-2：批次级 trace_id 建任务即固化——processing 阶段轮询详情已可按它查审计。
+		TraceID: newLLMTraceID(),
 	}
 }
 
@@ -587,7 +589,17 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	batch.DataSnapshot = string(llmInput)
 	batch.FiltersJSON = string(filtersJSON)
 
-	picks, rejected, usage, latency, callErr := s.callWithRepair(ctx, userID, cfg, apiKey, allowPrivate, messages, poolBySymbol, count)
+	// P0-2 调用关联：主调一个 run（repair 同 run 按 attempt 区分），复核/反方派生 run
+	// 回指主调；manifest 数组随批次落库，llm_call_logs 凭 batch.TraceID 双向可查。
+	mainRun := newLLMRun(batch.TraceID, "", "recommendation", "recommendation.v1", batch.PromptVersion)
+	mainRun.hashData(string(llmInput))
+	var rvRun, bearRun *llmRun
+	fillBatchRunMeta := func() {
+		batch.LlmRunJSON = marshalLLMRunManifests(cfg,
+			runEntry(mainRun, true), runEntry(rvRun, true), runEntry(bearRun, true))
+	}
+
+	picks, rejected, usage, latency, callErr := s.callWithRepair(ctx, userID, mainRun, cfg, apiKey, allowPrivate, messages, poolBySymbol, count)
 
 	// #11 原始 LLM 动作快照（复核前）：applyReviews 对 reject 会把 p.Action 强制改写为
 	// watch，事件表 RawAction 须记复核前值才能与 PostGateAction 构成门控前后对照。此处
@@ -599,7 +611,8 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 
 	// 可选 AI 复核（verify）：风控复核员逐条挑刺，reject 降级为观察。
 	if callErr == nil && len(picks) > 0 && plan.verify {
-		reviews, overall, rvUsage := s.reviewPicks(ctx, userID, cfg, apiKey, allowPrivate, recType, picks, poolBySymbol)
+		reviews, overall, rvUsage, rvR := s.reviewPicks(ctx, userID, cfg, apiKey, allowPrivate, recType, picks, poolBySymbol, batch.TraceID, mainRun.RunID)
+		rvRun = rvR
 		usage.PromptTokens += rvUsage.PromptTokens
 		usage.CompletionTokens += rvUsage.CompletionTokens
 		usage.TotalTokens += rvUsage.TotalTokens
@@ -616,7 +629,8 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	// 放在复核之后——被复核否决降为 watch 的条目不再消耗反方论证篇幅。
 	var bearGates []gateNote
 	if callErr == nil && len(picks) > 0 && plan.bear {
-		bears, bUsage := s.bearReview(ctx, userID, cfg, apiKey, allowPrivate, picks, poolBySymbol)
+		bears, bUsage, bearR := s.bearReview(ctx, userID, cfg, apiKey, allowPrivate, picks, poolBySymbol, batch.TraceID, mainRun.RunID)
+		bearRun = bearR
 		usage.PromptTokens += bUsage.PromptTokens
 		usage.CompletionTokens += bUsage.CompletionTokens
 		usage.TotalTokens += bUsage.TotalTokens
@@ -645,10 +659,12 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 					rawActionBySym[p.Symbol] = p.Action
 				}
 				degradedNote = "AI 精选未完成（" + callErr.Error() + "）；已按量化排名生成降级推荐——规则生成，未经 AI 解读，请自行核查"
+				mainRun.DegradedReason = "quant_fallback"
 				callErr = nil
 			}
 		}
 		if callErr != nil {
+			fillBatchRunMeta()
 			s.failBatch(batch, usage, latency, callErr.Error())
 			// 保留中央客户端返回的 RefusalError 错误链，后台调用方/后续 API
 			// 才能继续识别 llm_call_failed、llm_response_incomplete 等拒答码。
@@ -666,7 +682,9 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 			batch.Error = "模型判断当前无足够合适的标的，未强行凑数（宁缺毋滥）；各候选的落选理由见「为什么没选它」"
 		} else {
 			batch.Error = "模型未给出候选池内的有效推荐，请调整策略或稍后重试"
+			mainRun.DegradedReason = "llm_output_invalid"
 		}
+		fillBatchRunMeta()
 		if err := common.DB.Save(batch).Error; err != nil {
 			return nil, err
 		}
@@ -737,6 +755,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		batch.Status = model.RecStatusSuccess
 		batch.Error = ""
 	}
+	fillBatchRunMeta()
 	items := make([]model.Recommendation, 0, len(picks))
 	err = common.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Save(batch).Error; err != nil {
@@ -944,10 +963,12 @@ func buildQuantFallbackPicks(recType string, cands []candidate, count int) []rec
 
 // callWithRepair 调用 LLM，反编造校验（picks 必须∈候选池），失败有限次 repair，累计 token。
 // 同时收集池内落选标的的一句话理由（rejected，best-effort 不参与合格判定）。
-func (s *RecommendationService) callWithRepair(ctx context.Context, userID int64, cfg *model.LLMConfig, apiKey string, allowPrivate bool, messages []chatMessage, pool map[string]candidate, count int) ([]recPick, []recReject, chatUsage, int64, error) {
+// run 承载 P0-2 关联元数据（prompt hash 在此按初始消息计算，attempt 1 基递增）。
+func (s *RecommendationService) callWithRepair(ctx context.Context, userID int64, run *llmRun, cfg *model.LLMConfig, apiKey string, allowPrivate bool, messages []chatMessage, pool map[string]candidate, count int) ([]recPick, []recReject, chatUsage, int64, error) {
 	var acc chatUsage
 	var lastLatency int64
 	convo := append([]chatMessage(nil), messages...)
+	run.hashPrompt(messages)
 
 	for attempt := 0; attempt <= recRepairAttempts; attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
@@ -955,8 +976,9 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, userID int64
 			Temperature: cfg.Temperature, MaxTokens: capModuleTokens(cfg.MaxTokens, recMaxTokensCap),
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0
-			Meta:   chatMeta{CallerUserID: userID, Module: "recommendation", ConfigID: cfg.ID, Provider: cfg.Provider},
+			Meta:   run.chatMeta(userID, cfg, attempt+1),
 		})
+		run.record(res, err)
 		if err != nil {
 			return nil, nil, acc, lastLatency, err
 		}
@@ -986,7 +1008,8 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, userID int64
 // reviewPicks AI 复核（verify 模式）：以「风控复核员」独立视角逐条挑刺——核对证据与数据
 // 是否一致、风险是否被低估、价位是否合理，输出 pass/warn/reject 与建议置信度。
 // best-effort：失败只是没有复核结论，不影响主结果。1 次 repair。
-func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, cfg *model.LLMConfig, apiKey string, allowPrivate bool, recType string, picks []recPick, pool map[string]candidate) ([]pickReview, string, chatUsage) {
+// 第四返回值为复核 run 元数据（parent 回指主调）。
+func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, cfg *model.LLMConfig, apiKey string, allowPrivate bool, recType string, picks []recPick, pool map[string]candidate, traceID, parentRunID string) ([]pickReview, string, chatUsage, *llmRun) {
 	var usage chatUsage
 	rows := make([]map[string]any, 0, len(picks))
 	for _, p := range picks {
@@ -1003,7 +1026,7 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 	}
 	inputJSON, err := json.Marshal(rows)
 	if err != nil {
-		return nil, "", usage
+		return nil, "", usage, nil
 	}
 
 	sys := `你是一名独立的风控复核员，逐条审查另一位研究员给出的股票推荐。你不重新选股，只挑刺。审查维度：
@@ -1018,6 +1041,9 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 		{Role: "system", Content: sys},
 		{Role: "user", Content: "推荐与对应真实数据如下（JSON 数组，每项含 pick 与 data）：\n" + string(inputJSON)},
 	}
+	run := newLLMRun(traceID, parentRunID, "rec_review", "rec_review.v1", recPromptVersion)
+	run.hashData(string(inputJSON))
+	run.hashPrompt(convo)
 	type reviewOut struct {
 		Reviews []pickReview `json:"reviews"`
 		Overall string       `json:"overall"`
@@ -1028,10 +1054,11 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 			Temperature: cfg.Temperature, MaxTokens: capModuleTokens(cfg.MaxTokens, recReviewTokensCap),
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）
-			Meta:   chatMeta{CallerUserID: userID, Module: "rec_review", ConfigID: cfg.ID, Provider: cfg.Provider},
+			Meta:   run.chatMeta(userID, cfg, attempt+1),
 		})
+		run.record(res, err)
 		if err != nil {
-			return nil, "", usage
+			return nil, "", usage, run
 		}
 		usage.PromptTokens += res.Usage.PromptTokens
 		usage.CompletionTokens += res.Usage.CompletionTokens
@@ -1061,7 +1088,7 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 				valid = append(valid, r)
 			}
 			if len(valid) > 0 {
-				return valid, truncateRunes(strings.TrimSpace(out.Overall), 500), usage
+				return valid, truncateRunes(strings.TrimSpace(out.Overall), 500), usage, run
 			}
 		}
 		convo = append(convo,
@@ -1069,7 +1096,8 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 			chatMessage{Role: "user", Content: "上一条输出不合格。请只输出 JSON：{\"reviews\":[{\"symbol\",\"verdict\":\"pass|warn|reject\",\"comment\",\"confidence\"}],\"overall\":\"...\"}，symbol 必须来自被审推荐。"},
 		)
 	}
-	return nil, "", usage
+	run.DegradedReason = "llm_output_invalid"
+	return nil, "", usage, run
 }
 
 // applyReviews 把复核结论回填到推荐：reject 降级为观察并追加风险；复核置信度非 0 时覆盖。

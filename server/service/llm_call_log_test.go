@@ -180,7 +180,7 @@ func TestLLMCallLog_ListFilterAndDetail(t *testing.T) {
 	}
 
 	svc := &AdminService{}
-	list, err := svc.ListLLMCalls(1001, "", "", 1, 10)
+	list, err := svc.ListLLMCalls(1001, "", "", "", 1, 10)
 	if err != nil || list.Total != 2 {
 		t.Fatalf("按用户筛选应 2 条: total=%d err=%v", list.Total, err)
 	}
@@ -197,16 +197,16 @@ func TestLLMCallLog_ListFilterAndDetail(t *testing.T) {
 		t.Fatalf("username 应回填 display_name: %+v", list.Items)
 	}
 
-	if list, _ = svc.ListLLMCalls(0, "qa", "", 1, 10); list.Total != 2 {
+	if list, _ = svc.ListLLMCalls(0, "qa", "", "", 1, 10); list.Total != 2 {
 		t.Fatalf("按模块筛选应 2 条: %d", list.Total)
 	}
-	if list, _ = svc.ListLLMCalls(1001, "qa", "", 1, 10); list.Total != 1 {
+	if list, _ = svc.ListLLMCalls(1001, "qa", "", "", 1, 10); list.Total != 1 {
 		t.Fatalf("用户+模块组合应 1 条: %d", list.Total)
 	}
-	if list, _ = svc.ListLLMCalls(0, "", model.LLMCallStatusError, 1, 10); list.Total != 1 || list.Items[0].ErrorMsg != "boom" {
+	if list, _ = svc.ListLLMCalls(0, "", model.LLMCallStatusError, "", 1, 10); list.Total != 1 || list.Items[0].ErrorMsg != "boom" {
 		t.Fatalf("按状态筛选应 1 条 error: %+v", list)
 	}
-	if list, _ = svc.ListLLMCalls(0, "", "", 2, 1); list.Total != 3 || len(list.Items) != 1 {
+	if list, _ = svc.ListLLMCalls(0, "", "", "", 2, 1); list.Total != 3 || len(list.Items) != 1 {
 		t.Fatalf("分页 total 应 3、页内 1 条: total=%d items=%d", list.Total, len(list.Items))
 	}
 

@@ -111,6 +111,15 @@
   - **⑧ LLM 调用审计正文保持原文**：`llm_call_logs` 的 RequestBody/ResponseBody **原样保留**供管理员排障（仅 60KB 长度截断）；API key 走 Authorization 头不进 body。产品决策只取消 P0-8 的正文脱敏要求，勿再引入打码/哈希替换；P0-8 的 run/trace/业务结果关联及 schema/prompt/data/attempt/repair/finish 元数据未取消，随 P0-2 实施。
   - **⑨ 日报 PIT 日期/时点门**：正式日报只接受 trading_calendar 明确 open；closed 返回 market_closed，缺行/查询失败返回 market_calendar_unknown，禁止工作日近似。快照指数保留 data_time/trade_date、breadth/fund-flow 保留 trade_date/captured_at；核心块业务日期未知/非报告日，或同日指数源时间早于 14:30 时，必须从 LLM 输入和 evidence 值域剥离价格/涨跌/资金数值，只留来源/时点/stale_note；旧 breadth 不得驱动明日策略；自选异动必须 QuoteOK 且 freshness=fresh。
 
+- **LLM 准确性 P0 第二批（P0-2 统一运行元数据 + P0-8 调用关联/审计完整性，2026-07-21）防回归**（权威计划 `docs/LLM_ACCURACY_OPTIMIZATION_PLAN.md` §5.1/§7.1 v1.6，改 llm_run/llm_call_log/任何 LLM 调用点前先读）：
+  - **① 关联语义不可漂移**：trace_id=一个业务结果（分析记录/推荐批次/日报/问答会话/一次对比）；run_id=一个逻辑调用组——**主调与其全部 repair 轮共享同一 run_id，靠 1 基 attempt 区分**；复核/反方/交易计划各是独立 run，parent_run_id 回指主调；`attempt_count=1+repair_count` 不变式由 `llmRun.manifest()` 保证（TestLLMRunManifestInvariant 锁定）。业务表落 trace_id+llm_run_json、llm_call_logs 落逐请求元数据，两侧凭 trace_id 双向查——**新增任何 `chatCompletion*` 调用必须经 `newLLMRun`+`run.chatMeta(attempt)`+`run.record(res,err)` 三件套接线**，直填裸 `chatMeta{}` 只允许 llm.go 探针（module=test，有意独立）与单测。
+  - **② structured_method 记「实际生效」形态**：JSON mode 因端点不支持回落时，chat/responses×流式/非流式**四处回落点**都调 `markJSONModeDropped()`——新增回落分支必须同步补调，否则审计把 free_text 冒充 json_object。manifest 里的 structured_method 是请求口径，逐请求真值以 llm_call_logs 为准（注释已声明，别把两处混为一谈）。
+  - **③ finish_state 规范化枚举封闭**：只允许 stop/tool_calls/completed/length/max_tokens/content_filter/failed/cancelled/eof_without_marker/error/unknown/空（成功但上游未报告）；provider 原始值恒存 finish_state_raw。错误路径 res 常为 nil，`normalizeLLMFinishState` 从门禁文案还原 length/max_tokens/eof 语义——**改 llm_contract.go 的拒收文案（finish_reason=%s / eof_without_marker / max_output_tokens 字样）须同步核对该还原逻辑与其表驱动测试**。
+  - **④ prompt/data hash 语义**：prompt_hash=初始业务消息序列（ac1 注入前）的 sha256，repair 轮不重算（同 run 恒等，测试锁定）；data_hash=喂给模型的数据快照 JSON。ID 用 crypto/rand 128bit hex（t/r 前缀），**禁改成时间戳/自增等可预测形态**（trace_id 透出前端响应）。
+  - **⑤ 兼容边界**：全部新列 nullable 兼容零值，旧记录/旧会话读取不回填；QA 旧会话首次新提问才补写 trace_id（补写失败不阻断提问）；日报双败回滚路径不覆盖旧报告字段（失败尝试凭 trace 在审计侧可查）；推荐 buildPool 阶段失败（零 LLM 调用）只有批次 trace 无 manifest 属正常。manifest 的 coverage 字段预留恒省略（P1-1 填充），**不得在 P0-2 语义下伪造 coverage 数值**。列表查询新列已加入 Select 白名单，llm_run_json/正文重字段仍不进列表。
+  - **⑥ 正文策略延续**：审计正文原样保留、仅 60KB 截断，P0-8 只补关联/完整性元数据——**严禁借本批结构重新引入正文脱敏**（用户明确决策）。管理端 llm-calls 的 trace 筛选同时匹配 trace_id 或 run_id。
+  - **⑦ 测试时刻依赖教训**：TestStrategySignalHits 原只钉 bar 末日进日历，16:30 后 `wideExpectedDate` 切「今日」→ openDaysBehind 判 -1 被 fail-closed 拒绝——**下午运行必挂**。凡 seed 旧日期数据又依赖「期望交易日」的测试，日历必须同时钉 bar 末日与今日（两行齐钉，任意时刻确定性通过）。
+
 ## 4. 未完成项与储备（按数据源可得性推进）
 
 > **2026-07-06 起后续开发按 `DEVELOPMENT_PLAN.md` 的批次（N1→N2→F1→T1→S1→F2→M1→M2→M3）推进**——它是面向执行的施工图（每批含方案锚点/依赖/验收）；分析依据与上游接口速查表在 `REFERENCE_ANALYSIS.md`。以下原有储备多数已并入该计划：

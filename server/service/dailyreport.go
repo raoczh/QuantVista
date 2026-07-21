@@ -327,10 +327,13 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 
 	// 复盘与推荐并行（2026-07-14）：两路 LLM 链路互不依赖、互不阻断（单方失败 partial
 	// 的语义早已存在），串行只是白白把总时长翻倍。单用户瞬时并发=2，可接受。
+	// P0-2 调用关联：日报复盘链路一个 trace（推荐批次自带 trace，经批次 ID 间接串联）。
+	trace := newLLMTraceID()
 	var (
 		wg           sync.WaitGroup
 		review       *dailyReview
 		reviewTokens int
+		reviewRun    *llmRun
 		reviewErr    error
 		recView      *RecommendationView
 		recErr       error
@@ -338,7 +341,7 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		review, reviewTokens, reviewErr = s.callReview(ctx, userID, date, plan.cfg, plan.apiKey, plan.allowPrivate, string(snapJSON))
+		review, reviewTokens, reviewRun, reviewErr = s.callReview(ctx, userID, date, plan.cfg, plan.apiKey, plan.allowPrivate, string(snapJSON), trace)
 	}()
 	go func() {
 		defer wg.Done()
@@ -360,6 +363,10 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 	report.Provider = plan.cfg.Provider
 	report.Model = plan.cfg.Model
 	report.TotalTokens = reviewTokens
+	// P0-2：trace 与复盘运行元数据落库（双败回滚路径不覆盖旧报告字段，失败尝试的
+	// 调用仍可按 trace_id 在 llm_call_logs 查到）。
+	report.TraceID = trace
+	report.LlmRunJSON = marshalLLMRunManifests(plan.cfg, runEntry(reviewRun, true))
 	if reviewErr == nil {
 		review.EvidenceCheck = dailyReviewEvidence(review, snapshot) // 信任层回填后随 ReviewJSON 一起落库
 		b, _ := json.Marshal(review)
@@ -814,9 +821,10 @@ func dailyReviewEvidence(rv *dailyReview, snap *reportSnapshot) *evidenceCheck {
 // d2: 输出纪律条（段落句数/risk_warnings 字数上限，压单次生成时长进上游 60s 窗口）；d1: 初版。
 const dailyReviewPromptVersion = "d3"
 
-// callReview 调用 LLM 生成复盘，解析失败 repair 一次。返回（复盘, 总 token, 错误）。
+// callReview 调用 LLM 生成复盘，解析失败 repair 一次。返回（复盘, 总 token, run 元数据, 错误）。
 // M3c：module=daily 的自定义模板整段替换默认复盘系统提示（占位符 {{date}} 宽容渲染）。
-func (s *DailyReportService) callReview(ctx context.Context, userID int64, date string, cfg *model.LLMConfig, apiKey string, allowPrivate bool, snapshotJSON string) (*dailyReview, int, error) {
+// 首轮与 repair 轮共享同一 run_id（attempt 1/2），P0-2 关联元数据随审计与日报落库。
+func (s *DailyReportService) callReview(ctx context.Context, userID int64, date string, cfg *model.LLMConfig, apiKey string, allowPrivate bool, snapshotJSON, traceID string) (*dailyReview, int, *llmRun, error) {
 	sys := dailyReviewSystem
 	if custom, ok := promptOverrideFor(userID, model.PromptModuleDaily, map[string]string{"date": date}); ok {
 		sys = custom
@@ -825,6 +833,10 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 		{Role: "system", Content: sys},
 		{Role: "user", Content: fmt.Sprintf("今日收盘数据如下（JSON）：\n%s", truncateRunes(snapshotJSON, contextBudgetChars))},
 	}
+	run := newLLMRun(traceID, "", "daily_report", "daily_report.v1",
+		promptVersionFor(userID, model.PromptModuleDaily, dailyReviewPromptVersion))
+	run.hashData(snapshotJSON)
+	run.hashPrompt(messages)
 	total := 0
 	parse := func(content string) (*dailyReview, error) {
 		var rv dailyReview
@@ -841,14 +853,15 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 		Temperature: cfg.Temperature, MaxTokens: capModuleTokens(cfg.MaxTokens, reportReviewTokensCap),
 		Messages: messages, JSONMode: true, AllowPrivate: allowPrivate,
-		Meta: chatMeta{CallerUserID: userID, Module: "daily_report", ConfigID: cfg.ID, Provider: cfg.Provider},
+		Meta: run.chatMeta(userID, cfg, 1),
 	})
+	run.record(res, err)
 	if err != nil {
-		return nil, total, err
+		return nil, total, run, err
 	}
 	total += res.Usage.TotalTokens
 	if rv, perr := parse(res.Content); perr == nil {
-		return rv, total, nil
+		return rv, total, run, nil
 	}
 
 	// repair 一次。坏输出只回灌开头片段（完整回灌会拖慢下一轮生成，更易撞上游 60s 超时）。
@@ -861,17 +874,19 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 		Temperature: cfg.Temperature, MaxTokens: capModuleTokens(cfg.MaxTokens, reportReviewTokensCap),
 		Messages: messages, JSONMode: true, AllowPrivate: allowPrivate,
 		Repair: true, // repair 轮：契约开启时温度固定 0
-		Meta:   chatMeta{CallerUserID: userID, Module: "daily_report", ConfigID: cfg.ID, Provider: cfg.Provider},
+		Meta:   run.chatMeta(userID, cfg, 2),
 	})
+	run.record(res2, err)
 	if err != nil {
-		return nil, total, err
+		return nil, total, run, err
 	}
 	total += res2.Usage.TotalTokens
 	rv, perr := parse(res2.Content)
 	if perr != nil {
-		return nil, total, fmt.Errorf("复盘输出无法解析：%v", perr)
+		run.DegradedReason = "llm_output_invalid"
+		return nil, total, run, fmt.Errorf("复盘输出无法解析：%v", perr)
 	}
-	return rv, total, nil
+	return rv, total, run, nil
 }
 
 // ---- 卖点提醒 ----
