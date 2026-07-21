@@ -1,6 +1,9 @@
 package datasource
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestNormalizeClsStockID(t *testing.T) {
 	cases := []struct {
@@ -61,6 +64,16 @@ func TestStripJSONP(t *testing.T) {
 func TestStripEMTags(t *testing.T) {
 	if got := stripEMTags("<em>贵州茅台</em>发布公告"); got != "贵州茅台发布公告" {
 		t.Errorf("stripEMTags = %q", got)
+	}
+}
+
+func TestParseEMPublishTimeFailClosed(t *testing.T) {
+	if _, ok := parseEMPublishTime("not-a-time"); ok {
+		t.Fatal("无效时间必须返回 ok=false，不能伪造为当前时间")
+	}
+	got, ok := parseEMPublishTime("2025-12-31 23:59:59")
+	if !ok || got.Year() != 2025 || got.Month() != time.December || got.Day() != 31 {
+		t.Fatalf("跨年完整时间解析错误: %v ok=%v", got, ok)
 	}
 }
 

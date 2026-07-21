@@ -98,6 +98,31 @@ func isTradingDayToday(now time.Time) bool {
 	return wd >= time.Monday && wd <= time.Friday
 }
 
+type dailyTradingDayState string
+
+const (
+	dailyTradingDayOpen    dailyTradingDayState = "open"
+	dailyTradingDayClosed  dailyTradingDayState = "closed"
+	dailyTradingDayUnknown dailyTradingDayState = "unknown"
+)
+
+// dailyTradingDayStatus 日报专用交易日历判定。日报承诺当日收盘口径，缺行或查询失败
+// 不能用周一至周五近似，否则节假日或日历同步故障会生成一份伪“今日日报”。
+func dailyTradingDayStatus(now time.Time) dailyTradingDayState {
+	if common.DB == nil {
+		return dailyTradingDayUnknown
+	}
+	var cal model.TradingCalendar
+	res := common.DB.Where("market = ? AND trade_date = ?", "cn", now.Format("2006-01-02")).Limit(1).Find(&cal)
+	if res.Error != nil || res.RowsAffected != 1 {
+		return dailyTradingDayUnknown
+	}
+	if cal.IsOpen {
+		return dailyTradingDayOpen
+	}
+	return dailyTradingDayClosed
+}
+
 // List 用户的日报列表（排除大字段）。
 func (s *DailyReportService) List(userID int64, limit int) ([]model.DailyReport, error) {
 	if limit <= 0 || limit > 60 {
@@ -174,8 +199,11 @@ func (s *DailyReportService) assembleView(r *model.DailyReport) *DailyReportView
 // manual=false（自动 job）：已存在即跳过；调用方已在后台 goroutine 内，保持同步执行。
 func (s *DailyReportService) GenerateFor(ctx context.Context, userID int64, manual bool) (*DailyReportView, error) {
 	now := s.now()
-	if !isTradingDayToday(now) {
+	switch dailyTradingDayStatus(now) {
+	case dailyTradingDayClosed:
 		return nil, refusalErr(RefusalMarketClosed, "今日休市，无日报可生成")
+	case dailyTradingDayUnknown:
+		return nil, refusalErr(RefusalMarketCalendarUnknown, "交易日历暂不可用，无法确认今日是否开市，日报未生成")
 	}
 	// 收盘数据就绪门槛：正式日报承诺「当日收盘口径」（复盘/涨跌家数/资金流/明日推荐
 	// 均按收盘数据组织）。15:35（收盘增量落定，同自动窗口起点）之前手动生成会拿盘中
@@ -459,14 +487,28 @@ func (s *DailyReportService) buildSnapshot(ctx context.Context, userID int64, da
 			if i >= 4 {
 				break
 			}
-			m.Indices = append(m.Indices, map[string]any{"name": ix.Name, "price": ix.Price, "change_pct": ix.ChangePct})
+			row := map[string]any{"name": ix.Name, "price": ix.Price, "change_pct": ix.ChangePct,
+				"data_time": "", "trade_date": ""}
+			if !ix.DataTime.IsZero() {
+				row["data_time"] = ix.DataTime.In(time.Local).Format("2006-01-02 15:04:05")
+				row["trade_date"] = ix.DataTime.In(time.Local).Format("2006-01-02")
+			}
+			m.Indices = append(m.Indices, row)
 		}
 		if ov.Breadth != nil {
 			m.Breadth = map[string]any{"advances": ov.Breadth.Advances, "declines": ov.Breadth.Declines,
-				"limit_up": ov.Breadth.LimitUp, "limit_down": ov.Breadth.LimitDown}
+				"limit_up": ov.Breadth.LimitUp, "limit_down": ov.Breadth.LimitDown,
+				"trade_date": ov.Breadth.TradeDate}
+			if !ov.Breadth.DataTime.IsZero() {
+				m.Breadth["captured_at"] = ov.Breadth.DataTime.In(time.Local).Format("2006-01-02 15:04:05")
+			}
 		}
 		if ov.FundFlow != nil {
-			m.FundFlow = map[string]any{"main_net_yi": round2(ov.FundFlow.MainNet / 1e8)}
+			m.FundFlow = map[string]any{"main_net_yi": round2(ov.FundFlow.MainNet / 1e8),
+				"trade_date": ov.FundFlow.TradeDate}
+			if !ov.FundFlow.DataTime.IsZero() {
+				m.FundFlow["captured_at"] = ov.FundFlow.DataTime.In(time.Local).Format("2006-01-02 15:04:05")
+			}
 		}
 		// M3a 情绪温度计：16:35 涨停池 job 先于日报窗口（15:35 起）么？不——日报窗口
 		// 15:35~20:00 早段可能取到上一交易日的 mood（trade_date 标注归属日，prompt
@@ -505,39 +547,25 @@ func (s *DailyReportService) buildSnapshot(ctx context.Context, userID int64, da
 
 	// 自选异动：全部分组条目按当日涨跌绝对值取前 8。
 	if groups, err := s.watchlist.List(ctx, userID); err == nil {
-		var items []reportWatchItem
-		for _, g := range groups {
-			for _, it := range g.Items {
-				if it.QuoteOK {
-					items = append(items, reportWatchItem{Symbol: it.Symbol, Name: it.Name, ChangePct: it.ChangePct})
-				}
-			}
-		}
-		for i := 0; i < len(items); i++ {
-			for j := i + 1; j < len(items); j++ {
-				if abs(items[j].ChangePct) > abs(items[i].ChangePct) {
-					items[i], items[j] = items[j], items[i]
-				}
-			}
-		}
-		if len(items) > 8 {
-			items = items[:8]
-		}
-		snap.Watch = items
+		snap.Watch = selectReportWatchItems(groups)
 	}
 
 	// 今日命中提醒（事件表按触发时间过滤，含已读——复盘看全天）。
 	var events []model.AlertEvent
 	dayStart, _ := time.ParseInLocation("2006-01-02", date, time.Local)
+	dayEnd := dayStart.Add(24 * time.Hour)
+	if now := s.now(); now.Before(dayEnd) {
+		dayEnd = now
+	}
 	if err := common.DB.Where("user_id = ? AND triggered_at >= ? AND triggered_at < ?",
-		userID, dayStart, dayStart.Add(24*time.Hour)).Limit(20).Find(&events).Error; err == nil {
+		userID, dayStart, dayEnd).Limit(20).Find(&events).Error; err == nil {
 		for _, e := range events {
 			snap.Alerts = append(snap.Alerts, fmt.Sprintf("%s(%s) %s", e.Name, e.Symbol, e.Message))
 		}
 	}
 
 	// N2 今日重要事件：4 步硬规则（降噪→三维打分→同主线合并→截断），LLM 只写摘要。
-	snap.Events = buildTodayEvents(date)
+	snap.Events = buildTodayEventsAt(date, s.now())
 
 	// F1 明日披露名单：自选∪持仓中次日预约披露财报的标的（数据来自预约披露表）。
 	if d, err := time.ParseInLocation("2006-01-02", date, time.Local); err == nil {
@@ -551,9 +579,33 @@ func (s *DailyReportService) buildSnapshot(ctx context.Context, userID int64, da
 	return snap
 }
 
+func selectReportWatchItems(groups []WatchlistGroupView) []reportWatchItem {
+	var items []reportWatchItem
+	for _, group := range groups {
+		for _, item := range group.Items {
+			if !item.QuoteOK || item.FreshnessStatus != freshStatusFresh {
+				continue
+			}
+			items = append(items, reportWatchItem{Symbol: item.Symbol, Name: item.Name, ChangePct: item.ChangePct})
+		}
+	}
+	for i := 0; i < len(items); i++ {
+		for j := i + 1; j < len(items); j++ {
+			if abs(items[j].ChangePct) > abs(items[i].ChangePct) {
+				items[i], items[j] = items[j], items[i]
+			}
+		}
+	}
+	if len(items) > 8 {
+		items = items[:8]
+	}
+	return items
+}
+
 // reportDataDeficiencies P1 数据水位检查（纯函数可测）：核心块逐项对账——缺失/归属日
 // 不符（如 15:35~16:35 窗口 mood 仍是上一交易日口径）都显式登记，禁止旧数据静默冒充
-// 「今日完整报告」。mood 归属日不符时就地打 stale_for_today 标记。
+// 「今日完整报告」。日期未知/过期的块只保留来源与时点元数据，数值从 LLM 输入和
+// evidence 值域中剥离，避免模型无视提示后仍把旧数字写成“今日”并通过数值核验。
 func reportDataDeficiencies(snap *reportSnapshot, date string) []string {
 	var defs []string
 	if snap.Market == nil {
@@ -561,20 +613,93 @@ func reportDataDeficiencies(snap *reportSnapshot, date string) []string {
 	}
 	if len(snap.Market.Indices) == 0 {
 		defs = append(defs, "指数行情缺失")
+	} else {
+		indexIssueLogged := false
+		for i, ix := range snap.Market.Indices {
+			td, hasDate := ix["trade_date"].(string)
+			td = strings.TrimSpace(td)
+			if !hasDate || strings.TrimSpace(td) == "" {
+				note := "指数行情业务日期缺失，无法确认是否为当日收盘口径"
+				if !indexIssueLogged {
+					defs = append(defs, note)
+					indexIssueLogged = true
+				}
+				snap.Market.Indices[i] = reportStaleMetadata(ix, note)
+			} else if td != date {
+				note := fmt.Sprintf("指数行情仍为 %s 口径，不代表当日收盘", td)
+				if !indexIssueLogged {
+					defs = append(defs, note)
+					indexIssueLogged = true
+				}
+				snap.Market.Indices[i] = reportStaleMetadata(ix, note)
+			} else if note := reportIndexTimeDeficiency(ix, date); note != "" {
+				if !indexIssueLogged {
+					defs = append(defs, note)
+					indexIssueLogged = true
+				}
+				snap.Market.Indices[i] = reportStaleMetadata(ix, note)
+			}
+		}
 	}
 	if snap.Market.Breadth == nil {
 		defs = append(defs, "涨跌家数缺失（赚钱效应维度不可判）")
+	} else if td, hasDate := snap.Market.Breadth["trade_date"].(string); !hasDate || strings.TrimSpace(td) == "" {
+		note := "涨跌家数业务日期缺失，赚钱效应不可按当日口径判断"
+		defs = append(defs, note)
+		snap.Market.Breadth = reportStaleMetadata(snap.Market.Breadth, note)
+	} else if td, _ := snap.Market.Breadth["trade_date"].(string); td != date {
+		note := fmt.Sprintf("涨跌家数仍为 %s 口径，不得参与当日策略选择", td)
+		defs = append(defs, note)
+		snap.Market.Breadth = reportStaleMetadata(snap.Market.Breadth, note)
 	}
 	if snap.Market.FundFlow == nil {
 		defs = append(defs, "两市资金流缺失")
+	} else if td, hasDate := snap.Market.FundFlow["trade_date"].(string); !hasDate || strings.TrimSpace(td) == "" {
+		note := "两市资金流业务日期缺失，无法确认是否为当日口径"
+		defs = append(defs, note)
+		snap.Market.FundFlow = reportStaleMetadata(snap.Market.FundFlow, note)
+	} else if td, _ := snap.Market.FundFlow["trade_date"].(string); td != date {
+		note := fmt.Sprintf("两市资金流仍为 %s 口径，不代表当日资金流", td)
+		defs = append(defs, note)
+		snap.Market.FundFlow = reportStaleMetadata(snap.Market.FundFlow, note)
 	}
 	if snap.Market.Mood == nil {
 		defs = append(defs, "情绪温度计（涨停池）今日未就绪")
-	} else if td, _ := snap.Market.Mood["trade_date"].(string); td != "" && td != date {
-		defs = append(defs, fmt.Sprintf("情绪温度计仍为 %s 口径（当日数据 16:35 采集后才有），不代表今日情绪，引用必须注明归属日", td))
-		snap.Market.Mood["stale_for_today"] = true
+	} else if td, hasDate := snap.Market.Mood["trade_date"].(string); !hasDate || strings.TrimSpace(td) == "" {
+		note := "情绪温度计业务日期缺失，无法确认是否为当日口径"
+		defs = append(defs, note)
+		snap.Market.Mood = reportStaleMetadata(snap.Market.Mood, note)
+	} else if td != date {
+		note := fmt.Sprintf("情绪温度计仍为 %s 口径（当日数据 16:35 采集后才有），不代表今日情绪", td)
+		defs = append(defs, note)
+		snap.Market.Mood = reportStaleMetadata(snap.Market.Mood, note)
 	}
 	return defs
+}
+
+func reportStaleMetadata(block map[string]any, note string) map[string]any {
+	out := map[string]any{"stale_for_today": true, "stale_note": note}
+	for _, key := range []string{"name", "code", "source", "trade_date", "data_time", "captured_at"} {
+		if value, ok := block[key]; ok {
+			out[key] = value
+		}
+	}
+	return out
+}
+
+func reportIndexTimeDeficiency(index map[string]any, date string) string {
+	value, ok := index["data_time"].(string)
+	if !ok || strings.TrimSpace(value) == "" {
+		return "指数行情源时间缺失，无法确认是否为当日收盘口径"
+	}
+	dataTime, err := time.ParseInLocation("2006-01-02 15:04:05", strings.TrimSpace(value), time.Local)
+	if err != nil || dataTime.Format("2006-01-02") != date {
+		return "指数行情源时间无法核验，不得作为当日收盘口径"
+	}
+	if quoteFreshness(dataTime, dataTime, marketStatePostClose, date).Status != freshStatusFresh {
+		return fmt.Sprintf("指数行情虽为报告日但仅更新至 %s，未达到收盘口径", dataTime.Format("15:04:05"))
+	}
+	return ""
 }
 
 // pickDailyStrategy 按当日涨跌家数为明日推荐选短线策略：
@@ -582,6 +707,9 @@ func reportDataDeficiencies(snap *reportSnapshot, date string) []string {
 // 无涨跌家数数据时回退动量（与旧行为一致）。
 func pickDailyStrategy(snap *reportSnapshot) string {
 	if snap == nil || snap.Market == nil || snap.Market.Breadth == nil {
+		return "momentum"
+	}
+	if td, hasDate := snap.Market.Breadth["trade_date"].(string); !hasDate || strings.TrimSpace(td) == "" || td != snap.TradeDate {
 		return "momentum"
 	}
 	adv, _ := snap.Market.Breadth["advances"].(int)
@@ -806,7 +934,14 @@ func StartDailyReportJobs(mgr *datasource.Manager) {
 
 func (s *DailyReportService) runAutoOnce(ctx context.Context) {
 	now := s.now()
-	if !inReportWindow(now) || !isTradingDayToday(now) {
+	if !inReportWindow(now) {
+		return
+	}
+	switch dailyTradingDayStatus(now) {
+	case dailyTradingDayClosed:
+		return
+	case dailyTradingDayUnknown:
+		common.SysWarn("日报任务跳过：交易日历缺少 %s，无法确认是否开市", now.Format("2006-01-02"))
 		return
 	}
 	if !dailyReportRunning.CompareAndSwap(false, true) {

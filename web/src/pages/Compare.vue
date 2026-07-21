@@ -9,6 +9,7 @@ import {
   NSpin,
   NEmpty,
   NTag,
+  NAlert,
   useMessage,
 } from 'naive-ui'
 import { compareStocks, type CompareResult } from '@/api/compare'
@@ -154,6 +155,19 @@ const aiCheck = computed(() => {
   const c = result.value?.ai_comment_check
   return c && c.total > 0 ? c : null
 })
+
+const aiRefusalLabels: Record<string, string> = {
+  insufficient_fresh_quotes: '有效行情不足',
+  quota_exhausted: 'AI 次数配额已用尽',
+  quota_unavailable: '配额信息暂不可用',
+  llm_unavailable: '没有可用的 LLM 配置',
+  llm_call_failed: 'LLM 调用失败',
+  llm_response_incomplete: 'LLM 响应不完整',
+  llm_content_filtered: '内容被上游安全策略拦截',
+}
+function aiRefusalText(code: string) {
+  return aiRefusalLabels[code] || `服务拒绝（${code}）`
+}
 </script>
 
 <template>
@@ -293,6 +307,10 @@ const aiCheck = computed(() => {
             未参与对比：{{ failed.map((f) => `${f.symbol}（${f.error || '行情暂不可用'}）`).join('、') }}
           </div>
 
+          <n-alert v-if="result.ai_refusal_code" type="warning" :bordered="false" class="ai-refusal">
+            AI 点评未生成：{{ aiRefusalText(result.ai_refusal_code) }}。当前仅展示程序化指标对比。
+          </n-alert>
+
           <div v-if="result.ai_comment" class="ai">
             <div class="ai-title">
               <span>AI 点评</span>
@@ -391,6 +409,9 @@ const aiCheck = computed(() => {
   font-size: 12px;
   opacity: 0.6;
   margin-top: 12px;
+}
+.ai-refusal {
+  margin-top: 14px;
 }
 .ai {
   margin-top: 16px;

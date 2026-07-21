@@ -321,7 +321,10 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 		if err := common.DB.Create(rec).Error; err != nil {
 			return nil, err
 		}
-		return nil, errors.New(callErr.Error())
+		// 保留中央客户端返回的 RefusalError 错误链，供 controller/common.ApiError
+		// 透出 llm_call_failed/llm_response_incomplete 等机读拒答码；不要用
+		// errors.New(callErr.Error()) 重建并丢失类型信息。
+		return nil, callErr
 	case result != nil:
 		rec.Status = model.AnalysisStatusSuccess
 		rec.Rating = result.Rating
@@ -555,7 +558,8 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
-			Meta: chatMeta{CallerUserID: userID, Module: "analysis_review", ConfigID: cfg.ID, Provider: cfg.Provider},
+			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）
+			Meta:   chatMeta{CallerUserID: userID, Module: "analysis_review", ConfigID: cfg.ID, Provider: cfg.Provider},
 		})
 		if err != nil {
 			return nil, usage
@@ -965,6 +969,7 @@ var staleModeActionWords = []string{
 // 只是软引导，模型不遵守时由这里兜底保证输出形态，不依赖模型自觉）：
 //   - summary 强制以「截至 <quote_as_of> 的历史数据解释：」开头（模型没写就补写）；
 //   - suggestions 剔除含当前买卖行动词的条目，剔空后补固定「待行情恢复」句。
+//
 // 返回给 sys_confidence_why 的说明（无剔除返回空）。
 func enforceStaleModeResult(r *AnalysisResult, asOf string) string {
 	prefix := "截至 " + orStr(asOf, "未知时间") + " 的历史数据解释："

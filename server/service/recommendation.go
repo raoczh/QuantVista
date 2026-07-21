@@ -650,7 +650,9 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		}
 		if callErr != nil {
 			s.failBatch(batch, usage, latency, callErr.Error())
-			return nil, errors.New(callErr.Error())
+			// 保留中央客户端返回的 RefusalError 错误链，后台调用方/后续 API
+			// 才能继续识别 llm_call_failed、llm_response_incomplete 等拒答码。
+			return nil, callErr
 		}
 	}
 	if len(picks) == 0 {
@@ -1025,7 +1027,8 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			Temperature: cfg.Temperature, MaxTokens: capModuleTokens(cfg.MaxTokens, recReviewTokensCap),
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
-			Meta: chatMeta{CallerUserID: userID, Module: "rec_review", ConfigID: cfg.ID, Provider: cfg.Provider},
+			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）
+			Meta:   chatMeta{CallerUserID: userID, Module: "rec_review", ConfigID: cfg.ID, Provider: cfg.Provider},
 		})
 		if err != nil {
 			return nil, "", usage
@@ -1399,7 +1402,7 @@ func (s *RecommendationService) freshenCandidates(ctx context.Context, pool []ca
 // 用户筛选终判、涨停判断、computeScore/computeCandFactors 与排名一律建立在刷新后
 // 的行情上。stale/取不到 → 透明排除 + quote_stale 事件（影子标签自然结算可回验误伤）。
 // 名额分配（assignScanQuota）在此之后进行，天然只发给存活者，无需补位轮
-//（qf2 的「先发名额再刷新参评者+池满补位」顺序漏洞由此根治）。
+// （qf2 的「先发名额再刷新参评者+池满补位」顺序漏洞由此根治）。
 func (s *RecommendationService) freshenPool(ctx context.Context, pool []candidate, filters RecFilters) []gateNote {
 	if s.market == nil {
 		return nil
@@ -1472,7 +1475,7 @@ func (s *RecommendationService) applyQuoteFreshGate(ctx context.Context, market 
 // buildPool 阶段①②：多源建池（自选 ∪ 按策略组合的榜单来源，来源可叠加）→
 // 基础准入（candidateEligible：ST/退市/北交所/无行情/流动性/黑名单，不合格不进池）→
 // 估值富化 → 静态筛选 → 行情时效核验刷新（freshenPool，qf3）→ 用户筛选
-//（applyQuoteFilters 基于刷新后行情，不合格保留并标注 excluded 原因）→ 评分名额分配。
+// （applyQuoteFilters 基于刷新后行情，不合格保留并标注 excluded 原因）→ 评分名额分配。
 // 返回 全量池（含被筛掉者）、quote_stale 门控记录；未被筛掉的数量超过
 // maxScanCandidates 时后来者标注「池满」。
 func (s *RecommendationService) buildPool(ctx context.Context, userID int64, market, recType string, strat *strategyTemplate, filters RecFilters) ([]candidate, []gateNote, error) {

@@ -37,7 +37,7 @@ func (rc *RecommendationController) Generate(c *gin.Context) {
 	allowPrivate := currentRole(c) == model.RoleAdmin
 	v, err := rc.svc.Generate(c.Request.Context(), currentUserID(c), allowPrivate, req)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiError(c, err)
 		return
 	}
 	common.ApiSuccess(c, v)
@@ -88,7 +88,7 @@ func (rc *RecommendationController) Delete(c *gin.Context) {
 }
 
 // AckReview PUT /api/recommendations/review-ack/:id —— 标记推荐复盘提示已读
-//（:id 为追踪状态行 id，今日待办 rec_review 条目的 ref_id）。
+// （:id 为追踪状态行 id，今日待办 rec_review 条目的 ref_id）。
 func (rc *RecommendationController) AckReview(c *gin.Context) {
 	id, ok := parseIDParam(c, "id")
 	if !ok {

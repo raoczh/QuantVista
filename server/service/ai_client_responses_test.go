@@ -150,7 +150,7 @@ func TestResponsesCompletionStreamFailed(t *testing.T) {
 		BaseURL: srv.URL, APIKey: "k", Model: "m", EndpointType: model.LLMEndpointResponses, AllowPrivate: true,
 		Messages: []chatMessage{{Role: "user", Content: "hi"}},
 	}, nil)
-	if err == nil || !strings.Contains(err.Error(), "model overloaded") {
+	if err == nil || !strings.Contains(err.Error(), "model overloaded") || RefusalCodeOf(err) != RefusalLLMCallFailed {
 		t.Fatalf("failed 事件应判失败并带出 message: %v", err)
 	}
 }

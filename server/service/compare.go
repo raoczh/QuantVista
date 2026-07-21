@@ -81,8 +81,8 @@ type CompareResult struct {
 	AIComment      string         `json:"ai_comment"`
 	AICommentCheck *evidenceCheck `json:"ai_comment_check,omitempty"` // 服务端回填：AI 点评引用数字与各行指标的核验
 	Note           string         `json:"note"`
-	// AIRefusalCode AI 点评未生成时的机读拒答码（P0-7：insufficient_fresh_quotes /
-	// quota_exhausted / llm_unavailable，空=已生成或未请求 AI）；Note 保持人类可读说明。
+	// AIRefusalCode AI 点评未生成时的机读拒答码（行情不足、配额/配置、调用/完整性等，
+	// 空=已生成或未请求 AI）；Note 保持人类可读说明。
 	AIRefusalCode string `json:"ai_refusal_code,omitempty"`
 	// AI 点评实际使用的 LLM（对比不落库，随响应回传供前端展示；无点评时为零值）。
 	AIConfigID int64  `json:"ai_llm_config_id,omitempty"`
@@ -257,20 +257,8 @@ func changeOverN(closes []float64, n int) float64 {
 // aiComment 生成一段横向对比点评。返回（点评, 说明, 机读拒答码, 实际使用的 LLM 配置）；
 // 失败或配额不足时点评为空、说明解释原因、code 供前端程序化分支、配置为 nil。
 func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPrivate bool, llmConfigID int64, rows []CompareRow) (string, string, string, *model.LLMConfig) {
-	cfg, apiKey, err := s.llm.ResolveForUse(userID, llmConfigID)
-	if err != nil {
-		return "", "AI 点评不可用：" + err.Error(), RefusalLLMUnavailable, nil
-	}
-	allowPrivate = llmAllowPrivate(allowPrivate, cfg) // 回退到管理员配置时按配置所有者放行内网
-	if err := checkQuota(userID); err != nil {
-		if errors.Is(err, errQuotaExhausted) {
-			return "", "AI 次数配额已用尽，仅展示指标对比", RefusalQuotaExhausted, nil
-		}
-		// 与 analysis/qa/recommendation 一致 fail-closed：配额读不到时不放行调用。
-		return "", "AI 点评不可用：配额信息读取失败", RefusalQuotaExhausted, nil
-	}
-
-	// 只把有行情的标的喂给模型（含已算好的五维量化评分——此前算了却没喂给模型）。
+	// 数据充分性是业务安全门，应先于配置和配额解析。否则同一批 fresh<2 的数据会因
+	// 用户是否配置 LLM 而返回不同拒答码，掩盖真正的 fail-closed 原因。
 	var b strings.Builder
 	b.WriteString("请对下列股票做一次简明的横向对比点评（180 字以内，一段话）：指出相对强弱、趋势与均线位置差异、估值水位差异（如有 PE/PB 数据）、谁更值得关注及其理由。要求：只依据给出的数据，关键判断引用具体数值（如「A 综合分 78 高于 B 的 52」）；系统会程序化核对你引用的数字，与数据不符的会被标记展示给用户，故不得编造或凭印象填数；禁止使用你记忆中关于这些公司的信息，不得虚构财务明细/新闻；这是研究参考，不构成投资建议，末尾一句风险提示。\n\n数据（score 为本站五维技术评分 0-100，仅供参考锚点）：\n")
 	valid := 0
@@ -288,6 +276,21 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 		return "", "有效行情不足，无法生成 AI 点评", RefusalFreshQuotesInsufficient, nil
 	}
 
+	cfg, apiKey, err := s.llm.ResolveForUse(userID, llmConfigID)
+	if err != nil {
+		return "", "AI 点评不可用：" + err.Error(), RefusalLLMUnavailable, nil
+	}
+	allowPrivate = llmAllowPrivate(allowPrivate, cfg) // 回退到管理员配置时按配置所有者放行内网
+	if err := checkQuota(userID); err != nil {
+		if code := RefusalCodeOf(err); code != "" {
+			if code == RefusalQuotaExhausted {
+				return "", "AI 次数配额已用尽，仅展示指标对比", code, nil
+			}
+			return "", "AI 点评不可用：配额信息读取失败", code, nil
+		}
+		return "", "AI 点评不可用：配额信息读取失败", RefusalQuotaUnavailable, nil
+	}
+
 	res, err := chatCompletion(ctx, chatParams{
 		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 		Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
@@ -299,7 +302,11 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 		Meta: chatMeta{CallerUserID: userID, Module: "compare", ConfigID: cfg.ID, Provider: cfg.Provider},
 	})
 	if err != nil {
-		return "", "AI 点评生成失败：" + err.Error(), RefusalLLMUnavailable, nil
+		code := RefusalCodeOf(err)
+		if code == "" {
+			code = RefusalLLMCallFailed
+		}
+		return "", "AI 点评生成失败：" + err.Error(), code, nil
 	}
 	if res.Usage.TotalTokens > 0 {
 		consumeQuota(userID, res.Usage.TotalTokens, true)

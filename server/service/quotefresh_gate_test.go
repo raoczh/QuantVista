@@ -188,9 +188,9 @@ func TestReportDataDeficiencies(t *testing.T) {
 	}
 	// mood 为上一交易日：登记 + 打 stale_for_today。
 	snap2 := &reportSnapshot{TradeDate: "2026-07-17", Market: &reportMarket{
-		Indices:  []map[string]any{{"name": "上证指数"}},
-		Breadth:  map[string]any{"advances": 3000},
-		FundFlow: map[string]any{"main_net_yi": 12.5},
+		Indices:  []map[string]any{{"name": "上证指数", "trade_date": "2026-07-17", "data_time": "2026-07-17 15:00:00"}},
+		Breadth:  map[string]any{"advances": 3000, "trade_date": "2026-07-17"},
+		FundFlow: map[string]any{"main_net_yi": 12.5, "trade_date": "2026-07-17"},
 		Mood:     map[string]any{"trade_date": "2026-07-16"},
 	}}
 	defs2 := reportDataDeficiencies(snap2, "2026-07-17")
@@ -202,9 +202,9 @@ func TestReportDataDeficiencies(t *testing.T) {
 	}
 	// 当日 mood 完整：零缺口。
 	snap3 := &reportSnapshot{TradeDate: "2026-07-17", Market: &reportMarket{
-		Indices:  []map[string]any{{"name": "上证指数"}},
-		Breadth:  map[string]any{"advances": 3000},
-		FundFlow: map[string]any{"main_net_yi": 12.5},
+		Indices:  []map[string]any{{"name": "上证指数", "trade_date": "2026-07-17", "data_time": "2026-07-17 15:00:00"}},
+		Breadth:  map[string]any{"advances": 3000, "trade_date": "2026-07-17"},
+		FundFlow: map[string]any{"main_net_yi": 12.5, "trade_date": "2026-07-17"},
 		Mood:     map[string]any{"trade_date": "2026-07-17"},
 	}}
 	if defs3 := reportDataDeficiencies(snap3, "2026-07-17"); len(defs3) != 0 {
@@ -328,7 +328,7 @@ func TestTextLabeledValuesUnitInts(t *testing.T) {
 }
 
 // TestQaCurrentFreshness 旧问答会话按当前时刻重判：昨天 fresh 的快照今天必须能判 stale
-//（详情页与续问的时效声明都吃这个重判，不再只读快照创建时的 freshness_status）。
+// （详情页与续问的时效声明都吃这个重判，不再只读快照创建时的 freshness_status）。
 func TestQaCurrentFreshness(t *testing.T) {
 	setupTestDB(t)
 	pinCalendarTo(t, prevOpenTradeDate(time.Now().Format("2006-01-02")))

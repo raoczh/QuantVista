@@ -380,6 +380,13 @@ var (
 // 权重 = 4 - source_priority（P1=3 / P2=2 / P3=1），取最新 sentiAggMaxNews 条。
 // 返回 (score -1~1, 参与条数, 是否有数据)。
 func stockDailySentiment(symbol, date string) (float64, int, bool) {
+	return stockDailySentimentAt(symbol, date, time.Now())
+}
+
+// stockDailySentimentAt 与 stockDailySentiment 相同，但固定本轮聚合的查询上界。
+// 生产入口传 time.Now；测试用固定时钟，避免把新闻时间和严格 `< now` 上界放在
+// 同一个 SQLite 时间精度边界上造成偶发漏行。
+func stockDailySentimentAt(symbol, date string, now time.Time) (float64, int, bool) {
 	if common.DB == nil || symbol == "" {
 		return 0, 0, false
 	}
@@ -401,7 +408,7 @@ func stockDailySentiment(symbol, date string) (float64, int, bool) {
 		sentiAggInflight[key] = wg
 		sentiAggMu.Unlock()
 
-		score, count, detail := computeDailySentiment(symbol, date)
+		score, count, detail := computeDailySentimentAt(symbol, date, now)
 		// P1 水位修复：仅在算到新闻（count>0）时才落缓存行——早晨新闻尚未采集时算出的
 		// 「0 条」若落库，(symbol,date) 幂等会把「无新闻」冻结成全天结论，之后采集到的
 		// 新闻永远进不了当日情绪。空结果不落库、每次现算（轻查询），新闻到位自然生效；
@@ -422,14 +429,25 @@ func stockDailySentiment(symbol, date string) (float64, int, bool) {
 // computeDailySentiment 从当日已增强新闻合成个股情绪分（纯读，可测）。
 // 返回 (score, 条数, 参与明细 JSON——{id,title,score,w} 数组，落库可复核)。
 func computeDailySentiment(symbol, date string) (float64, int, string) {
+	return computeDailySentimentAt(symbol, date, time.Now())
+}
+
+func computeDailySentimentAt(symbol, date string, now time.Time) (float64, int, string) {
 	dayStart, err := time.ParseInLocation("2006-01-02", date, time.Local)
 	if err != nil {
+		return 0, 0, ""
+	}
+	dayEnd := dayStart.Add(24 * time.Hour)
+	if now.Before(dayEnd) {
+		dayEnd = now
+	}
+	if !dayEnd.After(dayStart) {
 		return 0, 0, ""
 	}
 	var rows []model.News
 	common.DB.Select("id, title, sentiment_score, source_priority").
 		Where("related_symbols LIKE ? AND sentiment <> '' AND publish_time >= ? AND publish_time < ?",
-			"%\""+symbol+"\"%", dayStart, dayStart.Add(24*time.Hour)).
+			"%\""+symbol+"\"%", dayStart, dayEnd).
 		Order("publish_time DESC").Limit(sentiAggMaxNews).Find(&rows)
 	if len(rows) == 0 {
 		return 0, 0, ""
@@ -496,12 +514,16 @@ const newsBriefMaxAge = 7 * 24 * time.Hour
 // latestNewsBriefs 某标的近 7 天内最新 limit 条新闻（标题+情绪标签），供个股分析/问答
 // prompt 注入。best-effort：无 DB / 窗口内无新闻返回空。
 func latestNewsBriefs(symbol string, limit int) []newsBrief {
+	return latestNewsBriefsAt(symbol, limit, time.Now())
+}
+
+func latestNewsBriefsAt(symbol string, limit int, now time.Time) []newsBrief {
 	if common.DB == nil || len(symbol) != 6 {
 		return nil
 	}
 	var rows []model.News
 	if err := common.DB.Select("title, sentiment, publish_time, source").
-		Where("related_symbols LIKE ? AND publish_time > ?", "%\""+symbol+"\"%", time.Now().Add(-newsBriefMaxAge)).
+		Where("related_symbols LIKE ? AND publish_time >= ? AND publish_time <= ?", "%\""+symbol+"\"%", now.Add(-newsBriefMaxAge), now).
 		Order("publish_time DESC").Limit(limit).Find(&rows).Error; err != nil {
 		return nil
 	}

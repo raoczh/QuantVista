@@ -31,7 +31,7 @@ func TestInReportWindow(t *testing.T) {
 	}
 }
 
-// TestIsTradingDayToday 优先交易日历，无记录时回退周一~五。
+// TestIsTradingDayToday 优先交易日历，无记录时回退周一~五（通用行情链路的历史兼容语义）。
 func TestIsTradingDayToday(t *testing.T) {
 	setupTestDB(t)
 
@@ -49,6 +49,101 @@ func TestIsTradingDayToday(t *testing.T) {
 	common.DB.Create(&model.TradingCalendar{Market: "cn", TradeDate: "2026-07-03", IsOpen: false})
 	if isTradingDayToday(fri) {
 		t.Fatalf("日历标记休市应优先于工作日回退")
+	}
+}
+
+func TestDailyTradingDayStatusFailClosed(t *testing.T) {
+	setupTestDB(t)
+	now := time.Date(2026, 7, 6, 16, 0, 0, 0, time.Local)
+	if got := dailyTradingDayStatus(now); got != dailyTradingDayUnknown {
+		t.Fatalf("缺少日历行应为 unknown，got %q", got)
+	}
+	if err := common.DB.Create(&model.TradingCalendar{Market: "cn", TradeDate: "2026-07-06", IsOpen: false}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got := dailyTradingDayStatus(now); got != dailyTradingDayClosed {
+		t.Fatalf("日历明确休市应为 closed，got %q", got)
+	}
+	common.DB.Model(&model.TradingCalendar{}).Where("market = ? AND trade_date = ?", "cn", "2026-07-06").Update("is_open", true)
+	if got := dailyTradingDayStatus(now); got != dailyTradingDayOpen {
+		t.Fatalf("日历明确开市应为 open，got %q", got)
+	}
+}
+
+func TestDailyReportCalendarUnknownRefusal(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
+	svc := &DailyReportService{nowFn: func() time.Time {
+		return time.Date(2026, 7, 6, 16, 0, 0, 0, time.Local)
+	}}
+	_, err := svc.GenerateFor(nil, 1, true)
+	if RefusalCodeOf(err) != RefusalMarketCalendarUnknown {
+		t.Fatalf("日历缺行必须机读拒答 %q，got %v", RefusalMarketCalendarUnknown, err)
+	}
+}
+
+func TestDailySnapshotDateGate(t *testing.T) {
+	old := &reportSnapshot{TradeDate: "2026-07-06", Market: &reportMarket{
+		Indices:  []map[string]any{{"name": "上证", "price": 1.0, "trade_date": "2026-07-03"}},
+		Breadth:  map[string]any{"advances": 100, "declines": 1000, "trade_date": "2026-07-03"},
+		FundFlow: map[string]any{"main_net_yi": 1.0, "trade_date": "2026-07-03"},
+	}}
+	defs := reportDataDeficiencies(old, old.TradeDate)
+	if len(defs) < 3 {
+		t.Fatalf("三个旧核心块都应进入缺口清单，got %v", defs)
+	}
+	if got := pickDailyStrategy(old); got != "momentum" {
+		t.Fatalf("旧 breadth 不得驱动明日策略，got %q", got)
+	}
+	if _, ok := old.Market.Indices[0]["price"]; ok {
+		t.Fatal("旧指数数值必须从 LLM 输入/evidence 值域剥离")
+	}
+	if _, ok := old.Market.Breadth["advances"]; ok {
+		t.Fatal("旧涨跌家数必须从 LLM 输入/evidence 值域剥离")
+	}
+	if _, ok := old.Market.FundFlow["main_net_yi"]; ok {
+		t.Fatal("旧资金流数值必须从 LLM 输入/evidence 值域剥离")
+	}
+	unknown := &reportSnapshot{TradeDate: "2026-07-06", Market: &reportMarket{
+		Indices:  []map[string]any{{"name": "上证", "price": 1.0}},
+		Breadth:  map[string]any{"advances": 100, "declines": 1000},
+		FundFlow: map[string]any{"main_net_yi": 1.0},
+	}}
+	if defs := reportDataDeficiencies(unknown, unknown.TradeDate); len(defs) < 3 {
+		t.Fatalf("业务日期缺失的三个核心块都必须 fail-closed，got %v", defs)
+	}
+	if got := pickDailyStrategy(unknown); got != "momentum" {
+		t.Fatalf("业务日期未知的 breadth 不得驱动明日策略，got %q", got)
+	}
+	intradayIndex := &reportSnapshot{TradeDate: "2026-07-06", Market: &reportMarket{
+		Indices:  []map[string]any{{"name": "上证", "price": 3200.0, "trade_date": "2026-07-06", "data_time": "2026-07-06 10:00:00"}},
+		Breadth:  map[string]any{"advances": 100, "declines": 1000, "trade_date": "2026-07-06"},
+		FundFlow: map[string]any{"main_net_yi": 1.0, "trade_date": "2026-07-06"},
+		Mood:     map[string]any{"trade_date": "2026-07-06"},
+	}}
+	if defs := reportDataDeficiencies(intradayIndex, intradayIndex.TradeDate); len(defs) != 1 {
+		t.Fatalf("同日早盘指数必须登记收盘口径缺口: %v", defs)
+	}
+	if _, ok := intradayIndex.Market.Indices[0]["price"]; ok {
+		t.Fatal("同日早盘停滞指数不得进入 LLM 输入/evidence 值域")
+	}
+	fresh := &reportSnapshot{TradeDate: "2026-07-06", Market: &reportMarket{
+		Breadth: map[string]any{"advances": 100, "declines": 1000, "trade_date": "2026-07-06"},
+	}}
+	if got := pickDailyStrategy(fresh); got != "pullback" {
+		t.Fatalf("当日 breadth 应按比例选择 pullback，got %q", got)
+	}
+}
+
+func TestSelectReportWatchItemsRejectsStaleQuotes(t *testing.T) {
+	groups := []WatchlistGroupView{{Items: []WatchlistItemView{
+		{WatchlistItem: model.WatchlistItem{Symbol: "600001", Name: "旧行情"}, QuoteOK: true, ChangePct: 9.9, FreshnessStatus: freshStatusStale},
+		{WatchlistItem: model.WatchlistItem{Symbol: "600002", Name: "新行情"}, QuoteOK: true, ChangePct: -3.2, FreshnessStatus: freshStatusFresh},
+		{WatchlistItem: model.WatchlistItem{Symbol: "600003", Name: "未知"}, QuoteOK: true, ChangePct: 8.8, FreshnessStatus: freshStatusUnknown},
+	}}}
+	items := selectReportWatchItems(groups)
+	if len(items) != 1 || items[0].Symbol != "600002" {
+		t.Fatalf("日报自选异动只允许 fresh 行情，got %+v", items)
 	}
 }
 

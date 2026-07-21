@@ -6,6 +6,29 @@ export interface ApiEnvelope<T> {
   success: boolean
   message: string
   data: T
+  code?: string
+}
+
+export class ApiRequestError extends Error {
+  readonly code?: string
+  readonly status?: number
+
+  constructor(message: string, code?: string, status?: number) {
+    super(message)
+    this.name = 'ApiRequestError'
+    this.code = code || undefined
+    this.status = status
+  }
+}
+
+export function getApiErrorCode(error: unknown): string | undefined {
+  if (error instanceof ApiRequestError) return error.code
+  if (error && typeof error === 'object') {
+    const value = error as { code?: unknown; refusalCode?: unknown }
+    if (typeof value.refusalCode === 'string' && value.refusalCode) return value.refusalCode
+    if (typeof value.code === 'string' && value.code) return value.code
+  }
+  return undefined
 }
 
 const http: AxiosInstance = axios.create({
@@ -98,20 +121,21 @@ export async function request<T>(config: Parameters<AxiosInstance['request']>[0]
   } catch (e) {
     if (axios.isAxiosError(e)) {
       if (e.code === 'ECONNABORTED') {
-        throw new Error('请求超时：任务可能仍在后台执行，请稍后刷新查看结果')
+        throw new ApiRequestError('请求超时：任务可能仍在后台执行，请稍后刷新查看结果', 'request_timeout')
       }
       // 后端统一包络在 4xx/5xx 时仍带 message；优先透传真实原因（如 LLM 回退被关、
       // 配额不足等），否则保留原始 axios 错误供上层判断 status/code。
-      const backendMsg = (e.response?.data as ApiEnvelope<unknown> | undefined)?.message
+      const backend = e.response?.data as ApiEnvelope<unknown> | undefined
+      const backendMsg = backend?.message
       if (backendMsg) {
-        throw new Error(backendMsg)
+        throw new ApiRequestError(backendMsg, backend?.code, e.response?.status)
       }
     }
     throw e
   }
   const body = resp.data
   if (!body || body.success !== true) {
-    throw new Error(body?.message || '请求失败')
+    throw new ApiRequestError(body?.message || '请求失败', body?.code, resp.status)
   }
   return body.data
 }

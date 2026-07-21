@@ -79,8 +79,9 @@ func (u responsesUsage) toChatUsage() chatUsage {
 }
 
 type responsesOutputContent struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type    string `json:"type"`
+	Text    string `json:"text"`
+	Refusal string `json:"refusal"`
 }
 
 type responsesOutputItem struct {
@@ -117,6 +118,22 @@ func extractResponsesText(output []responsesOutputItem) string {
 		}
 	}
 	return sb.String()
+}
+
+// extractResponsesRefusal 提取标准 Responses 结构化拒答内容。bool 表示是否出现
+// type=refusal；即使上游漏了文案也不能把该形态误报为空响应或当成功。
+func extractResponsesRefusal(output []responsesOutputItem) (string, bool) {
+	for _, out := range output {
+		if out.Type != "message" || (out.Role != "" && out.Role != "assistant") {
+			continue
+		}
+		for _, c := range out.Content {
+			if c.Type == "refusal" {
+				return strings.TrimSpace(c.Refusal), true
+			}
+		}
+	}
+	return "", false
 }
 
 // responsesCompletion 非流式补全（与 chatCompletion 同语义同返回）。JSONMode 不被支持时
@@ -186,13 +203,17 @@ func doResponses(ctx context.Context, p chatParams, jsonMode bool) (*chatResult,
 		return nil, 0, nil, latency, fmt.Errorf("请求失败: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	contractEnabled := p.accuracyContractEnabled()
+	raw, readErr := readLLMResponseBody(resp.Body, contractEnabled)
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, resp.StatusCode, raw, latency, nil
 	}
+	if readErr != nil {
+		return nil, resp.StatusCode, raw, latency, readErr
+	}
 
-	res, perr := parseResponsesBody(raw, resp.StatusCode, endpoint)
+	res, perr := parseResponsesBody(raw, resp.StatusCode, endpoint, contractEnabled)
 	if perr != nil {
 		return nil, resp.StatusCode, raw, latency, perr
 	}
@@ -200,7 +221,7 @@ func doResponses(ctx context.Context, p chatParams, jsonMode bool) (*chatResult,
 }
 
 // parseResponsesBody 解析 /responses 的 200 响应体（非流式整包形态）。
-func parseResponsesBody(raw []byte, status int, endpoint string) (*chatResult, error) {
+func parseResponsesBody(raw []byte, status int, endpoint string, contractEnabled bool) (*chatResult, error) {
 	var parsed responsesResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		if looksLikeHTML(raw) {
@@ -209,9 +230,22 @@ func parseResponsesBody(raw []byte, status int, endpoint string) (*chatResult, e
 		}
 		return nil, fmt.Errorf("解析 LLM 响应失败: %w（响应开头: %s）", err, bodySnippet(raw))
 	}
-	// 200 但响应体带 error 对象（部分网关形态）：按错误处理。
-	if msg := errorMessageFromRaw(parsed.Error); msg != "" {
+	// 200 但响应体带 error 对象（部分网关形态）：按错误处理。error 非 null 即失败，
+	// 不能只在带 message 时拒绝；原始 code 还用于 content_filter 机读分类。
+	if contractEnabled {
+		if uerr := upstreamLLMError(parsed.Error); uerr != nil {
+			return nil, uerr
+		}
+	} else if msg := errorMessageFromRaw(parsed.Error); msg != "" {
+		// flag 关闭时保留旧路径：只拒绝带 message 的 error；code-only error 与
+		// output 并存的非标准网关形态继续按旧逻辑读取 output。
 		return nil, fmt.Errorf("LLM 返回错误：%s", msg)
+	}
+	if refusal, ok := extractResponsesRefusal(parsed.Output); contractEnabled && ok {
+		if refusal == "" {
+			refusal = "上游未提供拒答原因"
+		}
+		return nil, refusalErr(RefusalLLMContentFiltered, "模型拒绝生成该内容："+refusal)
 	}
 	content := extractResponsesText(parsed.Output)
 	incompleteReason := ""
@@ -220,7 +254,7 @@ func parseResponsesBody(raw []byte, status int, endpoint string) (*chatResult, e
 	}
 	// 完整性门禁（契约开启时）：仅 status=completed 算成功，incomplete/failed/空一律拒收
 	//（incomplete 带部分内容也是半截，responses 是显式端点选择、标准实现必回 status）。
-	if rerr := responsesStatusReject(parsed.Status, incompleteReason); rerr != nil {
+	if rerr := responsesStatusReject(contractEnabled, parsed.Status, incompleteReason); rerr != nil {
 		return nil, rerr
 	}
 	if parsed.Status == "incomplete" && strings.TrimSpace(content) == "" {
@@ -249,6 +283,23 @@ func errorMessageFromRaw(rawErr json.RawMessage) string {
 		return es
 	}
 	return ""
+}
+
+// upstreamLLMError 把 HTTP 200/SSE 中的非 null error 对象转成错误。raw 中的
+// content_filter 不能在只提取 message 后丢失，否则中央分类会误报 llm_call_failed。
+func upstreamLLMError(rawErr json.RawMessage) error {
+	rawText := strings.TrimSpace(string(rawErr))
+	if rawText == "" || rawText == "null" {
+		return nil
+	}
+	msg := errorMessageFromRaw(rawErr)
+	if msg == "" {
+		msg = rawText
+	}
+	if strings.Contains(strings.ToLower(rawText), "content_filter") {
+		return refusalErr(RefusalLLMContentFiltered, "内容被上游安全策略拦截（content_filter）："+msg)
+	}
+	return refusalErr(RefusalLLMCallFailed, "LLM 返回错误："+msg)
 }
 
 // responsesCompletionStream 流式补全：SSE data 行按事件 type 分派——
@@ -318,22 +369,28 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	br := bufio.NewReader(resp.Body)
 	if !isSSEResponse(resp, br) {
 		// 上游忽略 stream 参数直接返回整包 JSON：按非流式解析。
-		raw, _ := io.ReadAll(io.LimitReader(br, 1<<20))
-		res, perr := parseResponsesBody(raw, resp.StatusCode, endpoint)
+		contractEnabled := p.accuracyContractEnabled()
+		raw, readErr := readLLMResponseBody(br, contractEnabled)
+		if readErr != nil {
+			return nil, readErr
+		}
+		res, perr := parseResponsesBody(raw, resp.StatusCode, endpoint, contractEnabled)
 		if perr != nil {
 			return nil, perr
 		}
-		return finishStreamResult(p, res.Content, res.Usage, start, onDelta)
+		return finishStreamResult(p, res.Content, res.Usage, res.FinishReason, start, onDelta)
 	}
 
 	var sb strings.Builder
 	var usage chatUsage
 	var firstChunkMs int64
-	doneStatus := ""       // 完成事件携带的状态：completed / incomplete；空=仅 [DONE] 收尾
+	doneStatus := ""       // 终态事件 response 对象实际携带的 status；不得由事件名推断
+	terminalEvent := ""    // response.completed/done/incomplete 或传输层 [DONE]
 	incompleteReason := "" // incomplete 事件的截断原因（如 max_output_tokens）
 	sc := bufio.NewScanner(br)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	done := false
+	contractEnabled := p.accuracyContractEnabled()
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, ":") || strings.HasPrefix(line, "event:") {
@@ -350,16 +407,35 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 		}
 		data = strings.TrimSpace(data)
 		if data == "[DONE]" {
+			terminalEvent = "[DONE]"
 			done = true
 			break
 		}
 		var ev struct {
 			Type     string             `json:"type"`
 			Delta    string             `json:"delta"`
+			Code     string             `json:"code"`
+			Message  string             `json:"message"`
+			Refusal  string             `json:"refusal"`
 			Response *responsesResponse `json:"response"`
+			Error    json.RawMessage    `json:"error"`
 		}
-		if json.Unmarshal([]byte(data), &ev) != nil {
-			continue // 单个坏事件容错跳过
+		if jerr := json.Unmarshal([]byte(data), &ev); jerr != nil {
+			if rerr := streamProtocolReject(contractEnabled, "Responses SSE JSON 解析失败"); rerr != nil {
+				return nil, rerr
+			}
+			continue // 关闭契约时保留旧兼容路径
+		}
+		if contractEnabled {
+			if uerr := upstreamLLMError(ev.Error); uerr != nil {
+				return nil, uerr
+			}
+		}
+		if strings.TrimSpace(ev.Type) == "" {
+			if rerr := streamProtocolReject(contractEnabled, "Responses SSE 事件缺少 type"); rerr != nil {
+				return nil, rerr
+			}
+			continue
 		}
 		switch ev.Type {
 		case "response.output_text.delta":
@@ -369,15 +445,61 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 					onDelta(ev.Delta)
 				}
 			}
+		case "response.refusal.delta", "response.refusal.done":
+			if contractEnabled {
+				msg := strings.TrimSpace(ev.Delta)
+				if msg == "" {
+					msg = strings.TrimSpace(ev.Refusal)
+				}
+				if msg == "" {
+					msg = "上游未提供拒答原因"
+				}
+				return nil, refusalErr(RefusalLLMContentFiltered, "模型拒绝生成该内容："+msg)
+			}
 		case "response.completed", "response.done":
-			doneStatus = "completed"
-			if ev.Response != nil && ev.Response.Usage != nil {
-				usage = ev.Response.Usage.toChatUsage()
+			terminalEvent = ev.Type
+			if ev.Response != nil {
+				if contractEnabled {
+					if uerr := upstreamLLMError(ev.Response.Error); uerr != nil {
+						return nil, uerr
+					}
+				}
+				if ev.Response.IncompleteDetails != nil {
+					if rerr := responsesStatusReject(contractEnabled, "incomplete", ev.Response.IncompleteDetails.Reason); rerr != nil {
+						return nil, rerr
+					}
+				}
+				if refusal, ok := extractResponsesRefusal(ev.Response.Output); contractEnabled && ok {
+					if refusal == "" {
+						refusal = "上游未提供拒答原因"
+					}
+					return nil, refusalErr(RefusalLLMContentFiltered, "模型拒绝生成该内容："+refusal)
+				}
+				doneStatus = ev.Response.Status
+				if ev.Response.Usage != nil {
+					usage = ev.Response.Usage.toChatUsage()
+				}
+			}
+			if !contractEnabled {
+				// 兼容旧路径：历史实现仅凭事件名即视为 completed。
+				doneStatus = "completed"
 			}
 			done = true
 		case "response.incomplete":
-			doneStatus = "incomplete"
+			terminalEvent = ev.Type
 			if ev.Response != nil {
+				if contractEnabled {
+					if uerr := upstreamLLMError(ev.Response.Error); uerr != nil {
+						return nil, uerr
+					}
+					if refusal, ok := extractResponsesRefusal(ev.Response.Output); ok {
+						if refusal == "" {
+							refusal = "上游未提供拒答原因"
+						}
+						return nil, refusalErr(RefusalLLMContentFiltered, "模型拒绝生成该内容："+refusal)
+					}
+				}
+				doneStatus = ev.Response.Status
 				if ev.Response.Usage != nil {
 					usage = ev.Response.Usage.toChatUsage()
 				}
@@ -385,11 +507,22 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 					incompleteReason = ev.Response.IncompleteDetails.Reason
 				}
 			}
+			if !contractEnabled && doneStatus == "" {
+				doneStatus = "incomplete"
+			}
 			done = true
 		case "response.failed", "response.error", "error":
-			msg := ""
+			if uerr := upstreamLLMError(ev.Error); uerr != nil {
+				return nil, uerr
+			}
+			if strings.Contains(strings.ToLower(ev.Code), "content_filter") {
+				return nil, refusalErr(RefusalLLMContentFiltered, "内容被上游安全策略拦截（content_filter）："+ev.Message)
+			}
+			msg := strings.TrimSpace(ev.Message)
 			if ev.Response != nil {
-				msg = errorMessageFromRaw(ev.Response.Error)
+				if uerr := upstreamLLMError(ev.Response.Error); uerr != nil {
+					return nil, uerr
+				}
 			}
 			if msg == "" {
 				msg = extractErr([]byte(data))
@@ -405,15 +538,14 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	}
 	if !done {
 		// 正常 EOF 但从未收到完成事件/[DONE]：契约开启时拒收（eof_without_marker）。
-		if rerr := streamEOFReject(); rerr != nil {
+		if rerr := streamEOFReject(contractEnabled); rerr != nil {
 			return nil, rerr
 		}
 	}
-	if doneStatus == "incomplete" {
-		// incomplete 完成事件=输出被截断（多为 max_output_tokens）：契约开启时拒收半截。
-		if rerr := responsesStatusReject(doneStatus, incompleteReason); rerr != nil {
-			return nil, rerr
-		}
+	// Responses 的 [DONE] 只是传输层哨兵，不能证明模型完成。契约开启时必须同时看到
+	// completed/done 终态事件和其 response.status=completed；空状态、冲突状态均拒收。
+	if rerr := responsesStreamStatusReject(contractEnabled, terminalEvent, doneStatus, incompleteReason); rerr != nil {
+		return nil, rerr
 	}
 	content := sb.String()
 	if strings.TrimSpace(content) == "" {

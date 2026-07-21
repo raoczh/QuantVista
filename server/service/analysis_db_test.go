@@ -101,7 +101,7 @@ func TestConsumeQuota(t *testing.T) {
 	if q.ActionUsed != 0 || q.TokenUsed != 0 || q.RequestCount != 0 {
 		t.Fatalf("新配额应为 0: %+v", q)
 	}
-	consumeQuota(7, 120, true)  // 用户手动动作
+	consumeQuota(7, 120, true) // 用户手动动作
 	consumeQuota(7, 30, false) // 后台任务：只记 token 不扣次
 	q2, _ := getUserQuota(7)
 	if q2.TokenUsed != 150 || q2.RequestCount != 2 {
@@ -118,5 +118,28 @@ func TestConsumeQuota(t *testing.T) {
 	common.DB.Model(&model.UserQuota{}).Where("user_id = ?", 7).Update("action_limit", 1)
 	if err := checkQuota(7); err == nil {
 		t.Fatalf("次数用尽应熔断")
+	} else if RefusalCodeOf(err) != RefusalQuotaExhausted {
+		t.Fatalf("次数用尽应挂机读码 %s, got %q / %v", RefusalQuotaExhausted, RefusalCodeOf(err), err)
+	}
+}
+
+func TestCheckQuotaDatabaseFailureCode(t *testing.T) {
+	oldDB := common.DB
+	db, err := gorm.Open(sqlite.Open("file:quota_failure?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	common.DB = db
+	t.Cleanup(func() { common.DB = oldDB })
+
+	if got := RefusalCodeOf(checkQuota(99)); got != RefusalQuotaUnavailable {
+		t.Fatalf("配额数据库读取失败不得误报 quota_exhausted，got %q", got)
 	}
 }

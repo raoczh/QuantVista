@@ -387,7 +387,16 @@ func (s *LLMService) getOwned(userID, id int64) (*model.LLMConfig, error) {
 // id>0 取指定配置（限本人）；id<=0 取默认配置（无默认则取最早一条）。
 // 本人一条配置都没有时，回退到首个启用管理员的默认配置——管理员代付 key，
 // 次数/token 配额仍按发起用户记（consumeQuota 在各调用方按发起 userID）。
+// 失败统一挂机读码 llm_unavailable（文案原样保留），供 API 包络 code 字段透出。
 func (s *LLMService) ResolveForUse(userID, id int64) (*model.LLMConfig, string, error) {
+	cfg, key, err := s.resolveForUseInner(userID, id)
+	if err != nil {
+		return nil, "", asLLMUnavailable(err)
+	}
+	return cfg, key, nil
+}
+
+func (s *LLMService) resolveForUseInner(userID, id int64) (*model.LLMConfig, string, error) {
 	var cfg model.LLMConfig
 	if id > 0 {
 		c, err := s.getOwned(userID, id)
@@ -413,6 +422,17 @@ func (s *LLMService) ResolveForUse(userID, id int64) (*model.LLMConfig, string, 
 		return nil, "", errors.New("该 LLM 配置缺少 API Key，请先补全")
 	}
 	return &cfg, key, nil
+}
+
+// asLLMUnavailable 将配置解析失败挂成机读拒答码；已是 RefusalError 则原样返回。
+func asLLMUnavailable(err error) error {
+	if err == nil {
+		return nil
+	}
+	if RefusalCodeOf(err) != "" {
+		return err
+	}
+	return refusalErr(RefusalLLMUnavailable, err.Error())
 }
 
 // adminFallback 无自有配置时的用户回退入口：受管理后台"LLM 回退"开关控制，

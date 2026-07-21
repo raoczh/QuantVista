@@ -51,6 +51,10 @@ type qaStreamLine struct {
 	Data        *service.QaConversationView `json:"data,omitempty"`
 }
 
+func qaStreamErrorLine(err error) qaStreamLine {
+	return qaStreamLine{Status: "error", Message: err.Error(), RefusalCode: service.RefusalCodeOf(err)}
+}
+
 // AskStream POST /api/qa/ask-stream —— 流式问答：application/x-ndjson 逐行推
 // {module,code,chunk,status}；X-Accel-Buffering:no 防反代整段缓冲。流结束后推
 // status=done 行携带完整会话视图（含后置核验 CheckJSON），前端据此替换本地状态。
@@ -84,7 +88,7 @@ func (qc *QaController) AskStream(c *gin.Context) {
 	if err != nil {
 		// 首字节前的失败（配额/配置/快照）与流中断都走同一 error 行；
 		// 此时可能已写过 200 头，无法降级为标准包络，前端按行协议处理。
-		writeLine(qaStreamLine{Status: "error", Message: err.Error(), RefusalCode: service.RefusalCodeOf(err)})
+		writeLine(qaStreamErrorLine(err))
 		return
 	}
 	writeLine(qaStreamLine{Status: "done", Data: v})

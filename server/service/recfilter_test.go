@@ -356,7 +356,9 @@ func TestStrategyByKeyStrict(t *testing.T) {
 // TestPickDailyStrategy 日报按涨跌家数选策略：强势动量/弱势回踩/中性活跃。
 func TestPickDailyStrategy(t *testing.T) {
 	mk := func(adv, dec int) *reportSnapshot {
-		return &reportSnapshot{Market: &reportMarket{Breadth: map[string]any{"advances": adv, "declines": dec}}}
+		return &reportSnapshot{TradeDate: "2026-07-17", Market: &reportMarket{Breadth: map[string]any{
+			"advances": adv, "declines": dec, "trade_date": "2026-07-17",
+		}}}
 	}
 	if got := pickDailyStrategy(mk(3000, 1500)); got != "momentum" {
 		t.Fatalf("强势应选 momentum，得到 %s", got)
@@ -384,7 +386,7 @@ func TestApplyReviews(t *testing.T) {
 		{Symbol: "600000", Verdict: "reject", Comment: "证据与数据不符", Confidence: 30},
 		{Symbol: "000001", Verdict: "pass", Confidence: 0},
 		{Symbol: "600036", Verdict: "reject", Comment: "风险被低估", Confidence: 0}, // 复核未给值也必须压低
-		{Symbol: "601318", Verdict: "reject", Comment: "追高", Confidence: 20},    // 复核给的值已 ≤25
+		{Symbol: "601318", Verdict: "reject", Comment: "追高", Confidence: 20},   // 复核给的值已 ≤25
 	})
 	if out[0].Action != model.RecActionWatch {
 		t.Fatalf("reject 应降级为 watch，得到 %s", out[0].Action)

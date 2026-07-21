@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"quantvista/common"
 	"quantvista/model"
 )
 
@@ -47,7 +48,7 @@ func TestSelectReportEvents(t *testing.T) {
 		mk("收评：三大指数集体收涨，两市成交额1.2万亿", 1, ""), // 黑名单降噪
 		mk("央行宣布降准0.5个百分点，释放长期流动性约1万亿元", 1, `["银行"]`),
 		mk("央行降准0.5个百分点释放约1万亿元流动性", 2, `["银行"]`), // 同主线，应被合并
-		mk("某公司中标日常项目", 3, ""), // 低分被过滤
+		mk("某公司中标日常项目", 3, ""),                   // 低分被过滤
 		mk("证监会就减持新规公开征求意见", 1, ""),
 	}
 	events := selectReportEvents(rows)
@@ -107,5 +108,23 @@ func TestSelectReportEventsTopN(t *testing.T) {
 	events := selectReportEvents(rows)
 	if len(events) != eventTopN {
 		t.Errorf("14 条独立高分事件应截断到 Top %d, got %d", eventTopN, len(events))
+	}
+}
+
+func TestBuildTodayEventsExcludesFutureRecords(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Where("1 = 1").Delete(&model.News{})
+	t.Cleanup(func() { common.DB.Where("1 = 1").Delete(&model.News{}) })
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.Local)
+	rows := []model.News{
+		{Title: "央行宣布降准释放流动性", Source: "cls", Category: "telegraph", SourcePriority: 1, PublishTime: now.Add(-time.Hour), ContentHash: "event-past"},
+		{Title: "国务院宣布降息支持市场", Source: "cls", Category: "telegraph", SourcePriority: 1, PublishTime: now.Add(time.Hour), ContentHash: "event-future"},
+	}
+	if err := common.DB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	events := buildTodayEventsAt("2026-07-21", now)
+	if len(events) != 1 || events[0].Title != rows[0].Title {
+		t.Fatalf("日报事件窗口不得包含当前时刻之后的记录: %+v", events)
 	}
 }

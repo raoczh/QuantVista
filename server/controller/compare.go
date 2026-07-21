@@ -27,7 +27,7 @@ func (cc *CompareController) Compare(c *gin.Context) {
 	allowPrivate := currentRole(c) == model.RoleAdmin
 	res, err := cc.svc.Compare(c.Request.Context(), currentUserID(c), allowPrivate, req)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiError(c, err)
 		return
 	}
 	common.ApiSuccess(c, res)

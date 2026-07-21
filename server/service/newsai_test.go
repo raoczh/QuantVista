@@ -81,20 +81,27 @@ func TestNormalizeEnhance(t *testing.T) {
 // TestStockDailySentiment 聚合情绪分：来源权重加权、(symbol,date) 幂等一天一次。
 func TestStockDailySentiment(t *testing.T) {
 	setupTestDB(t)
-	now := time.Now()
+	common.DB.Where("symbol IN ?", []string{"600001", "600999"}).Delete(&model.StockSentiment{})
+	common.DB.Where("related_symbols LIKE ?", "%\"600001\"%").Delete(&model.News{})
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.Local)
 	date := now.Format("2006-01-02")
-	mk := func(id int64, score float64, prio int, senti string) {
-		common.DB.Create(&model.News{
-			ID: id, Title: "t", RelatedSymbols: `["600001"]`, Source: "cls",
-			PublishTime: now, CollectTime: now, ContentHash: string(rune('a'+id)) + date,
+	seq := 0
+	mk := func(score float64, prio int, senti string) {
+		seq++
+		row := &model.News{
+			Title: "t", RelatedSymbols: `["600001"]`, Source: "cls",
+			PublishTime: now.Add(-time.Hour), CollectTime: now, ContentHash: date + string(rune('a'+seq)),
 			SourcePriority: prio, Sentiment: senti, SentimentScore: score,
-		})
+		}
+		if err := common.DB.Create(row).Error; err != nil {
+			t.Fatalf("插入情绪测试新闻失败: %v", err)
+		}
 	}
-	mk(1, 0.9, 1, "positive") // 权重 3
-	mk(2, -0.3, 3, "negative") // 权重 1
-	mk(3, 0.5, 2, "")          // 未增强，不参与
+	mk(0.9, 1, "positive")  // 权重 3
+	mk(-0.3, 3, "negative") // 权重 1
+	mk(0.5, 2, "")          // 未增强，不参与
 
-	score, cnt, ok := stockDailySentiment("600001", date)
+	score, cnt, ok := stockDailySentimentAt("600001", date, now)
 	if !ok || cnt != 2 {
 		t.Fatalf("ok=%v cnt=%d, want true 2", ok, cnt)
 	}
@@ -104,15 +111,35 @@ func TestStockDailySentiment(t *testing.T) {
 	}
 
 	// 幂等：再插新闻不改变已落库的当日聚合分（一天只算一次）。
-	mk(4, -1, 1, "negative")
-	score2, cnt2, _ := stockDailySentiment("600001", date)
+	mk(-1, 1, "negative")
+	score2, cnt2, _ := stockDailySentimentAt("600001", date, now)
 	if score2 != score || cnt2 != cnt {
 		t.Errorf("(symbol,date) 应幂等复用缓存: got (%v,%d) want (%v,%d)", score2, cnt2, score, cnt)
 	}
 
 	// 无新闻标的：落 0 分 0 条、ok=false。
-	if _, cnt3, ok3 := stockDailySentiment("600999", date); ok3 || cnt3 != 0 {
+	if _, cnt3, ok3 := stockDailySentimentAt("600999", date, now); ok3 || cnt3 != 0 {
 		t.Errorf("无新闻应 (0,false), got cnt=%d ok=%v", cnt3, ok3)
+	}
+}
+
+func TestComputeDailySentimentExcludesFutureNews(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Where("1 = 1").Delete(&model.News{})
+	t.Cleanup(func() { common.DB.Where("1 = 1").Delete(&model.News{}) })
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.Local)
+	rows := []model.News{
+		{Title: "已发布利好", RelatedSymbols: `["600777"]`, Source: "cls", PublishTime: now.Add(-time.Hour),
+			ContentHash: "sentiment-past", SourcePriority: 1, Sentiment: "positive", SentimentScore: 0.8},
+		{Title: "未来利空", RelatedSymbols: `["600777"]`, Source: "cls", PublishTime: now.Add(time.Hour),
+			ContentHash: "sentiment-future", SourcePriority: 1, Sentiment: "negative", SentimentScore: -1},
+	}
+	if err := common.DB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	score, count, detail := computeDailySentimentAt("600777", "2026-07-21", now)
+	if count != 1 || score != 0.8 || strings.Contains(detail, "未来利空") {
+		t.Fatalf("当日情绪不得读取当前时刻之后的新闻: score=%v count=%d detail=%s", score, count, detail)
 	}
 }
 

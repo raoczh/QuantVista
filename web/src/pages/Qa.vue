@@ -27,6 +27,7 @@ import {
 } from '@/api/qa'
 import type { EvidenceCheck, RiskFlag } from '@/api/trust'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
+import { getApiErrorCode } from '@/api/client'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
 import { renderMarkdown } from '@/lib/markdown'
@@ -151,9 +152,10 @@ async function send(allowStale?: boolean | Event) {
     await loadHistory()
   } catch (e) {
     const msg = (e as Error).message || ''
+    const refusalCode = getApiErrorCode(e)
     // 行情时效 fail-closed：后端拒绝按最新行情首答时给用户显式降级选择（历史数据解释
     // 模式），不悄悄放行——确认后带 allow_stale 重试（与个股分析同款交互）。
-    if (!staleOk && msg.includes('历史数据解释')) {
+    if (!staleOk && (refusalCode === 'stale_quote' || (!refusalCode && msg.includes('历史数据解释')))) {
       dialog.warning({
         title: '行情非最新，无法按最新行情回答',
         content: msg + '。是否按「截至行情时刻的历史数据解释」模式继续？该模式下回答不代表当前盘面，也不会给出当前买卖参考。',
