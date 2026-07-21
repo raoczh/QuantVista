@@ -30,7 +30,7 @@ func (ac *AnalysisController) Create(c *gin.Context) {
 	allowPrivate := currentRole(c) == model.RoleAdmin
 	v, err := ac.svc.Analyze(c.Request.Context(), currentUserID(c), allowPrivate, req)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiError(c, err) // 机读拒答码（stale_quote 等）随包络 code 字段透出
 		return
 	}
 	common.ApiSuccess(c, v)

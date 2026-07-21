@@ -31,7 +31,7 @@ func (qc *QaController) Ask(c *gin.Context) {
 	allowPrivate := currentRole(c) == model.RoleAdmin
 	v, err := qc.svc.Ask(c.Request.Context(), currentUserID(c), allowPrivate, req)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiError(c, err) // 机读拒答码（stale_quote 等）随包络 code 字段透出
 		return
 	}
 	common.ApiSuccess(c, v)
@@ -40,12 +40,15 @@ func (qc *QaController) Ask(c *gin.Context) {
 // qaStreamLine 流式问答 NDJSON 协议行（S1）。code 字段现在就进协议：单标的留空，
 // 为横向对比/批量场景预留（届时按标的代码区分行归属）。
 type qaStreamLine struct {
-	Module  string                      `json:"module"`
-	Code    string                      `json:"code"`
-	Status  string                      `json:"status"` // streaming / done / error
-	Chunk   string                      `json:"chunk,omitempty"`
-	Message string                      `json:"message,omitempty"`
-	Data    *service.QaConversationView `json:"data,omitempty"`
+	Module string `json:"module"`
+	Code   string `json:"code"`
+	Status string `json:"status"` // streaming / done / error
+	Chunk  string `json:"chunk,omitempty"`
+	// RefusalCode 机读拒答码（P0-7）：error 行上透出（如 stale_quote），前端按它分支
+	//（流式已写 200 头无法用标准包络的 code 字段，走行协议）。
+	RefusalCode string                      `json:"refusal_code,omitempty"`
+	Message     string                      `json:"message,omitempty"`
+	Data        *service.QaConversationView `json:"data,omitempty"`
 }
 
 // AskStream POST /api/qa/ask-stream —— 流式问答：application/x-ndjson 逐行推
@@ -81,7 +84,7 @@ func (qc *QaController) AskStream(c *gin.Context) {
 	if err != nil {
 		// 首字节前的失败（配额/配置/快照）与流中断都走同一 error 行；
 		// 此时可能已写过 200 头，无法降级为标准包络，前端按行协议处理。
-		writeLine(qaStreamLine{Status: "error", Message: err.Error()})
+		writeLine(qaStreamLine{Status: "error", Message: err.Error(), RefusalCode: service.RefusalCodeOf(err)})
 		return
 	}
 	writeLine(qaStreamLine{Status: "done", Data: v})

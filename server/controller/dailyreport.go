@@ -62,7 +62,7 @@ func (dc *DailyReportController) Get(c *gin.Context) {
 func (dc *DailyReportController) Generate(c *gin.Context) {
 	v, err := dc.svc.GenerateFor(c.Request.Context(), currentUserID(c), true)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiError(c, err) // 机读拒答码（market_closed/report_window_not_open）随包络 code 透出
 		return
 	}
 	common.ApiSuccess(c, v)
@@ -75,7 +75,7 @@ func (dc *DailyReportController) Delete(c *gin.Context) {
 		return
 	}
 	if err := dc.svc.Delete(currentUserID(c), id); err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiError(c, err) // report_processing 拒删码透出
 		return
 	}
 	common.ApiSuccess(c, gin.H{"ok": true})

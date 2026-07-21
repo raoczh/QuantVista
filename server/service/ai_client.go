@@ -91,7 +91,10 @@ type chatParams struct {
 	Messages     []chatMessage
 	JSONMode     bool // 请求 response_format=json_object（不支持则由调用逻辑 fallback）
 	AllowPrivate bool // 管理员可放行内网自建模型
-	Meta         chatMeta
+	// Repair 本次请求是否为 repair 轮（首轮之后的结构修复请求）：契约开启时温度固定 0
+	//（llm_contract.go）。由各模块 repair 循环在 attempt>0 时置 true；次数上限仍归模块管。
+	Repair bool
+	Meta   chatMeta
 }
 
 // isResponsesEndpoint 该次调用是否走 /v1/responses（空值按 chat/completions）。
@@ -115,6 +118,10 @@ type chatResult struct {
 	// ≈LatencyMs 说明上游忽略 stream 整包返回（假流式），是区分
 	// 「模型生成慢」与「网关不透传流」的关键观测。
 	FirstChunkMs int64
+	// FinishReason 上游报告的完成状态原始值：chat=finish_reason（stop/length/…），
+	// responses=status（completed/incomplete/…）。完整性门禁（llm_contract.go）据此拒收
+	// 截断/拦截响应；空串=上游未报告。
+	FinishReason string
 }
 
 // capModuleTokens 模块级输出预算：上游普遍存在 60s 级整包超时，单次生成时长
@@ -135,6 +142,7 @@ func capModuleTokens(userMax, moduleCap int) int {
 // 若服务端因不支持该字段返回 4xx，则去掉 response_format 重试一次（fallback，靠 prompt 约束 JSON）。
 // EndpointType=responses 时分流到 /v1/responses 适配（ai_client_responses.go），返回语义一致。
 func chatCompletion(ctx context.Context, p chatParams) (res *chatResult, err error) {
+	p = applyAccuracyContract(p) // ac1 契约注入+温度钳制在审计之前——RequestBody 记录上游真实收到的形态
 	started := time.Now()
 	streamed := true // 默认先走流式；回落非流式时置 false——审计必须记录实际请求形态而非入口意图
 	defer func() { writeLLMCallLog(p, streamed, res, err, time.Since(started)) }()
@@ -192,6 +200,10 @@ func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error)
 	}
 	if status != http.StatusOK {
 		return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", status, statusHint(status), extractErr(raw))
+	}
+	// 完整性门禁（契约开启时）：截断/拦截响应即使带部分内容也拒收。
+	if rerr := chatFinishReject(res.FinishReason); rerr != nil {
+		return nil, rerr
 	}
 	if strings.TrimSpace(res.Content) == "" {
 		return nil, errors.New("LLM 返回空内容")
@@ -295,14 +307,16 @@ func parseChatResponse(raw []byte, status int, endpoint string) (*chatResult, er
 		return nil, fmt.Errorf("解析 LLM 响应失败: %w（响应开头: %s）", err, bodySnippet(raw))
 	}
 	content := ""
+	finish := ""
 	if len(parsed.Choices) > 0 {
 		content = parsed.Choices[0].Message.Content
+		finish = parsed.Choices[0].FinishReason
 		// 上游安全策略拦截（finish_reason=content_filter）且无内容：给明确文案而非笼统"空内容"。
-		if content == "" && parsed.Choices[0].FinishReason == "content_filter" {
+		if content == "" && finish == "content_filter" {
 			return nil, errors.New("内容被上游安全策略拦截（finish_reason=content_filter）")
 		}
 	}
-	return &chatResult{Content: content, Usage: parsed.Usage}, nil
+	return &chatResult{Content: content, Usage: parsed.Usage, FinishReason: finish}, nil
 }
 
 // looksLikeUnsupportedJSONMode 粗略判断 4xx 是否因不支持 response_format / text.format 引起。
@@ -437,6 +451,7 @@ func estimateUsage(messages []chatMessage, content string) chatUsage {
 // 建立连接前的错误分类与非流式一致。上游忽略 stream 参数返回整包 JSON 时按非流式解析兼容。
 // EndpointType=responses 时分流到 /v1/responses 适配。
 func chatCompletionStream(ctx context.Context, p chatParams, onDelta func(string)) (res *chatResult, err error) {
+	p = applyAccuracyContract(p)
 	started := time.Now()
 	defer func() { writeLLMCallLog(p, true, res, err, time.Since(started)) }()
 	return chatCompletionStreamInner(ctx, p, onDelta)
@@ -539,6 +554,10 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 		if perr != nil {
 			return nil, perr
 		}
+		// 整包回落同样过完整性门禁（截断的整包 JSON 若碰巧仍合法解析，靠 finish_reason 拦）。
+		if rerr := chatFinishReject(res.FinishReason); rerr != nil {
+			return nil, rerr
+		}
 		return finishStreamResult(p, res.Content, res.Usage, start, onDelta)
 	}
 
@@ -546,6 +565,7 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 	var sb strings.Builder
 	var usage chatUsage
 	var firstChunkMs int64
+	finishReason := "" // 最后一个非空 finish_reason（stop/length/content_filter/…）
 	sc := bufio.NewScanner(br)
 	sc.Buffer(make([]byte, 64<<10), 1<<20) // 单行上限 1MB（长 delta/大 usage 容错）
 	done := false
@@ -592,6 +612,7 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 				}
 			}
 			if c.FinishReason != nil && *c.FinishReason != "" {
+				finishReason = *c.FinishReason
 				done = true
 			}
 		}
@@ -603,6 +624,16 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 		// 流中断且未正常收尾：已有内容也判失败（半截回答不落库，让调用方决定重试）。
 		return nil, fmt.Errorf("流式响应中断: %w", err)
 	}
+	if !done {
+		// 正常 EOF 但从未收到 [DONE]/finish_reason（网关在上游超时后干净关连接的典型形态）：
+		// 契约开启时拒收（eof_without_marker），关闭时保持旧行为当成功。
+		if rerr := streamEOFReject(); rerr != nil {
+			return nil, rerr
+		}
+	}
+	if rerr := chatFinishReject(finishReason); rerr != nil {
+		return nil, rerr
+	}
 	content := sb.String()
 	if strings.TrimSpace(content) == "" {
 		return nil, errors.New("LLM 返回空内容")
@@ -610,7 +641,7 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 	if usage.TotalTokens == 0 {
 		usage = estimateUsage(p.Messages, content)
 	}
-	return &chatResult{Content: content, Usage: usage, LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs}, nil
+	return &chatResult{Content: content, Usage: usage, LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs, FinishReason: finishReason}, nil
 }
 
 // finishStreamResult 流式路径拿到整包内容（上游忽略 stream）时的统一收尾：

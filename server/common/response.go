@@ -1,6 +1,7 @@
 package common
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -17,11 +18,23 @@ func ApiSuccess(c *gin.Context, data any) {
 	})
 }
 
+// refusalCoder 机读拒答码接口（service.RefusalError 实现；接口探测避免 common→service 反向依赖）。
+type refusalCoder interface{ RefusalCode() string }
+
+// ApiError 错误包络；错误链中带机读拒答码（service.RefusalError）时附加 code 字段，
+// 前端按 code 程序化分支（如 stale_quote 弹「按历史数据解释」确认），不再解析中文文案。
 func ApiError(c *gin.Context, err error) {
-	c.JSON(http.StatusOK, gin.H{
+	h := gin.H{
 		"success": false,
 		"message": err.Error(),
-	})
+	}
+	var rc refusalCoder
+	if errors.As(err, &rc) {
+		if code := rc.RefusalCode(); code != "" {
+			h["code"] = code
+		}
+	}
+	c.JSON(http.StatusOK, h)
 }
 
 func ApiErrorMsg(c *gin.Context, msg string) {

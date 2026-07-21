@@ -120,7 +120,7 @@ func (s *DailyReportService) Delete(userID, id int64) error {
 		return errors.New("日报不存在")
 	}
 	if r.Status == model.ReportStatusProcessing && time.Since(r.UpdatedAt) < reportProcessingStale {
-		return errors.New("日报正在生成中，请等任务结束后再删除")
+		return refusalErr(RefusalReportProcessing, "日报正在生成中，请等任务结束后再删除")
 	}
 	return common.DB.Delete(&r).Error
 }
@@ -175,13 +175,13 @@ func (s *DailyReportService) assembleView(r *model.DailyReport) *DailyReportView
 func (s *DailyReportService) GenerateFor(ctx context.Context, userID int64, manual bool) (*DailyReportView, error) {
 	now := s.now()
 	if !isTradingDayToday(now) {
-		return nil, errors.New("今日休市，无日报可生成")
+		return nil, refusalErr(RefusalMarketClosed, "今日休市，无日报可生成")
 	}
 	// 收盘数据就绪门槛：正式日报承诺「当日收盘口径」（复盘/涨跌家数/资金流/明日推荐
 	// 均按收盘数据组织）。15:35（收盘增量落定，同自动窗口起点）之前手动生成会拿盘中
 	// 半截数据占用当天唯一记录，且 15:35 自动任务发现已存在便不再重建——直接拒绝。
 	if manual && now.Hour()*60+now.Minute() < reportWindowStartMin {
-		return nil, errors.New("收盘日报需在 15:35 收盘数据就绪后生成（当前为盘前/盘中时段，早盘生成会以盘中数据冒充收盘口径）")
+		return nil, refusalErr(RefusalReportWindow, "收盘日报需在 15:35 收盘数据就绪后生成（当前为盘前/盘中时段，早盘生成会以盘中数据冒充收盘口径）")
 	}
 	date := now.Format("2006-01-02")
 
@@ -732,7 +732,8 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 		Temperature: cfg.Temperature, MaxTokens: capModuleTokens(cfg.MaxTokens, reportReviewTokensCap),
 		Messages: messages, JSONMode: true, AllowPrivate: allowPrivate,
-		Meta: chatMeta{CallerUserID: userID, Module: "daily_report", ConfigID: cfg.ID, Provider: cfg.Provider},
+		Repair: true, // repair 轮：契约开启时温度固定 0
+		Meta:   chatMeta{CallerUserID: userID, Module: "daily_report", ConfigID: cfg.ID, Provider: cfg.Provider},
 	})
 	if err != nil {
 		return nil, total, err

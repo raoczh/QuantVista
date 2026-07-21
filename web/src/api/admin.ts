@@ -10,6 +10,7 @@ export interface SystemSettings {
   news_auto_llm: boolean
   llm_fallback_enabled: boolean
   llm_fallback_config_id: number
+  llm_accuracy_contract: boolean
   site_base_url: string
 }
 
@@ -23,6 +24,7 @@ export interface SystemSettingsUpdate {
   news_auto_llm?: boolean
   llm_fallback_enabled?: boolean
   llm_fallback_config_id?: number
+  llm_accuracy_contract?: boolean
   site_base_url?: string
 }
 

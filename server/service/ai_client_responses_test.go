@@ -70,9 +70,10 @@ func TestResponsesCompletion(t *testing.T) {
 	if res.Usage.PromptTokens != 11 || res.Usage.CompletionTokens != 7 || res.Usage.TotalTokens != 18 {
 		t.Fatalf("usage 应按 input/output_tokens 映射: %+v", res.Usage)
 	}
-	// 请求体映射断言。
-	if gotBody["instructions"] != "你是助手" {
-		t.Fatalf("system 应并入 instructions: %v", gotBody["instructions"])
+	// 请求体映射断言。ac1 契约（P0-1）作为首条 system 一并合入 instructions，模块 system 随后。
+	instr, _ := gotBody["instructions"].(string)
+	if !strings.HasPrefix(instr, "【系统准确性契约 "+llmAccuracyContractVersion) || !strings.Contains(instr, "你是助手") {
+		t.Fatalf("instructions 应为 ac1 契约+模块 system 合并: %v", instr)
 	}
 	if gotBody["max_output_tokens"] != float64(1234) {
 		t.Fatalf("max_tokens 应映射为 max_output_tokens: %v", gotBody["max_output_tokens"])

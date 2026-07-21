@@ -193,8 +193,9 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 	if mkt == "cn" && len(symbol) == 6 && !isCNFund(symbol) {
 		if briefs := latestNewsBriefs(symbol, 5); len(briefs) > 0 {
 			snap["news"] = map[string]any{
-				"items": briefs,
-				"note":  "该股最近相关新闻的标题与情绪标签（利好/利空/中性为程序化预判，仅供参考，不保证完整覆盖）",
+				"items":  briefs,
+				"window": "近7天",
+				"note":   "该股近 7 天内相关新闻的标题与情绪标签（利好/利空/中性为程序化预判，仅供参考，不保证完整覆盖；更早的旧闻不注入，不得凭记忆补充）",
 			}
 		} else {
 			turnover := 0.0
@@ -204,7 +205,7 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 				}
 			}
 			snap["news"] = map[string]any{
-				"note":           "暂无直接相关新闻，请按以下市场信号判断，不得臆测消息面",
+				"note":           "近 7 天内暂无直接相关新闻，请按以下市场信号判断，不得臆测消息面",
 				"market_signals": fallbackMarketSignals(q.ChangePct, bars, turnover),
 			}
 		}

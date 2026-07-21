@@ -24,6 +24,7 @@ type SystemSettingsView struct {
 	NewsAutoLLM            bool   `json:"news_auto_llm"`
 	LLMFallbackEnabled     bool   `json:"llm_fallback_enabled"`
 	LLMFallbackConfigID    int64  `json:"llm_fallback_config_id"`
+	LLMAccuracyContract    bool   `json:"llm_accuracy_contract"`
 	SiteBaseURL            string `json:"site_base_url"`
 }
 
@@ -38,6 +39,7 @@ func (s *AdminService) GetSettings() SystemSettingsView {
 		NewsAutoLLM:            setting.NewsAutoLLM(),
 		LLMFallbackEnabled:     setting.LLMFallbackEnabled(),
 		LLMFallbackConfigID:    setting.LLMFallbackConfigID(),
+		LLMAccuracyContract:    setting.LLMAccuracyContract(),
 		SiteBaseURL:            setting.SiteBaseURL(),
 	}
 }
@@ -52,6 +54,7 @@ type UpdateSettingsInput struct {
 	NewsAutoLLM            *bool   `json:"news_auto_llm"`
 	LLMFallbackEnabled     *bool   `json:"llm_fallback_enabled"`
 	LLMFallbackConfigID    *int64  `json:"llm_fallback_config_id"`
+	LLMAccuracyContract    *bool   `json:"llm_accuracy_contract"`
 	SiteBaseURL            *string `json:"site_base_url"` // 空串 = 清除（推送通知不带点击跳转）
 }
 
@@ -69,6 +72,11 @@ func (s *AdminService) UpdateSettings(in UpdateSettingsInput) (SystemSettingsVie
 	}
 	if in.NewsAutoLLM != nil {
 		if err := setting.SetNewsAutoLLM(*in.NewsAutoLLM); err != nil {
+			return SystemSettingsView{}, err
+		}
+	}
+	if in.LLMAccuracyContract != nil {
+		if err := setting.SetLLMAccuracyContract(*in.LLMAccuracyContract); err != nil {
 			return SystemSettingsView{}, err
 		}
 	}

@@ -81,6 +81,9 @@ type CompareResult struct {
 	AIComment      string         `json:"ai_comment"`
 	AICommentCheck *evidenceCheck `json:"ai_comment_check,omitempty"` // 服务端回填：AI 点评引用数字与各行指标的核验
 	Note           string         `json:"note"`
+	// AIRefusalCode AI 点评未生成时的机读拒答码（P0-7：insufficient_fresh_quotes /
+	// quota_exhausted / llm_unavailable，空=已生成或未请求 AI）；Note 保持人类可读说明。
+	AIRefusalCode string `json:"ai_refusal_code,omitempty"`
 	// AI 点评实际使用的 LLM（对比不落库，随响应回传供前端展示；无点评时为零值）。
 	AIConfigID int64  `json:"ai_llm_config_id,omitempty"`
 	AIProvider string `json:"ai_provider,omitempty"`
@@ -132,8 +135,9 @@ func (s *CompareService) Compare(ctx context.Context, userID int64, allowPrivate
 
 	// 可选 AI 一句话点评。
 	if req.WithAI {
-		comment, note, usedCfg := s.aiComment(ctx, userID, allowPrivate, req.LLMConfigID, rows)
+		comment, note, refusalCode, usedCfg := s.aiComment(ctx, userID, allowPrivate, req.LLMConfigID, rows)
 		res.AIComment = comment
+		res.AIRefusalCode = refusalCode
 		if comment != "" {
 			// 证据核验：点评引用的数字与全部对比行的指标值域比对（点评无 K 线明细，全量收集即可）。
 			res.AICommentCheck = verifyEvidenceLabeled(
@@ -250,20 +254,20 @@ func changeOverN(closes []float64, n int) float64 {
 	return round2((closes[len(closes)-1] - prev) / prev * 100)
 }
 
-// aiComment 生成一段横向对比点评。返回（点评, 说明, 实际使用的 LLM 配置）；
-// 失败或配额不足时点评为空、说明解释原因、配置为 nil。
-func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPrivate bool, llmConfigID int64, rows []CompareRow) (string, string, *model.LLMConfig) {
+// aiComment 生成一段横向对比点评。返回（点评, 说明, 机读拒答码, 实际使用的 LLM 配置）；
+// 失败或配额不足时点评为空、说明解释原因、code 供前端程序化分支、配置为 nil。
+func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPrivate bool, llmConfigID int64, rows []CompareRow) (string, string, string, *model.LLMConfig) {
 	cfg, apiKey, err := s.llm.ResolveForUse(userID, llmConfigID)
 	if err != nil {
-		return "", "AI 点评不可用：" + err.Error(), nil
+		return "", "AI 点评不可用：" + err.Error(), RefusalLLMUnavailable, nil
 	}
 	allowPrivate = llmAllowPrivate(allowPrivate, cfg) // 回退到管理员配置时按配置所有者放行内网
 	if err := checkQuota(userID); err != nil {
 		if errors.Is(err, errQuotaExhausted) {
-			return "", "AI 次数配额已用尽，仅展示指标对比", nil
+			return "", "AI 次数配额已用尽，仅展示指标对比", RefusalQuotaExhausted, nil
 		}
 		// 与 analysis/qa/recommendation 一致 fail-closed：配额读不到时不放行调用。
-		return "", "AI 点评不可用：配额信息读取失败", nil
+		return "", "AI 点评不可用：配额信息读取失败", RefusalQuotaExhausted, nil
 	}
 
 	// 只把有行情的标的喂给模型（含已算好的五维量化评分——此前算了却没喂给模型）。
@@ -279,7 +283,9 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 		b.WriteString("\n")
 	}
 	if valid < compareMinSymbols {
-		return "", "有效行情不足，无法生成 AI 点评", nil
+		// P0-7 fail-closed：fresh 行情不足 2 只时对比结论无从谈起（旧价比强弱是假强弱），
+		// 拒绝调 AI；stale 行已在表格带状态展示。
+		return "", "有效行情不足，无法生成 AI 点评", RefusalFreshQuotesInsufficient, nil
 	}
 
 	res, err := chatCompletion(ctx, chatParams{
@@ -293,12 +299,12 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 		Meta: chatMeta{CallerUserID: userID, Module: "compare", ConfigID: cfg.ID, Provider: cfg.Provider},
 	})
 	if err != nil {
-		return "", "AI 点评生成失败：" + err.Error(), nil
+		return "", "AI 点评生成失败：" + err.Error(), RefusalLLMUnavailable, nil
 	}
 	if res.Usage.TotalTokens > 0 {
 		consumeQuota(userID, res.Usage.TotalTokens, true)
 	}
-	return strings.TrimSpace(res.Content), "", cfg
+	return strings.TrimSpace(res.Content), "", "", cfg
 }
 
 func nameOr(r CompareRow) string {

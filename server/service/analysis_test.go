@@ -323,6 +323,9 @@ func TestChatCompletion_RetriesTransient5xx(t *testing.T) {
 }
 
 func TestChatCompletion_EstimatesUsageWhenMissing(t *testing.T) {
+	// 关闭准确性契约：本测试验证 estimateUsage 的粗估公式本身，ac1 契约文本会计入
+	// prompt 字符数（那是正确行为），但精确断言不应与契约文本长度耦合。
+	setContractFlag(t, false)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// 不返回 usage 字段：应按字符粗估兜底。
 		_ = json.NewEncoder(w).Encode(map[string]any{
