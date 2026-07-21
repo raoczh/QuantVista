@@ -1259,7 +1259,9 @@ func normalizePick(p recPick, sym string, c candidate) recPick {
 	if strings.TrimSpace(p.Disclaimer) == "" {
 		p.Disclaimer = "本推荐由 AI 模型基于候选池内公开行情与量化因子自动生成，可能存在数字与事实偏差，仅供研究参考，不构成投资建议，历史表现不代表未来，据此操作风险自负。"
 	}
-	return p
+	// P0-4 跨字段纪律（llm_semantic_validator.go，flag 控）：短线 buy 盈亏比 <1.5
+	// 透明降级为 watch（prompt 纪律的程序化，沿上方 shortPlanPricesValid 降级先例）。
+	return applyRecPickSemantics(p)
 }
 
 // minCandidateAmount PRD 3.6 流动性前置筛选默认值：日成交额不足 1 亿元的标的剔除

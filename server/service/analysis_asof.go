@@ -10,6 +10,7 @@ import (
 	"quantvista/common"
 	"quantvista/datasource"
 	"quantvista/model"
+	"quantvista/setting"
 )
 
 // M2 回溯诊断：AI 个股分析加 as_of 参数——日线/指标截断到该日组装 prompt（无未来
@@ -159,6 +160,19 @@ func buildStockSnapshotAsOf(symbol, mkt, asOf string) (string, map[string]any, e
 
 	// 诚实声明：该模式下不可得的数据维度（防模型臆测，也防「事后诸葛」）。
 	snap["unavailable_note"] = "历史回溯快照：估值(PE/PB/市值)、新闻舆情、公告、财务指标、实时盘面与风险闸门数据在该模式下不可得，均不得臆测；分析只能依据上述日线衍生数据"
+	// ev4（P0-3，flag llm_evidence_refs）：同一缺口清单的结构化形态（field_path/reason/
+	// impact），机器可读并经核验层透出前端；与上面的自然语言声明保持同一事实。
+	if setting.LLMEvidenceRefs() {
+		impact := "该维度不得臆测；只能声明历史回溯模式下数据不可得"
+		reason := "历史回溯模式无该维度的时点快照"
+		snap["unknowns"] = []map[string]any{
+			{"field_path": "valuation", "reason": reason, "impact": impact},
+			{"field_path": "news", "reason": reason, "impact": impact},
+			{"field_path": "announcements", "reason": reason, "impact": impact},
+			{"field_path": "finance", "reason": reason, "impact": impact},
+			{"field_path": "risk_gate", "reason": reason, "impact": impact},
+		}
+	}
 	return label, snap, nil
 }
 

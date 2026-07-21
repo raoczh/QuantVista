@@ -120,6 +120,15 @@
   - **⑥ 正文策略延续**：审计正文原样保留、仅 60KB 截断，P0-8 只补关联/完整性元数据——**严禁借本批结构重新引入正文脱敏**（用户明确决策）。管理端 llm-calls 的 trace 筛选同时匹配 trace_id 或 run_id。
   - **⑦ 测试时刻依赖教训**：TestStrategySignalHits 原只钉 bar 末日进日历，16:30 后 `wideExpectedDate` 切「今日」→ openDaysBehind 判 -1 被 fail-closed 拒绝——**下午运行必挂**。凡 seed 旧日期数据又依赖「期望交易日」的测试，日历必须同时钉 bar 末日与今日（两行齐钉，任意时刻确定性通过）。
 
+- **LLM 准确性 P0 第三批（P0-3 字段路径证据链 ev4 + P0-4 跨模块 semantic validator，2026-07-21）防回归**（权威计划 `docs/LLM_ACCURACY_OPTIMIZATION_PLAN.md` §5.2/§7.1 v1.7，改 trust.go/llm_semantic_validator.go/快照 builder/各模块 parse 回调前先读）：
+  - **① ev4 证据链是程序推导不是模型自报**：`evidence_id`（ev-001…按命中序分配）/`source`/`as_of`/`path` 全部由核验引擎（trust.go verifyEvidenceLabeled+matchLabeled）从快照值域回填——**禁止让模型输出 evidence_id 并照单采信**（模型侧 claims/evidence_ids schema 属 P1-2，另行设计防伪造）。source 提示在 `stockFieldHints`：quote/valuation 从快照元数据逐次读取，technicals=daily_bars、finance=eastmoney_f10、org_view=eastmoney_datacenter 是结构性事实（旧落库快照同样适用）；新增快照数据段时**必须同步补 source 提示**，否则该段证据链缺 source 维。
+  - **② unknowns 语义**：`snap["unknowns"]`（field_path/reason/impact）只收「本应有但取不到」的段（个股：估值取失败/日线缺/财务缺/机构观点缺；as_of 快照：五段固定清单）；**已知不适用（ETF 无估值/财务）与有 fallback 声明的段（news 无相关新闻带 market_signals）不算缺口**——把「已知为空」写成 unknown 会稀释缺口警示。unknowns 随快照进 prompt（改变 data_hash 属预期）；`snapshotUnknownItems` 兼容原生与 JSON 回灌两形态（QA 复用落库快照）。旧记录无 unknowns/evidence_id/source/key_section 字段，前端 TrustBadges 全部 v-if 兜底。
+  - **③ key_section 口径**：关键结论段=分析/日报「总结」、问答「回答」、对比「AI点评」（调用方 markKeySection 指定）；SnapshotMatched 只认 origin 空的命中（plan/user/context 复述不算）；Total>0 且 SnapshotMatched=0 时置信依据与前端 tooltip 点名但**不额外降档**（全局命中率已由 evidenceConfidenceSignal 管，双重扣分会放大单一信号）。
+  - **④ P0-4 失败语义与既有路径对齐，不得静默修正**：分析/panel 的「block ⇒ 不得 bullish」在 parse 回调返回 error → 触发 repair（错误文案即修复反馈，含「语义校验失败」字样）→ 打满 1+maxRepairAttempts 仍不过 → 既有 degraded 落库（原文保留，非 success）；交易计划语义错误 → repair → 仍不过 → 既有 best-effort 不带 trade_plan；推荐短线 buy RR<1.5 → **透明降级** watch+risks 注记（沿 shortPlanPricesValid 先例：价位关系合法故保留价位，只降 action）。**三种处理形态是有意差异**（强语义拒绝 vs 单条目透明降级），改动前先想清楚落在哪一类。
+  - **⑤ validator 是收口不是替换**：validateTradePlanSemantics 内部先调既有 validateTradePlan（**恒开，不受 flag 控**），再叠 flag 控的跨字段上下文反证（block/评级偏空——前置确定性 NoPlan 已拦，这里是防调用顺序重构旁路的收口）；normalizePick 既有归一化/剥除/悬空清零全部保留，applyRecPickSemantics 只在其尾部叠加。**影子纪律不动**：regime/bear/quality 影子门控仍不改写 action，RR 纪律与影子门控无关（它是价位赔率的确定性数学，非预测质量门控）。量化降级 picks 恒 watch，天然不受 RR 纪律影响。
+  - **⑥ flag 边界**：`llm_evidence_refs`/`llm_semantic_validator` 均 `!= "false"` 缺省开（setting/system.go 同款惯例），管理后台「LLM 准确性契约」卡三开关并列；关闭只回退本批新增（ev_refs 关=不注入 unknowns 回 ev3 行为；validator 关=新增跨字段规则跳过），**P0-7 安全地板与各模块既有校验永不受这两个 flag 控制**。测试切 flag 必须 setupTestDB+Cleanup 恢复 true（options 表写库，内存库共享——setContractFlag 同款）。
+  - **⑦ 版本与兼容**：核验引擎版本 ev3→**ev4**（断言 Version 的测试已同步）；prompt 版本不变（p17/d3/q10 等——unknowns 是 L2 数据段非提示词文本）；分析/panel/trade_plan schema_version 不变（新增字段全 omitempty 旧读兼容）。快照注入 unknowns 后 data_hash 与旧批次不可比属预期，勿当回归。
+
 ## 4. 未完成项与储备（按数据源可得性推进）
 
 > **2026-07-06 起后续开发按 `DEVELOPMENT_PLAN.md` 的批次（N1→N2→F1→T1→S1→F2→M1→M2→M3）推进**——它是面向执行的施工图（每批含方案锚点/依赖/验收）；分析依据与上游接口速查表在 `REFERENCE_ANALYSIS.md`。以下原有储备多数已并入该计划：

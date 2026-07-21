@@ -805,7 +805,7 @@ func dailyReviewEvidence(rv *dailyReview, snap *reportSnapshot) *evidenceCheck {
 		sections = append(sections, evidenceSection{Module: "风险提示", Text: w})
 	}
 	// 快照统一按报告交易日作为 as_of（全字段通配 "" 前缀）。
-	vals := snapshotLabeledValues(snap, map[string]string{"": snap.TradeDate})
+	vals := snapshotLabeledValues(snap, &snapshotHints{asOf: map[string]string{"": snap.TradeDate}})
 	vals = append(vals, textLabeledValues("提醒文案", "context", snap.Alerts)...)
 	// N2 事件标题同为文本型合法来源（标题里的小数被复述不算幻觉）。
 	titles := make([]string, 0, len(snap.Events))
@@ -813,7 +813,11 @@ func dailyReviewEvidence(rv *dailyReview, snap *reportSnapshot) *evidenceCheck {
 		titles = append(titles, e.Title)
 	}
 	vals = append(vals, textLabeledValues("事件标题", "context", titles)...)
-	return verifyEvidenceLabeled(sections, vals)
+	check := verifyEvidenceLabeled(sections, vals)
+	// ev4（P0-3）：关键结论段（总结）快照佐证计数（复盘快照无 builder 级 unknowns，
+	// 数据缺口由 data_deficiencies 水位纪律承担，见 reportDataDeficiencies）。
+	markKeySection(check, "总结")
+	return check
 }
 
 // dailyReviewPromptVersion 复盘系统提示版本（M3c 起随报告落库；改 dailyReviewSystem 时递增）。

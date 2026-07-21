@@ -26,6 +26,8 @@ const (
 	keyLLMFallbackID      = "llm_fallback_config_id"
 	keySiteBaseURL        = "site_base_url"
 	keyLLMAccuracy        = "llm_accuracy_contract"
+	keyLLMEvidenceRefs    = "llm_evidence_refs"
+	keyLLMSemanticValid   = "llm_semantic_validator"
 )
 
 // 新闻快讯采集间隔（分钟）的默认值与钳制范围：下限防打爆免费上游，上限防配成"实际不采集"。
@@ -53,6 +55,12 @@ var (
 	// LLM 准确性契约（P0-1，ac1）：中央出口注入不可覆盖契约 + 结构化低温钳制 +
 	// repair 温度归零 + 流式完整性门禁。默认开；上游网关兼容性异常时可关闭回退旧路径。
 	llmAccuracyContract = true
+	// P0-3 字段路径证据链（ev4）：快照结构化 unknowns 注入 + 证据核验 evidence_id/source
+	// 标注。默认开；关闭回退 ev3 行为（快照不注入 unknowns 块）。
+	llmEvidenceRefs = true
+	// P0-4 跨模块语义校验（llm_semantic_validator.go）：rating/action/计划价/风险闸门
+	// 跨字段一致性。默认开；关闭仅回退新增跨字段规则，各模块既有专属校验不受此开关控制。
+	llmSemanticValidator = true
 )
 
 // Init 从 DB 加载系统配置；首启时若 DB 缺 GitHub 凭证而 env 提供了，则种子回填到 DB。
@@ -122,6 +130,8 @@ func apply(opts map[string]string) {
 
 	// 准确性契约同款 != "false" 缺省开语义（新门禁的回滚开关，而非默认停用的实验位）。
 	llmAccuracyContract = opts[keyLLMAccuracy] != "false"
+	llmEvidenceRefs = opts[keyLLMEvidenceRefs] != "false"
+	llmSemanticValidator = opts[keyLLMSemanticValid] != "false"
 }
 
 // normalizeSiteBaseURL 去空白与尾部斜杠（拼路由时统一 base+/path 形态）。
@@ -177,6 +187,13 @@ func SiteBaseURL() string { mu.RLock(); defer mu.RUnlock(); return siteBaseURL }
 // 关闭 = 全部回退旧路径（回滚开关，见 docs/LLM_ACCURACY_OPTIMIZATION_PLAN.md §10.1）。
 func LLMAccuracyContract() bool { mu.RLock(); defer mu.RUnlock(); return llmAccuracyContract }
 
+// LLMEvidenceRefs P0-3 字段路径证据链开关（快照 unknowns 注入 + evidence_id/source 标注）。
+func LLMEvidenceRefs() bool { mu.RLock(); defer mu.RUnlock(); return llmEvidenceRefs }
+
+// LLMSemanticValidator P0-4 跨模块语义校验开关（仅控制新增跨字段规则；
+// 各模块既有专属校验——validateTradePlan/shortPlanPricesValid 等——不受此开关影响）。
+func LLMSemanticValidator() bool { mu.RLock(); defer mu.RUnlock(); return llmSemanticValidator }
+
 // ---- 写入（持久化 + 刷新内存）----
 
 // SetRegistrationOpen 设置是否开放注册。
@@ -215,6 +232,28 @@ func SetLLMAccuracyContract(v bool) error {
 	}
 	mu.Lock()
 	llmAccuracyContract = v
+	mu.Unlock()
+	return nil
+}
+
+// SetLLMEvidenceRefs 设置 P0-3 字段路径证据链开关。
+func SetLLMEvidenceRefs(v bool) error {
+	if err := model.UpsertOption(keyLLMEvidenceRefs, strconv.FormatBool(v)); err != nil {
+		return err
+	}
+	mu.Lock()
+	llmEvidenceRefs = v
+	mu.Unlock()
+	return nil
+}
+
+// SetLLMSemanticValidator 设置 P0-4 跨模块语义校验开关。
+func SetLLMSemanticValidator(v bool) error {
+	if err := model.UpsertOption(keyLLMSemanticValid, strconv.FormatBool(v)); err != nil {
+		return err
+	}
+	mu.Lock()
+	llmSemanticValidator = v
 	mu.Unlock()
 	return nil
 }
