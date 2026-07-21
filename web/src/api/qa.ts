@@ -8,6 +8,7 @@ export interface QaMessage {
   role: 'user' | 'assistant'
   content: string
   check_json?: string // assistant 回答的证据核验结果 JSON（服务端回填，旧消息无）
+  run_id?: string // P0-2：本轮回答对应的调用组 ID（llm_call_logs.run_id 同值；旧消息无）
   total_tokens: number
   created_at: string
 }
@@ -23,6 +24,7 @@ export interface QaConversation {
   model: string
   message_count: number
   total_tokens: number
+  trace_id?: string // P0-2：会话级调用追溯 ID（旧会话首次新提问时补写）
   created_at: string
   updated_at: string
 }

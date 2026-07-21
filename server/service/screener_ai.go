@@ -54,6 +54,8 @@ type ParseStrategyResult struct {
 	Conditions    []string  `json:"conditions"` // describeCondTree 人话条件清单（前端预览）
 	PromptVersion string    `json:"prompt_version"`
 	TotalTokens   int       `json:"total_tokens"`
+	// TraceID P0-2 调用追溯 ID（解析不落库，随响应回传；管理端 llm-calls 按 trace 可查）。
+	TraceID string `json:"trace_id,omitempty"`
 	// 实际使用的 LLM（解析不落库，随响应回传供前端展示）。
 	LLMConfigID int64  `json:"llm_config_id"`
 	Provider    string `json:"provider"`
@@ -84,6 +86,10 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 		{Role: "system", Content: buildParseStrategySystemPrompt()},
 		{Role: "user", Content: text},
 	}
+	// P0-2：一次解析一个 trace + 一个 run（repair 同 run）；输入白话文本即数据快照。
+	run := newLLMRun(newLLMTraceID(), "", "screener_parse", "screener_parse.v1", screenerParsePromptVersion)
+	run.hashData(text)
+	run.hashPrompt(convo)
 	var acc chatUsage
 	var parsed *parsedStrategy
 	var lastPerr error
@@ -99,8 +105,9 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 			JSONMode:     true,
 			AllowPrivate: allowPrivate,
 			Repair:       attempt > 0, // repair 轮：契约开启时温度固定 0
-			Meta:         chatMeta{CallerUserID: userID, Module: "screener_parse", ConfigID: cfg.ID, Provider: cfg.Provider},
+			Meta:         run.chatMeta(userID, cfg, attempt+1),
 		})
+		run.record(res, callErr)
 		if callErr != nil {
 			// 网络/鉴权类失败：已消耗的 token 照记（审计），动作照计次（与分析口径一致）。
 			if acc.TotalTokens > 0 {
@@ -134,6 +141,7 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 		Explain:       truncateRunes(strings.TrimSpace(parsed.Explain), 200),
 		PromptVersion: screenerParsePromptVersion,
 		TotalTokens:   acc.TotalTokens,
+		TraceID:       run.TraceID,
 		LLMConfigID:   cfg.ID,
 		Provider:      cfg.Provider,
 		Model:         cfg.Model,

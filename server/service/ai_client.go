@@ -117,7 +117,18 @@ type chatParams struct {
 	// accuracyContract 是公开出口捕获的本次调用开关快照；nil 仅用于绕过出口的内部测试。
 	// 不进入上游 payload，也不写入业务 prompt。
 	accuracyContract *bool
-	Meta             chatMeta
+	// effectiveJSONMode 审计观测：本次上游请求最终是否携带 JSON 结构化约束
+	//（response_format/text.format）。公开出口按 JSONMode 初始化；端点不支持而回落
+	// 时由内部四处回落点置 false——writeLLMCallLog 据此记录实际生效的 structured_method。
+	effectiveJSONMode *bool
+	Meta              chatMeta
+}
+
+// markJSONModeDropped JSON mode 回落点统一记录（nil 安全：绕过公开出口的路径无观测指针）。
+func (p chatParams) markJSONModeDropped() {
+	if p.effectiveJSONMode != nil {
+		*p.effectiveJSONMode = false
+	}
 }
 
 // isResponsesEndpoint 该次调用是否走 /v1/responses（空值按 chat/completions）。
@@ -166,6 +177,8 @@ func capModuleTokens(userMax, moduleCap int) int {
 // EndpointType=responses 时分流到 /v1/responses 适配（ai_client_responses.go），返回语义一致。
 func chatCompletion(ctx context.Context, p chatParams) (res *chatResult, err error) {
 	p = applyAccuracyContract(p) // ac1 契约注入+温度钳制在审计之前——RequestBody 记录上游真实收到的形态
+	effJSON := p.JSONMode
+	p.effectiveJSONMode = &effJSON
 	started := time.Now()
 	streamed := true // 默认先走流式；回落非流式时置 false——审计必须记录实际请求形态而非入口意图
 	defer func() {
@@ -219,6 +232,7 @@ func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error)
 	}
 	if status != http.StatusOK && p.JSONMode && looksLikeUnsupportedJSONMode(status, raw) {
 		// 该服务端不支持 response_format：去掉后重试。
+		p.markJSONModeDropped()
 		res, status, raw, latency, err = doChat(ctx, p, false)
 		if err != nil {
 			return nil, err
@@ -494,6 +508,8 @@ func estimateUsage(messages []chatMessage, content string) chatUsage {
 // EndpointType=responses 时分流到 /v1/responses 适配。
 func chatCompletionStream(ctx context.Context, p chatParams, onDelta func(string)) (res *chatResult, err error) {
 	p = applyAccuracyContract(p)
+	effJSON := p.JSONMode
+	p.effectiveJSONMode = &effJSON
 	started := time.Now()
 	defer func() {
 		err = classifyLLMError(err)
@@ -576,6 +592,9 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 		if (dropUsage || dropJSON) && ctx.Err() == nil {
 			usageOpt = usageOpt && !dropUsage
 			jsonOn = jsonOn && !dropJSON
+			if dropJSON {
+				p.markJSONModeDropped()
+			}
 			body = buildBody(usageOpt, jsonOn)
 			if r2, e2 := send(); e2 == nil {
 				resp = r2

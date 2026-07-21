@@ -385,6 +385,7 @@ func TestModuleCallFailurePreservesRefusalCode(t *testing.T) {
 	recommendationSvc := &RecommendationService{}
 	_, _, _, _, err = recommendationSvc.callWithRepair(
 		context.Background(), userID,
+		newLLMRun("", "", "recommendation", "recommendation.v1", ""),
 		&model.LLMConfig{BaseURL: srv.URL, Model: "m"}, "sk-test", true,
 		[]chatMessage{{Role: "user", Content: "x"}},
 		map[string]candidate{"600001": {Symbol: "600001", Name: "甲", Price: 10}},

@@ -747,7 +747,7 @@ func TestCompareAIRefusalCodePreservesIncompleteResponse(t *testing.T) {
 		{Symbol: "600001", Market: "cn", Name: "甲", QuoteOK: true, Price: 10},
 		{Symbol: "600002", Market: "cn", Name: "乙", QuoteOK: true, Price: 12},
 	}
-	comment, _, code, _ := svc.aiComment(context.Background(), 9911, true, cfg.ID, rows)
+	comment, _, code, _, _ := svc.aiComment(context.Background(), 9911, true, cfg.ID, rows)
 	if comment != "" || code != RefusalLLMResponseIncomplete {
 		t.Fatalf("Compare 必须把中央不完整响应码写入 ai_refusal_code: comment=%q code=%q", comment, code)
 	}
@@ -756,7 +756,7 @@ func TestCompareAIRefusalCodePreservesIncompleteResponse(t *testing.T) {
 func TestCompareFreshnessRefusalPrecedesLLMResolution(t *testing.T) {
 	svc := &CompareService{}
 	rows := []CompareRow{{Symbol: "600001", Market: "cn", QuoteOK: true, Price: 10}}
-	comment, _, code, _ := svc.aiComment(context.Background(), 9912, false, 0, rows)
+	comment, _, code, _, _ := svc.aiComment(context.Background(), 9912, false, 0, rows)
 	if comment != "" || code != RefusalFreshQuotesInsufficient {
 		t.Fatalf("fresh 行情不足应先于 LLM 配置/配额拒答: comment=%q code=%q", comment, code)
 	}
@@ -787,7 +787,7 @@ func TestP0SevenFloorsRemainEnabledWhenContractFlagOff(t *testing.T) {
 	}
 
 	compare := &CompareService{}
-	_, _, code, _ := compare.aiComment(context.Background(), 9920, false, 0,
+	_, _, code, _, _ := compare.aiComment(context.Background(), 9920, false, 0,
 		[]CompareRow{{Symbol: "600888", Market: "cn", QuoteOK: true, Price: 10}})
 	if code != RefusalFreshQuotesInsufficient {
 		t.Fatalf("flag 关闭不得放松 Compare fresh 门: code=%q", code)
@@ -812,8 +812,8 @@ func TestReviewRepairTemperatureAndAttemptLimit(t *testing.T) {
 	cfg := &model.LLMConfig{BaseURL: srv.URL, Model: "m", Temperature: 0.9, MaxTokens: 64}
 
 	analysis := &AnalysisService{}
-	review, _ := analysis.reviewAnalysis(context.Background(), 9921, cfg, "k", true, "stock",
-		map[string]any{"price": 10}, &AnalysisResult{Rating: model.AnalysisRatingNeutral, Summary: "x"})
+	review, _, _ := analysis.reviewAnalysis(context.Background(), 9921, cfg, "k", true, "stock",
+		map[string]any{"price": 10}, &AnalysisResult{Rating: model.AnalysisRatingNeutral, Summary: "x"}, "", "")
 	if review != nil {
 		t.Fatalf("两轮无效输出后 analysis_review 应确定性放弃: %+v", review)
 	}
@@ -821,8 +821,8 @@ func TestReviewRepairTemperatureAndAttemptLimit(t *testing.T) {
 	recommendation := &RecommendationService{}
 	picks := []recPick{{Symbol: "600001", Action: model.RecActionWatch}}
 	pool := map[string]candidate{"600001": {Symbol: "600001", Name: "甲", Price: 10}}
-	reviews, _, _ := recommendation.reviewPicks(context.Background(), 9921, cfg, "k", true,
-		model.RecTypeShortTerm, picks, pool)
+	reviews, _, _, _ := recommendation.reviewPicks(context.Background(), 9921, cfg, "k", true,
+		model.RecTypeShortTerm, picks, pool, "", "")
 	if reviews != nil {
 		t.Fatalf("两轮无效输出后 rec_review 应确定性放弃: %+v", reviews)
 	}
@@ -902,7 +902,7 @@ func TestRepairOverLimitStops(t *testing.T) {
 	svc := &AnalysisService{}
 	parseAlwaysFail := func(string) error { return errors.New("故意校验失败") }
 	_, _, _, err := svc.callWithRepair(
-		context.Background(), 1, "analysis",
+		context.Background(), 1, newLLMRun("", "", "analysis", "analysis.v1", ""),
 		&model.LLMConfig{BaseURL: srv.URL, Model: "m", Temperature: 0.5, MaxTokens: 64},
 		"k", true,
 		[]chatMessage{{Role: "user", Content: "x"}},

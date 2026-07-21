@@ -25,6 +25,16 @@ type chatMeta struct {
 	Module       string
 	ConfigID     int64
 	Provider     string
+
+	// ---- P0-2 调用关联元数据（llm_run.go 的 llmRun.chatMeta 统一构造；直填仅限探针/测试）----
+	TraceID       string
+	RunID         string
+	ParentRunID   string
+	Attempt       int // 1 基；0=未接线路径未记录
+	SchemaVersion string
+	PromptVersion string
+	PromptHash    string
+	DataHash      string
 }
 
 // writeLLMCallLog 落一条调用审计。正文为管理员排障用原文：messages + 响应 content 仅
@@ -62,6 +72,16 @@ func writeLLMCallLog(p chatParams, stream bool, res *chatResult, callErr error, 
 	if endpointType == "" {
 		endpointType = model.LLMEndpointChat
 	}
+	// 实际生效的结构化方法：JSON mode 因端点不支持而回落时内部会把 effectiveJSONMode
+	// 置 false（chat/responses、流式/非流式四处回落点），审计记录真实形态。
+	effectiveJSON := p.JSONMode
+	if p.effectiveJSONMode != nil {
+		effectiveJSON = *p.effectiveJSONMode
+	}
+	finishRaw := ""
+	if res != nil {
+		finishRaw = res.FinishReason
+	}
 	row := &model.LLMCallLog{
 		UserID:           p.Meta.CallerUserID,
 		Module:           p.Meta.Module,
@@ -79,6 +99,20 @@ func writeLLMCallLog(p chatParams, stream bool, res *chatResult, callErr error, 
 		FirstChunkMs:     firstChunkMs,
 		RequestBody:      truncateAuditText(string(requestJSON), llmCallBodyLimit),
 		ResponseBody:     truncateAuditText(responseBody, llmCallBodyLimit),
+
+		// P0-2/P0-8 关联与完整性元数据（旧记录为空，读取兼容）。
+		TraceID:          p.Meta.TraceID,
+		RunID:            p.Meta.RunID,
+		ParentRunID:      p.Meta.ParentRunID,
+		Attempt:          p.Meta.Attempt,
+		Repair:           p.Repair,
+		StructuredMethod: structuredMethodName(effectiveJSON),
+		SchemaVersion:    p.Meta.SchemaVersion,
+		PromptVersion:    p.Meta.PromptVersion,
+		PromptHash:       p.Meta.PromptHash,
+		DataHash:         p.Meta.DataHash,
+		FinishState:      normalizeLLMFinishState(finishRaw, callErr),
+		FinishStateRaw:   finishRaw,
 	}
 	if err := common.DB.Create(row).Error; err != nil {
 		common.SysWarn("LLM 调用审计写入失败(module=%s user=%d): %v", p.Meta.Module, p.Meta.CallerUserID, err)
@@ -111,7 +145,7 @@ type LLMCallLogList struct {
 	Total int64            `json:"total"`
 }
 
-func (s *AdminService) ListLLMCalls(userID int64, module, status string, page, pageSize int) (*LLMCallLogList, error) {
+func (s *AdminService) ListLLMCalls(userID int64, module, status, trace string, page, pageSize int) (*LLMCallLogList, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -131,12 +165,18 @@ func (s *AdminService) ListLLMCalls(userID int64, module, status string, page, p
 	if status = strings.TrimSpace(status); status != "" {
 		q = q.Where("status = ?", status)
 	}
+	// P0-2 追溯筛选：按业务结果的 trace_id（或某个 run_id）列出其全部关联调用
+	//（主调/repair/复核/反方/交易计划一屏可见）。
+	if trace = strings.TrimSpace(trace); trace != "" {
+		q = q.Where("trace_id = ? OR run_id = ?", trace, trace)
+	}
 	var total int64
 	if err := q.Count(&total).Error; err != nil {
 		return nil, err
 	}
 	var logs []model.LLMCallLog
-	if err := q.Select("id,user_id,module,llm_config_id,provider,model,endpoint_type,stream,status,error_msg,prompt_tokens,completion_tokens,total_tokens,latency_ms,first_chunk_ms,created_at").
+	if err := q.Select("id,user_id,module,llm_config_id,provider,model,endpoint_type,stream,status,error_msg,prompt_tokens,completion_tokens,total_tokens,latency_ms,first_chunk_ms," +
+		"trace_id,run_id,parent_run_id,attempt,repair,structured_method,schema_version,prompt_version,prompt_hash,data_hash,finish_state,finish_state_raw,created_at").
 		Order("id desc").Offset((page - 1) * pageSize).Limit(pageSize).Find(&logs).Error; err != nil {
 		return nil, err
 	}

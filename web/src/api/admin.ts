@@ -148,6 +148,19 @@ export interface LLMCallLogItem {
   first_chunk_ms: number // 流式首个 data 块耗时；0=非流式；≈latency_ms 说明上游整包返回（假流式）
   request_body: string // 仅详情接口返回，列表恒为空
   response_body: string
+  // ---- P0-2/P0-8 调用关联与完整性元数据（旧记录为空字符串/0）----
+  trace_id: string // 业务结果级追溯 ID（主调/repair/复核/反方共享）
+  run_id: string // 逻辑调用组 ID（主调与其 repair 同组）
+  parent_run_id: string // 派生调用（复核/反方/交易计划）回指主调 run
+  attempt: number // 1 基轮次；0=旧记录未记录
+  repair: boolean
+  structured_method: string // json_object / free_text（实际生效形态）
+  schema_version: string
+  prompt_version: string
+  prompt_hash: string
+  data_hash: string
+  finish_state: string // 规范化终态；空=成功但上游未报告
+  finish_state_raw: string
   created_at: string
 }
 
@@ -156,7 +169,14 @@ export interface LLMCallLogList {
   total: number
 }
 
-export function listLlmCalls(params: { user_id?: number; module?: string; status?: string; page?: number; page_size?: number }) {
+export function listLlmCalls(params: {
+  user_id?: number
+  module?: string
+  status?: string
+  trace?: string // trace_id 或 run_id：列出一次业务运行的全部关联调用
+  page?: number
+  page_size?: number
+}) {
   return request<LLMCallLogList>({ url: '/admin/llm-calls', params })
 }
 

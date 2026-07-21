@@ -185,8 +185,8 @@ func TestAttachTradePlan_DeterministicSkips(t *testing.T) {
 	req := AnalyzeRequest{Module: model.AnalysisModuleStock, Mode: model.AnalysisModeStandard}
 	// 偏空。
 	r := &AnalysisResult{Rating: model.AnalysisRatingBearish}
-	u := s.attachTradePlan(context.Background(), 0, nil, "", true, req,
-		map[string]any{"quote": map[string]any{"price": 10.0}}, r)
+	u, _ := s.attachTradePlan(context.Background(), 0, nil, "", true, req,
+		map[string]any{"quote": map[string]any{"price": 10.0}}, r, "", "")
 	if u.TotalTokens != 0 || r.TradePlan == nil || !r.TradePlan.NoPlan {
 		t.Fatalf("偏空应零成本 NoPlan: %+v", r.TradePlan)
 	}
@@ -196,33 +196,33 @@ func TestAttachTradePlan_DeterministicSkips(t *testing.T) {
 		"quote":     map[string]any{"price": 10.0},
 		"risk_gate": map[string]any{"flags": []riskFlag{{Level: "block"}}},
 	}
-	s.attachTradePlan(context.Background(), 0, nil, "", true, req, snap, r)
+	s.attachTradePlan(context.Background(), 0, nil, "", true, req, snap, r, "", "")
 	if r.TradePlan == nil || !r.TradePlan.NoPlan || !strings.Contains(r.TradePlan.NoPlanReason, "风险闸门") {
 		t.Fatalf("block 应 NoPlan: %+v", r.TradePlan)
 	}
 	// 现价缺失。
 	r = &AnalysisResult{Rating: model.AnalysisRatingNeutral}
-	s.attachTradePlan(context.Background(), 0, nil, "", true, req, map[string]any{"freshness_status": "fresh"}, r)
+	s.attachTradePlan(context.Background(), 0, nil, "", true, req, map[string]any{"freshness_status": "fresh"}, r, "", "")
 	if r.TradePlan == nil || !r.TradePlan.NoPlan {
 		t.Fatal("现价缺失应 NoPlan")
 	}
 	// 行情过期（stale）/时效未知（缺 freshness_status）：不生成精确交易计划。
 	r = &AnalysisResult{Rating: model.AnalysisRatingBullish}
 	s.attachTradePlan(context.Background(), 0, nil, "", true, req,
-		map[string]any{"quote": map[string]any{"price": 10.0}, "freshness_status": "stale"}, r)
+		map[string]any{"quote": map[string]any{"price": 10.0}, "freshness_status": "stale"}, r, "", "")
 	if r.TradePlan == nil || !r.TradePlan.NoPlan || !strings.Contains(r.TradePlan.NoPlanReason, "行情") {
 		t.Fatalf("stale 行情应 NoPlan: %+v", r.TradePlan)
 	}
 	r = &AnalysisResult{Rating: model.AnalysisRatingBullish}
 	s.attachTradePlan(context.Background(), 0, nil, "", true, req,
-		map[string]any{"quote": map[string]any{"price": 10.0}}, r)
+		map[string]any{"quote": map[string]any{"price": 10.0}}, r, "", "")
 	if r.TradePlan == nil || !r.TradePlan.NoPlan {
 		t.Fatal("缺 freshness_status（时效未知）应 NoPlan")
 	}
 	// 有 freshness_note（全源过期仍带旧价返回）同样拒绝。
 	r = &AnalysisResult{Rating: model.AnalysisRatingBullish}
 	s.attachTradePlan(context.Background(), 0, nil, "", true, req,
-		map[string]any{"quote": map[string]any{"price": 10.0}, "freshness_status": "fresh", "freshness_note": "行情仅更新至…"}, r)
+		map[string]any{"quote": map[string]any{"price": 10.0}, "freshness_status": "fresh", "freshness_note": "行情仅更新至…"}, r, "", "")
 	if r.TradePlan == nil || !r.TradePlan.NoPlan {
 		t.Fatal("带 freshness_note 应 NoPlan")
 	}
@@ -230,7 +230,7 @@ func TestAttachTradePlan_DeterministicSkips(t *testing.T) {
 	r = &AnalysisResult{Rating: model.AnalysisRatingBullish}
 	s.attachTradePlan(context.Background(), 0, nil, "", true,
 		AnalyzeRequest{Module: model.AnalysisModuleStock, Mode: model.AnalysisModeStandard, AsOf: "2026-06-01"},
-		map[string]any{"quote": map[string]any{"price": 10.0}}, r)
+		map[string]any{"quote": map[string]any{"price": 10.0}}, r, "", "")
 	if r.TradePlan != nil {
 		t.Fatal("回溯模式不应生成交易计划")
 	}
@@ -264,8 +264,8 @@ func TestAttachTradePlan_EndToEnd(t *testing.T) {
 	s := &AnalysisService{} // market=nil → breadth 缺失走中性 0.6
 	cfg := &model.LLMConfig{BaseURL: srv.URL, Model: "m"}
 	r := &AnalysisResult{Rating: model.AnalysisRatingBullish}
-	usage := s.attachTradePlan(context.Background(), 0, cfg, "k", true,
-		AnalyzeRequest{Module: model.AnalysisModuleStock, Mode: model.AnalysisModeStandard}, snap, r)
+	usage, _ := s.attachTradePlan(context.Background(), 0, cfg, "k", true,
+		AnalyzeRequest{Module: model.AnalysisModuleStock, Mode: model.AnalysisModeStandard}, snap, r, "", "")
 
 	if calls != 2 {
 		t.Fatalf("违纪应触发 repair，期望 2 次调用, got %d", calls)

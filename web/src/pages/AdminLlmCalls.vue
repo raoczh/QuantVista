@@ -3,6 +3,7 @@ import { computed, h, onMounted, reactive, ref } from 'vue'
 import {
   NButton,
   NDataTable,
+  NInput,
   NModal,
   NSelect,
   NSpin,
@@ -42,8 +43,9 @@ const statusOptions = [
   { label: '失败', value: 'error' },
 ]
 
-/* 筛选状态：变更即回第一页重新拉取 */
-const filters = reactive({ user_id: 0, module: '', status: '' })
+/* 筛选状态：变更即回第一页重新拉取。trace 输入 trace_id 或 run_id，列出一次业务
+ * 运行（主调/repair/复核/反方/交易计划）的全部关联调用（P0-2）。 */
+const filters = reactive({ user_id: 0, module: '', status: '', trace: '' })
 const users = ref<AuthUser[]>([])
 const userOptions = computed(() => [
   { label: '全部用户', value: 0 },
@@ -76,6 +78,7 @@ async function load() {
       user_id: filters.user_id || undefined,
       module: filters.module || undefined,
       status: filters.status || undefined,
+      trace: filters.trace.trim() || undefined,
       page: pagination.page,
       page_size: pagination.pageSize,
     })
@@ -155,12 +158,33 @@ const columns = computed<DataTableColumns<LLMCallLogItem>>(() => [
       ),
   },
   {
+    title: '轮次',
+    key: 'attempt',
+    width: 90,
+    render: (row) =>
+      row.attempt
+        ? h('span', { class: 'cell-dim', title: `run ${row.run_id || '-'}` }, [
+            `#${row.attempt}`,
+            row.repair ? ' · repair' : '',
+          ])
+        : h('span', { class: 'cell-dim' }, '-'),
+  },
+  {
     title: '状态',
     key: 'status',
     width: 80,
     render: (row) =>
-      h(NTag, { size: 'small', round: true, bordered: false, type: row.status === 'success' ? 'success' : 'error' }, () =>
-        row.status === 'success' ? '成功' : '失败',
+      h(
+        NTag,
+        {
+          size: 'small',
+          round: true,
+          bordered: false,
+          type: row.status === 'success' ? 'success' : 'error',
+          // finish_state：规范化终态（length/eof_without_marker 等一眼可辨）。
+          title: row.finish_state ? `终态 ${row.finish_state}${row.finish_state_raw ? `（原始 ${row.finish_state_raw}）` : ''}` : undefined,
+        },
+        () => (row.status === 'success' ? '成功' : '失败'),
       ),
   },
 ])
@@ -210,6 +234,15 @@ onMounted(() => {
         <n-select v-model:value="filters.user_id" :options="userOptions" filterable class="filter-item" @update:value="onFilterChange" />
         <n-select v-model:value="filters.module" :options="moduleOptions" class="filter-item" @update:value="onFilterChange" />
         <n-select v-model:value="filters.status" :options="statusOptions" class="filter-item filter-status" @update:value="onFilterChange" />
+        <n-input
+          v-model:value="filters.trace"
+          placeholder="trace_id / run_id 追溯"
+          size="small"
+          clearable
+          class="filter-item"
+          @keyup.enter="onFilterChange"
+          @clear="onFilterChange"
+        />
         <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>
       </div>
       <n-data-table
@@ -236,6 +269,21 @@ onMounted(() => {
             <span>· {{ detail.endpoint_type === 'responses' ? 'responses' : 'chat' }}{{ detail.stream ? '（流式）' : '' }}</span>
             <span>· token {{ detail.total_tokens.toLocaleString() }}（输入 {{ detail.prompt_tokens }} / 输出 {{ detail.completion_tokens }}）</span>
             <span>· 耗时 {{ fmtLatency(detail.latency_ms) }}</span>
+          </div>
+          <!-- P0-2 关联元数据：trace/run/attempt/结构化方法/终态/hash（旧记录为空不渲染） -->
+          <div v-if="detail.trace_id" class="meta">
+            <span>trace {{ detail.trace_id }}</span>
+            <span>· run {{ detail.run_id }}</span>
+            <span v-if="detail.parent_run_id">· parent {{ detail.parent_run_id }}</span>
+            <span v-if="detail.attempt">· 第 {{ detail.attempt }} 轮{{ detail.repair ? '（repair）' : '' }}</span>
+            <span v-if="detail.structured_method">· {{ detail.structured_method }}</span>
+            <span v-if="detail.schema_version">· {{ detail.schema_version }}</span>
+            <span v-if="detail.prompt_version">· prompt {{ detail.prompt_version }}</span>
+            <span v-if="detail.finish_state">· 终态 {{ detail.finish_state }}<template v-if="detail.finish_state_raw">（{{ detail.finish_state_raw }}）</template></span>
+          </div>
+          <div v-if="detail.prompt_hash || detail.data_hash" class="meta hash-meta">
+            <span v-if="detail.prompt_hash">prompt_hash {{ detail.prompt_hash }}</span>
+            <span v-if="detail.data_hash">data_hash {{ detail.data_hash }}</span>
           </div>
           <n-tag v-if="detail.status !== 'success'" type="error" size="small" :bordered="false" class="err-tag">
             {{ detail.error_msg || '调用失败' }}
@@ -295,6 +343,9 @@ onMounted(() => {
   gap: 4px 6px;
   font-size: 12px;
   opacity: 0.7;
+}
+.hash-meta span {
+  word-break: break-all;
 }
 .err-tag {
   align-self: flex-start;

@@ -22,6 +22,11 @@ type DailyReport struct {
 	Provider    string `gorm:"size:32" json:"provider"`
 	Model       string `gorm:"size:64" json:"model"`
 
+	// P0-2 调用关联：日报复盘链路的 trace_id 与运行元数据 manifest（推荐批次的调用
+	// 关联由其批次行自带，经 RecommendationBatchID 间接串联）。旧行为空。
+	TraceID    string `gorm:"size:40;index" json:"trace_id"`
+	LlmRunJSON string `gorm:"type:text" json:"llm_run_json,omitempty"`
+
 	// 今日复盘：LLM 结构化输出 + 输入数据快照（可复现）。列表查询时排除大字段。
 	ReviewJSON   string `gorm:"type:text" json:"review_json"`
 	SnapshotJSON string `gorm:"type:text" json:"snapshot_json"`

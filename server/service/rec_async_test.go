@@ -240,7 +240,7 @@ func TestCallWithRepairBudgetAndTruncate(t *testing.T) {
 	svc := &RecommendationService{}
 	cfg := &model.LLMConfig{BaseURL: srv.URL, Model: "m", MaxTokens: 8000}
 	pool := map[string]candidate{"600001": {Symbol: "600001", Name: "甲", Price: 10}}
-	picks, _, usage, _, err := svc.callWithRepair(context.Background(), 33, cfg, "sk", true,
+	picks, _, usage, _, err := svc.callWithRepair(context.Background(), 33, newLLMRun("", "", "recommendation", "recommendation.v1", ""), cfg, "sk", true,
 		[]chatMessage{{Role: "system", Content: "s"}, {Role: "user", Content: "u"}}, pool, 3)
 	if err != nil {
 		t.Fatalf("repair 后应成功: %v", err)

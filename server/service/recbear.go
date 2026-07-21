@@ -48,8 +48,9 @@ A 股空头论据检查框架（逐项对照名单数据检查，命中才写）
 只输出 JSON：{"bears":[{"symbol":"...","bear_case":"3~5 句最强反方论证（引用数据）","severity":"high|med|low"}]}，覆盖全部给出的标的，不要任何解释或代码块标记。每条 bear_case ≤120 字。`
 
 // bearReview 对 buy 条目独立调用构建 bear case。best-effort：失败只是没有反方结论，
-// 不影响主结果；1 次 repair。返回按 symbol 归并的有效结论与 token 用量。
-func (s *RecommendationService) bearReview(ctx context.Context, userID int64, cfg *model.LLMConfig, apiKey string, allowPrivate bool, picks []recPick, pool map[string]candidate) ([]pickBear, chatUsage) {
+// 不影响主结果；1 次 repair。返回按 symbol 归并的有效结论、token 用量与反方 run 元数据
+//（无 buy 零调用时 run 为 nil）。
+func (s *RecommendationService) bearReview(ctx context.Context, userID int64, cfg *model.LLMConfig, apiKey string, allowPrivate bool, picks []recPick, pool map[string]candidate, traceID, parentRunID string) ([]pickBear, chatUsage, *llmRun) {
 	var usage chatUsage
 	rows := make([]map[string]any, 0, len(picks))
 	buySet := map[string]bool{}
@@ -71,17 +72,20 @@ func (s *RecommendationService) bearReview(ctx context.Context, userID int64, cf
 		})
 	}
 	if len(rows) == 0 {
-		return nil, usage // 无 buy 条目：零调用零成本
+		return nil, usage, nil // 无 buy 条目：零调用零成本
 	}
 	inputJSON, err := json.Marshal(rows)
 	if err != nil {
-		return nil, usage
+		return nil, usage, nil
 	}
 
 	convo := []chatMessage{
 		{Role: "system", Content: bearSystemPrompt},
 		{Role: "user", Content: "买入建议与对应真实数据如下（JSON 数组，bull_reason 为正方理由，供你针对性反驳）：\n" + string(inputJSON)},
 	}
+	run := newLLMRun(traceID, parentRunID, "rec_bear", "rec_bear.v1", bearReviewVersion)
+	run.hashData(string(inputJSON))
+	run.hashPrompt(convo)
 	type bearOut struct {
 		Bears []pickBear `json:"bears"`
 	}
@@ -91,10 +95,11 @@ func (s *RecommendationService) bearReview(ctx context.Context, userID int64, cf
 			Temperature: cfg.Temperature, MaxTokens: capModuleTokens(cfg.MaxTokens, recBearTokensCap),
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0
-			Meta:   chatMeta{CallerUserID: userID, Module: "rec_bear", ConfigID: cfg.ID, Provider: cfg.Provider},
+			Meta:   run.chatMeta(userID, cfg, attempt+1),
 		})
+		run.record(res, err)
 		if err != nil {
-			return nil, usage
+			return nil, usage, run
 		}
 		usage.PromptTokens += res.Usage.PromptTokens
 		usage.CompletionTokens += res.Usage.CompletionTokens
@@ -115,7 +120,7 @@ func (s *RecommendationService) bearReview(ctx context.Context, userID int64, cf
 				valid = append(valid, b)
 			}
 			if len(valid) > 0 {
-				return valid, usage
+				return valid, usage, run
 			}
 		}
 		convo = append(convo,
@@ -123,7 +128,8 @@ func (s *RecommendationService) bearReview(ctx context.Context, userID int64, cf
 			chatMessage{Role: "user", Content: "上一条输出不合格。请只输出 JSON：{\"bears\":[{\"symbol\",\"bear_case\",\"severity\":\"high|med|low\"}]}，symbol 必须来自给出的买入标的。"},
 		)
 	}
-	return nil, usage
+	run.DegradedReason = "llm_output_invalid"
+	return nil, usage, run
 }
 
 // normalizeBearSeverity 归一 severity 枚举（模型常输出 medium/中/高 等变体）。

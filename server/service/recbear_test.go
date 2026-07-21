@@ -94,7 +94,7 @@ func TestBearReviewEndToEnd(t *testing.T) {
 		{Symbol: "600200", Action: model.RecActionBuy, Confidence: 70},
 		{Symbol: "600900", Action: model.RecActionWatch, Confidence: 40}, // watch 不进反方输入
 	}
-	bears, usage := svc.bearReview(context.Background(), 33, cfg, "sk", true, picks, pool)
+	bears, usage, _ := svc.bearReview(context.Background(), 33, cfg, "sk", true, picks, pool, "", "")
 
 	if calls != 1 || usage.TotalTokens != 30 {
 		t.Fatalf("应 1 次调用 30 token: calls=%d usage=%+v", calls, usage)
@@ -126,8 +126,8 @@ func TestBearReviewEndToEnd(t *testing.T) {
 
 	// 无 buy 条目：零调用零成本。
 	calls = 0
-	bears, usage = svc.bearReview(context.Background(), 33, cfg, "sk", true,
-		[]recPick{{Symbol: "600900", Action: model.RecActionWatch}}, pool)
+	bears, usage, _ = svc.bearReview(context.Background(), 33, cfg, "sk", true,
+		[]recPick{{Symbol: "600900", Action: model.RecActionWatch}}, pool, "", "")
 	if calls != 0 || bears != nil || usage.TotalTokens != 0 {
 		t.Fatalf("无 buy 应零调用: calls=%d bears=%+v usage=%+v", calls, bears, usage)
 	}
