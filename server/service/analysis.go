@@ -52,7 +52,6 @@ func NewAnalysisService(market *MarketService, watchlist *WatchlistService, posi
 const (
 	analysisPromptVersion   = "p17" // p17: 历史解释模式程序化硬约束（enforceStaleModeResult：summary 强制「截至 X 的历史数据解释」前缀、suggestions 剔除当前买卖行动词；panel 模式非 fresh 直接拒绝不接受 allow_stale）；p16: 行情时效 fail-closed——持仓割/守/补三选一仅限有当前有效行情的仓（stale/失败仓禁三选一）、个股 stale 禁当前评级（改历史解释模式或数据不足）、快照逐项 freshness 元数据；p15: 个股快照行情新鲜度元数据（captured_at/quote_as_of/quote_source/bars_as_of/market_state/freshness_status），stale 必须声明行情截至时间、非交易时段按收盘口径；p14: P3b 板块模块 board_valuation（中位 PE/PB+横截面/时序分位+积累天数）与 board_flow（板块主力资金）两段进 sector guidance；p13: P3a 机构观点 org_view 段（评级分布/评级变动/目标价偏离/调研密度）进个股 guidance + trade_plan 机构目标价对照锚；p12: M3c 交易员阶段（个股标准分析追加交易计划二次调用+量化仓位公式，计划价位与仓位数字进核验值域）；p11: M3a 市场模块情绪温度计 mood 段（连板分布/炸板率/昨涨停溢价）；p10: M2 回溯诊断 as_of 模式（截断快照+回溯声明段）；p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
 	analysisStrategyVersion = "s1"
-	maxRepairAttempts       = 2 // 结构化校验失败后的额外重试次数（总调用 = 1 + maxRepairAttempts）
 )
 
 var validAnalysisModule = map[string]bool{
@@ -402,14 +401,17 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, run 
 	run.hashPrompt(messages)
 
 	convo := append([]chatMessage(nil), messages...)
-	for attempt := 0; attempt <= maxRepairAttempts; attempt++ {
+	// P0-9：repair 次数与输出预算按 run.Module 从模块预算表取（analysis 显式覆盖 2 次、
+	// trade_plan 同款；见 llm_budget.go）。
+	repairLimit := moduleRepairAttempts(run.Module)
+	for attempt := 0; attempt <= repairLimit; attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL:      cfg.BaseURL,
 			APIKey:       apiKey,
 			Model:        cfg.Model,
 			EndpointType: cfg.EndpointType,
 			Temperature:  cfg.Temperature,
-			MaxTokens:    cfg.MaxTokens,
+			MaxTokens:    moduleTokenCap(run.Module, cfg.MaxTokens),
 			Messages:     convo,
 			JSONMode:     true,
 			AllowPrivate: allowPrivate,
@@ -431,9 +433,10 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, run 
 		if perr == nil {
 			return lastRaw, acc, lastLatency, nil
 		}
-		// 校验失败：追加 repair 指令再试。
+		// 校验失败：追加 repair 指令再试。坏输出按模块上限截断回灌（P0-9：完整回灌
+		// 会拖慢下一轮生成，更易撞上游 60s 超时——推荐/日报先例）。
 		convo = append(convo,
-			chatMessage{Role: "assistant", Content: res.Content},
+			chatMessage{Role: "assistant", Content: moduleRepairFeed(run.Module, res.Content)},
 			chatMessage{Role: "user", Content: "上一条输出不符合要求：" + perr.Error() + "。" + repairHint},
 		)
 	}
@@ -601,10 +604,10 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 			"\n\n【待复核的分析结果】（JSON）：\n" + string(resJSON)},
 	}
 	run.hashPrompt(convo)
-	for attempt := 0; attempt <= 1; attempt++ {
+	for attempt := 0; attempt <= moduleRepairAttempts("analysis_review"); attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-			Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
+			Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("analysis_review", cfg.MaxTokens),
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
@@ -633,7 +636,7 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 			}
 		}
 		convo = append(convo,
-			chatMessage{Role: "assistant", Content: res.Content},
+			chatMessage{Role: "assistant", Content: moduleRepairFeed("analysis_review", res.Content)},
 			chatMessage{Role: "user", Content: `上一条输出不合格。请只输出 JSON：{"verdict":"pass|warn|reject","comment":"...","confidence":0-100 整数}。`},
 		)
 	}

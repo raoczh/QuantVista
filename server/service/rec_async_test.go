@@ -260,8 +260,8 @@ func TestCallWithRepairBudgetAndTruncate(t *testing.T) {
 	if err := json.Unmarshal([]byte(bodies[0]), &payload); err != nil {
 		t.Fatalf("解析请求体失败: %v", err)
 	}
-	if payload.MaxTokens != recMaxTokensCap {
-		t.Fatalf("max_tokens 应钳到 %d: %d", recMaxTokensCap, payload.MaxTokens)
+	if payload.MaxTokens != moduleBudget("recommendation").MaxTokens {
+		t.Fatalf("max_tokens 应钳到 %d: %d", moduleBudget("recommendation").MaxTokens, payload.MaxTokens)
 	}
 	// repair 轮：坏输出回灌须截断（完整 1500 字回灌会拖慢下一轮）。
 	if err := json.Unmarshal([]byte(bodies[1]), &payload); err != nil {

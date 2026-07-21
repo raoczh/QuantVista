@@ -22,7 +22,6 @@ import (
 // verify（RecommendRequest.BearCheck 未显式指定时跟随 Verify）。
 const (
 	bearReviewVersion = "br1"
-	recBearTokensCap  = 1500 // 反方研究员输出预算（与复核员同档：每只 buy 一段 bear case）
 )
 
 // pickBear 反方研究员对单条 buy 的结论（落 pick 明细，影子期仅展示）。
@@ -89,10 +88,10 @@ func (s *RecommendationService) bearReview(ctx context.Context, userID int64, cf
 	type bearOut struct {
 		Bears []pickBear `json:"bears"`
 	}
-	for attempt := 0; attempt <= 1; attempt++ {
+	for attempt := 0; attempt <= moduleRepairAttempts("rec_bear"); attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-			Temperature: cfg.Temperature, MaxTokens: capModuleTokens(cfg.MaxTokens, recBearTokensCap),
+			Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("rec_bear", cfg.MaxTokens),
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
@@ -124,7 +123,7 @@ func (s *RecommendationService) bearReview(ctx context.Context, userID int64, cf
 			}
 		}
 		convo = append(convo,
-			chatMessage{Role: "assistant", Content: truncateRunes(res.Content, 600)},
+			chatMessage{Role: "assistant", Content: moduleRepairFeed("rec_bear", res.Content)},
 			chatMessage{Role: "user", Content: "上一条输出不合格。请只输出 JSON：{\"bears\":[{\"symbol\",\"bear_case\",\"severity\":\"high|med|low\"}]}，symbol 必须来自给出的买入标的。"},
 		)
 	}

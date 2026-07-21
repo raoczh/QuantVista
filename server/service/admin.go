@@ -27,6 +27,7 @@ type SystemSettingsView struct {
 	LLMAccuracyContract    bool   `json:"llm_accuracy_contract"`
 	LLMEvidenceRefs        bool   `json:"llm_evidence_refs"`
 	LLMSemanticValidator   bool   `json:"llm_semantic_validator"`
+	LLMCapabilityRouting   bool   `json:"llm_capability_routing"`
 	SiteBaseURL            string `json:"site_base_url"`
 }
 
@@ -44,6 +45,7 @@ func (s *AdminService) GetSettings() SystemSettingsView {
 		LLMAccuracyContract:    setting.LLMAccuracyContract(),
 		LLMEvidenceRefs:        setting.LLMEvidenceRefs(),
 		LLMSemanticValidator:   setting.LLMSemanticValidator(),
+		LLMCapabilityRouting:   setting.LLMCapabilityRouting(),
 		SiteBaseURL:            setting.SiteBaseURL(),
 	}
 }
@@ -61,6 +63,7 @@ type UpdateSettingsInput struct {
 	LLMAccuracyContract    *bool   `json:"llm_accuracy_contract"`
 	LLMEvidenceRefs        *bool   `json:"llm_evidence_refs"`
 	LLMSemanticValidator   *bool   `json:"llm_semantic_validator"`
+	LLMCapabilityRouting   *bool   `json:"llm_capability_routing"`
 	SiteBaseURL            *string `json:"site_base_url"` // 空串 = 清除（推送通知不带点击跳转）
 }
 
@@ -93,6 +96,11 @@ func (s *AdminService) UpdateSettings(in UpdateSettingsInput) (SystemSettingsVie
 	}
 	if in.LLMSemanticValidator != nil {
 		if err := setting.SetLLMSemanticValidator(*in.LLMSemanticValidator); err != nil {
+			return SystemSettingsView{}, err
+		}
+	}
+	if in.LLMCapabilityRouting != nil {
+		if err := setting.SetLLMCapabilityRouting(*in.LLMCapabilityRouting); err != nil {
 			return SystemSettingsView{}, err
 		}
 	}

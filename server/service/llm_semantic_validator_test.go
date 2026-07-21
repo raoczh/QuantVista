@@ -363,7 +363,7 @@ func TestNormalizePickRRDiscipline(t *testing.T) {
 
 // TestAnalysisSemanticRepairFlow 假 LLM 端到端（callWithRepair 层）：block 快照下
 // 首轮 bullish 触发语义 repair（反馈含修复指引），第二轮 neutral 通过；恒 bullish 时
-// 打满 1+maxRepairAttempts 轮后 result 仍为 nil（走既有 degraded 语义，不落成功）。
+// 打满 1+moduleRepairAttempts("analysis") 轮后 result 仍为 nil（走既有 degraded 语义，不落成功）。
 func TestAnalysisSemanticRepairFlow(t *testing.T) {
 	mkSrv := func(fixAfter int, calls *int) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -427,7 +427,7 @@ func TestAnalysisSemanticRepairFlow(t *testing.T) {
 	if result2 != nil {
 		t.Fatal("语义恒不过不得产出成功结构化结果")
 	}
-	if calls != 1+maxRepairAttempts {
-		t.Fatalf("总轮次应 1+maxRepairAttempts=%d, got %d", 1+maxRepairAttempts, calls)
+	if calls != 1+moduleRepairAttempts("analysis") {
+		t.Fatalf("总轮次应 1+moduleRepairAttempts(analysis)=%d, got %d", 1+moduleRepairAttempts("analysis"), calls)
 	}
 }

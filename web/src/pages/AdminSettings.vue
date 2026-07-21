@@ -69,6 +69,7 @@ async function load() {
     acEnabled.value = settings.value.llm_accuracy_contract
     evRefsEnabled.value = settings.value.llm_evidence_refs
     semanticEnabled.value = settings.value.llm_semantic_validator
+    capRoutingEnabled.value = settings.value.llm_capability_routing
     siteBaseURL.value = settings.value.site_base_url
   } catch (e) {
     message.error((e as Error).message)
@@ -178,6 +179,23 @@ async function toggleSemanticValidator(v: boolean) {
     await load()
   } finally {
     savingSv.value = false
+  }
+}
+
+/* P0-5 能力矩阵声明化路由：已声明/观察到不支持 json_object 的模型直接按纯文本请求 */
+const savingCapRoute = ref(false)
+const capRoutingEnabled = ref(true)
+async function toggleCapabilityRouting(v: boolean) {
+  savingCapRoute.value = true
+  try {
+    settings.value = await updateSystemSettings({ llm_capability_routing: v })
+    capRoutingEnabled.value = settings.value.llm_capability_routing
+    message.success('已保存，下一次 AI 调用生效')
+  } catch (e) {
+    message.error((e as Error).message)
+    await load()
+  } finally {
+    savingCapRoute.value = false
   }
 }
 
@@ -444,6 +462,13 @@ onMounted(() => {
             <n-switch :value="semanticEnabled" :loading="savingSv" @update:value="toggleSemanticValidator" />
             <span style="opacity: 0.6; font-size: 12px">
               开启（P0-4）：评级/动作/计划价与风险闸门的跨字段一致性（如 ST 禁买级标的不得评偏多、短线买入盈亏比不足降观察）。关闭仅回退新增跨字段规则，各模块既有校验不受影响。
+            </span>
+          </n-space>
+          <n-space align="center">
+            <span>模型能力声明化路由：</span>
+            <n-switch :value="capRoutingEnabled" :loading="savingCapRoute" @update:value="toggleCapabilityRouting" />
+            <span style="opacity: 0.6; font-size: 12px">
+              开启（P0-5）：已声明或观察到不支持 JSON 结构化输出的模型，业务调用直接按纯文本请求（省一次注定失败的请求；LLM 配置页「测试连接」会顺带探测并记录）。关闭回退每次在线试错的隐式回落。
             </span>
           </n-space>
         </n-space>

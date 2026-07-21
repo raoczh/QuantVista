@@ -40,17 +40,13 @@ const (
 	factorBarLimit     = 90    // 五维评分/窗口因子的日线口径（MA60 需 ≥60，留余量）；实际拉取按 chipBarLimit=210，评分前截尾
 	maxPoolIntake      = 240   // 建池总量护栏（自选无上限，防极端用户打爆估值批量请求）
 	poolSnapshotMax    = 150   // 候选池快照落库条目上限（MySQL TEXT 64KB 容量保护，超出部分只记数量）
-	recRepairAttempts  = 1     // 校验失败 repair 次数（2026-07-14 2→1：每多一轮就多一次逼近上游 60s 超时的机会，宁可降级）
 
 	// 异步任务化（2026-07-14）：手动生成立即返回 processing 批次，后台独立 Context 完成后回写。
 	recJobTimeout      = 6 * time.Minute  // 后台生成任务总 deadline（建池+评分 3~8s + LLM 主调/repair/复核）
 	recProcessingStale = 15 * time.Minute // processing 批次超过该时长视为死任务（进程重启遗留），惰性判 failed
 
-	// 模块级输出预算（capModuleTokens 钳制用户全局 max_tokens）：上游 60s 整包超时下，
-	// 输出 token 数直接决定单次生成时长。值取「JSON 完整所需 + 余量」，压得过低会
-	// 截断 JSON 反而触发 repair 更慢。
-	recMaxTokensCap    = 2500 // 主调/repair：≤5 只 pick（reason/risks/evidence 限条数字数）+ ≤9 条落选理由
-	recReviewTokensCap = 1500 // AI 复核员输出
+	// 模块级输出预算与 repair 次数（P0-9）：已收口 llm_budget.go 模块预算表
+	//（recommendation 2500/rec_review 1500/rec_bear 1500、repair 均 1 次、坏输出回灌 600 字）。
 )
 
 // poolFullPrefix 「评分名额已满」排除原因前缀（scorePool 补位时按它识别可回补的标的）。
@@ -970,10 +966,10 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, userID int64
 	convo := append([]chatMessage(nil), messages...)
 	run.hashPrompt(messages)
 
-	for attempt := 0; attempt <= recRepairAttempts; attempt++ {
+	for attempt := 0; attempt <= moduleRepairAttempts("recommendation"); attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-			Temperature: cfg.Temperature, MaxTokens: capModuleTokens(cfg.MaxTokens, recMaxTokensCap),
+			Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("recommendation", cfg.MaxTokens),
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
@@ -996,7 +992,7 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, userID int64
 		// 更容易再次撞上游 60s 超时。
 		symbols := poolSymbolList(pool)
 		convo = append(convo,
-			chatMessage{Role: "assistant", Content: truncateRunes(res.Content, 600)},
+			chatMessage{Role: "assistant", Content: moduleRepairFeed("recommendation", res.Content)},
 			chatMessage{Role: "user", Content: "上一条输出不合格：" + perr.Error() +
 				"。只能从以下候选池 symbol 中选，严禁使用池外或杜撰的代码：" + symbols +
 				"。请重新输出 JSON：{\"picks\":[...],\"rejected\":[...]}，每个 pick 含 symbol、action、confidence、reason、risks、evidence 等字段，rejected 为池内未入选标的的 {symbol,reason} 一句话理由，不要任何解释或代码块标记。"},
@@ -1048,10 +1044,10 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 		Reviews []pickReview `json:"reviews"`
 		Overall string       `json:"overall"`
 	}
-	for attempt := 0; attempt <= 1; attempt++ {
+	for attempt := 0; attempt <= moduleRepairAttempts("rec_review"); attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-			Temperature: cfg.Temperature, MaxTokens: capModuleTokens(cfg.MaxTokens, recReviewTokensCap),
+			Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("rec_review", cfg.MaxTokens),
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
@@ -1092,7 +1088,7 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 			}
 		}
 		convo = append(convo,
-			chatMessage{Role: "assistant", Content: res.Content},
+			chatMessage{Role: "assistant", Content: moduleRepairFeed("rec_review", res.Content)},
 			chatMessage{Role: "user", Content: "上一条输出不合格。请只输出 JSON：{\"reviews\":[{\"symbol\",\"verdict\":\"pass|warn|reject\",\"comment\",\"confidence\"}],\"overall\":\"...\"}，symbol 必须来自被审推荐。"},
 		)
 	}
