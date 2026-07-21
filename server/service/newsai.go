@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -219,7 +218,7 @@ func enhanceBatchLLM(ctx context.Context, cfg *model.LLMConfig, apiKey string, a
 	run.hashPrompt(messages)
 	res, err := chatCompletion(ctx, chatParams{
 		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-		Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens,
+		Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("news", cfg.MaxTokens),
 		Messages: messages,
 		JSONMode: true, AllowPrivate: allowPrivate,
 		Meta: run.chatMeta(adminID, cfg, 1),
@@ -235,7 +234,8 @@ func enhanceBatchLLM(ctx context.Context, cfg *model.LLMConfig, apiKey string, a
 		Items []newsEnhanceItem `json:"items"`
 	}
 	if err := json.Unmarshal([]byte(extractJSONObject(res.Content)), &out); err != nil {
-		return nil, fmt.Errorf("增强输出解析失败: %v", err)
+		// P0-9：输出不合法进统一机读码（无 repair，调用方降级规则路径）。
+		return nil, refusalErrf(RefusalLLMOutputInvalid, "增强输出解析失败: %v", err)
 	}
 	byID := make(map[int64]newsEnhanceItem, len(out.Items))
 	for _, it := range out.Items {

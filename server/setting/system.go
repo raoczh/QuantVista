@@ -28,6 +28,7 @@ const (
 	keyLLMAccuracy        = "llm_accuracy_contract"
 	keyLLMEvidenceRefs    = "llm_evidence_refs"
 	keyLLMSemanticValid   = "llm_semantic_validator"
+	keyLLMCapRouting      = "llm_capability_routing"
 )
 
 // 新闻快讯采集间隔（分钟）的默认值与钳制范围：下限防打爆免费上游，上限防配成"实际不采集"。
@@ -61,6 +62,9 @@ var (
 	// P0-4 跨模块语义校验（llm_semantic_validator.go）：rating/action/计划价/风险闸门
 	// 跨字段一致性。默认开；关闭仅回退新增跨字段规则，各模块既有专属校验不受此开关控制。
 	llmSemanticValidator = true
+	// P0-5 能力矩阵声明化路由（model_capabilities.go）：已声明/观察到不支持 json_object
+	// 的目标直接按 free_text 请求。默认开；关闭回退隐式回落旧路径（能力观察仍照常记录）。
+	llmCapabilityRouting = true
 )
 
 // Init 从 DB 加载系统配置；首启时若 DB 缺 GitHub 凭证而 env 提供了，则种子回填到 DB。
@@ -132,6 +136,7 @@ func apply(opts map[string]string) {
 	llmAccuracyContract = opts[keyLLMAccuracy] != "false"
 	llmEvidenceRefs = opts[keyLLMEvidenceRefs] != "false"
 	llmSemanticValidator = opts[keyLLMSemanticValid] != "false"
+	llmCapabilityRouting = opts[keyLLMCapRouting] != "false"
 }
 
 // normalizeSiteBaseURL 去空白与尾部斜杠（拼路由时统一 base+/path 形态）。
@@ -194,6 +199,10 @@ func LLMEvidenceRefs() bool { mu.RLock(); defer mu.RUnlock(); return llmEvidence
 // 各模块既有专属校验——validateTradePlan/shortPlanPricesValid 等——不受此开关影响）。
 func LLMSemanticValidator() bool { mu.RLock(); defer mu.RUnlock(); return llmSemanticValidator }
 
+// LLMCapabilityRouting P0-5 能力矩阵声明化路由开关（仅控制「按声明/观察直接降 free_text」
+// 的路由决策；四处隐式回落点与能力观察记录不受此开关影响）。
+func LLMCapabilityRouting() bool { mu.RLock(); defer mu.RUnlock(); return llmCapabilityRouting }
+
 // ---- 写入（持久化 + 刷新内存）----
 
 // SetRegistrationOpen 设置是否开放注册。
@@ -254,6 +263,17 @@ func SetLLMSemanticValidator(v bool) error {
 	}
 	mu.Lock()
 	llmSemanticValidator = v
+	mu.Unlock()
+	return nil
+}
+
+// SetLLMCapabilityRouting 设置 P0-5 能力矩阵声明化路由开关。
+func SetLLMCapabilityRouting(v bool) error {
+	if err := model.UpsertOption(keyLLMCapRouting, strconv.FormatBool(v)); err != nil {
+		return err
+	}
+	mu.Lock()
+	llmCapabilityRouting = v
 	mu.Unlock()
 	return nil
 }

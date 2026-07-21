@@ -179,6 +179,7 @@ func chatCompletion(ctx context.Context, p chatParams) (res *chatResult, err err
 	p = applyAccuracyContract(p) // ac1 契约注入+温度钳制在审计之前——RequestBody 记录上游真实收到的形态
 	effJSON := p.JSONMode
 	p.effectiveJSONMode = &effJSON
+	p = applyCapabilityRouting(p) // P0-5 声明化路由：已知不支持 json_object 的目标直接按 free_text 请求
 	started := time.Now()
 	streamed := true // 默认先走流式；回落非流式时置 false——审计必须记录实际请求形态而非入口意图
 	defer func() {
@@ -231,8 +232,8 @@ func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error)
 		return nil, err
 	}
 	if status != http.StatusOK && p.JSONMode && looksLikeUnsupportedJSONMode(status, raw) {
-		// 该服务端不支持 response_format：去掉后重试。
-		p.markJSONModeDropped()
+		// 该服务端不支持 response_format：去掉后重试，并写入能力观察（P0-5 声明化路由）。
+		p.noteJSONModeUnsupported(fmt.Sprintf("chat 非流式 HTTP %d 拒绝 response_format", status))
 		res, status, raw, latency, err = doChat(ctx, p, false)
 		if err != nil {
 			return nil, err
@@ -510,6 +511,7 @@ func chatCompletionStream(ctx context.Context, p chatParams, onDelta func(string
 	p = applyAccuracyContract(p)
 	effJSON := p.JSONMode
 	p.effectiveJSONMode = &effJSON
+	p = applyCapabilityRouting(p) // P0-5 声明化路由：已知不支持 json_object 的目标直接按 free_text 请求
 	started := time.Now()
 	defer func() {
 		err = classifyLLMError(err)
@@ -593,7 +595,7 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 			usageOpt = usageOpt && !dropUsage
 			jsonOn = jsonOn && !dropJSON
 			if dropJSON {
-				p.markJSONModeDropped()
+				p.noteJSONModeUnsupported(fmt.Sprintf("chat 流式 HTTP %d 拒绝 response_format", resp.StatusCode))
 			}
 			body = buildBody(usageOpt, jsonOn)
 			if r2, e2 := send(); e2 == nil {

@@ -13,6 +13,7 @@ export interface SystemSettings {
   llm_accuracy_contract: boolean
   llm_evidence_refs: boolean
   llm_semantic_validator: boolean
+  llm_capability_routing: boolean
   site_base_url: string
 }
 
@@ -29,6 +30,7 @@ export interface SystemSettingsUpdate {
   llm_accuracy_contract?: boolean
   llm_evidence_refs?: boolean
   llm_semantic_validator?: boolean
+  llm_capability_routing?: boolean
   site_base_url?: string
 }
 

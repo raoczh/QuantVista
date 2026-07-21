@@ -148,6 +148,9 @@ type LLMRunManifest struct {
 
 	AttemptCount int `json:"attempt_count"` // = 1 + RepairCount（不变式，manifest() 保证）
 	RepairCount  int `json:"repair_count"`  // 首轮之后的额外次数
+	// OutputBudget 模块声明的输出 token 预算（P0-9，llm_budget.go；实际请求值为
+	// min(用户配置, 本值)，见 moduleTokenCap）。0=未声明（省略）。
+	OutputBudget int `json:"output_budget,omitempty"`
 
 	FinishState    string `json:"finish_state,omitempty"`
 	FinishStateRaw string `json:"finish_state_raw,omitempty"`
@@ -162,6 +165,7 @@ func (r *llmRun) manifest(cfg *model.LLMConfig, jsonMode bool) LLMRunManifest {
 		PromptHash: r.PromptHash, DataHash: r.DataHash,
 		StructuredMethod: structuredMethodName(jsonMode),
 		AttemptCount:     r.Attempts,
+		OutputBudget:     moduleBudget(r.Module).MaxTokens,
 		FinishState:      r.FinishState, FinishStateRaw: r.FinishStateRaw,
 		DegradedReason: r.DegradedReason,
 	}

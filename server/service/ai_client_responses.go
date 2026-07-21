@@ -149,7 +149,7 @@ func responsesCompletion(ctx context.Context, p chatParams) (*chatResult, error)
 		return nil, err
 	}
 	if status != http.StatusOK && p.JSONMode && looksLikeUnsupportedJSONMode(status, raw) {
-		p.markJSONModeDropped()
+		p.noteJSONModeUnsupported(fmt.Sprintf("responses 非流式 HTTP %d 拒绝 text.format", status))
 		res, status, raw, latency, err = doResponses(ctx, p, false)
 		if err != nil {
 			return nil, err
@@ -352,7 +352,7 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 		resp.Body.Close()
 		if looksLikeUnsupportedJSONMode(resp.StatusCode, raw) && ctx.Err() == nil {
 			jsonOn = false
-			p.markJSONModeDropped()
+			p.noteJSONModeUnsupported(fmt.Sprintf("responses 流式 HTTP %d 拒绝 text.format", resp.StatusCode))
 			body, _ = json.Marshal(buildResponsesPayload(p, false, true))
 			if r2, e2 := send(); e2 == nil {
 				resp = r2

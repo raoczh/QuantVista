@@ -27,7 +27,6 @@ const (
 	// screenerParsePromptVersion 解析 prompt 版本（独立于分析 p*/推荐 s* 序列）。
 	screenerParsePromptVersion = "sp1"
 	parseStrategyTextMax       = 300 // 白话输入长度上限（rune）
-	parseStrategyRepairMax     = 1   // 结构/校验失败后的 repair 次数上限
 )
 
 // ScreenerAIService 白话建策略：LLM 解析自然语言为条件树。
@@ -93,14 +92,14 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 	var acc chatUsage
 	var parsed *parsedStrategy
 	var lastPerr error
-	for attempt := 0; attempt <= parseStrategyRepairMax; attempt++ {
+	for attempt := 0; attempt <= moduleRepairAttempts("screener_parse"); attempt++ {
 		res, callErr := chatCompletion(ctx, chatParams{
 			BaseURL:      cfg.BaseURL,
 			APIKey:       apiKey,
 			Model:        cfg.Model,
 			EndpointType: cfg.EndpointType,
 			Temperature:  cfg.Temperature,
-			MaxTokens:    cfg.MaxTokens,
+			MaxTokens:    moduleTokenCap("screener_parse", cfg.MaxTokens),
 			Messages:     convo,
 			JSONMode:     true,
 			AllowPrivate: allowPrivate,
@@ -124,7 +123,7 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 			break
 		}
 		convo = append(convo,
-			chatMessage{Role: "assistant", Content: res.Content},
+			chatMessage{Role: "assistant", Content: moduleRepairFeed("screener_parse", res.Content)},
 			chatMessage{Role: "user", Content: "上一条输出不符合要求：" + lastPerr.Error() + "。" + parseStrategyRepairHint},
 		)
 	}
@@ -132,7 +131,9 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 		consumeQuota(userID, acc.TotalTokens, true)
 	}
 	if lastPerr != nil {
-		return nil, fmt.Errorf("AI 输出无法解析为合法条件树（已重试一次）：%v", lastPerr)
+		// P0-9：repair 打满仍无合法输出进统一机读码（交互式动作，报错让用户重试，不出降级半成品）。
+		run.DegradedReason = "llm_output_invalid"
+		return nil, refusalErrf(RefusalLLMOutputInvalid, "AI 输出无法解析为合法条件树（已重试 %d 次）：%v", moduleRepairAttempts("screener_parse"), lastPerr)
 	}
 
 	out := &ParseStrategyResult{

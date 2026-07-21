@@ -301,6 +301,7 @@ func (s *LLMService) testOpenAICompatibleForUser(userID, configID int64, provide
 	}
 	// 200 也要能解析出对应端点的结构才算通过——SPA fallback / 网关拦截页会 200 + HTML，
 	// 只看状态码会"测试成功、实际分析失败"（json: invalid character '<'）。
+	capTarget := llmCapabilityTarget(configID, baseURL, modelName, endpointType)
 	if isResponses {
 		var parsed struct {
 			Output []json.RawMessage `json:"output"`
@@ -314,10 +315,13 @@ func (s *LLMService) testOpenAICompatibleForUser(userID, configID int64, provide
 				Message: fmt.Sprintf("%s：请检查 Base URL 是否为 API 地址（实际请求 %s，根地址会自动补 /v1/responses）", msg, endpoint)}
 		}
 		if len(parsed.Output) == 0 {
+			observeLLMCapability(capTarget, capEndpointResponses, capUnsupported, "连通但响应不含 output")
 			return &TestResult{OK: false, LatencyMs: latency,
 				Message: "连通但响应不含 output（" + extractErr(raw) + "），可能不支持 Responses 端点"}
 		}
-		return &TestResult{OK: true, LatencyMs: latency, Message: "连接成功"}
+		observeLLMCapability(capTarget, capEndpointResponses, capSupported, "连通探测成功")
+		return &TestResult{OK: true, LatencyMs: latency,
+			Message: "连接成功" + s.jsonModeSmokeNote(userID, configID, provider, endpointType, baseURL, apiKey, modelName, allowPrivate)}
 	}
 	var parsed struct {
 		Choices []json.RawMessage `json:"choices"`
@@ -331,10 +335,114 @@ func (s *LLMService) testOpenAICompatibleForUser(userID, configID int64, provide
 			Message: fmt.Sprintf("%s：请检查 Base URL 是否为 API 地址（实际请求 %s，根地址会自动补 /v1/chat/completions）", msg, endpoint)}
 	}
 	if len(parsed.Choices) == 0 {
+		observeLLMCapability(capTarget, capEndpointChat, capUnsupported, "连通但响应不含 choices")
 		return &TestResult{OK: false, LatencyMs: latency,
 			Message: "连通但响应不含 choices（" + extractErr(raw) + "），可能不是 OpenAI 兼容接口"}
 	}
-	return &TestResult{OK: true, LatencyMs: latency, Message: "连接成功"}
+	observeLLMCapability(capTarget, capEndpointChat, capSupported, "连通探测成功")
+	return &TestResult{OK: true, LatencyMs: latency,
+		Message: "连接成功" + s.jsonModeSmokeNote(userID, configID, provider, endpointType, baseURL, apiKey, modelName, allowPrivate)}
+}
+
+// jsonModeSmokeNote 运行 JSON 结构化能力 smoke 并生成测试结果附注（P0-5）。
+func (s *LLMService) jsonModeSmokeNote(userID, configID int64, provider, endpointType, baseURL, apiKey, modelName string, allowPrivate bool) string {
+	switch s.probeJSONModeCapability(userID, configID, provider, endpointType, baseURL, apiKey, modelName, allowPrivate) {
+	case capSupported:
+		return "；JSON 结构化：支持"
+	case capUnsupported:
+		return "；JSON 结构化：不支持（已记录，业务结构化调用将直接按纯文本请求并靠提示词约束）"
+	default:
+		return "；JSON 结构化：未能确认（业务调用将按需在线回落）"
+	}
+}
+
+// probeJSONModeCapability JSON 结构化能力 smoke（P0-5 capability matrix）：基础连通探测
+// 成功后追加一次带 response_format/text.format 的最小探测请求，结论写入能力观察存储，
+// 供业务调用的声明化路由（applyCapabilityRouting）消费——与四处隐式回落点同一观察口径。
+// 仍是独立 capability probe：module=test 单独审计、不注入任何业务 prompt；
+// 探测通过（json_object supported）不代表业务推理可用。
+func (s *LLMService) probeJSONModeCapability(userID, configID int64, provider, endpointType, baseURL, apiKey, modelName string, allowPrivate bool) llmCapState {
+	const probeMsg = `请只输出一个 JSON 对象：{"ok":true}`
+	isResponses := normalizeEndpointType(endpointType) == model.LLMEndpointResponses
+	var endpoint string
+	var body []byte
+	if isResponses {
+		endpoint = responsesURL(baseURL)
+		body, _ = json.Marshal(map[string]any{
+			"model":             modelName,
+			"input":             []map[string]string{{"role": "user", "content": probeMsg}},
+			"max_output_tokens": 32,
+			"stream":            false,
+			"text":              map[string]any{"format": map[string]string{"type": "json_object"}},
+		})
+	} else {
+		endpoint = chatCompletionsURL(baseURL)
+		body, _ = json.Marshal(map[string]any{
+			"model":           modelName,
+			"messages":        []map[string]string{{"role": "user", "content": probeMsg}},
+			"max_tokens":      32,
+			"stream":          false,
+			"response_format": map[string]string{"type": "json_object"},
+		})
+	}
+	params := chatParams{
+		Model: modelName, EndpointType: endpointType, JSONMode: true,
+		Messages: []chatMessage{{Role: "user", Content: probeMsg}},
+		Meta:     chatMeta{CallerUserID: userID, Module: "test", ConfigID: configID, Provider: provider},
+	}
+	started := time.Now()
+	var probeRes *chatResult
+	var probeErr error
+	defer func() { writeLLMCallLog(params, false, probeRes, probeErr, time.Since(started)) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		probeErr = err
+		return capUnknown
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	client := common.SafeHTTPClient(20*time.Second, allowPrivate)
+	resp, err := client.Do(req)
+	if err != nil {
+		probeErr = err
+		return capUnknown
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	target := llmCapabilityTarget(configID, baseURL, modelName, endpointType)
+	if resp.StatusCode == http.StatusOK {
+		hasContent := false
+		if isResponses {
+			var parsed struct {
+				Output []json.RawMessage `json:"output"`
+			}
+			hasContent = json.Unmarshal(raw, &parsed) == nil && len(parsed.Output) > 0
+		} else {
+			var parsed struct {
+				Choices []json.RawMessage `json:"choices"`
+			}
+			hasContent = json.Unmarshal(raw, &parsed) == nil && len(parsed.Choices) > 0
+		}
+		if hasContent {
+			observeLLMCapability(target, capJSONObject, capSupported, "provider smoke 结构化探测成功")
+			probeRes = &chatResult{Content: "json_object supported"}
+			return capSupported
+		}
+		probeErr = errors.New("结构化探测 200 但响应无内容")
+		return capUnknown
+	}
+	if looksLikeUnsupportedJSONMode(resp.StatusCode, raw) {
+		observeLLMCapability(target, capJSONObject, capUnsupported,
+			fmt.Sprintf("provider smoke HTTP %d 拒绝结构化参数", resp.StatusCode))
+		probeRes = &chatResult{Content: "json_object unsupported"}
+		return capUnsupported
+	}
+	// 网络/限流/5xx 等非结论性失败：不落观察（unknown 保持乐观路径 + 隐式回落兜底）。
+	probeErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, extractErr(raw))
+	return capUnknown
 }
 
 // extractErr 从上游错误体里抽取 message：兼容 OpenAI 风格 {"error":{"message":...}}、

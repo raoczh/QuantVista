@@ -30,7 +30,6 @@ const (
 	// 异步任务化（2026-07-14）：手动生成立即返回 processing 报告，后台独立 Context 完成后回写。
 	reportJobTimeout      = 8 * time.Minute  // 后台任务总 deadline（与原自动日报单用户 deadline 一致）
 	reportProcessingStale = 15 * time.Minute // processing 报告超过该时长视为死任务（进程重启遗留），允许重新生成接管
-	reportReviewTokensCap = 1500             // 复盘输出预算（capModuleTokens 钳制用户全局 max_tokens，压单次生成进上游 60s 窗口）
 )
 
 // DailyReportService 依赖既有服务拼装，不重复造数据链路。
@@ -855,7 +854,7 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 
 	res, err := chatCompletion(ctx, chatParams{
 		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-		Temperature: cfg.Temperature, MaxTokens: capModuleTokens(cfg.MaxTokens, reportReviewTokensCap),
+		Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("daily_report", cfg.MaxTokens),
 		Messages: messages, JSONMode: true, AllowPrivate: allowPrivate,
 		Meta: run.chatMeta(userID, cfg, 1),
 	})
@@ -868,14 +867,15 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 		return rv, total, run, nil
 	}
 
-	// repair 一次。坏输出只回灌开头片段（完整回灌会拖慢下一轮生成，更易撞上游 60s 超时）。
+	// repair 一次（与预算表 daily_report.RepairAttempts=1 声明一致——本函数为固定
+	// 「首轮+1 次 repair」结构，改次数须连同预算表同步）。坏输出按模块上限截断回灌。
 	messages = append(messages,
-		chatMessage{Role: "assistant", Content: truncateRunes(res.Content, 800)},
+		chatMessage{Role: "assistant", Content: moduleRepairFeed("daily_report", res.Content)},
 		chatMessage{Role: "user", Content: dailyReviewRepairHint},
 	)
 	res2, err := chatCompletion(ctx, chatParams{
 		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-		Temperature: cfg.Temperature, MaxTokens: capModuleTokens(cfg.MaxTokens, reportReviewTokensCap),
+		Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("daily_report", cfg.MaxTokens),
 		Messages: messages, JSONMode: true, AllowPrivate: allowPrivate,
 		Repair: true, // repair 轮：契约开启时温度固定 0
 		Meta:   run.chatMeta(userID, cfg, 2),
@@ -888,7 +888,7 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 	rv, perr := parse(res2.Content)
 	if perr != nil {
 		run.DegradedReason = "llm_output_invalid"
-		return nil, total, run, fmt.Errorf("复盘输出无法解析：%v", perr)
+		return nil, total, run, refusalErrf(RefusalLLMOutputInvalid, "复盘输出无法解析：%v", perr)
 	}
 	return rv, total, run, nil
 }

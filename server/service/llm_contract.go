@@ -239,6 +239,9 @@ const (
 	RefusalLLMResponseIncomplete = "llm_response_incomplete"
 	// RefusalLLMContentFiltered 上游安全策略拦截内容。
 	RefusalLLMContentFiltered = "llm_content_filtered"
+	// RefusalLLMOutputInvalid LLM 调用本身成功，但输出经结构化/语义校验且 repair 打满
+	// 仍无法解析为合法结果（P0-9：repair 耗尽统一进机读码，不得以裸 error 丢失语义）。
+	RefusalLLMOutputInvalid = "llm_output_invalid"
 )
 
 // refusalErr 构造机读拒答错误。

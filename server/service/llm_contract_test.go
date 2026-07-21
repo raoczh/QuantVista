@@ -887,7 +887,7 @@ func TestAccuracyContractFlagSnapshottedPerCall(t *testing.T) {
 }
 
 // TestRepairOverLimitStops 反例：模块 repair 上限到达后不得再隐式多试一轮。
-// analysis 主链路 maxRepairAttempts=2 → 总调用 = 1 首轮 + 2 repair = 3；超过则停止。
+// analysis 主链路 moduleRepairAttempts("analysis")=2 → 总调用 = 1 首轮 + 2 repair = 3；超过则停止。
 // 模拟 parse 恒失败：上游被调用次数必须恰好等于上限，不得多打。
 func TestRepairOverLimitStops(t *testing.T) {
 	setContractFlag(t, true)
@@ -910,11 +910,11 @@ func TestRepairOverLimitStops(t *testing.T) {
 		analysisRepairHint,
 	)
 	// callWithRepair 在用尽 repair 后返回 callErr=nil + 最后原文（调用方走 degraded）；
-	// 关键断言是「不多打一轮」——总次数 = 1 + maxRepairAttempts。
+	// 关键断言是「不多打一轮」——总次数 = 1 + moduleRepairAttempts("analysis")。
 	if err != nil {
 		t.Fatalf("用尽 repair 应降级返回 nil callErr, got %v", err)
 	}
-	wantCalls := 1 + maxRepairAttempts
+	wantCalls := 1 + moduleRepairAttempts("analysis")
 	if callCount != wantCalls {
 		t.Fatalf("repair 超限后不得隐式再试：期望 %d 次上游调用, got %d", wantCalls, callCount)
 	}

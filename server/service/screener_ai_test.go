@@ -235,6 +235,10 @@ func TestParseStrategyRepairStillBad(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "无法解析") {
 		t.Fatalf("应报解析失败: %v", err)
 	}
+	// P0-9：repair 打满进统一机读码。
+	if RefusalCodeOf(err) != RefusalLLMOutputInvalid {
+		t.Fatalf("repair 耗尽应带 llm_output_invalid 码: %q", RefusalCodeOf(err))
+	}
 	if calls != 2 {
 		t.Fatalf("应止步于 1 次 repair, got %d", calls)
 	}
