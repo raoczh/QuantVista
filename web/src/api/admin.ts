@@ -11,6 +11,8 @@ export interface SystemSettings {
   llm_fallback_enabled: boolean
   llm_fallback_config_id: number
   llm_accuracy_contract: boolean
+  llm_evidence_refs: boolean
+  llm_semantic_validator: boolean
   site_base_url: string
 }
 
@@ -25,6 +27,8 @@ export interface SystemSettingsUpdate {
   llm_fallback_enabled?: boolean
   llm_fallback_config_id?: number
   llm_accuracy_contract?: boolean
+  llm_evidence_refs?: boolean
+  llm_semantic_validator?: boolean
   site_base_url?: string
 }
 

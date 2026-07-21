@@ -67,6 +67,8 @@ async function load() {
     fb.enabled = settings.value.llm_fallback_enabled
     fb.config_id = settings.value.llm_fallback_config_id
     acEnabled.value = settings.value.llm_accuracy_contract
+    evRefsEnabled.value = settings.value.llm_evidence_refs
+    semanticEnabled.value = settings.value.llm_semantic_validator
     siteBaseURL.value = settings.value.site_base_url
   } catch (e) {
     message.error((e as Error).message)
@@ -142,6 +144,40 @@ async function toggleAccuracy(v: boolean) {
     await load()
   } finally {
     savingAc.value = false
+  }
+}
+
+/* P0-3 字段路径证据链（ev4）：快照结构化数据缺口注入 + 证据链 evidence_id/source 标注 */
+const savingEv = ref(false)
+const evRefsEnabled = ref(true)
+async function toggleEvidenceRefs(v: boolean) {
+  savingEv.value = true
+  try {
+    settings.value = await updateSystemSettings({ llm_evidence_refs: v })
+    evRefsEnabled.value = settings.value.llm_evidence_refs
+    message.success('已保存，下一次 AI 调用生效')
+  } catch (e) {
+    message.error((e as Error).message)
+    await load()
+  } finally {
+    savingEv.value = false
+  }
+}
+
+/* P0-4 跨模块语义校验：rating/action/计划价/风险闸门跨字段一致性（仅新增规则的回滚开关） */
+const savingSv = ref(false)
+const semanticEnabled = ref(true)
+async function toggleSemanticValidator(v: boolean) {
+  savingSv.value = true
+  try {
+    settings.value = await updateSystemSettings({ llm_semantic_validator: v })
+    semanticEnabled.value = settings.value.llm_semantic_validator
+    message.success('已保存，下一次 AI 调用生效')
+  } catch (e) {
+    message.error((e as Error).message)
+    await load()
+  } finally {
+    savingSv.value = false
   }
 }
 
@@ -386,14 +422,30 @@ onMounted(() => {
         </n-form>
       </SectionCard>
 
-      <!-- LLM 准确性契约（P0-1 ac1） -->
+      <!-- LLM 准确性契约（P0-1 ac1）+ P0-3 证据链 + P0-4 语义校验 -->
       <SectionCard title="LLM 准确性契约" :hoverable="false">
-        <n-space align="center">
-          <span>启用准确性契约：</span>
-          <n-switch :value="acEnabled" :loading="savingAc" @update:value="toggleAccuracy" />
-          <span style="opacity: 0.6; font-size: 12px">
-            开启：所有 AI 调用注入不可覆盖的准确性契约（ac1）、结构化调用低温钳制、repair 温度归零、拒收被截断或无终止标记的半截响应。仅当上游网关兼容性异常（正常请求被误判拒收）时才临时关闭回退旧路径。
-          </span>
+        <n-space vertical size="large">
+          <n-space align="center">
+            <span>启用准确性契约：</span>
+            <n-switch :value="acEnabled" :loading="savingAc" @update:value="toggleAccuracy" />
+            <span style="opacity: 0.6; font-size: 12px">
+              开启：所有 AI 调用注入不可覆盖的准确性契约（ac1）、结构化调用低温钳制、repair 温度归零、拒收被截断或无终止标记的半截响应。仅当上游网关兼容性异常（正常请求被误判拒收）时才临时关闭回退旧路径。
+            </span>
+          </n-space>
+          <n-space align="center">
+            <span>字段路径证据链：</span>
+            <n-switch :value="evRefsEnabled" :loading="savingEv" @update:value="toggleEvidenceRefs" />
+            <span style="opacity: 0.6; font-size: 12px">
+              开启（P0-3）：个股快照对缺失数据段注入结构化 unknowns（模型可区分「没有数据」与「数据为零」），数值核验明细带证据链 ID 与数据源。关闭回退 ev3 行为。
+            </span>
+          </n-space>
+          <n-space align="center">
+            <span>跨模块语义校验：</span>
+            <n-switch :value="semanticEnabled" :loading="savingSv" @update:value="toggleSemanticValidator" />
+            <span style="opacity: 0.6; font-size: 12px">
+              开启（P0-4）：评级/动作/计划价与风险闸门的跨字段一致性（如 ST 禁买级标的不得评偏多、短线买入盈亏比不足降观察）。关闭仅回退新增跨字段规则，各模块既有校验不受影响。
+            </span>
+          </n-space>
         </n-space>
       </SectionCard>
 

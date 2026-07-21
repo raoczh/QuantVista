@@ -146,6 +146,7 @@ func (s *CompareService) Compare(ctx context.Context, userID int64, allowPrivate
 			res.AICommentCheck = verifyEvidenceLabeled(
 				[]evidenceSection{{Module: "AI点评", Text: comment}},
 				snapshotLabeledValues(rows, nil))
+			markKeySection(res.AICommentCheck, "AI点评")
 		}
 		if comment != "" && usedCfg != nil {
 			res.AIConfigID = usedCfg.ID

@@ -12,6 +12,7 @@ import (
 	"quantvista/common"
 	"quantvista/datasource"
 	"quantvista/model"
+	"quantvista/setting"
 )
 
 // 数据上下文组装：为每个分析模块采集数据、压缩并分级注入，产出可复现的结构化快照。
@@ -126,6 +127,7 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 	// 直接标注资产类型并以说明替代估值段。估值随附 source_data_time（采集与源数据
 	// 时间不得混用），过期时带 valuation_stale 标注（换手/量比/振幅为旧口径）。
 	var valuation *datasource.Valuation
+	valuationMissing := false
 	if isCNFund(symbol) {
 		snap["asset_type"] = "etf"
 		snap["valuation"] = map[string]any{"note": "ETF/基金无个股估值指标（PE/PB/市值不适用）"}
@@ -143,6 +145,9 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 			"limit_up":      round2(v.LimitUp),
 			"limit_down":    round2(v.LimitDown),
 		}
+		if v.Source != "" {
+			val["source"] = v.Source // ev4：估值段数据源标识（stockFieldHints 读取进证据链）
+		}
 		if v.IsST {
 			val["is_st"] = true
 		}
@@ -153,6 +158,8 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 			val["valuation_stale"] = "估值/盘面快照非当前有效口径（换手率/量比/振幅为截至 source_data_time 的旧值），引用须声明时点"
 		}
 		snap["valuation"] = val
+	} else {
+		valuationMissing = true
 	}
 
 	// 风险闸门（S1）：ST/退市、一字板、流动性、小市值的程序化前置判定，注入 prompt
@@ -234,7 +241,45 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 	if label == "" {
 		label = q.Symbol
 	}
+	appendStockSnapshotUnknowns(snap, mkt, symbol, valuationMissing)
 	return label, snap, nil
+}
+
+// appendStockSnapshotUnknowns 个股快照的结构化数据缺口声明（ev4，P0-3，flag llm_evidence_refs
+// 缺省开）：对「本应有但取不到」的数据段落 field_path/reason/impact，随快照喂给模型
+// （区分「没有数据」和「数据为零」，禁止臆测补齐）并经 snapshotUnknownItems 透出前端。
+// 已知不适用（ETF 无估值）与有 fallback 声明的段（news 无相关新闻带 market_signals）
+// 不算缺口，不进 unknowns。字符串结构不进 snapshotLabeledValues 数值值域，不影响核验。
+func appendStockSnapshotUnknowns(snap map[string]any, mkt, symbol string, valuationMissing bool) {
+	if !setting.LLMEvidenceRefs() {
+		return
+	}
+	var unknowns []map[string]any
+	addUnknown := func(fieldPath, reason, impact string) {
+		unknowns = append(unknowns, map[string]any{"field_path": fieldPath, "reason": reason, "impact": impact})
+	}
+	if valuationMissing {
+		addUnknown("valuation", "估值/盘面数据本次不可得（数据源失败或不覆盖）",
+			"PE/PB/市值/换手等估值判断缺席，不得臆测估值水位")
+	}
+	if _, ok := snap["technicals"]; !ok {
+		addUnknown("technicals", "日线数据暂不可用",
+			"技术指标、量化评分与仓位建议缺席，不得凭印象描述均线/量能形态")
+	}
+	if mkt == "cn" && len(symbol) == 6 && !isCNFund(symbol) {
+		if _, ok := snap["finance"]; !ok {
+			addUnknown("finance", "财务指标（F10）暂未采集到",
+				"盈利能力/成长性判断缺少财务依据，不得虚构 ROE/增速等数字")
+		}
+		if _, ok := snap["org_view"]; !ok {
+			addUnknown("org_view", "机构观点（研报评级/目标价/调研）暂未采集到",
+				"无卖方观点对照，不得以「机构看好/一致预期」措辞")
+		}
+	}
+	if len(unknowns) > 0 {
+		snap["unknowns"] = unknowns
+		snap["unknowns_note"] = "以上字段本次快照缺失（缺失≠为零）：对应维度只能声明数据不足，禁止用常识或记忆补齐"
+	}
 }
 
 // computeTechnicals 从升序日线（最新在末尾）算常用技术指标。

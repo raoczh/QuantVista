@@ -54,6 +54,12 @@ const evColor = computed(() => {
 const evHasItems = computed(() => !!ev.value?.items?.length)
 const evMatchedItems = computed(() => (ev.value?.items || []).filter((i) => i.matched))
 const evUnmatchedItems = computed(() => (ev.value?.items || []).filter((i) => !i.matched))
+// ev4：结构化数据缺口与关键结论段佐证（旧记录无这些字段时 v-if 兜底不渲染）。
+const evUnknowns = computed(() => ev.value?.unknowns || [])
+const evKeyUnbacked = computed(() => {
+  const ks = ev.value?.key_section
+  return !!ks && ks.total > 0 && ks.snapshot_matched === 0
+})
 const detailShow = ref(false)
 function openDetail() {
   if (evHasItems.value) detailShow.value = true
@@ -124,6 +130,10 @@ const hasAny = computed(
         容差）<template v-if="evOriginSummary">——{{ evOriginSummary }}</template
         >。<template v-if="evAllRestated"
           >⚠ 本次命中全部为合法复述（AI 计划价/用户输入/上下文），没有任何数字被数据快照佐证，请勿当作「已被数据证明」。</template
+        ><template v-if="evKeyUnbacked"
+          >⚠ 关键结论（{{ ev?.key_section?.module }}）中的数字无一被数据快照佐证。</template
+        ><template v-if="evUnknowns.length"
+          >本次数据快照有 {{ evUnknowns.length }} 个缺失数据段（见明细「数据缺口」）。</template
         ><template v-if="ev.skipped_count"
           >另跳过 {{ ev.skipped_count }} 个（小整数/年份/代码等非核验对象）。</template
         >
@@ -197,6 +207,7 @@ const hasAny = computed(
               <span class="ev-raw" :style="{ color: upColor }"
                 >{{ it.raw }}{{ it.unit }} {{ dirLabel(it.direction) }}</span
               >
+              <span v-if="it.evidence_id" class="ev-id">{{ it.evidence_id }}</span>
               <span v-if="it.count && it.count > 1" class="ev-count">×{{ it.count }}</span>
               <span v-if="it.module" class="ev-mod">{{ it.module }}</span>
               <span
@@ -208,6 +219,7 @@ const hasAny = computed(
             </div>
             <div class="ev-match">
               {{ it.path }} = {{ it.snap_value }}<template v-if="it.tolerance"> （±{{ it.tolerance }}）</template
+              ><template v-if="it.source"> · 来源 {{ it.source }}</template
               ><template v-if="it.as_of"> · 数据时间 {{ it.as_of }}</template>
               <template v-if="it.origin === 'plan'">
                 · 该数字来自 AI 自身给出的计划价/公式输出，属合法复述，但并非被数据快照佐证</template
@@ -221,6 +233,21 @@ const hasAny = computed(
               <template v-else-if="!it.origin"> · 数据快照佐证</template>
             </div>
             <div v-if="it.sentence" class="ev-sent">「{{ it.sentence }}」</div>
+          </div>
+        </n-collapse-item>
+        <n-collapse-item
+          v-if="evUnknowns.length"
+          :title="`数据缺口 ${evUnknowns.length} 项`"
+          name="unknowns"
+        >
+          <div v-for="(u, i) in evUnknowns" :key="'k' + i" class="ev-item">
+            <div class="ev-line">
+              <span class="ev-raw" :style="{ color: flatColor }">{{ u.field_path }}</span>
+            </div>
+            <div class="ev-reason">{{ u.reason }}<template v-if="u.impact">——{{ u.impact }}</template></div>
+          </div>
+          <div class="ev-reason" style="margin-top: 6px">
+            以上数据段本次快照缺失（缺失≠为零）：AI 已被要求对应维度只声明数据不足、不得臆测补齐。
           </div>
         </n-collapse-item>
       </n-collapse>
@@ -275,6 +302,15 @@ const hasAny = computed(
 .ev-mod {
   font-size: 12px;
   color: v-bind('vars.textColor3');
+}
+.ev-id {
+  font-size: 11px;
+  font-family: monospace;
+  color: v-bind('vars.textColor3');
+  border: 1px solid v-bind('vars.dividerColor');
+  border-radius: 10px;
+  padding: 0 6px;
+  line-height: 16px;
 }
 .ev-reason,
 .ev-match {

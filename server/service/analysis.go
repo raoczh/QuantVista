@@ -261,6 +261,9 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	}
 
 	// 解析器按模式分流：标准 → AnalysisResult；panel → PanelResult。
+	// 结构化解析之后叠加 P0-4 跨字段语义校验（rating vs 风险闸门）：校验错误同解析错误
+	// 一样触发 repair（错误文案即修复反馈），repair 后仍不过走既有 degraded 路径——
+	// 语义不一致的结果不落「成功」。
 	var result *AnalysisResult
 	var panel *PanelResult
 	parse := func(content string) error {
@@ -269,12 +272,18 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 			if perr != nil {
 				return perr
 			}
+			if serr := validatePanelSemantics(p, actx.Snapshot); serr != nil {
+				return serr
+			}
 			panel = p
 			return nil
 		}
 		r, perr := parseAnalysisResult(content)
 		if perr != nil {
 			return perr
+		}
+		if serr := validateAnalysisSemantics(r, actx.Snapshot); serr != nil {
+			return serr
 		}
 		result = r
 		return nil
@@ -451,7 +460,7 @@ func (s *AnalysisService) fillAnalysisTrust(ctx context.Context, userID int64, c
 	addSec("关注点", result.Suggestions...)
 	addSec("反方观点", result.AntiThesis...)
 	addSec("失效条件", result.KillSwitches...)
-	vals := snapshotLabeledValues(snapshot, stockAsOfHints(snapshot), "recent_bars")
+	vals := snapshotLabeledValues(snapshot, stockFieldHints(snapshot), "recent_bars")
 	// 新闻标题是喂给模型的文本型合法来源（N2 舆情段）：标题里的小数并入值域，
 	// 忠实引用不算幻觉（同日报 Alerts 前例）。公告标题（F1）与风险闸门提示文本
 	//（S1，含 9.5/3000 等阈值数字）同理。
@@ -473,6 +482,10 @@ func (s *AnalysisService) fillAnalysisTrust(ctx context.Context, userID int64, c
 		}
 	}
 	result.EvidenceCheck = verifyEvidenceLabeled(sections, vals)
+	// ev4（P0-3）：快照 builder 声明的结构化数据缺口透传前端；关键结论段（总结）的
+	// 快照佐证计数——总结含数字但无一被快照佐证时在置信依据里如实点名。
+	result.EvidenceCheck.Unknowns = snapshotUnknownItems(snapshot)
+	markKeySection(result.EvidenceCheck, "总结")
 	result.SysConfidence, result.SysConfidenceWhy = analysisSystemConfidence(result.EvidenceCheck, snapshot)
 
 	if !req.Verify {
@@ -512,6 +525,11 @@ func analysisSystemConfidence(ev *evidenceCheck, snapshot map[string]any) (strin
 		level += delta
 		if reason != "" {
 			reasons = append(reasons, reason)
+		}
+		// ev4（P0-3）：关键结论段（总结）含数字但无一被快照佐证时如实点名——
+		// 不额外降档（全局命中率已由上面口径管），只保证覆盖缺口对用户可见。
+		if ks := ev.KeySection; ks != nil && ks.Total > 0 && ks.SnapshotMatched == 0 {
+			reasons = append(reasons, "关键结论（总结）中的数字无一被数据快照佐证")
 		}
 	}
 	// 个股快照（含 quote 块）才有技术因子/量化评分锚点；缺失则定性判断精度受限。

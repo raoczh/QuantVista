@@ -126,7 +126,10 @@ func TestSnapshotLabeledValues(t *testing.T) {
 		"note":        "文本不参与",
 		"zero":        0.0,
 	}
-	vals := snapshotLabeledValues(snap, map[string]string{"quote.": "2026-07-17 15:00:00"}, "recent_bars")
+	vals := snapshotLabeledValues(snap, &snapshotHints{
+		asOf:   map[string]string{"quote.": "2026-07-17 15:00:00"},
+		source: map[string]string{"quote.": "eastmoney"},
+	}, "recent_bars")
 	for _, want := range []float64{12.34, -1.5, 11.98, 2.5e9, 25} { // 25 = 亿元换算
 		if !labeledHas(vals, want) {
 			t.Fatalf("值域缺少 %v，got %+v", want, vals)
@@ -150,6 +153,9 @@ func TestSnapshotLabeledValues(t *testing.T) {
 	}
 	if priceItem.AsOf != "2026-07-17 15:00:00" {
 		t.Fatalf("as_of hint 未命中，got %q", priceItem.AsOf)
+	}
+	if priceItem.Source != "eastmoney" {
+		t.Fatalf("source hint 未命中（ev4），got %q", priceItem.Source)
 	}
 }
 

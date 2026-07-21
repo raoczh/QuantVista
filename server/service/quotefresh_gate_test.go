@@ -152,8 +152,8 @@ func TestEvidenceOriginSummary(t *testing.T) {
 	check := verifyEvidenceLabeled([]evidenceSection{
 		{Module: "回答", Text: "现价 9.88，目标价 10.5；你提到的成本 8.8 与新闻里的 3.33 亿"},
 	}, vals)
-	if check.Version != "ev3" {
-		t.Fatalf("核验版本应为 ev3: %s", check.Version)
+	if check.Version != "ev4" {
+		t.Fatalf("核验版本应为 ev4: %s", check.Version)
 	}
 	if check.Matched != 4 {
 		t.Fatalf("总命中应 4: %+v", check)

@@ -25,6 +25,8 @@ type SystemSettingsView struct {
 	LLMFallbackEnabled     bool   `json:"llm_fallback_enabled"`
 	LLMFallbackConfigID    int64  `json:"llm_fallback_config_id"`
 	LLMAccuracyContract    bool   `json:"llm_accuracy_contract"`
+	LLMEvidenceRefs        bool   `json:"llm_evidence_refs"`
+	LLMSemanticValidator   bool   `json:"llm_semantic_validator"`
 	SiteBaseURL            string `json:"site_base_url"`
 }
 
@@ -40,6 +42,8 @@ func (s *AdminService) GetSettings() SystemSettingsView {
 		LLMFallbackEnabled:     setting.LLMFallbackEnabled(),
 		LLMFallbackConfigID:    setting.LLMFallbackConfigID(),
 		LLMAccuracyContract:    setting.LLMAccuracyContract(),
+		LLMEvidenceRefs:        setting.LLMEvidenceRefs(),
+		LLMSemanticValidator:   setting.LLMSemanticValidator(),
 		SiteBaseURL:            setting.SiteBaseURL(),
 	}
 }
@@ -55,6 +59,8 @@ type UpdateSettingsInput struct {
 	LLMFallbackEnabled     *bool   `json:"llm_fallback_enabled"`
 	LLMFallbackConfigID    *int64  `json:"llm_fallback_config_id"`
 	LLMAccuracyContract    *bool   `json:"llm_accuracy_contract"`
+	LLMEvidenceRefs        *bool   `json:"llm_evidence_refs"`
+	LLMSemanticValidator   *bool   `json:"llm_semantic_validator"`
 	SiteBaseURL            *string `json:"site_base_url"` // 空串 = 清除（推送通知不带点击跳转）
 }
 
@@ -77,6 +83,16 @@ func (s *AdminService) UpdateSettings(in UpdateSettingsInput) (SystemSettingsVie
 	}
 	if in.LLMAccuracyContract != nil {
 		if err := setting.SetLLMAccuracyContract(*in.LLMAccuracyContract); err != nil {
+			return SystemSettingsView{}, err
+		}
+	}
+	if in.LLMEvidenceRefs != nil {
+		if err := setting.SetLLMEvidenceRefs(*in.LLMEvidenceRefs); err != nil {
+			return SystemSettingsView{}, err
+		}
+	}
+	if in.LLMSemanticValidator != nil {
+		if err := setting.SetLLMSemanticValidator(*in.LLMSemanticValidator); err != nil {
 			return SystemSettingsView{}, err
 		}
 	}

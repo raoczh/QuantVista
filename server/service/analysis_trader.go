@@ -113,7 +113,9 @@ func (s *AnalysisService) attachTradePlan(ctx context.Context, userID int64, cfg
 			return perr
 		}
 		if !p.NoPlan {
-			if verr := validateTradePlan(px, p); verr != nil {
+			// P0-4 统一收口：既有专属校验（validateTradePlan，恒开）+ 跨字段上下文
+			// 一致性（risk gate block/评级偏空反证，flag 控）。
+			if verr := validateTradePlanSemantics(px, p, result.Rating, snapshot); verr != nil {
 				return verr
 			}
 		}

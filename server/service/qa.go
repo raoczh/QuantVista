@@ -271,7 +271,7 @@ func (s *QaService) finalizeAsk(userID int64, ac *qaAskContext, res *chatResult)
 	checkJSON := ""
 	var snap map[string]any
 	if json.Unmarshal([]byte(ac.conv.DataSnapshot), &snap) == nil {
-		vals := snapshotLabeledValues(snap, stockAsOfHints(snap), "recent_bars")
+		vals := snapshotLabeledValues(snap, stockFieldHints(snap), "recent_bars")
 		// 快照 news 舆情段的新闻标题是文本型合法来源，标题里的小数并入值域（N2）；
 		// announcements 公告段标题（F1）与 risk_gate 提示文本（S1）同理。
 		vals = append(vals, textLabeledValues("新闻标题", "context", newsTitleTexts(snap))...)
@@ -287,6 +287,9 @@ func (s *QaService) finalizeAsk(userID int64, ac *qaAskContext, res *chatResult)
 		// 均不得把它冒充「数据快照佐证」。
 		vals = append(vals, textLabeledValues("用户提问", "user", userTexts)...)
 		check := verifyEvidenceLabeled([]evidenceSection{{Module: "回答", Text: answer}}, vals)
+		// ev4（P0-3）：快照结构化数据缺口透传 + 关键结论段（回答）快照佐证计数。
+		check.Unknowns = snapshotUnknownItems(snap)
+		markKeySection(check, "回答")
 		if b, err := json.Marshal(check); err == nil {
 			checkJSON = string(b)
 		}

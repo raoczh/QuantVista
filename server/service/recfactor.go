@@ -500,6 +500,10 @@ type evidenceCheck struct {
 	PlanMatched     int `json:"plan_matched,omitempty"`     // 命中模型自身计划价/公式输出（复述，非快照佐证）
 	UserMatched     int `json:"user_matched,omitempty"`     // 命中用户输入/设定阈值（复述，非快照佐证）
 	ContextMatched  int `json:"context_matched,omitempty"`  // 命中新闻/公告标题、提醒文案等上下文文本
+
+	// ev4（P0-3 字段路径证据链）：结构化数据缺口与关键结论段证据覆盖。
+	Unknowns   []evidenceUnknown   `json:"unknowns,omitempty"`    // 快照 builder 声明的缺失数据段（field_path/reason/impact）
+	KeySection *evidenceKeySection `json:"key_section,omitempty"` // 关键结论段（总结/回答/AI点评）的快照佐证计数
 }
 
 var evidenceNumRe = regexp.MustCompile(`[-+]?\d+(?:\.\d+)?`)
