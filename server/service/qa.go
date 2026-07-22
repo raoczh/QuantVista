@@ -82,6 +82,9 @@ type qaAskContext struct {
 	cfg      *model.LLMConfig
 	apiKey   string
 	run      *llmRun // P0-2：本轮提问的调用组（会话级 trace + 每问一个 run）
+	// promptVersion 本轮实际使用的 prompt 版本（P0-6 修复批：prepare 阶段从同一模板快照
+	// 产出，buildMessages 正文/run/会话落库三处共用——finalize 刷新会话字段不再重新查库）。
+	promptVersion string
 }
 
 // qaConvLocks 会话级进程内互斥：同一会话的并发追问必须串行，否则两问会各自
@@ -176,6 +179,12 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 		return nil, err
 	}
 
+	// P0-6 修复批：qa 模板一次固化快照——会话 PromptVersion、buildMessages 的角色段与
+	// run 的 prompt 版本全部消费同一份（此前三处各查一次库，模板中途编辑会造成
+	// 「正文与版本不一致」或同一次提问内版本漂移）。
+	qaPrompt := loadPromptRuntime(userID, model.PromptModuleQa)
+	promptVersion := qaPrompt.Version(qaPromptVersion)
+
 	// 取得或新建会话。
 	var conv model.AiConversation
 	isNewConv := req.ConversationID <= 0
@@ -187,7 +196,7 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 			return nil, errors.New("该会话消息已达上限，请新建会话")
 		}
 	} else if req.AnalysisRecordID > 0 {
-		c, cerr := qaConversationFromAnalysis(userID, req.AnalysisRecordID, cfg, question)
+		c, cerr := qaConversationFromAnalysis(userID, req.AnalysisRecordID, cfg, question, promptVersion)
 		if cerr != nil {
 			return nil, cerr
 		}
@@ -218,7 +227,7 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 			UserID: userID, Symbol: symbol, Market: market, Name: name,
 			Title:       truncateRunes(question, 128),
 			LLMConfigID: cfg.ID, Provider: cfg.Provider, Model: cfg.Model,
-			PromptVersion: qaPromptVersionFor(userID),
+			PromptVersion: promptVersion,
 			TraceID:       newLLMTraceID(), // P0-2：会话级 trace，本会话全部调用共享
 			DataSnapshot:  string(snapJSON),
 		}
@@ -239,14 +248,15 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 	if err != nil {
 		return nil, err
 	}
-	messages := s.buildMessages(conv, history, question)
-	run := newLLMRun(conv.TraceID, "", "qa", "qa.free_text.v1", qaPromptVersionFor(userID))
+	messages := s.buildMessagesFrom(qaPrompt, conv, history, question)
+	run := newLLMRun(conv.TraceID, "", "qa", "qa.free_text.v1", promptVersion)
 	run.hashData(conv.DataSnapshot)
 	run.hashPrompt(messages)
 	return &qaAskContext{
 		conv: conv, isNew: isNewConv, question: question, history: history,
 		messages: messages,
 		cfg:      cfg, apiKey: apiKey, run: run,
+		promptVersion: promptVersion,
 	}, nil
 }
 
@@ -312,9 +322,11 @@ func (s *QaService) finalizeAsk(userID int64, ac *qaAskContext, res *chatResult)
 			return err
 		}
 		return tx.Model(&model.AiConversation{}).Where("id = ?", ac.conv.ID).Updates(map[string]any{
-			"message_count":  gorm.Expr("message_count + 2"),
-			"total_tokens":   gorm.Expr("total_tokens + ?", res.Usage.TotalTokens),
-			"prompt_version": qaPromptVersionFor(userID),
+			"message_count": gorm.Expr("message_count + 2"),
+			"total_tokens":  gorm.Expr("total_tokens + ?", res.Usage.TotalTokens),
+			// P0-6 修复批：刷新用 prepare 阶段固化的版本（与本轮 buildMessages 正文同快照），
+			// 不再重新查库——落库版本必然对应本轮实际使用的模板内容。
+			"prompt_version": ac.promptVersion,
 		}).Error
 	})
 	if err != nil {
@@ -330,7 +342,8 @@ func (s *QaService) finalizeAsk(userID int64, ac *qaAskContext, res *chatResult)
 // qaConversationFromAnalysis 从分析记录新建问答会话：复用其数据快照（已 fitBudget），
 // 不重复拉数——问答的上下文与分析所见完全一致，追问「刚才的结论」才有据可依。
 // 校验归属（仅本人）且必须是带快照的个股分析。落库后返回。
-func qaConversationFromAnalysis(userID, recordID int64, cfg *model.LLMConfig, question string) (*model.AiConversation, error) {
+// promptVersion 由调用方（prepareAsk）从本轮模板快照产出，保证与实际消息正文同源。
+func qaConversationFromAnalysis(userID, recordID int64, cfg *model.LLMConfig, question, promptVersion string) (*model.AiConversation, error) {
 	var rec model.AnalysisRecord
 	if err := common.DB.Select("id", "user_id", "module", "market", "symbol", "target", "data_snapshot").
 		Where("id = ? AND user_id = ?", recordID, userID).First(&rec).Error; err != nil {
@@ -347,7 +360,7 @@ func qaConversationFromAnalysis(userID, recordID int64, cfg *model.LLMConfig, qu
 		UserID: userID, Symbol: rec.Symbol, Market: rec.Market, Name: name,
 		Title:       truncateRunes(question, 128),
 		LLMConfigID: cfg.ID, Provider: cfg.Provider, Model: cfg.Model,
-		PromptVersion: qaPromptVersionFor(userID),
+		PromptVersion: promptVersion,
 		TraceID:       newLLMTraceID(), // P0-2：独立会话独立 trace（与源分析记录经快照复用间接关联）
 		DataSnapshot:  rec.DataSnapshot,
 	}
@@ -389,13 +402,19 @@ func (s *QaService) qaCurrentFreshness(market string, meta *qaSnapshotMeta) (str
 	}
 }
 
-// buildMessages 组装发送给 LLM 的消息序列。系统提示含个股数据快照，历史仅取最近若干条。
+// buildMessages 组装发送给 LLM 的消息序列（独立查询一次模板；业务链路 prepareAsk 用
+// buildMessagesFrom 消费已固化的快照）。保留供单测直接调用。
+func (s *QaService) buildMessages(conv model.AiConversation, history []model.AiConversationMessage, question string) []chatMessage {
+	return s.buildMessagesFrom(loadPromptRuntime(conv.UserID, model.PromptModuleQa), conv, history, question)
+}
+
+// buildMessagesFrom 由模板快照组装消息序列。系统提示含个股数据快照，历史仅取最近若干条。
 // P0-6：module=qa 的自定义模板是 L3 任务段（替换默认角色行，占位符宽容渲染），要求
 // 契约段恒由系统追加不可覆盖；快照注入与时效重判段不变。
-func (s *QaService) buildMessages(conv model.AiConversation, history []model.AiConversationMessage, question string) []chatMessage {
+func (s *QaService) buildMessagesFrom(qaPrompt promptRuntime, conv model.AiConversation, history []model.AiConversationMessage, question string) []chatMessage {
 	var sys strings.Builder
 	intro := qaRoleIntro
-	if custom, ok := promptOverrideFor(conv.UserID, model.PromptModuleQa, map[string]string{
+	if custom, ok := qaPrompt.Render(map[string]string{
 		"symbol": conv.Symbol, "name": conv.Name, "market": conv.Market,
 	}); ok {
 		intro = composeCustomTaskPrompt(custom, qaPromptContract)

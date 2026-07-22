@@ -36,7 +36,7 @@ func TestCapabilitiesMerge(t *testing.T) {
 	resetLLMCapabilityStore()
 	t.Cleanup(resetLLMCapabilityStore)
 
-	target := llmCapabilityTarget(0, "https://x.example.com", "m1", "")
+	target := llmCapabilityTarget(0, "gw", "https://x.example.com", "m1", "")
 	if got := capabilitiesFor("openai", target).JSONObject; got != capSupported {
 		t.Fatalf("openai 内置声明应 supported, got %s", got)
 	}
@@ -58,8 +58,23 @@ func TestCapabilitiesMerge(t *testing.T) {
 		t.Fatalf("过期后应回落内置声明, got %s", got)
 	}
 	// configID 参与 key：同 URL 不同配置身份互不污染。
-	if llmCapabilityTarget(7, "https://x.example.com", "m1", "") == target {
+	if llmCapabilityTarget(7, "gw", "https://x.example.com", "m1", "") == target {
 		t.Fatal("配置身份应参与观察 key")
+	}
+	// P0-5 修复批：BaseURL 与 provider 都参与 key——配置只换上游（改 BaseURL 或 provider）
+	// 而保持 configID/model/endpoint 时，新上游不得继承旧上游的观察。
+	if llmCapabilityTarget(7, "gw", "https://x.example.com", "m1", "") ==
+		llmCapabilityTarget(7, "gw", "https://y.example.com", "m1", "") {
+		t.Fatal("BaseURL 应参与观察 key（换上游旧观察须失效）")
+	}
+	if llmCapabilityTarget(7, "gw", "https://x.example.com", "m1", "") ==
+		llmCapabilityTarget(7, "other", "https://x.example.com", "m1", "") {
+		t.Fatal("provider 应参与观察 key")
+	}
+	// 规范化：BaseURL 尾斜杠/大小写不产生第二个 key。
+	if llmCapabilityTarget(7, "GW", "https://X.example.com/", "m1", "") !=
+		llmCapabilityTarget(7, "gw", "https://x.example.com", "m1", "") {
+		t.Fatal("provider/BaseURL 应规范化后参与 key")
 	}
 }
 
@@ -222,7 +237,7 @@ func TestJSONModeSmokeProbe(t *testing.T) {
 		if !r.OK || !strings.Contains(r.Message, "JSON 结构化：支持") {
 			t.Fatalf("应连接成功且 smoke 判支持: %+v", r)
 		}
-		target := llmCapabilityTarget(0, srv.URL, "m", "")
+		target := llmCapabilityTarget(0, "gw", srv.URL, "m", "")
 		if obs, ok := lookupLLMCapability(target, capJSONObject); !ok || obs.State != capSupported {
 			t.Fatalf("smoke 应写 supported 观察: %+v ok=%v", obs, ok)
 		}
@@ -253,7 +268,7 @@ func TestJSONModeSmokeProbe(t *testing.T) {
 		if !r.OK || !strings.Contains(r.Message, "JSON 结构化：不支持") {
 			t.Fatalf("基础连通成功 + smoke 判不支持: %+v", r)
 		}
-		if obs, ok := lookupLLMCapability(llmCapabilityTarget(0, srv.URL, "m", ""), capJSONObject); !ok || obs.State != capUnsupported {
+		if obs, ok := lookupLLMCapability(llmCapabilityTarget(0, "gw", srv.URL, "m", ""), capJSONObject); !ok || obs.State != capUnsupported {
 			t.Fatalf("smoke 应写 unsupported 观察: %+v ok=%v", obs, ok)
 		}
 	})
@@ -274,7 +289,7 @@ func TestJSONModeSmokeProbe(t *testing.T) {
 		if !r.OK || !strings.Contains(r.Message, "未能确认") {
 			t.Fatalf("5xx 属非结论性失败: %+v", r)
 		}
-		if _, ok := lookupLLMCapability(llmCapabilityTarget(0, srv.URL, "m", ""), capJSONObject); ok {
+		if _, ok := lookupLLMCapability(llmCapabilityTarget(0, "gw", srv.URL, "m", ""), capJSONObject); ok {
 			t.Fatal("非结论性失败不得写观察")
 		}
 	})
@@ -397,5 +412,172 @@ func TestCallWithRepairFeedTruncated(t *testing.T) {
 	}
 	if got := len([]rune(secondReqAssistant)); got > wantMax+1 { // truncateRunes 带省略号容差
 		t.Fatalf("回灌应截断到 ≤%d rune, got %d", wantMax, got)
+	}
+}
+
+// TestLooksLikeUnsupportedParamRecognition P0-5 修复批：参数识别收紧的表驱动正反例——
+// JSON mode 判定必须明确指向结构化字段；「model/stream/temperature not supported」是反例；
+// temperature/max_tokens 各自只认指向自身字段且带「不被接受」措辞的错误，值超限不算。
+func TestLooksLikeUnsupportedParamRecognition(t *testing.T) {
+	cases := []struct {
+		name                   string
+		body                   string
+		json, temperature, tok bool
+	}{
+		{"response_format 不支持", `{"error":{"message":"response_format is not supported"}}`, true, false, false},
+		{"text.format 非法", `{"error":{"message":"Invalid parameter: text.format"}}`, true, false, false},
+		{"json_object 拒绝", `{"error":{"message":"json_object unsupported by this model"}}`, true, false, false},
+		{"model 不支持（反例）", `{"error":{"message":"model not supported"}}`, false, false, false},
+		{"stream 不支持（反例）", `{"error":{"message":"stream not supported"}}`, false, false, false},
+		{"temperature 不支持", `{"error":{"message":"temperature is not supported with this model"}}`, false, true, false},
+		{"temperature 值不受支持", `{"error":{"message":"Unsupported value: 'temperature' does not support 0.2 with this model."}}`, false, true, false},
+		{"max_tokens 参数不支持", `{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."}}`, false, false, true},
+		{"max_tokens 值超限（反例）", `{"error":{"message":"max_tokens is too large: 999999. This model supports at most 4096."}}`, false, false, false},
+		{"泛 400 无字段指向（反例）", `{"error":{"message":"bad request"}}`, false, false, false},
+	}
+	for _, c := range cases {
+		if got := looksLikeUnsupportedJSONMode(400, []byte(c.body)); got != c.json {
+			t.Errorf("%s: json=%v want %v", c.name, got, c.json)
+		}
+		if got := looksLikeUnsupportedTemperature(400, []byte(c.body)); got != c.temperature {
+			t.Errorf("%s: temperature=%v want %v", c.name, got, c.temperature)
+		}
+		if got := looksLikeUnsupportedMaxTokens(400, []byte(c.body)); got != c.tok {
+			t.Errorf("%s: max_tokens=%v want %v", c.name, got, c.tok)
+		}
+	}
+	// 5xx 一律不判参数不支持。
+	if looksLikeUnsupportedJSONMode(500, []byte("response_format")) ||
+		looksLikeUnsupportedTemperature(500, []byte("temperature not supported")) {
+		t.Fatal("5xx 不得判参数不支持")
+	}
+}
+
+// TestFallbackFailureNoObservation P0-5 修复批：fallback 失败不得提交能力观察——
+// 首个 4xx 文案虽含 response_format 字样，但去参重试仍 4xx（错误另有原因），
+// 观察存储必须保持干净，后续能力状态不被单次误判污染。
+func TestFallbackFailureNoObservation(t *testing.T) {
+	setCapRoutingFlag(t, true)
+	resetLLMCapabilityStore()
+	t.Cleanup(resetLLMCapabilityStore)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(b), "response_format") {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"response_format is not supported"}}`))
+			return
+		}
+		// 去参后仍 4xx：真正的错误另有原因（如模型名不存在）。
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"message":"model m not found"}}`))
+	}))
+	defer srv.Close()
+
+	params := chatParams{
+		BaseURL: srv.URL, APIKey: "k", Model: "m", JSONMode: true, AllowPrivate: true,
+		Messages: []chatMessage{{Role: "user", Content: "hi"}},
+		Meta:     chatMeta{CallerUserID: 1, Module: "captest_fbfail"},
+	}
+	if _, err := chatCompletion(context.Background(), params); err == nil {
+		t.Fatal("fallback 仍失败应返回错误")
+	}
+	if _, ok := lookupLLMCapability(capabilityTargetOf(params), capJSONObject); ok {
+		t.Fatal("fallback 失败不得提交 unsupported 观察")
+	}
+}
+
+// TestTemperatureCapabilityFallback temperature 参数能力贯通端到端：首次调用被
+// 「temperature not supported」4xx 拒 → 去参重试成功 → 提交观察；第二次调用声明化路由
+// 直接省略 temperature（最终 payload 不含该字段），审计 RequestBody 记录最终形态。
+func TestTemperatureCapabilityFallback(t *testing.T) {
+	setCapRoutingFlag(t, true)
+	resetLLMCapabilityStore()
+	t.Cleanup(resetLLMCapabilityStore)
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		if strings.Contains(string(b), "temperature") {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"temperature is not supported with this model"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"total_tokens":5}}`))
+	}))
+	defer srv.Close()
+
+	params := chatParams{
+		BaseURL: srv.URL, APIKey: "k", Model: "m", Temperature: 0.7, AllowPrivate: true,
+		Messages: []chatMessage{{Role: "user", Content: "hi"}},
+		Meta:     chatMeta{CallerUserID: 1, Module: "captest_temp"},
+	}
+	if _, err := chatCompletion(context.Background(), params); err != nil {
+		t.Fatalf("温度 fallback 应成功: %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("应 2 个请求（带温度被拒+去参成功）, got %d", len(bodies))
+	}
+	if strings.Contains(bodies[1], "temperature") {
+		t.Fatal("fallback 请求不得再带 temperature")
+	}
+	if obs, ok := lookupLLMCapability(capabilityTargetOf(params), capTemperature); !ok || obs.State != capUnsupported {
+		t.Fatalf("fallback 成功后应提交 temperature 观察: %+v ok=%v", obs, ok)
+	}
+	// 第二次调用：声明化路由直接省略 temperature，只发 1 个请求。
+	if _, err := chatCompletion(context.Background(), params); err != nil {
+		t.Fatalf("路由后调用应成功: %v", err)
+	}
+	if len(bodies) != 3 || strings.Contains(bodies[2], "temperature") {
+		t.Fatalf("路由后应 1 个不带 temperature 的请求: n=%d", len(bodies))
+	}
+	// 审计 RequestBody=最终实际 payload（不含 temperature，含 messages/model）。
+	var lastLog model.LLMCallLog
+	if err := common.DB.Where("module = ?", "captest_temp").Order("id desc").First(&lastLog).Error; err != nil {
+		t.Fatalf("查审计失败: %v", err)
+	}
+	if strings.Contains(lastLog.RequestBody, `"temperature"`) || !strings.Contains(lastLog.RequestBody, `"model"`) {
+		t.Fatalf("审计 RequestBody 应为最终省略 temperature 的 payload: %.120s", lastLog.RequestBody)
+	}
+}
+
+// TestMaxTokensCapabilityFallback max_tokens 参数能力贯通：被「Unsupported parameter:
+// max_tokens」4xx 拒 → 去参重试成功 → 提交观察；路由后直接省略（预算失效可观察不静默——
+// 观察存储/审计 payload 双向可见）。
+func TestMaxTokensCapabilityFallback(t *testing.T) {
+	setCapRoutingFlag(t, true)
+	resetLLMCapabilityStore()
+	t.Cleanup(resetLLMCapabilityStore)
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		if strings.Contains(string(b), "max_tokens") {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model."}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"total_tokens":5}}`))
+	}))
+	defer srv.Close()
+
+	params := chatParams{
+		BaseURL: srv.URL, APIKey: "k", Model: "m", MaxTokens: 2000, AllowPrivate: true,
+		Messages: []chatMessage{{Role: "user", Content: "hi"}},
+		Meta:     chatMeta{CallerUserID: 1, Module: "captest_tok"},
+	}
+	if _, err := chatCompletion(context.Background(), params); err != nil {
+		t.Fatalf("max_tokens fallback 应成功: %v", err)
+	}
+	if len(bodies) != 2 || strings.Contains(bodies[1], "max_tokens") {
+		t.Fatalf("fallback 请求不得再带 max_tokens: n=%d", len(bodies))
+	}
+	if obs, ok := lookupLLMCapability(capabilityTargetOf(params), capMaxTokens); !ok || obs.State != capUnsupported {
+		t.Fatalf("fallback 成功后应提交 max_tokens 观察: %+v ok=%v", obs, ok)
+	}
+	if _, err := chatCompletion(context.Background(), params); err != nil {
+		t.Fatalf("路由后调用应成功: %v", err)
+	}
+	if len(bodies) != 3 || strings.Contains(bodies[2], "max_tokens") {
+		t.Fatalf("路由后应 1 个不带 max_tokens 的请求: n=%d", len(bodies))
 	}
 }

@@ -76,6 +76,11 @@ func Migrate() error {
 	if err := common.DB.AutoMigrate(AllModels()...); err != nil {
 		return err
 	}
+	// P0-6 存量模板基线迁移（幂等）：legacy prompt_templates 行回填 content_hash/revision
+	// 并补建基线快照——保证升级后的首次修改/删除仍能回查升级前原文。
+	if err := MigratePromptTemplateBaselines(); err != nil {
+		common.SysWarn("prompt 模板基线迁移未完成（不阻断启动，下次启动重试）: %v", err)
+	}
 	common.SysLog("数据库自动迁移完成")
 	return nil
 }

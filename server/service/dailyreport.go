@@ -324,6 +324,10 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 	snapJSON, _ := json.Marshal(snapshot)
 	pref := s.userPref(userID)
 
+	// P0-6 修复批：daily 模板一次固化快照——callReview 的系统提示、run 的 prompt 版本与
+	// report.PromptVersion 消费同一份，模板在复盘生成期间被编辑不会造成正文/版本错位。
+	dailyPrompt := loadPromptRuntime(userID, model.PromptModuleDaily)
+
 	// 复盘与推荐并行（2026-07-14）：两路 LLM 链路互不依赖、互不阻断（单方失败 partial
 	// 的语义早已存在），串行只是白白把总时长翻倍。单用户瞬时并发=2，可接受。
 	// P0-2 调用关联：日报复盘链路一个 trace（推荐批次自带 trace，经批次 ID 间接串联）。
@@ -340,7 +344,7 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		review, reviewTokens, reviewRun, reviewErr = s.callReview(ctx, userID, date, plan.cfg, plan.apiKey, plan.allowPrivate, string(snapJSON), trace)
+		review, reviewTokens, reviewRun, reviewErr = s.callReview(ctx, userID, date, dailyPrompt, plan.cfg, plan.apiKey, plan.allowPrivate, string(snapJSON), trace)
 	}()
 	go func() {
 		defer wg.Done()
@@ -356,7 +360,8 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 
 	report.SnapshotJSON = string(snapJSON)
 	// M3c：复盘 prompt 版本落库（启用 daily 自定义模板时 -custom 后缀，历史可归因）。
-	report.PromptVersion = promptVersionFor(userID, model.PromptModuleDaily, dailyReviewPromptVersion)
+	// P0-6 修复批：与 callReview 用的正文出自同一 dailyPrompt 快照。
+	report.PromptVersion = dailyPrompt.Version(dailyReviewPromptVersion)
 	// 生成时使用的 LLM 落库（配置名前端按 llm_config_id 查自己的配置清单解析）。
 	report.LLMConfigID = plan.cfg.ID
 	report.Provider = plan.cfg.Provider
@@ -834,11 +839,17 @@ func dailyReviewEvidence(rv *dailyReview, snap *reportSnapshot) *evidenceCheck {
 // d2: 输出纪律条（段落句数/risk_warnings 字数上限，压单次生成时长进上游 60s 窗口）；d1: 初版。
 const dailyReviewPromptVersion = "d3"
 
-// dailyReviewSystemFor 本次复盘的系统提示：P0-6 起 module=daily 的自定义模板是 L3
-// 任务段（替换默认角色行），规则/schema 契约段恒由系统追加不可覆盖（占位符 {{date}}
-// 宽容渲染）。独立成函数供单测直接断言组装形态。
+// dailyReviewSystemFor 本次复盘的系统提示（独立查询一次模板；业务链路请用
+// dailyReviewSystemFrom 消费已固化的快照）。独立成函数供单测直接断言组装形态。
 func dailyReviewSystemFor(userID int64, date string) string {
-	if custom, ok := promptOverrideFor(userID, model.PromptModuleDaily, map[string]string{"date": date}); ok {
+	return dailyReviewSystemFrom(loadPromptRuntime(userID, model.PromptModuleDaily), date)
+}
+
+// dailyReviewSystemFrom 由模板快照组装复盘系统提示：P0-6 起 module=daily 的自定义模板是
+// L3 任务段（替换默认角色行），规则/schema 契约段恒由系统追加不可覆盖（占位符 {{date}}
+// 宽容渲染）。
+func dailyReviewSystemFrom(pr promptRuntime, date string) string {
+	if custom, ok := pr.Render(map[string]string{"date": date}); ok {
 		return composeCustomTaskPrompt(custom, dailyReviewContract)
 	}
 	return dailyReviewSystem
@@ -846,14 +857,15 @@ func dailyReviewSystemFor(userID int64, date string) string {
 
 // callReview 调用 LLM 生成复盘，解析失败 repair 一次。返回（复盘, 总 token, run 元数据, 错误）。
 // 首轮与 repair 轮共享同一 run_id（attempt 1/2），P0-2 关联元数据随审计与日报落库。
-func (s *DailyReportService) callReview(ctx context.Context, userID int64, date string, cfg *model.LLMConfig, apiKey string, allowPrivate bool, snapshotJSON, traceID string) (*dailyReview, int, *llmRun, error) {
-	sys := dailyReviewSystemFor(userID, date)
+// dailyPrompt 为调用方一次固化的模板快照（正文与版本同源，P0-6 修复批）。
+func (s *DailyReportService) callReview(ctx context.Context, userID int64, date string, dailyPrompt promptRuntime, cfg *model.LLMConfig, apiKey string, allowPrivate bool, snapshotJSON, traceID string) (*dailyReview, int, *llmRun, error) {
+	sys := dailyReviewSystemFrom(dailyPrompt, date)
 	messages := []chatMessage{
 		{Role: "system", Content: sys},
 		{Role: "user", Content: fmt.Sprintf("今日收盘数据如下（JSON）：\n%s", truncateRunes(snapshotJSON, contextBudgetChars))},
 	}
 	run := newLLMRun(traceID, "", "daily_report", "daily_report.v1",
-		promptVersionFor(userID, model.PromptModuleDaily, dailyReviewPromptVersion))
+		dailyPrompt.Version(dailyReviewPromptVersion))
 	run.hashData(snapshotJSON)
 	run.hashPrompt(messages)
 	total := 0
@@ -875,10 +887,13 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 		Meta: run.chatMeta(userID, cfg, 1),
 	})
 	run.record(res, err)
+	if res != nil {
+		// audit outcome：拒收调用的真实 token 消耗也计入（res 在完整性拒收时非 nil）。
+		total += res.Usage.TotalTokens
+	}
 	if err != nil {
 		return nil, total, run, err
 	}
-	total += res.Usage.TotalTokens
 	if rv, perr := parse(res.Content); perr == nil {
 		return rv, total, run, nil
 	}
@@ -897,10 +912,12 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 		Meta:   run.chatMeta(userID, cfg, 2),
 	})
 	run.record(res2, err)
+	if res2 != nil {
+		total += res2.Usage.TotalTokens
+	}
 	if err != nil {
 		return nil, total, run, err
 	}
-	total += res2.Usage.TotalTokens
 	rv, perr := parse(res2.Content)
 	if perr != nil {
 		run.DegradedReason = "llm_output_invalid"

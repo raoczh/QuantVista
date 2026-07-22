@@ -411,6 +411,10 @@ type recGenPlan struct {
 	bear         bool // S2-2 反方研究员（未显式指定时关联 verify）
 	cfg          *model.LLMConfig
 	apiKey       string
+	// prompt P0-6 修复批：recommend 模板的不可变运行快照——同步段一次读取固化，
+	// 批次 PromptVersion（newProcessingBatch）与后台 buildMessages 的正文消费同一份；
+	// 后台严禁重新查库读模板（异步窗口内模板被编辑会造成正文与已记录版本不一致）。
+	prompt promptRuntime
 }
 
 // prepareGeneration 同步段：参数校验、LLM 配置解析、配额熔断、筛选条件装载。
@@ -460,6 +464,7 @@ func (s *RecommendationService) prepareGeneration(userID int64, allowPrivate boo
 		userID: userID, allowPrivate: allowPrivate, manualAction: manualAction,
 		recType: req.Type, market: market, count: count, strat: strat,
 		filters: filters, verify: req.Verify, bear: bear, cfg: cfg, apiKey: apiKey,
+		prompt: loadPromptRuntime(userID, model.PromptModuleRecommend),
 	}, nil
 }
 
@@ -472,7 +477,9 @@ func (p *recGenPlan) newProcessingBatch() *model.RecommendationBatch {
 		Status:      model.RecStatusProcessing,
 		LLMConfigID: p.cfg.ID, Provider: p.cfg.Provider, Model: p.cfg.Model,
 		// M3c：启用 recommend 自定义模板时版本号加 -custom 后缀（同分析域前例，历史可归因）。
-		PromptVersion:   promptVersionFor(p.userID, model.PromptModuleRecommend, recPromptVersion),
+		// P0-6 修复批：版本出自 plan.prompt 快照——后台 buildMessages 用同一快照渲染正文，
+		// 版本与实际发送的模板内容必然一致（不再各自查库）。
+		PromptVersion:   p.prompt.Version(recPromptVersion),
 		StrategyVersion: recStrategyVersion,
 		// P0-2：批次级 trace_id 建任务即固化——processing 阶段轮询详情已可按它查审计。
 		TraceID: newLLMTraceID(),
@@ -578,7 +585,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	// 的影子对照（prompt 里既有的 BenchTrend 弱势提示保持现状不动）。
 	batch.Regime = regime.Regime
 	batch.RegimeJSON = marshalRegimeJSON(regime) // 拒选/降级路径也可见；成功路径追加仓位参数后覆盖
-	messages := s.buildMessages(userID, recType, strat, market, count, llmCands, filters, mktCtx)
+	messages := s.buildMessages(plan.prompt, recType, strat, market, count, llmCands, filters, mktCtx)
 	llmInput, _ := json.Marshal(map[string]any{"market_context": mktCtx, "candidates": compactForLLM(recType, llmCands)})
 	batch.CandidateCount = kept
 	batch.CandidatePool = poolJSON
@@ -976,6 +983,13 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, userID int64
 		})
 		run.record(res, err)
 		if err != nil {
+			// audit outcome（P0-8 修复批）：完整性拒收的调用上游确已消耗 token，
+			// res 带出的真实 usage 照常累计进批次统计。
+			if res != nil {
+				acc.PromptTokens += res.Usage.PromptTokens
+				acc.CompletionTokens += res.Usage.CompletionTokens
+				acc.TotalTokens += res.Usage.TotalTokens
+			}
 			return nil, nil, acc, lastLatency, err
 		}
 		acc.PromptTokens += res.Usage.PromptTokens
@@ -1054,6 +1068,12 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 		})
 		run.record(res, err)
 		if err != nil {
+			// audit outcome：拒收调用的真实 token 消耗照常累计（res 可能非 nil）。
+			if res != nil {
+				usage.PromptTokens += res.Usage.PromptTokens
+				usage.CompletionTokens += res.Usage.CompletionTokens
+				usage.TotalTokens += res.Usage.TotalTokens
+			}
 			return nil, "", usage, run
 		}
 		usage.PromptTokens += res.Usage.PromptTokens
@@ -2183,13 +2203,15 @@ func composeBatchTitle(recType string, strat *strategyTemplate, filters RecFilte
 
 // buildMessages 组装系统提示 + 用户消息。p4：候选已由量化系统筛选评分排序，
 // LLM 的角色是「精选 + 解读 + 否决」而非海选；强制引用字段数值、禁用先验记忆、允许少选。
-func (s *RecommendationService) buildMessages(userID int64, recType string, strat *strategyTemplate, market string, count int, llmCands []candidate, filters RecFilters, mktCtx *recMarketContext) []chatMessage {
+// recPrompt 为同步段固化进 recGenPlan 的模板快照（P0-6 修复批：与批次 PromptVersion 同源，
+// 后台不得重新查库读模板）。
+func (s *RecommendationService) buildMessages(recPrompt promptRuntime, recType string, strat *strategyTemplate, market string, count int, llmCands []candidate, filters RecFilters, mktCtx *recMarketContext) []chatMessage {
 	var sys strings.Builder
 	// P0-6：module=recommend 的自定义模板是 L3 任务段（替换默认角色定位），铁律契约段
 	// 恒由系统追加不可覆盖（composeCustomTaskPrompt）；反编造另有 parseAndFilterPicks
 	// 程序化兜底。占位符宽容渲染。
 	intro := recRoleIntro
-	if custom, ok := promptOverrideFor(userID, model.PromptModuleRecommend, map[string]string{
+	if custom, ok := recPrompt.Render(map[string]string{
 		"type": recTypeLabel(recType), "strategy": strat.Name,
 		"market": market, "count": strconv.Itoa(count),
 	}); ok {

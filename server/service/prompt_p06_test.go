@@ -107,6 +107,183 @@ func TestPromptContentHashAndRevision(t *testing.T) {
 	}
 }
 
+// TestPromptRuntimeSnapshotConsistency P0-6 修复批：loadPromptRuntime 固化的快照不可变——
+// 模板在快照读取之后被编辑（模拟「promptOverrideFor 与 promptVersionFor 分别查库」竞态窗口
+// 内的更新，确定性注入，不依赖 sleep），已固化快照的正文与版本仍指向同一旧内容；
+// 重新 load 才得到新内容。异步场景（推荐 recGenPlan）靠该性质保证后台正文与已记录版本一致。
+func TestPromptRuntimeSnapshotConsistency(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Exec("DELETE FROM prompt_templates")
+	common.DB.Exec("DELETE FROM prompt_template_revisions")
+	t.Cleanup(func() {
+		common.DB.Exec("DELETE FROM prompt_templates")
+		common.DB.Exec("DELETE FROM prompt_template_revisions")
+	})
+	svc := &PromptService{}
+	if _, _, err := svc.Upsert(41, PromptInput{Module: model.PromptModuleQa, Content: "旧版角色 {{name}}", Enabled: true}); err != nil {
+		t.Fatalf("初版失败: %v", err)
+	}
+
+	pr := loadPromptRuntime(41, model.PromptModuleQa)
+	if !pr.Custom || pr.Hash != promptContentHash("旧版角色 {{name}}") {
+		t.Fatalf("快照未命中初版: %+v", pr)
+	}
+
+	// 快照固化后模板被编辑（中途更新场景，确定性注入）。
+	if _, _, err := svc.Upsert(41, PromptInput{Module: model.PromptModuleQa, Content: "新版角色", Enabled: true}); err != nil {
+		t.Fatalf("更新失败: %v", err)
+	}
+
+	// 已固化快照：正文与版本仍为旧内容且互相一致。
+	body, ok := pr.Render(map[string]string{"name": "茅台"})
+	if !ok || body != "旧版角色 茅台" {
+		t.Fatalf("快照正文应保持旧版: %q", body)
+	}
+	wantOld := qaPromptVersion + "-custom." + promptContentHash("旧版角色 {{name}}")[:8]
+	if v := pr.Version(qaPromptVersion); v != wantOld {
+		t.Fatalf("快照版本应保持旧版: %q want %q", v, wantOld)
+	}
+	// 重新 load：得到新内容，版本随内容变化。
+	pr2 := loadPromptRuntime(41, model.PromptModuleQa)
+	if body2, _ := pr2.Render(nil); body2 != "新版角色" {
+		t.Fatalf("重新加载应得新版: %q", body2)
+	}
+	if pr2.Version(qaPromptVersion) == wantOld {
+		t.Fatal("新内容版本串必须变化")
+	}
+}
+
+// TestRecPlanPromptSnapshot 推荐异步计划的模板快照固化：prepareGeneration 时代读入
+// recGenPlan 的快照，在后台执行前模板被编辑（异步窗口内更新的确定性注入）——
+// newProcessingBatch 记录的 PromptVersion 与 buildMessages 实际注入的正文必须同源（旧版）。
+func TestRecPlanPromptSnapshot(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Exec("DELETE FROM prompt_templates")
+	common.DB.Exec("DELETE FROM prompt_template_revisions")
+	t.Cleanup(func() {
+		common.DB.Exec("DELETE FROM prompt_templates")
+		common.DB.Exec("DELETE FROM prompt_template_revisions")
+	})
+	svc := &PromptService{}
+	if _, _, err := svc.Upsert(42, PromptInput{Module: model.PromptModuleRecommend, Content: "旧版推荐重点", Enabled: true}); err != nil {
+		t.Fatalf("初版失败: %v", err)
+	}
+
+	// 模拟 prepareGeneration 同步段：快照固化进计划。
+	plan := &recGenPlan{
+		userID: 42, recType: model.RecTypeShortTerm, market: "cn", count: 3,
+		strat:  &strategyTemplate{Key: "momentum", Name: "动量突破", guide: "看量价"},
+		cfg:    &model.LLMConfig{ID: 1, Provider: "openai", Model: "gpt-x"},
+		prompt: loadPromptRuntime(42, model.PromptModuleRecommend),
+	}
+	batch := plan.newProcessingBatch()
+
+	// 后台执行前模板被编辑。
+	if _, _, err := svc.Upsert(42, PromptInput{Module: model.PromptModuleRecommend, Content: "新版推荐重点", Enabled: true}); err != nil {
+		t.Fatalf("更新失败: %v", err)
+	}
+
+	// 后台段：buildMessages 消费计划里的快照——正文是旧版，且与批次已记录版本的 hash8 对应。
+	rec := &RecommendationService{}
+	msgs := rec.buildMessages(plan.prompt, plan.recType, plan.strat, plan.market, plan.count, nil, RecFilters{}, nil)
+	if !strings.Contains(msgs[0].Content, "旧版推荐重点") || strings.Contains(msgs[0].Content, "新版推荐重点") {
+		t.Fatalf("后台正文必须来自计划固化的旧快照: %.80s", msgs[0].Content)
+	}
+	wantVer := recPromptVersion + "-custom." + promptContentHash("旧版推荐重点")[:8]
+	if batch.PromptVersion != wantVer {
+		t.Fatalf("批次版本 = %q, want %q（与后台正文同源）", batch.PromptVersion, wantVer)
+	}
+}
+
+// TestPromptBaselineMigration P0-6 修复批：legacy 模板基线迁移——升级前旧行（hash 空/
+// revision=0/无快照）回填 + 基线快照补建 + 重复迁移零写入 + 部分迁移状态修复 +
+// 迁移后的首次修改仍能回查升级前原文。
+func TestPromptBaselineMigration(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Exec("DELETE FROM prompt_templates")
+	common.DB.Exec("DELETE FROM prompt_template_revisions")
+	t.Cleanup(func() {
+		common.DB.Exec("DELETE FROM prompt_templates")
+		common.DB.Exec("DELETE FROM prompt_template_revisions")
+	})
+
+	// legacy 行：AutoMigrate 后的升级前形态（content_hash=""、revision=0、无任何快照）。
+	legacy := &model.PromptTemplate{UserID: 51, Module: model.PromptModuleDaily, Content: "升级前的珍贵正文", Enabled: true}
+	common.DB.Create(legacy)
+	common.DB.Model(&model.PromptTemplate{}).Where("id = ?", legacy.ID).
+		Updates(map[string]any{"content_hash": "", "revision": 0})
+
+	// 部分迁移状态：行已回填但快照缺失。
+	partial := &model.PromptTemplate{UserID: 52, Module: model.PromptModuleQa, Content: "行已回填快照缺失",
+		ContentHash: model.PromptContentHash("行已回填快照缺失"), Revision: 1, Enabled: true}
+	common.DB.Create(partial)
+
+	// 已完整迁移的行（对照组：不得产生任何新写入）。
+	complete := &model.PromptTemplate{UserID: 53, Module: model.PromptModuleReview, Content: "已完整",
+		ContentHash: model.PromptContentHash("已完整"), Revision: 2, Enabled: true}
+	common.DB.Create(complete)
+	common.DB.Create(&model.PromptTemplateRevision{TemplateID: complete.ID, UserID: 53,
+		Module: model.PromptModuleReview, Revision: 2, ContentHash: complete.ContentHash, Content: "已完整"})
+
+	if err := model.MigratePromptTemplateBaselines(); err != nil {
+		t.Fatalf("迁移失败: %v", err)
+	}
+
+	// legacy 行：hash/revision 回填 + 基线快照=升级前原文。
+	// （每次查询用新变量——复用带主键的 struct 会把旧字段带进 WHERE，GORM 已知坑。）
+	var rowLegacy model.PromptTemplate
+	common.DB.First(&rowLegacy, legacy.ID)
+	if rowLegacy.ContentHash != model.PromptContentHash("升级前的珍贵正文") || rowLegacy.Revision != 1 {
+		t.Fatalf("legacy 行应回填 hash/revision: %+v", rowLegacy)
+	}
+	var revs []model.PromptTemplateRevision
+	common.DB.Where("template_id = ?", legacy.ID).Find(&revs)
+	if len(revs) != 1 || revs[0].Revision != 1 || revs[0].Content != "升级前的珍贵正文" {
+		t.Fatalf("legacy 行应补建基线快照: %+v", revs)
+	}
+
+	// 部分迁移行：只补快照，行 revision 不动。
+	var rowPartial model.PromptTemplate
+	common.DB.First(&rowPartial, partial.ID)
+	if rowPartial.Revision != 1 {
+		t.Fatalf("部分迁移行 revision 不应变化: %+v", rowPartial)
+	}
+	common.DB.Where("template_id = ?", partial.ID).Find(&revs)
+	if len(revs) != 1 || revs[0].Content != "行已回填快照缺失" || revs[0].Revision != 1 {
+		t.Fatalf("部分迁移行应只补快照: %+v", revs)
+	}
+
+	// 重复迁移幂等：再跑一次，快照数与 revision 零变化。
+	if err := model.MigratePromptTemplateBaselines(); err != nil {
+		t.Fatalf("重复迁移失败: %v", err)
+	}
+	var cnt int64
+	common.DB.Model(&model.PromptTemplateRevision{}).Count(&cnt)
+	if cnt != 3 { // legacy 1 + partial 1 + complete 1
+		t.Fatalf("重复迁移不得新增快照，总数 %d", cnt)
+	}
+	var rowLegacy2 model.PromptTemplate
+	common.DB.First(&rowLegacy2, legacy.ID)
+	if rowLegacy2.Revision != 1 {
+		t.Fatalf("重复迁移不得递增 revision: %+v", rowLegacy2)
+	}
+	var rowComplete model.PromptTemplate
+	common.DB.First(&rowComplete, complete.ID)
+	if rowComplete.Revision != 2 {
+		t.Fatalf("已完整行不得被改动: %+v", rowComplete)
+	}
+
+	// 升级后的首次修改：旧正文仍可回查（rev1=升级前原文，rev2=新内容）。
+	svc := &PromptService{}
+	if _, _, err := svc.Upsert(51, PromptInput{Module: model.PromptModuleDaily, Content: "升级后的新正文", Enabled: true}); err != nil {
+		t.Fatalf("升级后首次修改失败: %v", err)
+	}
+	common.DB.Where("template_id = ?", legacy.ID).Order("revision").Find(&revs)
+	if len(revs) != 2 || revs[0].Content != "升级前的珍贵正文" || revs[1].Content != "升级后的新正文" || revs[1].Revision != 2 {
+		t.Fatalf("首次修改后升级前原文必须可回查: %+v", revs)
+	}
+}
+
 // TestLintPromptContent 占位符/内容诊断表驱动（P0-6「占位符错误可诊断」）。
 func TestLintPromptContent(t *testing.T) {
 	cases := []struct {

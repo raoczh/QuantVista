@@ -57,7 +57,7 @@ const (
 )
 
 // llmModelCapabilities 一个 (provider, model, endpoint) 目标的能力声明快照
-//（内置声明与运行时观察合并后的视图）。
+// （内置声明与运行时观察合并后的视图）。
 type llmModelCapabilities struct {
 	JSONObject  llmCapState
 	FreeText    llmCapState
@@ -94,22 +94,24 @@ type llmCapObservation struct {
 // 个人自用单实例，进程内即可；重启清零无害（回到 unknown 乐观路径）。
 var llmCapabilityStore sync.Map // string -> llmCapObservation
 
-// llmCapabilityTarget 观察 key 的目标标识。configID>0 用配置身份（配置改模型后 key
-// 变化天然失效）；无配置身份（TestByInput 表单探测）退回 URL+模型。
-func llmCapabilityTarget(configID int64, baseURL, modelName, endpointType string) string {
+// llmCapabilityTarget 观察 key 的目标标识。必须包含配置身份（configID）、规范化
+// provider、规范化 BaseURL、model 与 endpoint 全部维度——configID 不变但用户改配置
+// 换上游（改 BaseURL/provider 而保持 model/endpoint）时，key 随之变化，旧上游的观察
+// 天然失效，不会被新上游继承（P0-5 修复批：此前 configID 形态缺 BaseURL/provider 维度）。
+// 无配置身份（TestByInput 表单探测）时 configID=0，凭 URL 形态区分。
+func llmCapabilityTarget(configID int64, provider, baseURL, modelName, endpointType string) string {
 	ep := endpointType
 	if ep == "" {
 		ep = model.LLMEndpointChat
 	}
-	if configID > 0 {
-		return fmt.Sprintf("cfg:%d|%s|%s", configID, modelName, ep)
-	}
-	return fmt.Sprintf("url:%s|%s|%s", strings.TrimRight(strings.TrimSpace(baseURL), "/"), modelName, ep)
+	base := strings.ToLower(strings.TrimRight(strings.TrimSpace(baseURL), "/"))
+	prov := strings.ToLower(strings.TrimSpace(provider))
+	return fmt.Sprintf("cfg:%d|%s|%s|%s|%s", configID, prov, base, modelName, ep)
 }
 
 // capabilityTargetOf 从一次调用参数派生观察 key。
 func capabilityTargetOf(p chatParams) string {
-	return llmCapabilityTarget(p.Meta.ConfigID, p.BaseURL, p.Model, p.EndpointType)
+	return llmCapabilityTarget(p.Meta.ConfigID, p.Meta.Provider, p.BaseURL, p.Model, p.EndpointType)
 }
 
 // observeLLMCapability 写入一条运行时观察。状态变化时打系统日志（错误路由可观察）；
@@ -147,7 +149,9 @@ func resetLLMCapabilityStore() {
 }
 
 // capabilitiesFor 合并「内置 provider 声明 + 运行时观察」输出能力快照：观察优先于声明
-//（观察来自该目标的真实响应，比按 provider 名的静态假设可信）。
+// （观察来自该目标的真实响应，比按 provider 名的静态假设可信）。json_object 之外，
+// temperature/max_tokens 参数能力同样由观察覆盖（P0-5 修复批：此前两维只有静态字段、
+// 从未参与决策，最终 payload 无条件发送）。
 func capabilitiesFor(provider string, target string) llmModelCapabilities {
 	caps, ok := builtinProviderCapabilities[strings.ToLower(strings.TrimSpace(provider))]
 	if !ok {
@@ -156,29 +160,58 @@ func capabilitiesFor(provider string, target string) llmModelCapabilities {
 	if obs, ok := lookupLLMCapability(target, capJSONObject); ok {
 		caps.JSONObject = obs.State
 	}
+	if obs, ok := lookupLLMCapability(target, capTemperature); ok {
+		caps.Temperature = obs.State
+	}
+	if obs, ok := lookupLLMCapability(target, capMaxTokens); ok {
+		caps.MaxTokens = obs.State
+	}
 	return caps
 }
 
-// applyCapabilityRouting 公开出口的声明化路由：结构化调用（JSONMode）在能力矩阵已声明
-// json_object 不支持时，直接按 free_text 请求——省掉一次注定失败的请求与隐式回落，
-// 审计 structured_method 如实记 free_text（markJSONModeDropped）。
+// applyCapabilityRouting 公开出口的声明化路由（P0-5）：
+//   - 结构化调用（JSONMode）在能力矩阵已声明 json_object 不支持时，直接按 free_text 请求
+//     ——省掉一次注定失败的请求与隐式回落，审计 structured_method 如实记 free_text；
+//   - temperature/max_tokens 参数已声明不支持时，最终 payload 直接不携带该参数
+//     （不再无条件发送；实际发送形态以审计 RequestBody 的最终 payload 为准）。
+//
 // 必须在 effectiveJSONMode 观测指针初始化之后调用；flag 关闭时原样返回（保留旧隐式回落路径）。
 func applyCapabilityRouting(p chatParams) chatParams {
-	if !p.JSONMode || !setting.LLMCapabilityRouting() {
+	if !setting.LLMCapabilityRouting() {
 		return p
 	}
-	target := capabilityTargetOf(p)
-	if capabilitiesFor(p.Meta.Provider, target).JSONObject == capUnsupported {
+	caps := capabilitiesFor(p.Meta.Provider, capabilityTargetOf(p))
+	if p.JSONMode && caps.JSONObject == capUnsupported {
 		p.JSONMode = false
 		p.markJSONModeDropped()
+	}
+	if caps.Temperature == capUnsupported {
+		p.markTemperatureOmitted()
+	}
+	if p.MaxTokens > 0 && caps.MaxTokens == capUnsupported {
+		// token 参数不被上游接受：省略参数而非拒绝调用（模块预算的强制力由此失效，
+		// 属可观察的兼容性降级——观察存储/系统日志/审计 RequestBody 三处可见，
+		// 不是静默无上限）。
+		p.markMaxTokensOmitted()
 	}
 	return p
 }
 
-// noteJSONModeUnsupported 四处 JSON mode 隐式回落点（chat/responses × 流式/非流式）的
-// 统一挂钩：审计观测置 free_text（markJSONModeDropped 原语义）+ 写入能力观察，让下一次
-// 调用走声明化路由。新增回落分支必须改调本方法而非裸调 markJSONModeDropped。
-func (p chatParams) noteJSONModeUnsupported(reason string) {
-	p.markJSONModeDropped()
+// observeJSONModeUnsupported JSON mode 能力观察提交（P0-5 修复批：与审计观测拆分）。
+// 只允许在「去掉结构化参数后的 fallback 请求确认成功」之后调用——4xx 里的字样只是猜测，
+// fallback 成功才证明失败确实源于结构化参数；fallback 也失败（错误另有原因，如模型名
+// 不存在）时不得提交，否则一次误判污染该目标 12h 的能力状态。
+// 审计侧的 markJSONModeDropped（最终请求形态=free_text）仍应在重试发出前置位，两者职责不同。
+func (p chatParams) observeJSONModeUnsupported(reason string) {
 	observeLLMCapability(capabilityTargetOf(p), capJSONObject, capUnsupported, reason)
+}
+
+// observeTemperatureUnsupported / observeMaxTokensUnsupported 参数能力观察提交，
+// 纪律同 observeJSONModeUnsupported：仅在去参 fallback 确认成功后调用。
+func (p chatParams) observeTemperatureUnsupported(reason string) {
+	observeLLMCapability(capabilityTargetOf(p), capTemperature, capUnsupported, reason)
+}
+
+func (p chatParams) observeMaxTokensUnsupported(reason string) {
+	observeLLMCapability(capabilityTargetOf(p), capMaxTokens, capUnsupported, reason)
 }

@@ -48,7 +48,7 @@ A 股空头论据检查框架（逐项对照名单数据检查，命中才写）
 
 // bearReview 对 buy 条目独立调用构建 bear case。best-effort：失败只是没有反方结论，
 // 不影响主结果；1 次 repair。返回按 symbol 归并的有效结论、token 用量与反方 run 元数据
-//（无 buy 零调用时 run 为 nil）。
+// （无 buy 零调用时 run 为 nil）。
 func (s *RecommendationService) bearReview(ctx context.Context, userID int64, cfg *model.LLMConfig, apiKey string, allowPrivate bool, picks []recPick, pool map[string]candidate, traceID, parentRunID string) ([]pickBear, chatUsage, *llmRun) {
 	var usage chatUsage
 	rows := make([]map[string]any, 0, len(picks))
@@ -98,6 +98,12 @@ func (s *RecommendationService) bearReview(ctx context.Context, userID int64, cf
 		})
 		run.record(res, err)
 		if err != nil {
+			// audit outcome：拒收调用的真实 token 消耗照常累计（res 可能非 nil）。
+			if res != nil {
+				usage.PromptTokens += res.Usage.PromptTokens
+				usage.CompletionTokens += res.Usage.CompletionTokens
+				usage.TotalTokens += res.Usage.TotalTokens
+			}
 			return nil, usage, run
 		}
 		usage.PromptTokens += res.Usage.PromptTokens

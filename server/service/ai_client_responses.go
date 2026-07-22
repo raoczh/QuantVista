@@ -34,7 +34,8 @@ func responsesURL(baseURL string) string {
 	return base + "/v1/responses"
 }
 
-// buildResponsesPayload chat 语义 → responses 请求体。
+// buildResponsesPayload chat 语义 → responses 请求体。temperature/max_output_tokens 按
+// 能力观测省略（P0-5 修复批）；最终形态经 noteFinalRequestBody 记入审计。
 func buildResponsesPayload(p chatParams, jsonMode, stream bool) map[string]any {
 	var instructions []string
 	input := make([]map[string]any, 0, len(p.Messages))
@@ -50,21 +51,30 @@ func buildResponsesPayload(p chatParams, jsonMode, stream bool) map[string]any {
 		}
 	}
 	payload := map[string]any{
-		"model":       p.Model,
-		"input":       input,
-		"temperature": p.Temperature,
-		"stream":      stream,
+		"model":  p.Model,
+		"input":  input,
+		"stream": stream,
+	}
+	if !p.temperatureOmitted() {
+		payload["temperature"] = p.Temperature
 	}
 	if len(instructions) > 0 {
 		payload["instructions"] = strings.Join(instructions, "\n\n")
 	}
-	if p.MaxTokens > 0 {
+	if p.MaxTokens > 0 && !p.maxTokensOmitted() {
 		payload["max_output_tokens"] = p.MaxTokens
 	}
 	if jsonMode {
 		payload["text"] = map[string]any{"format": map[string]string{"type": "json_object"}}
 	}
 	return payload
+}
+
+// marshalResponsesPayload 序列化 payload 并记录最终请求体审计观测。
+func marshalResponsesPayload(p chatParams, jsonMode, stream bool) []byte {
+	body, _ := json.Marshal(buildResponsesPayload(p, jsonMode, stream))
+	p.noteFinalRequestBody(body)
+	return body
 }
 
 // responses 响应体（文本子集）。usage 字段名与 chat 不同（input/output_tokens）。
@@ -136,8 +146,9 @@ func extractResponsesRefusal(output []responsesOutputItem) (string, bool) {
 	return "", false
 }
 
-// responsesCompletion 非流式补全（与 chatCompletion 同语义同返回）。JSONMode 不被支持时
-// 去掉 text.format 重试一次，fallback 逻辑与 chat 端一致。
+// responsesCompletion 非流式补全（与 chatCompletion 同语义同返回）。参数兼容性 fallback
+// 与 chat 端一致：4xx 明确指向 text.format/temperature/max_output_tokens 时去掉命中参数
+// 重试（至多 2 轮），能力观察只在去参后的请求确认成功时提交。
 func responsesCompletion(ctx context.Context, p chatParams) (*chatResult, error) {
 	u, err := url.Parse(p.BaseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
@@ -146,20 +157,49 @@ func responsesCompletion(ctx context.Context, p chatParams) (*chatResult, error)
 
 	res, status, raw, latency, err := doResponses(ctx, p, p.JSONMode)
 	if err != nil {
-		return nil, err
+		return res, err
 	}
-	if status != http.StatusOK && p.JSONMode && looksLikeUnsupportedJSONMode(status, raw) {
-		p.noteJSONModeUnsupported(fmt.Sprintf("responses 非流式 HTTP %d 拒绝 text.format", status))
-		res, status, raw, latency, err = doResponses(ctx, p, false)
+	jsonOn := p.JSONMode
+	var capConfirms []func()
+	for retry := 0; retry < 2 && status >= 400 && status < 500 && ctx.Err() == nil; retry++ {
+		changed := false
+		switch {
+		case jsonOn && looksLikeUnsupportedJSONMode(status, raw):
+			jsonOn = false
+			p.markJSONModeDropped()
+			reason := fmt.Sprintf("responses 非流式 HTTP %d 拒绝 text.format", status)
+			capConfirms = append(capConfirms, func() { p.observeJSONModeUnsupported(reason) })
+			changed = true
+		case !p.temperatureOmitted() && looksLikeUnsupportedTemperature(status, raw):
+			p.markTemperatureOmitted()
+			reason := fmt.Sprintf("responses 非流式 HTTP %d 拒绝 temperature", status)
+			capConfirms = append(capConfirms, func() { p.observeTemperatureUnsupported(reason) })
+			changed = true
+		case p.MaxTokens > 0 && !p.maxTokensOmitted() && looksLikeUnsupportedMaxTokens(status, raw):
+			p.markMaxTokensOmitted()
+			reason := fmt.Sprintf("responses 非流式 HTTP %d 拒绝 max_output_tokens", status)
+			capConfirms = append(capConfirms, func() { p.observeMaxTokensUnsupported(reason) })
+			changed = true
+		}
+		if !changed {
+			break
+		}
+		res, status, raw, latency, err = doResponses(ctx, p, jsonOn)
 		if err != nil {
-			return nil, err
+			return res, err
+		}
+	}
+	if status == http.StatusOK {
+		for _, confirm := range capConfirms {
+			confirm()
 		}
 	}
 	if status != http.StatusOK {
 		return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", status, statusHint(status), extractErr(raw))
 	}
 	if strings.TrimSpace(res.Content) == "" {
-		return nil, errors.New("LLM 返回空内容")
+		res.LatencyMs = latency
+		return res, errors.New("LLM 返回空内容")
 	}
 	if res.Usage.TotalTokens == 0 {
 		res.Usage = estimateUsage(p.Messages, res.Content)
@@ -169,10 +209,10 @@ func responsesCompletion(ctx context.Context, p chatParams) (*chatResult, error)
 }
 
 // doResponses 单次 /responses HTTP 调用；重试策略与 doChat 一致（瞬时网络错误 +
-// 429/500/502/503 各重试一次，504 不重试）。
+// 429/500/502/503 各重试一次，504 不重试）。解析/门禁类错误时结果仍尽量带出（audit outcome）。
 func doResponses(ctx context.Context, p chatParams, jsonMode bool) (*chatResult, int, []byte, int64, error) {
 	endpoint := responsesURL(p.BaseURL)
-	body, _ := json.Marshal(buildResponsesPayload(p, jsonMode, false))
+	body := marshalResponsesPayload(p, jsonMode, false)
 
 	client := aiHTTPClient(p.AllowPrivate)
 	send := func() (*http.Response, error) {
@@ -216,12 +256,15 @@ func doResponses(ctx context.Context, p chatParams, jsonMode bool) (*chatResult,
 
 	res, perr := parseResponsesBody(raw, resp.StatusCode, endpoint, contractEnabled)
 	if perr != nil {
-		return nil, resp.StatusCode, raw, latency, perr
+		// audit outcome：incomplete/failed 等拒收时已解析出的正文/usage/原始 status 随错误带出。
+		return res, resp.StatusCode, raw, latency, perr
 	}
 	return res, resp.StatusCode, raw, latency, nil
 }
 
 // parseResponsesBody 解析 /responses 的 200 响应体（非流式整包形态）。
+// 返回错误时结果仍尽量非 nil（audit outcome：正文/usage/原始 status 供审计保留真实上游
+// 结果——调用方以错误为准判失败，不消费结果内容）。
 func parseResponsesBody(raw []byte, status int, endpoint string, contractEnabled bool) (*chatResult, error) {
 	var parsed responsesResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
@@ -231,39 +274,39 @@ func parseResponsesBody(raw []byte, status int, endpoint string, contractEnabled
 		}
 		return nil, fmt.Errorf("解析 LLM 响应失败: %w（响应开头: %s）", err, bodySnippet(raw))
 	}
+	res := &chatResult{Content: extractResponsesText(parsed.Output), FinishReason: parsed.Status}
+	if parsed.Usage != nil {
+		res.Usage = parsed.Usage.toChatUsage()
+	}
 	// 200 但响应体带 error 对象（部分网关形态）：按错误处理。error 非 null 即失败，
 	// 不能只在带 message 时拒绝；原始 code 还用于 content_filter 机读分类。
 	if contractEnabled {
 		if uerr := upstreamLLMError(parsed.Error); uerr != nil {
-			return nil, uerr
+			return res, uerr
 		}
 	} else if msg := errorMessageFromRaw(parsed.Error); msg != "" {
 		// flag 关闭时保留旧路径：只拒绝带 message 的 error；code-only error 与
 		// output 并存的非标准网关形态继续按旧逻辑读取 output。
-		return nil, fmt.Errorf("LLM 返回错误：%s", msg)
+		return res, fmt.Errorf("LLM 返回错误：%s", msg)
 	}
 	if refusal, ok := extractResponsesRefusal(parsed.Output); contractEnabled && ok {
 		if refusal == "" {
 			refusal = "上游未提供拒答原因"
 		}
-		return nil, refusalErr(RefusalLLMContentFiltered, "模型拒绝生成该内容："+refusal)
+		return res, refusalErr(RefusalLLMContentFiltered, "模型拒绝生成该内容："+refusal)
 	}
-	content := extractResponsesText(parsed.Output)
 	incompleteReason := ""
 	if parsed.IncompleteDetails != nil {
 		incompleteReason = parsed.IncompleteDetails.Reason
 	}
 	// 完整性门禁（契约开启时）：仅 status=completed 算成功，incomplete/failed/空一律拒收
 	//（incomplete 带部分内容也是半截，responses 是显式端点选择、标准实现必回 status）。
+	// 拒收结果（正文/usage/原始 status）随错误带出供审计保留（P0-8 修复批 audit outcome）。
 	if rerr := responsesStatusReject(contractEnabled, parsed.Status, incompleteReason); rerr != nil {
-		return nil, rerr
+		return res, rerr
 	}
-	if parsed.Status == "incomplete" && strings.TrimSpace(content) == "" {
-		return nil, fmt.Errorf("LLM 响应未完成（%s）且无内容，可尝试调大 max_tokens", incompleteReason)
-	}
-	res := &chatResult{Content: content, FinishReason: parsed.Status}
-	if parsed.Usage != nil {
-		res.Usage = parsed.Usage.toChatUsage()
+	if parsed.Status == "incomplete" && strings.TrimSpace(res.Content) == "" {
+		return res, fmt.Errorf("LLM 响应未完成（%s）且无内容，可尝试调大 max_tokens", incompleteReason)
 	}
 	return res, nil
 }
@@ -306,7 +349,8 @@ func upstreamLLMError(rawErr json.RawMessage) error {
 // responsesCompletionStream 流式补全：SSE data 行按事件 type 分派——
 // response.output_text.delta 取 delta 追加、response.completed/incomplete 取最终 usage、
 // response.failed/error 判失败。流中断即失败不落半截，与 chat 端纪律一致。
-// JSONMode 带 text.format，遇不支持的 4xx 去掉重试一次；上游忽略 stream 返回整包 JSON 时按非流式解析兼容。
+// 4xx 明确指向 text.format/temperature/max_output_tokens 时去掉命中参数重试一次
+// （能力观察在重试建流成功后提交）；上游忽略 stream 返回整包 JSON 时按非流式解析兼容。
 func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(string)) (*chatResult, error) {
 	u, err := url.Parse(p.BaseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
@@ -314,7 +358,7 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	}
 	endpoint := responsesURL(p.BaseURL)
 	jsonOn := p.JSONMode
-	body, _ := json.Marshal(buildResponsesPayload(p, jsonOn, true))
+	body := marshalResponsesPayload(p, jsonOn, true)
 
 	client := aiStreamHTTPClient(p.AllowPrivate)
 	send := func() (*http.Response, error) {
@@ -346,16 +390,40 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 			resp = r2
 		}
 	}
-	if jsonOn && resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		// 不支持 text.format 的端点：去掉后重试一次（与非流式 fallback 同款）。
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		// 不支持 text.format/temperature/max_output_tokens 的端点：去掉命中参数后重试一次
+		//（与非流式 fallback 同款识别）；能力观察只在重试建流成功后提交（P0-5 修复批）。
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		if looksLikeUnsupportedJSONMode(resp.StatusCode, raw) && ctx.Err() == nil {
-			jsonOn = false
-			p.noteJSONModeUnsupported(fmt.Sprintf("responses 流式 HTTP %d 拒绝 text.format", resp.StatusCode))
-			body, _ = json.Marshal(buildResponsesPayload(p, false, true))
+		dropJSON := jsonOn && looksLikeUnsupportedJSONMode(resp.StatusCode, raw)
+		dropTemp := !p.temperatureOmitted() && looksLikeUnsupportedTemperature(resp.StatusCode, raw)
+		dropMaxTok := p.MaxTokens > 0 && !p.maxTokensOmitted() && looksLikeUnsupportedMaxTokens(resp.StatusCode, raw)
+		if (dropJSON || dropTemp || dropMaxTok) && ctx.Err() == nil {
+			jsonOn = jsonOn && !dropJSON
+			var capConfirms []func()
+			if dropJSON {
+				p.markJSONModeDropped()
+				reason := fmt.Sprintf("responses 流式 HTTP %d 拒绝 text.format", resp.StatusCode)
+				capConfirms = append(capConfirms, func() { p.observeJSONModeUnsupported(reason) })
+			}
+			if dropTemp {
+				p.markTemperatureOmitted()
+				reason := fmt.Sprintf("responses 流式 HTTP %d 拒绝 temperature", resp.StatusCode)
+				capConfirms = append(capConfirms, func() { p.observeTemperatureUnsupported(reason) })
+			}
+			if dropMaxTok {
+				p.markMaxTokensOmitted()
+				reason := fmt.Sprintf("responses 流式 HTTP %d 拒绝 max_output_tokens", resp.StatusCode)
+				capConfirms = append(capConfirms, func() { p.observeMaxTokensUnsupported(reason) })
+			}
+			body = marshalResponsesPayload(p, jsonOn, true)
 			if r2, e2 := send(); e2 == nil {
 				resp = r2
+				if resp.StatusCode == http.StatusOK {
+					for _, confirm := range capConfirms {
+						confirm()
+					}
+				}
 			} else {
 				return nil, fmt.Errorf("请求失败: %w", e2)
 			}
@@ -378,7 +446,7 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 		}
 		res, perr := parseResponsesBody(raw, resp.StatusCode, endpoint, contractEnabled)
 		if perr != nil {
-			return nil, perr
+			return res, perr // audit outcome：已解析出的正文/usage/原始 status 随错误带出
 		}
 		return finishStreamResult(p, res.Content, res.Usage, res.FinishReason, start, onDelta)
 	}
@@ -393,6 +461,12 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	done := false
 	contractEnabled := p.accuracyContractEnabled()
+	// partialResult 拒收/中断路径的审计结果（audit outcome）：已聚合正文、上游报告的 usage
+	// 与原始终态随错误一并带出——审计与 run.record 保留真实上游结果，调用方按错误判失败。
+	partialResult := func() *chatResult {
+		return &chatResult{Content: sb.String(), Usage: usage,
+			LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs, FinishReason: doneStatus}
+	}
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, ":") || strings.HasPrefix(line, "event:") {
@@ -424,18 +498,18 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 		}
 		if jerr := json.Unmarshal([]byte(data), &ev); jerr != nil {
 			if rerr := streamProtocolReject(contractEnabled, "Responses SSE JSON 解析失败"); rerr != nil {
-				return nil, rerr
+				return partialResult(), rerr
 			}
 			continue // 关闭契约时保留旧兼容路径
 		}
 		if contractEnabled {
 			if uerr := upstreamLLMError(ev.Error); uerr != nil {
-				return nil, uerr
+				return partialResult(), uerr
 			}
 		}
 		if strings.TrimSpace(ev.Type) == "" {
 			if rerr := streamProtocolReject(contractEnabled, "Responses SSE 事件缺少 type"); rerr != nil {
-				return nil, rerr
+				return partialResult(), rerr
 			}
 			continue
 		}
@@ -456,30 +530,32 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 				if msg == "" {
 					msg = "上游未提供拒答原因"
 				}
-				return nil, refusalErr(RefusalLLMContentFiltered, "模型拒绝生成该内容："+msg)
+				return partialResult(), refusalErr(RefusalLLMContentFiltered, "模型拒绝生成该内容："+msg)
 			}
 		case "response.completed", "response.done":
 			terminalEvent = ev.Type
 			if ev.Response != nil {
+				// 先记录事实（status/usage）再做拒收判定：拒收路径的审计结果也要带真实终态。
+				doneStatus = ev.Response.Status
+				if ev.Response.Usage != nil {
+					usage = ev.Response.Usage.toChatUsage()
+				}
 				if contractEnabled {
 					if uerr := upstreamLLMError(ev.Response.Error); uerr != nil {
-						return nil, uerr
+						return partialResult(), uerr
 					}
 				}
 				if ev.Response.IncompleteDetails != nil {
-					if rerr := responsesStatusReject(contractEnabled, "incomplete", ev.Response.IncompleteDetails.Reason); rerr != nil {
-						return nil, rerr
+					incompleteReason = ev.Response.IncompleteDetails.Reason
+					if rerr := responsesStatusReject(contractEnabled, "incomplete", incompleteReason); rerr != nil {
+						return partialResult(), rerr
 					}
 				}
 				if refusal, ok := extractResponsesRefusal(ev.Response.Output); contractEnabled && ok {
 					if refusal == "" {
 						refusal = "上游未提供拒答原因"
 					}
-					return nil, refusalErr(RefusalLLMContentFiltered, "模型拒绝生成该内容："+refusal)
-				}
-				doneStatus = ev.Response.Status
-				if ev.Response.Usage != nil {
-					usage = ev.Response.Usage.toChatUsage()
+					return partialResult(), refusalErr(RefusalLLMContentFiltered, "模型拒绝生成该内容："+refusal)
 				}
 			}
 			if !contractEnabled {
@@ -490,17 +566,6 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 		case "response.incomplete":
 			terminalEvent = ev.Type
 			if ev.Response != nil {
-				if contractEnabled {
-					if uerr := upstreamLLMError(ev.Response.Error); uerr != nil {
-						return nil, uerr
-					}
-					if refusal, ok := extractResponsesRefusal(ev.Response.Output); ok {
-						if refusal == "" {
-							refusal = "上游未提供拒答原因"
-						}
-						return nil, refusalErr(RefusalLLMContentFiltered, "模型拒绝生成该内容："+refusal)
-					}
-				}
 				doneStatus = ev.Response.Status
 				if ev.Response.Usage != nil {
 					usage = ev.Response.Usage.toChatUsage()
@@ -508,50 +573,65 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 				if ev.Response.IncompleteDetails != nil {
 					incompleteReason = ev.Response.IncompleteDetails.Reason
 				}
+				if contractEnabled {
+					if uerr := upstreamLLMError(ev.Response.Error); uerr != nil {
+						return partialResult(), uerr
+					}
+					if refusal, ok := extractResponsesRefusal(ev.Response.Output); ok {
+						if refusal == "" {
+							refusal = "上游未提供拒答原因"
+						}
+						return partialResult(), refusalErr(RefusalLLMContentFiltered, "模型拒绝生成该内容："+refusal)
+					}
+				}
 			}
 			if !contractEnabled && doneStatus == "" {
 				doneStatus = "incomplete"
 			}
 			done = true
 		case "response.failed", "response.error", "error":
+			if ev.Response != nil && ev.Response.Status != "" {
+				doneStatus = ev.Response.Status
+			}
 			if uerr := upstreamLLMError(ev.Error); uerr != nil {
-				return nil, uerr
+				return partialResult(), uerr
 			}
 			if strings.Contains(strings.ToLower(ev.Code), "content_filter") {
-				return nil, refusalErr(RefusalLLMContentFiltered, "内容被上游安全策略拦截（content_filter）："+ev.Message)
+				return partialResult(), refusalErr(RefusalLLMContentFiltered, "内容被上游安全策略拦截（content_filter）："+ev.Message)
 			}
 			msg := strings.TrimSpace(ev.Message)
 			if ev.Response != nil {
 				if uerr := upstreamLLMError(ev.Response.Error); uerr != nil {
-					return nil, uerr
+					return partialResult(), uerr
 				}
 			}
 			if msg == "" {
 				msg = extractErr([]byte(data))
 			}
-			return nil, fmt.Errorf("LLM 流式返回错误：%s", msg)
+			return partialResult(), fmt.Errorf("LLM 流式返回错误：%s", msg)
 		}
 		if done {
 			break
 		}
 	}
 	if err := sc.Err(); err != nil && !done {
-		return nil, fmt.Errorf("流式响应中断: %w", err)
+		return partialResult(), fmt.Errorf("流式响应中断: %w", err)
 	}
 	if !done {
 		// 正常 EOF 但从未收到完成事件/[DONE]：契约开启时拒收（eof_without_marker）。
 		if rerr := streamEOFReject(contractEnabled); rerr != nil {
-			return nil, rerr
+			return partialResult(), rerr
 		}
 	}
 	// Responses 的 [DONE] 只是传输层哨兵，不能证明模型完成。契约开启时必须同时看到
 	// completed/done 终态事件和其 response.status=completed；空状态、冲突状态均拒收。
+	// 拒收结果（半截正文/usage/原始 status）随错误带出供审计保留。
 	if rerr := responsesStreamStatusReject(contractEnabled, terminalEvent, doneStatus, incompleteReason); rerr != nil {
-		return nil, rerr
+		return partialResult(), rerr
 	}
 	content := sb.String()
 	if strings.TrimSpace(content) == "" {
-		return nil, errors.New("LLM 返回空内容")
+		return partialResult(), errors.New("LLM 返回空内容")
 	}
 	if usage.TotalTokens == 0 {
 		usage = estimateUsage(p.Messages, content)
