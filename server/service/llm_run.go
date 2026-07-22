@@ -69,7 +69,7 @@ type llmRun struct {
 	Module      string // 与 llm_call_logs.module 同名同值（business_result_type 粒度）
 
 	SchemaVersion string // 输出契约版本（如 analysis.v1；自由文本模块 *.free_text.v1）
-	PromptVersion string // 业务 prompt 版本（p17/d3/q10/sp1/-custom 等，与既有版本号同源）
+	PromptVersion string // 业务 prompt 版本（p18/d3/q11/sp2/-custom 等，与既有版本号同源）
 	PromptHash    string
 	DataHash      string // 输入数据快照 hash（喂给模型的数据 JSON）
 

@@ -510,8 +510,8 @@ func quoteAsOfOf(conv model.AiConversation) string {
 }
 
 // qaPromptVersion 问答系统提示版本（会话不落库版本列，仅供代码内追溯）。
-// q10: 首答新鲜度门（全源无 fresh 默认拒绝、allow_stale 才生成且快照打 stale_mode）+ 快照时效按每轮提问时刻重判注入（旧会话跨天不再向模型声明 fresh）；q9: 快照新鲜度元数据（captured_at/quote_as_of/bars_as_of/quote_source/freshness_status/market_state），stale 时必须声明行情截至时间、非交易时段按收盘口径表述；q8: P3a org_view 机构观点段进快照说明（卖方乐观偏差纪律）；q7: F2 finance 财务段（F10 最新期+趋势）进快照说明；q6: risk_gate 风险闸门段、允许轻量 Markdown（流式渲染配套）；q5: announcements 公告段；q4: news 舆情段；q3: 回答引用的数字会被程序化核验，威慑幻觉；q2: 快照含五维量化评分锚点、要求引用数值、禁用先验记忆。
-const qaPromptVersion = "q10"
+// q11: 回答正文严格控制在 800 汉字内，配合 2500 token 单次预算；q10: 首答新鲜度门（全源无 fresh 默认拒绝、allow_stale 才生成且快照打 stale_mode）+ 快照时效按每轮提问时刻重判注入（旧会话跨天不再向模型声明 fresh）；q9: 快照新鲜度元数据（captured_at/quote_as_of/bars_as_of/quote_source/freshness_status/market_state），stale 时必须声明行情截至时间、非交易时段按收盘口径表述；q8: P3a org_view 机构观点段进快照说明（卖方乐观偏差纪律）；q7: F2 finance 财务段（F10 最新期主要指标与近几期趋势）进快照说明；q6: risk_gate 风险闸门段、允许轻量 Markdown（流式渲染配套）；q5: announcements 公告段；q4: news 舆情段；q3: 回答引用的数字会被程序化核验，威慑幻觉；q2: 快照含五维量化评分锚点、要求引用数值、禁用先验记忆。
+const qaPromptVersion = "q11"
 
 // qaRoleTaskSeg 问答角色任务段（L3）：module=qa 自定义模板替换的部分——角色定位与
 // 回答风格。P0-6 起自定义不再整段替换，要求契约段恒由系统追加。
@@ -525,7 +525,7 @@ const qaPromptContract = `要求：
 3. 行情新鲜度（必须遵守）：freshness_status=stale 或快照带 freshness_note 时，回答涉及价格/涨跌必须先声明「行情仅更新至 quote_as_of」，严禁以「实时/当前盘面」口径表述；market_state 非 trading（休市/午间/盘前）时按最近交易日收盘（或阶段）口径措辞，不得暗示实时成交。
 4. 风险闸门（快照 risk_gate 块，必须遵守）：level=block（ST/退市警示）为硬约束——不得给出任何买入倾向的回答，先讲退市/警示风险；level=warn（一字板/流动性不足）须在回答中主动提示并约束结论（一字板不得按可正常成交分析）。risk_gate.note 声明的未接入维度（质押/解禁等），涉及时照实说「未接入数据，请自行核查」，严禁装作已核查。
 5. 关键判断引用快照中的具体字段与数值（如「现价 12.34 高于 MA20=11.98」），让用户可以核对。系统会程序化核对你回答中引用的数字，与快照不符的会被标记展示给用户，因此不要编造或凭印象填写数字。
-6. 回答简明、聚焦用户问题，使用简体中文；必要时给出研究性看法，但不下达买卖指令。可用轻量 Markdown 排版（短列表、**加粗**关键结论），不要输出表格、图片与链接。`
+6. 回答简明、聚焦用户问题，使用简体中文；正文严格控制在 800 个汉字以内，复杂问题也只保留最关键的结论、证据与风险，不重复背景或快照原文。必要时给出研究性看法，但不下达买卖指令。可用轻量 Markdown 排版（短列表、**加粗**关键结论），不要输出表格、图片与链接。`
 
 // qaRoleIntro 默认角色段 = 任务段 + 契约段（编译期拼接，与 P0-6 拆分前逐字节一致，
 // 默认路径零行为变化）。

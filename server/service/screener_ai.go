@@ -26,8 +26,8 @@ import (
 
 const (
 	// screenerParsePromptVersion 解析 prompt 版本（独立于分析 p*/推荐 s* 序列）。
-	screenerParsePromptVersion = "sp1"
-	parseStrategyTextMax       = 300 // 白话输入长度上限（rune）
+	screenerParsePromptVersion = "sp2" // sp2: explain/unmatched 字数与紧凑 JSON 输出纪律
+	parseStrategyTextMax       = 300   // 白话输入长度上限（rune）
 	screenerParseJobTimeout    = 5 * time.Minute
 )
 
@@ -279,7 +279,7 @@ func screenerFactorDictLines() []string {
 	return lines
 }
 
-// buildParseStrategySystemPrompt 解析系统提示词（版本 sp1）。
+// buildParseStrategySystemPrompt 解析系统提示词（版本 sp2）。
 func buildParseStrategySystemPrompt() string {
 	var b strings.Builder
 	b.WriteString("你是选股条件翻译器：把用户的白话选股描述转换成条件树 JSON。你只做翻译，不评价策略好坏，不添加用户没提的条件。\n\n")
@@ -298,7 +298,7 @@ func buildParseStrategySystemPrompt() string {
 	b.WriteString("- 数值单位与因子一致：百分比因子直接写数字（15 表示 15%）。\n")
 
 	b.WriteString("\n【输出格式】只输出一个 JSON 对象，不要解释、不要代码块标记：\n")
-	b.WriteString("{\"tree\":<条件树，全部表述都无法映射时为 null>,\"unmatched\":[\"无法映射的表述（可括注原因）\"],\"explain\":\"一句话复述你理解的选股意图\"}\n")
+	b.WriteString("{\"tree\":<条件树，全部表述都无法映射时为 null>,\"unmatched\":[\"无法映射的表述（每条不超过 80 字，可括注原因）\"],\"explain\":\"不超过 80 字的一句话选股意图\"}\n")
 
 	b.WriteString("\n【纪律】\n")
 	b.WriteString("1. 只能使用因子字典中的 key，绝不发明、拼写变体或改写。\n")
@@ -306,6 +306,7 @@ func buildParseStrategySystemPrompt() string {
 	b.WriteString("3. 因子字典没有估值（市盈率/市净率/市值）、资金流（主力/北向）、财务（营收/利润）、板块题材、龙虎榜等数据，这类表述一律进 unmatched。\n")
 	b.WriteString("4. 用户没给具体数值的模糊表述（如「温和放量」），按典型阈值合理量化，并在 explain 里体现。\n")
 	b.WriteString("5. 「回踩/贴近某均线」用对应 bias 因子（如 bias_20 介于小区间），「站上/跌破某均线」用 close 与均线的 ref 比较或 above_* 布尔因子。\n")
+	b.WriteString("6. 输出紧凑 JSON，不复述因子字典、DSL、示例或用户原文，不增加 schema 外字段。\n")
 
 	b.WriteString("\n【示例】\n")
 	b.WriteString("输入：量比 2 倍以上放量突破 20 日新高，换手别超过 20%\n")

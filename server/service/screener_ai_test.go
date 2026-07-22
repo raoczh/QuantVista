@@ -29,7 +29,7 @@ func TestParseStrategyPromptFactorDict(t *testing.T) {
 		}
 	}
 	// 纪律要点必须在场：unmatched 兜底 + 禁硬凑 + 输出 schema。
-	for _, kw := range []string{"unmatched", "禁止硬凑", "explain", "is_true"} {
+	for _, kw := range []string{"unmatched", "禁止硬凑", "explain", "is_true", "不超过 80 字", "紧凑 JSON"} {
 		if !strings.Contains(prompt, kw) {
 			t.Errorf("prompt 缺关键内容 %q", kw)
 		}
@@ -139,7 +139,7 @@ func parseQuotaRow(t *testing.T, userID int64) model.UserQuota {
 	return q
 }
 
-// TestParseStrategyEndToEnd 假 LLM 端到端：一次成功解析——树/人话回显/sp1 版本，
+// TestParseStrategyEndToEnd 假 LLM 端到端：一次成功解析——树/人话回显/prompt 版本，
 // 配额计 1 次动作 + token 入账。
 func TestParseStrategyEndToEnd(t *testing.T) {
 	calls := 0

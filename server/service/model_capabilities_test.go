@@ -306,8 +306,10 @@ func TestModuleBudgetTable(t *testing.T) {
 		{"recommendation", 0, 2500},      // 用户未配置 → 模块预算
 		{"recommendation", 100000, 2500}, // 用户过大 → 钳到模块预算
 		{"recommendation", 800, 800},     // 用户更小 → 用户优先
-		{"qa", 100000, 8000},
-		{"compare", 0, 2000},
+		{"analysis", 100000, 2500},
+		{"qa", 100000, 2500},
+		{"compare", 0, 1000},
+		{"news", 0, 2500},
 		{"unregistered_module", 1234, 1234}, // 未登记模块不钳（接线遗漏由覆盖测试兜底）
 	}
 	for _, c := range cases {
@@ -315,8 +317,8 @@ func TestModuleBudgetTable(t *testing.T) {
 			t.Errorf("moduleTokenCap(%s,%d)=%d, want %d", c.module, c.userMax, got, c.want)
 		}
 	}
-	if moduleRepairAttempts("analysis") != 2 || moduleRepairAttempts("trade_plan") != 2 {
-		t.Fatal("analysis/trade_plan 显式覆盖 2 次不得丢失")
+	if moduleRepairAttempts("analysis") != 1 || moduleRepairAttempts("trade_plan") != 1 {
+		t.Fatal("analysis/trade_plan 最多 repair 1 次")
 	}
 	if moduleRepairAttempts("recommendation") != 1 || moduleRepairAttempts("screener_parse") != 1 {
 		t.Fatal("registered 模块 repair 应为 1")
@@ -337,6 +339,33 @@ func TestModuleBudgetTable(t *testing.T) {
 		}
 		if b.MaxTokens <= 0 {
 			t.Errorf("业务模块 %s 预算不得为 0（回退用户全局值）", m)
+		}
+		if b.MaxTokens > 2500 {
+			t.Errorf("业务模块 %s 单次预算 %d 超过上游 60s 窗口的 2500 token 护栏", m, b.MaxTokens)
+		}
+		if b.RepairAttempts > 1 {
+			t.Errorf("业务模块 %s repair 次数 %d 超过单次瘦身纪律", m, b.RepairAttempts)
+		}
+	}
+}
+
+// TestTimeoutSensitivePromptDiscipline 锁住与单次预算配套的输出长度纪律；只有 token cap
+// 没有 prompt 约束时，模型仍会奔着上限生成，容易再次撞上游绝对 60s 超时。
+func TestTimeoutSensitivePromptDiscipline(t *testing.T) {
+	checks := []struct {
+		name string
+		text string
+		want string
+	}{
+		{"analysis", analysisOutputSpec, "每条不超过 60 字"},
+		{"analysis_panel", panelOutputSpec, "不超过 100 字"},
+		{"qa", qaPromptContract, "800 个汉字以内"},
+		{"news", newsEnhanceSystem, "每条输入新闻恰好输出一项"},
+		{"screener_parse", buildParseStrategySystemPrompt(), "不超过 80 字"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(c.text, c.want) {
+			t.Errorf("%s prompt 缺少输出纪律 %q", c.name, c.want)
 		}
 	}
 }
@@ -541,8 +570,8 @@ func TestTemperatureCapabilityFallback(t *testing.T) {
 }
 
 // TestMaxTokensCapabilityFallback max_tokens 参数能力贯通：被「Unsupported parameter:
-// max_tokens」4xx 拒 → 去参重试成功 → 提交观察；路由后直接省略（预算失效可观察不静默——
-// 观察存储/审计 payload 双向可见）。
+// max_tokens」4xx 拒后携同一预算改用 max_completion_tokens；路由后直接使用新字段，
+// 任何请求都不能丢失模块预算。
 func TestMaxTokensCapabilityFallback(t *testing.T) {
 	setCapRoutingFlag(t, true)
 	resetLLMCapabilityStore()
@@ -551,9 +580,9 @@ func TestMaxTokensCapabilityFallback(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		bodies = append(bodies, string(b))
-		if strings.Contains(string(b), "max_tokens") {
+		if strings.Contains(string(b), `"max_tokens"`) {
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model."}}`))
+			_, _ = w.Write([]byte(`{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."}}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"total_tokens":5}}`))
@@ -568,8 +597,8 @@ func TestMaxTokensCapabilityFallback(t *testing.T) {
 	if _, err := chatCompletion(context.Background(), params); err != nil {
 		t.Fatalf("max_tokens fallback 应成功: %v", err)
 	}
-	if len(bodies) != 2 || strings.Contains(bodies[1], "max_tokens") {
-		t.Fatalf("fallback 请求不得再带 max_tokens: n=%d", len(bodies))
+	if len(bodies) != 2 || !strings.Contains(bodies[1], `"max_completion_tokens":2000`) {
+		t.Fatalf("fallback 请求必须携同一预算改用 max_completion_tokens: n=%d bodies=%#v", len(bodies), bodies)
 	}
 	if obs, ok := lookupLLMCapability(capabilityTargetOf(params), capMaxTokens); !ok || obs.State != capUnsupported {
 		t.Fatalf("fallback 成功后应提交 max_tokens 观察: %+v ok=%v", obs, ok)
@@ -577,7 +606,291 @@ func TestMaxTokensCapabilityFallback(t *testing.T) {
 	if _, err := chatCompletion(context.Background(), params); err != nil {
 		t.Fatalf("路由后调用应成功: %v", err)
 	}
-	if len(bodies) != 3 || strings.Contains(bodies[2], "max_tokens") {
-		t.Fatalf("路由后应 1 个不带 max_tokens 的请求: n=%d", len(bodies))
+	if len(bodies) != 3 || !strings.Contains(bodies[2], `"max_completion_tokens":2000`) {
+		t.Fatalf("路由后应直接携预算使用 max_completion_tokens: n=%d bodies=%#v", len(bodies), bodies)
 	}
+}
+
+// TestTokenBudgetNeverDropped 两种 Chat token 字段都被拒时必须失败；Responses 拒绝
+// max_output_tokens 时同样失败。所有实际请求都应携带原预算，禁止退成无上限生成。
+func TestTokenBudgetNeverDropped(t *testing.T) {
+	setCapRoutingFlag(t, true)
+	resetLLMCapabilityStore()
+	t.Cleanup(resetLLMCapabilityStore)
+
+	t.Run("chat_both_fields_rejected", func(t *testing.T) {
+		var bodies []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, string(b))
+			w.WriteHeader(http.StatusBadRequest)
+			if strings.Contains(string(b), `"max_completion_tokens"`) {
+				_, _ = w.Write([]byte(`{"error":{"message":"Unsupported parameter: max_completion_tokens"}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"error":{"message":"Unsupported parameter: max_tokens; use max_completion_tokens"}}`))
+		}))
+		defer srv.Close()
+
+		params := chatParams{BaseURL: srv.URL, APIKey: "k", Model: "m", MaxTokens: 777,
+			AllowPrivate: true, Messages: []chatMessage{{Role: "user", Content: "hi"}}}
+		if _, err := chatCompletion(context.Background(), params); err == nil {
+			t.Fatal("两种 token 字段都被拒时必须失败")
+		}
+		if len(bodies) != 2 || !strings.Contains(bodies[0], `"max_tokens":777`) ||
+			!strings.Contains(bodies[1], `"max_completion_tokens":777`) {
+			t.Fatalf("两次请求都必须保留预算: %#v", bodies)
+		}
+	})
+
+	t.Run("responses_field_rejected", func(t *testing.T) {
+		var bodies []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, string(b))
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"Unsupported parameter: max_output_tokens"}}`))
+		}))
+		defer srv.Close()
+
+		params := chatParams{BaseURL: srv.URL, APIKey: "k", Model: "m", EndpointType: model.LLMEndpointResponses,
+			MaxTokens: 888, AllowPrivate: true, Messages: []chatMessage{{Role: "user", Content: "hi"}}}
+		if _, err := chatCompletion(context.Background(), params); err == nil {
+			t.Fatal("Responses 拒绝 max_output_tokens 时必须失败")
+		}
+		if len(bodies) != 1 || !strings.Contains(bodies[0], `"max_output_tokens":888`) {
+			t.Fatalf("Responses 请求必须保留预算且不得无上限重试: %#v", bodies)
+		}
+	})
+
+	t.Run("chat_plain_both_fields_rejected", func(t *testing.T) {
+		var bodies []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, string(b))
+			w.WriteHeader(http.StatusBadRequest)
+			if strings.Contains(string(b), `"max_completion_tokens"`) {
+				_, _ = w.Write([]byte(`{"error":{"message":"Unsupported parameter: max_completion_tokens"}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"error":{"message":"Unsupported parameter: max_tokens; use max_completion_tokens"}}`))
+		}))
+		defer srv.Close()
+
+		params := initCallObservers(chatParams{BaseURL: srv.URL, APIKey: "k", Model: "m", MaxTokens: 779,
+			AllowPrivate: true, Messages: []chatMessage{{Role: "user", Content: "hi"}}})
+		if _, err := chatCompletionPlain(context.Background(), params); err == nil {
+			t.Fatal("非流式 Chat 两种 token 字段都被拒时必须失败")
+		}
+		if len(bodies) != 2 || !strings.Contains(bodies[0], `"max_tokens":779`) ||
+			!strings.Contains(bodies[1], `"max_completion_tokens":779`) {
+			t.Fatalf("非流式 Chat 两次请求都必须保留预算: %#v", bodies)
+		}
+	})
+
+	t.Run("responses_plain_field_rejected", func(t *testing.T) {
+		var bodies []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, string(b))
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"Unsupported parameter: max_output_tokens"}}`))
+		}))
+		defer srv.Close()
+
+		params := initCallObservers(chatParams{BaseURL: srv.URL, APIKey: "k", Model: "m",
+			EndpointType: model.LLMEndpointResponses, MaxTokens: 889, AllowPrivate: true,
+			Messages: []chatMessage{{Role: "user", Content: "hi"}}})
+		if _, err := responsesCompletion(context.Background(), params); err == nil {
+			t.Fatal("非流式 Responses 拒绝 max_output_tokens 时必须失败")
+		}
+		if len(bodies) != 1 || !strings.Contains(bodies[0], `"max_output_tokens":889`) {
+			t.Fatalf("非流式 Responses 必须保留预算且不得无上限重试: %#v", bodies)
+		}
+	})
+}
+
+// TestSequentialCapabilityFallback 模拟兼容网关逐次只报告一个未知参数。默认流式
+// 入口必须一直保持 stream=true 与 token 上限，直到所有可兼容字段处理完；整包回落
+// 路径也须具备同样的有限进展语义。
+func TestSequentialCapabilityFallback(t *testing.T) {
+	setCapRoutingFlag(t, true)
+	resetLLMCapabilityStore()
+	t.Cleanup(resetLLMCapabilityStore)
+
+	t.Run("chat_stream", func(t *testing.T) {
+		var bodies []map[string]any
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("解析 Chat 请求失败: %v", err)
+			}
+			bodies = append(bodies, body)
+			switch {
+			case body["stream_options"] != nil:
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"message":"Unknown parameter: stream_options"}}`))
+			case body["response_format"] != nil:
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"message":"response_format not supported"}}`))
+			case body["temperature"] != nil:
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"message":"temperature not supported"}}`))
+			case body["max_tokens"] != nil:
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"message":"max_tokens not supported; use max_completion_tokens"}}`))
+			default:
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"))
+			}
+		}))
+		defer srv.Close()
+
+		params := chatParams{BaseURL: srv.URL, APIKey: "k", Model: "m", Temperature: 0.2,
+			MaxTokens: 777, JSONMode: true, AllowPrivate: true,
+			Messages: []chatMessage{{Role: "user", Content: "hi"}}}
+		res, err := chatCompletion(context.Background(), params)
+		if err != nil || res.Content != "ok" {
+			t.Fatalf("Chat 逐项兼容回退应成功: res=%+v err=%v", res, err)
+		}
+		if len(bodies) != 5 {
+			t.Fatalf("Chat 应依次处理四个兼容维度，共 5 个请求，got %d", len(bodies))
+		}
+		for i, body := range bodies {
+			if stream, _ := body["stream"].(bool); !stream {
+				t.Fatalf("Chat 第 %d 次回退丢失 stream=true: %#v", i+1, body)
+			}
+			if _, oldOK := body["max_tokens"]; !oldOK {
+				if v, newOK := body["max_completion_tokens"].(float64); !newOK || v != 777 {
+					t.Fatalf("Chat 第 %d 次请求丢失 token 预算: %#v", i+1, body)
+				}
+			} else if body["max_tokens"] != float64(777) {
+				t.Fatalf("Chat 第 %d 次 max_tokens 预算错误: %#v", i+1, body)
+			}
+		}
+	})
+
+	t.Run("responses_stream", func(t *testing.T) {
+		var bodies []map[string]any
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("解析 Responses 请求失败: %v", err)
+			}
+			bodies = append(bodies, body)
+			switch {
+			case body["text"] != nil:
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"message":"text.format json_object not supported"}}`))
+			case body["temperature"] != nil:
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"message":"temperature not supported"}}`))
+			default:
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n" +
+					"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"))
+			}
+		}))
+		defer srv.Close()
+
+		params := chatParams{BaseURL: srv.URL, APIKey: "k", Model: "m", EndpointType: model.LLMEndpointResponses,
+			Temperature: 0.2, MaxTokens: 888, JSONMode: true, AllowPrivate: true,
+			Messages: []chatMessage{{Role: "user", Content: "hi"}}}
+		res, err := chatCompletion(context.Background(), params)
+		if err != nil || res.Content != "ok" {
+			t.Fatalf("Responses 逐项兼容回退应成功: res=%+v err=%v", res, err)
+		}
+		if len(bodies) != 3 {
+			t.Fatalf("Responses 应依次处理两个兼容维度，共 3 个请求，got %d", len(bodies))
+		}
+		for i, body := range bodies {
+			if stream, _ := body["stream"].(bool); !stream {
+				t.Fatalf("Responses 第 %d 次回退丢失 stream=true: %#v", i+1, body)
+			}
+			if body["max_output_tokens"] != float64(888) {
+				t.Fatalf("Responses 第 %d 次请求丢失 token 预算: %#v", i+1, body)
+			}
+		}
+	})
+
+	t.Run("plain_paths", func(t *testing.T) {
+		t.Run("chat", func(t *testing.T) {
+			var bodies []map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				bodies = append(bodies, body)
+				switch {
+				case body["response_format"] != nil:
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"error":{"message":"response_format not supported"}}`))
+				case body["temperature"] != nil:
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"error":{"message":"temperature not supported"}}`))
+				case body["max_tokens"] != nil:
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"error":{"message":"max_tokens not supported; use max_completion_tokens"}}`))
+				default:
+					_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`))
+				}
+			}))
+			defer srv.Close()
+
+			params := initCallObservers(chatParams{BaseURL: srv.URL, APIKey: "k", Model: "m", Temperature: 0.2,
+				MaxTokens: 991, JSONMode: true, AllowPrivate: true,
+				Messages: []chatMessage{{Role: "user", Content: "hi"}}})
+			if _, err := chatCompletionPlain(context.Background(), params); err != nil {
+				t.Fatalf("非流式 Chat 逐项回退应成功: %v", err)
+			}
+			if len(bodies) != 4 {
+				t.Fatalf("非流式 Chat 应共 4 个请求，got %d", len(bodies))
+			}
+			for i, body := range bodies {
+				if stream, _ := body["stream"].(bool); stream {
+					t.Fatalf("非流式 Chat 第 %d 次请求不应变成 stream=true", i+1)
+				}
+				if _, oldOK := body["max_tokens"]; !oldOK && body["max_completion_tokens"] != float64(991) {
+					t.Fatalf("非流式 Chat 第 %d 次请求丢失预算: %#v", i+1, body)
+				}
+			}
+		})
+
+		t.Run("responses", func(t *testing.T) {
+			var bodies []map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				bodies = append(bodies, body)
+				switch {
+				case body["text"] != nil:
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"error":{"message":"text.format json_object not supported"}}`))
+				case body["temperature"] != nil:
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"error":{"message":"temperature not supported"}}`))
+				default:
+					_, _ = w.Write([]byte(`{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`))
+				}
+			}))
+			defer srv.Close()
+
+			params := initCallObservers(chatParams{BaseURL: srv.URL, APIKey: "k", Model: "m",
+				EndpointType: model.LLMEndpointResponses, Temperature: 0.2, MaxTokens: 992,
+				JSONMode: true, AllowPrivate: true, Messages: []chatMessage{{Role: "user", Content: "hi"}}})
+			if _, err := responsesCompletion(context.Background(), params); err != nil {
+				t.Fatalf("非流式 Responses 逐项回退应成功: %v", err)
+			}
+			if len(bodies) != 3 {
+				t.Fatalf("非流式 Responses 应共 3 个请求，got %d", len(bodies))
+			}
+			for i, body := range bodies {
+				if stream, _ := body["stream"].(bool); stream {
+					t.Fatalf("非流式 Responses 第 %d 次请求不应变成 stream=true", i+1)
+				}
+				if body["max_output_tokens"] != float64(992) {
+					t.Fatalf("非流式 Responses 第 %d 次请求丢失预算: %#v", i+1, body)
+				}
+			}
+		})
+	})
 }

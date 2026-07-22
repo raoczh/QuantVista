@@ -13,8 +13,8 @@ package service
 //     校准的初值，调整须掂量：过小会触发 finish_reason=length 拒收（契约开启时
 //     fail-closed，见下），过大失去预算意义。
 //   - RepairAttempts 是首轮之后允许的额外修复次数：全局默认 llmDefaultRepairAttempts=1，
-//     模块显式覆盖须在本表登记（analysis/trade_plan 保留历史值 2——共用
-//     AnalysisService.callWithRepair 的既有行为，不做静默变更）。达到上限后必须拒答
+//     模块显式覆盖须在本表登记。上游单次请求有绝对 60s 窗口时，多打一轮并不能挽救
+//     已超时的调用；结构化模块统一至多 repair 1 次。达到上限后必须拒答
 //     （RefusalLLMOutputInvalid）或走确定性降级，禁止隐式追加。
 //   - RepairFeedChars 是 repair 轮回灌上一轮坏输出的字符上限（完整回灌会把大段废文本
 //     重新塞进上下文，拖慢下一轮生成、更易撞上游 60s 超时——推荐 600/日报 800 先例）。
@@ -28,7 +28,7 @@ package service
 const llmDefaultRepairAttempts = 1
 
 // llmDefaultRepairFeedChars repair 回灌坏输出的默认字符上限。
-const llmDefaultRepairFeedChars = 800
+const llmDefaultRepairFeedChars = 600
 
 // llmModuleBudget 一个模块的输出预算声明。
 type llmModuleBudget struct {
@@ -43,28 +43,27 @@ type llmModuleBudget struct {
 // llmModuleBudgets 模块预算表：key 与 llm_call_logs.module / llmRun.Module 同名同值。
 // 新增 chatCompletion* 调用模块必须先在此登记预算（与 §2.5 调用矩阵登记同一纪律）。
 var llmModuleBudgets = map[string]llmModuleBudget{
-	// 分析主调（标准/panel 同 module 不同 schema）：结构化字段多（要点/风险/机会/反方/失效
-	// 条件等），预算给足；repair 2 次为既有显式覆盖（callWithRepair 历史行为）。
-	"analysis": {MaxTokens: 4000, RepairAttempts: 2, RepairFeedChars: 800},
-	// 交易计划：小 JSON（价位区间/止损/止盈/checklist）；与 analysis 共用 callWithRepair，
-	// repair 2 次保留既有行为。
-	"trade_plan": {MaxTokens: 1500, RepairAttempts: 2, RepairFeedChars: 800},
+	// 分析主调（标准/panel 同 module 不同 schema）：字段多，但 prompt 已限定数组条数/单条
+	// 字数；与推荐主调同为 2500，避免用户全局配置把单次生成拖过上游 60s 窗口。
+	"analysis": {MaxTokens: 2500, RepairAttempts: 1, RepairFeedChars: 600},
+	// 交易计划：小 JSON（价位区间/止损/止盈/checklist），一次 repair 足够。
+	"trade_plan": {MaxTokens: 1500, RepairAttempts: 1, RepairFeedChars: 600},
 	// 分析复核员：单条 verdict JSON。
-	"analysis_review": {MaxTokens: 1000, RepairAttempts: 1, RepairFeedChars: 800},
+	"analysis_review": {MaxTokens: 1000, RepairAttempts: 1, RepairFeedChars: 600},
 	// 推荐主调/复核/反方：2026-07-14 异步任务化批定标（压单次生成进上游 60s 窗口）。
 	"recommendation": {MaxTokens: 2500, RepairAttempts: 1, RepairFeedChars: 600},
 	"rec_review":     {MaxTokens: 1500, RepairAttempts: 1, RepairFeedChars: 600},
 	"rec_bear":       {MaxTokens: 1500, RepairAttempts: 1, RepairFeedChars: 600},
 	// 日报复盘：同上批定标；callReview 为固定「首轮+1 次 repair」结构，与本表声明一致。
 	"daily_report": {MaxTokens: 1500, RepairAttempts: 1, RepairFeedChars: 800},
-	// 问答：自由文本对话，预算宽（长解释合法），无结构化 repair。
-	"qa": {MaxTokens: 8000, RepairAttempts: 0},
-	// 对比短评：自由文本，无 repair。
-	"compare": {MaxTokens: 2000, RepairAttempts: 0},
+	// 问答：自由文本对话，prompt 限 800 汉字；无结构化 repair。
+	"qa": {MaxTokens: 2500, RepairAttempts: 0},
+	// 对比短评：严格 180 字内的自由文本，无 repair。
+	"compare": {MaxTokens: 1000, RepairAttempts: 0},
 	// 新闻情绪批标注（8 条/批 JSON）：解析失败降级规则路径，不 repair。
-	"news": {MaxTokens: 3000, RepairAttempts: 0},
+	"news": {MaxTokens: 2500, RepairAttempts: 0},
 	// 白话建策略：条件树 JSON。
-	"screener_parse": {MaxTokens: 2000, RepairAttempts: 1, RepairFeedChars: 800},
+	"screener_parse": {MaxTokens: 2000, RepairAttempts: 1, RepairFeedChars: 600},
 }
 
 // moduleBudget 取模块预算；未登记模块回默认（不钳 token、repair 默认 1）——
