@@ -10,9 +10,10 @@ const (
 	AnalysisModuleWatchlist = "watchlist" // 自选股
 	AnalysisModulePosition  = "position"  // 持仓
 
-	AnalysisStatusSuccess  = "success"  // 结构化输出校验通过
-	AnalysisStatusDegraded = "degraded" // 模型有输出但结构化校验失败，降级保存原文
-	AnalysisStatusFailed   = "failed"   // 调用失败（网络/鉴权/配额等），无有效结果
+	AnalysisStatusProcessing = "processing" // 后台任务已创建，正在采集数据/调用模型
+	AnalysisStatusSuccess    = "success"    // 结构化输出校验通过
+	AnalysisStatusDegraded   = "degraded"   // 模型有输出但结构化校验失败，降级保存原文
+	AnalysisStatusFailed     = "failed"     // 调用失败（网络/鉴权/配额等），无有效结果
 
 	AnalysisRatingBullish = "bullish"
 	AnalysisRatingNeutral = "neutral"
@@ -34,15 +35,16 @@ type AnalysisRecord struct {
 	Target string `gorm:"size:64" json:"target"` // 展示用标签（个股名/「全市场」/分组名等）
 	Title  string `gorm:"size:128" json:"title"`
 
-	Status     string `gorm:"size:16" json:"status"`
-	Mode       string `gorm:"size:16" json:"mode"` // ""=标准 / "panel"=多角色观点
+	Status string `gorm:"size:16" json:"status"`
+	Mode   string `gorm:"size:16" json:"mode"` // ""=标准 / "panel"=多角色观点
 	// AsOf 回溯诊断日期（YYYY-MM-DD，空=实时分析）。M2：个股模块支持按历史日期
 	// 截断日线组装 prompt（无未来泄露），事后用 hindsight 端点对照真实走势。
 	AsOf       string `gorm:"size:10" json:"as_of"`
-	Rating     string `gorm:"size:16" json:"rating"`    // 抽取到列，便于列表快速展示
-	Confidence int    `json:"confidence"`               // 0-100
-	Summary    string `gorm:"size:1024" json:"summary"` // 一句话总览（降级时为截断原文）
-	Error      string `gorm:"size:512" json:"error"`    // 失败/降级原因
+	Rating     string `gorm:"size:16" json:"rating"`     // 抽取到列，便于列表快速展示
+	Confidence int    `json:"confidence"`                // 0-100
+	Summary    string `gorm:"size:1024" json:"summary"`  // 一句话总览（降级时为截断原文）
+	Error      string `gorm:"size:512" json:"error"`     // 失败/降级原因
+	ErrorCode  string `gorm:"size:64" json:"error_code"` // 失败机读码（异步终态仍可恢复 stale_quote 等交互）
 
 	// 重字段：列表不返回，仅详情返回。
 	ResultJSON   string `gorm:"type:text" json:"result_json,omitempty"`   // 结构化结果 JSON（降级存原文）

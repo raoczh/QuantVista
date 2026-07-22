@@ -1,8 +1,6 @@
 package controller
 
 import (
-	"encoding/json"
-	"net/http"
 	"strconv"
 
 	"quantvista/common"
@@ -21,7 +19,8 @@ func NewQaController(svc *service.QaService) *QaController {
 	return &QaController{svc: svc}
 }
 
-// Ask POST /api/qa/ask —— 新建会话或在已有会话上追问。
+// Ask POST /api/qa/ask —— 创建后台问答任务并立即返回。客户端轮询任务得到
+// conversation_id 后，再从 QA 业务接口读取最终会话。
 func (qc *QaController) Ask(c *gin.Context) {
 	var req service.QaAskRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -29,69 +28,18 @@ func (qc *QaController) Ask(c *gin.Context) {
 		return
 	}
 	allowPrivate := currentRole(c) == model.RoleAdmin
-	v, err := qc.svc.Ask(c.Request.Context(), currentUserID(c), allowPrivate, req)
+	v, err := qc.svc.AskAsync(currentUserID(c), allowPrivate, req)
 	if err != nil {
-		common.ApiError(c, err) // 机读拒答码（stale_quote 等）随包络 code 字段透出
+		common.ApiError(c, err)
 		return
 	}
 	common.ApiSuccess(c, v)
 }
 
-// qaStreamLine 流式问答 NDJSON 协议行（S1）。code 字段现在就进协议：单标的留空，
-// 为横向对比/批量场景预留（届时按标的代码区分行归属）。
-type qaStreamLine struct {
-	Module string `json:"module"`
-	Code   string `json:"code"`
-	Status string `json:"status"` // streaming / done / error
-	Chunk  string `json:"chunk,omitempty"`
-	// RefusalCode 机读拒答码（P0-7）：error 行上透出（如 stale_quote），前端按它分支
-	//（流式已写 200 头无法用标准包络的 code 字段，走行协议）。
-	RefusalCode string                      `json:"refusal_code,omitempty"`
-	Message     string                      `json:"message,omitempty"`
-	Data        *service.QaConversationView `json:"data,omitempty"`
-}
-
-func qaStreamErrorLine(err error) qaStreamLine {
-	return qaStreamLine{Status: "error", Message: err.Error(), RefusalCode: service.RefusalCodeOf(err)}
-}
-
-// AskStream POST /api/qa/ask-stream —— 流式问答：application/x-ndjson 逐行推
-// {module,code,chunk,status}；X-Accel-Buffering:no 防反代整段缓冲。流结束后推
-// status=done 行携带完整会话视图（含后置核验 CheckJSON），前端据此替换本地状态。
+// AskStream 保留旧路由兼容性，但不再在请求生命周期内执行流式 LLM 调用；响应契约与
+// Ask 相同，立即返回 processing 任务。旧客户端应迁移到 /qa/ask + 任务轮询。
 func (qc *QaController) AskStream(c *gin.Context) {
-	var req service.QaAskRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		common.ApiErrorMsg(c, "请求格式错误")
-		return
-	}
-	allowPrivate := currentRole(c) == model.RoleAdmin
-
-	c.Header("Content-Type", "application/x-ndjson; charset=utf-8")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("X-Accel-Buffering", "no") // nginx 反代下禁用响应缓冲，保证逐行到达
-	flusher, _ := c.Writer.(http.Flusher)
-	writeLine := func(line qaStreamLine) {
-		line.Module = "qa"
-		b, err := json.Marshal(line)
-		if err != nil {
-			return
-		}
-		_, _ = c.Writer.Write(append(b, '\n'))
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
-
-	v, err := qc.svc.AskStream(c.Request.Context(), currentUserID(c), allowPrivate, req, func(chunk string) {
-		writeLine(qaStreamLine{Status: "streaming", Chunk: chunk})
-	})
-	if err != nil {
-		// 首字节前的失败（配额/配置/快照）与流中断都走同一 error 行；
-		// 此时可能已写过 200 头，无法降级为标准包络，前端按行协议处理。
-		writeLine(qaStreamErrorLine(err))
-		return
-	}
-	writeLine(qaStreamLine{Status: "done", Data: v})
+	qc.Ask(c)
 }
 
 // List GET /api/qa?limit=

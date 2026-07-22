@@ -1,4 +1,5 @@
-import { request, AI_TIMEOUT } from './client'
+import { request } from './client'
+import type { LLMTask } from './llmTask'
 
 // M1 条件树选股：因子宽表扫描 + 策略广场 + 自定义策略。
 
@@ -138,12 +139,10 @@ export interface ParseStrategyResult {
 
 /** 白话描述 → 条件树（消耗 1 次 AI 配额；生成树需用户确认后才落编辑器）。 */
 export function parseScreenerStrategy(text: string) {
-  // 走 LLM 解析，服务端合法耗时可达 90s+，不能继承 client 默认 20s。
-  return request<ParseStrategyResult>({
+  return request<LLMTask<ParseStrategyResult>>({
     url: '/screener/parse',
     method: 'post',
     data: { text },
-    timeout: AI_TIMEOUT,
   })
 }
 

@@ -26,6 +26,7 @@ func NewCompareService(market *MarketService, llm *LLMService) *CompareService {
 const (
 	compareMinSymbols = 2
 	compareMaxSymbols = 6
+	compareJobTimeout = 5 * time.Minute
 	// comparePromptVersion 对比 AI 点评的内联提示词版本（P0-2 修复批新设）：aiComment 的
 	// system/user 提示词为固定内联文本，改措辞须递增本版本——审计与 trace 关联凭它归因。
 	// c1: 初版（横向对比点评 180 字约束 + 数值引用纪律 + 风险提示）。
@@ -98,28 +99,9 @@ type CompareResult struct {
 
 // Compare 并发采集各标的指标，去重后组装；WithAI 时追加一句话点评。
 func (s *CompareService) Compare(ctx context.Context, userID int64, allowPrivate bool, req CompareRequest) (*CompareResult, error) {
-	// 规整 + 去重。
-	seen := map[string]bool{}
-	refs := make([]CompareSymbol, 0, len(req.Symbols))
-	for _, cs := range req.Symbols {
-		symbol, market, err := normalizeSymbolMarket(cs.Symbol, cs.Market)
-		if err != nil {
-			continue
-		}
-		key := market + ":" + symbol
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		refs = append(refs, CompareSymbol{Symbol: symbol, Market: market})
-	}
-	if len(refs) < compareMinSymbols {
-		return nil, fmt.Errorf("请至少提供 %d 只有效股票进行对比", compareMinSymbols)
-	}
-	truncNote := ""
-	if len(refs) > compareMaxSymbols {
-		truncNote = fmt.Sprintf("最多同时对比 %d 只，已忽略多余标的；", compareMaxSymbols)
-		refs = refs[:compareMaxSymbols]
+	refs, truncNote, err := normalizeCompareRequest(req)
+	if err != nil {
+		return nil, err
 	}
 
 	// 并发采集各标的指标。
@@ -162,6 +144,48 @@ func (s *CompareService) Compare(ctx context.Context, userID int64, allowPrivate
 		}
 	}
 	return res, nil
+}
+
+// CompareAsync 将带 AI 点评的对比放入通用 LLM 后台任务。HTTP 请求只负责
+// 校验和建任务，行情采集与 LLM 调用使用独立 context，不受上游断连影响。
+func (s *CompareService) CompareAsync(userID int64, allowPrivate bool, req CompareRequest) (*LLMTaskView, error) {
+	_, _, err := normalizeCompareRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	req.WithAI = true
+	return StartAsyncLLMTask(userID, "compare", req, compareJobTimeout, func(ctx context.Context) (any, error) {
+		return s.Compare(ctx, userID, allowPrivate, req)
+	})
+}
+
+// normalizeCompareRequest 规整、去重并限制对比标的数量。同步与异步入口共用，
+// 确保无效请求在建后台任务前就被拒绝。
+func normalizeCompareRequest(req CompareRequest) ([]CompareSymbol, string, error) {
+	// 规整 + 去重。
+	seen := map[string]bool{}
+	refs := make([]CompareSymbol, 0, len(req.Symbols))
+	for _, cs := range req.Symbols {
+		symbol, market, err := normalizeSymbolMarket(cs.Symbol, cs.Market)
+		if err != nil {
+			continue
+		}
+		key := market + ":" + symbol
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		refs = append(refs, CompareSymbol{Symbol: symbol, Market: market})
+	}
+	if len(refs) < compareMinSymbols {
+		return nil, "", fmt.Errorf("请至少提供 %d 只有效股票进行对比", compareMinSymbols)
+	}
+	truncNote := ""
+	if len(refs) > compareMaxSymbols {
+		truncNote = fmt.Sprintf("最多同时对比 %d 只，已忽略多余标的；", compareMaxSymbols)
+		refs = refs[:compareMaxSymbols]
+	}
+	return refs, truncNote, nil
 }
 
 // buildRow 采集单只标的的对比指标（行情 + 技术指标）。

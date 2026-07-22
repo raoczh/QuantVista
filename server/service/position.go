@@ -32,13 +32,13 @@ var validPositionType = map[string]bool{
 // 最近已知价放 LastPrice 供展示（须随 QuoteAsOf/StaleReason 标注，不冒充实时）。
 type PositionView struct {
 	model.Position
-	CurrentPrice float64 `json:"current_price"` // 持仓中的现价（已平仓为卖出价）；仅 fresh 时有值
-	QuoteOK      bool    `json:"quote_ok"`      // 是否取到当前有效（fresh）行情
-	Cost         float64 `json:"cost"`          // 买入总成本 = 买入价*数量 + 买入费 + 买入税
-	MarketValue  float64 `json:"market_value"`  // 现值
-	ProfitAmount float64 `json:"profit_amount"` // 盈亏额（已扣相关费税）
-	ProfitPct    float64 `json:"profit_pct"`    // 收益率 %
-	Realized     bool    `json:"realized"`      // 是否已实现（已平仓）
+	CurrentPrice float64 `json:"current_price"`  // 持仓中的现价（已平仓为卖出价）；仅 fresh 时有值
+	QuoteOK      bool    `json:"quote_ok"`       // 是否取到当前有效（fresh）行情
+	Cost         float64 `json:"cost"`           // 买入总成本 = 买入价*数量 + 买入费 + 买入税
+	MarketValue  float64 `json:"market_value"`   // 现值
+	ProfitAmount float64 `json:"profit_amount"`  // 盈亏额（已扣相关费税）
+	ProfitPct    float64 `json:"profit_pct"`     // 收益率 %
+	Realized     bool    `json:"realized"`       // 是否已实现（已平仓）
 	DayChangePct float64 `json:"day_change_pct"` // 当日涨跌幅 %（仅 fresh 时有值）
 
 	// 行情新鲜度（fail-closed 契约块）：
@@ -221,7 +221,8 @@ func lastStockAnalysisFor(userID int64, positions []model.Position) map[string]t
 	}
 	if err := common.DB.Model(&model.AnalysisRecord{}).
 		Select("symbol, MAX(created_at) AS last").
-		Where("user_id = ? AND module = ? AND symbol IN ?", userID, model.AnalysisModuleStock, symbols).
+		Where("user_id = ? AND module = ? AND symbol IN ? AND status IN ?", userID, model.AnalysisModuleStock, symbols,
+			[]string{model.AnalysisStatusSuccess, model.AnalysisStatusDegraded}).
 		Group("symbol").Scan(&rows).Error; err != nil {
 		return out
 	}

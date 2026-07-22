@@ -1,8 +1,8 @@
-import { request, AI_TIMEOUT } from './client'
+import { request } from './client'
 import type { EvidenceCheck, TrustReview, SysConfidence, RiskFlag } from './trust'
 
 export type AnalysisModule = 'market' | 'sector' | 'stock' | 'watchlist' | 'position'
-export type AnalysisStatus = 'success' | 'degraded' | 'failed'
+export type AnalysisStatus = 'processing' | 'success' | 'degraded' | 'failed'
 export type AnalysisRating = 'bullish' | 'neutral' | 'bearish'
 
 export interface AnalyzeRequest {
@@ -111,6 +111,7 @@ export interface AnalysisRecord {
   confidence: number
   summary: string
   error: string
+  error_code?: string
   llm_config_id?: number // 生成时使用的 LLM 配置 id（配置名前端按自己的清单解析）
   provider: string
   model: string
@@ -139,7 +140,7 @@ export interface AnalysisView extends AnalysisRecord {
 }
 
 export function createAnalysis(req: AnalyzeRequest) {
-  return request<AnalysisView>({ url: '/analysis', method: 'post', data: req, timeout: AI_TIMEOUT })
+  return request<AnalysisView>({ url: '/analysis', method: 'post', data: req })
 }
 
 export function listAnalysis(module?: string, limit = 30) {

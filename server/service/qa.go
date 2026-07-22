@@ -30,6 +30,7 @@ const (
 	qaMaxQuestionRunes = 500
 	qaHistoryLimit     = 12  // 每次调用最多带入的历史消息条数（控上下文）
 	qaMaxMessages      = 100 // 单会话消息上限
+	qaJobTimeout       = 10 * time.Minute
 )
 
 // QaAskRequest 提问入参。ConversationID=0 表示新建会话（需 Symbol/Market，
@@ -45,6 +46,23 @@ type QaAskRequest struct {
 	// 默认 false——新会话采集快照时全源无 fresh 行情则拒绝生成首答（前端弹确认）；
 	// 显式置 true 才按「截至行情时刻的历史数据解释」口径创建会话（快照打 stale_mode）。
 	AllowStale bool `json:"allow_stale"`
+}
+
+// QaTaskResult 是通用后台任务中保存的轻量定位结果。完整会话及历史消息仍以 QA 业务表
+// 为唯一事实来源，避免每轮任务都重复保存逐渐增长的 QaConversationView。
+type QaTaskResult struct {
+	ConversationID int64 `json:"conversation_id"`
+}
+
+func normalizeQaAskRequest(req QaAskRequest) (QaAskRequest, error) {
+	req.Question = strings.TrimSpace(req.Question)
+	if req.Question == "" {
+		return req, errors.New("问题不能为空")
+	}
+	if len([]rune(req.Question)) > qaMaxQuestionRunes {
+		return req, errors.New("问题过长（最多 500 字）")
+	}
+	return req, nil
 }
 
 // QaConversationView 会话 + 消息列表。RiskFlags 为快照 risk_gate 的程序化风险标志
@@ -98,8 +116,35 @@ func qaConvLock(convID int64) *sync.Mutex {
 	return m.(*sync.Mutex)
 }
 
+// AskAsync 创建通用 LLM 后台任务并立即返回。实际快照采集、模型调用、证据核验和
+// 会话落库均在独立于 HTTP 请求的 Context 中执行，反向代理或浏览器断开不会取消任务。
+// Ask 保留同步语义，供后台 runner、服务内调用和既有测试复用。
+func (s *QaService) AskAsync(userID int64, allowPrivate bool, req QaAskRequest) (*LLMTaskView, error) {
+	var err error
+	req, err = normalizeQaAskRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	return StartAsyncLLMTask(userID, "qa", req, qaJobTimeout, func(ctx context.Context) (any, error) {
+		view, err := s.ask(ctx, userID, allowPrivate, req)
+		if err != nil {
+			return nil, err
+		}
+		return QaTaskResult{ConversationID: view.ID}, nil
+	})
+}
+
 // Ask 提问（非流式）：新建会话（首轮采集快照）或在已有会话上追问。返回会话全量视图。
 func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, req QaAskRequest) (*QaConversationView, error) {
+	var err error
+	req, err = normalizeQaAskRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	return s.ask(ctx, userID, allowPrivate, req)
+}
+
+func (s *QaService) ask(ctx context.Context, userID int64, allowPrivate bool, req QaAskRequest) (*QaConversationView, error) {
 	if req.ConversationID > 0 {
 		mu := qaConvLock(req.ConversationID)
 		mu.Lock()
@@ -108,6 +153,13 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 	ac, err := s.prepareAsk(ctx, userID, req)
 	if err != nil {
 		return nil, err
+	}
+	// 新会话的 ID 直到 prepareAsk 落库后才确定；从这里起同样持有会话锁，避免
+	// 后台调用期间被删除而留下孤儿消息。已有会话已在函数入口加锁，不能重复锁。
+	if req.ConversationID <= 0 {
+		mu := qaConvLock(ac.conv.ID)
+		mu.Lock()
+		defer mu.Unlock()
 	}
 	res, callErr := chatCompletion(ctx, chatParams{
 		BaseURL: ac.cfg.BaseURL, APIKey: ac.apiKey, Model: ac.cfg.Model, EndpointType: ac.cfg.EndpointType,
@@ -127,6 +179,11 @@ func (s *QaService) Ask(ctx context.Context, userID int64, allowPrivate bool, re
 // 流结束后走与非流式完全相同的收尾（证据核验落 CheckJSON → 落库 → 配额），核验徽章由
 // 最终返回的会话视图后置更新。LLM 配置关闭了 stream 时退回非流式调用、整段作为单个增量吐出。
 func (s *QaService) AskStream(ctx context.Context, userID int64, allowPrivate bool, req QaAskRequest, onDelta func(string)) (*QaConversationView, error) {
+	var err error
+	req, err = normalizeQaAskRequest(req)
+	if err != nil {
+		return nil, err
+	}
 	if req.ConversationID > 0 {
 		mu := qaConvLock(req.ConversationID)
 		mu.Lock()
@@ -135,6 +192,11 @@ func (s *QaService) AskStream(ctx context.Context, userID int64, allowPrivate bo
 	ac, err := s.prepareAsk(ctx, userID, req)
 	if err != nil {
 		return nil, err
+	}
+	if req.ConversationID <= 0 {
+		mu := qaConvLock(ac.conv.ID)
+		mu.Lock()
+		defer mu.Unlock()
 	}
 	params := chatParams{
 		BaseURL: ac.cfg.BaseURL, APIKey: ac.apiKey, Model: ac.cfg.Model, EndpointType: ac.cfg.EndpointType,
@@ -162,13 +224,7 @@ func (s *QaService) AskStream(ctx context.Context, userID int64, allowPrivate bo
 
 // prepareAsk 校验入参、解析 LLM 配置与配额、取得/新建会话、组装消息序列。
 func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskRequest) (*qaAskContext, error) {
-	question := strings.TrimSpace(req.Question)
-	if question == "" {
-		return nil, errors.New("问题不能为空")
-	}
-	if len([]rune(question)) > qaMaxQuestionRunes {
-		return nil, errors.New("问题过长（最多 500 字）")
-	}
+	question := req.Question
 
 	// LLM 配置 + 配额熔断。
 	cfg, apiKey, err := s.llm.ResolveForUse(userID, req.LLMConfigID)
@@ -584,6 +640,25 @@ func (s *QaService) Snapshot(userID, id int64) (string, error) {
 
 // Delete 删除会话及其消息（仅本人，事务）。
 func (s *QaService) Delete(userID, id int64) error {
+	if err := expireStaleLLMTasks(userID); err != nil {
+		return err
+	}
+	var processing int64
+	if err := common.DB.Model(&model.LLMTask{}).
+		Where("user_id = ? AND kind = ? AND status = ?", userID, "qa", model.LLMTaskStatusProcessing).
+		Count(&processing).Error; err != nil {
+		return err
+	}
+	if processing > 0 {
+		return errors.New("问答正在后台执行，请等任务结束后再删除会话")
+	}
+
+	mu := qaConvLock(id)
+	if !mu.TryLock() {
+		return errors.New("问答正在后台执行，请等任务结束后再删除会话")
+	}
+	defer mu.Unlock()
+
 	var conv model.AiConversation
 	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&conv).Error; err != nil {
 		return errors.New("会话不存在")

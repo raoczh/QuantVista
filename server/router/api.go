@@ -53,6 +53,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	setupCtl := controller.NewSetupController(authSvc)
 	userCtl := controller.NewUserController(userSvc)
 	llmCtl := controller.NewLLMController(llmSvc)
+	llmTaskCtl := controller.NewLLMTaskController()
 	adminCtl := controller.NewAdminController(adminSvc)
 	watchlistCtl := controller.NewWatchlistController(watchlistSvc)
 	positionCtl := controller.NewPositionController(positionSvc)
@@ -156,6 +157,12 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			}
 			// 草稿测试单独成路径，避免与 /llm-configs/:id 的参数段冲突。
 			authed.POST("/llm-config-test", llmCtl.TestDraft)
+
+			llmTasks := authed.Group("/llm-tasks")
+			{
+				llmTasks.GET("", llmTaskCtl.List)
+				llmTasks.GET("/:id", llmTaskCtl.Get)
+			}
 
 			// 自选股（分组 + 条目，按用户隔离）
 			watchlists := authed.Group("/watchlists")
