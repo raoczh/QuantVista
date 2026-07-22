@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onBeforeUnmount, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NButton,
@@ -20,6 +20,7 @@ import {
   NEmpty,
   NPopover,
   NPopconfirm,
+  NAlert,
   useMessage,
 } from 'naive-ui'
 import {
@@ -41,6 +42,8 @@ import {
   type CondNode,
   type ParseStrategyResult,
 } from '@/api/screener'
+import { getLLMTask, listLLMTasks, type LLMTask } from '@/api/llmTask'
+import { isPollCancelled, pollUntil } from '@/lib/poll'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
 import { useIsMobile } from '@/composables/useIsMobile'
@@ -281,14 +284,22 @@ function openEdit(cs: CustomStrategy) {
 const aiText = ref('')
 const aiParsing = ref(false)
 const aiResult = ref<ParseStrategyResult | null>(null)
+const aiTask = ref<LLMTask<ParseStrategyResult> | null>(null)
+const aiTaskError = ref('')
+let aiPollAbort: AbortController | null = null
+onBeforeUnmount(() => aiPollAbort?.abort())
 // 套用的嵌套树（行式编辑器只支持一层 all 的既有约束）：非空时行编辑区切只读展示。
 const aiAdvancedTree = ref<CondNode | null>(null)
 const aiAdvancedConditions = ref<string[]>([])
 
 function resetAiGen() {
+  aiPollAbort?.abort()
+  aiPollAbort = null
   aiText.value = ''
   aiParsing.value = false
   aiResult.value = null
+  aiTask.value = null
+  aiTaskError.value = ''
   aiAdvancedTree.value = null
   aiAdvancedConditions.value = []
 }
@@ -301,17 +312,81 @@ async function runAiParse() {
   }
   aiParsing.value = true
   aiResult.value = null
+  aiTaskError.value = ''
   try {
-    aiResult.value = await parseScreenerStrategy(text)
-    if (!aiResult.value.tree) {
-      message.warning('AI 未能映射出任何条件（因子库没有对应数据，详见提示）')
-    }
+    const task = await parseScreenerStrategy(text)
+    aiTask.value = task
+    message.info('解析任务已创建，正在后台执行（刷新或关闭页面不影响任务）')
+    await trackParseTask(task)
   } catch (e) {
-    message.error((e as Error).message)
+    if (!isPollCancelled(e)) {
+      aiTaskError.value = (e as Error).message
+      message.error(aiTaskError.value)
+    }
   } finally {
     aiParsing.value = false
   }
 }
+
+function applyParseResult(value: ParseStrategyResult) {
+  aiResult.value = value
+  aiTaskError.value = ''
+  if (!value.tree) {
+    message.warning('AI 未能映射出任何条件（因子库没有对应数据，详见提示）')
+  }
+}
+
+async function trackParseTask(initial: LLMTask<ParseStrategyResult>, silentFailure = false) {
+  aiPollAbort?.abort()
+  const controller = new AbortController()
+  aiPollAbort = controller
+  aiTask.value = initial
+  aiParsing.value = initial.status === 'processing'
+  try {
+    const task =
+      initial.status === 'processing'
+        ? await pollUntil(() => getLLMTask<ParseStrategyResult>(initial.id), (v) => v.status !== 'processing', {
+            signal: controller.signal,
+          })
+        : initial
+    aiTask.value = task
+    if (task.status === 'failed') throw new Error(task.error || '自然语言选股解析失败')
+    if (!task.result) throw new Error('解析任务已完成，但未返回结果')
+    applyParseResult(task.result)
+  } catch (e) {
+    if (isPollCancelled(e)) return
+    aiTaskError.value = (e as Error).message
+    if (!silentFailure) message.error(aiTaskError.value)
+  } finally {
+    if (aiPollAbort === controller) {
+      aiPollAbort = null
+      aiParsing.value = false
+    }
+  }
+}
+
+async function restoreParseTask() {
+  const tasks = await listLLMTasks<ParseStrategyResult>({ kind: 'screener_parse', limit: 1 }).catch(() => [])
+  const summary = tasks[0]
+  if (!summary) return
+  const terminalIsRecent = Date.now() - new Date(summary.updated_at || summary.created_at).getTime() < 15 * 60 * 1000
+  if (summary.status !== 'processing' && !terminalIsRecent) return
+  const task =
+    summary.status === 'processing' ? summary : await getLLMTask<ParseStrategyResult>(summary.id).catch(() => summary)
+  editorShow.value = true
+  if (!editorRows.value.length) editorRows.value = [{ factor: 'chg_pct', op: 'between', value: 1, value2: 6 }]
+  if (task.status === 'processing') {
+    void trackParseTask(task)
+  } else if (task.status === 'success' && task.result) {
+    aiTask.value = task
+    aiResult.value = task.result
+  } else if (task.status === 'failed') {
+    aiTask.value = task
+    aiTaskError.value = task.error || '自然语言选股解析失败'
+  }
+}
+
+onMounted(() => void restoreParseTask())
 
 function adoptAiResult() {
   const r = aiResult.value
@@ -638,6 +713,10 @@ async function removeCustom(id: number) {
             />
             <n-button size="small" type="primary" secondary :loading="aiParsing" @click="runAiParse">AI 生成</n-button>
           </div>
+          <n-alert v-if="aiTask?.status === 'processing'" type="info" :bordered="false">
+            正在后台解析选股条件，页面刷新或关闭不会中断任务。
+          </n-alert>
+          <n-alert v-else-if="aiTaskError" type="error" :bordered="false">解析失败：{{ aiTaskError }}</n-alert>
           <div v-if="aiResult" class="ai-preview">
             <p v-if="aiResult.explain" class="ai-explain">AI 理解：{{ aiResult.explain }}</p>
             <p v-if="llmLabel(aiResult)" class="ai-explain">解析模型：{{ llmLabel(aiResult) }}</p>

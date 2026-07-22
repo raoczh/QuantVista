@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onBeforeUnmount, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -14,6 +14,8 @@ import {
 } from 'naive-ui'
 import { compareStocks, type CompareResult } from '@/api/compare'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
+import { getLLMTask, isLLMTask, listLLMTasks, type LLMTask } from '@/api/llmTask'
+import { isPollCancelled, pollUntil } from '@/lib/poll'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
 import PageContainer from '@/components/PageContainer.vue'
@@ -82,6 +84,15 @@ loadLLM()
 // ---------- 对比 ----------
 const result = ref<CompareResult | null>(null)
 const running = ref(false)
+const activeTask = ref<LLMTask<CompareResult> | null>(null)
+const taskError = ref('')
+
+function applyCompareResult(value: CompareResult) {
+  result.value = value
+  taskError.value = ''
+  if (value.note) message.info(value.note)
+}
+
 async function run() {
   const symbols = inputs.value.map((r) => ({ symbol: r.symbol.trim(), market: r.market })).filter((r) => r.symbol)
   if (symbols.length < 2) {
@@ -92,15 +103,78 @@ async function run() {
     message.warning('未配置 LLM，将仅做指标对比')
   }
   running.value = true
+  taskError.value = ''
   try {
-    result.value = await compareStocks({ symbols, with_ai: withAI.value, llm_config_id: llmId.value })
-    if (result.value.note) message.info(result.value.note)
+    const response = await compareStocks({ symbols, with_ai: withAI.value, llm_config_id: llmId.value })
+    if (isLLMTask<CompareResult>(response)) {
+      activeTask.value = response
+      message.info('任务已创建，正在后台生成 AI 点评（刷新或关闭页面不影响任务）')
+      await trackCompareTask(response)
+    } else {
+      activeTask.value = null
+      applyCompareResult(response)
+    }
   } catch (e) {
-    message.error((e as Error).message)
+    if (!isPollCancelled(e)) {
+      taskError.value = (e as Error).message
+      message.error(taskError.value)
+    }
   } finally {
     running.value = false
   }
 }
+
+let pollAbort: AbortController | null = null
+onBeforeUnmount(() => pollAbort?.abort())
+
+async function trackCompareTask(initial: LLMTask<CompareResult>) {
+  pollAbort?.abort()
+  const controller = new AbortController()
+  pollAbort = controller
+  running.value = true
+  activeTask.value = initial
+  try {
+    const task =
+      initial.status === 'processing'
+        ? await pollUntil(() => getLLMTask<CompareResult>(initial.id), (v) => v.status !== 'processing', {
+            signal: controller.signal,
+          })
+        : initial
+    activeTask.value = task
+    if (task.status === 'failed') throw new Error(task.error || '横向对比任务执行失败')
+    if (!task.result) throw new Error('横向对比任务已完成，但未返回结果')
+    applyCompareResult(task.result)
+  } catch (e) {
+    if (isPollCancelled(e)) return
+    taskError.value = (e as Error).message
+    message.error(taskError.value)
+  } finally {
+    if (pollAbort === controller) {
+      pollAbort = null
+      running.value = false
+    }
+  }
+}
+
+async function restoreCompareTask() {
+  const tasks = await listLLMTasks<CompareResult>({ kind: 'compare', limit: 1 }).catch(() => [])
+  const summary = tasks[0]
+  if (!summary) return
+  if (summary.status === 'processing') {
+    activeTask.value = summary
+    void trackCompareTask(summary)
+    return
+  }
+  const task = await getLLMTask<CompareResult>(summary.id).catch(() => summary)
+  activeTask.value = task
+  if (task.status === 'success' && task.result) {
+    result.value = task.result
+  } else if (task.status === 'failed') {
+    taskError.value = task.error || '横向对比任务执行失败'
+  }
+}
+
+onMounted(() => void restoreCompareTask())
 
 // ---------- 展示辅助 ----------
 const rows = computed(() => result.value?.rows.filter((r) => r.quote_ok) || [])
@@ -197,6 +271,11 @@ function aiRefusalText(code: string) {
           <n-button type="primary" :loading="running" @click="run">开始对比</n-button>
         </div>
       </SectionCard>
+
+      <n-alert v-if="activeTask?.status === 'processing'" type="info" :bordered="false">
+        AI 点评正在后台生成，页面刷新或关闭不会中断任务。
+      </n-alert>
+      <n-alert v-else-if="taskError" type="error" :bordered="false"> 横向对比失败：{{ taskError }} </n-alert>
 
       <SectionCard v-if="result" title="对比结果">
         <n-spin :show="running">

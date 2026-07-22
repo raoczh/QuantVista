@@ -14,6 +14,7 @@ func AllModels() []any {
 		&UserQuota{},
 		&LLMConfig{},
 		&LLMCallLog{},
+		&LLMTask{},
 		&Stock{},
 		&StockQuote{},
 		&DailyBar{},

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // P3c AI 白话建策略：自然语言 → 条件树 DSL（service/screener.go）。
@@ -27,6 +28,7 @@ const (
 	// screenerParsePromptVersion 解析 prompt 版本（独立于分析 p*/推荐 s* 序列）。
 	screenerParsePromptVersion = "sp1"
 	parseStrategyTextMax       = 300 // 白话输入长度上限（rune）
+	screenerParseJobTimeout    = 5 * time.Minute
 )
 
 // ScreenerAIService 白话建策略：LLM 解析自然语言为条件树。
@@ -64,13 +66,11 @@ type ParseStrategyResult struct {
 // ParseStrategy 把白话选股描述解析为条件树。校验失败 repair 一次，仍不过则报错
 // （交互式动作，不做降级半成品——用户重试成本低，脏树落编辑器危害大）。
 func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, allowPrivate bool, req ParseStrategyRequest) (*ParseStrategyResult, error) {
-	text := strings.TrimSpace(req.Text)
-	if text == "" {
-		return nil, errors.New("请先用白话描述选股条件")
+	req, err := normalizeParseStrategyRequest(req)
+	if err != nil {
+		return nil, err
 	}
-	if len([]rune(text)) > parseStrategyTextMax {
-		return nil, fmt.Errorf("描述过长（最多 %d 字）", parseStrategyTextMax)
-	}
+	text := req.Text
 
 	cfg, apiKey, err := s.llm.ResolveForUse(userID, req.LLMConfigID)
 	if err != nil {
@@ -160,6 +160,29 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 		out.Conditions = describeCondTree(out.Tree)
 	}
 	return out, nil
+}
+
+// ParseStrategyAsync 将白话选股解析放入通用 LLM 后台任务，避免 HTTP 请求或
+// 反向代理的短超时取消正在进行的模型调用。
+func (s *ScreenerAIService) ParseStrategyAsync(userID int64, allowPrivate bool, req ParseStrategyRequest) (*LLMTaskView, error) {
+	req, err := normalizeParseStrategyRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	return StartAsyncLLMTask(userID, "screener_parse", req, screenerParseJobTimeout, func(ctx context.Context) (any, error) {
+		return s.ParseStrategy(ctx, userID, allowPrivate, req)
+	})
+}
+
+func normalizeParseStrategyRequest(req ParseStrategyRequest) (ParseStrategyRequest, error) {
+	req.Text = strings.TrimSpace(req.Text)
+	if req.Text == "" {
+		return req, errors.New("请先用白话描述选股条件")
+	}
+	if len([]rune(req.Text)) > parseStrategyTextMax {
+		return req, fmt.Errorf("描述过长（最多 %d 字）", parseStrategyTextMax)
+	}
+	return req, nil
 }
 
 // ---------- LLM 输出解析 ----------

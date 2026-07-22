@@ -28,7 +28,7 @@ func (ac *AnalysisController) Create(c *gin.Context) {
 	}
 	// allowPrivate：仅管理员可让分析调用触达内网自建模型（与 LLM 测试连接一致，防 SSRF）。
 	allowPrivate := currentRole(c) == model.RoleAdmin
-	v, err := ac.svc.Analyze(c.Request.Context(), currentUserID(c), allowPrivate, req)
+	v, err := ac.svc.AnalyzeAsync(currentUserID(c), allowPrivate, req)
 	if err != nil {
 		common.ApiError(c, err) // 机读拒答码（stale_quote 等）随包络 code 字段透出
 		return

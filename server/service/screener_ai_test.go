@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -278,5 +279,38 @@ func TestParseStrategyInputValidation(t *testing.T) {
 	long := strings.Repeat("涨", parseStrategyTextMax+1)
 	if _, err := svc.ParseStrategy(context.Background(), 1, false, ParseStrategyRequest{Text: long}); err == nil {
 		t.Fatal("超长输入应拒绝")
+	}
+}
+
+// TestParseStrategyAsyncTask 白话选股解析立即返回 processing 任务，
+// LLM 调用在后台完成后通过通用任务详情返回原 ParseStrategyResult。
+func TestParseStrategyAsyncTask(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		content := `{\"tree\":{\"all\":[{\"factor\":\"rsi_14\",\"op\":\"<\",\"value\":30}]},\"unmatched\":[],\"explain\":\"RSI 超卖\"}`
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"` + content + `"}}],"usage":{"total_tokens":90}}`))
+	}))
+	defer srv.Close()
+
+	const userID int64 = 12022
+	resetAsyncLLMTasks(t)
+	seedParseStrategyEnv(t, userID, srv.URL)
+	svc := NewScreenerAIService(NewLLMService())
+	task, err := svc.ParseStrategyAsync(userID, true, ParseStrategyRequest{Text: "  RSI 超卖  "})
+	if err != nil {
+		t.Fatalf("建解析任务失败: %v", err)
+	}
+	if task.Kind != "screener_parse" || task.Status != model.LLMTaskStatusProcessing {
+		t.Fatalf("应立即返回 screener_parse processing 任务: %+v", task)
+	}
+	done := waitAsyncLLMTask(t, userID, task.ID)
+	if done.Status != model.LLMTaskStatusSuccess {
+		t.Fatalf("解析任务应成功: %+v", done)
+	}
+	var got ParseStrategyResult
+	if err := json.Unmarshal(done.Result, &got); err != nil {
+		t.Fatalf("解码解析结果失败: %v; raw=%s", err, done.Result)
+	}
+	if got.Tree == nil || len(got.Tree.All) != 1 || got.Tree.All[0].Factor != "rsi_14" {
+		t.Fatalf("后台解析条件树不正确: %+v", got.Tree)
 	}
 }

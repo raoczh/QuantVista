@@ -16,21 +16,25 @@ import {
   useMessage,
 } from 'naive-ui'
 import {
-  askQaStream,
+  askQa,
   listConversations,
   getConversation,
   deleteConversation,
   getQaSnapshot,
+  type QaAskRequest,
+  type QaTaskResult,
   type QaConversation,
   type QaConversationView,
   type QaMessage,
 } from '@/api/qa'
+import { getLLMTask, listLLMTasks, type LLMTask } from '@/api/llmTask'
 import type { EvidenceCheck, RiskFlag } from '@/api/trust'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { getApiErrorCode } from '@/api/client'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
 import { renderMarkdown } from '@/lib/markdown'
+import { pollUntil, isPollCancelled } from '@/lib/poll'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
@@ -54,41 +58,17 @@ const market = ref('cn')
 const question = ref('')
 const asking = ref(false)
 const scrollBox = ref<HTMLElement | null>(null)
+const activeTaskId = ref<number | null>(null)
+const taskError = ref('')
+const taskErrorCode = ref('')
 // 从分析结果「继续问答」进入：新会话复用该分析记录的数据快照（不重复拉数）。
 const fromAnalysisId = ref<number | null>(null)
 const fromAnalysisName = ref('')
 
-// ---------- 流式渲染（S1）----------
-// 增量先进 streamRaw 缓冲，100ms 节流转 markdown（renderMarkdown 已 DOMPurify 消毒），
-// 避免每个 token 都重排。核验徽章在 done 行替换 current 后自然后置出现。
+// ---------- 后台任务 ----------
 const pendingQuestion = ref('')
-const streamHtml = ref('')
-let streamRaw = ''
-let renderTimer: number | null = null
-
-function flushStreamRender() {
-  renderTimer = null
-  streamHtml.value = renderMarkdown(streamRaw)
-  void scrollToBottom()
-}
-function onStreamChunk(text: string) {
-  streamRaw += text
-  if (renderTimer === null) {
-    renderTimer = window.setTimeout(flushStreamRender, 100)
-  }
-}
-function resetStream() {
-  if (renderTimer !== null) {
-    window.clearTimeout(renderTimer)
-    renderTimer = null
-  }
-  streamRaw = ''
-  streamHtml.value = ''
-  pendingQuestion.value = ''
-}
-onBeforeUnmount(() => {
-  if (renderTimer !== null) window.clearTimeout(renderTimer)
-})
+let pollAbort: AbortController | null = null
+onBeforeUnmount(() => pollAbort?.abort())
 
 // ---------- LLM ----------
 const llmConfigs = ref<LLMConfig[]>([])
@@ -115,62 +95,115 @@ async function scrollToBottom() {
 // 不得被误当成「已确认历史解释模式」。
 async function send(allowStale?: boolean | Event) {
   const staleOk = allowStale === true
-  if (asking.value) return // 回车/连击防抖：请求在途时不重复提交
+  if (asking.value) return // 回车/连击防抖：后台任务执行中不重复提交
   const q = question.value.trim()
   if (!q) return
   if (!current.value && !symbol.value.trim()) {
     message.warning('请输入要提问的股票代码')
     return
   }
-  asking.value = true
-  pendingQuestion.value = q
-  streamRaw = ''
-  streamHtml.value = ''
-  // 记录发起时的会话身份：流式期间用户可能切到别的会话，落地前比对以防旧回答覆盖新界面。
   const startConvId = current.value?.id
+  const payload: QaAskRequest = {
+    conversation_id: startConvId,
+    symbol: current.value ? undefined : symbol.value.trim(),
+    market: current.value ? undefined : market.value,
+    llm_config_id: llmId.value,
+    question: q,
+    analysis_record_id: !current.value && fromAnalysisId.value ? fromAnalysisId.value : undefined,
+    allow_stale: staleOk || undefined,
+  }
+  await submitQaTask(payload, startConvId)
+}
+
+function showTaskFailure(messageText: string, code = '', payload?: QaAskRequest, startConvId?: number) {
+  const msg = messageText || '问答任务失败'
+  taskError.value = msg
+  taskErrorCode.value = code
+  // 行情时效 fail-closed：后台终态仍保留 stale_quote，沿用原请求显式确认后重提。
+  if (payload && !payload.allow_stale && (code === 'stale_quote' || (!code && msg.includes('历史数据解释')))) {
+    dialog.warning({
+      title: '行情非最新，无法按最新行情回答',
+      content: msg + '。是否按「截至行情时刻的历史数据解释」模式继续？该模式下回答不代表当前盘面，也不会给出当前买卖参考。',
+      positiveText: '按历史数据解释提问',
+      negativeText: '取消',
+      onPositiveClick: () => {
+        void submitQaTask({ ...payload, allow_stale: true }, startConvId)
+      },
+    })
+    return
+  }
+  message.error(msg)
+}
+
+async function trackQaTask(
+  initial: LLMTask<QaTaskResult>,
+  payload?: QaAskRequest,
+  startConvId?: number,
+) {
+  pollAbort?.abort()
+  const controller = new AbortController()
+  pollAbort = controller
+  activeTaskId.value = initial.id
+  asking.value = true
+  try {
+    const task =
+      initial.status === 'processing'
+        ? await pollUntil(
+            () => getLLMTask<QaTaskResult>(initial.id),
+            (v) => v.status !== 'processing',
+            { signal: controller.signal, timeoutMs: 11 * 60 * 1000 },
+          )
+        : initial
+    if (task.status === 'failed') {
+      showTaskFailure(task.error || '问答任务失败', task.error_code || '', payload, startConvId)
+      return
+    }
+    if (!task.result?.conversation_id) throw new Error('问答任务已完成，但未返回会话编号')
+    const view = await getConversation(task.result.conversation_id)
+
+    // 任务期间若用户切换了会话，只刷新历史，不用旧任务结果覆盖当前界面。
+    if (current.value?.id === startConvId) {
+      current.value = view
+      if (!payload || question.value.trim() === payload.question.trim()) question.value = ''
+      fromAnalysisId.value = null
+      fromAnalysisName.value = ''
+      await scrollToBottom()
+    }
+    taskError.value = ''
+    taskErrorCode.value = ''
+    message.success('回答已生成')
+  } catch (e) {
+    if (isPollCancelled(e)) return
+    showTaskFailure((e as Error).message || '问答任务状态读取失败', getApiErrorCode(e) || '', payload, startConvId)
+  } finally {
+    if (pollAbort === controller) {
+      pollAbort = null
+      activeTaskId.value = null
+      asking.value = false
+      pendingQuestion.value = ''
+      await loadHistory()
+    }
+  }
+}
+
+async function submitQaTask(payload: QaAskRequest, startConvId?: number) {
+  if (asking.value) return
+  asking.value = true
+  pendingQuestion.value = payload.question
+  taskError.value = ''
+  taskErrorCode.value = ''
   await scrollToBottom()
   try {
-    const view = await askQaStream(
-      {
-        conversation_id: startConvId,
-        symbol: current.value ? undefined : symbol.value.trim(),
-        market: current.value ? undefined : market.value,
-        llm_config_id: llmId.value,
-        question: q,
-        analysis_record_id: !current.value && fromAnalysisId.value ? fromAnalysisId.value : undefined,
-        allow_stale: staleOk || undefined,
-      },
-      onStreamChunk,
-    )
-    // 期间会话已被切走（打开别的会话/新会话/删除）则丢弃本次回答，不切回旧会话。
-    if (current.value?.id !== startConvId) return
-    current.value = view
-    question.value = ''
-    fromAnalysisId.value = null
-    fromAnalysisName.value = ''
-    await scrollToBottom()
+    const task = await askQa(payload)
+    message.info('任务已创建，正在后台生成回答（刷新或关闭页面不影响任务）')
     await loadHistory()
+    await trackQaTask(task, payload, startConvId)
   } catch (e) {
-    const msg = (e as Error).message || ''
-    const refusalCode = getApiErrorCode(e)
-    // 行情时效 fail-closed：后端拒绝按最新行情首答时给用户显式降级选择（历史数据解释
-    // 模式），不悄悄放行——确认后带 allow_stale 重试（与个股分析同款交互）。
-    if (!staleOk && (refusalCode === 'stale_quote' || (!refusalCode && msg.includes('历史数据解释')))) {
-      dialog.warning({
-        title: '行情非最新，无法按最新行情回答',
-        content: msg + '。是否按「截至行情时刻的历史数据解释」模式继续？该模式下回答不代表当前盘面，也不会给出当前买卖参考。',
-        positiveText: '按历史数据解释提问',
-        negativeText: '取消',
-        onPositiveClick: () => {
-          void send(true)
-        },
-      })
-    } else {
-      message.error(msg)
-    }
-  } finally {
+    showTaskFailure((e as Error).message || '问答任务提交失败', getApiErrorCode(e) || '', payload, startConvId)
     asking.value = false
-    resetStream()
+    pendingQuestion.value = ''
+  } finally {
+    await loadHistory()
   }
 }
 
@@ -178,6 +211,8 @@ function newChat() {
   current.value = null
   symbol.value = ''
   question.value = ''
+  taskError.value = ''
+  taskErrorCode.value = ''
   fromAnalysisId.value = null
   fromAnalysisName.value = ''
 }
@@ -230,9 +265,24 @@ async function loadHistory() {
     historyLoading.value = false
   }
 }
+
+async function recoverProcessingTask() {
+  try {
+    const tasks = await listLLMTasks<QaTaskResult>({ kind: 'qa', status: 'processing', limit: 1 })
+    const task = tasks[0]
+    if (!task) return
+    message.info('已恢复正在后台执行的问答任务')
+    void trackQaTask(task, undefined, current.value?.id)
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+
 async function openConv(c: QaConversation) {
   try {
     current.value = await getConversation(c.id)
+    taskError.value = ''
+    taskErrorCode.value = ''
     await scrollToBottom()
   } catch (e) {
     message.error((e as Error).message)
@@ -308,6 +358,7 @@ watch(() => route.query, applyRouteQuery)
 onMounted(async () => {
   applyRouteQuery()
   await Promise.all([loadLLM(), loadHistory()])
+  await recoverProcessingTask()
 })
 </script>
 
@@ -336,9 +387,9 @@ onMounted(async () => {
                   <div class="conv-sub">{{ c.title }}</div>
                   <div class="conv-meta">{{ c.message_count }} 条 · {{ fmtTime(c.updated_at) }}</div>
                 </div>
-                <n-popconfirm @positive-click="removeConv(c)">
+                <n-popconfirm :disabled="asking" @positive-click="removeConv(c)">
                   <template #trigger>
-                    <n-button size="tiny" quaternary type="error" @click.stop>删</n-button>
+                    <n-button size="tiny" quaternary type="error" :disabled="asking" @click.stop>删</n-button>
                   </template>
                   删除该会话？
                 </n-popconfirm>
@@ -358,6 +409,13 @@ onMounted(async () => {
               <span class="chat-meta">{{ llmLabel(current) || current.model }} · {{ current.total_tokens }} tokens</span>
             </div>
           </template>
+
+          <n-alert v-if="taskError" type="error" title="后台问答失败" :bordered="false" style="margin-bottom: 12px">
+            {{ taskError }}<span v-if="taskErrorCode" class="task-code">（{{ taskErrorCode }}）</span>
+          </n-alert>
+          <n-alert v-else-if="asking" type="info" title="正在后台生成回答" :bordered="false" style="margin-bottom: 12px">
+            任务 #{{ activeTaskId || '创建中' }} 正在执行，刷新或关闭页面不会中断。
+          </n-alert>
 
           <!-- 行情新鲜度（q10）：以按读取时刻重判的 current_status 为准展示——快照内的
                freshness_status 是创建时的历史事实，昨天 fresh 的会话今天必须能亮「行情非最新」。 -->
@@ -437,15 +495,14 @@ onMounted(async () => {
                   </div>
                 </div>
               </template>
-              <!-- 流式中的本轮问答（done 后被 current 的正式消息替换，核验徽章随之后置出现） -->
+              <!-- 后台任务中的本轮问答（完成后由正式消息替换，核验徽章随后出现） -->
               <template v-if="asking">
-                <div class="msg user">
+                <div v-if="pendingQuestion" class="msg user">
                   <div class="bubble-wrap"><div class="bubble">{{ pendingQuestion }}</div></div>
                 </div>
                 <div class="msg assistant">
                   <div class="bubble-wrap">
-                    <div v-if="streamHtml" class="bubble md streaming" v-html="streamHtml"></div>
-                    <div v-else class="bubble thinking">思考中…</div>
+                    <div class="bubble thinking">后台生成中…</div>
                   </div>
                 </div>
               </template>
@@ -461,11 +518,12 @@ onMounted(async () => {
               :autosize="{ minRows: 1, maxRows: 4 }"
               placeholder="就这只股票提问，如「现在的均线排列如何？回撤风险大吗？」"
               maxlength="500"
+              :disabled="asking"
               @keydown.enter.exact.prevent="send"
             />
             <n-button type="primary" :loading="asking" @click="send">发送</n-button>
           </div>
-          <div class="composer-hint">仅依据行情/技术指标与已采集的新闻公告快照回答（流式输出），不构成投资建议。Enter 发送。</div>
+          <div class="composer-hint">仅依据行情/技术指标与已采集的新闻公告快照回答，不构成投资建议。Enter 发送。</div>
         </SectionCard>
       </div>
     </div>
@@ -659,16 +717,8 @@ onMounted(async () => {
   border-left: 3px solid var(--qv-divider);
   opacity: 0.8;
 }
-/* 流式中的气泡尾部光标 */
-.bubble.streaming::after {
-  content: '▍';
-  opacity: 0.5;
-  animation: qv-blink 1s step-start infinite;
-}
-@keyframes qv-blink {
-  50% {
-    opacity: 0;
-  }
+.task-code {
+  opacity: 0.65;
 }
 .risk-flags {
   display: flex;

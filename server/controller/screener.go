@@ -82,7 +82,7 @@ func (sc *ScreenerController) Parse(c *gin.Context) {
 	}
 	// allowPrivate：仅管理员可触达内网自建模型（与分析/问答一致，防 SSRF）。
 	allowPrivate := currentRole(c) == model.RoleAdmin
-	res, err := sc.ai.ParseStrategy(c.Request.Context(), currentUserID(c), allowPrivate, req)
+	res, err := sc.ai.ParseStrategyAsync(currentUserID(c), allowPrivate, req)
 	if err != nil {
 		common.ApiError(c, err)
 		return

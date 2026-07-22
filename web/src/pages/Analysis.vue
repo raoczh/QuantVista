@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -42,6 +42,7 @@ import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { getApiErrorCode } from '@/api/client'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
+import { pollUntil, isPollCancelled } from '@/lib/poll'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
@@ -125,61 +126,109 @@ async function loadLLM() {
 const running = ref(false)
 const current = ref<AnalysisView | null>(null)
 
-async function runAnalysis(allowStale = false) {
+function analysisPayload(allowStale = false): AnalyzeRequest | null {
   if (form.value.module === 'stock' && !form.value.symbol?.trim()) {
     message.warning('请输入股票代码')
+    return null
+  }
+  const payload: AnalyzeRequest = {
+    module: form.value.module,
+    llm_config_id: form.value.llm_config_id,
+    question: form.value.question?.trim() || undefined,
+  }
+  if (needMarket.value) payload.market = form.value.market
+  if (needSymbol.value) payload.symbol = form.value.symbol?.trim()
+  if (needTarget.value) payload.target = form.value.target?.trim() || undefined
+  if (form.value.module === 'stock' && panelMode.value && !asOfStr.value) payload.mode = 'panel'
+  else if (verifyMode.value) payload.verify = true // 复核仅对标准模式生效（panel 无标准结论字段）
+  if (form.value.module === 'stock' && !payload.mode && asOfStr.value) payload.as_of = asOfStr.value
+  if (allowStale) payload.allow_stale = true // 用户已确认：行情过期，按截至时刻的历史数据解释
+  return payload
+}
+
+function handleAnalysisFailure(msg: string, refusalCode = '', payload?: AnalyzeRequest) {
+  // 行情时效 fail-closed：异步终态同样保留 error_code，完成轮询后继续原来的显式确认交互。
+  const canRetryAsHistorical =
+    payload?.module === 'stock' && payload.mode !== 'panel' && !payload.as_of && !payload.allow_stale
+  if (canRetryAsHistorical && (refusalCode === 'stale_quote' || (!refusalCode && msg.includes('历史数据解释')))) {
+    dialog.warning({
+      title: '行情已过期，无法给出当前评级',
+      content:
+        msg +
+        '。是否按「截至行情时刻的历史数据解释」模式继续？该模式不代表当前盘面判断，也不会给出当前买卖行动建议。',
+      positiveText: '按历史数据解释',
+      negativeText: '取消',
+      onPositiveClick: () => {
+        void submitAnalysis({ ...payload, allow_stale: true })
+      },
+    })
     return
   }
+  message.error(msg || '分析失败')
+}
+
+function notifyAnalysisResult(view: AnalysisView, payload?: AnalyzeRequest) {
+  if (view.status === 'failed') {
+    handleAnalysisFailure(view.error || '分析失败', view.error_code || '', payload)
+  } else if (view.status === 'degraded') {
+    message.warning('模型输出未通过结构化校验，已降级为原文展示')
+  } else {
+    message.success('分析完成')
+  }
+}
+
+let pollAbort: AbortController | null = null
+onBeforeUnmount(() => pollAbort?.abort())
+
+async function trackAnalysis(id: number, payload?: AnalyzeRequest) {
+  running.value = true
+  pollAbort?.abort()
+  const controller = new AbortController()
+  pollAbort = controller
+  try {
+    const view = await pollUntil(() => getAnalysis(id), (v) => v.status !== 'processing', {
+      signal: controller.signal,
+      timeoutMs: 11 * 60 * 1000,
+    })
+    if (!current.value || current.value.id === id) current.value = view
+    notifyAnalysisResult(view, payload)
+  } catch (e) {
+    if (isPollCancelled(e)) return
+    message.error((e as Error).message)
+  } finally {
+    if (pollAbort === controller) {
+      pollAbort = null
+      running.value = false
+      await loadHistory()
+    }
+  }
+}
+
+async function submitAnalysis(payload: AnalyzeRequest) {
   running.value = true
   try {
-    const payload: AnalyzeRequest = {
-      module: form.value.module,
-      llm_config_id: form.value.llm_config_id,
-      question: form.value.question?.trim() || undefined,
-    }
-    if (needMarket.value) payload.market = form.value.market
-    if (needSymbol.value) payload.symbol = form.value.symbol?.trim()
-    if (needTarget.value) payload.target = form.value.target?.trim() || undefined
-    if (form.value.module === 'stock' && panelMode.value && !asOfStr.value) payload.mode = 'panel'
-    else if (verifyMode.value) payload.verify = true // 复核仅对标准模式生效（panel 无标准结论字段）
-    if (form.value.module === 'stock' && !payload.mode && asOfStr.value) payload.as_of = asOfStr.value
-    if (allowStale) payload.allow_stale = true // 用户已确认：行情过期，按截至时刻的历史数据解释
     const view = await createAnalysis(payload)
     current.value = view
     diff.value = null
-    if (view.status === 'degraded') {
-      message.warning('模型输出未通过结构化校验，已降级为原文展示')
-    } else {
-      message.success('分析完成')
+    if (view.status === 'processing') {
+      message.info('任务已创建，正在后台分析（刷新或关闭页面不影响任务）')
+      await loadHistory()
+      await trackAnalysis(view.id, payload)
+      return
     }
+    notifyAnalysisResult(view, payload)
   } catch (e) {
     const msg = (e as Error).message || ''
-    const refusalCode = getApiErrorCode(e)
-    // 行情时效 fail-closed：后端拒绝当前评级时给用户显式降级选择（历史数据解释模式），
-    // 不悄悄放行——确认后带 allow_stale 重试。
-    const canRetryAsHistorical = form.value.module === 'stock' && !panelMode.value && !asOfStr.value
-    if (
-      !allowStale &&
-      canRetryAsHistorical &&
-      (refusalCode === 'stale_quote' || (!refusalCode && msg.includes('历史数据解释')))
-    ) {
-      dialog.warning({
-        title: '行情已过期，无法给出当前评级',
-        content: msg + '。是否按「截至行情时刻的历史数据解释」模式继续？该模式不代表当前盘面判断，也不会给出当前买卖行动建议。',
-        positiveText: '按历史数据解释',
-        negativeText: '取消',
-        onPositiveClick: () => {
-          void runAnalysis(true)
-        },
-      })
-    } else {
-      message.error(msg)
-    }
+    handleAnalysisFailure(msg, getApiErrorCode(e), payload)
   } finally {
     running.value = false
-    // 无论成功/降级/失败都刷新历史（失败记录服务端已落库，便于用户看到）。
     await loadHistory()
   }
+}
+
+async function runAnalysis(allowStale = false) {
+  const payload = analysisPayload(allowStale)
+  if (payload) await submitAnalysis(payload)
 }
 
 // ---------- 历史 ----------
@@ -206,6 +255,7 @@ async function openRecord(rec: AnalysisRecord) {
   try {
     current.value = await getAnalysis(rec.id)
     diff.value = null
+    if (current.value.status === 'processing') void trackAnalysis(rec.id)
   } catch (e) {
     message.error((e as Error).message)
   }
@@ -254,7 +304,7 @@ function moduleText(m: string) {
   return moduleOptions.find((o) => o.value === m)?.label || m
 }
 function statusText(s: string) {
-  return s === 'success' ? '成功' : s === 'degraded' ? '降级' : '失败'
+  return s === 'processing' ? '分析中' : s === 'success' ? '成功' : s === 'degraded' ? '降级' : '失败'
 }
 function fmtTime(t: string) {
   if (!t) return ''
@@ -359,7 +409,11 @@ const hindsight = ref<HindsightView | null>(null)
 const hsTargetPrice = ref<number | null>(null)
 const hsStopPrice = ref<number | null>(null)
 const canHindsight = computed(
-  () => current.value?.module === 'stock' && (current.value.market || 'cn') === 'cn' && !!current.value.symbol,
+  () =>
+    current.value?.status !== 'processing' &&
+    current.value?.module === 'stock' &&
+    (current.value.market || 'cn') === 'cn' &&
+    !!current.value.symbol,
 )
 async function openHindsight(refresh = false) {
   if (!current.value) return
@@ -400,6 +454,11 @@ onMounted(async () => {
   if (route.query.symbol) form.value.symbol = String(route.query.symbol)
   if (route.query.market) form.value.market = String(route.query.market)
   await Promise.all([loadLLM(), loadHistory()])
+  const processing = history.value.find((h) => h.status === 'processing')
+  if (processing) {
+    current.value = await getAnalysis(processing.id).catch(() => null)
+    void trackAnalysis(processing.id)
+  }
 })
 </script>
 
@@ -514,10 +573,15 @@ onMounted(async () => {
                     :style="{ color: ratingColor(h.rating) }"
                     >{{ ratingText(h.rating) }}</span
                   >
-                  <n-tag v-else size="tiny" :type="h.status === 'failed' ? 'error' : 'warning'" :bordered="false">
+                  <n-tag
+                    v-else
+                    size="tiny"
+                    :type="h.status === 'failed' ? 'error' : h.status === 'processing' ? 'info' : 'warning'"
+                    :bordered="false"
+                  >
                     {{ statusText(h.status) }}
                   </n-tag>
-                  <n-popconfirm @positive-click="removeRecord(h)">
+                  <n-popconfirm v-if="h.status !== 'processing'" @positive-click="removeRecord(h)">
                     <template #trigger>
                       <n-button size="tiny" quaternary type="error" @click.stop>删</n-button>
                     </template>
@@ -581,6 +645,15 @@ onMounted(async () => {
                   </div>
                 </div>
               </div>
+
+              <n-alert
+                v-if="current.status === 'processing'"
+                type="info"
+                :bordered="false"
+                style="margin-bottom: 12px"
+              >
+                正在后台采集数据并生成分析。关闭或刷新页面不会中断任务，完成后会自动展示。
+              </n-alert>
 
               <!-- 历史解释模式横幅：结果不是当前盘面判断，禁按普通评级消费 -->
               <n-alert v-if="current.stale_mode" type="warning" :bordered="false" class="stale-mode-banner">

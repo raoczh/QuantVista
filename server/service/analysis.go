@@ -52,6 +52,8 @@ func NewAnalysisService(market *MarketService, watchlist *WatchlistService, posi
 const (
 	analysisPromptVersion   = "p17" // p17: 历史解释模式程序化硬约束（enforceStaleModeResult：summary 强制「截至 X 的历史数据解释」前缀、suggestions 剔除当前买卖行动词；panel 模式非 fresh 直接拒绝不接受 allow_stale）；p16: 行情时效 fail-closed——持仓割/守/补三选一仅限有当前有效行情的仓（stale/失败仓禁三选一）、个股 stale 禁当前评级（改历史解释模式或数据不足）、快照逐项 freshness 元数据；p15: 个股快照行情新鲜度元数据（captured_at/quote_as_of/quote_source/bars_as_of/market_state/freshness_status），stale 必须声明行情截至时间、非交易时段按收盘口径；p14: P3b 板块模块 board_valuation（中位 PE/PB+横截面/时序分位+积累天数）与 board_flow（板块主力资金）两段进 sector guidance；p13: P3a 机构观点 org_view 段（评级分布/评级变动/目标价偏离/调研密度）进个股 guidance + trade_plan 机构目标价对照锚；p12: M3c 交易员阶段（个股标准分析追加交易计划二次调用+量化仓位公式，计划价位与仓位数字进核验值域）；p11: M3a 市场模块情绪温度计 mood 段（连板分布/炸板率/昨涨停溢价）；p10: M2 回溯诊断 as_of 模式（截断快照+回溯声明段）；p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁先验记忆；p3: 反方观点/失效条件/数据盲区
 	analysisStrategyVersion = "s1"
+	analysisJobTimeout      = 10 * time.Minute
+	analysisProcessingStale = 15 * time.Minute
 )
 
 var validAnalysisModule = map[string]bool{
@@ -138,8 +140,61 @@ type AnalysisView struct {
 	StaleModeNote string `json:"stale_mode_note,omitempty"`
 }
 
-// Analyze 执行一次分析。allowPrivate 由调用方按角色决定（管理员可访问内网自建模型）。
+// analysisPlan 是同步准备阶段固化的运行计划。LLM 配置、密钥与 prompt 快照只解析一次，
+// 后台窗口内即使用户修改配置/模板，本次任务仍保持可复现的一致版本。
+type analysisPlan struct {
+	userID       int64
+	allowPrivate bool
+	req          AnalyzeRequest
+	cfg          *model.LLMConfig
+	apiKey       string
+	prompt       promptRuntime
+}
+
+// Analyze 保留同步执行语义，供服务内调用与既有测试使用。HTTP 入口统一走 AnalyzeAsync。
 func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivate bool, req AnalyzeRequest) (*AnalysisView, error) {
+	plan, err := s.prepareAnalysis(userID, allowPrivate, req)
+	if err != nil {
+		return nil, err
+	}
+	return s.runAnalysis(ctx, plan, nil)
+}
+
+// AnalyzeAsync 发起后台分析：同步段只做确定性校验、配置解析与 processing 落库，
+// 数据采集及全部 LLM 阶段使用独立于 HTTP 请求的 Context。浏览器、反代断开不会取消任务。
+func (s *AnalysisService) AnalyzeAsync(userID int64, allowPrivate bool, req AnalyzeRequest) (*AnalysisView, error) {
+	plan, err := s.prepareAnalysis(userID, allowPrivate, req)
+	if err != nil {
+		return nil, err
+	}
+	if v := s.reuseProcessingAnalysis(userID); v != nil {
+		return v, nil
+	}
+	rec := plan.newProcessingRecord(s)
+	if err := common.DB.Create(rec).Error; err != nil {
+		return nil, err
+	}
+	// 返回值必须在启动 goroutine 前复制，避免响应序列化与后台回写共享同一对象。
+	view := s.toView(*rec)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				common.SysWarn("分析后台任务 panic record=%d: %v", rec.ID, r)
+				rec.ErrorCode = AsyncLLMTaskErrorPanic
+				s.failAnalysisRecord(rec, fmt.Sprintf("分析任务异常终止: %v", r))
+			}
+		}()
+		bg, cancel := context.WithTimeout(context.Background(), analysisJobTimeout)
+		defer cancel()
+		if _, err := s.runAnalysis(bg, plan, rec); err != nil {
+			common.SysWarn("用户 %d 分析任务失败 record=%d: %v", userID, rec.ID, err)
+		}
+	}()
+	return view, nil
+}
+
+// prepareAnalysis 完成无需访问行情/模型的确定性准备，非法输入、无配置与配额用尽立即返回。
+func (s *AnalysisService) prepareAnalysis(userID int64, allowPrivate bool, req AnalyzeRequest) (*analysisPlan, error) {
 	req.Module = strings.ToLower(strings.TrimSpace(req.Module))
 	if !validAnalysisModule[req.Module] {
 		return nil, errors.New("不支持的分析模块")
@@ -154,6 +209,7 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	if len([]rune(req.Question)) > 500 {
 		return nil, errors.New("附加问题过长（最多 500 字）")
 	}
+	req.Question = strings.TrimSpace(req.Question)
 	// M2 回溯诊断：仅个股+标准模式；日期规整为 YYYY-MM-DD 且早于今天。
 	req.AsOf = strings.TrimSpace(req.AsOf)
 	if req.AsOf != "" {
@@ -166,23 +222,87 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 		}
 		req.AsOf = d
 	}
+	if req.Module == model.AnalysisModuleStock {
+		symbol, market, err := normalizeSymbolMarket(req.Symbol, req.Market)
+		if err != nil {
+			return nil, err
+		}
+		req.Symbol, req.Market = symbol, market
+	} else {
+		req.Market = normalizeMarketOnly(req.Market)
+	}
+	req.Target = strings.TrimSpace(req.Target)
 
-	// 1) LLM 配置（含解密密钥）。
+	// LLM 配置（含解密密钥）。
 	cfg, apiKey, err := s.llm.ResolveForUse(userID, req.LLMConfigID)
 	if err != nil {
 		return nil, err
 	}
 	allowPrivate = llmAllowPrivate(allowPrivate, cfg) // 回退到管理员配置时按配置所有者放行内网
 
-	// 2) 配额熔断：次数额度用尽直接拒绝（不发起调用）。
+	// 配额熔断：次数额度用尽直接拒绝（不发起调用）。
 	if err := checkQuota(userID); err != nil {
 		return nil, err
 	}
+	return &analysisPlan{
+		userID: userID, allowPrivate: allowPrivate, req: req,
+		cfg: cfg, apiKey: apiKey, prompt: loadPromptRuntime(userID, req.Module),
+	}, nil
+}
 
-	// 3) 组装数据上下文（失败即返回，不产生空记录）。
+func (p *analysisPlan) newProcessingRecord(s *AnalysisService) *model.AnalysisRecord {
+	label := analysisRequestLabel(p.req)
+	promptVersion := analysisPromptVersion
+	if p.req.Mode == model.AnalysisModeStandard {
+		promptVersion = p.prompt.Version(analysisPromptVersion)
+	}
+	return &model.AnalysisRecord{
+		UserID: p.userID, Module: p.req.Module, Mode: p.req.Mode, AsOf: p.req.AsOf,
+		Market: p.req.Market, Symbol: p.req.Symbol, Target: label,
+		Title: s.analysisTitle(p.req, label), Status: model.AnalysisStatusProcessing,
+		Summary:     "正在后台分析",
+		LLMConfigID: p.cfg.ID, Provider: p.cfg.Provider, Model: p.cfg.Model,
+		PromptVersion: promptVersion, StrategyVersion: analysisStrategyVersion,
+		TraceID: newLLMTraceID(),
+	}
+}
+
+func analysisRequestLabel(req AnalyzeRequest) string {
+	switch req.Module {
+	case model.AnalysisModuleStock:
+		return req.Symbol
+	case model.AnalysisModuleSector:
+		if req.Target != "" {
+			return req.Target
+		}
+		return "板块概览"
+	case model.AnalysisModuleWatchlist:
+		return "自选股"
+	case model.AnalysisModulePosition:
+		return "持仓"
+	default:
+		return "全市场"
+	}
+}
+
+func (s *AnalysisService) analysisTitle(req AnalyzeRequest, label string) string {
+	title := s.title(req.Module, req.Mode, label)
+	if req.AsOf != "" {
+		title += " · 回溯@" + req.AsOf
+	}
+	return title
+}
+
+// runAnalysis 执行数据采集、LLM 主调/交易计划/复核并持久化终态。
+// rec 非 nil 表示异步入口已经落过 processing 行，所有退出路径都必须回写它。
+func (s *AnalysisService) runAnalysis(ctx context.Context, plan *analysisPlan, rec *model.AnalysisRecord) (*AnalysisView, error) {
+	userID, allowPrivate, req := plan.userID, plan.allowPrivate, plan.req
+	cfg, apiKey := plan.cfg, plan.apiKey
+
+	// 组装数据上下文。异步任务失败时回写 processing 行；同步调用保持原先不留空记录的语义。
 	actx, err := s.buildContext(ctx, userID, req)
 	if err != nil {
-		return nil, err
+		return s.failAnalysisRun(rec, err)
 	}
 	// 行情时效 fail-closed（P0-5）：个股「当前分析/当前评级」不得建立在过期或无法核验
 	// 时效的行情上——全源无 fresh 时默认拒绝（数据不足）；用户显式 allow_stale 才按
@@ -198,13 +318,13 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 				// panel 是「四角色对当下盘面表态」的编排，输出 schema（roles/consensus）
 				// 没有历史解释形态的改写点，且专属提示词不含历史解释约束——非 fresh
 				// 一律拒绝，不接受 allow_stale（标准分析的历史解释模式可用）。
-				return nil, refusalErr(RefusalStaleQuote, "行情已过期或时效无法核验，多角色观点不支持历史解释模式；请改用标准分析（可选「按历史数据解释」）或待行情恢复后重试")
+				return s.failAnalysisRun(rec, refusalErr(RefusalStaleQuote, "行情已过期或时效无法核验，多角色观点不支持历史解释模式；请改用标准分析（可选「按历史数据解释」）或待行情恢复后重试"))
 			}
 			if !req.AllowStale {
 				if st == freshStatusUnknown {
-					return nil, refusalErr(RefusalStaleQuote, "该市场无交易日历，无法核验行情时效，无法给出当前评级；可选择「按截至行情时刻的历史数据解释」模式重试")
+					return s.failAnalysisRun(rec, refusalErr(RefusalStaleQuote, "该市场无交易日历，无法核验行情时效，无法给出当前评级；可选择「按截至行情时刻的历史数据解释」模式重试"))
 				}
-				return nil, refusalErrf(RefusalStaleQuote, "行情已过期（仅更新至 %s，可能停牌、休市异常或数据源故障），无法给出当前评级；可选择「按截至该时刻的历史数据解释」模式重试", orStr(asOf, "未知时间"))
+				return s.failAnalysisRun(rec, refusalErrf(RefusalStaleQuote, "行情已过期（仅更新至 %s，可能停牌、休市异常或数据源故障），无法给出当前评级；可选择「按截至该时刻的历史数据解释」模式重试", orStr(asOf, "未知时间")))
 			}
 			staleMode = true
 			staleAsOf = asOf
@@ -218,38 +338,18 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	// P0-6 修复批：模块模板一次 loadPromptRuntime 固化快照——正文渲染（buildMessages）与
 	// 版本归因（rec.PromptVersion/run）消费同一快照，模板在生成期间被编辑不会造成
 	// 「正文新版本旧」或反之的错位。panel 不套用用户模板（固定编排），快照仅标准模式消费。
-	modulePrompt := loadPromptRuntime(userID, req.Module)
+	modulePrompt := plan.prompt
 	messages := s.buildMessages(modulePrompt, req, actx, string(snapshotJSON))
-	promptVersion := analysisPromptVersion
-	if req.Mode == model.AnalysisModeStandard {
-		// P0-6：主记录版本只归因本模块的 guidance 模板（-custom.<hash8> 可回查内容）；
-		// 复核员模板的归因在 manifest 里 review run 自己的 prompt_version
-		//（analysisReviewSystemFor），不再混入主记录版本——两个模板各自可精确复现。
-		promptVersion = modulePrompt.Version(analysisPromptVersion)
+	if rec == nil {
+		rec = plan.newProcessingRecord(s)
 	}
-	rec := &model.AnalysisRecord{
-		UserID:          userID,
-		Module:          req.Module,
-		Mode:            req.Mode,
-		AsOf:            req.AsOf,
-		Market:          normalizeMarketOnly(req.Market),
-		Symbol:          strings.TrimSpace(req.Symbol),
-		Target:          actx.Label,
-		Title:           s.title(req.Module, req.Mode, actx.Label),
-		LLMConfigID:     cfg.ID,
-		Provider:        cfg.Provider,
-		Model:           cfg.Model,
-		PromptVersion:   promptVersion,
-		StrategyVersion: analysisStrategyVersion,
-		DataSnapshot:    string(snapshotJSON),
-	}
-	if req.AsOf != "" {
-		rec.Title += " · 回溯@" + req.AsOf
-	}
+	rec.Target = actx.Label
+	rec.Title = s.analysisTitle(req, actx.Label)
+	rec.DataSnapshot = string(snapshotJSON)
+	promptVersion := rec.PromptVersion
 	// P0-2 调用关联：本次分析一个 trace；主调/交易计划/复核各一个 run（repair 同 run
 	// 靠 attempt 区分）。manifest 数组随记录落库，llm_call_logs 凭 trace_id 双向可查。
-	trace := newLLMTraceID()
-	rec.TraceID = trace
+	trace := rec.TraceID
 	schemaVer := "analysis.v1"
 	if req.Mode == model.AnalysisModePanel {
 		schemaVer = "analysis_panel.v1"
@@ -345,9 +445,10 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 		// 调用彻底失败：无有效结果，记 failed（不写脏结构化数据）。
 		rec.Status = model.AnalysisStatusFailed
 		rec.Error = truncateRunes(callErr.Error(), 500)
+		rec.ErrorCode = asyncLLMTaskErrorCode(callErr)
 		rec.Summary = "分析失败"
 		fillRunMeta()
-		if err := common.DB.Create(rec).Error; err != nil {
+		if err := persistAnalysisRecord(rec); err != nil {
 			return nil, err
 		}
 		// 保留中央客户端返回的 RefusalError 错误链，供 controller/common.ApiError
@@ -381,10 +482,62 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	}
 
 	fillRunMeta()
-	if err := common.DB.Create(rec).Error; err != nil {
+	if err := persistAnalysisRecord(rec); err != nil {
 		return nil, err
 	}
 	return s.toView(*rec), nil
+}
+
+func persistAnalysisRecord(rec *model.AnalysisRecord) error {
+	if rec.ID == 0 {
+		return common.DB.Create(rec).Error
+	}
+	return common.DB.Save(rec).Error
+}
+
+// failAnalysisRun 将异步 processing 记录收敛为 failed；同步调用在数据采集阶段失败时
+// 仍保持旧语义，不额外创建失败空记录。
+func (s *AnalysisService) failAnalysisRun(rec *model.AnalysisRecord, err error) (*AnalysisView, error) {
+	if rec != nil && rec.ID != 0 {
+		rec.ErrorCode = asyncLLMTaskErrorCode(err)
+		s.failAnalysisRecord(rec, err.Error())
+	}
+	return nil, err
+}
+
+func (s *AnalysisService) failAnalysisRecord(rec *model.AnalysisRecord, msg string) {
+	rec.Status = model.AnalysisStatusFailed
+	rec.Error = truncateRunes(msg, 500)
+	rec.Summary = "分析失败"
+	if err := common.DB.Save(rec).Error; err != nil {
+		common.SysWarn("分析失败状态回写失败 record=%d: %v", rec.ID, err)
+	}
+}
+
+// expireStaleAnalyses 将进程重启/崩溃遗留的 processing 壳惰性收敛，避免前端永久轮询。
+func (s *AnalysisService) expireStaleAnalyses(userID int64) {
+	if err := common.DB.Model(&model.AnalysisRecord{}).
+		Where("user_id = ? AND status = ? AND updated_at < ?", userID, model.AnalysisStatusProcessing, time.Now().Add(-analysisProcessingStale)).
+		Updates(map[string]any{
+			"status":     model.AnalysisStatusFailed,
+			"summary":    "分析失败",
+			"error":      "任务中断（服务重启或执行超时），请重新发起分析",
+			"error_code": AsyncLLMTaskErrorStale,
+		}).Error; err != nil {
+		common.SysWarn("分析死任务清理失败 user=%d: %v", userID, err)
+	}
+}
+
+// reuseProcessingAnalysis 防止重复点击/请求重试并行烧 token。分析页本身在任务完成前
+// 禁止再次提交，因此按用户复用最新 processing 与前端交互一致。
+func (s *AnalysisService) reuseProcessingAnalysis(userID int64) *AnalysisView {
+	s.expireStaleAnalyses(userID)
+	var rec model.AnalysisRecord
+	if err := common.DB.Where("user_id = ? AND status = ?", userID, model.AnalysisStatusProcessing).
+		Order("id DESC").First(&rec).Error; err != nil {
+		return nil
+	}
+	return s.toView(rec)
 }
 
 // analysisRepairHint / panelRepairHint 结构化校验失败后的修复指令。
@@ -678,6 +831,7 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 
 // History 列出分析历史（不返回重字段 result_json/data_snapshot）。
 func (s *AnalysisService) History(userID int64, module string, limit int) ([]model.AnalysisRecord, error) {
+	s.expireStaleAnalyses(userID)
 	if limit <= 0 || limit > 100 {
 		limit = 30
 	}
@@ -691,7 +845,7 @@ func (s *AnalysisService) History(userID int64, module string, limit int) ([]mod
 	var rows []model.AnalysisRecord
 	// 显式选列，避免把大字段 result_json/data_snapshot 拉进列表。
 	err := q.Select("id", "user_id", "module", "market", "symbol", "target", "title",
-		"status", "mode", "as_of", "rating", "confidence", "summary", "error",
+		"status", "mode", "as_of", "rating", "confidence", "summary", "error", "error_code",
 		"llm_config_id", "provider", "model", "prompt_version", "strategy_version",
 		"prompt_tokens", "completion_tokens", "total_tokens", "latency_ms",
 		"created_at", "updated_at").
@@ -704,6 +858,7 @@ func (s *AnalysisService) History(userID int64, module string, limit int) ([]mod
 
 // Get 取单条分析详情（含结构化结果与数据快照，供复现）。仅本人。
 func (s *AnalysisService) Get(userID, id int64) (*AnalysisView, error) {
+	s.expireStaleAnalyses(userID)
 	var rec model.AnalysisRecord
 	err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&rec).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -717,14 +872,15 @@ func (s *AnalysisService) Get(userID, id int64) (*AnalysisView, error) {
 
 // Delete 删除分析记录（仅本人）。
 func (s *AnalysisService) Delete(userID, id int64) error {
-	res := common.DB.Where("id = ? AND user_id = ?", id, userID).Delete(&model.AnalysisRecord{})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
+	s.expireStaleAnalyses(userID)
+	var rec model.AnalysisRecord
+	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&rec).Error; err != nil {
 		return errors.New("分析记录不存在")
 	}
-	return nil
+	if rec.Status == model.AnalysisStatusProcessing {
+		return errors.New("分析正在后台执行，请等任务结束后再删除")
+	}
+	return common.DB.Delete(&rec).Error
 }
 
 // AnalysisDiff 与上一份同对象成功分析的差异（变化检测）。

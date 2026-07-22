@@ -1,4 +1,5 @@
-import { request, AI_TIMEOUT } from './client'
+import { request } from './client'
+import type { LLMTask } from './llmTask'
 import type { EvidenceCheck } from './trust'
 
 export interface CompareRow {
@@ -54,5 +55,5 @@ export interface CompareRequest {
 }
 
 export function compareStocks(req: CompareRequest) {
-  return request<CompareResult>({ url: '/compare', method: 'post', data: req, timeout: AI_TIMEOUT })
+  return request<CompareResult | LLMTask<CompareResult>>({ url: '/compare', method: 'post', data: req })
 }
