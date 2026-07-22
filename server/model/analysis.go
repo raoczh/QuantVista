@@ -51,7 +51,7 @@ type AnalysisRecord struct {
 	LLMConfigID     int64  `json:"llm_config_id"`
 	Provider        string `gorm:"size:32" json:"provider"`
 	Model           string `gorm:"size:64" json:"model"`
-	PromptVersion   string `gorm:"size:16" json:"prompt_version"`
+	PromptVersion   string `gorm:"size:32" json:"prompt_version"` // P0-6：-custom.<hash8> 后缀需 32 宽
 	StrategyVersion string `gorm:"size:16" json:"strategy_version"`
 
 	// P0-2 调用关联：本次分析的 trace_id（llm_call_logs 同值，双向可查）与运行元数据

@@ -217,12 +217,11 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	// 4) 构造消息并调用 + 结构化校验/repair。
 	messages := s.buildMessages(userID, req, actx, string(snapshotJSON))
 	promptVersion := analysisPromptVersion
-	if req.Mode == model.AnalysisModeStandard &&
-		(userPromptOverride(userID, req.Module) != "" ||
-			(req.Verify && userPromptOverride(userID, model.PromptModuleReview) != "")) {
-		// 标记本次使用了用户自定义模板（模块指引或复核员模板任一）——否则历史记录
-		// 声称 p12 却无法按 p12 复现。（模板内容可被用户随后编辑，当前仅标记。）
-		promptVersion = analysisPromptVersion + "-custom"
+	if req.Mode == model.AnalysisModeStandard {
+		// P0-6：主记录版本只归因本模块的 guidance 模板（-custom.<hash8> 可回查内容）；
+		// 复核员模板的归因在 manifest 里 review run 自己的 prompt_version
+		//（analysisReviewSystemFor），不再混入主记录版本——两个模板各自可精确复现。
+		promptVersion = promptVersionFor(userID, req.Module, analysisPromptVersion)
 	}
 	rec := &model.AnalysisRecord{
 		UserID:          userID,
@@ -565,14 +564,33 @@ func analysisSystemConfidence(ev *evidenceCheck, snapshot map[string]any) (strin
 	return labels[level], strings.Join(reasons, "；")
 }
 
-// analysisReviewSystem 分析复核员默认系统提示（module=review 的自定义模板可整段替换）。
-const analysisReviewSystem = `你是一名独立的分析复核员，对照数据快照审查另一位研究员给出的分析。你不重新分析，只挑刺。审查维度：
+// analysisReviewTaskSeg 复核员角色任务段（L3）：module=review 自定义模板替换的部分——
+// 角色定位与审查维度重点。P0-6 起自定义不再整段替换，verdict/输出契约段恒由系统追加。
+const analysisReviewTaskSeg = `你是一名独立的分析复核员，对照数据快照审查另一位研究员给出的分析。你不重新分析，只挑刺。审查维度：
 1. 数字一致：分析中引用的数字是否与数据快照一致，有没有夸大、张冠李戴或凭空捏造；
 2. 风险完整：主要风险是否说够，有没有被淡化或遗漏；
 3. 评级自洽：rating（偏多/中性/偏空）与快照里的数据是否自洽，有没有明显相悖；
-4. 置信校准：结论的置信度是否过度自信。
-给出 verdict：pass（无实质问题）/ warn（有值得注意的问题但不至于否决）/ reject（数字与数据明显不符或风险被严重低估，应降级）。
+4. 置信校准：结论的置信度是否过度自信。`
+
+// analysisReviewContract 复核模块契约段（L1，不可被自定义模板覆盖）：verdict 枚举语义
+// 与输出 JSON schema（解析依赖，被替换掉会让复核结果永远解析失败）。
+const analysisReviewContract = `给出 verdict：pass（无实质问题）/ warn（有值得注意的问题但不至于否决）/ reject（数字与数据明显不符或风险被严重低估，应降级）。
 只输出 JSON：{"verdict":"pass|warn|reject","comment":"一两句中文说明","confidence":0-100 的复核后建议置信度整数}，不要任何解释或代码块标记。confidence 给具体数值（reject 时给你认为的真实低值）；填 0 表示维持原置信度不调整。`
+
+// analysisReviewSystem 分析复核员默认系统提示 = 任务段 + 契约段（编译期拼接，与 P0-6
+// 拆分前逐字节一致，默认路径零行为变化）。
+const analysisReviewSystem = analysisReviewTaskSeg + "\n" + analysisReviewContract
+
+// analysisReviewSystemFor 本次复核的系统提示与 prompt 版本：P0-6 起 module=review 的
+// 自定义模板是 L3 任务段（替换角色与审查维度），verdict/schema 契约段恒由系统追加
+// 不可覆盖；版本经 promptVersionFor 带 -custom.<hash8> 内容归因。独立成函数供单测。
+func analysisReviewSystemFor(userID int64, module string) (string, string) {
+	sys := analysisReviewSystem
+	if custom, ok := promptOverrideFor(userID, model.PromptModuleReview, map[string]string{"module": module}); ok {
+		sys = composeCustomTaskPrompt(custom, analysisReviewContract)
+	}
+	return sys, promptVersionFor(userID, model.PromptModuleReview, analysisPromptVersion)
+}
 
 // reviewAnalysis AI 复核（verify 模式）：以独立复核员视角对照数据快照审查一份分析，
 // 只挑刺不重写，输出 pass/warn/reject 与建议置信度。best-effort：失败只是没有复核结论，
@@ -586,12 +604,7 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 	resForReview.TradePlan = nil
 	resJSON, _ := json.Marshal(resForReview)
 
-	sys := analysisReviewSystem
-	reviewPromptVersion := analysisPromptVersion
-	if custom, ok := promptOverrideFor(userID, model.PromptModuleReview, map[string]string{"module": module}); ok {
-		sys = custom
-		reviewPromptVersion += "-custom"
-	}
+	sys, reviewPromptVersion := analysisReviewSystemFor(userID, module)
 	run := newLLMRun(traceID, parentRunID, "analysis_review", "analysis_review.v1", reviewPromptVersion)
 	run.hashData(string(snapJSON))
 

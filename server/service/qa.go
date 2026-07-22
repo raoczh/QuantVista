@@ -390,14 +390,15 @@ func (s *QaService) qaCurrentFreshness(market string, meta *qaSnapshotMeta) (str
 }
 
 // buildMessages 组装发送给 LLM 的消息序列。系统提示含个股数据快照，历史仅取最近若干条。
-// M3c：module=qa 的自定义模板整段替换默认角色段（占位符宽容渲染），快照注入不变。
+// P0-6：module=qa 的自定义模板是 L3 任务段（替换默认角色行，占位符宽容渲染），要求
+// 契约段恒由系统追加不可覆盖；快照注入与时效重判段不变。
 func (s *QaService) buildMessages(conv model.AiConversation, history []model.AiConversationMessage, question string) []chatMessage {
 	var sys strings.Builder
 	intro := qaRoleIntro
 	if custom, ok := promptOverrideFor(conv.UserID, model.PromptModuleQa, map[string]string{
 		"symbol": conv.Symbol, "name": conv.Name, "market": conv.Market,
 	}); ok {
-		intro = custom
+		intro = composeCustomTaskPrompt(custom, qaPromptContract)
 	}
 	sys.WriteString(intro)
 	sys.WriteString("\n\n【个股数据快照】（本次会话固定，供多轮问答复用；JSON，价格为货币单位、金额单位为元）：\n")
@@ -437,15 +438,23 @@ func quoteAsOfOf(conv model.AiConversation) string {
 // q10: 首答新鲜度门（全源无 fresh 默认拒绝、allow_stale 才生成且快照打 stale_mode）+ 快照时效按每轮提问时刻重判注入（旧会话跨天不再向模型声明 fresh）；q9: 快照新鲜度元数据（captured_at/quote_as_of/bars_as_of/quote_source/freshness_status/market_state），stale 时必须声明行情截至时间、非交易时段按收盘口径表述；q8: P3a org_view 机构观点段进快照说明（卖方乐观偏差纪律）；q7: F2 finance 财务段（F10 最新期+趋势）进快照说明；q6: risk_gate 风险闸门段、允许轻量 Markdown（流式渲染配套）；q5: announcements 公告段；q4: news 舆情段；q3: 回答引用的数字会被程序化核验，威慑幻觉；q2: 快照含五维量化评分锚点、要求引用数值、禁用先验记忆。
 const qaPromptVersion = "q10"
 
-const qaRoleIntro = `你是一名严谨的证券研究助理，正在就某只个股与用户进行多轮问答。你的回答仅供研究参考，不构成投资建议。
+// qaRoleTaskSeg 问答角色任务段（L3）：module=qa 自定义模板替换的部分——角色定位与
+// 回答风格。P0-6 起自定义不再整段替换，要求契约段恒由系统追加。
+const qaRoleTaskSeg = `你是一名严谨的证券研究助理，正在就某只个股与用户进行多轮问答。你的回答仅供研究参考，不构成投资建议。`
 
-要求：
+// qaPromptContract 问答模块契约段（L1，不可被自定义模板覆盖）：数据边界/时效/风险闸门/
+// 数值核验/输出格式纪律。
+const qaPromptContract = `要求：
 1. 只依据【个股数据快照】中的事实回答，严禁编造未提供的财务、消息、评级或价格；数据不足时明确说明局限，不臆测。禁止使用你记忆中关于该公司的信息（名气/行业地位/历史印象都不算数据）。
 2. 该快照仅含采集时点的行情（quote_as_of 为行情数据时间、quote_source 为来源、freshness_status 为新鲜度状态、market_state 为市场时段、captured_at 为采集时刻）、技术指标、五维量化评分 quant_score（纯技术面 0-100 参考锚点）、可能存在的 news 舆情段（最近相关新闻标题+情绪标签，覆盖面有限）、可能存在的 finance 财务段（F10 最新期主要指标与近几期趋势，季报口径有滞后；值为 0 可能表示上游缺失，不得据此下「归零」结论）与可能存在的 org_view 机构观点段（卖方研报评级分布/评级变动/目标价统计/调研密度；解读纪律：卖方评级普遍乐观，不得以「多少家买入」论证看多，有信息量的是评级下调、目标价与现价的偏离、调研密度变化），无财务全表明细与资金流，涉及缺失维度时如实告知。引用新闻只能复述给出的标题，不得臆测正文细节；news 标注「暂无直接相关新闻」时按 market_signals 判断并明示消息面缺失。
 3. 行情新鲜度（必须遵守）：freshness_status=stale 或快照带 freshness_note 时，回答涉及价格/涨跌必须先声明「行情仅更新至 quote_as_of」，严禁以「实时/当前盘面」口径表述；market_state 非 trading（休市/午间/盘前）时按最近交易日收盘（或阶段）口径措辞，不得暗示实时成交。
 4. 风险闸门（快照 risk_gate 块，必须遵守）：level=block（ST/退市警示）为硬约束——不得给出任何买入倾向的回答，先讲退市/警示风险；level=warn（一字板/流动性不足）须在回答中主动提示并约束结论（一字板不得按可正常成交分析）。risk_gate.note 声明的未接入维度（质押/解禁等），涉及时照实说「未接入数据，请自行核查」，严禁装作已核查。
 5. 关键判断引用快照中的具体字段与数值（如「现价 12.34 高于 MA20=11.98」），让用户可以核对。系统会程序化核对你回答中引用的数字，与快照不符的会被标记展示给用户，因此不要编造或凭印象填写数字。
 6. 回答简明、聚焦用户问题，使用简体中文；必要时给出研究性看法，但不下达买卖指令。可用轻量 Markdown 排版（短列表、**加粗**关键结论），不要输出表格、图片与链接。`
+
+// qaRoleIntro 默认角色段 = 任务段 + 契约段（编译期拼接，与 P0-6 拆分前逐字节一致，
+// 默认路径零行为变化）。
+const qaRoleIntro = qaRoleTaskSeg + "\n\n" + qaPromptContract
 
 // loadMessages 取会话的全部消息（升序）。仅本人。
 func (s *QaService) loadMessages(userID, convID int64) ([]model.AiConversationMessage, error) {
