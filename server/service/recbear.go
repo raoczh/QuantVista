@@ -21,7 +21,7 @@ import (
 // 调用预算：主调 1 + 复核（verify）1 + 反方 1 = 上限 3 次不变；反方开关默认关联
 // verify（RecommendRequest.BearCheck 未显式指定时跟随 Verify）。
 const (
-	bearReviewVersion = "br1"
+	bearReviewVersion = "br2"
 )
 
 // pickBear 反方研究员对单条 buy 的结论（落 pick 明细，影子期仅展示）。
@@ -44,7 +44,7 @@ A 股空头论据检查框架（逐项对照名单数据检查，命中才写）
 6. 解禁与减持：本系统未提供解禁/减持数据——如判断该风险值得核查，只能提示「需自行核查解禁与股东减持公告」，严禁虚构具体解禁日期、数量或股东行为。
 
 铁律：只依据给出的数据论证，引用具体字段与数值；数据不足处如实说明，不得用记忆中的公司印象编造论据。severity 分级：high=反方证据足以否决买入（若采纳应降为观察）；med=风险显著需减仓或收紧止损；low=常规风险提示。
-只输出 JSON：{"bears":[{"symbol":"...","bear_case":"3~5 句最强反方论证（引用数据）","severity":"high|med|low"}]}，覆盖全部给出的标的，不要任何解释或代码块标记。每条 bear_case ≤120 字。`
+只输出 JSON：{"bears":[{"symbol":"...","bear_case":"最强反方论证（引用数据）","severity":"high|med|low"}]}，覆盖全部给出的标的，不要任何解释或代码块标记。`
 
 // bearReview 对 buy 条目独立调用构建 bear case。best-effort：失败只是没有反方结论，
 // 不影响主结果；1 次 repair。返回按 symbol 归并的有效结论、token 用量与反方 run 元数据

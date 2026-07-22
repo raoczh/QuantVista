@@ -27,7 +27,7 @@ type tradePlan struct {
 	TargetPrice  float64  `json:"target_price,omitempty"`   // 目标价
 	StopPrice    float64  `json:"stop_price,omitempty"`     // 止损价（硬纪律：必须低于现价）
 	HorizonDays  FlexInt  `json:"horizon_days,omitempty"`   // 预期持有周期（交易日）
-	PlanNote     string   `json:"plan_note,omitempty"`      // 计划思路一句话
+	PlanNote     string   `json:"plan_note,omitempty"`      // 计划思路
 	Checklist    []string `json:"checklist,omitempty"`      // 买入前逐项核对的操作清单
 
 	// --- 服务端回填（非 LLM 输出）---
@@ -49,14 +49,14 @@ type positionAdvice struct {
 
 const tradePlanSystem = `你是一名严谨的交易计划员，基于另一位研究员的分析结论与数据快照，给出可执行的交易计划。你的输出仅供研究参考，不构成投资建议。
 规则：
-1. 价位必须锚定数据快照：买入区间、目标价、止损价须依据现价、MA5/MA10/MA20、区间高低点、涨跌停价等快照中的具体数值推导，禁止凭空给价、禁止使用你记忆中的历史价位。若快照含 org_view.target_price（机构目标价统计），把它当对照锚而非依据：你的目标价应独立从技术面推导，若与机构中位数（median）偏离很大，在 plan_note 中用一句话说明差异方向（注意卖方目标价普遍乐观，不得直接抄用）。
+1. 价位必须锚定数据快照：买入区间、目标价、止损价须依据现价、MA5/MA10/MA20、区间高低点、涨跌停价等快照中的具体数值推导，禁止凭空给价、禁止使用你记忆中的历史价位。若快照含 org_view.target_price（机构目标价统计），把它当对照锚而非依据：你的目标价应独立从技术面推导，若与机构中位数（median）偏离很大，在 plan_note 中说明差异方向（注意卖方目标价普遍乐观，不得直接抄用）。
 2. 硬纪律（违反会被程序拒绝）：止损价必须低于现价；止损价必须低于买入区间下沿；目标价必须高于买入区间上沿与现价；买入区间下沿不高于上沿。
 3. horizon_days 为预期持有周期（交易日，1~120）：短线思路 3~20，波段 20~60，依据分析结论选择。
-4. checklist 为买入前逐项核对的操作清单（3~5 条，每条不超过 40 字，只写一个可观察、可执行的核对项，如「竞价高开超 5% 放弃按区间挂单」「跌破买入区间下沿当日不接刀」）。
-5. 若分析评级为偏空(bearish)、风险闸门标注禁止买入、或数据不足以定出可靠价位，只输出 {"no_plan": true, "no_plan_reason": "不超过 80 字的一句话原因"}。
-只输出一个 JSON 对象，不要任何解释或代码块标记，字段：no_plan(可省)、no_plan_reason(可省)、buy_low、buy_high、target_price、stop_price、horizon_days(整数)、plan_note(不超过 80 字的一句话计划思路)、checklist(字符串数组)。`
+4. checklist 为买入前逐项核对的操作清单，每项都应是可观察、可执行的核对条件，如「竞价高开超 5% 放弃按区间挂单」「跌破买入区间下沿当日不接刀」。
+5. 若分析评级为偏空(bearish)、风险闸门标注禁止买入、或数据不足以定出可靠价位，只输出 {"no_plan": true, "no_plan_reason": "无法给出计划的原因"}。
+只输出一个 JSON 对象，不要任何解释或代码块标记，字段：no_plan(可省)、no_plan_reason(可省)、buy_low、buy_high、target_price、stop_price、horizon_days(整数)、plan_note(计划思路)、checklist(字符串数组)。`
 
-const tradePlanRepairHint = `请只输出一个合法 JSON 对象：{"buy_low":数字,"buy_high":数字,"target_price":数字,"stop_price":数字,"horizon_days":整数,"plan_note":"不超过80字","checklist":["3~5条，每条不超过40字"]}，且满足 止损价<现价、止损价<buy_low、target_price>buy_high；或 {"no_plan":true,"no_plan_reason":"不超过80字"}。不要任何解释或代码块标记。`
+const tradePlanRepairHint = `请只输出一个合法 JSON 对象：{"buy_low":数字,"buy_high":数字,"target_price":数字,"stop_price":数字,"horizon_days":整数,"plan_note":"计划思路","checklist":["可观察、可执行的核对条件"]}，且满足 止损价<现价、止损价<buy_low、target_price>buy_high；或 {"no_plan":true,"no_plan_reason":"无法给出计划的原因"}。不要任何解释或代码块标记。`
 
 // attachTradePlan 为一份成功的个股标准分析追加交易计划（就地写 result.TradePlan），
 // 返回本次消耗的 token 与计划 run 元数据（确定性拒绝零调用时为 nil）。仅 stock+标准模式+

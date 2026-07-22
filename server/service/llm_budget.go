@@ -43,8 +43,8 @@ type llmModuleBudget struct {
 // llmModuleBudgets 模块预算表：key 与 llm_call_logs.module / llmRun.Module 同名同值。
 // 新增 chatCompletion* 调用模块必须先在此登记预算（与 §2.5 调用矩阵登记同一纪律）。
 var llmModuleBudgets = map[string]llmModuleBudget{
-	// 分析主调（标准/panel 同 module 不同 schema）：字段多，但 prompt 已限定数组条数/单条
-	// 字数；与推荐主调同为 2500，避免用户全局配置把单次生成拖过上游 60s 窗口。
+	// 分析主调（标准/panel 同 module 不同 schema）：字段较多；与推荐主调同为 2500，
+	// 避免用户全局配置把单次生成拖过上游 60s 窗口。
 	"analysis": {MaxTokens: 2500, RepairAttempts: 1, RepairFeedChars: 600},
 	// 交易计划：小 JSON（价位区间/止损/止盈/checklist），一次 repair 足够。
 	"trade_plan": {MaxTokens: 1500, RepairAttempts: 1, RepairFeedChars: 600},
@@ -56,9 +56,9 @@ var llmModuleBudgets = map[string]llmModuleBudget{
 	"rec_bear":       {MaxTokens: 1500, RepairAttempts: 1, RepairFeedChars: 600},
 	// 日报复盘：同上批定标；callReview 为固定「首轮+1 次 repair」结构，与本表声明一致。
 	"daily_report": {MaxTokens: 1500, RepairAttempts: 1, RepairFeedChars: 800},
-	// 问答：自由文本对话，prompt 限 800 汉字；无结构化 repair。
+	// 问答：自由文本对话，无结构化 repair。
 	"qa": {MaxTokens: 2500, RepairAttempts: 0},
-	// 对比短评：严格 180 字内的自由文本，无 repair。
+	// 对比点评：自由文本，无 repair。
 	"compare": {MaxTokens: 1000, RepairAttempts: 0},
 	// 新闻情绪批标注（8 条/批 JSON）：解析失败降级规则路径，不 repair。
 	"news": {MaxTokens: 2500, RepairAttempts: 0},
