@@ -176,7 +176,10 @@ func responsesStatusReject(contractEnabled bool, status, incompleteReason string
 	if normalizedReason != "" {
 		detail += "/" + normalizedReason
 	}
-	return refusalErrf(RefusalLLMResponseIncomplete, "Responses 响应未完成（status=%s），已拒收不完整内容；若为 max_output_tokens 截断可调大 max_tokens", detail)
+	// ⚠️ 固定提示文案不得携带 "max_output_tokens" 字样——normalizeLLMFinishState 的文案
+	// 还原按该关键词判截断语义，只有 detail 里真实携带截断原因（reason=max_output_tokens）
+	// 时才应命中；固定后缀带它会把任意 incomplete 一律误归 max_tokens。
+	return refusalErrf(RefusalLLMResponseIncomplete, "Responses 响应未完成（status=%s），已拒收不完整内容；若为输出上限截断可调大 max_tokens", detail)
 }
 
 // responsesStreamStatusReject 对 Responses 流式终态同时校验事件类型与响应体状态。

@@ -65,9 +65,10 @@ func TestPromptExtendedModules(t *testing.T) {
 	}
 
 	// 推荐 buildMessages：自定义任务段生效，且铁律契约段仍被系统追加（P0-6 不可覆盖）。
+	// P0-6 修复批：签名改为消费固化的模板快照（loadPromptRuntime），与批次版本同源。
 	rec := &RecommendationService{}
 	strat := &strategyTemplate{Key: "momentum", Name: "动量突破", guide: "看量价"}
-	msgs := rec.buildMessages(7, model.RecTypeShortTerm, strat, "cn", 3, nil, RecFilters{}, nil)
+	msgs := rec.buildMessages(loadPromptRuntime(7, model.PromptModuleRecommend), model.RecTypeShortTerm, strat, "cn", 3, nil, RecFilters{}, nil)
 	if !strings.Contains(msgs[0].Content, "自定义recommend指引 cn") {
 		t.Fatalf("推荐系统提示应含自定义任务段: %.80s", msgs[0].Content)
 	}
@@ -75,7 +76,7 @@ func TestPromptExtendedModules(t *testing.T) {
 		t.Fatalf("自定义时铁律契约段应被系统追加（不可覆盖）")
 	}
 	// 未自定义用户走默认整段（无契约分界头）。
-	msgs = rec.buildMessages(8, model.RecTypeShortTerm, strat, "cn", 3, nil, RecFilters{}, nil)
+	msgs = rec.buildMessages(loadPromptRuntime(8, model.PromptModuleRecommend), model.RecTypeShortTerm, strat, "cn", 3, nil, RecFilters{}, nil)
 	if !strings.Contains(msgs[0].Content, "铁律") {
 		t.Fatal("无自定义时应回退默认 recRoleIntro")
 	}

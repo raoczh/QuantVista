@@ -35,17 +35,34 @@ type chatMeta struct {
 	PromptVersion string
 	PromptHash    string
 	DataHash      string
+	// StructuredDropped run 级结构化回落观测（P0-2 修复批）：JSON mode 在本 run 任一
+	// attempt 因端点不支持回落 free_text 时，中央客户端经 markJSONModeDropped 置位——
+	// 业务 manifest 据此记录「最终实际生效」的 structured_method，而非入口意图。
+	// 由 llmRun.chatMeta 指向 run 内部字段；探针/测试直填路径为 nil（安全跳过）。
+	StructuredDropped *bool
 }
 
-// writeLLMCallLog 落一条调用审计。正文为管理员排障用原文：messages + 响应 content 仅
-// truncateAuditText 限长，不做敏感字段打码/哈希替换（与 P0-8 取消脱敏的产品决策一致）。
+// writeLLMCallLog 落一条调用审计。正文为管理员排障用原文：请求为最终实际发送的完整
+// payload（含最终有效 temperature、实际 token 上限与结构化参数——P0-8 修复批；API key 走
+// Authorization 头不进 body），响应为上游正文，均仅 truncateAuditText 限长，不做敏感字段
+// 打码/哈希替换（与 P0-8 取消脱敏的产品决策一致）。
+// 错误状态（含完整性门禁拒收）下若结果带出了上游真实正文/usage/原始终态（audit outcome），
+// ResponseBody 保留真实正文、ErrorMsg 单独保存错误、usage 与 finish_state_raw 照实落——
+// 拒收不等于丢失审计。
 func writeLLMCallLog(p chatParams, stream bool, res *chatResult, callErr error, elapsed time.Duration) {
 	if common.DB == nil {
 		return
 	}
-	requestJSON, marshalErr := json.Marshal(p.Messages)
-	if marshalErr != nil {
-		requestJSON = []byte("[]")
+	requestBody := ""
+	if p.finalRequestBody != nil && *p.finalRequestBody != "" {
+		requestBody = *p.finalRequestBody
+	} else {
+		// 兜底（探针自埋点等未接最终 payload 观测的路径）：至少保留消息序列。
+		requestJSON, marshalErr := json.Marshal(p.Messages)
+		if marshalErr != nil {
+			requestJSON = []byte("[]")
+		}
+		requestBody = string(requestJSON)
 	}
 
 	status := model.LLMCallStatusSuccess
@@ -65,7 +82,10 @@ func writeLLMCallLog(p chatParams, stream bool, res *chatResult, callErr error, 
 	if callErr != nil {
 		status = model.LLMCallStatusError
 		errorMsg = truncateAuditText(callErr.Error(), 512)
-		responseBody = callErr.Error()
+		if responseBody == "" {
+			// 无上游正文可保留（网络失败/坏 JSON 等）：ResponseBody 落错误文案维持旧排障习惯。
+			responseBody = callErr.Error()
+		}
 	}
 
 	endpointType := p.EndpointType
@@ -97,7 +117,7 @@ func writeLLMCallLog(p chatParams, stream bool, res *chatResult, callErr error, 
 		TotalTokens:      usage.TotalTokens,
 		LatencyMs:        latencyMs,
 		FirstChunkMs:     firstChunkMs,
-		RequestBody:      truncateAuditText(string(requestJSON), llmCallBodyLimit),
+		RequestBody:      truncateAuditText(requestBody, llmCallBodyLimit),
 		ResponseBody:     truncateAuditText(responseBody, llmCallBodyLimit),
 
 		// P0-2/P0-8 关联与完整性元数据（旧记录为空，读取兼容）。

@@ -110,7 +110,7 @@ func TestQaConversationFromAnalysis(t *testing.T) {
 		Status: model.AnalysisStatusSuccess, DataSnapshot: `{"x":1}`}
 	common.DB.Create(nonStock)
 
-	conv, err := qaConversationFromAnalysis(1, rec.ID, cfg, "现在的估值贵吗")
+	conv, err := qaConversationFromAnalysis(1, rec.ID, cfg, "现在的估值贵吗", qaPromptVersion)
 	if err != nil {
 		t.Fatalf("从个股分析发起问答失败: %v", err)
 	}
@@ -120,13 +120,16 @@ func TestQaConversationFromAnalysis(t *testing.T) {
 	if conv.Symbol != "600519" || conv.Name != "贵州茅台" {
 		t.Fatalf("标的信息应取自分析记录: %+v", conv)
 	}
+	if conv.PromptVersion != qaPromptVersion {
+		t.Fatalf("会话应固化调用方传入的版本快照: %q", conv.PromptVersion)
+	}
 
 	// 非个股模块拒绝。
-	if _, err := qaConversationFromAnalysis(1, nonStock.ID, cfg, "q"); err == nil {
+	if _, err := qaConversationFromAnalysis(1, nonStock.ID, cfg, "q", qaPromptVersion); err == nil {
 		t.Fatalf("非个股分析应拒绝")
 	}
 	// 跨用户拒绝。
-	if _, err := qaConversationFromAnalysis(2, rec.ID, cfg, "q"); err == nil {
+	if _, err := qaConversationFromAnalysis(2, rec.ID, cfg, "q", qaPromptVersion); err == nil {
 		t.Fatalf("跨用户应拒绝")
 	}
 }

@@ -301,7 +301,7 @@ func (s *LLMService) testOpenAICompatibleForUser(userID, configID int64, provide
 	}
 	// 200 也要能解析出对应端点的结构才算通过——SPA fallback / 网关拦截页会 200 + HTML，
 	// 只看状态码会"测试成功、实际分析失败"（json: invalid character '<'）。
-	capTarget := llmCapabilityTarget(configID, baseURL, modelName, endpointType)
+	capTarget := llmCapabilityTarget(configID, provider, baseURL, modelName, endpointType)
 	if isResponses {
 		var parsed struct {
 			Output []json.RawMessage `json:"output"`
@@ -412,7 +412,7 @@ func (s *LLMService) probeJSONModeCapability(userID, configID int64, provider, e
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	target := llmCapabilityTarget(configID, baseURL, modelName, endpointType)
+	target := llmCapabilityTarget(configID, provider, baseURL, modelName, endpointType)
 	if resp.StatusCode == http.StatusOK {
 		hasContent := false
 		if isResponses {
@@ -435,6 +435,9 @@ func (s *LLMService) probeJSONModeCapability(userID, configID int64, provider, e
 		return capUnknown
 	}
 	if looksLikeUnsupportedJSONMode(resp.StatusCode, raw) {
+		// 判定确证性说明（对齐业务侧「fallback 成功才提交观察」纪律）：smoke 在基础连通
+		// 探测 200 之后才运行——同目标不带结构化参数的请求已确认成功，此处带参数 4xx 且
+		// 文案明确指向结构化字段，构成同样的对照证据；泛 4xx（模型名/鉴权等）不落观察。
 		observeLLMCapability(target, capJSONObject, capUnsupported,
 			fmt.Sprintf("provider smoke HTTP %d 拒绝结构化参数", resp.StatusCode))
 		probeRes = &chatResult{Content: "json_object unsupported"}

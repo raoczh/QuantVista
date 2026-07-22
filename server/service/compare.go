@@ -26,6 +26,10 @@ func NewCompareService(market *MarketService, llm *LLMService) *CompareService {
 const (
 	compareMinSymbols = 2
 	compareMaxSymbols = 6
+	// comparePromptVersion 对比 AI 点评的内联提示词版本（P0-2 修复批新设）：aiComment 的
+	// system/user 提示词为固定内联文本，改措辞须递增本版本——审计与 trace 关联凭它归因。
+	// c1: 初版（横向对比点评 180 字约束 + 数值引用纪律 + 风险提示）。
+	comparePromptVersion = "c1"
 )
 
 // CompareRow 单只标的的对比指标。行情时效契约：QuoteOK 仅在取到 fresh 行情时为
@@ -297,7 +301,8 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 	}
 
 	// P0-2：对比无业务落库行，trace 随响应回传（管理端审计按 trace_id 可查本次调用）。
-	run := newLLMRun(newLLMTraceID(), "", "compare", "compare.free_text.v1", "")
+	// prompt 版本接 comparePromptVersion（内联提示词的稳定显式版本，改措辞须递增）。
+	run := newLLMRun(newLLMTraceID(), "", "compare", "compare.free_text.v1", comparePromptVersion)
 	messages := []chatMessage{
 		{Role: "system", Content: "你是严谨的证券研究助理，输出仅供研究参考，不构成投资建议。"},
 		{Role: "user", Content: b.String()},

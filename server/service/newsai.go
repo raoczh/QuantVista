@@ -209,7 +209,9 @@ func enhanceBatchLLM(ctx context.Context, cfg *model.LLMConfig, apiKey string, a
 	user := "【可选板块列表】：" + strings.Join(newsSectorList, "、") +
 		"\n\n【待标注新闻】（JSON 数组）：\n" + string(inJSON)
 
-	run := newLLMRun(traceID, "", "news", "news_enhance.v1", "")
+	// P0-2 修复批：run 的 prompt 版本接既有 sentiPromptVersion（n1）——newsEnhanceSystem
+	// 是固定内联提示词，改措辞须递增该版本；此前传空串导致 news 调用的审计/关联缺版本归因。
+	run := newLLMRun(traceID, "", "news", "news_enhance.v1", sentiPromptVersion)
 	messages := []chatMessage{
 		{Role: "system", Content: newsEnhanceSystem},
 		{Role: "user", Content: user},

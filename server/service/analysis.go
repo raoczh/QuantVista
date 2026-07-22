@@ -215,13 +215,17 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 	snapshotJSON, _ := json.Marshal(actx.Snapshot)
 
 	// 4) 构造消息并调用 + 结构化校验/repair。
-	messages := s.buildMessages(userID, req, actx, string(snapshotJSON))
+	// P0-6 修复批：模块模板一次 loadPromptRuntime 固化快照——正文渲染（buildMessages）与
+	// 版本归因（rec.PromptVersion/run）消费同一快照，模板在生成期间被编辑不会造成
+	// 「正文新版本旧」或反之的错位。panel 不套用用户模板（固定编排），快照仅标准模式消费。
+	modulePrompt := loadPromptRuntime(userID, req.Module)
+	messages := s.buildMessages(modulePrompt, req, actx, string(snapshotJSON))
 	promptVersion := analysisPromptVersion
 	if req.Mode == model.AnalysisModeStandard {
 		// P0-6：主记录版本只归因本模块的 guidance 模板（-custom.<hash8> 可回查内容）；
 		// 复核员模板的归因在 manifest 里 review run 自己的 prompt_version
 		//（analysisReviewSystemFor），不再混入主记录版本——两个模板各自可精确复现。
-		promptVersion = promptVersionFor(userID, req.Module, analysisPromptVersion)
+		promptVersion = modulePrompt.Version(analysisPromptVersion)
 	}
 	rec := &model.AnalysisRecord{
 		UserID:          userID,
@@ -420,6 +424,13 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, run 
 		run.record(res, err)
 		if err != nil {
 			// 网络/鉴权/服务端错误：若已有过成功响应文本则不再重试，直接返回错误。
+			// audit outcome（P0-8 修复批）：完整性拒收的调用上游确已消耗 token，
+			// res 带出的真实 usage 照常累计——业务表 token 统计反映实际上游消耗。
+			if res != nil {
+				acc.PromptTokens += res.Usage.PromptTokens
+				acc.CompletionTokens += res.Usage.CompletionTokens
+				acc.TotalTokens += res.Usage.TotalTokens
+			}
 			return lastRaw, acc, lastLatency, err
 		}
 		acc.PromptTokens += res.Usage.PromptTokens
@@ -583,13 +594,15 @@ const analysisReviewSystem = analysisReviewTaskSeg + "\n" + analysisReviewContra
 
 // analysisReviewSystemFor 本次复核的系统提示与 prompt 版本：P0-6 起 module=review 的
 // 自定义模板是 L3 任务段（替换角色与审查维度），verdict/schema 契约段恒由系统追加
-// 不可覆盖；版本经 promptVersionFor 带 -custom.<hash8> 内容归因。独立成函数供单测。
+// 不可覆盖；版本带 -custom.<hash8> 内容归因。正文与版本消费同一 loadPromptRuntime
+// 快照（一次查询）——模板在两者之间被编辑不会造成正文/版本错位。独立成函数供单测。
 func analysisReviewSystemFor(userID int64, module string) (string, string) {
+	pr := loadPromptRuntime(userID, model.PromptModuleReview)
 	sys := analysisReviewSystem
-	if custom, ok := promptOverrideFor(userID, model.PromptModuleReview, map[string]string{"module": module}); ok {
+	if custom, ok := pr.Render(map[string]string{"module": module}); ok {
 		sys = composeCustomTaskPrompt(custom, analysisReviewContract)
 	}
-	return sys, promptVersionFor(userID, model.PromptModuleReview, analysisPromptVersion)
+	return sys, pr.Version(analysisPromptVersion)
 }
 
 // reviewAnalysis AI 复核（verify 模式）：以独立复核员视角对照数据快照审查一份分析，
@@ -627,6 +640,12 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 		})
 		run.record(res, err)
 		if err != nil {
+			// audit outcome：拒收调用的真实 token 消耗照常累计（res 可能非 nil）。
+			if res != nil {
+				usage.PromptTokens += res.Usage.PromptTokens
+				usage.CompletionTokens += res.Usage.CompletionTokens
+				usage.TotalTokens += res.Usage.TotalTokens
+			}
 			return nil, usage, run
 		}
 		usage.PromptTokens += res.Usage.PromptTokens
@@ -871,9 +890,10 @@ func ratingCN(rating string) string {
 
 // --- prompt 构造与结果校验 ---
 
-// buildMessages 组装系统提示 + 用户消息（含数据快照 JSON）。系统提示按模块定制，且尊重用户自定义模板；
+// buildMessages 组装系统提示 + 用户消息（含数据快照 JSON）。系统提示按模块定制，且尊重用户自定义模板
+// （modulePrompt 为调用方一次固化的模板快照——与版本归因同源，P0-6 修复批）；
 // panel 模式使用专属多角色系统提示（不套用用户模板——panel 是固定编排）。
-func (s *AnalysisService) buildMessages(userID int64, req AnalyzeRequest, actx *analysisContext, snapshotJSON string) []chatMessage {
+func (s *AnalysisService) buildMessages(modulePrompt promptRuntime, req AnalyzeRequest, actx *analysisContext, snapshotJSON string) []chatMessage {
 	var b strings.Builder
 	fmt.Fprintf(&b, "请对以下【%s】进行分析。\n\n", s.title(req.Module, req.Mode, actx.Label))
 	if q := strings.TrimSpace(req.Question); q != "" {
@@ -890,7 +910,7 @@ func (s *AnalysisService) buildMessages(userID int64, req AnalyzeRequest, actx *
 	}
 	b.WriteString("\n请严格按系统要求的 JSON schema 输出，只依据以上数据分析。")
 
-	sysPrompt := analysisSystemPrompt(userID, req.Module, map[string]string{
+	sysPrompt := analysisSystemPromptFrom(modulePrompt, req.Module, map[string]string{
 		"market": normalizeMarketOnly(req.Market),
 		"symbol": strings.TrimSpace(req.Symbol),
 		"target": actx.Label,
@@ -904,11 +924,17 @@ func (s *AnalysisService) buildMessages(userID int64, req AnalyzeRequest, actx *
 	}
 }
 
-// analysisSystemPrompt 按模块拼接系统提示：通用身份 + 模块专属分析维度 + 通用输出/合规约束。
-// 若用户为该模块启用了自定义模板，则用其替换默认分析维度指引（占位符宽容渲染）。
+// analysisSystemPrompt 按模块拼接系统提示（独立查询一次模板）。业务链路请改用
+// analysisSystemPromptFrom（正文与版本共用同一 loadPromptRuntime 快照）。
 func analysisSystemPrompt(userID int64, module string, vars map[string]string) string {
+	return analysisSystemPromptFrom(loadPromptRuntime(userID, module), module, vars)
+}
+
+// analysisSystemPromptFrom 由模板快照拼接系统提示：通用身份 + 模块专属分析维度 + 通用输出/合规约束。
+// 快照命中自定义模板时用其替换默认分析维度指引（占位符宽容渲染）。
+func analysisSystemPromptFrom(pr promptRuntime, module string, vars map[string]string) string {
 	guidance := moduleGuidance[module]
-	if custom, ok := promptOverrideFor(userID, module, vars); ok {
+	if custom, ok := pr.Render(vars); ok {
 		guidance = custom
 	}
 	return analysisRoleIntro + "\n\n" + guidance + "\n\n" + analysisOutputSpec

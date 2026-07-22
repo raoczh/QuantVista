@@ -77,6 +77,12 @@ type llmRun struct {
 	FinishState    string // 最后一次请求的规范化终态（normalizeLLMFinishState）
 	FinishStateRaw string // 上游原始 finish_reason/status
 	DegradedReason string // 业务层降级原因（quant_fallback/llm_output_invalid 等；空=未降级）
+	// structuredDropped 本 run 内 JSON mode 是否发生过回落（P0-2 修复批）：中央客户端在
+	// 声明化路由或隐式回落点经 chatMeta.StructuredDropped 指针置位。manifest 据此输出
+	// 「最终实际生效」的 structured_method——同一 run 的主调与 repair 轮同配置同目标，
+	// 回落具备粘性（能力观察写入后声明化路由接管），任一 attempt 回落即整个 run 按
+	// free_text 归因（多 attempt 汇总语义，见 §5.1）。
+	structuredDropped bool
 }
 
 // newLLMRun 创建调用组。parentRunID 为空表示主调。
@@ -106,6 +112,7 @@ func (r *llmRun) chatMeta(userID int64, cfg *model.LLMConfig, attempt int) chatM
 		Module: r.Module, Attempt: attempt,
 		SchemaVersion: r.SchemaVersion, PromptVersion: r.PromptVersion,
 		PromptHash: r.PromptHash, DataHash: r.DataHash,
+		StructuredDropped: &r.structuredDropped, // 中央客户端回落时置位，manifest 消费
 	}
 	if cfg != nil {
 		m.ConfigID = cfg.ID
@@ -115,7 +122,8 @@ func (r *llmRun) chatMeta(userID int64, cfg *model.LLMConfig, attempt int) chatM
 }
 
 // record 记录本 run 最后一次请求的终态（成功与失败都要记；err 含 RefusalError 时
-// 归一到规范化枚举）。res 为 nil 时只按 err 归类。
+// 归一到规范化枚举）。P0-8 修复批起完整性拒收路径的 res 也带真实原始终态（audit
+// outcome），raw 优先取上游真值；res 为 nil（网络失败等无响应场景）时按 err 归类。
 func (r *llmRun) record(res *chatResult, err error) {
 	raw := ""
 	if res != nil {
@@ -137,8 +145,10 @@ type LLMRunManifest struct {
 	PromptVersion string `json:"prompt_version,omitempty"`
 	PromptHash    string `json:"prompt_hash,omitempty"`
 	DataHash      string `json:"data_snapshot_hash,omitempty"`
-	// StructuredMethod 请求口径（json_object/free_text）。JSON mode 因端点不支持而回落的
-	// 「实际生效形态」以 llm_call_logs.structured_method 为准（逐请求记录）。
+	// StructuredMethod 本 run 最终实际生效的结构化方法（P0-2 修复批）：JSON mode 因端点
+	// 不支持而回落（声明化路由或运行时 fallback）时如实记 free_text，不再写入口意图。
+	// 多 attempt 汇总语义：任一 attempt 回落即整个 run 记 free_text（同 run 各 attempt 同
+	// 配置同目标，回落有粘性）；逐请求真值仍以 llm_call_logs.structured_method 为准。
 	StructuredMethod string `json:"structured_method,omitempty"`
 
 	Provider     string `json:"provider,omitempty"`
@@ -157,13 +167,14 @@ type LLMRunManifest struct {
 	DegradedReason string `json:"degraded_reason,omitempty"`
 }
 
-// manifest 输出本 run 的运行元数据。jsonMode 为该模块的请求口径。
+// manifest 输出本 run 的运行元数据。jsonMode 为该模块的请求口径；最终实际生效形态在
+// run 内发生过回落（structuredDropped）时如实按 free_text 归因。
 func (r *llmRun) manifest(cfg *model.LLMConfig, jsonMode bool) LLMRunManifest {
 	m := LLMRunManifest{
 		RunID: r.RunID, TraceID: r.TraceID, ParentRunID: r.ParentRunID, Module: r.Module,
 		SchemaVersion: r.SchemaVersion, PromptVersion: r.PromptVersion,
 		PromptHash: r.PromptHash, DataHash: r.DataHash,
-		StructuredMethod: structuredMethodName(jsonMode),
+		StructuredMethod: structuredMethodName(jsonMode && !r.structuredDropped),
 		AttemptCount:     r.Attempts,
 		OutputBudget:     moduleBudget(r.Module).MaxTokens,
 		FinishState:      r.FinishState, FinishStateRaw: r.FinishStateRaw,

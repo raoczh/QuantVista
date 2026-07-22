@@ -1,8 +1,6 @@
 package service
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"regexp"
 	"strings"
@@ -51,7 +49,7 @@ var promptModuleLabels = map[string]string{
 }
 
 // validPromptModule 可自定义模板的模块合法性 = promptModuleLabels 的键集
-//（单一权威，别再另建平行清单——加新模块只需 labels/Modules order/placeholders 三处）。
+// （单一权威，别再另建平行清单——加新模块只需 labels/Modules order/placeholders 三处）。
 func validPromptModule(module string) bool {
 	_, ok := promptModuleLabels[module]
 	return ok
@@ -137,14 +135,10 @@ func (s *PromptService) List(userID int64) ([]model.PromptTemplate, error) {
 	return rows, err
 }
 
-// promptContentHash 模板内容 hash（sha256 hex 前 16 位）。对原始模板内容（渲染前）计算——
-// 渲染后含运行时变量值，同一模板不同标的会得到不同 hash，失去「归因到模板」的意义。
+// promptContentHash 模板内容 hash：实现在 model.PromptContentHash（启动基线迁移与
+// service 层必须共用同一实现，两份实现会造成归因 hash 漂移）。
 func promptContentHash(content string) string {
-	if content == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(content))
-	return hex.EncodeToString(sum[:])[:16]
+	return model.PromptContentHash(content)
 }
 
 // Upsert 新建或更新某模块的模板（每用户每模块唯一）。P0-6：内容变化时 Revision 递增并落
@@ -255,13 +249,60 @@ func userPromptTemplateRow(userID int64, module string) *model.PromptTemplate {
 	return &tpl
 }
 
-// userPromptOverride 返回用户某模块启用的自定义指引；无则空串（调用方回退默认）。
-func userPromptOverride(userID int64, module string) string {
+// promptRuntime 一次业务运行的 prompt 模板不可变快照（P0-6 修复批）：同一模板行只读一次，
+// 正文渲染、版本归因、run/manifest、业务表与 llm_call_logs 全部消费同一份数据——
+// 消除「promptOverrideFor 与 promptVersionFor 分别查库，模板在两次查询间被编辑导致
+// 实际正文与记录版本/hash 不一致」的竞态。异步任务（推荐 recGenPlan）把本结构固化进
+// 计划，后台不得重新查库读另一版模板。
+type promptRuntime struct {
+	Module   string
+	Custom   bool   // 是否命中启用中的自定义模板
+	Raw      string // 模板原始内容（渲染前；Custom=false 为空）
+	Hash     string // content hash（sha256 前 16；Custom=false 为空）
+	Revision int
+}
+
+// loadPromptRuntime 一次查询固化用户某模块的模板快照。无启用模板返回零值（Custom=false，
+// Render 回退默认、Version 回退裸 base）。升级前旧行 content_hash 为空时读取侧现算
+// （启动迁移 MigratePromptTemplateBaselines 已回填，这里是双保险）。
+func loadPromptRuntime(userID int64, module string) promptRuntime {
 	tpl := userPromptTemplateRow(userID, module)
 	if tpl == nil {
-		return ""
+		return promptRuntime{Module: module}
 	}
-	return strings.TrimSpace(tpl.Content)
+	h := tpl.ContentHash
+	if h == "" {
+		h = promptContentHash(tpl.Content)
+	}
+	return promptRuntime{
+		Module: module, Custom: true,
+		Raw: strings.TrimSpace(tpl.Content), Hash: h, Revision: tpl.Revision,
+	}
+}
+
+// Render 渲染快照正文（占位符宽容渲染）。Custom=false 返回 ("", false)，调用方回退默认。
+func (pr promptRuntime) Render(vars map[string]string) (string, bool) {
+	if !pr.Custom || pr.Raw == "" {
+		return "", false
+	}
+	return renderPromptTemplate(pr.Raw, vars), true
+}
+
+// Version 版本归因串：Custom 时 base+"-custom."+hash8（同一快照的正文与版本必然一致），
+// 否则裸 base。
+func (pr promptRuntime) Version(base string) string {
+	if !pr.Custom {
+		return base
+	}
+	if len(pr.Hash) < 8 {
+		return base + "-custom"
+	}
+	return base + "-custom." + pr.Hash[:8]
+}
+
+// userPromptOverride 返回用户某模块启用的自定义指引；无则空串（调用方回退默认）。
+func userPromptOverride(userID int64, module string) string {
+	return loadPromptRuntime(userID, module).Raw
 }
 
 // promptPlaceholderRe 占位符形态：{{name}}（允许两侧空白，name 为小写字母/下划线）。
@@ -324,7 +365,7 @@ func lintPromptContent(module, content string) []string {
 
 // renderPromptTemplate 占位符宽容渲染：vars 里有值的占位符替换为值；
 // 未提供值/拼错的占位符保留原样（不报错不吞字），模板写错不至于让整段提示词失效
-//（保存时 lintPromptContent 已给出诊断警告）。
+// （保存时 lintPromptContent 已给出诊断警告）。
 func renderPromptTemplate(content string, vars map[string]string) string {
 	if content == "" || len(vars) == 0 {
 		return content
@@ -338,34 +379,18 @@ func renderPromptTemplate(content string, vars map[string]string) string {
 	})
 }
 
-// promptOverrideFor 组合读取链：取用户自定义模板并做占位符渲染；无自定义返回 ("", false)。
-// 各消费方（分析/推荐/日报/问答/复核）统一走它，custom=true 时版本号经 promptVersionFor
-// 加 -custom.<hash8> 后缀归因。注意：四个扩展模块拿到返回值后必须经 composeCustomTaskPrompt
-// 追加模块契约（L1 不可覆盖），不得直接整段当系统提示。
+// promptOverrideFor 兼容读取链（一次独立查询）：取用户自定义模板并做占位符渲染；无自定义
+// 返回 ("", false)。⚠️ P0-6 修复批起，需要「正文与版本同源」的消费点（分析/推荐/日报/问答/
+// 复核的业务链路）必须先 loadPromptRuntime 固化快照，再从同一快照 Render+Version——
+// 本函数与 promptVersionFor 各自独立查库，成对使用存在模板中途更新的竞态，仅供
+// 不落版本号的轻量场景与既有测试使用。
 func promptOverrideFor(userID int64, module string, vars map[string]string) (string, bool) {
-	o := userPromptOverride(userID, module)
-	if o == "" {
-		return "", false
-	}
-	return renderPromptTemplate(o, vars), true
+	return loadPromptRuntime(userID, module).Render(vars)
 }
 
-// promptVersionFor 统一的版本号归因后缀：该模块启用了自定义模板则 base+"-custom."+hash8。
-// hash8=模板内容 sha256 前 8 位（P0-6）：同名版本必对应同一模板内容——内容被编辑后
-// 版本串随之变化，落库记录可凭 hash 在 prompt_template_revisions 回查当时原文。
-// 升级前旧行 content_hash 为空，读取侧按现存内容现算（下次保存时回填）。
-// 推荐/日报/问答/分析（含复核）共用，别各自散写后缀拼接。
+// promptVersionFor 兼容版本归因（一次独立查询）：base 或 base-custom.<hash8>。
+// 同 promptOverrideFor 的警告：业务链路统一走 loadPromptRuntime 快照，勿与
+// promptOverrideFor 成对分别查库。
 func promptVersionFor(userID int64, module, base string) string {
-	tpl := userPromptTemplateRow(userID, module)
-	if tpl == nil {
-		return base
-	}
-	h := tpl.ContentHash
-	if h == "" {
-		h = promptContentHash(tpl.Content)
-	}
-	if len(h) < 8 {
-		return base + "-custom"
-	}
-	return base + "-custom." + h[:8]
+	return loadPromptRuntime(userID, module).Version(base)
 }

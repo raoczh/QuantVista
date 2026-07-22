@@ -62,7 +62,7 @@ type ParseStrategyResult struct {
 }
 
 // ParseStrategy 把白话选股描述解析为条件树。校验失败 repair 一次，仍不过则报错
-//（交互式动作，不做降级半成品——用户重试成本低，脏树落编辑器危害大）。
+// （交互式动作，不做降级半成品——用户重试成本低，脏树落编辑器危害大）。
 func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, allowPrivate bool, req ParseStrategyRequest) (*ParseStrategyResult, error) {
 	text := strings.TrimSpace(req.Text)
 	if text == "" {
@@ -108,6 +108,12 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 		})
 		run.record(res, callErr)
 		if callErr != nil {
+			// audit outcome：完整性拒收调用的真实 token 消耗照记（res 可能非 nil）。
+			if res != nil {
+				acc.PromptTokens += res.Usage.PromptTokens
+				acc.CompletionTokens += res.Usage.CompletionTokens
+				acc.TotalTokens += res.Usage.TotalTokens
+			}
 			// 网络/鉴权类失败：已消耗的 token 照记（审计），动作照计次（与分析口径一致）。
 			if acc.TotalTokens > 0 {
 				consumeQuota(userID, acc.TotalTokens, true)
@@ -170,7 +176,7 @@ const parseStrategyRepairHint = "请只输出一个合法 JSON 对象：{\"tree\
 	"无法映射的表述放进 unmatched 而不是硬凑因子。不要任何解释或代码块标记。"
 
 // parseStrategyLLMOutput 解析并校验 LLM 输出。tree 为 null 仅当 unmatched 非空时合法
-//（「一个条件都没映射出来」必须给出理由，防止模型空手交差）。
+// （「一个条件都没映射出来」必须给出理由，防止模型空手交差）。
 func parseStrategyLLMOutput(content string) (*parsedStrategy, error) {
 	raw := extractJSONObject(content)
 	if raw == "" {
