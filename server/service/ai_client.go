@@ -24,9 +24,12 @@ import (
 // 未达上游的网络错误；504 视为真超时不重试）、状态码分类提示、usage 缺失时字符粗估兜底。
 
 const (
-	aiCallTimeout       = 90 * time.Second
-	aiRetryBackoff      = 800 * time.Millisecond
-	aiResponseBodyLimit = 1 << 20
+	aiCallTimeout                = 90 * time.Second
+	aiRetryBackoff               = 800 * time.Millisecond
+	aiResponseBodyLimit          = 1 << 20
+	chatPlainFallbackLimit       = 3 // response_format、temperature、token 字段可被依次拒绝
+	chatStreamingFallbackLimit   = 4 // 流式路径再多一个 stream_options 兼容维度
+	responsesStreamFallbackLimit = 2 // text.format、temperature；token 预算不允许删除
 )
 
 // 包级复用两个 client（allowPrivate 两态），避免每次调用重建 Transport——
@@ -45,6 +48,9 @@ func newAIStreamClient(allowPrivate bool) *http.Client {
 	c := common.SafeHTTPClient(0, allowPrivate)
 	if tr, ok := c.Transport.(*http.Transport); ok {
 		tr.ResponseHeaderTimeout = aiCallTimeout
+		// SSE 必须逐块透传。禁用自动 gzip，避免部分兼容网关/反代把小分片
+		// 聚合到压缩缓冲区后才下发，最终触发其 60s 级空闲超时。
+		tr.DisableCompression = true
 	}
 	return c
 }
@@ -61,6 +67,15 @@ func aiStreamHTTPClient(allowPrivate bool) *http.Client {
 		return aiStreamClientPrivate
 	}
 	return aiStreamClientPublic
+}
+
+// setSSERequestHeaders 统一声明真正的 SSE 长连接语义。Accept 让上游选择事件流，
+// no-cache 与 identity 则避免中转代理缓存/压缩并攒成整包；不要设置 Connection，
+// 该 hop-by-hop 头与 HTTP/2 不兼容，连接复用交给 net/http Transport 处理。
+func setSSERequestHeaders(req *http.Request) {
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Accept-Encoding", "identity")
 }
 
 // aiStreamMaxDuration 流式调用无 client.Timeout 兜底，若 ctx 也没带 deadline，
@@ -121,12 +136,11 @@ type chatParams struct {
 	//（response_format/text.format）。公开出口按 JSONMode 初始化；端点不支持而回落
 	// 时由内部四处回落点置 false——writeLLMCallLog 据此记录实际生效的 structured_method。
 	effectiveJSONMode *bool
-	// omitTemperature / omitMaxTokens 参数省略观测（P0-5 修复批）：声明化路由或运行时
-	// fallback 判定上游不接受该参数时置位，四条请求路径构造 payload 时据此省略字段
-	//（此前 temperature/max_tokens 无条件发送，能力维度只是结构字段）。指针共享：
-	// 公开出口初始化，内部 fallback 点置位后重试与审计均可见。
-	omitTemperature *bool
-	omitMaxTokens   *bool
+	// omitTemperature 参数省略观测（P0-5 修复批）：声明化路由或运行时 fallback
+	// 判定上游不接受该参数时置位。token 参数不允许省略：chat 端会在旧字段被拒后
+	// 切换到等价的 max_completion_tokens，始终保留模块输出预算。
+	omitTemperature     *bool
+	maxCompletionTokens *bool
 	// finalRequestBody 最终实际发送的请求体 JSON（审计观测）：每次真正发出 HTTP 请求前
 	// 由各路径写入（fallback 重试覆盖为最终形态），writeLLMCallLog 落 RequestBody——
 	// 审计保存上游真实收到的完整 payload（含最终有效 temperature、实际 token 上限与
@@ -157,15 +171,25 @@ func (p chatParams) temperatureOmitted() bool {
 	return p.omitTemperature != nil && *p.omitTemperature
 }
 
-// markMaxTokensOmitted / maxTokensOmitted token 上限参数省略观测（nil 安全）。
-func (p chatParams) markMaxTokensOmitted() {
-	if p.omitMaxTokens != nil {
-		*p.omitMaxTokens = true
+// markMaxCompletionTokens 切换 Chat Completions 的 token 参数变体（nil 安全）。
+// 新版 reasoning 模型拒绝 max_tokens、要求 max_completion_tokens；后者可能连隐藏
+// reasoning token 一并计入，并非完全相同语义，但仍须沿用同一数值上限，绝不能因
+// 兼容性回落把预算整个删掉、退成无界生成。
+func (p chatParams) markMaxCompletionTokens() {
+	if p.maxCompletionTokens != nil {
+		*p.maxCompletionTokens = true
 	}
 }
 
-func (p chatParams) maxTokensOmitted() bool {
-	return p.omitMaxTokens != nil && *p.omitMaxTokens
+func (p chatParams) usesMaxCompletionTokens() bool {
+	return p.maxCompletionTokens != nil && *p.maxCompletionTokens
+}
+
+func (p chatParams) maxTokensField() string {
+	if p.usesMaxCompletionTokens() {
+		return "max_completion_tokens"
+	}
+	return "max_tokens"
 }
 
 // noteFinalRequestBody 记录最终实际发送的请求体（nil 安全；fallback 重试覆盖）。
@@ -232,13 +256,13 @@ func chatCompletion(ctx context.Context, p chatParams) (res *chatResult, err err
 	return chatCompletionInner(ctx, p, &streamed)
 }
 
-// initCallObservers 公开出口初始化本次调用的观测指针（structured/temperature/max_tokens
-// 的实际生效形态 + 最终请求体），供内部 fallback 点回写、审计层读取。
+// initCallObservers 公开出口初始化本次调用的观测指针（structured/temperature/token
+// 参数的实际生效形态 + 最终请求体），供内部 fallback 点回写、审计层读取。
 func initCallObservers(p chatParams) chatParams {
 	effJSON := p.JSONMode
 	p.effectiveJSONMode = &effJSON
-	omitTemp, omitMaxTok := false, false
-	p.omitTemperature, p.omitMaxTokens = &omitTemp, &omitMaxTok
+	omitTemp, useMaxCompletion := false, false
+	p.omitTemperature, p.maxCompletionTokens = &omitTemp, &useMaxCompletion
 	finalBody := ""
 	p.finalRequestBody = &finalBody
 	return p
@@ -288,13 +312,14 @@ func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error)
 	if err != nil {
 		return res, err
 	}
-	// 参数兼容性 fallback（P0-5 修复批）：4xx 错误明确指向 response_format/temperature/
-	// max_tokens 参数时，去掉命中参数重试（至多 2 轮，覆盖上游逐个报参数错的形态）。
-	// 能力观察只在「去参后的请求确认成功」时统一提交——fallback 失败说明错误另有原因，
+	// 参数兼容性 fallback（P0-5 修复批）：4xx 错误明确指向 response_format/temperature
+	// 时去掉命中参数；max_tokens 被拒时携同一预算切到 max_completion_tokens。
+	// 至多 3 轮，覆盖上游逐个报参数错的形态。能力观察只在回落请求成功时统一提交——
+	// fallback 失败说明错误另有原因，
 	// 提交观察会让一次误判污染该目标 12h 的能力状态。
 	jsonOn := p.JSONMode
 	var capConfirms []func()
-	for retry := 0; retry < 2 && status >= 400 && status < 500 && ctx.Err() == nil; retry++ {
+	for retry := 0; retry < chatPlainFallbackLimit && status >= 400 && status < 500 && ctx.Err() == nil; retry++ {
 		changed := false
 		switch {
 		case jsonOn && looksLikeUnsupportedJSONMode(status, raw):
@@ -308,9 +333,9 @@ func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error)
 			reason := fmt.Sprintf("chat 非流式 HTTP %d 拒绝 temperature", status)
 			capConfirms = append(capConfirms, func() { p.observeTemperatureUnsupported(reason) })
 			changed = true
-		case p.MaxTokens > 0 && !p.maxTokensOmitted() && looksLikeUnsupportedMaxTokens(status, raw):
-			p.markMaxTokensOmitted()
-			reason := fmt.Sprintf("chat 非流式 HTTP %d 拒绝 max_tokens", status)
+		case p.MaxTokens > 0 && !p.usesMaxCompletionTokens() && looksLikeUnsupportedMaxTokens(status, raw):
+			p.markMaxCompletionTokens()
+			reason := fmt.Sprintf("chat 非流式 HTTP %d 拒绝 max_tokens，改用 max_completion_tokens", status)
 			capConfirms = append(capConfirms, func() { p.observeMaxTokensUnsupported(reason) })
 			changed = true
 		}
@@ -362,8 +387,8 @@ func doChat(ctx context.Context, p chatParams, jsonMode bool) (*chatResult, int,
 	if !p.temperatureOmitted() {
 		payload["temperature"] = p.Temperature
 	}
-	if p.MaxTokens > 0 && !p.maxTokensOmitted() {
-		payload["max_tokens"] = p.MaxTokens
+	if p.MaxTokens > 0 {
+		payload[p.maxTokensField()] = p.MaxTokens
 	}
 	if jsonMode {
 		payload["response_format"] = map[string]string{"type": "json_object"}
@@ -656,8 +681,8 @@ func estimateUsage(messages []chatMessage, content string) chatUsage {
 // chatCompletionStream 发起一次流式补全（SSE）：逐行剥 "data: " 前缀解析 delta.content，
 // 每个增量经 onDelta 回调吐出（调用方负责推给前端）；[DONE] 或 finish_reason 终止。
 // 返回聚合后的完整内容与 usage（请求带 stream_options.include_usage 让上游在末 chunk 回
-// usage——new-api 同款；不支持该字段的 4xx 会去掉重试一次，仍缺失则字符粗估）。
-// JSONMode 同非流式：带 response_format，遇不支持的 4xx 去掉重试一次靠 prompt 约束。
+// usage——new-api 同款；不支持该字段的 4xx 会去掉后继续建流，仍缺失则字符粗估）。
+// JSONMode 同非流式：带 response_format，遇不支持的 4xx 去掉后继续建流、靠 prompt 约束。
 // 不做状态码重试（流一旦建立，中断即失败——半截内容重试会让用户看到重复文本）；
 // 建立连接前的错误分类与非流式一致。上游忽略 stream 参数返回整包 JSON 时按非流式解析兼容。
 // EndpointType=responses 时分流到 /v1/responses 适配。
@@ -694,8 +719,8 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 		if !p.temperatureOmitted() {
 			payload["temperature"] = p.Temperature
 		}
-		if p.MaxTokens > 0 && !p.maxTokensOmitted() {
-			payload["max_tokens"] = p.MaxTokens
+		if p.MaxTokens > 0 {
+			payload[p.maxTokensField()] = p.MaxTokens
 		}
 		if withUsageOpt {
 			payload["stream_options"] = map[string]bool{"include_usage": true}
@@ -718,7 +743,7 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+p.APIKey)
-		req.Header.Set("Accept", "text/event-stream")
+		setSSERequestHeaders(req)
 		return client.Do(req)
 	}
 
@@ -741,48 +766,52 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 			resp = r2
 		}
 	}
-	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		// 部分兼容端点不认识 stream_options / response_format / temperature / max_tokens：
-		// 识别后去掉命中字段重试一次；能力观察只在重试建流成功（HTTP 200）后提交
-		//（fallback 失败说明错误另有原因，不得据 4xx 字样污染能力状态——P0-5 修复批）。
+	// 兼容网关常逐个报告未知参数：例如先拒绝 stream_options，重发后才拒绝
+	// max_tokens。必须按“每轮确有形态变化”的有限状态机继续建流；只重发一次会在
+	// token 字段切换前失败。能力观察累计到最终 HTTP 200 后再统一提交，失败链不污染缓存。
+	var capConfirms []func()
+	for retry := 0; retry < chatStreamingFallbackLimit &&
+		resp.StatusCode >= 400 && resp.StatusCode < 500 && ctx.Err() == nil; retry++ {
+		status := resp.StatusCode
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		dropUsage := strings.Contains(strings.ToLower(string(raw)), "stream_options")
-		dropJSON := jsonOn && looksLikeUnsupportedJSONMode(resp.StatusCode, raw)
-		dropTemp := !p.temperatureOmitted() && looksLikeUnsupportedTemperature(resp.StatusCode, raw)
-		dropMaxTok := p.MaxTokens > 0 && !p.maxTokensOmitted() && looksLikeUnsupportedMaxTokens(resp.StatusCode, raw)
-		if (dropUsage || dropJSON || dropTemp || dropMaxTok) && ctx.Err() == nil {
-			usageOpt = usageOpt && !dropUsage
-			jsonOn = jsonOn && !dropJSON
-			var capConfirms []func()
-			if dropJSON {
-				p.markJSONModeDropped()
-				reason := fmt.Sprintf("chat 流式 HTTP %d 拒绝 response_format", resp.StatusCode)
-				capConfirms = append(capConfirms, func() { p.observeJSONModeUnsupported(reason) })
-			}
-			if dropTemp {
-				p.markTemperatureOmitted()
-				reason := fmt.Sprintf("chat 流式 HTTP %d 拒绝 temperature", resp.StatusCode)
-				capConfirms = append(capConfirms, func() { p.observeTemperatureUnsupported(reason) })
-			}
-			if dropMaxTok {
-				p.markMaxTokensOmitted()
-				reason := fmt.Sprintf("chat 流式 HTTP %d 拒绝 max_tokens", resp.StatusCode)
-				capConfirms = append(capConfirms, func() { p.observeMaxTokensUnsupported(reason) })
-			}
-			body = buildBody(usageOpt, jsonOn)
-			if r2, e2 := send(); e2 == nil {
-				resp = r2
-				if resp.StatusCode == http.StatusOK {
-					for _, confirm := range capConfirms {
-						confirm()
-					}
-				}
-			} else {
-				return nil, fmt.Errorf("请求失败: %w", e2)
-			}
-		} else {
-			return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", resp.StatusCode, statusHint(resp.StatusCode), extractErr(raw))
+		msg := strings.ToLower(string(raw))
+		dropUsage := usageOpt && strings.Contains(msg, "stream_options")
+		dropJSON := jsonOn && looksLikeUnsupportedJSONMode(status, raw)
+		dropTemp := !p.temperatureOmitted() && looksLikeUnsupportedTemperature(status, raw)
+		switchMaxTok := p.MaxTokens > 0 && !p.usesMaxCompletionTokens() && looksLikeUnsupportedMaxTokens(status, raw)
+		if !dropUsage && !dropJSON && !dropTemp && !switchMaxTok {
+			return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", status, statusHint(status), extractErr(raw))
+		}
+		if dropUsage {
+			usageOpt = false
+		}
+		if dropJSON {
+			jsonOn = false
+			p.markJSONModeDropped()
+			reason := fmt.Sprintf("chat 流式 HTTP %d 拒绝 response_format", status)
+			capConfirms = append(capConfirms, func() { p.observeJSONModeUnsupported(reason) })
+		}
+		if dropTemp {
+			p.markTemperatureOmitted()
+			reason := fmt.Sprintf("chat 流式 HTTP %d 拒绝 temperature", status)
+			capConfirms = append(capConfirms, func() { p.observeTemperatureUnsupported(reason) })
+		}
+		if switchMaxTok {
+			p.markMaxCompletionTokens()
+			reason := fmt.Sprintf("chat 流式 HTTP %d 拒绝 max_tokens，改用 max_completion_tokens", status)
+			capConfirms = append(capConfirms, func() { p.observeMaxTokensUnsupported(reason) })
+		}
+		body = buildBody(usageOpt, jsonOn)
+		r2, e2 := send()
+		if e2 != nil {
+			return nil, fmt.Errorf("请求失败: %w", e2)
+		}
+		resp = r2
+	}
+	if resp.StatusCode == http.StatusOK {
+		for _, confirm := range capConfirms {
+			confirm()
 		}
 	}
 	defer resp.Body.Close()

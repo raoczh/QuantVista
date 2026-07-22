@@ -336,7 +336,7 @@ Go API Server
 
 ## 6. AI 调用设计
 
-> **HTTP 客户端加固（2026-07-03，参照 new-api 中继实践）**：`service/ai_client.go` 复用包级连接池（allowPrivate 两态各一个 client，repair/panel 连发请求不再重复 TLS 握手）；瞬时失败单次重试（未达上游的网络错误、429/500/502/503；504 视为真超时不重试，退避 800ms）；错误按状态码归类中文提示（401/403 密钥无效、404 路径或模型不存在、429 限流、5xx 上游异常）并透传上游 error.message；上游不回 usage 时按字符粗估（≈2 字符/token）兜底作审计。单次调用超时 90s，与前端 AI 请求 5 分钟窗口配合（最多 1+2 次 repair）。
+> **HTTP 客户端加固（2026-07-03；2026-07-22 长流修订）**：`service/ai_client.go` 复用包级连接池（allowPrivate 两态各一个 client，repair/panel 连发请求不再重复 TLS 握手）；全部业务 `chatCompletion` 默认先发真正 SSE 请求，流式 client 不设整体 `Timeout`，只以 90s `ResponseHeaderTimeout` 防建连挂死、以后台任务总 deadline 控制全程。SSE 请求固定携带 `Accept: text/event-stream`、`Cache-Control: no-cache`、`Accept-Encoding: identity`，Transport 禁用自动压缩，避免兼容网关/反代缓冲分片后触发 60s 空闲超时。瞬时失败只重试未达上游的网络错误与 429/500/502/503；504 视为真实超时不自动重试。错误按状态码归类并透传上游 error.message；usage 缺失时按字符粗估，仅用于审计。
 >
 > **双端点类型（2026-07-09）**：LLM 配置新增 `endpoint_type`（`chat_completions` 默认 / `responses`）。`responses` 走 `ai_client_responses.go` 按 new-api relayconvert 口径适配 `/v1/responses`（system→instructions 合并、messages→input、max_tokens→max_output_tokens、response_format→text.format、output 取 message+assistant 的 output_text、usage input/output_tokens 映射；流式按事件 type 分派）。两端点共用 `chatCompletion`/`chatCompletionStream` 入口，对 caller 透明。
 
@@ -364,7 +364,7 @@ LLM 的角色从「海选者」降级为「解释者/否决者」（listwise 海
 
 关键常量：`maxScanCandidates=48 / maxLLMCandidates=10 / maxPoolIntake=240 / poolSnapshotMax=150`。
 
-推荐/日报生成为**异步任务**（2026-07-14）：生成接口先落 `processing` 批次/报告立即返回，建池→评分→LLM 精选在服务端后台独立 Context（`context.Background()`+总 deadline）执行完成后回写，前端轮询详情直到脱离 processing——浏览器超时、反代 60s 掐断、页面刷新都不再中断任务；AI 精选超时时按量化排名生成**降级推荐**（规则计划价、条目带 `degraded_source` 标记、置信度恒 low）。
+生成类 LLM 均为**异步任务**（推荐/日报自 2026-07-14，分析/问答/AI 对比/白话选股自 2026-07-22）：HTTP 入口只做确定性校验、配置/配额解析并落 `processing` 后立即返回；数据采集与全部 LLM 阶段在服务端 `context.Background()` 派生的有界 Context 中执行，前端轮询业务记录或 `llm_tasks` 直到终态。浏览器断开、反代 60s 超时和页面刷新都不会取消后台模型调用。推荐主调失败时既有量化降级语义保持不变；其他模块按各自失败/降级契约收尾，不用量化结果掩盖上游错误。
 
 策略-来源映射（`strategySources`，对冲「热度榜供给的票恰是风控规则最想排除的票」的结构性矛盾）：
 momentum=涨幅+换手+成交额；pullback=**回调榜**(跌幅升序过滤温和回调)+成交额+涨幅；active=成交额+换手+涨幅；
@@ -426,15 +426,16 @@ value=**低PB榜**(升序滤负PB)+成交额；growth=涨幅+换手+成交额；
 - 写失败仅 SysWarn 不影响主流程；`common.DB` 为空直接跳过（直调 ai_client 的单测不受影响）。
 - 管理端 `GET /api/admin/llm-calls`（列表显式排除两 TEXT 列防大响应，user/module/status 筛选+分页）与 `/api/admin/llm-calls/:id`（全文详情），仅 AdminAuth；前端 `/admin/llm-calls` 页。**请求正文含用户数据（持仓、自选等），仅管理员可见。**
 - 每日 03:25 清理 90 天前记录。
-- **stream 列记录实际请求形态**（2026-07-14）：`chatCompletion` 内部流式优先、上游拒绝 stream 时回落非流式——审计按实际发出的请求记 stream 值，不按入口意图；`first_chunk_ms` 记流式首个 data 块到达耗时（非流式恒 0），**≈latency_ms 即上游忽略 stream 整包返回（假流式网关）**，是排查 60s 超时归属层的第一观测。
+- **stream 列记录实际请求形态**（2026-07-14；2026-07-22 加固）：`chatCompletion` 内部流式优先、上游明确拒绝 stream 时才回落非流式；Chat/Responses 两条 SSE 路径共用无整体超时 client 与防缓存/压缩请求头。审计按实际发出的请求记 stream 值，不按入口意图；`first_chunk_ms` 记首个 data 块到达耗时（非流式恒 0），**≈latency_ms 即上游忽略 stream 整包返回（假流式网关）**，是排查 60s 超时归属层的第一观测。
 
-### 6.10 生成类任务异步化与超时预算（2026-07-14）
+### 6.10 生成类任务异步化与超时预算（2026-07-14；2026-07-22 全链路修订）
 
-背景：部分 LLM 中转站对单次请求有 **60s 绝对整包超时**（不可调），且浏览器/反代链路也存在同量级超时——同步整包接口一次串行 2~5 次 LLM 调用必然被掐断。三层组合解法：
+背景：浏览器/入站反代与 LLM 中转站是两层不同的超时。后台任务解决前者取消请求 Context 的问题；真正 SSE 与单次输出预算解决后者的 60s 空闲/整包限制。只改前端轮询不能处理模型网关 504，必须同时满足以下约束：
 
-1. **异步任务化**：不建通用 jobs 表，直接复用业务表状态——`recommendation_batches`/`daily_reports` 新增 `processing` 状态；生成接口同步段只做校验/LLM 配置解析/配额熔断并落 processing 行立即返回，后台 goroutine 用 `context.Background()`+总 deadline（推荐 6min/日报 8min）执行后回写。前端 `pollUntil`（`web/src/lib/poll.ts`）2.5s 轮询详情；页面刷新凭列表里的 processing 记录恢复跟踪。幂等防重：同用户存在 15min 内的 processing 记录直接复用；超过 15min 的视为死任务（进程重启遗留）惰性判 failed。
-2. **单次调用瘦身**：模块级输出预算 `capModuleTokens(用户 max_tokens, 模块上限)`——复盘 1500/推荐主调与 repair 2500/复核 1500（输出 token 数是生成时长的主导项）；LLM 名单 Top16→10；prompt 输出纪律（reason/risks/evidence 条数与单条字数上限、落选理由 ≤20 字）；repair 次数 2→1 且坏输出只回灌开头片段（推荐 600 字/日报 800 字）。
-3. **可靠降级**：AI 主调用**超时/网络/5xx/流中断**类失败时按量化排名生成降级推荐（`buildQuantFallbackPicks`：ATR 规则计划价、action 恒 watch、置信度恒 low、`degraded_source=quant_fallback` 标记）；鉴权/路径/配额类确定性错误不降级直接失败。日报复盘与推荐两路 goroutine **并行**（互不阻断，单方失败 partial 语义不变）；重生成不再「先删后生成」——旧行原地置 processing、内容字段保留，双败回滚旧状态（旧报告不丢）。
+1. **异步任务化**：推荐/日报/分析复用各自业务表的 `processing` 状态；问答、AI 对比、白话选股复用通用 `llm_tasks`。同步入口不采集行情、不调用模型；后台 goroutine 使用独立 Context + 总 deadline（推荐 6min、日报 8min、分析/问答 10min、对比/白话选股 5min）。前端 `pollUntil` 轮询并可在刷新后恢复；15min 陈旧任务惰性收敛为 failed。
+2. **真正流式调用**：所有业务 `chatCompletion` 先走 Chat/Responses SSE，`stream=true` 与防缓冲请求头在每个 fallback 请求中都保留；流式 client 无整体 HTTP timeout。只有上游明确以 4xx 拒绝 stream 时才回落整包请求，不能在 504、流中断或调用 Context 取消后静默改走非流式。
+3. **单次调用瘦身**：模块预算取 `min(用户 max_tokens, 模块上限)`；analysis/recommendation/qa/news=2500，trade_plan/rec_review/rec_bear/daily_report=1500，analysis_review/compare=1000，screener_parse=2000。全部结构化模块最多 1 次 repair，坏输出默认只回灌 600 字（日报 800 字）；prompt 同时限制数组条数、单条字数或总字数。Chat 端拒绝 `max_tokens` 时必须携同值改用 `max_completion_tokens`；Responses 始终携带 `max_output_tokens`。两种字段都不支持则失败，禁止删除 token 参数退成无上限生成。
+4. **业务降级边界**：只有推荐维持既有量化降级（ATR 规则计划价、action 恒 watch、置信度 low、`degraded_source=quant_fallback`）；鉴权/路径/配额类确定性错误直接失败。日报两路并行并保留旧报告回滚语义；其他模块按自身失败/结构化降级契约收尾。
 
 ## 7. 数据缓存策略
 

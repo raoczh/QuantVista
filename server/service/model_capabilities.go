@@ -48,7 +48,9 @@ const (
 	capFreeText llmCapability = "free_text"
 	// capTemperature temperature 参数。
 	capTemperature llmCapability = "temperature"
-	// capMaxTokens max_tokens（chat）/ max_output_tokens（responses）参数。
+	// capMaxTokens 记录 Chat 端旧字段 max_tokens 是否被拒。unsupported 表示应改用
+	// 等价的 max_completion_tokens，而不是省略输出预算。target 含 endpoint，Responses
+	// 的 max_output_tokens 不复用这项回落。
 	capMaxTokens llmCapability = "max_tokens"
 	// capEndpointChat / capEndpointResponses 端点可用性（smoke 观察；业务不自动改写
 	// 用户显式选择的端点类型，仅作可观察声明）。
@@ -150,8 +152,8 @@ func resetLLMCapabilityStore() {
 
 // capabilitiesFor 合并「内置 provider 声明 + 运行时观察」输出能力快照：观察优先于声明
 // （观察来自该目标的真实响应，比按 provider 名的静态假设可信）。json_object 之外，
-// temperature/max_tokens 参数能力同样由观察覆盖（P0-5 修复批：此前两维只有静态字段、
-// 从未参与决策，最终 payload 无条件发送）。
+// temperature/max_tokens 参数能力同样由观察覆盖（P0-5 修复批）。其中 max_tokens 的
+// unsupported 在 Chat 端表示改用 max_completion_tokens，模块预算始终保留。
 func capabilitiesFor(provider string, target string) llmModelCapabilities {
 	caps, ok := builtinProviderCapabilities[strings.ToLower(strings.TrimSpace(provider))]
 	if !ok {
@@ -172,8 +174,8 @@ func capabilitiesFor(provider string, target string) llmModelCapabilities {
 // applyCapabilityRouting 公开出口的声明化路由（P0-5）：
 //   - 结构化调用（JSONMode）在能力矩阵已声明 json_object 不支持时，直接按 free_text 请求
 //     ——省掉一次注定失败的请求与隐式回落，审计 structured_method 如实记 free_text；
-//   - temperature/max_tokens 参数已声明不支持时，最终 payload 直接不携带该参数
-//     （不再无条件发送；实际发送形态以审计 RequestBody 的最终 payload 为准）。
+//   - temperature 已声明不支持时省略；Chat 的 max_tokens 已知被拒时改用
+//     max_completion_tokens。Responses 的 max_output_tokens 没有等价替代，不做省略回落。
 //
 // 必须在 effectiveJSONMode 观测指针初始化之后调用；flag 关闭时原样返回（保留旧隐式回落路径）。
 func applyCapabilityRouting(p chatParams) chatParams {
@@ -188,11 +190,8 @@ func applyCapabilityRouting(p chatParams) chatParams {
 	if caps.Temperature == capUnsupported {
 		p.markTemperatureOmitted()
 	}
-	if p.MaxTokens > 0 && caps.MaxTokens == capUnsupported {
-		// token 参数不被上游接受：省略参数而非拒绝调用（模块预算的强制力由此失效，
-		// 属可观察的兼容性降级——观察存储/系统日志/审计 RequestBody 三处可见，
-		// 不是静默无上限）。
-		p.markMaxTokensOmitted()
+	if p.MaxTokens > 0 && !p.isResponsesEndpoint() && caps.MaxTokens == capUnsupported {
+		p.markMaxCompletionTokens()
 	}
 	return p
 }
@@ -206,8 +205,8 @@ func (p chatParams) observeJSONModeUnsupported(reason string) {
 	observeLLMCapability(capabilityTargetOf(p), capJSONObject, capUnsupported, reason)
 }
 
-// observeTemperatureUnsupported / observeMaxTokensUnsupported 参数能力观察提交，
-// 纪律同 observeJSONModeUnsupported：仅在去参 fallback 确认成功后调用。
+// observeTemperatureUnsupported / observeMaxTokensUnsupported 参数能力观察提交。
+// 后者只在 Chat 改用 max_completion_tokens 后确认成功时调用。
 func (p chatParams) observeTemperatureUnsupported(reason string) {
 	observeLLMCapability(capabilityTargetOf(p), capTemperature, capUnsupported, reason)
 }
