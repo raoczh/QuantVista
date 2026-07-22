@@ -71,9 +71,11 @@ async function save(m: PromptModuleInfo) {
   }
   saving.value = m.module
   try {
-    await upsertPromptTemplate({ module: m.module, content: d.content, enabled: d.enabled })
+    const res = await upsertPromptTemplate({ module: m.module, content: d.content, enabled: d.enabled })
     await load(m.module)
     message.success('已保存')
+    // P0-6：占位符/内容 lint 诊断（不阻断保存，逐条提示）。
+    for (const w of res.warnings ?? []) message.warning(w, { duration: 6000 })
   } catch (e) {
     message.error((e as Error).message)
   } finally {
@@ -99,6 +101,11 @@ function useDefault(m: PromptModuleInfo) {
   drafts.value[m.module].content = m.default
 }
 
+// P0-6：模板行（含 content_hash/revision 归因信息）。
+function tplOf(module: string) {
+  return templates.value.find((t) => t.module === module)
+}
+
 onMounted(load)
 </script>
 
@@ -110,11 +117,14 @@ onMounted(load)
           <n-button size="tiny" quaternary :loading="loading" @click="load()">刷新</n-button>
         </template>
         <p class="tip">
-          每个模块可写一段自定义指引，替换系统默认的提示词段；「启用」后该模块的 AI
-          调用即时使用你的模板（无需重启）。分析 5 模块替换分析维度指引，推荐/日报/问答/复核替换各自的角色与规则段。
-          通用的合规身份与 JSON 输出规范仍由系统保证（例外：「收盘日报」与「AI 复核」的模板是整段系统提示，
-          自带 JSON 输出 schema——自定义时请保留默认模板末尾的输出格式要求，否则解析会失败降级）。模板里可用占位符（如
-          <code>{{ '\{\{symbol\}\}' }}</code>）注入运行时上下文，写错或未提供值的占位符会原样保留。
+          每个模块可写一段自定义任务指引（关注角度/语气/排序偏好），「启用」后该模块的 AI
+          调用即时使用你的模板（无需重启）。自定义内容一律作为「任务段」注入：分析 5 模块替换分析维度指引，
+          推荐/日报/问答/复核替换各自的角色定位段；各模块的准确性纪律、数据边界与 JSON 输出格式是
+          <b>系统契约，由系统自动追加、不可被模板覆盖</b>（下方每个模块可查看其契约内容），
+          模板里无需也不应再写输出格式要求。此前按「整段替换」写的旧模板已自动降级为任务段注入——
+          若旧模板末尾自带 JSON schema 段，建议删除以免与系统契约重复。模板里可用占位符（如
+          <code>{{ '\{\{symbol\}\}' }}</code>）注入运行时上下文，写错或未提供值的占位符会原样保留（保存时会提示诊断）。
+          每次内容变化都会保存不可变快照并生成内容指纹（版本号 -custom.指纹 可在调用审计中归因到当时的模板原文）。
           留空并保存无效，如需恢复默认请点「恢复默认」。
         </p>
         <n-spin :show="loading && !modules.length">
@@ -132,6 +142,15 @@ onMounted(load)
                     >{{ drafts[m.module]?.enabled ? '自定义生效' : '自定义未启用' }}</n-tag
                   >
                   <n-tag v-else size="tiny" round :bordered="false">默认</n-tag>
+                  <n-tag
+                    v-if="tplOf(m.module)?.content_hash"
+                    size="tiny"
+                    round
+                    :bordered="false"
+                    class="ph-tag"
+                    :title="'内容指纹（版本号 -custom.' + tplOf(m.module)!.content_hash!.slice(0, 8) + ' 可在调用审计中归因）'"
+                    >r{{ tplOf(m.module)?.revision }} · {{ tplOf(m.module)!.content_hash!.slice(0, 8) }}</n-tag
+                  >
                 </div>
               </template>
               <div v-if="drafts[m.module]" class="mod-body">
@@ -142,9 +161,15 @@ onMounted(load)
                   </n-tag>
                 </div>
                 <div class="mod-default">
-                  <div class="mod-default-title">默认指引（参考）</div>
+                  <div class="mod-default-title">默认任务段（参考——自定义替换的就是这一段）</div>
                   <pre class="mod-default-text">{{ m.default }}</pre>
                   <n-button size="tiny" quaternary @click="useDefault(m)">以默认为模板</n-button>
+                </div>
+                <div v-if="m.contract" class="mod-default">
+                  <div class="mod-default-title">
+                    系统契约（自动追加，不可覆盖——纪律与输出格式由系统保证，模板中无需再写）
+                  </div>
+                  <pre class="mod-default-text">{{ m.contract }}</pre>
                 </div>
                 <n-input
                   v-model:value="drafts[m.module].content"

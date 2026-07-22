@@ -14,15 +14,15 @@ func TestPromptUpsertAndOverride(t *testing.T) {
 	svc := &PromptService{}
 
 	// 非法模块 / 空内容。
-	if _, err := svc.Upsert(1, PromptInput{Module: "unknown", Content: "x"}); err == nil {
+	if _, _, err := svc.Upsert(1, PromptInput{Module: "unknown", Content: "x"}); err == nil {
 		t.Fatalf("非法模块应报错")
 	}
-	if _, err := svc.Upsert(1, PromptInput{Module: model.AnalysisModuleStock, Content: "   "}); err == nil {
+	if _, _, err := svc.Upsert(1, PromptInput{Module: model.AnalysisModuleStock, Content: "   "}); err == nil {
 		t.Fatalf("空内容应报错")
 	}
 
 	// 创建（未启用）→ override 应为空（回退默认）。
-	tpl, err := svc.Upsert(1, PromptInput{Module: model.AnalysisModuleStock, Content: "只看均线与量能。", Enabled: false})
+	tpl, _, err := svc.Upsert(1, PromptInput{Module: model.AnalysisModuleStock, Content: "只看均线与量能。", Enabled: false})
 	if err != nil {
 		t.Fatalf("创建失败: %v", err)
 	}
@@ -31,7 +31,7 @@ func TestPromptUpsertAndOverride(t *testing.T) {
 	}
 
 	// 更新为启用（同模块应 upsert 而非新增）→ override 生效。
-	if _, err := svc.Upsert(1, PromptInput{Module: model.AnalysisModuleStock, Content: "只看均线与量能。", Enabled: true}); err != nil {
+	if _, _, err := svc.Upsert(1, PromptInput{Module: model.AnalysisModuleStock, Content: "只看均线与量能。", Enabled: true}); err != nil {
 		t.Fatalf("更新失败: %v", err)
 	}
 	var cnt int64

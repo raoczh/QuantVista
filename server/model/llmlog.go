@@ -50,7 +50,7 @@ type LLMCallLog struct {
 	// 因端点不支持回落时记录回落后的真实形态，与请求入口意图区分（同 Stream 字段纪律）。
 	StructuredMethod string `gorm:"size:16" json:"structured_method"`
 	SchemaVersion    string `gorm:"size:32" json:"schema_version"`
-	PromptVersion    string `gorm:"size:24" json:"prompt_version"`
+	PromptVersion    string `gorm:"size:32" json:"prompt_version"` // P0-6：-custom.<hash8> 后缀需 32 宽
 	// PromptHash 初始业务消息序列（ac1 注入前）的 sha256；DataHash 输入数据快照的 sha256。
 	PromptHash string `gorm:"size:80" json:"prompt_hash"`
 	DataHash   string `gorm:"size:80" json:"data_hash"`

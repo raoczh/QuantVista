@@ -2185,14 +2185,15 @@ func composeBatchTitle(recType string, strat *strategyTemplate, filters RecFilte
 // LLM 的角色是「精选 + 解读 + 否决」而非海选；强制引用字段数值、禁用先验记忆、允许少选。
 func (s *RecommendationService) buildMessages(userID int64, recType string, strat *strategyTemplate, market string, count int, llmCands []candidate, filters RecFilters, mktCtx *recMarketContext) []chatMessage {
 	var sys strings.Builder
-	// M3c：module=recommend 的自定义模板整段替换默认角色与铁律段（占位符宽容渲染）。
-	// 反编造由 parseAndFilterPicks 程序化兜底，自定义文本弱化纪律也放不进池外标的。
+	// P0-6：module=recommend 的自定义模板是 L3 任务段（替换默认角色定位），铁律契约段
+	// 恒由系统追加不可覆盖（composeCustomTaskPrompt）；反编造另有 parseAndFilterPicks
+	// 程序化兜底。占位符宽容渲染。
 	intro := recRoleIntro
 	if custom, ok := promptOverrideFor(userID, model.PromptModuleRecommend, map[string]string{
 		"type": recTypeLabel(recType), "strategy": strat.Name,
 		"market": market, "count": strconv.Itoa(count),
 	}); ok {
-		intro = custom
+		intro = composeCustomTaskPrompt(custom, recPromptContract)
 	}
 	sys.WriteString(intro)
 	sys.WriteString("\n\n")
@@ -2234,15 +2235,23 @@ func (s *RecommendationService) buildMessages(userID int64, recType string, stra
 	}
 }
 
-const recRoleIntro = `你是一名严谨的证券研究员，服务于个人投资研究工具。量化系统已完成候选筛选、技术因子计算与评分排序，你的任务是在此基础上精选、解读与否决——不是重新海选。你的输出仅供研究参考，不构成任何投资建议或买卖指令。
+// recRoleTaskSeg 推荐角色任务段（L3）：module=recommend 自定义模板替换的部分——
+// 角色定位与任务重点。P0-6 起自定义不再整段替换，铁律段恒由系统追加。
+const recRoleTaskSeg = `你是一名严谨的证券研究员，服务于个人投资研究工具。量化系统已完成候选筛选、技术因子计算与评分排序，你的任务是在此基础上精选、解读与否决——不是重新海选。你的输出仅供研究参考，不构成任何投资建议或买卖指令。`
 
-铁律：
+// recPromptContract 推荐模块契约段（L1，不可被自定义模板覆盖）：候选边界/反编造/
+// 证据纪律/宁缺毋滥/输出协议。程序侧另有 parseAndFilterPicks 反编造兜底。
+const recPromptContract = `铁律：
 1. 只能从【量化初选名单】中挑选，symbol 必须与名单完全一致；严禁推荐名单外标的或杜撰任何代码/数据。
 2. 只依据名单与市场环境中给出的数据分析。禁止使用你记忆中关于任何公司的信息——名气、行业地位、历史印象、新闻记忆都不算数据，只看本次给出的数字。数据不足处如实说明局限，不臆测未提供的财务/消息。
 3. 每个标的必须给出：理由(reason)、风险(risks)、数据依据(evidence)。evidence 每条都要引用具体字段名与数值（如「score=78.5 池内第1」「换手率6.3%、量比2.1 温和放量」「bias_20=+4.2% 未超买」）。系统会程序化核对你引用的数字，与数据不符的证据会被标记出来展示给用户。
 4. 宁缺毋滥但不无故少给：名单中符合策略且证据充分的标的足够时，应给足要求的数量；证据不足或与策略不符时明确不选，picks 可以少于要求数量甚至为空。不得为凑满数量而降低证据标准——第 N 只的证据强度不应明显弱于第 1 只；对勉强符合策略的边际标的，用 action="watch" 并如实给低 confidence，而不是凑成 buy。落选与入选都要有数据依据。
 5. 名单内未入选的标的，在 rejected 数组中各给一句话落选理由（{"symbol","reason"}）。
 6. 全程简体中文。只输出一个 JSON 对象 {"picks":[...],"rejected":[...]}，不要任何解释文字或 Markdown 代码块标记。`
+
+// recRoleIntro 默认角色与铁律段 = 任务段 + 契约段（编译期拼接，与 P0-6 拆分前逐字节一致，
+// 默认路径零行为变化）。
+const recRoleIntro = recRoleTaskSeg + "\n\n" + recPromptContract
 
 const shortTermSpec = `本次为【短线推荐】。每个 pick 需包含字段：
 - symbol: 名单中的代码

@@ -21,8 +21,9 @@ type AiConversation struct {
 	Provider    string `gorm:"size:32" json:"provider"`
 	Model       string `gorm:"size:64" json:"model"`
 
-	// 问答 prompt 版本（M3c 起落库，会话创建时固化；-custom 后缀=启用了自定义模板）。
-	PromptVersion string `gorm:"size:16" json:"prompt_version"`
+	// 问答 prompt 版本（M3c 起落库，会话创建时固化；-custom.<hash8> 后缀=启用了自定义模板，
+	// hash8 归因到模板内容，P0-6 起需 32 宽）。
+	PromptVersion string `gorm:"size:32" json:"prompt_version"`
 
 	// P0-2 调用关联：会话级 trace_id（该会话全部提问的 LLM 调用共享；llm_call_logs
 	// 同值可双向查询）。旧会话为空，首次新提问时补写。

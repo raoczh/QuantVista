@@ -32,18 +32,19 @@ func (pc *PromptController) List(c *gin.Context) {
 }
 
 // Upsert POST /api/prompt-templates —— 新建或更新某模块模板。
+// P0-6：响应含 template 与 warnings（占位符/内容 lint 诊断，不阻断保存）。
 func (pc *PromptController) Upsert(c *gin.Context) {
 	var in service.PromptInput
 	if err := c.ShouldBindJSON(&in); err != nil {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	tpl, err := pc.svc.Upsert(currentUserID(c), in)
+	tpl, warnings, err := pc.svc.Upsert(currentUserID(c), in)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
 	}
-	common.ApiSuccess(c, tpl)
+	common.ApiSuccess(c, gin.H{"template": tpl, "warnings": warnings})
 }
 
 // Delete DELETE /api/prompt-templates/:id —— 删除（恢复默认）。

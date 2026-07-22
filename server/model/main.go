@@ -37,6 +37,7 @@ func AllModels() []any {
 		&PaperTrade{},
 		&NotifyChannel{},
 		&PromptTemplate{},
+		&PromptTemplateRevision{},
 		&ThesisCard{},
 		&ResearchNote{},
 		&DailyReport{},
