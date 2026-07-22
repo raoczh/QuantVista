@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -349,23 +350,62 @@ func TestModuleBudgetTable(t *testing.T) {
 	}
 }
 
-// TestTimeoutSensitivePromptDiscipline 锁住与单次预算配套的输出长度纪律；只有 token cap
-// 没有 prompt 约束时，模型仍会奔着上限生成，容易再次撞上游绝对 60s 超时。
-func TestTimeoutSensitivePromptDiscipline(t *testing.T) {
-	checks := []struct {
+// TestPromptOutputLengthLimitsRemoved 锁定业务 prompt 不再用字数、句数或性能型数组
+// 上限压缩回答，并确保删除篇幅限制时没有连带删除关键结构与业务契约。
+func TestPromptOutputLengthLimitsRemoved(t *testing.T) {
+	prompts := []struct {
 		name string
 		text string
-		want string
 	}{
-		{"analysis", analysisOutputSpec, "每条不超过 60 字"},
-		{"analysis_panel", panelOutputSpec, "不超过 100 字"},
-		{"qa", qaPromptContract, "800 个汉字以内"},
-		{"news", newsEnhanceSystem, "每条输入新闻恰好输出一项"},
-		{"screener_parse", buildParseStrategySystemPrompt(), "不超过 80 字"},
+		{"analysis", analysisRepairHint + analysisOutputSpec},
+		{"analysis_panel", panelRepairHint + panelOutputSpec},
+		{"analysis_review", analysisReviewContract},
+		{"trade_plan", tradePlanSystem + tradePlanRepairHint},
+		{"recommendation_short", recPromptContract + shortTermSpec},
+		{"recommendation_long", recPromptContract + longTermSpec},
+		{"recommendation_review", recReviewSystemPrompt},
+		{"rec_bear", bearSystemPrompt},
+		{"daily_report", dailyReviewSystem},
+		{"qa", qaRoleIntro},
+		{"compare", comparePromptInstruction},
+		{"news", newsEnhanceSystem},
+		{"screener_parse", buildParseStrategySystemPrompt()},
 	}
-	for _, c := range checks {
-		if !strings.Contains(c.text, c.want) {
-			t.Errorf("%s prompt 缺少输出纪律 %q", c.name, c.want)
+	forbidden := []*regexp.Regexp{
+		regexp.MustCompile(`(?:不超过|最多|少于|控制在|限制在|≤)\s*[0-9０-９]+\s*(?:个)?(?:汉字|字|字符|句|条)`),
+		regexp.MustCompile(`[0-9０-９]+\s*(?:个)?(?:汉字|字|字符)\s*(?:以内|之内|上限)`),
+		regexp.MustCompile(`[0-9０-９]+\s*[~～-]\s*[0-9０-９]+\s*(?:句|条)`),
+		regexp.MustCompile(`一句话|一两句|一段话|只写一段|不分段|不列清单`),
+		regexp.MustCompile(`严格时限|精炼比|紧凑\s*JSON`),
+	}
+	for _, p := range prompts {
+		for _, pattern := range forbidden {
+			if match := pattern.FindString(p.text); match != "" {
+				t.Errorf("%s prompt 仍包含输出篇幅限制 %q", p.name, match)
+			}
+		}
+	}
+
+	required := []struct {
+		name string
+		text string
+		want []string
+	}{
+		{"analysis", analysisOutputSpec, []string{"rating:", "anti_thesis:", "disclaimer:"}},
+		{"analysis_panel", panelOutputSpec, []string{"恰好 4 个元素", "technical", "consensus"}},
+		{"trade_plan", tradePlanSystem, []string{"止损价必须低于现价", "目标价必须高于", "只输出一个 JSON 对象"}},
+		{"recommendation", recPromptContract, []string{"只能从【量化初选名单】", "picks 可以少于要求数量", "只输出一个 JSON 对象"}},
+		{"recommendation_review", recReviewSystemPrompt, []string{"pass|warn|reject", "reviews", "overall"}},
+		{"rec_bear", bearSystemPrompt, []string{"覆盖全部给出的标的", "high|med|low"}},
+		{"daily_report", dailyReviewSystem, []string{"data_deficiencies", "risk_warnings", "tomorrow_plan"}},
+		{"news", newsEnhanceSystem, []string{"每条输入新闻恰好输出一项", "保持输入顺序与 id", "related_sectors"}},
+		{"screener_parse", buildParseStrategySystemPrompt(), []string{"≤6 层", "叶子总数 ≤48", "unmatched"}},
+	}
+	for _, c := range required {
+		for _, want := range c.want {
+			if !strings.Contains(c.text, want) {
+				t.Errorf("%s prompt 缺少业务契约 %q", c.name, want)
+			}
 		}
 	}
 }

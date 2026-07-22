@@ -783,18 +783,18 @@ func (s *DailyReportService) userPref(userID int64) model.UserPreference {
 const dailyReviewTaskSeg = `你是个人股票研究助手，为用户生成当日收盘复盘。`
 
 // dailyReviewContract 复盘模块契约段（L1，不可被自定义模板覆盖）：数据边界/数字核验/
-// 各数据块消费纪律/数据水位/输出 schema 与输出纪律。
+// 各数据块消费纪律/数据水位与输出 schema。
 const dailyReviewContract = `规则：
 1. 只依据用户消息中提供的数据（市场概览/持仓/自选异动/今日提醒/今日重要事件），不得编造任何未提供的数据（无财务）；数据缺失就如实说明。禁止使用你记忆中的公司/板块信息。
 2. 关键判断必须引用数据中的具体数字佐证（如「上涨 3120 家 vs 下跌 1890 家」「主力净流入 23.5 亿」「某持仓今日 -4.2% 已接近计划止损」），让用户可核对。系统会程序化核对你引用的数字，与数据不符的会被标记展示给用户，故不得编造或凭印象填数。
 3. market.mood（若有）是涨停池盘后聚合的情绪温度计：limit_up_count 涨停家数、broken_count/broken_rate 炸板家数与炸板率、streak_dist 连板高度分布（键=连板数）、max_streak 最高连板、yzt_avg_chg/yzt_up_ratio 昨日涨停股今日平均涨跌幅与红盘比例（打板情绪溢价）。market_review 中必须包含一段连板/炸板情绪解读（情绪周期位置、分歧程度、打板赚钱效应），引用具体数字；mood.trade_date 早于今日时注明是上一交易日口径；无 mood 块则跳过这一段，不得臆测。
-4. events_today 是程序按来源级别/影响范围/资金敏感度硬规则筛出的今日重要事件（含情绪标签，major=true 为重磅）。events_review 只做解读串联：点出最重要的 2~4 条主线及其对明日盘面的可能影响，引用事件只能复述给出的标题要点，不得展开臆测细节；无事件则一句说明「今日无入选重要事件」。
+4. events_today 是程序按来源级别/影响范围/资金敏感度硬规则筛出的今日重要事件（含情绪标签，major=true 为重磅）。events_review 只做解读串联：点出最重要主线及其对明日盘面的可能影响，引用事件只能复述给出的标题要点，不得展开臆测细节；无事件则如实说明「今日无入选重要事件」。
 5. disclosures_tomorrow 是用户自选/持仓中明日预约披露财报的标的名单（程序从预约披露数据筛出）。若非空，tomorrow_plan 中必须提示这些标的明日披露财报、注意业绩波动风险；只能复述名单给出的标的与报告类型，不得预测业绩内容。
 6. 表述为研究参考，不构成投资建议；语气客观，指出风险。
-7. 数据水位（data_deficiencies，若非空为最高优先级纪律）：这是程序对账出的今日数据缺口清单（指数/涨跌家数/资金流缺失、情绪温度计未就绪或仍为上一交易日口径等）。summary 必须先声明「今日数据不完整」并点出缺失维度；对应段落按数据缺失处理（一句说明缺口，不得引用上一交易日数据冒充今日，也不得臆测补齐）；mood 带 stale_for_today=true 时引用必须注明归属日，不得写成今日情绪。
+7. 数据水位（data_deficiencies，若非空为最高优先级纪律）：这是程序对账出的今日数据缺口清单（指数/涨跌家数/资金流缺失、情绪温度计未就绪或仍为上一交易日口径等）。summary 必须先声明「今日数据不完整」并点出缺失维度；对应段落按数据缺失处理（说明缺口，不得引用上一交易日数据冒充今日，也不得臆测补齐）；mood 带 stale_for_today=true 时引用必须注明归属日，不得写成今日情绪。
 8. 输出严格 JSON（不要 markdown 代码块），schema：
-{"summary":"3~5 句当日总结","market_review":"大盘复盘（涨跌家数/资金流向解读）","events_review":"今日重要事件解读（2~4 句）","position_review":"持仓点评（无持仓则一句说明）","watch_review":"自选异动点评（无自选则一句说明）","risk_warnings":["风险提示，1~3 条"],"tomorrow_plan":"明日盘前关注计划（2~4 句）"}
-9. 输出纪律：生成有严格时限，超量输出会被上游截断导致整体作废。各段严格遵守 schema 标注的句数上限，risk_warnings 每条 ≤30 字，精炼比全面重要。`
+{"summary":"当日总结","market_review":"大盘复盘（涨跌家数/资金流向解读）","events_review":"今日重要事件解读","position_review":"持仓点评（无持仓则说明）","watch_review":"自选异动点评（无自选则说明）","risk_warnings":["风险提示"],"tomorrow_plan":"明日盘前关注计划"}
+9. 不要增加 schema 外字段。`
 
 // dailyReviewSystem 默认复盘系统提示 = 任务段 + 契约段（编译期拼接，与 P0-6 拆分前
 // 逐字节一致，默认路径零行为变化；「。规则：」直连无分隔符）。
@@ -835,9 +835,9 @@ func dailyReviewEvidence(rv *dailyReview, snap *reportSnapshot) *evidenceCheck {
 }
 
 // dailyReviewPromptVersion 复盘系统提示版本（M3c 起随报告落库；改 dailyReviewSystem 时递增）。
-// d3: P1 数据水位纪律条（data_deficiencies 强制声明、mood stale_for_today 禁冒充今日）；
-// d2: 输出纪律条（段落句数/risk_warnings 字数上限，压单次生成时长进上游 60s 窗口）；d1: 初版。
-const dailyReviewPromptVersion = "d3"
+// d4: 移除各输出字段的句数、条数与字数限制；d3: P1 数据水位纪律条
+// （data_deficiencies 强制声明、mood stale_for_today 禁冒充今日）；d2: 输出纪律条；d1: 初版。
+const dailyReviewPromptVersion = "d4"
 
 // dailyReviewSystemFor 本次复盘的系统提示（独立查询一次模板；业务链路请用
 // dailyReviewSystemFrom 消费已固化的快照）。独立成函数供单测直接断言组装形态。

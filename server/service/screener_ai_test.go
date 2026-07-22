@@ -29,7 +29,7 @@ func TestParseStrategyPromptFactorDict(t *testing.T) {
 		}
 	}
 	// 纪律要点必须在场：unmatched 兜底 + 禁硬凑 + 输出 schema。
-	for _, kw := range []string{"unmatched", "禁止硬凑", "explain", "is_true", "不超过 80 字", "紧凑 JSON"} {
+	for _, kw := range []string{"unmatched", "禁止硬凑", "explain", "is_true", "不增加 schema 外字段"} {
 		if !strings.Contains(prompt, kw) {
 			t.Errorf("prompt 缺关键内容 %q", kw)
 		}

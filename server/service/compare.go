@@ -12,7 +12,7 @@ import (
 	"quantvista/model"
 )
 
-// CompareService 个股横向对比：多只股票并排比较行情与技术指标，可选 AI 一句话点评。
+// CompareService 个股横向对比：多只股票并排比较行情与技术指标，可选 AI 点评。
 // 纯读操作，不落库；AI 点评复用 ai_client + 配额熔断。
 type CompareService struct {
 	market *MarketService
@@ -29,8 +29,9 @@ const (
 	compareJobTimeout = 5 * time.Minute
 	// comparePromptVersion 对比 AI 点评的内联提示词版本（P0-2 修复批新设）：aiComment 的
 	// system/user 提示词为固定内联文本，改措辞须递增本版本——审计与 trace 关联凭它归因。
-	// c2: 强化 180 字、不分段不列清单的单次输出纪律；c1: 初版。
-	comparePromptVersion = "c2"
+	// c3: 移除点评字数和段落形式限制；c2: 强化 180 字、不分段不列清单的输出纪律；c1: 初版。
+	comparePromptVersion     = "c3"
+	comparePromptInstruction = "请对下列股票做横向对比点评。指出相对强弱、趋势与均线位置差异、估值水位差异（如有 PE/PB 数据）、谁更值得关注及其理由。要求：只依据给出的数据，关键判断引用具体数值（如「A 综合分 78 高于 B 的 52」）；系统会程序化核对你引用的数字，与数据不符的会被标记展示给用户，故不得编造或凭印象填数；禁止使用你记忆中关于这些公司的信息，不得虚构财务明细/新闻；这是研究参考，不构成投资建议，同时给出风险提示。\n\n数据（score 为本站五维技术评分 0-100，仅供参考锚点）：\n"
 )
 
 // CompareRow 单只标的的对比指标。行情时效契约：QuoteOK 仅在取到 fresh 行情时为
@@ -97,7 +98,7 @@ type CompareResult struct {
 	AIModel    string `json:"ai_model,omitempty"`
 }
 
-// Compare 并发采集各标的指标，去重后组装；WithAI 时追加一句话点评。
+// Compare 并发采集各标的指标，去重后组装；WithAI 时追加 AI 点评。
 func (s *CompareService) Compare(ctx context.Context, userID int64, allowPrivate bool, req CompareRequest) (*CompareResult, error) {
 	refs, truncNote, err := normalizeCompareRequest(req)
 	if err != nil {
@@ -121,7 +122,7 @@ func (s *CompareService) Compare(ctx context.Context, userID int64, allowPrivate
 
 	res := &CompareResult{Rows: rows, Note: truncNote}
 
-	// 可选 AI 一句话点评。
+	// 可选 AI 点评。
 	if req.WithAI {
 		comment, note, refusalCode, usedCfg, aiTrace := s.aiComment(ctx, userID, allowPrivate, req.LLMConfigID, rows)
 		res.AIComment = comment
@@ -286,14 +287,14 @@ func changeOverN(closes []float64, n int) float64 {
 	return round2((closes[len(closes)-1] - prev) / prev * 100)
 }
 
-// aiComment 生成一段横向对比点评。返回（点评, 说明, 机读拒答码, 实际使用的 LLM 配置, trace_id）；
+// aiComment 生成横向对比点评。返回（点评, 说明, 机读拒答码, 实际使用的 LLM 配置, trace_id）；
 // 失败或配额不足时点评为空、说明解释原因、code 供前端程序化分支、配置为 nil。
 // trace_id 仅在实际发起过 LLM 调用时非空（P0-2；对比不落库，随响应回传）。
 func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPrivate bool, llmConfigID int64, rows []CompareRow) (string, string, string, *model.LLMConfig, string) {
 	// 数据充分性是业务安全门，应先于配置和配额解析。否则同一批 fresh<2 的数据会因
 	// 用户是否配置 LLM 而返回不同拒答码，掩盖真正的 fail-closed 原因。
 	var b strings.Builder
-	b.WriteString("请对下列股票做一次简明的横向对比点评：严格控制在 180 字以内，只写一段，不分段、不列清单。指出相对强弱、趋势与均线位置差异、估值水位差异（如有 PE/PB 数据）、谁更值得关注及其理由。要求：只依据给出的数据，关键判断引用具体数值（如「A 综合分 78 高于 B 的 52」）；系统会程序化核对你引用的数字，与数据不符的会被标记展示给用户，故不得编造或凭印象填数；禁止使用你记忆中关于这些公司的信息，不得虚构财务明细/新闻；这是研究参考，不构成投资建议，末尾一句风险提示。\n\n数据（score 为本站五维技术评分 0-100，仅供参考锚点）：\n")
+	b.WriteString(comparePromptInstruction)
 	valid := 0
 	for _, r := range rows {
 		if !r.QuoteOK {
