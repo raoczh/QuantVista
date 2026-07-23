@@ -324,3 +324,132 @@ export function getWalkForward(refresh = false) {
     timeout: HEAVY_TIMEOUT,
   })
 }
+
+// ---------- P1-7 校准与后验标签报表（管理端只读，纯测量零门控） ----------
+
+export interface CalibBucket {
+  label: string
+  sample: number
+  avg_conf: number
+  hit_rate_pct: number
+  avg_net_pct: number
+  gap_pct: number
+}
+
+export interface CalibTierCell {
+  tier: string
+  sample: number
+  hit_rate_pct: number
+  median_net_pct: number
+  avg_net_pct: number
+  avg_gross_pct: number
+  avg_alpha_pct: number
+  alpha_sample: number
+  severe_loss_pct: number
+}
+
+export interface CalibCoverage {
+  total: number
+  matured: number
+  pending: number
+  skipped: number
+  no_data: number
+  forced: number
+  degraded_excl: number
+  matured_ratio_pct: number
+}
+
+export interface CalibActionPR {
+  sample: number
+  buy_sample: number
+  precision_net_pct?: number
+  recall_net_pct?: number
+  watch_hit_pct?: number
+  precision_alpha_pct?: number
+  recall_alpha_pct?: number
+  alpha_sample: number
+}
+
+export interface RecCalibReport {
+  type: string
+  horizon_days: number
+  evaluated: boolean
+  sample: number
+  buy_sample: number
+  coverage: CalibCoverage
+  brier?: number
+  ece?: number
+  reliability?: CalibBucket[]
+  sys_tiers?: CalibTierCell[]
+  tier_monotone?: string
+  action_pr: CalibActionPR
+  notes: string[]
+}
+
+export interface AnalysisCalibTier {
+  tier: string
+  sample: number
+  hit_rate_pct: number
+  avg_ret20_pct: number
+}
+
+export interface AnalysisCalibReport {
+  evaluated: boolean
+  scanned: number
+  judged: number
+  neutral_skipped: number
+  immature_skipped: number
+  no_data_skipped: number
+  no_sys_conf: number
+  brier?: number
+  ece?: number
+  reliability?: CalibBucket[]
+  sys_tiers?: AnalysisCalibTier[]
+  notes: string[]
+}
+
+export interface LLMCalibrationReport {
+  generated_at: string
+  label_version: string
+  recommendation: RecCalibReport[]
+  analysis: AnalysisCalibReport
+  elapsed_ms: number
+  notes: string[]
+}
+
+export function getLLMCalibration(refresh = false) {
+  return request<LLMCalibrationReport>({
+    url: '/admin/llm-calibration',
+    params: refresh ? { refresh: 1 } : undefined,
+    timeout: HEAVY_TIMEOUT,
+  })
+}
+
+// ---------- P1-8 角色/提示词资产 registry（管理端只读声明表） ----------
+
+export interface LLMRoleAsset {
+  role_id: string
+  name: string
+  version: string
+  schema_version: string
+  purpose: string
+  market: string
+  horizons: string
+  trigger: string
+  input_whitelist: string[]
+  must_answer: string[]
+  forbidden_actions: string[]
+  fallback: string
+  max_tokens: number
+  repair_attempts: number
+  counter_examples: string[]
+}
+
+export interface LLMRolesResponse {
+  roles: LLMRoleAsset[]
+  disciplines: string[]
+}
+
+export function getLLMRoles() {
+  return request<LLMRolesResponse>({ url: '/admin/llm-roles' })
+}

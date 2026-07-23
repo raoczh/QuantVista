@@ -140,6 +140,8 @@ const userOptions = computed<DropdownOption[]>(() => {
       { label: 'LLM 调用记录', key: 'admin-llm-calls' },
       { label: '因子 IC 排行', key: 'admin-factor-ic' },
       { label: 'Walk-Forward 基线', key: 'admin-walk-forward' },
+      { label: 'LLM 校准报表', key: 'admin-calibration' },
+      { label: 'LLM 角色资产', key: 'admin-llm-roles' },
     )
   opts.push({ type: 'divider', key: 'd1' }, { label: '退出登录', key: 'logout' })
   return opts
@@ -152,6 +154,8 @@ async function onSelectUser(key: string) {
   else if (key === 'admin-llm-calls') router.push('/admin/llm-calls')
   else if (key === 'admin-factor-ic') router.push('/admin/factor-ic')
   else if (key === 'admin-walk-forward') router.push('/admin/walk-forward')
+  else if (key === 'admin-calibration') router.push('/admin/calibration')
+  else if (key === 'admin-llm-roles') router.push('/admin/llm-roles')
   else if (key === 'logout') {
     setMarketTitle('')
     await authStore.logout()

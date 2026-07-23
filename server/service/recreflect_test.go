@@ -190,6 +190,10 @@ func TestReflectionGenerateEndToEnd(t *testing.T) {
 	// 两条代表持有期候选：短线 h=10 止盈、长线 h=20 止损。
 	l1 := seedMaturedLabel(t, 1, "600100", model.RecTypeShortTerm, "momentum", 10, 9.5, true, false)
 	l2 := seedMaturedLabel(t, 1, "600200", model.RecTypeLongTerm, "value", 20, -7.0, false, true)
+	// updated_at 钉同一时刻：候选序落到 id ASC tiebreaker（l1 先建 → idx0）。
+	// 不钉时两行跨毫秒创建会让 DESC 序漂移（与其他测试共跑曾因此教训错位 flaky）。
+	common.DB.Model(&model.RecommendationLabel{}).Where("id IN ?", []int64{l1.ID, l2.ID}).
+		Update("updated_at", time.Date(2026, 7, 1, 16, 0, 0, 0, time.Local))
 
 	n, err := GenerateRecommendationReflections(context.Background())
 	if err != nil || n != 2 {

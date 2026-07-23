@@ -354,6 +354,9 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				admin.PUT("/users/:id/quota", adminCtl.UpdateUserQuota)
 				admin.GET("/llm-calls", adminCtl.ListLLMCalls)
 				admin.GET("/llm-calls/:id", adminCtl.GetLLMCall)
+				// P1-7 校准与后验标签报表（只读，refresh=1 重算）+ P1-8 角色资产 registry
+				admin.GET("/llm-calibration", adminCtl.LLMCalibration)
+				admin.GET("/llm-roles", adminCtl.LLMRoles)
 
 				// 数据源健康端点（S1 健康滑窗：每 (源,能力) success/empty/error 与冷却状态）
 				admin.GET("/datasources", marketCtl.DataSources)

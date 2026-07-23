@@ -191,7 +191,9 @@ func loadReflectionCandidates(limit int) ([]reflectionCandidate, error) {
 		Where("(type = ? AND horizon_days = 10) OR (type = ? AND horizon_days = 20)",
 			model.RecTypeShortTerm, model.RecTypeLongTerm).
 		Where("NOT EXISTS (SELECT 1 FROM recommendation_reflections rr WHERE rr.recommendation_id = recommendation_labels.recommendation_id AND rr.horizon_days = recommendation_labels.horizon_days)").
-		Order("updated_at DESC").Limit(limit).
+		// id ASC 是确定性 tiebreaker：同一轮结算的标签 updated_at 常落同一毫秒，
+		// 无 tiebreaker 时顺序退化为物理页序（不可复现，测试也曾因此 flaky）。
+		Order("updated_at DESC, id ASC").Limit(limit).
 		Find(&labels).Error; err != nil {
 		return nil, err
 	}
