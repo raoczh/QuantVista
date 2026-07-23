@@ -46,8 +46,8 @@ func TestEvidenceRefsIDAndSource(t *testing.T) {
 	check := verifyEvidenceLabeled([]evidenceSection{
 		{Module: "总结", Text: "现价 9.88 站上 MA20=9.5，另有凭空的 77.77"},
 	}, vals)
-	if check.Version != "ev4" {
-		t.Fatalf("版本应为 ev4: %s", check.Version)
+	if check.Version != "ev5" {
+		t.Fatalf("版本应为 ev5: %s", check.Version)
 	}
 	ids := map[string]bool{}
 	for _, it := range check.Items {

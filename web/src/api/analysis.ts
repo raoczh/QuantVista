@@ -60,6 +60,7 @@ export interface TradePlan {
   horizon_days?: number
   plan_note?: string
   checklist?: string[]
+  invalidators?: string[] // P1-2：计划失效条件（模型声明，服务端归一；与止损价互补的形态/逻辑作废信号）
   rr_ratio?: number // 盈亏比（服务端计算）
   position?: PositionAdvice
   discipline_notes?: string[] // 纪律校验说明（盈亏比不足降仓等）

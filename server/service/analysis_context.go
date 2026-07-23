@@ -197,12 +197,17 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 	// N2 舆情段：最近 5 条相关新闻标题+情绪标签；无新闻时注入程序算好的
 	// 涨跌五档/量能三档/换手率并明示「暂无直接相关新闻」（fallback 让模型
 	// 有确定性的市场信号可依，而不是围绕消息面自由发挥）。仅 A 股 6 位代码口径。
+	// P1-4：两分支均带 window_meta 机读窗口声明（window_start/end/source_coverage/
+	// source_alignment）——窗口外新闻 0 注入由查询双边界保证，这里把窗口显式化为
+	// 机器可读契约；对齐分类由程序按版本化阈值计算（nw1），模型只解释不重分类。
 	if mkt == "cn" && len(symbol) == 6 && !isCNFund(symbol) {
-		if briefs := latestNewsBriefs(symbol, 5); len(briefs) > 0 {
+		briefs, windowMeta := latestNewsWindow(symbol, 5)
+		if len(briefs) > 0 {
 			snap["news"] = map[string]any{
-				"items":  briefs,
-				"window": "近7天",
-				"note":   "该股近 7 天内相关新闻的标题与情绪标签（利好/利空/中性为程序化预判，仅供参考，不保证完整覆盖；更早的旧闻不注入，不得凭记忆补充）",
+				"items":       briefs,
+				"window":      "近7天",
+				"window_meta": windowMeta,
+				"note":        "该股近 7 天内相关新闻的标题与情绪标签（利好/利空/中性为程序化预判，仅供参考，不保证完整覆盖；更早的旧闻不注入，不得凭记忆补充）。window_meta.source_alignment 为程序化来源方向对齐判定（single_source=单一来源不得写成市场共识；divergent=来源分歧须如实指出），只能解释、不得重新分类",
 			}
 		} else {
 			turnover := 0.0
@@ -213,6 +218,7 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 			}
 			snap["news"] = map[string]any{
 				"note":           "近 7 天内暂无直接相关新闻，请按以下市场信号判断，不得臆测消息面",
+				"window_meta":    windowMeta,
 				"market_signals": fallbackMarketSignals(q.ChangePct, bars, turnover),
 			}
 		}

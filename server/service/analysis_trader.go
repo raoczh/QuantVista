@@ -29,6 +29,10 @@ type tradePlan struct {
 	HorizonDays  FlexInt  `json:"horizon_days,omitempty"`   // 预期持有周期（交易日）
 	PlanNote     string   `json:"plan_note,omitempty"`      // 计划思路
 	Checklist    []string `json:"checklist,omitempty"`      // 买入前逐项核对的操作清单
+	// Invalidators 计划失效条件（P1-2）：出现什么可观察信号说明本计划已作废（如「放量
+	// 跌破 MA20」）。模型输出的预测性声明（非数据事实，输出合法），服务端归一收集进
+	// 结论级 claim（llm_claims.go）。止损价是价格失效线，这里是形态/逻辑失效声明，互补。
+	Invalidators []string `json:"invalidators,omitempty"`
 
 	// --- 服务端回填（非 LLM 输出）---
 	RRRatio    float64         `json:"rr_ratio,omitempty"`         // 盈亏比 =(目标-区间中值)/(区间中值-止损)
@@ -53,10 +57,11 @@ const tradePlanSystem = `你是一名严谨的交易计划员，基于另一位�
 2. 硬纪律（违反会被程序拒绝）：止损价必须低于现价；止损价必须低于买入区间下沿；目标价必须高于买入区间上沿与现价；买入区间下沿不高于上沿。
 3. horizon_days 为预期持有周期（交易日，1~120）：短线思路 3~20，波段 20~60，依据分析结论选择。
 4. checklist 为买入前逐项核对的操作清单，每项都应是可观察、可执行的核对条件，如「竞价高开超 5% 放弃按区间挂单」「跌破买入区间下沿当日不接刀」。
-5. 若分析评级为偏空(bearish)、风险闸门标注禁止买入、或数据不足以定出可靠价位，只输出 {"no_plan": true, "no_plan_reason": "无法给出计划的原因"}。
-只输出一个 JSON 对象，不要任何解释或代码块标记，字段：no_plan(可省)、no_plan_reason(可省)、buy_low、buy_high、target_price、stop_price、horizon_days(整数)、plan_note(计划思路)、checklist(字符串数组)。`
+5. invalidators 为计划失效条件（字符串数组）：出现什么可观察信号说明本计划的前提已不成立、应放弃或重估（如「放量跌破 MA20」「大盘转入普跌」）。与止损价互补：止损是价格纪律，失效条件是形态/逻辑层面的作废声明；只能基于快照中存在的指标表述，不得引用快照外数据。
+6. 若分析评级为偏空(bearish)、风险闸门标注禁止买入、或数据不足以定出可靠价位，只输出 {"no_plan": true, "no_plan_reason": "无法给出计划的原因"}。
+只输出一个 JSON 对象，不要任何解释或代码块标记，字段：no_plan(可省)、no_plan_reason(可省)、buy_low、buy_high、target_price、stop_price、horizon_days(整数)、plan_note(计划思路)、checklist(字符串数组)、invalidators(字符串数组，计划失效条件)。`
 
-const tradePlanRepairHint = `请只输出一个合法 JSON 对象：{"buy_low":数字,"buy_high":数字,"target_price":数字,"stop_price":数字,"horizon_days":整数,"plan_note":"计划思路","checklist":["可观察、可执行的核对条件"]}，且满足 止损价<现价、止损价<buy_low、target_price>buy_high；或 {"no_plan":true,"no_plan_reason":"无法给出计划的原因"}。不要任何解释或代码块标记。`
+const tradePlanRepairHint = `请只输出一个合法 JSON 对象：{"buy_low":数字,"buy_high":数字,"target_price":数字,"stop_price":数字,"horizon_days":整数,"plan_note":"计划思路","checklist":["可观察、可执行的核对条件"],"invalidators":["计划失效条件"]}，且满足 止损价<现价、止损价<buy_low、target_price>buy_high；或 {"no_plan":true,"no_plan_reason":"无法给出计划的原因"}。不要任何解释或代码块标记。`
 
 // attachTradePlan 为一份成功的个股标准分析追加交易计划（就地写 result.TradePlan），
 // 返回本次消耗的 token 与计划 run 元数据（确定性拒绝零调用时为 nil）。仅 stock+标准模式+
@@ -103,7 +108,8 @@ func (s *AnalysisService) attachTradePlan(ctx context.Context, userID int64, cfg
 		{Role: "user", Content: fmt.Sprintf("现价：%.2f\n\n【数据快照】（JSON）：\n%s\n\n【分析结论】（JSON）：\n%s",
 			px, string(snapJSON), string(resJSON))},
 	}
-	run := newLLMRun(traceID, parentRunID, "trade_plan", "trade_plan.v1", analysisPromptVersion)
+	// P1-2：schema v2 = 输出新增 invalidators（计划失效条件）字段。
+	run := newLLMRun(traceID, parentRunID, "trade_plan", "trade_plan.v2", analysisPromptVersion)
 	run.hashData(string(snapJSON))
 
 	var plan *tradePlan
@@ -149,6 +155,9 @@ func (s *AnalysisService) attachTradePlan(ctx context.Context, userID int64, cfg
 	for i, c := range plan.Checklist {
 		plan.Checklist[i] = truncateRunes(strings.TrimSpace(c), 120)
 	}
+	// P1-2：失效条件归一（去空/截长/限条数，与 claim 层同口径）。模型未输出如实为空
+	// ——不硬造；claim 的 invalidators 随之为空，前端如实展示。
+	plan.Invalidators = normalizeInvalidators(plan.Invalidators)
 
 	pos := computePositionAdvice(closesFromSnapshot(snapshot), <-breadthCh)
 	applyPlanDiscipline(plan, pos)

@@ -33,7 +33,7 @@ func NewRecommendationService(market *MarketService, watchlist *WatchlistService
 }
 
 const (
-	recPromptVersion   = "p12" // p12: 移除推荐与推荐复核输出字段的字数/条数限制；p11: 输出瘦身（reason/risks/evidence 条数与单条字数上限、落选理由 ≤20 字）+ LLM 名单 16→10；p10: M3b 盘中因子字段说明（尾盘涨幅/量占比/早盘/VWAP）；p9: M3a 龙虎榜/机构/人气榜/主力资金流字段说明；p8: F2 长线名单新增 fin 财务摘要（ROE/营收净利增速/毛利率）字段说明、longTermSpec 撤「缺财务明细」声明；p7: T1 技术指标与筹码字段说明；p6: senti 消息面字段；p5: 来源随策略组合；p4: 四阶段流水线；p3: 落选理由；p2: 估值富化
+	recPromptVersion   = "p13" // p13: P1-2 长线 pick 新增 invalidation 失效条件字段（短线既有；schema recommendation.v2）；p12: 移除推荐与推荐复核输出字段的字数/条数限制；p11: 输出瘦身（reason/risks/evidence 条数与单条字数上限、落选理由 ≤20 字）+ LLM 名单 16→10；p10: M3b 盘中因子字段说明（尾盘涨幅/量占比/早盘/VWAP）；p9: M3a 龙虎榜/机构/人气榜/主力资金流字段说明；p8: F2 长线名单新增 fin 财务摘要（ROE/营收净利增速/毛利率）字段说明、longTermSpec 撤「缺财务明细」声明；p7: T1 技术指标与筹码字段说明；p6: senti 消息面字段；p5: 来源随策略组合；p4: 四阶段流水线；p3: 落选理由；p2: 估值富化
 	recStrategyVersion = "s9"  // s9: S1-3 名单去相关（相关性去重+同行业≤2 只，被挤出者记反事实事件）；s8: M3b 盘中因子短线加分项（尾盘放量拉升/跳水/收盘vs VWAP/午后重心上移/早盘强势）；s7: M3a 龙虎榜净买/机构席位/人气跃升/主力连续净流入加分项 + 量能维融合主力资金分；s6: F2 财务加分项（value ROE/growth 双增速/leader 盈利质量 + 业绩恶化通用扣分）；s5: T1 指标加分项 + 筹码超跌 + 五维动量/风险维升级；s4: 消息面情绪因子；s3: 策略-来源映射 + 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
 	maxScanCandidates  = 48    // 进入量化评分的候选上限（约束日线拉取量：48 只 × 1 次 HTTP，并发 6 约 3~8s）
 	maxLLMCandidates   = 10    // 量化排序后进入 LLM 精选的名单上限（2026-07-14 16→10：上游 60s 整包超时下压输入与落选理由输出量；控上下文与位置偏差面）
@@ -594,7 +594,8 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 
 	// P0-2 调用关联：主调一个 run（repair 同 run 按 attempt 区分），复核/反方派生 run
 	// 回指主调；manifest 数组随批次落库，llm_call_logs 凭 batch.TraceID 双向可查。
-	mainRun := newLLMRun(batch.TraceID, "", "recommendation", "recommendation.v1", batch.PromptVersion)
+	// P1-2：schema v2 = 长线 pick 新增 invalidation 失效条件字段（短线既有）。
+	mainRun := newLLMRun(batch.TraceID, "", "recommendation", "recommendation.v2", batch.PromptVersion)
 	mainRun.hashData(string(llmInput))
 	var rvRun, bearRun *llmRun
 	fillBatchRunMeta := func() {
@@ -721,6 +722,9 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 				markValueOrigin(labeledVals("筛选阈值", filters.PriceMin, filters.PriceMax, filters.MaxGain5dPct,
 					filters.TurnoverMin, filters.TurnoverMax, filters.FloatCapMinYi, filters.FloatCapMaxYi), "user")...,
 			)...)
+		// ev5（P1-2）：每条推荐升格为结论级 claim（text=长线 thesis/短线首条理由、
+		// 失效条件=invalidation、evidence_ids 从本条 evidence 核验命中程序推导）。
+		picks[i].EvidenceCheck.Claims = deriveClaims(picks[i].EvidenceCheck, []claimSpec{recPickClaimSpec(picks[i])})
 		if picks[i].DegradedSource != "" {
 			// 量化降级条目：核验照跑（证明引用数字真实），但置信度必须如实标 low——
 			// AI 未参与，「核验全绿」不等于研究结论可信。
@@ -2450,6 +2454,7 @@ const longTermSpec = `本次为【长线推荐】。名单含实时行情、估�
 - thesis: 基本面/投资逻辑（只能基于名单给出的估值水位与 fin 财务摘要，不得虚构行业对比或未提供的财务明细）
 - valuation_low / valuation_high: 合理估值区间（若估值数据缺失无法给出可填 0 并在 thesis 说明）
 - key_metrics: 字符串数组，需持续跟踪的关键指标（如营收增速、毛利率、市占率）
+- invalidation: 失效条件——出现什么可观察信号说明本条投资逻辑已不成立（如"净利同比连续两期转负""跌破长期趋势线且缩量无承接"）；只能基于名单给出的数据维度表述
 - review_cycle: 复盘周期（如"每季度财报后"）
 - disclaimer: 风险与免责提示`
 

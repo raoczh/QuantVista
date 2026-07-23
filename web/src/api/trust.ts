@@ -35,6 +35,17 @@ export interface EvidenceKeySection {
   snapshot_matched: number
 }
 
+// ev5（P1-2）：结论级声明——关键结论升格为可追踪对象。evidence_ids/status 由服务端
+// 从核验明细程序推导（非模型自报）；invalidators 为模型声明的失效条件（程序归一收集）。
+export interface LlmClaim {
+  claim_id: string
+  section: string
+  text: string
+  evidence_ids?: string[]
+  status: 'resolved' | 'unresolved' | 'contradictory'
+  invalidators?: string[]
+}
+
 // 证据数字核验结果（服务端程序化比对 LLM 引用的数字与数据快照）。
 // ev3 起 matched 拆分来源：snapshot_matched 才是「被数据快照佐证」；plan/user/context
 // 命中只是合法复述（模型计划价/用户输入/上下文文本），展示时不得混称「快照命中」。
@@ -54,6 +65,7 @@ export interface EvidenceCheck {
   context_matched?: number // 上下文文本（新闻/公告标题、提醒文案）复述
   unknowns?: EvidenceUnknown[]
   key_section?: EvidenceKeySection
+  claims?: LlmClaim[] // ev5：结论级声明（旧记录无此字段）
 }
 
 // AI 复核结论（verify 模式；symbol 仅推荐域按标的复核时使用）。

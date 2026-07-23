@@ -60,6 +60,20 @@ const evKeyUnbacked = computed(() => {
   const ks = ev.value?.key_section
   return !!ks && ks.total > 0 && ks.snapshot_matched === 0
 })
+// ev5（P1-2）：结论级 claims（旧记录无此字段兜底空）。contradictory 是最强告警——
+// 结论引用的数字与快照方向相反。
+const evClaims = computed(() => ev.value?.claims || [])
+const evHasContradictory = computed(() => evClaims.value.some((c) => c.status === 'contradictory'))
+const CLAIM_STATUS_LABEL: Record<string, string> = {
+  resolved: '已被快照佐证',
+  unresolved: '未被快照佐证',
+  contradictory: '与快照矛盾',
+}
+function claimStatusColor(s: string) {
+  if (s === 'resolved') return upColor.value
+  if (s === 'contradictory') return downColor.value
+  return flatColor.value
+}
 const detailShow = ref(false)
 function openDetail() {
   if (evHasItems.value) detailShow.value = true
@@ -132,6 +146,8 @@ const hasAny = computed(
           >⚠ 本次命中全部为合法复述（AI 计划价/用户输入/上下文），没有任何数字被数据快照佐证，请勿当作「已被数据证明」。</template
         ><template v-if="evKeyUnbacked"
           >⚠ 关键结论（{{ ev?.key_section?.module }}）中的数字无一被数据快照佐证。</template
+        ><template v-if="evHasContradictory"
+          >⚠ 存在与快照方向矛盾的结论（见明细「结论追踪」）。</template
         ><template v-if="evUnknowns.length"
           >本次数据快照有 {{ evUnknowns.length }} 个缺失数据段（见明细「数据缺口」）。</template
         ><template v-if="ev.skipped_count"
@@ -233,6 +249,37 @@ const hasAny = computed(
               <template v-else-if="!it.origin"> · 数据快照佐证</template>
             </div>
             <div v-if="it.sentence" class="ev-sent">「{{ it.sentence }}」</div>
+          </div>
+        </n-collapse-item>
+        <n-collapse-item
+          v-if="evClaims.length"
+          :title="`结论追踪 ${evClaims.length} 项${evHasContradictory ? '（含与快照矛盾项）' : ''}`"
+          name="claims"
+        >
+          <div v-for="c in evClaims" :key="c.claim_id" class="ev-item">
+            <div class="ev-line">
+              <span class="ev-id">{{ c.claim_id }}</span>
+              <span class="ev-mod">{{ c.section }}</span>
+              <span
+                class="ev-origin"
+                :style="{ color: claimStatusColor(c.status), borderColor: withAlpha(claimStatusColor(c.status), 0.5) }"
+                >{{ CLAIM_STATUS_LABEL[c.status] || c.status }}</span
+              >
+            </div>
+            <div class="ev-sent">「{{ c.text }}」</div>
+            <div v-if="c.evidence_ids?.length" class="ev-match">
+              佐证证据：<span v-for="id in c.evidence_ids" :key="id" class="ev-id" style="margin-right: 4px">{{
+                id
+              }}</span
+              >（见「已吻合」明细同 ID 项）
+            </div>
+            <div v-if="c.invalidators?.length" class="ev-reason">
+              失效条件：{{ c.invalidators.join('；') }}
+            </div>
+          </div>
+          <div class="ev-reason" style="margin-top: 6px">
+            结论级追踪：claim 与证据 ID 的关联由程序从核验明细推导（非 AI
+            自报）。「未被快照佐证」不是错误——定性结论可以没有数字；「与快照矛盾」表示该段引用数字与快照方向相反，请谨慎对待。
           </div>
         </n-collapse-item>
         <n-collapse-item

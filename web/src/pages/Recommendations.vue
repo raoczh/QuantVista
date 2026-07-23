@@ -1248,7 +1248,8 @@ function qgFieldLabels(fields?: string[]): string {
                         <n-tag v-for="(m, i) in it.detail.key_metrics" :key="i" size="small" :bordered="false" round>{{ m }}</n-tag>
                       </div>
                     </div>
-                    <div v-if="current.type === 'short_term' && it.detail.invalidation" class="invalid">
+                    <!-- P1-2：失效条件短线/长线都展示（长线 p13 起要求模型输出投资逻辑作废信号） -->
+                    <div v-if="it.detail.invalidation" class="invalid">
                       失效条件：{{ it.detail.invalidation }}
                     </div>
                     <!-- S1-4 执行纪律三条（固定展示：截住「推荐胜率」与「用户执行」的偏差） -->

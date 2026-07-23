@@ -831,6 +831,9 @@ func dailyReviewEvidence(rv *dailyReview, snap *reportSnapshot) *evidenceCheck {
 	// ev4（P0-3）：关键结论段（总结）快照佐证计数（复盘快照无 builder 级 unknowns，
 	// 数据缺口由 data_deficiencies 水位纪律承担，见 reportDataDeficiencies）。
 	markKeySection(check, "总结")
+	// ev5（P1-2）：总结与明日计划升格为结论级 claims（evidence_ids/status 程序推导；
+	// 日报 schema 无失效条件字段，invalidators 如实为空）。
+	check.Claims = deriveClaims(check, dailyClaimSpecs(rv))
 	return check
 }
 

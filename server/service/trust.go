@@ -102,7 +102,8 @@ var evidenceUpWords = []string{"上涨", "涨至", "突破", "净流入", "流�
 //     且与快照值符号一致时允许，否则记 direction_mismatch（取消旧的无条件绝对值匹配）；
 //   - items 上限 50（Truncated 标记），Unmatched（legacy）保留 ≤10 供旧前端兼容。
 func verifyEvidenceLabeled(sections []evidenceSection, vals []labeledValue) *evidenceCheck {
-	check := &evidenceCheck{Version: "ev4"}
+	// ev5：P1-2 起 evidenceCheck 携带结论级 claims（deriveClaims 由调用方按模块结论段挂载）。
+	check := &evidenceCheck{Version: "ev5"}
 	type key struct {
 		v    float64
 		unit string
@@ -236,8 +237,8 @@ func markKeySection(check *evidenceCheck, module string) {
 // 快照来源（Origin 空）优先于 plan/user 来源：同一数字既在快照又在计划价中时按「被数据
 // 佐证」记，避免把有数据支撑的引用错标成「模型自述」。
 func matchLabeled(it *evidenceItem, cands []float64, dir string, vals []labeledValue) {
-	var oppo *labeledValue     // 仅差符号的候选（用于 direction_mismatch 说明）
-	var nonSnap *labeledValue  // 首个命中的非快照来源候选（快照候选未命中时回退）
+	var oppo *labeledValue    // 仅差符号的候选（用于 direction_mismatch 说明）
+	var nonSnap *labeledValue // 首个命中的非快照来源候选（快照候选未命中时回退）
 	fill := func(v labeledValue, tol float64) {
 		it.Matched = true
 		it.Path = v.Path
@@ -578,6 +579,7 @@ func snapshotUnknownItems(snap map[string]any) []evidenceUnknown {
 //     命中是「合法复述」不是数据支撑，从升档分母剔除——「引用的数字全是模型自己的计划价，
 //     核验全绿」不得升档（快照佐证为 0 时升档=复述冒充证明）。
 //   - 降档仍看总命中率：matched/total < 0.4（未命中才是疑似幻觉，与命中来源无关）。
+//
 // 返回 delta（-1/0/+1）与人话理由。
 func evidenceConfidenceSignal(ev *evidenceCheck) (int, string) {
 	if ev == nil || ev.Total == 0 {

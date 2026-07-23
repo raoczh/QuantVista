@@ -36,18 +36,18 @@ type candFactors struct {
 
 	// T1 经典指标（indicator.go 口径：RSI/ATR Wilder 平滑、MACD 柱 2 倍、BOLL 2σ）。
 	// 全部 omitempty：样本不足时缺席，LLM/前端见不到即不会引用。
-	RSI14     float64 `json:"rsi_14,omitempty"`
-	MACDDif   float64 `json:"macd_dif,omitempty"`
-	MACDDea   float64 `json:"macd_dea,omitempty"`
-	MACDHist  float64 `json:"macd_hist,omitempty"`     // 2×(DIF−DEA) A 股柱口径
-	MACDGold  bool    `json:"macd_gold,omitempty"`     // DIF>DEA 多头状态
-	MACDXUp   bool    `json:"macd_cross_up,omitempty"` // 近 3 日 DIF 上穿 DEA（金叉）
-	BollUp    float64 `json:"boll_up,omitempty"`
-	BollMid   float64 `json:"boll_mid,omitempty"`
-	BollLow   float64 `json:"boll_low,omitempty"`
-	BollPos   float64 `json:"boll_pos,omitempty"` // 带内位置 %（<0 破下轨、>100 破上轨）
-	ATR14     float64 `json:"atr_14,omitempty"`
-	ATRPct    float64 `json:"atr_pct,omitempty"` // ATR/现价 %
+	RSI14    float64 `json:"rsi_14,omitempty"`
+	MACDDif  float64 `json:"macd_dif,omitempty"`
+	MACDDea  float64 `json:"macd_dea,omitempty"`
+	MACDHist float64 `json:"macd_hist,omitempty"`     // 2×(DIF−DEA) A 股柱口径
+	MACDGold bool    `json:"macd_gold,omitempty"`     // DIF>DEA 多头状态
+	MACDXUp  bool    `json:"macd_cross_up,omitempty"` // 近 3 日 DIF 上穿 DEA（金叉）
+	BollUp   float64 `json:"boll_up,omitempty"`
+	BollMid  float64 `json:"boll_mid,omitempty"`
+	BollLow  float64 `json:"boll_low,omitempty"`
+	BollPos  float64 `json:"boll_pos,omitempty"` // 带内位置 %（<0 破下轨、>100 破上轨）
+	ATR14    float64 `json:"atr_14,omitempty"`
+	ATRPct   float64 `json:"atr_pct,omitempty"` // ATR/现价 %
 
 	// T1 筹码分布（chip.go 三角衰减模型，需 210 根日线；ChipBars=0 表示未算/不足）。
 	ChipProfit  float64 `json:"chip_profit,omitempty"`   // 获利盘 %（收盘价下方筹码占比）
@@ -55,7 +55,7 @@ type candFactors struct {
 	ChipBars    int     `json:"chip_bars,omitempty"`     // 参与筹码计算的日线根数
 
 	// M3a 主力资金流因子（fund_flow_daily 缓存派生；缺失=资金流数据暂不可得）。
-	MainNetDays int     `json:"main_net_days,omitempty"` // 连续净流入天数（负=连续净流出）
+	MainNetDays int     `json:"main_net_days,omitempty"`  // 连续净流入天数（负=连续净流出）
 	MainNet5dYi float64 `json:"main_net_5d_yi,omitempty"` // 近 5 日主力净额（亿元）
 
 	// M3b 盘中因子（腾讯 5 分钟线盘后聚合；T-1 信号——最近一个已同步交易日的
@@ -496,14 +496,20 @@ type evidenceCheck struct {
 	Truncated      bool           `json:"truncated,omitempty"`       // items 是否被截断至 50
 	Items          []evidenceItem `json:"items,omitempty"`           // 逐项明细
 
-	SnapshotMatched int `json:"snapshot_matched"`           // 被数据快照佐证的个数（origin 空）
-	PlanMatched     int `json:"plan_matched,omitempty"`     // 命中模型自身计划价/公式输出（复述，非快照佐证）
-	UserMatched     int `json:"user_matched,omitempty"`     // 命中用户输入/设定阈值（复述，非快照佐证）
-	ContextMatched  int `json:"context_matched,omitempty"`  // 命中新闻/公告标题、提醒文案等上下文文本
+	SnapshotMatched int `json:"snapshot_matched"`          // 被数据快照佐证的个数（origin 空）
+	PlanMatched     int `json:"plan_matched,omitempty"`    // 命中模型自身计划价/公式输出（复述，非快照佐证）
+	UserMatched     int `json:"user_matched,omitempty"`    // 命中用户输入/设定阈值（复述，非快照佐证）
+	ContextMatched  int `json:"context_matched,omitempty"` // 命中新闻/公告标题、提醒文案等上下文文本
 
 	// ev4（P0-3 字段路径证据链）：结构化数据缺口与关键结论段证据覆盖。
 	Unknowns   []evidenceUnknown   `json:"unknowns,omitempty"`    // 快照 builder 声明的缺失数据段（field_path/reason/impact）
 	KeySection *evidenceKeySection `json:"key_section,omitempty"` // 关键结论段（总结/回答/AI点评）的快照佐证计数
+
+	// ev5（P1-2 claim/evidence/invalidator）：结论级声明——关键结论段升格为可追踪对象，
+	// evidence_ids 程序推导（禁模型自报）、status 可标记 resolved/unresolved/contradictory、
+	// invalidators 收集模型声明的失效条件。deriveClaims（llm_claims.go）在各模块信任层
+	// 回填时挂载；旧记录无该字段，前端 v-if 兜底。
+	Claims []llmClaim `json:"claims,omitempty"`
 }
 
 var evidenceNumRe = regexp.MustCompile(`[-+]?\d+(?:\.\d+)?`)

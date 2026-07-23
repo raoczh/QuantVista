@@ -839,6 +839,12 @@ onMounted(async () => {
                       <li v-for="(c, i) in current.result.trade_plan.checklist" :key="i">{{ c }}</li>
                     </ul>
                   </div>
+                  <div v-if="current.result.trade_plan.invalidators?.length" class="plan-checklist">
+                    <div class="pc-label" :style="{ color: vars.warningColor }">计划失效条件（出现即放弃或重估本计划）</div>
+                    <ul>
+                      <li v-for="(c, i) in current.result.trade_plan.invalidators" :key="i">{{ c }}</li>
+                    </ul>
+                  </div>
                 </div>
                 <div v-else-if="current.result.trade_plan?.no_plan" class="block">
                   <div class="block-title">交易计划</div>
