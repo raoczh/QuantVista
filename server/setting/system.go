@@ -29,6 +29,8 @@ const (
 	keyLLMEvidenceRefs    = "llm_evidence_refs"
 	keyLLMSemanticValid   = "llm_semantic_validator"
 	keyLLMCapRouting      = "llm_capability_routing"
+	keyLLMDebate          = "llm_conditional_debate"
+	keyLLMReflection      = "llm_reflection_shadow"
 )
 
 // 新闻快讯采集间隔（分钟）的默认值与钳制范围：下限防打爆免费上游，上限防配成"实际不采集"。
@@ -65,6 +67,12 @@ var (
 	// P0-5 能力矩阵声明化路由（model_capabilities.go）：已声明/观察到不支持 json_object
 	// 的目标直接按 free_text 请求。默认开；关闭回退隐式回落旧路径（能力观察仍照常记录）。
 	llmCapabilityRouting = true
+	// P1-3 条件式独立 bull/bear/judge 辩论（analysis_debate.go）：仅低置信度/证据冲突/
+	// 风险闸门临界的个股标准分析触发（高置信默认单路零额外成本）。默认开；关闭回退单路。
+	llmConditionalDebate = true
+	// P1-5 反思记忆影子层（recreflect.go）：成熟标签 ≥30 后 LLM 反思生成 + 推荐生成时
+	// 影子检索（不注入 prompt 不改写结果）。默认开；关闭停止生成与检索（已落库反思保留）。
+	llmReflectionShadow = true
 )
 
 // Init 从 DB 加载系统配置；首启时若 DB 缺 GitHub 凭证而 env 提供了，则种子回填到 DB。
@@ -137,6 +145,8 @@ func apply(opts map[string]string) {
 	llmEvidenceRefs = opts[keyLLMEvidenceRefs] != "false"
 	llmSemanticValidator = opts[keyLLMSemanticValid] != "false"
 	llmCapabilityRouting = opts[keyLLMCapRouting] != "false"
+	llmConditionalDebate = opts[keyLLMDebate] != "false"
+	llmReflectionShadow = opts[keyLLMReflection] != "false"
 }
 
 // normalizeSiteBaseURL 去空白与尾部斜杠（拼路由时统一 base+/path 形态）。
@@ -202,6 +212,13 @@ func LLMSemanticValidator() bool { mu.RLock(); defer mu.RUnlock(); return llmSem
 // LLMCapabilityRouting P0-5 能力矩阵声明化路由开关（仅控制「按声明/观察直接降 free_text」
 // 的路由决策；四处隐式回落点与能力观察记录不受此开关影响）。
 func LLMCapabilityRouting() bool { mu.RLock(); defer mu.RUnlock(); return llmCapabilityRouting }
+
+// LLMConditionalDebate P1-3 条件式辩论开关（仅控制触发判定；主分析单路链路不受影响）。
+func LLMConditionalDebate() bool { mu.RLock(); defer mu.RUnlock(); return llmConditionalDebate }
+
+// LLMReflectionShadow P1-5 反思记忆影子层开关（反思生成 job 与推荐生成时的影子检索；
+// 关闭不删除已落库反思，重开即恢复）。
+func LLMReflectionShadow() bool { mu.RLock(); defer mu.RUnlock(); return llmReflectionShadow }
 
 // ---- 写入（持久化 + 刷新内存）----
 
@@ -274,6 +291,28 @@ func SetLLMCapabilityRouting(v bool) error {
 	}
 	mu.Lock()
 	llmCapabilityRouting = v
+	mu.Unlock()
+	return nil
+}
+
+// SetLLMConditionalDebate 设置 P1-3 条件式辩论开关。
+func SetLLMConditionalDebate(v bool) error {
+	if err := model.UpsertOption(keyLLMDebate, strconv.FormatBool(v)); err != nil {
+		return err
+	}
+	mu.Lock()
+	llmConditionalDebate = v
+	mu.Unlock()
+	return nil
+}
+
+// SetLLMReflectionShadow 设置 P1-5 反思记忆影子层开关。
+func SetLLMReflectionShadow(v bool) error {
+	if err := model.UpsertOption(keyLLMReflection, strconv.FormatBool(v)); err != nil {
+		return err
+	}
+	mu.Lock()
+	llmReflectionShadow = v
 	mu.Unlock()
 	return nil
 }

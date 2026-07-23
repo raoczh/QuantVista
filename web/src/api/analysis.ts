@@ -37,6 +37,7 @@ export interface AnalysisResult {
   sys_confidence_why?: string
   review?: TrustReview
   trade_plan?: TradePlan // M3c 交易员阶段（个股标准模式）
+  debate?: DebateResult // P1-3 条件式 bull/bear/judge 辩论（触发条件命中才有）
 }
 
 // 量化仓位建议（纯 Go 公式，可复现）：仓位% = 100×clip(2.5/vol20,0.3,1.0)×择时系数。
@@ -64,6 +65,41 @@ export interface TradePlan {
   rr_ratio?: number // 盈亏比（服务端计算）
   position?: PositionAdvice
   discipline_notes?: string[] // 纪律校验说明（盈亏比不足降仓等）
+}
+
+// P1-3 条件式独立 bull/bear/judge 辩论（低置信/证据冲突/风险闸门临界触发；服务端回填）。
+// 附加复核不改写主结果：judge verdict 与主评级并列展示，方向相反时程序置信度已压 low。
+export interface DebateClaim {
+  id: string // bu-01… / be-01…（程序重编号）
+  text: string
+  evidence_ids?: string[] // 引用核验证据白名单（程序校验，越界已剥除）
+  invalidator?: string
+  confirmed?: boolean // 仅 bear：true=数据已证实风险 / false=假设性风险
+}
+export interface DebateChallenge {
+  claim_id: string
+  text: string
+}
+export interface DebateJudge {
+  verdict: AnalysisRating
+  decisive_claim_ids?: string[]
+  rejected_claim_ids?: string[]
+  unresolved_claim_ids?: string[]
+  confidence_reason?: string
+  invalidators?: string[]
+  conflict_note?: string
+}
+export interface DebateResult {
+  triggered: boolean
+  trigger_reasons: string[] // low_confidence / contradictory_claims / risk_gate_borderline
+  rounds: number
+  bull?: DebateClaim[]
+  bear?: DebateClaim[]
+  challenges?: DebateChallenge[]
+  rebuttals?: DebateChallenge[]
+  judge?: DebateJudge
+  degraded_reason?: string // bull_failed / bear_failed / judge_failed / judge_invalid
+  version: string
 }
 
 // 多角色观点（mode=panel）。

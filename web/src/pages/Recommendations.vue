@@ -47,6 +47,7 @@ import {
   type RecFilters,
   type PoolCandidate,
   type RecCoverageDiag,
+  type ReflectionMatch,
 } from '@/api/recommendation'
 import { getPreference, updatePreference, type UserPreference } from '@/api/user'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
@@ -542,6 +543,23 @@ const regimeSignals = computed<string[]>(() => {
   }
 })
 
+// ---------- P1-5 反思记忆影子（详情接口 reflection_json） ----------
+// 影子纪律：教训只记录展示，未注入 prompt、不影响本批结果（tag 与 tooltip 均如实声明）。
+const reflectionMatches = computed<ReflectionMatch[]>(() => {
+  const raw = current.value?.reflection_json
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw) as { matched?: ReflectionMatch[] }
+    return Array.isArray(parsed.matched) ? parsed.matched : []
+  } catch {
+    return []
+  }
+})
+function reflectionOutcomeLabel(o: string): string {
+  const names: Record<string, string> = { win: '盈利', loss: '亏损', take_profit: '止盈', stop_loss: '止损' }
+  return names[o] || o
+}
+
 // ---------- P1-1 AI 输出 coverage/越池诊断（llm_run_json 推荐主调 run） ----------
 // 程序化计数：越池/乱码/重复条目服务端已剥除，这里让「剥除」可见（观测非门控）。
 const coverageDiag = computed<RecCoverageDiag | null>(() => {
@@ -986,6 +1004,20 @@ function qgFieldLabels(fields?: string[]): string {
                     <div v-for="(s, i) in coverageTipLines" :key="i">{{ s }}</div>
                     <div class="regime-tip-note">
                       越池/无法识别的标的已被程序剥除，不进入展示与追踪；本诊断为观测记录（不改变推荐行为），完整数据随批次运行元数据落库。
+                    </div>
+                  </div>
+                </n-tooltip>
+                <!-- P1-5 反思记忆影子：本批生成时检索到的适用历史教训（未注入 prompt 不影响结果） -->
+                <n-tooltip v-if="reflectionMatches.length" trigger="hover" placement="bottom">
+                  <template #trigger>
+                    <n-tag size="small" round :bordered="false" type="default">反思记忆（影子）× {{ reflectionMatches.length }}</n-tag>
+                  </template>
+                  <div class="regime-tip">
+                    <div v-for="m in reflectionMatches" :key="m.id">
+                      #{{ m.id }} {{ m.symbol }}（{{ reflectionOutcomeLabel(m.outcome) }} {{ m.return_pct > 0 ? '+' : '' }}{{ m.return_pct.toFixed(1) }}%·{{ m.matched_by === 'symbol' ? '同标的' : '同策略' }}）：{{ m.lesson }}
+                    </div>
+                    <div class="regime-tip-note">
+                      影子层：历史教训仅记录，未注入提示词、不影响本批推荐结果；注入转正需影子配对评审。
                     </div>
                   </div>
                 </n-tooltip>

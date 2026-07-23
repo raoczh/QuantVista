@@ -330,6 +330,42 @@ function reviewAlertType(v: string): 'success' | 'warning' | 'error' {
   return 'warning'
 }
 
+// P1-3 条件式辩论展示辅助。
+function debateTriggerLabel(r: string): string {
+  const names: Record<string, string> = {
+    low_confidence: '低置信度',
+    contradictory_claims: '结论与数据矛盾',
+    risk_gate_borderline: '风险临界',
+  }
+  return names[r] || r
+}
+function debateDegradedLabel(r: string): string {
+  const names: Record<string, string> = {
+    bull_failed: '看多方生成失败',
+    bear_failed: '看空方生成失败',
+    judge_failed: '裁判调用失败',
+    judge_invalid: '裁判输出不合格',
+  }
+  return names[r] || r
+}
+// 被裁判否定/采信的论点标记（decisive=★ / rejected=✕ 置灰）。
+function debateClaimRejected(id: string): boolean {
+  return !!current.value?.result?.debate?.judge?.rejected_claim_ids?.includes(id)
+}
+function debateClaimMark(id: string): string {
+  const j = current.value?.result?.debate?.judge
+  if (!j) return ''
+  if (j.decisive_claim_ids?.includes(id)) return '★'
+  if (j.rejected_claim_ids?.includes(id)) return '✕'
+  return ''
+}
+const debateOppositeMain = computed(() => {
+  const r = current.value?.result
+  const v = r?.debate?.judge?.verdict
+  if (!r || !v) return false
+  return (r.rating === 'bullish' && v === 'bearish') || (r.rating === 'bearish' && v === 'bullish')
+})
+
 // ---------- 数据快照透明面板（Get 已回传 data_snapshot） ----------
 const snapshotShow = ref(false)
 const snapshotText = computed(() => {
@@ -850,6 +886,82 @@ onMounted(async () => {
                   <div class="block-title">交易计划</div>
                   <p class="panel-text">未生成：{{ current.result.trade_plan.no_plan_reason }}</p>
                 </div>
+
+                <!-- P1-3 条件式多空辩论（触发条件命中才有；附加复核不改写主结论） -->
+                <div v-if="current.result.debate?.triggered" class="block debate-block">
+                  <div class="block-title">
+                    多空辩论复核
+                    <n-tag v-for="r in current.result.debate.trigger_reasons" :key="r" size="tiny" type="warning" :bordered="false" style="margin-left: 6px">
+                      {{ debateTriggerLabel(r) }}
+                    </n-tag>
+                    <n-tooltip trigger="hover" placement="top">
+                      <template #trigger>
+                        <span class="debate-hint">条件式</span>
+                      </template>
+                      仅在低置信度、结论与数据矛盾或风险闸门临界时触发的独立看多/看空/裁判三角色复核；结论与主分析并列展示，不改写主评级。
+                    </n-tooltip>
+                  </div>
+                  <p v-if="current.result.debate.degraded_reason && !current.result.debate.judge" class="panel-text" :style="{ color: vars.warningColor }">
+                    辩论未完成（{{ debateDegradedLabel(current.result.debate.degraded_reason) }}），以上单路分析结果不受影响。
+                  </p>
+                  <template v-if="current.result.debate.bull?.length || current.result.debate.bear?.length">
+                    <div class="debate-sides">
+                      <div class="debate-side">
+                        <div class="ds-head" :style="{ color: upColor }">看多方</div>
+                        <div v-for="c in current.result.debate.bull" :key="c.id" class="ds-claim" :class="{ 'ds-rejected': debateClaimRejected(c.id) }">
+                          <span class="ds-id">{{ c.id }}</span>
+                          <span class="ds-mark" v-if="debateClaimMark(c.id)">{{ debateClaimMark(c.id) }}</span>
+                          {{ c.text }}
+                          <div v-if="c.evidence_ids?.length" class="ds-ev">证据：{{ c.evidence_ids.join('、') }}</div>
+                          <div v-if="c.invalidator" class="ds-inv">失效条件：{{ c.invalidator }}</div>
+                        </div>
+                      </div>
+                      <div class="debate-side">
+                        <div class="ds-head" :style="{ color: downColor }">看空方</div>
+                        <div v-for="c in current.result.debate.bear" :key="c.id" class="ds-claim" :class="{ 'ds-rejected': debateClaimRejected(c.id) }">
+                          <span class="ds-id">{{ c.id }}</span>
+                          <span class="ds-mark" v-if="debateClaimMark(c.id)">{{ debateClaimMark(c.id) }}</span>
+                          <n-tag v-if="c.confirmed === false" size="tiny" :bordered="false" style="margin-right: 4px">假设风险</n-tag>
+                          {{ c.text }}
+                          <div v-if="c.evidence_ids?.length" class="ds-ev">证据：{{ c.evidence_ids.join('、') }}</div>
+                          <div v-if="c.invalidator" class="ds-inv">推翻条件：{{ c.invalidator }}</div>
+                        </div>
+                      </div>
+                    </div>
+                    <div v-if="current.result.debate.challenges?.length || current.result.debate.rebuttals?.length" class="debate-cross">
+                      <div v-for="(ch, i) in current.result.debate.challenges" :key="'c' + i" class="dc-row">
+                        <span :style="{ color: downColor }">空⇒{{ ch.claim_id }}</span>：{{ ch.text }}
+                      </div>
+                      <div v-for="(rb, i) in current.result.debate.rebuttals" :key="'r' + i" class="dc-row">
+                        <span :style="{ color: upColor }">多⇒{{ rb.claim_id }}</span>：{{ rb.text }}
+                      </div>
+                    </div>
+                  </template>
+                  <div v-if="current.result.debate.judge" class="debate-judge">
+                    <div class="dj-head">
+                      裁决：
+                      <span :style="{ color: ratingColor(current.result.debate.judge.verdict), fontWeight: 600 }">
+                        {{ ratingText(current.result.debate.judge.verdict) }}
+                      </span>
+                      <span v-if="debateOppositeMain" class="dj-warn" :style="{ color: vars.warningColor }">
+                        与主评级方向相反（程序置信度已按低处理）
+                      </span>
+                    </div>
+                    <p v-if="current.result.debate.judge.confidence_reason" class="panel-text">
+                      {{ current.result.debate.judge.confidence_reason }}
+                    </p>
+                    <p v-if="current.result.debate.judge.conflict_note" class="panel-text" :style="{ color: vars.warningColor }">
+                      冲突点：{{ current.result.debate.judge.conflict_note }}
+                    </p>
+                    <div v-if="current.result.debate.judge.unresolved_claim_ids?.length" class="ds-ev">
+                      证据不足未裁决：{{ current.result.debate.judge.unresolved_claim_ids.join('、') }}
+                    </div>
+                    <div v-if="current.result.debate.judge.invalidators?.length" class="ds-inv">
+                      裁决失效条件：{{ current.result.debate.judge.invalidators.join('；') }}
+                    </div>
+                  </div>
+                </div>
+
                 <p class="disclaimer">{{ current.result.disclaimer }}</p>
               </template>
 
@@ -1364,6 +1476,83 @@ onMounted(async () => {
 }
 .plan-checklist {
   margin-top: 8px;
+}
+/* P1-3 条件式多空辩论 */
+.debate-block {
+  margin-top: 14px;
+}
+.debate-hint {
+  margin-left: 6px;
+  font-size: 11px;
+  opacity: 0.55;
+  cursor: help;
+  border-bottom: 1px dotted currentColor;
+}
+.debate-sides {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 8px;
+}
+@media (max-width: 768px) {
+  .debate-sides {
+    grid-template-columns: 1fr;
+  }
+}
+.ds-head {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.ds-claim {
+  font-size: 12.5px;
+  line-height: 1.6;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(128, 128, 128, 0.06);
+  margin-bottom: 6px;
+}
+.ds-claim.ds-rejected {
+  opacity: 0.55;
+  text-decoration: line-through;
+}
+.ds-id {
+  font-size: 11px;
+  opacity: 0.5;
+  margin-right: 4px;
+  font-family: monospace;
+}
+.ds-mark {
+  font-size: 11px;
+  margin-right: 4px;
+}
+.ds-ev,
+.ds-inv {
+  font-size: 11px;
+  opacity: 0.6;
+  margin-top: 3px;
+  text-decoration: none;
+}
+.debate-cross {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.dc-row {
+  margin-bottom: 4px;
+}
+.debate-judge {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(128, 128, 128, 0.3);
+}
+.dj-head {
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+.dj-warn {
+  margin-left: 8px;
+  font-size: 12px;
 }
 .raw {
   font-size: 13px;

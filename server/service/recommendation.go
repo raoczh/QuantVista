@@ -591,6 +591,9 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	batch.CandidatePool = poolJSON
 	batch.DataSnapshot = string(llmInput)
 	batch.FiltersJSON = string(filtersJSON)
+	// P1-5 反思记忆影子检索（三不纪律：不注入 prompt——messages 已在上方构造完毕、
+	// 不改写 picks/置信度、拒选与降级路径同样随批次落库）。best-effort，空=无匹配零噪声。
+	batch.ReflectionJSON = reflectionShadowJSON(recType, strat.Key, llmCands)
 
 	// P0-2 调用关联：主调一个 run（repair 同 run 按 attempt 区分），复核/反方派生 run
 	// 回指主调；manifest 数组随批次落库，llm_call_logs 凭 batch.TraceID 双向可查。

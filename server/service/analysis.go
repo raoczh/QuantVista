@@ -103,6 +103,7 @@ type AnalysisResult struct {
 	SysConfidenceWhy string          `json:"sys_confidence_why,omitempty"` // 置信度依据说明
 	Review           *analysisReview `json:"review,omitempty"`             // AI 复核员结论（verify 模式）
 	TradePlan        *tradePlan      `json:"trade_plan,omitempty"`         // 交易员阶段：交易计划+量化仓位（M3c，个股标准模式）
+	Debate           *debateResult   `json:"debate,omitempty"`             // 条件式 bull/bear/judge 辩论（P1-3，触发条件命中才有）
 }
 
 // analysisReview AI 复核员对一份分析的结论。Confidence 用 FlexInt——模型常把整数字段
@@ -357,9 +358,13 @@ func (s *AnalysisService) runAnalysis(ctx context.Context, plan *analysisPlan, r
 	mainRun := newLLMRun(trace, "", "analysis", schemaVer, promptVersion)
 	mainRun.hashData(string(snapshotJSON))
 	var tpRun, rvRun *llmRun
+	var debateRuns []*llmRun
 	fillRunMeta := func() {
-		rec.LlmRunJSON = marshalLLMRunManifests(cfg,
-			runEntry(mainRun, true), runEntry(tpRun, true), runEntry(rvRun, true))
+		entries := []llmRunManifestEntry{runEntry(mainRun, true), runEntry(tpRun, true), runEntry(rvRun, true)}
+		for _, dr := range debateRuns {
+			entries = append(entries, runEntry(dr, true))
+		}
+		rec.LlmRunJSON = marshalLLMRunManifests(cfg, entries...)
 	}
 
 	// 解析器按模式分流：标准 → AnalysisResult；panel → PanelResult。
@@ -421,6 +426,17 @@ func (s *AnalysisService) runAnalysis(ctx context.Context, plan *analysisPlan, r
 		usage.PromptTokens += rvUsage.PromptTokens
 		usage.CompletionTokens += rvUsage.CompletionTokens
 		usage.TotalTokens += rvUsage.TotalTokens
+		// P1-3 条件式辩论（信任层回填之后——触发判定消费 SysConfidence 终值与 claims 状态，
+		// 复核 reject 压低的置信度同样构成触发信号）：仅个股标准模式、非回溯、非历史解释。
+		// 辩论是附加复核，主结果（rating/summary/claims）不改写；失败降级为既有单路。
+		if req.Module == model.AnalysisModuleStock && req.Mode != model.AnalysisModePanel &&
+			req.AsOf == "" && !staleMode {
+			dbUsage, dbRuns := s.attachDebate(ctx, userID, cfg, apiKey, allowPrivate, actx.Snapshot, result, trace, mainRun.RunID)
+			debateRuns = dbRuns
+			usage.PromptTokens += dbUsage.PromptTokens
+			usage.CompletionTokens += dbUsage.CompletionTokens
+			usage.TotalTokens += dbUsage.TotalTokens
+		}
 		if staleEnforceNote != "" {
 			if result.SysConfidenceWhy != "" {
 				result.SysConfidenceWhy += "；" + staleEnforceNote
@@ -1269,7 +1285,7 @@ func parseAnalysisResult(content string) (*AnalysisResult, error) {
 	if err := json.Unmarshal([]byte(jsonStr), &raw); err != nil {
 		return nil, fmt.Errorf("JSON 解析失败: %v", err)
 	}
-	for _, k := range []string{"evidence_check", "sys_confidence", "sys_confidence_why", "review", "trade_plan"} {
+	for _, k := range []string{"evidence_check", "sys_confidence", "sys_confidence_why", "review", "trade_plan", "debate"} {
 		delete(raw, k)
 	}
 	cleaned, err := json.Marshal(raw)

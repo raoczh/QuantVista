@@ -28,6 +28,8 @@ type SystemSettingsView struct {
 	LLMEvidenceRefs        bool   `json:"llm_evidence_refs"`
 	LLMSemanticValidator   bool   `json:"llm_semantic_validator"`
 	LLMCapabilityRouting   bool   `json:"llm_capability_routing"`
+	LLMConditionalDebate   bool   `json:"llm_conditional_debate"`
+	LLMReflectionShadow    bool   `json:"llm_reflection_shadow"`
 	SiteBaseURL            string `json:"site_base_url"`
 }
 
@@ -46,6 +48,8 @@ func (s *AdminService) GetSettings() SystemSettingsView {
 		LLMEvidenceRefs:        setting.LLMEvidenceRefs(),
 		LLMSemanticValidator:   setting.LLMSemanticValidator(),
 		LLMCapabilityRouting:   setting.LLMCapabilityRouting(),
+		LLMConditionalDebate:   setting.LLMConditionalDebate(),
+		LLMReflectionShadow:    setting.LLMReflectionShadow(),
 		SiteBaseURL:            setting.SiteBaseURL(),
 	}
 }
@@ -64,6 +68,8 @@ type UpdateSettingsInput struct {
 	LLMEvidenceRefs        *bool   `json:"llm_evidence_refs"`
 	LLMSemanticValidator   *bool   `json:"llm_semantic_validator"`
 	LLMCapabilityRouting   *bool   `json:"llm_capability_routing"`
+	LLMConditionalDebate   *bool   `json:"llm_conditional_debate"`
+	LLMReflectionShadow    *bool   `json:"llm_reflection_shadow"`
 	SiteBaseURL            *string `json:"site_base_url"` // 空串 = 清除（推送通知不带点击跳转）
 }
 
@@ -101,6 +107,16 @@ func (s *AdminService) UpdateSettings(in UpdateSettingsInput) (SystemSettingsVie
 	}
 	if in.LLMCapabilityRouting != nil {
 		if err := setting.SetLLMCapabilityRouting(*in.LLMCapabilityRouting); err != nil {
+			return SystemSettingsView{}, err
+		}
+	}
+	if in.LLMConditionalDebate != nil {
+		if err := setting.SetLLMConditionalDebate(*in.LLMConditionalDebate); err != nil {
+			return SystemSettingsView{}, err
+		}
+	}
+	if in.LLMReflectionShadow != nil {
+		if err := setting.SetLLMReflectionShadow(*in.LLMReflectionShadow); err != nil {
 			return SystemSettingsView{}, err
 		}
 	}

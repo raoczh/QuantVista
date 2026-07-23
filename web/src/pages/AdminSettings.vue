@@ -70,6 +70,8 @@ async function load() {
     evRefsEnabled.value = settings.value.llm_evidence_refs
     semanticEnabled.value = settings.value.llm_semantic_validator
     capRoutingEnabled.value = settings.value.llm_capability_routing
+    debateEnabled.value = settings.value.llm_conditional_debate
+    reflectionEnabled.value = settings.value.llm_reflection_shadow
     siteBaseURL.value = settings.value.site_base_url
   } catch (e) {
     message.error((e as Error).message)
@@ -196,6 +198,40 @@ async function toggleCapabilityRouting(v: boolean) {
     await load()
   } finally {
     savingCapRoute.value = false
+  }
+}
+
+/* P1-3 条件式辩论：低置信/证据冲突/风险临界的个股分析追加 bull/bear/judge 独立复核 */
+const savingDebate = ref(false)
+const debateEnabled = ref(true)
+async function toggleDebate(v: boolean) {
+  savingDebate.value = true
+  try {
+    settings.value = await updateSystemSettings({ llm_conditional_debate: v })
+    debateEnabled.value = settings.value.llm_conditional_debate
+    message.success('已保存，下一次 AI 调用生效')
+  } catch (e) {
+    message.error((e as Error).message)
+    await load()
+  } finally {
+    savingDebate.value = false
+  }
+}
+
+/* P1-5 反思记忆影子层：成熟推荐教训生成 + 推荐生成时影子检索（不注入不改写） */
+const savingReflection = ref(false)
+const reflectionEnabled = ref(true)
+async function toggleReflection(v: boolean) {
+  savingReflection.value = true
+  try {
+    settings.value = await updateSystemSettings({ llm_reflection_shadow: v })
+    reflectionEnabled.value = settings.value.llm_reflection_shadow
+    message.success('已保存，下一轮任务生效')
+  } catch (e) {
+    message.error((e as Error).message)
+    await load()
+  } finally {
+    savingReflection.value = false
   }
 }
 
@@ -469,6 +505,20 @@ onMounted(() => {
             <n-switch :value="capRoutingEnabled" :loading="savingCapRoute" @update:value="toggleCapabilityRouting" />
             <span style="opacity: 0.6; font-size: 12px">
               开启（P0-5）：已声明或观察到不支持 JSON 结构化输出的模型，业务调用直接按纯文本请求（省一次注定失败的请求；LLM 配置页「测试连接」会顺带探测并记录）。关闭回退每次在线试错的隐式回落。
+            </span>
+          </n-space>
+          <n-space align="center">
+            <span>条件式多空辩论：</span>
+            <n-switch :value="debateEnabled" :loading="savingDebate" @update:value="toggleDebate" />
+            <span style="opacity: 0.6; font-size: 12px">
+              开启（P1-3）：个股标准分析在低置信度/结论与数据矛盾/风险闸门临界时，追加独立的看多/看空/裁判三角色辩论复核（最多 4 次额外调用，触发条件与预算记录进运行清单）。高置信分析不触发零成本；辩论失败自动回退单路结果。
+            </span>
+          </n-space>
+          <n-space align="center">
+            <span>反思记忆影子层：</span>
+            <n-switch :value="reflectionEnabled" :loading="savingReflection" @update:value="toggleReflection" />
+            <span style="opacity: 0.6; font-size: 12px">
+              开启（P1-5）：成熟推荐样本 ≥30 后，后台按批结算结果生成历史教训（LLM 反思，走系统默认配置）；推荐生成时检索适用教训随批次记录（影子：不注入提示词、不改写结果）。关闭停止生成与检索，已生成教训保留。
             </span>
           </n-space>
         </n-space>

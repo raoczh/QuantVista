@@ -64,6 +64,15 @@ var llmModuleBudgets = map[string]llmModuleBudget{
 	"news": {MaxTokens: 2500, RepairAttempts: 0},
 	// 白话建策略：条件树 JSON。
 	"screener_parse": {MaxTokens: 2000, RepairAttempts: 1, RepairFeedChars: 600},
+	// P1-3 条件式辩论三角色（analysis_debate.go）：bull/bear 各输出 ≤4 条带证据引用的
+	// claims、judge 输出裁决 JSON；rebuttal 是单条反驳小 JSON。条件触发非默认路径，
+	// 预算按「结构紧凑的观点 JSON」定标。
+	"debate_bull":     {MaxTokens: 1200, RepairAttempts: 1, RepairFeedChars: 600},
+	"debate_bear":     {MaxTokens: 1200, RepairAttempts: 1, RepairFeedChars: 600},
+	"debate_rebuttal": {MaxTokens: 800, RepairAttempts: 1, RepairFeedChars: 400},
+	"debate_judge":    {MaxTokens: 1200, RepairAttempts: 1, RepairFeedChars: 600},
+	// P1-5 反思记忆生成（recreflect.go）：批量 ≤5 条成熟推荐的教训 JSON（每条 2-4 句）。
+	"reflection": {MaxTokens: 1500, RepairAttempts: 1, RepairFeedChars: 600},
 }
 
 // moduleBudget 取模块预算；未登记模块回默认（不钳 token、repair 默认 1）——

@@ -14,6 +14,8 @@ export interface SystemSettings {
   llm_evidence_refs: boolean
   llm_semantic_validator: boolean
   llm_capability_routing: boolean
+  llm_conditional_debate: boolean
+  llm_reflection_shadow: boolean
   site_base_url: string
 }
 
@@ -31,6 +33,8 @@ export interface SystemSettingsUpdate {
   llm_evidence_refs?: boolean
   llm_semantic_validator?: boolean
   llm_capability_routing?: boolean
+  llm_conditional_debate?: boolean
+  llm_reflection_shadow?: boolean
   site_base_url?: string
 }
 

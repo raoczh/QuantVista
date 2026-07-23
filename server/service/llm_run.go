@@ -87,6 +87,9 @@ type llmRun struct {
 	// 由 parseAndFilterPicks 产出、callWithRepair 挂载）。其他模块恒 nil（manifest 省略）——
 	// **禁止在无程序化计数来源的模块伪造该字段**（P0-2 起的明令，本批起仅推荐真实填充）。
 	Coverage *RecCoverageDiag
+	// DebateInfo P1-3 条件式辩论的触发条件与调用预算声明（仅辩论首个 run——bull——携带；
+	// 程序判定的触发原因，非模型自报）。其他模块恒 nil（manifest 省略）。
+	DebateInfo *DebateManifestInfo
 }
 
 // newLLMRun 创建调用组。parentRunID 为空表示主调。
@@ -173,6 +176,9 @@ type LLMRunManifest struct {
 	// unknown/duplicate/out_of_pool 样本、prompt_trimmed、机读错误码）。
 	// 仅推荐主调 run 非空；其他模块省略——不得伪造。
 	Coverage *RecCoverageDiag `json:"coverage,omitempty"`
+	// Debate P1-3 条件式辩论声明（触发原因/轮数/调用预算；程序判定非模型自报）。
+	// 仅辩论 bull run 非空；其他模块省略。
+	Debate *DebateManifestInfo `json:"debate,omitempty"`
 }
 
 // manifest 输出本 run 的运行元数据。jsonMode 为该模块的请求口径；最终实际生效形态在
@@ -188,6 +194,7 @@ func (r *llmRun) manifest(cfg *model.LLMConfig, jsonMode bool) LLMRunManifest {
 		FinishState:      r.FinishState, FinishStateRaw: r.FinishStateRaw,
 		DegradedReason: r.DegradedReason,
 		Coverage:       r.Coverage,
+		Debate:         r.DebateInfo,
 	}
 	if m.AttemptCount < 1 {
 		m.AttemptCount = 1 // 防御：manifest 只在实际发起过调用的 run 上输出

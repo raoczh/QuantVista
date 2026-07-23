@@ -811,6 +811,14 @@ func StartTrackingJobs(mgr *datasource.Manager) {
 		}
 		lcancel()
 
+		// P1-5 反思记忆生成（标签结算之后——新成熟标签本轮即可反思）：成熟标签 ≥30 才
+		// 启用，每轮 ≤5 条控成本；LLM 挂系统默认配置只记审计不扣次。best-effort。
+		rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		if _, err := GenerateRecommendationReflections(rctx); err != nil {
+			common.SysWarn("推荐反思生成失败: %v", err)
+		}
+		rcancel()
+
 		// #10 事实账本完整性巡检：success/degraded 批次的候选事件+影子标签本应在生成时
 		// 同步落库（recordBatchFacts 已进程内重试）。仍 facts_recorded=false 的是生成时
 		// DB 长时间不可用或进程崩溃遗留——无法可靠持久化补建（快照丢失价格版本锚、

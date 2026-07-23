@@ -34,15 +34,20 @@ type RecommendationBatch struct {
 
 	CandidateCount int    `json:"candidate_count"`                                 // 候选池标的数（未被过滤的）
 	CandidatePool  string `gorm:"type:mediumtext" json:"candidate_pool,omitempty"` // 候选池快照 JSON，含被过滤标的与原因、量化因子与评分（列表查询不返回；mediumtext——全景快照含因子明细，TEXT 64KB 会被大池撑爆）
-	DataSnapshot   string `gorm:"type:text" json:"data_snapshot,omitempty"`  // 喂给模型的数据 JSON（列表查询不返回）
-	RejectedJSON   string `gorm:"type:text" json:"rejected_json,omitempty"`  // 池内落选标的一句话理由 [{symbol,name,reason}]（列表查询不返回）
-	FiltersJSON    string `gorm:"type:text" json:"filters_json,omitempty"`   // 本次生效的筛选条件快照（透明可回显）
-	ReviewJSON     string `gorm:"type:text" json:"review_json,omitempty"`    // AI 复核员结论 JSON（verify 模式；列表查询不返回）
+	DataSnapshot   string `gorm:"type:text" json:"data_snapshot,omitempty"`        // 喂给模型的数据 JSON（列表查询不返回）
+	RejectedJSON   string `gorm:"type:text" json:"rejected_json,omitempty"`        // 池内落选标的一句话理由 [{symbol,name,reason}]（列表查询不返回）
+	FiltersJSON    string `gorm:"type:text" json:"filters_json,omitempty"`         // 本次生效的筛选条件快照（透明可回显）
+	ReviewJSON     string `gorm:"type:text" json:"review_json,omitempty"`          // AI 复核员结论 JSON（verify 模式；列表查询不返回）
 
 	// Regime S1-1 大盘闸门三档判定（offense/neutral/defense；空=未判定，如旧记录/数据缺失）。
 	// 影子模式：只落库与展示，不改写 action；强制降级由 feature flag 控制（默认关）。
 	Regime     string `gorm:"size:16" json:"regime"`
 	RegimeJSON string `gorm:"type:text" json:"regime_json,omitempty"` // 判定依据明细 + 仓位模型参数快照（可回溯）
+
+	// ReflectionJSON P1-5 反思记忆影子检索快照：本批生成时点检索到的适用历史教训
+	// （reflection ID/适用条件/available_from）。影子纪律：不注入 prompt、不改写结果、
+	// 拒选批次也落——转正评审的数据地基。空=未检索（旧记录/flag 关/无匹配）。
+	ReflectionJSON string `gorm:"type:text" json:"reflection_json,omitempty"`
 
 	LLMConfigID     int64  `json:"llm_config_id"`
 	Provider        string `gorm:"size:32" json:"provider"`

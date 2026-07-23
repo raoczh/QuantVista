@@ -302,6 +302,7 @@ export interface RecommendationBatch {
   rejected_json?: string // 池内落选理由 JSON（详情接口返回，列表不含）
   filters_json?: string // 本次生效筛选条件快照（详情接口返回）
   review_json?: string // AI 复核结论 JSON（verify 模式，详情接口返回）
+  reflection_json?: string // P1-5 反思记忆影子检索快照（详情接口返回；影子：未注入 prompt 不影响结果）
   trace_id?: string // P0-2 业务结果级审计关联（管理端 /admin/llm-calls 按它筛选调用记录）
   llm_run_json?: string // LLM 运行 manifest 数组（详情接口返回；推荐主调 run 含 P1-1 coverage 诊断）
   llm_config_id?: number // 生成时使用的 LLM 配置 id（配置名前端按自己的清单解析）
@@ -338,6 +339,20 @@ export interface RecCoverageDiag {
 
 export interface RecommendationView extends RecommendationBatch {
   items: RecommendationItem[]
+}
+
+// P1-5 反思记忆影子检索命中（reflection_json.matched 元素）。
+export interface ReflectionMatch {
+  id: number
+  symbol: string
+  strategy: string
+  rec_type: string
+  horizon_days: number
+  outcome: string // win / loss / take_profit / stop_loss
+  return_pct: number
+  lesson: string
+  available_from: string
+  matched_by: 'symbol' | 'strategy'
 }
 
 export function listStrategies(type: RecType) {
