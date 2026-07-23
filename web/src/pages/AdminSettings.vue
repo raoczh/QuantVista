@@ -73,6 +73,7 @@ async function load() {
     debateEnabled.value = settings.value.llm_conditional_debate
     reflectionEnabled.value = settings.value.llm_reflection_shadow
     challengerEnabled.value = settings.value.llm_challenger
+    layeredCtxEnabled.value = settings.value.llm_layered_context
     siteBaseURL.value = settings.value.site_base_url
   } catch (e) {
     message.error((e as Error).message)
@@ -250,6 +251,23 @@ async function toggleChallenger(v: boolean) {
     await load()
   } finally {
     savingChallenger.value = false
+  }
+}
+
+/* P2-3 多层上下文：QA 被裁剪历史的分层注入 + 反思影子检索分层（纯程序化零额外调用） */
+const savingLayeredCtx = ref(false)
+const layeredCtxEnabled = ref(true)
+async function toggleLayeredContext(v: boolean) {
+  savingLayeredCtx.value = true
+  try {
+    settings.value = await updateSystemSettings({ llm_layered_context: v })
+    layeredCtxEnabled.value = settings.value.llm_layered_context
+    message.success('已保存，下一次 AI 调用生效')
+  } catch (e) {
+    message.error((e as Error).message)
+    await load()
+  } finally {
+    savingLayeredCtx.value = false
   }
 }
 
@@ -544,6 +562,13 @@ onMounted(() => {
             <n-switch :value="challengerEnabled" :loading="savingChallenger" @update:value="toggleChallenger" />
             <span style="opacity: 0.6; font-size: 12px">
               开启（P2-1，缺省关）：存在 running 状态的 champion/challenger 实验时，实验创建者本人的每批推荐额外发起一次 challenger 影子调用（双倍 token 成本），输出只落实验样本表、不影响业务结果。实验管理见「LLM 实验」页。
+            </span>
+          </n-space>
+          <n-space align="center">
+            <span>多层上下文检索：</span>
+            <n-switch :value="layeredCtxEnabled" :loading="savingLayeredCtx" @update:value="toggleLayeredContext" />
+            <span style="opacity: 0.6; font-size: 12px">
+              开启（P2-3）：问答被裁剪的更早轮次以程序化「索引 + 按相关性检索摘录」注入（此前静默丢弃），每轮回答记录上下文分层快照（各层条数/粗估 token/不可见轮数）；反思影子检索同步分层。纯程序化零额外 LLM 调用；关闭回退旧的静默截断（快照观测保留）。
             </span>
           </n-space>
         </n-space>

@@ -11,6 +11,7 @@ import (
 
 	"quantvista/common"
 	"quantvista/model"
+	"quantvista/setting"
 
 	"gorm.io/gorm"
 )
@@ -103,6 +104,8 @@ type qaAskContext struct {
 	// promptVersion 本轮实际使用的 prompt 版本（P0-6 修复批：prepare 阶段从同一模板快照
 	// 产出，buildMessages 正文/run/会话落库三处共用——finalize 刷新会话字段不再重新查库）。
 	promptVersion string
+	// ctxJSON P2-3 本轮上下文分层快照（QaContextLayers JSON；随 assistant 消息落库）。
+	ctxJSON string
 }
 
 // qaConvLocks 会话级进程内互斥：同一会话的并发追问必须串行，否则两问会各自
@@ -299,12 +302,18 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 		common.DB.Model(&model.AiConversation{}).Where("id = ?", conv.ID).Update("trace_id", conv.TraceID)
 	}
 
-	// 组装消息：系统提示（角色 + 数据快照）+ 历史 + 本轮提问。
+	// 组装消息：系统提示（角色 + 数据快照 + P2-3 分层历史段）+ Tier1 历史 + 本轮提问。
 	history, err := s.loadMessages(userID, conv.ID)
 	if err != nil {
 		return nil, err
 	}
-	messages := s.buildMessagesFrom(qaPrompt, conv, history, question)
+	messages, ctxLayers := s.buildMessagesFrom(qaPrompt, conv, history, question)
+	ctxJSON := ""
+	if ctxLayers != nil {
+		if b, err := json.Marshal(ctxLayers); err == nil {
+			ctxJSON = string(b)
+		}
+	}
 	run := newLLMRun(conv.TraceID, "", "qa", "qa.free_text.v1", promptVersion)
 	run.hashData(conv.DataSnapshot)
 	run.hashPrompt(messages)
@@ -313,6 +322,7 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 		messages: messages,
 		cfg:      cfg, apiKey: apiKey, run: run,
 		promptVersion: promptVersion,
+		ctxJSON:       ctxJSON,
 	}, nil
 }
 
@@ -371,6 +381,7 @@ func (s *QaService) finalizeAsk(userID int64, ac *qaAskContext, res *chatResult)
 		}
 		am := model.AiConversationMessage{
 			ConversationID: ac.conv.ID, UserID: userID, Role: model.QaRoleAssistant, Content: answer, CheckJSON: checkJSON,
+			ContextJSON:  ac.ctxJSON,   // P2-3：本轮上下文分层快照（模型看到了什么可核查）
 			RunID:        ac.run.RunID, // P0-2：本轮回答 ↔ llm_call_logs.run_id
 			PromptTokens: res.Usage.PromptTokens, CompletionTokens: res.Usage.CompletionTokens, TotalTokens: res.Usage.TotalTokens,
 		}
@@ -461,13 +472,17 @@ func (s *QaService) qaCurrentFreshness(market string, meta *qaSnapshotMeta) (str
 // buildMessages 组装发送给 LLM 的消息序列（独立查询一次模板；业务链路 prepareAsk 用
 // buildMessagesFrom 消费已固化的快照）。保留供单测直接调用。
 func (s *QaService) buildMessages(conv model.AiConversation, history []model.AiConversationMessage, question string) []chatMessage {
-	return s.buildMessagesFrom(loadPromptRuntime(conv.UserID, model.PromptModuleQa), conv, history, question)
+	msgs, _ := s.buildMessagesFrom(loadPromptRuntime(conv.UserID, model.PromptModuleQa), conv, history, question)
+	return msgs
 }
 
 // buildMessagesFrom 由模板快照组装消息序列。系统提示含个股数据快照，历史仅取最近若干条。
 // P0-6：module=qa 的自定义模板是 L3 任务段（替换默认角色行，占位符宽容渲染），要求
 // 契约段恒由系统追加不可覆盖；快照注入与时效重判段不变。
-func (s *QaService) buildMessagesFrom(qaPrompt promptRuntime, conv model.AiConversation, history []model.AiConversationMessage, question string) []chatMessage {
+// P2-3（q13）：被 qaHistoryLimit 裁剪的更早轮次不再静默丢弃——flag 开时注入程序化
+// Tier2 索引/Tier3 按需检索段（qa_context.go），并返回分层快照供落库观测；flag 关时
+// 消息序列与旧版逐字节一致（返回的分层快照仍统计 Tier1，观测不受 flag 控制）。
+func (s *QaService) buildMessagesFrom(qaPrompt promptRuntime, conv model.AiConversation, history []model.AiConversationMessage, question string) ([]chatMessage, *QaContextLayers) {
 	var sys strings.Builder
 	intro := qaRoleIntro
 	if custom, ok := qaPrompt.Render(map[string]string{
@@ -486,19 +501,34 @@ func (s *QaService) buildMessagesFrom(qaPrompt promptRuntime, conv model.AiConve
 			"。本轮回答涉及价格/涨跌/盘面必须先声明「行情截至 " + orStr(quoteAsOfOf(conv), "快照采集时刻") +
 			"」，一律按历史数据解释口径表述，严禁以「当前/现在/实时」口径描述该快照行情，严禁给出基于当前盘面的买入/卖出/加减仓行动参考。")
 	}
-	sys.WriteString("\n\n对象：" + conv.Name + "（" + conv.Symbol + "）。请只依据以上数据回答，缺失的数据如实说明。")
 
-	msgs := []chatMessage{{Role: "system", Content: sys.String()}}
-	// 只带最近 qaHistoryLimit 条历史，避免上下文膨胀。
+	// 历史窗口切分：Tier1=最近 qaHistoryLimit 条全文（消息流位置与旧版一致）。
 	start := 0
 	if len(history) > qaHistoryLimit {
 		start = len(history) - qaHistoryLimit
 	}
-	for _, m := range history[start:] {
+	older, recent := history[:start], history[start:]
+	layered := buildQaLayeredContext(older, recent, question)
+	if setting.LLMLayeredContext() && layered.Segment != "" {
+		sys.WriteString("\n\n" + layered.Segment)
+	} else if layered.Layers != nil && !setting.LLMLayeredContext() {
+		// flag 关：回退旧的静默截断——分层段清零如实反映「未注入」（观测照落）。
+		l := layered.Layers
+		l.InvisibleRounds += l.Tier2Rounds + l.Tier3Rounds
+		l.Tier2Rounds, l.Tier2Chars, l.Tier3Rounds, l.Tier3Chars, l.Tier3Matched = 0, 0, 0, 0, nil
+		l.Tier2DroppedRounds = l.InvisibleRounds
+	}
+	sys.WriteString("\n\n对象：" + conv.Name + "（" + conv.Symbol + "）。请只依据以上数据回答，缺失的数据如实说明。")
+
+	msgs := []chatMessage{{Role: "system", Content: sys.String()}}
+	for _, m := range recent {
 		msgs = append(msgs, chatMessage{Role: m.Role, Content: m.Content})
 	}
 	msgs = append(msgs, chatMessage{Role: "user", Content: question})
-	return msgs
+	if layered.Layers != nil {
+		layered.Layers.ApproxTokens = qaApproxTokens(msgs)
+	}
+	return msgs, layered.Layers
 }
 
 // quoteAsOfOf 会话快照的行情数据时刻（buildMessages 时效段展示用）。
@@ -510,8 +540,10 @@ func quoteAsOfOf(conv model.AiConversation) string {
 }
 
 // qaPromptVersion 问答系统提示版本（会话不落库版本列，仅供代码内追溯）。
-// q12: 移除回答正文 800 汉字限制；q11: 回答正文长度纪律；q10: 首答新鲜度门（全源无 fresh 默认拒绝、allow_stale 才生成且快照打 stale_mode）+ 快照时效按每轮提问时刻重判注入（旧会话跨天不再向模型声明 fresh）；q9: 快照新鲜度元数据（captured_at/quote_as_of/bars_as_of/quote_source/freshness_status/market_state），stale 时必须声明行情截至时间、非交易时段按收盘口径表述；q8: P3a org_view 机构观点段进快照说明（卖方乐观偏差纪律）；q7: F2 finance 财务段（F10 最新期主要指标与近几期趋势）进快照说明；q6: risk_gate 风险闸门段、允许轻量 Markdown（流式渲染配套）；q5: announcements 公告段；q4: news 舆情段；q3: 回答引用的数字会被程序化核验，威慑幻觉；q2: 快照含五维量化评分锚点、要求引用数值、禁用先验记忆。
-const qaPromptVersion = "q12"
+// q13: P2-3 多层上下文——被 qaHistoryLimit 裁剪的更早轮次注入程序化「历史会话分层
+// 上下文」段（Tier2 截断索引 + Tier3 按本轮问题相关性检索的原文摘录），flag
+// llm_layered_context 关闭回退 q12 的静默截断；q12: 移除回答正文 800 汉字限制；q11: 回答正文长度纪律；q10: 首答新鲜度门（全源无 fresh 默认拒绝、allow_stale 才生成且快照打 stale_mode）+ 快照时效按每轮提问时刻重判注入（旧会话跨天不再向模型声明 fresh）；q9: 快照新鲜度元数据（captured_at/quote_as_of/bars_as_of/quote_source/freshness_status/market_state），stale 时必须声明行情截至时间、非交易时段按收盘口径表述；q8: P3a org_view 机构观点段进快照说明（卖方乐观偏差纪律）；q7: F2 finance 财务段（F10 最新期主要指标与近几期趋势）进快照说明；q6: risk_gate 风险闸门段、允许轻量 Markdown（流式渲染配套）；q5: announcements 公告段；q4: news 舆情段；q3: 回答引用的数字会被程序化核验，威慑幻觉；q2: 快照含五维量化评分锚点、要求引用数值、禁用先验记忆。
+const qaPromptVersion = "q13"
 
 // qaRoleTaskSeg 问答角色任务段（L3）：module=qa 自定义模板替换的部分——角色定位与
 // 回答风格。P0-6 起自定义不再整段替换，要求契约段恒由系统追加。

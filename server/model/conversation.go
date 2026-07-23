@@ -50,6 +50,11 @@ type AiConversationMessage struct {
 	// assistant 回答的证据数字核验结果（服务端回填，JSON；user 消息为空）。旧消息无此列，前端 v-if 兜底。
 	CheckJSON string `gorm:"type:text" json:"check_json,omitempty"`
 
+	// ContextJSON P2-3 本轮上下文分层快照（QaContextLayers JSON：Tier1/2/3 条数与字符、
+	// 完全不可见轮数、粗估 token、Tier3 命中依据——「模型看到了什么」可核查）。
+	// assistant 消息回填；user 消息与旧消息为空，前端 v-if 兜底。
+	ContextJSON string `gorm:"type:text" json:"context_json,omitempty"`
+
 	// P0-2 调用关联：本轮回答对应的 run_id（llm_call_logs 同值；user 消息与旧消息为空）。
 	RunID string `gorm:"size:40" json:"run_id,omitempty"`
 

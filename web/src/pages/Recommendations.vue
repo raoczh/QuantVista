@@ -48,6 +48,7 @@ import {
   type PoolCandidate,
   type RecCoverageDiag,
   type ReflectionMatch,
+  type ReflectionLayers,
 } from '@/api/recommendation'
 import { getPreference, updatePreference, type UserPreference } from '@/api/user'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
@@ -555,6 +556,27 @@ const reflectionMatches = computed<ReflectionMatch[]>(() => {
     return []
   }
 })
+// P2-3 分层元数据（rf2 快照；旧 rf1 快照无 layers 则不展示）。
+const reflectionLayers = computed<ReflectionLayers | null>(() => {
+  const raw = current.value?.reflection_json
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw) as { layers?: ReflectionLayers }
+    return parsed.layers || null
+  } catch {
+    return null
+  }
+})
+function reflectionLayerLine(l: ReflectionLayers): string {
+  const parts = [`同标的 ${l.tier1_count} · 同策略 ${l.tier2_count}`]
+  if (l.trimmed_count > 0) parts.push(`候选 ${l.candidates_total} 条（超名额裁剪 ${l.trimmed_count} 条）`)
+  const s = l.tier3_stats
+  if (s && s.total > 0)
+    parts.push(
+      `同策略全历史 ${s.total} 条教训：盈利 ${s.wins + s.take_profit}/亏损 ${s.losses + s.stop_loss}，均收益 ${s.avg_return_pct > 0 ? '+' : ''}${s.avg_return_pct.toFixed(1)}%`,
+    )
+  return parts.join('；')
+}
 function reflectionOutcomeLabel(o: string): string {
   const names: Record<string, string> = { win: '盈利', loss: '亏损', take_profit: '止盈', stop_loss: '止损' }
   return names[o] || o
@@ -1016,6 +1038,8 @@ function qgFieldLabels(fields?: string[]): string {
                     <div v-for="m in reflectionMatches" :key="m.id">
                       #{{ m.id }} {{ m.symbol }}（{{ reflectionOutcomeLabel(m.outcome) }} {{ m.return_pct > 0 ? '+' : '' }}{{ m.return_pct.toFixed(1) }}%·{{ m.matched_by === 'symbol' ? '同标的' : '同策略' }}）：{{ m.lesson }}
                     </div>
+                    <!-- P2-3 分层元数据（rf2）：命中分布/候选与被裁剪计数/同策略全历史结局统计 -->
+                    <div v-if="reflectionLayers" class="regime-tip-note">分层：{{ reflectionLayerLine(reflectionLayers) }}</div>
                     <div class="regime-tip-note">
                       影子层：历史教训仅记录，未注入提示词、不影响本批推荐结果；注入转正需影子配对评审。
                     </div>

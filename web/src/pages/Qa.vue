@@ -26,6 +26,7 @@ import {
   type QaConversation,
   type QaConversationView,
   type QaMessage,
+  type QaContextLayers,
 } from '@/api/qa'
 import { getLLMTask, listLLMTasks, type LLMTask } from '@/api/llmTask'
 import type { EvidenceCheck, RiskFlag } from '@/api/trust'
@@ -314,6 +315,41 @@ function msgCheck(m: QaMessage): EvidenceCheck | null {
   }
 }
 
+// P2-3 上下文分层快照（context_json 解析；旧消息无则不渲染；仅有被裁剪历史时展示——
+// 短会话 Tier2/3 全零属正常，渲染反而是噪声）。
+function msgCtx(m: QaMessage): QaContextLayers | null {
+  if (!m.context_json) return null
+  try {
+    const c = JSON.parse(m.context_json) as QaContextLayers
+    if (!c || (!c.tier2_rounds && !c.tier3_rounds && !c.invisible_rounds)) return null
+    return c
+  } catch {
+    return null
+  }
+}
+
+function ctxSummary(c: QaContextLayers): string {
+  const parts = [`全文 ${c.tier1_msgs} 条`]
+  if (c.tier2_rounds) parts.push(`索引 ${c.tier2_rounds} 轮`)
+  if (c.tier3_rounds) parts.push(`检索 ${c.tier3_rounds} 轮`)
+  if (c.invisible_rounds) parts.push(`不可见 ${c.invisible_rounds} 轮`)
+  return parts.join(' · ')
+}
+
+function ctxDetail(c: QaContextLayers): string {
+  const lines = [
+    `本轮注入上下文 ≈${c.approx_tokens} token（粗估）`,
+    `Tier1 最近消息全文：${c.tier1_msgs} 条（${c.tier1_chars} 字）`,
+  ]
+  if (c.tier2_rounds) lines.push(`Tier2 更早轮次索引：${c.tier2_rounds} 轮（${c.tier2_chars} 字）`)
+  if (c.tier3_rounds && c.tier3_matched?.length)
+    lines.push(
+      `Tier3 按相关性检索：${c.tier3_matched.map((m) => `第 ${m.round} 轮（相关度 ${m.score}）`).join('、')}`,
+    )
+  if (c.invisible_rounds) lines.push(`对模型完全不可见：${c.invisible_rounds} 轮（篇幅所限未注入）`)
+  return lines.join('\n')
+}
+
 // ---------- 数据快照透明面板（按需单取，详情不带） ----------
 const snapshotShow = ref(false)
 const snapshotText = ref('')
@@ -491,6 +527,14 @@ onMounted(async () => {
                     <div v-else class="bubble">{{ m.content }}</div>
                     <div v-if="m.role === 'assistant' && msgCheck(m)" class="check-badge">
                       <TrustBadges :evidence-check="msgCheck(m)!" />
+                    </div>
+                    <div v-if="m.role === 'assistant' && msgCtx(m)" class="ctx-badge">
+                      <n-tooltip trigger="hover" placement="top-start">
+                        <template #trigger>
+                          <n-tag size="tiny" :bordered="false" type="info">上下文：{{ ctxSummary(msgCtx(m)!) }}</n-tag>
+                        </template>
+                        <div style="white-space: pre-line; max-width: 320px">{{ ctxDetail(msgCtx(m)!) }}</div>
+                      </n-tooltip>
                     </div>
                   </div>
                 </div>
@@ -739,6 +783,9 @@ onMounted(async () => {
   opacity: 0.75;
 }
 .check-badge {
+  margin-top: 4px;
+}
+.ctx-badge {
   margin-top: 4px;
 }
 .extra-row {

@@ -319,9 +319,19 @@ func TestReflectionShadowJSONNotMutatePicks(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &snap); err != nil {
 		t.Fatalf("快照应为合法 JSON: %v", err)
 	}
-	if snap.Version != reflectionVersion || len(snap.Matched) != 1 ||
+	// P2-3：llm_layered_context 缺省开——快照版本 rf2 并携带分层元数据（Tier1=symbol
+	// 命中、候选/被裁计数、Tier3 同策略结局统计）。
+	if snap.Version != reflectionShadowVersion || len(snap.Matched) != 1 ||
 		snap.Matched[0].Lesson != "追高失败教训" || !strings.Contains(snap.Note, "未注入") {
 		t.Fatalf("快照形态不符: %+v", snap)
+	}
+	if snap.Layers == nil || snap.Layers.Tier1Count != 1 || snap.Layers.Tier2Count != 0 ||
+		snap.Layers.CandidatesTotal != 1 || snap.Layers.TrimmedCount != 0 {
+		t.Fatalf("分层元数据不符: %+v", snap.Layers)
+	}
+	if snap.Layers.Tier3Stats == nil || snap.Layers.Tier3Stats.Total != 1 ||
+		snap.Layers.Tier3Stats.Losses != 1 || snap.Layers.Tier3Stats.AvgReturnPct != -5 {
+		t.Fatalf("Tier3 结局统计不符: %+v", snap.Layers.Tier3Stats)
 	}
 	// 无匹配（标的与策略都不命中）：空串（批次列保持空，前端零噪声）。
 	if got := reflectionShadowJSON(0, model.RecTypeShortTerm, "pullback", []candidate{{Symbol: "000999"}}); got != "" {

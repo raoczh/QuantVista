@@ -355,6 +355,23 @@ export interface ReflectionMatch {
   matched_by: 'symbol' | 'strategy'
 }
 
+// P2-3 反思影子检索分层元数据（reflection_json.layers，rf2 快照；旧快照无）。
+export interface ReflectionLayers {
+  tier1_count: number
+  tier2_count: number
+  candidates_total: number
+  trimmed_count: number
+  tier3_stats?: {
+    total: number
+    wins: number
+    losses: number
+    take_profit: number
+    stop_loss: number
+    avg_return_pct: number
+  }
+  approx_chars: number
+}
+
 export function listStrategies(type: RecType) {
   return request<Strategy[]>({ url: '/recommendations/strategies', method: 'get', params: { type } })
 }

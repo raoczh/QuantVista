@@ -357,6 +357,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				// P1-7 校准与后验标签报表（只读，refresh=1 重算）+ P1-8 角色资产 registry
 				admin.GET("/llm-calibration", adminCtl.LLMCalibration)
 				admin.GET("/llm-roles", adminCtl.LLMRoles)
+				// P2-5 组合/回测联合评估（只读；include_locked=1 显式请求锁定段并登记审计）
+				admin.GET("/llm-joint-eval", adminCtl.LLMJointEval)
 				// P2-1/P2-2 champion/challenger prompt 实验（影子采样；promote=P1-9 质量门）
 				admin.GET("/llm-experiments", adminCtl.LLMExperiments)
 				admin.GET("/llm-experiments/:id", adminCtl.GetLLMExperiment)

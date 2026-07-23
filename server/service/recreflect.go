@@ -319,6 +319,117 @@ type reflectionShadowSnapshot struct {
 	CheckedAt time.Time         `json:"checked_at"`
 	Matched   []reflectionMatch `json:"matched"`
 	Note      string            `json:"note"`
+	// Layers P2-3 分层可观测（rf2）：各层命中/候选计数、被名额裁剪数与按需历史统计——
+	// 「检索到什么、裁掉多少」可核查。llm_layered_context 关闭时缺席（回退 rf1 形态）。
+	Layers *reflectionLayers `json:"layers,omitempty"`
+}
+
+// reflectionShadowVersion 影子检索快照版本（与生成版本 reflectionVersion 自 P2-3 起
+// 拆分：生成逻辑 rf1 未变，检索快照升 rf2=分层可观测；改检索/分层结构递增此常量）。
+const reflectionShadowVersion = "rf2"
+
+// reflectionLayers 影子检索分层元数据（Tier1=同标的教训、Tier2=同策略教训、
+// Tier3=同策略全历史结局聚合统计——逐条注入有名额上限，聚合概览无名额压力）。
+type reflectionLayers struct {
+	Tier1Count int `json:"tier1_count"` // matched 中 symbol 命中数
+	Tier2Count int `json:"tier2_count"` // matched 中 strategy 命中数
+	// CandidatesTotal 符合条件（本人+available_from+symbol∪strategy 池）的候选总数；
+	// TrimmedCount=候选超出名额被裁数（被裁剪可见——「还有多少教训没进快照」）。
+	CandidatesTotal int                   `json:"candidates_total"`
+	TrimmedCount    int                   `json:"trimmed_count"`
+	Tier3Stats      *reflectionTier3Stats `json:"tier3_stats,omitempty"`
+	ApproxChars     int                   `json:"approx_chars"` // matched 教训文本总字符（快照体积观察）
+}
+
+// reflectionTier3Stats 按需历史层：同策略全历史反思的结局分布（聚合统计非逐条）。
+type reflectionTier3Stats struct {
+	Total        int     `json:"total"`
+	Wins         int     `json:"wins"`
+	Losses       int     `json:"losses"`
+	TakeProfit   int     `json:"take_profit"`
+	StopLoss     int     `json:"stop_loss"`
+	AvgReturnPct float64 `json:"avg_return_pct"`
+}
+
+// reflectionLayerStats 计算分层元数据（纯查询；恒带 userID 与 available_from 过滤——
+// 用户隔离与防回放泄漏铁律对分层统计同样生效，严禁移除）。
+func reflectionLayerStats(asOf time.Time, userID int64, recType, strategy string, symbols []string, matched []reflectionMatch) *reflectionLayers {
+	l := &reflectionLayers{}
+	for _, m := range matched {
+		switch m.MatchedBy {
+		case "symbol":
+			l.Tier1Count++
+		case "strategy":
+			l.Tier2Count++
+		}
+		l.ApproxChars += len([]rune(m.Lesson))
+	}
+	var total int64
+	if err := common.DB.Model(&model.RecommendationReflection{}).
+		Where("user_id = ? AND available_from <= ? AND (symbol IN ? OR (rec_type = ? AND strategy = ?))",
+			userID, asOf, symbols, recType, strategy).
+		Count(&total).Error; err == nil {
+		l.CandidatesTotal = int(total)
+		if trimmed := l.CandidatesTotal - len(matched); trimmed > 0 {
+			l.TrimmedCount = trimmed
+		}
+	}
+	var rows []model.RecommendationReflection
+	if err := common.DB.Select("outcome", "return_pct").
+		Where("user_id = ? AND available_from <= ? AND rec_type = ? AND strategy = ?", userID, asOf, recType, strategy).
+		Find(&rows).Error; err == nil && len(rows) > 0 {
+		st := &reflectionTier3Stats{Total: len(rows)}
+		var sum float64
+		for _, r := range rows {
+			sum += r.ReturnPct
+			// 结局串与 reflectionOutcome 程序归类同源（win/loss/take_profit/stop_loss）。
+			switch r.Outcome {
+			case "win":
+				st.Wins++
+			case "loss":
+				st.Losses++
+			case "take_profit":
+				st.TakeProfit++
+			case "stop_loss":
+				st.StopLoss++
+			}
+		}
+		st.AvgReturnPct = round2(sum / float64(len(rows)))
+		l.Tier3Stats = st
+	}
+	return l
+}
+
+// reflectionShadowJSON 推荐生成时的影子检索快照（runGeneration 调用，best-effort）：
+// flag 关/无匹配返回空串（批次列保持空，前端零噪声）。**只读不写、不进 prompt、
+// 不碰 picks**——影子纪律的代码形态就是「返回值只赋给 batch.ReflectionJSON」。
+// P2-3：llm_layered_context 开时快照升 rf2（补分层元数据与 Tier3 聚合统计），关时
+// 保持 rf1 形态——两 flag 正交（reflection_shadow 控检索与否、layered_context 控分层）。
+func reflectionShadowJSON(userID int64, recType, strategy string, llmCands []candidate) string {
+	if !setting.LLMReflectionShadow() {
+		return ""
+	}
+	symbols := make([]string, 0, len(llmCands))
+	for _, c := range llmCands {
+		symbols = append(symbols, c.Symbol)
+	}
+	matched := lookupReflections(time.Now(), userID, recType, strategy, symbols)
+	if len(matched) == 0 {
+		return ""
+	}
+	snap := reflectionShadowSnapshot{
+		Version: reflectionVersion, CheckedAt: time.Now(), Matched: matched,
+		Note: "影子层：历史教训仅记录未注入 prompt，不影响本批推荐结果；注入转正需影子配对评审",
+	}
+	if setting.LLMLayeredContext() {
+		snap.Version = reflectionShadowVersion
+		snap.Layers = reflectionLayerStats(time.Now(), userID, recType, strategy, symbols, matched)
+	}
+	b, err := json.Marshal(snap)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 // lookupReflections 检索适用教训（纯查询，可测）：available_from <= asOf 是防回放泄漏
@@ -358,30 +469,4 @@ func lookupReflections(asOf time.Time, userID int64, recType, strategy string, s
 		}
 	}
 	return out
-}
-
-// reflectionShadowJSON 推荐生成时的影子检索快照（runGeneration 调用，best-effort）：
-// flag 关/无匹配返回空串（批次列保持空，前端零噪声）。**只读不写、不进 prompt、
-// 不碰 picks**——影子纪律的代码形态就是「返回值只赋给 batch.ReflectionJSON」。
-func reflectionShadowJSON(userID int64, recType, strategy string, llmCands []candidate) string {
-	if !setting.LLMReflectionShadow() {
-		return ""
-	}
-	symbols := make([]string, 0, len(llmCands))
-	for _, c := range llmCands {
-		symbols = append(symbols, c.Symbol)
-	}
-	matched := lookupReflections(time.Now(), userID, recType, strategy, symbols)
-	if len(matched) == 0 {
-		return ""
-	}
-	snap := reflectionShadowSnapshot{
-		Version: reflectionVersion, CheckedAt: time.Now(), Matched: matched,
-		Note: "影子层：历史教训仅记录未注入 prompt，不影响本批推荐结果；注入转正需影子配对评审",
-	}
-	b, err := json.Marshal(snap)
-	if err != nil {
-		return ""
-	}
-	return string(b)
 }

@@ -32,6 +32,7 @@ const (
 	keyLLMDebate          = "llm_conditional_debate"
 	keyLLMReflection      = "llm_reflection_shadow"
 	keyLLMChallenger      = "llm_challenger"
+	keyLLMLayeredContext  = "llm_layered_context"
 )
 
 // 新闻快讯采集间隔（分钟）的默认值与钳制范围：下限防打爆免费上游，上限防配成"实际不采集"。
@@ -78,6 +79,10 @@ var (
 	// 命中时每批推荐额外一次 challenger 影子调用（双倍 token），须管理员显式开启；
 	// 关闭只停采样，实验记录与已采样本保留。
 	llmChallenger = false
+	// P2-3 多层上下文检索（qa_context.go/recreflect.go）：QA 被裁剪历史的程序化
+	// Tier2 索引/Tier3 按需检索注入 + 反思影子检索分层。纯程序化零额外 LLM 调用，
+	// 默认开；关闭回退旧的静默截断（上下文快照仍照常落库观测）。
+	llmLayeredContext = true
 )
 
 // Init 从 DB 加载系统配置；首启时若 DB 缺 GitHub 凭证而 env 提供了，则种子回填到 DB。
@@ -155,6 +160,8 @@ func apply(opts map[string]string) {
 	// P2-1 challenger 影子采样**缺省关**（与上面回滚开关语义相反）：每次命中会额外烧一次
 	// LLM 调用（双倍 token），必须管理员显式启用——== "true" 才开。
 	llmChallenger = opts[keyLLMChallenger] == "true"
+	// P2-3 多层上下文缺省开（!= "false" 回滚开关语义：零额外调用，非成本开关）。
+	llmLayeredContext = opts[keyLLMLayeredContext] != "false"
 }
 
 // normalizeSiteBaseURL 去空白与尾部斜杠（拼路由时统一 base+/path 形态）。
@@ -227,6 +234,10 @@ func LLMConditionalDebate() bool { mu.RLock(); defer mu.RUnlock(); return llmCon
 // LLMReflectionShadow P1-5 反思记忆影子层开关（反思生成 job 与推荐生成时的影子检索；
 // 关闭不删除已落库反思，重开即恢复）。
 func LLMReflectionShadow() bool { mu.RLock(); defer mu.RUnlock(); return llmReflectionShadow }
+
+// LLMLayeredContext P2-3 多层上下文检索开关（QA 被裁剪历史的 Tier2 索引/Tier3 按需
+// 检索注入 + 反思影子检索分层）。关闭回退旧的静默截断；上下文快照观测不受控。
+func LLMLayeredContext() bool { mu.RLock(); defer mu.RUnlock(); return llmLayeredContext }
 
 // ---- 写入（持久化 + 刷新内存）----
 
@@ -335,6 +346,17 @@ func SetLLMChallenger(v bool) error {
 	}
 	mu.Lock()
 	llmChallenger = v
+	mu.Unlock()
+	return nil
+}
+
+// SetLLMLayeredContext 设置 P2-3 多层上下文检索开关。
+func SetLLMLayeredContext(v bool) error {
+	if err := model.UpsertOption(keyLLMLayeredContext, strconv.FormatBool(v)); err != nil {
+		return err
+	}
+	mu.Lock()
+	llmLayeredContext = v
 	mu.Unlock()
 	return nil
 }

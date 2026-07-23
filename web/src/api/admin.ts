@@ -17,6 +17,7 @@ export interface SystemSettings {
   llm_conditional_debate: boolean
   llm_reflection_shadow: boolean
   llm_challenger: boolean
+  llm_layered_context: boolean
   site_base_url: string
 }
 
@@ -37,6 +38,7 @@ export interface SystemSettingsUpdate {
   llm_conditional_debate?: boolean
   llm_reflection_shadow?: boolean
   llm_challenger?: boolean
+  llm_layered_context?: boolean
   site_base_url?: string
 }
 
@@ -385,8 +387,28 @@ export interface RecCalibReport {
   reliability?: CalibBucket[]
   sys_tiers?: CalibTierCell[]
   tier_monotone?: string
+  slices?: CalibSliceGroup[]
   action_pr: CalibActionPR
   notes: string[]
+}
+
+// P2-5 分层维度（策略/regime/provider·model/prompt_version；buy 口径）。
+export interface CalibSliceRow {
+  key: string
+  sample: number
+  hit_rate_pct: number
+  avg_net_pct: number
+  median_net_pct: number
+  avg_alpha_pct: number
+  alpha_sample: number
+  brier?: number
+  ece?: number
+}
+
+export interface CalibSliceGroup {
+  dim: string
+  label: string
+  rows: CalibSliceRow[]
 }
 
 export interface AnalysisCalibTier {
@@ -425,6 +447,85 @@ export function getLLMCalibration(refresh = false) {
   return request<LLMCalibrationReport>({
     url: '/admin/llm-calibration',
     params: refresh ? { refresh: 1 } : undefined,
+    timeout: HEAVY_TIMEOUT,
+  })
+}
+
+// ---------- P2-5 组合/回测联合评估（管理端只读，纯测量零门控） ----------
+
+export interface JointEvalSegment {
+  segment: string
+  date_start: string
+  date_end: string
+  signal_days: number
+  sample: number
+  buy_sample: number
+  win_rate_pct: number
+  avg_net_pct: number
+  median_net_pct: number
+  p10_net_pct: number
+  severe_loss_pct: number
+  avg_gross_pct: number
+  cost_drag_pct: number
+  avg_alpha_pct: number
+  alpha_sample: number
+  nav_return_pct: number
+  max_drawdown_pct: number
+  avg_mae_pct: number
+  worst_mae_pct: number
+  calib_sample: number
+  brier?: number
+  ece?: number
+}
+
+export interface JointLockedPreview {
+  date_start: string
+  date_end: string
+  signal_days: number
+  sample: number
+}
+
+export interface JointTurnover {
+  pairs: number
+  avg_new_pct: number
+  avg_overlap_pct: number
+}
+
+export interface JointEvalSection {
+  type: string
+  horizon_days: number
+  coverage: CalibCoverage
+  dev?: JointEvalSegment
+  locked?: JointEvalSegment
+  locked_preview?: JointLockedPreview
+  turnover: JointTurnover
+  slices?: CalibSliceGroup[]
+  notes: string[]
+}
+
+export interface JointLockedAudit {
+  count: number
+  last_at: string
+  log?: string[]
+}
+
+export interface JointEvalReport {
+  generated_at: string
+  label_version: string
+  include_locked: boolean
+  locked_audit?: JointLockedAudit
+  sections: JointEvalSection[]
+  elapsed_ms: number
+  notes: string[]
+}
+
+export function getJointEval(opts: { refresh?: boolean; includeLocked?: boolean } = {}) {
+  const params: Record<string, number> = {}
+  if (opts.refresh) params.refresh = 1
+  if (opts.includeLocked) params.include_locked = 1
+  return request<JointEvalReport>({
+    url: '/admin/llm-joint-eval',
+    params: Object.keys(params).length ? params : undefined,
     timeout: HEAVY_TIMEOUT,
   })
 }

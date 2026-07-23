@@ -92,6 +92,157 @@ type CalibCoverage struct {
 	MaturedRatioPct float64 `json:"matured_ratio_pct"`
 }
 
+// CalibSliceRow 分层维度单行（P2-5 批落地第五十一批声明的口径限制：先分层再汇总）。
+// 口径与主校准一致：buy 成熟样本（剔 forced/degraded/orphan）；每层 Brier/ECE 与报表级
+// 同门槛（≥ calibEvalMinSample 才产出，小样本层只报命中率/收益供参考）。
+type CalibSliceRow struct {
+	Key          string   `json:"key"`
+	Sample       int      `json:"sample"` // buy 成熟样本
+	HitRatePct   float64  `json:"hit_rate_pct"`
+	AvgNetPct    float64  `json:"avg_net_pct"`
+	MedianNetPct float64  `json:"median_net_pct"`
+	AvgAlphaPct  float64  `json:"avg_alpha_pct"`
+	AlphaSample  int      `json:"alpha_sample"`
+	Brier        *float64 `json:"brier,omitempty"`
+	ECE          *float64 `json:"ece,omitempty"`
+}
+
+// CalibSliceGroup 单一分层维度的全部取值行。
+type CalibSliceGroup struct {
+	Dim   string          `json:"dim"`   // strategy / regime / provider_model / prompt_version
+	Label string          `json:"label"` // 展示名
+	Rows  []CalibSliceRow `json:"rows"`
+}
+
+// calibSliceObs 分层观测（label 收益 + 口头置信度 + 维度键；联合评估复用同内核）。
+type calibSliceObs struct {
+	Key      string
+	Conf     float64
+	Hit      bool
+	Net      float64
+	Alpha    float64
+	HasBench bool
+}
+
+// calibSliceMaxRows 单维度最多展示的取值行；超出按样本降序保留、其余合并「（其他）」
+// 行（防止长尾 prompt_version/provider 撑爆报表；合并行不产出 Brier/ECE——混合层无解释意义）。
+const calibSliceMaxRows = 12
+
+// calibSliceRows 把观测按维度取值分组为统计行：样本降序（同样本按 key 字典序稳定），
+// 每层样本 ≥ calibEvalMinSample 才产出 Brier/ECE（与报表级「已评估」同门槛）。
+func calibSliceRows(obs []calibSliceObs) []CalibSliceRow {
+	groups := map[string][]calibSliceObs{}
+	for _, o := range obs {
+		k := o.Key
+		if k == "" {
+			k = "（未知）"
+		}
+		groups[k] = append(groups[k], o)
+	}
+	keys := make([]string, 0, len(groups))
+	for k := range groups {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if len(groups[keys[i]]) != len(groups[keys[j]]) {
+			return len(groups[keys[i]]) > len(groups[keys[j]])
+		}
+		return keys[i] < keys[j]
+	})
+
+	build := func(key string, list []calibSliceObs, withCalib bool) CalibSliceRow {
+		row := CalibSliceRow{Key: key, Sample: len(list)}
+		nets := make([]float64, 0, len(list))
+		var sumNet, sumAlpha float64
+		hits := 0
+		var cobs []calibObs
+		for _, o := range list {
+			nets = append(nets, o.Net)
+			sumNet += o.Net
+			if o.Hit {
+				hits++
+			}
+			if o.HasBench {
+				row.AlphaSample++
+				sumAlpha += o.Alpha
+			}
+			cobs = append(cobs, calibObs{Conf: o.Conf, Hit: o.Hit, Net: o.Net})
+		}
+		sort.Float64s(nets)
+		n := float64(len(list))
+		if n > 0 {
+			row.HitRatePct = round2(float64(hits) / n * 100)
+			row.AvgNetPct = round2(sumNet / n)
+			row.MedianNetPct = round2(median(nets))
+		}
+		if row.AlphaSample > 0 {
+			row.AvgAlphaPct = round2(sumAlpha / float64(row.AlphaSample))
+		}
+		if withCalib && len(cobs) >= calibEvalMinSample {
+			row.Brier = calibBrier(cobs)
+			row.ECE = calibECE(cobs)
+		}
+		return row
+	}
+
+	var rows []CalibSliceRow
+	var restList []calibSliceObs
+	restKinds := 0
+	for i, k := range keys {
+		if i < calibSliceMaxRows {
+			rows = append(rows, build(k, groups[k], true))
+			continue
+		}
+		restKinds++
+		restList = append(restList, groups[k]...)
+	}
+	if restKinds > 0 {
+		rows = append(rows, build(fmt.Sprintf("（其他 %d 项）", restKinds), restList, false))
+	}
+	return rows
+}
+
+// calibBatchMeta 批次归因元数据（分层维度来源：批次表 Provider/Model/PromptVersion 列）。
+type calibBatchMeta struct {
+	Provider      string
+	Model         string
+	PromptVersion string
+}
+
+// calibBatchMetaByID 批量查批次归因列（500 一批防 IN 过长；旧批次空值层归「（未知）」）。
+func calibBatchMetaByID(ids []int64) (map[int64]calibBatchMeta, error) {
+	out := map[int64]calibBatchMeta{}
+	for start := 0; start < len(ids); start += 500 {
+		end := start + 500
+		if end > len(ids) {
+			end = len(ids)
+		}
+		var rows []model.RecommendationBatch
+		if err := common.DB.Select("id", "provider", "model", "prompt_version").
+			Where("id IN ?", ids[start:end]).Find(&rows).Error; err != nil {
+			return nil, err
+		}
+		for _, b := range rows {
+			out[b.ID] = calibBatchMeta{Provider: b.Provider, Model: b.Model, PromptVersion: b.PromptVersion}
+		}
+	}
+	return out, nil
+}
+
+// calibProviderModelKey provider/model 分层键（批次已删或旧行空值时如实「（未知）」）。
+func calibProviderModelKey(m calibBatchMeta, ok bool) string {
+	if !ok || (m.Provider == "" && m.Model == "") {
+		return ""
+	}
+	if m.Model == "" {
+		return m.Provider
+	}
+	if m.Provider == "" {
+		return m.Model
+	}
+	return m.Provider + "/" + m.Model
+}
+
 // CalibActionPR 动作 precision/recall（action=buy 当预测正类、结果为正当事实正类）。
 type CalibActionPR struct {
 	Sample          int      `json:"sample"` // buy+watch 成熟样本
@@ -122,6 +273,10 @@ type RecCalibReport struct {
 	// 程序合成置信度分档（buy 样本）。
 	SysTiers     []CalibTierCell `json:"sys_tiers,omitempty"`
 	TierMonotone string          `json:"tier_monotone,omitempty"` // 单调性描述（不下结论）
+
+	// Slices P2-5 批分层维度（策略/regime/provider·model/prompt_version；buy 口径）——
+	// 落地第五十一批 Notes 声明的「先分层再汇总」口径限制。
+	Slices []CalibSliceGroup `json:"slices,omitempty"`
 
 	ActionPR CalibActionPR `json:"action_pr"`
 	Notes    []string      `json:"notes"`
@@ -313,19 +468,31 @@ type calibPickMeta struct {
 	DegradedSource string `json:"degraded_source"`
 }
 
-// buildRecCalibReport 单 type×horizon 的推荐校准（全库口径：管理端报表不分用户，
-// 样本才够门槛；Notes 声明）。
-func buildRecCalibReport(recType string, horizon int) (*RecCalibReport, error) {
-	rep := &RecCalibReport{Type: recType, HorizonDays: horizon}
+// calibRecMeta 推荐条目关联元数据（口头置信度列 + DetailJSON 摘取）。
+type calibRecMeta struct {
+	conf     int
+	sysConf  string
+	degraded bool
+}
 
+// calibSample 单条可用校准样本（成熟、非强平、非降级、非孤儿）。
+type calibSample struct {
+	label model.RecommendationLabel
+	meta  calibRecMeta
+}
+
+// loadRecCalibSamples 加载单 type×horizon 的标签样本与覆盖面分类（校准报表与 P2-5
+// 联合评估共用同一口径：l2/next_open/rec_id>0；matured 中 forced/orphan/degraded 单列
+// 剔除——两报表口径漂移会让「校准」与「联合评估」各说各话，收口在此）。
+func loadRecCalibSamples(recType string, horizon int) (usable []calibSample, coverage CalibCoverage, err error) {
 	var labels []model.RecommendationLabel
-	if err := common.DB.
+	if err = common.DB.
 		Where("horizon_days = ? AND entry_mode = ? AND recommendation_id > 0 AND label_version = ? AND type = ?",
 			horizon, model.EntryModeNextOpen, labelVersion, recType).
 		Find(&labels).Error; err != nil {
-		return nil, err
+		return nil, coverage, err
 	}
-	rep.Coverage.Total = len(labels)
+	coverage.Total = len(labels)
 
 	// 关联推荐条目：口头置信度列 + DetailJSON 的 sys_confidence/degraded_source。
 	ids := make([]int64, 0, len(labels))
@@ -336,67 +503,71 @@ func buildRecCalibReport(recType string, horizon int) (*RecCalibReport, error) {
 			ids = append(ids, l.RecommendationID)
 		}
 	}
-	type recMeta struct {
-		conf     int
-		sysConf  string
-		degraded bool
-	}
-	metas := map[int64]recMeta{}
+	metas := map[int64]calibRecMeta{}
 	for start := 0; start < len(ids); start += 500 {
 		end := start + 500
 		if end > len(ids) {
 			end = len(ids)
 		}
 		var recs []model.Recommendation
-		if err := common.DB.Select("id", "confidence", "detail_json").
+		if err = common.DB.Select("id", "confidence", "detail_json").
 			Where("id IN ?", ids[start:end]).Find(&recs).Error; err != nil {
-			return nil, err
+			return nil, coverage, err
 		}
 		for _, r := range recs {
 			var pm calibPickMeta
 			_ = json.Unmarshal([]byte(r.DetailJSON), &pm)
-			metas[r.ID] = recMeta{conf: r.Confidence, sysConf: pm.SysConfidence, degraded: pm.DegradedSource != ""}
+			metas[r.ID] = calibRecMeta{conf: r.Confidence, sysConf: pm.SysConfidence, degraded: pm.DegradedSource != ""}
 		}
 	}
 
-	type sample struct {
-		label model.RecommendationLabel
-		meta  recMeta
-	}
-	var usable []sample
 	for _, l := range labels {
 		switch l.MaturityStatus {
 		case model.LabelMatured:
-			rep.Coverage.Matured++
+			coverage.Matured++
 			if l.Forced {
-				rep.Coverage.Forced++
+				coverage.Forced++
 				continue
 			}
 			m, ok := metas[l.RecommendationID]
 			if !ok {
 				// 孤儿标签（推荐条目已被用户删除）：置信度/SysConfidence 无从查证，
 				// 混入会以 confidence=0 进桶把 Brier/ECE 拉向失真——单列剔除（审查修复批）。
-				rep.Coverage.OrphanExcl++
+				coverage.OrphanExcl++
 				continue
 			}
 			if m.degraded {
 				// 量化降级条目：置信度 35/SysConfidence low 是程序赋值，不是模型预测，
 				// 混入会把「程序规则」误测成「模型校准」。
-				rep.Coverage.DegradedExcl++
+				coverage.DegradedExcl++
 				continue
 			}
-			usable = append(usable, sample{label: l, meta: m})
+			usable = append(usable, calibSample{label: l, meta: m})
 		case model.LabelPending:
-			rep.Coverage.Pending++
+			coverage.Pending++
 		case model.LabelSkipped:
-			rep.Coverage.Skipped++
+			coverage.Skipped++
 		case model.LabelNoData:
-			rep.Coverage.NoData++
+			coverage.NoData++
 		}
 	}
-	if rep.Coverage.Total > 0 {
-		rep.Coverage.MaturedRatioPct = round2(float64(rep.Coverage.Matured) / float64(rep.Coverage.Total) * 100)
+	if coverage.Total > 0 {
+		coverage.MaturedRatioPct = round2(float64(coverage.Matured) / float64(coverage.Total) * 100)
 	}
+	return usable, coverage, nil
+}
+
+// buildRecCalibReport 单 type×horizon 的推荐校准（全库口径：管理端报表不分用户，
+// 样本才够门槛；Notes 声明）。
+func buildRecCalibReport(recType string, horizon int) (*RecCalibReport, error) {
+	rep := &RecCalibReport{Type: recType, HorizonDays: horizon}
+
+	usable, coverage, err := loadRecCalibSamples(recType, horizon)
+	if err != nil {
+		return nil, err
+	}
+	rep.Coverage = coverage
+	type sample = calibSample
 
 	rep.Sample = len(usable)
 
@@ -535,12 +706,75 @@ func buildRecCalibReport(recType string, horizon int) (*RecCalibReport, error) {
 		rep.TierMonotone = calibTierMonotone(rep.SysTiers)
 	}
 
+	// P2-5 分层维度（buy 口径，与口头置信度校准同样本池）：策略/regime 用标签归因冗余，
+	// provider·model/prompt_version 关联批次归因列（批次已删/旧行空值层归「（未知）」）。
+	// 分层是观察不是采信：每层样本 ≥ calibEvalMinSample 才产出该层 Brier/ECE。
+	{
+		var buys []sample
+		batchIDs := make([]int64, 0, 16)
+		seenBatch := map[int64]bool{}
+		for _, s := range usable {
+			if s.label.Action != model.RecActionBuy {
+				continue
+			}
+			buys = append(buys, s)
+			if s.label.BatchID > 0 && !seenBatch[s.label.BatchID] {
+				seenBatch[s.label.BatchID] = true
+				batchIDs = append(batchIDs, s.label.BatchID)
+			}
+		}
+		if len(buys) > 0 {
+			bmetas, err := calibBatchMetaByID(batchIDs)
+			if err != nil {
+				return nil, err
+			}
+			sliceObs := func(keyOf func(sample) string) []calibSliceObs {
+				out := make([]calibSliceObs, 0, len(buys))
+				for _, s := range buys {
+					out = append(out, calibSliceObs{
+						Key: keyOf(s), Conf: float64(s.meta.conf),
+						Hit: s.label.NetReturnPct > 0, Net: s.label.NetReturnPct,
+						Alpha: s.label.AlphaPct, HasBench: s.label.HasBench,
+					})
+				}
+				return out
+			}
+			dims := []struct {
+				dim   string
+				label string
+				keyOf func(sample) string
+			}{
+				{"strategy", "策略", func(s sample) string { return s.label.Strategy }},
+				{"regime", "市场状态", func(s sample) string { return s.label.Regime }},
+				{"provider_model", "Provider·Model", func(s sample) string {
+					m, ok := bmetas[s.label.BatchID]
+					return calibProviderModelKey(m, ok)
+				}},
+				{"prompt_version", "Prompt 版本", func(s sample) string {
+					m, ok := bmetas[s.label.BatchID]
+					if !ok {
+						return ""
+					}
+					return m.PromptVersion
+				}},
+			}
+			for _, d := range dims {
+				rows := calibSliceRows(sliceObs(d.keyOf))
+				if len(rows) == 0 {
+					continue
+				}
+				rep.Slices = append(rep.Slices, CalibSliceGroup{Dim: d.dim, Label: d.label, Rows: rows})
+			}
+		}
+	}
+
 	rep.Notes = append(rep.Notes,
 		"全库口径（不分用户）：管理端测量报表，样本才够门槛；口径=统一执行模拟 next_open、label_version="+labelVersion+"、成熟非强平非降级",
 		"口头置信度校准仅限 buy 样本；y=净收益>0。Brier/ECE 是「模型口头 confidence 不当真实概率」（§6.3）的测量证据，非采信",
 		"程序合成置信度是有序档位不硬造概率，只报分档命中率/收益与单调性观察；成本前（gross）与成本后（net）收益分开统计",
 		fmt.Sprintf("「已评估」硬门槛=buy 口头置信度样本 ≥%d（§8.1 推荐模块每数据状态 100；未评估≠0 分）；分档/PR 表 <%d 仅供分级参考、单桶/单档 <%d 统计不稳定", calibEvalMinSample, calibMinSample, calibMinBucket),
-		"口径限制（如实声明）：未按 provider/model/prompt/策略/regime 分层（先分层再汇总的完整口径待 P2-5 联合评估）；confidence 为落库终值（复核 reject 降级条目的置信度已被程序改写，混合了模型原始预测与复核修正）",
+		fmt.Sprintf("分层维度（P2-5）：策略/市场状态取标签归因冗余，provider·model/prompt_version 关联批次归因列（prompt_version 分层即 champion/challenger 晋级前后的对照落点）；每层样本 ≥%d 才产出该层 Brier/ECE，小样本层只报命中率/收益供参考，分层是观察不是采信", calibEvalMinSample),
+		"口径限制（如实声明）：confidence 为落库终值（复核 reject 降级条目的置信度已被程序改写，混合了模型原始预测与复核修正）",
 	)
 	return rep, nil
 }

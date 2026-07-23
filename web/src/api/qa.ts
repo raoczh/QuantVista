@@ -8,9 +8,27 @@ export interface QaMessage {
   role: 'user' | 'assistant'
   content: string
   check_json?: string // assistant 回答的证据核验结果 JSON（服务端回填，旧消息无）
+  context_json?: string // P2-3 本轮上下文分层快照 JSON（assistant 消息；旧消息无）
   run_id?: string // P0-2：本轮回答对应的调用组 ID（llm_call_logs.run_id 同值；旧消息无）
   total_tokens: number
   created_at: string
+}
+
+// P2-3 上下文分层快照（QaContextLayers；「模型看到了什么/没看到什么」可核查）。
+export interface QaContextLayers {
+  version: string
+  history_msgs: number
+  history_chars: number
+  tier1_msgs: number
+  tier1_chars: number
+  tier2_rounds: number
+  tier2_chars: number
+  tier2_dropped_rounds: number
+  tier3_rounds: number
+  tier3_chars: number
+  tier3_matched?: { round: number; score: number }[]
+  invisible_rounds: number
+  approx_tokens: number
 }
 
 export interface QaConversation {

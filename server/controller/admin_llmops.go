@@ -40,6 +40,26 @@ func (ac *AdminController) LLMRoles(c *gin.Context) {
 	})
 }
 
+// LLMJointEval GET /api/admin/llm-joint-eval?refresh=1&include_locked=1 —— P2-5
+// 组合/回测联合评估。默认返回进程内缓存（常规视图，不含锁定段指标）；refresh=1 重算；
+// include_locked=1 显式请求锁定段指标——恒重算不走缓存，且每次读取登记审计
+// （§9.1「发布前只读一次」以可见审计落地）。
+func (ac *AdminController) LLMJointEval(c *gin.Context) {
+	includeLocked := c.Query("include_locked") == "1"
+	if !includeLocked && c.Query("refresh") != "1" {
+		if rep := service.CachedJointEvalReport(); rep != nil {
+			common.ApiSuccess(c, rep)
+			return
+		}
+	}
+	rep, err := service.RunJointEval(includeLocked)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, rep)
+}
+
 // ---------- P2-1/P2-2 champion/challenger 实验（llm_experiment.go） ----------
 
 // LLMExperiments GET /api/admin/llm-experiments —— 实验列表（含 P2-2 谱系字段）。

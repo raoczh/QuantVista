@@ -7,6 +7,7 @@ import {
   type RecCalibReport,
   type CalibBucket,
   type CalibTierCell,
+  type CalibSliceRow,
   type AnalysisCalibTier,
 } from '@/api/admin'
 import PageContainer from '@/components/PageContainer.vue'
@@ -93,6 +94,18 @@ const anaTierColumns = computed<DataTableColumns<AnalysisCalibTier>>(() => [
   { title: '+20 日平均收益', key: 'ret', width: 120, render: (r) => h('span', { class: 'qv-tnum', style: `color:${netColor(r.avg_ret20_pct) || 'inherit'}` }, pct(r.avg_ret20_pct)) },
 ])
 
+// P2-5 分层维度表（策略/regime/provider·model/prompt_version；buy 口径）。
+const sliceColumns = computed<DataTableColumns<CalibSliceRow>>(() => [
+  { title: '取值', key: 'key', width: 190, ellipsis: { tooltip: true } },
+  { title: '样本', key: 'sample', width: 70, render: (r) => h('span', { class: 'qv-tnum', style: r.sample < 5 ? 'opacity:0.5' : '' }, String(r.sample)) },
+  { title: '命中率', key: 'hit', width: 84, render: (r) => h('span', { class: 'qv-tnum' }, pct(r.hit_rate_pct)) },
+  { title: '均值净收益', key: 'net', width: 100, render: (r) => h('span', { class: 'qv-tnum', style: `color:${netColor(r.avg_net_pct) || 'inherit'}` }, pct(r.avg_net_pct)) },
+  { title: '中位净收益', key: 'med', width: 100, render: (r) => h('span', { class: 'qv-tnum', style: `color:${netColor(r.median_net_pct) || 'inherit'}` }, pct(r.median_net_pct)) },
+  { title: '均值α', key: 'alpha', width: 90, render: (r) => h('span', { class: 'qv-tnum' }, r.alpha_sample > 0 ? pct(r.avg_alpha_pct) : '—') },
+  { title: 'Brier', key: 'brier', width: 90, render: (r) => h('span', { class: 'qv-tnum' }, r.brier === undefined || r.brier === null ? '未评估' : r.brier.toFixed(4)) },
+  { title: 'ECE', key: 'ece', width: 90, render: (r) => h('span', { class: 'qv-tnum' }, r.ece === undefined || r.ece === null ? '未评估' : r.ece.toFixed(4)) },
+])
+
 function prLine(rep: RecCalibReport): string {
   const pr = rep.action_pr
   const parts: string[] = []
@@ -144,6 +157,10 @@ function prLine(rep: RecCalibReport): string {
               <template v-if="rec.reliability?.length">
                 <div class="calib-sub">口头置信度可靠性曲线（仅 buy；负偏差=过度自信）</div>
                 <n-data-table :columns="bucketColumns" :data="rec.reliability" :row-key="(r: CalibBucket) => r.label" size="small" :scroll-x="620" />
+              </template>
+              <template v-for="grp in rec.slices || []" :key="grp.dim">
+                <div class="calib-sub">分层：{{ grp.label }}（仅 buy；每层样本达门槛才产出 Brier/ECE）</div>
+                <n-data-table :columns="sliceColumns" :data="grp.rows" :row-key="(r: CalibSliceRow) => r.key" size="small" :scroll-x="820" />
               </template>
               <div class="calib-notes">
                 <div v-for="(n, i) in rec.notes" :key="i">{{ n }}</div>

@@ -143,6 +143,7 @@ const userOptions = computed<DropdownOption[]>(() => {
       { label: 'LLM 校准报表', key: 'admin-calibration' },
       { label: 'LLM 角色资产', key: 'admin-llm-roles' },
       { label: 'LLM 实验', key: 'admin-llm-experiments' },
+      { label: '联合评估', key: 'admin-joint-eval' },
     )
   opts.push({ type: 'divider', key: 'd1' }, { label: '退出登录', key: 'logout' })
   return opts
@@ -158,6 +159,7 @@ async function onSelectUser(key: string) {
   else if (key === 'admin-calibration') router.push('/admin/calibration')
   else if (key === 'admin-llm-roles') router.push('/admin/llm-roles')
   else if (key === 'admin-llm-experiments') router.push('/admin/llm-experiments')
+  else if (key === 'admin-joint-eval') router.push('/admin/joint-eval')
   else if (key === 'logout') {
     setMarketTitle('')
     await authStore.logout()
