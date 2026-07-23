@@ -99,6 +99,7 @@ export interface DebateResult {
   rebuttals?: DebateChallenge[]
   judge?: DebateJudge
   degraded_reason?: string // bull_failed / bear_failed / judge_failed / judge_invalid
+  rebuttal_degraded?: boolean // 反驳轮失败（best-effort：裁决照常，轮数已回退 1）
   version: string
 }
 

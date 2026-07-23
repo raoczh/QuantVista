@@ -66,6 +66,8 @@ func AllModels() []any {
 		&RecommendationLabel{},
 		&RecommendationCandidateEvent{},
 		&RecommendationReflection{},
+		&LLMExperiment{},
+		&LLMExperimentRun{},
 		&StockUniverseDaily{},
 		&FactorSnapshotDaily{},
 	}

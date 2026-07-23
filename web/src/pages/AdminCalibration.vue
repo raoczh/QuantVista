@@ -100,6 +100,7 @@ function prLine(rep: RecCalibReport): string {
   parts.push(`recall=${pct(pr.recall_net_pct)}`)
   parts.push(`watch 对照命中=${pct(pr.watch_hit_pct)}`)
   if (pr.alpha_sample > 0) parts.push(`precision(α)=${pct(pr.precision_alpha_pct)}`)
+  if (pr.alpha_sample > 0) parts.push(`recall(α)=${pct(pr.recall_alpha_pct)}`)
   return parts.join(' · ')
 }
 </script>
@@ -125,14 +126,14 @@ function prLine(rep: RecCalibReport): string {
               <div class="calib-head">
                 <span class="calib-title">{{ typeLabel[rec.type] || rec.type }} · 持有 {{ rec.horizon_days }} 交易日</span>
                 <n-tag size="small" :type="rec.evaluated ? 'success' : 'warning'" :bordered="false">
-                  {{ rec.evaluated ? `已评估（成熟样本 ${rec.sample}）` : `未评估（样本 ${rec.sample} 不足 30）` }}
+                  {{ rec.evaluated ? `已评估（buy 校准样本达标）` : `未评估（buy 校准样本不足 100）` }}
                 </n-tag>
                 <span class="calib-kv">Brier={{ num4(rec.brier) }} · ECE={{ num4(rec.ece) }}</span>
               </div>
               <div class="calib-cov">
                 标签覆盖：共 {{ rec.coverage.total }} 条 · 成熟 {{ rec.coverage.matured }}（{{ rec.coverage.matured_ratio_pct.toFixed(1) }}%）·
                 待成熟 {{ rec.coverage.pending }} · 无法成交 {{ rec.coverage.skipped }} · 无数据 {{ rec.coverage.no_data }} ·
-                强平剔除 {{ rec.coverage.forced }} · 量化降级剔除 {{ rec.coverage.degraded_excl }}
+                强平剔除 {{ rec.coverage.forced }} · 量化降级剔除 {{ rec.coverage.degraded_excl }} · 孤儿剔除 {{ rec.coverage.orphan_excl }}
               </div>
               <div class="calib-cov">动作判定（buy {{ rec.buy_sample }} / 全部 {{ rec.action_pr.sample }}）：{{ prLine(rec) }}</div>
               <template v-if="rec.sys_tiers?.length">
@@ -158,14 +159,14 @@ function prLine(rep: RecCalibReport): string {
           <div v-if="report?.analysis">
             <div class="calib-head">
               <n-tag size="small" :type="report.analysis.evaluated ? 'success' : 'warning'" :bordered="false">
-                {{ report.analysis.evaluated ? `已评估（可判定 ${report.analysis.judged}）` : `未评估（可判定 ${report.analysis.judged} 不足 30）` }}
+                {{ report.analysis.evaluated ? `已评估（可判定 ${report.analysis.judged}）` : `未评估（可判定 ${report.analysis.judged} 不足 100）` }}
               </n-tag>
               <span class="calib-kv">Brier={{ num4(report.analysis.brier) }} · ECE={{ num4(report.analysis.ece) }}</span>
             </div>
             <div class="calib-cov">
               回看 {{ report.analysis.scanned }} 条个股标准分析 · 可判定 {{ report.analysis.judged }} ·
               中性不判 {{ report.analysis.neutral_skipped }} · 未满 20 交易日 {{ report.analysis.immature_skipped }} ·
-              无本地日线 {{ report.analysis.no_data_skipped }} · 旧记录无程序置信度 {{ report.analysis.no_sys_conf }}
+              无本地日线 {{ report.analysis.no_data_skipped }} · 旧记录无程序置信度 {{ report.analysis.no_sys_conf }} · 同标的同日去重 {{ report.analysis.dup_skipped }}
             </div>
             <template v-if="report.analysis.sys_tiers?.length">
               <div class="calib-sub">程序合成置信度分档（方向命中口径）</div>

@@ -142,25 +142,29 @@ func analysisClaimSpecs(result *AnalysisResult) []claimSpec {
 	return specs
 }
 
-// recPickClaimSpec 单条推荐的 claim spec：短线 text=首条理由、长线 text=投资逻辑（thesis）
-// 优先；失效条件=invalidation 字段（短线既有、长线 P1-2 起要求输出）。
-// Section 与 verifyEvidence 的固定段名「推荐依据」一致。
-func recPickClaimSpec(p recPick) claimSpec {
-	text := ""
+// recPickClaimText 单条推荐的结论正文（claim 文本与其核验段共用，审查修复批抽出）：
+// 短线=首条理由、长线=投资逻辑（thesis）优先；全空时以动作本身为结论陈述兜底。
+func recPickClaimText(p recPick) string {
 	if strings.TrimSpace(p.Thesis) != "" {
-		text = p.Thesis
-	} else if len(p.Reason) > 0 {
-		text = p.Reason[0]
+		return p.Thesis
 	}
-	if strings.TrimSpace(text) == "" {
-		// 理由与逻辑全空（orEmpty 兜底后是 []）：以动作本身为结论陈述，保证 pick 恒有 claim。
-		text = fmt.Sprintf("%s：%s", p.Symbol, recActionLabel(p.Action))
+	if len(p.Reason) > 0 && strings.TrimSpace(p.Reason[0]) != "" {
+		return p.Reason[0]
 	}
+	return fmt.Sprintf("%s：%s", p.Symbol, recActionLabel(p.Action))
+}
+
+// recPickClaimSpec 单条推荐的 claim spec：text=recPickClaimText（thesis/首条理由）。
+// Section=「推荐结论」——审查修复批起 claim 正文自成核验段（verifyEvidence 已把该文本
+// 作为独立 section 核验）：claim 的 evidence_ids 只从**结论正文自身**的快照命中推导、
+// 正文里的方向错误能标 contradictory。此前 Section=「推荐依据」时，一条与结论无关但
+// 数字正确的 evidence 也会把 thesis 标成 resolved（核验的不是被声明的内容）——严禁改回。
+func recPickClaimSpec(p recPick) claimSpec {
 	var inv []string
 	if strings.TrimSpace(p.Invalidation) != "" {
 		inv = []string{p.Invalidation}
 	}
-	return claimSpec{Section: "推荐依据", Text: text, Invalidators: inv}
+	return claimSpec{Section: recClaimSection, Text: recPickClaimText(p), Invalidators: inv}
 }
 
 // recActionLabel action 人话（claim 兜底文本用）。

@@ -40,6 +40,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/admin/walk-forward', name: 'admin-walk-forward', component: () => import('@/pages/AdminWalkForward.vue'), meta: { title: 'Walk-Forward 基线', admin: true } },
   { path: '/admin/calibration', name: 'admin-calibration', component: () => import('@/pages/AdminCalibration.vue'), meta: { title: 'LLM 校准报表', admin: true } },
   { path: '/admin/llm-roles', name: 'admin-llm-roles', component: () => import('@/pages/AdminLlmRoles.vue'), meta: { title: 'LLM 角色资产', admin: true } },
+  { path: '/admin/llm-experiments', name: 'admin-llm-experiments', component: () => import('@/pages/AdminLlmExperiments.vue'), meta: { title: 'LLM 实验', admin: true } },
   { path: '/:pathMatch(.*)*', name: 'notfound', component: Placeholder, meta: { title: '未找到' } },
 ]
 

@@ -105,6 +105,8 @@ func verifyEvidenceLabeled(sections []evidenceSection, vals []labeledValue) *evi
 	// ev5：P1-2 起 evidenceCheck 携带结论级 claims（deriveClaims 由调用方按模块结论段挂载）。
 	check := &evidenceCheck{Version: "ev5"}
 	type key struct {
+		sec string // 审查修复批：去重限同段——相同数值出现在不同结论段时各自成项，
+		// 否则后段的证据被前段吞并，后段 claim 会得到错误的 unresolved
 		v    float64
 		unit string
 		dir  string
@@ -155,7 +157,7 @@ func verifyEvidenceLabeled(sections []evidenceSection, vals []labeledValue) *evi
 			// 识别方向（前窗口方向词，或 token 自带符号）。
 			dir := directionOf(runes, loc[0], text, tok, num)
 
-			k := key{v: math.Round(scaled*1e4) / 1e4, unit: unitNorm, dir: dir}
+			k := key{sec: sec.Module, v: math.Round(scaled*1e4) / 1e4, unit: unitNorm, dir: dir}
 			if idx, ok := seen[k]; ok {
 				items[idx].Count++
 				continue

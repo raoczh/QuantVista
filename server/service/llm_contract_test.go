@@ -781,7 +781,7 @@ func TestP0SevenFloorsRemainEnabledWhenContractFlagOff(t *testing.T) {
 	if err := common.DB.Create(&news).Error; err != nil {
 		t.Fatal(err)
 	}
-	briefs := latestNewsBriefsAt("600888", 10, now)
+	briefs, _ := latestNewsBriefsAt("600888", 10, now)
 	if len(briefs) != 1 || briefs[0].Title != "窗口内" {
 		t.Fatalf("flag 关闭不得放松新闻双边窗口: %+v", briefs)
 	}
@@ -941,7 +941,7 @@ func TestLatestNewsBriefsWindow(t *testing.T) {
 		}
 	}
 
-	briefs := latestNewsBriefsAt("600000", 10, now)
+	briefs, _ := latestNewsBriefsAt("600000", 10, now)
 	if len(briefs) != 4 {
 		t.Fatalf("窗口应包含 2/6/恰好7天/跨年四条，排除旧闻和未来（期望 4 条）, got %d: %+v", len(briefs), briefs)
 	}

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -158,7 +159,7 @@ func TestReflectionFlagOff(t *testing.T) {
 	common.DB.Create(&model.RecommendationReflection{RecommendationID: 991, HorizonDays: 10,
 		Symbol: "600100", Strategy: "momentum", RecType: model.RecTypeShortTerm,
 		Outcome: "win", Lesson: "教训", AvailableFrom: time.Now().Add(-time.Hour), ReflectionVersion: reflectionVersion})
-	if got := reflectionShadowJSON(model.RecTypeShortTerm, "momentum",
+	if got := reflectionShadowJSON(0, model.RecTypeShortTerm, "momentum",
 		[]candidate{{Symbol: "600100"}}); got != "" {
 		t.Fatalf("flag 关检索应返回空: %s", got)
 	}
@@ -253,12 +254,12 @@ func TestReflectionAvailableFromFilter(t *testing.T) {
 		Symbol: "600100", Strategy: "momentum", RecType: model.RecTypeShortTerm,
 		Outcome: "loss", Lesson: "未来的教训（不可见）", AvailableFrom: now.Add(time.Hour), ReflectionVersion: reflectionVersion})
 
-	got := lookupReflections(now, model.RecTypeShortTerm, "momentum", []string{"600100"})
+	got := lookupReflections(now, 0, model.RecTypeShortTerm, "momentum", []string{"600100"})
 	if len(got) != 1 || got[0].ID == 0 || !strings.Contains(got[0].Lesson, "过去的教训") {
 		t.Fatalf("未来 available_from 必须被过滤: %+v", got)
 	}
 	// 回放时点更早：全部不可见。
-	if got := lookupReflections(now.Add(-2*time.Hour), model.RecTypeShortTerm, "momentum", []string{"600100"}); len(got) != 0 {
+	if got := lookupReflections(now.Add(-2*time.Hour), 0, model.RecTypeShortTerm, "momentum", []string{"600100"}); len(got) != 0 {
 		t.Fatalf("回放时点早于全部教训生成时刻应为空: %+v", got)
 	}
 }
@@ -280,7 +281,7 @@ func TestReflectionLookupPriority(t *testing.T) {
 	mk(2003, "600400", "momentum") // strategy 命中
 	mk(2004, "600500", "other")    // 都不命中
 
-	got := lookupReflections(now, model.RecTypeShortTerm, "momentum", []string{"600100", "600900"})
+	got := lookupReflections(now, 0, model.RecTypeShortTerm, "momentum", []string{"600100", "600900"})
 	if len(got) != 3 {
 		t.Fatalf("应命中 3 条（1 symbol + 2 strategy）: %+v", got)
 	}
@@ -308,7 +309,7 @@ func TestReflectionShadowJSONNotMutatePicks(t *testing.T) {
 
 	cands := []candidate{{Symbol: "600100", Name: "甲", Price: 10, Score: 80}}
 	before, _ := json.Marshal(cands)
-	raw := reflectionShadowJSON(model.RecTypeShortTerm, "momentum", cands)
+	raw := reflectionShadowJSON(0, model.RecTypeShortTerm, "momentum", cands)
 	after, _ := json.Marshal(cands)
 
 	if string(before) != string(after) {
@@ -323,7 +324,57 @@ func TestReflectionShadowJSONNotMutatePicks(t *testing.T) {
 		t.Fatalf("快照形态不符: %+v", snap)
 	}
 	// 无匹配（标的与策略都不命中）：空串（批次列保持空，前端零噪声）。
-	if got := reflectionShadowJSON(model.RecTypeShortTerm, "pullback", []candidate{{Symbol: "000999"}}); got != "" {
+	if got := reflectionShadowJSON(0, model.RecTypeShortTerm, "pullback", []candidate{{Symbol: "000999"}}); got != "" {
 		t.Fatalf("无匹配应返回空串: %s", got)
+	}
+}
+
+// TestReflectionUserIsolation 用户隔离铁律（审查修复批）：影子检索只返回本用户的
+// 教训——反思行携带来源用户的标的/收益结局/教训文本，跨用户返回即数据泄漏。
+func TestReflectionUserIsolation(t *testing.T) {
+	setReflectionFlag(t, true)
+	cleanReflectionTables(t)
+
+	now := time.Now()
+	common.DB.Create(&model.RecommendationReflection{RecommendationID: 5001, HorizonDays: 10,
+		UserID: 11, Symbol: "600100", Strategy: "momentum", RecType: model.RecTypeShortTerm,
+		Outcome: "loss", ReturnPct: -8, Lesson: "用户A的教训", AvailableFrom: now.Add(-time.Hour),
+		ReflectionVersion: reflectionVersion})
+
+	// 用户 B（22）检索同标的/同策略：一条都不可见。
+	if got := lookupReflections(now, 22, model.RecTypeShortTerm, "momentum", []string{"600100"}); len(got) != 0 {
+		t.Fatalf("跨用户教训不得返回: %+v", got)
+	}
+	if got := reflectionShadowJSON(22, model.RecTypeShortTerm, "momentum", []candidate{{Symbol: "600100"}}); got != "" {
+		t.Fatalf("跨用户影子快照应为空: %s", got)
+	}
+	// 本人可见。
+	if got := lookupReflections(now, 11, model.RecTypeShortTerm, "momentum", []string{"600100"}); len(got) != 1 {
+		t.Fatalf("本人教训应可见: %+v", got)
+	}
+}
+
+// TestReflectionOrphanLabelsNotBlocking 孤儿标签不阻塞（审查修复批）：推荐条目已删的
+// 标签在 SQL 侧排除——「最新 N 条全是孤儿」时更早的有效候选仍能被选中，不会每轮
+// 重复选中孤儿导致永久饿死。
+func TestReflectionOrphanLabelsNotBlocking(t *testing.T) {
+	setReflectionFlag(t, true)
+	cleanReflectionTables(t)
+
+	// 先落 1 条有效候选（较早），再落 6 条孤儿（较新：标签在、推荐行删除）。
+	valid := seedMaturedLabel(t, 1, "600700", model.RecTypeShortTerm, "momentum", 10, 4.2, false, false)
+	common.DB.Model(&model.RecommendationLabel{}).Where("id = ?", valid.ID).
+		Update("updated_at", time.Now().Add(-time.Hour))
+	for i := 0; i < 6; i++ {
+		l := seedMaturedLabel(t, 1, fmt.Sprintf("6008%02d", i), model.RecTypeShortTerm, "momentum", 10, 1, false, false)
+		common.DB.Delete(&model.Recommendation{}, l.RecommendationID)
+	}
+
+	cands, err := loadReflectionCandidates(5)
+	if err != nil {
+		t.Fatalf("loadReflectionCandidates: %v", err)
+	}
+	if len(cands) != 1 || cands[0].label.ID != valid.ID {
+		t.Fatalf("孤儿标签应在 SQL 侧排除，仅返回有效候选: %d 条", len(cands))
 	}
 }

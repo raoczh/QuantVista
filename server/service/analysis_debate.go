@@ -38,7 +38,10 @@ import (
 // flag `llm_conditional_debate`（缺省开）：关闭只回退触发判定，主分析链路不受影响。
 
 // debateVersion 辩论编排版本（触发条件/轮次策略/prompt 措辞变更时递增）。
-const debateVersion = "db1"
+// db2（审查修复批）：程序收口三条——claim 必须引用合法 evidence_id（零引用剥除）、bear
+// challenges 非空、judge 三列表互斥且至少一个有效引用；rebuttal 失败回退 Rounds=1 并记
+// rebuttal_degraded；prompt 措辞同步。db1：初版条件式编排。
+const debateVersion = "db2"
 
 // 辩论轮次与规模上限。
 const (
@@ -108,7 +111,10 @@ type debateResult struct {
 	Rebuttals      []debateChallenge `json:"rebuttals,omitempty"`
 	Judge          *debateJudge      `json:"judge,omitempty"`
 	DegradedReason string            `json:"degraded_reason,omitempty"`
-	Version        string            `json:"version"`
+	// RebuttalDegraded 反驳轮失败标记（审查修复批）：rebuttal 是 best-effort，失败不
+	// 降级整体（judge 照常裁决），但必须如实记录且 Rounds 回退 1——不许伪装成完整两轮。
+	RebuttalDegraded bool   `json:"rebuttal_degraded,omitempty"`
+	Version          string `json:"version"`
 }
 
 // debateTriggerReasons 程序判定触发条件（纯函数可测）。返回空=不触发（高置信默认单路）。
@@ -205,7 +211,7 @@ func buildDebateEvidenceIndex(ev *evidenceCheck) ([]debateEvidenceRef, map[strin
 
 const debateBullSystem = `你是独立的看多研究员（bull），只建立当前数据快照下最强的看多论证。你与主分析师、看空研究员相互独立。
 规则：
-1. 只依据【数据快照】与【证据索引】论证；每条论点的 evidence_ids 只能引用证据索引中存在的 evidence_id，不得编造证据或引用快照外事实；
+1. 只依据【数据快照】与【证据索引】论证；每条论点的 evidence_ids **必须**引用至少一个证据索引中存在的 evidence_id（无证据引用的论点会被程序剥除），不得编造证据或引用快照外事实；
 2. 主分析中的反方观点（anti_thesis）与矛盾结论是你要正面回应的对手观点，不得回避；
 3. 必须至少为一条论点主动给出 invalidator（出现什么情况该看多论点失效）；
 4. 不得淡化风险闸门提示，不得把数据缺失（unknown）当利好。
@@ -213,8 +219,8 @@ const debateBullSystem = `你是独立的看多研究员（bull），只建立�
 
 const debateBearSystem = `你是独立的看空研究员（bear），只寻找会让看多论点失败的风险：财务、估值、行业、政策、流动性、事件与执行风险。你与主分析师、看多研究员相互独立。
 规则：
-1. 只依据【数据快照】与【证据索引】论证；evidence_ids 只能引用证据索引中存在的 evidence_id；
-2. 逐条审视【看多论点】，对你不认同的条目在 challenges 中给出针对性反驳（claim_id 用对方论点 id）；
+1. 只依据【数据快照】与【证据索引】论证；每条看空论点的 evidence_ids **必须**引用至少一个证据索引中存在的 evidence_id（无证据引用的论点会被程序剥除）；
+2. 逐条审视【看多论点】，challenges **至少给出一条**针对性反驳（claim_id 用对方论点 id）——空 challenges 视为未完成反驳职责；
 3. 每条看空论点标注 confirmed：true=数据已证实的风险，false=假设性风险（数据不足以证实但值得警惕）；
 4. 必须至少为一条论点写出 invalidator（什么新证据会推翻这条看空判断）；数据未提供的维度（如解禁减持）只能提示核查，严禁虚构。
 只输出 JSON：{"claims":[{"text":"看空论点","evidence_ids":[],"confirmed":true,"invalidator":"推翻条件"}],"challenges":[{"claim_id":"bu-01","text":"针对性反驳（带具体数字/事实）"}]}，claims 1~4 条，不要任何解释或代码块标记。`
@@ -228,7 +234,7 @@ const debateJudgeSystem = `你是辩论裁判（judge），对看多/看空双�
 1. 按证据质量排序：来源状态、时效、直接性与独立来源数——不按角色票数平均，不和稀泥；
 2. verdict 只能是 bullish/neutral/bearish；neutral 只能用于证据真正平衡或不足，不得用于回避判断；
 3. 风险闸门为禁止买入级（block）时 verdict 不得为 bullish；
-4. decisive_claim_ids=决定裁决方向的关键论点、rejected_claim_ids=被证据否定的论点、unresolved_claim_ids=证据不足无法裁决的论点——只能引用双方实际给出的论点 id（bu-*/be-*），不得新增双方未提出的事实；
+4. decisive_claim_ids=决定裁决方向的关键论点、rejected_claim_ids=被证据否定的论点、unresolved_claim_ids=证据不足无法裁决的论点——只能引用双方实际给出的论点 id（bu-*/be-*），三个列表合计**必须至少引用一个**（无引用的裁决无效），同一 id 不得重复出现在多个列表，不得新增双方未提出的事实；
 5. 估值、技术与事件结论方向冲突时必须写 conflict_note 点名冲突，不能用一句「综合来看」抹平；
 6. confidence_reason 写清裁决的置信依据；invalidators 写出会推翻本裁决的条件。
 只输出 JSON：{"verdict":"bullish|neutral|bearish","decisive_claim_ids":[],"rejected_claim_ids":[],"unresolved_claim_ids":[],"confidence_reason":"...","invalidators":[],"conflict_note":""}，不要任何解释或代码块标记。`
@@ -276,11 +282,13 @@ func (s *AnalysisService) debateCallOne(ctx context.Context, userID int64, run *
 }
 
 // normalizeDebateClaims 归一一方 claims：程序重编号 id（prefix-01…）、剥除证据白名单外的
-// evidence_id、截断文本、限条数。全部条目都无 invalidator 时返回错误（蓝图纪律：必须主动
-// 给出至少一个失效条件——作为解析错误触发 repair）。
+// evidence_id、截断文本、限条数。程序收口两条（审查修复批，蓝图 C「每方逐条引用证据」）：
+// ①剥除后零条合法 evidence 引用的 claim 直接丢弃——空口论点不进辩论记录；②全部条目
+// 都无 invalidator 时返回错误。两类失败均作为解析错误触发 repair。
 func normalizeDebateClaims(in []debateClaim, prefix string, allow map[string]bool) ([]debateClaim, error) {
 	out := make([]debateClaim, 0, debateMaxClaims)
 	hasInvalidator := false
+	dropped := 0
 	for _, c := range in {
 		text := strings.TrimSpace(c.Text)
 		if text == "" {
@@ -292,6 +300,10 @@ func normalizeDebateClaims(in []debateClaim, prefix string, allow map[string]boo
 			if allow[id] {
 				evs = append(evs, id)
 			}
+		}
+		if len(evs) == 0 {
+			dropped++ // 无合法证据引用：丢弃（引用越界被剥空的与压根没引用的同罪）
+			continue
 		}
 		inv := strings.TrimSpace(c.Invalidator)
 		if inv != "" {
@@ -309,6 +321,9 @@ func normalizeDebateClaims(in []debateClaim, prefix string, allow map[string]boo
 		}
 	}
 	if len(out) == 0 {
+		if dropped > 0 {
+			return nil, fmt.Errorf("全部 %d 条论点均未引用证据索引中的合法 evidence_id（每条论点必须引用至少一个）", dropped)
+		}
 		return nil, errors.New("claims 为空或全部无效")
 	}
 	if !hasInvalidator {
@@ -468,6 +483,12 @@ func (s *AnalysisService) runDebate(ctx context.Context, userID int64, cfg *mode
 			}
 			bearClaims = claims
 			challenges = filterChallenges(out.Challenges, claimIDSet(bullClaims), debateMaxClaims)
+			// 程序收口（审查修复批，蓝图 C「逐条回应」的最低要求）：bear 必须至少
+			// 有效回应一条看多论点——空 challenges（或引用全部非法被剥空）不算完成
+			// 反驳职责，触发 repair。全覆盖不强制（claims 条数不对等时不可达）。
+			if len(challenges) == 0 {
+				return errors.New("challenges 为空或 claim_id 全部非法：必须逐条审视看多论点，至少有效回应一条")
+			}
 			return nil
 		},
 		`请只输出 JSON：{"claims":[{"text","evidence_ids":[],"confirmed":true,"invalidator"}],"challenges":[{"claim_id","text"}]}，claim_id 只能引用看多论点的 id。`)
@@ -511,7 +532,13 @@ func (s *AnalysisService) runDebate(ctx context.Context, userID int64, cfg *mode
 			`请只输出 JSON：{"rebuttals":[{"claim_id","text"}]}，claim_id 只能引用看空论点的 id。`)
 		addUsage(&usage, rbUsage)
 		if rbErr != nil {
-			rebuttals = nil // 反驳轮 best-effort：失败不降级整体，无反驳直接裁决
+			// 反驳轮 best-effort：失败不降级整体、继续裁决，但**如实回退轮数并记录**
+			// （审查修复批）——Rounds=2 是「完成了两轮」的声明，失败后维持 2 会把
+			// 单轮辩论伪装成完整两轮；RebuttalDegraded 供前端/manifest 归因。
+			rebuttals = nil
+			deb.Rounds = 1
+			info.Rounds = 1
+			deb.RebuttalDegraded = true
 		}
 	}
 	deb.Rebuttals = rebuttals
@@ -549,6 +576,28 @@ func (s *AnalysisService) runDebate(ctx context.Context, userID int64, cfg *mode
 			out.DecisiveClaimIDs = filterClaimIDs(out.DecisiveClaimIDs, validIDs)
 			out.RejectedClaimIDs = filterClaimIDs(out.RejectedClaimIDs, validIDs)
 			out.UnresolvedClaimIDs = filterClaimIDs(out.UnresolvedClaimIDs, validIDs)
+			// 审查修复批：①三列表互斥——同一 claim 同时出现在多个列表时按
+			// decisive>rejected>unresolved 优先级去重（裁决自相矛盾不作 repair，程序收口）；
+			// ②剥除后必须至少保留一个有效 claim 引用——{"verdict":"bearish",
+			// "decisive_claim_ids":["fake"]} 这类空引用裁决不得生效（会压低主分析置信度
+			// 却没有任何论点支撑），触发 repair、打满走 judge_invalid。
+			taken := map[string]bool{}
+			dedupe := func(ids []string) []string {
+				var kept []string
+				for _, id := range ids {
+					if !taken[id] {
+						taken[id] = true
+						kept = append(kept, id)
+					}
+				}
+				return kept
+			}
+			out.DecisiveClaimIDs = dedupe(out.DecisiveClaimIDs)
+			out.RejectedClaimIDs = dedupe(out.RejectedClaimIDs)
+			out.UnresolvedClaimIDs = dedupe(out.UnresolvedClaimIDs)
+			if len(out.DecisiveClaimIDs)+len(out.RejectedClaimIDs)+len(out.UnresolvedClaimIDs) == 0 {
+				return errors.New("decisive/rejected/unresolved 必须引用至少一个双方实际产出的 claim id（bu-*/be-*）")
+			}
 			out.ConfidenceReason = truncateRunes(strings.TrimSpace(out.ConfidenceReason), debateTextMax)
 			out.ConflictNote = truncateRunes(strings.TrimSpace(out.ConflictNote), debateTextMax)
 			out.Invalidators = normalizeInvalidators(out.Invalidators)

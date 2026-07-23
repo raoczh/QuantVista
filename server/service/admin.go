@@ -30,6 +30,7 @@ type SystemSettingsView struct {
 	LLMCapabilityRouting   bool   `json:"llm_capability_routing"`
 	LLMConditionalDebate   bool   `json:"llm_conditional_debate"`
 	LLMReflectionShadow    bool   `json:"llm_reflection_shadow"`
+	LLMChallenger          bool   `json:"llm_challenger"`
 	SiteBaseURL            string `json:"site_base_url"`
 }
 
@@ -50,6 +51,7 @@ func (s *AdminService) GetSettings() SystemSettingsView {
 		LLMCapabilityRouting:   setting.LLMCapabilityRouting(),
 		LLMConditionalDebate:   setting.LLMConditionalDebate(),
 		LLMReflectionShadow:    setting.LLMReflectionShadow(),
+		LLMChallenger:          setting.LLMChallenger(),
 		SiteBaseURL:            setting.SiteBaseURL(),
 	}
 }
@@ -70,6 +72,7 @@ type UpdateSettingsInput struct {
 	LLMCapabilityRouting   *bool   `json:"llm_capability_routing"`
 	LLMConditionalDebate   *bool   `json:"llm_conditional_debate"`
 	LLMReflectionShadow    *bool   `json:"llm_reflection_shadow"`
+	LLMChallenger          *bool   `json:"llm_challenger"`
 	SiteBaseURL            *string `json:"site_base_url"` // 空串 = 清除（推送通知不带点击跳转）
 }
 
@@ -117,6 +120,11 @@ func (s *AdminService) UpdateSettings(in UpdateSettingsInput) (SystemSettingsVie
 	}
 	if in.LLMReflectionShadow != nil {
 		if err := setting.SetLLMReflectionShadow(*in.LLMReflectionShadow); err != nil {
+			return SystemSettingsView{}, err
+		}
+	}
+	if in.LLMChallenger != nil {
+		if err := setting.SetLLMChallenger(*in.LLMChallenger); err != nil {
 			return SystemSettingsView{}, err
 		}
 	}

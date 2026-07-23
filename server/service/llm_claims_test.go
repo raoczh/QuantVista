@@ -149,7 +149,7 @@ func TestRecPickClaimSpec(t *testing.T) {
 	long := recPick{Symbol: "600519", Action: model.RecActionBuy,
 		Thesis: "估值低位+盈利稳健", Reason: []string{"理由1"}, Invalidation: "净利连续两期转负"}
 	sp := recPickClaimSpec(long)
-	if sp.Section != "推荐依据" || sp.Text != "估值低位+盈利稳健" || sp.Invalidators[0] != "净利连续两期转负" {
+	if sp.Section != recClaimSection || sp.Text != "估值低位+盈利稳健" || sp.Invalidators[0] != "净利连续两期转负" {
 		t.Fatalf("长线 spec 错误: %+v", sp)
 	}
 	short := recPick{Symbol: "000001", Action: model.RecActionWatch, Reason: []string{"量价配合"}}

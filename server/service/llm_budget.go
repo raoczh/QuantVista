@@ -73,6 +73,9 @@ var llmModuleBudgets = map[string]llmModuleBudget{
 	"debate_judge":    {MaxTokens: 1200, RepairAttempts: 1, RepairFeedChars: 600},
 	// P1-5 反思记忆生成（recreflect.go）：批量 ≤5 条成熟推荐的教训 JSON（每条 2-4 句）。
 	"reflection": {MaxTokens: 1500, RepairAttempts: 1, RepairFeedChars: 600},
+	// P2-1 challenger 影子采样（llm_experiment.go）：与推荐主调同预算（公平对照），
+	// **无 repair**——影子对照要测的就是 challenger「一把过」的结构化质量。
+	"experiment": {MaxTokens: 2500, RepairAttempts: 0},
 }
 
 // moduleBudget 取模块预算；未登记模块回默认（不钳 token、repair 默认 1）——

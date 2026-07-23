@@ -191,6 +191,10 @@ func loadReflectionCandidates(limit int) ([]reflectionCandidate, error) {
 		Where("(type = ? AND horizon_days = 10) OR (type = ? AND horizon_days = 20)",
 			model.RecTypeShortTerm, model.RecTypeLongTerm).
 		Where("NOT EXISTS (SELECT 1 FROM recommendation_reflections rr WHERE rr.recommendation_id = recommendation_labels.recommendation_id AND rr.horizon_days = recommendation_labels.horizon_days)").
+		// 孤儿标签排除（审查修复批）：推荐条目被用户删除后标签仍在（标签是测量事实
+		// 不级联删），若只在取出后逐条跳过，「最新 5 条全是孤儿」会让每轮都重复选中
+		// 它们，更早的有效候选永远排不上队——必须在 SQL 侧排除孤儿行。
+		Where("EXISTS (SELECT 1 FROM recommendations r WHERE r.id = recommendation_labels.recommendation_id)").
 		// id ASC 是确定性 tiebreaker：同一轮结算的标签 updated_at 常落同一毫秒，
 		// 无 tiebreaker 时顺序退化为物理页序（不可复现，测试也曾因此 flaky）。
 		Order("updated_at DESC, id ASC").Limit(limit).
@@ -319,7 +323,9 @@ type reflectionShadowSnapshot struct {
 
 // lookupReflections 检索适用教训（纯查询，可测）：available_from <= asOf 是防回放泄漏
 // 铁律；同标的教训优先，名额未满再补同策略教训（symbol 命中语义更强）。
-func lookupReflections(asOf time.Time, recType, strategy string, symbols []string) []reflectionMatch {
+// userID 过滤是用户隔离铁律（审查修复批）：反思行携带来源用户的标的/收益结局/教训文本，
+// 跨用户返回=把 A 的持仓线索泄漏进 B 的批次快照并在前端展示——严禁移除该条件。
+func lookupReflections(asOf time.Time, userID int64, recType, strategy string, symbols []string) []reflectionMatch {
 	if common.DB == nil || len(symbols) == 0 {
 		return nil
 	}
@@ -340,13 +346,13 @@ func lookupReflections(asOf time.Time, recType, strategy string, symbols []strin
 		}
 	}
 	var bySymbol []model.RecommendationReflection
-	if err := common.DB.Where("available_from <= ? AND symbol IN ?", asOf, symbols).
+	if err := common.DB.Where("user_id = ? AND available_from <= ? AND symbol IN ?", userID, asOf, symbols).
 		Order("available_from DESC").Limit(reflectionShadowMax).Find(&bySymbol).Error; err == nil {
 		appendRows(bySymbol, "symbol")
 	}
 	if len(out) < reflectionShadowMax {
 		var byStrategy []model.RecommendationReflection
-		if err := common.DB.Where("available_from <= ? AND rec_type = ? AND strategy = ?", asOf, recType, strategy).
+		if err := common.DB.Where("user_id = ? AND available_from <= ? AND rec_type = ? AND strategy = ?", userID, asOf, recType, strategy).
 			Order("available_from DESC").Limit(reflectionShadowMax).Find(&byStrategy).Error; err == nil {
 			appendRows(byStrategy, "strategy")
 		}
@@ -357,7 +363,7 @@ func lookupReflections(asOf time.Time, recType, strategy string, symbols []strin
 // reflectionShadowJSON 推荐生成时的影子检索快照（runGeneration 调用，best-effort）：
 // flag 关/无匹配返回空串（批次列保持空，前端零噪声）。**只读不写、不进 prompt、
 // 不碰 picks**——影子纪律的代码形态就是「返回值只赋给 batch.ReflectionJSON」。
-func reflectionShadowJSON(recType, strategy string, llmCands []candidate) string {
+func reflectionShadowJSON(userID int64, recType, strategy string, llmCands []candidate) string {
 	if !setting.LLMReflectionShadow() {
 		return ""
 	}
@@ -365,7 +371,7 @@ func reflectionShadowJSON(recType, strategy string, llmCands []candidate) string
 	for _, c := range llmCands {
 		symbols = append(symbols, c.Symbol)
 	}
-	matched := lookupReflections(time.Now(), recType, strategy, symbols)
+	matched := lookupReflections(time.Now(), userID, recType, strategy, symbols)
 	if len(matched) == 0 {
 		return ""
 	}

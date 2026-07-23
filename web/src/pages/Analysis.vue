@@ -901,6 +901,9 @@ onMounted(async () => {
                       仅在低置信度、结论与数据矛盾或风险闸门临界时触发的独立看多/看空/裁判三角色复核；结论与主分析并列展示，不改写主评级。
                     </n-tooltip>
                   </div>
+                  <p v-if="current.result.debate.rebuttal_degraded" class="panel-text" :style="{ color: vars.warningColor }">
+                    反驳轮未完成（模型输出不合格），本次为单轮辩论后直接裁决。
+                  </p>
                   <p v-if="current.result.debate.degraded_reason && !current.result.debate.judge" class="panel-text" :style="{ color: vars.warningColor }">
                     辩论未完成（{{ debateDegradedLabel(current.result.debate.degraded_reason) }}），以上单路分析结果不受影响。
                   </p>

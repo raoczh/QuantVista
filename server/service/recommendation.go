@@ -593,7 +593,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	batch.FiltersJSON = string(filtersJSON)
 	// P1-5 反思记忆影子检索（三不纪律：不注入 prompt——messages 已在上方构造完毕、
 	// 不改写 picks/置信度、拒选与降级路径同样随批次落库）。best-effort，空=无匹配零噪声。
-	batch.ReflectionJSON = reflectionShadowJSON(recType, strat.Key, llmCands)
+	batch.ReflectionJSON = reflectionShadowJSON(userID, recType, strat.Key, llmCands)
 
 	// P0-2 调用关联：主调一个 run（repair 同 run 按 attempt 区分），复核/反方派生 run
 	// 回指主调；manifest 数组随批次落库，llm_call_logs 凭 batch.TraceID 双向可查。
@@ -612,6 +612,15 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	// 只是没喂给它」。仅诊断已存在时补填（调用失败无结构输出时 manifest 靠
 	// finish_state/degraded_reason 归因，不造空诊断）。
 	markCoveragePromptTrimmed(mainRun.Coverage, kept, len(llmCands))
+
+	// P2-1 challenger 影子采样（flag 缺省关；best-effort）：主调成功且有该用户的 running
+	// 实验时，同一候选名单只换 challenger 任务段再调一次，输出只落实验表——picks/批次
+	// 零改写（championPicks 传切片副本防越界写）。
+	if callErr == nil {
+		championPicks := append([]recPick(nil), picks...)
+		s.maybeChallengerShadow(ctx, plan, batch, mainRun, latency, usage, championPicks,
+			poolBySymbol, recType, strat, market, count, llmCands, filters, mktCtx)
+	}
 
 	// #11 原始 LLM 动作快照（复核前）：applyReviews 对 reject 会把 p.Action 强制改写为
 	// watch，事件表 RawAction 须记复核前值才能与 PostGateAction 构成门控前后对照。此处
@@ -719,7 +728,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		// 计划价与用户筛选阈值并入证据核验值域：模型在 evidence 里复述自己给出的
 		// 止盈/止损/买入区间、或用户设定的价格/换手/市值/追高阈值，均为合法引用而非幻觉。
 		// Origin 标注（plan/user）让前端区分「被快照数据佐证」与「模型复述自身结论」。
-		picks[i].EvidenceCheck = verifyEvidence(picks[i].Evidence, c,
+		picks[i].EvidenceCheck = verifyEvidence(picks[i].Evidence, recPickClaimText(picks[i]), c,
 			append(
 				markValueOrigin(labeledVals("交易计划", picks[i].BuyZoneLow, picks[i].BuyZoneHigh, picks[i].TakeProfit, picks[i].StopLoss), "plan"),
 				markValueOrigin(labeledVals("筛选阈值", filters.PriceMin, filters.PriceMax, filters.MaxGain5dPct,
@@ -1339,12 +1348,11 @@ func parseAndFilterPicks(content string, pool map[string]candidate, maxCount int
 		diag.CoveredCount++
 	}
 	diag.finalize()
-	if len(out) == 0 && len(*parsed.Picks) > 0 {
-		return nil, nil, diag, fmt.Errorf("推荐的标的均不在候选池内（池外 %d/无法识别 %d/重复 %d）",
-			diag.OutOfPoolCount, diag.UnknownCount, diag.DuplicateCount)
-	}
 
 	// 落选理由：同样只认池内标的（防杜撰），已入选的不算落选，去重、理由截断。
+	// 审查修复批：本段在「全越池 error」判定之前执行——picks 全无效时 rejected 里的
+	// 越池/空理由条目同样要计入 RejectedDropped（error 路径 diag 也是归因载体，
+	// 提前返回会让诊断少一半）。
 	rejected := make([]recReject, 0, len(parsed.Rejected))
 	seenRej := map[string]bool{}
 	for _, r := range parsed.Rejected {
@@ -1368,6 +1376,11 @@ func parseAndFilterPicks(content string, pool map[string]candidate, maxCount int
 		}
 		seenRej[sym] = true
 		rejected = append(rejected, recReject{Symbol: sym, Name: c.Name, Reason: reason})
+	}
+
+	if len(out) == 0 && len(*parsed.Picks) > 0 {
+		return nil, nil, diag, fmt.Errorf("推荐的标的均不在候选池内（池外 %d/无法识别 %d/重复 %d）",
+			diag.OutOfPoolCount, diag.UnknownCount, diag.DuplicateCount)
 	}
 	return out, rejected, diag, nil
 }

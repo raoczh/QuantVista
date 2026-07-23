@@ -248,8 +248,10 @@ func TestRecCalibReportEndToEnd(t *testing.T) {
 	}
 }
 
-// TestRecCalibReportEvaluatedThreshold 样本 ≥ calibMinSample 时 evaluated=true 且
-// Brier/ECE 输出：30 条 buy conf=80 全命中 → Brier=(0.8-1)²=0.04、ECE=|1-0.8|=0.2。
+// TestRecCalibReportEvaluatedThreshold 「已评估」硬门槛（审查修复批统一为 buy 校准样本
+// ≥ calibEvalMinSample=100，与 Brier/ECE 产出同门槛）：100 条 buy conf=80 全命中 →
+// evaluated=true、Brier=(0.8-1)²=0.04、ECE=|1-0.8|=0.2；30 条（旧分级门槛）只算分级
+// 参考，evaluated=false 且 Brier/ECE 为 nil（未评估≠0 分）。
 func TestRecCalibReportEvaluatedThreshold(t *testing.T) {
 	setupTestDB(t)
 	cleanCalibTables(t)
@@ -260,7 +262,17 @@ func TestRecCalibReportEvaluatedThreshold(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildRecCalibReport: %v", err)
 	}
-	if !rep.Evaluated || rep.Sample != calibMinSample {
+	if rep.Evaluated || rep.Brier != nil || rep.ECE != nil {
+		t.Fatalf("样本 %d < %d 不得标已评估或产出 Brier/ECE: eval=%v brier=%v", rep.Sample, calibEvalMinSample, rep.Evaluated, rep.Brier)
+	}
+	for i := calibMinSample + 1; i <= calibEvalMinSample; i++ {
+		seedCalibLabel(t, int64(i), model.RecActionBuy, 80, "high", 5, model.LabelMatured, false, false)
+	}
+	rep, err = buildRecCalibReport(model.RecTypeShortTerm, 10)
+	if err != nil {
+		t.Fatalf("buildRecCalibReport: %v", err)
+	}
+	if !rep.Evaluated || rep.Sample != calibEvalMinSample {
 		t.Fatalf("样本 %d 应标已评估: %+v", rep.Sample, rep.Evaluated)
 	}
 	if rep.Brier == nil || *rep.Brier != 0.04 {

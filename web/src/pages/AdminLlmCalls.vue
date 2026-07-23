@@ -31,6 +31,12 @@ const moduleLabel: Record<string, string> = {
   daily_report: '收盘日报',
   news: '新闻情绪',
   screener_parse: '白话建策略',
+  debate_bull: '辩论·看多',
+  debate_bear: '辩论·看空',
+  debate_rebuttal: '辩论·反驳',
+  debate_judge: '辩论·裁判',
+  reflection: '推荐反思',
+  experiment: 'Prompt 实验（影子）',
   test: '测试连接',
 }
 const moduleOptions = [

@@ -35,8 +35,12 @@ import (
 // 无方向不判，单列计数）。
 
 const (
-	// calibMinSample 报表「已评估」的最低总样本（§8.1 个人低频模块分级门槛）。
+	// calibMinSample 分级参考门槛（§8.1 低频模块分级）：分档/PR 表低于此仅供参考。
 	calibMinSample = 30
+	// calibEvalMinSample 「已评估」硬门槛（§8.1：推荐/个股分析每种数据状态至少 100 个
+	// 样本，30 只允许 compare/screener 等低频模块——审查修复批对齐，evaluated 与
+	// Brier/ECE 产出用同一门槛，杜绝「绿 tag 已评估但 Brier 未评估」的两层矛盾）。
+	calibEvalMinSample = 100
 	// calibMinBucket 单桶/单档最低样本，低于则前端标注「样本不足」（归因报表同值）。
 	calibMinBucket = 5
 	// calibAnalysisScanMax 分析侧最多回看的记录条数（每条要查两次日线，控制现算成本）。
@@ -84,6 +88,7 @@ type CalibCoverage struct {
 	NoData          int     `json:"no_data"`
 	Forced          int     `json:"forced"`        // 强平剔除（收益不可靠）
 	DegradedExcl    int     `json:"degraded_excl"` // 量化降级条目剔除（置信度非模型预测）
+	OrphanExcl      int     `json:"orphan_excl"`   // 孤儿标签剔除（推荐条目已删，置信度无从查证——混入会以 0 置信进桶）
 	MaturedRatioPct float64 `json:"matured_ratio_pct"`
 }
 
@@ -140,6 +145,7 @@ type AnalysisCalibReport struct {
 	ImmatureSkipped int `json:"immature_skipped"` // 基准日后不足 20 根
 	NoDataSkipped   int `json:"no_data_skipped"`  // 无本地日线
 	NoSysConf       int `json:"no_sys_conf"`      // ResultJSON 无 sys_confidence（旧记录）
+	DupSkipped      int `json:"dup_skipped"`      // 同标的同基准日重复分析（只计最新一条，重复生成不刷样本）
 
 	Brier       *float64            `json:"brier,omitempty"` // 口头置信度 vs 方向命中
 	ECE         *float64            `json:"ece,omitempty"`
@@ -367,7 +373,13 @@ func buildRecCalibReport(recType string, horizon int) (*RecCalibReport, error) {
 				continue
 			}
 			m, ok := metas[l.RecommendationID]
-			if ok && m.degraded {
+			if !ok {
+				// 孤儿标签（推荐条目已被用户删除）：置信度/SysConfidence 无从查证，
+				// 混入会以 confidence=0 进桶把 Brier/ECE 拉向失真——单列剔除（审查修复批）。
+				rep.Coverage.OrphanExcl++
+				continue
+			}
+			if m.degraded {
 				// 量化降级条目：置信度 35/SysConfidence low 是程序赋值，不是模型预测，
 				// 混入会把「程序规则」误测成「模型校准」。
 				rep.Coverage.DegradedExcl++
@@ -387,7 +399,6 @@ func buildRecCalibReport(recType string, horizon int) (*RecCalibReport, error) {
 	}
 
 	rep.Sample = len(usable)
-	rep.Evaluated = rep.Sample >= calibMinSample
 
 	// 动作 precision/recall（buy∪watch 全量；alpha 口径只吃 HasBench 样本）。
 	var buyN, buyHit, posN, watchN, watchHit int
@@ -471,7 +482,11 @@ func buildRecCalibReport(recType string, horizon int) (*RecCalibReport, error) {
 		tierRows[tier] = append(tierRows[tier], s.label)
 		tierGross[tier] += s.label.GrossReturnPct
 	}
-	if len(obs) >= calibMinSample {
+	// evaluated 与 Brier/ECE 同门槛（审查修复批）：口径统一为「buy 口头置信度样本
+	// ≥ calibEvalMinSample」——分档/PR 表任何样本量都展示（前端按 calibMinBucket 标注
+	// 样本不足），但报表级「已评估」只认校准指标真正产出。
+	rep.Evaluated = len(obs) >= calibEvalMinSample
+	if rep.Evaluated {
 		rep.Brier = calibBrier(obs)
 		rep.ECE = calibECE(obs)
 	}
@@ -524,7 +539,8 @@ func buildRecCalibReport(recType string, horizon int) (*RecCalibReport, error) {
 		"全库口径（不分用户）：管理端测量报表，样本才够门槛；口径=统一执行模拟 next_open、label_version="+labelVersion+"、成熟非强平非降级",
 		"口头置信度校准仅限 buy 样本；y=净收益>0。Brier/ECE 是「模型口头 confidence 不当真实概率」（§6.3）的测量证据，非采信",
 		"程序合成置信度是有序档位不硬造概率，只报分档命中率/收益与单调性观察；成本前（gross）与成本后（net）收益分开统计",
-		fmt.Sprintf("总样本 <%d 时 evaluated=false（未评估≠0 分）；单桶/单档 <%d 时统计不稳定仅供参考", calibMinSample, calibMinBucket),
+		fmt.Sprintf("「已评估」硬门槛=buy 口头置信度样本 ≥%d（§8.1 推荐模块每数据状态 100；未评估≠0 分）；分档/PR 表 <%d 仅供分级参考、单桶/单档 <%d 统计不稳定", calibEvalMinSample, calibMinSample, calibMinBucket),
+		"口径限制（如实声明）：未按 provider/model/prompt/策略/regime 分层（先分层再汇总的完整口径待 P2-5 联合评估）；confidence 为落库终值（复核 reject 降级条目的置信度已被程序改写，混合了模型原始预测与复核修正）",
 	)
 	return rep, nil
 }
@@ -544,13 +560,19 @@ func buildAnalysisCalibReport(ctx context.Context) (*AnalysisCalibReport, error)
 	var recs []model.AnalysisRecord
 	if err := common.DB.
 		Select("id", "symbol", "market", "rating", "confidence", "as_of", "created_at", "result_json").
-		Where("module = ? AND market = ? AND status = ? AND mode = '' AND symbol <> ''",
+		// as_of 回溯诊断记录排除（审查修复批）：回溯分析是「事后视角的历史解释」，与
+		// 实时分析混测会污染 PIT 纪律（同一历史日期可反复生成刷样本）；只测实时记录。
+		Where("module = ? AND market = ? AND status = ? AND mode = '' AND symbol <> '' AND (as_of = '' OR as_of IS NULL)",
 			model.AnalysisModuleStock, "cn", model.AnalysisStatusSuccess).
 		Order("id DESC").Limit(calibAnalysisScanMax).
 		Find(&recs).Error; err != nil {
 		return nil, err
 	}
 	rep.Scanned = len(recs)
+
+	// symbol×基准日去重（审查修复批）：同标的同日重复分析只计最新一条——重复生成
+	// 不得刷样本量（§9.1 事件粒度）。
+	seenEvent := map[string]bool{}
 
 	var obs []calibObs
 	type tierAgg struct {
@@ -571,6 +593,12 @@ func buildAnalysisCalibReport(ctx context.Context) (*AnalysisCalibReport, error)
 		baseDate := r.AsOf
 		if baseDate == "" {
 			baseDate = r.CreatedAt.In(time.Local).Format("2006-01-02")
+		}
+		if key := r.Symbol + "|" + baseDate; seenEvent[key] {
+			rep.DupSkipped++
+			continue
+		} else {
+			seenEvent[key] = true
 		}
 		base := cnBarsUpTo(r.Symbol, baseDate, 1)
 		if len(base) == 0 || base[0].Close <= 0 {
@@ -613,8 +641,8 @@ func buildAnalysisCalibReport(ctx context.Context) (*AnalysisCalibReport, error)
 		}
 	}
 
-	rep.Evaluated = rep.Judged >= calibMinSample
-	if rep.Judged >= calibMinSample {
+	rep.Evaluated = rep.Judged >= calibEvalMinSample
+	if rep.Evaluated {
 		rep.Brier = calibBrier(obs)
 		rep.ECE = calibECE(obs)
 	}

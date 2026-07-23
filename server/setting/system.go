@@ -31,6 +31,7 @@ const (
 	keyLLMCapRouting      = "llm_capability_routing"
 	keyLLMDebate          = "llm_conditional_debate"
 	keyLLMReflection      = "llm_reflection_shadow"
+	keyLLMChallenger      = "llm_challenger"
 )
 
 // 新闻快讯采集间隔（分钟）的默认值与钳制范围：下限防打爆免费上游，上限防配成"实际不采集"。
@@ -73,6 +74,10 @@ var (
 	// P1-5 反思记忆影子层（recreflect.go）：成熟标签 ≥30 后 LLM 反思生成 + 推荐生成时
 	// 影子检索（不注入 prompt 不改写结果）。默认开；关闭停止生成与检索（已落库反思保留）。
 	llmReflectionShadow = true
+	// P2-1 champion/challenger 影子采样（llm_experiment.go）：**默认关**——running 实验
+	// 命中时每批推荐额外一次 challenger 影子调用（双倍 token），须管理员显式开启；
+	// 关闭只停采样，实验记录与已采样本保留。
+	llmChallenger = false
 )
 
 // Init 从 DB 加载系统配置；首启时若 DB 缺 GitHub 凭证而 env 提供了，则种子回填到 DB。
@@ -147,6 +152,9 @@ func apply(opts map[string]string) {
 	llmCapabilityRouting = opts[keyLLMCapRouting] != "false"
 	llmConditionalDebate = opts[keyLLMDebate] != "false"
 	llmReflectionShadow = opts[keyLLMReflection] != "false"
+	// P2-1 challenger 影子采样**缺省关**（与上面回滚开关语义相反）：每次命中会额外烧一次
+	// LLM 调用（双倍 token），必须管理员显式启用——== "true" 才开。
+	llmChallenger = opts[keyLLMChallenger] == "true"
 }
 
 // normalizeSiteBaseURL 去空白与尾部斜杠（拼路由时统一 base+/path 形态）。
@@ -313,6 +321,20 @@ func SetLLMReflectionShadow(v bool) error {
 	}
 	mu.Lock()
 	llmReflectionShadow = v
+	mu.Unlock()
+	return nil
+}
+
+// LLMChallenger P2-1 challenger 影子采样开关（缺省关：额外 LLM 成本须显式启用）。
+func LLMChallenger() bool { mu.RLock(); defer mu.RUnlock(); return llmChallenger }
+
+// SetLLMChallenger 设置 P2-1 challenger 影子采样开关。
+func SetLLMChallenger(v bool) error {
+	if err := model.UpsertOption(keyLLMChallenger, strconv.FormatBool(v)); err != nil {
+		return err
+	}
+	mu.Lock()
+	llmChallenger = v
 	mu.Unlock()
 	return nil
 }

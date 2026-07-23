@@ -503,8 +503,10 @@ func computeDailySentimentAt(symbol, date string, now time.Time) (float64, int, 
 type newsBrief struct {
 	Title     string `json:"title"`
 	Sentiment string `json:"sentiment,omitempty"` // 利好/利空/中性（中文标签，供模型直接引用）
-	Time      string `json:"time"`
+	Time      string `json:"time"`                // 值取 publish_time（业务发布时点，非采集时刻）
 	Source    string `json:"source"`
+	// Category 新闻类别（telegraph/flash/stock；蓝图 F：注入项保留 category 元数据）。
+	Category string `json:"category,omitempty"`
 	// Priority 来源优先级（1=财联社电报级 … 5=低优先级；0=未知）。P1/P2 全量 LLM 增强、
 	// P3 规则先行的成本分层同一口径（EnhanceNewsRound）。
 	Priority int `json:"priority,omitempty"`
@@ -531,17 +533,17 @@ func sentimentCN(s string) string {
 const newsBriefMaxAge = 7 * 24 * time.Hour
 
 // latestNewsBriefsAt 某标的近 7 天内最新 limit 条新闻（标题+情绪标签+来源元数据），
-// P1-4 起经 latestNewsWindow 消费（briefs 与窗口声明同刻构建）。best-effort：
-// 无 DB / 窗口内无新闻返回空。
-func latestNewsBriefsAt(symbol string, limit int, now time.Time) []newsBrief {
+// P1-4 起经 latestNewsWindow 消费（briefs 与窗口声明同刻构建）。查询失败以 error 区分
+// 「确无」与「没查到」（审查修复批：不再吞错——window_meta.source_query_status 消费）。
+func latestNewsBriefsAt(symbol string, limit int, now time.Time) ([]newsBrief, error) {
 	if common.DB == nil || len(symbol) != 6 {
-		return nil
+		return nil, nil
 	}
 	var rows []model.News
-	if err := common.DB.Select("title, sentiment, publish_time, source, source_priority, impact_scope").
+	if err := common.DB.Select("title, sentiment, publish_time, source, category, source_priority, impact_scope").
 		Where("related_symbols LIKE ? AND publish_time >= ? AND publish_time <= ?", "%\""+symbol+"\"%", now.Add(-newsBriefMaxAge), now).
 		Order("publish_time DESC").Limit(limit).Find(&rows).Error; err != nil {
-		return nil
+		return nil, err
 	}
 	out := make([]newsBrief, 0, len(rows))
 	for _, n := range rows {
@@ -549,30 +551,46 @@ func latestNewsBriefsAt(symbol string, limit int, now time.Time) []newsBrief {
 			Title: n.Title, Sentiment: sentimentCN(n.Sentiment),
 			// 带年份的完整时点（旧格式 "01-02 15:04" 跨年会误导模型把去年当今年）。
 			Time: n.PublishTime.Format("2006-01-02 15:04"), Source: n.Source,
-			Priority: n.SourcePriority, Scope: n.ImpactScope,
+			Category: n.Category, Priority: n.SourcePriority, Scope: n.ImpactScope,
 		})
 	}
-	return out
+	return out, nil
 }
 
 // --- P1-4 新闻窗口与来源对齐（docs/LLM_ACCURACY_OPTIMIZATION_PLAN.md §7.2 P1-4）---
 
 // newsWindowVersion 窗口/对齐算法版本：改分类阈值或规则必须递增（source_alignment 是
 // 程序按版本化阈值计算的声明，模型只解释分歧、不得重新分类——蓝图 F 纪律）。
-const newsWindowVersion = "nw1"
+// nw2（审查修复批）：①对齐/覆盖统计基于**完整 7 日窗口**（上限 newsWindowStatMax 条）
+// 而非仅注入的最新 5 条；②single_source 按**独立来源数**判定（同一媒体多条同向新闻
+// 不再冒充多源一致）；③全部无情绪标注（未增强）时 alignment=unavailable（无从判定，
+// 不再误标 aligned）；④新增 total_in_window/injected_count/source_query_status——
+// 查询失败与「窗口内确无」显式分开。nw1：注入条目口径、主导比 0.7。
+const newsWindowVersion = "nw2"
 
-// newsAlignmentDominantRatio 对齐分类阈值（nw1）：正负两方向并存时，主导方向占
+// newsAlignmentDominantRatio 对齐分类阈值：正负两方向并存时，主导方向占
 // 方向性样本的比例 ≥ 该值为 mixed（主导但有杂音），否则 divergent（显著分歧）。
 const newsAlignmentDominantRatio = 0.7
 
+// newsWindowStatMax 窗口统计的取样上限（防极端标的整窗数千条拖垮快照构建；
+// 达到上限时统计代表「窗口内最新 200 条」，total_in_window 仍是全窗口真实计数）。
+const newsWindowStatMax = 200
+
 // source_alignment 封闭枚举（蓝图 F）。
 const (
-	newsAlignAligned      = "aligned"       // 多条且方向一致（含全中性）
+	newsAlignAligned      = "aligned"       // 多源且方向一致（含全中性）
 	newsAlignMixed        = "mixed"         // 双向并存但一方主导（≥70%）
 	newsAlignDivergent    = "divergent"     // 双向显著分歧（主导 <70%）
-	newsAlignSingleSource = "single_source" // 仅 1 条，无从交叉验证（不得写成「市场共识」）
-	newsAlignUnavailable  = "unavailable"   // 窗口内无新闻
+	newsAlignSingleSource = "single_source" // 独立来源 ≤1，无从交叉验证（不得写成「市场共识」）
+	newsAlignUnavailable  = "unavailable"   // 窗口内无新闻，或全部条目无情绪标注/查询失败（无从判定）
 )
+
+// newsWindowStat 窗口统计行（对齐/覆盖的计算输入——完整窗口口径，非仅注入条目）。
+type newsWindowStat struct {
+	Sentiment string
+	Source    string
+	Priority  int
+}
 
 // newsWindowMeta 注入快照的机读窗口声明（L2 数据段，非 prompt 文本）：把既有
 // [now-7d, now] 硬窗口显式化为机器可读契约——窗口外新闻 0 注入由查询双边界保证，
@@ -580,8 +598,16 @@ const (
 type newsWindowMeta struct {
 	WindowStart string `json:"window_start"` // 窗口下界（含），本地时区
 	WindowEnd   string `json:"window_end"`   // 窗口上界（含）=构建时刻——未来记录恒不注入
-	// SourceCoverage 来源优先级覆盖计数（键 "P1"…"P5"，"P0"=未知优先级）：声明本次
-	// 注入条目来自哪些优先级档位、各多少条。空 map 省略（无新闻）。
+	// TotalInWindow 窗口内新闻总条数（完整窗口计数）；InjectedCount 实际注入条数
+	//（≤5 条最新）。两者分开声明「统计基于全窗口、正文只注入最新若干条」。
+	TotalInWindow int `json:"total_in_window"`
+	InjectedCount int `json:"injected_count"`
+	// SourceQueryStatus 查询状态（ok/failed）：failed=来源查询未完成，alignment 为
+	// unavailable 时消费方可区分「查了确无」与「没查成」（P1-4 契约：只有查询完整
+	// 且窗口内确无实质事件才可当 no_material_event）。
+	SourceQueryStatus string `json:"source_query_status"`
+	// SourceCoverage 来源优先级覆盖计数（键 "P1"…"P5"，"P0"=未知优先级）：完整窗口
+	// 口径（nw2）。空 map 省略（无新闻）。
 	SourceCoverage map[string]int `json:"source_coverage,omitempty"`
 	// SourceAlignment 程序化方向对齐分类（版本化阈值，见 newsAlignmentDominantRatio）。
 	// 模型只能解释分歧，不得重新分类；单源不得写成共识。
@@ -589,43 +615,65 @@ type newsWindowMeta struct {
 	Version         string `json:"version"`
 }
 
-// buildNewsWindowMeta 由注入条目组装窗口声明（纯函数，可测）。briefs 为空时
-// alignment=unavailable（窗口内确无新闻——与「没查」不同，查询已完成才会走到这里）。
-func buildNewsWindowMeta(briefs []newsBrief, now time.Time) newsWindowMeta {
+// buildNewsWindowMeta 由窗口统计组装窗口声明（纯函数，可测）。stats 为完整窗口统计行
+// （nw2），total 为窗口内真实总数，injected 为实际注入条数；queryOK=false 时如实声明
+// 查询失败（alignment=unavailable，不冒充「确无」）。
+func buildNewsWindowMeta(stats []newsWindowStat, total, injected int, queryOK bool, now time.Time) newsWindowMeta {
 	m := newsWindowMeta{
-		WindowStart:     now.Add(-newsBriefMaxAge).Format("2006-01-02 15:04"),
-		WindowEnd:       now.Format("2006-01-02 15:04"),
-		SourceAlignment: computeSourceAlignment(briefs),
-		Version:         newsWindowVersion,
+		WindowStart:       now.Add(-newsBriefMaxAge).Format("2006-01-02 15:04"),
+		WindowEnd:         now.Format("2006-01-02 15:04"),
+		TotalInWindow:     total,
+		InjectedCount:     injected,
+		SourceQueryStatus: "ok",
+		SourceAlignment:   computeSourceAlignment(stats),
+		Version:           newsWindowVersion,
 	}
-	if len(briefs) > 0 {
+	if !queryOK {
+		m.SourceQueryStatus = "failed"
+		m.SourceAlignment = newsAlignUnavailable
+		return m
+	}
+	if len(stats) > 0 {
 		cov := make(map[string]int, 4)
-		for _, b := range briefs {
-			cov[fmt.Sprintf("P%d", b.Priority)]++
+		for _, s := range stats {
+			cov[fmt.Sprintf("P%d", s.Priority)]++
 		}
 		m.SourceCoverage = cov
 	}
 	return m
 }
 
-// computeSourceAlignment 方向对齐分类（nw1）：按注入条目的情绪标签统计正/负方向
-// （中性不参与方向判定）。0 条=unavailable、1 条=single_source；多条：单方向（或全
-// 中性）=aligned，双向并存按主导占比分 mixed/divergent。
-func computeSourceAlignment(briefs []newsBrief) string {
-	switch len(briefs) {
-	case 0:
+// computeSourceAlignment 方向对齐分类（nw2，完整窗口口径）：
+//   - 0 条=unavailable；
+//   - 独立来源 ≤1（无论条数）=single_source——同一媒体连发多条同向新闻不构成交叉验证；
+//   - 无任何方向样本：全部显式中性=aligned（多源一致中性），否则（含未增强/无标注条目
+//     且无一显式判向）=unavailable——「没标注」不是「一致」；
+//   - 双向并存按主导占比分 mixed/divergent，单方向=aligned。
+func computeSourceAlignment(stats []newsWindowStat) string {
+	if len(stats) == 0 {
 		return newsAlignUnavailable
-	case 1:
+	}
+	srcs := map[string]bool{}
+	pos, neg, neutral := 0, 0, 0
+	for _, s := range stats {
+		srcs[strings.TrimSpace(s.Source)] = true
+		switch s.Sentiment {
+		case "positive":
+			pos++
+		case "negative":
+			neg++
+		case "neutral":
+			neutral++
+		}
+	}
+	if len(srcs) <= 1 {
 		return newsAlignSingleSource
 	}
-	pos, neg := 0, 0
-	for _, b := range briefs {
-		switch b.Sentiment {
-		case "利好":
-			pos++
-		case "利空":
-			neg++
+	if pos == 0 && neg == 0 {
+		if neutral > 0 {
+			return newsAlignAligned
 		}
+		return newsAlignUnavailable
 	}
 	if pos == 0 || neg == 0 {
 		return newsAlignAligned
@@ -640,16 +688,46 @@ func computeSourceAlignment(briefs []newsBrief) string {
 	return newsAlignDivergent
 }
 
-// latestNewsWindow 取窗口内新闻 + 机读窗口声明（P1-4 快照注入入口，替代裸
-// latestNewsBriefs：调用方拿到的 briefs 与 meta 基于同一时刻构建，窗口声明与
-// 实际注入内容不会错位）。
+// loadNewsWindowStats 完整窗口统计行 + 总数（nw2）：统计与注入分开查——注入限 5 条控
+// prompt 预算，统计覆盖全窗口（取样上限 newsWindowStatMax）才能代表「7 日窗口的来源
+// 覆盖与方向对齐」。
+func loadNewsWindowStats(symbol string, now time.Time) ([]newsWindowStat, int, error) {
+	if common.DB == nil || len(symbol) != 6 {
+		return nil, 0, nil
+	}
+	q := common.DB.Model(&model.News{}).
+		Where("related_symbols LIKE ? AND publish_time >= ? AND publish_time <= ?",
+			"%\""+symbol+"\"%", now.Add(-newsBriefMaxAge), now)
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var rows []model.News
+	if err := q.Select("sentiment, source, source_priority").
+		Order("publish_time DESC").Limit(newsWindowStatMax).Find(&rows).Error; err != nil {
+		return nil, 0, err
+	}
+	stats := make([]newsWindowStat, 0, len(rows))
+	for _, n := range rows {
+		stats = append(stats, newsWindowStat{Sentiment: n.Sentiment, Source: n.Source, Priority: n.SourcePriority})
+	}
+	return stats, int(total), nil
+}
+
+// latestNewsWindow 取窗口内新闻 + 机读窗口声明（P1-4 快照注入入口）：调用方拿到的
+// briefs 与 meta 基于同一时刻构建，窗口声明与实际注入内容不会错位。
 func latestNewsWindow(symbol string, limit int) ([]newsBrief, newsWindowMeta) {
 	return latestNewsWindowAt(symbol, limit, time.Now())
 }
 
 func latestNewsWindowAt(symbol string, limit int, now time.Time) ([]newsBrief, newsWindowMeta) {
-	briefs := latestNewsBriefsAt(symbol, limit, now)
-	return briefs, buildNewsWindowMeta(briefs, now)
+	briefs, berr := latestNewsBriefsAt(symbol, limit, now)
+	stats, total, serr := loadNewsWindowStats(symbol, now)
+	queryOK := berr == nil && serr == nil
+	if !queryOK {
+		common.SysWarn("新闻窗口查询失败 %s: brief=%v stats=%v", symbol, berr, serr)
+	}
+	return briefs, buildNewsWindowMeta(stats, total, len(briefs), queryOK, now)
 }
 
 // newsTitleTexts 从个股快照的 news 块提取标题等文本（信任层：标题里的小数是

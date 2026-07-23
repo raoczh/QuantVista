@@ -72,6 +72,7 @@ async function load() {
     capRoutingEnabled.value = settings.value.llm_capability_routing
     debateEnabled.value = settings.value.llm_conditional_debate
     reflectionEnabled.value = settings.value.llm_reflection_shadow
+    challengerEnabled.value = settings.value.llm_challenger
     siteBaseURL.value = settings.value.site_base_url
   } catch (e) {
     message.error((e as Error).message)
@@ -232,6 +233,23 @@ async function toggleReflection(v: boolean) {
     await load()
   } finally {
     savingReflection.value = false
+  }
+}
+
+/* P2-1 challenger 影子采样：running 实验命中时每批推荐额外一次影子调用（缺省关） */
+const savingChallenger = ref(false)
+const challengerEnabled = ref(false)
+async function toggleChallenger(v: boolean) {
+  savingChallenger.value = true
+  try {
+    settings.value = await updateSystemSettings({ llm_challenger: v })
+    challengerEnabled.value = settings.value.llm_challenger
+    message.success('已保存，下一次推荐生成生效')
+  } catch (e) {
+    message.error((e as Error).message)
+    await load()
+  } finally {
+    savingChallenger.value = false
   }
 }
 
@@ -519,6 +537,13 @@ onMounted(() => {
             <n-switch :value="reflectionEnabled" :loading="savingReflection" @update:value="toggleReflection" />
             <span style="opacity: 0.6; font-size: 12px">
               开启（P1-5）：成熟推荐样本 ≥30 后，后台按批结算结果生成历史教训（LLM 反思，走系统默认配置）；推荐生成时检索适用教训随批次记录（影子：不注入提示词、不改写结果）。关闭停止生成与检索，已生成教训保留。
+            </span>
+          </n-space>
+          <n-space align="center">
+            <span>Prompt 实验影子采样：</span>
+            <n-switch :value="challengerEnabled" :loading="savingChallenger" @update:value="toggleChallenger" />
+            <span style="opacity: 0.6; font-size: 12px">
+              开启（P2-1，缺省关）：存在 running 状态的 champion/challenger 实验时，实验创建者本人的每批推荐额外发起一次 challenger 影子调用（双倍 token 成本），输出只落实验样本表、不影响业务结果。实验管理见「LLM 实验」页。
             </span>
           </n-space>
         </n-space>

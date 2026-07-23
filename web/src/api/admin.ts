@@ -16,6 +16,7 @@ export interface SystemSettings {
   llm_capability_routing: boolean
   llm_conditional_debate: boolean
   llm_reflection_shadow: boolean
+  llm_challenger: boolean
   site_base_url: string
 }
 
@@ -35,6 +36,7 @@ export interface SystemSettingsUpdate {
   llm_capability_routing?: boolean
   llm_conditional_debate?: boolean
   llm_reflection_shadow?: boolean
+  llm_challenger?: boolean
   site_base_url?: string
 }
 
@@ -356,6 +358,7 @@ export interface CalibCoverage {
   no_data: number
   forced: number
   degraded_excl: number
+  orphan_excl: number
   matured_ratio_pct: number
 }
 
@@ -401,6 +404,7 @@ export interface AnalysisCalibReport {
   immature_skipped: number
   no_data_skipped: number
   no_sys_conf: number
+  dup_skipped: number
   brier?: number
   ece?: number
   reliability?: CalibBucket[]
@@ -452,4 +456,93 @@ export interface LLMRolesResponse {
 
 export function getLLMRoles() {
   return request<LLMRolesResponse>({ url: '/admin/llm-roles' })
+}
+
+// ---------- P2-1/P2-2 champion/challenger prompt 实验 ----------
+
+export interface LLMExperiment {
+  id: number
+  user_id: number
+  module: string
+  prompt_module: string
+  name: string
+  hypothesis: string
+  expected_improvement: string
+  challenger_content: string
+  challenger_hash: string
+  champion_version: string
+  champion_hash: string
+  status: 'draft' | 'running' | 'completed' | 'promoted' | 'abandoned'
+  sample_target: number
+  sample_count: number
+  actual_json: string
+  conclusion: string
+  failure_reason: string
+  parent_id: number
+  promoted_revision: number
+  started_at?: string
+  completed_at?: string
+  created_at: string
+}
+
+export interface LLMExperimentRun {
+  id: number
+  experiment_id: number
+  batch_id: number
+  trace_id: string
+  champion_run_id: string
+  valid: boolean
+  picks_count: number
+  champion_picks: number
+  overlap_count: number
+  coverage_json: string
+  champion_tokens: number
+  challenger_tokens: number
+  champion_ms: number
+  challenger_ms: number
+  finish_state: string
+  error: string
+  created_at: string
+}
+
+export interface LLMExperimentActual {
+  samples: number
+  valid_count: number
+  valid_rate_pct: number
+  avg_champion_tokens: number
+  avg_challenger_tokens: number
+  avg_champion_ms: number
+  avg_challenger_ms: number
+  avg_overlap_pct: number
+  avg_champion_picks: number
+  avg_challenger_picks: number
+  errors?: string[]
+}
+
+export interface LLMExperimentInput {
+  module: string
+  name: string
+  hypothesis: string
+  expected_improvement: string
+  challenger_content: string
+  sample_target?: number
+  parent_id?: number
+}
+
+export function listLLMExperiments() {
+  return request<LLMExperiment[]>({ url: '/admin/llm-experiments' })
+}
+
+export function getLLMExperiment(id: number) {
+  return request<{ experiment: LLMExperiment; runs: LLMExperimentRun[] }>({ url: `/admin/llm-experiments/${id}` })
+}
+
+export function createLLMExperiment(input: LLMExperimentInput) {
+  return request<{ experiment: LLMExperiment; warnings: string[] }>({
+    url: '/admin/llm-experiments', method: 'post', data: input,
+  })
+}
+
+export function actLLMExperiment(id: number, action: 'start' | 'complete' | 'promote' | 'abandon', body?: { conclusion?: string; failure_reason?: string }) {
+  return request<LLMExperiment>({ url: `/admin/llm-experiments/${id}/${action}`, method: 'post', data: body ?? {} })
 }

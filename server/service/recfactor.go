@@ -610,15 +610,23 @@ func labeledVals(path string, vs ...float64) []labeledValue {
 	return out
 }
 
+// recClaimSection 推荐结论正文的核验段名（与 recPickClaimSpec.Section 严格一致）。
+const recClaimSection = "推荐结论"
+
 // verifyEvidence 核验一条推荐的 evidence 数字与快照的吻合度。数字提取/单位规范化/方向规则/
 // 去重计数统一在 trust.go 的 verifyEvidenceLabeled（全模块共用口径）。
 // extra 为快照之外的合法引用值域（模型自身计划价、用户筛选阈值），由调用方按上下文传入。
-func verifyEvidence(evidence []string, c candidate, extra ...labeledValue) *evidenceCheck {
+// claimText 为该条推荐的结论正文（thesis/首条理由，审查修复批）：自成「推荐结论」段核验，
+// claim 的佐证/矛盾判定只看结论正文自身的数字，不被 evidence 数组的无关命中冒充。
+func verifyEvidence(evidence []string, claimText string, c candidate, extra ...labeledValue) *evidenceCheck {
 	vals := candidateLabeledValues(c)
 	vals = append(vals, extra...)
-	sections := make([]evidenceSection, 0, len(evidence))
+	sections := make([]evidenceSection, 0, len(evidence)+1)
 	for _, e := range evidence {
 		sections = append(sections, evidenceSection{Module: "推荐依据", Text: e})
+	}
+	if strings.TrimSpace(claimText) != "" {
+		sections = append(sections, evidenceSection{Module: recClaimSection, Text: claimText})
 	}
 	return verifyEvidenceLabeled(sections, vals)
 }

@@ -84,17 +84,19 @@ func TestDebateTriggerReasons(t *testing.T) {
 	}
 }
 
-// TestNormalizeDebateClaims 归一纪律：程序重编号、证据白名单外剥除、条数上限、
-// 全部无 invalidator 报错（触发 repair）、空 claims 报错。
+// TestNormalizeDebateClaims 归一纪律：程序重编号、证据白名单外剥除、零合法证据的
+// claim 丢弃（db2）、条数上限、全部无 invalidator 报错（触发 repair）、空 claims 报错。
 func TestNormalizeDebateClaims(t *testing.T) {
-	allow := map[string]bool{"ev-001": true, "ev-002": true}
+	allow := map[string]bool{"ev-001": true, "ev-002": true, "ev-003": true}
 	in := []debateClaim{
 		{ID: "模型自编-99", Text: "论点A", EvidenceIDs: []string{"ev-001", "ev-999"}, Invalidator: "条件A"},
 		{Text: "  "}, // 空文本剔除
 		{Text: "论点B", EvidenceIDs: []string{"ev-002"}},
-		{Text: "论点C"},
-		{Text: "论点D"},
-		{Text: "论点E（超上限丢弃）", Invalidator: "x"},
+		{Text: "论点C（无证据引用，db2 丢弃）"},
+		{Text: "论点D（引用全越界，db2 丢弃）", EvidenceIDs: []string{"ev-777"}},
+		{Text: "论点E", EvidenceIDs: []string{"ev-003"}, Invalidator: "条件E"},
+		{Text: "论点F", EvidenceIDs: []string{"ev-001"}},
+		{Text: "论点G（超上限丢弃）", EvidenceIDs: []string{"ev-002"}, Invalidator: "x"},
 	}
 	out, err := normalizeDebateClaims(in, "bu", allow)
 	if err != nil {
@@ -284,7 +286,7 @@ func TestDebateRebuttalRound(t *testing.T) {
 		},
 		func() string {
 			// bear 引用同一 ev-001：对立解读，触发反驳轮。
-			return `{"claims":[{"text":"同一价位是压力位","evidence_ids":["ev-001"],"confirmed":false,"invalidator":"突破站稳"}],"challenges":[]}`
+			return `{"claims":[{"text":"同一价位是压力位","evidence_ids":["ev-001"],"confirmed":false,"invalidator":"突破站稳"}],"challenges":[{"claim_id":"bu-01","text":"针对性反驳"}]}`
 		},
 		func() string { return `{"rebuttals":[{"claim_id":"be-01","text":"但是缩量说明抛压衰竭"}]}` },
 		func() string {
@@ -324,7 +326,7 @@ func TestDebateOppositeVerdictLowersConfidence(t *testing.T) {
 			return `{"claims":[{"text":"多头论点","evidence_ids":["ev-001"],"invalidator":"x"}]}`
 		},
 		func() string {
-			return `{"claims":[{"text":"空头论点","evidence_ids":["ev-002"],"confirmed":true,"invalidator":"y"}],"challenges":[]}`
+			return `{"claims":[{"text":"空头论点","evidence_ids":["ev-002"],"confirmed":true,"invalidator":"y"}],"challenges":[{"claim_id":"bu-01","text":"针对性反驳"}]}`
 		},
 		func() string { return `{"rebuttals":[]}` },
 		func() string {
@@ -400,7 +402,7 @@ func TestDebateJudgeBlockGuard(t *testing.T) {
 			return `{"claims":[{"text":"多头论点","evidence_ids":["ev-001"],"invalidator":"x"}]}`
 		},
 		func() string {
-			return `{"claims":[{"text":"空头论点","evidence_ids":["ev-002"],"confirmed":true,"invalidator":"y"}],"challenges":[]}`
+			return `{"claims":[{"text":"空头论点","evidence_ids":["ev-002"],"confirmed":true,"invalidator":"y"}],"challenges":[{"claim_id":"bu-01","text":"针对性反驳"}]}`
 		},
 		func() string { return `{"rebuttals":[]}` },
 		func() string {
@@ -463,5 +465,86 @@ func TestDebateModuleBudgets(t *testing.T) {
 		if b.MaxTokens <= 0 || b.MaxTokens > 2500 {
 			t.Errorf("模块 %s 预算越界: %d", m, b.MaxTokens)
 		}
+	}
+}
+
+// TestDebateRebuttalFailureNotFakeTwoRounds 反驳轮失败（审查修复批）：Rounds 回退 1、
+// rebuttal_degraded 如实记录、judge 照常裁决（best-effort 不降级整体）——不许把单轮
+// 辩论伪装成完整两轮。
+func TestDebateRebuttalFailureNotFakeTwoRounds(t *testing.T) {
+	setDebateFlag(t, true)
+
+	var calls []string
+	srv := debateFakeServer(t, &calls,
+		func() string {
+			return `{"claims":[{"text":"缩量回踩支撑","evidence_ids":["ev-001"],"invalidator":"放量跌破"}]}`
+		},
+		func() string {
+			return `{"claims":[{"text":"同一价位是压力位","evidence_ids":["ev-001"],"confirmed":false,"invalidator":"突破站稳"}],"challenges":[{"claim_id":"bu-01","text":"针对性反驳"}]}`
+		},
+		func() string { return `{"rebuttals":[{"claim_id":"be-99","text":"引用非法恒失败"}]}` },
+		func() string {
+			return `{"verdict":"neutral","decisive_claim_ids":[],"rejected_claim_ids":[],"unresolved_claim_ids":["bu-01"],"confidence_reason":"平衡","invalidators":[],"conflict_note":"对立解读"}`
+		})
+	defer srv.Close()
+
+	svc := &AnalysisService{}
+	cfg := &model.LLMConfig{BaseURL: srv.URL, Model: "m", MaxTokens: 8000}
+	result := debateTestResult()
+	_, runs := svc.attachDebate(context.Background(), 7, cfg, "sk", true, map[string]any{}, result, "t1", "r-main")
+
+	deb := result.Debate
+	if deb == nil || deb.DegradedReason != "" || deb.Judge == nil {
+		t.Fatalf("rebuttal 失败不得降级整体、judge 应照常: %+v", deb)
+	}
+	if deb.Rounds != 1 || !deb.RebuttalDegraded || len(deb.Rebuttals) != 0 {
+		t.Fatalf("失败应回退 Rounds=1 并记 rebuttal_degraded: rounds=%d degraded=%v", deb.Rounds, deb.RebuttalDegraded)
+	}
+	// manifest 里 bull run 的声明轮数同样回退。
+	if runs[0].DebateInfo == nil || runs[0].DebateInfo.Rounds != 1 {
+		t.Fatalf("manifest 声明轮数应回退 1: %+v", runs[0].DebateInfo)
+	}
+}
+
+// TestDebateJudgeEmptyReferenceRejected judge 空引用收口（审查修复批）：三列表引用
+// 全部非法（剥空）时不得生效——repair 后仍空 → judge_invalid 降级（双方论点保留）。
+func TestDebateJudgeEmptyReferenceRejected(t *testing.T) {
+	setDebateFlag(t, true)
+
+	var calls []string
+	srv := debateFakeServer(t, &calls,
+		func() string {
+			return `{"claims":[{"text":"多头论点","evidence_ids":["ev-001"],"invalidator":"x"}]}`
+		},
+		func() string {
+			return `{"claims":[{"text":"空头论点","evidence_ids":["ev-002"],"confirmed":true,"invalidator":"y"}],"challenges":[{"claim_id":"bu-01","text":"针对性反驳"}]}`
+		},
+		func() string { return `{}` },
+		func() string {
+			return `{"verdict":"bearish","decisive_claim_ids":["fake-01"],"rejected_claim_ids":[],"unresolved_claim_ids":[],"confidence_reason":"空引用裁决","invalidators":[],"conflict_note":""}`
+		})
+	defer srv.Close()
+
+	svc := &AnalysisService{}
+	cfg := &model.LLMConfig{BaseURL: srv.URL, Model: "m", MaxTokens: 8000}
+	result := &AnalysisResult{Rating: model.AnalysisRatingBullish, Summary: "s",
+		SysConfidence: "low", SysConfidenceWhy: "核验吻合率低",
+		EvidenceCheck: &evidenceCheck{Version: "ev5", Items: []evidenceItem{
+			{Matched: true, EvidenceID: "ev-001", Path: "现价", SnapValue: 10.5},
+			{Matched: true, EvidenceID: "ev-002", Path: "涨跌幅%", SnapValue: -3.2},
+		}},
+	}
+	svc.attachDebate(context.Background(), 7, cfg, "sk", true, map[string]any{}, result, "t1", "r-main")
+
+	deb := result.Debate
+	if deb == nil || deb.DegradedReason != "judge_invalid" || deb.Judge != nil {
+		t.Fatalf("空引用裁决应 judge_invalid 降级: %+v", deb)
+	}
+	if len(deb.Bull) != 1 || len(deb.Bear) != 1 {
+		t.Fatalf("降级仍保留双方论点: %+v", deb)
+	}
+	// 裁决未生效：不得压低置信度点名（SysConfidenceWhy 无辩论字样追加）。
+	if strings.Contains(result.SysConfidenceWhy, "辩论") {
+		t.Fatalf("无效裁决不得联动置信度: %s", result.SysConfidenceWhy)
 	}
 }
