@@ -83,6 +83,10 @@ type llmRun struct {
 	// 回落具备粘性（能力观察写入后声明化路由接管），任一 attempt 回落即整个 run 按
 	// free_text 归因（多 attempt 汇总语义，见 §5.1）。
 	structuredDropped bool
+	// Coverage P1-1 推荐 coverage/越池诊断（仅推荐主调 run 填充；程序化计数非模型自报，
+	// 由 parseAndFilterPicks 产出、callWithRepair 挂载）。其他模块恒 nil（manifest 省略）——
+	// **禁止在无程序化计数来源的模块伪造该字段**（P0-2 起的明令，本批起仅推荐真实填充）。
+	Coverage *RecCoverageDiag
 }
 
 // newLLMRun 创建调用组。parentRunID 为空表示主调。
@@ -134,7 +138,7 @@ func (r *llmRun) record(res *chatResult, err error) {
 }
 
 // LLMRunManifest §5.1 目标契约的本批实现子集（业务表 llm_run_json 数组元素）。
-// coverage 字段本批仅预留（P1-1 起由推荐 coverage 诊断填充），恒省略。
+// coverage 自 P1-1 起由推荐主调 run 填充程序化诊断（RecCoverageDiag），其他模块恒省略。
 type LLMRunManifest struct {
 	RunID       string `json:"run_id"`
 	TraceID     string `json:"trace_id"`
@@ -165,6 +169,10 @@ type LLMRunManifest struct {
 	FinishState    string `json:"finish_state,omitempty"`
 	FinishStateRaw string `json:"finish_state_raw,omitempty"`
 	DegradedReason string `json:"degraded_reason,omitempty"`
+	// Coverage P1-1 推荐 coverage/越池诊断（程序化计数：input/unique/covered、
+	// unknown/duplicate/out_of_pool 样本、prompt_trimmed、机读错误码）。
+	// 仅推荐主调 run 非空；其他模块省略——不得伪造。
+	Coverage *RecCoverageDiag `json:"coverage,omitempty"`
 }
 
 // manifest 输出本 run 的运行元数据。jsonMode 为该模块的请求口径；最终实际生效形态在
@@ -179,6 +187,7 @@ func (r *llmRun) manifest(cfg *model.LLMConfig, jsonMode bool) LLMRunManifest {
 		OutputBudget:     moduleBudget(r.Module).MaxTokens,
 		FinishState:      r.FinishState, FinishStateRaw: r.FinishStateRaw,
 		DegradedReason: r.DegradedReason,
+		Coverage:       r.Coverage,
 	}
 	if m.AttemptCount < 1 {
 		m.AttemptCount = 1 // 防御：manifest 只在实际发起过调用的 run 上输出

@@ -24,7 +24,7 @@ func TestParseAndFilterPicks_DropsFabricated(t *testing.T) {
 		{"symbol":"999999","action":"buy","confidence":90,"reason":["编造的票"]},
 		{"symbol":"000001","action":"watch","confidence":55,"reason":["观察"]}
 	]}`
-	picks, _, err := parseAndFilterPicks(content, pool, 5)
+	picks, _, _, err := parseAndFilterPicks(content, pool, 5)
 	if err != nil {
 		t.Fatalf("期望成功: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestParseAndFilterPicks_Rejected(t *testing.T) {
 		{"symbol":"000001","reason":"重复条目"},
 		{"symbol":"","reason":"空代码"}
 	]}`
-	_, rejected, err := parseAndFilterPicks(content, pool, 5)
+	_, rejected, _, err := parseAndFilterPicks(content, pool, 5)
 	if err != nil {
 		t.Fatalf("期望成功: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestParseAndFilterPicks_Rejected(t *testing.T) {
 func TestParseAndFilterPicks_RejectedMissing(t *testing.T) {
 	pool := testPool()
 	content := `{"picks":[{"symbol":"600000","action":"buy","confidence":70}]}`
-	picks, rejected, err := parseAndFilterPicks(content, pool, 5)
+	picks, rejected, _, err := parseAndFilterPicks(content, pool, 5)
 	if err != nil || len(picks) != 1 {
 		t.Fatalf("缺 rejected 不应报错: err=%v picks=%d", err, len(picks))
 	}
@@ -79,7 +79,7 @@ func TestParseAndFilterPicks_RejectedMissing(t *testing.T) {
 func TestParseAndFilterPicks_AllFabricated(t *testing.T) {
 	pool := testPool()
 	content := `{"picks":[{"symbol":"AAAAAA","action":"buy","confidence":80}]}`
-	if _, _, err := parseAndFilterPicks(content, pool, 5); err == nil {
+	if _, _, _, err := parseAndFilterPicks(content, pool, 5); err == nil {
 		t.Fatalf("全部越池时应返回错误")
 	}
 }
@@ -91,7 +91,7 @@ func TestParseAndFilterPicks_Dedup(t *testing.T) {
 		{"symbol":"600000","action":"buy","confidence":70},
 		{"symbol":"600000","action":"watch","confidence":40}
 	]}`
-	picks, _, err := parseAndFilterPicks(content, pool, 5)
+	picks, _, _, err := parseAndFilterPicks(content, pool, 5)
 	if err != nil {
 		t.Fatalf("期望成功: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestParseAndFilterPicks_CountCap(t *testing.T) {
 		{"symbol":"600036","action":"buy","confidence":60},
 		{"symbol":"601318","action":"buy","confidence":55}
 	]}`
-	picks, _, err := parseAndFilterPicks(content, pool, 3)
+	picks, _, _, err := parseAndFilterPicks(content, pool, 3)
 	if err != nil {
 		t.Fatalf("期望成功: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestParseAndFilterPicks_CountCap(t *testing.T) {
 func TestParseAndFilterPicks_EmptyPicksLegal(t *testing.T) {
 	pool := testPool()
 	content := `{"picks":[],"rejected":[{"symbol":"000001","reason":"量价背离，短线无安全买点"}]}`
-	picks, rejected, err := parseAndFilterPicks(content, pool, 5)
+	picks, rejected, _, err := parseAndFilterPicks(content, pool, 5)
 	if err != nil {
 		t.Fatalf("显式空 picks 是合法拒选，不应报错: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestParseAndFilterPicks_EmptyPicksLegal(t *testing.T) {
 // 模型没按 schema 输出，应报错触发 repair（指针语义区分两者）。
 func TestParseAndFilterPicks_MissingPicksField(t *testing.T) {
 	pool := testPool()
-	if _, _, err := parseAndFilterPicks(`{"rejected":[]}`, pool, 5); err == nil {
+	if _, _, _, err := parseAndFilterPicks(`{"rejected":[]}`, pool, 5); err == nil {
 		t.Fatalf("缺 picks 字段应报错（区别于显式空数组的合法拒选）")
 	}
 }

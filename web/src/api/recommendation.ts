@@ -302,6 +302,8 @@ export interface RecommendationBatch {
   rejected_json?: string // 池内落选理由 JSON（详情接口返回，列表不含）
   filters_json?: string // 本次生效筛选条件快照（详情接口返回）
   review_json?: string // AI 复核结论 JSON（verify 模式，详情接口返回）
+  trace_id?: string // P0-2 业务结果级审计关联（管理端 /admin/llm-calls 按它筛选调用记录）
+  llm_run_json?: string // LLM 运行 manifest 数组（详情接口返回；推荐主调 run 含 P1-1 coverage 诊断）
   llm_config_id?: number // 生成时使用的 LLM 配置 id（配置名前端按自己的清单解析）
   provider: string
   model: string
@@ -312,6 +314,26 @@ export interface RecommendationBatch {
   total_tokens: number
   latency_ms: number
   created_at: string
+}
+
+// P1-1 推荐 coverage/越池诊断（llm_run_json 里推荐主调 run 的 coverage 字段；
+// 程序化计数非模型自报：越池/乱码/重复条目已被服务端剥除，这里是剥除的可见记录）。
+export interface RecCoverageDiag {
+  input_count: number
+  unique_count: number
+  covered_count: number
+  truncated_count?: number
+  unknown_count?: number
+  duplicate_count?: number
+  out_of_pool_count?: number
+  unknown_symbols?: string[]
+  duplicate_symbols?: string[]
+  out_of_pool_symbols?: string[]
+  rejected_dropped?: number
+  prompt_trimmed?: boolean
+  prompt_trimmed_note?: string
+  coverage: number
+  error_codes?: string[]
 }
 
 export interface RecommendationView extends RecommendationBatch {

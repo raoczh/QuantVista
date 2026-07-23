@@ -46,6 +46,7 @@ import {
   type RecReject,
   type RecFilters,
   type PoolCandidate,
+  type RecCoverageDiag,
 } from '@/api/recommendation'
 import { getPreference, updatePreference, type UserPreference } from '@/api/user'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
@@ -541,6 +542,45 @@ const regimeSignals = computed<string[]>(() => {
   }
 })
 
+// ---------- P1-1 AI 输出 coverage/越池诊断（llm_run_json 推荐主调 run） ----------
+// 程序化计数：越池/乱码/重复条目服务端已剥除，这里让「剥除」可见（观测非门控）。
+const coverageDiag = computed<RecCoverageDiag | null>(() => {
+  const raw = current.value?.llm_run_json
+  if (!raw) return null
+  try {
+    const runs = JSON.parse(raw) as Array<{ module?: string; coverage?: RecCoverageDiag }>
+    for (const r of runs) {
+      if (r.module === 'recommendation' && r.coverage) return r.coverage
+    }
+    return null
+  } catch {
+    return null
+  }
+})
+// 仅异常时展示（正常批次 coverage=1 不加噪声；完整诊断恒在批次 llm_run_json 可查）。
+const coverageIssues = computed<string[]>(() => {
+  const d = coverageDiag.value
+  if (!d) return []
+  const parts: string[] = []
+  if (d.out_of_pool_count) parts.push(`越池 ${d.out_of_pool_count}`)
+  if (d.unknown_count) parts.push(`无法识别 ${d.unknown_count}`)
+  if (d.duplicate_count) parts.push(`重复 ${d.duplicate_count}`)
+  if (d.truncated_count) parts.push(`超量 ${d.truncated_count}`)
+  return parts
+})
+const coverageTipLines = computed<string[]>(() => {
+  const d = coverageDiag.value
+  if (!d) return []
+  const lines: string[] = [
+    `模型输出 ${d.input_count} 条，池内合法保留 ${d.covered_count} 条（coverage ${Math.round((d.coverage ?? 0) * 100)}%）`,
+  ]
+  if (d.out_of_pool_symbols?.length) lines.push(`越池样本：${d.out_of_pool_symbols.join('、')}`)
+  if (d.unknown_symbols?.length) lines.push(`无法识别样本：${d.unknown_symbols.join('、')}`)
+  if (d.duplicate_symbols?.length) lines.push(`重复样本：${d.duplicate_symbols.join('、')}`)
+  if (d.prompt_trimmed && d.prompt_trimmed_note) lines.push(d.prompt_trimmed_note)
+  return lines
+})
+
 // ---------- S1-4 一键挂止损提醒 ----------
 const stopAlerting = ref<Record<number, boolean>>({})
 async function addStopAlert(it: RecommendationItem) {
@@ -934,6 +974,18 @@ function qgFieldLabels(fields?: string[]): string {
                     <div v-for="(s, i) in regimeSignals" :key="i">{{ s }}</div>
                     <div class="regime-tip-note">
                       三档判定为影子模式：仅提示，不改写推荐动作；防守档建议整体保守、降低仓位。
+                    </div>
+                  </div>
+                </n-tooltip>
+                <!-- P1-1 AI 输出诊断：仅异常时显示（越池/乱码/重复/超量已被程序剥除，这里是剥除的可见记录） -->
+                <n-tooltip v-if="coverageIssues.length" trigger="hover" placement="bottom">
+                  <template #trigger>
+                    <n-tag size="small" round :bordered="false" type="warning">AI 输出剥除：{{ coverageIssues.join(' / ') }}</n-tag>
+                  </template>
+                  <div class="regime-tip">
+                    <div v-for="(s, i) in coverageTipLines" :key="i">{{ s }}</div>
+                    <div class="regime-tip-note">
+                      越池/无法识别的标的已被程序剥除，不进入展示与追踪；本诊断为观测记录（不改变推荐行为），完整数据随批次运行元数据落库。
                     </div>
                   </div>
                 </n-tooltip>

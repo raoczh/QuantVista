@@ -603,6 +603,11 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	}
 
 	picks, rejected, usage, latency, callErr := s.callWithRepair(ctx, userID, mainRun, cfg, apiKey, allowPrivate, messages, poolBySymbol, count)
+	// P1-1 输入侧裁剪声明：池内合格候选（kept）只有量化排名前 maxLLMCandidates 只进
+	// LLM 名单（Top-N 是设计行为）——coverage 语义完整性要求如实声明「模型没选它可能
+	// 只是没喂给它」。仅诊断已存在时补填（调用失败无结构输出时 manifest 靠
+	// finish_state/degraded_reason 归因，不造空诊断）。
+	markCoveragePromptTrimmed(mainRun.Coverage, kept, len(llmCands))
 
 	// #11 原始 LLM 动作快照（复核前）：applyReviews 对 reject 会把 p.Action 强制改写为
 	// watch，事件表 RawAction 须记复核前值才能与 PostGateAction 构成门控前后对照。此处
@@ -997,7 +1002,13 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, userID int64
 		acc.TotalTokens += res.Usage.TotalTokens
 		lastLatency = res.LatencyMs
 
-		picks, rejected, perr := parseAndFilterPicks(res.Content, pool, count)
+		picks, rejected, diag, perr := parseAndFilterPicks(res.Content, pool, count)
+		if diag != nil {
+			// P1-1：run 承载最后一轮有结构输出的 coverage 诊断（成功轮，或 repair 打满
+			// 仍失败的最后一轮——降级批次靠它归因「为什么无效」）；JSON 都没解析出来的
+			// 轮次 diag=nil，保留上一轮诊断不覆盖。
+			run.Coverage = diag
+		}
 		if perr == nil {
 			return picks, rejected, acc, lastLatency, nil
 		}
@@ -1149,49 +1160,181 @@ func applyReviews(picks []recPick, reviews []pickReview) []recPick {
 	return picks
 }
 
+// P1-1 推荐 coverage/越池诊断的机读错误码。这些是**诊断码**（观测），不是 llm_contract.go
+// 的拒答码（业务失败）——诊断不改变主链路行为，只让「剥除」从静默变为可见。
+const (
+	recDiagOutOfPool = "rec_pick_out_of_pool"    // 形态合法（6 位数字）但不在候选池：越池，疑用训练记忆选股
+	recDiagUnknown   = "rec_pick_unknown_symbol" // 无法识别为 A 股代码形态（空白/名称/乱码）：输出质量缺陷
+	recDiagDuplicate = "rec_pick_duplicate"      // 同一标的重复输出
+	recDiagOverflow  = "rec_pick_overflow"       // 池内合法但超出请求数量被截断丢弃
+)
+
+// recDiagSampleMax 诊断样本数组上限（防模型输出大量乱码把 manifest 撑爆）；
+// 完整数量以对应 count 字段为准（数组只是样本）。
+const recDiagSampleMax = 10
+
+// RecCoverageDiag P1-1 推荐 coverage/越池诊断（计划 §4.5.5 蓝图 D 的 diagnostics 字段，
+// §7.2 P1-1）。**程序化计数，非模型自报**——parseAndFilterPicks 在剥除时逐条归类，
+// 每个输入条目恰记入一类：covered / truncated / duplicate / out_of_pool / unknown，
+// 不变式 input_count = covered + truncated + duplicate + unknown + out_of_pool 各计数之和。
+// 随推荐主调 run 的 manifest（批次 llm_run_json）落库；诊断是观测不是门控，
+// 剥除行为与既有完全一致（越池仍丢弃、超量仍截断、全越池仍触发 repair）。
+type RecCoverageDiag struct {
+	InputCount   int `json:"input_count"`   // 模型输出 picks 原始条数
+	UniqueCount  int `json:"unique_count"`  // 去重后条数（= input - duplicate）
+	CoveredCount int `json:"covered_count"` // 池内合法且被保留的条数（= len(picks)）
+	// TruncatedCount 池内合法但超出请求数量被丢弃的条数（模型多给，PRD 3.6 截断）。
+	TruncatedCount int `json:"truncated_count,omitempty"`
+	UnknownCount   int `json:"unknown_count,omitempty"` // 含空白 symbol（空白不进样本数组）
+	DuplicateCount int `json:"duplicate_count,omitempty"`
+	OutOfPoolCount int `json:"out_of_pool_count,omitempty"`
+	// 样本数组（蓝图 D 字段名）：每类最多 recDiagSampleMax 个、单个截 16 字符；
+	// 完整数量看 count 字段。
+	UnknownSymbols   []string `json:"unknown_symbols,omitempty"`
+	DuplicateSymbols []string `json:"duplicate_symbols,omitempty"`
+	OutOfPoolSymbols []string `json:"out_of_pool_symbols,omitempty"`
+	// RejectedDropped 落选理由（rejected）里因越池/重复/空代码/空理由被丢弃的条数
+	//（「已入选不算落选」的正常剥除不计——那不是模型输出缺陷）。
+	RejectedDropped int `json:"rejected_dropped,omitempty"`
+	// PromptTrimmed 输入侧裁剪声明：池内合格候选多于实际喂给 LLM 的名单（Top-N 设计行为）。
+	// 「模型没选它」可能只是「没喂给它」——coverage 语义完整性要求如实声明。
+	// 由 runGeneration 层填充（parse 层不知道池全景）。
+	PromptTrimmed     bool   `json:"prompt_trimmed,omitempty"`
+	PromptTrimmedNote string `json:"prompt_trimmed_note,omitempty"`
+	// Coverage 输出侧合法率 = (covered+truncated)/unique；无输出（合法空拒选）= 1。
+	// 1.0 = 模型输出全部在池内；<1 = 存在越池/乱码输出（详见 error_codes 与样本）。
+	Coverage float64 `json:"coverage"`
+	// ErrorCodes 机读错误码汇总（recDiag* 常量；空=输出全部合法）。
+	ErrorCodes []string `json:"error_codes,omitempty"`
+}
+
+// finalize 收尾派生字段（unique/coverage/error_codes）。
+func (d *RecCoverageDiag) finalize() {
+	d.UniqueCount = d.InputCount - d.DuplicateCount
+	if d.UniqueCount > 0 {
+		d.Coverage = round2(float64(d.CoveredCount+d.TruncatedCount) / float64(d.UniqueCount))
+	} else {
+		d.Coverage = 1 // 无输出即无违规（显式空拒选合法）
+	}
+	d.ErrorCodes = nil
+	for _, c := range []struct {
+		n    int
+		code string
+	}{
+		{d.OutOfPoolCount, recDiagOutOfPool},
+		{d.UnknownCount, recDiagUnknown},
+		{d.DuplicateCount, recDiagDuplicate},
+		{d.TruncatedCount, recDiagOverflow},
+	} {
+		if c.n > 0 {
+			d.ErrorCodes = append(d.ErrorCodes, c.code)
+		}
+	}
+}
+
+// looksLikeCNSymbol 是否为 A 股代码形态（6 位纯数字）——区分「越池」（形态合法、
+// 疑似训练记忆里的真实股票）与「无法识别」（幻觉/乱码/公司名）两类输出缺陷。
+func looksLikeCNSymbol(sym string) bool {
+	if len(sym) != 6 {
+		return false
+	}
+	for _, ch := range sym {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// addDiagSample 样本数组追加（上限+截断；计数由调用方维护）。
+func addDiagSample(list *[]string, sym string) {
+	if len(*list) < recDiagSampleMax {
+		*list = append(*list, truncateRunes(sym, 16))
+	}
+}
+
+// markCoveragePromptTrimmed 输入侧裁剪声明（runGeneration 层调用）：kept=池内合格候选数、
+// llmCount=实际进 LLM 名单数。diag 为 nil（调用失败无结构输出）时不造空诊断——
+// RecCoverageDiag 的 Coverage=0 零值会被误读成「全越池」。
+func markCoveragePromptTrimmed(diag *RecCoverageDiag, kept, llmCount int) {
+	if diag == nil || kept <= llmCount {
+		return
+	}
+	diag.PromptTrimmed = true
+	diag.PromptTrimmedNote = fmt.Sprintf("候选池合格 %d 只，按量化排名前 %d 只进入 LLM 精选", kept, llmCount)
+}
+
 // parseAndFilterPicks 解析 picks 并执行反编造过滤（只保留∈候选池的标的），
 // 输出条数不超过 maxCount（PRD 3.6：用户可选 3~5 个，模型多给的截断丢弃）。
 // 同时解析 rejected（池内落选理由）：仅保留∈候选池且未入选的标的，best-effort、
 // 缺失不构成不合格。返回 error（触发 repair）当：JSON 解析失败、缺 picks 字段、
 // 或非空 picks 过滤后无任何有效标的。**显式空数组是合法结果**——p4 prompt 明示
 // 「宁缺毋滥、picks 可为空」，模型行使拒选权时不得触发 repair 强迫其硬凑标的。
-func parseAndFilterPicks(content string, pool map[string]candidate, maxCount int) ([]recPick, []recReject, error) {
+//
+// P1-1：第三返回值为 coverage 诊断（剥除不再静默）——凡解析出 picks 结构即非 nil
+// （**全越池返回 error 时也带诊断**，供 repair 打满仍失败的批次归因）；JSON 解析失败/
+// 缺 picks 字段时为 nil（无结构可诊断）。诊断纯观测：picks/rejected 输出与改造前逐字节一致。
+func parseAndFilterPicks(content string, pool map[string]candidate, maxCount int) ([]recPick, []recReject, *RecCoverageDiag, error) {
 	if maxCount <= 0 || maxCount > 5 {
 		maxCount = 5
 	}
 	jsonStr := extractJSONObject(content)
 	if jsonStr == "" {
-		return nil, nil, errors.New("未找到 JSON 对象")
+		return nil, nil, nil, errors.New("未找到 JSON 对象")
 	}
 	var parsed struct {
 		Picks    *[]recPick  `json:"picks"` // 指针区分「字段缺失」（repair）与「显式空数组」（合法拒选）
 		Rejected []recReject `json:"rejected"`
 	}
 	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
-		return nil, nil, fmt.Errorf("JSON 解析失败: %v", err)
+		return nil, nil, nil, fmt.Errorf("JSON 解析失败: %v", err)
 	}
 	if parsed.Picks == nil {
-		return nil, nil, errors.New("缺少 picks 字段")
+		return nil, nil, nil, errors.New("缺少 picks 字段")
 	}
 
+	diag := &RecCoverageDiag{InputCount: len(*parsed.Picks)}
 	out := make([]recPick, 0, len(*parsed.Picks))
+	// seen=已保留进 picks 的标的（rejected 的「已入选不算落选」判定依赖此语义，
+	// truncated 条目**不得**标入——否则超量标的出现在 rejected 里会被误剥除，行为漂移）；
+	// seenAll=出现过的任何非空标的（诊断重复判定，越池标的重复输出也归 duplicate）。
 	seen := map[string]bool{}
+	seenAll := map[string]bool{}
 	for _, p := range *parsed.Picks {
 		sym := strings.TrimSpace(p.Symbol)
-		if sym == "" || seen[sym] {
+		if sym == "" {
+			diag.UnknownCount++ // 空白无法归因到具体标的：只计数不进样本数组
 			continue
 		}
+		if seenAll[sym] {
+			diag.DuplicateCount++
+			addDiagSample(&diag.DuplicateSymbols, sym)
+			continue
+		}
+		seenAll[sym] = true
 		if _, ok := pool[sym]; !ok {
-			continue // 反编造：越池标的直接丢弃
+			// 反编造：越池标的直接丢弃（行为不变）；诊断按形态分类。
+			if looksLikeCNSymbol(sym) {
+				diag.OutOfPoolCount++
+				addDiagSample(&diag.OutOfPoolSymbols, sym)
+			} else {
+				diag.UnknownCount++
+				addDiagSample(&diag.UnknownSymbols, sym)
+			}
+			continue
+		}
+		if len(out) >= maxCount {
+			diag.TruncatedCount++ // 池内合法但超量：不进 picks（原 break 语义），继续遍历只为计数
+			continue
 		}
 		seen[sym] = true
 		out = append(out, normalizePick(p, sym, pool[sym]))
-		if len(out) >= maxCount {
-			break
-		}
+		diag.CoveredCount++
 	}
+	diag.finalize()
 	if len(out) == 0 && len(*parsed.Picks) > 0 {
-		return nil, nil, errors.New("推荐的标的均不在候选池内")
+		return nil, nil, diag, fmt.Errorf("推荐的标的均不在候选池内（池外 %d/无法识别 %d/重复 %d）",
+			diag.OutOfPoolCount, diag.UnknownCount, diag.DuplicateCount)
 	}
 
 	// 落选理由：同样只认池内标的（防杜撰），已入选的不算落选，去重、理由截断。
@@ -1199,21 +1342,27 @@ func parseAndFilterPicks(content string, pool map[string]candidate, maxCount int
 	seenRej := map[string]bool{}
 	for _, r := range parsed.Rejected {
 		sym := strings.TrimSpace(r.Symbol)
-		if sym == "" || seen[sym] || seenRej[sym] {
+		if sym == "" || seenRej[sym] {
+			diag.RejectedDropped++
 			continue
+		}
+		if seen[sym] {
+			continue // 已入选不算落选：正常语义剥除，非输出缺陷，不计 RejectedDropped
 		}
 		c, ok := pool[sym]
 		if !ok {
+			diag.RejectedDropped++
 			continue
 		}
 		reason := truncateRunes(strings.TrimSpace(r.Reason), 200)
 		if reason == "" {
+			diag.RejectedDropped++
 			continue
 		}
 		seenRej[sym] = true
 		rejected = append(rejected, recReject{Symbol: sym, Name: c.Name, Reason: reason})
 	}
-	return out, rejected, nil
+	return out, rejected, diag, nil
 }
 
 // normalizePick 规整单条推荐的字段（action/confidence/数值/免责兜底）。
