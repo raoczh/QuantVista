@@ -244,6 +244,7 @@ func capModuleTokens(userMax, moduleCap int) int {
 // 若服务端因不支持该字段返回 4xx，则去掉 response_format 重试一次（fallback，靠 prompt 约束 JSON）。
 // EndpointType=responses 时分流到 /v1/responses 适配（ai_client_responses.go），返回语义一致。
 func chatCompletion(ctx context.Context, p chatParams) (res *chatResult, err error) {
+	p = applyModelRouting(p)     // P2-4 模块级模型路由：先换目标，后续契约/能力路由作用于最终目标
 	p = applyAccuracyContract(p) // ac1 契约注入+温度钳制在审计之前——RequestBody 记录上游真实收到的形态
 	p = initCallObservers(p)
 	p = applyCapabilityRouting(p) // P0-5 声明化路由：已知不支持的结构化/参数维度直接省略
@@ -687,6 +688,7 @@ func estimateUsage(messages []chatMessage, content string) chatUsage {
 // 建立连接前的错误分类与非流式一致。上游忽略 stream 参数返回整包 JSON 时按非流式解析兼容。
 // EndpointType=responses 时分流到 /v1/responses 适配。
 func chatCompletionStream(ctx context.Context, p chatParams, onDelta func(string)) (res *chatResult, err error) {
+	p = applyModelRouting(p) // P2-4 模块级模型路由：先换目标，后续契约/能力路由作用于最终目标
 	p = applyAccuracyContract(p)
 	p = initCallObservers(p)
 	p = applyCapabilityRouting(p) // P0-5 声明化路由：已知不支持的结构化/参数维度直接省略

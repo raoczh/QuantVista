@@ -47,11 +47,20 @@ type LLMExperiment struct {
 	FailureReason string `gorm:"size:512" json:"failure_reason"`   // P2-2：失败原因（未达预期时必填）
 	ParentID      int64  `gorm:"index;default:0" json:"parent_id"` // 父实验（版本谱系）
 
-	PromotedRevision int        `json:"promoted_revision"` // 晋级后模板 revision（快照表可回放）
-	StartedAt        *time.Time `json:"started_at"`
-	CompletedAt      *time.Time `json:"completed_at"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
+	PromotedRevision int `json:"promoted_revision"` // 晋级后模板 revision（快照表可回放）
+
+	// P2-6 一键切回 champion 的回滚锚：晋级瞬间固化「当时启用中的模板状态」——
+	// PrePromoteEnabled=false 表示晋级前用默认模板（回滚=停用自定义模板）；true 表示
+	// 晋级前已有启用中的自定义模板（回滚=把该内容重新落为启用模板，生成新 revision，
+	// 不删工件——champion 指针语义与 promote 对称）。内容不出 JSON（体积+无展示需求）。
+	PrePromoteEnabled bool       `json:"pre_promote_enabled"`
+	PrePromoteContent string     `gorm:"type:text" json:"-"`
+	RolledBackAt      *time.Time `json:"rolled_back_at"`
+
+	StartedAt   *time.Time `json:"started_at"`
+	CompletedAt *time.Time `json:"completed_at"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
 // LLMExperimentRun 一次影子采样工件：同一批次里 champion（业务主调）与 challenger
@@ -80,13 +89,40 @@ type LLMExperimentRun struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// LLMReleaseAudit P2-6 自动发布门的 LLM 复核工件（PASS/FAIL）：审计员角色
+// （module=release_audit）对 completed 实验做「程序硬检覆盖不了的缺口」复核，
+// 每次运行落一行（完整运行工件保留，晋级门只消费最新一行且要求 hash 匹配）。
+// Verdict 封闭三态：pass / fail / error（LLM 输出无效或调用失败——error 不是 FAIL
+// 判定，但同样挡晋级：没有 PASS 就不进 synthesis，P1-9 语义）。
+type LLMReleaseAudit struct {
+	ID           int64  `gorm:"primaryKey" json:"id"`
+	ExperimentID int64  `gorm:"index" json:"experiment_id"`
+	UserID       int64  `json:"user_id"` // 触发审计的管理员（quota 记账主体为配置所有者）
+	Verdict      string `gorm:"size:8" json:"verdict"`
+	FindingsJSON string `gorm:"type:text" json:"findings_json"`
+	Summary      string `gorm:"size:512" json:"summary"`
+	// ChallengerHash 审计对象内容 hash（晋级门校验：审计的必须是当前 challenger 内容）。
+	ChallengerHash string    `gorm:"size:32" json:"challenger_hash"`
+	TraceID        string    `gorm:"size:40" json:"trace_id"` // llm-calls 可回查逐请求审计
+	TokensUsed     int       `json:"tokens_used"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+// 发布审计判定封闭枚举。
+const (
+	ReleaseAuditPass  = "pass"
+	ReleaseAuditFail  = "fail"
+	ReleaseAuditError = "error"
+)
+
 // 实验状态封闭枚举。
 const (
-	ExpStatusDraft     = "draft"
-	ExpStatusRunning   = "running"
-	ExpStatusCompleted = "completed"
-	ExpStatusPromoted  = "promoted"
-	ExpStatusAbandoned = "abandoned"
+	ExpStatusDraft      = "draft"
+	ExpStatusRunning    = "running"
+	ExpStatusCompleted  = "completed"
+	ExpStatusPromoted   = "promoted"
+	ExpStatusAbandoned  = "abandoned"
+	ExpStatusRolledBack = "rolled_back" // P2-6 一键切回 champion 后的终态
 )
 
 // 实验结论封闭枚举（P2-2 反馈）。

@@ -76,6 +76,8 @@ var llmModuleBudgets = map[string]llmModuleBudget{
 	// P2-1 challenger 影子采样（llm_experiment.go）：与推荐主调同预算（公平对照），
 	// **无 repair**——影子对照要测的就是 challenger「一把过」的结构化质量。
 	"experiment": {MaxTokens: 2500, RepairAttempts: 0},
+	// P2-6 发布审计员（llm_release_gate.go）：verdict+findings 小 JSON；手动管理员动作。
+	"release_audit": {MaxTokens: 1500, RepairAttempts: 1, RepairFeedChars: 600},
 }
 
 // moduleBudget 取模块预算；未登记模块回默认（不钳 token、repair 默认 1）——

@@ -359,11 +359,17 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				admin.GET("/llm-roles", adminCtl.LLMRoles)
 				// P2-5 组合/回测联合评估（只读；include_locked=1 显式请求锁定段并登记审计）
 				admin.GET("/llm-joint-eval", adminCtl.LLMJointEval)
-				// P2-1/P2-2 champion/challenger prompt 实验（影子采样；promote=P1-9 质量门）
+				// P2-1/P2-2 champion/challenger prompt 实验（影子采样；promote=P1-9 质量门；
+				// P2-6 action 扩 audit/rollback）
 				admin.GET("/llm-experiments", adminCtl.LLMExperiments)
 				admin.GET("/llm-experiments/:id", adminCtl.GetLLMExperiment)
 				admin.POST("/llm-experiments", adminCtl.CreateLLMExperiment)
 				admin.POST("/llm-experiments/:id/:action", adminCtl.LLMExperimentAction)
+				// P2-4 模型路由（模块→指定 LLM 配置；自动回退状态显式恢复）
+				admin.GET("/llm-routes", adminCtl.LLMRoutes)
+				admin.POST("/llm-routes", adminCtl.UpsertLLMRoute)
+				admin.DELETE("/llm-routes/:id", adminCtl.DeleteLLMRoute)
+				admin.POST("/llm-routes/:id/reset", adminCtl.ResetLLMRoute)
 
 				// 数据源健康端点（S1 健康滑窗：每 (源,能力) success/empty/error 与冷却状态）
 				admin.GET("/datasources", marketCtl.DataSources)

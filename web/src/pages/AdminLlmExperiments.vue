@@ -5,8 +5,9 @@ import {
   NModal, NSelect, NSpin, NTag, useDialog, useMessage,
 } from 'naive-ui'
 import {
-  actLLMExperiment, createLLMExperiment, getLLMExperiment, listLLMExperiments,
+  actLLMExperiment, auditLLMExperiment, createLLMExperiment, getLLMExperiment, listLLMExperiments,
   type LLMExperiment, type LLMExperimentActual, type LLMExperimentInput, type LLMExperimentRun,
+  type LLMReleaseAudit, type LLMReleaseAuditFinding,
 } from '@/api/admin'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
@@ -18,10 +19,10 @@ const rows = ref<LLMExperiment[]>([])
 const loading = ref(false)
 
 const STATUS_LABEL: Record<string, string> = {
-  draft: '草稿', running: '采样中', completed: '已完成', promoted: '已晋级', abandoned: '已废弃',
+  draft: '草稿', running: '采样中', completed: '已完成', promoted: '已晋级', abandoned: '已废弃', rolled_back: '已回滚',
 }
 const STATUS_TYPE: Record<string, 'default' | 'info' | 'success' | 'warning' | 'error'> = {
-  draft: 'default', running: 'info', completed: 'warning', promoted: 'success', abandoned: 'error',
+  draft: 'default', running: 'info', completed: 'warning', promoted: 'success', abandoned: 'error', rolled_back: 'error',
 }
 const CONCLUDE_LABEL: Record<string, string> = {
   improved: '有增量', no_improvement: '无增量', worse: '劣化',
@@ -48,15 +49,43 @@ function parseActual(exp: LLMExperiment): LLMExperimentActual | null {
   }
 }
 
-/* 明细（影子样本） */
+/* 明细（影子样本 + 发布审计工件） */
 const detailRuns = reactive<Record<number, LLMExperimentRun[]>>({})
-async function loadDetail(id: number) {
-  if (detailRuns[id]) return
+const detailAudits = reactive<Record<number, LLMReleaseAudit[]>>({})
+async function loadDetail(id: number, force = false) {
+  if (detailRuns[id] && !force) return
   try {
     const res = await getLLMExperiment(id)
     detailRuns[id] = res.runs
+    detailAudits[id] = res.audits ?? []
   } catch (e) {
     message.error((e as Error).message)
+  }
+}
+
+function auditFindings(a: LLMReleaseAudit): LLMReleaseAuditFinding[] {
+  if (!a.findings_json) return []
+  try {
+    return (JSON.parse(a.findings_json) as LLMReleaseAuditFinding[]) ?? []
+  } catch {
+    return []
+  }
+}
+const AUDIT_TYPE: Record<string, 'success' | 'error' | 'warning'> = { pass: 'success', fail: 'error', error: 'warning' }
+const AUDIT_LABEL: Record<string, string> = { pass: 'PASS', fail: 'FAIL', error: '未判定' }
+
+/* P2-6 发布审计（LLM 只复核程序硬检覆盖不了的缺口；一次真实 LLM 调用） */
+const auditing = ref(false)
+async function runAudit(exp: LLMExperiment) {
+  auditing.value = true
+  try {
+    const a = await auditLLMExperiment(exp.id)
+    message.success(`发布审计完成：${AUDIT_LABEL[a.verdict] || a.verdict}`)
+    await loadDetail(exp.id, true)
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    auditing.value = false
   }
 }
 
@@ -66,7 +95,7 @@ function onHeaderClick(data: { name: string | number }) {
 
 /* 动作 */
 const acting = ref(false)
-async function act(exp: LLMExperiment, action: 'start' | 'promote' | 'abandon') {
+async function act(exp: LLMExperiment, action: 'start' | 'promote' | 'rollback' | 'abandon') {
   acting.value = true
   try {
     await actLLMExperiment(exp.id, action)
@@ -82,10 +111,20 @@ async function act(exp: LLMExperiment, action: 'start' | 'promote' | 'abandon') 
 function confirmPromote(exp: LLMExperiment) {
   dialog.warning({
     title: '晋级为 champion',
-    content: '将把 challenger 内容落为该模块启用中的自定义模板（生成新的不可变 revision 快照并切换指针）。发布质量门（样本量/结构化有效率/结论）不通过会被拒绝。回滚 = 在提示词页恢复上一版本。',
+    content: '将把 challenger 内容落为该模块启用中的自定义模板（生成新的不可变 revision 快照并切换指针）。发布质量门（样本量/结构化有效率/结论/内容 hash/发布审计 PASS）不通过会被拒绝。回滚 = 本页「一键切回 champion」。',
     positiveText: '晋级',
     negativeText: '取消',
     onPositiveClick: () => act(exp, 'promote'),
+  })
+}
+
+function confirmRollback(exp: LLMExperiment) {
+  dialog.warning({
+    title: '一键切回 champion',
+    content: '将恢复晋级前的模板状态（晋级前有自定义模板则恢复其内容并生成新 revision；晋级前为默认模板则停用当前自定义模板）。实验进入「已回滚」终态，工件全部保留。',
+    positiveText: '回滚',
+    negativeText: '取消',
+    onPositiveClick: () => act(exp, 'rollback'),
   })
 }
 
@@ -142,7 +181,7 @@ async function submitCreate() {
 <template>
   <PageContainer
     title="LLM 实验（champion / challenger）"
-    subtitle="P2-1/P2-2 实验飞轮：challenger 只影子运行（不影响业务结果）；假设→实验→反馈闭环，无增量不晋级；晋级须过发布质量门（P1-9 硬检）"
+    subtitle="P2-1/P2-2 实验飞轮：challenger 只影子运行（不影响业务结果）；假设→实验→反馈闭环，无增量不晋级；晋级须过发布质量门（P1-9 硬检 + P2-6 发布审计 PASS），晋级后可一键切回 champion"
   >
     <div class="exp-wrap">
       <SectionCard title="实验列表">
@@ -191,8 +230,21 @@ async function submitCreate() {
                 <div class="exp-actions">
                   <n-button v-if="r.status === 'draft'" size="tiny" type="primary" :loading="acting" @click="act(r, 'start')">启动采样</n-button>
                   <n-button v-if="r.status === 'running'" size="tiny" type="warning" :loading="acting" @click="completeTarget = r">完成实验</n-button>
+                  <n-button v-if="r.status === 'completed'" size="tiny" type="info" :loading="auditing" @click="runAudit(r)">发布审计</n-button>
                   <n-button v-if="r.status === 'completed'" size="tiny" type="success" :loading="acting" @click="confirmPromote(r)">晋级 champion</n-button>
-                  <n-button v-if="r.status !== 'promoted' && r.status !== 'abandoned'" size="tiny" :loading="acting" @click="act(r, 'abandon')">废弃</n-button>
+                  <n-button v-if="r.status === 'promoted'" size="tiny" type="error" :loading="acting" @click="confirmRollback(r)">一键切回 champion</n-button>
+                  <n-button v-if="r.status !== 'promoted' && r.status !== 'abandoned' && r.status !== 'rolled_back'" size="tiny" :loading="acting" @click="act(r, 'abandon')">废弃</n-button>
+                </div>
+                <div v-if="detailAudits[r.id]?.length" class="exp-runs">
+                  <div class="exp-runs-title">发布审计工件（{{ detailAudits[r.id].length }} 次，晋级门只认最新且要求内容 hash 匹配）</div>
+                  <div v-for="a in detailAudits[r.id]" :key="a.id" class="exp-run-line">
+                    <n-tag size="tiny" :bordered="false" round :type="AUDIT_TYPE[a.verdict] || 'default'">{{ AUDIT_LABEL[a.verdict] || a.verdict }}</n-tag>
+                    {{ a.summary }}
+                    <template v-if="auditFindings(a).length">
+                      · 发现：<template v-for="(f, i) in auditFindings(a)" :key="i">{{ i > 0 ? '；' : '' }}[{{ f.severity }}] {{ f.code }} {{ f.message }}</template>
+                    </template>
+                    · trace {{ a.trace_id.slice(0, 10) }} · {{ a.tokens_used }} tok
+                  </div>
                 </div>
                 <div v-if="detailRuns[r.id]?.length" class="exp-runs">
                   <div class="exp-runs-title">影子样本（{{ detailRuns[r.id].length }} 条）</div>

@@ -68,6 +68,8 @@ func AllModels() []any {
 		&RecommendationReflection{},
 		&LLMExperiment{},
 		&LLMExperimentRun{},
+		&LLMReleaseAudit{},
+		&LLMModuleRoute{},
 		&StockUniverseDaily{},
 		&FactorSnapshotDaily{},
 	}

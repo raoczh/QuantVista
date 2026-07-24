@@ -33,9 +33,15 @@ import {
   triggerSnapshot,
   triggerFactorRebuild,
   triggerBackfillCalendar,
+  listLLMRoutes,
+  upsertLLMRoute,
+  deleteLLMRoute,
+  resetLLMRoute,
   type SystemSettings,
   type SyncLog,
   type DataHealthReport,
+  type LLMRouteView,
+  type LLMRouteModuleOption,
 } from '@/api/admin'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import type { AuthUser } from '@/api/auth'
@@ -74,6 +80,7 @@ async function load() {
     reflectionEnabled.value = settings.value.llm_reflection_shadow
     challengerEnabled.value = settings.value.llm_challenger
     layeredCtxEnabled.value = settings.value.llm_layered_context
+    modelRoutingEnabled.value = settings.value.llm_model_routing
     siteBaseURL.value = settings.value.site_base_url
   } catch (e) {
     message.error((e as Error).message)
@@ -271,6 +278,108 @@ async function toggleLayeredContext(v: boolean) {
   }
 }
 
+/* P2-4 模型路由：按模块把 AI 调用改走指定配置（缺省关；自动回退须显式恢复） */
+const savingModelRouting = ref(false)
+const modelRoutingEnabled = ref(false)
+async function toggleModelRouting(v: boolean) {
+  savingModelRouting.value = true
+  try {
+    settings.value = await updateSystemSettings({ llm_model_routing: v })
+    modelRoutingEnabled.value = settings.value.llm_model_routing
+    message.success('已保存，下一次 AI 调用生效')
+  } catch (e) {
+    message.error((e as Error).message)
+    await load()
+  } finally {
+    savingModelRouting.value = false
+  }
+}
+
+const routes = ref<LLMRouteView[]>([])
+const routeModules = ref<LLMRouteModuleOption[]>([])
+const routeSaving = ref(false)
+const routeForm = reactive({ module: '', config_id: 0, enabled: true, note: '', max_cost_ratio: 0 })
+const routeModuleOptions = computed(() =>
+  routeModules.value.map((m) => ({ label: `${m.label}（${m.module}）`, value: m.module })),
+)
+const routeConfigOptions = computed(() =>
+  myConfigs.value.map((c) => ({ label: `${c.name}（${c.model}）`, value: c.id })),
+)
+async function loadRoutes() {
+  try {
+    const res = await listLLMRoutes()
+    routes.value = res.routes
+    routeModules.value = res.modules
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+async function saveRoute() {
+  if (!routeForm.module || !routeForm.config_id) {
+    message.warning('请选择模块与目标配置')
+    return
+  }
+  routeSaving.value = true
+  try {
+    await upsertLLMRoute({
+      module: routeForm.module,
+      config_id: routeForm.config_id,
+      enabled: routeForm.enabled,
+      note: routeForm.note,
+      max_cost_ratio: routeForm.max_cost_ratio || 0,
+    })
+    message.success('路由已保存（自动回退状态已清除）')
+    routeForm.module = ''
+    routeForm.config_id = 0
+    routeForm.note = ''
+    routeForm.max_cost_ratio = 0
+    routeForm.enabled = true
+    await loadRoutes()
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    routeSaving.value = false
+  }
+}
+function editRoute(r: LLMRouteView) {
+  routeForm.module = r.module
+  routeForm.config_id = r.config_id
+  routeForm.enabled = r.enabled
+  routeForm.note = r.note
+  routeForm.max_cost_ratio = r.max_cost_ratio || 0
+}
+async function removeRoute(r: LLMRouteView) {
+  try {
+    await deleteLLMRoute(r.id)
+    message.success('路由已删除，恢复默认配置链路')
+    await loadRoutes()
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+async function recoverRoute(r: LLMRouteView) {
+  try {
+    await resetLLMRoute(r.id)
+    message.success('已恢复该路由（自动回退状态清除）')
+    await loadRoutes()
+  } catch (e) {
+    message.error((e as Error).message)
+  }
+}
+function routeHealthText(r: LLMRouteView): string {
+  const h = r.health
+  const parts: string[] = []
+  if (h.routed.total > 0) {
+    parts.push(`近24h ${h.routed.total} 次（失败 ${h.routed.errors}）`)
+  } else {
+    parts.push('近24h 无调用')
+  }
+  if (h.cost_ratio > 0) parts.push(`成本比 ${h.cost_ratio}`)
+  if (h.calib_brier != null && h.calib_best_peer != null)
+    parts.push(`Brier ${h.calib_brier}（最优层 ${h.calib_best_peer}）`)
+  return parts.join(' · ')
+}
+
 /* 新闻采集配置：间隔分钟数 + 自动 LLM 情绪分析开关 */
 const savingNews = ref(false)
 const news = reactive({ interval: 5, auto_llm: true })
@@ -453,6 +562,7 @@ onMounted(() => {
   loadLogs()
   loadMyConfigs()
   loadHealth()
+  loadRoutes()
 })
 </script>
 
@@ -571,7 +681,78 @@ onMounted(() => {
               开启（P2-3）：问答被裁剪的更早轮次以程序化「索引 + 按相关性检索摘录」注入（此前静默丢弃），每轮回答记录上下文分层快照（各层条数/粗估 token/不可见轮数）；反思影子检索同步分层。纯程序化零额外 LLM 调用；关闭回退旧的静默截断（快照观测保留）。
             </span>
           </n-space>
+          <n-space align="center">
+            <span>模型路由：</span>
+            <n-switch :value="modelRoutingEnabled" :loading="savingModelRouting" @update:value="toggleModelRouting" />
+            <span style="opacity: 0.6; font-size: 12px">
+              开启（P2-4，缺省关）：按下方「模型路由」表把指定模块的 AI 调用改走指定配置（如小模型跑新闻情绪省成本）。结构化任务不会路由到已知不支持 JSON 输出的目标；失败率/成本比/校准 Brier 恶化会自动回退并停用该路由（须显式恢复）。配额仍记发起用户；审计记录路由后真实目标。
+            </span>
+          </n-space>
         </n-space>
+      </SectionCard>
+
+      <!-- P2-4 模型路由表 -->
+      <SectionCard title="模型路由" :hoverable="false">
+        <n-alert type="info" :show-icon="false" :bordered="false" class="note">
+          一行 = 一个模块的调用改走指定 LLM 配置（目标配置须属启用状态的管理员）。挑战者影子采样（experiment）恒跟随推荐主调的路由（单变量对照），不可单独配置。总开关在上方「LLM 准确性契约」卡的「模型路由」。
+        </n-alert>
+        <n-table :bordered="false" :single-line="false" v-if="routes.length">
+          <thead>
+            <tr>
+              <th>模块</th>
+              <th>目标配置</th>
+              <th>状态</th>
+              <th>健康</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="r in routes" :key="r.id">
+              <td>{{ r.module }}</td>
+              <td>
+                <template v-if="r.config_missing"><n-tag size="small" type="error">配置已删</n-tag></template>
+                <template v-else>{{ r.config_name }} · {{ r.config_model }}</template>
+              </td>
+              <td>
+                <n-tag v-if="r.auto_fallback_at" size="small" type="warning">自动回退</n-tag>
+                <n-tag v-else-if="r.enabled" size="small" type="success">生效中</n-tag>
+                <n-tag v-else size="small">已停用</n-tag>
+                <div v-if="r.auto_fallback_reason" style="font-size: 12px; opacity: 0.65; max-width: 320px">{{ r.auto_fallback_reason }}</div>
+              </td>
+              <td style="font-size: 12px; opacity: 0.8">{{ routeHealthText(r) }}</td>
+              <td>
+                <n-space size="small">
+                  <n-button size="tiny" @click="editRoute(r)">编辑</n-button>
+                  <n-button v-if="r.auto_fallback_at" size="tiny" type="warning" @click="recoverRoute(r)">恢复</n-button>
+                  <n-popconfirm @positive-click="removeRoute(r)">
+                    <template #trigger><n-button size="tiny" type="error">删除</n-button></template>
+                    删除后该模块恢复默认配置链路？
+                  </n-popconfirm>
+                </n-space>
+              </td>
+            </tr>
+          </tbody>
+        </n-table>
+        <n-empty v-else description="暂无路由：全部模块走默认配置链路" style="margin: 12px 0" />
+        <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 560px; margin-top: 12px" :show-feedback="false">
+          <n-form-item label="模块">
+            <n-select v-model:value="routeForm.module" :options="routeModuleOptions" placeholder="选择业务模块" filterable />
+          </n-form-item>
+          <n-form-item label="目标配置">
+            <n-select v-model:value="routeForm.config_id" :options="routeConfigOptions" placeholder="选择本人的 LLM 配置" />
+          </n-form-item>
+          <n-form-item label="成本回退阈值">
+            <n-input-number v-model:value="routeForm.max_cost_ratio" :min="0" :step="0.05" style="width: 160px" />
+            <span style="font-size: 12px; opacity: 0.55; margin-left: 8px">路由目标平均 token / 其他配置平均 token 超过该比值自动回退；0 = 默认 1.35</span>
+          </n-form-item>
+          <n-form-item label="备注">
+            <n-input v-model:value="routeForm.note" placeholder="为什么路由（可选）" />
+          </n-form-item>
+          <n-form-item label="启用">
+            <n-switch v-model:value="routeForm.enabled" />
+          </n-form-item>
+          <n-button type="primary" :loading="routeSaving" @click="saveRoute">保存路由</n-button>
+        </n-form>
       </SectionCard>
 
       <!-- GitHub OAuth -->

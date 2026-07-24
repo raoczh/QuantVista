@@ -33,6 +33,7 @@ const (
 	keyLLMReflection      = "llm_reflection_shadow"
 	keyLLMChallenger      = "llm_challenger"
 	keyLLMLayeredContext  = "llm_layered_context"
+	keyLLMModelRouting    = "llm_model_routing"
 )
 
 // 新闻快讯采集间隔（分钟）的默认值与钳制范围：下限防打爆免费上游，上限防配成"实际不采集"。
@@ -83,6 +84,10 @@ var (
 	// Tier2 索引/Tier3 按需检索注入 + 反思影子检索分层。纯程序化零额外 LLM 调用，
 	// 默认开；关闭回退旧的静默截断（上下文快照仍照常落库观测）。
 	llmLayeredContext = true
+	// P2-4 模型路由（llm_router.go）：按模块把 LLM 调用改走管理员指定配置。**默认关**——
+	// 它改变业务调用目标（行为开关非回滚开关，llm_challenger 同款 == "true" 语义）；
+	// 且路由表为空时开了也无事发生。关闭只停路由决策，路由表与自动回退记录保留。
+	llmModelRouting = false
 )
 
 // Init 从 DB 加载系统配置；首启时若 DB 缺 GitHub 凭证而 env 提供了，则种子回填到 DB。
@@ -162,6 +167,9 @@ func apply(opts map[string]string) {
 	llmChallenger = opts[keyLLMChallenger] == "true"
 	// P2-3 多层上下文缺省开（!= "false" 回滚开关语义：零额外调用，非成本开关）。
 	llmLayeredContext = opts[keyLLMLayeredContext] != "false"
+	// P2-4 模型路由**缺省关**（llm_challenger 同款 == "true" 语义）：改变业务调用目标，
+	// 须管理员显式启用；路由表另有 per-module Enabled 与自动回退双重闸。
+	llmModelRouting = opts[keyLLMModelRouting] == "true"
 }
 
 // normalizeSiteBaseURL 去空白与尾部斜杠（拼路由时统一 base+/path 形态）。
@@ -357,6 +365,20 @@ func SetLLMLayeredContext(v bool) error {
 	}
 	mu.Lock()
 	llmLayeredContext = v
+	mu.Unlock()
+	return nil
+}
+
+// LLMModelRouting P2-4 模型路由开关（缺省关：改变业务调用目标须显式启用）。
+func LLMModelRouting() bool { mu.RLock(); defer mu.RUnlock(); return llmModelRouting }
+
+// SetLLMModelRouting 设置 P2-4 模型路由开关。
+func SetLLMModelRouting(v bool) error {
+	if err := model.UpsertOption(keyLLMModelRouting, strconv.FormatBool(v)); err != nil {
+		return err
+	}
+	mu.Lock()
+	llmModelRouting = v
 	mu.Unlock()
 	return nil
 }

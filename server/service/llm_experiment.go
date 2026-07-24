@@ -284,6 +284,28 @@ func PromoteLLMExperiment(id int64) (*model.LLMExperiment, error) {
 	if promptContentHash(exp.ChallengerContent) != exp.ChallengerHash {
 		return nil, errors.New("challenger 内容与创建时 hash 不符（快照被篡改），拒绝晋级")
 	}
+	// 门 6（P2-6 自动发布门）：LLM 发布审计工件必须 PASS 且审计对象与当前内容一致
+	// ——「未 PASS 不进入 synthesis」（P1-9）在此收口；审计只复核程序硬检覆盖不了的
+	// 内容性缺口（llm_release_gate.go），promote 本身仍是管理员显式动作（人工审批）。
+	audit := latestReleaseAudit(exp.ID)
+	if audit == nil {
+		return nil, errors.New("缺少发布审计工件：先在实验页运行「发布审计」（P2-6 门 6：未 PASS 不晋级）")
+	}
+	if audit.ChallengerHash != exp.ChallengerHash {
+		return nil, errors.New("最新审计工件的内容 hash 与当前 challenger 不符（内容变过须重审），拒绝晋级")
+	}
+	if audit.Verdict != model.ReleaseAuditPass {
+		return nil, fmt.Errorf("最新发布审计 verdict=%s（%s）：未 PASS 不晋级", audit.Verdict, audit.Summary)
+	}
+
+	// 回滚锚（P2-6）：晋级瞬间固化「当时启用中的模板状态」——一键切回 champion 的依据。
+	if row := userPromptTemplateRow(exp.UserID, exp.PromptModule); row != nil {
+		exp.PrePromoteEnabled = true
+		exp.PrePromoteContent = row.Content
+	} else {
+		exp.PrePromoteEnabled = false
+		exp.PrePromoteContent = ""
+	}
 
 	// 晋级=champion 指针切换：经既有 Upsert 落为启用模板（内容 hash/revision/不可变
 	// revision 快照全走 P0-6 既有机制；契约段由 composeCustomTaskPrompt 恒追加）。
@@ -297,7 +319,7 @@ func PromoteLLMExperiment(id int64) (*model.LLMExperiment, error) {
 	if err := common.DB.Save(&exp).Error; err != nil {
 		return nil, err
 	}
-	common.SysLog("实验 #%d 晋级：module=%s revision=%d hash=%s（回滚=提示词页恢复上一 revision）",
+	common.SysLog("实验 #%d 晋级：module=%s revision=%d hash=%s（回滚=实验页「一键切回 champion」）",
 		exp.ID, exp.PromptModule, tpl.Revision, exp.ChallengerHash)
 	return &exp, nil
 }
@@ -309,7 +331,10 @@ func AbandonLLMExperiment(id int64, reason string) (*model.LLMExperiment, error)
 		return nil, errors.New("实验不存在")
 	}
 	if exp.Status == model.ExpStatusPromoted {
-		return nil, errors.New("已晋级实验不可废弃（回滚走提示词页恢复上一 revision）")
+		return nil, errors.New("已晋级实验不可废弃（回滚走「一键切回 champion」）")
+	}
+	if exp.Status == model.ExpStatusRolledBack {
+		return nil, errors.New("已回滚实验是终态，不可废弃")
 	}
 	if exp.Status == model.ExpStatusAbandoned {
 		return &exp, nil

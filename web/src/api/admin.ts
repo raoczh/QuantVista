@@ -18,6 +18,7 @@ export interface SystemSettings {
   llm_reflection_shadow: boolean
   llm_challenger: boolean
   llm_layered_context: boolean
+  llm_model_routing: boolean
   site_base_url: string
 }
 
@@ -39,6 +40,7 @@ export interface SystemSettingsUpdate {
   llm_reflection_shadow?: boolean
   llm_challenger?: boolean
   llm_layered_context?: boolean
+  llm_model_routing?: boolean
   site_base_url?: string
 }
 
@@ -573,7 +575,7 @@ export interface LLMExperiment {
   challenger_hash: string
   champion_version: string
   champion_hash: string
-  status: 'draft' | 'running' | 'completed' | 'promoted' | 'abandoned'
+  status: 'draft' | 'running' | 'completed' | 'promoted' | 'abandoned' | 'rolled_back'
   sample_target: number
   sample_count: number
   actual_json: string
@@ -581,6 +583,8 @@ export interface LLMExperiment {
   failure_reason: string
   parent_id: number
   promoted_revision: number
+  pre_promote_enabled: boolean
+  rolled_back_at?: string
   started_at?: string
   completed_at?: string
   created_at: string
@@ -635,7 +639,7 @@ export function listLLMExperiments() {
 }
 
 export function getLLMExperiment(id: number) {
-  return request<{ experiment: LLMExperiment; runs: LLMExperimentRun[] }>({ url: `/admin/llm-experiments/${id}` })
+  return request<{ experiment: LLMExperiment; runs: LLMExperimentRun[]; audits: LLMReleaseAudit[] }>({ url: `/admin/llm-experiments/${id}` })
 }
 
 export function createLLMExperiment(input: LLMExperimentInput) {
@@ -644,6 +648,95 @@ export function createLLMExperiment(input: LLMExperimentInput) {
   })
 }
 
-export function actLLMExperiment(id: number, action: 'start' | 'complete' | 'promote' | 'abandon', body?: { conclusion?: string; failure_reason?: string }) {
+export function actLLMExperiment(id: number, action: 'start' | 'complete' | 'promote' | 'rollback' | 'abandon', body?: { conclusion?: string; failure_reason?: string }) {
   return request<LLMExperiment>({ url: `/admin/llm-experiments/${id}/${action}`, method: 'post', data: body ?? {} })
+}
+
+// ---------- P2-6 自动发布门（发布审计工件） ----------
+
+export interface LLMReleaseAuditFinding {
+  code: string
+  severity: 'high' | 'med' | 'low'
+  message: string
+}
+
+export interface LLMReleaseAudit {
+  id: number
+  experiment_id: number
+  user_id: number
+  verdict: 'pass' | 'fail' | 'error'
+  findings_json: string
+  summary: string
+  challenger_hash: string
+  trace_id: string
+  tokens_used: number
+  created_at: string
+}
+
+export function auditLLMExperiment(id: number) {
+  return request<LLMReleaseAudit>({ url: `/admin/llm-experiments/${id}/audit`, method: 'post', data: {} })
+}
+
+// ---------- P2-4 模型路由 ----------
+
+export interface LLMRouteCallStats {
+  total: number
+  errors: number
+  avg_tokens: number
+  success_n: number
+}
+
+export interface LLMRouteHealth {
+  routed: LLMRouteCallStats
+  baseline: LLMRouteCallStats
+  cost_ratio: number
+  calib_brier?: number
+  calib_best_peer?: number
+}
+
+export interface LLMRouteView {
+  id: number
+  module: string
+  config_id: number
+  enabled: boolean
+  note: string
+  max_cost_ratio: number
+  auto_fallback_at?: string
+  auto_fallback_reason: string
+  created_at: string
+  updated_at: string
+  config_name: string
+  config_provider: string
+  config_model: string
+  config_missing: boolean
+  health: LLMRouteHealth
+}
+
+export interface LLMRouteModuleOption {
+  module: string
+  label: string
+}
+
+export interface LLMRouteInput {
+  module: string
+  config_id: number
+  enabled: boolean
+  note?: string
+  max_cost_ratio?: number
+}
+
+export function listLLMRoutes() {
+  return request<{ routes: LLMRouteView[]; modules: LLMRouteModuleOption[] }>({ url: '/admin/llm-routes' })
+}
+
+export function upsertLLMRoute(input: LLMRouteInput) {
+  return request<LLMRouteView>({ url: '/admin/llm-routes', method: 'post', data: input })
+}
+
+export function deleteLLMRoute(id: number) {
+  return request<{ deleted: boolean }>({ url: `/admin/llm-routes/${id}`, method: 'delete' })
+}
+
+export function resetLLMRoute(id: number) {
+  return request<LLMRouteView>({ url: `/admin/llm-routes/${id}/reset`, method: 'post', data: {} })
 }

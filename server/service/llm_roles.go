@@ -277,6 +277,18 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		Fallback:         "任何失败只落样本行 Error 字段（失败也是实验数据），业务批次零影响",
 		CounterExamples:  []string{"TestChallengerShadowNotMutateBusiness", "TestLLMExperimentPromoteGate"},
 	},
+	"release_audit": {
+		RoleID: "release_audit", Name: "发布审计员（release_auditor）",
+		Version: releaseAuditPromptVersion, SchemaVersion: "release_audit.v1",
+		Purpose: "P2-6 自动发布门的 LLM 复核：对 completed 实验的 challenger 内容只复核程序硬检覆盖不了的缺口（契约削弱/单变量夹带/诱导伪造措辞/结论与指标矛盾），产出 PASS/FAIL 工件供 promote 门 6 消费",
+		Market:  "-（元任务，不面向行情）", Horizons: "-",
+		Trigger:          "管理员在实验页手动触发（仅 completed 状态）；promote 门 6 只认最新工件且要求内容 hash 匹配；LLM 不可用如实报错不出假 PASS",
+		InputWhitelist:   []string{"实验元数据（假设/预期/结论/影子聚合指标）", "champion 与 challenger 任务段内容"},
+		MustAnswer:       []string{"verdict=pass/fail 封闭枚举（程序校验）", "fail 必附 findings（code/severity/message）", "high 级 finding 程序强制 fail（口是心非收口）"},
+		ForbiddenActions: []string{"复述程序硬检已覆盖的门槛（样本量/有效率/hash/状态机）", "输出 pass 同时给出 high 级 finding（程序改判 fail）", "替代人工审批（promote 仍是管理员显式动作）"},
+		Fallback:         "解析失败 repair 1 次；仍无效落 verdict=error 工件（同样挡晋级，可重跑），不伪造 PASS",
+		CounterExamples:  []string{"TestParseReleaseAudit", "TestLLMExperimentAuditGate"},
+	},
 }
 
 // LLMRoleRegistry 输出角色资产列表（按 RoleID 稳定排序，预算表回填 token/repair——

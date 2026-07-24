@@ -40,6 +40,9 @@ type chatMeta struct {
 	// 业务 manifest 据此记录「最终实际生效」的 structured_method，而非入口意图。
 	// 由 llmRun.chatMeta 指向 run 内部字段；探针/测试直填路径为 nil（安全跳过）。
 	StructuredDropped *bool
+	// RouteApplied P2-4 模型路由观测（llmRun.chatMeta 指向 run 内部字段；applyModelRouting
+	// 命中时回写路由目标与原配置归因，manifest 的 routed 字段消费）。nil 安全跳过。
+	RouteApplied *LLMRouteApplied
 }
 
 // writeLLMCallLog 落一条调用审计。正文为管理员排障用原文：请求为最终实际发送的完整

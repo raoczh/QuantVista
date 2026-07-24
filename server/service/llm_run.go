@@ -90,6 +90,10 @@ type llmRun struct {
 	// DebateInfo P1-3 条件式辩论的触发条件与调用预算声明（仅辩论首个 run——bull——携带；
 	// 程序判定的触发原因，非模型自报）。其他模块恒 nil（manifest 省略）。
 	DebateInfo *DebateManifestInfo
+	// routeApplied P2-4 模型路由观测（中央客户端 applyModelRouting 经 chatMeta.RouteApplied
+	// 指针回写；Applied=false 表示本 run 未被路由）。manifest 的 routed 字段消费——
+	// llm_call_logs 逐请求已记路由后真实目标，这里补业务侧「原配置→路由目标」归因。
+	routeApplied LLMRouteApplied
 }
 
 // newLLMRun 创建调用组。parentRunID 为空表示主调。
@@ -120,6 +124,7 @@ func (r *llmRun) chatMeta(userID int64, cfg *model.LLMConfig, attempt int) chatM
 		SchemaVersion: r.SchemaVersion, PromptVersion: r.PromptVersion,
 		PromptHash: r.PromptHash, DataHash: r.DataHash,
 		StructuredDropped: &r.structuredDropped, // 中央客户端回落时置位，manifest 消费
+		RouteApplied:      &r.routeApplied,      // P2-4 模型路由观测（applyModelRouting 回写）
 	}
 	if cfg != nil {
 		m.ConfigID = cfg.ID
@@ -179,6 +184,10 @@ type LLMRunManifest struct {
 	// Debate P1-3 条件式辩论声明（触发原因/轮数/调用预算；程序判定非模型自报）。
 	// 仅辩论 bull run 非空；其他模块省略。
 	Debate *DebateManifestInfo `json:"debate,omitempty"`
+	// Routed P2-4 模型路由声明（本 run 被路由到的目标与原配置归因）。未路由省略；
+	// Provider/Model/LLMConfigID 字段仍记业务解析出的原配置（champion 链路），
+	// 路由后逐请求真实目标以 llm_call_logs 为准。
+	Routed *LLMRouteApplied `json:"routed,omitempty"`
 }
 
 // manifest 输出本 run 的运行元数据。jsonMode 为该模块的请求口径；最终实际生效形态在
@@ -195,6 +204,10 @@ func (r *llmRun) manifest(cfg *model.LLMConfig, jsonMode bool) LLMRunManifest {
 		DegradedReason: r.DegradedReason,
 		Coverage:       r.Coverage,
 		Debate:         r.DebateInfo,
+	}
+	if r.routeApplied.Applied {
+		ra := r.routeApplied
+		m.Routed = &ra
 	}
 	if m.AttemptCount < 1 {
 		m.AttemptCount = 1 // 防御：manifest 只在实际发起过调用的 run 上输出

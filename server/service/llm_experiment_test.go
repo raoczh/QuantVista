@@ -27,6 +27,7 @@ func setChallengerFlag(t *testing.T, v bool) {
 func cleanExperimentTables(t *testing.T) {
 	t.Helper()
 	clean := func() {
+		common.DB.Where("1=1").Delete(&model.LLMReleaseAudit{})
 		common.DB.Where("1=1").Delete(&model.LLMExperimentRun{})
 		common.DB.Where("1=1").Delete(&model.LLMExperiment{})
 		common.DB.Where("module = ?", "recommend").Delete(&model.PromptTemplate{})
@@ -162,6 +163,13 @@ func TestLLMExperimentPromoteGate(t *testing.T) {
 	}
 	common.DB.Model(&model.LLMExperiment{}).Where("id = ?", exp.ID).
 		UpdateColumn("challenger_content", expInput().ChallengerContent)
+
+	// 门 6（P2-6）：无发布审计工件不得晋级；补 PASS 工件（e2e 见 TestLLMExperimentAuditGate）。
+	if _, err := PromoteLLMExperiment(exp.ID); err == nil || !strings.Contains(err.Error(), "审计") {
+		t.Fatalf("无审计工件应拒绝晋级: %v", err)
+	}
+	common.DB.Create(&model.LLMReleaseAudit{ExperimentID: exp.ID, Verdict: model.ReleaseAuditPass,
+		ChallengerHash: exp.ChallengerHash, Summary: "seed"})
 
 	got, err := PromoteLLMExperiment(exp.ID)
 	if err != nil {

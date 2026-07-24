@@ -72,7 +72,8 @@ func (ac *AdminController) LLMExperiments(c *gin.Context) {
 	common.ApiSuccess(c, rows)
 }
 
-// GetLLMExperiment GET /api/admin/llm-experiments/:id —— 实验详情 + 影子样本明细。
+// GetLLMExperiment GET /api/admin/llm-experiments/:id —— 实验详情 + 影子样本明细
+// + 发布审计工件（P2-6）。
 func (ac *AdminController) GetLLMExperiment(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
@@ -84,7 +85,7 @@ func (ac *AdminController) GetLLMExperiment(c *gin.Context) {
 		common.ApiErrorMsg(c, err.Error())
 		return
 	}
-	common.ApiSuccess(c, gin.H{"experiment": exp, "runs": runs})
+	common.ApiSuccess(c, gin.H{"experiment": exp, "runs": runs, "audits": service.ListLLMReleaseAudits(id)})
 }
 
 // CreateLLMExperiment POST /api/admin/llm-experiments —— 创建（draft，challenger 快照固化）。
@@ -103,7 +104,8 @@ func (ac *AdminController) CreateLLMExperiment(c *gin.Context) {
 }
 
 // LLMExperimentAction POST /api/admin/llm-experiments/:id/:action —— 状态机动作：
-// start（单变量校验）/complete（P2-2 结论与失败原因）/promote（P1-9 发布质量门硬检）/
+// start（单变量校验）/complete（P2-2 结论与失败原因）/audit（P2-6 发布审计，返回工件）/
+// promote（P1-9 发布质量门硬检，含门 6 审计工件）/rollback（P2-6 一键切回 champion）/
 // abandon。
 func (ac *AdminController) LLMExperimentAction(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -116,6 +118,15 @@ func (ac *AdminController) LLMExperimentAction(c *gin.Context) {
 		FailureReason string `json:"failure_reason"`
 	}
 	_ = c.ShouldBindJSON(&body) // start/promote 无 body 合法
+	if c.Param("action") == "audit" {
+		audit, err := service.RunLLMExperimentAudit(c.Request.Context(), id)
+		if err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+		common.ApiSuccess(c, audit)
+		return
+	}
 	var exp *model.LLMExperiment
 	switch c.Param("action") {
 	case "start":
@@ -124,6 +135,8 @@ func (ac *AdminController) LLMExperimentAction(c *gin.Context) {
 		exp, err = service.CompleteLLMExperiment(id, body.Conclusion, body.FailureReason)
 	case "promote":
 		exp, err = service.PromoteLLMExperiment(id)
+	case "rollback":
+		exp, err = service.RollbackLLMExperiment(id)
 	case "abandon":
 		exp, err = service.AbandonLLMExperiment(id, body.FailureReason)
 	default:
@@ -135,4 +148,61 @@ func (ac *AdminController) LLMExperimentAction(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, exp)
+}
+
+// ---------- P2-4 模型路由（llm_router.go） ----------
+
+// LLMRoutes GET /api/admin/llm-routes —— 路由列表 + 可选模块 + 健康快照。
+func (ac *AdminController) LLMRoutes(c *gin.Context) {
+	routes, modules, err := service.ListLLMRoutes()
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, gin.H{"routes": routes, "modules": modules})
+}
+
+// UpsertLLMRoute POST /api/admin/llm-routes —— 建/改路由（按 module upsert；
+// 显式保存=清除自动回退状态）。
+func (ac *AdminController) UpsertLLMRoute(c *gin.Context) {
+	var in service.LLMRouteInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		common.ApiErrorMsg(c, "请求格式错误")
+		return
+	}
+	rt, err := service.UpsertLLMRoute(in)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, rt)
+}
+
+// DeleteLLMRoute DELETE /api/admin/llm-routes/:id —— 删除路由（回到默认配置链路）。
+func (ac *AdminController) DeleteLLMRoute(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		common.ApiErrorMsg(c, "非法的路由 id")
+		return
+	}
+	if err := service.DeleteLLMRoute(id); err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, gin.H{"deleted": true})
+}
+
+// ResetLLMRoute POST /api/admin/llm-routes/:id/reset —— 显式恢复自动回退的路由。
+func (ac *AdminController) ResetLLMRoute(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		common.ApiErrorMsg(c, "非法的路由 id")
+		return
+	}
+	rt, err := service.ResetLLMRouteFallback(id)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, rt)
 }
