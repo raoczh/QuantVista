@@ -233,6 +233,30 @@ func TestLLMExperimentRollback(t *testing.T) {
 	if tpl.Content != expInput().ChallengerContent || !tpl.Enabled {
 		t.Fatalf("晋级后模板应为 challenger 内容: %+v", tpl)
 	}
+	// 审查修复批反例：晋级后模板被编辑（champion 指针前移）→ 回滚失去对象，拒绝；
+	// 列表视图透出 rollback_stale 供前端禁用按钮。恢复 challenger 内容后可正常回滚。
+	if _, _, err := ps.Upsert(1, PromptInput{Module: "recommend", Content: "晋级后管理员又改过的内容", Enabled: true}); err != nil {
+		t.Fatalf("模拟编辑: %v", err)
+	}
+	if _, err := RollbackLLMExperiment(exp.ID); err == nil || !strings.Contains(err.Error(), "拒绝回滚") {
+		t.Fatalf("champion 前移后应拒绝回滚: %v", err)
+	}
+	views, err := ListLLMExperiments()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	staleSeen := false
+	for _, v := range views {
+		if v.ID == exp.ID {
+			staleSeen = v.RollbackStale != ""
+		}
+	}
+	if !staleSeen {
+		t.Fatal("列表应透出 rollback_stale")
+	}
+	if _, _, err := ps.Upsert(1, PromptInput{Module: "recommend", Content: expInput().ChallengerContent, Enabled: true}); err != nil {
+		t.Fatalf("恢复 challenger 内容: %v", err)
+	}
 	rb, err := RollbackLLMExperiment(exp.ID)
 	if err != nil || rb.Status != model.ExpStatusRolledBack || rb.RolledBackAt == nil {
 		t.Fatalf("回滚: %v %+v", err, rb)

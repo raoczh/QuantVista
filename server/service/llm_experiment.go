@@ -108,12 +108,21 @@ func CreateLLMExperiment(userID int64, in LLMExperimentInput) (*model.LLMExperim
 	}
 
 	champ := loadPromptRuntime(userID, promptModule)
+	// champion 基线内容当场固化（P2-6 审查修复批）：自定义态=当时启用模板内容；默认态=
+	// 实际的内置任务段（promptModuleDefaultTaskSegs，不用占位说明冒充）。发布审计与
+	// promote 门恒对照此锚——创建后 champion 被编辑不改变实验的对照基准，只会被
+	// 基线漂移校验拦下（单变量复核的稳定依据）。
+	champContent := champ.Raw
+	if !champ.Custom {
+		champContent = promptModuleDefaultTaskSegs[promptModule]
+	}
 	exp := &model.LLMExperiment{
 		UserID: userID, Module: in.Module, PromptModule: promptModule,
 		Name: name, Hypothesis: hypo, ExpectedImprovement: expect,
 		ChallengerContent: content, ChallengerHash: promptContentHash(content),
 		ChampionVersion: champ.Version(recPromptVersion), ChampionHash: champ.Hash,
-		Status: model.ExpStatusDraft, SampleTarget: target, ParentID: in.ParentID,
+		ChampionContent: champContent,
+		Status:          model.ExpStatusDraft, SampleTarget: target, ParentID: in.ParentID,
 	}
 	if err := common.DB.Create(exp).Error; err != nil {
 		return nil, nil, err
@@ -284,6 +293,12 @@ func PromoteLLMExperiment(id int64) (*model.LLMExperiment, error) {
 	if promptContentHash(exp.ChallengerContent) != exp.ChallengerHash {
 		return nil, errors.New("challenger 内容与创建时 hash 不符（快照被篡改），拒绝晋级")
 	}
+	// 门 5b（审查修复批）：champion 基线未漂移——实验对照的是创建时的 champion 锚，
+	// 创建后 champion 被编辑（或别的实验晋级）时影子对照与当前线上形态脱节，实验
+	// 结论不再能回答「相对当前 champion 是否有增量」，须基于新基线重建实验。
+	if h := promptTemplateRowHash(userPromptTemplateRow(exp.UserID, exp.PromptModule)); h != exp.ChampionHash {
+		return nil, errors.New("当前 champion 已不是实验创建时的对照基线（创建后模板被编辑或有其他实验晋级），实验对照失效——请基于当前 champion 重建实验")
+	}
 	// 门 6（P2-6 自动发布门）：LLM 发布审计工件必须 PASS 且审计对象与当前内容一致
 	// ——「未 PASS 不进入 synthesis」（P1-9）在此收口；审计只复核程序硬检覆盖不了的
 	// 内容性缺口（llm_release_gate.go），promote 本身仍是管理员显式动作（人工审批）。
@@ -293,6 +308,11 @@ func PromoteLLMExperiment(id int64) (*model.LLMExperiment, error) {
 	}
 	if audit.ChallengerHash != exp.ChallengerHash {
 		return nil, errors.New("最新审计工件的内容 hash 与当前 challenger 不符（内容变过须重审），拒绝晋级")
+	}
+	// 门 6b（审查修复批）：工件必须绑定实验的 champion 基线——审计消费的对照与实验锚
+	// 不一致（修复前的旧工件无绑定、或锚内容被改库）时旧 PASS 不可复用，须重审。
+	if audit.ChampionHash != promptContentHash(releaseAuditChampionContent(&exp)) {
+		return nil, errors.New("最新审计工件未绑定实验的 champion 基线（旧版工件或基线被改动），须重新运行发布审计")
 	}
 	if audit.Verdict != model.ReleaseAuditPass {
 		return nil, fmt.Errorf("最新发布审计 verdict=%s（%s）：未 PASS 不晋级", audit.Verdict, audit.Summary)
@@ -349,11 +369,26 @@ func AbandonLLMExperiment(id int64, reason string) (*model.LLMExperiment, error)
 	return &exp, nil
 }
 
+// LLMExperimentView 管理端实验视图：附回滚可用性判定（审查修复批——promoted 实验的
+// 当前启用模板已不是其晋级产物时，回滚会覆盖更新的 champion，前端据此禁用按钮并说明）。
+type LLMExperimentView struct {
+	model.LLMExperiment
+	RollbackStale string `json:"rollback_stale,omitempty"`
+}
+
 // ListLLMExperiments 全部实验（管理端；按 id 倒序）。
-func ListLLMExperiments() ([]model.LLMExperiment, error) {
+func ListLLMExperiments() ([]LLMExperimentView, error) {
 	var rows []model.LLMExperiment
-	err := common.DB.Order("id DESC").Limit(200).Find(&rows).Error
-	return rows, err
+	if err := common.DB.Order("id DESC").Limit(200).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]LLMExperimentView, 0, len(rows))
+	for i := range rows {
+		out = append(out, LLMExperimentView{
+			LLMExperiment: rows[i], RollbackStale: experimentRollbackStale(&rows[i]),
+		})
+	}
+	return out, nil
 }
 
 // LLMExperimentDetail 实验 + 影子样本明细。

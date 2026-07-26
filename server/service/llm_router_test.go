@@ -426,3 +426,27 @@ func TestModelRoutingEndToEndAudit(t *testing.T) {
 		t.Fatalf("run 级路由观测不符: %+v", run.routeApplied)
 	}
 }
+
+// TestApplyBatchRouteAttribution 审查修复批：推荐批次归因列回写路由后真实目标——
+// 批次 Provider/Model 是校准分层 provider·model、联合评估对照与路由 Brier 回退的
+// 数据源，路由流量不得归入原始模型层；未路由零改写，LLMConfigID 恒保持原配置指针。
+func TestApplyBatchRouteAttribution(t *testing.T) {
+	batch := &model.RecommendationBatch{LLMConfigID: 999, Provider: "orig-prov", Model: "orig-model"}
+	run := newLLMRun("t-attr", "", "recommendation", "recommendation.v2", "p13")
+
+	// 未路由：零改写。
+	applyBatchRouteAttribution(batch, run)
+	if batch.Provider != "orig-prov" || batch.Model != "orig-model" {
+		t.Fatalf("未路由不得改写归因: %+v", batch)
+	}
+
+	run.routeApplied = LLMRouteApplied{Applied: true, RouteID: 1, ConfigID: 7,
+		Provider: "routed-prov", Model: "routed-model", FromConfigID: 999, FromModel: "orig-model"}
+	applyBatchRouteAttribution(batch, run)
+	if batch.Provider != "routed-prov" || batch.Model != "routed-model" {
+		t.Fatalf("路由后归因应记真实目标: %+v", batch)
+	}
+	if batch.LLMConfigID != 999 {
+		t.Fatalf("LLMConfigID 应保持原配置指针（回显/重试语义）: %d", batch.LLMConfigID)
+	}
+}

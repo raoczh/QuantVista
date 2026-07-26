@@ -501,6 +501,20 @@ func (s *RecommendationService) reuseProcessingBatch(userID int64) *Recommendati
 	return &RecommendationView{RecommendationBatch: b, Items: []RecommendationItemView{}}
 }
 
+// applyBatchRouteAttribution P2-4 审查修复批：主调被模型路由改写时，批次归因列回写
+// 路由后真实目标——批次 Provider/Model 是校准分层 provider·model、联合评估对照与路由
+// Brier 回退（routeCalibBrierPair）的数据源，修复前记的是原配置，路由流量全部误归入
+// 原始模型层：目标模型无直接调用样本时 Brier 回退拿不到数据；有直接样本时用的也不是
+// 路由流量的表现（P2-5 provider·model 联合评估同样误归因）。原配置归因不丢——manifest
+// routed 声明带 FromConfigID/FromModel，llm_call_logs 逐请求另有真值；LLMConfigID 保持
+// 业务解析出的原配置（用户配置指针语义，回显/重试沿用）。
+func applyBatchRouteAttribution(batch *model.RecommendationBatch, mainRun *llmRun) {
+	if ra := mainRun.routeApplied; ra.Applied {
+		batch.Provider = ra.Provider
+		batch.Model = ra.Model
+	}
+}
+
 // failBatch 后台任务失败收尾：回写 failed 状态与错误（token 审计一并落）。
 func (s *RecommendationService) failBatch(batch *model.RecommendationBatch, usage chatUsage, latency int64, msg string) {
 	batch.Status = model.RecStatusFailed
@@ -612,6 +626,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	// 只是没喂给它」。仅诊断已存在时补填（调用失败无结构输出时 manifest 靠
 	// finish_state/degraded_reason 归因，不造空诊断）。
 	markCoveragePromptTrimmed(mainRun.Coverage, kept, len(llmCands))
+	applyBatchRouteAttribution(batch, mainRun)
 
 	// P2-1 challenger 影子采样（flag 缺省关；best-effort）：主调成功且有该用户的 running
 	// 实验时，同一候选名单只换 challenger 任务段再调一次，输出只落实验表——picks/批次

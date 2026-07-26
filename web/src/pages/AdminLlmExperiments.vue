@@ -216,6 +216,7 @@ async function submitCreate() {
                 </div>
                 <div class="exp-row"><span class="exp-k">challenger 任务段</span><span class="exp-content">{{ r.challenger_content }}</span></div>
                 <div v-if="r.failure_reason" class="exp-row"><span class="exp-k">失败原因</span><span>{{ r.failure_reason }}</span></div>
+                <div v-if="r.rollback_stale" class="exp-row"><span class="exp-k">回滚不可用</span><span>{{ r.rollback_stale }}（如需恢复历史内容请在提示词页按 revision 快照操作）</span></div>
                 <div v-if="parseActual(r)" class="exp-row">
                   <span class="exp-k">实际结果</span>
                   <span>
@@ -232,7 +233,7 @@ async function submitCreate() {
                   <n-button v-if="r.status === 'running'" size="tiny" type="warning" :loading="acting" @click="completeTarget = r">完成实验</n-button>
                   <n-button v-if="r.status === 'completed'" size="tiny" type="info" :loading="auditing" @click="runAudit(r)">发布审计</n-button>
                   <n-button v-if="r.status === 'completed'" size="tiny" type="success" :loading="acting" @click="confirmPromote(r)">晋级 champion</n-button>
-                  <n-button v-if="r.status === 'promoted'" size="tiny" type="error" :loading="acting" @click="confirmRollback(r)">一键切回 champion</n-button>
+                  <n-button v-if="r.status === 'promoted'" size="tiny" type="error" :loading="acting" :disabled="!!r.rollback_stale" @click="confirmRollback(r)">一键切回 champion</n-button>
                   <n-button v-if="r.status !== 'promoted' && r.status !== 'abandoned' && r.status !== 'rolled_back'" size="tiny" :loading="acting" @click="act(r, 'abandon')">废弃</n-button>
                 </div>
                 <div v-if="detailAudits[r.id]?.length" class="exp-runs">

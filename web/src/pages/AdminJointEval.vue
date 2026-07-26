@@ -114,7 +114,7 @@ const sliceColumns = computed<DataTableColumns<CalibSliceRow>>(() => [
               <div class="je-head">
                 <span class="je-title">{{ typeLabel[sec.type] || sec.type }} · 持有 {{ sec.horizon_days }} 交易日</span>
                 <n-tag size="small" :bordered="false">
-                  换手：相邻批次新进 {{ sec.turnover.pairs > 0 ? pct(sec.turnover.avg_new_pct) : '—' }} · 重合
+                  换手{{ report.include_locked ? '（全量日期）' : '（开发段日期界内）' }}：相邻批次新进 {{ sec.turnover.pairs > 0 ? pct(sec.turnover.avg_new_pct) : '—' }} · 重合
                   {{ sec.turnover.pairs > 0 ? pct(sec.turnover.avg_overlap_pct) : '—' }}（{{ sec.turnover.pairs }} 对）
                 </n-tag>
               </div>

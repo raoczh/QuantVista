@@ -110,12 +110,26 @@ func parseReleaseAudit(content string) (*releaseAuditResult, error) {
 	return &out, nil
 }
 
-// releaseAuditChampionContent 审计输入的 champion 侧内容（当前启用模板；默认模板时声明）。
-func releaseAuditChampionContent(userID int64, promptModule string) string {
-	if row := userPromptTemplateRow(userID, promptModule); row != nil {
+// releaseAuditChampionContent 审计输入的 champion 侧基线（审查修复批）：恒用实验创建
+// 时固化的 ChampionContent 锚——审计对照的是实验的对照基准，不是「审计当下」的活模板
+// （创建后 champion 被编辑时两者漂移，「是否夹带 hypothesis 外额外变更」的单变量复核
+// 会失去稳定依据）；默认 champion 场景锚里存的就是实际内置任务段，不再用占位说明冒充。
+// 修复前创建的旧实验行无内容锚：按锚 hash 尽力回退（默认态=内置任务段/自定义态=当前
+// 启用模板现值），promote 侧的基线漂移门仍会拦住锚不一致的晋级。
+func releaseAuditChampionContent(exp *model.LLMExperiment) string {
+	if strings.TrimSpace(exp.ChampionContent) != "" {
+		return exp.ChampionContent
+	}
+	if exp.ChampionHash == "" {
+		if seg, ok := promptModuleDefaultTaskSegs[exp.PromptModule]; ok {
+			return seg
+		}
+		return "（系统默认模板，无自定义任务段）"
+	}
+	if row := userPromptTemplateRow(exp.UserID, exp.PromptModule); row != nil {
 		return row.Content
 	}
-	return "（当前使用系统默认模板，无自定义任务段）"
+	return "（champion 基线内容不可得：旧实验行无内容锚且当前无启用中的模板）"
 }
 
 // RunLLMExperimentAudit P2-6 发布审计：对 completed 实验运行一次审计员 LLM 复核，
@@ -134,6 +148,7 @@ func RunLLMExperimentAudit(ctx context.Context, expID int64) (*model.LLMReleaseA
 		return nil, fmt.Errorf("发布审计不可用（系统默认 LLM 未就绪）：%v", err)
 	}
 
+	championContent := releaseAuditChampionContent(&exp)
 	input := map[string]any{
 		"module":               exp.Module,
 		"prompt_module":        exp.PromptModule,
@@ -142,7 +157,7 @@ func RunLLMExperimentAudit(ctx context.Context, expID int64) (*model.LLMReleaseA
 		"conclusion":           exp.Conclusion,
 		"failure_reason":       exp.FailureReason,
 		"actual_metrics":       json.RawMessage(orEmptyJSON(exp.ActualJSON)),
-		"champion_content":     releaseAuditChampionContent(exp.UserID, exp.PromptModule),
+		"champion_content":     championContent,
 		"challenger_content":   exp.ChallengerContent,
 	}
 	inputJSON, err := json.Marshal(input)
@@ -151,7 +166,7 @@ func RunLLMExperimentAudit(ctx context.Context, expID int64) (*model.LLMReleaseA
 	}
 	convo := []chatMessage{
 		{Role: "system", Content: releaseAuditSystem},
-		{Role: "user", Content: "待审计的实验材料如下（JSON；champion_content 为当前启用任务段，challenger_content 为待晋级任务段）：\n" + string(inputJSON)},
+		{Role: "user", Content: "待审计的实验材料如下（JSON；champion_content 为实验创建时固化的对照基线任务段，challenger_content 为待晋级任务段）：\n" + string(inputJSON)},
 	}
 	run := newLLMRun(newLLMTraceID(), "", "release_audit", "release_audit.v1", releaseAuditPromptVersion)
 	run.hashData(string(inputJSON))
@@ -196,7 +211,11 @@ func RunLLMExperimentAudit(ctx context.Context, expID int64) (*model.LLMReleaseA
 
 	row := model.LLMReleaseAudit{
 		ExperimentID: exp.ID, UserID: adminID,
-		ChallengerHash: exp.ChallengerHash, TraceID: run.TraceID, TokensUsed: usage.TotalTokens,
+		ChallengerHash: exp.ChallengerHash,
+		// 工件绑定审计实际消费的 champion 基线（审查修复批）：promote 门校验工件与实验锚
+		// 一致——审计通过后基线认知变化（旧工件）不得复用旧 PASS。
+		ChampionHash: promptContentHash(championContent),
+		TraceID:      run.TraceID, TokensUsed: usage.TotalTokens,
 	}
 	if result != nil {
 		row.Verdict = result.Verdict
@@ -234,8 +253,28 @@ func ListLLMReleaseAudits(expID int64) []model.LLMReleaseAudit {
 	return rows
 }
 
+// experimentRollbackStale 判定 promoted 实验的回滚是否已失去对象（审查修复批）：
+// 当前启用模板不再是该实验晋级出的 challenger 内容（晋级后模板被编辑、或更新的实验
+// 再晋级）时，按 PrePromote 锚无条件恢复会覆盖更新的 champion——返回不可回滚原因。
+// 非 promoted 状态返回空串（无判定语义）。
+func experimentRollbackStale(exp *model.LLMExperiment) string {
+	if exp.Status != model.ExpStatusPromoted {
+		return ""
+	}
+	row := userPromptTemplateRow(exp.UserID, exp.PromptModule)
+	if row == nil {
+		return "当前该模块无启用中的自定义模板（晋级后模板已被删除或停用），本实验的回滚锚已失去对象"
+	}
+	if promptTemplateRowHash(row) != exp.ChallengerHash {
+		return "当前启用模板内容已不是本实验晋级出的 challenger（晋级后被编辑或有更新的实验晋级），回滚会覆盖更新的 champion"
+	}
+	return ""
+}
+
 // RollbackLLMExperiment P2-6 一键切回 champion：promoted→rolled_back（终态），
 // 按晋级瞬间固化的 PrePromote 锚恢复模板状态（经 Upsert 生成新 revision，不删工件）。
+// 审查修复批：回滚前校验当前启用模板仍是本实验晋级出的 challenger——champion 指针
+// 已前移（编辑/更新实验晋级）时拒绝，防旧实验回滚覆盖更新的 champion。
 func RollbackLLMExperiment(id int64) (*model.LLMExperiment, error) {
 	var exp model.LLMExperiment
 	if err := common.DB.First(&exp, id).Error; err != nil {
@@ -243,6 +282,9 @@ func RollbackLLMExperiment(id int64) (*model.LLMExperiment, error) {
 	}
 	if exp.Status != model.ExpStatusPromoted {
 		return nil, fmt.Errorf("仅 promoted 实验可回滚（当前 %s）", exp.Status)
+	}
+	if reason := experimentRollbackStale(&exp); reason != "" {
+		return nil, errors.New("拒绝回滚：" + reason + "（如需恢复历史内容请在提示词页按 revision 快照操作）")
 	}
 	ps := NewPromptService()
 	if exp.PrePromoteEnabled {

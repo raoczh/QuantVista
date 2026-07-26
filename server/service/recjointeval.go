@@ -388,13 +388,21 @@ func buildJointEvalSection(recType string, horizon int, includeLocked bool) (*Jo
 		}
 	}
 
-	// 换手：该 type×horizon 的全部标签行（含 pending——名单构成不需要成熟）按批次
-	// 聚合 buy 名单。独立轻量查询（只取四列）。
+	// 换手：该 type×horizon 的标签行（含 pending——名单构成不需要成熟）按批次聚合
+	// buy 名单。独立轻量查询（只取四列）。**锁定段隔离（审查修复批）**：默认视图只吃
+	// 开发段信号日的批次——修复前无条件全量查询让常规页面请求消费了 locked 日期的名单
+	// 数据（换手指标受 locked 影响却无审计记录），违反「默认只显示 locked 范围与样本数」；
+	// include_locked（已登记审计的显式请求）才纳入 locked 日期批次。注意切分基于可用
+	// 成熟样本的信号日集合，晚于 dev 末日的日期（含未成熟新批次）默认一律排除——宁缺
+	// 勿泄，与锁定段「按日期界」的语义一致。
 	var turnRows []model.RecommendationLabel
-	if err := common.DB.Select("user_id", "batch_id", "signal_date", "symbol", "action").
+	turnQ := common.DB.Select("user_id", "batch_id", "signal_date", "symbol", "action").
 		Where("horizon_days = ? AND entry_mode = ? AND recommendation_id > 0 AND label_version = ? AND type = ?",
-			horizon, model.EntryModeNextOpen, labelVersion, recType).
-		Find(&turnRows).Error; err != nil {
+			horizon, model.EntryModeNextOpen, labelVersion, recType)
+	if !includeLocked && len(lockedDays) > 0 && len(devDays) > 0 {
+		turnQ = turnQ.Where("signal_date <= ?", devDays[len(devDays)-1])
+	}
+	if err := turnQ.Find(&turnRows).Error; err != nil {
 		return nil, err
 	}
 	batchMap := map[int64]*jointBatchPicks{}
@@ -470,7 +478,7 @@ func buildJointEvalSection(recType string, horizon int, includeLocked bool) (*Jo
 		fmt.Sprintf("切分（§9.1 时间切分不随机打散）：唯一信号日升序前 %.0f%% 归开发段、其余归锁定段；不足 %d 个信号日不切分（锁定段如实缺席）", jointDevFrac*100, jointMinSplitDays),
 		"净值口径：按信号日串联各期组合平均净收益（等权、持有期末结算、忽略持有期重叠）——「逐批全仓换仓」的近似而非逐日盯市；标签级最大不利波动（MAE）并列供回撤参照",
 		"成本拖累=毛收益−净收益均值（佣金万2.5最低5元+卖出印花税万5）；执行模拟按次日开盘价成交、无滑点项，属理想化假设（如实声明，不硬造滑点数字）",
-		"换手=同一用户同类型相邻批次 buy 名单对比（新进占比 |新面孔|/|本批|、重合率 |∩|/|∪|），跨用户不混排；名单构成不需要标签成熟",
+		"换手=同一用户同类型相邻批次 buy 名单对比（新进占比 |新面孔|/|本批|、重合率 |∩|/|∪|），跨用户不混排；名单构成不需要标签成熟；默认视图只统计开发段日期界内的批次（晚于开发段末日的一律不进——锁定段隔离），读取锁定段时才含全量日期",
 		"版本/来源对照只吃开发段样本（锁定段隔离——不给「以对照之名反复消费锁定段」留后门）；prompt_version 对照即 champion/challenger 晋级前后的收益对照落点（P2-2 声明的晋级后评估）",
 	)
 	return sec, nil

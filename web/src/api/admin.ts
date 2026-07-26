@@ -584,6 +584,8 @@ export interface LLMExperiment {
   parent_id: number
   promoted_revision: number
   pre_promote_enabled: boolean
+  /** 非空=回滚已失去对象（当前启用模板不再是本实验晋级产物），后端会拒绝回滚 */
+  rollback_stale?: string
   rolled_back_at?: string
   started_at?: string
   completed_at?: string
@@ -668,6 +670,8 @@ export interface LLMReleaseAudit {
   findings_json: string
   summary: string
   challenger_hash: string
+  /** 审计所用 champion 基线 hash（工件与实验锚不一致时旧 PASS 不可复用） */
+  champion_hash: string
   trace_id: string
   tokens_used: number
   created_at: string

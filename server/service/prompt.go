@@ -90,6 +90,16 @@ func composeCustomTaskPrompt(custom, contract string) string {
 	return custom + "\n\n" + promptContractHeader + "\n" + contract
 }
 
+// promptModuleDefaultTaskSegs 四个扩展模块的默认 L3 任务段（单一权威）：Modules()
+// 的「以默认为模板」展示与实验 champion 基线固化（llm_experiment.go）共用——默认
+// champion 的「实际内容」就是这段任务段，发布审计不得用占位说明冒充（P2-6 审查修复批）。
+var promptModuleDefaultTaskSegs = map[string]string{
+	model.PromptModuleRecommend: recRoleTaskSeg,
+	model.PromptModuleDaily:     dailyReviewTaskSeg,
+	model.PromptModuleQa:        qaRoleTaskSeg,
+	model.PromptModuleReview:    analysisReviewTaskSeg,
+}
+
 // Modules 返回所有可自定义的模块及其默认指引。扩展模块的默认值取自各消费方的
 // 系统提示【任务段】（P0-6：不再返回整段——整段含契约，「以默认为模板」拷进
 // 编辑框再保存会与系统追加的契约段重复）。
@@ -100,15 +110,9 @@ func (s *PromptService) Modules() []PromptModuleInfo {
 		model.PromptModuleRecommend, model.PromptModuleDaily,
 		model.PromptModuleQa, model.PromptModuleReview,
 	}
-	defaults := map[string]string{
-		model.PromptModuleRecommend: recRoleTaskSeg,
-		model.PromptModuleDaily:     dailyReviewTaskSeg,
-		model.PromptModuleQa:        qaRoleTaskSeg,
-		model.PromptModuleReview:    analysisReviewTaskSeg,
-	}
 	out := make([]PromptModuleInfo, 0, len(order))
 	for _, m := range order {
-		def, ok := defaults[m]
+		def, ok := promptModuleDefaultTaskSegs[m]
 		if !ok {
 			def = moduleGuidance[m]
 		}
@@ -249,6 +253,19 @@ func userPromptTemplateRow(userID int64, module string) *model.PromptTemplate {
 	return &tpl
 }
 
+// promptTemplateRowHash 模板行内容 hash（nil 安全：无行返回空串；升级前旧行
+// content_hash 为空时按正文现算兜底）。实验的 champion 锚一致性/回滚校验与
+// loadPromptRuntime 共用此实现——两处各算会造成归因漂移。
+func promptTemplateRowHash(row *model.PromptTemplate) string {
+	if row == nil {
+		return ""
+	}
+	if row.ContentHash != "" {
+		return row.ContentHash
+	}
+	return promptContentHash(row.Content)
+}
+
 // promptRuntime 一次业务运行的 prompt 模板不可变快照（P0-6 修复批）：同一模板行只读一次，
 // 正文渲染、版本归因、run/manifest、业务表与 llm_call_logs 全部消费同一份数据——
 // 消除「promptOverrideFor 与 promptVersionFor 分别查库，模板在两次查询间被编辑导致
@@ -270,10 +287,7 @@ func loadPromptRuntime(userID int64, module string) promptRuntime {
 	if tpl == nil {
 		return promptRuntime{Module: module}
 	}
-	h := tpl.ContentHash
-	if h == "" {
-		h = promptContentHash(tpl.Content)
-	}
+	h := promptTemplateRowHash(tpl)
 	return promptRuntime{
 		Module: module, Custom: true,
 		Raw: strings.TrimSpace(tpl.Content), Hash: h, Revision: tpl.Revision,

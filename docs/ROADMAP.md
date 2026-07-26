@@ -196,6 +196,12 @@
   - **⑧ P1-9 明确延后不是取消**：延后决策与理由固化在计划 §7.2 P1-9 行（预设晋级流程属 P2-1；代码硬检已是运行时校验）——待 P2-1 实验流程建立后作为发布门实施，届时先读该行再动工。
   - **⑨ 反思候选排序确定性（顺手修的既有 flaky）**：loadReflectionCandidates 的排序已改 `updated_at DESC, id ASC`——**id ASC tiebreaker 不许删**（同一轮结算的标签 updated_at 常落同一毫秒，无 tiebreaker 顺序退化为 SQLite 物理页序不可复现；TestReflectionGenerateEndToEnd 曾因此在与其他测试共跑时教训 idx 错位 flaky，测试侧已钉 updated_at+依赖该 tiebreaker）。凡「ORDER BY 时间戳」的候选/分页查询照此办理（时间戳等值退化是通例）。
 
+- **LLM 准确性 P2 外部审查修复批（2026-07-26，codex 4 项全属实全修）防回归**（改 llm_release_gate.go 回滚/审计、llm_experiment.go promote 门、recjointeval.go 换手、recommendation.go 批次归因前先读）：
+  - **① 回滚先验对象一致性**：`RollbackLLMExperiment` 在按 PrePromote 锚恢复前必须过 `experimentRollbackStale` 校验——当前启用模板 hash 必须仍等于该实验 ChallengerHash（晋级后模板被编辑、或更新实验再晋级=champion 指针已前移，旧实验回滚会覆盖更新的 champion，拒绝并指引提示词页 revision 快照）；列表接口（LLMExperimentView.RollbackStale）透出原因，前端禁用按钮。**严禁退回「状态是 promoted 就无条件恢复锚」**。
+  - **② 联合评估换手的锁定段隔离**：默认视图（!includeLocked）换手查询以 dev 段末日为界（`signal_date <=` devDays 末日，仅在存在 locked 段时加界）——修复前无条件全量查询让常规请求消费 locked 日期名单数据且无审计；include_locked（已登记审计）才含全量日期。收益/校准/版本对照的段隔离原有逻辑不变，本条补的是换手这条漏网通道。
+  - **③ 路由后批次归因记真实目标**：`applyBatchRouteAttribution`（推荐主调后、批次落库前）——mainRun.routeApplied.Applied 时把批次 Provider/Model 改写为路由后真实目标。批次归因列是校准分层 provider·model、联合评估对照与路由 Brier 回退（routeCalibBrierPair）的数据源，记原配置会让路由流量全部误归入原始模型层（Brier 回退失效/失真）。LLMConfigID 恒保持原配置指针（回显/重试语义）；原→新归因看 manifest routed 与 llm_call_logs。
+  - **④ 发布审计绑定实验基线**：实验创建时固化 `ChampionContent` 内容锚（默认 champion=实际内置任务段 `promptModuleDefaultTaskSegs`，与 Prompts.Modules 单一权威，**不得用占位说明冒充**）；`releaseAuditChampionContent` 恒吃实验锚非「审计当下」活模板；工件落 `ChampionHash`（审计实际消费的基线 hash）；promote 增门 5b（当前 champion 未偏离创建时锚——偏离=实验对照失效须重建）+门 6b（工件 ChampionHash 与实验锚一致——旧版无绑定工件/基线改动后旧 PASS 不可复用须重审）。
+
 - **LLM 准确性 P2-4 模型路由 + P2-6 自动发布门批（2026-07-24，P2 收官）防回归**（权威计划 `docs/LLM_ACCURACY_OPTIMIZATION_PLAN.md` v2.6 §7.3/§10，改 llm_router.go/llm_release_gate.go/llm_experiment.go promote/ai_client 出口顺序前先读）：
   - **① 路由挂点与顺序不可倒**：`applyModelRouting` 在 `chatCompletion`/`chatCompletionStream` 两公开出口的**最前面**（applyAccuracyContract/initCallObservers/applyCapabilityRouting 之前）——温度钳制与 P0-5 能力路由必须作用于路由后的最终目标；探针（module=test）与 Meta.Module 空恒不路由。路由只换调用目标（BaseURL/APIKey/Model/EndpointType/Temperature+预算取严），**业务 prompt/schema/模块预算/repair 纪律/配额记账主体零改动**——想在路由层改写消息或预算上限属越权。
   - **② experiment 恒跟随 recommendation 路由**（`llmRouteModuleAlias`，UpsertLLMRoute 拒绝单独配置）：champion 主调与 challenger 影子必须打同一目标模型，否则 P2-1 单变量对照（§9.3）失效——**严禁删别名或放开 experiment 路由**（TestApplyModelRoutingSwapsTarget 锁定）。

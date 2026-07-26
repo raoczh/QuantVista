@@ -37,6 +37,11 @@ type LLMExperiment struct {
 	ChallengerHash    string `gorm:"size:32" json:"challenger_hash"`
 	ChampionVersion   string `gorm:"size:32" json:"champion_version"` // 创建时 champion 版本串（base 或 base-custom.hash8）
 	ChampionHash      string `gorm:"size:32" json:"champion_hash"`    // champion 为自定义模板时的内容 hash（默认模板为空）
+	// ChampionContent 创建时固化的 champion 基线内容快照（P2-6 审查修复批）：发布审计
+	// 对照的必须是实验创建时的对照基线，而非「审计当下」的活模板（创建后 champion 被
+	// 编辑时两者不同，单变量复核会失去稳定依据）；默认模板场景固化实际的内置任务段
+	//（promptModuleDefaultTaskSegs），不得用占位说明冒充。不出 JSON（体积，无展示需求）。
+	ChampionContent string `gorm:"type:text" json:"-"`
 
 	Status       string `gorm:"size:16;index" json:"status"` // draft/running/completed/promoted/abandoned
 	SampleTarget int    `json:"sample_target"`               // 影子采样目标条数（达标停采）
@@ -102,10 +107,13 @@ type LLMReleaseAudit struct {
 	FindingsJSON string `gorm:"type:text" json:"findings_json"`
 	Summary      string `gorm:"size:512" json:"summary"`
 	// ChallengerHash 审计对象内容 hash（晋级门校验：审计的必须是当前 challenger 内容）。
-	ChallengerHash string    `gorm:"size:32" json:"challenger_hash"`
-	TraceID        string    `gorm:"size:40" json:"trace_id"` // llm-calls 可回查逐请求审计
-	TokensUsed     int       `json:"tokens_used"`
-	CreatedAt      time.Time `json:"created_at"`
+	ChallengerHash string `gorm:"size:32" json:"challenger_hash"`
+	// ChampionHash 审计所用 champion 基线内容 hash（P2-6 审查修复批：工件绑定对照基线
+	// ——promote 门 6 同时校验 champion 基线未漂移，审计通过后 champion 被编辑须重审）。
+	ChampionHash string    `gorm:"size:32" json:"champion_hash"`
+	TraceID      string    `gorm:"size:40" json:"trace_id"` // llm-calls 可回查逐请求审计
+	TokensUsed   int       `json:"tokens_used"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // 发布审计判定封闭枚举。

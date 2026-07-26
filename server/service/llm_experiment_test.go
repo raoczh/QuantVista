@@ -168,8 +168,17 @@ func TestLLMExperimentPromoteGate(t *testing.T) {
 	if _, err := PromoteLLMExperiment(exp.ID); err == nil || !strings.Contains(err.Error(), "审计") {
 		t.Fatalf("无审计工件应拒绝晋级: %v", err)
 	}
+	// 门 6b 反例（审查修复批）：未绑定 champion 基线的旧版工件（ChampionHash 空）不可用。
 	common.DB.Create(&model.LLMReleaseAudit{ExperimentID: exp.ID, Verdict: model.ReleaseAuditPass,
-		ChallengerHash: exp.ChallengerHash, Summary: "seed"})
+		ChallengerHash: exp.ChallengerHash, Summary: "legacy-seed"})
+	if _, err := PromoteLLMExperiment(exp.ID); err == nil || !strings.Contains(err.Error(), "champion 基线") {
+		t.Fatalf("未绑定基线的工件应拒绝晋级: %v", err)
+	}
+	var expRow model.LLMExperiment
+	common.DB.First(&expRow, exp.ID)
+	common.DB.Create(&model.LLMReleaseAudit{ExperimentID: exp.ID, Verdict: model.ReleaseAuditPass,
+		ChallengerHash: exp.ChallengerHash,
+		ChampionHash:   promptContentHash(releaseAuditChampionContent(&expRow)), Summary: "seed"})
 
 	got, err := PromoteLLMExperiment(exp.ID)
 	if err != nil {

@@ -208,6 +208,12 @@ func TestJointEvalEndToEnd(t *testing.T) {
 	if pvGroup == nil || len(pvGroup.Rows) != 1 || pvGroup.Rows[0].Key != "p13" || pvGroup.Rows[0].Sample != 8 {
 		t.Fatalf("版本对照应只含 dev 段 p13×8: %+v", pvGroup)
 	}
+	// 换手锁定段隔离（审查修复批）：102 批次全部落在 locked 日期，默认视图不得进换手
+	// 统计（只剩 101 一个批次成不了对）——修复前默认路径无条件全量查询，locked 名单
+	// 数据在无审计的情况下被常规请求消费。
+	if sec.Turnover.Pairs != 0 {
+		t.Fatalf("默认视图换手不得消费 locked 日期批次: %+v", sec.Turnover)
+	}
 	// 审计：未读锁定段 count=0（响应不带 locked_audit 或 count=0）。
 	if rep.LockedAudit != nil && rep.LockedAudit.Count != 0 {
 		t.Fatalf("未读过锁定段不应有审计计数: %+v", rep.LockedAudit)
@@ -226,6 +232,10 @@ func TestJointEvalEndToEnd(t *testing.T) {
 	}
 	if sec2.Locked == nil || sec2.Locked.BuySample != 4 || sec2.Locked.WinRatePct != 100 {
 		t.Fatalf("锁定段指标不符（4 条全 +5）: %+v", sec2.Locked)
+	}
+	// include_locked（已审计）才含全量日期批次：101/102 成一对。
+	if sec2.Turnover.Pairs != 1 {
+		t.Fatalf("读取锁定段时换手应含全量批次: %+v", sec2.Turnover)
 	}
 	if rep2.LockedAudit == nil || rep2.LockedAudit.Count != 1 || len(rep2.LockedAudit.Log) != 1 {
 		t.Fatalf("锁定段读取应登记审计: %+v", rep2.LockedAudit)
