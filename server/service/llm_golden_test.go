@@ -1,8 +1,11 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +35,15 @@ import (
 //	生产 prompt 无篇幅限制         | model_capabilities_test.go:TestPromptOutputLengthLimitsRemoved
 //	P1-2 claim 推导三态/归一       | llm_claims_test.go（本批）
 //	P1-2/P1-4 端到端与注入防护     | 本文件
+//	来源黑名单（降噪词零注入）     | 本文件:TestGoldenNewsSourceBlacklistNoise（第五十六批①）
+//	cold-data 长期无新信息标的     | 本文件:TestGoldenColdDataFixtures（第五十六批①）
+//	复核员解析归一 known-answer    | 本文件:TestGoldenAnalysisReviewParse（第五十六批①）
+//	辩论 bear 失职连坐降级         | 本文件:TestGoldenDebateBearEmptyChallengesRepair（第五十六批①）
+//	候选池黑名单/用户回避          | recommendation_test.go:TestLoadCandidateFilter/TestNormalizeBlacklist
+//
+// **满额纪律（第五十六批①）**：18 角色的 known-answer/edge-case 坐标机读登记在
+// llm_roles.go（KnownAnswers/EdgeCases 字段），TestLLMRoleGoldenQuota 校验「每角色
+// ≥2 KA + ≥1 EC 且全部真实存在」——新增角色/挪动测试必须同步 registry，缺额直接红。
 type goldenIndex struct{} // 仅承载上表文档；无运行语义
 
 // ---- P1-4 新闻窗口与来源对齐 ----
@@ -402,5 +414,155 @@ func TestGoldenNewsWindowFullStats(t *testing.T) {
 	}
 	if meta.Version != "nw2" {
 		t.Fatalf("版本应 nw2: %s", meta.Version)
+	}
+}
+
+// ---- 第五十六批①：P1-6 满额补位（来源黑名单 / cold-data / 复核解析 / bear 失职） ----
+
+// TestGoldenNewsSourceBlacklistNoise 来源黑名单 fixture（§8.1「来源层级/黑名单」）：
+// 日报事件选择的降噪黑名单（eventNoiseWords）——盘面播报类标题即使来源优先级最高、
+// 关键词得分再高也零注入；黑名单外的驱动性消息正常入选。这是「黑名单来源不喂模型」
+// 的程序化落点（QuantVista 无媒体级黑名单表，噪声词表即来源质量黑名单的实现形态）。
+func TestGoldenNewsSourceBlacklistNoise(t *testing.T) {
+	now := time.Now()
+	mk := func(title string, prio int) model.News {
+		return model.News{Title: title, SourcePriority: prio, PublishTime: now}
+	}
+	rows := []model.News{
+		mk("收评：三大指数集体收涨，央行宣布降准释放流动性", 1), // 黑名单词「收评」——即使正文含高分词也整条降噪
+		mk("龙虎榜：机构净买入某股 3 亿元", 1),
+		mk("北向资金今日净流入 50 亿元", 1),
+		mk("央行宣布降准0.5个百分点，释放长期流动性约1万亿元", 2), // 非黑名单：正常入选
+	}
+	events := selectReportEvents(rows)
+	if len(events) != 1 || !strings.Contains(events[0].Title, "降准0.5个百分点") {
+		t.Fatalf("黑名单标题应零注入、只留驱动性消息: %+v", events)
+	}
+	// known-answer：黑名单词表关键锚存在（防瘦身把「收评/龙虎榜」类删掉悄悄放行噪声）。
+	for _, anchor := range []string{"收评", "龙虎榜", "北向资金", "涨停复盘"} {
+		found := false
+		for _, w := range eventNoiseWords {
+			if w == anchor {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("降噪黑名单缺关键锚 %q（删词须评审）", anchor)
+		}
+	}
+	// edge：全黑名单输入 → 空事件（不硬凑）。
+	if got := selectReportEvents([]model.News{mk("午评：两市震荡", 1), mk("主力资金流向监测", 1)}); len(got) != 0 {
+		t.Fatalf("全噪声输入应空事件: %+v", got)
+	}
+}
+
+// TestGoldenColdDataFixtures cold-data fixture（§8.1；Colleague Skill 概念=长期无新
+// 信息的标的）：QuantVista 的 cold-data 落点是机读 unknowns 声明（P0-3）——数据段
+// 长期缺席时快照如实注入 unknowns[]（缺失≠为零），模型侧禁止用记忆补齐。known-answer：
+// 全维度冷数据的 unknowns 字段清单精确匹配；edge：新闻窗口空（7 日无任何新闻=冷门股
+// 常态）时 window_meta 仍声明边界与 unavailable（「确无」≠「没查」）。
+func TestGoldenColdDataFixtures(t *testing.T) {
+	setEvidenceRefsFlag(t, true)
+	// known-answer：行情外全维度缺席（估值/日线/财务/机构观点长期未覆盖的冷门标的）。
+	snap := map[string]any{"quote": map[string]any{"price": 3.21}}
+	appendStockSnapshotUnknowns(snap, "cn", "600000", true)
+	unk := snapshotUnknownItems(snap)
+	want := map[string]bool{"valuation": true, "technicals": true, "finance": true, "org_view": true}
+	if len(unk) != len(want) {
+		t.Fatalf("全冷数据应恰 %d 项 unknowns: %+v", len(want), unk)
+	}
+	for _, u := range unk {
+		if !want[u.FieldPath] {
+			t.Fatalf("意外的 unknown 字段: %+v", u)
+		}
+		if u.Reason == "" || u.Impact == "" {
+			t.Fatalf("unknown 必须带 reason/impact（区分「没有数据」与「数据为零」）: %+v", u)
+		}
+	}
+	if _, ok := snap["unknowns_note"]; !ok {
+		t.Fatal("冷数据快照必须带 unknowns_note（禁止用常识或记忆补齐的纪律声明）")
+	}
+	// edge：冷门股 7 日新闻窗口空——window_meta 仍声明查询边界（unavailable 是查询
+	// 完成后的诚实答案，冷数据不冒充「有共识」）。
+	empty := buildNewsWindowMeta(nil, 0, 0, true, time.Date(2026, 7, 26, 10, 0, 0, 0, time.Local))
+	if empty.SourceAlignment != newsAlignUnavailable || empty.WindowStart == "" {
+		t.Fatalf("冷门股空窗口应 unavailable 且声明边界: %+v", empty)
+	}
+}
+
+// TestGoldenAnalysisReviewParse 分析复核员解析 known-answer（假 LLM 端到端）：
+// verdict 大小写归一、confidence clamp 到 [0,100]、comment 截 300 字；
+// edge：非法 verdict 触发 repair、二轮仍非法确定性放弃（无复核结论非 degraded）。
+func TestGoldenAnalysisReviewParse(t *testing.T) {
+	setupTestDB(t)
+	step := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		step++
+		content := `{"verdict":"REJECT","comment":"` + strings.Repeat("险", 320) + `","confidence":150}`
+		if step > 1 {
+			t.Errorf("首轮合法输出不应触发 repair")
+		}
+		esc, _ := json.Marshal(content)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":` + string(esc) + `}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	}))
+	defer srv.Close()
+
+	svc := &AnalysisService{}
+	cfg := &model.LLMConfig{BaseURL: srv.URL, Model: "m", MaxTokens: 100}
+	review, usage, run := svc.reviewAnalysis(context.Background(), 1, cfg, "k", true, "stock",
+		map[string]any{"price": 10.0}, &AnalysisResult{Rating: model.AnalysisRatingNeutral, Summary: "x"}, "t-rv", "r-main")
+	if review == nil || review.Verdict != "reject" {
+		t.Fatalf("REJECT 应归一小写 reject: %+v", review)
+	}
+	if int(review.Confidence) != 100 {
+		t.Fatalf("confidence=150 应 clamp 到 100: %d", int(review.Confidence))
+	}
+	if got := len([]rune(review.Comment)); got != 300 {
+		t.Fatalf("comment 应截 300 字: %d", got)
+	}
+	if usage.TotalTokens != 15 || run == nil || run.Module != "analysis_review" {
+		t.Fatalf("run/usage 登记不符: %+v %+v", usage, run)
+	}
+}
+
+// TestGoldenDebateBearEmptyChallengesRepair 辩论 bear 失职反例（db2 程序收口）：
+// challenges 引用全部非法（被剥空=没有回应任何看多论点）→ repair 反馈；二轮仍失职
+// → bear_failed 连 bull 一起丢弃（单方论点有误导性），主结果零改写。
+func TestGoldenDebateBearEmptyChallengesRepair(t *testing.T) {
+	setDebateFlag(t, true)
+	var calls []string
+	bearRounds := 0
+	srv := debateFakeServer(t, &calls,
+		func() string {
+			return `{"claims":[{"text":"多头论点","evidence_ids":["ev-001"],"invalidator":"x"}]}`
+		},
+		func() string {
+			bearRounds++
+			// claim_id 引用不存在的 bu-99：filterChallenges 剥空 → 失职。
+			return `{"claims":[{"text":"空头论点","evidence_ids":["ev-002"],"invalidator":"y"}],"challenges":[{"claim_id":"bu-99","text":"驴唇不对马嘴"}]}`
+		},
+		func() string { return `{}` },
+		func() string { t.Errorf("bear 失败不应调 judge"); return `{}` })
+	defer srv.Close()
+
+	svc := &AnalysisService{}
+	cfg := &model.LLMConfig{BaseURL: srv.URL, Model: "m", MaxTokens: 8000}
+	result := debateTestResult()
+	ratingBefore, sysBefore := result.Rating, result.SysConfidence
+
+	deb, _, _ := svc.runDebate(context.Background(), 7, cfg, "sk", true, map[string]any{}, result,
+		[]string{debateTriggerLowConfidence}, "t1", "r-main")
+	if bearRounds != 2 {
+		t.Fatalf("bear 失职应 repair 一次共 2 调: %d", bearRounds)
+	}
+	if deb.DegradedReason != "bear_failed" {
+		t.Fatalf("引用全非法应降级 bear_failed: %+v", deb)
+	}
+	if len(deb.Bull) != 0 || len(deb.Bear) != 0 {
+		t.Fatalf("bear_failed 应连 bull 一起丢弃（单方论点有误导性）: %+v", deb)
+	}
+	if result.Rating != ratingBefore || result.SysConfidence != sysBefore {
+		t.Fatalf("辩论降级不得改写主结果")
 	}
 }

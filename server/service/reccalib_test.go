@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -415,5 +416,138 @@ func TestRunLLMCalibrationCacheAndShape(t *testing.T) {
 	}
 	if CachedLLMCalibrationReport() != rep {
 		t.Fatalf("缓存应返回同一报表")
+	}
+}
+
+// ---------- 第五十六批②：原始置信度双口径 ----------
+
+// TestSnapshotRawConfidence 快照点语义：复核改写前快照原值；已有快照幂等不覆盖；
+// 与 applyReviews 组合后 Confidence 被压 25 而 RawConfidence 保留 85（分界成立）。
+func TestSnapshotRawConfidence(t *testing.T) {
+	picks := []recPick{
+		{Symbol: "600000", Action: model.RecActionBuy, Confidence: 85},
+		{Symbol: "000001", Action: model.RecActionBuy, Confidence: 70},
+	}
+	snapshotRawConfidence(picks)
+	if picks[0].RawConfidence == nil || *picks[0].RawConfidence != 85 {
+		t.Fatalf("快照应记录复核前置信度: %+v", picks[0].RawConfidence)
+	}
+	// 幂等：二次调用不覆盖（防 repair 重入等异常路径把改写后值误当原始值）。
+	picks[0].Confidence = 25
+	snapshotRawConfidence(picks)
+	if *picks[0].RawConfidence != 85 {
+		t.Fatalf("已有快照不得被二次快照覆盖: %d", *picks[0].RawConfidence)
+	}
+	// 与复核级联组合：reject 压 25 后原值仍在——「原始 vs 终值」分界的落点。
+	out := applyReviews(picks, []pickReview{{Symbol: "000001", Verdict: "reject", Confidence: 0}})
+	if out[1].Confidence != 25 || out[1].RawConfidence == nil || *out[1].RawConfidence != 70 {
+		t.Fatalf("reject 级联后终值 25、原始快照应保留 70: conf=%d raw=%v", out[1].Confidence, out[1].RawConfidence)
+	}
+	// 模型自附 raw_confidence 剥除（服务端快照字段不可伪造）。
+	fake := 99
+	p := normalizePick(recPick{Action: model.RecActionBuy, Confidence: 60, RawConfidence: &fake},
+		"600036", candidate{Symbol: "600036", Price: 10})
+	if p.RawConfidence != nil {
+		t.Fatalf("normalizePick 应剥除模型自附 raw_confidence: %v", *p.RawConfidence)
+	}
+}
+
+// TestCalibRawSummary 双口径分列验算：有快照（diverged/一致）、无快照（missing）、
+// watch 不进；门槛与主口径一致（≥ calibEvalMinSample 才产出 Brier/ECE）。
+func TestCalibRawSummary(t *testing.T) {
+	iptr := func(v int) *int { return &v }
+	mk := func(action string, conf int, raw *int, hit bool) calibSample {
+		net := -1.0
+		if hit {
+			net = 1
+		}
+		return calibSample{
+			label: model.RecommendationLabel{Action: action, NetReturnPct: net},
+			meta:  calibRecMeta{conf: conf, rawConf: raw},
+		}
+	}
+	samples := []calibSample{
+		mk(model.RecActionBuy, 25, iptr(85), false),  // 被复核压 25：diverged
+		mk(model.RecActionBuy, 70, iptr(70), true),   // 未改写：一致
+		mk(model.RecActionBuy, 80, nil, true),        // 旧记录：missing
+		mk(model.RecActionWatch, 60, iptr(60), true), // watch 不进（buy 口径）
+	}
+	raw := calibRawSummary(samples)
+	if raw.Sample != 2 || raw.Missing != 1 || raw.Diverged != 1 {
+		t.Fatalf("分列计数不符: %+v", raw)
+	}
+	if raw.Brier != nil || raw.ECE != nil {
+		t.Fatalf("样本 2 < %d 不得产出 Brier/ECE: %+v", calibEvalMinSample, raw)
+	}
+	// 达门槛：100 条 raw=80 全命中 → Brier=(0.8-1)²=0.04、ECE=0.2（终值 conf=25 全部
+	// diverged——原始口径的 Brier 不吃终值，这正是双口径要测的分界）。
+	big := make([]calibSample, 0, calibEvalMinSample)
+	for i := 0; i < calibEvalMinSample; i++ {
+		big = append(big, mk(model.RecActionBuy, 25, iptr(80), true))
+	}
+	raw = calibRawSummary(big)
+	if raw.Sample != calibEvalMinSample || raw.Diverged != calibEvalMinSample {
+		t.Fatalf("达门槛计数不符: %+v", raw)
+	}
+	if raw.Brier == nil || *raw.Brier != 0.04 || raw.ECE == nil || *raw.ECE != 0.2 {
+		t.Fatalf("原始口径应按快照值算 Brier=0.04/ECE=0.2: brier=%v ece=%v", raw.Brier, raw.ECE)
+	}
+}
+
+// TestRecCalibReportRawCalibEndToEnd DB 端到端：DetailJSON 带 raw_confidence 的新记录
+// 与不带的旧记录混合——raw_calib 分列如实（新 2 其中 1 diverged、旧 1 missing），
+// 主口径 Brier/ECE 继续吃终值列不受影响。
+func TestRecCalibReportRawCalibEndToEnd(t *testing.T) {
+	setupTestDB(t)
+	cleanCalibTables(t)
+	seed := func(recID int64, conf int, detail string, net float64) {
+		if err := common.DB.Create(&model.Recommendation{
+			ID: recID, BatchID: 1, UserID: 1, Symbol: "600000", Market: "cn",
+			Action: model.RecActionBuy, Confidence: conf, DetailJSON: detail,
+		}).Error; err != nil {
+			t.Fatalf("seed rec: %v", err)
+		}
+		if err := common.DB.Create(&model.RecommendationLabel{
+			RecommendationID: recID, HorizonDays: 10, EntryMode: model.EntryModeNextOpen,
+			Type: model.RecTypeShortTerm, Action: model.RecActionBuy,
+			NetReturnPct: net, GrossReturnPct: net + 0.4,
+			MaturityStatus: model.LabelMatured, LabelVersion: labelVersion,
+		}).Error; err != nil {
+			t.Fatalf("seed label: %v", err)
+		}
+	}
+	seed(1, 25, `{"sys_confidence":"low","raw_confidence":85}`, -2) // 复核压 25：diverged
+	seed(2, 70, `{"sys_confidence":"high","raw_confidence":70}`, 3) // 一致
+	seed(3, 80, `{"sys_confidence":"high"}`, 3)                     // 旧记录无快照
+
+	rep, err := buildRecCalibReport(model.RecTypeShortTerm, 10)
+	if err != nil {
+		t.Fatalf("buildRecCalibReport: %v", err)
+	}
+	if rep.RawCalib == nil {
+		t.Fatalf("buy 样本非空应输出 raw_calib 分列")
+	}
+	if rep.RawCalib.Sample != 2 || rep.RawCalib.Missing != 1 || rep.RawCalib.Diverged != 1 {
+		t.Fatalf("raw_calib 分列不符: %+v", rep.RawCalib)
+	}
+	if rep.RawCalib.Brier != nil {
+		t.Fatalf("快照样本 2 < 门槛不得产出原始口径 Brier: %+v", rep.RawCalib)
+	}
+	// raw_confidence=0 是合法值域（非 missing）：终值 0 vs 原始 0 一致。
+	seed(4, 0, `{"sys_confidence":"low","raw_confidence":0}`, -1)
+	rep, err = buildRecCalibReport(model.RecTypeShortTerm, 10)
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if rep.RawCalib.Sample != 3 || rep.RawCalib.Missing != 1 || rep.RawCalib.Diverged != 1 {
+		t.Fatalf("raw_confidence=0 应计入快照样本非 missing: %+v", rep.RawCalib)
+	}
+	// Notes 应声明双口径（旧「口径限制」声明已换）。
+	joined := ""
+	for _, n := range rep.Notes {
+		joined += n + "\n"
+	}
+	if !strings.Contains(joined, "双口径") || strings.Contains(joined, "口径限制（如实声明）") {
+		t.Fatalf("Notes 应换双口径声明: %s", joined)
 	}
 }

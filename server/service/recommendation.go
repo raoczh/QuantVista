@@ -305,6 +305,11 @@ type recPick struct {
 	DegradedSource string `json:"degraded_source,omitempty"`
 	// QuoteAsOf 该条推荐所依据行情的数据源时刻（服务端从候选回填，模型无权自附）。
 	QuoteAsOf string `json:"quote_as_of,omitempty"`
+	// RawConfidence 模型原始口头置信度快照（第五十六批②：复核改写前的值——applyReviews
+	// 的 reject 压 25/复核覆盖是 Confidence 唯一改写点，本字段在其之前由服务端快照）。
+	// 指针语义：nil=旧记录无原始值（校准侧单列 raw_missing，不硬造）；非 nil 恒序列化
+	// （含 0——0 是值域内合法置信度，不能用零值省略混淆「无原始值」）。模型自附一律剥除。
+	RawConfidence *int `json:"raw_confidence,omitempty"`
 }
 
 // pickReview AI 复核员对单条推荐的结论。Confidence 用 FlexInt——模型常把整数字段
@@ -639,7 +644,9 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 
 	// #11 原始 LLM 动作快照（复核前）：applyReviews 对 reject 会把 p.Action 强制改写为
 	// watch，事件表 RawAction 须记复核前值才能与 PostGateAction 构成门控前后对照。此处
-	// 在复核之前快照 Symbol→Action；降级兜底路径下方另行重建。
+	// 在复核之前快照 Symbol→Action；降级兜底路径下方另行重建（兜底 picks 不经
+	// snapshotRawConfidence——程序赋值 35 不是模型预测，RawConfidence 恒 nil 如实）。
+	snapshotRawConfidence(picks)
 	rawActionBySym := make(map[string]string, len(picks))
 	for _, p := range picks {
 		rawActionBySym[p.Symbol] = p.Action
@@ -1158,6 +1165,21 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 	return nil, "", usage, run
 }
 
+// snapshotRawConfidence 第五十六批②：在复核改写之前快照模型原始口头置信度。挂点
+// 与 rawActionBySym 同位（parse+normalize 之后、applyReviews 之前）——此时 Confidence
+// 已经 normalizePick clamp 到 [0,100] 但尚未被复核 reject 级联/复核覆盖改写，是「模型
+// 预测」与「程序修正」的分界值。量化降级兜底 picks 不经本函数（程序赋值非模型预测，
+// RawConfidence 恒 nil 如实缺席）。幂等防御：已有快照不覆盖（repair 重入等异常路径）。
+func snapshotRawConfidence(picks []recPick) {
+	for i := range picks {
+		if picks[i].RawConfidence != nil {
+			continue
+		}
+		v := int(picks[i].Confidence)
+		picks[i].RawConfidence = &v
+	}
+}
+
 // applyReviews 把复核结论回填到推荐：reject 降级为观察并追加风险；复核置信度非 0 时覆盖。
 // reject 无论复核员是否给出置信度，最终置信度强制压到 ≤25——否则「复核否决」徽章
 // 与原有的高置信度（如 85）并排展示，自相矛盾误导用户。
@@ -1408,7 +1430,8 @@ func normalizePick(p recPick, sym string, c candidate) recPick {
 	// verify/bear 关闭时无人覆盖就会以「复核通过/反方低危」的假面落库展示。
 	// DegradedSource 不在此清（quant_fallback 构造路径先设值再过本函数）。
 	p.Review, p.Bear, p.QualityGate = nil, nil, nil
-	p.QuoteAsOf = "" // 服务端回填字段，模型自附一律剥除
+	p.QuoteAsOf = ""      // 服务端回填字段，模型自附一律剥除
+	p.RawConfidence = nil // 服务端快照字段（复核前置信度），模型自附一律剥除
 	p.Action = strings.ToLower(strings.TrimSpace(p.Action))
 	if p.Action != model.RecActionBuy && p.Action != model.RecActionWatch {
 		p.Action = model.RecActionWatch

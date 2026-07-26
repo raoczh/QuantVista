@@ -69,8 +69,12 @@ onMounted(async () => {
                 </div>
                 <div class="role-row"><span class="role-k">失败降级</span><span>{{ r.fallback }}</span></div>
                 <div class="role-row">
-                  <span class="role-k">反例坐标</span>
-                  <span><code v-for="c in r.counter_examples" :key="c" class="role-ce">{{ c }}</code></span>
+                  <span class="role-k">known-answer</span>
+                  <span><code v-for="c in r.known_answers" :key="c" class="role-ce">{{ c }}</code></span>
+                </div>
+                <div class="role-row">
+                  <span class="role-k">edge-case</span>
+                  <span><code v-for="c in r.edge_cases" :key="c" class="role-ce">{{ c }}</code></span>
                 </div>
               </div>
             </n-collapse-item>

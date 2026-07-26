@@ -71,10 +71,13 @@ type JointEvalSegment struct {
 	AvgMaePct      float64 `json:"avg_mae_pct"`      // 标签级持有期内最大不利波动均值（负）
 	WorstMaePct    float64 `json:"worst_mae_pct"`
 
-	// 校准（buy 口头置信度；与校准报表同门槛，样本不足 nil=未评估）。
+	// 校准（buy 口头置信度；与校准报表同门槛，样本不足 nil=未评估）。主口径=落库终值。
 	CalibSample int      `json:"calib_sample"`
 	Brier       *float64 `json:"brier,omitempty"`
 	ECE         *float64 `json:"ece,omitempty"`
+	// RawCalib 原始口径分列（第五十六批②，与校准报表 calibRawSummary 同实现同门槛）：
+	// 复核改写前的模型预测快照单独测校准；旧记录无快照如实计 missing。
+	RawCalib *CalibRawSummary `json:"raw_calib,omitempty"`
 }
 
 // JointLockedPreview 锁定段默认视图：只给范围与计数，不给任何收益/校准指标。
@@ -290,6 +293,10 @@ func jointSegStats(segment string, days []string, list []calibSample) *JointEval
 	if len(cobs) >= calibEvalMinSample {
 		seg.Brier = calibBrier(cobs)
 		seg.ECE = calibECE(cobs)
+	}
+	// 原始口径分列（第五十六批②）：与校准报表共用 calibRawSummary（同实现同门槛）。
+	if len(cobs) > 0 {
+		seg.RawCalib = calibRawSummary(list)
 	}
 	return seg
 }

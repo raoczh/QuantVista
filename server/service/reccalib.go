@@ -243,6 +243,45 @@ func calibProviderModelKey(m calibBatchMeta, ok bool) string {
 	return m.Provider + "/" + m.Model
 }
 
+// CalibRawSummary 原始口头置信度口径分列（第五十六批②，清「confidence 为落库终值」
+// 口径限制）：RawConfidence=复核 reject 级联/复核覆盖改写前的模型预测快照。与主校准
+// （终值口径）分开测——终值口径测「用户实际看到的置信度」的校准性，原始口径测「模型
+// 自身预测」的校准性，两者混在一列会把复核修正误记到模型头上。纯测量零门控。
+type CalibRawSummary struct {
+	Sample  int `json:"sample"`  // 有原始快照的 buy 样本（Brier/ECE 的分母池）
+	Missing int `json:"missing"` // 旧记录无原始快照（如实单列剔除，不硬造=不拿终值冒充原始值）
+	// Diverged 原始 ≠ 终值的样本数（被复核覆盖/reject 级联真实改写过的面）。
+	Diverged int      `json:"diverged"`
+	Brier    *float64 `json:"brier,omitempty"` // ≥ calibEvalMinSample 才产出（与主口径同门槛）
+	ECE      *float64 `json:"ece,omitempty"`
+}
+
+// calibRawSummary 从样本池聚合原始口径分列（watch 在函数内跳过——与主校准同为 buy
+// 口径；校准报表与联合评估共用同一实现，两处口径漂移会让「原始 vs 终值」各说各话）。
+func calibRawSummary(samples []calibSample) *CalibRawSummary {
+	raw := &CalibRawSummary{}
+	var robs []calibObs
+	for _, s := range samples {
+		if s.label.Action != model.RecActionBuy {
+			continue
+		}
+		if s.meta.rawConf == nil {
+			raw.Missing++
+			continue
+		}
+		raw.Sample++
+		if *s.meta.rawConf != s.meta.conf {
+			raw.Diverged++
+		}
+		robs = append(robs, calibObs{Conf: float64(*s.meta.rawConf), Hit: s.label.NetReturnPct > 0, Net: s.label.NetReturnPct})
+	}
+	if len(robs) >= calibEvalMinSample {
+		raw.Brier = calibBrier(robs)
+		raw.ECE = calibECE(robs)
+	}
+	return raw
+}
+
 // CalibActionPR 动作 precision/recall（action=buy 当预测正类、结果为正当事实正类）。
 type CalibActionPR struct {
 	Sample          int      `json:"sample"` // buy+watch 成熟样本
@@ -266,9 +305,14 @@ type RecCalibReport struct {
 	Coverage CalibCoverage `json:"coverage"`
 
 	// 口头置信度校准（buy 样本；y=净收益>0）。样本不足时为 nil（「未评估」非 0 分）。
+	// 主口径=落库终值（用户实际看到的置信度，含复核 reject 级联/复核覆盖修正）。
 	Brier       *float64      `json:"brier,omitempty"`
 	ECE         *float64      `json:"ece,omitempty"`
 	Reliability []CalibBucket `json:"reliability,omitempty"`
+
+	// RawCalib 原始口径分列（第五十六批②）：复核改写前的模型预测快照单独测校准。
+	// 旧记录无快照如实进 Missing 不硬造。
+	RawCalib *CalibRawSummary `json:"raw_calib,omitempty"`
 
 	// 程序合成置信度分档（buy 样本）。
 	SysTiers     []CalibTierCell `json:"sys_tiers,omitempty"`
@@ -466,11 +510,15 @@ func calibTierMonotone(tiers []CalibTierCell) string {
 type calibPickMeta struct {
 	SysConfidence  string `json:"sys_confidence"`
 	DegradedSource string `json:"degraded_source"`
+	// RawConfidence 模型原始口头置信度快照（第五十六批②；复核 reject 级联/复核覆盖
+	// 改写前的值）。nil=旧记录无快照（单列 raw_missing，不硬造）。
+	RawConfidence *int `json:"raw_confidence"`
 }
 
 // calibRecMeta 推荐条目关联元数据（口头置信度列 + DetailJSON 摘取）。
 type calibRecMeta struct {
 	conf     int
+	rawConf  *int // 原始口头置信度快照（nil=旧记录缺席）
 	sysConf  string
 	degraded bool
 }
@@ -517,7 +565,7 @@ func loadRecCalibSamples(recType string, horizon int) (usable []calibSample, cov
 		for _, r := range recs {
 			var pm calibPickMeta
 			_ = json.Unmarshal([]byte(r.DetailJSON), &pm)
-			metas[r.ID] = calibRecMeta{conf: r.Confidence, sysConf: pm.SysConfidence, degraded: pm.DegradedSource != ""}
+			metas[r.ID] = calibRecMeta{conf: r.Confidence, rawConf: pm.RawConfidence, sysConf: pm.SysConfidence, degraded: pm.DegradedSource != ""}
 		}
 	}
 
@@ -662,6 +710,10 @@ func buildRecCalibReport(recType string, horizon int) (*RecCalibReport, error) {
 		rep.ECE = calibECE(obs)
 	}
 	rep.Reliability = calibReliability(obs)
+	// 原始口径分列（第五十六批②）：仅 buy 样本非空时输出（与主校准同池同门槛）。
+	if len(obs) > 0 {
+		rep.RawCalib = calibRawSummary(usable)
+	}
 
 	appendTier := func(tier string) {
 		rows, ok := tierRows[tier]
@@ -774,7 +826,7 @@ func buildRecCalibReport(recType string, horizon int) (*RecCalibReport, error) {
 		"程序合成置信度是有序档位不硬造概率，只报分档命中率/收益与单调性观察；成本前（gross）与成本后（net）收益分开统计",
 		fmt.Sprintf("「已评估」硬门槛=buy 口头置信度样本 ≥%d（§8.1 推荐模块每数据状态 100；未评估≠0 分）；分档/PR 表 <%d 仅供分级参考、单桶/单档 <%d 统计不稳定", calibEvalMinSample, calibMinSample, calibMinBucket),
 		fmt.Sprintf("分层维度（P2-5）：策略/市场状态取标签归因冗余，provider·model/prompt_version 关联批次归因列（prompt_version 分层即 champion/challenger 晋级前后的对照落点）；每层样本 ≥%d 才产出该层 Brier/ECE，小样本层只报命中率/收益供参考，分层是观察不是采信", calibEvalMinSample),
-		"口径限制（如实声明）：confidence 为落库终值（复核 reject 降级条目的置信度已被程序改写，混合了模型原始预测与复核修正）",
+		"双口径（第五十六批）：主校准=落库终值（用户实际看到的置信度，含复核 reject 级联/复核覆盖修正）；raw_calib=模型原始口头置信度快照（复核改写前）单独分列——旧记录无快照如实计 missing 不硬造，两口径同池同门槛",
 	)
 	return rep, nil
 }

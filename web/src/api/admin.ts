@@ -377,6 +377,15 @@ export interface CalibActionPR {
   alpha_sample: number
 }
 
+/* 第五十六批②：原始口头置信度口径分列（复核改写前的模型预测快照单独测校准） */
+export interface CalibRawSummary {
+  sample: number
+  missing: number
+  diverged: number
+  brier?: number
+  ece?: number
+}
+
 export interface RecCalibReport {
   type: string
   horizon_days: number
@@ -387,6 +396,7 @@ export interface RecCalibReport {
   brier?: number
   ece?: number
   reliability?: CalibBucket[]
+  raw_calib?: CalibRawSummary
   sys_tiers?: CalibTierCell[]
   tier_monotone?: string
   slices?: CalibSliceGroup[]
@@ -478,6 +488,7 @@ export interface JointEvalSegment {
   calib_sample: number
   brier?: number
   ece?: number
+  raw_calib?: CalibRawSummary
 }
 
 export interface JointLockedPreview {
@@ -549,7 +560,9 @@ export interface LLMRoleAsset {
   fallback: string
   max_tokens: number
   repair_attempts: number
-  counter_examples: string[]
+  /* 第五十六批①：P1-6 满额坐标（每角色 ≥2 known-answer + ≥1 edge-case，测试锁定） */
+  known_answers: string[]
+  edge_cases: string[]
 }
 
 export interface LLMRolesResponse {

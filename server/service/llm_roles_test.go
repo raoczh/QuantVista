@@ -45,9 +45,6 @@ func TestLLMRoleRegistryComplete(t *testing.T) {
 		if len(a.ForbiddenActions) == 0 {
 			t.Errorf("%s: ForbiddenActions 至少 1 条", id)
 		}
-		if len(a.CounterExamples) == 0 {
-			t.Errorf("%s: CounterExamples 至少 1 条反例测试坐标", id)
-		}
 	}
 }
 
@@ -99,21 +96,37 @@ func TestLLMRoleSchemaAnchors(t *testing.T) {
 	}
 }
 
-// TestLLMRoleCounterExamplesExist 反例坐标真实存在：每个 CounterExamples 引用的
-// 测试函数必须在本包 *_test.go 中定义——挪动/重命名测试须同步 registry
-// （llm_golden_test.go 目录同款纪律，这里是机读+程序校验）。
-func TestLLMRoleCounterExamplesExist(t *testing.T) {
+// TestLLMRoleGoldenQuota P1-6 满额校验（第五十六批①，取代原 TestLLMRoleCounterExamplesExist
+// 的存在性校验并升级为满额校验）：每个启用角色至少 2 个 known-answer + 1 个 edge-case
+// （§8.1 硬门槛），全部坐标必须真实存在于本包 *_test.go 且两数组不重复登记——
+// 挪动/重命名测试须同步 registry；新增角色缺额直接红（防「先登记后补测试」的假账）。
+func TestLLMRoleGoldenQuota(t *testing.T) {
 	src := serviceSources(t, true)
-	for id, a := range llmRoleAssets {
-		for _, ce := range a.CounterExamples {
+	checkList := func(id, kind string, list []string, seen map[string]bool) {
+		for _, ce := range list {
 			if !strings.HasPrefix(ce, "Test") {
-				t.Errorf("%s: 反例坐标 %q 应是测试函数名（Test 前缀）", id, ce)
+				t.Errorf("%s: %s 坐标 %q 应是测试函数名（Test 前缀）", id, kind, ce)
 				continue
 			}
+			if seen[ce] {
+				t.Errorf("%s: 坐标 %q 在 KnownAnswers/EdgeCases 重复登记（一个测试只计一次额度）", id, ce)
+			}
+			seen[ce] = true
 			if !strings.Contains(src, "func "+ce+"(") {
-				t.Errorf("%s: 反例测试 %q 不存在于本包 *_test.go（挪动测试须同步 registry）", id, ce)
+				t.Errorf("%s: %s 测试 %q 不存在于本包 *_test.go（挪动测试须同步 registry）", id, kind, ce)
 			}
 		}
+	}
+	for id, a := range llmRoleAssets {
+		if len(a.KnownAnswers) < 2 {
+			t.Errorf("%s: known-answer 不足 2 个（§8.1 满额门槛）: %v", id, a.KnownAnswers)
+		}
+		if len(a.EdgeCases) < 1 {
+			t.Errorf("%s: edge-case 不足 1 个（§8.1 满额门槛）: %v", id, a.EdgeCases)
+		}
+		seen := map[string]bool{}
+		checkList(id, "known-answer", a.KnownAnswers, seen)
+		checkList(id, "edge-case", a.EdgeCases, seen)
 	}
 }
 

@@ -16,9 +16,10 @@ import "sort"
 //   - 版本锚用**常量引用**（编译期绑定）：代码版本常量递增时 registry 自动跟随，
 //     不存在手抄漂移；SchemaVersion 是字符串，由 TestLLMRoleSchemaAnchors 读源码
 //     对拍 newLLMRun 调用处防漂移。
-//   - 反例坐标（CounterExamples）引用真实测试函数名，TestLLMRoleCounterExamplesExist
-//     读 *_test.go 源码校验存在性——挪动/重命名测试必须同步本表（llm_golden_test.go
-//     目录同款纪律，但这里是机读+程序校验）。
+//   - 回归集坐标（KnownAnswers/EdgeCases，第五十六批①取代原 CounterExamples 单数组）
+//     引用真实测试函数名，TestLLMRoleGoldenQuota 读 *_test.go 源码校验存在性与
+//     §8.1 满额门槛（每角色 ≥2 known-answer + ≥1 edge-case）——挪动/重命名测试必须
+//     同步本表（llm_golden_test.go 目录同款纪律，但这里是机读+程序校验）。
 //
 // 不做什么（有意边界）：
 //   - P1-9 角色质量门与发布审计**明确延后**：其「未 PASS 不进入 synthesis」预设了
@@ -56,8 +57,14 @@ type LLMRoleAsset struct {
 	// MaxTokens/RepairAttempts 由 llmModuleBudgets 回填（单一权威，不在本表重复声明）。
 	MaxTokens      int `json:"max_tokens"`
 	RepairAttempts int `json:"repair_attempts"`
-	// CounterExamples 反例测试坐标（真实测试函数名，存在性由测试校验）。
-	CounterExamples []string `json:"counter_examples"`
+	// KnownAnswers / EdgeCases 固定回归集坐标（第五十六批①：P1-6 满额门槛 §8.1
+	// 「每角色至少 2 个 known-answer + 1 个 edge-case」的机读登记，取代原
+	// CounterExamples 单数组）。KnownAnswers=固定输入→精确断言预期输出（手工验算/
+	// 表驱动正例/端到端具体值）；EdgeCases=边界与异常路径（失败降级/剥除/拒绝/flag 关/
+	// 旧记录兼容）。全部引用真实测试函数名——存在性与满额由 TestLLMRoleGoldenQuota
+	// 读 *_test.go 源码校验，挪动/重命名测试必须同步本表。
+	KnownAnswers []string `json:"known_answers"`
+	EdgeCases    []string `json:"edge_cases"`
 }
 
 // llmRoleGlobalDisciplines 全局纪律（跨角色恒真，管理端与 registry 一并透出）：
@@ -83,7 +90,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"rating 与证据/风险闸门一致（block ⇒ 不得 bullish，语义校验拒收）", "anti_thesis 反方观点与 kill_switches 失效条件", "unknowns 数据盲区如实声明", "引用数字须与快照吻合（证据核验 ev5）"},
 		ForbiddenActions: []string{"补写快照外的价格/财务/新闻", "risk_gate=block 时输出 bullish", "自附 sys_confidence/evidence_check/trade_plan/debate 等服务端字段（parse 剥除）", "stale 快照下给当前行动建议"},
 		Fallback:         "repair 打满走 degraded 落库（原文保留非成功）；拒答带机读码（stale_quote 等）",
-		CounterExamples:  []string{"TestValidateAnalysisSemantics", "TestParseAnalysisResult_StripsTrustFields", "TestGoldenCustomTemplateCannotOverrideSafety", "TestGoldenAnalysisClaims"},
+		KnownAnswers:     []string{"TestGoldenAnalysisClaims", "TestParseAnalysisResult_Valid", "TestPanelMajorityRating"},
+		EdgeCases:        []string{"TestValidateAnalysisSemantics", "TestParseAnalysisResult_StripsTrustFields", "TestGoldenCustomTemplateCannotOverrideSafety", "TestGoldenColdDataFixtures"},
 	},
 	"trade_plan": {
 		RoleID: "trade_plan", Name: "交易计划员（plan_interpreter）",
@@ -95,7 +103,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"止损<现价、止损<买入区间下沿、目标>区间上沿（validateTradePlan 硬纪律）", "invalidators 计划失效条件（P1-2；模型未输出如实为空，归一收集非硬校验）", "操作清单 checklist"},
 		ForbiddenActions: []string{"计算仓位/RR/费用（Go 回填，模型自附值剥除）", "stale 行情下给精确价位", "盈亏比<2:1 时维持满仓（服务端减半记 discipline_notes）"},
 		Fallback:         "repair 打满 best-effort 不带计划（主分析不受影响）",
-		CounterExamples:  []string{"TestValidateTradePlan", "TestAttachTradePlan_DeterministicSkips", "TestParseTradePlan_StripServerFields", "TestGoldenTradePlanInvalidatorsParse"},
+		KnownAnswers:     []string{"TestGoldenTradePlanInvalidatorsParse", "TestValidateTradePlan", "TestAttachTradePlan_EndToEnd"},
+		EdgeCases:        []string{"TestAttachTradePlan_DeterministicSkips", "TestParseTradePlan_StripServerFields", "TestValidateTradePlanSemantics"},
 	},
 	"analysis_review": {
 		RoleID: "analysis_review", Name: "分析复核员（risk_reviewer）",
@@ -107,7 +116,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"verdict pass/warn/reject 与理由", "reject 必须级联（Action 压 watch、置信度 ≤25、SysConfidence=low）"},
 		ForbiddenActions: []string{"直接改写主结果字段（只出 verdict，级联由程序执行）", "以复核通过替代证据核验"},
 		Fallback:         "best-effort：失败只是没有复核结论，不影响主结果",
-		CounterExamples:  []string{"TestAnalysisReviewRejectCascade", "TestReviewRepairTemperatureAndAttemptLimit"},
+		KnownAnswers:     []string{"TestAnalysisReviewRejectCascade", "TestGoldenAnalysisReviewParse"},
+		EdgeCases:        []string{"TestReviewRepairTemperatureAndAttemptLimit"},
 	},
 	"recommendation": {
 		RoleID: "recommendation", Name: "候选精选器（candidate_selector）",
@@ -119,7 +129,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"picks 逐条理由/风险/证据数字", "长短线失效条件（invalidation，P1-2）", "rejected 落选理由", "短线 buy 盈亏比≥1.5（不足程序降 watch）"},
 		ForbiddenActions: []string{"推荐池外/名单外标的（parseAndFilterPicks 剥除+coverage 诊断）", "自报 quant_score/sys_confidence/review/bear 等服务端字段", "为凑数量放宽门槛（空选合法）"},
 		Fallback:         "超时/网络/5xx/流中断走量化降级（恒 watch+置信 35+SysConfidence low）；宁缺毋滥拒选语义不动",
-		CounterExamples:  []string{"TestParseAndFilterPicks_DropsFabricated", "TestParseAndFilterPicksCoverageDiag", "TestParseAndFilterPicks_EmptyPicksLegal", "TestQuantFallbackKeepsScreenScore"},
+		KnownAnswers:     []string{"TestParseAndFilterPicksCoverageDiag", "TestGoldenRecPickInvalidationClaims", "TestQuantFallbackKeepsScreenScore"},
+		EdgeCases:        []string{"TestParseAndFilterPicks_DropsFabricated", "TestParseAndFilterPicks_EmptyPicksLegal", "TestLoadCandidateFilter"},
 	},
 	"rec_review": {
 		RoleID: "rec_review", Name: "推荐复核员（rec_reviewer）",
@@ -131,7 +142,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"逐条 verdict 与理由", "reject 级联（buy→watch、置信度压低）由程序执行"},
 		ForbiddenActions: []string{"直接改写名单（只出 verdict）", "复核通过解除候选池边界"},
 		Fallback:         "best-effort：失败无复核结论，token 计入批次",
-		CounterExamples:  []string{"TestApplyReviews", "TestNormalizePick_Clamps"},
+		KnownAnswers:     []string{"TestApplyReviews", "TestSnapshotRawConfidence"},
+		EdgeCases:        []string{"TestNormalizePick_Clamps", "TestReviewRepairTemperatureAndAttemptLimit"},
 	},
 	"rec_bear": {
 		RoleID: "rec_bear", Name: "反方研究员（independent_bear）",
@@ -143,7 +155,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"最强反方论证与 severity（high/med/low）", "解禁减持数据系统未提供——只能提示核查"},
 		ForbiddenActions: []string{"改写 action/置信度（影子三不纪律）", "虚构解禁/质押/减持数据", "对 watch 条目消耗篇幅"},
 		Fallback:         "best-effort 1 次 repair；失败该条无反方论证",
-		CounterExamples:  []string{"TestBearPromptFramework", "TestApplyBearShadow", "TestNormalizePickStripsServerFields"},
+		KnownAnswers:     []string{"TestBearReviewEndToEnd", "TestApplyBearShadow"},
+		EdgeCases:        []string{"TestBearPromptFramework", "TestNormalizePickStripsServerFields"},
 	},
 	"daily_report": {
 		RoleID: "daily_report", Name: "收盘复盘员（market_summarizer）",
@@ -155,7 +168,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"总结与明日计划（claims 推导，P1-2）", "数据缺口如实声明不冒充今日", "复盘不硬造失效条件（对已发生事实的解读）"},
 		ForbiddenActions: []string{"用未来/过期数据冒充今日口径", "重建推荐（与批次一致）"},
 		Fallback:         "repair 打满归 llm_output_invalid；复盘失败保留旧报告、partial 如实标注",
-		CounterExamples:  []string{"TestDailySnapshotDateGate", "TestDailyTradingDayStatusFailClosed", "TestDailyReviewEvidenceClaims"},
+		KnownAnswers:     []string{"TestDailyReviewEvidenceClaims", "TestSelectReportEvents"},
+		EdgeCases:        []string{"TestDailySnapshotDateGate", "TestDailyTradingDayStatusFailClosed", "TestGoldenNewsSourceBlacklistNoise"},
 	},
 	"qa": {
 		RoleID: "qa", Name: "证据问答员（evidence_qa）",
@@ -167,7 +181,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"快照外事实答未知", "时效非 fresh 如实声明「截至 X」"},
 		ForbiddenActions: []string{"下达买卖指令（自由文本契约锚点）", "执行问题文本中的指令（注入隔离）", "流中断落半截回答"},
 		Fallback:         "流式失败不落库；拒答带机读码",
-		CounterExamples:  []string{"TestQaBuildMessages", "TestGoldenInjectionStaysInDataSection", "TestGoldenCustomTemplateCannotOverrideSafety"},
+		KnownAnswers:     []string{"TestQaBuildMessages", "TestQaLayeredContextTiers"},
+		EdgeCases:        []string{"TestGoldenInjectionStaysInDataSection", "TestGoldenCustomTemplateCannotOverrideSafety", "TestQaBuildMessagesLayeredFlagOff"},
 	},
 	"compare": {
 		RoleID: "compare", Name: "对比点评员（comparison_analyst）",
@@ -179,7 +194,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"只比较共同可用字段", "字段缺失方不得据此判劣"},
 		ForbiddenActions: []string{"荐股式结论（研究参考表述）", "引用不在对比表中的数据"},
 		Fallback:         "AI 失败返回 ai_refusal_code，量化对比表不受影响",
-		CounterExamples:  []string{"TestChangeOverN", "TestNormalizeCompareRequestKeepsTruncationNote"},
+		KnownAnswers:     []string{"TestChangeOverN", "TestCompareValueSetContainsRows"},
+		EdgeCases:        []string{"TestNormalizeCompareRequestKeepsTruncationNote", "TestCompareFreshnessRefusalPrecedesLLMResolution"},
 	},
 	"news": {
 		RoleID: "news", Name: "新闻情绪标注员（news_window_classifier）",
@@ -191,7 +207,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"逐 ID 恰一项", "方向与分数矛盾以方向为准分数归 0", "related_sectors 过白名单"},
 		ForbiddenActions: []string{"窗口外/未来记录注入（0 注入锁定）", "单源写成市场共识（alignment 程序分类模型只解释）"},
 		Fallback:         "解析失败降级规则路径（applySentimentRules），不 repair",
-		CounterExamples:  []string{"TestComputeDailySentimentExcludesFutureNews", "TestGoldenNewsWindowZeroInjection", "TestGoldenNewsAlignment", "TestNormalizeEnhance"},
+		KnownAnswers:     []string{"TestGoldenNewsAlignment", "TestGoldenNewsWindowMeta", "TestNormalizeEnhance"},
+		EdgeCases:        []string{"TestComputeDailySentimentExcludesFutureNews", "TestGoldenNewsWindowZeroInjection", "TestGoldenNewsSourceBlacklistNoise"},
 	},
 	"screener_parse": {
 		RoleID: "screener_parse", Name: "白话建策略解析器（factor_mapper）",
@@ -203,7 +220,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"无法映射的表述如实进 unmatched 禁硬凑", "tree=null 仅当 unmatched 非空合法（拦空手交差）"},
 		ForbiddenActions: []string{"引用白名单外因子（validateCondTree 拒收）", "直接落库/扫描"},
 		Fallback:         "repair 一次仍不过报错（不出降级半成品）",
-		CounterExamples:  []string{"TestParseStrategyPromptFactorDict", "TestParseStrategyLLMOutput", "TestParseStrategyRepairStillBad"},
+		KnownAnswers:     []string{"TestParseStrategyLLMOutput", "TestParseStrategyEndToEnd", "TestParseStrategyPromptFactorDict"},
+		EdgeCases:        []string{"TestParseStrategyRepairStillBad", "TestParseStrategyInputValidation"},
 	},
 	"debate_bull": {
 		RoleID: "debate_bull", Name: "辩论看多方（bull_researcher）",
@@ -215,7 +233,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"每条 claim 必须引用至少一个合法 evidence_id（零引用剥除、全空触发 repair，db2）", "至少一条失效条件（全无报错触发 repair）"},
 		ForbiddenActions: []string{"淡化 risk_gate", "把未知当利好", "自报 claim id（程序重编号 bu-*）"},
 		Fallback:         "bull_failed 丢弃全部辩论产物（主分析不受影响），后续调用止损",
-		CounterExamples:  []string{"TestDebateTriggerReasons", "TestDebateBullFailedDegrades", "TestNormalizeDebateClaims"},
+		KnownAnswers:     []string{"TestDebateTriggerReasons", "TestNormalizeDebateClaims"},
+		EdgeCases:        []string{"TestDebateBullFailedDegrades"},
 	},
 	"debate_bear": {
 		RoleID: "debate_bear", Name: "辩论看空方（bear_researcher）",
@@ -227,7 +246,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"challenges 至少一条有效回应 bull claim id（空/全非法触发 repair，db2；引用校验剥除非法引用）", "每条 claim 必须引用合法 evidence_id（db2）", "区分已证实风险与假设风险（confirmed 缺省按假设风险 false 处理）"},
 		ForbiddenActions: []string{"虚构证据 id", "重复 bull 的事实当反驳"},
 		Fallback:         "bear_failed 连 bull 一起丢弃（单方论点有误导性）",
-		CounterExamples:  []string{"TestDebateEndToEnd", "TestNormalizeDebateClaims"},
+		KnownAnswers:     []string{"TestDebateEndToEnd", "TestNormalizeDebateClaims"},
+		EdgeCases:        []string{"TestGoldenDebateBearEmptyChallengesRepair"},
 	},
 	"debate_rebuttal": {
 		RoleID: "debate_rebuttal", Name: "辩论反驳轮（bull_rebuttal）",
@@ -239,7 +259,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"针对共享证据的对立解读给出反驳"},
 		ForbiddenActions: []string{"新增双方未引用的事实", "无条件追加轮次"},
 		Fallback:         "rebuttal 失败 best-effort 不降级整体（judge 照常裁决）",
-		CounterExamples:  []string{"TestHasSharedEvidence", "TestDebateRebuttalRound"},
+		KnownAnswers:     []string{"TestHasSharedEvidence", "TestDebateRebuttalRound"},
+		EdgeCases:        []string{"TestDebateRebuttalFailureNotFakeTwoRounds"},
 	},
 	"debate_judge": {
 		RoleID: "debate_judge", Name: "辩论裁判（research_judge）",
@@ -251,7 +272,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"按证据质量排序不按角色票数平均（§6.3 反投票合成锚）", "block 时 verdict 不得 bullish（收口校验，repair 仍违纪 judge_invalid）", "三列表互斥且至少一个有效 claim 引用（空引用裁决触发 repair，db2）", "冲突输出 conflict_note 不和稀泥"},
 		ForbiddenActions: []string{"以票数合成信号", "新增双方未引用的事实", "改写主分析 rating/summary/claims"},
 		Fallback:         "judge_failed/judge_invalid 保留双方论点无裁决（对抗已完成只缺裁决）",
-		CounterExamples:  []string{"TestDebateJudgeBlockGuard", "TestDebateOppositeVerdictLowersConfidence", "TestParseAnalysisResultStripsDebate"},
+		KnownAnswers:     []string{"TestDebateOppositeVerdictLowersConfidence", "TestDebateEndToEnd"},
+		EdgeCases:        []string{"TestDebateJudgeBlockGuard", "TestParseAnalysisResultStripsDebate", "TestDebateJudgeEmptyReferenceRejected"},
 	},
 	"reflection": {
 		RoleID: "reflection", Name: "反思记忆生成器（reflection_writer）",
@@ -263,7 +285,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"方向对不对/论点哪部分成立失败/一条可迁移教训", "idx 关联程序校验（越界=伪造关联丢弃）"},
 		ForbiddenActions: []string{"判定输赢（outcome 程序归类）", "注入推荐 prompt（影子三不）", "改写 action/置信度"},
 		Fallback:         "生成失败本轮跳过（幂等下轮再试）；检索失败影子字段空串零噪声",
-		CounterExamples:  []string{"TestReflectionAvailableFromFilter", "TestReflectionShadowJSONNotMutatePicks", "TestReflectionBelowThresholdNoCall"},
+		KnownAnswers:     []string{"TestReflectionOutcome", "TestReflectionGenerateEndToEnd"},
+		EdgeCases:        []string{"TestReflectionAvailableFromFilter", "TestReflectionShadowJSONNotMutatePicks", "TestReflectionBelowThresholdNoCall"},
 	},
 	"experiment": {
 		RoleID: "experiment", Name: "challenger 影子研究员（prompt_challenger）",
@@ -275,7 +298,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"与推荐主调同 schema（picks/rejected JSON）", "无 repair——影子对照测『一把过』的结构化质量"},
 		ForbiddenActions: []string{"改写业务批次 picks/置信度（输出只落 llm_experiment_runs，测试锁定字节一致）", "跨用户采样", "晋级绕过 P1-9 发布质量门（PromoteLLMExperiment 硬检）"},
 		Fallback:         "任何失败只落样本行 Error 字段（失败也是实验数据），业务批次零影响",
-		CounterExamples:  []string{"TestChallengerShadowNotMutateBusiness", "TestLLMExperimentPromoteGate"},
+		KnownAnswers:     []string{"TestChallengerShadowNotMutateBusiness", "TestLLMExperimentLifecycle"},
+		EdgeCases:        []string{"TestLLMExperimentPromoteGate"},
 	},
 	"release_audit": {
 		RoleID: "release_audit", Name: "发布审计员（release_auditor）",
@@ -287,7 +311,8 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		MustAnswer:       []string{"verdict=pass/fail 封闭枚举（程序校验）", "fail 必附 findings（code/severity/message）", "high 级 finding 程序强制 fail（口是心非收口）"},
 		ForbiddenActions: []string{"复述程序硬检已覆盖的门槛（样本量/有效率/hash/状态机）", "输出 pass 同时给出 high 级 finding（程序改判 fail）", "替代人工审批（promote 仍是管理员显式动作）"},
 		Fallback:         "解析失败 repair 1 次；仍无效落 verdict=error 工件（同样挡晋级，可重跑），不伪造 PASS",
-		CounterExamples:  []string{"TestParseReleaseAudit", "TestLLMExperimentAuditGate"},
+		KnownAnswers:     []string{"TestParseReleaseAudit", "TestLLMExperimentAuditGate"},
+		EdgeCases:        []string{"TestLLMExperimentRollback"},
 	},
 }
 

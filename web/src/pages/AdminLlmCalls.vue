@@ -37,6 +37,7 @@ const moduleLabel: Record<string, string> = {
   debate_judge: '辩论·裁判',
   reflection: '推荐反思',
   experiment: 'Prompt 实验（影子）',
+  release_audit: '发布审计',
   test: '测试连接',
 }
 const moduleOptions = [

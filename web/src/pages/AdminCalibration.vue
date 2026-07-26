@@ -141,7 +141,11 @@ function prLine(rep: RecCalibReport): string {
                 <n-tag size="small" :type="rec.evaluated ? 'success' : 'warning'" :bordered="false">
                   {{ rec.evaluated ? `已评估（buy 校准样本达标）` : `未评估（buy 校准样本不足 100）` }}
                 </n-tag>
-                <span class="calib-kv">Brier={{ num4(rec.brier) }} · ECE={{ num4(rec.ece) }}</span>
+                <span class="calib-kv">Brier={{ num4(rec.brier) }} · ECE={{ num4(rec.ece) }}（终值口径）</span>
+              </div>
+              <div v-if="rec.raw_calib" class="calib-cov">
+                原始口径（复核改写前的模型预测）：快照样本 {{ rec.raw_calib.sample }} · 旧记录无快照 {{ rec.raw_calib.missing }} ·
+                被复核改写 {{ rec.raw_calib.diverged }} · Brier={{ num4(rec.raw_calib.brier) }} · ECE={{ num4(rec.raw_calib.ece) }}
               </div>
               <div class="calib-cov">
                 标签覆盖：共 {{ rec.coverage.total }} 条 · 成熟 {{ rec.coverage.matured }}（{{ rec.coverage.matured_ratio_pct.toFixed(1) }}%）·

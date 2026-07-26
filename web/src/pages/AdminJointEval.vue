@@ -127,6 +127,14 @@ const sliceColumns = computed<DataTableColumns<CalibSliceRow>>(() => [
                 <n-data-table :columns="segColumns" :data="segRows(sec)" :row-key="(r: SegRow) => r.seg_label" size="small" :scroll-x="1620" />
               </template>
               <div v-else class="je-empty">暂无成熟样本。</div>
+              <template v-for="seg in [sec.dev, sec.locked]" :key="sec.type + (seg?.segment || '')">
+                <div v-if="seg?.raw_calib" class="je-cov">
+                  {{ seg.segment === 'locked' ? '锁定段' : '开发段' }}原始口径（复核改写前）：快照样本 {{ seg.raw_calib.sample }} ·
+                  无快照 {{ seg.raw_calib.missing }} · 被复核改写 {{ seg.raw_calib.diverged }} ·
+                  Brier={{ seg.raw_calib.brier === undefined || seg.raw_calib.brier === null ? '未评估' : seg.raw_calib.brier.toFixed(4) }} ·
+                  ECE={{ seg.raw_calib.ece === undefined || seg.raw_calib.ece === null ? '未评估' : seg.raw_calib.ece.toFixed(4) }}（表内 Brier/ECE 为终值口径）
+                </div>
+              </template>
               <div v-if="sec.locked_preview && !sec.locked" class="je-locked">
                 锁定测试段：{{ sec.locked_preview.date_start }} ~ {{ sec.locked_preview.date_end }}（{{ sec.locked_preview.signal_days }} 个信号日 ·
                 {{ sec.locked_preview.sample }} 样本）——指标未读取（点「读取锁定段」显式请求，读取将登记审计）
