@@ -252,8 +252,8 @@ func runEntry(run *llmRun, jsonMode bool) llmRunManifestEntry {
 	return llmRunManifestEntry{run: run, jsonMode: jsonMode}
 }
 
-// structuredMethodName 结构化方法枚举（本项目仅两态；json_schema/function_calling 属
-// P0-5 capability matrix 之后的能力）。
+// structuredMethodName 结构化方法枚举（本项目仅两态；json_schema/function_calling 已
+// 定夺不引入——计划 v2.9 P0-5 行，业务链路无此请求形态则能力声明位是假账）。
 func structuredMethodName(jsonMode bool) string {
 	if jsonMode {
 		return model.LLMStructuredJSONObject

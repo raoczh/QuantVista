@@ -6,8 +6,9 @@ const (
 	LLMCallStatusSuccess = "success"
 	LLMCallStatusError   = "error"
 
-	// 结构化方法枚举（P0-2）：本项目当前仅两态；json_schema/function_calling 待 P0-5
-	// capability matrix 后引入，届时在此扩枚举而非另起词表。
+	// 结构化方法枚举（P0-2）：本项目当前仅两态。json_schema/function_calling 已定夺不引入
+	// （计划 v2.9：全部业务链路无此请求形态，扩声明位=无消费方的假账）；若未来某模块
+	// 真实改用该请求形态，在此扩枚举而非另起词表。
 	LLMStructuredJSONObject = "json_object"
 	LLMStructuredFreeText   = "free_text"
 )
@@ -15,20 +16,20 @@ const (
 // LLMCallLog 记录一次真实的上游 LLM 请求。请求与响应正文仅供管理员审计，
 // 列表查询必须显式排除两个 TEXT 字段，避免普通翻页返回大体积敏感数据。
 type LLMCallLog struct {
-	ID               int64     `gorm:"primaryKey" json:"id"`
-	UserID           int64     `gorm:"index" json:"user_id"`
-	Module           string    `gorm:"size:32;index" json:"module"`
-	LLMConfigID      int64     `gorm:"index" json:"llm_config_id"`
-	Provider         string    `gorm:"size:32" json:"provider"`
-	Model            string    `gorm:"size:64" json:"model"`
-	EndpointType     string    `gorm:"size:24" json:"endpoint_type"`
-	Stream           bool      `json:"stream"`
-	Status           string    `gorm:"size:16;index" json:"status"`
-	ErrorMsg         string    `gorm:"size:512" json:"error_msg"`
-	PromptTokens     int       `json:"prompt_tokens"`
-	CompletionTokens int       `json:"completion_tokens"`
-	TotalTokens      int       `json:"total_tokens"`
-	LatencyMs        int64     `json:"latency_ms"`
+	ID               int64  `gorm:"primaryKey" json:"id"`
+	UserID           int64  `gorm:"index" json:"user_id"`
+	Module           string `gorm:"size:32;index" json:"module"`
+	LLMConfigID      int64  `gorm:"index" json:"llm_config_id"`
+	Provider         string `gorm:"size:32" json:"provider"`
+	Model            string `gorm:"size:64" json:"model"`
+	EndpointType     string `gorm:"size:24" json:"endpoint_type"`
+	Stream           bool   `json:"stream"`
+	Status           string `gorm:"size:16;index" json:"status"`
+	ErrorMsg         string `gorm:"size:512" json:"error_msg"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	TotalTokens      int    `json:"total_tokens"`
+	LatencyMs        int64  `json:"latency_ms"`
 	// FirstChunkMs 流式请求首个 data 块到达耗时（非流式恒 0）。
 	// ≈latency_ms 说明上游忽略 stream 整包返回（假流式网关），排查 60s 超时归属层时先看它。
 	FirstChunkMs int64  `json:"first_chunk_ms"`
