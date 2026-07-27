@@ -33,10 +33,17 @@ type LLMExperiment struct {
 	Hypothesis          string `gorm:"size:512" json:"hypothesis"`           // P2-2：想验证什么
 	ExpectedImprovement string `gorm:"size:512" json:"expected_improvement"` // P2-2：预期改善（可含机读指标目标）
 
-	ChallengerContent string `gorm:"type:text" json:"challenger_content"` // 创建时固化的任务段快照
-	ChallengerHash    string `gorm:"size:32" json:"challenger_hash"`
-	ChampionVersion   string `gorm:"size:32" json:"champion_version"` // 创建时 champion 版本串（base 或 base-custom.hash8）
-	ChampionHash      string `gorm:"size:32" json:"champion_hash"`    // champion 为自定义模板时的内容 hash（默认模板为空）
+	ChallengerContent  string `gorm:"type:text" json:"challenger_content"` // 创建时固化的任务段快照
+	ChallengerHash     string `gorm:"size:32" json:"challenger_hash"`
+	ChampionVersion    string `gorm:"size:32" json:"champion_version"` // 创建时 champion 版本串（base 或 base-custom.hash8）
+	ChampionHash       string `gorm:"size:32" json:"champion_hash"`    // 创建时实际任务段 hash（默认/自定义均非空）
+	ChampionCustom     bool   `json:"champion_custom"`                 // 创建时是否启用自定义模板
+	ChampionRevision   int    `json:"champion_revision"`               // 自定义 champion 的模板 revision；默认态为 0
+	ChampionGeneration int64  `json:"champion_generation"`             // 单调 champion 代际；内容/启停/删除任一变化均前移
+	BaselineVersion    int    `json:"-"`                               // 0=旧行，1=内容/形态/revision，2=再含 generation
+	// BaselineInvalidReason 是一旦观测到运行期基线漂移就固化的失效原因。不能只在 promote
+	// 时比较最终 hash：A→B 采样后再恢复 A 仍已污染单变量样本，必须保持不可洗回。
+	BaselineInvalidReason string `gorm:"size:512;default:''" json:"-"`
 	// ChampionContent 创建时固化的 champion 基线内容快照（P2-6 审查修复批）：发布审计
 	// 对照的必须是实验创建时的对照基线，而非「审计当下」的活模板（创建后 champion 被
 	// 编辑时两者不同，单变量复核会失去稳定依据）；默认模板场景固化实际的内置任务段
@@ -52,7 +59,8 @@ type LLMExperiment struct {
 	FailureReason string `gorm:"size:512" json:"failure_reason"`   // P2-2：失败原因（未达预期时必填）
 	ParentID      int64  `gorm:"index;default:0" json:"parent_id"` // 父实验（版本谱系）
 
-	PromotedRevision int `json:"promoted_revision"` // 晋级后模板 revision（快照表可回放）
+	PromotedRevision   int   `json:"promoted_revision"`   // 晋级后模板 revision（快照表可回放）
+	PromotedGeneration int64 `json:"promoted_generation"` // 晋级完成时的 champion 归属代际（回滚对象锚）
 
 	// P2-6 一键切回 champion 的回滚锚：晋级瞬间固化「当时启用中的模板状态」——
 	// PrePromoteEnabled=false 表示晋级前用默认模板（回滚=停用自定义模板）；true 表示
@@ -66,6 +74,13 @@ type LLMExperiment struct {
 	CompletedAt *time.Time `json:"completed_at"`
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
+// LLMExperimentModuleLock 是模块级数据库锁槽。行永久保留，只用于 Start 时
+// SELECT ... FOR UPDATE 串行化“检查 running + draft→running”，不承载业务状态。
+type LLMExperimentModuleLock struct {
+	Module    string    `gorm:"size:32;primaryKey" json:"module"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // LLMExperimentRun 一次影子采样工件：同一批次里 champion（业务主调）与 challenger

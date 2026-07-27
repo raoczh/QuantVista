@@ -128,7 +128,10 @@ func spotTradeDate(rows []datasource.SpotRow) (string, error) {
 // 判定除权则全量重锚。返回 true 表示已重锚（调用方不必再写本窗）。
 // 重锚失败时返回 false 退回旧行为（本窗照写，至少最新窗口是新基准），并把 states
 // 置回 pending 交给初始化任务重试——那条路径拉全量 250 根，多点采样必能再次抓住断层。
-func (s *MarketService) detectAndRebase(market, symbol string, fresh []datasource.Bar) bool {
+func (s *MarketService) detectAndRebase(ctx context.Context, market, symbol string, fresh []datasource.Bar) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// 排除"今天"的根：当日 close 盘中持续变化（DB 里可能是早间价、fresh 是此刻价），
 	// 拿它比对会把盘中波动误判成除权。历史日的收盘值只有除权重锚才会变，才是可靠锚点。
 	today := time.Now().Format("2006-01-02")
@@ -142,7 +145,7 @@ func (s *MarketService) detectAndRebase(market, symbol string, fresh []datasourc
 		return false
 	}
 	var rows []model.DailyBar
-	if err := common.DB.Select("trade_date", "close").
+	if err := common.DB.WithContext(ctx).Select("trade_date", "close").
 		Where("symbol = ? AND market = ? AND trade_date IN ?", symbol, market, sampleDates(dates, rebaseSamplePoints)).
 		Find(&rows).Error; err != nil || len(rows) == 0 {
 		return false
@@ -155,11 +158,13 @@ func (s *MarketService) detectAndRebase(market, symbol string, fresh []datasourc
 	if !mismatch {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	rebaseCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if err := s.rebaseStock(ctx, market, symbol, fresh); err != nil {
+	if err := s.rebaseStock(rebaseCtx, market, symbol, fresh); err != nil {
 		common.SysWarn("检测到除权 %s.%s（%s close 偏差）但重锚失败: %v；已标记待初始化任务重拉", market, symbol, day, err)
-		s.markStatePending(market, symbol)
+		if ctx.Err() == nil {
+			s.markStatePending(ctx, market, symbol)
+		}
 		return false
 	}
 	common.SysLog("检测到除权/送转 %s.%s（%s close 偏差超 %.1f%%），已全量重锚", market, symbol, day, rebaseTolerance*100)
@@ -204,7 +209,7 @@ func (s *MarketService) rebaseStock(ctx context.Context, market, symbol string, 
 	if len(rows) == 0 {
 		return errors.New("重拉序列无有效交易日")
 	}
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
+	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// 整股删+插：窗口之外的更老数据已无法对齐新基准，留着就是断层毒数据；
 		// 因子宽表/筹码/回测的窗口均 ≤250 日，删除不损失有效信息。
 		if err := tx.Where("symbol = ? AND market = ?", symbol, market).Delete(&model.DailyBar{}).Error; err != nil {
@@ -216,7 +221,7 @@ func (s *MarketService) rebaseStock(ctx context.Context, market, symbol string, 
 		return err
 	}
 	last := rows[len(rows)-1]
-	s.touchStateAfterRebase(market, symbol, len(rows), last.TradeDate)
+	s.touchStateAfterRebase(ctx, market, symbol, len(rows), last.TradeDate)
 	return nil
 }
 
@@ -235,9 +240,9 @@ func (s *MarketService) wideDailyBars(ctx context.Context, market, symbol string
 
 // touchStateAfterRebase 重锚成功后更新宇宙状态（无 states 行的标的如 ETF 静默跳过——
 // adjust_epoch 是审计字段，不影响正确性）。
-func (s *MarketService) touchStateAfterRebase(market, symbol string, barsCount int, lastDate string) {
+func (s *MarketService) touchStateAfterRebase(ctx context.Context, market, symbol string, barsCount int, lastDate string) {
 	today := time.Now().Format("2006-01-02")
-	common.DB.Model(&model.MarketSyncState{}).
+	common.DB.WithContext(ctx).Model(&model.MarketSyncState{}).
 		Where("symbol = ? AND market = ?", symbol, market).
 		Updates(map[string]any{
 			"adjust_epoch": today, "bars_count": barsCount, "last_bar_date": lastDate,
@@ -246,8 +251,8 @@ func (s *MarketService) touchStateAfterRebase(market, symbol string, barsCount i
 }
 
 // markStatePending 重锚失败时把标的踢回 pending，让历史初始化任务下轮全量重拉修复断层。
-func (s *MarketService) markStatePending(market, symbol string) {
-	common.DB.Model(&model.MarketSyncState{}).
+func (s *MarketService) markStatePending(ctx context.Context, market, symbol string) {
+	common.DB.WithContext(ctx).Model(&model.MarketSyncState{}).
 		Where("symbol = ? AND market = ?", symbol, market).
 		Updates(map[string]any{"init_status": "pending", "fail_count": 0})
 }
@@ -416,7 +421,7 @@ func (s *MarketService) rebaseSuspects(ctx context.Context, rows []datasource.Sp
 		}
 		if err := s.rebaseStock(ctx, "cn", sym, nil); err != nil {
 			common.SysWarn("除权重锚失败 cn.%s: %v；已标记待初始化任务重拉", sym, err)
-			s.markStatePending("cn", sym)
+			s.markStatePending(ctx, "cn", sym)
 		} else {
 			rebased++
 		}
@@ -585,7 +590,7 @@ loop:
 				srcFailStreak = 0
 				// 落库失败不标 done：否则该股永久缺口（宽表/因子/回测都读不到）。
 				// 保持 pending，走 recordFail 计一次尝试，下一轮 job/手动重试。
-				if perr := s.persistDailyBars("cn", st.Symbol, bars); perr != nil { // 内部含除权检测：有旧基准数据时自动全量重锚
+				if perr := s.persistDailyBars(ctx, "cn", st.Symbol, bars); perr != nil { // 内部含除权检测：有旧基准数据时自动全量重锚
 					recordFail(st, perr.Error())
 					break
 				}

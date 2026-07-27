@@ -107,7 +107,7 @@ func TestCalibTierMonotone(t *testing.T) {
 
 func cleanCalibTables(t *testing.T) {
 	t.Helper()
-	tables := []string{"recommendation_labels", "recommendations", "analysis_records", "daily_bars"}
+	tables := []string{"recommendation_labels", "recommendation_candidate_events", "recommendations", "analysis_records", "daily_bars"}
 	wipe := func() {
 		for _, tbl := range tables {
 			common.DB.Exec("DELETE FROM " + tbl)
@@ -421,8 +421,8 @@ func TestRunLLMCalibrationCacheAndShape(t *testing.T) {
 
 // ---------- 第五十六批②：原始置信度双口径 ----------
 
-// TestSnapshotRawConfidence 快照点语义：复核改写前快照原值；已有快照幂等不覆盖；
-// 与 applyReviews 组合后 Confidence 被压 25 而 RawConfidence 保留 85（分界成立）。
+// TestSnapshotRawConfidence 快照点语义：复核改写前同时快照动作与置信度；已有快照
+// 幂等不覆盖；与 applyReviews 组合后最终 buy→watch，而原始快照保持 buy/原置信度。
 func TestSnapshotRawConfidence(t *testing.T) {
 	picks := []recPick{
 		{Symbol: "600000", Action: model.RecActionBuy, Confidence: 85},
@@ -432,48 +432,57 @@ func TestSnapshotRawConfidence(t *testing.T) {
 	if picks[0].RawConfidence == nil || *picks[0].RawConfidence != 85 {
 		t.Fatalf("快照应记录复核前置信度: %+v", picks[0].RawConfidence)
 	}
+	if picks[0].RawAction == nil || *picks[0].RawAction != model.RecActionBuy {
+		t.Fatalf("快照应记录复核前动作: %+v", picks[0].RawAction)
+	}
 	// 幂等：二次调用不覆盖（防 repair 重入等异常路径把改写后值误当原始值）。
 	picks[0].Confidence = 25
+	picks[0].Action = model.RecActionWatch
 	snapshotRawConfidence(picks)
-	if *picks[0].RawConfidence != 85 {
-		t.Fatalf("已有快照不得被二次快照覆盖: %d", *picks[0].RawConfidence)
+	if *picks[0].RawConfidence != 85 || *picks[0].RawAction != model.RecActionBuy {
+		t.Fatalf("已有快照不得被二次快照覆盖: action=%s confidence=%d", *picks[0].RawAction, *picks[0].RawConfidence)
 	}
-	// 与复核级联组合：reject 压 25 后原值仍在——「原始 vs 终值」分界的落点。
+	// 与复核级联组合：reject 后最终 watch/25，原始 buy/70 仍在。
 	out := applyReviews(picks, []pickReview{{Symbol: "000001", Verdict: "reject", Confidence: 0}})
-	if out[1].Confidence != 25 || out[1].RawConfidence == nil || *out[1].RawConfidence != 70 {
-		t.Fatalf("reject 级联后终值 25、原始快照应保留 70: conf=%d raw=%v", out[1].Confidence, out[1].RawConfidence)
+	if out[1].Action != model.RecActionWatch || out[1].Confidence != 25 ||
+		out[1].RawAction == nil || *out[1].RawAction != model.RecActionBuy ||
+		out[1].RawConfidence == nil || *out[1].RawConfidence != 70 {
+		t.Fatalf("reject 后应为最终 watch/25、原始 buy/70: %+v", out[1])
 	}
-	// 模型自附 raw_confidence 剥除（服务端快照字段不可伪造）。
+	// 模型自附 raw_action/raw_confidence 均剥除（服务端快照字段不可伪造）。
 	fake := 99
-	p := normalizePick(recPick{Action: model.RecActionBuy, Confidence: 60, RawConfidence: &fake},
+	fakeAction := model.RecActionWatch
+	p := normalizePick(recPick{Action: model.RecActionBuy, Confidence: 60, RawAction: &fakeAction, RawConfidence: &fake},
 		"600036", candidate{Symbol: "600036", Price: 10})
-	if p.RawConfidence != nil {
-		t.Fatalf("normalizePick 应剥除模型自附 raw_confidence: %v", *p.RawConfidence)
+	if p.RawAction != nil || p.RawConfidence != nil {
+		t.Fatalf("normalizePick 应剥除模型自附 raw 字段: action=%v confidence=%v", p.RawAction, p.RawConfidence)
 	}
 }
 
 // TestCalibRawSummary 双口径分列验算：有快照（diverged/一致）、无快照（missing）、
-// watch 不进；门槛与主口径一致（≥ calibEvalMinSample 才产出 Brier/ECE）。
+// 原始 watch 不进；门槛与主口径一致（≥ calibEvalMinSample 才产出 Brier/ECE）。
 func TestCalibRawSummary(t *testing.T) {
 	iptr := func(v int) *int { return &v }
-	mk := func(action string, conf int, raw *int, hit bool) calibSample {
+	sptr := func(v string) *string { return &v }
+	mk := func(action string, rawAction *string, conf int, raw *int, hit bool) calibSample {
 		net := -1.0
 		if hit {
 			net = 1
 		}
 		return calibSample{
 			label: model.RecommendationLabel{Action: action, NetReturnPct: net},
-			meta:  calibRecMeta{conf: conf, rawConf: raw},
+			meta:  calibRecMeta{conf: conf, rawAction: rawAction, rawConf: raw},
 		}
 	}
 	samples := []calibSample{
-		mk(model.RecActionBuy, 25, iptr(85), false),  // 被复核压 25：diverged
-		mk(model.RecActionBuy, 70, iptr(70), true),   // 未改写：一致
-		mk(model.RecActionBuy, 80, nil, true),        // 旧记录：missing
-		mk(model.RecActionWatch, 60, iptr(60), true), // watch 不进（buy 口径）
+		mk(model.RecActionWatch, sptr(model.RecActionBuy), 25, iptr(85), false), // 真实 reject：原始 buy→最终 watch
+		mk(model.RecActionBuy, sptr(model.RecActionBuy), 70, iptr(70), true),    // 未改写：一致
+		mk(model.RecActionBuy, nil, 80, nil, true),                              // 旧记录：按最终 buy 回退，confidence missing
+		mk(model.RecActionWatch, sptr(model.RecActionBuy), 25, nil, false),      // 历史 reject：动作可回填、置信度缺失
+		mk(model.RecActionBuy, sptr(model.RecActionWatch), 60, iptr(60), true),  // 原始 watch：即使最终 buy 也不进
 	}
 	raw := calibRawSummary(samples)
-	if raw.Sample != 2 || raw.Missing != 1 || raw.Diverged != 1 {
+	if raw.Sample != 2 || raw.Missing != 2 || raw.Diverged != 2 {
 		t.Fatalf("分列计数不符: %+v", raw)
 	}
 	if raw.Brier != nil || raw.ECE != nil {
@@ -483,7 +492,7 @@ func TestCalibRawSummary(t *testing.T) {
 	// diverged——原始口径的 Brier 不吃终值，这正是双口径要测的分界）。
 	big := make([]calibSample, 0, calibEvalMinSample)
 	for i := 0; i < calibEvalMinSample; i++ {
-		big = append(big, mk(model.RecActionBuy, 25, iptr(80), true))
+		big = append(big, mk(model.RecActionWatch, sptr(model.RecActionBuy), 25, iptr(80), true))
 	}
 	raw = calibRawSummary(big)
 	if raw.Sample != calibEvalMinSample || raw.Diverged != calibEvalMinSample {
@@ -494,33 +503,42 @@ func TestCalibRawSummary(t *testing.T) {
 	}
 }
 
-// TestRecCalibReportRawCalibEndToEnd DB 端到端：DetailJSON 带 raw_confidence 的新记录
-// 与不带的旧记录混合——raw_calib 分列如实（新 2 其中 1 diverged、旧 1 missing），
-// 主口径 Brier/ECE 继续吃终值列不受影响。
+// TestRecCalibReportRawCalibEndToEnd DB 端到端：真实 buy→reject 以最终 watch 落标签，
+// DetailJSON 保留 raw_action/raw_confidence；并验证旧记录无 raw 字段的回退兼容。
 func TestRecCalibReportRawCalibEndToEnd(t *testing.T) {
 	setupTestDB(t)
 	cleanCalibTables(t)
-	seed := func(recID int64, conf int, detail string, net float64) {
+	seed := func(recID int64, action string, conf int, detail string, net float64) {
 		if err := common.DB.Create(&model.Recommendation{
 			ID: recID, BatchID: 1, UserID: 1, Symbol: "600000", Market: "cn",
-			Action: model.RecActionBuy, Confidence: conf, DetailJSON: detail,
+			Action: action, Confidence: conf, DetailJSON: detail,
 		}).Error; err != nil {
 			t.Fatalf("seed rec: %v", err)
 		}
 		if err := common.DB.Create(&model.RecommendationLabel{
 			RecommendationID: recID, HorizonDays: 10, EntryMode: model.EntryModeNextOpen,
-			Type: model.RecTypeShortTerm, Action: model.RecActionBuy,
+			Type: model.RecTypeShortTerm, Action: action,
 			NetReturnPct: net, GrossReturnPct: net + 0.4,
 			MaturityStatus: model.LabelMatured, LabelVersion: labelVersion,
 		}).Error; err != nil {
 			t.Fatalf("seed label: %v", err)
 		}
 	}
-	seed(1, 25, `{"sys_confidence":"low","raw_confidence":85}`, -2) // 复核压 25：diverged
-	seed(2, 70, `{"sys_confidence":"high","raw_confidence":70}`, 3) // 一致
-	seed(3, 80, `{"sys_confidence":"high"}`, 3)                     // 旧记录无快照
+	seed(1, model.RecActionWatch, 25, `{"sys_confidence":"low","raw_action":"buy","raw_confidence":85}`, -2)
 
+	// 全部原始 buy 均被 reject 时最终 buy 池为空，raw_calib 仍必须输出。
 	rep, err := buildRecCalibReport(model.RecTypeShortTerm, 10)
+	if err != nil {
+		t.Fatalf("build reject-only report: %v", err)
+	}
+	if rep.BuySample != 0 || rep.RawCalib == nil || rep.RawCalib.Sample != 1 || rep.RawCalib.Diverged != 1 {
+		t.Fatalf("reject-only 仍应保留原始 buy 校准: %+v", rep)
+	}
+
+	seed(2, model.RecActionBuy, 70, `{"sys_confidence":"high","raw_action":"buy","raw_confidence":70}`, 3)
+	seed(3, model.RecActionBuy, 80, `{"sys_confidence":"high"}`, 3) // 旧记录无快照：按最终 buy 回退
+
+	rep, err = buildRecCalibReport(model.RecTypeShortTerm, 10)
 	if err != nil {
 		t.Fatalf("buildRecCalibReport: %v", err)
 	}
@@ -534,7 +552,7 @@ func TestRecCalibReportRawCalibEndToEnd(t *testing.T) {
 		t.Fatalf("快照样本 2 < 门槛不得产出原始口径 Brier: %+v", rep.RawCalib)
 	}
 	// raw_confidence=0 是合法值域（非 missing）：终值 0 vs 原始 0 一致。
-	seed(4, 0, `{"sys_confidence":"low","raw_confidence":0}`, -1)
+	seed(4, model.RecActionBuy, 0, `{"sys_confidence":"low","raw_action":"buy","raw_confidence":0}`, -1)
 	rep, err = buildRecCalibReport(model.RecTypeShortTerm, 10)
 	if err != nil {
 		t.Fatalf("rebuild: %v", err)
@@ -549,5 +567,109 @@ func TestRecCalibReportRawCalibEndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(joined, "双口径") || strings.Contains(joined, "口径限制（如实声明）") {
 		t.Fatalf("Notes 应换双口径声明: %s", joined)
+	}
+}
+
+// TestRecCalibReportLegacyRawActionFromPickedEvent 历史记录只有 raw_confidence、没有
+// raw_action 时，以同 batch+symbol 的 picked 事件 RawAction 还原复核前动作。
+func TestRecCalibReportLegacyRawActionFromPickedEvent(t *testing.T) {
+	setupTestDB(t)
+	cleanCalibTables(t)
+
+	const (
+		recID   int64 = 101
+		batchID int64 = 77
+		symbol        = "600777"
+	)
+	if err := common.DB.Create(&model.Recommendation{
+		ID: recID, BatchID: batchID, UserID: 1, Symbol: symbol, Market: "cn",
+		Action: model.RecActionWatch, Confidence: 25,
+		DetailJSON: `{"sys_confidence":"low","raw_confidence":85}`,
+	}).Error; err != nil {
+		t.Fatalf("seed legacy recommendation: %v", err)
+	}
+	if err := common.DB.Create(&model.RecommendationLabel{
+		RecommendationID: recID, BatchID: batchID, UserID: 1, Symbol: symbol, Market: "cn",
+		HorizonDays: 10, EntryMode: model.EntryModeNextOpen, Type: model.RecTypeShortTerm,
+		Action: model.RecActionWatch, NetReturnPct: -2, GrossReturnPct: -1.6,
+		MaturityStatus: model.LabelMatured, LabelVersion: labelVersion,
+	}).Error; err != nil {
+		t.Fatalf("seed legacy label: %v", err)
+	}
+	events := []model.RecommendationCandidateEvent{
+		// 同 symbol 不同 batch 不能串到目标推荐。
+		{BatchID: batchID - 1, UserID: 1, Symbol: symbol, Market: "cn", CandidateStage: model.CandStagePicked, RawAction: model.RecActionWatch},
+		// 同 batch+symbol 但非 picked 也不能作为原动作来源。
+		{BatchID: batchID, UserID: 1, Symbol: symbol, Market: "cn", CandidateStage: model.CandStageLLMList, RawAction: model.RecActionWatch},
+		{BatchID: batchID, UserID: 1, Symbol: symbol, Market: "cn", CandidateStage: model.CandStagePicked,
+			RawAction: model.RecActionBuy, PostGateAction: model.RecActionWatch},
+	}
+	if err := common.DB.Create(&events).Error; err != nil {
+		t.Fatalf("seed candidate events: %v", err)
+	}
+
+	rep, err := buildRecCalibReport(model.RecTypeShortTerm, 10)
+	if err != nil {
+		t.Fatalf("build legacy report: %v", err)
+	}
+	if rep.BuySample != 0 {
+		t.Fatalf("最终 watch 不应进入主 buy 校准，得到 %d", rep.BuySample)
+	}
+	if rep.RawCalib == nil || rep.RawCalib.Sample != 1 || rep.RawCalib.Missing != 0 || rep.RawCalib.Diverged != 1 {
+		t.Fatalf("历史原始 buy 应由 picked 事件回填并计入 raw 校准: %+v", rep.RawCalib)
+	}
+
+	// 权威 picked 事件也缺失时维持旧行为：回退最终 watch，不硬造原始 buy。
+	if err := common.DB.Delete(&model.RecommendationCandidateEvent{}, events[2].ID).Error; err != nil {
+		t.Fatalf("delete target picked event: %v", err)
+	}
+	rep, err = buildRecCalibReport(model.RecTypeShortTerm, 10)
+	if err != nil {
+		t.Fatalf("rebuild legacy report without picked event: %v", err)
+	}
+	if rep.RawCalib != nil {
+		t.Fatalf("缺 picked 事件时应回退最终 watch，不得伪造 raw buy: %+v", rep.RawCalib)
+	}
+}
+
+// TestRecCalibReportLegacyActionDivergesWithoutRawConfidence 覆盖更早期的历史记录：
+// picked 事件能还原原始 buy，但 DetailJSON 没有 raw_confidence。它应同时计入 missing
+// 与动作 diverged，不能因为缺置信度就漏掉复核改写事实。
+func TestRecCalibReportLegacyActionDivergesWithoutRawConfidence(t *testing.T) {
+	setupTestDB(t)
+	cleanCalibTables(t)
+
+	const (
+		recID   int64 = 102
+		batchID int64 = 78
+		symbol        = "600778"
+	)
+	if err := common.DB.Create(&model.Recommendation{
+		ID: recID, BatchID: batchID, UserID: 1, Symbol: symbol, Market: "cn",
+		Action: model.RecActionWatch, Confidence: 25, DetailJSON: `{"sys_confidence":"low"}`,
+	}).Error; err != nil {
+		t.Fatalf("seed legacy recommendation: %v", err)
+	}
+	if err := common.DB.Create(&model.RecommendationLabel{
+		RecommendationID: recID, BatchID: batchID, UserID: 1, Symbol: symbol, Market: "cn",
+		HorizonDays: 10, EntryMode: model.EntryModeNextOpen, Type: model.RecTypeShortTerm,
+		Action: model.RecActionWatch, NetReturnPct: -2, GrossReturnPct: -1.6,
+		MaturityStatus: model.LabelMatured, LabelVersion: labelVersion,
+	}).Error; err != nil {
+		t.Fatalf("seed legacy label: %v", err)
+	}
+	if err := common.DB.Create(&model.RecommendationCandidateEvent{
+		BatchID: batchID, UserID: 1, Symbol: symbol, Market: "cn", CandidateStage: model.CandStagePicked,
+		RawAction: model.RecActionBuy, PostGateAction: model.RecActionWatch,
+	}).Error; err != nil {
+		t.Fatalf("seed picked event: %v", err)
+	}
+
+	rep, err := buildRecCalibReport(model.RecTypeShortTerm, 10)
+	if err != nil {
+		t.Fatalf("build legacy report: %v", err)
+	}
+	if rep.RawCalib == nil || rep.RawCalib.Sample != 0 || rep.RawCalib.Missing != 1 || rep.RawCalib.Diverged != 1 {
+		t.Fatalf("缺 raw confidence 仍应记录动作分歧: %+v", rep.RawCalib)
 	}
 }

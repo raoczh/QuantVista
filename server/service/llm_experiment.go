@@ -13,6 +13,8 @@ import (
 	"quantvista/common"
 	"quantvista/model"
 	"quantvista/setting"
+
+	"gorm.io/gorm/clause"
 )
 
 // P2-1 champion/challenger prompt 实验 + P2-2 hypothesis→experiment→feedback
@@ -56,6 +58,196 @@ const (
 // llmExperimentSupportedModules 业务模块 → prompt 模块（PromptTemplate.module）。
 var llmExperimentSupportedModules = map[string]string{
 	"recommendation": "recommend",
+}
+
+const (
+	llmExperimentBaselineVersionV1 = 1
+	llmExperimentBaselineVersion   = 2
+)
+
+// experimentPromptBaseline 是某一时刻真实生效的 L3 champion 快照。Row 同时保留底层
+// 模板行的 CAS 锚；默认态可有一条 disabled 行，但它不改变 Custom/Content/Hash。
+type experimentPromptBaseline struct {
+	Custom          bool
+	Content         string
+	Hash            string
+	Version         string
+	Revision        int
+	Generation      int64
+	GenerationKnown bool
+	Row             *model.PromptTemplate
+}
+
+func loadExperimentPromptBaseline(db *gorm.DB, userID int64, promptModule string) (*experimentPromptBaseline, error) {
+	return loadExperimentPromptBaselineMode(db, userID, promptModule, false)
+}
+
+func lockExperimentPromptBaseline(db *gorm.DB, userID int64, promptModule string) (*experimentPromptBaseline, error) {
+	return loadExperimentPromptBaselineMode(db, userID, promptModule, true)
+}
+
+func loadExperimentPromptBaselineMode(db *gorm.DB, userID int64, promptModule string, lock bool) (*experimentPromptBaseline, error) {
+	var generation int64
+	var generationKnown bool
+	if lock {
+		state, err := lockPromptChampionState(db, userID, promptModule)
+		if err != nil {
+			return nil, err
+		}
+		generation, generationKnown = state.Generation, true
+	} else {
+		generation, generationKnown = promptChampionGeneration(db, userID, promptModule)
+	}
+	var row model.PromptTemplate
+	err := db.Where("user_id = ? AND module = ?", userID, promptModule).First(&row).Error
+	var rowPtr *model.PromptTemplate
+	switch {
+	case err == nil:
+		rowPtr = &row
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		// 默认态允许没有模板行。
+	default:
+		return nil, err
+	}
+
+	b := &experimentPromptBaseline{Row: rowPtr, Generation: generation, GenerationKnown: generationKnown}
+	if rowPtr != nil && rowPtr.Enabled {
+		b.Custom = true
+		b.Content = strings.TrimSpace(rowPtr.Content)
+		b.Revision = rowPtr.Revision
+	} else {
+		content, ok := promptModuleDefaultTaskSegs[promptModule]
+		if !ok || strings.TrimSpace(content) == "" {
+			return nil, fmt.Errorf("模块 %s 缺少默认任务段，无法固化实验基线", promptModule)
+		}
+		b.Content = content
+	}
+	b.Hash = promptContentHash(b.Content)
+	pr := promptRuntime{Module: promptModule, Custom: b.Custom, Raw: b.Content, Hash: b.Hash,
+		Revision: b.Revision, Generation: b.Generation, GenerationKnown: b.GenerationKnown}
+	b.Version = pr.Version(recPromptVersion)
+	return b, nil
+}
+
+func experimentPromptBaselineFromRuntime(pr promptRuntime, promptModule string) (*experimentPromptBaseline, error) {
+	b := &experimentPromptBaseline{Custom: pr.Custom, Revision: pr.Revision,
+		Generation: pr.Generation, GenerationKnown: pr.GenerationKnown}
+	if pr.Custom {
+		b.Content = strings.TrimSpace(pr.Raw)
+	} else {
+		content, ok := promptModuleDefaultTaskSegs[promptModule]
+		if !ok || strings.TrimSpace(content) == "" {
+			return nil, fmt.Errorf("模块 %s 缺少默认任务段，无法校验实验基线", promptModule)
+		}
+		b.Content = content
+	}
+	b.Hash = promptContentHash(b.Content)
+	b.Version = promptRuntime{Module: promptModule, Custom: b.Custom, Raw: b.Content,
+		Hash: b.Hash, Revision: b.Revision}.Version(recPromptVersion)
+	return b, nil
+}
+
+func experimentExpectedChampionCustom(exp *model.LLMExperiment) bool {
+	if exp.BaselineVersion >= llmExperimentBaselineVersionV1 {
+		return exp.ChampionCustom
+	}
+	// 旧行没有 ChampionCustom；历史版本串是唯一可靠的形态信号。
+	return strings.Contains(exp.ChampionVersion, "-custom")
+}
+
+func experimentExpectedChampionHash(exp *model.LLMExperiment) string {
+	if exp.ChampionHash != "" {
+		return exp.ChampionHash
+	}
+	if strings.TrimSpace(exp.ChampionContent) != "" {
+		return promptContentHash(exp.ChampionContent)
+	}
+	// 最老的默认态实验没有正文锚，只能按当前内置段兼容；新格式不再进入此分支。
+	return promptContentHash(promptModuleDefaultTaskSegs[exp.PromptModule])
+}
+
+func experimentBaselineStaleReason(exp *model.LLMExperiment, current *experimentPromptBaseline) string {
+	if strings.TrimSpace(exp.BaselineInvalidReason) != "" {
+		return exp.BaselineInvalidReason
+	}
+	if exp.BaselineVersion < llmExperimentBaselineVersion {
+		return fmt.Sprintf("实验基线格式 v%d 缺少单调 champion generation，无法证明运行期未发生 A→B→A；请重建实验",
+			exp.BaselineVersion)
+	}
+	expectedCustom := experimentExpectedChampionCustom(exp)
+	if current.Custom != expectedCustom {
+		return fmt.Sprintf("champion 形态已从创建时的 custom=%v 变为 custom=%v", expectedCustom, current.Custom)
+	}
+	expectedHash := experimentExpectedChampionHash(exp)
+	if expectedHash == "" || current.Hash != expectedHash {
+		return fmt.Sprintf("champion 内容已偏离创建基线（期望 hash=%s，当前 hash=%s）", expectedHash, current.Hash)
+	}
+	if exp.BaselineVersion >= llmExperimentBaselineVersionV1 {
+		if current.Version != exp.ChampionVersion {
+			return fmt.Sprintf("champion 系统版本已变化（期望 %s，当前 %s）", exp.ChampionVersion, current.Version)
+		}
+		// 自定义模板 revision 是不可洗回的历史锚：A→B→A 虽内容 hash 恢复，revision 已前移。
+		if expectedCustom && current.Revision != exp.ChampionRevision {
+			return fmt.Sprintf("champion revision 已从 %d 前移到 %d（曾发生运行期编辑）",
+				exp.ChampionRevision, current.Revision)
+		}
+	}
+	if current.GenerationKnown && current.Generation != exp.ChampionGeneration {
+		return fmt.Sprintf("champion generation 已从 %d 前移到 %d（曾发生内容、启停或删除变化）",
+			exp.ChampionGeneration, current.Generation)
+	}
+	return ""
+}
+
+func markExperimentBaselineInvalid(db *gorm.DB, exp *model.LLMExperiment, reason string) {
+	reason = truncateRunes(strings.TrimSpace(reason), 500)
+	if reason == "" {
+		return
+	}
+	res := db.Model(&model.LLMExperiment{}).
+		Where("id = ? AND (baseline_invalid_reason = '' OR baseline_invalid_reason IS NULL)", exp.ID).
+		Update("baseline_invalid_reason", reason)
+	if res.Error != nil {
+		common.SysWarn("实验基线失效标记写入失败 exp=%d: %v", exp.ID, res.Error)
+		return
+	}
+	exp.BaselineInvalidReason = reason
+}
+
+func validateExperimentCurrentBaseline(db *gorm.DB, exp *model.LLMExperiment) (*experimentPromptBaseline, string, error) {
+	current, err := lockExperimentPromptBaseline(db, exp.UserID, exp.PromptModule)
+	if err != nil {
+		return nil, "", err
+	}
+	return current, experimentBaselineStaleReason(exp, current), nil
+}
+
+func lockExperimentRow(tx *gorm.DB, id int64, exp *model.LLMExperiment) error {
+	q := tx
+	if tx.Dialector.Name() != "sqlite" {
+		q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	return q.First(exp, id).Error
+}
+
+func lockExperimentModule(tx *gorm.DB, module string) error {
+	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&model.LLMExperimentModuleLock{
+		Module: module,
+	}).Error; err != nil {
+		return err
+	}
+	var slot model.LLMExperimentModuleLock
+	q := tx.Where("module = ?", module)
+	if tx.Dialector.Name() != "sqlite" {
+		q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	return q.First(&slot).Error
+}
+
+type experimentBaselineStaleError struct{ reason string }
+
+func (e *experimentBaselineStaleError) Error() string {
+	return "实验 champion 基线已失效：" + e.reason + "；请基于当前 champion 重建实验"
 }
 
 // LLMExperimentInput 创建入参。
@@ -107,24 +299,27 @@ func CreateLLMExperiment(userID int64, in LLMExperimentInput) (*model.LLMExperim
 		target = llmExperimentTargetMax
 	}
 
-	champ := loadPromptRuntime(userID, promptModule)
-	// champion 基线内容当场固化（P2-6 审查修复批）：自定义态=当时启用模板内容；默认态=
-	// 实际的内置任务段（promptModuleDefaultTaskSegs，不用占位说明冒充）。发布审计与
-	// promote 门恒对照此锚——创建后 champion 被编辑不改变实验的对照基准，只会被
-	// 基线漂移校验拦下（单变量复核的稳定依据）。
-	champContent := champ.Raw
-	if !champ.Custom {
-		champContent = promptModuleDefaultTaskSegs[promptModule]
-	}
-	exp := &model.LLMExperiment{
-		UserID: userID, Module: in.Module, PromptModule: promptModule,
-		Name: name, Hypothesis: hypo, ExpectedImprovement: expect,
-		ChallengerContent: content, ChallengerHash: promptContentHash(content),
-		ChampionVersion: champ.Version(recPromptVersion), ChampionHash: champ.Hash,
-		ChampionContent: champContent,
-		Status:          model.ExpStatusDraft, SampleTarget: target, ParentID: in.ParentID,
-	}
-	if err := common.DB.Create(exp).Error; err != nil {
+	promptExperimentStateMu.Lock()
+	defer promptExperimentStateMu.Unlock()
+	var exp *model.LLMExperiment
+	err := common.DB.Transaction(func(tx *gorm.DB) error {
+		champ, err := lockExperimentPromptBaseline(tx, userID, promptModule)
+		if err != nil {
+			return fmt.Errorf("读取 champion 基线失败: %v", err)
+		}
+		exp = &model.LLMExperiment{
+			UserID: userID, Module: in.Module, PromptModule: promptModule,
+			Name: name, Hypothesis: hypo, ExpectedImprovement: expect,
+			ChallengerContent: content, ChallengerHash: promptContentHash(content),
+			ChampionVersion: champ.Version, ChampionHash: champ.Hash,
+			ChampionCustom: champ.Custom, ChampionRevision: champ.Revision,
+			ChampionGeneration: champ.Generation,
+			ChampionContent:    champ.Content, BaselineVersion: llmExperimentBaselineVersion,
+			Status: model.ExpStatusDraft, SampleTarget: target, ParentID: in.ParentID,
+		}
+		return tx.Create(exp).Error
+	})
+	if err != nil {
 		return nil, nil, err
 	}
 	return exp, lintPromptContent(promptModule, content), nil
@@ -134,25 +329,55 @@ func CreateLLMExperiment(userID int64, in LLMExperimentInput) (*model.LLMExperim
 // 实验（两个 challenger 并行会互抢影子流量且无法归因）。
 func StartLLMExperiment(id int64) (*model.LLMExperiment, error) {
 	var exp model.LLMExperiment
-	if err := common.DB.First(&exp, id).Error; err != nil {
-		return nil, errors.New("实验不存在")
-	}
-	if exp.Status != model.ExpStatusDraft {
-		return nil, fmt.Errorf("仅 draft 可启动（当前 %s）", exp.Status)
-	}
-	var running int64
-	if err := common.DB.Model(&model.LLMExperiment{}).
-		Where("module = ? AND status = ?", exp.Module, model.ExpStatusRunning).
-		Count(&running).Error; err != nil {
-		return nil, err
-	}
-	if running > 0 {
-		return nil, errors.New("该模块已有 running 实验（单变量纪律：一个模块同时只跑一个 challenger）")
-	}
-	now := time.Now()
-	exp.Status = model.ExpStatusRunning
-	exp.StartedAt = &now
-	if err := common.DB.Save(&exp).Error; err != nil {
+	var staleReason string
+	err := withPromptExperimentState(func() error {
+		return common.DB.Transaction(func(tx *gorm.DB) error {
+			if err := lockExperimentRow(tx, id, &exp); err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return errors.New("实验不存在")
+				}
+				return err
+			}
+			if exp.Status != model.ExpStatusDraft {
+				return fmt.Errorf("仅 draft 可启动（当前 %s）", exp.Status)
+			}
+			if err := lockExperimentModule(tx, exp.Module); err != nil {
+				return err
+			}
+			if _, reason, err := validateExperimentCurrentBaseline(tx, &exp); err != nil {
+				return fmt.Errorf("校验 champion 基线失败: %v", err)
+			} else if reason != "" {
+				staleReason = reason
+				return &experimentBaselineStaleError{reason: reason}
+			}
+			var running int64
+			if err := tx.Model(&model.LLMExperiment{}).
+				Where("module = ? AND status = ?", exp.Module, model.ExpStatusRunning).
+				Count(&running).Error; err != nil {
+				return err
+			}
+			if running > 0 {
+				return errors.New("该模块已有 running 实验（单变量纪律：一个模块同时只跑一个 challenger）")
+			}
+			now := time.Now()
+			res := tx.Model(&model.LLMExperiment{}).
+				Where("id = ? AND status = ? AND (baseline_invalid_reason = '' OR baseline_invalid_reason IS NULL)",
+					exp.ID, model.ExpStatusDraft).
+				Updates(map[string]any{"status": model.ExpStatusRunning, "started_at": now})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return errors.New("实验状态或 champion 基线已被并发修改，请刷新后重试")
+			}
+			exp.Status, exp.StartedAt = model.ExpStatusRunning, &now
+			return nil
+		})
+	})
+	if err != nil {
+		if staleReason != "" && exp.ID > 0 {
+			markExperimentBaselineInvalid(common.DB, &exp, staleReason)
+		}
 		return nil, err
 	}
 	if !setting.LLMChallenger() {
@@ -219,13 +444,6 @@ func aggregateExperimentRuns(runs []model.LLMExperimentRun) llmExperimentActual 
 // CompleteLLMExperiment running→completed（P2-2 反馈闭环）：聚合影子样本进 ActualJSON，
 // 管理员按报表判定结论；非 improved 必须写失败原因（失败原因是飞轮资产）。
 func CompleteLLMExperiment(id int64, conclusion, failureReason string) (*model.LLMExperiment, error) {
-	var exp model.LLMExperiment
-	if err := common.DB.First(&exp, id).Error; err != nil {
-		return nil, errors.New("实验不存在")
-	}
-	if exp.Status != model.ExpStatusRunning {
-		return nil, fmt.Errorf("仅 running 可完成（当前 %s）", exp.Status)
-	}
 	switch conclusion {
 	case model.ExpConcludeImproved, model.ExpConcludeNoGain, model.ExpConcludeWorse:
 	default:
@@ -235,20 +453,41 @@ func CompleteLLMExperiment(id int64, conclusion, failureReason string) (*model.L
 	if conclusion != model.ExpConcludeImproved && failureReason == "" {
 		return nil, errors.New("未达预期的实验必须记录失败原因（P2-2：失败原因是飞轮资产）")
 	}
-	var runs []model.LLMExperimentRun
-	if err := common.DB.Where("experiment_id = ?", exp.ID).Find(&runs).Error; err != nil {
-		return nil, err
-	}
-	actual := aggregateExperimentRuns(runs)
-	b, _ := json.Marshal(actual)
-	now := time.Now()
-	exp.Status = model.ExpStatusCompleted
-	exp.ActualJSON = string(b)
-	exp.Conclusion = conclusion
-	exp.FailureReason = failureReason
-	exp.SampleCount = len(runs)
-	exp.CompletedAt = &now
-	if err := common.DB.Save(&exp).Error; err != nil {
+	var exp model.LLMExperiment
+	err := withPromptExperimentState(func() error {
+		return common.DB.Transaction(func(tx *gorm.DB) error {
+			if err := lockExperimentRow(tx, id, &exp); err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return errors.New("实验不存在")
+				}
+				return err
+			}
+			if exp.Status != model.ExpStatusRunning {
+				return fmt.Errorf("仅 running 可完成（当前 %s）", exp.Status)
+			}
+			var runs []model.LLMExperimentRun
+			if err := tx.Where("experiment_id = ?", exp.ID).Find(&runs).Error; err != nil {
+				return err
+			}
+			actual := aggregateExperimentRuns(runs)
+			b, _ := json.Marshal(actual)
+			now := time.Now()
+			res := tx.Model(&model.LLMExperiment{}).Where("id = ? AND status = ?", exp.ID, model.ExpStatusRunning).
+				Updates(map[string]any{"status": model.ExpStatusCompleted, "actual_json": string(b),
+					"conclusion": conclusion, "failure_reason": failureReason, "sample_count": len(runs),
+					"completed_at": now, "updated_at": now})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return errors.New("实验状态已被并发修改，完成操作已取消")
+			}
+			exp.Status, exp.ActualJSON, exp.Conclusion = model.ExpStatusCompleted, string(b), conclusion
+			exp.FailureReason, exp.SampleCount, exp.CompletedAt = failureReason, len(runs), &now
+			return nil
+		})
+	})
+	if err != nil {
 		return nil, err
 	}
 	return &exp, nil
@@ -259,111 +498,168 @@ func CompleteLLMExperiment(id int64, conclusion, failureReason string) (*model.L
 // 任何一条不过=拒绝晋级（保持 completed，可继续 abandon 或复制新实验迭代）。
 func PromoteLLMExperiment(id int64) (*model.LLMExperiment, error) {
 	var exp model.LLMExperiment
-	if err := common.DB.First(&exp, id).Error; err != nil {
-		return nil, errors.New("实验不存在")
-	}
-	// 门 1：状态机——只有 completed（有聚合反馈）可晋级。
-	if exp.Status != model.ExpStatusCompleted {
-		return nil, fmt.Errorf("仅 completed 可晋级（当前 %s）", exp.Status)
-	}
-	// 门 2：无增量不晋级（P2-2）。
-	if exp.Conclusion != model.ExpConcludeImproved {
-		return nil, fmt.Errorf("结论为 %q：无增量不晋级", exp.Conclusion)
-	}
-	// 门 3：样本量。
-	var runs []model.LLMExperimentRun
-	if err := common.DB.Where("experiment_id = ?", exp.ID).Find(&runs).Error; err != nil {
-		return nil, err
-	}
-	if len(runs) < llmExperimentMinSamples {
-		return nil, fmt.Errorf("影子样本 %d 不足 %d，不得晋级", len(runs), llmExperimentMinSamples)
-	}
-	// 门 4：结构化有效率（从样本重算，不信 ActualJSON 自报）。
-	valid := 0
-	for _, r := range runs {
-		if r.Valid {
-			valid++
-		}
-	}
-	if rate := float64(valid) / float64(len(runs)); rate < llmExperimentMinValidRate {
-		return nil, fmt.Errorf("challenger 结构化有效率 %.0f%% 低于 %.0f%%，不得晋级",
-			rate*100, llmExperimentMinValidRate*100)
-	}
-	// 门 5：内容完整性（防实验期间被外部改库）。
-	if promptContentHash(exp.ChallengerContent) != exp.ChallengerHash {
-		return nil, errors.New("challenger 内容与创建时 hash 不符（快照被篡改），拒绝晋级")
-	}
-	// 门 5b（审查修复批）：champion 基线未漂移——实验对照的是创建时的 champion 锚，
-	// 创建后 champion 被编辑（或别的实验晋级）时影子对照与当前线上形态脱节，实验
-	// 结论不再能回答「相对当前 champion 是否有增量」，须基于新基线重建实验。
-	if h := promptTemplateRowHash(userPromptTemplateRow(exp.UserID, exp.PromptModule)); h != exp.ChampionHash {
-		return nil, errors.New("当前 champion 已不是实验创建时的对照基线（创建后模板被编辑或有其他实验晋级），实验对照失效——请基于当前 champion 重建实验")
-	}
-	// 门 6（P2-6 自动发布门）：LLM 发布审计工件必须 PASS 且审计对象与当前内容一致
-	// ——「未 PASS 不进入 synthesis」（P1-9）在此收口；审计只复核程序硬检覆盖不了的
-	// 内容性缺口（llm_release_gate.go），promote 本身仍是管理员显式动作（人工审批）。
-	audit := latestReleaseAudit(exp.ID)
-	if audit == nil {
-		return nil, errors.New("缺少发布审计工件：先在实验页运行「发布审计」（P2-6 门 6：未 PASS 不晋级）")
-	}
-	if audit.ChallengerHash != exp.ChallengerHash {
-		return nil, errors.New("最新审计工件的内容 hash 与当前 challenger 不符（内容变过须重审），拒绝晋级")
-	}
-	// 门 6b（审查修复批）：工件必须绑定实验的 champion 基线——审计消费的对照与实验锚
-	// 不一致（修复前的旧工件无绑定、或锚内容被改库）时旧 PASS 不可复用，须重审。
-	if audit.ChampionHash != promptContentHash(releaseAuditChampionContent(&exp)) {
-		return nil, errors.New("最新审计工件未绑定实验的 champion 基线（旧版工件或基线被改动），须重新运行发布审计")
-	}
-	if audit.Verdict != model.ReleaseAuditPass {
-		return nil, fmt.Errorf("最新发布审计 verdict=%s（%s）：未 PASS 不晋级", audit.Verdict, audit.Summary)
-	}
+	var staleReason string
+	err := withPromptExperimentState(func() error {
+		return common.DB.Transaction(func(tx *gorm.DB) error {
+			if err := lockExperimentRow(tx, id, &exp); err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return errors.New("实验不存在")
+				}
+				return err
+			}
+			// 门 1：状态机——只有 completed（有聚合反馈）可晋级。
+			if exp.Status != model.ExpStatusCompleted {
+				return fmt.Errorf("仅 completed 可晋级（当前 %s）", exp.Status)
+			}
+			// 门 2：无增量不晋级（P2-2）。
+			if exp.Conclusion != model.ExpConcludeImproved {
+				return fmt.Errorf("结论为 %q：无增量不晋级", exp.Conclusion)
+			}
+			// 门 3/4：从样本重算样本量与结构化有效率，不信 ActualJSON 自报。
+			var runs []model.LLMExperimentRun
+			if err := tx.Where("experiment_id = ?", exp.ID).Find(&runs).Error; err != nil {
+				return err
+			}
+			if len(runs) < llmExperimentMinSamples {
+				return fmt.Errorf("影子样本 %d 不足 %d，不得晋级", len(runs), llmExperimentMinSamples)
+			}
+			valid := 0
+			for _, r := range runs {
+				if r.Valid {
+					valid++
+				}
+			}
+			if rate := float64(valid) / float64(len(runs)); rate < llmExperimentMinValidRate {
+				return fmt.Errorf("challenger 结构化有效率 %.0f%% 低于 %.0f%%，不得晋级",
+					rate*100, llmExperimentMinValidRate*100)
+			}
+			// 门 5：challenger 快照与 champion 基线均不可漂移。
+			if promptContentHash(exp.ChallengerContent) != exp.ChallengerHash {
+				return errors.New("challenger 内容与创建时 hash 不符（快照被篡改），拒绝晋级")
+			}
+			baseline, reason, err := validateExperimentCurrentBaseline(tx, &exp)
+			if err != nil {
+				return fmt.Errorf("校验 champion 基线失败: %v", err)
+			}
+			if reason != "" {
+				staleReason = reason
+				return &experimentBaselineStaleError{reason: reason}
+			}
 
-	// 回滚锚（P2-6）：晋级瞬间固化「当时启用中的模板状态」——一键切回 champion 的依据。
-	if row := userPromptTemplateRow(exp.UserID, exp.PromptModule); row != nil {
-		exp.PrePromoteEnabled = true
-		exp.PrePromoteContent = row.Content
-	} else {
-		exp.PrePromoteEnabled = false
-		exp.PrePromoteContent = ""
-	}
+			// 门 6：最新审计工件必须 PASS，且同时绑定 challenger 与 champion 锚。
+			audit := latestReleaseAuditDB(tx, exp.ID)
+			if audit == nil {
+				return errors.New("缺少发布审计工件：先在实验页运行「发布审计」（P2-6 门 6：未 PASS 不晋级）")
+			}
+			if audit.ChallengerHash != exp.ChallengerHash {
+				return errors.New("最新审计工件的内容 hash 与当前 challenger 不符（内容变过须重审），拒绝晋级")
+			}
+			if audit.ChampionHash != promptContentHash(releaseAuditChampionContentDB(tx, &exp)) {
+				return errors.New("最新审计工件未绑定实验的 champion 基线（旧版工件或基线被改动），须重新运行发布审计")
+			}
+			if audit.Verdict != model.ReleaseAuditPass {
+				return fmt.Errorf("最新发布审计 verdict=%s（%s）：未 PASS 不晋级", audit.Verdict, audit.Summary)
+			}
 
-	// 晋级=champion 指针切换：经既有 Upsert 落为启用模板（内容 hash/revision/不可变
-	// revision 快照全走 P0-6 既有机制；契约段由 composeCustomTaskPrompt 恒追加）。
-	ps := NewPromptService()
-	tpl, _, err := ps.Upsert(exp.UserID, PromptInput{Module: exp.PromptModule, Content: exp.ChallengerContent, Enabled: true})
+			// 模板写入与实验状态共用事务。expected Row 是基线校验读取的 CAS 锚；若其后有
+			// 并发编辑，条件 UPDATE 不命中，整个事务（含 revision 快照）回滚。
+			exp.PrePromoteEnabled = baseline.Custom
+			exp.PrePromoteContent = ""
+			if baseline.Custom {
+				exp.PrePromoteContent = baseline.Content
+			}
+			module, content, hash, _, normErr := normalizePromptInput(PromptInput{
+				Module: exp.PromptModule, Content: exp.ChallengerContent, Enabled: true,
+			})
+			if normErr != nil {
+				return normErr
+			}
+			tpl, err := upsertPromptTemplateTx(tx, exp.UserID, module, content, hash, true, baseline.Row, true)
+			if err != nil {
+				return fmt.Errorf("晋级落模板失败: %v", err)
+			}
+			// 每次晋级都取得一个唯一的 champion 归属代际。通常模板内容/启用状态变化已由
+			// Upsert 推进 generation；challenger 与当前内容相同时 Upsert 是幂等 no-op，仍须
+			// 推进一步，避免后续同 hash 实验晋级后旧实验还能冒充当前回滚对象。
+			promotedState, err := lockPromptChampionState(tx, exp.UserID, exp.PromptModule)
+			if err != nil {
+				return fmt.Errorf("读取晋级 champion generation 失败: %v", err)
+			}
+			if promotedState.Generation == baseline.Generation {
+				if err := advancePromptChampionState(tx, promotedState); err != nil {
+					return fmt.Errorf("推进晋级 champion generation 失败: %v", err)
+				}
+			}
+			exp.PromotedGeneration = promotedState.Generation
+			now := time.Now()
+			res := tx.Model(&model.LLMExperiment{}).
+				Where("id = ? AND status = ? AND (baseline_invalid_reason = '' OR baseline_invalid_reason IS NULL)",
+					exp.ID, model.ExpStatusCompleted).
+				Updates(map[string]any{
+					"status": model.ExpStatusPromoted, "promoted_revision": tpl.Revision,
+					"promoted_generation": exp.PromotedGeneration,
+					"pre_promote_enabled": exp.PrePromoteEnabled, "pre_promote_content": exp.PrePromoteContent,
+					"updated_at": now,
+				})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return errors.New("实验状态或 champion 基线已被并发修改，晋级已取消")
+			}
+			exp.Status, exp.PromotedRevision = model.ExpStatusPromoted, tpl.Revision
+			return nil
+		})
+	})
 	if err != nil {
-		return nil, fmt.Errorf("晋级落模板失败: %v", err)
-	}
-	exp.Status = model.ExpStatusPromoted
-	exp.PromotedRevision = tpl.Revision
-	if err := common.DB.Save(&exp).Error; err != nil {
+		// 事务内写失效原因会随拒绝一起回滚，因此在事务外粘性落库。
+		if staleReason != "" && exp.ID > 0 {
+			markExperimentBaselineInvalid(common.DB, &exp, staleReason)
+		}
 		return nil, err
 	}
 	common.SysLog("实验 #%d 晋级：module=%s revision=%d hash=%s（回滚=实验页「一键切回 champion」）",
-		exp.ID, exp.PromptModule, tpl.Revision, exp.ChallengerHash)
+		exp.ID, exp.PromptModule, exp.PromotedRevision, exp.ChallengerHash)
 	return &exp, nil
 }
 
 // AbandonLLMExperiment 任何非 promoted 状态→abandoned（记录原因；样本保留可追溯）。
 func AbandonLLMExperiment(id int64, reason string) (*model.LLMExperiment, error) {
 	var exp model.LLMExperiment
-	if err := common.DB.First(&exp, id).Error; err != nil {
-		return nil, errors.New("实验不存在")
-	}
-	if exp.Status == model.ExpStatusPromoted {
-		return nil, errors.New("已晋级实验不可废弃（回滚走「一键切回 champion」）")
-	}
-	if exp.Status == model.ExpStatusRolledBack {
-		return nil, errors.New("已回滚实验是终态，不可废弃")
-	}
-	if exp.Status == model.ExpStatusAbandoned {
-		return &exp, nil
-	}
-	exp.Status = model.ExpStatusAbandoned
-	if r := strings.TrimSpace(reason); r != "" {
-		exp.FailureReason = r
-	}
-	if err := common.DB.Save(&exp).Error; err != nil {
+	err := withPromptExperimentState(func() error {
+		return common.DB.Transaction(func(tx *gorm.DB) error {
+			if err := lockExperimentRow(tx, id, &exp); err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return errors.New("实验不存在")
+				}
+				return err
+			}
+			if exp.Status == model.ExpStatusPromoted {
+				return errors.New("已晋级实验不可废弃（回滚走「一键切回 champion」）")
+			}
+			if exp.Status == model.ExpStatusRolledBack {
+				return errors.New("已回滚实验是终态，不可废弃")
+			}
+			if exp.Status == model.ExpStatusAbandoned {
+				return nil
+			}
+			updates := map[string]any{"status": model.ExpStatusAbandoned, "updated_at": time.Now()}
+			if r := strings.TrimSpace(reason); r != "" {
+				updates["failure_reason"] = r
+				exp.FailureReason = r
+			}
+			res := tx.Model(&model.LLMExperiment{}).Where("id = ? AND status = ?", exp.ID, exp.Status).Updates(updates)
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return errors.New("实验状态已被并发修改，废弃操作已取消")
+			}
+			exp.Status = model.ExpStatusAbandoned
+			return nil
+		})
+	})
+	if err != nil {
 		return nil, err
 	}
 	return &exp, nil
@@ -374,6 +670,7 @@ func AbandonLLMExperiment(id int64, reason string) (*model.LLMExperiment, error)
 type LLMExperimentView struct {
 	model.LLMExperiment
 	RollbackStale string `json:"rollback_stale,omitempty"`
+	BaselineStale string `json:"baseline_stale,omitempty"`
 }
 
 // ListLLMExperiments 全部实验（管理端；按 id 倒序）。
@@ -384,8 +681,18 @@ func ListLLMExperiments() ([]LLMExperimentView, error) {
 	}
 	out := make([]LLMExperimentView, 0, len(rows))
 	for i := range rows {
+		baselineStale := rows[i].BaselineInvalidReason
+		if baselineStale == "" && (rows[i].Status == model.ExpStatusDraft ||
+			rows[i].Status == model.ExpStatusRunning || rows[i].Status == model.ExpStatusCompleted) {
+			_, reason, err := validateExperimentCurrentBaseline(common.DB, &rows[i])
+			if err != nil {
+				return nil, err
+			}
+			baselineStale = reason
+		}
 		out = append(out, LLMExperimentView{
 			LLMExperiment: rows[i], RollbackStale: experimentRollbackStale(&rows[i]),
+			BaselineStale: baselineStale,
 		})
 	}
 	return out, nil
@@ -410,12 +717,18 @@ func LLMExperimentDetail(id int64) (*model.LLMExperiment, []model.LLMExperimentR
 func activeExperimentFor(module string, userID int64) *model.LLMExperiment {
 	var exp model.LLMExperiment
 	err := common.DB.Where("module = ? AND user_id = ? AND status = ? AND sample_count < sample_target",
-		module, userID, model.ExpStatusRunning).First(&exp).Error
+		module, userID, model.ExpStatusRunning).
+		Where("baseline_invalid_reason = '' OR baseline_invalid_reason IS NULL").First(&exp).Error
 	if err != nil {
 		return nil
 	}
 	return &exp
 }
+
+var (
+	errExperimentSampleClosed    = errors.New("实验已停止采样")
+	errExperimentSampleDuplicate = errors.New("同一批次已存在实验样本")
+)
 
 // maybeChallengerShadow challenger 影子采样（best-effort，任何失败只记日志/样本行，
 // 不影响业务批次）：同一批次候选名单，仅换 challenger 任务段重建消息，一次调用
@@ -431,6 +744,30 @@ func (s *RecommendationService) maybeChallengerShadow(ctx context.Context, plan 
 	}
 	exp := activeExperimentFor("recommendation", plan.userID)
 	if exp == nil {
+		return
+	}
+	// 对照主调用实际消费的 plan.prompt 快照，而不是重新读活模板。若某批主调已经用了
+	// B 版本，则即使稍后恢复 A，也必须粘性标记该实验失效且不落污染样本。
+	championBaseline, err := experimentPromptBaselineFromRuntime(plan.prompt, exp.PromptModule)
+	if err != nil {
+		common.SysWarn("实验基线快照校验失败 exp=%d: %v", exp.ID, err)
+		return
+	}
+	if reason := experimentBaselineStaleReason(exp, championBaseline); reason != "" {
+		// 业务批次可能早于实验启动：例如批次固化 A 后，管理员切到 B 并基于 B 启动
+		// 实验，随后旧批次 A 才完成。此时批次快照不属于该实验的采样窗口，只应跳过；
+		// 是否粘性失效必须以 live champion 复验，不能让旧批次误杀新实验。
+		_, liveReason, liveErr := validateExperimentCurrentBaseline(common.DB, exp)
+		if liveErr != nil {
+			common.SysWarn("实验 #%d 复验 live champion 失败，跳过本批影子采样：%v", exp.ID, liveErr)
+			return
+		}
+		if liveReason == "" {
+			common.SysLog("实验 #%d 跳过早于当前基线的旧批次：%s", exp.ID, reason)
+			return
+		}
+		markExperimentBaselineInvalid(common.DB, exp, liveReason)
+		common.SysWarn("实验 #%d 停止影子采样：live champion 基线失效：%s", exp.ID, liveReason)
 		return
 	}
 	chPr := promptRuntime{Module: exp.PromptModule, Custom: true,
@@ -488,13 +825,60 @@ func (s *RecommendationService) maybeChallengerShadow(ctx context.Context, plan 
 			}
 		}
 	}
-	if dberr := common.DB.Create(&row).Error; dberr != nil {
-		common.SysWarn("实验样本落库失败 exp=%d: %v", exp.ID, dberr)
-		return
+	var staleReason string
+	dberr := withPromptExperimentState(func() error {
+		return common.DB.Transaction(func(tx *gorm.DB) error {
+			var latest model.LLMExperiment
+			if err := lockExperimentRow(tx, exp.ID, &latest); err != nil {
+				return err
+			}
+			if latest.Status != model.ExpStatusRunning || strings.TrimSpace(latest.BaselineInvalidReason) != "" ||
+				latest.SampleCount >= latest.SampleTarget {
+				return errExperimentSampleClosed
+			}
+			if promptContentHash(latest.ChallengerContent) != latest.ChallengerHash ||
+				latest.ChallengerHash != exp.ChallengerHash {
+				return errExperimentSampleClosed
+			}
+			if _, reason, err := validateExperimentCurrentBaseline(tx, &latest); err != nil {
+				return err
+			} else if reason != "" {
+				staleReason = reason
+				return &experimentBaselineStaleError{reason: reason}
+			}
+			var existing int64
+			if err := tx.Model(&model.LLMExperimentRun{}).
+				Where("experiment_id = ? AND batch_id = ?", latest.ID, row.BatchID).
+				Count(&existing).Error; err != nil {
+				return err
+			}
+			if existing > 0 {
+				return errExperimentSampleDuplicate
+			}
+			if err := tx.Create(&row).Error; err != nil {
+				return err
+			}
+			res := tx.Model(&model.LLMExperiment{}).
+				Where("id = ? AND status = ? AND sample_count < sample_target AND (baseline_invalid_reason = '' OR baseline_invalid_reason IS NULL)",
+					latest.ID, model.ExpStatusRunning).
+				UpdateColumn("sample_count", gorm.Expr("sample_count + 1"))
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return errExperimentSampleClosed
+			}
+			return nil
+		})
+	})
+	if staleReason != "" {
+		markExperimentBaselineInvalid(common.DB, exp, staleReason)
 	}
-	if dberr := common.DB.Model(&model.LLMExperiment{}).Where("id = ?", exp.ID).
-		UpdateColumn("sample_count", gorm.Expr("sample_count + 1")).Error; dberr != nil {
-		common.SysWarn("实验计数更新失败 exp=%d: %v", exp.ID, dberr)
+	if dberr != nil {
+		if !errors.Is(dberr, errExperimentSampleClosed) && !errors.Is(dberr, errExperimentSampleDuplicate) {
+			common.SysWarn("实验样本落库失败 exp=%d: %v", exp.ID, dberr)
+		}
+		return
 	}
 	common.SysLog("实验 #%d 影子采样：batch=%d valid=%v picks=%d overlap=%d/%d tokens=%d",
 		exp.ID, batch.ID, row.Valid, row.PicksCount, row.OverlapCount, row.ChampionPicks, row.ChallengerTokens)

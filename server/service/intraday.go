@@ -59,14 +59,15 @@ const (
 // intradaySyncRunning 同步防抖（后台 job 与启动补跑共用）。
 var intradaySyncRunning atomic.Bool
 
-// IntradayService 盘中因子同步与查询。fetchMin5 可注入（单测假源）。
+// IntradayService 盘中因子同步与分时查询。fetchMin5/fetchMin1 可注入（单测假源）。
 type IntradayService struct {
 	fetchMin5 func(ctx context.Context, market, symbol string, count int) ([]datasource.Min5Bar, error)
+	fetchMin1 func(ctx context.Context, market, symbol string, count int) ([]datasource.Min5Bar, float64, error)
 }
 
 func NewIntradayService() *IntradayService {
 	ta := datasource.NewTencentAdapter()
-	return &IntradayService{fetchMin5: ta.GetMin5Bars}
+	return &IntradayService{fetchMin5: ta.GetMin5Bars, fetchMin1: ta.GetMin1Bars}
 }
 
 // ---------- 纯函数（单测锚点） ----------

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"quantvista/common"
@@ -27,21 +29,35 @@ import (
 const (
 	optMoodPoolDay = "mood_pool_day" // 涨停池 已成功同步的交易日（沿用旧 key 保兼容）
 	optMoodPopDay  = "mood_pop_day"  // 人气榜 已成功同步的交易日（与涨停池各自独立推进）
-	optMoodLhbDay  = "mood_lhb_day"  // 龙虎榜+机构统计 已成功同步的交易日
+	// 旧 mood_lhb_day 可能由“主榜成功、机构榜失败”的旧实现错误推进，不能作为完整快照游标。
+	// v2 首次为空时会强制重验近 30 天，之后只在主榜+机构榜原子提交后推进。
+	optMoodLhbLegacyDay = "mood_lhb_day"
+	optMoodLhbDay       = "mood_lhb_complete_day_v2"
 
 	moodPoolCutoffMin = 16*60 + 35 // 16:35 后当日涨停池数据视为可采
 	moodLhbCutoffMin  = 18*60 + 45 // 18:45 后当日龙虎榜数据视为可采
 
-	lhbBackfillDays = 30 // 首轮部署回填龙虎榜/机构统计的自然日跨度（详情页上榜记录立即可用）
+	lhbBackfillDays  = 30               // 首轮部署回填龙虎榜/机构统计的自然日跨度（详情页上榜记录立即可用）
+	lhbRetryInterval = 30 * time.Minute // 游标落后或当日尚未发布时的重试间隔
 )
 
 // MoodService 扩展数据采集与查询。
 type MoodService struct {
-	em *datasource.EastMoneyAdapter
+	em               *datasource.EastMoneyAdapter
+	fetchLhbDaily    func(context.Context, string) ([]datasource.LhbRow, error)
+	fetchLhbOrgDaily func(context.Context, string) ([]datasource.LhbOrgRow, error)
+	repairCalendar   func(context.Context) error
+	now              func() time.Time
 }
 
 func NewMoodService() *MoodService {
-	return &MoodService{em: datasource.NewEastMoneyAdapter()}
+	em := datasource.NewEastMoneyAdapter()
+	return &MoodService{
+		em:               em,
+		fetchLhbDaily:    em.GetLhbDaily,
+		fetchLhbOrgDaily: em.GetLhbOrgDaily,
+		now:              time.Now,
+	}
 }
 
 // ---------- 纯函数（单测锚点） ----------
@@ -213,36 +229,112 @@ func (s *MoodService) SyncPopularity(ctx context.Context, tradeDate string) erro
 }
 
 // SyncLhb 采集某交易日龙虎榜详情 + 机构买卖统计。返回主表行数。
-// ErrNoData 透传给调用方（可能是「当日未发布」或「非交易日」，游标不推进，下次再试）。
+// 两份上游数据均成功（机构 ErrNoData 表示当日确实无机构席位，按空集处理）后，才在
+// 同一事务内删除重建该日两张表；抓取或任一落库失败都不会留下半份快照。
 func (s *MoodService) SyncLhb(ctx context.Context, tradeDate string) (int, error) {
 	if common.DB == nil {
 		return 0, errors.New("数据库不可用")
 	}
-	rows, err := s.em.GetLhbDaily(ctx, tradeDate)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := s.fetchLhbRows(ctx, tradeDate)
 	if err != nil {
 		return 0, err
 	}
-	n, err := upsertLhbRows(rows)
+	if len(rows) == 0 {
+		return 0, datasource.ErrNoData
+	}
+	orgRows, err := s.fetchLhbOrgRows(ctx, tradeDate)
+	if errors.Is(err, datasource.ErrNoData) {
+		orgRows = nil
+	} else if errors.Is(err, datasource.ErrLhbNotReady) {
+		now := time.Now()
+		if s.now != nil {
+			now = s.now()
+		}
+		if !lhbOrgNotReadyCanFinalizeEmpty(tradeDate, now) {
+			return 0, err
+		}
+		orgRows = nil
+	} else if err != nil {
+		return 0, err
+	}
+
+	lhbRecs := makeLhbEntries(rows, tradeDate)
+	orgRecs := makeLhbOrgEntries(orgRows, tradeDate)
+	err = common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("market = ? AND trade_date = ?", "cn", tradeDate).
+			Delete(&model.LhbEntry{}).Error; err != nil {
+			return err
+		}
+		// 机构榜「先删后插」：原子替换语义——同步成功即让该日 DB 与上游一致。
+		// 空结果也删是有意的（见 TestSyncLhbAtomicReplace）：上游 9201 对「尚未发布」
+		// 与「确实为空」不可区分，故用时间守卫 lhbOrgNotReadyCanFinalizeEmpty 把风险
+		// 限制在历史日——当天的 not-ready 一律整次失败重试，绝不收口为空榜。
+		// 残余风险：历史日上游瞬时回 9201 会抹掉该日真实机构数据（游标推进后不回填）。
+		if err := tx.Where("market = ? AND trade_date = ?", "cn", tradeDate).
+			Delete(&model.LhbOrgDaily{}).Error; err != nil {
+			return err
+		}
+		if len(lhbRecs) > 0 {
+			if err := tx.CreateInBatches(lhbRecs, 200).Error; err != nil {
+				return err
+			}
+		}
+		if len(orgRecs) > 0 {
+			if err := tx.CreateInBatches(orgRecs, 200).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return 0, err
 	}
-	// 机构统计 best-effort：当日无机构上榜（ErrNoData）是正常态，其余失败仅告警不阻断。
-	orgRows, oerr := s.em.GetLhbOrgDaily(ctx, tradeDate)
-	if oerr != nil && !errors.Is(oerr, datasource.ErrNoData) {
-		common.SysWarn("机构买卖统计拉取失败 %s: %v", tradeDate, oerr)
-	}
-	if err := upsertLhbOrgRows(orgRows); err != nil {
-		common.SysWarn("机构买卖统计落库失败 %s: %v", tradeDate, err)
-	}
-	return n, nil
+	return len(lhbRecs), nil
 }
 
-// upsertLhbRows 龙虎榜主表批量 upsert（键 symbol+market+trade_date+change_type 幂等）。
-func upsertLhbRows(rows []datasource.LhbRow) (int, error) {
+// lhbOrgNotReadyCanFinalizeEmpty 只允许把历史日期的“机构榜仍无结果”最终确认为空榜。
+// 当日 9201 可能只是主榜先发布、机构榜仍在生成，必须继续重试而不能清表推进游标。
+func lhbOrgNotReadyCanFinalizeEmpty(tradeDate string, now time.Time) bool {
+	day, err := time.ParseInLocation("2006-01-02", tradeDate, time.Local)
+	if err != nil {
+		return false
+	}
+	today := time.Date(now.In(time.Local).Year(), now.In(time.Local).Month(), now.In(time.Local).Day(), 0, 0, 0, 0, time.Local)
+	return day.Before(today)
+}
+
+func (s *MoodService) fetchLhbRows(ctx context.Context, tradeDate string) ([]datasource.LhbRow, error) {
+	if s.fetchLhbDaily != nil {
+		return s.fetchLhbDaily(ctx, tradeDate)
+	}
+	if s.em == nil {
+		return nil, errors.New("龙虎榜数据源不可用")
+	}
+	return s.em.GetLhbDaily(ctx, tradeDate)
+}
+
+func (s *MoodService) fetchLhbOrgRows(ctx context.Context, tradeDate string) ([]datasource.LhbOrgRow, error) {
+	if s.fetchLhbOrgDaily != nil {
+		return s.fetchLhbOrgDaily(ctx, tradeDate)
+	}
+	if s.em == nil {
+		return nil, errors.New("机构龙虎榜数据源不可用")
+	}
+	return s.em.GetLhbOrgDaily(ctx, tradeDate)
+}
+
+func makeLhbEntries(rows []datasource.LhbRow, tradeDate string) []model.LhbEntry {
 	recs := make([]model.LhbEntry, 0, len(rows))
 	for _, r := range rows {
+		date := tradeDate
+		if date == "" {
+			date = r.TradeDate
+		}
 		recs = append(recs, model.LhbEntry{
-			Symbol: r.Symbol, Market: "cn", TradeDate: r.TradeDate,
+			Symbol: r.Symbol, Market: "cn", TradeDate: date,
 			ChangeType: truncateRunes(r.ChangeType, 24), Name: r.Name,
 			Reason: truncateRunes(r.Reason, 128), Note: truncateRunes(r.Note, 128),
 			Close: r.Close, ChangePct: round2(r.ChangePct),
@@ -250,6 +342,30 @@ func upsertLhbRows(rows []datasource.LhbRow) (int, error) {
 			NetRatio: round2(r.NetRatio), TurnoverRate: round2(r.TurnoverRate),
 		})
 	}
+	return recs
+}
+
+func makeLhbOrgEntries(rows []datasource.LhbOrgRow, tradeDate string) []model.LhbOrgDaily {
+	recs := make([]model.LhbOrgDaily, 0, len(rows))
+	for _, r := range rows {
+		date := tradeDate
+		if date == "" {
+			date = r.TradeDate
+		}
+		recs = append(recs, model.LhbOrgDaily{
+			Symbol: r.Symbol, Market: "cn", TradeDate: date, Name: r.Name,
+			Close: r.Close, ChangePct: round2(r.ChangePct),
+			BuyTimes: r.BuyTimes, SellTimes: r.SellTimes,
+			BuyAmt: r.BuyAmt, SellAmt: r.SellAmt, NetBuy: r.NetBuy,
+			NetRatio: round2(r.NetRatio), Reason: truncateRunes(r.Reason, 128),
+		})
+	}
+	return recs
+}
+
+// upsertLhbRows 龙虎榜主表批量 upsert（键 symbol+market+trade_date+change_type 幂等）。
+func upsertLhbRows(rows []datasource.LhbRow) (int, error) {
+	recs := makeLhbEntries(rows, "")
 	if len(recs) == 0 {
 		return 0, nil
 	}
@@ -267,16 +383,7 @@ func upsertLhbRows(rows []datasource.LhbRow) (int, error) {
 
 // upsertLhbOrgRows 机构买卖统计批量 upsert（键 symbol+market+trade_date 幂等）。
 func upsertLhbOrgRows(rows []datasource.LhbOrgRow) error {
-	recs := make([]model.LhbOrgDaily, 0, len(rows))
-	for _, r := range rows {
-		recs = append(recs, model.LhbOrgDaily{
-			Symbol: r.Symbol, Market: "cn", TradeDate: r.TradeDate, Name: r.Name,
-			Close: r.Close, ChangePct: round2(r.ChangePct),
-			BuyTimes: r.BuyTimes, SellTimes: r.SellTimes,
-			BuyAmt: r.BuyAmt, SellAmt: r.SellAmt, NetBuy: r.NetBuy,
-			NetRatio: round2(r.NetRatio), Reason: truncateRunes(r.Reason, 128),
-		})
-	}
+	recs := makeLhbOrgEntries(rows, "")
 	if len(recs) == 0 {
 		return nil
 	}
@@ -289,32 +396,57 @@ func upsertLhbOrgRows(rows []datasource.LhbOrgRow) error {
 	}).CreateInBatches(recs, 200).Error
 }
 
-// backfillLhb 首轮部署回填近 days 个自然日的龙虎榜（详情页上榜记录立即可用）。
-// 逐日拉取由 datacenter 包级令牌桶自然限速（QPS≤2）；单日失败跳过不阻断。
-func (s *MoodService) backfillLhb(ctx context.Context, endDate string, days int) {
-	end, err := time.ParseInLocation("2006-01-02", endDate, time.Local)
+// lhbPendingDatesWithCoverage 返回游标之后、目标日之前（含目标日）的开市日及日历是否完整。
+// 周末是确定休市；任一工作日缺行则 complete=false，调用方必须先修复日历，不能猜成开市
+// （法定节假日会卡死）或休市（真实开市日会被越过）。
+func lhbPendingDatesWithCoverage(cursor, target string) ([]string, bool) {
+	pending := []string{}
+	targetDay, err := time.ParseInLocation("2006-01-02", target, time.Local)
 	if err != nil {
-		return
+		return pending, false
 	}
-	total := 0
-	for i := 1; i <= days; i++ {
-		if ctx.Err() != nil {
-			return
+	// 下界统一用开区间；多减一天以保留旧逻辑的「目标日前 30 天 + 目标日」边界。
+	start := targetDay.AddDate(0, 0, -lhbBackfillDays-1)
+	if cursor != "" {
+		cursorDay, err := time.ParseInLocation("2006-01-02", cursor, time.Local)
+		if err == nil {
+			if !cursorDay.Before(targetDay) {
+				return pending, true
+			}
+			start = cursorDay
 		}
-		d := end.AddDate(0, 0, -i)
-		if wd := d.Weekday(); wd == time.Saturday || wd == time.Sunday {
+	}
+	startDate := start.Format("2006-01-02")
+	calendarByDate := map[string]bool{}
+	if common.DB != nil {
+		var calendar []model.TradingCalendar
+		if err := common.DB.Select("trade_date", "is_open").
+			Where("market = ? AND trade_date > ? AND trade_date <= ?", "cn", startDate, target).
+			Order("trade_date ASC").Find(&calendar).Error; err == nil {
+			for _, day := range calendar {
+				calendarByDate[day.TradeDate] = day.IsOpen
+			}
+		}
+	}
+	complete := true
+	for day := start.AddDate(0, 0, 1); !day.After(targetDay); day = day.AddDate(0, 0, 1) {
+		date := day.Format("2006-01-02")
+		if isOpen, known := calendarByDate[date]; known {
+			if isOpen {
+				pending = append(pending, date)
+			}
 			continue
 		}
-		n, err := s.SyncLhb(ctx, d.Format("2006-01-02"))
-		if err != nil && !errors.Is(err, datasource.ErrNoData) {
-			common.SysDebug("龙虎榜回填跳过 %s: %v", d.Format("2006-01-02"), err)
-			continue
+		if wd := day.Weekday(); wd >= time.Monday && wd <= time.Friday {
+			complete = false
 		}
-		total += n
 	}
-	if total > 0 {
-		common.SysLog("龙虎榜历史回填完成：近 %d 天共 %d 行", days, total)
-	}
+	return pending, complete
+}
+
+func lhbPendingDates(cursor, target string) []string {
+	pending, _ := lhbPendingDatesWithCoverage(cursor, target)
+	return pending
 }
 
 // compactDate 2026-07-08 → 20260708（涨停池接口的 date 参数格式）。
@@ -329,6 +461,337 @@ func compactDate(d string) string {
 }
 
 // ---------- 消费查询 ----------
+
+// MoodTrendPoint 情绪趋势单点。历史不可回溯，缺勤日不补造。
+type MoodTrendPoint struct {
+	TradeDate    string  `json:"trade_date"`
+	LimitUpCount int     `json:"limit_up_count"`
+	BrokenCount  int     `json:"broken_count"`
+	BrokenRate   float64 `json:"broken_rate"`
+	MaxStreak    int     `json:"max_streak"`
+	YztAvgChg    float64 `json:"yzt_avg_chg"`
+	YztUpRatio   float64 `json:"yzt_up_ratio"`
+}
+
+// StreakLadder 连板梯队，按高度降序，每档保留全部当日涨停股。
+type StreakLadder struct {
+	Streak int                  `json:"streak"`
+	Count  int                  `json:"count"`
+	Stocks []model.LimitUpStock `json:"stocks"`
+}
+
+// MoodOverviewView 盘面情绪页聚合响应。
+type MoodOverviewView struct {
+	Market        string                 `json:"market"`
+	Latest        *model.MarketMoodDaily `json:"latest"`
+	StreakDist    map[string]int         `json:"streak_dist"`
+	StreakLadders []StreakLadder         `json:"streak_ladders"`
+	Trend         []MoodTrendPoint       `json:"trend"`
+	SealFundTop   []model.LimitUpStock   `json:"seal_fund_top"`
+}
+
+// MoodOverview 返回最近情绪快照、当日连板梯队、近 N 日趋势和封板资金 Top。
+// 多表读取放在同一快照事务，避免恰逢盘后同步时 Latest/Trend/梯队跨交易日混合。
+func (s *MoodService) MoodOverview(ctx context.Context, market string, days int) (*MoodOverviewView, error) {
+	market = strings.ToLower(strings.TrimSpace(market))
+	if market != "cn" {
+		return nil, errors.New("盘面情绪仅支持 A 股（market=cn）")
+	}
+	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
+	}
+	if days <= 0 {
+		days = 20
+	}
+	if days > 120 {
+		days = 120
+	}
+	out := &MoodOverviewView{
+		Market: market, StreakDist: map[string]int{},
+		StreakLadders: []StreakLadder{}, Trend: []MoodTrendPoint{},
+		SealFundTop: []model.LimitUpStock{},
+	}
+
+	var latest model.MarketMoodDaily
+	var moodRows []model.MarketMoodDaily
+	var stocks []model.LimitUpStock
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	found := false
+	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		err := tx.Where("market = ?", market).Order("trade_date DESC").First(&latest).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		found = true
+		if err := tx.Where("market = ?", market).Order("trade_date DESC").Limit(days).Find(&moodRows).Error; err != nil {
+			return err
+		}
+		return tx.Where("market = ? AND trade_date = ?", market, latest.TradeDate).
+			Order("streak DESC, seal_fund DESC, symbol ASC").Find(&stocks).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return out, nil
+	}
+	out.Latest = &latest
+	if latest.StreakDistJSON != "" {
+		_ = json.Unmarshal([]byte(latest.StreakDistJSON), &out.StreakDist)
+	}
+	for i := len(moodRows) - 1; i >= 0; i-- {
+		r := moodRows[i]
+		out.Trend = append(out.Trend, MoodTrendPoint{
+			TradeDate: r.TradeDate, LimitUpCount: r.LimitUpCount,
+			BrokenCount: r.BrokenCount, BrokenRate: r.BrokenRate, MaxStreak: r.MaxStreak,
+			YztAvgChg: r.YztAvgChg, YztUpRatio: r.YztUpRatio,
+		})
+	}
+
+	byStreak := make(map[int][]model.LimitUpStock)
+	for _, stock := range stocks {
+		streak := stock.Streak
+		if streak < 1 {
+			streak = 1
+		}
+		byStreak[streak] = append(byStreak[streak], stock)
+	}
+	heights := make([]int, 0, len(byStreak))
+	for height := range byStreak {
+		heights = append(heights, height)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(heights)))
+	for _, height := range heights {
+		group := byStreak[height]
+		out.StreakLadders = append(out.StreakLadders, StreakLadder{Streak: height, Count: len(group), Stocks: group})
+	}
+
+	sort.SliceStable(stocks, func(i, j int) bool {
+		if stocks[i].SealFund == stocks[j].SealFund {
+			return stocks[i].Symbol < stocks[j].Symbol
+		}
+		return stocks[i].SealFund > stocks[j].SealFund
+	})
+	if len(stocks) > 10 {
+		stocks = stocks[:10]
+	}
+	out.SealFundTop = stocks
+	return out, nil
+}
+
+// LhbDailyItem 全市场龙虎榜一行，并入同股同日机构席位统计。
+type LhbDailyItem struct {
+	Symbol       string  `json:"symbol"`
+	Name         string  `json:"name"`
+	Reason       string  `json:"reason"`
+	Note         string  `json:"note,omitempty"`
+	Close        float64 `json:"close"`
+	ChangePct    float64 `json:"change_pct"`
+	NetBuy       float64 `json:"net_buy"`
+	BuyAmt       float64 `json:"buy_amt"`
+	SellAmt      float64 `json:"sell_amt"`
+	DealAmt      float64 `json:"deal_amt"`
+	NetRatio     float64 `json:"net_ratio"`
+	TurnoverRate float64 `json:"turnover_rate"`
+	OrgNetBuy    float64 `json:"org_net_buy"`
+	OrgBuyTimes  int     `json:"org_buy_times"`
+	OrgSellTimes int     `json:"org_sell_times"`
+}
+
+type LhbDailyView struct {
+	Market    string         `json:"market"`
+	TradeDate string         `json:"trade_date"`
+	Items     []LhbDailyItem `json:"items"`
+}
+
+// LhbDaily 返回指定交易日全市场龙虎榜；date 为空时回退最近有数据日。
+func (s *MoodService) LhbDaily(ctx context.Context, market, date string, limit int) (*LhbDailyView, error) {
+	market = strings.ToLower(strings.TrimSpace(market))
+	if market != "cn" {
+		return nil, errors.New("龙虎榜仅支持 A 股（market=cn）")
+	}
+	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
+	}
+	date = strings.TrimSpace(date)
+	if date != "" {
+		if _, err := time.Parse("2006-01-02", date); err != nil {
+			return nil, errors.New("date 格式应为 YYYY-MM-DD")
+		}
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	var rows []model.LhbEntry
+	var orgRows []model.LhbOrgDaily
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if date == "" {
+			var dates []string
+			if err := tx.Model(&model.LhbEntry{}).Where("market = ?", market).
+				Order("trade_date DESC").Limit(1).Pluck("trade_date", &dates).Error; err != nil {
+				return err
+			}
+			if len(dates) > 0 {
+				date = dates[0]
+			}
+		}
+		if date == "" {
+			return nil
+		}
+		if err := tx.Where("market = ? AND trade_date = ?", market, date).
+			Order("net_buy DESC, id ASC").Limit(limit).Find(&rows).Error; err != nil {
+			return err
+		}
+		return tx.Where("market = ? AND trade_date = ?", market, date).Find(&orgRows).Error
+	}); err != nil {
+		return nil, err
+	}
+	out := &LhbDailyView{Market: market, TradeDate: date, Items: []LhbDailyItem{}}
+	orgBySymbol := make(map[string]model.LhbOrgDaily, len(orgRows))
+	for _, row := range orgRows {
+		orgBySymbol[row.Symbol] = row
+	}
+	for _, row := range rows {
+		item := LhbDailyItem{
+			Symbol: row.Symbol, Name: row.Name, Reason: row.Reason, Note: row.Note,
+			Close: row.Close, ChangePct: row.ChangePct, NetBuy: row.NetBuy,
+			BuyAmt: row.BuyAmt, SellAmt: row.SellAmt, DealAmt: row.DealAmt,
+			NetRatio: row.NetRatio, TurnoverRate: row.TurnoverRate,
+		}
+		if org, ok := orgBySymbol[row.Symbol]; ok {
+			item.OrgNetBuy = org.NetBuy
+			item.OrgBuyTimes = org.BuyTimes
+			item.OrgSellTimes = org.SellTimes
+		}
+		out.Items = append(out.Items, item)
+	}
+	return out, nil
+}
+
+type PopularityDailyItem struct {
+	Symbol   string `json:"symbol"`
+	Name     string `json:"name"`
+	Rank     int    `json:"rank"`
+	PrevRank int    `json:"prev_rank"`
+	IsNew    bool   `json:"is_new"`
+}
+
+type PopularityDailyView struct {
+	Market    string                `json:"market"`
+	TradeDate string                `json:"trade_date"`
+	Items     []PopularityDailyItem `json:"items"`
+}
+
+// PopularityDaily 返回指定日人气榜；date 为空时回退最近快照，并标记新上榜。
+func (s *MoodService) PopularityDaily(ctx context.Context, market, date string) (*PopularityDailyView, error) {
+	market = strings.ToLower(strings.TrimSpace(market))
+	if market != "cn" {
+		return nil, errors.New("人气榜仅支持 A 股（market=cn）")
+	}
+	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
+	}
+	date = strings.TrimSpace(date)
+	if date != "" {
+		if _, err := time.Parse("2006-01-02", date); err != nil {
+			return nil, errors.New("date 格式应为 YYYY-MM-DD")
+		}
+	}
+	var rows []model.PopularityRank
+	var universe []model.StockUniverseDaily
+	var states []model.MarketSyncState
+	var stocks []model.Stock
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if date == "" {
+			var dates []string
+			if err := tx.Model(&model.PopularityRank{}).Where("market = ?", market).
+				Order("trade_date DESC").Limit(1).Pluck("trade_date", &dates).Error; err != nil {
+				return err
+			}
+			if len(dates) > 0 {
+				date = dates[0]
+			}
+		}
+		if date == "" {
+			return nil
+		}
+		// rank 是 MySQL 8.0.2+ 保留字（窗口函数 RANK()）：GORM 的 Order(string) 走
+		// clause.Column{Raw:true} 原样拼接不加引号，裸 `ORDER BY rank` 在 MySQL 上是
+		// ERROR 1064，而 SQLite 不把 rank 当保留字 → 单测全绿、生产必挂。
+		// 用 OrderByColumn 让方言各自加引号（写入侧 clause.AssignmentColumns 本就正确）。
+		if err := tx.Where("market = ? AND trade_date = ?", market, date).
+			Order(clause.OrderByColumn{Column: clause.Column{Name: "rank"}}).
+			Order(clause.OrderByColumn{Column: clause.Column{Name: "symbol"}}).
+			Find(&rows).Error; err != nil {
+			return err
+		}
+		symbols := make([]string, 0, len(rows))
+		for _, row := range rows {
+			symbols = append(symbols, row.Symbol)
+		}
+		if len(symbols) == 0 {
+			return nil
+		}
+		var universeDates []string
+		if err := tx.Model(&model.StockUniverseDaily{}).Where("market = ?", market).
+			Order("trade_date DESC").Limit(1).Pluck("trade_date", &universeDates).Error; err != nil {
+			return err
+		}
+		if len(universeDates) > 0 {
+			if err := tx.Select("symbol", "name").
+				Where("market = ? AND trade_date = ? AND symbol IN ?", market, universeDates[0], symbols).
+				Find(&universe).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Select("symbol", "name").
+			Where("market = ? AND symbol IN ?", market, symbols).Find(&states).Error; err != nil {
+			return err
+		}
+		return tx.Select("symbol", "name").
+			Where("market = ? AND symbol IN ?", market, symbols).Find(&stocks).Error
+	}); err != nil {
+		return nil, err
+	}
+	out := &PopularityDailyView{Market: market, TradeDate: date, Items: []PopularityDailyItem{}}
+	nameBySymbol := make(map[string]string, len(rows))
+	for _, stock := range stocks {
+		if stock.Name != "" {
+			nameBySymbol[stock.Symbol] = stock.Name
+		}
+	}
+	for _, state := range states {
+		if state.Name != "" {
+			nameBySymbol[state.Symbol] = state.Name
+		}
+	}
+	for _, stock := range universe {
+		if stock.Name != "" {
+			nameBySymbol[stock.Symbol] = stock.Name
+		}
+	}
+	for _, row := range rows {
+		out.Items = append(out.Items, PopularityDailyItem{
+			Symbol: row.Symbol, Name: nameBySymbol[row.Symbol], Rank: row.Rank,
+			PrevRank: row.PrevRank, IsNew: row.IsNew || row.PrevRank <= 0,
+		})
+	}
+	return out, nil
+}
 
 // moodBrief 最近一日情绪温度计（市场分析快照/日报快照的 mood 段）。无数据返回 nil。
 // 连板分布转成可读 map；日期随行返回，供 prompt 声明数据归属日。
@@ -388,20 +851,36 @@ func signalDateUsable(latest string) bool {
 	return lag >= 0 && lag <= signalStaleMaxOpenDays
 }
 
-// lhbSignalsFor 批量查询候选的最近龙虎榜信号。
-func lhbSignalsFor(symbols []string) map[string]lhbSignal {
+// lhbSignalsFor 批量查询候选的最近龙虎榜信号。主榜和机构榜必须来自同一读事务快照。
+func lhbSignalsFor(ctx context.Context, symbols []string) map[string]lhbSignal {
 	out := map[string]lhbSignal{}
 	if common.DB == nil || len(symbols) == 0 {
 		return out
 	}
-	var latest string
-	common.DB.Model(&model.LhbEntry{}).Where("market = ?", "cn").
-		Select("MAX(trade_date)").Scan(&latest)
-	if !signalDateUsable(latest) {
-		return out
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	var rows []model.LhbEntry
-	common.DB.Where("market = ? AND trade_date = ? AND symbol IN ?", "cn", latest, symbols).Find(&rows)
+	var orgRows []model.LhbOrgDaily
+	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var latest string
+		if err := tx.Model(&model.LhbEntry{}).Where("market = ?", "cn").
+			Select("MAX(trade_date)").Scan(&latest).Error; err != nil {
+			return err
+		}
+		if !signalDateUsable(latest) {
+			return nil
+		}
+		if err := tx.Where("market = ? AND trade_date = ? AND symbol IN ?", "cn", latest, symbols).
+			Find(&rows).Error; err != nil {
+			return err
+		}
+		return tx.Where("market = ? AND trade_date = ? AND symbol IN ?", "cn", latest, symbols).
+			Find(&orgRows).Error
+	})
+	if err != nil {
+		return out
+	}
 	for _, r := range rows {
 		sig, ok := out[r.Symbol]
 		if !ok || absF(r.NetBuy) > absF(sig.NetBuyYi*1e8) {
@@ -411,8 +890,6 @@ func lhbSignalsFor(symbols []string) map[string]lhbSignal {
 			}
 		}
 	}
-	var orgRows []model.LhbOrgDaily
-	common.DB.Where("market = ? AND trade_date = ? AND symbol IN ?", "cn", latest, symbols).Find(&orgRows)
 	for _, r := range orgRows {
 		sig := out[r.Symbol]
 		if sig.TradeDate == "" {
@@ -433,20 +910,31 @@ type popSignal struct {
 	IsNew     bool
 }
 
-// popSignalsFor 批量查询候选的最近人气榜名次。
-func popSignalsFor(symbols []string) map[string]popSignal {
+// popSignalsFor 批量查询候选的最近人气榜名次（MAX 日期与明细同一快照）。
+func popSignalsFor(ctx context.Context, symbols []string) map[string]popSignal {
 	out := map[string]popSignal{}
 	if common.DB == nil || len(symbols) == 0 {
 		return out
 	}
-	var latest string
-	common.DB.Model(&model.PopularityRank{}).Where("market = ?", "cn").
-		Select("MAX(trade_date)").Scan(&latest)
-	if !signalDateUsable(latest) {
-		return out
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	var rows []model.PopularityRank
-	common.DB.Where("market = ? AND trade_date = ? AND symbol IN ?", "cn", latest, symbols).Find(&rows)
+	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var latest string
+		if err := tx.Model(&model.PopularityRank{}).Where("market = ?", "cn").
+			Select("MAX(trade_date)").Scan(&latest).Error; err != nil {
+			return err
+		}
+		if !signalDateUsable(latest) {
+			return nil
+		}
+		return tx.Where("market = ? AND trade_date = ? AND symbol IN ?", "cn", latest, symbols).
+			Find(&rows).Error
+	})
+	if err != nil {
+		return out
+	}
 	for _, r := range rows {
 		out[r.Symbol] = popSignal{TradeDate: r.TradeDate, Rank: r.Rank, PrevRank: r.PrevRank, IsNew: r.IsNew}
 	}
@@ -473,28 +961,40 @@ type LhbRecordView struct {
 }
 
 // StockLhbRecords 个股最近上榜记录（详情页）。按日期降序，同日多原因各自成行。
-func (s *MoodService) StockLhbRecords(symbol string, limit int) []LhbRecordView {
+// 主榜与机构榜在同一读事务内查询，避免同步事务提交夹缝产生跨版本混合。
+func (s *MoodService) StockLhbRecords(ctx context.Context, symbol string, limit int) []LhbRecordView {
 	if common.DB == nil || !isSixDigits(symbol) {
 		return []LhbRecordView{}
 	}
 	if limit <= 0 || limit > 30 {
 		limit = 10
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var rows []model.LhbEntry
-	if err := common.DB.Where("symbol = ? AND market = ?", symbol, "cn").
-		Order("trade_date DESC, id ASC").Limit(limit).Find(&rows).Error; err != nil {
+	var orgRows []model.LhbOrgDaily
+	if err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("symbol = ? AND market = ?", symbol, "cn").
+			Order("trade_date DESC, id ASC").Limit(limit).Find(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		dates := make([]string, 0, len(rows))
+		for _, r := range rows {
+			dates = append(dates, r.TradeDate)
+		}
+		return tx.Where("symbol = ? AND market = ? AND trade_date IN ?", symbol, "cn", dates).
+			Find(&orgRows).Error
+	}); err != nil {
 		return []LhbRecordView{}
 	}
 	if len(rows) == 0 {
 		return []LhbRecordView{}
 	}
-	dates := make([]string, 0, len(rows))
-	for _, r := range rows {
-		dates = append(dates, r.TradeDate)
-	}
 	orgBy := map[string]model.LhbOrgDaily{}
-	var orgRows []model.LhbOrgDaily
-	common.DB.Where("symbol = ? AND market = ? AND trade_date IN ?", symbol, "cn", dates).Find(&orgRows)
 	for _, r := range orgRows {
 		orgBy[r.TradeDate] = r
 	}
@@ -544,57 +1044,144 @@ func (s *MoodService) runMoodPools(ctx context.Context, target, today string) {
 	}
 }
 
+// lhbSkipAfterFails 历史日连续失败达此次数即跳过（推进游标）。重试间隔 30min，
+// 3 次≈1.5 小时持续失败——足以区分瞬时故障与恒定失败。
+//
+// 为什么必须能跳过：pending 按交易日**升序**逐日补，旧实现任一天失败就 return false、
+// 游标不动，下轮重试的还是同一个最早缺口。而恒定失败是可达的——该日东财确无榜
+//（ErrNoData）、或 parseLhbRowStrict 因缺必填字段整天作废——于是最老的一天会把其后
+// 所有天连同**今天**的榜一起永久卡死。今天（target）不参与跳过：盘后逐步落库，
+// 18:00 前未发布是正常态，必须继续等。
+const lhbSkipAfterFails = 3
+
+// lhbDayFails 同一交易日连续失败计数（进程内；重启后重新计数，宁可多试几轮）。
+var (
+	lhbFailMu   sync.Mutex
+	lhbDayFails = map[string]int{}
+)
+
+func bumpLhbDayFail(date string) int {
+	lhbFailMu.Lock()
+	defer lhbFailMu.Unlock()
+	lhbDayFails[date]++
+	return lhbDayFails[date]
+}
+
+func clearLhbDayFail(date string) {
+	lhbFailMu.Lock()
+	defer lhbFailMu.Unlock()
+	delete(lhbDayFails, date)
+}
+
+// runMoodLhb 从游标之后按交易日升序补到 target。失败即停确保下轮仍从最早缺口开始；
+// 但历史日连续失败达 lhbSkipAfterFails 次即跳过，防单日恒定失败卡死其后所有天。
+// 每个成功日单独推进游标，长回填即使超时也能从已提交位置续跑。
+func (s *MoodService) runMoodLhb(ctx context.Context, target string) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cursor := optionValue(optMoodLhbDay)
+	if cursor == target {
+		return true
+	}
+	pending, complete := lhbPendingDatesWithCoverage(cursor, target)
+	if !complete && s.repairCalendar != nil {
+		if err := s.repairCalendar(ctx); err != nil {
+			common.SysWarn("龙虎榜补缺口前修复交易日历失败: %v", err)
+			return false
+		}
+		pending, complete = lhbPendingDatesWithCoverage(cursor, target)
+	}
+	if !complete {
+		common.SysWarn("龙虎榜补缺口暂停：%s 至 %s 的交易日历不完整", cursor, target)
+		return false
+	}
+	for _, date := range pending {
+		if err := ctx.Err(); err != nil {
+			common.SysWarn("龙虎榜补缺口中止 %s: %v", date, err)
+			return false
+		}
+		n, err := s.SyncLhb(ctx, date)
+		if err != nil {
+			// ctx 用尽属本轮预算问题不是该日的问题，不计入失败次数。
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				common.SysWarn("龙虎榜补缺口中止 %s: %v", date, err)
+				return false
+			}
+			fails := bumpLhbDayFail(date)
+			if date != target && fails >= lhbSkipAfterFails {
+				common.SysWarn("龙虎榜 %s 连续 %d 次失败，跳过该日继续补后续（最后错误: %v）", date, fails, err)
+				if uerr := model.UpsertOption(optMoodLhbDay, date); uerr != nil {
+					common.SysWarn("龙虎榜游标推进失败 %s: %v", date, uerr)
+					return false
+				}
+				cursor = date
+				clearLhbDayFail(date)
+				continue
+			}
+			if errors.Is(err, datasource.ErrNoData) {
+				common.SysDebug("龙虎榜 %s 暂无数据（未发布或日历有误），下次再试（第 %d 次）", date, fails)
+			} else {
+				common.SysWarn("龙虎榜采集失败 %s（第 %d 次）: %v", date, fails, err)
+			}
+			return false
+		}
+		clearLhbDayFail(date)
+		if err := model.UpsertOption(optMoodLhbDay, date); err != nil {
+			common.SysWarn("龙虎榜游标推进失败 %s: %v", date, err)
+			return false
+		}
+		cursor = date
+		common.SysLog("龙虎榜采集完成 %s：%d 行", date, n)
+	}
+	return cursor == target
+}
+
 // StartMoodJobs 盘后错峰采集：16:35 涨停池+人气榜、18:45 龙虎榜+机构统计。
-// 启动 3 分钟后按游标补跑缺口（涨停池上游不可回溯，补跑失败即诚实缺失该日）。
-func StartMoodJobs() *MoodService {
+// 涨停池与龙虎榜使用独立循环：前者每日执行，后者按游标升序补缺口且落后时约 30 分钟重试。
+func StartMoodJobs(mgr *datasource.Manager) *MoodService {
 	svc := NewMoodService()
+	marketSvc := NewMarketService(mgr)
+	svc.repairCalendar = func(ctx context.Context) error {
+		_, err := marketSvc.BackfillCalendar(ctx, "cn")
+		return err
+	}
 	runPools := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		svc.runMoodPools(ctx, moodTargetDate(time.Now(), moodPoolCutoffMin), time.Now().Format("2006-01-02"))
 	}
-	runLhb := func() {
-		target := moodTargetDate(time.Now(), moodLhbCutoffMin)
-		if optionValue(optMoodLhbDay) == target {
-			return
-		}
-		firstRun := optionValue(optMoodLhbDay) == ""
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
-		n, err := svc.SyncLhb(ctx, target)
-		if err != nil {
-			if errors.Is(err, datasource.ErrNoData) {
-				common.SysDebug("龙虎榜 %s 暂无数据（未发布或非交易日），下次再试", target)
-			} else {
-				common.SysWarn("龙虎榜采集失败 %s: %v", target, err)
-			}
-			return
-		}
-		_ = model.UpsertOption(optMoodLhbDay, target)
-		common.SysLog("龙虎榜采集完成 %s：%d 行", target, n)
-		if firstRun {
-			svc.backfillLhb(ctx, target, lhbBackfillDays)
-		}
-	}
-	// 启动补跑 + 每日定时（自然日循环，交易日判定在 moodTargetDate/游标里消化）。
+
+	// 涨停池/人气榜每日循环。上游不可回溯，失败仍保持诚实缺失，不与龙虎榜重试互相阻塞。
 	go func() {
 		if common.DB == nil {
 			return
 		}
 		time.Sleep(3 * time.Minute)
-		runPools()
-		runLhb()
 		for {
-			now := time.Now()
-			nextPool := nextDailyAt(now, 16, 35)
-			nextLhb := nextDailyAt(now, 18, 45)
-			if nextPool.Before(nextLhb) {
-				time.Sleep(time.Until(nextPool))
-				runPools()
-			} else {
-				time.Sleep(time.Until(nextLhb))
-				runLhb()
+			runPools()
+			time.Sleep(time.Until(nextDailyAt(time.Now(), 16, 35)))
+		}
+	}()
+
+	// 龙虎榜独立循环。成功追平后睡到下个 18:45；失败、超时或任务跨过 cutoff
+	// 导致目标日变化时，约 30 分钟后重试最早缺口。
+	go func() {
+		if common.DB == nil {
+			return
+		}
+		time.Sleep(3 * time.Minute)
+		for {
+			target := moodTargetDate(time.Now(), moodLhbCutoffMin)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			caughtUp := svc.runMoodLhb(ctx, target)
+			cancel()
+			currentTarget := moodTargetDate(time.Now(), moodLhbCutoffMin)
+			if !caughtUp || optionValue(optMoodLhbDay) != currentTarget {
+				time.Sleep(lhbRetryInterval)
+				continue
 			}
+			time.Sleep(time.Until(nextDailyAt(time.Now(), 18, 45)))
 		}
 	}()
 	return svc

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"quantvista/common"
 	"quantvista/model"
@@ -20,7 +21,9 @@ func cleanReleaseGateTables(t *testing.T) {
 		common.DB.Where("1=1").Delete(&model.LLMReleaseAudit{})
 		common.DB.Where("1=1").Delete(&model.LLMExperimentRun{})
 		common.DB.Where("1=1").Delete(&model.LLMExperiment{})
+		common.DB.Where("1=1").Delete(&model.LLMExperimentModuleLock{})
 		common.DB.Where("module = ?", "recommend").Delete(&model.PromptTemplate{})
+		common.DB.Where("module = ?", "recommend").Delete(&model.PromptChampionState{})
 		common.DB.Where("name LIKE ?", "ra-%").Delete(&model.LLMConfig{})
 		common.DB.Where("username LIKE ?", "ra-%").Delete(&model.User{})
 	}
@@ -201,6 +204,54 @@ func TestLLMExperimentAuditGate(t *testing.T) {
 	}
 }
 
+// TestReleaseAuditCannotAppendFailAfterPromote 旧 PASS 存在且新 FAIL 正在外部调用时，
+// promote 若先取得实验锁，新审计不得在 promoted 之后追加成“最新 FAIL”。
+func TestReleaseAuditCannotAppendFailAfterPromote(t *testing.T) {
+	setChallengerFlag(t, false)
+	cleanReleaseGateTables(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		_, _ = w.Write([]byte(auditChatBody(`{"verdict":"fail","findings":[{"code":"late_fail","severity":"high","message":"迟到失败"}],"summary":"失败"}`)))
+	}))
+	defer srv.Close()
+	seedAuditAdmin(t, srv.URL)
+	exp := releaseGateFixture(t)
+	common.DB.Create(&model.LLMReleaseAudit{
+		ExperimentID: exp.ID, Verdict: model.ReleaseAuditPass,
+		ChallengerHash: exp.ChallengerHash,
+		ChampionHash:   promptContentHash(releaseAuditChampionContent(exp)), Summary: "old-pass",
+	})
+	auditErr := make(chan error, 1)
+	go func() {
+		_, err := RunLLMExperimentAudit(context.Background(), exp.ID)
+		auditErr <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("等待新审计进入外部调用超时")
+	}
+	if got, err := PromoteLLMExperiment(exp.ID); err != nil || got.Status != model.ExpStatusPromoted {
+		t.Fatalf("旧 PASS 下 promote 应先成功: %v %+v", err, got)
+	}
+	close(release)
+	select {
+	case err := <-auditErr:
+		if err == nil || !strings.Contains(err.Error(), "状态已变") {
+			t.Fatalf("迟到审计应因 promoted 作废: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("等待迟到审计结束超时")
+	}
+	audits := ListLLMReleaseAudits(exp.ID)
+	if len(audits) != 1 || audits[0].Verdict != model.ReleaseAuditPass {
+		t.Fatalf("promote 后不得追加迟到 FAIL: %+v", audits)
+	}
+}
+
 // TestLLMExperimentRollback 一键切回 champion：晋级前有/无自定义模板两形态对称恢复；
 // rolled_back 终态不可 abandon/重复回滚；非 promoted 不可回滚。
 func TestLLMExperimentRollback(t *testing.T) {
@@ -233,29 +284,8 @@ func TestLLMExperimentRollback(t *testing.T) {
 	if tpl.Content != expInput().ChallengerContent || !tpl.Enabled {
 		t.Fatalf("晋级后模板应为 challenger 内容: %+v", tpl)
 	}
-	// 审查修复批反例：晋级后模板被编辑（champion 指针前移）→ 回滚失去对象，拒绝；
-	// 列表视图透出 rollback_stale 供前端禁用按钮。恢复 challenger 内容后可正常回滚。
-	if _, _, err := ps.Upsert(1, PromptInput{Module: "recommend", Content: "晋级后管理员又改过的内容", Enabled: true}); err != nil {
-		t.Fatalf("模拟编辑: %v", err)
-	}
-	if _, err := RollbackLLMExperiment(exp.ID); err == nil || !strings.Contains(err.Error(), "拒绝回滚") {
-		t.Fatalf("champion 前移后应拒绝回滚: %v", err)
-	}
-	views, err := ListLLMExperiments()
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	staleSeen := false
-	for _, v := range views {
-		if v.ID == exp.ID {
-			staleSeen = v.RollbackStale != ""
-		}
-	}
-	if !staleSeen {
-		t.Fatal("列表应透出 rollback_stale")
-	}
-	if _, _, err := ps.Upsert(1, PromptInput{Module: "recommend", Content: expInput().ChallengerContent, Enabled: true}); err != nil {
-		t.Fatalf("恢复 challenger 内容: %v", err)
+	if got.PromotedGeneration <= 0 {
+		t.Fatalf("晋级必须固化 generation 回滚锚: %+v", got)
 	}
 	rb, err := RollbackLLMExperiment(exp.ID)
 	if err != nil || rb.Status != model.ExpStatusRolledBack || rb.RolledBackAt == nil {
@@ -295,6 +325,174 @@ func TestLLMExperimentRollback(t *testing.T) {
 	var kept model.PromptTemplate
 	if err := common.DB.Where("user_id = 1 AND module = ?", "recommend").First(&kept).Error; err != nil || kept.Enabled {
 		t.Fatalf("自定义模板应保留但停用（不删工件）: %v %+v", err, kept)
+	}
+}
+
+// TestLLMExperimentRollbackGenerationCannotWashBack 晋级产物经历 A→B→A 后，内容 hash
+// 虽恢复，generation/revision 已前移，旧实验不得覆盖当前 champion；列表同步标 stale。
+func TestLLMExperimentRollbackGenerationCannotWashBack(t *testing.T) {
+	setChallengerFlag(t, false)
+	cleanReleaseGateTables(t)
+	exp := releaseGateFixture(t)
+	common.DB.Create(&model.LLMReleaseAudit{
+		ExperimentID: exp.ID, Verdict: model.ReleaseAuditPass,
+		ChallengerHash: exp.ChallengerHash,
+		ChampionHash:   promptContentHash(releaseAuditChampionContent(exp)), Summary: "seed",
+	})
+	promoted, err := PromoteLLMExperiment(exp.ID)
+	if err != nil || promoted.PromotedGeneration <= 0 {
+		t.Fatalf("晋级: %v %+v", err, promoted)
+	}
+	ps := NewPromptService()
+	if _, _, err := ps.Upsert(1, PromptInput{Module: "recommend", Content: "晋级后的 B", Enabled: true}); err != nil {
+		t.Fatalf("A→B: %v", err)
+	}
+	if _, _, err := ps.Upsert(1, PromptInput{Module: "recommend", Content: exp.ChallengerContent, Enabled: true}); err != nil {
+		t.Fatalf("B→A: %v", err)
+	}
+	current, err := loadExperimentPromptBaseline(common.DB, exp.UserID, exp.PromptModule)
+	if err != nil {
+		t.Fatalf("读取洗回后的 champion: %v", err)
+	}
+	if current.Hash != exp.ChallengerHash || current.Generation == promoted.PromotedGeneration {
+		t.Fatalf("反例前提不成立：hash 应相同但 generation 应前移: current=%+v promoted=%+v", current, promoted)
+	}
+	if _, err := RollbackLLMExperiment(exp.ID); err == nil || !strings.Contains(err.Error(), "generation") {
+		t.Fatalf("A→B→A 后旧实验必须按 generation 拒绝回滚: %v", err)
+	}
+	views, err := ListLLMExperiments()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	for _, view := range views {
+		if view.ID == exp.ID {
+			if !strings.Contains(view.RollbackStale, "generation") {
+				t.Fatalf("列表应透出 generation stale: %+v", view)
+			}
+			return
+		}
+	}
+	t.Fatal("列表缺少实验")
+}
+
+// TestLLMExperimentRollbackRejectedAfterLaterSameHashPromote 后续实验即使晋级相同内容、
+// revision/hash 均未变化，也必须取得新的归属 generation，旧实验不再拥有回滚权。
+func TestLLMExperimentRollbackRejectedAfterLaterSameHashPromote(t *testing.T) {
+	setChallengerFlag(t, false)
+	cleanReleaseGateTables(t)
+	seedPass := func(exp *model.LLMExperiment) {
+		t.Helper()
+		if err := common.DB.Create(&model.LLMReleaseAudit{
+			ExperimentID: exp.ID, Verdict: model.ReleaseAuditPass,
+			ChallengerHash: exp.ChallengerHash,
+			ChampionHash:   promptContentHash(releaseAuditChampionContent(exp)), Summary: "seed",
+		}).Error; err != nil {
+			t.Fatalf("落 PASS 工件: %v", err)
+		}
+	}
+
+	first := releaseGateFixture(t)
+	seedPass(first)
+	firstPromoted, err := PromoteLLMExperiment(first.ID)
+	if err != nil {
+		t.Fatalf("第一次晋级: %v", err)
+	}
+	second := releaseGateFixture(t) // baseline 与 challenger 都是第一次晋级出的同一内容
+	seedPass(second)
+	secondPromoted, err := PromoteLLMExperiment(second.ID)
+	if err != nil {
+		t.Fatalf("同 hash 后续实验晋级: %v", err)
+	}
+	if secondPromoted.PromotedRevision != firstPromoted.PromotedRevision ||
+		secondPromoted.PromotedGeneration <= firstPromoted.PromotedGeneration {
+		t.Fatalf("同 hash 晋级应保留 revision 但推进归属 generation: first=%+v second=%+v",
+			firstPromoted, secondPromoted)
+	}
+	if _, err := RollbackLLMExperiment(first.ID); err == nil || !strings.Contains(err.Error(), "generation") {
+		t.Fatalf("后续同 hash 实验晋级后，旧实验必须拒绝回滚: %v", err)
+	}
+	if _, err := RollbackLLMExperiment(second.ID); err != nil {
+		t.Fatalf("最新同 hash 实验仍应拥有回滚权: %v", err)
+	}
+}
+
+// TestLLMExperimentPromoteRollbackAtomic 状态落库失败时，模板正文、enabled 与 revision
+// 快照必须随事务一起回滚，不能留下“线上已切换但实验仍是旧状态”的半完成结果。
+func TestLLMExperimentPromoteRollbackAtomic(t *testing.T) {
+	setChallengerFlag(t, false)
+	cleanReleaseGateTables(t)
+	exp := releaseGateFixture(t)
+	common.DB.Create(&model.LLMReleaseAudit{
+		ExperimentID: exp.ID, Verdict: model.ReleaseAuditPass,
+		ChallengerHash: exp.ChallengerHash,
+		ChampionHash:   promptContentHash(releaseAuditChampionContent(exp)), Summary: "seed",
+	})
+	var revisionsBefore int64
+	common.DB.Model(&model.PromptTemplateRevision{}).
+		Where("user_id = ? AND module = ?", exp.UserID, exp.PromptModule).Count(&revisionsBefore)
+
+	const promoteTrigger = "test_fail_experiment_promote"
+	common.DB.Exec("DROP TRIGGER IF EXISTS " + promoteTrigger)
+	t.Cleanup(func() { common.DB.Exec("DROP TRIGGER IF EXISTS " + promoteTrigger) })
+	if err := common.DB.Exec(`CREATE TRIGGER ` + promoteTrigger + `
+		BEFORE UPDATE OF status ON llm_experiments
+		WHEN NEW.status = 'promoted'
+		BEGIN SELECT RAISE(ABORT, 'forced promote status failure'); END`).Error; err != nil {
+		t.Fatalf("创建 promote 故障触发器: %v", err)
+	}
+	if _, err := PromoteLLMExperiment(exp.ID); err == nil {
+		t.Fatal("状态写失败时 promote 应失败")
+	}
+	var templateCount int64
+	common.DB.Model(&model.PromptTemplate{}).
+		Where("user_id = ? AND module = ?", exp.UserID, exp.PromptModule).Count(&templateCount)
+	if templateCount != 0 {
+		t.Fatalf("失败 promote 不得留下模板行: %d", templateCount)
+	}
+	var revisionsAfter int64
+	common.DB.Model(&model.PromptTemplateRevision{}).
+		Where("user_id = ? AND module = ?", exp.UserID, exp.PromptModule).Count(&revisionsAfter)
+	if revisionsAfter != revisionsBefore {
+		t.Fatalf("失败 promote 不得留下 revision 快照: before=%d after=%d", revisionsBefore, revisionsAfter)
+	}
+	var stored model.LLMExperiment
+	common.DB.First(&stored, exp.ID)
+	if stored.Status != model.ExpStatusCompleted || stored.PromotedRevision != 0 {
+		t.Fatalf("失败 promote 后实验应保持 completed: %+v", stored)
+	}
+	if err := common.DB.Exec("DROP TRIGGER " + promoteTrigger).Error; err != nil {
+		t.Fatalf("删除 promote 故障触发器: %v", err)
+	}
+
+	promoted, err := PromoteLLMExperiment(exp.ID)
+	if err != nil {
+		t.Fatalf("移除故障后 promote: %v", err)
+	}
+	var before model.PromptTemplate
+	if err := common.DB.Where("user_id = ? AND module = ?", exp.UserID, exp.PromptModule).First(&before).Error; err != nil {
+		t.Fatalf("读取晋级模板: %v", err)
+	}
+
+	const rollbackTrigger = "test_fail_experiment_rollback"
+	common.DB.Exec("DROP TRIGGER IF EXISTS " + rollbackTrigger)
+	t.Cleanup(func() { common.DB.Exec("DROP TRIGGER IF EXISTS " + rollbackTrigger) })
+	if err := common.DB.Exec(`CREATE TRIGGER ` + rollbackTrigger + `
+		BEFORE UPDATE OF status ON llm_experiments
+		WHEN NEW.status = 'rolled_back'
+		BEGIN SELECT RAISE(ABORT, 'forced rollback status failure'); END`).Error; err != nil {
+		t.Fatalf("创建 rollback 故障触发器: %v", err)
+	}
+	if _, err := RollbackLLMExperiment(exp.ID); err == nil {
+		t.Fatal("状态写失败时 rollback 应失败")
+	}
+	var after model.PromptTemplate
+	common.DB.First(&after, before.ID)
+	if !after.Enabled || after.Content != before.Content || after.Revision != before.Revision {
+		t.Fatalf("失败 rollback 必须回滚模板与 revision: before=%+v after=%+v", before, after)
+	}
+	common.DB.First(&stored, exp.ID)
+	if stored.Status != model.ExpStatusPromoted || stored.PromotedRevision != promoted.PromotedRevision {
+		t.Fatalf("失败 rollback 后实验应保持 promoted: %+v", stored)
 	}
 }
 

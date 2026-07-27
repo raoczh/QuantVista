@@ -124,7 +124,7 @@ func TestParseAndFilterPicksCoverageEmptyPicks(t *testing.T) {
 // 帮助 repair 反馈更精准。
 func TestParseAndFilterPicksCoverageAllInvalid(t *testing.T) {
 	pool := testPool()
-	content := `{"picks":[{"symbol":"999999","action":"buy"},{"symbol":"贵州茅台","action":"buy"}]}`
+	content := `{"picks":[{"symbol":"999999","action":"buy","confidence":80},{"symbol":"贵州茅台","action":"buy","confidence":80}]}`
 	_, _, diag, err := parseAndFilterPicks(content, pool, 5)
 	if err == nil {
 		t.Fatalf("全越池应返回错误")

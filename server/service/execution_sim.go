@@ -281,8 +281,11 @@ func simulateLabelHold(bars []datasource.Bar, i int, symbol, name string, horizo
 	if exitPrice <= 0 {
 		// 出场根坏数据（停牌/未同步的 0 价）：不伪造成熟收益，返回 pending 等待（与
 		// simEntry 买入侧 Open<=0 判 skip_suspend 对称，出场侧保守取 pending）。
+		// MFE/MAE 记录已有窗口，与上面 !endOK 的 pending 分支同口径——超窗强平
+		// （forceCloseStaleLabel）会沿用 out 里的 MFE/MAE，不算则强平后恒为 0。
 		out.Status = btPending
 		out.SellDate, out.SellPrice = "", 0
+		out.MfePct, out.MaePct = excursion(bars, buyIdx, len(bars)-1, buyPrice)
 		return out
 	}
 	sellAmount := exitPrice * qty

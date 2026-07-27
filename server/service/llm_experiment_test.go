@@ -5,8 +5,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"quantvista/common"
 	"quantvista/model"
@@ -30,10 +32,21 @@ func cleanExperimentTables(t *testing.T) {
 		common.DB.Where("1=1").Delete(&model.LLMReleaseAudit{})
 		common.DB.Where("1=1").Delete(&model.LLMExperimentRun{})
 		common.DB.Where("1=1").Delete(&model.LLMExperiment{})
+		common.DB.Where("1=1").Delete(&model.LLMExperimentModuleLock{})
 		common.DB.Where("module = ?", "recommend").Delete(&model.PromptTemplate{})
+		common.DB.Where("module = ?", "recommend").Delete(&model.PromptChampionState{})
 	}
 	clean()
 	t.Cleanup(clean)
+}
+
+func waitSignal(t *testing.T, ch <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("等待 %s 超时", name)
+	}
 }
 
 func expInput() LLMExperimentInput {
@@ -115,6 +128,103 @@ func TestLLMExperimentLifecycle(t *testing.T) {
 	}
 }
 
+// TestLLMExperimentConcurrentStart 同模块两个 draft 并发启动时，模块锁槽把
+// “检查 running + 状态迁移”串成一个事务，最终只能有一个 running。
+func TestLLMExperimentConcurrentStart(t *testing.T) {
+	setChallengerFlag(t, false)
+	cleanExperimentTables(t)
+	a, _, err := CreateLLMExperiment(1, expInput())
+	if err != nil {
+		t.Fatalf("创建 A: %v", err)
+	}
+	b, _, err := CreateLLMExperiment(1, expInput())
+	if err != nil {
+		t.Fatalf("创建 B: %v", err)
+	}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, id := range []int64{a.ID, b.ID} {
+		wg.Add(1)
+		go func(expID int64) {
+			defer wg.Done()
+			<-start
+			_, err := StartLLMExperiment(expID)
+			results <- err
+		}(id)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	successes := 0
+	for err := range results {
+		if err == nil {
+			successes++
+		} else if !strings.Contains(err.Error(), "单变量") {
+			t.Fatalf("失败方应由单变量门拒绝: %v", err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("并发启动应恰好成功一个，got %d", successes)
+	}
+	var running int64
+	common.DB.Model(&model.LLMExperiment{}).
+		Where("module = ? AND status = ?", "recommendation", model.ExpStatusRunning).Count(&running)
+	if running != 1 {
+		t.Fatalf("库内 running 应恰好一个，got %d", running)
+	}
+}
+
+// TestLLMExperimentChampionGenerationCannotWashBack generation 覆盖 revision 无法表达的
+// 默认/启停/删除往返；旧格式非终态实验也 fail-closed。
+func TestLLMExperimentChampionGenerationCannotWashBack(t *testing.T) {
+	setChallengerFlag(t, false)
+	cleanExperimentTables(t)
+	ps := NewPromptService()
+
+	defaultExp, _, err := CreateLLMExperiment(11, expInput())
+	if err != nil {
+		t.Fatalf("创建默认态实验: %v", err)
+	}
+	tpl, _, err := ps.Upsert(11, PromptInput{Module: model.PromptModuleRecommend, Content: "临时 custom", Enabled: true})
+	if err != nil {
+		t.Fatalf("default→custom: %v", err)
+	}
+	if err := ps.Delete(11, tpl.ID); err != nil {
+		t.Fatalf("custom→default: %v", err)
+	}
+	if _, err := StartLLMExperiment(defaultExp.ID); err == nil || !strings.Contains(err.Error(), "generation") {
+		t.Fatalf("default→custom→default 不得洗回: %v", err)
+	}
+
+	if _, _, err := ps.Upsert(12, PromptInput{Module: model.PromptModuleRecommend, Content: "custom-A", Enabled: true}); err != nil {
+		t.Fatalf("预置 A: %v", err)
+	}
+	customExp, _, err := CreateLLMExperiment(12, expInput())
+	if err != nil {
+		t.Fatalf("创建 custom 实验: %v", err)
+	}
+	if _, _, err := ps.Upsert(12, PromptInput{Module: model.PromptModuleRecommend, Content: "custom-A", Enabled: false}); err != nil {
+		t.Fatalf("停用 A: %v", err)
+	}
+	if _, _, err := ps.Upsert(12, PromptInput{Module: model.PromptModuleRecommend, Content: "custom-A", Enabled: true}); err != nil {
+		t.Fatalf("恢复 A: %v", err)
+	}
+	if _, err := StartLLMExperiment(customExp.ID); err == nil || !strings.Contains(err.Error(), "generation") {
+		t.Fatalf("custom A→disabled→A 不得洗回: %v", err)
+	}
+
+	legacy, _, err := CreateLLMExperiment(13, expInput())
+	if err != nil {
+		t.Fatalf("创建 legacy 探针: %v", err)
+	}
+	common.DB.Model(&model.LLMExperiment{}).Where("id = ?", legacy.ID).
+		UpdateColumn("baseline_version", llmExperimentBaselineVersionV1)
+	if _, err := StartLLMExperiment(legacy.ID); err == nil || !strings.Contains(err.Error(), "缺少单调") {
+		t.Fatalf("旧非终态实验应 fail-closed: %v", err)
+	}
+}
+
 // seedExperimentRuns 批量落影子样本。
 func seedExperimentRuns(t *testing.T, expID int64, valid, invalid int) {
 	t.Helper()
@@ -184,8 +294,8 @@ func TestLLMExperimentPromoteGate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("全门通过应晋级: %v", err)
 	}
-	if got.Status != model.ExpStatusPromoted || got.PromotedRevision <= 0 {
-		t.Fatalf("晋级状态/revision 不符: %+v", got)
+	if got.Status != model.ExpStatusPromoted || got.PromotedRevision <= 0 || got.PromotedGeneration <= 0 {
+		t.Fatalf("晋级状态/revision/generation 不符: %+v", got)
 	}
 	// champion 指针已切换：启用中的 recommend 模板即 challenger 内容。
 	var tpl model.PromptTemplate
@@ -311,6 +421,265 @@ func TestChallengerShadowNotMutateBusiness(t *testing.T) {
 	if calls.Load() != 1 {
 		t.Fatalf("达标后不应继续采样: %d", calls.Load())
 	}
+}
+
+// TestChallengerShadowInFlightCannotCrossComplete 外部调用开始后若实验先完成，迟到样本
+// 不得落库；ActualJSON、SampleCount 与 run 集合保持同一稳定快照。
+func TestChallengerShadowInFlightCannotCrossComplete(t *testing.T) {
+	setChallengerFlag(t, true)
+	cleanExperimentTables(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"picks\":[],\"rejected\":[]}"}}]}`))
+	}))
+	defer srv.Close()
+	exp, _, err := CreateLLMExperiment(1, expInput())
+	if err != nil {
+		t.Fatalf("创建: %v", err)
+	}
+	if _, err := StartLLMExperiment(exp.ID); err != nil {
+		t.Fatalf("启动: %v", err)
+	}
+	plan, batch, mainRun, champion, pool, cands := challengerShadowFixture(srv.URL)
+	plan.prompt = loadPromptRuntime(1, model.PromptModuleRecommend)
+	strat, _ := strategyByKey(model.RecTypeShortTerm, "")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		(&RecommendationService{}).maybeChallengerShadow(context.Background(), plan, batch, mainRun, 10,
+			chatUsage{}, champion, pool, model.RecTypeShortTerm, strat, "cn", 3, cands, RecFilters{}, nil)
+	}()
+	waitSignal(t, started, "影子上游调用开始")
+	completed, err := CompleteLLMExperiment(exp.ID, model.ExpConcludeImproved, "")
+	if err != nil {
+		t.Fatalf("完成实验: %v", err)
+	}
+	close(release)
+	waitSignal(t, done, "迟到影子调用返回")
+	var runCount int64
+	common.DB.Model(&model.LLMExperimentRun{}).Where("experiment_id = ?", exp.ID).Count(&runCount)
+	var stored model.LLMExperiment
+	common.DB.First(&stored, exp.ID)
+	if runCount != 0 || stored.SampleCount != 0 || completed.SampleCount != 0 ||
+		!strings.Contains(stored.ActualJSON, `"samples":0`) {
+		t.Fatalf("完成后的迟到样本不得改变稳定集合: runs=%d stored=%+v completed=%+v", runCount, stored, completed)
+	}
+}
+
+// TestChallengerShadowInFlightCannotCrossAbandon 废弃与样本最终提交使用同一实验行锁；
+// 废弃先线性化时，迟到样本不能复活计数或写入 run。
+func TestChallengerShadowInFlightCannotCrossAbandon(t *testing.T) {
+	setChallengerFlag(t, true)
+	cleanExperimentTables(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"picks\":[],\"rejected\":[]}"}}]}`))
+	}))
+	defer srv.Close()
+	exp, _, err := CreateLLMExperiment(1, expInput())
+	if err != nil {
+		t.Fatalf("创建: %v", err)
+	}
+	if _, err := StartLLMExperiment(exp.ID); err != nil {
+		t.Fatalf("启动: %v", err)
+	}
+	plan, batch, mainRun, champion, pool, cands := challengerShadowFixture(srv.URL)
+	plan.prompt = loadPromptRuntime(1, model.PromptModuleRecommend)
+	strat, _ := strategyByKey(model.RecTypeShortTerm, "")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		(&RecommendationService{}).maybeChallengerShadow(context.Background(), plan, batch, mainRun, 10,
+			chatUsage{}, champion, pool, model.RecTypeShortTerm, strat, "cn", 3, cands, RecFilters{}, nil)
+	}()
+	waitSignal(t, started, "影子上游调用开始")
+	abandoned, err := AbandonLLMExperiment(exp.ID, "并发废弃")
+	if err != nil || abandoned.Status != model.ExpStatusAbandoned {
+		t.Fatalf("废弃实验: %v %+v", err, abandoned)
+	}
+	close(release)
+	waitSignal(t, done, "迟到影子调用返回")
+	var runCount int64
+	common.DB.Model(&model.LLMExperimentRun{}).Where("experiment_id = ?", exp.ID).Count(&runCount)
+	var stored model.LLMExperiment
+	common.DB.First(&stored, exp.ID)
+	if runCount != 0 || stored.SampleCount != 0 || stored.Status != model.ExpStatusAbandoned {
+		t.Fatalf("废弃后的迟到样本不得改写实验: runs=%d stored=%+v", runCount, stored)
+	}
+}
+
+// TestLLMExperimentDefaultBaselineDriftSticky 默认任务段也是完整基线：代码升级造成的
+// 内置段变化须在 start/audit/promote 拒绝；内容恢复后已观测到的漂移仍不可洗回。
+func TestLLMExperimentDefaultBaselineDriftSticky(t *testing.T) {
+	setChallengerFlag(t, false)
+	cleanExperimentTables(t)
+	original := promptModuleDefaultTaskSegs[model.PromptModuleRecommend]
+	t.Cleanup(func() { promptModuleDefaultTaskSegs[model.PromptModuleRecommend] = original })
+
+	startExp, _, err := CreateLLMExperiment(1, expInput())
+	if err != nil {
+		t.Fatalf("创建 start 探针: %v", err)
+	}
+	promptModuleDefaultTaskSegs[model.PromptModuleRecommend] = original + "\n默认任务段升级"
+	if _, err := StartLLMExperiment(startExp.ID); err == nil || !strings.Contains(err.Error(), "基线已失效") {
+		t.Fatalf("默认任务段变化后 start 应拒绝: %v", err)
+	}
+
+	// 另建一个 completed 实验，分别锁定 audit/promote 门。先恢复创建与采样时的基线。
+	promptModuleDefaultTaskSegs[model.PromptModuleRecommend] = original
+	exp := releaseGateFixture(t)
+	promptModuleDefaultTaskSegs[model.PromptModuleRecommend] = original + "\n第二次默认任务段升级"
+	if _, err := RunLLMExperimentAudit(context.Background(), exp.ID); err == nil ||
+		!strings.Contains(err.Error(), "基线已失效") {
+		t.Fatalf("默认任务段变化后 audit 应拒绝: %v", err)
+	}
+	if _, err := PromoteLLMExperiment(exp.ID); err == nil || !strings.Contains(err.Error(), "基线已失效") {
+		t.Fatalf("默认任务段变化后 promote 应拒绝: %v", err)
+	}
+
+	// 恢复原文后仍由持久失效原因挡住，列表同步透出 baseline_stale。
+	promptModuleDefaultTaskSegs[model.PromptModuleRecommend] = original
+	if _, err := PromoteLLMExperiment(exp.ID); err == nil || !strings.Contains(err.Error(), "基线已失效") {
+		t.Fatalf("默认任务段恢复后不得洗回: %v", err)
+	}
+	views, err := ListLLMExperiments()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	seen := false
+	for _, view := range views {
+		if view.ID == exp.ID && view.BaselineStale != "" {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatal("列表应返回 baseline_stale")
+	}
+}
+
+// TestChallengerShadowOldBatchBeforeExperimentDoesNotInvalidate 新实验基于 live B 启动后，
+// 启动前已固化 A 的旧业务批次迟到完成时只跳过，不得把有效的 B 基线实验永久标 stale。
+func TestChallengerShadowOldBatchBeforeExperimentDoesNotInvalidate(t *testing.T) {
+	setChallengerFlag(t, true)
+	cleanExperimentTables(t)
+	ps := NewPromptService()
+	if _, _, err := ps.Upsert(1, PromptInput{Module: model.PromptModuleRecommend, Content: "custom-A", Enabled: true}); err != nil {
+		t.Fatalf("预置 A: %v", err)
+	}
+	oldPrompt := loadPromptRuntime(1, model.PromptModuleRecommend) // 实验启动前批次已固化 A
+	if _, _, err := ps.Upsert(1, PromptInput{Module: model.PromptModuleRecommend, Content: "custom-B", Enabled: true}); err != nil {
+		t.Fatalf("切到 B: %v", err)
+	}
+	exp, _, err := CreateLLMExperiment(1, expInput())
+	if err != nil {
+		t.Fatalf("基于 B 创建实验: %v", err)
+	}
+	if _, err := StartLLMExperiment(exp.ID); err != nil {
+		t.Fatalf("启动 B 基线实验: %v", err)
+	}
+
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"picks\":[],\"rejected\":[]}"}}]}`))
+	}))
+	defer srv.Close()
+	plan, batch, mainRun, champion, pool, cands := challengerShadowFixture(srv.URL)
+	plan.prompt = oldPrompt
+	strat, _ := strategyByKey(model.RecTypeShortTerm, "")
+	svc := &RecommendationService{}
+	svc.maybeChallengerShadow(context.Background(), plan, batch, mainRun, 10,
+		chatUsage{}, champion, pool, model.RecTypeShortTerm, strat, "cn", 3, cands, RecFilters{}, nil)
+	if calls.Load() != 0 {
+		t.Fatalf("旧批次 A 不属于 B 实验采样窗口，不应调用 challenger: %d", calls.Load())
+	}
+	var stored model.LLMExperiment
+	if err := common.DB.First(&stored, exp.ID).Error; err != nil {
+		t.Fatalf("读取实验: %v", err)
+	}
+	if stored.BaselineInvalidReason != "" || stored.SampleCount != 0 {
+		t.Fatalf("旧批次只能跳过，不得污染或永久失效实验: %+v", stored)
+	}
+
+	// 后续真实使用 live B 的批次仍可正常采样，证明旧批次没有误杀实验。
+	plan.prompt = loadPromptRuntime(1, model.PromptModuleRecommend)
+	svc.maybeChallengerShadow(context.Background(), plan, batch, mainRun, 10,
+		chatUsage{}, champion, pool, model.RecTypeShortTerm, strat, "cn", 3, cands, RecFilters{}, nil)
+	if calls.Load() != 1 {
+		t.Fatalf("live B 批次应继续正常采样: %d", calls.Load())
+	}
+	if err := common.DB.First(&stored, exp.ID).Error; err != nil || stored.SampleCount != 1 || stored.BaselineInvalidReason != "" {
+		t.Fatalf("live B 采样后实验状态不符: err=%v exp=%+v", err, stored)
+	}
+}
+
+// TestChallengerShadowCustomBaselineCannotWashBack 自定义 A→B 时，使用 B 的主调用不得
+// 进入 A 基线实验；即使随后恢复 A，revision 与粘性失效标记仍保留。
+func TestChallengerShadowCustomBaselineCannotWashBack(t *testing.T) {
+	setChallengerFlag(t, true)
+	cleanExperimentTables(t)
+	ps := NewPromptService()
+	if _, _, err := ps.Upsert(1, PromptInput{Module: model.PromptModuleRecommend, Content: "custom-A", Enabled: true}); err != nil {
+		t.Fatalf("预置 A: %v", err)
+	}
+	exp, _, err := CreateLLMExperiment(1, expInput())
+	if err != nil {
+		t.Fatalf("创建: %v", err)
+	}
+	if _, err := StartLLMExperiment(exp.ID); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if _, _, err := ps.Upsert(1, PromptInput{Module: model.PromptModuleRecommend, Content: "custom-B", Enabled: true}); err != nil {
+		t.Fatalf("切到 B: %v", err)
+	}
+
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"choices":[]}`))
+	}))
+	defer srv.Close()
+	plan, batch, mainRun, champion, pool, cands := challengerShadowFixture(srv.URL)
+	plan.prompt = loadPromptRuntime(1, model.PromptModuleRecommend) // 主调用实际使用 B
+	strat, _ := strategyByKey(model.RecTypeShortTerm, "")
+	(&RecommendationService{}).maybeChallengerShadow(context.Background(), plan, batch, mainRun, 10,
+		chatUsage{}, champion, pool, model.RecTypeShortTerm, strat, "cn", 3, cands, RecFilters{}, nil)
+	if calls.Load() != 0 {
+		t.Fatalf("基线漂移后不得发影子调用: %d", calls.Load())
+	}
+	var runCount int64
+	common.DB.Model(&model.LLMExperimentRun{}).Where("experiment_id = ?", exp.ID).Count(&runCount)
+	if runCount != 0 {
+		t.Fatalf("基线漂移不得落污染样本: %d", runCount)
+	}
+
+	if _, _, err := ps.Upsert(1, PromptInput{Module: model.PromptModuleRecommend, Content: "custom-A", Enabled: true}); err != nil {
+		t.Fatalf("恢复 A: %v", err)
+	}
+	var row model.LLMExperiment
+	common.DB.First(&row, exp.ID)
+	if row.BaselineInvalidReason == "" {
+		t.Fatal("A→B 采样尝试必须粘性记录基线失效")
+	}
+	views, err := ListLLMExperiments()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	for _, view := range views {
+		if view.ID == exp.ID {
+			if view.BaselineStale == "" {
+				t.Fatal("恢复 A 后列表仍应返回 baseline_stale")
+			}
+			return
+		}
+	}
+	t.Fatal("列表缺少实验")
 }
 
 // TestExperimentBudgetRegistered 影子模块预算登记：无 repair、与推荐主调同 token 预算。

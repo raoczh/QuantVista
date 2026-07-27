@@ -95,14 +95,35 @@ func seedRecallFixture(t *testing.T) (batchID int64) {
 	if err := common.DB.Create(&events).Error; err != nil {
 		t.Fatalf("seed events 失败: %v", err)
 	}
+	// LabelVersion 必填：生产侧 reclabel.go 创建与结算两处都写当前版本，
+	// 报表按 label_version 隔离（l1 已终态样本执行语义与 l2 不同，永久留库不重算）。
 	label := model.RecommendationLabel{
 		RecommendationID: 0, CandidateEventID: events[1].ID, BatchID: batch.ID, UserID: 7,
 		Symbol: "600002", Market: "cn", Type: model.RecTypeShortTerm,
 		HorizonDays: 5, EntryMode: model.EntryModeNextOpen,
 		SignalDate: signalDate, NetReturnPct: 8.0, MaturityStatus: model.LabelMatured,
+		LabelVersion: labelVersion,
 	}
 	if err := common.DB.Create(&label).Error; err != nil {
 		t.Fatalf("seed label 失败: %v", err)
+	}
+	// 两条干扰样本，锁定「错失收益」分布的剔除口径（与归因/影子/校准/联合评估一致）：
+	// ①旧口径 l1 行（执行语义不同，混入会让新旧各说各话）；②Forced 强平行（顺延/退市
+	// 长停按末根收盘，真实中卖不出、收益偏保守）。两者都不得进 MissedLabels。
+	noise := []model.RecommendationLabel{
+		{RecommendationID: 0, CandidateEventID: events[2].ID, BatchID: batch.ID, UserID: 7,
+			Symbol: "600003", Market: "cn", Type: model.RecTypeShortTerm,
+			HorizonDays: 5, EntryMode: model.EntryModeNextOpen,
+			SignalDate: signalDate, NetReturnPct: 99.0, MaturityStatus: model.LabelMatured,
+			LabelVersion: "l1"},
+		{RecommendationID: 0, CandidateEventID: events[0].ID, BatchID: batch.ID, UserID: 7,
+			Symbol: "600001", Market: "cn", Type: model.RecTypeShortTerm,
+			HorizonDays: 5, EntryMode: model.EntryModeNextOpen,
+			SignalDate: signalDate, NetReturnPct: -77.0, MaturityStatus: model.LabelMatured,
+			LabelVersion: labelVersion, Forced: true},
+	}
+	if err := common.DB.Create(&noise).Error; err != nil {
+		t.Fatalf("seed noise label 失败: %v", err)
 	}
 	return batch.ID
 }

@@ -125,6 +125,7 @@ func (s *RecommendationService) bearReview(ctx context.Context, userID int64, cf
 				valid = append(valid, b)
 			}
 			if len(valid) > 0 {
+				run.acceptRouteAttribution()
 				return valid, usage, run
 			}
 		}

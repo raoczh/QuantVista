@@ -292,6 +292,59 @@ func TestJointEvalNoSplitFewDays(t *testing.T) {
 	}
 }
 
+// TestJointEvalTurnoverStrictlyUsesDevDays 少于切分门槛时 lockedDays 为空，默认换手仍只能
+// 使用成熟 devDays；更晚的 pending 批次不得因“未发生切分”而混入。
+func TestJointEvalTurnoverStrictlyUsesDevDays(t *testing.T) {
+	setupTestDB(t)
+	cleanJointTables(t)
+	common.DB.Create(&model.RecommendationBatch{ID: 211, UserID: 1, Type: model.RecTypeShortTerm,
+		Provider: "openai", Model: "m", PromptVersion: "p13", Status: model.RecStatusSuccess})
+	common.DB.Create(&model.RecommendationBatch{ID: 212, UserID: 1, Type: model.RecTypeShortTerm,
+		Provider: "openai", Model: "m", PromptVersion: "p13", Status: model.RecStatusSuccess})
+	common.DB.Create(&model.RecommendationBatch{ID: 213, UserID: 1, Type: model.RecTypeShortTerm,
+		Provider: "openai", Model: "m", PromptVersion: "p13", Status: model.RecStatusSuccess})
+	id := int64(2000)
+	for i := 1; i <= 5; i++ {
+		id++
+		jointSeedLabel(t, id, 211, time.Date(2026, 7, i, 0, 0, 0, 0, time.Local).Format("2006-01-02"),
+			model.RecActionBuy, 80, 1, -1, model.LabelMatured)
+	}
+	jointSeedLabel(t, id+1, 212, "2026-07-20", model.RecActionBuy, 80, 0, 0, model.LabelPending)
+	jointSeedLabel(t, id+2, 213, "2026-07-21", model.RecActionBuy, 80, 0, 0, model.LabelPending)
+
+	sec, err := buildJointEvalSection(model.RecTypeShortTerm, 10, false)
+	if err != nil {
+		t.Fatalf("buildJointEvalSection: %v", err)
+	}
+	if sec.Dev == nil || sec.Dev.SignalDays != 5 || sec.LockedPreview != nil {
+		t.Fatalf("应为 5 个 dev 日且不切分: dev=%+v preview=%+v", sec.Dev, sec.LockedPreview)
+	}
+	if sec.Turnover.Pairs != 0 {
+		t.Fatalf("默认换手不得纳入 devDays 外的 future pending 批次: %+v", sec.Turnover)
+	}
+}
+
+// TestJointEvalTurnoverEmptyWithoutDevDays 全部标签 pending 时没有成熟 dev 日期；默认路径
+// 不应查询全量名单并计算换手，结果须为空。
+func TestJointEvalTurnoverEmptyWithoutDevDays(t *testing.T) {
+	setupTestDB(t)
+	cleanJointTables(t)
+	common.DB.Create(&model.RecommendationBatch{ID: 221, UserID: 1, Type: model.RecTypeShortTerm,
+		Provider: "openai", Model: "m", PromptVersion: "p13", Status: model.RecStatusSuccess})
+	common.DB.Create(&model.RecommendationBatch{ID: 222, UserID: 1, Type: model.RecTypeShortTerm,
+		Provider: "openai", Model: "m", PromptVersion: "p13", Status: model.RecStatusSuccess})
+	jointSeedLabel(t, 2201, 221, "2026-07-20", model.RecActionBuy, 80, 0, 0, model.LabelPending)
+	jointSeedLabel(t, 2202, 222, "2026-07-21", model.RecActionBuy, 80, 0, 0, model.LabelPending)
+
+	sec, err := buildJointEvalSection(model.RecTypeShortTerm, 10, false)
+	if err != nil {
+		t.Fatalf("buildJointEvalSection: %v", err)
+	}
+	if sec.Dev == nil || sec.Dev.SignalDays != 0 || sec.Turnover.Pairs != 0 {
+		t.Fatalf("无 devDays 时默认 turnover 必须为空: dev=%+v turnover=%+v", sec.Dev, sec.Turnover)
+	}
+}
+
 // TestJointSegStatsCalibThreshold 段内校准与校准报表同门槛：不足 calibEvalMinSample
 // 时 Brier/ECE 为 nil（未评估≠0 分），calib_sample 如实计数。
 func TestJointSegStatsCalibThreshold(t *testing.T) {
@@ -449,5 +502,26 @@ func TestJointEvalMarshal(t *testing.T) {
 	}
 	if len(rep.Sections) != 2 {
 		t.Fatalf("应两个 section（短线/长线）: %d", len(rep.Sections))
+	}
+}
+
+// TestJointSegStatsRawCalibRejectOnly 联合评估主口径没有最终 buy 时，仍应按原始
+// buy 输出 raw_calib，避免复核 reject 样本从联合评估中消失。
+func TestJointSegStatsRawCalibRejectOnly(t *testing.T) {
+	rawAction := model.RecActionBuy
+	rawConfidence := 85
+	seg := jointSegStats("dev", []string{"2026-06-01"}, []calibSample{{
+		label: model.RecommendationLabel{
+			Action: model.RecActionWatch, SignalDate: "2026-06-01", NetReturnPct: -2,
+		},
+		meta: calibRecMeta{
+			conf: 25, rawAction: &rawAction, rawConf: &rawConfidence,
+		},
+	}})
+	if seg.BuySample != 0 || seg.CalibSample != 0 {
+		t.Fatalf("最终 watch 不应进入主口径: %+v", seg)
+	}
+	if seg.RawCalib == nil || seg.RawCalib.Sample != 1 || seg.RawCalib.Diverged != 1 || seg.RawCalib.Missing != 0 {
+		t.Fatalf("reject-only 应保留原始 buy 校准: %+v", seg.RawCalib)
 	}
 }

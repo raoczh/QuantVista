@@ -54,7 +54,7 @@ func main() {
 	service.StartDailyReportJobs(mgr)
 	service.StartNewsJobs()
 	service.StartFinanceJobs(mgr)
-	service.StartMoodJobs()
+	service.StartMoodJobs(mgr)
 	service.StartIntradayJobs()
 	service.StartLLMLogJobs()
 

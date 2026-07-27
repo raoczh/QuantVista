@@ -14,6 +14,9 @@ const min5Fixture = `{"code":0,"msg":"","data":{"sh600519":{"qt":{"sh600519":["1
 // 非法代码：qt 空数组且无 m5 键（2026-07-09 实测 sh999999）。
 const min5InvalidFixture = `{"code":0,"msg":"","data":{"sh999999":{"qt":{"sh999999":[],"market":["..."]}}}}`
 
+// mkline m1 与 m5 同构；保留 prec 锚点与跨日行，消费层负责只取末日。
+const min1Fixture = `{"code":0,"msg":"","data":{"sz000001":{"m1":[["202607241500","10.10","10.20","10.25","10.05","900",{},"0.1"],["202607270931","10.30","10.35","10.40","10.28","1200",{},"0.1"],["202607270932","10.35","10.32","10.38","10.30","800",{},"0.1"]],"prec":"10.18"}}}`
+
 func TestParseMin5Response(t *testing.T) {
 	bars, err := parseMin5Response([]byte(min5Fixture), "sh600519")
 	if err != nil {
@@ -38,6 +41,25 @@ func TestParseMin5Response(t *testing.T) {
 		if x.High < x.Open || x.High < x.Close || x.Low > x.Open || x.Low > x.Close {
 			t.Errorf("第 %d 根 OHLC 不变式破坏: %+v", i, x)
 		}
+	}
+}
+
+func TestParseMinuteResponseM1(t *testing.T) {
+	bars, prec, err := parseMinuteResponse([]byte(min1Fixture), "sz000001", minutePeriodM1)
+	if err != nil {
+		t.Fatalf("解析 m1 失败: %v", err)
+	}
+	if len(bars) != 3 || prec != 10.18 {
+		t.Fatalf("m1/prec 错误: bars=%d prec=%v", len(bars), prec)
+	}
+	if bars[1].Time != "202607270931" || bars[1].Open != 10.30 || bars[1].Close != 10.35 || bars[1].Volume != 1200 {
+		t.Fatalf("m1 列序/单位错误: %+v", bars[1])
+	}
+
+	withoutPrec := `{"code":0,"data":{"sz000001":{"m1":[["202607270931","10","10.1","10.2","9.9","1",{},"0"]]}}}`
+	_, prec, err = parseMinuteResponse([]byte(withoutPrec), "sz000001", minutePeriodM1)
+	if err != nil || prec != 0 {
+		t.Fatalf("prec 缺失应如实返回 0 交由服务层回退: prec=%v err=%v", prec, err)
 	}
 }
 

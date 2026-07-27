@@ -34,6 +34,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	scoreSvc := service.NewScoreService(marketSvc)
 	indicatorSvc := service.NewIndicatorService(marketSvc)
 	chipSvc := service.NewChipService(marketSvc)
+	intradaySvc := service.NewIntradayService()
 	paperSvc := service.NewPaperService(marketSvc)
 	etfSvc := service.NewEtfService(marketSvc)
 	notifySvc := service.NewNotifyService()
@@ -48,7 +49,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	orgViewSvc := service.NewOrgViewService()
 
 	// controllers
-	marketCtl := controller.NewMarketController(marketSvc, scoreSvc, indicatorSvc, chipSvc)
+	marketCtl := controller.NewMarketController(marketSvc, scoreSvc, indicatorSvc, chipSvc, intradaySvc)
 	authCtl := controller.NewAuthController(authSvc)
 	setupCtl := controller.NewSetupController(authSvc)
 	userCtl := controller.NewUserController(userSvc)
@@ -112,7 +113,11 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 		markets.Use(middleware.RateLimit(120, time.Minute))
 		{
 			markets.GET("/:market/overview", marketCtl.GetOverview)
+			markets.GET("/:market/mood", moodCtl.Overview)
+			markets.GET("/:market/lhb", moodCtl.LhbDaily)
+			markets.GET("/:market/popularity", moodCtl.PopularityDaily)
 			markets.GET("/:market/stocks/:symbol/quote", marketCtl.GetQuote)
+			markets.GET("/:market/stocks/:symbol/minute", marketCtl.GetMinuteLine)
 			markets.GET("/:market/stocks/:symbol/bars", marketCtl.GetDailyBars)
 			markets.GET("/:market/stocks/:symbol/score", marketCtl.GetScore)
 			markets.GET("/:market/stocks/:symbol/valuation", marketCtl.GetValuation)

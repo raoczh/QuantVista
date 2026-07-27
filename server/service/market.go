@@ -59,7 +59,7 @@ func (s *MarketService) GetQuote(ctx context.Context, market, symbol string) (*d
 	}
 
 	// 落库：股票基础信息 + 最新行情快照（按 symbol+market 覆盖更新）。
-	s.persist(q)
+	s.persist(ctx, q)
 
 	if b, err := json.Marshal(q); err == nil {
 		common.RedisSet(cacheKey, string(b), quoteCacheTTL)
@@ -121,7 +121,7 @@ func (s *MarketService) GetFreshQuote(ctx context.Context, market, symbol string
 		common.SysWarn("取新鲜行情失败 symbol=%s: %v", symbol, err)
 		return nil, quoteFreshInfo{Status: freshStatusStale, MarketState: state, ExpectedDate: expected}, err
 	}
-	s.persist(q)
+	s.persist(ctx, q)
 	if b, err := json.Marshal(q); err == nil {
 		common.RedisSet(cacheKey, string(b), quoteCacheTTL)
 		if !fresh {
@@ -245,7 +245,7 @@ func (s *MarketService) GetDailyBars(ctx context.Context, market, symbol string,
 	}
 	// 在线读路径 best-effort 落库：拉取成功即向调用方返回行情，落库失败只告警
 	//（persistDailyBars 内部已 SysWarn），不因缓存回种失败阻断读。
-	_ = s.persistDailyBars(market, symbol, bars)
+	_ = s.persistDailyBars(ctx, market, symbol, bars)
 	if b, err := json.Marshal(bars); err == nil {
 		common.RedisSet(cacheKey, string(b), dailyBarsCacheTTL)
 	}
@@ -466,16 +466,23 @@ func (s *MarketService) GetOverview(ctx context.Context, market string) *Overvie
 	return ov
 }
 
-func (s *MarketService) persistDailyBars(market, symbol string, bars []datasource.Bar) error {
+func (s *MarketService) persistDailyBars(ctx context.Context, market, symbol string, bars []datasource.Bar) error {
 	if common.DB == nil || len(bars) == 0 {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	db := common.DB.WithContext(ctx)
 
 	// M1 除权检测（防"部分窗口重写"漏检）：本次拉取若与 DB 内已有窗口的 close 多点
 	// 比对出现偏差，说明发生了除权/送转（东财前复权序列整体重锚）——此时只 upsert
 	// 本窗会留下"窗口内新基准、窗口外旧基准"的断层。检测命中即全量重锚（250 根删+插）
 	// 后直接返回。仅东财源检测：新浪日线不复权，与前复权基准比对必然偏差，会误判。
-	if market == "cn" && bars[0].Source == "eastmoney" && s.detectAndRebase(market, symbol, bars) {
+	if market == "cn" && bars[0].Source == "eastmoney" && s.detectAndRebase(ctx, market, symbol, bars) {
 		return nil
 	}
 
@@ -537,7 +544,7 @@ func (s *MarketService) persistDailyBars(market, symbol string, bars []datasourc
 		if hasTurnover {
 			updateCols = append(updateCols, "turnover_rate")
 		}
-		if err := common.DB.Clauses(clause.OnConflict{
+		if err := db.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "trade_date"}},
 			DoUpdates: clause.AssignmentColumns(updateCols),
 		}).CreateInBatches(dailyRows, 200).Error; err != nil && err != gorm.ErrEmptySlice {
@@ -549,7 +556,7 @@ func (s *MarketService) persistDailyBars(market, symbol string, bars []datasourc
 	}
 
 	if len(calendarRows) > 0 {
-		if err := common.DB.Clauses(clause.OnConflict{
+		if err := db.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "market"}, {Name: "trade_date"}},
 			DoUpdates: clause.AssignmentColumns([]string{"is_open"}),
 		}).CreateInBatches(calendarRows, 200).Error; err != nil && err != gorm.ErrEmptySlice {
@@ -559,13 +566,17 @@ func (s *MarketService) persistDailyBars(market, symbol string, bars []datasourc
 	}
 	return nil
 }
-func (s *MarketService) persist(q *datasource.Quote) {
+func (s *MarketService) persist(ctx context.Context, q *datasource.Quote) {
 	if common.DB == nil {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db := common.DB.WithContext(ctx)
 	// upsert stock
 	stock := model.Stock{Symbol: q.Symbol, Market: q.Market, Name: q.Name}
-	if err := common.DB.Clauses(clause.OnConflict{
+	if err := db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "symbol"}, {Name: "market"}},
 		DoUpdates: clause.AssignmentColumns([]string{"name", "updated_at"}),
 	}).Create(&stock).Error; err != nil {
@@ -584,7 +595,7 @@ func (s *MarketService) persist(q *datasource.Quote) {
 		Open: q.Open, High: q.High, Low: q.Low, PrevClose: q.PrevClose,
 		Volume: q.Volume, Amount: q.Amount, Source: q.Source, DataTime: dataTime,
 	}
-	if err := common.DB.Clauses(clause.OnConflict{
+	if err := db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "symbol"}, {Name: "market"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"price", "change_pct", "open", "high", "low", "prev_close",

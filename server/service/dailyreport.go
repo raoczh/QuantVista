@@ -898,6 +898,7 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 		return nil, total, run, err
 	}
 	if rv, perr := parse(res.Content); perr == nil {
+		run.acceptRouteAttribution()
 		return rv, total, run, nil
 	}
 
@@ -926,6 +927,7 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 		run.DegradedReason = "llm_output_invalid"
 		return nil, total, run, refusalErrf(RefusalLLMOutputInvalid, "复盘输出无法解析：%v", perr)
 	}
+	run.acceptRouteAttribution()
 	return rv, total, run, nil
 }
 

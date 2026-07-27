@@ -457,14 +457,18 @@ func lookupReflections(asOf time.Time, userID int64, recType, strategy string, s
 		}
 	}
 	var bySymbol []model.RecommendationReflection
+	// id DESC tiebreaker 不许删：同一轮生成的反思共用同一个 now 作 available_from
+	//（reflectionBatchMax=5 条一次落库），时间戳完全相同；无 tiebreaker 时候选超过名额
+	// 选中哪几条退化为 SQLite 物理页序，影子快照不可复现。同 loadReflectionCandidates
+	// 的 id ASC 先例（那处曾导致测试 flaky）。
 	if err := common.DB.Where("user_id = ? AND available_from <= ? AND symbol IN ?", userID, asOf, symbols).
-		Order("available_from DESC").Limit(reflectionShadowMax).Find(&bySymbol).Error; err == nil {
+		Order("available_from DESC, id DESC").Limit(reflectionShadowMax).Find(&bySymbol).Error; err == nil {
 		appendRows(bySymbol, "symbol")
 	}
 	if len(out) < reflectionShadowMax {
 		var byStrategy []model.RecommendationReflection
 		if err := common.DB.Where("user_id = ? AND available_from <= ? AND rec_type = ? AND strategy = ?", userID, asOf, recType, strategy).
-			Order("available_from DESC").Limit(reflectionShadowMax).Find(&byStrategy).Error; err == nil {
+			Order("available_from DESC, id DESC").Limit(reflectionShadowMax).Find(&byStrategy).Error; err == nil {
 			appendRows(byStrategy, "strategy")
 		}
 	}

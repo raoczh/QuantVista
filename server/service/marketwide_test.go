@@ -324,7 +324,7 @@ func TestPersistDailyBarsDetectRebase(t *testing.T) {
 	svc := &MarketService{wide: fake}
 
 	// 部分窗口落库 → 多点检测命中 → 自动全量重锚（防"部分窗口重写"漏检的核心场景）。
-	svc.persistDailyBars("cn", "600002", freshTail)
+	svc.persistDailyBars(context.Background(), "cn", "600002", freshTail)
 	if n := barCount(t, "600002"); n != 250 {
 		t.Fatalf("重锚后 bar 数 = %d, want 250", n)
 	}
@@ -344,7 +344,7 @@ func TestPersistDailyBarsDetectRebase(t *testing.T) {
 	for i := range sinaBars {
 		sinaBars[i].Source = "sina"
 	}
-	svc.persistDailyBars("cn", "600003", sinaBars)
+	svc.persistDailyBars(context.Background(), "cn", "600003", sinaBars)
 	if n := barCount(t, "600003"); n != 120 {
 		t.Fatalf("sina 源不应触发重锚, bar 数 = %d, want 120", n)
 	}
@@ -375,7 +375,7 @@ func TestPersistDailyBarsRebaseFailFallback(t *testing.T) {
 	for i := range fresh {
 		fresh[i].Source = "eastmoney"
 	}
-	svc.persistDailyBars("cn", "600004", fresh)
+	svc.persistDailyBars(context.Background(), "cn", "600004", fresh)
 	// 本窗已写（尾部新基准），头部残留旧基准（断层），但 states 已标 pending。
 	var tail model.DailyBar
 	common.DB.Where("symbol = ? AND trade_date = ?", "600004", allDates[199]).First(&tail)

@@ -40,8 +40,10 @@
 
 ### 2.4 腾讯财经（qt.gtimg.cn）
 
-- 用途：实时行情快照（独立于东财/新浪的第三源，稳定性好）。
+- 用途：实时行情快照（独立于东财/新浪的第三源，稳定性好）以及 mkline m1/m5 分钟线。
 - 接口：`https://qt.gtimg.cn/q=sh600000`（批量用逗号分隔），需带 `Referer`，返回 GBK 文本，`~` 分隔字段。
+- 分钟线接口：`https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600000,m1,,260`；m1 用于个股分时图按需拉取，
+  m5 用于盘中因子盘后同步。两者都无成交额列；m1 均价线按 `Σ(close×volume)/Σvolume` 估算并显式标注。
 - 已接入为行情链路第二源；日线腾讯接口字段不稳，未用。
 
 ### 2.5 东财负载节点（重要技巧）
@@ -77,9 +79,10 @@
 
 接口：`stk_mins`（分钟线）、`margin_detail`（融资融券明细）、`ccass_hold`（中央结算持股）等。
 
-用途：分钟级行情、融资融券明细、沪深港通持股明细。
+用途：Tushare 自身的分钟级行情、融资融券明细、沪深港通持股明细。
 
-**标记暂不实现**：对个人自用研究工具，分钟线与这类明细数据性价比不足（捐赠门槛高、对长短线研究与追踪非必需），本项目不做。实时盘中仍走东财/新浪；如未来确需分钟级数据再评估。
+**标记暂不实现**：不接入上述需 5000 积分的 Tushare 能力。个股分时与盘中因子已改用免鉴权的腾讯 mkline
+m1/m5；融资融券明细、沪深港通持股明细仍不做。
 
 ### 3.4 启用步骤
 
@@ -119,7 +122,7 @@
 | 实时行情 | 腾讯 | `qt.gtimg.cn/q=` | ✅ 已接入（2.4） |
 | 东财负载节点 | 东财 | `{1..99}.push2.eastmoney.com` | ✅ 已采纳（2.5） |
 | 板块/榜单 | 东财 | `{n}.push2.eastmoney.com/api/qt/clist/get` | ✅ 已用（best-effort，限流时降级） |
-| 5 分钟线（盘中因子） | 腾讯 | `ifzq.gtimg.cn/appstock/app/kline/mkline` | ✅ 已接入（M3b，`tencent_mkline.go`，count≤800≈18 交易日） |
+| 1/5 分钟线（分时图/盘中因子） | 腾讯 | `ifzq.gtimg.cn/appstock/app/kline/mkline` | ✅ 已接入（A1/M3b，m1 按需短缓存、m5 盘后同步；`tencent_mkline.go`） |
 | 财务三表/F10/财报日历/公告 | 东财 | `datacenter.eastmoney.com`（RPT_* 报表族） | ✅ 已接入（F1/F2，`emdatacenter.go` 网关 QPS≤2） |
 | 龙虎榜/机构席位 | 东财 | datacenter `RPT_DAILYBILLBOARD_DETAILSNEW` 等 | ✅ 已接入（M3a，`emlhb.go`） |
 | 涨停池/连板/炸板情绪 | 东财 | `push2ex.eastmoney.com/getTopicZTPool` 族 | ✅ 已接入（M3a，`eastmoney_ztpool.go`，不可回溯靠每日快照积累） |

@@ -221,12 +221,20 @@ func (s *RecommendationService) RecRecallReport(ctx context.Context, userID int6
 		}
 	}
 	var labels []model.RecommendationLabel
-	if err := common.DB.Where("batch_id IN ? AND horizon_days = ? AND entry_mode = ? AND maturity_status = ?",
-		batchIDs, horizon, model.EntryModeNextOpen, model.LabelMatured).Find(&labels).Error; err != nil {
+	// label_version 隔离与 Forced 剔除：与归因（recattribution）/影子（recshadow）/
+	// 校准（reccalib）/联合评估（recjointeval）四处口径对齐——l1 已终态样本不重算、
+	// 永久留库（执行语义与 l2 不同：l1 是 buyIdx+horizon-1，h=1 时同日买卖违反 T+1），
+	// 混入会让「错失机会收益」新旧语义各说各话；Forced（顺延/退市长停末根强平）收益
+	// 偏保守（真实中卖不出），与本报表机会集侧既有的 Forced 剔除保持一致。
+	if err := common.DB.Where("batch_id IN ? AND horizon_days = ? AND entry_mode = ? AND maturity_status = ? AND label_version = ?",
+		batchIDs, horizon, model.EntryModeNextOpen, model.LabelMatured, labelVersion).Find(&labels).Error; err != nil {
 		return nil, err
 	}
 	labelNet := map[string]float64{} // "batch|symbol" → 成熟净收益
 	for _, l := range labels {
+		if l.Forced {
+			continue
+		}
 		labelNet[fmt.Sprintf("%d|%s", l.BatchID, l.Symbol)] = l.NetReturnPct
 	}
 

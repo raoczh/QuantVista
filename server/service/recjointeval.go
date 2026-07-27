@@ -294,9 +294,10 @@ func jointSegStats(segment string, days []string, list []calibSample) *JointEval
 		seg.Brier = calibBrier(cobs)
 		seg.ECE = calibECE(cobs)
 	}
-	// 原始口径分列（第五十六批②）：与校准报表共用 calibRawSummary（同实现同门槛）。
-	if len(cobs) > 0 {
-		seg.RawCalib = calibRawSummary(list)
+	// 原始口径按复核前动作取样；即使最终 buy 为空也保留被 reject 的原始 buy。
+	rawCalib := calibRawSummary(list)
+	if rawCalib.Sample > 0 || rawCalib.Missing > 0 {
+		seg.RawCalib = rawCalib
 	}
 	return seg
 }
@@ -399,18 +400,20 @@ func buildJointEvalSection(recType string, horizon int, includeLocked bool) (*Jo
 	// buy 名单。独立轻量查询（只取四列）。**锁定段隔离（审查修复批）**：默认视图只吃
 	// 开发段信号日的批次——修复前无条件全量查询让常规页面请求消费了 locked 日期的名单
 	// 数据（换手指标受 locked 影响却无审计记录），违反「默认只显示 locked 范围与样本数」；
-	// include_locked（已登记审计的显式请求）才纳入 locked 日期批次。注意切分基于可用
-	// 成熟样本的信号日集合，晚于 dev 末日的日期（含未成熟新批次）默认一律排除——宁缺
-	// 勿泄，与锁定段「按日期界」的语义一致。
+	// include_locked（已登记审计的显式请求）才纳入其他日期批次。默认路径严格使用
+	// signal_date IN devDays，而不是“<= dev 末日”：无成熟 dev 日期时结果必须为空，少日
+	// 不切分时也不能让 devDays 之外的 pending 批次混入换手。
 	var turnRows []model.RecommendationLabel
-	turnQ := common.DB.Select("user_id", "batch_id", "signal_date", "symbol", "action").
-		Where("horizon_days = ? AND entry_mode = ? AND recommendation_id > 0 AND label_version = ? AND type = ?",
-			horizon, model.EntryModeNextOpen, labelVersion, recType)
-	if !includeLocked && len(lockedDays) > 0 && len(devDays) > 0 {
-		turnQ = turnQ.Where("signal_date <= ?", devDays[len(devDays)-1])
-	}
-	if err := turnQ.Find(&turnRows).Error; err != nil {
-		return nil, err
+	if includeLocked || len(devDays) > 0 {
+		turnQ := common.DB.Select("user_id", "batch_id", "signal_date", "symbol", "action").
+			Where("horizon_days = ? AND entry_mode = ? AND recommendation_id > 0 AND label_version = ? AND type = ?",
+				horizon, model.EntryModeNextOpen, labelVersion, recType)
+		if !includeLocked {
+			turnQ = turnQ.Where("signal_date IN ?", devDays)
+		}
+		if err := turnQ.Find(&turnRows).Error; err != nil {
+			return nil, err
+		}
 	}
 	batchMap := map[int64]*jointBatchPicks{}
 	for _, l := range turnRows {

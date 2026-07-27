@@ -27,7 +27,7 @@ func (f *FlexInt) UnmarshalJSON(b []byte) error {
 		return nil
 	}
 	v, err := strconv.ParseFloat(s, 64)
-	if err != nil {
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
 		return fmt.Errorf("期望数字，得到 %s", s)
 	}
 	*f = FlexInt(math.Round(v))
@@ -600,6 +600,7 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, run 
 				acc.CompletionTokens += res.Usage.CompletionTokens
 				acc.TotalTokens += res.Usage.TotalTokens
 			}
+			run.routeApplied = LLMRouteApplied{}
 			return lastRaw, acc, lastLatency, err
 		}
 		acc.PromptTokens += res.Usage.PromptTokens
@@ -610,6 +611,7 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, run 
 
 		perr := parse(res.Content)
 		if perr == nil {
+			run.acceptRouteAttribution()
 			return lastRaw, acc, lastLatency, nil
 		}
 		// 校验失败：追加 repair 指令再试。坏输出按模块上限截断回灌（P0-9：完整回灌
@@ -619,6 +621,7 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, run 
 			chatMessage{Role: "user", Content: "上一条输出不符合要求：" + perr.Error() + "。" + repairHint},
 		)
 	}
+	run.routeApplied = LLMRouteApplied{}
 	return lastRaw, acc, lastLatency, nil // 降级
 }
 
@@ -836,6 +839,7 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 					rv.Confidence = 100
 				}
 				rv.Comment = truncateRunes(strings.TrimSpace(rv.Comment), 300)
+				run.acceptRouteAttribution()
 				return &rv, usage, run
 			}
 		}

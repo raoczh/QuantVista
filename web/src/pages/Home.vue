@@ -425,8 +425,11 @@ function onResize() {
         </n-gi>
         <n-gi>
           <SectionCard title="市场情绪">
-            <template v-if="breadthUnavailable" #extra>
-              <n-tag size="small" type="warning" round :bordered="false">数据源繁忙</n-tag>
+            <template #extra>
+              <div class="card-actions">
+                <n-tag v-if="breadthUnavailable" size="small" type="warning" round :bordered="false">数据源繁忙</n-tag>
+                <n-button size="tiny" quaternary type="primary" @click="router.push('/mood')">查看盘面</n-button>
+              </div>
             </template>
             <div v-if="overview?.breadth" class="breadth">
               <div class="breadth-summary">
@@ -676,6 +679,11 @@ function onResize() {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+.card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 /* 我的概览卡：可点击直达，与 StatCard 同质感 */

@@ -90,10 +90,11 @@ type llmRun struct {
 	// DebateInfo P1-3 条件式辩论的触发条件与调用预算声明（仅辩论首个 run——bull——携带；
 	// 程序判定的触发原因，非模型自报）。其他模块恒 nil（manifest 省略）。
 	DebateInfo *DebateManifestInfo
-	// routeApplied P2-4 模型路由观测（中央客户端 applyModelRouting 经 chatMeta.RouteApplied
-	// 指针回写；Applied=false 表示本 run 未被路由）。manifest 的 routed 字段消费——
-	// llm_call_logs 逐请求已记路由后真实目标，这里补业务侧「原配置→路由目标」归因。
-	routeApplied LLMRouteApplied
+	// routeApplied 是当前 attempt 的候选路由归因，由中央客户端 applyModelRouting 经
+	// chatMeta.RouteApplied 回写。acceptedRouteApplied 只在业务解析器接受该 attempt 后
+	// 提交；manifest 只能消费后者，拒收/repair/调用失败的目标不得冒充业务结果来源。
+	routeApplied         LLMRouteApplied
+	acceptedRouteApplied LLMRouteApplied
 }
 
 // newLLMRun 创建调用组。parentRunID 为空表示主调。
@@ -114,6 +115,10 @@ func (r *llmRun) chatMeta(userID int64, cfg *model.LLMConfig, attempt int) chatM
 	if attempt < 1 {
 		attempt = 1
 	}
+	// 路由归因是单 attempt 候选，不是粘性状态。开始下一轮意味着上一轮未被业务接受，
+	// 因此候选与已提交值都清空；repair 可能因能力观察改回原模型。
+	r.routeApplied = LLMRouteApplied{}
+	r.acceptedRouteApplied = LLMRouteApplied{}
 	if attempt > r.Attempts {
 		r.Attempts = attempt
 	}
@@ -131,6 +136,12 @@ func (r *llmRun) chatMeta(userID int64, cfg *model.LLMConfig, attempt int) chatM
 		m.Provider = cfg.Provider
 	}
 	return m
+}
+
+// acceptRouteAttribution 在业务解析/校验全部通过后提交当前 attempt 的路由归因。
+// 未路由的 accepted attempt 也会提交零值，从而明确清掉被拒收前序 attempt 的目标。
+func (r *llmRun) acceptRouteAttribution() {
+	r.acceptedRouteApplied = r.routeApplied
 }
 
 // record 记录本 run 最后一次请求的终态（成功与失败都要记；err 含 RefusalError 时
@@ -205,8 +216,8 @@ func (r *llmRun) manifest(cfg *model.LLMConfig, jsonMode bool) LLMRunManifest {
 		Coverage:       r.Coverage,
 		Debate:         r.DebateInfo,
 	}
-	if r.routeApplied.Applied {
-		ra := r.routeApplied
+	if r.acceptedRouteApplied.Applied {
+		ra := r.acceptedRouteApplied
 		m.Routed = &ra
 	}
 	if m.AttemptCount < 1 {

@@ -54,7 +54,7 @@ func (ac *AlertController) Update(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	rule, err := ac.svc.Update(currentUserID(c), id, in)
+	rule, err := ac.svc.Update(c.Request.Context(), currentUserID(c), id, in)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -75,7 +75,7 @@ func (ac *AlertController) SetStatus(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	rule, err := ac.svc.SetStatus(currentUserID(c), id, body.Status)
+	rule, err := ac.svc.SetStatus(c.Request.Context(), currentUserID(c), id, body.Status)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -89,7 +89,7 @@ func (ac *AlertController) Delete(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := ac.svc.Delete(currentUserID(c), id); err != nil {
+	if err := ac.svc.Delete(c.Request.Context(), currentUserID(c), id); err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
 	}

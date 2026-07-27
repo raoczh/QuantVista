@@ -1,8 +1,12 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"quantvista/common"
@@ -146,6 +150,129 @@ func TestParseAndFilterPicks_MissingPicksField(t *testing.T) {
 	pool := testPool()
 	if _, _, _, err := parseAndFilterPicks(`{"rejected":[]}`, pool, 5); err == nil {
 		t.Fatalf("缺 picks 字段应报错（区别于显式空数组的合法拒选）")
+	}
+}
+
+// TestParseAndFilterPicks_ConfidencePresence 缺失/null/空 confidence 都不是预测 0，
+// 必须报错触发 repair；显式数值 0 仍是合法置信度。
+func TestParseAndFilterPicks_ConfidencePresence(t *testing.T) {
+	pool := testPool()
+	invalid := map[string]string{
+		"missing":      `{"picks":[{"symbol":"600000","action":"buy"}]}`,
+		"null":         `{"picks":[{"symbol":"600000","action":"buy","confidence":null}]}`,
+		"empty":        `{"picks":[{"symbol":"600000","action":"buy","confidence":""}]}`,
+		"string_null":  `{"picks":[{"symbol":"600000","action":"buy","confidence":"null"}]}`,
+		"nan":          `{"picks":[{"symbol":"600000","action":"buy","confidence":"NaN"}]}`,
+		"positive_inf": `{"picks":[{"symbol":"600000","action":"buy","confidence":"+Inf"}]}`,
+		"negative_inf": `{"picks":[{"symbol":"600000","action":"buy","confidence":"-Inf"}]}`,
+	}
+	for name, content := range invalid {
+		t.Run(name, func(t *testing.T) {
+			if _, _, _, err := parseAndFilterPicks(content, pool, 5); err == nil ||
+				(!strings.Contains(err.Error(), "confidence") && !strings.Contains(err.Error(), "期望数字")) {
+				t.Fatalf("无效 confidence 应触发校验错误，得到 %v", err)
+			}
+		})
+	}
+
+	for _, content := range []string{
+		`{"picks":[{"symbol":"600000","action":"buy","confidence":0}]}`,
+		`{"picks":[{"symbol":"600000","action":"buy","confidence":"0"}]}`,
+	} {
+		picks, _, _, err := parseAndFilterPicks(content, pool, 5)
+		if err != nil || len(picks) != 1 || picks[0].Confidence != 0 {
+			t.Fatalf("显式 confidence=0 应合法: picks=%+v err=%v", picks, err)
+		}
+	}
+}
+
+// TestRecommendationRepairInvalidConfidence 真实走 callWithRepair：首轮缺失/null，
+// 第二轮补齐 confidence 后成功，证明 presence 校验接入现有 repair 链。
+func TestRecommendationRepairInvalidConfidence(t *testing.T) {
+	for name, invalid := range map[string]string{
+		"missing": `{"picks":[{"symbol":"600000","action":"buy"}]}`,
+		"null":    `{"picks":[{"symbol":"600000","action":"buy","confidence":null}]}`,
+		"nan":     `{"picks":[{"symbol":"600000","action":"buy","confidence":"NaN"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls++
+				content := invalid
+				if calls == 2 {
+					content = `{"picks":[{"symbol":"600000","action":"buy","confidence":72}]}`
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"choices": []map[string]any{{
+						"message": map[string]any{"content": content}, "finish_reason": "stop",
+					}},
+					"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+				})
+			}))
+			defer srv.Close()
+
+			svc := &RecommendationService{}
+			cfg := &model.LLMConfig{BaseURL: srv.URL, Model: "m", MaxTokens: 100}
+			run := newLLMRun("trace-confidence", "", "recommendation", "recommendation.v2", recPromptVersion)
+			picks, _, _, _, err := svc.callWithRepair(context.Background(), 1, run, cfg, "k", true,
+				[]chatMessage{{Role: "user", Content: "test"}}, testPool(), 1)
+			if err != nil || calls != 2 || len(picks) != 1 || picks[0].Confidence != 72 {
+				t.Fatalf("应 repair 一次后成功: calls=%d picks=%+v err=%v", calls, picks, err)
+			}
+		})
+	}
+}
+
+// TestRecReviewPickInputExcludesServerFields 复核 DTO 与纯模型字段的旧序列化逐字节一致，
+// 且新增任何服务端信任字段都不会进入复核 prompt。
+func TestRecReviewPickInputExcludesServerFields(t *testing.T) {
+	base := recPick{
+		Symbol: "600000", Action: model.RecActionBuy, Confidence: 78,
+		Reason: []string{"理由"}, Risks: []string{"风险"}, Evidence: []string{"证据"},
+		BuyZoneLow: 9.8, BuyZoneHigh: 10.2, TakeProfit: 11.5, StopLoss: 9.1,
+		ValidDays: 5, Invalidation: "跌破支撑",
+		Thesis: "长期逻辑", ValuationLow: 8, ValuationHigh: 12,
+		KeyMetrics: []string{"ROE"}, ReviewCycle: "季度", Disclaimer: "仅供参考",
+	}
+	want, err := json.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawAction, rawConfidence := model.RecActionBuy, 78
+	withServerFields := base
+	withServerFields.PositionPct = 10
+	withServerFields.PositionWhy = "服务端计算"
+	withServerFields.QuantScore = 88
+	withServerFields.QuantRank = 1
+	withServerFields.PoolSize = 10
+	withServerFields.LotCost = 1000
+	withServerFields.EvidenceCheck = &evidenceCheck{}
+	withServerFields.SysConfidence = "high"
+	withServerFields.SysConfidenceWhy = "服务端计算"
+	withServerFields.Review = &pickReview{Verdict: "pass"}
+	withServerFields.Bear = &pickBear{}
+	withServerFields.QualityGate = &qualityGateResult{}
+	withServerFields.DegradedSource = "quant_fallback"
+	withServerFields.QuoteAsOf = "2026-07-27 10:00:00"
+	withServerFields.RawAction = &rawAction
+	withServerFields.RawConfidence = &rawConfidence
+
+	got, err := json.Marshal(newRecReviewPickInput(withServerFields))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("复核 DTO 应保持纯模型字段序列化不变\nwant=%s\n got=%s", want, got)
+	}
+	for _, key := range []string{
+		"position_pct", "position_why", "quant_score", "quant_rank", "pool_size", "lot_cost",
+		"evidence_check", "sys_confidence", "sys_confidence_why", "review", "bear",
+		"quality_gate", "degraded_source", "quote_as_of", "raw_action", "raw_confidence",
+	} {
+		if strings.Contains(string(got), `"`+key+`"`) {
+			t.Fatalf("复核 DTO 不得包含服务端字段 %s: %s", key, got)
+		}
 	}
 }
 

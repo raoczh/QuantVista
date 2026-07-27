@@ -4,13 +4,13 @@
 > 现只保留对后续开发有约束力的内容：当前状态、实现边界、防回归要点、未完成项与欠人工验证清单。
 > 表结构以 `server/model/*.go`（GORM AutoMigrate）为准；数据源认知见 `DATA_SOURCES.md`；架构与 UI 约定见 `ARCHITECTURE.md`；部署见 `DEPLOYMENT.md`。
 
-## 1. 当前状态（截至 2026-07-17，外部审查修复批：codex 52 项 8 组核验后修 ~38 项，执行结算 l1→l2）
+## 1. 当前状态（截至 2026-07-27，散户体验第一批 A1~A4 + 最近五次提交审查修复）
 
 个人自用 AI 股票研究平台，Go(Gin+GORM)+Vue3(Naive UI)，单容器 go:embed 托管前端，生产 MySQL。已具备：
 
 - **账户与设置**：密码 + GitHub OAuth 双登录、账号绑定/解绑、JWT(access+refresh 可吊销/即时失效)、管理员后台（注册开关/GitHub 凭证/用户与配额管理/**新闻采集配置/LLM 回退/LLM 调用审计页**）、用户级 LLM 配置（OpenAI 兼容、**chat_completions 与 responses 双端点类型**、密钥加密、测试连接、**无配置用户回退管理员指定配置**）、偏好（默认市场/风险/推荐筛选默认[股价默认 ≤50 元、可排除创业板/科创板]/黑名单/流动性门槛/提醒与日报开关）。
-- **行情与数据**：东财→腾讯→新浪三源主备切换；实时行情/日线（东财前复权 fqt=1）/指数/榜单（涨幅/成交额/换手率/回调[跌幅升序]/低PB[升序]，方向参数支持「不热」来源）/板块/涨跌家数/两市资金流/腾讯免费估值（PE/PB/市值/换手/量比/振幅/涨跌停价）；交易日历回填、日线批量同步、市场情绪快照；**机构观点（P3a）：卖方研报评级与机构调研按需拉取缓存，进详情页与个股 AI 证据链**；**板块数据（M3c+P3b）：行业/概念热力图、板块详情（指数日线/成分股/主力资金历史透传/行业估值聚合表——中位 PE·PB+横截面与时序分位），板块 AI 分析吃 board_valuation/board_flow 两段**。
-- **研究工作台**：市场首页看板、个股详情页（日K/估值/五维评分/快捷动作）、自选股（分组/研究阶段漏斗/错过机会复盘）、持仓（盈亏费税精算/风险计划/买入前清单/结构化复盘/组合总览与风控信号/CSV 导入导出）、投资逻辑卡、投资笔记、条件提醒（6 类规则+命中明细状态机+主动推送）、今日待办聚合、模拟交易（虚拟账户/真实行情成交/佣金印花税）、**指数 ETF 交易**（精选指数 ETF 行情清单、复用模拟盘买卖、ETF 免印花税费率）。
+- **行情与数据**：东财→腾讯→新浪三源主备切换；实时行情/日线（东财前复权 fqt=1）/腾讯 m1 分时与 m5 盘中因子/指数/榜单（涨幅/成交额/换手率/回调[跌幅升序]/低PB[升序]，方向参数支持「不热」来源）/板块/涨跌家数/两市资金流/腾讯免费估值（PE/PB/市值/换手/量比/振幅/涨跌停价）；交易日历回填、日线批量同步、市场情绪快照；**机构观点（P3a）：卖方研报评级与机构调研按需拉取缓存，进详情页与个股 AI 证据链**；**板块数据（M3c+P3b）：行业/概念热力图、板块详情（指数日线/成分股/主力资金历史透传/行业估值聚合表——中位 PE·PB+横截面与时序分位），板块 AI 分析吃 board_valuation/board_flow 两段**。
+- **研究工作台**：市场首页看板、个股详情页（A 股分时/日K/估值/五维评分/快捷动作）、盘面情绪页（情绪趋势/连板梯队/全市场龙虎榜/人气榜）、自选股（分组/研究阶段漏斗/错过机会复盘）、持仓（盈亏费税精算/风险计划/买入前清单/结构化复盘/组合总览与风控信号/CSV 导入导出）、投资逻辑卡、投资笔记、条件提醒（6 类规则+命中明细状态机+主动推送，交易窗口约 2 分钟检查）、今日待办聚合、模拟交易（虚拟账户/真实行情成交/佣金印花税）、**指数 ETF 交易**（精选指数 ETF 行情清单、复用模拟盘买卖、ETF 免印花税费率）。
 - **AI 链路（全链路信任层）**：五模块分析（个股/市场/板块/自选/持仓，反方视角三字段、panel 多角色、变化检测 diff）、个股问答（快照复用多轮）、横向对比（可选 AI 点评）、短线/长线推荐（**四阶段流水线**：多源建池→用户筛选硬过滤→本地量化评分→LLM 仅对 Top10 精选/否决）、推荐追踪（止盈止损盘中触达判定/基准 alpha/7/14/30 日节点收益/历史表现统计/复盘待办已读消项）、收盘日报（复盘+明日推荐+卖点提醒自动建规则，支持删除重生成）、**AI 白话建策略（P3c）**：自然语言→条件树解析（factorDefs 程序生成因子字典、unmatched 兜底禁硬凑、人话预览+用户确认才落编辑器）。**全部长耗时 AI 入口均为后台任务**：推荐/日报/分析用业务记录 processing，问答/AI 对比/白话选股用通用 `llm_tasks`；HTTP 秒回、前端轮询、后台独立 Context，浏览器或入站反代断开不取消模型调用。推荐的量化降级边界保持原样，其他模块不借此掩盖上游错误。**全部 AI 产出标注所用 LLM 配置名与模型**（日报落库三列，对比/选股解析随响应回传，前端 useLlmLabel 共享映射）。
 - **信任机制（推荐域已全量，其余 AI 模块同标准推广）**：程序化证据核验（LLM 引用数字与数据快照容差比对）、程序合成置信度（量化排名×核验吻合率×数据完备度，不信 LLM 口头置信度）、AI 复核员（可选二次调用挑刺 pass/warn/reject，reject 强制降级）、候选池全景透明面板、prompt 强制引用数值+禁先验记忆+允许拒选、数据快照落库可复现。**推荐准确性工程（S0~S2 已落地，规划 `docs/RECOMMENDATION_ACCURACY_PLAN.md`）**：标签事实表+反事实事件表（统一执行模拟结算 1/5/10/20/60 日净收益/alpha/三重障碍，影子标签对照）、regime 三档大盘闸门（影子）、目标波动仓位建议、名单去相关、错误归因报表；**S2 影子件**：反方研究员（对每只 buy 独立构建最强 bear case，只展示不改写，high 危记影子事件）、数据质量门控（按策略分场景的缺失面→would-be 置信度封顶，只记录不执行，情绪缺失≠中性区分标记）、影子门控对照报表（gated vs ungated 成熟收益+覆盖率，一切门控转正评审的数据地基）、反思记忆表结构（LLM 反思延后至成熟样本 ≥30）；**S3 测量层（纯测量零门控零 LLM）**：每日因子快照（fv1 首写胜不可变）、候选池召回评估（Recall@K/来源消融/错失机会率）、因子 RankIC 排行（19 个 A 类无量纲因子 as-of 重建）、walk-forward 评估基线（训练/验证/测试滚动切分 Purge+Embargo、手工评分 baseline、Precision_net@K 与 Precision_alpha@K/净收益中位数/严重亏损率、评分 Top10 组合月度走查，管理端只读页）。
 
@@ -245,9 +245,18 @@
   - **⑧ 校准口径修正**：孤儿标签单列剔除（orphan_excl，不以 0 置信进桶）；「已评估」硬门槛统一为 calibEvalMinSample=100（§8.1 推荐/分析口径；30 只是分级参考）且与 Brier/ECE 产出同门槛；分析侧排除 as_of 回溯记录+symbol×基准日去重（重复生成不刷样本）；Notes 如实声明未分层 provider/model/策略与 confidence 为复核后终值的口径限制。
   - **⑨ 已知限制（如实声明非隐藏；第五十六批清账后状态）**：registry 未含 §4.5 完整字段全集（methodology/来源层级/冷数据策略等——声明表 scope 决策见 v2.3/v2.4）；~~每角色 2 known-answer+1 edge 的 P1-6 满额门槛未达~~ → **已于第五十六批达成**（KnownAnswers/EdgeCases 满额登记+TestLLMRoleGoldenQuota 程序校验，见「计划遗留收口批」条目①②）；校准刷新路径全表加载在个人量级可承受、规模化优化留 P2-5；experiment 影子 run 不进批次 LlmRunJSON（审计凭同 trace_id 查 llm-calls）——**第五十六批评估后固化为有意不做**（理由见「计划遗留收口批」条目⑤，别再当欠账重提）。
 
+- **散户体验第一批 A1~A4 防回归**（2026-07-27，权威施工图 `docs/RETAIL_EXPERIENCE_PLAN.md`）：①腾讯 mkline m1/m5 共用解析但口径分开：m1 分时均价严格为 `Σ(close×volume)/Σvolume`，m5 盘中因子 VWAP 仍为典型价口径；m1 只支持 `market=cn`、只取末根所属交易日、`prec` 缺失用首根开盘并显式 `base_from_open`，不得假造昨收。②分时 60 秒缓存必须同 key 合并并发 miss、清过期且容量有界；flight 只有仍是该 key 当前注册项时才能发布缓存，全部等待者取消后启动的 replacement 结果不得被旧 flight 迟到覆盖；不做历史分时落库。③Mood 多表查询必须在同一读事务快照内完成；人气榜名称按「最新 `StockUniverseDaily` → `MarketSyncState` → `Stock`」补齐。情绪历史只读实际快照，涨停池不可回溯，缺勤日不得补造；龙虎榜按净买额降序且保留同股多原因行，主榜与机构榜须先完整拉取、再按日期于同一事务删除重建；机构榜当日 9201 是“尚未发布”而非空榜，只有显式空榜或历史日仍无结果才可确认为空；任一其他错误都不推进游标。旧版 `mood_lhb_day` 可能记录半份同步，升级后必须用 v2 完整游标强制重验近 30 日；游标后的交易日缺口必须以完整交易日历升序补齐，工作日缺行视为 unknown、先触发日历修复且修复前不推进，遇同步错误停止并约 30 分钟重试，且调度与涨停池循环相互独立；人气榜 `hisRc<=0` 才是新上榜。④提醒交易窗口 2 分钟、其余 30 分钟；整轮派发截止与每用户预算分离，盘中每个已派发用户各有 110 秒，实际执行用户必须是轮转列表的连续前缀，公平游标只按实际派发数推进；同用户 `TryLock` 防重入，规则按 ID 稳定轮转，规则一旦开始尝试即推进用户规则游标、尚未开始的后缀不推进，慢源不得让后缀规则永久饥饿；已落事件的主动推送须在用户锁内用独立有界 context 至少尝试一次，不能因后续规则耗尽评估 context 而永久丢失。全天约 169 轮而非低于旧版 96 轮；过载时只如实记录本轮容量，改频率前必须评估免费源容量。
+
+- **最近五次提交审查修复防回归**（2026-07-27）：①推荐进入 AI 复核前固化 `RawAction/RawConfidence`；raw 校准只按原始 buy 样本计算，即使最终 buy 全被 reject 也不得把 raw 口径清空。复核提示只接收显式 DTO，严禁把服务端置信度/核验结果等字段序列化给模型；confidence 缺失/null/空串触发 repair，显式数值 0 合法。②实验创建必须固化默认或自定义 champion 的真实内容 hash、形态与 revision；start/采样/audit/promote 全链路校验，任何 A→B→A 恢复都不能洗掉粘性 `baseline_stale`；采样遇到早于实验启动的旧批次 prompt 快照时须复验 live champion，live 仍命中实验锚则只跳过旧批次，严禁误写永久失效。③ promote/rollback 的模板指针、revision、generation、实验状态必须同事务并以 CAS 检查 `RowsAffected`；晋级固化 `PromotedGeneration`，后续实验晋级即使 hash/revision 相同也须推进归属代际；回滚同时命中晋级 generation/revision 锚才可执行，失败不得留下孤儿 revision 或半切状态。④每次 repair 前清空旧路由归因，只把最终 accepted attempt 写入业务 manifest。⑤联合评估默认换手查询严格限定 `devDays`；开发段为空时 turnover 为空，严禁读取 locked/future 日期。
+
+- **第五十八批交叉审查修复防回归**（2026-07-27，8 项）：①**流式 usage 不得在 finish_reason 处提前 break**——OpenAI `include_usage` 的 usage 专属 chunk（`choices:[]` + usage）排在 finish_reason **之后**、`[DONE]` 之前，提前收尾会让 usage 恒回落 `estimateUsage` 字符粗估，污染 `llm_router` 的 `cost_exceeded` 自动回退判定（chat 粗估 vs responses 端点真值混比，且自动回退持久化不自动恢复）；改为有界续读（`streamPostFinishMaxEvents=4`，拿到 usage 或 `[DONE]` 即收尾），`done` 已置真故 EOF/读错判定不受影响。②**`backfillActualLabels` 从 seed 只继承归因维度，结算结果一律清零**（ExitDate/ExitPrice/Gross/Net/Bench/Alpha/HasBench/Mfe/Mae/HitTP/HitSL/Forced/SkipReason）——seed 取 h=1 的 next_open 行，它在推荐次日即成熟而持仓血缘通常晚于它建立，不清零会让 pending 行一路携带 1 日窗口收益；且 Bench/Alpha/HasBench 仅在买卖两端都命中基准轴时才被覆盖、SkipReason 仅在非 matured 分支才写，两者会永久留在 5/10/20/60 日行上。③**`settleFromActualEntry` 已定位建仓根后的 pending 必须带回 BuyDate/BuyPrice 与窗口 MFE/MAE**——`advanceOneLabel` 的超窗强平 guard 是 `out.BuyDate != ""`，不带则 `forceCloseStaleLabel` 的 actual 分支（qty=100）是死代码，退市/长停时 next_open 强平成熟而 actual 判 no_data，同一事实两口径打架；`e<0`（从未入场）保持裸 pending。④`execution_sim` 出场根坏数据的 pending 分支补算 MFE/MAE，与 `!endOK` 分支同口径（强平会沿用 out 里的值）。⑤**`recrecall` 错失收益补 `label_version` 隔离 + Forced 剔除**——此前是归因/影子/校准/联合评估四处都有、唯独召回评估漏掉的一处。⑥`BatchBacktest` 补 Forced 单列剔除（`BatchHoldStat.Forced` + Notes 声明），与 `Run`/walkforward/recrecall/recattribution 对齐。⑦**人气榜排序禁用裸 `Order("rank")`**——`rank` 是 MySQL 8.0.2+ 保留字，GORM `Order(string)` 走 `clause.Column{Raw:true}` 原样拼接不加引号 → 生产 ERROR 1064，而 SQLite 不视其为保留字使单测永远绿；改 `clause.OrderByColumn` 由方言加引号，`TestPopularityDailyOrderSQLDialectSafe` 同时静态扫描源码与断言生成 SQL。⑧**提醒 CRUD 有界抢锁**（`alertCRUDLockWait=3s`）——后台评估持锁最长 110s/3min 且推送 flush 再占 15s，无界共锁会让交易时段「暂停/删除提醒」挂起两分钟，浏览器先断时把裸 `context canceled` 透传给用户；拿不到锁返回中文提示，不绕过锁故一致性设计不变。附带：`lookupReflections` 补 `id DESC` tiebreaker（同轮反思 available_from 相同，无 tiebreaker 时影子快照不可复现，同 `loadReflectionCandidates` 先例）；`withPromptExperimentState` 统一 defer 释放（手写 Lock/Unlock 夹 GORM Transaction，panic 被 gin Recovery 吞掉后锁永不释放，会冻结全部模板写入与实验操作）；`runMoodLhb` 历史日连续失败 `lhbSkipAfterFails=3` 次即跳过推进游标——pending 按交易日升序补，旧实现任一天恒定失败（该日确无榜 / `parseLhbRowStrict` 因缺必填字段整天作废）会把其后所有天连同**今天**永久卡死，target 当天不参与跳过（盘后逐步落库，未发布是正常态）。
+  - **保留的既有设计（审查提出但确认不改）**：`SyncLhb` 机构榜「先删后插」即使本次空结果也删，是有意的原子替换语义（`TestSyncLhbAtomicReplace` 锁定）——上游 9201 对「尚未发布」与「确实为空」不可区分，风险由 `lhbOrgNotReadyCanFinalizeEmpty` 的时间守卫限制在历史日，当天 not-ready 一律整次失败重试绝不收口为空榜。**残余风险**：历史日上游瞬时回 9201 会抹掉该日真实机构数据且游标推进后不回填。
+
 ## 4. 未完成项与储备（按数据源可得性推进）
 
 > **2026-07-06 起后续开发按 `DEVELOPMENT_PLAN.md` 的批次（N1→N2→F1→T1→S1→F2→M1→M2→M3）推进**——它是面向执行的施工图（每批含方案锚点/依赖/验收）；分析依据与上游接口速查表在 `REFERENCE_ANALYSIS.md`。以下原有储备多数已并入该计划：
+
+- 散户体验剩余 B5~C13 按 `docs/RETAIL_EXPERIENCE_PLAN.md` 第二至第四批推进；不得把未实施项写成已完成。
 
 - 新闻情绪（→ 批次 N1/N2，财联社/东财源已调研齐）、财务详情/财报日历（→ 批次 F1/F2，东财 datacenter 网关免 Tushare）、回测模块（→ 批次 M2 时光机）。
 - 多数据源系统级切换管理端（`data_source_configs` 接读写）。
@@ -258,6 +267,10 @@
 ## 5. 欠人工验证清单
 
 > **2026-07-26 第五十五批部署验收**：LLM 准确性 P0~P2 六大条+审查修复批 4 回归点的**程序化可测项已全部实测通过（47/47，零新 bug）**，逐条打勾报告与剩余人工清单（真实 LLM/浏览器目验/交易日 job 三组）见 `docs/ACCEPTANCE_BATCH55_REPORT.md`——人工执行时以该报告 §3 为准，其条目已按依赖归组去重；下文各批原始条目保留作防回归语境。
+
+- 散户体验第一批 A1~A4 欠部署验收：A 股个股页分时/日 K 切换实测（价格、估算均价、昨收虚线、成交量均非空，休市时 `trade_date` 如实为最近交易日；非 A 股不请求并隐藏分时）；`/mood` 四 tab 用真实盘后数据核对聚合/排序/缺失态；两页至少 1 亮 1 暗主题及 375px/1440px 目验；交易日观察提醒在两个窗口约 2 分钟派发、慢轮次无排队和重复推送，并记录腾讯限流情况。
+- 最近五次提交审查修复欠部署验收：真实推荐开启复核后核对 raw/final 双置信度与 reject 全量场景；实验创建后修改 champion，列表应显示 `baseline_stale` 且禁用启动/审计/晋级；故障注入和 locked 段隔离已有程序化测试，部署只需回归管理端提示与真实 LLM 工件。
+- 第五十八批交叉审查修复欠部署验收：①真实 LLM 走一次 chat 流式调用，核对 `llm_call_logs` 的 token 为上游真值而非粗估（对比同 prompt 的 responses 端点量级应接近，此前 chat 侧系统性偏低 2~3 倍）；②生产 MySQL 上打开 `/mood` 人气榜 tab 确认不再 500（本地 SQLite 复现不出）；③交易时段编辑/暂停/删除一条提醒，确认 3 秒内返回（拿不到锁时是中文提示而非 `context canceled`）；④积累 actual_position 标签后抽查 pending 行的收益字段为 0、退市/长停标的两条口径都能成熟。
 
 - 推荐页/设置页新 UI 浏览器目验（筛选表单交互、真实生成一次、候选池全景、信任徽章 tooltip、AI 复核开关，亮/暗主题各一）。
 - 指数 ETF 页与各 AI 页新增信任徽章/透明面板的浏览器目验。

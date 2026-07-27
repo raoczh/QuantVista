@@ -19,6 +19,48 @@ func NewMoodController(svc *service.MoodService) *MoodController {
 	return &MoodController{svc: svc}
 }
 
+// Overview GET /api/markets/:market/mood?days=
+func (mc *MoodController) Overview(c *gin.Context) {
+	days := 0
+	if raw := c.Query("days"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			days = n
+		}
+	}
+	out, err := mc.svc.MoodOverview(c.Request.Context(), c.Param("market"), days)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, out)
+}
+
+// LhbDaily GET /api/markets/:market/lhb?date=&limit=
+func (mc *MoodController) LhbDaily(c *gin.Context) {
+	limit := 0
+	if raw := c.Query("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			limit = n
+		}
+	}
+	out, err := mc.svc.LhbDaily(c.Request.Context(), c.Param("market"), c.Query("date"), limit)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, out)
+}
+
+// PopularityDaily GET /api/markets/:market/popularity?date=
+func (mc *MoodController) PopularityDaily(c *gin.Context) {
+	out, err := mc.svc.PopularityDaily(c.Request.Context(), c.Param("market"), c.Query("date"))
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, out)
+}
+
 // StockFundFlow GET /api/markets/:market/stocks/:symbol/fundflow?days=
 // 个股详情「主力资金」块：逐日主力净额序列 + 今日/5/10/20 日汇总与连续净流入天数。
 // 首次访问触发按需拉取（冷却 1h），非 A 股/基金返回空序列。
@@ -51,5 +93,5 @@ func (mc *MoodController) StockLhb(c *gin.Context) {
 			limit = n
 		}
 	}
-	common.ApiSuccess(c, mc.svc.StockLhbRecords(c.Param("symbol"), limit))
+	common.ApiSuccess(c, mc.svc.StockLhbRecords(c.Request.Context(), c.Param("symbol"), limit))
 }

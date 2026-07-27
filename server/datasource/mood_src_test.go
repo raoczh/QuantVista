@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
 	"testing"
+	"time"
 )
 
 // ---------- 龙虎榜 ----------
@@ -68,6 +71,61 @@ func TestParseLhbOrgRow(t *testing.T) {
 	bj := dcRowFrom(t, `{"SECURITY_CODE":"430047","TRADE_DATE":"2026-07-07 00:00:00"}`)
 	if _, ok := parseLhbOrgRow(bj); ok {
 		t.Error("北交所代码应被过滤")
+	}
+}
+
+func TestGetLhbOrgDailyEmptyResponseIsNotReady(t *testing.T) {
+	withDcTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"version":null,"result":null,"success":false,"message":"返回数据为空","code":9201}`)
+	}, time.Millisecond)
+
+	_, err := NewEastMoneyAdapter().GetLhbOrgDaily(context.Background(), "2026-07-27")
+	if !errors.Is(err, ErrLhbNotReady) {
+		t.Fatalf("机构榜首页无结果必须保留未发布语义，got %v", err)
+	}
+}
+
+func TestGetLhbOrgDailyPublishedEmptyAndInvalidRows(t *testing.T) {
+	t.Run("已发布但无受支持股票", func(t *testing.T) {
+		withDcTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Fprint(w, dcPage(1, `{"SECURITY_CODE":"430047","SECURITY_NAME_ABBR":"北交样本","TRADE_DATE":"2026-07-27 00:00:00"}`))
+		}, time.Millisecond)
+		rows, err := NewEastMoneyAdapter().GetLhbOrgDaily(context.Background(), "2026-07-27")
+		if err != nil || len(rows) != 0 {
+			t.Fatalf("已发布响应过滤后为空应是完整空榜，rows=%v err=%v", rows, err)
+		}
+	})
+
+	t.Run("原始行全部解析失败", func(t *testing.T) {
+		withDcTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Fprint(w, dcPage(1, `"invalid-row"`))
+		}, time.Millisecond)
+		_, err := NewEastMoneyAdapter().GetLhbOrgDaily(context.Background(), "2026-07-27")
+		if !errors.Is(err, ErrUpstream) {
+			t.Fatalf("原始行全部解析失败不能伪装空榜，got %v", err)
+		}
+	})
+
+	t.Run("合法对象但必填字段漂移", func(t *testing.T) {
+		withDcTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Fprint(w, dcPage(1, `{"RENAMED_CODE":"600000","TRADE_DATE":"2026-07-27 00:00:00"}`))
+		}, time.Millisecond)
+		_, err := NewEastMoneyAdapter().GetLhbOrgDaily(context.Background(), "2026-07-27")
+		if !errors.Is(err, ErrUpstream) {
+			t.Fatalf("机构榜必填字段漂移不能伪装空榜，got %v", err)
+		}
+	})
+}
+
+func TestGetLhbDailyRejectsPartialMalformedRows(t *testing.T) {
+	withDcTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, dcPage(1,
+			`{"TRADE_DATE":"2026-07-27 00:00:00","SECURITY_CODE":"600000","SECURITY_NAME_ABBR":"浦发银行","SECURITY_TYPE_CODE":"058001001","CHANGE_TYPE":"daily"}`,
+			`{"TRADE_DATE":"2026-07-27 00:00:00","RENAMED_CODE":"000001","SECURITY_NAME_ABBR":"平安银行","SECURITY_TYPE_CODE":"058001001","CHANGE_TYPE":"daily"}`))
+	}, time.Millisecond)
+	_, err := NewEastMoneyAdapter().GetLhbDaily(context.Background(), "2026-07-27")
+	if !errors.Is(err, ErrUpstream) {
+		t.Fatalf("主榜混入结构坏行时必须整批失败，got %v", err)
 	}
 }
 

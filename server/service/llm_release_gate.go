@@ -10,6 +10,8 @@ import (
 
 	"quantvista/common"
 	"quantvista/model"
+
+	"gorm.io/gorm"
 )
 
 // P2-6 自动发布门（docs/LLM_ACCURACY_OPTIMIZATION_PLAN.md §7.3 P2-6）：
@@ -116,7 +118,7 @@ func parseReleaseAudit(content string) (*releaseAuditResult, error) {
 // 会失去稳定依据）；默认 champion 场景锚里存的就是实际内置任务段，不再用占位说明冒充。
 // 修复前创建的旧实验行无内容锚：按锚 hash 尽力回退（默认态=内置任务段/自定义态=当前
 // 启用模板现值），promote 侧的基线漂移门仍会拦住锚不一致的晋级。
-func releaseAuditChampionContent(exp *model.LLMExperiment) string {
+func releaseAuditChampionContentDB(db *gorm.DB, exp *model.LLMExperiment) string {
 	if strings.TrimSpace(exp.ChampionContent) != "" {
 		return exp.ChampionContent
 	}
@@ -126,10 +128,16 @@ func releaseAuditChampionContent(exp *model.LLMExperiment) string {
 		}
 		return "（系统默认模板，无自定义任务段）"
 	}
-	if row := userPromptTemplateRow(exp.UserID, exp.PromptModule); row != nil {
+	var row model.PromptTemplate
+	if err := db.Where("user_id = ? AND module = ? AND enabled = ?", exp.UserID, exp.PromptModule, true).
+		First(&row).Error; err == nil {
 		return row.Content
 	}
 	return "（champion 基线内容不可得：旧实验行无内容锚且当前无启用中的模板）"
+}
+
+func releaseAuditChampionContent(exp *model.LLMExperiment) string {
+	return releaseAuditChampionContentDB(common.DB, exp)
 }
 
 // RunLLMExperimentAudit P2-6 发布审计：对 completed 实验运行一次审计员 LLM 复核，
@@ -142,6 +150,15 @@ func RunLLMExperimentAudit(ctx context.Context, expID int64) (*model.LLMReleaseA
 	}
 	if exp.Status != model.ExpStatusCompleted {
 		return nil, fmt.Errorf("仅 completed 实验可运行发布审计（当前 %s）", exp.Status)
+	}
+	if promptContentHash(exp.ChallengerContent) != exp.ChallengerHash {
+		return nil, errors.New("challenger 内容与创建时 hash 不符（快照被篡改），拒绝审计")
+	}
+	if _, reason, err := validateExperimentCurrentBaseline(common.DB, &exp); err != nil {
+		return nil, fmt.Errorf("校验 champion 基线失败: %v", err)
+	} else if reason != "" {
+		markExperimentBaselineInvalid(common.DB, &exp, reason)
+		return nil, &experimentBaselineStaleError{reason: reason}
 	}
 	cfg, apiKey, adminID, err := resolveNewsLLM()
 	if err != nil {
@@ -228,7 +245,40 @@ func RunLLMExperimentAudit(ctx context.Context, expID int64) (*model.LLMReleaseA
 		row.Verdict = model.ReleaseAuditError
 		row.Summary = truncateRunes("审计未得出判定："+errString(lastErr), 500)
 	}
-	if err := common.DB.Create(&row).Error; err != nil {
+
+	// 外部调用期间实验或模板可能变化。最终“锁实验行 + 锁 champion generation +
+	// 复验 + 插入工件”必须是一个事务，并与 promote 锁同一实验行：新 FAIL 若先落库，
+	// promote 必然看见；promote 若先完成，本次结果因状态已变而不落库。
+	var latest model.LLMExperiment
+	var staleReason string
+	err = withPromptExperimentState(func() error {
+		return common.DB.Transaction(func(tx *gorm.DB) error {
+			if err := lockExperimentRow(tx, exp.ID, &latest); err != nil {
+				return err
+			}
+			if latest.Status != model.ExpStatusCompleted {
+				return fmt.Errorf("审计期间实验状态已变为 %s，本次结果不落发布工件", latest.Status)
+			}
+			if promptContentHash(latest.ChallengerContent) != latest.ChallengerHash ||
+				latest.ChallengerHash != exp.ChallengerHash {
+				return errors.New("审计期间 challenger 快照发生变化，本次结果作废")
+			}
+			if _, reason, err := validateExperimentCurrentBaseline(tx, &latest); err != nil {
+				return fmt.Errorf("复验 champion 基线失败: %v", err)
+			} else if reason != "" {
+				staleReason = reason
+				return &experimentBaselineStaleError{reason: reason}
+			}
+			if promptContentHash(releaseAuditChampionContentDB(tx, &latest)) != row.ChampionHash {
+				return errors.New("审计期间 champion 对照内容发生变化，本次结果作废")
+			}
+			return tx.Create(&row).Error
+		})
+	})
+	if staleReason != "" {
+		markExperimentBaselineInvalid(common.DB, &latest, staleReason)
+	}
+	if err != nil {
 		return nil, err
 	}
 	common.SysLog("实验 #%d 发布审计完成：verdict=%s tokens=%d trace=%s", exp.ID, row.Verdict, row.TokensUsed, row.TraceID)
@@ -236,12 +286,16 @@ func RunLLMExperimentAudit(ctx context.Context, expID int64) (*model.LLMReleaseA
 }
 
 // latestReleaseAudit 实验最新审计工件（promote 门 6 消费）。
-func latestReleaseAudit(expID int64) *model.LLMReleaseAudit {
+func latestReleaseAuditDB(db *gorm.DB, expID int64) *model.LLMReleaseAudit {
 	var row model.LLMReleaseAudit
-	if err := common.DB.Where("experiment_id = ?", expID).Order("id DESC").First(&row).Error; err != nil {
+	if err := db.Where("experiment_id = ?", expID).Order("id DESC").First(&row).Error; err != nil {
 		return nil
 	}
 	return &row
+}
+
+func latestReleaseAudit(expID int64) *model.LLMReleaseAudit {
+	return latestReleaseAuditDB(common.DB, expID)
 }
 
 // ListLLMReleaseAudits 实验全部审计工件（详情页展示，倒序）。
@@ -257,18 +311,39 @@ func ListLLMReleaseAudits(expID int64) []model.LLMReleaseAudit {
 // 当前启用模板不再是该实验晋级出的 challenger 内容（晋级后模板被编辑、或更新的实验
 // 再晋级）时，按 PrePromote 锚无条件恢复会覆盖更新的 champion——返回不可回滚原因。
 // 非 promoted 状态返回空串（无判定语义）。
+func experimentRollbackStaleForBaseline(exp *model.LLMExperiment, current *experimentPromptBaseline) string {
+	if exp.Status != model.ExpStatusPromoted {
+		return ""
+	}
+	if current == nil || !current.Custom {
+		return "当前该模块无启用中的自定义模板（晋级后模板已被删除或停用），本实验的回滚锚已失去对象"
+	}
+	if exp.PromotedGeneration <= 0 {
+		return "实验缺少晋级时的 champion generation 锚，无法证明当前模板仍是该实验的晋级产物"
+	}
+	if !current.GenerationKnown || current.Generation != exp.PromotedGeneration {
+		return fmt.Sprintf("当前 champion generation=%d，已不是本实验晋级时的 generation=%d（晋级后被编辑、洗回或有后续实验晋级）",
+			current.Generation, exp.PromotedGeneration)
+	}
+	if current.Hash != exp.ChallengerHash {
+		return "当前启用模板内容已不是本实验晋级出的 challenger（晋级后被编辑或有更新的实验晋级），回滚会覆盖更新的 champion"
+	}
+	if exp.PromotedRevision <= 0 || current.Revision != exp.PromotedRevision {
+		return fmt.Sprintf("当前模板 revision=%d，已不是本实验晋级时的 revision=%d，回滚会覆盖更新的 champion",
+			current.Revision, exp.PromotedRevision)
+	}
+	return ""
+}
+
 func experimentRollbackStale(exp *model.LLMExperiment) string {
 	if exp.Status != model.ExpStatusPromoted {
 		return ""
 	}
-	row := userPromptTemplateRow(exp.UserID, exp.PromptModule)
-	if row == nil {
-		return "当前该模块无启用中的自定义模板（晋级后模板已被删除或停用），本实验的回滚锚已失去对象"
+	current, err := loadExperimentPromptBaseline(common.DB, exp.UserID, exp.PromptModule)
+	if err != nil {
+		return "读取当前 champion 失败，无法安全回滚"
 	}
-	if promptTemplateRowHash(row) != exp.ChallengerHash {
-		return "当前启用模板内容已不是本实验晋级出的 challenger（晋级后被编辑或有更新的实验晋级），回滚会覆盖更新的 champion"
-	}
-	return ""
+	return experimentRollbackStaleForBaseline(exp, current)
 }
 
 // RollbackLLMExperiment P2-6 一键切回 champion：promoted→rolled_back（终态），
@@ -277,35 +352,55 @@ func experimentRollbackStale(exp *model.LLMExperiment) string {
 // 已前移（编辑/更新实验晋级）时拒绝，防旧实验回滚覆盖更新的 champion。
 func RollbackLLMExperiment(id int64) (*model.LLMExperiment, error) {
 	var exp model.LLMExperiment
-	if err := common.DB.First(&exp, id).Error; err != nil {
-		return nil, errors.New("实验不存在")
-	}
-	if exp.Status != model.ExpStatusPromoted {
-		return nil, fmt.Errorf("仅 promoted 实验可回滚（当前 %s）", exp.Status)
-	}
-	if reason := experimentRollbackStale(&exp); reason != "" {
-		return nil, errors.New("拒绝回滚：" + reason + "（如需恢复历史内容请在提示词页按 revision 快照操作）")
-	}
-	ps := NewPromptService()
-	if exp.PrePromoteEnabled {
-		// 晋级前已有启用中的自定义模板：把该内容重新落为启用模板（champion 指针切回）。
-		if _, _, err := ps.Upsert(exp.UserID, PromptInput{
-			Module: exp.PromptModule, Content: exp.PrePromoteContent, Enabled: true,
-		}); err != nil {
-			return nil, fmt.Errorf("回滚落模板失败: %v", err)
-		}
-	} else if row := userPromptTemplateRow(exp.UserID, exp.PromptModule); row != nil {
-		// 晋级前用默认模板：停用当前自定义模板（内容保留、指针回默认——不删工件）。
-		if _, _, err := ps.Upsert(exp.UserID, PromptInput{
-			Module: exp.PromptModule, Content: row.Content, Enabled: false,
-		}); err != nil {
-			return nil, fmt.Errorf("回滚停用模板失败: %v", err)
-		}
-	}
-	now := time.Now()
-	exp.Status = model.ExpStatusRolledBack
-	exp.RolledBackAt = &now
-	if err := common.DB.Save(&exp).Error; err != nil {
+	err := withPromptExperimentState(func() error {
+		return common.DB.Transaction(func(tx *gorm.DB) error {
+			if err := lockExperimentRow(tx, id, &exp); err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return errors.New("实验不存在")
+				}
+				return err
+			}
+			if exp.Status != model.ExpStatusPromoted {
+				return fmt.Errorf("仅 promoted 实验可回滚（当前 %s）", exp.Status)
+			}
+			current, err := lockExperimentPromptBaseline(tx, exp.UserID, exp.PromptModule)
+			if err != nil {
+				return err
+			}
+			if reason := experimentRollbackStaleForBaseline(&exp, current); reason != "" {
+				return errors.New("拒绝回滚：" + reason + "（如需恢复历史内容请在提示词页按 revision 快照操作）")
+			}
+
+			content, enabled := current.Content, false
+			if exp.PrePromoteEnabled {
+				content, enabled = exp.PrePromoteContent, true
+			}
+			module, normalized, hash, _, normErr := normalizePromptInput(PromptInput{
+				Module: exp.PromptModule, Content: content, Enabled: enabled,
+			})
+			if normErr != nil {
+				return normErr
+			}
+			if _, err := upsertPromptTemplateTx(tx, exp.UserID, module, normalized, hash,
+				enabled, current.Row, true); err != nil {
+				return fmt.Errorf("回滚落模板失败: %v", err)
+			}
+
+			now := time.Now()
+			res := tx.Model(&model.LLMExperiment{}).
+				Where("id = ? AND status = ?", exp.ID, model.ExpStatusPromoted).
+				Updates(map[string]any{"status": model.ExpStatusRolledBack, "rolled_back_at": now, "updated_at": now})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return errors.New("实验状态已被并发修改，回滚已取消")
+			}
+			exp.Status, exp.RolledBackAt = model.ExpStatusRolledBack, &now
+			return nil
+		})
+	})
+	if err != nil {
 		return nil, err
 	}
 	common.SysLog("实验 #%d 已回滚：module=%s 恢复晋级前状态（pre_promote_enabled=%v）",

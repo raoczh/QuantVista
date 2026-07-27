@@ -37,11 +37,11 @@ var validNotifyKind = map[string]bool{
 // NotifyMessage 推送消息（SendMsg 主入口的载荷）。
 // Route/Kind/Priority 仅 ntfy 通道消费：Server酱/Webhook 保持 title+content 老格式零回归。
 type NotifyMessage struct {
-	Title   string
-	Content string
-	Route   string // 站内路由（/alerts、/daily-reports、/stock/600519）；ntfy 拼 click=<SiteBaseURL>+Route，SiteBaseURL 未配置则不带
-	Kind    string // 消息类别（映射 ntfy tags 图标）：alert / earn / report / guard
-	Priority int   // ntfy 优先级 1~5；0=默认（不下发字段）。止损触达等紧急事件给 4
+	Title    string
+	Content  string
+	Route    string // 站内路由（/alerts、/daily-reports、/stock/600519）；ntfy 拼 click=<SiteBaseURL>+Route，SiteBaseURL 未配置则不带
+	Kind     string // 消息类别（映射 ntfy tags 图标）：alert / earn / report / guard
+	Priority int    // ntfy 优先级 1~5；0=默认（不下发字段）。止损触达等紧急事件给 4
 }
 
 // 消息类别（NotifyMessage.Kind）。
@@ -243,12 +243,24 @@ func (s *NotifyService) Test(userID, id int64) error {
 // SendMsg 向用户所有启用的通道推送一条消息（best-effort，逐个通道独立成败）。
 // 主入口：Route/Kind/Priority 由 ntfy 通道消费，老通道只用 Title/Content。
 func (s *NotifyService) SendMsg(userID int64, msg NotifyMessage) {
+	s.SendMsgContext(context.Background(), userID, msg)
+}
+
+// SendMsgContext 是提醒评估使用的可取消入口。数据库读取、逐通道 HTTP 请求和结果回写
+// 共用调用方预算，避免提醒轮次超时后通知仍占用用户锁或后台 worker。
+func (s *NotifyService) SendMsgContext(ctx context.Context, userID int64, msg NotifyMessage) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var rows []model.NotifyChannel
-	if err := common.DB.Where("user_id = ? AND enabled = ?", userID, true).Find(&rows).Error; err != nil {
+	if err := common.DB.WithContext(ctx).Where("user_id = ? AND enabled = ?", userID, true).Find(&rows).Error; err != nil {
 		return
 	}
 	for _, ch := range rows {
-		_ = s.sendTo(ch, msg)
+		if ctx.Err() != nil {
+			return
+		}
+		_ = s.sendToContext(ctx, ch, msg)
 	}
 }
 
@@ -266,32 +278,43 @@ func (s *NotifyService) HasEnabledChannel(userID int64) bool {
 
 // sendTo 向单个通道发送，并回写 last_sent_at/last_error。
 func (s *NotifyService) sendTo(ch model.NotifyChannel, msg NotifyMessage) error {
+	return s.sendToContext(context.Background(), ch, msg)
+}
+
+func (s *NotifyService) sendToContext(ctx context.Context, ch model.NotifyChannel, msg NotifyMessage) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	target, err := common.Decrypt(ch.TargetCipher)
 	if err != nil || target == "" {
 		if err == nil {
 			err = errors.New("通道密钥缺失或解密失败")
 		}
-		s.recordResult(ch.ID, err)
+		s.recordResultContext(ctx, ch.ID, err)
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+	sendCtx, cancel := context.WithTimeout(ctx, notifyTimeout)
 	defer cancel()
 
 	switch ch.Kind {
 	case model.NotifyKindServerChan:
-		err = sendServerChan(ctx, target, msg.Title, msg.Content)
+		err = sendServerChan(sendCtx, target, msg.Title, msg.Content)
 	case model.NotifyKindWebhook:
-		err = sendWebhook(ctx, target, msg.Title, msg.Content)
+		err = sendWebhook(sendCtx, target, msg.Title, msg.Content)
 	case model.NotifyKindNtfy:
-		err = sendNtfy(ctx, target, msg)
+		err = sendNtfy(sendCtx, target, msg)
 	default:
 		err = errors.New("未知通道类型")
 	}
-	s.recordResult(ch.ID, err)
+	s.recordResultContext(ctx, ch.ID, err)
 	return err
 }
 
 func (s *NotifyService) recordResult(id int64, err error) {
+	s.recordResultContext(context.Background(), id, err)
+}
+
+func (s *NotifyService) recordResultContext(ctx context.Context, id int64, err error) {
 	now := time.Now()
 	upd := map[string]any{"last_sent_at": &now}
 	if err != nil {
@@ -299,7 +322,7 @@ func (s *NotifyService) recordResult(id int64, err error) {
 	} else {
 		upd["last_error"] = ""
 	}
-	common.DB.Model(&model.NotifyChannel{}).Where("id = ?", id).Updates(upd)
+	common.DB.WithContext(ctx).Model(&model.NotifyChannel{}).Where("id = ?", id).Updates(upd)
 }
 
 // sendServerChan 走 Server酱 sctapi.ftqq.com/{sendkey}.send（表单 title+desp）。

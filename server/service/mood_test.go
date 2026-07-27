@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,9 @@ import (
 	"quantvista/common"
 	"quantvista/datasource"
 	"quantvista/model"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // cleanMoodTables 内存库 cache=shared 测试间共享，M3a 表为市场级公共数据，先清场。
@@ -167,7 +172,7 @@ func TestSyncLhbAndSignals(t *testing.T) {
 	}
 
 	// lhbSignalsFor：同股多原因取净买额最大的一条 + 机构信号合并。
-	sigs := lhbSignalsFor([]string{"002185", "600000"})
+	sigs := lhbSignalsFor(context.Background(), []string{"002185", "600000"})
 	sig, ok := sigs["002185"]
 	if !ok {
 		t.Fatal("002185 应有龙虎榜信号")
@@ -180,7 +185,7 @@ func TestSyncLhbAndSignals(t *testing.T) {
 	}
 
 	// 详情页记录：2 行 + 机构净买合并。
-	recs := svc.StockLhbRecords("002185", 10)
+	recs := svc.StockLhbRecords(context.Background(), "002185", 10)
 	if len(recs) != 2 {
 		t.Fatalf("上榜记录应 2 行，got %d", len(recs))
 	}
@@ -202,12 +207,134 @@ func TestPopularitySignals(t *testing.T) {
 	if err := common.DB.Create(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
-	sigs := popSignalsFor([]string{"000725", "002185", "600584"})
+	sigs := popSignalsFor(context.Background(), []string{"000725", "002185", "600584"})
 	if len(sigs) != 2 {
 		t.Fatalf("应只取最新交易日 2 行，got %d", len(sigs))
 	}
 	if !sigs["002185"].IsNew || sigs["000725"].Rank != 1 {
 		t.Errorf("人气信号错误: %+v", sigs)
+	}
+}
+
+func TestMoodOverviewAggregation(t *testing.T) {
+	setupTestDB(t)
+	cleanMoodTables(t)
+	moods := []model.MarketMoodDaily{
+		{Market: "cn", TradeDate: "2026-07-08", LimitUpCount: 30, BrokenCount: 10, BrokenRate: 25, MaxStreak: 2},
+		{Market: "cn", TradeDate: "2026-07-09", LimitUpCount: 45, BrokenCount: 5, BrokenRate: 10, MaxStreak: 4,
+			YztAvgChg: 2.5, YztUpRatio: 70, StreakDistJSON: `{"1":2,"2":1,"4":1}`},
+	}
+	if err := common.DB.Create(&moods).Error; err != nil {
+		t.Fatal(err)
+	}
+	stocks := []model.LimitUpStock{
+		{Symbol: "600001", Market: "cn", TradeDate: "2026-07-09", Name: "一号", Streak: 1, SealFund: 1e8},
+		{Symbol: "600002", Market: "cn", TradeDate: "2026-07-09", Name: "二号", Streak: 4, SealFund: 2e8},
+		{Symbol: "600003", Market: "cn", TradeDate: "2026-07-09", Name: "三号", Streak: 2, SealFund: 5e8},
+		{Symbol: "600004", Market: "cn", TradeDate: "2026-07-09", Name: "四号", Streak: 1, SealFund: 3e8},
+	}
+	if err := common.DB.Create(&stocks).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	view, err := NewMoodService().MoodOverview(context.Background(), "cn", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Latest == nil || view.Latest.TradeDate != "2026-07-09" || view.StreakDist["4"] != 1 {
+		t.Fatalf("最近快照/分布错误: %+v", view)
+	}
+	if len(view.Trend) != 2 || view.Trend[0].TradeDate != "2026-07-08" || view.Trend[1].TradeDate != "2026-07-09" {
+		t.Fatalf("趋势应按日期升序: %+v", view.Trend)
+	}
+	if len(view.StreakLadders) != 3 || view.StreakLadders[0].Streak != 4 || view.StreakLadders[2].Count != 2 {
+		t.Fatalf("连板梯队错误: %+v", view.StreakLadders)
+	}
+	if len(view.SealFundTop) != 4 || view.SealFundTop[0].Symbol != "600003" {
+		t.Fatalf("封板资金排序错误: %+v", view.SealFundTop)
+	}
+	if _, err := NewMoodService().MoodOverview(context.Background(), "us", 10); err == nil {
+		t.Fatal("非 A 股盘面情绪应拒绝")
+	}
+}
+
+func TestLhbAndPopularityDaily(t *testing.T) {
+	setupTestDB(t)
+	cleanMoodTables(t)
+	rows := []model.LhbEntry{
+		{Symbol: "600011", Market: "cn", TradeDate: "2026-07-08", ChangeType: "old", Name: "旧日", NetBuy: 9e8},
+		{Symbol: "600012", Market: "cn", TradeDate: "2026-07-09", ChangeType: "a", Name: "甲", NetBuy: 2e8, Reason: "原因甲"},
+		{Symbol: "600013", Market: "cn", TradeDate: "2026-07-09", ChangeType: "b", Name: "乙", NetBuy: 5e8, Reason: "原因乙"},
+	}
+	if err := common.DB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := common.DB.Create(&model.LhbOrgDaily{
+		Symbol: "600013", Market: "cn", TradeDate: "2026-07-09", Name: "乙",
+		NetBuy: 1.5e8, BuyTimes: 3, SellTimes: 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	lhb, err := NewMoodService().LhbDaily(context.Background(), "cn", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lhb.TradeDate != "2026-07-09" || len(lhb.Items) != 2 || lhb.Items[0].Symbol != "600013" || lhb.Items[0].OrgBuyTimes != 3 {
+		t.Fatalf("龙虎榜日期回退/排序/机构合并错误: %+v", lhb)
+	}
+	if _, err := NewMoodService().LhbDaily(context.Background(), "cn", "20260709", 10); err == nil {
+		t.Fatal("非法日期应拒绝")
+	}
+
+	const popSymbol = "689901"
+	common.DB.Where("market = ? AND symbol = ?", "cn", popSymbol).Delete(&model.Stock{})
+	t.Cleanup(func() { common.DB.Where("market = ? AND symbol = ?", "cn", popSymbol).Delete(&model.Stock{}) })
+	if err := common.DB.Create(&model.Stock{Symbol: popSymbol, Market: "cn", Name: "人气股"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	popRows := []model.PopularityRank{
+		{Symbol: "600011", Market: "cn", TradeDate: "2026-07-08", Rank: 1, PrevRank: 2},
+		{Symbol: popSymbol, Market: "cn", TradeDate: "2026-07-09", Rank: 2, PrevRank: -3},
+		{Symbol: "689902", Market: "cn", TradeDate: "2026-07-09", Rank: 1, PrevRank: 5},
+	}
+	if err := common.DB.Create(&popRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	pop, err := NewMoodService().PopularityDaily(context.Background(), "cn", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pop.TradeDate != "2026-07-09" || len(pop.Items) != 2 || pop.Items[0].Rank != 1 || !pop.Items[1].IsNew || pop.Items[1].Name != "人气股" {
+		t.Fatalf("人气榜日期回退/排序/名称/新上榜错误: %+v", pop)
+	}
+}
+
+func TestMoodQueriesHonorCanceledContext(t *testing.T) {
+	setupTestDB(t)
+	cleanMoodTables(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	svc := NewMoodService()
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{"overview", func() error { _, err := svc.MoodOverview(ctx, "cn", 20); return err }},
+		{"lhb", func() error { _, err := svc.LhbDaily(ctx, "cn", "", 50); return err }},
+		{"popularity", func() error { _, err := svc.PopularityDaily(ctx, "cn", ""); return err }},
+		{"stock_lhb", func() error {
+			if rows := svc.StockLhbRecords(ctx, "002185", 10); len(rows) != 0 {
+				return errors.New("取消后仍返回龙虎榜记录")
+			}
+			return ctx.Err()
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.call(); err == nil {
+				t.Fatal("请求 context 已取消时查询不应继续执行")
+			}
+		})
 	}
 }
 
@@ -272,5 +399,404 @@ func TestRunMoodPoolsSplitCursors(t *testing.T) {
 	svc.runMoodPools(context.Background(), target, "2026-07-09")
 	if ztCalls != 1 {
 		t.Fatalf("池游标已达标不应重采, got %d", ztCalls)
+	}
+}
+
+func TestSyncLhbAtomicReplace(t *testing.T) {
+	setupTestDB(t)
+	const tradeDate = "2026-07-27"
+
+	seedOld := func(t *testing.T) {
+		t.Helper()
+		cleanMoodTables(t)
+		if err := common.DB.Create(&model.LhbEntry{
+			Symbol: "600001", Market: "cn", TradeDate: tradeDate,
+			ChangeType: "old", Name: "旧主榜",
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := common.DB.Create(&model.LhbOrgDaily{
+			Symbol: "600001", Market: "cn", TradeDate: tradeDate, Name: "旧机构榜",
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertOld := func(t *testing.T) {
+		t.Helper()
+		var mainRows []model.LhbEntry
+		var orgRows []model.LhbOrgDaily
+		common.DB.Where("trade_date = ?", tradeDate).Find(&mainRows)
+		common.DB.Where("trade_date = ?", tradeDate).Find(&orgRows)
+		if len(mainRows) != 1 || mainRows[0].Name != "旧主榜" || len(orgRows) != 1 || orgRows[0].Name != "旧机构榜" {
+			t.Fatalf("失败后两表都应保持旧快照: main=%+v org=%+v", mainRows, orgRows)
+		}
+	}
+	newMain := []datasource.LhbRow{{Symbol: "600002", Name: "新主榜", ChangeType: "new"}}
+
+	t.Run("机构拉取失败不写库", func(t *testing.T) {
+		seedOld(t)
+		svc := NewMoodService()
+		svc.fetchLhbDaily = func(context.Context, string) ([]datasource.LhbRow, error) {
+			return newMain, nil
+		}
+		svc.fetchLhbOrgDaily = func(context.Context, string) ([]datasource.LhbOrgRow, error) {
+			return nil, errors.New("机构接口故障")
+		}
+		if _, err := svc.SyncLhb(context.Background(), tradeDate); err == nil {
+			t.Fatal("机构拉取失败应使整次同步失败")
+		}
+		assertOld(t)
+	})
+
+	t.Run("机构当日尚未发布不写库", func(t *testing.T) {
+		seedOld(t)
+		svc := NewMoodService()
+		svc.now = func() time.Time {
+			return time.Date(2026, 7, 27, 19, 15, 0, 0, time.Local)
+		}
+		svc.fetchLhbDaily = func(context.Context, string) ([]datasource.LhbRow, error) {
+			return newMain, nil
+		}
+		svc.fetchLhbOrgDaily = func(context.Context, string) ([]datasource.LhbOrgRow, error) {
+			return nil, datasource.ErrLhbNotReady
+		}
+		if _, err := svc.SyncLhb(context.Background(), tradeDate); !errors.Is(err, datasource.ErrLhbNotReady) {
+			t.Fatalf("当日机构榜未发布应使整次同步重试，got %v", err)
+		}
+		assertOld(t)
+	})
+
+	t.Run("机构插入失败回滚两表", func(t *testing.T) {
+		seedOld(t)
+		svc := NewMoodService()
+		svc.fetchLhbDaily = func(context.Context, string) ([]datasource.LhbRow, error) {
+			return newMain, nil
+		}
+		svc.fetchLhbOrgDaily = func(context.Context, string) ([]datasource.LhbOrgRow, error) {
+			return []datasource.LhbOrgRow{
+				{Symbol: "600002", Name: "新机构榜 A"},
+				{Symbol: "600002", Name: "新机构榜 B"}, // 同日同股触发唯一键冲突
+			}, nil
+		}
+		if _, err := svc.SyncLhb(context.Background(), tradeDate); err == nil {
+			t.Fatal("机构插入失败应使整次事务回滚")
+		}
+		assertOld(t)
+	})
+
+	t.Run("机构空榜提交完整快照", func(t *testing.T) {
+		seedOld(t)
+		svc := NewMoodService()
+		svc.fetchLhbDaily = func(context.Context, string) ([]datasource.LhbRow, error) {
+			return newMain, nil
+		}
+		svc.fetchLhbOrgDaily = func(context.Context, string) ([]datasource.LhbOrgRow, error) {
+			return nil, datasource.ErrNoData
+		}
+		n, err := svc.SyncLhb(context.Background(), tradeDate)
+		if err != nil || n != 1 {
+			t.Fatalf("机构空榜应允许主榜完整提交, n=%d err=%v", n, err)
+		}
+		var mainRows []model.LhbEntry
+		var orgCount int64
+		common.DB.Where("trade_date = ?", tradeDate).Find(&mainRows)
+		common.DB.Model(&model.LhbOrgDaily{}).Where("trade_date = ?", tradeDate).Count(&orgCount)
+		if len(mainRows) != 1 || mainRows[0].Name != "新主榜" || orgCount != 0 {
+			t.Fatalf("机构空榜应替换主榜并清空旧机构榜: main=%+v orgCount=%d", mainRows, orgCount)
+		}
+	})
+
+	t.Run("历史日仍无机构结果可最终确认为空榜", func(t *testing.T) {
+		seedOld(t)
+		svc := NewMoodService()
+		svc.now = func() time.Time {
+			return time.Date(2026, 7, 28, 0, 30, 0, 0, time.Local)
+		}
+		svc.fetchLhbDaily = func(context.Context, string) ([]datasource.LhbRow, error) {
+			return newMain, nil
+		}
+		svc.fetchLhbOrgDaily = func(context.Context, string) ([]datasource.LhbOrgRow, error) {
+			return nil, datasource.ErrLhbNotReady
+		}
+		n, err := svc.SyncLhb(context.Background(), tradeDate)
+		if err != nil || n != 1 {
+			t.Fatalf("历史日可把持续无结果收口为空榜, n=%d err=%v", n, err)
+		}
+		var orgCount int64
+		common.DB.Model(&model.LhbOrgDaily{}).Where("trade_date = ?", tradeDate).Count(&orgCount)
+		if orgCount != 0 {
+			t.Fatalf("历史空榜应清掉旧机构数据, got %d", orgCount)
+		}
+	})
+}
+
+func TestLhbPendingDates(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
+	t.Cleanup(func() { common.DB.Where("1 = 1").Delete(&model.TradingCalendar{}) })
+	openDates := map[string]bool{
+		"2026-07-01": true, "2026-07-03": true, "2026-07-24": true,
+		"2026-07-27": true, "2026-07-28": true, "2026-07-31": true,
+	}
+	calendar := []model.TradingCalendar{{Market: "cn", TradeDate: "2026-06-30", IsOpen: true}}
+	for day := time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local); !day.After(time.Date(2026, 7, 31, 0, 0, 0, 0, time.Local)); day = day.AddDate(0, 0, 1) {
+		date := day.Format("2006-01-02")
+		calendar = append(calendar, model.TradingCalendar{Market: "cn", TradeDate: date, IsOpen: openDates[date]})
+	}
+	if err := common.DB.Select("Market", "TradeDate", "IsOpen").Create(&calendar).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(lhbPendingDates("2026-07-24", "2026-07-28"), ","); got != "2026-07-27,2026-07-28" {
+		t.Fatalf("非空游标应只返回 cursor 后的开市日并升序排列, got %s", got)
+	}
+	if got := strings.Join(lhbPendingDates("", "2026-07-31"), ","); got != "2026-07-01,2026-07-03,2026-07-24,2026-07-27,2026-07-28,2026-07-31" {
+		t.Fatalf("空游标应保留目标日前 30 个自然日的回填边界, got %s", got)
+	}
+
+	// 日历局部缺行时逐日回退：已知 07-27 开市，缺失的周二 07-28 不能被当休市跳过。
+	common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
+	if err := common.DB.Create(&model.TradingCalendar{Market: "cn", TradeDate: "2026-07-27", IsOpen: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	got, complete := lhbPendingDatesWithCoverage("2026-07-24", "2026-07-28")
+	if complete || strings.Join(got, ",") != "2026-07-27" {
+		t.Fatalf("稀疏日历必须标 unknown 且不得越过缺失工作日, dates=%v complete=%v", got, complete)
+	}
+}
+
+func TestRunMoodLhbStopsAtFirstGap(t *testing.T) {
+	setupTestDB(t)
+	cleanMoodTables(t)
+	common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
+	common.DB.Where("`key` = ?", optMoodLhbDay).Delete(&model.Option{})
+	t.Cleanup(func() {
+		common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
+		common.DB.Where("`key` = ?", optMoodLhbDay).Delete(&model.Option{})
+	})
+	calendar := []model.TradingCalendar{
+		{Market: "cn", TradeDate: "2026-07-24", IsOpen: true},
+		{Market: "cn", TradeDate: "2026-07-27", IsOpen: true},
+		{Market: "cn", TradeDate: "2026-07-28", IsOpen: true},
+	}
+	if err := common.DB.Select("Market", "TradeDate", "IsOpen").Create(&calendar).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := model.UpsertOption(optMoodLhbDay, "2026-07-24"); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewMoodService()
+	failMonday := true
+	calls := []string{}
+	svc.fetchLhbDaily = func(_ context.Context, date string) ([]datasource.LhbRow, error) {
+		calls = append(calls, date)
+		if date == "2026-07-27" && failMonday {
+			return nil, errors.New("周一临时失败")
+		}
+		symbol := "600027"
+		if date == "2026-07-28" {
+			symbol = "600028"
+		}
+		return []datasource.LhbRow{{Symbol: symbol, Name: date, ChangeType: "daily"}}, nil
+	}
+	svc.fetchLhbOrgDaily = func(context.Context, string) ([]datasource.LhbOrgRow, error) {
+		return nil, datasource.ErrNoData
+	}
+
+	if svc.runMoodLhb(context.Background(), "2026-07-28") {
+		t.Fatal("周一失败时不应宣称已追平周二")
+	}
+	if got := strings.Join(calls, ","); got != "2026-07-27" {
+		t.Fatalf("任一天失败后必须停止，不能越过缺口采周二, calls=%s", got)
+	}
+	if got := optionValue(optMoodLhbDay); got != "2026-07-24" {
+		t.Fatalf("失败日不得推进游标, got %s", got)
+	}
+
+	failMonday = false
+	calls = nil
+	if !svc.runMoodLhb(context.Background(), "2026-07-28") {
+		t.Fatal("下一轮应从周一开始并追平周二")
+	}
+	if got := strings.Join(calls, ","); got != "2026-07-27,2026-07-28" {
+		t.Fatalf("周二补跑必须先补周一再采周二, calls=%s", got)
+	}
+	if got := optionValue(optMoodLhbDay); got != "2026-07-28" {
+		t.Fatalf("补齐后游标应到周二, got %s", got)
+	}
+	var count int64
+	common.DB.Model(&model.LhbEntry{}).Where("trade_date IN ?", []string{"2026-07-27", "2026-07-28"}).Count(&count)
+	if count != 2 {
+		t.Fatalf("周一、周二主榜都应落库, got %d", count)
+	}
+}
+
+func TestRunMoodLhbRepairsIncompleteCalendarBeforeSync(t *testing.T) {
+	setupTestDB(t)
+	cleanMoodTables(t)
+	common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
+	common.DB.Where("`key` = ?", optMoodLhbDay).Delete(&model.Option{})
+	t.Cleanup(func() {
+		common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
+		common.DB.Where("`key` = ?", optMoodLhbDay).Delete(&model.Option{})
+	})
+	if err := model.UpsertOption(optMoodLhbDay, "2026-07-24"); err != nil {
+		t.Fatal(err)
+	}
+	// 只有周一一行，周二缺失；同步前必须先修复日历，不能越过 unknown。
+	if err := common.DB.Create(&model.TradingCalendar{Market: "cn", TradeDate: "2026-07-27", IsOpen: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewMoodService()
+	repaired := 0
+	svc.repairCalendar = func(context.Context) error {
+		repaired++
+		return common.DB.Create(&model.TradingCalendar{Market: "cn", TradeDate: "2026-07-28", IsOpen: true}).Error
+	}
+	calls := []string{}
+	svc.fetchLhbDaily = func(_ context.Context, date string) ([]datasource.LhbRow, error) {
+		calls = append(calls, date)
+		return []datasource.LhbRow{{Symbol: "600000", Name: date, ChangeType: "daily"}}, nil
+	}
+	svc.fetchLhbOrgDaily = func(context.Context, string) ([]datasource.LhbOrgRow, error) {
+		return nil, datasource.ErrNoData
+	}
+	if !svc.runMoodLhb(context.Background(), "2026-07-28") {
+		t.Fatal("日历修复后应按序追平")
+	}
+	if repaired != 1 || strings.Join(calls, ",") != "2026-07-27,2026-07-28" {
+		t.Fatalf("应先修日历再连续同步: repaired=%d calls=%v", repaired, calls)
+	}
+}
+
+func TestRunMoodLhbV2CursorIgnoresLegacyCompletion(t *testing.T) {
+	setupTestDB(t)
+	cleanMoodTables(t)
+	common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
+	common.DB.Where("`key` IN ?", []string{optMoodLhbLegacyDay, optMoodLhbDay}).Delete(&model.Option{})
+	t.Cleanup(func() {
+		common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
+		common.DB.Where("`key` IN ?", []string{optMoodLhbLegacyDay, optMoodLhbDay}).Delete(&model.Option{})
+	})
+	const target = "2026-07-28"
+	if err := model.UpsertOption(optMoodLhbLegacyDay, target); err != nil {
+		t.Fatal(err)
+	}
+	// 建完整窗口日历，仅 target 开市，让本测试只关注旧游标不能短路 v2 重验。
+	start := time.Date(2026, 6, 28, 0, 0, 0, 0, time.Local)
+	end := time.Date(2026, 7, 28, 0, 0, 0, 0, time.Local)
+	calendar := make([]model.TradingCalendar, 0, 31)
+	for day := start; !day.After(end); day = day.AddDate(0, 0, 1) {
+		date := day.Format("2006-01-02")
+		calendar = append(calendar, model.TradingCalendar{Market: "cn", TradeDate: date, IsOpen: date == target})
+	}
+	if err := common.DB.Select("Market", "TradeDate", "IsOpen").Create(&calendar).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewMoodService()
+	calls := 0
+	svc.fetchLhbDaily = func(context.Context, string) ([]datasource.LhbRow, error) {
+		calls++
+		return []datasource.LhbRow{{Symbol: "600000", Name: "v2重验", ChangeType: "daily"}}, nil
+	}
+	svc.fetchLhbOrgDaily = func(context.Context, string) ([]datasource.LhbOrgRow, error) {
+		return nil, datasource.ErrNoData
+	}
+	if !svc.runMoodLhb(context.Background(), target) || calls != 1 {
+		t.Fatalf("旧完成游标不得短路 v2 重验: calls=%d v2=%q", calls, optionValue(optMoodLhbDay))
+	}
+}
+
+func TestPopularityDailyNamePriority(t *testing.T) {
+	setupTestDB(t)
+	cleanMoodTables(t)
+	symbols := []string{"689911", "689912", "689913", "689914"}
+	for _, table := range []any{&model.StockUniverseDaily{}, &model.MarketSyncState{}, &model.Stock{}} {
+		common.DB.Where("symbol IN ?", symbols).Delete(table)
+	}
+	t.Cleanup(func() {
+		for _, table := range []any{&model.StockUniverseDaily{}, &model.MarketSyncState{}, &model.Stock{}} {
+			common.DB.Where("symbol IN ?", symbols).Delete(table)
+		}
+	})
+	stocks := []model.Stock{
+		{Symbol: symbols[0], Market: "cn", Name: "基础名一"},
+		{Symbol: symbols[1], Market: "cn", Name: "基础名二"},
+		{Symbol: symbols[2], Market: "cn", Name: "基础名三"},
+		{Symbol: symbols[3], Market: "cn", Name: "基础名四"},
+	}
+	states := []model.MarketSyncState{
+		{Symbol: symbols[0], Market: "cn", Name: "状态名一"},
+		{Symbol: symbols[1], Market: "cn", Name: "状态名二"},
+		{Symbol: symbols[3], Market: "cn", Name: "状态名四"},
+	}
+	universe := []model.StockUniverseDaily{
+		{TradeDate: "2999-12-30", Symbol: symbols[0], Market: "cn", Name: "宇宙旧名"},
+		{TradeDate: "2999-12-31", Symbol: symbols[0], Market: "cn", Name: "宇宙最新名"},
+		{TradeDate: "2999-12-31", Symbol: symbols[3], Market: "cn", Name: ""},
+	}
+	if err := common.DB.Create(&stocks).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := common.DB.Create(&states).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := common.DB.Create(&universe).Error; err != nil {
+		t.Fatal(err)
+	}
+	for i, symbol := range symbols {
+		if err := common.DB.Create(&model.PopularityRank{
+			Symbol: symbol, Market: "cn", TradeDate: "2026-07-28", Rank: i + 1, PrevRank: i + 2,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	view, err := NewMoodService().PopularityDaily(context.Background(), "cn", "2026-07-28")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]string{}
+	for _, item := range view.Items {
+		names[item.Symbol] = item.Name
+	}
+	if names[symbols[0]] != "宇宙最新名" || names[symbols[1]] != "状态名二" || names[symbols[2]] != "基础名三" {
+		t.Fatalf("名称来源优先级错误: %+v", names)
+	}
+	if names[symbols[3]] != "状态名四" {
+		t.Fatalf("高优先级空名称不应遮蔽下一级来源: %+v", names)
+	}
+}
+
+// TestPopularityDailyOrderSQLDialectSafe 人气榜排序不得使用裸 `ORDER BY rank`。
+//
+// rank 是 MySQL 8.0.2+ 保留字（窗口函数 RANK()），GORM 的 Order(string) 走
+// clause.Column{Raw:true} 原样拼接不加引号 → 生产 MySQL 报 ERROR 1064，而 SQLite
+// 不把 rank 当保留字，纯功能测试永远绿（这个 bug 就是这么漏过去的）。
+// 两道断言：①源码里不得出现裸 Order("rank；②OrderByColumn 确实产出带引号的列名。
+func TestPopularityDailyOrderSQLDialectSafe(t *testing.T) {
+	setupTestDB(t)
+
+	src, err := os.ReadFile("mood.go")
+	if err != nil {
+		t.Fatalf("读取 mood.go 失败: %v", err)
+	}
+	if strings.Contains(string(src), `Order("rank`) {
+		t.Fatal(`mood.go 出现裸 Order("rank...")：rank 是 MySQL 保留字，须用 clause.OrderByColumn 让方言加引号`)
+	}
+
+	var rows []model.PopularityRank
+	stmt := common.DB.Session(&gorm.Session{DryRun: true}).
+		Where("market = ? AND trade_date = ?", "cn", "2026-07-28").
+		Order(clause.OrderByColumn{Column: clause.Column{Name: "rank"}}).
+		Order(clause.OrderByColumn{Column: clause.Column{Name: "symbol"}}).
+		Find(&rows).Statement
+	sql := stmt.SQL.String()
+	if strings.Contains(sql, "ORDER BY rank") {
+		t.Fatalf("rank 未被引号包裹，MySQL 上是语法错误: %s", sql)
+	}
+	if !strings.Contains(sql, "`rank`") && !strings.Contains(sql, `"rank"`) {
+		t.Fatalf("rank 应被方言引号包裹: %s", sql)
 	}
 }

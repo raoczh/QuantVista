@@ -25,7 +25,7 @@ const (
 
 // LhbRow 龙虎榜单行（一只股票的一个上榜原因）。
 type LhbRow struct {
-	Symbol       string  // 6 位代码
+	Symbol       string // 6 位代码
 	Name         string
 	TradeDate    string  // YYYY-MM-DD
 	ChangeType   string  // 上榜类别代码（同股同日多行的区分键）
@@ -90,9 +90,13 @@ func (e *EastMoneyAdapter) GetLhbDaily(ctx context.Context, date string) ([]LhbR
 		for _, raw := range raws {
 			r, perr := ParseDcRow(raw)
 			if perr != nil {
-				continue
+				return nil, fmt.Errorf("%w: 龙虎榜 %s 行解析失败: %v", ErrUpstream, date, perr)
 			}
-			if row, ok := parseLhbRow(r); ok {
+			row, ok, perr := parseLhbRowStrict(r)
+			if perr != nil {
+				return nil, fmt.Errorf("%w: 龙虎榜 %s 行结构无效: %v", ErrUpstream, date, perr)
+			}
+			if ok {
 				out = append(out, row)
 			}
 		}
@@ -105,15 +109,27 @@ func (e *EastMoneyAdapter) GetLhbDaily(ctx context.Context, date string) ([]LhbR
 
 // parseLhbRow 单行解析（抽出便于单测，防上游字段漂移）。
 func parseLhbRow(r DcRow) (LhbRow, bool) {
+	row, ok, err := parseLhbRowStrict(r)
+	return row, ok && err == nil
+}
+
+func parseLhbRowStrict(r DcRow) (LhbRow, bool, error) {
 	sym := r.String("SECURITY_CODE")
-	if !lhbStockRow(r.String("SECURITY_TYPE_CODE"), sym) {
-		return LhbRow{}, false
+	typeCode := r.String("SECURITY_TYPE_CODE")
+	tradeDate := r.Date("TRADE_DATE")
+	changeType := r.String("CHANGE_TYPE")
+	name := r.String("SECURITY_NAME_ABBR")
+	if sym == "" || typeCode == "" || tradeDate == "" || changeType == "" || name == "" {
+		return LhbRow{}, false, errors.New("缺少代码/类型/日期/类别/名称必填字段")
+	}
+	if !lhbStockRow(typeCode, sym) {
+		return LhbRow{}, false, nil
 	}
 	return LhbRow{
 		Symbol:       sym,
-		Name:         r.String("SECURITY_NAME_ABBR"),
-		TradeDate:    r.Date("TRADE_DATE"),
-		ChangeType:   r.String("CHANGE_TYPE"),
+		Name:         name,
+		TradeDate:    tradeDate,
+		ChangeType:   changeType,
 		Reason:       r.String("EXPLANATION"),
 		Note:         r.String("EXPLAIN"),
 		Close:        r.Float("CLOSE_PRICE"),
@@ -126,7 +142,7 @@ func parseLhbRow(r DcRow) (LhbRow, bool) {
 		NetRatio:     r.Float("DEAL_NET_RATIO"),
 		TurnoverRate: r.Float("TURNOVERRATE"),
 		FloatCap:     r.Float("FREE_MARKET_CAP"),
-	}, true
+	}, true, nil
 }
 
 // GetLhbOrgDaily 拉取某交易日机构买卖每日统计（已过滤为可识别的 A 股代码）。
@@ -139,20 +155,30 @@ func (e *EastMoneyAdapter) GetLhbOrgDaily(ctx context.Context, date string) ([]L
 	})
 	var out []LhbOrgRow
 	seen := map[string]bool{}
+	rawCount := 0
 	for page := 0; page < lhbMaxPages; page++ {
 		raws, err := it.Next(ctx)
+		if errors.Is(err, ErrNoData) && rawCount == 0 {
+			// datacenter 对“尚未发布”和“最终确实为空”都返回 9201。这里保留
+			// 未就绪语义，由 service 结合交易日期决定何时可最终确认为空榜。
+			return nil, fmt.Errorf("%w: %s", ErrLhbNotReady, date)
+		}
 		if err != nil {
 			return nil, err
 		}
 		if raws == nil {
 			break
 		}
+		rawCount += len(raws)
 		for _, raw := range raws {
 			r, perr := ParseDcRow(raw)
 			if perr != nil {
-				continue
+				return nil, fmt.Errorf("%w: 机构龙虎榜 %s 行解析失败: %v", ErrUpstream, date, perr)
 			}
-			row, ok := parseLhbOrgRow(r)
+			row, ok, perr := parseLhbOrgRowStrict(r)
+			if perr != nil {
+				return nil, fmt.Errorf("%w: 机构龙虎榜 %s 行结构无效: %v", ErrUpstream, date, perr)
+			}
 			if !ok || seen[row.Symbol] {
 				continue // 机构统计按股聚合，同股理论一行；重复行保序取首行
 			}
@@ -161,20 +187,31 @@ func (e *EastMoneyAdapter) GetLhbOrgDaily(ctx context.Context, date string) ([]L
 		}
 	}
 	if len(out) == 0 {
-		return nil, ErrNoData
+		// 上游已经返回了可解析的完整响应，只是没有本项目支持的 A 股行。
+		return []LhbOrgRow{}, nil
 	}
 	return out, nil
 }
 
 func parseLhbOrgRow(r DcRow) (LhbOrgRow, bool) {
+	row, ok, err := parseLhbOrgRowStrict(r)
+	return row, ok && err == nil
+}
+
+func parseLhbOrgRowStrict(r DcRow) (LhbOrgRow, bool, error) {
 	sym := r.String("SECURITY_CODE")
+	tradeDate := r.Date("TRADE_DATE")
+	name := r.String("SECURITY_NAME_ABBR")
+	if len(sym) != 6 || tradeDate == "" || name == "" {
+		return LhbOrgRow{}, false, errors.New("缺少或非法的代码/日期/名称必填字段")
+	}
 	if _, ok := cnSecid(sym); !ok {
-		return LhbOrgRow{}, false
+		return LhbOrgRow{}, false, nil
 	}
 	return LhbOrgRow{
 		Symbol:    sym,
-		Name:      r.String("SECURITY_NAME_ABBR"),
-		TradeDate: r.Date("TRADE_DATE"),
+		Name:      name,
+		TradeDate: tradeDate,
 		Close:     r.Float("CLOSE_PRICE"),
 		ChangePct: r.Float("CHANGE_RATE"),
 		BuyTimes:  int(r.Float("BUY_TIMES")),
@@ -184,7 +221,7 @@ func parseLhbOrgRow(r DcRow) (LhbOrgRow, bool) {
 		NetBuy:    r.Float("NET_BUY_AMT"),
 		NetRatio:  r.Float("RATIO"),
 		Reason:    r.String("EXPLANATION"),
-	}, true
+	}, true, nil
 }
 
 // ErrLhbNotReady 龙虎榜当日数据尚未发布（datacenter 盘后逐步落库，18:00 前可能不全）。

@@ -310,6 +310,82 @@ type recPick struct {
 	// 指针语义：nil=旧记录无原始值（校准侧单列 raw_missing，不硬造）；非 nil 恒序列化
 	// （含 0——0 是值域内合法置信度，不能用零值省略混淆「无原始值」）。模型自附一律剥除。
 	RawConfidence *int `json:"raw_confidence,omitempty"`
+	// RawAction 与 RawConfidence 同点快照，用于区分复核前 buy 与 reject 后 watch。
+	// 指针语义兼容旧记录；模型自附一律由 normalizePick 剥除。
+	RawAction *string `json:"raw_action,omitempty"`
+
+	// confidencePresent 仅记录模型 JSON 是否给出有效 confidence；显式 0 合法，
+	// 缺失/null/空字符串必须触发 repair，不能混作预测 0。
+	confidencePresent bool `json:"-"`
+}
+
+// UnmarshalJSON 在保留 FlexInt 容错解析的同时记录 confidence 是否真实存在。
+// recPick 也用于读取历史 DetailJSON，因此这里只记录 presence，业务校验由
+// parseAndFilterPicks 在 LLM 输出入口执行。
+func (p *recPick) UnmarshalJSON(data []byte) error {
+	type recPickWire recPick
+	var wire recPickWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	var marker struct {
+		Confidence json.RawMessage `json:"confidence"`
+	}
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return err
+	}
+	present := false
+	raw := strings.TrimSpace(string(marker.Confidence))
+	if raw != "" && raw != "null" {
+		present = true
+		if strings.HasPrefix(raw, `"`) {
+			var value string
+			if err := json.Unmarshal(marker.Confidence, &value); err != nil {
+				return err
+			}
+			value = strings.TrimSpace(value)
+			present = value != "" && !strings.EqualFold(value, "null")
+		}
+	}
+	*p = recPick(wire)
+	p.confidencePresent = present
+	return nil
+}
+
+// recReviewPickInput 是复核模型可见的主模型输出 DTO。服务端信任层字段必须与复核
+// prompt 隔离，否则新增落库字段会静默改变复核输入、token 与 hash。
+type recReviewPickInput struct {
+	Symbol     string   `json:"symbol"`
+	Action     string   `json:"action"`
+	Confidence FlexInt  `json:"confidence"`
+	Reason     []string `json:"reason"`
+	Risks      []string `json:"risks"`
+	Evidence   []string `json:"evidence"`
+
+	BuyZoneLow   float64 `json:"buy_zone_low"`
+	BuyZoneHigh  float64 `json:"buy_zone_high"`
+	TakeProfit   float64 `json:"take_profit"`
+	StopLoss     float64 `json:"stop_loss"`
+	ValidDays    int     `json:"valid_days"`
+	Invalidation string  `json:"invalidation"`
+
+	Thesis        string   `json:"thesis"`
+	ValuationLow  float64  `json:"valuation_low"`
+	ValuationHigh float64  `json:"valuation_high"`
+	KeyMetrics    []string `json:"key_metrics"`
+	ReviewCycle   string   `json:"review_cycle"`
+	Disclaimer    string   `json:"disclaimer"`
+}
+
+func newRecReviewPickInput(p recPick) recReviewPickInput {
+	return recReviewPickInput{
+		Symbol: p.Symbol, Action: p.Action, Confidence: p.Confidence,
+		Reason: p.Reason, Risks: p.Risks, Evidence: p.Evidence,
+		BuyZoneLow: p.BuyZoneLow, BuyZoneHigh: p.BuyZoneHigh, TakeProfit: p.TakeProfit,
+		StopLoss: p.StopLoss, ValidDays: p.ValidDays, Invalidation: p.Invalidation,
+		Thesis: p.Thesis, ValuationLow: p.ValuationLow, ValuationHigh: p.ValuationHigh,
+		KeyMetrics: p.KeyMetrics, ReviewCycle: p.ReviewCycle, Disclaimer: p.Disclaimer,
+	}
 }
 
 // pickReview AI 复核员对单条推荐的结论。Confidence 用 FlexInt——模型常把整数字段
@@ -514,7 +590,7 @@ func (s *RecommendationService) reuseProcessingBatch(userID int64) *Recommendati
 // routed 声明带 FromConfigID/FromModel，llm_call_logs 逐请求另有真值；LLMConfigID 保持
 // 业务解析出的原配置（用户配置指针语义，回显/重试沿用）。
 func applyBatchRouteAttribution(batch *model.RecommendationBatch, mainRun *llmRun) {
-	if ra := mainRun.routeApplied; ra.Applied {
+	if ra := mainRun.acceptedRouteApplied; ra.Applied {
 		batch.Provider = ra.Provider
 		batch.Model = ra.Model
 	}
@@ -650,6 +726,9 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	rawActionBySym := make(map[string]string, len(picks))
 	for _, p := range picks {
 		rawActionBySym[p.Symbol] = p.Action
+		if p.RawAction != nil {
+			rawActionBySym[p.Symbol] = *p.RawAction
+		}
 	}
 
 	// 可选 AI 复核（verify）：风控复核员逐条挑刺，reject 降级为观察。
@@ -1033,6 +1112,7 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, userID int64
 				acc.CompletionTokens += res.Usage.CompletionTokens
 				acc.TotalTokens += res.Usage.TotalTokens
 			}
+			run.routeApplied = LLMRouteApplied{}
 			return nil, nil, acc, lastLatency, err
 		}
 		acc.PromptTokens += res.Usage.PromptTokens
@@ -1048,6 +1128,7 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, userID int64
 			run.Coverage = diag
 		}
 		if perr == nil {
+			run.acceptRouteAttribution()
 			return picks, rejected, acc, lastLatency, nil
 		}
 		// 校验失败：追加 repair，明确告知只能用候选池中的 symbol。坏输出只回灌开头
@@ -1061,6 +1142,7 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, userID int64
 				"。请重新输出 JSON：{\"picks\":[...],\"rejected\":[...]}，每个 pick 含 symbol、action、confidence、reason、risks、evidence 等字段，rejected 为池内未入选标的的 {symbol,reason} 落选理由，不要任何解释或代码块标记。"},
 		)
 	}
+	run.routeApplied = LLMRouteApplied{}
 	return nil, nil, acc, lastLatency, nil // 降级
 }
 
@@ -1082,7 +1164,7 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 	for _, p := range picks {
 		c := pool[p.Symbol]
 		rows = append(rows, map[string]any{
-			"pick": p,
+			"pick": newRecReviewPickInput(p),
 			"data": map[string]any{
 				"price": c.Price, "change_pct": c.ChangePct, "turnover_rate": c.TurnoverRate,
 				"volume_ratio": c.VolumeRatio, "pe_ttm": c.PETTM, "pb": c.PB,
@@ -1153,6 +1235,7 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 				valid = append(valid, r)
 			}
 			if len(valid) > 0 {
+				run.acceptRouteAttribution()
 				return valid, truncateRunes(strings.TrimSpace(out.Overall), 500), usage, run
 			}
 		}
@@ -1165,18 +1248,19 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 	return nil, "", usage, run
 }
 
-// snapshotRawConfidence 第五十六批②：在复核改写之前快照模型原始口头置信度。挂点
-// 与 rawActionBySym 同位（parse+normalize 之后、applyReviews 之前）——此时 Confidence
-// 已经 normalizePick clamp 到 [0,100] 但尚未被复核 reject 级联/复核覆盖改写，是「模型
-// 预测」与「程序修正」的分界值。量化降级兜底 picks 不经本函数（程序赋值非模型预测，
-// RawConfidence 恒 nil 如实缺席）。幂等防御：已有快照不覆盖（repair 重入等异常路径）。
+// snapshotRawConfidence 在复核改写之前同时快照模型原始动作与口头置信度。此时字段
+// 已经 normalizePick 规整，但尚未被 applyReviews 改写；量化降级兜底不经本函数。
+// 两个字段分别幂等，避免异常重入用改写后值覆盖原始值。
 func snapshotRawConfidence(picks []recPick) {
 	for i := range picks {
-		if picks[i].RawConfidence != nil {
-			continue
+		if picks[i].RawAction == nil {
+			action := picks[i].Action
+			picks[i].RawAction = &action
 		}
-		v := int(picks[i].Confidence)
-		picks[i].RawConfidence = &v
+		if picks[i].RawConfidence == nil {
+			v := int(picks[i].Confidence)
+			picks[i].RawConfidence = &v
+		}
 	}
 }
 
@@ -1345,6 +1429,11 @@ func parseAndFilterPicks(content string, pool map[string]candidate, maxCount int
 	if parsed.Picks == nil {
 		return nil, nil, nil, errors.New("缺少 picks 字段")
 	}
+	for i, p := range *parsed.Picks {
+		if !p.confidencePresent {
+			return nil, nil, nil, fmt.Errorf("picks[%d] 缺少有效 confidence 字段", i)
+		}
+	}
 
 	diag := &RecCoverageDiag{InputCount: len(*parsed.Picks)}
 	out := make([]recPick, 0, len(*parsed.Picks))
@@ -1432,6 +1521,7 @@ func normalizePick(p recPick, sym string, c candidate) recPick {
 	p.Review, p.Bear, p.QualityGate = nil, nil, nil
 	p.QuoteAsOf = ""      // 服务端回填字段，模型自附一律剥除
 	p.RawConfidence = nil // 服务端快照字段（复核前置信度），模型自附一律剥除
+	p.RawAction = nil     // 服务端快照字段（复核前动作），模型自附一律剥除
 	p.Action = strings.ToLower(strings.TrimSpace(p.Action))
 	if p.Action != model.RecActionBuy && p.Action != model.RecActionWatch {
 		p.Action = model.RecActionWatch
@@ -2008,8 +2098,8 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 		for _, i := range idxs {
 			syms = append(syms, pool[i].Symbol)
 		}
-		lhbSigs := lhbSignalsFor(syms)
-		popSigs := popSignalsFor(syms)
+		lhbSigs := lhbSignalsFor(ctx, syms)
+		popSigs := popSignalsFor(ctx, syms)
 		// M3b 盘中因子批量注入（本地表一次查询，最近已同步交易日 T-1 口径）；
 		// 写回点在下方 Factors 创建之后。
 		intraSigs := intradaySignalsFor(syms)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -248,29 +249,54 @@ func calibProviderModelKey(m calibBatchMeta, ok bool) string {
 // （终值口径）分开测——终值口径测「用户实际看到的置信度」的校准性，原始口径测「模型
 // 自身预测」的校准性，两者混在一列会把复核修正误记到模型头上。纯测量零门控。
 type CalibRawSummary struct {
-	Sample  int `json:"sample"`  // 有原始快照的 buy 样本（Brier/ECE 的分母池）
+	Sample  int `json:"sample"`  // 有原始快照的原始 buy 样本（Brier/ECE 的分母池）
 	Missing int `json:"missing"` // 旧记录无原始快照（如实单列剔除，不硬造=不拿终值冒充原始值）
-	// Diverged 原始 ≠ 终值的样本数（被复核覆盖/reject 级联真实改写过的面）。
+	// Diverged 原始动作或置信度与终值不同的样本数（复核真实改写过的面）。动作差异
+	// 在 raw confidence 缺失时仍可判定，因此该数不受 Sample（可计算校准的样本）约束。
 	Diverged int      `json:"diverged"`
 	Brier    *float64 `json:"brier,omitempty"` // ≥ calibEvalMinSample 才产出（与主口径同门槛）
 	ECE      *float64 `json:"ece,omitempty"`
 }
 
-// calibRawSummary 从样本池聚合原始口径分列（watch 在函数内跳过——与主校准同为 buy
-// 口径；校准报表与联合评估共用同一实现，两处口径漂移会让「原始 vs 终值」各说各话）。
+func normalizeCalibRawAction(action string) string {
+	action = strings.ToLower(strings.TrimSpace(action))
+	if action == model.RecActionBuy || action == model.RecActionWatch {
+		return action
+	}
+	return ""
+}
+
+// calibRawAction 返回模型原始动作。新记录优先使用 DetailJSON 快照；旧记录由加载层尝试
+// 从同批次同标的 picked 事件回填，仍缺失时才回退标签终值。
+func calibRawAction(s calibSample) string {
+	if s.meta.rawAction != nil {
+		if action := normalizeCalibRawAction(*s.meta.rawAction); action != "" {
+			return action
+		}
+	}
+	return s.label.Action
+}
+
+// calibRawSummary 从样本池聚合原始口径分列：主口径按最终 buy，raw 口径按原始 buy。
+// 校准报表与联合评估共用同一实现，避免两处口径漂移。
 func calibRawSummary(samples []calibSample) *CalibRawSummary {
 	raw := &CalibRawSummary{}
 	var robs []calibObs
 	for _, s := range samples {
-		if s.label.Action != model.RecActionBuy {
+		rawAction := calibRawAction(s)
+		if rawAction != model.RecActionBuy {
 			continue
+		}
+		actionDiverged := rawAction != s.label.Action
+		if actionDiverged {
+			raw.Diverged++
 		}
 		if s.meta.rawConf == nil {
 			raw.Missing++
 			continue
 		}
 		raw.Sample++
-		if *s.meta.rawConf != s.meta.conf {
+		if !actionDiverged && *s.meta.rawConf != s.meta.conf {
 			raw.Diverged++
 		}
 		robs = append(robs, calibObs{Conf: float64(*s.meta.rawConf), Hit: s.label.NetReturnPct > 0, Net: s.label.NetReturnPct})
@@ -510,6 +536,8 @@ func calibTierMonotone(tiers []CalibTierCell) string {
 type calibPickMeta struct {
 	SysConfidence  string `json:"sys_confidence"`
 	DegradedSource string `json:"degraded_source"`
+	// RawAction 与 RawConfidence 同点快照；nil=旧记录无原始动作。
+	RawAction *string `json:"raw_action"`
 	// RawConfidence 模型原始口头置信度快照（第五十六批②；复核 reject 级联/复核覆盖
 	// 改写前的值）。nil=旧记录无快照（单列 raw_missing，不硬造）。
 	RawConfidence *int `json:"raw_confidence"`
@@ -517,10 +545,72 @@ type calibPickMeta struct {
 
 // calibRecMeta 推荐条目关联元数据（口头置信度列 + DetailJSON 摘取）。
 type calibRecMeta struct {
-	conf     int
-	rawConf  *int // 原始口头置信度快照（nil=旧记录缺席）
-	sysConf  string
-	degraded bool
+	conf      int
+	rawAction *string // 原始动作快照（DetailJSON 优先，旧记录可由 picked 事件回填）
+	rawConf   *int    // 原始口头置信度快照（nil=旧记录缺席）
+	sysConf   string
+	degraded  bool
+}
+
+type calibRawActionRef struct {
+	recID   int64
+	batchID int64
+	symbol  string
+}
+
+type calibRawActionKey struct {
+	batchID int64
+	symbol  string
+}
+
+// calibPickedRawActions 为 DetailJSON 尚无 raw_action 的历史推荐查权威原动作。
+// candidate_events 无唯一索引，异常重试可能产生重复行；按 id 倒序取最新有效 picked 行。
+func calibPickedRawActions(refs []calibRawActionRef) (map[int64]string, error) {
+	out := make(map[int64]string)
+	if len(refs) == 0 {
+		return out, nil
+	}
+
+	recIDsByKey := make(map[calibRawActionKey][]int64, len(refs))
+	batchIDs := make([]int64, 0, len(refs))
+	seenBatch := make(map[int64]bool, len(refs))
+	for _, ref := range refs {
+		if ref.batchID <= 0 || ref.symbol == "" {
+			continue
+		}
+		key := calibRawActionKey{batchID: ref.batchID, symbol: ref.symbol}
+		recIDsByKey[key] = append(recIDsByKey[key], ref.recID)
+		if !seenBatch[ref.batchID] {
+			seenBatch[ref.batchID] = true
+			batchIDs = append(batchIDs, ref.batchID)
+		}
+	}
+
+	for start := 0; start < len(batchIDs); start += 500 {
+		end := start + 500
+		if end > len(batchIDs) {
+			end = len(batchIDs)
+		}
+		var events []model.RecommendationCandidateEvent
+		if err := common.DB.Select("id", "batch_id", "symbol", "raw_action").
+			Where("batch_id IN ? AND candidate_stage = ?", batchIDs[start:end], model.CandStagePicked).
+			Order("id DESC").Find(&events).Error; err != nil {
+			return nil, err
+		}
+		for _, ev := range events {
+			action := normalizeCalibRawAction(ev.RawAction)
+			if action == "" {
+				continue
+			}
+			key := calibRawActionKey{batchID: ev.BatchID, symbol: ev.Symbol}
+			for _, recID := range recIDsByKey[key] {
+				if _, exists := out[recID]; !exists {
+					out[recID] = action
+				}
+			}
+		}
+	}
+	return out, nil
 }
 
 // calibSample 单条可用校准样本（成熟、非强平、非降级、非孤儿）。
@@ -542,7 +632,7 @@ func loadRecCalibSamples(recType string, horizon int) (usable []calibSample, cov
 	}
 	coverage.Total = len(labels)
 
-	// 关联推荐条目：口头置信度列 + DetailJSON 的 sys_confidence/degraded_source。
+	// 关联推荐条目：口头置信度列 + DetailJSON 元数据；旧 raw_action 再从 picked 事件回填。
 	ids := make([]int64, 0, len(labels))
 	seen := map[int64]bool{}
 	for _, l := range labels {
@@ -552,21 +642,35 @@ func loadRecCalibSamples(recType string, horizon int) (usable []calibSample, cov
 		}
 	}
 	metas := map[int64]calibRecMeta{}
+	var legacyRawActionRefs []calibRawActionRef
 	for start := 0; start < len(ids); start += 500 {
 		end := start + 500
 		if end > len(ids) {
 			end = len(ids)
 		}
 		var recs []model.Recommendation
-		if err = common.DB.Select("id", "confidence", "detail_json").
+		if err = common.DB.Select("id", "batch_id", "symbol", "confidence", "detail_json").
 			Where("id IN ?", ids[start:end]).Find(&recs).Error; err != nil {
 			return nil, coverage, err
 		}
 		for _, r := range recs {
 			var pm calibPickMeta
 			_ = json.Unmarshal([]byte(r.DetailJSON), &pm)
-			metas[r.ID] = calibRecMeta{conf: r.Confidence, rawConf: pm.RawConfidence, sysConf: pm.SysConfidence, degraded: pm.DegradedSource != ""}
+			metas[r.ID] = calibRecMeta{conf: r.Confidence, rawAction: pm.RawAction, rawConf: pm.RawConfidence, sysConf: pm.SysConfidence, degraded: pm.DegradedSource != ""}
+			if pm.RawAction == nil || normalizeCalibRawAction(*pm.RawAction) == "" {
+				legacyRawActionRefs = append(legacyRawActionRefs, calibRawActionRef{recID: r.ID, batchID: r.BatchID, symbol: r.Symbol})
+			}
 		}
+	}
+	pickedRawActions, loadErr := calibPickedRawActions(legacyRawActionRefs)
+	if loadErr != nil {
+		return nil, coverage, fmt.Errorf("加载历史推荐原始动作失败: %w", loadErr)
+	}
+	for recID, action := range pickedRawActions {
+		m := metas[recID]
+		rawAction := action
+		m.rawAction = &rawAction
+		metas[recID] = m
 	}
 
 	for _, l := range labels {
@@ -710,9 +814,10 @@ func buildRecCalibReport(recType string, horizon int) (*RecCalibReport, error) {
 		rep.ECE = calibECE(obs)
 	}
 	rep.Reliability = calibReliability(obs)
-	// 原始口径分列（第五十六批②）：仅 buy 样本非空时输出（与主校准同池同门槛）。
-	if len(obs) > 0 {
-		rep.RawCalib = calibRawSummary(usable)
+	// 原始口径分列按复核前动作取样；即使全部原始 buy 都被 reject 成 watch 也必须输出。
+	rawCalib := calibRawSummary(usable)
+	if rawCalib.Sample > 0 || rawCalib.Missing > 0 {
+		rep.RawCalib = rawCalib
 	}
 
 	appendTier := func(tier string) {
@@ -826,7 +931,7 @@ func buildRecCalibReport(recType string, horizon int) (*RecCalibReport, error) {
 		"程序合成置信度是有序档位不硬造概率，只报分档命中率/收益与单调性观察；成本前（gross）与成本后（net）收益分开统计",
 		fmt.Sprintf("「已评估」硬门槛=buy 口头置信度样本 ≥%d（§8.1 推荐模块每数据状态 100；未评估≠0 分）；分档/PR 表 <%d 仅供分级参考、单桶/单档 <%d 统计不稳定", calibEvalMinSample, calibMinSample, calibMinBucket),
 		fmt.Sprintf("分层维度（P2-5）：策略/市场状态取标签归因冗余，provider·model/prompt_version 关联批次归因列（prompt_version 分层即 champion/challenger 晋级前后的对照落点）；每层样本 ≥%d 才产出该层 Brier/ECE，小样本层只报命中率/收益供参考，分层是观察不是采信", calibEvalMinSample),
-		"双口径（第五十六批）：主校准=落库终值（用户实际看到的置信度，含复核 reject 级联/复核覆盖修正）；raw_calib=模型原始口头置信度快照（复核改写前）单独分列——旧记录无快照如实计 missing 不硬造，两口径同池同门槛",
+		"双口径（第五十六批）：主校准按最终 buy 与落库终值；raw_calib 按复核前原始 buy 与原始口头置信度。两者共用成熟、非强平、非降级标签总体及评估门槛；旧记录无原始动作时先按同批次同标的 picked 事件回填，事件也缺失才回退最终动作；无原始置信度时计 missing",
 	)
 	return rep, nil
 }

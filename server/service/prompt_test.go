@@ -1,10 +1,13 @@
 package service
 
 import (
+	"errors"
 	"testing"
 
 	"quantvista/common"
 	"quantvista/model"
+
+	"gorm.io/gorm"
 )
 
 // TestPromptUpsertAndOverride upsert 唯一/校验 + userPromptOverride 生效条件 + 隔离 + 删除。
@@ -73,6 +76,36 @@ func TestPromptUpsertAndOverride(t *testing.T) {
 		if m.Default == "" || m.Label == "" {
 			t.Fatalf("模块信息缺失: %+v", m)
 		}
+	}
+}
+
+// TestPromptUpsertExpectedRowCAS promote/rollback 读取的 expected row 一旦落后于并发编辑，
+// 事务内核必须拒绝覆盖，并保留已经提交的新模板。
+func TestPromptUpsertExpectedRowCAS(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Exec("DELETE FROM prompt_template_revisions")
+	common.DB.Exec("DELETE FROM prompt_templates")
+	ps := NewPromptService()
+	first, _, err := ps.Upsert(77, PromptInput{Module: model.PromptModuleRecommend, Content: "cas-A", Enabled: true})
+	if err != nil {
+		t.Fatalf("创建 A: %v", err)
+	}
+	expected := *first
+	if _, _, err := ps.Upsert(77, PromptInput{Module: model.PromptModuleRecommend, Content: "cas-B", Enabled: true}); err != nil {
+		t.Fatalf("并发编辑 B: %v", err)
+	}
+	err = common.DB.Transaction(func(tx *gorm.DB) error {
+		_, err := upsertPromptTemplateTx(tx, 77, model.PromptModuleRecommend,
+			"cas-C", promptContentHash("cas-C"), true, &expected, true)
+		return err
+	})
+	if !errors.Is(err, errPromptTemplateConcurrent) {
+		t.Fatalf("stale expected row 应触发 CAS 拒绝: %v", err)
+	}
+	var got model.PromptTemplate
+	common.DB.Where("user_id = ? AND module = ?", 77, model.PromptModuleRecommend).First(&got)
+	if got.Content != "cas-B" || got.Revision != expected.Revision+1 {
+		t.Fatalf("CAS 失败不得覆盖已提交 B: %+v", got)
 	}
 }
 

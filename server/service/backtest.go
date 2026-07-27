@@ -771,6 +771,7 @@ type BatchHoldStat struct {
 	AvgAlphaPct  float64       `json:"avg_alpha_pct"`
 	AlphaSample  int           `json:"alpha_sample"`
 	Pending      int           `json:"pending"`
+	Forced       int           `json:"forced"` // 顺延/退市长停末根强平，单列剔除不进统计
 	Skipped      int           `json:"skipped"` // 一字板/停牌/资金不足合计
 	NoData       int           `json:"no_data"`
 	AlphaHist    []AlphaBucket `json:"alpha_hist"`
@@ -848,6 +849,7 @@ func (s *BacktestService) BatchBacktest(ctx context.Context, userID int64, req B
 	res := &BatchBacktestResult{Batches: len(batches)}
 	type acc struct {
 		trades, pending, skipped, noData, alphaSample int
+		forced                                        int
 		wins                                          int
 		sumRet, sumAlpha                              float64
 		hist                                          []int
@@ -894,6 +896,15 @@ func (s *BacktestService) BatchBacktest(ctx context.Context, userID int64, req B
 					a := accBy[h]
 					switch o.Status {
 					case btTraded:
+						if o.Forced {
+							// 顺延到末根强平 / 退市长停末根收盘强平：真实中卖不出，收益偏
+							// 保守。与 Run 的 aggregate、walkforward、recrecall、recattribution
+							// 四处口径一致单列剔除，不进胜率/均值/alpha 直方图。
+							a.forced++
+							cell.Status = "forced"
+							row.Holds[fmt.Sprintf("%d", h)] = cell
+							continue
+						}
 						a.trades++
 						a.sumRet += o.ReturnPct
 						if o.ReturnPct > 0 {
@@ -925,7 +936,7 @@ func (s *BacktestService) BatchBacktest(ctx context.Context, userID int64, req B
 	for _, h := range holds {
 		a := accBy[h]
 		st := BatchHoldStat{
-			HoldDays: h, Trades: a.trades, Pending: a.pending,
+			HoldDays: h, Trades: a.trades, Pending: a.pending, Forced: a.forced,
 			Skipped: a.skipped, NoData: a.noData, AlphaSample: a.alphaSample,
 		}
 		if a.trades > 0 {
@@ -944,6 +955,7 @@ func (s *BacktestService) BatchBacktest(ctx context.Context, userID int64, req B
 		"回验口径：推荐日（或其前最近交易日）次日开盘买入、持有 5/10/20 交易日收盘卖出，A 股约束与费率同条件树回测",
 		"alpha=个股区间收益−上证同区间收益（买入日收盘→卖出日收盘口径）；基准缺失的样本不计入 alpha",
 		"pending=持有期尚未走完；skipped=一字板买不进/停牌/拨款不足一手",
+		"forced=顺延到末根或退市/长停按末根收盘强平，真实中卖不出、收益偏保守，单列剔除不进胜率/均值/alpha",
 	)
 	if len(benchClose) == 0 {
 		res.Notes = append(res.Notes, "基准指数数据不可得，本次回验无 alpha")

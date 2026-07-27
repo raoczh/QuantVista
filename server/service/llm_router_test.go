@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -137,6 +138,8 @@ func TestApplyModelRoutingSwapsTarget(t *testing.T) {
 		ra.FromConfigID != 999 || ra.FromModel != "orig-model" {
 		t.Fatalf("RouteApplied 观测不符: %+v", ra)
 	}
+	// 中央客户端只产出本 attempt 的候选归因；业务接受输出后才允许进 manifest。
+	run.acceptRouteAttribution()
 	m := run.manifest(origCfg, false)
 	if m.Routed == nil || m.Routed.ConfigID != cfg.ID || m.Routed.FromModel != "orig-model" {
 		t.Fatalf("manifest 应带 routed 声明: %+v", m.Routed)
@@ -442,11 +445,103 @@ func TestApplyBatchRouteAttribution(t *testing.T) {
 
 	run.routeApplied = LLMRouteApplied{Applied: true, RouteID: 1, ConfigID: 7,
 		Provider: "routed-prov", Model: "routed-model", FromConfigID: 999, FromModel: "orig-model"}
+	run.acceptRouteAttribution()
 	applyBatchRouteAttribution(batch, run)
 	if batch.Provider != "routed-prov" || batch.Model != "routed-model" {
 		t.Fatalf("路由后归因应记真实目标: %+v", batch)
 	}
 	if batch.LLMConfigID != 999 {
 		t.Fatalf("LLMConfigID 应保持原配置指针（回显/重试语义）: %d", batch.LLMConfigID)
+	}
+}
+
+// TestSecondaryRunRejectedAttemptsDoNotPublishRoute 验证次级 rec_bear run 即使最后一次
+// HTTP 调用命中路由，只要业务 JSON 未通过解析，manifest 就不能记录该失败目标。
+func TestSecondaryRunRejectedAttemptsDoNotPublishRoute(t *testing.T) {
+	setModelRoutingFlag(t, true)
+	cleanRouteTables(t)
+
+	var calls atomic.Int64
+	routedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"not-json"},"finish_reason":"stop"}],"usage":{"total_tokens":5}}`))
+	}))
+	defer routedSrv.Close()
+
+	targetCfg := seedRouteAdminConfig(t, routedSrv.URL)
+	if _, err := UpsertLLMRoute(LLMRouteInput{Module: "rec_bear", ConfigID: targetCfg.ID, Enabled: true}); err != nil {
+		t.Fatalf("建 rec_bear 路由: %v", err)
+	}
+	origCfg := &model.LLMConfig{ID: 999, Provider: "orig-prov", BaseURL: routedSrv.URL,
+		Model: "orig-model", MaxTokens: 1500}
+	pool := map[string]candidate{"600000": {Symbol: "600000", Name: "浦发银行", Price: 10}}
+	bears, _, run := (&RecommendationService{}).bearReview(context.Background(), 1, origCfg, "sk-orig", true,
+		[]recPick{{Symbol: "600000", Action: model.RecActionBuy, Confidence: 60}}, pool, "t-bear-route", "r-parent")
+	if bears != nil || run == nil || calls.Load() != int64(1+moduleRepairAttempts("rec_bear")) {
+		t.Fatalf("应打满 repair 且拒收: calls=%d bears=%+v run=%v", calls.Load(), bears, run != nil)
+	}
+	if !run.routeApplied.Applied {
+		t.Fatalf("前置条件：最后一次调用应命中路由: %+v", run.routeApplied)
+	}
+	if run.acceptedRouteApplied.Applied {
+		t.Fatalf("解析未通过不得提交路由归因: %+v", run.acceptedRouteApplied)
+	}
+	if got := run.manifest(origCfg, true); got.Routed != nil {
+		t.Fatalf("失败的次级 run 不得在 manifest 中声明 routed: %+v", got.Routed)
+	}
+}
+
+// TestApplyBatchRouteAttributionUsesAcceptedRepair 首轮路由目标回落 free-text 后输出无效，
+// repair 因能力观察改走原模型并成功时，批次只能归因最终被接受的原模型。
+func TestApplyBatchRouteAttributionUsesAcceptedRepair(t *testing.T) {
+	setModelRoutingFlag(t, true)
+	cleanRouteTables(t)
+	if err := setting.SetLLMCapabilityRouting(true); err != nil {
+		t.Fatalf("开启能力路由: %v", err)
+	}
+	t.Cleanup(func() { _ = setting.SetLLMCapabilityRouting(true) })
+
+	var routedCalls, origCalls atomic.Int64
+	routedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		routedCalls.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "response_format") {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"response_format is not supported"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"not-json"},"finish_reason":"stop"}],"usage":{"total_tokens":5}}`))
+	}))
+	defer routedSrv.Close()
+	origSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origCalls.Add(1)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"picks\":[{\"symbol\":\"600000\",\"action\":\"watch\",\"confidence\":55,\"reason\":[\"r\"],\"risks\":[\"k\"],\"evidence\":[\"e\"]}],\"rejected\":[]}"},"finish_reason":"stop"}],"usage":{"total_tokens":7}}`))
+	}))
+	defer origSrv.Close()
+
+	targetCfg := seedRouteAdminConfig(t, routedSrv.URL)
+	if _, err := UpsertLLMRoute(LLMRouteInput{Module: "recommendation", ConfigID: targetCfg.ID, Enabled: true}); err != nil {
+		t.Fatalf("建路由: %v", err)
+	}
+	origCfg := &model.LLMConfig{ID: 999, Provider: "orig-prov", BaseURL: origSrv.URL,
+		Model: "orig-model", MaxTokens: 2500}
+	run := newLLMRun("t-repair-route", "", "recommendation", "recommendation.v2", "p13")
+	pool := map[string]candidate{"600000": {Symbol: "600000", Name: "浦发银行", Price: 10}}
+	picks, _, _, _, err := (&RecommendationService{}).callWithRepair(context.Background(), 1, run,
+		origCfg, "sk-orig", true, []chatMessage{{Role: "user", Content: "pick"}}, pool, 3)
+	if err != nil || len(picks) != 1 {
+		t.Fatalf("repair 应由原模型产出可接受结果: err=%v picks=%+v", err, picks)
+	}
+	if routedCalls.Load() != 2 || origCalls.Load() != 1 {
+		t.Fatalf("请求路径应为 routed(结构化拒绝+free-text 无效)→orig repair: routed=%d orig=%d",
+			routedCalls.Load(), origCalls.Load())
+	}
+	if run.routeApplied.Applied {
+		t.Fatalf("最终 accepted attempt 未路由，不得继承首轮归因: %+v", run.routeApplied)
+	}
+	batch := &model.RecommendationBatch{LLMConfigID: origCfg.ID, Provider: origCfg.Provider, Model: origCfg.Model}
+	applyBatchRouteAttribution(batch, run)
+	if batch.Provider != origCfg.Provider || batch.Model != origCfg.Model {
+		t.Fatalf("批次应归因最终原模型: %+v", batch)
 	}
 }

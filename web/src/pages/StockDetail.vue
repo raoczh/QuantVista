@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
-import { NButton, NEmpty, NGi, NGrid, NResult, NSpin, NTag, NTooltip } from 'naive-ui'
+import { NAlert, NButton, NButtonGroup, NEmpty, NGi, NGrid, NResult, NSpin, NTag, NTooltip } from 'naive-ui'
 import * as echarts from 'echarts'
 import {
   getQuote,
   getDailyBars,
+  getMinuteLine,
   getValuation,
   getScore,
   getIndicators,
@@ -14,6 +15,7 @@ import {
   getStockLhb,
   type Quote,
   type Bar,
+  type MinuteLine,
   type Valuation,
   type StockScore,
   type IndicatorSeries,
@@ -47,6 +49,10 @@ const quote = ref<Quote | null>(null)
 const valuation = ref<Valuation | null>(null)
 const score = ref<StockScore | null>(null)
 const bars = ref<Bar[]>([])
+const minute = ref<MinuteLine | null>(null)
+const minuteLoading = ref(false)
+const minuteError = ref('')
+const chartMode = ref<'minute' | 'daily'>(market.value === 'cn' ? 'minute' : 'daily')
 const indicators = ref<IndicatorSeries | null>(null)
 const chips = ref<ChipDist | null>(null)
 const news = ref<NewsItem[]>([])
@@ -96,6 +102,33 @@ async function load(silent = false) {
     const q = await getQuote(market.value, symbol.value)
     if (mySeq !== loadSeq) return
     quote.value = q
+    if (market.value === 'cn') {
+      // 静默刷新（盘中每 60s 自动刷新）不置 loading：分时卡的 n-spin 遮罩会每分钟
+      // 闪一次（降透明度 + pointer-events:none + 转圈），而这恰是用户正盯着分时图的
+      // 时候。首次/手动加载仍然显示。
+      if (!silent) minuteLoading.value = true
+      minuteError.value = ''
+      getMinuteLine(market.value, symbol.value)
+        .then((r) => {
+          if (mySeq !== loadSeq) return
+          minute.value = r
+          nextTick(() => renderChart())
+        })
+        .catch((e) => {
+          if (mySeq !== loadSeq) return
+          minute.value = null
+          minuteError.value = (e as Error).message
+          nextTick(() => renderChart())
+        })
+        .finally(() => {
+          if (mySeq === loadSeq) minuteLoading.value = false
+        })
+    } else {
+      minute.value = null
+      minuteError.value = ''
+      minuteLoading.value = false
+      chartMode.value = 'daily'
+    }
     // 估值 / 评分 / 相关新闻 best-effort：失败只是不显示对应卡片。
     getValuation(market.value, symbol.value)
       .then((v) => {
@@ -169,7 +202,7 @@ async function load(silent = false) {
       .then((r) => {
         if (mySeq !== loadSeq) return
         indicators.value = r
-        renderChart()
+        nextTick(() => renderChart())
       })
       .catch(() => {
         if (mySeq === loadSeq) indicators.value = null
@@ -187,6 +220,10 @@ async function load(silent = false) {
     const b = await getDailyBars(market.value, symbol.value, 120)
     if (mySeq !== loadSeq) return
     bars.value = b
+    // 必须等 DOM patch：图表容器带 v-show（日K 分支条件是 bars.length > 0），赋值当帧
+    // 容器仍是 display:none，同步 renderChart 会让 echarts.init 拿到 0×0 建出空白画布，
+    // 且 resize 监听只挂在 window 上不会自愈——表现为日K 区域一片空白直到切走再切回。
+    await nextTick()
     renderChart()
   } catch (e) {
     if (!silent && mySeq === loadSeq) {
@@ -208,6 +245,10 @@ function alignByDate(vals: (number | null)[]): (number | null)[] {
 }
 
 function renderChart() {
+  if (chartMode.value === 'minute') {
+    renderMinuteChart()
+    return
+  }
   if (!chartEl.value || !bars.value.length) return
   if (chart) {
     chart.dispose()
@@ -301,6 +342,132 @@ function renderChart() {
       },
       line('DIF', alignByDate(indicators.value.dif), difColor, 1, { xAxisIndex: 1, yAxisIndex: 1 }),
       line('DEA', alignByDate(indicators.value.dea), deaColor, 1, { xAxisIndex: 1, yAxisIndex: 1 }),
+    ],
+  })
+}
+
+function renderMinuteChart() {
+  const line = minute.value
+  if (!chartEl.value || !line?.points.length) {
+    chart?.dispose()
+    chart = null
+    return
+  }
+  chart?.dispose()
+  chart = echarts.init(chartEl.value, isDark.value ? 'dark' : undefined)
+  const prices = line.points.map((p) => p.price)
+  const avgs = line.points.map((p) => p.avg)
+  const volumes = line.points.map((p) => p.volume)
+  const times = line.points.map((p) => p.time)
+  const priceColor = pctColor(line.last - line.prev_close)
+  const avgColor = vars.value.warningColor
+  const baseColor = vars.value.textColor3
+  const maxDeviation = Math.max(
+    Math.abs(line.high - line.prev_close),
+    Math.abs(line.low - line.prev_close),
+    line.prev_close * 0.002,
+  )
+
+  chart.setOption({
+    backgroundColor: 'transparent',
+    animationDuration: 300,
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'cross' },
+      confine: true,
+      formatter: (params: { seriesName: string; value: number; axisValue: string }[]) => {
+        if (!params.length) return ''
+        const i = times.indexOf(params[0].axisValue)
+        const p = line.points[i]
+        if (!p) return ''
+        const change = line.prev_close ? ((p.price / line.prev_close - 1) * 100).toFixed(2) : '-'
+        return `${line.trade_date} ${p.time}<br/>价格 ${p.price.toFixed(2)}（${Number(change) > 0 ? '+' : ''}${change}%）<br/>估算均价 ${p.avg.toFixed(3)}<br/>成交量 ${fmtVol(p.volume)}`
+      },
+    },
+    axisPointer: { link: [{ xAxisIndex: 'all' }] },
+    legend: {
+      top: 0,
+      data: ['价格', '估算均价'],
+      textStyle: { color: vars.value.textColor3, fontSize: 11 },
+      itemWidth: 16,
+      itemHeight: 8,
+    },
+    grid: [
+      { left: 54, right: 18, top: 30, height: '62%' },
+      { left: 54, right: 18, top: '76%', height: '17%' },
+    ],
+    xAxis: [
+      {
+        type: 'category',
+        data: times,
+        boundaryGap: false,
+        axisLabel: { interval: Math.max(1, Math.floor(times.length / 5)), fontSize: 10 },
+      },
+      {
+        type: 'category',
+        gridIndex: 1,
+        data: times,
+        boundaryGap: true,
+        axisLabel: { show: false },
+        axisTick: { show: false },
+      },
+    ],
+    yAxis: [
+      {
+        type: 'value',
+        min: Number((line.prev_close - maxDeviation).toFixed(3)),
+        max: Number((line.prev_close + maxDeviation).toFixed(3)),
+        scale: true,
+        axisLabel: { formatter: (v: number) => v.toFixed(2) },
+        splitLine: { lineStyle: { color: vars.value.dividerColor } },
+      },
+      {
+        type: 'value',
+        gridIndex: 1,
+        splitNumber: 2,
+        axisLabel: { formatter: (v: number) => (v >= 10000 ? `${(v / 10000).toFixed(0)}万` : String(v)) },
+        splitLine: { show: false },
+      },
+    ],
+    series: [
+      {
+        type: 'line',
+        name: '价格',
+        data: prices,
+        symbol: 'none',
+        lineStyle: { width: 1.5, color: priceColor },
+        itemStyle: { color: priceColor },
+        markLine: {
+          symbol: 'none',
+          silent: true,
+          label: { formatter: line.base_from_open ? '开盘基准' : '昨收', color: baseColor },
+          lineStyle: { type: 'dashed', color: baseColor, opacity: 0.75 },
+          data: [{ yAxis: line.prev_close }],
+        },
+      },
+      {
+        type: 'line',
+        name: '估算均价',
+        data: avgs,
+        symbol: 'none',
+        lineStyle: { width: 1.2, color: avgColor },
+        itemStyle: { color: avgColor },
+      },
+      {
+        type: 'bar',
+        name: '成交量',
+        xAxisIndex: 1,
+        yAxisIndex: 1,
+        data: volumes,
+        barWidth: '70%',
+        itemStyle: {
+          color: (p: { dataIndex: number }) => {
+            const prev = p.dataIndex > 0 ? prices[p.dataIndex - 1] : line.prev_close
+            return pctColor(prices[p.dataIndex] - prev)
+          },
+          opacity: 0.75,
+        },
+      },
     ],
   })
 }
@@ -524,10 +691,17 @@ watch(isDark, () => {
   renderFinanceChart()
   renderFundFlowChart()
 })
+watch(chartMode, async () => {
+  await nextTick()
+  renderChart()
+})
 // 同页跳转到另一只个股（如从对比/搜索进来）时整页重载。
 watch([market, symbol], () => {
   valuation.value = null
   score.value = null
+  minute.value = null
+  minuteError.value = ''
+  chartMode.value = market.value === 'cn' ? 'minute' : 'daily'
   indicators.value = null
   chips.value = null
   finance.value = null
@@ -667,13 +841,36 @@ function scoreType(total: number) {
           </div>
         </SectionCard>
 
-        <!-- 日 K + MACD/BOLL 副图 -->
-        <SectionCard title="日 K（近 120 交易日）">
+        <!-- 分时与日 K 共用稳定尺寸图表容器，切换时重绘。 -->
+        <SectionCard title="行情走势">
           <template #extra>
-            <span class="src-hint">BOLL(20,2σ) · MACD(12,26,9)</span>
+            <n-button-group v-if="market === 'cn'" size="small">
+              <n-button :type="chartMode === 'minute' ? 'primary' : 'default'" @click="chartMode = 'minute'">分时</n-button>
+              <n-button :type="chartMode === 'daily' ? 'primary' : 'default'" @click="chartMode = 'daily'">日 K</n-button>
+            </n-button-group>
           </template>
-          <div ref="chartEl" class="kchart"></div>
-          <n-empty v-if="!bars.length" description="日线数据暂不可用" />
+          <n-spin :show="chartMode === 'minute' && minuteLoading">
+            <div v-if="chartMode === 'minute' && minute" class="minute-meta">
+              <span>{{ minute.trade_date }}</span>
+              <span>累计 {{ fmtVol(minute.total_volume) }}</span>
+              <span>高 {{ fmt(minute.high) }}</span>
+              <span>低 {{ fmt(minute.low) }}</span>
+              <span>{{ minute.base_from_open ? '昨收缺失，基准线使用开盘价' : '基准线为昨收' }}</span>
+            </div>
+            <div v-show="chartMode === 'daily' ? bars.length > 0 : !!minute?.points.length" ref="chartEl" class="kchart"></div>
+            <div v-if="chartMode === 'minute' && minute" class="src-hint minute-note">{{ minute.avg_note }}</div>
+            <n-alert v-if="chartMode === 'minute' && minuteError" type="error" :bordered="false">
+              {{ minuteError }}
+            </n-alert>
+            <n-empty
+              v-else-if="chartMode === 'minute' && !minuteLoading && !minute"
+              description="分时数据暂不可用"
+            />
+            <n-empty v-else-if="chartMode === 'daily' && !bars.length" description="日线数据暂不可用" />
+            <div v-if="chartMode === 'daily' && bars.length" class="src-hint minute-note">
+              近 120 交易日 · BOLL(20,2σ) · MACD(12,26,9)
+            </div>
+          </n-spin>
         </SectionCard>
 
         <!-- 筹码分布（T1）：日K+换手率三角衰减本地复算，与东财展示或有复权口径差异 -->
@@ -969,10 +1166,26 @@ function scoreType(total: number) {
   width: 100%;
   height: 460px;
 }
+.minute-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px 16px;
+  min-height: 24px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  opacity: 0.68;
+}
+.minute-note {
+  margin-top: 6px;
+  line-height: 1.6;
+}
 @media (max-width: 768px) {
   /* 小屏 460px ≈ 72vh 占满一屏还多，与 chip/ff/fin 图同做降高 */
   .kchart {
     height: 360px;
+  }
+  .minute-meta {
+    gap: 4px 12px;
   }
 }
 

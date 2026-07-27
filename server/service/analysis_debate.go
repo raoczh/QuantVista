@@ -268,6 +268,7 @@ func (s *AnalysisService) debateCallOne(ctx context.Context, userID int64, run *
 		usage.CompletionTokens += res.Usage.CompletionTokens
 		usage.TotalTokens += res.Usage.TotalTokens
 		if perr := parse(res.Content); perr == nil {
+			run.acceptRouteAttribution()
 			return usage, nil
 		} else {
 			lastErr = perr

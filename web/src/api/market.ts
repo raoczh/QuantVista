@@ -206,6 +206,157 @@ export function getDailyBars(market: string, symbol: string, limit = 120) {
   })
 }
 
+// A1 个股分时线。成交量单位为手；均价为服务端基于分钟线估算的累计均价。
+export interface MinutePoint {
+  time: string
+  price: number
+  avg: number
+  volume: number
+}
+
+export interface MinuteLine {
+  symbol: string
+  market: string
+  trade_date: string
+  prev_close: number
+  base_from_open: boolean
+  points: MinutePoint[]
+  total_volume: number
+  high: number
+  low: number
+  last: number
+  avg_note: string
+}
+
+export function getMinuteLine(market: string, symbol: string) {
+  return request<MinuteLine>({
+    url: `/markets/${market}/stocks/${symbol}/minute`,
+    method: 'get',
+  })
+}
+
+// A2 盘面情绪。比例字段均为百分比数值，金额字段单位为元。
+export interface MarketMoodDaily {
+  market: string
+  trade_date: string
+  limit_up_count: number
+  broken_count: number
+  broken_rate: number
+  max_streak: number
+  streak_dist_json: string
+  yzt_count: number
+  yzt_avg_chg: number
+  yzt_up_ratio: number
+  seal_fund_top: number
+}
+
+export interface LimitUpStock {
+  symbol: string
+  market: string
+  trade_date: string
+  name: string
+  price: number
+  amount: number
+  float_cap: number
+  turnover_rate: number
+  streak: number
+  first_seal_at: number
+  last_seal_at: number
+  seal_fund: number
+  break_count: number
+  industry: string
+  stat_days: number
+  stat_count: number
+}
+
+export interface MoodTrendPoint {
+  trade_date: string
+  limit_up_count: number
+  broken_count: number
+  broken_rate: number
+  max_streak: number
+  yzt_avg_chg: number
+  yzt_up_ratio: number
+}
+
+export interface StreakLadder {
+  streak: number
+  count: number
+  stocks: LimitUpStock[]
+}
+
+export interface MoodOverview {
+  market: string
+  latest: MarketMoodDaily | null
+  streak_dist: Record<string, number>
+  streak_ladders: StreakLadder[]
+  trend: MoodTrendPoint[]
+  seal_fund_top: LimitUpStock[]
+}
+
+export function getMarketMood(market = 'cn', days = 20) {
+  return request<MoodOverview>({
+    url: `/markets/${market}/mood`,
+    method: 'get',
+    params: { days },
+  })
+}
+
+// A3 全市场龙虎榜与人气榜。
+export interface LhbDailyItem {
+  symbol: string
+  name: string
+  reason: string
+  note: string
+  close: number
+  change_pct: number
+  net_buy: number
+  buy_amt: number
+  sell_amt: number
+  deal_amt: number
+  net_ratio: number
+  turnover_rate: number
+  org_net_buy: number
+  org_buy_times: number
+  org_sell_times: number
+}
+
+export interface LhbDaily {
+  market: string
+  trade_date: string
+  items: LhbDailyItem[]
+}
+
+export function getMarketLhb(market = 'cn', date = '', limit = 50) {
+  return request<LhbDaily>({
+    url: `/markets/${market}/lhb`,
+    method: 'get',
+    params: { date: date || undefined, limit },
+  })
+}
+
+export interface PopularityDailyItem {
+  symbol: string
+  name: string
+  rank: number
+  prev_rank: number
+  is_new: boolean
+}
+
+export interface PopularityDaily {
+  market: string
+  trade_date: string
+  items: PopularityDailyItem[]
+}
+
+export function getMarketPopularity(market = 'cn', date = '') {
+  return request<PopularityDaily>({
+    url: `/markets/${market}/popularity`,
+    method: 'get',
+    params: { date: date || undefined },
+  })
+}
+
 export function getValuation(market: string, symbol: string) {
   return request<Valuation>({ url: `/markets/${market}/stocks/${symbol}/valuation`, method: 'get' })
 }

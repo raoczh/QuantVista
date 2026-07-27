@@ -51,6 +51,21 @@ type PromptTemplateRevision struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// PromptChampionState 是每个用户/模块真实生效 prompt 的单调代际锚。
+//
+// PromptTemplate.Revision 只描述内容快照：仅切 enabled 不递增，删除后重建还会从 1
+// 开始，因此不能识别 default→custom→default、custom A→disabled→A 这类“洗回”。
+// Generation 对内容、enabled、创建和删除的每次有效变化都递增，且模板删除时保留。
+type PromptChampionState struct {
+	ID         int64  `gorm:"primaryKey" json:"id"`
+	UserID     int64  `gorm:"index:idx_pcs_uniq,unique" json:"user_id"`
+	Module     string `gorm:"size:16;index:idx_pcs_uniq,unique" json:"module"`
+	Generation int64  `gorm:"not null;default:0" json:"generation"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // 扩展提示词模块（M3c）。分析 5 模块沿用 AnalysisModule* 常量。
 const (
 	PromptModuleRecommend = "recommend" // 推荐：角色与铁律段（recRoleIntro）
@@ -151,10 +166,48 @@ func migratePromptTemplateBaselines(db *gorm.DB) error {
 	return nil
 }
 
+// migratePromptChampionStates 为升级前已有模板补建 generation 锚。旧实验没有创建时
+// generation，service 层会 fail-closed 要求重建；这里仅为升级后的新实验建立可持续的
+// 单调起点。Generation 至少为 1，并尽量沿用现有 revision 作为起点。
+func migratePromptChampionStates(db *gorm.DB) error {
+	var rows []PromptTemplate
+	if err := db.Find(&rows).Error; err != nil {
+		return err
+	}
+	for _, row := range rows {
+		generation := int64(row.Revision)
+		if generation < 1 {
+			generation = 1
+		}
+		var count int64
+		if err := db.Model(&PromptChampionState{}).
+			Where("user_id = ? AND module = ?", row.UserID, row.Module).Count(&count).Error; err != nil {
+			return err
+		}
+		if count > 0 {
+			continue
+		}
+		if err := db.Create(&PromptChampionState{
+			UserID: row.UserID, Module: row.Module, Generation: generation,
+		}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // MigratePromptTemplateBaselines 导出入口（Migrate 内部调用；测试可显式调用）。
 func MigratePromptTemplateBaselines() error {
 	if common.DB == nil {
 		return nil
 	}
 	return migratePromptTemplateBaselines(common.DB)
+}
+
+// MigratePromptChampionStates 导出入口（Migrate 内部调用；测试可显式调用）。
+func MigratePromptChampionStates() error {
+	if common.DB == nil {
+		return nil
+	}
+	return migratePromptChampionStates(common.DB)
 }

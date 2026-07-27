@@ -597,6 +597,8 @@ export interface LLMExperiment {
   parent_id: number
   promoted_revision: number
   pre_promote_enabled: boolean
+  /** 非空=创建实验时固化的 champion 基线已漂移；实验不可再启动、审计或晋级 */
+  baseline_stale?: string
   /** 非空=回滚已失去对象（当前启用模板不再是本实验晋级产物），后端会拒绝回滚 */
   rollback_stale?: string
   rolled_back_at?: string

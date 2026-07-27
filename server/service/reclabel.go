@@ -544,6 +544,16 @@ func settleFromActualEntry(bars []datasource.Bar, entryDate string, entryPrice f
 	if e < 0 {
 		return labelOutcome{Status: btPending}
 	}
+	// 已定位建仓根（e>=0）后的 pending 一律带回 BuyDate/BuyPrice 与已有窗口 MFE/MAE：
+	// advanceOneLabel 的超窗强平 guard 是 `out.BuyDate != ""`，不带则 forceCloseStaleLabel
+	// 的 actual 分支（qty=100 名义一手）永远走不到——用户实际持有的标的退市/长停时，
+	// next_open 口径按末根收盘强平成熟、actual 口径却判 no_data，同一事实两条并列口径
+	// 给出不同结论。e<0（从未入场）保持裸 pending，应当走 no_data。
+	pendingAtEntry := func() labelOutcome {
+		o := labelOutcome{Status: btPending, BuyDate: entryDate, BuyPrice: entryPrice}
+		o.MfePct, o.MaePct = excursion(bars, e, len(bars)-1, entryPrice)
+		return o
+	}
 	// 建仓根为买入根 → 卖出根 = e + horizon（建仓根之后第 horizon 个交易日，与统一
 	// 模拟 buyIdx+holdN 同口径）。
 	var j int
@@ -554,7 +564,7 @@ func settleFromActualEntry(bars []datasource.Bar, entryDate string, entryPrice f
 				j = len(bars) - 1 // 市场已过到期日、个股停更 → 退市/长停：末根收盘强平
 				forced = true
 			} else {
-				return labelOutcome{Status: btPending}
+				return pendingAtEntry()
 			}
 		} else {
 			j = e
@@ -565,12 +575,12 @@ func settleFromActualEntry(bars []datasource.Bar, entryDate string, entryPrice f
 	} else {
 		j = e + horizon
 		if j >= len(bars) {
-			return labelOutcome{Status: btPending}
+			return pendingAtEntry()
 		}
 	}
 	sell := bars[j]
 	if sell.Close <= 0 {
-		return labelOutcome{Status: btPending} // 出场根坏数据：不伪造成熟收益
+		return pendingAtEntry() // 出场根坏数据：不伪造成熟收益
 	}
 	out := labelOutcome{Status: btTraded, BuyDate: entryDate, BuyPrice: entryPrice, Forced: forced}
 	qty := 100.0 // 名义一手：净收益率与股数无关（费率含最低佣金 5 元，按一手口径计）
@@ -637,6 +647,20 @@ func backfillActualLabels() {
 			l.ActualBuyPrice = pos.BuyPrice
 			l.EntryDate = pos.BuyDate
 			l.EntryPrice = 0
+			// 只从 seed 继承归因维度（Strategy/Source/Industry/Regime/Entry*/Ref*/Batch/
+			// User/Symbol/Type/Action/SignalDate/SignalAsOf），**结算结果一律清零**——
+			// seed 取的是 h=1 的 next_open 行，它在推荐次日即成熟，而持仓血缘通常晚于
+			// 它建立，故 seed 几乎必然带完整收益数据。不清零则新建的 pending 行会一路
+			// 携带「1 日窗口的收益/alpha/障碍命中」直到自己结算；且 BenchReturnPct/
+			// AlphaPct/HasBench 仅在买卖两端都命中基准轴时才被覆盖、SkipReason 仅在
+			// 非 matured 分支才写，两者会把 1 日 alpha 与旧 skip 原因永久留在 5/10/20/60
+			// 日行上。actual_position 是持续积累的事实表，脏数据是永久写入。
+			l.ExitDate, l.ExitPrice = "", 0
+			l.GrossReturnPct, l.NetReturnPct = 0, 0
+			l.BenchReturnPct, l.AlphaPct, l.HasBench = 0, 0, false
+			l.MfePct, l.MaePct = 0, 0
+			l.HitTakeProfit, l.HitStopLoss, l.Forced = false, false, false
+			l.SkipReason = ""
 			l.CreatedAt, l.UpdatedAt = time.Time{}, time.Time{}
 			rows = append(rows, l)
 		}

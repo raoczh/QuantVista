@@ -20,11 +20,13 @@ type MarketController struct {
 	score     *service.ScoreService
 	indicator *service.IndicatorService
 	chip      *service.ChipService
+	intraday  *service.IntradayService
 }
 
 func NewMarketController(svc *service.MarketService, score *service.ScoreService,
-	indicator *service.IndicatorService, chip *service.ChipService) *MarketController {
-	return &MarketController{svc: svc, score: score, indicator: indicator, chip: chip}
+	indicator *service.IndicatorService, chip *service.ChipService,
+	intraday *service.IntradayService) *MarketController {
+	return &MarketController{svc: svc, score: score, indicator: indicator, chip: chip, intraday: intraday}
 }
 
 // GetOverview GET /api/markets/:market/overview
@@ -57,6 +59,17 @@ func (mc *MarketController) GetQuote(c *gin.Context) {
 		*datasource.Quote
 		Freshness *service.QuoteFreshnessView `json:"freshness"`
 	}{q, mc.svc.FreshnessView(market, q)})
+}
+
+// GetMinuteLine GET /api/markets/:market/stocks/:symbol/minute
+// 腾讯 m1 分时线按需读取，不落历史；非交易时段返回上游最近交易日并带 trade_date。
+func (mc *MarketController) GetMinuteLine(c *gin.Context) {
+	line, err := mc.intraday.MinuteLine(c.Request.Context(), c.Param("market"), c.Param("symbol"))
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, line)
 }
 
 // GetDailyBars GET /api/markets/:market/stocks/:symbol/bars?limit=120
@@ -276,7 +289,7 @@ func (mc *MarketController) WideStatus(c *gin.Context) {
 }
 
 // FactorIC GET /api/admin/market/factor-ic?refresh=1 —— S3-4 因子 RankIC 验证报表
-//（管理端只读页）。默认返回进程内缓存；无缓存或 refresh=1 时全量重算（数秒级，
+// （管理端只读页）。默认返回进程内缓存；无缓存或 refresh=1 时全量重算（数秒级，
 // 全局互斥）。纯程序计算零 LLM 调用。
 func (mc *MarketController) FactorIC(c *gin.Context) {
 	if c.Query("refresh") != "1" {

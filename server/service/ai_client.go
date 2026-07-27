@@ -82,6 +82,11 @@ func setSSERequestHeaders(req *http.Request) {
 // 由 ensureDeadline 补这个上限，防止对端停止发数据后连接无限悬挂。
 const aiStreamMaxDuration = 10 * time.Minute
 
+// streamPostFinishMaxEvents 收到 finish_reason 后为等 usage 专属 chunk 额外读取的事件上限。
+// OpenAI 约定 include_usage 的 usage 块紧随 finish_reason（通常 1 个事件，[DONE] 随后），
+// 留 4 个余量兼容中转网关插入的心跳/空事件；超限即收尾，不为拿 usage 赌上 ctx deadline。
+const streamPostFinishMaxEvents = 4
+
 // ensureDeadline ctx 无 deadline 时补一个流式上限（有 deadline 则原样返回）。
 func ensureDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
 	if _, ok := ctx.Deadline(); ok {
@@ -849,6 +854,8 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 	sc := bufio.NewScanner(br)
 	sc.Buffer(make([]byte, 64<<10), 1<<20) // 单行上限 1MB（长 delta/大 usage 容错）
 	done := false
+	// postFinishEvents 收到 finish_reason 之后额外读取的事件数（见循环内续读说明）。
+	postFinishEvents := 0
 	contractEnabled := p.accuracyContractEnabled()
 	// partialResult 拒收/中断路径的审计结果（audit outcome）：把已聚合的正文、上游报告的
 	// usage 与原始终态随错误一并带出——writeLLMCallLog 与 run.record 据此保留真实上游
@@ -877,6 +884,19 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 			sawDoneMarker = true
 			done = true
 			break
+		}
+		// finish_reason 之后的续读窗口：**不在 finish_reason 处立即收尾**——OpenAI 约定
+		// stream_options.include_usage 的 usage 专属 chunk（choices:[] + usage）排在
+		// finish_reason 之后、[DONE] 之前，提前 break 会让 usage 永远读不到而恒回落
+		// estimateUsage 字符粗估。粗估会污染 llm_router 的 cost_exceeded 自动回退判定
+		// （chat 粗估 vs responses 端点真值混比，且自动回退持久化不自动恢复）。
+		// 有界续读：超过 streamPostFinishMaxEvents 即收尾，防上游报完 finish_reason
+		// 却不关连接时挂到 ctx deadline。此时 done 已为真，后续 EOF/读错判定不受影响。
+		if done {
+			postFinishEvents++
+			if postFinishEvents > streamPostFinishMaxEvents {
+				break
+			}
 		}
 		var chunk struct {
 			Choices *[]struct {
@@ -924,7 +944,9 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 				done = true
 			}
 		}
-		if done {
+		// 已拿到上游真实 usage 即可收尾（覆盖「usage 与 finish_reason 同块」的非标准形态）；
+		// 否则继续在上面的续读窗口内等 usage 专属 chunk。
+		if done && usage.TotalTokens > 0 {
 			break
 		}
 	}

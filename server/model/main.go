@@ -39,6 +39,7 @@ func AllModels() []any {
 		&NotifyChannel{},
 		&PromptTemplate{},
 		&PromptTemplateRevision{},
+		&PromptChampionState{},
 		&ThesisCard{},
 		&ResearchNote{},
 		&DailyReport{},
@@ -67,6 +68,7 @@ func AllModels() []any {
 		&RecommendationCandidateEvent{},
 		&RecommendationReflection{},
 		&LLMExperiment{},
+		&LLMExperimentModuleLock{},
 		&LLMExperimentRun{},
 		&LLMReleaseAudit{},
 		&LLMModuleRoute{},
@@ -85,6 +87,9 @@ func Migrate() error {
 	// 并补建基线快照——保证升级后的首次修改/删除仍能回查升级前原文。
 	if err := MigratePromptTemplateBaselines(); err != nil {
 		common.SysWarn("prompt 模板基线迁移未完成（不阻断启动，下次启动重试）: %v", err)
+	}
+	if err := MigratePromptChampionStates(); err != nil {
+		common.SysWarn("prompt champion generation 迁移未完成（不阻断启动，下次启动重试）: %v", err)
 	}
 	common.SysLog("数据库自动迁移完成")
 	return nil

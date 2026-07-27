@@ -1027,3 +1027,137 @@ func TestMedianAmountsFor(t *testing.T) {
 		t.Fatalf("无日线标的不应出现在结果中")
 	}
 }
+
+// TestBackfillActualLabelsResetsSettlement 补建 actual_position 标签必须清零种子的结算结果。
+//
+// 种子取的是 h=1 的 next_open 行——它在推荐次日即成熟，而持仓血缘通常晚于它建立，
+// 故种子几乎必然带完整收益。旧实现 `l := seed` 整 struct 复制只重置了 8 个字段，
+// 收益/alpha/障碍命中/skip_reason 全被带进新建的 pending 行；而 BenchReturnPct/
+// AlphaPct/HasBench 只在买卖两端都命中基准轴时才被覆盖、SkipReason 只在非 matured
+// 分支才写，两者会把「1 日窗口的 alpha」与旧 skip 原因永久留在 5/10/20/60 日行上。
+// actual_position 是持续积累的事实表，脏数据是永久写入。
+func TestBackfillActualLabelsResetsSettlement(t *testing.T) {
+	setupTestDB(t)
+	cleanLabelTables(t)
+
+	signalDate := time.Now().AddDate(0, 0, -30).Format("2006-01-02")
+	batch := &model.RecommendationBatch{UserID: 7, Type: model.RecTypeShortTerm, Market: "cn",
+		Status: model.RecStatusSuccess, CreatedAt: time.Now().AddDate(0, 0, -30)}
+	common.DB.Create(batch)
+	rec := model.Recommendation{BatchID: batch.ID, UserID: 7, Symbol: "600321", Market: "cn",
+		Action: model.RecActionBuy, RefPrice: 10}
+	common.DB.Create(&rec)
+	// 持仓血缘：backfillActualLabels 只对有 recommendation_id 的持仓补建。
+	common.DB.Create(&model.Position{UserID: 7, Symbol: "600321", Market: "cn",
+		PositionType: model.PositionTypeShortTerm, Status: model.PositionStatusHolding,
+		RecommendationID: rec.ID, BuyPrice: 11.5, Quantity: 100,
+		BuyDate: time.Now().AddDate(0, 0, -20).Format("2006-01-02")})
+
+	// 种子 = 已成熟的 h=1 next_open 行，带满结算结果与归因维度。
+	seed := model.RecommendationLabel{
+		RecommendationID: rec.ID, HorizonDays: model.LabelHorizons[0],
+		EntryMode: model.EntryModeNextOpen, BatchID: batch.ID, UserID: 7,
+		Symbol: "600321", Market: "cn", Type: model.RecTypeShortTerm, Action: model.RecActionBuy,
+		SignalDate: signalDate, MaturityStatus: model.LabelMatured, LabelVersion: labelVersion,
+		EntryDate: signalDate, EntryPrice: 10, ExitDate: signalDate, ExitPrice: 10.9,
+		GrossReturnPct: 9, NetReturnPct: 8.7, BenchReturnPct: 1.2, AlphaPct: 7.5, HasBench: true,
+		MfePct: 9.9, MaePct: -0.4, HitTakeProfit: true, HitStopLoss: false, Forced: true,
+		SkipReason: "skip_limit_up",
+		Strategy:   "momentum", Source: "eastmoney", Industry: "电子", Regime: "offense",
+	}
+	common.DB.Create(&seed)
+
+	backfillActualLabels()
+
+	var rows []model.RecommendationLabel
+	if err := common.DB.Where("recommendation_id = ? AND entry_mode = ?", rec.ID, model.EntryModeActual).
+		Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != len(model.LabelHorizons) {
+		t.Fatalf("应补建 %d 条 actual 标签，实得 %d", len(model.LabelHorizons), len(rows))
+	}
+	for _, r := range rows {
+		if r.MaturityStatus != model.LabelPending {
+			t.Fatalf("h=%d 应为 pending，实得 %s", r.HorizonDays, r.MaturityStatus)
+		}
+		// 结算结果必须全清零——否则 pending 行会一路带着种子的 1 日收益。
+		if r.ExitDate != "" || r.ExitPrice != 0 {
+			t.Fatalf("h=%d 出场字段未清零: %q %v", r.HorizonDays, r.ExitDate, r.ExitPrice)
+		}
+		if r.GrossReturnPct != 0 || r.NetReturnPct != 0 {
+			t.Fatalf("h=%d 收益未清零: gross=%v net=%v", r.HorizonDays, r.GrossReturnPct, r.NetReturnPct)
+		}
+		if r.BenchReturnPct != 0 || r.AlphaPct != 0 || r.HasBench {
+			t.Fatalf("h=%d 基准/alpha 未清零: bench=%v alpha=%v hasBench=%v",
+				r.HorizonDays, r.BenchReturnPct, r.AlphaPct, r.HasBench)
+		}
+		if r.MfePct != 0 || r.MaePct != 0 {
+			t.Fatalf("h=%d MFE/MAE 未清零: %v %v", r.HorizonDays, r.MfePct, r.MaePct)
+		}
+		if r.HitTakeProfit || r.HitStopLoss || r.Forced {
+			t.Fatalf("h=%d 障碍/强平标记未清零", r.HorizonDays)
+		}
+		if r.SkipReason != "" {
+			t.Fatalf("h=%d skip_reason 未清零: %q", r.HorizonDays, r.SkipReason)
+		}
+		// 归因维度必须保留（这正是从 seed 继承的目的）。
+		if r.Strategy != "momentum" || r.Source != "eastmoney" || r.Industry != "电子" || r.Regime != "offense" {
+			t.Fatalf("h=%d 归因维度丢失: %+v", r.HorizonDays, r)
+		}
+		if r.ActualBuyPrice != 11.5 {
+			t.Fatalf("h=%d 实际买入价应取持仓: %v", r.HorizonDays, r.ActualBuyPrice)
+		}
+	}
+}
+
+// TestSettleActualEntryPendingCarriesEntry actual 口径的 pending 必须带回 BuyDate/BuyPrice。
+//
+// advanceOneLabel 的超窗强平 guard 是 `out.BuyDate != ""`。旧实现三处 pending 返回
+// 都是裸 labelOutcome{Status: btPending}，导致 forceCloseStaleLabel 里专为 actual 写的
+// qty=100 分支成为死代码：用户实际持有的标的退市/长停时，next_open 口径按末根收盘
+// 强平成熟（有收益），actual 口径却判 no_data（无收益）——同一事实两条并列口径给出
+// 不同结论。e<0（从未入场）仍应是裸 pending，走 no_data。
+func TestSettleActualEntryPendingCarriesEntry(t *testing.T) {
+	bars := []datasource.Bar{
+		{TradeDate: "2026-06-01", Open: 10, High: 10.8, Low: 9.6, Close: 10.5},
+		{TradeDate: "2026-06-02", Open: 10.5, High: 11.2, Low: 10.3, Close: 11},
+		{TradeDate: "2026-06-03", Open: 11, High: 11.5, Low: 10.9, Close: 11.3},
+	}
+	// 已入场但个股停更、市场轴也未过到期日 → pending，须带 BuyDate/BuyPrice 与窗口 MFE/MAE。
+	out := settleFromActualEntry(bars, "2026-06-01", 10, 20, "2026-09-01", "")
+	if out.Status != btPending {
+		t.Fatalf("应为 pending，实得 %s", out.Status)
+	}
+	if out.BuyDate != "2026-06-01" || out.BuyPrice != 10 {
+		t.Fatalf("pending 须带回建仓信息，实得 %q %v", out.BuyDate, out.BuyPrice)
+	}
+	if out.MfePct <= 0 || out.MaePct > 0 {
+		t.Fatalf("pending 须带已有窗口 MFE/MAE，实得 mfe=%v mae=%v", out.MfePct, out.MaePct)
+	}
+
+	// 无市场轴、格子口径走不完 → 同样带回建仓信息。
+	out2 := settleFromActualEntry(bars, "2026-06-01", 10, 20, "", "")
+	if out2.Status != btPending || out2.BuyDate == "" || out2.BuyPrice != 10 {
+		t.Fatalf("无轴 pending 须带建仓信息: %+v", out2)
+	}
+
+	// 从未入场（建仓日晚于全部 K 线）→ 裸 pending，不得伪造建仓，交由上层判 no_data。
+	out3 := settleFromActualEntry(bars, "2026-12-31", 10, 5, "", "")
+	if out3.Status != btPending {
+		t.Fatalf("未入场应为 pending: %s", out3.Status)
+	}
+	if out3.BuyDate != "" || out3.BuyPrice != 0 {
+		t.Fatalf("未入场不得带建仓信息: %q %v", out3.BuyDate, out3.BuyPrice)
+	}
+
+	// 强平 guard 联动：带回建仓信息后 forceCloseStaleLabel 的 actual 分支可达。
+	l := model.RecommendationLabel{Symbol: "600321", EntryMode: model.EntryModeActual}
+	o := out
+	if !forceCloseStaleLabel(&l, &o, bars) {
+		t.Fatal("actual 口径应能按末根收盘强平（此前是死代码）")
+	}
+	if o.Status != btTraded || !o.Forced || o.SellDate != "2026-06-03" {
+		t.Fatalf("强平结果不符: %+v", o)
+	}
+}
