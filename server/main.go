@@ -57,6 +57,9 @@ func main() {
 	service.StartMoodJobs(mgr)
 	service.StartIntradayJobs()
 	service.StartLLMLogJobs()
+	// B8/B9 公司行动与打新日历：每日 19:25 同步四张 RPT_* 报表
+	//（错峰在 19:05 财报之后、19:35 盘后守护轮之前——守护轮要消费本轮落库的解禁/除权数据）。
+	service.StartCorpActionJobs()
 	// B7 资产曲线：交易日 16:20 为全部用户落真实持仓/模拟盘资产快照（幂等 upsert）。
 	service.StartPortfolioSnapshotJob(
 		service.NewPositionService(service.NewMarketService(mgr)),

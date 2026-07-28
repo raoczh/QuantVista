@@ -6,6 +6,9 @@ import "time"
 const (
 	PaperSideBuy  = "buy"
 	PaperSideSell = "sell"
+	// PaperSideAdjust 除权除息折算（B8）：模拟盘自动执行，不是买卖，
+	// Price/Amount 恒 0，Quantity 记数量变化量（送转为正），RealizedPnl 记现金分红。
+	PaperSideAdjust = "adjust"
 
 	PaperDefaultCash = 100000 // 默认初始资金
 )

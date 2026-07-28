@@ -41,6 +41,9 @@ import {
   type TradeStats,
   type TradeStatBucket,
   type PortfolioCurve,
+  listCorpAdjusts,
+  actCorpAdjust,
+  type PositionCorpAdjust,
 } from '@/api/position'
 import { isAbortError } from '@/api/client'
 import { importPositions, downloadPositionTemplate, type ImportResult } from '@/api/export'
@@ -544,7 +547,30 @@ async function loadTrades(id: number) {
   }
 }
 function sideLabel(side: string) {
-  return side === 'buy' ? '买入' : '卖出'
+  if (side === 'buy') return '买入'
+  if (side === 'adjust') return '除权折算'
+  return '卖出'
+}
+// 流水方向配色：adjust 不是买卖，用中性色（拿涨跌色会让「折算」看着像一次盈亏）。
+function sideColor(side: string) {
+  if (side === 'adjust') return undefined
+  return pctColor(side === 'buy' ? 1 : -1)
+}
+// 撤销一笔已确认的折算（入口放在流水里——用户看到那笔 adjust 才会想撤）。
+// 后端只在「账面仍等于折算结果且其后无新交易」时接受，否则明确拒绝、不做部分回滚。
+const revertingTrade = ref<number | null>(null)
+async function revertAdjustTrade(t: PositionTrade, positionId: number) {
+  if (!t.adjust_id || revertingTrade.value) return
+  revertingTrade.value = t.id
+  try {
+    await actCorpAdjust(t.adjust_id, 'revert')
+    message.success('已撤销该次折算，账本回滚')
+    await Promise.all([load(), loadTrades(positionId), loadCorpAdjusts()])
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    revertingTrade.value = null
+  }
 }
 
 // ---------- B6 复盘统计 ----------
@@ -601,6 +627,55 @@ const curveDayOptions = [
   { label: '近 180 天', value: 180 },
   { label: '近 1 年', value: 365 },
 ]
+
+// ---------- B8 除权除息待确认折算 ----------
+// **纪律：程序绝不静默改写用户账本**——这里只呈现建议，用户点确认才写。
+// 撤销仅在「账面仍等于折算结果且其后无新交易」时被后端接受，否则明确拒绝。
+const corpAdjusts = ref<PositionCorpAdjust[]>([])
+const corpAdjustLoading = ref(false)
+const corpAdjustError = ref('')
+const corpAdjustActing = ref<number | null>(null)
+let corpAdjustAbort: AbortController | null = null
+
+async function loadCorpAdjusts() {
+  corpAdjustAbort?.abort()
+  const ctrl = new AbortController()
+  corpAdjustAbort = ctrl
+  corpAdjustLoading.value = true
+  corpAdjustError.value = ''
+  try {
+    corpAdjusts.value = await listCorpAdjusts('pending', ctrl.signal)
+  } catch (e) {
+    if (isAbortError(e)) return
+    corpAdjustError.value = (e as Error).message
+  } finally {
+    if (corpAdjustAbort === ctrl) corpAdjustLoading.value = false
+  }
+}
+
+async function doCorpAdjust(row: PositionCorpAdjust, action: 'confirm' | 'dismiss') {
+  if (corpAdjustActing.value) return
+  corpAdjustActing.value = row.id
+  try {
+    await actCorpAdjust(row.id, action)
+    message.success(action === 'confirm' ? '已按方案折算持仓' : '已忽略该调整')
+    await Promise.all([loadCorpAdjusts(), load()])
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    corpAdjustActing.value = null
+  }
+}
+
+// 折算说明（每 10 股口径原文优先）。
+function adjustPlanText(a: PositionCorpAdjust) {
+  if (a.plan_profile) return a.plan_profile
+  const parts: string[] = []
+  if (a.bonus_ratio > 0) parts.push(`送 ${a.bonus_ratio}`)
+  if (a.transfer_ratio > 0) parts.push(`转 ${a.transfer_ratio}`)
+  if (a.dividend_pretax > 0) parts.push(`派 ${a.dividend_pretax} 元`)
+  return parts.length ? `每 10 股 ${parts.join(' ')}` : '—'
+}
 
 async function loadCurve() {
   curveAbort?.abort()
@@ -704,10 +779,13 @@ onMounted(async () => {
   }
   await load()
   loadCurve()
+  loadCorpAdjusts()
   window.addEventListener('resize', onResize)
 })
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
+  corpAdjustAbort?.abort()
+  corpAdjustAbort = null
   curveSeq++
   curveAbort?.abort()
   curveAbort = null
@@ -773,6 +851,51 @@ onBeforeUnmount(() => {
 
       <n-tabs v-model:value="mainTab" type="line" animated>
         <n-tab-pane name="list" tab="持仓明细">
+          <!-- B8 除权除息待确认折算：仅在有 pending 建议时出现。
+               **不确认的话本页盈亏就是错的数字**（10 转 10 后显示 -50%），
+               所以放在最顶部；但程序绝不代替用户改账本。 -->
+          <SectionCard v-if="corpAdjusts.length || corpAdjustError" title="除权除息待确认">
+            <template #extra>
+              <n-button size="tiny" quaternary :loading="corpAdjustLoading" @click="loadCorpAdjusts">刷新</n-button>
+            </template>
+            <n-alert v-if="corpAdjustError" type="error" :bordered="false" title="调整建议读取失败">
+              {{ corpAdjustError }}
+            </n-alert>
+            <template v-else>
+              <n-alert type="warning" :bordered="false" style="margin-bottom: 10px" :show-icon="false">
+                以下持仓已到除权除息日，账面数量与成本需要折算。确认前本页显示的盈亏是失真的（送转会让股价与数量
+                同时变化，例如 10 转 10 后会显示成 −50%）。程序不会自动改写你的账本，请核对后确认；确认后可撤销。
+              </n-alert>
+              <div class="adjust-list">
+                <div v-for="a in corpAdjusts" :key="a.id" class="adjust-row">
+                  <div class="adjust-main">
+                    <div class="adjust-head">
+                      <span class="adjust-name">{{ a.name || a.symbol }}</span>
+                      <span class="adjust-symbol qv-mono">{{ a.symbol }}</span>
+                      <n-tag size="tiny" round :bordered="false" type="warning">除权日 {{ a.ex_date }}</n-tag>
+                    </div>
+                    <div class="adjust-plan">{{ adjustPlanText(a) }}</div>
+                    <div class="adjust-calc qv-tnum">
+                      数量 {{ a.qty_before }} → <b>{{ a.qty_after }}</b> 股 · 成本
+                      {{ a.cost_before.toFixed(4) }} → <b>{{ a.cost_after.toFixed(4) }}</b> 元
+                      <span v-if="a.cash_dividend > 0"> · 现金分红 {{ a.cash_dividend.toFixed(2) }} 元（税前）</span>
+                    </div>
+                  </div>
+                  <div class="adjust-actions">
+                    <n-button
+                      size="small"
+                      type="primary"
+                      :loading="corpAdjustActing === a.id"
+                      @click="doCorpAdjust(a, 'confirm')"
+                      >确认折算</n-button
+                    >
+                    <n-button size="small" quaternary @click="doCorpAdjust(a, 'dismiss')">忽略</n-button>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </SectionCard>
+
           <!-- B7 资产曲线：读每交易日 16:20 落库的快照，不做插值补造 -->
           <SectionCard title="资产曲线">
             <template #extra>
@@ -943,20 +1066,31 @@ onBeforeUnmount(() => {
                           <tr v-for="t in tradesById[p.id]" :key="t.id">
                             <td>{{ t.trade_date || '—' }}</td>
                             <td>
-                              <span :style="{ color: pctColor(t.side === 'buy' ? 1 : -1) }">{{ sideLabel(t.side) }}</span>
+                              <span :style="{ color: sideColor(t.side) }">{{ sideLabel(t.side) }}</span>
                             </td>
                             <td class="ta-r">{{ fmt(t.price) }}</td>
                             <td class="ta-r">{{ t.quantity }}</td>
                             <td class="ta-r">{{ fmt(t.fee) }}</td>
                             <td class="ta-r">{{ fmt(t.tax) }}</td>
-                            <td class="ta-r" :style="{ color: t.side === 'sell' ? pctColor(t.realized_pnl) : undefined }">
-                              {{ t.side === 'sell' ? fmtMoney(t.realized_pnl) : '—' }}
+                            <td
+                              class="ta-r"
+                              :style="{ color: t.side === 'sell' ? pctColor(t.realized_pnl) : undefined }"
+                              :title="t.side === 'adjust' ? '除权折算笔记的是到手税前现金分红' : ''"
+                            >
+                              {{ t.side === 'buy' ? '—' : fmtMoney(t.realized_pnl) }}
                             </td>
                             <td class="ta-r">{{ t.quantity_after }}</td>
                             <td class="ta-r">{{ fmt(t.avg_cost_after) }}</td>
                             <td class="t-note">
                               {{ t.note || '—' }}
                               <n-tag v-if="t.backfilled" size="tiny" :bordered="false" title="旧持仓惰性补建的等价记录，非用户录入">补建</n-tag>
+                              <n-popconfirm v-if="t.side === 'adjust' && t.adjust_id" @positive-click="revertAdjustTrade(t, p.id)">
+                                <template #trigger>
+                                  <n-button size="tiny" quaternary :loading="revertingTrade === t.id">撤销折算</n-button>
+                                </template>
+                                撤销后数量与成本回滚到折算前（{{ t.quantity_before }} 股 / {{ fmt(t.avg_cost_before || 0) }}
+                                元）。若此后已有新交易，后端会拒绝撤销。
+                              </n-popconfirm>
                             </td>
                           </tr>
                         </tbody>
@@ -1778,6 +1912,65 @@ onBeforeUnmount(() => {
   }
   .lesson-text {
     flex-basis: 100%;
+  }
+}
+
+/* B8 除权除息待确认 */
+.adjust-list {
+  display: flex;
+  flex-direction: column;
+}
+.adjust-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+}
+.adjust-row + .adjust-row {
+  border-top: 1px dashed rgba(128, 128, 128, 0.22);
+}
+.adjust-main {
+  flex: 1;
+  min-width: 0;
+}
+.adjust-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.adjust-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+.adjust-symbol {
+  font-size: 12px;
+  opacity: 0.5;
+}
+.adjust-plan {
+  font-size: 13px;
+  opacity: 0.8;
+  margin-top: 3px;
+}
+.adjust-calc {
+  font-size: 12px;
+  opacity: 0.72;
+  margin-top: 3px;
+}
+.adjust-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+@media (max-width: 768px) {
+  .adjust-row {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+  .adjust-actions {
+    flex-basis: 100%;
+    justify-content: flex-end;
   }
 }
 </style>

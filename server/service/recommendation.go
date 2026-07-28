@@ -138,17 +138,25 @@ type candidate struct {
 	SentiScore float64      `json:"senti_score,omitempty"` // N2 当日聚合情绪分 -1~1（新闻加权合成）
 	SentiNews  int          `json:"senti_news,omitempty"`  // 参与聚合的新闻条数（0=当日无相关新闻）
 	// M3a 扩展信号（最近有数据交易日的口径，通常为 T-1 信息；缺失=未上榜/无快照）。
-	LhbNetYi  float64  `json:"lhb_net_yi,omitempty"` // 龙虎榜净买额（亿元，负=净卖出）
-	LhbReason string   `json:"lhb_reason,omitempty"` // 上榜原因
-	OrgNetYi  float64  `json:"org_net_yi,omitempty"` // 机构席位净买额（亿元，负=净卖出）
-	OrgBuys   int      `json:"org_buys,omitempty"`   // 机构席位买入次数
-	PopRank   int      `json:"pop_rank,omitempty"`   // 股吧人气榜名次（1~100）
-	PopPrev   int      `json:"pop_prev,omitempty"`   // 昨日名次（<=0=新上榜）
-	PopNew    bool     `json:"pop_new,omitempty"`    // 人气榜新上榜
-	Score     float64  `json:"score,omitempty"`      // 量化综合分 0-100（五维基础分 + 策略加分）
-	Rank      int      `json:"rank,omitempty"`       // 未被排除者中的排名（1=最高）
-	Bonus     []string `json:"bonus,omitempty"`      // 策略加分/扣分明细（可解释）
-	SentToLLM bool     `json:"sent_to_llm,omitempty"`
+	LhbNetYi  float64 `json:"lhb_net_yi,omitempty"` // 龙虎榜净买额（亿元，负=净卖出）
+	LhbReason string  `json:"lhb_reason,omitempty"` // 上榜原因
+	OrgNetYi  float64 `json:"org_net_yi,omitempty"` // 机构席位净买额（亿元，负=净卖出）
+	OrgBuys   int     `json:"org_buys,omitempty"`   // 机构席位买入次数
+	PopRank   int     `json:"pop_rank,omitempty"`   // 股吧人气榜名次（1~100）
+	PopPrev   int     `json:"pop_prev,omitempty"`   // 昨日名次（<=0=新上榜）
+	PopNew    bool    `json:"pop_new,omitempty"`    // 人气榜新上榜
+	// B9 限售解禁（未来 60 天内最近一批；缺失=窗口内无解禁或数据未同步——
+	// **两者语义不同**，由 LiftUnknown 区分，模型不得把缺失读成「无解禁」）。
+	LiftDate    string   `json:"lift_date,omitempty"`     // 最近解禁日 YYYY-MM-DD
+	LiftDays    int      `json:"lift_days,omitempty"`     // 距今自然日
+	LiftRatio   float64  `json:"lift_ratio,omitempty"`    // 占流通股 %
+	LiftSharesW float64  `json:"lift_shares_w,omitempty"` // 解禁股数（万股）
+	LiftCapYi   float64  `json:"lift_cap_yi,omitempty"`   // 解禁市值（亿元）
+	LiftUnknown bool     `json:"lift_unknown,omitempty"`  // true=解禁数据不可用（不是「无解禁」）
+	Score       float64  `json:"score,omitempty"`         // 量化综合分 0-100（五维基础分 + 策略加分）
+	Rank        int      `json:"rank,omitempty"`          // 未被排除者中的排名（1=最高）
+	Bonus       []string `json:"bonus,omitempty"`         // 策略加分/扣分明细（可解释）
+	SentToLLM   bool     `json:"sent_to_llm,omitempty"`
 	// QuoteAsOf 行情时效硬门通过时的数据源行情时刻（YYYY-MM-DD HH:MM）：终选名单喂
 	// LLM 前逐只全源核验并刷新现价，此字段随池快照/pick 明细落库，标明推荐建立在
 	// 哪个时点的行情上（字符串不进数值核验值域）。
@@ -2103,6 +2111,9 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 		// M3b 盘中因子批量注入（本地表一次查询，最近已同步交易日 T-1 口径）；
 		// 写回点在下方 Factors 创建之后。
 		intraSigs := intradaySignalsFor(syms)
+		// B9 限售解禁批量注入（本地表一次查询）：bear 论据框架首条就是解禁，
+		// 此前无数据可依只能提示自行核查，现在有数据要能引用具体数字。
+		liftSigs, liftAvailable := liftSignalsFor(syms)
 		for _, i := range idxs {
 			if sig, ok := lhbSigs[pool[i].Symbol]; ok {
 				pool[i].LhbNetYi = sig.NetBuyYi
@@ -2114,6 +2125,16 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 				pool[i].PopRank = sig.Rank
 				pool[i].PopPrev = sig.PrevRank
 				pool[i].PopNew = sig.IsNew
+			}
+			if !liftAvailable {
+				// 数据不可用：显式标 unknown，**不能留空让模型读成「无解禁」**。
+				pool[i].LiftUnknown = true
+			} else if sig, ok := liftSigs[pool[i].Symbol]; ok {
+				pool[i].LiftDate = sig.Date
+				pool[i].LiftDays = sig.Days
+				pool[i].LiftRatio = sig.RatioPct
+				pool[i].LiftSharesW = sig.SharesWan
+				pool[i].LiftCapYi = sig.CapYi
 			}
 		}
 		var wg sync.WaitGroup

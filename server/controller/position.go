@@ -3,6 +3,7 @@ package controller
 import (
 	"strconv"
 	"strings"
+	"time"
 
 	"quantvista/common"
 	"quantvista/model"
@@ -160,6 +161,79 @@ func (pc *PositionController) Curve(c *gin.Context) {
 		}
 	}
 	out, err := service.PortfolioCurve(currentUserID(c), model.SnapshotKindReal, days)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, out)
+}
+
+// CorpAdjusts GET /api/positions/corp-adjusts?status= —— 除权除息待确认折算建议（B8）。
+// 顺带按今日除权日生成一次（幂等），保证用户打开持仓页就能看到今天该确认的调整。
+func (pc *PositionController) CorpAdjusts(c *gin.Context) {
+	uid := currentUserID(c)
+	status := strings.ToLower(strings.TrimSpace(c.Query("status")))
+	if status == "" || status == model.CorpAdjustPending {
+		if _, err := service.GenerateCorpAdjusts(uid, time.Now().Format("2006-01-02")); err != nil {
+			common.SysWarn("生成除权调整建议失败 user=%d: %v", uid, err)
+		}
+	}
+	rows, err := service.ListCorpAdjusts(uid, status)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, rows)
+}
+
+// CorpAdjustAction POST /api/positions/corp-adjusts/:id/:action —— confirm / revert / dismiss（B8）。
+// 三个动作合并成一个受约束的枚举入口，避免路由分散后漏掉归属校验。
+func (pc *PositionController) CorpAdjustAction(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	uid := currentUserID(c)
+	var out *model.PositionCorpAdjust
+	var err error
+	switch strings.ToLower(c.Param("action")) {
+	case "confirm":
+		out, err = pc.svc.ConfirmCorpAdjust(uid, id)
+	case "revert":
+		out, err = pc.svc.RevertCorpAdjust(uid, id)
+	case "dismiss":
+		out, err = pc.svc.DismissCorpAdjust(uid, id)
+	default:
+		common.ApiErrorMsg(c, "不支持的操作")
+		return
+	}
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, out)
+}
+
+// Calendar GET /api/events/calendar?days= —— 未来 N 天事件日历（B9）。
+func Calendar(c *gin.Context) {
+	days := 0
+	if raw := c.Query("days"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			days = n
+		}
+	}
+	out, err := service.EventCalendar(currentUserID(c), days)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, out)
+}
+
+// StockCorpEvents GET /api/markets/:market/stocks/:symbol/corp-events —— 个股解禁 / 分红（B9）。
+// 公开市场信息，无用户隔离（与 lhb/orgview 同层）。
+func StockCorpEvents(c *gin.Context) {
+	out, err := service.StockCorpEventsFor(c.Param("market"), c.Param("symbol"))
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return

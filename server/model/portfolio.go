@@ -121,6 +121,9 @@ type Position struct {
 const (
 	PositionTradeBuy  = "buy"
 	PositionTradeSell = "sell"
+	// PositionTradeAdjust 除权除息折算（B8）：不是买卖，只改数量与每股成本，
+	// 现金分红计入 RealizedPnl（真金到账）。**必须由用户显式确认才写**。
+	PositionTradeAdjust = "adjust"
 )
 
 // PositionTrade 持仓分批加/减仓流水（B5）。
@@ -145,11 +148,24 @@ type PositionTrade struct {
 	Note      string `gorm:"size:255" json:"note"`
 
 	// RealizedPnl 该笔卖出结转的已实现盈亏（元）。买入笔恒 0。
+	// adjust 笔（B8 除权除息）记本次到手的税前现金分红——那是真金到账，
+	// 与卖出兑现同属「已实现」，不计入会让分红股的累计收益长期少算。
 	RealizedPnl float64 `gorm:"type:decimal(20,4)" json:"realized_pnl"`
 	// AvgCostAfter 该笔之后的加权平均成本、QuantityAfter 该笔之后的持仓数量。
 	// 落库快照供流水明细还原当时账面，避免前端二次推算与服务端算法漂移。
 	AvgCostAfter  float64 `gorm:"type:decimal(20,4)" json:"avg_cost_after"`
 	QuantityAfter float64 `gorm:"type:decimal(20,4)" json:"quantity_after"`
+
+	// ---- 除权除息折算审计（B8）----
+	// AvgCostBefore/QuantityBefore 该笔**之前**的账面。adjust 笔必填（折算前后可逐笔核对）；
+	// buy/sell 笔顺带填写便于明细阅读。**0 值有歧义**（首笔建仓前确实是 0，旧流水也是 0），
+	// 仅在 adjust 笔上作为审计依据使用，不要拿它反推其它笔的历史。
+	AvgCostBefore  float64 `gorm:"type:decimal(20,4)" json:"avg_cost_before"`
+	QuantityBefore float64 `gorm:"type:decimal(20,4)" json:"quantity_before"`
+	// CorporateActionID 来源公司行动（仅 adjust 笔非 0）；AdjustID 关联的调整建议行，
+	// **状态的唯一权威在 PositionCorpAdjust.Status**，不在流水里冗余状态列（防两处不一致）。
+	CorporateActionID int64 `gorm:"index" json:"corporate_action_id"`
+	AdjustID          int64 `gorm:"index" json:"adjust_id"`
 
 	// Backfilled 该笔是否为旧持仓惰性补建的等价首笔买入（非用户真实录入的加仓动作）。
 	Backfilled bool `gorm:"default:false" json:"backfilled"`

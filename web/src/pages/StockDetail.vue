@@ -28,6 +28,7 @@ import { isAbortError } from '@/api/client'
 import { getAnnouncements, type AnnouncementItem } from '@/api/announcement'
 import { getStockFinance, type StockFinance } from '@/api/finance'
 import { getStockOrgView, type StockOrgView } from '@/api/orgview'
+import { getStockCorpEvents, type StockCorpEvents } from '@/api/event'
 import { useUi, withAlpha } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import { useStockActions } from '@/composables/useStockActions'
@@ -62,6 +63,10 @@ const finance = ref<StockFinance | null>(null)
 const fundflow = ref<StockFundFlow | null>(null)
 const lhbRecords = ref<LhbRecord[]>([])
 const orgview = ref<StockOrgView | null>(null)
+// B9 解禁 / 分红：null=尚未取到（加载中或失败）——与「取到了但没有解禁」严格区分，
+// 后者是 corpEvents 非 null 且 lifts 为空数组。
+const corpEvents = ref<StockCorpEvents | null>(null)
+const corpEventsError = ref('')
 
 // 情绪标签（N2）：利好/利空才渲染，颜色随涨跌色主题。
 function sentiView(n: NewsItem): { text: string; color: string } | null {
@@ -218,6 +223,19 @@ async function load(silent = false) {
         })
         .catch(() => {
           if (mySeq === loadSeq) orgview.value = null
+        })
+      // 解禁 / 分红（B9）：每日 19:25 job 同步的本地表，零上游成本。
+      // 失败时记 error 并保持 corpEvents=null——空态文案会据此说「读取失败」而不是「无解禁」。
+      getStockCorpEvents(market.value, symbol.value)
+        .then((r) => {
+          if (mySeq !== loadSeq) return
+          corpEvents.value = r
+          corpEventsError.value = ''
+        })
+        .catch((e) => {
+          if (mySeq !== loadSeq || isAbortError(e)) return
+          corpEvents.value = null
+          corpEventsError.value = (e as Error).message
         })
     }
     // 指标副图 / 筹码分布 best-effort：失败时 K 线退回单图、筹码卡显示占位。
@@ -668,6 +686,36 @@ function renderFundFlowChart() {
 function fmtNetYi(n: number) {
   return (n / 1e8).toFixed(2)
 }
+
+/* B9 解禁 / 分红展示辅助 */
+// 解禁按解禁日拆「未来」与「已过去」：未来的是决策变量，已过去的是背景（刚解禁完的抛压）。
+const todayStr = computed(() => new Date().toLocaleDateString('sv-SE'))
+const upcomingLifts = computed(() => (corpEvents.value?.lifts || []).filter((l) => l.free_date >= todayStr.value))
+const pastLifts = computed(() => (corpEvents.value?.lifts || []).filter((l) => l.free_date < todayStr.value))
+function fmtWanShares(n: number) {
+  return (n / 1e4).toFixed(0)
+}
+function liftDaysLeft(date: string) {
+  const d = Math.round((new Date(date + 'T00:00:00').getTime() - new Date(todayStr.value + 'T00:00:00').getTime()) / 86400000)
+  if (d === 0) return '今天'
+  if (d < 0) return `${-d} 天前`
+  return `${d} 天后`
+}
+// 占流通股比例 ≥10% 视为显著抛压（与后端风险闸门 riskLiftRatioWarn 同阈值）。
+// 用 pctColor(-1) 取「下跌方向」色：解禁是利空，颜色随 6 主题的涨跌色配置走，
+// 不硬编码红绿（涨绿跌红的主题下同样正确）。
+function liftRatioColor(ratio: number) {
+  return ratio >= 10 ? pctColor(-1) : undefined
+}
+// 分红方案一句话（每 10 股口径原文优先，缺失时按比例拼）。
+function planText(a: { plan_profile: string; bonus_ratio: number; transfer_ratio: number; dividend_pretax: number }) {
+  if (a.plan_profile) return a.plan_profile
+  const parts: string[] = []
+  if (a.bonus_ratio > 0) parts.push(`送 ${a.bonus_ratio}`)
+  if (a.transfer_ratio > 0) parts.push(`转 ${a.transfer_ratio}`)
+  if (a.dividend_pretax > 0) parts.push(`派 ${a.dividend_pretax} 元`)
+  return parts.length ? `每 10 股 ${parts.join(' ')}` : '不分配'
+}
 function streakText(ff: StockFundFlow) {
   if (ff.streak_days > 0) return `连续净流入 ${ff.streak_days} 天`
   if (ff.streak_days < 0) return `连续净流出 ${-ff.streak_days} 天`
@@ -747,6 +795,8 @@ watch([market, symbol], () => {
   fundflow.value = null
   lhbRecords.value = []
   orgview.value = null
+  corpEvents.value = null
+  corpEventsError.value = ''
   news.value = []
   announcements.value = []
   disposeCharts()
@@ -977,6 +1027,70 @@ function scoreType(total: number) {
             </div>
           </div>
           <n-empty v-else description="近期无上榜记录（覆盖近 30 天龙虎榜采集）" />
+        </SectionCard>
+
+        <!-- 解禁 / 分红（B9）：每日 19:25 同步的本地表。
+             **状态三分**：读取失败 / 数据不可用 / 确实没有——空态文案严格区分，
+             绝不把「查不到」显示成「无解禁」（与 AI 侧 riskGateNoteFor 同一纪律）。 -->
+        <SectionCard v-if="market === 'cn' && !isFund" title="解禁 / 分红">
+          <template #extra>
+            <span class="src-hint">解禁前瞻半年 · 分红近 8 期</span>
+          </template>
+          <n-spin :show="loading && !corpEvents">
+            <n-alert v-if="corpEventsError" type="error" :bordered="false" title="解禁 / 分红读取失败">
+              {{ corpEventsError }}——这不代表无解禁，请稍后刷新或自行核查公告。
+            </n-alert>
+            <n-alert
+              v-else-if="corpEvents && corpEvents.lift_unavailable"
+              type="warning"
+              :bordered="false"
+              title="解禁数据本次不可用"
+            >
+              {{ corpEvents.note || '同步未完成或查询失败，无法判断解禁风险，请自行核查。' }}
+            </n-alert>
+            <template v-else-if="corpEvents">
+              <div class="corp-sub">限售解禁</div>
+              <div v-if="upcomingLifts.length || pastLifts.length" class="lhb-list">
+                <div v-for="(l, i) in upcomingLifts" :key="'u' + i" class="lhb-row">
+                  <span class="news-time qv-tnum">{{ l.free_date }}</span>
+                  <n-tag size="tiny" round :bordered="false" type="warning">{{ liftDaysLeft(l.free_date) }}</n-tag>
+                  <span class="lhb-reason">{{ l.free_type || '限售股解禁' }}</span>
+                  <span class="lhb-num qv-tnum">{{ fmtWanShares(l.free_shares) }} 万股</span>
+                  <span class="lhb-num qv-tnum">{{ (l.lift_market_cap / 1e8).toFixed(2) }} 亿元</span>
+                  <span class="lhb-num qv-tnum" :style="{ color: liftRatioColor(l.free_ratio) }"
+                    >占流通 {{ l.free_ratio.toFixed(2) }}%</span
+                  >
+                </div>
+                <div v-for="(l, i) in pastLifts" :key="'p' + i" class="lhb-row corp-past">
+                  <span class="news-time qv-tnum">{{ l.free_date }}</span>
+                  <n-tag size="tiny" round :bordered="false">{{ liftDaysLeft(l.free_date) }}</n-tag>
+                  <span class="lhb-reason">{{ l.free_type || '限售股解禁' }}</span>
+                  <span class="lhb-num qv-tnum">{{ fmtWanShares(l.free_shares) }} 万股</span>
+                  <span class="lhb-num qv-tnum">占流通 {{ l.free_ratio.toFixed(2) }}%</span>
+                </div>
+              </div>
+              <n-empty v-else description="近 3 个月至未来半年内无解禁安排（数据已同步，非缺失）" :show-icon="false" />
+
+              <div class="corp-sub">分红送转</div>
+              <n-alert v-if="corpEvents.action_unavailable" type="warning" :bordered="false" :show-icon="false">
+                分红数据本次不可用，无法判断分红情况。
+              </n-alert>
+              <div v-else-if="corpEvents.actions.length" class="lhb-list">
+                <div v-for="(a, i) in corpEvents.actions" :key="i" class="lhb-row">
+                  <span class="news-time qv-tnum">{{ a.report_date }}</span>
+                  <span class="lhb-reason">{{ planText(a) }}</span>
+                  <span v-if="a.ex_date" class="lhb-num qv-tnum">除权 {{ a.ex_date }}</span>
+                  <span v-else class="lhb-num">除权日待定</span>
+                  <span v-if="a.dividend_yield > 0" class="lhb-num qv-tnum"
+                    >股息率 {{ a.dividend_yield.toFixed(2) }}%</span
+                  >
+                  <n-tag v-if="a.progress" size="tiny" round :bordered="false">{{ a.progress }}</n-tag>
+                </div>
+              </div>
+              <n-empty v-else description="暂无分红送转方案记录（数据已同步，非缺失）" :show-icon="false" />
+            </template>
+            <n-empty v-else description="解禁 / 分红数据加载中" :show-icon="false" />
+          </n-spin>
         </SectionCard>
 
         <!-- 估值 + 评分 -->
@@ -1313,6 +1427,20 @@ function scoreType(total: number) {
 .lhb-note {
   opacity: 0.6;
   font-size: 12px;
+}
+/* B9 解禁 / 分红块 */
+.corp-sub {
+  font-size: 12px;
+  font-weight: 600;
+  opacity: 0.7;
+  margin: 10px 0 2px;
+}
+.corp-sub:first-child {
+  margin-top: 0;
+}
+/* 已过去的解禁淡化：是背景不是决策变量 */
+.corp-past {
+  opacity: 0.6;
 }
 .lhb-num {
   flex-shrink: 0;

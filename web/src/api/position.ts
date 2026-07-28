@@ -161,17 +161,22 @@ export interface PositionTrade {
   id: number
   user_id: number
   position_id: number
-  side: string // buy=加仓 / sell=减仓
+  side: string // buy=加仓 / sell=减仓 / adjust=除权除息折算（B8）
   price: number
   quantity: number
   fee: number
   tax: number
   trade_date: string
   note: string
-  realized_pnl: number // 该笔卖出结转的已实现盈亏（买入笔恒 0）
+  realized_pnl: number // 卖出结转的已实现盈亏；adjust 笔为到手现金分红（买入笔恒 0）
   avg_cost_after: number // 该笔之后的加权平均成本
   quantity_after: number // 该笔之后的持仓数量
   backfilled: boolean // 旧持仓惰性补建的等价首笔买入（非用户录入）
+  // B8 折算审计：仅 adjust 笔有效（0 值在其它笔上无意义，勿反推）
+  avg_cost_before?: number
+  quantity_before?: number
+  corporate_action_id?: number
+  adjust_id?: number
   created_at: string
   updated_at: string
 }
@@ -296,4 +301,48 @@ export interface PortfolioCurve {
 
 export function getPositionCurve(days = 90, signal?: AbortSignal) {
   return request<PortfolioCurve>({ url: '/positions/curve', params: { days }, signal })
+}
+
+// ---------- B8 除权除息持仓调整 ----------
+
+// 调整建议状态机：pending 待确认 → confirmed 已写入账本 → reverted 已撤销（可再确认）
+// / dismissed 已忽略（终态）。
+export type CorpAdjustStatus = 'pending' | 'confirmed' | 'reverted' | 'dismissed'
+
+export interface PositionCorpAdjust {
+  id: number
+  user_id: number
+  position_id: number
+  corporate_action_id: number
+  symbol: string
+  market: string
+  name: string
+  ex_date: string
+  // 方案（每 10 股口径，勿预先除以 10）
+  bonus_ratio: number
+  transfer_ratio: number
+  dividend_pretax: number
+  plan_profile: string
+  // 折算前后账面
+  qty_before: number
+  qty_after: number
+  cost_before: number
+  cost_after: number
+  cash_dividend: number // 到手税前现金分红（元）
+  status: CorpAdjustStatus
+  trade_id: number
+  confirmed_at: string | null
+  reverted_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export function listCorpAdjusts(status = 'pending', signal?: AbortSignal) {
+  return request<PositionCorpAdjust[]>({ url: '/positions/corp-adjusts', params: { status }, signal })
+}
+
+// 确认 / 撤销 / 忽略。撤销仅在「当前账面仍等于折算结果且其后无新交易」时被接受，
+// 否则后端明确拒绝并给出原因（不做部分回滚）。
+export function actCorpAdjust(id: number, action: 'confirm' | 'revert' | 'dismiss') {
+  return request<PositionCorpAdjust>({ url: `/positions/corp-adjusts/${id}/${action}`, method: 'post' })
 }

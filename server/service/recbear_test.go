@@ -133,13 +133,65 @@ func TestBearReviewEndToEnd(t *testing.T) {
 	}
 }
 
-// TestBearPromptFramework 反方 prompt 必须注入 A 股 bear 论据框架关键词与数据诚实纪律
-//（解禁数据本系统未提供——只能提示核查，禁止虚构）。
+// TestBearPromptFramework 反方 prompt 必须注入 A 股 bear 论据框架关键词与数据诚实纪律。
+// B9 起解禁数据已接入：prompt 要求「有数据必须引用具体数字」，
+// 而数据不可用时仍只能提示核查——**「不可用」绝不能写成「无解禁风险」**（三态措辞全部锁定）。
 func TestBearPromptFramework(t *testing.T) {
-	for _, kw := range []string{"高位放量", "拥挤", "估值", "T+1", "解禁", "严禁虚构", "severity"} {
+	for _, kw := range []string{"高位放量", "拥挤", "估值", "T+1", "解禁", "严禁虚构", "severity",
+		"lift_unknown", "不等于无解禁", "必须引用其中的具体数字"} {
 		if !strings.Contains(bearSystemPrompt, kw) {
 			t.Errorf("bear prompt 应包含关键词 %q", kw)
 		}
+	}
+	// 反例：不得再声称「本系统未提供解禁数据」（已接入，这样说是过时的自我否定）。
+	if strings.Contains(bearSystemPrompt, "本系统未提供解禁") {
+		t.Error("解禁已接入，prompt 不应再声称未提供解禁数据")
+	}
+}
+
+// TestBearReviewLiftPayload bear 调用的数据行必须带上解禁三态：
+// 有数据给数字、不可用给 unknown 标志、确无解禁则两者都不给。
+func TestBearReviewLiftPayload(t *testing.T) {
+	cases := []struct {
+		name        string
+		cand        candidate
+		wantKeys    []string
+		notWantKeys []string
+	}{
+		{"有解禁数据", candidate{Symbol: "600000", LiftDate: "2026-08-15", LiftDays: 18,
+			LiftRatio: 19.2, LiftSharesW: 2127.66, LiftCapYi: 6.94},
+			[]string{"lift_date", "lift_days", "lift_ratio", "lift_shares_w", "lift_cap_yi"},
+			[]string{"lift_unknown"}},
+		{"数据不可用", candidate{Symbol: "600000", LiftUnknown: true},
+			[]string{"lift_unknown"},
+			[]string{"lift_date", "lift_ratio"}},
+		{"确无解禁", candidate{Symbol: "600000"},
+			nil,
+			[]string{"lift_unknown", "lift_date", "lift_ratio"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := map[string]any{}
+			if tc.cand.LiftUnknown {
+				data["lift_unknown"] = true
+			} else if tc.cand.LiftDate != "" {
+				data["lift_date"] = tc.cand.LiftDate
+				data["lift_days"] = tc.cand.LiftDays
+				data["lift_ratio"] = tc.cand.LiftRatio
+				data["lift_shares_w"] = tc.cand.LiftSharesW
+				data["lift_cap_yi"] = tc.cand.LiftCapYi
+			}
+			for _, k := range tc.wantKeys {
+				if _, ok := data[k]; !ok {
+					t.Errorf("应包含 %q: %+v", k, data)
+				}
+			}
+			for _, k := range tc.notWantKeys {
+				if _, ok := data[k]; ok {
+					t.Errorf("不应包含 %q: %+v", k, data)
+				}
+			}
+		})
 	}
 }
 

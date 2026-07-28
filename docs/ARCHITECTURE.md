@@ -225,16 +225,58 @@ Go API Server
 
 **相关表（B5~B7 新增）**：
 
-- `position_trades`：`user_id / position_id / side(buy|sell) / price / quantity / fee / tax /
-  trade_date / note / realized_pnl / avg_cost_after / quantity_after / backfilled`，
+- `position_trades`：`user_id / position_id / side(buy|sell|adjust) / price / quantity / fee / tax /
+  trade_date / note / realized_pnl / avg_cost_after / quantity_after / backfilled`
+  + B8 折算审计列 `avg_cost_before / quantity_before / corporate_action_id / adjust_id`，
   索引 `(user_id, position_id)`。单位：price=元/股、quantity=股、fee/tax=元。
   旧持仓读取时**惰性补建**等价首笔 buy（`backfilled=true`），幂等 + 行锁并发安全 +
-  不改动任何既有汇总值。
+  不改动任何既有汇总值。`side=adjust` 是**除权除息折算**（不是买卖）：price/fee/tax 恒 0，
+  quantity 记数量变化量，realized_pnl 记到手税前现金分红；前后账面在
+  `*_before/*_after` 四列，来源在 `corporate_action_id`——**审计信息一律成列，不塞进 note**。
 - `portfolio_snapshots`：`user_id / kind(real|paper) / trade_date / market_value / cost /
   unrealized_pnl / realized_cum / cash / position_count / partial / missing_count / note`，
   唯一键 `(user_id, kind, trade_date)`。交易日 16:20 job 幂等 upsert（错峰：16:10 全市场日线、
   16:35 涨停池、18:45 龙虎榜）。**fail-closed**：市值走 `FreshQuotesFor`，stale/失败的标的
   既不进市值也不进成本，该日快照标 `partial` 并记缺口数——绝不用旧价冒充。
+
+**公司行动与事件日历相关表（B8~B9 新增）**：
+
+- `corporate_actions`：`symbol / market / name / report_date / ex_date / record_date / notice_date /
+  bonus_ratio / transfer_ratio / dividend_pretax / dividend_yield / progress / plan_profile`，
+  唯一键 `(symbol, market, report_date, ex_date)`。**送转与派息为「每 10 股」口径原值**
+  （`bonus_ratio=2` = 每 10 股送 2 股，B8 折算公式直接按此写，**不要预先除以 10**）；
+  `dividend_yield` 为百分比数值（上游小数已 ×100）。同一报告期方案随进度（预案 → 实施分配）
+  走 upsert 更新而非堆积新行；除权日确定前 `ex_date` 为空串。
+- `restricted_releases`：`symbol / market / name / free_date / free_type / free_shares /
+  lift_market_cap / free_ratio / total_ratio`，唯一键 `(symbol, market, free_date, free_type)`
+  ——**同股同日可有多批不同类型的限售股同时解禁**，只按 `(symbol, free_date)` 去重会少算规模。
+  单位：`free_shares`=股、`lift_market_cap`=元、两个 ratio=百分比数值。
+  **`free_shares` 是「本次」解禁量**（上游 `CURRENT_FREE_SHARES`），上游同名的 `FREE_SHARES`
+  是「解禁后已流通股数」，错用会把规模高估数倍（见 `datasource/emcorpaction.go` 头注的实测验算）。
+- `ipo_subscriptions`：`kind(stock|cb) / code / name / apply_code / apply_date / issue_price /
+  apply_upper / pay_date / ballot_date / list_date / board / stock_code / stock_name / rating /
+  issue_scale_yi`，唯一键 `(kind, code, apply_date)`。新股与可转债两源合表；
+  **`apply_code` 不进唯一键**（沪市新股与可转债的申购代码都与标的代码不同，上游订正应就地更新）。
+  `issue_price=0` 表示尚未定价——**不用预估价冒充**。
+- `position_corp_adjusts`：除权除息**待确认**调整建议 + 审计。
+  `user_id / position_id / corporate_action_id`（唯一键）` / symbol / ex_date / 方案快照四列 /
+  qty_before / qty_after / cost_before / cost_after / cash_dividend / status / trade_id /
+  confirmed_at / reverted_at`。状态机 `pending → confirmed → reverted`（可再确认）/ `dismissed`。
+  **程序绝不静默改写用户真实账本**：只有用户显式确认才落 `position_trades{side:adjust}` 并改写
+  `positions`；撤销仅在「当前账面仍等于折算结果且其后无任何新交易」时被接受，否则明确拒绝。
+- `paper_corp_adjusts`：模拟盘**自动**折算审计，唯一键 `(user_id, corporate_action_id)`
+  ——虚拟账户无真实后果故自动执行，按 action 唯一键保证重跑不重复发钱。
+
+**除权除息折算公式（B8，改动前先读）**：
+
+```
+新数量 = 原数量 × (1 + (送股 + 转增) / 10)
+新成本 = (原成本 × 原数量 − 每10股派息 × 原数量 / 10) / 新数量
+```
+
+现金分红计入 `realized_pnl`（真金到账，与卖出兑现同属「已实现」）；
+`total_buy_cost / total_buy_qty` **保持不变**——送转不是「又买了一次」，改动它们会让
+「一共投入多少 / 已平仓收益率」全部失真。
 
 接口示例：
 
@@ -246,6 +288,10 @@ Go API Server
 - `GET /api/positions/:id/trades` / `POST /api/positions/:id/trades`（B5 流水明细 / 加仓·减仓）
 - `GET /api/positions/stats?range=`（B6 个人交易复盘统计，纯读时聚合）
 - `GET /api/positions/curve?days=` / `GET /api/paper/curve?days=`（B7 资产曲线，读盘后快照）
+- `GET /api/positions/corp-adjusts?status=` / `POST /api/positions/corp-adjusts/:id/:action`
+  （B8 除权除息待确认折算；action = confirm | revert | dismiss）
+- `GET /api/events/calendar?days=`（B9 未来 N 天事件日历：持仓/自选的解禁·除权·财报 + 全市场打新）
+- `GET /api/markets/:market/stocks/:symbol/corp-events`（B9 个股解禁 / 分红，公开信息无用户隔离）
 - `DELETE /api/positions/:id`（级联删流水）
 -（复盘内容随 close 落库，无独立 review 端点）
 

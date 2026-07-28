@@ -44,6 +44,8 @@ const (
 
 	guardEventWindowDays = 2  // 盘后事件回看自然日窗口（today-2 起），服务缺勤时补推
 	guardEarnAheadDays   = 3  // 财报披露临近提前量（自然日，对齐 earn_date 提醒默认）
+	guardLiftAheadDays   = 10 // 限售解禁临近提前量（自然日；A 股头号利空，给足调仓时间）
+	guardExDivAheadDays  = 3  // 除权除息日临近提前量（自然日；提示账面数字将变化）
 	guardEveningPushCap  = 10 // 单用户单轮盘后推送上限（防首轮冷启动存量事件刷屏；超出只落台账）
 )
 
@@ -67,12 +69,13 @@ type guardConfig struct {
 	WatchPct   float64 `json:"watch_pct"`   // 守护范围自选当日异动阈值 %
 	StopLoss   bool    `json:"stop_loss"`   // 持仓止损触达子开关
 	TakeProfit bool    `json:"take_profit"` // 持仓止盈触达子开关
-	Evening    bool    `json:"evening"`     // 持仓盘后事件子开关（公告/龙虎榜/财报披露/业绩预告）
+	Evening    bool    `json:"evening"`     // 持仓盘后事件子开关（公告/龙虎榜/财报披露/业绩预告/解禁/除权）
+	Ipo        bool    `json:"ipo"`         // 打新提醒子开关（B9，**不依赖持仓**，独立于 evening）
 }
 
-// defaultGuardConfig 默认全开：pos±5%、watch±7%、止损止盈与盘后事件均开。
+// defaultGuardConfig 默认全开：pos±5%、watch±7%、止损止盈、盘后事件与打新提醒均开。
 func defaultGuardConfig() guardConfig {
-	return guardConfig{Enabled: true, PosPct: 5, WatchPct: 7, StopLoss: true, TakeProfit: true, Evening: true}
+	return guardConfig{Enabled: true, PosPct: 5, WatchPct: 7, StopLoss: true, TakeProfit: true, Evening: true, Ipo: true}
 }
 
 // sanitizeGuardConfig 归一化阈值：非正回退默认、上限钳制 30%（防误配空推或极端阈值）。
@@ -125,20 +128,20 @@ type guardObs struct {
 
 // guardHit 一条命中的守护事件（待去重落库 + 推送）。
 type guardHit struct {
-	Symbol   string
-	Market   string
-	Name     string
-	Kind     string
-	Price    float64
-	Message  string
-	Priority int    // ntfy 优先级；止损/持仓跌停=4，其余=0（默认）
-	Route    string // 点击跳转路由
+	Symbol    string
+	Market    string
+	Name      string
+	Kind      string
+	Price     float64
+	Message   string
+	Priority  int    // ntfy 优先级；止损/持仓跌停=4，其余=0（默认）
+	Route     string // 点击跳转路由
 	EventDate string // 盘后事件自身日期（去重台账 trade_date）；空=盘中事件，用评估当日
 }
 
 // evalPositionGuard 评估持仓的止损/止盈触达与当日异动，返回命中列表（可多条并存）。
 // 止损/止盈的触达判定用当日 low/high 兜底——对齐 alert.go evaluateAlert 的 price 分支
-//（盘中最低触及止损、最高触及止盈即算命中，不漏判盘中触达）。
+// （盘中最低触及止损、最高触及止盈即算命中，不漏判盘中触达）。
 // limitPct 为该标的板块涨跌停幅度（limitUpPctFor）：|涨跌幅| 接近该幅度（-0.3 容差对齐
 // isAtLimitUp）即视为涨跌停——即使用户异动阈值配得比涨停幅还高也推（对齐 watch 侧先例）；
 // 跌停对持仓是紧急事件，优先级与止损同为 4。
@@ -208,7 +211,7 @@ func evalPositionGuard(pos model.Position, cfg guardConfig, obs guardObs, limitP
 
 // evalWatchGuard 评估守护范围自选的当日异动或涨跌停，命中返回一条事件（否则 nil）。
 // limitPct 为该标的板块涨跌停幅度（limitUpPctFor）：|涨跌幅| 接近该幅度即视为涨跌停
-//（-0.3 容差对齐 isAtLimitUp）；用户阈值 watch_pct 未达但触及涨跌停也推。
+// （-0.3 容差对齐 isAtLimitUp）；用户阈值 watch_pct 未达但触及涨跌停也推。
 func evalWatchGuard(item model.WatchlistItem, cfg guardConfig, obs guardObs, limitPct float64) *guardHit {
 	if obs.Price <= 0 || cfg.WatchPct <= 0 {
 		return nil
@@ -276,6 +279,12 @@ func guardTitle(kind string) string {
 		return "QuantVista 持仓财报提醒"
 	case model.GuardKindPosEarnFcst:
 		return "QuantVista 持仓业绩预告"
+	case model.GuardKindPosLift:
+		return "QuantVista 持仓解禁提醒"
+	case model.GuardKindPosExDiv:
+		return "QuantVista 持仓除权除息"
+	case model.GuardKindIpoToday:
+		return "QuantVista 打新提醒"
 	}
 	return "QuantVista 守护提醒"
 }
@@ -283,7 +292,7 @@ func guardTitle(kind string) string {
 // ---------- 台账去重 ----------
 
 // recordGuardEvent 落库守护事件，唯一索引冲突时跳过。返回是否为「本轮新事件」
-//（RowsAffected>0）——同日同标的同类事件只在首次命中返回 true，用于驱动推送。
+// （RowsAffected>0）——同日同标的同类事件只在首次命中返回 true，用于驱动推送。
 func recordGuardEvent(userID int64, tradeDate string, h guardHit) bool {
 	ev := model.GuardEvent{
 		UserID: userID, Symbol: h.Symbol, Kind: h.Kind, TradeDate: tradeDate,
@@ -411,7 +420,7 @@ func (s *GuardService) evaluateGuardUser(ctx context.Context, userID int64, cfg 
 // ---------- 盘后持仓事件（公告/龙虎榜/财报披露/业绩预告，纯本地表查询） ----------
 
 // evalPosAnnouncements 持仓公告：窗口内公告按发布日分组，每组聚合一条事件
-//（同股同日多条公告合并成一条推送；去重键 trade_date=发布日，跨轮幂等）。
+// （同股同日多条公告合并成一条推送；去重键 trade_date=发布日，跨轮幂等）。
 func evalPosAnnouncements(symbol, name string, anns []model.Announcement) []guardHit {
 	if len(anns) == 0 {
 		return nil
@@ -561,7 +570,182 @@ func evalPosEarnFcst(symbol, name string, fc *model.EarningsForecast, since stri
 	}
 }
 
-// evaluateGuardUserEvening 单用户盘后事件评估：持仓 symbol 集合 → 四类本地表批量查询 →
+// evalPosLift 持仓限售解禁临近（B9）：解禁日在 [today, today+guardLiftAheadDays] 内。
+// 去重键 trade_date=解禁日——整个临近窗口只推一次；同日多批不同类型的解禁合并成一条
+// （GuardEvent 唯一键不含类型，分开推也会被去重吞掉，不如一次说清总量）。
+// 解禁是 A 股头号利空，占流通股比例是散户最关心的量级信号，必须带上。
+func evalPosLift(symbol, name string, rows []model.RestrictedRelease, today string) *guardHit {
+	if len(rows) == 0 {
+		return nil
+	}
+	td, err := time.ParseInLocation("2006-01-02", today, time.Local)
+	if err != nil {
+		return nil
+	}
+	// 取窗口内最近的一个解禁日，合并该日全部批次。
+	var target string
+	for _, r := range rows {
+		fd, perr := time.ParseInLocation("2006-01-02", r.FreeDate, time.Local)
+		if perr != nil {
+			continue
+		}
+		days := int(fd.Sub(td).Hours() / 24)
+		if days < 0 || days > guardLiftAheadDays {
+			continue
+		}
+		if target == "" || r.FreeDate < target {
+			target = r.FreeDate
+		}
+	}
+	if target == "" {
+		return nil
+	}
+	var shares, cap_, ratio float64
+	var types []string
+	seenType := map[string]bool{}
+	for _, r := range rows {
+		if r.FreeDate != target {
+			continue
+		}
+		shares += r.FreeShares
+		cap_ += r.LiftMarketCap
+		ratio += r.FreeRatio
+		if r.FreeType != "" && !seenType[r.FreeType] {
+			seenType[r.FreeType] = true
+			types = append(types, r.FreeType)
+		}
+		if name == "" {
+			name = r.Name
+		}
+	}
+	if shares <= 0 {
+		return nil
+	}
+	if name == "" {
+		name = symbol
+	}
+	fd, _ := time.ParseInLocation("2006-01-02", target, time.Local)
+	days := int(fd.Sub(td).Hours() / 24)
+	when := fmt.Sprintf("%d 天后", days)
+	if days == 0 {
+		when = "今日"
+	}
+	typeTxt := ""
+	if len(types) > 0 {
+		typeTxt = "（" + strings.Join(types, "；") + "）"
+	}
+	ratioTxt := ""
+	if ratio > 0 {
+		ratioTxt = fmt.Sprintf("，占流通股 %.2f%%", ratio)
+	}
+	return &guardHit{
+		Symbol: symbol, Market: "cn", Name: name, Kind: model.GuardKindPosLift,
+		Route: stockDetailRoute("cn", symbol), EventDate: target, Priority: 0,
+		Message: truncateRunes(fmt.Sprintf("🔓 持仓解禁：%s(%s) %s（%s）解禁 %.0f 万股、市值约 %.2f 亿元%s%s",
+			name, symbol, target, when, shares/1e4, cap_/1e8, ratioTxt, typeTxt), 256),
+	}
+}
+
+// evalPosExDiv 持仓除权除息日临近（B9）：除权日在 [today, today+guardExDivAheadDays] 内。
+// 去重键 trade_date=除权日。文案要点明「账面数字会变」——这正是 B8 要解决的困惑来源。
+func evalPosExDiv(symbol, name string, rows []model.CorporateAction, today string) *guardHit {
+	if len(rows) == 0 {
+		return nil
+	}
+	td, err := time.ParseInLocation("2006-01-02", today, time.Local)
+	if err != nil {
+		return nil
+	}
+	var best *model.CorporateAction
+	for i := range rows {
+		r := rows[i]
+		if r.ExDate == "" || !r.HasAdjustment() {
+			continue
+		}
+		ed, perr := time.ParseInLocation("2006-01-02", r.ExDate, time.Local)
+		if perr != nil {
+			continue
+		}
+		days := int(ed.Sub(td).Hours() / 24)
+		if days < 0 || days > guardExDivAheadDays {
+			continue
+		}
+		if best == nil || r.ExDate < best.ExDate {
+			best = &rows[i]
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	if name == "" {
+		name = best.Name
+	}
+	if name == "" {
+		name = symbol
+	}
+	ed, _ := time.ParseInLocation("2006-01-02", best.ExDate, time.Local)
+	days := int(ed.Sub(td).Hours() / 24)
+	when := fmt.Sprintf("%d 天后", days)
+	if days == 0 {
+		when = "今日"
+	}
+	plan := best.PlanProfile
+	if plan == "" {
+		plan = fmt.Sprintf("每10股送%.4g转%.4g派%.4g元", best.BonusRatio, best.TransferRatio, best.DividendPretax)
+	}
+	tail := "，除权后持仓成本与数量需折算（届时在持仓页确认）"
+	if best.BonusRatio <= 0 && best.TransferRatio <= 0 {
+		tail = "，除权后持仓成本需折算（届时在持仓页确认）"
+	}
+	return &guardHit{
+		Symbol: symbol, Market: "cn", Name: name, Kind: model.GuardKindPosExDiv,
+		Route: "/positions", EventDate: best.ExDate, Priority: 0,
+		Message: truncateRunes(fmt.Sprintf("💰 持仓除权除息：%s(%s) %s（%s）除权除息，方案 %s%s",
+			name, symbol, best.ExDate, when, plan, tail), 256),
+	}
+}
+
+// evalIpoToday 今日可申购的新股/可转债（B9，**不依赖持仓**）。
+// 每只标的一条（Symbol=申购代码），去重键 trade_date=申购日——同一只新股只推一次。
+func evalIpoToday(rows []model.IpoSubscription, today string) []guardHit {
+	var hits []guardHit
+	for _, r := range rows {
+		if r.ApplyDate != today {
+			continue
+		}
+		label, extra := "新股", ""
+		if r.Kind == model.IpoKindCb {
+			label = "可转债"
+			if r.StockName != "" {
+				extra = fmt.Sprintf("，正股 %s(%s)", r.StockName, r.StockCode)
+			}
+			if r.Rating != "" {
+				extra += "，评级 " + r.Rating
+			}
+		} else {
+			if r.Board != "" {
+				extra = "，" + r.Board
+			}
+			if r.ApplyUpper > 0 {
+				extra += fmt.Sprintf("，申购上限 %.0f 股", r.ApplyUpper)
+			}
+		}
+		priceTxt := "发行价待定"
+		if r.IssuePrice > 0 {
+			priceTxt = fmt.Sprintf("发行价 %.2f 元", r.IssuePrice)
+		}
+		hits = append(hits, guardHit{
+			// Symbol 用申购代码：这是用户实际下单敲的代码，也天然构成同日多只的去重键。
+			Symbol: r.ApplyCode, Market: "cn", Name: r.Name, Kind: model.GuardKindIpoToday,
+			Route: "/todos", EventDate: r.ApplyDate, Priority: 0,
+			Message: truncateRunes(fmt.Sprintf("🎫 今日打新：%s %s（申购代码 %s）今日可申购，%s%s",
+				label, r.Name, r.ApplyCode, priceTxt, extra), 256),
+		})
+	}
+	return hits
+}
+
+// evaluateGuardUserEvening 单用户盘后事件评估：持仓 symbol 集合 → 六类本地表批量查询 →
 // 纯函数评估 → 台账去重 → 推送（cap 限流防冷启动存量刷屏）。返回新事件数。
 func (s *GuardService) evaluateGuardUserEvening(userID int64, today, since string) int {
 	var positions []model.Position
@@ -580,7 +764,7 @@ func (s *GuardService) evaluateGuardUserEvening(userID int64, today, since strin
 		}
 	}
 
-	// 四类数据一次性批量查询（symbol IN），绝不逐 symbol 循环查。
+	// 六类数据一次性批量查询（symbol IN），绝不逐 symbol 循环查。
 	var anns []model.Announcement
 	common.DB.Where("symbol IN ? AND notice_date >= ?", syms, since).
 		Order("notice_date, id").Find(&anns)
@@ -594,6 +778,13 @@ func (s *GuardService) evaluateGuardUserEvening(userID int64, today, since strin
 	var fcs []model.EarningsForecast
 	common.DB.Where("symbol IN ? AND notice_date >= ?", syms, since).
 		Order("notice_date DESC, id DESC").Find(&fcs)
+	// B9：解禁（提前 10 天）与除权除息（提前 3 天）——查询窗口与各自提前量一致。
+	var lifts []model.RestrictedRelease
+	common.DB.Where("symbol IN ? AND market = ? AND free_date BETWEEN ? AND ?",
+		syms, "cn", today, mustAddDays(today, guardLiftAheadDays)).Order("free_date, id").Find(&lifts)
+	var exdivs []model.CorporateAction
+	common.DB.Where("symbol IN ? AND market = ? AND ex_date BETWEEN ? AND ?",
+		syms, "cn", today, mustAddDays(today, guardExDivAheadDays)).Order("ex_date, id").Find(&exdivs)
 
 	annBySym := map[string][]model.Announcement{}
 	for _, a := range anns {
@@ -615,6 +806,14 @@ func (s *GuardService) evaluateGuardUserEvening(userID int64, today, since strin
 			fcBySym[fcs[i].Symbol] = &fcs[i]
 		}
 	}
+	liftBySym := map[string][]model.RestrictedRelease{}
+	for _, r := range lifts {
+		liftBySym[r.Symbol] = append(liftBySym[r.Symbol], r)
+	}
+	exdivBySym := map[string][]model.CorporateAction{}
+	for _, r := range exdivs {
+		exdivBySym[r.Symbol] = append(exdivBySym[r.Symbol], r)
+	}
 
 	var newHits []guardHit
 	for _, sym := range syms {
@@ -628,10 +827,16 @@ func (s *GuardService) evaluateGuardUserEvening(userID int64, today, since strin
 		if h := evalPosEarnFcst(sym, name, fcBySym[sym], since); h != nil {
 			hits = append(hits, *h)
 		}
+		if h := evalPosLift(sym, name, liftBySym[sym], today); h != nil {
+			hits = append(hits, *h)
+		}
+		if h := evalPosExDiv(sym, name, exdivBySym[sym], today); h != nil {
+			hits = append(hits, *h)
+		}
 		for _, h := range hits {
 			date := h.EventDate
 			if date == "" {
-				date = today // 兜底：事件日期缺失按评估日去重（正常路径四类纯函数都必填）
+				date = today // 兜底：事件日期缺失按评估日去重（正常路径六类纯函数都必填）
 			}
 			if recordGuardEvent(userID, date, h) {
 				newHits = append(newHits, h)
@@ -681,6 +886,54 @@ func (s *GuardService) runGuardEveningRound() {
 			common.SysLog("用户 %d 盘后守护事件 %d 条", uid, n)
 		}
 	}
+	// 打新提醒（B9）：**不依赖持仓**，用户集合与上面不同——遍历全部有推送通道的用户。
+	s.runIpoRound(today)
+}
+
+// runIpoRound 今日打新提醒（B9）。与持仓事件轮分开：打新不依赖持仓，
+// 一个从没建过仓的用户同样该收到「今天有新股可申购」。
+// 幂等靠 GuardEvent 台账（键含申购代码 + 申购日），一只新股对一个用户只推一次。
+func (s *GuardService) runIpoRound(today string) {
+	var subs []model.IpoSubscription
+	if err := common.DB.Where("apply_date = ?", today).
+		Order("kind, code").Find(&subs).Error; err != nil {
+		common.SysWarn("打新提醒读取申购清单失败: %v", err)
+		return
+	}
+	hits := evalIpoToday(subs, today)
+	if len(hits) == 0 {
+		return
+	}
+	var uids []int64
+	// 有启用推送通道的用户即为候选（打新与持仓无关）。
+	if err := common.DB.Model(&model.NotifyChannel{}).Where("enabled = ?", true).
+		Distinct().Pluck("user_id", &uids).Error; err != nil {
+		common.SysWarn("打新提醒读取用户失败: %v", err)
+		return
+	}
+	for _, uid := range uids {
+		if !userNotifyEnabled(uid) || !s.notify.HasEnabledChannel(uid) {
+			continue
+		}
+		cfg := loadGuardConfig(uid)
+		if !cfg.Enabled || !cfg.Ipo {
+			continue
+		}
+		n := 0
+		for _, h := range hits {
+			if !recordGuardEvent(uid, h.EventDate, h) {
+				continue // 已推过
+			}
+			s.notify.SendMsg(uid, NotifyMessage{
+				Title: guardTitle(h.Kind), Content: h.Message,
+				Route: h.Route, Kind: NotifyMsgKindGuard, Priority: h.Priority,
+			})
+			n++
+		}
+		if n > 0 {
+			common.SysLog("用户 %d 打新提醒 %d 条", uid, n)
+		}
+	}
 }
 
 // mustAddDays 日期字符串加 N 自然日（解析失败返回原串，调用方查询条件退化为当日）。
@@ -722,7 +975,7 @@ func (s *GuardService) runGuardRound() {
 
 // StartGuardJobs 后台守护评估：
 //   - 盘中轮：启动延迟 75s（错开 alert 的 60s 启动）后首评，此后每 15 分钟一轮
-//    （runGuardRound 内部自判交易时段，非盘中空转即返回）；
+//     （runGuardRound 内部自判交易时段，非盘中空转即返回）；
 //   - 盘后事件轮：每天 19:35（数据依赖 18:45/19:05 两个 job 已错峰跑完）；启动 3 分钟后
 //     先补跑一轮（服务缺勤后补推窗口内漏掉的事件，GuardEvent 台账保证不重复）。
 func StartGuardJobs(mgr *datasource.Manager) *GuardService {

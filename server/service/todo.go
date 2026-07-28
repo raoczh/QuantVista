@@ -32,6 +32,8 @@ const (
 	TodoKindPositionLong  = "position_long"  // 长线持仓持有较久，建议定期复盘
 	TodoKindThesisDue     = "thesis_due"     // 投资逻辑卡到期待复盘
 	TodoKindStopLoss      = "stop_loss"      // 持仓现价接近/跌破计划止损
+	TodoKindCorpAdjust    = "corp_adjust"    // 除权除息待确认折算（B8，不确认账面盈亏就是错的）
+	TodoKindIpo           = "ipo"            // 今日可申购新股/可转债（B9，不依赖持仓）
 )
 
 // longHoldReviewDays 长线持仓超过该交易日数提示定期复盘。
@@ -203,6 +205,69 @@ func (s *TodoService) Build(ctx context.Context, userID int64) (*TodoResult, err
 		} else {
 			fail("逻辑卡", err)
 		}
+	}
+
+	// 5) 除权除息待确认折算（B8）：先按今日除权日生成建议（幂等），再把 pending 的列出来。
+	// 优先级 1——不确认的话持仓页显示的盈亏就是**错的数字**（10 转 10 后 -50%），
+	// 比「接近止损」更该立刻处理。
+	if _, err := GenerateCorpAdjusts(userID, res.Date); err != nil {
+		fail("除权除息调整", err)
+	}
+	if adjusts, err := ListCorpAdjusts(userID, model.CorpAdjustPending); err == nil {
+		for _, a := range adjusts {
+			detail := fmt.Sprintf("%s 除权除息（%s）：数量 %g → %g 股，成本 %.4f → %.4f 元",
+				a.ExDate, orSymbol(a.PlanProfile, "方案详见公告"),
+				a.QtyBefore, a.QtyAfter, a.CostBefore, a.CostAfter)
+			if a.CashDividend > 0 {
+				detail += fmt.Sprintf("，现金分红 %.2f 元（税前）", a.CashDividend)
+			}
+			res.Items = append(res.Items, TodoItem{
+				Kind: TodoKindCorpAdjust, Priority: 1,
+				Symbol: a.Symbol, Market: a.Market, Name: orSymbol(a.Name, a.Symbol),
+				Title:  "除权除息待确认折算",
+				Detail: detail,
+				RefID:  a.ID, RefType: "positions",
+			})
+			res.Reviews++
+		}
+	} else {
+		fail("除权除息调整", err)
+	}
+
+	// 6) 今日打新（B9）：**不依赖持仓**，全市场公开信息，人人可见。
+	// 优先级 2——申购当日有效，错过就没了，但不影响已有仓位的风险。
+	var subs []model.IpoSubscription
+	if err := common.DB.Where("apply_date = ?", res.Date).Order("kind, code").Find(&subs).Error; err == nil {
+		for _, sub := range subs {
+			label := "新股"
+			extra := sub.Board
+			if sub.Kind == model.IpoKindCb {
+				label = "可转债"
+				extra = ""
+				if sub.StockName != "" {
+					extra = fmt.Sprintf("正股 %s(%s)", sub.StockName, sub.StockCode)
+				}
+				if sub.Rating != "" {
+					extra = appendSep(extra, "评级 "+sub.Rating)
+				}
+			} else if sub.ApplyUpper > 0 {
+				extra = appendSep(extra, fmt.Sprintf("申购上限 %.0f 股", sub.ApplyUpper))
+			}
+			if sub.IssuePrice > 0 {
+				extra = appendSep(extra, fmt.Sprintf("发行价 %.2f 元", sub.IssuePrice))
+			} else {
+				extra = appendSep(extra, "发行价待定")
+			}
+			res.Items = append(res.Items, TodoItem{
+				Kind: TodoKindIpo, Priority: 2,
+				Symbol: sub.ApplyCode, Market: "cn", Name: sub.Name,
+				Title:  "今日可申购" + label,
+				Detail: fmt.Sprintf("申购代码 %s，%s", sub.ApplyCode, extra),
+				RefID:  sub.ID, RefType: "ipo",
+			})
+		}
+	} else {
+		fail("打新日历", err)
 	}
 
 	// 排序：优先级升序，其次有时间者靠前、时间新者靠前。

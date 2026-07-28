@@ -140,16 +140,39 @@ func TestAppendStockSnapshotUnknowns(t *testing.T) {
 		}
 	}
 
-	// 数据齐全：无 unknowns 键。
+	// 数据齐全：无 unknowns 键。B9 起 corp_events 也算一个维度——
+	// 段存在且未标 lifts_unavailable 即为「解禁数据可用」（空 lifts=确无解禁，有依据）。
 	full := map[string]any{
 		"quote":      map[string]any{"price": 10.0},
 		"technicals": map[string]any{"ma20": 9.5},
 		"finance":    map[string]any{"roe": 15.0},
 		"org_view":   map[string]any{"report_count_90d": 3.0},
+		"corp_events": map[string]any{
+			"lifts": []map[string]any{}, "lifts_note": "窗口内确无解禁安排",
+		},
 	}
 	appendStockSnapshotUnknowns(full, "cn", "600000", false)
 	if _, ok := full["unknowns"]; ok {
-		t.Fatal("数据齐全不应注入 unknowns")
+		t.Fatalf("数据齐全不应注入 unknowns: %+v", full["unknowns"])
+	}
+
+	// 解禁段显式不可用：必须算缺口（「查不到」不能被读成「无解禁」）。
+	liftDown := map[string]any{
+		"quote":       map[string]any{"price": 10.0},
+		"technicals":  map[string]any{"ma20": 9.5},
+		"finance":     map[string]any{"roe": 15.0},
+		"org_view":    map[string]any{"report_count_90d": 3.0},
+		"corp_events": map[string]any{"lifts_unavailable": true},
+	}
+	appendStockSnapshotUnknowns(liftDown, "cn", "600000", false)
+	var hasLift bool
+	for _, u := range snapshotUnknownItems(liftDown) {
+		if u.FieldPath == "corp_events.lifts" {
+			hasLift = true
+		}
+	}
+	if !hasLift {
+		t.Fatal("解禁数据不可用必须进 unknowns，否则模型会脑补「无解禁风险」")
 	}
 
 	// flag 关闭：回退 ev3 行为（不注入）。

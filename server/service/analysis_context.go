@@ -163,8 +163,18 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 	}
 
 	// 风险闸门（S1）：ST/退市、一字板、流动性、小市值的程序化前置判定，注入 prompt
-	// 且随快照透传前端展示；未接入的数据维度（质押/解禁）恒带「请自行核查」声明。
-	snap["risk_gate"] = riskGateBlock(computeRiskGate(q, valuation))
+	// 且随快照透传前端展示。**限售解禁自 B9 起已接入**，一并进闸门与 corp_events 段；
+	// 未接入的维度（质押/商誉）恒带「请自行核查」声明，解禁维度按**实际可用性**动态声明
+	// （查不到 ≠ 没有解禁，见 riskGateNoteFor）。
+	riskFlags := computeRiskGate(q, valuation)
+	corpEvents, lifts, liftAvailable := stockCorpEventsBlock(mkt, symbol, now)
+	if corpEvents != nil {
+		snap["corp_events"] = corpEvents
+	}
+	if liftAvailable {
+		riskFlags = append(riskFlags, evalLiftRiskFlags(lifts, now.Format("2006-01-02"))...)
+	}
+	snap["risk_gate"] = riskGateBlock(riskFlags, liftAvailable, len(lifts))
 
 	// 日线：取近 60 根算技术指标，注入近 30 根明细；顺手算五维量化评分
 	// （与个股详情页/对比/推荐同一 computeScore 口径），给 LLM 一个确定性的量化锚点，
@@ -281,11 +291,104 @@ func appendStockSnapshotUnknowns(snap map[string]any, mkt, symbol string, valuat
 			addUnknown("org_view", "机构观点（研报评级/目标价/调研）暂未采集到",
 				"无卖方观点对照，不得以「机构看好/一致预期」措辞")
 		}
+		// B9：解禁数据不可用是**真缺口**（不是「无解禁」）——必须显式进 unknowns，
+		// 否则模型看到 corp_events 里没有 lifts 会自行脑补「该股无解禁风险」。
+		if ce, ok := snap["corp_events"].(map[string]any); !ok {
+			addUnknown("corp_events.lifts", "限售解禁数据本次不可用（同步未完成或查询失败）",
+				"无法判断解禁抛压，不得给出「无解禁风险」结论，只能声明需自行核查")
+		} else if unavailable, _ := ce["lifts_unavailable"].(bool); unavailable {
+			addUnknown("corp_events.lifts", "限售解禁数据本次不可用（同步未完成或查询失败）",
+				"无法判断解禁抛压，不得给出「无解禁风险」结论，只能声明需自行核查")
+		}
 	}
 	if len(unknowns) > 0 {
 		snap["unknowns"] = unknowns
 		snap["unknowns_note"] = "以上字段本次快照缺失（缺失≠为零）：对应维度只能声明数据不足，禁止用常识或记忆补齐"
 	}
+}
+
+// stockCorpEventsBlock 组装个股快照的 corp_events 段（B9：限售解禁 + 分红送转/股息率）。
+//
+// 返回 (段, 窗口内解禁批次, 解禁数据是否可用)。**available=false 与 len(lifts)==0 语义完全不同**：
+// 前者是「不知道」（同步未跑/查询失败/非 A 股），后者是「确实没有」——调用方据此
+// 决定 risk_gate 的措辞，绝不能把未知说成无解禁。
+//
+// 进入本段的每一个数值（解禁股数/市值/比例、送转比例、每 10 股派息、股息率）都会被
+// snapshotLabeledValues 递归收进证据核验值域，模型忠实引用不会被误判幻觉；
+// 反之伪造的数字必然落在值域外被标记 unmatched（TestCorpEventsEvidenceDomain 锁定）。
+func stockCorpEventsBlock(mkt, symbol string, now time.Time) (map[string]any, []model.RestrictedRelease, bool) {
+	if mkt != "cn" || len(symbol) != 6 || isCNFund(symbol) {
+		return nil, nil, false // 非 A 股正股：本维度不适用，也不是「无解禁」
+	}
+	ev, err := StockCorpEventsFor(mkt, symbol)
+	if err != nil || ev == nil {
+		return nil, nil, false
+	}
+	available := !ev.LiftUnavailable
+	today := now.Format("2006-01-02")
+
+	block := map[string]any{}
+	// 解禁：只放**未来**窗口内的（已过去的解禁不是决策变量，放进来只会稀释值域）。
+	var future []model.RestrictedRelease
+	rows := make([]map[string]any, 0, len(ev.Lifts))
+	for _, l := range ev.Lifts {
+		if l.FreeDate < today {
+			continue
+		}
+		future = append(future, l)
+		rows = append(rows, map[string]any{
+			"symbol":             l.Symbol, // 数组段名用 symbol（snapshotLabeledValues 惯例）
+			"free_date":          l.FreeDate,
+			"free_type":          l.FreeType,
+			"free_shares_wan":    round2(l.FreeShares / 1e4),    // 万股（人类可读口径，与文案一致）
+			"lift_market_cap_yi": round2(l.LiftMarketCap / 1e8), // 亿元
+			"free_ratio_pct":     round2(l.FreeRatio),           // 占流通股 %
+			"total_ratio_pct":    round2(l.TotalRatio),          // 占总股本 %
+		})
+	}
+	if available {
+		block["lifts"] = rows
+		block["lifts_note"] = fmt.Sprintf(
+			"限售解禁数据截至 %s，窗口=未来 %d 天；股数单位万股、市值单位亿元、比例为占比百分数。空数组=该窗口内确无解禁安排（有数据依据，非缺失）。",
+			today, stockLiftAheadDays)
+	} else {
+		block["lifts_unavailable"] = true
+		block["lifts_note"] = "限售解禁数据本次不可用（同步未完成或查询失败）——这不等于无解禁，禁止据此给出「无解禁风险」的结论。"
+	}
+
+	// 分红送转：最近几期方案 + 最新股息率。
+	if !ev.ActionUnavailable && len(ev.Actions) > 0 {
+		acts := make([]map[string]any, 0, len(ev.Actions))
+		for _, a := range ev.Actions {
+			item := map[string]any{
+				"report_date":        a.ReportDate,
+				"ex_date":            a.ExDate,
+				"progress":           a.Progress,
+				"plan":               a.PlanProfile,
+				"bonus_per10":        a.BonusRatio,
+				"transfer_per10":     a.TransferRatio,
+				"dividend_per10":     a.DividendPretax,
+				"dividend_yield_pct": a.DividendYield,
+			}
+			acts = append(acts, item)
+		}
+		block["dividends"] = acts
+		block["dividends_note"] = "送转与派息为 A 股「每 10 股」口径（bonus_per10=2 表示每 10 股送 2 股）；dividend_yield_pct 为股息率百分数。"
+		// **口径基数必须进值域**：模型几乎必然写成「每 10 股派 X 元」，而核验侧对
+		// 带单位的整数（「10 股」）不跳过——值域里没有 10 就会把正确复述判成幻觉。
+		// 10 是方案口径的组成部分，不是编造的数字，显式成键是诚实且必要的。
+		block["ratio_base_shares"] = 10
+		// 最新一期股息率单列，供估值段直接引用（C10 的落点之一）。
+		if y := ev.Actions[0].DividendYield; y > 0 {
+			block["latest_dividend_yield_pct"] = y
+		}
+	} else if ev.ActionUnavailable {
+		block["dividends_unavailable"] = true
+	}
+	if len(block) == 0 {
+		return nil, future, available
+	}
+	return block, future, available
 }
 
 // computeTechnicals 从升序日线（最新在末尾）算常用技术指标。

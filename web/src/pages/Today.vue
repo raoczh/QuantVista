@@ -3,6 +3,7 @@ import { ref, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { NButton, NSpin, NEmpty, NTag, NGrid, NGi, NAlert, useMessage } from 'naive-ui'
 import { getTodos, type TodoItem, type TodoResult } from '@/api/todo'
+import { getEventCalendar, type CalendarEvent, type CalendarResult } from '@/api/event'
 import { setAlertEventStatus } from '@/api/alert'
 import { ackRecommendationReview } from '@/api/recommendation'
 import { useUi } from '@/composables/useUi'
@@ -43,6 +44,10 @@ function kindMeta(kind: string) {
       return { label: '长线持仓', color: flatColor.value }
     case 'thesis_due':
       return { label: '逻辑卡复盘', color: vars.value.infoColor }
+    case 'corp_adjust':
+      return { label: '除权折算', color: vars.value.warningColor }
+    case 'ipo':
+      return { label: '今日打新', color: vars.value.successColor }
     default:
       return { label: '待办', color: flatColor.value }
   }
@@ -96,6 +101,71 @@ async function markRecReview(item: TodoItem) {
 }
 
 onMounted(load)
+
+// ---------- B9 事件日历（未来 30 天与我相关的解禁/除权/财报 + 全市场打新） ----------
+
+const calendar = ref<CalendarResult | null>(null)
+const calLoading = ref(false)
+const calError = ref('')
+let calAbort: AbortController | null = null
+
+function isAbortError(e: unknown) {
+  const err = e as { name?: string; code?: string }
+  return err?.name === 'AbortError' || err?.code === 'ERR_CANCELED'
+}
+
+async function loadCalendar() {
+  calAbort?.abort()
+  const ctrl = new AbortController()
+  calAbort = ctrl
+  calLoading.value = true
+  calError.value = ''
+  try {
+    calendar.value = await getEventCalendar(30, ctrl.signal)
+  } catch (e) {
+    if (isAbortError(e)) return
+    calError.value = (e as Error).message
+  } finally {
+    if (calAbort === ctrl) calLoading.value = false
+  }
+}
+
+// 事件类型 → 展示元信息。
+function eventMeta(kind: string) {
+  switch (kind) {
+    case 'lift':
+      return { label: '解禁', color: downColor.value }
+    case 'ex_div':
+      return { label: '除权除息', color: vars.value.warningColor }
+    case 'earn':
+      return { label: '财报', color: vars.value.infoColor }
+    case 'ipo':
+      return { label: '新股申购', color: upColor.value }
+    case 'cb':
+      return { label: '可转债申购', color: vars.value.successColor }
+    default:
+      return { label: '事件', color: flatColor.value }
+  }
+}
+function relationLabel(rel: string) {
+  return rel === 'position' ? '我的持仓' : rel === 'watch' ? '我的自选' : '全市场'
+}
+// 日期边界：0=今天、负数不应出现（后端只查未来窗口），其余按天数展示。
+function daysLabel(n: number) {
+  if (n <= 0) return '今天'
+  if (n === 1) return '明天'
+  return `${n} 天后`
+}
+function openEvent(ev: CalendarEvent) {
+  if (ev.route) {
+    router.push(ev.route)
+  } else if (ev.kind === 'ipo' || ev.kind === 'cb') {
+    // 打新无个股详情可跳（申购代码不是可查行情的标的），停留在本页即可。
+    message.info(`申购代码 ${ev.apply_code || ev.symbol}，请在券商 App 下单`)
+  }
+}
+
+onMounted(loadCalendar)
 </script>
 
 <template>
@@ -169,6 +239,62 @@ onMounted(load)
                   >
                 </template>
                 <n-button size="small" tertiary @click="handle(it)">去处理</n-button>
+              </div>
+            </div>
+          </div>
+        </n-spin>
+      </SectionCard>
+
+      <SectionCard title="事件日历 · 未来 30 天">
+        <template #extra>
+          <n-button size="tiny" quaternary :loading="calLoading" @click="loadCalendar">刷新</n-button>
+        </template>
+        <n-spin :show="calLoading && !calendar">
+          <n-alert v-if="calError" type="error" :bordered="false" style="margin-bottom: 12px" title="事件日历读取失败">
+            {{ calError }}
+          </n-alert>
+          <n-alert
+            v-else-if="calendar && calendar.complete === false"
+            type="warning"
+            :bordered="false"
+            style="margin-bottom: 12px"
+            title="事件清单可能不完整"
+          >
+            <div v-for="(e, i) in calendar.errors || []" :key="i">{{ e }}</div>
+          </n-alert>
+          <n-empty
+            v-if="!calError && calendar && !calendar.events.length"
+            :description="
+              calendar.complete === false
+                ? '未取到事件，但部分数据读取失败，状态不明——不代表未来 30 天无事发生'
+                : '未来 30 天没有与你相关的解禁、除权、财报，也没有可申购的新股'
+            "
+            style="padding: 32px 0"
+          />
+          <div v-else-if="!calError" class="events">
+            <div v-for="(ev, i) in calendar?.events || []" :key="i" class="event" @click="openEvent(ev)">
+              <div class="event-date">
+                <span class="event-day qv-tnum">{{ ev.date.slice(5) }}</span>
+                <span class="event-left">{{ daysLabel(ev.days_left) }}</span>
+              </div>
+              <div class="event-bar" :style="{ background: eventMeta(ev.kind).color }" />
+              <div class="event-main">
+                <div class="event-head">
+                  <n-tag
+                    size="tiny"
+                    round
+                    :bordered="false"
+                    :color="{ color: withAlpha(eventMeta(ev.kind).color, 0.14), textColor: eventMeta(ev.kind).color }"
+                    >{{ eventMeta(ev.kind).label }}</n-tag
+                  >
+                  <n-tag v-if="ev.relation !== 'market'" size="tiny" round :bordered="false" type="info">{{
+                    relationLabel(ev.relation)
+                  }}</n-tag>
+                  <span class="event-name"
+                    >{{ ev.name || ev.symbol }}<span class="event-symbol qv-mono"> {{ ev.symbol }}</span></span
+                  >
+                </div>
+                <div class="event-detail">{{ ev.detail }}</div>
               </div>
             </div>
           </div>
@@ -251,5 +377,80 @@ onMounted(load)
   align-items: center;
   gap: 4px;
   flex-shrink: 0;
+}
+
+/* B9 事件日历 */
+.events {
+  display: flex;
+  flex-direction: column;
+}
+.event {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 4px;
+  border-bottom: 1px solid var(--qv-divider);
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+.event:hover {
+  opacity: 0.75;
+}
+.event:last-child {
+  border-bottom: none;
+}
+.event-date {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 62px;
+  flex-shrink: 0;
+}
+.event-day {
+  font-size: 14px;
+  font-weight: 600;
+}
+.event-left {
+  font-size: 11px;
+  opacity: 0.55;
+}
+.event-bar {
+  width: 3px;
+  align-self: stretch;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.event-main {
+  flex: 1;
+  min-width: 0;
+}
+.event-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.event-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+.event-symbol {
+  opacity: 0.5;
+  font-size: 12px;
+  font-weight: 400;
+}
+.event-detail {
+  font-size: 12px;
+  opacity: 0.72;
+  margin-top: 3px;
+}
+@media (max-width: 768px) {
+  .event {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+  .event-date {
+    width: 54px;
+  }
 }
 </style>

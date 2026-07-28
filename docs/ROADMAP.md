@@ -4,7 +4,7 @@
 > 现只保留对后续开发有约束力的内容：当前状态、实现边界、防回归要点、未完成项与欠人工验证清单。
 > 表结构以 `server/model/*.go`（GORM AutoMigrate）为准；数据源认知见 `DATA_SOURCES.md`；架构与 UI 约定见 `ARCHITECTURE.md`；部署见 `DEPLOYMENT.md`。
 
-## 1. 当前状态（截至 2026-07-28，散户体验第一批 A1~A4 + 第二批 B5~B7 + 交叉审查修复）
+## 1. 当前状态（截至 2026-07-28，散户体验第一批 A1~A4 + 第二批 B5~B7 + 第三批 B8~B9）
 
 个人自用 AI 股票研究平台，Go(Gin+GORM)+Vue3(Naive UI)，单容器 go:embed 托管前端，生产 MySQL。已具备：
 
@@ -258,11 +258,36 @@
 - **第五十八批交叉审查修复防回归**（2026-07-27，8 项）：①**流式 usage 不得在 finish_reason 处提前 break**——OpenAI `include_usage` 的 usage 专属 chunk（`choices:[]` + usage）排在 finish_reason **之后**、`[DONE]` 之前，提前收尾会让 usage 恒回落 `estimateUsage` 字符粗估，污染 `llm_router` 的 `cost_exceeded` 自动回退判定（chat 粗估 vs responses 端点真值混比，且自动回退持久化不自动恢复）；改为有界续读（`streamPostFinishMaxEvents=4`，拿到 usage 或 `[DONE]` 即收尾），`done` 已置真故 EOF/读错判定不受影响。②**`backfillActualLabels` 从 seed 只继承归因维度，结算结果一律清零**（ExitDate/ExitPrice/Gross/Net/Bench/Alpha/HasBench/Mfe/Mae/HitTP/HitSL/Forced/SkipReason）——seed 取 h=1 的 next_open 行，它在推荐次日即成熟而持仓血缘通常晚于它建立，不清零会让 pending 行一路携带 1 日窗口收益；且 Bench/Alpha/HasBench 仅在买卖两端都命中基准轴时才被覆盖、SkipReason 仅在非 matured 分支才写，两者会永久留在 5/10/20/60 日行上。③**`settleFromActualEntry` 已定位建仓根后的 pending 必须带回 BuyDate/BuyPrice 与窗口 MFE/MAE**——`advanceOneLabel` 的超窗强平 guard 是 `out.BuyDate != ""`，不带则 `forceCloseStaleLabel` 的 actual 分支（qty=100）是死代码，退市/长停时 next_open 强平成熟而 actual 判 no_data，同一事实两口径打架；`e<0`（从未入场）保持裸 pending。④`execution_sim` 出场根坏数据的 pending 分支补算 MFE/MAE，与 `!endOK` 分支同口径（强平会沿用 out 里的值）。⑤**`recrecall` 错失收益补 `label_version` 隔离 + Forced 剔除**——此前是归因/影子/校准/联合评估四处都有、唯独召回评估漏掉的一处。⑥`BatchBacktest` 补 Forced 单列剔除（`BatchHoldStat.Forced` + Notes 声明），与 `Run`/walkforward/recrecall/recattribution 对齐。⑦**人气榜排序禁用裸 `Order("rank")`**——`rank` 是 MySQL 8.0.2+ 保留字，GORM `Order(string)` 走 `clause.Column{Raw:true}` 原样拼接不加引号 → 生产 ERROR 1064，而 SQLite 不视其为保留字使单测永远绿；改 `clause.OrderByColumn` 由方言加引号，`TestPopularityDailyOrderSQLDialectSafe` 同时静态扫描源码与断言生成 SQL。⑧**提醒 CRUD 有界抢锁**（`alertCRUDLockWait=3s`）——后台评估持锁最长 110s/3min 且推送 flush 再占 15s，无界共锁会让交易时段「暂停/删除提醒」挂起两分钟，浏览器先断时把裸 `context canceled` 透传给用户；拿不到锁返回中文提示，不绕过锁故一致性设计不变。附带：`lookupReflections` 补 `id DESC` tiebreaker（同轮反思 available_from 相同，无 tiebreaker 时影子快照不可复现，同 `loadReflectionCandidates` 先例）；`withPromptExperimentState` 统一 defer 释放（手写 Lock/Unlock 夹 GORM Transaction，panic 被 gin Recovery 吞掉后锁永不释放，会冻结全部模板写入与实验操作）；`runMoodLhb` 历史日连续失败 `lhbSkipAfterFails=3` 次即跳过推进游标——pending 按交易日升序补，旧实现任一天恒定失败（该日确无榜 / `parseLhbRowStrict` 因缺必填字段整天作废）会把其后所有天连同**今天**永久卡死，target 当天不参与跳过（盘后逐步落库，未发布是正常态）。
   - **保留的既有设计（审查提出但确认不改）**：`SyncLhb` 机构榜「先删后插」即使本次空结果也删，是有意的原子替换语义（`TestSyncLhbAtomicReplace` 锁定）——上游 9201 对「尚未发布」与「确实为空」不可区分，风险由 `lhbOrgNotReadyCanFinalizeEmpty` 的时间守卫限制在历史日，当天 not-ready 一律整次失败重试绝不收口为空榜。**残余风险**：历史日上游瞬时回 9201 会抹掉该日真实机构数据且游标推进后不回填。
 
+- **散户体验第三批 B8~B9 防回归**（2026-07-28 第六十批，权威施工图 `docs/RETAIL_EXPERIENCE_PLAN.md` §5）：
+  ①**解禁字段口径**：东财 `RPT_LIFT_STAGE` 的 `FREE_SHARES` 是「解禁后已流通股数」**不是本次解禁量**，
+  本次解禁取 `CURRENT_FREE_SHARES`（缺失退 `ABLE_FREE_SHARES`，**绝不退回 `FREE_SHARES`**，实测差 6 倍）；
+  万股→股、万元→元、小数→百分数三类换算在 `datasource/emcorpaction.go` 收口，落库后全链路统一为股/元/百分数；
+  验算锚点 `CURRENT × 现价 == LIFT_MARKET_CAP`。②**A 股过滤不能只靠 `cnSecid`**：它对 '9' 开头一律放行
+  （沪 B 股 900xxx 会分红），分红报表又不返回 `SECURITY_TYPE_CODE`——必须走 `cnAShareCode` 代码段白名单；
+  北交所有意排除（行情源不覆盖）。③解禁唯一键含 `free_type`：同股同日多批不同类型解禁，
+  少这一维会把规模少算。④**B8 绝不静默改写用户账本**：只生成 `position_corp_adjusts` 建议，
+  用户确认才在事务+行锁内落 `position_trades{side:adjust}` 并改写 `positions`；建议幂等靠
+  `OnConflict{DoNothing}`——**已确认/已忽略的行不得被重复扫描拉回 pending**；确认前用行锁内实时持仓与
+  `qty_before/cost_before` 比对（不一致=期间加减过仓，折算基数失效，拒绝）；撤销要求该 adjust 仍是最后一笔
+  且账面精确等于折算结果，否则明确拒绝，**不做部分回滚**。⑤折算公式
+  `新数量=原数量×(1+(送+转)/10)`、`新成本=(原成本×原数量−每10股派息×原数量/10)/新数量`，
+  送转**不改** `total_buy_cost/total_buy_qty`（用户没再投钱），现金分红进 `realized_pnl`。
+  ⑥模拟盘自动折算按 `(user_id, corporate_action_id)` 唯一键幂等——**重跑不得重复发分红现金**。
+  ⑦**「查不到」绝不能说成「无解禁」**：`riskGateNoteFor(liftAvailable, liftCount)` 三态声明
+  （不可用 / 确实无解禁 / 有解禁），数据不可用时同步落 `unknowns[corp_events.lifts]`；
+  recbear 框架第 6 条同为三态措辞（`lift_unknown=true` 只能提示自行核查）。
+  ⑧**口径基数 10 必须在证据核验值域内**（`corp_events.ratio_base_shares=10`）——
+  核验侧对「10 股」这类带单位整数不跳过，值域缺 10 会把「每 10 股派 X 元」的正确复述判成幻觉。
+  ⑨job 时点 19:25 **必须早于** guard 盘后轮 19:35（守护轮消费本轮落库的解禁/除权数据），
+  晚于 19:05 财报轮；四类各自独立，只有全成功才推进 `corpaction_last_sync_day` 游标——
+  网络失败永远只是「这次没查到」，不是「今天没有公司行动」。
+
 ## 4. 未完成项与储备（按数据源可得性推进）
 
 > **2026-07-06 起后续开发按 `DEVELOPMENT_PLAN.md` 的批次（N1→N2→F1→T1→S1→F2→M1→M2→M3）推进**——它是面向执行的施工图（每批含方案锚点/依赖/验收）；分析依据与上游接口速查表在 `REFERENCE_ANALYSIS.md`。以下原有储备多数已并入该计划：
 
-- 散户体验剩余 B5~C13 按 `docs/RETAIL_EXPERIENCE_PLAN.md` 第二至第四批推进；不得把未实施项写成已完成。
+- 散户体验剩余项按 `docs/RETAIL_EXPERIENCE_PLAN.md` 推进：**第四批已按用户反馈重排为「持仓卖出决策提醒」
+  （D14~D18）**——原 C10~C13 顺延为第五批。不得把未实施项写成已完成。
 
 - 新闻情绪（→ 批次 N1/N2，财联社/东财源已调研齐）、财务详情/财报日历（→ 批次 F1/F2，东财 datacenter 网关免 Tushare）、回测模块（→ 批次 M2 时光机）。
 - 多数据源系统级切换管理端（`data_source_configs` 接读写）。
@@ -286,6 +311,25 @@
   - ⑥**六主题 + 移动端目验**：持仓页两 tab、模拟盘曲线在至少 1 亮 1 暗主题下无硬编码色；375px 下曲线降高、流水表可横滚、加减仓弹窗表单为上标签布局。
   - ⑦**龙虎榜缺口重试**：制造一天历史缺口（或观察真实失败日）后确认 `options` 表出现 `mood_lhb_gaps_v1` 且值为日期数组，日志每 30 分钟出现「龙虎榜历史缺口 … 仍未补齐」，上游恢复后清空并出现「已补齐」。
   - ⑧**SSE 墙钟**：真实 LLM 流式调用正常返回 usage；若上游为中转网关，观察是否出现调用挂满 10 分钟的情况（应消失）。
+
+- **散户体验第三批 B8~B9 欠部署验收（2026-07-28 第六十批）**：
+  - ①**19:25 job 首轮实测**：观察日志中三类同步的入库行数与 `options.corpaction_last_sync_day`；
+    确认四张报表都真的拉到数据（分红近 90 天公告窗口、解禁与申购未来 60 天），且顺序在 19:05 之后、19:35 之前。
+  - ②**真实除权日持仓提示（需等到手上有股票除权当天）**：持仓页顶部出现「除权除息待确认」，
+    折算前后数量/成本与券商 App 对账一致；确认后流水多一笔 `除权折算`；撤销后账面精确回滚。
+    **重点核对送转股：确认前盈亏是失真的（10 转 10 会显示 −50%），确认后恢复正常**。
+  - ③**模拟盘自动折算**：模拟盘持有的股票除权后，数量/成本自动变化、现金增加分红、流水出现 adjust 笔；
+    重启服务后确认不重复发钱（审计表只有一行）。
+  - ④**事件日历**：今日待办页事件日历卡出现未来 30 天事件，持仓/自选标签正确、日期升序、
+    打新条目带申购代码；无事件时文案是「没有相关事件」而不是错误态。
+  - ⑤**个股解禁/分红块**：找一只近期有解禁的股票核对股数/市值/占比与东财页面一致；
+    找一只无解禁的确认显示「数据已同步，非缺失」；**制造一次同步失败（或未同步的新库）
+    确认显示「数据本次不可用」而不是「无解禁」**。
+  - ⑥**解禁/除权/打新推送**：交易日 19:35 后确认三类提醒到达，且同一事件不重复推送（跨天也不重复）。
+  - ⑦**AI 联动**：对有解禁的股票做一次个股分析，确认 risk_gate 出现 `lift_release` 条目、
+    结论里的解禁数字不被标为未核验；对无解禁的确认声明是「已接入，未来 180 天内无解禁安排」。
+  - ⑧**6 主题 + 移动端目验**：Today 事件日历卡、StockDetail 解禁/分红块、Positions 除权确认卡，
+    至少 1 亮 1 暗主题 + 375px/1440px。
 
 - 推荐页/设置页新 UI 浏览器目验（筛选表单交互、真实生成一次、候选池全景、信任徽章 tooltip、AI 复核开关，亮/暗主题各一）。
 - 指数 ETF 页与各 AI 页新增信任徽章/透明面板的浏览器目验。

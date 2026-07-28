@@ -76,7 +76,7 @@ func TestComputeRiskGate(t *testing.T) {
 // TestRiskGateTexts 原生与 JSON 反序列化两种快照形态都能提取提示文本（值域输入）。
 func TestRiskGateTexts(t *testing.T) {
 	flags := []riskFlag{{Level: "warn", Code: "limit_board", Text: "涨幅 10.02% 且振幅 0.00%"}}
-	snap := map[string]any{"risk_gate": riskGateBlock(flags)}
+	snap := map[string]any{"risk_gate": riskGateBlock(flags, true, 0)}
 	if texts := riskGateTexts(snap); len(texts) != 1 || texts[0] != flags[0].Text {
 		t.Fatalf("原生形态提取失败: %v", texts)
 	}
@@ -91,7 +91,7 @@ func TestRiskGateTexts(t *testing.T) {
 
 // TestParseRiskFlagsFromSnapshot 落库快照 JSON → 前端 risk_flags。
 func TestParseRiskFlagsFromSnapshot(t *testing.T) {
-	snap := map[string]any{"risk_gate": riskGateBlock([]riskFlag{{Level: "block", Code: "st", Text: "x"}})}
+	snap := map[string]any{"risk_gate": riskGateBlock([]riskFlag{{Level: "block", Code: "st", Text: "x"}}, true, 0)}
 	b, _ := json.Marshal(snap)
 	flags := parseRiskFlagsFromSnapshot(string(b))
 	if len(flags) != 1 || flags[0].Code != "st" || flags[0].Level != "block" {

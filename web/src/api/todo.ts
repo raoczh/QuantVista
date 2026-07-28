@@ -1,6 +1,14 @@
 import { request } from './client'
 
-export type TodoKind = 'alert' | 'rec_review' | 'position_short' | 'position_long' | 'thesis_due' | 'stop_loss'
+export type TodoKind =
+  | 'alert'
+  | 'rec_review'
+  | 'position_short'
+  | 'position_long'
+  | 'thesis_due'
+  | 'stop_loss'
+  | 'corp_adjust' // B8 除权除息待确认折算（不确认则持仓页盈亏是错的）
+  | 'ipo' // B9 今日可申购新股/可转债（不依赖持仓）
 
 export interface TodoItem {
   kind: TodoKind
@@ -11,7 +19,7 @@ export interface TodoItem {
   title: string
   detail: string
   ref_id: number
-  ref_type: string // alerts / recommendations / positions
+  ref_type: string // alerts / recommendations / positions / thesis / ipo
   time: string | null
 }
 

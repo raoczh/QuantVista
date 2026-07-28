@@ -5,14 +5,17 @@ import "time"
 // 守护事件类型（GuardEvent.Kind）：盘中=持仓止损/止盈触达、持仓异动、自选异动；
 // 盘后=持仓公告/龙虎榜/财报披露临近/业绩预告（每日 19:35 轮，数据来自本地缓存表零上游成本）。
 const (
-	GuardKindStopLoss    = "stop_loss"    // 持仓现价触及计划止损
-	GuardKindTakeProfit  = "take_profit"  // 持仓现价触及计划止盈
-	GuardKindPosMove     = "pos_move"     // 持仓当日异动（|涨跌幅| ≥ 阈值 或 涨跌停）
-	GuardKindWatchMove   = "watch_move"   // 守护范围内自选当日异动（|涨跌幅| ≥ 阈值 或 涨跌停）
-	GuardKindPosNotice   = "pos_notice"   // 持仓当日新公告（盘后）
-	GuardKindPosLhb      = "pos_lhb"      // 持仓登龙虎榜（盘后）
+	GuardKindStopLoss    = "stop_loss"     // 持仓现价触及计划止损
+	GuardKindTakeProfit  = "take_profit"   // 持仓现价触及计划止盈
+	GuardKindPosMove     = "pos_move"      // 持仓当日异动（|涨跌幅| ≥ 阈值 或 涨跌停）
+	GuardKindWatchMove   = "watch_move"    // 守护范围内自选当日异动（|涨跌幅| ≥ 阈值 或 涨跌停）
+	GuardKindPosNotice   = "pos_notice"    // 持仓当日新公告（盘后）
+	GuardKindPosLhb      = "pos_lhb"       // 持仓登龙虎榜（盘后）
 	GuardKindPosEarnDate = "pos_earn_date" // 持仓财报披露临近（盘后，自动，无需手工配 AlertRule）
 	GuardKindPosEarnFcst = "pos_earn_fcst" // 持仓新业绩预告（盘后）
+	GuardKindPosLift     = "pos_lift"      // 持仓限售解禁临近（盘后，提前 10 天；B9）
+	GuardKindPosExDiv    = "pos_ex_div"    // 持仓除权除息日临近（盘后，提前 3 天；B9）
+	GuardKindIpoToday    = "ipo_today"     // 今日可申购新股/可转债（盘后，**不依赖持仓**；B9）
 )
 
 // GuardEvent 自选/持仓异动守护推送的去重台账（阶段 D）。
@@ -31,8 +34,8 @@ type GuardEvent struct {
 
 	Market  string  `gorm:"size:8" json:"market"`
 	Name    string  `gorm:"size:64" json:"name"`
-	Price   float64 `gorm:"type:decimal(20,4)" json:"price"`   // 触发时现价
-	Message string  `gorm:"size:256" json:"message"`           // 推送正文（人话说明）
+	Price   float64 `gorm:"type:decimal(20,4)" json:"price"` // 触发时现价
+	Message string  `gorm:"size:256" json:"message"`         // 推送正文（人话说明）
 
 	CreatedAt time.Time `json:"created_at"`
 }

@@ -536,6 +536,11 @@ func stockFieldHints(snap map[string]any) *snapshotHints {
 	if _, ok := snap["org_view"]; ok {
 		h.source["org_view."] = "eastmoney_datacenter"
 	}
+	// B9：解禁/分红同样来自东财 datacenter RPT_* 报表（每日 19:25 同步），
+	// 证据链回指要能说清「这个解禁数字是谁给的」。
+	if _, ok := snap["corp_events"]; ok {
+		h.source["corp_events."] = "eastmoney_datacenter"
+	}
 	if len(h.asOf) == 0 && len(h.source) == 0 {
 		return nil
 	}

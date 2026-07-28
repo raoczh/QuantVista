@@ -464,11 +464,14 @@ func TestGoldenNewsSourceBlacklistNoise(t *testing.T) {
 // 常态）时 window_meta 仍声明边界与 unavailable（「确无」≠「没查」）。
 func TestGoldenColdDataFixtures(t *testing.T) {
 	setEvidenceRefsFlag(t, true)
-	// known-answer：行情外全维度缺席（估值/日线/财务/机构观点长期未覆盖的冷门标的）。
+	// known-answer：行情外全维度缺席（估值/日线/财务/机构观点/解禁长期未覆盖的冷门标的）。
+	// B9 起解禁进快照：**快照里没有 corp_events 段 = 解禁数据不可用**，同样是真缺口——
+	// 不显式声明的话模型会把「没看到解禁段」读成「该股无解禁风险」。
 	snap := map[string]any{"quote": map[string]any{"price": 3.21}}
 	appendStockSnapshotUnknowns(snap, "cn", "600000", true)
 	unk := snapshotUnknownItems(snap)
-	want := map[string]bool{"valuation": true, "technicals": true, "finance": true, "org_view": true}
+	want := map[string]bool{"valuation": true, "technicals": true, "finance": true,
+		"org_view": true, "corp_events.lifts": true}
 	if len(unk) != len(want) {
 		t.Fatalf("全冷数据应恰 %d 项 unknowns: %+v", len(want), unk)
 	}

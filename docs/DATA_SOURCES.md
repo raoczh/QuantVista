@@ -46,6 +46,29 @@
   m5 用于盘中因子盘后同步。两者都无成交额列；m1 均价线按 `Σ(close×volume)/Σvolume` 估算并显式标注。
 - 已接入为行情链路第二源；日线腾讯接口字段不稳，未用。
 
+### 2.4b 东财 datacenter RPT_* 报表（免 token 统一网关）
+
+- 入口：`https://datacenter-web.eastmoney.com/api/data/v1/get`，免 token，一个客户端解锁全部 RPT_* 报表。
+- **纪律：所有 RPT_* 查询必须走 `datasource/emdatacenter.go` 的 `DataCenterQuery`**（包级令牌桶 QPS≤2 +
+  翻页 + 退避重试），不得另起 HTTP 路径。
+- 已接入报表：业绩预告/快报、预约披露、龙虎榜主表与机构统计、股东户数、研报评级/机构调研，
+  以及 B8~B9 的四张公司行动报表（2026-07-28 逐字段实测）：
+
+| 报表 | 用途 | 关键字段与**实测口径** |
+| --- | --- | --- |
+| `RPT_SHAREBONUS_DET` | 分红送转 / 除权除息 / 股息率 | `BONUS_RATIO`(每10股送) `IT_RATIO`(每10股转) `PRETAX_BONUS_RMB`(每10股派息税前,元) `EQUITY_RECORD_DATE` `EX_DIVIDEND_DATE` `REPORT_DATE` `ASSIGN_PROGRESS` `IMPL_PLAN_PROFILE` `DIVIDENT_RATIO`(**小数**,落库 ×100 转百分比)。**不返回 `SECURITY_TYPE_CODE`**，须用 A 股代码段白名单过滤（B 股 900xxx 会分红且被 `cnSecid` 放行） |
+| `RPT_LIFT_STAGE` | 限售解禁 | `FREE_DATE` `CURRENT_FREE_SHARES`(**本次解禁量,万股**) `LIFT_MARKET_CAP`(**万元**) `FREE_SHARES_TYPE` `FREE_RATIO`/`TOTAL_RATIO`(**小数**) `SECURITY_TYPE_CODE`(058=股票,须过滤 060 可转债) |
+| `RPTA_APP_IPOAPPLY` | 新股申购 | `APPLY_CODE`(与股票代码可不同) `APPLY_DATE` `ONLINE_APPLY_UPPER`(股) `ISSUE_PRICE`(**未定价为 null**) `BALLOT_PAY_DATE` `BALLOT_NUM_DATE` `LISTING_DATE` `MARKET`(板块) |
+| `RPT_BOND_CB_LIST` | 可转债申购 | `SECURITY_CODE`(转债) `CORRECODE`(**申购代码**) `PUBLIC_START_DATE`(**网上申购日**) `CONVERT_STOCK_CODE`/`SECURITY_SHORT_NAME`(正股) `RATING` `ISSUE_PRICE` `ACTUAL_ISSUE_SCALE`(亿元) |
+
+> **解禁字段的坑（必读）**：`FREE_SHARES` **不是**本次解禁量，而是「解禁后的已流通股数」；
+> 本次真正解禁的是 `CURRENT_FREE_SHARES`（≈`ABLE_FREE_SHARES`）。实测 600675：
+> CURRENT=21276.6 万股 vs FREE_SHARES=132074.5 万股，差 6 倍。
+> 验算锚点：`CURRENT_FREE_SHARES × NEW(现价) == LIFT_MARKET_CAP`；
+> `FREE_RATIO == CURRENT/(FREE_SHARES−CURRENT)`（占解禁前流通股）；
+> `TOTAL_RATIO == CURRENT/(FREE_SHARES+NON_FREE_SHARES)`（占总股本）。
+> 单位换算（万股→股、万元→元、小数→百分数）在 `datasource/emcorpaction.go` 收口，落库后全链路统一。
+
 ### 2.5 东财负载节点（重要技巧）
 
 - 东财把接口分流到 `{1..99}.push2.eastmoney.com` / `{1..99}.push2his.eastmoney.com` 负载节点（来自 akshare 实现）。

@@ -129,6 +129,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			markets.GET("/:market/stocks/:symbol/lhb", moodCtl.StockLhb)
 			// P3a：机构观点（研报评级/机构调研，按需拉取+缓存）
 			markets.GET("/:market/stocks/:symbol/orgview", orgViewCtl.StockOrgView)
+			// B9：个股解禁 / 分红送转（每日 19:25 job 同步的公开信息，无用户隔离）
+			markets.GET("/:market/stocks/:symbol/corp-events", controller.StockCorpEvents)
 			// M3c：行业/概念板块热力图 + 板块详情（指数日线 + 成分股 + 估值）
 			markets.GET("/:market/boards", boardCtl.Heatmap)
 			markets.GET("/:market/boards/:code", boardCtl.Detail)
@@ -201,6 +203,10 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				positions.POST("/:id/close", positionCtl.Close)
 				positions.GET("/:id/trades", positionCtl.Trades)    // B5 流水明细
 				positions.POST("/:id/trades", positionCtl.AddTrade) // B5 加仓/减仓
+				// B8 除权除息调整建议：列表 + confirm/revert/dismiss 三动作
+				//（静态段 corp-adjusts 与 :id 同层，gin 通配约束下动作并入 :action 分支）
+				positions.GET("/corp-adjusts", positionCtl.CorpAdjusts)
+				positions.POST("/corp-adjusts/:id/:action", positionCtl.CorpAdjustAction)
 			}
 
 			// AI 分析中心（按用户隔离；发起分析限流，防止刷爆 LLM 配额与费用）
@@ -247,6 +253,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 
 			// 今日待办/待复盘（聚合命中提醒 + 推荐/持仓复盘信号 + 逻辑卡到期）
 			authed.GET("/todos", todoCtl.List)
+			// B9 事件日历：未来 N 天与我相关的解禁/除权/财报 + 全市场打新
+			authed.GET("/events/calendar", controller.Calendar)
 
 			// 收盘日报（今日复盘 + 明日推荐；后台任务自动生成，手动重生成限流防连击烧 token）
 			reports := authed.Group("/daily-reports")

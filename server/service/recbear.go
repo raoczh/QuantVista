@@ -32,7 +32,9 @@ type pickBear struct {
 }
 
 // bearSystemPrompt 反方研究员系统提示：独立空头视角，注入 A 股 bear 论据检查框架。
-// 数据诚实纪律与主调用同源——解禁/减持等本系统未提供的数据只能提示核查，禁止虚构。
+// 数据诚实纪律与主调用同源——减持等本系统未提供的数据只能提示核查，禁止虚构。
+// **解禁自 B9 起已接入**（lift_* 字段）：有数据时必须引用具体数字，
+// lift_unknown=true 时回落到「只能提示自行核查」，绝不把「查不到」写成「无解禁」。
 const bearSystemPrompt = `你是一名独立的空头研究员（反方研究员），任务是对另一位研究员建议买入的每只 A 股标的，构建**最强反方论证（bear case）**。你不给买入建议，只找否决理由。
 
 A 股空头论据检查框架（逐项对照名单数据检查，命中才写）：
@@ -41,7 +43,7 @@ A 股空头论据检查框架（逐项对照名单数据检查，命中才写）
 3. 估值风险：pe_ttm/pb 明显偏高或为负（亏损股）；长线标的财务恶化（fin 中增速/ROE 下滑）；
 4. T+1 锁仓风险：当日买入无法当日卖出，若尾盘拉升买入次日低开即被动锁仓（tail30_chg 大幅拉升 + close_vs_vwap 偏离过高时要点名）；
 5. 技术面背离：MACD 顶背离迹象、RSI 超买（rsi_14≥70）、乖离过大（bias_20 偏高）、跌破关键均线；
-6. 解禁与减持：本系统未提供解禁/减持数据——如判断该风险值得核查，只能提示「需自行核查解禁与股东减持公告」，严禁虚构具体解禁日期、数量或股东行为。
+6. 限售解禁：data.lift_date/lift_days/lift_ratio/lift_shares_w/lift_cap_yi 为已核实的解禁数据（占流通股比例越高抛压越大，10% 以上须重点提示）——**有这些字段时必须引用其中的具体数字论证**，不得含糊其辞。若 data.lift_unknown=true，说明本次解禁数据不可用（**不等于无解禁**），只能提示「需自行核查解禁公告」，严禁虚构具体解禁日期与数量，也严禁写成「无解禁风险」；无 lift_* 字段且 lift_unknown 不为真，表示未来 60 天内确无解禁安排，可据此排除该风险。股东减持数据本系统未提供，只能提示自行核查减持公告，严禁虚构股东行为。
 
 铁律：只依据给出的数据论证，引用具体字段与数值；数据不足处如实说明，不得用记忆中的公司印象编造论据。severity 分级：high=反方证据足以否决买入（若采纳应降为观察）；med=风险显著需减仓或收紧止损；low=常规风险提示。
 只输出 JSON：{"bears":[{"symbol":"...","bear_case":"最强反方论证（引用数据）","severity":"high|med|low"}]}，覆盖全部给出的标的，不要任何解释或代码块标记。`
@@ -59,15 +61,27 @@ func (s *RecommendationService) bearReview(ctx context.Context, userID int64, cf
 		}
 		c := pool[p.Symbol]
 		buySet[p.Symbol] = true
+		data := map[string]any{
+			"price": c.Price, "change_pct": c.ChangePct, "turnover_rate": c.TurnoverRate,
+			"volume_ratio": c.VolumeRatio, "pe_ttm": c.PETTM, "pb": c.PB,
+			"float_cap_yi": round2(c.FloatCap / 1e8), "pop_rank": c.PopRank,
+			"factors": c.Factors, "fin": c.Fin,
+		}
+		// B9 解禁：有数据给数字、不可用给 unknown 标志——两者都得让模型看见，
+		// 静默留空会被读成「无解禁」（这正是框架第 6 条要防的）。
+		if c.LiftUnknown {
+			data["lift_unknown"] = true
+		} else if c.LiftDate != "" {
+			data["lift_date"] = c.LiftDate
+			data["lift_days"] = c.LiftDays
+			data["lift_ratio"] = c.LiftRatio
+			data["lift_shares_w"] = c.LiftSharesW
+			data["lift_cap_yi"] = c.LiftCapYi
+		}
 		rows = append(rows, map[string]any{
 			"symbol": p.Symbol, "name": c.Name, "action": p.Action, "confidence": int(p.Confidence),
 			"bull_reason": p.Reason,
-			"data": map[string]any{
-				"price": c.Price, "change_pct": c.ChangePct, "turnover_rate": c.TurnoverRate,
-				"volume_ratio": c.VolumeRatio, "pe_ttm": c.PETTM, "pb": c.PB,
-				"float_cap_yi": round2(c.FloatCap / 1e8), "pop_rank": c.PopRank,
-				"factors": c.Factors, "fin": c.Fin,
-			},
+			"data":        data,
 		})
 	}
 	if len(rows) == 0 {

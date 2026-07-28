@@ -76,6 +76,11 @@ func AllModels() []any {
 		&LLMModuleRoute{},
 		&StockUniverseDaily{},
 		&FactorSnapshotDaily{},
+		&CorporateAction{},
+		&RestrictedRelease{},
+		&IpoSubscription{},
+		&PositionCorpAdjust{},
+		&PaperCorpAdjust{},
 	}
 }
 
