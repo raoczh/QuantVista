@@ -31,15 +31,15 @@ const (
 
 // WatchlistItem 自选股条目。唯一约束 user_id+watchlist_id+symbol+market，避免同组重复添加。
 type WatchlistItem struct {
-	ID          int64     `gorm:"primaryKey" json:"id"`
-	UserID      int64     `gorm:"index;index:idx_wli_uniq,unique" json:"user_id"`
-	WatchlistID int64     `gorm:"index;index:idx_wli_uniq,unique" json:"watchlist_id"`
-	Symbol      string    `gorm:"size:16;index:idx_wli_uniq,unique" json:"symbol"`
-	Market      string    `gorm:"size:8;index:idx_wli_uniq,unique" json:"market"`
-	Name        string    `gorm:"size:64" json:"name"`
-	Note        string    `gorm:"size:512" json:"note"`           // 备注
-	FocusReason string    `gorm:"size:512" json:"focus_reason"`   // 关注原因
-	IsPinned    bool      `gorm:"default:false" json:"is_pinned"` // 重点关注
+	ID          int64  `gorm:"primaryKey" json:"id"`
+	UserID      int64  `gorm:"index;index:idx_wli_uniq,unique" json:"user_id"`
+	WatchlistID int64  `gorm:"index;index:idx_wli_uniq,unique" json:"watchlist_id"`
+	Symbol      string `gorm:"size:16;index:idx_wli_uniq,unique" json:"symbol"`
+	Market      string `gorm:"size:8;index:idx_wli_uniq,unique" json:"market"`
+	Name        string `gorm:"size:64" json:"name"`
+	Note        string `gorm:"size:512" json:"note"`           // 备注
+	FocusReason string `gorm:"size:512" json:"focus_reason"`   // 关注原因
+	IsPinned    bool   `gorm:"default:false" json:"is_pinned"` // 重点关注
 
 	ResearchStage string     `gorm:"size:16;index:idx_wli_stage" json:"research_stage"` // 机会池漏斗阶段
 	PassedReason  string     `gorm:"size:255" json:"passed_reason"`                     // 放弃原因（stage=passed）
@@ -97,8 +97,97 @@ type Position struct {
 	AiVerdict     string `gorm:"size:16" json:"ai_verdict"`      // right/wrong/mixed/unused 当时 AI 判断对错
 	LessonLearned string `gorm:"size:512" json:"lesson_learned"` // 下次策略调整点
 
+	// ---- 账本汇总（B5 分批加/减仓；由 PositionTrade 流水在同一事务内回写）----
+	// RealizedPnl 累计已实现盈亏（元，已扣该部分的买入分摊费税与卖出费税）。
+	// 持仓中也可能非 0（已部分兑现），组合总览据此把「已落袋」与「浮盈」分开统计。
+	RealizedPnl float64 `gorm:"type:decimal(20,4)" json:"realized_pnl"`
+	// TotalBuyCost 累计买入总成本（元，含全部买入费税）；TotalSellNet 累计卖出净收入
+	//（元，已扣全部卖出费税）；TotalBuyQty 累计买入股数。三者只增不减，是「已平仓收益率」
+	// 与「一共买过多少」的来源——BuyPrice/Quantity 表达的是**当前剩余**持仓，
+	// 全部卖出后 Quantity 归 0，无法还原总账。
+	// TotalBuyCost=0 表示该持仓尚未补建流水（旧数据），消费方回退旧算式，见 computeView。
+	TotalBuyCost float64 `gorm:"type:decimal(20,4)" json:"total_buy_cost"`
+	TotalSellNet float64 `gorm:"type:decimal(20,4)" json:"total_sell_net"`
+	TotalBuyQty  float64 `gorm:"type:decimal(20,4)" json:"total_buy_qty"`
+
 	// 来源推荐血缘（一键建仓时写入；0=手动建仓无来源）。供「AI 推荐 vs 实际买入」对比。
 	RecommendationID int64 `gorm:"index" json:"recommendation_id"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// 持仓流水方向。
+const (
+	PositionTradeBuy  = "buy"
+	PositionTradeSell = "sell"
+)
+
+// PositionTrade 持仓分批加/减仓流水（B5）。
+//
+// **口径铁律**：`Position.BuyPrice` 恒为当前持仓的加权平均成本、`Position.Quantity`
+// 恒为当前持仓数量——全部既有消费方（tracking 的 actual_position 标签、todo 止损、
+// guard 事件、组合总览）读法零改动。本表是明细来源，汇总值在同一事务内回写 Position。
+//
+// 单位：price=元/股，quantity=股，fee/tax=元，trade_date=YYYY-MM-DD。
+type PositionTrade struct {
+	ID         int64 `gorm:"primaryKey" json:"id"`
+	UserID     int64 `gorm:"index;index:idx_ptrade_pos" json:"user_id"`
+	PositionID int64 `gorm:"index:idx_ptrade_pos" json:"position_id"`
+
+	Side     string  `gorm:"size:8" json:"side"` // buy=加仓 / sell=减仓
+	Price    float64 `gorm:"type:decimal(20,4)" json:"price"`
+	Quantity float64 `gorm:"type:decimal(20,4)" json:"quantity"`
+	Fee      float64 `gorm:"type:decimal(20,4)" json:"fee"`
+	Tax      float64 `gorm:"type:decimal(20,4)" json:"tax"`
+
+	TradeDate string `gorm:"size:10" json:"trade_date"`
+	Note      string `gorm:"size:255" json:"note"`
+
+	// RealizedPnl 该笔卖出结转的已实现盈亏（元）。买入笔恒 0。
+	RealizedPnl float64 `gorm:"type:decimal(20,4)" json:"realized_pnl"`
+	// AvgCostAfter 该笔之后的加权平均成本、QuantityAfter 该笔之后的持仓数量。
+	// 落库快照供流水明细还原当时账面，避免前端二次推算与服务端算法漂移。
+	AvgCostAfter  float64 `gorm:"type:decimal(20,4)" json:"avg_cost_after"`
+	QuantityAfter float64 `gorm:"type:decimal(20,4)" json:"quantity_after"`
+
+	// Backfilled 该笔是否为旧持仓惰性补建的等价首笔买入（非用户真实录入的加仓动作）。
+	Backfilled bool `gorm:"default:false" json:"backfilled"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// 资产快照账户类型（B7）。
+const (
+	SnapshotKindReal  = "real"  // 真实持仓账本
+	SnapshotKindPaper = "paper" // 模拟盘
+)
+
+// PortfolioSnapshot 每交易日盘后资产快照（B7 资产曲线）。
+// 唯一键 (user_id, kind, trade_date)，job 幂等 upsert。
+//
+// **fail-closed**：市值一律走 FreshQuotesFor，stale/取不到的标的不用旧价冒充——
+// 该用户当日快照标 Partial 并记缺口数与说明，曲线上如实呈现「当日部分标的无有效价」。
+// 单位：金额=元。
+type PortfolioSnapshot struct {
+	ID        int64  `gorm:"primaryKey" json:"id"`
+	UserID    int64  `gorm:"index;index:idx_psnap_uniq,unique" json:"user_id"`
+	Kind      string `gorm:"size:8;index:idx_psnap_uniq,unique" json:"kind"`        // real / paper
+	TradeDate string `gorm:"size:10;index:idx_psnap_uniq,unique" json:"trade_date"` // YYYY-MM-DD
+
+	MarketValue   float64 `gorm:"type:decimal(20,4)" json:"market_value"`   // 持仓市值（已定价部分）
+	Cost          float64 `gorm:"type:decimal(20,4)" json:"cost"`           // 持仓成本（已定价部分）
+	UnrealizedPnl float64 `gorm:"type:decimal(20,4)" json:"unrealized_pnl"` // 浮动盈亏
+	RealizedCum   float64 `gorm:"type:decimal(20,4)" json:"realized_cum"`   // 累计已实现盈亏
+	Cash          float64 `gorm:"type:decimal(20,4)" json:"cash"`           // 可用现金（仅 paper）
+	PositionCount int     `json:"position_count"`                           // 持仓标的笔数
+
+	// Partial 当日存在无有效行情的持仓（未计入市值/浮盈）；MissingCount 为其笔数，
+	// Note 为口径说明。曲线消费方必须据此标注，不得把 partial 点当完整净值。
+	Partial      bool   `gorm:"default:false" json:"partial"`
+	MissingCount int    `json:"missing_count"`
+	Note         string `gorm:"size:255" json:"note"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`

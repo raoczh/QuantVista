@@ -31,6 +31,17 @@ export function getApiErrorCode(error: unknown): string | undefined {
   return undefined
 }
 
+/**
+ * 请求是否因 AbortController 主动取消而失败（切标的/组件卸载时的正常路径）。
+ * 取消不是故障：页面据此跳过错误提示与状态回填，避免用户看到「加载失败」的假报错。
+ */
+export function isAbortError(error: unknown): boolean {
+  if (axios.isCancel(error)) return true
+  if (error instanceof DOMException && error.name === 'AbortError') return true
+  const code = getApiErrorCode(error)
+  return code === 'ERR_CANCELED'
+}
+
 const http: AxiosInstance = axios.create({
   baseURL: '/api',
   timeout: 20000,

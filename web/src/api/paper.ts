@@ -1,4 +1,5 @@
 import { request } from './client'
+import type { PortfolioCurve } from './position'
 
 export interface PaperAccount {
   id: number
@@ -76,4 +77,9 @@ export function getPaperTrades(limit = 50) {
 
 export function resetPaper(initialCash?: number) {
   return request<PaperAccount>({ url: '/paper/reset', method: 'post', data: { initial_cash: initialCash } })
+}
+
+// B7 模拟盘资产曲线（读每交易日 16:20 落库的快照；partial 点表示当日有标的无有效行情）。
+export function getPaperCurve(days = 90, signal?: AbortSignal) {
+  return request<PortfolioCurve>({ url: '/paper/curve', method: 'get', params: { days }, signal })
 }

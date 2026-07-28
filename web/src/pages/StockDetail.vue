@@ -24,6 +24,7 @@ import {
   type LhbRecord,
 } from '@/api/market'
 import { getNews, newsSourceLabel, sentimentTag, type NewsItem } from '@/api/news'
+import { isAbortError } from '@/api/client'
 import { getAnnouncements, type AnnouncementItem } from '@/api/announcement'
 import { getStockFinance, type StockFinance } from '@/api/finance'
 import { getStockOrgView, type StockOrgView } from '@/api/orgview'
@@ -90,10 +91,31 @@ let ffChart: echarts.ECharts | null = null
 // 切换标的的竞态守卫：每次 load 领一个自增序号，所有 best-effort 回填落地前比对，
 // 旧标的的迟到响应不再覆盖新标的数据。
 let loadSeq = 0
+// 分时请求的中止器：切标的/卸载时 abort，在途请求不再挂着连接等超时。
+let minuteAbort: AbortController | null = null
+
+// disposeCharts 销毁全部 ECharts 实例。切标的时容器会随 v-if/v-show 变化重建，
+// 旧实例继续绑在被移除的 DOM 上（renderChipCharts 等在数据为 null 时直接 return
+// 不会 dispose），既泄漏又会让 onResize 对着孤儿实例 resize。
+function disposeCharts() {
+  chart?.dispose()
+  chart = null
+  chipChart?.dispose()
+  chipChart = null
+  chipTrendChart?.dispose()
+  chipTrendChart = null
+  finChart?.dispose()
+  finChart = null
+  ffChart?.dispose()
+  ffChart = null
+}
 
 async function load(silent = false) {
   if (!symbol.value) return
   const mySeq = ++loadSeq
+  minuteAbort?.abort()
+  const myMinuteAbort = new AbortController()
+  minuteAbort = myMinuteAbort
   if (!silent) {
     loading.value = true
     loadError.value = ''
@@ -108,14 +130,15 @@ async function load(silent = false) {
       // 时候。首次/手动加载仍然显示。
       if (!silent) minuteLoading.value = true
       minuteError.value = ''
-      getMinuteLine(market.value, symbol.value)
+      getMinuteLine(market.value, symbol.value, myMinuteAbort.signal)
         .then((r) => {
           if (mySeq !== loadSeq) return
           minute.value = r
           nextTick(() => renderChart())
         })
         .catch((e) => {
-          if (mySeq !== loadSeq) return
+          // 主动取消属正常路径（切标的/卸载），不当失败展示。
+          if (mySeq !== loadSeq || isAbortError(e)) return
           minute.value = null
           minuteError.value = (e as Error).message
           nextTick(() => renderChart())
@@ -226,7 +249,7 @@ async function load(silent = false) {
     await nextTick()
     renderChart()
   } catch (e) {
-    if (!silent && mySeq === loadSeq) {
+    if (!silent && mySeq === loadSeq && !isAbortError(e)) {
       loadError.value = (e as Error).message
       quote.value = null
     }
@@ -685,7 +708,11 @@ function fmtSignedPct(v: number) {
   return (v > 0 ? '+' : '') + v.toFixed(1)
 }
 
-watch(isDark, () => {
+// 主题变化必须整套重绘：6 套主题里明暗只是其一，同为浅色的樱桃红↔天青蓝换主题时
+// isDark 不变而 primaryColor/errorColor/dividerColor 全变——只监听 isDark 会让图表
+// 一直用上一套主题的色板（§4.1 图表主题感知硬约束）。vars 是 useThemeVars 的 computed，
+// 主题 override 换对象即触发。
+watch([isDark, vars], () => {
   renderChart()
   renderChipCharts()
   renderFinanceChart()
@@ -696,11 +723,23 @@ watch(chartMode, async () => {
   renderChart()
 })
 // 同页跳转到另一只个股（如从对比/搜索进来）时整页重载。
+// 顺序要点：①先让 loadSeq 失效并 abort 在途请求——旧标的的迟到响应绝不能落到新标的上；
+// ②清空**全部**行情态（含 quote/bars，此前漏清会让新标的加载期间显示旧标的的价格与
+// K 线，且 quote 非空使整个详情区照常渲染，用户看到的是另一只股票的数据）；
+// ③dispose 图表实例，避免容器随 v-if 重建后旧实例孤儿化。
 watch([market, symbol], () => {
+  loadSeq++
+  minuteAbort?.abort()
+  minuteAbort = null
+  loading.value = false
+  loadError.value = ''
+  quote.value = null
+  bars.value = []
   valuation.value = null
   score.value = null
   minute.value = null
   minuteError.value = ''
+  minuteLoading.value = false
   chartMode.value = market.value === 'cn' ? 'minute' : 'daily'
   indicators.value = null
   chips.value = null
@@ -710,6 +749,7 @@ watch([market, symbol], () => {
   orgview.value = null
   news.value = []
   announcements.value = []
+  disposeCharts()
   load()
 })
 
@@ -719,16 +759,10 @@ onMounted(() => {
 })
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
-  chart?.dispose()
-  chart = null
-  chipChart?.dispose()
-  chipChart = null
-  chipTrendChart?.dispose()
-  chipTrendChart = null
-  finChart?.dispose()
-  finChart = null
-  ffChart?.dispose()
-  ffChart = null
+  loadSeq++
+  minuteAbort?.abort()
+  minuteAbort = null
+  disposeCharts()
 })
 function onResize() {
   chart?.resize()

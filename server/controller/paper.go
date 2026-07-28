@@ -4,6 +4,7 @@ import (
 	"strconv"
 
 	"quantvista/common"
+	"quantvista/model"
 	"quantvista/service"
 
 	"github.com/gin-gonic/gin"
@@ -71,4 +72,20 @@ func (pc *PaperController) Reset(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, acc)
+}
+
+// Curve GET /api/paper/curve?days= —— 模拟盘资产曲线（B7，读快照表）。
+func (pc *PaperController) Curve(c *gin.Context) {
+	days := 0
+	if raw := c.Query("days"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			days = n
+		}
+	}
+	out, err := service.PortfolioCurve(currentUserID(c), model.SnapshotKindPaper, days)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, out)
 }

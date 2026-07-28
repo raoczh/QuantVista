@@ -137,10 +137,10 @@ func TestSimulateLabelHold_MarketAxis(t *testing.T) {
 }
 
 // TestSimulateLabelHold_ExcursionToExit 障碍出场日的 MFE/MAE 只计入确定经历的价位
-//（开盘价与障碍成交价）——触发后的同日行情未经历，不得夸大。
+// （开盘价与障碍成交价）——触发后的同日行情未经历，不得夸大。
 func TestSimulateLabelHold_ExcursionToExit(t *testing.T) {
 	bars := []datasource.Bar{
-		{TradeDate: "2026-06-01", Open: 9.9, High: 10.1, Low: 9.8, Close: 10.0},  // 信号日
+		{TradeDate: "2026-06-01", Open: 9.9, High: 10.1, Low: 9.8, Close: 10.0},   // 信号日
 		{TradeDate: "2026-06-02", Open: 10.0, High: 10.2, Low: 9.95, Close: 10.1}, // 买入日
 		// 出场日：低开触止损 9.5，随后全天暴力拉升 high=12（出场后的行情）。
 		{TradeDate: "2026-06-03", Open: 9.8, High: 12.0, Low: 9.4, Close: 11.8},
@@ -757,6 +757,84 @@ func TestAdvanceLabelForcedStaleClose(t *testing.T) {
 	}
 	if got.LabelVersion != labelVersion {
 		t.Fatalf("旧 l1 行结算后应回写版本 %s，得到 %s", labelVersion, got.LabelVersion)
+	}
+}
+
+// TestLabelAgeAnchorByEntryMode 超窗年龄锚点按 entry_mode 分流：
+// next_open 以信号日为锚（口径不变）；actual_position 以**实际建仓日**为锚。
+// 核心反例——「旧推荐 + 今天新建仓」：持仓血缘常晚于推荐建立，若仍按信号日计龄，
+// 标签一诞生就已超 labelNoDataAfterDays=90，会在建仓当天被判 no_data 或按个股末根
+// 收盘 Forced 强平，写进 actual_position 这张持续积累的事实表就是永久脏数据。
+func TestLabelAgeAnchorByEntryMode(t *testing.T) {
+	today := time.Now().Format("2006-01-02")
+	oldSignal := time.Now().AddDate(0, 0, -100).Format("2006-01-02") // 超 90 日
+
+	// 锚点纯函数：只有「actual 且有建仓日」才改锚，其余一律信号日。
+	anchorCases := []struct {
+		name      string
+		entryMode string
+		entryDate string
+		want      string
+	}{
+		{"next_open 恒用信号日", model.EntryModeNextOpen, "", oldSignal},
+		{"next_open 有 entry_date 也用信号日", model.EntryModeNextOpen, today, oldSignal},
+		{"actual 用建仓日", model.EntryModeActual, today, today},
+		{"actual 无建仓日回退信号日", model.EntryModeActual, "", oldSignal},
+	}
+	for _, tc := range anchorCases {
+		l := &model.RecommendationLabel{EntryMode: tc.entryMode, EntryDate: tc.entryDate, SignalDate: oldSignal}
+		if got := labelAgeAnchor(l); got != tc.want {
+			t.Errorf("%s: 锚点应为 %s，得到 %s", tc.name, tc.want, got)
+		}
+	}
+
+	mkBars := func(startOffsetDays, n int, price float64) []datasource.Bar {
+		out := make([]datasource.Bar, 0, n)
+		for i := 0; i < n; i++ {
+			d := time.Now().AddDate(0, 0, startOffsetDays+i).Format("2006-01-02")
+			out = append(out, datasource.Bar{TradeDate: d, Open: price, High: price, Low: price, Close: price, Volume: 1000})
+		}
+		return out
+	}
+
+	// ① 旧推荐 + 今天新建仓：日线连续到今天，持有期尚未走完 → 必须保持 pending。
+	//    按旧的信号日锚会立刻满足「超 90 日仍 pending」而被 Forced 强平成熟。
+	fresh := &model.RecommendationLabel{
+		Symbol: "600100", HorizonDays: 5, EntryMode: model.EntryModeActual,
+		EntryDate: today, ActualBuyPrice: 10, SignalDate: oldSignal,
+		MaturityStatus: model.LabelPending, LabelVersion: labelVersion,
+	}
+	if changed := advanceOneLabel(fresh, mkBars(-100, 101, 10), "甲", nil, nil, today); changed {
+		t.Fatalf("今天新建仓的 actual 标签不得提前成熟: %+v", fresh)
+	}
+	if fresh.MaturityStatus != model.LabelPending || fresh.Forced {
+		t.Fatalf("今天新建仓应保持 pending 且未强平: status=%s forced=%v", fresh.MaturityStatus, fresh.Forced)
+	}
+
+	// ② 换锚不等于关掉超窗机制：建仓日本身已超 90 日且个股停更 → 照旧末根收盘强平。
+	staleEntry := time.Now().AddDate(0, 0, -100).Format("2006-01-02")
+	stale := &model.RecommendationLabel{
+		Symbol: "600100", HorizonDays: 5, EntryMode: model.EntryModeActual,
+		EntryDate: staleEntry, ActualBuyPrice: 10, SignalDate: oldSignal,
+		MaturityStatus: model.LabelPending, LabelVersion: labelVersion,
+	}
+	if changed := advanceOneLabel(stale, mkBars(-100, 3, 10), "甲", nil, nil, today); !changed {
+		t.Fatal("建仓日已超窗且个股停更应终结（强平或 no_data），不得永久滞留 pending")
+	}
+	if stale.MaturityStatus != model.LabelMatured || !stale.Forced {
+		t.Fatalf("建仓日超窗应末根收盘强平: status=%s forced=%v", stale.MaturityStatus, stale.Forced)
+	}
+
+	// ③ next_open 口径不受影响：信号日超窗 + 个股停更 → 仍按信号日锚强平。
+	nextOpen := &model.RecommendationLabel{
+		Symbol: "600100", HorizonDays: 5, EntryMode: model.EntryModeNextOpen,
+		SignalDate: oldSignal, MaturityStatus: model.LabelPending, LabelVersion: labelVersion,
+	}
+	if changed := advanceOneLabel(nextOpen, mkBars(-100, 3, 10), "甲", nil, nil, today); !changed {
+		t.Fatal("next_open 信号日超窗应终结")
+	}
+	if nextOpen.MaturityStatus != model.LabelMatured || !nextOpen.Forced {
+		t.Fatalf("next_open 超窗口径不得改变: status=%s forced=%v", nextOpen.MaturityStatus, nextOpen.Forced)
 	}
 }
 

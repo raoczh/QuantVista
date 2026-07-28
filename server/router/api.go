@@ -192,11 +192,15 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			{
 				positions.GET("", positionCtl.List)
 				positions.GET("/overview", positionCtl.Overview) // 静态段先于 :id
+				positions.GET("/stats", positionCtl.Stats)       // B6 个人交易复盘统计
+				positions.GET("/curve", positionCtl.Curve)       // B7 资产曲线
 				positions.POST("", positionCtl.Create)
 				positions.POST("/import", middleware.RateLimit(10, time.Minute), exportCtl.ImportPositions)
 				positions.PUT("/:id", positionCtl.Update)
 				positions.DELETE("/:id", positionCtl.Delete)
 				positions.POST("/:id/close", positionCtl.Close)
+				positions.GET("/:id/trades", positionCtl.Trades)    // B5 流水明细
+				positions.POST("/:id/trades", positionCtl.AddTrade) // B5 加仓/减仓
 			}
 
 			// AI 分析中心（按用户隔离；发起分析限流，防止刷爆 LLM 配额与费用）
@@ -320,6 +324,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			paper := authed.Group("/paper")
 			{
 				paper.GET("/overview", paperCtl.Overview)
+				paper.GET("/curve", paperCtl.Curve) // B7 资产曲线
 				paper.POST("/trade", middleware.RateLimit(60, time.Minute), paperCtl.Trade)
 				paper.GET("/trades", paperCtl.Trades)
 				paper.POST("/reset", paperCtl.Reset)

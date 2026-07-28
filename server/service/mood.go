@@ -33,6 +33,9 @@ const (
 	// v2 首次为空时会强制重验近 30 天，之后只在主榜+机构榜原子提交后推进。
 	optMoodLhbLegacyDay = "mood_lhb_day"
 	optMoodLhbDay       = "mood_lhb_complete_day_v2"
+	// 未解决缺口清单（JSON 数组）。游标只表达「该日之前都已处理」，不等于「都已完成」——
+	// 恒定失败的历史日被登记在这里持续重试，直到主榜+机构榜原子成功或确认为空榜。
+	optMoodLhbGaps = "mood_lhb_gaps_v1"
 
 	moodPoolCutoffMin = 16*60 + 35 // 16:35 后当日涨停池数据视为可采
 	moodLhbCutoffMin  = 18*60 + 45 // 18:45 后当日龙虎榜数据视为可采
@@ -298,12 +301,26 @@ func (s *MoodService) SyncLhb(ctx context.Context, tradeDate string) (int, error
 // lhbOrgNotReadyCanFinalizeEmpty 只允许把历史日期的“机构榜仍无结果”最终确认为空榜。
 // 当日 9201 可能只是主榜先发布、机构榜仍在生成，必须继续重试而不能清表推进游标。
 func lhbOrgNotReadyCanFinalizeEmpty(tradeDate string, now time.Time) bool {
+	return isHistoricalTradeDate(tradeDate, now)
+}
+
+// isHistoricalTradeDate tradeDate 是否严格早于 now 所在自然日（即当日盘后发布窗口已翻页）。
+func isHistoricalTradeDate(tradeDate string, now time.Time) bool {
 	day, err := time.ParseInLocation("2006-01-02", tradeDate, time.Local)
 	if err != nil {
 		return false
 	}
-	today := time.Date(now.In(time.Local).Year(), now.In(time.Local).Month(), now.In(time.Local).Day(), 0, 0, 0, 0, time.Local)
+	local := now.In(time.Local)
+	today := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, time.Local)
 	return day.Before(today)
+}
+
+// nowOrDefault 服务时钟（测试可注入）。
+func (s *MoodService) nowOrDefault() time.Time {
+	if s != nil && s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }
 
 func (s *MoodService) fetchLhbRows(ctx context.Context, tradeDate string) ([]datasource.LhbRow, error) {
@@ -962,9 +979,14 @@ type LhbRecordView struct {
 
 // StockLhbRecords 个股最近上榜记录（详情页）。按日期降序，同日多原因各自成行。
 // 主榜与机构榜在同一读事务内查询，避免同步事务提交夹缝产生跨版本混合。
-func (s *MoodService) StockLhbRecords(ctx context.Context, symbol string, limit int) []LhbRecordView {
-	if common.DB == nil || !isSixDigits(symbol) {
-		return []LhbRecordView{}
+// DB/context 错误如实返回：静默吞掉会让「查询失败」与「近期无上榜」在前端长得一模一样。
+func (s *MoodService) StockLhbRecords(ctx context.Context, symbol string, limit int) ([]LhbRecordView, error) {
+	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
+	}
+	if !isSixDigits(symbol) {
+		// 非 A 股 6 位代码本就不可能有龙虎榜记录，属诚实空集不是错误。
+		return []LhbRecordView{}, nil
 	}
 	if limit <= 0 || limit > 30 {
 		limit = 10
@@ -989,10 +1011,10 @@ func (s *MoodService) StockLhbRecords(ctx context.Context, symbol string, limit 
 		return tx.Where("symbol = ? AND market = ? AND trade_date IN ?", symbol, "cn", dates).
 			Find(&orgRows).Error
 	}); err != nil {
-		return []LhbRecordView{}
+		return nil, err
 	}
 	if len(rows) == 0 {
-		return []LhbRecordView{}
+		return []LhbRecordView{}, nil
 	}
 	orgBy := map[string]model.LhbOrgDaily{}
 	for _, r := range orgRows {
@@ -1010,7 +1032,7 @@ func (s *MoodService) StockLhbRecords(ctx context.Context, symbol string, limit 
 		}
 		out = append(out, v)
 	}
-	return out
+	return out, nil
 }
 
 // ---------- 后台任务 ----------
@@ -1044,15 +1066,28 @@ func (s *MoodService) runMoodPools(ctx context.Context, target, today string) {
 	}
 }
 
-// lhbSkipAfterFails 历史日连续失败达此次数即跳过（推进游标）。重试间隔 30min，
+// lhbSkipAfterFails 历史日连续失败达此次数即「不再阻塞后续日期」。重试间隔 30min，
 // 3 次≈1.5 小时持续失败——足以区分瞬时故障与恒定失败。
 //
-// 为什么必须能跳过：pending 按交易日**升序**逐日补，旧实现任一天失败就 return false、
+// 为什么必须能继续往后走：pending 按交易日**升序**逐日补，任一天失败就 return false、
 // 游标不动，下轮重试的还是同一个最早缺口。而恒定失败是可达的——该日东财确无榜
-//（ErrNoData）、或 parseLhbRowStrict 因缺必填字段整天作废——于是最老的一天会把其后
-// 所有天连同**今天**的榜一起永久卡死。今天（target）不参与跳过：盘后逐步落库，
+// （ErrNoData）、或 parseLhbRowStrict 因缺必填字段整天作废——于是最老的一天会把其后
+// 所有天连同**今天**的榜一起永久卡死。今天（target）不在此列：盘后逐步落库，
 // 18:00 前未发布是正常态，必须继续等。
+//
+// **但「继续往后走」≠「该日已完成」**：游标推进的同时必须把该日登记进
+// optMoodLhbGaps 未解决缺口清单并每轮持续重试，只有下面两种结局才算终结：
+//   - 主榜+机构榜在同一事务原子提交成功；
+//   - 可证明的历史空榜（上游明确回 ErrNoData、该日已成历史、且连续 lhbSkipAfterFails
+//     轮仍为空——「查得到且确实没有」，区别于网络/解析类的「查不到」）。
 const lhbSkipAfterFails = 3
+
+// lhbGapRetryPerRound 每轮补跑最多重试的历史缺口数（防单轮被长缺口清单拖满 10 分钟预算）。
+const lhbGapRetryPerRound = 5
+
+// lhbGapMaxEntries 未解决缺口清单容量上限。触顶说明上游长期异常，丢最老的一条并告警，
+// 避免 option 值无界增长（正常运行永远达不到）。
+const lhbGapMaxEntries = 200
 
 // lhbDayFails 同一交易日连续失败计数（进程内；重启后重新计数，宁可多试几轮）。
 var (
@@ -1073,16 +1108,152 @@ func clearLhbDayFail(date string) {
 	delete(lhbDayFails, date)
 }
 
-// runMoodLhb 从游标之后按交易日升序补到 target。失败即停确保下轮仍从最早缺口开始；
-// 但历史日连续失败达 lhbSkipAfterFails 次即跳过，防单日恒定失败卡死其后所有天。
+// loadLhbGaps 读未解决缺口清单（升序去重；解析失败按空处理，不因脏值卡死采集）。
+func loadLhbGaps() []string {
+	raw := optionValue(optMoodLhbGaps)
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var dates []string
+	if err := json.Unmarshal([]byte(raw), &dates); err != nil {
+		common.SysWarn("龙虎榜缺口清单解析失败（按空处理）: %v", err)
+		return nil
+	}
+	out := make([]string, 0, len(dates))
+	seen := map[string]bool{}
+	for _, d := range dates {
+		d = strings.TrimSpace(d)
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// saveLhbGaps 落库未解决缺口清单（空清单落空串，读侧等价于无缺口）。
+func saveLhbGaps(dates []string) error {
+	if len(dates) == 0 {
+		return model.UpsertOption(optMoodLhbGaps, "")
+	}
+	b, err := json.Marshal(dates)
+	if err != nil {
+		return err
+	}
+	return model.UpsertOption(optMoodLhbGaps, string(b))
+}
+
+// appendLhbGap 登记一个未解决缺口（升序去重、容量有界）。
+func appendLhbGap(gaps []string, date string) []string {
+	for _, d := range gaps {
+		if d == date {
+			return gaps
+		}
+	}
+	out := append(append([]string{}, gaps...), date)
+	sort.Strings(out)
+	if len(out) > lhbGapMaxEntries {
+		common.SysWarn("龙虎榜未解决缺口超过 %d 条，丢弃最早的 %s（上游长期异常，请人工核查）",
+			lhbGapMaxEntries, out[0])
+		out = out[len(out)-lhbGapMaxEntries:]
+	}
+	return out
+}
+
+// lhbDayOutcome 单个交易日的同步结局。
+type lhbDayOutcome int
+
+const (
+	lhbDayDone        lhbDayOutcome = iota // 主榜+机构榜原子提交成功
+	lhbDayEmptyProven                      // 可证明的历史空榜（上游明确回空且已成历史）
+	lhbDayRetry                            // 尚未终结，需继续重试
+	lhbDayAborted                          // ctx 用尽，本轮预算问题不归因于该日
+)
+
+// syncLhbDay 同步单日并归类结局。第二个返回值：Done 时为主榜行数，Retry 时为该日连续失败次数。
+func (s *MoodService) syncLhbDay(ctx context.Context, date string) (lhbDayOutcome, int, error) {
+	n, err := s.SyncLhb(ctx, date)
+	if err == nil {
+		clearLhbDayFail(date)
+		return lhbDayDone, n, nil
+	}
+	// ctx 用尽属本轮预算问题不是该日的问题，不计入失败次数。
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return lhbDayAborted, 0, err
+	}
+	fails := bumpLhbDayFail(date)
+	// 可证明的历史空榜：上游明确回「查得到且确实没有」（ErrNoData），该日已成历史
+	// （当日未发布不能当空），且连续多轮仍为空。网络/解析类失败不适用——那是「查不到」。
+	if errors.Is(err, datasource.ErrNoData) && fails >= lhbSkipAfterFails &&
+		isHistoricalTradeDate(date, s.nowOrDefault()) {
+		clearLhbDayFail(date)
+		return lhbDayEmptyProven, 0, nil
+	}
+	return lhbDayRetry, fails, err
+}
+
+// retryLhbGaps 每轮优先重试已登记的未解决缺口。补齐/确认空榜即从清单移除，
+// 其余原样保留继续下轮重试（**绝不因为重试过就当完成**）。
+func (s *MoodService) retryLhbGaps(ctx context.Context, gaps []string) ([]string, bool) {
+	if len(gaps) == 0 {
+		return gaps, false
+	}
+	remain := make([]string, 0, len(gaps))
+	changed, aborted, tried := false, false, 0
+	for i := 0; i < len(gaps); i++ {
+		date := gaps[i]
+		if tried >= lhbGapRetryPerRound || ctx.Err() != nil {
+			remain = append(remain, gaps[i:]...)
+			break
+		}
+		tried++
+		outcome, _, err := s.syncLhbDay(ctx, date)
+		switch outcome {
+		case lhbDayDone:
+			changed = true
+			common.SysLog("龙虎榜历史缺口 %s 已补齐", date)
+		case lhbDayEmptyProven:
+			changed = true
+			common.SysLog("龙虎榜历史缺口 %s 经上游多轮确认为空榜，收口", date)
+		case lhbDayAborted:
+			aborted = true
+			remain = append(remain, gaps[i:]...)
+		default:
+			remain = append(remain, date)
+			common.SysDebug("龙虎榜历史缺口 %s 仍未补齐（继续重试）: %v", date, err)
+		}
+		if aborted {
+			break
+		}
+	}
+	if changed {
+		if err := saveLhbGaps(remain); err != nil {
+			common.SysWarn("龙虎榜缺口清单落库失败: %v", err)
+			return gaps, aborted
+		}
+	}
+	return remain, aborted
+}
+
+// runMoodLhb 从游标之后按交易日升序补到 target，并在每轮开头重试历史未解决缺口。
+// 单日失败即停确保下轮仍从最早缺口开始；历史日连续失败达 lhbSkipAfterFails 次时，
+// **登记进未解决缺口清单**后才推进游标继续后续日期——缺口持续重试，不冒充完成。
 // 每个成功日单独推进游标，长回填即使超时也能从已提交位置续跑。
+// 返回值 true 仅当「游标已达 target 且无未解决缺口」，false 会让调度循环 30 分钟后重试。
 func (s *MoodService) runMoodLhb(ctx context.Context, target string) bool {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	gaps, aborted := s.retryLhbGaps(ctx, loadLhbGaps())
+	if aborted {
+		common.SysWarn("龙虎榜历史缺口重试中止：本轮预算用尽")
+		return false
+	}
 	cursor := optionValue(optMoodLhbDay)
 	if cursor == target {
-		return true
+		return len(gaps) == 0
 	}
 	pending, complete := lhbPendingDatesWithCoverage(cursor, target)
 	if !complete && s.repairCalendar != nil {
@@ -1101,40 +1272,48 @@ func (s *MoodService) runMoodLhb(ctx context.Context, target string) bool {
 			common.SysWarn("龙虎榜补缺口中止 %s: %v", date, err)
 			return false
 		}
-		n, err := s.SyncLhb(ctx, date)
-		if err != nil {
-			// ctx 用尽属本轮预算问题不是该日的问题，不计入失败次数。
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				common.SysWarn("龙虎榜补缺口中止 %s: %v", date, err)
-				return false
-			}
-			fails := bumpLhbDayFail(date)
-			if date != target && fails >= lhbSkipAfterFails {
-				common.SysWarn("龙虎榜 %s 连续 %d 次失败，跳过该日继续补后续（最后错误: %v）", date, fails, err)
+		outcome, info, err := s.syncLhbDay(ctx, date)
+		switch outcome {
+		case lhbDayAborted:
+			common.SysWarn("龙虎榜补缺口中止 %s: %v", date, err)
+			return false
+		case lhbDayRetry:
+			if date != target && info >= lhbSkipAfterFails {
+				// 继续补后续日期，但该日**登记为未解决缺口**持续重试——游标推进只表示
+				// 「已处理到这里」，缺口清单非空时 runMoodLhb 永不宣称追平。
+				gaps = appendLhbGap(gaps, date)
+				if serr := saveLhbGaps(gaps); serr != nil {
+					common.SysWarn("龙虎榜缺口清单落库失败 %s: %v", date, serr)
+					return false
+				}
+				clearLhbDayFail(date)
 				if uerr := model.UpsertOption(optMoodLhbDay, date); uerr != nil {
 					common.SysWarn("龙虎榜游标推进失败 %s: %v", date, uerr)
 					return false
 				}
 				cursor = date
-				clearLhbDayFail(date)
+				common.SysWarn("龙虎榜 %s 连续 %d 次失败，登记为未解决缺口并继续补后续（将持续重试；最后错误: %v）",
+					date, info, err)
 				continue
 			}
 			if errors.Is(err, datasource.ErrNoData) {
-				common.SysDebug("龙虎榜 %s 暂无数据（未发布或日历有误），下次再试（第 %d 次）", date, fails)
+				common.SysDebug("龙虎榜 %s 暂无数据（未发布或日历有误），下次再试（第 %d 次）", date, info)
 			} else {
-				common.SysWarn("龙虎榜采集失败 %s（第 %d 次）: %v", date, fails, err)
+				common.SysWarn("龙虎榜采集失败 %s（第 %d 次）: %v", date, info, err)
 			}
 			return false
+		case lhbDayEmptyProven:
+			common.SysLog("龙虎榜 %s 经上游多轮确认为空榜，收口", date)
+		default:
+			common.SysLog("龙虎榜采集完成 %s：%d 行", date, info)
 		}
-		clearLhbDayFail(date)
 		if err := model.UpsertOption(optMoodLhbDay, date); err != nil {
 			common.SysWarn("龙虎榜游标推进失败 %s: %v", date, err)
 			return false
 		}
 		cursor = date
-		common.SysLog("龙虎榜采集完成 %s：%d 行", date, n)
 	}
-	return cursor == target
+	return cursor == target && len(gaps) == 0
 }
 
 // StartMoodJobs 盘后错峰采集：16:35 涨停池+人气榜、18:45 龙虎榜+机构统计。

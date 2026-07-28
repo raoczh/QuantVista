@@ -210,10 +210,31 @@ Go API Server
 
 职责：
 
-- 管理已购入持仓。
+- 管理已购入持仓（**带流水的账本**：分批加仓/减仓、加权成本重算、已实现盈亏结转）。
 - 记录买入和卖出。
 - 计算当前盈亏。
 - 关联 AI 推荐记录。
+- 每交易日盘后落资产快照，供资产曲线。
+
+**账本口径铁律（B5，改代码前必读）**：`positions.buy_price` 恒为**当前持仓**的加权平均成本、
+`positions.quantity` 恒为**当前持仓**数量（全部卖出后为 0）、`buy_fee/buy_tax` 恒为当前持仓尚未
+结转的买入费税——全部既有消费方（tracking 的 actual_position 标签、todo 止损、guard 事件、组合
+总览）读法零改动。累计口径（一共买过多少 / 卖回多少 / 赚了多少）走 `total_buy_qty` /
+`total_buy_cost` / `total_sell_net` / `realized_pnl` 四个汇总列，**绝不从当前持仓字段反推**。
+`position_trades` 是唯一明细来源，汇总值在同一事务内回写 positions。
+
+**相关表（B5~B7 新增）**：
+
+- `position_trades`：`user_id / position_id / side(buy|sell) / price / quantity / fee / tax /
+  trade_date / note / realized_pnl / avg_cost_after / quantity_after / backfilled`，
+  索引 `(user_id, position_id)`。单位：price=元/股、quantity=股、fee/tax=元。
+  旧持仓读取时**惰性补建**等价首笔 buy（`backfilled=true`），幂等 + 行锁并发安全 +
+  不改动任何既有汇总值。
+- `portfolio_snapshots`：`user_id / kind(real|paper) / trade_date / market_value / cost /
+  unrealized_pnl / realized_cum / cash / position_count / partial / missing_count / note`，
+  唯一键 `(user_id, kind, trade_date)`。交易日 16:20 job 幂等 upsert（错峰：16:10 全市场日线、
+  16:35 涨停池、18:45 龙虎榜）。**fail-closed**：市值走 `FreshQuotesFor`，stale/失败的标的
+  既不进市值也不进成本，该日快照标 `partial` 并记缺口数——绝不用旧价冒充。
 
 接口示例：
 
@@ -221,8 +242,11 @@ Go API Server
 - `POST /api/positions`
 - `POST /api/positions/import`（CSV 批量导入，multipart，逐行校验+错误行报告，上限 500 行，限流 10/min）
 - `PUT /api/positions/:id`
-- `POST /api/positions/:id/close`
-- `DELETE /api/positions/:id`
+- `POST /api/positions/:id/close`（= 卖出全部剩余数量的减仓笔，走同一流水逻辑）
+- `GET /api/positions/:id/trades` / `POST /api/positions/:id/trades`（B5 流水明细 / 加仓·减仓）
+- `GET /api/positions/stats?range=`（B6 个人交易复盘统计，纯读时聚合）
+- `GET /api/positions/curve?days=` / `GET /api/paper/curve?days=`（B7 资产曲线，读盘后快照）
+- `DELETE /api/positions/:id`（级联删流水）
 -（复盘内容随 close 落库，无独立 review 端点）
 
 ### 5.5 AI Analysis Service
@@ -478,6 +502,7 @@ AI 结果：
 - `/screener`：策略选股（21 策略组合筛选，S1）
 - `/backtest`：回测时光机（S1）
 - `/heatmap`：行业热力图（M3b）
+- `/mood`：盘面情绪（情绪总览 / 连板梯队 / 龙虎榜 / 人气榜四 tab，A1~A3 散户体验第一批）
 - `/boards/:code`：板块详情（M3c）
 - `/daily-report`：收盘日报（今日复盘 + 明日推荐，2026-07-03；`GET/POST /api/daily-reports*` 端点，交易日 15:35 后 `StartDailyReportJobs` 自动生成、手动重生成限流 5/min；首页「AI 今日观点」卡展示最新摘要）
 - `/login`（+ `/login/callback` OAuth 回调）、`/setup`：登录 / 首启建管理员

@@ -207,6 +207,7 @@ export function getDailyBars(market: string, symbol: string, limit = 120) {
 }
 
 // A1 个股分时线。成交量单位为手；均价为服务端基于分钟线估算的累计均价。
+// signal：切标的/组件卸载时中止在途请求（迟到响应不再占用连接，也让页面侧 loadSeq 失效）。
 export interface MinutePoint {
   time: string
   price: number
@@ -228,10 +229,11 @@ export interface MinuteLine {
   avg_note: string
 }
 
-export function getMinuteLine(market: string, symbol: string) {
+export function getMinuteLine(market: string, symbol: string, signal?: AbortSignal) {
   return request<MinuteLine>({
     url: `/markets/${market}/stocks/${symbol}/minute`,
     method: 'get',
+    signal,
   })
 }
 
@@ -294,11 +296,12 @@ export interface MoodOverview {
   seal_fund_top: LimitUpStock[]
 }
 
-export function getMarketMood(market = 'cn', days = 20) {
+export function getMarketMood(market = 'cn', days = 20, signal?: AbortSignal) {
   return request<MoodOverview>({
     url: `/markets/${market}/mood`,
     method: 'get',
     params: { days },
+    signal,
   })
 }
 
@@ -307,7 +310,8 @@ export interface LhbDailyItem {
   symbol: string
   name: string
   reason: string
-  note: string
+  // 后端 `json:"note,omitempty"`：无补充说明时字段整个缺席，不是空串。
+  note?: string
   close: number
   change_pct: number
   net_buy: number
@@ -327,11 +331,12 @@ export interface LhbDaily {
   items: LhbDailyItem[]
 }
 
-export function getMarketLhb(market = 'cn', date = '', limit = 50) {
+export function getMarketLhb(market = 'cn', date = '', limit = 50, signal?: AbortSignal) {
   return request<LhbDaily>({
     url: `/markets/${market}/lhb`,
     method: 'get',
     params: { date: date || undefined, limit },
+    signal,
   })
 }
 
@@ -349,11 +354,12 @@ export interface PopularityDaily {
   items: PopularityDailyItem[]
 }
 
-export function getMarketPopularity(market = 'cn', date = '') {
+export function getMarketPopularity(market = 'cn', date = '', signal?: AbortSignal) {
   return request<PopularityDaily>({
     url: `/markets/${market}/popularity`,
     method: 'get',
     params: { date: date || undefined },
+    signal,
   })
 }
 

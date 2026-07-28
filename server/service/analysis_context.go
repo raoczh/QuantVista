@@ -506,6 +506,13 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 	quoteFailed := 0 // 行情失败/过期、未计入市值/盈亏的持仓数（部分估值透明化）
 	quoteStale := 0  // 其中「取到但已过期」的仓数（fail-closed：旧价不参与当前汇总）
 	for _, v := range views {
+		// quantity 语义对 AI 保持不变：持仓中=当前持有股数；已平仓=**累计买入股数**
+		// （B5 后 Position.Quantity 在清仓时归 0，直接给 0 会让 AI 以为这笔从没买过；
+		// 旧记录补建后 TotalBuyQty == Quantity，故新旧数据在快照里表现一致）。
+		qty := v.Quantity
+		if v.Status == model.PositionStatusClosed && v.TotalBuyQty > 0 {
+			qty = v.TotalBuyQty
+		}
 		row := map[string]any{
 			"name":      v.Name,
 			"symbol":    v.Symbol,
@@ -513,7 +520,7 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 			"type":      v.PositionType,
 			"status":    v.Status,
 			"buy_price": round2(v.BuyPrice),
-			"quantity":  round2(v.Quantity),
+			"quantity":  round2(qty),
 			"cost":      round2(v.Cost),
 		}
 		// 逐仓行情时效元数据（字符串值不进数值核验值域）：AI 必须能区分

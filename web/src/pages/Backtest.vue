@@ -414,7 +414,7 @@ onMounted(() => {
                       </span>
                     </div>
                     <div class="rec-hold-line dim">
-                      未走完 {{ st.pending }} · 跳过 {{ st.skipped }} · 无数据 {{ st.no_data }}
+                      未走完 {{ st.pending }} · 强平 {{ st.forced }} · 跳过 {{ st.skipped }} · 无数据 {{ st.no_data }}
                     </div>
                   </div>
                 </n-gi>
@@ -477,6 +477,12 @@ onMounted(() => {
                                 : '—'
                             }}
                           </span>
+                        </template>
+                        <!-- forced：末根收盘强平，收益是算得出来的但真实中卖不出，
+                             展示数值同时明确标注，且不进上方胜率/均值/alpha 统计。 -->
+                        <template v-else-if="r.holds[String(st.hold_days)]?.status === 'forced'">
+                          <span class="dim">{{ fmtPct(r.holds[String(st.hold_days)].return_pct) }}</span>
+                          <span class="dim">（强平）</span>
                         </template>
                         <span v-else class="dim">{{ HOLD_STATUS_LABEL[r.holds[String(st.hold_days)]?.status ?? ''] ?? '—' }}</span>
                       </td>

@@ -32,6 +32,184 @@ func cleanMoodTables(t *testing.T) {
 	})
 }
 
+// resetLhbGapState 清空进程内失败计数与持久化缺口清单（lhbDayFails 是包级全局，
+// 跨测试会互相污染）。
+func resetLhbGapState(t *testing.T) {
+	t.Helper()
+	clear := func() {
+		lhbFailMu.Lock()
+		lhbDayFails = map[string]int{}
+		lhbFailMu.Unlock()
+		common.DB.Where("`key` IN ?", []string{optMoodLhbDay, optMoodLhbGaps}).Delete(&model.Option{})
+	}
+	clear()
+	t.Cleanup(clear)
+}
+
+// TestRunMoodLhbPersistsUnresolvedGap 历史日恒定失败：连续 lhbSkipAfterFails 次后允许
+// 继续补后续日期（防单日卡死其后所有天连同今天），但**必须把该日登记为未解决缺口并
+// 持续重试**——游标推进只表示「已处理到这里」，绝不冒充完成。
+// 旧实现在此直接推进 complete 游标，该日从此永远不再采集、也无任何记录。
+func TestRunMoodLhbPersistsUnresolvedGap(t *testing.T) {
+	setupTestDB(t)
+	cleanMoodTables(t)
+	resetLhbGapState(t)
+	common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
+	t.Cleanup(func() { common.DB.Where("1 = 1").Delete(&model.TradingCalendar{}) })
+	calendar := []model.TradingCalendar{
+		{Market: "cn", TradeDate: "2026-07-24", IsOpen: true},
+		{Market: "cn", TradeDate: "2026-07-27", IsOpen: true},
+		{Market: "cn", TradeDate: "2026-07-28", IsOpen: true},
+	}
+	if err := common.DB.Select("Market", "TradeDate", "IsOpen").Create(&calendar).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := model.UpsertOption(optMoodLhbDay, "2026-07-24"); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewMoodService()
+	svc.now = func() time.Time { return time.Date(2026, 7, 28, 20, 0, 0, 0, time.Local) }
+	brokenMonday := true
+	svc.fetchLhbDaily = func(_ context.Context, date string) ([]datasource.LhbRow, error) {
+		if date == "2026-07-27" && brokenMonday {
+			// 网络类恒定失败（≠ ErrNoData 的「查得到且确实没有」）：绝不可收口为空榜。
+			return nil, errors.New("上游 502")
+		}
+		symbol := map[string]string{"2026-07-27": "600027", "2026-07-28": "600028"}[date]
+		return []datasource.LhbRow{{Symbol: symbol, Name: date, ChangeType: "daily"}}, nil
+	}
+	svc.fetchLhbOrgDaily = func(context.Context, string) ([]datasource.LhbOrgRow, error) {
+		return nil, datasource.ErrNoData
+	}
+
+	// 前 lhbSkipAfterFails-1 轮：失败即停，游标不动，缺口清单仍为空（还在瞬时故障容忍期）。
+	for i := 1; i < lhbSkipAfterFails; i++ {
+		if svc.runMoodLhb(context.Background(), "2026-07-28") {
+			t.Fatalf("第 %d 轮周一仍失败，不应宣称追平", i)
+		}
+		if got := optionValue(optMoodLhbDay); got != "2026-07-24" {
+			t.Fatalf("第 %d 轮不得推进游标, got %s", i, got)
+		}
+		if got := optionValue(optMoodLhbGaps); got != "" {
+			t.Fatalf("未达阈值不应登记缺口, got %s", got)
+		}
+	}
+
+	// 第 lhbSkipAfterFails 轮：周一登记为未解决缺口 + 游标推进 + 继续补周二。
+	if svc.runMoodLhb(context.Background(), "2026-07-28") {
+		t.Fatal("存在未解决缺口时不得宣称追平（调度会据此 30 分钟后重试）")
+	}
+	if got := optionValue(optMoodLhbDay); got != "2026-07-28" {
+		t.Fatalf("登记缺口后应继续补到周二, got %s", got)
+	}
+	if got := loadLhbGaps(); len(got) != 1 || got[0] != "2026-07-27" {
+		t.Fatalf("周一必须持久化为未解决缺口, got %v", got)
+	}
+	var mondayRows, tuesdayRows int64
+	common.DB.Model(&model.LhbEntry{}).Where("trade_date = ?", "2026-07-27").Count(&mondayRows)
+	common.DB.Model(&model.LhbEntry{}).Where("trade_date = ?", "2026-07-28").Count(&tuesdayRows)
+	if mondayRows != 0 || tuesdayRows != 1 {
+		t.Fatalf("周一无数据、周二应落库: monday=%d tuesday=%d", mondayRows, tuesdayRows)
+	}
+
+	// 缺口持续重试：仍失败则原样保留，绝不因为「重试过」就当完成。
+	mondayCalls := 0
+	prevFetch := svc.fetchLhbDaily
+	svc.fetchLhbDaily = func(ctx context.Context, date string) ([]datasource.LhbRow, error) {
+		if date == "2026-07-27" {
+			mondayCalls++
+		}
+		return prevFetch(ctx, date)
+	}
+	if svc.runMoodLhb(context.Background(), "2026-07-28") {
+		t.Fatal("缺口未补齐时不得宣称追平")
+	}
+	if mondayCalls != 1 {
+		t.Fatalf("每轮都应重试未解决缺口, calls=%d", mondayCalls)
+	}
+	if got := loadLhbGaps(); len(got) != 1 {
+		t.Fatalf("仍失败的缺口必须保留, got %v", got)
+	}
+
+	// 上游恢复：缺口补齐后清单清空，此时才算真正追平。
+	brokenMonday = false
+	if !svc.runMoodLhb(context.Background(), "2026-07-28") {
+		t.Fatal("缺口补齐且游标到位后应宣称追平")
+	}
+	if got := loadLhbGaps(); len(got) != 0 {
+		t.Fatalf("补齐后缺口清单应清空, got %v", got)
+	}
+	common.DB.Model(&model.LhbEntry{}).Where("trade_date = ?", "2026-07-27").Count(&mondayRows)
+	if mondayRows != 1 {
+		t.Fatalf("补齐后周一主榜应落库, got %d", mondayRows)
+	}
+}
+
+// TestRunMoodLhbProvenEmptyDayFinalizes 可证明的历史空榜：上游明确回 ErrNoData
+// （查得到且确实没有）、该日已成历史、且连续多轮仍为空 → 收口为完成，不进缺口清单。
+// 与网络类失败的区别是本质性的：后者是「查不到」，永远不能当成「没有」。
+func TestRunMoodLhbProvenEmptyDayFinalizes(t *testing.T) {
+	setupTestDB(t)
+	cleanMoodTables(t)
+	resetLhbGapState(t)
+	common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
+	t.Cleanup(func() { common.DB.Where("1 = 1").Delete(&model.TradingCalendar{}) })
+	calendar := []model.TradingCalendar{
+		{Market: "cn", TradeDate: "2026-07-24", IsOpen: true},
+		{Market: "cn", TradeDate: "2026-07-27", IsOpen: true},
+	}
+	if err := common.DB.Select("Market", "TradeDate", "IsOpen").Create(&calendar).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := model.UpsertOption(optMoodLhbDay, "2026-07-24"); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewMoodService()
+	// 「今天」是 07-28，故 07-27 已是历史日（当日未发布不可当空榜）。
+	svc.now = func() time.Time { return time.Date(2026, 7, 28, 20, 0, 0, 0, time.Local) }
+	svc.fetchLhbDaily = func(context.Context, string) ([]datasource.LhbRow, error) {
+		return nil, nil // 上游明确回空
+	}
+	svc.fetchLhbOrgDaily = func(context.Context, string) ([]datasource.LhbOrgRow, error) {
+		return nil, datasource.ErrNoData
+	}
+
+	for i := 1; i < lhbSkipAfterFails; i++ {
+		if svc.runMoodLhb(context.Background(), "2026-07-27") {
+			t.Fatalf("第 %d 轮尚未达确认阈值，不应收口", i)
+		}
+		if got := optionValue(optMoodLhbDay); got != "2026-07-24" {
+			t.Fatalf("第 %d 轮不得推进游标, got %s", i, got)
+		}
+	}
+	if !svc.runMoodLhb(context.Background(), "2026-07-27") {
+		t.Fatal("多轮确认为空榜后应收口并追平")
+	}
+	if got := optionValue(optMoodLhbDay); got != "2026-07-27" {
+		t.Fatalf("空榜确认后应推进游标, got %s", got)
+	}
+	if got := loadLhbGaps(); len(got) != 0 {
+		t.Fatalf("可证明的空榜不进缺口清单, got %v", got)
+	}
+
+	// 反例：同样的 ErrNoData 若发生在**当日**（未过发布窗口），永远不得收口为空榜。
+	resetLhbGapState(t)
+	if err := model.UpsertOption(optMoodLhbDay, "2026-07-24"); err != nil {
+		t.Fatal(err)
+	}
+	svc.now = func() time.Time { return time.Date(2026, 7, 27, 19, 0, 0, 0, time.Local) }
+	for i := 0; i < lhbSkipAfterFails+2; i++ {
+		if svc.runMoodLhb(context.Background(), "2026-07-27") {
+			t.Fatal("当日尚未发布的空结果不得收口为空榜")
+		}
+	}
+	if got := optionValue(optMoodLhbDay); got != "2026-07-24" {
+		t.Fatalf("当日空结果不得推进游标, got %s", got)
+	}
+}
+
 // computeMoodDaily：连板分布/最高连板/炸板率/昨涨停溢价/封板资金 top 的手工验算。
 func TestComputeMoodDaily(t *testing.T) {
 	zt := []datasource.ZTPoolItem{
@@ -185,7 +363,10 @@ func TestSyncLhbAndSignals(t *testing.T) {
 	}
 
 	// 详情页记录：2 行 + 机构净买合并。
-	recs := svc.StockLhbRecords(context.Background(), "002185", 10)
+	recs, err := svc.StockLhbRecords(context.Background(), "002185", 10)
+	if err != nil {
+		t.Fatalf("上榜记录查询失败: %v", err)
+	}
 	if len(recs) != 2 {
 		t.Fatalf("上榜记录应 2 行，got %d", len(recs))
 	}
@@ -323,10 +504,12 @@ func TestMoodQueriesHonorCanceledContext(t *testing.T) {
 		{"lhb", func() error { _, err := svc.LhbDaily(ctx, "cn", "", 50); return err }},
 		{"popularity", func() error { _, err := svc.PopularityDaily(ctx, "cn", ""); return err }},
 		{"stock_lhb", func() error {
-			if rows := svc.StockLhbRecords(ctx, "002185", 10); len(rows) != 0 {
+			// 服务层如实返回 DB/context 错误（不再由测试自行伪造 ctx.Err 冒充失败）。
+			rows, err := svc.StockLhbRecords(ctx, "002185", 10)
+			if len(rows) != 0 {
 				return errors.New("取消后仍返回龙虎榜记录")
 			}
-			return ctx.Err()
+			return err
 		}},
 	}
 	for _, tt := range tests {
@@ -567,6 +750,7 @@ func TestLhbPendingDates(t *testing.T) {
 func TestRunMoodLhbStopsAtFirstGap(t *testing.T) {
 	setupTestDB(t)
 	cleanMoodTables(t)
+	resetLhbGapState(t) // 失败计数与缺口清单是包级全局，先清场
 	common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
 	common.DB.Where("`key` = ?", optMoodLhbDay).Delete(&model.Option{})
 	t.Cleanup(func() {
@@ -634,6 +818,7 @@ func TestRunMoodLhbStopsAtFirstGap(t *testing.T) {
 func TestRunMoodLhbRepairsIncompleteCalendarBeforeSync(t *testing.T) {
 	setupTestDB(t)
 	cleanMoodTables(t)
+	resetLhbGapState(t)
 	common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
 	common.DB.Where("`key` = ?", optMoodLhbDay).Delete(&model.Option{})
 	t.Cleanup(func() {
@@ -673,6 +858,7 @@ func TestRunMoodLhbRepairsIncompleteCalendarBeforeSync(t *testing.T) {
 func TestRunMoodLhbV2CursorIgnoresLegacyCompletion(t *testing.T) {
 	setupTestDB(t)
 	cleanMoodTables(t)
+	resetLhbGapState(t)
 	common.DB.Where("1 = 1").Delete(&model.TradingCalendar{})
 	common.DB.Where("`key` IN ?", []string{optMoodLhbLegacyDay, optMoodLhbDay}).Delete(&model.Option{})
 	t.Cleanup(func() {

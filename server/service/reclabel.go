@@ -41,10 +41,10 @@ const (
 
 // gateNote 阶段③/④产生的门控记录（影子或名单裁剪），随事件落库。
 type gateNote struct {
-	Symbol      string
-	GateType    string // model.GateRegimeShadow / GateBearShadow / GateQualityShadow / GateCorrelation / GateIndustryCap
-	GateVersion string // 产生该门控的判定版本（空=沿用 regimeVersion，兼容第一批落库口径）
-	Reason      string
+	Symbol        string
+	GateType      string // model.GateRegimeShadow / GateBearShadow / GateQualityShadow / GateCorrelation / GateIndustryCap
+	GateVersion   string // 产生该门控的判定版本（空=沿用 regimeVersion，兼容第一批落库口径）
+	Reason        string
 	WouldBeAction string // 影子门控「若强制会改写成」；名单裁剪/质量封顶类为空
 	// AllTypes 合并后携带的全部命中门控（含主门控，按优先级排序）——mergeGateNotes
 	// 填充，落库进事件行 GateTypes；单门控时为 nil（落库回退 GateType 单值）。
@@ -352,8 +352,8 @@ func AdvanceRecommendationLabels(ctx context.Context, market *MarketService) (in
 const labelFarFuture = "9999-12-31"
 
 // labelAxisDates 市场轴定位：signalDate 之后第 1 个交易日（计划买入日）与卖出日
-//（卖出根 = 买入根 + horizon，即买入根之后第 horizon 个交易日）。轴为空返回两个空串
-//（回退旧口径）；轴覆盖不足时到期日返回哨兵（数据未到，必 pending）。
+// （卖出根 = 买入根 + horizon，即买入根之后第 horizon 个交易日）。轴为空返回两个空串
+// （回退旧口径）；轴覆盖不足时到期日返回哨兵（数据未到，必 pending）。
 func labelAxisDates(axis []string, signalDate string, horizon int) (nextDate, sellDate string) {
 	if len(axis) == 0 {
 		return "", ""
@@ -374,6 +374,19 @@ func labelAxisDates(axis []string, signalDate string, horizon int) (nextDate, se
 	return nextDate, sellDate
 }
 
+// labelAgeAnchor 标签「超窗」判定的年龄锚点。
+//   - next_open：信号日（拨款次日开盘入场，窗口自信号日起算，口径不变）；
+//   - actual_position：**实际建仓日**。持仓血缘通常晚于推荐建立，旧推荐今天新建仓时若
+//     仍按信号日计龄，标签一诞生就已「超窗」，会被立刻判 no_data，或在刚入场当天按个股
+//     末根收盘 Forced 强平——两者都是提前成熟的假数据，且 actual_position 是持续积累的
+//     事实表，脏数据是永久写入。EntryDate 为空（尚未补出建仓日）时回退信号日。
+func labelAgeAnchor(l *model.RecommendationLabel) string {
+	if l.EntryMode == model.EntryModeActual && l.EntryDate != "" {
+		return l.EntryDate
+	}
+	return l.SignalDate
+}
+
 // advanceOneLabel 结算单条标签；返回是否有状态变化需要落库。
 func advanceOneLabel(l *model.RecommendationLabel, bars []datasource.Bar, name string, axis []string, benchClose map[string]float64, today string) bool {
 	// 定位信号根：<= signal_date 的最后一根（推荐日盘中/盘后生成都算当日信号，
@@ -387,7 +400,7 @@ func advanceOneLabel(l *model.RecommendationLabel, bars []datasource.Bar, name s
 	}
 	if i < 0 || len(bars) == 0 {
 		// 无信号日及之前的日线：超过窗口仍无数据判 no_data，否则继续等。
-		if daysBetween(l.SignalDate, today) > labelNoDataAfterDays {
+		if daysBetween(labelAgeAnchor(l), today) > labelNoDataAfterDays {
 			l.MaturityStatus = model.LabelNoData
 			l.LabelVersion = labelVersion
 			return true
@@ -424,7 +437,7 @@ func advanceOneLabel(l *model.RecommendationLabel, bars []datasource.Bar, name s
 	}
 	switch out.Status {
 	case btPending:
-		if daysBetween(l.SignalDate, today) > labelNoDataAfterDays {
+		if daysBetween(labelAgeAnchor(l), today) > labelNoDataAfterDays {
 			// 超窗仍 pending：已入场（BuyDate 非空）且无市场轴可判到期 → 用个股末根
 			// 收盘强平（Forced），落入下方成熟写回；从未入场或补不出 → no_data 终态。
 			if out.BuyDate != "" && forceCloseStaleLabel(l, &out, bars) {

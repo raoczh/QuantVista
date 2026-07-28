@@ -87,6 +87,14 @@ const aiStreamMaxDuration = 10 * time.Minute
 // 留 4 个余量兼容中转网关插入的心跳/空事件；超限即收尾，不为拿 usage 赌上 ctx deadline。
 const streamPostFinishMaxEvents = 4
 
+// streamPostFinishWait 收到 finish_reason 后等 usage 尾块的**墙钟**上限。
+// 事件计数只在上游还在发 data 事件时才推进：上游报完 finish_reason 后既不发事件也不关
+// 连接（静默 hang），或只发 SSE 注释心跳（`:` 开头，按协议不是事件），阻塞的 Scan 会一路
+// 挂到 ctx deadline（可达 aiStreamMaxDuration 10 分钟）——一次分析调用就此僵死。
+// 到期强制关闭响应体让 Scan 立即返回；此时 done 已为真，已聚合的正文与 finish_reason
+// 照常收尾，只是 usage 回落字符粗估。
+const streamPostFinishWait = 2 * time.Second
+
 // ensureDeadline ctx 无 deadline 时补一个流式上限（有 deadline 则原样返回）。
 func ensureDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
 	if _, ok := ctx.Deadline(); ok {
@@ -856,6 +864,20 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 	done := false
 	// postFinishEvents 收到 finish_reason 之后额外读取的事件数（见循环内续读说明）。
 	postFinishEvents := 0
+	// postFinishTimer 续读窗口的墙钟闸（见 streamPostFinishWait）：finish_reason 到达时
+	// 起表，到期关闭响应体解阻塞。只起一次；正常收尾时由 defer 停表。
+	var postFinishTimer *time.Timer
+	defer func() {
+		if postFinishTimer != nil {
+			postFinishTimer.Stop()
+		}
+	}()
+	armPostFinishDeadline := func() {
+		if postFinishTimer != nil {
+			return
+		}
+		postFinishTimer = time.AfterFunc(streamPostFinishWait, func() { resp.Body.Close() })
+	}
 	contractEnabled := p.accuracyContractEnabled()
 	// partialResult 拒收/中断路径的审计结果（audit outcome）：把已聚合的正文、上游报告的
 	// usage 与原始终态随错误一并带出——writeLLMCallLog 与 run.record 据此保留真实上游
@@ -942,6 +964,7 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 			if c.FinishReason != nil && *c.FinishReason != "" {
 				finishReason = *c.FinishReason
 				done = true
+				armPostFinishDeadline()
 			}
 		}
 		// 已拿到上游真实 usage 即可收尾（覆盖「usage 与 finish_reason 同块」的非标准形态）；

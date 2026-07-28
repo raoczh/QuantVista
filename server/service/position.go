@@ -10,6 +10,8 @@ import (
 	"quantvista/common"
 	"quantvista/datasource"
 	"quantvista/model"
+
+	"gorm.io/gorm"
 )
 
 // PositionService 已购入持仓。按 userID 隔离；盈亏用实时行情计算，不落库快照。
@@ -66,16 +68,27 @@ const nearStopLossPct = 3.0
 const analysisStaleDays = 7
 
 // computeView 计算单条持仓的成本/现值/盈亏。price 为持仓中的实时现价，hasQuote 表示是否取到。
+//
+// 已平仓分两种口径：
+//   - **账本口径**（TotalBuyCost>0，即已有流水）：成本/回收/盈亏全部取累计汇总列，
+//     这是分批卖出唯一正确的算法——BuyPrice/Quantity 只描述「当前剩余」，清仓后为 0。
+//   - **旧记录兜底**（尚未惰性补流水）：保持原算式逐字节等价，避免补建前后数字跳变。
 func computeView(p model.Position, price float64, hasQuote bool) PositionView {
 	v := PositionView{Position: p}
 	v.Cost = p.BuyPrice*p.Quantity + p.BuyFee + p.BuyTax
 
 	if p.Status == model.PositionStatusClosed {
 		// 已平仓：盈亏已实现，扣买卖全部费税。
-		proceeds := p.SellPrice * p.Quantity
+		if p.TotalBuyCost > 0 {
+			v.Cost = p.TotalBuyCost
+			v.MarketValue = p.TotalSellNet
+			v.ProfitAmount = p.RealizedPnl
+		} else {
+			proceeds := p.SellPrice * p.Quantity
+			v.MarketValue = proceeds
+			v.ProfitAmount = proceeds - p.SellFee - p.SellTax - v.Cost
+		}
 		v.CurrentPrice = p.SellPrice
-		v.MarketValue = proceeds
-		v.ProfitAmount = proceeds - p.SellFee - p.SellTax - v.Cost
 		v.Realized = true
 		v.QuoteOK = true
 	} else if hasQuote {
@@ -93,18 +106,32 @@ func computeView(p model.Position, price float64, hasQuote bool) PositionView {
 
 // List 列出持仓（status: holding/closed/all），富化实时盈亏。
 func (s *PositionService) List(ctx context.Context, userID int64, status string) ([]PositionView, error) {
-	q := common.DB.Where("user_id = ?", userID)
 	switch status {
-	case model.PositionStatusHolding, model.PositionStatusClosed:
-		q = q.Where("status = ?", status)
-	case "", "all":
-		// 全部
+	case model.PositionStatusHolding, model.PositionStatusClosed, "", "all":
 	default:
 		return nil, errors.New("非法的状态筛选")
 	}
-	var positions []model.Position
-	if err := q.Order("status, id DESC").Find(&positions).Error; err != nil {
+	// 每次重建查询：GORM 链式对象执行后不可复用（条件会累积）。
+	loadPositions := func() ([]model.Position, error) {
+		q := common.DB.Where("user_id = ?", userID)
+		if status == model.PositionStatusHolding || status == model.PositionStatusClosed {
+			q = q.Where("status = ?", status)
+		}
+		var rows []model.Position
+		err := q.Order("status, id DESC").Find(&rows).Error
+		return rows, err
+	}
+	positions, err := loadPositions()
+	if err != nil {
 		return nil, err
+	}
+	// B5 惰性补流水：老持仓（无流水）补一笔等价买入并回填累计汇总列。幂等、并发安全，
+	// 且**不改变任何既有汇总值**（见 ensurePositionTradesTx）。补完重读一次，
+	// 让本次响应就与库内一致，不必让用户刷第二次才看到流水。
+	if backfillPositionLedgers(userID, positions) {
+		if positions, err = loadPositions(); err != nil {
+			return nil, err
+		}
 	}
 
 	// 仅持仓中的需要现价。行情时效 fail-closed：走 FreshQuotesFor（全源换源找当前
@@ -275,6 +302,9 @@ func (s *PositionService) Overview(ctx context.Context, userID int64) (*Portfoli
 			continue
 		}
 		ov.HoldingCount++
+		// 持仓中也可能已部分兑现（B5 减仓）：这部分已落袋，与浮盈分开累加，
+		// 不能因为「仓位还在」就当没赚过。
+		ov.RealizedProfit += v.RealizedPnl
 		ov.TotalCost += v.Cost
 		if v.QuoteOK {
 			pricedCost += v.Cost
@@ -514,7 +544,16 @@ func (s *PositionService) Create(ctx context.Context, userID int64, in PositionI
 
 		RecommendationID: in.RecommendationID,
 	}
-	if err := common.DB.Create(p).Error; err != nil {
+	// 建仓即写首笔 buy 流水（账本从第一天自洽），并初始化累计汇总列。
+	p.TotalBuyCost = round4(in.BuyPrice*in.Quantity + in.BuyFee + in.BuyTax)
+	p.TotalBuyQty = in.Quantity
+	if err := common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(p).Error; err != nil {
+			return err
+		}
+		trade := buildInitialTrade(p)
+		return tx.Create(&trade).Error
+	}); err != nil {
 		return nil, err
 	}
 	return p, nil
@@ -522,46 +561,85 @@ func (s *PositionService) Create(ctx context.Context, userID int64, in PositionI
 
 // Update 编辑持仓的买入信息与备注（仅本人；不在此改状态/卖出）。
 // 已平仓持仓的买入字段冻结（改动会直接改变已实现盈亏），仅允许改备注类字段。
+//
+// **不得绕过流水破坏账本**（B5）：一旦持仓有过真实加/减仓（流水多于建仓那一笔），
+// 直接改写 BuyPrice/Quantity/BuyFee/BuyTax 会让汇总与明细永久对不上——此时买入字段
+// 一律冻结，改数量走加仓/减仓，改错价走「删除重建」。只有「仅有建仓一笔流水」的持仓
+// 允许修正录入错误，且同一事务内把那笔流水一并改掉，保持流水↔汇总严格自洽。
 func (s *PositionService) Update(userID, id int64, in PositionInput) (*model.Position, error) {
-	var p model.Position
-	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&p).Error; err != nil {
-		return nil, errors.New("持仓不存在")
-	}
-	if p.Status == model.PositionStatusClosed {
+	var out model.Position
+	err := common.DB.Transaction(func(tx *gorm.DB) error {
+		var p model.Position
+		if err := lockedPosition(tx, userID, id, &p); err != nil {
+			return errors.New("持仓不存在")
+		}
+		if p.Status == model.PositionStatusClosed {
+			p.BuyReason = truncateRunes(strings.TrimSpace(in.BuyReason), 500)
+			p.UserNote = truncateRunes(strings.TrimSpace(in.UserNote), 500)
+			if err := tx.Save(&p).Error; err != nil {
+				return err
+			}
+			out = p
+			return nil
+		}
+		if err := ensurePositionTradesTx(tx, &p); err != nil {
+			return err
+		}
+		var trades []model.PositionTrade
+		if err := tx.Where("position_id = ? AND user_id = ?", p.ID, userID).
+			Order("id ASC").Find(&trades).Error; err != nil {
+			return err
+		}
+		buyFieldsChanged := in.BuyPrice != p.BuyPrice || in.Quantity != p.Quantity ||
+			in.BuyFee != p.BuyFee || in.BuyTax != p.BuyTax || in.BuyDate != p.BuyDate
+		if len(trades) > 1 && buyFieldsChanged {
+			return errors.New("该持仓已有加/减仓流水，买入价格、数量与费税不能直接编辑（请用加仓/减仓，或删除持仓重建）")
+		}
+		if err := validateBuy(&in); err != nil {
+			return err
+		}
+		p.PositionType = in.PositionType
+		p.BuyPrice = in.BuyPrice
+		p.BuyDate = in.BuyDate
+		p.Quantity = in.Quantity
+		p.BuyFee = in.BuyFee
+		p.BuyTax = in.BuyTax
 		p.BuyReason = truncateRunes(strings.TrimSpace(in.BuyReason), 500)
 		p.UserNote = truncateRunes(strings.TrimSpace(in.UserNote), 500)
-		if err := common.DB.Save(&p).Error; err != nil {
-			return nil, err
+		p.PlanStopLoss = in.PlanStopLoss
+		p.PlanTakeProfit = in.PlanTakeProfit
+		if in.ChecklistJSON != nil {
+			p.ChecklistJSON = *in.ChecklistJSON
 		}
-		return &p, nil
-	}
-	if err := validateBuy(&in); err != nil {
+		if c := strings.TrimSpace(in.Currency); c != "" {
+			currency, err := normalizeCurrency(c, p.Market)
+			if err != nil {
+				return err
+			}
+			p.Currency = currency
+		}
+		// 唯一那笔建仓流水与汇总列同步改写，账本保持自洽。
+		p.TotalBuyCost = round4(in.BuyPrice*in.Quantity + in.BuyFee + in.BuyTax)
+		p.TotalBuyQty = in.Quantity
+		if len(trades) == 1 {
+			t := trades[0]
+			t.Price, t.Quantity, t.Fee, t.Tax = in.BuyPrice, in.Quantity, in.BuyFee, in.BuyTax
+			t.TradeDate = in.BuyDate
+			t.AvgCostAfter, t.QuantityAfter = in.BuyPrice, in.Quantity
+			if err := tx.Save(&t).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Save(&p).Error; err != nil {
+			return err
+		}
+		out = p
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	p.PositionType = in.PositionType
-	p.BuyPrice = in.BuyPrice
-	p.BuyDate = in.BuyDate
-	p.Quantity = in.Quantity
-	p.BuyFee = in.BuyFee
-	p.BuyTax = in.BuyTax
-	p.BuyReason = truncateRunes(strings.TrimSpace(in.BuyReason), 500)
-	p.UserNote = truncateRunes(strings.TrimSpace(in.UserNote), 500)
-	p.PlanStopLoss = in.PlanStopLoss
-	p.PlanTakeProfit = in.PlanTakeProfit
-	if in.ChecklistJSON != nil {
-		p.ChecklistJSON = *in.ChecklistJSON
-	}
-	if c := strings.TrimSpace(in.Currency); c != "" {
-		currency, err := normalizeCurrency(c, p.Market)
-		if err != nil {
-			return nil, err
-		}
-		p.Currency = currency
-	}
-	if err := common.DB.Save(&p).Error; err != nil {
-		return nil, err
-	}
-	return &p, nil
+	return &out, nil
 }
 
 // CloseInput 平仓（标记已卖出）入参。
@@ -582,13 +660,12 @@ var validSellPlanned = map[string]bool{"": true, "yes": true, "no": true, "parti
 var validAiVerdict = map[string]bool{"": true, "right": true, "wrong": true, "mixed": true, "unused": true}
 
 // Close 标记持仓已卖出并填写复盘（仅本人；重复平仓报错）。
+// **走与加减仓完全相同的流水逻辑**（B5）：一次性平仓 = 卖出当前全部剩余数量的减仓笔，
+// 复盘字段随该笔写入。绝不再直接改状态——否则「一键平仓」会绕过账本，
+// 已实现盈亏与流水明细当场对不上。
 func (s *PositionService) Close(userID, id int64, in CloseInput) (*model.Position, error) {
-	var p model.Position
-	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&p).Error; err != nil {
-		return nil, errors.New("持仓不存在")
-	}
-	if p.Status == model.PositionStatusClosed {
-		return nil, errors.New("该持仓已卖出")
+	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
 	}
 	if in.SellPrice <= 0 {
 		return nil, errors.New("卖出价格必须大于 0")
@@ -600,9 +677,6 @@ func (s *PositionService) Close(userID, id int64, in CloseInput) (*model.Positio
 		if _, err := time.Parse("2006-01-02", in.SellDate); err != nil {
 			return nil, errors.New("卖出日期格式应为 YYYY-MM-DD")
 		}
-		if p.BuyDate != "" && in.SellDate < p.BuyDate {
-			return nil, errors.New("卖出日期不能早于买入日期")
-		}
 	}
 	if !validSellPlanned[in.SellPlanned] {
 		return nil, errors.New("是否按计划卖出取值须为 yes/no/partial")
@@ -610,30 +684,36 @@ func (s *PositionService) Close(userID, id int64, in CloseInput) (*model.Positio
 	if !validAiVerdict[in.AiVerdict] {
 		return nil, errors.New("AI 判断对错取值须为 right/wrong/mixed/unused")
 	}
-	p.Status = model.PositionStatusClosed
-	p.SellPrice = in.SellPrice
-	p.SellDate = in.SellDate
-	p.SellFee = in.SellFee
-	p.SellTax = in.SellTax
-	p.SellReason = truncateRunes(strings.TrimSpace(in.SellReason), 500)
-	p.ReviewNote = truncateRunes(strings.TrimSpace(in.ReviewNote), 500)
-	p.SellPlanned = in.SellPlanned
-	p.AiVerdict = in.AiVerdict
-	p.LessonLearned = truncateRunes(strings.TrimSpace(in.LessonLearned), 500)
-	if err := common.DB.Save(&p).Error; err != nil {
-		return nil, err
+	var p model.Position
+	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&p).Error; err != nil {
+		return nil, errors.New("持仓不存在")
 	}
-	return &p, nil
+	if p.Status == model.PositionStatusClosed {
+		return nil, errors.New("该持仓已卖出")
+	}
+	if in.SellDate != "" && p.BuyDate != "" && in.SellDate < p.BuyDate {
+		return nil, errors.New("卖出日期不能早于买入日期")
+	}
+	return s.AddTrade(userID, id, PositionTradeInput{
+		Side: model.PositionTradeSell, Price: in.SellPrice, Quantity: p.Quantity,
+		Fee: in.SellFee, Tax: in.SellTax, TradeDate: in.SellDate, Note: "平仓",
+		SellReason: in.SellReason, ReviewNote: in.ReviewNote,
+		SellPlanned: in.SellPlanned, AiVerdict: in.AiVerdict, LessonLearned: in.LessonLearned,
+	})
 }
 
-// Delete 删除持仓（仅本人）。
+// Delete 删除持仓（仅本人）。流水是持仓的从属明细，随持仓一并删除（同一事务），
+// 否则会留下无主流水污染复盘统计。
 func (s *PositionService) Delete(userID, id int64) error {
-	res := common.DB.Where("id = ? AND user_id = ?", id, userID).Delete(&model.Position{})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return errors.New("持仓不存在")
-	}
-	return nil
+	return common.DB.Transaction(func(tx *gorm.DB) error {
+		res := tx.Where("id = ? AND user_id = ?", id, userID).Delete(&model.Position{})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return errors.New("持仓不存在")
+		}
+		return tx.Where("position_id = ? AND user_id = ?", id, userID).
+			Delete(&model.PositionTrade{}).Error
+	})
 }

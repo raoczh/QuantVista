@@ -12,6 +12,8 @@ import (
 
 	"quantvista/common"
 	"quantvista/model"
+
+	"gorm.io/gorm"
 )
 
 // ExportService 用户数据 CSV 导出与持仓 CSV 导入。
@@ -102,6 +104,9 @@ func (s *ExportService) positionRows(userID int64) ([][]string, error) {
 		"buy_price", "buy_date", "quantity", "buy_fee", "buy_tax", "buy_reason",
 		"plan_stop_loss", "plan_take_profit",
 		"sell_price", "sell_date", "sell_fee", "sell_tax", "sell_reason", "review_note",
+		// B5 账本汇总：quantity 是**当前剩余**数量（全部卖出后为 0），
+		// 「一共买过多少 / 一共赚了多少」看下面三列。
+		"total_buy_qty", "total_buy_cost", "total_sell_net", "realized_pnl",
 		"recommendation_id", "created_at",
 	}}
 	for _, p := range ps {
@@ -110,6 +115,7 @@ func (s *ExportService) positionRows(userID int64) ([][]string, error) {
 			f2(p.BuyPrice), p.BuyDate, f2(p.Quantity), f2(p.BuyFee), f2(p.BuyTax), p.BuyReason,
 			f2(p.PlanStopLoss), f2(p.PlanTakeProfit),
 			f2(p.SellPrice), p.SellDate, f2(p.SellFee), f2(p.SellTax), p.SellReason, p.ReviewNote,
+			f2(p.TotalBuyQty), f2(p.TotalBuyCost), f2(p.TotalSellNet), f2(p.RealizedPnl),
 			strconv.FormatInt(p.RecommendationID, 10), p.CreatedAt.Format(csvTimeLayout),
 		})
 	}
@@ -266,7 +272,23 @@ func (s *ExportService) ImportPositions(userID int64, r io.Reader) (*ImportResul
 	if len(pending) == 0 {
 		return res, nil
 	}
-	if err := common.DB.CreateInBatches(pending, 100).Error; err != nil {
+	// 导入的持仓同样要有账本首笔 buy 流水（B5），否则「导入的仓位没有流水」会在
+	// 加减仓时才惰性补，且导入当下的汇总列为空。整批同事务：要么全成要么全不成。
+	if err := common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.CreateInBatches(pending, 100).Error; err != nil {
+			return err
+		}
+		trades := make([]model.PositionTrade, 0, len(pending))
+		for i := range pending {
+			trades = append(trades, model.PositionTrade{
+				UserID: pending[i].UserID, PositionID: pending[i].ID, Side: model.PositionTradeBuy,
+				Price: pending[i].BuyPrice, Quantity: pending[i].Quantity,
+				Fee: pending[i].BuyFee, Tax: pending[i].BuyTax, TradeDate: pending[i].BuyDate,
+				Note: "CSV 导入建仓", AvgCostAfter: pending[i].BuyPrice, QuantityAfter: pending[i].Quantity,
+			})
+		}
+		return tx.CreateInBatches(trades, 100).Error
+	}); err != nil {
 		return nil, err
 	}
 	res.Imported = len(pending)
@@ -317,6 +339,8 @@ func parseImportRow(userID int64, rec []string, get func([]string, string) strin
 		Currency: defaultCurrencyFor(market),
 		BuyPrice: buyPrice, BuyDate: buyDate, Quantity: qty, BuyFee: fee, BuyTax: tax,
 		BuyReason: truncateRunes(get(rec, "reason"), 500),
+		// B5 账本汇总初值（与首笔 buy 流水同源）。
+		TotalBuyCost: round4(buyPrice*qty + fee + tax), TotalBuyQty: qty,
 	}, nil
 }
 

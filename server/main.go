@@ -57,6 +57,11 @@ func main() {
 	service.StartMoodJobs(mgr)
 	service.StartIntradayJobs()
 	service.StartLLMLogJobs()
+	// B7 资产曲线：交易日 16:20 为全部用户落真实持仓/模拟盘资产快照（幂等 upsert）。
+	service.StartPortfolioSnapshotJob(
+		service.NewPositionService(service.NewMarketService(mgr)),
+		service.NewPaperService(service.NewMarketService(mgr)),
+	)
 
 	if !common.DebugEnabled {
 		gin.SetMode(gin.ReleaseMode)

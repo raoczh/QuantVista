@@ -24,6 +24,7 @@ import {
   type PopularityDailyItem,
 } from '@/api/market'
 import { useUi, withAlpha } from '@/composables/useUi'
+import { isAbortError } from '@/api/client'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import StatCard from '@/components/StatCard.vue'
@@ -50,33 +51,45 @@ const lhbRows = computed<LhbTableRow[]>(() =>
   })),
 )
 
+// 三个查询共用一个中止器：重复点刷新/组件卸载时中止上一轮，迟到响应不再回填。
+let loadAbort: AbortController | null = null
+// 轮次序号：只有最新一轮的结果允许落地（abort 之外再加一道守卫，
+// 因为 Promise.allSettled 里已完成的分支不会被 abort 影响）。
+let loadSeq = 0
+
 async function load() {
+  loadAbort?.abort()
+  const myAbort = new AbortController()
+  loadAbort = myAbort
+  const mySeq = ++loadSeq
   loading.value = true
   moodError.value = ''
   lhbError.value = ''
   popularityError.value = ''
   const [moodResult, lhbResult, popularityResult] = await Promise.allSettled([
-    getMarketMood('cn', 30),
-    getMarketLhb('cn', '', 100),
-    getMarketPopularity('cn'),
+    getMarketMood('cn', 30, myAbort.signal),
+    getMarketLhb('cn', '', 100, myAbort.signal),
+    getMarketPopularity('cn', '', myAbort.signal),
   ])
+  if (mySeq !== loadSeq) return
   if (moodResult.status === 'fulfilled') mood.value = moodResult.value
-  else {
+  else if (!isAbortError(moodResult.reason)) {
     mood.value = null
     moodError.value = errorText(moodResult.reason)
   }
   if (lhbResult.status === 'fulfilled') lhb.value = lhbResult.value
-  else {
+  else if (!isAbortError(lhbResult.reason)) {
     lhb.value = null
     lhbError.value = errorText(lhbResult.reason)
   }
   if (popularityResult.status === 'fulfilled') popularity.value = popularityResult.value
-  else {
+  else if (!isAbortError(popularityResult.reason)) {
     popularity.value = null
     popularityError.value = errorText(popularityResult.reason)
   }
   loading.value = false
   await nextTick()
+  if (mySeq !== loadSeq) return
   renderTrend()
 }
 
@@ -274,7 +287,9 @@ watch(activeTab, async (tab) => {
     renderTrend()
   }
 })
-watch(isDark, () => renderTrend())
+// 主题变化整套重绘：6 套主题中明暗只是其一，同为浅色的两套换主题时 isDark 不变而
+// primaryColor/errorColor/dividerColor 全变——只监听 isDark 图表会留在旧色板上。
+watch([isDark, vars], () => renderTrend())
 
 onMounted(() => {
   load()
@@ -282,6 +297,9 @@ onMounted(() => {
 })
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
+  loadSeq++
+  loadAbort?.abort()
+  loadAbort = null
   trendChart?.dispose()
   trendChart = null
 })

@@ -93,5 +93,10 @@ func (mc *MoodController) StockLhb(c *gin.Context) {
 			limit = n
 		}
 	}
-	common.ApiSuccess(c, mc.svc.StockLhbRecords(c.Request.Context(), c.Param("symbol"), limit))
+	rows, err := mc.svc.StockLhbRecords(c.Request.Context(), c.Param("symbol"), limit)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, rows)
 }

@@ -153,6 +153,90 @@ func TestChatCompletionStream_NoUsageAfterFinishStillTerminates(t *testing.T) {
 	}
 }
 
+// TestChatCompletionStream_SilentAfterFinishTerminatesByWallClock 上游报完 finish_reason 后
+// **完全静默**（不发任何事件、也不关连接）：事件计数永远不会推进（它只在有 data 事件到达时
+// 才加），旧实现会一路阻塞到 ctx deadline（生产上是 aiStreamMaxDuration 10 分钟）。
+// 墙钟闸必须在 streamPostFinishWait 内解阻塞并正常收尾。
+func TestChatCompletionStream_SilentAfterFinishTerminatesByWallClock(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"答案"}}]}` + "\n"))
+		_, _ = w.Write([]byte(`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n"))
+		fl.Flush()
+		<-r.Context().Done() // 静默 hang：等客户端断开
+	}))
+	defer srv.Close()
+
+	// ctx 上限远大于墙钟：若靠 ctx 兜底，本测试会跑满 30s 而不是 ~2s。
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	res, err := chatCompletionStream(ctx, chatParams{
+		BaseURL: srv.URL, APIKey: "k", Model: "m",
+		Messages:     []chatMessage{{Role: "user", Content: "hi"}},
+		AllowPrivate: true,
+	}, nil)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("墙钟到期应正常收尾: %v", err)
+	}
+	if res.Content != "答案" || res.FinishReason != "stop" {
+		t.Fatalf("正文/终态不符: %q %q", res.Content, res.FinishReason)
+	}
+	if res.Usage.TotalTokens == 0 {
+		t.Fatal("拿不到上游 usage 时应回落字符粗估")
+	}
+	if elapsed > streamPostFinishWait+5*time.Second {
+		t.Fatalf("静默连接必须在续读墙钟内返回，实耗 %v（墙钟 %v）", elapsed, streamPostFinishWait)
+	}
+}
+
+// TestChatCompletionStream_CommentHeartbeatAfterFinishTerminates 上游报完 finish_reason 后
+// 只发 SSE 注释心跳（`:` 开头）：按协议注释不是事件，不进 postFinishEvents 预算，
+// 只有墙钟能兜住。断言在墙钟内返回而不是被心跳一直喂着读到 ctx deadline。
+func TestChatCompletionStream_CommentHeartbeatAfterFinishTerminates(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":"答案"}}]}` + "\n"))
+		_, _ = w.Write([]byte(`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n"))
+		fl.Flush()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			default:
+			}
+			if _, err := w.Write([]byte(": keep-alive\n\n")); err != nil {
+				return
+			}
+			fl.Flush()
+			time.Sleep(20 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	res, err := chatCompletionStream(ctx, chatParams{
+		BaseURL: srv.URL, APIKey: "k", Model: "m",
+		Messages:     []chatMessage{{Role: "user", Content: "hi"}},
+		AllowPrivate: true,
+	}, nil)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("仅注释心跳时应正常收尾: %v", err)
+	}
+	if res.Content != "答案" || res.FinishReason != "stop" {
+		t.Fatalf("正文/终态不符: %q %q", res.Content, res.FinishReason)
+	}
+	if elapsed > streamPostFinishWait+5*time.Second {
+		t.Fatalf("仅注释心跳必须在续读墙钟内返回，实耗 %v（墙钟 %v）", elapsed, streamPostFinishWait)
+	}
+}
+
 // TestChatCompletionStream_HTTPError 建流前的 4xx 报带状态提示的错误。
 func TestChatCompletionStream_HTTPError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

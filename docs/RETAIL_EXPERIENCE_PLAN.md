@@ -9,7 +9,7 @@
 >
 > 权威性：本文档是散户体验域的施工图与验收依据。防回归要点入 `ROADMAP.md` §3。
 >
-> **实施状态（2026-07-27）**：第一批 A1~A4 已完成代码实现与程序化测试；B5~C13 按第二至第四批继续实施。
+> **实施状态（2026-07-28）**：第一批 A1~A4、第二批 B5~B7 已完成代码实现与程序化测试；B8~C13 按第三、四批继续实施。
 
 ---
 
@@ -127,6 +127,9 @@ https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600000,m1,,240
 ## 4. 第二批：个人账本（B5~B7）
 
 > 主题：**把「持仓」从一条静态记录升级为一本真实账本**。
+>
+> **实施状态（2026-07-28，第五十九批）**：B5~B7 全部落地。与本节原设计的三处偏差如实记录在
+> 各小节的「实施补记」中——都是实施中发现原设计不足而做的加强，不是缩水。
 
 ### B5 分批加仓 / 减仓
 
@@ -146,6 +149,21 @@ https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600000,m1,,240
 - **旧数据兼容**：无流水的存量持仓，读取时**惰性补建**一笔等价 buy 流水（幂等，不改变任何汇总值）。
 - **前端**：`Positions.vue` 每行加「加仓/减仓」入口 + 展开流水明细。
 
+**实施补记（2026-07-28）**：
+
+1. **`RealizedPnl` 一个字段不够**——全部卖出后 `Quantity` 归 0、`BuyFee/BuyTax` 结清，
+   已平仓收益率的分母（累计买入成本）与「一共买过多少股」都无从还原，旧的
+   `computeView` 算式 `SellPrice×Quantity − 卖出费税 − 成本` 在分批卖出下必然算错。
+   故实际落了**四个**汇总列：`RealizedPnl / TotalBuyCost / TotalSellNet / TotalBuyQty`。
+   `computeView` 对已平仓分两路：有流水走账本口径，旧记录（尚未补建）走原算式**逐字节等价**。
+2. **`Close` 改为走同一流水逻辑**（= 卖出全部剩余数量的减仓笔 + 复盘字段），
+   不再直接改状态——否则「一键平仓」绕过账本，已实现盈亏与流水当场对不上。
+3. **`Update` 补了防绕过约束**：持仓一旦有过真实加/减仓（流水多于建仓那一笔），
+   买入价格/数量/费税一律冻结；只有「仅建仓一笔」的持仓允许修正录入错误，
+   且同一事务内把那笔流水一并改掉。CSV 导入同样落首笔流水。
+4. **惰性补建不改动 `Quantity/BuyPrice/BuyFee/BuyTax/SellPrice`**：旧 `closed` 记录的
+   `Quantity` 保持为「平仓时的数量」，导出与展示逐字不变；只回填四个新汇总列 + 流水行。
+
 ### B6 个人交易复盘统计
 
 - **新 service** `tradestat.go`：吃已平仓持仓 + 流水，聚合
@@ -156,6 +174,11 @@ https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600000,m1,,240
 - **API**：`GET /api/positions/stats?range=`
 - **前端**：`Positions.vue` 新增「复盘统计」tab。
 
+**实施补记（2026-07-28）**：三处「诚实表达」按纪律落地——①窗口内零样本不给 0% 胜率，
+如实声明「没有样本」；②无亏损交易时盈亏比为 `null`（不是 0 也不是 ∞，样本不足以给出该比值）；
+③行业未积累的标的单列「行业未知」组且**恒排最后**（不摊派到其它行业，也不混在真实取值中间
+被读成「未知行业赚得最多」）；缺买卖日期/无交易日历的样本不进平均持有交易日并计数声明。
+
 ### B7 资产曲线
 
 - **新表** `PortfolioSnapshot`：`user_id / kind(real|paper) / trade_date / market_value / cost /
@@ -165,6 +188,11 @@ https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600000,m1,,240
   不用旧价冒充（沿用 `Overview` 既有 `ValuationNote` 纪律）。
 - **API**：`GET /api/positions/curve?days=`、`GET /api/paper/curve?days=`
 - **前端**：`Positions.vue` / `Paper.vue` 顶部资产曲线图。
+
+**实施补记（2026-07-28）**：①非 fresh 的标的**既不进市值也不进成本**——只剔市值会让浮亏
+等于负的成本，比缺这个点更糟；②模拟盘快照与 `PaperService.Overview` 有意不同：Overview 用
+成本兜底估值保证总资产可读，**快照不兜底**，否则一段停牌期会在曲线上画出一条平直的假净值；
+③曲线点上 partial 日以空心大点标出并在 tooltip 说明，前端不得把 partial 点当完整净值。
 
 ---
 

@@ -102,6 +102,8 @@ export interface BatchHoldStat {
   avg_alpha_pct: number
   alpha_sample: number
   pending: number
+  // 顺延到末根 / 退市长停按末根收盘强平：真实中卖不出，单列剔除不进胜率/均值/alpha。
+  forced: number
   skipped: number
   no_data: number
   alpha_hist: AlphaBucket[]
@@ -134,5 +136,7 @@ export const HOLD_STATUS_LABEL: Record<string, string> = {
   skip_cash: '拨款不足',
   skip_suspend: '停牌',
   pending: '未走完',
+  // 后端把 Forced 成交单独降级为 forced 状态（真实中卖不出，收益偏保守，不进统计）。
+  forced: '强平',
   no_data: '无数据',
 }

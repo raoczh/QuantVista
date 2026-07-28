@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed, nextTick, watch } from 'vue'
 import {
   NButton,
   NInput,
@@ -19,24 +19,28 @@ import {
   NAlert,
   useMessage,
 } from 'naive-ui'
+import * as echarts from 'echarts'
 import {
   getPaperOverview,
   paperTrade,
   getPaperTrades,
   resetPaper,
+  getPaperCurve,
   type PaperOverview,
   type PaperHolding,
   type PaperTrade,
 } from '@/api/paper'
+import type { PortfolioCurve } from '@/api/position'
+import { isAbortError } from '@/api/client'
 import { isEtfSymbol } from '@/api/etf'
-import { useUi } from '@/composables/useUi'
+import { useUi, withAlpha } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import StatCard from '@/components/StatCard.vue'
 import FreshnessTag from '@/components/FreshnessTag.vue'
 
 const message = useMessage()
-const { pctColor, vars } = useUi()
+const { pctColor, vars, isDark } = useUi()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const marketOptions = [
@@ -120,7 +124,130 @@ function fmtTime(t: string) {
   return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : ''
 }
 
-onMounted(load)
+// ---------- B7 资产曲线 ----------
+const curveEl = ref<HTMLDivElement | null>(null)
+let curveChart: echarts.ECharts | null = null
+const curve = ref<PortfolioCurve | null>(null)
+const curveDays = ref(90)
+const curveLoading = ref(false)
+let curveAbort: AbortController | null = null
+let curveSeq = 0
+const curveDayOptions = [
+  { label: '近 30 天', value: 30 },
+  { label: '近 90 天', value: 90 },
+  { label: '近 180 天', value: 180 },
+  { label: '近 1 年', value: 365 },
+]
+
+async function loadCurve() {
+  curveAbort?.abort()
+  const myAbort = new AbortController()
+  curveAbort = myAbort
+  const mySeq = ++curveSeq
+  curveLoading.value = true
+  try {
+    const data = await getPaperCurve(curveDays.value, myAbort.signal)
+    if (mySeq !== curveSeq) return
+    curve.value = data
+    await nextTick()
+    renderCurve()
+  } catch (e) {
+    if (mySeq !== curveSeq || isAbortError(e)) return
+    curve.value = null
+  } finally {
+    if (mySeq === curveSeq) curveLoading.value = false
+  }
+}
+watch(curveDays, () => loadCurve())
+
+function renderCurve() {
+  const c = curve.value
+  if (!curveEl.value || !c?.points.length) {
+    curveChart?.dispose()
+    curveChart = null
+    return
+  }
+  curveChart?.dispose()
+  curveChart = echarts.init(curveEl.value, isDark.value ? 'dark' : undefined)
+  const primary = vars.value.primaryColor
+  const warn = vars.value.warningColor
+  curveChart.setOption({
+    backgroundColor: 'transparent',
+    tooltip: {
+      trigger: 'axis',
+      confine: true,
+      formatter: (ps: { axisValue: string; seriesName: string; value: number; dataIndex: number }[]) => {
+        if (!ps.length) return ''
+        const p = c.points[ps[0].dataIndex]
+        const lines = ps.map((s) => `${s.seriesName} ${fmtMoney(s.value)}`)
+        if (p?.partial) lines.push(`⚠ ${p.note || '当日部分标的无有效行情，非完整净值'}`)
+        return `${ps[0].axisValue}<br/>${lines.join('<br/>')}`
+      },
+    },
+    legend: {
+      top: 0,
+      data: ['总资产', '持仓市值'],
+      textStyle: { color: vars.value.textColor3, fontSize: 11 },
+      itemWidth: 14,
+      itemHeight: 8,
+    },
+    grid: { left: 62, right: 18, top: 30, bottom: 28 },
+    xAxis: {
+      type: 'category',
+      data: c.points.map((p) => p.trade_date),
+      boundaryGap: false,
+      axisLabel: { hideOverlap: true, fontSize: 10 },
+    },
+    yAxis: {
+      type: 'value',
+      scale: true,
+      splitLine: { lineStyle: { color: vars.value.dividerColor } },
+      axisLabel: { fontSize: 10 },
+    },
+    series: [
+      {
+        name: '总资产',
+        type: 'line',
+        data: c.points.map((p) => p.total_assets),
+        symbol: 'circle',
+        // partial 点用空心大点标出：那天有标的没有有效行情，不是完整净值。
+        symbolSize: (_v: number, params: { dataIndex: number }) => (c.points[params.dataIndex]?.partial ? 8 : 3),
+        itemStyle: {
+          color: (params: { dataIndex: number }) => (c.points[params.dataIndex]?.partial ? warn : primary),
+        },
+        lineStyle: { width: 2, color: primary },
+        areaStyle: { color: withAlpha(primary, 0.1) },
+      },
+      {
+        name: '持仓市值',
+        type: 'line',
+        data: c.points.map((p) => p.market_value),
+        symbol: 'none',
+        lineStyle: { width: 1.5, type: 'dashed', color: warn },
+        itemStyle: { color: warn },
+      },
+    ],
+  })
+}
+function onResize() {
+  curveChart?.resize()
+}
+// 主题变化整套重绘（6 套主题里明暗只是其一，只监听 isDark 会留在旧色板上）。
+watch([isDark, vars], () => renderCurve())
+
+onMounted(() => {
+  load()
+  loadCurve()
+  window.addEventListener('resize', onResize)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', onResize)
+  curveSeq++
+  curveAbort?.abort()
+  curveAbort = null
+  curveChart?.dispose()
+  curveChart = null
+})
 </script>
 
 <template>
@@ -150,6 +277,26 @@ onMounted(load)
           <StatCard label="累计已实现" :value="fmtMoney(overview?.realized_pnl ?? 0)" />
         </n-gi>
       </n-grid>
+
+      <!-- B7 资产曲线：读每交易日 16:20 落库的快照，不做插值补造 -->
+      <SectionCard title="资产曲线">
+        <template #extra>
+          <div class="curve-actions">
+            <n-select v-model:value="curveDays" :options="curveDayOptions" size="small" style="width: 120px" />
+            <n-button size="tiny" quaternary :loading="curveLoading" @click="loadCurve">刷新</n-button>
+          </div>
+        </template>
+        <n-spin :show="curveLoading && !curve">
+          <div v-show="!!curve?.points.length" ref="curveEl" class="curve-chart"></div>
+          <n-empty
+            v-if="!curve?.points.length"
+            description="暂无资产快照——曲线自启用之日起按交易日盘后积累，不回溯历史"
+          />
+          <div v-if="curve?.notes?.length" class="curve-notes">
+            <div v-for="(n, i) in curve.notes" :key="i">{{ n }}</div>
+          </div>
+        </n-spin>
+      </SectionCard>
 
       <div class="cols">
         <!-- 下单 -->
@@ -399,5 +546,27 @@ onMounted(load)
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+
+/* ---------- B7 资产曲线 ---------- */
+.curve-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.curve-chart {
+  width: 100%;
+  height: 300px;
+}
+.curve-notes {
+  margin-top: 8px;
+  font-size: 12px;
+  opacity: 0.6;
+  line-height: 1.7;
+}
+@media (max-width: 768px) {
+  .curve-chart {
+    height: 240px;
+  }
 }
 </style>
