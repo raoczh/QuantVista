@@ -25,8 +25,8 @@ import (
 //     **用户不需要手工填任何价格**——旧「持仓止损」待办要求手工填 plan_stop_loss，
 //     这正是它形同虚设的原因；
 //   - fail-closed：无 fresh 行情的持仓本轮跳过（旧价触发止损提醒是误报）；
-//   - 去重键 (rule_id, symbol, trade_date)：一条规则一天里可以为不同标的各落一条事件，
-//     但同一标的当天只落一条（旧的「按规则 triggered_at 判当日」会把多只压成一只）。
+//   - 去重键 (rule_id, position_id, trade_date)：一条规则一天里逐仓落事件，同一标的的
+//     多笔不同成本仓位也不会互相吞掉（旧的 symbol 去重会把它们压成一笔）。
 
 // positionAlertEval 单笔持仓的观测值（纯函数入参，单测锚点）。
 // 金额单位元/股，比例单位 %。
@@ -105,12 +105,25 @@ func evaluatePositionAlert(rule model.AlertRule, name string, in positionAlertEv
 		if in.Peak <= 0 {
 			return false, 0, "" // 峰值未建立：不可判定（不是「没回撤」）
 		}
-		lo := dayLowOrPrice(in)
-		dd := peakDrawdownPct(in.Peak, lo)
-		if dd >= rule.Threshold {
-			peakTxt := fmt.Sprintf("持仓期最高 %.2f", in.Peak)
+		lo := in.Price
+		peak := in.Peak
+		peakDate := in.PeakDate
+		// 日线 High/Low 没有先后顺序。若本轮 DayHigh 首次抬高持仓峰值，不能再拿
+		// 同一天更早可能出现的 DayLow 与它拼成“先高后低”的虚假回撤；此时只用
+		// 当前现价判断从新峰值到现在确实已经发生的回撤。
+		if in.DayHigh > peak {
+			peak = in.DayHigh
 			if in.PeakDate != "" {
-				peakTxt += "（" + in.PeakDate + "）"
+				peakDate = in.PeakDate
+			}
+		} else {
+			lo = dayLowOrPrice(in)
+		}
+		dd := peakDrawdownPct(peak, lo)
+		if dd >= rule.Threshold {
+			peakTxt := fmt.Sprintf("持仓期最高 %.2f", peak)
+			if peakDate != "" {
+				peakTxt += "（" + peakDate + "）"
 			}
 			return true, dd, fmt.Sprintf("%s 自%s回撤 %.2f%%（≥%.4g%%，当日最低 %.2f）%s",
 				label, peakTxt, dd, rule.Threshold, lo, tail)
@@ -220,7 +233,7 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 			// 盘中用当日最高抬升峰值参与判定（**不落库**：盘中峰值随时在变，
 			// 落库交给盘后 16:25 那一次，避免高频写与并发竞争）。
 			if in.Peak > 0 && in.DayHigh > in.Peak {
-				in.Peak, in.PeakDate = in.DayHigh, today
+				in.PeakDate = today
 			}
 			triggered, value, msg := evaluatePositionAlert(rule, p.Name, in)
 			// 观测值只在「可判定」时参与 last_value——peak 未建立时 value 恒 0，
@@ -253,7 +266,7 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 // persistPositionAlertEvaluation 把一条持仓类规则本轮的全部命中落库（单事务）。
 //
 // 与 persistAlertEvaluation 的两点不同：
-//  1. **一条规则可落多条事件**（不同标的各一条），去重键是 (rule_id, symbol, trade_date)；
+//  1. **一条规则可落多条事件**（逐持仓），去重键是 (rule_id, position_id, trade_date)；
 //  2. **不置 status=triggered**——持仓类规则 Once 恒 false（validate 强制），
 //     命中一笔就暂停整条规则会让其余持仓失联。
 //
@@ -294,10 +307,11 @@ func persistPositionAlertEvaluation(ctx context.Context, rule model.AlertRule, h
 			updates["trigger_msg"] = truncateRunes(worst.Message, 256)
 		}
 		for _, h := range hits {
-			// 同一规则同一标的当日只落一条（幂等；服务重启/手动「立即检查」重复评估不刷屏）。
+			// 同一规则同一持仓当日只落一条。同一标的可能有多笔不同成本的仓位，
+			// 按 symbol 去重会吞掉后面的决策提醒。
 			var cnt int64
 			if err := tx.Model(&model.AlertEvent{}).
-				Where("rule_id = ? AND symbol = ? AND trade_date = ?", current.ID, h.Position.Symbol, today).
+				Where("rule_id = ? AND position_id = ? AND trade_date = ?", current.ID, h.Position.ID, today).
 				Count(&cnt).Error; err != nil {
 				return err
 			}

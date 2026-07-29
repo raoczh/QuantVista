@@ -109,6 +109,10 @@ type Position struct {
 	TotalBuyCost float64 `gorm:"type:decimal(20,4)" json:"total_buy_cost"`
 	TotalSellNet float64 `gorm:"type:decimal(20,4)" json:"total_sell_net"`
 	TotalBuyQty  float64 `gorm:"type:decimal(20,4)" json:"total_buy_qty"`
+	// RemainingCost 当前剩余仓位尚未结转的精确成本余额（含尚未结转的买入费税）。
+	// BuyPrice 只有 4 位，不能用 BuyPrice*Quantity 结转大额仓位，否则加权均价舍入会把
+	// 误差放大成真实盈亏。加仓增加、减仓按比例结转、送转/现金分红均不改变总成本余额。
+	RemainingCost float64 `gorm:"type:decimal(20,4)" json:"remaining_cost"`
 
 	// ---- 持仓期最高价（D15 移动止盈）----
 	// PeakPrice 自 PeakFrom 起该标的到过的最高价（元/股，**账面口径**，与 BuyPrice 同口径）；

@@ -133,6 +133,9 @@ func TestImportPositions(t *testing.T) {
 	if ps[0].Symbol != "600000" || ps[0].PositionType != model.PositionTypeShortTerm || ps[0].BuyFee != 5 {
 		t.Fatalf("第一条字段错误: %+v", ps[0])
 	}
+	if ps[0].RemainingCost != ps[0].TotalBuyCost || ps[0].RemainingCost != 8505 {
+		t.Fatalf("导入建仓必须同时初始化精确剩余成本: %+v", ps[0])
+	}
 	if ps[1].Symbol != "600519" || ps[1].Market != "cn" || ps[1].PositionType != model.PositionTypeLongTerm {
 		t.Fatalf("第二条（默认市场/中文类型）字段错误: %+v", ps[1])
 	}
@@ -143,6 +146,13 @@ func TestImportPositions(t *testing.T) {
 	// 缺必需列拒绝。
 	if _, err := svc.ImportPositions(1, strings.NewReader("symbol,market\n600000,cn\n")); err == nil {
 		t.Fatalf("缺必需列应拒绝")
+	}
+
+	// 持仓导出文件不是恢复格式，不能把 closed/部分减仓账本静默重建成 holding。
+	exported := "symbol,buy_price,buy_date,quantity,status,total_buy_cost,realized_pnl\n" +
+		"600000,8,2026-06-01,100,closed,800,100\n"
+	if _, err := svc.ImportPositions(1, strings.NewReader(exported)); err == nil {
+		t.Fatal("检测到导出专属账本列时必须整体拒绝并提示使用导入模板")
 	}
 
 	// BOM 表头容忍。

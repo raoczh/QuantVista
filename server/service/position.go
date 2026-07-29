@@ -79,7 +79,7 @@ const analysisStaleDays = 7
 //   - **旧记录兜底**（尚未惰性补流水）：保持原算式逐字节等价，避免补建前后数字跳变。
 func computeView(p model.Position, price float64, hasQuote bool) PositionView {
 	v := PositionView{Position: p}
-	v.Cost = p.BuyPrice*p.Quantity + p.BuyFee + p.BuyTax
+	v.Cost = positionCurrentCost(p)
 
 	if p.Status == model.PositionStatusClosed {
 		// 已平仓：盈亏已实现，扣买卖全部费税。
@@ -106,6 +106,23 @@ func computeView(p model.Position, price float64, hasQuote bool) PositionView {
 		v.ProfitPct = v.ProfitAmount / v.Cost * 100
 	}
 	return v
+}
+
+// positionCurrentCost 是持仓中剩余成本的统一读取口径。新账本读精确余额；升级前的
+// 存量行在惰性回填完成前沿用旧算式，保证页面可用且数字不突然缺席。
+func positionCurrentCost(p model.Position) float64 {
+	if p.Status == model.PositionStatusHolding && p.Quantity > positionQtyEps {
+		if p.RemainingCost > 0 {
+			return p.RemainingCost
+		}
+		if p.TotalBuyCost > 0 && common.DB != nil {
+			// 惰性迁移写库失败时仍尝试只读还原；只纳入 sell 流水，排除 adjust 现金分红。
+			if inferred, err := inferredRemainingCost(common.DB, p); err == nil && inferred >= 0 {
+				return inferred
+			}
+		}
+	}
+	return round4(p.BuyPrice*p.Quantity + p.BuyFee + p.BuyTax)
 }
 
 // List 列出持仓（status: holding/closed/all），富化实时盈亏。
@@ -566,6 +583,7 @@ func (s *PositionService) Create(ctx context.Context, userID int64, in PositionI
 	// 建仓即写首笔 buy 流水（账本从第一天自洽），并初始化累计汇总列。
 	p.TotalBuyCost = round4(in.BuyPrice*in.Quantity + in.BuyFee + in.BuyTax)
 	p.TotalBuyQty = in.Quantity
+	p.RemainingCost = p.TotalBuyCost
 	// D15 持仓期最高价从建仓那一刻起算——买入日之前的高点不是我赚到过的利润。
 	p.PeakPrice, p.PeakFrom = peakInitFor(in.BuyPrice, in.BuyDate, time.Now().In(time.Local).Format("2006-01-02"))
 	p.PeakDate = p.PeakFrom
@@ -643,6 +661,7 @@ func (s *PositionService) Update(userID, id int64, in PositionInput) (*model.Pos
 		// 唯一那笔建仓流水与汇总列同步改写，账本保持自洽。
 		p.TotalBuyCost = round4(in.BuyPrice*in.Quantity + in.BuyFee + in.BuyTax)
 		p.TotalBuyQty = in.Quantity
+		p.RemainingCost = p.TotalBuyCost
 		if len(trades) == 1 {
 			t := trades[0]
 			t.Price, t.Quantity, t.Fee, t.Tax = in.BuyPrice, in.Quantity, in.BuyFee, in.BuyTax
@@ -706,18 +725,8 @@ func (s *PositionService) Close(userID, id int64, in CloseInput) (*model.Positio
 	if !validAiVerdict[in.AiVerdict] {
 		return nil, errors.New("AI 判断对错取值须为 right/wrong/mixed/unused")
 	}
-	var p model.Position
-	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&p).Error; err != nil {
-		return nil, errors.New("持仓不存在")
-	}
-	if p.Status == model.PositionStatusClosed {
-		return nil, errors.New("该持仓已卖出")
-	}
-	if in.SellDate != "" && p.BuyDate != "" && in.SellDate < p.BuyDate {
-		return nil, errors.New("卖出日期不能早于买入日期")
-	}
 	return s.AddTrade(userID, id, PositionTradeInput{
-		Side: model.PositionTradeSell, Price: in.SellPrice, Quantity: p.Quantity,
+		Side: model.PositionTradeSell, Price: in.SellPrice, closeAll: true,
 		Fee: in.SellFee, Tax: in.SellTax, TradeDate: in.SellDate, Note: "平仓",
 		SellReason: in.SellReason, ReviewNote: in.ReviewNote,
 		SellPlanned: in.SellPlanned, AiVerdict: in.AiVerdict, LessonLearned: in.LessonLearned,

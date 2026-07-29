@@ -76,13 +76,12 @@ type AlertRule struct {
 // 独立于规则行的最近命中快照——历史可追溯，且用户可逐条标记已读/忽略「完成待办」。
 // 今日待办的提醒条目即本表 unread 事件。
 //
-// **去重键下沉到 (rule_id, symbol, trade_date)（D14/D15 起）**：持仓卖出决策类规则
-// 可绑定「我的全部持仓」，同一天会对多只股票各自命中——旧的「按规则行 triggered_at
-// 是否为今天」判重会把多只股票的命中压成一条，用户只看得到其中一只。
-// PositionID 记录命中的是哪一笔持仓（同一标的可有多笔仓位），非持仓类恒 0。
+// 持仓卖出决策类按 (rule_id, position_id, trade_date) 去重：规则可绑定「我的全部持仓」，
+// 同一标的也允许有多笔不同成本的仓位，必须逐仓落事件。非持仓类仍由规则的
+// triggered_at 做同日去重，PositionID 恒 0。
 type AlertEvent struct {
 	ID     int64 `gorm:"primaryKey" json:"id"`
-	RuleID int64 `gorm:"index:idx_alert_event_rule;index:idx_alert_event_dedup,priority:1" json:"rule_id"`
+	RuleID int64 `gorm:"index:idx_alert_event_rule;index:idx_alert_event_dedup,priority:1;index:idx_alert_event_pos_dedup,priority:1" json:"rule_id"`
 	UserID int64 `gorm:"index:idx_alert_event_user_status" json:"user_id"`
 
 	Symbol  string `gorm:"size:16;index:idx_alert_event_dedup,priority:2" json:"symbol"`
@@ -93,9 +92,9 @@ type AlertEvent struct {
 
 	// TradeDate 命中所属交易日（YYYY-MM-DD 本地时区）。**旧事件该列为空串**——
 	// 历史数据不追溯改写，判重只在新写入的行之间生效。
-	TradeDate string `gorm:"size:10;index:idx_alert_event_dedup,priority:3" json:"trade_date"`
+	TradeDate string `gorm:"size:10;index:idx_alert_event_dedup,priority:3;index:idx_alert_event_pos_dedup,priority:3" json:"trade_date"`
 	// PositionID 命中的持仓行（持仓卖出决策类才有值），供前端直接定位到那一笔。
-	PositionID int64 `gorm:"index" json:"position_id"`
+	PositionID int64 `gorm:"index;index:idx_alert_event_pos_dedup,priority:2" json:"position_id"`
 
 	TriggeredAt time.Time `json:"triggered_at"`
 	Status      string    `gorm:"size:16;index:idx_alert_event_user_status" json:"status"` // unread/read/dismissed

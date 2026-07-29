@@ -91,6 +91,27 @@ func Migrate() error {
 	if err := common.DB.AutoMigrate(AllModels()...); err != nil {
 		return err
 	}
+	// 新增字符串列在旧库里可能是 SQL NULL，而 service 层统一把「尚无稳定身份」表示为
+	// 空串。先归一再跑兼容匹配，避免旧预案无法接续、被重复插入。
+	if err := common.DB.Exec(
+		"UPDATE corporate_actions SET plan_notice_date = '' WHERE plan_notice_date IS NULL",
+	).Error; err != nil {
+		return err
+	}
+	// 公司行动业务身份已从会变化的 ExDate 升级为 PlanNoticeDate。AutoMigrate 不会
+	// 删除旧索引；保留它会让同一报告期、同一除权日的两次独立方案无法并存。
+	if m := common.DB.Migrator(); m.HasIndex(&CorporateAction{}, "idx_corpaction_uniq") {
+		if err := m.DropIndex(&CorporateAction{}, "idx_corpaction_uniq"); err != nil {
+			return err
+		}
+	}
+	// v2 把 NoticeDate 纳入仅用于容纳弱身份数据的存储索引。旧索引不删除会继续
+	// 拒绝 PlanNoticeDate/ExDate 均空、但公告日不同的两份预案。
+	if m := common.DB.Migrator(); m.HasIndex(&CorporateAction{}, "idx_corpaction_storage_uniq") {
+		if err := m.DropIndex(&CorporateAction{}, "idx_corpaction_storage_uniq"); err != nil {
+			return err
+		}
+	}
 	// P0-6 存量模板基线迁移（幂等）：legacy prompt_templates 行回填 content_hash/revision
 	// 并补建基线快照——保证升级后的首次修改/删除仍能回查升级前原文。
 	if err := MigratePromptTemplateBaselines(); err != nil {

@@ -44,15 +44,12 @@ const (
 
 // adjustPriceForCorpAction 价格侧除权除息折算（纯函数）。
 //
-// 与 computeCorpAdjust 的成本公式同构——把
-//
-//	costAfter = (cost×qty − 每10股派息×qty/10) / (qty×factor)
-//
-// 里的 qty 消掉即得本式，故峰值与成本在除权日按同一比例移动，回撤百分比不会因除权跳变：
+// 峰值使用市场价格的标准除权公式，保证除权日前后的价格回撤口径连续。账本侧现金
+// 分红单独计入已实现收益、不冲减剩余成本，因此这里与持仓成本的处理并不相同：
 //
 //	新价 = (原价 − 每10股派息/10) / (1 + (送股+转增)/10)
 //
-// 派息大于股价的极端情形钉在 0（与 computeCorpAdjust 的成本钉零同款处理）。
+// 派息大于股价的极端情形钉在 0。
 func adjustPriceForCorpAction(price, bonus, transfer, dividend float64) float64 {
 	if price <= 0 {
 		return 0

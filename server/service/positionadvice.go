@@ -29,7 +29,7 @@ import (
 
 const (
 	// positionAdvicePromptVersion 建议 prompt 版本（改措辞/枚举语义必须递增，审计按它归因）。
-	positionAdvicePromptVersion = "pa1"
+	positionAdvicePromptVersion = "pa2"
 	// positionAdviceJobTimeout 后台任务总预算。
 	positionAdviceJobTimeout = 5 * time.Minute
 	// positionAdviceMaxPositions 单次最多分析的持仓笔数（控上下文预算）。超出按
@@ -54,16 +54,16 @@ func NewPositionAdviceService(position *PositionService, llm *LLMService) *Posit
 
 // PositionAdvice 单笔持仓的结论。
 type PositionAdvice struct {
-	Symbol string `json:"symbol"`
-	Name   string `json:"name,omitempty"`
+	// PositionID 是模型必须原样回传的逐持仓身份；服务端按 ID+symbol 双重校验。
+	PositionID int64  `json:"position_id"`
+	Symbol     string `json:"symbol"`
+	Name       string `json:"name,omitempty"`
 	// Verdict 封闭枚举 hold|trim|exit（服务端归一，非法值整条丢弃）。
 	Verdict string `json:"verdict"`
 	// Reason 结论理由（要求引用喂进去的具体数值）。
 	Reason string `json:"reason"`
 	// Invalidation 失效条件：什么情况下这个结论不再成立（对齐既有 kill_switches 纪律）。
 	Invalidation string `json:"invalidation"`
-	// PositionID 对应的持仓行（服务端回填，模型无从伪造）。
-	PositionID int64 `json:"position_id,omitempty"`
 }
 
 // PositionAdviceResult 一次建议的完整结果（落 llm_tasks 的 result_json）。
@@ -140,8 +140,9 @@ const positionAdviceSystemPrompt = `你是一名持仓风控顾问。用户已�
 4. invalidation 写「什么情况下这个结论不再成立」（具体价位 / 事件 / 时间窗口），不要写空泛的「市场变化时」。
 5. 这是研究参考，不构成投资建议；不要给出加仓建议——本任务只回答持有 / 减仓 / 清仓。
 
-只输出 JSON：{"advices":[{"symbol":"...","verdict":"hold|trim|exit","reason":"...","invalidation":"..."}]}，
-覆盖全部给出的持仓，不要任何解释或代码块标记。`
+只输出 JSON：{"advices":[{"position_id":123,"symbol":"...","verdict":"hold|trim|exit","reason":"...","invalidation":"..."}]}。
+position_id 与 symbol 必须逐字复制对应输入行；同一 symbol 可能有多笔不同成本的持仓，必须按 position_id 分别覆盖，
+不要合并或省略。不要任何解释或代码块标记。`
 
 // AdviseAsync 建后台任务（HTTP 秒回）。校验在同步段完成，模型调用在独立 context 上跑。
 func (s *PositionAdviceService) AdviseAsync(userID int64, allowPrivate bool, req PositionAdviceRequest) (*LLMTaskView, error) {
@@ -157,16 +158,17 @@ func (s *PositionAdviceService) AdviseAsync(userID int64, allowPrivate bool, req
 
 // positionAdviceRow 喂给模型的单笔持仓（**全部数值由 Go 算好**）。
 type positionAdviceRow struct {
-	Symbol    string  `json:"symbol"`
-	Name      string  `json:"name"`
-	Type      string  `json:"type"`       // short_term / long_term
-	Cost      float64 `json:"cost"`       // 我的加权成本（元/股）
-	Quantity  float64 `json:"quantity"`   // 持有股数
-	Price     float64 `json:"price"`      // 当前有效现价
-	PnlPct    float64 `json:"pnl_pct"`    // 浮动盈亏 %
-	PnlAmount float64 `json:"pnl_amount"` // 浮动盈亏金额（元）
-	HeldDays  int     `json:"held_days"`  // 已持有交易日
-	WeightPct float64 `json:"weight_pct"` // 占我全部已定价持仓市值的比例 %
+	PositionID int64   `json:"position_id"` // 逐持仓稳定身份，模型必须原样回传
+	Symbol     string  `json:"symbol"`
+	Name       string  `json:"name"`
+	Type       string  `json:"type"`       // short_term / long_term
+	Cost       float64 `json:"cost"`       // 我的加权成本（元/股）
+	Quantity   float64 `json:"quantity"`   // 持有股数
+	Price      float64 `json:"price"`      // 当前有效现价
+	PnlPct     float64 `json:"pnl_pct"`    // 浮动盈亏 %
+	PnlAmount  float64 `json:"pnl_amount"` // 浮动盈亏金额（元）
+	HeldDays   int     `json:"held_days"`  // 已持有交易日
+	WeightPct  float64 `json:"weight_pct"` // 占我全部已定价持仓市值的比例 %
 
 	BuyReason string `json:"buy_reason,omitempty"` // 我当初为什么买（原始录入）
 
@@ -178,7 +180,6 @@ type positionAdviceRow struct {
 	Signals []string `json:"signals,omitempty"` // D14/D15 命中的提醒
 	Events  []string `json:"events,omitempty"`  // D16 待复核的利空事件
 
-	PositionID int64 `json:"-"` // 服务端回填用，不进 prompt
 }
 
 // Advise 生成逐笔卖出建议（后台任务体；也可被测试直接调用）。
@@ -275,19 +276,13 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 		{Role: "system", Content: positionAdviceSystemPrompt},
 		{Role: "user", Content: "我的持仓与系统算好的数据如下（JSON 数组）：\n" + string(inputJSON)},
 	}
-	run := newLLMRun(newLLMTraceID(), "", "position_advice", "position_advice.v1", positionAdvicePromptVersion)
+	run := newLLMRun(newLLMTraceID(), "", "position_advice", "position_advice.v2", positionAdvicePromptVersion)
 	run.hashData(string(inputJSON))
 	run.hashPrompt(convo)
 
-	symbolSet := map[string]bool{}
-	posBySymbol := map[string]int64{}
-	nameBySymbol := map[string]string{}
+	posByID := map[int64]positionAdviceRow{}
 	for _, r := range rows {
-		symbolSet[r.Symbol] = true
-		if _, ok := posBySymbol[r.Symbol]; !ok {
-			posBySymbol[r.Symbol] = r.PositionID
-			nameBySymbol[r.Symbol] = r.Name
-		}
+		posByID[r.PositionID] = r
 	}
 
 	type adviceOut struct {
@@ -316,7 +311,7 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 		}
 		var out adviceOut
 		if jerr := json.Unmarshal([]byte(extractJSONObject(result.Content)), &out); jerr == nil {
-			valid := filterPositionAdvices(out.Advices, symbolSet, posBySymbol, nameBySymbol)
+			valid := filterPositionAdvices(out.Advices, posByID)
 			if len(valid) > 0 {
 				run.acceptRouteAttribution()
 				res.Advices = valid
@@ -325,7 +320,7 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 				res.EvidenceCheck = verifyPositionAdvice(valid, rows)
 				if n := len(rows) - len(valid); n > 0 {
 					res.Notes = append(res.Notes, fmt.Sprintf(
-						"%d 笔持仓模型未给出合法结论（枚举越界或标的不在名单内），已丢弃——未擅自代填「继续持有」", n))
+						"%d 笔持仓模型未给出合法结论（枚举越界或 position_id/symbol 不匹配），已丢弃——未擅自代填「继续持有」", n))
 				}
 				return res, nil
 			}
@@ -335,49 +330,92 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 		}
 		convo = append(convo,
 			chatMessage{Role: "assistant", Content: moduleRepairFeed("position_advice", result.Content)},
-			chatMessage{Role: "user", Content: "上一条输出不合格。请只输出 JSON：{\"advices\":[{\"symbol\",\"verdict\":\"hold|trim|exit\",\"reason\",\"invalidation\"}]}，symbol 必须来自给出的持仓列表。"},
+			chatMessage{Role: "user", Content: "上一条输出不合格。请只输出 JSON：{\"advices\":[{\"position_id\",\"symbol\",\"verdict\":\"hold|trim|exit\",\"reason\",\"invalidation\"}]}。position_id 与 symbol 必须来自同一输入行；同代码多仓也要逐笔输出。"},
 		)
 	}
 	run.DegradedReason = "llm_output_invalid"
 	return nil, refusalErrf(RefusalLLMOutputInvalid, "AI 卖出建议输出不合格：%v", lastErr)
 }
 
-// filterPositionAdvices 服务端强校验：枚举越界、标的不在名单、重复、空理由一律丢弃。
+// filterPositionAdvices 服务端强校验：枚举越界、ID/代码不匹配、重复 ID、空理由一律丢弃。
 // **不代填默认值**——模型没给出合法结论就是没给，代填 hold 会把「没结论」伪装成「建议持有」。
-func filterPositionAdvices(in []PositionAdvice, allowed map[string]bool,
-	posBySymbol map[string]int64, nameBySymbol map[string]string) []PositionAdvice {
+func filterPositionAdvices(in []PositionAdvice, positions map[int64]positionAdviceRow) []PositionAdvice {
 	out := make([]PositionAdvice, 0, len(in))
-	seen := map[string]bool{}
+	seen := map[int64]bool{}
 	for _, a := range in {
 		a.Symbol = strings.TrimSpace(a.Symbol)
 		a.Verdict = normalizePositionVerdict(a.Verdict)
 		a.Reason = truncateRunes(strings.TrimSpace(a.Reason), 400)
 		a.Invalidation = truncateRunes(strings.TrimSpace(a.Invalidation), 300)
-		if !allowed[a.Symbol] || seen[a.Symbol] || a.Verdict == "" || a.Reason == "" {
+		p, ok := positions[a.PositionID]
+		if !ok || p.Symbol != a.Symbol || seen[a.PositionID] || a.Verdict == "" ||
+			a.Reason == "" || a.Invalidation == "" {
 			continue
 		}
-		seen[a.Symbol] = true
-		// 名称与持仓 id 一律服务端回填（模型输出的这两项不可信，也没必要信）。
-		a.Name = nameBySymbol[a.Symbol]
-		a.PositionID = posBySymbol[a.Symbol]
+		seen[a.PositionID] = true
+		// 名称一律服务端回填。
+		a.Name = p.Name
 		out = append(out, a)
 	}
 	return out
 }
 
-// verifyPositionAdvice 结论的证据核验：模型引用的数字与喂进去的持仓快照比对。
-// 值域取全部入参行（成本/现价/盈亏/持有天数/峰值/回撤/仓位占比都是合法来源）。
+// verifyPositionAdvice 逐仓核验模型引用的数字。每条建议只能使用其 position_id 对应行的
+// 成本/现价/盈亏/持有天数/峰值/回撤/仓位占比，不能拿另一笔仓位的数字串线佐证。
 func verifyPositionAdvice(advices []PositionAdvice, rows []positionAdviceRow) *evidenceCheck {
-	sections := make([]evidenceSection, 0, len(advices)*2)
+	rowByID := make(map[int64]positionAdviceRow, len(rows))
+	for _, row := range rows {
+		rowByID[row.PositionID] = row
+	}
+	check := &evidenceCheck{
+		Version:    "ev5",
+		KeySection: &evidenceKeySection{Module: "建议"},
+	}
+	evidenceSeq := 0
 	for _, a := range advices {
+		row, ok := rowByID[a.PositionID]
+		if !ok || row.Symbol != a.Symbol {
+			continue
+		}
 		label := orSymbol(a.Name, a.Symbol)
-		sections = append(sections, evidenceSection{Module: label + "·建议", Text: a.Reason})
+		sections := []evidenceSection{{Module: "建议", Text: a.Reason}}
 		if a.Invalidation != "" {
-			sections = append(sections, evidenceSection{Module: label + "·失效条件", Text: a.Invalidation})
+			sections = append(sections, evidenceSection{Module: "失效条件", Text: a.Invalidation})
+		}
+		one := verifyEvidenceLabeled(sections, snapshotLabeledValues(row, nil))
+		markKeySection(one, "建议")
+		check.Total += one.Total
+		check.Matched += one.Matched
+		check.SkippedCount += one.SkippedCount
+		check.UnmatchedTotal += one.UnmatchedTotal
+		check.SnapshotMatched += one.SnapshotMatched
+		check.PlanMatched += one.PlanMatched
+		check.UserMatched += one.UserMatched
+		check.ContextMatched += one.ContextMatched
+		check.Truncated = check.Truncated || one.Truncated
+		if one.KeySection != nil {
+			check.KeySection.Total += one.KeySection.Total
+			check.KeySection.SnapshotMatched += one.KeySection.SnapshotMatched
+		}
+		for _, raw := range one.Unmatched {
+			if len(check.Unmatched) >= 10 {
+				break
+			}
+			check.Unmatched = append(check.Unmatched, raw)
+		}
+		for _, item := range one.Items {
+			item.Module = fmt.Sprintf("%s#%d·%s", label, a.PositionID, item.Module)
+			if item.Matched {
+				evidenceSeq++
+				item.EvidenceID = fmt.Sprintf("ev-%03d", evidenceSeq)
+			}
+			if len(check.Items) < 50 {
+				check.Items = append(check.Items, item)
+			} else {
+				check.Truncated = true
+			}
 		}
 	}
-	check := verifyEvidenceLabeled(sections, snapshotLabeledValues(rows, nil))
-	markKeySection(check, "建议")
 	return check
 }
 

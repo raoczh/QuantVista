@@ -105,7 +105,10 @@ func TestDividendYieldsForBatch(t *testing.T) {
 		}
 	}
 
-	all := DividendYieldsFor(nil, now)
+	all, err := DividendYieldsFor(nil, now)
+	if err != nil {
+		t.Fatalf("批量查询失败: %v", err)
+	}
 	if len(all) != 2 {
 		t.Fatalf("应只有两只票有股息率，got %d: %+v", len(all), all)
 	}
@@ -117,9 +120,40 @@ func TestDividendYieldsForBatch(t *testing.T) {
 	}
 
 	// 指定 symbols 过滤生效。
-	sub := DividendYieldsFor([]string{"600519"}, now)
+	sub, err := DividendYieldsFor([]string{"600519"}, now)
+	if err != nil {
+		t.Fatalf("按 symbol 查询失败: %v", err)
+	}
 	if len(sub) != 1 || sub["600519"] != 1.88 {
 		t.Fatalf("按 symbol 过滤结果不对: %+v", sub)
+	}
+}
+
+// TestDividendYieldReadFailureStopsFactorBuild 锁住 fail-closed 链路：公司行动表读取失败时，
+// 既不能把失败伪装成「全市场都没有股息率」，也不能继续构建并触发首写胜快照。
+func TestDividendYieldReadFailureStopsFactorBuild(t *testing.T) {
+	setupTestDB(t)
+	cleanCorpTables(t)
+	if err := common.DB.Create(&model.MarketSyncState{
+		Symbol: "600000", Market: "cn", Name: "浦发银行",
+		InitStatus: "done", LastBarDate: "2026-07-29",
+	}).Error; err != nil {
+		t.Fatalf("建同步状态失败: %v", err)
+	}
+	if err := common.DB.Migrator().DropTable(&model.CorporateAction{}); err != nil {
+		t.Fatalf("故障注入：删除公司行动表失败: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = common.DB.AutoMigrate(&model.CorporateAction{})
+		common.DB.Where("symbol = ? AND market = ?", "600000", "cn").
+			Delete(&model.MarketSyncState{})
+	})
+
+	if got, err := DividendYieldsFor(nil, time.Now()); err == nil || got != nil {
+		t.Fatalf("读取失败必须显式报错且不返回空 map 冒充无数据: got=%v err=%v", got, err)
+	}
+	if table, err := buildFactorTable(t.Context()); err == nil || table != nil {
+		t.Fatalf("股息率读取失败必须阻断宽表构建，防止冻结不完整快照: table=%v err=%v", table, err)
 	}
 }
 

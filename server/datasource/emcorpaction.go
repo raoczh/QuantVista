@@ -50,8 +50,10 @@ type CorpActionRow struct {
 
 	ExDate     string // 除权除息日 YYYY-MM-DD（空=方案未到实施阶段）
 	RecordDate string // 股权登记日 YYYY-MM-DD
-	ReportDate string // 报告期 YYYY-MM-DD（与 ExDate 共同构成自然唯一键）
-	NoticeDate string // 公告日 YYYY-MM-DD
+	ReportDate string // 报告期 YYYY-MM-DD
+	// PlanNoticeDate 预案首次公告日，是同一方案跨进度与日期订正的稳定标识。
+	PlanNoticeDate string
+	NoticeDate     string // 公告日 YYYY-MM-DD
 
 	BonusRatio     float64 // 每 10 股送股（股）
 	TransferRatio  float64 // 每 10 股转增（股）
@@ -215,13 +217,14 @@ func parseCorpActionRow(r DcRow) (CorpActionRow, bool, error) {
 		return CorpActionRow{}, false, nil
 	}
 	return CorpActionRow{
-		Symbol:     sym,
-		Name:       r.String("SECURITY_NAME_ABBR"),
-		Market:     "cn",
-		ExDate:     r.Date("EX_DIVIDEND_DATE"),
-		RecordDate: r.Date("EQUITY_RECORD_DATE"),
-		ReportDate: reportDate,
-		NoticeDate: r.Date("NOTICE_DATE"),
+		Symbol:         sym,
+		Name:           r.String("SECURITY_NAME_ABBR"),
+		Market:         "cn",
+		ExDate:         r.Date("EX_DIVIDEND_DATE"),
+		RecordDate:     r.Date("EQUITY_RECORD_DATE"),
+		ReportDate:     reportDate,
+		PlanNoticeDate: r.Date("PLAN_NOTICE_DATE"),
+		NoticeDate:     r.Date("NOTICE_DATE"),
 
 		BonusRatio:     r.Float("BONUS_RATIO"),
 		TransferRatio:  r.Float("IT_RATIO"),

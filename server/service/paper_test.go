@@ -55,9 +55,7 @@ func TestIsCNFund(t *testing.T) {
 // 显式传 Price>0，Trade 跳过行情取数，可离线测（market 的 mgr 不被触达）。
 func TestPaperTradeFlow(t *testing.T) {
 	setupTestDB(t)
-	common.DB.Exec("DELETE FROM paper_accounts")
-	common.DB.Exec("DELETE FROM paper_holdings")
-	common.DB.Exec("DELETE FROM paper_trades")
+	cleanCorpTables(t)
 	svc := &PaperService{market: &MarketService{}}
 	ctx := context.Background()
 	const uid = 1
@@ -133,6 +131,9 @@ func TestPaperTradeFlow(t *testing.T) {
 		t.Fatalf("ETF 买入不应有印花税，得到 %v", etfTr.Tax)
 	}
 
+	if err := common.DB.Create(&model.PaperCorpAdjust{UserID: uid, CorporateActionID: 999}).Error; err != nil {
+		t.Fatalf("建重置前公司行动审计失败: %v", err)
+	}
 	// 重置。
 	if _, err := svc.Reset(uid, 50000); err != nil {
 		t.Fatalf("重置失败: %v", err)
@@ -144,5 +145,9 @@ func TestPaperTradeFlow(t *testing.T) {
 	common.DB.Model(&model.PaperTrade{}).Where("user_id = ?", uid).Count(&cnt)
 	if cnt != 0 {
 		t.Fatalf("重置应清空流水，剩 %d", cnt)
+	}
+	common.DB.Model(&model.PaperCorpAdjust{}).Where("user_id = ?", uid).Count(&cnt)
+	if cnt != 0 {
+		t.Fatalf("重置应清空公司行动幂等审计，否则新账户会漏调，剩 %d", cnt)
 	}
 }

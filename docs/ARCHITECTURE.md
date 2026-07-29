@@ -221,7 +221,9 @@ Go API Server
 `positions.quantity` 恒为**当前持仓**数量（全部卖出后为 0）、`buy_fee/buy_tax` 恒为当前持仓尚未
 结转的买入费税——全部既有消费方（tracking 的 actual_position 标签、todo 止损、guard 事件、组合
 总览）读法零改动。累计口径（一共买过多少 / 卖回多少 / 赚了多少）走 `total_buy_qty` /
-`total_buy_cost` / `total_sell_net` / `realized_pnl` 四个汇总列，**绝不从当前持仓字段反推**。
+`total_buy_cost` / `total_sell_net` / `realized_pnl`；当前剩余仓位的金额权威走
+`remaining_cost`，**绝不再用四位 `buy_price × quantity` 结转大额仓位**。升级前已有流水的
+持仓按卖出流水恒等式迁移余额，`adjust` 现金分红不参与成本反推。
 `position_trades` 是唯一明细来源，汇总值在同一事务内回写 positions。
 
 **相关表（B5~B7 新增）**：
@@ -242,31 +244,39 @@ Go API Server
 
 **公司行动与事件日历相关表（B8~B9 新增）**：
 
-- `corporate_actions`：`symbol / market / name / report_date / ex_date / record_date / notice_date /
+- `corporate_actions`：`symbol / market / name / report_date / ex_date / record_date / plan_notice_date / notice_date /
   bonus_ratio / transfer_ratio / dividend_pretax / dividend_yield / progress / plan_profile`，
-  唯一键 `(symbol, market, report_date, ex_date)`。**送转与派息为「每 10 股」口径原值**
+  逻辑稳定身份为上游 `PLAN_NOTICE_DATE`（连同 symbol/market/report_date）；`ex_date` 会从空值
+  推进到实施日，也可能被订正，不能承担业务身份。存储护栏索引额外含 `ex_date` 以兼容
+  `plan_notice_date` 为空的历史分次实施行，写入统一由 service 按稳定身份就地更新。
+  **送转与派息为「每 10 股」口径原值**
   （`bonus_ratio=2` = 每 10 股送 2 股，B8 折算公式直接按此写，**不要预先除以 10**）；
   `dividend_yield` 为百分比数值（上游小数已 ×100）。**该列为 0 表示「该期方案没有股息率」
   （预案/纯送转，上游不给），不是「股息率为零」**——取值一律走 `pickLatestDividendYield`（见 C10 段）。
-  同一报告期方案随进度（预案 → 实施分配）
-  走 upsert 更新而非堆积新行；除权日确定前 `ex_date` 为空串。
+  同一方案随进度（预案 → 实施分配）更新而非堆积；除权日确定前 `ex_date` 为空串。
 - `restricted_releases`：`symbol / market / name / free_date / free_type / free_shares /
   lift_market_cap / free_ratio / total_ratio`，唯一键 `(symbol, market, free_date, free_type)`
   ——**同股同日可有多批不同类型的限售股同时解禁**，只按 `(symbol, free_date)` 去重会少算规模。
   单位：`free_shares`=股、`lift_market_cap`=元、两个 ratio=百分比数值。
   **`free_shares` 是「本次」解禁量**（上游 `CURRENT_FREE_SHARES`），上游同名的 `FREE_SHARES`
   是「解禁后已流通股数」，错用会把规模高估数倍（见 `datasource/emcorpaction.go` 头注的实测验算）。
+  完整窗口同步成功后把返回集合视为权威，删除窗口内已改期或取消的旧行；网络、分页或解析失败
+  不执行清理。
 - `ipo_subscriptions`：`kind(stock|cb) / code / name / apply_code / apply_date / issue_price /
   apply_upper / pay_date / ballot_date / list_date / board / stock_code / stock_name / rating /
-  issue_scale_yi`，唯一键 `(kind, code, apply_date)`。新股与可转债两源合表；
+  issue_scale_yi`，存储唯一键 `(kind, code, apply_date)`，逻辑稳定身份为 `(kind, code)`：改期
+  就地更新申购日，完整窗口成功后按 kind 分源清理取消项和历史重复；股票源失败不清转债（反之亦然）。
+  新股与可转债两源合表；
   **`apply_code` 不进唯一键**（沪市新股与可转债的申购代码都与标的代码不同，上游订正应就地更新）。
   `issue_price=0` 表示尚未定价——**不用预估价冒充**。
 - `position_corp_adjusts`：除权除息**待确认**调整建议 + 审计。
-  `user_id / position_id / corporate_action_id`（唯一键）` / symbol / ex_date / 方案快照四列 /
-  qty_before / qty_after / cost_before / cost_after / cash_dividend / status / trade_id /
-  confirmed_at / reverted_at`。状态机 `pending → confirmed → reverted`（可再确认）/ `dismissed`。
+  `user_id / position_id / corporate_action_id`（唯一键）` / symbol / ex_date / record_date / 方案快照四列 /
+  qty_before / entitled_qty / qty_after / cost_before / cost_after / cash_dividend / manual_review /
+  review_reason / status / trade_id / confirmed_at / reverted_at`。状态机
+  `pending → confirmed → reverted`（可再确认）/ `dismissed`。
   **程序绝不静默改写用户真实账本**：只有用户显式确认才落 `position_trades{side:adjust}` 并改写
-  `positions`；撤销仅在「当前账面仍等于折算结果且其后无任何新交易」时被接受，否则明确拒绝。
+  `positions`；建议回补近 30 天漏跑方案，pending/reverted 按当前账面刷新，confirmed/dismissed
+  保持终态；撤销仅在「当前账面仍等于折算结果且其后无任何新交易」时被接受，否则明确拒绝。
 - `paper_corp_adjusts`：模拟盘**自动**折算审计，唯一键 `(user_id, corporate_action_id)`
   ——虚拟账户无真实后果故自动执行，按 action 唯一键保证重跑不重复发钱。
 
@@ -298,15 +308,26 @@ Go API Server
 **除权除息折算公式（B8，改动前先读；D15 起含峰值）**：
 
 ```
-新数量 = 原数量 × (1 + (送股 + 转增) / 10)
-新成本 = (原成本 × 原数量 − 每10股派息 × 原数量 / 10) / 新数量
-新峰值 = (原峰值 − 每10股派息 / 10) / (1 + (送股 + 转增) / 10)     ← 与成本式消去数量即得
+有权数量 = 股权登记日收盘数量（流水按业务日期重建）
+新数量 = 当前数量 + 有权数量 × (送股 + 转增) / 10
+新成本 = 原成本 × 当前数量 / 新数量
+现金分红 = 有权数量 × 每10股派息 / 10
+新峰值 = (原峰值 − 每10股派息 / 10) / (1 + (送股 + 转增) / 10)
 ```
 
-现金分红计入 `realized_pnl`（真金到账，与卖出兑现同属「已实现」）；
+现金分红只计入 `realized_pnl`（真金到账，与卖出兑现同属「已实现」），**不再同时冲减
+剩余成本**，否则最终收益会重复计算一次；`remaining_cost` 保持不变，仅由新数量摊薄每股成本。
 `total_buy_cost / total_buy_qty` **保持不变**——送转不是「又买了一次」，改动它们会让
 「一共投入多少 / 已平仓收益率」全部失真。
-**峰值必须与成本按同一比例移动**，否则 10 转 10 的除权当天会凭空出现 50% 的假回撤。
+峰值按市场价格的标准除权公式移动，避免除权日出现假回撤；它会扣除每股派息，而账本成本
+不扣现金分红，因此两者不再是同一公式。
+
+**时序边界**：纯现金分红不改变数量与成本，登记日有权的仓位即使后来已平仓，仍可生成
+零数量建议，确认后只增加 `realized_pnl`；送转必须先于除权日后的卖出入账。真实盘卖出前会
+阻断未处理送转，模拟盘下单前先自动结算；若历史上已经先卖出或清仓，当前版本不会拿现有
+聚合态倒序套公式，而是落一条 `manual_review=true` 的待处理记录并明确说明原因。此类记录禁止
+自动确认，用户明确确认已自行核对后可忽略并解除交易拦截；忽略不会自动修正账本（完整自动
+修复需要按业务日期重放全部流水）。
 
 **行业 / 风格暴露（C13，第六十二批；读时计算零落库、零新表）**：
 
@@ -345,7 +366,9 @@ AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yiel
 - `GET /api/positions/sell-reviews?status=` / `PUT /api/positions/sell-reviews/:id/status`
   （D16 卖出复核清单与状态机；status = open | resolved | dismissed）
 - `POST /api/positions/advice`（D17 AI 逐笔卖出建议，**走 llm_tasks 后台任务秒回任务 id**，
-  前端 `GET /api/llm-tasks/:id` 轮询；限流 15/min）
+  前端 `GET /api/llm-tasks/:id` 轮询；限流 15/min）。当前契约为 `pa2 / position_advice.v2`：
+  prompt 给每笔仓位显式 `position_id`，模型必须原样回传 `position_id + symbol`，服务端双重
+  校验并按 position ID 去重，同代码多仓不得合并。
 - `GET /api/events/calendar?days=`（B9 未来 N 天事件日历：持仓/自选的解禁·除权·财报 + 全市场打新）
 - `GET /api/markets/:market/stocks/:symbol/corp-events`（B9 个股解禁 / 分红，公开信息无用户隔离）
 - `DELETE /api/positions/:id`（级联删流水）
@@ -435,7 +458,7 @@ AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yiel
   - `op` 无方向语义统一存 gte；**`Once` 强制 false**（一条规则覆盖多笔持仓，命中一笔就暂停整条会让其余持仓失联）；threshold 一律正数百分比。
   - fail-closed：无 fresh 行情的持仓本轮跳过；盘中用当日 high 抬升峰值参与判定但**不落库**（落库交给 16:25 盘后那一次）。
 - 命中明细状态机（`alert_events`，unread/read/dismissed）：`GET /api/alerts/events?status=&limit=`，`PUT /api/alerts/events/:id/status`，`PUT /api/alerts/events/read-all`
-- **事件去重键 `(rule_id, symbol, trade_date)`（D14 起下沉）**：绑「全部持仓」的规则同一天会对多只标的各自命中，旧的「按规则行 `triggered_at` 是否为今天」判重会把它们压成一条。`alert_events` 因此新增 `trade_date`（旧行空串，历史不追溯）与 `position_id`（持仓类命中的那一笔，其余恒 0）。
+- **持仓类事件去重键 `(rule_id, position_id, trade_date)`（D14 起下沉）**：绑「全部持仓」的规则同一天会逐仓命中，同一代码也可能有多笔不同成本的持仓；按 symbol 判重会吞掉后面的仓位。`alert_events` 因此新增 `trade_date`（旧行空串，历史不追溯）与 `position_id`（持仓类命中的那一笔，其余恒 0）。非持仓类仍由规则行 `triggered_at` 做同日去重。
 - 今日待办（`GET /api/todos?scope=`）的提醒条目即 unread 事件，`ref_id` 为事件 id，可就地标记已读/忽略「完成待办」
 
 ### 5.8.2 今日待办范围（D18）

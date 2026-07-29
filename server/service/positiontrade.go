@@ -36,10 +36,11 @@ type positionLedger struct {
 	BuyFee   float64 // 当前持仓尚未结转的买入费用（元）
 	BuyTax   float64 // 当前持仓尚未结转的买入税费（元）
 
-	RealizedPnl  float64 // 累计已实现盈亏（元）
-	TotalBuyCost float64 // 累计买入总成本（元，含买入费税）
-	TotalSellNet float64 // 累计卖出净收入（元，已扣卖出费税）
-	TotalBuyQty  float64 // 累计买入数量（股）
+	RealizedPnl   float64 // 累计已实现盈亏（元）
+	TotalBuyCost  float64 // 累计买入总成本（元，含买入费税）
+	TotalSellNet  float64 // 累计卖出净收入（元，已扣卖出费税）
+	TotalBuyQty   float64 // 累计买入数量（股）
+	RemainingCost float64 // 当前剩余仓位尚未结转的精确成本余额（含买入费税）
 }
 
 func ledgerFromPosition(p *model.Position) positionLedger {
@@ -47,6 +48,7 @@ func ledgerFromPosition(p *model.Position) positionLedger {
 		AvgCost: p.BuyPrice, Quantity: p.Quantity, BuyFee: p.BuyFee, BuyTax: p.BuyTax,
 		RealizedPnl: p.RealizedPnl, TotalBuyCost: p.TotalBuyCost,
 		TotalSellNet: p.TotalSellNet, TotalBuyQty: p.TotalBuyQty,
+		RemainingCost: p.RemainingCost,
 	}
 }
 
@@ -54,6 +56,32 @@ func (l positionLedger) applyTo(p *model.Position) {
 	p.BuyPrice, p.Quantity, p.BuyFee, p.BuyTax = l.AvgCost, l.Quantity, l.BuyFee, l.BuyTax
 	p.RealizedPnl, p.TotalBuyCost = l.RealizedPnl, l.TotalBuyCost
 	p.TotalSellNet, p.TotalBuyQty = l.TotalSellNet, l.TotalBuyQty
+	p.RemainingCost = l.RemainingCost
+}
+
+// currentCost 返回当前仓位的金额权威。旧数据尚无 RemainingCost 时回退原口径，
+// 下一次惰性补建或交易会把余额固化，避免加权均价的 4 位舍入误差继续放大。
+func (l positionLedger) currentCost() float64 {
+	if l.TotalBuyCost > 0 || l.RemainingCost > 0 || l.Quantity <= positionQtyEps {
+		return round4(l.RemainingCost)
+	}
+	return round4(l.AvgCost*l.Quantity + l.BuyFee + l.BuyTax)
+}
+
+// inferredRemainingCost 从累计账与卖出流水还原精确剩余成本。RealizedPnl 同时包含
+// adjust 现金分红，不能直接全量代入恒等式；只有 sell 流水满足
+// 「本笔已实现 = 卖出净额 - 本笔结转成本」。
+func inferredRemainingCost(db *gorm.DB, p model.Position) (float64, error) {
+	var row struct {
+		SellRealized float64 `gorm:"column:sell_realized"`
+	}
+	if err := db.Model(&model.PositionTrade{}).
+		Select("COALESCE(SUM(realized_pnl), 0) AS sell_realized").
+		Where("position_id = ? AND user_id = ? AND side = ?", p.ID, p.UserID, model.PositionTradeSell).
+		Scan(&row).Error; err != nil {
+		return 0, err
+	}
+	return round4(p.TotalBuyCost - p.TotalSellNet + row.SellRealized), nil
 }
 
 // round4 见 paper.go（落库精度 decimal(20,4)）：金额/单价统一按 4 位收敛，
@@ -72,6 +100,7 @@ func ledgerBuy(l positionLedger, price, qty, fee, tax float64) (positionLedger, 
 	if fee < 0 || tax < 0 {
 		return l, errors.New("费用/税费不能为负")
 	}
+	currentCost := l.currentCost()
 	newQty := l.Quantity + qty
 	l.AvgCost = round4((l.AvgCost*l.Quantity + price*qty) / newQty)
 	l.Quantity = round4(newQty)
@@ -79,6 +108,7 @@ func ledgerBuy(l positionLedger, price, qty, fee, tax float64) (positionLedger, 
 	l.BuyTax = round4(l.BuyTax + tax)
 	l.TotalBuyCost = round4(l.TotalBuyCost + price*qty + fee + tax)
 	l.TotalBuyQty = round4(l.TotalBuyQty + qty)
+	l.RemainingCost = round4(currentCost + price*qty + fee + tax)
 	return l, nil
 }
 
@@ -108,7 +138,11 @@ func ledgerSell(l positionLedger, price, qty, fee, tax float64) (positionLedger,
 		// 清仓时把剩余买入费税一次结清，避免按比例分摊的舍入残渣永久挂在账上。
 		allocFee, allocTax = l.BuyFee, l.BuyTax
 	}
-	costPart := l.AvgCost*qty + allocFee + allocTax
+	remainingCost := l.currentCost()
+	costPart := remainingCost
+	if !sellAll {
+		costPart = round4(remainingCost * qty / l.Quantity)
+	}
 	netProceeds := price*qty - fee - tax
 	realized := round4(netProceeds - costPart)
 
@@ -116,8 +150,9 @@ func ledgerSell(l positionLedger, price, qty, fee, tax float64) (positionLedger,
 	l.TotalSellNet = round4(l.TotalSellNet + netProceeds)
 	l.BuyFee = round4(l.BuyFee - allocFee)
 	l.BuyTax = round4(l.BuyTax - allocTax)
+	l.RemainingCost = round4(remainingCost - costPart)
 	if sellAll {
-		l.Quantity, l.BuyFee, l.BuyTax = 0, 0, 0
+		l.Quantity, l.BuyFee, l.BuyTax, l.RemainingCost = 0, 0, 0, 0
 	} else {
 		l.Quantity = round4(l.Quantity - qty)
 	}
@@ -142,6 +177,10 @@ type PositionTradeInput struct {
 	SellPlanned   string `json:"sell_planned"`
 	AiVerdict     string `json:"ai_verdict"`
 	LessonLearned string `json:"lesson_learned"`
+
+	// closeAll 仅供 PositionService.Close 使用：在持仓行锁内读取实时剩余数量，避免
+	// 事务外读数量后与并发加减仓竞态。HTTP 入参无法设置。
+	closeAll bool
 }
 
 // lockedPosition 事务内按 (id, user_id) 重读持仓并加行锁；MySQL 走 FOR UPDATE 串行化
@@ -183,6 +222,26 @@ func ensurePositionTradesTx(tx *gorm.DB, p *model.Position) error {
 		return err
 	}
 	if n > 0 {
+		if p.Status == model.PositionStatusHolding && p.Quantity > positionQtyEps && p.RemainingCost <= 0 {
+			if p.TotalBuyCost > 0 {
+				// 账本恒等式只使用 sell 流水的已实现；adjust 现金分红不冲减也不抬高成本。
+				var err error
+				p.RemainingCost, err = inferredRemainingCost(tx, *p)
+				if err != nil {
+					return err
+				}
+				if p.RemainingCost < -positionQtyEps {
+					return fmt.Errorf("持仓账本剩余成本异常为负数：%g", p.RemainingCost)
+				}
+				if p.RemainingCost < 0 {
+					p.RemainingCost = 0
+				}
+			} else {
+				p.RemainingCost = round4(p.BuyPrice*p.Quantity + p.BuyFee + p.BuyTax)
+			}
+			return tx.Model(&model.Position{}).Where("id = ? AND user_id = ?", p.ID, p.UserID).
+				Update("remaining_cost", p.RemainingCost).Error
+		}
 		return nil
 	}
 	buyCost := round4(p.BuyPrice*p.Quantity + p.BuyFee + p.BuyTax)
@@ -194,6 +253,7 @@ func ensurePositionTradesTx(tx *gorm.DB, p *model.Position) error {
 	}}
 	p.TotalBuyCost, p.TotalBuyQty = buyCost, p.Quantity
 	p.TotalSellNet, p.RealizedPnl = 0, 0
+	p.RemainingCost = buyCost
 	if p.Status == model.PositionStatusClosed && p.SellPrice > 0 {
 		sellNet := round4(p.SellPrice*p.Quantity - p.SellFee - p.SellTax)
 		trades = append(trades, model.PositionTrade{
@@ -204,6 +264,7 @@ func ensurePositionTradesTx(tx *gorm.DB, p *model.Position) error {
 		})
 		p.TotalSellNet = sellNet
 		p.RealizedPnl = round4(sellNet - buyCost)
+		p.RemainingCost = 0
 	}
 	if err := tx.Create(&trades).Error; err != nil {
 		return err
@@ -214,6 +275,7 @@ func ensurePositionTradesTx(tx *gorm.DB, p *model.Position) error {
 			"total_buy_cost": p.TotalBuyCost,
 			"total_sell_net": p.TotalSellNet,
 			"total_buy_qty":  p.TotalBuyQty,
+			"remaining_cost": p.RemainingCost,
 		}).Error
 }
 
@@ -226,29 +288,16 @@ func backfillPositionLedgers(userID int64, positions []model.Position) bool {
 	}
 	ids := make([]int64, 0, len(positions))
 	for _, p := range positions {
-		if p.TotalBuyCost <= 0 {
+		if p.TotalBuyCost <= 0 ||
+			(p.Status == model.PositionStatusHolding && p.Quantity > positionQtyEps && p.RemainingCost <= 0) {
 			ids = append(ids, p.ID)
 		}
 	}
 	if len(ids) == 0 {
 		return false
 	}
-	// 一次查出已有流水的持仓，避免逐条起事务。
-	var withTrades []int64
-	if err := common.DB.Model(&model.PositionTrade{}).
-		Where("user_id = ? AND position_id IN ?", userID, ids).
-		Distinct().Pluck("position_id", &withTrades).Error; err != nil {
-		return false
-	}
-	done := map[int64]bool{}
-	for _, id := range withTrades {
-		done[id] = true
-	}
 	wrote := false
 	for _, id := range ids {
-		if done[id] {
-			continue
-		}
 		err := common.DB.Transaction(func(tx *gorm.DB) error {
 			var p model.Position
 			if err := lockedPosition(tx, userID, id, &p); err != nil {
@@ -265,6 +314,41 @@ func backfillPositionLedgers(userID int64, positions []model.Position) bool {
 	return wrote
 }
 
+// ensurePositionLedgersStrict 是资产快照使用的 fail-closed 版本。与列表读取的 best-effort
+// 补建不同，任何一笔失败都会返回错误，调用方不得据不完整 RealizedPnl 落历史快照。
+func ensurePositionLedgersStrict(userID int64, positions []model.Position) (bool, error) {
+	if common.DB == nil {
+		return false, errors.New("数据库不可用")
+	}
+	if len(positions) == 0 {
+		return false, nil
+	}
+	ids := make([]int64, 0, len(positions))
+	for _, p := range positions {
+		// 汇总口径已经完整的 legacy closed 记录可能没有足够字段重建明细
+		// （例如 Quantity/SellPrice 已归零），但它的 RealizedPnl/TotalBuyCost
+		// 仍可直接用于快照；只有汇总本身缺失时才要求严格补建。
+		if p.TotalBuyCost <= 0 ||
+			(p.Status == model.PositionStatusHolding && p.Quantity > positionQtyEps && p.RemainingCost <= 0) {
+			ids = append(ids, p.ID)
+		}
+	}
+	wrote := false
+	for _, id := range ids {
+		if err := common.DB.Transaction(func(tx *gorm.DB) error {
+			var p model.Position
+			if err := lockedPosition(tx, userID, id, &p); err != nil {
+				return err
+			}
+			return ensurePositionTradesTx(tx, &p)
+		}); err != nil {
+			return wrote, fmt.Errorf("持仓 %d 补建流水失败: %w", id, err)
+		}
+		wrote = true
+	}
+	return wrote, nil
+}
+
 // ListTrades 列出某持仓的流水明细（仅本人；按时间正序）。读取前惰性补建，
 // 保证「老持仓点开流水也看得到等价首笔买入」。
 func (s *PositionService) ListTrades(userID, positionID int64) ([]model.PositionTrade, error) {
@@ -275,7 +359,8 @@ func (s *PositionService) ListTrades(userID, positionID int64) ([]model.Position
 	if err := common.DB.Where("id = ? AND user_id = ?", positionID, userID).First(&p).Error; err != nil {
 		return nil, errors.New("持仓不存在")
 	}
-	if p.TotalBuyCost <= 0 {
+	if p.TotalBuyCost <= 0 ||
+		(p.Status == model.PositionStatusHolding && p.Quantity > positionQtyEps && p.RemainingCost <= 0) {
 		if err := common.DB.Transaction(func(tx *gorm.DB) error {
 			var locked model.Position
 			if err := lockedPosition(tx, userID, positionID, &locked); err != nil {
@@ -307,10 +392,14 @@ func (s *PositionService) AddTrade(userID, positionID int64, in PositionTradeInp
 	if side != model.PositionTradeBuy && side != model.PositionTradeSell {
 		return nil, errors.New("交易方向须为 buy 或 sell")
 	}
-	if in.TradeDate != "" {
-		if _, err := time.Parse("2006-01-02", in.TradeDate); err != nil {
-			return nil, errors.New("交易日期格式应为 YYYY-MM-DD")
-		}
+	today := time.Now().In(time.Local).Format("2006-01-02")
+	if strings.TrimSpace(in.TradeDate) == "" {
+		in.TradeDate = today
+	} else if _, err := time.Parse("2006-01-02", in.TradeDate); err != nil {
+		return nil, errors.New("交易日期格式应为 YYYY-MM-DD")
+	}
+	if in.TradeDate > today {
+		return nil, errors.New("交易日期不能晚于今天")
 	}
 	if side == model.PositionTradeSell {
 		if !validSellPlanned[in.SellPlanned] {
@@ -337,9 +426,24 @@ func (s *PositionService) AddTrade(userID, positionID int64, in PositionTradeInp
 		if in.TradeDate != "" && p.BuyDate != "" && in.TradeDate < p.BuyDate {
 			return errors.New("交易日期不能早于建仓日期")
 		}
+		if side == model.PositionTradeSell && in.closeAll {
+			in.Quantity = p.Quantity
+		}
+		var lastTrade model.PositionTrade
+		if err := tx.Where("position_id = ? AND user_id = ?", p.ID, userID).
+			Order("trade_date DESC, id DESC").First(&lastTrade).Error; err != nil {
+			return err
+		}
+		if lastTrade.TradeDate != "" && in.TradeDate < lastTrade.TradeDate {
+			return fmt.Errorf("交易日期不能早于最近一笔流水日期 %s（账本按录入顺序结转）", lastTrade.TradeDate)
+		}
+		if side == model.PositionTradeSell {
+			if err := ensurePositionShareActionsProcessedTx(tx, p, in.TradeDate); err != nil {
+				return err
+			}
+		}
 
 		ledger := ledgerFromPosition(&p)
-		today := time.Now().In(time.Local).Format("2006-01-02")
 		// D15：先补齐峰值（老持仓可能尚未初始化），加仓分支随后按新成本重置它。
 		if _, err := ensurePositionPeakTx(tx, &p, today); err != nil {
 			return err

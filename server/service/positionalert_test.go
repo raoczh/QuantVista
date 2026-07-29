@@ -80,6 +80,15 @@ func TestEvaluatePositionAlertPure(t *testing.T) {
 	if !containsAll(msg, "持仓期最高 20.00", "2026-06-01") {
 		t.Fatalf("peak_drawdown 消息应带峰值与其日期: %s", msg)
 	}
+	// 日内先低后高无法从 OHLC 判序：旧峰值 10、当日低 8 后高 12、现价 12，
+	// 不能拼成“从 12 回撤到 8”的 33.33% 假信号；新峰值后的可知回撤为 0。
+	intradayNewPeak := positionAlertEval{
+		AvgCost: 10, Price: 12, DayHigh: 12, DayLow: 8, Peak: 10, PeakDate: "2026-06-01",
+	}
+	if ok, value, _ := evaluatePositionAlert(
+		model.AlertRule{Kind: model.AlertKindPeakDrawdown, Threshold: 20}, "", intradayNewPeak); ok || value != 0 {
+		t.Fatalf("当日新高与当日低点顺序不明时不得制造峰值回撤，ok=%v value=%v", ok, value)
+	}
 
 	// **不可判定 ≠ 未触发**：峰值为 0（未初始化）时 peak_drawdown 恒不命中且观测值为 0，
 	// 调用方据此不写 last_value（否则用户会看到「回撤 0%」这个假状态）。
@@ -194,7 +203,7 @@ func TestPositionAlertAllPositionsAndFailClosed(t *testing.T) {
 		t.Fatalf("持仓类规则命中后必须保持 active，得到 %s", saved.Status)
 	}
 
-	// 重复评估同一天：不再新增事件（去重键 rule+symbol+trade_date 幂等）。
+	// 重复评估同一天：不再新增事件（去重键 rule+position+trade_date 幂等）。
 	if _, err := svc.evaluatePositionRules(context.Background(), 1, []model.AlertRule{saved}); err != nil {
 		t.Fatalf("重复评估失败: %v", err)
 	}
@@ -202,6 +211,55 @@ func TestPositionAlertAllPositionsAndFailClosed(t *testing.T) {
 	common.DB.Model(&model.AlertEvent{}).Where("rule_id = ?", rule.ID).Count(&again)
 	if again != 2 {
 		t.Fatalf("同日重复评估不应新增事件，得到 %d", again)
+	}
+}
+
+// TestPositionAlertSameSymbolMultiplePositions 同一标的允许有多笔独立持仓；成本不同、
+// 决策也不同。事件必须按 position_id 去重，不能按 symbol 把后面的仓位吞掉。
+func TestPositionAlertSameSymbolMultiplePositions(t *testing.T) {
+	setupTestDB(t)
+	cleanCorpTables(t)
+	today := time.Now().In(time.Local).Format("2006-01-02")
+
+	p1 := seedHoldingWithPeak(t, 1, "600000", "浦发银行-低成本仓", 10, 1000, 10, today)
+	p2 := seedHoldingWithPeak(t, 1, "600000", "浦发银行-高成本仓", 12, 500, 12, today)
+	market := &fakeAlertMarket{
+		getFreshQuote: func(_ context.Context, _, _ string) (*datasource.Quote, quoteFreshInfo, error) {
+			return &datasource.Quote{Price: 8, High: 8.2, Low: 7.8}, quoteFreshInfo{Status: freshStatusFresh}, nil
+		},
+	}
+	svc := &AlertService{market: market}
+	rule := &model.AlertRule{
+		UserID: 1, Market: "cn", Name: positionAlertAllName,
+		Kind: model.AlertKindCostDrawdown, Op: model.AlertOpGTE, Threshold: 10,
+		Status: model.AlertStatusActive,
+	}
+	if err := common.DB.Create(rule).Error; err != nil {
+		t.Fatalf("建规则失败: %v", err)
+	}
+
+	hits, err := svc.evaluatePositionRules(context.Background(), 1, []model.AlertRule{*rule})
+	if err != nil {
+		t.Fatalf("评估失败: %v", err)
+	}
+	if hits != 2 {
+		t.Fatalf("同代码两笔持仓都超过阈值，应命中 2 笔，得到 %d", hits)
+	}
+	var events []model.AlertEvent
+	if err := common.DB.Where("rule_id = ?", rule.ID).Order("position_id").Find(&events).Error; err != nil {
+		t.Fatalf("查事件失败: %v", err)
+	}
+	if len(events) != 2 || events[0].PositionID != p1.ID || events[1].PositionID != p2.ID {
+		t.Fatalf("事件必须逐仓落库，不能按 symbol 合并: %+v", events)
+	}
+
+	if _, err := svc.evaluatePositionRules(context.Background(), 1, []model.AlertRule{*rule}); err != nil {
+		t.Fatalf("重复评估失败: %v", err)
+	}
+	var count int64
+	common.DB.Model(&model.AlertEvent{}).Where("rule_id = ?", rule.ID).Count(&count)
+	if count != 2 {
+		t.Fatalf("同日重复评估应按 position_id 幂等，得到 %d 条", count)
 	}
 }
 
@@ -373,15 +431,15 @@ func TestAdjustPriceForCorpAction(t *testing.T) {
 	if got := adjustPriceForCorpAction(20, 0, 0, 5); got != 19.5 {
 		t.Fatalf("每10股派5元后峰值应为 19.5，得到 %v", got)
 	}
-	// 与成本折算同构：对同一笔持仓，成本与峰值必须按同一比例移动，
-	// 否则回撤百分比会在除权当天凭空跳变。
-	res, ok := computeCorpAdjust(1000, 20, 10, 0, 5)
+	// 峰值跟随市场价格刻度扣除派息；成本基只按送转摊薄，因为现金已经单独记入
+	// realized_pnl。两者不能再强求同值，否则现金分红会被重复计收益。
+	res, ok := computeCorpAdjust(1000, 20, 1000, 10, 0, 5)
 	if !ok {
 		t.Fatal("成本折算应成立")
 	}
 	peak := adjustPriceForCorpAction(20, 10, 0, 5)
-	if peak != res.CostAfter {
-		t.Fatalf("同一价位的成本折算(%v)与峰值折算(%v)必须一致", res.CostAfter, peak)
+	if res.CostAfter != 10 || peak != 9.75 {
+		t.Fatalf("成本基与市场价格刻度应分别为 10 / 9.75，得到 %v / %v", res.CostAfter, peak)
 	}
 }
 

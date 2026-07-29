@@ -1,6 +1,8 @@
 package service
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	"quantvista/common"
@@ -80,10 +82,12 @@ func pickLatestDividendYield(actions []model.CorporateAction, now time.Time) *Di
 // 窗口内数期方案，量级 2 万行以内，与宽表构建的其它元数据读取同级。
 // symbols 为空表示**全市场**（宽表构建走这条路，不需要先知道行数）。
 // 返回 map 只含有值的 symbol：**不在 map 里 = 无数据**，与「股息率 0」严格区分。
-func DividendYieldsFor(symbols []string, now time.Time) map[string]float64 {
+// 数据库读取失败必须显式返回 error：因子快照是首写胜且同日不可覆盖，若把读取失败
+// 降级为空 map，会把当天全市场的 div_yield 永久冻结为缺失。
+func DividendYieldsFor(symbols []string, now time.Time) (map[string]float64, error) {
 	out := map[string]float64{}
 	if common.DB == nil {
-		return out
+		return nil, errors.New("数据库不可用")
 	}
 	cutoff := now.AddDate(0, 0, -dividendYieldMaxAgeDays).Format("2006-01-02")
 	q := common.DB.Model(&model.CorporateAction{}).
@@ -94,8 +98,7 @@ func DividendYieldsFor(symbols []string, now time.Time) map[string]float64 {
 	}
 	var rows []model.CorporateAction
 	if err := q.Find(&rows).Error; err != nil {
-		common.SysWarn("股息率批量查询失败: %v", err)
-		return out
+		return nil, fmt.Errorf("股息率批量查询失败: %w", err)
 	}
 	bySymbol := map[string][]model.CorporateAction{}
 	for _, r := range rows {
@@ -106,5 +109,5 @@ func DividendYieldsFor(symbols []string, now time.Time) map[string]float64 {
 			out[sym] = v.YieldPct
 		}
 	}
-	return out
+	return out, nil
 }

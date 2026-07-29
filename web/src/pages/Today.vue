@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NButton,
@@ -30,6 +30,7 @@ const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const data = ref<TodoResult | null>(null)
 const loading = ref(false)
+const todoError = ref('')
 // D18：默认只看与我的账本有关的条目——推荐复盘（AI 推过就追踪、没买也天天提示）
 // 是旧待办的噪音主体，已挪到推荐追踪页；打新归「全市场」。数据一条不删，随时可切。
 const scope = ref<TodoScope>('ledger')
@@ -39,14 +40,29 @@ const scopeOptions: { label: string; value: TodoScope }[] = [
   { label: '全市场', value: 'market' },
   { label: '全部', value: 'all' },
 ]
+let todoAbort: AbortController | null = null
+let todoSeq = 0
 async function load() {
+  todoAbort?.abort()
+  const ctrl = new AbortController()
+  todoAbort = ctrl
+  const mySeq = ++todoSeq
+  const requestedScope = scope.value
+  // 切换范围时不保留上一范围的条目，避免加载期间把账本待办显示在“研究跟踪”下。
+  if (data.value?.scope !== requestedScope) data.value = null
   loading.value = true
+  todoError.value = ''
   try {
-    data.value = await getTodos(scope.value)
+    const result = await getTodos(requestedScope, ctrl.signal)
+    if (mySeq !== todoSeq) return
+    data.value = result
   } catch (e) {
+    if (mySeq !== todoSeq || isAbortError(e)) return
+    data.value = null
+    todoError.value = (e as Error).message
     message.error((e as Error).message)
   } finally {
-    loading.value = false
+    if (mySeq === todoSeq) loading.value = false
   }
 }
 // 其它范围还有多少条（提示用户「东西没丢，在别处」）。
@@ -216,6 +232,13 @@ function openEvent(ev: CalendarEvent) {
 }
 
 onMounted(loadCalendar)
+onBeforeUnmount(() => {
+  todoSeq++
+  todoAbort?.abort()
+  todoAbort = null
+  calAbort?.abort()
+  calAbort = null
+})
 </script>
 
 <template>
@@ -227,13 +250,13 @@ onMounted(loadCalendar)
     <div class="todo" :style="styleVars">
       <n-grid cols="2 s:3" :x-gap="14" :y-gap="14" responsive="screen">
         <n-gi>
-          <StatCard label="待办合计" :value="String(data?.total ?? 0)" />
+          <StatCard label="待办合计" :value="data ? String(data.total) : '—'" />
         </n-gi>
         <n-gi>
-          <StatCard label="命中提醒" :value="String(data?.alerts ?? 0)" />
+          <StatCard label="命中提醒" :value="data ? String(data.alerts) : '—'" />
         </n-gi>
         <n-gi>
-          <StatCard label="待复盘" :value="String(data?.reviews ?? 0)" />
+          <StatCard label="待复盘" :value="data ? String(data.reviews) : '—'" />
         </n-gi>
       </n-grid>
 
@@ -246,8 +269,11 @@ onMounted(loadCalendar)
           </n-radio-group>
         </template>
         <n-spin :show="loading && !data">
+          <n-alert v-if="todoError" type="error" :bordered="false" title="今日待办读取失败">
+            {{ todoError }}
+          </n-alert>
           <n-alert
-            v-if="data && data.complete === false"
+            v-else-if="data && data.complete === false"
             type="warning"
             :bordered="false"
             style="margin-bottom: 12px"
@@ -304,7 +330,7 @@ onMounted(loadCalendar)
                   >
                   <n-button size="small" quaternary @click="markSellReview(it, 'dismissed')">忽略</n-button>
                 </template>
-                <n-button size="small" tertiary @click="handle(it)">去处理</n-button>
+                <n-button v-if="it.ref_type !== 'ipo'" size="small" tertiary @click="handle(it)">去处理</n-button>
               </div>
             </div>
           </div>

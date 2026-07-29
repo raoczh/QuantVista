@@ -107,7 +107,8 @@ func TestParseCorpActionRow(t *testing.T) {
 		t.Fatalf("基础字段错: %+v", row)
 	}
 	if row.ExDate != "2026-08-04" || row.RecordDate != "2026-08-03" ||
-		row.ReportDate != "2025-12-31" || row.NoticeDate != "2026-07-28" {
+		row.ReportDate != "2025-12-31" || row.PlanNoticeDate != "2026-03-25" ||
+		row.NoticeDate != "2026-07-28" {
 		t.Fatalf("日期应截 10 位: %+v", row)
 	}
 	if row.BonusRatio != 0 || row.TransferRatio != 0 {

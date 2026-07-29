@@ -106,7 +106,7 @@ func (s *ExportService) positionRows(userID int64) ([][]string, error) {
 		"sell_price", "sell_date", "sell_fee", "sell_tax", "sell_reason", "review_note",
 		// B5 账本汇总：quantity 是**当前剩余**数量（全部卖出后为 0），
 		// 「一共买过多少 / 一共赚了多少」看下面三列。
-		"total_buy_qty", "total_buy_cost", "total_sell_net", "realized_pnl",
+		"total_buy_qty", "total_buy_cost", "total_sell_net", "realized_pnl", "remaining_cost",
 		"recommendation_id", "created_at",
 	}}
 	for _, p := range ps {
@@ -115,7 +115,7 @@ func (s *ExportService) positionRows(userID int64) ([][]string, error) {
 			f2(p.BuyPrice), p.BuyDate, f2(p.Quantity), f2(p.BuyFee), f2(p.BuyTax), p.BuyReason,
 			f2(p.PlanStopLoss), f2(p.PlanTakeProfit),
 			f2(p.SellPrice), p.SellDate, f2(p.SellFee), f2(p.SellTax), p.SellReason, p.ReviewNote,
-			f2(p.TotalBuyQty), f2(p.TotalBuyCost), f2(p.TotalSellNet), f2(p.RealizedPnl),
+			f2(p.TotalBuyQty), f2(p.TotalBuyCost), f2(p.TotalSellNet), f2(p.RealizedPnl), f2(p.RemainingCost),
 			strconv.FormatInt(p.RecommendationID, 10), p.CreatedAt.Format(csvTimeLayout),
 		})
 	}
@@ -239,6 +239,15 @@ func (s *ExportService) ImportPositions(userID int64, r io.Reader) (*ImportResul
 			return nil, fmt.Errorf("缺少必需列 %s（模板列：%s）", need, strings.Join(PositionImportTemplate, ","))
 		}
 	}
+	// 导出 CSV 包含当前状态和累计账本，但本入口只承诺「按模板批量建仓」，不是账本恢复。
+	// 若静默接受导出文件，部分减仓会丢流水与已实现盈亏，closed 行还会被误建为 holding。
+	for _, exportOnly := range []string{
+		"status", "total_buy_qty", "total_buy_cost", "total_sell_net", "realized_pnl", "remaining_cost",
+	} {
+		if _, ok := col[exportOnly]; ok {
+			return nil, errors.New("检测到持仓导出文件；CSV 导入仅用于按模板批量建仓，不能恢复历史流水和已平仓记录，请下载导入模板")
+		}
+	}
 	get := func(rec []string, name string) string {
 		if i, ok := col[name]; ok && i < len(rec) {
 			return strings.TrimSpace(rec[i])
@@ -341,6 +350,7 @@ func parseImportRow(userID int64, rec []string, get func([]string, string) strin
 		BuyReason: truncateRunes(get(rec, "reason"), 500),
 		// B5 账本汇总初值（与首笔 buy 流水同源）。
 		TotalBuyCost: round4(buyPrice*qty + fee + tax), TotalBuyQty: qty,
+		RemainingCost: round4(buyPrice*qty + fee + tax),
 	}, nil
 }
 

@@ -44,13 +44,14 @@ export interface PaperTrade {
   symbol: string
   market: string
   name: string
-  side: 'buy' | 'sell'
+  side: 'buy' | 'sell' | 'adjust'
   price: number
   quantity: number
   amount: number
   fee: number
   tax: number
   realized_pnl: number
+  trade_date: string // 业务发生日；除权补跑时可能早于 created_at
   created_at: string
 }
 

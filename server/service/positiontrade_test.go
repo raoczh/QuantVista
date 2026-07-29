@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"quantvista/common"
 	"quantvista/datasource"
@@ -16,7 +17,8 @@ func cleanLedgerTables(t *testing.T) {
 	t.Helper()
 	wipe := func() {
 		for _, m := range []any{&model.Position{}, &model.PositionTrade{}, &model.PortfolioSnapshot{},
-			&model.PaperAccount{}, &model.PaperHolding{}, &model.PaperTrade{}} {
+			&model.PaperAccount{}, &model.PaperHolding{}, &model.PaperTrade{},
+			&model.CorporateAction{}, &model.PositionCorpAdjust{}, &model.PaperCorpAdjust{}} {
 			common.DB.Where("1 = 1").Delete(m)
 		}
 	}
@@ -33,6 +35,7 @@ func seedHoldingWithLedger(t *testing.T, userID int64, symbol string, price, qty
 		BuyPrice: price, BuyDate: buyDate, Quantity: qty, BuyFee: fee, BuyTax: tax,
 		TotalBuyCost: round4(price*qty + fee + tax), TotalBuyQty: qty,
 	}
+	p.RemainingCost = p.TotalBuyCost
 	if err := common.DB.Create(&p).Error; err != nil {
 		t.Fatalf("建持仓失败: %v", err)
 	}
@@ -50,7 +53,7 @@ func TestLedgerBuyWeightedCost(t *testing.T) {
 	// 买入费 = 5+6 = 11、税 = 1+2 = 3
 	// 累计买入成本 = 10*1000+5+1 + 12*1000+6+2 = 10006 + 12008 = 22014
 	l := positionLedger{AvgCost: 10, Quantity: 1000, BuyFee: 5, BuyTax: 1,
-		TotalBuyCost: 10006, TotalBuyQty: 1000}
+		TotalBuyCost: 10006, TotalBuyQty: 1000, RemainingCost: 10006}
 	got, err := ledgerBuy(l, 12, 1000, 6, 2)
 	if err != nil {
 		t.Fatalf("加仓失败: %v", err)
@@ -66,7 +69,8 @@ func TestLedgerBuyWeightedCost(t *testing.T) {
 		t.Fatalf("持仓成本应与累计买入成本自洽（未卖出时），得到 %v", c)
 	}
 	// 非整数加权：1000@10 + 500@13 → (10000+6500)/1500 = 11
-	l2, err := ledgerBuy(positionLedger{AvgCost: 10, Quantity: 1000, TotalBuyQty: 1000, TotalBuyCost: 10000}, 13, 500, 0, 0)
+	l2, err := ledgerBuy(positionLedger{AvgCost: 10, Quantity: 1000, TotalBuyQty: 1000,
+		TotalBuyCost: 10000, RemainingCost: 10000}, 13, 500, 0, 0)
 	if err != nil {
 		t.Fatalf("加仓失败: %v", err)
 	}
@@ -91,7 +95,7 @@ func TestLedgerBuyWeightedCost(t *testing.T) {
 func TestLedgerSellPartialAndOversell(t *testing.T) {
 	// 建仓 2000 股 @11，买入费 11 税 3（承接上一测试的账面）。
 	l := positionLedger{AvgCost: 11, Quantity: 2000, BuyFee: 11, BuyTax: 3,
-		TotalBuyCost: 22014, TotalBuyQty: 2000}
+		TotalBuyCost: 22014, TotalBuyQty: 2000, RemainingCost: 22014}
 
 	// 卖 500 股 @13，卖出费 4 税 6：
 	//   分摊买入费 = 11*500/2000 = 2.75、税 = 3*500/2000 = 0.75
@@ -269,6 +273,122 @@ func TestAddTradeEndToEnd(t *testing.T) {
 	}
 	if _, err := svc.ListTrades(99, p.ID); err == nil {
 		t.Fatal("跨用户查流水必须失败")
+	}
+}
+
+// TestRemainingCostMigrationUsesLedgerIdentity 升级前已有多笔流水的仓位不能再用四位均价
+// 乘数量迁移余额。40 万股@1 + 60 万股@1.0001 的精确成本是 1,000,060，均价落库为
+// 1.0001；若按均价反推会多出 40 元，清仓盈亏随之少 40 元。
+func TestRemainingCostMigrationUsesLedgerIdentity(t *testing.T) {
+	setupTestDB(t)
+	cleanLedgerTables(t)
+	p := model.Position{
+		UserID: 1, Symbol: "600099", Market: "cn", Status: model.PositionStatusHolding,
+		PositionType: model.PositionTypeLongTerm, BuyPrice: 1.0001, BuyDate: "2026-01-01",
+		Quantity: 1000000, TotalBuyCost: 1000060, TotalBuyQty: 1000000,
+		RemainingCost: 0, // 模拟升级前尚无该列的行
+	}
+	if err := common.DB.Create(&p).Error; err != nil {
+		t.Fatal(err)
+	}
+	trades := []model.PositionTrade{
+		{UserID: 1, PositionID: p.ID, Side: model.PositionTradeBuy, Price: 1, Quantity: 400000,
+			TradeDate: "2026-01-01", AvgCostAfter: 1, QuantityAfter: 400000},
+		{UserID: 1, PositionID: p.ID, Side: model.PositionTradeBuy, Price: 1.0001, Quantity: 600000,
+			TradeDate: "2026-01-02", AvgCostAfter: 1.0001, QuantityAfter: 1000000},
+	}
+	if err := common.DB.Create(&trades).Error; err != nil {
+		t.Fatal(err)
+	}
+	svc := &PositionService{}
+	closed, err := svc.AddTrade(1, p.ID, PositionTradeInput{
+		Side: model.PositionTradeSell, Price: 2, Quantity: 1000000, TradeDate: "2026-01-03",
+	})
+	if err != nil {
+		t.Fatalf("清仓失败: %v", err)
+	}
+	if closed.RealizedPnl != 999940 {
+		t.Fatalf("应按精确成本 1,000,060 结转，已实现应为 999,940，得到 %v", closed.RealizedPnl)
+	}
+}
+
+func TestRemainingCostMigrationExcludesAdjustDividend(t *testing.T) {
+	setupTestDB(t)
+	cleanLedgerTables(t)
+	p := model.Position{
+		UserID: 1, Symbol: "600097", Market: "cn", Status: model.PositionStatusHolding,
+		PositionType: model.PositionTypeLongTerm, BuyPrice: 10, BuyDate: "2026-01-01",
+		Quantity: 1000, TotalBuyCost: 10000, TotalBuyQty: 1000,
+		RealizedPnl: 100, RemainingCost: 0,
+	}
+	if err := common.DB.Create(&p).Error; err != nil {
+		t.Fatal(err)
+	}
+	trades := []model.PositionTrade{
+		{UserID: 1, PositionID: p.ID, Side: model.PositionTradeBuy, Price: 10, Quantity: 1000,
+			TradeDate: "2026-01-01", AvgCostAfter: 10, QuantityAfter: 1000},
+		{UserID: 1, PositionID: p.ID, Side: model.PositionTradeAdjust, RealizedPnl: 100,
+			TradeDate: "2026-06-01", AvgCostBefore: 10, AvgCostAfter: 10,
+			QuantityBefore: 1000, QuantityAfter: 1000},
+	}
+	if err := common.DB.Create(&trades).Error; err != nil {
+		t.Fatal(err)
+	}
+	closed, err := (&PositionService{}).AddTrade(1, p.ID, PositionTradeInput{
+		Side: model.PositionTradeSell, Price: 11, Quantity: 1000, TradeDate: "2026-06-02",
+	})
+	if err != nil {
+		t.Fatalf("清仓失败: %v", err)
+	}
+	if closed.RealizedPnl != 1100 {
+		t.Fatalf("现金分红不能抬高剩余成本：分红 100 + 卖出收益 1000 应为 1100，得到 %v", closed.RealizedPnl)
+	}
+}
+
+// TestAddTradeChronology 追加式账本必须按日期顺序录入；空日期固化为今天，未来日期拒绝。
+func TestAddTradeChronology(t *testing.T) {
+	setupTestDB(t)
+	cleanLedgerTables(t)
+	todayTime := time.Now().In(time.Local)
+	date := func(delta int) string { return todayTime.AddDate(0, 0, delta).Format("2006-01-02") }
+	p := seedHoldingWithLedger(t, 1, "600098", 10, 100, 0, 0, date(-10))
+	svc := &PositionService{}
+	if _, err := svc.AddTrade(1, p.ID, PositionTradeInput{
+		Side: model.PositionTradeSell, Price: 12, Quantity: 50, TradeDate: date(-5),
+	}); err != nil {
+		t.Fatalf("正常减仓失败: %v", err)
+	}
+	var before model.Position
+	common.DB.First(&before, p.ID)
+	var countBefore int64
+	common.DB.Model(&model.PositionTrade{}).Where("position_id = ?", p.ID).Count(&countBefore)
+	if _, err := svc.AddTrade(1, p.ID, PositionTradeInput{
+		Side: model.PositionTradeBuy, Price: 20, Quantity: 100, TradeDate: date(-7),
+	}); err == nil {
+		t.Fatal("早于最近流水的补录必须拒绝，否则展示顺序与结转顺序不一致")
+	}
+	var after model.Position
+	common.DB.First(&after, p.ID)
+	var countAfter int64
+	common.DB.Model(&model.PositionTrade{}).Where("position_id = ?", p.ID).Count(&countAfter)
+	if after.Quantity != before.Quantity || after.RealizedPnl != before.RealizedPnl || countAfter != countBefore {
+		t.Fatalf("被拒绝的补录不得改变账本: before=%+v after=%+v trades=%d/%d",
+			before, after, countBefore, countAfter)
+	}
+	if _, err := svc.AddTrade(1, p.ID, PositionTradeInput{
+		Side: model.PositionTradeBuy, Price: 11, Quantity: 10, TradeDate: date(1),
+	}); err == nil {
+		t.Fatal("未来交易日期必须拒绝")
+	}
+	if _, err := svc.AddTrade(1, p.ID, PositionTradeInput{
+		Side: model.PositionTradeBuy, Price: 11, Quantity: 10,
+	}); err != nil {
+		t.Fatalf("空日期应固化为今天并成功入账: %v", err)
+	}
+	var last model.PositionTrade
+	common.DB.Where("position_id = ?", p.ID).Order("id DESC").First(&last)
+	if last.TradeDate != date(0) {
+		t.Fatalf("空日期应落为今天 %s，得到 %s", date(0), last.TradeDate)
 	}
 }
 
@@ -896,6 +1016,40 @@ func TestRunPortfolioSnapshotsIdempotent(t *testing.T) {
 	common.DB.Where("user_id = 2 AND kind = ?", model.SnapshotKindPaper).First(&paperSnap)
 	if paperSnap.Cash != 100000 || paperSnap.Partial {
 		t.Fatalf("空持仓模拟盘快照应只有现金且不标 partial: %+v", paperSnap)
+	}
+}
+
+func TestSnapshotUserIDsPropagatesQueryErrors(t *testing.T) {
+	setupTestDB(t)
+	cleanLedgerTables(t)
+	t.Cleanup(func() {
+		if err := common.DB.AutoMigrate(&model.Position{}, &model.PaperAccount{}); err != nil {
+			t.Errorf("恢复快照候选表失败: %v", err)
+		}
+	})
+	if err := common.DB.Migrator().DropTable(&model.Position{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := snapshotUserIDs(); err == nil {
+		t.Fatal("持仓表查询失败不得静默等价为零候选用户")
+	}
+	if n := RunPortfolioSnapshots(context.Background(), &PositionService{}, &PaperService{}, "2026-07-28"); n != 0 {
+		t.Fatalf("持仓候选查询失败时本轮必须中止，得到 %d 条", n)
+	}
+	if err := common.DB.AutoMigrate(&model.Position{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := common.DB.Migrator().DropTable(&model.PaperAccount{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := snapshotUserIDs(); err == nil {
+		t.Fatal("模拟账户表查询失败不得静默等价为零候选用户")
+	}
+	if n := RunPortfolioSnapshots(context.Background(), &PositionService{}, &PaperService{}, "2026-07-28"); n != 0 {
+		t.Fatalf("模拟账户候选查询失败时本轮必须中止，得到 %d 条", n)
+	}
+	if err := common.DB.AutoMigrate(&model.PaperAccount{}); err != nil {
+		t.Fatal(err)
 	}
 }
 

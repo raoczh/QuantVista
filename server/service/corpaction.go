@@ -10,6 +10,7 @@ import (
 	"quantvista/datasource"
 	"quantvista/model"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -54,6 +55,325 @@ func (s *CorpActionService) emAdapter() (*datasource.EastMoneyAdapter, error) {
 	return s.em, nil
 }
 
+func corporateActionReferenced(tx *gorm.DB, actionID int64) (bool, error) {
+	for _, table := range []any{
+		&model.PositionCorpAdjust{},
+		&model.PaperCorpAdjust{},
+		&model.PositionTrade{},
+	} {
+		var count int64
+		if err := tx.Model(table).Where("corporate_action_id = ?", actionID).Count(&count).Error; err != nil {
+			return false, err
+		}
+		if count > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// storeCorporateActions 按稳定方案身份写入。ExDate 会从空值推进到实施日期，也可能被
+// 上游订正，因此不能直接作为 upsert 身份；PLAN_NOTICE_DATE 相同的行必须就地更新。
+// 上游偶发漏稳定字段时，只在 NoticeDate/ExDate 能唯一消歧且候选尚未被账本引用时接续；
+// 两个日期都变化时无法区分“订正”与“独立方案”，必须报错，不能猜测复用或新建幽灵记录。
+func storeCorporateActions(recs []model.CorporateAction) error {
+	if common.DB == nil {
+		return errors.New("数据库不可用")
+	}
+	return common.DB.Transaction(func(tx *gorm.DB) error {
+		for i := range recs {
+			rec := recs[i]
+			base := tx.Where("symbol = ? AND market = ? AND report_date = ?",
+				rec.Symbol, rec.Market, rec.ReportDate)
+			var candidates []model.CorporateAction
+			if err := base.Order("id ASC").Find(&candidates).Error; err != nil {
+				return err
+			}
+			ambiguous := func(reason string, n int) error {
+				return fmt.Errorf("公司行动身份歧义 %s/%s report=%s（%s，候选 %d 条）",
+					rec.Market, rec.Symbol, rec.ReportDate, reason, n)
+			}
+			pickUnique := func(rows []model.CorporateAction, reason string, dst *model.CorporateAction) (bool, error) {
+				switch len(rows) {
+				case 0:
+					return false, nil
+				case 1:
+					*dst = rows[0]
+					return true, nil
+				default:
+					return false, ambiguous(reason, len(rows))
+				}
+			}
+			filter := func(src []model.CorporateAction, keep func(model.CorporateAction) bool) []model.CorporateAction {
+				out := make([]model.CorporateAction, 0, len(src))
+				for _, row := range src {
+					if keep(row) {
+						out = append(out, row)
+					}
+				}
+				return out
+			}
+			var existing model.CorporateAction
+			found := false
+			weakMatch := false
+			if rec.PlanNoticeDate != "" {
+				exact := filter(candidates, func(row model.CorporateAction) bool {
+					return row.PlanNoticeDate == rec.PlanNoticeDate
+				})
+				legacyCandidates := filter(candidates, func(row model.CorporateAction) bool {
+					return row.PlanNoticeDate == ""
+				})
+				var err error
+				found, err = pickUnique(exact, "相同 PLAN_NOTICE_DATE", &existing)
+				if err != nil {
+					return err
+				}
+				if !found {
+					// 升级前空身份行只能由公告日消歧：优先首次预案公告日，其次本次
+					// 公告日，最后才接 NoticeDate 也为空的旧行。实施阶段若已有同 ExDate
+					// 的兼容行，优先保留它的 ID（它可能已被审计引用），再清掉空日期预案。
+					// 不能只凭同 ExDate 覆盖 NoticeDate 不同的未知方案。
+					compatible := filter(legacyCandidates, func(row model.CorporateAction) bool {
+						return row.NoticeDate == "" || row.NoticeDate == rec.PlanNoticeDate ||
+							(rec.NoticeDate != "" && row.NoticeDate == rec.NoticeDate)
+					})
+					if rec.ExDate != "" {
+						sameEx := filter(compatible, func(row model.CorporateAction) bool {
+							return row.ExDate == rec.ExDate
+						})
+						found, err = pickUnique(sameEx, "同除权日旧行无法唯一消歧", &existing)
+						if err != nil {
+							return err
+						}
+					}
+					if !found {
+						pending := filter(compatible, func(row model.CorporateAction) bool {
+							return row.ExDate == ""
+						})
+						found, err = pickUnique(pending, "空日期旧预案无法唯一消歧", &existing)
+						if err != nil {
+							return err
+						}
+					}
+				}
+				if !found && len(legacyCandidates) > 0 {
+					return ambiguous("新稳定身份无法可靠关联同报告期旧弱身份行", len(legacyCandidates))
+				}
+				// 有稳定 Plan 的载荷若只靠“同 Ex、但旧行连公告日也没有”接上，
+				// 仍是弱证据；旧 ID 已被账本引用时不得借此重新解释来源。
+				weakMatch = found && existing.PlanNoticeDate == "" && existing.NoticeDate == ""
+			} else {
+				// 缺 PLAN_NOTICE_DATE：先用完整的 ExDate+NoticeDate 组合，再分别尝试
+				// NoticeDate 与兼容的 ExDate。同 Ex 但两个非空公告日不同，必须视为
+				// 独立方案，不能退化成「同 Ex 唯一」后误覆盖。
+				exactPayload := filter(candidates, func(row model.CorporateAction) bool {
+					return row.ExDate == rec.ExDate && row.NoticeDate == rec.NoticeDate
+				})
+				var pickErr error
+				found, pickErr = pickUnique(exactPayload, "相同除权日/公告日无法唯一消歧", &existing)
+				if pickErr != nil {
+					return pickErr
+				}
+				if !found && rec.NoticeDate != "" {
+					sameNotice := filter(candidates, func(row model.CorporateAction) bool {
+						return row.NoticeDate == rec.NoticeDate
+					})
+					found, pickErr = pickUnique(sameNotice, "同公告日无法唯一消歧", &existing)
+					if pickErr != nil {
+						return pickErr
+					}
+				}
+				if !found && rec.ExDate != "" {
+					sameEx := filter(candidates, func(row model.CorporateAction) bool {
+						return row.ExDate == rec.ExDate
+					})
+					compatibleEx := filter(sameEx, func(row model.CorporateAction) bool {
+						return rec.NoticeDate == "" || row.NoticeDate == "" || row.NoticeDate == rec.NoticeDate
+					})
+					found, pickErr = pickUnique(compatibleEx, "同除权日存在多个兼容方案", &existing)
+					if pickErr != nil {
+						return pickErr
+					}
+				}
+				if !found {
+					legacy := filter(candidates, func(row model.CorporateAction) bool {
+						return row.PlanNoticeDate == "" && (row.ExDate == rec.ExDate || row.ExDate == "")
+					})
+					if rec.NoticeDate != "" {
+						legacy = filter(legacy, func(row model.CorporateAction) bool {
+							return row.NoticeDate == rec.NoticeDate || row.NoticeDate == ""
+						})
+					}
+					var pickErr error
+					found, pickErr = pickUnique(legacy, "空身份旧行无法唯一消歧", &existing)
+					if pickErr != nil {
+						return pickErr
+					}
+				}
+				if !found && len(candidates) > 0 {
+					// 同 Ex、不同 Notice 也可能只是同一方案的实施公告更新；没有稳定
+					// Plan 无法证明它是独立方案。只要已有候选却无法可靠关联就 fail closed。
+					return ambiguous("缺 PLAN_NOTICE_DATE 且日期无法可靠关联", len(candidates))
+				}
+				weakMatch = found
+			}
+			if found {
+				if weakMatch {
+					referenced, err := corporateActionReferenced(tx, existing.ID)
+					if err != nil {
+						return err
+					}
+					if referenced {
+						return ambiguous("弱身份候选已被账本引用，拒绝改写", 1)
+					}
+				}
+				if rec.PlanNoticeDate == "" {
+					rec.PlanNoticeDate = existing.PlanNoticeDate
+				}
+				if weakMatch {
+					// 弱身份载荷的空日期表示“本次缺失”，不能把已经明确的实施/登记/
+					// 公告日期回退为空，否则权益基数与后续匹配都会漂移。
+					if rec.ExDate == "" {
+						rec.ExDate = existing.ExDate
+					}
+					if rec.RecordDate == "" {
+						rec.RecordDate = existing.RecordDate
+					}
+					if rec.NoticeDate == "" {
+						rec.NoticeDate = existing.NoticeDate
+					}
+				}
+				// 旧实现可能已经留下「空日期预案 + 实施行」两份。空日期行从未能生成折算，
+				// 因而可安全清理；有日期行可能已被审计引用，绝不在这里删除。
+				if rec.ExDate != "" && rec.PlanNoticeDate != "" {
+					if err := tx.Where("symbol = ? AND market = ? AND report_date = ?",
+						rec.Symbol, rec.Market, rec.ReportDate).Where(
+						"id <> ? AND ex_date = '' AND COALESCE(plan_notice_date, '') = '' AND notice_date = ?",
+						existing.ID, rec.PlanNoticeDate,
+					).
+						Delete(&model.CorporateAction{}).Error; err != nil {
+						return err
+					}
+				}
+				rec.ID, rec.CreatedAt = existing.ID, existing.CreatedAt
+				if err := tx.Save(&rec).Error; err != nil {
+					return err
+				}
+				continue
+			}
+			if err := tx.Create(&rec).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func liftStoreKey(r model.RestrictedRelease) string {
+	return r.Symbol + "\x00" + r.Market + "\x00" + r.FreeDate + "\x00" + r.FreeType
+}
+
+// storeRestrictedReleases 把一次完整窗口查询当作权威集合：先 upsert 返回行，再删除窗口内
+// 已不在上游集合的旧行。只有完整拉取成功才调用本函数，网络/分页/解析失败绝不清数据。
+func storeRestrictedReleases(recs []model.RestrictedRelease, from, to string) error {
+	if common.DB == nil {
+		return errors.New("数据库不可用")
+	}
+	return common.DB.Transaction(func(tx *gorm.DB) error {
+		if len(recs) > 0 {
+			if err := tx.Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "free_date"}, {Name: "free_type"}},
+				DoUpdates: clause.AssignmentColumns([]string{
+					"name", "free_shares", "lift_market_cap", "free_ratio", "total_ratio", "updated_at",
+				}),
+			}).CreateInBatches(recs, 200).Error; err != nil {
+				return err
+			}
+		}
+		keep := make(map[string]struct{}, len(recs))
+		for _, rec := range recs {
+			keep[liftStoreKey(rec)] = struct{}{}
+		}
+		var old []model.RestrictedRelease
+		if err := tx.Where("free_date BETWEEN ? AND ?", from, to).Find(&old).Error; err != nil {
+			return err
+		}
+		var staleIDs []int64
+		for _, row := range old {
+			if _, ok := keep[liftStoreKey(row)]; !ok {
+				staleIDs = append(staleIDs, row.ID)
+			}
+		}
+		if len(staleIDs) > 0 {
+			return tx.Where("id IN ?", staleIDs).Delete(&model.RestrictedRelease{}).Error
+		}
+		return nil
+	})
+}
+
+// storeIpoSubscriptions 以 (kind, code) 作为稳定发行身份就地更新时间，并对该来源的完整
+// 查询窗口单独对账。股票源和转债源互不借用结果，避免一源失败时误清另一源数据。
+func storeIpoSubscriptions(kind string, recs []model.IpoSubscription, from, to string) error {
+	if common.DB == nil {
+		return errors.New("数据库不可用")
+	}
+	return common.DB.Transaction(func(tx *gorm.DB) error {
+		for i := range recs {
+			rec := recs[i]
+			var existing []model.IpoSubscription
+			if err := tx.Where("kind = ? AND code = ?", kind, rec.Code).Order("id ASC").Find(&existing).Error; err != nil {
+				return err
+			}
+			if len(existing) > 0 {
+				keeper := existing[0]
+				for _, row := range existing {
+					if row.ApplyDate == rec.ApplyDate {
+						keeper = row
+						break
+					}
+				}
+				if len(existing) > 1 {
+					ids := make([]int64, 0, len(existing)-1)
+					for _, dup := range existing {
+						if dup.ID != keeper.ID {
+							ids = append(ids, dup.ID)
+						}
+					}
+					if err := tx.Where("id IN ?", ids).Delete(&model.IpoSubscription{}).Error; err != nil {
+						return err
+					}
+				}
+				rec.ID, rec.CreatedAt = keeper.ID, keeper.CreatedAt
+				if err := tx.Save(&rec).Error; err != nil {
+					return err
+				}
+				continue
+			}
+			if err := tx.Create(&rec).Error; err != nil {
+				return err
+			}
+		}
+		keep := make(map[string]struct{}, len(recs))
+		for _, rec := range recs {
+			keep[rec.Code] = struct{}{}
+		}
+		var old []model.IpoSubscription
+		if err := tx.Where("kind = ? AND apply_date BETWEEN ? AND ?", kind, from, to).Find(&old).Error; err != nil {
+			return err
+		}
+		var staleIDs []int64
+		for _, row := range old {
+			if _, ok := keep[row.Code]; !ok {
+				staleIDs = append(staleIDs, row.ID)
+			}
+		}
+		if len(staleIDs) > 0 {
+			return tx.Where("id IN ?", staleIDs).Delete(&model.IpoSubscription{}).Error
+		}
+		return nil
+	})
+}
+
 // SyncCorporateActions 同步分红送转（近 N 天公告窗口）。返回入库行数。
 func (s *CorpActionService) SyncCorporateActions(ctx context.Context) (int, error) {
 	em, err := s.emAdapter()
@@ -73,7 +393,7 @@ func (s *CorpActionService) SyncCorporateActions(ctx context.Context) (int, erro
 		recs = append(recs, model.CorporateAction{
 			Symbol: r.Symbol, Market: r.Market, Name: r.Name,
 			ReportDate: r.ReportDate, ExDate: r.ExDate,
-			RecordDate: r.RecordDate, NoticeDate: r.NoticeDate,
+			RecordDate: r.RecordDate, PlanNoticeDate: r.PlanNoticeDate, NoticeDate: r.NoticeDate,
 			BonusRatio: r.BonusRatio, TransferRatio: r.TransferRatio,
 			DividendPretax: r.DividendPretax, DividendYield: r.DividendYield,
 			Progress: r.Progress, PlanProfile: truncateRunes(r.PlanProfile, 250),
@@ -82,13 +402,7 @@ func (s *CorpActionService) SyncCorporateActions(ctx context.Context) (int, erro
 	if len(recs) == 0 {
 		return 0, nil
 	}
-	if err := common.DB.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "report_date"}, {Name: "ex_date"}},
-		DoUpdates: clause.AssignmentColumns([]string{
-			"name", "record_date", "notice_date", "bonus_ratio", "transfer_ratio",
-			"dividend_pretax", "dividend_yield", "progress", "plan_profile", "updated_at",
-		}),
-	}).CreateInBatches(recs, 200).Error; err != nil {
+	if err := storeCorporateActions(recs); err != nil {
 		return 0, err
 	}
 	return len(recs), nil
@@ -104,10 +418,7 @@ func (s *CorpActionService) SyncRestrictedReleases(ctx context.Context) (int, er
 	from := now.Format("2006-01-02")
 	to := now.AddDate(0, 0, corpActionFutureDays).Format("2006-01-02")
 	rows, err := em.GetLiftReleases(ctx, from, to)
-	if err != nil {
-		if errors.Is(err, datasource.ErrNoData) {
-			return 0, nil
-		}
+	if err != nil && !errors.Is(err, datasource.ErrNoData) {
 		return 0, err
 	}
 	recs := make([]model.RestrictedRelease, 0, len(rows))
@@ -119,15 +430,7 @@ func (s *CorpActionService) SyncRestrictedReleases(ctx context.Context) (int, er
 			FreeRatio: r.FreeRatio, TotalRatio: r.TotalRatio,
 		})
 	}
-	if len(recs) == 0 {
-		return 0, nil
-	}
-	if err := common.DB.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "free_date"}, {Name: "free_type"}},
-		DoUpdates: clause.AssignmentColumns([]string{
-			"name", "free_shares", "lift_market_cap", "free_ratio", "total_ratio", "updated_at",
-		}),
-	}).CreateInBatches(recs, 200).Error; err != nil {
+	if err := storeRestrictedReleases(recs, from, to); err != nil {
 		return 0, err
 	}
 	return len(recs), nil
@@ -144,50 +447,51 @@ func (s *CorpActionService) SyncIpoSubscriptions(ctx context.Context) (int, erro
 	from := now.Format("2006-01-02")
 	to := now.AddDate(0, 0, corpActionFutureDays).Format("2006-01-02")
 
-	var recs []model.IpoSubscription
 	var errs []error
+	total := 0
 
 	stocks, serr := em.GetIpoSubscriptions(ctx, from, to)
 	if serr != nil && !errors.Is(serr, datasource.ErrNoData) {
 		errs = append(errs, fmt.Errorf("新股申购: %w", serr))
-	}
-	for _, r := range stocks {
-		recs = append(recs, model.IpoSubscription{
-			Kind: model.IpoKindStock, Code: r.Symbol, Name: r.Name,
-			ApplyCode: r.ApplyCode, ApplyDate: r.ApplyDate,
-			IssuePrice: r.IssuePrice, ApplyUpper: r.ApplyUpper,
-			PayDate: r.PayDate, BallotDate: r.BallotDate, ListDate: r.ListDate,
-			Board: r.Board,
-		})
+	} else {
+		recs := make([]model.IpoSubscription, 0, len(stocks))
+		for _, r := range stocks {
+			recs = append(recs, model.IpoSubscription{
+				Kind: model.IpoKindStock, Code: r.Symbol, Name: r.Name,
+				ApplyCode: r.ApplyCode, ApplyDate: r.ApplyDate,
+				IssuePrice: r.IssuePrice, ApplyUpper: r.ApplyUpper,
+				PayDate: r.PayDate, BallotDate: r.BallotDate, ListDate: r.ListDate,
+				Board: r.Board,
+			})
+		}
+		if err := storeIpoSubscriptions(model.IpoKindStock, recs, from, to); err != nil {
+			errs = append(errs, fmt.Errorf("新股申购入库: %w", err))
+		} else {
+			total += len(recs)
+		}
 	}
 
 	cbs, cerr := em.GetCbSubscriptions(ctx, from, to)
 	if cerr != nil && !errors.Is(cerr, datasource.ErrNoData) {
 		errs = append(errs, fmt.Errorf("可转债申购: %w", cerr))
-	}
-	for _, r := range cbs {
-		recs = append(recs, model.IpoSubscription{
-			Kind: model.IpoKindCb, Code: r.Symbol, Name: r.Name,
-			ApplyCode: r.ApplyCode, ApplyDate: r.ApplyDate,
-			IssuePrice: r.IssuePrice, ListDate: r.ListDate,
-			StockCode: r.StockCode, StockName: r.StockName,
-			Rating: r.Rating, IssueScaleYi: r.IssueScaleYi,
-		})
-	}
-
-	if len(recs) > 0 {
-		if err := common.DB.Clauses(clause.OnConflict{
-			Columns: []clause.Column{{Name: "kind"}, {Name: "code"}, {Name: "apply_date"}},
-			DoUpdates: clause.AssignmentColumns([]string{
-				"name", "apply_code", "issue_price", "apply_upper", "pay_date",
-				"ballot_date", "list_date", "board", "stock_code", "stock_name",
-				"rating", "issue_scale_yi", "updated_at",
-			}),
-		}).CreateInBatches(recs, 200).Error; err != nil {
-			errs = append(errs, err)
+	} else {
+		recs := make([]model.IpoSubscription, 0, len(cbs))
+		for _, r := range cbs {
+			recs = append(recs, model.IpoSubscription{
+				Kind: model.IpoKindCb, Code: r.Symbol, Name: r.Name,
+				ApplyCode: r.ApplyCode, ApplyDate: r.ApplyDate,
+				IssuePrice: r.IssuePrice, ListDate: r.ListDate,
+				StockCode: r.StockCode, StockName: r.StockName,
+				Rating: r.Rating, IssueScaleYi: r.IssueScaleYi,
+			})
+		}
+		if err := storeIpoSubscriptions(model.IpoKindCb, recs, from, to); err != nil {
+			errs = append(errs, fmt.Errorf("可转债申购入库: %w", err))
+		} else {
+			total += len(recs)
 		}
 	}
-	return len(recs), errors.Join(errs...)
+	return total, errors.Join(errs...)
 }
 
 // RunCorpActionSync 跑一轮完整同步。四类互不阻断，返回是否**全部成功**（供游标推进判定）。

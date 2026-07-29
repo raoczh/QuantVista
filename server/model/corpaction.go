@@ -16,20 +16,22 @@ const (
 
 // CorporateAction 分红送转方案（RPT_SHAREBONUS_DET）。
 //
-// **自然唯一键 (symbol, market, report_date, ex_date)**：同一报告期的方案会随进度多次
-// 更新（预案 → 股东大会通过 → 实施分配），除权日确定前 ex_date 为空串。以 report_date
-// 为主键成分保证同一期方案始终落在同一行（进度推进走 upsert 更新而非堆积新行）；
-// 把 ex_date 一并纳入是为了兜住「同一报告期分两次实施」（中期+末期特别分红）的少数情形。
+// 同一方案用上游 PLAN_NOTICE_DATE（预案公告日）稳定识别；ExDate 会在预案推进和日期
+// 订正时变化，不能单独承担身份。写入统一经过 service 层按 PlanNoticeDate 查找并就地
+// 更新，兼容升级前没有该列的数据。存储唯一索引额外保留 ExDate 与 NoticeDate，以容纳
+// 稳定字段缺失时同报告期的多份方案；它们不是业务身份。
 type CorporateAction struct {
 	ID     int64  `gorm:"primaryKey" json:"id"`
-	Symbol string `gorm:"size:16;index;uniqueIndex:idx_corpaction_uniq" json:"symbol"`
-	Market string `gorm:"size:8;uniqueIndex:idx_corpaction_uniq" json:"market"`
+	Symbol string `gorm:"size:16;index;uniqueIndex:idx_corpaction_storage_v2_uniq" json:"symbol"`
+	Market string `gorm:"size:8;uniqueIndex:idx_corpaction_storage_v2_uniq" json:"market"`
 	Name   string `gorm:"size:64" json:"name"`
 
-	ReportDate string `gorm:"size:10;uniqueIndex:idx_corpaction_uniq" json:"report_date"` // 报告期 YYYY-MM-DD
-	ExDate     string `gorm:"size:10;index;uniqueIndex:idx_corpaction_uniq" json:"ex_date"`
+	ReportDate string `gorm:"size:10;uniqueIndex:idx_corpaction_storage_v2_uniq" json:"report_date"` // 报告期 YYYY-MM-DD
+	ExDate     string `gorm:"size:10;index;uniqueIndex:idx_corpaction_storage_v2_uniq" json:"ex_date"`
 	RecordDate string `gorm:"size:10" json:"record_date"` // 股权登记日
-	NoticeDate string `gorm:"size:10;index" json:"notice_date"`
+	// PlanNoticeDate 方案首次预案公告日，跨「预案 -> 实施」及日期订正保持稳定。
+	PlanNoticeDate string `gorm:"size:10;index;uniqueIndex:idx_corpaction_storage_v2_uniq" json:"plan_notice_date"`
+	NoticeDate     string `gorm:"size:10;index;uniqueIndex:idx_corpaction_storage_v2_uniq" json:"notice_date"`
 
 	BonusRatio     float64 `gorm:"type:decimal(20,4)" json:"bonus_ratio"`     // 每 10 股送股（股）
 	TransferRatio  float64 `gorm:"type:decimal(20,4)" json:"transfer_ratio"`  // 每 10 股转增（股）
@@ -43,8 +45,8 @@ type CorporateAction struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// HasAdjustment 该方案是否会改变持仓数量或成本（送/转/派任一非零）。
-// 纯派息（只有 DividendPretax）也要折算成本，故三者取或。
+// HasAdjustment 该方案是否需要生成持仓账务调整（送/转/派任一非零）。
+// 纯派息不改变持仓成本，但要作为已实现收益入账，故三者取或。
 func (c *CorporateAction) HasAdjustment() bool {
 	return c.BonusRatio > 0 || c.TransferRatio > 0 || c.DividendPretax > 0
 }
@@ -83,10 +85,10 @@ const (
 
 // IpoSubscription 新股 / 可转债申购（RPTA_APP_IPOAPPLY + RPT_BOND_CB_LIST 两源合表）。
 //
-// **自然唯一键 (kind, code, apply_date)**：code 为标的代码（新股=股票代码、
-// 可转债=转债代码），同一标的只申购一次；apply_date 纳入键是为了兜住上游改期
-// （改期会新增一行而非覆盖，两行都在日历上、旧行随窗口滑出自然消失，
-// 好过静默改写用户已看到的日期）。**申购代码 apply_code 不进唯一键**——
+// 业务稳定身份是 (kind, code)：code 为标的代码（新股=股票代码、可转债=转债代码），
+// 同一发行的 apply_date 被上游订正时就地更新；完整窗口同步还会清理取消项和历史重复。
+// 表上的旧存储唯一索引仍含 apply_date，service 层负责按稳定身份收敛。**申购代码
+// apply_code 不进身份**——
 // 沪市新股申购代码与股票代码不同、可转债申购代码是独立的 CORRECODE，
 // 上游订正申购代码时应就地更新而不是新增一行。
 type IpoSubscription struct {
@@ -144,10 +146,11 @@ type PositionCorpAdjust struct {
 	// CorporateActionID 来源公司行动（显式外键列，撤销/重复确认判定与审计都靠它）。
 	CorporateActionID int64 `gorm:"index;uniqueIndex:idx_corpadj_uniq" json:"corporate_action_id"`
 
-	Symbol string `gorm:"size:16;index" json:"symbol"`
-	Market string `gorm:"size:8" json:"market"`
-	Name   string `gorm:"size:64" json:"name"`
-	ExDate string `gorm:"size:10;index" json:"ex_date"`
+	Symbol     string `gorm:"size:16;index" json:"symbol"`
+	Market     string `gorm:"size:8" json:"market"`
+	Name       string `gorm:"size:64" json:"name"`
+	ExDate     string `gorm:"size:10;index" json:"ex_date"`
+	RecordDate string `gorm:"size:10" json:"record_date"`
 
 	// 方案快照（生成时固化，避免上游后续修订让已确认的调整对不上账）。
 	BonusRatio     float64 `gorm:"type:decimal(20,4)" json:"bonus_ratio"`
@@ -156,12 +159,19 @@ type PositionCorpAdjust struct {
 	PlanProfile    string  `gorm:"size:255" json:"plan_profile"`
 
 	// 调整前后账面（生成时按当时持仓算；确认时会用行锁内的实时值二次校验）。
-	QtyBefore  float64 `gorm:"type:decimal(20,4)" json:"qty_before"`
-	QtyAfter   float64 `gorm:"type:decimal(20,4)" json:"qty_after"`
-	CostBefore float64 `gorm:"type:decimal(20,4)" json:"cost_before"` // 每股加权成本（元）
-	CostAfter  float64 `gorm:"type:decimal(20,4)" json:"cost_after"`
-	// CashDividend 本次到手现金分红（元，税前）= 每 10 股派息 × 数量 / 10。
+	QtyBefore float64 `gorm:"type:decimal(20,4)" json:"qty_before"`
+	// EntitledQty 股权登记日收盘时实际有权数量；除权日新买入的份额不参与本次送转派息。
+	EntitledQty float64 `gorm:"type:decimal(20,4)" json:"entitled_qty"`
+	QtyAfter    float64 `gorm:"type:decimal(20,4)" json:"qty_after"`
+	CostBefore  float64 `gorm:"type:decimal(20,4)" json:"cost_before"` // 每股加权成本（元）
+	CostAfter   float64 `gorm:"type:decimal(20,4)" json:"cost_after"`
+	// CashDividend 本次到手现金分红（元，税前）= 每 10 股派息 × EntitledQty / 10。
 	CashDividend float64 `gorm:"type:decimal(20,4)" json:"cash_dividend"`
+
+	// ManualReview 表示历史流水已发生在送转之前，当前聚合态不能安全自动倒序折算。
+	// 此类建议只用于把风险显式呈现并提供人工确认后的忽略入口，绝不允许确认入账。
+	ManualReview bool   `gorm:"default:false" json:"manual_review"`
+	ReviewReason string `gorm:"size:255" json:"review_reason"`
 
 	// PeakBefore/PeakAfter 持仓期最高价（D15）折算前后值。**撤销时按 PeakBefore 原值
 	// 还原而非反算折算公式**——反算会引入舍入漂移，让撤销后的峰值与折算前差几厘。
@@ -182,19 +192,22 @@ type PositionCorpAdjust struct {
 // PaperCorpAdjust 模拟盘除权除息自动调整审计（B8）。
 //
 // 模拟盘是虚拟账户、无真实后果，**自动执行**（与真实持仓的「必须用户确认」相反）。
-// **唯一键 (user_id, corporate_action_id)**：按 action 保证重跑不重复调整——
-// 模拟盘持仓按 (user, symbol, market) 聚合成一条，同一 action 对同一用户只会调一次。
+// **唯一键 (user_id, corporate_action_id)**：按 action 保证重跑不重复调整或发钱。
+// 当前 holding 自动折算；已清仓的纯现金分红也会落零数量审计，同一 action 对同一用户
+// 仍只执行一次。模拟账户 Reset 必须连本表一并清空，否则新账户会被旧审计误判已处理。
 type PaperCorpAdjust struct {
 	ID                int64 `gorm:"primaryKey" json:"id"`
 	UserID            int64 `gorm:"index;uniqueIndex:idx_papercorpadj_uniq" json:"user_id"`
 	CorporateActionID int64 `gorm:"index;uniqueIndex:idx_papercorpadj_uniq" json:"corporate_action_id"`
 
-	Symbol string `gorm:"size:16;index" json:"symbol"`
-	Market string `gorm:"size:8" json:"market"`
-	Name   string `gorm:"size:64" json:"name"`
-	ExDate string `gorm:"size:10;index" json:"ex_date"`
+	Symbol     string `gorm:"size:16;index" json:"symbol"`
+	Market     string `gorm:"size:8" json:"market"`
+	Name       string `gorm:"size:64" json:"name"`
+	ExDate     string `gorm:"size:10;index" json:"ex_date"`
+	RecordDate string `gorm:"size:10" json:"record_date"`
 
 	QtyBefore    float64 `gorm:"type:decimal(20,4)" json:"qty_before"`
+	EntitledQty  float64 `gorm:"type:decimal(20,4)" json:"entitled_qty"`
 	QtyAfter     float64 `gorm:"type:decimal(20,4)" json:"qty_after"`
 	CostBefore   float64 `gorm:"type:decimal(20,4)" json:"cost_before"`
 	CostAfter    float64 `gorm:"type:decimal(20,4)" json:"cost_after"`

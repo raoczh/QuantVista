@@ -29,40 +29,48 @@ func TestNormalizePositionVerdict(t *testing.T) {
 	}
 }
 
-// TestFilterPositionAdvices 服务端强校验：越界标的/非法枚举/重复/空理由一律丢弃，
+// TestFilterPositionAdvices 服务端强校验：越界标的/非法枚举/重复/空理由或失效条件一律丢弃，
 // 名称与持仓 id 由服务端回填。
 func TestFilterPositionAdvices(t *testing.T) {
-	allowed := map[string]bool{"600000": true, "600519": true}
-	posBySym := map[string]int64{"600000": 11, "600519": 22}
-	nameBySym := map[string]string{"600000": "浦发银行", "600519": "贵州茅台"}
-	in := []PositionAdvice{
-		{Symbol: "600000", Verdict: "清仓", Reason: "解禁临近且已破 MA60", Invalidation: "收复 MA60 且解禁落地无抛压"},
-		{Symbol: "600000", Verdict: "hold", Reason: "重复条目"},    // 重复：丢弃
-		{Symbol: "000001", Verdict: "exit", Reason: "不在持仓名单里"}, // 越界标的：丢弃
-		{Symbol: "600519", Verdict: "加仓", Reason: "枚举越界"},      // 非法枚举：丢弃
-		{Symbol: "600519", Verdict: "hold", Reason: ""},        // 空理由：丢弃
-		{Symbol: "600519", Verdict: "trim", Reason: "仓位占比过高", Name: "模型自填的假名字"},
+	positions := map[int64]positionAdviceRow{
+		11: {PositionID: 11, Symbol: "600000", Name: "浦发银行"},
+		12: {PositionID: 12, Symbol: "600000", Name: "浦发银行第二笔"},
+		22: {PositionID: 22, Symbol: "600519", Name: "贵州茅台"},
 	}
-	out := filterPositionAdvices(in, allowed, posBySym, nameBySym)
-	if len(out) != 2 {
-		t.Fatalf("应只保留 2 条合法结论，得到 %d: %+v", len(out), out)
+	in := []PositionAdvice{
+		{PositionID: 11, Symbol: "600000", Verdict: "清仓", Reason: "解禁临近且已破 MA60", Invalidation: "收复 MA60 且解禁落地无抛压"},
+		{PositionID: 11, Symbol: "600000", Verdict: "hold", Reason: "重复 ID"}, // 重复：丢弃
+		{PositionID: 12, Symbol: "600000", Verdict: "hold", Reason: "第二笔成本不同，继续持有", Invalidation: "跌破 8 元"},
+		{PositionID: 22, Symbol: "600000", Verdict: "exit", Reason: "ID 与代码错配"}, // 丢弃
+		{PositionID: 999, Symbol: "000001", Verdict: "exit", Reason: "不在持仓名单里"},
+		{PositionID: 22, Symbol: "600519", Verdict: "加仓", Reason: "枚举越界"},
+		{PositionID: 22, Symbol: "600519", Verdict: "hold", Reason: ""},
+		{PositionID: 22, Symbol: "600519", Verdict: "hold", Reason: "理由合法但失效条件为空"},
+		{PositionID: 22, Symbol: "600519", Verdict: "trim", Reason: "仓位占比过高", Invalidation: "仓位降至 20%", Name: "模型自填的假名字"},
+	}
+	out := filterPositionAdvices(in, positions)
+	if len(out) != 3 {
+		t.Fatalf("应保留同代码的两笔持仓及茅台共 3 条合法结论，得到 %d: %+v", len(out), out)
 	}
 	if out[0].Verdict != PositionVerdictExit || out[0].PositionID != 11 || out[0].Name != "浦发银行" {
 		t.Fatalf("首条应归一为 exit 且服务端回填名称与持仓 id: %+v", out[0])
 	}
-	if out[1].Name != "贵州茅台" {
-		t.Fatalf("模型自填的名称必须被服务端值覆盖: %+v", out[1])
+	if out[1].PositionID != 12 || out[1].Name != "浦发银行第二笔" {
+		t.Fatalf("同代码第二笔持仓不得被第一笔吞掉: %+v", out[1])
+	}
+	if out[2].Name != "贵州茅台" {
+		t.Fatalf("模型自填的名称必须被服务端值覆盖: %+v", out[2])
 	}
 }
 
 // TestVerifyPositionAdviceEvidence 结论里的数字进核验值域：真实值可引用、伪造值被标记。
 func TestVerifyPositionAdviceEvidence(t *testing.T) {
 	rows := []positionAdviceRow{{
-		Symbol: "600000", Name: "浦发银行", Cost: 10.5, Price: 8.4, PnlPct: -20,
+		PositionID: 11, Symbol: "600000", Name: "浦发银行", Cost: 10.5, Price: 8.4, PnlPct: -20,
 		HeldDays: 35, Peak: 13.2, PeakDrawdownPct: 36.36, WeightPct: 42.5,
 	}}
 	real := []PositionAdvice{{
-		Symbol: "600000", Name: "浦发银行", Verdict: PositionVerdictExit,
+		PositionID: 11, Symbol: "600000", Name: "浦发银行", Verdict: PositionVerdictExit,
 		Reason:       "成本 10.5 元，现价 8.4 元，浮亏 20%；自持仓期最高 13.2 已回撤 36.36%，且仓位占比 42.5% 过高",
 		Invalidation: "重新站上 10.5 元成本线",
 	}}
@@ -75,12 +83,24 @@ func TestVerifyPositionAdviceEvidence(t *testing.T) {
 	}
 	// 伪造值必须被抓出来。
 	fake := []PositionAdvice{{
-		Symbol: "600000", Name: "浦发银行", Verdict: PositionVerdictExit,
+		PositionID: 11, Symbol: "600000", Name: "浦发银行", Verdict: PositionVerdictExit,
 		Reason: "成本 66.66 元，现价 99.99 元，浮亏 88.88%",
 	}}
 	fakeCheck := verifyPositionAdvice(fake, rows)
 	if fakeCheck.UnmatchedTotal == 0 {
 		t.Fatal("编造的数字必须被核验标记（信任层失守）")
+	}
+
+	// 同代码第二笔仓位的真实成本也不能替第一笔背书。
+	rows = append(rows, positionAdviceRow{
+		PositionID: 12, Symbol: "600000", Name: "浦发银行第二笔", Cost: 66.66, Price: 8.4,
+	})
+	cross := []PositionAdvice{{
+		PositionID: 11, Symbol: "600000", Name: "浦发银行", Verdict: PositionVerdictExit,
+		Reason: "我的成本是 66.66 元",
+	}}
+	if crossCheck := verifyPositionAdvice(cross, rows); crossCheck.UnmatchedTotal == 0 {
+		t.Fatal("第一笔建议引用第二笔仓位成本必须判为未匹配")
 	}
 }
 

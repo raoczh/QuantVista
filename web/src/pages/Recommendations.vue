@@ -478,6 +478,7 @@ onMounted(async () => {
 // 是那里的噪音主体，搬到这里它自己的页面上。**数据一条没删**，只换了消费出口。
 const reviews = ref<TodoItem[]>([])
 const reviewsLoading = ref(false)
+const reviewsError = ref('')
 const reviewAcking = ref<number | null>(null)
 let reviewsAbort: AbortController | null = null
 
@@ -486,11 +487,19 @@ async function loadReviews() {
   const ctrl = new AbortController()
   reviewsAbort = ctrl
   reviewsLoading.value = true
+  reviewsError.value = ''
   try {
     const res = await getTodos('research', ctrl.signal)
+    if (reviewsAbort !== ctrl) return
     reviews.value = res.items.filter((it) => it.kind === 'rec_review')
+    if (!res.complete) {
+      reviewsError.value = res.errors?.filter(Boolean).join('；') || '部分待办数据暂时不可用，列表可能不完整'
+    }
   } catch (e) {
-    if (!isAbortError(e)) reviews.value = []
+    if (reviewsAbort === ctrl && !isAbortError(e)) {
+      reviews.value = []
+      reviewsError.value = (e as Error).message
+    }
   } finally {
     if (reviewsAbort === ctrl) reviewsLoading.value = false
   }
@@ -893,13 +902,21 @@ function qgFieldLabels(fields?: string[]): string {
 
         <!-- D18：推荐复盘提示的新家。今日待办默认只显示与账本有关的条目，
              「AI 推过就追踪、我没买也天天提示」的复盘提醒搬到这里；数据一条没删。 -->
-        <SectionCard v-if="reviews.length || reviewsLoading" title="待复盘提示">
+        <SectionCard v-if="reviews.length || reviewsLoading || reviewsError" title="待复盘提示">
           <template #extra>
             <n-button size="tiny" quaternary :loading="reviewsLoading" @click="loadReviews">刷新</n-button>
           </template>
+          <n-alert
+            v-if="reviewsError"
+            :type="reviews.length ? 'warning' : 'error'"
+            :bordered="false"
+            :title="reviews.length ? '待复盘提示可能不完整' : '待复盘提示读取失败'"
+          >
+            {{ reviewsError }}
+          </n-alert>
           <n-spin :show="reviewsLoading && !reviews.length">
-            <n-empty v-if="!reviews.length" description="没有需要复盘的推荐" size="small" />
-            <div v-else class="review-list">
+            <n-empty v-if="!reviews.length && !reviewsError" description="没有需要复盘的推荐" size="small" />
+            <div v-if="reviews.length" class="review-list">
               <div v-for="it in reviews" :key="it.ref_id" class="review-item">
                 <div class="review-main">
                   <div class="review-title">

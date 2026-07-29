@@ -74,23 +74,41 @@ const warnColor = computed(() => vars.value.warningColor)
 const positions = ref<Position[]>([])
 const overview = ref<PortfolioOverview | null>(null)
 const loading = ref(false)
+const loadError = ref('')
 const statusFilter = ref<'holding' | 'closed' | 'all'>('holding')
 const typeFilter = ref<'all' | 'short_term' | 'long_term'>('all')
+let positionLoadSeq = 0
+let loadedStatus: typeof statusFilter.value | null = null
 
 const marketOptions = [
   { label: 'A 股', value: 'cn' },
 ]
 
 async function load(silent = false) {
+  // 自动刷新不抢占正在进行的手动刷新，否则它可能让手动轮次失效且把错误静默吞掉。
+  if (silent && loading.value) return
+  const requestedStatus = statusFilter.value
+  const mySeq = ++positionLoadSeq
+  // 切换状态筛选时先清掉上一范围的持仓，避免请求期间把“持仓中”数据显示在“已卖出”下。
+  if (loadedStatus !== requestedStatus) positions.value = []
   if (!silent) loading.value = true
+  loadError.value = ''
   try {
-    const [list, ov] = await Promise.all([listPositions(statusFilter.value), getPortfolioOverview()])
+    const [list, ov] = await Promise.all([listPositions(requestedStatus), getPortfolioOverview()])
+    if (mySeq !== positionLoadSeq || requestedStatus !== statusFilter.value) return
     positions.value = list
     overview.value = ov
+    loadedStatus = requestedStatus
   } catch (e) {
-    if (!silent) message.error((e as Error).message)
+    if (mySeq === positionLoadSeq) {
+      positions.value = []
+      overview.value = null
+      loadError.value = (e as Error).message
+      if (!silent) message.error(loadError.value)
+    }
   } finally {
-    if (!silent) loading.value = false
+    // 静默自动刷新可能在手动刷新期间接管最新轮次；最新轮次无论是否 silent 都要收起旧 loading。
+    if (mySeq === positionLoadSeq) loading.value = false
   }
 }
 
@@ -269,21 +287,23 @@ async function submit() {
     message.warning('请输入股票代码')
     return
   }
-  if (!f.buy_price || f.buy_price <= 0) {
-    message.warning('请输入买入价格')
-    return
-  }
-  if (!f.quantity || f.quantity <= 0) {
-    message.warning('请输入买入数量')
-    return
-  }
-  if (f.plan_stop_loss && f.buy_price && f.plan_stop_loss >= f.buy_price) {
-    message.warning('计划止损价应低于买入价')
-    return
-  }
-  if (f.plan_take_profit && f.buy_price && f.plan_take_profit <= f.buy_price) {
-    message.warning('计划止盈价应高于买入价')
-    return
+  if (!editingClosed.value) {
+    if (!f.buy_price || f.buy_price <= 0) {
+      message.warning('请输入买入价格')
+      return
+    }
+    if (!f.quantity || f.quantity <= 0) {
+      message.warning('请输入买入数量')
+      return
+    }
+    if (f.plan_stop_loss && f.plan_stop_loss >= f.buy_price) {
+      message.warning('计划止损价应低于买入价')
+      return
+    }
+    if (f.plan_take_profit && f.plan_take_profit <= f.buy_price) {
+      message.warning('计划止盈价应高于买入价')
+      return
+    }
   }
   submitting.value = true
   try {
@@ -536,24 +556,42 @@ async function submitTrade() {
 // 展开的流水明细（一次只展开一行，避免长列表拉出几十个请求）。
 const expandedTrades = ref<number | null>(null)
 const tradesById = ref<Record<number, PositionTrade[]>>({})
+const tradesErrorById = ref<Record<number, string>>({})
 const tradesLoading = ref(false)
+let tradesSeq = 0
 
 async function toggleTrades(p: Position) {
   if (expandedTrades.value === p.id) {
+    tradesSeq++
+    tradesLoading.value = false
     expandedTrades.value = null
     return
   }
+  // 只允许当前展开行的请求控制 loading/回填；上一行迟到的响应直接丢弃。
+  tradesSeq++
+  tradesLoading.value = false
   expandedTrades.value = p.id
   if (!tradesById.value[p.id]) await loadTrades(p.id)
 }
 async function loadTrades(id: number) {
+  const mySeq = ++tradesSeq
+  const nextTrades = { ...tradesById.value }
+  delete nextTrades[id]
+  tradesById.value = nextTrades
+  tradesErrorById.value = { ...tradesErrorById.value, [id]: '' }
   tradesLoading.value = true
   try {
-    tradesById.value = { ...tradesById.value, [id]: await listPositionTrades(id) }
+    const rows = await listPositionTrades(id)
+    if (mySeq !== tradesSeq || expandedTrades.value !== id) return
+    tradesById.value = { ...tradesById.value, [id]: rows }
   } catch (e) {
-    message.error((e as Error).message)
+    if (mySeq === tradesSeq) {
+      const error = (e as Error).message
+      tradesErrorById.value = { ...tradesErrorById.value, [id]: error }
+      message.error(error)
+    }
   } finally {
-    tradesLoading.value = false
+    if (mySeq === tradesSeq) tradesLoading.value = false
   }
 }
 function sideLabel(side: string) {
@@ -587,7 +625,9 @@ async function revertAdjustTrade(t: PositionTrade, positionId: number) {
 const mainTab = ref('list')
 const stats = ref<TradeStats | null>(null)
 const statsLoading = ref(false)
+const statsError = ref('')
 const statsRange = ref('all')
+let statsSeq = 0
 const rangeOptions = [
   { label: '全部历史', value: 'all' },
   { label: '近 30 天', value: '30d' },
@@ -596,14 +636,23 @@ const rangeOptions = [
   { label: '近 1 年', value: '1y' },
 ]
 async function loadStats() {
+  const requestedRange = statsRange.value
+  const mySeq = ++statsSeq
+  if (stats.value?.range !== requestedRange) stats.value = null
   statsLoading.value = true
+  statsError.value = ''
   try {
-    stats.value = await getTradeStats(statsRange.value)
+    const result = await getTradeStats(requestedRange)
+    if (mySeq !== statsSeq || requestedRange !== statsRange.value) return
+    stats.value = result
   } catch (e) {
-    message.error((e as Error).message)
-    stats.value = null
+    if (mySeq === statsSeq) {
+      statsError.value = (e as Error).message
+      message.error(statsError.value)
+      stats.value = null
+    }
   } finally {
-    statsLoading.value = false
+    if (mySeq === statsSeq) statsLoading.value = false
   }
 }
 watch(mainTab, (t) => {
@@ -721,6 +770,7 @@ let curveChart: echarts.ECharts | null = null
 const curve = ref<PortfolioCurve | null>(null)
 const curveDays = ref(90)
 const curveLoading = ref(false)
+const curveError = ref('')
 let curveAbort: AbortController | null = null
 let curveSeq = 0
 const curveDayOptions = [
@@ -865,9 +915,12 @@ async function loadCurve() {
   const myAbort = new AbortController()
   curveAbort = myAbort
   const mySeq = ++curveSeq
+  const requestedDays = curveDays.value
+  if (curve.value?.days !== requestedDays) curve.value = null
   curveLoading.value = true
+  curveError.value = ''
   try {
-    const data = await getPositionCurve(curveDays.value, myAbort.signal)
+    const data = await getPositionCurve(requestedDays, myAbort.signal)
     if (mySeq !== curveSeq) return
     curve.value = data
     await nextTick()
@@ -875,6 +928,9 @@ async function loadCurve() {
   } catch (e) {
     if (mySeq !== curveSeq || isAbortError(e)) return
     curve.value = null
+    curveError.value = (e as Error).message
+    curveChart?.dispose()
+    curveChart = null
   } finally {
     if (mySeq === curveSeq) curveLoading.value = false
   }
@@ -972,6 +1028,9 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
+  positionLoadSeq++
+  statsSeq++
+  tradesSeq++
   corpAdjustAbort?.abort()
   corpAdjustAbort = null
   sellReviewAbort?.abort()
@@ -1000,30 +1059,34 @@ onBeforeUnmount(() => {
       <!-- 汇总（组合总览：全组合口径） -->
       <n-grid cols="2 s:4" :x-gap="14" :y-gap="14" responsive="screen">
         <n-gi>
-          <StatCard label="持仓成本" :value="fmtMoney(overview?.total_cost ?? 0)" />
+          <StatCard label="持仓成本" :value="overview ? fmtMoney(overview.total_cost) : '—'" />
         </n-gi>
         <n-gi>
           <StatCard
             label="当前市值"
-            :value="fmtMoney(overview?.total_value ?? 0)"
+            :value="overview ? fmtMoney(overview.total_value) : '—'"
             :sub="pricedLabel"
           />
         </n-gi>
         <n-gi>
           <StatCard
             label="浮动盈亏"
-            :value="fmtMoney(overview?.total_profit ?? 0)"
-            :change-pct="overview?.profit_pct ?? 0"
+            :value="overview ? fmtMoney(overview.total_profit) : '—'"
+            :change-pct="overview ? overview.profit_pct : undefined"
           />
         </n-gi>
         <n-gi>
-          <StatCard label="已实现盈亏" :value="fmtMoney(overview?.realized_profit ?? 0)" sub="已平仓累计" />
+          <StatCard
+            label="已实现盈亏"
+            :value="overview ? fmtMoney(overview.realized_profit) : '—'"
+            :sub="overview ? '已平仓累计' : ''"
+          />
         </n-gi>
         <n-gi>
           <StatCard
             label="持仓笔数"
-            :value="String(overview?.holding_count ?? 0)"
-            :sub="`盈 ${overview?.win_count ?? 0} · 亏 ${overview?.lose_count ?? 0}`"
+            :value="overview ? String(overview.holding_count) : '—'"
+            :sub="overview ? `盈 ${overview.win_count} · 亏 ${overview.lose_count}` : ''"
           />
         </n-gi>
         <n-gi>
@@ -1037,6 +1100,10 @@ onBeforeUnmount(() => {
           />
         </n-gi>
       </n-grid>
+
+      <n-alert v-if="loadError" type="error" :bordered="false" title="持仓读取失败">
+        {{ loadError }}
+      </n-alert>
 
       <!-- 组合风控信号（集中度/止损/未分析） -->
       <n-alert v-if="overview?.signals?.length" type="warning" title="组合风控信号">
@@ -1057,8 +1124,8 @@ onBeforeUnmount(() => {
             </n-alert>
             <template v-else>
               <n-alert type="warning" :bordered="false" style="margin-bottom: 10px" :show-icon="false">
-                以下持仓已到除权除息日，账面数量与成本需要折算。确认前本页显示的盈亏是失真的（送转会让股价与数量
-                同时变化，例如 10 转 10 后会显示成 −50%）。程序不会自动改写你的账本，请核对后确认；确认后可撤销。
+                以下持仓已到除权除息日。普通建议核对后可确认折算；标记“需人工核对”的历史错序记录不会自动改账，
+                只有明确确认已自行核对后才能忽略并解除交易拦截。
               </n-alert>
               <div class="adjust-list">
                 <div v-for="a in corpAdjusts" :key="a.id" class="adjust-row">
@@ -1066,24 +1133,42 @@ onBeforeUnmount(() => {
                     <div class="adjust-head">
                       <span class="adjust-name">{{ a.name || a.symbol }}</span>
                       <span class="adjust-symbol qv-mono">{{ a.symbol }}</span>
+                      <n-tag v-if="a.manual_review" size="tiny" round :bordered="false" type="error">需人工核对</n-tag>
+                      <n-tag v-if="a.record_date" size="tiny" round :bordered="false">登记日 {{ a.record_date }}</n-tag>
                       <n-tag size="tiny" round :bordered="false" type="warning">除权日 {{ a.ex_date }}</n-tag>
                     </div>
                     <div class="adjust-plan">{{ adjustPlanText(a) }}</div>
-                    <div class="adjust-calc qv-tnum">
-                      数量 {{ a.qty_before }} → <b>{{ a.qty_after }}</b> 股 · 成本
+                    <div v-if="a.manual_review" class="adjust-review">
+                      {{ a.review_reason }}。忽略只解除拦截，不会自动修正数量、成本或已实现盈亏。
+                    </div>
+                    <div v-else class="adjust-calc qv-tnum">
+                      <template v-if="a.entitled_qty > 0">登记日有权 {{ a.entitled_qty }} 股 · </template>
+                      当前数量 {{ a.qty_before }} → <b>{{ a.qty_after }}</b> 股 · 成本
                       {{ a.cost_before.toFixed(4) }} → <b>{{ a.cost_after.toFixed(4) }}</b> 元
                       <span v-if="a.cash_dividend > 0"> · 现金分红 {{ a.cash_dividend.toFixed(2) }} 元（税前）</span>
                     </div>
                   </div>
                   <div class="adjust-actions">
                     <n-button
+                      v-if="!a.manual_review"
                       size="small"
                       type="primary"
                       :loading="corpAdjustActing === a.id"
                       @click="doCorpAdjust(a, 'confirm')"
                       >确认折算</n-button
                     >
-                    <n-button size="small" quaternary @click="doCorpAdjust(a, 'dismiss')">忽略</n-button>
+                    <n-popconfirm
+                      v-if="a.manual_review"
+                      positive-text="确认已核对"
+                      negative-text="取消"
+                      @positive-click="doCorpAdjust(a, 'dismiss')"
+                    >
+                      <template #trigger>
+                        <n-button size="small" type="warning" :loading="corpAdjustActing === a.id">已核对并忽略</n-button>
+                      </template>
+                      确认已自行核对历史流水。系统不会自动修正账本，忽略后将允许继续交易。
+                    </n-popconfirm>
+                    <n-button v-else size="small" quaternary @click="doCorpAdjust(a, 'dismiss')">忽略</n-button>
                   </div>
                 </div>
               </div>
@@ -1142,7 +1227,7 @@ onBeforeUnmount(() => {
             <div v-else class="advice-box">
               <div v-for="(n, i) in advice.notes || []" :key="i" class="advice-note">{{ n }}</div>
               <div class="advice-list">
-                <div v-for="a in advice.advices" :key="a.symbol" class="advice-row">
+                <div v-for="a in advice.advices" :key="a.position_id || a.symbol" class="advice-row">
                   <div class="advice-head">
                     <n-tag size="small" round :bordered="false" :type="verdictType(a.verdict)">{{
                       verdictLabel(a.verdict)
@@ -1202,9 +1287,12 @@ onBeforeUnmount(() => {
               </div>
             </template>
             <n-spin :show="curveLoading && !curve">
+              <n-alert v-if="curveError" type="error" :bordered="false" title="资产曲线读取失败">
+                {{ curveError }}
+              </n-alert>
               <div v-show="!!curve?.points.length" ref="curveEl" class="curve-chart"></div>
               <n-empty
-                v-if="!curve?.points.length"
+                v-if="!curveLoading && !curveError && curve && !curve.points.length"
                 description="暂无资产快照——曲线自启用之日起按交易日盘后积累，不回溯历史"
               />
               <div v-if="curve?.notes?.length" class="curve-notes">
@@ -1221,7 +1309,7 @@ onBeforeUnmount(() => {
                   <n-radio-button value="short_term">短线</n-radio-button>
                   <n-radio-button value="long_term">长线</n-radio-button>
                 </n-radio-group>
-                <n-radio-group v-model:value="statusFilter" size="small" @update:value="load">
+                <n-radio-group v-model:value="statusFilter" size="small" @update:value="load()">
                   <n-radio-button value="holding">持仓中</n-radio-button>
                   <n-radio-button value="closed">已卖出</n-radio-button>
                   <n-radio-button value="all">全部</n-radio-button>
@@ -1230,8 +1318,11 @@ onBeforeUnmount(() => {
             </template>
 
             <n-spin :show="loading && !positions.length">
-              <n-empty v-if="!filtered.length" description="暂无持仓，点击「新建持仓」记录一笔买入" />
-              <div v-else class="rows">
+              <n-empty
+                v-if="!loading && !loadError && !filtered.length"
+                description="暂无持仓，点击「新建持仓」记录一笔买入"
+              />
+              <div v-if="filtered.length" class="rows">
                 <div v-for="p in filtered" :key="p.id" class="row-wrap">
                   <div class="row">
                     <div class="r-name">
@@ -1353,7 +1444,19 @@ onBeforeUnmount(() => {
                   <!-- B5 流水明细（展开一行） -->
                   <div v-if="expandedTrades === p.id" class="trade-panel">
                     <n-spin :show="tradesLoading && !tradesById[p.id]">
-                      <n-empty v-if="!tradesById[p.id]?.length" size="small" description="暂无流水" />
+                      <n-alert
+                        v-if="tradesErrorById[p.id]"
+                        type="error"
+                        :bordered="false"
+                        title="流水读取失败"
+                      >
+                        {{ tradesErrorById[p.id] }}
+                      </n-alert>
+                      <n-empty
+                        v-else-if="!tradesLoading && tradesById[p.id] && !tradesById[p.id].length"
+                        size="small"
+                        description="暂无流水"
+                      />
                       <table v-else class="trade-table qv-tnum">
                         <thead>
                           <tr>
@@ -1375,16 +1478,27 @@ onBeforeUnmount(() => {
                             <td>
                               <span :style="{ color: sideColor(t.side) }">{{ sideLabel(t.side) }}</span>
                             </td>
-                            <td class="ta-r">{{ fmt(t.price) }}</td>
-                            <td class="ta-r">{{ t.quantity }}</td>
-                            <td class="ta-r">{{ fmt(t.fee) }}</td>
-                            <td class="ta-r">{{ fmt(t.tax) }}</td>
+                            <td class="ta-r">{{ t.side === 'adjust' ? '—' : fmt(t.price) }}</td>
+                            <td
+                              class="ta-r"
+                              :title="t.side === 'adjust' ? '除权折算导致的持仓数量变化，不是一次买卖' : ''"
+                            >
+                              {{
+                                t.side === 'adjust'
+                                  ? t.quantity
+                                    ? `${t.quantity > 0 ? '+' : ''}${t.quantity}`
+                                    : '—'
+                                  : t.quantity
+                              }}
+                            </td>
+                            <td class="ta-r">{{ t.side === 'adjust' ? '—' : fmt(t.fee) }}</td>
+                            <td class="ta-r">{{ t.side === 'adjust' ? '—' : fmt(t.tax) }}</td>
                             <td
                               class="ta-r"
                               :style="{ color: t.side === 'sell' ? pctColor(t.realized_pnl) : undefined }"
                               :title="t.side === 'adjust' ? '除权折算笔记的是到手税前现金分红' : ''"
                             >
-                              {{ t.side === 'buy' ? '—' : fmtMoney(t.realized_pnl) }}
+                              {{ t.side === 'buy' || (t.side === 'adjust' && !t.realized_pnl) ? '—' : fmtMoney(t.realized_pnl) }}
                             </td>
                             <td class="ta-r">{{ t.quantity_after }}</td>
                             <td class="ta-r">{{ fmt(t.avg_cost_after) }}</td>
@@ -1420,7 +1534,10 @@ onBeforeUnmount(() => {
               </div>
             </template>
             <n-spin :show="statsLoading && !stats">
-              <template v-if="stats">
+              <n-alert v-if="statsError" type="error" :bordered="false" title="复盘统计读取失败">
+                {{ statsError }}
+              </n-alert>
+              <template v-else-if="stats">
                 <n-grid cols="2 s:4" :x-gap="14" :y-gap="14" responsive="screen">
                   <n-gi>
                     <StatCard
@@ -1821,6 +1938,7 @@ onBeforeUnmount(() => {
     <n-modal v-model:show="importModal" preset="card" title="导入持仓（CSV）" style="max-width: 560px">
       <div class="import-body">
         <div class="import-tip">
+          此入口仅用于批量新建持仓，不恢复历史加减仓流水、已实现盈亏或已平仓记录；持仓导出文件不能直接导回。
           模板列：<code>symbol,market,type,buy_price,buy_date,quantity,buy_fee,buy_tax,reason</code>。
           type 支持 short_term/long_term（或 短线/长线），market 留空默认 cn，日期格式 YYYY-MM-DD，单次最多 500 行。
           <n-button size="tiny" quaternary type="primary" @click="downloadPositionTemplate">下载模板</n-button>
@@ -2284,6 +2402,12 @@ onBeforeUnmount(() => {
   font-size: 12px;
   opacity: 0.72;
   margin-top: 3px;
+}
+.adjust-review {
+  margin-top: 5px;
+  color: v-bind('vars.errorColor');
+  font-size: 12px;
+  line-height: 1.55;
 }
 .adjust-actions {
   display: flex;

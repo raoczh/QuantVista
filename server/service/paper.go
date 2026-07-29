@@ -64,7 +64,23 @@ func (s *PaperService) GetOrCreateAccount(userID int64) (*model.PaperAccount, er
 	err := common.DB.Where("user_id = ?", userID).First(&acc).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		acc = model.PaperAccount{UserID: userID, InitialCash: model.PaperDefaultCash, Cash: model.PaperDefaultCash}
-		if err := common.DB.Create(&acc).Error; err != nil {
+		res := common.DB.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "user_id"}},
+			DoNothing: true,
+		}).Create(&acc)
+		if res.Error != nil {
+			return nil, res.Error
+		}
+		if res.RowsAffected == 0 {
+			// 并发首建由另一请求抢先成功，重读唯一行即可。
+			if err := common.DB.Where("user_id = ?", userID).First(&acc).Error; err != nil {
+				return nil, err
+			}
+		}
+		if acc.ID == 0 {
+			return nil, errors.New("模拟账户创建失败")
+		}
+		if err := common.DB.Where("user_id = ?", userID).First(&acc).Error; err != nil {
 			return nil, err
 		}
 		return &acc, nil
@@ -97,6 +113,10 @@ func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (
 	}
 	if in.Quantity <= 0 {
 		return nil, errors.New("数量必须大于 0")
+	}
+	tradeDate := time.Now().In(time.Local).Format("2006-01-02")
+	if err := ensurePaperCorpAdjustBeforeTrade(userID, symbol, market, tradeDate); err != nil {
+		return nil, err
 	}
 
 	// 成交价：给定则用给定（跳过行情，便于离线/指定价成交）；否则取实时行情价。
@@ -134,12 +154,16 @@ func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (
 	trade := &model.PaperTrade{
 		UserID: userID, Symbol: symbol, Market: market, Name: name,
 		Side: side, Price: price, Quantity: in.Quantity,
+		TradeDate: tradeDate,
 	}
 
 	err = common.DB.Transaction(func(tx *gorm.DB) error {
 		// 事务内重读账户（MySQL 加行锁；SQLite 单写者天然串行），
 		// 避免并发交易基于事务外的过期余额计算、互相覆盖丢失更新。
 		if err := lockedAccount(tx, userID, acc); err != nil {
+			return err
+		}
+		if err := verifyPaperCorpAdjustBeforeTradeTx(tx, userID, symbol, market, tradeDate); err != nil {
 			return err
 		}
 		amount := round2(price * in.Quantity)
@@ -149,6 +173,9 @@ func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (
 		var holding model.PaperHolding
 		hErr := tx.Where("user_id = ? AND symbol = ? AND market = ?", userID, symbol, market).First(&holding).Error
 		hasHolding := hErr == nil
+		if hErr != nil && !errors.Is(hErr, gorm.ErrRecordNotFound) {
+			return hErr
+		}
 
 		if side == model.PaperSideBuy {
 			costBasis := amount + fee
@@ -236,6 +263,14 @@ type PaperOverview struct {
 	ValuationNote   string `json:"valuation_note,omitempty"`
 }
 
+func paperRealizedPnl(db *gorm.DB, userID int64) (float64, error) {
+	var realized float64
+	err := db.Model(&model.PaperTrade{}).Where("user_id = ? AND side IN ?", userID,
+		[]string{model.PaperSideSell, model.PaperSideAdjust}).
+		Select("COALESCE(SUM(realized_pnl),0)").Scan(&realized).Error
+	return round2(realized), err
+}
+
 // Overview 账户总览：持仓按当前有效行情估值，汇总总资产与盈亏。
 // fail-closed：非 fresh（stale/unknown/失败）的持仓按成本估值、浮盈记 0 并透明计数
 // ——旧价市值冒充「实时资产」会让总资产与盈亏虚高/虚低。
@@ -307,11 +342,12 @@ func (s *PaperService) Overview(ctx context.Context, userID int64) (*PaperOvervi
 		ov.TotalProfitPct = round2(ov.TotalProfit / acc.InitialCash * 100)
 	}
 
-	// 累计已实现盈亏（卖出流水求和）。
-	var realized float64
-	common.DB.Model(&model.PaperTrade{}).Where("user_id = ? AND side = ?", userID, model.PaperSideSell).
-		Select("COALESCE(SUM(realized_pnl),0)").Scan(&realized)
-	ov.RealizedPnl = round2(realized)
+	// 累计已实现盈亏（卖出兑现 + 除权现金分红）。
+	realized, err := paperRealizedPnl(common.DB, userID)
+	if err != nil {
+		return nil, err
+	}
+	ov.RealizedPnl = realized
 	return ov, nil
 }
 
@@ -349,6 +385,13 @@ func (s *PaperService) Reset(userID int64, initialCash float64) (*model.PaperAcc
 			return err
 		}
 		if err := tx.Where("user_id = ?", userID).Delete(&model.PaperTrade{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", userID).Delete(&model.PaperCorpAdjust{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ? AND kind = ?", userID, model.SnapshotKindPaper).
+			Delete(&model.PortfolioSnapshot{}).Error; err != nil {
 			return err
 		}
 		acc.InitialCash = initialCash

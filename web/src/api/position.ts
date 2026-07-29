@@ -37,6 +37,7 @@ export interface Position {
   total_buy_cost: number // 累计买入总成本（含买入费税）
   total_sell_net: number // 累计卖出净收入（已扣卖出费税）
   total_buy_qty: number // 累计买入股数
+  remaining_cost: number // 当前剩余仓位精确成本余额（结转权威，避免均价舍入放大）
   recommendation_id: number // 来源推荐（0=手动建仓）
   // 富化字段
   current_price: number
@@ -368,6 +369,7 @@ export interface PositionCorpAdjust {
   market: string
   name: string
   ex_date: string
+  record_date: string
   // 方案（每 10 股口径，勿预先除以 10）
   bonus_ratio: number
   transfer_ratio: number
@@ -375,10 +377,13 @@ export interface PositionCorpAdjust {
   plan_profile: string
   // 折算前后账面
   qty_before: number
+  entitled_qty: number // 股权登记日收盘时实际有权数量；除权日后买入的份额不参与本次权益
   qty_after: number
   cost_before: number
   cost_after: number
   cash_dividend: number // 到手税前现金分红（元）
+  manual_review: boolean // 历史流水无法安全自动倒序折算，只能人工核对后忽略
+  review_reason: string
   status: CorpAdjustStatus
   trade_id: number
   confirmed_at: string | null

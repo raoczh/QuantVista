@@ -45,14 +45,16 @@ type PaperTrade struct {
 	Symbol string `gorm:"size:16" json:"symbol"`
 	Market string `gorm:"size:8" json:"market"`
 	Name   string `gorm:"size:64" json:"name"`
-	Side   string `gorm:"size:8" json:"side"` // buy / sell
+	Side   string `gorm:"size:8" json:"side"` // buy / sell / adjust
 
 	Price       float64 `gorm:"type:decimal(20,4)" json:"price"`
 	Quantity    float64 `gorm:"type:decimal(20,4)" json:"quantity"`
 	Amount      float64 `gorm:"type:decimal(20,2)" json:"amount"` // price*qty
 	Fee         float64 `gorm:"type:decimal(20,2)" json:"fee"`
 	Tax         float64 `gorm:"type:decimal(20,2)" json:"tax"`
-	RealizedPnl float64 `gorm:"type:decimal(20,2)" json:"realized_pnl"` // 卖出时的已实现盈亏（净）
+	RealizedPnl float64 `gorm:"type:decimal(20,2)" json:"realized_pnl"` // 卖出净盈亏；adjust 为现金分红
+	// TradeDate 是业务发生日；升级前流水为空时，权益重建回退 CreatedAt 的本地日期。
+	TradeDate string `gorm:"size:10;index" json:"trade_date"`
 
 	CreatedAt time.Time `json:"created_at"`
 }

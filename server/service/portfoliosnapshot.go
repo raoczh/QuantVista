@@ -126,7 +126,7 @@ func realSnapshotFrom(userID int64, tradeDate string, positions []model.Position
 			continue
 		}
 		snap.MarketValue = round2(snap.MarketValue + fq.Quote.Price*p.Quantity)
-		snap.Cost = round2(snap.Cost + p.BuyPrice*p.Quantity + p.BuyFee + p.BuyTax)
+		snap.Cost = round2(snap.Cost + positionCurrentCost(p))
 	}
 	snap.UnrealizedPnl = round2(snap.MarketValue - snap.Cost)
 	if snap.MissingCount > 0 {
@@ -144,9 +144,21 @@ func (s *PositionService) buildRealSnapshot(ctx context.Context, userID int64, t
 	}
 	// 先补齐账本再算：从未打开过持仓页的老用户，RealizedPnl 全为 0，
 	// 曲线的「累计已实现」会一路是 0——不是他没赚过，是账本还没补建。
-	if backfillPositionLedgers(userID, positions) {
+	wrote, err := ensurePositionLedgersStrict(userID, positions)
+	if err != nil {
+		return nil, err
+	}
+	if wrote {
 		if err := common.DB.WithContext(ctx).Where("user_id = ?", userID).Find(&positions).Error; err != nil {
 			return nil, err
+		}
+	}
+	for _, p := range positions {
+		if p.TotalBuyCost <= 0 {
+			return nil, fmt.Errorf("持仓 %d 账本未就绪：累计买入成本为空", p.ID)
+		}
+		if p.Status == model.PositionStatusHolding && p.Quantity > positionQtyEps && p.RemainingCost <= 0 {
+			return nil, fmt.Errorf("持仓 %d 账本未就绪：剩余成本为空", p.ID)
 		}
 	}
 	refs := make([]QuoteRef, 0, len(positions))
@@ -192,6 +204,26 @@ func paperSnapshotFrom(userID int64, tradeDate string, acc model.PaperAccount, h
 
 // buildPaperSnapshot 计算某用户当日模拟盘快照。
 func (s *PaperService) buildPaperSnapshot(ctx context.Context, userID int64, tradeDate string) (*model.PortfolioSnapshot, error) {
+	// 公司行动 job 在 19:25，而资产快照在 16:20。快照必须主动结算当日及近期
+	// 已到期行动，否则会把除权后的价格配上除权前数量/成本，永久冻结一个假点。
+	var symbols []struct {
+		Symbol string
+		Market string
+	}
+	if err := common.DB.WithContext(ctx).Raw(
+		"SELECT symbol, market FROM paper_holdings WHERE user_id = ? "+
+			"UNION SELECT symbol, market FROM paper_trades WHERE user_id = ?", userID, userID,
+	).Scan(&symbols).Error; err != nil {
+		return nil, err
+	}
+	for _, item := range symbols {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := ensurePaperCorpAdjustBeforeTrade(userID, item.Symbol, item.Market, tradeDate); err != nil {
+			return nil, fmt.Errorf("模拟盘公司行动结算失败 %s/%s: %w", item.Market, item.Symbol, err)
+		}
+	}
 	var acc model.PaperAccount
 	if err := common.DB.WithContext(ctx).Where("user_id = ?", userID).First(&acc).Error; err != nil {
 		return nil, err
@@ -204,10 +236,10 @@ func (s *PaperService) buildPaperSnapshot(ctx context.Context, userID int64, tra
 	for _, h := range holdings {
 		refs = append(refs, QuoteRef{Market: h.Market, Symbol: h.Symbol})
 	}
-	var realized float64
-	common.DB.WithContext(ctx).Model(&model.PaperTrade{}).
-		Where("user_id = ? AND side = ?", userID, model.PaperSideSell).
-		Select("COALESCE(SUM(realized_pnl),0)").Scan(&realized)
+	realized, err := paperRealizedPnl(common.DB.WithContext(ctx), userID)
+	if err != nil {
+		return nil, err
+	}
 	return paperSnapshotFrom(userID, tradeDate, acc, holdings, s.market.FreshQuotesFor(ctx, refs), realized), nil
 }
 
@@ -225,13 +257,17 @@ func upsertPortfolioSnapshot(snap *model.PortfolioSnapshot) error {
 
 // snapshotUserIDs 需要落快照的用户：有持仓（含已平仓，累计已实现盈亏要继续画）
 // ∪ 有模拟账户。两类分别返回，避免给没有模拟盘的用户造空快照。
-func snapshotUserIDs() (real, paper []int64) {
+func snapshotUserIDs() (real, paper []int64, err error) {
 	if common.DB == nil {
-		return nil, nil
+		return nil, nil, errors.New("数据库不可用")
 	}
-	common.DB.Model(&model.Position{}).Distinct().Pluck("user_id", &real)
-	common.DB.Model(&model.PaperAccount{}).Distinct().Pluck("user_id", &paper)
-	return real, paper
+	if err := common.DB.Model(&model.Position{}).Distinct().Pluck("user_id", &real).Error; err != nil {
+		return nil, nil, fmt.Errorf("读取真实持仓快照候选用户: %w", err)
+	}
+	if err := common.DB.Model(&model.PaperAccount{}).Distinct().Pluck("user_id", &paper).Error; err != nil {
+		return nil, nil, fmt.Errorf("读取模拟盘快照候选用户: %w", err)
+	}
+	return real, paper, nil
 }
 
 // RunPortfolioSnapshots 为全部相关用户落当日快照（幂等；供 job 与测试调用）。
@@ -241,7 +277,11 @@ func RunPortfolioSnapshots(ctx context.Context, posSvc *PositionService, paperSv
 	if common.DB == nil || tradeDate == "" {
 		return 0
 	}
-	realUsers, paperUsers := snapshotUserIDs()
+	realUsers, paperUsers, err := snapshotUserIDs()
+	if err != nil {
+		common.SysWarn("资产快照候选用户读取失败: %v", err)
+		return 0
+	}
 	n := 0
 	for _, uid := range realUsers {
 		if err := ctx.Err(); err != nil {

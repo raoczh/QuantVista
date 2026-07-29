@@ -274,6 +274,96 @@ func TestSellReviewIntoTodo(t *testing.T) {
 	}
 }
 
+// TestSellReviewReadErrorsPropagate 数据库读取失败不能伪装成“本轮没有待办”。
+// 调度层依赖这些错误区分真实空结果与扫描不完整，下一轮才能留下可观测告警。
+func TestSellReviewReadErrorsPropagate(t *testing.T) {
+	t.Run("候选用户", func(t *testing.T) {
+		setupTestDB(t)
+		if err := common.DB.Migrator().DropTable(&model.Position{}); err != nil {
+			t.Fatalf("删除 positions 失败: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := common.DB.AutoMigrate(&model.Position{}); err != nil {
+				t.Errorf("恢复 positions 失败: %v", err)
+			}
+		})
+		if _, err := sellReviewUserIDs(context.Background()); err == nil || !strings.Contains(err.Error(), "候选用户") {
+			t.Fatalf("候选用户查询失败必须上浮，得到 %v", err)
+		}
+	})
+
+	readCases := []struct {
+		name  string
+		table any
+		want  string
+	}{
+		{name: "解禁", table: &model.RestrictedRelease{}, want: "解禁数据"},
+		{name: "除权除息", table: &model.CorporateAction{}, want: "除权除息数据"},
+		{name: "业绩预告", table: &model.EarningsForecast{}, want: "业绩预告数据"},
+		{name: "龙虎榜", table: &model.LhbEntry{}, want: "龙虎榜数据"},
+		{name: "日线", table: &model.DailyBar{}, want: "日线"},
+	}
+	for _, tc := range readCases {
+		t.Run(tc.name, func(t *testing.T) {
+			setupTestDB(t)
+			cleanCorpTables(t)
+			if err := common.DB.Create(&model.Position{
+				UserID: 1, Symbol: "600000", Market: "cn", Name: "浦发银行",
+				PositionType: model.PositionTypeLongTerm, Status: model.PositionStatusHolding,
+				BuyPrice: 10, Quantity: 1000, BuyDate: "2026-07-01",
+			}).Error; err != nil {
+				t.Fatalf("建持仓失败: %v", err)
+			}
+			if err := common.DB.Migrator().DropTable(tc.table); err != nil {
+				t.Fatalf("删除 %s 测试表失败: %v", tc.name, err)
+			}
+			t.Cleanup(func() {
+				if err := common.DB.AutoMigrate(tc.table); err != nil {
+					t.Errorf("恢复 %s 测试表失败: %v", tc.name, err)
+				}
+			})
+
+			svc := &SellReviewService{}
+			_, err := svc.evaluateSellReviewsForUser(context.Background(), 1,
+				"2026-07-29", "2026-07-27")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("%s 查询失败必须上浮（期望包含 %q），得到 %v", tc.name, tc.want, err)
+			}
+		})
+	}
+
+	t.Run("写入", func(t *testing.T) {
+		setupTestDB(t)
+		cleanCorpTables(t)
+		p := model.Position{
+			UserID: 1, Symbol: "600000", Market: "cn", Name: "浦发银行",
+			PositionType: model.PositionTypeLongTerm, Status: model.PositionStatusHolding,
+			BuyPrice: 10, Quantity: 1000, BuyDate: "2026-07-01",
+		}
+		if err := common.DB.Create(&p).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := common.DB.Create(&model.RestrictedRelease{
+			Symbol: "600000", Market: "cn", Name: "浦发银行",
+			FreeDate: "2026-07-30", FreeType: "定增", FreeShares: 100000,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := common.DB.Exec(`CREATE TRIGGER fail_sell_review_insert
+			BEFORE INSERT ON sell_reviews BEGIN SELECT RAISE(FAIL, 'forced write failure'); END`).Error; err != nil {
+			t.Fatalf("创建写故障触发器失败: %v", err)
+		}
+		t.Cleanup(func() { _ = common.DB.Exec("DROP TRIGGER IF EXISTS fail_sell_review_insert").Error })
+
+		created, err := (&SellReviewService{}).evaluateSellReviewsForUser(
+			context.Background(), 1, "2026-07-29", "2026-07-27",
+		)
+		if created != 0 || err == nil || !strings.Contains(err.Error(), "写入") {
+			t.Fatalf("写入失败必须上浮且不得计成功: created=%d err=%v", created, err)
+		}
+	})
+}
+
 func twoDigit(n int) string {
 	if n < 10 {
 		return "0" + string(rune('0'+n))

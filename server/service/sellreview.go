@@ -427,15 +427,17 @@ func SetSellReviewStatus(userID, id int64, status string) (*model.SellReview, er
 // ---------- 评估编排 ----------
 
 // sellReviewUserIDs 有 A 股持仓的用户（本轮的候选集合）。
-func sellReviewUserIDs() []int64 {
+func sellReviewUserIDs(ctx context.Context) ([]int64, error) {
 	var ids []int64
 	if common.DB == nil {
-		return ids
+		return nil, errors.New("数据库不可用")
 	}
-	common.DB.Model(&model.Position{}).
+	if err := common.DB.WithContext(ctx).Model(&model.Position{}).
 		Where("status = ? AND market = ?", model.PositionStatusHolding, "cn").
-		Distinct().Pluck("user_id", &ids)
-	return ids
+		Distinct().Pluck("user_id", &ids).Error; err != nil {
+		return nil, fmt.Errorf("读取候选用户失败: %w", err)
+	}
+	return ids, nil
 }
 
 // EvaluateSellReviewsForUser 评估单个用户的持仓利空事件，落待办并（对新增两类）推送。
@@ -446,14 +448,26 @@ func sellReviewUserIDs() []int64 {
 // （利空事件本身与行情无关，行情只是让描述更有用；fail-closed 体现在
 // 「取不到就如实说浮盈亏未知」而不是「拿旧价算一个」）。
 func (s *SellReviewService) EvaluateSellReviewsForUser(ctx context.Context, userID int64, today, since string) int {
+	created, err := s.evaluateSellReviewsForUser(ctx, userID, today, since)
+	if err != nil {
+		common.SysWarn("卖出复核评估未完成 user=%d: %v", userID, err)
+	}
+	return created
+}
+
+// evaluateSellReviewsForUser 是带错误结果的内部执行路径。公开方法为兼容既有调用仍
+// 返回计数，但调度器走这里，避免把数据库故障误报成“本轮没有待办”。
+func (s *SellReviewService) evaluateSellReviewsForUser(ctx context.Context, userID int64, today, since string) (int, error) {
+	if common.DB == nil {
+		return 0, errors.New("数据库不可用")
+	}
 	var positions []model.Position
 	if err := common.DB.WithContext(ctx).Where("user_id = ? AND status = ? AND market = ?",
 		userID, model.PositionStatusHolding, "cn").Order("id ASC").Find(&positions).Error; err != nil {
-		common.SysWarn("卖出复核读取持仓失败 user=%d: %v", userID, err)
-		return 0
+		return 0, fmt.Errorf("读取持仓失败: %w", err)
 	}
 	if len(positions) == 0 {
-		return 0
+		return 0, nil
 	}
 	seen := map[string]bool{}
 	var syms []string
@@ -469,17 +483,27 @@ func (s *SellReviewService) EvaluateSellReviewsForUser(ctx context.Context, user
 
 	// 五类数据一次性批量查（symbol IN），绝不逐 symbol 循环查。
 	var lifts []model.RestrictedRelease
-	common.DB.WithContext(ctx).Where("symbol IN ? AND market = ? AND free_date BETWEEN ? AND ?",
-		syms, "cn", today, mustAddDays(today, sellReviewLiftAheadDays)).Order("free_date, id").Find(&lifts)
+	if err := common.DB.WithContext(ctx).Where("symbol IN ? AND market = ? AND free_date BETWEEN ? AND ?",
+		syms, "cn", today, mustAddDays(today, sellReviewLiftAheadDays)).
+		Order("free_date, id").Find(&lifts).Error; err != nil {
+		return 0, fmt.Errorf("读取解禁数据失败: %w", err)
+	}
 	var exdivs []model.CorporateAction
-	common.DB.WithContext(ctx).Where("symbol IN ? AND market = ? AND ex_date BETWEEN ? AND ?",
-		syms, "cn", today, mustAddDays(today, sellReviewExDivAheadDays)).Order("ex_date, id").Find(&exdivs)
+	if err := common.DB.WithContext(ctx).Where("symbol IN ? AND market = ? AND ex_date BETWEEN ? AND ?",
+		syms, "cn", today, mustAddDays(today, sellReviewExDivAheadDays)).
+		Order("ex_date, id").Find(&exdivs).Error; err != nil {
+		return 0, fmt.Errorf("读取除权除息数据失败: %w", err)
+	}
 	var fcs []model.EarningsForecast
-	common.DB.WithContext(ctx).Where("symbol IN ? AND notice_date >= ?", syms, since).
-		Order("notice_date DESC, id DESC").Find(&fcs)
+	if err := common.DB.WithContext(ctx).Where("symbol IN ? AND notice_date >= ?", syms, since).
+		Order("notice_date DESC, id DESC").Find(&fcs).Error; err != nil {
+		return 0, fmt.Errorf("读取业绩预告数据失败: %w", err)
+	}
 	var lhbs []model.LhbEntry
-	common.DB.WithContext(ctx).Where("symbol IN ? AND trade_date >= ?", syms, since).
-		Order("trade_date, id").Find(&lhbs)
+	if err := common.DB.WithContext(ctx).Where("symbol IN ? AND trade_date >= ?", syms, since).
+		Order("trade_date, id").Find(&lhbs).Error; err != nil {
+		return 0, fmt.Errorf("读取龙虎榜数据失败: %w", err)
+	}
 
 	liftBySym := map[string][]model.RestrictedRelease{}
 	for _, r := range lifts {
@@ -501,7 +525,11 @@ func (s *SellReviewService) EvaluateSellReviewsForUser(ctx context.Context, user
 	}
 	maBySym := map[string]*sellReviewHit{}
 	for _, sym := range syms {
-		if h := evalSellReviewMaBreak(recentLocalBars(ctx, "cn", sym, sellReviewBarLimit)); h != nil {
+		bars, err := recentLocalBars(ctx, "cn", sym, sellReviewBarLimit)
+		if err != nil {
+			return 0, fmt.Errorf("读取 %s 日线失败: %w", sym, err)
+		}
+		if h := evalSellReviewMaBreak(bars); h != nil {
 			maBySym[sym] = h
 		}
 	}
@@ -522,6 +550,7 @@ func (s *SellReviewService) EvaluateSellReviewsForUser(ctx context.Context, user
 	}
 
 	created := 0
+	var writeErrs []error
 	for _, p := range positions {
 		var hits []sellReviewHit
 		if h := evalSellReviewLift(liftBySym[p.Symbol], today); h != nil {
@@ -562,6 +591,9 @@ func (s *SellReviewService) EvaluateSellReviewsForUser(ctx context.Context, user
 			if err != nil {
 				common.SysWarn("卖出复核落库失败 user=%d pos=%d trigger=%s: %v",
 					userID, p.ID, h.Trigger, err)
+				writeErrs = append(writeErrs, fmt.Errorf(
+					"写入 pos=%d trigger=%s 卖出复核失败: %w", p.ID, h.Trigger, err,
+				))
 				continue
 			}
 			if !isNew {
@@ -575,7 +607,7 @@ func (s *SellReviewService) EvaluateSellReviewsForUser(ctx context.Context, user
 			}
 		}
 	}
-	return created
+	return created, errors.Join(writeErrs...)
 }
 
 // pushSellReview 推送一条卖出复核（去重走 GuardEvent 台账，通道复用 NotifyService）。
@@ -601,39 +633,53 @@ func (s *SellReviewService) pushSellReview(userID int64, p model.Position, h sel
 
 // recentLocalBars 读本地日线尾部 limit 根（升序）。**零上游请求**——
 // 全市场日线 16:10 已同步，跌破均线判定不该再去打行情源。
-// 读取失败或无数据返回 nil，调用方按「本轮不判断」处理。
-func recentLocalBars(ctx context.Context, market, symbol string, limit int) []model.DailyBar {
-	if common.DB == nil || symbol == "" || limit <= 0 {
-		return nil
+// 无数据返回空切片；读取失败显式上浮，不能与“尚无日线”混为一谈。
+func recentLocalBars(ctx context.Context, market, symbol string, limit int) ([]model.DailyBar, error) {
+	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
+	}
+	if symbol == "" || limit <= 0 {
+		return nil, errors.New("日线查询参数非法")
 	}
 	var rows []model.DailyBar
 	if err := common.DB.WithContext(ctx).
 		Where("symbol = ? AND market = ?", symbol, market).
 		Order("trade_date DESC").Limit(limit).Find(&rows).Error; err != nil {
-		return nil
+		return nil, err
 	}
 	// 反转成升序（评估函数约定最后一根是最新交易日）。
 	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
 		rows[i], rows[j] = rows[j], rows[i]
 	}
-	return rows
+	return rows, nil
 }
 
 // RunSellReviewRound 一轮卖出复核（供 job 与测试调用）。返回新建待办总数。
 func (s *SellReviewService) RunSellReviewRound(ctx context.Context) int {
 	if common.DB == nil {
+		common.SysWarn("卖出复核轮未执行: 数据库不可用")
 		return 0
 	}
 	now := time.Now()
 	today := now.Format("2006-01-02")
 	since := now.AddDate(0, 0, -sellReviewWindowDays).Format("2006-01-02")
 	total := 0
-	for _, uid := range sellReviewUserIDs() {
+	userIDs, err := sellReviewUserIDs(ctx)
+	if err != nil {
+		common.SysWarn("卖出复核读取候选用户失败: %v", err)
+		return 0
+	}
+	for _, uid := range userIDs {
 		if err := ctx.Err(); err != nil {
 			common.SysWarn("卖出复核轮中止: %v", err)
 			return total
 		}
-		if n := s.EvaluateSellReviewsForUser(ctx, uid, today, since); n > 0 {
+		n, err := s.evaluateSellReviewsForUser(ctx, uid, today, since)
+		if err != nil {
+			common.SysWarn("卖出复核评估未完成 user=%d: %v", uid, err)
+			continue
+		}
+		if n > 0 {
 			common.SysLog("用户 %d 新增卖出复核 %d 条", uid, n)
 			total += n
 		}

@@ -50,15 +50,28 @@ const marketOptions = [
 const overview = ref<PaperOverview | null>(null)
 const trades = ref<PaperTrade[]>([])
 const loading = ref(false)
+const loadError = ref('')
+let loadSeq = 0
 
 async function load() {
+  const mySeq = ++loadSeq
   loading.value = true
+  loadError.value = ''
   try {
-    ;[overview.value, trades.value] = await Promise.all([getPaperOverview(), getPaperTrades(50)])
+    const [nextOverview, nextTrades] = await Promise.all([getPaperOverview(), getPaperTrades(50)])
+    if (mySeq !== loadSeq) return
+    overview.value = nextOverview
+    trades.value = nextTrades
   } catch (e) {
-    message.error((e as Error).message)
+    if (mySeq === loadSeq) {
+      // 两个接口任一失败时都不能继续展示上一轮账户值，否则旧值会看起来像本次成功读取。
+      overview.value = null
+      trades.value = []
+      loadError.value = (e as Error).message
+      message.error(loadError.value)
+    }
   } finally {
-    loading.value = false
+    if (mySeq === loadSeq) loading.value = false
   }
 }
 
@@ -124,12 +137,32 @@ function fmtTime(t: string) {
   return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : ''
 }
 
+function fmtTradeTime(t: PaperTrade) {
+  const created = fmtTime(t.created_at)
+  if (!t.trade_date) return created
+  const createdDate = new Date(t.created_at).toLocaleDateString('sv-SE')
+  return createdDate === t.trade_date ? created : `${t.trade_date}（${created} 补记）`
+}
+
+function tradeSideLabel(side: PaperTrade['side']) {
+  if (side === 'buy') return '买'
+  if (side === 'sell') return '卖'
+  return '折算'
+}
+
+function tradeSideType(side: PaperTrade['side']) {
+  if (side === 'buy') return 'error'
+  if (side === 'sell') return 'success'
+  return 'default'
+}
+
 // ---------- B7 资产曲线 ----------
 const curveEl = ref<HTMLDivElement | null>(null)
 let curveChart: echarts.ECharts | null = null
 const curve = ref<PortfolioCurve | null>(null)
 const curveDays = ref(90)
 const curveLoading = ref(false)
+const curveError = ref('')
 let curveAbort: AbortController | null = null
 let curveSeq = 0
 const curveDayOptions = [
@@ -144,9 +177,12 @@ async function loadCurve() {
   const myAbort = new AbortController()
   curveAbort = myAbort
   const mySeq = ++curveSeq
+  const requestedDays = curveDays.value
+  if (curve.value?.days !== requestedDays) curve.value = null
   curveLoading.value = true
+  curveError.value = ''
   try {
-    const data = await getPaperCurve(curveDays.value, myAbort.signal)
+    const data = await getPaperCurve(requestedDays, myAbort.signal)
     if (mySeq !== curveSeq) return
     curve.value = data
     await nextTick()
@@ -154,6 +190,9 @@ async function loadCurve() {
   } catch (e) {
     if (mySeq !== curveSeq || isAbortError(e)) return
     curve.value = null
+    curveError.value = (e as Error).message
+    curveChart?.dispose()
+    curveChart = null
   } finally {
     if (mySeq === curveSeq) curveLoading.value = false
   }
@@ -242,6 +281,7 @@ onMounted(() => {
 })
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
+  loadSeq++
   curveSeq++
   curveAbort?.abort()
   curveAbort = null
@@ -261,22 +301,26 @@ onBeforeUnmount(() => {
       <!-- 账户总览 -->
       <n-grid cols="2 s:4" :x-gap="14" :y-gap="14" responsive="screen">
         <n-gi>
-          <StatCard label="总资产" :value="fmtMoney(overview?.total_assets ?? 0)" />
+          <StatCard label="总资产" :value="overview ? fmtMoney(overview.total_assets) : '—'" />
         </n-gi>
         <n-gi>
-          <StatCard label="可用现金" :value="fmtMoney(overview?.account.cash ?? 0)" />
+          <StatCard label="可用现金" :value="overview ? fmtMoney(overview.account.cash) : '—'" />
         </n-gi>
         <n-gi>
           <StatCard
             label="总盈亏"
-            :value="fmtMoney(overview?.total_profit ?? 0)"
-            :change-pct="overview?.total_profit_pct ?? 0"
+            :value="overview ? fmtMoney(overview.total_profit) : '—'"
+            :change-pct="overview ? overview.total_profit_pct : undefined"
           />
         </n-gi>
         <n-gi>
-          <StatCard label="累计已实现" :value="fmtMoney(overview?.realized_pnl ?? 0)" />
+          <StatCard label="累计已实现" :value="overview ? fmtMoney(overview.realized_pnl) : '—'" />
         </n-gi>
       </n-grid>
+
+      <n-alert v-if="loadError" type="error" :bordered="false" title="模拟账户读取失败">
+        {{ loadError }}
+      </n-alert>
 
       <!-- B7 资产曲线：读每交易日 16:20 落库的快照，不做插值补造 -->
       <SectionCard title="资产曲线">
@@ -287,9 +331,12 @@ onBeforeUnmount(() => {
           </div>
         </template>
         <n-spin :show="curveLoading && !curve">
+          <n-alert v-if="curveError" type="error" :bordered="false" title="资产曲线读取失败">
+            {{ curveError }}
+          </n-alert>
           <div v-show="!!curve?.points.length" ref="curveEl" class="curve-chart"></div>
           <n-empty
-            v-if="!curve?.points.length"
+            v-if="!curveLoading && !curveError && curve && !curve.points.length"
             description="暂无资产快照——曲线自启用之日起按交易日盘后积累，不回溯历史"
           />
           <div v-if="curve?.notes?.length" class="curve-notes">
@@ -354,8 +401,11 @@ onBeforeUnmount(() => {
               style="margin-bottom: 10px"
               >{{ overview.valuation_note }}</n-alert
             >
-            <n-empty v-if="!overview?.holdings.length" description="暂无持仓，在左侧下单买入" />
-            <div v-else class="holdings">
+            <n-empty
+              v-if="!loading && !loadError && overview && !overview.holdings.length"
+              description="暂无持仓，在左侧下单买入"
+            />
+            <div v-if="overview?.holdings.length" class="holdings">
               <div v-for="h in overview.holdings" :key="h.id" class="hold">
                 <div class="hold-main">
                   <div class="hold-title">
@@ -387,20 +437,26 @@ onBeforeUnmount(() => {
 
       <!-- 成交流水 -->
       <SectionCard title="成交流水">
-        <n-empty v-if="!trades.length" description="暂无成交" size="small" />
-        <div v-else class="trades">
+        <n-empty v-if="!loading && !loadError && overview && !trades.length" description="暂无成交" size="small" />
+        <div v-if="trades.length" class="trades">
           <div v-for="t in trades" :key="t.id" class="trade">
-            <n-tag size="tiny" round :bordered="false" :type="t.side === 'buy' ? 'error' : 'success'">{{
-              t.side === 'buy' ? '买' : '卖'
+            <n-tag size="tiny" round :bordered="false" :type="tradeSideType(t.side)">{{
+              tradeSideLabel(t.side)
             }}</n-tag>
             <span class="tr-name">{{ t.name || t.symbol }}</span>
             <n-tag v-if="isEtfSymbol(t.symbol)" size="tiny" round :bordered="false" type="info">ETF</n-tag>
-            <span class="tr-detail">{{ t.quantity }} 股 @ {{ fmt(t.price) }}</span>
-            <span class="tr-amount">{{ fmtMoney(t.amount) }}</span>
+            <span v-if="t.side === 'adjust'" class="tr-detail">
+              {{ t.quantity ? `数量调整 ${t.quantity > 0 ? '+' : ''}${t.quantity} 股` : '除权除息成本折算' }}
+            </span>
+            <span v-else class="tr-detail">{{ t.quantity }} 股 @ {{ fmt(t.price) }}</span>
+            <span v-if="t.side !== 'adjust'" class="tr-amount">{{ fmtMoney(t.amount) }}</span>
             <span v-if="t.side === 'sell'" class="tr-pnl" :style="{ color: pctColor(t.realized_pnl) }">
               盈亏 {{ fmtMoney(t.realized_pnl) }}
             </span>
-            <span class="tr-time">{{ fmtTime(t.created_at) }}</span>
+            <span v-else-if="t.side === 'adjust' && t.realized_pnl > 0" class="tr-pnl">
+              现金分红 {{ fmtMoney(t.realized_pnl) }}（税前）
+            </span>
+            <span class="tr-time">{{ fmtTradeTime(t) }}</span>
           </div>
         </div>
       </SectionCard>

@@ -211,8 +211,9 @@ https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600000,m1,,240
 
 - **新 adapter** `datasource/emcorpaction.go`：四张 RPT_* 报表的拉取与解析（走 `DataCenterQuery`）。
 - **新表**：
-  - `CorporateAction`（分红送转）：`symbol/market/ex_date/record_date/bonus_ratio/transfer_ratio/
-    dividend_pretax/plan_profile/progress/report_date/dividend_yield`，唯一键 `(symbol,market,ex_date,report_date)`；
+  - `CorporateAction`（分红送转）：`symbol/market/ex_date/record_date/plan_notice_date/notice_date/
+    bonus_ratio/transfer_ratio/dividend_pretax/plan_profile/progress/report_date/dividend_yield`；逻辑稳定身份为
+    `(symbol,market,report_date,plan_notice_date)`，`ex_date` 会推进或订正，不能承担业务身份；
   - `RestrictedRelease`（解禁）：`symbol/market/free_date/free_shares/lift_market_cap/free_type/free_ratio`；
   - `IpoSubscription`（新股/可转债申购）：`kind(stock|cb)/code/apply_code/name/apply_date/issue_price/
     apply_upper/pay_date/listing_date/convert_stock_code/rating`。
@@ -221,8 +222,9 @@ https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600000,m1,,240
 
 ### B8 除权除息调整持仓
 
-- **检测**：持仓股命中 `CorporateAction.ex_date == 今日` → 生成**待确认调整提示**。
-- **折算**：`新数量 = 原数量 × (1 + (送+转)/10)`；`新成本 = (原成本×原数量 − 派息×原数量/10) / 新数量`。
+- **检测**：回看近 30 天已除权方案，从流水重建登记日收盘有权数量并生成**待确认调整提示**。
+- **折算**：`新数量 = 当前数量 + 有权数量×(送+转)/10`；`新成本 = 当前价格成本基/新数量`；
+  `现金分红 = 有权数量×每10股派息/10`，现金只进已实现收益、不重复冲减成本。
 - **纪律（不自动改用户账本）**：折算结果以**建议**形式呈现，用户一键确认才写入；确认后写一笔
   `PositionTrade{side: adjust}` 审计流水记录调整前后值，**可撤销**。
   理由：持仓是用户的真实账本，程序静默改写用户成本价不可接受。
@@ -256,14 +258,16 @@ https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600000,m1,,240
    会把多批合并成一批、规模少算。
 4. **B8 的建议状态机比原设计多两态**：原设计只说「可撤销」，实际落了
    `pending → confirmed → reverted`（可再确认）与 `dismissed`（忽略，终态）四态。
-   幂等靠 `OnConflict{DoNothing}`——**已确认/已忽略的行绝不能被重复扫描拉回 pending**，
-   否则用户会被反复要求确认同一次除权。
+   唯一键保证幂等；pending/reverted 随最新账面刷新，**已确认/已忽略的行绝不能被重复扫描覆盖**。
 5. **确认与撤销都做了「基数校验」**：确认时用行锁内的实时持仓与建议生成时的
-   `qty_before/cost_before` 比对，不一致即拒绝（期间加减过仓 → 折算基数失效）；
+   `qty_before/cost_before/entitled_qty` 比对，不一致即拒绝；纯现金分红可在平仓后补记，含送转
+   则必须先于除权日后的卖出；历史已经错序时落 `manual_review` 记录，禁止自动确认，只允许用户
+   明确确认已自行核对后忽略并解除拦截，系统不按当前聚合态倒序硬套，也不声称已经修复账本；
    撤销要求该 adjust 流水仍是最后一笔且当前账面精确等于折算结果，否则明确拒绝，
    **不做尽力而为的部分回滚**。
 6. **送转不改 `total_buy_cost/total_buy_qty`**：用户没有再投入一分钱，改动累计买入口径
-   会让「一共投入多少 / 已平仓收益率」全部失真。现金分红计入 `realized_pnl`（真金到账）。
+   会让「一共投入多少 / 已平仓收益率」全部失真。现金分红只计入 `realized_pnl`（真金到账），
+   不再同时冲减 `remaining_cost`，否则总收益会重复计算。
 7. **AI 侧「解禁未接入」声明改为三态动态声明**（原设计只说「清掉声明」，不够）：
    `riskGateNoteFor(liftAvailable, liftCount)` 区分「数据不可用（不知道）」/「确实无解禁
    （有依据）」/「有解禁（详见明细段）」——**「查不到」绝不能说成「无解禁」**。
@@ -331,17 +335,18 @@ https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600000,m1,,240
    会在**用户刚刚回调加仓的当场**触发移动止盈提醒——而回调加仓正是最常见的加仓时机，
    这类误报是系统性的。**减仓不重置**（剩余仓位的持有期是连续的，它赚到过的高点依然算数）。
    反例锁在 `TestPositionPeakLifecycle`。
-2. **【必须按此执行】峰值必须随除权除息同步折算**，公式与成本侧同构（消去数量即得）：
+2. **【必须按此执行】峰值必须随除权除息同步折算**，使用市场价格侧标准除权公式：
    `新峰值 =(旧峰值 − 每10股派息/10)/(1+(送+转)/10)`。不折算则 10 转 10 的除权当天会凭空
-   出现一个 50% 的假回撤。撤销折算时按 `PositionCorpAdjust.PeakBefore` **原值还原而非反算**
+   出现一个 50% 的假回撤。账本成本不扣现金分红，因此它不再与成本式同构。撤销折算时按
+   `PositionCorpAdjust.PeakBefore` **原值还原而非反算**
    （反算留舍入漂移，破坏「撤销后与折算前一致」这条不变式）——为此给 B8 建议表加了
    `peak_before/peak_after` 两列。
 3. **移动止盈不能加「仅浮盈时才触发」的前置条件**——曾考虑用它压误报，但用户最痛的场景
    恰恰是「赚过 30% 没走，现在倒亏」，加了这个条件那个场景就永远不提醒。改用①的加仓重置
    来控误报，反例锁在 `TestEvaluatePositionAlertPure`。
-4. **提醒事件的去重键必须下沉到 `(rule_id, symbol, trade_date)`**：一条绑「我的全部持仓」的
-   规则同一天会对多只股票各自命中，旧的「按规则行 `triggered_at` 是否为今天」判重会把它们
-   压成一条，用户只看得到其中一只。`AlertEvent` 因此新增 `trade_date` 与 `position_id` 两列
+4. **持仓提醒事件的去重键必须下沉到 `(rule_id, position_id, trade_date)`**：一条绑「我的全部持仓」的
+   规则同一天会逐仓命中，同一代码也可能有多笔不同成本的仓位；按 symbol 判重会吞掉后面的仓位。
+   `AlertEvent` 因此新增 `trade_date` 与 `position_id` 两列
    （旧事件 `trade_date` 为空串，历史数据不追溯改写）。
 5. **持仓类规则的 `Once` 必须强制 false**：一条规则覆盖多笔持仓，命中一笔就把整条规则置
    `triggered` 暂停，其余持仓从此失联。同理 `op` 无方向语义（各 kind 自带方向），统一存 gte。

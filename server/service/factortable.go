@@ -563,8 +563,12 @@ func buildFactorTable(ctx context.Context) (*FactorTable, error) {
 		return nil, err
 	}
 	// C10 股息率：全市场一次读全（窗口内有股息率的方案行，量级 ≤2 万）。
-	// 查询失败只是这一列缺失（返回空 map → 全列 NaN），不阻断整表构建。
-	divYields := DividendYieldsFor(nil, time.Now())
+	// 查询失败必须阻断构建：因子快照首写胜且同日不可覆盖，若降级为空 map 继续落库，
+	// 会把当天全市场的 div_yield 永久冻结为缺失。
+	divYields, err := DividendYieldsFor(nil, time.Now())
+	if err != nil {
+		return nil, err
+	}
 	metaBy := make(map[string]wideStockMeta, len(states))
 	for _, st := range states {
 		m := wideStockMeta{Name: st.Name, ST: isSTName(st.Name)}
@@ -769,10 +773,10 @@ var (
 	factorBuildMu  sync.Mutex  // 构建互斥：懒加载调用方阻塞等待同一次构建
 	factorBuilding atomic.Bool // 状态展示 + 异步触发防抖
 	// factorFreshCache 新鲜日期的 60s 缓存（防每次扫描都查 states MAX）。
-	factorFreshMu   sync.Mutex
-	factorFreshVal  string
-	factorFreshAt   time.Time
-	factorFreshTTL  = time.Minute
+	factorFreshMu  sync.Mutex
+	factorFreshVal string
+	factorFreshAt  time.Time
+	factorFreshTTL = time.Minute
 )
 
 // CurrentFactorTable 当前宽表（可能 nil / 过期；扫描走 ensureFactorTable）。

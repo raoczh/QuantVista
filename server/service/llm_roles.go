@@ -316,7 +316,7 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 	},
 	"position_advice": {
 		RoleID: "position_advice", Name: "持仓风控顾问（position_advisor）",
-		Version: positionAdvicePromptVersion, SchemaVersion: "position_advice.v1",
+		Version: positionAdvicePromptVersion, SchemaVersion: "position_advice.v2",
 		Purpose: "D17 逐笔持仓的卖出决策：对用户**已经买入**的每一笔仓位给出封闭枚举 hold|trim|exit + 理由 + 失效条件。与持仓模块 AI 分析的边界——那个是整个组合的一段自由文本，这个是逐笔可执行的处置结论",
 		Market:  "A 股（cn）", Horizons: "无固定持有期——回答的是「这一笔现在怎么处理」",
 		Trigger: "用户在持仓页手动发起（走 llm_tasks 后台任务）；无 fresh 行情的仓位不进请求，一笔都没有则整体拒答 insufficient_fresh_quotes",
@@ -327,6 +327,7 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 			"我当初录入的买入理由",
 		},
 		MustAnswer: []string{
+			"position_id + symbol 必须对应同一输入行（同代码多仓按 position_id 分开）",
 			"verdict 封闭三值 hold/trim/exit（服务端 normalizePositionVerdict 归一，越界整条丢弃）",
 			"reason 必须引用喂进去的具体数值（进证据核验值域比对）",
 			"invalidation 写具体价位/事件/时间窗口，不得空泛",
