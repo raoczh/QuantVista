@@ -123,13 +123,14 @@ func TestPositionAlertAllPositionsAndFailClosed(t *testing.T) {
 	setupTestDB(t)
 	cleanCorpTables(t)
 	today := time.Now().In(time.Local).Format("2006-01-02")
+	peakFrom := time.Now().In(time.Local).AddDate(0, 0, -1).Format("2006-01-02")
 
-	seedHoldingWithPeak(t, 1, "600000", "浦发银行", 10, 1000, 10, today)
-	seedHoldingWithPeak(t, 1, "600519", "贵州茅台", 100, 100, 100, today)
+	seedHoldingWithPeak(t, 1, "600000", "浦发银行", 10, 1000, 10, peakFrom)
+	seedHoldingWithPeak(t, 1, "600519", "贵州茅台", 100, 100, 100, peakFrom)
 	// 第三只：行情 stale，fail-closed 不参与判定。
-	seedHoldingWithPeak(t, 1, "000002", "万科A", 10, 1000, 10, today)
+	seedHoldingWithPeak(t, 1, "000002", "万科A", 10, 1000, 10, peakFrom)
 	// 他人持仓（同样满足触发条件）——用户隔离，绝不能出现在用户 1 的事件里。
-	seedHoldingWithPeak(t, 2, "600004", "白云机场", 10, 1000, 10, today)
+	seedHoldingWithPeak(t, 2, "600004", "白云机场", 10, 1000, 10, peakFrom)
 
 	market := &fakeAlertMarket{
 		getFreshQuote: func(_ context.Context, _, symbol string) (*datasource.Quote, quoteFreshInfo, error) {
@@ -219,10 +220,10 @@ func TestPositionAlertAllPositionsAndFailClosed(t *testing.T) {
 func TestPositionAlertSameSymbolMultiplePositions(t *testing.T) {
 	setupTestDB(t)
 	cleanCorpTables(t)
-	today := time.Now().In(time.Local).Format("2006-01-02")
+	peakFrom := time.Now().In(time.Local).AddDate(0, 0, -1).Format("2006-01-02")
 
-	p1 := seedHoldingWithPeak(t, 1, "600000", "浦发银行-低成本仓", 10, 1000, 10, today)
-	p2 := seedHoldingWithPeak(t, 1, "600000", "浦发银行-高成本仓", 12, 500, 12, today)
+	p1 := seedHoldingWithPeak(t, 1, "600000", "浦发银行-低成本仓", 10, 1000, 10, peakFrom)
+	p2 := seedHoldingWithPeak(t, 1, "600000", "浦发银行-高成本仓", 12, 500, 12, peakFrom)
 	market := &fakeAlertMarket{
 		getFreshQuote: func(_ context.Context, _, _ string) (*datasource.Quote, quoteFreshInfo, error) {
 			return &datasource.Quote{Price: 8, High: 8.2, Low: 7.8}, quoteFreshInfo{Status: freshStatusFresh}, nil
@@ -267,9 +268,9 @@ func TestPositionAlertSameSymbolMultiplePositions(t *testing.T) {
 func TestPositionAlertBoundToSymbol(t *testing.T) {
 	setupTestDB(t)
 	cleanCorpTables(t)
-	today := time.Now().In(time.Local).Format("2006-01-02")
-	seedHoldingWithPeak(t, 1, "600000", "浦发银行", 10, 1000, 10, today)
-	seedHoldingWithPeak(t, 1, "600519", "贵州茅台", 100, 100, 100, today)
+	peakFrom := time.Now().In(time.Local).AddDate(0, 0, -1).Format("2006-01-02")
+	seedHoldingWithPeak(t, 1, "600000", "浦发银行", 10, 1000, 10, peakFrom)
+	seedHoldingWithPeak(t, 1, "600519", "贵州茅台", 100, 100, 100, peakFrom)
 
 	market := &fakeAlertMarket{
 		getFreshQuote: func(_ context.Context, _, _ string) (*datasource.Quote, quoteFreshInfo, error) {
@@ -290,6 +291,133 @@ func TestPositionAlertBoundToSymbol(t *testing.T) {
 	common.DB.Where("rule_id = ?", rule.ID).Find(&events)
 	if len(events) != 1 || events[0].Symbol != "600519" {
 		t.Fatalf("绑定 symbol 的规则只应评该标的，得到 %+v", events)
+	}
+}
+
+// TestPositionAlertStartDayUsesCurrentPrice 起算日整日 OHLC 可能发生在成交前，
+// 即使 fresh quote 带极端 High/Low，也只能用成交后的当前价判定。
+func TestPositionAlertStartDayUsesCurrentPrice(t *testing.T) {
+	setupTestDB(t)
+	cleanCorpTables(t)
+	tradeDate := "2026-07-27"
+	previous := "2026-07-24"
+	p := seedHoldingWithPeak(t, 1, "600000", "浦发银行", 10, 1000, 10, tradeDate)
+	quoteTime, _ := time.ParseInLocation("2006-01-02 15:04", tradeDate+" 09:20", time.Local)
+	market := &fakeAlertMarket{getFreshQuote: func(_ context.Context, _, _ string) (*datasource.Quote, quoteFreshInfo, error) {
+		return &datasource.Quote{Price: 11, High: 20, Low: 1, DataTime: quoteTime}, quoteFreshInfo{
+			Status: freshStatusFresh, MarketState: marketStatePreOpen, ExpectedDate: previous,
+		}, nil
+	}}
+	svc := &AlertService{market: market}
+	rules := []model.AlertRule{
+		{UserID: 1, Symbol: p.Symbol, Market: "cn", Kind: model.AlertKindCostGain,
+			Op: model.AlertOpGTE, Threshold: 50, Status: model.AlertStatusActive},
+		{UserID: 1, Symbol: p.Symbol, Market: "cn", Kind: model.AlertKindCostDrawdown,
+			Op: model.AlertOpGTE, Threshold: 50, Status: model.AlertStatusActive},
+		{UserID: 1, Symbol: p.Symbol, Market: "cn", Kind: model.AlertKindCostGain,
+			Op: model.AlertOpGTE, Threshold: 5, Status: model.AlertStatusActive},
+	}
+	for i := range rules {
+		if err := common.DB.Create(&rules[i]).Error; err != nil {
+			t.Fatalf("建规则失败: %v", err)
+		}
+	}
+	hits, err := svc.evaluatePositionRules(context.Background(), 1, rules)
+	if err != nil {
+		t.Fatalf("评估失败: %v", err)
+	}
+	if hits != 1 {
+		t.Fatalf("起算日 High/Low 不得制造命中，只有当前价涨 10%% 的规则应命中，得到 %d", hits)
+	}
+	var events []model.AlertEvent
+	if err := common.DB.Find(&events).Error; err != nil {
+		t.Fatalf("读事件失败: %v", err)
+	}
+	if len(events) != 1 || events[0].RuleID != rules[2].ID || events[0].TradeDate != tradeDate {
+		t.Fatalf("事件应按竞价行情实际日期落库，且只命中当前价规则: %+v", events)
+	}
+	var highRule model.AlertRule
+	common.DB.First(&highRule, rules[0].ID)
+	if highRule.LastValue != 10 || highRule.LastCheckDate != tradeDate {
+		t.Fatalf("起算日涨幅观测应只用现价 10%%，得到 value=%v date=%s", highRule.LastValue, highRule.LastCheckDate)
+	}
+}
+
+// TestPositionAlertUsesPerQuoteTradeDate 同轮可同时存在昨收与今日竞价两种 fresh
+// 行情；事件与绑定规则的 last_check_date 必须各归自己的实际观测交易日。
+func TestPositionAlertUsesPerQuoteTradeDate(t *testing.T) {
+	setupTestDB(t)
+	cleanCorpTables(t)
+	previous, auctionDate := "2026-07-24", "2026-07-27"
+	seedHoldingWithPeak(t, 1, "600000", "昨收仓", 10, 1000, 10, "2026-07-01")
+	seedHoldingWithPeak(t, 1, "600519", "竞价仓", 10, 1000, 10, "2026-07-01")
+	previousTime, _ := time.ParseInLocation("2006-01-02 15:04", previous+" 15:00", time.Local)
+	auctionTime, _ := time.ParseInLocation("2006-01-02 15:04", auctionDate+" 09:20", time.Local)
+	market := &fakeAlertMarket{getFreshQuote: func(_ context.Context, _, symbol string) (*datasource.Quote, quoteFreshInfo, error) {
+		if symbol == "600000" {
+			return &datasource.Quote{Price: 8, High: 8, Low: 8, DataTime: previousTime}, quoteFreshInfo{
+				Status: freshStatusFresh, MarketState: marketStatePreOpen, ExpectedDate: previous,
+			}, nil
+		}
+		return &datasource.Quote{Price: 8, High: 8, Low: 8, DataTime: auctionTime}, quoteFreshInfo{
+			Status: freshStatusFresh, MarketState: marketStatePreOpen, ExpectedDate: previous,
+		}, nil
+	}}
+	rules := []model.AlertRule{
+		{UserID: 1, Symbol: "600000", Market: "cn", Kind: model.AlertKindCostDrawdown,
+			Op: model.AlertOpGTE, Threshold: 10, Status: model.AlertStatusActive},
+		{UserID: 1, Symbol: "600519", Market: "cn", Kind: model.AlertKindCostDrawdown,
+			Op: model.AlertOpGTE, Threshold: 10, Status: model.AlertStatusActive},
+	}
+	for i := range rules {
+		common.DB.Create(&rules[i])
+	}
+	if hits, err := (&AlertService{market: market}).evaluatePositionRules(context.Background(), 1, rules); err != nil || hits != 2 {
+		t.Fatalf("混合 fresh 交易日应逐笔评估，hits=%d err=%v", hits, err)
+	}
+	var events []model.AlertEvent
+	common.DB.Order("rule_id ASC").Find(&events)
+	if len(events) != 2 || events[0].TradeDate != previous || events[1].TradeDate != auctionDate {
+		t.Fatalf("事件交易日必须来自各自 quote.DataTime: %+v", events)
+	}
+	var saved []model.AlertRule
+	common.DB.Where("id IN ?", []int64{rules[0].ID, rules[1].ID}).Order("id ASC").Find(&saved)
+	if len(saved) != 2 || saved[0].LastCheckDate != previous || saved[1].LastCheckDate != auctionDate {
+		t.Fatalf("绑定规则不得被别的持仓行情日期污染: %+v", saved)
+	}
+}
+
+// TestPositionAlertClosedDayDedup 休市期间重复消费最近收盘行情时，事件必须稳定
+// 去重到该行情交易日，不能按每次运行的墙钟日重复生成。
+func TestPositionAlertClosedDayDedup(t *testing.T) {
+	setupTestDB(t)
+	cleanCorpTables(t)
+	tradeDate := "2026-07-24"
+	seedHoldingWithPeak(t, 1, "600000", "浦发银行", 10, 1000, 10, "2026-07-01")
+	quoteTime, _ := time.ParseInLocation("2006-01-02 15:04", tradeDate+" 15:00", time.Local)
+	market := &fakeAlertMarket{getFreshQuote: func(_ context.Context, _, _ string) (*datasource.Quote, quoteFreshInfo, error) {
+		return &datasource.Quote{Price: 8, High: 8, Low: 8, DataTime: quoteTime}, quoteFreshInfo{
+			Status: freshStatusFresh, MarketState: marketStateClosed, ExpectedDate: tradeDate,
+		}, nil
+	}}
+	rule := model.AlertRule{UserID: 1, Market: "cn", Kind: model.AlertKindCostDrawdown,
+		Op: model.AlertOpGTE, Threshold: 10, Status: model.AlertStatusActive}
+	common.DB.Create(&rule)
+	svc := &AlertService{market: market}
+	for i := 0; i < 2; i++ {
+		if _, err := svc.evaluatePositionRules(context.Background(), 1, []model.AlertRule{rule}); err != nil {
+			t.Fatalf("第 %d 次评估失败: %v", i+1, err)
+		}
+	}
+	var events []model.AlertEvent
+	common.DB.Where("rule_id = ?", rule.ID).Find(&events)
+	if len(events) != 1 || events[0].TradeDate != tradeDate {
+		t.Fatalf("休市重复评估应只保留交易日上的一条事件: %+v", events)
+	}
+	var saved model.AlertRule
+	common.DB.First(&saved, rule.ID)
+	if saved.LastCheckDate != tradeDate {
+		t.Fatalf("last_check_date 应为行情交易日 %s，得到 %s", tradeDate, saved.LastCheckDate)
 	}
 }
 
@@ -399,7 +527,9 @@ func TestPositionPeakBackfillFromLocalBars(t *testing.T) {
 	// 买入日之前的高点**不算**（那不是用户赚到过的利润）。
 	before := time.Now().AddDate(0, 0, -30).Format("2006-01-02")
 	common.DB.Create(&model.DailyBar{Symbol: "600000", Market: "cn", TradeDate: before, High: 99, Close: 98})
+	common.DB.Create(&model.DailyBar{Symbol: "600000", Market: "cn", TradeDate: from, High: 97, Close: 96})
 	common.DB.Create(&model.DailyBar{Symbol: "600000", Market: "cn", TradeDate: mid, High: 18, Close: 17})
+	common.DB.Create(&model.DailyBar{Symbol: "600000", Market: "cn", TradeDate: today, High: 95, Close: 94})
 
 	p := seedHoldingWithPeak(t, 1, "600000", "浦发银行", 10, 1000, 0, from)
 	common.DB.Model(p).Updates(map[string]any{"peak_price": 0, "peak_date": "", "peak_from": ""})
@@ -410,7 +540,7 @@ func TestPositionPeakBackfillFromLocalBars(t *testing.T) {
 	var cur model.Position
 	common.DB.First(&cur, p.ID)
 	if cur.PeakPrice != 18 || cur.PeakDate != mid {
-		t.Fatalf("应回填持仓期内最高 18，得到 %v / %s（买入日之前的 99 不得计入）", cur.PeakPrice, cur.PeakDate)
+		t.Fatalf("应回填严格位于起算日与评估日前的最高 18，得到 %v / %s", cur.PeakPrice, cur.PeakDate)
 	}
 	if !cur.PeakBackfilled {
 		t.Fatal("日线回填必须标记 backfilled（前复权口径与账面价可能有出入）")
@@ -418,7 +548,46 @@ func TestPositionPeakBackfillFromLocalBars(t *testing.T) {
 	if cur.PeakFrom != from {
 		t.Fatalf("峰值起算日应为买入日，得到 %s", cur.PeakFrom)
 	}
-	_ = today
+}
+
+// TestPositionPeakUpdateSkipsStartDayAndBackfillsGap 盘后任务不消费起算日整日
+// High；服务漏跑中间交易日后，下一次运行会先补齐缺口。
+func TestPositionPeakUpdateSkipsStartDayAndBackfillsGap(t *testing.T) {
+	setupTestDB(t)
+	cleanCorpTables(t)
+	p := seedHoldingWithPeak(t, 1, "600000", "浦发银行", 10, 1000, 10, "2026-06-10")
+	common.DB.Create(&model.DailyBar{Symbol: p.Symbol, Market: p.Market, TradeDate: "2026-06-10", High: 99, Close: 12})
+	if n := RunPositionPeakUpdate("2026-06-10"); n != 0 {
+		t.Fatalf("起算日日线不得抬升峰值，更新数=%d", n)
+	}
+	var cur model.Position
+	common.DB.First(&cur, p.ID)
+	if cur.PeakPrice != 10 {
+		t.Fatalf("起算日成交前高点不得计入，得到 %v", cur.PeakPrice)
+	}
+	common.DB.Create(&model.DailyBar{Symbol: p.Symbol, Market: p.Market, TradeDate: "2026-06-11", High: 20, Close: 18})
+	common.DB.Create(&model.DailyBar{Symbol: p.Symbol, Market: p.Market, TradeDate: "2026-06-12", High: 15, Close: 14})
+	if n := RunPositionPeakUpdate("2026-06-12"); n != 1 {
+		t.Fatalf("下一次运行应补齐漏跑的 06-11 峰值，更新数=%d", n)
+	}
+	common.DB.First(&cur, p.ID)
+	if cur.PeakPrice != 20 || cur.PeakDate != "2026-06-11" || !cur.PeakBackfilled {
+		t.Fatalf("停机缺口峰值回填错误: %+v", cur)
+	}
+}
+
+// TestPeakViewForFreshQuote 展示与 AI 消费的峰值取落库峰值、fresh 日高和现价
+// 三者最大值；起算日仍忽略整日 High。
+func TestPeakViewForFreshQuote(t *testing.T) {
+	p := model.Position{PeakPrice: 10, PeakDate: "2026-06-01", PeakFrom: "2026-06-01"}
+	v := peakViewFor(p, 12, 15, "2026-06-02")
+	if v == nil || v.Price != 15 || v.Date != "2026-06-02" || v.DrawdownPct != 20 {
+		t.Fatalf("盘中新高视图错误: %+v", v)
+	}
+	v = peakViewFor(p, 12, 20, "2026-06-01")
+	if v == nil || v.Price != 12 || v.Date != "2026-06-01" || v.DrawdownPct != 0 {
+		t.Fatalf("起算日只能使用当前价，不能使用整日 High: %+v", v)
+	}
 }
 
 // TestAdjustPriceForCorpAction 价格侧折算与成本侧口径一致（手工验算）。

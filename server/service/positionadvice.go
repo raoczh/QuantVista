@@ -58,6 +58,10 @@ type PositionAdvice struct {
 	PositionID int64  `json:"position_id"`
 	Symbol     string `json:"symbol"`
 	Name       string `json:"name,omitempty"`
+	// PositionType/Cost/Quantity 来自服务端持仓快照，模型输出中的同名字段一律覆盖。
+	PositionType string  `json:"position_type"`
+	Cost         float64 `json:"cost"`
+	Quantity     float64 `json:"quantity"`
 	// Verdict 封闭枚举 hold|trim|exit（服务端归一，非法值整条丢弃）。
 	Verdict string `json:"verdict"`
 	// Reason 结论理由（要求引用喂进去的具体数值）。
@@ -68,7 +72,8 @@ type PositionAdvice struct {
 
 // PositionAdviceResult 一次建议的完整结果（落 llm_tasks 的 result_json）。
 type PositionAdviceResult struct {
-	Advices []PositionAdvice `json:"advices"`
+	Advices     []PositionAdvice `json:"advices"`
+	GeneratedAt string           `json:"generated_at"`
 	// Analyzed/Skipped 参与与被排除的持仓数；Notes 说明为什么被排除。
 	Analyzed int      `json:"analyzed"`
 	Skipped  int      `json:"skipped"`
@@ -83,6 +88,10 @@ type PositionAdviceResult struct {
 	Model       string `json:"model,omitempty"`
 	TraceID     string `json:"trace_id,omitempty"`
 	PromptVer   string `json:"prompt_version,omitempty"`
+}
+
+func stampPositionAdviceResult(res *PositionAdviceResult, now time.Time) {
+	res.GeneratedAt = now.Format(time.RFC3339)
 }
 
 // PositionAdviceRequest 入参。
@@ -322,6 +331,7 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 					res.Notes = append(res.Notes, fmt.Sprintf(
 						"%d 笔持仓模型未给出合法结论（枚举越界或 position_id/symbol 不匹配），已丢弃——未擅自代填「继续持有」", n))
 				}
+				stampPositionAdviceResult(res, time.Now())
 				return res, nil
 			}
 			lastErr = errors.New("模型未给出任何合法结论")
@@ -353,8 +363,11 @@ func filterPositionAdvices(in []PositionAdvice, positions map[int64]positionAdvi
 			continue
 		}
 		seen[a.PositionID] = true
-		// 名称一律服务端回填。
+		// 名称、持仓类型、成本和数量一律由服务端快照回填，不能信任模型自报。
 		a.Name = p.Name
+		a.PositionType = p.Type
+		a.Cost = p.Cost
+		a.Quantity = p.Quantity
 		out = append(out, a)
 	}
 	return out

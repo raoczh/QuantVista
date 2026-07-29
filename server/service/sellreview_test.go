@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"quantvista/common"
+	"quantvista/datasource"
 	"quantvista/model"
 )
 
@@ -82,7 +83,7 @@ func TestEvalSellReviewMaBreak(t *testing.T) {
 			TradeDate: "2026-06-" + twoDigit(i+1), Close: 10})
 	}
 	bars = append(bars, model.DailyBar{Symbol: "600000", Market: "cn", TradeDate: "2026-07-01", Close: 9})
-	h := evalSellReviewMaBreak(bars)
+	h := evalSellReviewMaBreak(bars, "2026-06-30", "2026-07-01")
 	if h == nil || h.Trigger != model.SellReviewMaBreak {
 		t.Fatal("刚跌破 MA20 应命中")
 	}
@@ -95,19 +96,27 @@ func TestEvalSellReviewMaBreak(t *testing.T) {
 
 	// 长期在均线下方：再加一根 8.5，此时前一根（9）已在均线下方 → 不再报。
 	bars = append(bars, model.DailyBar{Symbol: "600000", Market: "cn", TradeDate: "2026-07-02", Close: 8.5})
-	if h := evalSellReviewMaBreak(bars); h != nil {
+	if h := evalSellReviewMaBreak(bars, "2026-06-30", "2026-07-02"); h != nil {
 		t.Fatalf("长期在均线下方不应每天重复报: %+v", h)
 	}
 
 	// 样本不足：**不判断 ≠ 没跌破**，返回 nil 由调用方按「本轮无结论」处理。
-	if h := evalSellReviewMaBreak(bars[:10]); h != nil {
+	if h := evalSellReviewMaBreak(bars[:10], "2026-06-30", "2026-07-02"); h != nil {
 		t.Fatalf("样本不足时不应给出结论: %+v", h)
 	}
 	// 坏根（收盘 ≤0）整段不判。
 	broken := append([]model.DailyBar{}, bars...)
 	broken[3].Close = 0
-	if h := evalSellReviewMaBreak(broken); h != nil {
+	if h := evalSellReviewMaBreak(broken, "2026-06-30", "2026-07-02"); h != nil {
 		t.Fatal("存在坏根时应整段不判（宁可不报也不错报）")
+	}
+
+	// 命中日必须属于本轮评估窗口：陈旧日线和未来脏数据都不能生成新复核。
+	if h := evalSellReviewMaBreak(bars[:25], "2026-07-02", "2026-07-03"); h != nil {
+		t.Fatalf("窗口前的陈旧交叉不应命中: %+v", h)
+	}
+	if h := evalSellReviewMaBreak(bars[:25], "2026-06-01", "2026-06-30"); h != nil {
+		t.Fatalf("评估日之后的未来交叉不应命中: %+v", h)
 	}
 }
 
@@ -150,6 +159,45 @@ func TestComposeSellReviewDetail(t *testing.T) {
 	}
 	if strings.Contains(detail, "现价") {
 		t.Fatalf("行情不可用时不得写现价: %s", detail)
+	}
+}
+
+// TestUpsertSellReviewRequiresHolding 模拟扫描已拿到旧 holding 快照、随后用户完成
+// 平仓/删除的竞态：落库层必须重验当前状态，不能在终结事务之后补写新的 open。
+func TestUpsertSellReviewRequiresHolding(t *testing.T) {
+	setupTestDB(t)
+	cleanCorpTables(t)
+	today := time.Now().In(time.Local).Format("2006-01-02")
+	held := seedHoldingWithPeak(t, 1, "600000", "仍持仓", 10, 100, 10, today)
+	closed := seedHoldingWithPeak(t, 1, "600001", "已平仓", 10, 100, 10, today)
+	deleted := seedHoldingWithPeak(t, 1, "600002", "已删除", 10, 100, 10, today)
+	if err := common.DB.Model(closed).Update("status", model.PositionStatusClosed).Error; err != nil {
+		t.Fatalf("造已平仓状态失败: %v", err)
+	}
+	deletedID := deleted.ID
+	if err := common.DB.Delete(deleted).Error; err != nil {
+		t.Fatalf("造已删除状态失败: %v", err)
+	}
+
+	makeRow := func(positionID int64, symbol string) *model.SellReview {
+		return &model.SellReview{
+			UserID: 1, PositionID: positionID, Symbol: symbol, Market: "cn",
+			Trigger: model.SellReviewLift, TradeDate: today, Status: model.SellReviewStatusOpen,
+		}
+	}
+	if created, err := upsertSellReview(makeRow(closed.ID, closed.Symbol)); err != nil || created {
+		t.Fatalf("已平仓持仓应正常跳过，created=%v err=%v", created, err)
+	}
+	if created, err := upsertSellReview(makeRow(deletedID, deleted.Symbol)); err != nil || created {
+		t.Fatalf("已删除持仓应正常跳过，created=%v err=%v", created, err)
+	}
+	if created, err := upsertSellReview(makeRow(held.ID, held.Symbol)); err != nil || !created {
+		t.Fatalf("仍 holding 的持仓应允许新建，created=%v err=%v", created, err)
+	}
+	var rows []model.SellReview
+	common.DB.Find(&rows)
+	if len(rows) != 1 || rows[0].PositionID != held.ID || rows[0].Status != model.SellReviewStatusOpen {
+		t.Fatalf("落库门禁结果错误: %+v", rows)
 	}
 }
 
@@ -240,13 +288,17 @@ func TestSellReviewIntoTodo(t *testing.T) {
 	setupTestDB(t)
 	cleanCorpTables(t)
 	today := time.Now().Format("2006-01-02")
+	p := seedHoldingWithPeak(t, 1, "600000", "浦发银行", 10, 1000, 10, today)
 	common.DB.Create(&model.SellReview{
-		UserID: 1, PositionID: 7, Symbol: "600000", Market: "cn", Name: "浦发银行",
+		UserID: 1, PositionID: p.ID, Symbol: "600000", Market: "cn", Name: "浦发银行",
 		Trigger: model.SellReviewLift, TradeDate: today, Severity: model.SellReviewSeverityHigh,
 		Title: "限售解禁临近", Detail: "解禁 3000 万股。我的持仓：成本 10.00 元 × 1000 股",
 		Status: model.SellReviewStatusOpen,
 	})
-	svc := NewTodoService(&AlertService{}, &PositionService{market: nil}, nil)
+	// 有真实 holding 时 PositionService 会拉行情；零适配器让它稳定走 fail-closed，
+	// 本测试只验证卖出复核的待办聚合，不依赖外部行情。
+	svc := NewTodoService(&AlertService{},
+		NewPositionService(NewMarketService(datasource.NewManagerWithAdapters())), nil)
 	res, err := svc.Build(context.Background(), 1, TodoScopeLedger)
 	if err != nil {
 		t.Fatalf("待办聚合失败: %v", err)

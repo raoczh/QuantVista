@@ -134,8 +134,9 @@ func (s *TodoService) Build(ctx context.Context, userID int64, scope string) (*T
 	// 读取失败时按空集处理并留痕——宁可把持仓相关的提醒错分到 research
 	// （用户仍能在 all 范围看到），也不能凭空把非持仓标的说成持仓。
 	heldSymbols := map[string]bool{}
-	if syms, err := heldSymbolsFor(userID); err == nil {
-		heldSymbols = syms
+	heldPositionIDs := map[int64]bool{}
+	if syms, ids, err := heldPositionStateFor(userID); err == nil {
+		heldSymbols, heldPositionIDs = syms, ids
 	} else {
 		fail("持仓标的", err)
 	}
@@ -143,6 +144,9 @@ func (s *TodoService) Build(ctx context.Context, userID int64, scope string) (*T
 	// 1) 未读的提醒命中事件（alert_events 状态机，标记已读/忽略即完成待办）。
 	if events, err := s.alert.TriggeredForUser(userID); err == nil {
 		for _, e := range events {
+			if isPositionAlertKind(e.Kind) && (e.PositionID == 0 || !heldPositionIDs[e.PositionID]) {
+				continue // 平仓/删除后的遗留未读事件不能继续冒充当前持仓待办
+			}
 			t := e.TriggeredAt
 			// 持仓卖出决策类（D14/D15）天生属于账本；其余按标的是否在持仓中分流。
 			sc := TodoScopeResearch
@@ -392,22 +396,27 @@ func (s *TodoService) Build(ctx context.Context, userID int64, scope string) (*T
 	return res, nil
 }
 
-// heldSymbolsFor 用户当前持仓的标的集合（判定跨域待办算不算「与我的账本有关」）。
-func heldSymbolsFor(userID int64) (map[string]bool, error) {
-	out := map[string]bool{}
+// heldPositionStateFor 返回用户当前持仓的标的与持仓 ID 集合。
+func heldPositionStateFor(userID int64) (map[string]bool, map[int64]bool, error) {
+	symbols := map[string]bool{}
+	ids := map[int64]bool{}
 	if common.DB == nil {
-		return out, errors.New("数据库不可用")
+		return symbols, ids, errors.New("数据库不可用")
 	}
-	var syms []string
+	var rows []struct {
+		ID     int64
+		Symbol string
+	}
 	if err := common.DB.Model(&model.Position{}).
 		Where("user_id = ? AND status = ?", userID, model.PositionStatusHolding).
-		Distinct().Pluck("symbol", &syms).Error; err != nil {
-		return out, err
+		Select("id, symbol").Find(&rows).Error; err != nil {
+		return symbols, ids, err
 	}
-	for _, s := range syms {
-		out[s] = true
+	for _, row := range rows {
+		symbols[row.Symbol] = true
+		ids[row.ID] = true
 	}
-	return out, nil
+	return symbols, ids, nil
 }
 
 func recReviewDetail(st model.RecommendationStatus) string {

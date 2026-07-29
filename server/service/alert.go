@@ -530,21 +530,37 @@ func (s *AlertService) Delete(ctx context.Context, userID, id int64) error {
 // 用户标记已读/忽略即从待办消失——替代旧的「按规则行 triggered_at 推断」口径。
 func (s *AlertService) TriggeredForUser(userID int64) ([]model.AlertEvent, error) {
 	var rows []model.AlertEvent
-	err := common.DB.Where("user_id = ? AND status = ?", userID, model.AlertEventUnread).
+	q := common.DB.Model(&model.AlertEvent{}).
+		Where("alert_events.user_id = ? AND alert_events.status = ?", userID, model.AlertEventUnread)
+	err := withActionablePositionAlertEvents(q).
 		Order("triggered_at DESC").Limit(alertEventMaxList).Find(&rows).Error
 	return rows, err
 }
 
 // --- 命中事件（明细/状态机） ---
 
+// withActionablePositionAlertEvents 过滤已无对应本人持仓的遗留未读事件。
+// PositionID=0 是普通提醒，不依赖持仓；历史状态查询不调用本函数，仍保留完整记录。
+func withActionablePositionAlertEvents(q *gorm.DB) *gorm.DB {
+	return q.Where(`alert_events.position_id = 0 OR EXISTS (
+		SELECT 1 FROM positions
+		WHERE positions.id = alert_events.position_id
+		  AND positions.user_id = alert_events.user_id
+		  AND positions.status = ?
+	)`, model.PositionStatusHolding)
+}
+
 // ListEvents 命中历史（可按状态过滤，倒序）。
 func (s *AlertService) ListEvents(userID int64, status string, limit int) ([]model.AlertEvent, error) {
 	if limit <= 0 || limit > alertEventMaxList {
 		limit = 100
 	}
-	q := common.DB.Where("user_id = ?", userID)
+	q := common.DB.Model(&model.AlertEvent{}).Where("alert_events.user_id = ?", userID)
 	if status == model.AlertEventUnread || status == model.AlertEventRead || status == model.AlertEventDismissed {
-		q = q.Where("status = ?", status)
+		q = q.Where("alert_events.status = ?", status)
+		if status == model.AlertEventUnread {
+			q = withActionablePositionAlertEvents(q)
+		}
 	}
 	var rows []model.AlertEvent
 	err := q.Order("id DESC").Limit(limit).Find(&rows).Error
@@ -557,11 +573,30 @@ func (s *AlertService) SetEventStatus(userID, id int64, status string) (*model.A
 		return nil, errors.New("非法状态")
 	}
 	var ev model.AlertEvent
-	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&ev).Error; err != nil {
-		return nil, errors.New("命中记录不存在")
-	}
-	ev.Status = status
-	if err := common.DB.Save(&ev).Error; err != nil {
+	err := common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("id = ? AND user_id = ?", id, userID).First(&ev).Error; err != nil {
+			return errors.New("命中记录不存在")
+		}
+		if status == model.AlertEventUnread && ev.PositionID > 0 {
+			var p model.Position
+			q := tx.Where("id = ? AND user_id = ? AND status = ?",
+				ev.PositionID, userID, model.PositionStatusHolding)
+			if tx.Dialector.Name() != "sqlite" {
+				q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+			}
+			if err := q.First(&p).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return errors.New("关联持仓已平仓或不存在，不能恢复为未读")
+				}
+				return err
+			}
+		}
+		ev.Status = status
+		return tx.Model(&model.AlertEvent{}).
+			Where("id = ? AND user_id = ?", id, userID).
+			Update("status", status).Error
+	})
+	if err != nil {
 		return nil, err
 	}
 	return &ev, nil

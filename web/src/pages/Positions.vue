@@ -330,6 +330,7 @@ async function submit() {
     if (editing.value && f.id) await updatePosition(f.id, payload)
     else await createPosition(payload)
     editModal.value = false
+    invalidateAdvice()
     await load()
     message.success('已保存')
   } catch (e) {
@@ -400,7 +401,8 @@ async function submitClose() {
       lesson_learned: closeForm.value.lesson_learned,
     })
     closeModal.value = false
-    await load()
+    invalidateAdvice()
+    await Promise.all([load(), loadSellReviews()])
     message.success('已标记卖出')
   } catch (e) {
     message.error((e as Error).message)
@@ -412,7 +414,8 @@ async function submitClose() {
 async function remove(p: Position) {
   try {
     await deletePosition(p.id)
-    await load()
+    invalidateAdvice()
+    await Promise.all([load(), loadSellReviews()])
     message.success('已删除')
   } catch (e) {
     message.error((e as Error).message)
@@ -455,6 +458,7 @@ async function submitImport() {
     importResult.value = await importPositions(importFile.value)
     if (importResult.value.imported > 0) {
       message.success(`成功导入 ${importResult.value.imported} 条持仓`)
+      invalidateAdvice()
       await load()
     } else if (!importResult.value.failed.length) {
       message.warning('文件中没有可导入的数据行')
@@ -543,7 +547,8 @@ async function submitTrade() {
       lesson_learned: f.lesson_learned,
     })
     tradeModal.value = false
-    await load()
+    invalidateAdvice()
+    await Promise.all([load(), loadSellReviews()])
     if (expandedTrades.value === p.id) await loadTrades(p.id)
     message.success(f.side === 'buy' ? '已记录加仓' : '已记录减仓')
   } catch (e) {
@@ -613,6 +618,7 @@ async function revertAdjustTrade(t: PositionTrade, positionId: number) {
   try {
     await actCorpAdjust(t.adjust_id, 'revert')
     message.success('已撤销该次折算，账本回滚')
+    invalidateAdvice()
     await Promise.all([load(), loadTrades(positionId), loadCorpAdjusts()])
   } catch (e) {
     message.error((e as Error).message)
@@ -811,6 +817,7 @@ async function doCorpAdjust(row: PositionCorpAdjust, action: 'confirm' | 'dismis
   try {
     await actCorpAdjust(row.id, action)
     message.success(action === 'confirm' ? '已按方案折算持仓' : '已忽略该调整')
+    invalidateAdvice()
     await Promise.all([loadCorpAdjusts(), load()])
   } catch (e) {
     message.error((e as Error).message)
@@ -860,6 +867,7 @@ async function doSellReview(row: SellReview, status: 'resolved' | 'dismissed') {
   try {
     await setSellReviewStatus(row.id, status)
     message.success(status === 'resolved' ? '已标记复核完成' : '已忽略')
+    invalidateAdvice()
     await loadSellReviews()
   } catch (e) {
     message.error((e as Error).message)
@@ -880,6 +888,16 @@ const advice = ref<PositionAdviceResult | null>(null)
 const adviceLoading = ref(false)
 const adviceError = ref('')
 let adviceAbort: AbortController | null = null
+
+// 建议是一次性账本快照。任何会改变持仓数量/成本/公司行动或风险信号的成功操作，
+// 都必须立刻废弃旧结果；同时取消在途轮询，避免旧请求稍后回填成“当前建议”。
+function invalidateAdvice() {
+  adviceAbort?.abort()
+  adviceAbort = null
+  adviceLoading.value = false
+  advice.value = null
+  adviceError.value = ''
+}
 
 async function runAdvice() {
   if (adviceLoading.value) return
@@ -909,6 +927,11 @@ async function runAdvice() {
 
 const verdictLabel = (v: string) => POSITION_VERDICT_LABEL[v as keyof typeof POSITION_VERDICT_LABEL] || v
 const verdictType = (v: string) => (v === 'exit' ? 'error' : v === 'trim' ? 'warning' : 'success')
+const advicePositionType = (v: string) => (v === 'short_term' ? '短线' : v === 'long_term' ? '长线' : v)
+const adviceGeneratedAt = computed(() => {
+  if (!advice.value?.generated_at) return ''
+  return new Date(advice.value.generated_at).toLocaleString('zh-CN', { hour12: false })
+})
 
 async function loadCurve() {
   curveAbort?.abort()
@@ -1227,13 +1250,16 @@ onBeforeUnmount(() => {
             <div v-else class="advice-box">
               <div v-for="(n, i) in advice.notes || []" :key="i" class="advice-note">{{ n }}</div>
               <div class="advice-list">
-                <div v-for="a in advice.advices" :key="a.position_id || a.symbol" class="advice-row">
+                <div v-for="a in advice.advices" :key="a.position_id" class="advice-row">
                   <div class="advice-head">
                     <n-tag size="small" round :bordered="false" :type="verdictType(a.verdict)">{{
                       verdictLabel(a.verdict)
                     }}</n-tag>
                     <span class="advice-name">{{ a.name || a.symbol }}</span>
                     <span class="advice-symbol qv-mono">{{ a.symbol }}</span>
+                    <span class="advice-position qv-tnum">
+                      {{ advicePositionType(a.position_type) }} · 成本 {{ a.cost.toFixed(2) }} · {{ a.quantity }} 股
+                    </span>
                   </div>
                   <div class="advice-reason">{{ a.reason }}</div>
                   <div v-if="a.invalidation" class="advice-invalid">失效条件：{{ a.invalidation }}</div>
@@ -1245,6 +1271,7 @@ onBeforeUnmount(() => {
                   · 证据核验 {{ advice.evidence_check.matched }}/{{ advice.evidence_check.total }} 项与数据一致</span
                 >
                 <span v-if="advice.model"> · {{ advice.model }}</span>
+                <span v-if="adviceGeneratedAt"> · 生成于 {{ adviceGeneratedAt }}</span>
                 。研究参考，不构成投资建议。
               </div>
             </div>
@@ -2524,6 +2551,10 @@ onBeforeUnmount(() => {
 .advice-symbol {
   font-size: 12px;
   opacity: 0.5;
+}
+.advice-position {
+  font-size: 12px;
+  opacity: 0.65;
 }
 .advice-reason {
   font-size: 13px;

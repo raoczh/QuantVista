@@ -143,9 +143,10 @@ func pnlWord(pct float64) string {
 
 // positionAlertHit 一条规则在一笔持仓上的命中结果（待落库）。
 type positionAlertHit struct {
-	Position model.Position
-	Value    float64
-	Message  string
+	Position  model.Position
+	Value     float64
+	Message   string
+	TradeDate string
 }
 
 // evaluatePositionRules 评估用户的全部持仓类规则。
@@ -171,16 +172,6 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 	if len(positions) == 0 {
 		return 0, nil // 没有持仓：这类规则天然无事可做（不是错误）
 	}
-	// D15 峰值惰性初始化（老持仓/首次启用），补齐后重读拿到落库值。
-	if backfillPositionPeaks(userID, positions) {
-		if positions, err = loadPositions(); err != nil {
-			return 0, err
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-
 	// 批量新鲜行情（fail-closed：仅 fresh 参与判定）。
 	refs := make([]QuoteRef, 0, len(positions))
 	seen := map[string]bool{}
@@ -192,6 +183,40 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 		}
 	}
 	quotes := s.market.FreshQuotesFor(ctx, refs)
+	wallDate := time.Now().In(time.Local).Format("2006-01-02")
+	// 按每笔 fresh 行情的实际观测日分组补齐历史峰值。盘前可能同时拿到上一交易日
+	// 收盘与今天集合竞价两种 fresh quote，不能强压成一个统一 evaluationDate；每组
+	// 只补 (PeakFrom, quoteTradeDate)，该观测日的 High 仍由下方盘中逻辑处理。
+	type datedPositions struct {
+		indices []int
+		rows    []model.Position
+	}
+	groups := map[string]*datedPositions{}
+	for i, p := range positions {
+		fq, ok := quotes[QuoteKey(p.Market, p.Symbol)]
+		if !ok || fq.Quote == nil || fq.Quote.Price <= 0 || fq.Fresh.Status != freshStatusFresh {
+			continue
+		}
+		d := effectiveQuoteTradeDate(fq, wallDate)
+		g := groups[d]
+		if g == nil {
+			g = &datedPositions{}
+			groups[d] = g
+		}
+		g.indices = append(g.indices, i)
+		g.rows = append(g.rows, p)
+	}
+	for date, g := range groups {
+		if _, err := syncPositionPeaksBefore(ctx, userID, g.rows, date); err != nil {
+			return 0, fmt.Errorf("补齐持仓期峰值失败: %w", err)
+		}
+		for i, index := range g.indices {
+			positions[index] = g.rows[i]
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 
 	notifyOn := false
 	if s.notify != nil {
@@ -208,7 +233,6 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 		}()
 	}
 
-	today := time.Now().In(time.Local).Format("2006-01-02")
 	hits := 0
 	for _, rule := range rules {
 		if err := ctx.Err(); err != nil {
@@ -216,6 +240,7 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 		}
 		var ruleHits []positionAlertHit
 		extreme, hasObs := 0.0, false
+		ruleCheckDate := ""
 		for _, p := range positions {
 			// 绑定了 symbol 的规则只评该标的；未绑定 = 我的全部持仓。
 			if rule.Symbol != "" && rule.Symbol != p.Symbol {
@@ -225,15 +250,27 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 			if !ok || fq.Quote == nil || fq.Quote.Price <= 0 || fq.Fresh.Status != freshStatusFresh {
 				continue // fail-closed：无当前有效行情，本轮不评这一笔
 			}
+			tradeDate := effectiveQuoteTradeDate(fq, wallDate)
+			if p.PeakFrom != "" && p.PeakFrom > tradeDate {
+				continue // 最近有效行情早于建仓/加仓起算日，不能拿持仓前行情做判断
+			}
+			if tradeDate > ruleCheckDate {
+				ruleCheckDate = tradeDate
+			}
 			in := positionAlertEval{
 				AvgCost: p.BuyPrice, Price: fq.Quote.Price,
 				DayHigh: fq.Quote.High, DayLow: fq.Quote.Low,
 				Peak: p.PeakPrice, PeakDate: p.PeakDate,
 			}
+			// 起算日只有成交价/当前价的先后关系可知，整日 High/Low 可能发生在建仓或
+			// 加仓之前；当天一律只用当前价，宁可漏掉盘中触达也不制造持仓前假信号。
+			if p.PeakFrom != "" && p.PeakFrom == tradeDate {
+				in.DayHigh, in.DayLow = 0, 0
+			}
 			// 盘中用当日最高抬升峰值参与判定（**不落库**：盘中峰值随时在变，
 			// 落库交给盘后 16:25 那一次，避免高频写与并发竞争）。
 			if in.Peak > 0 && in.DayHigh > in.Peak {
-				in.PeakDate = today
+				in.PeakDate = tradeDate
 			}
 			triggered, value, msg := evaluatePositionAlert(rule, p.Name, in)
 			// 观测值只在「可判定」时参与 last_value——peak 未建立时 value 恒 0，
@@ -244,10 +281,17 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 				}
 			}
 			if triggered {
-				ruleHits = append(ruleHits, positionAlertHit{Position: p, Value: value, Message: msg})
+				ruleHits = append(ruleHits, positionAlertHit{
+					Position: p, Value: value, Message: msg, TradeDate: tradeDate,
+				})
 			}
 		}
-		created, active, perr := persistPositionAlertEvaluation(ctx, rule, ruleHits, extreme, hasObs, today, time.Now())
+		if ruleCheckDate == "" {
+			ruleCheckDate = wallDate
+		}
+		created, active, perr := persistPositionAlertEvaluation(
+			ctx, rule, ruleHits, extreme, hasObs, ruleCheckDate, time.Now(),
+		)
 		if perr != nil {
 			return hits, perr
 		}
@@ -272,7 +316,7 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 //
 // 返回本轮**新建**的事件列表（供推送——已存在的当日事件不重复推）、规则是否仍生效。
 func persistPositionAlertEvaluation(ctx context.Context, rule model.AlertRule, hits []positionAlertHit,
-	extreme float64, hasObs bool, today string, now time.Time) ([]positionAlertHit, bool, error) {
+	extreme float64, hasObs bool, checkDate string, now time.Time) ([]positionAlertHit, bool, error) {
 	var created []positionAlertHit
 	active := false
 	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -290,15 +334,35 @@ func persistPositionAlertEvaluation(ctx context.Context, rule model.AlertRule, h
 		}
 		active = true
 
-		updates := map[string]any{"last_check_date": today}
+		// 评估读到 holding 后，用户可能已经并发平仓/删除。落事件前按 position id
+		// 升序锁定并重验；若平仓先提交则本轮跳过，若本事务先拿到锁，则平仓会在
+		// 本事务提交后继续并终结刚写入的事件，二者都不会留下已平仓 unread。
+		validHits := make([]positionAlertHit, 0, len(hits))
+		for _, h := range hits {
+			var p model.Position
+			q := tx.Select("id").Where("id = ? AND user_id = ? AND status = ?",
+				h.Position.ID, current.UserID, model.PositionStatusHolding)
+			if tx.Dialector.Name() != "sqlite" {
+				q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+			}
+			if err := q.First(&p).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					continue
+				}
+				return err
+			}
+			validHits = append(validHits, h)
+		}
+
+		updates := map[string]any{"last_check_date": checkDate}
 		if hasObs {
 			updates["last_value"] = round2(extreme)
 		}
-		if len(hits) > 0 {
+		if len(validHits) > 0 {
 			// trigger_msg 取本轮**最紧急**的那笔（观测值最大 = 涨得最多/跌得最多/回撤最深），
 			// 规则行只有一个快照位，取首笔会让它随持仓 id 顺序而不是严重程度变化。
-			worst := hits[0]
-			for _, h := range hits[1:] {
+			worst := validHits[0]
+			for _, h := range validHits[1:] {
 				if h.Value > worst.Value {
 					worst = h
 				}
@@ -306,12 +370,16 @@ func persistPositionAlertEvaluation(ctx context.Context, rule model.AlertRule, h
 			updates["triggered_at"] = now
 			updates["trigger_msg"] = truncateRunes(worst.Message, 256)
 		}
-		for _, h := range hits {
+		for _, h := range validHits {
+			tradeDate := h.TradeDate
+			if tradeDate == "" {
+				tradeDate = checkDate
+			}
 			// 同一规则同一持仓当日只落一条。同一标的可能有多笔不同成本的仓位，
 			// 按 symbol 去重会吞掉后面的决策提醒。
 			var cnt int64
 			if err := tx.Model(&model.AlertEvent{}).
-				Where("rule_id = ? AND position_id = ? AND trade_date = ?", current.ID, h.Position.ID, today).
+				Where("rule_id = ? AND position_id = ? AND trade_date = ?", current.ID, h.Position.ID, tradeDate).
 				Count(&cnt).Error; err != nil {
 				return err
 			}
@@ -322,7 +390,7 @@ func persistPositionAlertEvaluation(ctx context.Context, rule model.AlertRule, h
 				RuleID: current.ID, UserID: current.UserID,
 				Symbol: h.Position.Symbol, Market: h.Position.Market,
 				Name: orSymbol(h.Position.Name, h.Position.Symbol), Kind: current.Kind,
-				Message: truncateRunes(h.Message, 256), TradeDate: today,
+				Message: truncateRunes(h.Message, 256), TradeDate: tradeDate,
 				PositionID: h.Position.ID, TriggeredAt: now, Status: model.AlertEventUnread,
 			}
 			if err := tx.Create(&ev).Error; err != nil {

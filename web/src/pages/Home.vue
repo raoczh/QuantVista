@@ -53,6 +53,7 @@ async function loadOverview(silent = false) {
 // ---------- 我的概览：仓位 / 待办 / 自选 / 推荐，一屏知全局 ----------
 const minePos = ref<{ pnl: number; pct: number; n: number; priced: number } | null>(null)
 const mineTodo = ref<TodoResult | null>(null)
+const mineTodoError = ref('')
 const mineWatch = ref<{ up: number; down: number; total: number } | null>(null)
 const mineRec = ref<RecommendationBatch | null>(null)
 const mineRecLoaded = ref(false)
@@ -81,7 +82,15 @@ async function loadMine() {
     }
     minePos.value = { pnl, pct: cost > 0 ? (pnl / cost) * 100 : 0, n, priced }
   }
-  if (todos.status === 'fulfilled') mineTodo.value = todos.value
+  if (todos.status === 'fulfilled') {
+    mineTodo.value = todos.value
+    mineTodoError.value = todos.value.complete
+      ? ''
+      : todos.value.errors?.join('；') || '待办清单读取不完整'
+  } else {
+    mineTodo.value = null
+    mineTodoError.value = (todos.reason as Error)?.message || '待办数据暂不可用'
+  }
   if (wl.status === 'fulfilled') {
     let up = 0
     let down = 0
@@ -301,12 +310,29 @@ function onResize() {
         <n-gi>
           <div class="mine-card" @click="router.push('/today')">
             <div class="mc-label">今日待办</div>
-            <div class="mc-value qv-figure" :class="{ 'mc-calm': mineTodo && !mineTodo.total }">
-              {{ mineTodo ? (mineTodo.total ? `${mineTodo.total} 项` : '无待办') : '—' }}
+            <div
+              class="mc-value qv-figure"
+              :class="{ 'mc-calm': mineTodo && mineTodo.complete && !mineTodo.total }"
+            >
+              {{
+                mineTodoError
+                  ? mineTodo?.total
+                    ? `至少 ${mineTodo.total} 项`
+                    : '状态未知'
+                  : mineTodo
+                    ? mineTodo.total
+                      ? `${mineTodo.total} 项`
+                      : '无待办'
+                    : '—'
+              }}
             </div>
             <div class="mc-sub">
-              <span v-if="mineTodo && mineTodo.total">提醒 {{ mineTodo.alerts }} · 复盘 {{ mineTodo.reviews }}</span>
-              <span v-else>一切都在轨道上</span>
+              <span v-if="mineTodoError">{{ mineTodoError }}</span>
+              <span v-else-if="mineTodo && mineTodo.total"
+                >提醒 {{ mineTodo.alerts }} · 复盘 {{ mineTodo.reviews }}</span
+              >
+              <span v-else-if="mineTodo">一切都在轨道上</span>
+              <span v-else>正在读取</span>
             </div>
           </div>
         </n-gi>

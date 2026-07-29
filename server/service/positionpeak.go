@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -85,27 +86,71 @@ func peakInitFor(buyPrice float64, buyDate, today string) (float64, string) {
 	return round4(buyPrice), from
 }
 
-// peakFromLocalBars 用本地日线回填 [from, today] 区间的最高价与所在交易日。
+// effectiveQuoteTradeDate 返回已通过 freshness 校验的行情实际观测交易日。
+// DataTime 优先：盘前 ExpectedDate 仍是上一交易日，但 09:15 后可能已拿到今天的
+// 集合竞价行情，此时提醒和起算日判断必须归到今天。休市日的 fresh 行情 DataTime
+// 按 freshness 契约只能落在 ExpectedDate，因此仍会稳定去重到最近交易日。
+func effectiveQuoteTradeDate(fq FreshQuoteResult, fallback string) string {
+	if fq.Quote != nil && !fq.Quote.DataTime.IsZero() {
+		return fq.Quote.DataTime.In(time.Local).Format("2006-01-02")
+	}
+	if fq.Fresh.ExpectedDate != "" {
+		return fq.Fresh.ExpectedDate
+	}
+	return fallback
+}
+
+// peakFromLocalBarsDB 用本地日线回填 (from, before) 区间的最高价与所在交易日。
+// 两端都严格排除：起算日的整日 OHLC 含建仓/加仓前波动，不能算作持仓期峰值；
+// 评估交易日由 fresh quote 的盘中 High 单独处理，避免日线与盘中口径重复。
 // 返回 (最高价, 交易日, 是否查到)。查询失败或无数据一律返回 false ——
 // **绝不返回 0 让调用方误以为「历史最高是 0」**。
-func peakFromLocalBars(market, symbol, from, today string) (float64, string, bool) {
-	if common.DB == nil || symbol == "" || from == "" {
-		return 0, "", false
+func peakFromLocalBarsDB(db *gorm.DB, market, symbol, from, before string) (float64, string, bool, error) {
+	if db == nil || symbol == "" || from == "" || before == "" || from >= before {
+		return 0, "", false, nil
 	}
 	var row struct {
 		High      float64
 		TradeDate string
 	}
 	// 取区间内 high 最大的那一根（并列取最早的一根，结果稳定可复现）。
-	err := common.DB.Model(&model.DailyBar{}).
+	err := db.Model(&model.DailyBar{}).
 		Select("high, trade_date").
-		Where("symbol = ? AND market = ? AND trade_date >= ? AND trade_date <= ? AND high > 0",
-			symbol, market, from, today).
+		Where("symbol = ? AND market = ? AND trade_date > ? AND trade_date < ? AND high > 0",
+			symbol, market, from, before).
 		Order("high DESC, trade_date ASC").Limit(1).Scan(&row).Error
-	if err != nil || row.High <= 0 {
-		return 0, "", false
+	if err != nil {
+		return 0, "", false, err
 	}
-	return round4(row.High), row.TradeDate, true
+	if row.High <= 0 {
+		return 0, "", false, nil
+	}
+	return round4(row.High), row.TradeDate, true, nil
+}
+
+func peakHistoryLower(from, before string) string {
+	lower := from
+	if upper, err := time.ParseInLocation("2006-01-02", before, time.Local); err == nil {
+		if limit := upper.AddDate(0, 0, -peakBackfillMaxDays).Format("2006-01-02"); limit > lower {
+			lower = limit
+		}
+	}
+	return lower
+}
+
+// fillPositionPeakFromLocalBars 用起算日之后、before 之前的本地日线抬升内存中的峰值。
+// 调用方负责把 p 保存到同一事务；返回是否发生变化。
+func fillPositionPeakFromLocalBars(db *gorm.DB, p *model.Position, before string) (bool, error) {
+	if p == nil || p.PeakFrom == "" || p.PeakPrice <= 0 {
+		return false, nil
+	}
+	lower := peakHistoryLower(p.PeakFrom, before)
+	hi, date, ok, err := peakFromLocalBarsDB(db, p.Market, p.Symbol, lower, before)
+	if err != nil || !ok || hi <= p.PeakPrice {
+		return false, err
+	}
+	p.PeakPrice, p.PeakDate, p.PeakBackfilled = hi, date, true
+	return true, nil
 }
 
 // ensurePositionPeakTx 事务内补齐单笔持仓的峰值（调用方须已持有行锁）。
@@ -120,22 +165,112 @@ func ensurePositionPeakTx(tx *gorm.DB, p *model.Position, today string) (bool, e
 	if price <= 0 {
 		return false, nil // 无买入价（异常数据）：不猜，留空等下次
 	}
-	date := from
-	backfilled := false
-	// 回填窗口下界：建仓日与 peakBackfillMaxDays 取较晚者。
-	lower := from
-	if limit := time.Now().AddDate(0, 0, -peakBackfillMaxDays).Format("2006-01-02"); limit > lower {
-		lower = limit
+	p.PeakPrice, p.PeakDate, p.PeakFrom, p.PeakBackfilled = price, from, from, false
+	if _, err := fillPositionPeakFromLocalBars(tx, p, today); err != nil {
+		return false, err
 	}
-	if hi, d, ok := peakFromLocalBars(p.Market, p.Symbol, lower, today); ok && hi > price {
-		price, date, backfilled = hi, d, true
-	}
-	p.PeakPrice, p.PeakDate, p.PeakFrom, p.PeakBackfilled = price, date, from, backfilled
 	return true, tx.Model(&model.Position{}).Where("id = ? AND user_id = ?", p.ID, p.UserID).
 		Updates(map[string]any{
 			"peak_price": p.PeakPrice, "peak_date": p.PeakDate,
 			"peak_from": p.PeakFrom, "peak_backfilled": p.PeakBackfilled,
 		}).Error
+}
+
+// syncPositionPeaksBefore 批量补齐每笔 holding 在 (PeakFrom, before) 内遗漏的本地日线峰值。
+// 一次读出相关日线，再按 position 的独立起算日归并；条件更新避免覆盖并发加仓/折算。
+// 返回实际写入的 position id 集合，并同步更新 positions 切片中的对应值。
+func syncPositionPeaksBefore(ctx context.Context, userID int64, positions []model.Position, before string) (map[int64]bool, error) {
+	updated := map[int64]bool{}
+	if common.DB == nil || len(positions) == 0 || before == "" {
+		return updated, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	type target struct {
+		index       int
+		original    model.Position
+		candidate   model.Position
+		searchAfter string
+	}
+	targets := make([]target, 0, len(positions))
+	byKey := map[string][]int{}
+	seenSymbols := map[string]bool{}
+	var symbols []string
+	globalLower := before
+	for i := range positions {
+		p := positions[i]
+		if p.Status != model.PositionStatusHolding || (userID > 0 && p.UserID != userID) {
+			continue
+		}
+		candidate := p
+		if candidate.PeakFrom == "" {
+			price, from := peakInitFor(candidate.BuyPrice, candidate.BuyDate, before)
+			if price <= 0 {
+				continue
+			}
+			candidate.PeakPrice, candidate.PeakDate = price, from
+			candidate.PeakFrom, candidate.PeakBackfilled = from, false
+		}
+		lower := peakHistoryLower(candidate.PeakFrom, before)
+		targets = append(targets, target{index: i, original: p, candidate: candidate, searchAfter: lower})
+		ti := len(targets) - 1
+		key := QuoteKey(candidate.Market, candidate.Symbol)
+		byKey[key] = append(byKey[key], ti)
+		if !seenSymbols[candidate.Symbol] {
+			seenSymbols[candidate.Symbol] = true
+			symbols = append(symbols, candidate.Symbol)
+		}
+		if lower < globalLower {
+			globalLower = lower
+		}
+	}
+	if len(targets) == 0 {
+		return updated, nil
+	}
+	var bars []model.DailyBar
+	if len(symbols) > 0 && globalLower < before {
+		if err := common.DB.WithContext(ctx).Where(
+			"symbol IN ? AND trade_date > ? AND trade_date < ? AND high > 0", symbols, globalLower, before,
+		).Order("trade_date ASC, id ASC").Find(&bars).Error; err != nil {
+			return updated, err
+		}
+	}
+	for _, bar := range bars {
+		for _, ti := range byKey[QuoteKey(bar.Market, bar.Symbol)] {
+			t := &targets[ti]
+			if bar.TradeDate <= t.searchAfter || bar.TradeDate <= t.candidate.PeakFrom || bar.TradeDate >= before {
+				continue
+			}
+			if bar.High > t.candidate.PeakPrice {
+				t.candidate.PeakPrice = round4(bar.High)
+				t.candidate.PeakDate = bar.TradeDate
+				t.candidate.PeakBackfilled = true
+			}
+		}
+	}
+	for _, t := range targets {
+		if t.candidate.PeakPrice == t.original.PeakPrice && t.candidate.PeakDate == t.original.PeakDate &&
+			t.candidate.PeakFrom == t.original.PeakFrom && t.candidate.PeakBackfilled == t.original.PeakBackfilled {
+			continue
+		}
+		res := common.DB.WithContext(ctx).Model(&model.Position{}).
+			Where("id = ? AND user_id = ? AND status = ? AND peak_from = ? AND peak_price = ?",
+				t.original.ID, t.original.UserID, model.PositionStatusHolding,
+				t.original.PeakFrom, t.original.PeakPrice).
+			Updates(map[string]any{
+				"peak_price": t.candidate.PeakPrice, "peak_date": t.candidate.PeakDate,
+				"peak_from": t.candidate.PeakFrom, "peak_backfilled": t.candidate.PeakBackfilled,
+			})
+		if res.Error != nil {
+			return updated, res.Error
+		}
+		if res.RowsAffected > 0 {
+			positions[t.index] = t.candidate
+			updated[t.original.ID] = true
+		}
+	}
+	return updated, nil
 }
 
 // backfillPositionPeaks 列表读取时的批量惰性初始化（同 backfillPositionLedgers 的形态）。
@@ -146,28 +281,12 @@ func backfillPositionPeaks(userID int64, positions []model.Position) bool {
 		return false
 	}
 	today := time.Now().In(time.Local).Format("2006-01-02")
-	wrote := false
-	for _, p := range positions {
-		if p.Status != model.PositionStatusHolding || p.PeakFrom != "" {
-			continue
-		}
-		id := p.ID
-		err := common.DB.Transaction(func(tx *gorm.DB) error {
-			var cur model.Position
-			if err := lockedPosition(tx, userID, id, &cur); err != nil {
-				return err
-			}
-			ok, err := ensurePositionPeakTx(tx, &cur, today)
-			if err == nil && ok {
-				wrote = true
-			}
-			return err
-		})
-		if err != nil {
-			common.SysWarn("持仓 %d 初始化持仓期峰值失败: %v", id, err)
-		}
+	updated, err := syncPositionPeaksBefore(context.Background(), userID, positions, today)
+	if err != nil {
+		common.SysWarn("用户 %d 补齐持仓期峰值失败: %v", userID, err)
+		return false
 	}
-	return wrote
+	return len(updated) > 0
 }
 
 // resetPeakOnBuy 加仓后重置峰值（在 AddTrade 的同一事务内调用）。
@@ -188,6 +307,14 @@ func resetPeakOnBuy(p *model.Position, price float64, tradeDate, today string) {
 	p.PeakDate = date
 	p.PeakFrom = date
 	p.PeakBackfilled = false
+}
+
+// rebuildPositionPeakOnBuyTx 按修正后的首笔买入/历史加仓重建峰值，并补齐起算日之后、
+// today 之前的本地日线；起算日自身整日 OHLC 明确排除。
+func rebuildPositionPeakOnBuyTx(tx *gorm.DB, p *model.Position, price float64, tradeDate, today string) error {
+	resetPeakOnBuy(p, price, tradeDate, today)
+	_, err := fillPositionPeakFromLocalBars(tx, p, today)
+	return err
 }
 
 // ---------- 盘后更新 ----------
@@ -214,12 +341,18 @@ func RunPositionPeakUpdate(tradeDate string) int {
 		return 0
 	}
 	var positions []model.Position
-	if err := common.DB.Where("status = ? AND peak_from <> ?",
-		model.PositionStatusHolding, "").Find(&positions).Error; err != nil {
+	if err := common.DB.Where("status = ?", model.PositionStatusHolding).Find(&positions).Error; err != nil {
 		common.SysWarn("持仓峰值更新读取持仓失败: %v", err)
 		return 0
 	}
 	if len(positions) == 0 {
+		return 0
+	}
+	// 先补 (PeakFrom, tradeDate) 的历史缺口，再处理 tradeDate 当日；服务停机漏掉的
+	// 任意中间交易日因此会在下一次运行时恢复，而不是永久丢失峰值。
+	updatedIDs, err := syncPositionPeaksBefore(context.Background(), 0, positions, tradeDate)
+	if err != nil {
+		common.SysWarn("持仓峰值更新补历史缺口失败: %v", err)
 		return 0
 	}
 	// 一次批量取当日全部相关日线（绝不逐仓查库）。
@@ -242,14 +375,14 @@ func RunPositionPeakUpdate(tradeDate string) int {
 		barByKey[QuoteKey(b.Market, b.Symbol)] = b
 	}
 
-	updated := 0
 	for _, p := range positions {
 		bar, ok := barByKey[QuoteKey(p.Market, p.Symbol)]
 		if !ok {
 			continue
 		}
-		// 事件早于峰值起算日的不算（当天建仓、当天盘后跑到更早的 bar 属异常，防御性判断）。
-		if p.PeakFrom != "" && bar.TradeDate < p.PeakFrom {
+		// 起算日整日 OHLC 含建仓/加仓前波动，无法判断先后；当天峰值只允许
+		// 盘中链路使用成交后的当前价，盘后日线必须从下一交易日起才参与。
+		if p.PeakFrom != "" && bar.TradeDate <= p.PeakFrom {
 			continue
 		}
 		next, nextDate, changed := bumpPeakWithBar(p.PeakPrice, p.PeakDate, bar.High, bar.TradeDate)
@@ -259,16 +392,18 @@ func RunPositionPeakUpdate(tradeDate string) int {
 		// 条件更新：只在峰值仍是我们读到的那个值时才写，避免与用户加仓（重置峰值）
 		// 并发时把刚重置的峰值又抬回旧高点。
 		res := common.DB.Model(&model.Position{}).
-			Where("id = ? AND status = ? AND peak_price = ?", p.ID, model.PositionStatusHolding, p.PeakPrice).
+			Where("id = ? AND status = ? AND peak_from = ? AND peak_price = ?",
+				p.ID, model.PositionStatusHolding, p.PeakFrom, p.PeakPrice).
 			Updates(map[string]any{"peak_price": next, "peak_date": nextDate})
 		if res.Error != nil {
 			common.SysWarn("持仓 %d 峰值更新失败: %v", p.ID, res.Error)
 			continue
 		}
 		if res.RowsAffected > 0 {
-			updated++
+			updatedIDs[p.ID] = true
 		}
 	}
+	updated := len(updatedIDs)
 	if updated > 0 {
 		common.SysLog("持仓期最高价更新 %s：%d 笔", tradeDate, updated)
 	}
@@ -305,15 +440,29 @@ type PeakView struct {
 	Note        string  `json:"note,omitempty"` // 口径说明
 }
 
-// peakViewFor 组装峰值视图。price<=0（无 fresh 行情）时 DrawdownPct 留空——
-// fail-closed：拿不到当前有效价就不给回撤数字，不用旧价算。
-func peakViewFor(p model.Position, price float64) *PeakView {
+// peakViewFor 组装峰值视图。盘中用 max(落库峰值, fresh High, 现价) 展示，避免
+// 16:25 落库前出现负回撤或 AI 漏掉盘中新高；起算交易日整日 OHLC 不可判序，仍只用现价。
+// price<=0（无 fresh 行情）时 DrawdownPct 留空，不用旧价算。
+func peakViewFor(p model.Position, price, dayHigh float64, tradeDate string) *PeakView {
 	if p.PeakFrom == "" || p.PeakPrice <= 0 {
 		return nil
 	}
-	v := &PeakView{Price: round2(p.PeakPrice), Date: p.PeakDate, From: p.PeakFrom, Backfilled: p.PeakBackfilled}
+	peak, peakDate := p.PeakPrice, p.PeakDate
+	if p.PeakFrom > tradeDate && tradeDate != "" {
+		price, dayHigh = 0, 0 // 行情代表的交易日早于本次持仓起算日
+	} else {
+		candidate := price
+		if p.PeakFrom != tradeDate && dayHigh > candidate {
+			candidate = dayHigh
+		}
+		if candidate > peak {
+			peak = candidate
+			peakDate = tradeDate
+		}
+	}
+	v := &PeakView{Price: round2(peak), Date: peakDate, From: p.PeakFrom, Backfilled: p.PeakBackfilled}
 	if price > 0 {
-		v.DrawdownPct = peakDrawdownPct(p.PeakPrice, price)
+		v.DrawdownPct = peakDrawdownPct(peak, price)
 	}
 	if p.PeakBackfilled {
 		v.Note = "最高价含本地日线（前复权口径）回填，与账面实际成交价可能有出入"

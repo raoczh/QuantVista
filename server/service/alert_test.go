@@ -723,6 +723,123 @@ func TestAlertEvents(t *testing.T) {
 	}
 }
 
+func TestPositionAlertEventLifecycleDefense(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Exec("DELETE FROM alert_events")
+	common.DB.Exec("DELETE FROM positions")
+	t.Cleanup(func() {
+		common.DB.Exec("DELETE FROM alert_events")
+		common.DB.Exec("DELETE FROM positions")
+	})
+	svc := &AlertService{}
+	now := time.Now()
+
+	closed := model.Position{UserID: 1, Symbol: "600000", Market: "cn", Name: "已平仓",
+		Status: model.PositionStatusClosed}
+	heldSibling := model.Position{UserID: 1, Symbol: "600000", Market: "cn", Name: "同代码在持",
+		Status: model.PositionStatusHolding}
+	deleted := model.Position{UserID: 1, Symbol: "000001", Market: "cn", Name: "待删除",
+		Status: model.PositionStatusHolding}
+	otherHeld := model.Position{UserID: 2, Symbol: "600519", Market: "cn", Name: "他人持仓",
+		Status: model.PositionStatusHolding}
+	for _, p := range []*model.Position{&closed, &heldSibling, &deleted, &otherHeld} {
+		if err := common.DB.Create(p).Error; err != nil {
+			t.Fatalf("创建持仓失败: %v", err)
+		}
+	}
+	deletedID := deleted.ID
+	if err := common.DB.Delete(&deleted).Error; err != nil {
+		t.Fatalf("删除测试持仓失败: %v", err)
+	}
+
+	nextRuleID := int64(1)
+	createEvent := func(positionID int64, kind, status, message string) model.AlertEvent {
+		t.Helper()
+		ev := model.AlertEvent{RuleID: nextRuleID, UserID: 1, Symbol: "600000", Market: "cn",
+			Kind: kind, Message: message, PositionID: positionID, TriggeredAt: now, Status: status}
+		nextRuleID++
+		if err := common.DB.Create(&ev).Error; err != nil {
+			t.Fatalf("创建提醒事件失败: %v", err)
+		}
+		return ev
+	}
+
+	closedUnread := createEvent(closed.ID, model.AlertKindPeakDrawdown, model.AlertEventUnread, "已平仓脏未读")
+	deletedUnread := createEvent(deletedID, model.AlertKindCostDrawdown, model.AlertEventUnread, "已删除脏未读")
+	otherUnread := createEvent(otherHeld.ID, model.AlertKindCostGain, model.AlertEventUnread, "错绑他人持仓")
+	heldUnread := createEvent(heldSibling.ID, model.AlertKindPeakDrawdown, model.AlertEventUnread, "有效持仓提醒")
+	normalUnread := createEvent(0, model.AlertKindPrice, model.AlertEventUnread, "普通未读")
+	closedRead := createEvent(closed.ID, model.AlertKindPeakDrawdown, model.AlertEventRead, "已平仓历史")
+	deletedDismissed := createEvent(deletedID, model.AlertKindCostDrawdown, model.AlertEventDismissed, "已删除历史")
+	otherRead := createEvent(otherHeld.ID, model.AlertKindCostGain, model.AlertEventRead, "他人持仓历史")
+	heldRead := createEvent(heldSibling.ID, model.AlertKindPeakDrawdown, model.AlertEventRead, "有效持仓历史")
+	normalRead := createEvent(0, model.AlertKindPrice, model.AlertEventRead, "普通历史")
+
+	assertEventIDs := func(label string, rows []model.AlertEvent, want ...int64) {
+		t.Helper()
+		got := make(map[int64]bool, len(rows))
+		for _, row := range rows {
+			got[row.ID] = true
+		}
+		if len(got) != len(want) {
+			t.Fatalf("%s 条数错误: got=%d want=%d rows=%+v", label, len(got), len(want), rows)
+		}
+		for _, id := range want {
+			if !got[id] {
+				t.Fatalf("%s 缺少事件 %d: %+v", label, id, rows)
+			}
+		}
+	}
+
+	triggered, err := svc.TriggeredForUser(1)
+	if err != nil {
+		t.Fatalf("查询未读提醒失败: %v", err)
+	}
+	assertEventIDs("TriggeredForUser", triggered, heldUnread.ID, normalUnread.ID)
+	unread, err := svc.ListEvents(1, model.AlertEventUnread, 100)
+	if err != nil {
+		t.Fatalf("查询未读历史失败: %v", err)
+	}
+	assertEventIDs("ListEvents(unread)", unread, heldUnread.ID, normalUnread.ID)
+
+	reads, _ := svc.ListEvents(1, model.AlertEventRead, 100)
+	assertEventIDs("ListEvents(read)", reads, closedRead.ID, otherRead.ID, heldRead.ID, normalRead.ID)
+	dismissed, _ := svc.ListEvents(1, model.AlertEventDismissed, 100)
+	assertEventIDs("ListEvents(dismissed)", dismissed, deletedDismissed.ID)
+	all, _ := svc.ListEvents(1, "all", 100)
+	assertEventIDs("ListEvents(all)", all,
+		closedUnread.ID, deletedUnread.ID, otherUnread.ID, heldUnread.ID, normalUnread.ID,
+		closedRead.ID, deletedDismissed.ID, otherRead.ID, heldRead.ID, normalRead.ID)
+
+	for name, ev := range map[string]model.AlertEvent{
+		"closed": closedRead, "deleted": deletedDismissed, "other_user": otherRead,
+	} {
+		if _, err := svc.SetEventStatus(1, ev.ID, model.AlertEventUnread); err == nil {
+			t.Fatalf("%s 持仓事件不得恢复未读", name)
+		}
+		var stored model.AlertEvent
+		if err := common.DB.First(&stored, ev.ID).Error; err != nil {
+			t.Fatalf("读取 %s 事件失败: %v", name, err)
+		}
+		if stored.Status != ev.Status {
+			t.Fatalf("%s 恢复失败后状态被改写: got=%s want=%s", name, stored.Status, ev.Status)
+		}
+	}
+	if _, err := svc.SetEventStatus(1, heldRead.ID, model.AlertEventUnread); err != nil {
+		t.Fatalf("本人有效持仓事件应可恢复未读: %v", err)
+	}
+	if _, err := svc.SetEventStatus(1, normalRead.ID, model.AlertEventUnread); err != nil {
+		t.Fatalf("PositionID=0 的普通事件应可恢复未读: %v", err)
+	}
+
+	triggered, err = svc.TriggeredForUser(1)
+	if err != nil {
+		t.Fatalf("恢复后查询未读提醒失败: %v", err)
+	}
+	assertEventIDs("恢复后的 TriggeredForUser", triggered,
+		heldUnread.ID, normalUnread.ID, heldRead.ID, normalRead.ID)
+}
+
 func TestPersistAlertEvaluationRollsBackEventWhenRuleUpdateFails(t *testing.T) {
 	setupTestDB(t)
 	common.DB.Exec("DELETE FROM alert_events")

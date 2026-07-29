@@ -44,14 +44,18 @@ const { isDark, primaryAlpha } = useUi()
 
 // ---------- 导航：高频一级直达，AI 工具与低频项归组，设置/管理后台只留用户菜单 ----------
 const todoCount = ref(0)
+const todoIncomplete = ref(false)
 async function refreshTodoCount() {
   try {
     // 不传 scope = 默认 ledger（D18）：徽标只数「与我的账本有关」的条目，
     // 与点进去的今日待办默认视图**同口径**。别改成 all——徽标 12 条、
     // 点进去只有 3 条会让用户以为丢了东西。
-    todoCount.value = (await getTodos()).total
+    const result = await getTodos()
+    todoCount.value = result.total
+    todoIncomplete.value = !result.complete
   } catch {
-    /* 徽标失败静默，不打扰 */
+    todoCount.value = 0
+    todoIncomplete.value = true
   }
 }
 // 离开待办相关页面时刷新徽标（处理完待办数量会变）。
@@ -77,8 +81,21 @@ const menuOptions = computed<MenuOption[]>(() => [
       h(RouterLink, { to: '/today', class: 'nav-today' }, {
         default: () => [
           '今日待办',
-          todoCount.value > 0
-            ? h('span', { class: 'nav-badge qv-tnum' }, todoCount.value > 99 ? '99+' : String(todoCount.value))
+          todoCount.value > 0 || todoIncomplete.value
+            ? h(
+                'span',
+                {
+                  class: ['nav-badge', 'qv-tnum', { 'nav-badge-incomplete': todoIncomplete.value }],
+                  title: todoIncomplete.value ? '待办清单读取不完整' : undefined,
+                },
+                todoIncomplete.value
+                  ? todoCount.value > 0
+                    ? `${todoCount.value}+`
+                    : '!'
+                  : todoCount.value > 99
+                    ? '99+'
+                    : String(todoCount.value),
+              )
             : null,
         ],
       }),
@@ -228,6 +245,7 @@ const shellVars = computed(() => ({
   '--qv-menu-hover': isDark.value ? 'rgba(255, 255, 255, 0.07)' : 'rgba(128, 128, 128, 0.1)',
   '--qv-glow': primaryAlpha(isDark.value ? 0.12 : 0.08),
   '--qv-badge-bg': vars.value.errorColor,
+  '--qv-badge-incomplete-bg': vars.value.warningColor,
 }))
 
 // 健康状态低频轮询：不随交易时段限制（数据库/Redis 掉线任何时段都要感知），
@@ -419,6 +437,9 @@ onUnmounted(() => {
   font-weight: 700;
   line-height: 16px;
   text-align: center;
+}
+.app-menu :deep(.nav-badge-incomplete) {
+  background: var(--qv-badge-incomplete-bg);
 }
 
 .header-right {

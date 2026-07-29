@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -30,15 +31,15 @@ func TestNormalizePositionVerdict(t *testing.T) {
 }
 
 // TestFilterPositionAdvices 服务端强校验：越界标的/非法枚举/重复/空理由或失效条件一律丢弃，
-// 名称与持仓 id 由服务端回填。
+// 名称、类型、成本、数量与持仓 id 由服务端回填。
 func TestFilterPositionAdvices(t *testing.T) {
 	positions := map[int64]positionAdviceRow{
-		11: {PositionID: 11, Symbol: "600000", Name: "浦发银行"},
-		12: {PositionID: 12, Symbol: "600000", Name: "浦发银行第二笔"},
-		22: {PositionID: 22, Symbol: "600519", Name: "贵州茅台"},
+		11: {PositionID: 11, Symbol: "600000", Name: "浦发银行", Type: model.PositionTypeShortTerm, Cost: 10.5, Quantity: 1200},
+		12: {PositionID: 12, Symbol: "600000", Name: "浦发银行第二笔", Type: model.PositionTypeLongTerm, Cost: 8.8, Quantity: 600},
+		22: {PositionID: 22, Symbol: "600519", Name: "贵州茅台", Type: model.PositionTypeLongTerm, Cost: 1500, Quantity: 100},
 	}
 	in := []PositionAdvice{
-		{PositionID: 11, Symbol: "600000", Verdict: "清仓", Reason: "解禁临近且已破 MA60", Invalidation: "收复 MA60 且解禁落地无抛压"},
+		{PositionID: 11, Symbol: "600000", PositionType: "forged_type", Cost: 999, Quantity: 999, Verdict: "清仓", Reason: "解禁临近且已破 MA60", Invalidation: "收复 MA60 且解禁落地无抛压"},
 		{PositionID: 11, Symbol: "600000", Verdict: "hold", Reason: "重复 ID"}, // 重复：丢弃
 		{PositionID: 12, Symbol: "600000", Verdict: "hold", Reason: "第二笔成本不同，继续持有", Invalidation: "跌破 8 元"},
 		{PositionID: 22, Symbol: "600000", Verdict: "exit", Reason: "ID 与代码错配"}, // 丢弃
@@ -55,11 +56,46 @@ func TestFilterPositionAdvices(t *testing.T) {
 	if out[0].Verdict != PositionVerdictExit || out[0].PositionID != 11 || out[0].Name != "浦发银行" {
 		t.Fatalf("首条应归一为 exit 且服务端回填名称与持仓 id: %+v", out[0])
 	}
+	if out[0].PositionType != model.PositionTypeShortTerm || out[0].Cost != 10.5 || out[0].Quantity != 1200 {
+		t.Fatalf("模型伪造的类型/成本/数量必须被服务端快照覆盖: %+v", out[0])
+	}
 	if out[1].PositionID != 12 || out[1].Name != "浦发银行第二笔" {
 		t.Fatalf("同代码第二笔持仓不得被第一笔吞掉: %+v", out[1])
 	}
 	if out[2].Name != "贵州茅台" {
 		t.Fatalf("模型自填的名称必须被服务端值覆盖: %+v", out[2])
+	}
+	payload, err := json.Marshal(out[0])
+	if err != nil {
+		t.Fatalf("序列化建议失败: %v", err)
+	}
+	var contract map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &contract); err != nil {
+		t.Fatalf("解析建议 JSON 失败: %v", err)
+	}
+	for _, key := range []string{"position_type", "cost", "quantity"} {
+		if _, ok := contract[key]; !ok {
+			t.Fatalf("建议 JSON 缺少服务端契约字段 %q: %s", key, payload)
+		}
+	}
+}
+
+func TestPositionAdviceResultGeneratedAt(t *testing.T) {
+	res := &PositionAdviceResult{Advices: []PositionAdvice{}, Notes: []string{}}
+	stampPositionAdviceResult(res, time.Now())
+	if _, err := time.Parse(time.RFC3339, res.GeneratedAt); err != nil {
+		t.Fatalf("generated_at 必须是 RFC3339: %q (%v)", res.GeneratedAt, err)
+	}
+	payload, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("序列化建议结果失败: %v", err)
+	}
+	var contract map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &contract); err != nil {
+		t.Fatalf("解析建议结果 JSON 失败: %v", err)
+	}
+	if _, ok := contract["generated_at"]; !ok {
+		t.Fatalf("建议结果 JSON 缺少 generated_at: %s", payload)
 	}
 }
 

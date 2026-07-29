@@ -475,7 +475,9 @@ func (s *PositionService) AddTrade(userID, positionID int64, in PositionTradeInp
 			// D15 口径：**加仓重置持仓期峰值**（成本已变，加仓前的高点不再是这本账
 			// 赚到过的利润）；减仓不重置（剩余仓位的持有期是连续的）。
 			// 完整理由与反例见 model.Position.PeakPrice 注释与 resetPeakOnBuy。
-			resetPeakOnBuy(&p, in.Price, in.TradeDate, today)
+			if err := rebuildPositionPeakOnBuyTx(tx, &p, in.Price, in.TradeDate, today); err != nil {
+				return err
+			}
 		}
 		if side == model.PositionTradeSell {
 			// 卖出笔同时刷新「最近一次卖出」快照（既有字段语义：最后一笔卖出）。
@@ -505,6 +507,11 @@ func (s *PositionService) AddTrade(userID, positionID int64, in PositionTradeInp
 		}
 		if err := tx.Save(&p).Error; err != nil {
 			return err
+		}
+		if p.Status == model.PositionStatusClosed {
+			if err := finalizePositionSellSignalsTx(tx, userID, p.ID, false); err != nil {
+				return err
+			}
 		}
 		out = p
 		return nil

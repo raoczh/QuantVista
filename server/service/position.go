@@ -181,14 +181,19 @@ func (s *PositionService) List(ctx context.Context, userID int64, status string)
 
 	out := make([]PositionView, 0, len(positions))
 	now := time.Now()
+	today := now.In(time.Local).Format("2006-01-02")
 	for _, p := range positions {
 		price, ok := 0.0, false
+		dayHigh := 0.0
+		quoteTradeDate := ""
 		var fq FreshQuoteResult
 		var hasQuote bool
 		if fq, hasQuote = quotes[QuoteKey(p.Market, p.Symbol)]; hasQuote && fq.Quote != nil && fq.Quote.Price > 0 {
 			// 仅 fresh 视为「取到现价」；stale/unknown 一律 fail-closed 不参与盈亏与止损判定。
 			if fq.Fresh.Status == freshStatusFresh {
 				price, ok = fq.Quote.Price, true
+				dayHigh = fq.Quote.High
+				quoteTradeDate = effectiveQuoteTradeDate(fq, today)
 			}
 		}
 		v := computeView(p, price, ok)
@@ -245,7 +250,7 @@ func (s *PositionService) List(ctx context.Context, userID int64, status string)
 				v.AnalysisStale = true
 			}
 			// D15 持仓期最高价与回撤（price=0 时只给峰值不给回撤，fail-closed）。
-			v.Peak = peakViewFor(p, price)
+			v.Peak = peakViewFor(p, price, dayHigh, quoteTradeDate)
 		}
 		out = append(out, v)
 	}
@@ -588,6 +593,9 @@ func (s *PositionService) Create(ctx context.Context, userID int64, in PositionI
 	p.PeakPrice, p.PeakFrom = peakInitFor(in.BuyPrice, in.BuyDate, time.Now().In(time.Local).Format("2006-01-02"))
 	p.PeakDate = p.PeakFrom
 	if err := common.DB.Transaction(func(tx *gorm.DB) error {
+		if _, err := fillPositionPeakFromLocalBars(tx, p, time.Now().In(time.Local).Format("2006-01-02")); err != nil {
+			return err
+		}
 		if err := tx.Create(p).Error; err != nil {
 			return err
 		}
@@ -630,6 +638,7 @@ func (s *PositionService) Update(userID, id int64, in PositionInput) (*model.Pos
 			Order("id ASC").Find(&trades).Error; err != nil {
 			return err
 		}
+		peakBasisChanged := in.BuyPrice != p.BuyPrice || in.BuyDate != p.BuyDate
 		buyFieldsChanged := in.BuyPrice != p.BuyPrice || in.Quantity != p.Quantity ||
 			in.BuyFee != p.BuyFee || in.BuyTax != p.BuyTax || in.BuyDate != p.BuyDate
 		if len(trades) > 1 && buyFieldsChanged {
@@ -668,6 +677,12 @@ func (s *PositionService) Update(userID, id int64, in PositionInput) (*model.Pos
 			t.TradeDate = in.BuyDate
 			t.AvgCostAfter, t.QuantityAfter = in.BuyPrice, in.Quantity
 			if err := tx.Save(&t).Error; err != nil {
+				return err
+			}
+		}
+		if peakBasisChanged {
+			if err := rebuildPositionPeakOnBuyTx(tx, &p, in.BuyPrice, in.BuyDate,
+				time.Now().In(time.Local).Format("2006-01-02")); err != nil {
 				return err
 			}
 		}
@@ -737,6 +752,15 @@ func (s *PositionService) Close(userID, id int64, in CloseInput) (*model.Positio
 // 否则会留下无主流水污染复盘统计。
 func (s *PositionService) Delete(userID, id int64) error {
 	return common.DB.Transaction(func(tx *gorm.DB) error {
+		// 全部涉及卖出信号的事务统一先锁 position、再更新 signal，避免与平仓、
+		// 扫描落库或恢复 open 并发时形成反向锁序。
+		var p model.Position
+		if err := lockedPosition(tx, userID, id, &p); err != nil {
+			return errors.New("持仓不存在")
+		}
+		if err := finalizePositionSellSignalsTx(tx, userID, id, true); err != nil {
+			return err
+		}
 		res := tx.Where("id = ? AND user_id = ?", id, userID).Delete(&model.Position{})
 		if res.Error != nil {
 			return res.Error

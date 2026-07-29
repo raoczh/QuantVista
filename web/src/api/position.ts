@@ -450,12 +450,15 @@ export function setSellReviewStatus(id: number, status: SellReviewStatus) {
 export type PositionVerdict = 'hold' | 'trim' | 'exit'
 
 export interface PositionAdvice {
+  position_id: number
   symbol: string
   name?: string
+  position_type: string
+  cost: number
+  quantity: number
   verdict: PositionVerdict
   reason: string
   invalidation: string
-  position_id?: number
 }
 
 export interface PositionAdviceResult {
@@ -469,6 +472,7 @@ export interface PositionAdviceResult {
   model?: string
   trace_id?: string
   prompt_version?: string
+  generated_at: string
 }
 
 /** 发起建议（后台任务，秒回任务 id；用 getLLMTask 轮询结果）。 */
