@@ -267,16 +267,43 @@ Go API Server
 - `paper_corp_adjusts`：模拟盘**自动**折算审计，唯一键 `(user_id, corporate_action_id)`
   ——虚拟账户无真实后果故自动执行，按 action 唯一键保证重跑不重复发钱。
 
-**除权除息折算公式（B8，改动前先读）**：
+**持仓卖出决策相关（D14~D17 新增）**：
+
+- `positions` 新增四列 `peak_price / peak_date / peak_from / peak_backfilled`
+  ——**持仓期最高价**（D15 移动止盈的地基）。口径全文见 `model.Position.PeakPrice` 注释，
+  三条不可回退：①**加仓重置**峰值为加仓价与加仓日（成本已变，加仓前的高点不再是这本账
+  赚到过的利润；不重置会让回调加仓当场误报大幅回撤）；②**减仓不重置**（剩余仓位持有期连续）；
+  ③**除权除息按价格侧公式同步折算**（见下），撤销时按落库原值还原。
+  `peak_backfilled=true` 表示由本地日线（**前复权口径**）回填而非逐日累积——偏差方向偏低
+  （偏保守少触发），UI 与 AI 快照必须标注，不得当作精确账面历史最高价。
+  更新时点：交易日 16:25 job 读当日 `daily_bars` 的 High **只抬不降**（零上游请求）；
+  盘中评估用 `max(落库峰值, 当日 fresh 行情 High)` 参与判定但**不落库**。
+- `position_corp_adjusts` 新增 `peak_before / peak_after` 两列：折算前后的峰值。
+  **撤销按 `peak_before` 原值还原而非反算公式**——反算留舍入漂移，破坏「撤销后与折算前
+  逐字节一致」这条不变式。`peak_before=0` 表示折算时尚无峰值记录，撤销时不动峰值。
+- `sell_reviews`：D16 卖出复核待办。`user_id / position_id / symbol / market / name /
+  trigger / trade_date / severity / title / detail / buy_price / quantity / price /
+  profit_pct / quote_ok / status / resolved_at`，唯一键 `(user_id, position_id, trigger, trade_date)`。
+  与另两张表的边界：`guard_events` 是**推送去重台账**（无状态机、不进页面）、
+  `alert_events` 是**用户手配规则的命中明细**、`sell_reviews` 是**系统自动发现的持仓利空**
+  （用户无需配置任何规则）。**去重维度按 position 而非 symbol**——同一个利空对不同成本的
+  两笔仓位含义完全不同。幂等靠 `OnConflict{DoNothing}`：已 resolved/dismissed 的行绝不能被
+  下轮扫描拉回 open（同 B8 先例）。`detail` 必须回答「这件事对**我这笔持仓**意味着什么」
+  （含我的成本与浮盈亏）；`quote_ok=false` 时 `price/profit_pct` 恒 0 且 detail 如实声明
+  行情不可用——绝不用旧价冒充。
+
+**除权除息折算公式（B8，改动前先读；D15 起含峰值）**：
 
 ```
 新数量 = 原数量 × (1 + (送股 + 转增) / 10)
 新成本 = (原成本 × 原数量 − 每10股派息 × 原数量 / 10) / 新数量
+新峰值 = (原峰值 − 每10股派息 / 10) / (1 + (送股 + 转增) / 10)     ← 与成本式消去数量即得
 ```
 
 现金分红计入 `realized_pnl`（真金到账，与卖出兑现同属「已实现」）；
 `total_buy_cost / total_buy_qty` **保持不变**——送转不是「又买了一次」，改动它们会让
 「一共投入多少 / 已平仓收益率」全部失真。
+**峰值必须与成本按同一比例移动**，否则 10 转 10 的除权当天会凭空出现 50% 的假回撤。
 
 接口示例：
 
@@ -290,6 +317,10 @@ Go API Server
 - `GET /api/positions/curve?days=` / `GET /api/paper/curve?days=`（B7 资产曲线，读盘后快照）
 - `GET /api/positions/corp-adjusts?status=` / `POST /api/positions/corp-adjusts/:id/:action`
   （B8 除权除息待确认折算；action = confirm | revert | dismiss）
+- `GET /api/positions/sell-reviews?status=` / `PUT /api/positions/sell-reviews/:id/status`
+  （D16 卖出复核清单与状态机；status = open | resolved | dismissed）
+- `POST /api/positions/advice`（D17 AI 逐笔卖出建议，**走 llm_tasks 后台任务秒回任务 id**，
+  前端 `GET /api/llm-tasks/:id` 轮询；限流 15/min）
 - `GET /api/events/calendar?days=`（B9 未来 N 天事件日历：持仓/自选的解禁·除权·财报 + 全市场打新）
 - `GET /api/markets/:market/stocks/:symbol/corp-events`（B9 个股解禁 / 分红，公开信息无用户隔离）
 - `DELETE /api/positions/:id`（级联删流水）
@@ -369,12 +400,34 @@ Go API Server
 - `GET /api/export/:kind`（kind=positions|watchlist|recommendations|analyses，CSV 带 BOM，限流 10/min）
 - `GET /api/admin/datasources`（数据源健康滑窗状态，S1；`data_source_configs` 死表已删，数据源无用户级配置）
 
-### 5.8.1 条件提醒与命中事件（阶段 7 + 批次 H）
+### 5.8.1 条件提醒与命中事件（阶段 7 + 批次 H；D14/D15 起含持仓类）
 
 - `GET/POST /api/alerts`，`PUT/DELETE /api/alerts/:id`，`PUT /api/alerts/:id/status`（暂停/恢复），`POST /api/alerts/evaluate`（手动评估，限流 20/min）
 - 提醒类型 kind：price（到价）/ pct_change（异动）/ ma（均线）/ breakout（突破）/ **volume_surge**（当日量≥N 倍 20 日均量）/ **amplitude**（当日振幅，优先腾讯估值源、缺则 (high-low)/prev_close 回退）/ **earn_date**（财报披露临近 ≤N 日，F1）/ **earn_fcst**（新业绩预告发布，F1）——财报两类不走盘中 15min 评估，由 finance job 每日一评
+- **持仓卖出决策类（D14/D15）**：`cost_gain`（现价相对我的成本涨 ≥N%）/ `cost_drawdown`（跌 ≥N%）/ `peak_drawdown`（自持仓期最高价回撤 ≥N%）。三条与上面各类的结构性差异（改代码前必读）：
+  - **评估单元是「一笔持仓」不是「一个 symbol」**：`symbol` 可为空 = 绑定「我的全部持仓」，评估时按当前 holding 逐仓展开（同一标的多笔仓位各自判定各自的成本）；走 `evaluatePositionRules` 独立编排，不能混进按 `rule.Symbol` 拉行情的 `evaluateRules`（空代码会拉挂）。
+  - **成本恒取 `positions.buy_price`**（B5 口径铁律），用户无需手工填任何价位——这正是旧「持仓止损」待办形同虚设的原因（必须先填 `plan_stop_loss`）。
+  - `op` 无方向语义统一存 gte；**`Once` 强制 false**（一条规则覆盖多笔持仓，命中一笔就暂停整条会让其余持仓失联）；threshold 一律正数百分比。
+  - fail-closed：无 fresh 行情的持仓本轮跳过；盘中用当日 high 抬升峰值参与判定但**不落库**（落库交给 16:25 盘后那一次）。
 - 命中明细状态机（`alert_events`，unread/read/dismissed）：`GET /api/alerts/events?status=&limit=`，`PUT /api/alerts/events/:id/status`，`PUT /api/alerts/events/read-all`
-- 今日待办（`GET /api/todos`）的提醒条目即 unread 事件，`ref_id` 为事件 id，可就地标记已读/忽略「完成待办」
+- **事件去重键 `(rule_id, symbol, trade_date)`（D14 起下沉）**：绑「全部持仓」的规则同一天会对多只标的各自命中，旧的「按规则行 `triggered_at` 是否为今天」判重会把它们压成一条。`alert_events` 因此新增 `trade_date`（旧行空串，历史不追溯）与 `position_id`（持仓类命中的那一笔，其余恒 0）。
+- 今日待办（`GET /api/todos?scope=`）的提醒条目即 unread 事件，`ref_id` 为事件 id，可就地标记已读/忽略「完成待办」
+
+### 5.8.2 今日待办范围（D18）
+
+`GET /api/todos?scope=ledger|research|market|all`，**默认 ledger**。
+
+用户反馈「现在提醒的是没什么用的」，噪音主体是推荐复盘（AI 推过就追踪、没买也天天提示）。
+范围只是**消费出口过滤器**，全量数据照常生成，一条不删：
+
+| scope | 含哪些 | 消费方 |
+| --- | --- | --- |
+| `ledger` | 卖出复核 / 持仓止损 / 持仓复盘 / 除权折算 / **持仓标的**的提醒与逻辑卡 | 今日待办默认视图、AppShell 徽标、首页待办卡 |
+| `research` | 推荐复盘 / **非持仓标的**的提醒与逻辑卡 | 推荐追踪页「待复盘提示」卡 |
+| `market` | 打新（与我买没买无关） | Today 页事件日历卡照常列出 |
+
+**计数按过滤后算**（所见即所计）——否则徽标 12 条、点进去 3 条会让用户以为丢了东西；
+`scope_counts` 另外给出各范围全量条数供「另有 N 条在别处」提示，`filtered` 为被过滤条数。
 
 ### 5.9 Job Service
 
@@ -385,6 +438,13 @@ Go API Server
 - 更新推荐追踪状态。
 - 清理过期缓存。
 - 生成每日市场摘要，后续可选。
+
+**盘后 job 顺序（错峰铁律，改时点前先读）**：16:10 全市场日线 → 16:20 资产快照 →
+**16:25 持仓期峰值更新**（读当日 `daily_bars`，零上游）→ 16:35 涨停池+人气 →
+17:05 盘中因子 → 18:45 龙虎榜 → 19:05 财报+公告 → 19:25 公司行动与打新 →
+19:35 盘后守护轮 → **19:40 卖出复核轮**。
+后两者顺序不可交换：两轮消费同一批本地数据，守护轮先落 `guard_events` 台账，
+复核轮的 `pos_ma_break` / `pos_lhb_sell` 推送才不会与它交叉。
 
 ### 5.10 扩展模块（N/F/T/S/M/P3 批次 + 2026-07 杂项批）
 

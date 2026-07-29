@@ -30,6 +30,9 @@ type alertMarketProvider interface {
 	GetDailyBars(context.Context, string, string, int) ([]datasource.Bar, error)
 	GetValuation(context.Context, string, string) (*datasource.Valuation, error)
 	QuoteFreshnessOf(string, time.Time) quoteFreshInfo
+	// FreshQuotesFor 批量新鲜行情（D14/D15 持仓类规则用：一个用户一次拉完全部持仓，
+	// 绝不逐仓调 GetFreshQuote——持仓数可达几十，逐只调会把上游打满）。
+	FreshQuotesFor(context.Context, []QuoteRef) map[string]FreshQuoteResult
 }
 
 type alertNotifier interface {
@@ -50,22 +53,40 @@ const (
 )
 
 var validAlertKind = map[string]bool{
-	model.AlertKindPrice:       true,
-	model.AlertKindPctChange:   true,
-	model.AlertKindMA:          true,
-	model.AlertKindBreakout:    true,
-	model.AlertKindVolumeSurge: true,
-	model.AlertKindAmplitude:   true,
-	model.AlertKindEarnDate:    true,
-	model.AlertKindEarnFcst:    true,
+	model.AlertKindPrice:        true,
+	model.AlertKindPctChange:    true,
+	model.AlertKindMA:           true,
+	model.AlertKindBreakout:     true,
+	model.AlertKindVolumeSurge:  true,
+	model.AlertKindAmplitude:    true,
+	model.AlertKindEarnDate:     true,
+	model.AlertKindEarnFcst:     true,
+	model.AlertKindCostGain:     true,
+	model.AlertKindCostDrawdown: true,
+	model.AlertKindPeakDrawdown: true,
 }
 
 // earnAlertKinds 财报日历类 kind：盘中高频行情评估显式排除（否则会被拉去每
 // symbol 拉行情空转），由财报刷新 job 每日一评 + 手动「立即检查」时顺带评估（查本地表零上游成本）。
 var earnAlertKinds = []string{model.AlertKindEarnDate, model.AlertKindEarnFcst}
 
+// positionAlertKinds 持仓卖出决策类 kind（D14/D15）：**评估单元是「一笔持仓」而非
+// 「一个 symbol」**——规则可不绑 symbol（= 我的全部持仓），成本取 positions.buy_price。
+// 盘中轮照评（它们要盯的就是盘中价），但走 evaluatePositionRules 这条独立编排，
+// 不能混进按 rule.Symbol 拉行情的 evaluateRules（symbol 为空会拉挂）。
+var positionAlertKinds = []string{model.AlertKindCostGain, model.AlertKindCostDrawdown, model.AlertKindPeakDrawdown}
+
+// nonPositionMarketKinds 走 evaluateRules 的行情类 kind（= 全部 kind − 财报类 − 持仓类）。
+var nonPositionMarketKinds = append(append([]string{}, earnAlertKinds...), positionAlertKinds...)
+
 func isEarnAlertKind(kind string) bool {
 	return kind == model.AlertKindEarnDate || kind == model.AlertKindEarnFcst
+}
+
+// isPositionAlertKind 是否为持仓卖出决策类（成本/峰值口径，可绑全部持仓）。
+func isPositionAlertKind(kind string) bool {
+	return kind == model.AlertKindCostGain || kind == model.AlertKindCostDrawdown ||
+		kind == model.AlertKindPeakDrawdown
 }
 
 // alertKindNeedsBars 该类型评估是否需要日线序列。
@@ -288,6 +309,13 @@ func (s *AlertService) validate(in *AlertInput) error {
 	if isEarnAlertKind(in.Kind) {
 		in.Op = model.AlertOpGTE // 财报类无比较方向语义，统一存 gte（前端可不传）
 	}
+	if isPositionAlertKind(in.Kind) {
+		// 持仓类各 kind 自带方向（涨够/跌够/回撤够），op 无语义统一存 gte；
+		// **Once 强制 false**——一条规则覆盖多笔持仓，命中一笔就暂停整条规则
+		// 会让其余持仓从此失联（这类规则的价值恰恰在于长期常驻）。
+		in.Op = model.AlertOpGTE
+		in.Once = false
+	}
 	if in.Op != model.AlertOpGTE && in.Op != model.AlertOpLTE {
 		return errors.New("比较方向须为 gte 或 lte")
 	}
@@ -315,18 +343,41 @@ func (s *AlertService) validate(in *AlertInput) error {
 		in.Threshold = float64(int(in.Threshold))
 	case model.AlertKindEarnFcst:
 		in.Threshold = 0
+	case model.AlertKindCostGain:
+		// 相对成本的涨幅可以很大（翻倍股），上限放到 1000%。
+		if in.Threshold <= 0 || in.Threshold > 1000 {
+			return errors.New("相对成本涨幅须在 0~1000 之间（%）")
+		}
+	case model.AlertKindCostDrawdown, model.AlertKindPeakDrawdown:
+		// 跌幅/回撤是正数百分比，最大不超过 100%（跌没了）。
+		if in.Threshold <= 0 || in.Threshold >= 100 {
+			return errors.New("跌幅/回撤须在 0~100 之间（%）")
+		}
 	}
 	return nil
 }
 
+// positionAlertAllName 未绑定 symbol 的持仓类规则的展示名。
+const positionAlertAllName = "我的全部持仓"
+
 // Create 新建提醒规则（校验代码 + 取名）。
+// **持仓卖出决策类允许 symbol 为空**（= 我的全部持仓），此时不校验代码、不拉行情取名。
 func (s *AlertService) Create(ctx context.Context, userID int64, in AlertInput) (*model.AlertRule, error) {
-	symbol, market, err := normalizeSymbolMarket(in.Symbol, in.Market)
-	if err != nil {
-		return nil, err
-	}
 	if err := s.validate(&in); err != nil {
 		return nil, err
+	}
+	allPositions := isPositionAlertKind(in.Kind) && strings.TrimSpace(in.Symbol) == ""
+	symbol, market := "", strings.TrimSpace(in.Market)
+	if allPositions {
+		if market == "" {
+			market = "cn" // 持仓类只覆盖 A 股（与 guard/事件日历同口径）
+		}
+	} else {
+		var err error
+		symbol, market, err = normalizeSymbolMarket(in.Symbol, in.Market)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var cnt int64
 	common.DB.Model(&model.AlertRule{}).Where("user_id = ?", userID).Count(&cnt)
@@ -334,7 +385,9 @@ func (s *AlertService) Create(ctx context.Context, userID int64, in AlertInput) 
 		return nil, fmt.Errorf("提醒规则数量已达上限（%d）", maxAlertsPerUser)
 	}
 	name := strings.TrimSpace(in.Name)
-	if q, e := s.market.GetQuote(ctx, market, symbol); e == nil && q.Name != "" {
+	if allPositions {
+		name = positionAlertAllName
+	} else if q, e := s.market.GetQuote(ctx, market, symbol); e == nil && q.Name != "" {
 		name = q.Name
 	} else if errors.Is(e, datasource.ErrSymbolInvalid) {
 		return nil, errors.New("无法识别的股票代码")
@@ -401,6 +454,11 @@ func (s *AlertService) Update(ctx context.Context, userID, id int64, in AlertInp
 	}
 	if err := s.validate(&in); err != nil {
 		return nil, err
+	}
+	// 未绑定 symbol 的规则（持仓类的「我的全部持仓」）不能被改成需要 symbol 的类型——
+	// 那样评估时会拿空代码去拉行情，规则永久空转。改类型请新建一条。
+	if rule.Symbol == "" && !isPositionAlertKind(in.Kind) {
+		return nil, errors.New("「我的全部持仓」规则只能在持仓类提醒之间切换，改成其它类型请新建一条")
 	}
 	rule.Kind = in.Kind
 	rule.Op = in.Op
@@ -650,7 +708,8 @@ func persistAlertEvaluation(ctx context.Context, rule model.AlertRule, value flo
 				ev := model.AlertEvent{
 					RuleID: current.ID, UserID: current.UserID,
 					Symbol: current.Symbol, Market: current.Market, Name: current.Name, Kind: current.Kind,
-					Message: truncateRunes(msg, 256), TriggeredAt: now, Status: model.AlertEventUnread,
+					Message: truncateRunes(msg, 256), TradeDate: today,
+					TriggeredAt: now, Status: model.AlertEventUnread,
 				}
 				if err := tx.Create(&ev).Error; err != nil {
 					return err
@@ -756,10 +815,22 @@ func (s *AlertService) tryEvaluateUserMarket(ctx context.Context, userID int64) 
 func (s *AlertService) evaluateUserMarketUnlocked(ctx context.Context, userID int64) (int, error) {
 	var rules []model.AlertRule
 	if err := common.DB.WithContext(ctx).Where("user_id = ? AND status = ? AND kind NOT IN ?",
-		userID, model.AlertStatusActive, earnAlertKinds).Order("id ASC").Find(&rules).Error; err != nil {
+		userID, model.AlertStatusActive, nonPositionMarketKinds).Order("id ASC").Find(&rules).Error; err != nil {
 		return 0, err
 	}
-	return s.evaluateRules(ctx, rules)
+	hits, err := s.evaluateRules(ctx, rules)
+	if err != nil {
+		return hits, err
+	}
+	// 持仓卖出决策类走独立编排（评估单元是持仓，不是 symbol）。
+	var posRules []model.AlertRule
+	if err := common.DB.WithContext(ctx).Where("user_id = ? AND status = ? AND kind IN ?",
+		userID, model.AlertStatusActive, positionAlertKinds).Order("id ASC").Find(&posRules).Error; err != nil {
+		return hits, err
+	}
+	posHits, err := s.evaluatePositionRules(ctx, userID, posRules)
+	hits += posHits
+	return hits, err
 }
 
 // evaluateRules 评估一批规则，按 symbol 缓存行情/日线/估值，避免重复请求。

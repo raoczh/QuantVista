@@ -16,6 +16,10 @@ const (
 	GuardKindPosLift     = "pos_lift"      // 持仓限售解禁临近（盘后，提前 10 天；B9）
 	GuardKindPosExDiv    = "pos_ex_div"    // 持仓除权除息日临近（盘后，提前 3 天；B9）
 	GuardKindIpoToday    = "ipo_today"     // 今日可申购新股/可转债（盘后，**不依赖持仓**；B9）
+	// D16 卖出复核新增的两类推送：解禁/除权/业绩预告已由上面几类覆盖，
+	// 这两类是既有守护没有的（跌破均线是趋势信号、龙虎榜既有 pos_lhb 不分买卖方向）。
+	GuardKindPosMaBreak = "pos_ma_break" // 持仓跌破关键均线（盘后，MA20/MA60）
+	GuardKindPosLhbSell = "pos_lhb_sell" // 持仓登龙虎榜且席位净卖出（盘后，游资出货）
 )
 
 // GuardEvent 自选/持仓异动守护推送的去重台账（阶段 D）。

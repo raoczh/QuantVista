@@ -44,7 +44,15 @@ import {
   listCorpAdjusts,
   actCorpAdjust,
   type PositionCorpAdjust,
+  listSellReviews,
+  setSellReviewStatus,
+  type SellReview,
+  requestPositionAdvice,
+  type PositionAdviceResult,
+  POSITION_VERDICT_LABEL,
 } from '@/api/position'
+import { getLLMTask } from '@/api/llmTask'
+import { pollUntil } from '@/lib/poll'
 import { isAbortError } from '@/api/client'
 import { importPositions, downloadPositionTemplate, type ImportResult } from '@/api/export'
 import { useUi, withAlpha } from '@/composables/useUi'
@@ -677,6 +685,87 @@ function adjustPlanText(a: PositionCorpAdjust) {
   return parts.length ? `每 10 股 ${parts.join(' ')}` : '—'
 }
 
+// ---------- D16 卖出复核 ----------
+// 持仓命中解禁 / 业绩变脸 / 跌破关键均线 / 龙虎榜出货 / 除权除息时自动生成，
+// 无需用户配置任何规则；detail 已由后端拼上「这件事对我这笔持仓的影响」。
+const sellReviews = ref<SellReview[]>([])
+const sellReviewLoading = ref(false)
+const sellReviewError = ref('')
+const sellReviewActing = ref<number | null>(null)
+let sellReviewAbort: AbortController | null = null
+
+async function loadSellReviews() {
+  sellReviewAbort?.abort()
+  const ctrl = new AbortController()
+  sellReviewAbort = ctrl
+  sellReviewLoading.value = true
+  sellReviewError.value = ''
+  try {
+    sellReviews.value = await listSellReviews('open', ctrl.signal)
+  } catch (e) {
+    if (isAbortError(e)) return
+    sellReviewError.value = (e as Error).message
+  } finally {
+    if (sellReviewAbort === ctrl) sellReviewLoading.value = false
+  }
+}
+
+async function doSellReview(row: SellReview, status: 'resolved' | 'dismissed') {
+  if (sellReviewActing.value) return
+  sellReviewActing.value = row.id
+  try {
+    await setSellReviewStatus(row.id, status)
+    message.success(status === 'resolved' ? '已标记复核完成' : '已忽略')
+    await loadSellReviews()
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    sellReviewActing.value = null
+  }
+}
+
+const severityType = (s: string) => (s === 'high' ? 'error' : s === 'med' ? 'warning' : 'default')
+const severityLabel = (s: string) => (s === 'high' ? '高' : s === 'med' ? '中' : '低')
+const triggerLabel = (t: string) =>
+  ({ lift: '限售解禁', earn_fcst: '业绩变脸', ma_break: '跌破均线', lhb_sell: '龙虎榜出货', ex_div: '除权除息' })[t] ||
+  '利空事件'
+
+// ---------- D17 AI 持有 / 减仓 / 清仓建议 ----------
+// 走 llm_tasks 后台任务：HTTP 秒回任务 id，前端轮询；浏览器断开不取消模型调用。
+const advice = ref<PositionAdviceResult | null>(null)
+const adviceLoading = ref(false)
+const adviceError = ref('')
+let adviceAbort: AbortController | null = null
+
+async function runAdvice() {
+  if (adviceLoading.value) return
+  adviceAbort?.abort()
+  const ctrl = new AbortController()
+  adviceAbort = ctrl
+  adviceLoading.value = true
+  adviceError.value = ''
+  try {
+    const task = await requestPositionAdvice()
+    const final = await pollUntil(
+      () => getLLMTask<PositionAdviceResult>(task.id),
+      (t) => t.status !== 'processing',
+      { signal: ctrl.signal },
+    )
+    if (final.status !== 'success' || !final.result) {
+      throw new Error(final.error || 'AI 建议生成失败')
+    }
+    advice.value = final.result
+  } catch (e) {
+    if (isAbortError(e) || (e as Error).name === 'PollCancelled') return
+    adviceError.value = (e as Error).message
+  } finally {
+    if (adviceAbort === ctrl) adviceLoading.value = false
+  }
+}
+
+const verdictLabel = (v: string) => POSITION_VERDICT_LABEL[v as keyof typeof POSITION_VERDICT_LABEL] || v
+const verdictType = (v: string) => (v === 'exit' ? 'error' : v === 'trim' ? 'warning' : 'success')
+
 async function loadCurve() {
   curveAbort?.abort()
   const myAbort = new AbortController()
@@ -780,12 +869,17 @@ onMounted(async () => {
   await load()
   loadCurve()
   loadCorpAdjusts()
+  loadSellReviews()
   window.addEventListener('resize', onResize)
 })
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
   corpAdjustAbort?.abort()
   corpAdjustAbort = null
+  sellReviewAbort?.abort()
+  sellReviewAbort = null
+  adviceAbort?.abort()
+  adviceAbort = null
   curveSeq++
   curveAbort?.abort()
   curveAbort = null
@@ -896,6 +990,81 @@ onBeforeUnmount(() => {
             </template>
           </SectionCard>
 
+          <!-- D16 卖出复核：持仓命中利空事件时自动生成，无需配置任何规则。
+               每条 detail 都回答「这件事对**我这笔持仓**意味着什么」（带我的成本与浮盈亏）。 -->
+          <SectionCard v-if="sellReviews.length || sellReviewError" title="卖出复核">
+            <template #extra>
+              <n-button size="tiny" quaternary :loading="sellReviewLoading" @click="loadSellReviews">刷新</n-button>
+            </template>
+            <n-alert v-if="sellReviewError" type="error" :bordered="false" title="卖出复核读取失败">
+              {{ sellReviewError }}
+            </n-alert>
+            <div v-else class="review-list">
+              <div v-for="r in sellReviews" :key="r.id" class="review-row">
+                <div class="review-main">
+                  <div class="review-head">
+                    <n-tag size="tiny" round :bordered="false" :type="severityType(r.severity)">{{
+                      severityLabel(r.severity)
+                    }}</n-tag>
+                    <n-tag size="tiny" round :bordered="false">{{ triggerLabel(r.trigger) }}</n-tag>
+                    <span class="review-name">{{ r.name || r.symbol }}</span>
+                    <span class="review-symbol qv-mono">{{ r.symbol }}</span>
+                    <span class="review-date">{{ r.trade_date }}</span>
+                  </div>
+                  <div class="review-detail">{{ r.detail }}</div>
+                </div>
+                <div class="review-actions">
+                  <n-button size="small" :loading="sellReviewActing === r.id" @click="doSellReview(r, 'resolved')"
+                    >已复核</n-button
+                  >
+                  <n-button size="small" quaternary @click="doSellReview(r, 'dismissed')">忽略</n-button>
+                </div>
+              </div>
+            </div>
+          </SectionCard>
+
+          <!-- D17 AI 卖出建议：逐笔持仓的 hold/trim/exit 封闭结论。
+               无当前有效行情的仓位不参与（不基于旧价出割/守/补结论）。 -->
+          <SectionCard title="AI 卖出建议">
+            <template #extra>
+              <n-button size="tiny" type="primary" ghost :loading="adviceLoading" @click="runAdvice">
+                {{ advice ? '重新生成' : '生成建议' }}
+              </n-button>
+            </template>
+            <n-alert v-if="adviceError" type="error" :bordered="false" title="AI 建议生成失败">
+              {{ adviceError }}
+            </n-alert>
+            <div v-else-if="!advice" class="advice-empty">
+              针对<b>每一笔持仓</b>给出「继续持有 / 减仓 / 清仓」的结论、理由与失效条件。
+              成本、浮动盈亏、持有交易日、自最高点回撤等数值由服务端算好后喂给模型，模型只做判断不做算术；
+              无当前有效行情的持仓不参与（不基于旧价给出割/守/补结论）。
+            </div>
+            <div v-else class="advice-box">
+              <div v-for="(n, i) in advice.notes || []" :key="i" class="advice-note">{{ n }}</div>
+              <div class="advice-list">
+                <div v-for="a in advice.advices" :key="a.symbol" class="advice-row">
+                  <div class="advice-head">
+                    <n-tag size="small" round :bordered="false" :type="verdictType(a.verdict)">{{
+                      verdictLabel(a.verdict)
+                    }}</n-tag>
+                    <span class="advice-name">{{ a.name || a.symbol }}</span>
+                    <span class="advice-symbol qv-mono">{{ a.symbol }}</span>
+                  </div>
+                  <div class="advice-reason">{{ a.reason }}</div>
+                  <div v-if="a.invalidation" class="advice-invalid">失效条件：{{ a.invalidation }}</div>
+                </div>
+              </div>
+              <div class="advice-foot">
+                本次分析 {{ advice.analyzed }} 笔<span v-if="advice.skipped > 0">，跳过 {{ advice.skipped }} 笔</span>
+                <span v-if="advice.evidence_check">
+                  · 证据核验 {{ advice.evidence_check.matched }}/{{ advice.evidence_check.total }} 项与数据一致</span
+                >
+                <span v-if="advice.model"> · {{ advice.model }}</span>
+                。研究参考，不构成投资建议。
+              </div>
+            </div>
+          </SectionCard>
+
           <!-- B7 资产曲线：读每交易日 16:20 落库的快照，不做插值补造 -->
           <SectionCard title="资产曲线">
             <template #extra>
@@ -986,6 +1155,21 @@ onBeforeUnmount(() => {
                       </div>
                       <div v-if="p.short_term_review" class="r-hint" :style="{ color: warnColor }">
                         ⚠ 短线已持有 {{ p.held_trade_days }} 交易日，建议复盘是否止盈/止损或转长线
+                      </div>
+                      <!-- D15 持仓期最高价与回撤：回答「我赚过多少、现在回吐了多少」。
+                           峰值自建仓起算（买入日之前的高点不算），加仓后按新成本重新起算。 -->
+                      <div v-if="p.status === 'holding' && p.peak" class="r-peak">
+                        持仓期最高 <span class="qv-tnum">{{ fmt(p.peak.price) }}</span>
+                        <span v-if="p.peak.date">（{{ p.peak.date }}）</span>
+                        <template v-if="p.quote_ok && p.peak.drawdown_pct > 0">
+                          · 已回撤
+                          <span class="qv-tnum" :style="{ color: pctColor(-p.peak.drawdown_pct) }"
+                            >{{ p.peak.drawdown_pct.toFixed(2) }}%</span
+                          >
+                        </template>
+                        <span v-else-if="!p.quote_ok"> · 回撤未知（无当前有效行情）</span>
+                        <span v-if="p.peak.from"> · 自 {{ p.peak.from }} 起算</span>
+                        <span v-if="p.peak.backfilled" class="r-peak-note" :title="p.peak.note">（含日线回填）</span>
                       </div>
                       <div v-if="p.status === 'closed' && p.review_note" class="r-review">
                         复盘：{{ p.review_note }}
@@ -1969,6 +2153,133 @@ onBeforeUnmount(() => {
     row-gap: 6px;
   }
   .adjust-actions {
+    flex-basis: 100%;
+    justify-content: flex-end;
+  }
+}
+
+/* D15 持仓期最高价与回撤 */
+.r-peak {
+  font-size: 12px;
+  opacity: 0.72;
+  margin-top: 3px;
+}
+.r-peak-note {
+  opacity: 0.7;
+  cursor: help;
+}
+
+/* D16 卖出复核 */
+.review-list {
+  display: flex;
+  flex-direction: column;
+}
+.review-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+}
+.review-row + .review-row {
+  border-top: 1px solid var(--qv-divider);
+}
+.review-main {
+  flex: 1;
+  min-width: 0;
+}
+.review-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.review-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+.review-symbol {
+  font-size: 12px;
+  opacity: 0.5;
+}
+.review-date {
+  font-size: 12px;
+  opacity: 0.5;
+}
+.review-detail {
+  font-size: 13px;
+  opacity: 0.8;
+  margin-top: 4px;
+  line-height: 1.6;
+}
+.review-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* D17 AI 卖出建议 */
+.advice-empty {
+  font-size: 13px;
+  opacity: 0.7;
+  line-height: 1.7;
+}
+.advice-box {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.advice-note {
+  font-size: 12px;
+  opacity: 0.65;
+}
+.advice-list {
+  display: flex;
+  flex-direction: column;
+}
+.advice-row {
+  padding: 10px 0;
+}
+.advice-row + .advice-row {
+  border-top: 1px solid var(--qv-divider);
+}
+.advice-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.advice-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+.advice-symbol {
+  font-size: 12px;
+  opacity: 0.5;
+}
+.advice-reason {
+  font-size: 13px;
+  opacity: 0.85;
+  margin-top: 5px;
+  line-height: 1.7;
+}
+.advice-invalid {
+  font-size: 12px;
+  opacity: 0.65;
+  margin-top: 4px;
+}
+.advice-foot {
+  font-size: 11px;
+  opacity: 0.55;
+  border-top: 1px solid var(--qv-divider);
+  padding-top: 8px;
+}
+@media (max-width: 768px) {
+  .review-row {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+  .review-actions {
     flex-basis: 100%;
     justify-content: flex-end;
   }

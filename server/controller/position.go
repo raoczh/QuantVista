@@ -230,6 +230,66 @@ func Calendar(c *gin.Context) {
 	common.ApiSuccess(c, out)
 }
 
+// SellReviews GET /api/positions/sell-reviews?status= —— 卖出复核清单（D16）。
+// status 默认 open；all / resolved / dismissed 可查历史。
+func SellReviews(c *gin.Context) {
+	rows, err := service.ListSellReviews(currentUserID(c), strings.ToLower(strings.TrimSpace(c.Query("status"))))
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, rows)
+}
+
+// SellReviewAction PUT /api/positions/sell-reviews/:id/status —— 标记已复核 / 忽略 / 恢复（D16）。
+func SellReviewAction(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	var body struct {
+		Status string `json:"status"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		common.ApiErrorMsg(c, "请求格式错误")
+		return
+	}
+	out, err := service.SetSellReviewStatus(currentUserID(c), id, strings.ToLower(strings.TrimSpace(body.Status)))
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, out)
+}
+
+// PositionAdviceController 持仓卖出决策 AI 建议（D17，走 llm_tasks 后台任务）。
+type PositionAdviceController struct {
+	svc *service.PositionAdviceService
+}
+
+func NewPositionAdviceController(svc *service.PositionAdviceService) *PositionAdviceController {
+	return &PositionAdviceController{svc: svc}
+}
+
+// Advise POST /api/positions/advice —— 建后台任务，秒回任务 id 供前端轮询。
+// 结果结构见 service.PositionAdviceResult（逐笔 hold|trim|exit + 理由 + 失效条件）。
+func (ac *PositionAdviceController) Advise(c *gin.Context) {
+	var req service.PositionAdviceRequest
+	// 允许空请求体（不带任何参数 = 分析全部持仓、用默认 LLM 配置）。
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			common.ApiErrorMsg(c, "请求格式错误")
+			return
+		}
+	}
+	task, err := ac.svc.AdviseAsync(currentUserID(c), currentRole(c) == model.RoleAdmin, req)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, task)
+}
+
 // StockCorpEvents GET /api/markets/:market/stocks/:symbol/corp-events —— 个股解禁 / 分红（B9）。
 // 公开市场信息，无用户隔离（与 lhb/orgview 同层）。
 func StockCorpEvents(c *gin.Context) {

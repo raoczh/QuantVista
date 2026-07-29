@@ -52,6 +52,20 @@ func (f *fakeAlertMarket) QuoteFreshnessOf(string, time.Time) quoteFreshInfo {
 	return quoteFreshInfo{Status: freshStatusFresh}
 }
 
+// FreshQuotesFor 默认实现：逐只走 GetFreshQuote（测试规模小，无需并发）。
+// 真实 MarketService 是并发批量版本，两者语义一致：仅取到的标的进 map。
+func (f *fakeAlertMarket) FreshQuotesFor(ctx context.Context, refs []QuoteRef) map[string]FreshQuoteResult {
+	out := make(map[string]FreshQuoteResult, len(refs))
+	for _, ref := range refs {
+		q, fi, err := f.GetFreshQuote(ctx, ref.Market, ref.Symbol)
+		if err != nil || q == nil {
+			continue
+		}
+		out[QuoteKey(ref.Market, ref.Symbol)] = FreshQuoteResult{Quote: q, Fresh: fi}
+	}
+	return out
+}
+
 type recordingAlertNotifier struct {
 	userID      int64
 	calls       atomic.Int32

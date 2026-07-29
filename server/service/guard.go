@@ -285,6 +285,8 @@ func guardTitle(kind string) string {
 		return "QuantVista 持仓除权除息"
 	case model.GuardKindIpoToday:
 		return "QuantVista 打新提醒"
+	case model.GuardKindPosMaBreak, model.GuardKindPosLhbSell:
+		return "QuantVista 卖出复核"
 	}
 	return "QuantVista 守护提醒"
 }

@@ -81,6 +81,7 @@ func AllModels() []any {
 		&IpoSubscription{},
 		&PositionCorpAdjust{},
 		&PaperCorpAdjust{},
+		&SellReview{},
 	}
 }
 

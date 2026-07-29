@@ -314,6 +314,33 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		KnownAnswers:     []string{"TestParseReleaseAudit", "TestLLMExperimentAuditGate"},
 		EdgeCases:        []string{"TestLLMExperimentRollback"},
 	},
+	"position_advice": {
+		RoleID: "position_advice", Name: "持仓风控顾问（position_advisor）",
+		Version: positionAdvicePromptVersion, SchemaVersion: "position_advice.v1",
+		Purpose: "D17 逐笔持仓的卖出决策：对用户**已经买入**的每一笔仓位给出封闭枚举 hold|trim|exit + 理由 + 失效条件。与持仓模块 AI 分析的边界——那个是整个组合的一段自由文本，这个是逐笔可执行的处置结论",
+		Market:  "A 股（cn）", Horizons: "无固定持有期——回答的是「这一笔现在怎么处理」",
+		Trigger: "用户在持仓页手动发起（走 llm_tasks 后台任务）；无 fresh 行情的仓位不进请求，一笔都没有则整体拒答 insufficient_fresh_quotes",
+		InputWhitelist: []string{
+			"我的成本/数量/浮动盈亏/持有交易日/仓位占比（**全部由 Go 算好**）",
+			"持仓期最高价与自峰值回撤（D15）",
+			"D14/D15 当日命中的提醒信号与 D16 未处理的卖出复核事件（按 position_id 归并）",
+			"我当初录入的买入理由",
+		},
+		MustAnswer: []string{
+			"verdict 封闭三值 hold/trim/exit（服务端 normalizePositionVerdict 归一，越界整条丢弃）",
+			"reason 必须引用喂进去的具体数值（进证据核验值域比对）",
+			"invalidation 写具体价位/事件/时间窗口，不得空泛",
+		},
+		ForbiddenActions: []string{
+			"自己重算成本/浮盈亏/回撤（算术一律由 Go 完成，模型只做判断）",
+			"给无 fresh 行情的仓位下结论（旧价上的割/守/补有害）",
+			"给出加仓建议（本任务只回答持有/减仓/清仓）",
+			"用记忆中的公司信息补数据（虚构财务/新闻/公告/股东行为）",
+		},
+		Fallback:     "解析失败 repair 1 次；仍无合法结论拒答 llm_output_invalid，**绝不代填 hold**——把「没结论」伪装成「建议继续持有」比没有建议更危险",
+		KnownAnswers: []string{"TestFilterPositionAdvices", "TestVerifyPositionAdviceEvidence", "TestSortAdviceRowsByUrgency"},
+		EdgeCases:    []string{"TestNormalizePositionVerdict", "TestPositionAdviceFailClosed"},
+	},
 }
 
 // LLMRoleRegistry 输出角色资产列表（按 RoleID 稳定排序，预算表回填 token/repair——

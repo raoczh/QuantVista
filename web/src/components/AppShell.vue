@@ -46,6 +46,9 @@ const { isDark, primaryAlpha } = useUi()
 const todoCount = ref(0)
 async function refreshTodoCount() {
   try {
+    // 不传 scope = 默认 ledger（D18）：徽标只数「与我的账本有关」的条目，
+    // 与点进去的今日待办默认视图**同口径**。别改成 all——徽标 12 条、
+    // 点进去只有 3 条会让用户以为丢了东西。
     todoCount.value = (await getTodos()).total
   } catch {
     /* 徽标失败静默，不打扰 */

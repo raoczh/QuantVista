@@ -1,4 +1,6 @@
 import { request } from './client'
+import type { LLMTask } from './llmTask'
+import type { EvidenceCheck } from './trust'
 
 export interface Position {
   id: number
@@ -56,6 +58,23 @@ export interface Position {
   below_stop_loss: boolean // 现价已跌破计划止损；仅 fresh 时判定
   last_analyzed_at: string | null // 该标的最近一次个股 AI 分析时间
   analysis_stale: boolean // 持仓中从未分析或距上次分析超过 7 天
+  // D15 持仓期最高价与回撤（未初始化/已平仓时缺席）
+  peak?: PositionPeak
+}
+
+/**
+ * D15 持仓期最高价。**口径**：自 from 起该标的到过的最高价（账面口径，除权除息同步折算）；
+ * 加仓会把峰值重置为加仓价（成本已变，加仓前的高点不再是这本账赚到过的利润），减仓不重置。
+ * drawdown_pct 仅在取到当前有效行情时有值；backfilled=true 表示由本地日线（前复权口径）
+ * 回填，与账面实际成交价可能有出入，展示时须带 note 说明。
+ */
+export interface PositionPeak {
+  price: number
+  date: string
+  from: string
+  drawdown_pct: number
+  backfilled: boolean
+  note?: string
 }
 
 export interface PortfolioOverview {
@@ -129,6 +148,7 @@ export type PositionBase = Omit<
   | 'below_stop_loss'
   | 'last_analyzed_at'
   | 'analysis_stale'
+  | 'peak'
 >
 
 export function listPositions(status: 'holding' | 'closed' | 'all' = 'all') {
@@ -345,4 +365,84 @@ export function listCorpAdjusts(status = 'pending', signal?: AbortSignal) {
 // 否则后端明确拒绝并给出原因（不做部分回滚）。
 export function actCorpAdjust(id: number, action: 'confirm' | 'revert' | 'dismiss') {
   return request<PositionCorpAdjust>({ url: `/positions/corp-adjusts/${id}/${action}`, method: 'post' })
+}
+
+// ---------- D16 卖出复核 ----------
+
+/** 触发类型：解禁 / 业绩预告变脸 / 跌破关键均线 / 龙虎榜净卖出 / 除权除息临近。 */
+export type SellReviewTrigger = 'lift' | 'earn_fcst' | 'ma_break' | 'lhb_sell' | 'ex_div'
+export type SellReviewStatus = 'open' | 'resolved' | 'dismissed'
+
+/**
+ * 持仓命中利空事件时自动生成的「该不该卖」复核项。**与条件提醒的区别**：
+ * 用户无需配置任何规则；detail 回答的是「这件事对**我这笔持仓**意味着什么」（含我的成本与浮盈亏）。
+ * quote_ok=false 时 price/profit_pct 恒为 0 且 detail 已如实声明行情不可用（不用旧价冒充）。
+ */
+export interface SellReview {
+  id: number
+  user_id: number
+  position_id: number
+  symbol: string
+  market: string
+  name: string
+  trigger: SellReviewTrigger
+  trade_date: string // 事件自身日期，不是扫描日
+  severity: 'high' | 'med' | 'low'
+  title: string
+  detail: string
+  buy_price: number
+  quantity: number
+  price: number
+  profit_pct: number
+  quote_ok: boolean
+  status: SellReviewStatus
+  resolved_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export function listSellReviews(status: SellReviewStatus | 'all' = 'open', signal?: AbortSignal) {
+  return request<SellReview[]>({ url: '/positions/sell-reviews', params: { status }, signal })
+}
+
+export function setSellReviewStatus(id: number, status: SellReviewStatus) {
+  return request<SellReview>({ url: `/positions/sell-reviews/${id}/status`, method: 'put', data: { status } })
+}
+
+// ---------- D17 AI 持有 / 减仓 / 清仓建议 ----------
+
+/** 封闭三值枚举——服务端强校验，模型输出越界的整条丢弃（绝不代填 hold）。 */
+export type PositionVerdict = 'hold' | 'trim' | 'exit'
+
+export interface PositionAdvice {
+  symbol: string
+  name?: string
+  verdict: PositionVerdict
+  reason: string
+  invalidation: string
+  position_id?: number
+}
+
+export interface PositionAdviceResult {
+  advices: PositionAdvice[]
+  analyzed: number
+  skipped: number // 因无当前有效行情未参与分析的仓数（fail-closed）
+  notes: string[]
+  evidence_check?: EvidenceCheck
+  llm_config_id?: number
+  provider?: string
+  model?: string
+  trace_id?: string
+  prompt_version?: string
+}
+
+/** 发起建议（后台任务，秒回任务 id；用 getLLMTask 轮询结果）。 */
+export function requestPositionAdvice(input: { llm_config_id?: number; symbol?: string } = {}) {
+  return request<LLMTask<PositionAdviceResult>>({ url: '/positions/advice', method: 'post', data: input })
+}
+
+export const POSITION_VERDICT_LABEL: Record<PositionVerdict, string> = {
+  hold: '继续持有',
+  trim: '减仓',
+  exit: '清仓',
 }

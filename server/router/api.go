@@ -47,6 +47,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	backtestSvc := service.NewBacktestService(marketSvc)
 	moodSvc := service.NewMoodService()
 	orgViewSvc := service.NewOrgViewService()
+	// D17 持仓卖出决策 AI 建议（逐笔 hold|trim|exit，走 llm_tasks 后台任务）
+	positionAdviceSvc := service.NewPositionAdviceService(positionSvc, llmSvc)
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc, scoreSvc, indicatorSvc, chipSvc, intradaySvc)
@@ -58,6 +60,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	adminCtl := controller.NewAdminController(adminSvc)
 	watchlistCtl := controller.NewWatchlistController(watchlistSvc)
 	positionCtl := controller.NewPositionController(positionSvc)
+	positionAdviceCtl := controller.NewPositionAdviceController(positionAdviceSvc)
 	analysisCtl := controller.NewAnalysisController(analysisSvc)
 	recommendationCtl := controller.NewRecommendationController(recommendationSvc, trackingSvc, alertSvc)
 	alertCtl := controller.NewAlertController(alertSvc)
@@ -207,6 +210,11 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				//（静态段 corp-adjusts 与 :id 同层，gin 通配约束下动作并入 :action 分支）
 				positions.GET("/corp-adjusts", positionCtl.CorpAdjusts)
 				positions.POST("/corp-adjusts/:id/:action", positionCtl.CorpAdjustAction)
+				// D16 卖出复核：清单 + 标记已复核/忽略/恢复
+				positions.GET("/sell-reviews", controller.SellReviews)
+				positions.PUT("/sell-reviews/:id/status", controller.SellReviewAction)
+				// D17 AI 持有/减仓/清仓建议（后台任务，秒回任务 id；限流控 LLM 成本）
+				positions.POST("/advice", middleware.RateLimit(15, time.Minute), positionAdviceCtl.Advise)
 			}
 
 			// AI 分析中心（按用户隔离；发起分析限流，防止刷爆 LLM 配额与费用）

@@ -56,6 +56,10 @@ type PositionView struct {
 	BelowStopLoss  bool       `json:"below_stop_loss"`  // 现价已跌破计划止损；仅 fresh 时判定
 	LastAnalyzedAt *time.Time `json:"last_analyzed_at"` // 该标的最近一次个股 AI 分析时间
 	AnalysisStale  bool       `json:"analysis_stale"`   // 持仓中从未分析或距上次分析超过 7 天
+
+	// Peak 持仓期最高价与回撤（D15；未初始化或已平仓为 nil）。
+	// 回撤值仅在取到 fresh 行情时有意义，口径见 peakViewFor。
+	Peak *PeakView `json:"peak,omitempty"`
 }
 
 // shortHoldReviewDays 短线持仓超过该交易日数则提示复盘（短线一般不宜久拖）。
@@ -128,7 +132,11 @@ func (s *PositionService) List(ctx context.Context, userID int64, status string)
 	// B5 惰性补流水：老持仓（无流水）补一笔等价买入并回填累计汇总列。幂等、并发安全，
 	// 且**不改变任何既有汇总值**（见 ensurePositionTradesTx）。补完重读一次，
 	// 让本次响应就与库内一致，不必让用户刷第二次才看到流水。
-	if backfillPositionLedgers(userID, positions) {
+	// D15 同款惰性初始化持仓期峰值（存量持仓尽量用本地日线回填历史最高，标 backfilled）。
+	// 两个补建都必须执行，**不能写成 a() || b() 短路**——账本补建成功会跳过峰值初始化。
+	wroteLedger := backfillPositionLedgers(userID, positions)
+	wrotePeak := backfillPositionPeaks(userID, positions)
+	if wroteLedger || wrotePeak {
 		if positions, err = loadPositions(); err != nil {
 			return nil, err
 		}
@@ -219,6 +227,8 @@ func (s *PositionService) List(ctx context.Context, userID int64, status string)
 			} else {
 				v.AnalysisStale = true
 			}
+			// D15 持仓期最高价与回撤（price=0 时只给峰值不给回撤，fail-closed）。
+			v.Peak = peakViewFor(p, price)
 		}
 		out = append(out, v)
 	}
@@ -547,6 +557,9 @@ func (s *PositionService) Create(ctx context.Context, userID int64, in PositionI
 	// 建仓即写首笔 buy 流水（账本从第一天自洽），并初始化累计汇总列。
 	p.TotalBuyCost = round4(in.BuyPrice*in.Quantity + in.BuyFee + in.BuyTax)
 	p.TotalBuyQty = in.Quantity
+	// D15 持仓期最高价从建仓那一刻起算——买入日之前的高点不是我赚到过的利润。
+	p.PeakPrice, p.PeakFrom = peakInitFor(in.BuyPrice, in.BuyDate, time.Now().In(time.Local).Format("2006-01-02"))
+	p.PeakDate = p.PeakFrom
 	if err := common.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(p).Error; err != nil {
 			return err

@@ -17,6 +17,19 @@ const (
 	AlertKindEarnDate = "earn_date" // 财报披露临近：距预约披露日 ≤N 自然日（threshold=N）
 	AlertKindEarnFcst = "earn_fcst" // 新业绩预告发布（带预增/预亏类型）
 
+	// D14/D15 持仓卖出决策类：**唯一一组基于用户实际成本的提醒**。
+	// 与上面各类的三点不同（改动前必读）：
+	//  1. **Symbol 可为空**——空 = 绑定「我的全部持仓」，评估时按当前 holding 逐仓展开；
+	//     填了 symbol 则只评该标的的持仓（同一标的多笔仓位各自判定）。
+	//  2. **成本恒取 `positions.buy_price`**（B5 口径铁律：当前持仓加权平均成本），
+	//     用户不需要手工填计划止损价——这正是旧「持仓止损」待办的死穴。
+	//  3. **Op 无方向语义**（各 kind 自带方向），统一存 gte；**Once 强制 false**——
+	//     一条规则覆盖多笔持仓，命中一笔就暂停整条规则会让其余持仓从此失联。
+	// threshold 一律为**正数百分比**（如 20 = 20%）。fail-closed：无 fresh 行情不触发。
+	AlertKindCostGain     = "cost_gain"     // 现价相对我的成本涨 ≥N%（考虑落袋）
+	AlertKindCostDrawdown = "cost_drawdown" // 现价相对我的成本跌 ≥N%（考虑止损）
+	AlertKindPeakDrawdown = "peak_drawdown" // 自持仓期最高价回撤 ≥N%（移动止盈）
+
 	AlertOpGTE = "gte" // >=（到价/涨幅向上、站上均线、新高突破）
 	AlertOpLTE = "lte" // <=（到价/跌幅向下、跌破均线、新低破位）
 
@@ -32,6 +45,9 @@ const (
 // AlertRule 用户设置的条件提醒规则。按 user_id 隔离。
 // 命中落库并在待办/相关页面高亮提示；若用户配置了启用的推送通道且偏好
 // 「开启提醒」打开，则额外主动推送（阶段8-③，同日去重，见 service/alert.go）。
+//
+// **Symbol 空串的含义（D14/D15 起）**：仅持仓卖出决策类合法，表示「我的全部持仓」；
+// 其余 kind 的 symbol 恒非空（Create 会校验代码格式）。
 type AlertRule struct {
 	ID     int64  `gorm:"primaryKey" json:"id"`
 	UserID int64  `gorm:"index:idx_alert_user" json:"user_id"`
@@ -59,16 +75,27 @@ type AlertRule struct {
 // AlertEvent 提醒命中明细（PRD 3.16 状态机）。每次规则命中（同日去重）落一条，
 // 独立于规则行的最近命中快照——历史可追溯，且用户可逐条标记已读/忽略「完成待办」。
 // 今日待办的提醒条目即本表 unread 事件。
+//
+// **去重键下沉到 (rule_id, symbol, trade_date)（D14/D15 起）**：持仓卖出决策类规则
+// 可绑定「我的全部持仓」，同一天会对多只股票各自命中——旧的「按规则行 triggered_at
+// 是否为今天」判重会把多只股票的命中压成一条，用户只看得到其中一只。
+// PositionID 记录命中的是哪一笔持仓（同一标的可有多笔仓位），非持仓类恒 0。
 type AlertEvent struct {
 	ID     int64 `gorm:"primaryKey" json:"id"`
-	RuleID int64 `gorm:"index:idx_alert_event_rule" json:"rule_id"`
+	RuleID int64 `gorm:"index:idx_alert_event_rule;index:idx_alert_event_dedup,priority:1" json:"rule_id"`
 	UserID int64 `gorm:"index:idx_alert_event_user_status" json:"user_id"`
 
-	Symbol  string `gorm:"size:16" json:"symbol"`
+	Symbol  string `gorm:"size:16;index:idx_alert_event_dedup,priority:2" json:"symbol"`
 	Market  string `gorm:"size:8" json:"market"`
 	Name    string `gorm:"size:64" json:"name"`
 	Kind    string `gorm:"size:16" json:"kind"`
 	Message string `gorm:"size:256" json:"message"` // 命中说明（同规则 trigger_msg 口径）
+
+	// TradeDate 命中所属交易日（YYYY-MM-DD 本地时区）。**旧事件该列为空串**——
+	// 历史数据不追溯改写，判重只在新写入的行之间生效。
+	TradeDate string `gorm:"size:10;index:idx_alert_event_dedup,priority:3" json:"trade_date"`
+	// PositionID 命中的持仓行（持仓卖出决策类才有值），供前端直接定位到那一笔。
+	PositionID int64 `gorm:"index" json:"position_id"`
 
 	TriggeredAt time.Time `json:"triggered_at"`
 	Status      string    `gorm:"size:16;index:idx_alert_event_user_status" json:"status"` // unread/read/dismissed

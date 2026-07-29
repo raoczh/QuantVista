@@ -1,10 +1,22 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
-import { NButton, NSpin, NEmpty, NTag, NGrid, NGi, NAlert, useMessage } from 'naive-ui'
-import { getTodos, type TodoItem, type TodoResult } from '@/api/todo'
+import {
+  NButton,
+  NSpin,
+  NEmpty,
+  NTag,
+  NGrid,
+  NGi,
+  NAlert,
+  NRadioGroup,
+  NRadioButton,
+  useMessage,
+} from 'naive-ui'
+import { getTodos, type TodoItem, type TodoResult, type TodoScope } from '@/api/todo'
 import { getEventCalendar, type CalendarEvent, type CalendarResult } from '@/api/event'
 import { setAlertEventStatus } from '@/api/alert'
+import { setSellReviewStatus } from '@/api/position'
 import { ackRecommendationReview } from '@/api/recommendation'
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
@@ -18,16 +30,36 @@ const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const data = ref<TodoResult | null>(null)
 const loading = ref(false)
+// D18：默认只看与我的账本有关的条目——推荐复盘（AI 推过就追踪、没买也天天提示）
+// 是旧待办的噪音主体，已挪到推荐追踪页；打新归「全市场」。数据一条不删，随时可切。
+const scope = ref<TodoScope>('ledger')
+const scopeOptions: { label: string; value: TodoScope }[] = [
+  { label: '我的账本', value: 'ledger' },
+  { label: '研究跟踪', value: 'research' },
+  { label: '全市场', value: 'market' },
+  { label: '全部', value: 'all' },
+]
 async function load() {
   loading.value = true
   try {
-    data.value = await getTodos()
+    data.value = await getTodos(scope.value)
   } catch (e) {
     message.error((e as Error).message)
   } finally {
     loading.value = false
   }
 }
+// 其它范围还有多少条（提示用户「东西没丢，在别处」）。
+const elsewhereHint = computed(() => {
+  const d = data.value
+  if (!d || d.scope === 'all' || d.filtered <= 0) return ''
+  const parts: string[] = []
+  const counts = d.scope_counts || {}
+  if (d.scope !== 'research' && counts.research > 0) parts.push(`推荐追踪页有 ${counts.research} 条复盘提示`)
+  if (d.scope !== 'market' && counts.market > 0) parts.push(`全市场有 ${counts.market} 条机会（打新等）`)
+  if (d.scope !== 'ledger' && counts.ledger > 0) parts.push(`我的账本有 ${counts.ledger} 条`)
+  return parts.join('，')
+})
 
 // 类型 → 展示元信息（标签 + 强调色）。
 function kindMeta(kind: string) {
@@ -36,6 +68,8 @@ function kindMeta(kind: string) {
       return { label: '提醒', color: upColor.value }
     case 'stop_loss':
       return { label: '止损警示', color: vars.value.errorColor }
+    case 'sell_review':
+      return { label: '卖出复核', color: vars.value.errorColor }
     case 'rec_review':
       return { label: '推荐复盘', color: downColor.value }
     case 'position_short':
@@ -92,6 +126,22 @@ async function markRecReview(item: TodoItem) {
   try {
     await ackRecommendationReview(item.ref_id)
     message.success('已标记已读')
+    await load()
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    marking.value = null
+  }
+}
+
+// 卖出复核就地消项（ref_id 即 sell_review id）。「已复核」= 我看过并作出了决定，
+// 「忽略」= 终态不再提示；两者都不会被下一轮扫描拉回。
+async function markSellReview(item: TodoItem, status: 'resolved' | 'dismissed') {
+  if (marking.value) return
+  marking.value = item.ref_id
+  try {
+    await setSellReviewStatus(item.ref_id, status)
+    message.success(status === 'resolved' ? '已标记复核完成' : '已忽略')
     await load()
   } catch (e) {
     message.error((e as Error).message)
@@ -169,7 +219,7 @@ onMounted(loadCalendar)
 </script>
 
 <template>
-  <PageContainer title="今日待办" subtitle="聚合命中提醒 · 推荐复盘 · 持仓复盘 —— 今天该看的一览">
+  <PageContainer title="今日待办" subtitle="默认只看与我的账本有关的事 —— 卖出复核 · 持仓风险 · 命中提醒">
     <template #actions>
       <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>
     </template>
@@ -188,6 +238,13 @@ onMounted(loadCalendar)
       </n-grid>
 
       <SectionCard :title="`清单${data?.date ? ' · ' + data.date : ''}`">
+        <template #extra>
+          <n-radio-group v-model:value="scope" size="small" @update:value="load">
+            <n-radio-button v-for="opt in scopeOptions" :key="opt.value" :value="opt.value">{{
+              opt.label
+            }}</n-radio-button>
+          </n-radio-group>
+        </template>
         <n-spin :show="loading && !data">
           <n-alert
             v-if="data && data.complete === false"
@@ -199,12 +256,15 @@ onMounted(loadCalendar)
             <div v-for="(e, i) in data.errors || []" :key="i">{{ e }}</div>
             <div v-if="!data.errors?.length">部分数据读取失败，状态不明的事项未列出，请稍后刷新重试。</div>
           </n-alert>
+          <div v-if="elsewhereHint" class="scope-hint">当前只显示「{{ scopeOptions.find((o) => o.value === scope)?.label }}」；{{ elsewhereHint }}。</div>
           <n-empty
             v-if="data && !data.items.length"
             :description="
               data.complete === false
                 ? '暂未取到待办事项，但部分数据读取失败，状态不明——不代表一切正常'
-                : '今天没有需要处理的事项，一切都在轨道上 👍'
+                : scope === 'ledger'
+                  ? '我的持仓今天没有需要处理的事项 👍'
+                  : '这个范围今天没有需要处理的事项 👍'
             "
             style="padding: 40px 0"
           />
@@ -237,6 +297,12 @@ onMounted(loadCalendar)
                   <n-button size="small" quaternary :loading="marking === it.ref_id" @click="markRecReview(it)"
                     >已读</n-button
                   >
+                </template>
+                <template v-else-if="it.kind === 'sell_review'">
+                  <n-button size="small" quaternary :loading="marking === it.ref_id" @click="markSellReview(it, 'resolved')"
+                    >已复核</n-button
+                  >
+                  <n-button size="small" quaternary @click="markSellReview(it, 'dismissed')">忽略</n-button>
                 </template>
                 <n-button size="small" tertiary @click="handle(it)">去处理</n-button>
               </div>
@@ -309,6 +375,11 @@ onMounted(loadCalendar)
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+.scope-hint {
+  font-size: 12px;
+  opacity: 0.6;
+  margin-bottom: 10px;
 }
 .items {
   display: flex;

@@ -110,6 +110,29 @@ type Position struct {
 	TotalSellNet float64 `gorm:"type:decimal(20,4)" json:"total_sell_net"`
 	TotalBuyQty  float64 `gorm:"type:decimal(20,4)" json:"total_buy_qty"`
 
+	// ---- 持仓期最高价（D15 移动止盈）----
+	// PeakPrice 自 PeakFrom 起该标的到过的最高价（元/股，**账面口径**，与 BuyPrice 同口径）；
+	// PeakDate 为该最高价所在交易日；PeakFrom 为峰值统计起始日。
+	//
+	// **加减仓与折算的口径定夺（改动前必读，反例测试锁定）**：
+	//   - 建仓：PeakPrice=买入价、PeakFrom=买入日（无买入日则建仓当日）；
+	//   - **加仓：峰值重置为加仓价、PeakFrom 重置为加仓日**——加权成本已变，加仓前的
+	//     高点不再是「按当前这本账赚到过的利润」。不重置的后果是刚加完仓（往往是回调
+	//     买入）当场被判成大幅回撤，系统性误报；重置是保守选择：宁可漏报不误报。
+	//   - **减仓：不重置**——剩余仓位的持有期是连续的，它赚到过的高点依然算数。
+	//   - **除权除息折算：按价格侧公式同步折算**（新峰值 =(旧峰值−每10股派息/10)/(1+(送+转)/10)），
+	//     否则送转除权当天会凭空出现一个等于送转比例的假回撤；撤销折算时按落库的
+	//     PeakBefore 原值还原（不用反算，避免舍入漂移）。
+	//   - 平仓：字段保留供复盘，不再更新（持仓已不存在，回撤无意义）。
+	//
+	// PeakBackfilled=true 表示 PeakPrice 由本地日线**前复权序列**回填而非逐交易日累积。
+	// 前复权序列在除权后整段重刷，与账面实际成交价可能有出入（方向上偏低 = 偏保守、
+	// 少触发），展示与提醒文案必须据此标注，不得当作精确的账面历史最高价。
+	PeakPrice      float64 `gorm:"type:decimal(20,4)" json:"peak_price"`
+	PeakDate       string  `gorm:"size:10" json:"peak_date"`
+	PeakFrom       string  `gorm:"size:10" json:"peak_from"`
+	PeakBackfilled bool    `gorm:"default:false" json:"peak_backfilled"`
+
 	// 来源推荐血缘（一键建仓时写入；0=手动建仓无来源）。供「AI 推荐 vs 实际买入」对比。
 	RecommendationID int64 `gorm:"index" json:"recommendation_id"`
 

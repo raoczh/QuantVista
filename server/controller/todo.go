@@ -16,9 +16,11 @@ func NewTodoController(svc *service.TodoService) *TodoController {
 	return &TodoController{svc: svc}
 }
 
-// List GET /api/todos —— 聚合当前用户的待办清单。
+// List GET /api/todos?scope= —— 聚合当前用户的待办清单。
+// scope 默认 ledger（只看与我的账本有关的）；research 为推荐追踪页的复盘区所用；
+// market 为打新等全市场机会；all 为全量。
 func (tc *TodoController) List(c *gin.Context) {
-	res, err := tc.svc.Build(c.Request.Context(), currentUserID(c))
+	res, err := tc.svc.Build(c.Request.Context(), currentUserID(c), c.Query("scope"))
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return

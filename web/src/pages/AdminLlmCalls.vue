@@ -38,6 +38,7 @@ const moduleLabel: Record<string, string> = {
   reflection: '推荐反思',
   experiment: 'Prompt 实验（影子）',
   release_audit: '发布审计',
+  position_advice: '持仓卖出建议',
   test: '测试连接',
 }
 const moduleOptions = [

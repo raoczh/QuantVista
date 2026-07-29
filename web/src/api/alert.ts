@@ -1,9 +1,28 @@
 import { request } from './client'
 
-export type AlertKind = 'price' | 'pct_change' | 'ma' | 'breakout' | 'volume_surge' | 'amplitude' | 'earn_date' | 'earn_fcst'
+export type AlertKind =
+  | 'price'
+  | 'pct_change'
+  | 'ma'
+  | 'breakout'
+  | 'volume_surge'
+  | 'amplitude'
+  | 'earn_date'
+  | 'earn_fcst'
+  // D14/D15 持仓卖出决策类：**唯一一组基于我的实际成本的提醒**。
+  // symbol 可留空 = 绑定「我的全部持仓」；成本取 positions.buy_price，无需手工填价。
+  | 'cost_gain' // 相对我的成本涨 ≥N%（考虑落袋）
+  | 'cost_drawdown' // 相对我的成本跌 ≥N%（考虑止损）
+  | 'peak_drawdown' // 自持仓期最高价回撤 ≥N%（移动止盈）
 export type AlertOp = 'gte' | 'lte'
 export type AlertStatus = 'active' | 'triggered' | 'paused'
 export type AlertEventStatus = 'unread' | 'read' | 'dismissed'
+
+/** 持仓卖出决策类 kind 集合（表单与展示按它分流）。 */
+export const POSITION_ALERT_KINDS: AlertKind[] = ['cost_gain', 'cost_drawdown', 'peak_drawdown']
+export function isPositionAlertKind(kind: string) {
+  return POSITION_ALERT_KINDS.includes(kind as AlertKind)
+}
 
 export interface AlertRule {
   id: number
@@ -73,6 +92,8 @@ export interface AlertEvent {
   name: string
   kind: AlertKind
   message: string
+  trade_date: string // 命中所属交易日（去重键的一部分；旧事件为空串）
+  position_id: number // 持仓类命中的那一笔持仓（其余恒 0）
   triggered_at: string
   status: AlertEventStatus
   created_at: string

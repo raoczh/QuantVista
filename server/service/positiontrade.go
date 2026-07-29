@@ -339,6 +339,11 @@ func (s *PositionService) AddTrade(userID, positionID int64, in PositionTradeInp
 		}
 
 		ledger := ledgerFromPosition(&p)
+		today := time.Now().In(time.Local).Format("2006-01-02")
+		// D15：先补齐峰值（老持仓可能尚未初始化），加仓分支随后按新成本重置它。
+		if _, err := ensurePositionPeakTx(tx, &p, today); err != nil {
+			return err
+		}
 		trade := model.PositionTrade{
 			UserID: userID, PositionID: p.ID, Side: side,
 			Price: in.Price, Quantity: in.Quantity, Fee: in.Fee, Tax: in.Tax,
@@ -362,6 +367,12 @@ func (s *PositionService) AddTrade(userID, positionID int64, in PositionTradeInp
 			return err
 		}
 		ledger.applyTo(&p)
+		if side == model.PositionTradeBuy {
+			// D15 口径：**加仓重置持仓期峰值**（成本已变，加仓前的高点不再是这本账
+			// 赚到过的利润）；减仓不重置（剩余仓位的持有期是连续的）。
+			// 完整理由与反例见 model.Position.PeakPrice 注释与 resetPeakOnBuy。
+			resetPeakOnBuy(&p, in.Price, in.TradeDate, today)
+		}
 		if side == model.PositionTradeSell {
 			// 卖出笔同时刷新「最近一次卖出」快照（既有字段语义：最后一笔卖出）。
 			p.SellPrice, p.SellFee, p.SellTax = in.Price, in.Fee, in.Tax

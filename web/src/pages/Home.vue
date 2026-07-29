@@ -60,6 +60,7 @@ const mineRecLoaded = ref(false)
 async function loadMine() {
   const [pos, todos, wl, recs] = await Promise.allSettled([
     listPositions('holding'),
+    // 不传 scope = 默认 ledger（D18，与 AppShell 徽标和今日待办默认视图同口径）。
     getTodos(),
     listWatchlists(),
     listRecommendations(undefined, 1),

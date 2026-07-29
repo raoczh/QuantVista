@@ -73,6 +73,9 @@ func cleanCorpTables(t *testing.T) {
 		"position_corp_adjusts", "paper_corp_adjusts",
 		"positions", "position_trades", "paper_holdings", "paper_accounts", "paper_trades",
 		"guard_events", "watchlist_items",
+		// D14~D16 新增：同进程共用一个内存库，带唯一键的新表必须一并清，
+		// 否则上一个用例的行会撞 sell_reviews 的 (user, position, trigger, trade_date) 唯一键。
+		"sell_reviews", "alert_rules", "alert_events", "daily_bars",
 	} {
 		if err := common.DB.Exec("DELETE FROM " + tbl).Error; err != nil {
 			t.Fatalf("清表 %s 失败: %v", tbl, err)

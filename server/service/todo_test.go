@@ -6,16 +6,17 @@ import (
 	"time"
 
 	"quantvista/common"
+	"quantvista/datasource"
 	"quantvista/model"
 )
 
 // TestTodoBuild 聚合命中提醒 + 推荐复盘 + 持仓复盘，验证计数、排序与用户隔离。
 func TestTodoBuild(t *testing.T) {
 	setupTestDB(t)
-	common.DB.Exec("DELETE FROM alert_rules")
-	common.DB.Exec("DELETE FROM alert_events")
+	// 同进程共用一个内存库：别的用例落的除权建议/卖出复核/打新都会混进本用例的计数，
+	// 统一走 cleanCorpTables 清干净（它已覆盖 positions/alert_*/sell_reviews/corp 系列）。
+	cleanCorpTables(t)
 	common.DB.Exec("DELETE FROM recommendation_statuses")
-	common.DB.Exec("DELETE FROM positions")
 
 	// 未读的提醒命中事件（用户1）——批次 H 起待办以 alert_events unread 为准。
 	now := time.Now()
@@ -44,7 +45,8 @@ func TestTodoBuild(t *testing.T) {
 
 	svc := NewTodoService(&AlertService{}, &PositionService{market: nil}, nil)
 	// position.List 需要 market 富化；这里无持仓，List 返回空即可（跳过持仓分支）。
-	res, err := svc.Build(context.Background(), 1)
+	// 用 all 范围断言全量聚合口径；D18 的范围过滤另有 TestTodoScopeFilter 专测。
+	res, err := svc.Build(context.Background(), 1, TodoScopeAll)
 	if err != nil {
 		t.Fatalf("Build 失败: %v", err)
 	}
@@ -85,14 +87,121 @@ func TestTodoBuild(t *testing.T) {
 	if err := tracking.AckReview(1, st.ID); err != nil {
 		t.Fatalf("AckReview 失败: %v", err)
 	}
-	resAck, _ := svc.Build(context.Background(), 1)
+	resAck, _ := svc.Build(context.Background(), 1, TodoScopeAll)
 	if resAck.Reviews != 1 {
 		t.Fatalf("已读后推荐复盘应剩 1，得到 %d", resAck.Reviews)
 	}
 
 	// 用户隔离：用户2 只见自己的 1 条命中提醒。
-	res2, _ := svc.Build(context.Background(), 2)
+	res2, _ := svc.Build(context.Background(), 2, TodoScopeAll)
 	if res2.Total != 1 || res2.Alerts != 1 {
 		t.Fatalf("用户2 应只见 1 条命中提醒，得到 total=%d alerts=%d", res2.Total, res2.Alerts)
+	}
+}
+
+// TestTodoScopeFilter D18 待办改造：默认只显示与我的账本有关的条目，
+// 推荐复盘归 research（挪到推荐追踪页）、打新归 market，分类计数按过滤后计算。
+func TestTodoScopeFilter(t *testing.T) {
+	setupTestDB(t)
+	cleanCorpTables(t)
+	common.DB.Exec("DELETE FROM recommendation_statuses")
+	common.DB.Exec("DELETE FROM sell_reviews")
+	today := time.Now().In(time.Local).Format("2006-01-02")
+	now := time.Now()
+
+	// 我持有 600000，没有持有 600519。
+	p := seedHoldingWithPeak(t, 1, "600000", "浦发银行", 10, 1000, 10, today)
+
+	// ① 持仓标的的提醒命中 → ledger；② 非持仓标的的提醒命中 → research；
+	// ③ 持仓类 kind 的提醒（symbol 恰好也在持仓里）→ ledger。
+	common.DB.Create(&model.AlertEvent{RuleID: 1, UserID: 1, Symbol: "600000", Market: "cn", Name: "浦发银行",
+		Kind: model.AlertKindPrice, Message: "到价", TradeDate: today, TriggeredAt: now, Status: model.AlertEventUnread})
+	common.DB.Create(&model.AlertEvent{RuleID: 2, UserID: 1, Symbol: "600519", Market: "cn", Name: "贵州茅台",
+		Kind: model.AlertKindPrice, Message: "到价", TradeDate: today, TriggeredAt: now, Status: model.AlertEventUnread})
+	common.DB.Create(&model.AlertEvent{RuleID: 3, UserID: 1, Symbol: "600000", Market: "cn", Name: "浦发银行",
+		Kind: model.AlertKindPeakDrawdown, Message: "自持仓期最高回撤 20.00%", TradeDate: today,
+		PositionID: p.ID, TriggeredAt: now, Status: model.AlertEventUnread})
+	// 推荐复盘（噪音主体）→ research。
+	common.DB.Create(&model.RecommendationStatus{RecommendationID: 1, BatchID: 10, UserID: 1, Symbol: "000001",
+		Type: model.RecTypeShortTerm, Outcome: model.RecOutcomeExpired, ReviewNeeded: true, ReturnPct: 1, ValidDays: 5})
+	// 打新 → market。
+	common.DB.Create(&model.IpoSubscription{Kind: model.IpoKindStock, Code: "301000", Name: "新股A",
+		ApplyCode: "301000", ApplyDate: today, IssuePrice: 20})
+	// 卖出复核 → ledger。
+	common.DB.Create(&model.SellReview{UserID: 1, PositionID: p.ID, Symbol: "600000", Market: "cn",
+		Name: "浦发银行", Trigger: model.SellReviewLift, TradeDate: today,
+		Severity: model.SellReviewSeverityMed, Title: "限售解禁临近", Detail: "解禁 3000 万股",
+		Status: model.SellReviewStatusOpen})
+
+	// 有持仓时 PositionService 必须有可用的 market（零适配器 Manager 让行情逐源失败，
+	// 走真实的 fail-closed 分支而不是 nil 崩溃）。
+	svc := NewTodoService(&AlertService{},
+		NewPositionService(NewMarketService(datasource.NewManagerWithAdapters())), nil)
+
+	// 默认（ledger）：2 条提醒 + 1 条卖出复核；推荐复盘与打新不在其中。
+	led, err := svc.Build(context.Background(), 1, "")
+	if err != nil {
+		t.Fatalf("待办聚合失败: %v", err)
+	}
+	if led.Scope != TodoScopeLedger {
+		t.Fatalf("默认范围应为 ledger，得到 %s", led.Scope)
+	}
+	if led.Total != 3 {
+		t.Fatalf("账本范围应有 3 条（2 提醒 + 1 卖出复核），得到 %d: %+v", led.Total, led.Items)
+	}
+	for _, it := range led.Items {
+		if it.Kind == TodoKindRecReview {
+			t.Fatal("推荐复盘不得出现在默认待办里（已挪到推荐追踪页）")
+		}
+		if it.Kind == TodoKindIpo {
+			t.Fatal("打新属全市场机会，不在账本范围")
+		}
+		if it.Symbol == "600519" {
+			t.Fatal("非持仓标的的提醒不属账本范围")
+		}
+	}
+	// 计数按过滤后算：所见即所计（否则徽标 6 条、点进去 3 条）。
+	if led.Alerts != 2 || led.Reviews != 1 {
+		t.Fatalf("分类计数应按过滤后计算，得到 alerts=%d reviews=%d", led.Alerts, led.Reviews)
+	}
+	if led.Filtered != 3 {
+		t.Fatalf("被过滤条数应为 3（推荐复盘 + 打新 + 非持仓提醒），得到 %d", led.Filtered)
+	}
+	if led.ScopeCounts[TodoScopeResearch] != 2 || led.ScopeCounts[TodoScopeMarket] != 1 {
+		t.Fatalf("ScopeCounts 应给出别处的条数（供前端提示）: %+v", led.ScopeCounts)
+	}
+
+	// research：推荐追踪页的复盘区取这一份。
+	res, _ := svc.Build(context.Background(), 1, TodoScopeResearch)
+	if res.Total != 2 {
+		t.Fatalf("research 范围应有 2 条（推荐复盘 + 非持仓提醒），得到 %d", res.Total)
+	}
+	var hasRec bool
+	for _, it := range res.Items {
+		if it.Kind == TodoKindRecReview {
+			hasRec = true
+		}
+	}
+	if !hasRec {
+		t.Fatal("推荐复盘数据必须仍在（只改消费出口，不删数据）")
+	}
+
+	// all：全量 6 条。
+	all, _ := svc.Build(context.Background(), 1, TodoScopeAll)
+	if all.Total != 6 || all.Filtered != 0 {
+		t.Fatalf("all 范围应为全量 6 条且过滤 0，得到 total=%d filtered=%d", all.Total, all.Filtered)
+	}
+
+	// 非法范围被拒。
+	if _, err := svc.Build(context.Background(), 1, "whatever"); err == nil {
+		t.Fatal("非法范围应被拒绝")
+	}
+
+	// 用户隔离：用户 2 什么都看不到。
+	other, _ := svc.Build(context.Background(), 2, TodoScopeAll)
+	for _, it := range other.Items {
+		if it.Kind != TodoKindIpo {
+			t.Fatalf("用户 2 只应看到全市场打新，得到 %+v", it)
+		}
 	}
 }

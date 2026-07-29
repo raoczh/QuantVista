@@ -33,6 +33,7 @@ import {
   getShadowReport,
   getRecallReport,
   createStopLossAlert,
+  ackRecommendationReview,
   emptyRecFilters,
   type Strategy,
   type RecommendRequest,
@@ -51,6 +52,8 @@ import {
   type ReflectionLayers,
 } from '@/api/recommendation'
 import { getPreference, updatePreference, type UserPreference } from '@/api/user'
+import { getTodos, type TodoItem } from '@/api/todo'
+import { isAbortError } from '@/api/client'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
@@ -251,7 +254,11 @@ async function generate() {
 // trackBatch 轮询后台任务直到脱离 processing；页面刷新后凭历史里的 processing 批次恢复跟踪。
 // 页面卸载时取消轮询，避免后台请求空转与已销毁组件的状态回填。
 let pollAbort: AbortController | null = null
-onBeforeUnmount(() => pollAbort?.abort())
+onBeforeUnmount(() => {
+  pollAbort?.abort()
+  reviewsAbort?.abort()
+  reviewsAbort = null
+})
 
 async function trackBatch(id: number) {
   running.value = true
@@ -457,7 +464,7 @@ function fmtTime(t: string) {
 }
 
 onMounted(async () => {
-  await Promise.all([loadStrategies(), loadLLM(), loadHistory(), loadPerformance(), loadPrefFilters()])
+  await Promise.all([loadStrategies(), loadLLM(), loadHistory(), loadPerformance(), loadPrefFilters(), loadReviews()])
   // 页面刷新恢复：仍在后台生成中的批次自动恢复跟踪（后端对陈旧 processing 会惰性判 failed）。
   const processing = history.value.find((h) => h.status === 'processing')
   if (processing) {
@@ -465,6 +472,43 @@ onMounted(async () => {
     void trackBatch(processing.id)
   }
 })
+
+// ---------- D18 待复盘提示（从今日待办搬过来的推荐复盘区） ----------
+// 今日待办默认只显示与账本有关的条目——「AI 推过就追踪、我没买也天天提示」的推荐复盘
+// 是那里的噪音主体，搬到这里它自己的页面上。**数据一条没删**，只换了消费出口。
+const reviews = ref<TodoItem[]>([])
+const reviewsLoading = ref(false)
+const reviewAcking = ref<number | null>(null)
+let reviewsAbort: AbortController | null = null
+
+async function loadReviews() {
+  reviewsAbort?.abort()
+  const ctrl = new AbortController()
+  reviewsAbort = ctrl
+  reviewsLoading.value = true
+  try {
+    const res = await getTodos('research', ctrl.signal)
+    reviews.value = res.items.filter((it) => it.kind === 'rec_review')
+  } catch (e) {
+    if (!isAbortError(e)) reviews.value = []
+  } finally {
+    if (reviewsAbort === ctrl) reviewsLoading.value = false
+  }
+}
+
+async function ackReview(item: TodoItem) {
+  if (reviewAcking.value) return
+  reviewAcking.value = item.ref_id
+  try {
+    await ackRecommendationReview(item.ref_id)
+    message.success('已标记已读')
+    await loadReviews()
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    reviewAcking.value = null
+  }
+}
 
 // ---------- 追踪 + 表现统计 ----------
 const performance = ref<PerformanceStats | null>(null)
@@ -845,6 +889,34 @@ function qgFieldLabels(fields?: string[]): string {
               本地量化评分排序（零 AI 成本）→ AI 只在 Top16 里精选并强制引用数据 → 程序核验证据数字。候选池全程透明，可在结果页展开查看每只股为什么进/为什么被筛掉。
             </div>
           </n-form>
+        </SectionCard>
+
+        <!-- D18：推荐复盘提示的新家。今日待办默认只显示与账本有关的条目，
+             「AI 推过就追踪、我没买也天天提示」的复盘提醒搬到这里；数据一条没删。 -->
+        <SectionCard v-if="reviews.length || reviewsLoading" title="待复盘提示">
+          <template #extra>
+            <n-button size="tiny" quaternary :loading="reviewsLoading" @click="loadReviews">刷新</n-button>
+          </template>
+          <n-spin :show="reviewsLoading && !reviews.length">
+            <n-empty v-if="!reviews.length" description="没有需要复盘的推荐" size="small" />
+            <div v-else class="review-list">
+              <div v-for="it in reviews" :key="it.ref_id" class="review-item">
+                <div class="review-main">
+                  <div class="review-title">
+                    <n-tag size="tiny" round :bordered="false" :type="it.priority === 1 ? 'error' : 'default'">{{
+                      it.priority === 1 ? '止损' : '复盘'
+                    }}</n-tag>
+                    <span class="review-name">{{ it.name || it.symbol }}</span>
+                    <span class="review-symbol qv-mono">{{ it.symbol }}</span>
+                  </div>
+                  <div class="review-sub">{{ it.title }} · {{ it.detail }}</div>
+                </div>
+                <n-button size="tiny" quaternary :loading="reviewAcking === it.ref_id" @click="ackReview(it)"
+                  >已读</n-button
+                >
+              </div>
+            </div>
+          </n-spin>
         </SectionCard>
 
         <SectionCard title="历史记录">
@@ -2196,5 +2268,49 @@ function qgFieldLabels(fields?: string[]): string {
 .rej-reason {
   opacity: 0.75;
   line-height: 1.5;
+}
+
+/* D18 待复盘提示（从今日待办搬来的推荐复盘区） */
+.review-list {
+  display: flex;
+  flex-direction: column;
+}
+.review-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+}
+.review-item + .review-item {
+  border-top: 1px solid var(--qv-divider);
+}
+.review-main {
+  flex: 1;
+  min-width: 0;
+}
+.review-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.review-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+.review-symbol {
+  font-size: 11px;
+  opacity: 0.5;
+}
+.review-sub {
+  font-size: 12px;
+  opacity: 0.7;
+  margin-top: 3px;
+}
+@media (max-width: 768px) {
+  .review-item {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
 }
 </style>

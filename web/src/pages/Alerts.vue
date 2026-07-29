@@ -29,6 +29,7 @@ import {
   listAlertEvents,
   setAlertEventStatus,
   readAllAlertEvents,
+  isPositionAlertKind,
   type AlertRule,
   type AlertInput,
   type AlertEvent,
@@ -57,6 +58,9 @@ const marketOptions = [
   { label: 'A 股', value: 'cn' },
 ]
 const kindOptions = [
+  { label: '【持仓】相对我的成本涨 N%（考虑落袋）', value: 'cost_gain' },
+  { label: '【持仓】相对我的成本跌 N%（考虑止损）', value: 'cost_drawdown' },
+  { label: '【持仓】自持仓期最高回撤 N%（移动止盈）', value: 'peak_drawdown' },
   { label: '到价提醒', value: 'price' },
   { label: '涨跌幅异动', value: 'pct_change' },
   { label: '均线（站上/跌破）', value: 'ma' },
@@ -68,6 +72,9 @@ const kindOptions = [
 ]
 // 财报日历类：无条件方向语义，且不走盘中行情评估（每日盘后财报数据刷新时评估一次）。
 const isEarnKind = computed(() => form.value.kind === 'earn_date' || form.value.kind === 'earn_fcst')
+// D14/D15 持仓类：方向由 kind 自带（op 无意义）、代码可留空 = 我的全部持仓、
+// 命中后不自动暂停（一条规则覆盖多笔持仓，暂停整条会让其余持仓失联）。
+const isPosKind = computed(() => isPositionAlertKind(form.value.kind))
 // op 选项随 kind 变化，文案更贴切。
 const opOptions = computed(() => {
   switch (form.value.kind) {
@@ -104,7 +111,8 @@ const needThreshold = computed(
     form.value.kind === 'pct_change' ||
     form.value.kind === 'volume_surge' ||
     form.value.kind === 'amplitude' ||
-    form.value.kind === 'earn_date',
+    form.value.kind === 'earn_date' ||
+    isPosKind.value,
 )
 const needPeriod = computed(() => form.value.kind === 'ma' || form.value.kind === 'breakout')
 const thresholdLabel = computed(() => {
@@ -119,6 +127,12 @@ const thresholdLabel = computed(() => {
       return '振幅阈值（%，(最高-最低)/昨收）'
     case 'earn_date':
       return '提前天数（距预约披露日 ≤N 天提醒）'
+    case 'cost_gain':
+      return '相对我的成本涨幅（%，如 20 = 涨 20% 提醒落袋）'
+    case 'cost_drawdown':
+      return '相对我的成本跌幅（%，如 8 = 跌 8% 提醒止损）'
+    case 'peak_drawdown':
+      return '自持仓期最高价的回撤（%，如 15 = 从最高点回撤 15% 提醒）'
     default:
       return '阈值'
   }
@@ -158,7 +172,8 @@ function editRule(r: AlertRule) {
 
 const saving = ref(false)
 async function submit() {
-  if (!editingId.value && !form.value.symbol.trim()) {
+  // 持仓类允许留空代码（= 我的全部持仓）；其余类型必须绑定标的。
+  if (!editingId.value && !isPosKind.value && !form.value.symbol.trim()) {
     message.warning('请输入股票代码')
     return
   }
@@ -226,8 +241,13 @@ async function remove(r: AlertRule) {
 }
 
 // ---------- 展示辅助 ----------
+// 持仓类规则的作用域：未绑定代码 = 我的全部持仓。
+function ruleScope(r: AlertRule) {
+  return r.symbol ? r.name || r.symbol : '我的全部持仓'
+}
 function describe(r: AlertRule) {
   const p = (n: number) => n.toFixed(2)
+  const g = (n: number) => String(Number(n.toFixed(2)))
   switch (r.kind) {
     case 'price':
       return `现价 ${r.op === 'gte' ? '≥' : '≤'} ${p(r.threshold)}`
@@ -245,6 +265,12 @@ function describe(r: AlertRule) {
       return `距财报预约披露日 ≤ ${r.threshold.toFixed(0)} 天`
     case 'earn_fcst':
       return '发布新业绩预告（预增/预亏等）'
+    case 'cost_gain':
+      return `${ruleScope(r)} 相对我的成本涨 ≥ ${g(r.threshold)}%`
+    case 'cost_drawdown':
+      return `${ruleScope(r)} 相对我的成本跌 ≥ ${g(r.threshold)}%`
+    case 'peak_drawdown':
+      return `${ruleScope(r)} 自持仓期最高价回撤 ≥ ${g(r.threshold)}%`
     default:
       return ''
   }
@@ -343,6 +369,9 @@ const kindLabelMap: Record<string, string> = {
   amplitude: '振幅',
   earn_date: '财报披露',
   earn_fcst: '业绩预告',
+  cost_gain: '成本止盈',
+  cost_drawdown: '成本止损',
+  peak_drawdown: '移动止盈',
 }
 
 // ---------- 推送通道 ----------
@@ -429,7 +458,10 @@ function channelKindLabel(k: string) {
 </script>
 
 <template>
-  <PageContainer title="条件提醒" subtitle="到价 / 异动 / 均线 / 突破 · 命中按当日 OHLC 判定 · 可配推送通道主动通知">
+  <PageContainer
+    title="条件提醒"
+    subtitle="持仓成本止盈止损 / 移动止盈 · 到价 / 异动 / 均线 / 突破 · 可配推送通道主动通知"
+  >
     <template #actions>
       <n-button size="small" quaternary :loading="evaluating" @click="runEvaluate">立即检查</n-button>
       <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>
@@ -440,10 +472,21 @@ function channelKindLabel(k: string) {
       <div class="col-form">
         <SectionCard :title="editingId ? '编辑提醒' : '新建提醒'">
           <n-form label-placement="top" :show-feedback="false" class="form">
+            <n-form-item label="提醒类型">
+              <n-select v-model:value="form.kind" :options="kindOptions" />
+            </n-form-item>
+            <div v-if="isPosKind" class="hint" style="margin: -4px 0 4px">
+              持仓类提醒基于<b>我的实际持仓成本</b>（加权均价，加减仓自动重算），无需手工填价位。
+              股票代码<b>留空即覆盖我的全部持仓</b>；命中后不会自动暂停，且无当前有效行情的持仓本轮不评（不用旧价误报）。
+            </div>
             <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
               <n-gi>
-                <n-form-item label="股票代码">
-                  <n-input v-model:value="form.symbol" placeholder="如 600000" :disabled="!!editingId" />
+                <n-form-item :label="isPosKind ? '股票代码（留空=全部持仓）' : '股票代码'">
+                  <n-input
+                    v-model:value="form.symbol"
+                    :placeholder="isPosKind ? '留空覆盖全部持仓' : '如 600000'"
+                    :disabled="!!editingId"
+                  />
                 </n-form-item>
               </n-gi>
               <n-gi>
@@ -452,10 +495,7 @@ function channelKindLabel(k: string) {
                 </n-form-item>
               </n-gi>
             </n-grid>
-            <n-form-item label="提醒类型">
-              <n-select v-model:value="form.kind" :options="kindOptions" />
-            </n-form-item>
-            <n-form-item v-if="!isEarnKind" label="条件方向">
+            <n-form-item v-if="!isEarnKind && !isPosKind" label="条件方向">
               <n-select v-model:value="form.op" :options="opOptions" />
             </n-form-item>
             <n-form-item v-if="needThreshold" :label="thresholdLabel">
@@ -473,7 +513,7 @@ function channelKindLabel(k: string) {
             <n-form-item v-if="needPeriod" label="周期（交易日）">
               <n-input-number v-model:value="form.period" :min="2" :max="250" style="width: 100%" />
             </n-form-item>
-            <n-form-item label="命中后自动暂停">
+            <n-form-item v-if="!isPosKind" label="命中后自动暂停">
               <n-switch v-model:value="form.once" />
               <span class="switch-hint">开启后命中一次即暂停，避免重复提示</span>
             </n-form-item>
@@ -558,10 +598,13 @@ function channelKindLabel(k: string) {
               <div v-for="r in rules" :key="r.id" class="rule" :class="{ hit: isHitToday(r) }">
                 <div class="rule-main">
                   <div class="rule-title">
-                    <span class="rule-name">{{ r.name || r.symbol }}</span>
-                    <span class="rule-symbol qv-mono">{{ r.symbol }}</span>
+                    <span class="rule-name">{{ ruleScope(r) }}</span>
+                    <span v-if="r.symbol" class="rule-symbol qv-mono">{{ r.symbol }}</span>
                     <n-tag size="tiny" round :bordered="false" :type="statusTag(r).type">{{
                       statusTag(r).text
+                    }}</n-tag>
+                    <n-tag v-if="isPositionAlertKind(r.kind)" size="tiny" round :bordered="false" type="info">{{
+                      kindLabelMap[r.kind]
                     }}</n-tag>
                   </div>
                   <div class="rule-cond">{{ describe(r) }}</div>
@@ -580,7 +623,7 @@ function channelKindLabel(k: string) {
                     <template #trigger>
                       <n-button size="tiny" quaternary type="error">删除</n-button>
                     </template>
-                    删除提醒「{{ r.name || r.symbol }}」？
+                    删除提醒「{{ ruleScope(r) }}」？
                   </n-popconfirm>
                 </div>
               </div>

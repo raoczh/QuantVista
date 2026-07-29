@@ -222,12 +222,26 @@ func (s *PositionService) ConfirmCorpAdjust(userID, adjustID int64) (*model.Posi
 		if !ok {
 			return errors.New("当前持仓无法折算（数量或成本为零）")
 		}
+		// D15：持仓期最高价按价格侧同一公式同步折算——不折算的话，10 转 10 的
+		// 除权当天会凭空出现一个 50% 的假回撤，移动止盈提醒当场误报。
+		// 峰值未初始化（旧持仓尚未惰性补齐）时跳过，不猜一个值。
+		peakBefore, peakAfter := p.PeakPrice, 0.0
+		peakChanged := false
+		if v, perr := peakAfterCorpAdjust(p, adj.BonusRatio, adj.TransferRatio, adj.DividendPretax); perr == nil {
+			peakAfter, peakChanged = v, true
+		} else {
+			peakBefore = 0
+		}
 
+		note := corpAdjustNote(adj)
+		if peakChanged {
+			note += peakAdjustNote(peakBefore, peakAfter)
+		}
 		trade := model.PositionTrade{
 			UserID: userID, PositionID: p.ID, Side: model.PositionTradeAdjust,
 			Price: 0, Quantity: round4(res.QtyAfter - p.Quantity), Fee: 0, Tax: 0,
 			TradeDate: adj.ExDate,
-			Note:      truncateRunes(corpAdjustNote(adj), 200),
+			Note:      truncateRunes(note, 200),
 			// 现金分红是真金到账，计入已实现盈亏。
 			RealizedPnl:    res.CashDividend,
 			AvgCostBefore:  p.BuyPrice,
@@ -244,6 +258,10 @@ func (s *PositionService) ConfirmCorpAdjust(userID, adjustID int64) (*model.Posi
 
 		p.Quantity = res.QtyAfter
 		p.BuyPrice = res.CostAfter
+		if peakChanged {
+			// 峰值起算日不变——除权不打断持有期，改变的只是价格刻度。
+			p.PeakPrice = peakAfter
+		}
 		// 现金分红进累计已实现盈亏；TotalBuyCost/TotalBuyQty 保持不变——
 		// 送转不是「又买了一次」，用户没有再投入一分钱，改动它们会让
 		// 「一共投入多少 / 已平仓收益率」全部失真。
@@ -259,6 +277,8 @@ func (s *PositionService) ConfirmCorpAdjust(userID, adjustID int64) (*model.Posi
 		adj.RevertedAt = nil
 		// 落库实际执行值（生成时的预估与执行时若有差异，以执行值为准）。
 		adj.QtyAfter, adj.CostAfter, adj.CashDividend = res.QtyAfter, res.CostAfter, res.CashDividend
+		// 峰值折算前后值成列：撤销时按 PeakBefore **原值**还原，不反算公式（避免舍入漂移）。
+		adj.PeakBefore, adj.PeakAfter = peakBefore, peakAfter
 		if err := tx.Save(&adj).Error; err != nil {
 			return err
 		}
@@ -320,6 +340,12 @@ func (s *PositionService) RevertCorpAdjust(userID, adjustID int64) (*model.Posit
 		}
 		p.Quantity = adj.QtyBefore
 		p.BuyPrice = adj.CostBefore
+		// D15：峰值按落库的**原值**还原（不反算折算公式——反算会留下几厘的舍入漂移，
+		// 让「撤销后应与折算前逐字节一致」这条不变式失守）。PeakBefore=0 表示折算时
+		// 该持仓尚无峰值记录，此时不动峰值。
+		if adj.PeakBefore > 0 {
+			p.PeakPrice = adj.PeakBefore
+		}
 		p.RealizedPnl = round4(p.RealizedPnl - adj.CashDividend)
 		if err := tx.Save(&p).Error; err != nil {
 			return err

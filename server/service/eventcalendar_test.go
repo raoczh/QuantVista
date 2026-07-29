@@ -428,7 +428,9 @@ func TestTodoCorpAdjustAndIpo(t *testing.T) {
 		StockCode: "603067", StockName: "振华股份", Rating: "AA"})
 
 	svc := NewTodoService(&AlertService{}, &PositionService{market: nil}, nil)
-	res, err := svc.Build(context.Background(), 1)
+	// 用 all 范围断言两类都在：D18 起除权折算属 ledger、打新属 market，
+	// 默认范围（ledger）看不到打新——本用例验的是「有没有生成」，不是消费出口分流。
+	res, err := svc.Build(context.Background(), 1, TodoScopeAll)
 	if err != nil {
 		t.Fatalf("待办聚合失败: %v", err)
 	}

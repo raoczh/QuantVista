@@ -78,6 +78,9 @@ var llmModuleBudgets = map[string]llmModuleBudget{
 	"experiment": {MaxTokens: 2500, RepairAttempts: 0},
 	// P2-6 发布审计员（llm_release_gate.go）：verdict+findings 小 JSON；手动管理员动作。
 	"release_audit": {MaxTokens: 1500, RepairAttempts: 1, RepairFeedChars: 600},
+	// D17 持仓卖出建议（positionadvice.go）：逐笔 {verdict, reason, invalidation} 小 JSON，
+	// 单次至多 positionAdviceMaxPositions=20 笔——按每笔约 100 token 的理由+失效条件定标。
+	"position_advice": {MaxTokens: 2500, RepairAttempts: 1, RepairFeedChars: 600},
 }
 
 // moduleBudget 取模块预算；未登记模块回默认（不钳 token、repair 默认 1）——
