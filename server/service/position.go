@@ -288,6 +288,10 @@ type PortfolioOverview struct {
 	QuoteFailedCount int `json:"quote_failed_count"` // 行情拉取失败、未计入市值/收益的持仓数（前端可提示口径）
 	QuoteStaleCount  int `json:"quote_stale_count"`  // 行情已过期（取到但非当前有效）、未计入市值/收益的持仓数
 
+	// Exposure 行业 / 市值风格 / 估值风格三维暴露（C13）。
+	// **nil = 没有可定价的持仓**（不是「暴露均匀」）；单个维度不可用时其 Available=false。
+	Exposure *PortfolioExposure `json:"exposure,omitempty"`
+
 	Signals []string `json:"signals"` // 风控信号（集中度/止损/未分析）
 }
 
@@ -374,10 +378,15 @@ func (s *PositionService) Overview(ctx context.Context, userID int64) (*Portfoli
 		}
 	}
 
+	// C13 行业 / 风格暴露：组合层的第二个风险视角（第一个是单一标的集中度）。
+	// 与市值口径一致：只有取到当前有效行情的持仓参与分布，未计入的笔数进 BaseNote。
+	ov.Exposure = s.exposureFor(ctx, views, ov.QuoteStaleCount+ov.QuoteFailedCount)
+
 	// 风控信号（个人风控提示：查询即提示，不推送）。
 	if ov.TopWeightPct > topWeightWarnPct {
 		ov.Signals = append(ov.Signals, fmt.Sprintf("%s 占持仓市值 %.1f%%，单一标的集中度偏高", orSymbol(ov.TopName, ov.TopSymbol), ov.TopWeightPct))
 	}
+	ov.Signals = append(ov.Signals, exposureSignals(ov.Exposure)...)
 	if belowStop > 0 {
 		ov.Signals = append(ov.Signals, fmt.Sprintf("%d 笔持仓已跌破计划止损价，请立即复核", belowStop))
 	}

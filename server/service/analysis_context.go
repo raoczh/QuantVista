@@ -373,14 +373,19 @@ func stockCorpEventsBlock(mkt, symbol string, now time.Time) (map[string]any, []
 			acts = append(acts, item)
 		}
 		block["dividends"] = acts
-		block["dividends_note"] = "送转与派息为 A 股「每 10 股」口径（bonus_per10=2 表示每 10 股送 2 股）；dividend_yield_pct 为股息率百分数。"
+		block["dividends_note"] = "送转与派息为 A 股「每 10 股」口径（bonus_per10=2 表示每 10 股送 2 股）；dividend_yield_pct 为股息率百分数（0=该期方案未给出股息率，不代表不分红）。"
 		// **口径基数必须进值域**：模型几乎必然写成「每 10 股派 X 元」，而核验侧对
 		// 带单位的整数（「10 股」）不跳过——值域里没有 10 就会把正确复述判成幻觉。
 		// 10 是方案口径的组成部分，不是编造的数字，显式成键是诚实且必要的。
 		block["ratio_base_shares"] = 10
-		// 最新一期股息率单列，供估值段直接引用（C10 的落点之一）。
-		if y := ev.Actions[0].DividendYield; y > 0 {
-			block["latest_dividend_yield_pct"] = y
+		// C10 当前股息率：走 pickLatestDividendYield 统一口径（最近一期**有股息率**的方案，
+		// 报告期在回看窗口内），与个股详情估值区、选股因子 div_yield 同源。
+		// **必须带 as_of 报告期**——不带时点的「股息率 3.2%」会被读成实时值；
+		// 数值叶子经 snapshotLabeledValues 自动进核验值域，模型忠实引用不判幻觉。
+		if dy := pickLatestDividendYield(ev.Actions, now); dy != nil {
+			block["latest_dividend_yield_pct"] = dy.YieldPct
+			block["latest_dividend_yield_as_of"] = dy.ReportDate
+			block["latest_dividend_yield_note"] = dy.Note
 		}
 	} else if ev.ActionUnavailable {
 		block["dividends_unavailable"] = true

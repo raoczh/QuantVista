@@ -215,6 +215,7 @@ Go API Server
 - 计算当前盈亏。
 - 关联 AI 推荐记录。
 - 每交易日盘后落资产快照，供资产曲线。
+- 组合层暴露分析（行业 / 市值风格 / 估值风格三维分布，读时计算不落库）。
 
 **账本口径铁律（B5，改代码前必读）**：`positions.buy_price` 恒为**当前持仓**的加权平均成本、
 `positions.quantity` 恒为**当前持仓**数量（全部卖出后为 0）、`buy_fee/buy_tax` 恒为当前持仓尚未
@@ -245,7 +246,9 @@ Go API Server
   bonus_ratio / transfer_ratio / dividend_pretax / dividend_yield / progress / plan_profile`，
   唯一键 `(symbol, market, report_date, ex_date)`。**送转与派息为「每 10 股」口径原值**
   （`bonus_ratio=2` = 每 10 股送 2 股，B8 折算公式直接按此写，**不要预先除以 10**）；
-  `dividend_yield` 为百分比数值（上游小数已 ×100）。同一报告期方案随进度（预案 → 实施分配）
+  `dividend_yield` 为百分比数值（上游小数已 ×100）。**该列为 0 表示「该期方案没有股息率」
+  （预案/纯送转，上游不给），不是「股息率为零」**——取值一律走 `pickLatestDividendYield`（见 C10 段）。
+  同一报告期方案随进度（预案 → 实施分配）
   走 upsert 更新而非堆积新行；除权日确定前 `ex_date` 为空串。
 - `restricted_releases`：`symbol / market / name / free_date / free_type / free_shares /
   lift_market_cap / free_ratio / total_ratio`，唯一键 `(symbol, market, free_date, free_type)`
@@ -305,9 +308,31 @@ Go API Server
 「一共投入多少 / 已平仓收益率」全部失真。
 **峰值必须与成本按同一比例移动**，否则 10 转 10 的除权当天会凭空出现 50% 的假回撤。
 
+**行业 / 风格暴露（C13，第六十二批；读时计算零落库、零新表）**：
+
+`GET /api/positions/overview` 的 `exposure` 段给出三维分布（`service/positionexposure.go`）：
+
+- **行业**走宇宙快照 `stock_universe_dailies.industry`（`industriesFor`）；**市值风格**与
+  **估值风格**走 `MarketService.ValuationsFor` 的 `TotalCap` / `PETTM`（腾讯免费估值，缓存 60s）。
+- 分档：大盘 ≥500 亿 / 中盘 100~500 亿 / 小盘 <100 亿（元）；PE ≤15 低 / 15~30 中 / >30 高 /
+  **严格负值**为亏损。**`PE==0` 是估值缺失不是亏损**（全项目铁律）。
+- **口径三条**：①占比基数 = 已定价（fresh 行情）持仓市值合计，**含「未知」桶**，各桶之和恒 100%
+  ——按「已知部分」做分母会让 20% 覆盖率的组合显示成「银行 100%」；②某维一条数据都没有时
+  `available=false` 整块缺席（「不知道」≠「分布均匀」），部分缺失显式成「未知」桶且**恒排最后**；
+  ③集中度提示须过覆盖率闸门（≥60%）——只查到一小部分持仓的行业就断言赛道集中是拿局部当整体。
+- 行情 stale/失败的持仓既不进市值也不进分布（与 `Overview.TotalValue` 同口径），未计入笔数在
+  `base_note` 里如实声明。
+
+**股息率（C10，第六十二批）**：`corporate_actions.dividend_yield` 的**唯一**取值口径是
+`service/dividendyield.go` 的 `pickLatestDividendYield`——取最近一期 `dividend_yield > 0`
+且报告期在 800 天窗口内的方案，随值透出报告期 as-of。三个消费方（个股详情估值区 /
+AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yield`）共用，
+不得各自从 `actions` 里挑。**取不到就整项缺席，绝不回退 0**（上游对预案与纯送转方案不给
+股息率、落库为 0；把 0 当答案会被读成「这家公司不分红」）。
+
 接口示例：
 
-- `GET /api/positions`（含止损/分析时效富化）/ `GET /api/positions/overview`（组合总览+风控信号）
+- `GET /api/positions`（含止损/分析时效富化）/ `GET /api/positions/overview`（组合总览+风控信号+**行业/风格暴露**）
 - `POST /api/positions`
 - `POST /api/positions/import`（CSV 批量导入，multipart，逐行校验+错误行报告，上限 500 行，限流 10/min）
 - `PUT /api/positions/:id`
@@ -454,7 +479,7 @@ Go API Server
 - **finance / finance_f10**（F1/F2）：财报日历/业绩预告/快报增量刷新 + F10 主要财务指标与三大报表关键科目按需缓存 + 公告采集，入个股详情财务块、长线推荐 fin 因子、财报提醒。
 - **indicator / chip**（T1）：MACD/BOLL/RSI/ATR 纯函数指标库（Wilder 口径）、筹码峰三角衰减复算、五维技术评分升级，供个股详情副图与推荐量化评分。
 - **riskgate / breaker / health**（S1）：风险闸门（ST/一字板/流动性/小市值进 AI prompt 与前端标签）、东财 push2 族域名断路器、数据源健康滑窗；问答流式输出同批。
-- **marketwide / factortable / screener**（M1）：全市场日线地基（宇宙字典/历史初始化/除权双层检测重锚）、52 因子列式宽表、条件树 DSL 选股（21 内置白话策略+自定义策略），`/screener` 页；策略信号进推荐候选池。
+- **marketwide / factortable / screener**（M1）：全市场日线地基（宇宙字典/历史初始化/除权双层检测重锚）、**63 因子**列式宽表（C10/C12 起含 `div_yield` 股息率与 10 个 K 线形态布尔因子，见 `kpattern.go`；**形态是描述性因子，不进任何评分权重**）、条件树 DSL 选股（21 内置白话策略+自定义策略），`/screener` 页；策略信号进推荐候选池。
 - **backtest / analysis_asof**（M2）：回测时光机（A 股约束五件套/无未来泄露切片复算）、历史推荐批次回验 α 分布、分析 as_of 回溯诊断与 hindsight 事后核验，`/backtest` 页。
 - **mood / fundflow / emlhb**（M3a）：龙虎榜、涨停池/炸板率情绪聚合、股吧人气榜、主力资金流（排行+单股历史），入推荐加分项、市场分析情绪段与个股详情。
 - **intraday**（M3b）：腾讯 5 分钟线盘中因子（尾盘拉升/跳水/VWAP 偏离/重心上移），入短线推荐加分。

@@ -94,6 +94,19 @@ var factorDefs = []factorDef{
 	{"high_250d", "创年内新高", "形态", fkBool, "收盘创近 250 日收盘新高"},
 	{"drawdown_20", "近20日最大回撤", "形态", fkPct, "近 20 日自高点最大回撤（正数）"},
 	{"volatility_20", "波动率(20日)", "形态", fkPct, "近 20 日日收益率标准差"},
+	// K 线形态（C12）：**描述性因子，不是买卖信号**，不参与任何评分权重。
+	// 每个 desc 都写死判定式，避免 AI 与用户望文生义（形态名在坊间有多种口径）。
+	// 数据不足/日线无效时为缺失（NaN）——NaN 连 is_false 也不命中，「未知」不等于「否」。
+	{"macd_golden_cross", "MACD金叉(当日)", "形态", fkBool, "最新一根 DIF 上穿 DEA（前一根 DIF≤DEA 且最新根 DIF>DEA）。与 macd_cross_up（近 3 日内出现过金叉）的区别是只认当天"},
+	{"ma_bull_align", "均线完全多头", "形态", fkBool, "MA5>MA10>MA20>MA60 且收盘价站上 MA5。比 bull_align（仅 MA5>MA10>MA20）多要求 60 日线与价格在最上方"},
+	{"morning_star", "早晨之星", "形态", fkBool, "三根 K 线：①阴线；②小实体星线（实体≤①实体一半）且实体不高于①的收盘；③阳线且收盘超过①实体中点。A 股跳空少，不强制要求缺口"},
+	{"evening_star", "黄昏之星", "形态", fkBool, "三根 K 线：①阳线；②小实体星线（实体≤①实体一半）且实体不低于①的收盘；③阴线且收盘跌破①实体中点。A 股跳空少，不强制要求缺口"},
+	{"bullish_engulfing", "看涨吞没", "形态", fkBool, "两根 K 线：前一根阴线，最新一根阳线且实体完全包住前一根实体（开盘≤前收、收盘≥前开）"},
+	{"dark_cloud", "乌云盖顶", "形态", fkBool, "两根 K 线：前一根阳线，最新一根高开（开盘>前收）收阴，收盘跌破前一根实体中点但未跌破前一根开盘（跌破即为看跌吞没）"},
+	{"hammer", "锤子线", "形态", fkBool, "最新一根：下影线≥实体 2 倍且上影线≤实体，实体非零。**只描述当日形态、不含位置判定**——出现在高位时是「上吊线」，需自行结合 pos_60 等位置因子"},
+	{"doji", "十字星", "形态", fkBool, "最新一根：实体≤当日振幅的 10% 且振幅>0（一字板振幅为 0，不算十字星）"},
+	{"three_white_soldiers", "红三兵", "形态", fkBool, "连续三根阳线，收盘逐日走高，且每根开盘价落在前一根实体之内（不跳空高开）"},
+	{"consecutive_up", "三连涨", "形态", fkBool, "最近 3 个交易日收盘价逐日走高（按收盘口径，不看阴阳）"},
 	// 量能
 	{"vol_boost", "量比(5日)", "量能", fkRatio, "今日成交量 / 前 5 日均量"},
 	{"vol_5v20", "量能趋势", "量能", fkRatio, "5 日均量 / 20 日均量"},
@@ -118,6 +131,9 @@ var factorDefs = []factorDef{
 	{"chip_profit", "获利盘比例", "筹码", fkPct, "收盘价下方筹码占比"},
 	{"chip_avg_cost", "筹码平均成本", "筹码", fkPrice, "全体持仓筹码的加权平均成本"},
 	{"chip_bars", "筹码窗口根数", "筹码", fkInt, "参与筹码计算的日线根数（<210 精度受限）"},
+	// 估值（C10；宽表**唯一**的非日线派生因子，来自落库的分红方案表 corporate_actions，
+	// 不是实时接口——PE/PB 那类实时单只估值仍无法全市场普查，别据此再加）
+	{"div_yield", "股息率", "估值", fkPct, "最近一期有股息率的分红方案的年度股息率（东财 DIVIDENT_RATIO，非按当前股价实时折算；本地无该股方案数据时为缺失，不是 0）"},
 	// 其他
 	{"is_st", "ST/风险警示", "其他", fkBool, "名称含 ST 或退市警示"},
 	{"bar_count", "日线根数", "其他", fkInt, "本股参与计算的日线根数"},
@@ -176,9 +192,16 @@ func (t *FactorTable) Fresh(i int) bool { return t.LastDates[i] == t.TradeDate }
 // ---------- 单股因子行计算 ----------
 
 // wideStockMeta 计算单股因子行所需的宇宙元数据。
+//
+// DivYield/DivYieldOK（C10）是**当前时点**的股息率，不是 as-of 可重建的历史序列
+// （上游只给「最近方案的股息率」这一个快照值）。故 M2 回测 / S3 因子 IC / walk-forward
+// 这些按历史切片复跑因子的路径**一律不填**，零值 DivYieldOK=false → div_yield 列为 NaN
+// ——把今天的股息率贴到历史信号日上就是未来函数，宁可缺失。
 type wideStockMeta struct {
-	Name string
-	ST   bool
+	Name       string
+	ST         bool
+	DivYield   float64 // 股息率 %（仅 DivYieldOK=true 时有意义）
+	DivYieldOK bool    // 是否取到股息率（false=无数据，**不是 0%**）
 }
 
 // computeWideRow 由升序日线算一行因子（按 factorDefs 序）。bars 需 ≥1 根。
@@ -478,6 +501,16 @@ func computeWideRowOpts(symbol string, meta wideStockMeta, bars []datasource.Bar
 	}
 
 	setBool("is_st", meta.ST)
+	// C10 股息率：外部装载的宇宙元数据，不由日线派生。未取到时保持 NaN（缺失≠0%）。
+	if meta.DivYieldOK {
+		set("div_yield", round2(meta.DivYield))
+	}
+	// C12 K 线形态：纯本地日线判定，样本不足/坏根为 NaN（见 kpattern.go）。
+	for key, v := range computePatternFactors(bars) {
+		if v.known {
+			setBool(key, v.hit)
+		}
+	}
 	set("bar_count", float64(n))
 	return vals
 }
@@ -529,9 +562,16 @@ func buildFactorTable(ctx context.Context) (*FactorTable, error) {
 	if err := common.DB.Select("symbol", "name").Where("market = ?", "cn").Find(&states).Error; err != nil {
 		return nil, err
 	}
+	// C10 股息率：全市场一次读全（窗口内有股息率的方案行，量级 ≤2 万）。
+	// 查询失败只是这一列缺失（返回空 map → 全列 NaN），不阻断整表构建。
+	divYields := DividendYieldsFor(nil, time.Now())
 	metaBy := make(map[string]wideStockMeta, len(states))
 	for _, st := range states {
-		metaBy[st.Symbol] = wideStockMeta{Name: st.Name, ST: isSTName(st.Name)}
+		m := wideStockMeta{Name: st.Name, ST: isSTName(st.Name)}
+		if y, ok := divYields[st.Symbol]; ok {
+			m.DivYield, m.DivYieldOK = y, true
+		}
+		metaBy[st.Symbol] = m
 	}
 
 	// 流式读 + 并行计算。

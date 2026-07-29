@@ -17,7 +17,10 @@ import (
 // 历史初始化推进都会走它）。首写胜的不可变纪律见 model/factorsnapshot.go 注释。
 
 // factorSnapshotVersion 因子快照版本（factorDefs 清单/口径变更时递增）。
-const factorSnapshotVersion = "fv1"
+// fv2（2026-07-29，C10+C12）：新增 div_yield 估值因子与 10 个 K 线形态布尔因子。
+// **历史 fv1 行不重写**（首写胜的不可变纪律）——fv1 快照里天然没有这些键，
+// 消费方按「键缺失=该日无该因子」处理，不得把缺键当成 0/false。
+const factorSnapshotVersion = "fv2"
 
 // SnapshotFactorTable 把宽表 t 固化落库。已有行不可变（重建/重跑不覆盖——daily_bars
 // 前复权重锚会整股重写，覆盖=把重写后的值伪装成当时快照，PIT 泄漏）；同一 trade_date

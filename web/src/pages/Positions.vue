@@ -41,6 +41,8 @@ import {
   type TradeStats,
   type TradeStatBucket,
   type PortfolioCurve,
+  type ExposureDim,
+  type ExposureBucket,
   listCorpAdjusts,
   actCorpAdjust,
   type PositionCorpAdjust,
@@ -606,7 +608,11 @@ async function loadStats() {
 }
 watch(mainTab, (t) => {
   if (t === 'stats' && !stats.value) loadStats()
-  if (t === 'list') nextTick(() => renderCurve())
+  if (t === 'list')
+    nextTick(() => {
+      renderCurve()
+      renderExposure()
+    })
 })
 watch(statsRange, () => {
   if (mainTab.value === 'stats') loadStats()
@@ -620,6 +626,94 @@ function bucketBarWidth(list: TradeStatBucket[], b: TradeStatBucket) {
   const max = Math.max(...list.map((x) => Math.abs(x.realized_pnl)), 1)
   return `${(Math.abs(b.realized_pnl) / max) * 100}%`
 }
+
+// ---------- C13 行业 / 风格暴露 ----------
+// 数据随组合总览一起下发（GET /positions/overview），不额外请求。
+// **纪律**：某一维 available=false 就整块不渲染——那是「不知道」，不是「分布均匀」；
+// unknown 桶用中性色且恒排最后（后端已保证顺序，前端不再重排）。
+const exposureEl = ref<HTMLDivElement | null>(null)
+let exposureChart: echarts.ECharts | null = null
+const exposureDimKey = ref<'industry' | 'cap_style' | 'value_style'>('industry')
+const exposureDimOptions = [
+  { label: '行业', value: 'industry' },
+  { label: '市值风格', value: 'cap_style' },
+  { label: '估值风格', value: 'value_style' },
+]
+const exposure = computed(() => overview.value?.exposure || null)
+const exposureDim = computed<ExposureDim | null>(() => {
+  const ex = exposure.value
+  if (!ex) return null
+  const d = ex[exposureDimKey.value]
+  return d?.available ? d : null
+})
+// 有任意一维可用才渲染整张卡（三维全无数据时不摆一张空卡）。
+const exposureAnyAvailable = computed(() => {
+  const ex = exposure.value
+  return !!ex && (ex.industry.available || ex.cap_style.available || ex.value_style.available)
+})
+// 不可用维度的空态文案：分维度说清「为什么没有」，不写笼统的「暂无数据」。
+const exposureEmptyText = computed(() => {
+  switch (exposureDimKey.value) {
+    case 'industry':
+      return '行业归属尚未积累（全市场宇宙快照按交易日盘后落库），本维暂不可用——这是「暂时不知道」，不是「没有行业集中」。'
+    case 'cap_style':
+      return '估值数据源本次未取到总市值，本维暂不可用。'
+    default:
+      return '估值数据源本次未取到 PE，本维暂不可用。'
+  }
+})
+
+function renderExposure() {
+  const dim = exposureDim.value
+  if (!exposureEl.value || !dim || !dim.buckets.length) {
+    exposureChart?.dispose()
+    exposureChart = null
+    return
+  }
+  exposureChart?.dispose()
+  exposureChart = echarts.init(exposureEl.value, isDark.value ? 'dark' : undefined)
+  const primary = vars.value.primaryColor
+  // 未知桶用文字三级色（中性），真实桶用主色按占比depth 递减——
+  // 全部走主题键，6 套主题下都成立，无硬编码色。
+  const known = dim.buckets.filter((b) => !b.unknown)
+  const colorOf = (b: ExposureBucket, i: number) => {
+    if (b.unknown) return withAlpha(vars.value.textColor3, 0.45)
+    const step = known.length > 1 ? i / (known.length - 1) : 0
+    return withAlpha(primary, 1 - step * 0.55)
+  }
+  exposureChart.setOption({
+    backgroundColor: 'transparent',
+    tooltip: {
+      trigger: 'item',
+      confine: true,
+      formatter: (p: { name: string; value: number; dataIndex: number }) => {
+        const b = dim.buckets[p.dataIndex]
+        if (!b) return ''
+        const tail = b.unknown ? '<br/>（数据缺失，不代表分布均匀）' : ''
+        return `${b.label}<br/>占比 ${b.weight_pct.toFixed(1)}% · ${b.count} 只<br/>市值 ${fmtMoney(b.value)}${tail}`
+      },
+    },
+    grid: { left: 8, right: 46, top: 6, bottom: 6, containLabel: true },
+    xAxis: { type: 'value', max: 100, axisLabel: { formatter: '{value}%', fontSize: 10 }, splitLine: { lineStyle: { color: vars.value.dividerColor } } },
+    // 横向条形图：类目多时自上而下阅读比饼图更清楚（行业可能十几个）。
+    yAxis: {
+      type: 'category',
+      inverse: true,
+      data: dim.buckets.map((b) => b.label),
+      axisLabel: { fontSize: 11, color: vars.value.textColor2 },
+      axisTick: { show: false },
+    },
+    series: [
+      {
+        type: 'bar',
+        data: dim.buckets.map((b, i) => ({ value: b.weight_pct, itemStyle: { color: colorOf(b, i), borderRadius: [0, 4, 4, 0] } })),
+        barMaxWidth: 18,
+        label: { show: true, position: 'right', formatter: '{c}%', fontSize: 10, color: vars.value.textColor3 },
+      },
+    ],
+  })
+}
+watch([exposureDimKey, exposure], () => nextTick(() => renderExposure()))
 
 // ---------- B7 资产曲线 ----------
 const curveEl = ref<HTMLDivElement | null>(null)
@@ -849,10 +943,14 @@ function renderCurve() {
 }
 function onResize() {
   curveChart?.resize()
+  exposureChart?.resize()
 }
 // 主题变化整套重绘：6 套主题中明暗只是其一，同为浅色的两套换主题时 isDark 不变
 // 而 primaryColor/dividerColor 全变，只监听 isDark 会留在旧色板上。
-watch([isDark, vars], () => renderCurve())
+watch([isDark, vars], () => {
+  renderCurve()
+  renderExposure()
+})
 
 onMounted(async () => {
   // 从自选/推荐「建仓」跳转而来：预填并打开建仓弹窗，然后清掉 query。
@@ -885,6 +983,8 @@ onBeforeUnmount(() => {
   curveAbort = null
   curveChart?.dispose()
   curveChart = null
+  exposureChart?.dispose()
+  exposureChart = null
 })
 </script>
 
@@ -1063,6 +1163,29 @@ onBeforeUnmount(() => {
                 。研究参考，不构成投资建议。
               </div>
             </div>
+          </SectionCard>
+
+          <!-- C13 行业 / 风格暴露：回答「我是不是把钱全压在一个赛道上」。
+               缺数据的维度整块缺席（那是「不知道」不是「均匀」），
+               缺失部分显式成「未知」桶且恒排最后。 -->
+          <SectionCard v-if="exposureAnyAvailable" title="行业 / 风格暴露">
+            <template #extra>
+              <n-radio-group v-model:value="exposureDimKey" size="small">
+                <n-radio-button v-for="o in exposureDimOptions" :key="o.value" :value="o.value">
+                  {{ o.label }}
+                </n-radio-button>
+              </n-radio-group>
+            </template>
+            <template v-if="exposureDim">
+              <div ref="exposureEl" class="exposure-chart"></div>
+              <div class="exposure-meta qv-tnum">
+                已定价市值 {{ fmtMoney(exposure?.base ?? 0) }} · 本维覆盖
+                {{ exposureDim.known_pct.toFixed(1) }}%
+              </div>
+              <div v-if="exposureDim.note" class="exposure-note">{{ exposureDim.note }}</div>
+              <div class="exposure-note">{{ exposure?.base_note }}</div>
+            </template>
+            <n-empty v-else :description="exposureEmptyText" />
           </SectionCard>
 
           <!-- B7 资产曲线：读每交易日 16:20 落库的快照，不做插值补造 -->
@@ -1921,6 +2044,23 @@ onBeforeUnmount(() => {
   line-height: 1.7;
 }
 
+/* ---------- C13 行业 / 风格暴露 ---------- */
+.exposure-chart {
+  width: 100%;
+  height: 260px;
+}
+.exposure-meta {
+  margin-top: 6px;
+  font-size: 12.5px;
+  opacity: 0.75;
+}
+.exposure-note {
+  margin-top: 4px;
+  font-size: 12px;
+  opacity: 0.6;
+  line-height: 1.7;
+}
+
 /* ---------- B5 流水明细 ---------- */
 .row-wrap {
   border-bottom: 1px solid var(--qv-divider);
@@ -2089,6 +2229,10 @@ onBeforeUnmount(() => {
 @media (max-width: 768px) {
   .curve-chart {
     height: 240px;
+  }
+  /* 行业桶多时手机上要更高才放得下类目标签 */
+  .exposure-chart {
+    height: 280px;
   }
   .dist-grid,
   .top-grid {

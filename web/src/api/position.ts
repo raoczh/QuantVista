@@ -77,6 +77,35 @@ export interface PositionPeak {
   note?: string
 }
 
+// C13 行业 / 市值风格 / 估值风格暴露。
+// **available=false 表示该维度一条数据都没有（不知道），不是「分布均匀」**——整块不渲染。
+// unknown=true 的桶是「数据缺失」桶，必须中性色 + 恒排最后，不得与真实取值混排。
+export interface ExposureBucket {
+  key: string
+  label: string
+  value: number // 市值（元）
+  weight_pct: number // 占已定价持仓市值 %
+  count: number // 标的数（同标的多笔仓算一只）
+  unknown?: boolean
+}
+
+export interface ExposureDim {
+  available: boolean
+  buckets: ExposureBucket[]
+  known_pct: number // 有归属的市值占比 %
+  top_label?: string
+  top_weight_pct?: number
+  note?: string
+}
+
+export interface PortfolioExposure {
+  base: number // 已定价持仓市值合计（元）
+  base_note: string
+  industry: ExposureDim
+  cap_style: ExposureDim
+  value_style: ExposureDim
+}
+
 export interface PortfolioOverview {
   holding_count: number
   total_cost: number
@@ -93,6 +122,7 @@ export interface PortfolioOverview {
   top_weight_pct: number // 最大单一持仓占比 %
   quote_failed_count: number // 行情拉取失败、未计入市值/收益的持仓数（部分估值口径）
   quote_stale_count: number // 行情已过期（非当前有效）、未计入市值/收益的持仓数
+  exposure?: PortfolioExposure // C13；缺席=没有可定价的持仓
   signals: string[] // 风控信号（集中度/止损/未分析）
 }
 

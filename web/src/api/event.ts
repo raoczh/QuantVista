@@ -71,11 +71,23 @@ export interface CorporateAction {
   plan_profile: string
 }
 
+// C10 当前股息率与其时点。**缺失时整个对象不下发（undefined），不是 0%**——
+// 展示必须带报告期，不带时点的股息率会被读成实时值。
+export interface DividendYieldView {
+  yield_pct: number // 股息率 %（>0）
+  report_date: string // 方案报告期（as-of）
+  ex_date?: string
+  progress?: string
+  plan_profile?: string
+  note: string // 口径声明（tooltip 用）
+}
+
 export interface StockCorpEvents {
   symbol: string
   market: string
   lifts: RestrictedRelease[]
   actions: CorporateAction[]
+  dividend_yield?: DividendYieldView
   // **unavailable=true 与空数组语义不同**：前者是「查不到」，后者是「确实没有」。
   // 展示时必须区分，不能把未知说成无解禁。
   lift_unavailable: boolean

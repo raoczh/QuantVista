@@ -6,8 +6,11 @@ import "quantvista/model"
 // 白话讲解 + 适用周期 + 风险等级。参考 StockNova builtin 思路按现有因子重写，
 // 阈值沿用项目内已有共识（量比 1.5~5 温和放量、换手 3~15 活跃、RSI 凹形逻辑等）。
 //
-// 纪律：新增策略只能引用 factorDefs 内因子（validateCondTree 会拦）；估值类
-//（PE/PB）宽表没有（腾讯估值是实时单只接口，无法全市场普查），别写进内置策略。
+// 纪律：新增策略只能引用 factorDefs 内因子（validateCondTree 会拦）；实时估值类
+//（PE/PB）宽表没有（腾讯估值是实时单只接口，无法全市场普查），别写进内置策略——
+// 唯一例外是 C10 的 `div_yield`（来自落库的 corporate_actions 分红方案表，可全市场取），
+// 但它对多数股票缺失（NaN），当作硬条件会把没分红数据的票全部筛掉，只宜作可选条件。
+// K 线形态因子（C12）是**描述性**的，可进条件树，但不得据此断言买卖方向。
 
 // builtinScreen 内置策略定义。
 type builtinScreen struct {

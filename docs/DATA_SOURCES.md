@@ -69,6 +69,13 @@
 > `TOTAL_RATIO == CURRENT/(FREE_SHARES+NON_FREE_SHARES)`（占总股本）。
 > 单位换算（万股→股、万元→元、小数→百分数）在 `datasource/emcorpaction.go` 收口，落库后全链路统一。
 
+> **股息率字段的坑（C10，2026-07-29 第六十二批）**：`DIVIDENT_RATIO` 只在方案给出确定分配额时才有值，
+> **预案与纯送转方案返回 null → 落库为 0**。因此「取最近一期方案的 `dividend_yield`」会在
+> 刚发完中报预案的窗口里把股息率报成 **0%**，而 0% 会被用户和模型读成「这家公司不分红」。
+> 正确口径是 `service/dividendyield.go` 的 `pickLatestDividendYield`：**只认 `> 0` 的行**，
+> 最近一期没有就回退上一期（报告期须在 800 天窗口内），全都没有则**整项缺席**。
+> 该值是「某期方案的年度口径」，**不是按当前股价实时折算的值**，展示与引用一律带报告期 as-of。
+
 ### 2.5 东财负载节点（重要技巧）
 
 - 东财把接口分流到 `{1..99}.push2.eastmoney.com` / `{1..99}.push2his.eastmoney.com` 负载节点（来自 akshare 实现）。

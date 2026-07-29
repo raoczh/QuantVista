@@ -26,7 +26,9 @@ import (
 
 const (
 	// screenerParsePromptVersion 解析 prompt 版本（独立于分析 p*/推荐 s* 序列）。
-	screenerParsePromptVersion = "sp3" // sp3: 移除 explain/unmatched 字数与紧凑输出限制；sp2: 输出瘦身
+	// 因子字典由 factorDefs 程序生成，**因子清单变了 prompt 就变了**，须一并递增版本，
+	// 否则同一版本号下的历史解析记录无法复现（当时的字典里根本没有这些因子）。
+	screenerParsePromptVersion = "sp4" // sp4: 因子字典新增 div_yield 与 10 个 K 线形态因子（C10/C12）；sp3: 移除 explain/unmatched 字数与紧凑输出限制；sp2: 输出瘦身
 	parseStrategyTextMax       = 300   // 白话输入长度上限（rune）
 	screenerParseJobTimeout    = 5 * time.Minute
 )
@@ -247,6 +249,9 @@ var parseFactorHints = map[string]string{
 	"ma_spread_pct": "<3 视为均线粘合",
 	"volatility_20": "低波动 <2、高波动 >5",
 	"drawdown_20":   "回撤温和 <8、深回撤 >15",
+	// C10：红利股口径。**多数股票没有股息率数据（缺失≠0）**，用户没明说要「高股息」时
+	// 不要主动加这个条件——加了会把没有分红数据的票全部筛掉。
+	"div_yield": "高股息 >3、超高 >5；A 股多数标的无该数据",
 }
 
 // factorUnitText 因子单位（按展示类型推导）。
@@ -279,7 +284,7 @@ func screenerFactorDictLines() []string {
 	return lines
 }
 
-// buildParseStrategySystemPrompt 解析系统提示词（版本 sp3）。
+// buildParseStrategySystemPrompt 解析系统提示词（版本 sp4）。
 func buildParseStrategySystemPrompt() string {
 	var b strings.Builder
 	b.WriteString("你是选股条件翻译器：把用户的白话选股描述转换成条件树 JSON。你只做翻译，不评价策略好坏，不添加用户没提的条件。\n\n")

@@ -692,6 +692,9 @@ function fmtNetYi(n: number) {
 const todayStr = computed(() => new Date().toLocaleDateString('sv-SE'))
 const upcomingLifts = computed(() => (corpEvents.value?.lifts || []).filter((l) => l.free_date >= todayStr.value))
 const pastLifts = computed(() => (corpEvents.value?.lifts || []).filter((l) => l.free_date < todayStr.value))
+// C10 当前股息率（后端 pickLatestDividendYield 统一挑选，前端不再自己从 actions 里挑，
+// 避免和 AI 快照/选股因子算出不同的数字）。undefined = 无数据，估值卡该项整项缺席。
+const dividendYield = computed(() => corpEvents.value?.dividend_yield)
 function fmtWanShares(n: number) {
   return (n / 1e4).toFixed(0)
 }
@@ -1107,6 +1110,21 @@ function scoreType(total: number) {
                   <div class="qc"><span class="qc-k">市净率</span><span class="qc-v qv-tnum">{{ fmt(valuation.pb) }}</span></div>
                   <div class="qc"><span class="qc-k">总市值</span><span class="qc-v qv-tnum">{{ fmtCap(valuation.total_cap) }}</span></div>
                   <div class="qc"><span class="qc-k">流通市值</span><span class="qc-v qv-tnum">{{ fmtCap(valuation.float_cap) }}</span></div>
+                  <!-- C10 股息率：来源与本卡其余项不同（东财分红方案，非腾讯实时行情），
+                       故必须带报告期时点与来源说明；无数据时整项缺席，绝不显示 0%
+                       （0% 会被读成「不分红」，而实际只是本地还没有该股的方案数据）。 -->
+                  <div v-if="dividendYield" class="qc">
+                    <span class="qc-k">股息率</span>
+                    <n-tooltip trigger="hover" :style="{ maxWidth: '320px' }">
+                      <template #trigger>
+                        <span class="qc-v qv-tnum qc-hint"
+                          >{{ dividendYield.yield_pct.toFixed(2) }}%
+                          <span class="qc-asof">{{ dividendYield.report_date }}</span></span
+                        >
+                      </template>
+                      {{ dividendYield.note }}
+                    </n-tooltip>
+                  </div>
                 </template>
                 <div v-else class="qc qc-wide"><span class="qc-k">类型</span><span class="qc-v">ETF/场内基金（无 PE/PB 个股估值指标）</span></div>
                 <div class="qc"><span class="qc-k">换手率</span><span class="qc-v qv-tnum">{{ fmt(valuation.turnover_rate) }}%</span></div>
@@ -1303,6 +1321,18 @@ function scoreType(total: number) {
 }
 .qc-v {
   font-weight: 600;
+}
+/* C10 股息率：与本卡其余项来源不同，用虚线下划线提示「悬停看口径」，
+   报告期弱化随行展示（不带时点的股息率会被读成实时值）。 */
+.qc-hint {
+  cursor: help;
+  border-bottom: 1px dotted currentColor;
+}
+.qc-asof {
+  font-weight: 400;
+  font-size: 11px;
+  opacity: 0.55;
+  margin-left: 2px;
 }
 .actions {
   display: flex;

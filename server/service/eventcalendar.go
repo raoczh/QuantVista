@@ -331,6 +331,10 @@ type StockCorpEvents struct {
 	Lifts   []model.RestrictedRelease `json:"lifts"`
 	Actions []model.CorporateAction   `json:"actions"`
 
+	// DividendYield 当前股息率与其报告期（C10；nil = 无数据，**不是 0%**）。
+	// 由 pickLatestDividendYield 统一挑选，个股详情估值区与 AI 快照共用同一口径。
+	DividendYield *DividendYieldView `json:"dividend_yield,omitempty"`
+
 	// LiftUnavailable/ActionUnavailable：**该维度数据不可用**（同步未跑/读取失败），
 	// 与「确实没有解禁/分红」是两回事——前端与 AI 都必须区分，不能把未知说成没有。
 	LiftUnavailable   bool   `json:"lift_unavailable"`
@@ -375,6 +379,12 @@ func StockCorpEventsFor(market, symbol string) (*StockCorpEvents, error) {
 	}
 	if out.Actions == nil {
 		out.Actions = []model.CorporateAction{}
+	}
+	// C10 当前股息率：在已取到的最近 stockActionLimit 期方案里挑（它们已按报告期降序，
+	// 覆盖约 2~4 年，足够回看窗口）。**读取失败时不挑**——失败已置 ActionUnavailable，
+	// 此时给出股息率等于用空结果冒充「无分红」。
+	if !out.ActionUnavailable {
+		out.DividendYield = pickLatestDividendYield(out.Actions, now)
 	}
 	return out, nil
 }
