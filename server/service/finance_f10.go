@@ -15,7 +15,8 @@ import (
 
 // F2 财务数据服务：F10 主要财务指标 + 三大报表关键科目的按需拉取与缓存。
 // 不做全市场普查——只有个股详情/AI 快照/长线推荐候选首次访问才触发上游拉取，
-// 之后走本地缓存；新鲜度 7 天（财报按季披露，7 天再查一次足够及时）。
+// 之后走本地缓存；推荐路径以披露日历的新报告信号触发刷新，7 天水位只作缺日历时
+// 的容灾探测（财报按季披露）。
 // 冷却/新鲜度状态用包级共享（FinanceService 有多个实例，annFetch 前科）。
 
 var (
@@ -32,8 +33,8 @@ const (
 )
 
 var (
-	finSyncMu   sync.Mutex
-	finSyncTry  = map[string]time.Time{} // "ind:600519" / "stmt:600519" → 上次尝试时刻
+	finSyncMu  sync.Mutex
+	finSyncTry = map[string]time.Time{} // "ind:600519" / "stmt:600519" → 上次尝试时刻
 )
 
 // finTryAllowed 尝试冷却检查（成功失败一律记时刻，1h 内不重试同一目标）。
@@ -47,26 +48,36 @@ func finTryAllowed(key string) bool {
 	return true
 }
 
-// finFresh 表内该股最新 updated_at 是否仍在新鲜期。
+// finFresh 表内该股最新 updated_at 是否仍在新鲜期。不要用 MAX(updated_at)：
+// SQLite 聚合表达式会丢失列的时间类型，扫描到 time.Time 失败后水位会永久为 false。
 func finFresh(mdl any, symbol string) bool {
 	if common.DB == nil {
 		return true // 无 DB 环境（纯函数单测）不触发上游
 	}
-	var last time.Time
-	row := common.DB.Model(mdl).Where("symbol = ?", symbol).Select("MAX(updated_at)").Row()
-	if row == nil || row.Scan(&last) != nil || last.IsZero() {
+	var row struct {
+		UpdatedAt time.Time `gorm:"column:updated_at"`
+	}
+	res := common.DB.Model(mdl).Where("symbol = ?", symbol).
+		Select("updated_at").Order("updated_at DESC").Limit(1).Scan(&row)
+	if res.Error != nil || res.RowsAffected == 0 || row.UpdatedAt.IsZero() {
 		return false
 	}
-	return time.Since(last) < finFreshTTL
+	return time.Since(row.UpdatedAt) < finFreshTTL
 }
 
 // ensureFinanceIndicators F10 主要财务指标按需同步（best-effort：失败静默，
 // 消费方按「缓存里有什么用什么」处理）。返回是否发生了上游拉取。
 func ensureFinanceIndicators(ctx context.Context, symbol string) bool {
+	return syncFinanceIndicators(ctx, symbol, false)
+}
+
+// syncFinanceIndicators 执行实际同步。force 只用于已有代码证据表明缓存不可用的场景：
+// 当前时点没有可用行，或披露日历已确认出现了更晚报告；它不会绕过 1h 尝试冷却。
+func syncFinanceIndicators(ctx context.Context, symbol string, force bool) bool {
 	if common.DB == nil || !isSixDigits(symbol) {
 		return false
 	}
-	if finFresh(&model.FinanceIndicator{}, symbol) || !finTryAllowed("ind:"+symbol) {
+	if (!force && finFresh(&model.FinanceIndicator{}, symbol)) || !finTryAllowed("ind:"+symbol) {
 		return false
 	}
 	rows, err := fetchF10(ctx, symbol)
@@ -107,6 +118,60 @@ func ensureFinanceIndicators(ctx context.Context, symbol string) bool {
 		common.SysWarn("财务指标落库失败 %s: %v", symbol, err)
 	}
 	return true
+}
+
+// financeIndicatorAsOf 返回截至 asOf 可证明已公告的最新 F10 行。NoticeDate 是首选
+// 可用时点；上游缺公告日时，必须由披露日历证明同报告期已实际发布，不能仅凭较新的
+// ReportDate 猜测可用性。
+func financeIndicatorAsOf(symbol, asOf string) *model.FinanceIndicator {
+	if common.DB == nil {
+		return nil
+	}
+	var rows []model.FinanceIndicator
+	res := common.DB.Where("symbol = ? AND market = ?", symbol, "cn").
+		Where("notice_date = '' OR notice_date IS NULL OR notice_date <= ?", asOf).
+		Order("report_date DESC, id DESC").Limit(finIndicatorKeep).Find(&rows)
+	if res.Error != nil || res.RowsAffected == 0 {
+		return nil
+	}
+	for i := range rows {
+		if rows[i].NoticeDate != "" || financeReportPublishedAsOf(symbol, rows[i].ReportDate, asOf) {
+			return &rows[i]
+		}
+	}
+	return nil
+}
+
+const financePublishedAsOfClause = `(actual_date <> '' AND actual_date <= ?)
+	OR ((actual_date = '' OR actual_date IS NULL) AND is_published = ?
+		AND appoint_date <> '' AND appoint_date <= ?)`
+
+func financeReportPublishedAsOf(symbol, reportDate, asOf string) bool {
+	if common.DB == nil || reportDate == "" {
+		return false
+	}
+	var count int64
+	res := common.DB.Model(&model.DisclosureSchedule{}).
+		Where("symbol = ? AND market = ? AND report_date = ?", symbol, "cn", reportDate).
+		Where(financePublishedAsOfClause, asOf, true, asOf).Count(&count)
+	return res.Error == nil && count > 0
+}
+
+// publishedFinanceReportAfter 用每日刷新的披露日历判断缓存是否已明确落后一季。
+// ActualDate 优先；上游缺 ActualDate 时才以 IsPublished+已到预约日兜底。所有日期都
+// 截断在 asOf，避免未来预约/公告造成 point-in-time 泄漏。
+func publishedFinanceReportAfter(symbol, reportDate, asOf string) string {
+	if common.DB == nil || reportDate == "" {
+		return ""
+	}
+	var row model.DisclosureSchedule
+	res := common.DB.Where("symbol = ? AND market = ? AND report_date > ?", symbol, "cn", reportDate).
+		Where(financePublishedAsOfClause, asOf, true, asOf).
+		Order("report_date DESC, id DESC").Limit(1).Find(&row)
+	if res.Error != nil || res.RowsAffected == 0 {
+		return ""
+	}
+	return row.ReportDate
 }
 
 // ensureFinanceStatements 三大报表关键科目按需同步（约 7 次上游请求 ≈3~4s，
@@ -250,16 +315,16 @@ type candFin struct {
 	DebtRatio    float64 `json:"debt_ratio,omitempty"`
 }
 
-// financeFactorFor 读取某股最新一期财务摘要供推荐评分/LLM 名单。
-// DB 缓存优先；缺失且预算未耗尽时上游拉一次（budget 由单次生成共享，控总时长）。
-// 返回 nil = 无数据（缺失不惩罚）。
+// financeFactorFor 读取某股截至当前时点可用的最新一期财务摘要供推荐评分/LLM 名单。
+// 披露日历确认有更新报告时强制尝试刷新；若刷新失败则 fail-closed，不让已知过期报告
+// 继续加分。没有更新事件时仍沿用 7 天同步水位作缺日历的容灾探测。
 func financeFactorFor(ctx context.Context, symbol string, budget *int) *candFin {
 	if common.DB == nil || !isSixDigits(symbol) {
 		return nil
 	}
-	load := func() *candFin {
-		var r model.FinanceIndicator
-		if err := common.DB.Where("symbol = ?", symbol).Order("report_date DESC").First(&r).Error; err != nil {
+	asOf := time.Now().In(time.Local).Format("2006-01-02")
+	toFactor := func(r *model.FinanceIndicator) *candFin {
+		if r == nil {
 			return nil
 		}
 		return &candFin{
@@ -268,14 +333,28 @@ func financeFactorFor(ctx context.Context, symbol string, budget *int) *candFin 
 			GrossMargin: round2(r.GrossMargin), NetMargin: round2(r.NetMargin), DebtRatio: round2(r.DebtRatio),
 		}
 	}
-	if f := load(); f != nil {
-		return f
+
+	cached := financeIndicatorAsOf(symbol, asOf)
+	requiredReport := ""
+	if cached != nil {
+		requiredReport = publishedFinanceReportAfter(symbol, cached.ReportDate, asOf)
+	}
+	refreshNeeded := cached == nil || requiredReport != "" || !finFresh(&model.FinanceIndicator{}, symbol)
+	if !refreshNeeded {
+		return toFactor(cached)
 	}
 	if budget == nil || *budget <= 0 {
-		return nil
+		if requiredReport != "" {
+			return nil // 已知有新报告但无法刷新，旧报告不得继续参与推荐。
+		}
+		return toFactor(cached)
 	}
-	if ensureFinanceIndicators(ctx, symbol) {
+	if syncFinanceIndicators(ctx, symbol, cached == nil || requiredReport != "") {
 		*budget--
 	}
-	return load()
+	latest := financeIndicatorAsOf(symbol, asOf)
+	if requiredReport != "" && (latest == nil || latest.ReportDate < requiredReport) {
+		return nil
+	}
+	return toFactor(latest)
 }

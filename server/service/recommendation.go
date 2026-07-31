@@ -157,9 +157,12 @@ type candidate struct {
 	Rank        int      `json:"rank,omitempty"`          // 未被排除者中的排名（1=最高）
 	Bonus       []string `json:"bonus,omitempty"`         // 策略加分/扣分明细（可解释）
 	SentToLLM   bool     `json:"sent_to_llm,omitempty"`
-	// QuoteAsOf 行情时效硬门通过时的数据源行情时刻（YYYY-MM-DD HH:MM）：终选名单喂
-	// LLM 前逐只全源核验并刷新现价，此字段随池快照/pick 明细落库，标明推荐建立在
-	// 哪个时点的行情上（字符串不进数值核验值域）。
+	// LLMInputOrder 是终选时效复核后实际送入模型的顺序（1-based）。Rank 是量化
+	// 排名，两者不能互相推导：名单按 pool 稳定顺序组装，且终选门可能继续剔除标的。
+	LLMInputOrder int `json:"llm_input_order,omitempty"`
+	// QuoteAsOf 评分前行情时效硬门通过时的数据源行情时刻（YYYY-MM-DD HH:MM）：
+	// 终选名单喂 LLM 前会再次全源核验有效性，但不单独覆盖现价制造「新价+旧分」。
+	// 此字段随池快照/pick 明细落库，标明整套评分与推荐建立在哪个一致快照上。
 	QuoteAsOf string `json:"quote_as_of,omitempty"`
 
 	// 进程内工作字段（小写不序列化，不进池快照）：closes/closeDates 尾部收盘序列及
@@ -660,15 +663,18 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		}
 	}
 	// 终选兜底门：评分期间（数秒~数十秒）行情可能失效，喂 LLM 前再核验一次
-	//（freshenPool 刚拉过、大概率命中缓存）。fresh 刷新现价/涨跌幅并记 quote_as_of；
-	// stale/取不到透明排除。全部过期时宁可零推荐也不基于旧价精选。
-	staleGates := s.applyQuoteFreshGate(ctx, market, pool, &llmCands)
+	//（freshenPool 刚拉过、大概率命中缓存）。stale/取不到或最新价已越过价格筛选时
+	// 透明排除；其余保留评分时的一致快照，不单独刷新现价制造「新价+旧分」。
+	finalRemoved, staleGates := s.applyQuoteFreshGate(ctx, market, pool, &llmCands, filters)
 	gates = append(gates, staleGates...)
-	kept -= len(staleGates)
+	kept -= finalRemoved
 	if len(llmCands) == 0 {
 		return nil, s.failEmptyShortlist(batch, pool, filters, gates, industryBy, kept,
 			len(staleGates) > 0 || len(freshGates) > 0)
 	}
+	// 冻结真正的模型输入顺序。必须与 compactForLLM 共用 rank 排序口径，并在
+	// 终选门之后写回 pool；候选池快照、事件事实与 prompt 才能稳定重建同一机会集。
+	llmCands = freezeLLMInputOrder(pool, llmCands)
 	poolBySymbol := make(map[string]candidate, len(llmCands))
 	for _, c := range llmCands {
 		poolBySymbol[c.Symbol] = c
@@ -1681,12 +1687,14 @@ func medianAmountsFor(market string, symbols []string) map[string]float64 {
 }
 
 // quoteFreshGateVersion 行情时效硬门判定版本（判定规则/口径变更时递增）。
+// qf4：终选复核使用最新 fresh quote 重跑价格/涨停边界，但通过者保留评分前的一致
+// 快照，不再只覆盖 Price/ChangePct 形成「新价+旧分」；终选筛除数同步修正池计数。
 // qf3：刷新前置到用户筛选**终判**之前（buildPool 内：静态筛选 → 刷新 → 用户筛选 →
 // 名额分配）——qf2 的刷新发生在旧价筛选与名额分配之后，被旧价误排除的候选（旧价 9 元
 // 撞「最低 10 元」而新价已达标）永远失去翻案机会，排除原因也是基于旧价的假账。
 // qf2：核验从「终选名单喂 LLM 前」前置到「用户筛选复核/评分/排名之前」（qf1 只对
 // Top 名单刷新 Price/ChangePct，评分与筛选仍建立在建池旧价上，新旧数据混合）。
-const quoteFreshGateVersion = "qf3"
+const quoteFreshGateVersion = "qf4"
 
 // applyFreshQuoteToCand 把一条已核验为 fresh 的行情应用到候选（纯函数，便于单测）：
 // 刷新 Price/ChangePct/Amount 等 quote 派生字段并记 QuoteAsOf，随后复筛用户价格/涨停
@@ -1768,14 +1776,22 @@ func (s *RecommendationService) freshenPool(ctx context.Context, pool []candidat
 	return gates
 }
 
+// finalQuoteFilterReason 用最新行情复核价格/涨停筛选，但不改写 scored。评分、
+// 因子、行情与 LLM 快照必须继续属于 freshenPool 时的同一份已核验快照；若
+// 在这里只覆盖 Price/ChangePct，就会制造「新价+旧分」。
+func finalQuoteFilterReason(scored candidate, latest *datasource.Quote, filters RecFilters) string {
+	probe := scored
+	return applyFreshQuoteToCand(&probe, latest, filters)
+}
+
 // applyQuoteFreshGate 终选兜底门：LLM 名单在 freshenPool 之后还要经历数秒级的日线
-// 拉取与评分，喂模型前再核验一次（大概率命中行情缓存，零上游成本）——评分期间行情
-// 失效（跨入午休/收盘停滞等）的候选在此透明剔除。fresh 的刷新 Price/ChangePct 与
-// QuoteAsOf（与评分价的差异为数秒内的正常盘面演进，非「旧价」）。
+// 拉取与评分，喂模型前再核验一次（大概率命中行情缓存，零上游成本）。行情失效
+// 的候选透明剔除；最新价已越过价格/涨停筛选时同样剔除。通过时保留评分时的
+// 已验证行情快照，不单独覆盖价格造成新旧数据混用。返回剔除数与 quote_stale 门控。
 // s.market 为 nil（单测注入环境）时跳过。
-func (s *RecommendationService) applyQuoteFreshGate(ctx context.Context, market string, pool []candidate, llmCands *[]candidate) []gateNote {
+func (s *RecommendationService) applyQuoteFreshGate(ctx context.Context, market string, pool []candidate, llmCands *[]candidate, filters RecFilters) (int, []gateNote) {
 	if s.market == nil || len(*llmCands) == 0 {
-		return nil
+		return 0, nil
 	}
 	refs := make([]QuoteRef, 0, len(*llmCands))
 	for _, c := range *llmCands {
@@ -1787,6 +1803,7 @@ func (s *RecommendationService) applyQuoteFreshGate(ctx context.Context, market 
 		idxBySym[pool[i].Symbol] = i
 	}
 	var gates []gateNote
+	removed := 0
 	keptCands := (*llmCands)[:0]
 	for _, c := range *llmCands {
 		fq, ok := fresh[QuoteKey(market, c.Symbol)]
@@ -1806,21 +1823,21 @@ func (s *RecommendationService) applyQuoteFreshGate(ctx context.Context, market 
 				GateVersion: quoteFreshGateVersion,
 				Reason:      reason,
 			})
+			removed++
 			continue
 		}
-		asOf := fq.Quote.DataTime.In(time.Local).Format("2006-01-02 15:04")
-		c.Price = round2(fq.Quote.Price)
-		c.ChangePct = round2(fq.Quote.ChangePct)
-		c.QuoteAsOf = asOf
-		if i, ok := idxBySym[c.Symbol]; ok {
-			pool[i].Price = c.Price
-			pool[i].ChangePct = c.ChangePct
-			pool[i].QuoteAsOf = asOf
+		if reason := finalQuoteFilterReason(c, fq.Quote, filters); reason != "" {
+			if i, ok := idxBySym[c.Symbol]; ok {
+				pool[i].Excluded = reason
+				pool[i].SentToLLM = false
+			}
+			removed++
+			continue
 		}
 		keptCands = append(keptCands, c)
 	}
 	*llmCands = keptCands
-	return gates
+	return removed, gates
 }
 
 // buildPool 阶段①②：多源建池（自选 ∪ 按策略组合的榜单来源，来源可叠加）→
@@ -2197,7 +2214,8 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 
 			// M3a 主力资金流：缓存优先、预算内补拉；有序列时融合量能维（0.6 原量能
 			// + 0.4 资金分）并派生连续净流入天数因子，缺失不惩罚（评分原样）。
-			if flows, _ := ensureStockFundFlow(ctx, s.em, pool[i].Market, pool[i].Symbol, &flowBudget); len(flows) > 0 {
+			flows, fresh := ensureStockFundFlow(ctx, s.em, pool[i].Market, pool[i].Symbol, &flowBudget)
+			if flows = fundFlowForScoring(flows, fresh); len(flows) > 0 {
 				sc = applyFlowScore(sc, flows)
 				pool[i].Factors.MainNetDays = mainNetStreakDays(flows)
 				pool[i].Factors.MainNet5dYi = round2(mainNetSum(flows, 5) / 1e8)
@@ -2427,10 +2445,33 @@ func (s *RecommendationService) buildMarketContext(ctx context.Context, market s
 	return mc, regime
 }
 
-// compactForLLM 生成喂给 LLM 的候选行（仅入选名单、按 rank 升序、字段紧凑）。
-func compactForLLM(recType string, cands []candidate) []map[string]any {
+// sortedLLMCandidates 是模型输入唯一排序口径。事实冻结与 prompt 紧凑化必须共用，
+// 防止 llm_input_order 记录的是池顺序、模型实际看到的却是 rank 顺序。
+func sortedLLMCandidates(cands []candidate) []candidate {
 	sorted := append([]candidate(nil), cands...)
 	sort.SliceStable(sorted, func(a, b int) bool { return sorted[a].Rank < sorted[b].Rank })
+	return sorted
+}
+
+// freezeLLMInputOrder 按实际送模顺序编号并同步回完整候选池。
+func freezeLLMInputOrder(pool []candidate, cands []candidate) []candidate {
+	sorted := sortedLLMCandidates(cands)
+	poolIdxBySymbol := make(map[string]int, len(pool))
+	for i := range pool {
+		poolIdxBySymbol[pool[i].Symbol] = i
+	}
+	for i := range sorted {
+		sorted[i].LLMInputOrder = i + 1
+		if pi, ok := poolIdxBySymbol[sorted[i].Symbol]; ok {
+			pool[pi].LLMInputOrder = i + 1
+		}
+	}
+	return sorted
+}
+
+// compactForLLM 生成喂给 LLM 的候选行（仅入选名单、按 rank 升序、字段紧凑）。
+func compactForLLM(recType string, cands []candidate) []map[string]any {
+	sorted := sortedLLMCandidates(cands)
 	rows := make([]map[string]any, 0, len(sorted))
 	for _, c := range sorted {
 		row := map[string]any{

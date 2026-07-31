@@ -7,6 +7,7 @@ import (
 
 	"quantvista/common"
 	"quantvista/model"
+	"quantvista/setting"
 )
 
 func TestApplySentimentRules(t *testing.T) {
@@ -78,7 +79,8 @@ func TestNormalizeEnhance(t *testing.T) {
 	}
 }
 
-// TestStockDailySentiment 聚合情绪分：来源权重加权、(symbol,date) 幂等一天一次。
+// TestStockDailySentiment 聚合情绪分：来源权重加权；采集间隔内复用缓存，超间隔后
+// 纳入新增强新闻，避免早盘首次非空结果冻结全天。
 func TestStockDailySentiment(t *testing.T) {
 	setupTestDB(t)
 	common.DB.Where("symbol IN ?", []string{"600001", "600999"}).Delete(&model.StockSentiment{})
@@ -110,16 +112,25 @@ func TestStockDailySentiment(t *testing.T) {
 		t.Errorf("score = %v, want ≈%v", score, want)
 	}
 
-	// 幂等：再插新闻不改变已落库的当日聚合分（一天只算一次）。
+	// 新增一条已增强利空：采集间隔内仍复用同一批证据快照。
+	common.DB.Model(&model.StockSentiment{}).Where("symbol = ? AND date = ?", "600001", date).
+		Update("updated_at", now)
 	mk(-1, 1, "negative")
-	score2, cnt2, _ := stockDailySentimentAt("600001", date, now)
+	score2, cnt2, _ := stockDailySentimentAt("600001", date, now.Add(time.Minute))
 	if score2 != score || cnt2 != cnt {
-		t.Errorf("(symbol,date) 应幂等复用缓存: got (%v,%d) want (%v,%d)", score2, cnt2, score, cnt)
+		t.Errorf("采集间隔内应复用缓存: got (%v,%d) want (%v,%d)", score2, cnt2, score, cnt)
+	}
+
+	// 超过采集间隔后重算，新利空进入结果。
+	refreshAt := now.Add(time.Duration(setting.NewsCollectIntervalMin()+1) * time.Minute)
+	score3, cnt3, ok3 := stockDailySentimentAt("600001", date, refreshAt)
+	if !ok3 || cnt3 != 3 || score3 == score {
+		t.Errorf("超采集间隔应纳入新新闻: got (%v,%d,%v), old=(%v,%d)", score3, cnt3, ok3, score, cnt)
 	}
 
 	// 无新闻标的：落 0 分 0 条、ok=false。
-	if _, cnt3, ok3 := stockDailySentimentAt("600999", date, now); ok3 || cnt3 != 0 {
-		t.Errorf("无新闻应 (0,false), got cnt=%d ok=%v", cnt3, ok3)
+	if _, emptyCount, emptyOK := stockDailySentimentAt("600999", date, now); emptyOK || emptyCount != 0 {
+		t.Errorf("无新闻应 (0,false), got cnt=%d ok=%v", emptyCount, emptyOK)
 	}
 }
 

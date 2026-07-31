@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -403,6 +404,21 @@ func TestChallengerShadowNotMutateBusiness(t *testing.T) {
 	}
 	if row.TraceID != "t-exp" || row.ChampionRun != mainRun.RunID || row.ChallengerTokens != 15 || row.ChampionTokens != 30 {
 		t.Fatalf("关联/成本记录不符: %+v", row)
+	}
+	if row.PickSchemaVersion != llmExperimentPickSchemaVersion {
+		t.Fatalf("逐标的事实 schema 未落库: %+v", row)
+	}
+	var championFacts, challengerFacts []llmExperimentPickFact
+	if err := json.Unmarshal([]byte(row.ChampionPicksJSON), &championFacts); err != nil {
+		t.Fatalf("champion 逐标的事实不是合法 JSON: %v", err)
+	}
+	if err := json.Unmarshal([]byte(row.ChallengerPicksJSON), &challengerFacts); err != nil {
+		t.Fatalf("challenger 逐标的事实不是合法 JSON: %v", err)
+	}
+	if len(championFacts) != 1 || championFacts[0].Symbol != "600100" || championFacts[0].Order != 1 ||
+		len(challengerFacts) != 2 || challengerFacts[0].Symbol != "600100" ||
+		challengerFacts[1].Symbol != "600200" || challengerFacts[1].Order != 2 {
+		t.Fatalf("逐标的输出事实不符: champion=%+v challenger=%+v", championFacts, challengerFacts)
 	}
 	if champion[0].Symbol != championBefore.Symbol || champion[0].Action != championBefore.Action {
 		t.Fatalf("影子采样不得改业务 picks: %+v", champion[0])

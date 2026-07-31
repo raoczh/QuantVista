@@ -98,6 +98,11 @@ type LLMExperimentRun struct {
 	ChampionPicks int    `json:"champion_picks"`
 	OverlapCount  int    `json:"overlap_count"`                  // 与 champion picks 的标的交集
 	CoverageJSON  string `gorm:"type:text" json:"coverage_json"` // challenger 侧 RecCoverageDiag
+	// PickSchemaVersion + 两份 JSON 固化规范化的逐标的输出，供未来按 batch_id+symbol
+	// 关联统一 selection outcome。旧行为空表示当时只记录聚合数量，禁止反推名单。
+	PickSchemaVersion   string `gorm:"size:16" json:"pick_schema_version"`
+	ChampionPicksJSON   string `gorm:"type:text" json:"champion_picks_json"`
+	ChallengerPicksJSON string `gorm:"type:text" json:"challenger_picks_json"`
 
 	ChampionTokens   int    `json:"champion_tokens"`
 	ChallengerTokens int    `json:"challenger_tokens"`

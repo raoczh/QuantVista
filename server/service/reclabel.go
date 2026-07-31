@@ -31,6 +31,9 @@ const (
 	// 修正（原 l1 的 buyIdx+horizon-1 在 horizon=1 时同日买卖违反 T+1）+ 退市/长停市场
 	// 轴强平 + 退出价守卫。旧 l1 pending 行用新逻辑结算后回写 l2；消费方按版本过滤防混池。
 	labelVersion = "l2"
+	// candidateRankingVersion 记录候选量化名次与实际 LLM 输入顺序的事实口径。
+	// 排序/tie-break/名单组装语义变化时必须递增，旧行空值不得参与精确配对评估。
+	candidateRankingVersion = "cr1"
 	// labelPerCap 标签结算的每标的拨款（与回测默认一致，元）。
 	labelPerCap = float64(btDefaultPerCap)
 	// labelNoDataAfterDays 信号日之后超过该自然日仍无任何日线 → no_data（退市/长停）。
@@ -142,7 +145,9 @@ func recordBatchFacts(batch *model.RecommendationBatch, pool []candidate, items 
 		ev := model.RecommendationCandidateEvent{
 			BatchID: batch.ID, UserID: batch.UserID,
 			Symbol: c.Symbol, Market: c.Market, Name: c.Name,
-			RawScore: c.Score, Source: firstSource(c), SentToLLM: c.SentToLLM,
+			RawScore: c.Score, ScoreRank: c.Rank, LLMInputOrder: c.LLMInputOrder,
+			RankingVersion: candidateRankingVersion,
+			Source:         firstSource(c), SentToLLM: c.SentToLLM,
 			RefPrice: c.Price,
 		}
 		switch {

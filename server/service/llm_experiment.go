@@ -53,6 +53,9 @@ const (
 	llmExperimentTargetDefault = 20
 	llmExperimentTargetMin     = 5
 	llmExperimentTargetMax     = 100
+	// llmExperimentPickSchemaVersion 是逐标的 champion/challenger 事实 JSON 口径。
+	// 字段或归一化语义变化时递增；旧 run 空值表示无法恢复历史名单。
+	llmExperimentPickSchemaVersion = "ep1"
 )
 
 // llmExperimentSupportedModules 业务模块 → prompt 模块（PromptTemplate.module）。
@@ -713,6 +716,26 @@ func LLMExperimentDetail(id int64) (*model.LLMExperiment, []model.LLMExperimentR
 
 // ---------- 影子采样钩子（推荐 runGeneration 主调成功后调用） ----------
 
+// llmExperimentPickFact 只固化决策质量评估所需的规范化字段，不复制理由、风险与
+// 交易计划大文本。Order 是模型原始输出顺序（1-based）。
+type llmExperimentPickFact struct {
+	Symbol     string `json:"symbol"`
+	Order      int    `json:"order"`
+	Action     string `json:"action"`
+	Confidence int    `json:"confidence"`
+}
+
+func marshalLLMExperimentPicks(picks []recPick) string {
+	facts := make([]llmExperimentPickFact, 0, len(picks))
+	for i, p := range picks {
+		facts = append(facts, llmExperimentPickFact{
+			Symbol: p.Symbol, Order: i + 1, Action: p.Action, Confidence: int(p.Confidence),
+		})
+	}
+	b, _ := json.Marshal(facts)
+	return string(b)
+}
+
 // activeExperimentFor 查该用户该模块可采样的 running 实验（采样只命中创建者本人）。
 func activeExperimentFor(module string, userID int64) *model.LLMExperiment {
 	var exp model.LLMExperiment
@@ -790,8 +813,9 @@ func (s *RecommendationService) maybeChallengerShadow(ctx context.Context, plan 
 	row := model.LLMExperimentRun{
 		ExperimentID: exp.ID, UserID: plan.userID, BatchID: batch.ID,
 		TraceID: batch.TraceID, ChampionRun: mainRun.RunID,
-		ChampionPicks:  len(championPicks),
-		ChampionTokens: championUsage.TotalTokens, ChampionMs: championMs,
+		ChampionPicks: len(championPicks), PickSchemaVersion: llmExperimentPickSchemaVersion,
+		ChampionPicksJSON: marshalLLMExperimentPicks(championPicks),
+		ChampionTokens:    championUsage.TotalTokens, ChampionMs: championMs,
 		ChallengerMs: elapsed, FinishState: run.FinishState,
 	}
 	if res != nil {
@@ -809,6 +833,7 @@ func (s *RecommendationService) maybeChallengerShadow(ctx context.Context, plan 
 		} else {
 			row.Valid = true
 			row.PicksCount = len(picks)
+			row.ChallengerPicksJSON = marshalLLMExperimentPicks(picks)
 			champSet := map[string]bool{}
 			for _, p := range championPicks {
 				champSet[p.Symbol] = true

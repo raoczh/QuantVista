@@ -84,6 +84,55 @@ func TestApplyFreshQuoteToCand(t *testing.T) {
 	}
 }
 
+// TestFinalQuoteFilterReasonKeepsScoringSnapshot 终选复核可用最新价拦截越界候选，
+// 但通过时不得只覆盖现价，留下与旧分数/旧因子混用的快照。
+func TestFinalQuoteFilterReasonKeepsScoringSnapshot(t *testing.T) {
+	dt := time.Date(2026, 7, 17, 10, 31, 0, 0, time.Local)
+	scored := candidate{
+		Symbol: "600010", Market: "cn", Price: 10, ChangePct: 1.2, Amount: 1e8,
+		QuoteAsOf: "2026-07-17 10:30", Score: 82,
+		Factors: &candFactors{Chg5d: 6.5}, ScoreDims: &scoreDims{Trend: 80},
+	}
+	latest := &datasource.Quote{Price: 10.2, ChangePct: 2.1, Amount: 1.2e8, DataTime: dt}
+	if reason := finalQuoteFilterReason(scored, latest, RecFilters{PriceMax: 20}); reason != "" {
+		t.Fatalf("仍在过滤范围内不应剔除: %s", reason)
+	}
+	if scored.Price != 10 || scored.ChangePct != 1.2 || scored.QuoteAsOf != "2026-07-17 10:30" ||
+		scored.Score != 82 || scored.Factors.Chg5d != 6.5 {
+		t.Fatalf("终选复核不得改写评分快照: %+v", scored)
+	}
+	if reason := finalQuoteFilterReason(scored,
+		&datasource.Quote{Price: 21, ChangePct: 9, DataTime: dt}, RecFilters{PriceMax: 20}); reason == "" {
+		t.Fatal("最新价越过价格上限时必须终选剔除")
+	}
+}
+
+// TestFreezeLLMInputOrderMatchesPromptOrder 锁定 cr1 的核心事实：候选池原始顺序即使
+// 与量化排名不同，落库的 llm_input_order 也必须与 compactForLLM 实际送模顺序一致。
+func TestFreezeLLMInputOrderMatchesPromptOrder(t *testing.T) {
+	pool := []candidate{
+		{Symbol: "600002", Rank: 2},
+		{Symbol: "600001", Rank: 1},
+		{Symbol: "600003", Rank: 3},
+	}
+	input := []candidate{pool[0], pool[1], pool[2]}
+	ordered := freezeLLMInputOrder(pool, input)
+	if len(ordered) != 3 || ordered[0].Symbol != "600001" || ordered[0].LLMInputOrder != 1 ||
+		ordered[1].Symbol != "600002" || ordered[1].LLMInputOrder != 2 ||
+		ordered[2].Symbol != "600003" || ordered[2].LLMInputOrder != 3 {
+		t.Fatalf("模型输入事实未按 rank 冻结: %+v", ordered)
+	}
+	rows := compactForLLM(model.RecTypeShortTerm, input)
+	for i, row := range rows {
+		if row["symbol"] != ordered[i].Symbol {
+			t.Fatalf("prompt 顺序与事实顺序不一致: rows=%+v ordered=%+v", rows, ordered)
+		}
+	}
+	if pool[0].LLMInputOrder != 2 || pool[1].LLMInputOrder != 1 || pool[2].LLMInputOrder != 3 {
+		t.Fatalf("完整候选池未同步真实送模顺序: %+v", pool)
+	}
+}
+
 // TestFailEmptyShortlistRecordsFacts 全 stale 提前失败：池快照/筛选参数回填、批次置
 // failed、quote_stale 反事实事件与事实账本照落（不能在 recordBatchFacts 前直接 return）。
 func TestFailEmptyShortlistRecordsFacts(t *testing.T) {

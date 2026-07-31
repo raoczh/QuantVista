@@ -100,7 +100,7 @@ type RecommendationLabel struct {
 
 // 候选事件阶段（candidate_stage）。
 const (
-	CandStageFiltered = "filtered" // 用户筛选/风控排除（excluded 非空）
+	CandStageFiltered = "filtered"  // 用户筛选/风控排除（excluded 非空）
 	CandStagePoolFull = "pool_full" // 评分名额已满未入评
 	CandStageScored   = "scored"    // 完成量化评分但未进 LLM 名单
 	CandStageLLMList  = "llm_list"  // 进入 LLM 名单但未入选（rejected/未提及）
@@ -130,19 +130,24 @@ type RecommendationCandidateEvent struct {
 
 	CandidateStage string  `gorm:"size:16" json:"candidate_stage"` // filtered/pool_full/scored/llm_list/picked
 	RawScore       float64 `gorm:"type:decimal(12,4)" json:"raw_score"`
-	RawAction      string  `gorm:"size:16" json:"raw_action"`       // LLM 原始动作（picked 条目）
-	WouldBeAction  string  `gorm:"size:16" json:"would_be_action"`  // 影子门控若强制执行会改写成的动作
-	PostGateAction string  `gorm:"size:16" json:"post_gate_action"` // 实际最终动作（影子期与 raw 相同）
-	GateType       string  `gorm:"size:32" json:"gate_type"`        // 主门控（多门控命中时按优先级取最强）
+	// ScoreRank 是生成时量化稳定排序名次；LLMInputOrder 是终选门后实际输入顺序。
+	// 两者为 0 表示旧行/该阶段无此事实，消费端不得用当前数据反推。
+	ScoreRank      int    `json:"score_rank"`
+	LLMInputOrder  int    `json:"llm_input_order"`
+	RankingVersion string `gorm:"size:16" json:"ranking_version"`
+	RawAction      string `gorm:"size:16" json:"raw_action"`       // LLM 原始动作（picked 条目）
+	WouldBeAction  string `gorm:"size:16" json:"would_be_action"`  // 影子门控若强制执行会改写成的动作
+	PostGateAction string `gorm:"size:16" json:"post_gate_action"` // 实际最终动作（影子期与 raw 相同）
+	GateType       string `gorm:"size:32" json:"gate_type"`        // 主门控（多门控命中时按优先级取最强）
 	// GateTypes 全部命中门控（逗号分隔，含主门控）——同一标的同时命中 regime/bear/
 	// quality 时各门控都保有样本，影子对照报表按此分别归组（只看 GateType 会让次要
 	// 门控永久丢失样本，无法分别验证增量效果）。旧行为空=只有 GateType 一个。
 	GateTypes   string `gorm:"size:128" json:"gate_types"`
 	GateVersion string `gorm:"size:16" json:"gate_version"`
 
-	RejectionReason  string `gorm:"size:256" json:"rejection_reason"` // excluded 原因 / LLM 落选理由
-	Source           string `gorm:"size:32" json:"source"`            // 候选首来源
-	SentToLLM        bool   `json:"sent_to_llm"`
+	RejectionReason  string  `gorm:"size:256" json:"rejection_reason"` // excluded 原因 / LLM 落选理由
+	Source           string  `gorm:"size:32" json:"source"`            // 候选首来源
+	SentToLLM        bool    `json:"sent_to_llm"`
 	RefPrice         float64 `gorm:"type:decimal(20,4)" json:"ref_price"` // 事件时点现价（影子标签入场锚）
 	OpportunitySetID string  `gorm:"size:32" json:"opportunity_set_id"`   // S3 召回评估预留
 

@@ -29,8 +29,8 @@ import (
 //     不留「永远重试烧 token」的尾巴。
 //
 // 两个幂等键分清：逐条新闻增强按 news.id（Sentiment 非空 = 已增强，与 symbol 无关，
-// 市场/政策类新闻常无 symbol）；个股当日聚合情绪分按 (symbol, date) 一天一次，
-// 并发合并用包级 mutex+map（项目无 x/sync 依赖，等价 singleflight）。
+// 市场/政策类新闻常无 symbol）；个股当日聚合情绪分按 (symbol, date) 唯一，当日按新闻
+// 采集间隔刷新、历史日冻结，并发合并用包级 mutex+map（项目无 x/sync 依赖）。
 //
 // LLM 挂在首个管理员的默认配置上（新闻是全局共享数据，非用户动作）：
 // token 记入该管理员审计、不扣次数配额。
@@ -389,11 +389,32 @@ var (
 )
 
 // stockDailySentiment 个股当日聚合情绪分：优先读 stock_sentiments 缓存，
-// 缺则由当日已增强新闻加权合成并落库（(symbol,date) 幂等一天一次）。
+// 缺失或当日缓存超过新闻采集间隔时，由已增强新闻重新合成并 upsert。
 // 权重 = 4 - source_priority（P1=3 / P2=2 / P3=1），取最新 sentiAggMaxNews 条。
 // 返回 (score -1~1, 参与条数, 是否有数据)。
 func stockDailySentiment(symbol, date string) (float64, int, bool) {
 	return stockDailySentimentAt(symbol, date, time.Now())
+}
+
+// sentimentAggregateCacheFresh 历史日结果冻结；当日结果按新闻采集间隔刷新，避免
+// 早盘首次非空聚合把午后新利空挡到第二天。row.UpdatedAt 晚于 as-of 时也不得复用，
+// 供固定时钟测试/历史回放保持 point-in-time。
+func sentimentAggregateCacheFresh(row *model.StockSentiment, date string, now time.Time) bool {
+	if row == nil || row.UpdatedAt.IsZero() || row.UpdatedAt.After(now) {
+		return false
+	}
+	today := now.In(time.Local).Format("2006-01-02")
+	if date < today {
+		return true
+	}
+	if date > today {
+		return false
+	}
+	ttl := time.Duration(setting.NewsCollectIntervalMin()) * time.Minute
+	if ttl < time.Minute {
+		ttl = time.Minute
+	}
+	return now.Sub(row.UpdatedAt) < ttl
 }
 
 // stockDailySentimentAt 与 stockDailySentiment 相同，但固定本轮聚合的查询上界。
@@ -407,7 +428,8 @@ func stockDailySentimentAt(symbol, date string, now time.Time) (float64, int, bo
 
 	for {
 		var row model.StockSentiment
-		if err := common.DB.Where("symbol = ? AND date = ?", symbol, date).First(&row).Error; err == nil {
+		if err := common.DB.Where("symbol = ? AND date = ?", symbol, date).First(&row).Error; err == nil &&
+			sentimentAggregateCacheFresh(&row, date, now) {
 			return row.Score, row.NewsCount, row.NewsCount > 0
 		}
 		sentiAggMu.Lock()
@@ -424,11 +446,14 @@ func stockDailySentimentAt(symbol, date string, now time.Time) (float64, int, bo
 		score, count, detail := computeDailySentimentAt(symbol, date, now)
 		// P1 水位修复：仅在算到新闻（count>0）时才落缓存行——早晨新闻尚未采集时算出的
 		// 「0 条」若落库，(symbol,date) 幂等会把「无新闻」冻结成全天结论，之后采集到的
-		// 新闻永远进不了当日情绪。空结果不落库、每次现算（轻查询），新闻到位自然生效；
-		// 非空结果照旧当日冻结（批次内证据可复现纪律不变）。
+		// 新闻永远进不了当日情绪。空结果不落库、每次现算（轻查询），新闻到位自然生效。
+		// 非空结果按采集间隔 upsert；每个推荐批次仍把实际结果固化进候选快照。
 		if count > 0 {
 			row = model.StockSentiment{Symbol: symbol, Date: date, Score: score, NewsCount: count, DetailJSON: detail}
-			common.DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&row)
+			common.DB.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "symbol"}, {Name: "date"}},
+				DoUpdates: clause.AssignmentColumns([]string{"score", "news_count", "detail_json", "updated_at"}),
+			}).Create(&row)
 		}
 
 		sentiAggMu.Lock()

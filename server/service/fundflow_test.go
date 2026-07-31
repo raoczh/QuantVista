@@ -1,4 +1,4 @@
-﻿package service
+package service
 
 import (
 	"context"
@@ -23,10 +23,10 @@ func TestMainNetStreakDays(t *testing.T) {
 		nets []float64
 		want int
 	}{
-		{[]float64{-1, 2, 3, 4}, 3},        // 末端连续 3 天净流入
-		{[]float64{1, -2, -3}, -2},         // 连续 2 天净流出
-		{[]float64{5, 0, 3}, 1},            // 零值（停牌）截断
-		{[]float64{2, 3, 0}, 0},            // 末日为 0 无方向
+		{[]float64{-1, 2, 3, 4}, 3}, // 末端连续 3 天净流入
+		{[]float64{1, -2, -3}, -2},  // 连续 2 天净流出
+		{[]float64{5, 0, 3}, 1},     // 零值（停牌）截断
+		{[]float64{2, 3, 0}, 0},     // 末日为 0 无方向
 		{nil, 0},
 		{[]float64{7}, 1},
 	}
@@ -132,5 +132,44 @@ func TestEnsureStockFundFlowCache(t *testing.T) {
 	ensureStockFundFlow(context.Background(), em, "cn", "000997", &budget)
 	if called != 1 {
 		t.Errorf("预算 0 不应打上游，called=%d", called)
+	}
+}
+
+// 推荐评分只能消费新鲜资金流；详情页仍可读取 stale 库存并用 Fresh=false 显式展示。
+func TestFundFlowForScoringRejectsStaleRows(t *testing.T) {
+	rows := []model.FundFlowDaily{{Symbol: "600519", Market: "cn", TradeDate: "2026-01-05", MainNet: 1}}
+	if got := fundFlowForScoring(rows, false); len(got) != 0 {
+		t.Fatalf("stale 资金流不得进入评分，got=%+v", got)
+	}
+	if got := fundFlowForScoring(rows, true); len(got) != 1 || got[0].MainNet != 1 {
+		t.Fatalf("fresh 资金流应原样进入评分，got=%+v", got)
+	}
+}
+
+// 冷却命中没有发生上游调用，不应占掉本批预算并让后续标的因遍历顺序失去补拉机会。
+func TestEnsureStockFundFlowCooldownDoesNotConsumeBudget(t *testing.T) {
+	setupTestDB(t)
+	cleanMoodTables(t)
+	em := datasource.NewEastMoneyAdapter()
+	calls := 0
+	em.SetFetchForTest(func(ctx context.Context, url string, headers map[string]string) ([]byte, int, error) {
+		calls++
+		return nil, 0, errTestUpstream
+	})
+
+	common.DB.Create(&model.FundFlowDaily{Symbol: "000996", Market: "cn", TradeDate: "2026-01-05", MainNet: 1})
+	common.DB.Create(&model.FundFlowDaily{Symbol: "000995", Market: "cn", TradeDate: "2026-01-05", MainNet: 1})
+	fflowTryMu.Lock()
+	fflowTry["cn:000996"] = time.Now()
+	fflowTryMu.Unlock()
+
+	budget := 1
+	ensureStockFundFlow(context.Background(), em, "cn", "000996", &budget)
+	if budget != 1 || calls != 0 {
+		t.Fatalf("冷却命中不应耗预算或打上游：budget=%d calls=%d", budget, calls)
+	}
+	ensureStockFundFlow(context.Background(), em, "cn", "000995", &budget)
+	if budget != 0 || calls != 1 {
+		t.Fatalf("后续标的应仍可使用预算：budget=%d calls=%d", budget, calls)
 	}
 }

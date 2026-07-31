@@ -276,7 +276,8 @@ func (s *ScoreService) Score(ctx context.Context, market, symbol string) (*Score
 	// M3a 量能维融合主力资金分（A 股非基金；缓存优先按需补拉，缺失时评分原样）。
 	// computeScore 纯函数不动——融合是外层包装，既有对拍/单测口径不受影响。
 	if market == "cn" && !isCNFund(symbol) {
-		if flows, _ := ensureStockFundFlow(ctx, s.em, market, symbol, nil); len(flows) > 0 {
+		flows, fresh := ensureStockFundFlow(ctx, s.em, market, symbol, nil)
+		if flows = fundFlowForScoring(flows, fresh); len(flows) > 0 {
 			res = applyFlowScore(res, flows)
 		}
 	}

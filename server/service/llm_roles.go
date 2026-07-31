@@ -124,7 +124,7 @@ var llmRoleAssets = map[string]LLMRoleAsset{
 		Version: recPromptVersion, SchemaVersion: "recommendation.v2",
 		Purpose: "在量化 Top10 候选内精选/否决并给出理由、风险、失效条件；允许宁缺毋滥空选",
 		Market:  "cn", Horizons: "短线 5/10 日、长线 20/60 日（标签 LabelHorizons）",
-		Trigger:          "用户手动生成或日报自动推荐；建池→用户筛选→量化评分→行情时效硬门（qf3）之后只喂 Top10；全池 stale 宁可失败不推荐",
+		Trigger:          "用户手动生成或日报自动推荐；建池→用户筛选→量化评分→行情时效硬门（qf4）之后只喂 Top10；全池 stale 宁可失败不推荐",
 		InputWhitelist:   []string{"候选因子（candFactors 全量：技术/筹码/情绪/资金/盘中/财务）", "来源与量化分", "风险字段", "reflection 影子层不注入（三不纪律）"},
 		MustAnswer:       []string{"picks 逐条理由/风险/证据数字", "长短线失效条件（invalidation，P1-2）", "rejected 落选理由", "短线 buy 盈亏比≥1.5（不足程序降 watch）"},
 		ForbiddenActions: []string{"推荐池外/名单外标的（parseAndFilterPicks 剥除+coverage 诊断）", "自报 quant_score/sys_confidence/review/bear 等服务端字段", "为凑数量放宽门槛（空选合法）"},

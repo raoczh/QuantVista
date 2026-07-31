@@ -22,12 +22,12 @@ import (
 // 上一交易日的序列本就成立（T-1 信号），详情页缺今日一根盘后自动补上。
 
 const (
-	fflowBarLimit     = 250              // 缓存窗口（与日线/因子窗口对齐，不拉全历史占库）
-	fflowTryCooldown  = time.Hour        // 同一标的拉取尝试冷却（成功失败都记）
-	fflowRecBudget    = 16               // 单次推荐生成允许回上游补拉的标的数
-	fflowStableHour   = 16               // 当日数据视为终态的小时（收盘后）
-	flowStreakBonus   = 3                // 连续净流入天数加分门槛（≥3 天）
-	flowVolumeWeight  = 0.4              // 量能维中主力资金分的权重（0.6 原量能 + 0.4 资金）
+	fflowBarLimit    = 250       // 缓存窗口（与日线/因子窗口对齐，不拉全历史占库）
+	fflowTryCooldown = time.Hour // 同一标的拉取尝试冷却（成功失败都记）
+	fflowRecBudget   = 16        // 单次推荐生成允许回上游补拉的标的数
+	fflowStableHour  = 16        // 当日数据视为终态的小时（收盘后）
+	flowStreakBonus  = 3         // 连续净流入天数加分门槛（≥3 天）
+	flowVolumeWeight = 0.4       // 量能维中主力资金分的权重（0.6 原量能 + 0.4 资金）
 )
 
 // fflowSyncTry 包级共享的拉取冷却表（MoodService/ScoreService/推荐域多实例共用，
@@ -66,14 +66,16 @@ func ensureStockFundFlow(ctx context.Context, em *datasource.EastMoneyAdapter, m
 	if len(rows) > 0 && rows[len(rows)-1].TradeDate >= freshSince {
 		return rows, true
 	}
-	if budget != nil {
-		if *budget <= 0 {
-			return rows, false
-		}
-		*budget--
+	if budget != nil && *budget <= 0 {
+		return rows, false
 	}
 	if !fflowTryAllowed(market + ":" + symbol) {
 		return rows, false
+	}
+	// 预算表示实际发出的上游请求数。冷却命中没有 I/O，不得白白占掉名额并让
+	// 后续标的因遍历顺序失去补拉机会。
+	if budget != nil {
+		*budget--
 	}
 	fctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
@@ -88,6 +90,15 @@ func ensureStockFundFlow(ctx context.Context, em *datasource.EastMoneyAdapter, m
 	rows = read()
 	fresh := len(rows) > 0 && rows[len(rows)-1].TradeDate >= freshSince
 	return rows, fresh
+}
+
+// fundFlowForScoring 收紧评分消费口径：ensureStockFundFlow 为详情页保留 stale
+// 库存，但评分、策略因子与 LLM 候选只能使用已通过交易日新鲜度检查的序列。
+func fundFlowForScoring(rows []model.FundFlowDaily, fresh bool) []model.FundFlowDaily {
+	if !fresh {
+		return nil
+	}
+	return rows
 }
 
 // persistFundFlow 资金流序列 upsert。16:00 前丢弃「今天」的行（盘中半截值防残留）。
@@ -160,7 +171,7 @@ func mainNetSum(flows []model.FundFlowDaily, n int) float64 {
 }
 
 // flowVolumeScore 主力资金分（0-100）：近 5 日主力净占比均值的线性映射
-//（+5% 强吸筹 →90、-5% 强流出 →10），50 为中性。样本不足 3 日不给分（ok=false）。
+// （+5% 强吸筹 →90、-5% 强流出 →10），50 为中性。样本不足 3 日不给分（ok=false）。
 // 用净占比而非净额：跨市值可比（1 亿净流入对茅台是噪声、对小票是主升）。
 func flowVolumeScore(flows []model.FundFlowDaily) (float64, bool) {
 	n := len(flows)

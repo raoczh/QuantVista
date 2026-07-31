@@ -17,6 +17,7 @@ func cleanF10(t *testing.T) {
 	t.Helper()
 	common.DB.Where("1 = 1").Delete(&model.FinanceIndicator{})
 	common.DB.Where("1 = 1").Delete(&model.FinanceStatement{})
+	common.DB.Where("1 = 1").Delete(&model.DisclosureSchedule{})
 	finSyncMu.Lock()
 	finSyncTry = map[string]time.Time{}
 	finSyncMu.Unlock()
@@ -38,6 +39,23 @@ func f10Row(t *testing.T, reportDate, name string, roe, revYoY, npYoY float64) d
 func jsonNum(f float64) string {
 	b, _ := json.Marshal(f)
 	return string(b)
+}
+
+// SQLite 的 MAX(updated_at) 不保留时间列类型；finFresh 必须从真实列读取时间。
+func TestFinFreshReadsSQLiteTimestamp(t *testing.T) {
+	setupTestDB(t)
+	cleanF10(t)
+	common.DB.Create(&model.FinanceIndicator{
+		Symbol: "600519", Market: "cn", ReportDate: "2025-12-31", ReportName: "2025年报",
+	})
+	if !finFresh(&model.FinanceIndicator{}, "600519") {
+		t.Fatal("刚写入的财务缓存应判为新鲜")
+	}
+	common.DB.Model(&model.FinanceIndicator{}).Where("symbol = ?", "600519").
+		Update("updated_at", time.Now().Add(-8*24*time.Hour))
+	if finFresh(&model.FinanceIndicator{}, "600519") {
+		t.Fatal("超过 7 天的财务缓存应判为过期")
+	}
 }
 
 // ensureFinanceIndicators：拉取落库 → 新鲜期内不再回上游 → 冷却清空+过期后重拉。
@@ -169,6 +187,139 @@ func TestFinanceFactorFor(t *testing.T) {
 	// 无缓存 + 预算耗尽 → nil 且不拉上游。
 	if fin := financeFactorFor(context.Background(), "000001", &budget); fin != nil {
 		t.Fatal("预算耗尽应返回 nil")
+	}
+}
+
+// 即使旧缓存刚写入，只要披露日历已确认有更新报告，推荐路径也必须尝试刷新。
+func TestFinanceFactorForRefreshesPublishedNewReport(t *testing.T) {
+	setupTestDB(t)
+	cleanF10(t)
+	oldF10 := fetchF10
+	defer func() { fetchF10 = oldF10 }()
+	calls := 0
+	fetchF10 = func(ctx context.Context, symbol string) ([]datasource.DcRow, error) {
+		calls++
+		return []datasource.DcRow{
+			f10Row(t, "2026-03-31", "2026一季报", 10.57, 6.34, 1.47),
+			f10Row(t, "2025-12-31", "2025年报", 34.2, 15.66, 15.38),
+		}, nil
+	}
+	common.DB.Create(&model.FinanceIndicator{
+		Symbol: "600519", Market: "cn", ReportDate: "2025-12-31", ReportName: "2025年报",
+		NoticeDate: time.Now().AddDate(0, 0, -30).Format("2006-01-02"), ROE: 34.2,
+	})
+	common.DB.Create(&model.DisclosureSchedule{
+		Symbol: "600519", Market: "cn", ReportDate: "2026-03-31", IsPublished: true,
+		ActualDate: time.Now().AddDate(0, 0, -1).Format("2006-01-02"),
+	})
+
+	budget := 1
+	fin := financeFactorFor(context.Background(), "600519", &budget)
+	if calls != 1 || budget != 0 {
+		t.Fatalf("新报告已披露时应绕过旧缓存刷新：calls=%d budget=%d", calls, budget)
+	}
+	if fin == nil || fin.Report != "2026一季报" {
+		t.Fatalf("应返回刷新后的最新报告，fin=%+v", fin)
+	}
+}
+
+// 已确认有新报告时，刷新失败必须 fail-closed，不能继续拿旧报告给长线策略加分。
+func TestFinanceFactorForRejectsKnownStaleAfterRefreshFailure(t *testing.T) {
+	setupTestDB(t)
+	cleanF10(t)
+	oldF10 := fetchF10
+	defer func() { fetchF10 = oldF10 }()
+	calls := 0
+	fetchF10 = func(ctx context.Context, symbol string) ([]datasource.DcRow, error) {
+		calls++
+		return nil, datasource.ErrNoData
+	}
+	common.DB.Create(&model.FinanceIndicator{
+		Symbol: "600519", Market: "cn", ReportDate: "2025-12-31", ReportName: "2025年报",
+		NoticeDate: time.Now().AddDate(0, 0, -30).Format("2006-01-02"), ROE: 34.2,
+	})
+	common.DB.Create(&model.DisclosureSchedule{
+		Symbol: "600519", Market: "cn", ReportDate: "2026-03-31", IsPublished: true,
+		ActualDate: time.Now().AddDate(0, 0, -1).Format("2006-01-02"),
+	})
+
+	budget := 1
+	fin := financeFactorFor(context.Background(), "600519", &budget)
+	if calls != 1 || budget != 0 {
+		t.Fatalf("应尝试一次刷新：calls=%d budget=%d", calls, budget)
+	}
+	if fin != nil {
+		t.Fatalf("已知过期的旧报告不得继续参与推荐，fin=%+v", fin)
+	}
+}
+
+// 披露日位于未来的报告不是当前时点可用数据，既不能触发刷新，也不能直接读入推荐。
+func TestFinanceFactorForExcludesFutureDisclosure(t *testing.T) {
+	setupTestDB(t)
+	cleanF10(t)
+	oldF10 := fetchF10
+	defer func() { fetchF10 = oldF10 }()
+	calls := 0
+	fetchF10 = func(ctx context.Context, symbol string) ([]datasource.DcRow, error) {
+		calls++
+		return nil, datasource.ErrNoData
+	}
+	today := time.Now()
+	common.DB.Create(&model.FinanceIndicator{
+		Symbol: "600519", Market: "cn", ReportDate: "2025-12-31", ReportName: "2025年报",
+		NoticeDate: today.AddDate(0, 0, -30).Format("2006-01-02"), ROE: 34.2,
+	})
+	common.DB.Create(&model.FinanceIndicator{
+		Symbol: "600519", Market: "cn", ReportDate: "2026-03-31", ReportName: "2026一季报",
+		NoticeDate: today.AddDate(0, 0, 1).Format("2006-01-02"), ROE: 99,
+	})
+	common.DB.Create(&model.DisclosureSchedule{
+		Symbol: "600519", Market: "cn", ReportDate: "2026-06-30", IsPublished: true,
+		ActualDate: today.AddDate(0, 0, 1).Format("2006-01-02"),
+	})
+	common.DB.Model(&model.FinanceIndicator{}).Where("symbol = ?", "600519").Update("updated_at", time.Now())
+	if !finFresh(&model.FinanceIndicator{}, "600519") {
+		t.Fatal("测试前置条件错误：缓存应处于 7 天容灾水位内")
+	}
+
+	budget := 1
+	fin := financeFactorFor(context.Background(), "600519", &budget)
+	if calls != 0 || budget != 1 {
+		t.Fatalf("未来披露不得触发刷新：calls=%d budget=%d", calls, budget)
+	}
+	if fin == nil || fin.Report != "2025年报" || fin.ROE != 34.2 {
+		t.Fatalf("未来 NoticeDate 行不得进入推荐，fin=%+v", fin)
+	}
+}
+
+// 公告日缺失不能自动视为可用；只有披露日历能证明同报告期已发布时才允许进入推荐。
+func TestFinanceFactorForRequiresProofForEmptyNoticeDate(t *testing.T) {
+	setupTestDB(t)
+	cleanF10(t)
+	today := time.Now()
+	common.DB.Create(&model.FinanceIndicator{
+		Symbol: "600519", Market: "cn", ReportDate: "2025-12-31", ReportName: "2025年报",
+		NoticeDate: today.AddDate(0, 0, -30).Format("2006-01-02"), ROE: 34.2,
+	})
+	common.DB.Create(&model.FinanceIndicator{
+		Symbol: "600519", Market: "cn", ReportDate: "2026-03-31", ReportName: "未知公告日一季报",
+		NoticeDate: "", ROE: 99,
+	})
+	common.DB.Model(&model.FinanceIndicator{}).Where("symbol = ?", "600519").Update("updated_at", time.Now())
+
+	budget := 0
+	fin := financeFactorFor(context.Background(), "600519", &budget)
+	if fin == nil || fin.Report != "2025年报" || fin.ROE != 34.2 {
+		t.Fatalf("无披露证据的空公告日报表不得压过已知可用旧报告，fin=%+v", fin)
+	}
+
+	common.DB.Create(&model.DisclosureSchedule{
+		Symbol: "600519", Market: "cn", ReportDate: "2026-03-31", IsPublished: true,
+		ActualDate: today.AddDate(0, 0, -1).Format("2006-01-02"),
+	})
+	fin = financeFactorFor(context.Background(), "600519", &budget)
+	if fin == nil || fin.Report != "未知公告日一季报" || fin.ROE != 99 {
+		t.Fatalf("披露日历已证明发布时应允许空公告日行，fin=%+v", fin)
 	}
 }
 

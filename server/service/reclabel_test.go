@@ -221,7 +221,8 @@ func TestRecordBatchFactsRawActionPreserved(t *testing.T) {
 		Name: "甲", Action: model.RecActionWatch, RefPrice: 10}
 	common.DB.Create(&rec)
 
-	pool := []candidate{{Symbol: "600100", Market: "cn", Name: "甲", Price: 10, SentToLLM: true}}
+	pool := []candidate{{Symbol: "600100", Market: "cn", Name: "甲", Price: 10, Score: 81,
+		Rank: 2, SentToLLM: true, LLMInputOrder: 1}}
 	// 复核后 pick.Action=watch（reject 降级）；快照记复核前 buy。
 	picks := []recPick{{Symbol: "600100", Action: model.RecActionWatch}}
 	raw := map[string]string{"600100": model.RecActionBuy}
@@ -238,6 +239,10 @@ func TestRecordBatchFactsRawActionPreserved(t *testing.T) {
 	}
 	if ev.PostGateAction != model.RecActionWatch {
 		t.Fatalf("PostGateAction 应为复核后 watch，得到 %s", ev.PostGateAction)
+	}
+	if ev.RawScore != 81 || ev.ScoreRank != 2 || ev.LLMInputOrder != 1 ||
+		ev.RankingVersion != candidateRankingVersion {
+		t.Fatalf("生成时排名/输入顺序事实未冻结: %+v", ev)
 	}
 }
 
@@ -936,6 +941,27 @@ func TestLabelRebaseAdjust(t *testing.T) {
 	// 调整后止盈=21.4/2=10.7：平滑 +1% 序列在持有期内触达（不调整则 21.4 永不触发）。
 	if !got.HitTakeProfit || got.ExitPrice != 10.7 {
 		t.Fatalf("重锚调整后应触止盈@10.7: %+v", got)
+	}
+}
+
+// TestLabelBarriersPickedVsShadow 锁定现有标签语义边界：正式推荐会读取 AI 计划价，
+// 影子候选没有 recommendation_id，因此固定持有且无障碍。两类 NetReturnPct 不能
+// 直接拿来度量“选股增量”，后续必须另建统一 fixed-hold selection outcome。
+func TestLabelBarriersPickedVsShadow(t *testing.T) {
+	setupTestDB(t)
+	cleanLabelTables(t)
+	detail, _ := json.Marshal(recPick{Symbol: "600100", TakeProfit: 11.2, StopLoss: 9.4})
+	rec := model.Recommendation{UserID: 1, BatchID: 1, Symbol: "600100", Market: "cn", DetailJSON: string(detail)}
+	if err := common.DB.Create(&rec).Error; err != nil {
+		t.Fatalf("创建推荐失败: %v", err)
+	}
+	tp, sl := labelBarriers(&model.RecommendationLabel{RecommendationID: rec.ID})
+	if tp != 11.2 || sl != 9.4 {
+		t.Fatalf("正式推荐应读取计划障碍: tp=%v sl=%v", tp, sl)
+	}
+	shadowTP, shadowSL := labelBarriers(&model.RecommendationLabel{CandidateEventID: 99})
+	if shadowTP != 0 || shadowSL != 0 {
+		t.Fatalf("影子候选不得伪造计划障碍: tp=%v sl=%v", shadowTP, shadowSL)
 	}
 }
 
