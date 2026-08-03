@@ -161,6 +161,7 @@ const userOptions = computed<DropdownOption[]>(() => {
       { label: 'LLM 调用记录', key: 'admin-llm-calls' },
       { label: '因子 IC 排行', key: 'admin-factor-ic' },
       { label: 'Walk-Forward 基线', key: 'admin-walk-forward' },
+      { label: '选股配对评估', key: 'admin-selection-eval' },
       { label: 'LLM 校准报表', key: 'admin-calibration' },
       { label: 'LLM 角色资产', key: 'admin-llm-roles' },
       { label: 'LLM 实验', key: 'admin-llm-experiments' },
@@ -177,6 +178,7 @@ async function onSelectUser(key: string) {
   else if (key === 'admin-llm-calls') router.push('/admin/llm-calls')
   else if (key === 'admin-factor-ic') router.push('/admin/factor-ic')
   else if (key === 'admin-walk-forward') router.push('/admin/walk-forward')
+  else if (key === 'admin-selection-eval') router.push('/admin/selection-eval')
   else if (key === 'admin-calibration') router.push('/admin/calibration')
   else if (key === 'admin-llm-roles') router.push('/admin/llm-roles')
   else if (key === 'admin-llm-experiments') router.push('/admin/llm-experiments')

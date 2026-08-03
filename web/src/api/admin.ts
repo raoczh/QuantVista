@@ -331,6 +331,227 @@ export function getWalkForward(refresh = false) {
   })
 }
 
+// S3-6B fixed-hold selection outcome 与同批配对评估（管理端只读）。
+export interface SelectionBootstrapSpec {
+  seed: number
+  iterations: number
+}
+
+export interface SelectionEvalCoverage {
+  batches: number
+  facts_ready_batches: number
+  success_batches: number
+  degraded_excluded: number
+  facts_missing_excluded: number
+  events_missing_excluded: number
+  ranking_excluded: number
+  duplicate_facts_excluded: number
+  pick_mismatch_excluded: number
+  zero_pick_batches: number
+  zero_pick_rate_pct: number
+  opportunity_symbols: number
+  ai_picks: number
+  outcome_rows: number
+  outcome_matured: number
+  outcome_pending: number
+  outcome_skipped: number
+  outcome_no_data: number
+  outcome_forced: number
+  challenger_runs: number
+  challenger_valid_runs: number
+  challenger_invalid_runs: number
+  challenger_zero_pick_runs: number
+}
+
+export interface SelectionMetric {
+  group: string
+  label: string
+  evaluated: boolean
+  batches: number
+  selected_symbols: number
+  sample_symbols: number
+  coverage_pct: number
+  avg_gross_pct: number
+  avg_net_pct: number
+  median_net_pct: number
+  p10_net_pct: number
+  net_positive_pct: number
+  severe_loss_pct: number
+  alpha_sample: number
+  avg_alpha_pct: number
+  median_alpha_pct: number
+  p10_alpha_pct: number
+  alpha_positive_pct: number
+  avg_mfe_pct: number
+  median_mfe_pct: number
+  avg_mae_pct: number
+  median_mae_pct: number
+}
+
+export interface SelectionBootstrapCI {
+  sample_batches: number
+  estimate: number
+  low_95: number
+  high_95: number
+}
+
+export interface SelectionBatchDiff {
+  batch_id: number
+  signal_date: string
+  k: number
+  left_symbols: string[] | null
+  right_symbols: string[] | null
+  avg_net_diff_pct: number
+  median_net_diff_pct: number
+  p10_net_diff_pct: number
+  net_positive_diff_pct: number
+  severe_loss_diff_pct: number
+  avg_mfe_diff_pct: number
+  avg_mae_diff_pct: number
+  has_alpha: boolean
+  avg_alpha_diff_pct: number
+}
+
+export interface SelectionPairedRow {
+  pair: string
+  label: string
+  left_group: string
+  right_group: string
+  batches: number
+  left_wins: number
+  ties: number
+  right_wins: number
+  avg_net_pct: SelectionBootstrapCI
+  median_net_pct: SelectionBootstrapCI
+  p10_net_pct: SelectionBootstrapCI
+  net_positive_pct: SelectionBootstrapCI
+  avg_alpha_pct: SelectionBootstrapCI
+  severe_loss_pct: SelectionBootstrapCI
+  avg_mfe_pct: SelectionBootstrapCI
+  avg_mae_pct: SelectionBootstrapCI
+  batch_diffs: SelectionBatchDiff[] | null
+}
+
+export interface SelectionSectionCoverage {
+  candidate_batches: number
+  comparable_batches: number
+  coverage_pct: number
+  missing_excluded: number
+  pending_excluded: number
+  skipped_excluded: number
+  no_data_excluded: number
+  forced_excluded: number
+}
+
+export interface SelectionPickView {
+  symbol: string
+  name: string
+  action?: string
+  order: number
+  score_rank: number
+}
+
+export interface SelectionBatchView {
+  batch_id: number
+  signal_date: string
+  n: number
+  ai: SelectionPickView[] | null
+  quant: SelectionPickView[] | null
+  comparable: boolean
+  exclusion?: string
+}
+
+export interface SelectionActionRow {
+  action: string
+  label: string
+  metric: SelectionMetric
+}
+
+export interface SelectionActionTransition {
+  from: string
+  to: string
+  count: number
+}
+
+export interface SelectionPlanPanel {
+  coverage: SelectionSectionCoverage
+  fixed_hold: SelectionMetric
+  plan_l2: SelectionMetric
+  pair: SelectionPairedRow
+  notes: string[] | null
+}
+
+export interface SelectionSliceRow {
+  key: string
+  batches: number
+  evaluated: boolean
+  avg_net_pct?: SelectionBootstrapCI
+  note?: string
+}
+
+export interface SelectionSliceGroup {
+  dim: string
+  label: string
+  rows: SelectionSliceRow[] | null
+}
+
+export interface SelectionChallengerCoverage {
+  runs: number
+  native_k_min: number
+  native_k_max: number
+  native_k_avg: number
+  native_eligible: number
+  matched_eligible: number
+  outcome_excluded: number
+  zero_matched: number
+}
+
+export interface SelectionChallengerEval {
+  experiment_id: number
+  name: string
+  coverage: SelectionChallengerCoverage
+  groups: SelectionMetric[] | null
+  pairs: SelectionPairedRow[] | null
+  notes: string[] | null
+}
+
+export interface SelectionEvalSection {
+  rec_type: string
+  horizon_days: number
+  coverage: SelectionSectionCoverage
+  groups: SelectionMetric[] | null
+  pairs: SelectionPairedRow[] | null
+  batches: SelectionBatchView[] | null
+  action_veto: SelectionActionRow[] | null
+  action_transitions: SelectionActionTransition[] | null
+  plan: SelectionPlanPanel
+  challengers: SelectionChallengerEval[] | null
+  slices: SelectionSliceGroup[] | null
+  notes: string[] | null
+}
+
+export interface SelectionEvalReport {
+  generated_at: string
+  outcome_version: string
+  schema_version: string
+  ranking_version: string
+  challenger_schema_version: string
+  bootstrap: SelectionBootstrapSpec
+  coverage: SelectionEvalCoverage
+  sections: SelectionEvalSection[] | null
+  notes: string[] | null
+  elapsed_ms: number
+}
+
+// 默认取进程内缓存；refresh=true 推进 outcome 并全量重算，计算路径不调用 LLM。
+export function getSelectionEval(refresh = false) {
+  return request<SelectionEvalReport>({
+    url: '/admin/selection-eval',
+    params: refresh ? { refresh: 1 } : undefined,
+    timeout: HEAVY_TIMEOUT,
+  })
+}
+
 // ---------- P1-7 校准与后验标签报表（管理端只读，纯测量零门控） ----------
 
 export interface CalibBucket {

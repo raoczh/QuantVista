@@ -68,6 +68,7 @@ func AllModels() []any {
 		&GuardEvent{},
 		&RecommendationLabel{},
 		&RecommendationCandidateEvent{},
+		&RecommendationSelectionOutcome{},
 		&RecommendationReflection{},
 		&LLMExperiment{},
 		&LLMExperimentModuleLock{},
