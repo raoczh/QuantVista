@@ -210,6 +210,9 @@ func TestSimulateLabelHold_MarketDelisted(t *testing.T) {
 // 为 watch 后，事件 RawAction 须仍记复核前的 buy（rawActionBySym 快照），PostGateAction
 // 记复核后终值 watch——二者相异才使门控前后对照有意义。
 func TestRecordBatchFactsRawActionPreserved(t *testing.T) {
+	if candidateRankingVersion != "cr2" {
+		t.Fatalf("确定性两阶段预热必须使用 ranking_version=cr2，得到 %q", candidateRankingVersion)
+	}
 	setupTestDB(t)
 	cleanLabelTables(t)
 

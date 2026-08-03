@@ -107,7 +107,7 @@ func TestFinalQuoteFilterReasonKeepsScoringSnapshot(t *testing.T) {
 	}
 }
 
-// TestFreezeLLMInputOrderMatchesPromptOrder 锁定 cr1 的核心事实：候选池原始顺序即使
+// TestFreezeLLMInputOrderMatchesPromptOrder 锁定排名版本共通事实：候选池原始顺序即使
 // 与量化排名不同，落库的 llm_input_order 也必须与 compactForLLM 实际送模顺序一致。
 func TestFreezeLLMInputOrderMatchesPromptOrder(t *testing.T) {
 	pool := []candidate{

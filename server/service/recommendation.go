@@ -130,13 +130,15 @@ type candidate struct {
 	LimitUp      float64 `json:"limit_up,omitempty"`      // 涨停价（判「已涨停买不进」）
 	Source       string  `json:"source,omitempty"`        // 兼容旧记录的单来源字段（新记录用 Sources）
 
-	Sources    []string     `json:"sources,omitempty"`     // watchlist / gainer / active / turnover（可多来源）
-	Excluded   string       `json:"excluded,omitempty"`    // 非空=被用户筛选/风控排除的原因（透明可查）
-	Factors    *candFactors `json:"factors,omitempty"`     // 技术因子快照（210 根日线派生：窗口因子尾窗口径、指标递推、筹码累积）
-	Fin        *candFin     `json:"fin,omitempty"`         // F2 财务摘要（长线：最新一期 ROE/增速/毛利率；缺失=无缓存且预算耗尽）
-	ScoreDims  *scoreDims   `json:"score_dims,omitempty"`  // 五维评分明细
-	SentiScore float64      `json:"senti_score,omitempty"` // N2 当日聚合情绪分 -1~1（新闻加权合成）
-	SentiNews  int          `json:"senti_news,omitempty"`  // 参与聚合的新闻条数（0=当日无相关新闻）
+	Sources    []string     `json:"sources,omitempty"`        // watchlist / gainer / active / turnover（可多来源）
+	Excluded   string       `json:"excluded,omitempty"`       // 非空=被用户筛选/风控排除的原因（透明可查）
+	Factors    *candFactors `json:"factors,omitempty"`        // 技术因子快照（210 根日线派生：窗口因子尾窗口径、指标递推、筹码累积）
+	Fin        *candFin     `json:"fin,omitempty"`            // F2 财务摘要（长线最新一期；nil 的具体缺失语义见 FinStatus）
+	FlowStatus string       `json:"flow_status,omitempty"`    // available / missing；只对已完成基础评分的候选写入
+	FinStatus  string       `json:"finance_status,omitempty"` // 长线 available / missing；短线不适用时留空
+	ScoreDims  *scoreDims   `json:"score_dims,omitempty"`     // 五维评分明细
+	SentiScore float64      `json:"senti_score,omitempty"`    // N2 当日聚合情绪分 -1~1（新闻加权合成）
+	SentiNews  int          `json:"senti_news,omitempty"`     // 参与聚合的新闻条数（0=当日无相关新闻）
 	// M3a 扩展信号（最近有数据交易日的口径，通常为 T-1 信息；缺失=未上榜/无快照）。
 	LhbNetYi  float64 `json:"lhb_net_yi,omitempty"` // 龙虎榜净买额（亿元，负=净卖出）
 	LhbReason string  `json:"lhb_reason,omitempty"` // 上榜原因
@@ -2102,6 +2104,23 @@ func marshalPoolSnapshot(pool []candidate) (string, int) {
 	return string(b), omitted
 }
 
+// adjustedCandidateScore 在给定五维分上叠加现有策略规则与低位高换手扣分。
+// 预热优先级与富化后的最终评分共用该组装，区别只在候选是否已写入 flow/finance。
+func adjustedCandidateScore(recType string, strat *strategyTemplate, c candidate, factors *candFactors, sc ScoreResult) (float64, []string) {
+	delta, notes := strategyAdjust(recType, strat.Key, c, factors)
+	if c.TurnoverRate > deadTurnoverPct {
+		// 低位高换手分级扣分：25~30% 比 20~25% 更接近极端换手，扣更重，
+		// 抵消五维量能维对爆量的加分（否则净效应近乎中性，惩罚失真）。
+		penalty, band := 5.0, "20~25%"
+		if c.TurnoverRate > 25 {
+			penalty, band = 8, "25~30%"
+		}
+		delta -= penalty
+		notes = append(notes, fmt.Sprintf("低位高换手 %.1f%%（%s 档）：放量启动与对倒出货并存，需谨慎（-%.0f）", c.TurnoverRate, band, penalty))
+	}
+	return round2(clamp0100(sc.Total + delta)), notes
+}
+
 // scorePool 阶段③：对未被排除的候选拉日线算技术因子，五维评分 + 策略加分合成量化分，
 // 追高保护在此判定（需要近 5 日涨幅），最后按分排名、去相关贪心选出 LLM 名单
 // （S1-3：相关性去重 + 同行业名额上限，返回被挤出者的门控记录供事件表落库）。
@@ -2109,13 +2128,15 @@ func marshalPoolSnapshot(pool []candidate) (string, int) {
 // 否则既能挤占名单名额、又静默绕过近 5 日涨幅追高保护。追高/无日线剔除释放的名额
 // 会从「池满」标的中按进池顺序补评一轮（只补一轮，拉取总量仍有界）。
 func (s *RecommendationService) scorePool(ctx context.Context, recType string, strat *strategyTemplate, pool []candidate, filters RecFilters, industryBy map[string]string) []gateNote {
-	sentiDate := time.Now().Format("2006-01-02")
+	scoreNow := time.Now().In(time.Local)
+	sentiDate := scoreNow.Format("2006-01-02")
 	// F2 财务拉取预算（仅长线消耗）：单次生成最多回上游拉 finRecFetchBudget 只 F10，
 	// 其余只吃本地缓存（缺失不惩罚），多次生成/详情页访问会逐步焐热缓存。
 	finBudget := finRecFetchBudget
 	// M3a 资金流历史补拉预算（短线/长线通用）：同款按需+缓存模式。
 	flowBudget := fflowRecBudget
-	// scoreRound 对给定下标拉日线并评分；返回本轮存活（未被排除）的数量。
+	// scoreRound 严格分两阶段：先为整轮候选计算不依赖 finance/flow 的基础事实与
+	// 硬过滤，再确定并执行两个独立补拉集合；全部结果冻结后才统一写回并终评。
 	scoreRound := func(idxs []int) int {
 		// M3a 龙虎榜/人气榜信号批量注入（本地表两次查询，最近有数据交易日口径）——
 		// 必须先于 strategyAdjust 写回候选，加分项才看得见。
@@ -2177,7 +2198,10 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 		}
 		wg.Wait()
 
-		alive := 0
+		baseScores := make(map[int]ScoreResult, len(idxs))
+		factorsBy := make(map[int]*candFactors, len(idxs))
+		computed := make([]int, 0, len(idxs))
+		preheat := make([]recPreheatCandidate, 0, len(idxs))
 		for _, i := range idxs {
 			bars := barsBy[i]
 			if len(bars) == 0 {
@@ -2193,7 +2217,10 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 				barsScore = barsScore[len(barsScore)-factorBarLimit:]
 			}
 			sc := computeScore(pool[i].Price, barsScore)
-			pool[i].Factors = computeCandFactors(pool[i].Price, bars)
+			factors := computeCandFactors(pool[i].Price, bars)
+			baseScores[i] = sc
+			factorsBy[i] = factors
+			computed = append(computed, i)
 			// S0-4 价格版本 + S1-3 相关性序列：保存尾部收盘与交易日（61 根足够 60 日
 			// 收益相关；日期供停牌错位下的交集对齐）与最近收盘日锚点（防前复权重锚
 			// 的比对基准）。
@@ -2212,42 +2239,33 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 			pool[i].lastBarDate = bars[len(bars)-1].TradeDate
 			pool[i].lastBarClose = bars[len(bars)-1].Close
 
-			// M3a 主力资金流：缓存优先、预算内补拉；有序列时融合量能维（0.6 原量能
-			// + 0.4 资金分）并派生连续净流入天数因子，缺失不惩罚（评分原样）。
-			flows, fresh := ensureStockFundFlow(ctx, s.em, pool[i].Market, pool[i].Symbol, &flowBudget)
-			if flows = fundFlowForScoring(flows, fresh); len(flows) > 0 {
-				sc = applyFlowScore(sc, flows)
-				pool[i].Factors.MainNetDays = mainNetStreakDays(flows)
-				pool[i].Factors.MainNet5dYi = round2(mainNetSum(flows, 5) / 1e8)
-			}
 			// M3b 盘中因子写回（T-1 盘中形态，进短线策略加分与 LLM 名单）。
 			if sig, ok := intraSigs[pool[i].Symbol]; ok {
-				pool[i].Factors.IntradayDate = sig.TradeDate
-				pool[i].Factors.Tail30Chg = sig.Tail30Chg
-				pool[i].Factors.Tail30VolPct = sig.Tail30VolPct
-				pool[i].Factors.MorningChg = sig.MorningChg
-				pool[i].Factors.CloseVsVwap = sig.CloseVsVwap
-				pool[i].Factors.PmVwapUp = sig.PmVwapUp
+				factors.IntradayDate = sig.TradeDate
+				factors.Tail30Chg = sig.Tail30Chg
+				factors.Tail30VolPct = sig.Tail30VolPct
+				factors.MorningChg = sig.MorningChg
+				factors.CloseVsVwap = sig.CloseVsVwap
+				factors.PmVwapUp = sig.PmVwapUp
 			}
-			pool[i].ScoreDims = &scoreDims{Trend: sc.Trend, Momentum: sc.Momentum, Position: sc.Position, Volume: sc.Volume, Risk: sc.Risk}
 
 			// T1 筹码分布（零上游成本本地复算）：获利盘进因子与评分。
 			// 失败（次新股不足 120 根/换手缺失）静默缺席——ChipBars=0 即「未算」。
 			if chip, err := computeChipDistribution(bars, 0); err == nil {
-				pool[i].Factors.ChipProfit = chip.Profit
-				pool[i].Factors.ChipAvgCost = chip.AvgCost
-				pool[i].Factors.ChipBars = chip.BarCount
+				factors.ChipProfit = chip.Profit
+				factors.ChipAvgCost = chip.AvgCost
+				factors.ChipBars = chip.BarCount
 			}
 
 			// 追高保护（依赖近 5 日涨幅因子）。
-			if reason := applyGainFilter(pool[i], pool[i].Factors, filters); reason != "" {
+			if reason := applyGainFilter(pool[i], factors, filters); reason != "" {
 				pool[i].Excluded = reason
 				continue
 			}
 
 			// 换手 20~30% 区间的位置判定（依赖 pos_60 因子）：高位=死亡换手排除；
 			// 低位保留但下方统一扣分标注（放量启动与对倒出货并存，透明交给用户权衡）。
-			if reason := applyTurnoverPosFilter(pool[i], pool[i].Factors); reason != "" {
+			if reason := applyTurnoverPosFilter(pool[i], factors); reason != "" {
 				pool[i].Excluded = reason
 				continue
 			}
@@ -2257,24 +2275,55 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 				pool[i].SentiScore, pool[i].SentiNews = sc, cnt
 			}
 
-			// F2 财务因子（仅长线）：最新一期 ROE/净利增速/营收增速进加分与 LLM 名单。
-			if recType == model.RecTypeLongTerm {
-				pool[i].Fin = financeFactorFor(ctx, pool[i].Symbol, &finBudget)
+			// 补拉优先级只看此刻可知的 A 类/PIT 基础分；Fin 仍为 nil、资金流字段仍为空。
+			pool[i].Fin = nil
+			pool[i].FlowStatus = ""
+			pool[i].FinStatus = ""
+			baseScore, _ := adjustedCandidateScore(recType, strat, pool[i], factors, sc)
+			preheat = append(preheat, recPreheatCandidate{Idx: i, Symbol: pool[i].Symbol, BaseScore: baseScore})
+		}
+
+		enriched := recRoundEnrichment{
+			Flows:            map[int][]model.FundFlowDaily{},
+			Finance:          map[int]*candFin{},
+			FlowAvailable:    map[int]bool{},
+			FinanceAvailable: map[int]bool{},
+		}
+		if len(preheat) > 0 {
+			enriched = s.preheatRecommendationRound(ctx, recType, pool, preheat, &finBudget, &flowBudget, scoreNow)
+		}
+
+		alive := 0
+		for _, i := range computed {
+			factors := factorsBy[i]
+			sc := baseScores[i]
+			pool[i].Factors = factors
+			if pool[i].Excluded != "" {
+				pool[i].ScoreDims = &scoreDims{Trend: sc.Trend, Momentum: sc.Momentum, Position: sc.Position, Volume: sc.Volume, Risk: sc.Risk}
+				continue
 			}
 
-			delta, notes := strategyAdjust(recType, strat.Key, pool[i], pool[i].Factors)
-			if pool[i].TurnoverRate > deadTurnoverPct {
-				// 低位高换手分级扣分：25~30% 比 20~25% 更接近极端换手，扣更重，
-				// 抵消五维量能维对爆量的加分（否则净效应近乎中性，惩罚失真）。
-				penalty, band := 5.0, "20~25%"
-				if pool[i].TurnoverRate > 25 {
-					penalty, band = 8, "25~30%"
-				}
-				delta -= penalty
-				notes = append(notes, fmt.Sprintf("低位高换手 %.1f%%（%s 档）：放量启动与对倒出货并存，需谨慎（-%.0f）", pool[i].TurnoverRate, band, penalty))
+			// 统一富化：只有 fresh 资金流才融合量能维并写派生因子；missing 明确标记，
+			// 零值不作为中性资金证据。财务同理，缺失时保持 Fin=nil。
+			if enriched.FlowAvailable[i] {
+				flows := enriched.Flows[i]
+				sc = applyFlowScore(sc, flows)
+				factors.MainNetDays = mainNetStreakDays(flows)
+				factors.MainNet5dYi = round2(mainNetSum(flows, 5) / 1e8)
+				pool[i].FlowStatus = recEnrichmentAvailable
+			} else {
+				pool[i].FlowStatus = recEnrichmentMissing
 			}
-			pool[i].Score = round2(clamp0100(sc.Total + delta))
-			pool[i].Bonus = notes
+			if recType == model.RecTypeLongTerm {
+				pool[i].Fin = enriched.Finance[i]
+				if enriched.FinanceAvailable[i] {
+					pool[i].FinStatus = recEnrichmentAvailable
+				} else {
+					pool[i].FinStatus = recEnrichmentMissing
+				}
+			}
+			pool[i].ScoreDims = &scoreDims{Trend: sc.Trend, Momentum: sc.Momentum, Position: sc.Position, Volume: sc.Volume, Risk: sc.Risk}
+			pool[i].Score, pool[i].Bonus = adjustedCandidateScore(recType, strat, pool[i], factors, sc)
 			alive++
 		}
 		return alive
@@ -2323,7 +2372,12 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 			ranked = append(ranked, scored{idx: i, score: pool[i].Score})
 		}
 	}
-	sort.SliceStable(ranked, func(a, b int) bool { return ranked[a].score > ranked[b].score })
+	sort.Slice(ranked, func(a, b int) bool {
+		if ranked[a].score != ranked[b].score {
+			return ranked[a].score > ranked[b].score
+		}
+		return pool[ranked[a].idx].Symbol < pool[ranked[b].idx].Symbol
+	})
 
 	// S1-3 组合去相关（名单阶段生效，不改写 LLM 输出）：按分数贪心入选——与已入选
 	// 标的近 60 日收益相关性超阈值只保留分高者；同行业（宇宙快照口径，未积累时该
@@ -2526,8 +2580,14 @@ func compactForLLM(recType string, cands []candidate) []map[string]any {
 		if c.Factors != nil {
 			row["factors"] = c.Factors
 		}
+		if c.FlowStatus != "" {
+			row["flow_status"] = c.FlowStatus
+		}
 		if c.Fin != nil {
 			row["fin"] = c.Fin
+		}
+		if c.FinStatus != "" {
+			row["finance_status"] = c.FinStatus
 		}
 		if len(c.Bonus) > 0 {
 			row["strategy_notes"] = c.Bonus

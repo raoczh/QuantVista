@@ -80,6 +80,12 @@ func syncFinanceIndicators(ctx context.Context, symbol string, force bool) bool 
 	if (!force && finFresh(&model.FinanceIndicator{}, symbol)) || !finTryAllowed("ind:"+symbol) {
 		return false
 	}
+	return fetchFinanceIndicators(ctx, symbol)
+}
+
+// fetchFinanceIndicators 执行一次已经通过新鲜度/冷却规划的真实上游请求。
+// 返回 true 表示请求已发出；请求失败、空响应或落库失败仍属于一次预算消耗。
+func fetchFinanceIndicators(ctx context.Context, symbol string) bool {
 	rows, err := fetchF10(ctx, symbol)
 	if err != nil {
 		common.SysDebug("F10 财务指标拉取失败 %s: %v", symbol, err)
@@ -315,46 +321,76 @@ type candFin struct {
 	DebtRatio    float64 `json:"debt_ratio,omitempty"`
 }
 
+// financeFactorProbe 是推荐轮在任何补拉发生前读取并冻结的本地财务状态。
+// RequiredReport 非空表示披露日历已证明缓存落后一季；Fresh 表示探测时缓存仍在 TTL 内。
+// 任一 stale 状态刷新未成功都必须 fail-closed。
+type financeFactorProbe struct {
+	Symbol         string
+	AsOf           string
+	Cached         *model.FinanceIndicator
+	RequiredReport string
+	Fresh          bool
+	RefreshNeeded  bool
+}
+
+func inspectFinanceFactor(symbol, asOf string) financeFactorProbe {
+	p := financeFactorProbe{Symbol: symbol, AsOf: asOf}
+	if common.DB == nil || !isSixDigits(symbol) {
+		return p
+	}
+	p.Cached = financeIndicatorAsOf(symbol, asOf)
+	if p.Cached != nil {
+		p.RequiredReport = publishedFinanceReportAfter(symbol, p.Cached.ReportDate, asOf)
+		p.Fresh = finFresh(&model.FinanceIndicator{}, symbol)
+	}
+	p.RefreshNeeded = p.Cached == nil || p.RequiredReport != "" || !p.Fresh
+	return p
+}
+
+func financeIndicatorToFactor(r *model.FinanceIndicator) *candFin {
+	if r == nil {
+		return nil
+	}
+	return &candFin{
+		Report: r.ReportName, ROE: round2(r.ROE),
+		RevenueYoY: round2(r.RevenueYoY), NetProfitYoY: round2(r.NetProfitYoY),
+		GrossMargin: round2(r.GrossMargin), NetMargin: round2(r.NetMargin), DebtRatio: round2(r.DebtRatio),
+	}
+}
+
+// resolveFinanceFactor 把探测时状态与补拉结果冻结成推荐可消费的因子。
+// fetched=false 时绝不重读 DB，避免其他并发写入改变已规划轮次的事实集合。
+func resolveFinanceFactor(p financeFactorProbe, fetched bool) *candFin {
+	latest := p.Cached
+	fresh := p.Fresh
+	if fetched {
+		latest = financeIndicatorAsOf(p.Symbol, p.AsOf)
+		fresh = latest != nil && finFresh(&model.FinanceIndicator{}, p.Symbol)
+	}
+	if !fresh || (p.RequiredReport != "" && (latest == nil || latest.ReportDate < p.RequiredReport)) {
+		return nil
+	}
+	return financeIndicatorToFactor(latest)
+}
+
 // financeFactorFor 读取某股截至当前时点可用的最新一期财务摘要供推荐评分/LLM 名单。
-// 披露日历确认有更新报告时强制尝试刷新；若刷新失败则 fail-closed，不让已知过期报告
-// 继续加分。没有更新事件时仍沿用 7 天同步水位作缺日历的容灾探测。
+// 披露日历确认有更新报告或缓存超过 7 天 TTL 时尝试刷新；若刷新未成功则
+// fail-closed，不让 stale 报告继续参与推荐。
 func financeFactorFor(ctx context.Context, symbol string, budget *int) *candFin {
 	if common.DB == nil || !isSixDigits(symbol) {
 		return nil
 	}
 	asOf := time.Now().In(time.Local).Format("2006-01-02")
-	toFactor := func(r *model.FinanceIndicator) *candFin {
-		if r == nil {
-			return nil
-		}
-		return &candFin{
-			Report: r.ReportName, ROE: round2(r.ROE),
-			RevenueYoY: round2(r.RevenueYoY), NetProfitYoY: round2(r.NetProfitYoY),
-			GrossMargin: round2(r.GrossMargin), NetMargin: round2(r.NetMargin), DebtRatio: round2(r.DebtRatio),
-		}
-	}
-
-	cached := financeIndicatorAsOf(symbol, asOf)
-	requiredReport := ""
-	if cached != nil {
-		requiredReport = publishedFinanceReportAfter(symbol, cached.ReportDate, asOf)
-	}
-	refreshNeeded := cached == nil || requiredReport != "" || !finFresh(&model.FinanceIndicator{}, symbol)
-	if !refreshNeeded {
-		return toFactor(cached)
+	probe := inspectFinanceFactor(symbol, asOf)
+	if !probe.RefreshNeeded {
+		return resolveFinanceFactor(probe, false)
 	}
 	if budget == nil || *budget <= 0 {
-		if requiredReport != "" {
-			return nil // 已知有新报告但无法刷新，旧报告不得继续参与推荐。
-		}
-		return toFactor(cached)
+		return resolveFinanceFactor(probe, false)
 	}
-	if syncFinanceIndicators(ctx, symbol, cached == nil || requiredReport != "") {
+	fetched := syncFinanceIndicators(ctx, symbol, probe.Cached == nil || probe.RequiredReport != "")
+	if fetched {
 		*budget--
 	}
-	latest := financeIndicatorAsOf(symbol, asOf)
-	if requiredReport != "" && (latest == nil || latest.ReportDate < requiredReport) {
-		return nil
-	}
-	return toFactor(latest)
+	return resolveFinanceFactor(probe, fetched)
 }

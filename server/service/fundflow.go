@@ -47,49 +47,68 @@ func fflowTryAllowed(key string) bool {
 	return true
 }
 
+// stockFundFlowProbe 是推荐轮在补拉前一次性读取并冻结的本地资金流状态。
+// Rows 可供详情页回退展示；只有 Fresh=true 才允许进入评分与 LLM 因子。
+type stockFundFlowProbe struct {
+	Market string
+	Symbol string
+	Rows   []model.FundFlowDaily
+	Fresh  bool
+}
+
+func inspectStockFundFlow(market, symbol string, now time.Time) stockFundFlowProbe {
+	p := stockFundFlowProbe{Market: market, Symbol: symbol}
+	if common.DB == nil || market != "cn" {
+		return p
+	}
+	common.DB.Where("symbol = ? AND market = ?", symbol, market).
+		Order("trade_date ASC").Limit(fflowBarLimit).Find(&p.Rows)
+	freshSince := prevOpenTradeDate(now.Format("2006-01-02"))
+	p.Fresh = len(p.Rows) > 0 && p.Rows[len(p.Rows)-1].TradeDate >= freshSince
+	return p
+}
+
+// fetchStockFundFlowReserved 执行一次已由推荐预热规划器占用冷却槽的真实请求。
+// 请求失败仍返回补拉前库存，Fresh 保持 false，并且不会在本轮继续尝试其他标的。
+func fetchStockFundFlowReserved(ctx context.Context, em *datasource.EastMoneyAdapter, p stockFundFlowProbe, now time.Time) stockFundFlowProbe {
+	fctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	bars, err := em.GetStockFundFlow(fctx, p.Market, p.Symbol, fflowBarLimit)
+	if err != nil {
+		if !errors.Is(err, datasource.ErrNoData) {
+			common.SysDebug("资金流历史拉取失败 %s: %v", p.Symbol, err)
+		}
+		return p
+	}
+	persistFundFlow(p.Market, p.Symbol, bars, now)
+	return inspectStockFundFlow(p.Market, p.Symbol, now)
+}
+
 // ensureStockFundFlow 读取某股资金流序列（升序，≤fflowBarLimit 根）；库存不新鲜且
 // 预算允许时回上游补拉。budget 为 nil 表示不限预算（详情页单股场景）。
 // 返回序列与「数据是否新鲜」（末行 ≥ 上一开市日）。失败返回库存（stale 也比没有强）。
 func ensureStockFundFlow(ctx context.Context, em *datasource.EastMoneyAdapter, market, symbol string, budget *int) ([]model.FundFlowDaily, bool) {
+	now := time.Now()
+	probe := inspectStockFundFlow(market, symbol, now)
 	if common.DB == nil || market != "cn" {
 		return nil, false
 	}
-	read := func() []model.FundFlowDaily {
-		var rows []model.FundFlowDaily
-		common.DB.Where("symbol = ? AND market = ?", symbol, market).
-			Order("trade_date ASC").Limit(fflowBarLimit).Find(&rows)
-		return rows
-	}
-	now := time.Now()
-	freshSince := prevOpenTradeDate(now.Format("2006-01-02"))
-	rows := read()
-	if len(rows) > 0 && rows[len(rows)-1].TradeDate >= freshSince {
-		return rows, true
+	if probe.Fresh {
+		return probe.Rows, true
 	}
 	if budget != nil && *budget <= 0 {
-		return rows, false
+		return probe.Rows, false
 	}
 	if !fflowTryAllowed(market + ":" + symbol) {
-		return rows, false
+		return probe.Rows, false
 	}
 	// 预算表示实际发出的上游请求数。冷却命中没有 I/O，不得白白占掉名额并让
 	// 后续标的因遍历顺序失去补拉机会。
 	if budget != nil {
 		*budget--
 	}
-	fctx, cancel := context.WithTimeout(ctx, 6*time.Second)
-	defer cancel()
-	bars, err := em.GetStockFundFlow(fctx, market, symbol, fflowBarLimit)
-	if err != nil {
-		if !errors.Is(err, datasource.ErrNoData) {
-			common.SysDebug("资金流历史拉取失败 %s: %v", symbol, err)
-		}
-		return rows, false
-	}
-	persistFundFlow(market, symbol, bars, now)
-	rows = read()
-	fresh := len(rows) > 0 && rows[len(rows)-1].TradeDate >= freshSince
-	return rows, fresh
+	probe = fetchStockFundFlowReserved(ctx, em, probe, now)
+	return probe.Rows, probe.Fresh
 }
 
 // fundFlowForScoring 收紧评分消费口径：ensureStockFundFlow 为详情页保留 stale
