@@ -246,36 +246,37 @@ func (s *AnalysisService) debateCallOne(ctx context.Context, userID int64, run *
 	convo := messages
 	run.hashPrompt(convo)
 	var lastErr error
-	for attempt := 0; attempt <= moduleRepairAttempts(run.Module); attempt++ {
+	repairLimit := moduleRepairAttempts(run.Module)
+	requestMax := moduleTokenCap(run.Module, cfg.MaxTokens)
+	for attempt := 0; attempt <= repairLimit; attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-			Temperature: cfg.Temperature, MaxTokens: moduleTokenCap(run.Module, cfg.MaxTokens),
+			Temperature: cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
 		})
 		run.record(res, err)
+		if res != nil {
+			addChatUsage(&usage, res.Usage)
+		}
 		if err != nil {
 			// audit outcome：拒收调用的真实 token 消耗照常累计（res 可能非 nil）。
-			if res != nil {
-				usage.PromptTokens += res.Usage.PromptTokens
-				usage.CompletionTokens += res.Usage.CompletionTokens
-				usage.TotalTokens += res.Usage.TotalTokens
+			if attempt < repairLimit && isTokenLimitFinishState(run.FinishState) {
+				requestMax = moduleRepairTokenCap(run.Module, requestMax)
+				convo = appendModuleRepairMessages(convo, run.Module, chatResultContent(res), run.FinishState,
+					"上一条输出因 token 上限被截断。请从头完整输出。"+repairHint)
+				continue
 			}
 			return usage, err
 		}
-		usage.PromptTokens += res.Usage.PromptTokens
-		usage.CompletionTokens += res.Usage.CompletionTokens
-		usage.TotalTokens += res.Usage.TotalTokens
 		if perr := parse(res.Content); perr == nil {
 			run.acceptRouteAttribution()
 			return usage, nil
 		} else {
 			lastErr = perr
-			convo = append(convo,
-				chatMessage{Role: "assistant", Content: moduleRepairFeed(run.Module, res.Content)},
-				chatMessage{Role: "user", Content: "上一条输出不合格：" + perr.Error() + "。" + repairHint},
-			)
+			convo = appendModuleRepairMessages(convo, run.Module, res.Content, run.FinishState,
+				"上一条输出不合格："+perr.Error()+"。"+repairHint)
 		}
 	}
 	run.DegradedReason = "llm_output_invalid"

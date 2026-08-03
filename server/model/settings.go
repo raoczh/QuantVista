@@ -19,14 +19,15 @@ type LLMConfig struct {
 	Model        string    `gorm:"size:64" json:"model"`
 	EndpointType string    `gorm:"size:24;default:chat_completions" json:"endpoint_type"` // 空值按 chat_completions
 	Temperature  float64   `gorm:"default:0.7" json:"temperature"`
-	MaxTokens    int       `gorm:"default:2048" json:"max_tokens"`
-	Stream       bool      `gorm:"default:true" json:"stream"`
-	IsDefault    bool      `gorm:"default:false" json:"is_default"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	// MaxTokens 新建缺省 8192（对齐 new-api Claude DefaultMaxTokens 缺省值）；无业务上限，
+	// 仅请求层保留整型溢出护栏（llmGlobalHardCap）。
+	MaxTokens int       `gorm:"default:8192" json:"max_tokens"`
+	Stream    bool      `gorm:"default:true" json:"stream"`
+	IsDefault bool      `gorm:"default:false" json:"is_default"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // DataSourceConfig 已删除（S1）：该表自骨架期建立后从未接线（死表）。数据源健康
 // 现由 datasource.HealthTracker 进程内滑窗承担（GET /api/admin/datasources），
 // 无需落库。旧库中残留的 data_source_configs 物理表无害，可手工 DROP。
-

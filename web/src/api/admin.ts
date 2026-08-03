@@ -159,11 +159,14 @@ export interface LLMCallLogItem {
   error_msg: string
   prompt_tokens: number
   completion_tokens: number
+  reasoning_tokens: number
+  cached_tokens: number
   total_tokens: number
   latency_ms: number
   first_chunk_ms: number // 流式首个 data 块耗时；0=非流式；≈latency_ms 说明上游整包返回（假流式）
   request_body: string // 仅详情接口返回，列表恒为空
   response_body: string
+  reasoning_content: string
   // ---- P0-2/P0-8 调用关联与完整性元数据（旧记录为空字符串/0）----
   trace_id: string // 业务结果级追溯 ID（主调/repair/复核/反方共享）
   run_id: string // 逻辑调用组 ID（主调与其 repair 同组）
@@ -177,12 +180,17 @@ export interface LLMCallLogItem {
   data_hash: string
   finish_state: string // 规范化终态；空=成功但上游未报告
   finish_state_raw: string
+  finish_attribution: string // reasoning_exhausted / content_exhausted / 空
   created_at: string
 }
 
 export interface LLMCallLogList {
   items: LLMCallLogItem[]
   total: number
+  length_stats: {
+    reasoning_exhausted: number
+    content_exhausted: number
+  }
 }
 
 export function listLlmCalls(params: {

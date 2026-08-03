@@ -576,6 +576,7 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, run 
 	// P0-9：repair 次数与输出预算按 run.Module 从模块预算表取；结构化模块至多
 	// repair 1 次，避免同一长输出连续占用多个上游 60s 窗口。
 	repairLimit := moduleRepairAttempts(run.Module)
+	requestMax := moduleTokenCap(run.Module, cfg.MaxTokens)
 	for attempt := 0; attempt <= repairLimit; attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL:      cfg.BaseURL,
@@ -583,7 +584,7 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, run 
 			Model:        cfg.Model,
 			EndpointType: cfg.EndpointType,
 			Temperature:  cfg.Temperature,
-			MaxTokens:    moduleTokenCap(run.Module, cfg.MaxTokens),
+			MaxTokens:    requestMax,
 			Messages:     convo,
 			JSONMode:     true,
 			AllowPrivate: allowPrivate,
@@ -591,21 +592,22 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, run 
 			Meta:         run.chatMeta(userID, cfg, attempt+1),
 		})
 		run.record(res, err)
+		if res != nil {
+			addChatUsage(&acc, res.Usage)
+		}
 		if err != nil {
 			// 网络/鉴权/服务端错误：若已有过成功响应文本则不再重试，直接返回错误。
 			// audit outcome（P0-8 修复批）：完整性拒收的调用上游确已消耗 token，
 			// res 带出的真实 usage 照常累计——业务表 token 统计反映实际上游消耗。
-			if res != nil {
-				acc.PromptTokens += res.Usage.PromptTokens
-				acc.CompletionTokens += res.Usage.CompletionTokens
-				acc.TotalTokens += res.Usage.TotalTokens
+			if attempt < repairLimit && isTokenLimitFinishState(run.FinishState) {
+				requestMax = moduleRepairTokenCap(run.Module, requestMax)
+				convo = appendModuleRepairMessages(convo, run.Module, chatResultContent(res), run.FinishState,
+					"上一条输出因 token 上限被截断。请从头重新输出完整结果。"+repairHint)
+				continue
 			}
 			run.routeApplied = LLMRouteApplied{}
 			return lastRaw, acc, lastLatency, err
 		}
-		acc.PromptTokens += res.Usage.PromptTokens
-		acc.CompletionTokens += res.Usage.CompletionTokens
-		acc.TotalTokens += res.Usage.TotalTokens
 		lastRaw = res.Content
 		lastLatency = res.LatencyMs
 
@@ -616,10 +618,8 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, run 
 		}
 		// 校验失败：追加 repair 指令再试。坏输出按模块上限截断回灌（P0-9：完整回灌
 		// 会拖慢下一轮生成，更易撞上游 60s 超时——推荐/日报先例）。
-		convo = append(convo,
-			chatMessage{Role: "assistant", Content: moduleRepairFeed(run.Module, res.Content)},
-			chatMessage{Role: "user", Content: "上一条输出不符合要求：" + perr.Error() + "。" + repairHint},
-		)
+		convo = appendModuleRepairMessages(convo, run.Module, res.Content, run.FinishState,
+			"上一条输出不符合要求："+perr.Error()+"。"+repairHint)
 	}
 	run.routeApplied = LLMRouteApplied{}
 	return lastRaw, acc, lastLatency, nil // 降级
@@ -805,27 +805,30 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 			"\n\n【待复核的分析结果】（JSON）：\n" + string(resJSON)},
 	}
 	run.hashPrompt(convo)
-	for attempt := 0; attempt <= moduleRepairAttempts("analysis_review"); attempt++ {
+	repairLimit := moduleRepairAttempts("analysis_review")
+	requestMax := moduleTokenCap("analysis_review", cfg.MaxTokens)
+	for attempt := 0; attempt <= repairLimit; attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-			Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("analysis_review", cfg.MaxTokens),
+			Temperature: cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
 		})
 		run.record(res, err)
+		if res != nil {
+			addChatUsage(&usage, res.Usage)
+		}
 		if err != nil {
 			// audit outcome：拒收调用的真实 token 消耗照常累计（res 可能非 nil）。
-			if res != nil {
-				usage.PromptTokens += res.Usage.PromptTokens
-				usage.CompletionTokens += res.Usage.CompletionTokens
-				usage.TotalTokens += res.Usage.TotalTokens
+			if attempt < repairLimit && isTokenLimitFinishState(run.FinishState) {
+				requestMax = moduleRepairTokenCap("analysis_review", requestMax)
+				convo = appendModuleRepairMessages(convo, "analysis_review", chatResultContent(res), run.FinishState,
+					`上一条输出因 token 上限被截断。请从头完整输出 JSON：{"verdict":"pass|warn|reject","comment":"...","confidence":0-100 整数}。`)
+				continue
 			}
 			return nil, usage, run
 		}
-		usage.PromptTokens += res.Usage.PromptTokens
-		usage.CompletionTokens += res.Usage.CompletionTokens
-		usage.TotalTokens += res.Usage.TotalTokens
 
 		var rv analysisReview
 		if json.Unmarshal([]byte(extractJSONObject(res.Content)), &rv) == nil {
@@ -843,10 +846,8 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 				return &rv, usage, run
 			}
 		}
-		convo = append(convo,
-			chatMessage{Role: "assistant", Content: moduleRepairFeed("analysis_review", res.Content)},
-			chatMessage{Role: "user", Content: `上一条输出不合格。请只输出 JSON：{"verdict":"pass|warn|reject","comment":"...","confidence":0-100 整数}。`},
-		)
+		convo = appendModuleRepairMessages(convo, "analysis_review", res.Content, run.FinishState,
+			`上一条输出不合格。请只输出 JSON：{"verdict":"pass|warn|reject","comment":"...","confidence":0-100 整数}。`)
 	}
 	run.DegradedReason = "llm_output_invalid"
 	return nil, usage, run

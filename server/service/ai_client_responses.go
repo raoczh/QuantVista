@@ -36,7 +36,7 @@ func responsesURL(baseURL string) string {
 
 // buildResponsesPayload chat 语义 → responses 请求体。temperature/max_output_tokens 按
 // 能力观测省略（P0-5 修复批）；最终形态经 noteFinalRequestBody 记入审计。
-func buildResponsesPayload(p chatParams, jsonMode, stream bool) map[string]any {
+func buildResponsesPayload(p chatParams, jsonMode, stream, promptCache bool) map[string]any {
 	var instructions []string
 	input := make([]map[string]any, 0, len(p.Messages))
 	for _, m := range p.Messages {
@@ -62,8 +62,9 @@ func buildResponsesPayload(p chatParams, jsonMode, stream bool) map[string]any {
 		payload["instructions"] = strings.Join(instructions, "\n\n")
 	}
 	if p.MaxTokens > 0 {
-		payload["max_output_tokens"] = p.MaxTokens
+		payload["max_output_tokens"] = p.requestTokenBudget()
 	}
+	p.addPromptCacheField(payload, promptCache)
 	if jsonMode {
 		payload["text"] = map[string]any{"format": map[string]string{"type": "json_object"}}
 	}
@@ -71,21 +72,32 @@ func buildResponsesPayload(p chatParams, jsonMode, stream bool) map[string]any {
 }
 
 // marshalResponsesPayload 序列化 payload 并记录最终请求体审计观测。
-func marshalResponsesPayload(p chatParams, jsonMode, stream bool) []byte {
-	body, _ := json.Marshal(buildResponsesPayload(p, jsonMode, stream))
+func marshalResponsesPayload(p chatParams, jsonMode, stream, promptCache bool) []byte {
+	body, _ := json.Marshal(buildResponsesPayload(p, jsonMode, stream, promptCache))
 	p.noteFinalRequestBody(body)
 	return body
 }
 
 // responses 响应体（文本子集）。usage 字段名与 chat 不同（input/output_tokens）。
 type responsesUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-	TotalTokens  int `json:"total_tokens"`
+	InputTokens             int                `json:"input_tokens"`
+	OutputTokens            int                `json:"output_tokens"`
+	TotalTokens             int                `json:"total_tokens"`
+	InputTokensDetails      inputTokenDetails  `json:"input_tokens_details"`
+	PromptTokensDetails     inputTokenDetails  `json:"prompt_tokens_details"`
+	OutputTokensDetails     outputTokenDetails `json:"output_tokens_details"`
+	CompletionTokenDetails  outputTokenDetails `json:"completion_tokens_details"`
+	PromptCacheHitTokens    int                `json:"prompt_cache_hit_tokens"`
+	CachedTokensCompat      int                `json:"cached_tokens"`
 }
 
 func (u responsesUsage) toChatUsage() chatUsage {
-	return chatUsage{PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens}
+	return chatUsage{
+		PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens,
+		ReasoningTokens: maxInt(u.OutputTokensDetails.ReasoningTokens, u.CompletionTokenDetails.ReasoningTokens),
+		CachedTokens: maxInt(u.InputTokensDetails.CachedTokens, u.PromptTokensDetails.CachedTokens,
+			u.PromptCacheHitTokens, u.CachedTokensCompat),
+	}
 }
 
 type responsesOutputContent struct {
@@ -98,6 +110,7 @@ type responsesOutputItem struct {
 	Type    string                   `json:"type"`
 	Role    string                   `json:"role"`
 	Content []responsesOutputContent `json:"content"`
+	Summary []responsesOutputContent `json:"summary"`
 }
 
 type responsesResponse struct {
@@ -130,6 +143,23 @@ func extractResponsesText(output []responsesOutputItem) string {
 	return sb.String()
 }
 
+func extractResponsesReasoning(output []responsesOutputItem) string {
+	var parts []string
+	for _, out := range output {
+		if out.Type != "reasoning" {
+			continue
+		}
+		for _, items := range [][]responsesOutputContent{out.Summary, out.Content} {
+			for _, item := range items {
+				if item.Text != "" {
+					parts = append(parts, item.Text)
+				}
+			}
+		}
+	}
+	return strings.Join(parts, "")
+}
+
 // extractResponsesRefusal 提取标准 Responses 结构化拒答内容。bool 表示是否出现
 // type=refusal；即使上游漏了文案也不能把该形态误报为空响应或当成功。
 func extractResponsesRefusal(output []responsesOutputItem) (string, bool) {
@@ -155,13 +185,14 @@ func responsesCompletion(ctx context.Context, p chatParams) (*chatResult, error)
 		return nil, errors.New("Base URL 非法（仅支持 http/https）")
 	}
 
-	res, status, raw, latency, err := doResponses(ctx, p, p.JSONMode)
+	cacheOn := p.promptCacheKey() != ""
+	res, status, raw, latency, err := doResponses(ctx, p, p.JSONMode, cacheOn)
 	if err != nil {
 		return res, err
 	}
 	jsonOn := p.JSONMode
 	var capConfirms []func()
-	for retry := 0; retry < 2 && status >= 400 && status < 500 && ctx.Err() == nil; retry++ {
+	for retry := 0; retry < responsesPlainFallbackLimit && status >= 400 && status < 500 && ctx.Err() == nil; retry++ {
 		changed := false
 		switch {
 		case jsonOn && looksLikeUnsupportedJSONMode(status, raw):
@@ -175,11 +206,14 @@ func responsesCompletion(ctx context.Context, p chatParams) (*chatResult, error)
 			reason := fmt.Sprintf("responses 非流式 HTTP %d 拒绝 temperature", status)
 			capConfirms = append(capConfirms, func() { p.observeTemperatureUnsupported(reason) })
 			changed = true
+		case cacheOn && looksLikeUnsupportedPromptCache(status, raw):
+			cacheOn = false
+			changed = true
 		}
 		if !changed {
 			break
 		}
-		res, status, raw, latency, err = doResponses(ctx, p, jsonOn)
+		res, status, raw, latency, err = doResponses(ctx, p, jsonOn, cacheOn)
 		if err != nil {
 			return res, err
 		}
@@ -205,9 +239,9 @@ func responsesCompletion(ctx context.Context, p chatParams) (*chatResult, error)
 
 // doResponses 单次 /responses HTTP 调用；重试策略与 doChat 一致（瞬时网络错误 +
 // 429/500/502/503 各重试一次，504 不重试）。解析/门禁类错误时结果仍尽量带出（audit outcome）。
-func doResponses(ctx context.Context, p chatParams, jsonMode bool) (*chatResult, int, []byte, int64, error) {
+func doResponses(ctx context.Context, p chatParams, jsonMode, promptCache bool) (*chatResult, int, []byte, int64, error) {
 	endpoint := responsesURL(p.BaseURL)
-	body := marshalResponsesPayload(p, jsonMode, false)
+	body := marshalResponsesPayload(p, jsonMode, false, promptCache)
 
 	client := aiHTTPClient(p.AllowPrivate)
 	send := func() (*http.Response, error) {
@@ -269,7 +303,11 @@ func parseResponsesBody(raw []byte, status int, endpoint string, contractEnabled
 		}
 		return nil, fmt.Errorf("解析 LLM 响应失败: %w（响应开头: %s）", err, bodySnippet(raw))
 	}
-	res := &chatResult{Content: extractResponsesText(parsed.Output), FinishReason: parsed.Status}
+	rawContent := extractResponsesText(parsed.Output)
+	visible, embeddedReasoning := splitThinkContent(rawContent)
+	res := &chatResult{Content: visible,
+		ReasoningContent: joinReasoningContent(extractResponsesReasoning(parsed.Output), embeddedReasoning),
+		FinishReason: parsed.Status}
 	if parsed.Usage != nil {
 		res.Usage = parsed.Usage.toChatUsage()
 	}
@@ -353,7 +391,8 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	}
 	endpoint := responsesURL(p.BaseURL)
 	jsonOn := p.JSONMode
-	body := marshalResponsesPayload(p, jsonOn, true)
+	cacheOn := p.promptCacheKey() != ""
+	body := marshalResponsesPayload(p, jsonOn, true, cacheOn)
 
 	client := aiStreamHTTPClient(p.AllowPrivate)
 	send := func() (*http.Response, error) {
@@ -395,7 +434,8 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 		resp.Body.Close()
 		dropJSON := jsonOn && looksLikeUnsupportedJSONMode(status, raw)
 		dropTemp := !p.temperatureOmitted() && looksLikeUnsupportedTemperature(status, raw)
-		if !dropJSON && !dropTemp {
+		dropCache := cacheOn && looksLikeUnsupportedPromptCache(status, raw)
+		if !dropJSON && !dropTemp && !dropCache {
 			return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", status, statusHint(status), extractErr(raw))
 		}
 		if dropJSON {
@@ -409,7 +449,10 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 			reason := fmt.Sprintf("responses 流式 HTTP %d 拒绝 temperature", status)
 			capConfirms = append(capConfirms, func() { p.observeTemperatureUnsupported(reason) })
 		}
-		body = marshalResponsesPayload(p, jsonOn, true)
+		if dropCache {
+			cacheOn = false
+		}
+		body = marshalResponsesPayload(p, jsonOn, true, cacheOn)
 		r2, e2 := send()
 		if e2 != nil {
 			return nil, fmt.Errorf("请求失败: %w", e2)
@@ -438,10 +481,12 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 		if perr != nil {
 			return res, perr // audit outcome：已解析出的正文/usage/原始 status 随错误带出
 		}
-		return finishStreamResult(p, res.Content, res.Usage, res.FinishReason, start, onDelta)
+		return finishStreamResult(p, res.Content, res.ReasoningContent, res.Usage, res.FinishReason, start, onDelta)
 	}
 
 	var sb strings.Builder
+	var reasoningBuilder strings.Builder
+	thinkFilter := thinkStreamFilter{}
 	var usage chatUsage
 	var firstChunkMs int64
 	doneStatus := ""       // 终态事件 response 对象实际携带的 status；不得由事件名推断
@@ -454,7 +499,10 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	// partialResult 拒收/中断路径的审计结果（audit outcome）：已聚合正文、上游报告的 usage
 	// 与原始终态随错误一并带出——审计与 run.record 保留真实上游结果，调用方按错误判失败。
 	partialResult := func() *chatResult {
-		return &chatResult{Content: sb.String(), Usage: usage,
+		filterCopy := thinkFilter
+		visibleTail, reasoningTail := filterCopy.Flush()
+		return &chatResult{Content: sb.String() + visibleTail,
+			ReasoningContent: joinReasoningContent(reasoningBuilder.String(), reasoningTail), Usage: usage,
 			LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs, FinishReason: doneStatus}
 	}
 	for sc.Scan() {
@@ -506,11 +554,15 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 		switch ev.Type {
 		case "response.output_text.delta":
 			if ev.Delta != "" {
-				sb.WriteString(ev.Delta)
-				if onDelta != nil {
-					onDelta(ev.Delta)
+				visible, embeddedReasoning := thinkFilter.Push(ev.Delta)
+				sb.WriteString(visible)
+				reasoningBuilder.WriteString(embeddedReasoning)
+				if onDelta != nil && visible != "" {
+					onDelta(visible)
 				}
 			}
+		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+			reasoningBuilder.WriteString(ev.Delta)
 		case "response.refusal.delta", "response.refusal.done":
 			if contractEnabled {
 				msg := strings.TrimSpace(ev.Delta)
@@ -529,6 +581,9 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 				doneStatus = ev.Response.Status
 				if ev.Response.Usage != nil {
 					usage = ev.Response.Usage.toChatUsage()
+				}
+				if reasoningBuilder.Len() == 0 {
+					reasoningBuilder.WriteString(extractResponsesReasoning(ev.Response.Output))
 				}
 				if contractEnabled {
 					if uerr := upstreamLLMError(ev.Response.Error); uerr != nil {
@@ -559,6 +614,9 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 				doneStatus = ev.Response.Status
 				if ev.Response.Usage != nil {
 					usage = ev.Response.Usage.toChatUsage()
+				}
+				if reasoningBuilder.Len() == 0 {
+					reasoningBuilder.WriteString(extractResponsesReasoning(ev.Response.Output))
 				}
 				if ev.Response.IncompleteDetails != nil {
 					incompleteReason = ev.Response.IncompleteDetails.Reason
@@ -619,6 +677,9 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	if rerr := responsesStreamStatusReject(contractEnabled, terminalEvent, doneStatus, incompleteReason); rerr != nil {
 		return partialResult(), rerr
 	}
+	visibleTail, reasoningTail := thinkFilter.Flush()
+	sb.WriteString(visibleTail)
+	reasoningBuilder.WriteString(reasoningTail)
 	content := sb.String()
 	if strings.TrimSpace(content) == "" {
 		return partialResult(), errors.New("LLM 返回空内容")
@@ -626,5 +687,6 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	if usage.TotalTokens == 0 {
 		usage = estimateUsage(p.Messages, content)
 	}
-	return &chatResult{Content: content, Usage: usage, LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs, FinishReason: doneStatus}, nil
+	return &chatResult{Content: content, ReasoningContent: strings.TrimSpace(reasoningBuilder.String()), Usage: usage,
+		LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs, FinishReason: doneStatus}, nil
 }

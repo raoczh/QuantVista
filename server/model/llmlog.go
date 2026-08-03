@@ -28,6 +28,8 @@ type LLMCallLog struct {
 	ErrorMsg         string `gorm:"size:512" json:"error_msg"`
 	PromptTokens     int    `json:"prompt_tokens"`
 	CompletionTokens int    `json:"completion_tokens"`
+	ReasoningTokens  int    `json:"reasoning_tokens"`
+	CachedTokens     int    `json:"cached_tokens"`
 	TotalTokens      int    `json:"total_tokens"`
 	LatencyMs        int64  `json:"latency_ms"`
 	// FirstChunkMs 流式请求首个 data 块到达耗时（非流式恒 0）。
@@ -35,6 +37,8 @@ type LLMCallLog struct {
 	FirstChunkMs int64  `json:"first_chunk_ms"`
 	RequestBody  string `gorm:"type:text" json:"request_body"`
 	ResponseBody string `gorm:"type:text" json:"response_body"`
+	// ReasoningContent 与对用户可见的 ResponseBody 分列，避免思考文本进入结构化解析。
+	ReasoningContent string `gorm:"type:text" json:"reasoning_content"`
 
 	// ---- P0-2/P0-8 调用关联与完整性元数据（2026-07 起写入；旧行为空，读取兼容）----
 	// TraceID 业务结果级追溯 ID：同一业务运行（主调/repair/复核/反方/交易计划/降级）共享；

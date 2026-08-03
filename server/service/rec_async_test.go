@@ -218,8 +218,9 @@ type strErr struct{ s string }
 
 func (e *strErr) Error() string { return e.s }
 
-// TestCallWithRepairBudgetAndTruncate 主调用输出预算钳制（用户 8000 → 模块 2500）、
-// repair 只跑 1 轮、坏输出回灌截断（≤600 字）。callWithRepair 直接吃 cfg 参数不走 DB。
+// TestCallWithRepairBudgetAndTruncate 主调用输出预算（用户 8000 显式配置必须原样生效，
+// 不被模块默认预算截小）、repair 只跑 1 轮、坏输出回灌截断（≤600 字）。
+// callWithRepair 直接吃 cfg 参数不走 DB。
 func TestCallWithRepairBudgetAndTruncate(t *testing.T) {
 	setupTestDB(t)
 
@@ -249,7 +250,7 @@ func TestCallWithRepairBudgetAndTruncate(t *testing.T) {
 		t.Fatalf("应恰好 2 轮（主调+1 次 repair）: calls=%d picks=%d tokens=%d", calls, len(picks), usage.TotalTokens)
 	}
 
-	// 输出预算：用户配 8000，实际请求应被钳到模块上限 2500。
+	// 输出预算：用户显式配置 8000，实际请求必须原样生效（模块默认 6000 只兜未配置场景）。
 	var payload struct {
 		MaxTokens int `json:"max_tokens"`
 		Messages  []struct {
@@ -260,8 +261,8 @@ func TestCallWithRepairBudgetAndTruncate(t *testing.T) {
 	if err := json.Unmarshal([]byte(bodies[0]), &payload); err != nil {
 		t.Fatalf("解析请求体失败: %v", err)
 	}
-	if payload.MaxTokens != moduleBudget("recommendation").MaxTokens {
-		t.Fatalf("max_tokens 应钳到 %d: %d", moduleBudget("recommendation").MaxTokens, payload.MaxTokens)
+	if payload.MaxTokens != 8000 {
+		t.Fatalf("max_tokens 应尊重用户配置 8000: %d", payload.MaxTokens)
 	}
 	// repair 轮：坏输出回灌须截断（完整 1500 字回灌会拖慢下一轮）。
 	if err := json.Unmarshal([]byte(bodies[1]), &payload); err != nil {
@@ -285,15 +286,17 @@ func TestCallWithRepairBudgetAndTruncate(t *testing.T) {
 	}
 }
 
-// TestCapModuleTokens 模块级输出预算钳制表驱动。
+// TestCapModuleTokens 模块级输出预算合成表驱动：用户显式配置原样生效，模块默认只兜
+// 未配置（0），仅整型溢出护栏钳制。
 func TestCapModuleTokens(t *testing.T) {
 	cases := []struct {
 		user, cap, want int
 	}{
-		{0, 2500, 2500},    // 用户未配 → 模块上限
-		{8000, 2500, 2500}, // 用户过大 → 钳到模块上限
-		{1200, 2500, 1200}, // 用户更小 → 尊重用户
-		{1200, 0, 1200},    // 模块无上限 → 原样
+		{0, 2500, 2500},                                  // 用户未配 → 模块默认
+		{8000, 2500, 8000},                               // 用户显式配置 → 原样生效
+		{1200, 2500, 1200},                               // 用户更小 → 尊重用户
+		{1200, 0, 1200},                                  // 模块无默认 → 原样
+		{llmGlobalHardCap + 100, 2500, llmGlobalHardCap}, // 溢出护栏
 	}
 	for _, c := range cases {
 		if got := capModuleTokens(c.user, c.cap); got != c.want {

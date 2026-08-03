@@ -296,22 +296,23 @@ func TestJSONModeSmokeProbe(t *testing.T) {
 	})
 }
 
-// TestModuleBudgetTable P0-9 预算表表驱动：token 钳制取小、repair 次数默认 1 与显式覆盖、
-// 全部业务模块已登记。
+// TestModuleBudgetTable P0-9 预算表表驱动：用户显式配置原样生效（仅整型溢出护栏）、
+// 模块默认只兜未配置（0）、repair 次数默认 1 与显式覆盖、全部业务模块已登记。
 func TestModuleBudgetTable(t *testing.T) {
 	cases := []struct {
 		module  string
 		userMax int
 		want    int
 	}{
-		{"recommendation", 0, 2500},      // 用户未配置 → 模块预算
-		{"recommendation", 100000, 2500}, // 用户过大 → 钳到模块预算
-		{"recommendation", 800, 800},     // 用户更小 → 用户优先
-		{"analysis", 100000, 2500},
-		{"qa", 100000, 2500},
-		{"compare", 0, 1000},
-		{"news", 0, 2500},
-		{"unregistered_module", 1234, 1234}, // 未登记模块不钳（接线遗漏由覆盖测试兜底）
+		{"recommendation", 0, 6000},          // 用户未配置 → 模块默认预算
+		{"recommendation", 100000, 100000},   // 用户显式配置 → 原样生效（不再钳到模块值）
+		{"recommendation", 800, 800},         // 用户更小 → 用户优先
+		{"analysis", 100000, 100000},
+		{"qa", 100000, 100000},
+		{"compare", 0, 1500},
+		{"news", 0, 3000},
+		{"recommendation", llmGlobalHardCap + 5, llmGlobalHardCap}, // 溢出护栏
+		{"unregistered_module", 1234, 1234},                        // 未登记模块不钳（接线遗漏由覆盖测试兜底）
 	}
 	for _, c := range cases {
 		if got := moduleTokenCap(c.module, c.userMax); got != c.want {
@@ -341,18 +342,33 @@ func TestModuleBudgetTable(t *testing.T) {
 		if b.MaxTokens <= 0 {
 			t.Errorf("业务模块 %s 预算不得为 0（回退用户全局值）", m)
 		}
-		if b.MaxTokens > 2500 {
-			t.Errorf("业务模块 %s 单次预算 %d 超过上游 60s 窗口的 2500 token 护栏", m, b.MaxTokens)
+		// 模块默认按输出分布 ×1.6 安全系数定标（v3.0 重定标——流式无 60s 整包窗口，
+		// 旧 2500 护栏前提失效）；本护栏只防误登记数量级（如手滑多个 0）。
+		if b.MaxTokens > 8000 {
+			t.Errorf("业务模块 %s 默认预算 %d 超出定标量级护栏 8000", m, b.MaxTokens)
 		}
 		if b.RepairAttempts > 1 {
 			t.Errorf("业务模块 %s repair 次数 %d 超过单次瘦身纪律", m, b.RepairAttempts)
 		}
 	}
+	// 截断扩容 repair：截断轮预算 ×1.5（未登记模块回默认倍率），溢出护栏钳制。
+	if got := moduleRepairTokenCap("recommendation", 6000); got != 9000 {
+		t.Errorf("截断 repair 预算应 ×1.5: %d", got)
+	}
+	if got := moduleRepairTokenCap("recommendation", llmGlobalHardCap); got != llmGlobalHardCap {
+		t.Errorf("截断 repair 扩容应受溢出护栏钳制: %d", got)
+	}
+	// experiment 与 recommendation 预算恒等（P2-1 单变量对照纪律）。
+	if llmModuleBudgets["experiment"].MaxTokens != llmModuleBudgets["recommendation"].MaxTokens {
+		t.Fatal("experiment 与 recommendation 预算必须恒等（公平对照）")
+	}
 }
 
-// TestPromptOutputLengthLimitsRemoved 锁定业务 prompt 不再用字数、句数或性能型数组
-// 上限压缩回答，并确保删除篇幅限制时没有连带删除关键结构与业务契约。
-func TestPromptOutputLengthLimitsRemoved(t *testing.T) {
+// TestPromptOutputLengthLimits v1.12 移除了压缩回答质量的篇幅限制；p14 对推荐模块
+// **有意恢复结构化体积控制**（条数上限+落选理由字数——输出体积须与输出预算匹配，
+// 截断故障根治批）。本测试锁定：推荐之外的模块仍无篇幅限制，推荐模块的体积控制
+// 形态与业务契约齐全。
+func TestPromptOutputLengthLimits(t *testing.T) {
 	prompts := []struct {
 		name string
 		text string
@@ -361,8 +377,6 @@ func TestPromptOutputLengthLimitsRemoved(t *testing.T) {
 		{"analysis_panel", panelRepairHint + panelOutputSpec},
 		{"analysis_review", analysisReviewContract},
 		{"trade_plan", tradePlanSystem + tradePlanRepairHint},
-		{"recommendation_short", recPromptContract + shortTermSpec},
-		{"recommendation_long", recPromptContract + longTermSpec},
 		{"recommendation_review", recReviewSystemPrompt},
 		{"rec_bear", bearSystemPrompt},
 		{"daily_report", dailyReviewSystem},
@@ -383,6 +397,18 @@ func TestPromptOutputLengthLimitsRemoved(t *testing.T) {
 			if match := pattern.FindString(p.text); match != "" {
 				t.Errorf("%s prompt 仍包含输出篇幅限制 %q", p.name, match)
 			}
+		}
+	}
+
+	// p14 推荐体积控制形态：pick 三数组各 ≤3 条、rejected 只列前 3 且 ≤30 字。
+	for _, want := range []string{"各不超过 3 条", "不超过 30 个汉字", "量化排名最高的 3 个"} {
+		if !strings.Contains(recPromptContract, want) {
+			t.Errorf("recommendation 契约缺少 p14 体积控制 %q", want)
+		}
+	}
+	for name, spec := range map[string]string{"short": shortTermSpec, "long": longTermSpec} {
+		if !strings.Contains(spec, "最多 3 条") {
+			t.Errorf("recommendation %s spec 缺少 p14 条数上限声明", name)
 		}
 	}
 
@@ -410,8 +436,8 @@ func TestPromptOutputLengthLimitsRemoved(t *testing.T) {
 	}
 }
 
-// TestModuleCapTruncationRejected 预算超限不得静默当成功：模块钳制后的请求携带预算
-// max_tokens，上游 finish_reason=length 截断被完整性门禁拒收（llm_response_incomplete）。
+// TestModuleCapTruncationRejected 预算超限不得静默当成功：未配置用户值时请求携带模块
+// 默认 max_tokens，上游 finish_reason=length 截断被完整性门禁拒收（llm_response_incomplete）。
 func TestModuleCapTruncationRejected(t *testing.T) {
 	setContractFlag(t, true)
 	var gotMaxTokens float64
@@ -428,11 +454,11 @@ func TestModuleCapTruncationRejected(t *testing.T) {
 
 	_, err := chatCompletion(context.Background(), chatParams{
 		BaseURL: srv.URL, APIKey: "k", Model: "m", AllowPrivate: true,
-		MaxTokens: moduleTokenCap("compare", 999999),
+		MaxTokens: moduleTokenCap("compare", 0),
 		Messages:  []chatMessage{{Role: "user", Content: "hi"}},
 	})
 	if gotMaxTokens != float64(moduleBudget("compare").MaxTokens) {
-		t.Fatalf("请求应携带模块预算 max_tokens=%d, got %v", moduleBudget("compare").MaxTokens, gotMaxTokens)
+		t.Fatalf("请求应携带模块默认 max_tokens=%d, got %v", moduleBudget("compare").MaxTokens, gotMaxTokens)
 	}
 	if err == nil || RefusalCodeOf(err) != RefusalLLMResponseIncomplete {
 		t.Fatalf("预算截断必须拒收: %v (code=%q)", err, RefusalCodeOf(err))
@@ -610,7 +636,8 @@ func TestTemperatureCapabilityFallback(t *testing.T) {
 }
 
 // TestMaxTokensCapabilityFallback max_tokens 参数能力贯通：被「Unsupported parameter:
-// max_tokens」4xx 拒后携同一预算改用 max_completion_tokens；路由后直接使用新字段，
+// max_tokens」4xx 拒后改用 max_completion_tokens——该字段把隐藏 reasoning token 一并
+// 计入，requestTokenBudget 按 ×2 预留（正文预算不被思考挤占）；路由后直接使用新字段，
 // 任何请求都不能丢失模块预算。
 func TestMaxTokensCapabilityFallback(t *testing.T) {
 	setCapRoutingFlag(t, true)
@@ -637,8 +664,8 @@ func TestMaxTokensCapabilityFallback(t *testing.T) {
 	if _, err := chatCompletion(context.Background(), params); err != nil {
 		t.Fatalf("max_tokens fallback 应成功: %v", err)
 	}
-	if len(bodies) != 2 || !strings.Contains(bodies[1], `"max_completion_tokens":2000`) {
-		t.Fatalf("fallback 请求必须携同一预算改用 max_completion_tokens: n=%d bodies=%#v", len(bodies), bodies)
+	if len(bodies) != 2 || !strings.Contains(bodies[1], `"max_completion_tokens":4000`) {
+		t.Fatalf("fallback 请求必须改用 max_completion_tokens 并 ×2 预留 reasoning: n=%d bodies=%#v", len(bodies), bodies)
 	}
 	if obs, ok := lookupLLMCapability(capabilityTargetOf(params), capMaxTokens); !ok || obs.State != capUnsupported {
 		t.Fatalf("fallback 成功后应提交 max_tokens 观察: %+v ok=%v", obs, ok)
@@ -646,8 +673,8 @@ func TestMaxTokensCapabilityFallback(t *testing.T) {
 	if _, err := chatCompletion(context.Background(), params); err != nil {
 		t.Fatalf("路由后调用应成功: %v", err)
 	}
-	if len(bodies) != 3 || !strings.Contains(bodies[2], `"max_completion_tokens":2000`) {
-		t.Fatalf("路由后应直接携预算使用 max_completion_tokens: n=%d bodies=%#v", len(bodies), bodies)
+	if len(bodies) != 3 || !strings.Contains(bodies[2], `"max_completion_tokens":4000`) {
+		t.Fatalf("路由后应直接携 ×2 预算使用 max_completion_tokens: n=%d bodies=%#v", len(bodies), bodies)
 	}
 }
 
@@ -678,8 +705,8 @@ func TestTokenBudgetNeverDropped(t *testing.T) {
 			t.Fatal("两种 token 字段都被拒时必须失败")
 		}
 		if len(bodies) != 2 || !strings.Contains(bodies[0], `"max_tokens":777`) ||
-			!strings.Contains(bodies[1], `"max_completion_tokens":777`) {
-			t.Fatalf("两次请求都必须保留预算: %#v", bodies)
+			!strings.Contains(bodies[1], `"max_completion_tokens":1554`) {
+			t.Fatalf("两次请求都必须保留预算（切换字段后 ×2 预留 reasoning）: %#v", bodies)
 		}
 	})
 
@@ -723,8 +750,8 @@ func TestTokenBudgetNeverDropped(t *testing.T) {
 			t.Fatal("非流式 Chat 两种 token 字段都被拒时必须失败")
 		}
 		if len(bodies) != 2 || !strings.Contains(bodies[0], `"max_tokens":779`) ||
-			!strings.Contains(bodies[1], `"max_completion_tokens":779`) {
-			t.Fatalf("非流式 Chat 两次请求都必须保留预算: %#v", bodies)
+			!strings.Contains(bodies[1], `"max_completion_tokens":1558`) {
+			t.Fatalf("非流式 Chat 两次请求都必须保留预算（切换字段后 ×2 预留 reasoning）: %#v", bodies)
 		}
 	})
 
@@ -801,7 +828,8 @@ func TestSequentialCapabilityFallback(t *testing.T) {
 				t.Fatalf("Chat 第 %d 次回退丢失 stream=true: %#v", i+1, body)
 			}
 			if _, oldOK := body["max_tokens"]; !oldOK {
-				if v, newOK := body["max_completion_tokens"].(float64); !newOK || v != 777 {
+				// 切到 max_completion_tokens 后 ×2 预留 reasoning（requestTokenBudget）。
+				if v, newOK := body["max_completion_tokens"].(float64); !newOK || v != 1554 {
 					t.Fatalf("Chat 第 %d 次请求丢失 token 预算: %#v", i+1, body)
 				}
 			} else if body["max_tokens"] != float64(777) {
@@ -889,7 +917,7 @@ func TestSequentialCapabilityFallback(t *testing.T) {
 				if stream, _ := body["stream"].(bool); stream {
 					t.Fatalf("非流式 Chat 第 %d 次请求不应变成 stream=true", i+1)
 				}
-				if _, oldOK := body["max_tokens"]; !oldOK && body["max_completion_tokens"] != float64(991) {
+				if _, oldOK := body["max_tokens"]; !oldOK && body["max_completion_tokens"] != float64(1982) {
 					t.Fatalf("非流式 Chat 第 %d 次请求丢失预算: %#v", i+1, body)
 				}
 			}

@@ -5,7 +5,81 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"quantvista/common"
 )
+
+func validLLMConfigInput() LLMConfigInput {
+	return LLMConfigInput{
+		Name: "test", Provider: "openai", BaseURL: "https://api.example.com",
+		Model: "model", MaxTokens: 2048, Stream: true,
+	}
+}
+
+// TestLLMConfigValidateUnboundedMaxTokens max_tokens 无业务上限（对标 new-api：仅请求层
+// 保留整型溢出护栏），大值配置必须能通过校验；0/负数仍拒绝。
+func TestLLMConfigValidateUnboundedMaxTokens(t *testing.T) {
+	svc := &LLMService{}
+	for _, tokens := range []int{1, 2048, 200_001, 1_000_000} {
+		in := validLLMConfigInput()
+		in.MaxTokens = tokens
+		if err := svc.validate(in); err != nil {
+			t.Errorf("合法配置 max_tokens=%d 不应被拒绝: %v", tokens, err)
+		}
+	}
+	for _, tokens := range []int{0, -1} {
+		in := validLLMConfigInput()
+		in.MaxTokens = tokens
+		if err := svc.validate(in); err == nil {
+			t.Errorf("max_tokens=%d 应被拒绝", tokens)
+		}
+	}
+}
+
+// TestLLMConfigCRUDPersistsLargeMaxTokens 大 max_tokens 全链路持久化：创建/更新/读取
+// 不得被任何历史上限（如 200000）截断。
+func TestLLMConfigCRUDPersistsLargeMaxTokens(t *testing.T) {
+	setupTestDB(t)
+	if err := common.DB.Exec("DELETE FROM llm_configs").Error; err != nil {
+		t.Fatalf("清理 LLM 配置失败: %v", err)
+	}
+	oldKey := common.EncryptionKey
+	common.EncryptionKey = "llm-config-test-key"
+	t.Cleanup(func() {
+		common.EncryptionKey = oldKey
+		common.DB.Exec("DELETE FROM llm_configs")
+	})
+
+	svc := &LLMService{}
+	in := validLLMConfigInput()
+	in.APIKey = "sk-test"
+	in.MaxTokens = 1_000_000
+	created, err := svc.Create(101, in)
+	if err != nil {
+		t.Fatalf("创建配置失败: %v", err)
+	}
+	if created.MaxTokens != 1_000_000 {
+		t.Fatalf("创建未完整回填 max_tokens: %+v", created.LLMConfig)
+	}
+
+	in.APIKey = ""
+	in.MaxTokens = 2_000_000
+	updated, err := svc.Update(101, created.ID, in)
+	if err != nil {
+		t.Fatalf("更新配置失败: %v", err)
+	}
+	if updated.MaxTokens != 2_000_000 {
+		t.Fatalf("更新未完整回填 max_tokens: %+v", updated.LLMConfig)
+	}
+
+	rows, err := svc.List(101)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("读取配置失败: rows=%d err=%v", len(rows), err)
+	}
+	if rows[0].MaxTokens != 2_000_000 {
+		t.Fatalf("数据库未持久化完整配置: %+v", rows[0].LLMConfig)
+	}
+}
 
 // TestTestOpenAICompatible_HTMLNotOK 测试连接的核心防回归：200 + HTML（SPA fallback / 网关拦截页）
 // 不算连接成功——否则会"测试通过、实际分析失败（invalid character '<'）"。

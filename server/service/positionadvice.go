@@ -298,10 +298,12 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 		Advices []PositionAdvice `json:"advices"`
 	}
 	var lastErr error
-	for attempt := 0; attempt <= moduleRepairAttempts("position_advice"); attempt++ {
+	repairLimit := moduleRepairAttempts("position_advice")
+	requestMax := moduleTokenCap("position_advice", cfg.MaxTokens)
+	for attempt := 0; attempt <= repairLimit; attempt++ {
 		result, cerr := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-			Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("position_advice", cfg.MaxTokens),
+			Temperature: cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
@@ -312,6 +314,13 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 			consumeQuota(userID, result.Usage.TotalTokens, attempt == 0)
 		}
 		if cerr != nil {
+			if attempt < repairLimit && isTokenLimitFinishState(run.FinishState) {
+				lastErr = cerr
+				requestMax = moduleRepairTokenCap("position_advice", requestMax)
+				convo = appendModuleRepairMessages(convo, "position_advice", chatResultContent(result), run.FinishState,
+					"上一条输出因 token 上限被截断。请从头完整输出 advices JSON，position_id 与 symbol 必须来自同一输入行。")
+				continue
+			}
 			code := RefusalCodeOf(cerr)
 			if code == "" {
 				code = RefusalLLMCallFailed
@@ -338,10 +347,8 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 		} else {
 			lastErr = jerr
 		}
-		convo = append(convo,
-			chatMessage{Role: "assistant", Content: moduleRepairFeed("position_advice", result.Content)},
-			chatMessage{Role: "user", Content: "上一条输出不合格。请只输出 JSON：{\"advices\":[{\"position_id\",\"symbol\",\"verdict\":\"hold|trim|exit\",\"reason\",\"invalidation\"}]}。position_id 与 symbol 必须来自同一输入行；同代码多仓也要逐笔输出。"},
-		)
+		convo = appendModuleRepairMessages(convo, "position_advice", result.Content, run.FinishState,
+			"上一条输出不合格。请只输出 JSON：{\"advices\":[{\"position_id\",\"symbol\",\"verdict\":\"hold|trim|exit\",\"reason\",\"invalidation\"}]}。position_id 与 symbol 必须来自同一输入行；同代码多仓也要逐笔输出。")
 	}
 	run.DegradedReason = "llm_output_invalid"
 	return nil, refusalErrf(RefusalLLMOutputInvalid, "AI 卖出建议输出不合格：%v", lastErr)

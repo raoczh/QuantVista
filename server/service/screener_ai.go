@@ -94,14 +94,16 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 	var acc chatUsage
 	var parsed *parsedStrategy
 	var lastPerr error
-	for attempt := 0; attempt <= moduleRepairAttempts("screener_parse"); attempt++ {
+	repairLimit := moduleRepairAttempts("screener_parse")
+	requestMax := moduleTokenCap("screener_parse", cfg.MaxTokens)
+	for attempt := 0; attempt <= repairLimit; attempt++ {
 		res, callErr := chatCompletion(ctx, chatParams{
 			BaseURL:      cfg.BaseURL,
 			APIKey:       apiKey,
 			Model:        cfg.Model,
 			EndpointType: cfg.EndpointType,
 			Temperature:  cfg.Temperature,
-			MaxTokens:    moduleTokenCap("screener_parse", cfg.MaxTokens),
+			MaxTokens:    requestMax,
 			Messages:     convo,
 			JSONMode:     true,
 			AllowPrivate: allowPrivate,
@@ -109,12 +111,16 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 			Meta:         run.chatMeta(userID, cfg, attempt+1),
 		})
 		run.record(res, callErr)
+		if res != nil {
+			addChatUsage(&acc, res.Usage)
+		}
 		if callErr != nil {
 			// audit outcome：完整性拒收调用的真实 token 消耗照记（res 可能非 nil）。
-			if res != nil {
-				acc.PromptTokens += res.Usage.PromptTokens
-				acc.CompletionTokens += res.Usage.CompletionTokens
-				acc.TotalTokens += res.Usage.TotalTokens
+			if attempt < repairLimit && isTokenLimitFinishState(run.FinishState) {
+				requestMax = moduleRepairTokenCap("screener_parse", requestMax)
+				convo = appendModuleRepairMessages(convo, "screener_parse", chatResultContent(res), run.FinishState,
+					"上一条输出因 token 上限被截断。请从头完整输出条件树 JSON。"+parseStrategyRepairHint)
+				continue
 			}
 			// 网络/鉴权类失败：已消耗的 token 照记（审计），动作照计次（与分析口径一致）。
 			if acc.TotalTokens > 0 {
@@ -122,18 +128,12 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 			}
 			return nil, callErr
 		}
-		acc.PromptTokens += res.Usage.PromptTokens
-		acc.CompletionTokens += res.Usage.CompletionTokens
-		acc.TotalTokens += res.Usage.TotalTokens
-
 		parsed, lastPerr = parseStrategyLLMOutput(res.Content)
 		if lastPerr == nil {
 			break
 		}
-		convo = append(convo,
-			chatMessage{Role: "assistant", Content: moduleRepairFeed("screener_parse", res.Content)},
-			chatMessage{Role: "user", Content: "上一条输出不符合要求：" + lastPerr.Error() + "。" + parseStrategyRepairHint},
-		)
+		convo = appendModuleRepairMessages(convo, "screener_parse", res.Content, run.FinishState,
+			"上一条输出不符合要求："+lastPerr.Error()+"。"+parseStrategyRepairHint)
 	}
 	if acc.TotalTokens > 0 {
 		consumeQuota(userID, acc.TotalTokens, true)

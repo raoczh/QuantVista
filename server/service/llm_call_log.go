@@ -7,6 +7,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"gorm.io/gorm"
+
 	"quantvista/common"
 	"quantvista/model"
 )
@@ -22,9 +24,9 @@ const (
 
 type chatMeta struct {
 	CallerUserID int64
-	Module       string
-	ConfigID     int64
-	Provider     string
+	Module   string
+	ConfigID int64
+	Provider string
 
 	// ---- P0-2 调用关联元数据（llm_run.go 的 llmRun.chatMeta 统一构造；直填仅限探针/测试）----
 	TraceID       string
@@ -71,11 +73,13 @@ func writeLLMCallLog(p chatParams, stream bool, res *chatResult, callErr error, 
 	status := model.LLMCallStatusSuccess
 	errorMsg := ""
 	responseBody := ""
+	reasoningContent := ""
 	usage := chatUsage{}
 	latencyMs := elapsed.Milliseconds()
 	firstChunkMs := int64(0)
 	if res != nil {
 		responseBody = res.Content
+		reasoningContent = res.ReasoningContent
 		usage = res.Usage
 		if res.LatencyMs > 0 {
 			latencyMs = res.LatencyMs
@@ -117,11 +121,14 @@ func writeLLMCallLog(p chatParams, stream bool, res *chatResult, callErr error, 
 		ErrorMsg:         errorMsg,
 		PromptTokens:     usage.PromptTokens,
 		CompletionTokens: usage.CompletionTokens,
+		ReasoningTokens:  usage.ReasoningTokens,
+		CachedTokens:     usage.CachedTokens,
 		TotalTokens:      usage.TotalTokens,
 		LatencyMs:        latencyMs,
 		FirstChunkMs:     firstChunkMs,
 		RequestBody:      truncateAuditText(requestBody, llmCallBodyLimit),
 		ResponseBody:     truncateAuditText(responseBody, llmCallBodyLimit),
+		ReasoningContent: truncateAuditText(reasoningContent, llmCallBodyLimit),
 
 		// P0-2/P0-8 关联与完整性元数据（旧记录为空，读取兼容）。
 		TraceID:          p.Meta.TraceID,
@@ -160,13 +167,25 @@ func truncateAuditText(s string, limit int) string {
 
 type LLMCallLogView struct {
 	model.LLMCallLog
-	Username string `json:"username"`
+	Username         string `json:"username"`
+	FinishAttribution string `json:"finish_attribution"`
 }
 
 type LLMCallLogList struct {
-	Items []LLMCallLogView `json:"items"`
-	Total int64            `json:"total"`
+	Items       []LLMCallLogView        `json:"items"`
+	Total       int64                   `json:"total"`
+	LengthStats LLMTokenLimitStatistics `json:"length_stats"`
 }
+
+type LLMTokenLimitStatistics struct {
+	ReasoningExhausted int64 `json:"reasoning_exhausted"`
+	ContentExhausted   int64 `json:"content_exhausted"`
+}
+
+const (
+	finishAttributionReasoning = "reasoning_exhausted"
+	finishAttributionContent   = "content_exhausted"
+)
 
 func (s *AdminService) ListLLMCalls(userID int64, module, status, trace string, page, pageSize int) (*LLMCallLogList, error) {
 	if page < 1 {
@@ -178,32 +197,47 @@ func (s *AdminService) ListLLMCalls(userID int64, module, status, trace string, 
 	if pageSize > 100 {
 		pageSize = 100
 	}
-	q := common.DB.Model(&model.LLMCallLog{})
-	if userID > 0 {
-		q = q.Where("user_id = ?", userID)
-	}
-	if module = strings.TrimSpace(module); module != "" {
-		q = q.Where("module = ?", module)
-	}
-	if status = strings.TrimSpace(status); status != "" {
-		q = q.Where("status = ?", status)
-	}
-	// P0-2 追溯筛选：按业务结果的 trace_id（或某个 run_id）列出其全部关联调用
-	//（主调/repair/复核/反方/交易计划一屏可见）。
-	if trace = strings.TrimSpace(trace); trace != "" {
-		q = q.Where("trace_id = ? OR run_id = ?", trace, trace)
+	module = strings.TrimSpace(module)
+	status = strings.TrimSpace(status)
+	trace = strings.TrimSpace(trace)
+	// 同一组筛选条件要跑三条查询（count/截断归因统计/分页列表）。GORM 链在首个
+	// finisher 之后复用属未定义行为（Select/子句状态可能残留），每条查询独立重建。
+	baseQuery := func() *gorm.DB {
+		q := common.DB.Model(&model.LLMCallLog{})
+		if userID > 0 {
+			q = q.Where("user_id = ?", userID)
+		}
+		if module != "" {
+			q = q.Where("module = ?", module)
+		}
+		if status != "" {
+			q = q.Where("status = ?", status)
+		}
+		// P0-2 追溯筛选：按业务结果的 trace_id（或某个 run_id）列出其全部关联调用
+		//（主调/repair/复核/反方/交易计划一屏可见）。
+		if trace != "" {
+			q = q.Where("trace_id = ? OR run_id = ?", trace, trace)
+		}
+		return q
 	}
 	var total int64
-	if err := q.Count(&total).Error; err != nil {
+	if err := baseQuery().Count(&total).Error; err != nil {
+		return nil, err
+	}
+	var lengthStats LLMTokenLimitStatistics
+	if err := baseQuery().Select(
+		"COALESCE(SUM(CASE WHEN finish_state IN ? AND completion_tokens > 0 AND reasoning_tokens * 2 > completion_tokens THEN 1 ELSE 0 END), 0) AS reasoning_exhausted, "+
+			"COALESCE(SUM(CASE WHEN finish_state IN ? AND NOT (completion_tokens > 0 AND reasoning_tokens * 2 > completion_tokens) THEN 1 ELSE 0 END), 0) AS content_exhausted",
+		[]string{"length", "max_tokens"}, []string{"length", "max_tokens"}).Scan(&lengthStats).Error; err != nil {
 		return nil, err
 	}
 	var logs []model.LLMCallLog
-	if err := q.Select("id,user_id,module,llm_config_id,provider,model,endpoint_type,stream,status,error_msg,prompt_tokens,completion_tokens,total_tokens,latency_ms,first_chunk_ms," +
+	if err := baseQuery().Select("id,user_id,module,llm_config_id,provider,model,endpoint_type,stream,status,error_msg,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,total_tokens,latency_ms,first_chunk_ms," +
 		"trace_id,run_id,parent_run_id,attempt,repair,structured_method,schema_version,prompt_version,prompt_hash,data_hash,finish_state,finish_state_raw,created_at").
 		Order("id desc").Offset((page - 1) * pageSize).Limit(pageSize).Find(&logs).Error; err != nil {
 		return nil, err
 	}
-	return &LLMCallLogList{Items: llmCallViews(logs), Total: total}, nil
+	return &LLMCallLogList{Items: llmCallViews(logs), Total: total, LengthStats: lengthStats}, nil
 }
 
 func (s *AdminService) GetLLMCall(id int64) (*LLMCallLogView, error) {
@@ -239,9 +273,21 @@ func llmCallViews(logs []model.LLMCallLog) []LLMCallLogView {
 	}
 	views := make([]LLMCallLogView, 0, len(logs))
 	for _, row := range logs {
-		views = append(views, LLMCallLogView{LLMCallLog: row, Username: names[row.UserID]})
+		views = append(views, LLMCallLogView{
+			LLMCallLog: row, Username: names[row.UserID], FinishAttribution: finishAttribution(row),
+		})
 	}
 	return views
+}
+
+func finishAttribution(row model.LLMCallLog) string {
+	if !isTokenLimitFinishState(row.FinishState) {
+		return ""
+	}
+	if row.CompletionTokens > 0 && row.ReasoningTokens*2 > row.CompletionTokens {
+		return finishAttributionReasoning
+	}
+	return finishAttributionContent
 }
 
 func cleanupLLMCallLogsBefore(cutoff time.Time) (int64, error) {

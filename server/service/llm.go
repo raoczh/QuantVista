@@ -83,8 +83,8 @@ func (s *LLMService) validate(in LLMConfigInput) error {
 	if in.Temperature < 0 || in.Temperature > 2 {
 		return errors.New("temperature 需在 0~2 之间")
 	}
-	if in.MaxTokens < 1 || in.MaxTokens > 200000 {
-		return errors.New("max_tokens 取值不合理")
+	if in.MaxTokens < 1 {
+		return errors.New("max_tokens 必须大于等于 1")
 	}
 	switch normalizeEndpointType(in.EndpointType) {
 	case model.LLMEndpointChat, model.LLMEndpointResponses:

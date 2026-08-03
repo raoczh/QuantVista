@@ -698,10 +698,11 @@ func TestChallengerShadowCustomBaselineCannotWashBack(t *testing.T) {
 	t.Fatal("列表缺少实验")
 }
 
-// TestExperimentBudgetRegistered 影子模块预算登记：无 repair、与推荐主调同 token 预算。
+// TestExperimentBudgetRegistered 影子模块预算登记：无 repair、与推荐主调同 token 预算
+//（单变量对照纪律——数值恒等断言另见 TestModuleBudgetTable）。
 func TestExperimentBudgetRegistered(t *testing.T) {
-	if moduleTokenCap("experiment", 0) != 2500 || moduleRepairAttempts("experiment") != 0 {
-		t.Fatalf("experiment 预算应 2500/0: cap=%d repair=%d",
+	if moduleTokenCap("experiment", 0) != moduleTokenCap("recommendation", 0) || moduleRepairAttempts("experiment") != 0 {
+		t.Fatalf("experiment 预算应与 recommendation 恒等且无 repair: cap=%d repair=%d",
 			moduleTokenCap("experiment", 0), moduleRepairAttempts("experiment"))
 	}
 }

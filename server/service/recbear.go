@@ -102,27 +102,30 @@ func (s *RecommendationService) bearReview(ctx context.Context, userID int64, cf
 	type bearOut struct {
 		Bears []pickBear `json:"bears"`
 	}
-	for attempt := 0; attempt <= moduleRepairAttempts("rec_bear"); attempt++ {
+	repairLimit := moduleRepairAttempts("rec_bear")
+	requestMax := moduleTokenCap("rec_bear", cfg.MaxTokens)
+	for attempt := 0; attempt <= repairLimit; attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-			Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("rec_bear", cfg.MaxTokens),
+			Temperature: cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
 		})
 		run.record(res, err)
+		if res != nil {
+			addChatUsage(&usage, res.Usage)
+		}
 		if err != nil {
 			// audit outcome：拒收调用的真实 token 消耗照常累计（res 可能非 nil）。
-			if res != nil {
-				usage.PromptTokens += res.Usage.PromptTokens
-				usage.CompletionTokens += res.Usage.CompletionTokens
-				usage.TotalTokens += res.Usage.TotalTokens
+			if attempt < repairLimit && isTokenLimitFinishState(run.FinishState) {
+				requestMax = moduleRepairTokenCap("rec_bear", requestMax)
+				convo = appendModuleRepairMessages(convo, "rec_bear", chatResultContent(res), run.FinishState,
+					"上一条输出因 token 上限被截断。请从头完整输出 bears JSON，symbol 必须来自给出的买入标的。")
+				continue
 			}
 			return nil, usage, run
 		}
-		usage.PromptTokens += res.Usage.PromptTokens
-		usage.CompletionTokens += res.Usage.CompletionTokens
-		usage.TotalTokens += res.Usage.TotalTokens
 
 		var out bearOut
 		if jerr := json.Unmarshal([]byte(extractJSONObject(res.Content)), &out); jerr == nil && len(out.Bears) > 0 {
@@ -143,10 +146,8 @@ func (s *RecommendationService) bearReview(ctx context.Context, userID int64, cf
 				return valid, usage, run
 			}
 		}
-		convo = append(convo,
-			chatMessage{Role: "assistant", Content: moduleRepairFeed("rec_bear", res.Content)},
-			chatMessage{Role: "user", Content: "上一条输出不合格。请只输出 JSON：{\"bears\":[{\"symbol\",\"bear_case\",\"severity\":\"high|med|low\"}]}，symbol 必须来自给出的买入标的。"},
-		)
+		convo = appendModuleRepairMessages(convo, "rec_bear", res.Content, run.FinishState,
+			"上一条输出不合格。请只输出 JSON：{\"bears\":[{\"symbol\",\"bear_case\",\"severity\":\"high|med|low\"}]}，symbol 必须来自给出的买入标的。")
 	}
 	run.DegradedReason = "llm_output_invalid"
 	return nil, usage, run

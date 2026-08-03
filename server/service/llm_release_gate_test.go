@@ -496,10 +496,10 @@ func TestLLMExperimentPromoteRollbackAtomic(t *testing.T) {
 	}
 }
 
-// TestReleaseAuditBudgetAndRegistry 预算/角色登记：release_audit 1500/1，registry 有卡。
+// TestReleaseAuditBudgetAndRegistry 预算/角色登记：release_audit 2500/1，registry 有卡。
 func TestReleaseAuditBudgetAndRegistry(t *testing.T) {
-	if moduleTokenCap("release_audit", 0) != 1500 || moduleRepairAttempts("release_audit") != 1 {
-		t.Fatalf("release_audit 预算应 1500/1: cap=%d repair=%d",
+	if moduleTokenCap("release_audit", 0) != 2500 || moduleRepairAttempts("release_audit") != 1 {
+		t.Fatalf("release_audit 预算应 2500/1: cap=%d repair=%d",
 			moduleTokenCap("release_audit", 0), moduleRepairAttempts("release_audit"))
 	}
 	if _, ok := llmRoleAssets["release_audit"]; !ok {

@@ -178,8 +178,9 @@ func TestRejectedContentNeverParsedAsSuccess(t *testing.T) {
 	if parseCalled {
 		t.Fatal("半截正文绝不能进入成功解析")
 	}
-	// token 统计反映实际上游消耗（audit outcome 带出的 usage 被累计）。
-	if usage.TotalTokens != 10 {
+	// token 统计反映实际上游消耗：首轮 length 拒收（10）后按截断扩容策略 repair 一轮，
+	// 第二轮仍 length 拒收（10）——两轮真实消耗都必须累计（audit outcome）。
+	if usage.TotalTokens != 20 {
 		t.Fatalf("拒收调用的真实 token 应计入统计: %+v", usage)
 	}
 }

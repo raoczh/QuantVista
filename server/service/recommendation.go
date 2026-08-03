@@ -33,10 +33,10 @@ func NewRecommendationService(market *MarketService, watchlist *WatchlistService
 }
 
 const (
-	recPromptVersion   = "p13" // p13: P1-2 长线 pick 新增 invalidation 失效条件字段（短线既有；schema recommendation.v2）；p12: 移除推荐与推荐复核输出字段的字数/条数限制；p11: 输出瘦身（reason/risks/evidence 条数与单条字数上限、落选理由 ≤20 字）+ LLM 名单 16→10；p10: M3b 盘中因子字段说明（尾盘涨幅/量占比/早盘/VWAP）；p9: M3a 龙虎榜/机构/人气榜/主力资金流字段说明；p8: F2 长线名单新增 fin 财务摘要（ROE/营收净利增速/毛利率）字段说明、longTermSpec 撤「缺财务明细」声明；p7: T1 技术指标与筹码字段说明；p6: senti 消息面字段；p5: 来源随策略组合；p4: 四阶段流水线；p3: 落选理由；p2: 估值富化
+	recPromptVersion   = "p14" // p14: 控制结构化输出体积（reason/risks/evidence 各≤3 条；rejected 仅量化排名前 3 的未入选标的且理由≤30字）；p13: P1-2 长线 pick 新增 invalidation 失效条件字段（短线既有；schema recommendation.v2）；p12: 移除推荐与推荐复核输出字段的字数/条数限制；p11: 首轮输出瘦身 + LLM 名单 16→10；p10: M3b 盘中因子字段说明（尾盘涨幅/量占比/早盘/VWAP）
 	recStrategyVersion = "s9"  // s9: S1-3 名单去相关（相关性去重+同行业≤2 只，被挤出者记反事实事件）；s8: M3b 盘中因子短线加分项（尾盘放量拉升/跳水/收盘vs VWAP/午后重心上移/早盘强势）；s7: M3a 龙虎榜净买/机构席位/人气跃升/主力连续净流入加分项 + 量能维融合主力资金分；s6: F2 财务加分项（value ROE/growth 双增速/leader 盈利质量 + 业绩恶化通用扣分）；s5: T1 指标加分项 + 筹码超跌 + 五维动量/风险维升级；s4: 消息面情绪因子；s3: 策略-来源映射 + 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
 	maxScanCandidates  = 48    // 进入量化评分的候选上限（约束日线拉取量：48 只 × 1 次 HTTP，并发 6 约 3~8s）
-	maxLLMCandidates   = 10    // 量化排序后进入 LLM 精选的名单上限（2026-07-14 16→10：上游 60s 整包超时下压输入与落选理由输出量；控上下文与位置偏差面）
+	maxLLMCandidates   = 10    // 量化排序后进入 LLM 精选的名单上限（控上下文体积与位置偏差）
 	factorBarLimit     = 90    // 五维评分/窗口因子的日线口径（MA60 需 ≥60，留余量）；实际拉取按 chipBarLimit=210，评分前截尾
 	maxPoolIntake      = 240   // 建池总量护栏（自选无上限，防极端用户打爆估值批量请求）
 	poolSnapshotMax    = 150   // 候选池快照落库条目上限（MySQL TEXT 64KB 容量保护，超出部分只记数量）
@@ -45,8 +45,7 @@ const (
 	recJobTimeout      = 6 * time.Minute  // 后台生成任务总 deadline（建池+评分 3~8s + LLM 主调/repair/复核）
 	recProcessingStale = 15 * time.Minute // processing 批次超过该时长视为死任务（进程重启遗留），惰性判 failed
 
-	// 模块级输出预算与 repair 次数（P0-9）：已收口 llm_budget.go 模块预算表
-	//（recommendation 2500/rec_review 1500/rec_bear 1500、repair 均 1 次、坏输出回灌 600 字）。
+	// 模块级默认输出预算、截断扩容与 repair 次数统一收口 llm_budget.go。
 )
 
 // poolFullPrefix 「评分名额已满」排除原因前缀（scorePool 补位时按它识别可回补的标的）。
@@ -1111,31 +1110,33 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, userID int64
 	convo := append([]chatMessage(nil), messages...)
 	run.hashPrompt(messages)
 
-	for attempt := 0; attempt <= moduleRepairAttempts("recommendation"); attempt++ {
+	repairLimit := moduleRepairAttempts("recommendation")
+	requestMax := moduleTokenCap("recommendation", cfg.MaxTokens)
+	for attempt := 0; attempt <= repairLimit; attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-			Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("recommendation", cfg.MaxTokens),
+			Temperature: cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
 		})
 		run.record(res, err)
+		if res != nil {
+			addChatUsage(&acc, res.Usage)
+			lastLatency = res.LatencyMs
+		}
 		if err != nil {
 			// audit outcome（P0-8 修复批）：完整性拒收的调用上游确已消耗 token，
 			// res 带出的真实 usage 照常累计进批次统计。
-			if res != nil {
-				acc.PromptTokens += res.Usage.PromptTokens
-				acc.CompletionTokens += res.Usage.CompletionTokens
-				acc.TotalTokens += res.Usage.TotalTokens
+			if attempt < repairLimit && isTokenLimitFinishState(run.FinishState) {
+				requestMax = moduleRepairTokenCap("recommendation", requestMax)
+				convo = appendModuleRepairMessages(convo, "recommendation", chatResultContent(res), run.FinishState,
+					"上一条输出因 token 上限被截断。请从头重新输出完整 JSON，只能从候选池选择；picks 中 reason/risks/evidence 各不超过 3 条，rejected 只列量化排名前 3 的未入选标的且理由不超过 30 字。")
+				continue
 			}
 			run.routeApplied = LLMRouteApplied{}
 			return nil, nil, acc, lastLatency, err
 		}
-		acc.PromptTokens += res.Usage.PromptTokens
-		acc.CompletionTokens += res.Usage.CompletionTokens
-		acc.TotalTokens += res.Usage.TotalTokens
-		lastLatency = res.LatencyMs
-
 		picks, rejected, diag, perr := parseAndFilterPicks(res.Content, pool, count)
 		if diag != nil {
 			// P1-1：run 承载最后一轮有结构输出的 coverage 诊断（成功轮，或 repair 打满
@@ -1151,12 +1152,10 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, userID int64
 		// 片段定位——完整回灌会把一大段废文本重新塞进上下文，拖慢下一轮生成、
 		// 更容易再次撞上游 60s 超时。
 		symbols := poolSymbolList(pool)
-		convo = append(convo,
-			chatMessage{Role: "assistant", Content: moduleRepairFeed("recommendation", res.Content)},
-			chatMessage{Role: "user", Content: "上一条输出不合格：" + perr.Error() +
+		convo = appendModuleRepairMessages(convo, "recommendation", res.Content, run.FinishState,
+			"上一条输出不合格："+perr.Error()+
 				"。只能从以下候选池 symbol 中选，严禁使用池外或杜撰的代码：" + symbols +
-				"。请重新输出 JSON：{\"picks\":[...],\"rejected\":[...]}，每个 pick 含 symbol、action、confidence、reason、risks、evidence 等字段，rejected 为池内未入选标的的 {symbol,reason} 落选理由，不要任何解释或代码块标记。"},
-		)
+				"。请重新输出 JSON：{\"picks\":[...],\"rejected\":[...]}，每个 pick 含 symbol、action、confidence、reason、risks、evidence 等字段且三个数组各不超过 3 条；rejected 只列量化排名前 3 的未入选标的，每条理由不超过 30 字，不要任何解释或代码块标记。")
 	}
 	run.routeApplied = LLMRouteApplied{}
 	return nil, nil, acc, lastLatency, nil // 降级
@@ -1205,27 +1204,30 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 		Reviews []pickReview `json:"reviews"`
 		Overall string       `json:"overall"`
 	}
-	for attempt := 0; attempt <= moduleRepairAttempts("rec_review"); attempt++ {
+	repairLimit := moduleRepairAttempts("rec_review")
+	requestMax := moduleTokenCap("rec_review", cfg.MaxTokens)
+	for attempt := 0; attempt <= repairLimit; attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-			Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("rec_review", cfg.MaxTokens),
+			Temperature: cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
 		})
 		run.record(res, err)
+		if res != nil {
+			addChatUsage(&usage, res.Usage)
+		}
 		if err != nil {
 			// audit outcome：拒收调用的真实 token 消耗照常累计（res 可能非 nil）。
-			if res != nil {
-				usage.PromptTokens += res.Usage.PromptTokens
-				usage.CompletionTokens += res.Usage.CompletionTokens
-				usage.TotalTokens += res.Usage.TotalTokens
+			if attempt < repairLimit && isTokenLimitFinishState(run.FinishState) {
+				requestMax = moduleRepairTokenCap("rec_review", requestMax)
+				convo = appendModuleRepairMessages(convo, "rec_review", chatResultContent(res), run.FinishState,
+					"上一条输出因 token 上限被截断。请从头完整输出 reviews JSON，symbol 必须来自被审推荐。")
+				continue
 			}
 			return nil, "", usage, run
 		}
-		usage.PromptTokens += res.Usage.PromptTokens
-		usage.CompletionTokens += res.Usage.CompletionTokens
-		usage.TotalTokens += res.Usage.TotalTokens
 
 		var out reviewOut
 		if jerr := json.Unmarshal([]byte(extractJSONObject(res.Content)), &out); jerr == nil && len(out.Reviews) > 0 {
@@ -1255,10 +1257,8 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 				return valid, truncateRunes(strings.TrimSpace(out.Overall), 500), usage, run
 			}
 		}
-		convo = append(convo,
-			chatMessage{Role: "assistant", Content: moduleRepairFeed("rec_review", res.Content)},
-			chatMessage{Role: "user", Content: "上一条输出不合格。请只输出 JSON：{\"reviews\":[{\"symbol\",\"verdict\":\"pass|warn|reject\",\"comment\",\"confidence\"}],\"overall\":\"...\"}，symbol 必须来自被审推荐。"},
-		)
+		convo = appendModuleRepairMessages(convo, "rec_review", res.Content, run.FinishState,
+			"上一条输出不合格。请只输出 JSON：{\"reviews\":[{\"symbol\",\"verdict\":\"pass|warn|reject\",\"comment\",\"confidence\"}],\"overall\":\"...\"}，symbol 必须来自被审推荐。")
 	}
 	run.DegradedReason = "llm_output_invalid"
 	return nil, "", usage, run
@@ -2663,12 +2663,12 @@ func (s *RecommendationService) buildMessages(recPrompt promptRuntime, recType s
 	fmt.Fprintf(&u, "请从以下【量化初选名单】中，按「%s」策略精选至多 %d 个%s标的。\n", strat.Name, count, recTypeLabel(recType))
 	u.WriteString("名单已按量化综合分（score，0-100）降序排列，rank=1 为最高分。score 由五维技术评分（趋势/动量/位置/量能/风险，score_dims）加策略加分项（strategy_notes）合成，仅有排序意义、不代表预期收益。\n")
 	fmt.Fprintf(&u, "硬性要求：只能从名单里选，symbol 必须与名单完全一致，严禁名单外或虚构的标的；名单中符合策略的合格标的充足时应给足 %d 个，确实不足时宁可少选甚至不选（picks 可为空数组），绝不硬凑。你可以不同意量化排序（例如否决 rank 靠前者），但必须用名单中的数据说明理由。\n", count)
-	u.WriteString("同时请在 rejected 数组中，对名单内未入选的标的给出落选理由，只解释名单内标的。\n\n")
+	u.WriteString("rejected 只列量化排名最高的 3 个未入选标的，每条 reason 不超过 30 个汉字；只解释名单内标的。\n\n")
 	u.WriteString("【量化初选名单】（JSON；price 现价、change_pct 当日涨跌%、amount_yi 成交额亿元、turnover_rate 换手%、volume_ratio 量比、float_cap_yi 流通市值亿元、pe_ttm 市盈率TTM（负=亏损）、pb 市净率、senti_score 当日新闻聚合情绪分-1~1（senti_news 为条数，字段缺失=当日无相关新闻，不得臆测消息面）；lhb_net_yi 最近一次上龙虎榜的净买额亿元（负=净卖出，lhb_reason 为上榜原因，缺失=近期未上榜）、org_net_yi 机构席位净买额亿元（org_buys 为机构买入次数）、pop_rank 股吧人气榜名次（pop_new=true 新上榜；人气是关注度信号非基本面，高人气也意味着拥挤与情绪退潮风险）；factors：ma5/ma10/ma20/ma60 均线、chg_5d/chg_20d 近5/20日涨跌%、high_20d 创20日新高、bull_align 多头排列、vol_boost 今日量/5日均量、bias_20 MA20乖离%、volatility_20 波动率%、drawdown_20 近20日最大回撤%、pos_60 60日区间位置、rsi_14 RSI(14,Wilder)、macd_dif/macd_dea/macd_hist MACD(12,26,9)（柱=2×(DIF−DEA)）、macd_gold DIF在DEA上方、macd_cross_up 近3日金叉、boll_up/boll_mid/boll_low 布林带(20,2σ)、boll_pos 布林带内位置%、atr_14/atr_pct 真实波幅及其占现价%、chip_profit 获利盘%（收盘价下方筹码占比）、chip_avg_cost 筹码平均成本（chip_bars 为筹码窗口根数，缺失=未计算，不得臆测筹码面）、main_net_days 主力资金连续净流入天数（负=连续净流出，main_net_5d_yi 为近5日主力净额亿元，缺失=资金流数据暂不可得，不得臆测资金面）、盘中因子（intraday_date 为归属交易日的 T-1 盘中形态，缺失=盘中数据暂不可得，不得臆测盘中走势）：tail30_chg 尾盘30分钟涨幅%、tail30_vol_pct 尾盘30分钟量占全天%（均匀线12.5，>20 为尾盘异常放量）、morning_chg 早盘1小时涨幅%、close_vs_vwap 收盘相对全天均价偏离%（正=收在均价上方买方主导）、pm_vwap_up=true 下午均价高于上午（日内重心上移）；fin 财务摘要（长线名单）：roe 加权ROE%、revenue_yoy/net_profit_yoy 营收/净利同比%、gross_margin/net_margin 毛利率/净利率%、debt_ratio 资产负债率%、report 报告期（fin 缺失=财务数据暂不可得，不得臆测）；指标/估值字段缺失表示该数据暂不可得，不得臆测）：\n")
 	if b, err := json.Marshal(compactForLLM(recType, llmCands)); err == nil {
 		u.Write(b)
 	}
-	u.WriteString("\n\n请只输出 JSON：{\"picks\":[...],\"rejected\":[{\"symbol\":\"...\",\"reason\":\"落选理由\"}]}。")
+	u.WriteString("\n\n请只输出 JSON：{\"picks\":[...],\"rejected\":[{\"symbol\":\"...\",\"reason\":\"落选理由\"}]}。每个 pick 的 reason/risks/evidence 各不超过 3 条；rejected 最多 3 条且每条理由不超过 30 个汉字。")
 
 	return []chatMessage{
 		{Role: "system", Content: sys.String()},
@@ -2685,9 +2685,9 @@ const recRoleTaskSeg = `你是一名严谨的证券研究员，服务于个人�
 const recPromptContract = `铁律：
 1. 只能从【量化初选名单】中挑选，symbol 必须与名单完全一致；严禁推荐名单外标的或杜撰任何代码/数据。
 2. 只依据名单与市场环境中给出的数据分析。禁止使用你记忆中关于任何公司的信息——名气、行业地位、历史印象、新闻记忆都不算数据，只看本次给出的数字。数据不足处如实说明局限，不臆测未提供的财务/消息。
-3. 每个标的必须给出：理由(reason)、风险(risks)、数据依据(evidence)。evidence 每条都要引用具体字段名与数值（如「score=78.5 池内第1」「换手率6.3%、量比2.1 温和放量」「bias_20=+4.2% 未超买」）。系统会程序化核对你引用的数字，与数据不符的证据会被标记出来展示给用户。
+3. 每个标的必须给出：理由(reason)、风险(risks)、数据依据(evidence)，三个数组各不超过 3 条。evidence 每条都要引用具体字段名与数值（如「score=78.5 池内第1」「换手率6.3%、量比2.1 温和放量」「bias_20=+4.2% 未超买」）。系统会程序化核对你引用的数字，与数据不符的证据会被标记出来展示给用户。
 4. 宁缺毋滥但不无故少给：名单中符合策略且证据充分的标的足够时，应给足要求的数量；证据不足或与策略不符时明确不选，picks 可以少于要求数量甚至为空。不得为凑满数量而降低证据标准——第 N 只的证据强度不应明显弱于第 1 只；对勉强符合策略的边际标的，用 action="watch" 并如实给低 confidence，而不是凑成 buy。落选与入选都要有数据依据。
-5. 名单内未入选的标的，在 rejected 数组中给出落选理由（{"symbol","reason"}）。
+5. rejected 只列量化排名最高的 3 个未入选标的（{"symbol","reason"}），每条 reason 不超过 30 个汉字。
 6. 全程简体中文。只输出一个 JSON 对象 {"picks":[...],"rejected":[...]}，不要任何解释文字或 Markdown 代码块标记。`
 
 // recRoleIntro 默认角色与铁律段 = 任务段 + 契约段（编译期拼接，与 P0-6 拆分前逐字节一致，
@@ -2698,9 +2698,9 @@ const shortTermSpec = `本次为【短线推荐】。每个 pick 需包含字段
 - symbol: 名单中的代码
 - action: "buy"(可考虑买入) 或 "watch"(观察等待)
 - confidence: 0-100 整数
-- reason: 字符串数组，选择理由（技术面/量价/热点）
-- risks: 字符串数组，主要风险
-- evidence: 字符串数组，数据依据（引用名单中的具体字段与数值）
+- reason: 字符串数组，选择理由（技术面/量价/热点），最多 3 条
+- risks: 字符串数组，主要风险，最多 3 条
+- evidence: 字符串数组，数据依据（引用名单中的具体字段与数值），最多 3 条
 - buy_zone_low / buy_zone_high: 买入观察区间（下沿/上沿价格）
 - take_profit: 止盈目标价
 - stop_loss: 止损价
@@ -2714,9 +2714,9 @@ const longTermSpec = `本次为【长线推荐】。名单含实时行情、估�
 - symbol: 名单中的代码
 - action: "buy"(可考虑逢低布局) 或 "watch"(观察等待)
 - confidence: 0-100 整数
-- reason: 字符串数组，长期看好/关注的理由
-- risks: 字符串数组，主要风险
-- evidence: 字符串数组，数据依据（引用名单中的具体字段与数值，含 PE/PB/市值与 fin 中的 ROE/增速等财务依据）
+- reason: 字符串数组，长期看好/关注的理由，最多 3 条
+- risks: 字符串数组，主要风险，最多 3 条
+- evidence: 字符串数组，数据依据（引用名单中的具体字段与数值，含 PE/PB/市值与 fin 中的 ROE/增速等财务依据），最多 3 条
 - thesis: 基本面/投资逻辑（只能基于名单给出的估值水位与 fin 财务摘要，不得虚构行业对比或未提供的财务明细）
 - valuation_low / valuation_high: 合理估值区间（若估值数据缺失无法给出可填 0 并在 thesis 说明）
 - key_metrics: 字符串数组，需持续跟踪的关键指标（如营收增速、毛利率、市占率）

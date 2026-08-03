@@ -27,9 +27,10 @@ const (
 	aiCallTimeout                = 90 * time.Second
 	aiRetryBackoff               = 800 * time.Millisecond
 	aiResponseBodyLimit          = 1 << 20
-	chatPlainFallbackLimit       = 3 // response_format、temperature、token 字段可被依次拒绝
-	chatStreamingFallbackLimit   = 4 // 流式路径再多一个 stream_options 兼容维度
-	responsesStreamFallbackLimit = 2 // text.format、temperature；token 预算不允许删除
+	chatPlainFallbackLimit       = 4 // response_format、temperature、token、prompt_cache_key
+	chatStreamingFallbackLimit   = 5 // 流式路径再多一个 stream_options 兼容维度
+	responsesPlainFallbackLimit  = 3 // text.format、temperature、prompt_cache_key
+	responsesStreamFallbackLimit = 3 // 同上；token 预算不允许删除
 )
 
 // 包级复用两个 client（allowPrivate 两态），避免每次调用重建 Transport——
@@ -185,9 +186,8 @@ func (p chatParams) temperatureOmitted() bool {
 }
 
 // markMaxCompletionTokens 切换 Chat Completions 的 token 参数变体（nil 安全）。
-// 新版 reasoning 模型拒绝 max_tokens、要求 max_completion_tokens；后者可能连隐藏
-// reasoning token 一并计入，并非完全相同语义，但仍须沿用同一数值上限，绝不能因
-// 兼容性回落把预算整个删掉、退成无界生成。
+// max_completion_tokens 会把隐藏 reasoning token 计入，实际 payload 由
+// requestTokenBudget 预留推理空间，不能把正文预算原值机械搬过去。
 func (p chatParams) markMaxCompletionTokens() {
 	if p.maxCompletionTokens != nil {
 		*p.maxCompletionTokens = true
@@ -203,6 +203,25 @@ func (p chatParams) maxTokensField() string {
 		return "max_completion_tokens"
 	}
 	return "max_tokens"
+}
+
+// requestTokenBudget 返回最终请求字段的值。max_tokens 表示正文预算，原样尊重用户
+// 配置；max_completion_tokens 则包含 reasoning token，按任务要求预留一倍空间。
+// 上限仅防 int 放大溢出，正常范围不额外截断用户配置。
+func (p chatParams) requestTokenBudget() int {
+	if p.MaxTokens <= 0 {
+		return p.MaxTokens
+	}
+	if !p.usesMaxCompletionTokens() {
+		if p.MaxTokens > llmGlobalHardCap {
+			return llmGlobalHardCap
+		}
+		return p.MaxTokens
+	}
+	if p.MaxTokens >= llmGlobalHardCap/2 {
+		return llmGlobalHardCap
+	}
+	return p.MaxTokens * 2
 }
 
 // noteFinalRequestBody 记录最终实际发送的请求体（nil 安全；fallback 重试覆盖）。
@@ -222,13 +241,19 @@ type chatUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	ReasoningTokens  int `json:"-"`
+	CachedTokens     int `json:"-"`
+
+	PromptTokensDetails     inputTokenDetails  `json:"prompt_tokens_details"`
+	CompletionTokensDetails outputTokenDetails `json:"completion_tokens_details"`
 }
 
 // chatResult 一次补全调用的结果。
 type chatResult struct {
-	Content   string
-	Usage     chatUsage
-	LatencyMs int64
+	Content          string
+	ReasoningContent string
+	Usage            chatUsage
+	LatencyMs        int64
 	// FirstChunkMs 流式路径首个 data 块到达耗时（非流式恒 0）。
 	// ≈LatencyMs 说明上游忽略 stream 整包返回（假流式），是区分
 	// 「模型生成慢」与「网关不透传流」的关键观测。
@@ -239,15 +264,13 @@ type chatResult struct {
 	FinishReason string
 }
 
-// capModuleTokens 模块级输出预算：上游普遍存在 60s 级整包超时，单次生成时长
-// 主要由输出 token 数决定——内部 JSON 任务（日报复盘/推荐/复核）按模块钳制
-// 输出上限，避免用户全局 max_tokens 过大拖死单次调用。用户配置更小时以用户
-// 配置为准；未配置（0）时用模块上限。
+// capModuleTokens 合成用户配置与模块默认值：用户明确配置正数时必须原样生效，模块
+// 默认预算只用于 userMax=0 的兼容路径。仅保留与 new-api 同量级的整型溢出保护。
 func capModuleTokens(userMax, moduleCap int) int {
-	if moduleCap <= 0 {
-		return userMax
-	}
-	if userMax > 0 && userMax < moduleCap {
+	if userMax > 0 {
+		if userMax > llmGlobalHardCap {
+			return llmGlobalHardCap
+		}
 		return userMax
 	}
 	return moduleCap
@@ -261,6 +284,7 @@ func chatCompletion(ctx context.Context, p chatParams) (res *chatResult, err err
 	p = applyAccuracyContract(p) // ac1 契约注入+温度钳制在审计之前——RequestBody 记录上游真实收到的形态
 	p = initCallObservers(p)
 	p = applyCapabilityRouting(p) // P0-5 声明化路由：已知不支持的结构化/参数维度直接省略
+	p = applyReasoningTokenField(p)
 	started := time.Now()
 	streamed := true // 默认先走流式；回落非流式时置 false——审计必须记录实际请求形态而非入口意图
 	defer func() {
@@ -322,7 +346,8 @@ func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error)
 		return nil, errors.New("Base URL 非法（仅支持 http/https）")
 	}
 
-	res, status, raw, latency, err := doChat(ctx, p, p.JSONMode)
+	cacheOn := p.promptCacheKey() != ""
+	res, status, raw, latency, err := doChat(ctx, p, p.JSONMode, cacheOn)
 	if err != nil {
 		return res, err
 	}
@@ -352,11 +377,14 @@ func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error)
 			reason := fmt.Sprintf("chat 非流式 HTTP %d 拒绝 max_tokens，改用 max_completion_tokens", status)
 			capConfirms = append(capConfirms, func() { p.observeMaxTokensUnsupported(reason) })
 			changed = true
+		case cacheOn && looksLikeUnsupportedPromptCache(status, raw):
+			cacheOn = false
+			changed = true
 		}
 		if !changed {
 			break
 		}
-		res, status, raw, latency, err = doChat(ctx, p, jsonOn)
+		res, status, raw, latency, err = doChat(ctx, p, jsonOn, cacheOn)
 		if err != nil {
 			return res, err
 		}
@@ -390,7 +418,7 @@ func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error)
 
 // doChat 执行单次 HTTP 调用，返回解析后的结果、HTTP 状态码、原始响应体、耗时。
 // 解析/门禁类错误发生时结果仍尽量带出（audit outcome：正文/usage/原始终态供审计保留）。
-func doChat(ctx context.Context, p chatParams, jsonMode bool) (*chatResult, int, []byte, int64, error) {
+func doChat(ctx context.Context, p chatParams, jsonMode, promptCache bool) (*chatResult, int, []byte, int64, error) {
 	endpoint := chatCompletionsURL(p.BaseURL)
 
 	payload := map[string]any{
@@ -402,8 +430,9 @@ func doChat(ctx context.Context, p chatParams, jsonMode bool) (*chatResult, int,
 		payload["temperature"] = p.Temperature
 	}
 	if p.MaxTokens > 0 {
-		payload[p.maxTokensField()] = p.MaxTokens
+		payload[p.maxTokensField()] = p.requestTokenBudget()
 	}
+	p.addPromptCacheField(payload, promptCache)
 	if jsonMode {
 		payload["response_format"] = map[string]string{"type": "json_object"}
 	}
@@ -474,8 +503,10 @@ func parseChatResponse(raw []byte, status int, endpoint string, contractEnabled 
 	var parsed struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
-				Refusal string `json:"refusal"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				Reasoning        string `json:"reasoning"`
+				Refusal          string `json:"refusal"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -497,7 +528,13 @@ func parseChatResponse(raw []byte, status int, endpoint string, contractEnabled 
 		content = parsed.Choices[0].Message.Content
 		finish = parsed.Choices[0].FinishReason
 	}
-	res := &chatResult{Content: content, Usage: parsed.Usage, FinishReason: finish}
+	visible, embeddedReasoning := splitThinkContent(content)
+	reasoning := ""
+	if len(parsed.Choices) > 0 {
+		reasoning = joinReasoningContent(parsed.Choices[0].Message.ReasoningContent,
+			parsed.Choices[0].Message.Reasoning, embeddedReasoning)
+	}
+	res := &chatResult{Content: visible, ReasoningContent: reasoning, Usage: parsed.Usage, FinishReason: finish}
 	// 部分兼容网关把错误包在 HTTP 200 中；error 与 choices 同时出现也必须以 error 为准，
 	// 否则可能把上游明确失败后的占位/半截 choices 当成功。
 	if contractEnabled {
@@ -510,7 +547,7 @@ func parseChatResponse(raw []byte, status int, endpoint string, contractEnabled 
 			return res, refusalErr(RefusalLLMContentFiltered, "模型拒绝生成该内容："+parsed.Choices[0].Message.Refusal)
 		}
 		// 上游安全策略拦截（finish_reason=content_filter）且无内容：给明确文案而非笼统"空内容"。
-		if content == "" && finish == "content_filter" {
+		if visible == "" && finish == "content_filter" {
 			return res, errors.New("内容被上游安全策略拦截（finish_reason=content_filter）")
 		}
 	}
@@ -580,6 +617,13 @@ func looksLikeUnsupportedMaxTokens(status int, raw []byte) bool {
 		return false
 	}
 	return matchUnsupportedParam(msg, "max_tokens", "max_output_tokens")
+}
+
+func looksLikeUnsupportedPromptCache(status int, raw []byte) bool {
+	if status < 400 || status >= 500 {
+		return false
+	}
+	return matchUnsupportedParam(strings.ToLower(string(raw)), "prompt_cache_key")
 }
 
 // transientNetErr 是否为值得重试的瞬时网络错误：排除调用方取消、
@@ -705,6 +749,7 @@ func chatCompletionStream(ctx context.Context, p chatParams, onDelta func(string
 	p = applyAccuracyContract(p)
 	p = initCallObservers(p)
 	p = applyCapabilityRouting(p) // P0-5 声明化路由：已知不支持的结构化/参数维度直接省略
+	p = applyReasoningTokenField(p)
 	started := time.Now()
 	defer func() {
 		err = classifyLLMError(err)
@@ -725,6 +770,7 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 	}
 	endpoint := chatCompletionsURL(p.BaseURL)
 
+	cacheOn := p.promptCacheKey() != ""
 	buildBody := func(withUsageOpt, withJSON bool) []byte {
 		payload := map[string]any{
 			"model":    p.Model,
@@ -735,8 +781,9 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 			payload["temperature"] = p.Temperature
 		}
 		if p.MaxTokens > 0 {
-			payload[p.maxTokensField()] = p.MaxTokens
+			payload[p.maxTokensField()] = p.requestTokenBudget()
 		}
+		p.addPromptCacheField(payload, cacheOn)
 		if withUsageOpt {
 			payload["stream_options"] = map[string]bool{"include_usage": true}
 		}
@@ -795,7 +842,8 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 		dropJSON := jsonOn && looksLikeUnsupportedJSONMode(status, raw)
 		dropTemp := !p.temperatureOmitted() && looksLikeUnsupportedTemperature(status, raw)
 		switchMaxTok := p.MaxTokens > 0 && !p.usesMaxCompletionTokens() && looksLikeUnsupportedMaxTokens(status, raw)
-		if !dropUsage && !dropJSON && !dropTemp && !switchMaxTok {
+		dropCache := cacheOn && looksLikeUnsupportedPromptCache(status, raw)
+		if !dropUsage && !dropJSON && !dropTemp && !switchMaxTok && !dropCache {
 			return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", status, statusHint(status), extractErr(raw))
 		}
 		if dropUsage {
@@ -816,6 +864,9 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 			p.markMaxCompletionTokens()
 			reason := fmt.Sprintf("chat 流式 HTTP %d 拒绝 max_tokens，改用 max_completion_tokens", status)
 			capConfirms = append(capConfirms, func() { p.observeMaxTokensUnsupported(reason) })
+		}
+		if dropCache {
+			cacheOn = false
 		}
 		body = buildBody(usageOpt, jsonOn)
 		r2, e2 := send()
@@ -850,11 +901,13 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 		if rerr := chatFinishReject(contractEnabled, res.FinishReason, false); rerr != nil {
 			return res, rerr
 		}
-		return finishStreamResult(p, res.Content, res.Usage, res.FinishReason, start, onDelta)
+		return finishStreamResult(p, res.Content, res.ReasoningContent, res.Usage, res.FinishReason, start, onDelta)
 	}
 
 	// SSE 逐行状态机：每行形如 "data: {...}"；空行为事件分隔；"data: [DONE]" 结束。
 	var sb strings.Builder
+	var reasoningBuilder strings.Builder
+	thinkFilter := thinkStreamFilter{}
 	var usage chatUsage
 	var firstChunkMs int64
 	finishReason := "" // 最后一个非空 finish_reason（stop/length/content_filter/…）
@@ -883,7 +936,10 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 	// usage 与原始终态随错误一并带出——writeLLMCallLog 与 run.record 据此保留真实上游
 	// 结果，业务调用方按错误判失败、不消费内容。usage 不做粗估（失败路径只记上游真值）。
 	partialResult := func() *chatResult {
-		return &chatResult{Content: sb.String(), Usage: usage,
+		filterCopy := thinkFilter
+		visibleTail, reasoningTail := filterCopy.Flush()
+		return &chatResult{Content: sb.String() + visibleTail,
+			ReasoningContent: joinReasoningContent(reasoningBuilder.String(), reasoningTail), Usage: usage,
 			LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs, FinishReason: finishReason}
 	}
 	for sc.Scan() {
@@ -923,8 +979,10 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 		var chunk struct {
 			Choices *[]struct {
 				Delta struct {
-					Content string `json:"content"`
-					Refusal string `json:"refusal"`
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+					Reasoning        string `json:"reasoning"`
+					Refusal          string `json:"refusal"`
 				} `json:"delta"`
 				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
@@ -955,10 +1013,19 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 			if contractEnabled && strings.TrimSpace(c.Delta.Refusal) != "" {
 				return partialResult(), refusalErr(RefusalLLMContentFiltered, "模型拒绝生成该内容："+c.Delta.Refusal)
 			}
+			deltaReasoning := c.Delta.ReasoningContent
+			if deltaReasoning == "" {
+				deltaReasoning = c.Delta.Reasoning
+			}
+			if deltaReasoning != "" {
+				reasoningBuilder.WriteString(deltaReasoning)
+			}
 			if c.Delta.Content != "" {
-				sb.WriteString(c.Delta.Content)
-				if onDelta != nil {
-					onDelta(c.Delta.Content)
+				visible, embeddedReasoning := thinkFilter.Push(c.Delta.Content)
+				sb.WriteString(visible)
+				reasoningBuilder.WriteString(embeddedReasoning)
+				if onDelta != nil && visible != "" {
+					onDelta(visible)
 				}
 			}
 			if c.FinishReason != nil && *c.FinishReason != "" {
@@ -987,6 +1054,9 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 	if rerr := chatFinishReject(contractEnabled, finishReason, sawDoneMarker); rerr != nil {
 		return partialResult(), rerr
 	}
+	visibleTail, reasoningTail := thinkFilter.Flush()
+	sb.WriteString(visibleTail)
+	reasoningBuilder.WriteString(reasoningTail)
 	content := sb.String()
 	if strings.TrimSpace(content) == "" {
 		return partialResult(), errors.New("LLM 返回空内容")
@@ -994,13 +1064,14 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 	if usage.TotalTokens == 0 {
 		usage = estimateUsage(p.Messages, content)
 	}
-	return &chatResult{Content: content, Usage: usage, LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs, FinishReason: finishReason}, nil
+	return &chatResult{Content: content, ReasoningContent: strings.TrimSpace(reasoningBuilder.String()), Usage: usage,
+		LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs, FinishReason: finishReason}, nil
 }
 
 // finishStreamResult 流式路径拿到整包内容（上游忽略 stream）时的统一收尾：
 // 空内容校验、usage 粗估兜底、onDelta 一次性吐出全文（保持流式调用方能看到内容）。
 // FirstChunkMs 记为整包到达时刻（≈总耗时）——审计里两值几乎相等即可识别假流式网关。
-func finishStreamResult(p chatParams, content string, usage chatUsage, finishReason string, start time.Time, onDelta func(string)) (*chatResult, error) {
+func finishStreamResult(p chatParams, content, reasoningContent string, usage chatUsage, finishReason string, start time.Time, onDelta func(string)) (*chatResult, error) {
 	if strings.TrimSpace(content) == "" {
 		return nil, errors.New("LLM 返回空内容")
 	}
@@ -1014,7 +1085,8 @@ func finishStreamResult(p chatParams, content string, usage chatUsage, finishRea
 	if ms == 0 {
 		ms = 1
 	}
-	return &chatResult{Content: content, Usage: usage, LatencyMs: ms, FirstChunkMs: ms, FinishReason: finishReason}, nil
+	return &chatResult{Content: content, ReasoningContent: reasoningContent, Usage: usage,
+		LatencyMs: ms, FirstChunkMs: ms, FinishReason: finishReason}, nil
 }
 
 // isSSEResponse 判断 200 响应是否为 SSE 流：优先看 Content-Type；部分网关不回标准

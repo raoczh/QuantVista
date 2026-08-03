@@ -192,22 +192,28 @@ func RunLLMExperimentAudit(ctx context.Context, expID int64) (*model.LLMReleaseA
 	var usage chatUsage
 	var result *releaseAuditResult
 	var lastErr error
-	for attempt := 0; attempt <= moduleRepairAttempts("release_audit"); attempt++ {
+	repairLimit := moduleRepairAttempts("release_audit")
+	requestMax := moduleTokenCap("release_audit", cfg.MaxTokens)
+	for attempt := 0; attempt <= repairLimit; attempt++ {
 		res, cerr := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-			Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("release_audit", cfg.MaxTokens),
+			Temperature: cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: llmAllowPrivate(false, cfg),
 			Repair: attempt > 0,
 			Meta:   run.chatMeta(adminID, cfg, attempt+1),
 		})
 		run.record(res, cerr)
 		if res != nil {
-			usage.PromptTokens += res.Usage.PromptTokens
-			usage.CompletionTokens += res.Usage.CompletionTokens
-			usage.TotalTokens += res.Usage.TotalTokens
+			addChatUsage(&usage, res.Usage)
 		}
 		if cerr != nil {
 			lastErr = cerr
+			if attempt < repairLimit && isTokenLimitFinishState(run.FinishState) {
+				requestMax = moduleRepairTokenCap("release_audit", requestMax)
+				convo = appendModuleRepairMessages(convo, "release_audit", chatResultContent(res), run.FinishState,
+					"上一条输出因 token 上限被截断。请从头严格按完整 JSON 结构重新输出。")
+				continue
+			}
 			break // 调用层失败（网络/门禁拒收）：repair 救不了已失败的传输，直接落 error 工件
 		}
 		parsed, perr := parseReleaseAudit(res.Content)
@@ -216,10 +222,8 @@ func RunLLMExperimentAudit(ctx context.Context, expID int64) (*model.LLMReleaseA
 			break
 		}
 		lastErr = perr
-		convo = append(convo,
-			chatMessage{Role: "assistant", Content: moduleRepairFeed("release_audit", res.Content)},
-			chatMessage{Role: "user", Content: "上述输出不符合要求：" + perr.Error() + "。请严格按 JSON 结构重新输出。"},
-		)
+		convo = appendModuleRepairMessages(convo, "release_audit", res.Content, run.FinishState,
+			"上述输出不符合要求："+perr.Error()+"。请严格按 JSON 结构重新输出。")
 	}
 	if usage.TotalTokens > 0 {
 		// 手动管理员动作：token 记配置所有者并计一次动作（screener_parse 同款语义）。

@@ -858,8 +858,8 @@ func dailyReviewSystemFrom(pr promptRuntime, date string) string {
 	return dailyReviewSystem
 }
 
-// callReview 调用 LLM 生成复盘，解析失败 repair 一次。返回（复盘, 总 token, run 元数据, 错误）。
-// 首轮与 repair 轮共享同一 run_id（attempt 1/2），P0-2 关联元数据随审计与日报落库。
+// callReview 调用 LLM 生成复盘，解析失败或 token 截断时按模块策略 repair。
+// 首轮与 repair 轮共享同一 run_id，P0-2 关联元数据随审计与日报落库。
 // dailyPrompt 为调用方一次固化的模板快照（正文与版本同源，P0-6 修复批）。
 func (s *DailyReportService) callReview(ctx context.Context, userID int64, date string, dailyPrompt promptRuntime, cfg *model.LLMConfig, apiKey string, allowPrivate bool, snapshotJSON, traceID string) (*dailyReview, int, *llmRun, error) {
 	sys := dailyReviewSystemFrom(dailyPrompt, date)
@@ -883,52 +883,45 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 		return &rv, nil
 	}
 
-	res, err := chatCompletion(ctx, chatParams{
-		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-		Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("daily_report", cfg.MaxTokens),
-		Messages: messages, JSONMode: true, AllowPrivate: allowPrivate,
-		Meta: run.chatMeta(userID, cfg, 1),
-	})
-	run.record(res, err)
-	if res != nil {
-		// audit outcome：拒收调用的真实 token 消耗也计入（res 在完整性拒收时非 nil）。
-		total += res.Usage.TotalTokens
+	convo := append([]chatMessage(nil), messages...)
+	repairLimit := moduleRepairAttempts("daily_report")
+	requestMax := moduleTokenCap("daily_report", cfg.MaxTokens)
+	var lastParseErr error
+	for attempt := 0; attempt <= repairLimit; attempt++ {
+		res, err := chatCompletion(ctx, chatParams{
+			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
+			Temperature: cfg.Temperature, MaxTokens: requestMax,
+			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
+			Repair: attempt > 0,
+			Meta:   run.chatMeta(userID, cfg, attempt+1),
+		})
+		run.record(res, err)
+		if res != nil {
+			// 完整性拒收的调用也已消耗上游 token，必须计入日报总量。
+			total += res.Usage.TotalTokens
+		}
+		if err != nil {
+			if attempt < repairLimit && isTokenLimitFinishState(run.FinishState) {
+				requestMax = moduleRepairTokenCap("daily_report", requestMax)
+				convo = appendModuleRepairMessages(convo, "daily_report", chatResultContent(res), run.FinishState,
+					"上一条输出因 token 上限被截断。请从头重新输出完整结果。"+dailyReviewRepairHint)
+				continue
+			}
+			return nil, total, run, err
+		}
+		if rv, perr := parse(res.Content); perr == nil {
+			run.acceptRouteAttribution()
+			return rv, total, run, nil
+		} else {
+			lastParseErr = perr
+		}
+		if attempt < repairLimit {
+			convo = appendModuleRepairMessages(convo, "daily_report", res.Content, run.FinishState,
+				"上一条输出不符合要求："+lastParseErr.Error()+"。"+dailyReviewRepairHint)
+		}
 	}
-	if err != nil {
-		return nil, total, run, err
-	}
-	if rv, perr := parse(res.Content); perr == nil {
-		run.acceptRouteAttribution()
-		return rv, total, run, nil
-	}
-
-	// repair 一次（与预算表 daily_report.RepairAttempts=1 声明一致——本函数为固定
-	// 「首轮+1 次 repair」结构，改次数须连同预算表同步）。坏输出按模块上限截断回灌。
-	messages = append(messages,
-		chatMessage{Role: "assistant", Content: moduleRepairFeed("daily_report", res.Content)},
-		chatMessage{Role: "user", Content: dailyReviewRepairHint},
-	)
-	res2, err := chatCompletion(ctx, chatParams{
-		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-		Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("daily_report", cfg.MaxTokens),
-		Messages: messages, JSONMode: true, AllowPrivate: allowPrivate,
-		Repair: true, // repair 轮：契约开启时温度固定 0
-		Meta:   run.chatMeta(userID, cfg, 2),
-	})
-	run.record(res2, err)
-	if res2 != nil {
-		total += res2.Usage.TotalTokens
-	}
-	if err != nil {
-		return nil, total, run, err
-	}
-	rv, perr := parse(res2.Content)
-	if perr != nil {
-		run.DegradedReason = "llm_output_invalid"
-		return nil, total, run, refusalErrf(RefusalLLMOutputInvalid, "复盘输出无法解析：%v", perr)
-	}
-	run.acceptRouteAttribution()
-	return rv, total, run, nil
+	run.DegradedReason = "llm_output_invalid"
+	return nil, total, run, refusalErrf(RefusalLLMOutputInvalid, "复盘输出无法解析：%v", lastParseErr)
 }
 
 // ---- 卖点提醒 ----

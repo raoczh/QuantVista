@@ -86,7 +86,7 @@ const blankForm = (): LLMConfigInput => ({
   model: '',
   endpoint_type: 'chat_completions',
   temperature: 0.7,
-  max_tokens: 2048,
+  max_tokens: 8192,
   stream: true,
   is_default: false,
 })
@@ -711,7 +711,7 @@ async function doExport(kind: ExportKind) {
           <n-input-number v-model:value="form.temperature" :min="0" :max="2" :step="0.1" />
         </n-form-item>
         <n-form-item label="Max Tokens">
-          <n-input-number v-model:value="form.max_tokens" :min="1" :max="200000" />
+          <n-input-number v-model:value="form.max_tokens" :min="1" :precision="0" />
         </n-form-item>
         <n-form-item label="流式输出">
           <n-switch v-model:value="form.stream" />

@@ -253,26 +253,29 @@ func callReflectionLLM(ctx context.Context, userID int64, cfg *model.LLMConfig, 
 		} `json:"reflections"`
 	}
 	var lastErr error
-	for attempt := 0; attempt <= moduleRepairAttempts("reflection"); attempt++ {
+	repairLimit := moduleRepairAttempts("reflection")
+	requestMax := moduleTokenCap("reflection", cfg.MaxTokens)
+	for attempt := 0; attempt <= repairLimit; attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
-			Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("reflection", cfg.MaxTokens),
+			Temperature: cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: llmAllowPrivate(false, cfg),
 			Repair: attempt > 0,
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
 		})
 		run.record(res, err)
+		if res != nil {
+			addChatUsage(&usage, res.Usage)
+		}
 		if err != nil {
-			if res != nil {
-				usage.PromptTokens += res.Usage.PromptTokens
-				usage.CompletionTokens += res.Usage.CompletionTokens
-				usage.TotalTokens += res.Usage.TotalTokens
+			if attempt < repairLimit && isTokenLimitFinishState(run.FinishState) {
+				requestMax = moduleRepairTokenCap("reflection", requestMax)
+				convo = appendModuleRepairMessages(convo, "reflection", chatResultContent(res), run.FinishState,
+					`上一条输出因 token 上限被截断。请从头完整输出 JSON：{"reflections":[{"idx":0,"lesson":"..."}]}。`)
+				continue
 			}
 			return nil, usage, err
 		}
-		usage.PromptTokens += res.Usage.PromptTokens
-		usage.CompletionTokens += res.Usage.CompletionTokens
-		usage.TotalTokens += res.Usage.TotalTokens
 
 		var out reflOut
 		if jerr := json.Unmarshal([]byte(extractJSONObject(res.Content)), &out); jerr == nil && len(out.Reflections) > 0 {
@@ -288,10 +291,8 @@ func callReflectionLLM(ctx context.Context, userID int64, cfg *model.LLMConfig, 
 			}
 		}
 		lastErr = errors.New("反思输出解析失败")
-		convo = append(convo,
-			chatMessage{Role: "assistant", Content: moduleRepairFeed("reflection", res.Content)},
-			chatMessage{Role: "user", Content: `上一条输出不合格。请只输出 JSON：{"reflections":[{"idx":0,"lesson":"..."}]}，idx 为输入序号。`},
-		)
+		convo = appendModuleRepairMessages(convo, "reflection", res.Content, run.FinishState,
+			`上一条输出不合格。请只输出 JSON：{"reflections":[{"idx":0,"lesson":"..."}]}，idx 为输入序号。`)
 	}
 	run.DegradedReason = "llm_output_invalid"
 	return nil, usage, lastErr

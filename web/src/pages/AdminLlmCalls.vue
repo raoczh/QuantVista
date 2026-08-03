@@ -61,6 +61,7 @@ const userOptions = computed(() => [
 ])
 
 const rows = ref<LLMCallLogItem[]>([])
+const lengthStats = reactive({ reasoning_exhausted: 0, content_exhausted: 0 })
 const loading = ref(false)
 const pagination = reactive({
   page: 1,
@@ -92,6 +93,7 @@ async function load() {
     })
     rows.value = res.items
     pagination.itemCount = res.total
+    Object.assign(lengthStats, res.length_stats || { reasoning_exhausted: 0, content_exhausted: 0 })
   } catch (e) {
     message.error((e as Error).message)
   } finally {
@@ -144,7 +146,10 @@ const columns = computed<DataTableColumns<LLMCallLogItem>>(() => [
     render: (row) =>
       h(
         'span',
-        { class: 'qv-tnum', title: `输入 ${row.prompt_tokens} / 输出 ${row.completion_tokens}` },
+        {
+          class: 'qv-tnum',
+          title: `输入 ${row.prompt_tokens} / 输出 ${row.completion_tokens} / 思考 ${row.reasoning_tokens} / 缓存命中 ${row.cached_tokens}`,
+        },
         row.total_tokens ? row.total_tokens.toLocaleString() : '-',
       ),
   },
@@ -253,6 +258,11 @@ onMounted(() => {
         />
         <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>
       </div>
+      <div v-if="lengthStats.reasoning_exhausted + lengthStats.content_exhausted > 0" class="length-stats">
+        <span>Token 截断归因</span>
+        <n-tag size="small" type="warning" :bordered="false">思考吃光预算 {{ lengthStats.reasoning_exhausted }}</n-tag>
+        <n-tag size="small" :bordered="false">正文写满 {{ lengthStats.content_exhausted }}</n-tag>
+      </div>
       <n-data-table
         :columns="columns"
         :data="rows"
@@ -275,7 +285,10 @@ onMounted(() => {
             <span>· {{ moduleLabel[detail.module] || detail.module }}</span>
             <span>· {{ detail.provider }} / {{ detail.model }}</span>
             <span>· {{ detail.endpoint_type === 'responses' ? 'responses' : 'chat' }}{{ detail.stream ? '（流式）' : '' }}</span>
-            <span>· token {{ detail.total_tokens.toLocaleString() }}（输入 {{ detail.prompt_tokens }} / 输出 {{ detail.completion_tokens }}）</span>
+            <span
+              >· token {{ detail.total_tokens.toLocaleString() }}（输入 {{ detail.prompt_tokens }} / 输出 {{ detail.completion_tokens }} / 思考
+              {{ detail.reasoning_tokens }} / 缓存 {{ detail.cached_tokens }}）</span
+            >
             <span>· 耗时 {{ fmtLatency(detail.latency_ms) }}</span>
           </div>
           <!-- P0-2 关联元数据：trace/run/attempt/结构化方法/终态/hash（旧记录为空不渲染） -->
@@ -288,6 +301,9 @@ onMounted(() => {
             <span v-if="detail.schema_version">· {{ detail.schema_version }}</span>
             <span v-if="detail.prompt_version">· prompt {{ detail.prompt_version }}</span>
             <span v-if="detail.finish_state">· 终态 {{ detail.finish_state }}<template v-if="detail.finish_state_raw">（{{ detail.finish_state_raw }}）</template></span>
+            <span v-if="detail.finish_attribution"
+              >· {{ detail.finish_attribution === 'reasoning_exhausted' ? '思考吃光预算' : '正文写满' }}</span
+            >
           </div>
           <div v-if="detail.prompt_hash || detail.data_hash" class="meta hash-meta">
             <span v-if="detail.prompt_hash">prompt_hash {{ detail.prompt_hash }}</span>
@@ -300,6 +316,10 @@ onMounted(() => {
           <pre class="body-pre">{{ requestPretty || '（空）' }}</pre>
           <div class="body-title">响应</div>
           <pre class="body-pre">{{ detail.response_body || '（空）' }}</pre>
+          <template v-if="detail.reasoning_content">
+            <div class="body-title">Reasoning</div>
+            <pre class="body-pre">{{ detail.reasoning_content }}</pre>
+          </template>
         </div>
         <div v-else class="detail-empty">加载中…</div>
       </n-spin>
@@ -320,6 +340,15 @@ onMounted(() => {
 }
 .filter-status {
   width: 130px;
+}
+.length-stats {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: -2px 0 12px;
+  font-size: 12px;
+  opacity: 0.82;
 }
 @media (max-width: 640px) {
   .filter-item,
