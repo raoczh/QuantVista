@@ -32,8 +32,10 @@ const (
 	// 轴强平 + 退出价守卫。旧 l1 pending 行用新逻辑结算后回写 l2；消费方按版本过滤防混池。
 	labelVersion = "l2"
 	// candidateRankingVersion 记录候选量化名次与实际 LLM 输入顺序的事实口径。
-	// 排序/tie-break/名单组装语义变化时必须递增，旧行空值不得参与精确配对评估。
-	candidateRankingVersion = "cr1"
+	// cr2：财务/资金流补拉集合由富化前 A 类/PIT 基础分确定，基础分和最终分的并列
+	// 均以 symbol 升序稳定决胜，统一富化后才终评。cr1 的冷缓存预算可能按候选遍历
+	// 顺序消费。历史 cr1/空版本保持原值且不回填；精确配对须按版本分层，空版本不可评估。
+	candidateRankingVersion = "cr2"
 	// labelPerCap 标签结算的每标的拨款（与回测默认一致，元）。
 	labelPerCap = float64(btDefaultPerCap)
 	// labelNoDataAfterDays 信号日之后超过该自然日仍无任何日线 → no_data（退市/长停）。

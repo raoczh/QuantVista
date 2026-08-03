@@ -190,6 +190,89 @@ func TestFinanceFactorFor(t *testing.T) {
 	}
 }
 
+// 仅 TTL 过期也属于 stale：没有完成一次有效刷新时，旧财务不得进入推荐。
+func TestFinanceFactorForRejectsTTLStaleWithoutFreshRefresh(t *testing.T) {
+	seedStale := func(t *testing.T) {
+		t.Helper()
+		if err := common.DB.Create(&model.FinanceIndicator{
+			Symbol: "600519", Market: "cn", ReportDate: "2025-12-31", ReportName: "2025年报",
+			NoticeDate: time.Now().AddDate(0, 0, -30).Format("2006-01-02"), ROE: 34.2,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := common.DB.Model(&model.FinanceIndicator{}).Where("symbol = ?", "600519").
+			Update("updated_at", time.Now().Add(-8*24*time.Hour)).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("预算为零", func(t *testing.T) {
+		setupTestDB(t)
+		cleanF10(t)
+		seedStale(t)
+		oldF10 := fetchF10
+		defer func() { fetchF10 = oldF10 }()
+		calls := 0
+		fetchF10 = func(ctx context.Context, symbol string) ([]datasource.DcRow, error) {
+			calls++
+			return nil, datasource.ErrNoData
+		}
+
+		budget := 0
+		if fin := financeFactorFor(context.Background(), "600519", &budget); fin != nil {
+			t.Fatalf("预算为零时 stale 财务必须缺失，fin=%+v", fin)
+		}
+		if calls != 0 || budget != 0 {
+			t.Fatalf("预算为零不得请求上游：calls=%d budget=%d", calls, budget)
+		}
+	})
+
+	t.Run("冷却命中", func(t *testing.T) {
+		setupTestDB(t)
+		cleanF10(t)
+		seedStale(t)
+		oldF10 := fetchF10
+		defer func() { fetchF10 = oldF10 }()
+		calls := 0
+		fetchF10 = func(ctx context.Context, symbol string) ([]datasource.DcRow, error) {
+			calls++
+			return nil, datasource.ErrNoData
+		}
+		finSyncMu.Lock()
+		finSyncTry["ind:600519"] = time.Now()
+		finSyncMu.Unlock()
+
+		budget := 1
+		if fin := financeFactorFor(context.Background(), "600519", &budget); fin != nil {
+			t.Fatalf("冷却命中时 stale 财务必须缺失，fin=%+v", fin)
+		}
+		if calls != 0 || budget != 1 {
+			t.Fatalf("冷却命中不应消耗预算：calls=%d budget=%d", calls, budget)
+		}
+	})
+
+	t.Run("请求失败", func(t *testing.T) {
+		setupTestDB(t)
+		cleanF10(t)
+		seedStale(t)
+		oldF10 := fetchF10
+		defer func() { fetchF10 = oldF10 }()
+		calls := 0
+		fetchF10 = func(ctx context.Context, symbol string) ([]datasource.DcRow, error) {
+			calls++
+			return nil, datasource.ErrNoData
+		}
+
+		budget := 1
+		if fin := financeFactorFor(context.Background(), "600519", &budget); fin != nil {
+			t.Fatalf("刷新失败时 stale 财务必须缺失，fin=%+v", fin)
+		}
+		if calls != 1 || budget != 0 {
+			t.Fatalf("失败的真实请求仍应消耗预算：calls=%d budget=%d", calls, budget)
+		}
+	})
+}
+
 // 即使旧缓存刚写入，只要披露日历已确认有更新报告，推荐路径也必须尝试刷新。
 func TestFinanceFactorForRefreshesPublishedNewReport(t *testing.T) {
 	setupTestDB(t)
