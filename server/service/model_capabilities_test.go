@@ -364,11 +364,11 @@ func TestModuleBudgetTable(t *testing.T) {
 	}
 }
 
-// TestPromptOutputLengthLimits v1.12 移除了压缩回答质量的篇幅限制；p14 对推荐模块
-// **有意恢复结构化体积控制**（条数上限+落选理由字数——输出体积须与输出预算匹配，
-// 截断故障根治批）。本测试锁定：推荐之外的模块仍无篇幅限制，推荐模块的体积控制
-// 形态与业务契约齐全。
-func TestPromptOutputLengthLimits(t *testing.T) {
+// TestPromptOutputLengthLimitsRemoved 锁定业务 prompt 不再用字数、句数或性能型数组
+// 上限压缩回答，并确保删除篇幅限制时没有连带删除关键结构与业务契约。
+// p14 曾为配合 2500 预算对推荐 prompt 收紧条数/字数，p15 已撤销（用户定夺：不为省
+// token 限制输出——预算语义反转+截断扩容 repair 后无需压缩输出），推荐条目回归本扫描。
+func TestPromptOutputLengthLimitsRemoved(t *testing.T) {
 	prompts := []struct {
 		name string
 		text string
@@ -377,6 +377,8 @@ func TestPromptOutputLengthLimits(t *testing.T) {
 		{"analysis_panel", panelRepairHint + panelOutputSpec},
 		{"analysis_review", analysisReviewContract},
 		{"trade_plan", tradePlanSystem + tradePlanRepairHint},
+		{"recommendation_short", recPromptContract + shortTermSpec},
+		{"recommendation_long", recPromptContract + longTermSpec},
 		{"recommendation_review", recReviewSystemPrompt},
 		{"rec_bear", bearSystemPrompt},
 		{"daily_report", dailyReviewSystem},
@@ -397,18 +399,6 @@ func TestPromptOutputLengthLimits(t *testing.T) {
 			if match := pattern.FindString(p.text); match != "" {
 				t.Errorf("%s prompt 仍包含输出篇幅限制 %q", p.name, match)
 			}
-		}
-	}
-
-	// p14 推荐体积控制形态：pick 三数组各 ≤3 条、rejected 只列前 3 且 ≤30 字。
-	for _, want := range []string{"各不超过 3 条", "不超过 30 个汉字", "量化排名最高的 3 个"} {
-		if !strings.Contains(recPromptContract, want) {
-			t.Errorf("recommendation 契约缺少 p14 体积控制 %q", want)
-		}
-	}
-	for name, spec := range map[string]string{"short": shortTermSpec, "long": longTermSpec} {
-		if !strings.Contains(spec, "最多 3 条") {
-			t.Errorf("recommendation %s spec 缺少 p14 条数上限声明", name)
 		}
 	}
 
