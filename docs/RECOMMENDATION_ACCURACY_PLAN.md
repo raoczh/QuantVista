@@ -206,17 +206,17 @@ LLM 层：解释 Top-K、冲突检查、反方论证、受限 veto（不负责�
 
 ### S3-6 数据一致性与 AI 增量配对评估（S4 前置）
 
-**S3-6A 数据时点与事实冻结（2026-07-31 代码已实现，待部署验收）**：推荐与单股评分只消费通过交易日新鲜度检查的资金流；披露日历确认有新财报时刷新，已知过期且刷新失败则 fail-closed，未来 `NoticeDate` 不进推荐，空 `NoticeDate` 仅在披露日历能证明同报告期已发布时放行；终选行情 qf4 用最新价复核时效及价格边界，通过者保留评分前同一快照，禁止“新价 + 旧因子/旧分”；当日新闻情绪按新闻采集间隔刷新，历史日冻结。候选事件以 `cr1` 固化生成时 `score_rank` 与终选后真实 `llm_input_order`；challenger run 以 `ep1` 固化 champion/challenger 的 symbol、输出顺序、action、confidence。旧行缺版本/顺序/逐标的 JSON 时标记不可评估，禁止事后用当前行情或聚合数量反推。
+**S3-6A 数据时点与事实冻结（2026-07-31 代码已实现，待部署验收）**：推荐与单股评分只消费通过交易日新鲜度检查的资金流；披露日历确认有新财报时刷新，已知过期且刷新失败则 fail-closed，未来 `NoticeDate` 不进推荐，空 `NoticeDate` 仅在披露日历能证明同报告期已发布时放行；终选行情 qf4 用最新价复核时效及价格边界，通过者保留评分前同一快照，禁止“新价 + 旧因子/旧分”；当日新闻情绪按新闻采集间隔刷新，历史日冻结。候选事件以 `cr1`（原单轮富化）或 `cr2`（两阶段确定性预热）固化生成时 `score_rank` 与终选后真实 `llm_input_order`；challenger run 以 `ep1` 固化 champion/challenger 的 symbol、输出顺序、action、confidence。旧行缺版本/顺序/逐标的 JSON 时标记不可评估，禁止事后用当前行情或聚合数量反推。
 
-**S3-6B 统一 selection outcome + 配对报表（下一批，未实现）**：现有 `recommendation_labels` 中，正式推荐会读取 AI 止盈止损并可能提前退出，影子候选因无 `recommendation_id` 按固定周期持有；两类 `NetReturnPct` 不能直接比较选股能力。新增独立、版本化的 selection outcome，所有组统一使用同批次、同一 LLM 机会集、`next_open`、相同费税/T+1/可成交规则、固定 5/10/20/60 日且**不带止盈止损**。不得静默改写 `label_version=l2` 的既有计划结算语义。
+**S3-6B 统一 selection outcome + 配对报表（2026-08-03 代码已实现，待部署验收）**：现有 `recommendation_labels` 中，正式推荐会读取 AI 止盈止损并可能提前退出，影子候选因无 `recommendation_id` 按固定周期持有；两类 `NetReturnPct` 不能直接比较选股能力。现已新增独立、版本化的 `recommendation_selection_outcomes`（`so1` / `selection_outcome.v1`），所有组统一使用同批次、同一 LLM 机会集、`next_open`、相同费税/T+1/可成交规则、固定 5/10/20/60 日且**不带止盈止损**。`label_version=l2` 的既有计划结算语义保持不变。
 
-配对组固定为：① `Quant Top-N`（同机会集中按生成时 `score_rank` 取前 N）；②当前 AI 最终选股；③有逐标的事实的 challenger。`N=该批有效 AI picks 数`，AI 返回 0 只单列拒选覆盖率，不硬造收益样本。报表分开回答三件事：selection（选了谁）、action/veto（buy/watch/拒选）、plan（同一 AI picks 的计划结算相对 fixed-hold）；禁止合成一个含义不清的“AI 胜率”。只纳入 `facts_recorded=true`、当前事实/结果版本、成熟且非 forced 的可比批次，degraded/事实不完整/旧行无排名单列剔除。
+配对组固定为：① `Quant Top-N`（同机会集中按生成时 `score_rank` 取前 N）；②当前 AI 最终选股；③有逐标的事实的 challenger。`N=该批有效 AI picks 数`，AI 返回 0 只单列拒选覆盖率，不硬造收益样本。报表分开回答三件事：selection（选了谁）、action/veto（buy/watch/拒选）、plan（同一 AI picks 的计划结算相对 fixed-hold）；禁止合成一个含义不清的“AI 胜率”。只纳入 `facts_recorded=true`、已审计且批内一致的 `cr1/cr2` 事实、匹配的 `so1` 结果、成熟且非 forced 的 success 批次，degraded/事实不完整/未知或混合排名版本单列剔除。
 
-指标至少包含批次/标的样本数、覆盖率、净收益均值/中位数/P10、`net>0`、Alpha、严重亏损率（`net<-5%`）、MFE/MAE 和逐批配对差；置信区间按**批次**为重采样单位、固定 seed 做 paired bootstrap，不能把同批多只股票当独立样本。短线 5/10 日、长线 20/60 日分开，策略/regime/模型/prompt 版本仅在样本充足时分层，不足明确显示“不确定”。报表重算与缓存不得产生 LLM 调用。
+指标包含批次/标的样本数、覆盖率、净收益均值/中位数/P10、`net>0`、Alpha、严重亏损率（`net<-5%`）、MFE/MAE 和逐批配对差；置信区间按**批次**为重采样单位、固定 seed 做 paired bootstrap，不能把同批多只股票当独立样本。短线 5/10 日、长线 20/60 日分开，排名版本/策略/regime/模型/prompt 版本仅在样本充足时分层，不足明确显示“不确定”。管理员「选股配对评估」页支持重算与进程内缓存，整条路径不得产生 LLM 调用。
 
 **S3-6C score-blind 影子实验（S3-6B 后，未实现）**：作为独立输入实验类型，不是普通 prompt challenger。保持相同候选集合，只保留原始可用因子，移除 score/rank/bonus/score_dims 等派生锚点并按确定性 seed 随机顺序；固化 seed、输入顺序与输入 hash。默认关闭、每批仍至多一次 challenger 调用、永不改业务推荐。收益晋级门须先预注册评价窗口、最小有效批次、覆盖率下降上限、尾部风险阈值及多重检验方法。
 
-**尚未在本批解决的顺序偏置**：`finRecFetchBudget`/`fflowRecBudget` 仍按候选遍历顺序消费。完全冷缓存时，前 N 个候选更可能得到 C 类特征；后续应在不看 C 类结果的前提下，先用 A 类/PIT 信息确定性选定预热集合，再统一富化和评分，并对“有/无 C 类特征”加 missing 标记。未完成该两阶段改造前，不得宣称缓存热度对排名零影响。
+**两阶段确定性预热（2026-08-03 代码已实现，待部署验收）**：财务与资金流补拉不再按候选遍历顺序消费预算。系统先用补拉前 A 类/PIT 基础分按“分数降序、代码升序”分别冻结请求集合，再统一执行 I/O、冻结富化结果，最后计算正式分数；冷却命中不占预算，失败不按结果临时补选，并显式记录 `finance_status/flow_status`，候选排名版本递增为 `cr2`。资金流库存读取同步修为“最新 250 行后恢复日期升序”，财务 TTL 按实际 as-of 选中的报告行判断，未来/不可用新行不能替旧报告续命。该改造消除的是**遍历顺序**偏置；缓存是否真实可用仍会通过缺失状态与可用因子影响最终分数，不得宣称缓存覆盖差异已被消除。
 
 ### S4 模型化横截面排序（依赖 S3 数据/标签/baseline/walk-forward）
 

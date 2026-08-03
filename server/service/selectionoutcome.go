@@ -25,10 +25,22 @@ const (
 // selectionBatchFacts 是一批生成时事实的内存视图。Issue 非空时整批不得进入精确
 // selection 配对，也不得从当前行情或聚合计数猜测缺失事实。
 type selectionBatchFacts struct {
-	Batch       model.RecommendationBatch
-	Opportunity []model.RecommendationCandidateEvent // 按 llm_input_order 升序
-	Picks       []model.Recommendation               // 按真实 sort_order 升序
-	Issue       string
+	Batch          model.RecommendationBatch
+	RankingVersion string
+	Opportunity    []model.RecommendationCandidateEvent // 按 llm_input_order 升序
+	Picks          []model.Recommendation               // 按真实 sort_order 升序
+	Issue          string
+}
+
+// selectionRankingVersionSupported 只列出已经审计过、可精确复原机会集的版本。
+// 后续候选排序升级必须显式扩展这里，并补充新旧版本对拍，不能自动跟随当前版本。
+func selectionRankingVersionSupported(version string) bool {
+	switch version {
+	case "cr1", "cr2":
+		return true
+	default:
+		return false
+	}
 }
 
 func loadSelectionBatchFacts() ([]selectionBatchFacts, error) {
@@ -76,20 +88,24 @@ func loadSelectionBatchFacts() ([]selectionBatchFacts, error) {
 			bf.Issue = selectionFactEventsMissing
 		default:
 			bf.Opportunity, bf.Issue = validateSelectionFacts(allEvents, bf.Picks)
+			if bf.Issue == "" && len(bf.Opportunity) > 0 {
+				bf.RankingVersion = bf.Opportunity[0].RankingVersion
+			}
 		}
 		out = append(out, bf)
 	}
 	return out, nil
 }
 
-// validateSelectionFacts 校验一批生成时机会集。当前精确口径只认 cr1；所有实际送模
-// 标的必须有正 score_rank、连续 llm_input_order，且 symbol/rank/order 均唯一。
+// validateSelectionFacts 校验一批生成时机会集。所有实际送模标的必须属于同一个已
+// 审计排名版本、有正 score_rank、连续 llm_input_order，且 symbol/rank/order 均唯一。
 func validateSelectionFacts(events []model.RecommendationCandidateEvent, picks []model.Recommendation) ([]model.RecommendationCandidateEvent, string) {
 	opp := make([]model.RecommendationCandidateEvent, 0, len(events))
 	seenSym := map[string]bool{}
 	seenRank := map[int]bool{}
 	seenOrder := map[int]bool{}
 	pickedEvents := map[string]bool{}
+	rankingVersion := ""
 	for _, ev := range events {
 		if ev.CandidateStage == model.CandStagePicked {
 			if pickedEvents[ev.Symbol] {
@@ -100,8 +116,13 @@ func validateSelectionFacts(events []model.RecommendationCandidateEvent, picks [
 		if !ev.SentToLLM && ev.LLMInputOrder <= 0 {
 			continue
 		}
-		if !ev.SentToLLM || ev.RankingVersion != candidateRankingVersion ||
+		if !ev.SentToLLM || !selectionRankingVersionSupported(ev.RankingVersion) ||
 			ev.ScoreRank <= 0 || ev.LLMInputOrder <= 0 || ev.Symbol == "" {
+			return nil, selectionFactRankingOld
+		}
+		if rankingVersion == "" {
+			rankingVersion = ev.RankingVersion
+		} else if ev.RankingVersion != rankingVersion {
 			return nil, selectionFactRankingOld
 		}
 		if seenSym[ev.Symbol] || seenRank[ev.ScoreRank] || seenOrder[ev.LLMInputOrder] {
@@ -203,7 +224,7 @@ func advanceSelectionOutcomes(ctx context.Context, market *MarketService, batche
 				old, exists := existingByKey[key]
 				if exists && selectionOutcomeTerminal(old.MaturityStatus) &&
 					old.SchemaVersion == model.SelectionOutcomeSchemaVersion &&
-					old.RankingVersion == candidateRankingVersion {
+					old.RankingVersion == ev.RankingVersion {
 					stats.Unchanged++
 					continue
 				}
@@ -252,7 +273,7 @@ func computeSelectionOutcome(batch model.RecommendationBatch, ev model.Recommend
 		BatchID: batch.ID, CandidateEventID: ev.ID, UserID: batch.UserID,
 		Symbol: ev.Symbol, Market: ev.Market, Name: ev.Name, Type: batch.Type,
 		HorizonDays: horizon, SignalDate: signalDate, SignalAsOf: batch.CreatedAt,
-		EntryMode: model.EntryModeNextOpen, RankingVersion: candidateRankingVersion,
+		EntryMode: model.EntryModeNextOpen, RankingVersion: ev.RankingVersion,
 		OutcomeVersion: model.SelectionOutcomeVersion,
 		SchemaVersion:  model.SelectionOutcomeSchemaVersion,
 		MaturityStatus: model.LabelPending,

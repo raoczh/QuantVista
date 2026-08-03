@@ -375,6 +375,37 @@ func TestFinanceFactorForExcludesFutureDisclosure(t *testing.T) {
 	}
 }
 
+// 推荐 TTL 必须跟随实际可用报告行；尚未披露的新行刚写入，不能替陈旧旧报告续命。
+func TestFinanceFactorForUsesSelectedRowFreshness(t *testing.T) {
+	setupTestDB(t)
+	cleanF10(t)
+	today := time.Now()
+	old := model.FinanceIndicator{
+		Symbol: "600519", Market: "cn", ReportDate: "2025-12-31", ReportName: "2025年报",
+		NoticeDate: today.AddDate(0, 0, -30).Format("2006-01-02"), ROE: 34.2,
+	}
+	if err := common.DB.Create(&old).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := common.DB.Model(&old).Update("updated_at", today.Add(-8*24*time.Hour)).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := common.DB.Create(&model.FinanceIndicator{
+		Symbol: "600519", Market: "cn", ReportDate: "2026-03-31", ReportName: "未来一季报",
+		NoticeDate: today.AddDate(0, 0, 1).Format("2006-01-02"), ROE: 99,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !finFresh(&model.FinanceIndicator{}, "600519") {
+		t.Fatal("测试前置条件错误：按全表最新写入时间会误判为 fresh")
+	}
+
+	budget := 0
+	if fin := financeFactorFor(context.Background(), "600519", &budget); fin != nil {
+		t.Fatalf("未来行不得替已过 TTL 的实际可用报告续命，fin=%+v", fin)
+	}
+}
+
 // 公告日缺失不能自动视为可用；只有披露日历能证明同报告期已发布时才允许进入推荐。
 func TestFinanceFactorForRequiresProofForEmptyNoticeDate(t *testing.T) {
 	setupTestDB(t)

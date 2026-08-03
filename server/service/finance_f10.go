@@ -333,7 +333,16 @@ type financeFactorProbe struct {
 	RefreshNeeded  bool
 }
 
-func inspectFinanceFactor(symbol, asOf string) financeFactorProbe {
+// financeIndicatorRowFreshAt 必须检查真正被 point-in-time 选择的那一行，不能用
+// 同标的其他（可能尚未披露或无法证明可用的）行的 updated_at 代替。
+func financeIndicatorRowFreshAt(row *model.FinanceIndicator, now time.Time) bool {
+	if row == nil || row.UpdatedAt.IsZero() || row.UpdatedAt.After(now.Add(time.Minute)) {
+		return false
+	}
+	return now.Sub(row.UpdatedAt) < finFreshTTL
+}
+
+func inspectFinanceFactor(symbol, asOf string, now time.Time) financeFactorProbe {
 	p := financeFactorProbe{Symbol: symbol, AsOf: asOf}
 	if common.DB == nil || !isSixDigits(symbol) {
 		return p
@@ -341,7 +350,7 @@ func inspectFinanceFactor(symbol, asOf string) financeFactorProbe {
 	p.Cached = financeIndicatorAsOf(symbol, asOf)
 	if p.Cached != nil {
 		p.RequiredReport = publishedFinanceReportAfter(symbol, p.Cached.ReportDate, asOf)
-		p.Fresh = finFresh(&model.FinanceIndicator{}, symbol)
+		p.Fresh = financeIndicatorRowFreshAt(p.Cached, now)
 	}
 	p.RefreshNeeded = p.Cached == nil || p.RequiredReport != "" || !p.Fresh
 	return p
@@ -365,7 +374,7 @@ func resolveFinanceFactor(p financeFactorProbe, fetched bool) *candFin {
 	fresh := p.Fresh
 	if fetched {
 		latest = financeIndicatorAsOf(p.Symbol, p.AsOf)
-		fresh = latest != nil && finFresh(&model.FinanceIndicator{}, p.Symbol)
+		fresh = financeIndicatorRowFreshAt(latest, time.Now())
 	}
 	if !fresh || (p.RequiredReport != "" && (latest == nil || latest.ReportDate < p.RequiredReport)) {
 		return nil
@@ -380,8 +389,9 @@ func financeFactorFor(ctx context.Context, symbol string, budget *int) *candFin 
 	if common.DB == nil || !isSixDigits(symbol) {
 		return nil
 	}
-	asOf := time.Now().In(time.Local).Format("2006-01-02")
-	probe := inspectFinanceFactor(symbol, asOf)
+	now := time.Now()
+	asOf := now.In(time.Local).Format("2006-01-02")
+	probe := inspectFinanceFactor(symbol, asOf, now)
 	if !probe.RefreshNeeded {
 		return resolveFinanceFactor(probe, false)
 	}

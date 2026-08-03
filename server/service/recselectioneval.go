@@ -333,6 +333,7 @@ func buildSelectionEvalReport(batches []selectionBatchFacts, now time.Time) (*Se
 		Bootstrap:               SelectionBootstrapSpec{Seed: selectionBootstrapSeed, Iterations: selectionBootstrapIterations},
 	}
 	factByBatch := make(map[int64]*selectionBatchFacts, len(batches))
+	rankingVersions := map[string]bool{}
 	for i := range batches {
 		bf := &batches[i]
 		factByBatch[bf.Batch.ID] = bf
@@ -358,6 +359,7 @@ func buildSelectionEvalReport(batches []selectionBatchFacts, now time.Time) (*Se
 			continue
 		}
 		rep.Coverage.FactsReadyBatches++
+		rankingVersions[bf.RankingVersion] = true
 		rep.Coverage.OpportunitySymbols += len(bf.Opportunity)
 		rep.Coverage.AIPicks += len(bf.Picks)
 		if len(bf.Picks) == 0 {
@@ -367,6 +369,14 @@ func buildSelectionEvalReport(batches []selectionBatchFacts, now time.Time) (*Se
 	if rep.Coverage.FactsReadyBatches > 0 {
 		rep.Coverage.ZeroPickRatePct = round2(float64(rep.Coverage.ZeroPickBatches) /
 			float64(rep.Coverage.FactsReadyBatches) * 100)
+	}
+	if len(rankingVersions) > 0 {
+		versions := make([]string, 0, len(rankingVersions))
+		for version := range rankingVersions {
+			versions = append(versions, version)
+		}
+		sort.Strings(versions)
+		rep.RankingVersion = strings.Join(versions, ",")
 	}
 
 	var outcomes []model.RecommendationSelectionOutcome
@@ -389,8 +399,10 @@ func buildSelectionEvalReport(batches []selectionBatchFacts, now time.Time) (*Se
 		if row.Forced {
 			rep.Coverage.OutcomeForced++
 		}
+		bf, batchOK := factByBatch[row.BatchID]
 		if row.SchemaVersion == model.SelectionOutcomeSchemaVersion &&
-			row.RankingVersion == candidateRankingVersion {
+			selectionRankingVersionSupported(row.RankingVersion) && batchOK && bf.Issue == "" &&
+			row.RankingVersion == bf.RankingVersion {
 			outcomeByKey[selectionOutcomeKey(row.BatchID, row.Symbol, row.HorizonDays)] = row
 		}
 	}
@@ -429,7 +441,7 @@ func buildSelectionEvalReport(batches []selectionBatchFacts, now time.Time) (*Se
 	}
 	rep.Notes = []string{
 		"so1 是独立 fixed-hold 测量事实：next_open、统一费税、T+1/可成交规则、固定 5/10/20/60 交易日，不读取 TP/SL；l2 计划标签未被改写",
-		"主 selection 指标只纳入 facts_recorded=true、cr1 排名/输入顺序完整、success、AI picks>0 且两组结果全部成熟非 forced 的批次；degraded、旧行、pending/forced/no_data/skipped 分列",
+		fmt.Sprintf("主 selection 指标只纳入 facts_recorded=true、排名/输入顺序完整（观测版本 %s）、success、AI picks>0 且两组结果全部成熟非 forced 的批次；degraded、旧行、pending/forced/no_data/skipped 分列", rep.RankingVersion),
 		"组级收益按标的汇总；所有比较差先在每批内计算，再以批次为重采样单位做固定 seed paired bootstrap，避免把同批多只股票当独立样本",
 		"challenger 仅纳入 valid+ep1 且两份逐标的 JSON 完整的 run，并按 experiment_id 分开；matched-K=min(AI N, challenger 原生 K)，不补造标的",
 		fmt.Sprintf("策略/regime/provider·model/prompt 分层至少 %d 个可比批次才评估，否则明确标记不确定", selectionSliceMinBatches),
@@ -637,7 +649,7 @@ func buildSelectionSection(recType string, horizon int, batches []selectionBatch
 	sec.Challengers = buildSelectionChallengerEvals(recType, horizon, batchFacts, outcomes, challengers)
 	sec.Slices = buildSelectionSlices(diffs, batchFacts, recType, horizon)
 	sec.Notes = []string{
-		"Selection：AI 取真实 recommendations；N 为该批有效 AI picks 数；Quant 仅从同批 cr1 机会集按 score_rank 取前 N",
+		"Selection：AI 取真实 recommendations；N 为该批有效 AI picks 数；Quant 仅从同批已审计机会集按 score_rank 取前 N",
 		"Action / Veto：buy、watch、未选分别统计 fixed-hold 结果，不与 selection 配对结论合成一个胜率",
 		"Plan：只在同一 AI picks 交集上比较 l2 计划结算与 so1 fixed-hold，属于辅助面板",
 	}
@@ -1174,14 +1186,15 @@ func buildSelectionSlices(diffs []SelectionBatchDiff, batches map[int64]selectio
 	recType string, horizon int) []SelectionSliceGroup {
 	dims := []struct {
 		dim, label string
-		key        func(model.RecommendationBatch) string
+		key        func(selectionBatchFacts) string
 	}{
-		{"strategy", "策略", func(b model.RecommendationBatch) string { return b.Strategy }},
-		{"regime", "市场状态", func(b model.RecommendationBatch) string { return b.Regime }},
-		{"provider_model", "Provider · Model", func(b model.RecommendationBatch) string {
-			return strings.TrimSpace(b.Provider + " · " + b.Model)
+		{"ranking_version", "排名版本", func(b selectionBatchFacts) string { return b.RankingVersion }},
+		{"strategy", "策略", func(b selectionBatchFacts) string { return b.Batch.Strategy }},
+		{"regime", "市场状态", func(b selectionBatchFacts) string { return b.Batch.Regime }},
+		{"provider_model", "Provider · Model", func(b selectionBatchFacts) string {
+			return strings.TrimSpace(b.Batch.Provider + " · " + b.Batch.Model)
 		}},
-		{"prompt_version", "Prompt 版本", func(b model.RecommendationBatch) string { return b.PromptVersion }},
+		{"prompt_version", "Prompt 版本", func(b selectionBatchFacts) string { return b.Batch.PromptVersion }},
 	}
 	groups := make([]SelectionSliceGroup, 0, len(dims))
 	for _, dim := range dims {
@@ -1191,7 +1204,7 @@ func buildSelectionSlices(diffs []SelectionBatchDiff, batches map[int64]selectio
 			if !ok {
 				continue
 			}
-			key := strings.TrimSpace(dim.key(bf.Batch))
+			key := strings.TrimSpace(dim.key(bf))
 			if key == "" || key == "·" {
 				key = "（未知）"
 			}

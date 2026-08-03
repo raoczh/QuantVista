@@ -188,6 +188,29 @@ func selectionEvalMetricFor(t *testing.T, metrics []SelectionMetric, group strin
 	return SelectionMetric{}
 }
 
+func TestValidateSelectionFactsSupportsAuditedRankingVersions(t *testing.T) {
+	events := func(first, second string) []model.RecommendationCandidateEvent {
+		return []model.RecommendationCandidateEvent{
+			{Symbol: "600001", SentToLLM: true, ScoreRank: 1, LLMInputOrder: 1, RankingVersion: first},
+			{Symbol: "600002", SentToLLM: true, ScoreRank: 2, LLMInputOrder: 2, RankingVersion: second},
+		}
+	}
+	for _, version := range []string{"cr1", "cr2"} {
+		opp, issue := validateSelectionFacts(events(version, version), nil)
+		if issue != "" || len(opp) != 2 {
+			t.Fatalf("已审计版本 %s 应可精确评估：issue=%s opp=%+v", version, issue, opp)
+		}
+	}
+	for name, rows := range map[string][]model.RecommendationCandidateEvent{
+		"混合版本": events("cr1", "cr2"),
+		"未知版本": events("cr3", "cr3"),
+	} {
+		if _, issue := validateSelectionFacts(rows, nil); issue != selectionFactRankingOld {
+			t.Fatalf("%s 应拒绝为 ranking old，got %s", name, issue)
+		}
+	}
+}
+
 func TestSelectionEvalSyntheticPairingCoverageAndBootstrap(t *testing.T) {
 	setupSelectionEvalTestDB(t)
 	ctx := context.Background()
@@ -428,6 +451,10 @@ func TestRunSelectionEvalSO1SettlementIdempotentAndNoLLM(t *testing.T) {
 		created, []selectionEvalCandidateFixture{
 			{Symbol: "600901", Rank: 1, Order: 1, Picked: true},
 		})
+	if err := common.DB.Model(&model.RecommendationCandidateEvent{}).
+		Where("batch_id = ?", fixture.Batch.ID).Update("ranking_version", "cr1").Error; err != nil {
+		t.Fatalf("制造 cr1 历史事实失败: %v", err)
+	}
 
 	dates := []string{"2025-01-02", "2025-01-03", "2025-01-06", "2025-01-07", "2025-01-08", "2025-01-09", "2025-01-10"}
 	for _, date := range dates {
@@ -453,8 +480,12 @@ func TestRunSelectionEvalSO1SettlementIdempotentAndNoLLM(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := RunSelectionEval(context.Background(), nil); err != nil {
+	firstReport, err := RunSelectionEval(context.Background(), nil)
+	if err != nil {
 		t.Fatalf("首次真实 so1 结算失败: %v", err)
+	}
+	if firstReport.RankingVersion != "cr1" {
+		t.Fatalf("报表应保留历史事实版本 cr1，got %q", firstReport.RankingVersion)
 	}
 	var countFirst int64
 	if err := common.DB.Model(&model.RecommendationSelectionOutcome{}).
@@ -480,7 +511,7 @@ func TestRunSelectionEvalSO1SettlementIdempotentAndNoLLM(t *testing.T) {
 		t.Fatalf("真实 so1 gross/net/MFE/MAE 不符: %+v", first)
 	}
 	if first.EntryMode != model.EntryModeNextOpen || first.OutcomeVersion != model.SelectionOutcomeVersion ||
-		first.SchemaVersion != model.SelectionOutcomeSchemaVersion || first.RankingVersion != candidateRankingVersion {
+		first.SchemaVersion != model.SelectionOutcomeSchemaVersion || first.RankingVersion != "cr1" {
 		t.Fatalf("so1 版本或入场口径不符: %+v", first)
 	}
 

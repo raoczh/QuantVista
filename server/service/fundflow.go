@@ -62,7 +62,10 @@ func inspectStockFundFlow(market, symbol string, now time.Time) stockFundFlowPro
 		return p
 	}
 	common.DB.Where("symbol = ? AND market = ?", symbol, market).
-		Order("trade_date ASC").Limit(fflowBarLimit).Find(&p.Rows)
+		Order("trade_date DESC").Limit(fflowBarLimit).Find(&p.Rows)
+	for left, right := 0, len(p.Rows)-1; left < right; left, right = left+1, right-1 {
+		p.Rows[left], p.Rows[right] = p.Rows[right], p.Rows[left]
+	}
 	freshSince := prevOpenTradeDate(now.Format("2006-01-02"))
 	p.Fresh = len(p.Rows) > 0 && p.Rows[len(p.Rows)-1].TradeDate >= freshSince
 	return p

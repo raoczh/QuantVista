@@ -135,6 +135,49 @@ func TestEnsureStockFundFlowCache(t *testing.T) {
 	}
 }
 
+// inspectStockFundFlow 应截取最新窗口，再恢复成评分消费者需要的日期升序。
+// 库存累计超过窗口后，不能一直读到最老 250 行并永久误判 stale。
+func TestInspectStockFundFlowUsesLatestWindowAscending(t *testing.T) {
+	setupTestDB(t)
+	cleanMoodTables(t)
+	now := time.Now().In(time.Local)
+	fresh := prevOpenTradeDate(now.Format("2006-01-02"))
+	end, err := time.ParseInLocation("2006-01-02", fresh, time.Local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const extra = 5
+	rows := make([]model.FundFlowDaily, 0, fflowBarLimit+extra)
+	for i := fflowBarLimit + extra - 1; i >= 0; i-- {
+		rows = append(rows, model.FundFlowDaily{
+			Symbol: "000994", Market: "cn", TradeDate: end.AddDate(0, 0, -i).Format("2006-01-02"),
+			MainNet: float64(i),
+		})
+	}
+	if err := common.DB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	probe := inspectStockFundFlow("cn", "000994", now)
+	if len(probe.Rows) != fflowBarLimit {
+		t.Fatalf("应只返回最新 %d 行，got %d", fflowBarLimit, len(probe.Rows))
+	}
+	wantFirst := end.AddDate(0, 0, -(fflowBarLimit - 1)).Format("2006-01-02")
+	if probe.Rows[0].TradeDate != wantFirst || probe.Rows[len(probe.Rows)-1].TradeDate != fresh {
+		t.Fatalf("最新窗口边界不符：first=%s want=%s last=%s want=%s",
+			probe.Rows[0].TradeDate, wantFirst, probe.Rows[len(probe.Rows)-1].TradeDate, fresh)
+	}
+	for i := 1; i < len(probe.Rows); i++ {
+		if probe.Rows[i-1].TradeDate >= probe.Rows[i].TradeDate {
+			t.Fatalf("输出必须严格日期升序：i=%d prev=%s curr=%s", i,
+				probe.Rows[i-1].TradeDate, probe.Rows[i].TradeDate)
+		}
+	}
+	if !probe.Fresh {
+		t.Fatal("最新一行为上一开市日时应判为 fresh")
+	}
+}
+
 // 推荐评分只能消费新鲜资金流；详情页仍可读取 stale 库存并用 Fresh=false 显式展示。
 func TestFundFlowForScoringRejectsStaleRows(t *testing.T) {
 	rows := []model.FundFlowDaily{{Symbol: "600519", Market: "cn", TradeDate: "2026-01-05", MainNet: 1}}

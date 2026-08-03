@@ -90,7 +90,7 @@ func (s *RecommendationService) preheatRecommendationRound(
 		flowPlans = append(flowPlans, flowPlan)
 
 		if recType == model.RecTypeLongTerm {
-			finProbe := inspectFinanceFactor(base.Symbol, asOf)
+			finProbe := inspectFinanceFactor(base.Symbol, asOf, now)
 			finProbes[base.Idx] = finProbe
 			finPlan := base
 			finPlan.NeedsFetch = finProbe.RefreshNeeded
