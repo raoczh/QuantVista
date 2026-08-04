@@ -10,6 +10,24 @@ import (
 	"quantvista/model"
 )
 
+// llmCallTarget 是一次 attempt 经模型路由后的进程内目标快照。APIKey 仅供同批
+// score-blind 配对调用复用，禁止序列化或落库。
+type llmCallTarget struct {
+	BaseURL             string
+	APIKey              string
+	Model               string
+	EndpointType        string
+	Temperature         float64
+	MaxTokens           int
+	AccuracyContract    bool
+	JSONMode            bool
+	TemperatureOmitted  bool
+	MaxCompletionTokens bool
+	AllowPrivate        bool
+	ConfigID            int64
+	Provider            string
+}
+
 // P0-2 统一运行元数据 + P0-8 调用关联/完整性元数据（docs/LLM_ACCURACY_OPTIMIZATION_PLAN.md §5.1/§7.1）。
 //
 // 关联语义（不可回退的契约）：
@@ -95,6 +113,8 @@ type llmRun struct {
 	// 提交；manifest 只能消费后者，拒收/repair/调用失败的目标不得冒充业务结果来源。
 	routeApplied         LLMRouteApplied
 	acceptedRouteApplied LLMRouteApplied
+	targetSnapshot       llmCallTarget
+	acceptedTarget       llmCallTarget
 }
 
 // newLLMRun 创建调用组。parentRunID 为空表示主调。
@@ -119,6 +139,8 @@ func (r *llmRun) chatMeta(userID int64, cfg *model.LLMConfig, attempt int) chatM
 	// 因此候选与已提交值都清空；repair 可能因能力观察改回原模型。
 	r.routeApplied = LLMRouteApplied{}
 	r.acceptedRouteApplied = LLMRouteApplied{}
+	r.targetSnapshot = llmCallTarget{}
+	r.acceptedTarget = llmCallTarget{}
 	if attempt > r.Attempts {
 		r.Attempts = attempt
 	}
@@ -130,6 +152,7 @@ func (r *llmRun) chatMeta(userID int64, cfg *model.LLMConfig, attempt int) chatM
 		PromptHash: r.PromptHash, DataHash: r.DataHash,
 		StructuredDropped: &r.structuredDropped, // 中央客户端回落时置位，manifest 消费
 		RouteApplied:      &r.routeApplied,      // P2-4 模型路由观测（applyModelRouting 回写）
+		TargetSnapshot:    &r.targetSnapshot,
 	}
 	if cfg != nil {
 		m.ConfigID = cfg.ID
@@ -142,6 +165,7 @@ func (r *llmRun) chatMeta(userID int64, cfg *model.LLMConfig, attempt int) chatM
 // 未路由的 accepted attempt 也会提交零值，从而明确清掉被拒收前序 attempt 的目标。
 func (r *llmRun) acceptRouteAttribution() {
 	r.acceptedRouteApplied = r.routeApplied
+	r.acceptedTarget = r.targetSnapshot
 }
 
 // record 记录本 run 最后一次请求的终态（成功与失败都要记；err 含 RefusalError 时
@@ -181,8 +205,8 @@ type LLMRunManifest struct {
 
 	AttemptCount int `json:"attempt_count"` // = 1 + RepairCount（不变式，manifest() 保证）
 	RepairCount  int `json:"repair_count"`  // 首轮之后的额外次数
-	// OutputBudget 模块声明的输出 token 预算（P0-9，llm_budget.go；实际请求值为
-	// min(用户配置, 本值)，见 moduleTokenCap）。0=未声明（省略）。
+	// OutputBudget 模块声明的输出 token 预算（P0-9，llm_budget.go）；用户配置正数
+	// 原样生效，模块值仅作未配置时默认，repair 可按模块倍率扩容。0=未声明（省略）。
 	OutputBudget int `json:"output_budget,omitempty"`
 
 	FinishState    string `json:"finish_state,omitempty"`

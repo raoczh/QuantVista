@@ -244,7 +244,7 @@ async function toggleReflection(v: boolean) {
   }
 }
 
-/* P2-1 challenger 影子采样：running 实验命中时每批推荐额外一次影子调用（缺省关） */
+/* P2-1/S3-6C 统一影子实验：prompt 与 score-blind 互斥，每批最多一次额外调用（缺省关）。 */
 const savingChallenger = ref(false)
 const challengerEnabled = ref(false)
 async function toggleChallenger(v: boolean) {
@@ -668,10 +668,10 @@ onMounted(() => {
             </span>
           </n-space>
           <n-space align="center">
-            <span>Prompt 实验影子采样：</span>
+            <span>推荐影子实验采样：</span>
             <n-switch :value="challengerEnabled" :loading="savingChallenger" @update:value="toggleChallenger" />
             <span style="opacity: 0.6; font-size: 12px">
-              开启（P2-1，缺省关）：存在 running 状态的 champion/challenger 实验时，实验创建者本人的每批推荐额外发起一次 challenger 影子调用（双倍 token 成本），输出只落实验样本表、不影响业务结果。实验管理见「LLM 实验」页。
+              开启（P2-1/S3-6C，缺省关）：存在 running 的 prompt challenger 或 score-blind 输入实验时，仅对实验创建者本人每批推荐追加一次影子调用；两类实验互斥、合计最多一次。纯影子、不影响推荐：成功、失败、空 picks、越池结果均只落实验与审计事实，不改业务 picks、action、confidence、候选池、推荐批次状态或 l2 标签。
             </span>
           </n-space>
           <n-space align="center">
@@ -694,7 +694,7 @@ onMounted(() => {
       <!-- P2-4 模型路由表 -->
       <SectionCard title="模型路由" :hoverable="false">
         <n-alert type="info" :show-icon="false" :bordered="false" class="note">
-          一行 = 一个模块的调用改走指定 LLM 配置（目标配置须属启用状态的管理员）。挑战者影子采样（experiment）恒跟随推荐主调的路由（单变量对照），不可单独配置。总开关在上方「LLM 准确性契约」卡的「模型路由」。
+          一行 = 一个模块的调用改走指定 LLM 配置（目标配置须属启用状态的管理员）。推荐影子实验（prompt challenger / score-blind）恒跟随推荐主调的路由，不可单独配置。总开关在上方「LLM 准确性契约」卡的「模型路由」。
         </n-alert>
         <n-table :bordered="false" :single-line="false" v-if="routes.length">
           <thead>

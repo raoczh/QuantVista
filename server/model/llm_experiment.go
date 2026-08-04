@@ -23,6 +23,16 @@ import "time"
 type LLMExperiment struct {
 	ID     int64 `gorm:"primaryKey" json:"id"`
 	UserID int64 `gorm:"index" json:"user_id"` // 实验创建者（管理员）；影子采样只命中其本人请求
+	// ExperimentType 区分普通 prompt challenger 与 recommendation 输入实验。
+	// 旧行为空时由 service 按 prompt 兼容，禁止为了补类型而反推或改写历史工件。
+	ExperimentType string `gorm:"size:24;index" json:"experiment_type"`
+	// InputSchemaVersion 仅输入实验使用；score-blind 首版为 sb1。普通 prompt 实验为空。
+	InputSchemaVersion string `gorm:"size:16" json:"input_schema_version"`
+	// ProtocolJSON/Hash 是 score-blind 创建时预注册并锁定的不可变评价协议；后续启动、
+	// 采样与评估都会复验 hash，防观察结果后篡改门槛。
+	ProtocolJSON     string     `gorm:"type:text" json:"protocol_json"`
+	ProtocolHash     string     `gorm:"size:80" json:"protocol_hash"`
+	ProtocolLockedAt *time.Time `json:"protocol_locked_at"`
 
 	// Module 业务模块（llm_call_logs.module 口径）；PromptModule 对应 PromptTemplate.module。
 	// 首版仅支持 recommendation/recommend（llmExperimentSupportedModules）。
@@ -76,8 +86,8 @@ type LLMExperiment struct {
 	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
-// LLMExperimentModuleLock 是模块级数据库锁槽。行永久保留，只用于 Start 时
-// SELECT ... FOR UPDATE 串行化“检查 running + draft→running”，不承载业务状态。
+// LLMExperimentModuleLock 是模块级数据库锁槽。行永久保留，用于 Start 串行化
+// “检查 running + draft→running”，也用于 claim 串行化跨实验的 batch 去重；不承载业务状态。
 type LLMExperimentModuleLock struct {
 	Module    string    `gorm:"size:32;primaryKey" json:"module"`
 	CreatedAt time.Time `json:"created_at"`
@@ -89,9 +99,23 @@ type LLMExperimentRun struct {
 	ID           int64  `gorm:"primaryKey" json:"id"`
 	ExperimentID int64  `gorm:"index" json:"experiment_id"`
 	UserID       int64  `json:"user_id"`
-	BatchID      int64  `json:"batch_id"` // 推荐批次
+	BatchID      int64  `gorm:"index" json:"batch_id"` // 推荐批次；非唯一索引兼容历史重复工件
 	TraceID      string `gorm:"size:40" json:"trace_id"`
 	ChampionRun  string `gorm:"size:40" json:"champion_run_id"`
+	// ExperimentType/InputSchemaVersion 在每个样本上再次固化，避免报表依赖当前实验行
+	// 反推历史输入语义。旧 ep1 行为空时按 prompt 兼容。
+	ExperimentType     string `gorm:"size:24;index" json:"experiment_type"`
+	InputSchemaVersion string `gorm:"size:16" json:"input_schema_version"`
+	// RunStatus 在上游调用前先落 running 占位，串行化同批采样；完成后写
+	// success/empty_picks/out_of_pool/failed。崩溃遗留 running 超过 TTL 后固化为 failed，
+	// 计入完成样本且同批永不重试。
+	RunStatus string `gorm:"size:24;index" json:"run_status"`
+	// score-blind 的不可重建输入事实：seed、真实发送顺序、完整业务消息 hash 与精确快照。
+	// InputSnapshotJSON 不直接出管理 API（体积较大），但随工件永久保存供审计核验。
+	Seed              int64  `json:"seed"`
+	InputHash         string `gorm:"size:80" json:"input_hash"`
+	InputOrderJSON    string `gorm:"type:text" json:"input_order_json"`
+	InputSnapshotJSON string `gorm:"type:longtext" json:"-"`
 
 	Valid         bool   `json:"valid"`       // challenger 输出结构化解析+池校验通过
 	PicksCount    int    `json:"picks_count"` // challenger 有效 picks 数
@@ -141,6 +165,21 @@ const (
 	ReleaseAuditPass  = "pass"
 	ReleaseAuditFail  = "fail"
 	ReleaseAuditError = "error"
+)
+
+// 实验类型。空字符串只为读取旧 ep1 历史行保留，所有新行必须显式写入一种类型。
+const (
+	LLMExperimentTypePrompt     = "prompt"
+	LLMExperimentTypeScoreBlind = "score_blind"
+)
+
+// 影子样本运行状态。
+const (
+	LLMExperimentRunRunning   = "running"
+	LLMExperimentRunSuccess   = "success"
+	LLMExperimentRunEmpty     = "empty_picks"
+	LLMExperimentRunOutOfPool = "out_of_pool"
+	LLMExperimentRunFailed    = "failed"
 )
 
 // 实验状态封闭枚举。

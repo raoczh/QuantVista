@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"quantvista/model"
 )
 
 // TestChatCompletionsURL 端点拼接对齐 new-api/OpenAI SDK 惯例：
@@ -13,11 +15,11 @@ import (
 func TestChatCompletionsURL(t *testing.T) {
 	cases := map[string]string{
 		// new-api / one-api 惯例：填根地址
-		"https://api.openai.com":  "https://api.openai.com/v1/chat/completions",
-		"https://my-newapi.com":   "https://my-newapi.com/v1/chat/completions",
-		"https://my-newapi.com/":  "https://my-newapi.com/v1/chat/completions",
-		"http://10.0.0.2:3000":    "http://10.0.0.2:3000/v1/chat/completions",
-		" https://x.com/ ":        "https://x.com/v1/chat/completions", // 首尾空白与斜杠
+		"https://api.openai.com": "https://api.openai.com/v1/chat/completions",
+		"https://my-newapi.com":  "https://my-newapi.com/v1/chat/completions",
+		"https://my-newapi.com/": "https://my-newapi.com/v1/chat/completions",
+		"http://10.0.0.2:3000":   "http://10.0.0.2:3000/v1/chat/completions",
+		" https://x.com/ ":       "https://x.com/v1/chat/completions", // 首尾空白与斜杠
 		// OpenAI SDK 惯例：以 /v1 结尾
 		"https://api.deepseek.com/v1": "https://api.deepseek.com/v1/chat/completions",
 		"https://api.moonshot.cn/v1/": "https://api.moonshot.cn/v1/chat/completions",
@@ -44,7 +46,7 @@ func TestChatCompletion_RootBaseURLAutoV1(t *testing.T) {
 
 	res, err := chatCompletion(context.Background(), chatParams{
 		BaseURL: srv.URL, APIKey: "k", Model: "m",
-		Messages: []chatMessage{{Role: "user", Content: "hi"}},
+		Messages:     []chatMessage{{Role: "user", Content: "hi"}},
 		AllowPrivate: true,
 	})
 	if err != nil {
@@ -69,7 +71,7 @@ func TestChatCompletion_HTMLBodyDiagnostics(t *testing.T) {
 
 	_, err := chatCompletion(context.Background(), chatParams{
 		BaseURL: srv.URL, APIKey: "k", Model: "m",
-		Messages: []chatMessage{{Role: "user", Content: "hi"}},
+		Messages:     []chatMessage{{Role: "user", Content: "hi"}},
 		AllowPrivate: true,
 	})
 	if err == nil {
@@ -95,5 +97,61 @@ func TestBodySnippet(t *testing.T) {
 	got := bodySnippet([]byte(long))
 	if !strings.HasSuffix(got, "…") || len([]rune(got)) != 121 {
 		t.Errorf("超长应按 rune 截断到 120+…，got len=%d", len([]rune(got)))
+	}
+}
+
+func TestPrepareChatCompletionForAcceptedTargetPinsCentralState(t *testing.T) {
+	setContractFlag(t, true)
+	snapshot := llmCallTarget{}
+	target := llmCallTarget{
+		BaseURL: "https://accepted.example/v1", APIKey: "accepted-key", Model: "accepted-model",
+		EndpointType: model.LLMEndpointResponses, Temperature: 0.37, MaxTokens: 4321,
+		AccuracyContract: false, JSONMode: false, TemperatureOmitted: true, MaxCompletionTokens: true,
+		AllowPrivate: true, ConfigID: 77, Provider: "accepted-provider",
+	}
+	prepared := prepareChatCompletionForAcceptedTarget(chatParams{
+		BaseURL: "https://wrong.example", APIKey: "wrong", Model: "wrong", JSONMode: true,
+		Temperature: 0.99, MaxTokens: 1,
+		Messages: []chatMessage{{Role: "system", Content: "业务提示"}, {Role: "user", Content: "问题"}},
+		Meta:     chatMeta{ConfigID: 1, Provider: "wrong", TargetSnapshot: &snapshot},
+	}, target)
+
+	if prepared.BaseURL != target.BaseURL || prepared.APIKey != target.APIKey || prepared.Model != target.Model ||
+		prepared.EndpointType != target.EndpointType || prepared.Temperature != target.Temperature ||
+		prepared.MaxTokens != target.MaxTokens || prepared.Meta.ConfigID != target.ConfigID ||
+		prepared.Meta.Provider != target.Provider || prepared.AllowPrivate != target.AllowPrivate {
+		t.Fatalf("accepted target 应覆盖影子请求全部调用目标字段: %+v", prepared)
+	}
+	if prepared.JSONMode || !prepared.temperatureOmitted() || !prepared.usesMaxCompletionTokens() ||
+		prepared.accuracyContractEnabled() {
+		t.Fatalf("accepted attempt 的能力/契约准备态未固定: json=%v omit_temp=%v max_completion=%v ac=%v",
+			prepared.JSONMode, prepared.temperatureOmitted(), prepared.usesMaxCompletionTokens(), prepared.accuracyContractEnabled())
+	}
+	if len(prepared.Messages) != 2 || strings.Contains(prepared.Messages[0].Content, llmAccuracyContractVersion) {
+		t.Fatalf("全局契约开启不得覆盖 champion 已接受的关闭快照: %+v", prepared.Messages)
+	}
+	if snapshot != target {
+		t.Fatalf("最终准备态快照必须逐值等于 accepted target: got=%+v want=%+v", snapshot, target)
+	}
+}
+
+func TestPrepareChatCompletionForAcceptedTargetKeepsEnabledContract(t *testing.T) {
+	setContractFlag(t, false)
+	snapshot := llmCallTarget{}
+	target := llmCallTarget{
+		BaseURL: "https://accepted.example/v1", APIKey: "accepted-key", Model: "accepted-model",
+		Temperature: llmStructuredTempCap, MaxTokens: 6000,
+		AccuracyContract: true, JSONMode: true, ConfigID: 88, Provider: "accepted-provider",
+	}
+	prepared := prepareChatCompletionForAcceptedTarget(chatParams{
+		Messages: []chatMessage{{Role: "system", Content: "业务提示"}, {Role: "user", Content: "问题"}},
+		Meta:     chatMeta{TargetSnapshot: &snapshot},
+	}, target)
+	if !prepared.accuracyContractEnabled() || len(prepared.Messages) != 2 ||
+		!strings.Contains(prepared.Messages[0].Content, llmAccuracyContractVersion) {
+		t.Fatalf("全局契约关闭不得覆盖 champion 已接受的开启快照: %+v", prepared.Messages)
+	}
+	if snapshot != target {
+		t.Fatalf("开启契约的准备态快照漂移: got=%+v want=%+v", snapshot, target)
 	}
 }

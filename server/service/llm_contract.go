@@ -54,6 +54,12 @@ func applyAccuracyContract(p chatParams) chatParams {
 	// 开关只在公开调用出口读取一次。管理员中途切换只影响下一次调用，不能让已按
 	// ac1 发出的流在响应阶段突然切到兼容路径（或反向误杀旧路径请求）。
 	enabled := setting.LLMAccuracyContract()
+	return applyAccuracyContractSnapshot(p, enabled)
+}
+
+// applyAccuracyContractSnapshot 使用调用组已固化的开关值。score-blind 配对调用借此
+// 与 champion 最终接受 attempt 保持同一中央契约，不受两次调用间管理开关变化影响。
+func applyAccuracyContractSnapshot(p chatParams, enabled bool) chatParams {
 	p.accuracyContract = &enabled
 	if !enabled {
 		return p

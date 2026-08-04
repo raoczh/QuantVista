@@ -1,16 +1,19 @@
 <script setup lang="ts">
 import { computed, h, onMounted, ref } from 'vue'
-import { NButton, NDataTable, NSpin, NTag, useMessage, type DataTableColumns } from 'naive-ui'
+import { NAlert, NButton, NDataTable, NSpin, NTag, useMessage, type DataTableColumns } from 'naive-ui'
 import {
   getSelectionEval,
   type SelectionBatchView,
   type SelectionBatchDiff,
   type SelectionBootstrapCI,
+  type SelectionChallengerEval,
   type SelectionEvalReport,
   type SelectionEvalSection,
+  type LLMExperimentProtocol,
   type SelectionMetric,
   type SelectionPairedRow,
   type SelectionPickView,
+  type SelectionScoreBlindProtocolStatus,
   type SelectionSliceRow,
 } from '@/api/admin'
 import PageContainer from '@/components/PageContainer.vue'
@@ -288,6 +291,61 @@ function planMetrics(sec: SelectionEvalSection): SelectionMetric[] {
   return [sec.plan.fixed_hold, sec.plan.plan_l2]
 }
 
+function promptChallengers(sec: SelectionEvalSection): SelectionChallengerEval[] {
+  return (sec.challengers || []).filter((item) => !item.experiment_type || item.experiment_type === 'prompt')
+}
+
+function scoreBlindExperiments(sec: SelectionEvalSection): SelectionChallengerEval[] {
+  return (sec.challengers || []).filter((item) => item.experiment_type === 'score_blind')
+}
+
+function unknownChallengers(sec: SelectionEvalSection): SelectionChallengerEval[] {
+  return (sec.challengers || []).filter((item) =>
+    !!item.experiment_type && item.experiment_type !== 'prompt' && item.experiment_type !== 'score_blind')
+}
+
+function protocolLockComplete(challenger: SelectionChallengerEval): boolean {
+  return !!challenger.protocol && !!challenger.protocol_hash && challenger.input_schema_version === 'sb1'
+}
+
+function protocolReadinessType(status: SelectionScoreBlindProtocolStatus): 'info' | 'warning' {
+  return status.ready ? 'info' : 'warning'
+}
+
+function protocolGuardrailType(status: SelectionScoreBlindProtocolStatus): 'default' | 'info' | 'success' | 'error' {
+  if (!status.ready) return 'default'
+  if (!status.guardrails_passed) return 'error'
+  return status.multiple_testing_applied ? 'success' : 'info'
+}
+
+function protocolGuardrailLabel(status: SelectionScoreBlindProtocolStatus): string {
+  if (!status.ready) return '数值护栏待评估'
+  if (!status.guardrails_passed) return '数值护栏未通过'
+  return status.multiple_testing_applied ? '协议护栏通过' : '数值护栏通过，显著性未检验'
+}
+
+const MULTIPLE_TESTING_LABEL: Record<string, string> = {
+  holm_bonferroni: 'Holm-Bonferroni',
+  bonferroni: 'Bonferroni',
+  benjamini_hochberg: 'Benjamini-Hochberg',
+}
+
+function multipleTestingLabel(method: string): string {
+  return MULTIPLE_TESTING_LABEL[method] || method || '—'
+}
+
+function protocolSummary(protocol: LLMExperimentProtocol): string {
+  const severeLossDefinition = protocol.severe_loss_definition_pct ?? -5
+  return [
+    `短线 ${protocol.short_horizons.join('/')} 日`,
+    `长线 ${protocol.long_horizons.join('/')} 日`,
+    `最小有效批次 ${protocol.min_effective_batches}`,
+    `覆盖率下降 ≤ ${protocol.max_coverage_drop_pct}%`,
+    `严重亏损率 ≤ ${protocol.max_severe_loss_rate_pct}%（net<${severeLossDefinition}%）`,
+    `多重检验 ${multipleTestingLabel(protocol.multiple_testing_method)}`,
+  ].join(' · ')
+}
+
 function transitionLabel(from: string, to: string): string {
   return `${ACTION_LABEL[from] || from} → ${ACTION_LABEL[to] || to}`
 }
@@ -296,7 +354,7 @@ function transitionLabel(from: string, to: string): string {
 <template>
   <PageContainer
     title="选股配对评估"
-    subtitle="S3-6B：统一 so1 fixed-hold 口径，同批比较 Quant Top-N、AI 最终 picks 与有效 challenger；纯测量，不改变线上推荐或触发 LLM"
+    subtitle="S3-6B/C：so1 fixed-hold 同批配对；Prompt challenger 与 score-blind 输入实验独立分组，重算零 LLM 调用"
   >
     <div class="se-wrap">
       <SectionCard title="评估概览">
@@ -316,7 +374,7 @@ function transitionLabel(from: string, to: string): string {
               <n-tag size="small" type="success" :bordered="false">outcome {{ report.outcome_version }}</n-tag>
               <n-tag size="small" :bordered="false">schema {{ report.schema_version }}</n-tag>
               <n-tag size="small" :bordered="false">ranking {{ report.ranking_version }}</n-tag>
-              <n-tag size="small" :bordered="false">challenger {{ report.challenger_schema_version }}</n-tag>
+              <n-tag size="small" :bordered="false">shadow output {{ report.challenger_schema_version }}</n-tag>
             </div>
 
             <div class="se-coverage-grid">
@@ -351,9 +409,9 @@ function transitionLabel(from: string, to: string): string {
                 </span>
               </div>
               <div class="se-coverage-line">
-                <span class="se-coverage-label">Challenger</span>
+                <span class="se-coverage-label">影子实验</span>
                 <span class="qv-tnum">
-                  runs {{ report.coverage.challenger_runs }} · valid ep1 {{ report.coverage.challenger_valid_runs }} · 无效/不完整
+                  runs {{ report.coverage.challenger_runs }} · valid ep1 输出 {{ report.coverage.challenger_valid_runs }} · 无效/不完整
                   {{ report.coverage.challenger_invalid_runs }} · 零 picks {{ report.coverage.challenger_zero_pick_runs }}
                 </span>
               </div>
@@ -473,12 +531,13 @@ function transitionLabel(from: string, to: string): string {
           </div>
 
           <div class="se-layer">
-            <div class="se-sub">Challenger（valid ep1，原生 K 与 matched-K 分列）</div>
-            <template v-if="sec.challengers?.length">
-              <div v-for="challenger in sec.challengers" :key="challenger.experiment_id" class="se-challenger">
+            <div class="se-sub">Prompt challenger（旧记录缺 experiment_type 时按此兼容）</div>
+            <template v-if="promptChallengers(sec).length">
+              <div v-for="challenger in promptChallengers(sec)" :key="challenger.experiment_id" class="se-challenger">
                 <div class="se-challenger-head">
                   <span class="se-challenger-title">{{ challenger.name }}</span>
                   <n-tag size="small" :bordered="false">实验 #{{ challenger.experiment_id }}</n-tag>
+                  <n-tag size="small" :bordered="false">ep1 输出</n-tag>
                 </div>
                 <div class="se-coverage-inline qv-tnum">
                   runs {{ challenger.coverage.runs }} · 原生 K {{ challenger.coverage.native_k_min }} ~
@@ -508,8 +567,120 @@ function transitionLabel(from: string, to: string): string {
                 </div>
               </div>
             </template>
-            <div v-else class="se-inline-empty">暂无 valid 且逐标的 ep1 JSON 完整的 challenger run。</div>
+            <div v-else class="se-inline-empty">暂无 valid 且逐标的 ep1 JSON 完整的 prompt challenger run。</div>
           </div>
+
+          <div class="se-layer se-score-blind-layer">
+            <div class="se-sub">Score-blind 输入实验</div>
+            <div class="se-shadow-note">
+              <n-tag size="small" type="warning" :bordered="false">纯影子、不影响推荐</n-tag>
+              <span>独立输入实验分组；不属于 prompt challenger 晋级或发布审计路径。</span>
+            </div>
+            <template v-if="scoreBlindExperiments(sec).length">
+              <div v-for="challenger in scoreBlindExperiments(sec)" :key="challenger.experiment_id" class="se-challenger">
+                <div class="se-challenger-head">
+                  <span class="se-challenger-title">{{ challenger.name }}</span>
+                  <n-tag size="small" type="warning" :bordered="false">Score-blind</n-tag>
+                  <n-tag size="small" :bordered="false">{{ challenger.input_schema_version || 'schema 缺失' }} 输入</n-tag>
+                  <n-tag size="small" :bordered="false">ep1 输出</n-tag>
+                  <n-tag size="small" :bordered="false">实验 #{{ challenger.experiment_id }}</n-tag>
+                </div>
+                <div v-if="challenger.protocol" class="se-protocol-block">
+                  <div class="se-protocol-head">
+                    <n-tag size="small" :type="protocolLockComplete(challenger) ? 'info' : 'error'" :bordered="false">
+                      {{ protocolLockComplete(challenger) ? '锁定协议工件完整' : '协议工件不完整' }}
+                    </n-tag>
+                    <span>{{ protocolSummary(challenger.protocol) }}</span>
+                  </div>
+                  <div class="se-protocol-hash qv-mono">protocol hash {{ challenger.protocol_hash || '—' }}</div>
+                </div>
+                <n-alert v-else type="error" :show-icon="false" :bordered="false" class="se-protocol-alert">
+                  锁定评价协议缺失。该 score-blind 分组不得据此形成实验结论。
+                </n-alert>
+                <div v-if="challenger.protocol_status" class="se-protocol-status">
+                  <div class="se-protocol-head">
+                    <n-tag size="small" :type="protocolReadinessType(challenger.protocol_status)" :bordered="false">
+                      {{ challenger.protocol_status.ready ? '达到最小有效批次' : '样本积累中' }}
+                    </n-tag>
+                    <n-tag
+                      size="small"
+                      :type="protocolGuardrailType(challenger.protocol_status)"
+                      :bordered="false"
+                    >
+                      {{ protocolGuardrailLabel(challenger.protocol_status) }}
+                    </n-tag>
+                    <span>
+                      {{ challenger.protocol_status.window_group }} {{ challenger.protocol_status.horizon_days }} 日 ·
+                      有效批次 {{ challenger.protocol_status.effective_batches }}/{{ challenger.protocol_status.min_effective_batches }}
+                    </span>
+                  </div>
+                  <div class="se-protocol-metrics qv-tnum">
+                    覆盖率 champion {{ challenger.protocol_status.champion_coverage_pct.toFixed(2) }}% / score-blind
+                    {{ challenger.protocol_status.score_blind_coverage_pct.toFixed(2) }}% · 下降
+                    {{ challenger.protocol_status.coverage_drop_pct.toFixed(2) }} / 上限
+                    {{ challenger.protocol_status.max_coverage_drop_pct.toFixed(2) }} pt · 严重亏损率
+                    {{ challenger.protocol_status.severe_loss_rate_pct.toFixed(2) }}% / 上限
+                    {{ challenger.protocol_status.max_severe_loss_rate_pct.toFixed(2) }}% ·
+                    预注册 {{ multipleTestingLabel(challenger.protocol_status.multiple_testing_method) }} · 检验族
+                    {{ challenger.protocol_status.multiple_testing_family }} 个窗口 ·
+                    {{ challenger.protocol_status.multiple_testing_applied ? '已执行校正' : '未作显著性检验' }}
+                  </div>
+                  <div v-if="challenger.protocol_status.note" class="se-protocol-note">{{ challenger.protocol_status.note }}</div>
+                </div>
+                <n-alert v-else type="error" :show-icon="false" :bordered="false" class="se-protocol-alert">
+                  协议评估状态缺失。管理员记录的 improved 不是协议通过结论，本页不作正向判定。
+                </n-alert>
+                <div class="se-coverage-inline qv-tnum">
+                  runs {{ challenger.coverage.runs }} · 原生 K {{ challenger.coverage.native_k_min }} ~
+                  {{ challenger.coverage.native_k_max }}（均值 {{ challenger.coverage.native_k_avg.toFixed(2) }}）· 原生可评
+                  {{ challenger.coverage.native_eligible }} · matched-K 可评 {{ challenger.coverage.matched_eligible }} · outcome 剔除
+                  {{ challenger.coverage.outcome_excluded }} · 无 matched 样本 {{ challenger.coverage.zero_matched }}
+                </div>
+                <div class="se-attempt-coverage">
+                  <span>协议终态尝试 {{ challenger.coverage.runs }} 批：</span>
+                  <n-tag size="small" type="error" :bordered="false">调用失败 {{ challenger.coverage.failed_runs }}</n-tag>
+                  <n-tag size="small" type="error" :bordered="false">越池 {{ challenger.coverage.out_of_pool_runs }}</n-tag>
+                  <n-tag size="small" type="warning" :bordered="false">收益指标剔除 {{ challenger.coverage.metric_excluded }}</n-tag>
+                  <span>失败与越池保留在协议覆盖率分母，不进入收益指标。</span>
+                </div>
+                <n-data-table
+                  :columns="metricColumns"
+                  :data="challenger.groups || []"
+                  :row-key="(r: SelectionMetric) => r.group"
+                  size="small"
+                  :scroll-x="1580"
+                />
+                <n-data-table
+                  v-if="comparablePairs(challenger.pairs).length"
+                  class="se-pair-table"
+                  :columns="pairColumns"
+                  :data="comparablePairs(challenger.pairs)"
+                  :row-key="(r: SelectionPairedRow) => r.pair"
+                  size="small"
+                  :scroll-x="1890"
+                />
+                <div v-else class="se-inline-empty">该 score-blind 实验暂无 matched-K 配对批次。</div>
+                <div class="se-notes se-notes-compact">
+                  <div v-for="(note, i) in challenger.notes || []" :key="i">{{ note }}</div>
+                </div>
+              </div>
+            </template>
+            <div v-else class="se-inline-empty">暂无可评估的 score-blind 影子事实。</div>
+          </div>
+
+          <n-alert
+            v-if="unknownChallengers(sec).length"
+            type="error"
+            :show-icon="false"
+            :bordered="false"
+            class="se-unknown-alert"
+          >
+            检测到当前前端不认识的实验类型：
+            <span v-for="(challenger, i) in unknownChallengers(sec)" :key="challenger.experiment_id">
+              {{ i ? '；' : '' }}#{{ challenger.experiment_id }} {{ challenger.experiment_type }}
+            </span>。
+            已 fail-closed：不归入 Prompt challenger 或 Score-blind 分组，也不展示为可采信的配对结论。
+          </n-alert>
 
           <div class="se-layer">
             <div class="se-sub">AI - Quant 分层检查</div>
@@ -631,6 +802,60 @@ function transitionLabel(from: string, to: string): string {
 }
 .se-transition-row {
   margin: 0 0 8px;
+}
+.se-shadow-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  font-size: 12px;
+  opacity: 0.82;
+}
+.se-score-blind-layer {
+  border-top-style: solid;
+}
+.se-protocol-block,
+.se-protocol-status {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--qv-border, rgba(128, 128, 128, 0.28));
+  background: rgba(128, 128, 128, 0.06);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.se-protocol-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  line-height: 1.6;
+}
+.se-protocol-hash,
+.se-protocol-metrics,
+.se-protocol-note {
+  margin-top: 5px;
+  line-height: 1.6;
+}
+.se-protocol-note {
+  opacity: 0.7;
+}
+.se-protocol-alert,
+.se-unknown-alert {
+  margin: 8px 0;
+}
+.se-attempt-coverage {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 8px 0 10px;
+  font-size: 12px;
+  line-height: 1.7;
+}
+.se-unknown-alert {
+  margin-top: 18px;
+  overflow-wrap: anywhere;
 }
 .se-transition-label {
   font-size: 12px;

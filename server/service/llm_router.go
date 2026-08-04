@@ -310,11 +310,8 @@ func applyModelRouting(p chatParams) chatParams {
 	p.BaseURL, p.APIKey = rt.cfg.BaseURL, rt.apiKey
 	p.Model, p.EndpointType = rt.cfg.Model, rt.cfg.EndpointType
 	p.Temperature = rt.cfg.Temperature
-	// 输出预算取严：模块预算/原用户上限已并入 p.MaxTokens，路由配置更小时以路由配置为准
-	//（预算是防超时护栏，路由不得放大它）。
-	if rt.cfg.MaxTokens > 0 && (p.MaxTokens == 0 || rt.cfg.MaxTokens < p.MaxTokens) {
-		p.MaxTokens = rt.cfg.MaxTokens
-	}
+	// MaxTokens 是业务层已经计算完成的本次预算（含 length repair 扩容）。路由只换
+	// 调用目标，不得再用目标配置的默认值压低或放大它。
 	// AllowPrivate 按路由目标配置所有者重判（路由目标恒属启用管理员，llm 回退同款语义）。
 	p.AllowPrivate = llmAllowPrivate(p.AllowPrivate, &rt.cfg)
 	// 审计随目标走：llm_call_logs 逐请求记路由后的真实 config/provider/model。

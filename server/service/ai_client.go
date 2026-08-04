@@ -172,12 +172,18 @@ func (p chatParams) markJSONModeDropped() {
 	if p.Meta.StructuredDropped != nil {
 		*p.Meta.StructuredDropped = true
 	}
+	if p.Meta.TargetSnapshot != nil {
+		p.Meta.TargetSnapshot.JSONMode = false
+	}
 }
 
 // markTemperatureOmitted / temperatureOmitted 温度参数省略观测（nil 安全）。
 func (p chatParams) markTemperatureOmitted() {
 	if p.omitTemperature != nil {
 		*p.omitTemperature = true
+	}
+	if p.Meta.TargetSnapshot != nil {
+		p.Meta.TargetSnapshot.TemperatureOmitted = true
 	}
 }
 
@@ -191,6 +197,9 @@ func (p chatParams) temperatureOmitted() bool {
 func (p chatParams) markMaxCompletionTokens() {
 	if p.maxCompletionTokens != nil {
 		*p.maxCompletionTokens = true
+	}
+	if p.Meta.TargetSnapshot != nil {
+		p.Meta.TargetSnapshot.MaxCompletionTokens = true
 	}
 }
 
@@ -280,11 +289,65 @@ func capModuleTokens(userMax, moduleCap int) int {
 // 若服务端因不支持该字段返回 4xx，则去掉 response_format 重试一次（fallback，靠 prompt 约束 JSON）。
 // EndpointType=responses 时分流到 /v1/responses 适配（ai_client_responses.go），返回语义一致。
 func chatCompletion(ctx context.Context, p chatParams) (res *chatResult, err error) {
-	p = applyModelRouting(p)     // P2-4 模块级模型路由：先换目标，后续契约/能力路由作用于最终目标
+	return chatCompletionPrepared(ctx, prepareChatCompletion(p))
+}
+
+// prepareChatCompletion 固化一次调用在真正发网前的中央变换。需要持久化精确输入的
+// score-blind 影子路径会先调用本函数、落不可变快照，再把同一个 p 交给
+// chatCompletionPrepared；普通调用仍只经 chatCompletion 入口执行一次。
+func prepareChatCompletion(p chatParams) chatParams {
+	p = applyModelRouting(p) // P2-4 模块级模型路由：先换目标，后续契约/能力路由作用于最终目标
+	return prepareChatCompletionAfterRouting(p)
+}
+
+// prepareChatCompletionAfterRouting 用于已由业务配对关系固定目标的调用（score-blind
+// 必须跟随同批 champion 的实际目标）。调用方负责完整填好目标与 Meta，本函数不再查路由。
+func prepareChatCompletionAfterRouting(p chatParams) chatParams {
 	p = applyAccuracyContract(p) // ac1 契约注入+温度钳制在审计之前——RequestBody 记录上游真实收到的形态
 	p = initCallObservers(p)
 	p = applyCapabilityRouting(p) // P0-5 声明化路由：已知不支持的结构化/参数维度直接省略
 	p = applyReasoningTokenField(p)
+	p.snapshotPreparedTarget()
+	return p
+}
+
+// prepareChatCompletionForAcceptedTarget 固定 score-blind 与 champion 被接受 attempt 的
+// 中央准备态；不重新读取 accuracy/capability 开关或能力缓存。
+func prepareChatCompletionForAcceptedTarget(p chatParams, target llmCallTarget) chatParams {
+	p.BaseURL, p.APIKey = target.BaseURL, target.APIKey
+	p.Model, p.EndpointType = target.Model, target.EndpointType
+	p.Temperature, p.MaxTokens = target.Temperature, target.MaxTokens
+	p.JSONMode, p.AllowPrivate = target.JSONMode, target.AllowPrivate
+	p.Meta.ConfigID, p.Meta.Provider = target.ConfigID, target.Provider
+	p = applyAccuracyContractSnapshot(p, target.AccuracyContract)
+	p = initCallObservers(p)
+	if !target.JSONMode {
+		p.markJSONModeDropped()
+	}
+	if target.TemperatureOmitted {
+		p.markTemperatureOmitted()
+	}
+	if target.MaxCompletionTokens {
+		p.markMaxCompletionTokens()
+	}
+	p.snapshotPreparedTarget()
+	return p
+}
+
+func (p chatParams) snapshotPreparedTarget() {
+	if p.Meta.TargetSnapshot == nil {
+		return
+	}
+	*p.Meta.TargetSnapshot = llmCallTarget{
+		BaseURL: p.BaseURL, APIKey: p.APIKey, Model: p.Model, EndpointType: p.EndpointType,
+		Temperature: p.Temperature, MaxTokens: p.MaxTokens,
+		AccuracyContract: p.accuracyContractEnabled(), JSONMode: p.JSONMode,
+		TemperatureOmitted: p.temperatureOmitted(), MaxCompletionTokens: p.usesMaxCompletionTokens(),
+		AllowPrivate: p.AllowPrivate, ConfigID: p.Meta.ConfigID, Provider: p.Meta.Provider,
+	}
+}
+
+func chatCompletionPrepared(ctx context.Context, p chatParams) (res *chatResult, err error) {
 	started := time.Now()
 	streamed := true // 默认先走流式；回落非流式时置 false——审计必须记录实际请求形态而非入口意图
 	defer func() {
@@ -349,6 +412,10 @@ func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error)
 	cacheOn := p.promptCacheKey() != ""
 	res, status, raw, latency, err := doChat(ctx, p, p.JSONMode, cacheOn)
 	if err != nil {
+		if res != nil {
+			res.Usage = usageOrEstimate(p.Messages, res.Content, res.Usage)
+			res.LatencyMs = latency
+		}
 		return res, err
 	}
 	// 参数兼容性 fallback（P0-5 修复批）：4xx 错误明确指向 response_format/temperature
@@ -386,6 +453,10 @@ func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error)
 		}
 		res, status, raw, latency, err = doChat(ctx, p, jsonOn, cacheOn)
 		if err != nil {
+			if res != nil {
+				res.Usage = usageOrEstimate(p.Messages, res.Content, res.Usage)
+				res.LatencyMs = latency
+			}
 			return res, err
 		}
 	}
@@ -397,22 +468,17 @@ func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error)
 	if status != http.StatusOK {
 		return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", status, statusHint(status), extractErr(raw))
 	}
+	res.Usage = usageOrEstimate(p.Messages, res.Content, res.Usage)
+	res.LatencyMs = latency
 	// 完整性门禁（契约开启时）：截断/拦截响应即使带部分内容也拒收——但审计结果（res：
 	// 上游真实正文/usage/原始终态）随错误一并返回，writeLLMCallLog 与 run.record 据此
 	// 保留真实审计（P0-8 修复批 audit outcome）；调用方按 err 判定失败，不消费 res 内容。
 	if rerr := chatFinishReject(p.accuracyContractEnabled(), res.FinishReason, false); rerr != nil {
-		res.LatencyMs = latency
 		return res, rerr
 	}
 	if strings.TrimSpace(res.Content) == "" {
-		res.LatencyMs = latency
 		return res, errors.New("LLM 返回空内容")
 	}
-	// 部分兼容端点不回 usage：按字符粗估兜底（≈2 字符/token），仅作用量审计、不影响次数配额。
-	if res.Usage.TotalTokens == 0 {
-		res.Usage = estimateUsage(p.Messages, res.Content)
-	}
-	res.LatencyMs = latency
 	return res, nil
 }
 
@@ -534,6 +600,7 @@ func parseChatResponse(raw []byte, status int, endpoint string, contractEnabled 
 		reasoning = joinReasoningContent(parsed.Choices[0].Message.ReasoningContent,
 			parsed.Choices[0].Message.Reasoning, embeddedReasoning)
 	}
+	parsed.Usage.fillMissingUsageTotal()
 	res := &chatResult{Content: visible, ReasoningContent: reasoning, Usage: parsed.Usage, FinishReason: finish}
 	// 部分兼容网关把错误包在 HTTP 200 中；error 与 choices 同时出现也必须以 error 为准，
 	// 否则可能把上游明确失败后的占位/半截 choices 当成功。
@@ -745,11 +812,7 @@ func estimateUsage(messages []chatMessage, content string) chatUsage {
 // 建立连接前的错误分类与非流式一致。上游忽略 stream 参数返回整包 JSON 时按非流式解析兼容。
 // EndpointType=responses 时分流到 /v1/responses 适配。
 func chatCompletionStream(ctx context.Context, p chatParams, onDelta func(string)) (res *chatResult, err error) {
-	p = applyModelRouting(p) // P2-4 模块级模型路由：先换目标，后续契约/能力路由作用于最终目标
-	p = applyAccuracyContract(p)
-	p = initCallObservers(p)
-	p = applyCapabilityRouting(p) // P0-5 声明化路由：已知不支持的结构化/参数维度直接省略
-	p = applyReasoningTokenField(p)
+	p = prepareChatCompletion(p)
 	started := time.Now()
 	defer func() {
 		err = classifyLLMError(err)
@@ -934,12 +997,14 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 	contractEnabled := p.accuracyContractEnabled()
 	// partialResult 拒收/中断路径的审计结果（audit outcome）：把已聚合的正文、上游报告的
 	// usage 与原始终态随错误一并带出——writeLLMCallLog 与 run.record 据此保留真实上游
-	// 结果，业务调用方按错误判失败、不消费内容。usage 不做粗估（失败路径只记上游真值）。
+	// 结果，业务调用方按错误判失败、不消费内容。usage 有真实分量时只补 total；响应
+	// 已存在但完全无用量信息时才按同一规则估算。
 	partialResult := func() *chatResult {
 		filterCopy := thinkFilter
 		visibleTail, reasoningTail := filterCopy.Flush()
+		partialUsage := usageOrEstimate(p.Messages, sb.String()+visibleTail, usage)
 		return &chatResult{Content: sb.String() + visibleTail,
-			ReasoningContent: joinReasoningContent(reasoningBuilder.String(), reasoningTail), Usage: usage,
+			ReasoningContent: joinReasoningContent(reasoningBuilder.String(), reasoningTail), Usage: partialUsage,
 			LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs, FinishReason: finishReason}
 	}
 	for sc.Scan() {
@@ -995,6 +1060,10 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 			}
 			continue // 关闭契约时保留旧兼容路径
 		}
+		// 错误事件也可能携带已消耗的真实 usage；先归并事实，再按错误拒收。
+		if chunk.Usage != nil && chunk.Usage.hasReportedUsage() {
+			mergeChatUsage(&usage, *chunk.Usage)
+		}
 		if contractEnabled {
 			if uerr := upstreamLLMError(chunk.Error); uerr != nil {
 				return partialResult(), uerr
@@ -1005,9 +1074,6 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 				return partialResult(), rerr
 			}
 			continue
-		}
-		if chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
-			usage = *chunk.Usage
 		}
 		for _, c := range *chunk.Choices {
 			if contractEnabled && strings.TrimSpace(c.Delta.Refusal) != "" {
@@ -1034,11 +1100,8 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 				armPostFinishDeadline()
 			}
 		}
-		// 已拿到上游真实 usage 即可收尾（覆盖「usage 与 finish_reason 同块」的非标准形态）；
-		// 否则继续在上面的续读窗口内等 usage 专属 chunk。
-		if done && usage.TotalTokens > 0 {
-			break
-		}
+		// finish_reason 后仍继续到 [DONE]、有界事件上限或墙钟闸；已有分量可能只是
+		// partial usage，后续专属块仍可能补 completion/reasoning/cached。
 	}
 	if err := sc.Err(); err != nil && !done {
 		// 流中断且未正常收尾：已有内容也判失败（半截回答不落库，让调用方决定重试）。
@@ -1061,9 +1124,7 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 	if strings.TrimSpace(content) == "" {
 		return partialResult(), errors.New("LLM 返回空内容")
 	}
-	if usage.TotalTokens == 0 {
-		usage = estimateUsage(p.Messages, content)
-	}
+	usage = usageOrEstimate(p.Messages, content, usage)
 	return &chatResult{Content: content, ReasoningContent: strings.TrimSpace(reasoningBuilder.String()), Usage: usage,
 		LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs, FinishReason: finishReason}, nil
 }
@@ -1075,9 +1136,7 @@ func finishStreamResult(p chatParams, content, reasoningContent string, usage ch
 	if strings.TrimSpace(content) == "" {
 		return nil, errors.New("LLM 返回空内容")
 	}
-	if usage.TotalTokens == 0 {
-		usage = estimateUsage(p.Messages, content)
-	}
+	usage = usageOrEstimate(p.Messages, content, usage)
 	if onDelta != nil {
 		onDelta(content)
 	}

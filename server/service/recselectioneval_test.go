@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"math"
 	"reflect"
 	"testing"
@@ -152,6 +153,20 @@ func seedSelectionEvalPlanLabel(t *testing.T, fixture selectionEvalBatchFixture,
 		MfePct: 9, MaePct: -2, MaturityStatus: model.LabelMatured, LabelVersion: labelVersion,
 	}
 	mustCreateSelectionEvalFixture(t, &label)
+}
+
+func scoreBlindEvalInputFact(seed int64, order []string) (string, string) {
+	orderJSON, _ := json.Marshal(order)
+	snapshotJSON, _ := json.Marshal(scoreBlindInputSnapshot{
+		ExperimentType: model.LLMExperimentTypeScoreBlind, InputSchemaVersion: scoreBlindInputSchemaVersion,
+		Seed: seed, CandidateOrder: order, SchemaVersion: "recommendation.v2",
+		Model: "test-model", MaxTokens: 6000,
+		Messages: []chatMessage{
+			{Role: "system", Content: "score-blind frozen"},
+			{Role: "user", Content: "raw factors"},
+		},
+	})
+	return string(snapshotJSON), string(orderJSON)
 }
 
 func selectionEvalSectionFor(t *testing.T, report *SelectionEvalReport,
@@ -441,6 +456,204 @@ func TestSelectionEvalChallengerNativeAndMatchedK(t *testing.T) {
 		!reflect.DeepEqual(chalAI.BatchDiffs[0].RightSymbols, []string{"CHAL_AI"}) ||
 		!reflect.DeepEqual(chalQuant.BatchDiffs[0].RightSymbols, []string{"CHAL_QUANT"}) {
 		t.Fatalf("matched-K 截取顺序不符: ai=%+v quant=%+v", chalAI.BatchDiffs[0], chalQuant.BatchDiffs[0])
+	}
+}
+
+func TestSelectionEvalScoreBlindProtocolIsolatedAndNoLLMOrL2Mutation(t *testing.T) {
+	setupSelectionEvalTestDB(t)
+	created := time.Date(2025, 3, 3, 15, 30, 0, 0, time.Local)
+	fixture := seedSelectionEvalBatch(t, 401, model.RecTypeShortTerm, model.RecStatusSuccess, true,
+		created, []selectionEvalCandidateFixture{
+			{Symbol: "SB_CHAMPION", Rank: 1, Order: 1, Picked: true},
+			{Symbol: "SB_SHADOW", Rank: 2, Order: 2},
+		})
+	seedSelectionEvalOutcome(t, fixture, "SB_CHAMPION", 5, 2, false)
+	seedSelectionEvalOutcome(t, fixture, "SB_SHADOW", 5, -6, false)
+	seedSelectionEvalPlanLabel(t, fixture, fixture.Picks[0], 5, 3)
+
+	protocol, protocolJSON, protocolHash, err := normalizeScoreBlindProtocol(&ScoreBlindEvaluationProtocol{
+		ShortHorizons: []int{5, 10}, LongHorizons: []int{20, 60}, MinEffectiveBatches: 1,
+		MaxCoverageDropPct: 5, MaxSevereLossRatePct: 20, MultipleTestingMethod: "holm_bonferroni",
+	})
+	if err != nil {
+		t.Fatalf("构造 score-blind 协议失败: %v", err)
+	}
+	lockedAt := created.Add(-time.Hour)
+	experiment := model.LLMExperiment{
+		UserID: fixture.Batch.UserID, Module: "recommendation", Name: "score-blind so1",
+		ExperimentType: model.LLMExperimentTypeScoreBlind, InputSchemaVersion: scoreBlindInputSchemaVersion,
+		ProtocolJSON: protocolJSON, ProtocolHash: protocolHash, ProtocolLockedAt: &lockedAt, SampleTarget: 2,
+	}
+	mustCreateSelectionEvalFixture(t, &experiment)
+	order := []string{"SB_CHAMPION", "SB_SHADOW"}
+	inputSnapshot, inputOrder := scoreBlindEvalInputFact(20250804, order)
+	champion := []recPick{{Symbol: "SB_CHAMPION", Action: model.RecActionBuy, Confidence: 70}}
+	challenger := []recPick{{Symbol: "SB_SHADOW", Action: model.RecActionWatch, Confidence: 60}}
+	run := model.LLMExperimentRun{
+		ExperimentID: experiment.ID, UserID: fixture.Batch.UserID, BatchID: fixture.Batch.ID,
+		ExperimentType: model.LLMExperimentTypeScoreBlind, InputSchemaVersion: scoreBlindInputSchemaVersion,
+		RunStatus: model.LLMExperimentRunSuccess, Seed: 20250804,
+		InputHash: llmContentHash(inputSnapshot), InputOrderJSON: inputOrder, InputSnapshotJSON: inputSnapshot,
+		Valid: true, PicksCount: len(challenger), ChampionPicks: len(champion),
+		PickSchemaVersion: llmExperimentPickSchemaVersion,
+		ChampionPicksJSON: marshalLLMExperimentPicks(champion), ChallengerPicksJSON: marshalLLMExperimentPicks(challenger),
+	}
+	mustCreateSelectionEvalFixture(t, &run)
+	broken := run
+	var brokenSnapshot scoreBlindInputSnapshot
+	if err := json.Unmarshal([]byte(inputSnapshot), &brokenSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	brokenSnapshot.Seed++
+	brokenBytes, _ := json.Marshal(brokenSnapshot)
+	broken.InputSnapshotJSON = string(brokenBytes)
+	broken.InputHash = llmContentHash(broken.InputSnapshotJSON)
+	if issue := scoreBlindSelectionInputIssue(broken, map[string]bool{
+		"SB_CHAMPION": true, "SB_SHADOW": true,
+	}); issue != "score_blind_input_snapshot_invalid" {
+		t.Fatalf("快照 seed 与工件脱节必须拒绝，got %q", issue)
+	}
+	for i, terminal := range []string{model.LLMExperimentRunFailed, model.LLMExperimentRunOutOfPool} {
+		symbol := []string{"SB_FAILED", "SB_OUT_OF_POOL"}[i]
+		attemptFixture := seedSelectionEvalBatch(t, fixture.Batch.UserID, model.RecTypeShortTerm,
+			model.RecStatusSuccess, true, created.Add(time.Duration(i+1)*time.Minute),
+			[]selectionEvalCandidateFixture{{Symbol: symbol, Rank: 1, Order: 1, Picked: true}})
+		seedSelectionEvalOutcome(t, attemptFixture, symbol, 5, 1, false)
+		seed := int64(20250805 + i)
+		snapshot, orderJSON := scoreBlindEvalInputFact(seed, []string{symbol})
+		failedRun := model.LLMExperimentRun{
+			ExperimentID: experiment.ID, UserID: attemptFixture.Batch.UserID, BatchID: attemptFixture.Batch.ID,
+			ExperimentType: model.LLMExperimentTypeScoreBlind, InputSchemaVersion: scoreBlindInputSchemaVersion,
+			RunStatus: terminal, Seed: seed, InputHash: llmContentHash(snapshot),
+			InputOrderJSON: orderJSON, InputSnapshotJSON: snapshot,
+			Valid: false, ChampionPicks: 1, PickSchemaVersion: llmExperimentPickSchemaVersion,
+			ChampionPicksJSON: marshalLLMExperimentPicks([]recPick{{
+				Symbol: symbol, Action: model.RecActionBuy, Confidence: 70,
+			}}),
+		}
+		mustCreateSelectionEvalFixture(t, &failedRun)
+	}
+	mustCreateSelectionEvalFixture(t, &model.LLMCallLog{
+		UserID: fixture.Batch.UserID, Module: "selection-score-blind-sentinel", Status: "success",
+	})
+
+	var labelsBefore []model.RecommendationLabel
+	if err := common.DB.Order("id").Find(&labelsBefore).Error; err != nil {
+		t.Fatal(err)
+	}
+	var llmBefore int64
+	if err := common.DB.Model(&model.LLMCallLog{}).Count(&llmBefore).Error; err != nil {
+		t.Fatal(err)
+	}
+	report, err := RunSelectionEval(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("score-blind so1 评估失败: %v", err)
+	}
+	section := selectionEvalSectionFor(t, report, model.RecTypeShortTerm, 5)
+	if len(section.Challengers) != 1 {
+		t.Fatalf("score-blind 应独立形成实验分组: %+v", section.Challengers)
+	}
+	eval := section.Challengers[0]
+	if eval.ExperimentType != model.LLMExperimentTypeScoreBlind ||
+		eval.InputSchemaVersion != scoreBlindInputSchemaVersion || eval.ProtocolHash != protocolHash ||
+		!reflect.DeepEqual(eval.Protocol, protocol) || eval.ProtocolStatus == nil {
+		t.Fatalf("score-blind 类型/锁定协议未进入独立 so1 分组: %+v", eval)
+	}
+	status := eval.ProtocolStatus
+	if eval.Coverage.Runs != 3 || eval.Coverage.MetricExcluded != 2 ||
+		eval.Coverage.FailedRuns != 1 || eval.Coverage.OutOfPoolRuns != 1 ||
+		eval.Coverage.NativeEligible != 1 || eval.Coverage.MatchedEligible != 1 ||
+		eval.Coverage.NativeKMin != 1 || eval.Coverage.NativeKMax != 1 || eval.Coverage.NativeKAvg != 1 {
+		t.Fatalf("失败/越池尝试必须保留在协议分母并排除收益指标: %+v", eval.Coverage)
+	}
+	if status.HorizonDays != 5 || status.WindowGroup != "short" || status.EffectiveBatches != 1 ||
+		status.MinEffectiveBatches != 1 || status.ChampionCoveragePct != 100 ||
+		status.ScoreBlindCoveragePct != 33.33 || status.CoverageDropPct != 66.67 ||
+		status.SevereLossRatePct != 100 || status.MaxSevereLossRatePct != 20 ||
+		status.MultipleTestingMethod != "holm_bonferroni" || status.MultipleTestingFamily != 4 ||
+		status.MultipleTestingApplied || !status.Ready || status.GuardrailsPassed {
+		t.Fatalf("score-blind 预注册协议状态计算不符: %+v", status)
+	}
+
+	var labelsAfter []model.RecommendationLabel
+	if err := common.DB.Order("id").Find(&labelsAfter).Error; err != nil {
+		t.Fatal(err)
+	}
+	var llmAfter int64
+	if err := common.DB.Model(&model.LLMCallLog{}).Count(&llmAfter).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(labelsBefore, labelsAfter) {
+		t.Fatalf("score-blind so1 重算不得改写 l2 标签:\nbefore=%+v\nafter=%+v", labelsBefore, labelsAfter)
+	}
+	if llmAfter != llmBefore {
+		t.Fatalf("score-blind so1 重算不得触发 LLM: before=%d after=%d", llmBefore, llmAfter)
+	}
+}
+
+func TestSelectionEvalScoreBlindProtocolEffectiveBatchesDoNotRequireQuantOutcome(t *testing.T) {
+	setupSelectionEvalTestDB(t)
+	created := time.Date(2025, 3, 4, 15, 30, 0, 0, time.Local)
+	fixture := seedSelectionEvalBatch(t, 402, model.RecTypeShortTerm, model.RecStatusSuccess, true,
+		created, []selectionEvalCandidateFixture{
+			{Symbol: "SB_QUANT_MISSING", Rank: 1, Order: 1},
+			{Symbol: "SB_CHAMPION_READY", Rank: 2, Order: 2, Picked: true},
+			{Symbol: "SB_SHADOW_READY", Rank: 3, Order: 3},
+		})
+	seedSelectionEvalOutcome(t, fixture, "SB_CHAMPION_READY", 5, 2, false)
+	seedSelectionEvalOutcome(t, fixture, "SB_SHADOW_READY", 5, 3, false)
+
+	protocol, protocolJSON, protocolHash, err := normalizeScoreBlindProtocol(&ScoreBlindEvaluationProtocol{
+		ShortHorizons: []int{5, 10}, LongHorizons: []int{20, 60}, MinEffectiveBatches: 1,
+		MaxCoverageDropPct: 5, MaxSevereLossRatePct: 20, MultipleTestingMethod: "holm_bonferroni",
+	})
+	if err != nil {
+		t.Fatalf("构造 score-blind 协议失败: %v", err)
+	}
+	lockedAt := created.Add(-time.Hour)
+	experiment := model.LLMExperiment{
+		UserID: fixture.Batch.UserID, Module: "recommendation", Name: "score-blind quant outcome 缺失",
+		ExperimentType: model.LLMExperimentTypeScoreBlind, InputSchemaVersion: scoreBlindInputSchemaVersion,
+		ProtocolJSON: protocolJSON, ProtocolHash: protocolHash, ProtocolLockedAt: &lockedAt, SampleTarget: 2,
+	}
+	mustCreateSelectionEvalFixture(t, &experiment)
+	order := []string{"SB_QUANT_MISSING", "SB_CHAMPION_READY", "SB_SHADOW_READY"}
+	inputSnapshot, inputOrder := scoreBlindEvalInputFact(20250806, order)
+	champion := []recPick{{Symbol: "SB_CHAMPION_READY", Action: model.RecActionBuy, Confidence: 70}}
+	challenger := []recPick{{Symbol: "SB_SHADOW_READY", Action: model.RecActionWatch, Confidence: 60}}
+	mustCreateSelectionEvalFixture(t, &model.LLMExperimentRun{
+		ExperimentID: experiment.ID, UserID: fixture.Batch.UserID, BatchID: fixture.Batch.ID,
+		ExperimentType: model.LLMExperimentTypeScoreBlind, InputSchemaVersion: scoreBlindInputSchemaVersion,
+		RunStatus: model.LLMExperimentRunSuccess, Seed: 20250806,
+		InputHash: llmContentHash(inputSnapshot), InputOrderJSON: inputOrder, InputSnapshotJSON: inputSnapshot,
+		Valid: true, PicksCount: len(challenger), ChampionPicks: len(champion),
+		PickSchemaVersion: llmExperimentPickSchemaVersion,
+		ChampionPicksJSON: marshalLLMExperimentPicks(champion), ChallengerPicksJSON: marshalLLMExperimentPicks(challenger),
+	})
+
+	report, err := RunSelectionEval(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("score-blind so1 评估失败: %v", err)
+	}
+	section := selectionEvalSectionFor(t, report, model.RecTypeShortTerm, 5)
+	if len(section.Challengers) != 1 {
+		t.Fatalf("score-blind 应形成独立实验分组: %+v", section.Challengers)
+	}
+	eval := section.Challengers[0]
+	if !reflect.DeepEqual(eval.Protocol, protocol) || eval.ProtocolStatus == nil {
+		t.Fatalf("score-blind 协议状态缺失: %+v", eval)
+	}
+	if eval.Coverage.NativeEligible != 1 || eval.Coverage.MatchedEligible != 0 {
+		t.Fatalf("Quant outcome 缺失时应保留原生收益、继续排除三方 matched-K: %+v", eval.Coverage)
+	}
+	if eval.ProtocolStatus.EffectiveBatches != 1 || !eval.ProtocolStatus.Ready ||
+		!eval.ProtocolStatus.GuardrailsPassed {
+		t.Fatalf("协议有效批次只能依赖 score-blind+champion 成熟交集: %+v", eval.ProtocolStatus)
+	}
+	for _, pair := range eval.Pairs {
+		if pair.Batches != 0 {
+			t.Fatalf("Quant outcome 缺失不得改变既有三方共同配对队列: %+v", eval.Pairs)
+		}
 	}
 }
 

@@ -148,6 +148,9 @@ func RunLLMExperimentAudit(ctx context.Context, expID int64) (*model.LLMReleaseA
 	if err := common.DB.First(&exp, expID).Error; err != nil {
 		return nil, errors.New("实验不存在")
 	}
+	if experimentTypeOf(&exp) != model.LLMExperimentTypePrompt {
+		return nil, errors.New("score_blind 是纯影子输入实验，不进入 prompt 发布审计路径")
+	}
 	if exp.Status != model.ExpStatusCompleted {
 		return nil, fmt.Errorf("仅 completed 实验可运行发布审计（当前 %s）", exp.Status)
 	}
@@ -363,6 +366,9 @@ func RollbackLLMExperiment(id int64) (*model.LLMExperiment, error) {
 					return errors.New("实验不存在")
 				}
 				return err
+			}
+			if experimentTypeOf(&exp) != model.LLMExperimentTypePrompt {
+				return errors.New("score_blind 是纯影子输入实验，不进入 prompt 回滚路径")
 			}
 			if exp.Status != model.ExpStatusPromoted {
 				return fmt.Errorf("仅 promoted 实验可回滚（当前 %s）", exp.Status)

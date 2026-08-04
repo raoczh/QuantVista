@@ -24,9 +24,9 @@ const (
 
 type chatMeta struct {
 	CallerUserID int64
-	Module   string
-	ConfigID int64
-	Provider string
+	Module       string
+	ConfigID     int64
+	Provider     string
 
 	// ---- P0-2 调用关联元数据（llm_run.go 的 llmRun.chatMeta 统一构造；直填仅限探针/测试）----
 	TraceID       string
@@ -45,6 +45,9 @@ type chatMeta struct {
 	// RouteApplied P2-4 模型路由观测（llmRun.chatMeta 指向 run 内部字段；applyModelRouting
 	// 命中时回写路由目标与原配置归因，manifest 的 routed 字段消费）。nil 安全跳过。
 	RouteApplied *LLMRouteApplied
+	// TargetSnapshot 只在进程内保存一次 attempt 经路由后的精确调用目标（含 APIKey，
+	// 永不序列化/落库）。score-blind 用已被业务接受的 champion 快照固定同一目标。
+	TargetSnapshot *llmCallTarget
 }
 
 // writeLLMCallLog 落一条调用审计。正文为管理员排障用原文：请求为最终实际发送的完整
@@ -167,7 +170,7 @@ func truncateAuditText(s string, limit int) string {
 
 type LLMCallLogView struct {
 	model.LLMCallLog
-	Username         string `json:"username"`
+	Username          string `json:"username"`
 	FinishAttribution string `json:"finish_attribution"`
 }
 

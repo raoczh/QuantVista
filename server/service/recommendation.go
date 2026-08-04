@@ -43,6 +43,7 @@ const (
 
 	// 异步任务化（2026-07-14）：手动生成立即返回 processing 批次，后台独立 Context 完成后回写。
 	recJobTimeout      = 6 * time.Minute  // 后台生成任务总 deadline（建池+评分 3~8s + LLM 主调/repair/复核）
+	recShadowTimeout   = 2 * time.Minute  // 主批次与 facts 已稳定后独立运行；不得消费主链剩余 deadline
 	recProcessingStale = 15 * time.Minute // processing 批次超过该时长视为死任务（进程重启遗留），惰性判 failed
 
 	// 模块级默认输出预算、截断扩容与 repair 次数统一收口 llm_budget.go。
@@ -717,21 +718,14 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	}
 
 	picks, rejected, usage, latency, callErr := s.callWithRepair(ctx, userID, mainRun, cfg, apiKey, allowPrivate, messages, poolBySymbol, count)
+	mainCallSucceeded := callErr == nil
+	mainUsage, mainLatency := usage, latency
 	// P1-1 输入侧裁剪声明：池内合格候选（kept）只有量化排名前 maxLLMCandidates 只进
 	// LLM 名单（Top-N 是设计行为）——coverage 语义完整性要求如实声明「模型没选它可能
 	// 只是没喂给它」。仅诊断已存在时补填（调用失败无结构输出时 manifest 靠
 	// finish_state/degraded_reason 归因，不造空诊断）。
 	markCoveragePromptTrimmed(mainRun.Coverage, kept, len(llmCands))
 	applyBatchRouteAttribution(batch, mainRun)
-
-	// P2-1 challenger 影子采样（flag 缺省关；best-effort）：主调成功且有该用户的 running
-	// 实验时，同一候选名单只换 challenger 任务段再调一次，输出只落实验表——picks/批次
-	// 零改写（championPicks 传切片副本防越界写）。
-	if callErr == nil {
-		championPicks := append([]recPick(nil), picks...)
-		s.maybeChallengerShadow(ctx, plan, batch, mainRun, latency, usage, championPicks,
-			poolBySymbol, recType, strat, market, count, llmCands, filters, mktCtx)
-	}
 
 	// #11 原始 LLM 动作快照（复核前）：applyReviews 对 reject 会把 p.Action 强制改写为
 	// watch，事件表 RawAction 须记复核前值才能与 PostGateAction 构成门控前后对照。此处
@@ -830,6 +824,12 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		// 供「拒选是否正确」的错失机会/召回评估验证。gates 为名单阶段（相关性/同行业）
 		// 门控；无 buy 故无 regime/bear/quality 影子门控。
 		s.recordBatchFactsWithRetry(batch, pool, nil, nil, rejected, gates, industryBy, nil)
+		if mainCallSucceeded {
+			shadowCtx, cancelShadow := context.WithTimeout(context.Background(), recShadowTimeout)
+			s.maybeChallengerShadow(shadowCtx, plan, batch, mainRun, mainLatency, mainUsage, nil,
+				poolBySymbol, recType, strat, market, count, llmCands, filters, mktCtx)
+			cancelShadow()
+		}
 		return &RecommendationView{RecommendationBatch: *batch, Items: []RecommendationItemView{}}, nil
 	}
 
@@ -928,6 +928,16 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	// 全部成功置 facts_recorded=true；用尽仍失败保持 false 供人工排查（不影响主结果返回）。
 	s.recordBatchFactsWithRetry(batch, pool, items, picks, rejected, gates, industryBy, rawActionBySym)
 
+	// 推荐、复核/反方、业务条目与 so1/l2 事实全部稳定后才运行统一影子实验。
+	// 使用独立 deadline，任何超时/失败仅落实验审计，不能挤占主链 ctx 或回滚业务结果。
+	if mainCallSucceeded {
+		shadowCtx, cancelShadow := context.WithTimeout(context.Background(), recShadowTimeout)
+		championPicks := append([]recPick(nil), picks...)
+		s.maybeChallengerShadow(shadowCtx, plan, batch, mainRun, mainLatency, mainUsage, championPicks,
+			poolBySymbol, recType, strat, market, count, llmCands, filters, mktCtx)
+		cancelShadow()
+	}
+
 	return s.assembleView(*batch, items, nil, nil), nil
 }
 
@@ -980,10 +990,15 @@ func (s *RecommendationService) recordBatchFactsWithRetry(batch *model.Recommend
 		common.SysWarn("批次事实账本落库失败（重试 %d 次仍失败），facts_recorded 保持 false 待人工排查 batch=%d: %v", recFactsRetries, batch.ID, err)
 		return
 	}
-	batch.FactsRecorded = true
-	if uerr := common.DB.Model(batch).Update("facts_recorded", true).Error; uerr != nil {
-		common.SysWarn("批次 facts_recorded 标记回写失败 batch=%d: %v", batch.ID, uerr)
+	result := common.DB.Model(&model.RecommendationBatch{}).Where("id = ?", batch.ID).
+		Update("facts_recorded", true)
+	if result.Error != nil || result.RowsAffected != 1 {
+		batch.FactsRecorded = false
+		common.SysWarn("批次 facts_recorded 标记回写失败 batch=%d rows=%d: %v",
+			batch.ID, result.RowsAffected, result.Error)
+		return
 	}
+	batch.FactsRecorded = true
 }
 
 // applyBuyPositionSizing S1-2 仓位回填（#21）：只对 action=buy 条目算仓位——watch 不参与
@@ -1154,7 +1169,7 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, userID int64
 		symbols := poolSymbolList(pool)
 		convo = appendModuleRepairMessages(convo, "recommendation", res.Content, run.FinishState,
 			"上一条输出不合格："+perr.Error()+
-				"。只能从以下候选池 symbol 中选，严禁使用池外或杜撰的代码：" + symbols +
+				"。只能从以下候选池 symbol 中选，严禁使用池外或杜撰的代码："+symbols+
 				"。请重新输出 JSON：{\"picks\":[...],\"rejected\":[...]}，每个 pick 含 symbol、action、confidence、reason、risks、evidence 等字段，rejected 为池内未入选标的的 {symbol,reason} 落选理由，不要任何解释或代码块标记。")
 	}
 	run.routeApplied = LLMRouteApplied{}
@@ -2523,76 +2538,94 @@ func freezeLLMInputOrder(pool []candidate, cands []candidate) []candidate {
 	return sorted
 }
 
-// compactForLLM 生成喂给 LLM 的候选行（仅入选名单、按 rank 升序、字段紧凑）。
+// compactRawCandidateForLLM 只投影真实候选事实，不包含量化派生锚点。普通推荐与
+// score-blind 共用此实现，防两条路径的行情/因子/财务/资金流字段悄悄漂移。
+func compactRawCandidateForLLM(c candidate) map[string]any {
+	row := map[string]any{
+		"symbol": c.Symbol, "name": c.Name, "price": c.Price, "change_pct": c.ChangePct,
+		"sources": c.Sources,
+	}
+	if c.QuoteAsOf != "" {
+		row["quote_as_of"] = c.QuoteAsOf
+	}
+	if c.Amount > 0 {
+		row["amount_yi"] = round2(c.Amount / 1e8)
+	}
+	if c.TurnoverRate > 0 {
+		row["turnover_rate"] = c.TurnoverRate
+	}
+	if c.VolumeRatio > 0 {
+		row["volume_ratio"] = c.VolumeRatio
+	}
+	if c.FloatCap > 0 {
+		row["float_cap_yi"] = round2(c.FloatCap / 1e8)
+	}
+	if c.PETTM != 0 {
+		row["pe_ttm"] = c.PETTM
+	}
+	if c.PB != 0 {
+		row["pb"] = c.PB
+	}
+	if c.SentiNews > 0 {
+		row["senti_score"] = c.SentiScore
+		row["senti_news"] = c.SentiNews
+	}
+	if c.LhbNetYi != 0 {
+		row["lhb_net_yi"] = c.LhbNetYi
+		if c.LhbReason != "" {
+			row["lhb_reason"] = c.LhbReason
+		}
+	}
+	if c.OrgNetYi != 0 {
+		row["org_net_yi"] = c.OrgNetYi
+		row["org_buys"] = c.OrgBuys
+	}
+	if c.PopRank > 0 {
+		row["pop_rank"] = c.PopRank
+		if c.PopNew {
+			row["pop_new"] = true
+		}
+	}
+	if c.Factors != nil {
+		row["factors"] = c.Factors
+	}
+	if c.FlowStatus != "" {
+		row["flow_status"] = c.FlowStatus
+	}
+	if c.Fin != nil {
+		row["fin"] = c.Fin
+	}
+	if c.FinStatus != "" {
+		row["finance_status"] = c.FinStatus
+	}
+	return row
+}
+
+// compactForLLM 生成 champion 的候选行：真实字段外再附量化派生锚点，并按 rank 排序。
 func compactForLLM(recType string, cands []candidate) []map[string]any {
 	sorted := sortedLLMCandidates(cands)
 	rows := make([]map[string]any, 0, len(sorted))
 	for _, c := range sorted {
-		row := map[string]any{
-			"symbol": c.Symbol, "name": c.Name, "price": c.Price, "change_pct": c.ChangePct,
-			"score": c.Score, "rank": c.Rank, "sources": c.Sources,
-		}
-		if c.QuoteAsOf != "" {
-			row["quote_as_of"] = c.QuoteAsOf // 现价的行情时刻（时效硬门核验过），模型据此声明数据时点
-		}
-		if c.Amount > 0 {
-			row["amount_yi"] = round2(c.Amount / 1e8)
-		}
-		if c.TurnoverRate > 0 {
-			row["turnover_rate"] = c.TurnoverRate
-		}
-		if c.VolumeRatio > 0 {
-			row["volume_ratio"] = c.VolumeRatio
-		}
-		if c.FloatCap > 0 {
-			row["float_cap_yi"] = round2(c.FloatCap / 1e8)
-		}
-		if c.PETTM != 0 {
-			row["pe_ttm"] = c.PETTM
-		}
-		if c.PB != 0 {
-			row["pb"] = c.PB
-		}
-		if c.SentiNews > 0 {
-			row["senti_score"] = c.SentiScore
-			row["senti_news"] = c.SentiNews
-		}
-		// M3a 扩展信号：上过榜/进过人气榜才带字段（缺失=无该信号，prompt 已声明不得臆测）。
-		if c.LhbNetYi != 0 {
-			row["lhb_net_yi"] = c.LhbNetYi
-			if c.LhbReason != "" {
-				row["lhb_reason"] = c.LhbReason
-			}
-		}
-		if c.OrgNetYi != 0 {
-			row["org_net_yi"] = c.OrgNetYi
-			row["org_buys"] = c.OrgBuys
-		}
-		if c.PopRank > 0 {
-			row["pop_rank"] = c.PopRank
-			if c.PopNew {
-				row["pop_new"] = true
-			}
-		}
+		row := compactRawCandidateForLLM(c)
+		row["score"] = c.Score
+		row["rank"] = c.Rank
 		if c.ScoreDims != nil {
 			row["score_dims"] = c.ScoreDims
-		}
-		if c.Factors != nil {
-			row["factors"] = c.Factors
-		}
-		if c.FlowStatus != "" {
-			row["flow_status"] = c.FlowStatus
-		}
-		if c.Fin != nil {
-			row["fin"] = c.Fin
-		}
-		if c.FinStatus != "" {
-			row["finance_status"] = c.FinStatus
 		}
 		if len(c.Bonus) > 0 {
 			row["strategy_notes"] = c.Bonus
 		}
 		rows = append(rows, row)
+	}
+	return rows
+}
+
+// compactScoreBlindForLLM 保持调用方已用 seed 固化的顺序；只保留真实原始事实，
+// 明确不投影 score/rank/score_dims/bonus/strategy_notes。
+func compactScoreBlindForLLM(recType string, cands []candidate) []map[string]any {
+	rows := make([]map[string]any, 0, len(cands))
+	for _, c := range cands {
+		rows = append(rows, compactRawCandidateForLLM(c))
 	}
 	return rows
 }
@@ -2625,16 +2658,38 @@ func composeBatchTitle(recType string, strat *strategyTemplate, filters RecFilte
 // recPrompt 为同步段固化进 recGenPlan 的模板快照（P0-6 修复批：与批次 PromptVersion 同源，
 // 后台不得重新查库读模板）。
 func (s *RecommendationService) buildMessages(recPrompt promptRuntime, recType string, strat *strategyTemplate, market string, count int, llmCands []candidate, filters RecFilters, mktCtx *recMarketContext) []chatMessage {
+	return s.buildRecommendationMessages(recPrompt, recType, strat, market, count, llmCands, filters, mktCtx, false)
+}
+
+// buildScoreBlindMessages 与 champion 共用市场上下文、策略、输出 schema 和真实候选
+// 字段，只剥除量化派生锚点及其排序提示；候选顺序由调用方用 seed 预先固化。
+func (s *RecommendationService) buildScoreBlindMessages(recPrompt promptRuntime, recType string,
+	strat *strategyTemplate, market string, count int, llmCands []candidate, filters RecFilters,
+	mktCtx *recMarketContext) []chatMessage {
+	return s.buildRecommendationMessages(recPrompt, recType, strat, market, count, llmCands, filters, mktCtx, true)
+}
+
+func (s *RecommendationService) buildRecommendationMessages(recPrompt promptRuntime, recType string,
+	strat *strategyTemplate, market string, count int, llmCands []candidate, filters RecFilters,
+	mktCtx *recMarketContext, scoreBlind bool) []chatMessage {
 	var sys strings.Builder
 	// P0-6：module=recommend 的自定义模板是 L3 任务段（替换默认角色定位），铁律契约段
 	// 恒由系统追加不可覆盖（composeCustomTaskPrompt）；反编造另有 parseAndFilterPicks
 	// 程序化兜底。占位符宽容渲染。
 	intro := recRoleIntro
-	if custom, ok := recPrompt.Render(map[string]string{
-		"type": recTypeLabel(recType), "strategy": strat.Name,
-		"market": market, "count": strconv.Itoa(count),
-	}); ok {
-		intro = composeCustomTaskPrompt(custom, recPromptContract)
+	if scoreBlind {
+		// 自定义任务段是自由文本，无法靠有限关键词证明不存在“列表靠前优先”等
+		// 隐式顺序锚。score-blind 因此固定使用中性任务段；策略、市场上下文、
+		// 原始候选事实、输出契约与预算仍沿用同批 champion。
+		intro = scoreBlindRoleIntro
+	} else {
+		custom, customOK := recPrompt.Render(map[string]string{
+			"type": recTypeLabel(recType), "strategy": strat.Name,
+			"market": market, "count": strconv.Itoa(count),
+		})
+		if customOK {
+			intro = composeCustomTaskPrompt(custom, recPromptContract)
+		}
 	}
 	sys.WriteString(intro)
 	sys.WriteString("\n\n")
@@ -2660,12 +2715,26 @@ func (s *RecommendationService) buildMessages(recPrompt promptRuntime, recType s
 		}
 		u.WriteString("\n\n")
 	}
-	fmt.Fprintf(&u, "请从以下【量化初选名单】中，按「%s」策略精选至多 %d 个%s标的。\n", strat.Name, count, recTypeLabel(recType))
-	u.WriteString("名单已按量化综合分（score，0-100）降序排列，rank=1 为最高分。score 由五维技术评分（趋势/动量/位置/量能/风险，score_dims）加策略加分项（strategy_notes）合成，仅有排序意义、不代表预期收益。\n")
-	fmt.Fprintf(&u, "硬性要求：只能从名单里选，symbol 必须与名单完全一致，严禁名单外或虚构的标的；名单中符合策略的合格标的充足时应给足 %d 个，确实不足时宁可少选甚至不选（picks 可为空数组），绝不硬凑。你可以不同意量化排序（例如否决 rank 靠前者），但必须用名单中的数据说明理由。\n", count)
+	listTitle := "量化初选名单"
+	if scoreBlind {
+		listTitle = "候选集合"
+	}
+	fmt.Fprintf(&u, "请从以下【%s】中，按「%s」策略精选至多 %d 个%s标的。\n", listTitle, strat.Name, count, recTypeLabel(recType))
+	if !scoreBlind {
+		u.WriteString("名单已按量化综合分（score，0-100）降序排列，rank=1 为最高分。score 由五维技术评分（趋势/动量/位置/量能/风险，score_dims）加策略加分项（strategy_notes）合成，仅有排序意义、不代表预期收益。\n")
+	}
+	if scoreBlind {
+		fmt.Fprintf(&u, "硬性要求：只能从集合里选，symbol 必须与集合完全一致，严禁集合外或虚构的标的；集合中符合策略的合格标的充足时应给足 %d 个，确实不足时宁可少选甚至不选（picks 可为空数组），绝不硬凑。必须用集合中的数据说明理由。\n", count)
+	} else {
+		fmt.Fprintf(&u, "硬性要求：只能从名单里选，symbol 必须与名单完全一致，严禁名单外或虚构的标的；名单中符合策略的合格标的充足时应给足 %d 个，确实不足时宁可少选甚至不选（picks 可为空数组），绝不硬凑。你可以不同意量化排序（例如否决 rank 靠前者），但必须用名单中的数据说明理由。\n", count)
+	}
 	u.WriteString("同时请在 rejected 数组中，对名单内未入选的标的给出落选理由，只解释名单内标的。\n\n")
-	u.WriteString("【量化初选名单】（JSON；price 现价、change_pct 当日涨跌%、amount_yi 成交额亿元、turnover_rate 换手%、volume_ratio 量比、float_cap_yi 流通市值亿元、pe_ttm 市盈率TTM（负=亏损）、pb 市净率、senti_score 当日新闻聚合情绪分-1~1（senti_news 为条数，字段缺失=当日无相关新闻，不得臆测消息面）；lhb_net_yi 最近一次上龙虎榜的净买额亿元（负=净卖出，lhb_reason 为上榜原因，缺失=近期未上榜）、org_net_yi 机构席位净买额亿元（org_buys 为机构买入次数）、pop_rank 股吧人气榜名次（pop_new=true 新上榜；人气是关注度信号非基本面，高人气也意味着拥挤与情绪退潮风险）；factors：ma5/ma10/ma20/ma60 均线、chg_5d/chg_20d 近5/20日涨跌%、high_20d 创20日新高、bull_align 多头排列、vol_boost 今日量/5日均量、bias_20 MA20乖离%、volatility_20 波动率%、drawdown_20 近20日最大回撤%、pos_60 60日区间位置、rsi_14 RSI(14,Wilder)、macd_dif/macd_dea/macd_hist MACD(12,26,9)（柱=2×(DIF−DEA)）、macd_gold DIF在DEA上方、macd_cross_up 近3日金叉、boll_up/boll_mid/boll_low 布林带(20,2σ)、boll_pos 布林带内位置%、atr_14/atr_pct 真实波幅及其占现价%、chip_profit 获利盘%（收盘价下方筹码占比）、chip_avg_cost 筹码平均成本（chip_bars 为筹码窗口根数，缺失=未计算，不得臆测筹码面）、main_net_days 主力资金连续净流入天数（负=连续净流出，main_net_5d_yi 为近5日主力净额亿元，缺失=资金流数据暂不可得，不得臆测资金面）、盘中因子（intraday_date 为归属交易日的 T-1 盘中形态，缺失=盘中数据暂不可得，不得臆测盘中走势）：tail30_chg 尾盘30分钟涨幅%、tail30_vol_pct 尾盘30分钟量占全天%（均匀线12.5，>20 为尾盘异常放量）、morning_chg 早盘1小时涨幅%、close_vs_vwap 收盘相对全天均价偏离%（正=收在均价上方买方主导）、pm_vwap_up=true 下午均价高于上午（日内重心上移）；fin 财务摘要（长线名单）：roe 加权ROE%、revenue_yoy/net_profit_yoy 营收/净利同比%、gross_margin/net_margin 毛利率/净利率%、debt_ratio 资产负债率%、report 报告期（fin 缺失=财务数据暂不可得，不得臆测）；指标/估值字段缺失表示该数据暂不可得，不得臆测）：\n")
-	if b, err := json.Marshal(compactForLLM(recType, llmCands)); err == nil {
+	fmt.Fprintf(&u, "【%s】（JSON；price 现价、change_pct 当日涨跌%%、amount_yi 成交额亿元、turnover_rate 换手%%、volume_ratio 量比、float_cap_yi 流通市值亿元、pe_ttm 市盈率TTM（负=亏损）、pb 市净率、senti_score 当日新闻聚合情绪分-1~1（senti_news 为条数，字段缺失=当日无相关新闻，不得臆测消息面）；lhb_net_yi 最近一次上龙虎榜的净买额亿元（负=净卖出，lhb_reason 为上榜原因，缺失=近期未上榜）、org_net_yi 机构席位净买额亿元（org_buys 为机构买入次数）、pop_rank 股吧人气榜名次（pop_new=true 新上榜；人气是关注度信号非基本面，高人气也意味着拥挤与情绪退潮风险）；factors：ma5/ma10/ma20/ma60 均线、chg_5d/chg_20d 近5/20日涨跌%%、high_20d 创20日新高、bull_align 多头排列、vol_boost 今日量/5日均量、bias_20 MA20乖离%%、volatility_20 波动率%%、drawdown_20 近20日最大回撤%%、pos_60 60日区间位置、rsi_14 RSI(14,Wilder)、macd_dif/macd_dea/macd_hist MACD(12,26,9)（柱=2×(DIF−DEA)）、macd_gold DIF在DEA上方、macd_cross_up 近3日金叉、boll_up/boll_mid/boll_low 布林带(20,2σ)、boll_pos 布林带内位置%%、atr_14/atr_pct 真实波幅及其占现价%%、chip_profit 获利盘%%（收盘价下方筹码占比）、chip_avg_cost 筹码平均成本（chip_bars 为筹码窗口根数，缺失=未计算，不得臆测筹码面）、main_net_days 主力资金连续净流入天数（负=连续净流出，main_net_5d_yi 为近5日主力净额亿元，缺失=资金流数据暂不可得，不得臆测资金面）、盘中因子（intraday_date 为归属交易日的 T-1 盘中形态，缺失=盘中数据暂不可得，不得臆测盘中走势）：tail30_chg 尾盘30分钟涨幅%%、tail30_vol_pct 尾盘30分钟量占全天%%（均匀线12.5，>20 为尾盘异常放量）、morning_chg 早盘1小时涨幅%%、close_vs_vwap 收盘相对全天均价偏离%%（正=收在均价上方买方主导）、pm_vwap_up=true 下午均价高于上午（日内重心上移）；fin 财务摘要（长线名单）：roe 加权ROE%%、revenue_yoy/net_profit_yoy 营收/净利同比%%、gross_margin/net_margin 毛利率/净利率%%、debt_ratio 资产负债率%%、report 报告期（fin 缺失=财务数据暂不可得，不得臆测）；指标/估值字段缺失表示该数据暂不可得，不得臆测）：\n", listTitle)
+	compact := compactForLLM(recType, llmCands)
+	if scoreBlind {
+		compact = compactScoreBlindForLLM(recType, llmCands)
+	}
+	if b, err := json.Marshal(compact); err == nil {
 		u.Write(b)
 	}
 	u.WriteString("\n\n请只输出 JSON：{\"picks\":[...],\"rejected\":[{\"symbol\":\"...\",\"reason\":\"落选理由\"}]}。")
@@ -2675,6 +2744,18 @@ func (s *RecommendationService) buildMessages(recPrompt promptRuntime, recType s
 		{Role: "user", Content: u.String()},
 	}
 }
+
+const scoreBlindRoleTaskSeg = `你是一名严谨的证券研究员，服务于个人投资研究工具。系统已确定本次候选集合并提供同一时点的真实数据，你的任务是独立精选、解读与否决。你的输出仅供研究参考，不构成任何投资建议或买卖指令。`
+
+const scoreBlindPromptContract = `铁律：
+1. 只能从【候选集合】中挑选，symbol 必须与集合完全一致；严禁推荐集合外标的或杜撰任何代码/数据。
+2. 只依据候选集合与市场环境中给出的数据分析。禁止使用你记忆中关于任何公司的信息——名气、行业地位、历史印象、新闻记忆都不算数据，只看本次给出的数字。数据不足处如实说明局限，不臆测未提供的财务/消息。
+3. 每个标的必须给出：理由(reason)、风险(risks)、数据依据(evidence)。evidence 每条都要引用具体字段名与数值（如「换手率6.3%、量比2.1 温和放量」「bias_20=+4.2% 未超买」）。系统会程序化核对你引用的数字，与数据不符的证据会被标记出来展示给用户。
+4. 宁缺毋滥但不无故少给：集合中符合策略且证据充分的标的足够时，应给足要求的数量；证据不足或与策略不符时明确不选，picks 可以少于要求数量甚至为空。不得为凑满数量而降低证据标准；对勉强符合策略的边际标的，用 action="watch" 并如实给低 confidence，而不是凑成 buy。落选与入选都要有数据依据。
+5. 集合内未入选的标的，在 rejected 数组中给出落选理由（{"symbol","reason"}）。
+6. 全程简体中文。只输出一个 JSON 对象 {"picks":[...],"rejected":[...]}，不要任何解释文字或 Markdown 代码块标记。`
+
+const scoreBlindRoleIntro = scoreBlindRoleTaskSeg + "\n\n" + scoreBlindPromptContract
 
 // recRoleTaskSeg 推荐角色任务段（L3）：module=recommend 自定义模板替换的部分——
 // 角色定位与任务重点。P0-6 起自定义不再整段替换，铁律段恒由系统追加。

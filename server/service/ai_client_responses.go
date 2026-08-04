@@ -80,18 +80,24 @@ func marshalResponsesPayload(p chatParams, jsonMode, stream, promptCache bool) [
 
 // responses 响应体（文本子集）。usage 字段名与 chat 不同（input/output_tokens）。
 type responsesUsage struct {
-	InputTokens             int                `json:"input_tokens"`
-	OutputTokens            int                `json:"output_tokens"`
-	TotalTokens             int                `json:"total_tokens"`
-	InputTokensDetails      inputTokenDetails  `json:"input_tokens_details"`
-	PromptTokensDetails     inputTokenDetails  `json:"prompt_tokens_details"`
-	OutputTokensDetails     outputTokenDetails `json:"output_tokens_details"`
-	CompletionTokenDetails  outputTokenDetails `json:"completion_tokens_details"`
-	PromptCacheHitTokens    int                `json:"prompt_cache_hit_tokens"`
-	CachedTokensCompat      int                `json:"cached_tokens"`
+	InputTokens            int                `json:"input_tokens"`
+	OutputTokens           int                `json:"output_tokens"`
+	TotalTokens            int                `json:"total_tokens"`
+	InputTokensDetails     inputTokenDetails  `json:"input_tokens_details"`
+	PromptTokensDetails    inputTokenDetails  `json:"prompt_tokens_details"`
+	OutputTokensDetails    outputTokenDetails `json:"output_tokens_details"`
+	CompletionTokenDetails outputTokenDetails `json:"completion_tokens_details"`
+	PromptCacheHitTokens   int                `json:"prompt_cache_hit_tokens"`
+	CachedTokensCompat     int                `json:"cached_tokens"`
 }
 
 func (u responsesUsage) toChatUsage() chatUsage {
+	usage := u.toChatUsageRaw()
+	usage.fillMissingUsageTotal()
+	return usage
+}
+
+func (u responsesUsage) toChatUsageRaw() chatUsage {
 	return chatUsage{
 		PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens,
 		ReasoningTokens: maxInt(u.OutputTokensDetails.ReasoningTokens, u.CompletionTokenDetails.ReasoningTokens),
@@ -188,6 +194,10 @@ func responsesCompletion(ctx context.Context, p chatParams) (*chatResult, error)
 	cacheOn := p.promptCacheKey() != ""
 	res, status, raw, latency, err := doResponses(ctx, p, p.JSONMode, cacheOn)
 	if err != nil {
+		if res != nil {
+			res.Usage = usageOrEstimate(p.Messages, res.Content, res.Usage)
+			res.LatencyMs = latency
+		}
 		return res, err
 	}
 	jsonOn := p.JSONMode
@@ -215,6 +225,10 @@ func responsesCompletion(ctx context.Context, p chatParams) (*chatResult, error)
 		}
 		res, status, raw, latency, err = doResponses(ctx, p, jsonOn, cacheOn)
 		if err != nil {
+			if res != nil {
+				res.Usage = usageOrEstimate(p.Messages, res.Content, res.Usage)
+				res.LatencyMs = latency
+			}
 			return res, err
 		}
 	}
@@ -226,14 +240,11 @@ func responsesCompletion(ctx context.Context, p chatParams) (*chatResult, error)
 	if status != http.StatusOK {
 		return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", status, statusHint(status), extractErr(raw))
 	}
+	res.Usage = usageOrEstimate(p.Messages, res.Content, res.Usage)
+	res.LatencyMs = latency
 	if strings.TrimSpace(res.Content) == "" {
-		res.LatencyMs = latency
 		return res, errors.New("LLM 返回空内容")
 	}
-	if res.Usage.TotalTokens == 0 {
-		res.Usage = estimateUsage(p.Messages, res.Content)
-	}
-	res.LatencyMs = latency
 	return res, nil
 }
 
@@ -307,7 +318,7 @@ func parseResponsesBody(raw []byte, status int, endpoint string, contractEnabled
 	visible, embeddedReasoning := splitThinkContent(rawContent)
 	res := &chatResult{Content: visible,
 		ReasoningContent: joinReasoningContent(extractResponsesReasoning(parsed.Output), embeddedReasoning),
-		FinishReason: parsed.Status}
+		FinishReason:     parsed.Status}
 	if parsed.Usage != nil {
 		res.Usage = parsed.Usage.toChatUsage()
 	}
@@ -501,8 +512,9 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	partialResult := func() *chatResult {
 		filterCopy := thinkFilter
 		visibleTail, reasoningTail := filterCopy.Flush()
+		partialUsage := usageOrEstimate(p.Messages, sb.String()+visibleTail, usage)
 		return &chatResult{Content: sb.String() + visibleTail,
-			ReasoningContent: joinReasoningContent(reasoningBuilder.String(), reasoningTail), Usage: usage,
+			ReasoningContent: joinReasoningContent(reasoningBuilder.String(), reasoningTail), Usage: partialUsage,
 			LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs, FinishReason: doneStatus}
 	}
 	for sc.Scan() {
@@ -539,6 +551,10 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 				return partialResult(), rerr
 			}
 			continue // 关闭契约时保留旧兼容路径
+		}
+		// 失败/错误终态同样可能携带已消耗用量；先收集，再进入拒收分支。
+		if ev.Response != nil && ev.Response.Usage != nil {
+			mergeChatUsage(&usage, ev.Response.Usage.toChatUsageRaw())
 		}
 		if contractEnabled {
 			if uerr := upstreamLLMError(ev.Error); uerr != nil {
@@ -579,9 +595,6 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 			if ev.Response != nil {
 				// 先记录事实（status/usage）再做拒收判定：拒收路径的审计结果也要带真实终态。
 				doneStatus = ev.Response.Status
-				if ev.Response.Usage != nil {
-					usage = ev.Response.Usage.toChatUsage()
-				}
 				if reasoningBuilder.Len() == 0 {
 					reasoningBuilder.WriteString(extractResponsesReasoning(ev.Response.Output))
 				}
@@ -612,9 +625,6 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 			terminalEvent = ev.Type
 			if ev.Response != nil {
 				doneStatus = ev.Response.Status
-				if ev.Response.Usage != nil {
-					usage = ev.Response.Usage.toChatUsage()
-				}
 				if reasoningBuilder.Len() == 0 {
 					reasoningBuilder.WriteString(extractResponsesReasoning(ev.Response.Output))
 				}
@@ -684,9 +694,7 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	if strings.TrimSpace(content) == "" {
 		return partialResult(), errors.New("LLM 返回空内容")
 	}
-	if usage.TotalTokens == 0 {
-		usage = estimateUsage(p.Messages, content)
-	}
+	usage = usageOrEstimate(p.Messages, content, usage)
 	return &chatResult{Content: content, ReasoningContent: strings.TrimSpace(reasoningBuilder.String()), Usage: usage,
 		LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs, FinishReason: doneStatus}, nil
 }

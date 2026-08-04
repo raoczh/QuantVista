@@ -344,10 +344,10 @@ func SetLLMReflectionShadow(v bool) error {
 	return nil
 }
 
-// LLMChallenger P2-1 challenger 影子采样开关（缺省关：额外 LLM 成本须显式启用）。
+// LLMChallenger P2-1/S3-6C 统一推荐影子实验开关（缺省关：额外 LLM 成本须显式启用）。
 func LLMChallenger() bool { mu.RLock(); defer mu.RUnlock(); return llmChallenger }
 
-// SetLLMChallenger 设置 P2-1 challenger 影子采样开关。
+// SetLLMChallenger 设置统一推荐影子实验采样开关。
 func SetLLMChallenger(v bool) error {
 	if err := model.UpsertOption(keyLLMChallenger, strconv.FormatBool(v)); err != nil {
 		return err

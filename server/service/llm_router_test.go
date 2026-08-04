@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -103,7 +104,7 @@ func TestApplyModelRoutingFlagAndScope(t *testing.T) {
 }
 
 // TestApplyModelRoutingSwapsTarget 命中换目标：连接参数/审计 meta/RouteApplied 观测/
-// 预算取严/AllowPrivate 重判；experiment 恒跟随 recommendation 路由（单变量）。
+// 业务预算不变/AllowPrivate 重判；experiment 恒跟随 recommendation 路由（单变量）。
 func TestApplyModelRoutingSwapsTarget(t *testing.T) {
 	setModelRoutingFlag(t, true)
 	cleanRouteTables(t)
@@ -124,8 +125,8 @@ func TestApplyModelRoutingSwapsTarget(t *testing.T) {
 	if p.Temperature != 0.3 {
 		t.Fatalf("温度应取路由配置: %v", p.Temperature)
 	}
-	if p.MaxTokens != 1200 {
-		t.Fatalf("预算应取严（路由配置 1200 < 原 2500）: %d", p.MaxTokens)
+	if p.MaxTokens != 2500 {
+		t.Fatalf("路由不得改写已计算的业务预算（目标配置默认值为 1200）: %d", p.MaxTokens)
 	}
 	if !p.AllowPrivate {
 		t.Fatal("路由目标属管理员应放行内网")
@@ -145,7 +146,7 @@ func TestApplyModelRoutingSwapsTarget(t *testing.T) {
 		t.Fatalf("manifest 应带 routed 声明: %+v", m.Routed)
 	}
 
-	// 预算不放大：原 MaxTokens 更小时保留原值。
+	// 业务预算小于目标配置默认值时同样逐值保留。
 	p2 := routeTestParams("qa")
 	p2.MaxTokens = 800
 	if p2 = applyModelRouting(p2); p2.MaxTokens != 800 {
@@ -427,6 +428,71 @@ func TestModelRoutingEndToEndAudit(t *testing.T) {
 	}
 	if !run.routeApplied.Applied || run.routeApplied.FromConfigID != 999 {
 		t.Fatalf("run 级路由观测不符: %+v", run.routeApplied)
+	}
+}
+
+// TestModelRoutingPreservesLengthRepairBudget 端到端验证路由只换目标：业务首轮预算
+// 2000 必须原样发送，length repair 的 1.5 倍扩容必须实际发送为 3000，均不得被
+// 路由目标配置自身的 MaxTokens=1200 二次压低。
+func TestModelRoutingPreservesLengthRepairBudget(t *testing.T) {
+	setModelRoutingFlag(t, true)
+	cleanRouteTables(t)
+	if err := setting.SetLLMAccuracyContract(true); err != nil {
+		t.Fatalf("开启准确性契约: %v", err)
+	}
+	t.Cleanup(func() { _ = setting.SetLLMAccuracyContract(true) })
+
+	var routedCalls, origCalls atomic.Int64
+	var firstBudget, repairBudget atomic.Int64
+	routedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := routedCalls.Add(1)
+		var body struct {
+			MaxTokens int `json:"max_tokens"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("解析路由请求体: %v", err)
+		}
+		if call == 1 {
+			firstBudget.Store(int64(body.MaxTokens))
+		} else {
+			repairBudget.Store(int64(body.MaxTokens))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"partial\":true}"},"finish_reason":"length"}],"usage":{"prompt_tokens":5,"completion_tokens":5,"total_tokens":10}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":6,"completion_tokens":4,"total_tokens":10}}`))
+	}))
+	defer routedSrv.Close()
+	origSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		origCalls.Add(1)
+		http.Error(w, "原目标不应收到请求", http.StatusInternalServerError)
+	}))
+	defer origSrv.Close()
+
+	targetCfg := seedRouteAdminConfig(t, routedSrv.URL) // 目标配置 MaxTokens=1200
+	if _, err := UpsertLLMRoute(LLMRouteInput{Module: "analysis", ConfigID: targetCfg.ID, Enabled: true}); err != nil {
+		t.Fatalf("建 analysis 路由: %v", err)
+	}
+	origCfg := &model.LLMConfig{ID: 999, Provider: "orig-prov", BaseURL: origSrv.URL,
+		Model: "orig-model", MaxTokens: 2000}
+	run := newLLMRun("t-route-length-repair", "", "analysis", "analysis.v1", "p1")
+	parse := func(raw string) error {
+		var value map[string]any
+		return json.Unmarshal([]byte(raw), &value)
+	}
+	_, _, _, err := (&AnalysisService{}).callWithRepair(context.Background(), 1, run, origCfg,
+		"sk-orig", true, []chatMessage{{Role: "user", Content: "分析"}}, parse, analysisRepairHint)
+	if err != nil {
+		t.Fatalf("length repair 应成功: %v", err)
+	}
+	if routedCalls.Load() != 2 || origCalls.Load() != 0 {
+		t.Fatalf("两轮都应只请求路由目标: routed=%d orig=%d", routedCalls.Load(), origCalls.Load())
+	}
+	if firstBudget.Load() != 2000 || repairBudget.Load() != 3000 {
+		t.Fatalf("业务预算/repair 扩容不得被目标配置压低: first=%d repair=%d",
+			firstBudget.Load(), repairBudget.Load())
 	}
 }
 

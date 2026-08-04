@@ -188,6 +188,9 @@ type SelectionSliceGroup struct {
 
 type SelectionChallengerCoverage struct {
 	Runs            int     `json:"runs"`
+	MetricExcluded  int     `json:"metric_excluded"`
+	FailedRuns      int     `json:"failed_runs"`
+	OutOfPoolRuns   int     `json:"out_of_pool_runs"`
 	NativeKMin      int     `json:"native_k_min"`
 	NativeKMax      int     `json:"native_k_max"`
 	NativeKAvg      float64 `json:"native_k_avg"`
@@ -197,13 +200,37 @@ type SelectionChallengerCoverage struct {
 	ZeroMatched     int     `json:"zero_matched"`
 }
 
+type SelectionScoreBlindProtocolStatus struct {
+	HorizonDays            int     `json:"horizon_days"`
+	WindowGroup            string  `json:"window_group"`
+	EffectiveBatches       int     `json:"effective_batches"`
+	MinEffectiveBatches    int     `json:"min_effective_batches"`
+	ChampionCoveragePct    float64 `json:"champion_coverage_pct"`
+	ScoreBlindCoveragePct  float64 `json:"score_blind_coverage_pct"`
+	CoverageDropPct        float64 `json:"coverage_drop_pct"`
+	MaxCoverageDropPct     float64 `json:"max_coverage_drop_pct"`
+	SevereLossRatePct      float64 `json:"severe_loss_rate_pct"`
+	MaxSevereLossRatePct   float64 `json:"max_severe_loss_rate_pct"`
+	MultipleTestingMethod  string  `json:"multiple_testing_method"`
+	MultipleTestingFamily  int     `json:"multiple_testing_family"`
+	MultipleTestingApplied bool    `json:"multiple_testing_applied"`
+	Ready                  bool    `json:"ready"`
+	GuardrailsPassed       bool    `json:"guardrails_passed"`
+	Note                   string  `json:"note"`
+}
+
 type SelectionChallengerEval struct {
-	ExperimentID int64                       `json:"experiment_id"`
-	Name         string                      `json:"name"`
-	Coverage     SelectionChallengerCoverage `json:"coverage"`
-	Groups       []SelectionMetric           `json:"groups"`
-	Pairs        []SelectionPairedRow        `json:"pairs"`
-	Notes        []string                    `json:"notes"`
+	ExperimentID       int64                              `json:"experiment_id"`
+	Name               string                             `json:"name"`
+	ExperimentType     string                             `json:"experiment_type"`
+	InputSchemaVersion string                             `json:"input_schema_version,omitempty"`
+	Protocol           *ScoreBlindEvaluationProtocol      `json:"protocol,omitempty"`
+	ProtocolHash       string                             `json:"protocol_hash,omitempty"`
+	ProtocolStatus     *SelectionScoreBlindProtocolStatus `json:"protocol_status,omitempty"`
+	Coverage           SelectionChallengerCoverage        `json:"coverage"`
+	Groups             []SelectionMetric                  `json:"groups"`
+	Pairs              []SelectionPairedRow               `json:"pairs"`
+	Notes              []string                           `json:"notes"`
 }
 
 type SelectionEvalSection struct {
@@ -312,10 +339,15 @@ type selectionChallengerFact struct {
 }
 
 type selectionChallengerRun struct {
-	Run        model.LLMExperimentRun
-	Name       string
-	Challenger []selectionChallengerFact
-	Issue      string
+	Run                model.LLMExperimentRun
+	Name               string
+	ExperimentType     string
+	InputSchemaVersion string
+	Protocol           *ScoreBlindEvaluationProtocol
+	ProtocolHash       string
+	ProtocolAttempt    bool
+	Challenger         []selectionChallengerFact
+	Issue              string
 }
 
 type selectionPlanLabelEntry struct {
@@ -443,7 +475,7 @@ func buildSelectionEvalReport(batches []selectionBatchFacts, now time.Time) (*Se
 		"so1 是独立 fixed-hold 测量事实：next_open、统一费税、T+1/可成交规则、固定 5/10/20/60 交易日，不读取 TP/SL；l2 计划标签未被改写",
 		fmt.Sprintf("主 selection 指标只纳入 facts_recorded=true、排名/输入顺序完整（观测版本 %s）、success、AI picks>0 且两组结果全部成熟非 forced 的批次；degraded、旧行、pending/forced/no_data/skipped 分列", rep.RankingVersion),
 		"组级收益按标的汇总；所有比较差先在每批内计算，再以批次为重采样单位做固定 seed paired bootstrap，避免把同批多只股票当独立样本",
-		"challenger 仅纳入 valid+ep1 且两份逐标的 JSON 完整的 run，并按 experiment_id 分开；matched-K=min(AI N, challenger 原生 K)，不补造标的",
+		"prompt 影子指标仅纳入 valid+ep1 且两份逐标的 JSON 完整的 run；score-blind 协议覆盖率纳入通过 sb1 seed/order/精确输入 hash 校验的全部成功、空选、失败与越池终态，失败/越池只进分母不进收益指标；两类按实验类型与 experiment_id 独立分组，matched-K 不补造标的",
 		fmt.Sprintf("策略/regime/provider·model/prompt 分层至少 %d 个可比批次才评估，否则明确标记不确定", selectionSliceMinBatches),
 		"本报表计算路径不调用 LLM，不改推荐、prompt、权重、门控或模型路由",
 	}
@@ -487,6 +519,44 @@ func parseSelectionPickFacts(raw string, want int, allowed map[string]bool) ([]s
 	return out, nil
 }
 
+func scoreBlindSelectionInputIssue(run model.LLMExperimentRun, allowed map[string]bool) string {
+	if run.ExperimentType != model.LLMExperimentTypeScoreBlind ||
+		run.InputSchemaVersion != scoreBlindInputSchemaVersion || run.Seed <= 0 {
+		return "missing_score_blind_input_identity"
+	}
+	if strings.TrimSpace(run.InputSnapshotJSON) == "" ||
+		llmContentHash(run.InputSnapshotJSON) != run.InputHash {
+		return "score_blind_input_hash_mismatch"
+	}
+	var snapshot scoreBlindInputSnapshot
+	if err := json.Unmarshal([]byte(run.InputSnapshotJSON), &snapshot); err != nil ||
+		snapshot.ExperimentType != model.LLMExperimentTypeScoreBlind ||
+		snapshot.InputSchemaVersion != scoreBlindInputSchemaVersion ||
+		snapshot.Seed != run.Seed || snapshot.SchemaVersion != "recommendation.v2" ||
+		strings.TrimSpace(snapshot.Model) == "" || snapshot.MaxTokens <= 0 ||
+		len(snapshot.Messages) == 0 {
+		return "score_blind_input_snapshot_invalid"
+	}
+	var order []string
+	if err := json.Unmarshal([]byte(run.InputOrderJSON), &order); err != nil || len(order) != len(allowed) {
+		return "score_blind_input_order_invalid"
+	}
+	if len(snapshot.CandidateOrder) != len(order) {
+		return "score_blind_input_snapshot_mismatch"
+	}
+	seen := make(map[string]bool, len(order))
+	for i, symbol := range order {
+		if !allowed[symbol] || seen[symbol] {
+			return "score_blind_candidate_set_mismatch"
+		}
+		if snapshot.CandidateOrder[i] != symbol {
+			return "score_blind_input_snapshot_mismatch"
+		}
+		seen[symbol] = true
+	}
+	return ""
+}
+
 func loadSelectionChallengerRuns(facts map[int64]*selectionBatchFacts,
 	coverage *SelectionEvalCoverage) ([]selectionChallengerRun, error) {
 	var runs []model.LLMExperimentRun
@@ -495,12 +565,33 @@ func loadSelectionChallengerRuns(facts map[int64]*selectionBatchFacts,
 	}
 	coverage.ChallengerRuns = len(runs)
 	var experiments []model.LLMExperiment
-	if err := common.DB.Select("id", "name").Find(&experiments).Error; err != nil {
+	if err := common.DB.Select("id", "name", "experiment_type", "input_schema_version",
+		"protocol_json", "protocol_hash", "protocol_locked_at", "sample_target").Find(&experiments).Error; err != nil {
 		return nil, err
 	}
-	nameByID := map[int64]string{}
+	type experimentMeta struct {
+		Name               string
+		ExperimentType     string
+		InputSchemaVersion string
+		ProtocolValid      bool
+		Protocol           *ScoreBlindEvaluationProtocol
+		ProtocolHash       string
+	}
+	metaByID := map[int64]experimentMeta{}
 	for _, exp := range experiments {
-		nameByID[exp.ID] = exp.Name
+		typ := experimentTypeOf(&exp)
+		meta := experimentMeta{Name: exp.Name, ExperimentType: typ,
+			InputSchemaVersion: exp.InputSchemaVersion, ProtocolValid: true}
+		if typ == model.LLMExperimentTypeScoreBlind {
+			meta.ProtocolValid = validateScoreBlindProtocol(&exp, true) == nil
+			if meta.ProtocolValid {
+				var protocol ScoreBlindEvaluationProtocol
+				if json.Unmarshal([]byte(exp.ProtocolJSON), &protocol) == nil {
+					meta.Protocol, meta.ProtocolHash = &protocol, exp.ProtocolHash
+				}
+			}
+		}
+		metaByID[exp.ID] = meta
 	}
 	dups := map[string]int{}
 	for _, run := range runs {
@@ -508,12 +599,44 @@ func loadSelectionChallengerRuns(facts map[int64]*selectionBatchFacts,
 	}
 	out := make([]selectionChallengerRun, 0, len(runs))
 	for _, run := range runs {
-		cr := selectionChallengerRun{Run: run, Name: nameByID[run.ExperimentID]}
+		meta, experimentOK := metaByID[run.ExperimentID]
+		cr := selectionChallengerRun{Run: run, Name: meta.Name,
+			ExperimentType: meta.ExperimentType, InputSchemaVersion: meta.InputSchemaVersion,
+			Protocol: meta.Protocol, ProtocolHash: meta.ProtocolHash}
 		bf := facts[run.BatchID]
-		if dups[int64Key(run.ExperimentID)+":"+int64Key(run.BatchID)] != 1 {
+		// score-blind 协议覆盖率必须消费所有可信终态尝试，不能只看 Valid 成功行。
+		// failed/out_of_pool 仍进入分母但不进入收益指标；running 和输入工件损坏行不进入。
+		if experimentOK && dups[int64Key(run.ExperimentID)+":"+int64Key(run.BatchID)] == 1 &&
+			meta.ExperimentType == model.LLMExperimentTypeScoreBlind && meta.ProtocolValid &&
+			meta.InputSchemaVersion == scoreBlindInputSchemaVersion && bf != nil && bf.Issue == "" &&
+			(bf.Batch.Status == model.RecStatusSuccess || bf.Batch.Status == model.RecStatusDegraded) &&
+			(run.RunStatus == model.LLMExperimentRunSuccess || run.RunStatus == model.LLMExperimentRunEmpty ||
+				run.RunStatus == model.LLMExperimentRunOutOfPool || run.RunStatus == model.LLMExperimentRunFailed) &&
+			run.UserID == bf.Batch.UserID {
+			allowed := make(map[string]bool, len(bf.Opportunity))
+			for _, ev := range bf.Opportunity {
+				allowed[ev.Symbol] = true
+			}
+			cr.ProtocolAttempt = scoreBlindSelectionInputIssue(run, allowed) == ""
+		}
+		if !experimentOK {
+			cr.Issue = "experiment_missing"
+		} else if meta.ExperimentType != model.LLMExperimentTypePrompt &&
+			meta.ExperimentType != model.LLMExperimentTypeScoreBlind {
+			cr.Issue = "experiment_type_invalid"
+		} else if dups[int64Key(run.ExperimentID)+":"+int64Key(run.BatchID)] != 1 {
 			cr.Issue = "duplicate_experiment_batch_run"
 		} else if !run.Valid || run.PickSchemaVersion != llmExperimentPickSchemaVersion {
 			cr.Issue = "invalid_or_old_schema"
+		} else if run.RunStatus != "" && run.RunStatus != model.LLMExperimentRunSuccess &&
+			run.RunStatus != model.LLMExperimentRunEmpty {
+			cr.Issue = "unfinished_or_failed_run"
+		} else if meta.ExperimentType == model.LLMExperimentTypePrompt &&
+			run.ExperimentType != "" && run.ExperimentType != model.LLMExperimentTypePrompt {
+			cr.Issue = "experiment_type_mismatch"
+		} else if meta.ExperimentType == model.LLMExperimentTypeScoreBlind &&
+			(!meta.ProtocolValid || meta.InputSchemaVersion != scoreBlindInputSchemaVersion) {
+			cr.Issue = "score_blind_protocol_or_schema_invalid"
 		} else if bf == nil || bf.Issue != "" || bf.Batch.Status != model.RecStatusSuccess ||
 			run.UserID != bf.Batch.UserID {
 			cr.Issue = "batch_not_comparable"
@@ -522,9 +645,14 @@ func loadSelectionChallengerRuns(facts map[int64]*selectionBatchFacts,
 			for _, ev := range bf.Opportunity {
 				allowed[ev.Symbol] = true
 			}
+			if meta.ExperimentType == model.LLMExperimentTypeScoreBlind {
+				cr.Issue = scoreBlindSelectionInputIssue(run, allowed)
+			}
 			champ, champErr := parseSelectionPickFacts(run.ChampionPicksJSON, run.ChampionPicks, allowed)
 			chal, chalErr := parseSelectionPickFacts(run.ChallengerPicksJSON, run.PicksCount, allowed)
-			if champErr != nil || chalErr != nil || len(champ) != len(bf.Picks) {
+			if cr.Issue != "" {
+				// 输入工件无效时仍完成读取，但绝不进入配对指标。
+			} else if champErr != nil || chalErr != nil || len(champ) != len(bf.Picks) {
 				cr.Issue = "incomplete_pick_json"
 			} else {
 				for i := range champ {
@@ -565,10 +693,15 @@ func buildSelectionSection(recType string, horizon int, batches []selectionBatch
 	batchFacts := map[int64]selectionBatchFacts{}
 
 	for _, bf := range batches {
-		if bf.Batch.Type != recType || bf.Issue != "" || bf.Batch.Status != model.RecStatusSuccess {
+		if bf.Batch.Type != recType || bf.Issue != "" {
 			continue
 		}
+		// Challenger 子面板需要读取 score-blind 的 degraded/空 champion 终态；
+		// 主 selection 指标仍只纳入 success，维持既有评估口径。
 		batchFacts[bf.Batch.ID] = bf
+		if bf.Batch.Status != model.RecStatusSuccess {
+			continue
+		}
 		pickBySymbol := map[string]model.Recommendation{}
 		for _, pick := range bf.Picks {
 			pickBySymbol[pick.Symbol] = pick
@@ -1063,7 +1196,11 @@ func buildSelectionChallengerEvals(recType string, horizon int,
 	byExperiment := map[int64][]selectionChallengerRun{}
 	for _, run := range runs {
 		bf, ok := batchFacts[run.Run.BatchID]
-		if run.Issue == "" && ok && bf.Batch.Type == recType {
+		include := run.Issue == ""
+		if run.ExperimentType == model.LLMExperimentTypeScoreBlind {
+			include = run.ProtocolAttempt
+		}
+		if include && ok && bf.Batch.Type == recType {
 			byExperiment[run.Run.ExperimentID] = append(byExperiment[run.Run.ExperimentID], run)
 		}
 	}
@@ -1075,25 +1212,43 @@ func buildSelectionChallengerEvals(recType string, horizon int,
 	out := make([]SelectionChallengerEval, 0, len(ids))
 	for _, expID := range ids {
 		list := byExperiment[expID]
-		ev := SelectionChallengerEval{ExperimentID: expID, Name: list[0].Name}
+		ev := SelectionChallengerEval{ExperimentID: expID, Name: list[0].Name,
+			ExperimentType: list[0].ExperimentType, InputSchemaVersion: list[0].InputSchemaVersion,
+			Protocol: list[0].Protocol, ProtocolHash: list[0].ProtocolHash}
 		if ev.Name == "" {
 			ev.Name = "实验 #" + int64Key(expID)
 		}
 		var nativeObs, matchedObs, aiObs, quantObs []selectionObs
 		var chalAIDiffs, chalQuantDiffs []SelectionBatchDiff
 		selectedNative, selectedMatched, selectedAI, selectedQuant := 0, 0, 0, 0
-		nativeKTotal := 0
+		nativeKTotal, nativeMetricRuns, championEligible, protocolEffectiveBatches := 0, 0, 0, 0
 		for _, run := range list {
 			bf := batchFacts[run.Run.BatchID]
 			ev.Coverage.Runs++
+			championSymbols := recommendationSymbols(bf.Picks)
+			if len(championSymbols) > 0 &&
+				selectionOutcomeSetIssue(outcomes, bf.Batch.ID, championSymbols, horizon) == "" {
+				championEligible++
+			}
+			if run.Issue != "" {
+				ev.Coverage.MetricExcluded++
+				switch run.Run.RunStatus {
+				case model.LLMExperimentRunFailed:
+					ev.Coverage.FailedRuns++
+				case model.LLMExperimentRunOutOfPool:
+					ev.Coverage.OutOfPoolRuns++
+				}
+				continue
+			}
 			kNative := len(run.Challenger)
 			nativeKTotal += kNative
-			if ev.Coverage.Runs == 1 || kNative < ev.Coverage.NativeKMin {
+			if nativeMetricRuns == 0 || kNative < ev.Coverage.NativeKMin {
 				ev.Coverage.NativeKMin = kNative
 			}
 			if kNative > ev.Coverage.NativeKMax {
 				ev.Coverage.NativeKMax = kNative
 			}
+			nativeMetricRuns++
 			if kNative == 0 {
 				ev.Coverage.ZeroMatched++
 				continue
@@ -1128,6 +1283,12 @@ func buildSelectionChallengerEvals(recType string, horizon int,
 			selectedMatched += matchedK
 			selectedAI += matchedK
 			selectedQuant += matchedK
+			if run.ExperimentType == model.LLMExperimentTypeScoreBlind {
+				protocolSymbols := append(append([]string{}, matchedSymbols...), aiSymbols...)
+				if selectionOutcomeSetIssue(outcomes, bf.Batch.ID, protocolSymbols, horizon) == "" {
+					protocolEffectiveBatches++
+				}
+			}
 			union := append(append(append([]string{}, matchedSymbols...), aiSymbols...), quantSymbols...)
 			matchedReason := selectionOutcomeSetIssue(outcomes, bf.Batch.ID, union, horizon)
 			if matchedReason != "" {
@@ -1149,8 +1310,8 @@ func buildSelectionChallengerEvals(recType string, horizon int,
 				ev.Coverage.OutcomeExcluded++
 			}
 		}
-		if ev.Coverage.Runs > 0 {
-			ev.Coverage.NativeKAvg = round2(float64(nativeKTotal) / float64(ev.Coverage.Runs))
+		if nativeMetricRuns > 0 {
+			ev.Coverage.NativeKAvg = round2(float64(nativeKTotal) / float64(nativeMetricRuns))
 		}
 		ev.Groups = []SelectionMetric{
 			makeSelectionMetric("challenger_native", "Challenger 原生 K", selectedNative, nativeObs),
@@ -1169,9 +1330,57 @@ func buildSelectionChallengerEvals(recType string, horizon int,
 			"原生 K 保留 challenger 实际选择性；matched-K=min(AI N, challenger K)，AI 按最终顺序、Quant 按 score_rank、challenger 按 ep1 order 截取",
 			"不同 experiment_id 不混池；K=0 只计拒选，不产生收益样本",
 		}
+		if ev.ExperimentType == model.LLMExperimentTypeScoreBlind && ev.Protocol != nil {
+			championCoverage, scoreBlindCoverage := 0.0, 0.0
+			if ev.Coverage.Runs > 0 {
+				championCoverage = round2(float64(championEligible) / float64(ev.Coverage.Runs) * 100)
+				scoreBlindCoverage = round2(float64(ev.Coverage.NativeEligible) / float64(ev.Coverage.Runs) * 100)
+			}
+			coverageDrop := round2(championCoverage - scoreBlindCoverage)
+			if coverageDrop < 0 {
+				coverageDrop = 0
+			}
+			severeLossRate := selectionEvalMetricForGroup(ev.Groups, "challenger_native").SevereLossPct
+			windowGroup := "long"
+			if recType == model.RecTypeShortTerm {
+				windowGroup = "short"
+			}
+			status := &SelectionScoreBlindProtocolStatus{
+				HorizonDays: horizon, WindowGroup: windowGroup,
+				EffectiveBatches:    protocolEffectiveBatches,
+				MinEffectiveBatches: ev.Protocol.MinEffectiveBatches,
+				ChampionCoveragePct: championCoverage, ScoreBlindCoveragePct: scoreBlindCoverage,
+				CoverageDropPct: coverageDrop, MaxCoverageDropPct: ev.Protocol.MaxCoverageDropPct,
+				SevereLossRatePct: severeLossRate, MaxSevereLossRatePct: ev.Protocol.MaxSevereLossRatePct,
+				MultipleTestingMethod: ev.Protocol.MultipleTestingMethod, MultipleTestingFamily: 4,
+				MultipleTestingApplied: false,
+			}
+			status.Ready = status.EffectiveBatches >= status.MinEffectiveBatches
+			status.GuardrailsPassed = status.Ready &&
+				status.CoverageDropPct <= status.MaxCoverageDropPct &&
+				status.SevereLossRatePct <= status.MaxSevereLossRatePct
+			if status.Ready {
+				status.Note = "已达到预注册最小有效批次；覆盖率与严重亏损率按锁定阈值判定。多重检验方法已预注册，但当前报表不生成 p 值，不作显著性结论"
+			} else {
+				status.Note = "尚未达到预注册最小有效批次，不作实验结论。多重检验方法已预注册，但当前报表不生成 p 值，不作显著性结论"
+			}
+			ev.ProtocolStatus = status
+			ev.Notes = append(ev.Notes,
+				"score-blind 为纯影子输入实验；协议状态只消费 so1 固化事实，不触发 LLM，也不自动晋级或改写 l2",
+				"覆盖率门槛按有效批次占该实验有效 run 的比例比较；最小有效批次数按 challenger 与 champion 的 matched-K 成熟交集计算")
+		}
 		out = append(out, ev)
 	}
 	return out
+}
+
+func selectionEvalMetricForGroup(metrics []SelectionMetric, group string) SelectionMetric {
+	for _, metric := range metrics {
+		if metric.Group == group {
+			return metric
+		}
+	}
+	return SelectionMetric{}
 }
 
 func challengerSymbols(facts []selectionChallengerFact) []string {

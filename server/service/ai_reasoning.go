@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/json"
 	"strings"
+	"unicode"
 )
 
 // 推理/思考侧适配（对标 new-api relaykit 的请求转换与响应归一实践）：
@@ -57,6 +58,54 @@ func maxInt(values ...int) int {
 		}
 	}
 	return max
+}
+
+// hasReportedUsage 判断上游是否提供了任何真实用量。reasoning/cached 是
+// completion/prompt 的分量，也足以证明 usage 并非缺失。
+func (u chatUsage) hasReportedUsage() bool {
+	return u.TotalTokens > 0 || u.PromptTokens > 0 || u.CompletionTokens > 0 ||
+		u.ReasoningTokens > 0 || u.CachedTokens > 0
+}
+
+// fillMissingUsageTotal 只补上游缺失的 total。cached/reasoning 分别是 prompt/completion
+// 的子分量：父分量存在时以父分量为准，父分量缺失时才用对应子分量补已知下界。
+func (u *chatUsage) fillMissingUsageTotal() {
+	if u == nil || u.TotalTokens > 0 {
+		return
+	}
+	promptTokens := u.PromptTokens
+	if promptTokens == 0 {
+		promptTokens = u.CachedTokens
+	}
+	completionTokens := u.CompletionTokens
+	if completionTokens == 0 {
+		completionTokens = u.ReasoningTokens
+	}
+	u.TotalTokens = promptTokens + completionTokens
+}
+
+// mergeChatUsage 合并流式分块里可能拆开的 usage。各块常是累计快照或分别携带部分
+// 字段，因此逐字段取大而不累计。上游非零 total 是真实事实，合并阶段只在真实
+// total 之间取大；等所有块收齐后再由 fillMissingUsageTotal 补“始终为零”的 total。
+func mergeChatUsage(dst *chatUsage, src chatUsage) {
+	if dst == nil {
+		return
+	}
+	dst.PromptTokens = maxInt(dst.PromptTokens, src.PromptTokens)
+	dst.CompletionTokens = maxInt(dst.CompletionTokens, src.CompletionTokens)
+	dst.ReasoningTokens = maxInt(dst.ReasoningTokens, src.ReasoningTokens)
+	dst.CachedTokens = maxInt(dst.CachedTokens, src.CachedTokens)
+	dst.TotalTokens = maxInt(dst.TotalTokens, src.TotalTokens)
+}
+
+// usageOrEstimate 统一 Chat/Responses、流式/非流式的成功收尾语义：有任何上游
+// 真值就逐项保留并只补 total；确实完全没有 usage 时才做字符估算。
+func usageOrEstimate(messages []chatMessage, content string, usage chatUsage) chatUsage {
+	if !usage.hasReportedUsage() {
+		return estimateUsage(messages, content)
+	}
+	usage.fillMissingUsageTotal()
+	return usage
 }
 
 func addChatUsage(dst *chatUsage, src chatUsage) {
@@ -121,66 +170,78 @@ func joinReasoningContent(parts ...string) string {
 	return strings.Join(nonEmpty, "\n")
 }
 
-// thinkStreamFilter 能跨 SSE chunk 分离 <think>...</think>。未闭合标签后的剩余文本在
-// Flush 时仍归 reasoning，不能误当业务正文交给 extractJSONObject 或前端。
+// thinkStreamFilter 只分离首个非空白位置开始、且完整闭合的 provider think 块。
+// 在确认闭合前必须暂存原文：未闭合时 Flush 将整段按 visible 原样返回；一旦确认
+// 开头不是 think 块，后续 chunk 全部直通，正文或 JSON 中的字面标签不会被误删。
 type thinkStreamFilter struct {
-	pending string
-	inThink bool
+	pending  string
+	resolved bool
 }
 
 func (f *thinkStreamFilter) Push(chunk string) (visible, reasoning string) {
+	if f.resolved {
+		return chunk, ""
+	}
 	f.pending += chunk
-	var visibleBuilder, reasoningBuilder strings.Builder
-	for f.pending != "" {
-		tag := "<think>"
-		if f.inThink {
-			tag = "</think>"
-		}
-		lower := strings.ToLower(f.pending)
-		if idx := strings.Index(lower, tag); idx >= 0 {
-			f.writePart(&visibleBuilder, &reasoningBuilder, f.pending[:idx])
-			f.pending = f.pending[idx+len(tag):]
-			f.inThink = !f.inThink
-			continue
-		}
-		keep := longestTagPrefixSuffix(lower, tag)
-		emitLen := len(f.pending) - keep
-		f.writePart(&visibleBuilder, &reasoningBuilder, f.pending[:emitLen])
-		f.pending = f.pending[emitLen:]
-		break
+	trimmed := strings.TrimLeftFunc(f.pending, unicode.IsSpace)
+	if trimmed == "" {
+		return "", ""
 	}
-	return visibleBuilder.String(), reasoningBuilder.String()
-}
 
-func (f *thinkStreamFilter) Flush() (visible, reasoning string) {
-	if f.inThink {
-		reasoning = f.pending
-	} else {
-		visible = f.pending
+	const openTag = "<think>"
+	if len(trimmed) < len(openTag) {
+		if strings.EqualFold(trimmed, openTag[:len(trimmed)]) {
+			return "", ""
+		}
+		return f.resolveVisible(), ""
 	}
+	if !strings.EqualFold(trimmed[:len(openTag)], openTag) {
+		return f.resolveVisible(), ""
+	}
+
+	const closeTag = "</think>"
+	body := trimmed[len(openTag):]
+	closeAt := indexASCIIFold(body, closeTag)
+	if closeAt < 0 {
+		return "", ""
+	}
+	leadingLen := len(f.pending) - len(trimmed)
+	visible = f.pending[:leadingLen] + body[closeAt+len(closeTag):]
+	reasoning = body[:closeAt]
 	f.pending = ""
+	f.resolved = true
 	return visible, reasoning
 }
 
-func (f *thinkStreamFilter) writePart(visible, reasoning *strings.Builder, part string) {
-	if f.inThink {
-		reasoning.WriteString(part)
-	} else {
-		visible.WriteString(part)
+func (f *thinkStreamFilter) Flush() (visible, reasoning string) {
+	if !f.resolved {
+		visible = f.resolveVisible()
 	}
+	return visible, ""
 }
 
-func longestTagPrefixSuffix(value, tag string) int {
-	max := len(tag) - 1
-	if len(value) < max {
-		max = len(value)
-	}
-	for size := max; size > 0; size-- {
-		if strings.HasSuffix(value, tag[:size]) {
-			return size
+func (f *thinkStreamFilter) resolveVisible() string {
+	visible := f.pending
+	f.pending = ""
+	f.resolved = true
+	return visible
+}
+
+// indexASCIIFold 返回 ASCII 标签的大小写不敏感字节位置。不能先 ToLower 整段文本再
+// 用索引切原文：Unicode 大小写映射可能改变 UTF-8 字节长度，导致切片位置漂移。
+func indexASCIIFold(value, tag string) int {
+	for offset := 0; offset < len(value); {
+		next := strings.IndexByte(value[offset:], tag[0])
+		if next < 0 {
+			return -1
 		}
+		next += offset
+		if len(value)-next >= len(tag) && strings.EqualFold(value[next:next+len(tag)], tag) {
+			return next
+		}
+		offset = next + 1
 	}
-	return 0
+	return -1
 }
 
 func splitThinkContent(content string) (visible, reasoning string) {

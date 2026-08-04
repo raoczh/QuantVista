@@ -505,6 +505,9 @@ export interface SelectionSliceGroup {
 
 export interface SelectionChallengerCoverage {
   runs: number
+  metric_excluded: number
+  failed_runs: number
+  out_of_pool_runs: number
   native_k_min: number
   native_k_max: number
   native_k_avg: number
@@ -514,9 +517,34 @@ export interface SelectionChallengerCoverage {
   zero_matched: number
 }
 
+export interface SelectionScoreBlindProtocolStatus {
+  horizon_days: number
+  window_group: string
+  effective_batches: number
+  min_effective_batches: number
+  champion_coverage_pct: number
+  score_blind_coverage_pct: number
+  coverage_drop_pct: number
+  max_coverage_drop_pct: number
+  severe_loss_rate_pct: number
+  max_severe_loss_rate_pct: number
+  multiple_testing_method: string
+  multiple_testing_family: number
+  multiple_testing_applied: boolean
+  ready: boolean
+  guardrails_passed: boolean
+  note: string
+}
+
 export interface SelectionChallengerEval {
   experiment_id: number
   name: string
+  /** 旧 ep1 记录没有该字段时按 prompt 兼容。 */
+  experiment_type?: LLMExperimentTypeValue
+  input_schema_version?: string
+  protocol?: LLMExperimentProtocol
+  protocol_hash?: string
+  protocol_status?: SelectionScoreBlindProtocolStatus
   coverage: SelectionChallengerCoverage
   groups: SelectionMetric[] | null
   pairs: SelectionPairedRow[] | null
@@ -803,11 +831,33 @@ export function getLLMRoles() {
   return request<LLMRolesResponse>({ url: '/admin/llm-roles' })
 }
 
-// ---------- P2-1/P2-2 champion/challenger prompt 实验 ----------
+// ---------- P2-1/P2-2 prompt challenger + S3-6C score-blind 输入实验 ----------
+
+export type LLMExperimentType = 'prompt' | 'score_blind'
+
+// 服务端历史行可以缺类型，未来版本也可能返回当前前端尚不认识的类型。读取模型保留
+// 未知字符串，页面必须显式 fail-closed；创建接口仍只接受上面的已知类型联合。
+export type LLMExperimentTypeValue = LLMExperimentType | (string & {})
+
+export interface LLMExperimentProtocol {
+  short_horizons: number[]
+  long_horizons: number[]
+  min_effective_batches: number
+  max_coverage_drop_pct: number
+  max_severe_loss_rate_pct: number
+  multiple_testing_method: string
+  severe_loss_definition_pct?: number
+}
 
 export interface LLMExperiment {
   id: number
   user_id: number
+  /** 旧记录为空/缺失时按 prompt 读取。 */
+  experiment_type?: LLMExperimentTypeValue
+  input_schema_version?: string
+  protocol_json?: string
+  protocol_hash?: string
+  protocol_locked_at?: string
   module: string
   prompt_module: string
   name: string
@@ -817,6 +867,7 @@ export interface LLMExperiment {
   challenger_hash: string
   champion_version: string
   champion_hash: string
+  champion_custom: boolean
   status: 'draft' | 'running' | 'completed' | 'promoted' | 'abandoned' | 'rolled_back'
   sample_target: number
   sample_count: number
@@ -839,10 +890,18 @@ export interface LLMExperiment {
 export interface LLMExperimentRun {
   id: number
   experiment_id: number
+  /** 旧 ep1 记录为空/缺失时按 prompt 读取。 */
+  experiment_type?: LLMExperimentTypeValue
+  input_schema_version?: string
   batch_id: number
   trace_id: string
   champion_run_id: string
+  seed?: number
+  input_hash?: string
+  input_order_json?: string
+  run_status?: string
   valid: boolean
+  pick_schema_version?: string
   picks_count: number
   champion_picks: number
   overlap_count: number
@@ -872,10 +931,13 @@ export interface LLMExperimentActual {
 
 export interface LLMExperimentInput {
   module: string
+  experiment_type?: LLMExperimentType
   name: string
   hypothesis: string
   expected_improvement: string
-  challenger_content: string
+  challenger_content?: string
+  /** score-blind 启动前必填并在创建时锁定；prompt 实验不传。 */
+  protocol?: LLMExperimentProtocol
   sample_target?: number
   parent_id?: number
 }

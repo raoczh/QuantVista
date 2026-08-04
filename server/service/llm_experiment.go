@@ -2,9 +2,13 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
+	"sort"
 	"strings"
 	"time"
 
@@ -56,6 +60,12 @@ const (
 	// llmExperimentPickSchemaVersion 是逐标的 champion/challenger 事实 JSON 口径。
 	// 字段或归一化语义变化时递增；旧 run 空值表示无法恢复历史名单。
 	llmExperimentPickSchemaVersion = "ep1"
+	// scoreBlindInputSchemaVersion 是 recommendation 输入剥锚契约。字段、提示词净化
+	// 或顺序/hash 语义变化时必须递增；输出逐标的事实仍复用 ep1。
+	scoreBlindInputSchemaVersion = "sb1"
+	// 上游推荐任务 deadline 为 6 分钟；超过此窗口的 running 占位视为进程中断遗留，
+	// 新采样可清理，避免永久占满实验 target。
+	llmExperimentRunClaimTTL = 15 * time.Minute
 )
 
 // llmExperimentSupportedModules 业务模块 → prompt 模块（PromptTemplate.module）。
@@ -255,13 +265,125 @@ func (e *experimentBaselineStaleError) Error() string {
 
 // LLMExperimentInput 创建入参。
 type LLMExperimentInput struct {
-	Module              string `json:"module"`
-	Name                string `json:"name"`
-	Hypothesis          string `json:"hypothesis"`
-	ExpectedImprovement string `json:"expected_improvement"`
-	ChallengerContent   string `json:"challenger_content"`
-	SampleTarget        int    `json:"sample_target"`
-	ParentID            int64  `json:"parent_id"`
+	Module              string                        `json:"module"`
+	ExperimentType      string                        `json:"experiment_type"`
+	Name                string                        `json:"name"`
+	Hypothesis          string                        `json:"hypothesis"`
+	ExpectedImprovement string                        `json:"expected_improvement"`
+	ChallengerContent   string                        `json:"challenger_content"`
+	SampleTarget        int                           `json:"sample_target"`
+	ParentID            int64                         `json:"parent_id"`
+	Protocol            *ScoreBlindEvaluationProtocol `json:"protocol"`
+}
+
+// ScoreBlindEvaluationProtocol 是启动前必须预注册并锁定的收益评价协议。严重亏损
+// 定义沿用 so1 的 net_return_pct < -5%；MaxSevereLossRatePct 是允许的严重亏损率上限。
+type ScoreBlindEvaluationProtocol struct {
+	ShortHorizons           []int   `json:"short_horizons"`
+	LongHorizons            []int   `json:"long_horizons"`
+	MinEffectiveBatches     int     `json:"min_effective_batches"`
+	MaxCoverageDropPct      float64 `json:"max_coverage_drop_pct"`
+	MaxSevereLossRatePct    float64 `json:"max_severe_loss_rate_pct"`
+	MultipleTestingMethod   string  `json:"multiple_testing_method"`
+	SevereLossDefinitionPct float64 `json:"severe_loss_definition_pct"`
+}
+
+func normalizeExperimentType(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", model.LLMExperimentTypePrompt:
+		return model.LLMExperimentTypePrompt, nil
+	case model.LLMExperimentTypeScoreBlind:
+		return model.LLMExperimentTypeScoreBlind, nil
+	default:
+		return "", errors.New("experiment_type 须为 prompt 或 score_blind")
+	}
+}
+
+// experimentTypeOf 只在读取历史行时把空值兼容为 prompt，不写回数据库。未知类型
+// 原样返回，由各入口 fail-closed，绝不能误入 prompt 发布/评估路径。
+func experimentTypeOf(exp *model.LLMExperiment) string {
+	if exp == nil {
+		return model.LLMExperimentTypePrompt
+	}
+	typ := strings.TrimSpace(exp.ExperimentType)
+	switch typ {
+	case "", model.LLMExperimentTypePrompt:
+		return model.LLMExperimentTypePrompt
+	case model.LLMExperimentTypeScoreBlind:
+		return model.LLMExperimentTypeScoreBlind
+	default:
+		return typ
+	}
+}
+
+func normalizeScoreBlindProtocol(p *ScoreBlindEvaluationProtocol) (*ScoreBlindEvaluationProtocol, string, string, error) {
+	if p == nil {
+		return nil, "", "", errors.New("score_blind 启动前必须填写评价协议")
+	}
+	n := *p
+	n.ShortHorizons = append([]int(nil), p.ShortHorizons...)
+	n.LongHorizons = append([]int(nil), p.LongHorizons...)
+	n.MultipleTestingMethod = strings.ToLower(strings.TrimSpace(p.MultipleTestingMethod))
+	n.SevereLossDefinitionPct = -5
+	if len(n.ShortHorizons) != 2 || n.ShortHorizons[0] != 5 || n.ShortHorizons[1] != 10 ||
+		len(n.LongHorizons) != 2 || n.LongHorizons[0] != 20 || n.LongHorizons[1] != 60 {
+		return nil, "", "", errors.New("评价窗口必须锁定为短线 [5,10]、长线 [20,60] 交易日")
+	}
+	if n.MinEffectiveBatches <= 0 || n.MinEffectiveBatches > 100000 {
+		return nil, "", "", errors.New("min_effective_batches 必须为 1..100000")
+	}
+	if n.MaxCoverageDropPct <= 0 || n.MaxCoverageDropPct > 100 {
+		return nil, "", "", errors.New("max_coverage_drop_pct 必须为 (0,100]")
+	}
+	if n.MaxSevereLossRatePct <= 0 || n.MaxSevereLossRatePct > 100 {
+		return nil, "", "", errors.New("max_severe_loss_rate_pct 必须为 (0,100]")
+	}
+	switch n.MultipleTestingMethod {
+	case "holm_bonferroni", "bonferroni", "benjamini_hochberg":
+	default:
+		return nil, "", "", errors.New("multiple_testing_method 须为 holm_bonferroni/bonferroni/benjamini_hochberg")
+	}
+	b, err := json.Marshal(&n)
+	if err != nil {
+		return nil, "", "", err
+	}
+	raw := string(b)
+	return &n, raw, llmContentHash(raw), nil
+}
+
+func validateScoreBlindProtocol(exp *model.LLMExperiment, requireLocked bool) error {
+	typ := experimentTypeOf(exp)
+	if typ != model.LLMExperimentTypePrompt && typ != model.LLMExperimentTypeScoreBlind {
+		return fmt.Errorf("未知 experiment_type=%q，禁止进入实验生命周期", typ)
+	}
+	if typ != model.LLMExperimentTypeScoreBlind {
+		return nil
+	}
+	if experimentExpectedChampionCustom(exp) {
+		return errors.New("score_blind 仅支持默认推荐任务段；自定义 champion 会引入第二个实验变量")
+	}
+	if exp.InputSchemaVersion != scoreBlindInputSchemaVersion {
+		return fmt.Errorf("score_blind 输入 schema 必须为 %s", scoreBlindInputSchemaVersion)
+	}
+	var p ScoreBlindEvaluationProtocol
+	if err := json.Unmarshal([]byte(exp.ProtocolJSON), &p); err != nil {
+		return errors.New("score_blind 评价协议 JSON 已损坏")
+	}
+	_, canonical, hash, err := normalizeScoreBlindProtocol(&p)
+	if err != nil {
+		return err
+	}
+	if exp.SampleTarget < 2*p.MinEffectiveBatches {
+		return fmt.Errorf("score_blind 采样总目标至少应为每类最小有效批次数的 2 倍：当前 %d，至少 %d",
+			exp.SampleTarget, 2*p.MinEffectiveBatches)
+	}
+	if canonical != exp.ProtocolJSON || hash == "" || hash != exp.ProtocolHash {
+		return errors.New("score_blind 评价协议与创建时 hash 不一致，禁止启动或继续采样")
+	}
+	if requireLocked && exp.ProtocolLockedAt == nil {
+		return errors.New("score_blind 评价协议尚未锁定")
+	}
+	return nil
 }
 
 // CreateLLMExperiment 创建实验（draft）：challenger 内容当场固化快照 + champion 锚点
@@ -276,19 +398,44 @@ func CreateLLMExperiment(userID int64, in LLMExperimentInput) (*model.LLMExperim
 	hypo := strings.TrimSpace(in.Hypothesis)
 	expect := strings.TrimSpace(in.ExpectedImprovement)
 	content := strings.TrimSpace(in.ChallengerContent)
+	experimentType, typeErr := normalizeExperimentType(in.ExperimentType)
+	if typeErr != nil {
+		return nil, nil, typeErr
+	}
 	if name == "" || hypo == "" || expect == "" {
 		return nil, nil, errors.New("name/hypothesis/expected_improvement 必填（P2-2：没有假设与预期的实验不立项）")
 	}
-	if content == "" {
-		return nil, nil, errors.New("challenger_content 必填")
-	}
-	if len([]rune(content)) > maxPromptContentRunes {
-		return nil, nil, fmt.Errorf("challenger 内容超长（上限 %d 字符）", maxPromptContentRunes)
+	var protocolJSON, protocolHash string
+	if experimentType == model.LLMExperimentTypePrompt {
+		if content == "" {
+			return nil, nil, errors.New("prompt 实验的 challenger_content 必填")
+		}
+		if len([]rune(content)) > maxPromptContentRunes {
+			return nil, nil, fmt.Errorf("challenger 内容超长（上限 %d 字符）", maxPromptContentRunes)
+		}
+		if in.Protocol != nil {
+			return nil, nil, errors.New("prompt 实验不能携带 score_blind 评价协议")
+		}
+	} else {
+		if content != "" {
+			return nil, nil, errors.New("score_blind 是输入实验，不接受 challenger_content")
+		}
+		if in.ParentID != 0 {
+			return nil, nil, errors.New("score_blind 不进入 prompt 版本谱系，parent_id 必须为 0")
+		}
+		_, protocolJSON, protocolHash, typeErr = normalizeScoreBlindProtocol(in.Protocol)
+		if typeErr != nil {
+			return nil, nil, typeErr
+		}
 	}
 	if in.ParentID > 0 {
 		var parent model.LLMExperiment
 		if err := common.DB.First(&parent, in.ParentID).Error; err != nil {
 			return nil, nil, errors.New("父实验不存在")
+		}
+		if parent.UserID != userID || parent.Module != in.Module ||
+			experimentTypeOf(&parent) != model.LLMExperimentTypePrompt {
+			return nil, nil, errors.New("父实验必须是同一用户、同一模块的 prompt 实验")
 		}
 	}
 	target := in.SampleTarget
@@ -301,6 +448,10 @@ func CreateLLMExperiment(userID int64, in LLMExperimentInput) (*model.LLMExperim
 	if target > llmExperimentTargetMax {
 		target = llmExperimentTargetMax
 	}
+	if experimentType == model.LLMExperimentTypeScoreBlind && target < 2*in.Protocol.MinEffectiveBatches {
+		return nil, nil, fmt.Errorf("score_blind 采样总目标至少应为每类最小有效批次数的 2 倍：当前 %d，至少 %d",
+			target, 2*in.Protocol.MinEffectiveBatches)
+	}
 
 	promptExperimentStateMu.Lock()
 	defer promptExperimentStateMu.Unlock()
@@ -310,22 +461,37 @@ func CreateLLMExperiment(userID int64, in LLMExperimentInput) (*model.LLMExperim
 		if err != nil {
 			return fmt.Errorf("读取 champion 基线失败: %v", err)
 		}
+		if experimentType == model.LLMExperimentTypeScoreBlind && champ.Custom {
+			return errors.New("score_blind 仅支持默认推荐任务段；请先停用自定义 champion，避免引入第二个实验变量")
+		}
 		exp = &model.LLMExperiment{
 			UserID: userID, Module: in.Module, PromptModule: promptModule,
-			Name: name, Hypothesis: hypo, ExpectedImprovement: expect,
-			ChallengerContent: content, ChallengerHash: promptContentHash(content),
-			ChampionVersion: champ.Version, ChampionHash: champ.Hash,
+			ExperimentType: experimentType,
+			Name:           name, Hypothesis: hypo, ExpectedImprovement: expect,
+			ChallengerContent: content,
+			ChampionVersion:   champ.Version, ChampionHash: champ.Hash,
 			ChampionCustom: champ.Custom, ChampionRevision: champ.Revision,
 			ChampionGeneration: champ.Generation,
 			ChampionContent:    champ.Content, BaselineVersion: llmExperimentBaselineVersion,
 			Status: model.ExpStatusDraft, SampleTarget: target, ParentID: in.ParentID,
+		}
+		if experimentType == model.LLMExperimentTypePrompt {
+			exp.ChallengerHash = promptContentHash(content)
+		} else {
+			lockedAt := time.Now()
+			exp.InputSchemaVersion = scoreBlindInputSchemaVersion
+			exp.ProtocolJSON, exp.ProtocolHash = protocolJSON, protocolHash
+			exp.ProtocolLockedAt = &lockedAt
 		}
 		return tx.Create(exp).Error
 	})
 	if err != nil {
 		return nil, nil, err
 	}
-	return exp, lintPromptContent(promptModule, content), nil
+	if experimentType == model.LLMExperimentTypePrompt {
+		return exp, lintPromptContent(promptModule, content), nil
+	}
+	return exp, nil, nil
 }
 
 // StartLLMExperiment draft→running。单变量纪律：同一模块全局同时只允许一个 running
@@ -343,6 +509,9 @@ func StartLLMExperiment(id int64) (*model.LLMExperiment, error) {
 			}
 			if exp.Status != model.ExpStatusDraft {
 				return fmt.Errorf("仅 draft 可启动（当前 %s）", exp.Status)
+			}
+			if err := validateScoreBlindProtocol(&exp, false); err != nil {
+				return err
 			}
 			if err := lockExperimentModule(tx, exp.Module); err != nil {
 				return err
@@ -363,10 +532,14 @@ func StartLLMExperiment(id int64) (*model.LLMExperiment, error) {
 				return errors.New("该模块已有 running 实验（单变量纪律：一个模块同时只跑一个 challenger）")
 			}
 			now := time.Now()
+			updates := map[string]any{"status": model.ExpStatusRunning, "started_at": now}
+			if experimentTypeOf(&exp) == model.LLMExperimentTypeScoreBlind && exp.ProtocolLockedAt == nil {
+				updates["protocol_locked_at"] = now
+			}
 			res := tx.Model(&model.LLMExperiment{}).
 				Where("id = ? AND status = ? AND (baseline_invalid_reason = '' OR baseline_invalid_reason IS NULL)",
 					exp.ID, model.ExpStatusDraft).
-				Updates(map[string]any{"status": model.ExpStatusRunning, "started_at": now})
+				Updates(updates)
 			if res.Error != nil {
 				return res.Error
 			}
@@ -374,6 +547,9 @@ func StartLLMExperiment(id int64) (*model.LLMExperiment, error) {
 				return errors.New("实验状态或 champion 基线已被并发修改，请刷新后重试")
 			}
 			exp.Status, exp.StartedAt = model.ExpStatusRunning, &now
+			if experimentTypeOf(&exp) == model.LLMExperimentTypeScoreBlind && exp.ProtocolLockedAt == nil {
+				exp.ProtocolLockedAt = &now
+			}
 			return nil
 		})
 	})
@@ -468,8 +644,24 @@ func CompleteLLMExperiment(id int64, conclusion, failureReason string) (*model.L
 			if exp.Status != model.ExpStatusRunning {
 				return fmt.Errorf("仅 running 可完成（当前 %s）", exp.Status)
 			}
+			if err := validateScoreBlindProtocol(&exp, true); err != nil {
+				return err
+			}
+			if _, err := finalizeStaleExperimentClaims(tx, exp.ID); err != nil {
+				return err
+			}
+			var running int64
+			if err := tx.Model(&model.LLMExperimentRun{}).
+				Where("experiment_id = ? AND run_status = ?", exp.ID, model.LLMExperimentRunRunning).
+				Count(&running).Error; err != nil {
+				return err
+			}
+			if running > 0 {
+				return errors.New("仍有影子调用进行中，请等待运行事实终结后再完成实验")
+			}
 			var runs []model.LLMExperimentRun
-			if err := tx.Where("experiment_id = ?", exp.ID).Find(&runs).Error; err != nil {
+			if err := tx.Where("experiment_id = ? AND (run_status IS NULL OR run_status = '' OR run_status <> ?)",
+				exp.ID, model.LLMExperimentRunRunning).Find(&runs).Error; err != nil {
 				return err
 			}
 			actual := aggregateExperimentRuns(runs)
@@ -509,6 +701,9 @@ func PromoteLLMExperiment(id int64) (*model.LLMExperiment, error) {
 					return errors.New("实验不存在")
 				}
 				return err
+			}
+			if experimentTypeOf(&exp) != model.LLMExperimentTypePrompt {
+				return errors.New("score_blind 是纯影子输入实验，不进入 prompt promote 路径")
 			}
 			// 门 1：状态机——只有 completed（有聚合反馈）可晋级。
 			if exp.Status != model.ExpStatusCompleted {
@@ -646,6 +841,20 @@ func AbandonLLMExperiment(id int64, reason string) (*model.LLMExperiment, error)
 			if exp.Status == model.ExpStatusAbandoned {
 				return nil
 			}
+			if exp.Status == model.ExpStatusRunning {
+				if _, err := finalizeStaleExperimentClaims(tx, exp.ID); err != nil {
+					return err
+				}
+				var running int64
+				if err := tx.Model(&model.LLMExperimentRun{}).
+					Where("experiment_id = ? AND run_status = ?", exp.ID, model.LLMExperimentRunRunning).
+					Count(&running).Error; err != nil {
+					return err
+				}
+				if running > 0 {
+					return errors.New("仍有影子调用进行中，请等待运行事实终结后再废弃实验")
+				}
+			}
 			updates := map[string]any{"status": model.ExpStatusAbandoned, "updated_at": time.Now()}
 			if r := strings.TrimSpace(reason); r != "" {
 				updates["failure_reason"] = r
@@ -725,6 +934,26 @@ type llmExperimentPickFact struct {
 	Confidence int    `json:"confidence"`
 }
 
+type scoreBlindInputSnapshot struct {
+	ExperimentType      string          `json:"experiment_type"`
+	InputSchemaVersion  string          `json:"input_schema_version"`
+	Seed                int64           `json:"seed"`
+	CandidateOrder      []string        `json:"candidate_order"`
+	SchemaVersion       string          `json:"schema_version"`
+	ConfigID            int64           `json:"config_id"`
+	Provider            string          `json:"provider"`
+	Model               string          `json:"model"`
+	EndpointType        string          `json:"endpoint_type"`
+	Temperature         float64         `json:"temperature"`
+	MaxTokens           int             `json:"max_tokens"`
+	JSONMode            bool            `json:"json_mode"`
+	AccuracyContract    bool            `json:"accuracy_contract"`
+	TemperatureOmitted  bool            `json:"temperature_omitted"`
+	MaxCompletionTokens bool            `json:"max_completion_tokens"`
+	Route               LLMRouteApplied `json:"route"`
+	Messages            []chatMessage   `json:"messages"`
+}
+
 func marshalLLMExperimentPicks(picks []recPick) string {
 	facts := make([]llmExperimentPickFact, 0, len(picks))
 	for i, p := range picks {
@@ -753,33 +982,271 @@ var (
 	errExperimentSampleDuplicate = errors.New("同一批次已存在实验样本")
 )
 
-// maybeChallengerShadow challenger 影子采样（best-effort，任何失败只记日志/样本行，
-// 不影响业务批次）：同一批次候选名单，仅换 challenger 任务段重建消息，一次调用
-// （无 repair——影子对照要测的就是「一把过」的结构化质量），解析对照 champion picks。
-// **纪律：本函数只读业务数据，写入仅限实验两表与审计；championPicks 传值副本。**
+func scoreBlindSeed(experimentID, batchID int64) int64 {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d", scoreBlindInputSchemaVersion, experimentID, batchID)))
+	// 管理 API 由浏览器消费；限制在 JavaScript Number 的精确整数范围内，页面展示
+	// 与持久化 seed 必须逐位一致，不能因 64 位 JSON 数字被舍入而失去可复现性。
+	seed := int64(binary.BigEndian.Uint64(sum[:8]) & ((uint64(1) << 53) - 1))
+	if seed == 0 {
+		return 1
+	}
+	return seed
+}
+
+// shuffledScoreBlindCandidates 先按 symbol 建立与上游偶然顺序无关的规范起点，再用
+// 固定 seed 打乱。返回的 order 就是随后 JSON 数组的实际顺序，不允许事后重建。
+func shuffledScoreBlindCandidates(cands []candidate, seed int64) ([]candidate, []string, error) {
+	shuffled := append([]candidate(nil), cands...)
+	sort.SliceStable(shuffled, func(i, j int) bool { return shuffled[i].Symbol < shuffled[j].Symbol })
+	seen := make(map[string]bool, len(shuffled))
+	for _, cand := range shuffled {
+		if cand.Symbol == "" || seen[cand.Symbol] {
+			return nil, nil, errors.New("score_blind 候选集合含空 symbol 或重复 symbol")
+		}
+		seen[cand.Symbol] = true
+	}
+	rand.New(rand.NewSource(seed)).Shuffle(len(shuffled), func(i, j int) {
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	})
+	order := make([]string, 0, len(shuffled))
+	for _, cand := range shuffled {
+		if !seen[cand.Symbol] {
+			return nil, nil, errors.New("score_blind 打乱后候选集合发生变化")
+		}
+		order = append(order, cand.Symbol)
+	}
+	if len(order) != len(cands) {
+		return nil, nil, errors.New("score_blind 打乱后候选数量发生变化")
+	}
+	return shuffled, order, nil
+}
+
+// finalizeStaleExperimentClaims 把进程中断遗留的 running 占位固化为失败事实。
+// 结果未知时绝不删除或重试：这既保留精确输入，又让 batch_id 去重锚永久有效。
+func finalizeStaleExperimentClaims(tx *gorm.DB, experimentID int64) (int64, error) {
+	stale := tx.Model(&model.LLMExperimentRun{}).
+		Where("experiment_id = ? AND run_status = ? AND created_at < ?", experimentID,
+			model.LLMExperimentRunRunning, time.Now().Add(-llmExperimentRunClaimTTL)).
+		Updates(map[string]any{
+			"run_status":   model.LLMExperimentRunFailed,
+			"finish_state": "call_failed",
+			"error":        "影子调用占位超时，结果未知；为保证同批最多一次不重试",
+		})
+	if stale.Error != nil || stale.RowsAffected == 0 {
+		return stale.RowsAffected, stale.Error
+	}
+	if err := tx.Model(&model.LLMExperiment{}).Where("id = ?", experimentID).
+		UpdateColumn("sample_count", gorm.Expr("sample_count + ?", stale.RowsAffected)).Error; err != nil {
+		return 0, err
+	}
+	return stale.RowsAffected, nil
+}
+
+// claimExperimentRun 在外部调用前持久化 running 工件。模块槽锁串行化同批全局去重，
+// 实验行锁保护 target 余量和状态，因此同一批所有影子类型合计最多一次调用。
+func claimExperimentRun(exp *model.LLMExperiment, row *model.LLMExperimentRun) (string, error) {
+	var staleReason string
+	err := withPromptExperimentState(func() error {
+		return common.DB.Transaction(func(tx *gorm.DB) error {
+			if err := lockExperimentModule(tx, exp.Module); err != nil {
+				return err
+			}
+			var latest model.LLMExperiment
+			if err := lockExperimentRow(tx, exp.ID, &latest); err != nil {
+				return err
+			}
+			if latest.Module != exp.Module || latest.Status != model.ExpStatusRunning || latest.UserID != row.UserID ||
+				strings.TrimSpace(latest.BaselineInvalidReason) != "" {
+				return errExperimentSampleClosed
+			}
+			latestType := experimentTypeOf(&latest)
+			if (latestType != model.LLMExperimentTypePrompt &&
+				latestType != model.LLMExperimentTypeScoreBlind) || latestType != row.ExperimentType {
+				return errExperimentSampleClosed
+			}
+			if row.ExperimentType == model.LLMExperimentTypeScoreBlind {
+				if err := validateScoreBlindProtocol(&latest, true); err != nil {
+					return err
+				}
+			} else if promptContentHash(latest.ChallengerContent) != latest.ChallengerHash ||
+				latest.ChallengerHash != exp.ChallengerHash {
+				return errExperimentSampleClosed
+			}
+			if _, reason, err := validateExperimentCurrentBaseline(tx, &latest); err != nil {
+				return err
+			} else if reason != "" {
+				staleReason = reason
+				return &experimentBaselineStaleError{reason: reason}
+			}
+
+			// TTL 大于业务 deadline。进程中断后的结果已不可知，但调用可能已经发出。
+			staleCount, err := finalizeStaleExperimentClaims(tx, latest.ID)
+			if err != nil {
+				return err
+			}
+			latest.SampleCount += int(staleCount)
+			var existing int64
+			if err := tx.Model(&model.LLMExperimentRun{}).
+				Where("batch_id = ?", row.BatchID).
+				Count(&existing).Error; err != nil {
+				return err
+			}
+			if existing > 0 {
+				return errExperimentSampleDuplicate
+			}
+			var running int64
+			if err := tx.Model(&model.LLMExperimentRun{}).
+				Where("experiment_id = ? AND run_status = ?", latest.ID, model.LLMExperimentRunRunning).
+				Count(&running).Error; err != nil {
+				return err
+			}
+			if latest.SampleCount+int(running) >= latest.SampleTarget {
+				return errExperimentSampleClosed
+			}
+			return tx.Create(row).Error
+		})
+	})
+	return staleReason, err
+}
+
+// finishExperimentRun 只终结仍属于 running 实验的对应 claim。Complete/Abandon 会在
+// 存在 claim 时拒绝；若调用期间协议/基线异常，claim 也必须固化为 failed，禁止删除
+// 已经发出的外部调用事实。
+func finishExperimentRun(exp *model.LLMExperiment, row *model.LLMExperimentRun) (bool, string, error) {
+	var finalized bool
+	var staleReason string
+	var rejectedErr error
+	err := withPromptExperimentState(func() error {
+		return common.DB.Transaction(func(tx *gorm.DB) error {
+			var latest model.LLMExperiment
+			if err := lockExperimentRow(tx, exp.ID, &latest); err != nil {
+				return err
+			}
+			var claim model.LLMExperimentRun
+			if err := tx.Where("id = ? AND experiment_id = ? AND run_status = ?", row.ID, exp.ID,
+				model.LLMExperimentRunRunning).First(&claim).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil
+				}
+				return err
+			}
+			runUpdates := func() map[string]any {
+				return map[string]any{
+					"run_status": row.RunStatus, "valid": row.Valid, "picks_count": row.PicksCount,
+					"overlap_count": row.OverlapCount, "coverage_json": row.CoverageJSON,
+					"challenger_picks_json": row.ChallengerPicksJSON,
+					"challenger_tokens":     row.ChallengerTokens, "challenger_ms": row.ChallengerMs,
+					"finish_state": row.FinishState, "error": row.Error,
+				}
+			}
+			advanceSampleCount := func(required bool) error {
+				res := tx.Model(&model.LLMExperiment{}).
+					Where("id = ? AND status = ? AND sample_count < sample_target", latest.ID, model.ExpStatusRunning).
+					UpdateColumn("sample_count", gorm.Expr("sample_count + 1"))
+				if res.Error != nil {
+					return res.Error
+				}
+				if required && res.RowsAffected != 1 {
+					return errExperimentSampleClosed
+				}
+				return nil
+			}
+			rejectClaim := func(reason error) error {
+				rejectedErr = reason
+				updates := runUpdates()
+				updates["run_status"] = model.LLMExperimentRunFailed
+				updates["valid"] = false
+				detail := "影子调用完成后实验状态校验失败：" + reason.Error()
+				if strings.TrimSpace(row.Error) != "" {
+					detail = row.Error + "；" + detail
+				}
+				updates["error"] = truncateRunes(detail, 500)
+				res := tx.Model(&model.LLMExperimentRun{}).
+					Where("id = ? AND run_status = ?", claim.ID, model.LLMExperimentRunRunning).Updates(updates)
+				if res.Error != nil {
+					return res.Error
+				}
+				if res.RowsAffected != 1 {
+					return errExperimentSampleClosed
+				}
+				if err := advanceSampleCount(false); err != nil {
+					return err
+				}
+				finalized = true
+				return nil
+			}
+			if latest.Status != model.ExpStatusRunning || strings.TrimSpace(latest.BaselineInvalidReason) != "" ||
+				latest.SampleCount >= latest.SampleTarget {
+				return rejectClaim(errExperimentSampleClosed)
+			}
+			latestType := experimentTypeOf(&latest)
+			if (latestType != model.LLMExperimentTypePrompt &&
+				latestType != model.LLMExperimentTypeScoreBlind) || latestType != row.ExperimentType {
+				return rejectClaim(errExperimentSampleClosed)
+			}
+			if row.ExperimentType == model.LLMExperimentTypeScoreBlind {
+				if err := validateScoreBlindProtocol(&latest, true); err != nil {
+					return rejectClaim(err)
+				}
+			} else if promptContentHash(latest.ChallengerContent) != latest.ChallengerHash ||
+				latest.ChallengerHash != exp.ChallengerHash {
+				return rejectClaim(errExperimentSampleClosed)
+			}
+			if _, reason, err := validateExperimentCurrentBaseline(tx, &latest); err != nil {
+				return err
+			} else if reason != "" {
+				staleReason = reason
+				return rejectClaim(&experimentBaselineStaleError{reason: reason})
+			}
+			res := tx.Model(&model.LLMExperimentRun{}).
+				Where("id = ? AND run_status = ?", row.ID, model.LLMExperimentRunRunning).Updates(runUpdates())
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return errExperimentSampleClosed
+			}
+			if err := advanceSampleCount(true); err != nil {
+				return err
+			}
+			finalized = true
+			return nil
+		})
+	})
+	if err != nil {
+		return false, staleReason, err
+	}
+	return finalized, staleReason, rejectedErr
+}
+
+// maybeChallengerShadow 是 recommendation 的统一影子调度器（best-effort）：普通 prompt
+// challenger 与 score-blind 输入实验互斥，共用一次调用上限。所有成功、空 picks、越池与
+// 失败只写实验/LLM 审计事实，绝不改业务 picks、批次状态、候选池或 l2 标签。
 func (s *RecommendationService) maybeChallengerShadow(ctx context.Context, plan *recGenPlan,
 	batch *model.RecommendationBatch, mainRun *llmRun, championMs int64, championUsage chatUsage,
 	championPicks []recPick, poolBySymbol map[string]candidate,
 	recType string, strat *strategyTemplate, market string, count int,
 	llmCands []candidate, filters RecFilters, mktCtx *recMarketContext) {
-	if common.DB == nil || !setting.LLMChallenger() {
+	// 只有业务解析器已接受的 champion attempt 才具备可配对的真实调用目标。
+	// repair 打满后 recommendation 会走确定性降级并返回 nil error，但不会提交
+	// acceptedTarget；此时继续影子调用既没有合法 champion 输出，也无法保证同一路由目标。
+	if common.DB == nil || !setting.LLMChallenger() || plan == nil || batch == nil ||
+		mainRun == nil || batch.UserID != plan.userID || !batch.FactsRecorded ||
+		mainRun.Attempts != 1 || mainRun.acceptedTarget.Model == "" {
 		return
 	}
 	exp := activeExperimentFor("recommendation", plan.userID)
 	if exp == nil {
 		return
 	}
-	// 对照主调用实际消费的 plan.prompt 快照，而不是重新读活模板。若某批主调已经用了
-	// B 版本，则即使稍后恢复 A，也必须粘性标记该实验失效且不落污染样本。
+	// 对照主调用实际消费的 plan.prompt 快照。旧批次只跳过；live champion 已漂移则
+	// 粘性失效，防 A→B→A 洗回污染样本。
 	championBaseline, err := experimentPromptBaselineFromRuntime(plan.prompt, exp.PromptModule)
 	if err != nil {
 		common.SysWarn("实验基线快照校验失败 exp=%d: %v", exp.ID, err)
 		return
 	}
 	if reason := experimentBaselineStaleReason(exp, championBaseline); reason != "" {
-		// 业务批次可能早于实验启动：例如批次固化 A 后，管理员切到 B 并基于 B 启动
-		// 实验，随后旧批次 A 才完成。此时批次快照不属于该实验的采样窗口，只应跳过；
-		// 是否粘性失效必须以 live champion 复验，不能让旧批次误杀新实验。
 		_, liveReason, liveErr := validateExperimentCurrentBaseline(common.DB, exp)
 		if liveErr != nil {
 			common.SysWarn("实验 #%d 复验 live champion 失败，跳过本批影子采样：%v", exp.ID, liveErr)
@@ -793,118 +1260,167 @@ func (s *RecommendationService) maybeChallengerShadow(ctx context.Context, plan 
 		common.SysWarn("实验 #%d 停止影子采样：live champion 基线失效：%s", exp.ID, liveReason)
 		return
 	}
-	chPr := promptRuntime{Module: exp.PromptModule, Custom: true,
-		Raw: exp.ChallengerContent, Hash: exp.ChallengerHash}
-	messages := s.buildMessages(chPr, recType, strat, market, count, llmCands, filters, mktCtx)
 
-	run := newLLMRun(batch.TraceID, mainRun.RunID, "experiment", "recommendation.v2", chPr.Version(recPromptVersion))
+	experimentType := experimentTypeOf(exp)
+	if experimentType != model.LLMExperimentTypePrompt &&
+		experimentType != model.LLMExperimentTypeScoreBlind {
+		common.SysWarn("实验 #%d 类型 %q 非法，停止采样", exp.ID, experimentType)
+		return
+	}
+	var messages []chatMessage
+	var scoreBlindOrder []string
+	promptVersion := ""
+	row := model.LLMExperimentRun{
+		ExperimentID: exp.ID, UserID: plan.userID, BatchID: batch.ID,
+		TraceID: batch.TraceID, ChampionRun: mainRun.RunID, ExperimentType: experimentType,
+		RunStatus:     model.LLMExperimentRunRunning,
+		ChampionPicks: len(championPicks), PickSchemaVersion: llmExperimentPickSchemaVersion,
+		ChampionPicksJSON: marshalLLMExperimentPicks(championPicks),
+		ChampionTokens:    championUsage.TotalTokens, ChampionMs: championMs,
+	}
+	if experimentType == model.LLMExperimentTypeScoreBlind {
+		if err := validateScoreBlindProtocol(exp, true); err != nil {
+			common.SysWarn("score_blind 实验 #%d 协议校验失败，停止采样：%v", exp.ID, err)
+			return
+		}
+		row.InputSchemaVersion = scoreBlindInputSchemaVersion
+		row.Seed = scoreBlindSeed(exp.ID, batch.ID)
+		shuffled, order, err := shuffledScoreBlindCandidates(llmCands, row.Seed)
+		if err != nil {
+			common.SysWarn("score_blind 实验 #%d 输入冻结失败：%v", exp.ID, err)
+			return
+		}
+		messages = s.buildScoreBlindMessages(plan.prompt, recType, strat, market, count,
+			shuffled, filters, mktCtx)
+		orderJSON, orderErr := json.Marshal(order)
+		if orderErr != nil {
+			common.SysWarn("score_blind 实验 #%d 输入顺序序列化失败：%v", exp.ID, orderErr)
+			return
+		}
+		scoreBlindOrder = order
+		row.InputOrderJSON = string(orderJSON)
+		promptVersion = scoreBlindInputSchemaVersion
+	} else {
+		chPr := promptRuntime{Module: exp.PromptModule, Custom: true,
+			Raw: exp.ChallengerContent, Hash: exp.ChallengerHash}
+		messages = s.buildMessages(chPr, recType, strat, market, count, llmCands, filters, mktCtx)
+		promptVersion = chPr.Version(recPromptVersion)
+	}
+
+	run := newLLMRun(batch.TraceID, mainRun.RunID, "experiment", "recommendation.v2", promptVersion)
 	run.hashPrompt(messages)
 	cfg, apiKey := plan.cfg, plan.apiKey
-	start := time.Now()
-	res, err := chatCompletion(ctx, chatParams{
+	params := chatParams{
 		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 		Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("experiment", cfg.MaxTokens),
 		Messages: messages, JSONMode: true, AllowPrivate: plan.allowPrivate,
 		Meta: run.chatMeta(plan.userID, cfg, 1),
-	})
-	run.record(res, err)
-	elapsed := time.Since(start).Milliseconds()
-
-	row := model.LLMExperimentRun{
-		ExperimentID: exp.ID, UserID: plan.userID, BatchID: batch.ID,
-		TraceID: batch.TraceID, ChampionRun: mainRun.RunID,
-		ChampionPicks: len(championPicks), PickSchemaVersion: llmExperimentPickSchemaVersion,
-		ChampionPicksJSON: marshalLLMExperimentPicks(championPicks),
-		ChampionTokens:    championUsage.TotalTokens, ChampionMs: championMs,
-		ChallengerMs: elapsed, FinishState: run.FinishState,
 	}
+	// 不重新查询当前路由：必须逐值复用同批 champion 已接受 attempt 的真实目标，
+	// 防路由配置/健康状态在主调与影子间变化而破坏单变量对照。
+	target := mainRun.acceptedTarget
+	run.routeApplied = mainRun.acceptedRouteApplied
+	prepared := prepareChatCompletionForAcceptedTarget(params, target)
+	if experimentType == model.LLMExperimentTypeScoreBlind {
+		snapshot, snapshotErr := json.Marshal(scoreBlindInputSnapshot{
+			ExperimentType: experimentType, InputSchemaVersion: scoreBlindInputSchemaVersion,
+			Seed: row.Seed, CandidateOrder: append([]string(nil), scoreBlindOrder...),
+			SchemaVersion: "recommendation.v2", ConfigID: prepared.Meta.ConfigID, Provider: prepared.Meta.Provider,
+			Model: prepared.Model, EndpointType: prepared.EndpointType, Temperature: prepared.Temperature,
+			MaxTokens: prepared.MaxTokens, JSONMode: prepared.JSONMode,
+			AccuracyContract:    target.AccuracyContract,
+			TemperatureOmitted:  prepared.temperatureOmitted(),
+			MaxCompletionTokens: prepared.usesMaxCompletionTokens(), Route: run.routeApplied,
+			Messages: append([]chatMessage(nil), prepared.Messages...),
+		})
+		if snapshotErr != nil {
+			common.SysWarn("score_blind 实验 #%d 精确输入序列化失败：%v", exp.ID, snapshotErr)
+			return
+		}
+		row.InputSnapshotJSON = string(snapshot)
+		row.InputHash = llmContentHash(row.InputSnapshotJSON)
+	}
+
+	staleReason, claimErr := claimExperimentRun(exp, &row)
+	if staleReason != "" {
+		markExperimentBaselineInvalid(common.DB, exp, staleReason)
+	}
+	if claimErr != nil {
+		if !errors.Is(claimErr, errExperimentSampleClosed) &&
+			!errors.Is(claimErr, errExperimentSampleDuplicate) {
+			common.SysWarn("实验 #%d 抢占影子样本失败：%v", exp.ID, claimErr)
+		}
+		return
+	}
+
+	start := time.Now()
+	res, callErr := chatCompletionPrepared(ctx, prepared)
+	run.record(res, callErr)
+	row.ChallengerMs = time.Since(start).Milliseconds()
+	row.FinishState = run.FinishState
+	row.RunStatus = model.LLMExperimentRunFailed
 	if res != nil {
 		row.ChallengerTokens = res.Usage.TotalTokens
 		if res.Usage.TotalTokens > 0 {
-			consumeQuota(plan.userID, res.Usage.TotalTokens, false) // 只审计不扣次（后台影子）
+			consumeQuota(plan.userID, res.Usage.TotalTokens, false)
 		}
 	}
-	if err != nil {
-		row.Error = truncateRunes(err.Error(), 500)
+	if callErr != nil {
+		row.Error = truncateRunes(callErr.Error(), 500)
 	} else {
-		picks, _, diag, perr := parseAndFilterPicks(res.Content, poolBySymbol, count)
-		if perr != nil {
-			row.Error = truncateRunes(perr.Error(), 500)
-		} else {
-			row.Valid = true
-			row.PicksCount = len(picks)
-			row.ChallengerPicksJSON = marshalLLMExperimentPicks(picks)
-			champSet := map[string]bool{}
-			for _, p := range championPicks {
-				champSet[p.Symbol] = true
-			}
-			for _, p := range picks {
-				if champSet[p.Symbol] {
-					row.OverlapCount++
-				}
-			}
-		}
+		picks, _, diag, parseErr := parseAndFilterPicks(res.Content, poolBySymbol, count)
 		if diag != nil {
 			if b, jerr := json.Marshal(diag); jerr == nil {
 				row.CoverageJSON = string(b)
 			}
 		}
+		if len(picks) > 0 || parseErr == nil {
+			row.PicksCount = len(picks)
+			row.ChallengerPicksJSON = marshalLLMExperimentPicks(picks)
+			champSet := make(map[string]bool, len(championPicks))
+			for _, pick := range championPicks {
+				champSet[pick.Symbol] = true
+			}
+			for _, pick := range picks {
+				if champSet[pick.Symbol] {
+					row.OverlapCount++
+				}
+			}
+		}
+		outOfPool := diag != nil && (diag.OutOfPoolCount > 0 || diag.UnknownCount > 0)
+		switch {
+		case outOfPool:
+			row.RunStatus = model.LLMExperimentRunOutOfPool
+			if parseErr != nil {
+				row.Error = truncateRunes(parseErr.Error(), 500)
+			} else {
+				row.Error = "模型输出包含候选集合外或无法识别的 symbol"
+			}
+		case parseErr != nil:
+			row.Error = truncateRunes(parseErr.Error(), 500)
+		case len(picks) == 0:
+			row.Valid = true
+			row.RunStatus = model.LLMExperimentRunEmpty
+		default:
+			row.Valid = true
+			row.RunStatus = model.LLMExperimentRunSuccess
+		}
 	}
-	var staleReason string
-	dberr := withPromptExperimentState(func() error {
-		return common.DB.Transaction(func(tx *gorm.DB) error {
-			var latest model.LLMExperiment
-			if err := lockExperimentRow(tx, exp.ID, &latest); err != nil {
-				return err
-			}
-			if latest.Status != model.ExpStatusRunning || strings.TrimSpace(latest.BaselineInvalidReason) != "" ||
-				latest.SampleCount >= latest.SampleTarget {
-				return errExperimentSampleClosed
-			}
-			if promptContentHash(latest.ChallengerContent) != latest.ChallengerHash ||
-				latest.ChallengerHash != exp.ChallengerHash {
-				return errExperimentSampleClosed
-			}
-			if _, reason, err := validateExperimentCurrentBaseline(tx, &latest); err != nil {
-				return err
-			} else if reason != "" {
-				staleReason = reason
-				return &experimentBaselineStaleError{reason: reason}
-			}
-			var existing int64
-			if err := tx.Model(&model.LLMExperimentRun{}).
-				Where("experiment_id = ? AND batch_id = ?", latest.ID, row.BatchID).
-				Count(&existing).Error; err != nil {
-				return err
-			}
-			if existing > 0 {
-				return errExperimentSampleDuplicate
-			}
-			if err := tx.Create(&row).Error; err != nil {
-				return err
-			}
-			res := tx.Model(&model.LLMExperiment{}).
-				Where("id = ? AND status = ? AND sample_count < sample_target AND (baseline_invalid_reason = '' OR baseline_invalid_reason IS NULL)",
-					latest.ID, model.ExpStatusRunning).
-				UpdateColumn("sample_count", gorm.Expr("sample_count + 1"))
-			if res.Error != nil {
-				return res.Error
-			}
-			if res.RowsAffected != 1 {
-				return errExperimentSampleClosed
-			}
-			return nil
-		})
-	})
+
+	finalized, staleReason, finishErr := finishExperimentRun(exp, &row)
 	if staleReason != "" {
 		markExperimentBaselineInvalid(common.DB, exp, staleReason)
 	}
-	if dberr != nil {
-		if !errors.Is(dberr, errExperimentSampleClosed) && !errors.Is(dberr, errExperimentSampleDuplicate) {
-			common.SysWarn("实验样本落库失败 exp=%d: %v", exp.ID, dberr)
+	if finishErr != nil {
+		if !errors.Is(finishErr, errExperimentSampleClosed) {
+			common.SysWarn("实验样本终结失败 exp=%d run=%d: %v", exp.ID, row.ID, finishErr)
 		}
 		return
 	}
-	common.SysLog("实验 #%d 影子采样：batch=%d valid=%v picks=%d overlap=%d/%d tokens=%d",
-		exp.ID, batch.ID, row.Valid, row.PicksCount, row.OverlapCount, row.ChampionPicks, row.ChallengerTokens)
+	if !finalized {
+		return
+	}
+	common.SysLog("实验 #%d(%s) 影子采样：batch=%d status=%s valid=%v picks=%d overlap=%d/%d tokens=%d",
+		exp.ID, experimentType, batch.ID, row.RunStatus, row.Valid, row.PicksCount,
+		row.OverlapCount, row.ChampionPicks, row.ChallengerTokens)
 }
