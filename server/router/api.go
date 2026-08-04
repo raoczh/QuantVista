@@ -148,7 +148,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 		authed.Use(middleware.JWTAuth())
 		{
 			// 全局股票搜索（只读本地股票宇宙，不触发行情或外部数据源）。
-			authed.GET("/stocks/search", stockSearchCtl.Search)
+			authed.GET("/stocks/search", middleware.RateLimit(120, time.Minute), stockSearchCtl.Search)
 
 			user := authed.Group("/user")
 			{

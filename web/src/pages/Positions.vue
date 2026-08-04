@@ -68,7 +68,11 @@ const message = useMessage()
 const route = useRoute()
 const router = useRouter()
 const { pctColor, vars, isDark } = useUi()
-const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
+const styleVars = computed(() => ({
+  '--qv-divider': vars.value.dividerColor,
+  '--qv-action-target': withAlpha(vars.value.primaryColor, 0.12),
+  '--qv-action-target-line': vars.value.primaryColor,
+}))
 const warnColor = computed(() => vars.value.warningColor)
 
 const positions = ref<Position[]>([])
@@ -1031,24 +1035,81 @@ watch([isDark, vars], () => {
   renderExposure()
 })
 
-function applyStockActionQuery() {
-  if (route.query.add !== '1') return
-  openCreate({
-    symbol: String(route.query.symbol || ''),
-    market: String(route.query.market || 'cn'),
-    name: String(route.query.name || ''),
-    recId: Number(route.query.rec_id) || 0,
-  })
-  void router.replace({ name: 'positions' })
+const highlightedPositionID = ref<number | null>(null)
+let lastConsumedStockAction = ''
+let activeStockAction = ''
+
+function stockActionKey() {
+  const symbol = String(route.query.symbol || '').trim()
+  if (!symbol && route.query.add !== '1') return ''
+  return String(route.query._stock_action || '') || [symbol, route.query.market || 'cn', route.query.add || ''].join(':')
 }
 
-watch(() => route.query._stock_action, applyStockActionQuery)
+function positionElementID(id: number) {
+  return `position-item-${id}`
+}
+
+async function applyStockActionQuery(): Promise<boolean> {
+  const actionKey = stockActionKey()
+  if (!actionKey || actionKey === lastConsumedStockAction || actionKey === activeStockAction) return false
+
+  activeStockAction = actionKey
+  try {
+    if (route.query.add === '1') {
+      lastConsumedStockAction = actionKey
+      highlightedPositionID.value = null
+      openCreate({
+        symbol: String(route.query.symbol || ''),
+        market: String(route.query.market || 'cn'),
+        name: String(route.query.name || ''),
+        recId: Number(route.query.rec_id) || 0,
+      })
+      await router.replace({ name: 'positions' })
+      return true
+    }
+
+    statusFilter.value = 'holding'
+    typeFilter.value = 'all'
+    await load()
+    if (loadError.value || stockActionKey() !== actionKey) return true
+
+    const symbol = String(route.query.symbol || '').trim().toLowerCase()
+    const market = String(route.query.market || 'cn').trim().toLowerCase()
+    const target = positions.value.find(
+      (position) =>
+        position.symbol.trim().toLowerCase() === symbol &&
+        (position.market || 'cn').trim().toLowerCase() === market,
+    )
+
+    lastConsumedStockAction = actionKey
+    if (target) {
+      highlightedPositionID.value = target.id
+      await nextTick()
+      document.getElementById(positionElementID(target.id))?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+      })
+    } else {
+      highlightedPositionID.value = null
+      openCreate({
+        symbol: String(route.query.symbol || ''),
+        market: String(route.query.market || 'cn'),
+        name: String(route.query.name || ''),
+        recId: Number(route.query.rec_id) || 0,
+      })
+    }
+    await router.replace({ name: 'positions' })
+    return true
+  } finally {
+    if (activeStockAction === actionKey) activeStockAction = ''
+  }
+}
+
+watch(() => route.query._stock_action, () => void applyStockActionQuery())
 
 onMounted(async () => {
-  // 从自选/推荐「建仓」跳转而来：预填并打开建仓弹窗，然后清掉 query。
-  // rec_id 为来源推荐（血缘），落库后推荐详情可展示「已建仓」与价格对比。
-  applyStockActionQuery()
-  await load()
+  // 股票动作先核对当前持仓：已有记录定位高亮，否则预填建仓；rec_id 保留推荐血缘。
+  if (!(await applyStockActionQuery())) await load()
   loadCurve()
   loadCorpAdjusts()
   loadSellReviews()
@@ -1355,7 +1416,13 @@ onBeforeUnmount(() => {
                 description="暂无持仓，点击「新建持仓」记录一笔买入"
               />
               <div v-if="filtered.length" class="rows">
-                <div v-for="p in filtered" :key="p.id" class="row-wrap">
+                <div
+                  v-for="p in filtered"
+                  :id="positionElementID(p.id)"
+                  :key="p.id"
+                  class="row-wrap"
+                  :class="{ 'is-stock-action-target': highlightedPositionID === p.id }"
+                >
                   <div class="row">
                     <div class="r-name">
                       <div class="r-title-line">
@@ -2214,9 +2281,15 @@ onBeforeUnmount(() => {
 /* ---------- B5 流水明细 ---------- */
 .row-wrap {
   border-bottom: 1px solid var(--qv-divider);
+  border-radius: 8px;
+  transition: background-color 0.18s ease, box-shadow 0.18s ease;
 }
 .row-wrap:last-child {
   border-bottom: none;
+}
+.row-wrap.is-stock-action-target {
+  background: var(--qv-action-target);
+  box-shadow: inset 3px 0 0 var(--qv-action-target-line);
 }
 .row-wrap .row {
   border-bottom: none;

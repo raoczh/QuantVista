@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, onMounted, computed, nextTick, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
   NInput,
@@ -41,9 +41,14 @@ import ChangeTag from '@/components/ChangeTag.vue'
 import FreshnessTag from '@/components/FreshnessTag.vue'
 
 const message = useMessage()
+const route = useRoute()
 const router = useRouter()
 const { pctColor, vars, withAlpha } = useUi()
-const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
+const styleVars = computed(() => ({
+  '--qv-divider': vars.value.dividerColor,
+  '--qv-action-target': withAlpha(vars.value.primaryColor, 0.12),
+  '--qv-action-target-line': vars.value.primaryColor,
+}))
 
 const groups = ref<WatchlistGroup[]>([])
 const loading = ref(false)
@@ -52,12 +57,14 @@ const marketOptions = [
   { label: 'A 股', value: 'cn' },
 ]
 
-async function load(silent = false) {
+async function load(silent = false): Promise<boolean> {
   if (!silent) loading.value = true
   try {
     groups.value = await listWatchlists()
+    return true
   } catch (e) {
     if (!silent) message.error((e as Error).message)
+    return false
   } finally {
     if (!silent) loading.value = false
   }
@@ -199,22 +206,27 @@ const itemForm = ref<{
   watchlist_id: number
   symbol: string
   market: string
+  name: string
   focus_reason: string
   note: string
   is_pinned: boolean
-}>({ id: null, watchlist_id: 0, symbol: '', market: 'cn', focus_reason: '', note: '', is_pinned: false })
+}>({ id: null, watchlist_id: 0, symbol: '', market: 'cn', name: '', focus_reason: '', note: '', is_pinned: false })
 
 const groupSelectOptions = computed(() =>
   groups.value.map((g) => ({ label: g.name, value: g.id })),
 )
 
-function openAddItem(groupId?: number) {
+function openAddItem(
+  groupId?: number,
+  prefill?: { symbol?: string; market?: string; name?: string },
+) {
   itemEditing.value = false
   itemForm.value = {
     id: null,
     watchlist_id: groupId || groups.value[0]?.id || 0,
-    symbol: '',
-    market: 'cn',
+    symbol: prefill?.symbol || '',
+    market: prefill?.market || 'cn',
+    name: prefill?.name || '',
     focus_reason: '',
     note: '',
     is_pinned: false,
@@ -228,6 +240,7 @@ function openEditItem(item: WatchlistItem) {
     watchlist_id: item.watchlist_id,
     symbol: item.symbol,
     market: item.market,
+    name: item.name,
     focus_reason: item.focus_reason,
     note: item.note,
     is_pinned: item.is_pinned,
@@ -255,6 +268,7 @@ async function submitItem() {
       await addItem(f.watchlist_id, {
         symbol: f.symbol.trim(),
         market: f.market,
+        name: f.name.trim() || undefined,
         focus_reason: f.focus_reason,
         note: f.note,
         is_pinned: f.is_pinned,
@@ -368,7 +382,77 @@ function sparkStats(bars: Bar[]) {
 
 const totalCount = computed(() => groups.value.reduce((s, g) => s + g.items.length, 0))
 
-onMounted(load)
+const highlightedItemID = ref<number | null>(null)
+let lastConsumedStockAction = ''
+let activeStockAction = ''
+let stockActionLoad: Promise<boolean> | null = null
+
+function stockActionKey() {
+  const symbol = String(route.query.symbol || '').trim()
+  if (!symbol) return ''
+  return String(route.query._stock_action || '') || [symbol, route.query.market || 'cn', route.query.add || ''].join(':')
+}
+
+function ensureStockActionLoad() {
+  if (!stockActionLoad) {
+    stockActionLoad = load().finally(() => {
+      stockActionLoad = null
+    })
+  }
+  return stockActionLoad
+}
+
+function watchlistItemElementID(id: number) {
+  return `watchlist-item-${id}`
+}
+
+async function applyStockActionQuery(): Promise<boolean> {
+  const actionKey = stockActionKey()
+  if (!actionKey || actionKey === lastConsumedStockAction || actionKey === activeStockAction) return false
+
+  activeStockAction = actionKey
+  try {
+    const loaded = await ensureStockActionLoad()
+    if (!loaded || stockActionKey() !== actionKey) return true
+
+    const symbol = String(route.query.symbol || '').trim().toLowerCase()
+    const market = String(route.query.market || 'cn').trim().toLowerCase()
+    const target = groups.value
+      .flatMap((group) => group.items)
+      .find(
+        (item) =>
+          item.symbol.trim().toLowerCase() === symbol &&
+          (item.market || 'cn').trim().toLowerCase() === market,
+      )
+
+    lastConsumedStockAction = actionKey
+    if (target) {
+      highlightedItemID.value = target.id
+      await nextTick()
+      document.getElementById(watchlistItemElementID(target.id))?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+      })
+    } else {
+      highlightedItemID.value = null
+      openAddItem(undefined, {
+        symbol: String(route.query.symbol || ''),
+        market: String(route.query.market || 'cn'),
+        name: String(route.query.name || ''),
+      })
+    }
+    await router.replace({ name: 'watchlist' })
+    return true
+  } finally {
+    if (activeStockAction === actionKey) activeStockAction = ''
+  }
+}
+
+watch(() => route.query._stock_action, () => void applyStockActionQuery())
+
+onMounted(async () => {
+  if (!(await applyStockActionQuery())) await ensureStockActionLoad()
+})
 </script>
 
 <template>
@@ -400,7 +484,13 @@ onMounted(load)
 
           <n-empty v-if="!g.items.length" description="该分组暂无自选，点击「添加」加入股票" />
           <div v-else class="items">
-            <div v-for="it in g.items" :key="it.id" class="item-wrap">
+            <div
+              v-for="it in g.items"
+              :id="watchlistItemElementID(it.id)"
+              :key="it.id"
+              class="item-wrap"
+              :class="{ 'is-stock-action-target': highlightedItemID === it.id }"
+            >
               <div class="item" @click="toggleExpand(it)">
                 <span class="it-chevron" :class="{ 'is-open': expanded[it.id] }">▸</span>
                 <div class="it-main">
@@ -640,9 +730,15 @@ onMounted(load)
 }
 .item-wrap {
   border-bottom: 1px solid var(--qv-divider);
+  border-radius: 8px;
+  transition: background-color 0.18s ease, box-shadow 0.18s ease;
 }
 .item-wrap:last-child {
   border-bottom: none;
+}
+.item-wrap.is-stock-action-target {
+  background: var(--qv-action-target);
+  box-shadow: inset 3px 0 0 var(--qv-action-target-line);
 }
 .item {
   display: flex;
