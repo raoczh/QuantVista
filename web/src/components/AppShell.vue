@@ -26,6 +26,7 @@ import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import { setMarketTitle } from '@/lib/pageTitle'
 import BrandLogo from '@/components/BrandLogo.vue'
 import GlobalSearch from '@/components/GlobalSearch.vue'
+import MobileBottomNav from '@/components/MobileBottomNav.vue'
 
 // 应用主外壳：必须挂在 n-config-provider 内部，useThemeVars 才能取到主题 override。
 const route = useRoute()
@@ -42,9 +43,15 @@ const { user, isAdmin, isLoggedIn } = storeToRefs(authStore)
 const vars = useThemeVars()
 const { isDark, primaryAlpha } = useUi()
 
-// ---------- 导航：高频一级直达，AI 工具与低频项归组，设置/管理后台只留用户菜单 ----------
+// ---------- 导航：高频一级直达，市场/研究与低频项归组，设置/管理后台只留用户菜单 ----------
 const todoCount = ref(0)
 const todoIncomplete = ref(false)
+const todoBadgeText = computed(() => {
+  if (todoCount.value <= 0 && !todoIncomplete.value) return null
+  if (todoIncomplete.value) return todoCount.value > 0 ? `${todoCount.value}+` : '!'
+  return todoCount.value > 99 ? '99+' : String(todoCount.value)
+})
+
 async function refreshTodoCount() {
   try {
     // 不传 scope = 默认 ledger（D18）：徽标只数「与我的账本有关」的条目，
@@ -73,28 +80,20 @@ function navLink(to: string, text: string) {
 }
 
 const menuOptions = computed<MenuOption[]>(() => [
-  { label: navLink('/', '市场首页'), key: 'home' },
-  { label: navLink('/mood', '盘面情绪'), key: 'mood' },
-  { label: navLink('/news', '快讯'), key: 'news' },
+  { label: navLink('/', '首页'), key: 'home' },
   {
     label: () =>
       h(RouterLink, { to: '/today', class: 'nav-today' }, {
         default: () => [
-          '今日待办',
-          todoCount.value > 0 || todoIncomplete.value
+          '今日',
+          todoBadgeText.value
             ? h(
                 'span',
                 {
                   class: ['nav-badge', 'qv-tnum', { 'nav-badge-incomplete': todoIncomplete.value }],
                   title: todoIncomplete.value ? '待办清单读取不完整' : undefined,
                 },
-                todoIncomplete.value
-                  ? todoCount.value > 0
-                    ? `${todoCount.value}+`
-                    : '!'
-                  : todoCount.value > 99
-                    ? '99+'
-                    : String(todoCount.value),
+                todoBadgeText.value,
               )
             : null,
         ],
@@ -104,11 +103,21 @@ const menuOptions = computed<MenuOption[]>(() => [
   { label: navLink('/watchlist', '自选'), key: 'watchlist' },
   { label: navLink('/screener', '选股'), key: 'screener' },
   { label: navLink('/positions', '持仓'), key: 'positions' },
-  { label: navLink('/recommendations', '推荐追踪'), key: 'recommendations' },
   {
-    label: 'AI 研究',
-    key: 'ai-group',
+    label: '市场',
+    key: 'market-group',
     children: [
+      { label: navLink('/mood', '盘面情绪'), key: 'mood' },
+      { label: navLink('/news', '快讯'), key: 'news' },
+      { label: navLink('/heatmap', '行业热力图'), key: 'heatmap' },
+      { label: navLink('/etf', '指数ETF'), key: 'etf' },
+    ],
+  },
+  {
+    label: '研究',
+    key: 'research-group',
+    children: [
+      { label: navLink('/recommendations', '推荐追踪'), key: 'recommendations' },
       { label: navLink('/analysis', 'AI 分析'), key: 'analysis' },
       { label: navLink('/daily-report', '收盘日报'), key: 'daily-report' },
       { label: navLink('/qa', '个股问答'), key: 'qa' },
@@ -120,11 +129,9 @@ const menuOptions = computed<MenuOption[]>(() => [
     key: 'more-group',
     children: [
       { label: navLink('/backtest', '回测时光机'), key: 'backtest' },
-      { label: navLink('/heatmap', '行业热力图'), key: 'heatmap' },
       { label: navLink('/thesis', '投资逻辑卡'), key: 'thesis' },
       { label: navLink('/notes', '投资笔记'), key: 'notes' },
       { label: navLink('/paper', '模拟交易'), key: 'paper' },
-      { label: navLink('/etf', '指数ETF'), key: 'etf' },
       { label: navLink('/alerts', '条件提醒'), key: 'alerts' },
       { label: navLink('/prompt-templates', '提示词模板'), key: 'prompts' },
     ],
@@ -277,15 +284,23 @@ onUnmounted(() => {
       <RouterLink to="/" class="logo-link">
         <BrandLogo :size="30" />
       </RouterLink>
-      <n-menu mode="horizontal" responsive :options="menuOptions" :value="activeKey" class="app-menu" />
+      <div class="app-menu-wrap">
+        <n-menu mode="horizontal" responsive :options="menuOptions" :value="activeKey" class="app-menu" />
+      </div>
       <div class="header-right">
-        <!-- 全局速查入口（Ctrl+K） -->
-        <button class="search-trigger" type="button" @click="showSearch = true">
+        <!-- 全局股票搜索入口（Ctrl+K） -->
+        <button
+          class="search-trigger"
+          type="button"
+          aria-label="搜股票"
+          title="搜股票 (Ctrl+K)"
+          @click="showSearch = true"
+        >
           <svg class="st-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="11" cy="11" r="7" />
             <path d="m20 20-3.5-3.5" stroke-linecap="round" />
           </svg>
-          <span class="st-text">搜代码</span>
+          <span class="st-text">搜股票</span>
           <span class="st-kbd">Ctrl K</span>
         </button>
 
@@ -346,6 +361,13 @@ onUnmounted(() => {
       </RouterView>
     </main>
 
+    <MobileBottomNav
+      :search-active="showSearch"
+      :todo-badge="todoBadgeText"
+      :todo-incomplete="todoIncomplete"
+      @open-search="showSearch = true"
+    />
+
     <GlobalSearch v-model:show="showSearch" />
 
     <!-- 移动端抽屉导航：与顶部菜单同一份 options，分组默认展开 -->
@@ -354,13 +376,15 @@ onUnmounted(() => {
         <template #header>
           <BrandLogo :size="26" />
         </template>
-        <n-menu
-          mode="vertical"
-          :options="menuOptions"
-          :value="activeKey"
-          :default-expanded-keys="['ai-group', 'more-group']"
-          :indent="24"
-        />
+        <div class="drawer-menu-wrap" :style="shellVars">
+          <n-menu
+            mode="vertical"
+            :options="menuOptions"
+            :value="activeKey"
+            :default-expanded-keys="['market-group', 'research-group', 'more-group']"
+            :indent="24"
+          />
+        </div>
       </n-drawer-content>
     </n-drawer>
   </div>
@@ -402,33 +426,39 @@ onUnmounted(() => {
   text-decoration: none;
   flex-shrink: 0;
 }
-.app-menu {
+.app-menu-wrap {
   flex: 1;
+  min-width: 0;
+}
+.app-menu-wrap :deep(.app-menu) {
+  width: 100%;
 }
 
 /* 菜单项胶囊化：激活主色浅底、hover 中性浅底 */
-.app-menu :deep(.n-menu-item-content) {
+.app-menu-wrap :deep(.n-menu-item-content) {
   padding: 0 14px !important;
   border-radius: 999px;
   transition: background-color 0.18s ease;
 }
-.app-menu :deep(.n-menu-item-content:hover) {
+.app-menu-wrap :deep(.n-menu-item-content:hover) {
   background: var(--qv-menu-hover);
 }
-.app-menu :deep(.n-menu-item-content--selected),
-.app-menu :deep(.n-menu-item-content--child-active) {
+.app-menu-wrap :deep(.n-menu-item-content--selected),
+.app-menu-wrap :deep(.n-menu-item-content--child-active) {
   background: var(--qv-menu-active);
 }
-.app-menu :deep(.n-menu-item-content--selected .n-menu-item-content-header),
-.app-menu :deep(.n-menu-item-content--child-active .n-menu-item-content-header) {
+.app-menu-wrap :deep(.n-menu-item-content--selected .n-menu-item-content-header),
+.app-menu-wrap :deep(.n-menu-item-content--child-active .n-menu-item-content-header) {
   font-weight: 600;
 }
-.app-menu :deep(.nav-today) {
+.app-menu-wrap :deep(.nav-today),
+.drawer-menu-wrap :deep(.nav-today) {
   display: inline-flex;
   align-items: center;
   gap: 6px;
 }
-.app-menu :deep(.nav-badge) {
+.app-menu-wrap :deep(.nav-badge),
+.drawer-menu-wrap :deep(.nav-badge) {
   min-width: 16px;
   height: 16px;
   padding: 0 4px;
@@ -440,7 +470,8 @@ onUnmounted(() => {
   line-height: 16px;
   text-align: center;
 }
-.app-menu :deep(.nav-badge-incomplete) {
+.app-menu-wrap :deep(.nav-badge-incomplete),
+.drawer-menu-wrap :deep(.nav-badge-incomplete) {
   background: var(--qv-badge-incomplete-bg);
 }
 
@@ -592,7 +623,7 @@ onUnmounted(() => {
   .nav-burger {
     display: inline-flex;
   }
-  .app-menu {
+  .app-menu-wrap {
     display: none;
   }
   /* logo 靠左，右侧操作组自然靠右 */
@@ -602,20 +633,9 @@ onUnmounted(() => {
   .header-right {
     gap: 4px;
   }
-  /* 搜索入口只留放大镜图标 */
-  .st-text,
-  .st-kbd {
-    display: none;
-  }
+  /* 搜索由固定底栏承载，避免 320px 顶栏出现重复入口和拥挤。 */
   .search-trigger {
-    gap: 0;
-    padding: 0 8px;
-    border-color: transparent;
-    background: transparent;
-  }
-  .st-icon {
-    width: 17px;
-    height: 17px;
+    display: none;
   }
   /* 主题按钮只留色块，用户菜单只留头像 */
   .theme-label {
@@ -628,7 +648,7 @@ onUnmounted(() => {
     padding: 3px;
   }
   .app-main {
-    padding: 16px 12px 44px;
+    padding: 16px 12px calc(72px + env(safe-area-inset-bottom, 0px));
   }
 }
 </style>
