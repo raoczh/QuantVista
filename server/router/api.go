@@ -47,6 +47,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	backtestSvc := service.NewBacktestService(marketSvc)
 	moodSvc := service.NewMoodService()
 	orgViewSvc := service.NewOrgViewService()
+	stockSearchSvc := service.NewStockSearchService()
 	// D17 持仓卖出决策 AI 建议（逐笔 hold|trim|exit，走 llm_tasks 后台任务）
 	positionAdviceSvc := service.NewPositionAdviceService(positionSvc, llmSvc)
 
@@ -82,6 +83,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	moodCtl := controller.NewMoodController(moodSvc)
 	boardCtl := controller.NewBoardController(boardSvc)
 	orgViewCtl := controller.NewOrgViewController(orgViewSvc)
+	stockSearchCtl := controller.NewStockSearchController(stockSearchSvc)
 
 	api := r.Group("/api")
 	{
@@ -145,6 +147,9 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 		authed := api.Group("")
 		authed.Use(middleware.JWTAuth())
 		{
+			// 全局股票搜索（只读本地股票宇宙，不触发行情或外部数据源）。
+			authed.GET("/stocks/search", stockSearchCtl.Search)
+
 			user := authed.Group("/user")
 			{
 				user.GET("/self", userCtl.GetSelf)

@@ -484,11 +484,17 @@ function fmtSignedPct(v: number | undefined | null): string {
   return `${v > 0 ? '+' : ''}${v.toFixed(2)}%`
 }
 
-onMounted(async () => {
-  // 从个股页/自选跳转带参：预填模块与标的。
+function applyStockActionQuery() {
   if (route.query.module) form.value.module = String(route.query.module) as AnalysisModule
   if (route.query.symbol) form.value.symbol = String(route.query.symbol)
   if (route.query.market) form.value.market = String(route.query.market)
+}
+
+watch(() => route.query._stock_action, applyStockActionQuery)
+
+onMounted(async () => {
+  // 从个股页/自选跳转带参：预填模块与标的。
+  applyStockActionQuery()
   await Promise.all([loadLLM(), loadHistory()])
   const processing = history.value.find((h) => h.status === 'processing')
   if (processing) {

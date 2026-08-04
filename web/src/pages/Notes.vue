@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -64,15 +64,16 @@ async function load() {
 const showForm = ref(false)
 const saving = ref(false)
 const editingId = ref<number | null>(null)
-const form = ref<{ symbol: string; kind: NoteKind; title: string; content: string }>({
+const form = ref<{ symbol: string; market: string; kind: NoteKind; title: string; content: string }>({
   symbol: '',
+  market: 'cn',
   kind: '',
   title: '',
   content: '',
 })
 function resetForm() {
   editingId.value = null
-  form.value = { symbol: '', kind: '', title: '', content: '' }
+  form.value = { symbol: '', market: 'cn', kind: '', title: '', content: '' }
 }
 // 顶部按钮切换：收起时无条件清空编辑态，再点开即为新建，不会残留上次的“保存修改”态。
 function toggleForm() {
@@ -85,7 +86,7 @@ function toggleForm() {
 }
 function editNote(n: ResearchNote) {
   editingId.value = n.id
-  form.value = { symbol: n.symbol, kind: n.kind, title: n.title, content: n.content }
+  form.value = { symbol: n.symbol, market: n.market || 'cn', kind: n.kind, title: n.title, content: n.content }
   showForm.value = true
 }
 
@@ -98,7 +99,7 @@ async function submit() {
   try {
     const data = {
       symbol: form.value.symbol.trim(),
-      market: form.value.symbol.trim() ? 'cn' : '',
+      market: form.value.symbol.trim() ? form.value.market : '',
       kind: form.value.kind,
       title: form.value.title,
       content: form.value.content,
@@ -134,17 +135,25 @@ function fmtTime(t: string) {
   return new Date(t).toLocaleString('zh-CN', { hour12: false })
 }
 
-onMounted(() => {
+function applyStockActionQuery() {
   // 深链预填：/notes?add=1&symbol=（个股入口）；/notes?symbol= 直接过滤时间线。
   if (route.query.symbol) {
     if (route.query.add === '1') {
+      resetForm()
       form.value.symbol = String(route.query.symbol)
+      form.value.market = String(route.query.market || 'cn')
       showForm.value = true
     } else {
       filterSymbol.value = String(route.query.symbol)
     }
-    router.replace({ query: {} })
+    void router.replace({ query: {} })
   }
+}
+
+watch(() => route.query._stock_action, applyStockActionQuery)
+
+onMounted(() => {
+  applyStockActionQuery()
   load()
 })
 </script>

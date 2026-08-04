@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onBeforeUnmount, onMounted } from 'vue'
+import { ref, computed, onBeforeUnmount, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -31,6 +31,8 @@ const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const marketOptions = [
   { label: 'A 股', value: 'cn' },
+  { label: '港股', value: 'hk' },
+  { label: '美股', value: 'us' },
 ]
 
 // ---------- 输入 ----------
@@ -47,8 +49,8 @@ function removeRow(i: number) {
 
 const withAI = ref(false)
 
-// 支持 ?symbols=600519,000001 预填（全局速查/首页速查跳转入口），填完即清 query。
-onMounted(() => {
+// 支持 ?symbols=600519,000001 预填（全局搜索/首页入口），填完即清 query。
+function applyStockActionQuery() {
   const q = String(route.query.symbols || '')
   if (!q) return
   const syms = q
@@ -60,9 +62,13 @@ onMounted(() => {
   while (inputs.value.length < Math.max(2, syms.length)) inputs.value.push({ symbol: '', market: 'cn' })
   syms.forEach((s, i) => {
     inputs.value[i].symbol = s
+    if (i === 0 && route.query.market) inputs.value[i].market = String(route.query.market)
   })
-  router.replace({ name: 'compare' })
-})
+  void router.replace({ name: 'compare' })
+}
+
+watch(() => route.query._stock_action, applyStockActionQuery)
+onMounted(applyStockActionQuery)
 
 // ---------- LLM ----------
 const llmConfigs = ref<LLMConfig[]>([])

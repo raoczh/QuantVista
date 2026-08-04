@@ -1,76 +1,227 @@
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
-import { NModal, NInput, NButton, NSpin, NEmpty, useMessage } from 'naive-ui'
-import { getQuote, type Quote } from '@/api/market'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { NButton, NEmpty, NInput, NModal, NSpin, NTag } from 'naive-ui'
+import { searchStocks, type StockSearchItem } from '@/api/stockSearch'
+import { useStockActions, type StockActionKey, type StockRef } from '@/composables/useStockActions'
+import {
+  clearRecentStocks,
+  readRecentStocks,
+  type RecentStock,
+} from '@/composables/useRecentStocks'
+import { useAuthStore } from '@/stores/auth'
 import { useUi } from '@/composables/useUi'
-import { useStockActions } from '@/composables/useStockActions'
-import ChangeTag from './ChangeTag.vue'
+import StockActionMenu from './StockActionMenu.vue'
 
-// 全局速查命令面板：Ctrl/Cmd+K 唤起，精确代码查行情 + 快捷动作直达各功能页。
-// 后端无模糊搜索接口，仅支持精确代码（自用足够）；市场固定 A 股（与全站现状一致）。
 const props = defineProps<{ show: boolean }>()
-const emit = defineEmits<{ (e: 'update:show', v: boolean): void }>()
+const emit = defineEmits<{ (e: 'update:show', value: boolean): void }>()
 
-const message = useMessage()
-const { vars, pctColor, upColor, downColor } = useUi()
-const { adding, goAnalysis, goQa, goCompare, goAlert, addToWatchlist } = useStockActions(() =>
-  emit('update:show', false),
-)
-
+const auth = useAuthStore()
+const { vars, primaryAlpha } = useUi()
+const { goDetail } = useStockActions(() => emit('update:show', false))
 const keyword = ref('')
-const quote = ref<Quote | null>(null)
+const results = ref<StockSearchItem[]>([])
+const recentStocks = ref<RecentStock[]>([])
 const loading = ref(false)
+const errorMessage = ref('')
+const selectedIndex = ref(0)
 const inputRef = ref<InstanceType<typeof NInput> | null>(null)
 
+type DisplayStock = StockSearchItem | RecentStock
+
+const normalizedKeyword = computed(() => keyword.value.trim())
+const showingRecent = computed(() => normalizedKeyword.value === '')
+const displayItems = computed<DisplayStock[]>(() =>
+  showingRecent.value ? recentStocks.value : results.value,
+)
+const activeDescendant = computed(() =>
+  displayItems.value[selectedIndex.value] ? optionID(displayItems.value[selectedIndex.value]) : undefined,
+)
 const panelVars = computed(() => ({
   '--gs-bg': vars.value.cardColor,
   '--gs-divider': vars.value.dividerColor,
+  '--gs-primary': vars.value.primaryColor,
+  '--gs-active': primaryAlpha(0.1),
+  '--gs-muted': vars.value.textColor3,
 }))
+
+let debounceTimer: ReturnType<typeof setTimeout> | null = null
+let searchAbort: AbortController | null = null
+let searchSeq = 0
+
+function close() {
+  emit('update:show', false)
+}
+
+function cancelSearch() {
+  searchSeq++
+  if (debounceTimer) clearTimeout(debounceTimer)
+  debounceTimer = null
+  searchAbort?.abort()
+  searchAbort = null
+}
+
+function reloadRecent() {
+  recentStocks.value = readRecentStocks(auth.user?.id || 0)
+}
+
+function resetSearch() {
+  cancelSearch()
+  keyword.value = ''
+  results.value = []
+  errorMessage.value = ''
+  loading.value = false
+  selectedIndex.value = 0
+}
 
 watch(
   () => props.show,
-  async (v) => {
-    if (v) {
-      await nextTick()
-      inputRef.value?.focus()
-    } else {
-      keyword.value = ''
-      quote.value = null
+  async (show) => {
+    if (!show) {
+      resetSearch()
+      return
     }
+    reloadRecent()
+    await nextTick()
+    inputRef.value?.focus()
   },
 )
 
-function onKeydown(e: KeyboardEvent) {
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
-    e.preventDefault()
-    emit('update:show', !props.show)
-  }
-}
-onMounted(() => window.addEventListener('keydown', onKeydown))
-onUnmounted(() => window.removeEventListener('keydown', onKeydown))
+watch(
+  () => auth.user?.id,
+  () => {
+    resetSearch()
+    reloadRecent()
+  },
+)
 
-let searchSeq = 0
-async function search() {
-  const code = keyword.value.trim()
-  if (!code) return
+watch(keyword, (value) => {
+  cancelSearch()
+  results.value = []
+  errorMessage.value = ''
+  selectedIndex.value = 0
+  const query = value.trim()
+  if (!query) {
+    loading.value = false
+    reloadRecent()
+    return
+  }
+  loading.value = true
+  debounceTimer = setTimeout(() => void performSearch(query), 250)
+})
+
+async function performSearch(query = normalizedKeyword.value) {
+  if (!query) return
+  if (debounceTimer) clearTimeout(debounceTimer)
+  debounceTimer = null
+  searchAbort?.abort()
+  const controller = new AbortController()
+  searchAbort = controller
   const mySeq = ++searchSeq
   loading.value = true
-  quote.value = null
+  errorMessage.value = ''
   try {
-    const q = await getQuote('cn', code)
-    if (mySeq !== searchSeq) return
-    quote.value = q
+    const result = await searchStocks(query, 20, controller.signal)
+    if (mySeq !== searchSeq || query !== normalizedKeyword.value) return
+    results.value = result.items || []
+    selectedIndex.value = 0
   } catch (e) {
-    if (mySeq !== searchSeq) return
-    message.error((e as Error).message)
+    if (mySeq !== searchSeq || controller.signal.aborted) return
+    errorMessage.value = (e as Error).message || '搜索失败，请重试'
+    results.value = []
   } finally {
-    if (mySeq === searchSeq) loading.value = false
+    if (mySeq === searchSeq) {
+      loading.value = false
+      searchAbort = null
+    }
   }
 }
 
-function fmt(n: number) {
-  return n.toFixed(2)
+function onGlobalKeydown(event: KeyboardEvent) {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+    if (event.repeat) return
+    event.preventDefault()
+    emit('update:show', !props.show)
+    return
+  }
+  if (props.show && event.key === 'Escape' && !event.defaultPrevented) {
+    event.preventDefault()
+    close()
+  }
 }
+
+function onInputKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.keyCode === 229) return
+  const count = displayItems.value.length
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    close()
+    return
+  }
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    event.preventDefault()
+    if (!count) return
+    const direction = event.key === 'ArrowDown' ? 1 : -1
+    selectedIndex.value = (selectedIndex.value + direction + count) % count
+    void nextTick(() => {
+      document.getElementById(activeDescendant.value || '')?.scrollIntoView({ block: 'nearest' })
+    })
+    return
+  }
+  if (event.key === 'Enter') {
+    event.preventDefault()
+    const selected = displayItems.value[selectedIndex.value]
+    if (selected) {
+      void openStock(selected)
+    } else if (normalizedKeyword.value && !loading.value) {
+      void performSearch()
+    }
+  }
+}
+
+async function openStock(stock: StockRef) {
+  await goDetail(stock)
+}
+
+function clearHistory() {
+  clearRecentStocks(auth.user?.id || 0)
+  recentStocks.value = []
+  selectedIndex.value = 0
+}
+
+function onActionCompleted(
+  stock: DisplayStock,
+  event: { action: StockActionKey; success: boolean },
+) {
+  if (!event.success) return
+  reloadRecent()
+  if (event.action === 'watchlist' && 'in_watchlist' in stock) stock.in_watchlist = true
+}
+
+function optionID(stock: DisplayStock) {
+  return `gs-stock-${stock.market}-${stock.symbol}`.replace(/[^a-zA-Z0-9_-]/g, '-')
+}
+
+function marketLabel(market: string) {
+  return ({ cn: 'A 股', hk: '港股', us: '美股' } as Record<string, string>)[market.toLowerCase()] || market.toUpperCase()
+}
+
+function visitTime(value: string) {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })
+}
+
+onMounted(() => window.addEventListener('keydown', onGlobalKeydown))
+onUnmounted(() => {
+  window.removeEventListener('keydown', onGlobalKeydown)
+  cancelSearch()
+})
 </script>
 
 <template>
@@ -82,7 +233,7 @@ function fmt(n: number) {
   >
     <div class="gs-panel" :style="panelVars">
       <div class="gs-input-row">
-        <svg class="gs-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <svg class="gs-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
           <circle cx="11" cy="11" r="7" />
           <path d="m20 20-3.5-3.5" stroke-linecap="round" />
         </svg>
@@ -90,61 +241,113 @@ function fmt(n: number) {
           ref="inputRef"
           v-model:value="keyword"
           class="gs-input"
-          placeholder="输入股票代码回车查询，如 600519（仅 A 股）"
+          placeholder="搜索名称、代码或拼音"
+          :maxlength="64"
           :bordered="false"
           size="large"
-          @keyup.enter="search"
+          aria-label="搜索股票"
+          aria-controls="gs-stock-list"
+          :aria-activedescendant="activeDescendant"
+          @keydown="onInputKeydown"
         />
-        <span class="gs-kbd">ESC</span>
       </div>
 
       <div class="gs-body">
-        <n-spin :show="loading">
-          <template v-if="quote">
-            <div class="gs-head">
-              <div class="gs-name">
-                <span class="gs-title">{{ quote.name }}</span>
-                <span class="gs-symbol qv-mono">{{ quote.symbol }}</span>
+        <div v-if="normalizedKeyword && loading" class="gs-state" aria-live="polite">
+          <n-spin size="small" />
+          <span>正在搜索</span>
+        </div>
+
+        <div v-else-if="normalizedKeyword && errorMessage" class="gs-state gs-error" role="alert">
+          <span class="gs-state-text">{{ errorMessage }}</span>
+          <n-button size="small" secondary @click="performSearch()">重试</n-button>
+        </div>
+
+        <template v-else-if="normalizedKeyword && results.length">
+          <div class="gs-section-head">
+            <span>搜索结果</span>
+            <span class="gs-count">{{ results.length }} 项</span>
+          </div>
+          <div id="gs-stock-list" class="gs-list" role="listbox" aria-label="股票搜索结果">
+            <div
+              v-for="(stock, index) in results"
+              :id="optionID(stock)"
+              :key="`${stock.market}:${stock.symbol}`"
+              class="gs-result-row"
+              :class="{ 'is-active': index === selectedIndex }"
+              role="option"
+              :aria-selected="index === selectedIndex"
+              @mouseenter="selectedIndex = index"
+              @click="openStock(stock)"
+            >
+              <div class="gs-result-main">
+                <div class="gs-primary-line">
+                  <span class="gs-name" :title="stock.name">{{ stock.name }}</span>
+                  <span class="gs-symbol qv-mono">{{ stock.symbol }}</span>
+                </div>
+                <div class="gs-meta-line">
+                  <span>{{ marketLabel(stock.market) }}</span>
+                  <span v-if="stock.industry" class="gs-industry" :title="stock.industry">{{ stock.industry }}</span>
+                  <span>{{ stock.as_of ? `截至 ${stock.as_of}` : '数据日期未知' }}</span>
+                </div>
+                <div v-if="stock.in_watchlist || stock.has_position" class="gs-relations">
+                  <n-tag v-if="stock.in_watchlist" size="small" :bordered="false">自选</n-tag>
+                  <n-tag v-if="stock.has_position" size="small" type="success" :bordered="false">持仓</n-tag>
+                </div>
               </div>
-              <div class="gs-price-row">
-                <span class="gs-price qv-figure" :style="{ color: pctColor(quote.change_pct) }">
-                  {{ fmt(quote.price) }}
-                </span>
-                <ChangeTag :value="quote.change_pct" />
-              </div>
+              <StockActionMenu
+                :stock="stock"
+                :watchlist-state="stock.in_watchlist ? 'in' : 'out'"
+                :position-state="stock.has_position ? 'held' : 'none'"
+                @close="close"
+                @completed="onActionCompleted(stock, $event)"
+              />
             </div>
-            <div class="gs-grid">
-              <div class="gs-cell">
-                <span class="gs-k">今开</span>
-                <span class="gs-v qv-tnum">{{ fmt(quote.open) }}</span>
+          </div>
+        </template>
+
+        <n-empty
+          v-else-if="normalizedKeyword"
+          class="gs-empty"
+          description="没有找到相关股票"
+        />
+
+        <template v-else>
+          <div class="gs-section-head">
+            <span>最近访问</span>
+            <n-button v-if="recentStocks.length" size="tiny" quaternary @click="clearHistory">清空</n-button>
+          </div>
+          <div v-if="recentStocks.length" id="gs-stock-list" class="gs-list" role="listbox" aria-label="最近访问股票">
+            <div
+              v-for="(stock, index) in recentStocks"
+              :id="optionID(stock)"
+              :key="`${stock.market}:${stock.symbol}`"
+              class="gs-result-row"
+              :class="{ 'is-active': index === selectedIndex }"
+              role="option"
+              :aria-selected="index === selectedIndex"
+              @mouseenter="selectedIndex = index"
+              @click="openStock(stock)"
+            >
+              <div class="gs-result-main">
+                <div class="gs-primary-line">
+                  <span class="gs-name" :title="stock.name">{{ stock.name }}</span>
+                  <span class="gs-symbol qv-mono">{{ stock.symbol }}</span>
+                </div>
+                <div class="gs-meta-line">
+                  <span>{{ marketLabel(stock.market) }}</span>
+                  <span>最近于 {{ visitTime(stock.lastVisitedAt) }}</span>
+                </div>
               </div>
-              <div class="gs-cell">
-                <span class="gs-k">昨收</span>
-                <span class="gs-v qv-tnum">{{ fmt(quote.prev_close) }}</span>
-              </div>
-              <div class="gs-cell">
-                <span class="gs-k">最高</span>
-                <span class="gs-v qv-tnum" :style="{ color: upColor }">{{ fmt(quote.high) }}</span>
-              </div>
-              <div class="gs-cell">
-                <span class="gs-k">最低</span>
-                <span class="gs-v qv-tnum" :style="{ color: downColor }">{{ fmt(quote.low) }}</span>
-              </div>
+              <StockActionMenu
+                :stock="stock"
+                @close="close"
+                @completed="onActionCompleted(stock, $event)"
+              />
             </div>
-            <div class="gs-actions">
-              <n-button size="small" secondary @click="goAnalysis(quote)">AI 分析</n-button>
-              <n-button size="small" secondary @click="goQa(quote)">个股问答</n-button>
-              <n-button size="small" secondary @click="goCompare(quote)">横向对比</n-button>
-              <n-button size="small" secondary :loading="adding" @click="addToWatchlist(quote)">+ 自选</n-button>
-              <n-button size="small" secondary @click="goAlert(quote)">设提醒</n-button>
-            </div>
-          </template>
-          <n-empty
-            v-else-if="!loading"
-            class="gs-empty"
-            description="查到行情后可直达 AI 分析 / 问答 / 对比 / 自选 / 提醒"
-          />
-        </n-spin>
+          </div>
+          <n-empty v-else class="gs-empty" description="暂无最近访问" />
+        </template>
       </div>
     </div>
   </n-modal>
@@ -152,110 +355,170 @@ function fmt(n: number) {
 
 <style scoped>
 .gs-panel {
-  width: min(560px, calc(100vw - 32px));
-  margin-bottom: 26vh; /* 面板整体上移，命令面板惯例位 */
-  border-radius: 16px;
-  background: var(--gs-bg);
+  width: min(640px, calc(100vw - 32px));
+  max-height: min(620px, calc(100dvh - 64px));
+  margin-bottom: 12vh;
   border: 1px solid var(--gs-divider);
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.24);
+  border-radius: 8px;
+  background: var(--gs-bg);
+  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.24);
   overflow: hidden;
 }
 .gs-input-row {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 6px 14px;
+  gap: 8px;
+  min-width: 0;
+  padding: 7px 14px;
   border-bottom: 1px solid var(--gs-divider);
 }
 .gs-icon {
   width: 18px;
   height: 18px;
-  opacity: 0.5;
-  flex-shrink: 0;
-}
-.gs-input {
-  flex: 1;
-}
-.gs-kbd {
-  flex-shrink: 0;
-  font-size: 11px;
-  padding: 2px 6px;
-  border-radius: 5px;
-  border: 1px solid var(--gs-divider);
+  flex: 0 0 auto;
   opacity: 0.55;
 }
+.gs-input {
+  min-width: 0;
+  flex: 1;
+}
 .gs-body {
-  padding: 16px;
-  min-height: 132px;
+  min-height: 154px;
+  max-height: min(500px, calc(100dvh - 142px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 10px;
 }
-.gs-head {
+.gs-section-head {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
+  min-height: 30px;
+  padding: 0 8px 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--gs-muted);
 }
-.gs-name {
+.gs-count {
+  font-variant-numeric: tabular-nums;
+  font-weight: 400;
+}
+.gs-list {
+  display: grid;
+  gap: 2px;
+}
+.gs-result-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 70px;
+  padding: 9px 8px 9px 11px;
+  border-left: 3px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  outline: none;
+}
+.gs-result-row.is-active {
+  border-left-color: var(--gs-primary);
+  background: var(--gs-active);
+}
+.gs-result-main {
+  min-width: 0;
+}
+.gs-primary-line {
   display: flex;
   align-items: baseline;
   gap: 8px;
   min-width: 0;
 }
-.gs-title {
-  font-size: 17px;
-  font-weight: 700;
+.gs-name {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 15px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .gs-symbol {
+  flex: 0 0 auto;
   font-size: 12px;
-  opacity: 0.5;
+  color: var(--gs-muted);
 }
-.gs-price-row {
+.gs-meta-line {
   display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.gs-price {
-  font-size: 24px;
-  font-weight: 700;
-}
-.gs-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 10px;
-  margin-top: 14px;
-}
-.gs-cell {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-.gs-k {
-  font-size: 11px;
-  opacity: 0.55;
-}
-.gs-v {
-  font-size: 14px;
-  font-weight: 500;
-}
-.gs-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
   flex-wrap: wrap;
-  margin-top: 16px;
-  padding-top: 14px;
-  border-top: 1px solid var(--gs-divider);
+  gap: 3px 10px;
+  min-width: 0;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--gs-muted);
+}
+.gs-meta-line > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.gs-industry {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gs-relations {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+.gs-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 132px;
+  padding: 16px;
+  color: var(--gs-muted);
+}
+.gs-error {
+  flex-direction: column;
+  text-align: center;
+}
+.gs-state-text {
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 .gs-empty {
-  padding: 18px 0;
+  padding: 28px 0;
 }
 
 @media (max-width: 480px) {
-  .gs-grid {
-    grid-template-columns: repeat(2, 1fr);
+  .gs-panel {
+    width: calc(100vw - 16px);
+    max-height: calc(100dvh - 24px);
+    margin-bottom: 0;
   }
-  .gs-kbd {
-    display: none;
+  .gs-input-row {
+    padding-inline: 10px;
+  }
+  .gs-body {
+    max-height: calc(100dvh - 94px);
+    padding: 8px 6px;
+  }
+  .gs-result-row {
+    gap: 4px;
+    padding-inline: 8px 4px;
+  }
+  .gs-primary-line {
+    flex-wrap: wrap;
+    gap: 2px 7px;
+  }
+  .gs-name {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .gs-industry {
+    max-width: 120px;
   }
 }
 </style>

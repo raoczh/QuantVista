@@ -1031,18 +1031,23 @@ watch([isDark, vars], () => {
   renderExposure()
 })
 
+function applyStockActionQuery() {
+  if (route.query.add !== '1') return
+  openCreate({
+    symbol: String(route.query.symbol || ''),
+    market: String(route.query.market || 'cn'),
+    name: String(route.query.name || ''),
+    recId: Number(route.query.rec_id) || 0,
+  })
+  void router.replace({ name: 'positions' })
+}
+
+watch(() => route.query._stock_action, applyStockActionQuery)
+
 onMounted(async () => {
   // 从自选/推荐「建仓」跳转而来：预填并打开建仓弹窗，然后清掉 query。
   // rec_id 为来源推荐（血缘），落库后推荐详情可展示「已建仓」与价格对比。
-  if (route.query.add === '1') {
-    openCreate({
-      symbol: String(route.query.symbol || ''),
-      market: String(route.query.market || 'cn'),
-      name: String(route.query.name || ''),
-      recId: Number(route.query.rec_id) || 0,
-    })
-    router.replace({ name: 'positions' })
-  }
+  applyStockActionQuery()
   await load()
   loadCurve()
   loadCorpAdjusts()

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -56,6 +56,8 @@ const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const marketOptions = [
   { label: 'A 股', value: 'cn' },
+  { label: '港股', value: 'hk' },
+  { label: '美股', value: 'us' },
 ]
 const kindOptions = [
   { label: '【持仓】相对我的成本涨 N%（考虑落袋）', value: 'cost_gain' },
@@ -303,14 +305,20 @@ function fmtTime(t: string | null) {
   return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : ''
 }
 
+function applyStockActionQuery() {
+  if (route.query.add !== '1') return
+  resetForm()
+  form.value.symbol = String(route.query.symbol || '')
+  form.value.market = String(route.query.market || 'cn')
+  form.value.name = String(route.query.name || '')
+  void router.replace({ name: 'alerts' })
+}
+
+watch(() => route.query._stock_action, applyStockActionQuery)
+
 onMounted(async () => {
   // 从自选/持仓「设提醒」跳转预填。
-  if (route.query.add === '1') {
-    form.value.symbol = String(route.query.symbol || '')
-    form.value.market = String(route.query.market || 'cn')
-    form.value.name = String(route.query.name || '')
-    router.replace({ name: 'alerts' })
-  }
+  applyStockActionQuery()
   await Promise.all([load(), loadChannels(), loadEvents()])
 })
 
