@@ -48,6 +48,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	moodSvc := service.NewMoodService()
 	orgViewSvc := service.NewOrgViewService()
 	stockSearchSvc := service.NewStockSearchService()
+	taskCenterSvc := service.NewTaskCenterService()
 	// D17 持仓卖出决策 AI 建议（逐笔 hold|trim|exit，走 llm_tasks 后台任务）
 	positionAdviceSvc := service.NewPositionAdviceService(positionSvc, llmSvc)
 
@@ -58,6 +59,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	userCtl := controller.NewUserController(userSvc)
 	llmCtl := controller.NewLLMController(llmSvc)
 	llmTaskCtl := controller.NewLLMTaskController()
+	taskCenterCtl := controller.NewTaskCenterController(taskCenterSvc)
 	adminCtl := controller.NewAdminController(adminSvc)
 	watchlistCtl := controller.NewWatchlistController(watchlistSvc)
 	positionCtl := controller.NewPositionController(positionSvc)
@@ -149,6 +151,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 		{
 			// 全局股票搜索（只读本地股票宇宙，不触发行情或外部数据源）。
 			authed.GET("/stocks/search", middleware.RateLimit(120, time.Minute), stockSearchCtl.Search)
+			// 统一任务中心：当前用户业务任务；管理员可显式附带系统同步日志。
+			authed.GET("/tasks", taskCenterCtl.List)
 
 			user := authed.Group("/user")
 			{

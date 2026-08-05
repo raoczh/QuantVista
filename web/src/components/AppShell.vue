@@ -27,6 +27,7 @@ import { setMarketTitle } from '@/lib/pageTitle'
 import BrandLogo from '@/components/BrandLogo.vue'
 import GlobalSearch from '@/components/GlobalSearch.vue'
 import MobileBottomNav from '@/components/MobileBottomNav.vue'
+import RecentTasks from '@/components/RecentTasks.vue'
 
 // 应用主外壳：必须挂在 n-config-provider 内部，useThemeVars 才能取到主题 override。
 const route = useRoute()
@@ -122,6 +123,7 @@ const menuOptions = computed<MenuOption[]>(() => [
       { label: navLink('/daily-report', '收盘日报'), key: 'daily-report' },
       { label: navLink('/qa', '个股问答'), key: 'qa' },
       { label: navLink('/compare', '横向对比'), key: 'compare' },
+      { label: navLink('/tasks', '任务中心'), key: 'tasks' },
     ],
   },
   {
@@ -313,6 +315,8 @@ onUnmounted(() => {
           <span class="st-text">搜股票</span>
           <span class="st-kbd">Ctrl K</span>
         </button>
+
+        <RecentTasks />
 
         <!-- 后端状态：圆点 + 悬浮详情 -->
         <n-popover trigger="hover" placement="bottom">

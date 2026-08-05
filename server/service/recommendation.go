@@ -42,10 +42,8 @@ const (
 	poolSnapshotMax    = 150   // 候选池快照落库条目上限（MySQL TEXT 64KB 容量保护，超出部分只记数量）
 
 	// 异步任务化（2026-07-14）：手动生成立即返回 processing 批次，后台独立 Context 完成后回写。
-	recJobTimeout      = 6 * time.Minute  // 后台生成任务总 deadline（建池+评分 3~8s + LLM 主调/repair/复核）
-	recShadowTimeout   = 2 * time.Minute  // 主批次与 facts 已稳定后独立运行；不得消费主链剩余 deadline
-	recProcessingStale = 15 * time.Minute // processing 批次超过该时长视为死任务（进程重启遗留），惰性判 failed
-
+	recJobTimeout    = 6 * time.Minute // 后台生成任务总 deadline（建池+评分 3~8s + LLM 主调/repair/复核）
+	recShadowTimeout = 2 * time.Minute // 主批次与 facts 已稳定后独立运行；不得消费主链剩余 deadline
 	// 模块级默认输出预算、截断扩容与 repair 次数统一收口 llm_budget.go。
 )
 
@@ -580,13 +578,25 @@ func (p *recGenPlan) newProcessingBatch() *model.RecommendationBatch {
 	}
 }
 
-// reuseProcessingBatch 幂等防重：该用户仍在生成中的批次直接复用；超过 recProcessingStale
+// expireStaleRecommendationBatches 将进程重启/崩溃遗留的 processing 批次惰性收敛。
+func expireStaleRecommendationBatches(userID int64) error {
+	now := time.Now()
+	return common.DB.Model(&model.RecommendationBatch{}).
+		Where("user_id = ? AND status = ? AND updated_at < ?",
+			userID, model.RecStatusProcessing, now.Add(-taskProcessingStaleAfter)).
+		Updates(map[string]any{
+			"status":     model.RecStatusFailed,
+			"error":      "任务中断（服务重启或执行超时），请重新生成",
+			"updated_at": now,
+		}).Error
+}
+
+// reuseProcessingBatch 幂等防重：该用户仍在生成中的批次直接复用；超过共享 stale TTL
 // 未回写的 processing 批次视为死任务（进程重启/崩溃遗留）惰性判 failed，放行新任务。
 func (s *RecommendationService) reuseProcessingBatch(userID int64) *RecommendationView {
-	common.DB.Model(&model.RecommendationBatch{}).
-		Where("user_id = ? AND status = ? AND updated_at < ?",
-			userID, model.RecStatusProcessing, time.Now().Add(-recProcessingStale)).
-		Updates(map[string]any{"status": model.RecStatusFailed, "error": "任务中断（服务重启或执行超时），请重新生成"})
+	if err := expireStaleRecommendationBatches(userID); err != nil {
+		common.SysWarn("推荐死任务清理失败 user=%d: %v", userID, err)
+	}
 	var b model.RecommendationBatch
 	if err := common.DB.Where("user_id = ? AND status = ?", userID, model.RecStatusProcessing).
 		Order("id DESC").First(&b).Error; err != nil {

@@ -64,7 +64,9 @@ function applyStockActionQuery() {
     inputs.value[i].symbol = s
     if (i === 0 && route.query.market) inputs.value[i].market = String(route.query.market)
   })
-  void router.replace({ name: 'compare' })
+  const query = { ...route.query }
+  for (const key of ['symbols', 'symbol', 'market', 'name', '_stock_action']) delete query[key]
+  void router.replace({ name: 'compare', query })
 }
 
 watch(() => route.query._stock_action, applyStockActionQuery)
@@ -133,7 +135,7 @@ async function run() {
 let pollAbort: AbortController | null = null
 onBeforeUnmount(() => pollAbort?.abort())
 
-async function trackCompareTask(initial: LLMTask<CompareResult>) {
+async function trackCompareTask(initial: LLMTask<CompareResult>, expectedRouteTaskID: number | null = null) {
   pollAbort?.abort()
   const controller = new AbortController()
   pollAbort = controller
@@ -146,12 +148,17 @@ async function trackCompareTask(initial: LLMTask<CompareResult>) {
             signal: controller.signal,
           })
         : initial
+    if (expectedRouteTaskID !== null && routeTaskID() !== expectedRouteTaskID) return
     activeTask.value = task
-    if (task.status === 'failed') throw new Error(task.error || '横向对比任务执行失败')
+    if (task.status === 'failed') {
+      const detail = task.error || '横向对比任务执行失败'
+      throw new Error(task.error_code ? `${detail}（${task.error_code}）` : detail)
+    }
     if (!task.result) throw new Error('横向对比任务已完成，但未返回结果')
     applyCompareResult(task.result)
   } catch (e) {
     if (isPollCancelled(e)) return
+    if (expectedRouteTaskID !== null && routeTaskID() !== expectedRouteTaskID) return
     taskError.value = (e as Error).message
     message.error(taskError.value)
   } finally {
@@ -163,7 +170,9 @@ async function trackCompareTask(initial: LLMTask<CompareResult>) {
 }
 
 async function restoreCompareTask() {
+  if (routeTaskID()) return
   const tasks = await listLLMTasks<CompareResult>({ kind: 'compare', limit: 1 }).catch(() => [])
+  if (routeTaskID()) return
   const summary = tasks[0]
   if (!summary) return
   if (summary.status === 'processing') {
@@ -172,6 +181,7 @@ async function restoreCompareTask() {
     return
   }
   const task = await getLLMTask<CompareResult>(summary.id).catch(() => summary)
+  if (routeTaskID()) return
   activeTask.value = task
   if (task.status === 'success' && task.result) {
     result.value = task.result
@@ -180,7 +190,55 @@ async function restoreCompareTask() {
   }
 }
 
-onMounted(() => void restoreCompareTask())
+function routeTaskID(): number | null {
+  const raw = Array.isArray(route.query.task_id) ? route.query.task_id[0] : route.query.task_id
+  const id = Number(raw)
+  return Number.isInteger(id) && id > 0 ? id : null
+}
+
+let restoredRouteTaskID: number | null = null
+let restoringRouteTaskID: number | null = null
+async function restoreRouteTask(): Promise<boolean> {
+  const id = routeTaskID()
+  if (!id) {
+    restoredRouteTaskID = null
+    if (restoringRouteTaskID !== null) pollAbort?.abort()
+    return false
+  }
+  if (restoredRouteTaskID === id || restoringRouteTaskID === id) return true
+
+  restoringRouteTaskID = id
+  pollAbort?.abort()
+  result.value = null
+  activeTask.value = null
+  taskError.value = ''
+  try {
+    const task = await getLLMTask<CompareResult>(id)
+    if (routeTaskID() !== id) return true
+    restoredRouteTaskID = id
+    if (task.kind !== 'compare') {
+      taskError.value = '该任务不是横向对比任务，无法在此页面打开'
+      message.error(taskError.value)
+      return true
+    }
+    await trackCompareTask(task, id)
+  } catch (e) {
+    if (routeTaskID() === id) {
+      taskError.value = (e as Error).message || '横向对比任务状态读取失败'
+      message.error(taskError.value)
+    }
+  } finally {
+    if (restoringRouteTaskID === id) restoringRouteTaskID = null
+  }
+  return true
+}
+
+watch(() => route.query.task_id, () => void restoreRouteTask())
+
+onMounted(async () => {
+  if (await restoreRouteTask()) return
+  await restoreCompareTask()
+})
 
 // ---------- 展示辅助 ----------
 const rows = computed(() => result.value?.rows.filter((r) => r.quote_ok) || [])

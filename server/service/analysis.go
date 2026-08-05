@@ -53,7 +53,8 @@ const (
 	analysisPromptVersion   = "p20" // p20: P1-2 交易计划失效条件 invalidators（tradePlanSystem 要求输出计划作废信号，schema trade_plan.v2）+ 结论级 claims 服务端推导（ev5，非 prompt 变化）；p19: 移除输出字段字数/条数限制，保留 JSON schema 与分析语义；p18: 输出瘦身（结构化数组条数/单条字数、panel 共识与分歧字数上限）；p17: 历史解释模式程序化硬约束（enforceStaleModeResult：summary 强制「截至 X 的历史数据解释」前缀、suggestions 剔除当前买卖行动词；panel 模式非 fresh 直接拒绝不接受 allow_stale）；p16: 行情时效 fail-closed——持仓割/守/补三选一仅限有当前有效行情的仓（stale/失败仓禁三选一）、个股 stale 禁当前评级（改历史解释模式或数据不足）、快照逐项 freshness 元数据；p15: 个股快照行情新鲜度元数据（captured_at/quote_as_of/quote_source/bars_as_of/market_state/freshness_status），stale 必须声明行情截至时间、非交易时段按收盘口径；p14: P3b 板块模块 board_valuation（中位 PE/PB+横截面/时序分位+积累天数）与 board_flow（板块主力资金）两段进 sector guidance；p13: P3a 机构观点 org_view 段（评级分布/评级变动/目标价偏离/调研密度）进个股 guidance + trade_plan 机构目标价对照锚；p12: M3c 交易员阶段（个股标准分析追加交易计划二次调用+量化仓位公式，计划价位与仓位数字进核验值域）；p11: M3a 市场模块情绪温度计 mood 段（连板分布/炸板率/昨涨停溢价）；p10: M2 回溯诊断 as_of 模式（截断快照+回溯声明段）；p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁用先验记忆；p3: 反方观点/失效条件/数据盲区
 	analysisStrategyVersion = "s1"
 	analysisJobTimeout      = 10 * time.Minute
-	analysisProcessingStale = 15 * time.Minute
+	// 兼容包内既有异步测试；实际 stale 口径由 taskProcessingStaleAfter 唯一定义。
+	analysisProcessingStale = taskProcessingStaleAfter
 )
 
 var validAnalysisModule = map[string]bool{
@@ -531,15 +532,21 @@ func (s *AnalysisService) failAnalysisRecord(rec *model.AnalysisRecord, msg stri
 }
 
 // expireStaleAnalyses 将进程重启/崩溃遗留的 processing 壳惰性收敛，避免前端永久轮询。
-func (s *AnalysisService) expireStaleAnalyses(userID int64) {
-	if err := common.DB.Model(&model.AnalysisRecord{}).
-		Where("user_id = ? AND status = ? AND updated_at < ?", userID, model.AnalysisStatusProcessing, time.Now().Add(-analysisProcessingStale)).
+func expireStaleAnalyses(userID int64) error {
+	now := time.Now()
+	return common.DB.Model(&model.AnalysisRecord{}).
+		Where("user_id = ? AND status = ? AND updated_at < ?", userID, model.AnalysisStatusProcessing, now.Add(-taskProcessingStaleAfter)).
 		Updates(map[string]any{
 			"status":     model.AnalysisStatusFailed,
 			"summary":    "分析失败",
 			"error":      "任务中断（服务重启或执行超时），请重新发起分析",
 			"error_code": AsyncLLMTaskErrorStale,
-		}).Error; err != nil {
+			"updated_at": now,
+		}).Error
+}
+
+func (s *AnalysisService) expireStaleAnalyses(userID int64) {
+	if err := expireStaleAnalyses(userID); err != nil {
 		common.SysWarn("分析死任务清理失败 user=%d: %v", userID, err)
 	}
 }

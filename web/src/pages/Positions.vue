@@ -53,7 +53,7 @@ import {
   type PositionAdviceResult,
   POSITION_VERDICT_LABEL,
 } from '@/api/position'
-import { getLLMTask } from '@/api/llmTask'
+import { getLLMTask, type LLMTask } from '@/api/llmTask'
 import { pollUntil } from '@/lib/poll'
 import { isAbortError } from '@/api/client'
 import { importPositions, downloadPositionTemplate, type ImportResult } from '@/api/export'
@@ -912,15 +912,7 @@ async function runAdvice() {
   adviceError.value = ''
   try {
     const task = await requestPositionAdvice()
-    const final = await pollUntil(
-      () => getLLMTask<PositionAdviceResult>(task.id),
-      (t) => t.status !== 'processing',
-      { signal: ctrl.signal },
-    )
-    if (final.status !== 'success' || !final.result) {
-      throw new Error(final.error || 'AI 建议生成失败')
-    }
-    advice.value = final.result
+    await resolveAdviceTask(task, ctrl)
   } catch (e) {
     if (isAbortError(e) || (e as Error).name === 'PollCancelled') return
     adviceError.value = (e as Error).message
@@ -928,6 +920,73 @@ async function runAdvice() {
     if (adviceAbort === ctrl) adviceLoading.value = false
   }
 }
+
+async function resolveAdviceTask(
+  initial: LLMTask<PositionAdviceResult>,
+  ctrl: AbortController,
+  expectedRouteTaskID: number | null = null,
+) {
+  if (initial.kind !== 'position_advice') throw new Error('该任务不是持仓建议任务，无法在此页面打开')
+  const final =
+    initial.status === 'processing'
+      ? await pollUntil(
+          () => getLLMTask<PositionAdviceResult>(initial.id),
+          (task) => task.status !== 'processing',
+          { signal: ctrl.signal },
+        )
+      : initial
+  if (expectedRouteTaskID !== null && routeTaskID() !== expectedRouteTaskID) return
+  if (final.kind !== 'position_advice') throw new Error('该任务不是持仓建议任务，无法在此页面打开')
+  if (final.status !== 'success' || !final.result) {
+    const detail = final.error || 'AI 建议生成失败'
+    throw new Error(final.error_code ? `${detail}（${final.error_code}）` : detail)
+  }
+  advice.value = final.result
+}
+
+function routeTaskID(): number | null {
+  const raw = Array.isArray(route.query.task_id) ? route.query.task_id[0] : route.query.task_id
+  const id = Number(raw)
+  return Number.isInteger(id) && id > 0 ? id : null
+}
+
+let restoredAdviceTaskID: number | null = null
+let restoringAdviceTaskID: number | null = null
+async function restoreRouteAdvice(): Promise<boolean> {
+  const id = routeTaskID()
+  if (!id) {
+    restoredAdviceTaskID = null
+    if (restoringAdviceTaskID !== null) adviceAbort?.abort()
+    return false
+  }
+  if (restoredAdviceTaskID === id || restoringAdviceTaskID === id) return true
+
+  restoringAdviceTaskID = id
+  adviceAbort?.abort()
+  const ctrl = new AbortController()
+  adviceAbort = ctrl
+  adviceLoading.value = true
+  advice.value = null
+  adviceError.value = ''
+  try {
+    const task = await getLLMTask<PositionAdviceResult>(id)
+    if (routeTaskID() !== id) return true
+    restoredAdviceTaskID = id
+    await resolveAdviceTask(task, ctrl, id)
+  } catch (e) {
+    if (isAbortError(e) || (e as Error).name === 'PollCancelled') return true
+    if (routeTaskID() === id) adviceError.value = (e as Error).message || '持仓建议任务状态读取失败'
+  } finally {
+    if (restoringAdviceTaskID === id) restoringAdviceTaskID = null
+    if (adviceAbort === ctrl) {
+      adviceAbort = null
+      adviceLoading.value = false
+    }
+  }
+  return true
+}
+
+watch(() => route.query.task_id, () => void restoreRouteAdvice())
 
 const verdictLabel = (v: string) => POSITION_VERDICT_LABEL[v as keyof typeof POSITION_VERDICT_LABEL] || v
 const verdictType = (v: string) => (v === 'exit' ? 'error' : v === 'trim' ? 'warning' : 'success')
@@ -1045,6 +1104,12 @@ function stockActionKey() {
   return String(route.query._stock_action || '') || [symbol, route.query.market || 'cn', route.query.add || ''].join(':')
 }
 
+function stockRouteRemainder() {
+  const query = { ...route.query }
+  for (const key of ['symbol', 'market', 'name', 'add', 'rec_id', '_stock_action']) delete query[key]
+  return query
+}
+
 function positionElementID(id: number) {
   return `position-item-${id}`
 }
@@ -1064,7 +1129,7 @@ async function applyStockActionQuery(): Promise<boolean> {
         name: String(route.query.name || ''),
         recId: Number(route.query.rec_id) || 0,
       })
-      await router.replace({ name: 'positions' })
+      await router.replace({ name: 'positions', query: stockRouteRemainder() })
       return true
     }
 
@@ -1098,7 +1163,7 @@ async function applyStockActionQuery(): Promise<boolean> {
         recId: Number(route.query.rec_id) || 0,
       })
     }
-    await router.replace({ name: 'positions' })
+    await router.replace({ name: 'positions', query: stockRouteRemainder() })
     return true
   } finally {
     if (activeStockAction === actionKey) activeStockAction = ''
@@ -1108,11 +1173,13 @@ async function applyStockActionQuery(): Promise<boolean> {
 watch(() => route.query._stock_action, () => void applyStockActionQuery())
 
 onMounted(async () => {
+  const hasExplicitTask = routeTaskID() !== null
   // 股票动作先核对当前持仓：已有记录定位高亮，否则预填建仓；rec_id 保留推荐血缘。
   if (!(await applyStockActionQuery())) await load()
   loadCurve()
   loadCorpAdjusts()
   loadSellReviews()
+  if (hasExplicitTask) void restoreRouteAdvice()
   window.addEventListener('resize', onResize)
 })
 onBeforeUnmount(() => {

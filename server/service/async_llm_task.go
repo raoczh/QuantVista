@@ -18,8 +18,6 @@ import (
 )
 
 const (
-	asyncLLMTaskStaleAfter = 15 * time.Minute
-
 	AsyncLLMTaskErrorFailed       = "task_failed"
 	AsyncLLMTaskErrorTimeout      = "task_timeout"
 	AsyncLLMTaskErrorPanic        = "task_panic"
@@ -261,7 +259,7 @@ func expireStaleLLMTasks(userID int64) error {
 	}
 	return common.DB.Model(&model.LLMTask{}).
 		Where("user_id = ? AND status = ? AND updated_at < ?",
-			userID, model.LLMTaskStatusProcessing, time.Now().Add(-asyncLLMTaskStaleAfter)).
+			userID, model.LLMTaskStatusProcessing, time.Now().Add(-taskProcessingStaleAfter)).
 		Updates(map[string]any{
 			"status":     model.LLMTaskStatusFailed,
 			"active_key": nil,

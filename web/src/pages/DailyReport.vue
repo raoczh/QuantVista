@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
   NEmpty,
@@ -29,6 +29,7 @@ import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
 
 const message = useMessage()
+const route = useRoute()
 const router = useRouter()
 const { pctColor } = useUi()
 const { llmLabel } = useLlmLabel()
@@ -54,13 +55,22 @@ function statusType(s: string): 'success' | 'warning' | 'error' | 'info' {
   return s === 'success' ? 'success' : s === 'partial' ? 'warning' : s === 'processing' ? 'info' : 'error'
 }
 
-async function load() {
+let selectionSeq = 0
+async function load(preferredId: number | null = null) {
+  const seq = ++selectionSeq
+  pollAbort?.abort()
   loading.value = true
   try {
-    rows.value = await listDailyReports(30)
-    if (rows.value.length) {
-      selectedId.value = rows.value[0].id
-      current.value = await getDailyReport(rows.value[0].id)
+    const nextRows = await listDailyReports(30)
+    if (seq !== selectionSeq) return
+    rows.value = nextRows
+    const targetId = preferredId || rows.value[0]?.id || null
+    if (targetId) {
+      selectedId.value = targetId
+      const view = await getDailyReport(targetId)
+      if (seq !== selectionSeq) return
+      current.value = view
+      if (!rows.value.some((row) => row.id === view.id)) rows.value = [view, ...rows.value]
       // 页面刷新恢复：最新报告仍在后台生成中，继续轮询跟踪。
       if (current.value.status === 'processing') {
         void trackProcessing(current.value.id)
@@ -69,21 +79,27 @@ async function load() {
       current.value = null
     }
   } catch (e) {
-    message.error((e as Error).message)
+    if (seq === selectionSeq) message.error((e as Error).message)
   } finally {
-    loading.value = false
+    if (seq === selectionSeq) loading.value = false
   }
 }
 
 async function pick(id: number | null) {
   if (!id) return
+  const seq = ++selectionSeq
+  pollAbort?.abort()
   loading.value = true
   try {
-    current.value = await getDailyReport(id)
+    const view = await getDailyReport(id)
+    if (seq !== selectionSeq) return
+    current.value = view
+    selectedId.value = id
+    if (view.status === 'processing') void trackProcessing(id)
   } catch (e) {
-    message.error((e as Error).message)
+    if (seq === selectionSeq) message.error((e as Error).message)
   } finally {
-    loading.value = false
+    if (seq === selectionSeq) loading.value = false
   }
 }
 
@@ -96,12 +112,13 @@ onBeforeUnmount(() => pollAbort?.abort())
 async function trackProcessing(id: number) {
   generating.value = true
   pollAbort?.abort()
-  pollAbort = new AbortController()
+  const controller = new AbortController()
+  pollAbort = controller
   try {
     const v = await pollUntil(
       () => getDailyReport(id),
       (r) => r.status !== 'processing',
-      { signal: pollAbort.signal },
+      { signal: controller.signal },
     )
     if (selectedId.value === id || !selectedId.value) {
       current.value = v
@@ -117,7 +134,10 @@ async function trackProcessing(id: number) {
     if (isPollCancelled(e)) return
     message.error((e as Error).message)
   } finally {
-    generating.value = false
+    if (pollAbort === controller) {
+      pollAbort = null
+      generating.value = false
+    }
   }
 }
 
@@ -226,7 +246,22 @@ const disclosures = computed<string[]>(() => {
   }
 })
 
-onMounted(load)
+function routeReportID(): number | null {
+  const raw = Array.isArray(route.query.report_id) ? route.query.report_id[0] : route.query.report_id
+  const id = Number(raw)
+  return Number.isInteger(id) && id > 0 ? id : null
+}
+
+watch(
+  () => route.query.report_id,
+  () => {
+    const id = routeReportID()
+    if (id) void pick(id)
+    else void load()
+  },
+)
+
+onMounted(() => void load(routeReportID()))
 </script>
 
 <template>

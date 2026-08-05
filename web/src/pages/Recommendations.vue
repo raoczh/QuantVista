@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
   NSelect,
@@ -63,6 +63,7 @@ import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
 
 const message = useMessage()
+const route = useRoute()
 const router = useRouter()
 const { upColor, downColor, flatColor, vars, withAlpha } = useUi()
 const { llmLabel } = useLlmLabel()
@@ -263,12 +264,13 @@ onBeforeUnmount(() => {
 async function trackBatch(id: number) {
   running.value = true
   pollAbort?.abort()
-  pollAbort = new AbortController()
+  const controller = new AbortController()
+  pollAbort = controller
   try {
     const v = await pollUntil(
       () => getRecommendation(id),
       (r) => r.status !== 'processing',
-      { signal: pollAbort.signal },
+      { signal: controller.signal },
     )
     if (!current.value || current.value.id === id) current.value = v
     notifyResult(v)
@@ -276,8 +278,11 @@ async function trackBatch(id: number) {
     if (isPollCancelled(e)) return
     message.error((e as Error).message)
   } finally {
-    running.value = false
-    await loadHistory()
+    if (pollAbort === controller) {
+      pollAbort = null
+      running.value = false
+      await loadHistory()
+    }
   }
 }
 
@@ -315,6 +320,32 @@ async function openBatch(b: RecommendationBatch) {
     message.error((e as Error).message)
   }
 }
+
+function routeBatchID(): number | null {
+  const raw = Array.isArray(route.query.batch_id) ? route.query.batch_id[0] : route.query.batch_id
+  const id = Number(raw)
+  return Number.isInteger(id) && id > 0 ? id : null
+}
+
+let routeBatchSeq = 0
+async function openRouteBatch(): Promise<boolean> {
+  const id = routeBatchID()
+  if (!id) return false
+
+  const seq = ++routeBatchSeq
+  pollAbort?.abort()
+  try {
+    const view = await getRecommendation(id)
+    if (seq !== routeBatchSeq || routeBatchID() !== id) return true
+    current.value = view
+    if (view.status === 'processing') void trackBatch(id)
+  } catch (e) {
+    if (seq === routeBatchSeq && routeBatchID() === id) message.error((e as Error).message)
+  }
+  return true
+}
+
+watch(() => route.query.batch_id, () => void openRouteBatch())
 async function removeBatch(b: RecommendationBatch) {
   try {
     await deleteRecommendation(b.id)
@@ -465,6 +496,8 @@ function fmtTime(t: string) {
 
 onMounted(async () => {
   await Promise.all([loadStrategies(), loadLLM(), loadHistory(), loadPerformance(), loadPrefFilters(), loadReviews()])
+  // 任务中心指定的批次优先，避免被最近一个 processing 批次覆盖。
+  if (await openRouteBatch()) return
   // 页面刷新恢复：仍在后台生成中的批次自动恢复跟踪（后端对陈旧 processing 会惰性判 failed）。
   const processing = history.value.find((h) => h.status === 'processing')
   if (processing) {

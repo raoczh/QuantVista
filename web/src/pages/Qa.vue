@@ -140,6 +140,7 @@ async function trackQaTask(
   initial: LLMTask<QaTaskResult>,
   payload?: QaAskRequest,
   startConvId?: number,
+  forceOpenResult = false,
 ) {
   pollAbort?.abort()
   const controller = new AbortController()
@@ -155,15 +156,17 @@ async function trackQaTask(
             { signal: controller.signal, timeoutMs: 11 * 60 * 1000 },
           )
         : initial
+    if (forceOpenResult && routeTaskID() !== initial.id) return
     if (task.status === 'failed') {
       showTaskFailure(task.error || '问答任务失败', task.error_code || '', payload, startConvId)
       return
     }
     if (!task.result?.conversation_id) throw new Error('问答任务已完成，但未返回会话编号')
     const view = await getConversation(task.result.conversation_id)
+    if (forceOpenResult && routeTaskID() !== initial.id) return
 
     // 任务期间若用户切换了会话，只刷新历史，不用旧任务结果覆盖当前界面。
-    if (current.value?.id === startConvId) {
+    if (forceOpenResult || current.value?.id === startConvId) {
       current.value = view
       if (!payload || question.value.trim() === payload.question.trim()) question.value = ''
       fromAnalysisId.value = null
@@ -172,9 +175,10 @@ async function trackQaTask(
     }
     taskError.value = ''
     taskErrorCode.value = ''
-    message.success('回答已生成')
+    message.success(forceOpenResult ? '已打开任务结果' : '回答已生成')
   } catch (e) {
     if (isPollCancelled(e)) return
+    if (forceOpenResult && routeTaskID() !== initial.id) return
     showTaskFailure((e as Error).message || '问答任务状态读取失败', getApiErrorCode(e) || '', payload, startConvId)
   } finally {
     if (pollAbort === controller) {
@@ -279,6 +283,53 @@ async function recoverProcessingTask() {
   }
 }
 
+function routeTaskID(): number | null {
+  const raw = Array.isArray(route.query.task_id) ? route.query.task_id[0] : route.query.task_id
+  const id = Number(raw)
+  return Number.isInteger(id) && id > 0 ? id : null
+}
+
+let restoredRouteTaskID: number | null = null
+let restoringRouteTaskID: number | null = null
+let routeTaskTrackingID: number | null = null
+async function restoreRouteTask(): Promise<boolean> {
+  const id = routeTaskID()
+  if (!id) {
+    restoredRouteTaskID = null
+    if (routeTaskTrackingID !== null) {
+      pollAbort?.abort()
+      routeTaskTrackingID = null
+    }
+    return false
+  }
+  if (restoredRouteTaskID === id || restoringRouteTaskID === id) return true
+
+  restoringRouteTaskID = id
+  pollAbort?.abort()
+  current.value = null
+  taskError.value = ''
+  taskErrorCode.value = ''
+  try {
+    const task = await getLLMTask<QaTaskResult>(id)
+    if (routeTaskID() !== id) return true
+    restoredRouteTaskID = id
+    if (task.kind !== 'qa') {
+      showTaskFailure('该任务不是个股问答任务，无法在此页面打开')
+      return true
+    }
+    routeTaskTrackingID = id
+    await trackQaTask(task, undefined, undefined, true)
+  } catch (e) {
+    if (routeTaskID() === id) {
+      showTaskFailure((e as Error).message || '问答任务状态读取失败', getApiErrorCode(e) || '')
+    }
+  } finally {
+    if (restoringRouteTaskID === id) restoringRouteTaskID = null
+    if (routeTaskTrackingID === id) routeTaskTrackingID = null
+  }
+  return true
+}
+
 async function openConv(c: QaConversation) {
   try {
     current.value = await getConversation(c.id)
@@ -370,7 +421,13 @@ async function openSnapshot() {
 
 // 深链快捷入口：从个股详情/分析结果带 symbol 或 from_analysis 进入。
 // 用 watch 而非仅在 onMounted 读取——已停留在 /qa 时再次深链（query 变化）也能生效。
-function applyRouteQuery() {
+function clearStockRouteQuery() {
+  const query = { ...route.query }
+  for (const key of ['from_analysis', 'symbol', 'market', 'name', '_stock_action']) delete query[key]
+  void router.replace({ name: 'qa', query })
+}
+
+function applyStockRouteQuery() {
   if (route.query.from_analysis) {
     const id = Number(route.query.from_analysis)
     if (Number.isFinite(id) && id > 0) {
@@ -380,21 +437,28 @@ function applyRouteQuery() {
     symbol.value = String(route.query.symbol || '')
     market.value = String(route.query.market || 'cn')
     current.value = null // 深链进入新会话上下文
-    router.replace({ name: 'qa' })
+    clearStockRouteQuery()
   } else if (route.query.symbol) {
     symbol.value = String(route.query.symbol)
     market.value = String(route.query.market || 'cn')
     current.value = null
-    router.replace({ name: 'qa' })
+    clearStockRouteQuery()
   }
+}
+
+function applyRouteQuery() {
+  applyStockRouteQuery()
+  void restoreRouteTask()
 }
 
 watch(() => route.query, applyRouteQuery)
 
 onMounted(async () => {
-  applyRouteQuery()
+  const hasExplicitTask = routeTaskID() !== null
+  applyStockRouteQuery()
   await Promise.all([loadLLM(), loadHistory()])
-  await recoverProcessingTask()
+  if (hasExplicitTask) await restoreRouteTask()
+  else await recoverProcessingTask()
 })
 </script>
 

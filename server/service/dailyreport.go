@@ -28,8 +28,7 @@ const (
 	reportAlertExpireDays = 21 // 卖点提醒规则超过该自然日数自动暂停（覆盖短线最长有效期）
 
 	// 异步任务化（2026-07-14）：手动生成立即返回 processing 报告，后台独立 Context 完成后回写。
-	reportJobTimeout      = 8 * time.Minute  // 后台任务总 deadline（与原自动日报单用户 deadline 一致）
-	reportProcessingStale = 15 * time.Minute // processing 报告超过该时长视为死任务（进程重启遗留），允许重新生成接管
+	reportJobTimeout = 8 * time.Minute // 后台任务总 deadline（与原自动日报单用户 deadline 一致）
 )
 
 // DailyReportService 依赖既有服务拼装，不重复造数据链路。
@@ -122,8 +121,24 @@ func dailyTradingDayStatus(now time.Time) dailyTradingDayState {
 	return dailyTradingDayClosed
 }
 
+// expireStaleDailyReports 将服务重启或执行超时遗留的 processing 日报收敛为 failed。
+func expireStaleDailyReports(userID int64) error {
+	now := time.Now()
+	return common.DB.Model(&model.DailyReport{}).
+		Where("user_id = ? AND status = ? AND updated_at < ?",
+			userID, model.ReportStatusProcessing, now.Add(-taskProcessingStaleAfter)).
+		Updates(map[string]any{
+			"status":     model.ReportStatusFailed,
+			"error":      "任务中断（服务重启或执行超时），请重新生成日报",
+			"updated_at": now,
+		}).Error
+}
+
 // List 用户的日报列表（排除大字段）。
 func (s *DailyReportService) List(userID int64, limit int) ([]model.DailyReport, error) {
+	if err := expireStaleDailyReports(userID); err != nil {
+		return nil, err
+	}
 	if limit <= 0 || limit > 60 {
 		limit = 20
 	}
@@ -139,11 +154,14 @@ func (s *DailyReportService) List(userID int64, limit int) ([]model.DailyReport,
 // 回写会让删除名存实亡（Save 按主键 UPDATE 落空即静默丢失，行为不可预期）。
 // 关联的推荐批次与卖点提醒不级联删（推荐历史独立可见，提醒有自身过期清理）。
 func (s *DailyReportService) Delete(userID, id int64) error {
+	if err := expireStaleDailyReports(userID); err != nil {
+		return err
+	}
 	var r model.DailyReport
 	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&r).Error; err != nil {
 		return errors.New("日报不存在")
 	}
-	if r.Status == model.ReportStatusProcessing && time.Since(r.UpdatedAt) < reportProcessingStale {
+	if r.Status == model.ReportStatusProcessing {
 		return refusalErr(RefusalReportProcessing, "日报正在生成中，请等任务结束后再删除")
 	}
 	return common.DB.Delete(&r).Error
@@ -151,6 +169,9 @@ func (s *DailyReportService) Delete(userID, id int64) error {
 
 // Get 日报详情（含复盘全文与推荐批次视图）。
 func (s *DailyReportService) Get(userID, id int64) (*DailyReportView, error) {
+	if err := expireStaleDailyReports(userID); err != nil {
+		return nil, err
+	}
 	var r model.DailyReport
 	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&r).Error; err != nil {
 		return nil, errors.New("日报不存在")
@@ -160,6 +181,9 @@ func (s *DailyReportService) Get(userID, id int64) (*DailyReportView, error) {
 
 // Latest 最新一份日报（首页「AI 今日观点」卡用）。无日报返回 nil 不报错。
 func (s *DailyReportService) Latest(userID int64) (*DailyReportView, error) {
+	if err := expireStaleDailyReports(userID); err != nil {
+		return nil, err
+	}
 	var r model.DailyReport
 	err := common.DB.Where("user_id = ?", userID).Order("trade_date DESC, id DESC").First(&r).Error
 	if err != nil {
@@ -197,6 +221,9 @@ func (s *DailyReportService) assembleView(r *model.DailyReport) *DailyReportView
 // 重生成不再「先删旧报告再生成」，旧报告内容原地保留，双败时状态回滚（旧报告不丢）。
 // manual=false（自动 job）：已存在即跳过；调用方已在后台 goroutine 内，保持同步执行。
 func (s *DailyReportService) GenerateFor(ctx context.Context, userID int64, manual bool) (*DailyReportView, error) {
+	if err := expireStaleDailyReports(userID); err != nil {
+		return nil, err
+	}
 	now := s.now()
 	switch dailyTradingDayStatus(now) {
 	case dailyTradingDayClosed:
@@ -217,10 +244,8 @@ func (s *DailyReportService) GenerateFor(ctx context.Context, userID int64, manu
 	if exists && !manual {
 		return s.assembleView(&existing), nil
 	}
-	// 幂等防重：生成中的报告直接返回（重复点击不重复建任务烧 token）；超过
-	// reportProcessingStale 未回写的 processing 是死任务（进程重启遗留），放行接管重跑。
-	if exists && existing.Status == model.ReportStatusProcessing &&
-		time.Since(existing.UpdatedAt) < reportProcessingStale {
+	// 幂等防重：新鲜的生成中报告直接返回；遗留任务已由共享 stale 清理入口收敛为 failed。
+	if exists && existing.Status == model.ReportStatusProcessing {
 		return s.assembleView(&existing), nil
 	}
 

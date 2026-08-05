@@ -260,6 +260,33 @@ async function openRecord(rec: AnalysisRecord) {
     message.error((e as Error).message)
   }
 }
+
+function routeRecordID(): number | null {
+  const raw = Array.isArray(route.query.record_id) ? route.query.record_id[0] : route.query.record_id
+  const id = Number(raw)
+  return Number.isInteger(id) && id > 0 ? id : null
+}
+
+let routeRecordSeq = 0
+async function openRouteRecord(): Promise<boolean> {
+  const id = routeRecordID()
+  if (!id) return false
+
+  const seq = ++routeRecordSeq
+  pollAbort?.abort()
+  try {
+    const view = await getAnalysis(id)
+    if (seq !== routeRecordSeq || routeRecordID() !== id) return true
+    current.value = view
+    diff.value = null
+    if (view.status === 'processing') void trackAnalysis(id)
+  } catch (e) {
+    if (seq === routeRecordSeq && routeRecordID() === id) message.error((e as Error).message)
+  }
+  return true
+}
+
+watch(() => route.query.record_id, () => void openRouteRecord())
 async function removeRecord(rec: AnalysisRecord) {
   try {
     await deleteAnalysis(rec.id)
@@ -496,6 +523,8 @@ onMounted(async () => {
   // 从个股页/自选跳转带参：预填模块与标的。
   applyStockActionQuery()
   await Promise.all([loadLLM(), loadHistory()])
+  // 任务中心的显式记录优先于“恢复最近运行任务”，且不消费股票动作参数。
+  if (await openRouteRecord()) return
   const processing = history.value.find((h) => h.status === 'processing')
   if (processing) {
     current.value = await getAnalysis(processing.id).catch(() => null)
