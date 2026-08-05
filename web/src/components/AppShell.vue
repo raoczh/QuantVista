@@ -138,7 +138,13 @@ const menuOptions = computed<MenuOption[]>(() => [
   },
 ])
 
-const activeKey = computed(() => (route.name as string) || 'home')
+const routeMenuKey: Record<string, string> = {
+  'board-detail': 'heatmap',
+}
+const activeKey = computed(() => {
+  const name = String(route.name || '')
+  return routeMenuKey[name] || name || 'home'
+})
 
 // ---------- 主题 ----------
 const themeOptions = computed<DropdownOption[]>(() =>
@@ -214,6 +220,10 @@ const showSearch = ref(false)
 // ---------- 移动端抽屉导航 ----------
 // ≤768px 时顶部水平菜单放不下，收进左侧抽屉（汉堡按钮唤起）。
 const showNav = ref(false)
+function closeDrawerOnLinkClick(event: MouseEvent) {
+  const target = event.target
+  if (target instanceof Element && target.closest('a')) showNav.value = false
+}
 // 抽屉内点击菜单项（RouterLink）完成导航后自动收起。
 watch(
   () => route.fullPath,
@@ -343,12 +353,12 @@ onUnmounted(() => {
         </n-dropdown>
 
         <n-dropdown v-if="isLoggedIn" trigger="click" :options="userOptions" @select="onSelectUser">
-          <div class="user-chip">
+          <button class="user-chip" type="button" :aria-label="`${displayName || '用户'}菜单`">
             <n-avatar round :size="26" :style="{ background: vars.primaryColor, color: '#fff' }">
               {{ avatarText }}
             </n-avatar>
             <span class="user-name">{{ displayName }}</span>
-          </div>
+          </button>
         </n-dropdown>
       </div>
     </header>
@@ -376,7 +386,7 @@ onUnmounted(() => {
         <template #header>
           <BrandLogo :size="26" />
         </template>
-        <div class="drawer-menu-wrap" :style="shellVars">
+        <div class="drawer-menu-wrap" :style="shellVars" @click="closeDrawerOnLinkClick">
           <n-menu
             mode="vertical"
             :options="menuOptions"
@@ -554,13 +564,21 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 8px;
-  cursor: pointer;
   padding: 3px 10px 3px 3px;
+  border: 0;
   border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
   transition: background 0.15s ease;
 }
 .user-chip:hover {
   background: rgba(128, 128, 128, 0.1);
+}
+.user-chip:focus-visible {
+  outline: 2px solid var(--qv-menu-active-text);
+  outline-offset: 2px;
 }
 .user-name {
   font-size: 13px;
