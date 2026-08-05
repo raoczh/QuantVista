@@ -3,38 +3,82 @@ package service
 import (
 	"database/sql"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"quantvista/common"
 	"quantvista/model"
 )
 
-// P1 数据健康总览（管理端）：各数据域的 expected/observed 日期、落后开市日数、覆盖率、
-// 最近任务日志——「observed 只和库内自身 MAX 比较会把整库落后判成新鲜」的对账入口。
-// 只读聚合，补跑走既有管理端接口（wide-sync / wide-init / sync-bars / snapshot /
-// factor-rebuild / backfill-calendar）。
+// P0-3A 数据健康报告只读本地库。交易日窗口固定在 30~60 日，所有明细查询带日期
+// 范围、可用索引和结果硬上限；不得从该 GET 触发上游扫描。
+const (
+	DataHealthDefaultDays = 45
+	DataHealthMinDays     = 30
+	DataHealthMaxDays     = 60
+)
 
-// DataHealthItem 一个数据域的健康行。
+type DataHealthDay struct {
+	Date          string `json:"date"`
+	Status        string `json:"status"` // covered / missing / partial / suspended / closed / unknown
+	Observed      int64  `json:"observed"`
+	Expected      int64  `json:"expected"`
+	Suspended     int64  `json:"suspended,omitempty"`
+	RecoveryClass string `json:"recovery_class"` // backfillable / unrecoverable / partial / unknown
+	Note          string `json:"note,omitempty"`
+}
+
+type DataHealthFailureSummary struct {
+	Task      string    `json:"task"`
+	Status    string    `json:"status"`
+	Message   string    `json:"message"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// DataHealthItem 一个数据域的健康行。Coverage 保留旧客户端展示，数值分子/分母是新契约。
 type DataHealthItem struct {
-	Key          string             `json:"key"`
-	Name         string             `json:"name"`
-	ExpectedDate string             `json:"expected_date"`      // 按交易日历应有的最新日期
-	ObservedDate string             `json:"observed_date"`      // 库内实际最新日期（空=无数据）
-	LagOpenDays  int                `json:"lag_open_days"`      // 落后开市日数（-1=日历不可用无法判定）
-	Tolerance    int                `json:"tolerance_open_days"` // 该域的容忍落后（T-1 类信号为 1~2）
-	Status       string             `json:"status"`             // ok / behind / empty / unknown
-	Coverage     string             `json:"coverage,omitempty"` // 覆盖率描述（如 done/total、fresh 行占比）
-	LastRun      *model.DataSyncLog `json:"last_run,omitempty"` // 最近一次相关任务日志
-	Note         string             `json:"note,omitempty"`
+	Key                 string                    `json:"key"`
+	Name                string                    `json:"name"`
+	ExpectedDate        string                    `json:"expected_date"`
+	ObservedDate        string                    `json:"observed_date"`
+	LagOpenDays         int                       `json:"lag_open_days"`
+	Tolerance           int                       `json:"tolerance_open_days"`
+	Status              string                    `json:"status"` // ok / behind / empty / partial / unknown
+	Coverage            string                    `json:"coverage,omitempty"`
+	CoverageNumerator   int64                     `json:"coverage_numerator"`
+	CoverageDenominator int64                     `json:"coverage_denominator"`
+	CoverageUnit        string                    `json:"coverage_unit,omitempty"`
+	RecoveryClass       string                    `json:"recovery_class"`
+	GapCalendar         []DataHealthDay           `json:"gap_calendar,omitempty"`
+	LastRun             *model.DataSyncLog        `json:"last_run,omitempty"`
+	RecentFailure       *DataHealthFailureSummary `json:"recent_failure,omitempty"`
+	Note                string                    `json:"note,omitempty"`
 }
 
-// DataHealthReport 数据健康总览。
 type DataHealthReport struct {
-	GeneratedAt string           `json:"generated_at"`
-	Items       []DataHealthItem `json:"items"`
+	GeneratedAt  string           `json:"generated_at"`
+	WindowDays   int              `json:"window_days"`
+	WindowStart  string           `json:"window_start,omitempty"`
+	WindowEnd    string           `json:"window_end,omitempty"`
+	QueryHardMax int              `json:"query_hard_max"`
+	Items        []DataHealthItem `json:"items"`
 }
 
-// dhMaxDate 取某表某日期列的 MAX（best-effort，查询失败返回空）。
+func normalizeDataHealthDays(days int) int {
+	if days == 0 {
+		return DataHealthDefaultDays
+	}
+	if days < DataHealthMinDays {
+		return DataHealthMinDays
+	}
+	if days > DataHealthMaxDays {
+		return DataHealthMaxDays
+	}
+	return days
+}
+
+// dhMaxDate 只接受代码内固定列名；调用点都应让 where 命中模型现有索引。
 func dhMaxDate(modelPtr any, dateCol, where string, args ...any) string {
 	if common.DB == nil {
 		return ""
@@ -50,19 +94,41 @@ func dhMaxDate(modelPtr any, dateCol, where string, args ...any) string {
 	return d.String
 }
 
-// dhLastLog 最近一条指定任务日志。
-func dhLastLog(task string) *model.DataSyncLog {
+func dhNewsMax() string {
 	if common.DB == nil {
-		return nil
+		return ""
 	}
-	var l model.DataSyncLog
-	if err := common.DB.Where("task = ?", task).Order("id DESC").First(&l).Error; err != nil {
-		return nil
+	var row model.News
+	if err := common.DB.Select("publish_time").Order("publish_time DESC").Limit(1).Take(&row).Error; err != nil {
+		return ""
 	}
-	return &l
+	return row.PublishTime.Format("2006-01-02")
 }
 
-// dhStatus 按 observed/lag/tolerance 判定状态。
+func dhLastLog(tasks ...string) *model.DataSyncLog {
+	if common.DB == nil || len(tasks) == 0 {
+		return nil
+	}
+	var row model.DataSyncLog
+	if err := common.DB.Where("task IN ?", tasks).Order("created_at DESC, id DESC").Limit(1).Take(&row).Error; err != nil {
+		return nil
+	}
+	return &row
+}
+
+func dhRecentFailure(tasks ...string) *DataHealthFailureSummary {
+	if common.DB == nil || len(tasks) == 0 {
+		return nil
+	}
+	var row model.DataSyncLog
+	if err := common.DB.Select("task", "status", "message", "created_at").
+		Where("task IN ? AND status IN ?", tasks, []string{"failed", "partial"}).
+		Order("created_at DESC, id DESC").Limit(1).Take(&row).Error; err != nil {
+		return nil
+	}
+	return &DataHealthFailureSummary{Task: row.Task, Status: row.Status, Message: row.Message, CreatedAt: row.CreatedAt}
+}
+
 func dhStatus(observed string, lag, tolerance int) string {
 	switch {
 	case observed == "":
@@ -76,113 +142,389 @@ func dhStatus(observed string, lag, tolerance int) string {
 	}
 }
 
-// BuildDataHealthReport 聚合各数据域健康行（读时计算，无缓存——管理端低频操作）。
-func BuildDataHealthReport() *DataHealthReport {
-	now := time.Now()
-	rep := &DataHealthReport{GeneratedAt: now.Format("2006-01-02 15:04:05")}
-	expectedWide := wideExpectedDate(now)          // 16:30 后=今日（交易日），否则上一开市日
-	expectedPrev := prevOpenTradeDate(now.Format("2006-01-02")) // 恒为上一开市日（T-1 口径域）
-	// 盘后采集类（mood 16:35 / intraday 16:00 / lhb 晚间）：当日 17:30 前按 T-1 口径对账。
+func recentOpenDates(market, end string, days int) []string {
+	if common.DB == nil {
+		return nil
+	}
+	var dates []string
+	if err := common.DB.Model(&model.TradingCalendar{}).
+		Where("market = ? AND is_open = ? AND trade_date <= ?", market, true, end).
+		Order("trade_date DESC").Limit(days).Pluck("trade_date", &dates).Error; err != nil {
+		return nil
+	}
+	reverseStrings(dates)
+	return dates
+}
+
+type dhDateCount struct {
+	Date string
+	N    int64
+}
+
+func dhCounts(modelPtr any, dateCol, market, from, to string, limit int) map[string]int64 {
+	out := map[string]int64{}
+	if common.DB == nil || from == "" || to == "" {
+		return out
+	}
+	var rows []dhDateCount
+	q := common.DB.Model(modelPtr).Select(dateCol+" AS date, COUNT(*) AS n").
+		Where(dateCol+" >= ? AND "+dateCol+" <= ?", from, to)
+	if market != "" {
+		q = q.Where("market = ?", market)
+	}
+	if err := q.Group(dateCol).Order(dateCol).Limit(limit + 1).Find(&rows).Error; err != nil || len(rows) > limit {
+		return out
+	}
+	for _, row := range rows {
+		out[row.Date] = row.N
+	}
+	return out
+}
+
+func dhNewsCounts(from, to string, limit int) map[string]int64 {
+	out := map[string]int64{}
+	if common.DB == nil || from == "" || to == "" {
+		return out
+	}
+	end, err := time.ParseInLocation("2006-01-02", to, time.Local)
+	if err != nil {
+		return out
+	}
+	var rows []dhDateCount
+	if err := common.DB.Model(&model.News{}).
+		Select("DATE(publish_time) AS date, COUNT(*) AS n").
+		Where("publish_time >= ? AND publish_time < ?", from+" 00:00:00", end.AddDate(0, 0, 1)).
+		Group("DATE(publish_time)").Order("date").Limit(limit + 1).Find(&rows).Error; err != nil || len(rows) > limit {
+		return out
+	}
+	for _, row := range rows {
+		out[row.Date] = row.N
+	}
+	return out
+}
+
+func countCalendar(dates []string, counts map[string]int64, missingStatus, recovery, missingRecovery string) ([]DataHealthDay, int64, int64) {
+	calendar := make([]DataHealthDay, 0, len(dates))
+	var numerator int64
+	for _, date := range dates {
+		n := counts[date]
+		day := DataHealthDay{Date: date, Observed: n, Expected: 1, RecoveryClass: recovery}
+		if n > 0 {
+			day.Status = "covered"
+			numerator++
+		} else {
+			day.Status = missingStatus
+			day.RecoveryClass = missingRecovery
+		}
+		calendar = append(calendar, day)
+	}
+	return calendar, numerator, int64(len(dates))
+}
+
+func coverageText(numerator, denominator int64, unit string) string {
+	if denominator <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d/%d %s", numerator, denominator, unit)
+}
+
+func hasCoverageGap(days []DataHealthDay) (anyObserved, gap bool) {
+	for _, day := range days {
+		if day.Status == "covered" || day.Status == "suspended" || day.Status == "closed" {
+			anyObserved = true
+		}
+		if day.Status == "missing" || day.Status == "partial" {
+			gap = true
+		}
+	}
+	return
+}
+
+func finalizeHealthItem(item *DataHealthItem) {
+	item.Coverage = coverageText(item.CoverageNumerator, item.CoverageDenominator, item.CoverageUnit)
+	observed, gap := hasCoverageGap(item.GapCalendar)
+	if item.Status == "ok" && gap {
+		item.Status = "partial"
+	}
+	if item.Status == "empty" && observed {
+		item.Status = "partial"
+	}
+}
+
+type dhUniverseCoverage struct {
+	Date      string
+	Total     int64
+	Suspended int64
+}
+
+func dhActiveBarCounts(from, to string, limit int) map[string]int64 {
+	out := map[string]int64{}
+	if common.DB == nil || from == "" || to == "" {
+		return out
+	}
+	var rows []dhDateCount
+	err := common.DB.Table("daily_bars AS b").
+		Select("b.trade_date AS date, COUNT(*) AS n").
+		Joins("JOIN stock_universe_dailies AS u ON u.market = b.market AND u.symbol = b.symbol AND u.trade_date = b.trade_date").
+		Where("b.market = ? AND b.trade_date >= ? AND b.trade_date <= ? AND u.suspended = ?", "cn", from, to, false).
+		Group("b.trade_date").Order("b.trade_date").Limit(limit + 1).Find(&rows).Error
+	if err != nil || len(rows) > limit {
+		return out
+	}
+	for _, row := range rows {
+		out[row.Date] = row.N
+	}
+	return out
+}
+
+func wideGapCalendar(dates []string) ([]DataHealthDay, int64, int64) {
+	if len(dates) == 0 || common.DB == nil {
+		return nil, 0, 0
+	}
+	from, to := dates[0], dates[len(dates)-1]
+	barCounts := dhCounts(&model.DailyBar{}, "trade_date", "cn", from, to, len(dates))
+	activeBarCounts := dhActiveBarCounts(from, to, len(dates))
+	var universeRows []dhUniverseCoverage
+	common.DB.Model(&model.StockUniverseDaily{}).
+		Select("trade_date AS date, COUNT(*) AS total, SUM(CASE WHEN suspended THEN 1 ELSE 0 END) AS suspended").
+		Where("market = ? AND trade_date >= ? AND trade_date <= ?", "cn", from, to).
+		Group("trade_date").Order("trade_date").Limit(len(dates) + 1).Find(&universeRows)
+	universe := make(map[string]dhUniverseCoverage, len(universeRows))
+	for _, row := range universeRows {
+		universe[row.Date] = row
+	}
+	var currentTotal int64
+	common.DB.Model(&model.MarketSyncState{}).Where("market = ?", "cn").Count(&currentTotal)
+	calendar := make([]DataHealthDay, 0, len(dates))
+	var numerator, denominator int64
+	for _, date := range dates {
+		observed := barCounts[date]
+		u, hasPIT := universe[date]
+		expected, suspended := currentTotal, int64(0)
+		note := ""
+		if hasPIT {
+			expected = u.Total - u.Suspended
+			suspended = u.Suspended
+			observed = activeBarCounts[date]
+		} else if currentTotal > 0 {
+			note = "当日 PIT 宇宙缺失，停牌分母未知，暂按当前宇宙估计"
+		}
+		if expected == 0 && observed > 0 {
+			expected = observed
+		}
+		day := DataHealthDay{Date: date, Observed: observed, Expected: expected, Suspended: suspended, RecoveryClass: "backfillable", Note: note}
+		switch {
+		case expected == 0 && suspended > 0:
+			day.Status = "suspended"
+		case expected == 0:
+			day.Status = "unknown"
+			day.RecoveryClass = "unknown"
+		case observed == 0:
+			day.Status = "missing"
+		case observed < expected:
+			day.Status = "partial"
+		default:
+			day.Status = "covered"
+		}
+		denominator += expected
+		if observed > expected {
+			numerator += expected
+		} else {
+			numerator += observed
+		}
+		calendar = append(calendar, day)
+	}
+	return calendar, numerator, denominator
+}
+
+func calendarCoverage(from, to string, hardMax int) ([]DataHealthDay, int64, int64) {
+	if common.DB == nil || from == "" || to == "" {
+		return nil, 0, 0
+	}
+	f, err1 := time.ParseInLocation("2006-01-02", from, time.Local)
+	t, err2 := time.ParseInLocation("2006-01-02", to, time.Local)
+	if err1 != nil || err2 != nil {
+		return nil, 0, 0
+	}
+	naturalDays := int(t.Sub(f).Hours()/24) + 1
+	if naturalDays > hardMax {
+		f = t.AddDate(0, 0, -(hardMax - 1))
+		naturalDays = hardMax
+	}
+	var rows []model.TradingCalendar
+	common.DB.Select("trade_date", "is_open").Where("market = ? AND trade_date >= ? AND trade_date <= ?", "cn", f.Format("2006-01-02"), to).
+		Order("trade_date").Limit(naturalDays + 1).Find(&rows)
+	known := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		known[row.TradeDate] = row.IsOpen
+	}
+	calendar := make([]DataHealthDay, 0, naturalDays)
+	var numerator int64
+	for d := f; !d.After(t); d = d.AddDate(0, 0, 1) {
+		date := d.Format("2006-01-02")
+		isOpen, ok := known[date]
+		day := DataHealthDay{Date: date, Expected: 1, RecoveryClass: "backfillable"}
+		if !ok {
+			day.Status = "missing"
+		} else {
+			day.Observed = 1
+			numerator++
+			if isOpen {
+				day.Status = "covered"
+			} else {
+				day.Status = "closed"
+			}
+		}
+		calendar = append(calendar, day)
+	}
+	return calendar, numerator, int64(naturalDays)
+}
+
+func buildDataHealthReport(now time.Time, requestedDays int) *DataHealthReport {
+	days := normalizeDataHealthDays(requestedDays)
+	rep := &DataHealthReport{
+		GeneratedAt: now.Format("2006-01-02 15:04:05"), WindowDays: days,
+		QueryHardMax: DataHealthMaxDays,
+	}
+	expectedWide := wideExpectedDate(now)
+	expectedPrev := prevOpenTradeDate(now.Format("2006-01-02"))
 	expectedEvening := expectedPrev
 	if isTradingDayToday(now) && now.Hour()*60+now.Minute() >= 17*60+30 {
 		expectedEvening = now.Format("2006-01-02")
 	}
-
-	add := func(key, name, observed, expected string, tolerance int, coverage string, lastRun *model.DataSyncLog, note string) {
-		lag := 0
-		if observed == "" {
-			lag = -1
-		} else {
-			lag = openDaysBehind(observed, expected)
-		}
-		rep.Items = append(rep.Items, DataHealthItem{
-			Key: key, Name: name,
-			ExpectedDate: expected, ObservedDate: observed,
-			LagOpenDays: lag, Tolerance: tolerance,
-			Status:   dhStatus(observed, lag, tolerance),
-			Coverage: coverage, LastRun: lastRun, Note: note,
-		})
+	tradeDates := recentOpenDates("cn", expectedWide, days)
+	if len(tradeDates) > 0 {
+		rep.WindowStart, rep.WindowEnd = tradeDates[0], tradeDates[len(tradeDates)-1]
+		rep.WindowDays = len(tradeDates)
 	}
 
-	// 1) 全市场日线（M1 宇宙）。
+	add := func(item DataHealthItem) {
+		if item.ObservedDate == "" {
+			item.LagOpenDays = -1
+		} else {
+			item.LagOpenDays = openDaysBehind(item.ObservedDate, item.ExpectedDate)
+		}
+		item.Status = dhStatus(item.ObservedDate, item.LagOpenDays, item.Tolerance)
+		finalizeHealthItem(&item)
+		rep.Items = append(rep.Items, item)
+	}
+
 	wideObserved := ""
 	if d, err := wideFreshDate(); err == nil {
 		wideObserved = d
 	}
-	wideCoverage := ""
-	if common.DB != nil {
-		var total, done int64
-		common.DB.Model(&model.MarketSyncState{}).Where("market = ?", "cn").Count(&total)
-		common.DB.Model(&model.MarketSyncState{}).Where("market = ? AND init_status = ?", "cn", "done").Count(&done)
-		if total > 0 {
-			wideCoverage = fmtCoverage(done, total, "已建史")
+	wideCalendar, wideN, wideD := wideGapCalendar(tradeDates)
+	add(DataHealthItem{
+		Key: "marketwide", Name: "全市场日线", ExpectedDate: expectedWide, ObservedDate: wideObserved,
+		RecoveryClass: "backfillable", GapCalendar: wideCalendar,
+		CoverageNumerator: wideN, CoverageDenominator: wideD, CoverageUnit: "股票交易日",
+		LastRun: dhLastLog("sync_market_wide", "init_market_history"), RecentFailure: dhRecentFailure("sync_market_wide", "init_market_history"),
+		Note: "按 PIT 宇宙扣除已知停牌；PIT 缺失日按当前宇宙估计并明确标 partial",
+	})
+
+	if table := CurrentFactorTable(); table != nil {
+		expected := int64(len(table.Symbols))
+		fresh := int64(float64(expected) * table.FreshCoverage)
+		item := DataHealthItem{
+			Key: "factor_table", Name: "因子宽表", ExpectedDate: orStr(table.ExpectedDate, expectedWide), ObservedDate: table.TradeDate,
+			RecoveryClass: "partial", CoverageNumerator: fresh, CoverageDenominator: expected, CoverageUnit: "标的",
+			Note: "进程内当前快照，不提供伪造的历史日历；落后时先补日线再重建",
+		}
+		if table.TradeDate != "" {
+			item.GapCalendar = []DataHealthDay{{Date: table.TradeDate, Status: "covered", Observed: fresh, Expected: expected, RecoveryClass: "partial"}}
+		}
+		add(item)
+	} else {
+		add(DataHealthItem{Key: "factor_table", Name: "因子宽表", ExpectedDate: expectedWide, RecoveryClass: "unknown", CoverageDenominator: 1, CoverageUnit: "当前快照", Note: "进程内尚未构建"})
+	}
+
+	from, to := rep.WindowStart, rep.WindowEnd
+	appendCountDomain := func(key, name, observed, expected string, tolerance int, counts map[string]int64, missingStatus, recovery, missingRecovery, note string, tasks ...string) {
+		cal, n, d := countCalendar(tradeDates, counts, missingStatus, recovery, missingRecovery)
+		add(DataHealthItem{
+			Key: key, Name: name, ExpectedDate: expected, ObservedDate: observed, Tolerance: tolerance,
+			RecoveryClass: recovery, GapCalendar: cal, CoverageNumerator: n, CoverageDenominator: d, CoverageUnit: "交易日",
+			LastRun: dhLastLog(tasks...), RecentFailure: dhRecentFailure(tasks...), Note: note,
+		})
+	}
+	appendCountDomain("mood_pool", "涨停池/情绪温度计", dhMaxDate(&model.MarketMoodDaily{}, "trade_date", "market = ?", "cn"), expectedEvening, 1,
+		dhCounts(&model.MarketMoodDaily{}, "trade_date", "cn", from, to, len(tradeDates)), "missing", "unrecoverable", "unrecoverable", "上游不可回溯；休市日不进入分母")
+	appendCountDomain("pop_rank", "股吧人气榜", dhMaxDate(&model.PopularityRank{}, "trade_date", "market = ?", "cn"), expectedEvening, 1,
+		dhCounts(&model.PopularityRank{}, "trade_date", "cn", from, to, len(tradeDates)), "missing", "unrecoverable", "unrecoverable", "实时榜不可回溯")
+	appendCountDomain("lhb", "龙虎榜", dhMaxDate(&model.LhbEntry{}, "trade_date", "market = ?", "cn"), expectedPrev, 2,
+		dhCounts(&model.LhbEntry{}, "trade_date", "cn", from, to, len(tradeDates)), "unknown", "unknown", "unknown", "无上榜记录与未采集无法仅凭本地稀疏事件表区分")
+
+	intradayCounts := dhCounts(&model.IntradayFactorDaily{}, "trade_date", "cn", from, to, len(tradeDates))
+	intradayCalendar, intradayN, intradayD := countCalendar(tradeDates, intradayCounts, "missing", "partial", "backfillable")
+	for i := range intradayCalendar {
+		if intradayCalendar[i].Status == "missing" && len(intradayCalendar)-i > 18 {
+			intradayCalendar[i].RecoveryClass = "unrecoverable"
+			intradayCalendar[i].Note = "超出约 18 个交易日上游回溯窗"
 		}
 	}
-	add("marketwide", "全市场日线", wideObserved, expectedWide, 0, wideCoverage,
-		dhLastLog("sync_market_wide"), "16:10 增量 job；落后时用管理端「全市场增量同步」补跑")
-
-	// 2) 因子宽表（选股/策略信号地基）。
-	if t := CurrentFactorTable(); t != nil {
-		cov := fmtPctCoverage(t.FreshCoverage) + " fresh 行"
-		add("factor_table", "因子宽表", t.TradeDate, orStr(t.ExpectedDate, expectedWide), 0, cov, nil,
-			"构建于 "+t.BuiltAt.Format("01-02 15:04")+"；落后时先补全市场日线再「重建因子宽表」")
-	} else {
-		add("factor_table", "因子宽表", "", expectedWide, 0, "", nil, "进程内尚未构建（首次扫描/推荐会触发懒加载）")
-	}
-
-	// 3) 情绪温度计（涨停池，16:35 采集）。
-	add("mood_pool", "涨停池/情绪温度计", dhMaxDate(&model.MarketMoodDaily{}, "trade_date", "market = ?", "cn"),
-		expectedEvening, 1, "", nil, "16:35 job；上游不可回溯，错过窗口该日数据缺失")
-
-	// 4) 人气榜（实时榜，交易日当日）。
-	add("pop_rank", "股吧人气榜", dhMaxDate(&model.PopularityRank{}, "trade_date", "market = ?", "cn"),
-		expectedEvening, 1, "", nil, "实时榜不可回溯")
-
-	// 5) 龙虎榜（T-1 晚间披露）。
-	add("lhb", "龙虎榜", dhMaxDate(&model.LhbEntry{}, "trade_date", "market = ?", "cn"),
-		expectedPrev, 2, "", nil, "披露有延迟，容忍 2 个开市日")
-
-	// 6) 盘中因子（M3b，T-1 口径）。
-	add("intraday", "盘中因子", dhMaxDate(&model.IntradayFactorDaily{}, "trade_date", "market = ?", "cn"),
-		expectedEvening, 1, "", nil, "5 分钟线派生；上游可回溯约 18 个交易日")
-
-	// 7) 新闻（publish_time 按自然日）。
-	newsMax := dhMaxDate(&model.News{}, "DATE(publish_time)", "")
-	add("news", "新闻采集", newsMax, now.Format("2006-01-02"), 1, "", nil,
-		"采集间隔见系统设置；observed 为最新一条发布日期")
-
-	// 8) 公告（notice_date）。
-	add("announcements", "公告采集", dhMaxDate(&model.Announcement{}, "notice_date", ""),
-		expectedPrev, 2, "", nil, "自选∪持仓每日增量 + 详情页按需补拉")
-
-	// 9) 交易日历。健康口径=历史覆盖到最近开市日（新鲜度判定只回看，「回填日历」
-	// 按钮可修复）；未来覆盖只作提示不作告警——未来工作日节假日无公开数据源，
-	// 回填按钮只能预写周末休市，把「未来覆盖不足」设为 behind 会是永远修不掉的
-	// 假告警（第二轮复查：告警必须能被现有按钮修复）。
-	calMax := dhMaxDate(&model.TradingCalendar{}, "trade_date", "market = ?", "cn")
-	calStatus := "ok"
-	calNote := "决定所有新鲜度判定的口径；历史缺失时用「回填日历」补"
-	switch {
-	case calMax == "":
-		calStatus = "empty"
-	case calMax < expectedPrev:
-		calStatus = "behind"
-		calNote = "日历未覆盖到最近开市日（" + expectedPrev + "），新鲜度判定退化为周一~五近似，请回填"
-	case calMax < now.AddDate(0, 0, 14).Format("2006-01-02"):
-		calNote = "历史覆盖正常。提示：未来覆盖仅到 " + calMax + "（回填可预写未来周末休市；工作日节假日无公开数据源，长假当日的新鲜度判定会按周一~五近似产生 stale 误报，属已知诚实退化）"
-	}
-	rep.Items = append(rep.Items, DataHealthItem{
-		Key: "calendar", Name: "交易日历",
-		ExpectedDate: expectedPrev, ObservedDate: calMax,
-		Status: calStatus, Note: calNote,
+	add(DataHealthItem{
+		Key: "intraday", Name: "盘中因子", ExpectedDate: expectedEvening,
+		ObservedDate: dhMaxDate(&model.IntradayFactorDaily{}, "trade_date", "market = ?", "cn"), Tolerance: 1,
+		RecoveryClass: "partial", GapCalendar: intradayCalendar, CoverageNumerator: intradayN, CoverageDenominator: intradayD, CoverageUnit: "交易日",
+		Note: "近约 18 个交易日可补，超窗不可回溯",
 	})
+
+	appendCountDomain("news", "新闻采集", dhNewsMax(), now.Format("2006-01-02"), 1,
+		dhNewsCounts(from, to, len(tradeDates)), "unknown", "partial", "unknown", "事件稀疏；零条不能单凭本地表判定为采集失败")
+	appendCountDomain("announcements", "公告采集", dhMaxDate(&model.Announcement{}, "notice_date", ""), expectedPrev, 2,
+		dhCounts(&model.Announcement{}, "notice_date", "", from, to, len(tradeDates)), "unknown", "partial", "unknown", "按需覆盖；零公告与未采集需结合任务日志判断")
+
+	calMax := dhMaxDate(&model.TradingCalendar{}, "trade_date", "market = ?", "cn")
+	calFrom, calTo := rep.WindowStart, rep.WindowEnd
+	if calFrom == "" || calTo == "" {
+		calTo = expectedPrev
+		if parsed, err := time.ParseInLocation("2006-01-02", calTo, time.Local); err == nil {
+			calFrom = parsed.AddDate(0, 0, -(maintenanceMaxNaturalDays - 1)).Format("2006-01-02")
+		}
+	}
+	calCalendar, calN, calD := calendarCoverage(calFrom, calTo, maintenanceMaxNaturalDays)
+	calItem := DataHealthItem{
+		Key: "calendar", Name: "交易日历", ExpectedDate: expectedPrev, ObservedDate: calMax,
+		RecoveryClass: "backfillable", GapCalendar: calCalendar, CoverageNumerator: calN, CoverageDenominator: calD, CoverageUnit: "自然日",
+		LastRun: dhLastLog("backfill_calendar"), RecentFailure: dhRecentFailure("backfill_calendar"),
+		Note: "休市日显示 closed 且不计作业务缺口；未来工作日节假日无来源时保持 unknown",
+	}
+	add(calItem)
+
+	// 输出顺序固定，便于前端稳定 diff；防御未来调用点意外重复 key。
+	seen := make(map[string]struct{}, len(rep.Items))
+	filtered := rep.Items[:0]
+	for _, item := range rep.Items {
+		if _, ok := seen[item.Key]; ok {
+			continue
+		}
+		seen[item.Key] = struct{}{}
+		filtered = append(filtered, item)
+	}
+	rep.Items = filtered
 	return rep
 }
 
+// BuildDataHealthReport 保留默认调用入口。
+func BuildDataHealthReport() *DataHealthReport {
+	return buildDataHealthReport(time.Now(), DataHealthDefaultDays)
+}
+
+// BuildDataHealthReportForDays 供现有 GET 的 days 查询参数使用。
+func BuildDataHealthReportForDays(days int) *DataHealthReport {
+	return buildDataHealthReport(time.Now(), days)
+}
+
+// fmtCoverage/fmtPctCoverage 保留给同包旧调用或测试，避免口径散落。
 func fmtCoverage(done, total int64, label string) string {
 	return fmt.Sprintf("%s %d/%d", label, done, total)
 }
 
 func fmtPctCoverage(f float64) string {
 	return fmt.Sprintf("%.0f%%", f*100)
+}
+
+// stableDataHealthDays 供测试核对日期输出不因 map 遍历漂移。
+func stableDataHealthDays(days []DataHealthDay) {
+	sort.Slice(days, func(i, j int) bool { return strings.Compare(days[i].Date, days[j].Date) < 0 })
 }

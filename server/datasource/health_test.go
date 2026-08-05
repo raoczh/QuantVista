@@ -14,6 +14,17 @@ type fakeAdapter struct {
 	quote func() (*Quote, error)
 }
 
+func healthStatFor(t *testing.T, rows []HealthStat, source, capability, market string) HealthStat {
+	t.Helper()
+	for _, row := range rows {
+		if row.Source == source && row.Capability == capability && row.Market == market {
+			return row
+		}
+	}
+	t.Fatalf("未找到健康行 %s/%s/%s: %+v", source, capability, market, rows)
+	return HealthStat{}
+}
+
 func (f *fakeAdapter) Name() string { return f.name }
 func (f *fakeAdapter) GetQuote(context.Context, string, string) (*Quote, error) {
 	f.calls++
@@ -52,9 +63,9 @@ func TestHealthCooldownOnEmpty(t *testing.T) {
 	if !tr.Available("sina", "quote") {
 		t.Fatal("冷却期结束应恢复")
 	}
-	snap := tr.Snapshot()
-	if len(snap) != 1 || snap[0].Samples != 0 || snap[0].CooldownHits != 1 {
-		t.Fatalf("冷却触发时窗口应清零且记一次 cooldown_hits: %+v", snap)
+	st := healthStatFor(t, tr.Snapshot(), "sina", "quote", "cn")
+	if st.Samples != 0 || st.CooldownHits != 1 || !st.Observed || st.Observation != "empty" {
+		t.Fatalf("冷却触发时窗口应清零、保留 empty 观测并记一次 cooldown_hits: %+v", st)
 	}
 }
 
@@ -133,12 +144,59 @@ func TestRouteCapRecordsOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 	snap := m.HealthSnapshot()
-	if len(snap) != 2 {
-		t.Fatalf("应有两条滑窗记录: %+v", snap)
-	}
-	// 排序后 e 在前（e|quote < o|quote）。
-	if snap[0].Empty != 1 || snap[1].Success != 1 {
+	emptyStat := healthStatFor(t, snap, "e", "quote", "cn")
+	okStat := healthStatFor(t, snap, "o", "quote", "cn")
+	if emptyStat.Empty != 1 || emptyStat.Observation != "empty" || okStat.Success != 1 || okStat.Observation != "success" {
 		t.Fatalf("结局记录不符: %+v", snap)
+	}
+}
+
+// TestCapabilityRegistryUnknown 注册表是支持面的唯一来源：支持但从未调用仍必须返回
+// unknown，不能因为滑窗没有 key 就把能力当不存在。
+func TestCapabilityRegistryUnknown(t *testing.T) {
+	tr := NewHealthTracker()
+	rows := tr.Snapshot()
+	st := healthStatFor(t, rows, "tencent", "valuation", "cn")
+	if !st.Registered || !st.Supported || st.Observed || st.Observation != "unknown" || st.Samples != 0 {
+		t.Fatalf("未观测注册能力应为 unknown: %+v", st)
+	}
+	if st.TimeoutMs != 6000 || st.ExpectedFreshness == "" || st.QPSPolicy == "" || st.CacheSemantics == "" {
+		t.Fatalf("能力契约字段不完整: %+v", st)
+	}
+}
+
+// TestUnregisteredObservationDoesNotBecomeSupported 滑窗偶然出现未注册组合只做诊断，
+// supported 仍为 false。
+func TestUnregisteredObservationDoesNotBecomeSupported(t *testing.T) {
+	tr := NewHealthTracker()
+	tr.RecordForMarket("custom", "quote", "hk", outcomeSuccess, 12)
+	st := healthStatFor(t, tr.Snapshot(), "custom", "quote", "hk")
+	if st.Registered || st.Supported || st.Observation != "success" {
+		t.Fatalf("观测不得反推支持面: %+v", st)
+	}
+}
+
+func TestNilSuccessIsRecordedAsEmpty(t *testing.T) {
+	empty := &fakeAdapter{name: "eastmoney", quote: func() (*Quote, error) { return nil, nil }}
+	m := NewManagerWithAdapters(empty)
+	if _, err := m.GetQuote(context.Background(), "cn", "600000"); !errors.Is(err, ErrNoData) {
+		t.Fatalf("nil,nil 应归一为空响应，got %v", err)
+	}
+	st := healthStatFor(t, m.HealthSnapshot(), "eastmoney", "quote", "cn")
+	if st.Empty != 1 || st.Errors != 0 || st.Success != 0 || st.Observation != "empty" {
+		t.Fatalf("空响应不能计 success/error: %+v", st)
+	}
+}
+
+func TestHealthMarketIsolation(t *testing.T) {
+	tr := NewHealthTracker()
+	tr.RecordForMarket("custom", "quote", "cn", outcomeError, 20)
+	if !tr.AvailableForMarket("custom", "quote", "hk") {
+		t.Fatal("cn 观测不得污染 hk 维度")
+	}
+	cn := healthStatFor(t, tr.Snapshot(), "custom", "quote", "cn")
+	if cn.Errors != 1 || cn.Market != "cn" {
+		t.Fatalf("市场维度记录错误: %+v", cn)
 	}
 }
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { NAlert, NButton, NButtonGroup, NEmpty, NGi, NGrid, NResult, NSpin, NTag, NTooltip } from 'naive-ui'
 import * as echarts from 'echarts'
@@ -36,6 +36,8 @@ import { isEtfSymbol } from '@/api/etf'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
+import StockCoverageMatrix from '@/components/StockCoverageMatrix.vue'
+import { createLoadEpoch, resolveCoverageStatus, type StockCoverageItem } from '@/components/stockCoverage'
 
 const route = useRoute()
 const router = useRouter()
@@ -76,6 +78,29 @@ function sentiView(n: NewsItem): { text: string; color: string } | null {
 const loading = ref(false)
 const loadError = ref('')
 
+type CoverageKey = 'quote' | 'daily' | 'finance' | 'news' | 'announcements' | 'institutions' | 'funds' | 'events'
+const coverageKeys: CoverageKey[] = ['quote', 'daily', 'finance', 'news', 'announcements', 'institutions', 'funds', 'events']
+const coverageObserved = reactive<Record<CoverageKey, boolean>>({
+  quote: false, daily: false, finance: false, news: false,
+  announcements: false, institutions: false, funds: false, events: false,
+})
+const coverageErrors = reactive<Record<CoverageKey, string>>({
+  quote: '', daily: '', finance: '', news: '',
+  announcements: '', institutions: '', funds: '', events: '',
+})
+function resetCoverageState() {
+  for (const key of coverageKeys) {
+    coverageObserved[key] = false
+    coverageErrors[key] = ''
+  }
+}
+function markCoverage(key: CoverageKey, error?: unknown) {
+  coverageObserved[key] = true
+  coverageErrors[key] = error
+    ? (error instanceof Error ? error.message : String(error)) || '读取失败'
+    : ''
+}
+
 const stockRef = computed(() => ({
   symbol: symbol.value,
   market: market.value,
@@ -93,9 +118,8 @@ let finChart: echarts.ECharts | null = null
 const ffEl = ref<HTMLDivElement | null>(null)
 let ffChart: echarts.ECharts | null = null
 
-// 切换标的的竞态守卫：每次 load 领一个自增序号，所有 best-effort 回填落地前比对，
-// 旧标的的迟到响应不再覆盖新标的数据。
-let loadSeq = 0
+// 切换标的的竞态守卫：每次 load 领取 epoch，所有 best-effort 回填落地前比对。
+const loadEpoch = createLoadEpoch()
 // 分时请求的中止器：切标的/卸载时 abort，在途请求不再挂着连接等超时。
 let minuteAbort: AbortController | null = null
 
@@ -117,39 +141,44 @@ function disposeCharts() {
 
 async function load(silent = false) {
   if (!symbol.value) return
-  const mySeq = ++loadSeq
+  const mySeq = loadEpoch.next()
+  const requestMarket = market.value
+  const requestSymbol = symbol.value
+  const requestIsFund = requestMarket === 'cn' && isEtfSymbol(requestSymbol)
   minuteAbort?.abort()
   const myMinuteAbort = new AbortController()
   minuteAbort = myMinuteAbort
   if (!silent) {
     loading.value = true
     loadError.value = ''
+    resetCoverageState()
   }
   try {
-    const q = await getQuote(market.value, symbol.value)
-    if (mySeq !== loadSeq) return
+    const q = await getQuote(requestMarket, requestSymbol)
+    if (!loadEpoch.isCurrent(mySeq)) return
     quote.value = q
-    if (market.value === 'cn') {
+    markCoverage('quote')
+    if (requestMarket === 'cn') {
       // 静默刷新（盘中每 60s 自动刷新）不置 loading：分时卡的 n-spin 遮罩会每分钟
       // 闪一次（降透明度 + pointer-events:none + 转圈），而这恰是用户正盯着分时图的
       // 时候。首次/手动加载仍然显示。
       if (!silent) minuteLoading.value = true
       minuteError.value = ''
-      getMinuteLine(market.value, symbol.value, myMinuteAbort.signal)
+      getMinuteLine(requestMarket, requestSymbol, myMinuteAbort.signal)
         .then((r) => {
-          if (mySeq !== loadSeq) return
+          if (!loadEpoch.isCurrent(mySeq)) return
           minute.value = r
           nextTick(() => renderChart())
         })
         .catch((e) => {
           // 主动取消属正常路径（切标的/卸载），不当失败展示。
-          if (mySeq !== loadSeq || isAbortError(e)) return
+          if (!loadEpoch.isCurrent(mySeq) || isAbortError(e)) return
           minute.value = null
           minuteError.value = (e as Error).message
           nextTick(() => renderChart())
         })
         .finally(() => {
-          if (mySeq === loadSeq) minuteLoading.value = false
+          if (loadEpoch.isCurrent(mySeq)) minuteLoading.value = false
         })
     } else {
       minute.value = null
@@ -158,121 +187,154 @@ async function load(silent = false) {
       chartMode.value = 'daily'
     }
     // 估值 / 评分 / 相关新闻 best-effort：失败只是不显示对应卡片。
-    getValuation(market.value, symbol.value)
+    getValuation(requestMarket, requestSymbol)
       .then((v) => {
-        if (mySeq === loadSeq) valuation.value = v
+        if (loadEpoch.isCurrent(mySeq)) valuation.value = v
       })
       .catch(() => {
-        if (mySeq === loadSeq) valuation.value = null
+        if (loadEpoch.isCurrent(mySeq)) valuation.value = null
       })
-    getScore(market.value, symbol.value)
+    getScore(requestMarket, requestSymbol)
       .then((s) => {
-        if (mySeq === loadSeq) score.value = s
+        if (loadEpoch.isCurrent(mySeq)) score.value = s
       })
       .catch(() => {
-        if (mySeq === loadSeq) score.value = null
+        if (loadEpoch.isCurrent(mySeq)) score.value = null
       })
-    getNews({ symbol: symbol.value, limit: 15 })
+    getNews({ symbol: requestSymbol, limit: 15 })
       .then((r) => {
-        if (mySeq === loadSeq) news.value = r
+        if (!loadEpoch.isCurrent(mySeq)) return
+        news.value = r
+        markCoverage('news')
       })
-      .catch(() => {
-        if (mySeq === loadSeq) news.value = []
+      .catch((e) => {
+        if (!loadEpoch.isCurrent(mySeq)) return
+        news.value = []
+        markCoverage('news', e)
       })
-    getAnnouncements(symbol.value, 15)
+    getAnnouncements(requestSymbol, 15)
       .then((r) => {
-        if (mySeq === loadSeq) announcements.value = r
+        if (!loadEpoch.isCurrent(mySeq)) return
+        announcements.value = r
+        markCoverage('announcements')
       })
-      .catch(() => {
-        if (mySeq === loadSeq) announcements.value = []
+      .catch((e) => {
+        if (!loadEpoch.isCurrent(mySeq)) return
+        announcements.value = []
+        markCoverage('announcements', e)
       })
     // 财务摘要（F2）best-effort：A 股非基金才有；容器在 v-if 内，等 DOM 后挂图。
-    if (market.value === 'cn' && !isFund.value) {
-      getStockFinance(market.value, symbol.value)
+    if (requestMarket === 'cn' && !requestIsFund) {
+      getStockFinance(requestMarket, requestSymbol)
         .then((r) => {
-          if (mySeq !== loadSeq) return
+          if (!loadEpoch.isCurrent(mySeq)) return
           finance.value = r
+          markCoverage('finance')
           nextTick(() => renderFinanceChart())
         })
-        .catch(() => {
-          if (mySeq === loadSeq) finance.value = null
+        .catch((e) => {
+          if (!loadEpoch.isCurrent(mySeq)) return
+          finance.value = null
+          markCoverage('finance', e)
         })
       // 主力资金（M3a）：按需拉取+缓存，首次访问可能为空（下轮自动刷新补上）。
-      getStockFundFlow(market.value, symbol.value, 90)
+      getStockFundFlow(requestMarket, requestSymbol, 90)
         .then((r) => {
-          if (mySeq !== loadSeq) return
+          if (!loadEpoch.isCurrent(mySeq)) return
           fundflow.value = r
+          markCoverage('funds')
           nextTick(() => renderFundFlowChart())
         })
-        .catch(() => {
-          if (mySeq === loadSeq) fundflow.value = null
+        .catch((e) => {
+          if (!loadEpoch.isCurrent(mySeq)) return
+          fundflow.value = null
+          markCoverage('funds', e)
         })
       // 龙虎榜上榜记录（M3a）：本地缓存表，近 30 天回填 + 每日盘后采集。
-      getStockLhb(market.value, symbol.value, 10)
+      getStockLhb(requestMarket, requestSymbol, 10)
         .then((r) => {
-          if (mySeq === loadSeq) lhbRecords.value = r
+          if (loadEpoch.isCurrent(mySeq)) lhbRecords.value = r
         })
         .catch(() => {
-          if (mySeq === loadSeq) lhbRecords.value = []
+          if (loadEpoch.isCurrent(mySeq)) lhbRecords.value = []
         })
       // 机构观点（P3a）：按需拉取+缓存，首次访问可能为空（下轮自动刷新补上）；
       // 现价随行情带过去用于目标价偏离计算。
-      getStockOrgView(market.value, symbol.value, quote.value?.price)
+      getStockOrgView(requestMarket, requestSymbol, q.price)
         .then((r) => {
-          if (mySeq === loadSeq) orgview.value = r
+          if (!loadEpoch.isCurrent(mySeq)) return
+          orgview.value = r
+          markCoverage('institutions')
         })
-        .catch(() => {
-          if (mySeq === loadSeq) orgview.value = null
+        .catch((e) => {
+          if (!loadEpoch.isCurrent(mySeq)) return
+          orgview.value = null
+          markCoverage('institutions', e)
         })
       // 解禁 / 分红（B9）：每日 19:25 job 同步的本地表，零上游成本。
       // 失败时记 error 并保持 corpEvents=null——空态文案会据此说「读取失败」而不是「无解禁」。
-      getStockCorpEvents(market.value, symbol.value)
+      getStockCorpEvents(requestMarket, requestSymbol, myMinuteAbort.signal)
         .then((r) => {
-          if (mySeq !== loadSeq) return
+          if (!loadEpoch.isCurrent(mySeq)) return
           corpEvents.value = r
           corpEventsError.value = ''
+          markCoverage('events')
         })
         .catch((e) => {
-          if (mySeq !== loadSeq || isAbortError(e)) return
+          if (!loadEpoch.isCurrent(mySeq) || isAbortError(e)) return
           corpEvents.value = null
           corpEventsError.value = (e as Error).message
+          markCoverage('events', e)
         })
     }
     // 指标副图 / 筹码分布 best-effort：失败时 K 线退回单图、筹码卡显示占位。
-    getIndicators(market.value, symbol.value, 120)
+    getIndicators(requestMarket, requestSymbol, 120)
       .then((r) => {
-        if (mySeq !== loadSeq) return
+        if (!loadEpoch.isCurrent(mySeq)) return
         indicators.value = r
         nextTick(() => renderChart())
       })
       .catch(() => {
-        if (mySeq === loadSeq) indicators.value = null
+        if (loadEpoch.isCurrent(mySeq)) indicators.value = null
       })
-    getChips(market.value, symbol.value)
+    getChips(requestMarket, requestSymbol)
       .then((r) => {
-        if (mySeq !== loadSeq) return
+        if (!loadEpoch.isCurrent(mySeq)) return
         chips.value = r
         // 筹码卡容器在 v-if 内，等 DOM 渲染后再挂图。
         nextTick(() => renderChipCharts())
       })
       .catch(() => {
-        if (mySeq === loadSeq) chips.value = null
+        if (loadEpoch.isCurrent(mySeq)) chips.value = null
       })
-    const b = await getDailyBars(market.value, symbol.value, 120)
-    if (mySeq !== loadSeq) return
-    bars.value = b
-    // 必须等 DOM patch：图表容器带 v-show（日K 分支条件是 bars.length > 0），赋值当帧
-    // 容器仍是 display:none，同步 renderChart 会让 echarts.init 拿到 0×0 建出空白画布，
-    // 且 resize 监听只挂在 window 上不会自愈——表现为日K 区域一片空白直到切走再切回。
-    await nextTick()
-    renderChart()
+    try {
+      const b = await getDailyBars(requestMarket, requestSymbol, 120)
+      if (!loadEpoch.isCurrent(mySeq)) return
+      bars.value = b
+      markCoverage('daily')
+      // 必须等 DOM patch：图表容器带 v-show（日K 分支条件是 bars.length > 0），赋值当帧
+      // 容器仍是 display:none，同步 renderChart 会让 echarts.init 拿到 0×0 建出空白画布，
+      // 且 resize 监听只挂在 window 上不会自愈——表现为日K 区域一片空白直到切走再切回。
+      await nextTick()
+      renderChart()
+    } catch (e) {
+      if (!loadEpoch.isCurrent(mySeq) || isAbortError(e)) return
+      if (!silent) bars.value = []
+      markCoverage('daily', e)
+      if (!silent) {
+        await nextTick()
+        renderChart()
+      }
+    }
   } catch (e) {
-    if (!silent && mySeq === loadSeq && !isAbortError(e)) {
+    if (!loadEpoch.isCurrent(mySeq) || isAbortError(e)) return
+    markCoverage('quote', e)
+    if (!silent) {
       loadError.value = (e as Error).message
       quote.value = null
     }
   } finally {
-    if (mySeq === loadSeq) loading.value = false
+    if (loadEpoch.isCurrent(mySeq)) loading.value = false
   }
 }
 
@@ -729,6 +791,144 @@ function streakText(ff: StockFundFlow) {
 const ovTp = computed(() => orgview.value?.summary?.target_price || null)
 const ovSv = computed(() => orgview.value?.summary?.survey || null)
 const ovLc = computed(() => orgview.value?.summary?.latest_rating_change || null)
+
+function latestAsOf(values: Array<string | undefined>): string | undefined {
+  return values.filter((value): value is string => !!value).sort().at(-1)
+}
+function isOlderThan(value: string | undefined, days: number): boolean {
+  if (!value) return false
+  const timestamp = Date.parse(value)
+  return Number.isFinite(timestamp) && Date.now() - timestamp > days * 86_400_000
+}
+function coverageNote(key: CoverageKey, status: StockCoverageItem['status'], extra = ''): string | undefined {
+  if (coverageErrors[key]) return coverageErrors[key]
+  if (extra) return extra
+  if (status === 'missing') return '读取成功，当前没有该类记录'
+  if (status === 'unknown') return '当前标的未观测，或本地接口明确返回不可用'
+  if (status === 'stale') return '已有数据早于当前有效时点'
+  return undefined
+}
+
+const coverageItems = computed<StockCoverageItem[]>(() => {
+  const latestBar = latestAsOf(bars.value.map((item) => item.trade_date))
+  const expectedBarDate = quote.value?.freshness?.expected_as_of?.slice(0, 10)
+  const financeAsOf = latestAsOf([
+    ...(finance.value?.indicators || []).map((item) => item.report_date),
+    ...(finance.value?.statements || []).map((item) => item.report_date),
+  ])
+  const newsAsOf = latestAsOf(news.value.map((item) => item.publish_time))
+  const announcementAsOf = latestAsOf(announcements.value.map((item) => item.notice_date))
+  const institutionAsOf = latestAsOf([
+    ...(orgview.value?.reports || []).map((item) => item.report_date),
+    ...(orgview.value?.surveys || []).map((item) => item.survey_date),
+  ])
+  const eventAsOf = latestAsOf([
+    ...(corpEvents.value?.lifts || []).map((item) => item.free_date),
+    ...(corpEvents.value?.actions || []).map((item) => item.notice_date || item.report_date),
+  ])
+  const newsSources = Array.from(new Set(news.value.map(newsSourceLabel))).join(' / ')
+  const financeAvailable = !!finance.value && (finance.value.indicators.length > 0 || finance.value.statements.length > 0)
+  const institutionAvailable = !!orgview.value && (orgview.value.reports.length > 0 || orgview.value.surveys.length > 0)
+  const eventAvailable = !!corpEvents.value && (
+    corpEvents.value.lifts.length > 0 || corpEvents.value.actions.length > 0 || !!corpEvents.value.dividend_yield
+  )
+  const eventUnavailable = !!corpEvents.value && (corpEvents.value.lift_unavailable || corpEvents.value.action_unavailable)
+  const eventPartial = eventAvailable && eventUnavailable
+
+  const quoteStatus = resolveCoverageStatus({
+    observed: coverageObserved.quote,
+    available: !!quote.value,
+    error: coverageErrors.quote,
+    stale: quote.value?.freshness?.freshness_status === 'stale',
+  })
+  const dailyStatus = resolveCoverageStatus({
+    observed: coverageObserved.daily,
+    available: bars.value.length > 0,
+    error: coverageErrors.daily,
+    stale: !!latestBar && !!expectedBarDate && latestBar < expectedBarDate,
+  })
+  const financeStatus = resolveCoverageStatus({
+    observed: coverageObserved.finance,
+    available: financeAvailable,
+    error: coverageErrors.finance,
+    stale: financeAvailable && isOlderThan(financeAsOf, 220),
+  })
+  const newsStatus = resolveCoverageStatus({
+    observed: coverageObserved.news,
+    available: news.value.length > 0,
+    error: coverageErrors.news,
+    stale: news.value.length > 0 && isOlderThan(newsAsOf, 7),
+  })
+  const announcementStatus = resolveCoverageStatus({
+    observed: coverageObserved.announcements,
+    available: announcements.value.length > 0,
+    error: coverageErrors.announcements,
+  })
+  const institutionStatus = resolveCoverageStatus({
+    observed: coverageObserved.institutions,
+    available: institutionAvailable,
+    error: coverageErrors.institutions,
+  })
+  const fundsStatus = resolveCoverageStatus({
+    observed: coverageObserved.funds,
+    available: !!fundflow.value?.days.length,
+    error: coverageErrors.funds,
+    stale: !!fundflow.value?.days.length && !fundflow.value.fresh,
+  })
+  const eventStatus = resolveCoverageStatus({
+    observed: coverageObserved.events,
+    available: eventAvailable,
+    error: coverageErrors.events,
+    unknown: eventUnavailable && !eventAvailable,
+  })
+
+  return [
+    {
+      key: 'quote', label: '行情', status: quoteStatus,
+      source: quote.value?.source || '行情聚合', asOf: quote.value?.data_time,
+      note: coverageNote('quote', quoteStatus, quote.value?.freshness?.stale_reason || ''),
+    },
+    {
+      key: 'daily', label: '日线', status: dailyStatus,
+      source: '本地日线 / 行情源', asOf: latestBar,
+      note: coverageNote('daily', dailyStatus),
+    },
+    {
+      key: 'finance', label: '财务', status: financeStatus,
+      source: '东财 F10', asOf: financeAsOf,
+      note: coverageNote('finance', financeStatus),
+    },
+    {
+      key: 'news', label: '新闻', status: newsStatus,
+      source: newsSources || '财联社 / 东财', asOf: newsAsOf,
+      note: coverageNote('news', newsStatus),
+    },
+    {
+      key: 'announcements', label: '公告', status: announcementStatus,
+      source: '东财公告', asOf: announcementAsOf,
+      note: coverageNote('announcements', announcementStatus),
+    },
+    {
+      key: 'institutions', label: '机构', status: institutionStatus,
+      source: '东财研报 / 调研', asOf: institutionAsOf,
+      note: coverageNote('institutions', institutionStatus),
+    },
+    {
+      key: 'funds', label: '资金', status: fundsStatus,
+      source: '东财资金流', asOf: fundflow.value?.last_date,
+      note: coverageNote('funds', fundsStatus),
+    },
+    {
+      key: 'events', label: '事件', status: eventStatus,
+      source: '本地事件表 / 东财', asOf: eventAsOf,
+      note: coverageNote(
+        'events',
+        eventStatus,
+        eventPartial ? '部分事件类型不可用，当前结果可能不完整' : (corpEvents.value?.note || ''),
+      ),
+    },
+  ]
+})
 const ovDistText = computed(() => {
   const d = orgview.value?.summary?.rating_dist_90d
   if (!d || !d.total) return ''
@@ -774,12 +974,12 @@ watch(chartMode, async () => {
   renderChart()
 })
 // 同页跳转到另一只个股（如从对比/搜索进来）时整页重载。
-// 顺序要点：①先让 loadSeq 失效并 abort 在途请求——旧标的的迟到响应绝不能落到新标的上；
+// 顺序要点：①先让 load epoch 失效并 abort 在途请求——旧标的的迟到响应绝不能落到新标的上；
 // ②清空**全部**行情态（含 quote/bars，此前漏清会让新标的加载期间显示旧标的的价格与
 // K 线，且 quote 非空使整个详情区照常渲染，用户看到的是另一只股票的数据）；
 // ③dispose 图表实例，避免容器随 v-if 重建后旧实例孤儿化。
 watch([market, symbol], () => {
-  loadSeq++
+  loadEpoch.invalidate()
   minuteAbort?.abort()
   minuteAbort = null
   loading.value = false
@@ -812,7 +1012,7 @@ onMounted(() => {
 })
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
-  loadSeq++
+  loadEpoch.invalidate()
   minuteAbort?.abort()
   minuteAbort = null
   disposeCharts()
@@ -927,6 +1127,8 @@ function scoreType(total: number) {
             <n-button size="small" secondary @click="goPosition">建仓</n-button>
           </div>
         </SectionCard>
+
+        <StockCoverageMatrix :items="coverageItems" />
 
         <!-- 分时与日 K 共用稳定尺寸图表容器，切换时重绘。 -->
         <SectionCard title="行情走势">

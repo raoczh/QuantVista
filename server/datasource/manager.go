@@ -67,7 +67,7 @@ func classifyErr(err error) (string, callOutcome) {
 //  4. 其余错误归一为 {code, source, latency} 记 DEBUG 日志，并作为滑窗输入。
 //
 // 单源失败只记 DEBUG（有备源兜底不必刷屏）；全部失败由各入口记一条 WARN。
-func routeCap[T any](m *Manager, ctx context.Context, capability string, call func(ctx context.Context, a Adapter) (T, error)) (T, error) {
+func routeCap[T any](m *Manager, ctx context.Context, market, capability string, call func(ctx context.Context, a Adapter) (T, error)) (T, error) {
 	var zero T
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
@@ -77,7 +77,7 @@ func routeCap[T any](m *Manager, ctx context.Context, capability string, call fu
 
 	var lastErr error
 	trySource := func(a Adapter) (T, bool, error) {
-		return attemptSource(m, ctx, capability, a, call)
+		return attemptSource(m, ctx, market, capability, a, call)
 	}
 
 	var cooled []Adapter
@@ -85,7 +85,7 @@ func routeCap[T any](m *Manager, ctx context.Context, capability string, call fu
 		if ctx.Err() != nil {
 			break
 		}
-		if !m.health.Available(a.Name(), capability) {
+		if !m.health.AvailableForMarket(a.Name(), capability, market) {
 			cooled = append(cooled, a)
 			continue
 		}
@@ -124,7 +124,7 @@ func routeCap[T any](m *Manager, ctx context.Context, capability string, call fu
 
 // attemptSource 对单个源发起一次能力调用（含单源短预算、错误归一、健康滑窗记录、DEBUG 日志）。
 // 从 routeCap 内联闭包提取，供 routeCap 与 GetQuoteFresh 复用；行为与原闭包完全一致。
-func attemptSource[T any](m *Manager, ctx context.Context, capability string, a Adapter, call func(ctx context.Context, a Adapter) (T, error)) (T, bool, error) {
+func attemptSource[T any](m *Manager, ctx context.Context, market, capability string, a Adapter, call func(ctx context.Context, a Adapter) (T, error)) (T, bool, error) {
 	var zero T
 	sctx, cancel := context.WithTimeout(ctx, mgrSourceBudget)
 	defer cancel()
@@ -132,14 +132,14 @@ func attemptSource[T any](m *Manager, ctx context.Context, capability string, a 
 	r, err := call(sctx, a)
 	latency := time.Since(start).Milliseconds()
 	if err == nil {
-		m.health.Record(a.Name(), capability, outcomeSuccess, latency)
+		m.health.RecordForMarket(a.Name(), capability, market, outcomeSuccess, latency)
 		return r, true, nil
 	}
 	if errors.Is(err, ErrNotSupported) || errors.Is(err, ErrSymbolInvalid) {
 		return zero, false, err // 不记滑窗：非源健康问题
 	}
 	code, outcome := classifyErr(err)
-	m.health.Record(a.Name(), capability, outcome, latency)
+	m.health.RecordForMarket(a.Name(), capability, market, outcome, latency)
 	common.SysDebug("[datasource] code=%s source=%s cap=%s latency=%dms err=%v", code, a.Name(), capability, latency, err)
 	return zero, false, err
 }
@@ -165,7 +165,11 @@ func (m *Manager) GetQuoteFresh(ctx context.Context, market, symbol string, acce
 		defer cancel()
 	}
 	call := func(ctx context.Context, a Adapter) (*Quote, error) {
-		return a.GetQuote(ctx, market, symbol)
+		q, err := a.GetQuote(ctx, market, symbol)
+		if err == nil && q == nil {
+			err = ErrNoData
+		}
+		return q, err
 	}
 
 	var best *Quote
@@ -186,11 +190,11 @@ func (m *Manager) GetQuoteFresh(ctx context.Context, market, symbol string, acce
 		if ctx.Err() != nil {
 			break
 		}
-		if !m.health.Available(a.Name(), "quote") {
+		if !m.health.AvailableForMarket(a.Name(), "quote", market) {
 			cooled = append(cooled, a)
 			continue
 		}
-		q, ok, err := attemptSource(m, ctx, "quote", a, call)
+		q, ok, err := attemptSource(m, ctx, market, "quote", a, call)
 		if ok {
 			if consider(q) {
 				return best, true, nil
@@ -211,7 +215,7 @@ func (m *Manager) GetQuoteFresh(ctx context.Context, market, symbol string, acce
 		if ctx.Err() != nil {
 			break
 		}
-		q, ok, err := attemptSource(m, ctx, "quote", a, call)
+		q, ok, err := attemptSource(m, ctx, market, "quote", a, call)
 		if ok {
 			if consider(q) {
 				return best, true, nil
@@ -236,8 +240,12 @@ func (m *Manager) GetQuoteFresh(ctx context.Context, market, symbol string, acce
 
 // GetQuote 依次尝试各源，返回首个成功结果（含实际命中的 Source）。
 func (m *Manager) GetQuote(ctx context.Context, market, symbol string) (*Quote, error) {
-	q, err := routeCap(m, ctx, "quote", func(ctx context.Context, a Adapter) (*Quote, error) {
-		return a.GetQuote(ctx, market, symbol)
+	q, err := routeCap(m, ctx, market, "quote", func(ctx context.Context, a Adapter) (*Quote, error) {
+		q, qerr := a.GetQuote(ctx, market, symbol)
+		if qerr == nil && q == nil {
+			qerr = ErrNoData
+		}
+		return q, qerr
 	})
 	if err != nil && !errors.Is(err, ErrSymbolInvalid) {
 		common.SysWarn("所有数据源取行情失败 symbol=%s: %v", symbol, err)
@@ -248,8 +256,11 @@ func (m *Manager) GetQuote(ctx context.Context, market, symbol string) (*Quote, 
 // GetDailyBars 依次尝试支持日线的源：东财在前（fqt=1 前复权），腾讯不支持日线
 // 返回 ErrNotSupported 被跳过，新浪殿后兜底（无复权参数、无成交额）。
 func (m *Manager) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]Bar, error) {
-	bars, err := routeCap(m, ctx, "daily_bars", func(ctx context.Context, a Adapter) ([]Bar, error) {
+	bars, err := routeCap(m, ctx, market, "daily_bars", func(ctx context.Context, a Adapter) ([]Bar, error) {
 		bs, berr := a.GetDailyBars(ctx, market, symbol, limit)
+		if berr == nil && len(bs) == 0 {
+			berr = ErrNoData
+		}
 		if berr == nil {
 			for i := range bs {
 				if bs[i].Source == "" {
@@ -267,67 +278,91 @@ func (m *Manager) GetDailyBars(ctx context.Context, market, symbol string, limit
 
 // GetIndices 路由到实现 IndexProvider 的源（新浪批量优先）。
 func (m *Manager) GetIndices(ctx context.Context, market string) ([]Index, error) {
-	return routeCap(m, ctx, "indices", func(ctx context.Context, a Adapter) ([]Index, error) {
+	return routeCap(m, ctx, market, "indices", func(ctx context.Context, a Adapter) ([]Index, error) {
 		p, ok := a.(IndexProvider)
 		if !ok {
 			return nil, ErrNotSupported
 		}
-		return p.GetIndices(ctx, market)
+		rows, err := p.GetIndices(ctx, market)
+		if err == nil && len(rows) == 0 {
+			err = ErrNoData
+		}
+		return rows, err
 	})
 }
 
 // GetStockRanking 路由到实现 RankingProvider 的源（新浪 Market_Center）。
 func (m *Manager) GetStockRanking(ctx context.Context, market, sort string, asc bool, limit int) ([]StockRank, error) {
-	return routeCap(m, ctx, "ranking", func(ctx context.Context, a Adapter) ([]StockRank, error) {
+	return routeCap(m, ctx, market, "ranking", func(ctx context.Context, a Adapter) ([]StockRank, error) {
 		p, ok := a.(RankingProvider)
 		if !ok {
 			return nil, ErrNotSupported
 		}
-		return p.GetStockRanking(ctx, market, sort, asc, limit)
+		rows, err := p.GetStockRanking(ctx, market, sort, asc, limit)
+		if err == nil && len(rows) == 0 {
+			err = ErrNoData
+		}
+		return rows, err
 	})
 }
 
 // GetSectorRanking 路由到实现 SectorProvider 的源（东财 clist，best-effort）。
 func (m *Manager) GetSectorRanking(ctx context.Context, market string, limit int) ([]SectorRank, error) {
-	return routeCap(m, ctx, "sector", func(ctx context.Context, a Adapter) ([]SectorRank, error) {
+	return routeCap(m, ctx, market, "sector", func(ctx context.Context, a Adapter) ([]SectorRank, error) {
 		p, ok := a.(SectorProvider)
 		if !ok {
 			return nil, ErrNotSupported
 		}
-		return p.GetSectorRanking(ctx, market, limit)
+		rows, err := p.GetSectorRanking(ctx, market, limit)
+		if err == nil && len(rows) == 0 {
+			err = ErrNoData
+		}
+		return rows, err
 	})
 }
 
 // GetBreadth 路由到实现 BreadthProvider 的源（东财涨跌分布）。
 func (m *Manager) GetBreadth(ctx context.Context, market string) (*Breadth, error) {
-	return routeCap(m, ctx, "breadth", func(ctx context.Context, a Adapter) (*Breadth, error) {
+	return routeCap(m, ctx, market, "breadth", func(ctx context.Context, a Adapter) (*Breadth, error) {
 		p, ok := a.(BreadthProvider)
 		if !ok {
 			return nil, ErrNotSupported
 		}
-		return p.GetBreadth(ctx, market)
+		v, err := p.GetBreadth(ctx, market)
+		if err == nil && v == nil {
+			err = ErrNoData
+		}
+		return v, err
 	})
 }
 
 // GetMarketFundFlow 路由到实现 FundFlowProvider 的源（东财两市资金流）。
 func (m *Manager) GetMarketFundFlow(ctx context.Context, market string) (*MarketFundFlow, error) {
-	return routeCap(m, ctx, "fundflow", func(ctx context.Context, a Adapter) (*MarketFundFlow, error) {
+	return routeCap(m, ctx, market, "fundflow", func(ctx context.Context, a Adapter) (*MarketFundFlow, error) {
 		p, ok := a.(FundFlowProvider)
 		if !ok {
 			return nil, ErrNotSupported
 		}
-		return p.GetMarketFundFlow(ctx, market)
+		v, err := p.GetMarketFundFlow(ctx, market)
+		if err == nil && v == nil {
+			err = ErrNoData
+		}
+		return v, err
 	})
 }
 
 // GetTradingDays 路由到实现 TradingDaysProvider 的源（新浪上证指数日线）。
 func (m *Manager) GetTradingDays(ctx context.Context, market string, limit int) ([]string, error) {
-	return routeCap(m, ctx, "trading_days", func(ctx context.Context, a Adapter) ([]string, error) {
+	return routeCap(m, ctx, market, "trading_days", func(ctx context.Context, a Adapter) ([]string, error) {
 		p, ok := a.(TradingDaysProvider)
 		if !ok {
 			return nil, ErrNotSupported
 		}
-		return p.GetTradingDays(ctx, market, limit)
+		rows, err := p.GetTradingDays(ctx, market, limit)
+		if err == nil && len(rows) == 0 {
+			err = ErrNoData
+		}
+		return rows, err
 	})
 }
 
@@ -339,12 +374,15 @@ type benchmarkResult struct {
 
 // GetBenchmarkBars 路由到实现 BenchmarkBarsProvider 的源（新浪上证指数日线）。
 func (m *Manager) GetBenchmarkBars(ctx context.Context, market string, limit int) (string, []Bar, error) {
-	r, err := routeCap(m, ctx, "benchmark", func(ctx context.Context, a Adapter) (benchmarkResult, error) {
+	r, err := routeCap(m, ctx, market, "benchmark", func(ctx context.Context, a Adapter) (benchmarkResult, error) {
 		p, ok := a.(BenchmarkBarsProvider)
 		if !ok {
 			return benchmarkResult{}, ErrNotSupported
 		}
 		name, bars, berr := p.GetBenchmarkBars(ctx, market, limit)
+		if berr == nil && len(bars) == 0 {
+			berr = ErrNoData
+		}
 		return benchmarkResult{name: name, bars: bars}, berr
 	})
 	return r.name, r.bars, err
@@ -352,11 +390,15 @@ func (m *Manager) GetBenchmarkBars(ctx context.Context, market string, limit int
 
 // GetValuation 路由到实现 ValuationProvider 的源（腾讯行情自带估值字段）。
 func (m *Manager) GetValuation(ctx context.Context, market, symbol string) (*Valuation, error) {
-	return routeCap(m, ctx, "valuation", func(ctx context.Context, a Adapter) (*Valuation, error) {
+	return routeCap(m, ctx, market, "valuation", func(ctx context.Context, a Adapter) (*Valuation, error) {
 		p, ok := a.(ValuationProvider)
 		if !ok {
 			return nil, ErrNotSupported
 		}
-		return p.GetValuation(ctx, market, symbol)
+		v, err := p.GetValuation(ctx, market, symbol)
+		if err == nil && v == nil {
+			err = ErrNoData
+		}
+		return v, err
 	})
 }

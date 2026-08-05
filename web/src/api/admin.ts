@@ -91,6 +91,11 @@ export interface SyncLog {
   failed: number
   duration_ms: number
   message: string
+  trigger_source: string
+  user_id: number
+  parameter_summary: string
+  range_summary: string
+  plan_hash: string
   created_at: string
 }
 
@@ -98,7 +103,68 @@ export function listSyncLogs(limit = 50) {
   return request<SyncLog[]>({ url: '/admin/market/sync-logs', params: { limit } })
 }
 
-// ---------- P1 数据健康总览与补跑 ----------
+// ---------- P0-3A 数据源能力矩阵 ----------
+
+export type CapabilityObservation = 'unknown' | 'success' | 'empty' | 'error'
+
+export interface DataSourceCapability {
+  source: string
+  capability: string
+  market: string
+  frequency: string
+  expected_freshness_sec: number
+  expected_freshness: string
+  timeout_ms: number
+  qps_limit: number
+  qps_policy: string
+  cache_ttl_sec: number
+  cache_semantics: string
+  registered: boolean
+  supported: boolean
+  observation: CapabilityObservation
+  observed: boolean
+  samples: number
+  success: number
+  empty: number
+  errors: number
+  avg_latency_ms: number
+  last_observed_at?: string
+  last_success_at?: string
+  available: boolean
+  cooldown_left_sec: number
+  cooldown_hits: number
+  recovery_advice: string
+}
+
+export interface DataSourcesResponse {
+  health: DataSourceCapability[]
+}
+
+export function getDataSources() {
+  return request<DataSourcesResponse>({ url: '/admin/datasources' })
+}
+
+// ---------- P0-3A 数据健康总览与补跑 ----------
+
+export type GapDayStatus = 'covered' | 'missing' | 'partial' | 'suspended' | 'closed' | 'unknown'
+export type RecoveryClass = 'backfillable' | 'unrecoverable' | 'partial' | 'unknown'
+
+export interface DataHealthDay {
+  date: string
+  status: GapDayStatus
+  observed: number
+  expected: number
+  suspended?: number
+  recovery_class: RecoveryClass
+  note?: string
+}
+
+export interface DataHealthFailureSummary {
+  task: string
+  status: string
+  message: string
+  created_at: string
+}
 
 export interface DataHealthItem {
   key: string
@@ -107,31 +173,82 @@ export interface DataHealthItem {
   observed_date: string // 库内实际最新日期（空=无数据）
   lag_open_days: number // 落后开市日数（-1=日历不可用无法判定）
   tolerance_open_days: number
-  status: string // ok / behind / empty / unknown
+  status: string // ok / behind / empty / partial / unknown
   coverage?: string
+  coverage_numerator: number
+  coverage_denominator: number
+  coverage_unit?: string
+  recovery_class: RecoveryClass
+  gap_calendar?: DataHealthDay[]
   last_run?: SyncLog
+  recent_failure?: DataHealthFailureSummary
   note?: string
 }
 
 export interface DataHealthReport {
   generated_at: string
+  window_days: number
+  window_start?: string
+  window_end?: string
+  query_hard_max: number
   items: DataHealthItem[]
 }
 
-export function getDataHealth() {
-  return request<DataHealthReport>({ url: '/admin/data-health' })
+export function getDataHealth(days = 45) {
+  return request<DataHealthReport>({ url: '/admin/data-health', params: { days } })
+}
+
+export interface MaintenanceRequest {
+  market?: string
+  from?: string
+  to?: string
+  dry_run?: boolean
+  plan_hash?: string
+}
+
+export interface MaintenancePlan {
+  task: string
+  market: string
+  from: string
+  to: string
+  window_days: number
+  target_count: number
+  expected_count: number
+  existing_count: number
+  missing_count: number
+  suspended_count: number
+  estimated_requests: number
+  capped: boolean
+  sample_targets?: string[]
+  difference_summary: string
+  plan_hash: string
+  generated_at: string
+}
+
+export interface MaintenanceDryRunResponse {
+  dry_run: true
+  plan: MaintenancePlan
+}
+
+export interface MaintenanceExecutionResponse {
+  dry_run?: false
+  started?: boolean
+  task?: string
+  market?: string
+  plan_hash?: string
+  log?: SyncLog
 }
 
 // 补跑入口（既有管理端接口）：全市场增量 / 历史初始化 / 日线批量同步 / 情绪快照 /
 // 因子宽表重建 / 日历回填。均异步或幂等，返回启动标志。
-export function triggerWideSync() {
-  return request<{ started: boolean }>({ url: '/admin/market/wide-sync', method: 'post' })
+export function triggerWideSync(data?: MaintenanceRequest) {
+  return request<MaintenanceDryRunResponse | MaintenanceExecutionResponse>({ url: '/admin/market/wide-sync', method: 'post', data })
 }
 export function triggerWideInit() {
   return request<{ started: boolean }>({ url: '/admin/market/wide-init', method: 'post' })
 }
-export function triggerSyncBars() {
-  return request<{ started: boolean }>({ url: '/admin/market/sync-bars', method: 'post', timeout: HEAVY_TIMEOUT })
+export function triggerSyncBars(data?: MaintenanceRequest) {
+  return request<MaintenanceDryRunResponse | MaintenanceExecutionResponse>({ url: '/admin/market/sync-bars', method: 'post', data, timeout: HEAVY_TIMEOUT })
 }
 export function triggerSnapshot() {
   return request<unknown>({ url: '/admin/market/snapshot', method: 'post', timeout: HEAVY_TIMEOUT })
@@ -139,8 +256,8 @@ export function triggerSnapshot() {
 export function triggerFactorRebuild() {
   return request<{ started: boolean }>({ url: '/admin/market/factor-rebuild', method: 'post' })
 }
-export function triggerBackfillCalendar() {
-  return request<unknown>({ url: '/admin/market/backfill-calendar', method: 'post', timeout: HEAVY_TIMEOUT })
+export function triggerBackfillCalendar(data?: MaintenanceRequest) {
+  return request<MaintenanceDryRunResponse | MaintenanceExecutionResponse>({ url: '/admin/market/backfill-calendar', method: 'post', data, timeout: HEAVY_TIMEOUT })
 }
 
 // ---------- LLM 调用审计 ----------

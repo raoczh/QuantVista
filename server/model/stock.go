@@ -37,8 +37,8 @@ type StockQuote struct {
 type DailyBar struct {
 	ID        int64   `gorm:"primaryKey" json:"id"`
 	Symbol    string  `gorm:"size:16;index:idx_bar_symbol_date,unique" json:"symbol"`
-	Market    string  `gorm:"size:8;index:idx_bar_symbol_date,unique" json:"market"`
-	TradeDate string  `gorm:"size:10;index:idx_bar_symbol_date,unique" json:"trade_date"` // YYYY-MM-DD
+	Market    string  `gorm:"size:8;index:idx_bar_symbol_date,unique;index:idx_bar_market_date,priority:1" json:"market"`
+	TradeDate string  `gorm:"size:10;index:idx_bar_symbol_date,unique;index:idx_bar_market_date,priority:2" json:"trade_date"` // YYYY-MM-DD
 	Open      float64 `gorm:"type:decimal(20,4)" json:"open"`
 	High      float64 `gorm:"type:decimal(20,4)" json:"high"`
 	Low       float64 `gorm:"type:decimal(20,4)" json:"low"`
@@ -82,14 +82,21 @@ type MarketSnapshot struct {
 // DataSyncLog 数据同步任务审计：记录批量日线同步/日历回填等后台任务的执行结果。
 // 便于排查数据缺口与数据源限流（对应 phase0 review P1#3 的 data_sync_logs 缺口）。
 type DataSyncLog struct {
-	ID         int64     `gorm:"primaryKey" json:"id"`
-	Task       string    `gorm:"size:32;index" json:"task"` // sync_daily_bars / backfill_calendar / snapshot_market
-	Market     string    `gorm:"size:8" json:"market"`
-	Status     string    `gorm:"size:16" json:"status"`   // success / partial / failed
-	Total      int       `json:"total"`                   // 计划处理条目数
-	Succeeded  int       `json:"succeeded"`               // 成功条目数
-	Failed     int       `json:"failed"`                  // 失败条目数
-	DurationMs int64     `json:"duration_ms"`             // 耗时（毫秒）
-	Message    string    `gorm:"size:512" json:"message"` // 摘要或首个错误
-	CreatedAt  time.Time `gorm:"index" json:"created_at"`
+	ID         int64  `gorm:"primaryKey" json:"id"`
+	Task       string `gorm:"size:32;index;index:idx_sync_task_created,priority:1" json:"task"` // sync_daily_bars / backfill_calendar / snapshot_market
+	Market     string `gorm:"size:8" json:"market"`
+	Status     string `gorm:"size:16" json:"status"` // success / partial / failed
+	Total      int    `json:"total"`                 // 计划处理条目数
+	Succeeded  int    `json:"succeeded"`             // 成功条目数
+	Failed     int    `json:"failed"`                // 失败条目数
+	DurationMs int64  `json:"duration_ms"`           // 耗时（毫秒）
+	Message    string `gorm:"size:512" json:"message"`
+
+	// 运维审计只存白名单摘要，不存请求正文、token、cookie 或上游响应。
+	TriggerSource    string    `gorm:"size:24;index;default:scheduler" json:"trigger_source"` // scheduler / startup / admin / admin_legacy
+	UserID           int64     `gorm:"index" json:"user_id"`                                  // 管理员手动触发者；系统任务为 0
+	ParameterSummary string    `gorm:"size:512" json:"parameter_summary"`
+	RangeSummary     string    `gorm:"size:128" json:"range_summary"`
+	PlanHash         string    `gorm:"size:64" json:"plan_hash"`
+	CreatedAt        time.Time `gorm:"index;index:idx_sync_task_created,priority:2" json:"created_at"`
 }

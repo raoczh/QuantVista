@@ -16,6 +16,8 @@ import {
   NModal,
   NCheckbox,
   NEmpty,
+  NTooltip,
+  NDatePicker,
   useMessage,
 } from 'naive-ui'
 import {
@@ -26,6 +28,7 @@ import {
   getUserQuota,
   updateUserQuota,
   listSyncLogs,
+  getDataSources,
   getDataHealth,
   triggerWideSync,
   triggerWideInit,
@@ -39,7 +42,11 @@ import {
   resetLLMRoute,
   type SystemSettings,
   type SyncLog,
+  type DataSourceCapability,
   type DataHealthReport,
+  type DataHealthDay,
+  type MaintenancePlan,
+  type MaintenanceRequest,
   type LLMRouteView,
   type LLMRouteModuleOption,
 } from '@/api/admin'
@@ -527,10 +534,13 @@ function fmtLogTime(t: string) {
 /* P1 数据健康总览：各数据域 expected/observed 对账 + 补跑入口 */
 const health = ref<DataHealthReport | null>(null)
 const healthLoading = ref(false)
+const healthWindowDays = ref(45)
 async function loadHealth() {
   healthLoading.value = true
   try {
-    health.value = await getDataHealth()
+    health.value = await getDataHealth(healthWindowDays.value)
+    if (!maintenanceRange.from && health.value.window_start) maintenanceRange.from = health.value.window_start
+    if (!maintenanceRange.to && health.value.window_end) maintenanceRange.to = health.value.window_end
   } catch (e) {
     message.error((e as Error).message)
   } finally {
@@ -541,7 +551,158 @@ const healthStatusMeta: Record<string, { label: string; type: 'success' | 'error
   ok: { label: '正常', type: 'success' },
   behind: { label: '落后', type: 'error' },
   empty: { label: '无数据', type: 'warning' },
+  partial: { label: '部分覆盖', type: 'warning' },
   unknown: { label: '无法判定', type: 'default' },
+}
+const recoveryMeta: Record<string, { label: string; type: 'success' | 'error' | 'warning' | 'default' }> = {
+  backfillable: { label: '可补采', type: 'success' },
+  unrecoverable: { label: '不可回溯', type: 'error' },
+  partial: { label: '部分可补', type: 'warning' },
+  unknown: { label: '未知', type: 'default' },
+}
+
+const healthStatusFilter = ref<string | null>(null)
+const healthRecoveryFilter = ref<string | null>(null)
+const filteredHealthItems = computed(() =>
+  (health.value?.items || []).filter(
+    (item) => (!healthStatusFilter.value || item.status === healthStatusFilter.value)
+      && (!healthRecoveryFilter.value || item.recovery_class === healthRecoveryFilter.value),
+  ),
+)
+const healthStatusOptions = computed(() =>
+  [...new Set((health.value?.items || []).map((item) => item.status))].map((value) => ({
+    label: healthStatusMeta[value]?.label || value,
+    value,
+  })),
+)
+const healthRecoveryOptions = computed(() =>
+  [...new Set((health.value?.items || []).map((item) => item.recovery_class))].map((value) => ({
+    label: recoveryMeta[value]?.label || value,
+    value,
+  })),
+)
+
+function gapDayTitle(day: DataHealthDay) {
+  const label: Record<string, string> = {
+    covered: '已覆盖', missing: '缺失', partial: '部分覆盖', suspended: '停牌', closed: '休市', unknown: '未知',
+  }
+  const count = day.expected > 1 ? ` · ${day.observed}/${day.expected}` : ''
+  return `${day.date} · ${label[day.status] || day.status}${count}${day.note ? ` · ${day.note}` : ''}`
+}
+
+/* P0-3A provider x capability x market 注册矩阵（支持面来自代码注册，不从滑窗反推） */
+const capabilities = ref<DataSourceCapability[]>([])
+const capabilityLoading = ref(false)
+const capabilityProvider = ref<string | null>(null)
+const capabilityName = ref<string | null>(null)
+const capabilityObservation = ref<string | null>(null)
+async function loadCapabilities() {
+  capabilityLoading.value = true
+  try {
+    capabilities.value = (await getDataSources()).health
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    capabilityLoading.value = false
+  }
+}
+const capabilityProviderOptions = computed(() =>
+  [...new Set(capabilities.value.map((item) => item.source))].map((value) => ({ label: value, value })),
+)
+const capabilityNameOptions = computed(() =>
+  [...new Set(capabilities.value.map((item) => item.capability))].map((value) => ({ label: value, value })),
+)
+const capabilityObservationOptions = [
+  { label: '未观测', value: 'unknown' },
+  { label: '成功', value: 'success' },
+  { label: '空响应', value: 'empty' },
+  { label: '错误', value: 'error' },
+]
+const filteredCapabilities = computed(() => capabilities.value.filter((item) =>
+  (!capabilityProvider.value || item.source === capabilityProvider.value)
+  && (!capabilityName.value || item.capability === capabilityName.value)
+  && (!capabilityObservation.value || item.observation === capabilityObservation.value),
+))
+const capabilityObservationMeta: Record<string, { label: string; type: 'success' | 'error' | 'warning' | 'default' }> = {
+  unknown: { label: '未观测', type: 'default' },
+  success: { label: '成功', type: 'success' },
+  empty: { label: '空响应', type: 'warning' },
+  error: { label: '错误', type: 'error' },
+}
+
+/* 有 body 的补采先 dry-run；完全无 body 的旧客户端兼容由后端承担。 */
+type MaintenanceKind = 'wide' | 'bars' | 'calendar'
+const maintenanceRange = reactive<{ from: string | null; to: string | null }>({ from: null, to: null })
+const dryRunOpen = ref(false)
+const dryRunLoading = ref(false)
+const executingPlan = ref(false)
+const maintenanceKind = ref<MaintenanceKind>('bars')
+const maintenancePlan = ref<MaintenancePlan | null>(null)
+const maintenanceLabels: Record<MaintenanceKind, string> = {
+  wide: '全市场增量同步',
+  bars: '已跟踪日线补采',
+  calendar: '交易日历回填',
+}
+
+function maintenancePayload(kind: MaintenanceKind, dryRun: boolean, planHash?: string): MaintenanceRequest {
+  const payload: MaintenanceRequest = { market: 'cn', dry_run: dryRun, plan_hash: planHash }
+  if (kind !== 'wide' && maintenanceRange.from && maintenanceRange.to) {
+    payload.from = maintenanceRange.from
+    payload.to = maintenanceRange.to
+  }
+  return payload
+}
+
+async function callMaintenance(kind: MaintenanceKind, payload: MaintenanceRequest) {
+  if (kind === 'wide') return triggerWideSync(payload)
+  if (kind === 'calendar') return triggerBackfillCalendar(payload)
+  return triggerSyncBars(payload)
+}
+
+async function previewMaintenance(kind: MaintenanceKind) {
+  if (kind !== 'wide' && (!maintenanceRange.from || !maintenanceRange.to)) {
+    message.warning('请选择补采起止日期')
+    return
+  }
+  rerunning.value = kind
+  dryRunLoading.value = true
+  try {
+    const result = await callMaintenance(kind, maintenancePayload(kind, true))
+    if (!('plan' in result) || !result.plan) throw new Error('dry-run 未返回计划')
+    maintenanceKind.value = kind
+    maintenancePlan.value = result.plan
+    maintenanceRange.from = result.plan.from
+    maintenanceRange.to = result.plan.to
+    dryRunOpen.value = true
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    rerunning.value = ''
+    dryRunLoading.value = false
+  }
+}
+
+async function executeMaintenancePlan() {
+  const plan = maintenancePlan.value
+  if (!plan) return
+  executingPlan.value = true
+  try {
+    const result = await callMaintenance(maintenanceKind.value, {
+      market: plan.market,
+      from: plan.from,
+      to: plan.to,
+      dry_run: false,
+      plan_hash: plan.plan_hash,
+    })
+    message.success('started' in result && result.started === false ? '已有任务运行中' : '补采已确认执行')
+    dryRunOpen.value = false
+    await Promise.all([loadLogs(), loadHealth(), loadCapabilities()])
+  } catch (e) {
+    message.error((e as Error).message)
+    dryRunOpen.value = false
+  } finally {
+    executingPlan.value = false
+  }
 }
 const rerunning = ref('')
 async function rerun(key: string, fn: () => Promise<unknown>) {
@@ -562,6 +723,7 @@ onMounted(() => {
   loadLogs()
   loadMyConfigs()
   loadHealth()
+  loadCapabilities()
   loadRoutes()
 })
 </script>
@@ -835,20 +997,95 @@ onMounted(() => {
         </n-table>
       </SectionCard>
 
-      <!-- P1 数据健康总览：expected/observed 对账 + 补跑入口 -->
+      <!-- P0-3A 代码注册表与健康滑窗合并矩阵 -->
+      <SectionCard title="数据源能力矩阵" :hoverable="false">
+        <template #extra>
+          <n-button size="tiny" quaternary :loading="capabilityLoading" @click="loadCapabilities">刷新</n-button>
+        </template>
+        <div class="ops-filters">
+          <n-select v-model:value="capabilityProvider" clearable placeholder="数据源" :options="capabilityProviderOptions" />
+          <n-select v-model:value="capabilityName" clearable placeholder="能力" :options="capabilityNameOptions" />
+          <n-select v-model:value="capabilityObservation" clearable placeholder="观测" :options="capabilityObservationOptions" />
+        </div>
+        <n-empty v-if="!filteredCapabilities.length" description="暂无能力声明" size="small" style="padding: 20px 0" />
+        <n-table v-else-if="!isMobile" class="ops-table" :bordered="false" :single-line="false" size="small">
+          <thead>
+            <tr>
+              <th>数据源 / 能力</th>
+              <th>时效契约</th>
+              <th>超时 / QPS</th>
+              <th>缓存语义</th>
+              <th>观测</th>
+              <th>延迟 / 最近成功</th>
+              <th>恢复建议</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="cap in filteredCapabilities" :key="`${cap.source}:${cap.capability}:${cap.market}`">
+              <td>
+                <strong>{{ cap.source }}</strong>
+                <div class="ops-sub">{{ cap.capability }} · {{ cap.market }} · {{ cap.frequency }}</div>
+              </td>
+              <td class="ops-wrap">{{ cap.expected_freshness }}</td>
+              <td class="ops-wrap">
+                <span class="qv-tnum">{{ cap.timeout_ms }}ms</span>
+                <div class="ops-sub">{{ cap.qps_policy }}</div>
+              </td>
+              <td class="ops-wrap">{{ cap.cache_semantics }}<div class="ops-sub">TTL {{ cap.cache_ttl_sec }}s</div></td>
+              <td>
+                <n-tag :type="capabilityObservationMeta[cap.observation]?.type || 'default'" size="small" round>
+                  {{ capabilityObservationMeta[cap.observation]?.label || cap.observation }}
+                </n-tag>
+                <div class="ops-sub qv-tnum">{{ cap.success }} / {{ cap.empty }} / {{ cap.errors }} · n={{ cap.samples }}</div>
+                <div v-if="cap.cooldown_left_sec" class="ops-danger qv-tnum">冷却 {{ cap.cooldown_left_sec }}s</div>
+              </td>
+              <td class="ops-wrap qv-tnum">
+                {{ cap.samples ? `${cap.avg_latency_ms}ms` : '—' }}
+                <div class="ops-sub">{{ cap.last_success_at ? fmtLogTime(cap.last_success_at) : '从未成功' }}</div>
+              </td>
+              <td class="ops-wrap">{{ cap.recovery_advice }}</td>
+            </tr>
+          </tbody>
+        </n-table>
+        <div v-else class="ops-cards">
+          <article v-for="cap in filteredCapabilities" :key="`${cap.source}:${cap.capability}:${cap.market}`" class="ops-card">
+            <div class="ops-card-head">
+              <strong>{{ cap.source }} · {{ cap.capability }}</strong>
+              <n-tag :type="capabilityObservationMeta[cap.observation]?.type || 'default'" size="small" round>
+                {{ capabilityObservationMeta[cap.observation]?.label || cap.observation }}
+              </n-tag>
+            </div>
+            <div class="ops-sub">{{ cap.market }} · {{ cap.frequency }} · {{ cap.expected_freshness }}</div>
+            <div class="ops-kv"><span>窗口</span><span class="qv-tnum">成功 {{ cap.success }} · 空 {{ cap.empty }} · 错误 {{ cap.errors }} · n={{ cap.samples }}</span></div>
+            <div class="ops-kv"><span>延迟</span><span class="qv-tnum">{{ cap.samples ? `${cap.avg_latency_ms}ms` : '—' }}</span></div>
+            <div class="ops-kv"><span>最近成功</span><span>{{ cap.last_success_at ? fmtLogTime(cap.last_success_at) : '从未成功' }}</span></div>
+            <div class="ops-wrap">{{ cap.cache_semantics }}</div>
+            <div class="ops-sub">{{ cap.recovery_advice }}</div>
+          </article>
+        </div>
+      </SectionCard>
+
+      <!-- P0-3A 有界缺口日历、覆盖分母和 dry-run 补采 -->
       <SectionCard title="数据健康" :hoverable="false">
         <template #extra>
           <n-button size="tiny" quaternary :loading="healthLoading" @click="loadHealth">刷新</n-button>
         </template>
+        <div class="ops-filters health-filter-row">
+          <n-select v-model:value="healthWindowDays" :options="[{ label: '30 个交易日', value: 30 }, { label: '45 个交易日', value: 45 }, { label: '60 个交易日', value: 60 }]" @update:value="loadHealth" />
+          <n-select v-model:value="healthStatusFilter" clearable placeholder="健康状态" :options="healthStatusOptions" />
+          <n-select v-model:value="healthRecoveryFilter" clearable placeholder="恢复分类" :options="healthRecoveryOptions" />
+          <n-date-picker v-model:formatted-value="maintenanceRange.from" type="date" value-format="yyyy-MM-dd" clearable placeholder="补采起日" />
+          <n-date-picker v-model:formatted-value="maintenanceRange.to" type="date" value-format="yyyy-MM-dd" clearable placeholder="补采止日" />
+        </div>
         <div class="health-actions">
-          <n-button size="tiny" tertiary :loading="rerunning === 'wide'" @click="rerun('wide', triggerWideSync)"
+          <n-button size="tiny" tertiary :loading="rerunning === 'wide'" @click="previewMaintenance('wide')"
             >全市场增量同步</n-button
           >
           <n-button size="tiny" tertiary :loading="rerunning === 'init'" @click="rerun('init', triggerWideInit)"
             >历史初始化</n-button
           >
-          <n-button size="tiny" tertiary :loading="rerunning === 'bars'" @click="rerun('bars', triggerSyncBars)"
-            >日线批量同步</n-button
+          <n-button size="tiny" tertiary :loading="rerunning === 'bars'" @click="previewMaintenance('bars')"
+            >日线补采</n-button
           >
           <n-button size="tiny" tertiary :loading="rerunning === 'snap'" @click="rerun('snap', triggerSnapshot)"
             >情绪快照</n-button
@@ -863,55 +1100,89 @@ onMounted(() => {
           <n-button
             size="tiny"
             tertiary
-            :loading="rerunning === 'cal'"
-            @click="rerun('cal', triggerBackfillCalendar)"
+            :loading="rerunning === 'calendar'"
+            @click="previewMaintenance('calendar')"
             >回填日历</n-button
           >
         </div>
-        <n-empty v-if="!health?.items?.length" description="暂无数据" size="small" style="padding: 20px 0" />
-        <n-table v-else :bordered="false" :single-line="false" size="small">
+        <n-empty v-if="!filteredHealthItems.length" description="暂无数据" size="small" style="padding: 20px 0" />
+        <n-table v-else-if="!isMobile" class="ops-table health-table" :bordered="false" :single-line="false" size="small">
           <thead>
             <tr>
               <th>数据域</th>
-              <th>状态</th>
-              <th>库内最新</th>
-              <th>应有日期</th>
-              <th>落后</th>
+              <th>状态 / 恢复</th>
+              <th>水位</th>
               <th>覆盖</th>
-              <th>最近任务</th>
-              <th>说明</th>
+              <th>缺口日历</th>
+              <th>最近失败</th>
+              <th>口径</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="it in health.items" :key="it.key">
+            <tr v-for="it in filteredHealthItems" :key="it.key">
               <td>{{ it.name }}</td>
               <td>
                 <n-tag :type="healthStatusMeta[it.status]?.type || 'default'" size="small" round>{{
                   healthStatusMeta[it.status]?.label || it.status
                 }}</n-tag>
+                <n-tag :type="recoveryMeta[it.recovery_class]?.type || 'default'" size="small" round style="margin-left: 4px">
+                  {{ recoveryMeta[it.recovery_class]?.label || it.recovery_class }}
+                </n-tag>
               </td>
-              <td class="qv-tnum">{{ it.observed_date || '—' }}</td>
-              <td class="qv-tnum">{{ it.expected_date || '—' }}</td>
-              <td class="qv-tnum">
+              <td class="ops-wrap qv-tnum">
+                {{ it.observed_date || '—' }} / {{ it.expected_date || '—' }}
+                <div class="ops-sub">
                 <template v-if="it.lag_open_days > 0">{{ it.lag_open_days }} 开市日</template>
                 <template v-else-if="it.lag_open_days < 0">?</template>
                 <template v-else>—</template>
+                </div>
               </td>
-              <td>{{ it.coverage || '—' }}</td>
-              <td class="log-time">
-                <template v-if="it.last_run"
-                  >{{ fmtLogTime(it.last_run.created_at) }}
-                  <n-tag :type="logStatusType(it.last_run.status)" size="tiny" round>{{ it.last_run.status }}</n-tag>
-                  <span v-if="it.last_run.status !== 'success'" class="log-msg">{{ it.last_run.message }}</span>
+              <td class="ops-wrap qv-tnum">
+                {{ it.coverage || '—' }}
+                <div class="ops-sub">分母 {{ it.coverage_denominator }} {{ it.coverage_unit || '' }}</div>
+              </td>
+              <td>
+                <div class="gap-calendar">
+                  <n-tooltip v-for="day in it.gap_calendar || []" :key="day.date" trigger="hover">
+                    <template #trigger><span class="gap-day" :class="`gap-${day.status}`"></span></template>
+                    {{ gapDayTitle(day) }}
+                  </n-tooltip>
+                </div>
+              </td>
+              <td class="ops-wrap">
+                <template v-if="it.recent_failure">
+                  <span class="qv-tnum">{{ fmtLogTime(it.recent_failure.created_at) }}</span>
+                  <div class="ops-danger">{{ it.recent_failure.message }}</div>
                 </template>
                 <template v-else>—</template>
               </td>
-              <td class="log-msg">{{ it.note }}</td>
+              <td class="ops-wrap">{{ it.note }}</td>
             </tr>
           </tbody>
         </n-table>
-        <div style="font-size: 12px; opacity: 0.55; margin-top: 8px">
-          生成于 {{ health?.generated_at || '—' }}。「落后」按交易日历对照应有日期计算（不与库内自身最大日期比较）；超过容忍值的域会以「落后」标红，请用上方补跑入口处理。
+        <div v-else class="ops-cards">
+          <article v-for="it in filteredHealthItems" :key="it.key" class="ops-card">
+            <div class="ops-card-head">
+              <strong>{{ it.name }}</strong>
+              <span>
+                <n-tag :type="healthStatusMeta[it.status]?.type || 'default'" size="small" round>{{ healthStatusMeta[it.status]?.label || it.status }}</n-tag>
+                <n-tag :type="recoveryMeta[it.recovery_class]?.type || 'default'" size="small" round style="margin-left: 4px">{{ recoveryMeta[it.recovery_class]?.label || it.recovery_class }}</n-tag>
+              </span>
+            </div>
+            <div class="ops-kv"><span>水位</span><span class="qv-tnum">{{ it.observed_date || '—' }} / {{ it.expected_date || '—' }}</span></div>
+            <div class="ops-kv"><span>覆盖</span><span>{{ it.coverage || '—' }}</span></div>
+            <div class="gap-calendar gap-calendar-mobile">
+              <n-tooltip v-for="day in it.gap_calendar || []" :key="day.date" trigger="hover">
+                <template #trigger><span class="gap-day" :class="`gap-${day.status}`"></span></template>
+                {{ gapDayTitle(day) }}
+              </n-tooltip>
+            </div>
+            <div v-if="it.recent_failure" class="ops-danger">{{ fmtLogTime(it.recent_failure.created_at) }} · {{ it.recent_failure.message }}</div>
+            <div class="ops-sub">{{ it.note }}</div>
+          </article>
+        </div>
+        <div class="ops-footnote">
+          {{ health?.window_start || '—' }} ~ {{ health?.window_end || '—' }} · {{ health?.window_days || 0 }} 个交易日 · 查询硬上限 {{ health?.query_hard_max || 60 }} · 生成于 {{ health?.generated_at || '—' }}
         </div>
       </SectionCard>
 
@@ -921,7 +1192,7 @@ onMounted(() => {
           <n-button size="tiny" quaternary :loading="logsLoading" @click="loadLogs">刷新</n-button>
         </template>
         <n-empty v-if="!logs.length" description="暂无同步记录" size="small" style="padding: 20px 0" />
-        <n-table v-else :bordered="false" :single-line="false" size="small">
+        <n-table v-else-if="!isMobile" class="ops-table" :bordered="false" :single-line="false" size="small">
           <thead>
             <tr>
               <th>时间</th>
@@ -929,6 +1200,8 @@ onMounted(() => {
               <th>状态</th>
               <th>成功/总数</th>
               <th>耗时</th>
+              <th>触发 / 管理员</th>
+              <th>范围 / 参数</th>
               <th>摘要</th>
             </tr>
           </thead>
@@ -941,12 +1214,59 @@ onMounted(() => {
               </td>
               <td>{{ lg.succeeded }}/{{ lg.total }}<span v-if="lg.failed"> · 失败 {{ lg.failed }}</span></td>
               <td>{{ (lg.duration_ms / 1000).toFixed(1) }}s</td>
+              <td class="ops-wrap">{{ lg.trigger_source || 'legacy' }}<div class="ops-sub qv-tnum">user {{ lg.user_id || '—' }}</div></td>
+              <td class="ops-wrap">{{ lg.range_summary || '—' }}<div class="ops-sub">{{ lg.parameter_summary }}</div></td>
               <td class="log-msg">{{ lg.message }}</td>
             </tr>
           </tbody>
         </n-table>
+        <div v-else class="ops-cards">
+          <article v-for="lg in logs" :key="lg.id" class="ops-card">
+            <div class="ops-card-head">
+              <strong>{{ taskLabel[lg.task] || lg.task }}</strong>
+              <n-tag :type="logStatusType(lg.status)" size="small" round>{{ lg.status }}</n-tag>
+            </div>
+            <div class="ops-sub">{{ fmtLogTime(lg.created_at) }} · {{ lg.trigger_source || 'legacy' }} · user {{ lg.user_id || '—' }}</div>
+            <div class="ops-kv"><span>进度</span><span>{{ lg.succeeded }}/{{ lg.total }}<template v-if="lg.failed"> · 失败 {{ lg.failed }}</template></span></div>
+            <div v-if="lg.range_summary" class="ops-kv"><span>范围</span><span>{{ lg.range_summary }}</span></div>
+            <div class="ops-wrap">{{ lg.message }}</div>
+          </article>
+        </div>
       </SectionCard>
     </div>
+
+    <n-modal
+      v-model:show="dryRunOpen"
+      preset="card"
+      :title="`${maintenanceLabels[maintenanceKind]} · dry-run`"
+      :mask-closable="!dryRunLoading && !executingPlan"
+      style="max-width: 620px"
+    >
+      <template v-if="maintenancePlan">
+        <div class="plan-metrics">
+          <div><span>范围</span><strong class="qv-tnum">{{ maintenancePlan.from }} ~ {{ maintenancePlan.to }}</strong></div>
+          <div><span>目标</span><strong class="qv-tnum">{{ maintenancePlan.target_count }}</strong></div>
+          <div><span>已有</span><strong class="qv-tnum">{{ maintenancePlan.existing_count }}</strong></div>
+          <div><span>缺口</span><strong class="qv-tnum">{{ maintenancePlan.missing_count }}</strong></div>
+          <div><span>停牌排除</span><strong class="qv-tnum">{{ maintenancePlan.suspended_count }}</strong></div>
+          <div><span>预计请求</span><strong class="qv-tnum">{{ maintenancePlan.estimated_requests }}</strong></div>
+        </div>
+        <n-alert v-if="maintenancePlan.capped" type="warning" :show-icon="false" style="margin-top: 12px">
+          计划已触及单次处理硬上限。
+        </n-alert>
+        <div class="plan-summary">{{ maintenancePlan.difference_summary }}</div>
+        <div v-if="maintenancePlan.sample_targets?.length" class="plan-targets">
+          <n-tag v-for="target in maintenancePlan.sample_targets" :key="target" size="small" :bordered="false">{{ target }}</n-tag>
+        </div>
+        <div class="plan-hash qv-tnum">{{ maintenancePlan.plan_hash }}</div>
+      </template>
+      <template #footer>
+        <div class="modal-actions">
+          <n-button :disabled="executingPlan" @click="dryRunOpen = false">取消</n-button>
+          <n-button type="primary" :loading="executingPlan" @click="executeMaintenancePlan">确认执行</n-button>
+        </div>
+      </template>
+    </n-modal>
 
     <!-- 用户配额编辑 -->
     <n-modal v-model:show="quotaModal" preset="card" :title="`AI 配额 · ${quotaUser?.display_name || quotaUser?.username || ''}`" style="max-width: 460px">
@@ -1006,5 +1326,165 @@ onMounted(() => {
   flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 12px;
+}
+.ops-filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.health-filter-row {
+  grid-template-columns: repeat(auto-fit, minmax(142px, 1fr));
+}
+.ops-table {
+  width: 100%;
+  table-layout: fixed;
+}
+.ops-wrap {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+  font-size: 12px;
+}
+.ops-sub {
+  margin-top: 3px;
+  font-size: 11px;
+  line-height: 1.45;
+  opacity: 0.58;
+  overflow-wrap: anywhere;
+}
+.ops-danger {
+  margin-top: 3px;
+  color: #c2413b;
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.ops-cards {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+.ops-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.ops-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.ops-card-head > strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.ops-kv {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 6px;
+  font-size: 12px;
+}
+.ops-kv > span:last-child {
+  min-width: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.gap-calendar {
+  display: grid;
+  grid-template-columns: repeat(15, 10px);
+  grid-auto-rows: 10px;
+  gap: 3px;
+  width: max-content;
+  max-width: 100%;
+}
+.gap-day {
+  display: block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: #64748b;
+}
+.gap-covered { background: #2f8f5b; }
+.gap-missing { background: #c2413b; }
+.gap-partial { background: #d59a22; }
+.gap-suspended { background: #7b8490; }
+.gap-closed { background: #404853; }
+.gap-unknown { background: #3c7c9f; }
+.gap-calendar-mobile {
+  grid-template-columns: repeat(15, 10px);
+  margin-top: 10px;
+}
+.ops-footnote {
+  margin-top: 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  opacity: 0.55;
+}
+.plan-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.plan-metrics > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.plan-metrics span {
+  font-size: 11px;
+  opacity: 0.58;
+}
+.plan-metrics strong {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.plan-summary {
+  margin-top: 14px;
+  line-height: 1.6;
+}
+.plan-targets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.plan-hash {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed color-mix(in srgb, currentColor 18%, transparent);
+  font-size: 10px;
+  opacity: 0.5;
+  overflow-wrap: anywhere;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+@media (max-width: 768px) {
+  .ops-filters,
+  .health-filter-row {
+    grid-template-columns: 1fr 1fr;
+  }
+  .health-actions > * {
+    flex: 1 1 calc(50% - 4px);
+  }
+  .plan-metrics {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+@media (max-width: 420px) {
+  .ops-filters,
+  .health-filter-row {
+    grid-template-columns: 1fr;
+  }
 }
 </style>
