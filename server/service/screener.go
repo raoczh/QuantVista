@@ -8,9 +8,13 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"quantvista/common"
 	"quantvista/model"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // M1 条件树选股：JSON DSL 的校验/递归求值/命中原因人话化 + 扫描服务。
@@ -319,12 +323,13 @@ const (
 
 // ScanRequest 扫描入参：strategy_key（内置）/ strategy_id（自定义）/ tree（临时试跑）三选一。
 type ScanRequest struct {
-	StrategyKey  string    `json:"strategy_key"`
-	StrategyID   int64     `json:"strategy_id"`
-	Tree         *CondNode `json:"tree"`
-	IncludeST    bool      `json:"include_st"`    // 默认排除 ST/退市警示
-	IncludeStale bool      `json:"include_stale"` // 默认排除末根≠最新交易日的股（停牌/滞后，旧价因子会误导）
-	Limit        int       `json:"limit"`
+	StrategyKey        string    `json:"strategy_key"`
+	StrategyID         int64     `json:"strategy_id"`
+	StrategyRevisionID int64     `json:"strategy_revision_id"`
+	Tree               *CondNode `json:"tree"`
+	IncludeST          bool      `json:"include_st"`    // 默认排除 ST/退市警示
+	IncludeStale       bool      `json:"include_stale"` // 默认排除末根≠最新交易日的股（停牌/滞后，旧价因子会误导）
+	Limit              int       `json:"limit"`
 }
 
 // ScanHit 单只命中：行情摘要 + 人话命中原因。
@@ -341,17 +346,21 @@ type ScanHit struct {
 
 // ScanResult 扫描结果：命中列表 + 全景计数（引擎排除了什么全透明）。
 type ScanResult struct {
-	Strategy     string    `json:"strategy"` // 展示名
-	TradeDate    string    `json:"trade_date"`
-	Universe     int       `json:"universe"`      // 宽表内标的总数
-	Scanned      int       `json:"scanned"`       // 参与条件判定的行数
-	StaleSkipped int       `json:"stale_skipped"` // 停牌/数据滞后跳过
-	StSkipped    int       `json:"st_skipped"`    // ST/退市警示跳过
-	Matched      int       `json:"matched"`       // 命中总数
-	Truncated    bool      `json:"truncated"`     // 命中超出 limit 截断
-	Items        []ScanHit `json:"items"`
-	BuildMs      int64     `json:"build_ms"`   // 宽表构建耗时（缓存命中时为历史值）
-	Conditions   []string  `json:"conditions"` // 本次策略的静态条件清单
+	Strategy           string    `json:"strategy"` // 展示名
+	StrategyID         int64     `json:"strategy_id"`
+	StrategyRevisionID int64     `json:"strategy_revision_id"`
+	StrategyRevision   int       `json:"strategy_revision"`
+	StrategyHash       string    `json:"strategy_hash"`
+	TradeDate          string    `json:"trade_date"`
+	Universe           int       `json:"universe"`      // 宽表内标的总数
+	Scanned            int       `json:"scanned"`       // 参与条件判定的行数
+	StaleSkipped       int       `json:"stale_skipped"` // 停牌/数据滞后跳过
+	StSkipped          int       `json:"st_skipped"`    // ST/退市警示跳过
+	Matched            int       `json:"matched"`       // 命中总数
+	Truncated          bool      `json:"truncated"`     // 命中超出 limit 截断
+	Items              []ScanHit `json:"items"`
+	BuildMs            int64     `json:"build_ms"`   // 宽表构建耗时（缓存命中时为历史值）
+	Conditions         []string  `json:"conditions"` // 本次策略的静态条件清单
 
 	// P1 数据水位（对照交易日历，非库内自身 MAX）：ExpectedDate 应有交易日、
 	// LagOpenDays 库数据落后开市日数、FreshCoverage fresh 行覆盖率（0~1）、
@@ -365,10 +374,11 @@ type ScanResult struct {
 // Scan 全市场扫描。宽表构建有互斥防抖（并发请求等待同一次构建，见 ensureFactorTable），
 // 扫描本身是内存只读遍历（5500 行 × ≤48 叶 <10ms），无需额外互斥。
 func (s *ScreenerService) Scan(ctx context.Context, userID int64, req ScanRequest) (*ScanResult, error) {
-	tree, name, err := s.resolveTree(userID, req)
+	resolved, err := s.resolveStrategy(userID, req)
 	if err != nil {
 		return nil, err
 	}
+	tree, name := resolved.Tree, resolved.Name
 	if _, err := validateCondTree(tree, 1); err != nil {
 		return nil, err
 	}
@@ -389,11 +399,15 @@ func (s *ScreenerService) Scan(ctx context.Context, userID int64, req ScanReques
 	}
 
 	res := &ScanResult{
-		Strategy:   name,
-		TradeDate:  t.TradeDate,
-		Universe:   t.Len(),
-		BuildMs:    t.BuildMs,
-		Conditions: describeCondTree(tree),
+		Strategy:           name,
+		StrategyID:         resolved.StrategyID,
+		StrategyRevisionID: resolved.RevisionID,
+		StrategyRevision:   resolved.Revision,
+		StrategyHash:       resolved.Hash,
+		TradeDate:          t.TradeDate,
+		Universe:           t.Len(),
+		BuildMs:            t.BuildMs,
+		Conditions:         describeCondTree(tree),
 
 		ExpectedDate:  t.ExpectedDate,
 		LagOpenDays:   t.LagOpenDays,
@@ -463,33 +477,74 @@ func (s *ScreenerService) Scan(ctx context.Context, userID int64, req ScanReques
 	return res, nil
 }
 
-// resolveTree 解析扫描目标：内置 key / 自定义 id（校验归属）/ 临时树。
-func (s *ScreenerService) resolveTree(userID int64, req ScanRequest) (*CondNode, string, error) {
+type resolvedScreenerStrategy struct {
+	Tree       *CondNode
+	Name       string
+	StrategyID int64
+	RevisionID int64
+	Revision   int
+	Hash       string
+}
+
+// resolveStrategy 在请求开始时把自定义策略解析成不可变 revision 快照。后续扫描或
+// 回测只持有内存中的树与元数据，运行期间主表指针变化不会造成条件漂移。
+func (s *ScreenerService) resolveStrategy(userID int64, req ScanRequest) (*resolvedScreenerStrategy, error) {
+	if req.StrategyRevisionID > 0 && req.StrategyID <= 0 {
+		return nil, errors.New("strategy_revision_id 必须与 strategy_id 一起使用")
+	}
 	switch {
 	case req.StrategyKey != "":
+		if req.StrategyRevisionID > 0 {
+			return nil, errors.New("内置策略不能指定自定义策略版本")
+		}
 		b, ok := builtinScreenByKey(req.StrategyKey)
 		if !ok {
-			return nil, "", fmt.Errorf("未知内置策略 %q", req.StrategyKey)
+			return nil, fmt.Errorf("未知内置策略 %q", req.StrategyKey)
 		}
 		tree := b.Tree // 拷贝（between 校验会原地交换 value）
-		return &tree, b.Name, nil
+		return &resolvedScreenerStrategy{Tree: &tree, Name: b.Name}, nil
 	case req.StrategyID > 0:
 		if common.DB == nil {
-			return nil, "", errors.New("数据库不可用")
+			return nil, errors.New("数据库不可用")
 		}
-		var row model.ScreenerStrategy
-		if err := common.DB.Where("id = ? AND user_id = ?", req.StrategyID, userID).First(&row).Error; err != nil {
-			return nil, "", errors.New("自定义策略不存在")
+		var strategy model.ScreenerStrategy
+		if err := common.DB.Where("id = ? AND user_id = ?", req.StrategyID, userID).First(&strategy).Error; err != nil {
+			return nil, errors.New("自定义策略不存在")
+		}
+		revisionID := req.StrategyRevisionID
+		if revisionID == 0 {
+			revisionID = strategy.CurrentRevisionID
+		}
+		if revisionID <= 0 {
+			return nil, errors.New("自定义策略尚无可执行版本")
+		}
+		var revision model.ScreenerStrategyRevision
+		if err := common.DB.Where(
+			"id = ? AND user_id = ? AND strategy_id = ?", revisionID, userID, strategy.ID,
+		).First(&revision).Error; err != nil {
+			return nil, errors.New("策略版本不存在或不属于指定策略")
 		}
 		var tree CondNode
-		if err := json.Unmarshal([]byte(row.TreeJSON), &tree); err != nil {
-			return nil, "", fmt.Errorf("策略条件解析失败: %v", err)
+		if err := json.Unmarshal([]byte(revision.TreeJSON), &tree); err != nil {
+			return nil, fmt.Errorf("策略条件解析失败: %v", err)
 		}
-		return &tree, row.Name, nil
+		return &resolvedScreenerStrategy{
+			Tree: &tree, Name: revision.Name, StrategyID: strategy.ID,
+			RevisionID: revision.ID, Revision: revision.Revision, Hash: revision.ContentHash,
+		}, nil
 	case req.Tree != nil:
-		return req.Tree, "自定义条件", nil
+		return &resolvedScreenerStrategy{Tree: req.Tree, Name: "自定义条件"}, nil
 	}
-	return nil, "", errors.New("请指定策略（strategy_key / strategy_id / tree 三选一）")
+	return nil, errors.New("请指定策略（strategy_key / strategy_id / tree 三选一）")
+}
+
+// resolveTree 保留给包内既有调用；新执行路径如需版本元数据应使用 resolveStrategy。
+func (s *ScreenerService) resolveTree(userID int64, req ScanRequest) (*CondNode, string, error) {
+	resolved, err := s.resolveStrategy(userID, req)
+	if err != nil {
+		return nil, "", err
+	}
+	return resolved.Tree, resolved.Name, nil
 }
 
 // ---------- 策略管理 ----------
@@ -506,20 +561,44 @@ type BuiltinStrategyView struct {
 
 // StrategiesView 策略广场：内置 + 当前用户自定义。
 type StrategiesView struct {
-	Builtin []BuiltinStrategyView    `json:"builtin"`
-	Custom  []CustomStrategyView     `json:"custom"`
-	Factors []factorDef              `json:"factors"` // 因子字典（自定义编辑器）
+	Builtin []BuiltinStrategyView `json:"builtin"`
+	Custom  []CustomStrategyView  `json:"custom"`
+	Factors []factorDef           `json:"factors"` // 因子字典（自定义编辑器）
 }
 
 // CustomStrategyView 自定义策略行（树已展开供编辑器回填）。
 type CustomStrategyView struct {
-	ID         int64     `json:"id"`
-	Name       string    `json:"name"`
-	Desc       string    `json:"desc"`
-	Period     string    `json:"period"`
-	Risk       string    `json:"risk"`
-	Tree       *CondNode `json:"tree"`
-	Conditions []string  `json:"conditions"`
+	ID                int64     `json:"id"`
+	CurrentRevisionID int64     `json:"current_revision_id"`
+	Revision          int       `json:"revision"`
+	ContentHash       string    `json:"content_hash"`
+	Name              string    `json:"name"`
+	Desc              string    `json:"desc"`
+	Period            string    `json:"period"`
+	Risk              string    `json:"risk"`
+	Tree              *CondNode `json:"tree"`
+	Conditions        []string  `json:"conditions"`
+}
+
+// StrategyRevisionView 历史快照。ID 是 revision 主键，StrategyID 是所属策略。
+type StrategyRevisionView struct {
+	ID          int64     `json:"id"`
+	StrategyID  int64     `json:"strategy_id"`
+	Revision    int       `json:"revision"`
+	ContentHash string    `json:"content_hash"`
+	Name        string    `json:"name"`
+	Desc        string    `json:"desc"`
+	Period      string    `json:"period"`
+	Risk        string    `json:"risk"`
+	Tree        *CondNode `json:"tree"`
+	Conditions  []string  `json:"conditions"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type StrategyHistoryView struct {
+	StrategyID        int64                  `json:"strategy_id"`
+	CurrentRevisionID int64                  `json:"current_revision_id"`
+	Revisions         []StrategyRevisionView `json:"revisions"`
 }
 
 // Strategies 列出策略广场内容。
@@ -536,30 +615,79 @@ func (s *ScreenerService) Strategies(userID int64) (*StrategiesView, error) {
 		return v, nil
 	}
 	var rows []model.ScreenerStrategy
-	if err := common.DB.Where("user_id = ?", userID).Order("id DESC").Find(&rows).Error; err != nil {
+	if err := common.DB.Where("user_id = ? AND archived_at IS NULL", userID).Order("id DESC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	for _, r := range rows {
-		cv := CustomStrategyView{ID: r.ID, Name: r.Name, Desc: r.Desc, Period: r.Period, Risk: r.Risk}
-		var tree CondNode
-		if json.Unmarshal([]byte(r.TreeJSON), &tree) == nil {
-			cv.Tree = &tree
-			cv.Conditions = describeCondTree(&tree)
+	revisionIDs := make([]int64, 0, len(rows))
+	for _, row := range rows {
+		if row.CurrentRevisionID > 0 {
+			revisionIDs = append(revisionIDs, row.CurrentRevisionID)
 		}
-		v.Custom = append(v.Custom, cv)
+	}
+	var revisions []model.ScreenerStrategyRevision
+	if len(revisionIDs) > 0 {
+		if err := common.DB.Where("user_id = ? AND id IN ?", userID, revisionIDs).Find(&revisions).Error; err != nil {
+			return nil, err
+		}
+	}
+	byID := make(map[int64]model.ScreenerStrategyRevision, len(revisions))
+	for _, revision := range revisions {
+		byID[revision.ID] = revision
+	}
+	for _, r := range rows {
+		revision, ok := byID[r.CurrentRevisionID]
+		if !ok || revision.StrategyID != r.ID {
+			continue
+		}
+		v.Custom = append(v.Custom, customStrategyViewFromRevision(r.ID, r.CurrentRevisionID, revision))
 	}
 	return v, nil
 }
 
+// StrategyHistory 返回当前用户指定策略最近 50 个不可变快照（新到旧）。归档策略仍可
+// 查询历史，便于既有研究与回测复现。
+func (s *ScreenerService) StrategyHistory(userID, strategyID int64) (*StrategyHistoryView, error) {
+	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
+	}
+	var strategy model.ScreenerStrategy
+	if err := common.DB.Where("id = ? AND user_id = ?", strategyID, userID).First(&strategy).Error; err != nil {
+		return nil, errors.New("自定义策略不存在")
+	}
+	var rows []model.ScreenerStrategyRevision
+	if err := common.DB.Where("strategy_id = ? AND user_id = ?", strategyID, userID).
+		Order("revision DESC").Limit(50).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	view := &StrategyHistoryView{
+		StrategyID: strategy.ID, CurrentRevisionID: strategy.CurrentRevisionID,
+		Revisions: make([]StrategyRevisionView, 0, len(rows)),
+	}
+	for _, row := range rows {
+		view.Revisions = append(view.Revisions, strategyRevisionView(row))
+	}
+	return view, nil
+}
+
 // SaveStrategyRequest 新建/更新自定义策略。
 type SaveStrategyRequest struct {
-	ID     int64     `json:"id"` // 0=新建
-	Name   string    `json:"name"`
-	Desc   string    `json:"desc"`
-	Period string    `json:"period"`
-	Risk   string    `json:"risk"`
-	Tree   *CondNode `json:"tree"`
+	ID             int64     `json:"id"` // 0=新建
+	BaseRevisionID int64     `json:"base_revision_id"`
+	Name           string    `json:"name"`
+	Desc           string    `json:"desc"`
+	Period         string    `json:"period"`
+	Risk           string    `json:"risk"`
+	Tree           *CondNode `json:"tree"`
 }
+
+type strategyRevisionConflictError struct{}
+
+func (strategyRevisionConflictError) Error() string {
+	return "策略已被其他页面更新，请刷新并比较后重试"
+}
+func (strategyRevisionConflictError) RefusalCode() string { return "strategy_revision_conflict" }
+
+var ErrStrategyRevisionConflict error = strategyRevisionConflictError{}
 
 // SaveStrategy 保存自定义策略（user_id 隔离；树先校验）。
 func (s *ScreenerService) SaveStrategy(userID int64, req SaveStrategyRequest) (*CustomStrategyView, error) {
@@ -585,53 +713,205 @@ func (s *ScreenerService) SaveStrategy(userID int64, req SaveStrategyRequest) (*
 	if !validScreenRisk(req.Risk) {
 		req.Risk = "mid"
 	}
-	treeJSON, err := json.Marshal(req.Tree)
+	treeJSONRaw, err := json.Marshal(req.Tree)
 	if err != nil {
 		return nil, err
 	}
-	row := model.ScreenerStrategy{
-		UserID: userID, Name: req.Name, Desc: truncate(req.Desc, 256),
-		Period: req.Period, Risk: req.Risk, TreeJSON: string(treeJSON),
+	treeJSON, err := model.CanonicalScreenerTreeJSON(string(treeJSONRaw))
+	if err != nil {
+		return nil, fmt.Errorf("策略条件规范化失败: %w", err)
 	}
-	if req.ID > 0 {
-		var exist model.ScreenerStrategy
-		if err := common.DB.Where("id = ? AND user_id = ?", req.ID, userID).First(&exist).Error; err != nil {
-			return nil, errors.New("策略不存在")
+	req.Desc = truncateRunes(req.Desc, 256)
+	hash, err := model.ScreenerStrategyContentHash(req.Name, req.Desc, req.Period, req.Risk, treeJSON)
+	if err != nil {
+		return nil, fmt.Errorf("策略摘要生成失败: %w", err)
+	}
+
+	var out *CustomStrategyView
+	runTransaction := func() error {
+		return common.DB.Transaction(func(tx *gorm.DB) error {
+			if req.ID == 0 {
+				var n int64
+				if err := tx.Model(&model.ScreenerStrategy{}).
+					Where("user_id = ? AND archived_at IS NULL", userID).Count(&n).Error; err != nil {
+					return err
+				}
+				if n >= customStrategyMax {
+					return fmt.Errorf("自定义策略已达上限 %d 条", customStrategyMax)
+				}
+				strategy := model.ScreenerStrategy{
+					UserID: userID, Name: req.Name, Desc: req.Desc,
+					Period: req.Period, Risk: req.Risk, TreeJSON: treeJSON,
+				}
+				if err := tx.Create(&strategy).Error; err != nil {
+					return err
+				}
+				revision := model.ScreenerStrategyRevision{
+					UserID: userID, StrategyID: strategy.ID, Revision: 1, ContentHash: hash,
+					Name: req.Name, Desc: req.Desc, Period: req.Period, Risk: req.Risk, TreeJSON: treeJSON,
+				}
+				if err := tx.Create(&revision).Error; err != nil {
+					return err
+				}
+				if err := tx.Model(&strategy).Update("current_revision_id", revision.ID).Error; err != nil {
+					return err
+				}
+				view := customStrategyViewFromRevision(strategy.ID, revision.ID, revision)
+				out = &view
+				return nil
+			}
+
+			query := tx.Where("id = ? AND user_id = ? AND archived_at IS NULL", req.ID, userID)
+			if tx.Dialector.Name() == "mysql" {
+				query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+			}
+			var strategy model.ScreenerStrategy
+			if err := query.First(&strategy).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return errors.New("策略不存在或已归档")
+				}
+				return err
+			}
+			if req.BaseRevisionID <= 0 || strategy.CurrentRevisionID != req.BaseRevisionID {
+				return ErrStrategyRevisionConflict
+			}
+			var current model.ScreenerStrategyRevision
+			if err := tx.Where(
+				"id = ? AND user_id = ? AND strategy_id = ?", strategy.CurrentRevisionID, userID, strategy.ID,
+			).First(&current).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return errors.New("当前策略版本不存在")
+				}
+				return err
+			}
+			if current.ContentHash == hash {
+				view := customStrategyViewFromRevision(strategy.ID, current.ID, current)
+				out = &view
+				return nil
+			}
+
+			revision := model.ScreenerStrategyRevision{
+				UserID: userID, StrategyID: strategy.ID, Revision: current.Revision + 1, ContentHash: hash,
+				Name: req.Name, Desc: req.Desc, Period: req.Period, Risk: req.Risk, TreeJSON: treeJSON,
+			}
+			if err := tx.Create(&revision).Error; err != nil {
+				return err
+			}
+			res := tx.Model(&model.ScreenerStrategy{}).
+				Where("id = ? AND user_id = ? AND current_revision_id = ? AND archived_at IS NULL",
+					strategy.ID, userID, req.BaseRevisionID).
+				Updates(map[string]any{
+					"current_revision_id": revision.ID,
+					"name":                revision.Name,
+					"desc":                revision.Desc,
+					"period":              revision.Period,
+					"risk":                revision.Risk,
+					"tree_json":           revision.TreeJSON,
+				})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return ErrStrategyRevisionConflict
+			}
+			view := customStrategyViewFromRevision(strategy.ID, revision.ID, revision)
+			out = &view
+			return nil
+		})
+	}
+
+	attempts := 1
+	if req.ID > 0 && common.DB.Dialector.Name() == "sqlite" {
+		attempts = 5
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		out = nil
+		err = runTransaction()
+		if err == nil || !isRetryableStrategySaveError(err) {
+			break
 		}
-		row.ID = exist.ID
-		row.CreatedAt = exist.CreatedAt
-		if err := common.DB.Model(&exist).Updates(map[string]any{
-			"name": row.Name, "desc": row.Desc, "period": row.Period, "risk": row.Risk, "tree_json": row.TreeJSON,
-		}).Error; err != nil {
-			return nil, err
-		}
-	} else {
-		var n int64
-		common.DB.Model(&model.ScreenerStrategy{}).Where("user_id = ?", userID).Count(&n)
-		if n >= customStrategyMax {
-			return nil, fmt.Errorf("自定义策略已达上限 %d 条", customStrategyMax)
-		}
-		if err := common.DB.Create(&row).Error; err != nil {
-			return nil, err
+		if attempt+1 < attempts {
+			time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
 		}
 	}
-	return &CustomStrategyView{
-		ID: row.ID, Name: row.Name, Desc: row.Desc, Period: row.Period, Risk: row.Risk,
-		Tree: req.Tree, Conditions: describeCondTree(req.Tree),
-	}, nil
+	if err != nil {
+		if isRetryableStrategySaveError(err) {
+			return nil, fmt.Errorf("数据库繁忙，请稍后重试: %w", err)
+		}
+		return nil, normalizeStrategySaveError(err)
+	}
+	return out, nil
 }
 
-// DeleteStrategy 删除自定义策略（user_id 隔离）。
+func normalizeStrategySaveError(err error) error {
+	if errors.Is(err, ErrStrategyRevisionConflict) {
+		return ErrStrategyRevisionConflict
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "duplicate") || strings.Contains(msg, "unique constraint") {
+		return ErrStrategyRevisionConflict
+	}
+	return err
+}
+
+func isRetryableStrategySaveError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "database is locked") ||
+		strings.Contains(msg, "database table is locked") ||
+		strings.Contains(msg, "database is busy") ||
+		strings.Contains(msg, "deadlock")
+}
+
+func customStrategyViewFromRevision(strategyID, currentRevisionID int64, revision model.ScreenerStrategyRevision) CustomStrategyView {
+	view := CustomStrategyView{
+		ID: strategyID, CurrentRevisionID: currentRevisionID,
+		Revision: revision.Revision, ContentHash: revision.ContentHash,
+		Name: revision.Name, Desc: revision.Desc, Period: revision.Period, Risk: revision.Risk,
+	}
+	if tree := condTreeFromJSON(revision.TreeJSON); tree != nil {
+		view.Tree = tree
+		view.Conditions = describeCondTree(tree)
+	}
+	return view
+}
+
+func strategyRevisionView(revision model.ScreenerStrategyRevision) StrategyRevisionView {
+	view := StrategyRevisionView{
+		ID: revision.ID, StrategyID: revision.StrategyID, Revision: revision.Revision,
+		ContentHash: revision.ContentHash, Name: revision.Name, Desc: revision.Desc,
+		Period: revision.Period, Risk: revision.Risk, CreatedAt: revision.CreatedAt,
+	}
+	if tree := condTreeFromJSON(revision.TreeJSON); tree != nil {
+		view.Tree = tree
+		view.Conditions = describeCondTree(tree)
+	}
+	return view
+}
+
+func condTreeFromJSON(treeJSON string) *CondNode {
+	var tree CondNode
+	if err := json.Unmarshal([]byte(treeJSON), &tree); err != nil {
+		return nil
+	}
+	return &tree
+}
+
+// DeleteStrategy 归档自定义策略（user_id 隔离）；历史 revision 永久保留。
 func (s *ScreenerService) DeleteStrategy(userID, id int64) error {
 	if common.DB == nil {
 		return errors.New("数据库不可用")
 	}
-	res := common.DB.Where("id = ? AND user_id = ?", id, userID).Delete(&model.ScreenerStrategy{})
+	res := common.DB.Model(&model.ScreenerStrategy{}).
+		Where("id = ? AND user_id = ? AND archived_at IS NULL", id, userID).
+		Update("archived_at", time.Now())
 	if res.Error != nil {
 		return res.Error
 	}
 	if res.RowsAffected == 0 {
-		return errors.New("策略不存在")
+		return errors.New("策略不存在或已归档")
 	}
 	return nil
 }
@@ -646,9 +926,9 @@ func validScreenRisk(r string) bool   { return r == "low" || r == "mid" || r == 
 const strategySignalPoolLimit = 30
 
 // strategySignalHits 推荐池的策略信号来源：按推荐策略映射的内置选股策略
-//（recStrategySignalKey）做全市场扫描，返回成交额降序的前 n 只命中。
+// （recStrategySignalKey）做全市场扫描，返回成交额降序的前 n 只命中。
 // 宽表未就绪/全市场日线未初始化时返回 nil——best-effort，不阻断建池
-//（与榜单来源单路失败降级同款纪律）。
+// （与榜单来源单路失败降级同款纪律）。
 // P1 fail-closed：宽表数据落后应有交易日超过 1 个开市日时放弃本路来源——
 // 旧形态命中的「策略信号」会把过期技术形态当最新供给喂进推荐池。
 func strategySignalHits(ctx context.Context, recType, stratKey string, n int) []ScanHit {

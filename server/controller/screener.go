@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"strconv"
+
 	"quantvista/common"
 	"quantvista/model"
 	"quantvista/service"
@@ -20,6 +22,20 @@ func NewScreenerController(svc *service.ScreenerService, ai *service.ScreenerAIS
 
 // Strategies GET /api/screener/strategies —— 内置策略 + 当前用户自定义 + 因子字典。
 func (sc *ScreenerController) Strategies(c *gin.Context) {
+	if c.Query("history") == "1" {
+		strategyID, err := strconv.ParseInt(c.Query("strategy_id"), 10, 64)
+		if err != nil || strategyID <= 0 {
+			common.ApiErrorMsg(c, "strategy_id 无效")
+			return
+		}
+		v, err := sc.svc.StrategyHistory(currentUserID(c), strategyID)
+		if err != nil {
+			common.ApiErrorMsg(c, err.Error())
+			return
+		}
+		common.ApiSuccess(c, v)
+		return
+	}
 	v, err := sc.svc.Strategies(currentUserID(c))
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
@@ -53,7 +69,7 @@ func (sc *ScreenerController) SaveStrategy(c *gin.Context) {
 	}
 	v, err := sc.svc.SaveStrategy(currentUserID(c), req)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiError(c, err)
 		return
 	}
 	common.ApiSuccess(c, v)
@@ -69,7 +85,7 @@ func (sc *ScreenerController) DeleteStrategy(c *gin.Context) {
 		common.ApiErrorMsg(c, err.Error())
 		return
 	}
-	common.ApiSuccess(c, gin.H{"deleted": true})
+	common.ApiSuccess(c, gin.H{"archived": true})
 }
 
 // Parse POST /api/screener/parse —— AI 白话建策略：自然语言解析为条件树（P3c）。

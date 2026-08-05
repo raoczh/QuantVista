@@ -38,7 +38,7 @@ import (
 // 越短，ma250/pos_250 类长窗因子在早期信号日会缺失（NaN 不命中）；结果 notes 声明。
 
 const (
-	btDefaultLookback  = 60  // 默认信号窗口回看交易日数
+	btDefaultLookback  = 60 // 默认信号窗口回看交易日数
 	btMaxLookback      = 180
 	btMinLookback      = 10
 	btDefaultSignals   = 8 // 默认采样信号日数
@@ -73,9 +73,10 @@ func NewBacktestService(market *MarketService) *BacktestService {
 
 // BacktestRequest 条件树回测入参（策略三选一，同 ScanRequest 语义）。
 type BacktestRequest struct {
-	StrategyKey string    `json:"strategy_key"`
-	StrategyID  int64     `json:"strategy_id"`
-	Tree        *CondNode `json:"tree"`
+	StrategyKey        string    `json:"strategy_key"`
+	StrategyID         int64     `json:"strategy_id"`
+	StrategyRevisionID int64     `json:"strategy_revision_id"`
+	Tree               *CondNode `json:"tree"`
 
 	LookbackDays int     `json:"lookback_days"` // 信号窗口回看交易日数（默认 60）
 	SignalCount  int     `json:"signal_count"`  // 窗口内等距采样的信号日数（默认 8）
@@ -87,17 +88,17 @@ type BacktestRequest struct {
 
 // BacktestTrade 单笔模拟交易（best/worst 样本展示）。
 type BacktestTrade struct {
-	Symbol     string  `json:"symbol"`
-	Name       string  `json:"name"`
-	SignalDate string  `json:"signal_date"`
-	BuyDate    string  `json:"buy_date"`
-	SellDate   string  `json:"sell_date"`
-	BuyPrice   float64 `json:"buy_price"`
-	SellPrice  float64 `json:"sell_price"`
-	ReturnPct  float64 `json:"return_pct"`
+	Symbol     string   `json:"symbol"`
+	Name       string   `json:"name"`
+	SignalDate string   `json:"signal_date"`
+	BuyDate    string   `json:"buy_date"`
+	SellDate   string   `json:"sell_date"`
+	BuyPrice   float64  `json:"buy_price"`
+	SellPrice  float64  `json:"sell_price"`
+	ReturnPct  float64  `json:"return_pct"`
 	AlphaPct   *float64 `json:"alpha_pct,omitempty"` // nil=基准数据缺失
-	Deferred   int     `json:"deferred,omitempty"`   // 跌停顺延次数
-	Forced     bool    `json:"forced,omitempty"`     // 顺延到末根强平
+	Deferred   int      `json:"deferred,omitempty"`  // 跌停顺延次数
+	Forced     bool     `json:"forced,omitempty"`    // 顺延到末根强平
 }
 
 // BacktestHoldStat 单个持有期的统计。
@@ -125,26 +126,30 @@ type BacktestHoldStat struct {
 
 // BacktestDayStat 单个信号日的聚合行。
 type BacktestDayStat struct {
-	Date        string             `json:"date"`
-	Matched     int                `json:"matched"` // 条件命中数（截断前）
-	Taken       int                `json:"taken"`   // 按成交额截断后进入模拟的数量
-	AvgReturns  map[string]float64 `json:"avg_returns"` // hold(字符串) → 平均收益 %
-	TradedByHold map[string]int    `json:"traded_by_hold"`
+	Date         string             `json:"date"`
+	Matched      int                `json:"matched"`     // 条件命中数（截断前）
+	Taken        int                `json:"taken"`       // 按成交额截断后进入模拟的数量
+	AvgReturns   map[string]float64 `json:"avg_returns"` // hold(字符串) → 平均收益 %
+	TradedByHold map[string]int     `json:"traded_by_hold"`
 }
 
 // BacktestResult 条件树回测结果。
 type BacktestResult struct {
-	Strategy      string             `json:"strategy"`
-	Conditions    []string           `json:"conditions"`
-	TradeDate     string             `json:"trade_date"` // 数据末日
-	SignalDates   []string           `json:"signal_dates"`
-	Universe      int                `json:"universe"`       // 参与逐股处理的标的数
-	AdjustSuspect int                `json:"adjust_suspect"` // 复权自洽校验剔除的股票数
-	StSkipped     int                `json:"st_skipped"`
-	Stats         []BacktestHoldStat `json:"stats"`
-	Days          []BacktestDayStat  `json:"days"`
-	Notes         []string           `json:"notes"`
-	ElapsedMs     int64              `json:"elapsed_ms"`
+	Strategy           string             `json:"strategy"`
+	StrategyID         int64              `json:"strategy_id"`
+	StrategyRevisionID int64              `json:"strategy_revision_id"`
+	StrategyRevision   int                `json:"strategy_revision"`
+	StrategyHash       string             `json:"strategy_hash"`
+	Conditions         []string           `json:"conditions"`
+	TradeDate          string             `json:"trade_date"` // 数据末日
+	SignalDates        []string           `json:"signal_dates"`
+	Universe           int                `json:"universe"`       // 参与逐股处理的标的数
+	AdjustSuspect      int                `json:"adjust_suspect"` // 复权自洽校验剔除的股票数
+	StSkipped          int                `json:"st_skipped"`
+	Stats              []BacktestHoldStat `json:"stats"`
+	Days               []BacktestDayStat  `json:"days"`
+	Notes              []string           `json:"notes"`
+	ElapsedMs          int64              `json:"elapsed_ms"`
 }
 
 // ---------- 单笔持有期模拟 ----------
@@ -218,12 +223,14 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 
 	// 策略树（复用选股服务的解析与校验）。
 	scr := ScreenerService{}
-	tree, name, err := scr.resolveTree(userID, ScanRequest{
-		StrategyKey: req.StrategyKey, StrategyID: req.StrategyID, Tree: req.Tree,
+	resolved, err := scr.resolveStrategy(userID, ScanRequest{
+		StrategyKey: req.StrategyKey, StrategyID: req.StrategyID,
+		StrategyRevisionID: req.StrategyRevisionID, Tree: req.Tree,
 	})
 	if err != nil {
 		return nil, err
 	}
+	tree, name := resolved.Tree, resolved.Name
 	if _, err := validateCondTree(tree, 1); err != nil {
 		return nil, err
 	}
@@ -429,6 +436,10 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 	}
 
 	res := s.aggregate(tree, name, cands, holds, signalDates, topPerDay, benchClose)
+	res.StrategyID = resolved.StrategyID
+	res.StrategyRevisionID = resolved.RevisionID
+	res.StrategyRevision = resolved.Revision
+	res.StrategyHash = resolved.Hash
 	res.TradeDate = freshDate
 	res.Universe = int(universe.Load())
 	res.AdjustSuspect = int(suspects.Load())
@@ -771,7 +782,7 @@ type BatchHoldStat struct {
 	AvgAlphaPct  float64       `json:"avg_alpha_pct"`
 	AlphaSample  int           `json:"alpha_sample"`
 	Pending      int           `json:"pending"`
-	Forced       int           `json:"forced"` // 顺延/退市长停末根强平，单列剔除不进统计
+	Forced       int           `json:"forced"`  // 顺延/退市长停末根强平，单列剔除不进统计
 	Skipped      int           `json:"skipped"` // 一字板/停牌/资金不足合计
 	NoData       int           `json:"no_data"`
 	AlphaHist    []AlphaBucket `json:"alpha_hist"`

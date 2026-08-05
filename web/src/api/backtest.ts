@@ -6,6 +6,7 @@ import type { CondNode } from './screener'
 export interface BacktestRequest {
   strategy_key?: string
   strategy_id?: number
+  strategy_revision_id?: number
   tree?: CondNode
   lookback_days?: number
   signal_count?: number
@@ -60,6 +61,10 @@ export interface BacktestDayStat {
 
 export interface BacktestResult {
   strategy: string
+  strategy_id: number
+  strategy_revision_id: number
+  strategy_revision: number
+  strategy_hash: string
   conditions: string[] | null
   trade_date: string
   signal_dates: string[]

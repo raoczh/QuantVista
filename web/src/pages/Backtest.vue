@@ -28,7 +28,14 @@ import {
   type BacktestTrade,
   type BatchBacktestResult,
 } from '@/api/backtest'
-import { getScreenerStrategies, PERIOD_LABEL, type StrategiesView } from '@/api/screener'
+import {
+  getScreenerStrategies,
+  getScreenerStrategyHistory,
+  PERIOD_LABEL,
+  type CustomStrategy,
+  type ScreenerStrategyRevision,
+  type StrategiesView,
+} from '@/api/screener'
 import { listRecommendations, type RecommendationBatch } from '@/api/recommendation'
 import { useUi } from '@/composables/useUi'
 import { useIsMobile } from '@/composables/useIsMobile'
@@ -55,6 +62,84 @@ const perStockCap = ref(20000)
 const includeST = ref(false)
 const running = ref(false)
 const result = ref<BacktestResult | null>(null)
+const strategyRevisions = ref<ScreenerStrategyRevision[]>([])
+const strategyRevisionId = ref<number | null>(null)
+const revisionLoading = ref(false)
+const historyCurrentRevisionId = ref<number | null>(null)
+interface CustomStrategyOptionMeta {
+  id: number
+  current_revision_id: number
+  revision: number
+  content_hash: string
+  name: string
+  archived: boolean
+}
+const historyStrategyOption = ref<CustomStrategyOptionMeta | null>(null)
+const listedRevisionFallback = ref<CustomStrategy | null>(null)
+let revisionRequestSequence = 0
+
+function shortHash(hash?: string): string {
+  return hash ? hash.slice(0, 8) : '--------'
+}
+
+function selectedCustomID(value = strategyValue.value): number | null {
+  if (!value.startsWith('c:')) return null
+  const id = Number(value.slice(2))
+  return Number.isInteger(id) && id > 0 ? id : null
+}
+
+const selectedCustom = computed<CustomStrategy | CustomStrategyOptionMeta | undefined>(() => {
+  const id = selectedCustomID()
+  if (!id) return undefined
+  if (historyStrategyOption.value?.id === id) return historyStrategyOption.value
+  return strategies.value?.custom?.find((strategy) => strategy.id === id)
+})
+
+const revisionOptions = computed<SelectOption[]>(() => {
+  const options = strategyRevisions.value.map((revision) => ({
+    label: `${revision.id === historyCurrentRevisionId.value ? '当前 · ' : '历史 · '}v${revision.revision} · ${shortHash(revision.content_hash)}`,
+    value: revision.id,
+  }))
+  const selectedId = strategyRevisionId.value
+  if (selectedId && !strategyRevisions.value.some((revision) => revision.id === selectedId)) {
+    const fallback = listedRevisionFallback.value
+    if (fallback?.current_revision_id === selectedId) {
+      options.unshift({
+        label: `列表快照 · v${fallback.revision} · ${shortHash(fallback.content_hash)}`,
+        value: selectedId,
+      })
+    } else {
+      const prefix = selectedId === historyCurrentRevisionId.value ? '当前' : '指定'
+      options.unshift({ label: `${prefix} revision ID #${selectedId} · 运行时校验`, value: selectedId })
+    }
+  }
+  return options
+})
+
+const selectedRevision = computed(() =>
+  strategyRevisions.value.find((revision) => revision.id === strategyRevisionId.value),
+)
+
+const selectedRevisionHint = computed(() => {
+  const revision = selectedRevision.value
+  if (revision) {
+    const current = revision.id === historyCurrentRevisionId.value ? '当前版本' : '历史版本'
+    return `${current} · ${revision.name} · ${revision.created_at.replace('T', ' ').slice(0, 16)} · ${shortHash(revision.content_hash)}`
+  }
+  if (strategyRevisionId.value) {
+    const fallback = listedRevisionFallback.value
+    if (fallback?.current_revision_id === strategyRevisionId.value) {
+      return `版本历史加载失败，使用默认列表中的 v${fallback.revision} 快照；后端仍会校验版本归属`
+    }
+    return `指定 revision ID #${strategyRevisionId.value} 不在最近 50 条历史中，将由后端校验归属并读取不可变快照`
+  }
+  return ''
+})
+
+function customStrategyLabel(strategy: Pick<CustomStrategyOptionMeta, 'name' | 'revision' | 'content_hash'>): string {
+  if (!strategy.revision) return strategy.name
+  return `${strategy.name} · v${strategy.revision} · ${shortHash(strategy.content_hash)}`
+}
 
 const strategyOptions = computed<SelectOption[]>(() => {
   const s = strategies.value
@@ -69,10 +154,101 @@ const strategyOptions = computed<SelectOption[]>(() => {
       groups.push({ type: 'group', label: `内置 · ${PERIOD_LABEL[p] ?? p}`, key: p, children: byPeriod[p] })
     }
   }
-  const custom = (s.custom ?? []).map((c) => ({ label: c.name, value: `c:${c.id}` }))
+  const custom = (s.custom ?? []).map((c) => {
+    const latest = historyStrategyOption.value?.id === c.id ? historyStrategyOption.value : c
+    return { label: customStrategyLabel(latest), value: `c:${c.id}` }
+  })
   if (custom.length) groups.push({ type: 'group', label: '我的策略', key: 'custom', children: custom })
+  const historyStrategy = historyStrategyOption.value
+  if (historyStrategy && !(s.custom ?? []).some((strategy) => strategy.id === historyStrategy.id)) {
+    groups.push({
+      type: 'group',
+      label: '历史策略',
+      key: 'history-custom',
+      children: [{ label: customStrategyLabel(historyStrategy), value: `c:${historyStrategy.id}` }],
+    })
+  }
   return groups
 })
+
+async function loadStrategyRevisions(strategyId: number, preferredRevisionId?: number): Promise<boolean> {
+  const sequence = ++revisionRequestSequence
+  const listed = strategies.value?.custom?.find((strategy) => strategy.id === strategyId)
+  strategyRevisions.value = []
+  strategyRevisionId.value = preferredRevisionId ?? null
+  historyCurrentRevisionId.value = null
+  listedRevisionFallback.value = null
+  historyStrategyOption.value = listed
+    ? null
+    : {
+        id: strategyId,
+        current_revision_id: 0,
+        revision: 0,
+        content_hash: '',
+        name: `策略 #${strategyId}`,
+        archived: true,
+      }
+  revisionLoading.value = true
+  try {
+    const history = await getScreenerStrategyHistory(strategyId)
+    if (sequence !== revisionRequestSequence || selectedCustomID() !== strategyId) return false
+    strategyRevisions.value = history.revisions
+    historyCurrentRevisionId.value = history.current_revision_id || null
+    listedRevisionFallback.value = null
+    const currentRevision =
+      history.revisions.find((revision) => revision.id === history.current_revision_id) ?? history.revisions[0]
+    if (currentRevision) {
+      historyStrategyOption.value = {
+        id: strategyId,
+        current_revision_id: history.current_revision_id,
+        revision: currentRevision.revision,
+        content_hash: currentRevision.content_hash,
+        name: currentRevision.name,
+        archived: !listed,
+      }
+    }
+    // 显式 revision 可能早于 history 接口最近 50 条窗口；仍原样提交，由后端校验归属。
+    strategyRevisionId.value = preferredRevisionId ?? (history.current_revision_id || history.revisions[0]?.id || null)
+    return strategyRevisionId.value !== null
+  } catch (e) {
+    if (sequence !== revisionRequestSequence || selectedCustomID() !== strategyId) return false
+    if (preferredRevisionId !== undefined) {
+      message.warning(`版本历史加载失败，将把显式 revision 交由后端校验：${(e as Error).message}`)
+      return true
+    }
+    if (listed?.current_revision_id) {
+      listedRevisionFallback.value = listed
+      strategyRevisionId.value = listed.current_revision_id
+      message.warning(`版本历史加载失败，将使用默认列表中的 v${listed.revision} 快照：${(e as Error).message}`)
+      return true
+    }
+    message.warning(`版本历史加载失败：${(e as Error).message}`)
+    return false
+  } finally {
+    if (sequence === revisionRequestSequence) revisionLoading.value = false
+  }
+}
+
+function onStrategyChange(value: string | null) {
+  strategyValue.value = value ?? ''
+  result.value = null
+  const customId = selectedCustomID(strategyValue.value)
+  if (customId) {
+    void loadStrategyRevisions(customId)
+  } else {
+    revisionRequestSequence++
+    strategyRevisions.value = []
+    strategyRevisionId.value = null
+    historyCurrentRevisionId.value = null
+    historyStrategyOption.value = null
+    listedRevisionFallback.value = null
+    revisionLoading.value = false
+  }
+}
+
+function onRevisionChange() {
+  result.value = null
+}
 
 async function loadStrategies() {
   try {
@@ -81,9 +257,20 @@ async function loadStrategies() {
     const key = route.query.strategy_key as string
     if (key && strategies.value.builtin.some((b) => b.key === key)) {
       strategyValue.value = `b:${key}`
-      run()
-    } else if (!strategyValue.value && strategies.value.builtin.length) {
-      strategyValue.value = `b:${strategies.value.builtin[0].key}`
+      void run()
+    } else {
+      const customId = Number(route.query.strategy_id)
+      if (Number.isInteger(customId) && customId > 0) {
+        strategyValue.value = `c:${customId}`
+        const requestedRevisionId = Number(route.query.strategy_revision_id)
+        const revisionReady = await loadStrategyRevisions(
+          customId,
+          Number.isInteger(requestedRevisionId) && requestedRevisionId > 0 ? requestedRevisionId : undefined,
+        )
+        if (revisionReady) void run()
+      } else if (!strategyValue.value && strategies.value.builtin.length) {
+        strategyValue.value = `b:${strategies.value.builtin[0].key}`
+      }
     }
   } catch (e) {
     message.error((e as Error).message)
@@ -102,9 +289,14 @@ async function run() {
   running.value = true
   try {
     const [kind, id] = [strategyValue.value.slice(0, 1), strategyValue.value.slice(2)]
+    if (kind === 'c' && !strategyRevisionId.value) {
+      message.warning('请选择要回测的策略版本')
+      return
+    }
     result.value = await runBacktest({
       strategy_key: kind === 'b' ? id : undefined,
       strategy_id: kind === 'c' ? Number(id) : undefined,
+      strategy_revision_id: kind === 'c' ? strategyRevisionId.value ?? undefined : undefined,
       lookback_days: lookbackDays.value,
       signal_count: signalCount.value,
       hold_days: [...holdDays.value].sort((a, b) => a - b),
@@ -205,7 +397,24 @@ onMounted(() => {
           <div class="form-col">
             <div class="form-row">
               <span class="form-label">选股策略</span>
-              <n-select v-model:value="strategyValue" :options="strategyOptions" filterable placeholder="选择策略" />
+              <n-select
+                v-model:value="strategyValue"
+                :options="strategyOptions"
+                filterable
+                placeholder="选择策略"
+                @update:value="onStrategyChange"
+              />
+            </div>
+            <div v-if="selectedCustom" class="form-row">
+              <span class="form-label">策略版本</span>
+              <n-select
+                v-model:value="strategyRevisionId"
+                :options="revisionOptions"
+                :loading="revisionLoading"
+                placeholder="选择当前或历史版本"
+                @update:value="onRevisionChange"
+              />
+              <span v-if="selectedRevisionHint" class="revision-hint">{{ selectedRevisionHint }}</span>
             </div>
             <div class="form-row">
               <span class="form-label">回看窗口（交易日）</span>
@@ -243,6 +452,11 @@ onMounted(() => {
         <n-spin :show="running">
           <template v-if="result">
             <SectionCard :title="`回测结果 · ${result.strategy}`">
+              <div v-if="result.strategy_revision_id" class="result-revision">
+                <span>不可变策略快照</span>
+                <n-tag size="tiny" type="info" :bordered="false">v{{ result.strategy_revision }}</n-tag>
+                <code>{{ shortHash(result.strategy_hash) }}</code>
+              </div>
               <div class="meta-line">
                 数据截至 {{ result.trade_date }} · 信号日 {{ result.signal_dates.length }} 个 ·
                 宇宙 {{ result.universe }} 只（ST 跳过 {{ result.st_skipped }}，复权可疑剔除 {{ result.adjust_suspect }}）·
@@ -545,6 +759,12 @@ onMounted(() => {
   font-size: 13px;
   opacity: 0.75;
 }
+.revision-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  opacity: 0.62;
+  overflow-wrap: anywhere;
+}
 .hint {
   font-size: 12px;
   opacity: 0.6;
@@ -554,6 +774,14 @@ onMounted(() => {
   font-size: 13px;
   opacity: 0.75;
   margin-bottom: 10px;
+}
+.result-revision {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 7px;
+  font-size: 12px;
+  opacity: 0.82;
 }
 .cond-line {
   margin-bottom: 8px;

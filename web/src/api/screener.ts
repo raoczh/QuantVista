@@ -34,12 +34,36 @@ export interface BuiltinStrategy {
 
 export interface CustomStrategy {
   id: number
+  current_revision_id: number
+  revision: number
+  content_hash: string
   name: string
   desc: string
   period: string
   risk: string
   tree: CondNode | null
   conditions: string[]
+}
+
+/** 自定义策略的不可变执行快照。 */
+export interface ScreenerStrategyRevision {
+  id: number
+  strategy_id: number
+  revision: number
+  content_hash: string
+  name: string
+  desc: string
+  period: string
+  risk: string
+  tree: CondNode | null
+  conditions: string[]
+  created_at: string
+}
+
+export interface ScreenerStrategyHistory {
+  strategy_id: number
+  current_revision_id: number
+  revisions: ScreenerStrategyRevision[]
 }
 
 export interface StrategiesView {
@@ -51,6 +75,7 @@ export interface StrategiesView {
 export interface ScanRequest {
   strategy_key?: string
   strategy_id?: number
+  strategy_revision_id?: number
   tree?: CondNode
   include_st?: boolean
   include_stale?: boolean
@@ -70,6 +95,10 @@ export interface ScanHit {
 
 export interface ScanResult {
   strategy: string
+  strategy_id: number
+  strategy_revision_id: number
+  strategy_revision: number
+  strategy_hash: string
   trade_date: string
   universe: number
   scanned: number
@@ -94,6 +123,7 @@ export interface FactorTableStatus {
 
 export interface SaveStrategyRequest {
   id?: number
+  base_revision_id?: number
   name: string
   desc?: string
   period?: string
@@ -105,6 +135,51 @@ export function getScreenerStrategies() {
   return request<StrategiesView>({ url: '/screener/strategies', method: 'get' })
 }
 
+interface RawStrategyRevision extends Omit<ScreenerStrategyRevision, 'tree' | 'conditions'> {
+  tree?: CondNode | null
+  tree_json?: string
+  conditions?: string[] | null
+}
+
+interface RawStrategyHistory {
+  strategy_id?: number
+  current_revision_id?: number
+  revisions?: RawStrategyRevision[] | null
+  // 兼容后端将历史挂在策略列表视图上的早期响应结构。
+  history?: RawStrategyRevision[] | null
+  custom?: CustomStrategy[] | null
+}
+
+function parseRevisionTree(revision: RawStrategyRevision): CondNode | null {
+  if (revision.tree !== undefined) return revision.tree
+  if (!revision.tree_json) return null
+  try {
+    return JSON.parse(revision.tree_json) as CondNode
+  } catch {
+    return null
+  }
+}
+
+/** 获取单个策略最近 50 个 revision，按 revision 降序。 */
+export async function getScreenerStrategyHistory(strategyId: number): Promise<ScreenerStrategyHistory> {
+  const view = await request<RawStrategyHistory>({
+    url: '/screener/strategies',
+    method: 'get',
+    params: { history: 1, strategy_id: strategyId },
+  })
+  const current = view.custom?.find((item) => item.id === strategyId)
+  const revisions = (view.revisions ?? view.history ?? []).map((revision) => ({
+    ...revision,
+    tree: parseRevisionTree(revision),
+    conditions: revision.conditions ?? [],
+  }))
+  return {
+    strategy_id: view.strategy_id ?? strategyId,
+    current_revision_id: view.current_revision_id ?? current?.current_revision_id ?? 0,
+    revisions,
+  }
+}
+
 export function screenerScan(req: ScanRequest) {
   return request<ScanResult>({ url: '/screener/scan', method: 'post', data: req })
 }
@@ -114,7 +189,7 @@ export function saveScreenerStrategy(req: SaveStrategyRequest) {
 }
 
 export function deleteScreenerStrategy(id: number) {
-  return request<{ deleted: boolean }>({ url: `/screener/strategies/${id}`, method: 'delete' })
+  return request<{ archived?: boolean; deleted?: boolean }>({ url: `/screener/strategies/${id}`, method: 'delete' })
 }
 
 export function getScreenerStatus() {

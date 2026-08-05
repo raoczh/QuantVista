@@ -25,6 +25,7 @@ import {
 } from 'naive-ui'
 import {
   getScreenerStrategies,
+  getScreenerStrategyHistory,
   screenerScan,
   saveScreenerStrategy,
   deleteScreenerStrategy,
@@ -41,7 +42,10 @@ import {
   type FactorDef,
   type CondNode,
   type ParseStrategyResult,
+  type ScreenerStrategyHistory,
+  type ScreenerStrategyRevision,
 } from '@/api/screener'
+import { ApiRequestError } from '@/api/client'
 import { getLLMTask, listLLMTasks, type LLMTask } from '@/api/llmTask'
 import { isPollCancelled, pollUntil } from '@/lib/poll'
 import { useUi } from '@/composables/useUi'
@@ -58,7 +62,11 @@ const { vars } = useUi()
 const { llmLabel } = useLlmLabel()
 const { isMobile } = useIsMobile()
 const actions = useStockActions()
-const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
+const styleVars = computed(() => ({
+  '--qv-divider': vars.value.dividerColor,
+  '--qv-warning': vars.value.warningColor,
+  '--qv-code-bg': vars.value.actionColor,
+}))
 
 // ---------- 策略广场与宽表状态 ----------
 
@@ -101,10 +109,16 @@ const scanning = ref('') // 正在扫描的 strategy_key / `custom-{id}` / 'temp
 const result = ref<ScanResult | null>(null)
 const includeST = ref(false)
 const includeStale = ref(false)
+interface ScanTarget {
+  strategy_key?: string
+  strategy_id?: number
+  strategy_revision_id?: number
+  tree?: CondNode
+}
 // 最近一次扫描目标（开关切换后重扫用）。
-let lastScanTarget: { strategy_key?: string; strategy_id?: number; tree?: CondNode } | null = null
+let lastScanTarget: ScanTarget | null = null
 
-async function runScan(target: { strategy_key?: string; strategy_id?: number; tree?: CondNode }, tag: string) {
+async function runScan(target: ScanTarget, tag: string) {
   scanning.value = tag
   try {
     result.value = await screenerScan({
@@ -137,6 +151,10 @@ const resultStats = computed(() => {
   return parts.join(' · ')
 })
 
+function shortHash(hash?: string): string {
+  return hash ? hash.slice(0, 8) : '--------'
+}
+
 // ---------- 自定义策略编辑器 ----------
 
 // 行式条件（行间 AND）：数值因子支持 值比较/区间/与因子比，布尔因子支持 是/否。
@@ -157,6 +175,17 @@ const editorForm = ref<{ id: number; name: string; desc: string; period: string;
   risk: 'mid',
 })
 const editorRows = ref<CondRow[]>([])
+const editorBaseRevisionId = ref<number>()
+const editorLoadedRevision = ref<number>()
+const editorCurrentRevision = ref<number>()
+const editorRestored = ref(false)
+interface RevisionConflict {
+  staleRevisionId: number
+  currentRevisionId: number
+  currentRevision: number
+}
+const editorConflict = ref<RevisionConflict | null>(null)
+const conflictCompared = ref(false)
 
 const factorOptions = computed(() => {
   const groups = new Map<string, { label: string; value: string }[]>()
@@ -262,19 +291,231 @@ function flattenTree(tree: CondNode | null): CondRow[] | null {
 function openCreate() {
   editorForm.value = { id: 0, name: '', desc: '', period: 'swing', risk: 'mid' }
   editorRows.value = [{ factor: 'chg_pct', op: 'between', value: 1, value2: 6 }]
+  editorBaseRevisionId.value = undefined
+  editorLoadedRevision.value = undefined
+  editorCurrentRevision.value = undefined
+  editorRestored.value = false
+  editorConflict.value = null
+  conflictCompared.value = false
   resetAiGen()
   editorShow.value = true
 }
 function openEdit(cs: CustomStrategy) {
   const rows = flattenTree(cs.tree)
-  if (!rows) {
-    message.warning('该策略含高级嵌套条件（any 组），暂不支持表单编辑，可删除后重建')
+  resetAiGen()
+  editorForm.value = { id: cs.id, name: cs.name, desc: cs.desc, period: cs.period || 'swing', risk: cs.risk || 'mid' }
+  editorBaseRevisionId.value = cs.current_revision_id
+  editorLoadedRevision.value = cs.revision
+  editorCurrentRevision.value = cs.revision
+  editorRestored.value = false
+  editorConflict.value = null
+  conflictCompared.value = false
+  if (rows) {
+    editorRows.value = rows
+  } else {
+    editorRows.value = []
+    aiAdvancedTree.value = cs.tree
+    aiAdvancedConditions.value = cs.conditions ?? []
+    message.info('该版本含嵌套条件组，条件树将以只读方式保留，可修改基本信息并保存新版本')
+  }
+  editorShow.value = true
+}
+
+// ---------- 不可变版本历史与比较 ----------
+
+const historyShow = ref(false)
+const historyLoading = ref(false)
+const historyError = ref('')
+const historyName = ref('')
+const strategyHistory = ref<ScreenerStrategyHistory | null>(null)
+const historyLeftId = ref<number | null>(null)
+const historyRightId = ref<number | null>(null)
+let historyRequestSequence = 0
+
+const historyOptions = computed(() =>
+  (strategyHistory.value?.revisions ?? []).map((revision) => ({
+    label: `v${revision.revision} · ${shortHash(revision.content_hash)} · ${formatRevisionTime(revision.created_at)}`,
+    value: revision.id,
+  })),
+)
+const historyLeft = computed(() =>
+  strategyHistory.value?.revisions.find((revision) => revision.id === historyLeftId.value),
+)
+const historyRight = computed(() =>
+  strategyHistory.value?.revisions.find((revision) => revision.id === historyRightId.value),
+)
+
+function formatRevisionTime(value: string): string {
+  if (!value) return '时间未知'
+  return value.replace('T', ' ').slice(0, 16)
+}
+
+async function openHistory(
+  strategy: CustomStrategy | number,
+  preferredLeftId?: number,
+  preferredRightId?: number,
+): Promise<boolean> {
+  const requestSequence = ++historyRequestSequence
+  const strategyId = typeof strategy === 'number' ? strategy : strategy.id
+  historyName.value = typeof strategy === 'number' ? editorForm.value.name : strategy.name
+  historyShow.value = true
+  historyLoading.value = true
+  historyError.value = ''
+  strategyHistory.value = null
+  try {
+    const view = await getScreenerStrategyHistory(strategyId)
+    if (requestSequence !== historyRequestSequence) return false
+    strategyHistory.value = view
+    const revisions = view.revisions
+    const currentId = view.current_revision_id || revisions[0]?.id || null
+    historyLeftId.value = revisions.some((revision) => revision.id === preferredLeftId) ? preferredLeftId! : currentId
+    const fallbackRight = revisions.find((revision) => revision.id !== historyLeftId.value)?.id ?? currentId
+    historyRightId.value = revisions.some((revision) => revision.id === preferredRightId) ? preferredRightId! : fallbackRight
+    return true
+  } catch (e) {
+    if (requestSequence !== historyRequestSequence) return false
+    historyError.value = (e as Error).message
+    return false
+  } finally {
+    if (requestSequence === historyRequestSequence) historyLoading.value = false
+  }
+}
+
+function restoreRevision(revision: ScreenerStrategyRevision) {
+  const history = strategyHistory.value
+  if (!history || !revision.tree) {
+    message.error('该版本没有可恢复的条件树快照')
     return
   }
-  editorForm.value = { id: cs.id, name: cs.name, desc: cs.desc, period: cs.period || 'swing', risk: cs.risk || 'mid' }
-  editorRows.value = rows
+  const current = history.revisions.find((item) => item.id === history.current_revision_id) ?? history.revisions[0]
+  const rows = flattenTree(revision.tree)
   resetAiGen()
+  editorForm.value = {
+    id: revision.strategy_id,
+    name: revision.name,
+    desc: revision.desc,
+    period: revision.period || 'swing',
+    risk: revision.risk || 'mid',
+  }
+  editorBaseRevisionId.value = history.current_revision_id
+  editorLoadedRevision.value = revision.revision
+  editorCurrentRevision.value = current?.revision ?? revision.revision
+  editorRestored.value = revision.id !== history.current_revision_id
+  editorConflict.value = null
+  conflictCompared.value = false
+  if (rows) {
+    editorRows.value = rows
+  } else {
+    editorRows.value = []
+    aiAdvancedTree.value = revision.tree
+    aiAdvancedConditions.value = revision.conditions ?? []
+  }
+  historyShow.value = false
   editorShow.value = true
+}
+
+async function scanHistoryRevision(revision: ScreenerStrategyRevision) {
+  historyShow.value = false
+  await runScan(
+    { strategy_id: revision.strategy_id, strategy_revision_id: revision.id },
+    `custom-${revision.strategy_id}-revision-${revision.id}`,
+  )
+}
+
+function backtestHistoryRevision(revision: ScreenerStrategyRevision) {
+  router.push({
+    path: '/backtest',
+    query: { strategy_id: String(revision.strategy_id), strategy_revision_id: String(revision.id) },
+  })
+}
+
+function stableTreeJSON(tree: CondNode | null): string {
+  function normalize(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(normalize)
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+          .filter(([, item]) => item !== undefined)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, item]) => [key, normalize(item)]),
+      )
+    }
+    return value
+  }
+  return JSON.stringify(normalize(tree), null, 2)
+}
+
+interface TreeDiffLine {
+  text: string
+  changed: boolean
+}
+
+function lineDiff(leftText: string, rightText: string): { left: TreeDiffLine[]; right: TreeDiffLine[] } {
+  const left = leftText.split('\n')
+  const right = rightText.split('\n')
+  const lengths = Array.from({ length: left.length + 1 }, () => Array<number>(right.length + 1).fill(0))
+  for (let i = left.length - 1; i >= 0; i--) {
+    for (let j = right.length - 1; j >= 0; j--) {
+      lengths[i][j] = left[i] === right[j] ? lengths[i + 1][j + 1] + 1 : Math.max(lengths[i + 1][j], lengths[i][j + 1])
+    }
+  }
+  const leftSame = new Set<number>()
+  const rightSame = new Set<number>()
+  let i = 0
+  let j = 0
+  while (i < left.length && j < right.length) {
+    if (left[i] === right[j]) {
+      leftSame.add(i)
+      rightSame.add(j)
+      i++
+      j++
+    } else if (lengths[i + 1][j] >= lengths[i][j + 1]) {
+      i++
+    } else {
+      j++
+    }
+  }
+  return {
+    left: left.map((text, index) => ({ text, changed: !leftSame.has(index) })),
+    right: right.map((text, index) => ({ text, changed: !rightSame.has(index) })),
+  }
+}
+
+const historyTreeDiff = computed(() =>
+  lineDiff(stableTreeJSON(historyLeft.value?.tree ?? null), stableTreeJSON(historyRight.value?.tree ?? null)),
+)
+const historyTreeChanged = computed(
+  () => stableTreeJSON(historyLeft.value?.tree ?? null) !== stableTreeJSON(historyRight.value?.tree ?? null),
+)
+
+function historyFieldChanged(field: 'name' | 'desc' | 'period' | 'risk'): boolean {
+  return historyLeft.value?.[field] !== historyRight.value?.[field]
+}
+
+async function compareConflict() {
+  const conflict = editorConflict.value
+  if (!conflict) return
+  conflictCompared.value = await openHistory(editorForm.value.id, conflict.currentRevisionId, conflict.staleRevisionId)
+  if (conflictCompared.value && strategyHistory.value) {
+    const current = strategyHistory.value.revisions.find(
+      (revision) => revision.id === strategyHistory.value?.current_revision_id,
+    )
+    conflict.currentRevisionId = strategyHistory.value.current_revision_id
+    conflict.currentRevision = current?.revision ?? conflict.currentRevision
+  }
+}
+
+function acceptLatestConflictBase() {
+  const conflict = editorConflict.value
+  if (!conflict) return
+  if (!conflictCompared.value) {
+    message.warning('请先打开版本历史，比较冲突版本后再继续')
+    return
+  }
+  editorBaseRevisionId.value = conflict.currentRevisionId
+  editorCurrentRevision.value = conflict.currentRevision
+  editorConflict.value = null
+  message.info(`已改用 v${conflict.currentRevision} 作为保存基线；再次保存会创建一个新版本`)
 }
 
 // ---------- AI 白话生成（P3c）----------
@@ -418,6 +659,11 @@ function editorTree(): CondNode | null {
   return aiAdvancedTree.value ?? rowsToTree(editorRows.value)
 }
 
+function isRevisionConflict(error: unknown): boolean {
+  if (error instanceof ApiRequestError && (error.status === 409 || error.code === 'strategy_revision_conflict')) return true
+  return /刷新并比较|版本冲突|其他页面更新/.test((error as Error)?.message ?? '')
+}
+
 async function saveEditor() {
   const tree = editorTree()
   if (!editorForm.value.name.trim()) {
@@ -429,20 +675,49 @@ async function saveEditor() {
     return
   }
   editorSaving.value = true
+  const savedBaseRevisionId = editorBaseRevisionId.value
   try {
-    await saveScreenerStrategy({
+    const saved = await saveScreenerStrategy({
       id: editorForm.value.id || undefined,
+      base_revision_id: editorForm.value.id ? savedBaseRevisionId : undefined,
       name: editorForm.value.name,
       desc: editorForm.value.desc,
       period: editorForm.value.period,
       risk: editorForm.value.risk,
       tree,
     })
-    message.success('策略已保存')
+    if (editorForm.value.id && saved.current_revision_id === savedBaseRevisionId) {
+      message.info(`内容未变化，继续使用 v${saved.revision}`)
+    } else {
+      message.success(`策略已保存为 v${saved.revision}`)
+    }
     editorShow.value = false
     await load()
   } catch (e) {
-    message.error((e as Error).message)
+    if (editorForm.value.id && isRevisionConflict(e)) {
+      editorConflict.value = {
+        staleRevisionId: savedBaseRevisionId ?? 0,
+        currentRevisionId: 0,
+        currentRevision: 0,
+      }
+      conflictCompared.value = false
+      try {
+        data.value = await getScreenerStrategies()
+        const latest = customList.value.find((strategy) => strategy.id === editorForm.value.id)
+        if (latest) {
+          editorConflict.value = {
+            staleRevisionId: savedBaseRevisionId ?? 0,
+            currentRevisionId: latest.current_revision_id,
+            currentRevision: latest.revision,
+          }
+        }
+      } catch {
+        // 保留编辑内容和原始冲突提示，历史比较按钮仍可再次主动加载。
+      }
+      message.error('策略已被其他页面更新。当前编辑内容已保留，请刷新并比较版本后再决定是否保存')
+    } else {
+      message.error((e as Error).message)
+    }
   } finally {
     editorSaving.value = false
   }
@@ -461,7 +736,7 @@ async function tryScanEditor() {
 async function removeCustom(id: number) {
   try {
     await deleteScreenerStrategy(id)
-    message.success('已删除')
+    message.success('策略已归档，历史版本和既有研究不受影响')
     await load()
   } catch (e) {
     message.error((e as Error).message)
@@ -498,6 +773,11 @@ async function removeCustom(id: number) {
         <p class="result-stats">
           {{ resultStats }}
           <span class="muted">（数据为 {{ result.trade_date }} 收盘口径）</span>
+        </p>
+        <p v-if="result.strategy_revision_id" class="revision-meta">
+          固定快照
+          <n-tag size="tiny" type="info" :bordered="false">v{{ result.strategy_revision }}</n-tag>
+          <code>{{ shortHash(result.strategy_hash) }}</code>
         </p>
         <p v-if="result.conditions?.length" class="result-conds">
           条件：<n-tag v-for="c in result.conditions" :key="c" size="small" :bordered="false" class="cond-tag">{{ c }}</n-tag>
@@ -625,6 +905,8 @@ async function removeCustom(id: number) {
             <div class="cr-main">
               <div class="cr-head">
                 <span class="sc-name">{{ cs.name }}</span>
+                <n-tag size="tiny" type="info" :bordered="false">v{{ cs.revision }}</n-tag>
+                <code class="revision-hash">{{ shortHash(cs.content_hash) }}</code>
                 <n-tag size="tiny" :bordered="false">{{ PERIOD_LABEL[cs.period] || cs.period }}</n-tag>
                 <n-tag size="tiny" :bordered="false" :type="RISK_TAG_TYPE[cs.risk] || 'default'">{{
                   RISK_LABEL[cs.risk] || cs.risk
@@ -642,20 +924,142 @@ async function removeCustom(id: number) {
                 secondary
                 :loading="scanning === `custom-${cs.id}`"
                 :disabled="!!scanning && scanning !== `custom-${cs.id}`"
-                @click="runScan({ strategy_id: cs.id }, `custom-${cs.id}`)"
+                @click="runScan({ strategy_id: cs.id, strategy_revision_id: cs.current_revision_id }, `custom-${cs.id}`)"
                 >扫描</n-button
               >
+              <n-button
+                size="small"
+                quaternary
+                @click="router.push({ path: '/backtest', query: { strategy_id: String(cs.id), strategy_revision_id: String(cs.current_revision_id) } })"
+                >回测</n-button
+              >
+              <n-button size="small" quaternary @click="openHistory(cs)">版本</n-button>
               <n-button size="small" quaternary @click="openEdit(cs)">编辑</n-button>
               <n-popconfirm @positive-click="removeCustom(cs.id)">
                 <template #trigger>
-                  <n-button size="small" quaternary type="error">删除</n-button>
+                  <n-button size="small" quaternary type="error">归档</n-button>
                 </template>
-                确认删除策略「{{ cs.name }}」？
+                归档策略「{{ cs.name }}」？归档后默认列表不再显示，历史版本和既有研究不受影响。
               </n-popconfirm>
             </div>
           </div>
         </div>
       </SectionCard>
+
+      <!-- revision 历史：两版并排比较，恢复仅加载快照，不移动当前指针。 -->
+      <n-modal
+        v-model:show="historyShow"
+        preset="card"
+        :title="`版本历史 · ${historyName}`"
+        class="history-modal"
+        :style="[styleVars, { width: 'min(980px, calc(100vw - 24px))', maxHeight: 'calc(100vh - 32px)' }]"
+      >
+        <n-spin :show="historyLoading">
+          <n-alert v-if="historyError" type="error" :bordered="false">{{ historyError }}</n-alert>
+          <n-empty v-else-if="!historyLoading && !strategyHistory?.revisions.length" description="暂无版本历史" />
+          <template v-else-if="strategyHistory">
+            <p class="history-hint">
+              最近 {{ strategyHistory.revisions.length }} 个不可变版本。载入旧快照只会打开编辑器；确认保存后才创建新版本，当前指针和历史行不会被改写。
+            </p>
+            <div class="history-selects">
+              <div class="history-select">
+                <span>版本 A</span>
+                <n-select v-model:value="historyLeftId" :options="historyOptions" size="small" />
+              </div>
+              <div class="history-select">
+                <span>版本 B</span>
+                <n-select v-model:value="historyRightId" :options="historyOptions" size="small" />
+              </div>
+            </div>
+            <div v-if="historyLeft && historyRight" class="revision-compare">
+              <section class="revision-pane">
+                <div class="revision-pane-head">
+                  <div>
+                    <strong>v{{ historyLeft.revision }}</strong>
+                    <n-tag
+                      v-if="historyLeft.id === strategyHistory.current_revision_id"
+                      size="tiny"
+                      type="success"
+                      :bordered="false"
+                      >当前</n-tag
+                    >
+                    <code>{{ shortHash(historyLeft.content_hash) }}</code>
+                  </div>
+                  <div class="revision-actions">
+                    <n-button size="tiny" quaternary @click="scanHistoryRevision(historyLeft)">扫描</n-button>
+                    <n-button size="tiny" quaternary @click="backtestHistoryRevision(historyLeft)">回测</n-button>
+                    <n-button size="tiny" type="primary" secondary @click="restoreRevision(historyLeft)">载入编辑器</n-button>
+                  </div>
+                </div>
+                <div class="revision-time">{{ formatRevisionTime(historyLeft.created_at) }}</div>
+                <dl class="revision-fields">
+                  <div :class="{ changed: historyFieldChanged('name') }"><dt>名称</dt><dd>{{ historyLeft.name }}</dd></div>
+                  <div :class="{ changed: historyFieldChanged('desc') }"><dt>说明</dt><dd>{{ historyLeft.desc || '—' }}</dd></div>
+                  <div :class="{ changed: historyFieldChanged('period') }">
+                    <dt>周期</dt><dd>{{ PERIOD_LABEL[historyLeft.period] || historyLeft.period }}</dd>
+                  </div>
+                  <div :class="{ changed: historyFieldChanged('risk') }">
+                    <dt>风险</dt><dd>{{ RISK_LABEL[historyLeft.risk] || historyLeft.risk }}</dd>
+                  </div>
+                </dl>
+                <div class="tree-title">
+                  条件树
+                  <n-tag size="tiny" :type="historyTreeChanged ? 'warning' : 'success'" :bordered="false">
+                    {{ historyTreeChanged ? '有差异' : '相同' }}
+                  </n-tag>
+                </div>
+                <pre class="tree-code"><code><span
+                  v-for="(line, index) in historyTreeDiff.left"
+                  :key="index"
+                  :class="{ changed: line.changed }"
+                >{{ line.text }}</span></code></pre>
+              </section>
+              <section class="revision-pane">
+                <div class="revision-pane-head">
+                  <div>
+                    <strong>v{{ historyRight.revision }}</strong>
+                    <n-tag
+                      v-if="historyRight.id === strategyHistory.current_revision_id"
+                      size="tiny"
+                      type="success"
+                      :bordered="false"
+                      >当前</n-tag
+                    >
+                    <code>{{ shortHash(historyRight.content_hash) }}</code>
+                  </div>
+                  <div class="revision-actions">
+                    <n-button size="tiny" quaternary @click="scanHistoryRevision(historyRight)">扫描</n-button>
+                    <n-button size="tiny" quaternary @click="backtestHistoryRevision(historyRight)">回测</n-button>
+                    <n-button size="tiny" type="primary" secondary @click="restoreRevision(historyRight)">载入编辑器</n-button>
+                  </div>
+                </div>
+                <div class="revision-time">{{ formatRevisionTime(historyRight.created_at) }}</div>
+                <dl class="revision-fields">
+                  <div :class="{ changed: historyFieldChanged('name') }"><dt>名称</dt><dd>{{ historyRight.name }}</dd></div>
+                  <div :class="{ changed: historyFieldChanged('desc') }"><dt>说明</dt><dd>{{ historyRight.desc || '—' }}</dd></div>
+                  <div :class="{ changed: historyFieldChanged('period') }">
+                    <dt>周期</dt><dd>{{ PERIOD_LABEL[historyRight.period] || historyRight.period }}</dd>
+                  </div>
+                  <div :class="{ changed: historyFieldChanged('risk') }">
+                    <dt>风险</dt><dd>{{ RISK_LABEL[historyRight.risk] || historyRight.risk }}</dd>
+                  </div>
+                </dl>
+                <div class="tree-title">
+                  条件树
+                  <n-tag size="tiny" :type="historyTreeChanged ? 'warning' : 'success'" :bordered="false">
+                    {{ historyTreeChanged ? '有差异' : '相同' }}
+                  </n-tag>
+                </div>
+                <pre class="tree-code"><code><span
+                  v-for="(line, index) in historyTreeDiff.right"
+                  :key="index"
+                  :class="{ changed: line.changed }"
+                >{{ line.text }}</span></code></pre>
+              </section>
+            </div>
+          </template>
+        </n-spin>
+      </n-modal>
 
       <!-- 自定义策略编辑器（单根约束：n-modal 必须在 PageContainer 内） -->
       <n-modal
@@ -663,8 +1067,23 @@ async function removeCustom(id: number) {
         preset="card"
         :title="editorForm.id ? '编辑策略' : '新建策略'"
         class="editor-modal"
-        :style="{ maxWidth: '760px' }"
+        :style="[styleVars, { maxWidth: '760px' }]"
       >
+        <n-alert v-if="editorConflict" type="error" :bordered="false" class="editor-revision-alert">
+          <div>策略已被其他页面更新。当前编辑内容已保留；请刷新并比较后，再显式采用最新版本作为保存基线。</div>
+          <div class="alert-actions">
+            <n-button size="tiny" @click="compareConflict">刷新并比较</n-button>
+            <n-button size="tiny" type="primary" :disabled="!conflictCompared" @click="acceptLatestConflictBase">
+              采用最新基线
+            </n-button>
+          </div>
+        </n-alert>
+        <n-alert v-else-if="editorForm.id" :type="editorRestored ? 'warning' : 'info'" :bordered="false" class="editor-revision-alert">
+          <template v-if="editorRestored">
+            已载入 v{{ editorLoadedRevision }} 快照；当前仍为 v{{ editorCurrentRevision }}。只有确认保存后才会创建新版本。
+          </template>
+          <template v-else>正在编辑 v{{ editorLoadedRevision }}；保存不会覆盖该版本。</template>
+        </n-alert>
         <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 76">
           <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
             <n-gi>
@@ -784,7 +1203,9 @@ async function removeCustom(id: number) {
         <template #footer>
           <div class="editor-foot">
             <n-button size="small" @click="tryScanEditor">先试扫一次</n-button>
-            <n-button size="small" type="primary" :loading="editorSaving" @click="saveEditor">保存策略</n-button>
+            <n-button size="small" type="primary" :loading="editorSaving" @click="saveEditor">
+              {{ editorForm.id ? '保存为新版本' : '保存策略' }}
+            </n-button>
           </div>
         </template>
       </n-modal>
@@ -826,6 +1247,14 @@ async function removeCustom(id: number) {
 }
 .result-stats .muted {
   opacity: 0.6;
+}
+.revision-meta {
+  margin: -2px 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  opacity: 0.8;
 }
 .result-conds {
   margin: 0 0 10px;
@@ -950,10 +1379,133 @@ async function removeCustom(id: number) {
   gap: 6px;
   flex-wrap: wrap;
 }
+.revision-hash {
+  font-size: 11px;
+  opacity: 0.62;
+}
 .cr-actions {
   display: flex;
   gap: 4px;
   align-items: flex-start;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+/* 不可变版本历史 */
+.history-hint {
+  margin: 0 0 14px;
+  font-size: 12px;
+  line-height: 1.7;
+  opacity: 0.7;
+}
+.history-modal :deep(.n-card__content) {
+  overflow: auto;
+}
+.history-selects {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.history-select {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+}
+.revision-compare {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  border-top: 1px solid var(--qv-divider);
+}
+.revision-pane {
+  min-width: 0;
+  padding: 14px 14px 0 0;
+}
+.revision-pane + .revision-pane {
+  padding: 14px 0 0 14px;
+  border-left: 1px solid var(--qv-divider);
+}
+.revision-pane-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.revision-pane-head > div:first-child {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.revision-pane-head code {
+  font-size: 11px;
+  opacity: 0.65;
+}
+.revision-actions {
+  display: flex;
+  gap: 2px;
+  flex-wrap: wrap;
+}
+.revision-time {
+  margin-top: 3px;
+  font-size: 11px;
+  opacity: 0.55;
+}
+.revision-fields {
+  margin: 12px 0;
+  font-size: 12px;
+}
+.revision-fields > div {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 4px;
+}
+.revision-fields > div.changed {
+  background: color-mix(in srgb, var(--qv-warning) 12%, transparent);
+}
+.revision-fields dt {
+  opacity: 0.58;
+}
+.revision-fields dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.tree-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.tree-code {
+  max-height: 320px;
+  margin: 0;
+  padding: 8px;
+  overflow: auto;
+  border-radius: 4px;
+  background: var(--qv-code-bg);
+  font-size: 11px;
+  line-height: 1.55;
+}
+.tree-code span {
+  display: block;
+  min-height: 1.55em;
+  white-space: pre;
+}
+.tree-code span.changed {
+  background: color-mix(in srgb, var(--qv-warning) 18%, transparent);
+}
+.editor-revision-alert {
+  margin-bottom: 14px;
+}
+.alert-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
 }
 /* 编辑器 */
 .ai-gen {
@@ -1040,6 +1592,19 @@ async function removeCustom(id: number) {
   .cr-actions {
     flex-basis: 100%;
     justify-content: flex-end;
+  }
+  .history-selects,
+  .revision-compare {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .revision-pane,
+  .revision-pane + .revision-pane {
+    padding: 12px 0 0;
+    border-left: none;
+  }
+  .revision-pane + .revision-pane {
+    margin-top: 12px;
+    border-top: 1px solid var(--qv-divider);
   }
   .w-factor {
     width: 100%;

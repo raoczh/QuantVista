@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"sync"
@@ -236,16 +238,16 @@ func miniTable() *FactorTable {
 		Names:     []string{"甲股", "乙股"},
 		LastDates: []string{"2026-07-08", "2026-07-08"},
 		cols: map[string][]float64{
-			"close":      {21.35, 8.0},
-			"ma20":       {20.8, 8.5},
-			"rsi_14":     {38.2, nan},
-			"vol_boost":  {2.13, 1.0},
-			"bull_align": {1, 0},
-			"is_st":      {0, 0},
-			"amount_yi":  {5.6, 1.2},
-			"chg_pct":    {2.1, -1.0},
+			"close":         {21.35, 8.0},
+			"ma20":          {20.8, 8.5},
+			"rsi_14":        {38.2, nan},
+			"vol_boost":     {2.13, 1.0},
+			"bull_align":    {1, 0},
+			"is_st":         {0, 0},
+			"amount_yi":     {5.6, 1.2},
+			"chg_pct":       {2.1, -1.0},
 			"turnover_rate": {3.3, 1.1},
-			"pos_60":     {42, 80},
+			"pos_60":        {42, 80},
 		},
 	}
 }
@@ -286,7 +288,7 @@ func TestEvalCondAndExplain(t *testing.T) {
 
 	// any 分支：只列命中的那支。
 	anyTree := CondNode{Any: []CondNode{
-		leafV("rsi_14", ">", 90),  // 不命中
+		leafV("rsi_14", ">", 90), // 不命中
 		leafV("pos_60", "<", 50), // 命中
 	}}
 	if _, err := validateCondTree(&anyTree, 1); err != nil {
@@ -334,7 +336,7 @@ func seedWideStock(t *testing.T, symbol, name string, bars []datasource.Bar) {
 func TestScreenerScanEndToEnd(t *testing.T) {
 	setupTestDB(t)
 	cleanWideTables(t)
-	common.DB.Where("1 = 1").Delete(&model.ScreenerStrategy{})
+	cleanScreenerStrategies(t)
 	resetFactorTable()
 	defer resetFactorTable()
 
@@ -475,9 +477,19 @@ func resetFreshCacheOnly() {
 
 // ---------- 自定义策略 ----------
 
+func cleanScreenerStrategies(t *testing.T) {
+	t.Helper()
+	if err := common.DB.Exec("DELETE FROM screener_strategy_revisions").Error; err != nil {
+		t.Fatalf("清理策略 revision 失败: %v", err)
+	}
+	if err := common.DB.Exec("DELETE FROM screener_strategies").Error; err != nil {
+		t.Fatalf("清理策略失败: %v", err)
+	}
+}
+
 func TestScreenerStrategyCRUD(t *testing.T) {
 	setupTestDB(t)
-	common.DB.Where("1 = 1").Delete(&model.ScreenerStrategy{})
+	cleanScreenerStrategies(t)
 
 	svc := NewScreenerService()
 	tree := allOf(leafV("rsi_14", "<", 30), leafV("amount_yi", ">=", 1))
@@ -485,7 +497,8 @@ func TestScreenerStrategyCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("保存失败: %v", err)
 	}
-	if saved.ID == 0 || len(saved.Conditions) != 2 {
+	if saved.ID == 0 || saved.CurrentRevisionID == 0 || saved.Revision != 1 ||
+		len(saved.ContentHash) != 64 || len(saved.Conditions) != 2 {
 		t.Fatalf("保存结果异常: %+v", saved)
 	}
 	// 坏树被拦。
@@ -495,8 +508,14 @@ func TestScreenerStrategyCRUD(t *testing.T) {
 	}
 	// 更新。
 	tree2 := allOf(leafV("rsi_14", "<", 25))
-	if _, err := svc.SaveStrategy(1, SaveStrategyRequest{ID: saved.ID, Name: "超卖捡漏2", Tree: &tree2}); err != nil {
+	updated, err := svc.SaveStrategy(1, SaveStrategyRequest{
+		ID: saved.ID, BaseRevisionID: saved.CurrentRevisionID, Name: "超卖捡漏2", Tree: &tree2,
+	})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if updated.Revision != 2 || updated.CurrentRevisionID == saved.CurrentRevisionID {
+		t.Fatalf("更新必须新增 revision 2: %+v", updated)
 	}
 	// 列表（user 1 有、user 2 无）。
 	v1, _ := svc.Strategies(1)
@@ -514,7 +533,9 @@ func TestScreenerStrategyCRUD(t *testing.T) {
 		t.Fatal("user2 不应看到 user1 的策略")
 	}
 	// 跨用户改删被拦。
-	if _, err := svc.SaveStrategy(2, SaveStrategyRequest{ID: saved.ID, Name: "偷改", Tree: &tree}); err == nil {
+	if _, err := svc.SaveStrategy(2, SaveStrategyRequest{
+		ID: saved.ID, BaseRevisionID: updated.CurrentRevisionID, Name: "偷改", Tree: &tree,
+	}); err == nil {
 		t.Fatal("跨用户更新应失败")
 	}
 	if err := svc.DeleteStrategy(2, saved.ID); err == nil {
@@ -522,6 +543,231 @@ func TestScreenerStrategyCRUD(t *testing.T) {
 	}
 	if err := svc.DeleteStrategy(1, saved.ID); err != nil {
 		t.Fatal(err)
+	}
+	v1, err = svc.Strategies(1)
+	if err != nil || len(v1.Custom) != 0 {
+		t.Fatalf("归档策略不应出现在默认列表: %+v err=%v", v1.Custom, err)
+	}
+	history, err := svc.StrategyHistory(1, saved.ID)
+	if err != nil || len(history.Revisions) != 2 {
+		t.Fatalf("归档后历史必须保留: %+v err=%v", history, err)
+	}
+}
+
+func TestScreenerStrategyRevisionSequenceAndOptimisticLock(t *testing.T) {
+	setupTestDB(t)
+	cleanScreenerStrategies(t)
+	svc := NewScreenerService()
+
+	treeA := allOf(leafV("close", ">", 5))
+	v1, err := svc.SaveStrategy(11, SaveStrategyRequest{
+		Name: "策略A", Desc: "完整快照", Period: "swing", Risk: "mid", Tree: &treeA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unchanged, err := svc.SaveStrategy(11, SaveStrategyRequest{
+		ID: v1.ID, BaseRevisionID: v1.CurrentRevisionID,
+		Name: "策略A", Desc: "完整快照", Period: "swing", Risk: "mid", Tree: &treeA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged.CurrentRevisionID != v1.CurrentRevisionID || unchanged.Revision != 1 {
+		t.Fatalf("当前内容无变化应复用 revision 1: before=%+v after=%+v", v1, unchanged)
+	}
+
+	treeB := allOf(leafV("close", ">", 50))
+	v2, err := svc.SaveStrategy(11, SaveStrategyRequest{
+		ID: v1.ID, BaseRevisionID: v1.CurrentRevisionID,
+		Name: "策略B", Desc: "完整快照", Period: "short", Risk: "high", Tree: &treeB,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v3, err := svc.SaveStrategy(11, SaveStrategyRequest{
+		ID: v1.ID, BaseRevisionID: v2.CurrentRevisionID,
+		Name: "策略A", Desc: "完整快照", Period: "swing", Risk: "mid", Tree: &treeA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v2.Revision != 2 || v3.Revision != 3 || v3.CurrentRevisionID == v1.CurrentRevisionID {
+		t.Fatalf("A→B→A 必须产生连续三个 revision: v1=%+v v2=%+v v3=%+v", v1, v2, v3)
+	}
+	if v3.ContentHash != v1.ContentHash || v2.ContentHash == v1.ContentHash {
+		t.Fatalf("相同完整快照 hash 应稳定，变化快照应不同: %s %s %s", v1.ContentHash, v2.ContentHash, v3.ContentHash)
+	}
+
+	_, err = svc.SaveStrategy(11, SaveStrategyRequest{
+		ID: v1.ID, BaseRevisionID: v1.CurrentRevisionID,
+		Name: "策略A", Desc: "完整快照", Period: "swing", Risk: "mid", Tree: &treeA,
+	})
+	if !errors.Is(err, ErrStrategyRevisionConflict) {
+		t.Fatalf("旧页面保存必须返回乐观锁冲突，得到 %v", err)
+	}
+	history, err := svc.StrategyHistory(11, v1.ID)
+	if err != nil || len(history.Revisions) != 3 {
+		t.Fatalf("冲突不得产生 revision: %+v err=%v", history, err)
+	}
+	if history.Revisions[0].Revision != 3 || history.Revisions[2].Revision != 1 {
+		t.Fatalf("历史必须 revision DESC: %+v", history.Revisions)
+	}
+}
+
+func TestScreenerStrategyConcurrentSave(t *testing.T) {
+	setupTestDB(t)
+	cleanScreenerStrategies(t)
+	svc := NewScreenerService()
+	baseTree := allOf(leafV("close", ">", 5))
+	base, err := svc.SaveStrategy(21, SaveStrategyRequest{Name: "并发基线", Tree: &baseTree})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			tree := allOf(leafV("close", ">", float64(10+i)))
+			_, saveErr := svc.SaveStrategy(21, SaveStrategyRequest{
+				ID: base.ID, BaseRevisionID: base.CurrentRevisionID,
+				Name: fmt.Sprintf("并发版本%d", i), Tree: &tree,
+			})
+			errs <- saveErr
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	successes, conflicts := 0, 0
+	for saveErr := range errs {
+		switch {
+		case saveErr == nil:
+			successes++
+		case errors.Is(saveErr, ErrStrategyRevisionConflict):
+			conflicts++
+		default:
+			t.Fatalf("并发保存返回非预期错误: %v", saveErr)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("并发保存应恰好一成一冲突: success=%d conflict=%d", successes, conflicts)
+	}
+	history, err := svc.StrategyHistory(21, base.ID)
+	if err != nil || len(history.Revisions) != 2 || history.Revisions[0].Revision != 2 {
+		t.Fatalf("并发保存只能新增一个 revision 2: %+v err=%v", history, err)
+	}
+}
+
+func TestScreenerStrategyHistoryLimitIsolationAndRevisionAuthority(t *testing.T) {
+	setupTestDB(t)
+	cleanScreenerStrategies(t)
+	svc := NewScreenerService()
+	tree := allOf(leafV("close", ">", 1))
+	cur, err := svc.SaveStrategy(31, SaveStrategyRequest{Name: "版本01", Tree: &tree})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for revision := 2; revision <= 55; revision++ {
+		cur, err = svc.SaveStrategy(31, SaveStrategyRequest{
+			ID: cur.ID, BaseRevisionID: cur.CurrentRevisionID,
+			Name: fmt.Sprintf("版本%02d", revision), Tree: &tree,
+		})
+		if err != nil {
+			t.Fatalf("创建 revision %d: %v", revision, err)
+		}
+	}
+
+	// 主表只是兼容投影：即使被旧代码污染，默认列表仍必须展示 revision 快照。
+	if err := common.DB.Model(&model.ScreenerStrategy{}).Where("id = ?", cur.ID).
+		Updates(map[string]any{"name": "错误主表名", "tree_json": `{"factor":"close","op":">","value":999}`}).Error; err != nil {
+		t.Fatal(err)
+	}
+	listed, err := svc.Strategies(31)
+	if err != nil || len(listed.Custom) != 1 || listed.Custom[0].Name != "版本55" || listed.Custom[0].Revision != 55 {
+		t.Fatalf("列表必须以 current revision 为权威: %+v err=%v", listed, err)
+	}
+
+	history, err := svc.StrategyHistory(31, cur.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history.Revisions) != 50 || history.Revisions[0].Revision != 55 || history.Revisions[49].Revision != 6 {
+		t.Fatalf("历史最多 50 条且倒序: count=%d first=%d last=%d", len(history.Revisions), history.Revisions[0].Revision, history.Revisions[49].Revision)
+	}
+	if _, err := svc.StrategyHistory(32, cur.ID); err == nil {
+		t.Fatal("其他用户不得读取 revision 历史")
+	}
+}
+
+func TestScreenerOldRevisionReproducibleAfterEditAndArchive(t *testing.T) {
+	setupTestDB(t)
+	cleanWideTables(t)
+	cleanScreenerStrategies(t)
+	resetFactorTable()
+	defer resetFactorTable()
+	seedWideStock(t, "600100", "复现股", genTrendBars(80, 10, 0.2))
+
+	svc := NewScreenerService()
+	treeA := allOf(leafV("close", ">", 0))
+	v1, err := svc.SaveStrategy(41, SaveStrategyRequest{Name: "命中版本", Tree: &treeA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	treeB := allOf(leafV("close", ">", 100000))
+	v2, err := svc.SaveStrategy(41, SaveStrategyRequest{
+		ID: v1.ID, BaseRevisionID: v1.CurrentRevisionID, Name: "不命中版本", Tree: &treeB,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DeleteStrategy(41, v1.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	oldResult, err := svc.Scan(context.Background(), 41, ScanRequest{
+		StrategyID: v1.ID, StrategyRevisionID: v1.CurrentRevisionID,
+	})
+	if err != nil {
+		t.Fatalf("归档后显式旧 revision 仍应可扫描: %v", err)
+	}
+	if oldResult.Matched != 1 || oldResult.StrategyID != v1.ID ||
+		oldResult.StrategyRevisionID != v1.CurrentRevisionID || oldResult.StrategyRevision != 1 ||
+		oldResult.StrategyHash != v1.ContentHash {
+		t.Fatalf("旧 revision 扫描结果或元数据漂移: %+v", oldResult)
+	}
+	if oldResult.Strategy != "命中版本" ||
+		strings.Join(oldResult.Conditions, "|") != strings.Join(describeCondTree(&treeA), "|") {
+		t.Fatalf("旧 revision 扫描名称与条件漂移: %+v", oldResult)
+	}
+	currentResult, err := svc.Scan(context.Background(), 41, ScanRequest{StrategyID: v1.ID})
+	if err != nil {
+		t.Fatalf("归档策略当前 revision 仍应可复现: %v", err)
+	}
+	if currentResult.Matched != 0 || currentResult.StrategyRevisionID != v2.CurrentRevisionID ||
+		currentResult.StrategyRevision != 2 || currentResult.StrategyHash != v2.ContentHash {
+		t.Fatalf("未显式版本必须固定请求开始时 current revision: %+v", currentResult)
+	}
+
+	other, err := svc.SaveStrategy(41, SaveStrategyRequest{Name: "另一策略", Tree: &treeA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Scan(context.Background(), 41, ScanRequest{
+		StrategyID: v1.ID, StrategyRevisionID: other.CurrentRevisionID,
+	}); err == nil {
+		t.Fatal("revision 与 strategy 不匹配时必须拒绝")
+	}
+	if _, err := svc.Scan(context.Background(), 42, ScanRequest{
+		StrategyID: v1.ID, StrategyRevisionID: v1.CurrentRevisionID,
+	}); err == nil {
+		t.Fatal("其他用户不得扫描 revision")
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -433,6 +434,112 @@ func TestBacktestRunEndToEnd(t *testing.T) {
 	}
 }
 
+func TestBacktestPinsRevisionSnapshotDuringRun(t *testing.T) {
+	setupTestDB(t)
+	cleanScreenerStrategies(t)
+	axis := seedBacktestDB(t)
+	screener := NewScreenerService()
+	treeA := allOf(leafV("close", ">", 5))
+	v1, err := screener.SaveStrategy(51, SaveStrategyRequest{Name: "回测版本A", Tree: &treeA})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	enteredBench := make(chan struct{})
+	releaseBench := make(chan struct{})
+	var blockOnce sync.Once
+	backtest := &BacktestService{benchFn: func(ctx context.Context) []datasource.Bar {
+		blockOnce.Do(func() {
+			close(enteredBench)
+			<-releaseBench
+		})
+		return fakeBench(axis)
+	}}
+	type runOutcome struct {
+		result *BacktestResult
+		err    error
+	}
+	done := make(chan runOutcome, 1)
+	go func() {
+		result, runErr := backtest.Run(context.Background(), 51, BacktestRequest{
+			StrategyID: v1.ID, LookbackDays: 10, SignalCount: 2,
+			HoldDays: []int{2}, PerStockCap: 20000,
+		})
+		done <- runOutcome{result: result, err: runErr}
+	}()
+	select {
+	case <-enteredBench:
+	case <-time.After(3 * time.Second):
+		t.Fatal("回测未进入基准读取阶段")
+	}
+
+	// Run 已在进入 benchFn 前解析完 current revision；此时编辑并归档不得改变在途树。
+	treeB := allOf(leafV("close", ">", 50))
+	v2, err := screener.SaveStrategy(51, SaveStrategyRequest{
+		ID: v1.ID, BaseRevisionID: v1.CurrentRevisionID, Name: "回测版本B", Tree: &treeB,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := screener.DeleteStrategy(51, v1.ID); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseBench)
+	outcome := <-done
+	if outcome.err != nil {
+		t.Fatalf("在途回测失败: %v", outcome.err)
+	}
+	result := outcome.result
+	if result.StrategyRevisionID != v1.CurrentRevisionID || result.StrategyRevision != 1 ||
+		result.StrategyHash != v1.ContentHash || len(result.Stats) != 1 || result.Stats[0].Trades != 2 {
+		t.Fatalf("在途回测必须固定开始时 revision 1: %+v", result)
+	}
+	if result.Strategy != "回测版本A" || strings.Join(result.Conditions, "|") != strings.Join(describeCondTree(&treeA), "|") {
+		t.Fatalf("在途回测名称与条件必须来自 revision 1 快照: %+v", result)
+	}
+
+	// 归档后显式旧 revision 仍可复现；不传版本则读取已经切换的 current revision 2。
+	oldResult, err := backtest.Run(context.Background(), 51, BacktestRequest{
+		StrategyID: v1.ID, StrategyRevisionID: v1.CurrentRevisionID,
+		LookbackDays: 10, SignalCount: 2, HoldDays: []int{2}, PerStockCap: 20000,
+	})
+	if err != nil {
+		t.Fatalf("归档后旧 revision 回测失败: %v", err)
+	}
+	if oldResult.StrategyRevision != 1 || oldResult.StrategyHash != v1.ContentHash || oldResult.Stats[0].Trades != 2 {
+		t.Fatalf("旧 revision 回测不可复现: %+v", oldResult)
+	}
+	currentResult, err := backtest.Run(context.Background(), 51, BacktestRequest{
+		StrategyID: v1.ID, LookbackDays: 10, SignalCount: 2, HoldDays: []int{2}, PerStockCap: 20000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentResult.StrategyRevisionID != v2.CurrentRevisionID || currentResult.StrategyRevision != 2 ||
+		currentResult.StrategyHash != v2.ContentHash || currentResult.Stats[0].Trades != 0 {
+		t.Fatalf("后续回测应使用 revision 2: %+v", currentResult)
+	}
+	if currentResult.Strategy != "回测版本B" ||
+		strings.Join(currentResult.Conditions, "|") != strings.Join(describeCondTree(&treeB), "|") {
+		t.Fatalf("后续回测名称与条件必须来自 revision 2 快照: %+v", currentResult)
+	}
+
+	other, err := screener.SaveStrategy(51, SaveStrategyRequest{Name: "另一回测策略", Tree: &treeA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backtest.Run(context.Background(), 51, BacktestRequest{
+		StrategyID: v1.ID, StrategyRevisionID: other.CurrentRevisionID,
+	}); err == nil {
+		t.Fatal("回测必须拒绝与 strategy 不匹配的 revision")
+	}
+	if _, err := backtest.Run(context.Background(), 52, BacktestRequest{
+		StrategyID: v1.ID, StrategyRevisionID: v1.CurrentRevisionID,
+	}); err == nil {
+		t.Fatal("其他用户不得回测 revision")
+	}
+}
+
 // TestBacktestSTAsOf #8①：ST 按宇宙快照 as-of 各信号日判定——当前名称已戴 ST 帽但
 // 早期信号日 as-of 健康的股票，其健康期信号日不被整只剔除（防幸存者偏差）；始终 ST
 // 的股票仍整只剔除。对照旧口径（按当前名称整只剔）：本用例的「后来才 ST」股会被误剔、
@@ -464,11 +571,11 @@ func TestBacktestSTAsOf(t *testing.T) {
 
 	// 两只股：600008 始终 ST；600009 当前名称戴 ST 帽但 as-of 早信号日健康、晚信号日才 ST。
 	stocks := []struct {
-		symbol, name        string
-		stEarly, stLate     bool
+		symbol, name    string
+		stEarly, stLate bool
 	}{
-		{"600008", "ST老树", true, true},   // 全程 ST → 整只剔除
-		{"600009", "ST科技", false, true},  // 后来才 ST → 健康期信号日不得剔除
+		{"600008", "ST老树", true, true},  // 全程 ST → 整只剔除
+		{"600009", "ST科技", false, true}, // 后来才 ST → 健康期信号日不得剔除
 	}
 	for _, s := range stocks {
 		for _, b := range bars {

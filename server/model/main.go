@@ -55,6 +55,7 @@ func AllModels() []any {
 		&FinanceStatement{},
 		&MarketSyncState{},
 		&ScreenerStrategy{},
+		&ScreenerStrategyRevision{},
 		&LhbEntry{},
 		&LhbOrgDaily{},
 		&PopularityRank{},
@@ -90,6 +91,11 @@ func AllModels() []any {
 func Migrate() error {
 	common.SysLog("开始数据库自动迁移 ...")
 	if err := common.DB.AutoMigrate(AllModels()...); err != nil {
+		return err
+	}
+	// P0-4 存量自定义策略迁移（幂等）：为旧可变行固化 revision 1，并回填当前
+	// revision 指针。失败时阻断启动，避免新扫描继续从兼容字段读取无版本内容。
+	if err := MigrateScreenerStrategyRevisions(); err != nil {
 		return err
 	}
 	// 新增字符串列在旧库里可能是 SQL NULL，而 service 层统一把「尚无稳定身份」表示为
