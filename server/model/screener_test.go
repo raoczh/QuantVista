@@ -214,6 +214,16 @@ func TestScreenerStrategyRevisionImmutableAndUnique(t *testing.T) {
 	if stored.Name != "不可变" {
 		t.Errorf("不可变 revision 被更新: name=%q", stored.Name)
 	}
+	// UpdateColumn 会跳过 hooks；create-only 字段权限仍必须阻止快照被改写。
+	if err := db.Model(&revision).UpdateColumn("name", "绕过 hooks 覆盖").Error; err != nil {
+		t.Fatalf("UpdateColumn 应被字段权限静默忽略: %v", err)
+	}
+	if err := db.First(&stored, revision.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Name != "不可变" {
+		t.Fatalf("UpdateColumn 绕过了 revision 不可变约束: name=%q", stored.Name)
+	}
 
 	duplicate := revision
 	duplicate.ID = 0

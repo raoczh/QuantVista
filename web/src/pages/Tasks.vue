@@ -140,7 +140,6 @@ async function loadTaskRows() {
       {
         source: source.value,
         kind: kind.value,
-        status: status.value,
         limit: 100,
         include_system: isAdmin.value && includeSystem.value,
       },
@@ -169,15 +168,28 @@ watch(source, () => {
 })
 
 watch(kind, () => void refreshNow())
-watch(status, () => void refreshNow())
+
+function resetSystemOnlyFilters(): boolean {
+  if (source.value === 'data_sync') {
+    source.value = ''
+    return true
+  }
+  if (knownKindsBySource.data_sync.includes(kind.value)) {
+    kind.value = ''
+    return true
+  }
+  return false
+}
 
 watch(includeSystem, (enabled) => {
-  if (!enabled && source.value === 'data_sync') source.value = ''
-  else void refreshNow()
+  if (!enabled && resetSystemOnlyFilters()) return
+  void refreshNow()
 })
 
 watch(isAdmin, (admin) => {
-  if (!admin) includeSystem.value = false
+  if (admin) return
+  if (includeSystem.value) includeSystem.value = false
+  else resetSystemOnlyFilters()
 })
 
 onBeforeUnmount(() => requestController?.abort())

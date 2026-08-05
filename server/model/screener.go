@@ -44,16 +44,16 @@ type ScreenerStrategy struct {
 // 主表归档不会级联删除 revision，确保既有扫描和回测可继续按旧版本复现。
 type ScreenerStrategyRevision struct {
 	ID          int64     `gorm:"primaryKey" json:"id"`
-	UserID      int64     `gorm:"not null;index:idx_ssr_user_strategy" json:"user_id"`
-	StrategyID  int64     `gorm:"not null;index:idx_ssr_strategy_revision,unique;index:idx_ssr_user_strategy" json:"strategy_id"`
-	Revision    int       `gorm:"not null;index:idx_ssr_strategy_revision,unique" json:"revision"`
-	ContentHash string    `gorm:"size:64;not null" json:"content_hash"`
-	Name        string    `gorm:"size:64;not null" json:"name"`
-	Desc        string    `gorm:"size:256" json:"desc"`
-	Period      string    `gorm:"size:16;not null" json:"period"`
-	Risk        string    `gorm:"size:8;not null" json:"risk"`
-	TreeJSON    string    `gorm:"type:text;not null" json:"tree_json"`
-	CreatedAt   time.Time `json:"created_at"`
+	UserID      int64     `gorm:"not null;index:idx_ssr_user_strategy;<-:create" json:"user_id"`
+	StrategyID  int64     `gorm:"not null;index:idx_ssr_strategy_revision,unique;index:idx_ssr_user_strategy;<-:create" json:"strategy_id"`
+	Revision    int       `gorm:"not null;index:idx_ssr_strategy_revision,unique;<-:create" json:"revision"`
+	ContentHash string    `gorm:"size:64;not null;<-:create" json:"content_hash"`
+	Name        string    `gorm:"size:64;not null;<-:create" json:"name"`
+	Desc        string    `gorm:"size:256;<-:create" json:"desc"`
+	Period      string    `gorm:"size:16;not null;<-:create" json:"period"`
+	Risk        string    `gorm:"size:8;not null;<-:create" json:"risk"`
+	TreeJSON    string    `gorm:"type:text;not null;<-:create" json:"tree_json"`
+	CreatedAt   time.Time `gorm:"<-:create" json:"created_at"`
 }
 
 // ErrImmutableScreenerStrategyRevision 表示调用方尝试改写或删除历史策略快照。

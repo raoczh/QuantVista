@@ -103,6 +103,7 @@ async function send(allowStale?: boolean | Event) {
     message.warning('请输入要提问的股票代码')
     return
   }
+  releaseRouteTask()
   const startConvId = current.value?.id
   const payload: QaAskRequest = {
     conversation_id: startConvId,
@@ -141,6 +142,7 @@ async function trackQaTask(
   payload?: QaAskRequest,
   startConvId?: number,
   forceOpenResult = false,
+  expectedRouteEpoch?: number,
 ) {
   pollAbort?.abort()
   const controller = new AbortController()
@@ -156,14 +158,22 @@ async function trackQaTask(
             { signal: controller.signal, timeoutMs: 11 * 60 * 1000 },
           )
         : initial
-    if (forceOpenResult && routeTaskID() !== initial.id) return
+    if (
+      forceOpenResult &&
+      (routeTaskID() !== initial.id || (expectedRouteEpoch !== undefined && routeTaskEpoch !== expectedRouteEpoch))
+    )
+      return
     if (task.status === 'failed') {
       showTaskFailure(task.error || '问答任务失败', task.error_code || '', payload, startConvId)
       return
     }
     if (!task.result?.conversation_id) throw new Error('问答任务已完成，但未返回会话编号')
     const view = await getConversation(task.result.conversation_id)
-    if (forceOpenResult && routeTaskID() !== initial.id) return
+    if (
+      forceOpenResult &&
+      (routeTaskID() !== initial.id || (expectedRouteEpoch !== undefined && routeTaskEpoch !== expectedRouteEpoch))
+    )
+      return
 
     // 任务期间若用户切换了会话，只刷新历史，不用旧任务结果覆盖当前界面。
     if (forceOpenResult || current.value?.id === startConvId) {
@@ -178,7 +188,11 @@ async function trackQaTask(
     message.success(forceOpenResult ? '已打开任务结果' : '回答已生成')
   } catch (e) {
     if (isPollCancelled(e)) return
-    if (forceOpenResult && routeTaskID() !== initial.id) return
+    if (
+      forceOpenResult &&
+      (routeTaskID() !== initial.id || (expectedRouteEpoch !== undefined && routeTaskEpoch !== expectedRouteEpoch))
+    )
+      return
     showTaskFailure((e as Error).message || '问答任务状态读取失败', getApiErrorCode(e) || '', payload, startConvId)
   } finally {
     if (pollAbort === controller) {
@@ -213,6 +227,7 @@ async function submitQaTask(payload: QaAskRequest, startConvId?: number) {
 }
 
 function newChat() {
+  releaseRouteTask()
   current.value = null
   symbol.value = ''
   question.value = ''
@@ -291,7 +306,21 @@ function routeTaskID(): number | null {
 
 let restoredRouteTaskID: number | null = null
 let restoringRouteTaskID: number | null = null
+let restoringRouteTaskEpoch = -1
 let routeTaskTrackingID: number | null = null
+let routeTaskEpoch = 0
+
+function releaseRouteTask() {
+  if (!routeTaskID()) return
+  routeTaskEpoch++
+  restoredRouteTaskID = null
+  routeTaskTrackingID = null
+  pollAbort?.abort()
+  const query = { ...route.query }
+  delete query.task_id
+  void router.replace({ name: 'qa', query })
+}
+
 async function restoreRouteTask(): Promise<boolean> {
   const id = routeTaskID()
   if (!id) {
@@ -302,35 +331,45 @@ async function restoreRouteTask(): Promise<boolean> {
     }
     return false
   }
-  if (restoredRouteTaskID === id || restoringRouteTaskID === id) return true
+  if (
+    restoredRouteTaskID === id ||
+    (restoringRouteTaskID === id && restoringRouteTaskEpoch === routeTaskEpoch)
+  )
+    return true
 
+  const epoch = routeTaskEpoch
   restoringRouteTaskID = id
+  restoringRouteTaskEpoch = epoch
   pollAbort?.abort()
   current.value = null
   taskError.value = ''
   taskErrorCode.value = ''
   try {
     const task = await getLLMTask<QaTaskResult>(id)
-    if (routeTaskID() !== id) return true
+    if (routeTaskID() !== id || routeTaskEpoch !== epoch) return true
     restoredRouteTaskID = id
     if (task.kind !== 'qa') {
       showTaskFailure('该任务不是个股问答任务，无法在此页面打开')
       return true
     }
     routeTaskTrackingID = id
-    await trackQaTask(task, undefined, undefined, true)
+    await trackQaTask(task, undefined, undefined, true, epoch)
   } catch (e) {
-    if (routeTaskID() === id) {
+    if (routeTaskID() === id && routeTaskEpoch === epoch) {
       showTaskFailure((e as Error).message || '问答任务状态读取失败', getApiErrorCode(e) || '')
     }
   } finally {
-    if (restoringRouteTaskID === id) restoringRouteTaskID = null
+    if (restoringRouteTaskID === id && restoringRouteTaskEpoch === epoch) {
+      restoringRouteTaskID = null
+      restoringRouteTaskEpoch = -1
+    }
     if (routeTaskTrackingID === id) routeTaskTrackingID = null
   }
   return true
 }
 
 async function openConv(c: QaConversation) {
+  releaseRouteTask()
   try {
     current.value = await getConversation(c.id)
     taskError.value = ''

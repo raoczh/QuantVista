@@ -20,6 +20,7 @@ const router = useRouter()
 const route = useRoute()
 const { vars } = useUi()
 const tasks = ref<TaskCenterItem[]>([])
+const processingCount = ref(0)
 const show = ref(false)
 const loading = ref(false)
 const refreshing = ref(false)
@@ -27,9 +28,12 @@ const loadError = ref('')
 let requestController: AbortController | null = null
 
 const recent = computed(() => tasks.value.slice(0, 3))
-const processingCount = computed(() => tasks.value.filter((task) => task.status === 'processing').length)
 const hasProcessing = computed(() => processingCount.value > 0)
 const badgeText = computed(() => (processingCount.value > 99 ? '99+' : String(processingCount.value)))
+const processingSummary = computed(() => {
+  if (!processingCount.value) return '当前无运行任务'
+  return processingCount.value >= 100 ? '至少 100 项运行中' : `${processingCount.value} 项运行中`
+})
 const styleVars = computed(() => ({
   '--recent-border': vars.value.dividerColor,
   '--recent-muted': vars.value.textColor3,
@@ -45,9 +49,16 @@ async function loadRecentTasks() {
   refreshing.value = true
   loadError.value = ''
   try {
-    // limit=100 才能在单次轻量列表请求内同时得到准确的运行中数量与最近三项。
-    const rows = await listTasks({ limit: 100 }, controller.signal)
-    if (requestController === controller) tasks.value = rows
+    // 运行中任务单独筛选，避免较新的终态记录把较早的 processing 挤出全局窗口。
+    // 后端上限为 100；命中上限时 UI 明确显示“至少 100”。
+    const [rows, processing] = await Promise.all([
+      listTasks({ limit: 3 }, controller.signal),
+      listTasks({ status: 'processing', limit: 100 }, controller.signal),
+    ])
+    if (requestController === controller) {
+      tasks.value = rows
+      processingCount.value = processing.length
+    }
   } catch (error) {
     if (!isAbortError(error) && requestController === controller) loadError.value = (error as Error).message
   } finally {
@@ -105,7 +116,7 @@ function openAll() {
         type="button"
         class="recent-trigger"
         :class="{ running: hasProcessing, refreshing }"
-        :aria-label="processingCount ? `最近任务，${processingCount} 项运行中` : '最近任务'"
+        :aria-label="processingCount ? `最近任务，${processingSummary}` : '最近任务'"
         title="最近任务"
       >
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
@@ -121,7 +132,7 @@ function openAll() {
         <div>
           <div class="recent-title">最近任务</div>
           <div class="recent-summary qv-tnum">
-            {{ processingCount ? `${processingCount} 项运行中` : '当前无运行任务' }}
+            {{ processingSummary }}
           </div>
         </div>
         <n-button size="tiny" quaternary :loading="refreshing" @click="refreshNow()">刷新</n-button>

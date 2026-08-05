@@ -19,6 +19,7 @@ Go API Server
   +-- Tracking Service
   +-- Settings Service
   +-- Job Service
+  +-- Task Center Service
   |
   +-- MySQL（生产，宝塔托管）/ SQLite（开发）
   +-- Redis
@@ -494,6 +495,14 @@ AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yiel
 后两者顺序不可交换：两轮消费同一批本地数据，守护轮先落 `guard_events` 台账，
 复核轮的 `pos_ma_break` / `pos_lhb_sell` 推送才不会与它交叉。
 
+### 5.9.1 Task Center Service（Top50 P0-2A）
+
+`GET /api/tasks` 是现有异步业务表之上的只读轻量聚合层：默认按当前用户汇总分析、推荐、日报与通用 LLM 任务；只有管理员显式传 `include_system=1` 时，才附加没有用户归属的系统同步终态历史。各来源各执行一次有界、字段白名单查询，不读取结果正文、数据快照或请求 hash；单个来源失败时返回 `partial/degraded_sources`，其余来源仍可使用。
+
+所有来源统一映射状态、耗时、错误码、恢复建议与仅含记录 ID 的结果深链。15 分钟未更新的用户侧 `processing` 任务由各自业务服务按同一口径惰性收敛为 `failed`；顶栏最近任务与 processing 数量分别查询，达到 100 条上限时只能展示“至少 N 项”，不能把截断值当精确总数。
+
+P0-2A 不提供 `job_runs/job_steps`、事实阶段、取消、持久输入重跑、SSE 事件流、bounded worker 或积压观测。模型、provider、token、trace 等元数据只在原业务表真实具备时透传；系统同步目前只有终态日志，禁止由摘要层补造进度或可重放请求。
+
 ### 5.10 扩展模块（N/F/T/S/M/P3 批次 + 2026-07 杂项批）
 
 各批次陆续落地的独立 service 模块（批次交付记录见 [DEVELOPMENT_PLAN](DEVELOPMENT_PLAN.md)，接口速查见 REFERENCE_ANALYSIS §6）：
@@ -502,7 +511,7 @@ AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yiel
 - **finance / finance_f10**（F1/F2）：财报日历/业绩预告/快报增量刷新 + F10 主要财务指标与三大报表关键科目按需缓存 + 公告采集，入个股详情财务块、长线推荐 fin 因子、财报提醒。
 - **indicator / chip**（T1）：MACD/BOLL/RSI/ATR 纯函数指标库（Wilder 口径）、筹码峰三角衰减复算、五维技术评分升级，供个股详情副图与推荐量化评分。
 - **riskgate / breaker / health**（S1）：风险闸门（ST/一字板/流动性/小市值进 AI prompt 与前端标签）、东财 push2 族域名断路器、数据源健康滑窗；问答流式输出同批。
-- **marketwide / factortable / screener**（M1）：全市场日线地基（宇宙字典/历史初始化/除权双层检测重锚）、**63 因子**列式宽表（C10/C12 起含 `div_yield` 股息率与 10 个 K 线形态布尔因子，见 `kpattern.go`；**形态是描述性因子，不进任何评分权重**）、条件树 DSL 选股（21 内置白话策略+自定义策略），`/screener` 页；策略信号进推荐候选池。自定义策略以 `screener_strategy_revisions` 不可变快照为执行权威，主表只保留当前 revision 指针和兼容投影；升级时幂等补建存量 revision 1。编辑采用 `base_revision_id` 乐观锁并只追加 revision，删除语义为归档，历史快照不随之删除。
+- **marketwide / factortable / screener**（M1）：全市场日线地基（宇宙字典/历史初始化/除权双层检测重锚）、**63 因子**列式宽表（C10/C12 起含 `div_yield` 股息率与 10 个 K 线形态布尔因子，见 `kpattern.go`；**形态是描述性因子，不进任何评分权重**）、条件树 DSL 选股（21 内置白话策略+自定义策略），`/screener` 页；推荐候选池的 `strategy_signal` 当前仍只消费代码内置策略映射，自定义 revision 尚未进入推荐。自定义策略以 `screener_strategy_revisions` 追加快照为执行权威，主表只保留当前 revision 指针和兼容投影；升级时幂等补建存量 revision 1。编辑采用 `base_revision_id` 乐观锁并只追加 revision，删除语义为归档，历史快照不随之删除。
 - **backtest / analysis_asof**（M2）：回测时光机（A 股约束五件套/无未来泄露切片复算）、历史推荐批次回验 α 分布、分析 as_of 回溯诊断与 hindsight 事后核验，`/backtest` 页。自定义策略扫描/回测在请求开始时固定 `strategy_revision_id` 对应的条件树；未显式指定时只解析一次当时的当前指针，运行期间的策略编辑不会改变本次条件与 hash，结果回传 strategy/revision/hash 元数据供复现。
 - **mood / fundflow / emlhb**（M3a）：龙虎榜、涨停池/炸板率情绪聚合、股吧人气榜、主力资金流（排行+单股历史），入推荐加分项、市场分析情绪段与个股详情。
 - **intraday**（M3b）：腾讯 5 分钟线盘中因子（尾盘拉升/跳水/VWAP 偏离/重心上移），入短线推荐加分。
@@ -580,7 +589,7 @@ value=**低PB榜**(升序滤负PB)+成交额；growth=涨幅+换手+成交额；
 
 - 每次分析/推荐保存 **prompt 版本、策略版本、评分方法版本**；prompt/策略/评分迭代后，历史记录仍可定位当时方法、可横向比较。
 - 自定义选股策略 hash 对名称、说明、周期、风险和结构化规范后的完整条件树计算 SHA-256，不直接使用用户原始 JSON 文本；对象键序、空白和等价数字写法不造成 hash 漂移。
-- `(strategy_id, revision)` 唯一且 revision 行禁止更新/删除；同当前快照的重复保存复用当前 revision，内容变化（包括 A→B→A）按时间顺序继续追加。历史查询和显式旧版本执行均同时校验 `user_id` 与 `strategy_id`。
+- `(strategy_id, revision)` 唯一；应用层通过 GORM 更新/删除 hooks 与字段仅允许创建的权限阻止历史行被改写或删除，当前尚无数据库 trigger。对当前快照的重复保存复用当前 revision，内容变化（包括 A→B→A）按时间顺序继续追加。历史查询和显式旧版本执行均同时校验 `user_id` 与 `strategy_id`。
 
 ### 6.7 成本控制
 
@@ -669,6 +678,7 @@ AI 结果：
 - `/recommendations`：推荐历史与追踪（策略模板为页内下拉，无独立页）
 - `/qa`：个股 AI 问答
 - `/compare`：个股横向对比
+- `/tasks`：统一任务中心（P0-2A 只读摘要投影，支持状态/类型筛选、结果深链与失败恢复提示）
 - `/alerts`：提醒规则 + 推送通道
 - `/paper`：模拟交易
 - `/etf`：指数 ETF 交易（精选指数 ETF 行情 + 复用模拟盘买卖，2026-07-05）

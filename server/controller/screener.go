@@ -85,7 +85,8 @@ func (sc *ScreenerController) DeleteStrategy(c *gin.Context) {
 		common.ApiErrorMsg(c, err.Error())
 		return
 	}
-	common.ApiSuccess(c, gin.H{"archived": true})
+	// 归档是当前语义；保留 deleted=true，避免旧前端把成功响应误判为失败。
+	common.ApiSuccess(c, gin.H{"archived": true, "deleted": true})
 }
 
 // Parse POST /api/screener/parse —— AI 白话建策略：自然语言解析为条件树（P3c）。

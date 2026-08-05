@@ -731,12 +731,17 @@ func (s *ScreenerService) SaveStrategy(userID int64, req SaveStrategyRequest) (*
 	runTransaction := func() error {
 		return common.DB.Transaction(func(tx *gorm.DB) error {
 			if req.ID == 0 {
-				var n int64
-				if err := tx.Model(&model.ScreenerStrategy{}).
-					Where("user_id = ? AND archived_at IS NULL", userID).Count(&n).Error; err != nil {
+				// MySQL 用当前用户已有策略行的 next-key lock 串行化“计数+创建”，
+				// 防止两个页面同时在 49 条时都越过上限。SQLite 由下方事务重试收敛。
+				var active []model.ScreenerStrategy
+				activeQuery := tx.Select("id").Where("user_id = ? AND archived_at IS NULL", userID).Order("id ASC")
+				if tx.Dialector.Name() == "mysql" {
+					activeQuery = activeQuery.Clauses(clause.Locking{Strength: "UPDATE"})
+				}
+				if err := activeQuery.Find(&active).Error; err != nil {
 					return err
 				}
-				if n >= customStrategyMax {
+				if len(active) >= customStrategyMax {
 					return fmt.Errorf("自定义策略已达上限 %d 条", customStrategyMax)
 				}
 				strategy := model.ScreenerStrategy{
@@ -821,7 +826,7 @@ func (s *ScreenerService) SaveStrategy(userID int64, req SaveStrategyRequest) (*
 	}
 
 	attempts := 1
-	if req.ID > 0 && common.DB.Dialector.Name() == "sqlite" {
+	if common.DB.Dialector.Name() == "sqlite" {
 		attempts = 5
 	}
 	for attempt := 0; attempt < attempts; attempt++ {

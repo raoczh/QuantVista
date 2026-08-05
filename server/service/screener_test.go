@@ -665,6 +665,62 @@ func TestScreenerStrategyConcurrentSave(t *testing.T) {
 	}
 }
 
+func TestScreenerStrategyConcurrentCreateRespectsLimit(t *testing.T) {
+	setupTestDB(t)
+	cleanScreenerStrategies(t)
+	svc := NewScreenerService()
+	tree := allOf(leafV("close", ">", 1))
+	for i := 0; i < customStrategyMax-1; i++ {
+		if _, err := svc.SaveStrategy(22, SaveStrategyRequest{
+			Name: fmt.Sprintf("上限策略%02d", i+1), Tree: &tree,
+		}); err != nil {
+			t.Fatalf("预置第 %d 条策略: %v", i+1, err)
+		}
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := svc.SaveStrategy(22, SaveStrategyRequest{
+				Name: fmt.Sprintf("并发新建%d", i), Tree: &tree,
+			})
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	successes, limited := 0, 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			successes++
+		case strings.Contains(err.Error(), "已达上限"):
+			limited++
+		default:
+			t.Fatalf("并发新建返回非预期错误: %v", err)
+		}
+	}
+	if successes != 1 || limited != 1 {
+		t.Fatalf("49 条时并发新建应一成一拒: success=%d limited=%d", successes, limited)
+	}
+	var active int64
+	if err := common.DB.Model(&model.ScreenerStrategy{}).
+		Where("user_id = ? AND archived_at IS NULL", 22).Count(&active).Error; err != nil {
+		t.Fatal(err)
+	}
+	if active != customStrategyMax {
+		t.Fatalf("策略上限被并发穿透: got=%d want=%d", active, customStrategyMax)
+	}
+}
+
 func TestScreenerStrategyHistoryLimitIsolationAndRevisionAuthority(t *testing.T) {
 	setupTestDB(t)
 	cleanScreenerStrategies(t)
