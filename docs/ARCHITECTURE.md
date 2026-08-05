@@ -7,7 +7,7 @@ QuantVista 采用前后端分离的全栈架构：
 ```text
 Vue 前端
   |
-  | REST 为主；个股问答走 NDJSON 流式（S1），推荐/日报生成为异步任务+轮询（§6.10）
+  | REST 为主；个股问答走 NDJSON 流式（S1），作业事件走带 JWT 的 fetch SSE + 轮询回退（§6.10）
   v
 Go API Server
   |
@@ -551,7 +551,7 @@ LLM 的角色从「海选者」降级为「解释者/否决者」（listwise 海
 
 关键常量：`maxScanCandidates=48 / maxLLMCandidates=10 / maxPoolIntake=240 / poolSnapshotMax=150`。
 
-生成类 LLM 均为**异步任务**（推荐/日报自 2026-07-14，分析/问答/AI 对比/白话选股自 2026-07-22）：HTTP 入口只做确定性校验、配置/配额解析并落 `processing` 后立即返回；数据采集与全部 LLM 阶段在服务端 `context.Background()` 派生的有界 Context 中执行，前端轮询业务记录或 `llm_tasks` 直到终态。浏览器断开、反代 60s 超时和页面刷新都不会取消后台模型调用。推荐主调失败时既有量化降级语义保持不变；其他模块按各自失败/降级契约收尾，不用量化结果掩盖上游错误。
+生成类 LLM 均为**异步任务**（推荐/日报自 2026-07-14，分析/问答/AI 对比/白话选股自 2026-07-22）。P0-2B-1 起，`qa / compare / position_advice / screener_parse` 四类通用任务进入统一 `JobRun` 有界运行时；分析、推荐、日报与 `data_sync` 本批仍保留各自业务表/goroutine 的 legacy fallback，不代表 P0-2B 全量迁移完成。HTTP 入口只做确定性校验并立即返回；浏览器断开与页面刷新不取消后台模型调用。推荐主调失败时既有量化降级语义保持不变；其他模块按各自失败/降级契约收尾，不用量化结果掩盖上游错误。
 
 策略-来源映射（`strategySources`，对冲「热度榜供给的票恰是风控规则最想排除的票」的结构性矛盾）：
 momentum=涨幅+换手+成交额；pullback=**回调榜**(跌幅升序过滤温和回调)+成交额+涨幅；active=成交额+换手+涨幅；
@@ -621,10 +621,21 @@ value=**低PB榜**(升序滤负PB)+成交额；growth=涨幅+换手+成交额；
 
 背景：浏览器/入站反代与 LLM 中转站是两层不同的超时。后台任务解决前者取消请求 Context 的问题；真正 SSE 与单次输出预算解决后者的 60s 空闲/整包限制。只改前端轮询不能处理模型网关 504，必须同时满足以下约束：
 
-1. **异步任务化**：推荐/日报/分析复用各自业务表的 `processing` 状态；问答、AI 对比、白话选股复用通用 `llm_tasks`。同步入口不采集行情、不调用模型；后台 goroutine 使用独立 Context + 总 deadline（推荐 6min、日报 8min、分析/问答 10min、对比/白话选股 5min）。前端 `pollUntil` 轮询并可在刷新后恢复；15min 陈旧任务惰性收敛为 failed。
+1. **异步任务化**：推荐/日报/分析继续复用各自业务表的 `processing` 状态。问答、AI 对比、持仓建议、白话选股解析以 `JobRun` 为作业事实，`llm_tasks` 仅保留兼容结果载体和旧深链；同步入口不采集行情、不调用模型。四类统一作业使用固定 worker 数与总在途容量，满载稳定返回 `job_queue_busy`；各任务仍有独立总 deadline（问答 10min，其余三类 5min）。
 2. **真正流式调用**：所有业务 `chatCompletion` 先走 Chat/Responses SSE，`stream=true` 与防缓冲请求头在每个 fallback 请求中都保留；流式 client 无整体 HTTP timeout。只有上游明确以 4xx 拒绝 stream 时才回落整包请求，不能在 504、流中断或调用 Context 取消后静默改走非流式。
 3. **单次调用边界**：模块预算取 `min(用户 max_tokens, 模块上限)`；analysis/recommendation/qa/news=2500，trade_plan/rec_review/rec_bear/daily_report=1500，analysis_review/compare=1000，screener_parse=2000。全部结构化模块最多 1 次 repair，坏输出默认只回灌 600 字（日报 800 字）；业务 prompt 不再用字数、句数或性能型数组条数压缩模型回答，JSON schema、推荐数量、固定角色和逐 ID 映射等业务契约仍保留。Chat 端拒绝 `max_tokens` 时必须携同值改用 `max_completion_tokens`；Responses 始终携带 `max_output_tokens`。两种字段都不支持则失败，禁止删除 token 参数退成无上限生成。
 4. **业务降级边界**：只有推荐维持既有量化降级（ATR 规则计划价、action 恒 watch、置信度 low、`degraded_source=quant_fallback`）；鉴权/路径/配额类确定性错误直接失败。日报两路并行并保留旧报告回滚语义；其他模块按自身失败/结构化降级契约收尾。
+
+### 6.11 统一作业事实首批（P0-2B-1）
+
+本批范围严格限定为 `qa / compare / position_advice / screener_parse`。分析、推荐、日报和 `data_sync` 仍由任务中心作 legacy 投影；后续批次迁移前，不把它们伪装为 `JobRun`，也不宣称 P0-2B 已全部完成。
+
+- **事实模型**：`job_runs` 保存用户、kind、请求 hash、状态、父作业、错误、trace、模型/token/耗时/业务计数及原结果引用；`job_steps` 只记录真实发生的 `queued / dispatch / execute / persist`；`job_events` 用数据库自增主键提供全局单调 Event-ID。状态仅允许 `queued / running / success / degraded / failed / canceled`，所有终态更新均以当前状态和 `cancel_requested` 为条件做数据库 CAS，终态不能回退。
+- **快照边界**：`job_runs.request_snapshot` 是版本化、类型化且最大 16KiB 的业务请求，只包含重跑必需参数。创建前拒绝 API Key、Authorization、系统 prompt、消息数组与数据/结果快照字段；不保存 prompt 正文、大数据快照或结果正文。结果仍落原业务载体，本批用 `result_type=llm_task + result_id` 定位兼容结果。
+- **幂等与容量**：`(user_id, kind, request_hash)` 派生 `active_key`，仅 queued/running 持有并由唯一索引跨实例防重。运行时固定 4 个 worker、最多 32 个总在途作业，不再按请求无限创建 goroutine；满载不落孤儿 queued 行。
+- **取消与恢复**：queued 取消用 CAS 直接进入 canceled；running 先持久化 `cancel_requested`，本实例立即取消 Context，其他实例/恢复路径通过数据库轮询协作取消。成功持久化与取消在同一事务条件上竞争，只有一个终态获胜。启动时遗留 running 明确收敛为 `job_interrupted`（已请求取消者收敛 canceled），queued 按 ID 升序恢复，容量外的 queued 保持排队并随槽位释放续排。
+- **重跑**：仅失败且已注册的四类 handler 可重跑。重跑从旧 run 的持久快照创建新 run 并写 `parent_id`，旧 run 不修改；不支持的 kind 返回明确错误。
+- **事件与前端**：`GET /api/tasks/events` 位于 JWT 中间件后，支持 `Last-Event-ID`、单调 `id:`、`event: job` 与 15s heartbeat。前端用 `fetch` 的 `Authorization` 请求头读取流，token 从不进入 URL；断线指数重连并保留串行轮询回退。任务中心优先列 JobRun，查询旧 `llm_tasks` 时排除 `job_run_id IS NOT NULL`，从而避免双行；结果深链使用 `result_id`，旧 `/llm-tasks/:id` 与历史结果链接继续兼容。
 
 ## 7. 数据缓存策略
 

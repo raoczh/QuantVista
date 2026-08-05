@@ -20,7 +20,8 @@ func resetTaskCenterTestDB(t *testing.T) {
 	t.Helper()
 	setupTestDB(t)
 	for _, table := range []string{
-		"analysis_records", "recommendation_batches", "daily_reports", "llm_tasks", "data_sync_logs",
+		"job_events", "job_steps", "llm_tasks", "job_runs", "analysis_records",
+		"recommendation_batches", "daily_reports", "data_sync_logs",
 	} {
 		if err := common.DB.Exec("DELETE FROM " + table).Error; err != nil {
 			t.Fatalf("清理 %s 失败: %v", table, err)
@@ -181,8 +182,8 @@ func TestTaskCenterFiltersStableSortAndLimit(t *testing.T) {
 	if err != nil || len(stockItems) != 2 {
 		t.Fatalf("source/kind/status 联合筛选错误: items=%+v err=%v", stockItems, err)
 	}
-	qaItems, err := svc.List(1, model.RoleUser, TaskCenterListOptions{Kind: "qa", Status: TaskStatusProcessing})
-	if err != nil || len(qaItems) != 1 || qaItems[0].Source != TaskSourceLLM || qaItems[0].Stage != "processing" {
+	qaItems, err := svc.List(1, model.RoleUser, TaskCenterListOptions{Kind: "qa", Status: TaskStatusRunning})
+	if err != nil || len(qaItems) != 1 || qaItems[0].Source != TaskSourceLLM || qaItems[0].Stage != "running" {
 		t.Fatalf("跨来源 kind/status 筛选错误: items=%+v err=%v", qaItems, err)
 	}
 	wrongDailyKind, err := svc.List(1, model.RoleUser, TaskCenterListOptions{Source: TaskSourceDailyReport, Kind: "qa"})
@@ -281,7 +282,7 @@ func TestTaskCenterConvergesStaleTasksForCurrentUser(t *testing.T) {
 		}
 		if freshIDs[item.ID] {
 			seenFresh[item.ID] = true
-			if item.Status != TaskStatusProcessing || item.Stage != "processing" {
+			if item.Status != TaskStatusRunning || item.Stage != "running" {
 				t.Fatalf("新鲜 processing 不应被误判: %+v", item)
 			}
 		}
@@ -372,13 +373,13 @@ func TestTaskCenterUsesBoundedLightweightQueries(t *testing.T) {
 	recorder.mu.Lock()
 	selects := append([]string(nil), recorder.selects...)
 	recorder.mu.Unlock()
-	if len(selects) != 5 {
+	if len(selects) != 6 {
 		t.Fatalf("聚合应固定为每来源一次 SELECT、不得 N+1，got=%d sql=%v", len(selects), selects)
 	}
 	forbidden := []string{
 		"result_json", "data_snapshot", "candidate_pool", "rejected_json", "filters_json",
 		"review_json", "snapshot_json", "regime_json", "reflection_json", "llm_run_json",
-		"request_hash", "active_key",
+		"request_hash", "request_snapshot", "active_key",
 	}
 	for _, sql := range selects {
 		lower := strings.ToLower(sql)
@@ -387,5 +388,54 @@ func TestTaskCenterUsesBoundedLightweightQueries(t *testing.T) {
 				t.Fatalf("任务列表禁止读取大字段 %s: %s", column, sql)
 			}
 		}
+	}
+}
+
+func TestTaskCenterPrefersJobRunAndExcludesLinkedLegacyRow(t *testing.T) {
+	resetTaskCenterTestDB(t)
+	now := time.Now()
+	run := model.JobRun{
+		UserID: 21, Kind: JobKindQA, RequestHash: strings.Repeat("a", 64),
+		Status: model.JobStatusFailed, SnapshotVersion: jobSnapshotVersion,
+		RequestSnapshot: `{"version":1,"kind":"qa","allow_private":false,"request":{"question":"x"}}`,
+		ResultType:      "llm_task", Error: "failed", ErrorCode: AsyncLLMTaskErrorFailed,
+		QueuedAt: now, FinishedAt: &now, CreatedAt: now, UpdatedAt: now,
+	}
+	createTaskCenterRow(t, &run)
+	linked := model.LLMTask{UserID: 21, Kind: JobKindQA, JobRunID: &run.ID,
+		RequestHash: run.RequestHash, Status: model.LLMTaskStatusFailed,
+		CreatedAt: now, UpdatedAt: now}
+	createTaskCenterRow(t, &linked)
+	if err := common.DB.Model(&model.JobRun{}).Where("id = ?", run.ID).Update("result_id", linked.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	createTaskCenterRow(t, &model.JobStep{JobRunID: run.ID, Sequence: 1, Name: model.JobStepQueued,
+		Status: model.JobStatusSuccess, StartedAt: &now, FinishedAt: &now})
+	legacy := model.LLMTask{UserID: 21, Kind: JobKindCompare, RequestHash: strings.Repeat("b", 64),
+		Status: model.LLMTaskStatusSuccess, CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute)}
+	createTaskCenterRow(t, &legacy)
+
+	items, err := NewTaskCenterService().List(21, model.RoleUser, TaskCenterListOptions{IncludeSteps: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("关联 llm_tasks 必须排除，保留 JobRun 与未关联旧任务: %+v", items)
+	}
+	var jobItem, legacyItem *TaskCenterItem
+	for i := range items {
+		switch items[i].Source {
+		case TaskSourceJob:
+			jobItem = &items[i]
+		case TaskSourceLLM:
+			legacyItem = &items[i]
+		}
+	}
+	if jobItem == nil || jobItem.SourceID != run.ID || jobItem.ResultID != linked.ID ||
+		!jobItem.CanRetry || jobItem.CanCancel || len(jobItem.Steps) != 1 {
+		t.Fatalf("JobRun 事实投影不完整: %+v", jobItem)
+	}
+	if legacyItem == nil || legacyItem.SourceID != legacy.ID {
+		t.Fatalf("未关联旧任务应继续兼容: %+v", legacyItem)
 	}
 }

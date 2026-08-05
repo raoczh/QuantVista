@@ -24,7 +24,9 @@ type QaService struct {
 }
 
 func NewQaService(market *MarketService, llm *LLMService) *QaService {
-	return &QaService{market: market, llm: llm}
+	svc := &QaService{market: market, llm: llm}
+	svc.registerDurableJobHandler()
+	return svc
 }
 
 const (
@@ -128,13 +130,36 @@ func (s *QaService) AskAsync(userID int64, allowPrivate bool, req QaAskRequest) 
 	if err != nil {
 		return nil, err
 	}
-	return StartAsyncLLMTask(userID, "qa", req, qaJobTimeout, func(ctx context.Context) (any, error) {
-		view, err := s.ask(ctx, userID, allowPrivate, req)
-		if err != nil {
-			return nil, err
-		}
-		return QaTaskResult{ConversationID: view.ID}, nil
-	})
+	s.registerDurableJobHandler()
+	return StartDurableLLMTask(userID, JobKindQA, req, allowPrivate)
+}
+
+func (s *QaService) registerDurableJobHandler() {
+	RegisterDurableLLMJobHandler(JobKindQA, qaJobTimeout,
+		func(ctx context.Context, userID int64, allowPrivate bool, raw json.RawMessage) (DurableJobResult, error) {
+			var req QaAskRequest
+			if err := json.Unmarshal(raw, &req); err != nil {
+				return DurableJobResult{}, fmt.Errorf("问答作业快照无效: %w", err)
+			}
+			view, err := s.Ask(ctx, userID, allowPrivate, req)
+			if err != nil {
+				return DurableJobResult{}, err
+			}
+			result := DurableJobResult{
+				Value: QaTaskResult{ConversationID: view.ID}, Status: model.JobStatusSuccess,
+				TraceID: view.TraceID, Provider: view.Provider, Model: view.Model,
+				Total: 1, Succeeded: 1,
+			}
+			for i := len(view.Messages) - 1; i >= 0; i-- {
+				if view.Messages[i].Role == model.QaRoleAssistant {
+					result.PromptTokens = view.Messages[i].PromptTokens
+					result.CompletionTokens = view.Messages[i].CompletionTokens
+					result.TotalTokens = view.Messages[i].TotalTokens
+					break
+				}
+			}
+			return result, nil
+		})
 }
 
 // Ask 提问（非流式）：新建会话（首轮采集快照）或在已有会话上追问。返回会话全量视图。

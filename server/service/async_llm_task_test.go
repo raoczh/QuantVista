@@ -15,8 +15,10 @@ import (
 func resetAsyncLLMTasks(t *testing.T) {
 	t.Helper()
 	setupTestDB(t)
-	if err := common.DB.Exec("DELETE FROM llm_tasks").Error; err != nil {
-		t.Fatalf("清理任务表失败: %v", err)
+	for _, table := range []string{"job_events", "job_steps", "llm_tasks", "job_runs"} {
+		if err := common.DB.Exec("DELETE FROM " + table).Error; err != nil {
+			t.Fatalf("清理任务表 %s 失败: %v", table, err)
+		}
 	}
 }
 

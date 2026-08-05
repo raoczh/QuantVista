@@ -19,13 +19,17 @@ const (
 	TaskSourceAnalysis       = "analysis"
 	TaskSourceRecommendation = "recommendation"
 	TaskSourceDailyReport    = "daily_report"
+	TaskSourceJob            = "job"
 	TaskSourceLLM            = "llm"
 	TaskSourceDataSync       = "data_sync"
 
-	TaskStatusProcessing = "processing"
+	TaskStatusQueued     = "queued"
+	TaskStatusRunning    = "running"
+	TaskStatusProcessing = "processing" // 仅用于兼容旧业务表 raw_status
 	TaskStatusSuccess    = "success"
 	TaskStatusDegraded   = "degraded"
 	TaskStatusFailed     = "failed"
+	TaskStatusCanceled   = "canceled"
 
 	defaultTaskCenterLimit = 50
 	maxTaskCenterLimit     = 100
@@ -36,6 +40,8 @@ type TaskCenterItem struct {
 	ID       string `json:"id"`
 	Source   string `json:"source"`
 	SourceID int64  `json:"source_id"`
+	ResultID int64  `json:"result_id,omitempty"`
+	ParentID *int64 `json:"parent_id,omitempty"`
 	Kind     string `json:"kind"`
 	Title    string `json:"title"`
 	Target   string `json:"target"`
@@ -53,9 +59,13 @@ type TaskCenterItem struct {
 	LatencyMs        int64  `json:"latency_ms"`
 	TraceID          string `json:"trace_id"`
 
-	Total     int `json:"total"`
-	Succeeded int `json:"succeeded"`
-	Failed    int `json:"failed"`
+	Total           int           `json:"total"`
+	Succeeded       int           `json:"succeeded"`
+	Failed          int           `json:"failed"`
+	CanCancel       bool          `json:"can_cancel"`
+	CanRetry        bool          `json:"can_retry"`
+	CancelRequested bool          `json:"cancel_requested"`
+	Steps           []JobStepView `json:"steps,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -68,6 +78,7 @@ type TaskCenterListOptions struct {
 	Status        string
 	Limit         int
 	IncludeSystem bool
+	IncludeSteps  bool
 }
 
 type TaskCenterService struct{}
@@ -99,6 +110,13 @@ func (s *TaskCenterService) List(userID int64, role string, options TaskCenterLi
 	}
 
 	items := make([]TaskCenterItem, 0, filters.limit*4)
+	if taskSourceSelected(filters.source, TaskSourceJob) {
+		rows, err := listJobRunTasks(common.DB, userID, filters, options.IncludeSteps)
+		if err != nil {
+			return nil, fmt.Errorf("查询统一作业失败: %w", err)
+		}
+		items = append(items, rows...)
+	}
 	if taskSourceSelected(filters.source, TaskSourceAnalysis) {
 		rows, err := listAnalysisTasks(common.DB, userID, filters)
 		if err != nil {
@@ -164,7 +182,7 @@ func normalizeTaskCenterFilters(options TaskCenterListOptions) (taskCenterFilter
 		f.limit = maxTaskCenterLimit
 	}
 	if _, ok := map[string]struct{}{
-		"": {}, TaskSourceAnalysis: {}, TaskSourceRecommendation: {}, TaskSourceDailyReport: {},
+		"": {}, TaskSourceAnalysis: {}, TaskSourceRecommendation: {}, TaskSourceDailyReport: {}, TaskSourceJob: {},
 		TaskSourceLLM: {}, TaskSourceDataSync: {},
 	}[f.source]; !ok {
 		return taskCenterFilters{}, errors.New("非法的任务来源筛选")
@@ -174,12 +192,14 @@ func normalizeTaskCenterFilters(options TaskCenterListOptions) (taskCenterFilter
 	}
 	switch f.status {
 	case "":
-	case TaskStatusProcessing, TaskStatusSuccess, TaskStatusFailed:
+	case TaskStatusRunning:
+		f.rawStatuses = []string{TaskStatusRunning, TaskStatusProcessing}
+	case TaskStatusQueued, TaskStatusCanceled, TaskStatusSuccess, TaskStatusFailed:
 		f.rawStatuses = []string{f.status}
 	case TaskStatusDegraded:
 		f.rawStatuses = []string{TaskStatusDegraded, model.ReportStatusPartial}
 	default:
-		return taskCenterFilters{}, errors.New("任务状态须为 processing、success、degraded 或 failed")
+		return taskCenterFilters{}, errors.New("任务状态须为 queued、running、success、degraded、failed 或 canceled")
 	}
 	return f, nil
 }
@@ -358,10 +378,59 @@ type llmTaskCenterRow struct {
 	UpdatedAt time.Time
 }
 
+func listJobRunTasks(db *gorm.DB, userID int64, filters taskCenterFilters, includeSteps bool) ([]TaskCenterItem, error) {
+	q := db.Model(&model.JobRun{}).
+		Select("id", "kind", "parent_id", "status", "result_id", "error", "error_code",
+			"trace_id", "provider", "model", "prompt_tokens", "completion_tokens", "total_tokens",
+			"latency_ms", "total", "succeeded", "failed", "cancel_requested", "created_at", "updated_at").
+		Where("user_id = ?", userID)
+	if filters.kind != "" {
+		q = q.Where("kind = ?", filters.kind)
+	}
+	q = applyTaskStatusFilter(q, filters)
+	var runs []model.JobRun
+	if err := q.Order("created_at DESC, id DESC").Limit(filters.limit).Find(&runs).Error; err != nil {
+		return nil, err
+	}
+	var steps map[int64][]JobStepView
+	if includeSteps {
+		ids := make([]int64, 0, len(runs))
+		for _, run := range runs {
+			ids = append(ids, run.ID)
+		}
+		var err error
+		steps, err = listJobSteps(ids)
+		if err != nil {
+			return nil, err
+		}
+	}
+	items := make([]TaskCenterItem, 0, len(runs))
+	for _, run := range runs {
+		resultID := int64(0)
+		if run.ResultID != nil {
+			resultID = *run.ResultID
+		}
+		items = append(items, TaskCenterItem{
+			ID: taskCompositeID(TaskSourceJob, run.ID), Source: TaskSourceJob, SourceID: run.ID,
+			ResultID: resultID, ParentID: run.ParentID, Kind: run.Kind, Title: llmTaskTitle(run.Kind),
+			Status: run.Status, RawStatus: run.Status, Stage: taskStage(run.Status),
+			Error: run.Error, ErrorCode: run.ErrorCode, TraceID: run.TraceID,
+			Provider: run.Provider, Model: run.Model, PromptTokens: run.PromptTokens,
+			CompletionTokens: run.CompletionTokens, TotalTokens: run.TotalTokens,
+			LatencyMs: run.LatencyMs, Total: run.Total, Succeeded: run.Succeeded, Failed: run.Failed,
+			CanCancel:       (run.Status == model.JobStatusQueued || run.Status == model.JobStatusRunning) && !run.CancelRequested,
+			CanRetry:        run.Status == model.JobStatusFailed && isDurableJobKind(run.Kind),
+			CancelRequested: run.CancelRequested,
+			Steps:           steps[run.ID], CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt,
+		})
+	}
+	return items, nil
+}
+
 func listLLMTasks(db *gorm.DB, userID int64, filters taskCenterFilters) ([]TaskCenterItem, error) {
 	q := db.Model(&model.LLMTask{}).
 		Select("id", "kind", "status", "error", "error_code", "created_at", "updated_at").
-		Where("user_id = ?", userID)
+		Where("user_id = ? AND job_run_id IS NULL", userID)
 	if filters.kind != "" {
 		q = q.Where("kind = ?", filters.kind)
 	}
@@ -427,20 +496,27 @@ func listDataSyncTasks(db *gorm.DB, filters taskCenterFilters) ([]TaskCenterItem
 
 func normalizeTaskStatus(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case TaskStatusProcessing:
-		return TaskStatusProcessing
+	case TaskStatusQueued:
+		return TaskStatusQueued
+	case TaskStatusProcessing, TaskStatusRunning:
+		return TaskStatusRunning
 	case TaskStatusSuccess:
 		return TaskStatusSuccess
 	case TaskStatusDegraded, model.ReportStatusPartial:
 		return TaskStatusDegraded
+	case TaskStatusCanceled:
+		return TaskStatusCanceled
 	default:
 		return TaskStatusFailed
 	}
 }
 
 func taskStage(status string) string {
-	if status == TaskStatusProcessing {
-		return "processing"
+	if status == TaskStatusQueued {
+		return TaskStatusQueued
+	}
+	if status == TaskStatusRunning {
+		return TaskStatusRunning
 	}
 	return "finished"
 }

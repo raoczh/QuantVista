@@ -1,10 +1,13 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"quantvista/model"
 	"quantvista/service"
@@ -40,11 +43,11 @@ func TestTaskCenterControllerParsesFiltersAndGuardsSystemTasks(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	stub := &taskCenterListerStub{items: []service.TaskCenterItem{{
 		ID: "llm:9", Source: service.TaskSourceLLM, SourceID: 9, Kind: "qa",
-		Status: service.TaskStatusProcessing, RawStatus: service.TaskStatusProcessing, Stage: "processing",
+		Status: service.TaskStatusRunning, RawStatus: service.TaskStatusProcessing, Stage: "running",
 	}}}
 	controller := NewTaskCenterController(stub)
 	c, w := taskCenterTestContext(
-		"/api/tasks?source=llm&kind=qa&status=processing&limit=120&include_system=1",
+		"/api/tasks?source=llm&kind=qa&status=running&limit=120&include_system=1&include_steps=1",
 		model.RoleUser,
 	)
 	controller.List(c)
@@ -52,7 +55,7 @@ func TestTaskCenterControllerParsesFiltersAndGuardsSystemTasks(t *testing.T) {
 		t.Fatalf("当前用户上下文未透传: uid=%d role=%s", stub.userID, stub.role)
 	}
 	if stub.options.Source != service.TaskSourceLLM || stub.options.Kind != "qa" ||
-		stub.options.Status != service.TaskStatusProcessing || stub.options.Limit != 120 {
+		stub.options.Status != service.TaskStatusRunning || stub.options.Limit != 120 || !stub.options.IncludeSteps {
 		t.Fatalf("筛选参数解析错误: %+v", stub.options)
 	}
 	if stub.options.IncludeSystem {
@@ -73,6 +76,72 @@ func TestTaskCenterControllerParsesFiltersAndGuardsSystemTasks(t *testing.T) {
 	adminController.List(adminContext)
 	if !adminStub.options.IncludeSystem || adminStub.options.Limit != 0 || adminStub.role != model.RoleAdmin {
 		t.Fatalf("管理员 include_system 或非法 limit 默认值处理错误: %+v role=%s", adminStub.options, adminStub.role)
+	}
+}
+
+type taskCenterJobsStub struct {
+	taskCenterListerStub
+	afterIDs []int64
+	events   []service.JobEventView
+}
+
+func (s *taskCenterJobsStub) GetJob(userID, id int64) (*service.JobRunView, error) {
+	return &service.JobRunView{ID: id, Kind: service.JobKindQA, Status: model.JobStatusRunning}, nil
+}
+
+func (s *taskCenterJobsStub) CancelJob(userID, id int64) (*service.JobRunView, error) {
+	return &service.JobRunView{ID: id, Kind: service.JobKindQA, Status: model.JobStatusCanceled}, nil
+}
+
+func (s *taskCenterJobsStub) RetryJob(userID, id int64) (*service.JobRunView, error) {
+	return &service.JobRunView{ID: id + 1, ParentID: &id, Kind: service.JobKindQA, Status: model.JobStatusQueued}, nil
+}
+
+func (s *taskCenterJobsStub) Events(userID, afterID, limit int64) ([]service.JobEventView, error) {
+	s.afterIDs = append(s.afterIDs, afterID)
+	rows := make([]service.JobEventView, 0, len(s.events))
+	for _, event := range s.events {
+		if event.ID > afterID {
+			rows = append(rows, event)
+		}
+	}
+	return rows, nil
+}
+
+func TestTaskCenterEventStreamResumesAndHeartbeats(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	stub := &taskCenterJobsStub{events: []service.JobEventView{{
+		ID: 9, JobRunID: 3, Type: "status", Status: model.JobStatusSuccess, CreatedAt: time.Now(),
+	}}}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	base := httptest.NewRequest("GET", "/api/tasks/events", nil)
+	base.Header.Set("Last-Event-ID", "8")
+	ctx, cancel := context.WithCancel(base.Context())
+	c.Request = base.WithContext(ctx)
+	c.Set("uid", int64(7))
+	c.Set("role", model.RoleUser)
+
+	oldPoll, oldHeartbeat := taskEventPollInterval, taskEventHeartbeatInterval
+	taskEventPollInterval = time.Hour
+	taskEventHeartbeatInterval = 5 * time.Millisecond
+	t.Cleanup(func() {
+		taskEventPollInterval = oldPoll
+		taskEventHeartbeatInterval = oldHeartbeat
+	})
+	time.AfterFunc(100*time.Millisecond, cancel)
+	NewTaskCenterController(stub).Events(c)
+
+	body := w.Body.String()
+	if len(stub.afterIDs) == 0 || stub.afterIDs[0] != 8 {
+		t.Fatalf("未从 Last-Event-ID 续传: after=%v", stub.afterIDs)
+	}
+	if !strings.Contains(body, "id: 9\n") || !strings.Contains(body, "event: job\n") ||
+		!strings.Contains(body, ": heartbeat\n\n") {
+		t.Fatalf("SSE 事件 ID/heartbeat 不完整: %q", body)
+	}
+	if contentType := w.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/event-stream") {
+		t.Fatalf("SSE Content-Type 错误: %s", contentType)
 	}
 }
 

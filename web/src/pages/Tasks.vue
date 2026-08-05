@@ -2,12 +2,15 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
-import { NAlert, NButton, NEmpty, NSelect, NSpin, NSwitch, NTag } from 'naive-ui'
+import { NAlert, NButton, NEmpty, NPopconfirm, NSelect, NSpin, NSwitch, NTag } from 'naive-ui'
 import {
+  JOB_STEP_LABELS,
   TASK_SOURCE_LABELS,
   TASK_STATUS_LABELS,
+  cancelJob,
   formatTaskTime,
   listTasks,
+  retryJob,
   taskActionLabel,
   taskDurationText,
   taskKindLabel,
@@ -40,12 +43,15 @@ const source = ref<TaskSource | ''>('')
 const kind = ref('')
 const status = ref<TaskStatus | ''>('')
 const includeSystem = ref(false)
+const actionJobID = ref<number | null>(null)
+const actionError = ref('')
 let requestController: AbortController | null = null
 
 const knownKindsBySource: Record<TaskSource, string[]> = {
   analysis: ['market', 'sector', 'stock', 'watchlist', 'position'],
   recommendation: ['short_term', 'long_term'],
   daily_report: ['daily_report'],
+  job: ['qa', 'compare', 'position_advice', 'screener_parse'],
   llm: ['qa', 'compare', 'position_advice', 'screener_parse'],
   data_sync: ['sync_daily_bars', 'backfill_calendar', 'snapshot_market', 'sync_market_wide', 'init_market_history'],
 }
@@ -60,7 +66,7 @@ const styleVars = computed(() => ({
 }))
 
 const sourceOptions = computed(() => {
-  const values: TaskSource[] = ['analysis', 'recommendation', 'daily_report', 'llm']
+  const values: TaskSource[] = ['job', 'analysis', 'recommendation', 'daily_report', 'llm']
   if (isAdmin.value && includeSystem.value) values.push('data_sync')
   return [
     { label: '全部来源', value: '' },
@@ -96,7 +102,7 @@ const kindOptions = computed(() => {
 
 const statusOptions = [
   { label: '全部状态', value: '' },
-  ...(['processing', 'success', 'degraded', 'failed'] as TaskStatus[]).map((value) => ({
+  ...(['queued', 'running', 'success', 'degraded', 'failed', 'canceled'] as TaskStatus[]).map((value) => ({
     label: TASK_STATUS_LABELS[value],
     value,
   })),
@@ -110,16 +116,20 @@ const visibleTasks = computed(() =>
     ? kindFilteredTasks.value.filter((task) => task.status === status.value)
     : kindFilteredTasks.value,
 )
-const hasProcessing = computed(() => sourceFilteredTasks.value.some((task) => task.status === 'processing'))
+const hasProcessing = computed(() =>
+  sourceFilteredTasks.value.some((task) => task.status === 'queued' || task.status === 'running'),
+)
 
 const statusStats = computed(() => {
   const colors: Record<TaskStatus, string> = {
-    processing: vars.value.infoColor,
+    queued: vars.value.infoColor,
+    running: vars.value.primaryColor,
     success: vars.value.successColor,
     degraded: vars.value.warningColor,
     failed: vars.value.errorColor,
+    canceled: vars.value.textColor3,
   }
-  return (['processing', 'success', 'degraded', 'failed'] as TaskStatus[]).map((value) => ({
+  return (['queued', 'running', 'success', 'degraded', 'failed', 'canceled'] as TaskStatus[]).map((value) => ({
     value,
     label: TASK_STATUS_LABELS[value],
     count: kindFilteredTasks.value.filter((task) => task.status === value).length,
@@ -142,6 +152,7 @@ async function loadTaskRows() {
         kind: kind.value,
         limit: 100,
         include_system: isAdmin.value && includeSystem.value,
+        include_steps: true,
       },
       controller.signal,
     )
@@ -159,6 +170,7 @@ async function loadTaskRows() {
 
 const { refreshNow } = useVisibleTaskPolling(loadTaskRows, () => hasProcessing.value, {
   activeIntervalMs: 4000,
+  idleIntervalMs: 30_000,
 })
 
 watch(source, () => {
@@ -195,9 +207,9 @@ watch(isAdmin, (admin) => {
 onBeforeUnmount(() => requestController?.abort())
 
 function statusTagType(value: TaskStatus): 'info' | 'success' | 'warning' | 'error' {
-  if (value === 'processing') return 'info'
+  if (value === 'queued' || value === 'running') return 'info'
   if (value === 'success') return 'success'
-  if (value === 'degraded') return 'warning'
+  if (value === 'degraded' || value === 'canceled') return 'warning'
   return 'error'
 }
 
@@ -215,7 +227,37 @@ function traceText(traceID: string) {
 }
 
 function showTaskError(task: TaskCenterItem) {
-  return task.status === 'failed' || task.status === 'degraded'
+  return task.status === 'failed' || task.status === 'degraded' || task.status === 'canceled'
+}
+
+function stepStatusText(status: TaskStatus) {
+  return TASK_STATUS_LABELS[status]
+}
+
+async function cancelTask(task: TaskCenterItem) {
+  actionError.value = ''
+  actionJobID.value = task.source_id
+  try {
+    await cancelJob(task.source_id)
+    await refreshNow()
+  } catch (error) {
+    actionError.value = (error as Error).message
+  } finally {
+    actionJobID.value = null
+  }
+}
+
+async function rerunTask(task: TaskCenterItem) {
+  actionError.value = ''
+  actionJobID.value = task.source_id
+  try {
+    await retryJob(task.source_id)
+    await refreshNow()
+  } catch (error) {
+    actionError.value = (error as Error).message
+  } finally {
+    actionJobID.value = null
+  }
 }
 
 function openTask(task: TaskCenterItem) {
@@ -225,7 +267,7 @@ function openTask(task: TaskCenterItem) {
 </script>
 
 <template>
-  <PageContainer title="任务中心" subtitle="分析、推荐、日报与后台 AI 任务">
+  <PageContainer title="任务中心" subtitle="统一作业事实与兼容业务任务">
     <template #actions>
       <n-button size="small" :loading="refreshing" @click="refreshNow">刷新</n-button>
     </template>
@@ -262,6 +304,9 @@ function openTask(task: TaskCenterItem) {
         <n-alert v-if="loadError" type="error" :bordered="false" title="任务列表读取失败" class="load-alert">
           {{ loadError }}
         </n-alert>
+        <n-alert v-if="actionError" type="error" :bordered="false" title="任务操作失败" class="load-alert">
+          {{ actionError }}
+        </n-alert>
 
         <n-spin :show="loading">
           <n-empty v-if="!visibleTasks.length && !loading" description="当前筛选下没有任务" class="task-empty" />
@@ -275,7 +320,7 @@ function openTask(task: TaskCenterItem) {
                   <th>模型</th>
                   <th class="num-cell">Token</th>
                   <th class="num-cell">耗时</th>
-                  <th>进度</th>
+                  <th>业务计数</th>
                   <th>状态说明</th>
                   <th>创建时间</th>
                   <th class="action-cell">操作</th>
@@ -290,6 +335,7 @@ function openTask(task: TaskCenterItem) {
                       <span>{{ taskKindLabel(task.kind) }}</span>
                       <span v-if="task.target">{{ task.target }}</span>
                       <span class="qv-mono">#{{ task.source_id }}</span>
+                      <span v-if="task.parent_id" class="qv-mono">重跑自 #{{ task.parent_id }}</span>
                     </div>
                     <div v-if="task.trace_id" class="task-trace qv-mono" :title="task.trace_id">
                       trace {{ traceText(task.trace_id) }}
@@ -311,21 +357,47 @@ function openTask(task: TaskCenterItem) {
                   <td class="num-cell qv-tnum">{{ taskDurationText(task) }}</td>
                   <td class="progress-cell qv-tnum">{{ taskProgressText(task) }}</td>
                   <td class="advice-cell">
+                    <ol v-if="task.steps?.length" class="task-steps" aria-label="事实步骤">
+                      <li v-for="step in task.steps" :key="step.id">
+                        <span>{{ JOB_STEP_LABELS[step.name] || step.name }}</span>
+                        <span class="step-status">{{ stepStatusText(step.status) }}</span>
+                      </li>
+                    </ol>
                     <div v-if="showTaskError(task) && task.error" class="task-error">{{ task.error }}</div>
                     <code v-if="task.error_code" class="error-code">{{ task.error_code }}</code>
                     <div class="recovery">{{ taskRecoveryAdvice(task) }}</div>
                   </td>
                   <td class="time-cell qv-tnum">{{ formatTaskTime(task.created_at) }}</td>
                   <td class="action-cell">
-                    <n-button
-                      v-if="taskActionLabel(task)"
-                      size="tiny"
-                      quaternary
-                      type="primary"
-                      @click="openTask(task)"
-                    >
-                      {{ taskActionLabel(task) }}
-                    </n-button>
+                    <div class="task-actions">
+                      <n-button
+                        v-if="taskActionLabel(task)"
+                        size="tiny"
+                        quaternary
+                        type="primary"
+                        @click="openTask(task)"
+                      >
+                        {{ taskActionLabel(task) }}
+                      </n-button>
+                      <n-popconfirm v-if="task.can_cancel" @positive-click="cancelTask(task)">
+                        <template #trigger>
+                          <n-button size="tiny" quaternary type="warning" :loading="actionJobID === task.source_id">
+                            取消
+                          </n-button>
+                        </template>
+                        确认请求取消该作业？运行中的模型调用会协作终止。
+                      </n-popconfirm>
+                      <n-button
+                        v-if="task.can_retry"
+                        size="tiny"
+                        quaternary
+                        type="primary"
+                        :loading="actionJobID === task.source_id"
+                        @click="rerunTask(task)"
+                      >
+                        重跑
+                      </n-button>
+                    </div>
                   </td>
                 </tr>
               </tbody>
@@ -341,6 +413,7 @@ function openTask(task: TaskCenterItem) {
                     <span>{{ taskSourceLabel(task.source) }}</span>
                     <span>{{ taskKindLabel(task.kind) }}</span>
                     <span class="qv-mono">#{{ task.source_id }}</span>
+                    <span v-if="task.parent_id" class="qv-mono">重跑自 #{{ task.parent_id }}</span>
                   </div>
                 </div>
                 <n-tag size="small" round :bordered="false" :type="statusTagType(task.status)">
@@ -374,6 +447,12 @@ function openTask(task: TaskCenterItem) {
                   <dd class="qv-tnum">{{ formatTaskTime(task.created_at) }}</dd>
                 </div>
               </dl>
+              <ol v-if="task.steps?.length" class="task-steps mobile-steps" aria-label="事实步骤">
+                <li v-for="step in task.steps" :key="step.id">
+                  <span>{{ JOB_STEP_LABELS[step.name] || step.name }}</span>
+                  <span class="step-status">{{ stepStatusText(step.status) }}</span>
+                </li>
+              </ol>
               <div v-if="showTaskError(task) && task.error" class="task-error mobile-error">{{ task.error }}</div>
               <code v-if="task.error_code" class="error-code">{{ task.error_code }}</code>
               <p class="recovery mobile-recovery">{{ taskRecoveryAdvice(task) }}</p>
@@ -381,15 +460,35 @@ function openTask(task: TaskCenterItem) {
                 <span v-if="task.raw_status && task.raw_status !== task.status" class="raw-status">
                   原始状态 {{ task.raw_status }}
                 </span>
-                <n-button
-                  v-if="taskActionLabel(task)"
-                  size="small"
-                  tertiary
-                  type="primary"
-                  @click="openTask(task)"
-                >
-                  {{ taskActionLabel(task) }}
-                </n-button>
+                <div class="task-actions">
+                  <n-button
+                    v-if="taskActionLabel(task)"
+                    size="small"
+                    tertiary
+                    type="primary"
+                    @click="openTask(task)"
+                  >
+                    {{ taskActionLabel(task) }}
+                  </n-button>
+                  <n-popconfirm v-if="task.can_cancel" @positive-click="cancelTask(task)">
+                    <template #trigger>
+                      <n-button size="small" tertiary type="warning" :loading="actionJobID === task.source_id">
+                        取消
+                      </n-button>
+                    </template>
+                    确认请求取消该作业？运行中的模型调用会协作终止。
+                  </n-popconfirm>
+                  <n-button
+                    v-if="task.can_retry"
+                    size="small"
+                    tertiary
+                    type="primary"
+                    :loading="actionJobID === task.source_id"
+                    @click="rerunTask(task)"
+                  >
+                    重跑
+                  </n-button>
+                </div>
               </div>
             </article>
           </div>
@@ -408,7 +507,7 @@ function openTask(task: TaskCenterItem) {
 
 .status-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 10px;
 }
 
@@ -506,7 +605,7 @@ function openTask(task: TaskCenterItem) {
 
 .task-table {
   width: 100%;
-  min-width: 1240px;
+  min-width: 1320px;
   border-collapse: collapse;
   table-layout: fixed;
 }
@@ -536,7 +635,7 @@ function openTask(task: TaskCenterItem) {
 .task-table th:nth-child(4) { width: 72px; }
 .task-table th:nth-child(5) { width: 72px; }
 .task-table th:nth-child(6) { width: 90px; }
-.task-table th:nth-child(7) { width: 260px; }
+.task-table th:nth-child(7) { width: 300px; }
 .task-table th:nth-child(8) { width: 150px; }
 .task-table th:nth-child(9) { width: 118px; }
 
@@ -609,6 +708,29 @@ function openTask(task: TaskCenterItem) {
   -webkit-line-clamp: 2;
 }
 
+.task-steps {
+  display: flex;
+  margin: 0 0 7px;
+  padding: 0;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  list-style: none;
+}
+
+.task-steps li {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.step-status {
+  color: var(--task-muted);
+  font-size: 10px;
+}
+
 .error-code {
   display: inline-block;
   max-width: 100%;
@@ -635,13 +757,21 @@ function openTask(task: TaskCenterItem) {
   text-align: right !important;
 }
 
+.task-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+
 .mobile-list {
   display: none;
 }
 
 @media (max-width: 900px) {
   .status-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
 
@@ -728,6 +858,10 @@ function openTask(task: TaskCenterItem) {
     margin-top: 10px;
   }
 
+  .mobile-steps {
+    margin-top: 10px;
+  }
+
   .mobile-recovery {
     margin: 8px 0 0;
   }
@@ -743,6 +877,10 @@ function openTask(task: TaskCenterItem) {
 }
 
 @media (max-width: 420px) {
+  .status-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .status-stat {
     min-height: 68px;
     padding: 12px;

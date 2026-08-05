@@ -25,7 +25,7 @@ import (
 //   - **fail-closed**：无 fresh 行情的持仓不进请求（旧价上的割/守/补结论是有害的），
 //     一笔都没有则整体拒答 insufficient_fresh_quotes；
 //   - **结论进证据核验值域**：模型引用的数字与快照比对，编造的会被标记展示；
-//   - **走 llm_tasks 后台任务**：HTTP 秒回任务 id，前端轮询，浏览器断开不取消模型调用。
+//   - **走统一 JobRun**：HTTP 仍返回兼容 llm_task id，旧前端轮询与深链保持可用。
 
 const (
 	// positionAdvicePromptVersion 建议 prompt 版本（改措辞/枚举语义必须递增，审计按它归因）。
@@ -49,7 +49,9 @@ type PositionAdviceService struct {
 }
 
 func NewPositionAdviceService(position *PositionService, llm *LLMService) *PositionAdviceService {
-	return &PositionAdviceService{position: position, llm: llm}
+	svc := &PositionAdviceService{position: position, llm: llm}
+	svc.registerDurableJobHandler()
+	return svc
 }
 
 // PositionAdvice 单笔持仓的结论。
@@ -70,7 +72,7 @@ type PositionAdvice struct {
 	Invalidation string `json:"invalidation"`
 }
 
-// PositionAdviceResult 一次建议的完整结果（落 llm_tasks 的 result_json）。
+// PositionAdviceResult 一次建议的完整结果（落兼容 llm_tasks.result_json，JobRun 只存引用）。
 type PositionAdviceResult struct {
 	Advices     []PositionAdvice `json:"advices"`
 	GeneratedAt string           `json:"generated_at"`
@@ -159,9 +161,27 @@ func (s *PositionAdviceService) AdviseAsync(userID int64, allowPrivate bool, req
 		return nil, errors.New("持仓建议服务不可用")
 	}
 	req.Symbol = strings.TrimSpace(req.Symbol)
-	return StartAsyncLLMTask(userID, "position_advice", req, positionAdviceJobTimeout,
-		func(ctx context.Context) (any, error) {
-			return s.Advise(ctx, userID, allowPrivate, req)
+	s.registerDurableJobHandler()
+	return StartDurableLLMTask(userID, JobKindPositionAdvice, req, allowPrivate)
+}
+
+func (s *PositionAdviceService) registerDurableJobHandler() {
+	RegisterDurableLLMJobHandler(JobKindPositionAdvice, positionAdviceJobTimeout,
+		func(ctx context.Context, userID int64, allowPrivate bool, raw json.RawMessage) (DurableJobResult, error) {
+			var req PositionAdviceRequest
+			if err := json.Unmarshal(raw, &req); err != nil {
+				return DurableJobResult{}, fmt.Errorf("持仓建议作业快照无效: %w", err)
+			}
+			result, err := s.Advise(ctx, userID, allowPrivate, req)
+			if err != nil {
+				return DurableJobResult{}, err
+			}
+			return DurableJobResult{
+				Value: result, Status: model.JobStatusSuccess, TraceID: result.TraceID,
+				Provider: result.Provider, Model: result.Model,
+				Total: result.Analyzed, Succeeded: len(result.Advices),
+				Failed: max(0, result.Analyzed-len(result.Advices)),
+			}, nil
 		})
 }
 

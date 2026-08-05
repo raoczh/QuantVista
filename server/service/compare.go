@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -20,7 +21,9 @@ type CompareService struct {
 }
 
 func NewCompareService(market *MarketService, llm *LLMService) *CompareService {
-	return &CompareService{market: market, llm: llm}
+	svc := &CompareService{market: market, llm: llm}
+	svc.registerDurableJobHandler()
+	return svc
 }
 
 const (
@@ -150,14 +153,43 @@ func (s *CompareService) Compare(ctx context.Context, userID int64, allowPrivate
 // CompareAsync 将带 AI 点评的对比放入通用 LLM 后台任务。HTTP 请求只负责
 // 校验和建任务，行情采集与 LLM 调用使用独立 context，不受上游断连影响。
 func (s *CompareService) CompareAsync(userID int64, allowPrivate bool, req CompareRequest) (*LLMTaskView, error) {
-	_, _, err := normalizeCompareRequest(req)
+	refs, _, err := normalizeCompareRequest(req)
 	if err != nil {
 		return nil, err
 	}
+	req.Symbols = refs
 	req.WithAI = true
-	return StartAsyncLLMTask(userID, "compare", req, compareJobTimeout, func(ctx context.Context) (any, error) {
-		return s.Compare(ctx, userID, allowPrivate, req)
-	})
+	s.registerDurableJobHandler()
+	return StartDurableLLMTask(userID, JobKindCompare, req, allowPrivate)
+}
+
+func (s *CompareService) registerDurableJobHandler() {
+	RegisterDurableLLMJobHandler(JobKindCompare, compareJobTimeout,
+		func(ctx context.Context, userID int64, allowPrivate bool, raw json.RawMessage) (DurableJobResult, error) {
+			var req CompareRequest
+			if err := json.Unmarshal(raw, &req); err != nil {
+				return DurableJobResult{}, fmt.Errorf("对比作业快照无效: %w", err)
+			}
+			result, err := s.Compare(ctx, userID, allowPrivate, req)
+			if err != nil {
+				return DurableJobResult{}, err
+			}
+			status := model.JobStatusSuccess
+			if req.WithAI && result.AIRefusalCode != "" {
+				status = model.JobStatusDegraded
+			}
+			fresh := 0
+			for _, row := range result.Rows {
+				if row.QuoteOK {
+					fresh++
+				}
+			}
+			return DurableJobResult{
+				Value: result, Status: status, TraceID: result.AITraceID,
+				Provider: result.AIProvider, Model: result.AIModel,
+				Total: len(result.Rows), Succeeded: fresh, Failed: len(result.Rows) - fresh,
+			}, nil
+		})
 }
 
 // normalizeCompareRequest 规整、去重并限制对比标的数量。同步与异步入口共用，

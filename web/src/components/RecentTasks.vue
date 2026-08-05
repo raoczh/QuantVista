@@ -20,7 +20,7 @@ const router = useRouter()
 const route = useRoute()
 const { vars } = useUi()
 const tasks = ref<TaskCenterItem[]>([])
-const processingCount = ref(0)
+const activeCount = ref(0)
 const show = ref(false)
 const loading = ref(false)
 const refreshing = ref(false)
@@ -28,11 +28,11 @@ const loadError = ref('')
 let requestController: AbortController | null = null
 
 const recent = computed(() => tasks.value.slice(0, 3))
-const hasProcessing = computed(() => processingCount.value > 0)
-const badgeText = computed(() => (processingCount.value > 99 ? '99+' : String(processingCount.value)))
+const hasProcessing = computed(() => activeCount.value > 0)
+const badgeText = computed(() => (activeCount.value > 99 ? '99+' : String(activeCount.value)))
 const processingSummary = computed(() => {
-  if (!processingCount.value) return '当前无运行任务'
-  return processingCount.value >= 100 ? '至少 100 项运行中' : `${processingCount.value} 项运行中`
+  if (!activeCount.value) return '当前无进行中任务'
+  return activeCount.value >= 100 ? '至少 100 项进行中' : `${activeCount.value} 项进行中`
 })
 const styleVars = computed(() => ({
   '--recent-border': vars.value.dividerColor,
@@ -49,15 +49,16 @@ async function loadRecentTasks() {
   refreshing.value = true
   loadError.value = ''
   try {
-    // 运行中任务单独筛选，避免较新的终态记录把较早的 processing 挤出全局窗口。
-    // 后端上限为 100；命中上限时 UI 明确显示“至少 100”。
-    const [rows, processing] = await Promise.all([
+    // queued/running 分开读取，避免较新的终态记录把较早的活跃作业挤出窗口。
+    // 两个轻量摘要查询都不加载步骤或结果正文。
+    const [rows, running, queued] = await Promise.all([
       listTasks({ limit: 3 }, controller.signal),
-      listTasks({ status: 'processing', limit: 100 }, controller.signal),
+      listTasks({ status: 'running', limit: 100 }, controller.signal),
+      listTasks({ status: 'queued', limit: 100 }, controller.signal),
     ])
     if (requestController === controller) {
       tasks.value = rows
-      processingCount.value = processing.length
+      activeCount.value = running.length + queued.length
     }
   } catch (error) {
     if (!isAbortError(error) && requestController === controller) loadError.value = (error as Error).message
@@ -83,9 +84,9 @@ watch(show, (visible) => {
 onBeforeUnmount(() => requestController?.abort())
 
 function statusTagType(value: TaskStatus): 'info' | 'success' | 'warning' | 'error' {
-  if (value === 'processing') return 'info'
+  if (value === 'queued' || value === 'running') return 'info'
   if (value === 'success') return 'success'
-  if (value === 'degraded') return 'warning'
+  if (value === 'degraded' || value === 'canceled') return 'warning'
   return 'error'
 }
 
@@ -116,14 +117,14 @@ function openAll() {
         type="button"
         class="recent-trigger"
         :class="{ running: hasProcessing, refreshing }"
-        :aria-label="processingCount ? `最近任务，${processingSummary}` : '最近任务'"
+        :aria-label="activeCount ? `最近任务，${processingSummary}` : '最近任务'"
         title="最近任务"
       >
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
           <circle cx="12" cy="12" r="8" />
           <path d="M12 7v5l3 2" />
         </svg>
-        <span v-if="processingCount" class="running-badge qv-tnum" aria-hidden="true">{{ badgeText }}</span>
+        <span v-if="activeCount" class="running-badge qv-tnum" aria-hidden="true">{{ badgeText }}</span>
       </button>
     </template>
 

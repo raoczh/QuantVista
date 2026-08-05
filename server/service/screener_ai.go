@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"quantvista/model"
 )
 
 // P3c AI 白话建策略：自然语言 → 条件树 DSL（service/screener.go）。
@@ -39,7 +41,9 @@ type ScreenerAIService struct {
 }
 
 func NewScreenerAIService(llm *LLMService) *ScreenerAIService {
-	return &ScreenerAIService{llm: llm}
+	svc := &ScreenerAIService{llm: llm}
+	svc.registerDurableJobHandler()
+	return svc
 }
 
 // ParseStrategyRequest 解析入参。
@@ -171,9 +175,27 @@ func (s *ScreenerAIService) ParseStrategyAsync(userID int64, allowPrivate bool, 
 	if err != nil {
 		return nil, err
 	}
-	return StartAsyncLLMTask(userID, "screener_parse", req, screenerParseJobTimeout, func(ctx context.Context) (any, error) {
-		return s.ParseStrategy(ctx, userID, allowPrivate, req)
-	})
+	s.registerDurableJobHandler()
+	return StartDurableLLMTask(userID, JobKindScreenerParse, req, allowPrivate)
+}
+
+func (s *ScreenerAIService) registerDurableJobHandler() {
+	RegisterDurableLLMJobHandler(JobKindScreenerParse, screenerParseJobTimeout,
+		func(ctx context.Context, userID int64, allowPrivate bool, raw json.RawMessage) (DurableJobResult, error) {
+			var req ParseStrategyRequest
+			if err := json.Unmarshal(raw, &req); err != nil {
+				return DurableJobResult{}, fmt.Errorf("策略解析作业快照无效: %w", err)
+			}
+			result, err := s.ParseStrategy(ctx, userID, allowPrivate, req)
+			if err != nil {
+				return DurableJobResult{}, err
+			}
+			return DurableJobResult{
+				Value: result, Status: model.JobStatusSuccess, TraceID: result.TraceID,
+				Provider: result.Provider, Model: result.Model, TotalTokens: result.TotalTokens,
+				Total: 1, Succeeded: 1,
+			}, nil
+		})
 }
 
 func normalizeParseStrategyRequest(req ParseStrategyRequest) (ParseStrategyRequest, error) {

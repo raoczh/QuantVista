@@ -49,8 +49,10 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	orgViewSvc := service.NewOrgViewService()
 	stockSearchSvc := service.NewStockSearchService()
 	taskCenterSvc := service.NewTaskCenterService()
-	// D17 持仓卖出决策 AI 建议（逐笔 hold|trim|exit，走 llm_tasks 后台任务）
+	// D17 持仓卖出决策 AI 建议（逐笔 hold|trim|exit，走统一作业与兼容结果行）
 	positionAdviceSvc := service.NewPositionAdviceService(positionSvc, llmSvc)
+	// 四类首批 handler 均已注册；此时再收敛 running 并按持久顺序恢复 queued。
+	service.StartJobRuntime()
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc, scoreSvc, indicatorSvc, chipSvc, intradaySvc)
@@ -151,8 +153,15 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 		{
 			// 全局股票搜索（只读本地股票宇宙，不触发行情或外部数据源）。
 			authed.GET("/stocks/search", middleware.RateLimit(120, time.Minute), stockSearchCtl.Search)
-			// 统一任务中心：当前用户业务任务；管理员可显式附带系统同步日志。
-			authed.GET("/tasks", taskCenterCtl.List)
+			// 统一任务中心：JobRun 事实、操作与带 Last-Event-ID 的事件流；旧业务任务仍作兼容投影。
+			tasks := authed.Group("/tasks")
+			{
+				tasks.GET("", taskCenterCtl.List)
+				tasks.GET("/events", taskCenterCtl.Events)
+				tasks.GET("/:id", taskCenterCtl.Get)
+				tasks.POST("/:id/cancel", taskCenterCtl.Cancel)
+				tasks.POST("/:id/retry", taskCenterCtl.Retry)
+			}
 
 			user := authed.Group("/user")
 			{
