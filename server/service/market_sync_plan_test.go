@@ -134,8 +134,11 @@ func TestMaintenanceRangeHardLimitsAndCalendarPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.ExpectedCount != 5 || plan.ExistingCount != 4 || plan.MissingCount != 1 || plan.EstimatedRequests != 1 {
+	if plan.TargetCount != 5 || plan.ExpectedCount != 5 || plan.ExistingCount != 4 || plan.MissingCount != 1 || plan.EstimatedRequests != 1 {
 		t.Fatalf("日历计划差异错误: %+v", plan)
+	}
+	if len(plan.SampleTargets) != 5 || plan.SampleTargets[0] != "2026-08-01" || plan.SampleTargets[4] != "2026-08-05" {
+		t.Fatalf("日历计划样本必须展示实际订正范围，而非只展示缺失行: %+v", plan.SampleTargets)
 	}
 	if err := svc.ValidateMaintenancePlan(MaintenanceBackfillCalendar, MaintenanceRequest{Market: "cn", From: calReq.From, To: calReq.To}); err == nil {
 		t.Fatal("有 body 的执行没有 plan_hash 必须拒绝")

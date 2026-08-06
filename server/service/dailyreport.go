@@ -780,13 +780,17 @@ func abs(f float64) float64 {
 	return f
 }
 
-// isAdminUser 后台任务里判定 allowPrivate（管理员可用内网自建模型）。
+// isAdminUser 后台任务里判定 allowPrivate。必须同时是启用管理员；账号被降权或
+// 禁用后，尚未执行的持久任务不得继续沿用旧权限访问内网模型。
 func isAdminUser(userID int64) bool {
 	var u model.User
-	if err := common.DB.Select("role").First(&u, userID).Error; err != nil {
+	if common.DB == nil {
 		return false
 	}
-	return u.Role == model.RoleAdmin
+	if err := common.DB.Select("role", "status").First(&u, userID).Error; err != nil {
+		return false
+	}
+	return u.Role == model.RoleAdmin && u.Status == model.StatusEnabled
 }
 
 // userPref 读取偏好（失败给默认值，不阻断日报）。

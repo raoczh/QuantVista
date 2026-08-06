@@ -427,15 +427,15 @@ func (s *MarketService) buildCalendarPlan(req MaintenanceRequest) (*preparedMain
 	}
 	view := MaintenancePlan{
 		Task: MaintenanceBackfillCalendar, Market: market, From: from, To: to, WindowDays: len(dates),
-		TargetCount: len(missing), ExpectedCount: len(dates), ExistingCount: len(rows), MissingCount: len(missing),
+		TargetCount: len(dates), ExpectedCount: len(dates), ExistingCount: len(rows), MissingCount: len(missing),
 		EstimatedRequests: 1,
-		DifferenceSummary: fmt.Sprintf("范围内 %d 个自然日，本地已有 %d，待补/待核对 %d；执行时以上游开市日集合订正，未来未知工作日不写成休市", len(dates), len(rows), len(missing)),
+		DifferenceSummary: fmt.Sprintf("范围内 %d 个自然日将逐日核对并订正；本地已有 %d，缺少 %d；执行时以上游开市日集合为准，未来未知工作日不写成休市", len(dates), len(rows), len(missing)),
 		GeneratedAt:       time.Now().Format(time.RFC3339),
 	}
-	if len(missing) > 12 {
-		view.SampleTargets = append([]string(nil), missing[:12]...)
+	if len(dates) > 12 {
+		view.SampleTargets = append([]string(nil), dates[:12]...)
 	} else {
-		view.SampleTargets = append([]string(nil), missing...)
+		view.SampleTargets = append([]string(nil), dates...)
 	}
 	view.PlanHash = hashMaintenanceState(state)
 	return &preparedMaintenancePlan{view: view, dates: dates}, nil

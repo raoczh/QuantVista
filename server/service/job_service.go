@@ -201,7 +201,7 @@ func RetryJobRun(userID, id int64) (*JobRunView, error) {
 		return nil, err
 	}
 	task, err := defaultJobRuntime.start(
-		userID, parent.Kind, json.RawMessage(snapshot.Request), snapshot.AllowPrivate, &parent.ID, nil,
+		userID, parent.Kind, json.RawMessage(snapshot.Request), false, &parent.ID, nil,
 	)
 	if err != nil {
 		return nil, err

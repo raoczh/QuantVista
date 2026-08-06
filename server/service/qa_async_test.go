@@ -40,6 +40,13 @@ func TestQaAskAsyncReturnsBeforeLLM(t *testing.T) {
 	for _, table := range []string{"llm_tasks", "ai_conversation_messages", "ai_conversations", "llm_configs", "user_quota"} {
 		common.DB.Exec("DELETE FROM " + table)
 	}
+	common.DB.Where("id = ?", 71).Delete(&model.User{})
+	if err := common.DB.Create(&model.User{
+		ID: 71, Username: "qa-async-admin", Role: model.RoleAdmin, Status: model.StatusEnabled,
+	}).Error; err != nil {
+		t.Fatalf("建启用管理员失败: %v", err)
+	}
+	t.Cleanup(func() { common.DB.Where("id = ?", 71).Delete(&model.User{}) })
 	common.EncryptionKey = "unit-test-key"
 
 	entered := make(chan struct{}, 1)

@@ -39,6 +39,10 @@ func bindMaintenanceRequest(c *gin.Context) (service.MaintenanceRequest, bool, e
 	if len(body) > maintenanceBodyMaxBytes {
 		return req, true, errors.New("补采请求正文超过 4KiB 上限")
 	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return req, true, errors.New("补采请求正文必须是 JSON 对象")
+	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {

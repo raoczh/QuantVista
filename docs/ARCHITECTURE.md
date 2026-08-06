@@ -495,13 +495,13 @@ AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yiel
 后两者顺序不可交换：两轮消费同一批本地数据，守护轮先落 `guard_events` 台账，
 复核轮的 `pos_ma_break` / `pos_lhb_sell` 推送才不会与它交叉。
 
-### 5.9.1 Task Center Service（Top50 P0-2A）
+### 5.9.1 Task Center Service（Top50 P0-2A/P0-2B-1）
 
-`GET /api/tasks` 是现有异步业务表之上的只读轻量聚合层：默认按当前用户汇总分析、推荐、日报与通用 LLM 任务；只有管理员显式传 `include_system=1` 时，才附加没有用户归属的系统同步终态历史。各来源各执行一次有界、字段白名单查询，不读取结果正文、数据快照或请求 hash；单个来源失败时返回 `partial/degraded_sources`，其余来源仍可使用。
+`GET /api/tasks` 是统一作业与 legacy 异步业务表之上的轻量聚合层：默认按当前用户汇总 `JobRun`、分析、推荐、日报与未迁移的 `llm_tasks`；只有管理员显式传 `include_system=1` 时，才附加没有用户归属的系统同步终态历史。各来源各执行一次有界、字段白名单查询，不读取结果正文或数据快照，且查询 `llm_tasks` 时排除已有 `job_run_id` 的兼容结果。当前接口没有 `partial/degraded_sources` 契约，任一选中来源查询失败会使整个请求失败，调用方保留现有视图并展示错误。
 
-所有来源统一映射状态、耗时、错误码、恢复建议与仅含记录 ID 的结果深链。15 分钟未更新的用户侧 `processing` 任务由各自业务服务按同一口径惰性收敛为 `failed`；顶栏最近任务与 processing 数量分别查询，达到 100 条上限时只能展示“至少 N 项”，不能把截断值当精确总数。
+所有来源统一映射状态、耗时、错误码、恢复建议与仅含记录 ID 的结果深链。15 分钟未更新的 legacy 用户侧 `processing` 任务由各自业务服务按同一口径惰性收敛为 `failed`；`JobRun` 则由自身 CAS、取消和恢复规则收敛。顶栏最近任务与运行中数量分别查询，达到 100 条上限时只能展示“至少 N 项”，不能把截断值当精确总数。
 
-P0-2A 不提供 `job_runs/job_steps`、事实阶段、取消、持久输入重跑、SSE 事件流、bounded worker 或积压观测。模型、provider、token、trace 等元数据只在原业务表真实具备时透传；系统同步目前只有终态日志，禁止由摘要层补造进度或可重放请求。
+P0-2B-1 仅让 `qa/compare/position_advice/screener_parse` 获得 `job_runs/job_steps/job_events`、事实阶段、取消、持久输入重跑、SSE、bounded worker 与积压背压。分析、推荐、日报和数据同步仍是 legacy 投影；模型、provider、token、trace 等元数据只在来源真实具备时透传，禁止由摘要层补造进度或可重放请求。
 
 ### 5.10 扩展模块（N/F/T/S/M/P3 批次 + 2026-07 杂项批）
 
@@ -631,11 +631,19 @@ value=**低PB榜**(升序滤负PB)+成交额；growth=涨幅+换手+成交额；
 本批范围严格限定为 `qa / compare / position_advice / screener_parse`。分析、推荐、日报和 `data_sync` 仍由任务中心作 legacy 投影；后续批次迁移前，不把它们伪装为 `JobRun`，也不宣称 P0-2B 已全部完成。
 
 - **事实模型**：`job_runs` 保存用户、kind、请求 hash、状态、父作业、错误、trace、模型/token/耗时/业务计数及原结果引用；`job_steps` 只记录真实发生的 `queued / dispatch / execute / persist`；`job_events` 用数据库自增主键提供全局单调 Event-ID。状态仅允许 `queued / running / success / degraded / failed / canceled`，所有终态更新均以当前状态和 `cancel_requested` 为条件做数据库 CAS，终态不能回退。
-- **快照边界**：`job_runs.request_snapshot` 是版本化、类型化且最大 16KiB 的业务请求，只包含重跑必需参数。创建前拒绝 API Key、Authorization、系统 prompt、消息数组与数据/结果快照字段；不保存 prompt 正文、大数据快照或结果正文。结果仍落原业务载体，本批用 `result_type=llm_task + result_id` 定位兼容结果。
+- **快照与权限边界**：`job_runs.request_snapshot` 是版本化、类型化且最大 16KiB 的业务请求，只包含重跑必需参数。创建前拒绝 API Key、Authorization、系统 prompt、消息数组与数据/结果快照字段；不保存 prompt 正文、大数据快照、结果正文或提交时的 `allow_private`。执行、恢复与重跑都按当时数据库中的“启用管理员”状态重新判定私网模型权限；升级前快照里的旧 `allow_private` 字段只做解码兼容，绝不能成为授权依据。结果仍落原业务载体，本批用 `result_type=llm_task + result_id` 定位兼容结果，成功事务必须确认该结果行恰好更新一条，不能出现作业成功而结果缺失。
 - **幂等与容量**：`(user_id, kind, request_hash)` 派生 `active_key`，仅 queued/running 持有并由唯一索引跨实例防重。运行时固定 4 个 worker、最多 32 个总在途作业，不再按请求无限创建 goroutine；满载不落孤儿 queued 行。
 - **取消与恢复**：queued 取消用 CAS 直接进入 canceled；running 先持久化 `cancel_requested`，本实例立即取消 Context，其他实例/恢复路径通过数据库轮询协作取消。成功持久化与取消在同一事务条件上竞争，只有一个终态获胜。启动时遗留 running 明确收敛为 `job_interrupted`（已请求取消者收敛 canceled），queued 按 ID 升序恢复，容量外的 queued 保持排队并随槽位释放续排。
-- **重跑**：仅失败且已注册的四类 handler 可重跑。重跑从旧 run 的持久快照创建新 run 并写 `parent_id`，旧 run 不修改；不支持的 kind 返回明确错误。
+- **重跑**：仅失败且已注册的四类 handler 可重跑。重跑从旧 run 的持久快照创建新 run 并写 `parent_id`，旧 run 不修改；若同用户、同 kind、同请求已有 queued/running 作业，则稳定返回 `job_already_running`，不得复用一个没有该 parent 的在途 run；不支持的 kind 返回明确错误。
 - **事件与前端**：`GET /api/tasks/events` 位于 JWT 中间件后，支持 `Last-Event-ID`、单调 `id:`、`event: job` 与 15s heartbeat。前端用 `fetch` 的 `Authorization` 请求头读取流，token 从不进入 URL；断线指数重连并保留串行轮询回退。任务中心优先列 JobRun，查询旧 `llm_tasks` 时排除 `job_run_id IS NOT NULL`，从而避免双行；结果深链使用 `result_id`，旧 `/llm-tasks/:id` 与历史结果链接继续兼容。
+
+### 6.12 数据覆盖与维护预演（P0-3A）
+
+数据源支持面只认 `provider × capability × market` 代码注册表，健康滑窗仅提供观测，不得反推未注册能力。`GET /api/admin/datasources` 与 `GET /api/admin/data-health` 都只读取进程观测和本地数据库；后者把交易日窗口钳在 30～60 日，以索引查询和结果硬上限区分休市、停牌、缺失、部分覆盖与未知日历。稀疏事件零行保持 unknown，不能伪装成完整覆盖。
+
+`sync-bars/backfill-calendar/wide-sync` 的新请求正文只接受单个、最大 4KiB 的 JSON 对象；完全无 body 才走旧兼容路径。新路径必须先 dry-run，计划 hash 绑定本地事实并在真正上游调用前重算，事实变化即拒绝。日历计划的 `target_count` 与 `sample_targets` 表示执行时会逐日核对订正的完整范围，`missing_count` 只表示当前缺行数；二者不得混用。`DataSyncLog` 只保存触发来源、管理员、白名单参数摘要与 hash，不保存 token、cookie、密钥或原始正文。
+
+管理页与个股覆盖矩阵只使用主题变量和页面已经取得的数据；切股异步响应须经过 epoch 校验。主动 probe 与人工解冷仍属于 P0-3B，必须使用受权限、限流和审计保护的 POST 路由，不能塞进只读 GET 或页面刷新。
 
 ## 7. 数据缓存策略
 
@@ -689,7 +697,7 @@ AI 结果：
 - `/recommendations`：推荐历史与追踪（策略模板为页内下拉，无独立页）
 - `/qa`：个股 AI 问答
 - `/compare`：个股横向对比
-- `/tasks`：统一任务中心（P0-2A 只读摘要投影，支持状态/类型筛选、结果深链与失败恢复提示）
+- `/tasks`：统一任务中心（P0-2B-1 四类 JobRun 支持真实步骤、取消、重跑与 SSE；其余来源保持 legacy 投影）
 - `/alerts`：提醒规则 + 推送通道
 - `/paper`：模拟交易
 - `/etf`：指数 ETF 交易（精选指数 ETF 行情 + 复用模拟盘买卖，2026-07-05）

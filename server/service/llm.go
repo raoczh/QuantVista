@@ -594,8 +594,8 @@ func firstEnabledAdminID() (int64, error) {
 	return admin.ID, nil
 }
 
-// isEnabledAdmin 是否为启用状态的管理员（isAdminUser 只看角色，这里连状态一起校验，
-// 供回退配置的所有者合法性判断——被禁用管理员的配置不应继续被系统使用）。
+// isEnabledAdmin 是否为启用状态的管理员。保留该语义别名，供回退配置所有者的
+// 合法性判断使用。
 func isEnabledAdmin(userID int64) bool {
 	var u model.User
 	if err := common.DB.Select("role, status").First(&u, userID).Error; err != nil {

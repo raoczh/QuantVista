@@ -30,6 +30,7 @@ const (
 	jobCancelPoll       = 250 * time.Millisecond
 
 	JobErrorBusy               = "job_queue_busy"
+	JobErrorAlreadyRunning     = "job_already_running"
 	JobErrorCanceled           = "job_canceled"
 	JobErrorInterrupted        = "job_interrupted"
 	JobErrorHandlerUnavailable = "job_handler_unavailable"
@@ -38,6 +39,7 @@ const (
 
 var (
 	ErrJobQueueBusy         error = &jobServiceError{code: JobErrorBusy, message: "作业队列已满，请稍后重试"}
+	ErrJobAlreadyRunning          = &jobServiceError{code: JobErrorAlreadyRunning, message: "相同请求已有任务运行中，请等待其结束后再重跑"}
 	ErrJobKindUnsupported         = errors.New("不支持重跑该任务类型")
 	ErrJobNotFound                = errors.New("作业不存在")
 	ErrJobNotCancelable           = errors.New("作业已结束，不能取消")
@@ -59,10 +61,9 @@ type jobPanicError struct{ value any }
 func (e *jobPanicError) Error() string { return fmt.Sprintf("任务异常终止: %v", e.value) }
 
 type persistedJobSnapshot struct {
-	Version      int             `json:"version"`
-	Kind         string          `json:"kind"`
-	AllowPrivate bool            `json:"allow_private"`
-	Request      json.RawMessage `json:"request"`
+	Version int             `json:"version"`
+	Kind    string          `json:"kind"`
+	Request json.RawMessage `json:"request"`
 }
 
 // DurableJobResult 将原业务结果与作业观测元数据分开。Value 只写入 llm_tasks
@@ -244,7 +245,9 @@ func (r *jobRuntime) signalCancel(jobID int64) {
 	}
 }
 
-func makeJobSnapshot(kind string, request any, allowPrivate bool) ([]byte, string, error) {
+// allowPrivate 仅为兼容现有调用签名保留，绝不写入持久快照。执行器会按运行时的
+// 当前账号状态重新判定私网权限，避免降权或禁用后仍重放提交时权限。
+func makeJobSnapshot(kind string, request any, _ bool) ([]byte, string, error) {
 	requestJSON, err := json.Marshal(request)
 	if err != nil {
 		return nil, "", fmt.Errorf("任务请求无法序列化: %w", err)
@@ -253,7 +256,7 @@ func makeJobSnapshot(kind string, request any, allowPrivate bool) ([]byte, strin
 		return nil, "", err
 	}
 	snapshotJSON, err := json.Marshal(persistedJobSnapshot{
-		Version: jobSnapshotVersion, Kind: kind, AllowPrivate: allowPrivate,
+		Version: jobSnapshotVersion, Kind: kind,
 		Request: append(json.RawMessage(nil), requestJSON...),
 	})
 	if err != nil {
@@ -365,7 +368,7 @@ func (r *jobRuntime) start(userID int64, kind string, request any, allowPrivate 
 		return nil, err
 	}
 
-	if view, found, err := findActiveJobResult(userID, kind, requestHash); err != nil || found {
+	if view, found, err := findActiveJobForStart(userID, kind, requestHash, parentID != nil); err != nil || found {
 		return view, err
 	}
 	r.startWorkers()
@@ -375,7 +378,7 @@ func (r *jobRuntime) start(userID int64, kind string, request any, allowPrivate 
 
 	r.createMu.Lock()
 	defer r.createMu.Unlock()
-	if view, found, err := findActiveJobResult(userID, kind, requestHash); err != nil || found {
+	if view, found, err := findActiveJobForStart(userID, kind, requestHash, parentID != nil); err != nil || found {
 		<-r.slots
 		return view, err
 	}
@@ -415,8 +418,8 @@ func (r *jobRuntime) start(userID int64, kind string, request any, allowPrivate 
 	})
 	if err != nil {
 		<-r.slots
-		if view, found, queryErr := findActiveJobResult(userID, kind, requestHash); queryErr == nil && found {
-			return view, nil
+		if view, found, queryErr := findActiveJobForStart(userID, kind, requestHash, parentID != nil); found || queryErr != nil {
+			return view, queryErr
 		}
 		return nil, err
 	}
@@ -427,6 +430,17 @@ func (r *jobRuntime) start(userID int64, kind string, request any, allowPrivate 
 	}
 	r.enqueueReserved(run.ID)
 	return llmTaskView(task, false), nil
+}
+
+func findActiveJobForStart(userID int64, kind, requestHash string, retry bool) (*LLMTaskView, bool, error) {
+	view, found, err := findActiveJobResult(userID, kind, requestHash)
+	if err != nil || !found {
+		return view, found, err
+	}
+	if retry {
+		return nil, true, ErrJobAlreadyRunning
+	}
+	return view, true, nil
 }
 
 func findActiveJobResult(userID int64, kind, requestHash string) (*LLMTaskView, bool, error) {
@@ -540,7 +554,7 @@ func (r *jobRuntime) callHandler(ctx context.Context, handler durableJobHandler,
 			result = DurableJobResult{}
 		}
 	}()
-	return handler.run(ctx, userID, snapshot.AllowPrivate, append(json.RawMessage(nil), snapshot.Request...))
+	return handler.run(ctx, userID, isAdminUser(userID), append(json.RawMessage(nil), snapshot.Request...))
 }
 
 func (r *jobRuntime) monitorCancellation(ctx context.Context, cancel context.CancelFunc, jobID int64, done <-chan struct{}) {
@@ -688,13 +702,17 @@ func (r *jobRuntime) persistSuccess(run model.JobRun, result DurableJobResult, r
 		if run.ResultID == nil {
 			return errors.New("作业缺少结果引用")
 		}
-		if err := tx.Model(&model.LLMTask{}).
+		compatibility := tx.Model(&model.LLMTask{}).
 			Where("id = ? AND user_id = ? AND job_run_id = ?", *run.ResultID, run.UserID, run.ID).
 			Updates(map[string]any{
 				"status": model.LLMTaskStatusSuccess, "result_json": string(resultJSON),
 				"error": "", "error_code": "", "active_key": nil, "updated_at": now,
-			}).Error; err != nil {
-			return err
+			})
+		if compatibility.Error != nil {
+			return compatibility.Error
+		}
+		if compatibility.RowsAffected != 1 {
+			return errors.New("作业兼容结果引用无效")
 		}
 		if err := tx.Model(&model.JobStep{}).
 			Where("job_run_id = ? AND name = ? AND status = ?", run.ID, model.JobStepPersist, model.JobStatusRunning).

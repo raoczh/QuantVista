@@ -53,4 +53,10 @@ func TestBindMaintenanceRequestRejectsUnknownAndLargeBody(t *testing.T) {
 	if _, _, err := bindMaintenanceRequest(c); err == nil {
 		t.Fatal("未知 Content-Length 也不得绕过 4KiB 硬上限")
 	}
+	for _, body := range []string{"null", "[]", "true"} {
+		c = maintenanceTestContext(body)
+		if _, _, err := bindMaintenanceRequest(c); err == nil {
+			t.Fatalf("非 JSON 对象正文必须拒绝: %s", body)
+		}
+	}
 }

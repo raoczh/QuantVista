@@ -54,12 +54,14 @@ import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import type { AuthUser } from '@/api/auth'
 import { useAuthStore } from '@/stores/auth'
 import { useIsMobile } from '@/composables/useIsMobile'
+import { useUi, withAlpha } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 
 const message = useMessage()
 // 手机上左标签表单太挤，切换为上下堆叠。
 const { isMobile } = useIsMobile()
+const { vars } = useUi()
 const auth = useAuthStore()
 
 const settings = ref<SystemSettings | null>(null)
@@ -526,6 +528,9 @@ const taskLabel: Record<string, string> = {
   sync_daily_bars: '日线批量同步',
   backfill_calendar: '交易日历回填',
   snapshot_market: '市场情绪快照',
+  sync_market_wide: '全市场增量同步',
+  init_market_history: '全市场历史初始化',
+  init_market_history_trigger: '历史初始化触发',
 }
 function fmtLogTime(t: string) {
   return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : ''
@@ -660,6 +665,7 @@ async function callMaintenance(kind: MaintenanceKind, payload: MaintenanceReques
 }
 
 async function previewMaintenance(kind: MaintenanceKind) {
+  if (dryRunLoading.value || executingPlan.value) return
   if (kind !== 'wide' && (!maintenanceRange.from || !maintenanceRange.to)) {
     message.warning('请选择补采起止日期')
     return
@@ -684,7 +690,7 @@ async function previewMaintenance(kind: MaintenanceKind) {
 
 async function executeMaintenancePlan() {
   const plan = maintenancePlan.value
-  if (!plan) return
+  if (!plan || executingPlan.value) return
   executingPlan.value = true
   try {
     const result = await callMaintenance(maintenanceKind.value, {
@@ -1301,6 +1307,12 @@ onMounted(() => {
 
 <style scoped>
 .admin-stack {
+  --ops-error: v-bind('vars.errorColor');
+  --ops-success: v-bind('vars.successColor');
+  --ops-warning: v-bind('vars.warningColor');
+  --ops-info: v-bind('vars.infoColor');
+  --ops-muted: v-bind('withAlpha(vars.textColor3, 0.72)');
+  --ops-closed: v-bind('withAlpha(vars.textColor3, 0.42)');
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -1355,7 +1367,7 @@ onMounted(() => {
 }
 .ops-danger {
   margin-top: 3px;
-  color: #c2413b;
+  color: var(--ops-error);
   font-size: 11px;
   line-height: 1.45;
   overflow-wrap: anywhere;
@@ -1409,14 +1421,14 @@ onMounted(() => {
   width: 10px;
   height: 10px;
   border-radius: 2px;
-  background: #64748b;
+  background: var(--ops-muted);
 }
-.gap-covered { background: #2f8f5b; }
-.gap-missing { background: #c2413b; }
-.gap-partial { background: #d59a22; }
-.gap-suspended { background: #7b8490; }
-.gap-closed { background: #404853; }
-.gap-unknown { background: #3c7c9f; }
+.gap-covered { background: var(--ops-success); }
+.gap-missing { background: var(--ops-error); }
+.gap-partial { background: var(--ops-warning); }
+.gap-suspended { background: var(--ops-muted); }
+.gap-closed { background: var(--ops-closed); }
+.gap-unknown { background: var(--ops-info); }
 .gap-calendar-mobile {
   grid-template-columns: repeat(15, 10px);
   margin-top: 10px;

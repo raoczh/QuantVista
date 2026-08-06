@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -114,9 +115,16 @@ func seedParseStrategyEnv(t *testing.T, userID int64, baseURL string) {
 	setupTestDB(t)
 	common.DB.Exec("DELETE FROM llm_configs")
 	common.DB.Exec("DELETE FROM user_quota")
+	common.DB.Where("id = ?", userID).Delete(&model.User{})
+	if err := common.DB.Create(&model.User{
+		ID: userID, Username: fmt.Sprintf("parse-admin-%d", userID), Role: model.RoleAdmin, Status: model.StatusEnabled,
+	}).Error; err != nil {
+		t.Fatalf("建启用管理员失败: %v", err)
+	}
 	t.Cleanup(func() {
 		common.DB.Exec("DELETE FROM llm_configs")
 		common.DB.Exec("DELETE FROM user_quota")
+		common.DB.Where("id = ?", userID).Delete(&model.User{})
 	})
 	common.EncryptionKey = "unit-test-key"
 	cipher, err := common.Encrypt("sk-test")

@@ -216,10 +216,16 @@ func TestJobTerminalCASAndUserIsolation(t *testing.T) {
 func TestJobRetryCreatesChildAndKeepsParent(t *testing.T) {
 	resetDurableJobs(t)
 	var calls atomic.Int32
+	secondStarted := make(chan struct{})
+	secondRelease := make(chan struct{})
 	RegisterDurableLLMJobHandler(JobKindQA, time.Minute,
 		func(context.Context, int64, bool, json.RawMessage) (DurableJobResult, error) {
-			if calls.Add(1) == 1 {
+			switch calls.Add(1) {
+			case 1:
 				return DurableJobResult{}, errors.New("first failed")
+			case 2:
+				close(secondStarted)
+				<-secondRelease
 			}
 			return DurableJobResult{Value: QaTaskResult{ConversationID: 99}, Status: model.JobStatusSuccess}, nil
 		})
@@ -231,6 +237,25 @@ func TestJobRetryCreatesChildAndKeepsParent(t *testing.T) {
 	if got := waitJobRun(t, 805, parentID); got.Status != model.JobStatusFailed {
 		t.Fatalf("父作业应失败: %+v", got)
 	}
+	activeTask, err := StartDurableLLMTask(805, JobKindQA, map[string]string{"question": "retry"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-secondStarted
+	if _, err := RetryJobRun(805, parentID); !errors.Is(err, ErrJobAlreadyRunning) {
+		t.Fatalf("同请求已有在途任务时，重跑必须明确拒绝而非返回无 parent_id 的任务: %v", err)
+	}
+	var coded interface{ RefusalCode() string }
+	if !errors.As(ErrJobAlreadyRunning, &coded) || coded.RefusalCode() != JobErrorAlreadyRunning {
+		t.Fatalf("在途重跑拒绝码不稳定: %v", ErrJobAlreadyRunning)
+	}
+	var rejectedChildren int64
+	if err := common.DB.Model(&model.JobRun{}).Where("parent_id = ?", parentID).Count(&rejectedChildren).Error; err != nil || rejectedChildren != 0 {
+		t.Fatalf("被拒绝的重跑不得创建子作业: count=%d err=%v", rejectedChildren, err)
+	}
+	close(secondRelease)
+	waitJobRun(t, 805, jobRunIDForTask(t, activeTask.ID))
+
 	child, err := RetryJobRun(805, parentID)
 	if err != nil {
 		t.Fatal(err)
@@ -349,7 +374,7 @@ func TestJobSnapshotBoundAndSensitiveFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(snapshot)
-	for _, forbidden := range []string{"sk-secret", "system_prompt", "result_json", "messages"} {
+	for _, forbidden := range []string{"sk-secret", "system_prompt", "result_json", "messages", "allow_private"} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("快照泄露禁止内容 %q: %s", forbidden, text)
 		}
@@ -385,6 +410,75 @@ func TestJobSnapshotBoundAndSensitiveFields(t *testing.T) {
 	}
 	if strings.Contains(string(persisted), "sk-secret") || strings.Contains(string(persisted), "also-secret") {
 		t.Fatalf("作业错误与步骤不得持久化凭据: %s", persisted)
+	}
+}
+
+func TestJobExecutionRechecksEnabledAdminAndIgnoresLegacyPermission(t *testing.T) {
+	resetDurableJobs(t)
+	const userID int64 = 904
+	common.DB.Where("id = ?", userID).Delete(&model.User{})
+	if err := common.DB.Create(&model.User{
+		ID: userID, Username: "job-admin-904", Role: model.RoleAdmin, Status: model.StatusEnabled,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { common.DB.Where("id = ?", userID).Delete(&model.User{}) })
+
+	runtime := newJobRuntime(1, 2)
+	defer runtime.close()
+	blockerStarted := make(chan struct{})
+	blockerRelease := make(chan struct{})
+	blocker := durableJobHandler{timeout: time.Minute, run: func(context.Context, int64, bool, json.RawMessage) (DurableJobResult, error) {
+		close(blockerStarted)
+		<-blockerRelease
+		return DurableJobResult{Value: map[string]bool{"ok": true}, Status: model.JobStatusSuccess}, nil
+	}}
+	first, err := runtime.start(905, JobKindCompare, map[string]int{"n": 1}, false, nil, &blocker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-blockerStarted
+
+	allowSeen := make(chan bool, 1)
+	queuedHandler := durableJobHandler{timeout: time.Minute, run: func(_ context.Context, _ int64, allowPrivate bool, _ json.RawMessage) (DurableJobResult, error) {
+		allowSeen <- allowPrivate
+		return DurableJobResult{Value: map[string]bool{"ok": true}, Status: model.JobStatusSuccess}, nil
+	}}
+	queuedTask, err := runtime.start(userID, JobKindQA, map[string]string{"question": "permission"}, true, nil, &queuedHandler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queuedJobID := jobRunIDForTask(t, queuedTask.ID)
+	var queuedRun model.JobRun
+	if err := common.DB.First(&queuedRun, queuedJobID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(queuedRun.RequestSnapshot, "allow_private") {
+		t.Fatalf("新快照不得持久化提交时权限: %s", queuedRun.RequestSnapshot)
+	}
+	// 模拟升级前快照：旧字段仍可解码，但不得再成为授权依据。
+	var legacy map[string]any
+	if err := json.Unmarshal([]byte(queuedRun.RequestSnapshot), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacy["allow_private"] = true
+	legacyJSON, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := common.DB.Model(&model.JobRun{}).Where("id = ?", queuedJobID).Update("request_snapshot", string(legacyJSON)).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := common.DB.Model(&model.User{}).Where("id = ?", userID).Update("status", model.StatusDisabled).Error; err != nil {
+		t.Fatal(err)
+	}
+	close(blockerRelease)
+	if allow := <-allowSeen; allow {
+		t.Fatal("执行时账号已禁用，旧快照中的 allow_private 不得继续授权")
+	}
+	waitJobRun(t, 905, jobRunIDForTask(t, first.ID))
+	if got := waitJobRun(t, userID, queuedJobID); got.Status != model.JobStatusSuccess {
+		t.Fatalf("旧快照字段应兼容读取，作业本身仍可按当前权限执行: %+v", got)
 	}
 }
 

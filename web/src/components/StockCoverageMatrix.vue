@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { NTag, NTooltip } from 'naive-ui'
 import SectionCard from '@/components/SectionCard.vue'
+import { useUi } from '@/composables/useUi'
 import type { StockCoverageItem, StockCoverageStatus } from './stockCoverage'
 
 defineProps<{ items: StockCoverageItem[] }>()
+const { vars } = useUi()
 
 const statusMeta: Record<StockCoverageStatus, { label: string; type: 'success' | 'error' | 'warning' | 'default' }> = {
   available: { label: '可用', type: 'success' },
@@ -53,7 +55,7 @@ const statusMeta: Record<StockCoverageStatus, { label: string; type: 'success' |
   min-width: 0;
   min-height: 82px;
   padding: 10px;
-  background: var(--n-color, #fff);
+  background: v-bind('vars.cardColor');
 }
 .coverage-head {
   display: flex;
