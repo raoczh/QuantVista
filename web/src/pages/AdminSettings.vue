@@ -29,6 +29,8 @@ import {
   updateUserQuota,
   listSyncLogs,
   getDataSources,
+  probeDataSource,
+  uncoolDataSource,
   getDataHealth,
   triggerWideSync,
   triggerWideInit,
@@ -531,6 +533,8 @@ const taskLabel: Record<string, string> = {
   sync_market_wide: '全市场增量同步',
   init_market_history: '全市场历史初始化',
   init_market_history_trigger: '历史初始化触发',
+  datasource_probe: '数据源主动探测',
+  datasource_uncool: '数据源人工解冷',
 }
 function fmtLogTime(t: string) {
   return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : ''
@@ -601,6 +605,11 @@ const capabilityLoading = ref(false)
 const capabilityProvider = ref<string | null>(null)
 const capabilityName = ref<string | null>(null)
 const capabilityObservation = ref<string | null>(null)
+const capabilityActionKey = ref('')
+const uncoolOpen = ref(false)
+const uncoolTarget = ref<DataSourceCapability | null>(null)
+const uncoolReason = ref('')
+const uncoolSubmitting = ref(false)
 async function loadCapabilities() {
   capabilityLoading.value = true
   try {
@@ -633,6 +642,65 @@ const capabilityObservationMeta: Record<string, { label: string; type: 'success'
   success: { label: '成功', type: 'success' },
   empty: { label: '空响应', type: 'warning' },
   error: { label: '错误', type: 'error' },
+}
+
+function capabilityKey(cap: DataSourceCapability) {
+  return `${cap.source}:${cap.capability}:${cap.market}`
+}
+
+function capabilityTuple(cap: DataSourceCapability) {
+  return { provider: cap.source, capability: cap.capability, market: cap.market }
+}
+
+async function refreshCapabilityOps() {
+  await Promise.all([loadCapabilities(), loadLogs()])
+}
+
+async function probeCapability(cap: DataSourceCapability) {
+  const key = capabilityKey(cap)
+  if (capabilityActionKey.value || !cap.registered || !cap.supported) return
+  capabilityActionKey.value = key
+  try {
+    const op = await probeDataSource(capabilityTuple(cap))
+    if (op.result.outcome === 'success') message.success(`已探测 ${cap.source} · ${cap.capability}`)
+    else if (op.result.outcome === 'empty') message.warning(`探测完成：${cap.source} · ${cap.capability} 返回空响应`)
+    else message.error(`探测失败：${op.result.code}`)
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    // 上游 error 同样会形成健康观测和审计；无论结局都局部刷新矩阵与日志。
+    await refreshCapabilityOps()
+    capabilityActionKey.value = ''
+  }
+}
+
+function openUncool(cap: DataSourceCapability) {
+  if (capabilityActionKey.value || cap.cooldown_left_sec <= 0) return
+  uncoolTarget.value = cap
+  uncoolReason.value = ''
+  uncoolOpen.value = true
+}
+
+async function submitUncool() {
+  const cap = uncoolTarget.value
+  const reason = uncoolReason.value.trim()
+  if (!cap || uncoolSubmitting.value || !reason) {
+    if (!reason) message.warning('请填写解冷原因')
+    return
+  }
+  uncoolSubmitting.value = true
+  capabilityActionKey.value = capabilityKey(cap)
+  try {
+    const op = await uncoolDataSource({ ...capabilityTuple(cap), reason })
+    message.success(op.cleared ? '已解除指定能力冷却' : '该能力当前没有冷却')
+    uncoolOpen.value = false
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    await refreshCapabilityOps()
+    uncoolSubmitting.value = false
+    capabilityActionKey.value = ''
+  }
 }
 
 /* 有 body 的补采先 dry-run；完全无 body 的旧客户端兼容由后端承担。 */
@@ -1024,6 +1092,7 @@ onMounted(() => {
               <th>观测</th>
               <th>延迟 / 最近成功</th>
               <th>恢复建议</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody>
@@ -1050,6 +1119,33 @@ onMounted(() => {
                 <div class="ops-sub">{{ cap.last_success_at ? fmtLogTime(cap.last_success_at) : '从未成功' }}</div>
               </td>
               <td class="ops-wrap">{{ cap.recovery_advice }}</td>
+              <td>
+                <n-space vertical size="small">
+                  <n-popconfirm
+                    :positive-text="'探测'"
+                    :negative-text="'取消'"
+                    :disabled="!!capabilityActionKey"
+                    @positive-click="probeCapability(cap)"
+                  >
+                    <template #trigger>
+                      <n-button
+                        size="tiny"
+                        tertiary
+                        :loading="capabilityActionKey === capabilityKey(cap)"
+                        :disabled="!!capabilityActionKey || !cap.registered || !cap.supported"
+                      >探测</n-button>
+                    </template>
+                    仅请求一个样本并记录健康观测，确认继续？
+                  </n-popconfirm>
+                  <n-button
+                    size="tiny"
+                    tertiary
+                    type="warning"
+                    :disabled="!!capabilityActionKey || cap.cooldown_left_sec <= 0"
+                    @click="openUncool(cap)"
+                  >解除冷却</n-button>
+                </n-space>
+              </td>
             </tr>
           </tbody>
         </n-table>
@@ -1067,6 +1163,31 @@ onMounted(() => {
             <div class="ops-kv"><span>最近成功</span><span>{{ cap.last_success_at ? fmtLogTime(cap.last_success_at) : '从未成功' }}</span></div>
             <div class="ops-wrap">{{ cap.cache_semantics }}</div>
             <div class="ops-sub">{{ cap.recovery_advice }}</div>
+            <div class="capability-actions">
+              <n-popconfirm
+                :positive-text="'探测'"
+                :negative-text="'取消'"
+                :disabled="!!capabilityActionKey"
+                @positive-click="probeCapability(cap)"
+              >
+                <template #trigger>
+                  <n-button
+                    size="tiny"
+                    tertiary
+                    :loading="capabilityActionKey === capabilityKey(cap)"
+                    :disabled="!!capabilityActionKey || !cap.registered || !cap.supported"
+                  >探测</n-button>
+                </template>
+                仅请求一个样本并记录健康观测，确认继续？
+              </n-popconfirm>
+              <n-button
+                size="tiny"
+                tertiary
+                type="warning"
+                :disabled="!!capabilityActionKey || cap.cooldown_left_sec <= 0"
+                @click="openUncool(cap)"
+              >解除冷却</n-button>
+            </div>
           </article>
         </div>
       </SectionCard>
@@ -1274,6 +1395,41 @@ onMounted(() => {
       </template>
     </n-modal>
 
+    <n-modal
+      v-model:show="uncoolOpen"
+      preset="card"
+      title="解除数据源冷却"
+      style="max-width: 460px"
+      :mask-closable="!uncoolSubmitting"
+      :closable="!uncoolSubmitting"
+    >
+      <template v-if="uncoolTarget">
+        <div class="ops-sub" style="margin-bottom: 10px">
+          {{ uncoolTarget.source }} · {{ uncoolTarget.capability }} · {{ uncoolTarget.market }} · 剩余 {{ uncoolTarget.cooldown_left_sec }} 秒
+        </div>
+        <n-input
+          v-model:value="uncoolReason"
+          type="textarea"
+          maxlength="200"
+          show-count
+          :autosize="{ minRows: 3, maxRows: 5 }"
+          placeholder="填写本次人工解冷原因"
+          :disabled="uncoolSubmitting"
+        />
+      </template>
+      <template #footer>
+        <div class="modal-actions">
+          <n-button :disabled="uncoolSubmitting" @click="uncoolOpen = false">取消</n-button>
+          <n-button
+            type="warning"
+            :loading="uncoolSubmitting"
+            :disabled="uncoolSubmitting || !uncoolReason.trim()"
+            @click="submitUncool"
+          >确认解除</n-button>
+        </div>
+      </template>
+    </n-modal>
+
     <!-- 用户配额编辑 -->
     <n-modal v-model:show="quotaModal" preset="card" :title="`AI 配额 · ${quotaUser?.display_name || quotaUser?.username || ''}`" style="max-width: 460px">
       <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 110" :show-feedback="false">
@@ -1407,6 +1563,12 @@ onMounted(() => {
   min-width: 0;
   text-align: right;
   overflow-wrap: anywhere;
+}
+.capability-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
 }
 .gap-calendar {
   display: grid;

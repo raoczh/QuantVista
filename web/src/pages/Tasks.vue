@@ -51,7 +51,7 @@ const knownKindsBySource: Record<TaskSource, string[]> = {
   analysis: ['market', 'sector', 'stock', 'watchlist', 'position'],
   recommendation: ['short_term', 'long_term'],
   daily_report: ['daily_report'],
-  job: ['qa', 'compare', 'position_advice', 'screener_parse'],
+  job: ['analysis', 'recommendation', 'daily_report', 'qa', 'compare', 'position_advice', 'screener_parse'],
   llm: ['qa', 'compare', 'position_advice', 'screener_parse'],
   data_sync: ['sync_daily_bars', 'backfill_calendar', 'snapshot_market', 'sync_market_wide', 'init_market_history'],
 }

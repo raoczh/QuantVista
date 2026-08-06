@@ -60,8 +60,10 @@ func (s *DailyReportService) now() time.Time {
 
 func NewDailyReportService(market *MarketService, watchlist *WatchlistService, position *PositionService,
 	alert *AlertService, rec *RecommendationService, llm *LLMService, notify *NotifyService) *DailyReportService {
-	return &DailyReportService{market: market, watchlist: watchlist, position: position,
+	s := &DailyReportService{market: market, watchlist: watchlist, position: position,
 		alert: alert, rec: rec, llm: llm, notify: notify}
+	s.registerDurableJobHandler()
+	return s
 }
 
 // dailyReview LLM 复盘的结构化输出。
@@ -150,7 +152,7 @@ func (s *DailyReportService) List(userID int64, limit int) ([]model.DailyReport,
 	return rows, err
 }
 
-// Delete 删除一份日报（仅本人）。生成中的新鲜任务拒删——后台 goroutine 完成后的
+// Delete 删除一份日报（仅本人）。生成中的新鲜任务拒删——统一后台作业完成后的
 // 回写会让删除名存实亡（Save 按主键 UPDATE 落空即静默丢失，行为不可预期）。
 // 关联的推荐批次与卖点提醒不级联删（推荐历史独立可见，提醒有自身过期清理）。
 func (s *DailyReportService) Delete(userID, id int64) error {
@@ -216,10 +218,10 @@ func (s *DailyReportService) assembleView(r *model.DailyReport) *DailyReportView
 }
 
 // GenerateFor 为用户生成当日日报。
-// manual=true（手动生成/重生成）：异步任务化（2026-07-14）——同步段只做休市/LLM/配额
-// 校验并落 processing 状态立即返回，复盘+推荐在后台独立 Context 并行执行完成后回写；
+// manual=true（手动生成/重生成）：同步段只做休市/LLM/配额校验并在事务内创建
+// JobRun 与 processing 结果行后立即返回；复盘+推荐由统一固定 worker 执行并回写；
 // 重生成不再「先删旧报告再生成」，旧报告内容原地保留，双败时状态回滚（旧报告不丢）。
-// manual=false（自动 job）：已存在即跳过；调用方已在后台 goroutine 内，保持同步执行。
+// manual=false（自动 job）：已存在即跳过；新任务同样进入统一固定 worker。
 func (s *DailyReportService) GenerateFor(ctx context.Context, userID int64, manual bool) (*DailyReportView, error) {
 	if err := expireStaleDailyReports(userID); err != nil {
 		return nil, err
@@ -251,71 +253,27 @@ func (s *DailyReportService) GenerateFor(ctx context.Context, userID int64, manu
 
 	// LLM 配置解析 + 配额熔断（确定性错误立即返回，不建任务；自动生成不占次数，
 	// 但额度用尽也不再代烧 token）。
-	cfg, apiKey, err := s.llm.ResolveForUse(userID, 0)
+	cfg, _, err := s.llm.ResolveForUse(userID, 0)
 	if err != nil {
 		return nil, fmt.Errorf("未配置可用的 LLM：%w", err)
 	}
 	if err := checkQuota(userID); err != nil {
 		return nil, err
 	}
-	plan := reportGenPlan{
-		userID: userID, date: date, manual: manual,
-		cfg: cfg, apiKey: apiKey,
-		allowPrivate: llmAllowPrivate(isAdminUser(userID), cfg), // 回退到管理员配置时按配置所有者放行内网
+	_ = cfg // 工厂在同一事务内再次解析并只保留非敏感元数据
+	jobReq := dailyReportJobRequest{Version: 1, TradeDate: date, Manual: manual}
+	run, err := startDurableBusinessJob(userID, JobKindDailyReport, jobReq, isAdminUser(userID))
+	if err != nil {
+		return nil, err
 	}
-
-	// processing 行：当日首份=新建；重生成=旧行原地置 processing（内容字段全部保留，
-	// 新报告成功前旧报告始终可看——失败时状态回滚，替代旧版「先删后生成」的丢失风险）。
-	report := &model.DailyReport{UserID: userID, TradeDate: date, Market: "cn", Status: model.ReportStatusProcessing}
-	if exists {
-		report = &existing
-		plan.oldStatus = existing.Status
-		if plan.oldStatus == model.ReportStatusProcessing {
-			plan.oldStatus = model.ReportStatusFailed // 接管的死任务：失败时没有更好的可回滚状态
-		}
-		// 乐观接管：两个并发请求可能同时越过上面的「新鲜 processing 直接返回」判断
-		// （旧报告为 failed/success，或 processing 已 stale），无条件 Update 会双双建任务
-		// 重复烧 token。用 (id, status, updated_at) 条件更新，RowsAffected==0 视为已被
-		// 另一请求接管——回读当前行按「已在生成中」返回，不再重复起后台任务。
-		prevStatus, prevUpdatedAt := existing.Status, existing.UpdatedAt
-		report.Status = model.ReportStatusProcessing
-		res := common.DB.Model(&model.DailyReport{}).
-			Where("id = ? AND status = ? AND updated_at = ?", report.ID, prevStatus, prevUpdatedAt).
-			Update("status", model.ReportStatusProcessing)
-		if res.Error != nil {
-			return nil, res.Error
-		}
-		if res.RowsAffected == 0 {
-			var cur model.DailyReport
-			if err := common.DB.Where("id = ?", report.ID).First(&cur).Error; err != nil {
-				return nil, err
-			}
-			return s.assembleView(&cur), nil
-		}
-	} else if err := common.DB.Create(report).Error; err != nil {
-		return nil, err // 并发生成的兜底：user+trade_date 唯一索引拒绝第二行
+	if run.ResultID == nil {
+		return nil, errors.New("日报作业缺少结果引用")
 	}
-
-	if !manual {
-		return s.runGeneration(ctx, report, plan)
+	var report model.DailyReport
+	if err := common.DB.Where("id = ? AND user_id = ?", *run.ResultID, userID).First(&report).Error; err != nil {
+		return nil, err
 	}
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				common.SysWarn("日报后台任务 panic report=%d: %v", report.ID, r)
-				common.DB.Model(&model.DailyReport{}).Where("id = ?", report.ID).
-					Updates(map[string]any{"status": model.ReportStatusFailed,
-						"error": truncateRunes(fmt.Sprintf("生成任务异常终止: %v", r), 500)})
-			}
-		}()
-		// 独立于 HTTP 请求的 Context：浏览器断开/刷新不取消任务；总 deadline 防永久挂起。
-		bg, cancel := context.WithTimeout(context.Background(), reportJobTimeout)
-		defer cancel()
-		if _, err := s.runGeneration(bg, report, plan); err != nil {
-			common.SysWarn("用户 %d 日报后台生成失败: %v", userID, err)
-		}
-	}()
-	return s.assembleView(report), nil
+	return s.assembleView(&report), nil
 }
 
 // reportGenPlan 同步段产出、后台段消费的生成计划。
@@ -331,12 +289,13 @@ type reportGenPlan struct {
 	oldStatus string
 }
 
-// runGeneration 生成主体（同步执行；手动路径由 GenerateFor 放进后台 goroutine）：
+// runGeneration 生成主体（由统一 JobRun worker 同步调用）：
 // 快照 → 复盘与推荐两路并行 → 状态归纳回写 → 卖点提醒/配额/推送收尾。
 func (s *DailyReportService) runGeneration(ctx context.Context, report *model.DailyReport, plan reportGenPlan) (*DailyReportView, error) {
 	userID, date := plan.userID, plan.date
 	start := time.Now()
 
+	_ = JobStepTransition(ctx, "snapshot")
 	snapFn := s.snapshotFn
 	if snapFn == nil {
 		snapFn = s.buildSnapshot
@@ -348,6 +307,7 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 	snapshot := snapFn(ctx, userID, date)
 	snapJSON, _ := json.Marshal(snapshot)
 	pref := s.userPref(userID)
+	_ = JobStepFinish(ctx, "snapshot", model.JobStatusSuccess)
 
 	// P0-6 修复批：daily 模板一次固化快照——callReview 的系统提示、run 的 prompt 版本与
 	// report.PromptVersion 消费同一份，模板在复盘生成期间被编辑不会造成正文/版本错位。
@@ -366,22 +326,32 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 		recView      *RecommendationView
 		recErr       error
 	)
+	_ = JobStepTransition(ctx, "dual_generation")
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
+		dailyGenerationSlots <- struct{}{}
+		defer func() { <-dailyGenerationSlots }()
 		review, reviewTokens, reviewRun, reviewErr = s.callReview(ctx, userID, date, dailyPrompt, plan.cfg, plan.apiKey, plan.allowPrivate, string(snapJSON), trace)
 	}()
 	go func() {
 		defer wg.Done()
+		dailyGenerationSlots <- struct{}{}
+		defer func() { <-dailyGenerationSlots }()
 		// 明日推荐：复用推荐域（短线：买点/止盈/止损/有效期）。策略按当日市场环境
 		// 动态选择；筛选条件走用户偏好（Filters=nil 时推荐域自动加载）。
 		recReq := RecommendRequest{
 			Type: model.RecTypeShortTerm, Market: "cn", Count: pref.DefaultRecCount,
 			Strategy: pickDailyStrategy(snapshot),
 		}
-		recView, recErr = recFn(ctx, userID, plan.allowPrivate, recReq)
+		recView, recErr = recFn(withoutJobExecution(ctx), userID, plan.allowPrivate, recReq)
 	}()
 	wg.Wait()
+	if reviewErr == nil && recErr == nil {
+		_ = JobStepFinish(ctx, "dual_generation", model.JobStatusSuccess)
+	} else {
+		_ = JobStepFinish(ctx, "dual_generation", model.JobStatusDegraded)
+	}
 
 	report.SnapshotJSON = string(snapJSON)
 	// M3c：复盘 prompt 版本落库（启用 daily 自定义模板时 -custom 后缀，历史可归因）。
@@ -435,10 +405,12 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 	if report.Status == model.ReportStatusFailed && plan.oldStatus != "" {
 		msg := truncateRunes("重生成失败（已保留原报告）："+strings.Join(errParts, "；"), 500)
 		common.DB.Model(&model.DailyReport{}).Where("id = ?", report.ID).
-			Updates(map[string]any{"status": plan.oldStatus, "error": msg})
+			Updates(map[string]any{"status": plan.oldStatus, "previous_status": "", "error": msg})
 		return nil, errors.New(strings.Join(errParts, "；"))
 	}
 
+	_ = JobStepTransition(ctx, "finalize")
+	report.PreviousStatus = ""
 	if err := common.DB.Save(report).Error; err != nil {
 		return nil, err
 	}
@@ -451,9 +423,10 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 		s.createSellAlerts(ctx, userID, date, recView)
 	}
 
-	// 推送摘要（best-effort，受推送通道与偏好总闸控制）。
+	// 推送摘要（best-effort，受推送通道与偏好总闸控制）。沿用当前 worker
+	// 的 deadline，避免每份日报再派生一个可能长期堆积的无界 goroutine。
 	if review != nil && pref.EnableNotify && s.notify.HasEnabledChannel(userID) {
-		go s.notify.SendMsg(userID, NotifyMessage{
+		s.notify.SendMsgContext(ctx, userID, NotifyMessage{
 			Title: fmt.Sprintf("收盘日报 %s", date), Content: review.Summary,
 			Route: "/daily-report", Kind: NotifyMsgKindReport,
 		})
@@ -991,6 +964,8 @@ func pauseExpiredSellAlerts() {
 // ---- 后台任务 ----
 
 var dailyReportRunning atomic.Bool
+
+var dailyGenerationSlots = make(chan struct{}, jobWorkerCount*2)
 
 // StartDailyReportJobs 每 10 分钟检查一次：交易日收盘窗口内，为开启日报偏好且
 // 当日尚无报告的用户生成。逐用户串行（免费行情源经不起并发打）。

@@ -29,7 +29,9 @@ type RecommendationService struct {
 }
 
 func NewRecommendationService(market *MarketService, watchlist *WatchlistService, llm *LLMService) *RecommendationService {
-	return &RecommendationService{market: market, watchlist: watchlist, llm: llm, em: datasource.NewEastMoneyAdapter()}
+	s := &RecommendationService{market: market, watchlist: watchlist, llm: llm, em: datasource.NewEastMoneyAdapter()}
+	s.registerDurableJobHandler()
+	return s
 }
 
 const (
@@ -439,9 +441,9 @@ type RecommendationItemView struct {
 	Position *RecPositionLink            `json:"position"`
 }
 
-// Generate 生成一批推荐（用户手动发起，计 1 次配额）——异步任务化（2026-07-14）：
-// 同步段只做参数校验/LLM 配置解析/配额熔断，落一条 processing 批次后立即返回；
-// 建池/评分/LLM 精选在后台以独立 Context 执行，完成后回写批次。浏览器超时、反代
+// Generate 生成一批推荐（用户手动发起，计 1 次配额）：同步段只做参数校验、
+// LLM 配置解析与配额熔断，并在事务内创建 JobRun/processing 批次后立即返回；
+// 建池/评分/LLM 精选由统一固定 worker 执行，完成后回写批次。浏览器超时、反代
 // 掐断、页面刷新都不再中断任务；前端轮询 GET /recommendations/:id 直到脱离 processing。
 // allowPrivate 由调用方按角色决定（管理员可访问内网自建模型）。
 func (s *RecommendationService) Generate(ctx context.Context, userID int64, allowPrivate bool, req RecommendRequest) (*RecommendationView, error) {
@@ -453,29 +455,23 @@ func (s *RecommendationService) Generate(ctx context.Context, userID int64, allo
 	if v := s.reuseProcessingBatch(userID); v != nil {
 		return v, nil
 	}
-	batch := plan.newProcessingBatch()
-	if err := common.DB.Create(batch).Error; err != nil {
+	jobReq := recommendationJobRequestFromPlan(req, plan, true)
+	run, err := startDurableBusinessJob(userID, JobKindRecommendation, jobReq, allowPrivate)
+	if err != nil {
 		return nil, err
 	}
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				common.SysWarn("推荐后台任务 panic batch=%d: %v", batch.ID, r)
-				s.failBatch(batch, chatUsage{}, 0, fmt.Sprintf("生成任务异常终止: %v", r))
-			}
-		}()
-		// 独立于 HTTP 请求的 Context：浏览器断开不取消任务；总 deadline 防永久挂起。
-		bg, cancel := context.WithTimeout(context.Background(), recJobTimeout)
-		defer cancel()
-		if _, err := s.runGeneration(bg, batch, plan); err != nil {
-			common.SysWarn("用户 %d 推荐生成失败 batch=%d: %v", userID, batch.ID, err)
-		}
-	}()
-	return &RecommendationView{RecommendationBatch: *batch, Items: []RecommendationItemView{}}, nil
+	if run.ResultID == nil {
+		return nil, errors.New("推荐作业缺少结果引用")
+	}
+	var batch model.RecommendationBatch
+	if err := common.DB.Where("id = ? AND user_id = ?", *run.ResultID, userID).First(&batch).Error; err != nil {
+		return nil, err
+	}
+	return &RecommendationView{RecommendationBatch: batch, Items: []RecommendationItemView{}}, nil
 }
 
 // GenerateAuto 后台任务（收盘日报）代用户生成：token 照记审计，但不消耗次数配额。
-// 调用方已在自己的后台 goroutine 与 deadline 内，保持同步执行返回最终结果；
+// 调用方已在日报 JobRun 的有界双路阶段与 deadline 内，保持同步执行返回最终结果；
 // 批次同样先落 processing 行再回写，与手动路径完全同链路。
 func (s *RecommendationService) GenerateAuto(ctx context.Context, userID int64, allowPrivate bool, req RecommendRequest) (*RecommendationView, error) {
 	plan, err := s.prepareGeneration(userID, allowPrivate, req, false)
@@ -632,7 +628,7 @@ func (s *RecommendationService) failBatch(batch *model.RecommendationBatch, usag
 	}
 }
 
-// runGeneration 生成主体（同步执行；手动路径由 Generate 放进后台 goroutine）：
+// runGeneration 生成主体（用户入口由统一 JobRun worker 调用）：
 // 建池 → 量化评分 → LLM 精选 →（可选复核）→ 信任层回填 → 回写批次+落条目。
 // 失败一律先回写批次状态再返回错误；AI 超时/网络类失败降级为量化推荐。
 func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.RecommendationBatch, plan *recGenPlan) (*RecommendationView, error) {
@@ -642,6 +638,10 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 
 	// 阶段①②：多源建池（来源随策略组合）+ 基础准入 + 行情时效刷新（qf3 前置）+
 	// 用户筛选（基于刷新后行情，被筛掉的保留原因）。
+	if err := JobStepTransition(ctx, "candidate_pool"); err != nil {
+		s.failBatch(batch, chatUsage{}, 0, err.Error())
+		return nil, err
+	}
 	pool, freshGates, err := s.buildPool(ctx, userID, market, recType, strat, filters)
 	if err != nil {
 		s.failBatch(batch, chatUsage{}, 0, err.Error())
@@ -655,8 +655,13 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		s.failBatch(batch, chatUsage{}, 0, msg)
 		return nil, errors.New(msg)
 	}
+	_ = JobStepFinish(ctx, "candidate_pool", model.JobStatusSuccess)
 
 	// 阶段③：量化评分排序（拉日线算因子，追高保护在此判定），去相关贪心选出 LLM 名单。
+	if err := JobStepTransition(ctx, "quant_scoring"); err != nil {
+		s.failBatch(batch, chatUsage{}, 0, err.Error())
+		return nil, err
+	}
 	// 行业归属来自宇宙快照（S0-3；未积累时行业约束自动缺席）。
 	poolSyms := make([]string, 0, len(pool))
 	for _, c := range pool {
@@ -684,6 +689,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		return nil, s.failEmptyShortlist(batch, pool, filters, gates, industryBy, kept,
 			len(staleGates) > 0 || len(freshGates) > 0)
 	}
+	_ = JobStepFinish(ctx, "quant_scoring", model.JobStatusSuccess)
 	// 冻结真正的模型输入顺序。必须与 compactForLLM 共用 rank 排序口径，并在
 	// 终选门之后写回 pool；候选池快照、事件事实与 prompt 才能稳定重建同一机会集。
 	llmCands = freezeLLMInputOrder(pool, llmCands)
@@ -700,6 +706,10 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 
 	// 阶段④：LLM 精选 + 反编造校验 + repair。批次行（processing）已在同步段创建，
 	// 这里回填池快照与模型输入（生成中轮询详情即可见建池全景）。
+	if err := JobStepTransition(ctx, "llm_selection"); err != nil {
+		s.failBatch(batch, chatUsage{}, 0, err.Error())
+		return nil, err
+	}
 	mktCtx, regime := s.buildMarketContext(ctx, market)
 	// S1-1 regime 三档判定（影子模式）：照算照落库、前端展示，但**不注入 prompt 也
 	// 不改写 action**——注入 prompt 会让 LLM 自行少发 buy，污染「若强制降级会改写谁」
@@ -802,6 +812,8 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 				degradedNote = "AI 精选未完成（" + callErr.Error() + "）；已按量化排名生成降级推荐——规则生成，未经 AI 解读，请自行核查"
 				mainRun.DegradedReason = "quant_fallback"
 				callErr = nil
+				_ = JobStepFinish(ctx, "llm_selection", model.JobStatusDegraded)
+				_ = JobStepTransition(ctx, "quant_fallback")
 			}
 		}
 		if callErr != nil {
@@ -842,8 +854,12 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		}
 		return &RecommendationView{RecommendationBatch: *batch, Items: []RecommendationItemView{}}, nil
 	}
+	if degradedNote == "" {
+		_ = JobStepFinish(ctx, "llm_selection", model.JobStatusSuccess)
+	}
 
 	// 8) 信任层回填：量化分/排名/一手成本/证据核验/程序合成置信度。
+	_ = JobStepTransition(ctx, "trust_review")
 	for i := range picks {
 		c := poolBySymbol[picks[i].Symbol]
 		picks[i].QuantScore = c.Score
@@ -933,6 +949,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		s.failBatch(batch, usage, latency, "结果落库失败: "+err.Error())
 		return nil, err
 	}
+	_ = JobStepFinish(ctx, "trust_review", model.JobStatusSuccess)
 
 	// S0-5 反事实事件 + 标签事实（含影子标签）：进程内同步重试覆盖瞬时 DB 抖动，
 	// 全部成功置 facts_recorded=true；用尽仍失败保持 false 供人工排查（不影响主结果返回）。

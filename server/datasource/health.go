@@ -175,6 +175,26 @@ func (t *HealthTracker) AvailableForMarket(source, capability, market string) bo
 	return w == nil || !t.now().Before(w.cooldownUntil)
 }
 
+// ClearCooldownForMarket 只清除指定三元组的 cooldownUntil，保留环形窗口、
+// last outcome 和 cooldown 次数，便于管理员解冷后继续观察同一历史。
+// 返回解冷前剩余秒数与是否实际清除了冷却。
+func (t *HealthTracker) ClearCooldownForMarket(source, capability, market string) (int, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	w := t.windows[healthKey(source, capability, market)]
+	if w == nil {
+		return 0, false
+	}
+	now := t.now()
+	left := w.cooldownUntil.Sub(now)
+	if left <= 0 {
+		return 0, false
+	}
+	seconds := int(math.Ceil(left.Seconds()))
+	w.cooldownUntil = time.Time{}
+	return seconds, true
+}
+
 // HealthStat 健康端点（GET /api/admin/datasources）的单行能力矩阵。
 type HealthStat struct {
 	CapabilitySpec
@@ -243,10 +263,10 @@ func recoveryAdvice(st HealthStat) string {
 		return "注册表未声明该组合；历史观测不等于能力受支持，请先补注册与契约测试"
 	}
 	if !st.Observed {
-		return "等待正常业务调用形成观测；单能力主动 probe 留待 P0-3B 新路由接线"
+		return "等待正常业务调用形成观测，或由管理员执行一次受控单能力探测"
 	}
 	if st.CooldownLeft > 0 {
-		return fmt.Sprintf("等待冷却 %d 秒后自动恢复；持续失败时检查上游限流、网络与备用源", st.CooldownLeft)
+		return fmt.Sprintf("等待冷却 %d 秒后自动恢复；确认上游恢复后可由管理员填写原因并解除本能力冷却", st.CooldownLeft)
 	}
 	switch st.Observation {
 	case "empty":

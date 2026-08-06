@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"quantvista/common"
@@ -13,8 +14,11 @@ import (
 // 上层只依赖内部标准结构，单源挂掉可整体切换（见 docs/DATA_SOURCES.md）。
 // S1 起各能力路由入口统一走 routeCap：健康滑窗踢源 + 两层超时预算 + 错误归一日志。
 type Manager struct {
-	adapters []Adapter // 按优先级排列，[0] 为主源
-	health   *HealthTracker
+	adapters  []Adapter // 按优先级排列，[0] 为主源
+	health    *HealthTracker
+	probeMu   sync.Mutex
+	probeBusy map[string]struct{}
+	probeLast map[string]time.Time
 }
 
 // 两层超时预算：总预算兜底（调用方自带 deadline 时尊重调用方），单源短预算超时即换源。

@@ -45,7 +45,9 @@ type AnalysisService struct {
 }
 
 func NewAnalysisService(market *MarketService, watchlist *WatchlistService, position *PositionService, llm *LLMService, board *BoardService) *AnalysisService {
-	return &AnalysisService{market: market, watchlist: watchlist, position: position, llm: llm, board: board}
+	s := &AnalysisService{market: market, watchlist: watchlist, position: position, llm: llm, board: board}
+	s.registerDurableJobHandler()
+	return s
 }
 
 // 版本号：数据快照 + 这两个版本号共同保证「凭版本号复现」。改 prompt/策略时递增。
@@ -142,8 +144,8 @@ type AnalysisView struct {
 	StaleModeNote string `json:"stale_mode_note,omitempty"`
 }
 
-// analysisPlan 是同步准备阶段固化的运行计划。LLM 配置、密钥与 prompt 快照只解析一次，
-// 后台窗口内即使用户修改配置/模板，本次任务仍保持可复现的一致版本。
+// analysisPlan 是单次执行内的运行计划。持久 JobRun 只保存业务参数；真正执行、
+// 恢复或重跑时重新解析当前用户、LLM 配置与 prompt，再在该次执行内固定一致版本。
 type analysisPlan struct {
 	userID       int64
 	allowPrivate bool
@@ -172,27 +174,20 @@ func (s *AnalysisService) AnalyzeAsync(userID int64, allowPrivate bool, req Anal
 	if v := s.reuseProcessingAnalysis(userID); v != nil {
 		return v, nil
 	}
-	rec := plan.newProcessingRecord(s)
-	if err := common.DB.Create(rec).Error; err != nil {
+	// 只把经过规范化的业务参数放入快照；配置密钥、prompt、消息和 allow_private
+	// 均由执行器重新读取。占位行与 JobRun 在同一事务创建。
+	run, err := startDurableBusinessJob(userID, JobKindAnalysis, plan.req, allowPrivate)
+	if err != nil {
 		return nil, err
 	}
-	// 返回值必须在启动 goroutine 前复制，避免响应序列化与后台回写共享同一对象。
-	view := s.toView(*rec)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				common.SysWarn("分析后台任务 panic record=%d: %v", rec.ID, r)
-				rec.ErrorCode = AsyncLLMTaskErrorPanic
-				s.failAnalysisRecord(rec, fmt.Sprintf("分析任务异常终止: %v", r))
-			}
-		}()
-		bg, cancel := context.WithTimeout(context.Background(), analysisJobTimeout)
-		defer cancel()
-		if _, err := s.runAnalysis(bg, plan, rec); err != nil {
-			common.SysWarn("用户 %d 分析任务失败 record=%d: %v", userID, rec.ID, err)
-		}
-	}()
-	return view, nil
+	if run.ResultID == nil {
+		return nil, errors.New("分析作业缺少结果引用")
+	}
+	var rec model.AnalysisRecord
+	if err := common.DB.Where("id = ? AND user_id = ?", *run.ResultID, userID).First(&rec).Error; err != nil {
+		return nil, err
+	}
+	return s.toView(rec), nil
 }
 
 // prepareAnalysis 完成无需访问行情/模型的确定性准备，非法输入、无配置与配额用尽立即返回。
@@ -302,10 +297,14 @@ func (s *AnalysisService) runAnalysis(ctx context.Context, plan *analysisPlan, r
 	cfg, apiKey := plan.cfg, plan.apiKey
 
 	// 组装数据上下文。异步任务失败时回写 processing 行；同步调用保持原先不留空记录的语义。
+	if err := JobStepTransition(ctx, "collect_data"); err != nil {
+		return s.failAnalysisRun(rec, err)
+	}
 	actx, err := s.buildContext(ctx, userID, req)
 	if err != nil {
 		return s.failAnalysisRun(rec, err)
 	}
+	_ = JobStepFinish(ctx, "collect_data", model.JobStatusSuccess)
 	// 行情时效 fail-closed（P0-5）：个股「当前分析/当前评级」不得建立在过期或无法核验
 	// 时效的行情上——全源无 fresh 时默认拒绝（数据不足）；用户显式 allow_stale 才按
 	// 「截至行情时刻的历史数据解释」模式生成（快照打标 + guidance 提示 + 解析后
@@ -401,12 +400,19 @@ func (s *AnalysisService) runAnalysis(ctx context.Context, plan *analysisPlan, r
 		repairHint = panelRepairHint
 	}
 
+	if err := JobStepTransition(ctx, "llm_analysis"); err != nil {
+		return s.failAnalysisRun(rec, err)
+	}
 	raw, usage, latency, callErr := s.callWithRepair(ctx, userID, mainRun, cfg, apiKey, allowPrivate, messages, parse, repairHint)
+	if callErr == nil {
+		_ = JobStepFinish(ctx, "llm_analysis", model.JobStatusSuccess)
+	}
 
 	// 信任层：仅当成功解析出标准结构化结果时做证据核验 + 程序合成置信度 + 可选 AI 复核
 	// （panel 无标准结论字段、degraded 无合法结构，都不做）。复核在配额记账前完成，
 	// 其 token 折入本次动作一起累计与扣费（一次分析动作仍只计 1 次配额）。
 	if callErr == nil && result != nil {
+		_ = JobStepTransition(ctx, "trust_review")
 		// 历史解释模式程序化硬约束（先于核验与交易计划）：summary 强制历史解释前缀、
 		// suggestions 剔除当前买卖行动条目——提示词约束（guidance）只是软引导，模型
 		// 不遵守时由这里兜底保证输出形态（说明在信任层回填后并入 sys_confidence_why）。
@@ -445,6 +451,7 @@ func (s *AnalysisService) runAnalysis(ctx context.Context, plan *analysisPlan, r
 				result.SysConfidenceWhy = staleEnforceNote
 			}
 		}
+		_ = JobStepFinish(ctx, "trust_review", model.JobStatusSuccess)
 	}
 
 	rec.PromptTokens = usage.PromptTokens

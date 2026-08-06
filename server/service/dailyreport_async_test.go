@@ -145,6 +145,17 @@ func TestDailyReportAsyncParallel(t *testing.T) {
 	if q.ActionUsed != 1 {
 		t.Fatalf("手动生成应计 1 次动作: %+v", q)
 	}
+	var runs []model.JobRun
+	if err := common.DB.Where("user_id = ? AND result_type = ? AND result_id = ?", int64(51), JobResultDailyReport, v.ID).Find(&runs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Status != model.JobStatusDegraded {
+		t.Fatalf("日报 partial 必须映射为唯一 degraded JobRun: %+v", runs)
+	}
+	jobView, err := GetJobRun(51, runs[0].ID, true)
+	if err != nil || len(jobView.Steps) < 3 {
+		t.Fatalf("日报应记录真实三阶段步骤: view=%+v err=%v", jobView, err)
+	}
 }
 
 // TestDailyReportRegenerateKeepsOld 重生成双败：旧报告内容不被覆盖、状态回滚 success、

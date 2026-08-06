@@ -51,7 +51,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	taskCenterSvc := service.NewTaskCenterService()
 	// D17 持仓卖出决策 AI 建议（逐笔 hold|trim|exit，走统一作业与兼容结果行）
 	positionAdviceSvc := service.NewPositionAdviceService(positionSvc, llmSvc)
-	// 四类首批 handler 均已注册；此时再收敛 running 并按持久顺序恢复 queued。
+	// 七类用户作业 handler 均已注册；此时再收敛 running 并按持久顺序恢复 queued。
 	service.StartJobRuntime()
 
 	// controllers
@@ -419,6 +419,9 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 
 				// 数据源健康端点（S1 健康滑窗：每 (源,能力) success/empty/error 与冷却状态）
 				admin.GET("/datasources", marketCtl.DataSources)
+				// P0-3B：单能力有界主动探测与指定三元组人工解冷（均为 POST）
+				admin.POST("/datasources/probe", marketCtl.ProbeDataSource)
+				admin.POST("/datasources/uncool", marketCtl.UncoolDataSource)
 				// P1 数据健康总览：各数据域 expected/observed 日期、落后开市日数、覆盖率
 				admin.GET("/data-health", marketCtl.DataHealth)
 

@@ -95,7 +95,7 @@ type DataSyncLog struct {
 	// 运维审计只存白名单摘要，不存请求正文、token、cookie 或上游响应。
 	TriggerSource    string    `gorm:"size:24;index;default:scheduler" json:"trigger_source"` // scheduler / startup / admin / admin_legacy
 	UserID           int64     `gorm:"index" json:"user_id"`                                  // 管理员手动触发者；系统任务为 0
-	ParameterSummary string    `gorm:"size:512" json:"parameter_summary"`
+	ParameterSummary string    `gorm:"size:1024" json:"parameter_summary"`
 	RangeSummary     string    `gorm:"size:128" json:"range_summary"`
 	PlanHash         string    `gorm:"size:64" json:"plan_hash"`
 	CreatedAt        time.Time `gorm:"index;index:idx_sync_task_created,priority:2" json:"created_at"`

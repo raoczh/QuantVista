@@ -8,7 +8,7 @@ export type TaskStage = 'queued' | 'running' | 'finished'
 export interface JobStep {
   id: number
   sequence: number
-  name: 'queued' | 'dispatch' | 'execute' | 'persist'
+  name: string
   status: TaskStatus
   error?: string
   error_code?: string
@@ -95,6 +95,16 @@ export const JOB_STEP_LABELS: Record<JobStep['name'], string> = {
   dispatch: '工作器分派',
   execute: '业务执行',
   persist: '结果持久化',
+  collect_data: '采集证据',
+  llm_analysis: '模型分析',
+  trust_review: '可信度复核',
+  candidate_pool: '构建候选池',
+  quant_scoring: '量化评分',
+  llm_selection: '模型筛选',
+  quant_fallback: '量化降级',
+  snapshot: '生成数据快照',
+  dual_generation: '双路生成',
+  finalize: '报告收敛',
 }
 
 const TASK_KIND_LABELS: Record<string, string> = {
@@ -106,6 +116,8 @@ const TASK_KIND_LABELS: Record<string, string> = {
   short_term: '短线推荐',
   long_term: '长线推荐',
   daily_report: '收盘日报',
+  analysis: 'AI 分析',
+  recommendation: '选股推荐',
   qa: '个股问答',
   compare: '横向对比',
   position_advice: '持仓建议',
@@ -199,6 +211,9 @@ function baseTaskRoute(task: TaskCenterItem): RouteLocationRaw | null {
       return { name: 'admin' }
     case 'job':
     case 'llm':
+      if (task.kind === 'analysis') return { name: 'analysis' }
+      if (task.kind === 'recommendation') return { name: 'recommendations' }
+      if (task.kind === 'daily_report') return { name: 'daily-report' }
       if (task.kind === 'qa') return { name: 'qa' }
       if (task.kind === 'compare') return { name: 'compare' }
       if (task.kind === 'position_advice') return { name: 'positions' }
@@ -220,6 +235,9 @@ export function taskResultRoute(task: TaskCenterItem): RouteLocationRaw | null {
   if (task.source === 'recommendation') return { name: 'recommendations', query: { batch_id: id } }
   if (task.source === 'daily_report') return { name: 'daily-report', query: { report_id: id } }
   if (task.source === 'llm' || task.source === 'job') {
+    if (task.kind === 'analysis') return { name: 'analysis', query: { record_id: id } }
+    if (task.kind === 'recommendation') return { name: 'recommendations', query: { batch_id: id } }
+    if (task.kind === 'daily_report') return { name: 'daily-report', query: { report_id: id } }
     if (task.kind === 'qa') return { name: 'qa', query: { task_id: id } }
     if (task.kind === 'compare') return { name: 'compare', query: { task_id: id } }
     if (task.kind === 'position_advice') return { name: 'positions', query: { task_id: id } }

@@ -81,10 +81,19 @@ func (s *TaskCenterService) Events(userID, afterID, limit int64) ([]JobEventView
 }
 
 func StartDurableLLMTask(userID int64, kind string, request any, allowPrivate bool) (*LLMTaskView, error) {
-	if !isDurableJobKind(kind) {
+	if !isLegacyDurableJobKind(kind) {
 		return nil, fmt.Errorf("%w: %s", ErrJobKindUnsupported, kind)
 	}
 	return defaultJobRuntime.start(userID, kind, request, allowPrivate, nil, nil)
+}
+
+// startDurableBusinessJob 是三类用户任务的统一提交入口。它返回 JobRun 与结果引用，
+// 业务服务再用原有详情查询组装响应，因而旧业务 ID/路由保持不变。
+func startDurableBusinessJob(userID int64, kind string, request any, allowPrivate bool) (*model.JobRun, error) {
+	if !isBusinessDurableJobKind(kind) {
+		return nil, fmt.Errorf("%w: %s", ErrJobKindUnsupported, kind)
+	}
+	return defaultJobRuntime.startWithBinding(userID, kind, request, allowPrivate, nil, nil, nil)
 }
 
 func GetJobRun(userID, id int64, withSteps bool) (*JobRunView, error) {
@@ -145,7 +154,11 @@ func CancelJobRun(userID, id int64) (*JobRunView, error) {
 				return ErrJobNotCancelable
 			}
 			if run.ResultID != nil {
-				if err := failCompatibleLLMTask(tx, *run.ResultID, userID, JobErrorCanceled, "作业已取消", now); err != nil {
+				binding := defaultJobRuntime.bindingForRun(run)
+				if binding.finishFailure == nil {
+					return errors.New("作业结果绑定不可用")
+				}
+				if err := binding.finishFailure(tx, &run, model.JobStatusCanceled, JobErrorCanceled, "作业已取消", now); err != nil {
 					return err
 				}
 			}
@@ -200,21 +213,30 @@ func RetryJobRun(userID, id int64) (*JobRunView, error) {
 	if err != nil {
 		return nil, err
 	}
-	task, err := defaultJobRuntime.start(
-		userID, parent.Kind, json.RawMessage(snapshot.Request), false, &parent.ID, nil,
-	)
+	var child *model.JobRun
+	if isBusinessDurableJobKind(parent.Kind) {
+		child, err = defaultJobRuntime.startWithBinding(userID, parent.Kind, json.RawMessage(snapshot.Request), false, &parent.ID, nil, nil)
+	} else {
+		var task *LLMTaskView
+		task, err = defaultJobRuntime.start(userID, parent.Kind, json.RawMessage(snapshot.Request), false, &parent.ID, nil)
+		if err == nil {
+			var compatibility model.LLMTask
+			if lookupErr := common.DB.Select("job_run_id").Where("id = ? AND user_id = ?", task.ID, userID).First(&compatibility).Error; lookupErr != nil {
+				return nil, lookupErr
+			}
+			if compatibility.JobRunID == nil {
+				return nil, errors.New("重跑作业缺少事实关联")
+			}
+			return GetJobRun(userID, *compatibility.JobRunID, true)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-	var compatibility model.LLMTask
-	if err := common.DB.Select("job_run_id").Where("id = ? AND user_id = ?", task.ID, userID).
-		First(&compatibility).Error; err != nil {
-		return nil, err
-	}
-	if compatibility.JobRunID == nil {
+	if child == nil || child.ID == 0 {
 		return nil, errors.New("重跑作业缺少事实关联")
 	}
-	return GetJobRun(userID, *compatibility.JobRunID, true)
+	return GetJobRun(userID, child.ID, true)
 }
 
 func ListJobEvents(userID, afterID, limit int64) ([]JobEventView, error) {
@@ -282,8 +304,21 @@ func jobRunView(run model.JobRun) *JobRunView {
 }
 
 func isDurableJobKind(kind string) bool {
+	return isLegacyDurableJobKind(kind) || isBusinessDurableJobKind(kind)
+}
+
+func isLegacyDurableJobKind(kind string) bool {
 	switch strings.TrimSpace(kind) {
 	case JobKindQA, JobKindCompare, JobKindPositionAdvice, JobKindScreenerParse:
+		return true
+	default:
+		return false
+	}
+}
+
+func isBusinessDurableJobKind(kind string) bool {
+	switch strings.TrimSpace(kind) {
+	case JobKindAnalysis, JobKindRecommendation, JobKindDailyReport:
 		return true
 	default:
 		return false

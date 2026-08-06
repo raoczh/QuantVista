@@ -495,13 +495,13 @@ AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yiel
 后两者顺序不可交换：两轮消费同一批本地数据，守护轮先落 `guard_events` 台账，
 复核轮的 `pos_ma_break` / `pos_lhb_sell` 推送才不会与它交叉。
 
-### 5.9.1 Task Center Service（Top50 P0-2A/P0-2B-1）
+### 5.9.1 Task Center Service（Top50 P0-2A/P0-2B-2A）
 
 `GET /api/tasks` 是统一作业与 legacy 异步业务表之上的轻量聚合层：默认按当前用户汇总 `JobRun`、分析、推荐、日报与未迁移的 `llm_tasks`；只有管理员显式传 `include_system=1` 时，才附加没有用户归属的系统同步终态历史。各来源各执行一次有界、字段白名单查询，不读取结果正文或数据快照，且查询 `llm_tasks` 时排除已有 `job_run_id` 的兼容结果。当前接口没有 `partial/degraded_sources` 契约，任一选中来源查询失败会使整个请求失败，调用方保留现有视图并展示错误。
 
 所有来源统一映射状态、耗时、错误码、恢复建议与仅含记录 ID 的结果深链。15 分钟未更新的 legacy 用户侧 `processing` 任务由各自业务服务按同一口径惰性收敛为 `failed`；`JobRun` 则由自身 CAS、取消和恢复规则收敛。顶栏最近任务与运行中数量分别查询，达到 100 条上限时只能展示“至少 N 项”，不能把截断值当精确总数。
 
-P0-2B-1 仅让 `qa/compare/position_advice/screener_parse` 获得 `job_runs/job_steps/job_events`、事实阶段、取消、持久输入重跑、SSE、bounded worker 与积压背压。分析、推荐、日报和数据同步仍是 legacy 投影；模型、provider、token、trace 等元数据只在来源真实具备时透传，禁止由摘要层补造进度或可重放请求。
+P0-2B-1 先让 `qa/compare/position_advice/screener_parse` 获得统一作业能力；P0-2B-2A 再将 `analysis/recommendation/daily_report` 接入同一套 `job_runs/job_steps/job_events`、事实阶段、取消、版本化参数重跑、SSE、bounded worker 与总在途背压。七类用户作业的结果正文仍只保存在原业务事实表中，任务中心通过 `result_type/result_id` 建立深链且排除 legacy 重复行。`data_sync` 的 system owner/管理员触发者双重归属和 `ResearchArtifact` 留待 P0-2B-2B，禁止用 `user_id=0` 伪装用户作业；模型、provider、token、trace 等元数据只在来源真实具备时透传，禁止由摘要层补造进度或可重放请求。
 
 ### 5.10 扩展模块（N/F/T/S/M/P3 批次 + 2026-07 杂项批）
 
@@ -551,7 +551,7 @@ LLM 的角色从「海选者」降级为「解释者/否决者」（listwise 海
 
 关键常量：`maxScanCandidates=48 / maxLLMCandidates=10 / maxPoolIntake=240 / poolSnapshotMax=150`。
 
-生成类 LLM 均为**异步任务**（推荐/日报自 2026-07-14，分析/问答/AI 对比/白话选股自 2026-07-22）。P0-2B-1 起，`qa / compare / position_advice / screener_parse` 四类通用任务进入统一 `JobRun` 有界运行时；分析、推荐、日报与 `data_sync` 本批仍保留各自业务表/goroutine 的 legacy fallback，不代表 P0-2B 全量迁移完成。HTTP 入口只做确定性校验并立即返回；浏览器断开与页面刷新不取消后台模型调用。推荐主调失败时既有量化降级语义保持不变；其他模块按各自失败/降级契约收尾，不用量化结果掩盖上游错误。
+生成类 LLM 均为**异步任务**（推荐/日报自 2026-07-14，分析/问答/AI 对比/白话选股自 2026-07-22）。P0-2B-2A 起，`qa / compare / position_advice / screener_parse / analysis / recommendation / daily_report` 七类用户任务进入统一 `JobRun` 有界运行时；原业务表继续保存结果事实和历史深链，提交入口返回原业务记录 ID，不再为分析、推荐或日报启动提交级 goroutine。HTTP 入口只做确定性校验并立即返回；浏览器断开与页面刷新不取消后台模型调用。推荐主调失败时既有量化降级语义保持不变；其他模块按各自失败/降级契约收尾，不用量化结果掩盖上游错误。`data_sync` 与 `ResearchArtifact` 的归属模型仍留待 P0-2B-2B。
 
 策略-来源映射（`strategySources`，对冲「热度榜供给的票恰是风控规则最想排除的票」的结构性矛盾）：
 momentum=涨幅+换手+成交额；pullback=**回调榜**(跌幅升序过滤温和回调)+成交额+涨幅；active=成交额+换手+涨幅；
@@ -621,29 +621,31 @@ value=**低PB榜**(升序滤负PB)+成交额；growth=涨幅+换手+成交额；
 
 背景：浏览器/入站反代与 LLM 中转站是两层不同的超时。后台任务解决前者取消请求 Context 的问题；真正 SSE 与单次输出预算解决后者的 60s 空闲/整包限制。只改前端轮询不能处理模型网关 504，必须同时满足以下约束：
 
-1. **异步任务化**：推荐/日报/分析继续复用各自业务表的 `processing` 状态。问答、AI 对比、持仓建议、白话选股解析以 `JobRun` 为作业事实，`llm_tasks` 仅保留兼容结果载体和旧深链；同步入口不采集行情、不调用模型。四类统一作业使用固定 worker 数与总在途容量，满载稳定返回 `job_queue_busy`；各任务仍有独立总 deadline（问答 10min，其余三类 5min）。
+1. **异步任务化**：分析、推荐、日报、问答、AI 对比、持仓建议和白话选股解析均以 `JobRun` 为作业事实；前三类继续以各自业务表的 `processing/终态` 承载结果正文和旧深链，后四类以 `llm_tasks` 保留兼容结果。同步入口不采集行情、不调用模型；统一固定 4 worker、32 总在途，满载稳定返回 `job_queue_busy`，各任务保留独立总 deadline。
 2. **真正流式调用**：所有业务 `chatCompletion` 先走 Chat/Responses SSE，`stream=true` 与防缓冲请求头在每个 fallback 请求中都保留；流式 client 无整体 HTTP timeout。只有上游明确以 4xx 拒绝 stream 时才回落整包请求，不能在 504、流中断或调用 Context 取消后静默改走非流式。
 3. **单次调用边界**：模块预算取 `min(用户 max_tokens, 模块上限)`；analysis/recommendation/qa/news=2500，trade_plan/rec_review/rec_bear/daily_report=1500，analysis_review/compare=1000，screener_parse=2000。全部结构化模块最多 1 次 repair，坏输出默认只回灌 600 字（日报 800 字）；业务 prompt 不再用字数、句数或性能型数组条数压缩模型回答，JSON schema、推荐数量、固定角色和逐 ID 映射等业务契约仍保留。Chat 端拒绝 `max_tokens` 时必须携同值改用 `max_completion_tokens`；Responses 始终携带 `max_output_tokens`。两种字段都不支持则失败，禁止删除 token 参数退成无上限生成。
 4. **业务降级边界**：只有推荐维持既有量化降级（ATR 规则计划价、action 恒 watch、置信度 low、`degraded_source=quant_fallback`）；鉴权/路径/配额类确定性错误直接失败。日报两路并行并保留旧报告回滚语义；其他模块按自身失败/结构化降级契约收尾。
 
-### 6.11 统一作业事实首批（P0-2B-1）
+### 6.11 统一作业事实（P0-2B-1 / P0-2B-2A）
 
-本批范围严格限定为 `qa / compare / position_advice / screener_parse`。分析、推荐、日报和 `data_sync` 仍由任务中心作 legacy 投影；后续批次迁移前，不把它们伪装为 `JobRun`，也不宣称 P0-2B 已全部完成。
+P0-2B-1 首批覆盖 `qa / compare / position_advice / screener_parse`；P0-2B-2A 在同一运行时迁入 `analysis / recommendation / daily_report`。`data_sync` 因 system owner 与管理员触发者双重归属仍留给 P0-2B-2B，禁止用 `user_id=0` 伪造用户作业；统一 `ResearchArtifact` 也尚未落地，因此 P0-2B 仍未整体关闭。
 
-- **事实模型**：`job_runs` 保存用户、kind、请求 hash、状态、父作业、错误、trace、模型/token/耗时/业务计数及原结果引用；`job_steps` 只记录真实发生的 `queued / dispatch / execute / persist`；`job_events` 用数据库自增主键提供全局单调 Event-ID。状态仅允许 `queued / running / success / degraded / failed / canceled`，所有终态更新均以当前状态和 `cancel_requested` 为条件做数据库 CAS，终态不能回退。
-- **快照与权限边界**：`job_runs.request_snapshot` 是版本化、类型化且最大 16KiB 的业务请求，只包含重跑必需参数。创建前拒绝 API Key、Authorization、系统 prompt、消息数组与数据/结果快照字段；不保存 prompt 正文、大数据快照、结果正文或提交时的 `allow_private`。执行、恢复与重跑都按当时数据库中的“启用管理员”状态重新判定私网模型权限；升级前快照里的旧 `allow_private` 字段只做解码兼容，绝不能成为授权依据。结果仍落原业务载体，本批用 `result_type=llm_task + result_id` 定位兼容结果，成功事务必须确认该结果行恰好更新一条，不能出现作业成功而结果缺失。
+- **事实模型**：`job_runs` 保存用户、kind、请求 hash、状态、父作业、错误、trace、模型/token/耗时/业务计数及原结果引用；`job_events` 用数据库自增主键提供全局单调 Event-ID。通用四类记录 `queued/dispatch/execute/persist`；分析按实际记录 `collect_data/llm_analysis/trust_review`，推荐记录 `candidate_pool/quant_scoring/llm_selection/quant_fallback/trust_review`，日报记录 `snapshot/dual_generation/finalize`，最后统一进入 `persist`，未发生的步骤不补造。状态仅允许 `queued / running / success / degraded / failed / canceled`，所有终态更新均以当前状态和 `cancel_requested` 为条件做数据库 CAS，终态不能回退。
+- **快照、权限与结果绑定**：`job_runs.request_snapshot` 是版本化、类型化且最大 16KiB 的业务请求，只包含重跑必需参数。创建前拒绝 API Key、Authorization、cookie、prompt、消息数组、数据/结果正文与 `allow_private`。执行、恢复与重跑按当前数据库用户状态和角色重判私网权限，禁用或降权立即生效。`result_type` 支持 `llm_task/analysis/recommendation/daily_report`；业务占位行、JobRun 和引用在同一事务创建，成功事务必须确认引用结果已落终态，不把大结果复制进 JobRun。
 - **幂等与容量**：`(user_id, kind, request_hash)` 派生 `active_key`，仅 queued/running 持有并由唯一索引跨实例防重。运行时固定 4 个 worker、最多 32 个总在途作业，不再按请求无限创建 goroutine；满载不落孤儿 queued 行。
 - **取消与恢复**：queued 取消用 CAS 直接进入 canceled；running 先持久化 `cancel_requested`，本实例立即取消 Context，其他实例/恢复路径通过数据库轮询协作取消。成功持久化与取消在同一事务条件上竞争，只有一个终态获胜。启动时遗留 running 明确收敛为 `job_interrupted`（已请求取消者收敛 canceled），queued 按 ID 升序恢复，容量外的 queued 保持排队并随槽位释放续排。
-- **重跑**：仅失败且已注册的四类 handler 可重跑。重跑从旧 run 的持久快照创建新 run 并写 `parent_id`，旧 run 不修改；若同用户、同 kind、同请求已有 queued/running 作业，则稳定返回 `job_already_running`，不得复用一个没有该 parent 的在途 run；不支持的 kind 返回明确错误。
-- **事件与前端**：`GET /api/tasks/events` 位于 JWT 中间件后，支持 `Last-Event-ID`、单调 `id:`、`event: job` 与 15s heartbeat。前端用 `fetch` 的 `Authorization` 请求头读取流，token 从不进入 URL；断线指数重连并保留串行轮询回退。任务中心优先列 JobRun，查询旧 `llm_tasks` 时排除 `job_run_id IS NOT NULL`，从而避免双行；结果深链使用 `result_id`，旧 `/llm-tasks/:id` 与历史结果链接继续兼容。
+- **重跑**：仅失败且已注册的七类 handler 可重跑。重跑从旧 run 的持久快照创建新 run 并写 `parent_id`，旧 run 不修改；若同用户、同 kind、同请求已有 queued/running 作业，则稳定返回 `job_already_running`，不得复用一个没有该 parent 的在途 run；不支持的 kind 返回明确错误。
+- **事件与前端**：`GET /api/tasks/events` 位于 JWT 中间件后，支持 `Last-Event-ID`、单调 `id:`、`event: job` 与 15s heartbeat。前端用 `fetch` 的 `Authorization` 请求头读取流，token 从不进入 URL；断线指数重连并保留串行轮询回退。任务中心优先列 JobRun，查询旧 `llm_tasks` 与三类业务表时排除已被 `result_type/result_id` 引用的行，从而避免双行；深链使用业务 `result_id`，旧业务详情路由继续兼容。
 
-### 6.12 数据覆盖与维护预演（P0-3A）
+### 6.12 数据覆盖、主动探测与解冷（P0-3A / P0-3B）
 
 数据源支持面只认 `provider × capability × market` 代码注册表，健康滑窗仅提供观测，不得反推未注册能力。`GET /api/admin/datasources` 与 `GET /api/admin/data-health` 都只读取进程观测和本地数据库；后者把交易日窗口钳在 30～60 日，以索引查询和结果硬上限区分休市、停牌、缺失、部分覆盖与未知日历。稀疏事件零行保持 unknown，不能伪装成完整覆盖。
 
 `sync-bars/backfill-calendar/wide-sync` 的新请求正文只接受单个、最大 4KiB 的 JSON 对象；完全无 body 才走旧兼容路径。新路径必须先 dry-run，计划 hash 绑定本地事实并在真正上游调用前重算，事实变化即拒绝。日历计划的 `target_count` 与 `sample_targets` 表示执行时会逐日核对订正的完整范围，`missing_count` 只表示当前缺行数；二者不得混用。`DataSyncLog` 只保存触发来源、管理员、白名单参数摘要与 hash，不保存 token、cookie、密钥或原始正文。
 
-管理页与个股覆盖矩阵只使用主题变量和页面已经取得的数据；切股异步响应须经过 epoch 校验。主动 probe 与人工解冷仍属于 P0-3B，必须使用受权限、限流和审计保护的 POST 路由，不能塞进只读 GET 或页面刷新。
+管理员 `POST /api/admin/datasources/probe` 只接受注册表中的精确三元组，直达指定适配器而不自动换源；固定样本与列表 `limit=1`，同时受 12 次/分钟进程窗口、同三元组 15 秒、全局并发 2 和注册能力超时保护。success/empty/error 都写回同一健康滑窗；响应与 `DataSyncLog` 只含归一代码、耗时和白名单参数，不保存原始请求/响应或凭据。
+
+管理员 `POST /api/admin/datasources/uncool` 要求不超过 200 字且不含凭据字段的原因，只把指定三元组的 `cooldownUntil` 清零，保留环形样本、最后观测/成功和冷却次数；审计记录管理员、原因、解冷前剩余秒数与是否实际清除。管理页提供确认、loading、防连点、错误恢复和成功后能力/日志局部刷新；375px 与 1440px、亮暗主题均只使用主题变量。两个副作用都禁止用 GET 或页面刷新替代。
 
 ## 7. 数据缓存策略
 
@@ -697,7 +699,7 @@ AI 结果：
 - `/recommendations`：推荐历史与追踪（策略模板为页内下拉，无独立页）
 - `/qa`：个股 AI 问答
 - `/compare`：个股横向对比
-- `/tasks`：统一任务中心（P0-2B-1 四类 JobRun 支持真实步骤、取消、重跑与 SSE；其余来源保持 legacy 投影）
+- `/tasks`：统一任务中心（P0-2B-2A 七类用户 JobRun 支持真实步骤、取消、父子重跑、恢复与 SSE；原业务结果通过引用去重并保留历史深链，`data_sync` 仍为 system legacy 投影）
 - `/alerts`：提醒规则 + 推送通道
 - `/paper`：模拟交易
 - `/etf`：指数 ETF 交易（精选指数 ETF 行情 + 复用模拟盘买卖，2026-07-05）

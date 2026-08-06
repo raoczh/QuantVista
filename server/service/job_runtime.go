@@ -22,6 +22,14 @@ const (
 	JobKindCompare        = "compare"
 	JobKindPositionAdvice = "position_advice"
 	JobKindScreenerParse  = "screener_parse"
+	JobKindAnalysis       = "analysis"
+	JobKindRecommendation = "recommendation"
+	JobKindDailyReport    = "daily_report"
+
+	JobResultLLMTask        = "llm_task"
+	JobResultAnalysis       = "analysis"
+	JobResultRecommendation = "recommendation"
+	JobResultDailyReport    = "daily_report"
 
 	jobSnapshotVersion  = 1
 	jobSnapshotMaxBytes = 16 << 10
@@ -66,8 +74,8 @@ type persistedJobSnapshot struct {
 	Request json.RawMessage `json:"request"`
 }
 
-// DurableJobResult 将原业务结果与作业观测元数据分开。Value 只写入 llm_tasks
-// 兼容结果行，不会进入 job_runs。
+// DurableJobResult 将原业务结果与作业观测元数据分开。Value 只由兼容的
+// llm_task 绑定使用；分析/推荐/日报结果继续由各自业务表承载。
 type DurableJobResult struct {
 	Value            any
 	Status           string
@@ -84,9 +92,61 @@ type DurableJobResult struct {
 
 type DurableJobHandler func(context.Context, int64, bool, json.RawMessage) (DurableJobResult, error)
 
+// durableJobBinding 把作业事实与业务结果载体连接起来。创建、失败/取消回写和
+// 成功引用校验都在运行时事务内执行，避免孤儿业务行或 JobRun 成功但结果缺失。
+type durableJobBinding struct {
+	resultType string
+	create     func(*gorm.DB, *model.JobRun, json.RawMessage) (int64, error)
+	// resultCommittedByHandler 表示业务处理器返回前已把结果事实写入原业务表。
+	// 此时迟到的 cancel_requested 不能再把 JobRun 改成 canceled，否则会形成
+	// “作业取消但结果成功”的半终态；最终成功事务会校验结果并让成功获胜。
+	resultCommittedByHandler bool
+	// persistSuccess 必须在 JobRun 终态 CAS 同一事务内确认业务结果已经存在且可读。
+	persistSuccess func(*gorm.DB, *model.JobRun, DurableJobResult, []byte, time.Time) error
+	finishFailure  func(*gorm.DB, *model.JobRun, string, string, string, time.Time) error
+}
+
 type durableJobHandler struct {
-	timeout time.Duration
-	run     DurableJobHandler
+	timeout  time.Duration
+	run      DurableJobHandler
+	binding  durableJobBinding
+	legacyIO bool // 旧四类任务由运行时自动记录 execute 步骤。
+}
+
+func defaultLLMTaskBinding(kind string) durableJobBinding {
+	return durableJobBinding{
+		resultType: JobResultLLMTask,
+		create: func(tx *gorm.DB, run *model.JobRun, _ json.RawMessage) (int64, error) {
+			task := &model.LLMTask{UserID: run.UserID, Kind: run.Kind, JobRunID: &run.ID,
+				RequestHash: run.RequestHash, Status: model.LLMTaskStatusProcessing}
+			if err := tx.Create(task).Error; err != nil {
+				return 0, err
+			}
+			return task.ID, nil
+		},
+		persistSuccess: func(tx *gorm.DB, run *model.JobRun, result DurableJobResult, resultJSON []byte, now time.Time) error {
+			if run.ResultID == nil {
+				return errors.New("作业缺少兼容结果引用")
+			}
+			res := tx.Model(&model.LLMTask{}).
+				Where("id = ? AND user_id = ? AND job_run_id = ?", *run.ResultID, run.UserID, run.ID).
+				Updates(map[string]any{"status": model.LLMTaskStatusSuccess, "result_json": string(resultJSON),
+					"error": "", "error_code": "", "active_key": nil, "updated_at": now})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return errors.New("作业兼容结果引用无效")
+			}
+			return nil
+		},
+		finishFailure: func(tx *gorm.DB, run *model.JobRun, _ string, code, message string, now time.Time) error {
+			if run.ResultID == nil {
+				return errors.New("作业缺少兼容结果引用")
+			}
+			return failCompatibleLLMTask(tx, *run.ResultID, run.UserID, code, message, now)
+		},
+	}
 }
 
 type jobRuntime struct {
@@ -128,22 +188,29 @@ func newJobRuntime(workers, capacity int) *jobRuntime {
 
 var defaultJobRuntime = newJobRuntime(jobWorkerCount, jobCapacity)
 
-// RegisterDurableLLMJobHandler 注册可从持久快照恢复的处理器。四类首批任务由各自
-// service 构造函数注册，重启恢复与失败重跑只接受这些已注册类型。
+// RegisterDurableLLMJobHandler 注册兼容 llm_tasks 的可恢复处理器。
 func RegisterDurableLLMJobHandler(kind string, timeout time.Duration, handler DurableJobHandler) {
-	if !isDurableJobKind(kind) {
-		return
-	}
-	defaultJobRuntime.register(kind, timeout, handler)
+	defaultJobRuntime.registerWithBinding(kind, timeout, handler, defaultLLMTaskBinding(kind), true)
 }
 
+// registerDurableBusinessJobHandler 注册以原业务表为结果事实的作业。结果正文不会
+// 被复制进 job_runs；handler 只返回状态和调用元数据。
+func registerDurableBusinessJobHandler(kind string, timeout time.Duration, binding durableJobBinding, handler DurableJobHandler) {
+	defaultJobRuntime.registerWithBinding(kind, timeout, handler, binding, false)
+}
+
+// register 保留测试与旧内部调用的三参数形式，默认使用 llm_task 结果绑定。
 func (r *jobRuntime) register(kind string, timeout time.Duration, handler DurableJobHandler) {
+	r.registerWithBinding(kind, timeout, handler, defaultLLMTaskBinding(kind), true)
+}
+
+func (r *jobRuntime) registerWithBinding(kind string, timeout time.Duration, handler DurableJobHandler, binding durableJobBinding, legacyIO bool) {
 	kind = strings.TrimSpace(kind)
-	if kind == "" || timeout <= 0 || handler == nil {
+	if kind == "" || timeout <= 0 || handler == nil || binding.create == nil || binding.finishFailure == nil || binding.persistSuccess == nil {
 		return
 	}
 	r.mu.Lock()
-	r.handlers[kind] = durableJobHandler{timeout: timeout, run: handler}
+	r.handlers[kind] = durableJobHandler{timeout: timeout, run: handler, binding: binding, legacyIO: legacyIO}
 	r.mu.Unlock()
 }
 
@@ -223,11 +290,32 @@ func (r *jobRuntime) handlerFor(jobID int64, kind string) (durableJobHandler, bo
 	return handler, ok
 }
 
+func (r *jobRuntime) bindingForRun(run model.JobRun) durableJobBinding {
+	r.mu.Lock()
+	if h, ok := r.overrides[run.ID]; ok && h.binding.create != nil {
+		r.mu.Unlock()
+		return h.binding
+	}
+	h, ok := r.handlers[run.Kind]
+	r.mu.Unlock()
+	if ok && h.binding.create != nil {
+		return h.binding
+	}
+	return defaultLLMTaskBinding(run.Kind)
+}
+
 func (r *jobRuntime) hasHandler(kind string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	_, ok := r.handlers[kind]
 	return ok
+}
+
+func (r *jobRuntime) handler(kind string) (durableJobHandler, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	h, ok := r.handlers[kind]
+	return h, ok
 }
 
 func (r *jobRuntime) setCancel(jobID int64, cancel context.CancelFunc) {
@@ -289,8 +377,10 @@ func snapshotContainsSensitiveField(value any) bool {
 		for key, child := range typed {
 			normalized := strings.NewReplacer("_", "", "-", "", " ", "").Replace(strings.ToLower(key))
 			switch normalized {
-			case "apikey", "authorization", "systemprompt", "systemmessage", "messages",
-				"datasnapshot", "resultsnapshot", "resultjson", "secret", "accesstoken", "refreshtoken":
+			case "apikey", "authorization", "cookie", "systemprompt", "prompt", "prompttext", "systemmessage", "messages",
+				"data", "datasnapshot", "datasnapshotjson", "result", "resultsnapshot", "resultjson", "resultbody",
+				"response", "responsebody", "output", "payload", "body", "requestbody", "secret", "accesstoken",
+				"refreshtoken", "allowprivate":
 				return true
 			}
 			if snapshotContainsSensitiveField(child) {
@@ -349,7 +439,23 @@ func activeJobKey(userID int64, kind, requestHash string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// start 保留旧测试与兼容调用签名；业务表任务走 startWithBinding。
 func (r *jobRuntime) start(userID int64, kind string, request any, allowPrivate bool, parentID *int64, override *durableJobHandler) (*LLMTaskView, error) {
+	run, err := r.startWithBinding(userID, kind, request, allowPrivate, parentID, override, nil)
+	if err != nil {
+		return nil, err
+	}
+	if run.ResultID == nil {
+		return nil, errors.New("作业缺少兼容结果引用")
+	}
+	var task model.LLMTask
+	if err := common.DB.Where("id = ? AND user_id = ?", *run.ResultID, userID).First(&task).Error; err != nil {
+		return nil, err
+	}
+	return llmTaskView(task, false), nil
+}
+
+func (r *jobRuntime) startWithBinding(userID int64, kind string, request any, allowPrivate bool, parentID *int64, override *durableJobHandler, bindingOverride *durableJobBinding) (*model.JobRun, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库尚未初始化")
 	}
@@ -360,7 +466,27 @@ func (r *jobRuntime) start(userID int64, kind string, request any, allowPrivate 
 	if kind == "" || len(kind) > 64 {
 		return nil, errors.New("任务类型不能为空且不能超过 64 个字符")
 	}
-	if override == nil && !r.hasHandler(kind) {
+	var registered durableJobHandler
+	if override != nil {
+		registered = *override
+	} else {
+		var ok bool
+		registered, ok = r.handler(kind)
+		if !ok {
+			return nil, ErrJobKindUnsupported
+		}
+	}
+	binding := registered.binding
+	if bindingOverride != nil {
+		binding = *bindingOverride
+	}
+	if binding.create == nil {
+		binding = defaultLLMTaskBinding(kind)
+	}
+	if binding.resultType == "" {
+		binding.resultType = JobResultLLMTask
+	}
+	if registered.run == nil {
 		return nil, ErrJobKindUnsupported
 	}
 	snapshotJSON, requestHash, err := makeJobSnapshot(kind, request, allowPrivate)
@@ -368,8 +494,11 @@ func (r *jobRuntime) start(userID int64, kind string, request any, allowPrivate 
 		return nil, err
 	}
 
-	if view, found, err := findActiveJobForStart(userID, kind, requestHash, parentID != nil); err != nil || found {
-		return view, err
+	if active, found, err := findActiveJobRun(userID, kind, requestHash); err != nil || found {
+		if parentID != nil && found {
+			return nil, ErrJobAlreadyRunning
+		}
+		return active, err
 	}
 	r.startWorkers()
 	if !r.reserve() {
@@ -378,9 +507,12 @@ func (r *jobRuntime) start(userID int64, kind string, request any, allowPrivate 
 
 	r.createMu.Lock()
 	defer r.createMu.Unlock()
-	if view, found, err := findActiveJobForStart(userID, kind, requestHash, parentID != nil); err != nil || found {
+	if active, found, err := findActiveJobRun(userID, kind, requestHash); err != nil || found {
 		<-r.slots
-		return view, err
+		if parentID != nil && found {
+			return nil, ErrJobAlreadyRunning
+		}
+		return active, err
 	}
 
 	now := time.Now()
@@ -389,25 +521,24 @@ func (r *jobRuntime) start(userID int64, kind string, request any, allowPrivate 
 		UserID: userID, Kind: kind, RequestHash: requestHash, ActiveKey: &activeKey,
 		ParentID: parentID,
 		Status:   model.JobStatusQueued, SnapshotVersion: jobSnapshotVersion,
-		RequestSnapshot: string(snapshotJSON), ResultType: "llm_task", QueuedAt: now,
+		RequestSnapshot: string(snapshotJSON), ResultType: binding.resultType, QueuedAt: now,
 	}
-	var task model.LLMTask
 	err = common.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&run).Error; err != nil {
 			return err
 		}
-		task = model.LLMTask{
-			UserID: userID, Kind: kind, JobRunID: &run.ID, RequestHash: requestHash,
-			Status: model.LLMTaskStatusProcessing,
+		resultID, createErr := binding.create(tx, &run, snapshotJSONRequest(snapshotJSON))
+		if createErr != nil {
+			return createErr
 		}
-		if err := tx.Create(&task).Error; err != nil {
+		if resultID <= 0 {
+			return errors.New("业务结果占位创建失败")
+		}
+		run.ResultID = &resultID
+		if err := tx.Model(&model.JobRun{}).Where("id = ? AND result_id IS NULL", run.ID).
+			Update("result_id", resultID).Error; err != nil {
 			return err
 		}
-		if err := tx.Model(&model.JobRun{}).Where("id = ?", run.ID).
-			Update("result_id", task.ID).Error; err != nil {
-			return err
-		}
-		run.ResultID = &task.ID
 		started := now
 		step := model.JobStep{JobRunID: run.ID, Sequence: 1, Name: model.JobStepQueued,
 			Status: model.JobStatusRunning, StartedAt: &started}
@@ -418,18 +549,32 @@ func (r *jobRuntime) start(userID int64, kind string, request any, allowPrivate 
 	})
 	if err != nil {
 		<-r.slots
-		if view, found, queryErr := findActiveJobForStart(userID, kind, requestHash, parentID != nil); found || queryErr != nil {
-			return view, queryErr
+		if active, found, queryErr := findActiveJobRun(userID, kind, requestHash); found || queryErr != nil {
+			if parentID != nil && found {
+				return nil, ErrJobAlreadyRunning
+			}
+			return active, queryErr
 		}
 		return nil, err
 	}
 	if override != nil {
+		if override.binding.create == nil {
+			override.binding = binding
+		}
 		r.mu.Lock()
 		r.overrides[run.ID] = *override
 		r.mu.Unlock()
 	}
 	r.enqueueReserved(run.ID)
-	return llmTaskView(task, false), nil
+	return &run, nil
+}
+
+func snapshotJSONRequest(snapshot []byte) json.RawMessage {
+	var persisted persistedJobSnapshot
+	if json.Unmarshal(snapshot, &persisted) == nil {
+		return append(json.RawMessage(nil), persisted.Request...)
+	}
+	return nil
 }
 
 func findActiveJobForStart(userID int64, kind, requestHash string, retry bool) (*LLMTaskView, bool, error) {
@@ -441,6 +586,23 @@ func findActiveJobForStart(userID int64, kind, requestHash string, retry bool) (
 		return nil, true, ErrJobAlreadyRunning
 	}
 	return view, true, nil
+}
+
+func findActiveJobRun(userID int64, kind, requestHash string) (*model.JobRun, bool, error) {
+	var run model.JobRun
+	err := common.DB.Where("user_id = ? AND kind = ? AND request_hash = ? AND status IN ?",
+		userID, kind, requestHash, []string{model.JobStatusQueued, model.JobStatusRunning}).
+		Order("id DESC").First(&run).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if run.ResultID == nil {
+		return nil, false, errors.New("在途作业缺少结果引用")
+	}
+	return &run, true, nil
 }
 
 func findActiveJobResult(userID int64, kind, requestHash string) (*LLMTaskView, bool, error) {
@@ -480,7 +642,7 @@ func (r *jobRuntime) execute(jobID int64) {
 		r.failQueued(jobID, JobErrorHandlerUnavailable, "作业处理器不可用")
 		return
 	}
-	if !r.claim(run) {
+	if !r.claim(run, handler.legacyIO) {
 		return
 	}
 	if err := common.DB.First(&run, jobID).Error; err != nil {
@@ -493,12 +655,13 @@ func (r *jobRuntime) execute(jobID int64) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), handler.timeout)
+	ctx = withJobExecution(ctx, jobExecution{runtime: r, jobID: run.ID, resultType: run.ResultType, resultID: run.ResultID})
 	r.setCancel(jobID, cancel)
 	monitorDone := make(chan struct{})
 	go r.monitorCancellation(ctx, cancel, jobID, monitorDone)
 	started := time.Now()
 	result, runErr := r.callHandler(ctx, handler, run.UserID, snapshot)
-	if runErr == nil && ctx.Err() != nil {
+	if runErr == nil && ctx.Err() != nil && !handler.binding.resultCommittedByHandler {
 		runErr = ctx.Err()
 	}
 	cancel()
@@ -522,10 +685,8 @@ func (r *jobRuntime) execute(jobID int64) {
 		r.finishFailed(run, code, runErr.Error())
 		return
 	}
-	if jobCancelRequested(jobID) {
-		r.finishCanceled(run)
-		return
-	}
+	// 业务处理器已经完成并写入结果时，成功 CAS 与取消请求竞争；谁先提交谁获胜。
+	// 不在这里预判 cancel_requested，避免“结果已存在但作业被取消”的半终态。
 	result.Status = normalizeJobResultStatus(result.Status)
 	if result.Status == "" {
 		r.finishFailed(run, AsyncLLMTaskErrorFailed, "作业返回了非法终态")
@@ -537,7 +698,7 @@ func (r *jobRuntime) execute(jobID int64) {
 		return
 	}
 	result = fillJobUsageFromTrace(run.UserID, result)
-	if err := r.persistSuccess(run, result, resultJSON, latency); err != nil {
+	if err := r.persistSuccess(run, handler.binding, result, resultJSON, latency); err != nil {
 		if errors.Is(err, errJobCancelWon) {
 			r.finishCanceled(run)
 			return
@@ -619,7 +780,7 @@ func fillJobUsageFromTrace(userID int64, result DurableJobResult) DurableJobResu
 	return result
 }
 
-func (r *jobRuntime) claim(run model.JobRun) bool {
+func (r *jobRuntime) claim(run model.JobRun, legacyIO bool) bool {
 	now := time.Now()
 	err := common.DB.Transaction(func(tx *gorm.DB) error {
 		res := tx.Model(&model.JobRun{}).
@@ -638,11 +799,11 @@ func (r *jobRuntime) claim(run model.JobRun) bool {
 		}
 		dispatchStarted := now
 		dispatchFinished := time.Now()
-		steps := []model.JobStep{
-			{JobRunID: run.ID, Sequence: 2, Name: model.JobStepDispatch, Status: model.JobStatusSuccess,
-				StartedAt: &dispatchStarted, FinishedAt: &dispatchFinished},
-			{JobRunID: run.ID, Sequence: 3, Name: model.JobStepExecute, Status: model.JobStatusRunning,
-				StartedAt: &dispatchFinished},
+		steps := []model.JobStep{{JobRunID: run.ID, Sequence: 2, Name: model.JobStepDispatch, Status: model.JobStatusSuccess,
+			StartedAt: &dispatchStarted, FinishedAt: &dispatchFinished}}
+		if legacyIO {
+			steps = append(steps, model.JobStep{JobRunID: run.ID, Sequence: 3, Name: model.JobStepExecute,
+				Status: model.JobStatusRunning, StartedAt: &dispatchFinished})
 		}
 		if err := tx.Create(&steps).Error; err != nil {
 			return err
@@ -652,23 +813,28 @@ func (r *jobRuntime) claim(run model.JobRun) bool {
 	return err == nil
 }
 
-func (r *jobRuntime) beginPersist(run model.JobRun) error {
+func (r *jobRuntime) beginPersist(run model.JobRun, resultCommittedByHandler bool) error {
 	now := time.Now()
 	return common.DB.Transaction(func(tx *gorm.DB) error {
 		var current model.JobRun
 		if err := tx.Select("id", "status", "cancel_requested").First(&current, run.ID).Error; err != nil {
 			return err
 		}
-		if current.Status != model.JobStatusRunning || current.CancelRequested {
+		if current.Status != model.JobStatusRunning || (current.CancelRequested && !resultCommittedByHandler) {
 			return errJobCancelWon
 		}
 		if err := tx.Model(&model.JobStep{}).
-			Where("job_run_id = ? AND name = ? AND status = ?", run.ID, model.JobStepExecute, model.JobStatusRunning).
+			Where("job_run_id = ? AND status = ?", run.ID, model.JobStatusRunning).
 			Updates(map[string]any{"status": model.JobStatusSuccess, "finished_at": now, "updated_at": now}).Error; err != nil {
 			return err
 		}
+		var maxSequence int
+		if err := tx.Model(&model.JobStep{}).Where("job_run_id = ?", run.ID).
+			Select("COALESCE(MAX(sequence), 0)").Scan(&maxSequence).Error; err != nil {
+			return err
+		}
 		started := now
-		if err := tx.Create(&model.JobStep{JobRunID: run.ID, Sequence: 4, Name: model.JobStepPersist,
+		if err := tx.Create(&model.JobStep{JobRunID: run.ID, Sequence: maxSequence + 1, Name: model.JobStepPersist,
 			Status: model.JobStatusRunning, StartedAt: &started}).Error; err != nil {
 			return err
 		}
@@ -676,8 +842,8 @@ func (r *jobRuntime) beginPersist(run model.JobRun) error {
 	})
 }
 
-func (r *jobRuntime) persistSuccess(run model.JobRun, result DurableJobResult, resultJSON []byte, latency int64) error {
-	if err := r.beginPersist(run); err != nil {
+func (r *jobRuntime) persistSuccess(run model.JobRun, binding durableJobBinding, result DurableJobResult, resultJSON []byte, latency int64) error {
+	if err := r.beginPersist(run, binding.resultCommittedByHandler); err != nil {
 		return err
 	}
 	now := time.Now()
@@ -690,29 +856,26 @@ func (r *jobRuntime) persistSuccess(run model.JobRun, result DurableJobResult, r
 			"succeeded": result.Succeeded, "failed": result.Failed,
 			"finished_at": now, "updated_at": now,
 		}
-		res := tx.Model(&model.JobRun{}).
-			Where("id = ? AND status = ? AND cancel_requested = ?", run.ID, model.JobStatusRunning, false).
-			Updates(updates)
+		query := tx.Model(&model.JobRun{}).Where("id = ? AND status = ?", run.ID, model.JobStatusRunning)
+		if binding.resultCommittedByHandler {
+			// 原业务结果已先提交，成功是竞态中的既成事实；清除尚未收敛的
+			// cancel_requested，保证 JobRun 与业务事实保持同一终态。
+			updates["cancel_requested"] = false
+		} else {
+			query = query.Where("cancel_requested = ?", false)
+		}
+		res := query.Updates(updates)
 		if res.Error != nil {
 			return res.Error
 		}
 		if res.RowsAffected != 1 {
 			return errJobCancelWon
 		}
-		if run.ResultID == nil {
-			return errors.New("作业缺少结果引用")
+		if binding.persistSuccess == nil {
+			return errors.New("作业结果绑定不可用")
 		}
-		compatibility := tx.Model(&model.LLMTask{}).
-			Where("id = ? AND user_id = ? AND job_run_id = ?", *run.ResultID, run.UserID, run.ID).
-			Updates(map[string]any{
-				"status": model.LLMTaskStatusSuccess, "result_json": string(resultJSON),
-				"error": "", "error_code": "", "active_key": nil, "updated_at": now,
-			})
-		if compatibility.Error != nil {
-			return compatibility.Error
-		}
-		if compatibility.RowsAffected != 1 {
-			return errors.New("作业兼容结果引用无效")
+		if err := binding.persistSuccess(tx, &run, result, resultJSON, now); err != nil {
+			return err
 		}
 		if err := tx.Model(&model.JobStep{}).
 			Where("job_run_id = ? AND name = ? AND status = ?", run.ID, model.JobStepPersist, model.JobStatusRunning).
@@ -730,6 +893,7 @@ func (r *jobRuntime) finishFailed(run model.JobRun, code, message string) {
 	}
 	now := time.Now()
 	safeMessage := sanitizeJobError(message)
+	binding := r.bindingForRun(run)
 	err := common.DB.Transaction(func(tx *gorm.DB) error {
 		res := tx.Model(&model.JobRun{}).
 			Where("id = ? AND status = ? AND cancel_requested = ?", run.ID, model.JobStatusRunning, false).
@@ -744,10 +908,8 @@ func (r *jobRuntime) finishFailed(run model.JobRun, code, message string) {
 		if res.RowsAffected != 1 {
 			return errJobCancelWon
 		}
-		if run.ResultID != nil {
-			if err := failCompatibleLLMTask(tx, *run.ResultID, run.UserID, code, message, now); err != nil {
-				return err
-			}
+		if err := binding.finishFailure(tx, &run, model.JobStatusFailed, code, message, now); err != nil {
+			return err
 		}
 		if err := finishRunningJobSteps(tx, run.ID, model.JobStatusFailed, code, message, now); err != nil {
 			return err
@@ -763,6 +925,7 @@ func (r *jobRuntime) finishFailed(run model.JobRun, code, message string) {
 
 func (r *jobRuntime) finishCanceled(run model.JobRun) {
 	now := time.Now()
+	binding := r.bindingForRun(run)
 	err := common.DB.Transaction(func(tx *gorm.DB) error {
 		res := tx.Model(&model.JobRun{}).
 			Where("id = ? AND status = ?", run.ID, model.JobStatusRunning).
@@ -777,10 +940,8 @@ func (r *jobRuntime) finishCanceled(run model.JobRun) {
 		if res.RowsAffected != 1 {
 			return nil
 		}
-		if run.ResultID != nil {
-			if err := failCompatibleLLMTask(tx, *run.ResultID, run.UserID, JobErrorCanceled, "作业已取消", now); err != nil {
-				return err
-			}
+		if err := binding.finishFailure(tx, &run, model.JobStatusCanceled, JobErrorCanceled, "作业已取消", now); err != nil {
+			return err
 		}
 		if err := finishRunningJobSteps(tx, run.ID, model.JobStatusCanceled, JobErrorCanceled, "作业已取消", now); err != nil {
 			return err
@@ -817,6 +978,7 @@ func (r *jobRuntime) failQueued(jobID int64, code, message string) {
 	}
 	now := time.Now()
 	safeMessage := sanitizeJobError(message)
+	binding := r.bindingForRun(run)
 	_ = common.DB.Transaction(func(tx *gorm.DB) error {
 		res := tx.Model(&model.JobRun{}).Where("id = ? AND status = ?", jobID, model.JobStatusQueued).
 			Updates(map[string]any{
@@ -826,10 +988,8 @@ func (r *jobRuntime) failQueued(jobID int64, code, message string) {
 		if res.Error != nil || res.RowsAffected != 1 {
 			return res.Error
 		}
-		if run.ResultID != nil {
-			if err := failCompatibleLLMTask(tx, *run.ResultID, run.UserID, code, message, now); err != nil {
-				return err
-			}
+		if err := binding.finishFailure(tx, &run, model.JobStatusFailed, code, message, now); err != nil {
+			return err
 		}
 		if err := finishRunningJobSteps(tx, jobID, model.JobStatusFailed, code, message, now); err != nil {
 			return err
@@ -896,6 +1056,7 @@ func (r *jobRuntime) cancelQueued(jobID int64) {
 		return
 	}
 	now := time.Now()
+	binding := r.bindingForRun(run)
 	_ = common.DB.Transaction(func(tx *gorm.DB) error {
 		res := tx.Model(&model.JobRun{}).Where("id = ? AND status = ?", jobID, model.JobStatusQueued).
 			Updates(map[string]any{
@@ -906,10 +1067,8 @@ func (r *jobRuntime) cancelQueued(jobID int64) {
 		if res.Error != nil || res.RowsAffected != 1 {
 			return res.Error
 		}
-		if run.ResultID != nil {
-			if err := failCompatibleLLMTask(tx, *run.ResultID, run.UserID, JobErrorCanceled, "作业已取消", now); err != nil {
-				return err
-			}
+		if err := binding.finishFailure(tx, &run, model.JobStatusCanceled, JobErrorCanceled, "作业已取消", now); err != nil {
+			return err
 		}
 		if err := finishRunningJobSteps(tx, run.ID, model.JobStatusCanceled, JobErrorCanceled, "作业已取消", now); err != nil {
 			return err

@@ -252,7 +252,8 @@ func listAnalysisTasks(db *gorm.DB, userID int64, filters taskCenterFilters) ([]
 		Select("id", "module", "symbol", "target", "title", "status", "error", "error_code",
 			"provider", "model", "prompt_tokens", "completion_tokens", "total_tokens", "latency_ms",
 			"trace_id", "created_at", "updated_at").
-		Where("user_id = ?", userID)
+		Where("user_id = ?", userID).
+		Where("NOT EXISTS (SELECT 1 FROM job_runs jr WHERE jr.user_id = analysis_records.user_id AND jr.result_type = ? AND jr.result_id = analysis_records.id)", JobResultAnalysis)
 	if filters.kind != "" {
 		q = q.Where("module = ?", filters.kind)
 	}
@@ -303,7 +304,8 @@ func listRecommendationTasks(db *gorm.DB, userID int64, filters taskCenterFilter
 	q := db.Model(&model.RecommendationBatch{}).
 		Select("id", "type", "market", "title", "status", "error", "provider", "model",
 			"prompt_tokens", "completion_tokens", "total_tokens", "latency_ms", "trace_id", "created_at", "updated_at").
-		Where("user_id = ?", userID)
+		Where("user_id = ?", userID).
+		Where("NOT EXISTS (SELECT 1 FROM job_runs jr WHERE jr.user_id = recommendation_batches.user_id AND jr.result_type = ? AND jr.result_id = recommendation_batches.id)", JobResultRecommendation)
 	if filters.kind != "" {
 		q = q.Where("type = ?", filters.kind)
 	}
@@ -347,7 +349,8 @@ func listDailyReportTasks(db *gorm.DB, userID int64, filters taskCenterFilters) 
 	q := db.Model(&model.DailyReport{}).
 		Select("id", "trade_date", "market", "status", "error", "provider", "model", "total_tokens",
 			"latency_ms", "trace_id", "created_at", "updated_at").
-		Where("user_id = ?", userID)
+		Where("user_id = ?", userID).
+		Where("NOT EXISTS (SELECT 1 FROM job_runs jr WHERE jr.user_id = daily_reports.user_id AND jr.result_type = ? AND jr.result_id = daily_reports.id)", JobResultDailyReport)
 	q = applyTaskStatusFilter(q, filters)
 	var rows []dailyReportTaskRow
 	if err := q.Order("created_at DESC, id DESC").Limit(filters.limit).Find(&rows).Error; err != nil {
@@ -570,6 +573,12 @@ func recommendationTaskTitle(kind string) string {
 
 func llmTaskTitle(kind string) string {
 	switch kind {
+	case JobKindAnalysis:
+		return "AI 分析"
+	case JobKindRecommendation:
+		return "选股推荐"
+	case JobKindDailyReport:
+		return "收盘日报"
 	case "qa":
 		return "AI 问答"
 	case "compare":

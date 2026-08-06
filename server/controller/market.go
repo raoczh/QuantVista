@@ -356,6 +356,95 @@ func (mc *MarketController) DataSources(c *gin.Context) {
 	common.ApiSuccess(c, gin.H{"health": mc.svc.DataSourceHealth()})
 }
 
+const dataSourceOperationBodyMaxBytes = 2048
+
+func bindDataSourceProbe(c *gin.Context) (service.DataSourceProbeRequest, error) {
+	var req service.DataSourceProbeRequest
+	if c.Request.Body == nil {
+		return req, errors.New("探测请求正文不能为空")
+	}
+	if c.Request.ContentLength > dataSourceOperationBodyMaxBytes {
+		return req, errors.New("探测请求正文超过 2KiB 上限")
+	}
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, dataSourceOperationBodyMaxBytes+1))
+	if err != nil {
+		return req, err
+	}
+	if len(body) == 0 || len(body) > dataSourceOperationBodyMaxBytes {
+		return req, errors.New("探测请求正文无效")
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		return req, errors.New("探测请求格式错误")
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return req, errors.New("探测请求只能包含一个 JSON 对象")
+	}
+	return req, nil
+}
+
+func bindDataSourceUncool(c *gin.Context) (service.DataSourceUncoolRequest, error) {
+	var req service.DataSourceUncoolRequest
+	if c.Request.Body == nil {
+		return req, errors.New("解冷请求正文不能为空")
+	}
+	if c.Request.ContentLength > dataSourceOperationBodyMaxBytes {
+		return req, errors.New("解冷请求正文超过 2KiB 上限")
+	}
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, dataSourceOperationBodyMaxBytes+1))
+	if err != nil {
+		return req, err
+	}
+	if len(body) == 0 || len(body) > dataSourceOperationBodyMaxBytes {
+		return req, errors.New("解冷请求正文无效")
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		return req, errors.New("解冷请求格式错误")
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return req, errors.New("解冷请求只能包含一个 JSON 对象")
+	}
+	return req, nil
+}
+
+// ProbeDataSource POST /api/admin/datasources/probe —— 单 provider/capability/market
+// 有界探测。只返回归一化结果，具体上游响应永不进入响应或审计。
+func (mc *MarketController) ProbeDataSource(c *gin.Context) {
+	req, err := bindDataSourceProbe(c)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	result, err := mc.svc.ProbeDataSource(ctx, currentUserID(c), req)
+	if err != nil {
+		common.ApiErrorMsg(c, "数据源探测失败: "+err.Error())
+		return
+	}
+	common.ApiSuccess(c, result)
+}
+
+// UncoolDataSource POST /api/admin/datasources/uncool —— 指定三元组人工解冷。
+func (mc *MarketController) UncoolDataSource(c *gin.Context) {
+	req, err := bindDataSourceUncool(c)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	result, err := mc.svc.UncoolDataSource(c.Request.Context(), currentUserID(c), req)
+	if err != nil {
+		common.ApiErrorMsg(c, "解除冷却失败: "+err.Error())
+		return
+	}
+	common.ApiSuccess(c, result)
+}
+
 // DataHealth GET /api/admin/data-health —— P1 数据健康总览：各数据域的
 // expected/observed 日期、落后开市日数、覆盖率与最近任务日志（对账入口，
 // 补跑走既有 wide-sync/wide-init/sync-bars/snapshot/factor-rebuild 接口）。

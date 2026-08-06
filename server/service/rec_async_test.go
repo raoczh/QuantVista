@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -26,12 +27,18 @@ func seedRecEnv(t *testing.T, userID int64, baseURL string, maxTokens int) {
 	common.DB.Exec("DELETE FROM user_quota")
 	common.DB.Exec("DELETE FROM recommendation_batches")
 	common.DB.Exec("DELETE FROM recommendations")
+	common.DB.Exec("DELETE FROM users WHERE id = ?", userID)
 	t.Cleanup(func() {
 		common.DB.Exec("DELETE FROM llm_configs")
 		common.DB.Exec("DELETE FROM user_quota")
 		common.DB.Exec("DELETE FROM recommendation_batches")
 		common.DB.Exec("DELETE FROM recommendations")
+		common.DB.Exec("DELETE FROM users WHERE id = ?", userID)
 	})
+	if err := common.DB.Create(&model.User{ID: userID, Username: fmt.Sprintf("rec-user-%d", userID),
+		Role: model.RoleAdmin, Status: model.StatusEnabled}).Error; err != nil {
+		t.Fatalf("建测试用户失败: %v", err)
+	}
 	common.EncryptionKey = "unit-test-key"
 	cipher, err := common.Encrypt("sk-test")
 	if err != nil {
@@ -90,6 +97,13 @@ func TestRecommendationAsyncShell(t *testing.T) {
 	b := waitBatchStatus(t, v.ID)
 	if b.Status != model.RecStatusFailed || !strings.Contains(b.Error, "该市场暂无行情数据源支持") {
 		t.Fatalf("后台应回写 failed 与原因: %+v", b)
+	}
+	var runs []model.JobRun
+	if err := common.DB.Where("user_id = ? AND result_type = ? AND result_id = ?", int64(31), JobResultRecommendation, v.ID).Find(&runs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Status != model.JobStatusFailed {
+		t.Fatalf("推荐必须有唯一失败 JobRun 结果引用: %+v", runs)
 	}
 }
 
@@ -292,10 +306,10 @@ func TestCapModuleTokens(t *testing.T) {
 	cases := []struct {
 		user, cap, want int
 	}{
-		{0, 2500, 2500},                                  // 用户未配 → 模块默认
-		{8000, 2500, 8000},                               // 用户显式配置 → 原样生效
-		{1200, 2500, 1200},                               // 用户更小 → 尊重用户
-		{1200, 0, 1200},                                  // 模块无默认 → 原样
+		{0, 2500, 2500},    // 用户未配 → 模块默认
+		{8000, 2500, 8000}, // 用户显式配置 → 原样生效
+		{1200, 2500, 1200}, // 用户更小 → 尊重用户
+		{1200, 0, 1200},    // 模块无默认 → 原样
 		{llmGlobalHardCap + 100, 2500, llmGlobalHardCap}, // 溢出护栏
 	}
 	for _, c := range cases {

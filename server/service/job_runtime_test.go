@@ -366,6 +366,11 @@ func TestJobSnapshotBoundAndSensitiveFields(t *testing.T) {
 	if _, _, err := makeJobSnapshot(JobKindQA, map[string]string{"system_prompt": "secret"}, false); !errors.Is(err, ErrJobSnapshotSensitive) {
 		t.Fatalf("系统 prompt 字段必须拒绝持久化: %v", err)
 	}
+	for _, key := range []string{"data", "result", "response", "payload"} {
+		if _, _, err := makeJobSnapshot(JobKindQA, map[string]any{key: map[string]string{"content": "large body"}}, false); !errors.Is(err, ErrJobSnapshotSensitive) {
+			t.Fatalf("%s 正文字段必须拒绝持久化: %v", key, err)
+		}
+	}
 	if _, _, err := makeJobSnapshot(JobKindQA, map[string]string{"question": strings.Repeat("x", jobSnapshotMaxBytes)}, false); !errors.Is(err, ErrJobSnapshotTooLarge) {
 		t.Fatalf("超限快照必须拒绝: %v", err)
 	}
@@ -504,5 +509,136 @@ func TestJobEventsAreMonotonicAndUserIsolated(t *testing.T) {
 	other, err := ListJobEvents(902, 0, 100)
 	if err != nil || len(other) != 1 || other[0].JobRunID != 2 {
 		t.Fatalf("SSE 事件用户隔离失败: events=%+v err=%v", other, err)
+	}
+}
+
+func testAnalysisBusinessBinding() durableJobBinding {
+	return durableJobBinding{
+		resultType:               JobResultAnalysis,
+		resultCommittedByHandler: true,
+		create: func(tx *gorm.DB, run *model.JobRun, _ json.RawMessage) (int64, error) {
+			rec := model.AnalysisRecord{UserID: run.UserID, Module: model.AnalysisModuleMarket,
+				Title: "竞态测试", Status: model.AnalysisStatusProcessing}
+			if err := tx.Create(&rec).Error; err != nil {
+				return 0, err
+			}
+			return rec.ID, nil
+		},
+		persistSuccess: func(tx *gorm.DB, run *model.JobRun, result DurableJobResult, _ []byte, _ time.Time) error {
+			if run.ResultID == nil {
+				return errors.New("missing result reference")
+			}
+			var rec model.AnalysisRecord
+			if err := tx.Where("id = ? AND user_id = ?", *run.ResultID, run.UserID).First(&rec).Error; err != nil {
+				return err
+			}
+			if rec.Status != model.AnalysisStatusSuccess || result.Status != model.JobStatusSuccess {
+				return errors.New("business result not committed")
+			}
+			return nil
+		},
+		finishFailure: func(tx *gorm.DB, run *model.JobRun, _ string, _ string, message string, now time.Time) error {
+			if run.ResultID == nil {
+				return errors.New("missing result reference")
+			}
+			return tx.Model(&model.AnalysisRecord{}).
+				Where("id = ? AND user_id = ? AND status = ?", *run.ResultID, run.UserID, model.AnalysisStatusProcessing).
+				Updates(map[string]any{"status": model.AnalysisStatusFailed, "error": message, "updated_at": now}).Error
+		},
+	}
+}
+
+func TestBusinessResultCommitWinsLateCancellation(t *testing.T) {
+	resetDurableJobs(t)
+	const userID int64 = 907
+	common.DB.Where("user_id = ?", userID).Delete(&model.AnalysisRecord{})
+	runtime := newJobRuntime(1, 2)
+	defer runtime.close()
+	entered := make(chan struct{})
+	binding := testAnalysisBusinessBinding()
+	runtime.registerWithBinding("business_cancel_race", time.Minute,
+		func(ctx context.Context, _ int64, _ bool, _ json.RawMessage) (DurableJobResult, error) {
+			close(entered)
+			<-ctx.Done()
+			resultID, ok := currentJobResultID(ctx)
+			if !ok {
+				return DurableJobResult{}, errors.New("missing result id")
+			}
+			// 模拟业务事实先于 JobRun 终态提交，随后才观察到迟到取消。
+			if err := common.DB.Model(&model.AnalysisRecord{}).Where("id = ?", resultID).
+				Updates(map[string]any{"status": model.AnalysisStatusSuccess, "summary": "done"}).Error; err != nil {
+				return DurableJobResult{}, err
+			}
+			return DurableJobResult{Status: model.JobStatusSuccess}, nil
+		}, binding, false)
+	run, err := runtime.startWithBinding(userID, "business_cancel_race", map[string]int{"version": 1}, false, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	if err := common.DB.Model(&model.JobRun{}).Where("id = ? AND status = ?", run.ID, model.JobStatusRunning).
+		Update("cancel_requested", true).Error; err != nil {
+		t.Fatal(err)
+	}
+	runtime.signalCancel(run.ID)
+	done := waitJobRun(t, userID, run.ID)
+	if done.Status != model.JobStatusSuccess || done.CancelRequested {
+		t.Fatalf("committed business success must win late cancellation: %+v", done)
+	}
+	var rec model.AnalysisRecord
+	if err := common.DB.First(&rec, *run.ResultID).Error; err != nil || rec.Status != model.AnalysisStatusSuccess {
+		t.Fatalf("business result mismatch: %+v err=%v", rec, err)
+	}
+}
+
+func TestBusinessJobCreateRollsBackAndMissingResultCannotSucceed(t *testing.T) {
+	resetDurableJobs(t)
+	const userID int64 = 908
+	common.DB.Where("user_id = ?", userID).Delete(&model.AnalysisRecord{})
+
+	rollbackRuntime := newJobRuntime(1, 1)
+	rollbackBinding := testAnalysisBusinessBinding()
+	rollbackBinding.create = func(tx *gorm.DB, run *model.JobRun, _ json.RawMessage) (int64, error) {
+		rec := model.AnalysisRecord{UserID: run.UserID, Module: model.AnalysisModuleMarket,
+			Title: "rollback", Status: model.AnalysisStatusProcessing}
+		if err := tx.Create(&rec).Error; err != nil {
+			return 0, err
+		}
+		return rec.ID, errors.New("factory failed after placeholder")
+	}
+	rollbackRuntime.registerWithBinding("business_create_rollback", time.Minute,
+		func(context.Context, int64, bool, json.RawMessage) (DurableJobResult, error) {
+			return DurableJobResult{Status: model.JobStatusSuccess}, nil
+		}, rollbackBinding, false)
+	if _, err := rollbackRuntime.startWithBinding(userID, "business_create_rollback", map[string]int{"version": 1}, false, nil, nil, nil); err == nil {
+		t.Fatal("factory failure must abort submission")
+	}
+	rollbackRuntime.close()
+	var runCount, resultCount int64
+	common.DB.Model(&model.JobRun{}).Where("user_id = ? AND kind = ?", userID, "business_create_rollback").Count(&runCount)
+	common.DB.Model(&model.AnalysisRecord{}).Where("user_id = ? AND title = ?", userID, "rollback").Count(&resultCount)
+	if runCount != 0 || resultCount != 0 {
+		t.Fatalf("failed factory left orphan rows: runs=%d results=%d", runCount, resultCount)
+	}
+
+	missingRuntime := newJobRuntime(1, 1)
+	defer missingRuntime.close()
+	binding := testAnalysisBusinessBinding()
+	missingRuntime.registerWithBinding("business_missing_result", time.Minute,
+		func(context.Context, int64, bool, json.RawMessage) (DurableJobResult, error) {
+			// 故意不把 processing 业务行写成成功，验证 JobRun 不得先成功。
+			return DurableJobResult{Status: model.JobStatusSuccess}, nil
+		}, binding, false)
+	run, err := missingRuntime.startWithBinding(userID, "business_missing_result", map[string]int{"version": 1}, false, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := waitJobRun(t, userID, run.ID)
+	if done.Status != model.JobStatusFailed {
+		t.Fatalf("missing business result must fail JobRun: %+v", done)
+	}
+	var rec model.AnalysisRecord
+	if err := common.DB.First(&rec, *run.ResultID).Error; err != nil || rec.Status != model.AnalysisStatusFailed {
+		t.Fatalf("missing result placeholder must converge failed: %+v err=%v", rec, err)
 	}
 }

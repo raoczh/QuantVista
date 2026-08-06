@@ -13,6 +13,8 @@ type DailyReport struct {
 	Market    string `gorm:"size:8;default:cn" json:"market"`
 
 	Status string `gorm:"size:16" json:"status"` // success / partial / failed
+	// PreviousStatus 仅用于重生成中的失败/取消回滚；不向 API 暴露，也不承载报告正文。
+	PreviousStatus string `gorm:"size:16" json:"-"`
 
 	// 复盘 prompt 版本（M3c 起落库；-custom.<hash8> 后缀=当时启用了用户自定义模板，
 	// hash8 归因到模板内容，P0-6 起需 32 宽）。

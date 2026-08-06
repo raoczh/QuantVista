@@ -144,6 +144,44 @@ export function getDataSources() {
   return request<DataSourcesResponse>({ url: '/admin/datasources' })
 }
 
+export interface DataSourceProbeResult {
+  source: string
+  capability: string
+  market: string
+  outcome: CapabilityObservation
+  code: string
+  latency_ms: number
+  sample_count: number
+}
+
+export interface DataSourceProbeOperation {
+  result: DataSourceProbeResult
+  audit_id: number
+}
+
+export interface DataSourceTupleRequest {
+  provider: string
+  capability: string
+  market: string
+}
+
+export function probeDataSource(data: DataSourceTupleRequest) {
+  return request<DataSourceProbeOperation>({ url: '/admin/datasources/probe', method: 'post', data, timeout: 12_000 })
+}
+
+export interface DataSourceUncoolOperation {
+  provider: string
+  capability: string
+  market: string
+  cleared: boolean
+  cooldown_before_sec: number
+  audit_id: number
+}
+
+export function uncoolDataSource(data: DataSourceTupleRequest & { reason: string }) {
+  return request<DataSourceUncoolOperation>({ url: '/admin/datasources/uncool', method: 'post', data })
+}
+
 // ---------- P0-3A 数据健康总览与补跑 ----------
 
 export type GapDayStatus = 'covered' | 'missing' | 'partial' | 'suspended' | 'closed' | 'unknown'
