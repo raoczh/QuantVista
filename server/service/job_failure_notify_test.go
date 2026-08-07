@@ -127,7 +127,7 @@ func TestJobFailureNotificationsIdempotentMergedMutedAuthorizedAndRedacted(t *te
 	for _, notice := range notices {
 		byJob[notice.JobRunID] = notice
 	}
-	if byJob[run1.ID].Status != model.JobFailureNoticeDispatched || byJob[run1.ID].MergeCount != 2 {
+	if byJob[run1.ID].Status != model.JobFailureNoticeAttempted || byJob[run1.ID].MergeCount != 2 {
 		t.Fatalf("首条通知应记录短窗合并计数: %+v", byJob[run1.ID])
 	}
 	if byJob[run2.ID].Status != model.JobFailureNoticeMerged || byJob[run2.ID].MergeRootID == nil || *byJob[run2.ID].MergeRootID != byJob[run1.ID].ID {

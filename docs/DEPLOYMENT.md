@@ -77,6 +77,7 @@ openssl rand -base64 36   # 再生成一个作 ENCRYPTION_KEY
 - 给已有表加新列。
 - 加新索引。
 - 将现有非空列放宽为可空列。本轮统一系统作业会自动把 `job_runs.user_id`、`job_events.user_id` 调整为可空，并创建 `research_artifacts`、补齐 owner、触发人和结果引用字段。
+- 本轮 P0-5 会自动给 `alert_events` 增加命中上下文字段，并创建 `job_failure_notifications` 及其 JobRun 唯一键、短窗 group key/merge 索引；不需要额外 SQL 文件。
 
 **不会自动做的（需写迁移代码）：**
 
@@ -113,7 +114,7 @@ openssl rand -base64 36   # 再生成一个作 ENCRYPTION_KEY
 - 账号与配置：`users`、`user_preferences`、`user_quotas`、`refresh_tokens`（可不备，重新登录即可）、`options`（系统设置，GitHub secret 为密文）、`llm_configs`（API Key 为密文，恢复后需同一 `ENCRYPTION_KEY` 才能解密）、`prompt_templates`、`notify_channels`（target 为密文，同上）
 - 研究与交易记录：`watchlists`、`watchlist_items`、`positions`、`thesis_cards`、`research_notes`、`screener_strategies`（自定义选股策略）
 - AI 产出：`analysis_records`、`recommendation_batches`、`recommendations`、`recommendation_statuses`、`ai_conversations`、`ai_conversation_messages`、`daily_reports`
-- 提醒：`alert_rules`、`alert_events`
+- 提醒与任务通知：`alert_rules`、`alert_events`、`job_failure_notifications`
 - 模拟盘：`paper_accounts`、`paper_holdings`、`paper_trades`
 
 **行情缓存表（可不备份——均能从数据源重建）：**
@@ -135,7 +136,7 @@ docker exec mysql mysqldump -uquantvista -p'密码' --single-transaction quantvi
   users user_preferences user_quotas options llm_configs prompt_templates notify_channels \
   watchlists watchlist_items positions thesis_cards research_notes screener_strategies \
   analysis_records recommendation_batches recommendations recommendation_statuses \
-  ai_conversations ai_conversation_messages daily_reports alert_rules alert_events \
+  ai_conversations ai_conversation_messages daily_reports alert_rules alert_events job_failure_notifications \
   paper_accounts paper_holdings paper_trades | gzip > qv-user-$(date +%F).sql.gz
 ```
 

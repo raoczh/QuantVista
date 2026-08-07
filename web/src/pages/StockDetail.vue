@@ -129,6 +129,7 @@ const tabStates = reactive<Record<TabKey, SectionState>>({
   fundamental: { phase: 'idle', error: '', updatedAt: '' },
   research: { phase: 'idle', error: '', updatedAt: '' },
 })
+const eventPreviewState = reactive<SectionState>({ phase: 'idle', error: '', updatedAt: '' })
 
 type CoverageKey = 'quote' | 'daily' | 'finance' | 'news' | 'announcements' | 'institutions' | 'funds' | 'events'
 const coverageKeys: CoverageKey[] = ['quote', 'daily', 'finance', 'news', 'announcements', 'institutions', 'funds', 'events']
@@ -194,6 +195,18 @@ const positionSummary = computed<PositionRelationSummary | null>(() => {
   }
 })
 
+const eventSummaryPhase = computed<StockSectionPhase>(() => {
+  const state = tabStates.event
+  const phase = state.phase === 'idle' ? eventPreviewState.phase : state.phase
+  const sourceUnavailable = !!corpEvents.value
+    && (corpEvents.value.lift_unavailable || corpEvents.value.action_unavailable)
+  if ((phase === 'ready' || phase === 'empty') && (state.error || sourceUnavailable)) return 'error'
+  return phase
+})
+const eventSummaryPartial = computed(() => (
+  tabStates.event.phase === 'idle' && eventPreviewState.phase !== 'idle'
+))
+
 const decisionSummary = computed(() => buildDecisionSummary({
   quote: quote.value,
   position: positionSummary.value,
@@ -205,7 +218,8 @@ const decisionSummary = computed(() => buildDecisionSummary({
   corpEvents: corpEvents.value,
   announcements: announcements.value,
   news: news.value,
-  eventPhase: tabStates.event.phase,
+  eventPhase: eventSummaryPhase.value,
+  eventPartial: eventSummaryPartial.value,
   fundamentalPhase: tabStates.fundamental.phase,
 }))
 
@@ -217,6 +231,7 @@ const tabDataState = computed(() => ({
 }))
 const pageRefreshing = computed(() => {
   const phases = [quoteState.phase, relationshipState.phase, tabStates[activeTab.value].phase]
+  if (tabStates.event.phase === 'idle') phases.push(eventPreviewState.phase)
   return phases.some((phase) => phase === 'loading' || phase === 'refreshing')
 })
 const moreOptions = computed<DropdownOption[]>(() => [
@@ -242,6 +257,7 @@ let ffChart: echarts.ECharts | null = null
 const stockEpoch = createLoadEpoch()
 const quoteEpoch = createLoadEpoch()
 const relationshipEpoch = createLoadEpoch()
+const eventPreviewEpoch = createLoadEpoch()
 const tabEpochs: Record<TabKey, ReturnType<typeof createLoadEpoch>> = {
   trend: createLoadEpoch(),
   event: createLoadEpoch(),
@@ -277,6 +293,47 @@ function observedAt() {
 
 function stockRequestIsCurrent(token: number, requestMarket: string, requestSymbol: string) {
   return stockEpoch.isCurrent(token) && market.value === requestMarket && symbol.value === requestSymbol
+}
+
+function corpEventsAvailabilityIssue(result: StockCorpEvents) {
+  if (!result.lift_unavailable && !result.action_unavailable) return ''
+  if (result.note) return result.note
+  if (result.lift_unavailable && result.action_unavailable) return '解禁与分红数据本次均不可用'
+  return result.lift_unavailable ? '解禁数据本次不可用' : '分红数据本次不可用'
+}
+
+// 决策摘要只预取本地公司行动；公告与新闻仍保持事件页签按需加载。
+async function loadEventPreview(stockToken = currentStockToken) {
+  if (!symbol.value || market.value !== 'cn' || isEtfSymbol(symbol.value)) return
+  const requestToken = eventPreviewEpoch.next()
+  const requestMarket = market.value
+  const requestSymbol = symbol.value
+  eventPreviewState.phase = corpEvents.value ? 'refreshing' : 'loading'
+  eventPreviewState.error = ''
+  corpEventsError.value = ''
+  try {
+    const result = await getStockCorpEvents(requestMarket, requestSymbol, stockAbort?.signal)
+    if (!stockRequestIsCurrent(stockToken, requestMarket, requestSymbol) || !eventPreviewEpoch.isCurrent(requestToken)) return
+    corpEvents.value = result
+    corpEventsError.value = ''
+    const issue = corpEventsAvailabilityIssue(result)
+    markCoverage('events', issue || undefined)
+    eventPreviewState.error = issue
+    eventPreviewState.phase = issue ? 'error' : 'ready'
+    eventPreviewState.updatedAt = observedAt()
+  } catch (error) {
+    if (
+      isAbortError(error)
+      || !stockRequestIsCurrent(stockToken, requestMarket, requestSymbol)
+      || !eventPreviewEpoch.isCurrent(requestToken)
+    ) return
+    const message = errorMessage(error)
+    corpEventsError.value = message
+    markCoverage('events', error)
+    eventPreviewState.error = message
+    eventPreviewState.phase = 'error'
+    eventPreviewState.updatedAt = observedAt()
+  }
 }
 
 async function loadQuote(silent = false, stockToken = currentStockToken) {
@@ -431,6 +488,8 @@ async function loadTab(tab: TabKey, force = false, stockToken = currentStockToke
       ))
     }
   } else if (tab === 'event') {
+    // 用户进入完整事件页签后由 tab epoch 接管；仍在飞行的首屏预取结果不得迟到覆盖。
+    eventPreviewEpoch.invalidate()
     requests.push(runTabRequest(
       getNews({ symbol: requestSymbol, limit: 15 }),
       (result) => { news.value = result },
@@ -441,14 +500,17 @@ async function loadTab(tab: TabKey, force = false, stockToken = currentStockToke
       (result) => { announcements.value = result },
       stockToken, requestToken, tab, requestMarket, requestSymbol, 'announcements',
     ))
-    if (requestMarket === 'cn' && !requestIsFund) {
+    if (requestMarket === 'cn' && !requestIsFund && (force || !corpEvents.value)) {
+      corpEventsError.value = ''
       requests.push(runTabRequest(
         getStockCorpEvents(requestMarket, requestSymbol, stockAbort?.signal),
         (result) => {
           corpEvents.value = result
           corpEventsError.value = ''
+          const issue = corpEventsAvailabilityIssue(result)
+          markCoverage('events', issue || undefined)
         },
-        stockToken, requestToken, tab, requestMarket, requestSymbol, 'events',
+        stockToken, requestToken, tab, requestMarket, requestSymbol,
       ).then((outcome) => {
         if (outcome.error) corpEventsError.value = outcome.error
         return outcome
@@ -1155,6 +1217,7 @@ function startStockLoad() {
   currentStockToken = stockEpoch.next()
   quoteEpoch.invalidate()
   relationshipEpoch.invalidate()
+  eventPreviewEpoch.invalidate()
   for (const epoch of Object.values(tabEpochs)) epoch.invalidate()
   stockAbort?.abort()
   stockAbort = new AbortController()
@@ -1187,6 +1250,9 @@ function startStockLoad() {
   relationshipState.phase = 'idle'
   relationshipState.error = ''
   relationshipState.updatedAt = ''
+  eventPreviewState.phase = 'idle'
+  eventPreviewState.error = ''
+  eventPreviewState.updatedAt = ''
   for (const state of Object.values(tabStates)) {
     state.phase = 'idle'
     state.error = ''
@@ -1198,6 +1264,7 @@ function startStockLoad() {
   void loadQuote(false, currentStockToken)
   void loadRelationships(false, currentStockToken)
   void loadTab('trend', false, currentStockToken)
+  void loadEventPreview(currentStockToken)
 }
 
 watch([market, symbol], startStockLoad)
@@ -1220,6 +1287,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
   stockEpoch.invalidate()
+  eventPreviewEpoch.invalidate()
   stockAbort?.abort()
   stockAbort = null
   disposeCharts()
@@ -1237,6 +1305,9 @@ function refreshVisible() {
   void loadQuote(!!quote.value)
   void loadRelationships(positionsKnown.value || watchlistKnown.value)
   void loadTab(activeTab.value, true)
+  if (activeTab.value !== 'event' && eventPreviewState.phase !== 'idle') {
+    void loadEventPreview()
+  }
 }
 
 async function handleSummaryAction(action: 'watch' | 'alert' | 'analysis' | 'position') {

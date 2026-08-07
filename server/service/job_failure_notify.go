@@ -197,9 +197,11 @@ func (r *jobRuntime) notifyFailedJob(jobID int64) {
 		Title: "QuantVista 任务失败", Content: content, Route: route,
 		Kind: NotifyMsgKindTaskFailure, Priority: 4,
 	})
+	// NotifyService 逐通道 best-effort 且不返回聚合结果；这里只能确认已尝试，
+	// 不能把通道实际成功与否伪记为 dispatched。
 	if err := common.DB.Model(&model.JobFailureNotification{}).
 		Where("id = ? AND status = ?", claim.Notice.ID, model.JobFailureNoticeDispatching).
-		Update("status", model.JobFailureNoticeDispatched).Error; err != nil {
+		Update("status", model.JobFailureNoticeAttempted).Error; err != nil {
 		common.SysWarn("任务失败通知投递事实回写失败 job=%d: %v", jobID, err)
 	}
 }

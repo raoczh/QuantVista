@@ -505,7 +505,7 @@ AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yiel
 
 P0-2B-2B 已将六类系统维护任务接入相同的 JobRun/JobStep/恢复/背压运行时。用户作业 owner 为 `user` 且 `user_id>0`；系统作业 owner 为 `system` 且 `user_id IS NULL`，管理员手动触发另记 `triggered_by`。普通用户只能访问自己的 user JobRun；启用管理员还可审计、取消和失败重跑 system JobRun。`GET /api/admin/jobs/metrics` 仅聚合 kind/status/count、最老 queued_at 和进程容量，不选择 request snapshot。用户七类 SSE 鉴权与续传契约不变；系统任务当前由管理员任务页轮询同一事实，不额外伪造事件进度。
 
-P0-5 为 user owner 的 failed 终态增加 `job_failure_notifications` 幂等事实：`job_run_id` 唯一，system owner 不建通知行；同用户同 kind 以 5 分钟滑动窗口合并，稳定 group key 负责跨实例并发首条唯一，窗口轮换时释放旧 root，首行记录 `merge_count`，后续行只记 `merge_root_id` 而不再次外发。只有现有 `enable_notify` 总闸和至少一个启用通道同时满足时才声明外发，否则记 suppressed；不新增平行通知配置。失败终态事务提交后，通知行再以 `claimed→dispatching` CAS 抢占唯一发送权并 best-effort 调现有 NotifyService；外发失败不得改写 JobRun。正文只含任务 kind、白名单错误码和 `/tasks?job_id=<id>`；任务列表按 `job_id+user_id` 精确返回该行，禁止读取或推送 request snapshot、模型正文及原始错误详情。
+P0-5 为 user owner 的 failed 终态增加 `job_failure_notifications` 幂等事实：`job_run_id` 唯一，system owner 不建通知行；同用户同 kind 以 5 分钟滑动窗口合并，稳定 group key 负责跨实例并发首条唯一，窗口轮换时释放旧 root，首行记录 `merge_count`，后续行只记 `merge_root_id` 而不再次外发。只有现有 `enable_notify` 总闸和至少一个启用通道同时满足时才声明外发，否则记 suppressed；不新增平行通知配置。失败终态事务提交后，通知行再以 `claimed→dispatching→attempted` CAS 抢占唯一发送权并 best-effort 调现有 NotifyService；`attempted` 只证明调用已发生，NotifyService 当前不返回逐通道聚合结果，因此不得把它解释成确认送达。外发失败不得改写 JobRun。正文只含任务 kind、白名单错误码和 `/tasks?job_id=<id>`；任务列表按 `job_id+user_id` 精确返回该行，禁止读取或推送 request snapshot、模型正文及原始错误详情。
 
 ### 5.10 扩展模块（N/F/T/S/M/P3 批次 + 2026-07 杂项批）
 
@@ -691,7 +691,7 @@ AI 结果：
 
 - `/`：市场首页
 - `/news`：市场快讯（新闻情绪流，N1/N2）
-- `/stocks/:market/:symbol`：个股详情（行情/日K/估值/评分 + 快捷动作，2026-07-03；首页榜单行与个股速查可点击进入，`useStockActions.goDetail` 供各处复用）
+- `/stocks/:market/:symbol`：个股详情（P0-0C 决策摘要优先，走势/事件/基本面/研究四分区；A 股非基金首屏只预取本地公司行动，公告/新闻按事件页签加载，缺口保持 partial/unknown；stale/unknown 报价只称“最近已知”；首页榜单行与个股速查可点击进入，`useStockActions.goDetail` 供各处复用）
 - `/screener`：策略选股（21 策略组合筛选，S1）
 - `/backtest`：回测时光机（S1）
 - `/heatmap`：行业热力图（M3b）

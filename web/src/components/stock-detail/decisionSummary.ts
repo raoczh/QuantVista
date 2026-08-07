@@ -52,6 +52,7 @@ export interface DecisionSummaryInput {
   announcements: AnnouncementItem[]
   news: NewsItem[]
   eventPhase: StockSectionPhase
+  eventPartial: boolean
   fundamentalPhase: StockSectionPhase
   now?: Date
 }
@@ -79,18 +80,25 @@ function timestamp(value: string) {
   return Number.isFinite(parsed) ? parsed : 0
 }
 
-function unknownEvent(phase: StockSectionPhase): DecisionItem {
-  const detail = phase === 'idle'
+function unknownEvent(phase: StockSectionPhase, partial: boolean): DecisionItem {
+  const settledOrRefreshing = phase === 'ready' || phase === 'empty' || phase === 'refreshing'
+  const detail = partial && settledOrRefreshing
+    ? '公司行动已检查；公告和新闻将在进入“事件”页签后加载，当前不能据此判断近期无事。'
+    : phase === 'idle'
     ? '事件数据尚未请求，进入“事件”页签后加载。'
     : phase === 'loading'
       ? '事件数据正在加载，完成后会更新此处。'
+      : phase === 'refreshing'
+        ? '保留最近一次事件结果并正在刷新；这不等于未来没有其他风险。'
       : phase === 'error'
         ? '事件数据读取失败，当前无法判断近期事件。'
         : '已请求的事件来源未返回近期记录；这不等于未来没有其他风险。'
   return {
     id: 'event-unknown',
-    title: phase === 'empty' || phase === 'ready' ? '未发现近期事件' : '近期事件 unknown',
-    value: 'unknown',
+    title: partial && settledOrRefreshing
+      ? '近期事件待补全'
+      : settledOrRefreshing ? '未发现近期事件' : '近期事件 unknown',
+    value: partial && settledOrRefreshing ? 'partial' : 'unknown',
     detail,
     evidence: '没有可用于展示的确定性事件记录',
     source: 'unknown',
@@ -165,7 +173,7 @@ function selectRecentEvent(input: DecisionSummaryInput): DecisionItem {
     })
   }
 
-  if (!candidates.length) return unknownEvent(input.eventPhase)
+  if (!candidates.length) return unknownEvent(input.eventPhase, input.eventPartial)
   const nowAt = now.getTime()
   candidates.sort((a, b) => Math.abs(a.eventAt - nowAt) - Math.abs(b.eventAt - nowAt))
   const { eventAt: _eventAt, ...selected } = candidates[0]
@@ -192,11 +200,14 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
   }
 
   if (q) {
+    const quoteFresh = q.freshness?.freshness_status === 'fresh'
     changes.push({
       id: 'daily-change',
-      title: q.change_pct > 0 ? '今日上涨' : q.change_pct < 0 ? '今日下跌' : '今日平盘',
+      title: quoteFresh
+        ? q.change_pct > 0 ? '今日上涨' : q.change_pct < 0 ? '今日下跌' : '今日平盘'
+        : q.change_pct > 0 ? '最近已知上涨' : q.change_pct < 0 ? '最近已知下跌' : '最近已知平盘',
       value: signedPct(q.change_pct),
-      detail: `现价 ${q.price.toFixed(2)} 元，昨收 ${q.prev_close.toFixed(2)} 元。`,
+      detail: `${quoteFresh ? '现价' : '最近已知价'} ${q.price.toFixed(2)} 元，昨收 ${q.prev_close.toFixed(2)} 元。`,
       evidence: `(${q.price.toFixed(2)} - ${q.prev_close.toFixed(2)}) / ${q.prev_close.toFixed(2)}`,
       source: q.source || '行情聚合',
       asOf: q.data_time || 'unknown',
@@ -325,12 +336,23 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
     })
   }
 
-  if (risks.length < 2 && phaseUnknown(input.eventPhase)) {
+  const eventEvidenceIncomplete = input.eventPartial || phaseUnknown(input.eventPhase)
+  if (risks.length < 2 && eventEvidenceIncomplete) {
     risks.push({
       id: 'event-gap',
-      title: '事件风险 unknown',
-      value: input.eventPhase === 'error' ? '读取失败' : input.eventPhase === 'loading' ? '加载中' : '未请求',
-      detail: '公告、新闻和公司事件尚未形成完整证据，不能据此判断“近期无事”。',
+      title: input.eventPartial ? '事件风险待补全' : '事件风险 unknown',
+      value: input.eventPartial
+        ? input.eventPhase === 'error'
+          ? '公司行动读取失败'
+          : input.eventPhase === 'loading' ? '公司行动加载中' : '仅公司行动'
+        : input.eventPhase === 'error' ? '读取失败' : input.eventPhase === 'loading' ? '加载中' : '未请求',
+      detail: input.eventPartial
+        ? input.eventPhase === 'error'
+          ? '公司行动读取失败，公告和新闻也尚未加载，当前无法形成完整事件判断。'
+          : input.eventPhase === 'loading'
+            ? '公司行动正在加载，公告和新闻也尚未加载，当前无法形成完整事件判断。'
+          : '首屏只预取公司行动，公告和新闻尚未加载，不能据此判断“近期无事”。'
+        : '公告、新闻和公司事件尚未形成完整证据，不能据此判断“近期无事”。',
       evidence: '事件分区尚无可核验结果',
       source: 'unknown',
       asOf: 'unknown',
@@ -353,7 +375,8 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
   const invalidation: string[] = []
   if (q?.freshness?.freshness_status !== 'fresh') invalidation.push('行情不是当前有效盘面')
   if (!position?.quoteFresh && position) invalidation.push('持仓盈亏缺少完整有效行情')
-  if (phaseUnknown(input.eventPhase)) invalidation.push('事件证据未完成加载')
+  if (input.eventPartial) invalidation.push('事件证据仅预取公司行动，公告与新闻尚未加载')
+  else if (phaseUnknown(input.eventPhase)) invalidation.push('事件证据未完成加载')
   if (phaseUnknown(input.fundamentalPhase)) invalidation.push('基本面证据未完成加载')
   if (input.score?.data_limited) invalidation.push('技术评分样本不足')
 

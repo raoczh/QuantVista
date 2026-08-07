@@ -5,13 +5,14 @@ import "time"
 const (
 	JobFailureNoticeClaimed     = "claimed"
 	JobFailureNoticeDispatching = "dispatching"
-	JobFailureNoticeDispatched  = "dispatched"
+	JobFailureNoticeAttempted   = "attempted"
 	JobFailureNoticeMerged      = "merged"
 	JobFailureNoticeSuppressed  = "suppressed"
 )
 
 // JobFailureNotification 是用户作业失败通知的幂等事实。每个 JobRun 最多一行；
 // GroupKey 只在短窗内第一条通知上有值，后续同类失败通过 MergeRootID 合并。
+// attempted 只表示已调用 best-effort 通知器，不表示任一外部通道确认送达。
 type JobFailureNotification struct {
 	ID       int64  `gorm:"primaryKey" json:"id"`
 	JobRunID int64  `gorm:"not null;uniqueIndex" json:"job_run_id"`
