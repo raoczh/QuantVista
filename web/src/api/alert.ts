@@ -1,4 +1,4 @@
-import { request } from './client'
+import { ApiRequestError, getApiErrorCode, request } from './client'
 
 export type AlertKind =
   | 'price'
@@ -189,4 +189,41 @@ export function setAlertEventStatus(id: number, status: AlertEventStatus) {
 
 export function readAllAlertEvents() {
   return request<{ updated: number }>({ url: '/alerts/events/read-all', method: 'put' })
+}
+
+export type AlertRequestStage =
+  | 'rules'
+  | 'stocks'
+  | 'positions'
+  | 'save'
+  | 'events'
+  | 'detail'
+  | 'evaluate'
+  | 'action'
+
+/**
+ * 提醒页只展示阶段化、可恢复的安全文案。后端原始正文可能包含内部依赖信息，
+ * 因此这里仅依据受控的状态码/错误码分类，不直接拼接 error.message。
+ */
+export function alertRequestMessage(stage: AlertRequestStage, error: unknown): string {
+  const code = getApiErrorCode(error)
+  const status = error instanceof ApiRequestError ? error.status : undefined
+  if (code === 'request_timeout') return '请求超时，当前内容已保留。请稍后重试。'
+  if (status === 401) return '登录状态已失效，重新登录后可继续。'
+  if (status === 403) return '当前账号无权执行这项操作。'
+  if (stage === 'detail' && status === 404) return '这条命中记录不存在或已不可访问。'
+  if (stage === 'save' && status != null && status >= 400 && status < 500) {
+    return '保存未完成，请检查监控对象和参数后重试；已填写内容不会清空。'
+  }
+  const fallback: Record<AlertRequestStage, string> = {
+    rules: '提醒规则加载失败，请重试。',
+    stocks: '股票搜索失败，请重试当前关键词。',
+    positions: '持仓加载失败，请重试。',
+    save: '提醒保存失败，请稍后重试；已填写内容不会清空。',
+    events: '命中记录加载失败，请重试。',
+    detail: '命中详情加载失败，请重试。',
+    evaluate: '立即检查未完成，请稍后重试。',
+    action: '提醒操作未完成，请稍后重试。',
+  }
+  return fallback[stage]
 }

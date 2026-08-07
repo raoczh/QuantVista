@@ -1,30 +1,27 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch } from 'vue'
+import { ref, onMounted, computed, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
   NInput,
-  NInputNumber,
   NSelect,
-  NSwitch,
   NForm,
   NFormItem,
   NTag,
   NSpin,
   NEmpty,
   NPopconfirm,
-  NGrid,
-  NGi,
   NRadioGroup,
   NRadioButton,
   NModal,
   NAlert,
+  NDropdown,
   useMessage,
+  useDialog,
+  type DropdownOption,
 } from 'naive-ui'
 import {
   listAlerts,
-  createAlert,
-  updateAlert,
   setAlertStatus,
   deleteAlert,
   evaluateAlerts,
@@ -32,9 +29,9 @@ import {
   getAlertEvent,
   setAlertEventStatus,
   readAllAlertEvents,
+  alertRequestMessage,
   isPositionAlertKind,
   type AlertRule,
-  type AlertInput,
   type AlertEvent,
   type AlertEventStatus,
 } from '@/api/alert'
@@ -50,165 +47,48 @@ import {
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import AlertWizard from '@/components/alerts/AlertWizard.vue'
+import type { AlertStockContext } from '@/components/alerts/alertTemplates'
 
 const message = useMessage()
+const dialog = useDialog()
 const route = useRoute()
 const router = useRouter()
 const { upColor, vars, withAlpha } = useUi()
-const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
+const styleVars = computed(() => ({
+  '--qv-divider': vars.value.dividerColor,
+  '--qv-primary': vars.value.primaryColor,
+}))
 
-const marketOptions = [
-  { label: 'A 股', value: 'cn' },
-  { label: '港股', value: 'hk' },
-  { label: '美股', value: 'us' },
-]
-const kindOptions = [
-  { label: '【持仓】相对我的成本涨 N%（考虑落袋）', value: 'cost_gain' },
-  { label: '【持仓】相对我的成本跌 N%（考虑止损）', value: 'cost_drawdown' },
-  { label: '【持仓】自持仓期最高回撤 N%（移动止盈）', value: 'peak_drawdown' },
-  { label: '到价提醒', value: 'price' },
-  { label: '涨跌幅异动', value: 'pct_change' },
-  { label: '均线（站上/跌破）', value: 'ma' },
-  { label: '突破（新高/新低）', value: 'breakout' },
-  { label: '放量（vs 20 日均量）', value: 'volume_surge' },
-  { label: '振幅异动', value: 'amplitude' },
-  { label: '财报披露临近', value: 'earn_date' },
-  { label: '新业绩预告', value: 'earn_fcst' },
-]
-// 财报日历类：无条件方向语义，且不走盘中行情评估（每日盘后财报数据刷新时评估一次）。
-const isEarnKind = computed(() => form.value.kind === 'earn_date' || form.value.kind === 'earn_fcst')
-// D14/D15 持仓类：方向由 kind 自带（op 无意义）、代码可留空 = 我的全部持仓、
-// 命中后不自动暂停（一条规则覆盖多笔持仓，暂停整条会让其余持仓失联）。
-const isPosKind = computed(() => isPositionAlertKind(form.value.kind))
-// op 选项随 kind 变化，文案更贴切。
-const opOptions = computed(() => {
-  switch (form.value.kind) {
-    case 'ma':
-      return [
-        { label: '站上均线', value: 'gte' },
-        { label: '跌破均线', value: 'lte' },
-      ]
-    case 'breakout':
-      return [
-        { label: '创新高', value: 'gte' },
-        { label: '创新低', value: 'lte' },
-      ]
-    case 'volume_surge':
-      return [
-        { label: '放量达到倍数', value: 'gte' },
-        { label: '缩量低于倍数', value: 'lte' },
-      ]
-    case 'amplitude':
-      return [
-        { label: '振幅达到', value: 'gte' },
-        { label: '振幅低于', value: 'lte' },
-      ]
-    default:
-      return [
-        { label: '大于等于 ≥', value: 'gte' },
-        { label: '小于等于 ≤', value: 'lte' },
-      ]
-  }
-})
-const needThreshold = computed(
-  () =>
-    form.value.kind === 'price' ||
-    form.value.kind === 'pct_change' ||
-    form.value.kind === 'volume_surge' ||
-    form.value.kind === 'amplitude' ||
-    form.value.kind === 'earn_date' ||
-    isPosKind.value,
-)
-const needPeriod = computed(() => form.value.kind === 'ma' || form.value.kind === 'breakout')
-const thresholdLabel = computed(() => {
-  switch (form.value.kind) {
-    case 'price':
-      return '目标价'
-    case 'pct_change':
-      return '涨跌幅阈值（%）'
-    case 'volume_surge':
-      return '量比倍数（如 2 = 2 倍 20 日均量）'
-    case 'amplitude':
-      return '振幅阈值（%，(最高-最低)/昨收）'
-    case 'earn_date':
-      return '提前天数（距预约披露日 ≤N 天提醒）'
-    case 'cost_gain':
-      return '相对我的成本涨幅（%，如 20 = 涨 20% 提醒落袋）'
-    case 'cost_drawdown':
-      return '相对我的成本跌幅（%，如 8 = 跌 8% 提醒止损）'
-    case 'peak_drawdown':
-      return '自持仓期最高价的回撤（%，如 15 = 从最高点回撤 15% 提醒）'
-    default:
-      return '阈值'
-  }
-})
+// ---------- 模板向导 / 编辑入口 ----------
+const editingRule = ref<AlertRule | null>(null)
+const stockContext = ref<AlertStockContext | null>(null)
 
-// ---------- 表单 ----------
-const editingId = ref<number | null>(null)
-const form = ref<AlertInput & { symbol: string; market: string }>({
-  symbol: '',
-  market: 'cn',
-  name: '',
-  kind: 'price',
-  op: 'gte',
-  threshold: undefined,
-  period: 20,
-  once: true,
-  note: '',
-})
-function resetForm() {
-  editingId.value = null
-  form.value = { symbol: '', market: 'cn', name: '', kind: 'price', op: 'gte', threshold: undefined, period: 20, once: true, note: '' }
-}
 function editRule(r: AlertRule) {
-  editingId.value = r.id
-  form.value = {
-    symbol: r.symbol,
-    market: r.market,
-    name: r.name,
-    kind: r.kind,
-    op: r.op,
-    threshold: r.threshold ?? undefined,
-    period: r.period || 20,
-    once: r.once,
-    note: r.note,
-  }
+  editingRule.value = r
+  void nextTick(() => document.querySelector('.alert-wizard')?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
 }
 
-const saving = ref(false)
-async function submit() {
-  // 持仓类允许留空代码（= 我的全部持仓）；其余类型必须绑定标的。
-  if (!editingId.value && !isPosKind.value && !form.value.symbol.trim()) {
-    message.warning('请输入股票代码')
-    return
-  }
-  if (needThreshold.value && (form.value.threshold == null || (form.value.kind !== 'pct_change' && form.value.threshold <= 0))) {
-    message.warning(`请输入${thresholdLabel.value}`)
-    return
-  }
-  saving.value = true
-  try {
-    if (editingId.value) await updateAlert(editingId.value, form.value)
-    else await createAlert(form.value)
-    message.success('已保存')
-    resetForm()
-    await load()
-  } catch (e) {
-    message.error((e as Error).message)
-  } finally {
-    saving.value = false
-  }
+async function handleWizardSaved() {
+  editingRule.value = null
+  await load()
+}
+
+function cancelWizardEdit() {
+  editingRule.value = null
 }
 
 // ---------- 列表 ----------
 const rules = ref<AlertRule[]>([])
 const loading = ref(false)
+const rulesError = ref('')
 async function load() {
   loading.value = true
+  rulesError.value = ''
   try {
     rules.value = await listAlerts()
-  } catch (e) {
-    message.error((e as Error).message)
+  } catch (error) {
+    rulesError.value = alertRequestMessage('rules', error)
   } finally {
     loading.value = false
   }
@@ -220,8 +100,8 @@ async function runEvaluate() {
     const { hits } = await evaluateAlerts()
     message.success(hits > 0 ? `本次命中 ${hits} 条` : '暂无命中')
     await Promise.all([load(), loadEvents()])
-  } catch (e) {
-    message.error((e as Error).message)
+  } catch (error) {
+    message.error(alertRequestMessage('evaluate', error))
   } finally {
     evaluating.value = false
   }
@@ -230,19 +110,43 @@ async function toggle(r: AlertRule) {
   try {
     await setAlertStatus(r.id, r.status === 'paused' ? 'active' : 'paused')
     await load()
-  } catch (e) {
-    message.error((e as Error).message)
+  } catch (error) {
+    message.error(alertRequestMessage('action', error))
   }
 }
 async function remove(r: AlertRule) {
   try {
     await deleteAlert(r.id)
-    if (editingId.value === r.id) resetForm()
+    if (editingRule.value?.id === r.id) editingRule.value = null
     await load()
     message.success('已删除')
-  } catch (e) {
-    message.error((e as Error).message)
+  } catch (error) {
+    message.error(alertRequestMessage('action', error))
   }
+}
+
+function confirmRemove(r: AlertRule) {
+  dialog.warning({
+    title: '删除提醒',
+    content: `确认删除“${ruleScope(r)}”的这条提醒？历史命中记录会保留。`,
+    positiveText: '删除',
+    negativeText: '取消',
+    onPositiveClick: () => remove(r),
+  })
+}
+
+function ruleMenuOptions(r: AlertRule): DropdownOption[] {
+  return [
+    { key: 'edit', label: '编辑' },
+    { key: 'toggle', label: r.status === 'paused' ? '恢复' : '暂停' },
+    { key: 'delete', label: '删除' },
+  ]
+}
+
+function selectRuleAction(key: string | number, rule: AlertRule) {
+  if (key === 'edit') editRule(rule)
+  else if (key === 'toggle') void toggle(rule)
+  else if (key === 'delete') confirmRemove(rule)
 }
 
 // ---------- 展示辅助 ----------
@@ -310,11 +214,20 @@ function fmtTime(t: string | null) {
 
 function applyStockActionQuery() {
   if (route.query.add !== '1') return
-  resetForm()
-  form.value.symbol = String(route.query.symbol || '')
-  form.value.market = String(route.query.market || 'cn')
-  form.value.name = String(route.query.name || '')
-  void router.replace({ name: 'alerts' })
+  editingRule.value = null
+  stockContext.value = {
+    symbol: String(route.query.symbol || ''),
+    market: String(route.query.market || 'cn'),
+    name: String(route.query.name || ''),
+    nonce: String(route.query._stock_action || Date.now()),
+  }
+  const query = { ...route.query }
+  delete query.add
+  delete query.symbol
+  delete query.market
+  delete query.name
+  delete query._stock_action
+  void router.replace({ name: 'alerts', query })
 }
 
 watch(() => route.query._stock_action, applyStockActionQuery)
@@ -329,6 +242,7 @@ onMounted(async () => {
 // ---------- 命中历史（明细事件状态机） ----------
 const events = ref<AlertEvent[]>([])
 const eventsLoading = ref(false)
+const eventsError = ref('')
 const eventFilter = ref<'unread' | 'all' | 'read' | 'dismissed'>('unread')
 const eventFilterOptions = [
   { label: '未读', value: 'unread' },
@@ -338,10 +252,11 @@ const eventFilterOptions = [
 ]
 async function loadEvents() {
   eventsLoading.value = true
+  eventsError.value = ''
   try {
     events.value = await listAlertEvents(eventFilter.value === 'all' ? undefined : eventFilter.value)
-  } catch (e) {
-    message.error((e as Error).message)
+  } catch (error) {
+    eventsError.value = alertRequestMessage('events', error)
   } finally {
     eventsLoading.value = false
   }
@@ -350,8 +265,8 @@ async function markEvent(ev: AlertEvent, status: AlertEventStatus) {
   try {
     await setAlertEventStatus(ev.id, status)
     await loadEvents()
-  } catch (e) {
-    message.error((e as Error).message)
+  } catch (error) {
+    message.error(alertRequestMessage('action', error))
   }
 }
 const readingAll = ref(false)
@@ -361,8 +276,8 @@ async function markAllRead() {
     const { updated } = await readAllAlertEvents()
     message.success(updated > 0 ? `已标记 ${updated} 条为已读` : '没有未读命中')
     await loadEvents()
-  } catch (e) {
-    message.error((e as Error).message)
+  } catch (error) {
+    message.error(alertRequestMessage('action', error))
   } finally {
     readingAll.value = false
   }
@@ -371,6 +286,22 @@ function eventStatusTag(s: AlertEventStatus) {
   if (s === 'unread') return { text: '未读', type: 'warning' as const }
   if (s === 'read') return { text: '已读', type: 'success' as const }
   return { text: '已忽略', type: 'default' as const }
+}
+
+function eventMenuOptions(ev: AlertEvent): DropdownOption[] {
+  if (ev.status === 'unread') {
+    return [
+      { key: 'read', label: '标记已读' },
+      { key: 'dismissed', label: '忽略' },
+    ]
+  }
+  return [{ key: 'unread', label: '恢复未读' }]
+}
+
+function selectEventAction(key: string | number, event: AlertEvent) {
+  if (key === 'read' || key === 'dismissed' || key === 'unread') {
+    void markEvent(event, key)
+  }
 }
 const kindLabelMap: Record<string, string> = {
   price: '到价',
@@ -389,6 +320,7 @@ const kindLabelMap: Record<string, string> = {
 // ---------- 命中详情深链 ----------
 const detailOpen = ref(false)
 const detailLoading = ref(false)
+const detailError = ref('')
 const selectedEvent = ref<AlertEvent | null>(null)
 let detailSeq = 0
 
@@ -403,20 +335,24 @@ async function openRouteEvent() {
   if (!id) {
     detailOpen.value = false
     selectedEvent.value = null
+    detailError.value = ''
     return
   }
   const seq = ++detailSeq
+  const cached = events.value.find((event) => event.id === id)
+  if (cached) selectedEvent.value = cached
+  else if (selectedEvent.value?.id !== id) selectedEvent.value = null
+  detailOpen.value = true
   detailLoading.value = true
+  detailError.value = ''
   try {
     const event = await getAlertEvent(id)
     if (seq !== detailSeq || routeEventID() !== id) return
     selectedEvent.value = event
     detailOpen.value = true
-  } catch (e) {
+  } catch (error) {
     if (seq !== detailSeq || routeEventID() !== id) return
-    selectedEvent.value = null
-    detailOpen.value = false
-    message.error((e as Error).message)
+    detailError.value = alertRequestMessage('detail', error)
   } finally {
     if (seq === detailSeq) detailLoading.value = false
   }
@@ -424,6 +360,7 @@ async function openRouteEvent() {
 
 function openEventDetail(event: AlertEvent) {
   selectedEvent.value = event
+  detailError.value = ''
   detailOpen.value = true
   void router.push(event.deep_link)
 }
@@ -432,6 +369,7 @@ function closeEventDetail() {
   detailSeq++
   detailOpen.value = false
   selectedEvent.value = null
+  detailError.value = ''
   const query = { ...route.query }
   delete query.event_id
   void router.replace({ name: 'alerts', query })
@@ -500,8 +438,8 @@ const kindNotifyOptions = [
 async function loadChannels() {
   try {
     channels.value = await listChannels()
-  } catch (e) {
-    message.error((e as Error).message)
+  } catch (error) {
+    message.error(alertRequestMessage('action', error))
   }
 }
 const chAdding = ref(false)
@@ -527,8 +465,8 @@ async function addChannel() {
     ntfyForm.value = { url: '', topic: '', token: '' }
     await loadChannels()
     message.success('已添加推送通道')
-  } catch (e) {
-    message.error((e as Error).message)
+  } catch (error) {
+    message.error(alertRequestMessage('action', error))
   } finally {
     chAdding.value = false
   }
@@ -537,16 +475,16 @@ async function toggleChannel(ch: NotifyChannel) {
   try {
     await updateChannel(ch.id, { kind: ch.kind, name: ch.name, enabled: !ch.enabled })
     await loadChannels()
-  } catch (e) {
-    message.error((e as Error).message)
+  } catch (error) {
+    message.error(alertRequestMessage('action', error))
   }
 }
 async function testCh(ch: NotifyChannel) {
   try {
     await testChannel(ch.id)
     message.success('测试推送已发送，请查收')
-  } catch (e) {
-    message.error((e as Error).message)
+  } catch (error) {
+    message.error(alertRequestMessage('action', error))
   }
 }
 async function removeChannel(ch: NotifyChannel) {
@@ -554,8 +492,8 @@ async function removeChannel(ch: NotifyChannel) {
     await deleteChannel(ch.id)
     await loadChannels()
     message.success('已删除')
-  } catch (e) {
-    message.error((e as Error).message)
+  } catch (error) {
+    message.error(alertRequestMessage('action', error))
   }
 }
 function channelKindLabel(k: string) {
@@ -578,61 +516,13 @@ function channelKindLabel(k: string) {
     <div class="alerts" :style="styleVars">
       <!-- 左：新建/编辑 -->
       <div class="col-form">
-        <SectionCard :title="editingId ? '编辑提醒' : '新建提醒'">
-          <n-form label-placement="top" :show-feedback="false" class="form">
-            <n-form-item label="提醒类型">
-              <n-select v-model:value="form.kind" :options="kindOptions" />
-            </n-form-item>
-            <div v-if="isPosKind" class="hint" style="margin: -4px 0 4px">
-              持仓类提醒基于<b>我的实际持仓成本</b>（加权均价，加减仓自动重算），无需手工填价位。
-              股票代码<b>留空即覆盖我的全部持仓</b>；命中后不会自动暂停，且无当前有效行情的持仓本轮不评（不用旧价误报）。
-            </div>
-            <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
-              <n-gi>
-                <n-form-item :label="isPosKind ? '股票代码（留空=全部持仓）' : '股票代码'">
-                  <n-input
-                    v-model:value="form.symbol"
-                    :placeholder="isPosKind ? '留空覆盖全部持仓' : '如 600000'"
-                    :disabled="!!editingId"
-                  />
-                </n-form-item>
-              </n-gi>
-              <n-gi>
-                <n-form-item label="市场">
-                  <n-select v-model:value="form.market" :options="marketOptions" :disabled="!!editingId" />
-                </n-form-item>
-              </n-gi>
-            </n-grid>
-            <n-form-item v-if="!isEarnKind && !isPosKind" label="条件方向">
-              <n-select v-model:value="form.op" :options="opOptions" />
-            </n-form-item>
-            <n-form-item v-if="needThreshold" :label="thresholdLabel">
-              <n-input-number
-                v-model:value="form.threshold"
-                :precision="form.kind === 'earn_date' ? 0 : 2"
-                :min="form.kind === 'earn_date' ? 1 : undefined"
-                :max="form.kind === 'earn_date' ? 30 : undefined"
-                style="width: 100%"
-              />
-            </n-form-item>
-            <div v-if="isEarnKind" class="hint" style="margin: -4px 0 4px">
-              财报提醒按每日盘后刷新的披露/预告数据评估（每天一次），不占用盘中行情检查。
-            </div>
-            <n-form-item v-if="needPeriod" label="周期（交易日）">
-              <n-input-number v-model:value="form.period" :min="2" :max="250" style="width: 100%" />
-            </n-form-item>
-            <n-form-item v-if="!isPosKind" label="命中后自动暂停">
-              <n-switch v-model:value="form.once" />
-              <span class="switch-hint">开启后命中一次即暂停，避免重复提示</span>
-            </n-form-item>
-            <n-form-item label="备注">
-              <n-input v-model:value="form.note" placeholder="可选" maxlength="256" />
-            </n-form-item>
-            <div class="form-actions">
-              <n-button v-if="editingId" quaternary @click="resetForm">取消编辑</n-button>
-              <n-button type="primary" :loading="saving" @click="submit">{{ editingId ? '保存修改' : '添加提醒' }}</n-button>
-            </div>
-          </n-form>
+        <SectionCard :title="editingRule ? '编辑提醒' : '新建提醒'">
+          <AlertWizard
+            :editing-rule="editingRule"
+            :stock-context="stockContext"
+            @saved="handleWizardSaved"
+            @cancel-edit="cancelWizardEdit"
+          />
         </SectionCard>
 
         <SectionCard title="推送通道">
@@ -680,7 +570,7 @@ function channelKindLabel(k: string) {
                     ch.enabled ? '启用' : '停用'
                   }}</n-tag>
                 </div>
-                <div v-if="ch.last_error" class="ch-err">上次推送失败：{{ ch.last_error }}</div>
+                <div v-if="ch.last_error" class="ch-err">上次推送失败，请测试通道或检查配置</div>
               </div>
               <div class="ch-actions">
                 <n-button size="tiny" quaternary @click="testCh(ch)">测试</n-button>
@@ -701,7 +591,11 @@ function channelKindLabel(k: string) {
       <div class="col-list">
         <SectionCard title="我的提醒">
           <n-spin :show="loading && !rules.length">
-            <n-empty v-if="!rules.length" description="暂无提醒规则，在左侧添加一条" />
+            <n-alert v-if="rulesError" type="warning" title="提醒规则加载失败" :bordered="false" class="section-error">
+              {{ rules.length ? '仍展示上次加载的规则，刷新失败。' : rulesError }}
+              <div class="recovery-action"><n-button size="small" :loading="loading" @click="load">重试加载提醒</n-button></div>
+            </n-alert>
+            <n-empty v-if="!rules.length && !rulesError" description="暂无提醒规则，在左侧添加一条" />
             <div v-else class="rules">
               <div v-for="r in rules" :key="r.id" class="rule" :class="{ hit: isHitToday(r) }">
                 <div class="rule-main">
@@ -711,8 +605,8 @@ function channelKindLabel(k: string) {
                     <n-tag size="tiny" round :bordered="false" :type="statusTag(r).type">{{
                       statusTag(r).text
                     }}</n-tag>
-                    <n-tag v-if="isPositionAlertKind(r.kind)" size="tiny" round :bordered="false" type="info">{{
-                      kindLabelMap[r.kind]
+                    <n-tag size="tiny" round :bordered="false" :type="isPositionAlertKind(r.kind) ? 'info' : 'default'">{{
+                      kindLabelMap[r.kind] || r.kind
                     }}</n-tag>
                   </div>
                   <div class="rule-cond">{{ describe(r) }}</div>
@@ -724,7 +618,7 @@ function channelKindLabel(k: string) {
                   </div>
                   <div v-if="r.note" class="rule-note">{{ r.note }}</div>
                 </div>
-                <div class="rule-actions">
+                <div class="rule-actions desktop-actions">
                   <n-button size="tiny" quaternary @click="toggle(r)">{{ r.status === 'paused' ? '恢复' : '暂停' }}</n-button>
                   <n-button size="tiny" quaternary @click="editRule(r)">编辑</n-button>
                   <n-popconfirm @positive-click="remove(r)">
@@ -734,6 +628,11 @@ function channelKindLabel(k: string) {
                     删除提醒「{{ ruleScope(r) }}」？
                   </n-popconfirm>
                 </div>
+                <span class="mobile-actions">
+                  <n-dropdown trigger="click" placement="bottom-end" :options="ruleMenuOptions(r)" @select="(key) => selectRuleAction(key, r)">
+                    <n-button quaternary circle size="small" aria-label="提醒操作" title="提醒操作">⋯</n-button>
+                  </n-dropdown>
+                </span>
               </div>
             </div>
           </n-spin>
@@ -751,8 +650,12 @@ function channelKindLabel(k: string) {
             </div>
           </template>
           <n-spin :show="eventsLoading && !events.length">
+            <n-alert v-if="eventsError" type="warning" title="命中记录加载失败" :bordered="false" class="section-error">
+              {{ events.length ? '仍展示上次加载的命中记录，刷新失败。' : eventsError }}
+              <div class="recovery-action"><n-button size="small" :loading="eventsLoading" @click="loadEvents">重试加载记录</n-button></div>
+            </n-alert>
             <n-empty
-              v-if="!events.length"
+              v-if="!events.length && !eventsError"
               :description="eventFilter === 'unread' ? '没有未读命中，规则命中后会在这里留档' : '暂无命中记录'"
               style="padding: 24px 0"
             />
@@ -770,13 +673,19 @@ function channelKindLabel(k: string) {
                   <div class="ev-msg">{{ ev.message }}</div>
                   <div class="ev-time">{{ fmtTime(ev.triggered_at) }}</div>
                 </div>
-                <div class="ev-actions">
+                <div class="ev-actions desktop-actions">
                   <n-button size="tiny" quaternary @click="openEventDetail(ev)">详情</n-button>
                   <template v-if="ev.status === 'unread'">
                     <n-button size="tiny" quaternary @click="markEvent(ev, 'read')">已读</n-button>
                     <n-button size="tiny" quaternary @click="markEvent(ev, 'dismissed')">忽略</n-button>
                   </template>
                   <n-button v-else size="tiny" quaternary @click="markEvent(ev, 'unread')">恢复未读</n-button>
+                </div>
+                <div class="ev-mobile-actions mobile-actions">
+                  <n-button size="small" quaternary @click="openEventDetail(ev)">详情</n-button>
+                  <n-dropdown trigger="click" placement="bottom-end" :options="eventMenuOptions(ev)" @select="(key) => selectEventAction(key, ev)">
+                    <n-button quaternary circle size="small" aria-label="命中记录操作" title="命中记录操作">⋯</n-button>
+                  </n-dropdown>
                 </div>
               </div>
             </div>
@@ -794,6 +703,10 @@ function channelKindLabel(k: string) {
       @update:show="(show) => !show && closeEventDetail()"
     >
       <n-spin :show="detailLoading">
+        <n-alert v-if="detailError" type="warning" title="命中详情加载失败" :bordered="false" class="detail-error">
+          {{ selectedEvent ? '正在展示列表中已有的命中信息，详情刷新失败。' : detailError }}
+          <div class="recovery-action"><n-button size="small" :loading="detailLoading" @click="openRouteEvent">重试加载详情</n-button></div>
+        </n-alert>
         <template v-if="selectedEvent">
           <div class="detail-head">
             <div>
@@ -891,7 +804,7 @@ function channelKindLabel(k: string) {
 <style scoped>
 .alerts {
   display: grid;
-  grid-template-columns: 340px 1fr;
+  grid-template-columns: minmax(400px, 440px) minmax(0, 1fr);
   gap: 16px;
   align-items: start;
 }
@@ -912,16 +825,12 @@ function channelKindLabel(k: string) {
   flex-direction: column;
   gap: 12px;
 }
-.switch-hint {
-  font-size: 12px;
-  opacity: 0.5;
-  margin-left: 10px;
+.section-error,
+.detail-error {
+  margin-bottom: 12px;
 }
-.form-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 10px;
-  margin-top: 4px;
+.recovery-action {
+  margin-top: 8px;
 }
 .rules {
   display: flex;
@@ -933,16 +842,6 @@ function channelKindLabel(k: string) {
   gap: 12px;
   padding: 12px 6px;
   border-bottom: 1px solid var(--qv-divider);
-}
-@media (max-width: 768px) {
-  .rule {
-    flex-wrap: wrap;
-    row-gap: 4px;
-  }
-  .rule-actions {
-    flex-basis: 100%;
-    justify-content: flex-end;
-  }
 }
 .rule:last-child {
   border-bottom: none;
@@ -959,6 +858,7 @@ function channelKindLabel(k: string) {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 .rule-name {
   font-size: 14px;
@@ -997,6 +897,9 @@ function channelKindLabel(k: string) {
   align-items: center;
   gap: 4px;
   flex-shrink: 0;
+}
+.mobile-actions {
+  display: none;
 }
 /* 推送通道 */
 .channels {
@@ -1100,6 +1003,11 @@ function channelKindLabel(k: string) {
   gap: 4px;
   flex-shrink: 0;
 }
+:global(.event-detail-modal .n-card__content) {
+  max-height: min(74vh, 760px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
 .detail-head {
   display: flex;
   align-items: center;
@@ -1149,6 +1057,75 @@ function channelKindLabel(k: string) {
 @media (max-width: 480px) {
   .detail-grid {
     grid-template-columns: 84px minmax(0, 1fr);
+  }
+}
+@media (max-width: 768px) {
+  .alerts {
+    gap: 12px;
+  }
+  .rules,
+  .events {
+    gap: 8px;
+  }
+  .rule,
+  .event {
+    position: relative;
+    border: 1px solid var(--qv-divider);
+    border-radius: 6px;
+    padding: 12px;
+  }
+  .rule:last-child,
+  .event:last-child {
+    border-bottom: 1px solid var(--qv-divider);
+  }
+  .rule-title {
+    padding-right: 34px;
+  }
+  .rule-note {
+    display: none;
+  }
+  .rule-hit,
+  .ev-msg {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+  .desktop-actions {
+    display: none;
+  }
+  .mobile-actions {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    display: inline-flex;
+  }
+  .event {
+    flex-wrap: wrap;
+  }
+  .event .ev-main {
+    flex-basis: 100%;
+  }
+  .event .ev-symbol {
+    display: none;
+  }
+  .event .ev-mobile-actions {
+    position: static;
+    display: flex;
+    width: 100%;
+    justify-content: flex-end;
+  }
+  :global(.event-detail-modal .n-card__content) {
+    max-height: calc(100dvh - 132px - env(safe-area-inset-bottom, 0px));
+    padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+  }
+}
+@media (max-width: 768px) and (max-height: 560px) {
+  :global(.mobile-bottom-nav) {
+    display: none;
+  }
+  :global(.event-detail-modal .n-card__content) {
+    max-height: calc(100dvh - 96px);
   }
 }
 </style>
