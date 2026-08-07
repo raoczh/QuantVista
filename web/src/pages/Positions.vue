@@ -1099,6 +1099,7 @@ let lastConsumedStockAction = ''
 let activeStockAction = ''
 
 function stockActionKey() {
+  if (route.query.import === '1') return 'import'
   const symbol = String(route.query.symbol || '').trim()
   if (!symbol && route.query.add !== '1') return ''
   return String(route.query._stock_action || '') || [symbol, route.query.market || 'cn', route.query.add || ''].join(':')
@@ -1106,7 +1107,7 @@ function stockActionKey() {
 
 function stockRouteRemainder() {
   const query = { ...route.query }
-  for (const key of ['symbol', 'market', 'name', 'add', 'rec_id', '_stock_action']) delete query[key]
+  for (const key of ['symbol', 'market', 'name', 'add', 'import', 'rec_id', '_stock_action']) delete query[key]
   return query
 }
 
@@ -1120,6 +1121,12 @@ async function applyStockActionQuery(): Promise<boolean> {
 
   activeStockAction = actionKey
   try {
+    if (route.query.import === '1') {
+      lastConsumedStockAction = actionKey
+      openImport()
+      await router.replace({ name: 'positions', query: stockRouteRemainder() })
+      return false
+    }
     if (route.query.add === '1') {
       lastConsumedStockAction = actionKey
       highlightedPositionID.value = null
