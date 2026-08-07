@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
-import { useRoute } from 'vue-router'
+import { ref, computed, onBeforeUnmount, onMounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
   NTag,
@@ -21,6 +21,8 @@ import {
 } from 'naive-ui'
 import {
   runBacktest,
+  getBacktestResult,
+  listBacktestResults,
   backtestRecommendations,
   HOLD_STATUS_LABEL,
   type BacktestResult,
@@ -35,16 +37,20 @@ import {
   type CustomStrategy,
   type ScreenerStrategyRevision,
   type StrategiesView,
+  type StrategyRun,
 } from '@/api/screener'
+import { taskStatusLabel } from '@/api/taskCenter'
 import { listRecommendations, type RecommendationBatch } from '@/api/recommendation'
 import { useUi } from '@/composables/useUi'
 import { useIsMobile } from '@/composables/useIsMobile'
+import { isPollCancelled, pollUntil } from '@/lib/poll'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
 
 const message = useMessage()
 const route = useRoute()
+const router = useRouter()
 const { vars, pctColor } = useUi()
 const { isMobile } = useIsMobile()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
@@ -62,6 +68,8 @@ const perStockCap = ref(20000)
 const includeST = ref(false)
 const running = ref(false)
 const result = ref<BacktestResult | null>(null)
+const backtestHistory = ref<StrategyRun<BacktestResult>[]>([])
+let backtestPollAbort: AbortController | null = null
 const strategyRevisions = ref<ScreenerStrategyRevision[]>([])
 const strategyRevisionId = ref<number | null>(null)
 const revisionLoading = ref(false)
@@ -231,7 +239,6 @@ async function loadStrategyRevisions(strategyId: number, preferredRevisionId?: n
 
 function onStrategyChange(value: string | null) {
   strategyValue.value = value ?? ''
-  result.value = null
   const customId = selectedCustomID(strategyValue.value)
   if (customId) {
     void loadStrategyRevisions(customId)
@@ -246,13 +253,14 @@ function onStrategyChange(value: string | null) {
   }
 }
 
-function onRevisionChange() {
-  result.value = null
-}
-
 async function loadStrategies() {
   try {
     strategies.value = await getScreenerStrategies()
+    const resultId = Number(Array.isArray(route.query.result_id) ? route.query.result_id[0] : route.query.result_id)
+    if (Number.isSafeInteger(resultId) && resultId > 0) {
+      await openBacktestResult(resultId, true)
+      return
+    }
     // 深链 ?strategy_key=xxx（选股页「回测」按钮跳转）。
     const key = route.query.strategy_key as string
     if (key && strategies.value.builtin.some((b) => b.key === key)) {
@@ -277,6 +285,39 @@ async function loadStrategies() {
   }
 }
 
+async function loadBacktestHistory() {
+  backtestHistory.value = await listBacktestResults(20).catch(() => backtestHistory.value)
+}
+
+async function openBacktestResult(id: number, trackRunning = false) {
+  backtestPollAbort?.abort()
+  const controller = new AbortController()
+  backtestPollAbort = controller
+  try {
+    let run = await getBacktestResult(id)
+    if (trackRunning && (run.status === 'queued' || run.status === 'running')) {
+      run = await pollUntil(() => getBacktestResult(id), (value) => value.status !== 'queued' && value.status !== 'running', {
+        intervalMs: 1500,
+        timeoutMs: 20 * 60 * 1000,
+        signal: controller.signal,
+      })
+    }
+    if (run.status !== 'success' || !run.result) throw new Error(run.error || '回测未生成可用结果')
+    result.value = run.result
+    void router.replace({ query: { ...route.query, result_id: String(run.id) } })
+  } finally {
+    if (backtestPollAbort === controller) backtestPollAbort = null
+  }
+}
+
+function openBacktestHistory(item: StrategyRun<BacktestResult>) {
+  if (item.status === 'success') {
+    void openBacktestResult(item.id, false).catch((error) => message.error((error as Error).message))
+    return
+  }
+  void router.push({ name: 'tasks', query: { job_id: String(item.job_run_id) } })
+}
+
 async function run() {
   if (!strategyValue.value) {
     message.warning('请先选择策略')
@@ -293,7 +334,7 @@ async function run() {
       message.warning('请选择要回测的策略版本')
       return
     }
-    result.value = await runBacktest({
+    const created = await runBacktest({
       strategy_key: kind === 'b' ? id : undefined,
       strategy_id: kind === 'c' ? Number(id) : undefined,
       strategy_revision_id: kind === 'c' ? strategyRevisionId.value ?? undefined : undefined,
@@ -303,8 +344,12 @@ async function run() {
       per_stock_cap: perStockCap.value,
       include_st: includeST.value,
     })
+    void router.replace({ query: { ...route.query, result_id: String(created.id) } })
+    message.info('回测任务已创建，可在任务中心查看或取消')
+    await openBacktestResult(created.id, true)
+    await loadBacktestHistory()
   } catch (e) {
-    message.error((e as Error).message)
+    if (!isPollCancelled(e)) message.error(`${(e as Error).message}；最近一次成功结果仍保留在页面和回测历史中`)
   } finally {
     running.value = false
   }
@@ -376,7 +421,10 @@ const recHoldStat = computed(() => recResult.value?.stats.find((s) => String(s.h
 onMounted(() => {
   loadStrategies()
   loadBatches()
+  loadBacktestHistory()
 })
+
+onBeforeUnmount(() => backtestPollAbort?.abort())
 </script>
 
 <template>
@@ -412,7 +460,6 @@ onMounted(() => {
                 :options="revisionOptions"
                 :loading="revisionLoading"
                 placeholder="选择当前或历史版本"
-                @update:value="onRevisionChange"
               />
               <span v-if="selectedRevisionHint" class="revision-hint">{{ selectedRevisionHint }}</span>
             </div>
@@ -584,6 +631,24 @@ onMounted(() => {
             <n-empty description="选择策略并点击「开始回测」——历史信号日按当日因子选股、次日开盘买入，统计持有 5/10/20 日的真实表现" />
           </SectionCard>
         </n-spin>
+        <SectionCard title="回测历史">
+          <n-empty v-if="!backtestHistory.length" description="暂无持久回测结果" />
+          <div v-else class="qv-scroll-x">
+            <n-table size="small" :single-line="false">
+              <thead><tr><th>策略</th><th>版本</th><th>状态</th><th>数据时点</th><th>完成时间</th><th>操作</th></tr></thead>
+              <tbody>
+                <tr v-for="item in backtestHistory" :key="item.id">
+                  <td>{{ item.strategy_name }}</td>
+                  <td><span v-if="item.strategy_revision">v{{ item.strategy_revision }} · </span><code>{{ shortHash(item.strategy_hash) }}</code></td>
+                  <td><n-tag size="small" :type="item.status === 'success' ? 'success' : item.status === 'failed' ? 'error' : 'info'">{{ taskStatusLabel(item.status) }}</n-tag></td>
+                  <td>{{ item.as_of?.slice(0, 10) || '—' }}</td>
+                  <td>{{ (item.finished_at || item.created_at).replace('T', ' ').slice(0, 16) }}</td>
+                  <td><n-button size="tiny" quaternary @click="openBacktestHistory(item)">{{ item.status === 'success' ? '查看' : '任务详情' }}</n-button></td>
+                </tr>
+              </tbody>
+            </n-table>
+          </div>
+        </SectionCard>
       </div>
     </div>
 

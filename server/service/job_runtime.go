@@ -25,6 +25,8 @@ const (
 	JobKindAnalysis          = "analysis"
 	JobKindRecommendation    = "recommendation"
 	JobKindDailyReport       = "daily_report"
+	JobKindScreenerScan      = "screener_scan"
+	JobKindStrategyBacktest  = "strategy_backtest"
 	JobKindSyncDailyBars     = "sync_daily_bars"
 	JobKindBackfillCalendar  = "backfill_calendar"
 	JobKindSnapshotMarket    = "snapshot_market"
@@ -37,6 +39,7 @@ const (
 	JobResultRecommendation = "recommendation"
 	JobResultDailyReport    = "daily_report"
 	JobResultDataSync       = "data_sync"
+	JobResultStrategyRun    = "strategy_run"
 
 	jobSnapshotVersion  = 1
 	jobSnapshotMaxBytes = 16 << 10

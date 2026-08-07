@@ -111,6 +111,34 @@ export interface ScanResult {
   conditions: string[]
 }
 
+export type StrategyRunStatus = 'queued' | 'running' | 'success' | 'failed' | 'canceled'
+
+/** 扫描/策略回测共用的持久结果事实；列表响应不含 request/result 正文。 */
+export interface StrategyRun<T> {
+  id: number
+  job_run_id: number
+  kind: 'screener_scan' | 'strategy_backtest'
+  strategy_identity: 'builtin' | 'custom' | 'adhoc'
+  strategy_key?: string
+  strategy_id?: number
+  strategy_revision_id?: number
+  strategy_revision: number
+  strategy_hash: string
+  strategy_name: string
+  request_hash: string
+  as_of?: string
+  content_hash?: string
+  status: StrategyRunStatus
+  error?: string
+  error_code?: string
+  request?: ScanRequest | Record<string, unknown>
+  result?: T
+  started_at?: string
+  finished_at?: string
+  created_at: string
+  updated_at: string
+}
+
 export interface FactorTableStatus {
   ready: boolean
   building: boolean
@@ -181,7 +209,15 @@ export async function getScreenerStrategyHistory(strategyId: number): Promise<Sc
 }
 
 export function screenerScan(req: ScanRequest) {
-  return request<ScanResult>({ url: '/screener/scan', method: 'post', data: req })
+  return request<StrategyRun<ScanResult>>({ url: '/screener/scan', method: 'post', data: req })
+}
+
+export function listScreenerResults(limit = 20) {
+  return request<StrategyRun<ScanResult>[]>({ url: '/screener/results', method: 'get', params: { limit } })
+}
+
+export function getScreenerResult(id: number) {
+  return request<StrategyRun<ScanResult>>({ url: `/screener/results/${id}`, method: 'get' })
 }
 
 export function saveScreenerStrategy(req: SaveStrategyRequest) {

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"net/http"
 	"strconv"
 
 	"quantvista/common"
@@ -44,20 +45,46 @@ func (sc *ScreenerController) Strategies(c *gin.Context) {
 	common.ApiSuccess(c, v)
 }
 
-// Scan POST /api/screener/scan —— 全市场扫描（strategy_key / strategy_id / tree 三选一）。
-// 宽表过期时会在本次请求内同步重建（构建互斥，并发请求等待同一次构建）。
+// Scan POST /api/screener/scan —— 提交全市场扫描作业（strategy_key / strategy_id / tree 三选一）。
+// 宽表过期时由后台作业同步重建（构建互斥，并发作业等待同一次构建）。
 func (sc *ScreenerController) Scan(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
 	var req service.ScanRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	res, err := sc.svc.Scan(c.Request.Context(), currentUserID(c), req)
+	res, err := sc.svc.StartScanJob(currentUserID(c), req)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiError(c, err)
 		return
 	}
 	common.ApiSuccess(c, res)
+}
+
+// Results GET /api/screener/results —— 本人的扫描结果事实列表，不加载请求和结果正文。
+func (sc *ScreenerController) Results(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+	rows, err := service.ListStrategyRuns(currentUserID(c), service.JobKindScreenerScan, limit)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, rows)
+}
+
+// Result GET /api/screener/results/:id —— 本人的单个扫描结果稳定深链。
+func (sc *ScreenerController) Result(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	row, err := service.GetStrategyRun(currentUserID(c), service.JobKindScreenerScan, id)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, row)
 }
 
 // SaveStrategy POST /api/screener/strategies —— 新建/更新自定义策略。

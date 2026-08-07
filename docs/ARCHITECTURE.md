@@ -505,7 +505,7 @@ AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yiel
 
 所有来源统一映射状态、耗时、错误码、恢复建议与仅含记录 ID 的结果深链。15 分钟未更新且**没有 queued/running JobRun 引用**的 legacy 用户侧 `processing` 任务，才由各自业务服务按同一口径惰性收敛为 `failed`；活跃统一作业即使排队超过 15 分钟也由自身 CAS、取消和恢复规则收敛，旧清理器不得抢写业务结果。顶栏最近任务与运行中数量分别查询，达到 100 条上限时只能展示“至少 N 项”，不能把截断值当精确总数。
 
-P0-2B-2B 已将六类系统维护任务接入相同的 JobRun/JobStep/恢复/背压运行时。用户作业 owner 为 `user` 且 `user_id>0`；系统作业 owner 为 `system` 且 `user_id IS NULL`，管理员手动触发另记 `triggered_by`。普通用户只能访问自己的 user JobRun；启用管理员还可审计、取消和失败重跑 system JobRun。`GET /api/admin/jobs/metrics` 仅聚合 kind/status/count、最老 queued_at 和进程容量，不选择 request snapshot。用户七类 SSE 鉴权与续传契约不变；系统任务当前由管理员任务页轮询同一事实，不额外伪造事件进度。
+P0-2B-2B 已将六类系统维护任务接入相同的 JobRun/JobStep/恢复/背压运行时；P0-4 结果阶段又加入 `screener_scan/strategy_backtest`，用户作业共九类。用户作业 owner 为 `user` 且 `user_id>0`；系统作业 owner 为 `system` 且 `user_id IS NULL`，管理员手动触发另记 `triggered_by`。普通用户只能访问自己的 user JobRun；启用管理员还可审计、取消和失败重跑 system JobRun。`GET /api/admin/jobs/metrics` 仅聚合 kind/status/count、最老 queued_at 和进程容量，不选择 request snapshot。用户 SSE 鉴权与续传契约不变；系统任务当前由管理员任务页轮询同一事实，不额外伪造事件进度。
 
 P0-5 为 user owner 的 failed 终态增加 `job_failure_notifications` 幂等事实：`job_run_id` 唯一，system owner 不建通知行；同用户同 kind 以 5 分钟滑动窗口合并，稳定 group key 负责跨实例并发首条唯一，窗口轮换时释放旧 root，首行记录 `merge_count`，后续行只记 `merge_root_id` 而不再次外发。只有现有 `enable_notify` 总闸和至少一个启用通道同时满足时才声明外发，否则记 suppressed；不新增平行通知配置。失败终态事务提交后，通知行再以 `claimed→dispatching→attempted` CAS 抢占唯一发送权并 best-effort 调现有 NotifyService；`attempted` 只证明调用已发生，NotifyService 当前不返回逐通道聚合结果，因此不得把它解释成确认送达。外发失败不得改写 JobRun。正文只含任务 kind、白名单错误码和 `/tasks?job_id=<id>`；任务列表按 `job_id+user_id` 精确返回该行，禁止读取或推送 request snapshot、模型正文及原始错误详情。
 
@@ -517,8 +517,8 @@ P0-5 为 user owner 的 failed 终态增加 `job_failure_notifications` 幂等�
 - **finance / finance_f10**（F1/F2）：财报日历/业绩预告/快报增量刷新 + F10 主要财务指标与三大报表关键科目按需缓存 + 公告采集，入个股详情财务块、长线推荐 fin 因子、财报提醒。
 - **indicator / chip**（T1）：MACD/BOLL/RSI/ATR 纯函数指标库（Wilder 口径）、筹码峰三角衰减复算、五维技术评分升级，供个股详情副图与推荐量化评分。
 - **riskgate / breaker / health**（S1）：风险闸门（ST/一字板/流动性/小市值进 AI prompt 与前端标签）、东财 push2 族域名断路器、数据源健康滑窗；问答流式输出同批。
-- **marketwide / factortable / screener**（M1）：全市场日线地基（宇宙字典/历史初始化/除权双层检测重锚）、**63 因子**列式宽表（C10/C12 起含 `div_yield` 股息率与 10 个 K 线形态布尔因子，见 `kpattern.go`；**形态是描述性因子，不进任何评分权重**）、条件树 DSL 选股（21 内置白话策略+自定义策略），`/screener` 页；推荐候选池的 `strategy_signal` 当前仍只消费代码内置策略映射，自定义 revision 尚未进入推荐。自定义策略以 `screener_strategy_revisions` 追加快照为执行权威，主表只保留当前 revision 指针和兼容投影；升级时幂等补建存量 revision 1。编辑采用 `base_revision_id` 乐观锁并只追加 revision，删除语义为归档，历史快照不随之删除。
-- **backtest / analysis_asof**（M2）：回测时光机（A 股约束五件套/无未来泄露切片复算）、历史推荐批次回验 α 分布、分析 as_of 回溯诊断与 hindsight 事后核验，`/backtest` 页。自定义策略扫描/回测在请求开始时固定 `strategy_revision_id` 对应的条件树；未显式指定时只解析一次当时的当前指针，运行期间的策略编辑不会改变本次条件与 hash，结果回传 strategy/revision/hash 元数据供复现。
+- **marketwide / factortable / screener**（M1）：全市场日线地基（宇宙字典/历史初始化/除权双层检测重锚）、**63 因子**列式宽表（C10/C12 起含 `div_yield` 股息率与 10 个 K 线形态布尔因子，见 `kpattern.go`；**形态是描述性因子，不进任何评分权重**）、条件树 DSL 选股（21 内置白话策略+自定义策略），`/screener` 页；推荐候选池的 `strategy_signal` 当前仍只消费代码内置策略映射，自定义 revision 尚未进入推荐。自定义策略以 `screener_strategy_revisions` 追加快照为执行权威，主表只保留当前 revision 指针和兼容投影；升级时幂等补建存量 revision 1。编辑采用 `base_revision_id` 乐观锁并只追加 revision，删除语义为归档，历史快照不随之删除。扫描提交后立即返回 JobRun/结果引用，成功正文进入 `strategy_run_results`，本人可通过 `/api/screener/results/:id` 稳定找回。
+- **backtest / analysis_asof**（M2）：回测时光机（A 股约束五件套/无未来泄露切片复算）、历史推荐批次回验 α 分布、分析 as_of 回溯诊断与 hindsight 事后核验，`/backtest` 页。自定义策略扫描/回测在请求开始时固定 `strategy_revision_id` 对应的条件树；未显式指定时只解析一次当时的当前指针，运行期间的策略编辑不会改变本次条件与 hash。策略回测正文进入同一 `strategy_run_results` 事实，本人可通过 `/api/backtest/results/:id` 找回；旧结果和失败重跑只读保存时的规范化请求及 revision/hash，不重新解析当前策略。推荐批次回验接口保持既有同步口径。
 - **mood / fundflow / emlhb**（M3a）：龙虎榜、涨停池/炸板率情绪聚合、股吧人气榜、主力资金流（排行+单股历史），入推荐加分项、市场分析情绪段与个股详情。
 - **intraday**（M3b）：腾讯 5 分钟线盘中因子（尾盘拉升/跳水/VWAP 偏离/重心上移），入短线推荐加分。
 - **board**（M3c/P3b）：东财板块热度榜/成分股/板块指数日线（`/heatmap` 与 `/boards/:code` 页）+ 板块资金流历史透传 + 行业估值聚合（中位 PE/PB 与横截面/时序分位），入板块 AI 分析两段。
@@ -557,7 +557,7 @@ LLM 的角色从「海选者」降级为「解释者/否决者」（listwise 海
 
 关键常量：`maxScanCandidates=48 / maxLLMCandidates=10 / maxPoolIntake=240 / poolSnapshotMax=150`。
 
-生成类 LLM 均为异步任务。P0-2B-2B 起，七类用户任务以及六类系统数据维护/因子任务进入统一 `JobRun` 有界运行时；原业务表和 DataSyncLog 继续保存结果事实与历史深链。HTTP 入口只做确定性校验并立即返回，浏览器断开与页面刷新不取消后台任务。定时系统生产者遇队列背压使用去重重试器，拒绝时尚未创建 JobRun 或 processing 结果；批任务继续逐项隔离并在统一终态事务保存计数。
+生成类 LLM 均为异步任务。P0-4 结果阶段起，扫描/条件树回测也加入统一长任务范围，九类用户任务以及六类系统数据维护/因子任务共用 `JobRun` 有界运行时；原业务表、DataSyncLog 和 `strategy_run_results` 继续保存结果事实与历史深链。HTTP 入口只做确定性校验并立即返回，浏览器断开与页面刷新不取消后台任务。定时系统生产者遇队列背压使用去重重试器，拒绝时尚未创建 JobRun 或 processing 结果；批任务继续逐项隔离并在统一终态事务保存计数。
 
 策略-来源映射（`strategySources`，对冲「热度榜供给的票恰是风控规则最想排除的票」的结构性矛盾）：
 momentum=涨幅+换手+成交额；pullback=**回调榜**(跌幅升序过滤温和回调)+成交额+涨幅；active=成交额+换手+涨幅；
@@ -632,18 +632,18 @@ value=**低PB榜**(升序滤负PB)+成交额；growth=涨幅+换手+成交额；
 3. **单次调用边界**：模块预算取 `min(用户 max_tokens, 模块上限)`；analysis/recommendation/qa/news=2500，trade_plan/rec_review/rec_bear/daily_report=1500，analysis_review/compare=1000，screener_parse=2000。全部结构化模块最多 1 次 repair，坏输出默认只回灌 600 字（日报 800 字）；业务 prompt 不再用字数、句数或性能型数组条数压缩模型回答，JSON schema、推荐数量、固定角色和逐 ID 映射等业务契约仍保留。Chat 端拒绝 `max_tokens` 时必须携同值改用 `max_completion_tokens`；Responses 始终携带 `max_output_tokens`。两种字段都不支持则失败，禁止删除 token 参数退成无上限生成。
 4. **业务降级边界**：只有推荐维持既有量化降级（ATR 规则计划价、action 恒 watch、置信度 low、`degraded_source=quant_fallback`）；鉴权/路径/配额类确定性错误直接失败。日报两路并行并保留旧报告回滚语义；其他模块按自身失败/结构化降级契约收尾。
 
-### 6.11 统一作业事实与研究工件（P0-2B-1 / P0-2B-2B）
+### 6.11 统一作业事实与研究工件（P0-2B-1 / P0-2B-2B / P0-4）
 
-P0-2B-1/P0-2B-2A 覆盖七类用户任务；P0-2B-2B 在同一运行时加入 `sync_daily_bars / backfill_calendar / snapshot_market / sync_market_wide / init_market_history / factor_rebuild`，并建立一期不可变 `ResearchArtifact`。本节描述代码契约，生产 MySQL、真实队列压力和长任务恢复仍待线上验收。
+P0-2B-1/P0-2B-2A 覆盖七类用户任务；P0-2B-2B 在同一运行时加入 `sync_daily_bars / backfill_calendar / snapshot_market / sync_market_wide / init_market_history / factor_rebuild`，并建立一期不可变 `ResearchArtifact`。P0-4 结果阶段再接入 `screener_scan / strategy_backtest`，用户作业增至九类，并用 `strategy_run_results` 保存不可变业务结果。本节描述代码契约，生产 MySQL、真实队列压力和长任务恢复仍待线上验收。
 
 - **owner 与事实模型**：`job_runs.owner_type` 只允许应用层语义上的 user/system；user 必须绑定正数 `user_id`，system 必须为 SQL NULL，`triggered_by` 只记录管理员手动触发者。JobEvent 继承相同 owner。JobRun 保存 kind、版本化请求、状态、父作业、错误、trace、业务计数和结果引用；步骤只记录真实发生阶段，状态仅允许 `queued/running/success/degraded/failed/canceled`，终态以 CAS 收敛且不可回退。
-- **快照、权限与结果绑定**：request snapshot 最大 16KiB，拒绝密钥、Authorization、prompt/消息和数据/结果正文。`result_type` 支持 `llm_task/analysis/recommendation/daily_report/data_sync`。用户作业执行时重判账号状态/角色；普通用户无法读取、取消或重跑系统 ID，管理员只扩展到 system owner，不借此读取其他用户作业。DataSyncLog processing 占位、JobRun 和引用同事务创建；成功、部分失败、失败或取消均在 JobRun 终态事务更新同一日志，保留已完成计数，不产生第二条结果日志。
+- **快照、权限与结果绑定**：request snapshot 最大 16KiB，拒绝密钥、Authorization、prompt/消息和数据/结果正文。`result_type` 支持 `llm_task/analysis/recommendation/daily_report/data_sync/strategy_run`。扫描/回测的 JobRun 快照只含 schema 版本、稳定策略/revision 引用、content hash 和规范化请求 hash；包含实际执行条件树的完整规范化请求只在本人 `strategy_run_results` 中保存，结果正文最大 2MiB。worker 从该业务事实读取冻结树并剥离 key/id/current pointer 后执行，内置策略代码升级或 A→B 编辑都不能改变旧作业。用户作业执行时重判账号状态/角色；普通用户无法读取、取消或重跑系统 ID，管理员只扩展到 system owner，不借此读取其他用户结果。DataSyncLog 或 StrategyRunResult 占位、JobRun 和引用同事务创建；终态事务只更新已绑定的同一结果行，不产生第二条结果事实。
 - **幂等与容量**：用户按 owner/kind/request hash 防重，系统按 kind 排他防重；active key 仅 queued/running 持有。管理员重复手动触发同 kind 系统任务时返回既有 JobRun 与 `started=false`，不得把旧任务伪报成新计划已启动。运行时固定 4 worker、最多 32 总在途。用户入口满载返回 `job_queue_busy`；系统定时器对该错误去重重试，接受前不建事实行。管理员指标按 kind/status 聚合并显示最老排队与容量，查询禁止选择请求快照。
 - **取消与恢复**：queued 取消用 CAS 直接进入 canceled；running 先持久化 `cancel_requested`，本实例立即取消 Context，其他实例/恢复路径通过数据库轮询协作取消。成功持久化与取消在同一事务条件上竞争，只有一个终态获胜。启动时遗留 running 明确收敛为 `job_interrupted`（已请求取消者收敛 canceled），queued 按 ID 升序恢复，容量外的 queued 保持排队并随槽位释放续排。
-- **重跑**：失败且已注册的用户或系统 handler 可重跑。新 run 从旧快照创建并写 `parent_id`，旧 run 不修改；系统重跑的 `triggered_by` 是执行该动作的管理员。已有等价用户请求或同 kind 系统任务在途时返回 `job_already_running`。
+- **重跑**：失败且已注册的用户或系统 handler 可重跑。新 run 从旧快照创建并写 `parent_id`，旧 run 不修改；扫描/回测子作业同时复制父结果的完整规范化请求、稳定策略身份和 revision/hash，绝不查询当前策略指针。系统重跑的 `triggered_by` 是执行该动作的管理员。已有等价用户请求或同 kind 系统任务在途时返回 `job_already_running`。
 - **用户失败通知**：仅 failed 且 owner=user 的已提交 JobRun 可进入通知声明。`job_failure_notifications.job_run_id` 保证 CAS、恢复和重复观察下每个 run 至多一次；同用户同 kind 的短窗失败合并。通知开关复用 UserPreference/NotifyChannel，错误正文不进入推送。通知投递是终态之后的旁路，任何数据库或网络失败都只能记录告警，不能回滚或覆盖 JobRun 终态。
-- **事件与前端**：`GET /api/tasks/events` 位于 JWT 中间件后，支持 `Last-Event-ID`、单调 `id:`、`event: job` 与 15s heartbeat。前端用 `fetch` 的 `Authorization` 请求头读取流，token 从不进入 URL；断线指数重连并保留串行轮询回退。任务中心优先列 JobRun，查询旧 `llm_tasks` 与三类业务表时排除已被 `result_type/result_id` 引用的行，从而避免双行；深链使用业务 `result_id`，旧业务详情路由继续兼容。
-- **ResearchArtifact**：只保存 `type/schema_version/subject/as_of/available_at/content_hash/source_refs/storage_ref/job_run_id/owner/created_at`。分析、推荐、日报在业务结果校验与 JobRun 终态同一事务幂等建索引；分析 subject 对非个股模块使用真实 target，不能退化成空 symbol。hash 从当次已持久事实计算，正文、候选池和快照不复制。历史行不自动回填；扫描/回测当前没有持久结果事实，因此不猜测建索引，待将来先落不可变结果再接线。
+- **事件与前端**：`GET /api/tasks/events` 位于 JWT 中间件后，支持 `Last-Event-ID`、单调 `id:`、`event: job` 与 15s heartbeat。前端用 `fetch` 的 `Authorization` 请求头读取流，token 从不进入 URL；断线指数重连并保留串行轮询回退。任务中心优先列 JobRun，查询旧 `llm_tasks` 与三类业务表时排除已被 `result_type/result_id` 引用的行，从而避免双行；扫描/回测深链使用业务 `result_id` 跳到 `/screener?result_id=` 或 `/backtest?result_id=`。两页历史默认 20 条、最多 100 条，列表不选择请求/结果正文；详情同时按 `id+user_id+kind` 查询，失败刷新保留最近成功视图和历史恢复入口。
+- **ResearchArtifact**：只保存 `type/schema_version/subject/as_of/available_at/content_hash/source_refs/storage_ref/job_run_id/owner/created_at`。分析、推荐、日报、策略扫描和策略回测在业务结果校验与 JobRun 成功终态同一事务幂等建索引；扫描/回测的 `storage_ref` 必须是 `strategy_run_results:<id>`，hash 必须来自当次已持久结果正文，source refs 只含作业、结果、策略、revision 与请求 hash。失败、取消、临时响应和历史存量不建工件。正文、候选池、条件树、扫描命中、交易明细和快照不复制；分析 subject 对非个股模块使用真实 target，不能退化成空 symbol。
 - **保留策略**：每日 03:35 只删除“对应 JobRun 已终态且事件早于 30 天”的 JobEvent。JobRun/request snapshot 为重跑与审计保留，JobStep 随 JobRun 保留，业务快照由原事实表负责，ResearchArtifact 一期永久保留且拒绝更新/删除。任何后续分层归档必须先证明不会切断 parent 重跑、审计和 source/storage 血缘。
 
 ### 6.12 数据覆盖、主动探测与解冷（P0-3A / P0-3B）
@@ -694,8 +694,8 @@ AI 结果：
 - `/`：个人优先分时首页（盘前/盘中/盘后只调整个人区块顺序和默认展开；后端交易状态缺失时显示 unknown，市场全景在第二层）
 - `/news`：市场快讯（新闻情绪流，N1/N2）
 - `/stocks/:market/:symbol`：个股详情（P0-0C 决策摘要优先，走势/事件/基本面/研究四分区；A 股非基金首屏只预取本地公司行动，公告/新闻按事件页签加载，缺口保持 partial/unknown；stale/unknown 报价只称“最近已知”；首页榜单行与个股速查可点击进入，`useStockActions.goDetail` 供各处复用）
-- `/screener`：策略选股（21 策略组合筛选，S1）
-- `/backtest`：回测时光机（S1）
+- `/screener`：策略选股（21 策略组合筛选、异步扫描、本人持久历史与 `result_id` 深链）
+- `/backtest`：回测时光机（异步条件树回测、本人持久历史与 `result_id` 深链；推荐批次回验保持原接口）
 - `/heatmap`：行业热力图（M3b）
 - `/mood`：盘面情绪（情绪总览 / 连板梯队 / 龙虎榜 / 人气榜四 tab，A1~A3 散户体验第一批）
 - `/boards/:code`：板块详情（M3c）
@@ -708,7 +708,7 @@ AI 结果：
 - `/recommendations`：推荐历史与追踪（策略模板为页内下拉，无独立页）
 - `/qa`：个股 AI 问答
 - `/compare`：个股横向对比
-- `/tasks`：统一任务中心（P0-2B-2B 七类用户 JobRun 与六类 system JobRun 支持真实步骤、取消、父子重跑、恢复与 SSE；原业务结果和 DataSyncLog 通过引用去重并保留历史深链，legacy 同步日志仅作兼容投影）
+- `/tasks`：统一任务中心（九类用户 JobRun 与六类 system JobRun 支持真实步骤、取消、父子重跑、恢复与 SSE；原业务结果、策略运行结果和 DataSyncLog 通过引用去重并保留历史深链，legacy 同步日志仅作兼容投影）
 - `/alerts`：提醒规则 + 推送通道
 - `/paper`：模拟交易
 - `/etf`：指数 ETF 交易（精选指数 ETF 行情 + 复用模拟盘买卖，2026-07-05）

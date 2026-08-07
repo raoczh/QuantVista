@@ -121,6 +121,12 @@ export const JOB_STEP_LABELS: Record<JobStep['name'], string> = {
   snapshot: '生成数据快照',
   dual_generation: '双路生成',
   finalize: '报告收敛',
+  load_strategy: '加载策略快照',
+  factor_table: '准备因子宽表',
+  scan_universe: '扫描股票池',
+  market_axis: '准备市场时间轴',
+  evaluate_signals: '评估交易信号',
+  aggregate_results: '汇总回测结果',
 }
 
 const TASK_KIND_LABELS: Record<string, string> = {
@@ -138,6 +144,8 @@ const TASK_KIND_LABELS: Record<string, string> = {
   compare: '横向对比',
   position_advice: '持仓建议',
   screener_parse: '白话策略解析',
+  screener_scan: '策略扫描',
+  strategy_backtest: '策略回测',
   sync_daily_bars: '日线同步',
   backfill_calendar: '交易日历回填',
   snapshot_market: '市场快照',
@@ -235,6 +243,8 @@ function baseTaskRoute(task: TaskCenterItem): RouteLocationRaw | null {
       if (task.kind === 'compare') return { name: 'compare' }
       if (task.kind === 'position_advice') return { name: 'positions' }
       if (task.kind === 'screener_parse') return { name: 'screener' }
+      if (task.kind === 'screener_scan') return { name: 'screener' }
+      if (task.kind === 'strategy_backtest') return { name: 'backtest' }
       return null
   }
 }
@@ -258,6 +268,8 @@ export function taskResultRoute(task: TaskCenterItem): RouteLocationRaw | null {
     if (task.kind === 'qa') return { name: 'qa', query: { task_id: id } }
     if (task.kind === 'compare') return { name: 'compare', query: { task_id: id } }
     if (task.kind === 'position_advice') return { name: 'positions', query: { task_id: id } }
+    if (task.kind === 'screener_scan') return { name: 'screener', query: { result_id: id } }
+    if (task.kind === 'strategy_backtest') return { name: 'backtest', query: { result_id: id } }
   }
   return base
 }

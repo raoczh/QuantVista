@@ -45,6 +45,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	screenerSvc := service.NewScreenerService()
 	screenerAISvc := service.NewScreenerAIService(llmSvc)
 	backtestSvc := service.NewBacktestService(marketSvc)
+	service.RegisterStrategyResearchJobHandlers(screenerSvc, backtestSvc)
 	moodSvc := service.NewMoodService()
 	orgViewSvc := service.NewOrgViewService()
 	stockSearchSvc := service.NewStockSearchService()
@@ -341,6 +342,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			screener := authed.Group("/screener")
 			{
 				screener.GET("/strategies", screenerCtl.Strategies)
+				screener.GET("/results", screenerCtl.Results)
+				screener.GET("/results/:id", screenerCtl.Result)
 				screener.POST("/strategies", screenerCtl.SaveStrategy)
 				screener.DELETE("/strategies/:id", screenerCtl.DeleteStrategy)
 				screener.POST("/scan", middleware.RateLimit(20, time.Minute), screenerCtl.Scan)
@@ -352,6 +355,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			// 回测是数秒级重活且有全局互斥，限流从紧防连击）
 			backtest := authed.Group("/backtest")
 			{
+				backtest.GET("/results", backtestCtl.Results)
+				backtest.GET("/results/:id", backtestCtl.Result)
 				backtest.POST("/run", middleware.RateLimit(6, time.Minute), backtestCtl.Run)
 				backtest.POST("/recommendations", middleware.RateLimit(10, time.Minute), backtestCtl.Recommendations)
 			}

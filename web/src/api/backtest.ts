@@ -1,5 +1,5 @@
 import { request } from './client'
-import type { CondNode } from './screener'
+import type { CondNode, StrategyRun } from './screener'
 
 // M2 回测时光机：条件树策略历史回测 + 历史推荐批次回验（纯本地计算无 LLM）。
 
@@ -123,7 +123,15 @@ export interface BatchBacktestResult {
 }
 
 export function runBacktest(req: BacktestRequest) {
-  return request<BacktestResult>({ url: '/backtest/run', method: 'post', data: req, timeout: 120000 })
+  return request<StrategyRun<BacktestResult>>({ url: '/backtest/run', method: 'post', data: req })
+}
+
+export function listBacktestResults(limit = 20) {
+  return request<StrategyRun<BacktestResult>[]>({ url: '/backtest/results', method: 'get', params: { limit } })
+}
+
+export function getBacktestResult(id: number) {
+  return request<StrategyRun<BacktestResult>>({ url: `/backtest/results/${id}`, method: 'get' })
 }
 
 export function backtestRecommendations(batchId: number) {

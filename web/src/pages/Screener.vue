@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onBeforeUnmount, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
   NTag,
@@ -27,6 +27,8 @@ import {
   getScreenerStrategies,
   getScreenerStrategyHistory,
   screenerScan,
+  getScreenerResult,
+  listScreenerResults,
   saveScreenerStrategy,
   deleteScreenerStrategy,
   getScreenerStatus,
@@ -38,13 +40,16 @@ import {
   type BuiltinStrategy,
   type CustomStrategy,
   type ScanResult,
+  type ScanRequest,
   type FactorTableStatus,
   type FactorDef,
   type CondNode,
   type ParseStrategyResult,
   type ScreenerStrategyHistory,
   type ScreenerStrategyRevision,
+  type StrategyRun,
 } from '@/api/screener'
+import { taskStatusLabel } from '@/api/taskCenter'
 import { ApiRequestError } from '@/api/client'
 import { getLLMTask, listLLMTasks, type LLMTask } from '@/api/llmTask'
 import { isPollCancelled, pollUntil } from '@/lib/poll'
@@ -58,6 +63,7 @@ import ChangeTag from '@/components/ChangeTag.vue'
 
 const message = useMessage()
 const router = useRouter()
+const route = useRoute()
 const { vars } = useUi()
 const { llmLabel } = useLlmLabel()
 const { isMobile } = useIsMobile()
@@ -72,6 +78,7 @@ const styleVars = computed(() => ({
 
 const data = ref<StrategiesView | null>(null)
 const status = ref<FactorTableStatus | null>(null)
+const scanHistory = ref<StrategyRun<ScanResult>[]>([])
 const loading = ref(false)
 
 const periodFilter = ref<'all' | 'short' | 'swing' | 'mid'>('all')
@@ -86,7 +93,13 @@ const factors = computed<FactorDef[]>(() => data.value?.factors ?? [])
 async function load() {
   loading.value = true
   try {
-    ;[data.value, status.value] = await Promise.all([getScreenerStrategies(), getScreenerStatus()])
+    ;[data.value, status.value, scanHistory.value] = await Promise.all([
+      getScreenerStrategies(),
+      getScreenerStatus(),
+      listScreenerResults(20).catch(() => scanHistory.value),
+    ])
+    const resultId = Number(Array.isArray(route.query.result_id) ? route.query.result_id[0] : route.query.result_id)
+    if (Number.isSafeInteger(resultId) && resultId > 0) await openScanResult(resultId, true)
   } catch (e) {
     message.error((e as Error).message)
   } finally {
@@ -117,22 +130,69 @@ interface ScanTarget {
 }
 // 最近一次扫描目标（开关切换后重扫用）。
 let lastScanTarget: ScanTarget | null = null
+let scanPollAbort: AbortController | null = null
+onBeforeUnmount(() => scanPollAbort?.abort())
+
+function scanTargetFromRequest(request?: ScanRequest | Record<string, unknown>): ScanTarget | null {
+  if (!request) return null
+  const req = request as ScanRequest
+  if (req.strategy_key) return { strategy_key: req.strategy_key }
+  if (req.strategy_id) return { strategy_id: req.strategy_id, strategy_revision_id: req.strategy_revision_id }
+  if (req.tree) return { tree: req.tree }
+  return null
+}
+
+async function openScanResult(id: number, trackRunning = false) {
+  scanPollAbort?.abort()
+  const controller = new AbortController()
+  scanPollAbort = controller
+  try {
+    let run = await getScreenerResult(id)
+    if (trackRunning && (run.status === 'queued' || run.status === 'running')) {
+      run = await pollUntil(() => getScreenerResult(id), (value) => value.status !== 'queued' && value.status !== 'running', {
+        intervalMs: 1500,
+        timeoutMs: 15 * 60 * 1000,
+        signal: controller.signal,
+      })
+    }
+    if (run.status !== 'success' || !run.result) throw new Error(run.error || '扫描未生成可用结果')
+    result.value = run.result
+    includeST.value = Boolean((run.request as ScanRequest | undefined)?.include_st)
+    includeStale.value = Boolean((run.request as ScanRequest | undefined)?.include_stale)
+    lastScanTarget = scanTargetFromRequest(run.request)
+    void router.replace({ query: { ...route.query, result_id: String(run.id) } })
+  } finally {
+    if (scanPollAbort === controller) scanPollAbort = null
+  }
+}
+
+function openScanHistory(item: StrategyRun<ScanResult>) {
+  if (item.status === 'success') {
+    void openScanResult(item.id, false).catch((error) => message.error((error as Error).message))
+    return
+  }
+  void router.push({ name: 'tasks', query: { job_id: String(item.job_run_id) } })
+}
 
 async function runScan(target: ScanTarget, tag: string) {
   scanning.value = tag
   try {
-    result.value = await screenerScan({
+    const run = await screenerScan({
       ...target,
       include_st: includeST.value,
       include_stale: includeStale.value,
     })
+    void router.replace({ query: { ...route.query, result_id: String(run.id) } })
+    message.info('扫描任务已创建，可在任务中心查看或取消')
+    await openScanResult(run.id, true)
     lastScanTarget = target
     status.value = await getScreenerStatus().catch(() => status.value)
+    scanHistory.value = await listScreenerResults(20).catch(() => scanHistory.value)
     if (!result.value?.matched) {
       message.info('本次扫描无命中（条件较严或市况不配合，属正常情况）')
     }
   } catch (e) {
-    message.error((e as Error).message)
+    if (!isPollCancelled(e)) message.error(`${(e as Error).message}；最近一次成功结果仍保留在页面和扫描历史中`)
   } finally {
     scanning.value = ''
   }
@@ -843,6 +903,25 @@ async function removeCustom(id: number) {
                     >
                   </div>
                 </td>
+              </tr>
+            </tbody>
+          </n-table>
+        </div>
+      </SectionCard>
+
+      <SectionCard title="扫描历史" class="block">
+        <n-empty v-if="!scanHistory.length" description="暂无持久扫描结果" />
+        <div v-else class="qv-scroll-x">
+          <n-table size="small" :single-line="false">
+            <thead><tr><th>策略</th><th>版本</th><th>状态</th><th>数据时点</th><th>完成时间</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr v-for="item in scanHistory" :key="item.id">
+                <td>{{ item.strategy_name }}</td>
+                <td><span v-if="item.strategy_revision">v{{ item.strategy_revision }} · </span><code>{{ shortHash(item.strategy_hash) }}</code></td>
+                <td><n-tag size="small" :type="item.status === 'success' ? 'success' : item.status === 'failed' ? 'error' : 'info'">{{ taskStatusLabel(item.status) }}</n-tag></td>
+                <td>{{ item.as_of?.slice(0, 10) || '—' }}</td>
+                <td>{{ (item.finished_at || item.created_at).replace('T', ' ').slice(0, 16) }}</td>
+                <td><n-button size="tiny" quaternary @click="openScanHistory(item)">{{ item.status === 'success' ? '查看' : '任务详情' }}</n-button></td>
               </tr>
             </tbody>
           </n-table>

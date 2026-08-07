@@ -374,6 +374,9 @@ type ScanResult struct {
 // Scan 全市场扫描。宽表构建有互斥防抖（并发请求等待同一次构建，见 ensureFactorTable），
 // 扫描本身是内存只读遍历（5500 行 × ≤48 叶 <10ms），无需额外互斥。
 func (s *ScreenerService) Scan(ctx context.Context, userID int64, req ScanRequest) (*ScanResult, error) {
+	if err := JobStepTransition(ctx, "load_strategy"); err != nil {
+		return nil, err
+	}
 	resolved, err := s.resolveStrategy(userID, req)
 	if err != nil {
 		return nil, err
@@ -382,12 +385,20 @@ func (s *ScreenerService) Scan(ctx context.Context, userID int64, req ScanReques
 	if _, err := validateCondTree(tree, 1); err != nil {
 		return nil, err
 	}
+	_ = JobStepFinish(ctx, "load_strategy", model.JobStatusSuccess)
+	if err := JobStepTransition(ctx, "factor_table"); err != nil {
+		return nil, err
+	}
 	t, err := ensureFactorTable(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if t.Len() == 0 {
 		return nil, errors.New("全市场日线数据为空：请先在管理端启动全市场同步与历史初始化")
+	}
+	_ = JobStepFinish(ctx, "factor_table", model.JobStatusSuccess)
+	if err := JobStepTransition(ctx, "scan_universe"); err != nil {
+		return nil, err
 	}
 
 	limit := req.Limit
@@ -474,6 +485,7 @@ func (s *ScreenerService) Scan(ctx context.Context, userID int64, req ScanReques
 		explainRow(t, tree, i, &hit.Reasons)
 		res.Items = append(res.Items, hit)
 	}
+	_ = JobStepFinish(ctx, "scan_universe", model.JobStatusSuccess)
 	return res, nil
 }
 
@@ -502,7 +514,15 @@ func (s *ScreenerService) resolveStrategy(userID int64, req ScanRequest) (*resol
 			return nil, fmt.Errorf("未知内置策略 %q", req.StrategyKey)
 		}
 		tree := b.Tree // 拷贝（between 校验会原地交换 value）
-		return &resolvedScreenerStrategy{Tree: &tree, Name: b.Name}, nil
+		treeJSON, err := json.Marshal(tree)
+		if err != nil {
+			return nil, err
+		}
+		hash, err := model.ScreenerStrategyContentHash(b.Name, b.Desc, b.Period, b.Risk, string(treeJSON))
+		if err != nil {
+			return nil, fmt.Errorf("内置策略版本摘要生成失败: %w", err)
+		}
+		return &resolvedScreenerStrategy{Tree: &tree, Name: b.Name, Revision: 1, Hash: hash}, nil
 	case req.StrategyID > 0:
 		if common.DB == nil {
 			return nil, errors.New("数据库不可用")
@@ -533,7 +553,15 @@ func (s *ScreenerService) resolveStrategy(userID int64, req ScanRequest) (*resol
 			RevisionID: revision.ID, Revision: revision.Revision, Hash: revision.ContentHash,
 		}, nil
 	case req.Tree != nil:
-		return &resolvedScreenerStrategy{Tree: req.Tree, Name: "自定义条件"}, nil
+		treeJSON, err := json.Marshal(req.Tree)
+		if err != nil {
+			return nil, err
+		}
+		hash, err := model.ScreenerStrategyContentHash("自定义条件", "", "swing", "mid", string(treeJSON))
+		if err != nil {
+			return nil, fmt.Errorf("临时策略版本摘要生成失败: %w", err)
+		}
+		return &resolvedScreenerStrategy{Tree: req.Tree, Name: "自定义条件", Revision: 1, Hash: hash}, nil
 	}
 	return nil, errors.New("请指定策略（strategy_key / strategy_id / tree 三选一）")
 }

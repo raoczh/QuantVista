@@ -222,6 +222,9 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 	start := time.Now()
 
 	// 策略树（复用选股服务的解析与校验）。
+	if err := JobStepTransition(ctx, "load_strategy"); err != nil {
+		return nil, err
+	}
 	scr := ScreenerService{}
 	resolved, err := scr.resolveStrategy(userID, ScanRequest{
 		StrategyKey: req.StrategyKey, StrategyID: req.StrategyID,
@@ -234,6 +237,7 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 	if _, err := validateCondTree(tree, 1); err != nil {
 		return nil, err
 	}
+	_ = JobStepFinish(ctx, "load_strategy", model.JobStatusSuccess)
 
 	// 参数钳制。
 	lookback := clampInt(req.LookbackDays, btMinLookback, btMaxLookback, btDefaultLookback)
@@ -251,6 +255,9 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 	maxHold := holds[len(holds)-1]
 
 	// 数据末日 + 市场日轴 + 基准收盘。
+	if err := JobStepTransition(ctx, "market_axis"); err != nil {
+		return nil, err
+	}
 	freshDate, err := wideFreshDate()
 	if err != nil {
 		return nil, err
@@ -268,6 +275,7 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 	for i, d := range axis {
 		axisIndex[d] = i
 	}
+	_ = JobStepFinish(ctx, "market_axis", model.JobStatusSuccess)
 
 	// 宇宙元数据（同 buildFactorTable：states 小表一次读全）。
 	var states []model.MarketSyncState
@@ -287,6 +295,9 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 
 	withChip := treeUsesChipFactor(tree)
 
+	if err := JobStepTransition(ctx, "evaluate_signals"); err != nil {
+		return nil, err
+	}
 	// 流式读 daily_bars（与 buildFactorTable 同款：ORDER BY symbol, trade_date 恰合
 	// 唯一索引序免 filesort，列清单共用 dailyBarScanCols 别改列序）→ 逐股 worker
 	// 处理，内存 O(单股)。
@@ -434,6 +445,10 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 	if scanErr != nil {
 		return nil, scanErr
 	}
+	_ = JobStepFinish(ctx, "evaluate_signals", model.JobStatusSuccess)
+	if err := JobStepTransition(ctx, "aggregate_results"); err != nil {
+		return nil, err
+	}
 
 	res := s.aggregate(tree, name, cands, holds, signalDates, topPerDay, benchClose)
 	res.StrategyID = resolved.StrategyID
@@ -465,6 +480,7 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 	}
 	common.SysLog("回测完成: %s，信号日 %d 个，宇宙 %d 只，命中 %d 条，耗时 %dms",
 		name, len(signalDates), res.Universe, len(cands), res.ElapsedMs)
+	_ = JobStepFinish(ctx, "aggregate_results", model.JobStatusSuccess)
 	return res, nil
 }
 

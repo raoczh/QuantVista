@@ -18,8 +18,45 @@ const (
 	ArtifactTypeAnalysis       = "analysis"
 	ArtifactTypeRecommendation = "recommendation"
 	ArtifactTypeDailyReport    = "daily_report"
+	ArtifactTypeScreenerScan   = "screener_scan"
+	ArtifactTypeBacktest       = "strategy_backtest"
 	artifactSchemaVersion      = 1
 )
+
+func persistStrategyRunArtifact(tx *gorm.DB, run *model.JobRun, row model.StrategyRunResult, availableAt time.Time) error {
+	if row.Status != model.JobStatusSuccess || row.ContentHash == "" || row.AsOf == nil {
+		return errors.New("策略研究结果尚未形成可索引终态")
+	}
+	artifactType := ArtifactTypeScreenerScan
+	if row.Kind == JobKindStrategyBacktest {
+		artifactType = ArtifactTypeBacktest
+	} else if row.Kind != JobKindScreenerScan {
+		return errors.New("策略研究工件类型无效")
+	}
+	subject := row.StrategyIdentity + ":"
+	if row.StrategyIdentity == model.StrategyIdentityCustom && row.StrategyID != nil {
+		subject += fmt.Sprintf("%d:revision:%d", *row.StrategyID, row.StrategyRevision)
+	} else {
+		subject += row.StrategyKey
+	}
+	sources, err := json.Marshal(map[string]any{
+		"job_run_id": run.ID, "result_type": run.ResultType, "result_id": row.ID,
+		"strategy_identity": row.StrategyIdentity, "strategy_key": row.StrategyKey,
+		"strategy_id": row.StrategyID, "strategy_revision_id": row.StrategyRevisionID,
+		"strategy_revision": row.StrategyRevision, "strategy_hash": row.StrategyHash,
+		"request_hash": row.RequestHash,
+	})
+	if err != nil {
+		return err
+	}
+	artifact := &model.ResearchArtifact{
+		Type: artifactType, SchemaVersion: artifactSchemaVersion, Subject: subject,
+		AsOf: row.AsOf, AvailableAt: availableAt, ContentHash: row.ContentHash,
+		SourceRefs: string(sources), StorageRef: "strategy_run_results:" + fmt.Sprint(row.ID),
+		JobRunID: run.ID, OwnerType: run.OwnerType, OwnerUserID: run.OwnerUserID,
+	}
+	return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(artifact).Error
+}
 
 func persistAnalysisArtifact(tx *gorm.DB, run *model.JobRun, rec model.AnalysisRecord, availableAt time.Time) error {
 	target := rec.Symbol

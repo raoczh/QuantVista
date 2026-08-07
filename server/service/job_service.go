@@ -352,7 +352,8 @@ func isLegacyDurableJobKind(kind string) bool {
 
 func isBusinessDurableJobKind(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case JobKindAnalysis, JobKindRecommendation, JobKindDailyReport:
+	case JobKindAnalysis, JobKindRecommendation, JobKindDailyReport,
+		JobKindScreenerScan, JobKindStrategyBacktest:
 		return true
 	default:
 		return false

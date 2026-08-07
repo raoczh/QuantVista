@@ -671,6 +671,10 @@ func llmTaskTitle(kind string) string {
 		return "持仓建议"
 	case "screener_parse":
 		return "选股条件解析"
+	case JobKindScreenerScan:
+		return "策略扫描"
+	case JobKindStrategyBacktest:
+		return "策略回测"
 	default:
 		return "AI 任务"
 	}
