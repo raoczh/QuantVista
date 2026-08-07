@@ -302,7 +302,7 @@ const current = ref<RecommendationView | null>(null)
 const showAllReady = ref(false)
 
 function executionStatus(item: RecommendationItem): ExecutionStatus {
-  // 旧记录没有 execution_plan：保留可读和一键建仓兼容，但绝不把它冒充当前可执行。
+  // 旧记录没有 execution_plan：保留可读，但不能用当前偏好补算后直接执行。
   return item.detail?.execution_plan?.status || 'wait'
 }
 
@@ -1692,7 +1692,7 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
                       >挂止损提醒</n-button
                     >
                     <n-button
-                      v-if="!it.position && (!it.detail?.execution_plan || executionStatus(it) === 'ready')"
+                      v-if="!it.position && it.detail?.execution_plan && executionStatus(it) === 'ready'"
                       size="small"
                       type="primary"
                       ghost

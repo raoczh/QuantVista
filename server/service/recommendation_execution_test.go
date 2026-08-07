@@ -49,11 +49,11 @@ func TestBuildExecutionPlanShortReady(t *testing.T) {
 	if plan.Status != executionReady {
 		t.Fatalf("有效短线计划应 ready: %+v", plan)
 	}
-	if plan.PlannedCapital != 10000 || plan.PlannedPrice != 11 || plan.Quantity != 900 || plan.EstimatedCapital != 9900 {
+	if plan.PlannedCapital != 10000 || plan.PlannedPrice != 11 || plan.Quantity != 900 || plan.EstimatedCapital != 9905 {
 		t.Fatalf("研究预算与整手计算错误: %+v", plan)
 	}
-	if plan.MaxPlannedLoss == nil || *plan.MaxPlannedLoss != 2700 {
-		t.Fatalf("最大计划亏损应按区间上沿与止损计算为 2700: %+v", plan)
+	if plan.MaxPlannedLoss == nil || *plan.MaxPlannedLoss != 2713.6 {
+		t.Fatalf("最大计划亏损应包含买卖费用与卖出印花税: %+v", plan)
 	}
 	if plan.BudgetBasis != "research_budget" || plan.Version != executionPlanVersion {
 		t.Fatalf("预算口径/版本未固化: %+v", plan)
@@ -125,12 +125,22 @@ func TestBuildExecutionPlanLongTerm(t *testing.T) {
 	cand := executionTestCandidate()
 	snap := executionTestSnapshot("balanced", HorizonLongTerm, 100000)
 	plan := buildExecutionPlan(model.RecTypeLongTerm, pick, cand, snap, false, true, "fresh")
-	if plan.Status != executionReady || plan.Quantity != 1000 || plan.EstimatedCapital != 10000 {
+	if plan.Status != executionReady || plan.Quantity != 900 || plan.EstimatedCapital != 9005 {
 		t.Fatalf("有效长线估值区间应可形成整手计划: %+v", plan)
 	}
 	cand.Price = 13
 	if plan = buildExecutionPlan(model.RecTypeLongTerm, pick, cand, snap, false, true, "fresh"); plan.Status != executionWait || !hasExecutionReason(plan, "高于研究估值区间") {
 		t.Fatalf("长线价格超区间应等待: %+v", plan)
+	}
+}
+
+func TestBuildExecutionPlanExplainsTemporaryHorizonOverride(t *testing.T) {
+	plan := buildExecutionPlan(model.RecTypeLongTerm, recPick{
+		Symbol: "600000", Action: model.RecActionBuy, PositionPct: 10, ValuationLow: 8, ValuationHigh: 12,
+	}, executionTestCandidate(), executionTestSnapshot("balanced", HorizonShortTerm, 100000), false, true, "fresh")
+	joined := strings.Join(plan.PreferenceExplanation, "；")
+	if !strings.Contains(joined, "临时选择长线") || !strings.Contains(joined, "默认短线") {
+		t.Fatalf("临时覆盖周期时不得冒充默认偏好: %+v", plan.PreferenceExplanation)
 	}
 }
 

@@ -174,6 +174,45 @@ func TestTodoInboxSameDayMergeMuteVersionAndSeverityUpgrade(t *testing.T) {
 	}
 }
 
+func TestTodoInboxMuteRejectsExpandedGroupOverLimit(t *testing.T) {
+	setupTestDB(t)
+	cleanTodoInboxTables(t)
+	today := time.Now().In(time.Local).Format("2006-01-02")
+	for i := 0; i < 101; i++ {
+		seedTodoAlert(t, 930011, "600519", model.AlertKindPrice, today, model.AlertEventUnread)
+	}
+	svc := todoTestService(false)
+	res, err := svc.BuildInbox(context.Background(), 930011, TodoListOptions{Scope: TodoScopeAll})
+	if err != nil || len(res.Items) != 1 || len(res.Items[0].Children) != 101 {
+		t.Fatalf("同组测试数据构造失败: items=%d err=%v", len(res.Items), err)
+	}
+	child := res.Items[0].Children[0]
+	err = svc.ApplyInboxAction(930011, TodoActionRequest{Action: TodoActionMuteToday, Items: []TodoSourceRef{{
+		SourceKind: child.SourceKind, SourceID: child.SourceID, SourceVersion: child.SourceVersion,
+	}}})
+	if err == nil || !strings.Contains(err.Error(), "超过 100 条") {
+		t.Fatalf("静音扩展后的数量上限必须 fail-closed: %v", err)
+	}
+	var count int64
+	if dbErr := common.DB.Model(&model.TodoInboxState{}).Where("user_id = ?", 930011).Count(&count).Error; dbErr != nil || count != 0 {
+		t.Fatalf("超限拒绝前不得产生部分状态: count=%d err=%v", count, dbErr)
+	}
+}
+
+func TestTodoInboxCompletedPositionAlertStaysInLedgerScope(t *testing.T) {
+	setupTestDB(t)
+	cleanTodoInboxTables(t)
+	today := time.Now().In(time.Local).Format("2006-01-02")
+	seedTodoAlert(t, 930012, "600000", model.AlertKindCostDrawdown, today, model.AlertEventRead)
+	svc := todoTestService(false)
+	res, err := svc.BuildInbox(context.Background(), 930012, TodoListOptions{
+		Scope: TodoScopeLedger, Status: TodoStatusCompleted, PageSize: 20, HistoryDays: 30,
+	})
+	if err != nil || len(res.Items) != 1 || res.Items[0].Scope != TodoScopeLedger {
+		t.Fatalf("持仓提醒完成后仍应归入我的账本: items=%+v err=%v", res.Items, err)
+	}
+}
+
 func TestTodoInboxPartialTaskRedactionAndCompletedPagination(t *testing.T) {
 	setupTestDB(t)
 	cleanTodoInboxTables(t)

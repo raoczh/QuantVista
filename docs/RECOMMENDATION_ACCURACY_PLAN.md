@@ -31,7 +31,7 @@ S6 自动因子研究与策略进化（防过拟合硬门槛）
 
 - 三问投资偏好复用 `horizon_pref/risk_level/total_capital`，另以版本化 `investment_guide_version/status` 明确记录完成或跳过；不得根据字段默认值猜测用户做过向导；
 - 推荐生成时固化 `preference_snapshot=pref1`，包含偏好事实、向导状态与 `risk_budget=rb1` 全量参数；历史批次和队列中的作业不得读取当前偏好回算；
-- 每条推荐固化纯程序 `execution_plan=ep1`，按 `ready/wait/not_suitable` 区分当前可执行、等待条件和暂不适合，并保存研究预算、整百股数量、预计占用、止损存在时的最大计划亏损、不可计算原因和数据时点；
+- 每条推荐固化纯程序 `execution_plan=ep2`（旧 `ep1` 原样可读），按 `ready/wait/not_suitable` 区分当前可执行、等待条件和暂不适合，并保存研究预算、计入买入费税后的整百股数量与预计占用、止损存在时计入双边费税的最大计划亏损、不可计算原因和数据时点；
 - `total_capital` 只表示用户设定的**研究预算估算基数**，不是券商账户或实时可用现金；行情 `stale/unknown`、资金不足一手、已有持仓或价位关系无效时不得标记 `ready`；
 - 风险偏好只通过集中、版本化映射缩放既有程序仓位预算并改变展示解释，不增设收益门槛，不参与候选排序，不改写 AI 原始 `action/confidence`；
 - 执行状态、计划金额和最大风险是用户适配结果，禁止计入 Precision、胜率、Alpha、Brier/ECE 等预测能力指标，也不得以“更适合执行”宣称模型更准。

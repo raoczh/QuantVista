@@ -16,7 +16,7 @@ import (
 
 const (
 	recommendationPreferenceSnapshotVersion = "pref1"
-	executionPlanVersion                    = "ep1"
+	executionPlanVersion                    = "ep2"
 	riskBudgetVersion                       = "rb1"
 
 	executionReady       = "ready"
@@ -183,7 +183,12 @@ func buildExecutionPlan(recType string, p recPick, c candidate, snap recommendat
 	}
 	if preferenceSnapshotCompleted(snap) {
 		if label := horizonLabel(snap.HorizonPref); label != "" {
-			plan.PreferenceExplanation = append(plan.PreferenceExplanation, "按你的"+label+"持有周期展示本批研究计划")
+			if RecommendationTypeForHorizon(snap.HorizonPref) == recType {
+				plan.PreferenceExplanation = append(plan.PreferenceExplanation, "本批按你的"+label+"持有偏好展示")
+			} else {
+				plan.PreferenceExplanation = append(plan.PreferenceExplanation,
+					"本批临时选择"+recommendationTypeLabel(recType)+"，与默认"+label+"持有偏好不同")
+			}
 		}
 		if multiplier, ok := snap.RiskBudget.multiplier(snap.RiskLevel); ok {
 			plan.PreferenceExplanation = append(plan.PreferenceExplanation,
@@ -263,14 +268,22 @@ func buildExecutionPlan(recType string, p recPick, c candidate, snap recommendat
 				notSuitable = append(notSuitable, "计划资金不足买入一手（100股）")
 			} else {
 				plan.PlannedPrice = round2(plannedPrice)
-				plan.Quantity = lots * 100
-				plan.EstimatedCapital = round2(float64(plan.Quantity) * plannedPrice)
-				if p.StopLoss > 0 {
-					if p.StopLoss >= plannedPrice {
-						notSuitable = append(notSuitable, "止损价不低于计划价格，价位关系无效")
-					} else {
-						loss := round2((plannedPrice - p.StopLoss) * float64(plan.Quantity))
-						plan.MaxPlannedLoss = &loss
+				plan.Quantity = affordableBoardLotQuantity(c.Market, p.Symbol, plannedPrice, plan.PlannedCapital, lots*100)
+				if plan.Quantity <= 0 {
+					notSuitable = append(notSuitable, "计划资金计入买入费用后不足一手（100股）")
+				} else {
+					buyAmount := float64(plan.Quantity) * plannedPrice
+					buyFee, buyTax := tradeFee(c.Market, model.PaperSideBuy, p.Symbol, buyAmount)
+					plan.EstimatedCapital = round2(buyAmount + buyFee + buyTax)
+					if p.StopLoss > 0 {
+						if p.StopLoss >= plannedPrice {
+							notSuitable = append(notSuitable, "止损价不低于计划价格，价位关系无效")
+						} else {
+							sellAmount := p.StopLoss * float64(plan.Quantity)
+							sellFee, sellTax := tradeFee(c.Market, model.PaperSideSell, p.Symbol, sellAmount)
+							loss := round2(plan.EstimatedCapital - (sellAmount - sellFee - sellTax))
+							plan.MaxPlannedLoss = &loss
+						}
 					}
 				}
 			}
@@ -286,6 +299,27 @@ func buildExecutionPlan(recType string, p recPick, c candidate, snap recommendat
 		plan.UnavailableReasons = append(plan.UnavailableReasons, wait...)
 	}
 	return plan
+}
+
+func affordableBoardLotQuantity(market, symbol string, price, budget float64, initial int) int {
+	for quantity := initial; quantity >= 100; quantity -= 100 {
+		amount := float64(quantity) * price
+		fee, tax := tradeFee(market, model.PaperSideBuy, symbol, amount)
+		if round2(amount+fee+tax) <= budget {
+			return quantity
+		}
+	}
+	return 0
+}
+
+func recommendationTypeLabel(recType string) string {
+	if recType == model.RecTypeShortTerm {
+		return "短线"
+	}
+	if recType == model.RecTypeLongTerm {
+		return "长线"
+	}
+	return "未知周期"
 }
 
 func loadHoldingSymbolSet(userID int64) (map[string]bool, error) {

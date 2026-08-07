@@ -303,7 +303,11 @@ func loadCompletedTodoItems(userID int64, cutoff time.Time) ([]TodoItem, map[str
 	} else {
 		for _, event := range events {
 			t := event.UpdatedAt
-			out = append(out, TodoItem{Kind: TodoKindAlert, Scope: TodoScopeResearch, Priority: 3,
+			scope := TodoScopeResearch
+			if isPositionAlertKind(event.Kind) {
+				scope = TodoScopeLedger
+			}
+			out = append(out, TodoItem{Kind: TodoKindAlert, Scope: scope, Priority: 3,
 				Symbol: event.Symbol, Market: event.Market, Name: event.Name, Title: "条件提醒已收下", Detail: event.Message,
 				RefID: event.ID, RefType: "alerts", DeepLink: alertEventDeepLink(event.ID), Time: &t})
 		}
@@ -777,13 +781,13 @@ func (s *TodoService) ApplyInboxAction(userID int64, req TodoActionRequest) erro
 		for _, ref := range req.Items {
 			mutedGroups[baseTodoGroupKey(currentByKey[todoStateKey(ref.SourceKind, ref.SourceID)])] = true
 		}
-		if len(req.Items) > 100 {
-			return errors.New("同组事项超过 100 条，请先按来源处理")
-		}
 		for _, item := range currentItems {
 			key := todoStateKey(item.SourceKind, item.SourceID)
 			if !mutedGroups[baseTodoGroupKey(item)] || seen[key] {
 				continue
+			}
+			if len(req.Items) >= 100 {
+				return errors.New("同组事项超过 100 条，请先按来源处理")
 			}
 			req.Items = append(req.Items, TodoSourceRef{
 				SourceKind: item.SourceKind, SourceID: item.SourceID, SourceVersion: item.SourceVersion,

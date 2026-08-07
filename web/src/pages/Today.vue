@@ -29,6 +29,14 @@ import {
   type TodoStatus,
 } from '@/api/todo'
 import { getEventCalendar, type CalendarEvent, type CalendarResult } from '@/api/event'
+import {
+  enumQuery,
+  integerQuery,
+  queryRef,
+  stringQuery,
+  useListPageScroll,
+  useRouteQueryState,
+} from '@/composables/useListPageState'
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
@@ -50,7 +58,7 @@ const loading = ref(false)
 const todoError = ref('')
 const status = ref<TodoStatus>('needs_action')
 const scope = ref<TodoScope>('all')
-const source = ref(typeof route.query.source === 'string' ? route.query.source : '')
+const source = ref('')
 const page = ref(1)
 const selected = ref<string[]>([])
 const acting = ref('')
@@ -253,13 +261,24 @@ function handleChildMenu(child: TodoChild, key: string) {
   else runChildAction(child, key as TodoInboxAction)
 }
 
-onMounted(load)
+useRouteQueryState(route, router, [
+  queryRef('status', status, enumQuery<TodoStatus>('needs_action', ['needs_action', 'awareness', 'completed'])),
+  queryRef('scope', scope, enumQuery<TodoScope>('all', ['all', 'ledger', 'research', 'market'])),
+  queryRef('source', source, stringQuery('', 40)),
+  queryRef('page', page, integerQuery(1, 1, 100_000)),
+])
+const { restoreScroll } = useListPageScroll(route, 'today')
+
+onMounted(async () => {
+  await load()
+  await restoreScroll()
+})
 
 const calendar = ref<CalendarResult | null>(null)
 const calLoading = ref(false)
 const calError = ref('')
 let calAbort: AbortController | null = null
-const futureEvents = computed(() => (calendar.value?.events || []).filter((event) => event.days_left > 0))
+const futureEvents = computed(() => (calendar.value?.events || []).filter((event) => event.days_left >= 0))
 
 async function loadCalendar() {
   calAbort?.abort()
@@ -298,6 +317,7 @@ function relationLabel(value: string) {
 }
 
 function daysLabel(value: number) {
+  if (value <= 0) return '今天'
   return value === 1 ? '明天' : `${value} 天后`
 }
 
