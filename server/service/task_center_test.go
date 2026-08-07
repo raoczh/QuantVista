@@ -400,7 +400,7 @@ func TestTaskCenterUsesBoundedLightweightQueries(t *testing.T) {
 	recorder.mu.Lock()
 	selects := append([]string(nil), recorder.selects...)
 	recorder.mu.Unlock()
-	if len(selects) != 6 {
+	if len(selects) != 7 {
 		t.Fatalf("聚合应固定为每来源一次 SELECT、不得 N+1，got=%d sql=%v", len(selects), selects)
 	}
 	forbidden := []string{

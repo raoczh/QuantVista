@@ -67,7 +67,7 @@ func (s *RecommendationService) registerDurableJobHandler() {
 			}
 			return batch.ID, nil
 		},
-		persistSuccess: func(tx *gorm.DB, run *model.JobRun, result DurableJobResult, _ []byte, _ time.Time) error {
+		persistSuccess: func(tx *gorm.DB, run *model.JobRun, result DurableJobResult, _ []byte, now time.Time) error {
 			if run.ResultID == nil {
 				return errors.New("推荐作业缺少结果引用")
 			}
@@ -81,7 +81,7 @@ func (s *RecommendationService) registerDurableJobHandler() {
 			if result.Status != "" && batch.Status != result.Status {
 				return errors.New("推荐结果状态与作业不一致")
 			}
-			return nil
+			return persistRecommendationArtifact(tx, run, batch, now)
 		},
 		finishFailure: func(tx *gorm.DB, run *model.JobRun, _ string, code, message string, now time.Time) error {
 			if run.ResultID == nil {

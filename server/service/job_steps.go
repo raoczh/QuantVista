@@ -85,16 +85,26 @@ func JobStepFinish(ctx context.Context, name, status string) error {
 		if res.RowsAffected == 0 {
 			return nil
 		}
-		return appendJobEvent(tx, execution.userID(), execution.jobID, "step", status)
+		run, err := execution.run(tx)
+		if err != nil {
+			return err
+		}
+		return appendJobEventForRun(tx, run, "step", status)
 	})
 }
 
-func (e jobExecution) userID() int64 {
+func (e jobExecution) run(db *gorm.DB) (*model.JobRun, error) {
 	var run model.JobRun
-	if common.DB != nil && common.DB.Select("user_id").First(&run, e.jobID).Error == nil {
-		return run.UserID
+	if db == nil {
+		db = common.DB
 	}
-	return 0
+	if db == nil {
+		return nil, errors.New("数据库尚未初始化")
+	}
+	if err := db.Select("id", "owner_type", "user_id").First(&run, e.jobID).Error; err != nil {
+		return nil, err
+	}
+	return &run, nil
 }
 
 func (r *jobRuntime) transitionStep(jobID int64, name string) error {
@@ -125,13 +135,13 @@ func (r *jobRuntime) transitionStep(jobID int64, name string) error {
 			return err
 		}
 		var run model.JobRun
-		if err := tx.Select("user_id").First(&run, jobID).Error; err != nil {
+		if err := tx.Select("id", "owner_type", "user_id").First(&run, jobID).Error; err != nil {
 			return err
 		}
 		if err := tx.Create(&model.JobStep{JobRunID: jobID, Sequence: maxSeq + 1, Name: name,
 			Status: model.JobStatusRunning, StartedAt: &now}).Error; err != nil {
 			return err
 		}
-		return appendJobEvent(tx, run.UserID, jobID, "step", model.JobStatusRunning)
+		return appendJobEventForRun(tx, &run, "step", model.JobStatusRunning)
 	})
 }

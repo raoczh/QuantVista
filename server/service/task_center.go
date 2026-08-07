@@ -37,14 +37,17 @@ const (
 
 // TaskCenterItem 是跨业务表稳定的只读任务摘要。任务正文与结果只由原业务详情接口读取。
 type TaskCenterItem struct {
-	ID       string `json:"id"`
-	Source   string `json:"source"`
-	SourceID int64  `json:"source_id"`
-	ResultID int64  `json:"result_id,omitempty"`
-	ParentID *int64 `json:"parent_id,omitempty"`
-	Kind     string `json:"kind"`
-	Title    string `json:"title"`
-	Target   string `json:"target"`
+	ID          string `json:"id"`
+	Source      string `json:"source"`
+	SourceID    int64  `json:"source_id"`
+	ResultID    int64  `json:"result_id,omitempty"`
+	ParentID    *int64 `json:"parent_id,omitempty"`
+	Kind        string `json:"kind"`
+	Owner       string `json:"owner"`
+	OwnerUserID *int64 `json:"owner_user_id,omitempty"`
+	TriggeredBy *int64 `json:"triggered_by,omitempty"`
+	Title       string `json:"title"`
+	Target      string `json:"target"`
 
 	Status           string `json:"status"`
 	RawStatus        string `json:"raw_status"`
@@ -117,6 +120,13 @@ func (s *TaskCenterService) List(userID int64, role string, options TaskCenterLi
 		}
 		items = append(items, rows...)
 	}
+	if role == model.RoleAdmin && options.IncludeSystem && taskSourceSelected(filters.source, TaskSourceDataSync) {
+		rows, err := listSystemJobRunTasks(common.DB, filters, options.IncludeSteps)
+		if err != nil {
+			return nil, fmt.Errorf("查询统一系统作业失败: %w", err)
+		}
+		items = append(items, rows...)
+	}
 	if taskSourceSelected(filters.source, TaskSourceAnalysis) {
 		rows, err := listAnalysisTasks(common.DB, userID, filters)
 		if err != nil {
@@ -145,7 +155,7 @@ func (s *TaskCenterService) List(userID int64, role string, options TaskCenterLi
 		}
 		items = append(items, rows...)
 	}
-	// 防御性权限边界：调用方即使误传 IncludeSystem，非管理员也不会查询无用户归属的系统日志。
+	// 旧日志只作兼容投影；统一 JobRun 已经在上方展示，按 job_run_id 排除重复。
 	if role == model.RoleAdmin && options.IncludeSystem && taskSourceSelected(filters.source, TaskSourceDataSync) {
 		rows, err := listDataSyncTasks(common.DB, filters)
 		if err != nil {
@@ -383,7 +393,7 @@ type llmTaskCenterRow struct {
 
 func listJobRunTasks(db *gorm.DB, userID int64, filters taskCenterFilters, includeSteps bool) ([]TaskCenterItem, error) {
 	q := db.Model(&model.JobRun{}).
-		Select("id", "kind", "parent_id", "status", "result_id", "error", "error_code",
+		Select("id", "owner_type", "user_id", "triggered_by", "kind", "parent_id", "status", "result_id", "error", "error_code",
 			"trace_id", "provider", "model", "prompt_tokens", "completion_tokens", "total_tokens",
 			"latency_ms", "total", "succeeded", "failed", "cancel_requested", "created_at", "updated_at").
 		Where("user_id = ?", userID)
@@ -415,7 +425,8 @@ func listJobRunTasks(db *gorm.DB, userID int64, filters taskCenterFilters, inclu
 		}
 		items = append(items, TaskCenterItem{
 			ID: taskCompositeID(TaskSourceJob, run.ID), Source: TaskSourceJob, SourceID: run.ID,
-			ResultID: resultID, ParentID: run.ParentID, Kind: run.Kind, Title: llmTaskTitle(run.Kind),
+			ResultID: resultID, ParentID: run.ParentID, Kind: run.Kind, Owner: model.JobOwnerUser,
+			OwnerUserID: run.OwnerUserID, Title: llmTaskTitle(run.Kind),
 			Status: run.Status, RawStatus: run.Status, Stage: taskStage(run.Status),
 			Error: run.Error, ErrorCode: run.ErrorCode, TraceID: run.TraceID,
 			Provider: run.Provider, Model: run.Model, PromptTokens: run.PromptTokens,
@@ -425,6 +436,52 @@ func listJobRunTasks(db *gorm.DB, userID int64, filters taskCenterFilters, inclu
 			CanRetry:        run.Status == model.JobStatusFailed && isDurableJobKind(run.Kind),
 			CancelRequested: run.CancelRequested,
 			Steps:           steps[run.ID], CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt,
+		})
+	}
+	return items, nil
+}
+
+func listSystemJobRunTasks(db *gorm.DB, filters taskCenterFilters, includeSteps bool) ([]TaskCenterItem, error) {
+	q := db.Model(&model.JobRun{}).
+		Select("id", "owner_type", "user_id", "triggered_by", "kind", "parent_id", "status", "result_id", "error", "error_code",
+			"latency_ms", "total", "succeeded", "failed", "cancel_requested", "created_at", "updated_at").
+		Where("owner_type = ? AND user_id IS NULL", model.JobOwnerSystem)
+	if filters.kind != "" {
+		q = q.Where("kind = ?", filters.kind)
+	}
+	q = applyTaskStatusFilter(q, filters)
+	var runs []model.JobRun
+	if err := q.Order("created_at DESC, id DESC").Limit(filters.limit).Find(&runs).Error; err != nil {
+		return nil, err
+	}
+	var steps map[int64][]JobStepView
+	if includeSteps {
+		ids := make([]int64, 0, len(runs))
+		for _, run := range runs {
+			ids = append(ids, run.ID)
+		}
+		var err error
+		steps, err = listJobSteps(ids)
+		if err != nil {
+			return nil, err
+		}
+	}
+	items := make([]TaskCenterItem, 0, len(runs))
+	for _, run := range runs {
+		resultID := int64(0)
+		if run.ResultID != nil {
+			resultID = *run.ResultID
+		}
+		items = append(items, TaskCenterItem{
+			ID: taskCompositeID(TaskSourceJob, run.ID), Source: TaskSourceDataSync, SourceID: run.ID,
+			ResultID: resultID, ParentID: run.ParentID, Kind: run.Kind, Owner: model.JobOwnerSystem,
+			TriggeredBy: run.TriggeredBy, Title: dataSyncTaskTitle(run.Kind), Target: "cn",
+			Status: run.Status, RawStatus: run.Status, Stage: taskStage(run.Status),
+			Error: run.Error, ErrorCode: run.ErrorCode, LatencyMs: run.LatencyMs,
+			Total: run.Total, Succeeded: run.Succeeded, Failed: run.Failed,
+			CanCancel:       (run.Status == model.JobStatusQueued || run.Status == model.JobStatusRunning) && !run.CancelRequested,
+			CanRetry:        run.Status == model.JobStatusFailed && isSystemDurableJobKind(run.Kind),
+			CancelRequested: run.CancelRequested, Steps: steps[run.ID], CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt,
 		})
 	}
 	return items, nil
@@ -470,7 +527,8 @@ type dataSyncTaskRow struct {
 
 func listDataSyncTasks(db *gorm.DB, filters taskCenterFilters) ([]TaskCenterItem, error) {
 	q := db.Model(&model.DataSyncLog{}).
-		Select("id", "task", "market", "status", "total", "succeeded", "failed", "duration_ms", "message", "created_at")
+		Select("id", "task", "market", "status", "total", "succeeded", "failed", "duration_ms", "message", "created_at").
+		Where("job_run_id IS NULL")
 	if filters.kind != "" {
 		q = q.Where("task = ?", filters.kind)
 	}
@@ -488,7 +546,7 @@ func listDataSyncTasks(db *gorm.DB, filters taskCenterFilters) ([]TaskCenterItem
 		}
 		items = append(items, TaskCenterItem{
 			ID: taskCompositeID(TaskSourceDataSync, row.ID), Source: TaskSourceDataSync, SourceID: row.ID,
-			Kind: row.Task, Title: dataSyncTaskTitle(row.Task), Target: row.Market,
+			Kind: row.Task, Owner: model.JobOwnerSystem, Title: dataSyncTaskTitle(row.Task), Target: row.Market,
 			Status: status, RawStatus: row.Status, Stage: taskStage(status), Error: errorMessage,
 			LatencyMs: row.DurationMs, Total: row.Total, Succeeded: row.Succeeded, Failed: row.Failed,
 			CreatedAt: row.CreatedAt, UpdatedAt: row.CreatedAt,

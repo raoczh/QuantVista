@@ -114,6 +114,13 @@ func (sc *ScreenerController) Status(c *gin.Context) {
 
 // FactorRebuild POST /api/admin/market/factor-rebuild —— 手动异步重建因子宽表（管理员）。
 func (sc *ScreenerController) FactorRebuild(c *gin.Context) {
-	service.RebuildFactorTableAsync("管理端手动触发")
-	common.ApiSuccess(c, gin.H{"started": true})
+	actor := currentUserID(c)
+	job, err := service.StartSystemDataSyncJob(service.JobKindFactorRebuild, &actor, service.DataSyncJobRequest{
+		Version: 1, Market: "cn", TriggerSource: "admin", ParameterSummary: "manual_rebuild=true", Reason: "管理端手动触发",
+	})
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, gin.H{"started": true, "task": service.JobKindFactorRebuild, "job_run_id": job.ID})
 }

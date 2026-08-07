@@ -80,8 +80,13 @@ func (s *DailyReportService) registerDurableJobHandler() {
 			if result.Status != "" && reportStatusToJobStatus(report.Status) != result.Status {
 				return errors.New("日报结果状态与作业不一致")
 			}
-			return tx.Model(&model.DailyReport{}).Where("id = ?", report.ID).
-				Updates(map[string]any{"previous_status": "", "updated_at": now}).Error
+			if err := tx.Model(&model.DailyReport{}).Where("id = ?", report.ID).
+				Updates(map[string]any{"previous_status": "", "updated_at": now}).Error; err != nil {
+				return err
+			}
+			report.PreviousStatus = ""
+			report.UpdatedAt = now
+			return persistDailyReportArtifact(tx, run, report, now)
 		},
 		finishFailure: func(tx *gorm.DB, run *model.JobRun, _ string, code, message string, now time.Time) error {
 			if run.ResultID == nil {

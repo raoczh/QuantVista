@@ -23,6 +23,9 @@ export interface TaskCenterItem {
   result_id?: number
   parent_id?: number
   kind: string
+  owner: 'user' | 'system'
+  owner_user_id?: number
+  triggered_by?: number
   title: string
   target: string
   status: TaskStatus
@@ -48,6 +51,13 @@ export interface TaskCenterItem {
   updated_at: string
 }
 
+export interface JobRuntimeMetrics {
+  buckets: Array<{ kind: string; status: TaskStatus; count: number }>
+  oldest_queued_at?: string
+  capacity: { workers: number; capacity: number; in_use: number; available: number }
+  generated_at: string
+}
+
 export interface TaskCenterQuery {
   source?: TaskSource | ''
   kind?: string
@@ -70,6 +80,10 @@ export function listTasks(params: TaskCenterQuery = {}, signal?: AbortSignal) {
     },
     signal,
   })
+}
+
+export function getJobRuntimeMetrics(signal?: AbortSignal) {
+  return request<JobRuntimeMetrics>({ url: '/admin/jobs/metrics', method: 'get', signal })
 }
 
 export const TASK_SOURCE_LABELS: Record<TaskSource, string> = {
@@ -127,6 +141,7 @@ const TASK_KIND_LABELS: Record<string, string> = {
   snapshot_market: '市场快照',
   sync_market_wide: '全市场增量同步',
   init_market_history: '全市场历史初始化',
+  factor_rebuild: '因子宽表重建',
 }
 
 export function taskSourceLabel(source: TaskSource): string {

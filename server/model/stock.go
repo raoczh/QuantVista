@@ -83,9 +83,10 @@ type MarketSnapshot struct {
 // 便于排查数据缺口与数据源限流（对应 phase0 review P1#3 的 data_sync_logs 缺口）。
 type DataSyncLog struct {
 	ID         int64  `gorm:"primaryKey" json:"id"`
+	JobRunID   *int64 `gorm:"uniqueIndex" json:"job_run_id,omitempty"`
 	Task       string `gorm:"size:32;index;index:idx_sync_task_created,priority:1" json:"task"` // sync_daily_bars / backfill_calendar / snapshot_market
 	Market     string `gorm:"size:8" json:"market"`
-	Status     string `gorm:"size:16" json:"status"` // success / partial / failed
+	Status     string `gorm:"size:16" json:"status"` // processing / success / partial / failed / canceled
 	Total      int    `json:"total"`                 // 计划处理条目数
 	Succeeded  int    `json:"succeeded"`             // 成功条目数
 	Failed     int    `json:"failed"`                // 失败条目数

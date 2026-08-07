@@ -35,7 +35,7 @@ func (s *AnalysisService) registerDurableJobHandler() {
 			}
 			return rec.ID, nil
 		},
-		persistSuccess: func(tx *gorm.DB, run *model.JobRun, result DurableJobResult, _ []byte, _ time.Time) error {
+		persistSuccess: func(tx *gorm.DB, run *model.JobRun, result DurableJobResult, _ []byte, now time.Time) error {
 			if run.ResultID == nil {
 				return errors.New("分析作业缺少结果引用")
 			}
@@ -49,7 +49,7 @@ func (s *AnalysisService) registerDurableJobHandler() {
 			if result.Status != "" && rec.Status != result.Status {
 				return errors.New("分析结果状态与作业不一致")
 			}
-			return nil
+			return persistAnalysisArtifact(tx, run, rec, now)
 		},
 		finishFailure: func(tx *gorm.DB, run *model.JobRun, _ string, code, message string, now time.Time) error {
 			if run.ResultID == nil {

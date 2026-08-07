@@ -51,6 +51,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	taskCenterSvc := service.NewTaskCenterService()
 	// D17 持仓卖出决策 AI 建议（逐笔 hold|trim|exit，走统一作业与兼容结果行）
 	positionAdviceSvc := service.NewPositionAdviceService(positionSvc, llmSvc)
+	service.RegisterDataSyncJobHandlers(marketSvc)
 	// 七类用户作业 handler 均已注册；此时再收敛 running 并按持久顺序恢复 queued。
 	service.StartJobRuntime()
 
@@ -390,6 +391,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			admin := authed.Group("/admin")
 			admin.Use(middleware.AdminAuth())
 			{
+				admin.GET("/jobs/metrics", taskCenterCtl.Metrics)
 				admin.GET("/settings", adminCtl.GetSettings)
 				admin.PUT("/settings", adminCtl.UpdateSettings)
 				admin.GET("/users", adminCtl.ListUsers)

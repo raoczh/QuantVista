@@ -276,7 +276,7 @@ func (s *MarketService) SyncMarketWide(ctx context.Context) (*model.DataSyncLog,
 		log.Status = "failed"
 		log.Message = truncate(err.Error(), 512)
 		log.DurationMs = time.Since(start).Milliseconds()
-		s.recordSyncLog(log)
+		s.recordSyncLog(ctx, log)
 		return log, err
 	}
 
@@ -339,10 +339,15 @@ func (s *MarketService) SyncMarketWide(ctx context.Context) (*model.DataSyncLog,
 	log.Status = statusOf(log)
 	log.Message = truncate(fmt.Sprintf("%s：快照 %d 只，落 bar %d，除权重锚 %d/%d", tradeDate, len(rows), len(bars), rebased, suspects), 512)
 	log.DurationMs = time.Since(start).Milliseconds()
-	s.recordSyncLog(log)
+	s.recordSyncLog(ctx, log)
 	// M1 第二部分：增量落库完成后异步重建因子宽表（选股/推荐策略信号的数据地基）。
 	if log.Succeeded > 0 {
-		RebuildFactorTableAsync("每日增量完成")
+		if _, inJob := currentJobExecution(ctx); inJob {
+			ScheduleSystemDataSyncJob(JobKindFactorRebuild, DataSyncJobRequest{Version: dataSyncJobSnapshotVersion,
+				Market: "cn", TriggerSource: "system", ParameterSummary: "source=sync_market_wide", Reason: "每日增量完成"})
+		} else {
+			RebuildFactorTableAsync("每日增量完成")
+		}
 		// P3b：快照已带 f9/f115/f23/f100 估值字段，顺手按行业聚合板块估值（best-effort）。
 		AggregateBoardValuationAsync(rows, tradeDate)
 	}
@@ -487,6 +492,17 @@ func (s *MarketService) StartMarketWideInit() error {
 	return nil
 }
 
+// RunMarketWideInit 在当前上下文同步推进一轮初始化，供 JobRuntime 统一持有取消权。
+func (s *MarketService) RunMarketWideInit(ctx context.Context, audit SyncAudit) (*model.DataSyncLog, error) {
+	if !wideInitRunning.CompareAndSwap(false, true) {
+		return nil, ErrSyncInProgress
+	}
+	defer wideInitRunning.Store(false)
+	log, err := s.initMarketWideHistory(ctx)
+	applySyncAudit(log, audit)
+	return log, err
+}
+
 // PauseMarketWideInit 暂停当前初始化任务。进度在 states 表内，重新 Start 即从断点续跑。
 func (s *MarketService) PauseMarketWideInit() bool {
 	wideInitCancelMu.Lock()
@@ -515,7 +531,7 @@ func (s *MarketService) initMarketWideHistory(ctx context.Context) (*model.DataS
 	if pendingTotal == 0 {
 		log.Status = "success"
 		log.Message = "无待初始化标的"
-		s.recordSyncLog(log)
+		s.recordSyncLog(ctx, log)
 		return log, nil
 	}
 	common.SysLog("全市场历史初始化开跑: 待处理 %d 只（每只 %d 根，节流 %v）", pendingTotal, wideBarLimit, wideInitThrottle)
@@ -629,10 +645,15 @@ loop:
 		log.Message = truncate(fmt.Sprintf("本轮处理 %d/%d", log.Total, pendingTotal), 512)
 	}
 	log.DurationMs = time.Since(start).Milliseconds()
-	s.recordSyncLog(log)
+	s.recordSyncLog(ctx, log)
 	// 本轮有新建史标的即重建宽表（含暂停中断的部分进度——尽快让选股覆盖它们）。
 	if log.Succeeded > 0 {
-		RebuildFactorTableAsync("历史初始化推进")
+		if _, inJob := currentJobExecution(ctx); inJob {
+			ScheduleSystemDataSyncJob(JobKindFactorRebuild, DataSyncJobRequest{Version: dataSyncJobSnapshotVersion,
+				Market: "cn", TriggerSource: "system", ParameterSummary: "source=init_market_history", Reason: "历史初始化推进"})
+		} else {
+			RebuildFactorTableAsync("历史初始化推进")
+		}
 	}
 	if canceled {
 		return log, context.Canceled

@@ -47,7 +47,6 @@ func main() {
 	}
 
 	mgr := datasource.DefaultManager()
-	service.StartMarketJobs(mgr)
 	service.StartTrackingJobs(mgr)
 	service.StartAlertJobs(mgr)
 	service.StartGuardJobs(mgr)
@@ -57,6 +56,7 @@ func main() {
 	service.StartMoodJobs(mgr)
 	service.StartIntradayJobs()
 	service.StartLLMLogJobs()
+	service.StartJobMaintenanceJobs()
 	// B8/B9 公司行动与打新日历：每日 19:25 同步四张 RPT_* 报表
 	//（错峰在 19:05 财报之后、19:35 盘后守护轮之前——守护轮要消费本轮落库的解禁/除权数据）。
 	service.StartCorpActionJobs()
@@ -87,6 +87,8 @@ func main() {
 	engine.Use(middleware.Recovery(), middleware.Logger(), middleware.CORS())
 
 	router.SetApiRouter(engine, mgr)
+	// 市场维护已统一进入 JobRuntime，必须在 handler 注册与恢复完成后启动调度器。
+	service.StartMarketJobs(mgr)
 	router.SetWebRouter(engine, webFS)
 
 	addr := ":" + common.Port

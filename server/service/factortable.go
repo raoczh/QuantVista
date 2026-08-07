@@ -876,6 +876,35 @@ func RebuildFactorTableAsync(reason string) {
 	}()
 }
 
+// RebuildFactorTable 在调用方上下文内完成一次显式重建，供统一 JobRun 管理取消、
+// 超时和终态。与懒加载共用互斥锁，已有构建时明确返回背压错误。
+func RebuildFactorTable(ctx context.Context, reason string) (*FactorTable, error) {
+	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
+	}
+	if !factorBuildMu.TryLock() {
+		return nil, ErrSyncInProgress
+	}
+	defer factorBuildMu.Unlock()
+	factorBuilding.Store(true)
+	defer factorBuilding.Store(false)
+	factorFreshMu.Lock()
+	factorFreshVal = ""
+	factorFreshMu.Unlock()
+	table, err := buildFactorTable(ctx)
+	if err != nil {
+		return nil, err
+	}
+	factorTableMu.Lock()
+	factorTableCur = table
+	factorTableMu.Unlock()
+	common.SysLog("因子宽表重建完成（%s）: %s，%d 只，耗时 %dms", reason, table.TradeDate, table.Len(), table.BuildMs)
+	if _, err := SnapshotFactorTable(table); err != nil {
+		common.SysWarn("因子快照落库失败 %s: %v", table.TradeDate, err)
+	}
+	return table, nil
+}
+
 // FactorTableStatusView 宽表状态（选股页状态条 + 管理端）。
 type FactorTableStatusView struct {
 	Ready     bool      `json:"ready"`

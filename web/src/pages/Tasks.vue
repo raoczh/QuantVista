@@ -9,6 +9,7 @@ import {
   TASK_STATUS_LABELS,
   cancelJob,
   formatTaskTime,
+  getJobRuntimeMetrics,
   listTasks,
   retryJob,
   taskActionLabel,
@@ -20,6 +21,7 @@ import {
   taskSourceLabel,
   taskStageLabel,
   type TaskCenterItem,
+  type JobRuntimeMetrics,
   type TaskSource,
   type TaskStatus,
 } from '@/api/taskCenter'
@@ -36,6 +38,7 @@ const { isAdmin } = storeToRefs(authStore)
 const { vars } = useUi()
 
 const tasks = ref<TaskCenterItem[]>([])
+const runtimeMetrics = ref<JobRuntimeMetrics | null>(null)
 const loading = ref(false)
 const refreshing = ref(false)
 const loadError = ref('')
@@ -53,7 +56,7 @@ const knownKindsBySource: Record<TaskSource, string[]> = {
   daily_report: ['daily_report'],
   job: ['analysis', 'recommendation', 'daily_report', 'qa', 'compare', 'position_advice', 'screener_parse'],
   llm: ['qa', 'compare', 'position_advice', 'screener_parse'],
-  data_sync: ['sync_daily_bars', 'backfill_calendar', 'snapshot_market', 'sync_market_wide', 'init_market_history'],
+  data_sync: ['sync_daily_bars', 'backfill_calendar', 'snapshot_market', 'sync_market_wide', 'init_market_history', 'factor_rebuild'],
 }
 
 const styleVars = computed(() => ({
@@ -137,6 +140,11 @@ const statusStats = computed(() => {
   }))
 })
 
+const oldestQueuedText = computed(() => {
+  const value = runtimeMetrics.value?.oldest_queued_at
+  return value ? formatTaskTime(value) : '无排队任务'
+})
+
 async function loadTaskRows() {
   requestController?.abort()
   const controller = new AbortController()
@@ -146,7 +154,7 @@ async function loadTaskRows() {
   refreshing.value = true
   loadError.value = ''
   try {
-    const rows = await listTasks(
+    const rowsPromise = listTasks(
       {
         source: source.value,
         kind: kind.value,
@@ -156,7 +164,10 @@ async function loadTaskRows() {
       },
       controller.signal,
     )
+    const metricsPromise = isAdmin.value ? getJobRuntimeMetrics(controller.signal) : Promise.resolve(null)
+    const [rows, metrics] = await Promise.all([rowsPromise, metricsPromise])
     if (requestController === controller) tasks.value = rows
+    if (requestController === controller) runtimeMetrics.value = metrics
   } catch (error) {
     if (!isAbortError(error) && requestController === controller) loadError.value = (error as Error).message
   } finally {
@@ -289,6 +300,22 @@ function openTask(task: TaskCenterItem) {
         </button>
       </div>
 
+      <section v-if="isAdmin && runtimeMetrics" class="runtime-band" aria-label="统一作业容量">
+        <div class="capacity-facts">
+          <div><span>工作器</span><strong class="qv-tnum">{{ runtimeMetrics.capacity.workers }}</strong></div>
+          <div><span>容量使用</span><strong class="qv-tnum">{{ runtimeMetrics.capacity.in_use }} / {{ runtimeMetrics.capacity.capacity }}</strong></div>
+          <div><span>可用槽位</span><strong class="qv-tnum">{{ runtimeMetrics.capacity.available }}</strong></div>
+          <div><span>最老排队</span><strong class="qv-tnum">{{ oldestQueuedText }}</strong></div>
+        </div>
+        <div class="bucket-grid" aria-label="按类型与状态聚合">
+          <div v-for="bucket in runtimeMetrics.buckets" :key="`${bucket.kind}:${bucket.status}`" class="bucket-row">
+            <span>{{ taskKindLabel(bucket.kind) }}</span>
+            <span>{{ TASK_STATUS_LABELS[bucket.status] }}</span>
+            <strong class="qv-tnum">{{ bucket.count }}</strong>
+          </div>
+        </div>
+      </section>
+
       <SectionCard :hoverable="false">
         <div class="filters">
           <n-select v-model:value="source" :options="sourceOptions" size="small" class="filter-control" />
@@ -335,6 +362,8 @@ function openTask(task: TaskCenterItem) {
                       <span>{{ taskKindLabel(task.kind) }}</span>
                       <span v-if="task.target">{{ task.target }}</span>
                       <span class="qv-mono">#{{ task.source_id }}</span>
+                      <span v-if="task.owner === 'system'">system</span>
+                      <span v-if="task.triggered_by" class="qv-mono">触发者 #{{ task.triggered_by }}</span>
                       <span v-if="task.parent_id" class="qv-mono">重跑自 #{{ task.parent_id }}</span>
                     </div>
                     <div v-if="task.trace_id" class="task-trace qv-mono" :title="task.trace_id">
@@ -413,6 +442,8 @@ function openTask(task: TaskCenterItem) {
                     <span>{{ taskSourceLabel(task.source) }}</span>
                     <span>{{ taskKindLabel(task.kind) }}</span>
                     <span class="qv-mono">#{{ task.source_id }}</span>
+                    <span v-if="task.owner === 'system'">system</span>
+                    <span v-if="task.triggered_by" class="qv-mono">触发者 #{{ task.triggered_by }}</span>
                     <span v-if="task.parent_id" class="qv-mono">重跑自 #{{ task.parent_id }}</span>
                   </div>
                 </div>
@@ -509,6 +540,56 @@ function openTask(task: TaskCenterItem) {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 10px;
+}
+
+.runtime-band {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 1.4fr);
+  gap: 18px;
+  padding: 14px 0;
+  border-top: 1px solid var(--task-divider);
+  border-bottom: 1px solid var(--task-divider);
+}
+
+.capacity-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 20px;
+}
+
+.capacity-facts div,
+.bucket-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.capacity-facts span,
+.bucket-row span {
+  color: var(--task-muted);
+  font-size: 12px;
+}
+
+.capacity-facts strong,
+.bucket-row strong {
+  font-size: 13px;
+}
+
+.bucket-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  max-height: 112px;
+  gap: 5px 18px;
+  overflow: auto;
+}
+
+.bucket-row span:first-child {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .status-stat {
@@ -770,6 +851,10 @@ function openTask(task: TaskCenterItem) {
 }
 
 @media (max-width: 900px) {
+  .runtime-band {
+    grid-template-columns: 1fr;
+  }
+
   .status-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
@@ -877,6 +962,11 @@ function openTask(task: TaskCenterItem) {
 }
 
 @media (max-width: 420px) {
+  .capacity-facts,
+  .bucket-grid {
+    grid-template-columns: 1fr;
+  }
+
   .status-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }

@@ -495,13 +495,13 @@ AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yiel
 后两者顺序不可交换：两轮消费同一批本地数据，守护轮先落 `guard_events` 台账，
 复核轮的 `pos_ma_break` / `pos_lhb_sell` 推送才不会与它交叉。
 
-### 5.9.1 Task Center Service（Top50 P0-2A/P0-2B-2A）
+### 5.9.1 Task Center Service（Top50 P0-2A/P0-2B-2B）
 
-`GET /api/tasks` 是统一作业与 legacy 异步业务表之上的轻量聚合层：默认按当前用户汇总 `JobRun`、分析、推荐、日报与未迁移的 `llm_tasks`；只有管理员显式传 `include_system=1` 时，才附加没有用户归属的系统同步终态历史。各来源各执行一次有界、字段白名单查询，不读取结果正文或数据快照，且查询 `llm_tasks` 时排除已有 `job_run_id` 的兼容结果。当前接口没有 `partial/degraded_sources` 契约，任一选中来源查询失败会使整个请求失败，调用方保留现有视图并展示错误。
+`GET /api/tasks` 是统一作业与 legacy 异步业务表之上的轻量聚合层：默认按当前用户汇总 JobRun 与未迁移的兼容结果；管理员显式传 `include_system=1` 时，再投影 system JobRun，并只补充 `job_run_id IS NULL` 的 legacy DataSyncLog。系统行以 JobRun ID 执行取消/重跑，以 DataSyncLog ID 定位结果，因而不会双行。各来源各执行一次有界、字段白名单查询，不读取请求/结果正文或数据快照。
 
 所有来源统一映射状态、耗时、错误码、恢复建议与仅含记录 ID 的结果深链。15 分钟未更新且**没有 queued/running JobRun 引用**的 legacy 用户侧 `processing` 任务，才由各自业务服务按同一口径惰性收敛为 `failed`；活跃统一作业即使排队超过 15 分钟也由自身 CAS、取消和恢复规则收敛，旧清理器不得抢写业务结果。顶栏最近任务与运行中数量分别查询，达到 100 条上限时只能展示“至少 N 项”，不能把截断值当精确总数。
 
-P0-2B-1 先让 `qa/compare/position_advice/screener_parse` 获得统一作业能力；P0-2B-2A 再将 `analysis/recommendation/daily_report` 接入同一套 `job_runs/job_steps/job_events`、事实阶段、取消、版本化参数重跑、SSE、bounded worker 与总在途背压。七类用户作业的结果正文仍只保存在原业务事实表中，任务中心通过 `result_type/result_id` 建立深链且排除 legacy 重复行。`data_sync` 的 system owner/管理员触发者双重归属和 `ResearchArtifact` 留待 P0-2B-2B，禁止用 `user_id=0` 伪装用户作业；模型、provider、token、trace 等元数据只在来源真实具备时透传，禁止由摘要层补造进度或可重放请求。
+P0-2B-2B 已将六类系统维护任务接入相同的 JobRun/JobStep/恢复/背压运行时。用户作业 owner 为 `user` 且 `user_id>0`；系统作业 owner 为 `system` 且 `user_id IS NULL`，管理员手动触发另记 `triggered_by`。普通用户只能访问自己的 user JobRun；启用管理员还可审计、取消和失败重跑 system JobRun。`GET /api/admin/jobs/metrics` 仅聚合 kind/status/count、最老 queued_at 和进程容量，不选择 request snapshot。用户七类 SSE 鉴权与续传契约不变；系统任务当前由管理员任务页轮询同一事实，不额外伪造事件进度。
 
 ### 5.10 扩展模块（N/F/T/S/M/P3 批次 + 2026-07 杂项批）
 
@@ -551,7 +551,7 @@ LLM 的角色从「海选者」降级为「解释者/否决者」（listwise 海
 
 关键常量：`maxScanCandidates=48 / maxLLMCandidates=10 / maxPoolIntake=240 / poolSnapshotMax=150`。
 
-生成类 LLM 均为**异步任务**（推荐/日报自 2026-07-14，分析/问答/AI 对比/白话选股自 2026-07-22）。P0-2B-2A 起，`qa / compare / position_advice / screener_parse / analysis / recommendation / daily_report` 七类用户任务进入统一 `JobRun` 有界运行时；原业务表继续保存结果事实和历史深链，提交入口返回原业务记录 ID，不再为分析、推荐或日报启动提交级 goroutine。HTTP 入口只做确定性校验并立即返回；浏览器断开与页面刷新不取消后台模型调用。推荐主调失败时既有量化降级语义保持不变；其他模块按各自失败/降级契约收尾，不用量化结果掩盖上游错误。`data_sync` 与 `ResearchArtifact` 的归属模型仍留待 P0-2B-2B。
+生成类 LLM 均为异步任务。P0-2B-2B 起，七类用户任务以及六类系统数据维护/因子任务进入统一 `JobRun` 有界运行时；原业务表和 DataSyncLog 继续保存结果事实与历史深链。HTTP 入口只做确定性校验并立即返回，浏览器断开与页面刷新不取消后台任务。定时系统生产者遇队列背压使用去重重试器，拒绝时尚未创建 JobRun 或 processing 结果；批任务继续逐项隔离并在统一终态事务保存计数。
 
 策略-来源映射（`strategySources`，对冲「热度榜供给的票恰是风控规则最想排除的票」的结构性矛盾）：
 momentum=涨幅+换手+成交额；pullback=**回调榜**(跌幅升序过滤温和回调)+成交额+涨幅；active=成交额+换手+涨幅；
@@ -626,16 +626,18 @@ value=**低PB榜**(升序滤负PB)+成交额；growth=涨幅+换手+成交额；
 3. **单次调用边界**：模块预算取 `min(用户 max_tokens, 模块上限)`；analysis/recommendation/qa/news=2500，trade_plan/rec_review/rec_bear/daily_report=1500，analysis_review/compare=1000，screener_parse=2000。全部结构化模块最多 1 次 repair，坏输出默认只回灌 600 字（日报 800 字）；业务 prompt 不再用字数、句数或性能型数组条数压缩模型回答，JSON schema、推荐数量、固定角色和逐 ID 映射等业务契约仍保留。Chat 端拒绝 `max_tokens` 时必须携同值改用 `max_completion_tokens`；Responses 始终携带 `max_output_tokens`。两种字段都不支持则失败，禁止删除 token 参数退成无上限生成。
 4. **业务降级边界**：只有推荐维持既有量化降级（ATR 规则计划价、action 恒 watch、置信度 low、`degraded_source=quant_fallback`）；鉴权/路径/配额类确定性错误直接失败。日报两路并行并保留旧报告回滚语义；其他模块按自身失败/结构化降级契约收尾。
 
-### 6.11 统一作业事实（P0-2B-1 / P0-2B-2A）
+### 6.11 统一作业事实与研究工件（P0-2B-1 / P0-2B-2B）
 
-P0-2B-1 首批覆盖 `qa / compare / position_advice / screener_parse`；P0-2B-2A 在同一运行时迁入 `analysis / recommendation / daily_report`。`data_sync` 因 system owner 与管理员触发者双重归属仍留给 P0-2B-2B，禁止用 `user_id=0` 伪造用户作业；统一 `ResearchArtifact` 也尚未落地，因此 P0-2B 仍未整体关闭。
+P0-2B-1/P0-2B-2A 覆盖七类用户任务；P0-2B-2B 在同一运行时加入 `sync_daily_bars / backfill_calendar / snapshot_market / sync_market_wide / init_market_history / factor_rebuild`，并建立一期不可变 `ResearchArtifact`。本节描述代码契约，生产 MySQL、真实队列压力和长任务恢复仍待线上验收。
 
-- **事实模型**：`job_runs` 保存用户、kind、请求 hash、状态、父作业、错误、trace、模型/token/耗时/业务计数及原结果引用；`job_events` 用数据库自增主键提供全局单调 Event-ID。通用四类记录 `queued/dispatch/execute/persist`；分析按实际记录 `collect_data/llm_analysis/trust_review`，推荐记录 `candidate_pool/quant_scoring/llm_selection/quant_fallback/trust_review`，日报记录 `snapshot/dual_generation/finalize`，最后统一进入 `persist`，未发生的步骤不补造。状态仅允许 `queued / running / success / degraded / failed / canceled`，所有终态更新均以当前状态和 `cancel_requested` 为条件做数据库 CAS，终态不能回退。
-- **快照、权限与结果绑定**：`job_runs.request_snapshot` 是版本化、类型化且最大 16KiB 的业务请求，只包含重跑必需参数。创建前拒绝 API Key、Authorization、cookie、prompt、消息数组、数据/结果正文与 `allow_private`。执行、恢复与重跑按当前数据库用户状态和角色重判私网权限，禁用或降权立即生效。`result_type` 支持 `llm_task/analysis/recommendation/daily_report`；业务占位行、JobRun 和引用在同一事务创建，成功事务必须确认引用结果已落终态，不把大结果复制进 JobRun。
-- **幂等与容量**：`(user_id, kind, request_hash)` 派生 `active_key`，仅 queued/running 持有并由唯一索引跨实例防重。运行时固定 4 个 worker、最多 32 个总在途作业，不再按请求无限创建 goroutine；满载不落孤儿 queued 行。用户交互入口稳定返回 `job_queue_busy`；自动日报等周期生产者把它视为瞬时背压，不落永久失败结果，留待下一调度轮重试。
+- **owner 与事实模型**：`job_runs.owner_type` 只允许应用层语义上的 user/system；user 必须绑定正数 `user_id`，system 必须为 SQL NULL，`triggered_by` 只记录管理员手动触发者。JobEvent 继承相同 owner。JobRun 保存 kind、版本化请求、状态、父作业、错误、trace、业务计数和结果引用；步骤只记录真实发生阶段，状态仅允许 `queued/running/success/degraded/failed/canceled`，终态以 CAS 收敛且不可回退。
+- **快照、权限与结果绑定**：request snapshot 最大 16KiB，拒绝密钥、Authorization、prompt/消息和数据/结果正文。`result_type` 支持 `llm_task/analysis/recommendation/daily_report/data_sync`。用户作业执行时重判账号状态/角色；普通用户无法读取、取消或重跑系统 ID，管理员只扩展到 system owner，不借此读取其他用户作业。DataSyncLog processing 占位、JobRun 和引用同事务创建；成功、部分失败、失败或取消均在 JobRun 终态事务更新同一日志，保留已完成计数，不产生第二条结果日志。
+- **幂等与容量**：用户按 owner/kind/request hash 防重，系统按 kind 排他防重；active key 仅 queued/running 持有。运行时固定 4 worker、最多 32 总在途。用户入口满载返回 `job_queue_busy`；系统定时器对该错误去重重试，接受前不建事实行。管理员指标按 kind/status 聚合并显示最老排队与容量，查询禁止选择请求快照。
 - **取消与恢复**：queued 取消用 CAS 直接进入 canceled；running 先持久化 `cancel_requested`，本实例立即取消 Context，其他实例/恢复路径通过数据库轮询协作取消。成功持久化与取消在同一事务条件上竞争，只有一个终态获胜。启动时遗留 running 明确收敛为 `job_interrupted`（已请求取消者收敛 canceled），queued 按 ID 升序恢复，容量外的 queued 保持排队并随槽位释放续排。
-- **重跑**：仅失败且已注册的七类 handler 可重跑。重跑从旧 run 的持久快照创建新 run 并写 `parent_id`，旧 run 不修改；若同用户、同 kind、同请求已有 queued/running 作业，则稳定返回 `job_already_running`，不得复用一个没有该 parent 的在途 run；不支持的 kind 返回明确错误。
+- **重跑**：失败且已注册的用户或系统 handler 可重跑。新 run 从旧快照创建并写 `parent_id`，旧 run 不修改；系统重跑的 `triggered_by` 是执行该动作的管理员。已有等价用户请求或同 kind 系统任务在途时返回 `job_already_running`。
 - **事件与前端**：`GET /api/tasks/events` 位于 JWT 中间件后，支持 `Last-Event-ID`、单调 `id:`、`event: job` 与 15s heartbeat。前端用 `fetch` 的 `Authorization` 请求头读取流，token 从不进入 URL；断线指数重连并保留串行轮询回退。任务中心优先列 JobRun，查询旧 `llm_tasks` 与三类业务表时排除已被 `result_type/result_id` 引用的行，从而避免双行；深链使用业务 `result_id`，旧业务详情路由继续兼容。
+- **ResearchArtifact**：只保存 `type/schema_version/subject/as_of/available_at/content_hash/source_refs/storage_ref/job_run_id/owner/created_at`。分析、推荐、日报在业务结果校验与 JobRun 终态同一事务幂等建索引；hash 从当次已持久事实计算，正文、候选池和快照不复制。历史行不自动回填；扫描/回测当前没有持久结果事实，因此不猜测建索引，待将来先落不可变结果再接线。
+- **保留策略**：每日 03:35 只删除“对应 JobRun 已终态且事件早于 30 天”的 JobEvent。JobRun/request snapshot 为重跑与审计保留，JobStep 随 JobRun 保留，业务快照由原事实表负责，ResearchArtifact 一期永久保留且拒绝更新/删除。任何后续分层归档必须先证明不会切断 parent 重跑、审计和 source/storage 血缘。
 
 ### 6.12 数据覆盖、主动探测与解冷（P0-3A / P0-3B）
 
@@ -699,7 +701,7 @@ AI 结果：
 - `/recommendations`：推荐历史与追踪（策略模板为页内下拉，无独立页）
 - `/qa`：个股 AI 问答
 - `/compare`：个股横向对比
-- `/tasks`：统一任务中心（P0-2B-2A 七类用户 JobRun 支持真实步骤、取消、父子重跑、恢复与 SSE；原业务结果通过引用去重并保留历史深链，`data_sync` 仍为 system legacy 投影）
+- `/tasks`：统一任务中心（P0-2B-2B 七类用户 JobRun 与六类 system JobRun 支持真实步骤、取消、父子重跑、恢复与 SSE；原业务结果和 DataSyncLog 通过引用去重并保留历史深链，legacy 同步日志仅作兼容投影）
 - `/alerts`：提醒规则 + 推送通道
 - `/paper`：模拟交易
 - `/etf`：指数 ETF 交易（精选指数 ETF 行情 + 复用模拟盘买卖，2026-07-05）

@@ -26,6 +26,10 @@ type taskCenterJobs interface {
 	Events(userID, afterID, limit int64) ([]service.JobEventView, error)
 }
 
+type taskCenterMetrics interface {
+	Metrics(actorID int64) (*service.JobRuntimeMetrics, error)
+}
+
 var (
 	taskEventPollInterval      = time.Second
 	taskEventHeartbeatInterval = 15 * time.Second
@@ -33,8 +37,9 @@ var (
 
 // TaskCenterController 提供当前用户跨业务域的只读任务列表。
 type TaskCenterController struct {
-	svc  taskCenterLister
-	jobs taskCenterJobs
+	svc     taskCenterLister
+	jobs    taskCenterJobs
+	metrics taskCenterMetrics
 }
 
 func NewTaskCenterController(svc taskCenterLister) *TaskCenterController {
@@ -42,7 +47,24 @@ func NewTaskCenterController(svc taskCenterLister) *TaskCenterController {
 	if jobs, ok := svc.(taskCenterJobs); ok {
 		controller.jobs = jobs
 	}
+	if metrics, ok := svc.(taskCenterMetrics); ok {
+		controller.metrics = metrics
+	}
 	return controller
+}
+
+// Metrics GET /api/admin/jobs/metrics。聚合查询不选择请求快照或业务正文。
+func (tc *TaskCenterController) Metrics(c *gin.Context) {
+	if tc.metrics == nil {
+		common.ApiErrorMsg(c, "作业指标服务不可用")
+		return
+	}
+	metrics, err := tc.metrics.Metrics(currentUserID(c))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, metrics)
 }
 
 // List GET /api/tasks?source=&kind=&status=&limit=&include_system=1

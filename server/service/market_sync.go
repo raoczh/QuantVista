@@ -589,7 +589,7 @@ func (s *MarketService) RecordMaintenanceFailure(task, market string, audit Sync
 	log.Status = "failed"
 	log.Failed = 1
 	log.Message = truncate(err.Error(), 512)
-	s.recordSyncLog(log)
+	s.recordSyncLog(context.Background(), log)
 }
 
 func applySyncAudit(log *model.DataSyncLog, audit SyncAudit) {
@@ -635,7 +635,7 @@ func (s *MarketService) StartMarketWideInitWithAudit(audit SyncAudit) error {
 	log.Total = 1
 	log.Succeeded = 1
 	log.Message = "已接受全市场历史初始化/续跑请求"
-	s.recordSyncLog(log)
+	s.recordSyncLog(context.Background(), log)
 	return nil
 }
 
@@ -692,7 +692,7 @@ func (s *MarketService) SyncTrackedDailyBarsWithAudit(ctx context.Context, marke
 			log.Message = truncate("任务取消: "+ctx.Err().Error(), 512)
 			log.DurationMs = time.Since(start).Milliseconds()
 			log.Status = statusOf(log)
-			s.recordSyncLog(log)
+			s.recordSyncLog(ctx, log)
 			return log, ctx.Err()
 		default:
 		}
@@ -711,7 +711,7 @@ func (s *MarketService) SyncTrackedDailyBarsWithAudit(ctx context.Context, marke
 	log.DurationMs = time.Since(start).Milliseconds()
 	log.Message = truncate(firstErr, 512)
 	log.Status = statusOf(log)
-	s.recordSyncLog(log)
+	s.recordSyncLog(ctx, log)
 	return log, nil
 }
 
@@ -757,7 +757,7 @@ func (s *MarketService) RunSyncBarsPlan(ctx context.Context, req MaintenanceRequ
 		log.Status = "success"
 		log.Message = "计划内无日线缺口"
 		log.DurationMs = time.Since(start).Milliseconds()
-		s.recordSyncLog(log)
+		s.recordSyncLog(ctx, log)
 		return log, nil
 	}
 
@@ -768,7 +768,7 @@ func (s *MarketService) RunSyncBarsPlan(ctx context.Context, req MaintenanceRequ
 			log.Message = truncate("任务取消: "+err.Error(), 512)
 			log.DurationMs = time.Since(start).Milliseconds()
 			log.Status = statusOf(log)
-			s.recordSyncLog(log)
+			s.recordSyncLog(ctx, log)
 			return log, err
 		}
 		bars, fetchErr := s.mgr.GetDailyBars(ctx, st.Market, st.Symbol, fetchLimit)
@@ -808,7 +808,7 @@ func (s *MarketService) RunSyncBarsPlan(ctx context.Context, req MaintenanceRequ
 		}
 		return "；首错 " + firstErr
 	}(), ""), 512)
-	s.recordSyncLog(log)
+	s.recordSyncLog(ctx, log)
 	return log, nil
 }
 
@@ -835,7 +835,7 @@ func (s *MarketService) BackfillCalendarWithAudit(ctx context.Context, market st
 		log.Status = "failed"
 		log.Message = truncate(err.Error(), 512)
 		log.DurationMs = time.Since(start).Milliseconds()
-		s.recordSyncLog(log)
+		s.recordSyncLog(ctx, log)
 		return log, err
 	}
 
@@ -856,7 +856,7 @@ func (s *MarketService) BackfillCalendarWithAudit(ctx context.Context, market st
 		log.Status = "failed"
 		log.Message = "交易日日期解析失败"
 		log.DurationMs = time.Since(start).Milliseconds()
-		s.recordSyncLog(log)
+		s.recordSyncLog(ctx, log)
 		return log, errors.New(log.Message)
 	}
 
@@ -886,7 +886,7 @@ func (s *MarketService) BackfillCalendarWithAudit(ctx context.Context, market st
 		log.Status = "failed"
 		log.Message = truncate(err.Error(), 512)
 		log.DurationMs = time.Since(start).Milliseconds()
-		s.recordSyncLog(log)
+		s.recordSyncLog(ctx, log)
 		return log, err
 	}
 
@@ -896,7 +896,7 @@ func (s *MarketService) BackfillCalendarWithAudit(ctx context.Context, market st
 	futureWeekends := len(rows) - int(to.Sub(from).Hours()/24) - 1
 	log.Message = truncate(minDate+" ~ "+maxDate+" 共 "+strconv.Itoa(len(rows)-futureWeekends)+" 天（开市 "+strconv.Itoa(len(days))+"）；另预写未来周末休市 "+strconv.Itoa(futureWeekends)+" 天（工作日节假日无数据源，跨长假仍按周一~五近似）", 512)
 	log.DurationMs = time.Since(start).Milliseconds()
-	s.recordSyncLog(log)
+	s.recordSyncLog(ctx, log)
 	return log, nil
 }
 
@@ -921,7 +921,7 @@ func (s *MarketService) RunCalendarPlan(ctx context.Context, req MaintenanceRequ
 		log.Status = "failed"
 		log.Message = truncate(err.Error(), 512)
 		log.DurationMs = time.Since(start).Milliseconds()
-		s.recordSyncLog(log)
+		s.recordSyncLog(ctx, log)
 		return log, err
 	}
 	open := make(map[string]struct{}, len(days))
@@ -954,7 +954,7 @@ func (s *MarketService) RunCalendarPlan(ctx context.Context, req MaintenanceRequ
 		log.Status = "failed"
 		log.Message = truncate(err.Error(), 512)
 		log.DurationMs = time.Since(start).Milliseconds()
-		s.recordSyncLog(log)
+		s.recordSyncLog(ctx, log)
 		return log, err
 	}
 	log.Total = len(prepared.dates)
@@ -963,7 +963,7 @@ func (s *MarketService) RunCalendarPlan(ctx context.Context, req MaintenanceRequ
 	log.Status = statusOf(log)
 	log.Message = truncate(fmt.Sprintf("%s ~ %s：订正 %d 天，未来未知工作日保留 %d 天", prepared.view.From, prepared.view.To, len(rows), unresolved), 512)
 	log.DurationMs = time.Since(start).Milliseconds()
-	s.recordSyncLog(log)
+	s.recordSyncLog(ctx, log)
 	return log, nil
 }
 
@@ -1000,6 +1000,11 @@ func (s *MarketService) SnapshotMarket(ctx context.Context, market string) (*mod
 // SnapshotMarketWithAudit 仅供管理员手动入口：后台 10 分钟快照仍不刷审计表，手动操作
 // 则记录触发者与有限摘要。
 func (s *MarketService) SnapshotMarketWithAudit(ctx context.Context, market string, audit SyncAudit) (*model.MarketSnapshot, error) {
+	snap, _, err := s.runSnapshotMarketWithAudit(ctx, market, audit)
+	return snap, err
+}
+
+func (s *MarketService) runSnapshotMarketWithAudit(ctx context.Context, market string, audit SyncAudit) (*model.MarketSnapshot, *model.DataSyncLog, error) {
 	start := time.Now()
 	snap, err := s.SnapshotMarket(ctx, market)
 	log := newSyncLog("snapshot_market", market, audit)
@@ -1017,8 +1022,8 @@ func (s *MarketService) SnapshotMarketWithAudit(ctx context.Context, market stri
 			log.Message = truncate("市场情绪快照 "+snap.TradeDate, 512)
 		}
 	}
-	s.recordSyncLog(log)
-	return snap, err
+	s.recordSyncLog(ctx, log)
+	return snap, log, err
 }
 
 // sameBreadth 判断两条快照的涨跌家数是否一致（用于去重）。
@@ -1054,8 +1059,14 @@ func (s *MarketService) RecentSyncLogs(limit int) ([]model.DataSyncLog, error) {
 	return logs, err
 }
 
-func (s *MarketService) recordSyncLog(log *model.DataSyncLog) {
+func (s *MarketService) recordSyncLog(ctx context.Context, log *model.DataSyncLog) {
 	if common.DB == nil || log == nil {
+		return
+	}
+	if execution, ok := currentJobExecution(ctx); ok && execution.resultType == JobResultDataSync && execution.resultID != nil {
+		log.ID = *execution.resultID
+		jobID := execution.jobID
+		log.JobRunID = &jobID
 		return
 	}
 	if err := common.DB.Create(log).Error; err != nil {
@@ -1084,7 +1095,7 @@ func statusOf(log *model.DataSyncLog) string {
 //
 // 均为个人自用低频任务，失败仅记日志不影响主流程。
 func StartMarketJobs(mgr *datasource.Manager) {
-	svc := NewMarketService(mgr)
+	_ = mgr
 	const market = "cn"
 
 	// 启动时：日历为空才回填（避免每次重启都全量刷）。
@@ -1097,23 +1108,19 @@ func StartMarketJobs(mgr *datasource.Manager) {
 		if n > 0 {
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if _, err := svc.BackfillCalendar(ctx, market); err != nil {
-			common.SysWarn("启动回填交易日历失败: %v", err)
-		} else {
-			common.SysLog("启动回填交易日历完成")
-		}
+		ScheduleSystemDataSyncJob(JobKindBackfillCalendar, DataSyncJobRequest{
+			Version: dataSyncJobSnapshotVersion, Market: market, TriggerSource: "startup",
+			ParameterSummary: "lookback=" + strconv.Itoa(calendarLookback),
+		})
 	}()
 
 	// 市场情绪快照：每 10 分钟一次。
 	go func() {
 		snapshot := func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			if _, err := svc.SnapshotMarket(ctx, market); err != nil {
-				common.SysDebug("市场情绪快照跳过（数据源不可用）: %v", err)
-			}
+			ScheduleSystemDataSyncJob(JobKindSnapshotMarket, DataSyncJobRequest{
+				Version: dataSyncJobSnapshotVersion, Market: market, TriggerSource: "scheduler",
+				ParameterSummary: "interval=10m",
+			})
 		}
 		snapshot()
 		t := time.NewTicker(10 * time.Minute)
@@ -1130,13 +1137,10 @@ func StartMarketJobs(mgr *datasource.Manager) {
 	// 即便中途取消，游标也保证下一轮从断点续跑。
 	go func() {
 		runSync := func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-			defer cancel()
-			if log, err := svc.SyncTrackedDailyBars(ctx, market, 120); err != nil {
-				common.SysWarn("批量同步日线失败: %v", err)
-			} else if log.Total > 0 {
-				common.SysLog("批量同步日线完成: 共 %d 成功 %d 失败 %d", log.Total, log.Succeeded, log.Failed)
-			}
+			ScheduleSystemDataSyncJob(JobKindSyncDailyBars, DataSyncJobRequest{
+				Version: dataSyncJobSnapshotVersion, Market: market, BarLimit: 120,
+				TriggerSource: "scheduler", ParameterSummary: "bar_limit=120",
+			})
 		}
 		time.Sleep(5 * time.Minute)
 		runSync()
@@ -1157,21 +1161,10 @@ func StartMarketJobs(mgr *datasource.Manager) {
 			return
 		}
 		runWide := func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			if log, err := svc.SyncMarketWide(ctx); err != nil && !errors.Is(err, ErrSyncInProgress) {
-				common.SysWarn("全市场日线增量失败: %v", err)
-			} else if log != nil {
-				common.SysLog("全市场日线增量完成: %s", log.Message)
-			}
-			cancel()
-			var pending int64
-			common.DB.Model(&model.MarketSyncState{}).
-				Where("market = ? AND init_status = ?", market, "pending").Count(&pending)
-			if pending > 0 {
-				if err := svc.StartMarketWideInit(); err == nil {
-					common.SysLog("宇宙内尚有 %d 只待建史，已自动启动历史初始化", pending)
-				}
-			}
+			ScheduleSystemDataSyncJob(JobKindSyncMarketWide, DataSyncJobRequest{
+				Version: dataSyncJobSnapshotVersion, Market: market, TriggerSource: "scheduler",
+				ParameterSummary: "scheduled_at=16:10",
+			})
 		}
 		if now := time.Now(); isTradingDayToday(now) && now.Hour()*60+now.Minute() >= 16*60+10 {
 			var n int64
