@@ -499,7 +499,7 @@ AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yiel
 
 `GET /api/tasks` 是统一作业与 legacy 异步业务表之上的轻量聚合层：默认按当前用户汇总 `JobRun`、分析、推荐、日报与未迁移的 `llm_tasks`；只有管理员显式传 `include_system=1` 时，才附加没有用户归属的系统同步终态历史。各来源各执行一次有界、字段白名单查询，不读取结果正文或数据快照，且查询 `llm_tasks` 时排除已有 `job_run_id` 的兼容结果。当前接口没有 `partial/degraded_sources` 契约，任一选中来源查询失败会使整个请求失败，调用方保留现有视图并展示错误。
 
-所有来源统一映射状态、耗时、错误码、恢复建议与仅含记录 ID 的结果深链。15 分钟未更新的 legacy 用户侧 `processing` 任务由各自业务服务按同一口径惰性收敛为 `failed`；`JobRun` 则由自身 CAS、取消和恢复规则收敛。顶栏最近任务与运行中数量分别查询，达到 100 条上限时只能展示“至少 N 项”，不能把截断值当精确总数。
+所有来源统一映射状态、耗时、错误码、恢复建议与仅含记录 ID 的结果深链。15 分钟未更新且**没有 queued/running JobRun 引用**的 legacy 用户侧 `processing` 任务，才由各自业务服务按同一口径惰性收敛为 `failed`；活跃统一作业即使排队超过 15 分钟也由自身 CAS、取消和恢复规则收敛，旧清理器不得抢写业务结果。顶栏最近任务与运行中数量分别查询，达到 100 条上限时只能展示“至少 N 项”，不能把截断值当精确总数。
 
 P0-2B-1 先让 `qa/compare/position_advice/screener_parse` 获得统一作业能力；P0-2B-2A 再将 `analysis/recommendation/daily_report` 接入同一套 `job_runs/job_steps/job_events`、事实阶段、取消、版本化参数重跑、SSE、bounded worker 与总在途背压。七类用户作业的结果正文仍只保存在原业务事实表中，任务中心通过 `result_type/result_id` 建立深链且排除 legacy 重复行。`data_sync` 的 system owner/管理员触发者双重归属和 `ResearchArtifact` 留待 P0-2B-2B，禁止用 `user_id=0` 伪装用户作业；模型、provider、token、trace 等元数据只在来源真实具备时透传，禁止由摘要层补造进度或可重放请求。
 
@@ -632,7 +632,7 @@ P0-2B-1 首批覆盖 `qa / compare / position_advice / screener_parse`；P0-2B-2
 
 - **事实模型**：`job_runs` 保存用户、kind、请求 hash、状态、父作业、错误、trace、模型/token/耗时/业务计数及原结果引用；`job_events` 用数据库自增主键提供全局单调 Event-ID。通用四类记录 `queued/dispatch/execute/persist`；分析按实际记录 `collect_data/llm_analysis/trust_review`，推荐记录 `candidate_pool/quant_scoring/llm_selection/quant_fallback/trust_review`，日报记录 `snapshot/dual_generation/finalize`，最后统一进入 `persist`，未发生的步骤不补造。状态仅允许 `queued / running / success / degraded / failed / canceled`，所有终态更新均以当前状态和 `cancel_requested` 为条件做数据库 CAS，终态不能回退。
 - **快照、权限与结果绑定**：`job_runs.request_snapshot` 是版本化、类型化且最大 16KiB 的业务请求，只包含重跑必需参数。创建前拒绝 API Key、Authorization、cookie、prompt、消息数组、数据/结果正文与 `allow_private`。执行、恢复与重跑按当前数据库用户状态和角色重判私网权限，禁用或降权立即生效。`result_type` 支持 `llm_task/analysis/recommendation/daily_report`；业务占位行、JobRun 和引用在同一事务创建，成功事务必须确认引用结果已落终态，不把大结果复制进 JobRun。
-- **幂等与容量**：`(user_id, kind, request_hash)` 派生 `active_key`，仅 queued/running 持有并由唯一索引跨实例防重。运行时固定 4 个 worker、最多 32 个总在途作业，不再按请求无限创建 goroutine；满载不落孤儿 queued 行。
+- **幂等与容量**：`(user_id, kind, request_hash)` 派生 `active_key`，仅 queued/running 持有并由唯一索引跨实例防重。运行时固定 4 个 worker、最多 32 个总在途作业，不再按请求无限创建 goroutine；满载不落孤儿 queued 行。用户交互入口稳定返回 `job_queue_busy`；自动日报等周期生产者把它视为瞬时背压，不落永久失败结果，留待下一调度轮重试。
 - **取消与恢复**：queued 取消用 CAS 直接进入 canceled；running 先持久化 `cancel_requested`，本实例立即取消 Context，其他实例/恢复路径通过数据库轮询协作取消。成功持久化与取消在同一事务条件上竞争，只有一个终态获胜。启动时遗留 running 明确收敛为 `job_interrupted`（已请求取消者收敛 canceled），queued 按 ID 升序恢复，容量外的 queued 保持排队并随槽位释放续排。
 - **重跑**：仅失败且已注册的七类 handler 可重跑。重跑从旧 run 的持久快照创建新 run 并写 `parent_id`，旧 run 不修改；若同用户、同 kind、同请求已有 queued/running 作业，则稳定返回 `job_already_running`，不得复用一个没有该 parent 的在途 run；不支持的 kind 返回明确错误。
 - **事件与前端**：`GET /api/tasks/events` 位于 JWT 中间件后，支持 `Last-Event-ID`、单调 `id:`、`event: job` 与 15s heartbeat。前端用 `fetch` 的 `Authorization` 请求头读取流，token 从不进入 URL；断线指数重连并保留串行轮询回退。任务中心优先列 JobRun，查询旧 `llm_tasks` 与三类业务表时排除已被 `result_type/result_id` 引用的行，从而避免双行；深链使用业务 `result_id`，旧业务详情路由继续兼容。

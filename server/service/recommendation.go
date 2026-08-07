@@ -580,6 +580,8 @@ func expireStaleRecommendationBatches(userID int64) error {
 	return common.DB.Model(&model.RecommendationBatch{}).
 		Where("user_id = ? AND status = ? AND updated_at < ?",
 			userID, model.RecStatusProcessing, now.Add(-taskProcessingStaleAfter)).
+		Where("NOT EXISTS (SELECT 1 FROM job_runs jr WHERE jr.user_id = recommendation_batches.user_id AND jr.result_type = ? AND jr.result_id = recommendation_batches.id AND jr.status IN ?)",
+			JobResultRecommendation, []string{model.JobStatusQueued, model.JobStatusRunning}).
 		Updates(map[string]any{
 			"status":     model.RecStatusFailed,
 			"error":      "任务中断（服务重启或执行超时），请重新生成",

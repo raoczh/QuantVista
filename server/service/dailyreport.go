@@ -129,6 +129,8 @@ func expireStaleDailyReports(userID int64) error {
 	return common.DB.Model(&model.DailyReport{}).
 		Where("user_id = ? AND status = ? AND updated_at < ?",
 			userID, model.ReportStatusProcessing, now.Add(-taskProcessingStaleAfter)).
+		Where("NOT EXISTS (SELECT 1 FROM job_runs jr WHERE jr.user_id = daily_reports.user_id AND jr.result_type = ? AND jr.result_id = daily_reports.id AND jr.status IN ?)",
+			JobResultDailyReport, []string{model.JobStatusQueued, model.JobStatusRunning}).
 		Updates(map[string]any{
 			"status":     model.ReportStatusFailed,
 			"error":      "任务中断（服务重启或执行超时），请重新生成日报",
@@ -1022,21 +1024,34 @@ func (s *DailyReportService) runAutoOnce(ctx context.Context) {
 			continue
 		}
 		cctx, cancel := context.WithTimeout(ctx, 8*time.Minute)
-		if _, err := s.GenerateFor(cctx, uid, false); err != nil {
-			common.SysWarn("用户 %d 日报生成失败: %v", uid, err)
-			// 失败落一条 failed 记录，避免每 10 分钟反复重试烧 token。生成流程可能已
-			// 自建行（processing→failed 回写），已有行时跳过（user+trade_date 唯一）。
-			var fcnt int64
-			common.DB.Model(&model.DailyReport{}).Where("user_id = ? AND trade_date = ?", uid, date).Count(&fcnt)
-			if fcnt == 0 {
-				common.DB.Create(&model.DailyReport{
-					UserID: uid, TradeDate: date, Market: "cn",
-					Status: model.ReportStatusFailed, Error: truncateRunes(err.Error(), 500),
-				})
-			}
-		} else {
-			common.SysLog("用户 %d 收盘日报已生成", uid)
-		}
+		_, err := s.GenerateFor(cctx, uid, false)
 		cancel()
+		if err != nil {
+			common.SysWarn("用户 %d 日报生成失败: %v", uid, err)
+			recordAutoDailyFailure(uid, date, err)
+		} else {
+			common.SysLog("用户 %d 收盘日报已进入生成队列", uid)
+		}
+	}
+}
+
+func recordAutoDailyFailure(userID int64, date string, err error) {
+	if err == nil {
+		return
+	}
+	// 队列容量是瞬时背压，不是用户日报的业务失败。此时 JobRun 和结果行都
+	// 尚未创建，保留“当日无报告”才能让下一轮 10 分钟调度继续尝试。
+	if errors.Is(err, ErrJobQueueBusy) {
+		return
+	}
+	// 确定性失败落一条 failed 记录，避免每 10 分钟反复重试烧 token。生成流程可能
+	// 已自建行（processing→failed 回写），已有行时跳过（user+trade_date 唯一）。
+	var count int64
+	common.DB.Model(&model.DailyReport{}).Where("user_id = ? AND trade_date = ?", userID, date).Count(&count)
+	if count == 0 {
+		common.DB.Create(&model.DailyReport{
+			UserID: userID, TradeDate: date, Market: "cn",
+			Status: model.ReportStatusFailed, Error: truncateRunes(err.Error(), 500),
+		})
 	}
 }

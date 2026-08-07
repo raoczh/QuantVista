@@ -247,11 +247,26 @@ func TestTaskCenterConvergesStaleTasksForCurrentUser(t *testing.T) {
 	freshRec := &model.RecommendationBatch{UserID: 1, Type: model.RecTypeLongTerm, Status: model.RecStatusProcessing, CreatedAt: fresh, UpdatedAt: fresh}
 	oldReport := &model.DailyReport{UserID: 1, TradeDate: "2026-08-01", Status: model.ReportStatusProcessing, CreatedAt: old, UpdatedAt: old}
 	freshReport := &model.DailyReport{UserID: 1, TradeDate: "2026-08-02", Status: model.ReportStatusProcessing, CreatedAt: fresh, UpdatedAt: fresh}
+	activeAnalysis := &model.AnalysisRecord{UserID: 1, Module: model.AnalysisModulePosition, Status: model.AnalysisStatusProcessing, CreatedAt: old, UpdatedAt: old}
+	activeRec := &model.RecommendationBatch{UserID: 1, Type: model.RecTypeShortTerm, Status: model.RecStatusProcessing, CreatedAt: old, UpdatedAt: old}
+	activeReport := &model.DailyReport{UserID: 1, TradeDate: "2026-08-03", Status: model.ReportStatusProcessing, CreatedAt: old, UpdatedAt: old}
 	oldLLM := &model.LLMTask{UserID: 1, Kind: "qa", RequestHash: "old", Status: model.LLMTaskStatusProcessing, CreatedAt: old, UpdatedAt: old}
 	freshLLM := &model.LLMTask{UserID: 1, Kind: "compare", RequestHash: "fresh", Status: model.LLMTaskStatusProcessing, CreatedAt: fresh, UpdatedAt: fresh}
 	otherUser := &model.AnalysisRecord{UserID: 2, Module: model.AnalysisModuleStock, Status: model.AnalysisStatusProcessing, CreatedAt: old, UpdatedAt: old}
-	for _, row := range []any{oldAnalysis, freshAnalysis, oldRec, freshRec, oldReport, freshReport, oldLLM, freshLLM, otherUser} {
+	for _, row := range []any{oldAnalysis, freshAnalysis, oldRec, freshRec, oldReport, freshReport,
+		activeAnalysis, activeRec, activeReport, oldLLM, freshLLM, otherUser} {
 		createTaskCenterRow(t, row)
+	}
+	activeResultIDs := []int64{activeAnalysis.ID, activeRec.ID, activeReport.ID}
+	activeResultTypes := []string{JobResultAnalysis, JobResultRecommendation, JobResultDailyReport}
+	for i := range activeResultIDs {
+		resultID := activeResultIDs[i]
+		activeKey := fmt.Sprintf("active-stale-%d", i)
+		createTaskCenterRow(t, &model.JobRun{
+			UserID: 1, Kind: activeResultTypes[i], RequestHash: activeKey, ActiveKey: &activeKey,
+			Status: model.JobStatusQueued, RequestSnapshot: `{}`, ResultType: activeResultTypes[i],
+			ResultID: &resultID, QueuedAt: old, CreatedAt: old, UpdatedAt: old,
+		})
 	}
 
 	items, err := NewTaskCenterService().List(1, model.RoleUser, TaskCenterListOptions{})
@@ -293,6 +308,18 @@ func TestTaskCenterConvergesStaleTasksForCurrentUser(t *testing.T) {
 	var other model.AnalysisRecord
 	if err := common.DB.First(&other, otherUser.ID).Error; err != nil || other.Status != model.AnalysisStatusProcessing {
 		t.Fatalf("清理不得影响其他用户: row=%+v err=%v", other, err)
+	}
+	var persistedActiveAnalysis model.AnalysisRecord
+	if err := common.DB.First(&persistedActiveAnalysis, activeAnalysis.ID).Error; err != nil || persistedActiveAnalysis.Status != model.AnalysisStatusProcessing {
+		t.Fatalf("活跃 JobRun 引用的分析结果不得被 stale 清理: row=%+v err=%v", persistedActiveAnalysis, err)
+	}
+	var persistedActiveRec model.RecommendationBatch
+	if err := common.DB.First(&persistedActiveRec, activeRec.ID).Error; err != nil || persistedActiveRec.Status != model.RecStatusProcessing {
+		t.Fatalf("活跃 JobRun 引用的推荐结果不得被 stale 清理: row=%+v err=%v", persistedActiveRec, err)
+	}
+	var persistedActiveReport model.DailyReport
+	if err := common.DB.First(&persistedActiveReport, activeReport.ID).Error; err != nil || persistedActiveReport.Status != model.ReportStatusProcessing {
+		t.Fatalf("活跃 JobRun 引用的日报结果不得被 stale 清理: row=%+v err=%v", persistedActiveReport, err)
 	}
 	var persistedAnalysis model.AnalysisRecord
 	if err := common.DB.First(&persistedAnalysis, oldAnalysis.ID).Error; err != nil ||

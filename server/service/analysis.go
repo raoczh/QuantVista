@@ -543,6 +543,8 @@ func expireStaleAnalyses(userID int64) error {
 	now := time.Now()
 	return common.DB.Model(&model.AnalysisRecord{}).
 		Where("user_id = ? AND status = ? AND updated_at < ?", userID, model.AnalysisStatusProcessing, now.Add(-taskProcessingStaleAfter)).
+		Where("NOT EXISTS (SELECT 1 FROM job_runs jr WHERE jr.user_id = analysis_records.user_id AND jr.result_type = ? AND jr.result_id = analysis_records.id AND jr.status IN ?)",
+			JobResultAnalysis, []string{model.JobStatusQueued, model.JobStatusRunning}).
 		Updates(map[string]any{
 			"status":     model.AnalysisStatusFailed,
 			"summary":    "分析失败",

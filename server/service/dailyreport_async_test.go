@@ -290,3 +290,27 @@ func TestDailyReportNonTradingDayRejected(t *testing.T) {
 		t.Fatalf("非交易日应被拒: err=%v", err)
 	}
 }
+
+func TestAutoDailyQueueBusyRemainsRetryable(t *testing.T) {
+	setupTestDB(t)
+	const userID int64 = 56
+	date := time.Now().Format("2006-01-02")
+	common.DB.Where("user_id = ? AND trade_date = ?", userID, date).Delete(&model.DailyReport{})
+	t.Cleanup(func() {
+		common.DB.Where("user_id = ? AND trade_date = ?", userID, date).Delete(&model.DailyReport{})
+	})
+
+	recordAutoDailyFailure(userID, date, ErrJobQueueBusy)
+	var count int64
+	common.DB.Model(&model.DailyReport{}).Where("user_id = ? AND trade_date = ?", userID, date).Count(&count)
+	if count != 0 {
+		t.Fatalf("队列背压不得落永久失败日报，下一轮必须仍可重试: count=%d", count)
+	}
+
+	recordAutoDailyFailure(userID, date, errors.New("未配置可用的 LLM"))
+	var report model.DailyReport
+	if err := common.DB.Where("user_id = ? AND trade_date = ?", userID, date).First(&report).Error; err != nil ||
+		report.Status != model.ReportStatusFailed || !strings.Contains(report.Error, "LLM") {
+		t.Fatalf("确定性失败仍应落失败日报防止反复执行: row=%+v err=%v", report, err)
+	}
+}

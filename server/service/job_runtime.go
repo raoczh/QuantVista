@@ -214,7 +214,7 @@ func (r *jobRuntime) registerWithBinding(kind string, timeout time.Duration, han
 	r.mu.Unlock()
 }
 
-// StartJobRuntime 在四类 handler 完成注册后调用。running 作业在启动边界收敛，
+// StartJobRuntime 在全部用户作业 handler 完成注册后调用。running 作业在启动边界收敛，
 // queued 作业按 ID 升序重新进入有界队列；超出容量的行保持 queued，槽位释放后续排。
 func StartJobRuntime() {
 	defaultJobRuntime.startWorkers()
