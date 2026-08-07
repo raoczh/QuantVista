@@ -17,6 +17,8 @@ import {
   NGi,
   NRadioGroup,
   NRadioButton,
+  NModal,
+  NAlert,
   useMessage,
 } from 'naive-ui'
 import {
@@ -27,6 +29,7 @@ import {
   deleteAlert,
   evaluateAlerts,
   listAlertEvents,
+  getAlertEvent,
   setAlertEventStatus,
   readAllAlertEvents,
   isPositionAlertKind,
@@ -320,6 +323,7 @@ onMounted(async () => {
   // 从自选/持仓「设提醒」跳转预填。
   applyStockActionQuery()
   await Promise.all([load(), loadChannels(), loadEvents()])
+  await openRouteEvent()
 })
 
 // ---------- 命中历史（明细事件状态机） ----------
@@ -380,6 +384,102 @@ const kindLabelMap: Record<string, string> = {
   cost_gain: '成本止盈',
   cost_drawdown: '成本止损',
   peak_drawdown: '移动止盈',
+}
+
+// ---------- 命中详情深链 ----------
+const detailOpen = ref(false)
+const detailLoading = ref(false)
+const selectedEvent = ref<AlertEvent | null>(null)
+let detailSeq = 0
+
+function routeEventID(): number | null {
+  const raw = Array.isArray(route.query.event_id) ? route.query.event_id[0] : route.query.event_id
+  const id = Number(raw)
+  return Number.isSafeInteger(id) && id > 0 ? id : null
+}
+
+async function openRouteEvent() {
+  const id = routeEventID()
+  if (!id) {
+    detailOpen.value = false
+    selectedEvent.value = null
+    return
+  }
+  const seq = ++detailSeq
+  detailLoading.value = true
+  try {
+    const event = await getAlertEvent(id)
+    if (seq !== detailSeq || routeEventID() !== id) return
+    selectedEvent.value = event
+    detailOpen.value = true
+  } catch (e) {
+    if (seq !== detailSeq || routeEventID() !== id) return
+    selectedEvent.value = null
+    detailOpen.value = false
+    message.error((e as Error).message)
+  } finally {
+    if (seq === detailSeq) detailLoading.value = false
+  }
+}
+
+function openEventDetail(event: AlertEvent) {
+  selectedEvent.value = event
+  detailOpen.value = true
+  void router.push(event.deep_link)
+}
+
+function closeEventDetail() {
+  detailSeq++
+  detailOpen.value = false
+  selectedEvent.value = null
+  const query = { ...route.query }
+  delete query.event_id
+  void router.replace({ name: 'alerts', query })
+}
+
+watch(() => route.query.event_id, () => void openRouteEvent())
+
+const triggerFieldLabels: Record<string, string> = {
+  'quote.price': '现价',
+  'quote.high': '当日最高',
+  'quote.low': '当日最低',
+  'quote.change_pct': '当日涨跌幅',
+  'indicator.volume_ratio': '成交量倍数',
+  'indicator.amplitude': '当日振幅',
+  'position.cost_gain_pct': '相对成本涨幅',
+  'position.cost_drawdown_pct': '相对成本跌幅',
+  'position.peak_drawdown_pct': '自峰值回撤',
+  'financial.days_to_disclosure': '距披露日',
+  'financial.notice_date': '新业绩预告',
+  'financial.forecast_amp_lower': '预告变动下限',
+}
+function triggerFieldLabel(field: string) {
+  return triggerFieldLabels[field] || field
+}
+function operatorLabel(op?: string) {
+  if (op === 'gte') return '≥'
+  if (op === 'lte') return '≤'
+  if (op === 'new_fact') return '发现新事实'
+  return op || ''
+}
+function contextNumber(value: number | undefined, unit = '') {
+  if (value == null) return 'unknown'
+  return `${Number(value.toFixed(4))}${unit}`
+}
+function contextTime(value?: string) {
+  if (!value) return 'unknown'
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString('zh-CN', { hour12: false })
+}
+function metricLabel(name: string) {
+  const labels: Record<string, string> = {
+    moving_average: '移动平均线',
+    previous_high: '前期高点',
+    previous_low: '前期低点',
+    volume_ratio: '成交量倍数',
+    amplitude: '振幅',
+  }
+  return labels[name] || name
 }
 
 // ---------- 推送通道 ----------
@@ -671,6 +771,7 @@ function channelKindLabel(k: string) {
                   <div class="ev-time">{{ fmtTime(ev.triggered_at) }}</div>
                 </div>
                 <div class="ev-actions">
+                  <n-button size="tiny" quaternary @click="openEventDetail(ev)">详情</n-button>
                   <template v-if="ev.status === 'unread'">
                     <n-button size="tiny" quaternary @click="markEvent(ev, 'read')">已读</n-button>
                     <n-button size="tiny" quaternary @click="markEvent(ev, 'dismissed')">忽略</n-button>
@@ -683,6 +784,107 @@ function channelKindLabel(k: string) {
         </SectionCard>
       </div>
     </div>
+
+    <n-modal
+      :show="detailOpen"
+      preset="card"
+      title="提醒命中详情"
+      class="event-detail-modal"
+      :style="{ width: 'min(680px, calc(100vw - 24px))' }"
+      @update:show="(show) => !show && closeEventDetail()"
+    >
+      <n-spin :show="detailLoading">
+        <template v-if="selectedEvent">
+          <div class="detail-head">
+            <div>
+              <strong>{{ selectedEvent.name || selectedEvent.symbol }}</strong>
+              <span class="detail-symbol qv-mono">{{ selectedEvent.symbol }}</span>
+            </div>
+            <n-tag size="small" :type="eventStatusTag(selectedEvent.status).type">
+              {{ eventStatusTag(selectedEvent.status).text }}
+            </n-tag>
+          </div>
+          <div class="detail-reason">{{ selectedEvent.message }}</div>
+          <div class="detail-meta">命中于 {{ fmtTime(selectedEvent.triggered_at) }}</div>
+
+          <template v-if="selectedEvent.context_available && selectedEvent.context">
+            <div class="detail-section">
+              <div class="detail-section-title">触发判断</div>
+              <div class="detail-grid">
+                <span>使用字段</span><b>{{ triggerFieldLabel(selectedEvent.context.trigger.field) }}</b>
+                <span>实际值</span><b class="qv-tnum">{{ selectedEvent.context.trigger.value == null ? '见下方财报事实' : contextNumber(selectedEvent.context.trigger.value, selectedEvent.context.trigger.unit) }}</b>
+                <span>判断条件</span><b class="qv-tnum">{{ operatorLabel(selectedEvent.context.trigger.operator) }}<template v-if="selectedEvent.context.trigger.threshold != null"> {{ contextNumber(selectedEvent.context.trigger.threshold, selectedEvent.context.trigger.unit) }}</template></b>
+                <span>数据时点</span><b>{{ contextTime(selectedEvent.context.as_of) }}</b>
+                <span>数据来源</span><b>{{ selectedEvent.context.source || 'unknown' }}</b>
+              </div>
+            </div>
+
+            <div v-if="selectedEvent.context.quote" class="detail-section">
+              <div class="detail-section-title">行情快照</div>
+              <div class="detail-grid">
+                <span>现价</span><b class="qv-tnum">{{ contextNumber(selectedEvent.context.quote.price, ' 元') }}</b>
+                <span>最高 / 最低</span><b class="qv-tnum">{{ contextNumber(selectedEvent.context.quote.high, ' 元') }} / {{ contextNumber(selectedEvent.context.quote.low, ' 元') }}</b>
+                <span>涨跌幅</span><b class="qv-tnum">{{ contextNumber(selectedEvent.context.quote.change_pct, '%') }}</b>
+                <span>来源 / 时点</span><b>{{ selectedEvent.context.quote.source || 'unknown' }} / {{ contextTime(selectedEvent.context.quote.as_of) }}</b>
+              </div>
+            </div>
+
+            <div v-if="selectedEvent.context.bar" class="detail-section">
+              <div class="detail-section-title">日线依据</div>
+              <div class="detail-grid">
+                <span>交易日</span><b>{{ selectedEvent.context.bar.trade_date || 'unknown' }}</b>
+                <span>开 / 高 / 低 / 收</span><b class="qv-tnum">{{ contextNumber(selectedEvent.context.bar.open) }} / {{ contextNumber(selectedEvent.context.bar.high) }} / {{ contextNumber(selectedEvent.context.bar.low) }} / {{ contextNumber(selectedEvent.context.bar.close) }}</b>
+                <span>样本数</span><b class="qv-tnum">{{ selectedEvent.context.bar.sample_size ?? 'unknown' }}</b>
+                <span>数据来源</span><b>{{ selectedEvent.context.bar.source || 'unknown' }}</b>
+              </div>
+            </div>
+
+            <div v-if="selectedEvent.context.indicator" class="detail-section">
+              <div class="detail-section-title">技术指标</div>
+              <div class="detail-grid">
+                <span>指标</span><b>{{ metricLabel(selectedEvent.context.indicator.name) }}<template v-if="selectedEvent.context.indicator.period">（{{ selectedEvent.context.indicator.period }} 日）</template></b>
+                <span>指标值</span><b class="qv-tnum">{{ contextNumber(selectedEvent.context.indicator.value, selectedEvent.context.indicator.unit) }}</b>
+                <span v-if="selectedEvent.context.indicator.reference != null">参考值</span><b v-if="selectedEvent.context.indicator.reference != null" class="qv-tnum">{{ contextNumber(selectedEvent.context.indicator.reference) }}</b>
+                <span>来源 / 时点</span><b>{{ selectedEvent.context.indicator.source || 'unknown' }} / {{ contextTime(selectedEvent.context.indicator.as_of) }}</b>
+              </div>
+            </div>
+
+            <div v-if="selectedEvent.context.position" class="detail-section">
+              <div class="detail-section-title">持仓事实</div>
+              <div class="detail-grid">
+                <span>持仓记录</span><b class="qv-mono">#{{ selectedEvent.context.position.position_id }}</b>
+                <span>持仓成本</span><b class="qv-tnum">{{ contextNumber(selectedEvent.context.position.avg_cost, ' 元') }}</b>
+                <template v-if="selectedEvent.context.position.peak_price != null">
+                  <span>持仓期峰值</span><b class="qv-tnum">{{ contextNumber(selectedEvent.context.position.peak_price, ' 元') }}<template v-if="selectedEvent.context.position.peak_date">（{{ selectedEvent.context.position.peak_date }}）</template></b>
+                </template>
+              </div>
+            </div>
+
+            <div v-if="selectedEvent.context.financial" class="detail-section">
+              <div class="detail-section-title">财报事实</div>
+              <div class="detail-grid">
+                <span>事实类型</span><b>{{ selectedEvent.context.financial.fact_type === 'disclosure_schedule' ? '预约披露' : '业绩预告' }}</b>
+                <span v-if="selectedEvent.context.financial.report_date">报告期</span><b v-if="selectedEvent.context.financial.report_date">{{ selectedEvent.context.financial.report_date }}</b>
+                <span v-if="selectedEvent.context.financial.appoint_date">预约披露日</span><b v-if="selectedEvent.context.financial.appoint_date">{{ selectedEvent.context.financial.appoint_date }}</b>
+                <span v-if="selectedEvent.context.financial.notice_date">预告发布日期</span><b v-if="selectedEvent.context.financial.notice_date">{{ selectedEvent.context.financial.notice_date }}</b>
+                <span v-if="selectedEvent.context.financial.report_type">报告类型</span><b v-if="selectedEvent.context.financial.report_type">{{ selectedEvent.context.financial.report_type }}</b>
+                <span v-if="selectedEvent.context.financial.predict_type">预告类型</span><b v-if="selectedEvent.context.financial.predict_type">{{ selectedEvent.context.financial.predict_type }}</b>
+                <span v-if="selectedEvent.context.financial.predict_finance">预测指标</span><b v-if="selectedEvent.context.financial.predict_finance">{{ selectedEvent.context.financial.predict_finance }}</b>
+                <span v-if="selectedEvent.context.financial.amp_lower != null || selectedEvent.context.financial.amp_upper != null">预计变动</span><b v-if="selectedEvent.context.financial.amp_lower != null || selectedEvent.context.financial.amp_upper != null" class="qv-tnum">{{ contextNumber(selectedEvent.context.financial.amp_lower, '%') }} 至 {{ contextNumber(selectedEvent.context.financial.amp_upper, '%') }}</b>
+                <span>来源 / 时点</span><b>{{ selectedEvent.context.financial.source || 'unknown' }} / {{ contextTime(selectedEvent.context.financial.as_of) }}</b>
+              </div>
+            </div>
+
+            <div v-if="selectedEvent.context.unknown?.length" class="detail-unknown">
+              未取得：{{ selectedEvent.context.unknown.join('、') }}
+            </div>
+          </template>
+          <n-alert v-else type="default" :bordered="false" title="命中上下文不可用">
+            这是旧版事件或快照版本不可识别，仍保留原命中说明和时间。
+          </n-alert>
+        </template>
+      </n-spin>
+    </n-modal>
   </PageContainer>
 </template>
 
@@ -897,5 +1099,56 @@ function channelKindLabel(k: string) {
   align-items: center;
   gap: 4px;
   flex-shrink: 0;
+}
+.detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.detail-symbol {
+  margin-left: 8px;
+  font-size: 12px;
+  opacity: 0.55;
+}
+.detail-reason {
+  margin-top: 10px;
+  font-size: 14px;
+  line-height: 1.6;
+}
+.detail-meta,
+.detail-unknown {
+  margin-top: 5px;
+  font-size: 12px;
+  opacity: 0.6;
+}
+.detail-section {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid v-bind('vars.dividerColor');
+}
+.detail-section-title {
+  margin-bottom: 9px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.detail-grid {
+  display: grid;
+  grid-template-columns: 100px minmax(0, 1fr);
+  gap: 8px 12px;
+  font-size: 13px;
+}
+.detail-grid > span {
+  opacity: 0.58;
+}
+.detail-grid > b {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 500;
+}
+@media (max-width: 480px) {
+  .detail-grid {
+    grid-template-columns: 84px minmax(0, 1fr);
+  }
 }
 </style>

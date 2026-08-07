@@ -204,6 +204,12 @@ func TestEvaluateEarnRulesForUser(t *testing.T) {
 	if len(events) != 2 {
 		t.Fatalf("应落 2 条命中事件, got %d", len(events))
 	}
+	for _, event := range events {
+		ctx, ok := parseAlertEventContext(event.ContextVersion, event.ContextJSON)
+		if !ok || ctx.Financial == nil || ctx.Source != "finance_cache" {
+			t.Fatalf("财报事件必须固化结构化事实: event=%+v ctx=%+v", event, ctx)
+		}
+	}
 	// once 规则命中后置 triggered。
 	var r1 model.AlertRule
 	common.DB.First(&r1, rules[0].ID)

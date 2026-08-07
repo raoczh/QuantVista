@@ -92,6 +92,10 @@ export interface AlertEvent {
   name: string
   kind: AlertKind
   message: string
+  context_version: number
+  context_available: boolean
+  context?: AlertEventContext
+  deep_link: string
   trade_date: string // 命中所属交易日（去重键的一部分；旧事件为空串）
   position_id: number // 持仓类命中的那一笔持仓（其余恒 0）
   triggered_at: string
@@ -100,8 +104,83 @@ export interface AlertEvent {
   updated_at: string
 }
 
+export interface AlertEventContext {
+  version: number
+  rule: {
+    kind: string
+    operator?: string
+    threshold?: number
+    period?: number
+  }
+  trigger: {
+    field: string
+    value?: number
+    threshold?: number
+    operator?: string
+    unit?: string
+    reason: string
+  }
+  quote?: {
+    price?: number
+    open?: number
+    high?: number
+    low?: number
+    prev_close?: number
+    change_pct?: number
+    volume?: number
+    source?: string
+    as_of?: string
+  }
+  bar?: {
+    trade_date?: string
+    open?: number
+    high?: number
+    low?: number
+    close?: number
+    volume?: number
+    source?: string
+    sample_size?: number
+  }
+  indicator?: {
+    name: string
+    value?: number
+    reference?: number
+    period?: number
+    unit?: string
+    source?: string
+    as_of?: string
+  }
+  position?: {
+    position_id: number
+    avg_cost?: number
+    peak_price?: number
+    peak_date?: string
+    peak_from?: string
+  }
+  financial?: {
+    fact_type: string
+    report_date?: string
+    appoint_date?: string
+    notice_date?: string
+    report_type?: string
+    predict_type?: string
+    predict_finance?: string
+    amp_lower?: number
+    amp_upper?: number
+    source?: string
+    as_of?: string
+  }
+  source?: string
+  as_of?: string
+  unknown?: string[]
+}
+
 export function listAlertEvents(status?: string, limit?: number) {
   return request<AlertEvent[]>({ url: '/alerts/events', method: 'get', params: { status, limit } })
+}
+
+export function getAlertEvent(id: number) {
+  return request<AlertEvent>({ url: `/alerts/events/${id}`, method: 'get' })
 }
 
 export function setAlertEventStatus(id: number, status: AlertEventStatus) {

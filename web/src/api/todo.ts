@@ -32,6 +32,7 @@ export interface TodoItem {
   detail: string
   ref_id: number
   ref_type: string // alerts / recommendations / positions / thesis / ipo
+  deep_link?: string
   time: string | null
 }
 

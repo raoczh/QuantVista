@@ -175,6 +175,7 @@ type jobRuntime struct {
 	scheduled map[int64]struct{}
 	cancels   map[int64]context.CancelFunc
 	createMu  sync.Mutex
+	notifier  alertNotifier
 }
 
 func newJobRuntime(workers, capacity int) *jobRuntime {
@@ -193,6 +194,7 @@ func newJobRuntime(workers, capacity int) *jobRuntime {
 		overrides: make(map[int64]durableJobHandler),
 		scheduled: make(map[int64]struct{}),
 		cancels:   make(map[int64]context.CancelFunc),
+		notifier:  NewNotifyService(),
 	}
 }
 
@@ -1003,6 +1005,9 @@ func (r *jobRuntime) finishFailedWithResult(run model.JobRun, code, message stri
 		r.finishCanceled(run)
 	} else if err != nil {
 		common.SysWarn("作业失败状态回写失败 job=%d: %v", run.ID, err)
+	} else {
+		// 外发必须晚于终态事务提交；通知失败不得反向修改 JobRun。
+		r.notifyFailedJob(run.ID)
 	}
 }
 
@@ -1076,7 +1081,7 @@ func (r *jobRuntime) failQueued(jobID int64, code, message string) {
 	now := time.Now()
 	safeMessage := sanitizeJobError(message)
 	binding := r.bindingForRun(run)
-	_ = common.DB.Transaction(func(tx *gorm.DB) error {
+	err := common.DB.Transaction(func(tx *gorm.DB) error {
 		res := tx.Model(&model.JobRun{}).Where("id = ? AND status = ?", jobID, model.JobStatusQueued).
 			Updates(map[string]any{
 				"status": model.JobStatusFailed, "active_key": nil, "error": safeMessage,
@@ -1093,6 +1098,11 @@ func (r *jobRuntime) failQueued(jobID int64, code, message string) {
 		}
 		return appendJobEventForRun(tx, &run, "status", model.JobStatusFailed)
 	})
+	if err != nil {
+		common.SysWarn("排队作业失败状态回写失败 job=%d: %v", run.ID, err)
+		return
+	}
+	r.notifyFailedJob(run.ID)
 }
 
 func (r *jobRuntime) recoverPersisted() error {

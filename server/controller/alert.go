@@ -117,6 +117,20 @@ func (ac *AlertController) ListEvents(c *gin.Context) {
 	common.ApiSuccess(c, rows)
 }
 
+// GetEvent GET /api/alerts/events/:id —— 本人单条命中详情，不改变已读状态。
+func (ac *AlertController) GetEvent(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	event, err := ac.svc.GetEvent(currentUserID(c), id)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, event)
+}
+
 // SetEventStatus PUT /api/alerts/events/:id/status —— 标记已读/忽略/恢复未读。
 func (ac *AlertController) SetEventStatus(c *gin.Context) {
 	id, ok := parseIDParam(c, "id")

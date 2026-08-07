@@ -77,6 +77,7 @@ type TodoItem struct {
 	Detail   string     `json:"detail"`
 	RefID    int64      `json:"ref_id"`
 	RefType  string     `json:"ref_type"` // alerts / recommendations / positions
+	DeepLink string     `json:"deep_link,omitempty"`
 	Time     *time.Time `json:"time"`
 }
 
@@ -157,7 +158,7 @@ func (s *TodoService) Build(ctx context.Context, userID int64, scope string) (*T
 				Kind: TodoKindAlert, Scope: sc, Priority: 1,
 				Symbol: e.Symbol, Market: e.Market, Name: e.Name,
 				Title: "条件提醒命中", Detail: e.Message,
-				RefID: e.ID, RefType: "alerts", Time: &t,
+				RefID: e.ID, RefType: "alerts", DeepLink: alertEventDeepLink(e.ID), Time: &t,
 			})
 		}
 	} else {

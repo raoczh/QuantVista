@@ -67,7 +67,7 @@ func (tc *TaskCenterController) Metrics(c *gin.Context) {
 	common.ApiSuccess(c, metrics)
 }
 
-// List GET /api/tasks?source=&kind=&status=&limit=&include_system=1
+// List GET /api/tasks?job_id=&source=&kind=&status=&limit=&include_system=1
 func (tc *TaskCenterController) List(c *gin.Context) {
 	limit := 0
 	if raw := c.Query("limit"); raw != "" {
@@ -75,7 +75,14 @@ func (tc *TaskCenterController) List(c *gin.Context) {
 			limit = parsed
 		}
 	}
+	jobID := int64(0)
+	if raw := c.Query("job_id"); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+			jobID = parsed
+		}
+	}
 	items, err := tc.svc.List(currentUserID(c), currentRole(c), service.TaskCenterListOptions{
+		JobID:         jobID,
 		Source:        c.Query("source"),
 		Kind:          c.Query("kind"),
 		Status:        c.Query("status"),

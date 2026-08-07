@@ -459,6 +459,8 @@ AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yiel
   - `op` 无方向语义统一存 gte；**`Once` 强制 false**（一条规则覆盖多笔持仓，命中一笔就暂停整条会让其余持仓失联）；threshold 一律正数百分比。
   - fail-closed：无 fresh 行情的持仓本轮跳过；盘中用当日 high 抬升峰值参与判定但**不落库**（落库交给 16:25 盘后那一次）。
 - 命中明细状态机（`alert_events`，unread/read/dismissed）：`GET /api/alerts/events?status=&limit=`，`PUT /api/alerts/events/:id/status`，`PUT /api/alerts/events/read-all`
+- **P0-5 命中上下文（代码已实现、待线上验收）**：新事件写 `context_version=1` 与最大 4096 字节的白名单 JSON；普通行情只保留实际用于判定的 quote、最新 bar 摘要和 MA/前高前低/量比/振幅指标，财报只保留预约披露或业绩预告结构化字段，持仓只保留命中持仓 ID、加权成本、峰值与 fresh quote。缺失来源/时点进入 `unknown` 或省略；不得放 token/cookie/密钥、请求/响应正文或上游原始对象。旧事件保持 `0/空串`，API 显示上下文不可用，不追溯猜测。
+- **详情与深链**：`GET /api/alerts/events/:id` 必须同时按 `id+user_id` 查询，返回解析后的 `context/context_available` 与稳定 `deep_link=/alerts?event_id=<id>`，不返回原始 ContextJSON。列表与状态更新使用同一安全视图。Today 的提醒待办返回同一 deep_link；仅打开详情不改变 unread 状态。主动推送正文最多保留 5 条有界摘要及各自事件深链，不复制完整快照。
 - **持仓类事件去重键 `(rule_id, position_id, trade_date)`（D14 起下沉）**：绑「全部持仓」的规则同一天会逐仓命中，同一代码也可能有多笔不同成本的持仓；按 symbol 判重会吞掉后面的仓位。`alert_events` 因此新增 `trade_date`（旧行空串，历史不追溯）与 `position_id`（持仓类命中的那一笔，其余恒 0）。非持仓类仍由规则行 `triggered_at` 做同日去重。
 - 今日待办（`GET /api/todos?scope=`）的提醒条目即 unread 事件，`ref_id` 为事件 id，可就地标记已读/忽略「完成待办」
 
@@ -502,6 +504,8 @@ AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yiel
 所有来源统一映射状态、耗时、错误码、恢复建议与仅含记录 ID 的结果深链。15 分钟未更新且**没有 queued/running JobRun 引用**的 legacy 用户侧 `processing` 任务，才由各自业务服务按同一口径惰性收敛为 `failed`；活跃统一作业即使排队超过 15 分钟也由自身 CAS、取消和恢复规则收敛，旧清理器不得抢写业务结果。顶栏最近任务与运行中数量分别查询，达到 100 条上限时只能展示“至少 N 项”，不能把截断值当精确总数。
 
 P0-2B-2B 已将六类系统维护任务接入相同的 JobRun/JobStep/恢复/背压运行时。用户作业 owner 为 `user` 且 `user_id>0`；系统作业 owner 为 `system` 且 `user_id IS NULL`，管理员手动触发另记 `triggered_by`。普通用户只能访问自己的 user JobRun；启用管理员还可审计、取消和失败重跑 system JobRun。`GET /api/admin/jobs/metrics` 仅聚合 kind/status/count、最老 queued_at 和进程容量，不选择 request snapshot。用户七类 SSE 鉴权与续传契约不变；系统任务当前由管理员任务页轮询同一事实，不额外伪造事件进度。
+
+P0-5 为 user owner 的 failed 终态增加 `job_failure_notifications` 幂等事实：`job_run_id` 唯一，system owner 不建通知行；同用户同 kind 以 5 分钟滑动窗口合并，稳定 group key 负责跨实例并发首条唯一，窗口轮换时释放旧 root，首行记录 `merge_count`，后续行只记 `merge_root_id` 而不再次外发。只有现有 `enable_notify` 总闸和至少一个启用通道同时满足时才声明外发，否则记 suppressed；不新增平行通知配置。失败终态事务提交后，通知行再以 `claimed→dispatching` CAS 抢占唯一发送权并 best-effort 调现有 NotifyService；外发失败不得改写 JobRun。正文只含任务 kind、白名单错误码和 `/tasks?job_id=<id>`；任务列表按 `job_id+user_id` 精确返回该行，禁止读取或推送 request snapshot、模型正文及原始错误详情。
 
 ### 5.10 扩展模块（N/F/T/S/M/P3 批次 + 2026-07 杂项批）
 
@@ -635,6 +639,7 @@ P0-2B-1/P0-2B-2A 覆盖七类用户任务；P0-2B-2B 在同一运行时加入 `s
 - **幂等与容量**：用户按 owner/kind/request hash 防重，系统按 kind 排他防重；active key 仅 queued/running 持有。管理员重复手动触发同 kind 系统任务时返回既有 JobRun 与 `started=false`，不得把旧任务伪报成新计划已启动。运行时固定 4 worker、最多 32 总在途。用户入口满载返回 `job_queue_busy`；系统定时器对该错误去重重试，接受前不建事实行。管理员指标按 kind/status 聚合并显示最老排队与容量，查询禁止选择请求快照。
 - **取消与恢复**：queued 取消用 CAS 直接进入 canceled；running 先持久化 `cancel_requested`，本实例立即取消 Context，其他实例/恢复路径通过数据库轮询协作取消。成功持久化与取消在同一事务条件上竞争，只有一个终态获胜。启动时遗留 running 明确收敛为 `job_interrupted`（已请求取消者收敛 canceled），queued 按 ID 升序恢复，容量外的 queued 保持排队并随槽位释放续排。
 - **重跑**：失败且已注册的用户或系统 handler 可重跑。新 run 从旧快照创建并写 `parent_id`，旧 run 不修改；系统重跑的 `triggered_by` 是执行该动作的管理员。已有等价用户请求或同 kind 系统任务在途时返回 `job_already_running`。
+- **用户失败通知**：仅 failed 且 owner=user 的已提交 JobRun 可进入通知声明。`job_failure_notifications.job_run_id` 保证 CAS、恢复和重复观察下每个 run 至多一次；同用户同 kind 的短窗失败合并。通知开关复用 UserPreference/NotifyChannel，错误正文不进入推送。通知投递是终态之后的旁路，任何数据库或网络失败都只能记录告警，不能回滚或覆盖 JobRun 终态。
 - **事件与前端**：`GET /api/tasks/events` 位于 JWT 中间件后，支持 `Last-Event-ID`、单调 `id:`、`event: job` 与 15s heartbeat。前端用 `fetch` 的 `Authorization` 请求头读取流，token 从不进入 URL；断线指数重连并保留串行轮询回退。任务中心优先列 JobRun，查询旧 `llm_tasks` 与三类业务表时排除已被 `result_type/result_id` 引用的行，从而避免双行；深链使用业务 `result_id`，旧业务详情路由继续兼容。
 - **ResearchArtifact**：只保存 `type/schema_version/subject/as_of/available_at/content_hash/source_refs/storage_ref/job_run_id/owner/created_at`。分析、推荐、日报在业务结果校验与 JobRun 终态同一事务幂等建索引；分析 subject 对非个股模块使用真实 target，不能退化成空 symbol。hash 从当次已持久事实计算，正文、候选池和快照不复制。历史行不自动回填；扫描/回测当前没有持久结果事实，因此不猜测建索引，待将来先落不可变结果再接线。
 - **保留策略**：每日 03:35 只删除“对应 JobRun 已终态且事件早于 30 天”的 JobEvent。JobRun/request snapshot 为重跑与审计保留，JobStep 随 JobRun 保留，业务快照由原事实表负责，ResearchArtifact 一期永久保留且拒绝更新/删除。任何后续分层归档必须先证明不会切断 parent 重跑、审计和 source/storage 血缘。

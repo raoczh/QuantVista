@@ -551,7 +551,7 @@ func withActionablePositionAlertEvents(q *gorm.DB) *gorm.DB {
 }
 
 // ListEvents 命中历史（可按状态过滤，倒序）。
-func (s *AlertService) ListEvents(userID int64, status string, limit int) ([]model.AlertEvent, error) {
+func (s *AlertService) ListEvents(userID int64, status string, limit int) ([]AlertEventView, error) {
 	if limit <= 0 || limit > alertEventMaxList {
 		limit = 100
 	}
@@ -563,12 +563,28 @@ func (s *AlertService) ListEvents(userID int64, status string, limit int) ([]mod
 		}
 	}
 	var rows []model.AlertEvent
-	err := q.Order("id DESC").Limit(limit).Find(&rows).Error
-	return rows, err
+	if err := q.Order("id DESC").Limit(limit).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]AlertEventView, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, toAlertEventView(row))
+	}
+	return out, nil
+}
+
+// GetEvent 返回本人单条命中详情。查询条件同时带 user_id，深链不能越权枚举。
+func (s *AlertService) GetEvent(userID, id int64) (*AlertEventView, error) {
+	var event model.AlertEvent
+	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&event).Error; err != nil {
+		return nil, errors.New("命中记录不存在")
+	}
+	view := toAlertEventView(event)
+	return &view, nil
 }
 
 // SetEventStatus 标记事件已读/忽略（也允许恢复未读，仅本人）。
-func (s *AlertService) SetEventStatus(userID, id int64, status string) (*model.AlertEvent, error) {
+func (s *AlertService) SetEventStatus(userID, id int64, status string) (*AlertEventView, error) {
 	if status != model.AlertEventUnread && status != model.AlertEventRead && status != model.AlertEventDismissed {
 		return nil, errors.New("非法状态")
 	}
@@ -599,7 +615,8 @@ func (s *AlertService) SetEventStatus(userID, id int64, status string) (*model.A
 	if err != nil {
 		return nil, err
 	}
-	return &ev, nil
+	view := toAlertEventView(ev)
+	return &view, nil
 }
 
 // MarkAllEventsRead 全部未读事件标记已读，返回影响条数。
@@ -705,6 +722,7 @@ func walkAlertRules(ctx context.Context, userID int64, rules []model.AlertRule,
 type alertPersistResult struct {
 	active       bool
 	eventCreated bool
+	eventID      int64
 }
 
 var errAlertRuleChanged = errors.New("提醒规则已不再生效")
@@ -712,8 +730,12 @@ var errAlertRuleChanged = errors.New("提醒规则已不再生效")
 // persistAlertEvaluation 将事件和规则最近状态放在同一事务。命中前重新读取 active 行，
 // 即使未来扩成多实例，条件更新失败也会回滚事件，不留下孤儿事件或半写状态。
 func persistAlertEvaluation(ctx context.Context, rule model.AlertRule, value float64, triggered bool,
-	msg, today string, now time.Time) (alertPersistResult, error) {
+	msg, today string, now time.Time, eventContexts ...*AlertEventContext) (alertPersistResult, error) {
 	var out alertPersistResult
+	var eventContext *AlertEventContext
+	if len(eventContexts) > 0 {
+		eventContext = eventContexts[0]
+	}
 	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var current model.AlertRule
 		q := tx.Where("id = ? AND user_id = ? AND status = ?", rule.ID, rule.UserID, model.AlertStatusActive)
@@ -740,16 +762,22 @@ func persistAlertEvaluation(ctx context.Context, rule model.AlertRule, value flo
 			alreadyToday := current.TriggeredAt != nil &&
 				current.TriggeredAt.In(time.Local).Format("2006-01-02") == today
 			if !alreadyToday {
+				contextVersion, contextJSON, err := marshalAlertEventContext(eventContext)
+				if err != nil {
+					return err
+				}
 				ev := model.AlertEvent{
 					RuleID: current.ID, UserID: current.UserID,
 					Symbol: current.Symbol, Market: current.Market, Name: current.Name, Kind: current.Kind,
 					Message: truncateRunes(msg, 256), TradeDate: today,
+					ContextVersion: contextVersion, ContextJSON: contextJSON,
 					TriggeredAt: now, Status: model.AlertEventUnread,
 				}
 				if err := tx.Create(&ev).Error; err != nil {
 					return err
 				}
 				out.eventCreated = true
+				out.eventID = ev.ID
 			}
 		}
 		res := tx.Model(&model.AlertRule{}).
@@ -791,9 +819,14 @@ func alertNotificationsEnabled(ctx context.Context, userID int64) (bool, error) 
 
 // flushAlertNotification 在评估返回前同步尝试推送。WithoutCancel 保留调用链上的值，
 // 但不继承已经触发的取消/deadline；外层总超时保证用户锁不会被通知网络无限占用。
+type alertNotificationItem struct {
+	Summary  string
+	DeepLink string
+}
+
 func flushAlertNotification(sourceCtx context.Context, notifier alertNotifier, userID int64,
-	title, kind string, lines []string) {
-	if notifier == nil || len(lines) == 0 {
+	title, kind string, items []alertNotificationItem) {
+	if notifier == nil || len(items) == 0 {
 		return
 	}
 	base := context.Background()
@@ -802,9 +835,21 @@ func flushAlertNotification(sourceCtx context.Context, notifier alertNotifier, u
 	}
 	ctx, cancel := context.WithTimeout(base, alertNotifyFlushTimeout)
 	defer cancel()
+	const maxSummaries = 5
+	limit := len(items)
+	if limit > maxSummaries {
+		limit = maxSummaries
+	}
+	lines := make([]string, 0, limit*2+1)
+	for _, item := range items[:limit] {
+		lines = append(lines, truncateRunes(item.Summary, 120), "查看详情："+item.DeepLink)
+	}
+	if len(items) > limit {
+		lines = append(lines, fmt.Sprintf("另有 %d 条命中，请打开提醒页查看", len(items)-limit))
+	}
 	notifier.SendMsgContext(ctx, userID, NotifyMessage{
 		Title: title, Content: strings.Join(lines, "\n"),
-		Route: "/alerts", Kind: kind,
+		Route: items[0].DeepLink, Kind: kind,
 	})
 }
 
@@ -871,9 +916,13 @@ func (s *AlertService) evaluateUserMarketUnlocked(ctx context.Context, userID in
 // evaluateRules 评估一批规则，按 symbol 缓存行情/日线/估值，避免重复请求。
 func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRule) (int, error) {
 	type md struct {
-		eval     alertEval
-		ok       bool
-		valTried bool // 估值源振幅是否已尝试拉取（失败不重试）
+		eval         alertEval
+		quote        *datasource.Quote
+		bars         []datasource.Bar
+		metricSource string
+		metricAsOf   string
+		ok           bool
+		valTried     bool // 估值源振幅是否已尝试拉取（失败不重试）
 	}
 	cache := map[string]md{}
 	today := time.Now().In(time.Local).Format("2006-01-02")
@@ -902,12 +951,12 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 			return 0, err
 		}
 	}
-	var pushLines []string
+	var pushItems []alertNotificationItem
 	if notifyOn {
 		uid := rules[0].UserID
 		// 仅注册一次；无论正常结束还是后续规则超时，已落库事件都会在返回前尝试推送。
 		defer func() {
-			flushAlertNotification(ctx, s.notify, uid, "QuantVista 提醒命中", NotifyMsgKindAlert, pushLines)
+			flushAlertNotification(ctx, s.notify, uid, "QuantVista 提醒命中", NotifyMsgKindAlert, pushItems)
 		}()
 	}
 
@@ -926,6 +975,9 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 			q, fi, quoteErr := s.market.GetFreshQuote(ctx, rule.Market, rule.Symbol)
 			if quoteErr == nil && q != nil && q.Price > 0 && fi.Status == freshStatusFresh {
 				data.eval = alertEval{Price: q.Price, DayHigh: q.High, DayLow: q.Low, ChangePct: q.ChangePct, DayVolume: q.Volume}
+				data.quote = q
+				data.metricSource = q.Source
+				data.metricAsOf = alertContextTime(q.DataTime)
 				// 振幅回退基线：(high-low)/prev_close（估值源自带值优先，见下方按需覆盖）。
 				if q.PrevClose > 0 && q.High > 0 && q.High >= q.Low {
 					data.eval.Amplitude = round2((q.High - q.Low) / q.PrevClose * 100)
@@ -935,6 +987,7 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 				if alertKindNeedsBars(rule.Kind) {
 					if bars, berr := s.market.GetDailyBars(ctx, rule.Market, rule.Symbol, alertBarLimit); berr == nil {
 						fillBars(&data.eval, bars)
+						data.bars = bars
 					}
 				}
 			}
@@ -950,6 +1003,7 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 		if alertKindNeedsBars(rule.Kind) && len(data.eval.Closes) == 0 {
 			if bars, berr := s.market.GetDailyBars(ctx, rule.Market, rule.Symbol, alertBarLimit); berr == nil {
 				fillBars(&data.eval, bars)
+				data.bars = bars
 				cache[key] = data
 			}
 			if err := ctx.Err(); err != nil {
@@ -964,6 +1018,8 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 			if v, verr := s.market.GetValuation(ctx, rule.Market, rule.Symbol); verr == nil && v.Amplitude > 0 &&
 				s.market.QuoteFreshnessOf(rule.Market, v.DataTime).Status == freshStatusFresh {
 				data.eval.Amplitude = v.Amplitude
+				data.metricSource = v.Source
+				data.metricAsOf = alertContextTime(v.DataTime)
 			}
 			if err := ctx.Err(); err != nil {
 				return err
@@ -976,7 +1032,13 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 		}
 		triggered, value, msg := evaluateAlert(rule, data.eval)
 		now := time.Now()
-		persisted, err := persistAlertEvaluation(ctx, rule, value, triggered, msg, today, now)
+		var eventContext *AlertEventContext
+		if triggered {
+			eventContext = buildMarketAlertContext(
+				rule, data.eval, data.quote, data.bars, data.metricSource, data.metricAsOf, msg,
+			)
+		}
+		persisted, err := persistAlertEvaluation(ctx, rule, value, triggered, msg, today, now, eventContext)
 		if err != nil {
 			return err
 		}
@@ -988,7 +1050,10 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 			if name == "" {
 				name = rule.Symbol
 			}
-			pushLines = append(pushLines, name+"("+rule.Symbol+")："+msg)
+			pushItems = append(pushItems, alertNotificationItem{
+				Summary:  name + "(" + rule.Symbol + ")：" + msg,
+				DeepLink: alertEventDeepLink(persisted.eventID),
+			})
 		}
 		return nil
 	})
@@ -1316,11 +1381,11 @@ func (s *AlertService) evaluateEarnRulesForUserUnlocked(ctx context.Context, use
 			return 0, err
 		}
 	}
-	var pushLines []string
+	var pushItems []alertNotificationItem
 	if notifyOn {
 		// 与行情提醒一致：批内后续规则失败/超时也不能吞掉已落库事件的推送尝试。
 		defer func() {
-			flushAlertNotification(ctx, s.notify, userID, "QuantVista 财报提醒", NotifyMsgKindEarn, pushLines)
+			flushAlertNotification(ctx, s.notify, userID, "QuantVista 财报提醒", NotifyMsgKindEarn, pushItems)
 		}()
 	}
 	hits := 0
@@ -1332,6 +1397,7 @@ func (s *AlertService) evaluateEarnRulesForUserUnlocked(ctx context.Context, use
 		var triggered bool
 		var value float64
 		var msg string
+		var eventContext *AlertEventContext
 		switch rule.Kind {
 		case model.AlertKindEarnDate:
 			var sched model.DisclosureSchedule
@@ -1339,6 +1405,9 @@ func (s *AlertService) evaluateEarnRulesForUserUnlocked(ctx context.Context, use
 				Order("appoint_date ASC").First(&sched).Error
 			if err == nil {
 				triggered, value, msg = evaluateEarnDate(rule, sched.AppointDate, sched.ReportTypeName, now)
+				if triggered {
+					eventContext = buildEarnDateAlertContext(rule, sched, value, msg)
+				}
 			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 				return hits, err
 			}
@@ -1347,12 +1416,15 @@ func (s *AlertService) evaluateEarnRulesForUserUnlocked(ctx context.Context, use
 			err := db.Where("symbol = ?", rule.Symbol).Order("notice_date DESC, id DESC").First(&forecast).Error
 			if err == nil {
 				triggered, value, msg = evaluateEarnFcst(rule, &forecast, now)
+				if triggered {
+					eventContext = buildEarnForecastAlertContext(rule, forecast, value, msg)
+				}
 			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 				return hits, err
 			}
 		}
 
-		persisted, err := persistAlertEvaluation(ctx, rule, value, triggered, msg, today, time.Now())
+		persisted, err := persistAlertEvaluation(ctx, rule, value, triggered, msg, today, time.Now(), eventContext)
 		if err != nil {
 			return hits, err
 		}
@@ -1364,7 +1436,10 @@ func (s *AlertService) evaluateEarnRulesForUserUnlocked(ctx context.Context, use
 			if name == "" {
 				name = rule.Symbol
 			}
-			pushLines = append(pushLines, name+"("+rule.Symbol+")："+msg)
+			pushItems = append(pushItems, alertNotificationItem{
+				Summary:  name + "(" + rule.Symbol + ")：" + msg,
+				DeepLink: alertEventDeepLink(persisted.eventID),
+			})
 		}
 	}
 

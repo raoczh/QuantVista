@@ -790,6 +790,21 @@ func TestPositionAlertEventLifecycleDefense(t *testing.T) {
 			}
 		}
 	}
+	assertEventViewIDs := func(label string, rows []AlertEventView, want ...int64) {
+		t.Helper()
+		got := make(map[int64]bool, len(rows))
+		for _, row := range rows {
+			got[row.ID] = true
+		}
+		if len(got) != len(want) {
+			t.Fatalf("%s 条数错误: got=%d want=%d rows=%+v", label, len(got), len(want), rows)
+		}
+		for _, id := range want {
+			if !got[id] {
+				t.Fatalf("%s 缺少事件 %d: %+v", label, id, rows)
+			}
+		}
+	}
 
 	triggered, err := svc.TriggeredForUser(1)
 	if err != nil {
@@ -800,14 +815,14 @@ func TestPositionAlertEventLifecycleDefense(t *testing.T) {
 	if err != nil {
 		t.Fatalf("查询未读历史失败: %v", err)
 	}
-	assertEventIDs("ListEvents(unread)", unread, heldUnread.ID, normalUnread.ID)
+	assertEventViewIDs("ListEvents(unread)", unread, heldUnread.ID, normalUnread.ID)
 
 	reads, _ := svc.ListEvents(1, model.AlertEventRead, 100)
-	assertEventIDs("ListEvents(read)", reads, closedRead.ID, otherRead.ID, heldRead.ID, normalRead.ID)
+	assertEventViewIDs("ListEvents(read)", reads, closedRead.ID, otherRead.ID, heldRead.ID, normalRead.ID)
 	dismissed, _ := svc.ListEvents(1, model.AlertEventDismissed, 100)
-	assertEventIDs("ListEvents(dismissed)", dismissed, deletedDismissed.ID)
+	assertEventViewIDs("ListEvents(dismissed)", dismissed, deletedDismissed.ID)
 	all, _ := svc.ListEvents(1, "all", 100)
-	assertEventIDs("ListEvents(all)", all,
+	assertEventViewIDs("ListEvents(all)", all,
 		closedUnread.ID, deletedUnread.ID, otherUnread.ID, heldUnread.ID, normalUnread.ID,
 		closedRead.ID, deletedDismissed.ID, otherRead.ID, heldRead.ID, normalRead.ID)
 

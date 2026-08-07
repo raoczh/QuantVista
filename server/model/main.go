@@ -17,6 +17,7 @@ func AllModels() []any {
 		&JobRun{},
 		&JobStep{},
 		&JobEvent{},
+		&JobFailureNotification{},
 		&ResearchArtifact{},
 		&LLMTask{},
 		&Stock{},

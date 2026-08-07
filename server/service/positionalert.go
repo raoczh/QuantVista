@@ -147,6 +147,8 @@ type positionAlertHit struct {
 	Value     float64
 	Message   string
 	TradeDate string
+	Context   *AlertEventContext
+	EventID   int64
 }
 
 // evaluatePositionRules 评估用户的全部持仓类规则。
@@ -226,10 +228,10 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 			return 0, nerr
 		}
 	}
-	var pushLines []string
+	var pushItems []alertNotificationItem
 	if notifyOn {
 		defer func() {
-			flushAlertNotification(ctx, s.notify, userID, "QuantVista 持仓提醒", NotifyMsgKindAlert, pushLines)
+			flushAlertNotification(ctx, s.notify, userID, "QuantVista 持仓提醒", NotifyMsgKindAlert, pushItems)
 		}()
 	}
 
@@ -283,6 +285,7 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 			if triggered {
 				ruleHits = append(ruleHits, positionAlertHit{
 					Position: p, Value: value, Message: msg, TradeDate: tradeDate,
+					Context: buildPositionAlertContext(rule, in, fq.Quote, p, value, msg, tradeDate),
 				})
 			}
 		}
@@ -300,7 +303,9 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 		}
 		if notifyOn {
 			for _, h := range created {
-				pushLines = append(pushLines, h.Message)
+				pushItems = append(pushItems, alertNotificationItem{
+					Summary: h.Message, DeepLink: alertEventDeepLink(h.EventID),
+				})
 			}
 		}
 	}
@@ -386,16 +391,22 @@ func persistPositionAlertEvaluation(ctx context.Context, rule model.AlertRule, h
 			if cnt > 0 {
 				continue
 			}
+			contextVersion, contextJSON, err := marshalAlertEventContext(h.Context)
+			if err != nil {
+				return err
+			}
 			ev := model.AlertEvent{
 				RuleID: current.ID, UserID: current.UserID,
 				Symbol: h.Position.Symbol, Market: h.Position.Market,
 				Name: orSymbol(h.Position.Name, h.Position.Symbol), Kind: current.Kind,
 				Message: truncateRunes(h.Message, 256), TradeDate: tradeDate,
+				ContextVersion: contextVersion, ContextJSON: contextJSON,
 				PositionID: h.Position.ID, TriggeredAt: now, Status: model.AlertEventUnread,
 			}
 			if err := tx.Create(&ev).Error; err != nil {
 				return err
 			}
+			h.EventID = ev.ID
 			created = append(created, h)
 		}
 		res := tx.Model(&model.AlertRule{}).

@@ -46,10 +46,11 @@ type NotifyMessage struct {
 
 // 消息类别（NotifyMessage.Kind）。
 const (
-	NotifyMsgKindAlert  = "alert"  // 条件提醒命中
-	NotifyMsgKindEarn   = "earn"   // 财报提醒
-	NotifyMsgKindReport = "report" // 收盘日报
-	NotifyMsgKindGuard  = "guard"  // 守护推送（阶段 D）
+	NotifyMsgKindAlert       = "alert"        // 条件提醒命中
+	NotifyMsgKindEarn        = "earn"         // 财报提醒
+	NotifyMsgKindReport      = "report"       // 收盘日报
+	NotifyMsgKindGuard       = "guard"        // 守护推送（阶段 D）
+	NotifyMsgKindTaskFailure = "task_failure" // 用户作业失败
 )
 
 // ntfyTarget ntfy 通道 target 的明文结构（整串 JSON 加密落库）。
@@ -370,10 +371,11 @@ func sendWebhook(ctx context.Context, target, title, content string) error {
 
 // ntfyKindTags NotifyMessage.Kind → ntfy tags（emoji shortcode，通知栏显示对应图标）。
 var ntfyKindTags = map[string][]string{
-	NotifyMsgKindAlert:  {"bell"},
-	NotifyMsgKindEarn:   {"date"},
-	NotifyMsgKindReport: {"newspaper"},
-	NotifyMsgKindGuard:  {"shield"},
+	NotifyMsgKindAlert:       {"bell"},
+	NotifyMsgKindEarn:        {"date"},
+	NotifyMsgKindReport:      {"newspaper"},
+	NotifyMsgKindGuard:       {"shield"},
+	NotifyMsgKindTaskFailure: {"warning"},
 }
 
 // buildNtfyPayload 构造 ntfy JSON 发布载荷（纯函数，便于单测）。

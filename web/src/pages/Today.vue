@@ -108,8 +108,10 @@ function fmtTime(t: string | null) {
 
 // 一键跳转到对应页面处理。
 function handle(item: TodoItem) {
-  if (item.ref_type === 'alerts') {
-    router.push({ name: 'alerts' })
+  if (item.deep_link) {
+    router.push(item.deep_link)
+  } else if (item.ref_type === 'alerts') {
+    router.push({ name: 'alerts', query: { event_id: String(item.ref_id) } })
   } else if (item.ref_type === 'recommendations') {
     router.push({ name: 'recommendations' })
   } else if (item.ref_type === 'positions') {

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { NAlert, NButton, NEmpty, NPopconfirm, NSelect, NSpin, NSwitch, NTag } from 'naive-ui'
 import {
@@ -33,6 +33,7 @@ import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 
 const router = useRouter()
+const route = useRoute()
 const authStore = useAuthStore()
 const { isAdmin } = storeToRefs(authStore)
 const { vars } = useUi()
@@ -48,6 +49,11 @@ const status = ref<TaskStatus | ''>('')
 const includeSystem = ref(false)
 const actionJobID = ref<number | null>(null)
 const actionError = ref('')
+const focusedJobID = computed(() => {
+  const raw = Array.isArray(route.query.job_id) ? route.query.job_id[0] : route.query.job_id
+  const id = Number(raw)
+  return Number.isSafeInteger(id) && id > 0 ? id : null
+})
 let requestController: AbortController | null = null
 
 const knownKindsBySource: Record<TaskSource, string[]> = {
@@ -114,10 +120,15 @@ const statusOptions = [
 const kindFilteredTasks = computed(() =>
   kind.value ? sourceFilteredTasks.value.filter((task) => task.kind === kind.value) : sourceFilteredTasks.value,
 )
-const visibleTasks = computed(() =>
+const statusFilteredTasks = computed(() =>
   status.value
     ? kindFilteredTasks.value.filter((task) => task.status === status.value)
     : kindFilteredTasks.value,
+)
+const visibleTasks = computed(() =>
+  focusedJobID.value
+    ? accessibleTasks.value.filter((task) => task.source === 'job' && task.source_id === focusedJobID.value)
+    : statusFilteredTasks.value,
 )
 const hasProcessing = computed(() =>
   sourceFilteredTasks.value.some((task) => task.status === 'queued' || task.status === 'running'),
@@ -156,9 +167,10 @@ async function loadTaskRows() {
   try {
     const rowsPromise = listTasks(
       {
-        source: source.value,
-        kind: kind.value,
-        limit: 100,
+        job_id: focusedJobID.value || undefined,
+        source: focusedJobID.value ? undefined : source.value,
+        kind: focusedJobID.value ? undefined : kind.value,
+        limit: focusedJobID.value ? 1 : 100,
         include_system: isAdmin.value && includeSystem.value,
         include_steps: true,
       },
@@ -191,6 +203,7 @@ watch(source, () => {
 })
 
 watch(kind, () => void refreshNow())
+watch(focusedJobID, () => void refreshNow())
 
 function resetSystemOnlyFilters(): boolean {
   if (source.value === 'data_sync') {
@@ -226,6 +239,12 @@ function statusTagType(value: TaskStatus): 'info' | 'success' | 'warning' | 'err
 
 function toggleStatus(value: TaskStatus) {
   status.value = status.value === value ? '' : value
+}
+
+function clearFocusedJob() {
+  const query = { ...route.query }
+  delete query.job_id
+  void router.replace({ name: 'tasks', query })
 }
 
 function providerModel(task: TaskCenterItem) {
@@ -326,6 +345,7 @@ function openTask(task: TaskCenterItem) {
             <span>包含系统任务</span>
           </label>
           <span class="filter-count qv-tnum">{{ visibleTasks.length }} 项</span>
+          <n-button v-if="focusedJobID" size="small" quaternary @click="clearFocusedJob">返回全部任务</n-button>
         </div>
 
         <n-alert v-if="loadError" type="error" :bordered="false" title="任务列表读取失败" class="load-alert">

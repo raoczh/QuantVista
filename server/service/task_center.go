@@ -76,6 +76,7 @@ type TaskCenterItem struct {
 
 // TaskCenterListOptions 控制统一任务列表筛选。IncludeSystem 仍会在服务层校验管理员角色。
 type TaskCenterListOptions struct {
+	JobID         int64
 	Source        string
 	Kind          string
 	Status        string
@@ -89,6 +90,7 @@ type TaskCenterService struct{}
 func NewTaskCenterService() *TaskCenterService { return &TaskCenterService{} }
 
 type taskCenterFilters struct {
+	jobID       int64
 	source      string
 	kind        string
 	status      string
@@ -110,6 +112,13 @@ func (s *TaskCenterService) List(userID int64, role string, options TaskCenterLi
 	}
 	if err := expireStaleUserTasks(userID); err != nil {
 		return nil, fmt.Errorf("收敛遗留任务失败: %w", err)
+	}
+	if filters.jobID > 0 {
+		rows, err := listJobRunTasks(common.DB, userID, filters, options.IncludeSteps)
+		if err != nil {
+			return nil, fmt.Errorf("查询统一作业失败: %w", err)
+		}
+		return rows, nil
 	}
 
 	items := make([]TaskCenterItem, 0, filters.limit*4)
@@ -181,10 +190,14 @@ func (s *TaskCenterService) List(userID int64, role string, options TaskCenterLi
 
 func normalizeTaskCenterFilters(options TaskCenterListOptions) (taskCenterFilters, error) {
 	f := taskCenterFilters{
+		jobID:  options.JobID,
 		source: strings.ToLower(strings.TrimSpace(options.Source)),
 		kind:   strings.ToLower(strings.TrimSpace(options.Kind)),
 		status: strings.ToLower(strings.TrimSpace(options.Status)),
 		limit:  options.Limit,
+	}
+	if f.jobID < 0 {
+		return taskCenterFilters{}, errors.New("任务 ID 必须是正整数")
 	}
 	if f.limit <= 0 {
 		f.limit = defaultTaskCenterLimit
@@ -403,10 +416,15 @@ func listJobRunTasks(db *gorm.DB, userID int64, filters taskCenterFilters, inclu
 			"trace_id", "provider", "model", "prompt_tokens", "completion_tokens", "total_tokens",
 			"latency_ms", "total", "succeeded", "failed", "cancel_requested", "created_at", "updated_at").
 		Where("user_id = ?", userID)
+	if filters.jobID > 0 {
+		q = q.Where("id = ?", filters.jobID)
+	}
 	if filters.kind != "" {
 		q = q.Where("kind = ?", filters.kind)
 	}
-	q = applyTaskStatusFilter(q, filters)
+	if filters.jobID == 0 {
+		q = applyTaskStatusFilter(q, filters)
+	}
 	var runs []model.JobRun
 	if err := q.Order("created_at DESC, id DESC").Limit(filters.limit).Find(&runs).Error; err != nil {
 		return nil, err

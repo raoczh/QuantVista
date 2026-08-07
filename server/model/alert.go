@@ -90,6 +90,11 @@ type AlertEvent struct {
 	Kind    string `gorm:"size:16" json:"kind"`
 	Message string `gorm:"size:256" json:"message"` // 命中说明（同规则 trigger_msg 口径）
 
+	// ContextVersion/ContextJSON 是命中当刻的有界白名单快照。旧事件保持 0/空串，
+	// API 只返回解析后的结构，不暴露原始 JSON。
+	ContextVersion int    `gorm:"not null;default:0" json:"context_version"`
+	ContextJSON    string `gorm:"type:varchar(4096)" json:"-"`
+
 	// TradeDate 命中所属交易日（YYYY-MM-DD 本地时区）。**旧事件该列为空串**——
 	// 历史数据不追溯改写，判重只在新写入的行之间生效。
 	TradeDate string `gorm:"size:10;index:idx_alert_event_dedup,priority:3;index:idx_alert_event_pos_dedup,priority:3" json:"trade_date"`

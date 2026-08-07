@@ -172,6 +172,10 @@ func TestPositionAlertAllPositionsAndFailClosed(t *testing.T) {
 	bySym := map[string]model.AlertEvent{}
 	for _, e := range events {
 		bySym[e.Symbol] = e
+		ctx, ok := parseAlertEventContext(e.ContextVersion, e.ContextJSON)
+		if !ok || ctx.Position == nil || ctx.Position.PositionID != e.PositionID || ctx.Position.AvgCost == nil || ctx.Quote == nil {
+			t.Fatalf("持仓事件必须固化本人成本与命中行情: event=%+v ctx=%+v", e, ctx)
+		}
 		if e.UserID != 1 {
 			t.Fatalf("事件必须归属规则所有者: %+v", e)
 		}

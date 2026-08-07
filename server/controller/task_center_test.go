@@ -47,14 +47,14 @@ func TestTaskCenterControllerParsesFiltersAndGuardsSystemTasks(t *testing.T) {
 	}}}
 	controller := NewTaskCenterController(stub)
 	c, w := taskCenterTestContext(
-		"/api/tasks?source=llm&kind=qa&status=running&limit=120&include_system=1&include_steps=1",
+		"/api/tasks?job_id=42&source=llm&kind=qa&status=running&limit=120&include_system=1&include_steps=1",
 		model.RoleUser,
 	)
 	controller.List(c)
 	if stub.userID != 7 || stub.role != model.RoleUser {
 		t.Fatalf("当前用户上下文未透传: uid=%d role=%s", stub.userID, stub.role)
 	}
-	if stub.options.Source != service.TaskSourceLLM || stub.options.Kind != "qa" ||
+	if stub.options.JobID != 42 || stub.options.Source != service.TaskSourceLLM || stub.options.Kind != "qa" ||
 		stub.options.Status != service.TaskStatusRunning || stub.options.Limit != 120 || !stub.options.IncludeSteps {
 		t.Fatalf("筛选参数解析错误: %+v", stub.options)
 	}

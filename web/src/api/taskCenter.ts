@@ -59,6 +59,7 @@ export interface JobRuntimeMetrics {
 }
 
 export interface TaskCenterQuery {
+  job_id?: number
   source?: TaskSource | ''
   kind?: string
   status?: TaskStatus | ''
@@ -71,6 +72,7 @@ export function listTasks(params: TaskCenterQuery = {}, signal?: AbortSignal) {
   return request<TaskCenterItem[]>({
     url: '/tasks',
     params: {
+      job_id: params.job_id,
       source: params.source || undefined,
       kind: params.kind || undefined,
       status: params.status || undefined,

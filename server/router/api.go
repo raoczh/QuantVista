@@ -272,6 +272,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				alerts.POST("/evaluate", middleware.RateLimit(20, time.Minute), alertCtl.Evaluate)
 				alerts.GET("/events", alertCtl.ListEvents)
 				alerts.PUT("/events/read-all", alertCtl.ReadAllEvents)
+				alerts.GET("/events/:id", alertCtl.GetEvent)
 				alerts.PUT("/events/:id/status", alertCtl.SetEventStatus)
 				alerts.PUT("/:id", alertCtl.Update)
 				alerts.PUT("/:id/status", alertCtl.SetStatus)
