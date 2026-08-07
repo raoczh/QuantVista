@@ -254,7 +254,7 @@ const riskCalc = computed(() => {
   return out
 })
 
-function openCreate(prefill?: { symbol?: string; market?: string; name?: string; recId?: number }) {
+function openCreate(prefill?: { symbol?: string; market?: string; name?: string; recId?: number; quantity?: number }) {
   editing.value = false
   editingClosed.value = false
   form.value = {
@@ -265,7 +265,7 @@ function openCreate(prefill?: { symbol?: string; market?: string; name?: string;
     position_type: 'short_term',
     buy_price: undefined,
     buy_date: todayStr(),
-    quantity: undefined,
+    quantity: prefill?.quantity,
     buy_fee: 0,
     buy_tax: 0,
     buy_reason: '',
@@ -1165,12 +1165,17 @@ function stockActionKey() {
   if (route.query.import === '1') return 'import'
   const symbol = String(route.query.symbol || '').trim()
   if (!symbol && route.query.add !== '1') return ''
-  return String(route.query._stock_action || '') || [symbol, route.query.market || 'cn', route.query.add || ''].join(':')
+  return String(route.query._stock_action || '') || [symbol, route.query.market || 'cn', route.query.add || '', route.query.quantity || ''].join(':')
+}
+
+function routeSuggestedQuantity(): number | undefined {
+  const value = Number(route.query.quantity)
+  return Number.isInteger(value) && value >= 100 && value % 100 === 0 ? value : undefined
 }
 
 function stockRouteRemainder() {
   const query = { ...route.query }
-  for (const key of ['symbol', 'market', 'name', 'add', 'import', 'rec_id', '_stock_action']) delete query[key]
+  for (const key of ['symbol', 'market', 'name', 'add', 'import', 'rec_id', 'quantity', '_stock_action']) delete query[key]
   return query
 }
 
@@ -1198,6 +1203,7 @@ async function applyStockActionQuery(): Promise<boolean> {
         market: String(route.query.market || 'cn'),
         name: String(route.query.name || ''),
         recId: Number(route.query.rec_id) || 0,
+        quantity: routeSuggestedQuantity(),
       })
       await router.replace({ name: 'positions', query: stockRouteRemainder() })
       return true
@@ -1233,6 +1239,7 @@ async function applyStockActionQuery(): Promise<boolean> {
         market: String(route.query.market || 'cn'),
         name: String(route.query.name || ''),
         recId: Number(route.query.rec_id) || 0,
+        quantity: routeSuggestedQuantity(),
       })
     }
     await router.replace({ name: 'positions', query: stockRouteRemainder() })

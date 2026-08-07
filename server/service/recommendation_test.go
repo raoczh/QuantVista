@@ -255,6 +255,7 @@ func TestRecReviewPickInputExcludesServerFields(t *testing.T) {
 	withServerFields.QualityGate = &qualityGateResult{}
 	withServerFields.DegradedSource = "quant_fallback"
 	withServerFields.QuoteAsOf = "2026-07-27 10:00:00"
+	withServerFields.ExecutionPlan = &executionPlan{Status: executionReady, Version: executionPlanVersion}
 	withServerFields.RawAction = &rawAction
 	withServerFields.RawConfidence = &rawConfidence
 
@@ -268,7 +269,7 @@ func TestRecReviewPickInputExcludesServerFields(t *testing.T) {
 	for _, key := range []string{
 		"position_pct", "position_why", "quant_score", "quant_rank", "pool_size", "lot_cost",
 		"evidence_check", "sys_confidence", "sys_confidence_why", "review", "bear",
-		"quality_gate", "degraded_source", "quote_as_of", "raw_action", "raw_confidence",
+		"quality_gate", "degraded_source", "quote_as_of", "execution_plan", "raw_action", "raw_confidence",
 	} {
 		if strings.Contains(string(got), `"`+key+`"`) {
 			t.Fatalf("复核 DTO 不得包含服务端字段 %s: %s", key, got)

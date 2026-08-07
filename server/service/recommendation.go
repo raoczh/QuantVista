@@ -318,6 +318,9 @@ type recPick struct {
 	DegradedSource string `json:"degraded_source,omitempty"`
 	// QuoteAsOf 该条推荐所依据行情的数据源时刻（服务端从候选回填，模型无权自附）。
 	QuoteAsOf string `json:"quote_as_of,omitempty"`
+	// ExecutionPlan 用户偏好与现有仓位适配后的纯程序研究计划。它不参与模型输入，
+	// 不改写原始 action/confidence；随 DetailJSON 固化，历史详情不按当前偏好回算。
+	ExecutionPlan *executionPlan `json:"execution_plan,omitempty"`
 	// RawConfidence 模型原始口头置信度快照（第五十六批②：复核改写前的值——applyReviews
 	// 的 reject 压 25/复核覆盖是 Confidence 唯一改写点，本字段在其之前由服务端快照）。
 	// 指针语义：nil=旧记录无原始值（校准侧单列 raw_missing，不硬造）；非 nil 恒序列化
@@ -497,6 +500,7 @@ type recGenPlan struct {
 	filters      RecFilters
 	verify       bool
 	bear         bool // S2-2 反方研究员（未显式指定时关联 verify）
+	preference   recommendationPreferenceSnapshot
 	cfg          *model.LLMConfig
 	apiKey       string
 	// prompt P0-6 修复批：recommend 模板的不可变运行快照——同步段一次读取固化，
@@ -508,6 +512,13 @@ type recGenPlan struct {
 // prepareGeneration 同步段：参数校验、LLM 配置解析、配额熔断、筛选条件装载。
 // 确定性错误（类型/策略非法、无 LLM、配额尽）立即返回给用户，不建任务。
 func (s *RecommendationService) prepareGeneration(userID int64, allowPrivate bool, req RecommendRequest, manualAction bool) (*recGenPlan, error) {
+	return s.prepareGenerationWithSnapshot(userID, allowPrivate, req, manualAction, nil)
+}
+
+// prepareGenerationWithSnapshot 供持久化作业复用同步请求时已冻结的偏好；frozen=nil
+// 才读取当前偏好。这样排队期间修改设置不会改变已创建批次的执行适配语义。
+func (s *RecommendationService) prepareGenerationWithSnapshot(userID int64, allowPrivate bool, req RecommendRequest,
+	manualAction bool, frozen *recommendationPreferenceSnapshot) (*recGenPlan, error) {
 	req.Type = strings.ToLower(strings.TrimSpace(req.Type))
 	if req.Type != model.RecTypeShortTerm && req.Type != model.RecTypeLongTerm {
 		return nil, errors.New("推荐类型须为 short_term 或 long_term")
@@ -517,7 +528,20 @@ func (s *RecommendationService) prepareGeneration(userID int64, allowPrivate boo
 	if serr != nil {
 		return nil, serr
 	}
+	prefSnapshot := recommendationPreferenceSnapshot{}
+	if frozen != nil {
+		prefSnapshot = *frozen
+	} else {
+		var err error
+		prefSnapshot, err = captureRecommendationPreferenceSnapshot(userID)
+		if err != nil {
+			return nil, err
+		}
+	}
 	count := req.Count
+	if count == 0 && prefSnapshot.DefaultRecCount >= 3 && prefSnapshot.DefaultRecCount <= 5 {
+		count = prefSnapshot.DefaultRecCount
+	}
 	if count < 3 {
 		count = 3
 	}
@@ -552,7 +576,8 @@ func (s *RecommendationService) prepareGeneration(userID int64, allowPrivate boo
 		userID: userID, allowPrivate: allowPrivate, manualAction: manualAction,
 		recType: req.Type, market: market, count: count, strat: strat,
 		filters: filters, verify: req.Verify, bear: bear, cfg: cfg, apiKey: apiKey,
-		prompt: loadPromptRuntime(userID, model.PromptModuleRecommend),
+		preference: prefSnapshot,
+		prompt:     loadPromptRuntime(userID, model.PromptModuleRecommend),
 	}, nil
 }
 
@@ -567,8 +592,9 @@ func (p *recGenPlan) newProcessingBatch() *model.RecommendationBatch {
 		// M3c：启用 recommend 自定义模板时版本号加 -custom 后缀（同分析域前例，历史可归因）。
 		// P0-6 修复批：版本出自 plan.prompt 快照——后台 buildMessages 用同一快照渲染正文，
 		// 版本与实际发送的模板内容必然一致（不再各自查库）。
-		PromptVersion:   p.prompt.Version(recPromptVersion),
-		StrategyVersion: recStrategyVersion,
+		PromptVersion:      p.prompt.Version(recPromptVersion),
+		StrategyVersion:    recStrategyVersion,
+		PreferenceSnapshot: marshalPreferenceSnapshot(p.preference),
 		// P0-2：批次级 trace_id 建任务即固化——processing 阶段轮询详情已可按它查审计。
 		TraceID: newLLMTraceID(),
 	}
@@ -905,6 +931,17 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	// 落库可回溯。相关性系数用同批次入选标的间的真实收益相关性。
 	sizingParams := defaultSizingParams()
 	applyBuyPositionSizing(picks, poolBySymbol, regime.Regime, sizingParams)
+	// U26：风险偏好只缩放上述现有仓位预算，不参与收益门槛、排序或 AI 结论。
+	// 参数已随 PreferenceSnapshot 固化，后续映射调整不影响本批历史。
+	applyRiskPreferenceSizing(picks, plan.preference, regime.Regime)
+	// 每条推荐固化执行适配。持仓查询始终带 user_id；查询异常时 fail-closed 为 wait，
+	// 不把无法核验是否重复持仓的条目包装成可执行。
+	holdingSymbols, holdingErr := loadHoldingSymbolSet(userID)
+	for i := range picks {
+		c := poolBySymbol[picks[i].Symbol]
+		picks[i].ExecutionPlan = buildExecutionPlan(recType, picks[i], c, plan.preference,
+			holdingSymbols[marketSymbolKey(c.Market, c.Symbol)], holdingErr == nil, "fresh")
+	}
 	regime.Sizing = &sizingParams
 	batch.RegimeJSON = marshalRegimeJSON(regime)
 
@@ -1578,7 +1615,7 @@ func normalizePick(p recPick, sym string, c candidate) recPick {
 	// 反方与质量门控链路回填——模型在输出 JSON 里自附这些字段会被 Unmarshal 吃进来，
 	// verify/bear 关闭时无人覆盖就会以「复核通过/反方低危」的假面落库展示。
 	// DegradedSource 不在此清（quant_fallback 构造路径先设值再过本函数）。
-	p.Review, p.Bear, p.QualityGate = nil, nil, nil
+	p.Review, p.Bear, p.QualityGate, p.ExecutionPlan = nil, nil, nil, nil
 	p.QuoteAsOf = ""      // 服务端回填字段，模型自附一律剥除
 	p.RawConfidence = nil // 服务端快照字段（复核前置信度），模型自附一律剥除
 	p.RawAction = nil     // 服务端快照字段（复核前动作），模型自附一律剥除

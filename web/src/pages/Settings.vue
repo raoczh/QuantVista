@@ -29,13 +29,23 @@ import {
   type LLMConfig,
   type LLMConfigInput,
 } from '@/api/llm'
-import { getPreference, updatePreference, changePassword, getQuota, type UserPreference, type UserQuota, type BlacklistEntry } from '@/api/user'
+import {
+  INVESTMENT_GUIDE_VERSION,
+  getPreference,
+  updatePreference,
+  changePassword,
+  getQuota,
+  type UserPreference,
+  type UserQuota,
+  type BlacklistEntry,
+} from '@/api/user'
 import { downloadExport, type ExportKind } from '@/api/export'
 import { useAuthStore } from '@/stores/auth'
 import { isNativeApp } from '@/config/runtime'
 import { useIsMobile } from '@/composables/useIsMobile'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import InvestmentPreferenceGuide from '@/components/InvestmentPreferenceGuide.vue'
 
 const message = useMessage()
 const router = useRouter()
@@ -190,6 +200,7 @@ async function testDraft() {
 /* ---------------- 用户偏好 ---------------- */
 const pref = ref<UserPreference | null>(null)
 const savingPref = ref(false)
+const showInvestmentGuide = ref(false)
 const riskOptions = [
   { label: '保守', value: 'conservative' },
   { label: '均衡', value: 'balanced' },
@@ -210,9 +221,19 @@ async function loadPref() {
     parseBlacklist(pref.value.blacklist_json)
     parseRecFilters(pref.value.rec_filters_json)
     parseGuardConfig(pref.value.guard_config_json)
+    if (pref.value.investment_guide_version < INVESTMENT_GUIDE_VERSION) {
+      showInvestmentGuide.value = true
+    }
   } catch (e) {
     message.error((e as Error).message)
   }
+}
+
+function applyGuidePreference(value: UserPreference) {
+  pref.value = value
+  parseBlacklist(value.blacklist_json)
+  parseRecFilters(value.rec_filters_json)
+  parseGuardConfig(value.guard_config_json)
 }
 
 /* ---------------- 候选池回避规则（黑名单 + 成交额门槛） ---------------- */
@@ -464,6 +485,12 @@ async function doExport(kind: ExportKind) {
     <n-tab-pane name="pref" tab="偏好设置">
       <SectionCard :hoverable="false">
         <n-form v-if="pref" :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 480px">
+          <div class="guide-entry">
+            <n-button size="small" secondary @click="showInvestmentGuide = true">重新填写三问投资偏好</n-button>
+            <span class="notify-hint">
+              {{ pref.investment_guide_status === 'completed' ? '已完成' : pref.investment_guide_status === 'skipped' ? '已跳过' : '未完成' }}
+            </span>
+          </div>
           <n-form-item label="风险等级">
             <n-select v-model:value="pref.risk_level" :options="riskOptions" />
           </n-form-item>
@@ -676,6 +703,11 @@ async function doExport(kind: ExportKind) {
 
     <!-- 新增/编辑配置弹窗。注意：必须放在 PageContainer 内部保持页面单根——
          外壳 Transition mode="out-in" 遇到多根组件时 leave 过渡无法执行，会卡成白屏。 -->
+    <InvestmentPreferenceGuide
+      v-model="showInvestmentGuide"
+      :preference="pref"
+      @updated="applyGuidePreference"
+    />
     <n-modal v-model:show="showModal" preset="card" :title="editingId ? '编辑 LLM 配置' : '新增 LLM 配置'" style="max-width: 520px">
       <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 96">
         <n-form-item label="名称">
@@ -812,6 +844,13 @@ async function doExport(kind: ExportKind) {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+.guide-entry {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
 }
 .notify-hint {
   font-size: 12px;

@@ -128,6 +128,7 @@ export interface RecDetail {
   pool_size?: number
   lot_cost?: number
   quote_as_of?: string // 该条推荐所依据行情的数据源时刻（行情时效硬门核验，服务端回填）
+  execution_plan?: ExecutionPlan
   evidence_check?: EvidenceCheck
   sys_confidence?: 'high' | 'medium' | 'low'
   sys_confidence_why?: string
@@ -141,6 +142,24 @@ export interface RecDetail {
   quality_gate?: QualityGateShadow
   // 非空 = 降级生成（quant_fallback：AI 精选超时后按量化排名规则合成，未经 AI 解读）
   degraded_source?: string
+}
+
+export type ExecutionStatus = 'ready' | 'wait' | 'not_suitable'
+
+// 纯程序执行适配：研究预算估算，不代表券商可用现金，也不改变 AI 原始结论。
+export interface ExecutionPlan {
+  status: ExecutionStatus
+  preference_explanation: string[]
+  planned_capital: number
+  planned_price: number
+  quantity: number
+  estimated_capital: number
+  max_planned_loss?: number
+  unavailable_reasons: string[]
+  data_as_of: string
+  data_status: 'fresh' | 'stale' | 'unknown' | string
+  budget_basis: 'research_budget'
+  version: string
 }
 
 // S2-2 反方研究员对单条 buy 的最强 bear case。
@@ -302,6 +321,7 @@ export interface RecommendationBatch {
   rejected_json?: string // 池内落选理由 JSON（详情接口返回，列表不含）
   filters_json?: string // 本次生效筛选条件快照（详情接口返回）
   review_json?: string // AI 复核结论 JSON（verify 模式，详情接口返回）
+  preference_snapshot?: string // 生成时固化的版本化用户偏好与风险预算参数
   reflection_json?: string // P1-5 反思记忆影子检索快照（详情接口返回；影子：未注入 prompt 不影响结果）
   trace_id?: string // P0-2 业务结果级审计关联（管理端 /admin/llm-calls 按它筛选调用记录）
   llm_run_json?: string // LLM 运行 manifest 数组（详情接口返回；推荐主调 run 含 P1-1 coverage 诊断）

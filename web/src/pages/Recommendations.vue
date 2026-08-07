@@ -50,8 +50,14 @@ import {
   type RecCoverageDiag,
   type ReflectionMatch,
   type ReflectionLayers,
+  type ExecutionStatus,
 } from '@/api/recommendation'
-import { getPreference, updatePreference, type UserPreference } from '@/api/user'
+import {
+  INVESTMENT_GUIDE_VERSION,
+  getPreference,
+  updatePreference,
+  type UserPreference,
+} from '@/api/user'
 import { getTodos, type TodoItem } from '@/api/todo'
 import { isAbortError } from '@/api/client'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
@@ -73,6 +79,7 @@ import { pollUntil, isPollCancelled } from '@/lib/poll'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
+import InvestmentPreferenceGuide from '@/components/InvestmentPreferenceGuide.vue'
 
 const message = useMessage()
 const route = useRoute()
@@ -101,6 +108,9 @@ const marketOptions = [
 ]
 
 // ---------- 表单 ----------
+// 必须在 query 状态规范化前记录是否由调用者显式覆盖；缺省值不能冒充显式选择。
+const recTypeExplicitInURL = route.query.rec_type !== undefined
+const countExplicitInURL = route.query.count !== undefined
 const recTypeQuery = enumQuery<'short_term' | 'long_term'>('short_term', ['short_term', 'long_term'])
 const strategyQuery = stringQuery('', 80)
 const countQuery = integerQuery(5, 3, 5)
@@ -129,6 +139,7 @@ watch(
 const filters = ref<RecFilters>(emptyRecFilters())
 const pref = ref<UserPreference | null>(null)
 const savingFilters = ref(false)
+const showInvestmentGuide = ref(false)
 
 // 价格快捷档（解决「资金少买不起高价股」的一键入口）。
 const pricePresets = [
@@ -199,6 +210,16 @@ function parseFiltersJSON(raw: string | undefined | null): RecFilters | null {
 async function loadPrefFilters() {
   try {
     pref.value = await getPreference()
+    // URL 显式值只影响本次；URL 未覆盖时才真正消费已保存的周期与推荐数量。
+    if (!recTypeExplicitInURL) {
+      form.value.type = pref.value.horizon_pref === 'short_term' ? 'short_term' : 'long_term'
+    }
+    if (!countExplicitInURL && pref.value.default_rec_count >= 3 && pref.value.default_rec_count <= 5) {
+      form.value.count = pref.value.default_rec_count
+    }
+    if (pref.value.investment_guide_version < INVESTMENT_GUIDE_VERSION) {
+      showInvestmentGuide.value = true
+    }
     const f = parseFiltersJSON(pref.value.rec_filters_json)
     if (f) {
       const fromQuery = filters.value
@@ -210,6 +231,16 @@ async function loadPrefFilters() {
     }
   } catch {
     /* 偏好读取失败用默认，不打扰 */
+  }
+}
+
+function applyGuidePreference(value: UserPreference) {
+  pref.value = value
+  if (!recTypeExplicitInURL) {
+    form.value.type = value.horizon_pref === 'short_term' ? 'short_term' : 'long_term'
+  }
+  if (!countExplicitInURL && value.default_rec_count >= 3 && value.default_rec_count <= 5) {
+    form.value.count = value.default_rec_count
   }
 }
 
@@ -268,6 +299,47 @@ async function loadLLM() {
 // ---------- 生成 ----------
 const running = ref(false)
 const current = ref<RecommendationView | null>(null)
+const showAllReady = ref(false)
+
+function executionStatus(item: RecommendationItem): ExecutionStatus {
+  // 旧记录没有 execution_plan：保留可读和一键建仓兼容，但绝不把它冒充当前可执行。
+  return item.detail?.execution_plan?.status || 'wait'
+}
+
+const readyItems = computed(() => current.value?.items.filter((item) => executionStatus(item) === 'ready') || [])
+const waitItems = computed(() => current.value?.items.filter((item) => executionStatus(item) === 'wait') || [])
+const unsuitableItems = computed(
+  () => current.value?.items.filter((item) => executionStatus(item) === 'not_suitable') || [],
+)
+const visibleResultItems = computed(() => [
+  ...(showAllReady.value ? readyItems.value : readyItems.value.slice(0, 3)),
+  ...waitItems.value,
+  ...unsuitableItems.value,
+])
+
+function executionGroupTitle(item: RecommendationItem) {
+  const status = executionStatus(item)
+  if (status === 'ready') return `当前可执行（${readyItems.value.length}）`
+  if (status === 'not_suitable') return `暂不适合（${unsuitableItems.value.length}）`
+  return `等待条件（${waitItems.value.length}）`
+}
+
+function executionStatusLabel(item: RecommendationItem) {
+  const status = executionStatus(item)
+  if (!item.detail?.execution_plan) return '旧记录 · 待人工核验'
+  if (status === 'ready') return '当前可执行'
+  if (status === 'not_suitable') return '暂不适合'
+  return '等待条件'
+}
+
+function startsExecutionGroup(index: number) {
+  if (index === 0) return true
+  return executionStatus(visibleResultItems.value[index]) !== executionStatus(visibleResultItems.value[index - 1])
+}
+
+watch(() => current.value?.id, () => {
+  showAllReady.value = false
+})
 
 async function generate() {
   // 偏好接口慢/失败时表单仍是内置默认——生成前补一次加载，避免用户以为提交的是自己保存的偏好。
@@ -406,9 +478,17 @@ async function removeBatch(b: RecommendationBatch) {
 
 // 一键建仓：跳持仓页预填（带 rec_id 血缘，落库后详情可见「已建仓」与价格对比）。
 function buildPosition(item: RecommendationItem) {
+  const quantity = item.detail?.execution_plan?.quantity || 0
   router.push({
     name: 'positions',
-    query: { add: '1', symbol: item.symbol, market: item.market, name: item.name, rec_id: String(item.id) },
+    query: {
+      add: '1',
+      symbol: item.symbol,
+      market: item.market,
+      name: item.name,
+      rec_id: String(item.id),
+      quantity: quantity >= 100 ? String(quantity) : undefined,
+    },
   })
 }
 
@@ -532,6 +612,9 @@ function actionColor(a: string) {
 }
 function fmt(n: number | undefined) {
   return n == null || n === 0 ? '—' : n.toFixed(2)
+}
+function fmtMoney(n: number | undefined) {
+  return n && n > 0 ? `${n.toLocaleString('zh-CN', { maximumFractionDigits: 0 })} 元` : '—'
 }
 // 本地日期（YYYY-MM-DD）：追踪价归属日早于它 = 后端拿不到当日 fresh 行情、回退末根
 // 日线收盘，展示须标「X 收盘价」而非「现价」。
@@ -969,6 +1052,10 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
       <!-- 左：生成 + 历史 -->
       <div class="col-form">
         <SectionCard title="生成推荐">
+          <div class="pref-entry">
+            <span v-if="pref">{{ pref.horizon_pref === 'short_term' ? '短线' : pref.horizon_pref === 'mid_term' ? '中线' : '长线' }} · {{ pref.risk_level === 'conservative' ? '保守' : pref.risk_level === 'aggressive' ? '激进' : '均衡' }}</span>
+            <n-button size="tiny" quaternary @click="showInvestmentGuide = true">投资偏好</n-button>
+          </div>
           <n-form label-placement="top" :show-feedback="false" class="form">
             <n-form-item label="类型">
               <n-radio-group v-model:value="form.type">
@@ -1128,11 +1215,10 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
           </n-spin>
         </SectionCard>
 
-        <SectionCard v-if="performance && performance.sample > 0" title="历史表现">
-          <template #extra>
-            <span class="perf-n">样本 n={{ performance.sample }}</span>
-          </template>
-          <div class="perf">
+        <SectionCard v-if="performance && performance.sample > 0">
+          <n-collapse>
+            <n-collapse-item :title="`历史统计（样本 n=${performance.sample}）`" name="performance">
+              <div class="perf">
             <!-- S0-4 买入成熟口径（主指标）：只统计 action=buy 且已成熟（止盈/止损/过期）的样本，
                  watch 与未成熟不再混入分母虚增胜率。 -->
             <div class="perf-row">
@@ -1222,7 +1308,9 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
               仅统计有价格数据的推荐（量化降级批次单独剔除）；超额收益以上证指数为基准；买入胜率只计已成熟样本（短线终态/长线超复盘周期）。
             </div>
             <div v-if="performance.buy_matured < 10" class="perf-note">成熟买入样本较少（n&lt;10），统计结果波动大，仅供参考。</div>
-          </div>
+              </div>
+            </n-collapse-item>
+          </n-collapse>
         </SectionCard>
       </div>
 
@@ -1320,7 +1408,11 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
               />
 
               <div class="cards">
-                <div v-for="it in current.items" :key="it.id" class="card">
+                <template v-for="(it, itemIndex) in visibleResultItems" :key="it.id">
+                  <div v-if="startsExecutionGroup(itemIndex)" class="execution-group-head">
+                    {{ executionGroupTitle(it) }}
+                  </div>
+                  <div class="card">
                   <!-- 头 -->
                   <div class="card-head">
                     <div class="card-title">
@@ -1361,6 +1453,44 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
                       </span>
                       <n-tag v-if="it.position.status === 'closed'" size="tiny" :bordered="false">已卖出</n-tag>
                     </template>
+                  </div>
+
+                  <div v-if="it.detail" class="execution-summary" :data-status="executionStatus(it)">
+                    <div class="execution-summary-head">
+                      <n-tag
+                        size="small"
+                        :type="executionStatus(it) === 'ready' ? 'success' : executionStatus(it) === 'wait' ? 'warning' : 'default'"
+                        :bordered="false"
+                        round
+                      >{{ executionStatusLabel(it) }}</n-tag>
+                      <span v-if="it.detail.execution_plan" class="execution-asof">
+                        数据 {{ it.detail.execution_plan.data_as_of || '时点未知' }} · {{ it.detail.execution_plan.version }}
+                      </span>
+                    </div>
+                    <div v-if="it.detail.reason?.[0]" class="execution-row">
+                      <span>理由</span><b>{{ it.detail.reason[0] }}</b>
+                    </div>
+                    <div v-if="it.detail.risks?.[0]" class="execution-row risk-row">
+                      <span>最大风险</span><b>{{ it.detail.risks[0] }}</b>
+                    </div>
+                    <div v-if="it.detail.invalidation" class="execution-row">
+                      <span>失效条件</span><b>{{ it.detail.invalidation }}</b>
+                    </div>
+                    <div v-if="it.detail.execution_plan" class="execution-money">
+                      <div><span>计划金额</span><b>{{ fmtMoney(it.detail.execution_plan.planned_capital) }}</b></div>
+                      <div><span>整手数量</span><b>{{ it.detail.execution_plan.quantity ? `${it.detail.execution_plan.quantity} 股` : '—' }}</b></div>
+                      <div><span>预计占用</span><b>{{ fmtMoney(it.detail.execution_plan.estimated_capital) }}</b></div>
+                      <div><span>最大计划亏损</span><b>{{ fmtMoney(it.detail.execution_plan.max_planned_loss) }}</b></div>
+                    </div>
+                    <div v-if="it.detail.execution_plan?.preference_explanation?.length" class="execution-pref">
+                      <span v-for="(line, i) in it.detail.execution_plan.preference_explanation" :key="i">{{ line }}</span>
+                    </div>
+                    <div v-if="it.detail.execution_plan?.unavailable_reasons?.length" class="execution-reasons">
+                      {{ it.detail.execution_plan.unavailable_reasons.join('；') }}
+                    </div>
+                    <div v-if="!it.detail.execution_plan" class="execution-reasons">
+                      该批生成于执行计划版本上线前，保留原推荐与操作入口，但不标记为当前可执行。
+                    </div>
                   </div>
 
                   <!-- 信任徽章：量化分/排名 · 一手成本 · 证据核验 · 综合置信 · AI 复核 -->
@@ -1497,18 +1627,20 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
                       {{ it.detail.thesis }}
                     </p>
 
-                    <div v-if="it.detail.reason.length" class="block">
-                      <div class="block-title">理由</div>
-                      <ul>
-                        <li v-for="(x, i) in it.detail.reason" :key="i">{{ x }}</li>
-                      </ul>
-                    </div>
-                    <div v-if="it.detail.risks.length" class="block">
-                      <div class="block-title" :style="{ color: downColor }">风险</div>
-                      <ul>
-                        <li v-for="(x, i) in it.detail.risks" :key="i">{{ x }}</li>
-                      </ul>
-                    </div>
+                    <n-collapse class="item-research">
+                      <n-collapse-item title="完整理由、证据与反方核验" name="research">
+                        <div v-if="it.detail.reason?.length" class="block">
+                          <div class="block-title">完整理由</div>
+                          <ul>
+                            <li v-for="(x, i) in it.detail.reason" :key="i">{{ x }}</li>
+                          </ul>
+                        </div>
+                        <div v-if="it.detail.risks?.length" class="block">
+                          <div class="block-title" :style="{ color: downColor }">完整风险</div>
+                          <ul>
+                            <li v-for="(x, i) in it.detail.risks" :key="i">{{ x }}</li>
+                          </ul>
+                        </div>
                     <!-- S2-2 反方研究员（影子）：最强 bear case 只展示，不改写结论 -->
                     <div v-if="it.detail.bear" class="block bear-block" :style="{ borderColor: withAlpha(bearSeverityColor(it.detail.bear.severity), 0.35) }">
                       <div class="block-title bear-title">
@@ -1528,22 +1660,20 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
                       </template>
                       <template v-if="it.detail.quality_gate.senti_missing">当日无相关新闻（情绪数据缺失，不代表情绪中性）。</template>
                     </div>
-                    <div v-if="it.detail.evidence.length" class="block">
+                    <div v-if="it.detail.evidence?.length" class="block">
                       <div class="block-title">数据依据</div>
                       <ul>
                         <li v-for="(x, i) in it.detail.evidence" :key="i">{{ x }}</li>
                       </ul>
                     </div>
-                    <div v-if="current.type === 'long_term' && it.detail.key_metrics.length" class="block">
+                    <div v-if="current.type === 'long_term' && it.detail.key_metrics?.length" class="block">
                       <div class="block-title">跟踪指标</div>
                       <div class="metrics">
                         <n-tag v-for="(m, i) in it.detail.key_metrics" :key="i" size="small" :bordered="false" round>{{ m }}</n-tag>
                       </div>
                     </div>
-                    <!-- P1-2：失效条件短线/长线都展示（长线 p13 起要求模型输出投资逻辑作废信号） -->
-                    <div v-if="it.detail.invalidation" class="invalid">
-                      失效条件：{{ it.detail.invalidation }}
-                    </div>
+                      </n-collapse-item>
+                    </n-collapse>
                     <!-- S1-4 执行纪律三条（固定展示：截住「推荐胜率」与「用户执行」的偏差） -->
                     <div v-if="current.type === 'short_term' && it.detail.buy_zone_high > 0" class="discipline">
                       执行纪律：① 买入区间外不追（高于 {{ fmt(it.detail.buy_zone_high) }} 放弃本次机会）；②
@@ -1561,10 +1691,25 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
                       @click="addStopAlert(it)"
                       >挂止损提醒</n-button
                     >
-                    <n-button v-if="!it.position" size="small" type="primary" ghost @click="buildPosition(it)">一键建仓</n-button>
+                    <n-button
+                      v-if="!it.position && (!it.detail?.execution_plan || executionStatus(it) === 'ready')"
+                      size="small"
+                      type="primary"
+                      ghost
+                      @click="buildPosition(it)"
+                    >一键建仓</n-button>
+                    <n-button v-else-if="!it.position" size="small" disabled>条件未满足</n-button>
                     <n-button v-else size="small" tertiary @click="router.push({ name: 'positions' })">查看持仓</n-button>
                   </div>
                 </div>
+                  <n-button
+                    v-if="itemIndex === 2 && readyItems.length > 3 && !showAllReady"
+                    class="show-more-ready"
+                    size="small"
+                    tertiary
+                    @click="showAllReady = true"
+                  >展开其余 {{ readyItems.length - 3 }} 条可执行项</n-button>
+                </template>
               </div>
 
               <!-- 候选池全景：每只股为什么进、为什么被筛掉、量化分排第几，全透明 -->
@@ -1869,6 +2014,11 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
         </div>
       </n-spin>
     </n-modal>
+    <InvestmentPreferenceGuide
+      v-model="showInvestmentGuide"
+      :preference="pref"
+      @updated="applyGuidePreference"
+    />
   </PageContainer>
 </template>
 
@@ -1911,6 +2061,15 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+.pref-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  opacity: 0.75;
 }
 .hint {
   font-size: 12px;
@@ -2088,6 +2247,14 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
   flex-direction: column;
   gap: 14px;
 }
+.execution-group-head {
+  padding: 2px 2px 0;
+  font-size: 14px;
+  font-weight: 700;
+}
+.show-more-ready {
+  align-self: flex-start;
+}
 .card {
   border: 1px solid var(--qv-divider);
   border-radius: 12px;
@@ -2139,6 +2306,83 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
   font-size: 12px;
   opacity: 0.7;
   margin: 6px 0 12px;
+}
+.execution-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  margin-bottom: 12px;
+  border: 1px solid var(--qv-divider);
+  border-left: 3px solid v-bind('vars.warningColor');
+  border-radius: 8px;
+  background: v-bind('withAlpha(vars.warningColor, 0.035)');
+}
+.execution-summary[data-status='ready'] {
+  border-left-color: v-bind('vars.successColor');
+  background: v-bind('withAlpha(vars.successColor, 0.035)');
+}
+.execution-summary[data-status='not_suitable'] {
+  border-left-color: v-bind('vars.textColor3');
+  background: v-bind('withAlpha(vars.textColor3, 0.025)');
+}
+.execution-summary-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.execution-asof {
+  font-size: 11px;
+  opacity: 0.55;
+}
+.execution-row {
+  display: grid;
+  grid-template-columns: 70px minmax(0, 1fr);
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.execution-row > span,
+.execution-money span {
+  opacity: 0.55;
+}
+.execution-row > b {
+  font-weight: 500;
+}
+.risk-row > b {
+  color: v-bind('vars.errorColor');
+}
+.execution-money {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(110px, 1fr));
+  gap: 8px;
+}
+.execution-money > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  font-size: 12px;
+}
+.execution-money b {
+  font-size: 14px;
+}
+.execution-pref {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11px;
+  opacity: 0.65;
+}
+.execution-reasons {
+  font-size: 12px;
+  line-height: 1.5;
+  color: v-bind('vars.warningColor');
+}
+.item-research {
+  margin: 4px 0 8px;
 }
 /* 追踪状态 */
 .track {
@@ -2472,6 +2716,12 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
   margin-top: 3px;
 }
 @media (max-width: 768px) {
+  .execution-money {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .execution-row {
+    grid-template-columns: 64px minmax(0, 1fr);
+  }
   .review-item {
     flex-wrap: wrap;
     row-gap: 4px;

@@ -14,14 +14,16 @@ import (
 )
 
 type recommendationJobRequest struct {
-	Version int              `json:"version"`
-	Request RecommendRequest `json:"request"`
-	Manual  bool             `json:"manual"`
+	Version            int                               `json:"version"`
+	Request            RecommendRequest                  `json:"request"`
+	Manual             bool                              `json:"manual"`
+	PreferenceSnapshot *recommendationPreferenceSnapshot `json:"preference_snapshot,omitempty"`
 }
 
 func recommendationJobRequestFromPlan(req RecommendRequest, plan *recGenPlan, manual bool) recommendationJobRequest {
 	filters := plan.filters
-	return recommendationJobRequest{Version: 1, Manual: manual, Request: RecommendRequest{
+	snapshot := plan.preference
+	return recommendationJobRequest{Version: 2, Manual: manual, PreferenceSnapshot: &snapshot, Request: RecommendRequest{
 		Type: plan.recType, Market: plan.market, Strategy: plan.strat.Key, Count: plan.count,
 		Filters: &filters, Verify: plan.verify, BearCheck: boolPtr(plan.bear), LLMConfigID: req.LLMConfigID,
 	}}
@@ -57,7 +59,8 @@ func (s *RecommendationService) registerDurableJobHandler() {
 			if err != nil {
 				return 0, fmt.Errorf("推荐作业快照无效: %w", err)
 			}
-			plan, err := s.prepareGeneration(run.UserID, isAdminUser(run.UserID), jobReq.Request, jobReq.Manual)
+			plan, err := s.prepareGenerationWithSnapshot(run.UserID, isAdminUser(run.UserID), jobReq.Request,
+				jobReq.Manual, jobReq.PreferenceSnapshot)
 			if err != nil {
 				return 0, err
 			}
@@ -111,7 +114,8 @@ func (s *RecommendationService) registerDurableJobHandler() {
 			if err != nil {
 				return DurableJobResult{}, fmt.Errorf("推荐作业快照无效: %w", err)
 			}
-			plan, err := s.prepareGeneration(userID, allowPrivate, jobReq.Request, jobReq.Manual)
+			plan, err := s.prepareGenerationWithSnapshot(userID, allowPrivate, jobReq.Request,
+				jobReq.Manual, jobReq.PreferenceSnapshot)
 			if err != nil {
 				return DurableJobResult{}, err
 			}

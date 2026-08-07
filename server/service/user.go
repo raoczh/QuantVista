@@ -52,6 +52,9 @@ type PreferenceInput struct {
 
 	TotalCapital    float64 `json:"total_capital"`     // 总投资资金（元；0=未设置，持仓 AI 不注入资金上下文）
 	GuardConfigJSON string  `json:"guard_config_json"` // 智能守护配置（guardConfig JSON；空=默认全开）
+
+	InvestmentGuideVersion int    `json:"investment_guide_version"`
+	InvestmentGuideStatus  string `json:"investment_guide_status"`
 }
 
 // BlacklistEntry 候选池黑名单条目（用户配置的回避规则）。
@@ -116,6 +119,13 @@ const (
 
 	RecommendationTypeShortTerm = "short_term"
 	RecommendationTypeLongTerm  = "long_term"
+
+	// InvestmentGuideCurrentVersion 三问向导题目/语义版本。字段默认值不能代表用户作答；
+	// 前端仅在保存完成或明确跳过时写入当前版本。
+	InvestmentGuideCurrentVersion = 1
+	InvestmentGuideNotStarted     = "not_started"
+	InvestmentGuideCompleted      = "completed"
+	InvestmentGuideSkipped        = "skipped"
 )
 
 var (
@@ -151,6 +161,26 @@ func (s *UserService) UpdatePreference(userID int64, in PreferenceInput) (*model
 	if in.DefaultRecCount < 3 || in.DefaultRecCount > 5 {
 		return nil, errors.New("默认推荐数量需在 3~5 之间")
 	}
+	if in.TotalCapital < 0 || in.TotalCapital > 1e12 {
+		return nil, errors.New("总投资资金需在 0~1万亿 之间（0=未设置）")
+	}
+	guideStatus := strings.TrimSpace(in.InvestmentGuideStatus)
+	if guideStatus == "" && in.InvestmentGuideVersion == 0 {
+		guideStatus = InvestmentGuideNotStarted
+	}
+	if in.InvestmentGuideVersion < 0 || in.InvestmentGuideVersion > InvestmentGuideCurrentVersion {
+		return nil, errors.New("非法的投资偏好向导版本")
+	}
+	if in.InvestmentGuideVersion == 0 {
+		if guideStatus != InvestmentGuideNotStarted {
+			return nil, errors.New("未完成的投资偏好向导状态无效")
+		}
+	} else if guideStatus != InvestmentGuideCompleted && guideStatus != InvestmentGuideSkipped {
+		return nil, errors.New("非法的投资偏好向导状态")
+	}
+	if guideStatus == InvestmentGuideCompleted && in.TotalCapital <= 0 {
+		return nil, errors.New("完成投资偏好向导时需填写大于 0 的总投资资金")
+	}
 	if in.MinCandidateAmount < 0 || in.MinCandidateAmount > 1e12 {
 		return nil, errors.New("候选池最低成交额需在 0~1万亿 之间（0=不过滤）")
 	}
@@ -180,10 +210,9 @@ func (s *UserService) UpdatePreference(userID int64, in PreferenceInput) (*model
 	p.RecFiltersJSON = recFilters
 	p.EnableDailyReport = in.EnableDailyReport
 	p.GuardConfigJSON = guardCfg
-	if in.TotalCapital < 0 || in.TotalCapital > 1e12 {
-		return nil, errors.New("总投资资金需在 0~1万亿 之间（0=未设置）")
-	}
 	p.TotalCapital = in.TotalCapital
+	p.InvestmentGuideVersion = in.InvestmentGuideVersion
+	p.InvestmentGuideStatus = guideStatus
 	if err := common.DB.Save(p).Error; err != nil {
 		return nil, err
 	}

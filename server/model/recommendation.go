@@ -38,6 +38,9 @@ type RecommendationBatch struct {
 	RejectedJSON   string `gorm:"type:text" json:"rejected_json,omitempty"`        // 池内落选标的一句话理由 [{symbol,name,reason}]（列表查询不返回）
 	FiltersJSON    string `gorm:"type:text" json:"filters_json,omitempty"`         // 本次生效的筛选条件快照（透明可回显）
 	ReviewJSON     string `gorm:"type:text" json:"review_json,omitempty"`          // AI 复核员结论 JSON（verify 模式；列表查询不返回）
+	// PreferenceSnapshot 生成同步段固化的用户偏好与风险预算参数。历史批次只读该快照，
+	// 不用当前 UserPreference 回算，避免偏好更新后历史执行计划漂移。
+	PreferenceSnapshot string `gorm:"type:text" json:"preference_snapshot,omitempty"`
 
 	// Regime S1-1 大盘闸门三档判定（offense/neutral/defense；空=未判定，如旧记录/数据缺失）。
 	// 影子模式：只落库与展示，不改写 action；强制降级由 feature flag 控制（默认关）。
