@@ -513,8 +513,7 @@ func (s *ScreenerService) resolveStrategy(userID int64, req ScanRequest) (*resol
 		if !ok {
 			return nil, fmt.Errorf("未知内置策略 %q", req.StrategyKey)
 		}
-		tree := b.Tree // 拷贝（between 校验会原地交换 value）
-		treeJSON, err := json.Marshal(tree)
+		tree, treeJSON, err := canonicalCondTree(&b.Tree)
 		if err != nil {
 			return nil, err
 		}
@@ -522,7 +521,7 @@ func (s *ScreenerService) resolveStrategy(userID int64, req ScanRequest) (*resol
 		if err != nil {
 			return nil, fmt.Errorf("内置策略版本摘要生成失败: %w", err)
 		}
-		return &resolvedScreenerStrategy{Tree: &tree, Name: b.Name, Revision: 1, Hash: hash}, nil
+		return &resolvedScreenerStrategy{Tree: tree, Name: b.Name, Revision: 1, Hash: hash}, nil
 	case req.StrategyID > 0:
 		if common.DB == nil {
 			return nil, errors.New("数据库不可用")
@@ -548,12 +547,16 @@ func (s *ScreenerService) resolveStrategy(userID int64, req ScanRequest) (*resol
 		if err := json.Unmarshal([]byte(revision.TreeJSON), &tree); err != nil {
 			return nil, fmt.Errorf("策略条件解析失败: %v", err)
 		}
+		canonicalTree, _, err := canonicalCondTree(&tree)
+		if err != nil {
+			return nil, err
+		}
 		return &resolvedScreenerStrategy{
-			Tree: &tree, Name: revision.Name, StrategyID: strategy.ID,
+			Tree: canonicalTree, Name: revision.Name, StrategyID: strategy.ID,
 			RevisionID: revision.ID, Revision: revision.Revision, Hash: revision.ContentHash,
 		}, nil
 	case req.Tree != nil:
-		treeJSON, err := json.Marshal(req.Tree)
+		tree, treeJSON, err := canonicalCondTree(req.Tree)
 		if err != nil {
 			return nil, err
 		}
@@ -561,9 +564,34 @@ func (s *ScreenerService) resolveStrategy(userID int64, req ScanRequest) (*resol
 		if err != nil {
 			return nil, fmt.Errorf("临时策略版本摘要生成失败: %w", err)
 		}
-		return &resolvedScreenerStrategy{Tree: req.Tree, Name: "自定义条件", Revision: 1, Hash: hash}, nil
+		return &resolvedScreenerStrategy{Tree: tree, Name: "自定义条件", Revision: 1, Hash: hash}, nil
 	}
 	return nil, errors.New("请指定策略（strategy_key / strategy_id / tree 三选一）")
+}
+
+// canonicalCondTree 深复制并规范化条件树，再由规范化后的 JSON 计算内容摘要。
+// validateCondTree 对 between 允许宽容交换上下界；如果直接对调用方树校验后再
+// 使用校验前的 JSON 算 hash，会让 hash 与实际执行条件不一致。
+func canonicalCondTree(input *CondNode) (*CondNode, []byte, error) {
+	if input == nil {
+		return nil, nil, errors.New("条件树为空")
+	}
+	raw, err := json.Marshal(input)
+	if err != nil {
+		return nil, nil, err
+	}
+	var tree CondNode
+	if err := json.Unmarshal(raw, &tree); err != nil {
+		return nil, nil, err
+	}
+	if _, err := validateCondTree(&tree, 1); err != nil {
+		return nil, nil, err
+	}
+	canonical, err := json.Marshal(&tree)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &tree, canonical, nil
 }
 
 // resolveTree 保留给包内既有调用；新执行路径如需版本元数据应使用 resolveStrategy。

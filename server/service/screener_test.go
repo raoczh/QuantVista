@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -226,6 +227,32 @@ func TestValidateCondTree(t *testing.T) {
 		if _, err := validateCondTree(&tree, 1); err != nil {
 			t.Errorf("内置策略 %s 校验失败: %v", b.Key, err)
 		}
+	}
+}
+
+func TestResolveStrategyHashUsesCanonicalTree(t *testing.T) {
+	value, value2 := 45.0, 30.0
+	input := &CondNode{Factor: "rsi_14", Op: "between", Value: &value, Value2: &value2}
+	resolved, err := (&ScreenerService{}).resolveStrategy(1, ScanRequest{Tree: input})
+	if err != nil {
+		t.Fatalf("临时条件树解析失败: %v", err)
+	}
+	if *input.Value != 45 || *input.Value2 != 30 {
+		t.Fatalf("解析不应改写调用方条件树: %+v", input)
+	}
+	if *resolved.Tree.Value != 30 || *resolved.Tree.Value2 != 45 {
+		t.Fatalf("规范化后的 between 上下界不正确: %+v", resolved.Tree)
+	}
+	treeJSON, err := json.Marshal(resolved.Tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := model.ScreenerStrategyContentHash("自定义条件", "", "swing", "mid", string(treeJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Hash != want {
+		t.Fatalf("策略 hash 必须对应实际执行树: got=%s want=%s", resolved.Hash, want)
 	}
 }
 
