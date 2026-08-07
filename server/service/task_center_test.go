@@ -93,6 +93,9 @@ func TestTaskCenterUserIsolationAdminSystemAndStatusMapping(t *testing.T) {
 		if item.Source == TaskSourceDataSync || item.Title == "其他用户任务" {
 			t.Fatalf("普通用户泄露系统或其他用户任务: %+v", item)
 		}
+		if item.Owner != model.JobOwnerUser || item.OwnerUserID == nil || *item.OwnerUserID != 1 {
+			t.Fatalf("legacy 用户任务必须补齐 owner 契约: %+v", item)
+		}
 		if item.ID != fmt.Sprintf("%s:%d", item.Source, item.SourceID) {
 			t.Fatalf("复合 ID 不稳定: %+v", item)
 		}

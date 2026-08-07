@@ -22,8 +22,12 @@ const (
 )
 
 func persistAnalysisArtifact(tx *gorm.DB, run *model.JobRun, rec model.AnalysisRecord, availableAt time.Time) error {
+	target := rec.Symbol
+	if target == "" {
+		target = rec.Target
+	}
 	return createResearchArtifact(tx, run, ArtifactTypeAnalysis,
-		fmt.Sprintf("%s:%s:%s", rec.Module, rec.Market, rec.Symbol), rec.AsOf,
+		fmt.Sprintf("%s:%s:%s", rec.Module, rec.Market, target), rec.AsOf,
 		"analysis_records:"+fmt.Sprint(rec.ID), rec.TraceID, rec, availableAt)
 }
 

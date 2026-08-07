@@ -632,11 +632,11 @@ P0-2B-1/P0-2B-2A 覆盖七类用户任务；P0-2B-2B 在同一运行时加入 `s
 
 - **owner 与事实模型**：`job_runs.owner_type` 只允许应用层语义上的 user/system；user 必须绑定正数 `user_id`，system 必须为 SQL NULL，`triggered_by` 只记录管理员手动触发者。JobEvent 继承相同 owner。JobRun 保存 kind、版本化请求、状态、父作业、错误、trace、业务计数和结果引用；步骤只记录真实发生阶段，状态仅允许 `queued/running/success/degraded/failed/canceled`，终态以 CAS 收敛且不可回退。
 - **快照、权限与结果绑定**：request snapshot 最大 16KiB，拒绝密钥、Authorization、prompt/消息和数据/结果正文。`result_type` 支持 `llm_task/analysis/recommendation/daily_report/data_sync`。用户作业执行时重判账号状态/角色；普通用户无法读取、取消或重跑系统 ID，管理员只扩展到 system owner，不借此读取其他用户作业。DataSyncLog processing 占位、JobRun 和引用同事务创建；成功、部分失败、失败或取消均在 JobRun 终态事务更新同一日志，保留已完成计数，不产生第二条结果日志。
-- **幂等与容量**：用户按 owner/kind/request hash 防重，系统按 kind 排他防重；active key 仅 queued/running 持有。运行时固定 4 worker、最多 32 总在途。用户入口满载返回 `job_queue_busy`；系统定时器对该错误去重重试，接受前不建事实行。管理员指标按 kind/status 聚合并显示最老排队与容量，查询禁止选择请求快照。
+- **幂等与容量**：用户按 owner/kind/request hash 防重，系统按 kind 排他防重；active key 仅 queued/running 持有。管理员重复手动触发同 kind 系统任务时返回既有 JobRun 与 `started=false`，不得把旧任务伪报成新计划已启动。运行时固定 4 worker、最多 32 总在途。用户入口满载返回 `job_queue_busy`；系统定时器对该错误去重重试，接受前不建事实行。管理员指标按 kind/status 聚合并显示最老排队与容量，查询禁止选择请求快照。
 - **取消与恢复**：queued 取消用 CAS 直接进入 canceled；running 先持久化 `cancel_requested`，本实例立即取消 Context，其他实例/恢复路径通过数据库轮询协作取消。成功持久化与取消在同一事务条件上竞争，只有一个终态获胜。启动时遗留 running 明确收敛为 `job_interrupted`（已请求取消者收敛 canceled），queued 按 ID 升序恢复，容量外的 queued 保持排队并随槽位释放续排。
 - **重跑**：失败且已注册的用户或系统 handler 可重跑。新 run 从旧快照创建并写 `parent_id`，旧 run 不修改；系统重跑的 `triggered_by` 是执行该动作的管理员。已有等价用户请求或同 kind 系统任务在途时返回 `job_already_running`。
 - **事件与前端**：`GET /api/tasks/events` 位于 JWT 中间件后，支持 `Last-Event-ID`、单调 `id:`、`event: job` 与 15s heartbeat。前端用 `fetch` 的 `Authorization` 请求头读取流，token 从不进入 URL；断线指数重连并保留串行轮询回退。任务中心优先列 JobRun，查询旧 `llm_tasks` 与三类业务表时排除已被 `result_type/result_id` 引用的行，从而避免双行；深链使用业务 `result_id`，旧业务详情路由继续兼容。
-- **ResearchArtifact**：只保存 `type/schema_version/subject/as_of/available_at/content_hash/source_refs/storage_ref/job_run_id/owner/created_at`。分析、推荐、日报在业务结果校验与 JobRun 终态同一事务幂等建索引；hash 从当次已持久事实计算，正文、候选池和快照不复制。历史行不自动回填；扫描/回测当前没有持久结果事实，因此不猜测建索引，待将来先落不可变结果再接线。
+- **ResearchArtifact**：只保存 `type/schema_version/subject/as_of/available_at/content_hash/source_refs/storage_ref/job_run_id/owner/created_at`。分析、推荐、日报在业务结果校验与 JobRun 终态同一事务幂等建索引；分析 subject 对非个股模块使用真实 target，不能退化成空 symbol。hash 从当次已持久事实计算，正文、候选池和快照不复制。历史行不自动回填；扫描/回测当前没有持久结果事实，因此不猜测建索引，待将来先落不可变结果再接线。
 - **保留策略**：每日 03:35 只删除“对应 JobRun 已终态且事件早于 30 天”的 JobEvent。JobRun/request snapshot 为重跑与审计保留，JobStep 随 JobRun 保留，业务快照由原事实表负责，ResearchArtifact 一期永久保留且拒绝更新/删除。任何后续分层归档必须先证明不会切断 parent 重跑、审计和 source/storage 血缘。
 
 ### 6.12 数据覆盖、主动探测与解冷（P0-3A / P0-3B）

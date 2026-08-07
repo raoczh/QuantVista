@@ -70,7 +70,7 @@ QuantVista 现状以以下证据优先级判定：
 
 > 2026-08-07 状态修正：P0-2B-2B 已完成代码与自动化测试，当前为“代码已实现、待线上部署验收”。六类系统维护/因子任务使用 `owner=system + user_id IS NULL`，管理员手动触发另记 `triggered_by`；DataSyncLog 保持结果事实。分析/推荐/日报已幂等接一期不可变 ResearchArtifact，历史不猜测回填；扫描/回测尚无持久结果表，因此未伪造工件。管理员已有 kind/status、最老排队和容量指标；事件保留清理不删除步骤、快照、JobRun 或 Artifact。
 
-> 2026-08-07 审查修复：P0-2B-2A 的 legacy stale 收敛已排除仍被 queued/running JobRun 引用的分析、推荐和日报结果，避免长排队任务被旧 15 分钟清理器抢写；自动日报把 `job_queue_busy` 视为瞬时背压，不落永久失败行并在下一轮继续提交。两条均有数据库回归测试，线上仍需按 `ROADMAP.md` 压力场景验收。
+> 2026-08-07 审查修复：P0-2B-2A 的 legacy stale 收敛已排除仍被 queued/running JobRun 引用的分析、推荐和日报结果，避免长排队任务被旧 15 分钟清理器抢写；自动日报把 `job_queue_busy` 视为瞬时背压，不落永久失败行并在下一轮继续提交。P0-2B-2B 管理员重复触发同 kind 系统任务时返回既有 JobRun 与 `started=false`，管理页不再误报新任务；非个股分析 Artifact subject 使用真实 target。上述契约均有数据库回归测试，线上仍需按 `ROADMAP.md` 压力场景验收。
 
 - **稳定已有**：路由、模型、服务、页面和既有文档能够互相印证；
 - **开发中**：工作树已有实现，但尚未作为稳定基线验收，不得写成已交付；

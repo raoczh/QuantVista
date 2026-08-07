@@ -261,24 +261,29 @@ func (s *MarketService) dataSyncJobHandler(ctx context.Context, _ int64, _ bool,
 	return result, err
 }
 
-func StartSystemDataSyncJob(task string, triggeredBy *int64, req DataSyncJobRequest) (*JobRunView, error) {
-	run, err := startSystemDataSyncJob(defaultJobRuntime, task, triggeredBy, req)
+func StartSystemDataSyncJob(task string, triggeredBy *int64, req DataSyncJobRequest) (*JobRunView, bool, error) {
+	run, created, err := startSystemDataSyncJobWithStatus(defaultJobRuntime, task, triggeredBy, req)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return jobRunView(*run), nil
+	return jobRunView(*run), created, nil
 }
 
 func startSystemDataSyncJob(runtime *jobRuntime, task string, triggeredBy *int64, req DataSyncJobRequest) (*model.JobRun, error) {
+	run, _, err := startSystemDataSyncJobWithStatus(runtime, task, triggeredBy, req)
+	return run, err
+}
+
+func startSystemDataSyncJobWithStatus(runtime *jobRuntime, task string, triggeredBy *int64, req DataSyncJobRequest) (*model.JobRun, bool, error) {
 	if runtime == nil {
-		return nil, errors.New("作业运行时不可用")
+		return nil, false, errors.New("作业运行时不可用")
 	}
 	req.Task = task
 	normalized, err := normalizeDataSyncRequest(req)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return runtime.startSystemWithBinding(triggeredBy, task, normalized, nil)
+	return runtime.startSystemWithBindingStatus(triggeredBy, task, normalized, nil)
 }
 
 // ScheduleSystemDataSyncJob 是定时器入口。队列背压时保留一个去重重试器，直到任务

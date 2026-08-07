@@ -3,8 +3,8 @@ package model
 import "quantvista/common"
 
 // AllModels 需要 AutoMigrate 的模型清单。新增表只往这里加。
-// 注意：AutoMigrate 只建表/加列/加索引，不做删列/改类型等破坏性变更——
-// 那类变更参照 new-api 在迁移函数里写一次性 SQL（见 docs/DEPLOYMENT.md）。
+// AutoMigrate 会执行当前 GORM 支持的兼容性变更（包括放宽非空约束），但不会
+// 删除列或代替需要数据重写的业务迁移；特殊迁移仍应显式编码并保持启动幂等。
 func AllModels() []any {
 	return []any{
 		&User{},

@@ -270,11 +270,19 @@ export interface MaintenanceDryRunResponse {
 
 export interface MaintenanceExecutionResponse {
   dry_run?: false
-  started?: boolean
+  started: boolean
   task?: string
   market?: string
   plan_hash?: string
+  job_run_id: number
   log?: SyncLog
+}
+
+export interface SystemJobStartResponse {
+  started: boolean
+  task: string
+  market?: string
+  job_run_id: number
 }
 
 // 补跑入口（既有管理端接口）：全市场增量 / 历史初始化 / 日线批量同步 / 情绪快照 /
@@ -283,16 +291,16 @@ export function triggerWideSync(data?: MaintenanceRequest) {
   return request<MaintenanceDryRunResponse | MaintenanceExecutionResponse>({ url: '/admin/market/wide-sync', method: 'post', data })
 }
 export function triggerWideInit() {
-  return request<{ started: boolean }>({ url: '/admin/market/wide-init', method: 'post' })
+  return request<SystemJobStartResponse>({ url: '/admin/market/wide-init', method: 'post' })
 }
 export function triggerSyncBars(data?: MaintenanceRequest) {
   return request<MaintenanceDryRunResponse | MaintenanceExecutionResponse>({ url: '/admin/market/sync-bars', method: 'post', data, timeout: HEAVY_TIMEOUT })
 }
 export function triggerSnapshot() {
-  return request<unknown>({ url: '/admin/market/snapshot', method: 'post', timeout: HEAVY_TIMEOUT })
+  return request<SystemJobStartResponse>({ url: '/admin/market/snapshot', method: 'post', timeout: HEAVY_TIMEOUT })
 }
 export function triggerFactorRebuild() {
-  return request<{ started: boolean }>({ url: '/admin/market/factor-rebuild', method: 'post' })
+  return request<SystemJobStartResponse>({ url: '/admin/market/factor-rebuild', method: 'post' })
 }
 export function triggerBackfillCalendar(data?: MaintenanceRequest) {
   return request<MaintenanceDryRunResponse | MaintenanceExecutionResponse>({ url: '/admin/market/backfill-calendar', method: 'post', data, timeout: HEAVY_TIMEOUT })

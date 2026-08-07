@@ -473,14 +473,23 @@ func (r *jobRuntime) start(userID int64, kind string, request any, allowPrivate 
 }
 
 func (r *jobRuntime) startWithBinding(userID int64, kind string, request any, allowPrivate bool, parentID *int64, override *durableJobHandler, bindingOverride *durableJobBinding) (*model.JobRun, error) {
-	return r.startOwned(model.JobOwnerUser, userID, nil, kind, request, allowPrivate, parentID, override, bindingOverride)
+	return r.startOwned(model.JobOwnerUser, userID, nil, kind, request, allowPrivate, parentID, override, bindingOverride, nil)
 }
 
 func (r *jobRuntime) startSystemWithBinding(triggeredBy *int64, kind string, request any, parentID *int64) (*model.JobRun, error) {
-	return r.startOwned(model.JobOwnerSystem, 0, triggeredBy, kind, request, false, parentID, nil, nil)
+	return r.startOwned(model.JobOwnerSystem, 0, triggeredBy, kind, request, false, parentID, nil, nil, nil)
 }
 
-func (r *jobRuntime) startOwned(ownerType string, userID int64, triggeredBy *int64, kind string, request any, allowPrivate bool, parentID *int64, override *durableJobHandler, bindingOverride *durableJobBinding) (*model.JobRun, error) {
+func (r *jobRuntime) startSystemWithBindingStatus(triggeredBy *int64, kind string, request any, parentID *int64) (*model.JobRun, bool, error) {
+	created := false
+	run, err := r.startOwned(model.JobOwnerSystem, 0, triggeredBy, kind, request, false, parentID, nil, nil, &created)
+	return run, created, err
+}
+
+func (r *jobRuntime) startOwned(ownerType string, userID int64, triggeredBy *int64, kind string, request any, allowPrivate bool, parentID *int64, override *durableJobHandler, bindingOverride *durableJobBinding, created *bool) (*model.JobRun, error) {
+	if created != nil {
+		*created = false
+	}
 	if common.DB == nil {
 		return nil, errors.New("数据库尚未初始化")
 	}
@@ -598,6 +607,9 @@ func (r *jobRuntime) startOwned(ownerType string, userID int64, triggeredBy *int
 		r.mu.Unlock()
 	}
 	r.enqueueReserved(run.ID)
+	if created != nil {
+		*created = true
+	}
 	return &run, nil
 }
 

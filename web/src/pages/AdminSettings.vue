@@ -49,6 +49,7 @@ import {
   type DataHealthDay,
   type MaintenancePlan,
   type MaintenanceRequest,
+  type SystemJobStartResponse,
   type LLMRouteView,
   type LLMRouteModuleOption,
 } from '@/api/admin'
@@ -768,7 +769,12 @@ async function executeMaintenancePlan() {
       dry_run: false,
       plan_hash: plan.plan_hash,
     })
-    message.success('started' in result && result.started === false ? '已有任务运行中' : '补采已确认执行')
+    if (!('started' in result)) throw new Error('执行请求未返回任务状态')
+    message.success(
+      result.started === false
+        ? `已有同类任务运行中（#${result.job_run_id}）`
+        : `已进入任务队列（#${result.job_run_id}）`,
+    )
     dryRunOpen.value = false
     await Promise.all([loadLogs(), loadHealth(), loadCapabilities()])
   } catch (e) {
@@ -779,11 +785,15 @@ async function executeMaintenancePlan() {
   }
 }
 const rerunning = ref('')
-async function rerun(key: string, fn: () => Promise<unknown>) {
+async function rerun(key: string, fn: () => Promise<SystemJobStartResponse>) {
   rerunning.value = key
   try {
-    await fn()
-    message.success('已触发，稍后刷新查看结果')
+    const result = await fn()
+    message.success(
+      result.started
+        ? `已进入任务队列（#${result.job_run_id}）`
+        : `已有同类任务运行中（#${result.job_run_id}）`,
+    )
   } catch (e) {
     message.error((e as Error).message)
   } finally {

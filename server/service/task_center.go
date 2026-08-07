@@ -279,9 +279,11 @@ func listAnalysisTasks(db *gorm.DB, userID int64, filters taskCenterFilters) ([]
 			target = row.Symbol
 		}
 		status := normalizeTaskStatus(row.Status)
+		ownerUserID := userID
 		items = append(items, TaskCenterItem{
 			ID: taskCompositeID(TaskSourceAnalysis, row.ID), Source: TaskSourceAnalysis, SourceID: row.ID,
-			Kind: row.Module, Title: taskTitle(row.Title, analysisTaskTitle(row.Module, target)), Target: target,
+			Kind: row.Module, Owner: model.JobOwnerUser, OwnerUserID: &ownerUserID,
+			Title: taskTitle(row.Title, analysisTaskTitle(row.Module, target)), Target: target,
 			Status: status, RawStatus: row.Status, Stage: taskStage(status), Error: row.Error,
 			ErrorCode: taskErrorCode(status, row.ErrorCode, row.Error),
 			Provider:  row.Provider, Model: row.Model, PromptTokens: row.PromptTokens,
@@ -327,9 +329,11 @@ func listRecommendationTasks(db *gorm.DB, userID int64, filters taskCenterFilter
 	items := make([]TaskCenterItem, 0, len(rows))
 	for _, row := range rows {
 		status := normalizeTaskStatus(row.Status)
+		ownerUserID := userID
 		items = append(items, TaskCenterItem{
 			ID: taskCompositeID(TaskSourceRecommendation, row.ID), Source: TaskSourceRecommendation, SourceID: row.ID,
-			Kind: row.Type, Title: taskTitle(row.Title, recommendationTaskTitle(row.Type)), Target: row.Market,
+			Kind: row.Type, Owner: model.JobOwnerUser, OwnerUserID: &ownerUserID,
+			Title: taskTitle(row.Title, recommendationTaskTitle(row.Type)), Target: row.Market,
 			Status: status, RawStatus: row.Status, Stage: taskStage(status), Error: row.Error,
 			ErrorCode: taskErrorCode(status, "", row.Error),
 			Provider:  row.Provider, Model: row.Model, PromptTokens: row.PromptTokens,
@@ -369,9 +373,11 @@ func listDailyReportTasks(db *gorm.DB, userID int64, filters taskCenterFilters) 
 	items := make([]TaskCenterItem, 0, len(rows))
 	for _, row := range rows {
 		status := normalizeTaskStatus(row.Status)
+		ownerUserID := userID
 		items = append(items, TaskCenterItem{
 			ID: taskCompositeID(TaskSourceDailyReport, row.ID), Source: TaskSourceDailyReport, SourceID: row.ID,
-			Kind: TaskSourceDailyReport, Title: taskTitle("", row.TradeDate+" 收盘日报"), Target: row.TradeDate,
+			Kind: TaskSourceDailyReport, Owner: model.JobOwnerUser, OwnerUserID: &ownerUserID,
+			Title: taskTitle("", row.TradeDate+" 收盘日报"), Target: row.TradeDate,
 			Status: status, RawStatus: row.Status, Stage: taskStage(status), Error: row.Error,
 			ErrorCode: taskErrorCode(status, "", row.Error),
 			Provider:  row.Provider, Model: row.Model, TotalTokens: row.TotalTokens, LatencyMs: row.LatencyMs,
@@ -502,9 +508,11 @@ func listLLMTasks(db *gorm.DB, userID int64, filters taskCenterFilters) ([]TaskC
 	items := make([]TaskCenterItem, 0, len(rows))
 	for _, row := range rows {
 		status := normalizeTaskStatus(row.Status)
+		ownerUserID := userID
 		items = append(items, TaskCenterItem{
 			ID: taskCompositeID(TaskSourceLLM, row.ID), Source: TaskSourceLLM, SourceID: row.ID,
-			Kind: row.Kind, Title: llmTaskTitle(row.Kind), Status: status, RawStatus: row.Status,
+			Kind: row.Kind, Owner: model.JobOwnerUser, OwnerUserID: &ownerUserID,
+			Title: llmTaskTitle(row.Kind), Status: status, RawStatus: row.Status,
 			Stage: taskStage(status), Error: row.Error, ErrorCode: taskErrorCode(status, row.ErrorCode, row.Error),
 			CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 		})

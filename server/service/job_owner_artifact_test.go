@@ -260,6 +260,12 @@ func TestSystemSchedulerRetriesQueueBackpressureWithoutOrphans(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-started
+	actor := int64(9151)
+	existing, created, err := runtime.startSystemWithBindingStatus(&actor, JobKindSnapshotMarket,
+		DataSyncJobRequest{Version: 1, Task: JobKindSnapshotMarket, Market: "cn", TriggerSource: "admin"}, nil)
+	if err != nil || created || existing == nil || existing.ID != first.ID {
+		t.Fatalf("同 kind 在途系统作业必须返回 started=false 与原 run: existing=%+v created=%v err=%v", existing, created, err)
+	}
 	originalDelay := systemScheduleRetryDelay
 	systemScheduleRetryDelay = 10 * time.Millisecond
 	t.Cleanup(func() { systemScheduleRetryDelay = originalDelay })
@@ -296,8 +302,8 @@ func TestResearchArtifactIdempotentImmutableAndNoHistoricalGuess(t *testing.T) {
 	if err := common.DB.Create(run).Error; err != nil {
 		t.Fatal(err)
 	}
-	legacy := &model.AnalysisRecord{UserID: userID, Module: model.AnalysisModuleStock, Market: "cn",
-		Symbol: "600000", Status: model.AnalysisStatusSuccess, ResultJSON: `{"rating":"neutral"}`}
+	legacy := &model.AnalysisRecord{UserID: userID, Module: model.AnalysisModuleSector, Market: "cn",
+		Target: "半导体", Status: model.AnalysisStatusSuccess, ResultJSON: `{"rating":"neutral"}`}
 	if err := common.DB.Create(legacy).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -369,6 +375,9 @@ func TestResearchArtifactIdempotentImmutableAndNoHistoricalGuess(t *testing.T) {
 		t.Fatalf("三类 Artifact 应按 JobRun 幂等并保留重跑血缘: count=%d err=%v", len(artifacts), err)
 	}
 	for _, artifact := range artifacts {
+		if artifact.Type == ArtifactTypeAnalysis && artifact.Subject != "sector:cn:半导体" {
+			t.Fatalf("非个股分析 Artifact 必须保留真实 target: %+v", artifact)
+		}
 		for _, body := range []string{"rating", "candidate-body", "recommendation-body", "report-body", "snapshot-body"} {
 			if strings.Contains(artifact.SourceRefs, body) {
 				t.Fatalf("Artifact 不得复制业务正文 type=%s body=%s", artifact.Type, body)

@@ -252,7 +252,7 @@ func (mc *MarketController) SyncBars(c *gin.Context) {
 		}
 	}
 	actor := currentUserID(c)
-	job, err := service.StartSystemDataSyncJob(service.JobKindSyncDailyBars, &actor, service.DataSyncJobRequest{
+	job, started, err := service.StartSystemDataSyncJob(service.JobKindSyncDailyBars, &actor, service.DataSyncJobRequest{
 		Version: 1, Market: req.Market, Maintenance: req, HasMaintenance: hasBody, BarLimit: 120,
 		TriggerSource: audit.TriggerSource, ParameterSummary: audit.ParameterSummary,
 	})
@@ -260,7 +260,7 @@ func (mc *MarketController) SyncBars(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	common.ApiSuccess(c, gin.H{"started": true, "task": service.MaintenanceSyncBars, "market": req.Market, "plan_hash": req.PlanHash, "job_run_id": job.ID})
+	common.ApiSuccess(c, gin.H{"started": started, "task": service.MaintenanceSyncBars, "market": req.Market, "plan_hash": req.PlanHash, "job_run_id": job.ID})
 }
 
 // BackfillCalendar POST /api/admin/market/backfill-calendar
@@ -288,7 +288,7 @@ func (mc *MarketController) BackfillCalendar(c *gin.Context) {
 		}
 	}
 	actor := currentUserID(c)
-	job, err := service.StartSystemDataSyncJob(service.JobKindBackfillCalendar, &actor, service.DataSyncJobRequest{
+	job, started, err := service.StartSystemDataSyncJob(service.JobKindBackfillCalendar, &actor, service.DataSyncJobRequest{
 		Version: 1, Market: req.Market, Maintenance: req, HasMaintenance: hasBody,
 		TriggerSource: audit.TriggerSource, ParameterSummary: audit.ParameterSummary,
 	})
@@ -296,7 +296,7 @@ func (mc *MarketController) BackfillCalendar(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	common.ApiSuccess(c, gin.H{"dry_run": false, "started": true, "task": service.MaintenanceBackfillCalendar,
+	common.ApiSuccess(c, gin.H{"dry_run": false, "started": started, "task": service.MaintenanceBackfillCalendar,
 		"market": req.Market, "plan_hash": req.PlanHash, "job_run_id": job.ID})
 }
 
@@ -304,14 +304,14 @@ func (mc *MarketController) BackfillCalendar(c *gin.Context) {
 func (mc *MarketController) Snapshot(c *gin.Context) {
 	market := strings.ToLower(c.DefaultQuery("market", "cn"))
 	actor := currentUserID(c)
-	job, err := service.StartSystemDataSyncJob(service.JobKindSnapshotMarket, &actor, service.DataSyncJobRequest{
+	job, started, err := service.StartSystemDataSyncJob(service.JobKindSnapshotMarket, &actor, service.DataSyncJobRequest{
 		Version: 1, Market: market, TriggerSource: "admin", ParameterSummary: "manual_snapshot=true",
 	})
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	common.ApiSuccess(c, gin.H{"started": true, "task": service.JobKindSnapshotMarket, "market": market, "job_run_id": job.ID})
+	common.ApiSuccess(c, gin.H{"started": started, "task": service.JobKindSnapshotMarket, "market": market, "job_run_id": job.ID})
 }
 
 // SyncLogs GET /api/admin/market/sync-logs?limit=50
@@ -466,7 +466,7 @@ func (mc *MarketController) WideSync(c *gin.Context) {
 		}
 	}
 	actor := currentUserID(c)
-	job, err := service.StartSystemDataSyncJob(service.JobKindSyncMarketWide, &actor, service.DataSyncJobRequest{
+	job, started, err := service.StartSystemDataSyncJob(service.JobKindSyncMarketWide, &actor, service.DataSyncJobRequest{
 		Version: 1, Market: req.Market, Maintenance: req, HasMaintenance: hasBody,
 		TriggerSource: audit.TriggerSource, ParameterSummary: audit.ParameterSummary,
 	})
@@ -474,21 +474,21 @@ func (mc *MarketController) WideSync(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	common.ApiSuccess(c, gin.H{"started": true, "task": service.MaintenanceWideSync, "plan_hash": req.PlanHash, "job_run_id": job.ID})
+	common.ApiSuccess(c, gin.H{"started": started, "task": service.MaintenanceWideSync, "plan_hash": req.PlanHash, "job_run_id": job.ID})
 }
 
 // WideInitStart POST /api/admin/market/wide-init
 // 启动/续跑全市场历史初始化（断点续传，已在跑则报错）。
 func (mc *MarketController) WideInitStart(c *gin.Context) {
 	actor := currentUserID(c)
-	job, err := service.StartSystemDataSyncJob(service.JobKindInitMarketHistory, &actor, service.DataSyncJobRequest{
+	job, started, err := service.StartSystemDataSyncJob(service.JobKindInitMarketHistory, &actor, service.DataSyncJobRequest{
 		Version: 1, Market: "cn", TriggerSource: "admin", ParameterSummary: "resume=true", Reason: "管理端续跑",
 	})
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	common.ApiSuccess(c, gin.H{"started": true, "task": service.JobKindInitMarketHistory, "job_run_id": job.ID})
+	common.ApiSuccess(c, gin.H{"started": started, "task": service.JobKindInitMarketHistory, "job_run_id": job.ID})
 }
 
 // WideInitPause POST /api/admin/market/wide-init/pause
