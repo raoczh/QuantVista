@@ -35,6 +35,13 @@ import {
 import { getDailyBars, type Bar } from '@/api/market'
 import { useUi } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
+import {
+  idListQuery,
+  queryRef,
+  replaceRouteQuery,
+  useListPageScroll,
+  useRouteQueryState,
+} from '@/composables/useListPageState'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
@@ -334,14 +341,23 @@ function fmt(n: number | undefined) {
 const expanded = ref<Record<number, boolean>>({})
 const sparkBars = ref<Record<number, Bar[]>>({})
 const sparkLoading = ref<Record<number, boolean>>({})
+const expandedIDs = computed<number[]>({
+  get: () =>
+    Object.entries(expanded.value)
+      .filter(([, open]) => open)
+      .map(([id]) => Number(id))
+      .filter((id) => Number.isInteger(id) && id > 0)
+      .sort((a, b) => a - b),
+  set: (ids) => {
+    expanded.value = Object.fromEntries(ids.map((id) => [id, true]))
+  },
+})
 
-async function toggleExpand(it: WatchlistItem) {
-  if (expanded.value[it.id]) {
-    expanded.value[it.id] = false
-    return
-  }
-  expanded.value[it.id] = true
-  if (sparkBars.value[it.id]?.length) return
+useRouteQueryState(route, router, [queryRef('expanded', expandedIDs, idListQuery(8))])
+const { restoreScroll } = useListPageScroll(route, 'watchlist')
+
+async function loadSpark(it: WatchlistItem) {
+  if (sparkBars.value[it.id]?.length || sparkLoading.value[it.id]) return
   sparkLoading.value[it.id] = true
   try {
     sparkBars.value[it.id] = await getDailyBars(it.market, it.symbol, 60)
@@ -352,6 +368,30 @@ async function toggleExpand(it: WatchlistItem) {
     sparkLoading.value[it.id] = false
   }
 }
+
+async function toggleExpand(it: WatchlistItem) {
+  if (expanded.value[it.id]) {
+    expanded.value[it.id] = false
+    return
+  }
+  expanded.value[it.id] = true
+  await loadSpark(it)
+}
+
+async function restoreExpandedSparks() {
+  const items = new Map(groups.value.flatMap((group) => group.items).map((item) => [item.id, item]))
+  const valid = expandedIDs.value.filter((id) => items.has(id))
+  if (valid.length !== expandedIDs.value.length) expandedIDs.value = valid
+  // 顺序恢复，避免一次返回页面并发打出多只日线请求。
+  for (const id of valid) {
+    const item = items.get(id)
+    if (item) await loadSpark(item)
+  }
+}
+
+watch(expandedIDs, () => {
+  if (groups.value.length) void restoreExpandedSparks()
+})
 
 // 近 60 日收盘价 → SVG 路径（viewBox 560x72，preserveAspectRatio=none 拉伸自适应）
 const SPARK_W = 560
@@ -441,7 +481,13 @@ async function applyStockActionQuery(): Promise<boolean> {
         name: String(route.query.name || ''),
       })
     }
-    await router.replace({ name: 'watchlist' })
+    await replaceRouteQuery(route, router, {
+      symbol: undefined,
+      market: undefined,
+      name: undefined,
+      add: undefined,
+      _stock_action: undefined,
+    })
     return true
   } finally {
     if (activeStockAction === actionKey) activeStockAction = ''
@@ -451,7 +497,10 @@ async function applyStockActionQuery(): Promise<boolean> {
 watch(() => route.query._stock_action, () => void applyStockActionQuery())
 
 onMounted(async () => {
-  if (!(await applyStockActionQuery())) await ensureStockActionLoad()
+  const handledAction = await applyStockActionQuery()
+  if (!handledAction) await ensureStockActionLoad()
+  await restoreExpandedSparks()
+  if (!handledAction) await restoreScroll()
 })
 </script>
 

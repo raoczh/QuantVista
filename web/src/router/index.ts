@@ -51,6 +51,12 @@ const routes: RouteRecordRaw[] = [
 const router = createRouter({
   history: createWebHistory(),
   routes,
+  scrollBehavior(to, from, savedPosition) {
+    if (savedPosition) return savedPosition
+    // 筛选/页签同步使用同页 replace，不应把用户正在查看的位置推回顶部。
+    if (to.path === from.path) return false
+    return { top: 0 }
+  },
 })
 
 // 懒加载 chunk 拉取失败（多为部署更新后旧页面持有过期 hash）：整页跳转目标路由，

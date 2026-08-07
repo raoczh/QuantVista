@@ -59,6 +59,14 @@ import { isAbortError } from '@/api/client'
 import { importPositions, downloadPositionTemplate, type ImportResult } from '@/api/export'
 import { useUi, withAlpha } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
+import {
+  enumQuery,
+  integerEnumQuery,
+  integerQuery,
+  queryRef,
+  useListPageScroll,
+  useRouteQueryState,
+} from '@/composables/useListPageState'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import StatCard from '@/components/StatCard.vue'
@@ -79,10 +87,13 @@ const positions = ref<Position[]>([])
 const overview = ref<PortfolioOverview | null>(null)
 const loading = ref(false)
 const loadError = ref('')
-const statusFilter = ref<'holding' | 'closed' | 'all'>('holding')
-const typeFilter = ref<'all' | 'short_term' | 'long_term'>('all')
+const statusQuery = enumQuery<'holding' | 'closed' | 'all'>('holding', ['holding', 'closed', 'all'])
+const typeQuery = enumQuery<'all' | 'short_term' | 'long_term'>('all', ['all', 'short_term', 'long_term'])
+const statusFilter = ref(statusQuery.parse(route.query.status))
+const typeFilter = ref(typeQuery.parse(route.query.type))
 let positionLoadSeq = 0
 let loadedStatus: typeof statusFilter.value | null = null
+let suspendStatusReload = false
 
 const marketOptions = [
   { label: 'A 股', value: 'cn' },
@@ -103,6 +114,7 @@ async function load(silent = false) {
     positions.value = list
     overview.value = ov
     loadedStatus = requestedStatus
+    await restoreExpandedTrade()
   } catch (e) {
     if (mySeq === positionLoadSeq) {
       positions.value = []
@@ -118,6 +130,10 @@ async function load(silent = false) {
 
 // 盘中自动刷新盈亏（60s，仅交易时段+页面可见，静默）。
 useAutoRefresh(() => load(true), 60_000)
+
+watch(statusFilter, () => {
+  if (!suspendStatusReload) void load()
+})
 
 const filtered = computed(() =>
   typeFilter.value === 'all'
@@ -632,11 +648,19 @@ async function revertAdjustTrade(t: PositionTrade, positionId: number) {
 }
 
 // ---------- B6 复盘统计 ----------
-const mainTab = ref('list')
+const mainTabQuery = enumQuery<'list' | 'stats'>('list', ['list', 'stats'])
+const statsRangeQuery = enumQuery<'all' | '30d' | '90d' | '180d' | '1y'>('all', [
+  'all',
+  '30d',
+  '90d',
+  '180d',
+  '1y',
+])
+const mainTab = ref(mainTabQuery.parse(route.query.tab))
 const stats = ref<TradeStats | null>(null)
 const statsLoading = ref(false)
 const statsError = ref('')
-const statsRange = ref('all')
+const statsRange = ref(statsRangeQuery.parse(route.query.stats_range))
 let statsSeq = 0
 const rangeOptions = [
   { label: '全部历史', value: 'all' },
@@ -692,7 +716,12 @@ function bucketBarWidth(list: TradeStatBucket[], b: TradeStatBucket) {
 // unknown 桶用中性色且恒排最后（后端已保证顺序，前端不再重排）。
 const exposureEl = ref<HTMLDivElement | null>(null)
 let exposureChart: echarts.ECharts | null = null
-const exposureDimKey = ref<'industry' | 'cap_style' | 'value_style'>('industry')
+const exposureQuery = enumQuery<'industry' | 'cap_style' | 'value_style'>('industry', [
+  'industry',
+  'cap_style',
+  'value_style',
+])
+const exposureDimKey = ref(exposureQuery.parse(route.query.exposure))
 const exposureDimOptions = [
   { label: '行业', value: 'industry' },
   { label: '市值风格', value: 'cap_style' },
@@ -778,7 +807,8 @@ watch([exposureDimKey, exposure], () => nextTick(() => renderExposure()))
 const curveEl = ref<HTMLDivElement | null>(null)
 let curveChart: echarts.ECharts | null = null
 const curve = ref<PortfolioCurve | null>(null)
-const curveDays = ref(90)
+const curveDaysQuery = integerEnumQuery(90, [30, 90, 180, 365])
+const curveDays = ref(curveDaysQuery.parse(route.query.curve_days))
 const curveLoading = ref(false)
 const curveError = ref('')
 let curveAbort: AbortController | null = null
@@ -1098,6 +1128,39 @@ const highlightedPositionID = ref<number | null>(null)
 let lastConsumedStockAction = ''
 let activeStockAction = ''
 
+const expandedTradeID = computed<number>({
+  get: () => expandedTrades.value || 0,
+  set: (id) => {
+    expandedTrades.value = id > 0 ? id : null
+  },
+})
+useRouteQueryState(route, router, [
+  queryRef('status', statusFilter, statusQuery),
+  queryRef('type', typeFilter, typeQuery),
+  queryRef('stats_range', statsRange, statsRangeQuery),
+  queryRef('tab', mainTab, mainTabQuery),
+  queryRef('exposure', exposureDimKey, exposureQuery),
+  queryRef('curve_days', curveDays, curveDaysQuery),
+  queryRef('trade', expandedTradeID, integerQuery(0, 1, 2_147_483_647)),
+])
+const { restoreScroll } = useListPageScroll(route, 'positions')
+
+async function restoreExpandedTrade() {
+  const id = expandedTrades.value
+  if (!id || mainTab.value !== 'list') return
+  // query 同步会先更新筛选再发请求；旧范围列表不能据此把新范围的展开项判成无效。
+  if (loadedStatus !== statusFilter.value) return
+  const target = positions.value.find((position) => position.id === id)
+  if (!target || (typeFilter.value !== 'all' && target.position_type !== typeFilter.value)) {
+    expandedTrades.value = null
+    return
+  }
+  if (!tradesById.value[id]) await loadTrades(id)
+}
+
+watch(typeFilter, () => void restoreExpandedTrade())
+watch(expandedTrades, () => void restoreExpandedTrade())
+
 function stockActionKey() {
   if (route.query.import === '1') return 'import'
   const symbol = String(route.query.symbol || '').trim()
@@ -1140,8 +1203,10 @@ async function applyStockActionQuery(): Promise<boolean> {
       return true
     }
 
+    suspendStatusReload = true
     statusFilter.value = 'holding'
     typeFilter.value = 'all'
+    suspendStatusReload = false
     await load()
     if (loadError.value || stockActionKey() !== actionKey) return true
 
@@ -1181,13 +1246,14 @@ watch(() => route.query._stock_action, () => void applyStockActionQuery())
 
 onMounted(async () => {
   const hasExplicitTask = routeTaskID() !== null
+  const hadStockAction = !!stockActionKey()
   // 股票动作先核对当前持仓：已有记录定位高亮，否则预填建仓；rec_id 保留推荐血缘。
   if (!(await applyStockActionQuery())) await load()
-  loadCurve()
-  loadCorpAdjusts()
-  loadSellReviews()
+  await Promise.all([loadCurve(), loadCorpAdjusts(), loadSellReviews()])
+  if (mainTab.value === 'stats' && !stats.value) await loadStats()
   if (hasExplicitTask) void restoreRouteAdvice()
   window.addEventListener('resize', onResize)
+  if (!hadStockAction) await restoreScroll()
 })
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
@@ -1476,7 +1542,7 @@ onBeforeUnmount(() => {
                   <n-radio-button value="short_term">短线</n-radio-button>
                   <n-radio-button value="long_term">长线</n-radio-button>
                 </n-radio-group>
-                <n-radio-group v-model:value="statusFilter" size="small" @update:value="load()">
+                <n-radio-group v-model:value="statusFilter" size="small">
                   <n-radio-button value="holding">持仓中</n-radio-button>
                   <n-radio-button value="closed">已卖出</n-radio-button>
                   <n-radio-button value="all">全部</n-radio-button>

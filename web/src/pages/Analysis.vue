@@ -42,6 +42,13 @@ import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { getApiErrorCode } from '@/api/client'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
+import {
+  enumQuery,
+  queryRef,
+  replaceRouteQuery,
+  useListPageScroll,
+  useRouteQueryState,
+} from '@/composables/useListPageState'
 import { pollUntil, isPollCancelled } from '@/lib/poll'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
@@ -210,6 +217,7 @@ async function submitAnalysis(payload: AnalyzeRequest) {
     const view = await createAnalysis(payload)
     current.value = view
     diff.value = null
+    await replaceRouteQuery(route, router, { record_id: view.id })
     if (view.status === 'processing') {
       message.info('任务已创建，正在后台分析（刷新或关闭页面不影响任务）')
       await loadHistory()
@@ -235,7 +243,18 @@ async function runAnalysis(allowStale = false) {
 const history = ref<AnalysisRecord[]>([])
 const historyLoading = ref(false)
 // 历史模块筛选（PRD 3.14：按模块筛选历史，后端 History 已支持）。
-const historyModule = ref<string>('all')
+type HistoryModule = 'all' | AnalysisModule
+const historyModuleQuery = enumQuery<HistoryModule>('all', [
+  'all',
+  'stock',
+  'market',
+  'sector',
+  'watchlist',
+  'position',
+])
+const historyModule = ref<HistoryModule>(historyModuleQuery.parse(route.query.history_module))
+useRouteQueryState(route, router, [queryRef('history_module', historyModule, historyModuleQuery)])
+const { restoreScroll } = useListPageScroll(route, 'analysis')
 const historyFilterOptions: { label: string; value: string }[] = [
   { label: '全部模块', value: 'all' },
   ...moduleOptions,
@@ -255,6 +274,7 @@ async function openRecord(rec: AnalysisRecord) {
   try {
     current.value = await getAnalysis(rec.id)
     diff.value = null
+    await replaceRouteQuery(route, router, { record_id: rec.id })
     if (current.value.status === 'processing') void trackAnalysis(rec.id)
   } catch (e) {
     message.error((e as Error).message)
@@ -271,6 +291,7 @@ let routeRecordSeq = 0
 async function openRouteRecord(): Promise<boolean> {
   const id = routeRecordID()
   if (!id) return false
+  if (current.value?.id === id) return true
 
   const seq = ++routeRecordSeq
   pollAbort?.abort()
@@ -290,7 +311,10 @@ watch(() => route.query.record_id, () => void openRouteRecord())
 async function removeRecord(rec: AnalysisRecord) {
   try {
     await deleteAnalysis(rec.id)
-    if (current.value?.id === rec.id) current.value = null
+    if (current.value?.id === rec.id) {
+      current.value = null
+      await replaceRouteQuery(route, router, { record_id: undefined })
+    }
     await loadHistory()
     message.success('已删除')
   } catch (e) {
@@ -524,12 +548,19 @@ onMounted(async () => {
   applyStockActionQuery()
   await Promise.all([loadLLM(), loadHistory()])
   // 任务中心的显式记录优先于“恢复最近运行任务”，且不消费股票动作参数。
-  if (await openRouteRecord()) return
+  if (await openRouteRecord()) {
+    await restoreScroll()
+    return
+  }
   const processing = history.value.find((h) => h.status === 'processing')
   if (processing) {
     current.value = await getAnalysis(processing.id).catch(() => null)
-    void trackAnalysis(processing.id)
+    if (current.value) {
+      await replaceRouteQuery(route, router, { record_id: processing.id })
+      void trackAnalysis(processing.id)
+    }
   }
+  await restoreScroll()
 })
 </script>
 

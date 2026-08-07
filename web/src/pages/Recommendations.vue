@@ -57,6 +57,18 @@ import { isAbortError } from '@/api/client'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
+import {
+  booleanQuery,
+  enumListQuery,
+  enumQuery,
+  integerQuery,
+  numberQuery,
+  queryRef,
+  replaceRouteQuery,
+  stringQuery,
+  useListPageScroll,
+  useRouteQueryState,
+} from '@/composables/useListPageState'
 import { pollUntil, isPollCancelled } from '@/lib/poll'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
@@ -69,19 +81,41 @@ const { upColor, downColor, flatColor, vars, withAlpha } = useUi()
 const { llmLabel } = useLlmLabel()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
+const filterQueryFields: Array<[string, keyof RecFilters]> = [
+  ['price_min', 'price_min'],
+  ['price_max', 'price_max'],
+  ['cap_min', 'float_cap_min_yi'],
+  ['cap_max', 'float_cap_max_yi'],
+  ['turnover_min', 'turnover_min'],
+  ['turnover_max', 'turnover_max'],
+  ['max_gain_5d', 'max_gain_5d_pct'],
+  ['exclude_limit_up', 'exclude_limit_up'],
+  ['exclude_gem_star', 'exclude_gem_star'],
+]
+const explicitFilterFields = new Set(
+  filterQueryFields.filter(([queryKey]) => route.query[queryKey] !== undefined).map(([, field]) => field),
+)
+
 const marketOptions = [
   { label: 'A 股', value: 'cn' },
 ]
 
 // ---------- 表单 ----------
+const recTypeQuery = enumQuery<'short_term' | 'long_term'>('short_term', ['short_term', 'long_term'])
+const strategyQuery = stringQuery('', 80)
+const countQuery = integerQuery(5, 3, 5)
+const verifyQuery = booleanQuery(false)
+const bearCheckQuery = booleanQuery(false)
+const initialVerify = verifyQuery.parse(route.query.verify)
 const form = ref<RecommendRequest>({
-  type: 'short_term',
+  type: recTypeQuery.parse(route.query.rec_type),
   market: 'cn',
-  strategy: '',
+  strategy: strategyQuery.parse(route.query.strategy),
   llm_config_id: undefined,
-  count: 5,
-  verify: false,
-  bear_check: false,
+  count: countQuery.parse(route.query.count),
+  verify: initialVerify,
+  bear_check:
+    route.query.bear_check === undefined ? initialVerify : bearCheckQuery.parse(route.query.bear_check),
 })
 // 反方研究员默认关联复核开关（后端 bear_check 未传时同款语义；这里显式联动便于用户单独调整）。
 watch(
@@ -166,7 +200,14 @@ async function loadPrefFilters() {
   try {
     pref.value = await getPreference()
     const f = parseFiltersJSON(pref.value.rec_filters_json)
-    if (f) filters.value = f
+    if (f) {
+      const fromQuery = filters.value
+      const merged = { ...f }
+      for (const [, field] of filterQueryFields) {
+        if (explicitFilterFields.has(field)) Object.assign(merged, { [field]: fromQuery[field] })
+      }
+      filters.value = merged
+    }
   } catch {
     /* 偏好读取失败用默认，不打扰 */
   }
@@ -237,6 +278,7 @@ async function generate() {
     // 后台执行），轮询详情直到脱离 processing——浏览器超时/刷新不再中断任务。
     const v = await generateRecommendations({ ...form.value, filters: { ...filters.value } })
     current.value = v
+    await replaceRouteQuery(route, router, { batch_id: v.id })
     if (v.status === 'processing') {
       message.info('任务已创建，正在后台生成（刷新或关闭页面不影响任务）')
       await loadHistory()
@@ -316,6 +358,7 @@ async function loadHistory() {
 async function openBatch(b: RecommendationBatch) {
   try {
     current.value = await getRecommendation(b.id)
+    await replaceRouteQuery(route, router, { batch_id: b.id })
   } catch (e) {
     message.error((e as Error).message)
   }
@@ -331,6 +374,7 @@ let routeBatchSeq = 0
 async function openRouteBatch(): Promise<boolean> {
   const id = routeBatchID()
   if (!id) return false
+  if (current.value?.id === id) return true
 
   const seq = ++routeBatchSeq
   pollAbort?.abort()
@@ -349,7 +393,10 @@ watch(() => route.query.batch_id, () => void openRouteBatch())
 async function removeBatch(b: RecommendationBatch) {
   try {
     await deleteRecommendation(b.id)
-    if (current.value?.id === b.id) current.value = null
+    if (current.value?.id === b.id) {
+      current.value = null
+      await replaceRouteQuery(route, router, { batch_id: undefined })
+    }
     await loadHistory()
     message.success('已删除')
   } catch (e) {
@@ -365,13 +412,12 @@ function buildPosition(item: RecommendationItem) {
   })
 }
 
-// 点击推荐标的名/代码：新窗口打开个股详情（保留本页的生成/追踪上下文）。
+// 当前页进入个股详情，浏览器返回时由 URL + history 条目恢复本批结果与滚动位置。
 function openStockDetail(item: RecommendationItem) {
-  const href = router.resolve({
+  router.push({
     name: 'stock-detail',
     params: { market: item.market || 'cn', symbol: item.symbol },
-  }).href
-  window.open(href, '_blank')
+  })
 }
 
 // 推荐参考价 vs 实际买入价 偏离 %。
@@ -497,13 +543,20 @@ function fmtTime(t: string) {
 onMounted(async () => {
   await Promise.all([loadStrategies(), loadLLM(), loadHistory(), loadPerformance(), loadPrefFilters(), loadReviews()])
   // 任务中心指定的批次优先，避免被最近一个 processing 批次覆盖。
-  if (await openRouteBatch()) return
+  if (await openRouteBatch()) {
+    await restoreScroll()
+    return
+  }
   // 页面刷新恢复：仍在后台生成中的批次自动恢复跟踪（后端对陈旧 processing 会惰性判 failed）。
   const processing = history.value.find((h) => h.status === 'processing')
   if (processing) {
     current.value = await getRecommendation(processing.id).catch(() => null)
-    void trackBatch(processing.id)
+    if (current.value) {
+      await replaceRouteQuery(route, router, { batch_id: processing.id })
+      void trackBatch(processing.id)
+    }
   }
+  await restoreScroll()
 })
 
 // ---------- D18 待复盘提示（从今日待办搬过来的推荐复盘区） ----------
@@ -846,6 +899,67 @@ const QG_FIELD_LABEL: Record<string, string> = {
 function qgFieldLabels(fields?: string[]): string {
   return (fields || []).map((f) => QG_FIELD_LABEL[f] || f).join('、')
 }
+
+type ResultSection = 'pool' | 'rejected'
+const resultSectionsQuery = enumListQuery<ResultSection>(['pool', 'rejected'], 2)
+const resultSections = ref<ResultSection[]>(resultSectionsQuery.parse(route.query.sections))
+const recTypeState = computed({
+  get: () => form.value.type,
+  set: (value: 'short_term' | 'long_term') => {
+    form.value.type = value
+  },
+})
+const strategyState = computed<string>({
+  get: () => form.value.strategy || '',
+  set: (value) => {
+    form.value.strategy = value
+  },
+})
+const countState = computed<number>({
+  get: () => form.value.count || 5,
+  set: (value) => {
+    form.value.count = value
+  },
+})
+const verifyState = computed<boolean>({
+  get: () => !!form.value.verify,
+  set: (value) => {
+    form.value.verify = value
+  },
+})
+const bearCheckState = computed<boolean>({
+  get: () => !!form.value.bear_check,
+  set: (value) => {
+    form.value.bear_check = value
+  },
+})
+function filterState<K extends keyof RecFilters>(key: K) {
+  return computed<RecFilters[K]>({
+    get: () => filters.value[key],
+    set: (value) => {
+      filters.value = { ...filters.value, [key]: value }
+    },
+  })
+}
+
+useRouteQueryState(route, router, [
+  queryRef('rec_type', recTypeState, recTypeQuery),
+  queryRef('strategy', strategyState, strategyQuery),
+  queryRef('count', countState, countQuery),
+  queryRef('verify', verifyState, verifyQuery),
+  queryRef('bear_check', bearCheckState, bearCheckQuery),
+  queryRef('price_min', filterState('price_min'), numberQuery(0, 0, 1_000_000)),
+  queryRef('price_max', filterState('price_max'), numberQuery(50, 0, 1_000_000)),
+  queryRef('cap_min', filterState('float_cap_min_yi'), numberQuery(0, 0, 100_000_000)),
+  queryRef('cap_max', filterState('float_cap_max_yi'), numberQuery(0, 0, 100_000_000)),
+  queryRef('turnover_min', filterState('turnover_min'), numberQuery(0, 0, 25)),
+  queryRef('turnover_max', filterState('turnover_max'), numberQuery(0, 0, 30)),
+  queryRef('max_gain_5d', filterState('max_gain_5d_pct'), numberQuery(25, 0, 100)),
+  queryRef('exclude_limit_up', filterState('exclude_limit_up'), booleanQuery(true)),
+  queryRef('exclude_gem_star', filterState('exclude_gem_star'), booleanQuery(false)),
+  queryRef('sections', resultSections, resultSectionsQuery),
+])
+const { restoreScroll } = useListPageScroll(route, 'recommendations')
 
 </script>
 
@@ -1210,7 +1324,7 @@ function qgFieldLabels(fields?: string[]): string {
                   <!-- 头 -->
                   <div class="card-head">
                     <div class="card-title">
-                      <span class="ct-name ct-link" title="新窗口打开个股详情" @click="openStockDetail(it)">{{
+                      <span class="ct-name ct-link" title="打开个股详情" @click="openStockDetail(it)">{{
                         it.name || it.symbol
                       }}</span>
                       <span class="ct-symbol qv-mono ct-link" @click="openStockDetail(it)">{{ it.symbol }}</span>
@@ -1454,7 +1568,7 @@ function qgFieldLabels(fields?: string[]): string {
               </div>
 
               <!-- 候选池全景：每只股为什么进、为什么被筛掉、量化分排第几，全透明 -->
-              <n-collapse v-if="poolList.length" class="rejected">
+              <n-collapse v-if="poolList.length" v-model:value="resultSections" class="rejected">
                 <n-collapse-item
                   :title="`候选池全景（参与排名 ${poolRanked.length} 只 · 被筛掉 ${poolExcluded.length} 只）`"
                   name="pool"
@@ -1523,7 +1637,7 @@ function qgFieldLabels(fields?: string[]): string {
               </n-collapse>
 
               <!-- 为什么没选它：池内落选标的的一句话理由（复盘筛选逻辑用） -->
-              <n-collapse v-if="rejectedList.length" class="rejected">
+              <n-collapse v-if="rejectedList.length" v-model:value="resultSections" class="rejected">
                 <n-collapse-item :title="`为什么没选它（${rejectedList.length}）`" name="rejected">
                   <div v-for="(r, i) in rejectedList" :key="i" class="rej-row">
                     <span class="rej-name">{{ r.name || r.symbol }}<span class="rej-symbol qv-mono"> {{ r.symbol }}</span></span>
