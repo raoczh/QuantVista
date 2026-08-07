@@ -1,7 +1,21 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { RouterLink, useRoute, useRouter } from 'vue-router'
-import { NAlert, NButton, NButtonGroup, NEmpty, NGi, NGrid, NResult, NSpin, NTag, NTooltip } from 'naive-ui'
+import { RouterLink, useRoute } from 'vue-router'
+import {
+  NAlert,
+  NButton,
+  NButtonGroup,
+  NDropdown,
+  NEmpty,
+  NGi,
+  NGrid,
+  NSpin,
+  NTabPane,
+  NTabs,
+  NTag,
+  NTooltip,
+  type DropdownOption,
+} from 'naive-ui'
 import * as echarts from 'echarts'
 import {
   getQuote,
@@ -29,6 +43,8 @@ import { getAnnouncements, type AnnouncementItem } from '@/api/announcement'
 import { getStockFinance, type StockFinance } from '@/api/finance'
 import { getStockOrgView, type StockOrgView } from '@/api/orgview'
 import { getStockCorpEvents, type StockCorpEvents } from '@/api/event'
+import { listPositions, type Position } from '@/api/position'
+import { listWatchlists, type WatchlistGroup } from '@/api/watchlist'
 import { useUi, withAlpha } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import { useStockActions } from '@/composables/useStockActions'
@@ -38,11 +54,28 @@ import SectionCard from '@/components/SectionCard.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
 import StockCoverageMatrix from '@/components/StockCoverageMatrix.vue'
 import { createLoadEpoch, resolveCoverageStatus, type StockCoverageItem } from '@/components/stockCoverage'
+import StockDecisionSummary from '@/components/stock-detail/StockDecisionSummary.vue'
+import StockTabState from '@/components/stock-detail/StockTabState.vue'
+import {
+  buildDecisionSummary,
+  type PositionRelationSummary,
+  type StockSectionPhase,
+} from '@/components/stock-detail/decisionSummary'
 
 const route = useRoute()
-const router = useRouter()
 const { vars, isDark, pctColor } = useUi()
-const { adding, goAnalysis, goQa, goCompare, goAlert, goThesis, addToWatchlist } = useStockActions()
+const {
+  adding,
+  goAnalysis,
+  goQa,
+  goCompare,
+  goAlert,
+  goThesis,
+  goWatchlist,
+  goPosition: openPosition,
+  goNote,
+  addToWatchlist,
+} = useStockActions()
 
 const market = computed(() => String(route.params.market || 'cn'))
 const symbol = computed(() => String(route.params.symbol || ''))
@@ -69,14 +102,33 @@ const orgview = ref<StockOrgView | null>(null)
 // 后者是 corpEvents 非 null 且 lifts 为空数组。
 const corpEvents = ref<StockCorpEvents | null>(null)
 const corpEventsError = ref('')
+const positions = ref<Position[]>([])
+const watchlistGroups = ref<WatchlistGroup[]>([])
+const positionsKnown = ref(false)
+const watchlistKnown = ref(false)
+const relationshipAsOf = ref('')
 
 // 情绪标签（N2）：利好/利空才渲染，颜色随涨跌色主题。
 function sentiView(n: NewsItem): { text: string; color: string } | null {
   const t = sentimentTag(n)
   return t ? { text: t.text, color: pctColor(t.dir) } : null
 }
-const loading = ref(false)
-const loadError = ref('')
+type TabKey = 'trend' | 'event' | 'fundamental' | 'research'
+interface SectionState {
+  phase: StockSectionPhase
+  error: string
+  updatedAt: string
+}
+
+const activeTab = ref<TabKey>('trend')
+const quoteState = reactive<SectionState>({ phase: 'idle', error: '', updatedAt: '' })
+const relationshipState = reactive<SectionState>({ phase: 'idle', error: '', updatedAt: '' })
+const tabStates = reactive<Record<TabKey, SectionState>>({
+  trend: { phase: 'idle', error: '', updatedAt: '' },
+  event: { phase: 'idle', error: '', updatedAt: '' },
+  fundamental: { phase: 'idle', error: '', updatedAt: '' },
+  research: { phase: 'idle', error: '', updatedAt: '' },
+})
 
 type CoverageKey = 'quote' | 'daily' | 'finance' | 'news' | 'announcements' | 'institutions' | 'funds' | 'events'
 const coverageKeys: CoverageKey[] = ['quote', 'daily', 'finance', 'news', 'announcements', 'institutions', 'funds', 'events']
@@ -107,6 +159,74 @@ const stockRef = computed(() => ({
   name: quote.value?.name || symbol.value,
 }))
 
+function sameStock(item: { symbol: string; market?: string }) {
+  return item.symbol.toLowerCase() === symbol.value.toLowerCase()
+    && (item.market || 'cn').toLowerCase() === market.value.toLowerCase()
+}
+
+const inWatchlist = computed(() => watchlistGroups.value.some((group) => group.items.some(sameStock)))
+const matchingPositions = computed(() => positions.value.filter((item) => item.status === 'holding' && item.quantity > 0 && sameStock(item)))
+const positionSummary = computed<PositionRelationSummary | null>(() => {
+  const items = matchingPositions.value
+  if (!items.length) return null
+  const quantity = items.reduce((sum, item) => sum + item.quantity, 0)
+  const remainingCost = items.reduce((sum, item) => {
+    if (item.remaining_cost > 0) return sum + item.remaining_cost
+    if (item.cost > 0) return sum + item.cost
+    return sum + item.buy_price * item.quantity
+  }, 0)
+  const quoteFresh = items.every((item) => item.quote_ok)
+  const profitAmount = quoteFresh ? items.reduce((sum, item) => sum + item.profit_amount, 0) : null
+  const triggered = items.find((item) => item.below_stop_loss || item.near_stop_loss)
+  return {
+    lots: items.length,
+    quantity,
+    averageCost: quantity > 0 ? remainingCost / quantity : 0,
+    remainingCost,
+    profitAmount,
+    profitPct: profitAmount != null && remainingCost > 0 ? (profitAmount / remainingCost) * 100 : null,
+    realizedPnl: items.reduce((sum, item) => sum + item.realized_pnl, 0),
+    quoteFresh,
+    asOf: latestAsOf(items.map((item) => item.quote_as_of)),
+    belowStopLoss: items.some((item) => item.below_stop_loss),
+    nearStopLoss: items.some((item) => item.near_stop_loss),
+    stopLoss: triggered?.plan_stop_loss || undefined,
+  }
+})
+
+const decisionSummary = computed(() => buildDecisionSummary({
+  quote: quote.value,
+  position: positionSummary.value,
+  bars: bars.value,
+  valuation: valuation.value,
+  score: score.value,
+  fundflow: fundflow.value,
+  finance: finance.value,
+  corpEvents: corpEvents.value,
+  announcements: announcements.value,
+  news: news.value,
+  eventPhase: tabStates.event.phase,
+  fundamentalPhase: tabStates.fundamental.phase,
+}))
+
+const tabDataState = computed(() => ({
+  trend: tabHasData('trend'),
+  event: tabHasData('event'),
+  fundamental: tabHasData('fundamental'),
+  research: tabHasData('research'),
+}))
+const pageRefreshing = computed(() => {
+  const phases = [quoteState.phase, relationshipState.phase, tabStates[activeTab.value].phase]
+  return phases.some((phase) => phase === 'loading' || phase === 'refreshing')
+})
+const moreOptions = computed<DropdownOption[]>(() => [
+  { key: 'qa', label: '个股问答' },
+  { key: 'compare', label: '横向对比' },
+  { key: 'thesis', label: '逻辑卡' },
+  { key: 'note', label: '添加笔记' },
+  { key: 'position', label: positionSummary.value ? '持仓管理' : '记录持仓' },
+])
+
 const chartEl = ref<HTMLDivElement | null>(null)
 let chart: echarts.ECharts | null = null
 const chipEl = ref<HTMLDivElement | null>(null)
@@ -118,10 +238,18 @@ let finChart: echarts.ECharts | null = null
 const ffEl = ref<HTMLDivElement | null>(null)
 let ffChart: echarts.ECharts | null = null
 
-// 切换标的的竞态守卫：每次 load 领取 epoch，所有 best-effort 回填落地前比对。
-const loadEpoch = createLoadEpoch()
-// 分时请求的中止器：切标的/卸载时 abort，在途请求不再挂着连接等超时。
-let minuteAbort: AbortController | null = null
+// 标的 epoch 与分区 request epoch 双重守卫：切股使全部旧请求失效，同一分区连续重试时后发覆盖前发。
+const stockEpoch = createLoadEpoch()
+const quoteEpoch = createLoadEpoch()
+const relationshipEpoch = createLoadEpoch()
+const tabEpochs: Record<TabKey, ReturnType<typeof createLoadEpoch>> = {
+  trend: createLoadEpoch(),
+  event: createLoadEpoch(),
+  fundamental: createLoadEpoch(),
+  research: createLoadEpoch(),
+}
+let currentStockToken = 0
+let stockAbort: AbortController | null = null
 
 // disposeCharts 销毁全部 ECharts 实例。切标的时容器会随 v-if/v-show 变化重建，
 // 旧实例继续绑在被移除的 DOM 上（renderChipCharts 等在数据为 null 时直接 return
@@ -139,202 +267,238 @@ function disposeCharts() {
   ffChart = null
 }
 
-async function load(silent = false) {
+function errorMessage(error: unknown) {
+  return (error instanceof Error ? error.message : String(error)) || '读取失败'
+}
+
+function observedAt() {
+  return new Date().toLocaleString('sv-SE', { hour12: false })
+}
+
+function stockRequestIsCurrent(token: number, requestMarket: string, requestSymbol: string) {
+  return stockEpoch.isCurrent(token) && market.value === requestMarket && symbol.value === requestSymbol
+}
+
+async function loadQuote(silent = false, stockToken = currentStockToken) {
   if (!symbol.value) return
-  const mySeq = loadEpoch.next()
+  const requestToken = quoteEpoch.next()
+  const requestMarket = market.value
+  const requestSymbol = symbol.value
+  quoteState.phase = silent && quote.value ? 'refreshing' : 'loading'
+  quoteState.error = ''
+  try {
+    const result = await getQuote(requestMarket, requestSymbol)
+    if (!stockRequestIsCurrent(stockToken, requestMarket, requestSymbol) || !quoteEpoch.isCurrent(requestToken)) return
+    quote.value = result
+    quoteState.phase = 'ready'
+    quoteState.updatedAt = observedAt()
+    markCoverage('quote')
+  } catch (error) {
+    if (!stockRequestIsCurrent(stockToken, requestMarket, requestSymbol) || !quoteEpoch.isCurrent(requestToken)) return
+    quoteState.error = errorMessage(error)
+    quoteState.phase = quote.value ? 'ready' : 'error'
+    markCoverage('quote', error)
+  }
+}
+
+async function loadRelationships(silent = false, stockToken = currentStockToken) {
+  if (!symbol.value) return
+  const requestToken = relationshipEpoch.next()
+  const requestMarket = market.value
+  const requestSymbol = symbol.value
+  relationshipState.phase = silent && (positionsKnown.value || watchlistKnown.value) ? 'refreshing' : 'loading'
+  relationshipState.error = ''
+  const [positionResult, watchlistResult] = await Promise.allSettled([
+    listPositions('holding'),
+    listWatchlists(),
+  ])
+  if (!stockRequestIsCurrent(stockToken, requestMarket, requestSymbol) || !relationshipEpoch.isCurrent(requestToken)) return
+
+  const errors: string[] = []
+  if (positionResult.status === 'fulfilled') {
+    positions.value = positionResult.value
+    positionsKnown.value = true
+  } else {
+    errors.push(`持仓：${errorMessage(positionResult.reason)}`)
+  }
+  if (watchlistResult.status === 'fulfilled') {
+    watchlistGroups.value = watchlistResult.value
+    watchlistKnown.value = true
+  } else {
+    errors.push(`自选：${errorMessage(watchlistResult.reason)}`)
+  }
+  relationshipAsOf.value = observedAt()
+  relationshipState.updatedAt = relationshipAsOf.value
+  relationshipState.error = errors.join('；')
+  relationshipState.phase = positionsKnown.value || watchlistKnown.value ? 'ready' : 'error'
+}
+
+interface RequestOutcome {
+  ok: boolean
+  error?: string
+  aborted?: boolean
+}
+
+async function runTabRequest<T>(
+  promise: Promise<T>,
+  apply: (value: T) => void,
+  stockToken: number,
+  requestToken: number,
+  tab: TabKey,
+  requestMarket: string,
+  requestSymbol: string,
+  coverageKey?: CoverageKey,
+): Promise<RequestOutcome> {
+  try {
+    const result = await promise
+    if (!stockRequestIsCurrent(stockToken, requestMarket, requestSymbol) || !tabEpochs[tab].isCurrent(requestToken)) {
+      return { ok: false, aborted: true }
+    }
+    apply(result)
+    if (coverageKey) markCoverage(coverageKey)
+    return { ok: true }
+  } catch (error) {
+    if (
+      isAbortError(error)
+      || !stockRequestIsCurrent(stockToken, requestMarket, requestSymbol)
+      || !tabEpochs[tab].isCurrent(requestToken)
+    ) return { ok: false, aborted: true }
+    if (coverageKey) markCoverage(coverageKey, error)
+    return { ok: false, error: errorMessage(error) }
+  }
+}
+
+function tabHasData(tab: TabKey) {
+  if (tab === 'trend') return !!minute.value || bars.value.length > 0 || !!chips.value || !!fundflow.value || lhbRecords.value.length > 0
+  if (tab === 'event') return !!corpEvents.value || announcements.value.length > 0 || news.value.length > 0
+  if (tab === 'fundamental') return !!valuation.value || !!finance.value || !!score.value
+  return !!orgview.value || coverageKeys.some((key) => coverageObserved[key])
+}
+
+async function loadTab(tab: TabKey, force = false, stockToken = currentStockToken) {
+  const state = tabStates[tab]
+  if (!force && state.phase !== 'idle' && state.phase !== 'error') return
+  if (!symbol.value) return
+  const requestToken = tabEpochs[tab].next()
   const requestMarket = market.value
   const requestSymbol = symbol.value
   const requestIsFund = requestMarket === 'cn' && isEtfSymbol(requestSymbol)
-  minuteAbort?.abort()
-  const myMinuteAbort = new AbortController()
-  minuteAbort = myMinuteAbort
-  if (!silent) {
-    loading.value = true
-    loadError.value = ''
-    resetCoverageState()
-  }
-  try {
-    const q = await getQuote(requestMarket, requestSymbol)
-    if (!loadEpoch.isCurrent(mySeq)) return
-    quote.value = q
-    markCoverage('quote')
+  state.phase = tabHasData(tab) ? 'refreshing' : 'loading'
+  state.error = ''
+
+  const requests: Array<Promise<RequestOutcome>> = []
+  if (tab === 'trend') {
+    minuteLoading.value = requestMarket === 'cn'
+    minuteError.value = ''
+    requests.push(runTabRequest(
+      getDailyBars(requestMarket, requestSymbol, 120),
+      (result) => { bars.value = result },
+      stockToken, requestToken, tab, requestMarket, requestSymbol, 'daily',
+    ))
+    requests.push(runTabRequest(
+      getIndicators(requestMarket, requestSymbol, 120),
+      (result) => { indicators.value = result },
+      stockToken, requestToken, tab, requestMarket, requestSymbol,
+    ))
+    requests.push(runTabRequest(
+      getChips(requestMarket, requestSymbol),
+      (result) => { chips.value = result },
+      stockToken, requestToken, tab, requestMarket, requestSymbol,
+    ))
     if (requestMarket === 'cn') {
-      // 静默刷新（盘中每 60s 自动刷新）不置 loading：分时卡的 n-spin 遮罩会每分钟
-      // 闪一次（降透明度 + pointer-events:none + 转圈），而这恰是用户正盯着分时图的
-      // 时候。首次/手动加载仍然显示。
-      if (!silent) minuteLoading.value = true
-      minuteError.value = ''
-      getMinuteLine(requestMarket, requestSymbol, myMinuteAbort.signal)
-        .then((r) => {
-          if (!loadEpoch.isCurrent(mySeq)) return
-          minute.value = r
-          nextTick(() => renderChart())
-        })
-        .catch((e) => {
-          // 主动取消属正常路径（切标的/卸载），不当失败展示。
-          if (!loadEpoch.isCurrent(mySeq) || isAbortError(e)) return
-          minute.value = null
-          minuteError.value = (e as Error).message
-          nextTick(() => renderChart())
-        })
-        .finally(() => {
-          if (loadEpoch.isCurrent(mySeq)) minuteLoading.value = false
-        })
+      requests.push(runTabRequest(
+        getMinuteLine(requestMarket, requestSymbol, stockAbort?.signal),
+        (result) => { minute.value = result },
+        stockToken, requestToken, tab, requestMarket, requestSymbol,
+      ).then((outcome) => {
+        if (outcome.error) minuteError.value = outcome.error
+        return outcome
+      }))
     } else {
       minute.value = null
-      minuteError.value = ''
-      minuteLoading.value = false
       chartMode.value = 'daily'
     }
-    // 估值 / 评分 / 相关新闻 best-effort：失败只是不显示对应卡片。
-    getValuation(requestMarket, requestSymbol)
-      .then((v) => {
-        if (loadEpoch.isCurrent(mySeq)) valuation.value = v
-      })
-      .catch(() => {
-        if (loadEpoch.isCurrent(mySeq)) valuation.value = null
-      })
-    getScore(requestMarket, requestSymbol)
-      .then((s) => {
-        if (loadEpoch.isCurrent(mySeq)) score.value = s
-      })
-      .catch(() => {
-        if (loadEpoch.isCurrent(mySeq)) score.value = null
-      })
-    getNews({ symbol: requestSymbol, limit: 15 })
-      .then((r) => {
-        if (!loadEpoch.isCurrent(mySeq)) return
-        news.value = r
-        markCoverage('news')
-      })
-      .catch((e) => {
-        if (!loadEpoch.isCurrent(mySeq)) return
-        news.value = []
-        markCoverage('news', e)
-      })
-    getAnnouncements(requestSymbol, 15)
-      .then((r) => {
-        if (!loadEpoch.isCurrent(mySeq)) return
-        announcements.value = r
-        markCoverage('announcements')
-      })
-      .catch((e) => {
-        if (!loadEpoch.isCurrent(mySeq)) return
-        announcements.value = []
-        markCoverage('announcements', e)
-      })
-    // 财务摘要（F2）best-effort：A 股非基金才有；容器在 v-if 内，等 DOM 后挂图。
     if (requestMarket === 'cn' && !requestIsFund) {
-      getStockFinance(requestMarket, requestSymbol)
-        .then((r) => {
-          if (!loadEpoch.isCurrent(mySeq)) return
-          finance.value = r
-          markCoverage('finance')
-          nextTick(() => renderFinanceChart())
-        })
-        .catch((e) => {
-          if (!loadEpoch.isCurrent(mySeq)) return
-          finance.value = null
-          markCoverage('finance', e)
-        })
-      // 主力资金（M3a）：按需拉取+缓存，首次访问可能为空（下轮自动刷新补上）。
-      getStockFundFlow(requestMarket, requestSymbol, 90)
-        .then((r) => {
-          if (!loadEpoch.isCurrent(mySeq)) return
-          fundflow.value = r
-          markCoverage('funds')
-          nextTick(() => renderFundFlowChart())
-        })
-        .catch((e) => {
-          if (!loadEpoch.isCurrent(mySeq)) return
-          fundflow.value = null
-          markCoverage('funds', e)
-        })
-      // 龙虎榜上榜记录（M3a）：本地缓存表，近 30 天回填 + 每日盘后采集。
-      getStockLhb(requestMarket, requestSymbol, 10)
-        .then((r) => {
-          if (loadEpoch.isCurrent(mySeq)) lhbRecords.value = r
-        })
-        .catch(() => {
-          if (loadEpoch.isCurrent(mySeq)) lhbRecords.value = []
-        })
-      // 机构观点（P3a）：按需拉取+缓存，首次访问可能为空（下轮自动刷新补上）；
-      // 现价随行情带过去用于目标价偏离计算。
-      getStockOrgView(requestMarket, requestSymbol, q.price)
-        .then((r) => {
-          if (!loadEpoch.isCurrent(mySeq)) return
-          orgview.value = r
-          markCoverage('institutions')
-        })
-        .catch((e) => {
-          if (!loadEpoch.isCurrent(mySeq)) return
-          orgview.value = null
-          markCoverage('institutions', e)
-        })
-      // 解禁 / 分红（B9）：每日 19:25 job 同步的本地表，零上游成本。
-      // 失败时记 error 并保持 corpEvents=null——空态文案会据此说「读取失败」而不是「无解禁」。
-      getStockCorpEvents(requestMarket, requestSymbol, myMinuteAbort.signal)
-        .then((r) => {
-          if (!loadEpoch.isCurrent(mySeq)) return
-          corpEvents.value = r
+      requests.push(runTabRequest(
+        getStockFundFlow(requestMarket, requestSymbol, 90),
+        (result) => { fundflow.value = result },
+        stockToken, requestToken, tab, requestMarket, requestSymbol, 'funds',
+      ))
+      requests.push(runTabRequest(
+        getStockLhb(requestMarket, requestSymbol, 10),
+        (result) => { lhbRecords.value = result },
+        stockToken, requestToken, tab, requestMarket, requestSymbol,
+      ))
+    }
+  } else if (tab === 'event') {
+    requests.push(runTabRequest(
+      getNews({ symbol: requestSymbol, limit: 15 }),
+      (result) => { news.value = result },
+      stockToken, requestToken, tab, requestMarket, requestSymbol, 'news',
+    ))
+    requests.push(runTabRequest(
+      getAnnouncements(requestSymbol, 15),
+      (result) => { announcements.value = result },
+      stockToken, requestToken, tab, requestMarket, requestSymbol, 'announcements',
+    ))
+    if (requestMarket === 'cn' && !requestIsFund) {
+      requests.push(runTabRequest(
+        getStockCorpEvents(requestMarket, requestSymbol, stockAbort?.signal),
+        (result) => {
+          corpEvents.value = result
           corpEventsError.value = ''
-          markCoverage('events')
-        })
-        .catch((e) => {
-          if (!loadEpoch.isCurrent(mySeq) || isAbortError(e)) return
-          corpEvents.value = null
-          corpEventsError.value = (e as Error).message
-          markCoverage('events', e)
-        })
+        },
+        stockToken, requestToken, tab, requestMarket, requestSymbol, 'events',
+      ).then((outcome) => {
+        if (outcome.error) corpEventsError.value = outcome.error
+        return outcome
+      }))
     }
-    // 指标副图 / 筹码分布 best-effort：失败时 K 线退回单图、筹码卡显示占位。
-    getIndicators(requestMarket, requestSymbol, 120)
-      .then((r) => {
-        if (!loadEpoch.isCurrent(mySeq)) return
-        indicators.value = r
-        nextTick(() => renderChart())
-      })
-      .catch(() => {
-        if (loadEpoch.isCurrent(mySeq)) indicators.value = null
-      })
-    getChips(requestMarket, requestSymbol)
-      .then((r) => {
-        if (!loadEpoch.isCurrent(mySeq)) return
-        chips.value = r
-        // 筹码卡容器在 v-if 内，等 DOM 渲染后再挂图。
-        nextTick(() => renderChipCharts())
-      })
-      .catch(() => {
-        if (loadEpoch.isCurrent(mySeq)) chips.value = null
-      })
-    try {
-      const b = await getDailyBars(requestMarket, requestSymbol, 120)
-      if (!loadEpoch.isCurrent(mySeq)) return
-      bars.value = b
-      markCoverage('daily')
-      // 必须等 DOM patch：图表容器带 v-show（日K 分支条件是 bars.length > 0），赋值当帧
-      // 容器仍是 display:none，同步 renderChart 会让 echarts.init 拿到 0×0 建出空白画布，
-      // 且 resize 监听只挂在 window 上不会自愈——表现为日K 区域一片空白直到切走再切回。
-      await nextTick()
-      renderChart()
-    } catch (e) {
-      if (!loadEpoch.isCurrent(mySeq) || isAbortError(e)) return
-      if (!silent) bars.value = []
-      markCoverage('daily', e)
-      if (!silent) {
-        await nextTick()
-        renderChart()
-      }
+  } else if (tab === 'fundamental') {
+    requests.push(runTabRequest(
+      getValuation(requestMarket, requestSymbol),
+      (result) => { valuation.value = result },
+      stockToken, requestToken, tab, requestMarket, requestSymbol,
+    ))
+    requests.push(runTabRequest(
+      getScore(requestMarket, requestSymbol),
+      (result) => { score.value = result },
+      stockToken, requestToken, tab, requestMarket, requestSymbol,
+    ))
+    if (requestMarket === 'cn' && !requestIsFund) {
+      requests.push(runTabRequest(
+        getStockFinance(requestMarket, requestSymbol),
+        (result) => { finance.value = result },
+        stockToken, requestToken, tab, requestMarket, requestSymbol, 'finance',
+      ))
     }
-  } catch (e) {
-    if (!loadEpoch.isCurrent(mySeq) || isAbortError(e)) return
-    markCoverage('quote', e)
-    if (!silent) {
-      loadError.value = (e as Error).message
-      quote.value = null
+  } else {
+    if (requestMarket === 'cn' && !requestIsFund) {
+      requests.push(runTabRequest(
+        getStockOrgView(requestMarket, requestSymbol, quote.value?.price),
+        (result) => { orgview.value = result },
+        stockToken, requestToken, tab, requestMarket, requestSymbol, 'institutions',
+      ))
     }
-  } finally {
-    if (loadEpoch.isCurrent(mySeq)) loading.value = false
+  }
+
+  const outcomes = await Promise.all(requests)
+  if (!stockRequestIsCurrent(stockToken, requestMarket, requestSymbol) || !tabEpochs[tab].isCurrent(requestToken)) return
+  minuteLoading.value = false
+  const errors = outcomes.flatMap((outcome) => outcome.error ? [outcome.error] : [])
+  const completed = outcomes.filter((outcome) => outcome.ok).length
+  state.error = errors.join('；')
+  state.updatedAt = observedAt()
+  state.phase = completed === 0 && errors.length
+    ? 'error'
+    : tabHasData(tab) ? 'ready' : 'empty'
+  await nextTick()
+  if (tab === 'trend') {
+    renderChart()
+    renderChipCharts()
+    renderFundFlowChart()
+  } else if (tab === 'fundamental') {
+    renderFinanceChart()
   }
 }
 
@@ -800,11 +964,25 @@ function isOlderThan(value: string | undefined, days: number): boolean {
   const timestamp = Date.parse(value)
   return Number.isFinite(timestamp) && Date.now() - timestamp > days * 86_400_000
 }
+function coveragePhase(key: CoverageKey): StockSectionPhase {
+  if (key === 'quote') return quoteState.phase
+  if (key === 'daily' || key === 'funds') return tabStates.trend.phase
+  if (key === 'finance') return tabStates.fundamental.phase
+  if (key === 'institutions') return tabStates.research.phase
+  return tabStates.event.phase
+}
 function coverageNote(key: CoverageKey, status: StockCoverageItem['status'], extra = ''): string | undefined {
   if (coverageErrors[key]) return coverageErrors[key]
   if (extra) return extra
   if (status === 'missing') return '读取成功，当前没有该类记录'
-  if (status === 'unknown') return '当前标的未观测，或本地接口明确返回不可用'
+  if (status === 'unknown') {
+    const phase = coveragePhase(key)
+    if (phase === 'idle') return '尚未请求；进入对应页签后按需加载'
+    if (phase === 'loading') return '请求进行中，尚不能判断是否缺失'
+    if (phase === 'refreshing') return '保留最近已知数据，正在静默刷新'
+    if (phase === 'error') return '读取失败，当前状态未知'
+    return '本地接口明确返回不可用，当前状态未知'
+  }
   if (status === 'stale') return '已有数据早于当前有效时点'
   return undefined
 }
@@ -973,17 +1151,13 @@ watch(chartMode, async () => {
   await nextTick()
   renderChart()
 })
-// 同页跳转到另一只个股（如从对比/搜索进来）时整页重载。
-// 顺序要点：①先让 load epoch 失效并 abort 在途请求——旧标的的迟到响应绝不能落到新标的上；
-// ②清空**全部**行情态（含 quote/bars，此前漏清会让新标的加载期间显示旧标的的价格与
-// K 线，且 quote 非空使整个详情区照常渲染，用户看到的是另一只股票的数据）；
-// ③dispose 图表实例，避免容器随 v-if 重建后旧实例孤儿化。
-watch([market, symbol], () => {
-  loadEpoch.invalidate()
-  minuteAbort?.abort()
-  minuteAbort = null
-  loading.value = false
-  loadError.value = ''
+function startStockLoad() {
+  currentStockToken = stockEpoch.next()
+  quoteEpoch.invalidate()
+  relationshipEpoch.invalidate()
+  for (const epoch of Object.values(tabEpochs)) epoch.invalidate()
+  stockAbort?.abort()
+  stockAbort = new AbortController()
   quote.value = null
   bars.value = []
   valuation.value = null
@@ -1002,19 +1176,52 @@ watch([market, symbol], () => {
   corpEventsError.value = ''
   news.value = []
   announcements.value = []
+  positions.value = []
+  watchlistGroups.value = []
+  positionsKnown.value = false
+  watchlistKnown.value = false
+  relationshipAsOf.value = ''
+  quoteState.phase = 'idle'
+  quoteState.error = ''
+  quoteState.updatedAt = ''
+  relationshipState.phase = 'idle'
+  relationshipState.error = ''
+  relationshipState.updatedAt = ''
+  for (const state of Object.values(tabStates)) {
+    state.phase = 'idle'
+    state.error = ''
+    state.updatedAt = ''
+  }
+  activeTab.value = 'trend'
+  resetCoverageState()
   disposeCharts()
-  load()
+  void loadQuote(false, currentStockToken)
+  void loadRelationships(false, currentStockToken)
+  void loadTab('trend', false, currentStockToken)
+}
+
+watch([market, symbol], startStockLoad)
+watch(activeTab, async (tab) => {
+  void loadTab(tab)
+  await nextTick()
+  if (tab === 'trend') {
+    renderChart()
+    renderChipCharts()
+    renderFundFlowChart()
+  } else if (tab === 'fundamental') {
+    renderFinanceChart()
+  }
 })
 
 onMounted(() => {
-  load()
+  startStockLoad()
   window.addEventListener('resize', onResize)
 })
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
-  loadEpoch.invalidate()
-  minuteAbort?.abort()
-  minuteAbort = null
+  stockEpoch.invalidate()
+  stockAbort?.abort()
+  stockAbort = null
   disposeCharts()
 })
 function onResize() {
@@ -1024,22 +1231,45 @@ function onResize() {
   finChart?.resize()
   ffChart?.resize()
 }
-useAutoRefresh(() => load(true), 60_000)
+useAutoRefresh(() => loadQuote(true), 60_000)
 
-function goPosition() {
-  router.push({
-    path: '/positions',
-    query: { add: '1', symbol: symbol.value, market: market.value, name: quote.value?.name || '' },
-  })
+function refreshVisible() {
+  void loadQuote(!!quote.value)
+  void loadRelationships(positionsKnown.value || watchlistKnown.value)
+  void loadTab(activeTab.value, true)
+}
+
+async function handleSummaryAction(action: 'watch' | 'alert' | 'analysis' | 'position') {
+  if (action === 'watch') {
+    if (!watchlistKnown.value || inWatchlist.value) {
+      await goWatchlist(stockRef.value)
+      return
+    }
+    if (await addToWatchlist(stockRef.value)) await loadRelationships(true)
+    return
+  }
+  if (action === 'alert') {
+    await goAlert(stockRef.value)
+    return
+  }
+  if (action === 'analysis') {
+    await goAnalysis(stockRef.value)
+    return
+  }
+  await openPosition(stockRef.value, positionsKnown.value ? !!positionSummary.value : undefined)
+}
+
+async function selectMoreAction(key: string | number) {
+  if (key === 'qa') await goQa(stockRef.value)
+  else if (key === 'compare') await goCompare(stockRef.value)
+  else if (key === 'thesis') await goThesis(stockRef.value)
+  else if (key === 'note') await goNote(stockRef.value)
+  else if (key === 'position') await handleSummaryAction('position')
 }
 
 /* 展示辅助（口径与首页一致：量为手、额为元） */
 function fmt(n: number | undefined | null) {
   return n == null ? '-' : n.toFixed(2)
-}
-function fmtAmount(n: number | undefined) {
-  if (!n) return '-'
-  return (n / 1e8).toFixed(2) + ' 亿'
 }
 function fmtVol(n: number | undefined) {
   if (!n) return '-'
@@ -1048,9 +1278,6 @@ function fmtVol(n: number | undefined) {
 function fmtCap(n: number | undefined) {
   if (!n) return '-'
   return (n / 1e8).toFixed(0) + ' 亿'
-}
-function fmtTime(t: string | undefined) {
-  return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : '-'
 }
 function fmtNewsTime(t: string) {
   const d = new Date(t)
@@ -1077,59 +1304,37 @@ function scoreType(total: number) {
 </script>
 
 <template>
-  <PageContainer :title="quote ? `${quote.name} ${symbol}` : `个股详情 ${symbol}`" subtitle="行情 · K线 · 估值 · 评分一页看全">
+  <PageContainer :title="quote ? `${quote.name} ${symbol}` : `个股详情 ${symbol}`" subtitle="决策摘要 · 分区研究 · 原始证据">
     <template #actions>
-      <!-- 壳内无下拉刷新：60s 自动轮询之外给显式刷新入口 -->
-      <n-button size="small" quaternary :loading="loading" @click="load()">刷新</n-button>
+      <n-button size="small" quaternary :loading="pageRefreshing" @click="refreshVisible">刷新当前</n-button>
     </template>
-    <n-result v-if="loadError" status="warning" title="行情获取失败" :description="loadError">
-      <template #footer>
-        <n-button @click="load()">重试</n-button>
-        <n-button quaternary @click="router.back()">返回</n-button>
-      </template>
-    </n-result>
+    <div class="detail">
+      <StockDecisionSummary
+        :quote="quote"
+        :quote-phase="quoteState.phase"
+        :quote-error="quoteState.error"
+        :relationship-phase="relationshipState.phase"
+        :relationship-error="relationshipState.error"
+        :relationship-as-of="relationshipAsOf"
+        :watchlist-known="watchlistKnown"
+        :position-known="positionsKnown"
+        :in-watchlist="inWatchlist"
+        :position="positionSummary"
+        :summary="decisionSummary"
+        :adding="adding"
+        @retry-quote="loadQuote(false)"
+        @action="handleSummaryAction"
+      />
 
-    <n-spin v-else :show="loading">
-      <div v-if="quote" class="detail">
-        <!-- 行情头：现价 + 关键字段 + 快捷动作 -->
-        <SectionCard :hoverable="false">
-          <div class="head">
-            <div class="head-price">
-              <span class="hp-price qv-figure" :style="{ color: pctColor(quote.change_pct) }">{{ fmt(quote.price) }}</span>
-              <ChangeTag :value="quote.change_pct" />
-              <n-tag v-if="valuation?.is_st" type="warning" size="small" round :bordered="false">ST</n-tag>
-            </div>
-            <div class="head-meta">
-              <span>{{ quote.source }} · {{ fmtTime(quote.data_time) }}</span>
-              <n-tooltip v-if="quote.freshness?.freshness_status === 'stale'" trigger="hover">
-                <template #trigger>
-                  <n-tag type="warning" size="small" round :bordered="false">行情过期</n-tag>
-                </template>
-                {{ quote.freshness?.stale_reason || '全部数据源均未取到当前有效行情，价格非实时盘面' }}
-              </n-tooltip>
-            </div>
-          </div>
-          <div class="quote-grid">
-            <div class="qc"><span class="qc-k">今开</span><span class="qc-v qv-tnum">{{ fmt(quote.open) }}</span></div>
-            <div class="qc"><span class="qc-k">最高</span><span class="qc-v qv-tnum" :style="{ color: pctColor(1) }">{{ fmt(quote.high) }}</span></div>
-            <div class="qc"><span class="qc-k">最低</span><span class="qc-v qv-tnum" :style="{ color: pctColor(-1) }">{{ fmt(quote.low) }}</span></div>
-            <div class="qc"><span class="qc-k">昨收</span><span class="qc-v qv-tnum">{{ fmt(quote.prev_close) }}</span></div>
-            <div class="qc"><span class="qc-k">成交量</span><span class="qc-v qv-tnum">{{ fmtVol(quote.volume) }}</span></div>
-            <div class="qc"><span class="qc-k">成交额</span><span class="qc-v qv-tnum">{{ fmtAmount(quote.amount) }}</span></div>
-          </div>
-          <div class="actions">
-            <n-button size="small" secondary type="primary" @click="goAnalysis(stockRef)">AI 分析</n-button>
-            <n-button size="small" secondary @click="goQa(stockRef)">个股问答</n-button>
-            <n-button size="small" secondary @click="goCompare(stockRef)">横向对比</n-button>
-            <n-button size="small" secondary @click="goAlert(stockRef)">设提醒</n-button>
-            <n-button size="small" secondary @click="goThesis(stockRef)">逻辑卡</n-button>
-            <n-button size="small" secondary :loading="adding" @click="addToWatchlist(stockRef)">+ 自选</n-button>
-            <n-button size="small" secondary @click="goPosition">建仓</n-button>
-          </div>
-        </SectionCard>
-
-        <StockCoverageMatrix :items="coverageItems" />
-
+      <n-tabs v-model:value="activeTab" type="line" :animated="false" pane-class="stock-tab-pane">
+        <n-tab-pane name="trend" tab="走势" display-directive="show:lazy">
+          <StockTabState
+            :phase="tabStates.trend.phase"
+            :error="tabStates.trend.error"
+            :has-data="tabDataState.trend"
+            @retry="loadTab('trend', true)"
+          >
+            <div class="tab-content">
         <!-- 分时与日 K 共用稳定尺寸图表容器，切换时重绘。 -->
         <SectionCard title="行情走势">
           <template #extra>
@@ -1234,6 +1439,18 @@ function scoreType(total: number) {
           <n-empty v-else description="近期无上榜记录（覆盖近 30 天龙虎榜采集）" />
         </SectionCard>
 
+            </div>
+          </StockTabState>
+        </n-tab-pane>
+
+        <n-tab-pane name="event" tab="事件" display-directive="show:lazy">
+          <StockTabState
+            :phase="tabStates.event.phase"
+            :error="tabStates.event.error"
+            :has-data="tabDataState.event"
+            @retry="loadTab('event', true)"
+          >
+            <div class="tab-content">
         <!-- 解禁 / 分红（B9）：每日 19:25 同步的本地表。
              **状态三分**：读取失败 / 数据不可用 / 确实没有——空态文案严格区分，
              绝不把「查不到」显示成「无解禁」（与 AI 侧 riskGateNoteFor 同一纪律）。 -->
@@ -1241,7 +1458,7 @@ function scoreType(total: number) {
           <template #extra>
             <span class="src-hint">解禁前瞻半年 · 分红近 8 期</span>
           </template>
-          <n-spin :show="loading && !corpEvents">
+          <n-spin :show="tabStates.event.phase === 'refreshing' && !corpEvents">
             <n-alert v-if="corpEventsError" type="error" :bordered="false" title="解禁 / 分红读取失败">
               {{ corpEventsError }}——这不代表无解禁，请稍后刷新或自行核查公告。
             </n-alert>
@@ -1298,6 +1515,48 @@ function scoreType(total: number) {
           </n-spin>
         </SectionCard>
 
+        <SectionCard title="公告">
+          <div v-if="announcements.length" class="news-list">
+            <div v-for="a in announcements" :key="a.art_code" class="news-row">
+              <span class="news-time qv-tnum">{{ a.notice_date }}</span>
+              <a :href="a.url" target="_blank" rel="noopener noreferrer" class="news-title">{{ a.title }}</a>
+              <span v-if="a.notice_type" class="news-src">{{ a.notice_type }}</span>
+            </div>
+          </div>
+          <n-empty v-else description="请求成功，当前没有公告记录" />
+        </SectionCard>
+
+        <SectionCard title="相关新闻">
+          <template #extra>
+            <RouterLink :to="{ name: 'news', query: { symbol } }" class="news-more">更多快讯 →</RouterLink>
+          </template>
+          <div v-if="news.length" class="news-list">
+            <div v-for="n in news" :key="n.id" class="news-row">
+              <span class="news-time qv-tnum">{{ fmtNewsTime(n.publish_time) }}</span>
+              <a v-if="n.url" :href="n.url" target="_blank" rel="noopener noreferrer" class="news-title">{{ n.title }}</a>
+              <span v-else class="news-title">{{ n.title }}</span>
+              <span
+                v-if="sentiView(n)"
+                class="news-senti"
+                :style="{ color: sentiView(n)!.color, background: withAlpha(sentiView(n)!.color, isDark ? 0.16 : 0.1) }"
+              >{{ sentiView(n)!.text }}</span>
+              <span class="news-src">{{ newsSourceLabel(n) }}</span>
+            </div>
+          </div>
+          <n-empty v-else description="请求成功，当前没有相关新闻记录" />
+        </SectionCard>
+            </div>
+          </StockTabState>
+        </n-tab-pane>
+
+        <n-tab-pane name="fundamental" tab="基本面" display-directive="show:lazy">
+          <StockTabState
+            :phase="tabStates.fundamental.phase"
+            :error="tabStates.fundamental.error"
+            :has-data="tabDataState.fundamental"
+            @retry="loadTab('fundamental', true)"
+          >
+            <div class="tab-content">
         <!-- 估值 + 评分 -->
         <n-grid cols="1 m:2" :x-gap="16" :y-gap="16" responsive="screen">
           <n-gi>
@@ -1387,6 +1646,20 @@ function scoreType(total: number) {
           <n-empty v-else description="暂无财务数据（东财 F10，A 股标的；首次访问自动拉取，可稍后刷新）" />
         </SectionCard>
 
+            </div>
+          </StockTabState>
+        </n-tab-pane>
+
+        <n-tab-pane name="research" tab="研究" display-directive="show:lazy">
+          <StockTabState
+            :phase="tabStates.research.phase"
+            :error="tabStates.research.error"
+            :has-data="tabDataState.research"
+            @retry="loadTab('research', true)"
+          >
+            <div class="tab-content">
+        <StockCoverageMatrix :items="coverageItems" />
+
         <!-- 机构观点（P3a）：研报评级分布/变动/目标价 + 机构调研；按需拉取首访可能为空 -->
         <SectionCard v-if="market === 'cn' && !isFund" title="机构观点">
           <template #extra>
@@ -1432,77 +1705,41 @@ function scoreType(total: number) {
           </div>
           <n-empty v-else description="暂无机构观点数据（研报/调研覆盖 A 股，首次访问自动拉取，可稍后刷新）" />
         </SectionCard>
-
-        <!-- 公告（F1）：东财公告源，标题链到原文；采集范围外的股查询时按需补拉 -->
-        <SectionCard title="公告">
-          <div v-if="announcements.length" class="news-list">
-            <div v-for="a in announcements" :key="a.art_code" class="news-row">
-              <span class="news-time qv-tnum">{{ a.notice_date }}</span>
-              <a :href="a.url" target="_blank" rel="noopener noreferrer" class="news-title">{{ a.title }}</a>
-              <span v-if="a.notice_type" class="news-src">{{ a.notice_type }}</span>
             </div>
-          </div>
-          <n-empty v-else description="暂无公告数据（东财公告源，A 股标的）" />
-        </SectionCard>
+          </StockTabState>
+        </n-tab-pane>
+      </n-tabs>
+    </div>
 
-        <!-- 相关新闻（N1）：按代码关联财联社电报与东财个股新闻，best-effort -->
-        <SectionCard title="相关新闻">
-          <template #extra>
-            <RouterLink :to="{ name: 'news', query: { symbol } }" class="news-more">更多快讯 →</RouterLink>
-          </template>
-          <div v-if="news.length" class="news-list">
-            <div v-for="n in news" :key="n.id" class="news-row">
-              <span class="news-time qv-tnum">{{ fmtNewsTime(n.publish_time) }}</span>
-              <a
-                v-if="n.url"
-                :href="n.url"
-                target="_blank"
-                rel="noopener noreferrer"
-                class="news-title"
-              >{{ n.title }}</a>
-              <span v-else class="news-title">{{ n.title }}</span>
-              <span
-                v-if="sentiView(n)"
-                class="news-senti"
-                :style="{ color: sentiView(n)!.color, background: withAlpha(sentiView(n)!.color, isDark ? 0.16 : 0.1) }"
-              >{{ sentiView(n)!.text }}</span>
-              <span class="news-src">{{ newsSourceLabel(n) }}</span>
-            </div>
-          </div>
-          <n-empty v-else description="暂无相关新闻（覆盖财联社电报与东财个股新闻，A 股标的）" />
-        </SectionCard>
-      </div>
-    </n-spin>
+    <nav class="mobile-action-bar" aria-label="当前股票快捷动作">
+      <button type="button" :disabled="adding" @click="handleSummaryAction('watch')">
+        {{ inWatchlist ? '观察中' : '观察' }}
+      </button>
+      <button type="button" @click="handleSummaryAction('alert')">提醒</button>
+      <button type="button" class="primary" @click="handleSummaryAction('analysis')">分析</button>
+      <n-dropdown trigger="click" placement="top-end" :options="moreOptions" @select="selectMoreAction">
+        <button type="button" aria-label="更多股票操作" title="更多股票操作">⋯</button>
+      </n-dropdown>
+    </nav>
   </PageContainer>
 </template>
 
 <style scoped>
 .detail {
   display: flex;
+  min-width: 0;
   flex-direction: column;
   gap: 16px;
 }
-.head {
+.tab-content {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 12px;
+  min-width: 0;
+  flex-direction: column;
+  gap: 16px;
+  padding-top: 4px;
 }
-.head-price {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.hp-price {
-  font-size: 32px;
-  font-weight: 700;
-  line-height: 1;
-}
-.head-meta {
-  font-size: 12px;
-  opacity: 0.55;
+.mobile-action-bar {
+  display: none;
 }
 .quote-grid {
   display: grid;
@@ -1560,12 +1797,64 @@ function scoreType(total: number) {
   line-height: 1.6;
 }
 @media (max-width: 768px) {
+  .detail {
+    max-width: 100%;
+    padding-bottom: 68px;
+    overflow-x: clip;
+  }
+  .mobile-action-bar {
+    position: fixed;
+    right: 12px;
+    bottom: calc(57px + env(safe-area-inset-bottom, 0px));
+    left: 12px;
+    z-index: 89;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr)) 48px;
+    min-height: 52px;
+    box-sizing: border-box;
+    overflow: hidden;
+    border: 1px solid v-bind('vars.dividerColor');
+    border-radius: 8px 8px 0 0;
+    background: v-bind('vars.cardColor');
+    box-shadow: 0 -4px 18px v-bind('vars.boxShadow2');
+  }
+  .mobile-action-bar button {
+    width: 100%;
+    min-width: 0;
+    min-height: 50px;
+    padding: 0 6px;
+    border: 0;
+    border-right: 1px solid v-bind('vars.dividerColor');
+    background: transparent;
+    color: v-bind('vars.textColor1');
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0;
+  }
+  .mobile-action-bar button.primary {
+    background: v-bind('vars.primaryColor');
+    color: v-bind('vars.baseColor');
+  }
+  .mobile-action-bar button:disabled {
+    opacity: 0.5;
+  }
   /* 小屏 460px ≈ 72vh 占满一屏还多，与 chip/ff/fin 图同做降高 */
   .kchart {
     height: 360px;
   }
   .minute-meta {
     gap: 4px 12px;
+  }
+}
+
+@media (max-width: 768px) and (max-height: 600px) {
+  .detail {
+    padding-bottom: 0;
+  }
+  .mobile-action-bar {
+    position: static;
+    margin-top: 12px;
   }
 }
 
