@@ -615,7 +615,7 @@ onMounted(() => void loadPositions())
               <span class="field-value">持续生效，由后端按每笔持仓和交易日去重</span>
             </n-form-item>
             <n-form-item label="备注">
-              <n-input v-model:value="form.note" maxlength="256" placeholder="可选" />
+              <n-input v-model:value="form.note" maxlength="250" placeholder="可选" />
             </n-form-item>
           </div>
         </n-collapse-transition>

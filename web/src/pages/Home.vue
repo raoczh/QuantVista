@@ -98,6 +98,7 @@ const valuation = ref<Valuation | null>(null)
 const loading = ref(false)
 const quoteError = ref('')
 const barsError = ref('')
+const valuationError = ref('')
 const chartEl = ref<HTMLDivElement | null>(null)
 let chart: echarts.ECharts | null = null
 const lastBars = ref<Bar[]>([])
@@ -539,9 +540,11 @@ async function loadStock(silent = false) {
   }
   const seq = ++stockLoadSeq
   const sym = symbol.value.trim()
+  const previousSymbol = quote.value?.symbol
   if (!silent || !quote.value) loading.value = true
   quoteError.value = ''
   barsError.value = ''
+  valuationError.value = ''
 
   const [quoteResult, barsResult, valuationResult] = await Promise.allSettled([
     getQuote('cn', sym),
@@ -552,15 +555,26 @@ async function loadStock(silent = false) {
 
   if (quoteResult.status === 'fulfilled') {
     quote.value = quoteResult.value
-    valuation.value = valuationResult.status === 'fulfilled' ? valuationResult.value : null
+    const sameStock = previousSymbol === quoteResult.value.symbol
+    if (valuationResult.status === 'fulfilled') {
+      valuation.value = valuationResult.value
+    } else {
+      valuationError.value = errorText(valuationResult.reason, '估值数据暂不可用')
+      if (!sameStock || valuation.value?.symbol !== quoteResult.value.symbol) valuation.value = null
+    }
     if (barsResult.status === 'fulfilled') {
       lastBars.value = barsResult.value
       await nextTick()
       if (seq === stockLoadSeq) renderChart(barsResult.value)
     } else {
-      barsError.value = errorText(barsResult.reason, '日线数据暂不可用')
-      lastBars.value = []
-      chart?.clear()
+      const detail = errorText(barsResult.reason, '日线数据暂不可用')
+      barsError.value = sameStock && lastBars.value.length
+        ? `日线刷新失败，继续显示最近有效日线：${detail}`
+        : detail
+      if (!sameStock) {
+        lastBars.value = []
+        chart?.clear()
+      }
     }
   } else {
     quoteError.value = errorText(quoteResult.reason, '行情暂不可用')
@@ -1190,7 +1204,14 @@ function onResize() {
           来源 {{ quote?.source || '行情聚合' }} · as_of {{ quote?.freshness?.source_data_time || quote?.data_time || 'unknown' }}。
         </n-alert>
         <n-alert v-if="barsError" type="warning" :bordered="false" :show-icon="false" class="inline-state">
-          {{ barsError }}。日线来源 unknown · as_of unknown。
+          {{ barsError }}。日线来源 unknown · as_of {{ lastBars.at(-1)?.trade_date || 'unknown' }}。
+        </n-alert>
+        <n-alert v-if="valuationError" type="warning" :bordered="false" :show-icon="false" class="inline-state">
+          <template v-if="valuation && quote && valuation.symbol === quote.symbol">
+            估值刷新失败，继续显示最近有效估值：{{ valuationError }}。来源 {{ valuation.source || 'unknown' }} · as_of
+            {{ valuation.data_time || 'unknown' }}。
+          </template>
+          <template v-else>估值读取失败：{{ valuationError }}。本次不展示估值结果。</template>
         </n-alert>
 
         <div v-if="quote" class="quote-panel">

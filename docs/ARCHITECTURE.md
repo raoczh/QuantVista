@@ -57,7 +57,7 @@ Go API Server
 页面风格：
 
 - 应用型工作台，不做营销落地页。
-- 首页直接展示市场总览和可操作入口。
+- 首页第一层直接展示与当前用户有关的待办、持仓风险/行情缺口、重点自选和最近研究；市场总览与个股速查完整保留在第二层。
 - 信息密度适中，适合反复查看和对比。
 - 图表、表格、筛选器、状态标签、分段控件是主要 UI 形态。
 
@@ -96,6 +96,7 @@ Go API Server
 - `web/src/composables/useUi.ts`：全站取色入口，颜色全部来自 `useThemeVars()`，自动兼容 6 套主题。导出 `pctColor/pctBg`（涨红 `errorColor`/跌绿 `successColor`/平 `textColor3`）、`primaryAlpha(a)`、`withAlpha(color,a)`、`upColor/downColor`、`isDark`、`vars`。**任何涨跌/主色透明度需求走它，禁止硬编码 hex。**
 - `web/src/composables/useAutoRefresh.ts`：盘中自动刷新（仅交易时段周一~五 09:15–15:05 + 页面可见时轮询，切后台暂停；数据源有限流，**间隔不得低于 60s**）。Home/Watchlist/Positions 已接入，行情类新页面照用。
 - `web/src/composables/useStockActions.ts`：个股快捷动作（跳 AI 分析/问答/对比/设提醒 query 预填、加自选到第一分组）。Home 速查、GlobalSearch 复用；新入口一律走它。
+- `web/src/components/home/homeWorkspace.ts` + `HomeWorkspaceSection.vue`：首页盘前/盘中/盘后排序、默认展开与个人区块外壳。自动模式只认后端行情新鲜度的 `market_state`；缺失时上海时钟仅用于展示排序且状态保持 `unknown`。模式偏好按用户写本地存储，不落服务端、不改变业务事实。
 - `web/src/lib/pageTitle.ts`：标签页标题统一拼装（页面名 + 大盘行情两段互不覆盖），router.afterEach 与 AppShell 轮询各自 set。
 
 **外壳与导航**（`components/AppShell.vue`）
@@ -462,6 +463,7 @@ AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yiel
 - **P0-5 命中上下文（代码已实现、待线上验收）**：新事件写 `context_version=1` 与最大 4096 字节的白名单 JSON；普通行情只保留实际用于判定的 quote、最新 bar 摘要和 MA/前高前低/量比/振幅指标，财报只保留预约披露或业绩预告结构化字段，持仓只保留命中持仓 ID、加权成本、峰值与 fresh quote。缺失来源/时点进入 `unknown` 或省略；不得放 token/cookie/密钥、请求/响应正文或上游原始对象。旧事件保持 `0/空串`，API 显示上下文不可用，不追溯猜测。
 - **详情与深链**：`GET /api/alerts/events/:id` 必须同时按 `id+user_id` 查询，返回解析后的 `context/context_available` 与稳定 `deep_link=/alerts?event_id=<id>`，不返回原始 ContextJSON。列表与状态更新使用同一安全视图。Today 的提醒待办返回同一 deep_link；仅打开详情不改变 unread 状态。主动推送正文最多保留 5 条有界摘要及各自事件深链，不复制完整快照。
 - **持仓类事件去重键 `(rule_id, position_id, trade_date)`（D14 起下沉）**：绑「全部持仓」的规则同一天会逐仓命中，同一代码也可能有多笔不同成本的持仓；按 symbol 判重会吞掉后面的仓位。`alert_events` 因此新增 `trade_date`（旧行空串，历史不追溯）与 `position_id`（持仓类命中的那一笔，其余恒 0）。非持仓类仍由规则行 `triggered_at` 做同日去重。
+- **模板向导只是一层无损映射**：`AlertWizard.vue` 与 `alertTemplates.ts` 将 11 个现有 kind 组织为模板→范围→参数→确认，不新增规则类型或第二套评估语义。编辑旧规则时，只有 kind/op 能被模板完整表达才反推模板；缩量、低振幅或未知组合进入专家模式并保留原字段。持仓模板只能选当前持仓或空 symbol 的“我的全部持仓”，最终约束仍以后端 `AlertService.validate` 为权威。
 - 今日待办（`GET /api/todos?scope=`）的提醒条目即 unread 事件，`ref_id` 为事件 id，可就地标记已读/忽略「完成待办」
 
 ### 5.8.2 今日待办范围（D18）
@@ -689,7 +691,7 @@ AI 结果：
 
 实际路由（`web/src/router/index.ts`）：
 
-- `/`：市场首页
+- `/`：个人优先分时首页（盘前/盘中/盘后只调整个人区块顺序和默认展开；后端交易状态缺失时显示 unknown，市场全景在第二层）
 - `/news`：市场快讯（新闻情绪流，N1/N2）
 - `/stocks/:market/:symbol`：个股详情（P0-0C 决策摘要优先，走势/事件/基本面/研究四分区；A 股非基金首屏只预取本地公司行动，公告/新闻按事件页签加载，缺口保持 partial/unknown；stale/unknown 报价只称“最近已知”；首页榜单行与个股速查可点击进入，`useStockActions.goDetail` 供各处复用）
 - `/screener`：策略选股（21 策略组合筛选，S1）
