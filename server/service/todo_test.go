@@ -60,9 +60,9 @@ func TestTodoBuild(t *testing.T) {
 	if res.Total != 4 {
 		t.Fatalf("待办合计应为 4，得到 %d", res.Total)
 	}
-	// 排序：优先级 1 的（提醒命中 + 止损复盘）排在过期复盘（优先级 2）之前。
-	if res.Items[len(res.Items)-1].Priority != 2 {
-		t.Fatalf("最后一项应为优先级 2（过期），得到 %d", res.Items[len(res.Items)-1].Priority)
+	// 新收件箱排序：需处理项在仅知晓的普通提醒之前，顺序由服务端统一决定。
+	if res.Items[0].Status != TodoStatusNeedsAction || res.Items[len(res.Items)-1].Status != TodoStatusAwareness {
+		t.Fatalf("需处理项应排在仅知晓项之前: %+v", res.Items)
 	}
 	// alert 条目的 RefID 应为事件 id（供前端标记已读/忽略）；rec_review 条目的
 	// RefID 应为追踪状态行 id（供前端「已读」消项）。
@@ -165,7 +165,8 @@ func TestTodoScopeFilter(t *testing.T) {
 		t.Fatalf("分类计数应按过滤后计算，得到 alerts=%d reviews=%d", led.Alerts, led.Reviews)
 	}
 	if led.Filtered != 3 {
-		t.Fatalf("被过滤条数应为 3（推荐复盘 + 打新 + 非持仓提醒），得到 %d", led.Filtered)
+		t.Fatalf("被过滤条数应为 3（推荐复盘 + 打新 + 非持仓提醒），得到 %d，status=%+v source=%+v scope=%+v items=%+v",
+			led.Filtered, led.StatusCounts, led.SourceCounts, led.ScopeCounts, led.Items)
 	}
 	if led.ScopeCounts[TodoScopeResearch] != 2 || led.ScopeCounts[TodoScopeMarket] != 1 {
 		t.Fatalf("ScopeCounts 应给出别处的条数（供前端提示）: %+v", led.ScopeCounts)

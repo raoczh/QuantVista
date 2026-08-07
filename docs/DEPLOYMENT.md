@@ -79,13 +79,14 @@ openssl rand -base64 36   # 再生成一个作 ENCRYPTION_KEY
 - 将现有非空列放宽为可空列。本轮统一系统作业会自动把 `job_runs.user_id`、`job_events.user_id` 调整为可空，并创建 `research_artifacts`、补齐 owner、触发人和结果引用字段。
 - 本轮 P0-5 会自动给 `alert_events` 增加命中上下文字段，并创建 `job_failure_notifications` 及其 JobRun 唯一键、短窗 group key/merge 索引；不需要额外 SQL 文件。
 - 本轮 P0-4 策略结果阶段会自动创建 `strategy_run_results` 及其 owner/kind/状态/时间索引；有 16KiB 上限的规范化请求映射为 MySQL TEXT，最大 2MiB 的结果正文映射为 LONGTEXT。扫描/回测 handler 在作业恢复前完成注册，部署不需要另建队列或执行 SQL。
+- 本轮 Top50 U13/U18 会自动创建 `todo_inbox_states` 及 `(user_id, source_kind, source_id)` 唯一索引。该表只保存来源版本、已读、稍后和当日静默；提醒/推荐/任务正文不会复制。模型已进入 `model.AllModels()`，Docker 正常重部署会自动完成，不提供也不需要手工 SQL。
 
 **不会自动做的（需写迁移代码）：**
 
 - 删除列、重命名列，以及需要清洗或重写存量数据的类型/约束变更。
 - 这类变更必须在代码中增加幂等迁移函数，跟 `AutoMigrate` 一起在启动时执行，不能依赖运维人员临时手改生产库。
 
-因此本轮只需正常构建镜像并重新部署，**无需手工执行 SQL**。上线前仍应备份数据库，并在健康检查转绿前查看启动日志确认迁移成功；连续重启一次可核对迁移幂等，随后分别跑一项扫描和回测验证 `strategy_run_results`、JobRun 引用及 Artifact。不要把这条结论扩展成“任何未来的类型或数据迁移都能由 AutoMigrate 自动完成”。
+因此本轮只需正常构建镜像并重新部署，**无需手工执行 SQL**。上线前仍应备份数据库，并在健康检查转绿前查看启动日志确认迁移成功；连续重启一次可核对迁移幂等，随后分别跑一项扫描和回测验证 `strategy_run_results`、JobRun 引用及 Artifact，并用两个账号验证 `todo_inbox_states` 用户隔离、稍后跨日恢复和来源版本升级重现。不要把这条结论扩展成“任何未来的类型或数据迁移都能由 AutoMigrate 自动完成”。
 
 ## 5. 系统配置（管理后台，运行时可改）
 

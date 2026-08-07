@@ -282,6 +282,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 
 			// 今日待办/待复盘（聚合命中提醒 + 推荐/持仓复盘信号 + 逻辑卡到期）
 			authed.GET("/todos", todoCtl.List)
+			authed.PUT("/todos/actions", todoCtl.Action)
 			// B9 事件日历：未来 N 天与我相关的解禁/除权/财报 + 全市场打新
 			authed.GET("/events/calendar", controller.Calendar)
 

@@ -36,6 +36,7 @@ const (
 	TodoKindCorpAdjust    = "corp_adjust"    // 除权除息待确认折算（B8，不确认账面盈亏就是错的）
 	TodoKindIpo           = "ipo"            // 今日可申购新股/可转债（B9，不依赖持仓）
 	TodoKindSellReview    = "sell_review"    // 持仓命中利空事件，需卖出复核（D16）
+	TodoKindJobFailure    = "job_failure"    // 用户作业失败（只消费脱敏通知事实）
 )
 
 // 待办范围（D18）。用户的原话：「现在提醒的是没什么用的」——噪音主体是推荐复盘
@@ -69,7 +70,7 @@ const longHoldReviewDays = 60
 type TodoItem struct {
 	Kind     string     `json:"kind"`
 	Scope    string     `json:"scope"`    // ledger / research / market（D18 消费出口分流）
-	Priority int        `json:"priority"` // 越小越紧急，用于排序
+	Priority int        `json:"priority"` // 兼容旧前端；确定性顺序由后端 SortBucket 等字段统一计算
 	Symbol   string     `json:"symbol"`
 	Market   string     `json:"market"`
 	Name     string     `json:"name"`
@@ -79,6 +80,27 @@ type TodoItem struct {
 	RefType  string     `json:"ref_type"` // alerts / recommendations / positions
 	DeepLink string     `json:"deep_link,omitempty"`
 	Time     *time.Time `json:"time"`
+
+	Status        string      `json:"status"`
+	SourceKind    string      `json:"source_kind"`
+	SourceID      int64       `json:"source_id"`
+	SourceVersion string      `json:"source_version"`
+	SourceLabel   string      `json:"source_label"`
+	Severity      string      `json:"severity"`
+	DueAt         *time.Time  `json:"due_at,omitempty"`
+	Read          bool        `json:"read"`
+	SnoozedUntil  *time.Time  `json:"snoozed_until,omitempty"`
+	CanComplete   bool        `json:"can_complete"`
+	GroupKey      string      `json:"group_key"`
+	ChildCount    int         `json:"child_count"`
+	Children      []TodoChild `json:"children"`
+
+	groupCategory  string
+	eventDate      string
+	severityRank   int
+	sortBucket     int
+	versionChanged bool
+	mutedToday     bool
 }
 
 // TodoResult 聚合结果 + 分类计数。Complete=false 表示至少一个数据块读取失败，
@@ -100,6 +122,16 @@ type TodoResult struct {
 	ScopeCounts map[string]int `json:"scope_counts"`
 	// Filtered 因范围过滤而未展示的条数（= 全量 − Total）。
 	Filtered int `json:"filtered"`
+
+	Status       string         `json:"status"`
+	Source       string         `json:"source"`
+	StatusCounts map[string]int `json:"status_counts"`
+	SourceCounts map[string]int `json:"source_counts"`
+	Page         int            `json:"page"`
+	PageSize     int            `json:"page_size"`
+	MatchedTotal int            `json:"matched_total"`
+	HasMore      bool           `json:"has_more"`
+	Partial      bool           `json:"partial"`
 }
 
 var recReviewTitle = map[string]string{
@@ -108,13 +140,13 @@ var recReviewTitle = map[string]string{
 	model.RecOutcomeExpired:    "短线推荐已过有效期，需复盘",
 }
 
-// Build 聚合某用户当前的待办清单。任何数据块读取失败都会登记进 Errors 并置
+// buildActive 聚合某用户当前尚未完成的业务事实。任何数据块读取失败都会登记进 Errors 并置
 // Complete=false（fail-closed：不能吞错后返回空清单，让前端把「读不到止损信号」
 // 显示成「一切都在轨道上」）。
 //
 // scope 为消费出口过滤器（D18）：默认 ledger（只看与我的账本有关的），
 // **全量数据照常生成**，过滤只发生在返回前——ScopeCounts 会告诉前端别处还有多少条。
-func (s *TodoService) Build(ctx context.Context, userID int64, scope string) (*TodoResult, error) {
+func (s *TodoService) buildActive(ctx context.Context, userID int64, scope string) (*TodoResult, error) {
 	scope, err := validTodoScope(scope)
 	if err != nil {
 		return nil, err

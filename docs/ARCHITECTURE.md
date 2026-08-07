@@ -464,20 +464,28 @@ AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yiel
 - **详情与深链**：`GET /api/alerts/events/:id` 必须同时按 `id+user_id` 查询，返回解析后的 `context/context_available` 与稳定 `deep_link=/alerts?event_id=<id>`，不返回原始 ContextJSON。列表与状态更新使用同一安全视图。Today 的提醒待办返回同一 deep_link；仅打开详情不改变 unread 状态。主动推送正文最多保留 5 条有界摘要及各自事件深链，不复制完整快照。
 - **持仓类事件去重键 `(rule_id, position_id, trade_date)`（D14 起下沉）**：绑「全部持仓」的规则同一天会逐仓命中，同一代码也可能有多笔不同成本的持仓；按 symbol 判重会吞掉后面的仓位。`alert_events` 因此新增 `trade_date`（旧行空串，历史不追溯）与 `position_id`（持仓类命中的那一笔，其余恒 0）。非持仓类仍由规则行 `triggered_at` 做同日去重。
 - **模板向导只是一层无损映射**：`AlertWizard.vue` 与 `alertTemplates.ts` 将 11 个现有 kind 组织为模板→范围→参数→确认，不新增规则类型或第二套评估语义。编辑旧规则时，只有 kind/op 能被模板完整表达才反推模板；缩量、低振幅或未知组合进入专家模式并保留原字段。持仓模板只能选当前持仓或空 symbol 的“我的全部持仓”，最终约束仍以后端 `AlertService.validate` 为权威。
-- 今日待办（`GET /api/todos?scope=`）的提醒条目即 unread 事件，`ref_id` 为事件 id，可就地标记已读/忽略「完成待办」
+- Today 收件箱的提醒来源仍是 `alert_events`，`GuardEvent` 只保存主动推送去重台账，绝不直接作为页面事实。提醒“收下”调用 `AlertService.SetEventStatus`，推荐复盘调用 `TrackingService.AckReview`，卖出复核调用 `SetSellReviewStatus`；持仓止损、定期复盘、逻辑卡和公司行动不能由收件箱伪造完成，只能稍后或深链回原页面处理。
 
-### 5.8.2 今日待办范围（D18）
+### 5.8.2 Today 统一收件箱（D18 / Top50 U13/U18）
 
-`GET /api/todos?scope=ledger|research|market|all`，**默认 ledger**。
+`GET /api/todos?scope=&status=&source=&page=&page_size=&history_days=&limit=` 继续由现有 `TodoService` 聚合，不建立平行提醒引擎。`scope` 保持 `ledger/research/market/all` 兼容；`status` 为 `needs_action/awareness/completed/open/all`。Home 请求 `scope=all&status=needs_action&limit=3`，直接消费后端前三条，前端不复制排序。
+
+来源至少包括 `AlertEvent`、`RecommendationStatus`、持仓当前风险/复盘状态、`ThesisCard`、`PositionCorpAdjust`、`IpoSubscription`、`SellReview` 和脱敏 `JobFailureNotification`。任务失败投影只按白名单 `error_code` 重建摘要，不读取 `JobRun.Error/RequestSnapshot`，旧通知行即使含异常正文也不会透传。
+
+`todo_inbox_states` 是唯一新增状态表，字段只含 `user_id/source_kind/source_id/source_version/read/snoozed_until/muted_date/created_at/updated_at`。唯一键为用户+来源类型+来源 ID；标题、正文、股票和任务请求始终从原业务事实即时读取。状态更新与详情均按 `user_id` 隔离。`PUT /api/todos/actions` 支持最多 100 个来源引用的 `read/snooze/mute_today`，请求必须携当前来源版本，旧版本操作会被拒绝。
+
+同股同类同日事项按展示组返回，`children` 保留每个子事件的来源身份、正文和原业务深链。组静默会为当前全部子来源版本落轻量状态，因此同日同类的新普通事件可降噪；任何子来源版本变化、新交易日或严重度升级都会重新出现。稍后默认到次日 09:00，到期自动恢复。
+
+排序完全由服务端决定：持仓硬风险与账本错误优先，其次有截止时间的处理项，再到普通处理、研究与市场知晓项；同层依次按截止时间、严重度、scope、事件时间、kind、symbol、来源类型和 ID 打破平局。任一来源失败时保留其它来源并返回 `complete=false/partial=true/errors`，空数组不能冒充全部完成。完成历史只查最近 30 天（调用方可调，后端上限 90 天）并分页。
 
 用户反馈「现在提醒的是没什么用的」，噪音主体是推荐复盘（AI 推过就追踪、没买也天天提示）。
 范围只是**消费出口过滤器**，全量数据照常生成，一条不删：
 
 | scope | 含哪些 | 消费方 |
 | --- | --- | --- |
-| `ledger` | 卖出复核 / 持仓止损 / 持仓复盘 / 除权折算 / **持仓标的**的提醒与逻辑卡 | 今日待办默认视图、AppShell 徽标、首页待办卡 |
+| `ledger` | 卖出复核 / 持仓止损 / 持仓复盘 / 除权折算 / **持仓标的**的提醒与逻辑卡 | Today 范围筛选、账本徽标 |
 | `research` | 推荐复盘 / **非持仓标的**的提醒与逻辑卡 | 推荐追踪页「待复盘提示」卡 |
-| `market` | 打新（与我买没买无关） | Today 页事件日历卡照常列出 |
+| `market` | 打新（与我买没买无关） | Today “仅知晓”筛选；当日不在后续事件区重复展示 |
 
 **计数按过滤后算**（所见即所计）——否则徽标 12 条、点进去 3 条会让用户以为丢了东西；
 `scope_counts` 另外给出各范围全量条数供「另有 N 条在别处」提示，`filtered` 为被过滤条数。

@@ -26,7 +26,7 @@ import {
   type Valuation,
 } from '@/api/market'
 import { listPositions, type Position } from '@/api/position'
-import { getTodos, type TodoItem, type TodoResult } from '@/api/todo'
+import { getTodoInbox, type TodoItem, type TodoResult } from '@/api/todo'
 import { listWatchlists, type WatchlistGroup, type WatchlistItem } from '@/api/watchlist'
 import { listRecommendations, type RecommendationBatch } from '@/api/recommendation'
 import {
@@ -61,7 +61,6 @@ import {
   resolveHomeSession,
   sortHomeSections,
   sortPositionRisks,
-  sortPriorityItems,
   type HomeModePreference,
   type HomeWorkspaceMode,
   type HomeWorkspaceSectionID,
@@ -152,7 +151,7 @@ async function loadTodos(silent = false) {
   if (!silent || !mineTodo.value) mineTodoLoading.value = true
   mineTodoError.value = ''
   try {
-    const value = await getTodos()
+    const value = await getTodoInbox({ scope: 'all', status: 'needs_action', limit: 3 })
     mineTodo.value = value
     if (!value.complete) mineTodoError.value = value.errors?.join('；') || '待办清单读取不完整'
   } catch (error) {
@@ -244,7 +243,7 @@ const minePos = computed(() => {
   }
 })
 const positionRisks = computed(() => sortPositionRisks(holdingPositions.value))
-const priorityTodos = computed(() => sortPriorityItems(mineTodo.value?.items || []))
+const priorityTodos = computed(() => mineTodo.value?.items || [])
 const watchItems = computed<WatchlistItem[]>(() => watchGroups.value.flatMap((group) => group.items))
 const focusedWatchItems = computed(() => rankPinnedWatchChanges(watchItems.value))
 const watchFreshCount = computed(() => watchItems.value.filter((item) => item.quote_ok).length)
@@ -772,11 +771,11 @@ function onResize() {
                   :show-icon="false"
                   class="inline-state"
                 >
-                  {{ mineTodo ? '清单读取不完整，以下保留最近已知事项：' : '待办清单读取失败：' }}{{ mineTodoError }}。来源 今日待办账本 · as_of {{ mineTodo?.date || 'unknown' }}。
+                  {{ mineTodo ? '清单读取不完整，以下保留最近已知事项：' : '收件箱读取失败：' }}{{ mineTodoError }}。来源 今日收件箱 · as_of {{ mineTodo?.date || 'unknown' }}。
                 </n-alert>
                 <div v-if="priorityTodos.length" class="work-list">
                   <button
-                    v-for="item in priorityTodos.slice(0, 4)"
+                    v-for="item in priorityTodos"
                     :key="`${item.kind}-${item.ref_id}`"
                     type="button"
                     class="work-row"
@@ -792,12 +791,12 @@ function onResize() {
                     </span>
                   </button>
                   <div class="source-line">
-                    来源 今日待办账本（ledger） · as_of {{ mineTodo?.date || 'unknown' }}<template v-if="!mineTodo?.complete"> · 最近已知，完整性 unknown</template>
+                    来源 今日收件箱（需处理） · as_of {{ mineTodo?.date || 'unknown' }}<template v-if="!mineTodo?.complete"> · 最近已知，完整性 unknown</template>
                   </div>
                 </div>
                 <div v-else-if="mineTodoLoaded && mineTodo?.complete" class="calm-state">
-                  <strong>今日账本待办已全部处理完成</strong>
-                  <span>来源 今日待办账本 · as_of {{ mineTodo.date }}</span>
+                  <strong>今日需处理事项已全部完成</strong>
+                  <span>来源 今日收件箱 · as_of {{ mineTodo.date }}</span>
                   <n-button size="small" secondary @click="router.push('/today')">查看已完成</n-button>
                 </div>
                 <n-empty v-else-if="mineTodoLoaded && !mineTodoError" size="small" description="待办状态 unknown" />
