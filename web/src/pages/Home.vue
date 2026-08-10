@@ -247,6 +247,15 @@ const priorityTodos = computed(() => mineTodo.value?.items || [])
 const watchItems = computed<WatchlistItem[]>(() => watchGroups.value.flatMap((group) => group.items))
 const focusedWatchItems = computed(() => rankPinnedWatchChanges(watchItems.value))
 const watchFreshCount = computed(() => watchItems.value.filter((item) => item.quote_ok).length)
+const firstUseEmpty = computed(
+  () =>
+    positionsLoaded.value &&
+    watchLoaded.value &&
+    !positionsError.value &&
+    !watchError.value &&
+    positions.value.length === 0 &&
+    watchItems.value.length === 0,
+)
 
 function positionRiskLabels(position: Position) {
   const labels: string[] = []
@@ -689,6 +698,13 @@ function onResize() {
     </template>
 
     <div class="dashboard" :style="homeVars">
+      <n-alert v-if="firstUseEmpty" type="info" :bordered="false" :show-icon="false" class="first-use-entry">
+        <div>
+          <strong>从第一项关注开始</strong>
+          <span>设置投资偏好，再添加自选或导入持仓。</span>
+        </div>
+        <n-button size="small" type="primary" @click="router.push({ query: { onboarding: '1' } })">打开首次使用引导</n-button>
+      </n-alert>
       <SectionCard title="与我有关" :hoverable="false" class="personal-workspace">
         <div class="mode-toolbar">
           <div class="mode-current">
@@ -1526,6 +1542,22 @@ function onResize() {
   flex-wrap: wrap;
   gap: 8px;
 }
+.first-use-entry :deep(.n-alert-body__content) {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.first-use-entry div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.first-use-entry span {
+  font-size: 12px;
+  color: var(--home-muted);
+}
 .section-footer {
   display: flex;
   justify-content: flex-end;
@@ -1890,6 +1922,13 @@ function onResize() {
 }
 
 @media (max-width: 768px) {
+  .first-use-entry :deep(.n-alert-body__content) {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .first-use-entry .n-button {
+    width: 100%;
+  }
   .personal-workspace :deep(.n-card__content) {
     overflow-x: hidden;
   }

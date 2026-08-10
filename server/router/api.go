@@ -61,6 +61,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	authCtl := controller.NewAuthController(authSvc)
 	setupCtl := controller.NewSetupController(authSvc)
 	userCtl := controller.NewUserController(userSvc)
+	onboardingCtl := controller.NewOnboardingController()
 	llmCtl := controller.NewLLMController(llmSvc)
 	llmTaskCtl := controller.NewLLMTaskController()
 	taskCenterCtl := controller.NewTaskCenterController(taskCenterSvc)
@@ -81,10 +82,12 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	thesisCtl := controller.NewThesisController(thesisSvc)
 	noteCtl := controller.NewNoteController(noteSvc)
 	exportCtl := controller.NewExportController(service.NewExportService())
+	dataImportCtl := controller.NewDataImportController(service.NewDataImportService())
 	dailyReportCtl := controller.NewDailyReportController(dailyReportSvc)
 	newsCtl := controller.NewNewsController(newsSvc)
 	financeCtl := controller.NewFinanceController(financeSvc)
 	screenerCtl := controller.NewScreenerController(screenerSvc, screenerAISvc)
+	watchlistBatchCtl := controller.NewWatchlistBatchController()
 	backtestCtl := controller.NewBacktestController(backtestSvc)
 	moodCtl := controller.NewMoodController(moodSvc)
 	boardCtl := controller.NewBoardController(boardSvc)
@@ -176,6 +179,14 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				user.POST("/github/bind", middleware.RateLimit(10, time.Minute), authCtl.GitHubBind)
 				user.DELETE("/github/bind", authCtl.GitHubUnbind)
 			}
+			onboarding := authed.Group("/onboarding")
+			{
+				onboarding.GET("", onboardingCtl.Get)
+				onboarding.POST("/steps/:step/skip", onboardingCtl.Skip)
+				onboarding.POST("/finish", onboardingCtl.Finish)
+				onboarding.POST("/restart", onboardingCtl.Restart)
+				onboarding.POST("/defer", onboardingCtl.Defer)
+			}
 
 			llm := authed.Group("/llm-configs")
 			{
@@ -210,6 +221,18 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				wlItems.PUT("/:id", watchlistCtl.UpdateItem)
 				wlItems.PUT("/:id/stage", watchlistCtl.SetItemStage)
 				wlItems.DELETE("/:id", watchlistCtl.DeleteItem)
+			}
+
+			// U10/P09 统一导入：上传原始行事实 → 冻结映射预检 → 原子确认 → 可审计回滚。
+			imports := authed.Group("/imports")
+			{
+				imports.GET("/templates/:kind", dataImportCtl.Template)
+				imports.GET("", dataImportCtl.List)
+				imports.POST("", middleware.RateLimit(10, time.Minute), dataImportCtl.Upload)
+				imports.GET("/:id", dataImportCtl.Get)
+				imports.PUT("/:id/preview", dataImportCtl.Preview)
+				imports.POST("/:id/confirm", dataImportCtl.Confirm)
+				imports.POST("/:id/rollback", dataImportCtl.Rollback)
 			}
 
 			// 已购入持仓（按用户隔离）
@@ -345,6 +368,9 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				screener.GET("/strategies", screenerCtl.Strategies)
 				screener.GET("/results", screenerCtl.Results)
 				screener.GET("/results/:id", screenerCtl.Result)
+				screener.POST("/results/:id/watchlist-batches", watchlistBatchCtl.Create)
+				screener.GET("/watchlist-batches/:id", watchlistBatchCtl.Get)
+				screener.POST("/watchlist-batches/:id/undo", watchlistBatchCtl.Undo)
 				screener.POST("/strategies", screenerCtl.SaveStrategy)
 				screener.DELETE("/strategies/:id", screenerCtl.DeleteStrategy)
 				screener.POST("/scan", middleware.RateLimit(20, time.Minute), screenerCtl.Scan)

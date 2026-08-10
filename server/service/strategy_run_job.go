@@ -134,6 +134,7 @@ func frozenScanRequest(requestJSON string) (ScanRequest, error) {
 	if req.Tree == nil {
 		return ScanRequest{}, errors.New("扫描规范化请求缺少策略快照")
 	}
+	req.TemplateKey, req.TemplateVersion, req.TemplateParams = "", 0, nil
 	req.StrategyKey, req.StrategyID, req.StrategyRevisionID = "", 0, 0
 	return req, nil
 }
@@ -346,6 +347,12 @@ func (s *ScreenerService) prepareScanJob(userID int64, req ScanRequest) (strateg
 	seed := strategyRunSeed{Kind: JobKindScreenerScan, StrategyRevision: resolved.Revision,
 		StrategyHash: resolved.Hash, StrategyName: resolved.Name}
 	switch {
+	case req.TemplateKey != "":
+		seed.StrategyIdentity = model.StrategyIdentityBuiltin
+		seed.StrategyKey = fmt.Sprintf("retail:%s:v%d", resolved.TemplateKey, resolved.TemplateVersion)
+		normalized.TemplateKey = resolved.TemplateKey
+		normalized.TemplateVersion = resolved.TemplateVersion
+		normalized.TemplateParams = resolved.TemplateParams
 	case req.StrategyKey != "":
 		seed.StrategyIdentity, seed.StrategyKey = model.StrategyIdentityBuiltin, req.StrategyKey
 		normalized.StrategyKey = req.StrategyKey

@@ -321,15 +321,19 @@ const (
 	customStrategyMax = 50 // 每用户自定义策略上限
 )
 
-// ScanRequest 扫描入参：strategy_key（内置）/ strategy_id（自定义）/ tree（临时试跑）三选一。
+// ScanRequest 扫描入参：template_key（新手模板）/ strategy_key（内置）/
+// strategy_id（自定义）/ tree（临时试跑）四选一。
 type ScanRequest struct {
-	StrategyKey        string    `json:"strategy_key"`
-	StrategyID         int64     `json:"strategy_id"`
-	StrategyRevisionID int64     `json:"strategy_revision_id"`
-	Tree               *CondNode `json:"tree"`
-	IncludeST          bool      `json:"include_st"`    // 默认排除 ST/退市警示
-	IncludeStale       bool      `json:"include_stale"` // 默认排除末根≠最新交易日的股（停牌/滞后，旧价因子会误导）
-	Limit              int       `json:"limit"`
+	TemplateKey        string             `json:"template_key"`
+	TemplateVersion    int                `json:"template_version"`
+	TemplateParams     map[string]float64 `json:"template_params,omitempty"`
+	StrategyKey        string             `json:"strategy_key"`
+	StrategyID         int64              `json:"strategy_id"`
+	StrategyRevisionID int64              `json:"strategy_revision_id"`
+	Tree               *CondNode          `json:"tree"`
+	IncludeST          bool               `json:"include_st"`    // 默认排除 ST/退市警示
+	IncludeStale       bool               `json:"include_stale"` // 默认排除末根≠最新交易日的股（停牌/滞后，旧价因子会误导）
+	Limit              int                `json:"limit"`
 }
 
 // ScanHit 单只命中：行情摘要 + 人话命中原因。
@@ -490,21 +494,46 @@ func (s *ScreenerService) Scan(ctx context.Context, userID int64, req ScanReques
 }
 
 type resolvedScreenerStrategy struct {
-	Tree       *CondNode
-	Name       string
-	StrategyID int64
-	RevisionID int64
-	Revision   int
-	Hash       string
+	Tree            *CondNode
+	Name            string
+	StrategyID      int64
+	RevisionID      int64
+	Revision        int
+	Hash            string
+	TemplateKey     string
+	TemplateVersion int
+	TemplateParams  map[string]float64
 }
 
 // resolveStrategy 在请求开始时把自定义策略解析成不可变 revision 快照。后续扫描或
 // 回测只持有内存中的树与元数据，运行期间主表指针变化不会造成条件漂移。
 func (s *ScreenerService) resolveStrategy(userID int64, req ScanRequest) (*resolvedScreenerStrategy, error) {
+	sources := 0
+	if req.TemplateKey != "" {
+		sources++
+	}
+	if req.StrategyKey != "" {
+		sources++
+	}
+	if req.StrategyID > 0 {
+		sources++
+	}
+	if req.Tree != nil {
+		sources++
+	}
+	if sources != 1 {
+		return nil, errors.New("请指定且仅指定一种策略来源（template_key / strategy_key / strategy_id / tree）")
+	}
 	if req.StrategyRevisionID > 0 && req.StrategyID <= 0 {
 		return nil, errors.New("strategy_revision_id 必须与 strategy_id 一起使用")
 	}
 	switch {
+	case req.TemplateKey != "":
+		if req.StrategyRevisionID > 0 {
+			return nil, errors.New("新手模板不能指定自定义策略版本")
+		}
+		resolved, _, err := resolveRetailTemplate(req.TemplateKey, req.TemplateVersion, req.TemplateParams)
+		return resolved, err
 	case req.StrategyKey != "":
 		if req.StrategyRevisionID > 0 {
 			return nil, errors.New("内置策略不能指定自定义策略版本")
@@ -566,7 +595,7 @@ func (s *ScreenerService) resolveStrategy(userID int64, req ScanRequest) (*resol
 		}
 		return &resolvedScreenerStrategy{Tree: tree, Name: "自定义条件", Revision: 1, Hash: hash}, nil
 	}
-	return nil, errors.New("请指定策略（strategy_key / strategy_id / tree 三选一）")
+	return nil, errors.New("请指定策略")
 }
 
 // canonicalCondTree 深复制并规范化条件树，再由规范化后的 JSON 计算内容摘要。
@@ -617,9 +646,10 @@ type BuiltinStrategyView struct {
 
 // StrategiesView 策略广场：内置 + 当前用户自定义。
 type StrategiesView struct {
-	Builtin []BuiltinStrategyView `json:"builtin"`
-	Custom  []CustomStrategyView  `json:"custom"`
-	Factors []factorDef           `json:"factors"` // 因子字典（自定义编辑器）
+	RetailTemplates []RetailTemplateView  `json:"retail_templates"`
+	Builtin         []BuiltinStrategyView `json:"builtin"`
+	Custom          []CustomStrategyView  `json:"custom"`
+	Factors         []factorDef           `json:"factors"` // 因子字典（自定义编辑器）
 }
 
 // CustomStrategyView 自定义策略行（树已展开供编辑器回填）。
@@ -660,6 +690,17 @@ type StrategyHistoryView struct {
 // Strategies 列出策略广场内容。
 func (s *ScreenerService) Strategies(userID int64) (*StrategiesView, error) {
 	v := &StrategiesView{Factors: factorDefs}
+	for _, template := range retailTemplates {
+		defaults := make(map[string]float64, len(template.Params))
+		for _, param := range template.Params {
+			defaults[param.Key] = param.Default
+		}
+		tree := template.build(defaults)
+		view := template.RetailTemplateView
+		view.Params = append([]RetailTemplateParam(nil), template.Params...)
+		view.Conditions = describeCondTree(&tree)
+		v.RetailTemplates = append(v.RetailTemplates, view)
+	}
 	for _, b := range builtinScreens {
 		tree := b.Tree
 		v.Builtin = append(v.Builtin, BuiltinStrategyView{

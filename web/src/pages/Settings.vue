@@ -30,7 +30,6 @@ import {
   type LLMConfigInput,
 } from '@/api/llm'
 import {
-  INVESTMENT_GUIDE_VERSION,
   getPreference,
   updatePreference,
   changePassword,
@@ -221,9 +220,6 @@ async function loadPref() {
     parseBlacklist(pref.value.blacklist_json)
     parseRecFilters(pref.value.rec_filters_json)
     parseGuardConfig(pref.value.guard_config_json)
-    if (pref.value.investment_guide_version < INVESTMENT_GUIDE_VERSION) {
-      showInvestmentGuide.value = true
-    }
   } catch (e) {
     message.error((e as Error).message)
   }
@@ -487,6 +483,7 @@ async function doExport(kind: ExportKind) {
         <n-form v-if="pref" :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 480px">
           <div class="guide-entry">
             <n-button size="small" secondary @click="showInvestmentGuide = true">重新填写三问投资偏好</n-button>
+            <n-button size="small" secondary @click="router.push({ query: { ...route.query, onboarding: '1' } })">首次使用引导</n-button>
             <span class="notify-hint">
               {{ pref.investment_guide_status === 'completed' ? '已完成' : pref.investment_guide_status === 'skipped' ? '已跳过' : '未完成' }}
             </span>

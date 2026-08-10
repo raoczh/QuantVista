@@ -21,6 +21,7 @@ import {
   NPopover,
   NPopconfirm,
   NAlert,
+  NCheckbox,
   useMessage,
 } from 'naive-ui'
 import {
@@ -33,11 +34,14 @@ import {
   deleteScreenerStrategy,
   getScreenerStatus,
   parseScreenerStrategy,
+  createWatchlistBatch,
+  undoWatchlistBatch,
   PERIOD_LABEL,
   RISK_LABEL,
   RISK_TAG_TYPE,
   type StrategiesView,
   type BuiltinStrategy,
+  type RetailTemplate,
   type CustomStrategy,
   type ScanResult,
   type ScanRequest,
@@ -48,7 +52,9 @@ import {
   type ScreenerStrategyHistory,
   type ScreenerStrategyRevision,
   type StrategyRun,
+  type WatchlistBatch,
 } from '@/api/screener'
+import { listWatchlists, type WatchlistGroup } from '@/api/watchlist'
 import { taskStatusLabel } from '@/api/taskCenter'
 import { ApiRequestError } from '@/api/client'
 import { getLLMTask, listLLMTasks, type LLMTask } from '@/api/llmTask'
@@ -88,7 +94,9 @@ const builtinFiltered = computed<BuiltinStrategy[]>(() => {
   return list.filter((b) => b.period === periodFilter.value)
 })
 const customList = computed<CustomStrategy[]>(() => data.value?.custom ?? [])
+const retailTemplates = computed<RetailTemplate[]>(() => data.value?.retail_templates ?? [])
 const factors = computed<FactorDef[]>(() => data.value?.factors ?? [])
+const retailParamValues = ref<Record<string, Record<string, number>>>({})
 
 async function load() {
   loading.value = true
@@ -98,6 +106,10 @@ async function load() {
       getScreenerStatus(),
       listScreenerResults(20).catch(() => scanHistory.value),
     ])
+    for (const template of data.value?.retail_templates ?? []) {
+      if (retailParamValues.value[template.key]) continue
+      retailParamValues.value[template.key] = Object.fromEntries(template.params.map((param) => [param.key, param.default]))
+    }
     const resultId = Number(Array.isArray(route.query.result_id) ? route.query.result_id[0] : route.query.result_id)
     if (Number.isSafeInteger(resultId) && resultId > 0) await openScanResult(resultId, true)
   } catch (e) {
@@ -123,6 +135,9 @@ const result = ref<ScanResult | null>(null)
 const includeST = ref(false)
 const includeStale = ref(false)
 interface ScanTarget {
+  template_key?: string
+  template_version?: number
+  template_params?: Record<string, number>
   strategy_key?: string
   strategy_id?: number
   strategy_revision_id?: number
@@ -136,6 +151,13 @@ onBeforeUnmount(() => scanPollAbort?.abort())
 function scanTargetFromRequest(request?: ScanRequest | Record<string, unknown>): ScanTarget | null {
   if (!request) return null
   const req = request as ScanRequest
+  if (req.template_key) {
+    return {
+      template_key: req.template_key,
+      template_version: req.template_version,
+      template_params: req.template_params,
+    }
+  }
   if (req.strategy_key) return { strategy_key: req.strategy_key }
   if (req.strategy_id) return { strategy_id: req.strategy_id, strategy_revision_id: req.strategy_revision_id }
   if (req.tree) return { tree: req.tree }
@@ -157,6 +179,9 @@ async function openScanResult(id: number, trackRunning = false) {
     }
     if (run.status !== 'success' || !run.result) throw new Error(run.error || '扫描未生成可用结果')
     result.value = run.result
+    currentResultId.value = run.id
+    selectedSymbols.value = []
+    watchlistBatch.value = null
     includeST.value = Boolean((run.request as ScanRequest | undefined)?.include_st)
     includeStale.value = Boolean((run.request as ScanRequest | undefined)?.include_stale)
     lastScanTarget = scanTargetFromRequest(run.request)
@@ -164,6 +189,14 @@ async function openScanResult(id: number, trackRunning = false) {
   } finally {
     if (scanPollAbort === controller) scanPollAbort = null
   }
+}
+
+function runRetailTemplate(template: RetailTemplate) {
+  const params = { ...(retailParamValues.value[template.key] ?? {}) }
+  return runScan(
+    { template_key: template.key, template_version: template.version, template_params: params },
+    `retail-${template.key}`,
+  )
 }
 
 function openScanHistory(item: StrategyRun<ScanResult>) {
@@ -213,6 +246,103 @@ const resultStats = computed(() => {
 
 function shortHash(hash?: string): string {
   return hash ? hash.slice(0, 8) : '--------'
+}
+
+// ---------- 扫描结果批量加入自选 ----------
+
+const currentResultId = ref(0)
+const selectedSymbols = ref<string[]>([])
+const batchShow = ref(false)
+const batchLoading = ref(false)
+const watchlistGroups = ref<WatchlistGroup[]>([])
+const batchGroupId = ref<number | null>(null)
+const watchlistBatch = ref<WatchlistBatch | null>(null)
+const watchlistBatchIssues = computed(() =>
+  (watchlistBatch.value?.items ?? []).filter((item) => item.status === 'failed' || item.status === 'conflict'),
+)
+const displayedSymbols = computed(() => (result.value?.items ?? []).map((item) => item.symbol))
+const allDisplayedSelected = computed(
+  () => displayedSymbols.value.length > 0 && displayedSymbols.value.every((symbol) => selectedSymbols.value.includes(symbol)),
+)
+const someDisplayedSelected = computed(
+  () => !allDisplayedSelected.value && displayedSymbols.value.some((symbol) => selectedSymbols.value.includes(symbol)),
+)
+
+function toggleResultSymbol(symbol: string, checked: boolean) {
+  if (checked) {
+    if (selectedSymbols.value.includes(symbol)) return
+    if (selectedSymbols.value.length >= 100) {
+      message.warning('单次最多选择 100 只股票')
+      return
+    }
+    selectedSymbols.value = [...selectedSymbols.value, symbol]
+    return
+  }
+  selectedSymbols.value = selectedSymbols.value.filter((item) => item !== symbol)
+}
+
+function toggleAllResults(checked: boolean) {
+  if (!checked) {
+    selectedSymbols.value = []
+    return
+  }
+  if (displayedSymbols.value.length > 100) {
+    message.warning('当前结果超过 100 只，请先缩小范围后批量加入')
+    return
+  }
+  selectedSymbols.value = [...displayedSymbols.value]
+}
+
+async function openWatchlistBatch() {
+  if (!currentResultId.value || !selectedSymbols.value.length) {
+    message.warning('请先选择要加入自选的股票')
+    return
+  }
+  batchLoading.value = true
+  try {
+    watchlistGroups.value = await listWatchlists()
+    batchGroupId.value = watchlistGroups.value[0]?.id ?? null
+    watchlistBatch.value = null
+    batchShow.value = true
+  } catch (error) {
+    message.error((error as Error).message)
+  } finally {
+    batchLoading.value = false
+  }
+}
+
+async function applyWatchlistBatch() {
+  if (!batchGroupId.value) {
+    message.warning('请选择自选分组')
+    return
+  }
+  batchLoading.value = true
+  try {
+    watchlistBatch.value = await createWatchlistBatch(currentResultId.value, batchGroupId.value, selectedSymbols.value)
+    const batch = watchlistBatch.value
+    message.success(`批量处理完成：新增 ${batch.created}，已存在 ${batch.existed}，失败 ${batch.failed}`)
+  } catch (error) {
+    message.error((error as Error).message)
+  } finally {
+    batchLoading.value = false
+  }
+}
+
+async function undoCurrentWatchlistBatch() {
+  if (!watchlistBatch.value) return
+  batchLoading.value = true
+  try {
+    watchlistBatch.value = await undoWatchlistBatch(watchlistBatch.value.id)
+    if (watchlistBatch.value.conflicts) {
+      message.warning(`已撤销 ${watchlistBatch.value.removed} 项，${watchlistBatch.value.conflicts} 项因后续变更而保留`)
+    } else {
+      message.success(`已撤销本批新建的 ${watchlistBatch.value.removed} 项`)
+    }
+  } catch (error) {
+    message.error((error as Error).message)
+  } finally {
+    batchLoading.value = false
+  }
 }
 
 // ---------- 自定义策略编辑器 ----------
@@ -816,6 +946,60 @@ async function removeCustom(id: number) {
         <span class="status-text">{{ statusText }}</span>
       </div>
 
+      <SectionCard title="按目标选股" class="block">
+        <n-spin :show="loading">
+          <div class="retail-grid">
+            <section v-for="template in retailTemplates" :key="template.key" class="retail-template">
+              <div class="sc-head">
+                <span class="sc-name">{{ template.name }}</span>
+                <span class="sc-tags">
+                  <n-tag size="tiny" :bordered="false">{{ PERIOD_LABEL[template.period] || template.period }}</n-tag>
+                  <n-tag size="tiny" :bordered="false" :type="RISK_TAG_TYPE[template.risk_level] || 'default'">
+                    {{ RISK_LABEL[template.risk_level] || template.risk_level }}
+                  </n-tag>
+                </span>
+              </div>
+              <dl class="retail-notes">
+                <div><dt>适用</dt><dd>{{ template.scenario }}</dd></div>
+                <div><dt>风险</dt><dd>{{ template.risk }}</dd></div>
+                <div><dt>数据</dt><dd>{{ template.data_requirements }}</dd></div>
+              </dl>
+              <div class="retail-params">
+                <label v-for="param in template.params" :key="param.key">
+                  <span>{{ param.label }}</span>
+                  <n-input-number
+                    v-model:value="retailParamValues[template.key][param.key]"
+                    :min="param.min"
+                    :max="param.max"
+                    :step="param.step"
+                    size="small"
+                  >
+                    <template v-if="param.unit" #suffix>{{ param.unit }}</template>
+                  </n-input-number>
+                </label>
+              </div>
+              <div class="sc-conds">
+                <n-tag v-for="condition in template.conditions" :key="condition" size="small" :bordered="false" class="cond-tag">
+                  {{ condition }}
+                </n-tag>
+              </div>
+              <div class="retail-action">
+                <n-button
+                  size="small"
+                  type="primary"
+                  secondary
+                  :loading="scanning === `retail-${template.key}`"
+                  :disabled="!!scanning && scanning !== `retail-${template.key}`"
+                  @click="runRetailTemplate(template)"
+                >
+                  开始扫描
+                </n-button>
+              </div>
+            </section>
+          </div>
+        </n-spin>
+      </SectionCard>
+
       <!-- 扫描结果 -->
       <SectionCard v-if="result" :title="`扫描结果 · ${result.strategy}`" class="block">
         <template #extra>
@@ -842,11 +1026,36 @@ async function removeCustom(id: number) {
         <p v-if="result.conditions?.length" class="result-conds">
           条件：<n-tag v-for="c in result.conditions" :key="c" size="small" :bordered="false" class="cond-tag">{{ c }}</n-tag>
         </p>
+        <div v-if="result.items?.length" class="batch-toolbar">
+          <div class="batch-selection">
+            <n-checkbox
+              :checked="allDisplayedSelected"
+              :indeterminate="someDisplayedSelected"
+              @update:checked="toggleAllResults"
+            >
+              全选当前结果
+            </n-checkbox>
+            <span>已选 {{ selectedSymbols.length }} / 100</span>
+          </div>
+          <div class="batch-actions">
+            <n-button v-if="selectedSymbols.length" size="small" quaternary @click="selectedSymbols = []">清空</n-button>
+            <n-button
+              size="small"
+              type="primary"
+              :disabled="!selectedSymbols.length"
+              :loading="batchLoading"
+              @click="openWatchlistBatch"
+            >
+              批量加入自选
+            </n-button>
+          </div>
+        </div>
         <n-empty v-if="!result.items?.length" description="无命中标的" class="empty-pad" />
         <div v-else class="qv-scroll-x">
           <n-table size="small" :single-line="false" class="hits-table">
             <thead>
               <tr>
+                <th class="select-col">选择</th>
                 <th>代码</th>
                 <th>名称</th>
                 <th class="num">现价</th>
@@ -860,6 +1069,13 @@ async function removeCustom(id: number) {
             </thead>
             <tbody>
               <tr v-for="h in result.items" :key="h.symbol">
+                <td class="select-col">
+                  <n-checkbox
+                    :checked="selectedSymbols.includes(h.symbol)"
+                    :aria-label="`选择 ${h.name || h.symbol}`"
+                    @update:checked="(checked) => toggleResultSymbol(h.symbol, checked)"
+                  />
+                </td>
                 <td class="qv-tnum">{{ h.symbol }}</td>
                 <td>
                   <a class="stock-link" @click="actions.goDetail({ symbol: h.symbol, market: 'cn', name: h.name })">{{
@@ -909,6 +1125,66 @@ async function removeCustom(id: number) {
         </div>
       </SectionCard>
 
+      <n-modal
+        v-model:show="batchShow"
+        preset="card"
+        title="批量加入自选"
+        :mask-closable="!batchLoading"
+        :style="[styleVars, { width: 'min(620px, calc(100vw - 24px))' }]"
+      >
+        <template v-if="!watchlistBatch">
+          <n-form label-placement="top">
+            <n-form-item label="目标分组" required>
+              <n-select
+                v-model:value="batchGroupId"
+                :options="watchlistGroups.map((group) => ({ label: group.name, value: group.id }))"
+                placeholder="选择自选分组"
+              />
+            </n-form-item>
+          </n-form>
+          <p class="batch-modal-summary">本次处理 {{ selectedSymbols.length }} 只股票</p>
+          <div class="batch-modal-actions">
+            <n-button :disabled="batchLoading" @click="batchShow = false">取消</n-button>
+            <n-button type="primary" :loading="batchLoading" :disabled="!batchGroupId" @click="applyWatchlistBatch">
+              确认加入
+            </n-button>
+          </div>
+        </template>
+        <template v-else>
+          <n-alert
+            :type="watchlistBatch.status === 'undo_conflict' || watchlistBatch.failed ? 'warning' : watchlistBatch.status === 'undone' ? 'info' : 'success'"
+            :bordered="false"
+          >
+            新增 {{ watchlistBatch.created }} · 已存在 {{ watchlistBatch.existed }} · 失败 {{ watchlistBatch.failed }}
+            <template v-if="watchlistBatch.status !== 'applied'">
+              · 已撤销 {{ watchlistBatch.removed }} · 冲突 {{ watchlistBatch.conflicts }}
+            </template>
+          </n-alert>
+          <div v-if="watchlistBatchIssues.length" class="batch-issues qv-scroll-x">
+            <n-table size="small" :single-line="false">
+              <thead><tr><th>代码</th><th>状态</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr v-for="item in watchlistBatchIssues" :key="item.id">
+                  <td class="qv-tnum">{{ item.symbol }}</td>
+                  <td>{{ item.status === 'conflict' ? '撤销冲突' : '加入失败' }}</td>
+                  <td>{{ item.message || '未处理' }}</td>
+                </tr>
+              </tbody>
+            </n-table>
+          </div>
+          <div class="batch-modal-actions">
+            <n-popconfirm
+              v-if="watchlistBatch.status === 'applied' && watchlistBatch.created > 0"
+              @positive-click="undoCurrentWatchlistBatch"
+            >
+              <template #trigger><n-button :loading="batchLoading">撤销本批新增</n-button></template>
+              只移除本批新建且之后未被修改的自选项；原有项不会删除。
+            </n-popconfirm>
+            <n-button type="primary" @click="batchShow = false">完成</n-button>
+          </div>
+        </template>
+      </n-modal>
+
       <SectionCard title="扫描历史" class="block">
         <n-empty v-if="!scanHistory.length" description="暂无持久扫描结果" />
         <div v-else class="qv-scroll-x">
@@ -929,7 +1205,7 @@ async function removeCustom(id: number) {
       </SectionCard>
 
       <!-- 策略广场 -->
-      <SectionCard title="内置策略广场" class="block">
+      <SectionCard title="进阶内置策略" class="block">
         <template #extra>
           <n-radio-group v-model:value="periodFilter" size="small">
             <n-radio-button value="all">全部</n-radio-button>
@@ -1308,6 +1584,54 @@ async function removeCustom(id: number) {
 .block {
   width: 100%;
 }
+.retail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 24px;
+}
+.retail-template {
+  min-width: 0;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--qv-divider);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.retail-notes {
+  margin: 0;
+  display: grid;
+  gap: 5px;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.retail-notes > div {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 6px;
+}
+.retail-notes dt {
+  opacity: 0.58;
+}
+.retail-notes dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.retail-params {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.retail-params label {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+}
+.retail-action {
+  margin-top: auto;
+  display: flex;
+  justify-content: flex-end;
+}
 .result-switches {
   display: flex;
   gap: 14px;
@@ -1342,6 +1666,44 @@ async function removeCustom(id: number) {
   flex-wrap: wrap;
   gap: 4px;
   align-items: center;
+}
+.batch-toolbar {
+  margin: 10px 0;
+  padding: 8px 0;
+  border-top: 1px solid var(--qv-divider);
+  border-bottom: 1px solid var(--qv-divider);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.batch-selection,
+.batch-actions,
+.batch-modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.batch-selection > span,
+.batch-modal-summary {
+  font-size: 12px;
+  opacity: 0.68;
+}
+.batch-modal-summary {
+  margin: 0;
+}
+.batch-modal-actions {
+  margin-top: 16px;
+  justify-content: flex-end;
+}
+.batch-issues {
+  margin-top: 12px;
+}
+.select-col {
+  width: 52px;
+  text-align: center;
 }
 .cond-tag {
   font-size: 11px;
@@ -1387,7 +1749,7 @@ async function removeCustom(id: number) {
 /* 策略卡 */
 .strategy-card {
   border: 1px solid var(--qv-divider);
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 12px 14px;
   height: 100%;
   display: flex;
@@ -1664,6 +2026,26 @@ async function removeCustom(id: number) {
   gap: 8px;
 }
 @media (max-width: 768px) {
+  .retail-grid,
+  .retail-params {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .retail-grid {
+    column-gap: 0;
+  }
+  .batch-toolbar,
+  .batch-selection,
+  .batch-actions {
+    align-items: stretch;
+  }
+  .batch-toolbar {
+    flex-direction: column;
+  }
+  .batch-selection,
+  .batch-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
   .ai-input-row {
     flex-direction: column;
     align-items: stretch;

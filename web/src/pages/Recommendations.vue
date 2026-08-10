@@ -52,12 +52,7 @@ import {
   type ReflectionLayers,
   type ExecutionStatus,
 } from '@/api/recommendation'
-import {
-  INVESTMENT_GUIDE_VERSION,
-  getPreference,
-  updatePreference,
-  type UserPreference,
-} from '@/api/user'
+import { getPreference, updatePreference, type UserPreference } from '@/api/user'
 import { getTodos, type TodoItem } from '@/api/todo'
 import { isAbortError } from '@/api/client'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
@@ -216,9 +211,6 @@ async function loadPrefFilters() {
     }
     if (!countExplicitInURL && pref.value.default_rec_count >= 3 && pref.value.default_rec_count <= 5) {
       form.value.count = pref.value.default_rec_count
-    }
-    if (pref.value.investment_guide_version < INVESTMENT_GUIDE_VERSION) {
-      showInvestmentGuide.value = true
     }
     const f = parseFiltersJSON(pref.value.rec_filters_json)
     if (f) {
@@ -1055,6 +1047,7 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
           <div class="pref-entry">
             <span v-if="pref">{{ pref.horizon_pref === 'short_term' ? '短线' : pref.horizon_pref === 'mid_term' ? '中线' : '长线' }} · {{ pref.risk_level === 'conservative' ? '保守' : pref.risk_level === 'aggressive' ? '激进' : '均衡' }}</span>
             <n-button size="tiny" quaternary @click="showInvestmentGuide = true">投资偏好</n-button>
+            <n-button size="tiny" quaternary @click="router.push({ query: { ...route.query, onboarding: '1' } })">首次使用引导</n-button>
           </div>
           <n-form label-placement="top" :show-feedback="false" class="form">
             <n-form-item label="类型">

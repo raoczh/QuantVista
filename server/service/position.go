@@ -600,7 +600,10 @@ func (s *PositionService) Create(ctx context.Context, userID int64, in PositionI
 			return err
 		}
 		trade := buildInitialTrade(p)
-		return tx.Create(&trade).Error
+		if err := tx.Create(&trade).Error; err != nil {
+			return err
+		}
+		return setOnboardingStepTx(tx, userID, OnboardingStepPortfolio, model.OnboardingStepCompleted, 0)
 	}); err != nil {
 		return nil, err
 	}

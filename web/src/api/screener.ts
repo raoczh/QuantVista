@@ -32,6 +32,29 @@ export interface BuiltinStrategy {
   conditions: string[]
 }
 
+export interface RetailTemplateParam {
+  key: string
+  label: string
+  default: number
+  min: number
+  max: number
+  step: number
+  unit?: string
+}
+
+export interface RetailTemplate {
+  key: string
+  version: number
+  name: string
+  scenario: string
+  risk: string
+  data_requirements: string
+  params: RetailTemplateParam[]
+  conditions: string[]
+  period: 'short' | 'swing' | 'mid'
+  risk_level: 'low' | 'mid' | 'high'
+}
+
 export interface CustomStrategy {
   id: number
   current_revision_id: number
@@ -67,12 +90,16 @@ export interface ScreenerStrategyHistory {
 }
 
 export interface StrategiesView {
+  retail_templates: RetailTemplate[]
   builtin: BuiltinStrategy[]
   custom: CustomStrategy[] | null
   factors: FactorDef[]
 }
 
 export interface ScanRequest {
+  template_key?: string
+  template_version?: number
+  template_params?: Record<string, number>
   strategy_key?: string
   strategy_id?: number
   strategy_revision_id?: number
@@ -218,6 +245,53 @@ export function listScreenerResults(limit = 20) {
 
 export function getScreenerResult(id: number) {
   return request<StrategyRun<ScanResult>>({ url: `/screener/results/${id}`, method: 'get' })
+}
+
+export type WatchlistBatchStatus = 'applied' | 'undone' | 'undo_conflict'
+export type WatchlistBatchItemStatus = 'created' | 'existed' | 'failed' | 'removed' | 'conflict'
+
+export interface WatchlistBatchItem {
+  id: number
+  batch_id: string
+  symbol: string
+  market: string
+  name: string
+  watchlist_item_id: number
+  status: WatchlistBatchItemStatus
+  error_code?: string
+  message?: string
+}
+
+export interface WatchlistBatch {
+  id: string
+  result_id: number
+  group_id: number
+  status: WatchlistBatchStatus
+  requested: number
+  created: number
+  existed: number
+  failed: number
+  removed: number
+  conflicts: number
+  undone_at?: string
+  created_at: string
+  updated_at: string
+  items: WatchlistBatchItem[]
+}
+
+export function createWatchlistBatch(resultId: number, groupId: number, symbols: string[]) {
+  return request<WatchlistBatch>({
+    url: `/screener/results/${resultId}/watchlist-batches`,
+    method: 'post',
+    data: { group_id: groupId, symbols },
+  })
+}
+
+export function undoWatchlistBatch(batchId: string) {
+  return request<WatchlistBatch>({
+    url: `/screener/watchlist-batches/${encodeURIComponent(batchId)}/undo`,
+    method: 'post',
+  })
 }
 
 export function saveScreenerStrategy(req: SaveStrategyRequest) {

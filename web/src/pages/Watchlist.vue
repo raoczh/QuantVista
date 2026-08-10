@@ -46,6 +46,7 @@ import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
 import FreshnessTag from '@/components/FreshnessTag.vue'
+import DataImportWizard from '@/components/DataImportWizard.vue'
 
 const message = useMessage()
 const route = useRoute()
@@ -59,6 +60,14 @@ const styleVars = computed(() => ({
 
 const groups = ref<WatchlistGroup[]>([])
 const loading = ref(false)
+const importModal = ref(false)
+
+async function onImportChanged(kind?: string) {
+  await load()
+  if (route.query.onboarding_return === '1' && kind === 'watchlist') {
+    await router.push({ name: 'home', query: { onboarding: '1' } })
+  }
+}
 
 const marketOptions = [
   { label: 'A 股', value: 'cn' },
@@ -284,6 +293,9 @@ async function submitItem() {
     itemModal.value = false
     await load()
     message.success('已保存')
+    if (!itemEditing.value && route.query.onboarding_return === '1') {
+      await router.push({ name: 'home', query: { onboarding: '1' } })
+    }
   } catch (e) {
     message.error((e as Error).message)
   } finally {
@@ -429,7 +441,7 @@ let stockActionLoad: Promise<boolean> | null = null
 
 function stockActionKey() {
   const symbol = String(route.query.symbol || '').trim()
-  if (!symbol) return ''
+  if (!symbol && route.query.add !== '1') return ''
   return String(route.query._stock_action || '') || [symbol, route.query.market || 'cn', route.query.add || ''].join(':')
 }
 
@@ -510,6 +522,7 @@ onMounted(async () => {
       <n-tag size="small" round :bordered="false">{{ totalCount }} 只</n-tag>
       <n-button size="small" secondary @click="openCreateGroup">新建分组</n-button>
       <n-button size="small" type="primary" @click="openAddItem()">+ 添加自选</n-button>
+      <n-button size="small" quaternary @click="importModal = true">导入</n-button>
       <n-button size="small" secondary @click="openMissed">错过机会</n-button>
       <n-button size="small" quaternary :loading="loading" @click="load()">刷新</n-button>
     </template>
@@ -757,6 +770,13 @@ onMounted(async () => {
         </div>
       </template>
     </n-modal>
+
+    <DataImportWizard
+      v-model:show="importModal"
+      initial-kind="watchlist"
+      @confirmed="onImportChanged"
+      @rolled-back="onImportChanged"
+    />
 
     <n-text v-if="!loading && !groups.length" depth="3">暂无数据</n-text>
   </PageContainer>

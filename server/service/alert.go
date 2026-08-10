@@ -397,7 +397,17 @@ func (s *AlertService) Create(ctx context.Context, userID int64, in AlertInput) 
 		Kind: in.Kind, Op: in.Op, Threshold: round4(in.Threshold), Period: in.Period,
 		Once: in.Once, Note: truncateRunes(strings.TrimSpace(in.Note), 250), Status: model.AlertStatusActive,
 	}
-	if err := common.DB.Create(rule).Error; err != nil {
+	if err := common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(rule).Error; err != nil {
+			return err
+		}
+		progress, err := currentOnboardingProgressTx(tx, userID, OnboardingCurrentVersion, true)
+		if err != nil || progress.Status == model.OnboardingStatusCompleted || progress.AlertStatus == model.OnboardingStepSkipped {
+			return err
+		}
+		return tx.Model(&model.OnboardingProgress{}).Where("id = ? AND user_id = ?", progress.ID, userID).
+			Updates(map[string]any{"alert_rule_id": rule.ID, "deferred_until": nil}).Error
+	}); err != nil {
 		return nil, err
 	}
 	return rule, nil
@@ -858,6 +868,10 @@ func flushAlertNotification(sourceCtx context.Context, notifier alertNotifier, u
 // EvaluateUser 手动「立即检查」入口：行情类 + 财报日历类全量评估。
 // 财报类查本地表（零上游成本），让用户手动检查能当场验证财报提醒。
 func (s *AlertService) EvaluateUser(ctx context.Context, userID int64) (int, error) {
+	onboardingRuleID, err := activeOnboardingAlertRule(userID)
+	if err != nil {
+		return 0, errors.New("提醒检查准备失败，请重试")
+	}
 	hits, err := s.evaluateUserMarket(ctx, userID)
 	if err != nil {
 		return 0, err
@@ -867,6 +881,9 @@ func (s *AlertService) EvaluateUser(ctx context.Context, userID int64) (int, err
 		return hits, err
 	}
 	hits += earnHits
+	if err := completeOnboardingAlertTest(userID, onboardingRuleID); err != nil {
+		return hits, errors.New("提醒检查已完成，但引导进度保存失败，请重试")
+	}
 	return hits, nil
 }
 

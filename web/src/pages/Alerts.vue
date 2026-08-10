@@ -100,6 +100,9 @@ async function runEvaluate() {
     const { hits } = await evaluateAlerts()
     message.success(hits > 0 ? `本次命中 ${hits} 条` : '暂无命中')
     await Promise.all([load(), loadEvents()])
+    if (route.query.onboarding_return === '1') {
+      await router.push({ name: 'home', query: { onboarding: '1' } })
+    }
   } catch (error) {
     message.error(alertRequestMessage('evaluate', error))
   } finally {

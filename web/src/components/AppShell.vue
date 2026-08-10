@@ -28,6 +28,7 @@ import BrandLogo from '@/components/BrandLogo.vue'
 import GlobalSearch from '@/components/GlobalSearch.vue'
 import MobileBottomNav from '@/components/MobileBottomNav.vue'
 import RecentTasks from '@/components/RecentTasks.vue'
+import OnboardingGuide from '@/components/OnboardingGuide.vue'
 
 // 应用主外壳：必须挂在 n-config-provider 内部，useThemeVars 才能取到主题 override。
 const route = useRoute()
@@ -383,6 +384,7 @@ onUnmounted(() => {
     />
 
     <GlobalSearch v-model:show="showSearch" />
+    <OnboardingGuide v-if="isLoggedIn" />
 
     <!-- 移动端抽屉导航：与顶部菜单同一份 options，分组默认展开 -->
     <n-drawer v-model:show="showNav" placement="left" width="min(82vw, 300px)">

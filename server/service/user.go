@@ -213,7 +213,19 @@ func (s *UserService) UpdatePreference(userID int64, in PreferenceInput) (*model
 	p.TotalCapital = in.TotalCapital
 	p.InvestmentGuideVersion = in.InvestmentGuideVersion
 	p.InvestmentGuideStatus = guideStatus
-	if err := common.DB.Save(p).Error; err != nil {
+	if err := common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(p).Error; err != nil {
+			return err
+		}
+		switch guideStatus {
+		case InvestmentGuideCompleted:
+			return setOnboardingStepTx(tx, userID, OnboardingStepPreference, model.OnboardingStepCompleted, 0)
+		case InvestmentGuideSkipped:
+			return setOnboardingStepTx(tx, userID, OnboardingStepPreference, model.OnboardingStepSkipped, 0)
+		default:
+			return nil
+		}
+	}); err != nil {
 		return nil, err
 	}
 	return p, nil

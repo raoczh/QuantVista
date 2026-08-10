@@ -11,6 +11,7 @@ import (
 	"quantvista/model"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // WatchlistService 自选股分组与条目。所有操作按 userID 隔离，跨用户访问一律视为不存在。
@@ -228,14 +229,6 @@ func (s *WatchlistService) AddItem(ctx context.Context, userID, groupID int64, i
 		return nil, err
 	}
 
-	var exists int64
-	common.DB.Model(&model.WatchlistItem{}).
-		Where("user_id = ? AND watchlist_id = ? AND symbol = ? AND market = ?", userID, groupID, symbol, market).
-		Count(&exists)
-	if exists > 0 {
-		return nil, errors.New("该股票已在此分组中")
-	}
-
 	item := &model.WatchlistItem{
 		UserID:      userID,
 		WatchlistID: groupID,
@@ -246,8 +239,22 @@ func (s *WatchlistService) AddItem(ctx context.Context, userID, groupID int64, i
 		FocusReason: truncateRunes(strings.TrimSpace(in.FocusReason), 500),
 		IsPinned:    in.IsPinned,
 	}
-	if err := common.DB.Create(item).Error; err != nil {
-		return nil, errors.New("添加失败：" + err.Error())
+	if err := common.DB.Transaction(func(tx *gorm.DB) error {
+		var exists int64
+		if err := tx.Model(&model.WatchlistItem{}).
+			Where("user_id = ? AND watchlist_id = ? AND symbol = ? AND market = ?", userID, groupID, symbol, market).
+			Count(&exists).Error; err != nil {
+			return err
+		}
+		if exists > 0 {
+			return errors.New("该股票已在此分组中")
+		}
+		if err := tx.Create(item).Error; err != nil {
+			return errors.New("添加失败")
+		}
+		return setOnboardingStepTx(tx, userID, OnboardingStepPortfolio, model.OnboardingStepCompleted, 0)
+	}); err != nil {
+		return nil, err
 	}
 	return item, nil
 }
@@ -255,28 +262,36 @@ func (s *WatchlistService) AddItem(ctx context.Context, userID, groupID int64, i
 // UpdateItem 编辑条目：备注/关注原因/重点关注，或移动到另一分组（均须属本人）。
 func (s *WatchlistService) UpdateItem(userID, itemID int64, in WatchlistItemInput) (*model.WatchlistItem, error) {
 	var item model.WatchlistItem
-	if err := common.DB.Where("id = ? AND user_id = ?", itemID, userID).First(&item).Error; err != nil {
-		return nil, errors.New("自选条目不存在")
-	}
-	// 移动分组：校验目标分组属本人，且目标分组无同标的。
-	if in.WatchlistID != 0 && in.WatchlistID != item.WatchlistID {
-		var g model.Watchlist
-		if err := common.DB.Where("id = ? AND user_id = ?", in.WatchlistID, userID).First(&g).Error; err != nil {
-			return nil, errors.New("目标分组不存在")
+	if err := common.DB.Transaction(func(tx *gorm.DB) error {
+		query := tx.Where("id = ? AND user_id = ?", itemID, userID)
+		if !common.UsingSQLite {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
 		}
-		var dup int64
-		common.DB.Model(&model.WatchlistItem{}).
-			Where("user_id = ? AND watchlist_id = ? AND symbol = ? AND market = ?", userID, in.WatchlistID, item.Symbol, item.Market).
-			Count(&dup)
-		if dup > 0 {
-			return nil, errors.New("目标分组已有该股票")
+		if err := query.First(&item).Error; err != nil {
+			return errors.New("自选条目不存在")
 		}
-		item.WatchlistID = in.WatchlistID
-	}
-	item.Note = truncateRunes(strings.TrimSpace(in.Note), 500)
-	item.FocusReason = truncateRunes(strings.TrimSpace(in.FocusReason), 500)
-	item.IsPinned = in.IsPinned
-	if err := common.DB.Save(&item).Error; err != nil {
+		// 移动分组：校验目标分组属本人，且目标分组无同标的。
+		if in.WatchlistID != 0 && in.WatchlistID != item.WatchlistID {
+			var g model.Watchlist
+			if err := tx.Where("id = ? AND user_id = ?", in.WatchlistID, userID).First(&g).Error; err != nil {
+				return errors.New("目标分组不存在")
+			}
+			var dup int64
+			if err := tx.Model(&model.WatchlistItem{}).
+				Where("user_id = ? AND watchlist_id = ? AND symbol = ? AND market = ?", userID, in.WatchlistID, item.Symbol, item.Market).
+				Count(&dup).Error; err != nil {
+				return err
+			}
+			if dup > 0 {
+				return errors.New("目标分组已有该股票")
+			}
+			item.WatchlistID = in.WatchlistID
+		}
+		item.Note = truncateRunes(strings.TrimSpace(in.Note), 500)
+		item.FocusReason = truncateRunes(strings.TrimSpace(in.FocusReason), 500)
+		item.IsPinned = in.IsPinned
+		return tx.Save(&item).Error
+	}); err != nil {
 		return nil, err
 	}
 	return &item, nil
@@ -284,20 +299,30 @@ func (s *WatchlistService) UpdateItem(userID, itemID int64, in WatchlistItemInpu
 
 // DeleteItem 删除自选条目（仅本人）。
 func (s *WatchlistService) DeleteItem(userID, itemID int64) error {
-	res := common.DB.Where("id = ? AND user_id = ?", itemID, userID).Delete(&model.WatchlistItem{})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return errors.New("自选条目不存在")
-	}
-	return nil
+	return common.DB.Transaction(func(tx *gorm.DB) error {
+		var item model.WatchlistItem
+		query := tx.Where("id = ? AND user_id = ?", itemID, userID)
+		if !common.UsingSQLite {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := query.First(&item).Error; err != nil {
+			return errors.New("自选条目不存在")
+		}
+		res := tx.Where("id = ? AND user_id = ?", itemID, userID).Delete(&model.WatchlistItem{})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected != 1 {
+			return errors.New("自选条目已发生变化，请重试")
+		}
+		return nil
+	})
 }
 
 // --- 机会池漏斗 ---
 
 var validResearchStage = map[string]bool{
-	"": true, // 清除标注
+	"":                      true, // 清除标注
 	model.StageDiscovered:   true,
 	model.StageScreening:    true,
 	model.StageWatching:     true,
@@ -314,23 +339,37 @@ func (s *WatchlistService) SetItemStage(ctx context.Context, userID, itemID int6
 	if !validResearchStage[stage] {
 		return nil, errors.New("无效的研究阶段")
 	}
-	var item model.WatchlistItem
-	if err := common.DB.Where("id = ? AND user_id = ?", itemID, userID).First(&item).Error; err != nil {
+	var initial model.WatchlistItem
+	if err := common.DB.Where("id = ? AND user_id = ?", itemID, userID).First(&initial).Error; err != nil {
 		return nil, errors.New("自选条目不存在")
 	}
-	item.ResearchStage = stage
-	now := time.Now()
-	item.StageAt = &now
+	passedPrice := float64(0)
 	if stage == model.StagePassed {
-		item.PassedReason = truncateRunes(strings.TrimSpace(reason), 250)
 		// 放弃价 fail-closed：只记当前有效（fresh）行情——旧价会成为永久落库的错误
 		// 复盘基准（后续「错过机会」结论整体失真）；取不到 fresh 记 0（显示"无基准价"）。
-		if q, fi, err := s.market.GetFreshQuote(ctx, item.Market, item.Symbol); err == nil &&
+		if q, fi, err := s.market.GetFreshQuote(ctx, initial.Market, initial.Symbol); err == nil &&
 			q != nil && q.Price > 0 && fi.Status == freshStatusFresh {
-			item.PassedPrice = q.Price
+			passedPrice = q.Price
 		}
 	}
-	if err := common.DB.Save(&item).Error; err != nil {
+	var item model.WatchlistItem
+	if err := common.DB.Transaction(func(tx *gorm.DB) error {
+		query := tx.Where("id = ? AND user_id = ?", itemID, userID)
+		if !common.UsingSQLite {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := query.First(&item).Error; err != nil {
+			return errors.New("自选条目不存在")
+		}
+		item.ResearchStage = stage
+		now := time.Now()
+		item.StageAt = &now
+		if stage == model.StagePassed {
+			item.PassedReason = truncateRunes(strings.TrimSpace(reason), 250)
+			item.PassedPrice = passedPrice
+		}
+		return tx.Save(&item).Error
+	}); err != nil {
 		return nil, err
 	}
 	return &item, nil
