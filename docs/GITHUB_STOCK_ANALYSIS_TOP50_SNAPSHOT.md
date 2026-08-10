@@ -1,5 +1,7 @@
 # GitHub“股票分析”最佳匹配前 50 仓库快照
 
+> **文档状态：2026-07-28 搜索结果存档。** 排名、星数和项目状态会变化，本文只作为 Top50 分析的固定样本，不代表当前实现进度；实施状态看 `QUANTVISTA_TOP50_OPTIMIZATION_PLAN.md` 与 `ROADMAP.md`。
+>
 > 快照日期：2026-07-28（Asia/Shanghai）<br>
 > 检索地址：<https://github.com/search?q=%E8%82%A1%E7%A5%A8%E5%88%86%E6%9E%90&type=repositories><br>
 > 口径：关键词“股票分析”、类型“Repositories/仓库”、排序“Best match/最佳匹配”、每页 50 项。<br>
