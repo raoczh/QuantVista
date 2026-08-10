@@ -11,6 +11,8 @@ import (
 
 	"quantvista/common"
 	"quantvista/model"
+
+	"gorm.io/gorm"
 )
 
 // D17 AI 持有 / 减仓 / 清仓建议。
@@ -29,7 +31,7 @@ import (
 
 const (
 	// positionAdvicePromptVersion 建议 prompt 版本（改措辞/枚举语义必须递增，审计按它归因）。
-	positionAdvicePromptVersion = "pa2"
+	positionAdvicePromptVersion = "pa3"
 	// positionAdviceJobTimeout 后台任务总预算。
 	positionAdviceJobTimeout = 5 * time.Minute
 	// positionAdviceMaxPositions 单次最多分析的持仓笔数（控上下文预算）。超出按
@@ -101,6 +103,8 @@ type PositionAdviceRequest struct {
 	LLMConfigID int64 `json:"llm_config_id"`
 	// Symbol 可选：只分析某一只（空=全部持仓）。
 	Symbol string `json:"symbol"`
+	// PositionID 可选：精确分析一笔持仓；与 user_id、symbol 同时核验。
+	PositionID int64 `json:"position_id,omitempty"`
 }
 
 // normalizePositionVerdict 归一结论枚举（模型常输出 HOLD/持有/减持等变体）。
@@ -147,9 +151,10 @@ const positionAdviceSystemPrompt = `你是一名持仓风控顾问。用户已�
    系统会程序化核对你引用的数字，与数据不符的会被标记展示给用户。
 2. 结论必须建立在给出的数据上：触发的提醒信号 signals 与待复核利空事件 events 是最重要的输入，
    命中时必须在理由中点名并说明它对**这笔成本**的含义。
-3. **禁止使用你记忆中关于这些公司的信息**，不得虚构财务、新闻、公告、股东行为。数据没给的就说没有依据。
-4. invalidation 写「什么情况下这个结论不再成立」（具体价位 / 事件 / 时间窗口），不要写空泛的「市场变化时」。
-5. 这是研究参考，不构成投资建议；不要给出加仓建议——本任务只回答持有 / 减仓 / 清仓。
+3. exit_assessment 是程序硬规则已经落库的统一风险事实。你的意见与它并列展示，不能降低、覆盖或改写其中的风险等级。
+4. **禁止使用你记忆中关于这些公司的信息**，不得虚构财务、新闻、公告、股东行为。数据没给的就说没有依据。
+5. invalidation 写「什么情况下这个结论不再成立」（具体价位 / 事件 / 时间窗口），不要写空泛的「市场变化时」。
+6. 这是研究参考，不构成投资建议；不要给出加仓建议——本任务只回答持有 / 减仓 / 清仓。
 
 只输出 JSON：{"advices":[{"position_id":123,"symbol":"...","verdict":"hold|trim|exit","reason":"...","invalidation":"..."}]}。
 position_id 与 symbol 必须逐字复制对应输入行；同一 symbol 可能有多笔不同成本的持仓，必须按 position_id 分别覆盖，
@@ -161,8 +166,32 @@ func (s *PositionAdviceService) AdviseAsync(userID int64, allowPrivate bool, req
 		return nil, errors.New("持仓建议服务不可用")
 	}
 	req.Symbol = strings.TrimSpace(req.Symbol)
+	if err := validatePositionAdviceRequest(userID, req); err != nil {
+		return nil, err
+	}
 	s.registerDurableJobHandler()
 	return StartDurableLLMTask(userID, JobKindPositionAdvice, req, allowPrivate)
+}
+
+func validatePositionAdviceRequest(userID int64, req PositionAdviceRequest) error {
+	if req.PositionID <= 0 {
+		return nil
+	}
+	if strings.TrimSpace(req.Symbol) == "" {
+		return errors.New("精确持仓复核必须同时提供 symbol")
+	}
+	var p model.Position
+	err := common.DB.Where("id = ? AND user_id = ? AND status = ?", req.PositionID, userID, model.PositionStatusHolding).First(&p).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return errors.New("未找到属于当前用户的 holding 持仓")
+	}
+	if err != nil {
+		return fmt.Errorf("核验持仓失败: %w", err)
+	}
+	if p.Symbol != req.Symbol {
+		return errors.New("position_id 与 symbol 不匹配")
+	}
+	return nil
 }
 
 func (s *PositionAdviceService) registerDurableJobHandler() {
@@ -206,13 +235,17 @@ type positionAdviceRow struct {
 	PeakDrawdownPct float64 `json:"peak_drawdown_pct,omitempty"` // 自峰值回撤 %
 	PeakNote        string  `json:"peak_note,omitempty"`         // 前复权回填口径声明
 
-	Signals []string `json:"signals,omitempty"` // D14/D15 命中的提醒
-	Events  []string `json:"events,omitempty"`  // D16 待复核的利空事件
-
+	Signals        []string                    `json:"signals,omitempty"` // D14/D15 命中的提醒
+	Events         []string                    `json:"events,omitempty"`  // D16 待复核的利空事件
+	ExitAssessment *PositionExitAssessmentView `json:"exit_assessment,omitempty"`
 }
 
 // Advise 生成逐笔卖出建议（后台任务体；也可被测试直接调用）。
 func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowPrivate bool, req PositionAdviceRequest) (*PositionAdviceResult, error) {
+	req.Symbol = strings.TrimSpace(req.Symbol)
+	if err := validatePositionAdviceRequest(userID, req); err != nil {
+		return nil, err
+	}
 	views, err := s.position.List(ctx, userID, model.PositionStatusHolding)
 	if err != nil {
 		return nil, err
@@ -234,6 +267,9 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 	matched := 0
 	rows := make([]positionAdviceRow, 0, len(views))
 	for _, v := range views {
+		if req.PositionID > 0 && v.ID != req.PositionID {
+			continue
+		}
 		if req.Symbol != "" && v.Symbol != req.Symbol {
 			continue
 		}
@@ -259,6 +295,7 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 			row.PeakDrawdownPct = v.Peak.DrawdownPct
 			row.PeakNote = v.Peak.Note
 		}
+		row.ExitAssessment = v.ExitAssessment
 		rows = append(rows, row)
 	}
 	if len(rows) == 0 {

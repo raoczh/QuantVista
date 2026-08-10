@@ -20,6 +20,9 @@ const (
 	// 这两类是既有守护没有的（跌破均线是趋势信号、龙虎榜既有 pos_lhb 不分买卖方向）。
 	GuardKindPosMaBreak = "pos_ma_break" // 持仓跌破关键均线（盘后，MA20/MA60）
 	GuardKindPosLhbSell = "pos_lhb_sell" // 持仓登龙虎榜且席位净卖出（盘后，游资出货）
+	// 统一持仓卖出风险评估的通知去重键。review→urgent 使用不同 kind，允许升级再提醒。
+	GuardKindPosExitReview = "pos_exit_review"
+	GuardKindPosExitUrgent = "pos_exit_urgent"
 )
 
 // GuardEvent 自选/持仓异动守护推送的去重台账（阶段 D）。

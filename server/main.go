@@ -68,7 +68,7 @@ func main() {
 	// D15 持仓期最高价：交易日 16:25 用当日日线抬升峰值（错峰在资产快照之后）。
 	service.StartPositionPeakJob()
 	// D16 卖出复核：每日 19:40 扫描持仓利空事件（错峰在 19:35 盘后守护轮之后——
-	// 守护轮先落 GuardEvent 台账，复核轮才不会与它抢同一批新事件的推送）。
+	// 先保留 Guard/SellReview 原始事实，再生成统一 PositionExitAssessment 决定 Todo 与推送）。
 	service.StartSellReviewJob(service.NewMarketService(mgr))
 
 	if !common.DebugEnabled {

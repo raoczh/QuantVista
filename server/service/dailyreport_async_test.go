@@ -158,6 +158,33 @@ func TestDailyReportAsyncParallel(t *testing.T) {
 	}
 }
 
+func TestDailyReportRecommendationNoLongerCreatesSellAlerts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(reportOKReview))
+	}))
+	defer srv.Close()
+	seedReportEnv(t, 55, srv.URL)
+	svc := fakeReportSvc(func(context.Context, int64, bool, RecommendRequest) (*RecommendationView, error) {
+		return &RecommendationView{RecommendationBatch: model.RecommendationBatch{ID: 9001}, Items: []RecommendationItemView{{
+			Recommendation: model.Recommendation{Symbol: "600001", Market: "cn", Name: "测试股"},
+			Detail:         &recPick{TakeProfit: 12, StopLoss: 8},
+		}}}, nil
+	})
+	v, err := svc.GenerateFor(context.Background(), 55, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := waitReportStatus(t, v.ID)
+	if r.Status != model.ReportStatusSuccess || r.RecommendationBatchID != 9001 {
+		t.Fatalf("推荐仍应保留在日报中: %+v", r)
+	}
+	var count int64
+	common.DB.Model(&model.AlertRule{}).Where("user_id = ?", 55).Count(&count)
+	if count != 0 {
+		t.Fatalf("新日报不得为未持有推荐创建卖点规则，got %d", count)
+	}
+}
+
 // TestDailyReportRegenerateKeepsOld 重生成双败：旧报告内容不被覆盖、状态回滚 success、
 // 错误注明「已保留原报告」——替代旧版「先删后生成」的丢失风险。
 func TestDailyReportRegenerateKeepsOld(t *testing.T) {

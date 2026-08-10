@@ -16,25 +16,23 @@ import (
 
 // D16 利空事件触发卖出复核。
 //
-// 与 B9 盘后守护轮的分工（改动前先读）：
-//   - **guard 负责「推没推过」**（GuardEvent 台账 + 推送通道），事件一过就没了；
-//   - **SellReview 负责「我处理没处理」**（open/resolved/dismissed 状态机 + 今日待办）。
+// 与 B9 盘后守护轮、统一持仓卖出评估的分工（改动前先读）：
+//   - guard 与 SellReview 继续分别保存事件推送台账和逐持仓复核事实；
+//   - PositionExitAssessment 聚合这些事实，统一决定持仓页、Today 与卖出风险推送。
 //
 // 两者的去重维度也不同：guard 按 (user, symbol, kind, 事件日) —— 同一标的多笔持仓
 // 只推一次；SellReview 按 (user, **position**, trigger, 事件日) —— 每一笔持仓各自
 // 需要复核（成本不同，同一个利空对不同成本的仓位含义完全不同）。
 //
-// 五类触发中：解禁 / 除权除息 / 业绩预告已有 B9 的 guard 推送，本轮**只落待办不重复推**；
-// 跌破关键均线与龙虎榜净卖出是新增的两类，走 guard 台账去重后推送
-// （复用既有 NotifyService 通道与 EnableNotify 总闸，**不新建推送通道**）。
+// 原始 SellReview 不再直接进入 Today 或推送；它只保留审计与人工状态机语义。
+// review/urgent 的待办与推送必须消费同一条 PositionExitAssessment 事实。
 //
 // 每条待办的 Detail 必须回答「这件事对**我这笔持仓**意味着什么」——带上我的成本、
 // 我的浮盈亏、我的数量。这正是用户说的「现在的提醒也没管我是否买入了」。
 
 const (
 	// sellReviewHour/Min 卖出复核轮 19:40（错峰：19:25 公司行动同步、19:35 盘后守护轮）。
-	// 必须晚于守护轮——两者消费同一批本地数据，让守护轮先落台账，
-	// 本轮的 ma_break/lhb_sell 推送才不会与它交叉。
+	// 必须晚于守护轮：先落原始 Guard/SellReview 事实，再由本轮统一评估生成一次等级与通知。
 	sellReviewHour = 19
 	sellReviewMin  = 40
 
@@ -60,11 +58,11 @@ const (
 // SellReviewService 卖出复核评估与调度。
 type SellReviewService struct {
 	market *MarketService
-	notify *NotifyService
+	exit   *PositionExitAssessmentService
 }
 
 func NewSellReviewService(market *MarketService) *SellReviewService {
-	return &SellReviewService{market: market, notify: NewNotifyService()}
+	return &SellReviewService{market: market, exit: NewPositionExitAssessmentService(market)}
 }
 
 // ---------- 纯函数判定（单测锚点） ----------
@@ -76,8 +74,6 @@ type sellReviewHit struct {
 	Severity  string
 	Title     string
 	Detail    string // 事件本身的描述；账面影响由 composeSellReviewDetail 追加
-	// Push=true 表示这一类**没有**既有 guard 推送覆盖，需要本轮推（ma_break/lhb_sell）。
-	Push bool
 }
 
 // evalSellReviewLift 解禁临近（提前 sellReviewLiftAheadDays 天）。
@@ -236,7 +232,6 @@ func evalSellReviewMaBreak(bars []model.DailyBar, since, today string) *sellRevi
 			Title: fmt.Sprintf("跌破 MA%d", sellReviewMaLong),
 			Detail: fmt.Sprintf("%s 收盘 %.2f 跌破 %d 日均线 %.2f（中期趋势转弱）",
 				date, closes[last], sellReviewMaLong, ma),
-			Push: true,
 		}
 	}
 	if ma, ok := check(sellReviewMaShort); ok {
@@ -245,7 +240,6 @@ func evalSellReviewMaBreak(bars []model.DailyBar, since, today string) *sellRevi
 			Title: fmt.Sprintf("跌破 MA%d", sellReviewMaShort),
 			Detail: fmt.Sprintf("%s 收盘 %.2f 跌破 %d 日均线 %.2f（短期趋势转弱）",
 				date, closes[last], sellReviewMaShort, ma),
-			Push: true,
 		}
 	}
 	return nil
@@ -286,7 +280,7 @@ func evalSellReviewLhbSell(entries []model.LhbEntry) *sellReviewHit {
 	}
 	return &sellReviewHit{
 		Trigger: model.SellReviewLhbSell, TradeDate: best.TradeDate, Severity: sev,
-		Title: "龙虎榜净卖出", Detail: detail, Push: true,
+		Title: "龙虎榜净卖出", Detail: detail,
 	}
 }
 
@@ -507,11 +501,11 @@ func sellReviewUserIDs(ctx context.Context) ([]int64, error) {
 	return ids, nil
 }
 
-// EvaluateSellReviewsForUser 评估单个用户的持仓利空事件，落待办并（对新增两类）推送。
-// 返回本轮新建的待办数。
+// EvaluateSellReviewsForUser 评估单个用户的持仓利空事件并落审计事实；统一评估负责待办与推送。
+// 返回本轮新建的 SellReview 事实数。
 //
 // 数据全部来自本地缓存表（解禁/预告/龙虎榜/除权/日线），**零上游请求**；
-// 现价走 FreshQuotesFor，仅用于给 Detail 补账面影响——**取不到不阻断待办生成**
+// 现价走 FreshQuotesFor，仅用于给 Detail 补账面影响——**取不到不阻断事实生成**
 // （利空事件本身与行情无关，行情只是让描述更有用；fail-closed 体现在
 // 「取不到就如实说浮盈亏未知」而不是「拿旧价算一个」）。
 func (s *SellReviewService) EvaluateSellReviewsForUser(ctx context.Context, userID int64, today, since string) int {
@@ -523,7 +517,7 @@ func (s *SellReviewService) EvaluateSellReviewsForUser(ctx context.Context, user
 }
 
 // evaluateSellReviewsForUser 是带错误结果的内部执行路径。公开方法为兼容既有调用仍
-// 返回计数，但调度器走这里，避免把数据库故障误报成“本轮没有待办”。
+// 返回计数，但调度器走这里，避免把数据库故障误报成“本轮没有复核事实”。
 func (s *SellReviewService) evaluateSellReviewsForUser(ctx context.Context, userID int64, today, since string) (int, error) {
 	if common.DB == nil {
 		return 0, errors.New("数据库不可用")
@@ -608,14 +602,6 @@ func (s *SellReviewService) evaluateSellReviewsForUser(ctx context.Context, user
 		quotes = s.market.FreshQuotesFor(ctx, refs)
 	}
 
-	pushOn := userNotifyEnabled(userID) && s.notify != nil && s.notify.HasEnabledChannel(userID)
-	if pushOn {
-		cfg := loadGuardConfig(userID)
-		// 卖出复核推送沿用守护总开关与「盘后事件」子开关——用户关掉盘后事件
-		// 就是不想被盘后的事打扰，本轮不该绕过它另开一路。
-		pushOn = cfg.Enabled && cfg.Evening
-	}
-
 	created := 0
 	var writeErrs []error
 	for _, p := range positions {
@@ -667,35 +653,17 @@ func (s *SellReviewService) evaluateSellReviewsForUser(ctx context.Context, user
 				continue
 			}
 			created++
-			// 只有既有 guard 未覆盖的两类才推送（解禁/除权/预告已由 B9 盘后轮推过，
-			// 再推一遍就是同一件事两条通知）。去重仍走 GuardEvent 台账。
-			if h.Push && pushOn {
-				s.pushSellReview(userID, p, h, detail)
-			}
+		}
+	}
+	// 盘后链路在 SellReview 事实全部落库后生成一次统一评估快照；复用本轮已经
+	// 批量取得的持仓和行情，不再额外拉行情。旧 SellReview 自身不直接推送。
+	if s.exit != nil {
+		if _, err := s.exit.EvaluateUserWithSnapshot(ctx, userID, positions, quotes,
+			model.PositionExitSessionClose, time.Now().In(time.Local)); err != nil {
+			writeErrs = append(writeErrs, fmt.Errorf("统一持仓卖出风险评估失败: %w", err))
 		}
 	}
 	return created, errors.Join(writeErrs...)
-}
-
-// pushSellReview 推送一条卖出复核（去重走 GuardEvent 台账，通道复用 NotifyService）。
-func (s *SellReviewService) pushSellReview(userID int64, p model.Position, h sellReviewHit, detail string) {
-	kind := model.GuardKindPosMaBreak
-	if h.Trigger == model.SellReviewLhbSell {
-		kind = model.GuardKindPosLhbSell
-	}
-	msg := truncateRunes(fmt.Sprintf("⚠️ 卖出复核：%s(%s) %s——%s",
-		orSymbol(p.Name, p.Symbol), p.Symbol, h.Title, detail), 256)
-	hit := guardHit{
-		Symbol: p.Symbol, Market: p.Market, Name: orSymbol(p.Name, p.Symbol),
-		Kind: kind, Message: msg, Route: "/todos", EventDate: h.TradeDate,
-	}
-	if !recordGuardEvent(userID, h.TradeDate, hit) {
-		return // 已推过
-	}
-	s.notify.SendMsg(userID, NotifyMessage{
-		Title: guardTitle(kind), Content: msg,
-		Route: hit.Route, Kind: NotifyMsgKindGuard, Priority: 0,
-	})
 }
 
 // recentLocalBars 读本地日线尾部 limit 根（升序）。**零上游请求**——
@@ -721,7 +689,7 @@ func recentLocalBars(ctx context.Context, market, symbol string, limit int) ([]m
 	return rows, nil
 }
 
-// RunSellReviewRound 一轮卖出复核（供 job 与测试调用）。返回新建待办总数。
+// RunSellReviewRound 一轮卖出复核（供 job 与测试调用）。返回新建 SellReview 事实总数。
 func (s *SellReviewService) RunSellReviewRound(ctx context.Context) int {
 	if common.DB == nil {
 		common.SysWarn("卖出复核轮未执行: 数据库不可用")

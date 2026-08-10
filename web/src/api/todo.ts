@@ -10,6 +10,7 @@ export type TodoKind =
   | 'corp_adjust'
   | 'ipo'
   | 'sell_review'
+  | 'position_exit'
   | 'job_failure'
 
 export type TodoScope = 'ledger' | 'research' | 'market' | 'all'

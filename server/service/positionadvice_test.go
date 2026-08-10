@@ -214,6 +214,40 @@ func TestPositionAdviceFailClosed(t *testing.T) {
 	}
 }
 
+func TestPositionAdvicePrecisePositionScopeValidation(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Where("user_id IN ?", []int64{904, 905}).Delete(&model.Position{})
+	one := &model.Position{UserID: 904, Symbol: "600904", Market: "cn", Status: model.PositionStatusHolding, BuyPrice: 10, Quantity: 100}
+	other := &model.Position{UserID: 905, Symbol: "600905", Market: "cn", Status: model.PositionStatusHolding, BuyPrice: 10, Quantity: 100}
+	if err := common.DB.Create(one).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := common.DB.Create(other).Error; err != nil {
+		t.Fatal(err)
+	}
+	cases := []PositionAdviceRequest{
+		{PositionID: one.ID},
+		{PositionID: one.ID, Symbol: "600905"},
+		{PositionID: other.ID, Symbol: "600905"},
+	}
+	if err := validatePositionAdviceRequest(904, cases[0]); err == nil {
+		t.Fatal("精确持仓缺 symbol 必须拒绝")
+	}
+	if err := validatePositionAdviceRequest(904, cases[1]); err == nil {
+		t.Fatal("ID/symbol 错配必须拒绝")
+	}
+	if err := validatePositionAdviceRequest(904, cases[2]); err == nil {
+		t.Fatal("跨用户 position_id 必须拒绝")
+	}
+	if err := validatePositionAdviceRequest(904, PositionAdviceRequest{PositionID: one.ID, Symbol: one.Symbol}); err != nil {
+		t.Fatalf("本人 holding 精确请求应通过: %v", err)
+	}
+	common.DB.Model(&model.Position{}).Where("id = ?", one.ID).Update("status", model.PositionStatusClosed)
+	if err := validatePositionAdviceRequest(904, PositionAdviceRequest{PositionID: one.ID, Symbol: one.Symbol}); err == nil {
+		t.Fatal("已平仓精确请求必须拒绝")
+	}
+}
+
 // TestPositionAdviceModuleBudget 新模块必须在预算表登记（未登记属接线遗漏）。
 func TestPositionAdviceModuleBudget(t *testing.T) {
 	b, ok := llmModuleBudgets["position_advice"]

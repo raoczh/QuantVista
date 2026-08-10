@@ -36,6 +36,7 @@ const (
 	TodoKindCorpAdjust    = "corp_adjust"    // 除权除息待确认折算（B8，不确认账面盈亏就是错的）
 	TodoKindIpo           = "ipo"            // 今日可申购新股/可转债（B9，不依赖持仓）
 	TodoKindSellReview    = "sell_review"    // 持仓命中利空事件，需卖出复核（D16）
+	TodoKindPositionExit  = "position_exit"  // 统一持仓卖出风险评估（review / urgent）
 	TodoKindJobFailure    = "job_failure"    // 用户作业失败（只消费脱敏通知事实）
 )
 
@@ -173,17 +174,32 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 	} else {
 		fail("持仓标的", err)
 	}
+	positionIDs := make([]int64, 0, len(heldPositionIDs))
+	for id := range heldPositionIDs {
+		positionIDs = append(positionIDs, id)
+	}
+	latestExit := map[int64]PositionExitAssessmentView{}
+	if rows, err := LatestPositionExitAssessments(ctx, userID, positionIDs); err == nil {
+		latestExit = rows
+	} else {
+		fail("持仓卖出风险评估", err)
+	}
 
 	// 1) 未读的提醒命中事件（alert_events 状态机，标记已读/忽略即完成待办）。
 	if events, err := s.alert.TriggeredForUser(userID); err == nil {
 		for _, e := range events {
-			if isPositionAlertKind(e.Kind) && (e.PositionID == 0 || !heldPositionIDs[e.PositionID]) {
-				continue // 平仓/删除后的遗留未读事件不能继续冒充当前持仓待办
+			if isPositionAlertKind(e.Kind) {
+				if e.PositionID == 0 || !heldPositionIDs[e.PositionID] {
+					continue
+				}
+				if _, assessed := latestExit[e.PositionID]; assessed {
+					continue // 有统一事实后，持仓类 AlertEvent 只作审计
+				}
 			}
 			t := e.TriggeredAt
 			// 持仓卖出决策类（D14/D15）天生属于账本；其余按标的是否在持仓中分流。
 			sc := TodoScopeResearch
-			if isPositionAlertKind(e.Kind) || heldSymbols[e.Symbol] {
+			if heldSymbols[e.Symbol] {
 				sc = TodoScopeLedger
 			}
 			res.Items = append(res.Items, TodoItem{
@@ -227,29 +243,39 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 
 	// 3) 需复盘的持仓（短线超阈值 / 长线持有较久）+ 止损计划风控（最高优先级）。
 	if views, err := s.position.List(ctx, userID, model.PositionStatusHolding); err == nil {
-		unknownStop := 0 // 行情非 fresh、止损状态无法判定的仓数（fail-closed：状态不明必须显式提示）
 		for _, v := range views {
-			if !v.QuoteOK && v.PlanStopLoss > 0 {
-				unknownStop++
-			}
-			// 止损信号独立于复盘信号：破止损/近止损是当下要处理的风险。
-			switch {
-			case v.BelowStopLoss:
+			if a := v.ExitAssessment; a != nil && a.ShouldTodo &&
+				(a.Level == model.PositionExitLevelReview || a.Level == model.PositionExitLevelUrgent) {
+				priority, title := 1, "持仓卖出风险待复核"
+				if a.Level == model.PositionExitLevelUrgent {
+					priority, title = 0, "持仓卖出风险紧急"
+				}
+				t := a.EvaluatedAt
 				res.Items = append(res.Items, TodoItem{
-					Kind: TodoKindStopLoss, Scope: TodoScopeLedger, Priority: 1,
+					Kind: TodoKindPositionExit, Scope: TodoScopeLedger, Priority: priority,
 					Symbol: v.Symbol, Market: v.Market, Name: v.Name,
-					Title:  "持仓已跌破计划止损",
-					Detail: fmt.Sprintf("现价 %.2f 已低于计划止损 %.2f，按纪律应复核是否离场", v.CurrentPrice, v.PlanStopLoss),
-					RefID:  v.ID, RefType: "positions",
+					Title: title, Detail: a.PrimaryReason + "。" + a.NextAction,
+					RefID: a.ID, RefType: "positions", DeepLink: fmt.Sprintf("/positions?position_id=%d", v.ID), Time: &t,
 				})
-			case v.NearStopLoss:
-				res.Items = append(res.Items, TodoItem{
-					Kind: TodoKindStopLoss, Scope: TodoScopeLedger, Priority: 1,
-					Symbol: v.Symbol, Market: v.Market, Name: v.Name,
-					Title:  "持仓接近计划止损",
-					Detail: fmt.Sprintf("现价 %.2f 距计划止损 %.2f 不足 3%%，请提前想好应对", v.CurrentPrice, v.PlanStopLoss),
-					RefID:  v.ID, RefType: "positions",
-				})
+			} else if v.ExitAssessment == nil {
+				// 升级后的首次统一评估完成前保留旧止损入口；一旦存在 normal/watch/
+				// review/urgent/unknown 任一事实，Today 只消费统一事实。
+				switch {
+				case v.BelowStopLoss:
+					res.Items = append(res.Items, TodoItem{
+						Kind: TodoKindStopLoss, Scope: TodoScopeLedger, Priority: 1,
+						Symbol: v.Symbol, Market: v.Market, Name: v.Name,
+						Title: "持仓已跌破计划止损", Detail: fmt.Sprintf("现价 %.2f 已低于计划止损 %.2f，按纪律应复核是否离场", v.CurrentPrice, v.PlanStopLoss),
+						RefID: v.ID, RefType: "positions",
+					})
+				case v.NearStopLoss:
+					res.Items = append(res.Items, TodoItem{
+						Kind: TodoKindStopLoss, Scope: TodoScopeLedger, Priority: 1,
+						Symbol: v.Symbol, Market: v.Market, Name: v.Name,
+						Title: "持仓接近计划止损", Detail: fmt.Sprintf("现价 %.2f 距计划止损 %.2f 不足 3%%，请提前想好应对", v.CurrentPrice, v.PlanStopLoss),
+						RefID: v.ID, RefType: "positions",
+					})
+				}
 			}
 			switch {
 			case v.ShortTermReview:
@@ -269,12 +295,6 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 					RefID:  v.ID, RefType: "positions",
 				})
 			}
-		}
-		// 止损待办的判定依赖当前有效行情：行情过期/失败的仓无法判「破/近止损」，
-		// 状态不明必须显式提示，不能静默当作「一切正常」。
-		if unknownStop > 0 {
-			res.Complete = false
-			res.Errors = append(res.Errors, fmt.Sprintf("%d 笔设有止损计划的持仓无当前有效行情，止损状态未知（非「未触发」）", unknownStop))
 		}
 	} else {
 		// 止损信号来源于此块，读取失败必须留痕（静默吞错会让「破止损」待办凭空消失）。
@@ -365,22 +385,23 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 		fail("打新日历", err)
 	}
 
-	// 7) 卖出复核（D16）：持仓命中解禁/业绩变脸/跌破均线/龙虎榜出货/除权除息。
-	// 这是本批的核心——**唯一一类「基于我的成本、告诉我该不该卖」的待办**。
-	// high 严重度按优先级 1 与止损并列，其余 2。
+	// 兼容升级窗口：尚无统一评估事实的旧 SellReview 仍可处理；该持仓一旦生成
+	// 任一统一事实（包括 unknown），底层 SellReview 不再重复投影到 Today。
 	if reviews, err := ListSellReviews(userID, model.SellReviewStatusOpen); err == nil {
 		for _, r := range reviews {
-			pri := 2
+			if _, assessed := latestExit[r.PositionID]; assessed {
+				continue
+			}
+			priority := 2
 			if r.Severity == model.SellReviewSeverityHigh {
-				pri = 1
+				priority = 1
 			}
 			t := r.CreatedAt
 			res.Items = append(res.Items, TodoItem{
-				Kind: TodoKindSellReview, Scope: TodoScopeLedger, Priority: pri,
+				Kind: TodoKindSellReview, Scope: TodoScopeLedger, Priority: priority,
 				Symbol: r.Symbol, Market: r.Market, Name: r.Name,
-				Title:  "卖出复核 · " + r.Title,
-				Detail: r.Detail,
-				RefID:  r.ID, RefType: "positions", Time: &t,
+				Title: "卖出复核 · " + r.Title, Detail: r.Detail,
+				RefID: r.ID, RefType: "positions", Time: &t,
 			})
 		}
 	} else {
@@ -419,7 +440,7 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 		case TodoKindAlert:
 			res.Alerts++
 		case TodoKindRecReview, TodoKindStopLoss, TodoKindPositionShort,
-			TodoKindPositionLong, TodoKindThesisDue, TodoKindCorpAdjust, TodoKindSellReview:
+			TodoKindPositionLong, TodoKindThesisDue, TodoKindCorpAdjust, TodoKindSellReview, TodoKindPositionExit:
 			res.Reviews++
 		}
 	}

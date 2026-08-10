@@ -61,6 +61,58 @@ export interface Position {
   analysis_stale: boolean // 持仓中从未分析或距上次分析超过 7 天
   // D15 持仓期最高价与回撤（未初始化/已平仓时缺席）
   peak?: PositionPeak
+  exit_assessment?: PositionExitAssessment
+}
+
+export type PositionExitLevel = 'normal' | 'watch' | 'review' | 'urgent' | 'unknown'
+
+export interface PositionExitSignal {
+  key: string
+  label: string
+  detail: string
+  severity: PositionExitLevel
+  value?: number
+  threshold?: number
+  crossing?: boolean
+}
+
+export interface PositionExitAssessment {
+  id: number
+  user_id: number
+  position_id: number
+  symbol: string
+  market: string
+  name: string
+  trade_date: string
+  session: 'intraday' | 'close'
+  evaluated_at: string
+  level: PositionExitLevel
+  primary_signal: string
+  primary_reason: string
+  next_action: string
+  data_status: 'ready' | 'unknown'
+  trend: 'intact' | 'weak' | 'broken' | 'unknown'
+  quote_as_of: string
+  bars_as_of: string
+  quote_price: number
+  buy_price: number
+  profit_pct: number
+  peak_price: number
+  peak_drawdown_pct: number
+  ma20: number
+  ma60: number
+  atr14: number
+  atr_line: number
+  params_hash: string
+  fact_hash: string
+  version: string
+  should_todo: boolean
+  is_upgrade: boolean
+  signals: PositionExitSignal[]
+  evidence: string[]
+  data_gaps: string[]
+  alert_event_ids: number[]
+  sell_review_ids: number[]
 }
 
 /**
@@ -180,6 +232,7 @@ export type PositionBase = Omit<
   | 'last_analyzed_at'
   | 'analysis_stale'
   | 'peak'
+  | 'exit_assessment'
 >
 
 export function listPositions(status: 'holding' | 'closed' | 'all' = 'all') {
@@ -476,7 +529,7 @@ export interface PositionAdviceResult {
 }
 
 /** 发起建议（后台任务，秒回任务 id；用 getLLMTask 轮询结果）。 */
-export function requestPositionAdvice(input: { llm_config_id?: number; symbol?: string } = {}) {
+export function requestPositionAdvice(input: { llm_config_id?: number; symbol?: string; position_id?: number } = {}) {
   return request<LLMTask<PositionAdviceResult>>({ url: '/positions/advice', method: 'post', data: input })
 }
 

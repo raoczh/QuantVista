@@ -287,6 +287,8 @@ func guardTitle(kind string) string {
 		return "QuantVista 打新提醒"
 	case model.GuardKindPosMaBreak, model.GuardKindPosLhbSell:
 		return "QuantVista 卖出复核"
+	case model.GuardKindPosExitReview, model.GuardKindPosExitUrgent:
+		return "QuantVista 持仓卖出风险复核"
 	}
 	return "QuantVista 守护提醒"
 }
@@ -411,12 +413,25 @@ func (s *GuardService) evaluateGuardUser(ctx context.Context, userID int64, cfg 
 
 	// 逐条推送新事件（各带自身 Route/Priority，无法聚合成单条；同日去重已保证不刷屏）。
 	for _, h := range newHits {
+		if guardKindUsesExitAssessment(h.Kind) {
+			continue
+		}
 		s.notify.SendMsg(userID, NotifyMessage{
 			Title: guardTitle(h.Kind), Content: h.Message,
 			Route: h.Route, Kind: NotifyMsgKindGuard, Priority: h.Priority,
 		})
 	}
 	return len(newHits)
+}
+
+func guardKindUsesExitAssessment(kind string) bool {
+	switch kind {
+	case model.GuardKindStopLoss, model.GuardKindTakeProfit,
+		model.GuardKindPosLift, model.GuardKindPosEarnFcst,
+		model.GuardKindPosMaBreak, model.GuardKindPosLhbSell:
+		return true
+	}
+	return false
 }
 
 // ---------- 盘后持仓事件（公告/龙虎榜/财报披露/业绩预告，纯本地表查询） ----------
@@ -846,12 +861,20 @@ func (s *GuardService) evaluateGuardUserEvening(userID int64, today, since strin
 		}
 	}
 
+	// 卖出风险类底层 GuardEvent 保留审计，但由 19:40 SellReview 后生成的统一评估
+	// 决定等级与推送；公告、披露日期、除权口径等非卖出风险通知保持既有行为。
+	pushable := make([]guardHit, 0, len(newHits))
+	for _, h := range newHits {
+		if !guardKindUsesExitAssessment(h.Kind) {
+			pushable = append(pushable, h)
+		}
+	}
 	// 推送上限：首轮部署/首次开启时窗口内存量事件可能很多，超出只落台账不推
 	//（台账已记，不会顺延到下轮——存量旧闻主动放弃，日常增量远达不到上限）。
 	pushed := 0
-	for _, h := range newHits {
+	for _, h := range pushable {
 		if pushed >= guardEveningPushCap {
-			common.SysLog("用户 %d 盘后守护事件超推送上限，%d 条只落台账", userID, len(newHits)-pushed)
+			common.SysLog("用户 %d 盘后守护事件超推送上限，%d 条只落台账", userID, len(pushable)-pushed)
 			break
 		}
 		s.notify.SendMsg(userID, NotifyMessage{

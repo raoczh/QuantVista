@@ -60,6 +60,9 @@ type PositionView struct {
 	// Peak 持仓期最高价与回撤（D15；未初始化或已平仓为 nil）。
 	// 回撤值仅在取到 fresh 行情时有意义，口径见 peakViewFor。
 	Peak *PeakView `json:"peak,omitempty"`
+
+	// 最新统一卖出风险评估事实。仅 holding 持仓返回；等级不冗余到 positions 表。
+	ExitAssessment *PositionExitAssessmentView `json:"exit_assessment,omitempty"`
 }
 
 // shortHoldReviewDays 短线持仓超过该交易日数则提示复盘（短线一般不宜久拖）。
@@ -178,6 +181,16 @@ func (s *PositionService) List(ctx context.Context, userID int64, status string)
 
 	// 最近一次个股 AI 分析时间（一次分组查询，供「持仓过久未分析」提示）。
 	lastAnalyzed := lastStockAnalysisFor(userID, positions)
+	positionIDs := make([]int64, 0, len(positions))
+	for _, p := range positions {
+		if p.Status == model.PositionStatusHolding {
+			positionIDs = append(positionIDs, p.ID)
+		}
+	}
+	latestAssessments, err := LatestPositionExitAssessments(ctx, userID, positionIDs)
+	if err != nil {
+		return nil, fmt.Errorf("读取持仓卖出风险评估失败: %w", err)
+	}
 
 	out := make([]PositionView, 0, len(positions))
 	now := time.Now()
@@ -242,6 +255,10 @@ func (s *PositionService) List(ctx context.Context, userID int64, status string)
 		}
 		// 分析时效：持仓中从未做过个股分析、或距上次分析超过阈值。
 		if p.Status == model.PositionStatusHolding {
+			if assessment, exists := latestAssessments[p.ID]; exists {
+				copy := assessment
+				v.ExitAssessment = &copy
+			}
 			if t, exists := lastAnalyzed[p.Symbol]; exists {
 				tt := t
 				v.LastAnalyzedAt = &tt

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,7 @@ import (
 type AlertService struct {
 	market alertMarketProvider
 	notify alertNotifier
+	exit   *PositionExitAssessmentService
 }
 
 type alertMarketProvider interface {
@@ -40,7 +42,7 @@ type alertNotifier interface {
 }
 
 func NewAlertService(market *MarketService) *AlertService {
-	return &AlertService{market: market, notify: NewNotifyService()}
+	return &AlertService{market: market, notify: NewNotifyService(), exit: NewPositionExitAssessmentService(market)}
 }
 
 const (
@@ -928,7 +930,17 @@ func (s *AlertService) evaluateUserMarketUnlocked(ctx context.Context, userID in
 	}
 	posHits, err := s.evaluatePositionRules(ctx, userID, posRules)
 	hits += posHits
-	return hits, err
+	if err != nil {
+		return hits, err
+	}
+	// 有持仓类规则时 evaluatePositionRules 会把同一批 positions/quotes 直接交给
+	// 统一评估，避免提醒轮对同一用户重复拉行情；没有规则时仍需覆盖真实持仓。
+	if s.exit != nil && len(posRules) == 0 {
+		if _, exitErr := s.exit.EvaluateUser(ctx, userID, model.PositionExitSessionIntraday); exitErr != nil {
+			return hits, fmt.Errorf("统一持仓卖出风险评估失败: %w", exitErr)
+		}
+	}
+	return hits, nil
 }
 
 // evaluateRules 评估一批规则，按 symbol 缓存行情/日线/估值，避免重复请求。
@@ -1250,15 +1262,36 @@ func startAlertRound(now time.Time, svc *AlertService) {
 		dispatchCtx, cancel := context.WithTimeout(context.Background(), dispatchTimeout)
 		defer cancel()
 
-		var userIDs []int64
+		var alertUserIDs []int64
 		if err := common.DB.WithContext(dispatchCtx).Model(&model.AlertRule{}).
 			Where("status = ? AND kind NOT IN ?", model.AlertStatusActive, earnAlertKinds).
-			Distinct().Order("user_id ASC").Pluck("user_id", &userIDs).Error; err != nil {
+			Distinct().Order("user_id ASC").Pluck("user_id", &alertUserIDs).Error; err != nil {
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				common.SysWarn("提醒评估列举用户失败: %v", err)
 			}
 			return
 		}
+		var holdingUserIDs []int64
+		if err := common.DB.WithContext(dispatchCtx).Model(&model.Position{}).
+			Where("status = ?", model.PositionStatusHolding).
+			Distinct().Order("user_id ASC").Pluck("user_id", &holdingUserIDs).Error; err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				common.SysWarn("持仓卖出评估列举用户失败: %v", err)
+			}
+			return
+		}
+		userSet := map[int64]bool{}
+		for _, uid := range alertUserIDs {
+			userSet[uid] = true
+		}
+		for _, uid := range holdingUserIDs {
+			userSet[uid] = true
+		}
+		userIDs := make([]int64, 0, len(userSet))
+		for uid := range userSet {
+			userIDs = append(userIDs, uid)
+		}
+		sort.Slice(userIDs, func(i, j int) bool { return userIDs[i] < userIDs[j] })
 		if len(userIDs) > 0 {
 			cursor := alertRoundCursor.Load()
 			userIDs = rotateAlertUserIDs(userIDs, int(cursor%uint64(len(userIDs))))

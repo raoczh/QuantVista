@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,15 +18,14 @@ import (
 
 // 收盘日报：交易日 15:35 后为开启偏好的用户自动生成「今日复盘 + 明日选股推荐」。
 // 复盘 = 聚合市场/持仓/自选/提醒数据 → LLM 结构化总结（快照落库可复现）；
-// 推荐 = 复用 RecommendationService（短线，含买点区间/止盈/止损/有效期），
-// 并为每条推荐自动创建到价卖点提醒（note 前缀「收盘日报」，过期自动暂停）。
+// 推荐 = 复用 RecommendationService（短线，含买点区间/止盈/止损/有效期）。
+// 推荐仅用于发现和历史追踪，不再为未持有标的自动创建止盈/止损提醒。
 // 后台自动生成不消耗次数配额（token 照记审计）；手动重生成计 1 次。
 
 const (
 	reportWindowStartMin  = 15*60 + 35 // 15:35，收盘数据已稳定
 	reportWindowEndMin    = 20 * 60    // 20:00 后不再补生成
 	reportAlertNotePrefix = "收盘日报"
-	reportAlertExpireDays = 21 // 卖点提醒规则超过该自然日数自动暂停（覆盖短线最长有效期）
 
 	// 异步任务化（2026-07-14）：手动生成立即返回 processing 报告，后台独立 Context 完成后回写。
 	reportJobTimeout = 8 * time.Minute // 后台任务总 deadline（与原自动日报单用户 deadline 一致）
@@ -292,7 +292,7 @@ type reportGenPlan struct {
 }
 
 // runGeneration 生成主体（由统一 JobRun worker 同步调用）：
-// 快照 → 复盘与推荐两路并行 → 状态归纳回写 → 卖点提醒/配额/推送收尾。
+// 快照 → 复盘与推荐两路并行 → 状态归纳回写 → 配额/推送收尾。
 func (s *DailyReportService) runGeneration(ctx context.Context, report *model.DailyReport, plan reportGenPlan) (*DailyReportView, error) {
 	userID, date := plan.userID, plan.date
 	start := time.Now()
@@ -415,14 +415,6 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 	report.PreviousStatus = ""
 	if err := common.DB.Save(report).Error; err != nil {
 		return nil, err
-	}
-
-	// 卖点提醒：新推荐就绪后先清当日旧规则再建新（重生成场景防重复；推荐失败时
-	// 旧规则保留——旧推荐仍在生效期）。
-	if recErr == nil && recView != nil {
-		common.DB.Where("user_id = ? AND note LIKE ?", userID, reportAlertNotePrefix+" "+date+"%").
-			Delete(&model.AlertRule{})
-		s.createSellAlerts(ctx, userID, date, recView)
 	}
 
 	// 推送摘要（best-effort，受推送通道与偏好总闸控制）。沿用当前 worker
@@ -928,39 +920,42 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 	return nil, total, run, refusalErrf(RefusalLLMOutputInvalid, "复盘输出无法解析：%v", lastParseErr)
 }
 
-// ---- 卖点提醒 ----
+// ---- 历史推荐卖点规则止噪 ----
 
-// createSellAlerts 为推荐条目创建到价卖点提醒（止盈 gte / 止损 lte，once）。
-// 单条失败忽略（如触达规则数上限）；note 带日期，供 pauseExpiredSellAlerts 过期清理。
-func (s *DailyReportService) createSellAlerts(ctx context.Context, userID int64, date string, rec *RecommendationView) {
-	for _, item := range rec.Items {
-		if item.Detail == nil {
+var legacyDailyReportAlertNote = regexp.MustCompile(`^收盘日报 \d{4}-\d{2}-\d{2} 推荐(止盈|止损)卖点$`)
+
+// pauseLegacyDailyReportSellAlerts 幂等暂停旧版本由收盘日报自动创建、目前仍 active
+// 的卖点规则。候选先由 note 前缀收窄，再逐行核对完整文案、price/once/op 形状，
+// 避免用户手工创建的普通到价规则被误伤。规则和历史 AlertEvent 均保留供审计。
+func pauseLegacyDailyReportSellAlerts(ctx context.Context) (int64, error) {
+	if common.DB == nil {
+		return 0, errors.New("数据库不可用")
+	}
+	var rules []model.AlertRule
+	if err := common.DB.WithContext(ctx).Where(
+		"status = ? AND kind = ? AND once = ? AND note LIKE ?",
+		model.AlertStatusActive, model.AlertKindPrice, true, reportAlertNotePrefix+" %",
+	).Order("id ASC").Find(&rules).Error; err != nil {
+		return 0, err
+	}
+	ids := make([]int64, 0, len(rules))
+	for _, rule := range rules {
+		if !legacyDailyReportAlertNote.MatchString(rule.Note) {
 			continue
 		}
-		base := fmt.Sprintf("%s %s 推荐", reportAlertNotePrefix, date)
-		if tp := item.Detail.TakeProfit; tp > 0 {
-			_, _ = s.alert.Create(ctx, userID, AlertInput{
-				Symbol: item.Symbol, Market: item.Market, Name: item.Name,
-				Kind: model.AlertKindPrice, Op: model.AlertOpGTE, Threshold: tp, Once: true,
-				Note: base + "止盈卖点",
-			})
-		}
-		if sl := item.Detail.StopLoss; sl > 0 {
-			_, _ = s.alert.Create(ctx, userID, AlertInput{
-				Symbol: item.Symbol, Market: item.Market, Name: item.Name,
-				Kind: model.AlertKindPrice, Op: model.AlertOpLTE, Threshold: sl, Once: true,
-				Note: base + "止损卖点",
-			})
+		isTakeProfit := strings.HasSuffix(rule.Note, "推荐止盈卖点") && rule.Op == model.AlertOpGTE
+		isStopLoss := strings.HasSuffix(rule.Note, "推荐止损卖点") && rule.Op == model.AlertOpLTE
+		if rule.Threshold > 0 && (isTakeProfit || isStopLoss) {
+			ids = append(ids, rule.ID)
 		}
 	}
-}
-
-// pauseExpiredSellAlerts 把超过有效窗口仍未命中的日报卖点规则置为 paused（不删，留痕）。
-func pauseExpiredSellAlerts() {
-	cutoff := time.Now().AddDate(0, 0, -reportAlertExpireDays)
-	common.DB.Model(&model.AlertRule{}).
-		Where("status = ? AND note LIKE ? AND created_at < ?", model.AlertStatusActive, reportAlertNotePrefix+"%", cutoff).
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	result := common.DB.WithContext(ctx).Model(&model.AlertRule{}).
+		Where("id IN ? AND status = ?", ids, model.AlertStatusActive).
 		Update("status", model.AlertStatusPaused)
+	return result.RowsAffected, result.Error
 }
 
 // ---- 后台任务 ----
@@ -979,6 +974,11 @@ func StartDailyReportJobs(mgr *datasource.Manager) {
 		market, watchlist, NewPositionService(market), NewAlertService(market),
 		NewRecommendationService(market, watchlist, NewLLMService()), NewLLMService(), NewNotifyService(),
 	)
+	if count, err := pauseLegacyDailyReportSellAlerts(context.Background()); err != nil {
+		common.SysWarn("历史收盘日报卖点规则暂停失败（下次启动重试）: %v", err)
+	} else if count > 0 {
+		common.SysLog("已暂停 %d 条历史收盘日报卖点规则（记录保留供审计）", count)
+	}
 	go func() {
 		t := time.NewTicker(10 * time.Minute)
 		defer t.Stop()
@@ -1004,8 +1004,6 @@ func (s *DailyReportService) runAutoOnce(ctx context.Context) {
 		return
 	}
 	defer dailyReportRunning.Store(false)
-
-	pauseExpiredSellAlerts()
 
 	// 开启日报偏好且账号可用的用户。
 	var userIDs []int64

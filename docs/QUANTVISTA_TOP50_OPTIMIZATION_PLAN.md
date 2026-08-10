@@ -6,6 +6,9 @@
 > 样本快照：[GITHUB_STOCK_ANALYSIS_TOP50_SNAPSHOT.md](./GITHUB_STOCK_ANALYSIS_TOP50_SNAPSHOT.md)<br>
 > 本地源码：`D:\TestWorkSpace\_refs\stock-analysis-top50\01_*` 至 `50_*`<br>
 > 本文性质：产品与工程规划，不包含业务代码修改，不构成投资建议。
+>
+> **2026-08-10 业务优先级补充**：针对散户推荐召回、历史候选、漏选复盘和真实持仓卖出决策的跨域实施，不从 Top50 储备池另起平行方案，统一转入
+> [`RECOMMENDATION_DISCOVERY_AND_EXIT_PLAN.md`](./RECOMMENDATION_DISCOVERY_AND_EXIT_PLAN.md)。
 
 ## 0. 结论先行
 

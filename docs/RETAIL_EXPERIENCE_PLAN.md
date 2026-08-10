@@ -14,6 +14,9 @@
 > 「持仓卖出决策提醒」专项**（见 §6），原 C10~C13 顺延为第五批（见 §7），其中
 > **C11 经核对已由 D14/D15 完整覆盖，第五批只做收口标注、零代码改动**。
 > 全部 13 项缺口至此收官，本文档转为「现状与边界」参考。
+>
+> **2026-08-10 后续施工入口**：D14~D18 不会重做；推荐卖点提醒止噪、Alert/Guard/SellReview/PositionAdvice 的统一聚合和动态风险等级第一大批已完成，候选发现与复盘继续按
+> [`RECOMMENDATION_DISCOVERY_AND_EXIT_PLAN.md`](./RECOMMENDATION_DISCOVERY_AND_EXIT_PLAN.md) 后续批次实施。
 
 ---
 
@@ -356,9 +359,10 @@ https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600000,m1,,240
    `[买入日, 今天]` 的最高 High 并标 `peak_backfilled=true`。前复权序列在除权后整段重刷，
    与账面实际成交价可能有出入（方向上偏低 = 偏保守、少触发），UI 与 AI 快照都必须标注，
    不得当作精确的账面历史最高价。
-8. **D16 的推送只补既有 guard 没有的两类**：解禁 / 除权 / 业绩预告已由 B9 盘后轮推过，
-   卖出复核只落待办不重复推；新增 `pos_ma_break`（跌破 MA20/MA60）与 `pos_lhb_sell`
-   （席位净卖出）两个 GuardKind 走既有台账去重与 NotifyService 通道。
+8. **D16 原始实现的推送边界（已被第 14 条统一消费层取代）**：当时解禁 / 除权 / 业绩预告
+   由 B9 盘后轮推，新增 `pos_ma_break`（跌破 MA20/MA60）与 `pos_lhb_sell`（席位净卖出）
+   两个 GuardKind 直推。2026-08-10 起 GuardKind 与 SellReview 只保留事实/审计，卖出风险
+   必须经 `PositionExitAssessment` 定级后统一推送，不得恢复这条旧直推路径。
    **去重维度与 guard 不同**：guard 按 `(user, symbol, kind, 事件日)`，SellReview 按
    `(user, **position**, trigger, 事件日)`——同一个利空对不同成本的两笔仓位含义完全不同。
 9. **跌破均线只报「刚跌破」那一天**（前一根收盘仍在均线上、最新一根掉到均线下）：
@@ -382,6 +386,14 @@ https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600000,m1,,240
 13. **job 顺序**：16:20 资产快照 → **16:25 峰值更新**（读当日 `daily_bars`，零上游）→
     19:25 公司行动同步 → 19:35 盘后守护轮 → **19:40 卖出复核轮**。复核轮必须晚于守护轮，
     两者消费同一批本地数据，让守护轮先落台账才不会交叉推送。
+14. **2026-08-10 统一消费层补记（D14~D18 事实不重做）**：`AlertEvent`、`GuardEvent`、
+    `SellReview` 仍是原始触发、推送审计和人工处理事实；新增 append-only
+    `PositionExitAssessment` 聚合真实 holding 持仓的计划价、成本/峰值、事件、MA/ATR 与时点，
+    是持仓页风险、Today ledger Todo 和卖出风险通知的唯一等级事实。原始持仓 Alert/SellReview
+    在统一评估存在后不再重复进入 Today，MA/龙虎榜等原始 SellReview 也不再直接推送；
+    review/urgent 才产生统一 Todo/通知，unknown 只显示缺口。D17 保留全持仓手动分析，同时新增
+    `position_id` 精确复核并校验 user、symbol 与 holding；AI 不能覆盖程序风险。除权继续只提示
+    口径变化，不能单独升级卖出风险。
 
 ---
 

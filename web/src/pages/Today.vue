@@ -87,6 +87,7 @@ const sourceLabels: Record<string, string> = {
   corp_adjust: '公司行动',
   ipo: '打新日历',
   sell_review: '卖出复核',
+  position_exit: '持仓卖出风险',
   job_failure: '任务失败',
 }
 const sourceOptions = computed(() => [
@@ -144,6 +145,7 @@ function kindMeta(kind: string) {
   switch (kind) {
     case 'stop_loss':
     case 'sell_review':
+    case 'position_exit':
     case 'job_failure':
       return { label: sourceLabels[kind], color: vars.value.errorColor }
     case 'corp_adjust':

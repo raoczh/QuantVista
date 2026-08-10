@@ -296,12 +296,25 @@ func loadActiveJobFailures(userID int64, cutoff time.Time) ([]TodoItem, error) {
 func loadCompletedTodoItems(userID int64, cutoff time.Time) ([]TodoItem, map[string]error) {
 	out := []TodoItem{}
 	errs := map[string]error{}
+	assessedPositions := map[int64]bool{}
+	var assessedIDs []int64
+	if err := common.DB.Model(&model.PositionExitAssessment{}).Where("user_id = ?", userID).
+		Distinct().Pluck("position_id", &assessedIDs).Error; err != nil {
+		errs["持仓卖出风险完成历史"] = err
+	} else {
+		for _, id := range assessedIDs {
+			assessedPositions[id] = true
+		}
+	}
 	var events []model.AlertEvent
 	if err := common.DB.Where("user_id = ? AND status IN ? AND updated_at >= ?", userID,
 		[]string{model.AlertEventRead, model.AlertEventDismissed}, cutoff).Find(&events).Error; err != nil {
 		errs["提醒完成历史"] = err
 	} else {
 		for _, event := range events {
+			if isPositionAlertKind(event.Kind) && assessedPositions[event.PositionID] {
+				continue // 统一评估上线后，持仓类底层事件只留审计，不重复进入收件箱历史
+			}
 			t := event.UpdatedAt
 			scope := TodoScopeResearch
 			if isPositionAlertKind(event.Kind) {
@@ -310,6 +323,21 @@ func loadCompletedTodoItems(userID int64, cutoff time.Time) ([]TodoItem, map[str
 			out = append(out, TodoItem{Kind: TodoKindAlert, Scope: scope, Priority: 3,
 				Symbol: event.Symbol, Market: event.Market, Name: event.Name, Title: "条件提醒已收下", Detail: event.Message,
 				RefID: event.ID, RefType: "alerts", DeepLink: alertEventDeepLink(event.ID), Time: &t})
+		}
+	}
+	var reviews []model.SellReview
+	if err := common.DB.Where("user_id = ? AND status IN ? AND updated_at >= ?", userID,
+		[]string{model.SellReviewStatusResolved, model.SellReviewStatusDismissed}, cutoff).Find(&reviews).Error; err != nil {
+		errs["卖出复核完成历史"] = err
+	} else {
+		for _, row := range reviews {
+			if assessedPositions[row.PositionID] {
+				continue
+			}
+			t := row.UpdatedAt
+			out = append(out, TodoItem{Kind: TodoKindSellReview, Scope: TodoScopeLedger, Priority: 3,
+				Symbol: row.Symbol, Market: row.Market, Name: row.Name, Title: "卖出复核已完成 · " + row.Title, Detail: row.Detail,
+				RefID: row.ID, RefType: "positions", DeepLink: fmt.Sprintf("/positions?position_id=%d", row.PositionID), Time: &t})
 		}
 	}
 	var recs []model.RecommendationStatus
@@ -322,18 +350,6 @@ func loadCompletedTodoItems(userID int64, cutoff time.Time) ([]TodoItem, map[str
 			out = append(out, TodoItem{Kind: TodoKindRecReview, Scope: TodoScopeResearch, Priority: 3,
 				Symbol: row.Symbol, Market: row.Market, Name: row.Symbol, Title: "推荐复盘已收下", Detail: recReviewDetail(row),
 				RefID: row.ID, RefType: "recommendations", DeepLink: "/recommendations", Time: &t})
-		}
-	}
-	var reviews []model.SellReview
-	if err := common.DB.Where("user_id = ? AND status IN ? AND updated_at >= ?", userID,
-		[]string{model.SellReviewStatusResolved, model.SellReviewStatusDismissed}, cutoff).Find(&reviews).Error; err != nil {
-		errs["卖出复核完成历史"] = err
-	} else {
-		for _, row := range reviews {
-			t := row.UpdatedAt
-			out = append(out, TodoItem{Kind: TodoKindSellReview, Scope: TodoScopeLedger, Priority: 3,
-				Symbol: row.Symbol, Market: row.Market, Name: row.Name, Title: "卖出复核已完成 · " + row.Title, Detail: row.Detail,
-				RefID: row.ID, RefType: "positions", DeepLink: fmt.Sprintf("/positions?position_id=%d", row.PositionID), Time: &t})
 		}
 	}
 	var adjusts []model.PositionCorpAdjust
@@ -480,6 +496,24 @@ func enrichTodoItem(userID int64, today string, item *TodoItem) error {
 		if row.Status != model.SellReviewStatusOpen {
 			item.Status = TodoStatusCompleted
 		}
+	case TodoKindPositionExit:
+		var row model.PositionExitAssessment
+		if err := common.DB.Where("id = ? AND user_id = ?", item.RefID, userID).First(&row).Error; err != nil {
+			return err
+		}
+		// 同一持仓是稳定来源，评估事实哈希/交易日/等级才是版本。盘后为同一事实
+		// 追加 close 快照时 assessment_id 会变化，但用户已处理状态不能因此失效。
+		item.SourceID = row.PositionID
+		item.SourceVersion = todoVersion(row.FactHash, row.Level, row.TradeDate, row.Version)
+		item.eventDate = row.TradeDate
+		item.groupCategory = fmt.Sprintf("position_exit:%d", row.PositionID)
+		item.DeepLink = fmt.Sprintf("/positions?position_id=%d", row.PositionID)
+		item.CanComplete = row.ShouldTodo
+		if row.Level == model.PositionExitLevelUrgent {
+			item.Severity, item.severityRank, item.sortBucket = "critical", 4, 0
+		} else {
+			item.Severity, item.severityRank, item.sortBucket = "high", 3, 1
+		}
 	case TodoKindJobFailure:
 		var row model.JobFailureNotification
 		if err := common.DB.Where("id = ? AND user_id = ?", item.RefID, userID).First(&row).Error; err != nil {
@@ -556,6 +590,8 @@ func todoSourceLabel(kind string) string {
 		return "打新日历"
 	case TodoKindSellReview:
 		return "卖出复核"
+	case TodoKindPositionExit:
+		return "持仓卖出风险"
 	case TodoKindJobFailure:
 		return "任务中心"
 	default:
@@ -592,7 +628,7 @@ func applyTodoInboxStates(items []TodoItem, states map[string]model.TodoInboxSta
 		items[i].Read = state.Read
 		items[i].SnoozedUntil = state.SnoozedUntil
 		items[i].mutedToday = state.MutedDate == time.Now().In(time.Local).Format("2006-01-02")
-		if state.Read && (items[i].Kind == TodoKindIpo || items[i].Kind == TodoKindJobFailure) {
+		if state.Read && (items[i].Kind == TodoKindIpo || items[i].Kind == TodoKindJobFailure || items[i].Kind == TodoKindPositionExit) {
 			items[i].Status = TodoStatusCompleted
 			items[i].CanComplete = false
 		}
@@ -729,7 +765,7 @@ func groupHasReview(item TodoItem) bool {
 	for _, child := range item.Children {
 		switch child.Kind {
 		case TodoKindRecReview, TodoKindStopLoss, TodoKindPositionShort, TodoKindPositionLong,
-			TodoKindThesisDue, TodoKindCorpAdjust, TodoKindSellReview:
+			TodoKindThesisDue, TodoKindCorpAdjust, TodoKindSellReview, TodoKindPositionExit:
 			return true
 		}
 	}
@@ -824,7 +860,7 @@ func (s *TodoService) activeTodoItems(userID int64) ([]TodoItem, error) {
 
 func todoSourceCanComplete(kind string) bool {
 	switch kind {
-	case TodoKindAlert, TodoKindRecReview, TodoKindSellReview, TodoKindIpo, TodoKindJobFailure:
+	case TodoKindAlert, TodoKindRecReview, TodoKindSellReview, TodoKindPositionExit, TodoKindIpo, TodoKindJobFailure:
 		return true
 	default:
 		return false
@@ -854,7 +890,7 @@ func (s *TodoService) applyOneInboxAction(userID int64, action string, ref TodoS
 			if _, err := SetSellReviewStatus(userID, ref.SourceID, model.SellReviewStatusResolved); err != nil {
 				return err
 			}
-		case TodoKindIpo, TodoKindJobFailure:
+		case TodoKindPositionExit, TodoKindIpo, TodoKindJobFailure:
 		default:
 			return errors.New("该事项不能直接完成")
 		}
@@ -880,6 +916,13 @@ func upsertTodoInboxState(state model.TodoInboxState) error {
 }
 
 func currentTodoSourceRef(userID int64, kind string, id int64) (TodoSourceRef, error) {
+	if kind == TodoKindPositionExit {
+		latest, err := LatestPositionExitAssessment(context.Background(), userID, id)
+		if err != nil {
+			return TodoSourceRef{}, err
+		}
+		id = latest.ID
+	}
 	item := TodoItem{Kind: kind, RefID: id}
 	if err := enrichTodoItem(userID, time.Now().In(time.Local).Format("2006-01-02"), &item); err != nil {
 		return TodoSourceRef{}, err

@@ -1,12 +1,60 @@
 package service
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"quantvista/common"
 	"quantvista/model"
 )
+
+func TestPauseLegacyDailyReportSellAlertsPreciseAndIdempotent(t *testing.T) {
+	setupTestDB(t)
+	common.DB.Exec("DELETE FROM alert_events")
+	common.DB.Exec("DELETE FROM alert_rules")
+	rows := []model.AlertRule{
+		{UserID: 1, Symbol: "600001", Market: "cn", Kind: model.AlertKindPrice, Op: model.AlertOpGTE, Threshold: 12, Once: true, Status: model.AlertStatusActive, Note: "收盘日报 2026-07-01 推荐止盈卖点"},
+		{UserID: 1, Symbol: "600002", Market: "cn", Kind: model.AlertKindPrice, Op: model.AlertOpLTE, Threshold: 8, Once: true, Status: model.AlertStatusActive, Note: "收盘日报 2026-07-01 推荐止损卖点"},
+		{UserID: 1, Symbol: "600003", Market: "cn", Kind: model.AlertKindPrice, Op: model.AlertOpGTE, Threshold: 11, Once: true, Status: model.AlertStatusActive, Note: "我的普通到价规则"},
+		{UserID: 1, Symbol: "600004", Market: "cn", Kind: model.AlertKindPrice, Op: model.AlertOpGTE, Threshold: 11, Once: false, Status: model.AlertStatusActive, Note: "收盘日报 2026-07-01 推荐止盈卖点"},
+		{UserID: 1, Symbol: "600005", Market: "cn", Kind: model.AlertKindPrice, Op: model.AlertOpLTE, Threshold: 11, Once: true, Status: model.AlertStatusActive, Note: "收盘日报 2026-07-01 推荐止盈卖点"},
+		{UserID: 1, Symbol: "600006", Market: "cn", Kind: model.AlertKindPrice, Op: model.AlertOpGTE, Threshold: 11, Once: true, Status: model.AlertStatusTriggered, Note: "收盘日报 2026-07-01 推荐止盈卖点"},
+	}
+	for i := range rows {
+		if err := common.DB.Create(&rows[i]).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	event := model.AlertEvent{RuleID: rows[0].ID, UserID: 1, Symbol: rows[0].Symbol, Market: "cn", Kind: model.AlertKindPrice, TradeDate: "2026-07-01", Status: model.AlertEventUnread, TriggeredAt: time.Now()}
+	if err := common.DB.Create(&event).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := pauseLegacyDailyReportSellAlerts(context.Background())
+	if err != nil || count != 2 {
+		t.Fatalf("应精准暂停两条历史系统规则: count=%d err=%v", count, err)
+	}
+	count, err = pauseLegacyDailyReportSellAlerts(context.Background())
+	if err != nil || count != 0 {
+		t.Fatalf("重复执行应幂等: count=%d err=%v", count, err)
+	}
+	var got []model.AlertRule
+	common.DB.Order("id ASC").Find(&got)
+	if len(got) != len(rows) || got[0].Status != model.AlertStatusPaused || got[1].Status != model.AlertStatusPaused {
+		t.Fatalf("历史规则应保留并暂停: %+v", got)
+	}
+	for _, index := range []int{2, 3, 4, 5} {
+		if got[index].Status != rows[index].Status {
+			t.Fatalf("非精准匹配规则不应受影响 index=%d got=%s", index, got[index].Status)
+		}
+	}
+	var eventCount int64
+	common.DB.Model(&model.AlertEvent{}).Where("id = ?", event.ID).Count(&eventCount)
+	if eventCount != 1 {
+		t.Fatal("AlertEvent 审计记录不得删除")
+	}
+}
 
 // TestInReportWindow 收盘日报生成窗口（15:35 ~ 20:00）。
 func TestInReportWindow(t *testing.T) {

@@ -220,21 +220,6 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 		return 0, err
 	}
 
-	notifyOn := false
-	if s.notify != nil {
-		var nerr error
-		notifyOn, nerr = alertNotificationsEnabled(ctx, userID)
-		if nerr != nil {
-			return 0, nerr
-		}
-	}
-	var pushItems []alertNotificationItem
-	if notifyOn {
-		defer func() {
-			flushAlertNotification(ctx, s.notify, userID, "QuantVista 持仓提醒", NotifyMsgKindAlert, pushItems)
-		}()
-	}
-
 	hits := 0
 	for _, rule := range rules {
 		if err := ctx.Err(); err != nil {
@@ -292,7 +277,7 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 		if ruleCheckDate == "" {
 			ruleCheckDate = wallDate
 		}
-		created, active, perr := persistPositionAlertEvaluation(
+		_, active, perr := persistPositionAlertEvaluation(
 			ctx, rule, ruleHits, extreme, hasObs, ruleCheckDate, time.Now(),
 		)
 		if perr != nil {
@@ -301,12 +286,13 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 		if active {
 			hits += len(ruleHits)
 		}
-		if notifyOn {
-			for _, h := range created {
-				pushItems = append(pushItems, alertNotificationItem{
-					Summary: h.Message, DeepLink: alertEventDeepLink(h.EventID),
-				})
-			}
+	}
+	// 统一卖出评估复用本轮已批量取得并完成峰值补齐的持仓/行情快照。
+	// 评估事实失败必须向上传递，不能把关键查询失败默认为正常状态。
+	if s.exit != nil {
+		if _, err := s.exit.EvaluateUserWithSnapshot(ctx, userID, positions, quotes,
+			model.PositionExitSessionIntraday, time.Now().In(time.Local)); err != nil {
+			return hits, fmt.Errorf("统一持仓卖出风险评估失败: %w", err)
 		}
 	}
 	return hits, nil

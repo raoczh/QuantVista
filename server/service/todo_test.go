@@ -206,3 +206,64 @@ func TestTodoScopeFilter(t *testing.T) {
 		}
 	}
 }
+
+func TestTodoUsesUnifiedPositionExitFactAndKeepsHandledState(t *testing.T) {
+	setupTestDB(t)
+	cleanCorpTables(t)
+	common.DB.Exec("DELETE FROM position_exit_assessments WHERE user_id = ?", 906)
+	common.DB.Exec("DELETE FROM todo_inbox_states WHERE user_id = ?", 906)
+	today := time.Now().In(time.Local).Format("2006-01-02")
+	p := seedHoldingWithPeak(t, 906, "600906", "统一评估股", 10, 100, 12, today)
+	common.DB.Create(&model.AlertEvent{RuleID: 9061, UserID: 906, PositionID: p.ID, Symbol: p.Symbol, Market: "cn", Kind: model.AlertKindCostDrawdown, Message: "底层成本回撤", TradeDate: today, TriggeredAt: time.Now(), Status: model.AlertEventUnread})
+	common.DB.Create(&model.SellReview{UserID: 906, PositionID: p.ID, Symbol: p.Symbol, Market: "cn", Name: p.Name, Trigger: model.SellReviewLift, TradeDate: today, Severity: model.SellReviewSeverityHigh, Title: "底层解禁事实", Detail: "底层事实", Status: model.SellReviewStatusOpen})
+	assessment := &model.PositionExitAssessment{UserID: 906, PositionID: p.ID, Symbol: p.Symbol, Market: "cn", Name: p.Name,
+		TradeDate: today, Session: model.PositionExitSessionIntraday, EvaluatedAt: time.Now(), Level: model.PositionExitLevelReview,
+		PrimarySignal: model.AlertKindCostDrawdown, PrimaryReason: "成本回撤达到用户阈值", NextAction: "今天完成复核",
+		DataStatus: model.PositionExitDataReady, ShouldTodo: true, Version: model.PositionExitAssessmentVersion,
+		FactHash: "todo-review-fact", EventKey: "todo-review-event"}
+	if err := common.DB.Create(assessment).Error; err != nil {
+		t.Fatal(err)
+	}
+	svc := NewTodoService(&AlertService{}, NewPositionService(NewMarketService(datasource.NewManagerWithAdapters())), nil)
+	res, err := svc.Build(context.Background(), 906, TodoScopeLedger)
+	if err != nil || res.Total != 1 || res.Items[0].Kind != TodoKindPositionExit {
+		t.Fatalf("Today 必须只投影统一评估，不重复底层 Alert/SellReview: total=%d err=%v items=%+v", res.Total, err, res.Items)
+	}
+	child := res.Items[0].Children[0]
+	if err := svc.ApplyInboxAction(906, TodoActionRequest{Action: TodoActionRead, Items: []TodoSourceRef{{SourceKind: child.SourceKind, SourceID: child.SourceID, SourceVersion: child.SourceVersion}}}); err != nil {
+		t.Fatalf("统一评估待办应可完成: %v", err)
+	}
+	open, _ := svc.Build(context.Background(), 906, TodoScopeLedger)
+	if open.Total != 0 {
+		t.Fatalf("已处理的同一评估事实不得被重复拉回: %+v", open.Items)
+	}
+	closeSnapshot := *assessment
+	closeSnapshot.ID = 0
+	closeSnapshot.Session = model.PositionExitSessionClose
+	closeSnapshot.EventKey = "todo-review-close-event"
+	closeSnapshot.EvaluatedAt = time.Now().Add(500 * time.Millisecond)
+	if err := common.DB.Create(&closeSnapshot).Error; err != nil {
+		t.Fatal(err)
+	}
+	closedAgain, _ := svc.Build(context.Background(), 906, TodoScopeLedger)
+	if closedAgain.Total != 0 {
+		t.Fatalf("盘后追加的同交易日同事实不得让已处理 Todo 回流: %+v", closedAgain.Items)
+	}
+	urgent := *assessment
+	urgent.ID = 0
+	urgent.Level = model.PositionExitLevelUrgent
+	urgent.PrimarySignal = "plan_stop"
+	urgent.PrimaryReason = "触达计划止损"
+	urgent.FactHash = "todo-urgent-fact"
+	urgent.EventKey = "todo-urgent-event"
+	urgent.PreviousID = closeSnapshot.ID
+	urgent.IsUpgrade = true
+	urgent.EvaluatedAt = time.Now().Add(time.Second)
+	if err := common.DB.Create(&urgent).Error; err != nil {
+		t.Fatal(err)
+	}
+	upgraded, _ := svc.Build(context.Background(), 906, TodoScopeLedger)
+	if upgraded.Total != 1 || upgraded.Items[0].Severity != "critical" {
+		t.Fatalf("review→urgent 新事实应再次出现且高优先级: %+v", upgraded.Items)
+	}
+}

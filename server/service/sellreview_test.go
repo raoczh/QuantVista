@@ -90,8 +90,8 @@ func TestEvalSellReviewMaBreak(t *testing.T) {
 	if h.TradeDate != "2026-07-01" {
 		t.Fatalf("事件日应为跌破那一天，得到 %s", h.TradeDate)
 	}
-	if !h.Push {
-		t.Fatal("跌破均线是既有 guard 未覆盖的类型，应标记需推送")
+	if h.Severity != model.SellReviewSeverityMed {
+		t.Fatalf("MA20 跌破应保留中风险复核事实，got %s", h.Severity)
 	}
 
 	// 长期在均线下方：再加一根 8.5，此时前一根（9）已在均线下方 → 不再报。

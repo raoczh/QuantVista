@@ -46,11 +46,9 @@ import {
   listCorpAdjusts,
   actCorpAdjust,
   type PositionCorpAdjust,
-  listSellReviews,
-  setSellReviewStatus,
-  type SellReview,
   requestPositionAdvice,
   type PositionAdviceResult,
+  type PositionExitLevel,
   POSITION_VERDICT_LABEL,
 } from '@/api/position'
 import { getLLMTask, type LLMTask } from '@/api/llmTask'
@@ -422,7 +420,7 @@ async function submitClose() {
     })
     closeModal.value = false
     invalidateAdvice()
-    await Promise.all([load(), loadSellReviews()])
+    await load()
     message.success('已标记卖出')
   } catch (e) {
     message.error((e as Error).message)
@@ -435,7 +433,7 @@ async function remove(p: Position) {
   try {
     await deletePosition(p.id)
     invalidateAdvice()
-    await Promise.all([load(), loadSellReviews()])
+    await load()
     message.success('已删除')
   } catch (e) {
     message.error((e as Error).message)
@@ -544,7 +542,7 @@ async function submitTrade() {
     })
     tradeModal.value = false
     invalidateAdvice()
-    await Promise.all([load(), loadSellReviews()])
+    await load()
     if (expandedTrades.value === p.id) await loadTrades(p.id)
     message.success(f.side === 'buy' ? '已记录加仓' : '已记录减仓')
   } catch (e) {
@@ -846,57 +844,12 @@ function adjustPlanText(a: PositionCorpAdjust) {
   return parts.length ? `每 10 股 ${parts.join(' ')}` : '—'
 }
 
-// ---------- D16 卖出复核 ----------
-// 持仓命中解禁 / 业绩变脸 / 跌破关键均线 / 龙虎榜出货 / 除权除息时自动生成，
-// 无需用户配置任何规则；detail 已由后端拼上「这件事对我这笔持仓的影响」。
-const sellReviews = ref<SellReview[]>([])
-const sellReviewLoading = ref(false)
-const sellReviewError = ref('')
-const sellReviewActing = ref<number | null>(null)
-let sellReviewAbort: AbortController | null = null
-
-async function loadSellReviews() {
-  sellReviewAbort?.abort()
-  const ctrl = new AbortController()
-  sellReviewAbort = ctrl
-  sellReviewLoading.value = true
-  sellReviewError.value = ''
-  try {
-    sellReviews.value = await listSellReviews('open', ctrl.signal)
-  } catch (e) {
-    if (isAbortError(e)) return
-    sellReviewError.value = (e as Error).message
-  } finally {
-    if (sellReviewAbort === ctrl) sellReviewLoading.value = false
-  }
-}
-
-async function doSellReview(row: SellReview, status: 'resolved' | 'dismissed') {
-  if (sellReviewActing.value) return
-  sellReviewActing.value = row.id
-  try {
-    await setSellReviewStatus(row.id, status)
-    message.success(status === 'resolved' ? '已标记复核完成' : '已忽略')
-    invalidateAdvice()
-    await loadSellReviews()
-  } catch (e) {
-    message.error((e as Error).message)
-  } finally {
-    sellReviewActing.value = null
-  }
-}
-
-const severityType = (s: string) => (s === 'high' ? 'error' : s === 'med' ? 'warning' : 'default')
-const severityLabel = (s: string) => (s === 'high' ? '高' : s === 'med' ? '中' : '低')
-const triggerLabel = (t: string) =>
-  ({ lift: '限售解禁', earn_fcst: '业绩变脸', ma_break: '跌破均线', lhb_sell: '龙虎榜出货', ex_div: '除权除息' })[t] ||
-  '利空事件'
-
 // ---------- D17 AI 持有 / 减仓 / 清仓建议 ----------
 // 走 llm_tasks 后台任务：HTTP 秒回任务 id，前端轮询；浏览器断开不取消模型调用。
 const advice = ref<PositionAdviceResult | null>(null)
 const adviceLoading = ref(false)
 const adviceError = ref('')
+const adviceTargetPositionID = ref<number | null>(null)
 let adviceAbort: AbortController | null = null
 
 // 建议是一次性账本快照。任何会改变持仓数量/成本/公司行动或风险信号的成功操作，
@@ -909,23 +862,41 @@ function invalidateAdvice() {
   adviceError.value = ''
 }
 
-async function runAdvice() {
+async function runAdvice(target?: Position) {
   if (adviceLoading.value) return
   adviceAbort?.abort()
   const ctrl = new AbortController()
   adviceAbort = ctrl
   adviceLoading.value = true
+  adviceTargetPositionID.value = target?.id ?? null
   adviceError.value = ''
   try {
-    const task = await requestPositionAdvice()
+    const task = await requestPositionAdvice(
+      target ? { position_id: target.id, symbol: target.symbol } : {},
+    )
     await resolveAdviceTask(task, ctrl)
+    await nextTick()
+    document.getElementById('position-advice-panel')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   } catch (e) {
     if (isAbortError(e) || (e as Error).name === 'PollCancelled') return
     adviceError.value = (e as Error).message
   } finally {
-    if (adviceAbort === ctrl) adviceLoading.value = false
+    if (adviceAbort === ctrl) {
+      adviceLoading.value = false
+      adviceTargetPositionID.value = null
+    }
   }
 }
+
+const exitLevelLabel: Record<PositionExitLevel, string> = {
+  normal: '正常',
+  watch: '观察',
+  review: '待复核',
+  urgent: '紧急',
+  unknown: '数据不足',
+}
+const exitLevelType = (level: PositionExitLevel) =>
+  level === 'urgent' ? 'error' : level === 'review' || level === 'watch' ? 'warning' : level === 'normal' ? 'success' : 'default'
 
 async function resolveAdviceTask(
   initial: LLMTask<PositionAdviceResult>,
@@ -1139,6 +1110,8 @@ watch(expandedTrades, () => void restoreExpandedTrade())
 
 function stockActionKey() {
   if (route.query.import === '1') return 'import'
+  const positionID = Number(route.query.position_id)
+  if (Number.isInteger(positionID) && positionID > 0) return `position:${positionID}`
   const symbol = String(route.query.symbol || '').trim()
   if (!symbol && route.query.add !== '1') return ''
   return String(route.query._stock_action || '') || [symbol, route.query.market || 'cn', route.query.add || '', route.query.quantity || ''].join(':')
@@ -1192,13 +1165,16 @@ async function applyStockActionQuery(): Promise<boolean> {
     await load()
     if (loadError.value || stockActionKey() !== actionKey) return true
 
+    const requestedPositionID = Number(route.query.position_id)
     const symbol = String(route.query.symbol || '').trim().toLowerCase()
     const market = String(route.query.market || 'cn').trim().toLowerCase()
-    const target = positions.value.find(
-      (position) =>
-        position.symbol.trim().toLowerCase() === symbol &&
-        (position.market || 'cn').trim().toLowerCase() === market,
-    )
+    const target = Number.isInteger(requestedPositionID) && requestedPositionID > 0
+      ? positions.value.find((position) => position.id === requestedPositionID)
+      : positions.value.find(
+          (position) =>
+            position.symbol.trim().toLowerCase() === symbol &&
+            (position.market || 'cn').trim().toLowerCase() === market,
+        )
 
     lastConsumedStockAction = actionKey
     if (target) {
@@ -1208,7 +1184,7 @@ async function applyStockActionQuery(): Promise<boolean> {
         behavior: 'smooth',
         block: 'center',
       })
-    } else {
+    } else if (!(Number.isInteger(requestedPositionID) && requestedPositionID > 0)) {
       highlightedPositionID.value = null
       openCreate({
         symbol: String(route.query.symbol || ''),
@@ -1232,7 +1208,7 @@ onMounted(async () => {
   const hadStockAction = !!stockActionKey()
   // 股票动作先核对当前持仓：已有记录定位高亮，否则预填建仓；rec_id 保留推荐血缘。
   if (!(await applyStockActionQuery())) await load()
-  await Promise.all([loadCurve(), loadCorpAdjusts(), loadSellReviews()])
+  await Promise.all([loadCurve(), loadCorpAdjusts()])
   if (mainTab.value === 'stats' && !stats.value) await loadStats()
   if (hasExplicitTask) void restoreRouteAdvice()
   window.addEventListener('resize', onResize)
@@ -1245,8 +1221,6 @@ onBeforeUnmount(() => {
   tradesSeq++
   corpAdjustAbort?.abort()
   corpAdjustAbort = null
-  sellReviewAbort?.abort()
-  sellReviewAbort = null
   adviceAbort?.abort()
   adviceAbort = null
   curveSeq++
@@ -1387,45 +1361,12 @@ onBeforeUnmount(() => {
             </template>
           </SectionCard>
 
-          <!-- D16 卖出复核：持仓命中利空事件时自动生成，无需配置任何规则。
-               每条 detail 都回答「这件事对**我这笔持仓**意味着什么」（带我的成本与浮盈亏）。 -->
-          <SectionCard v-if="sellReviews.length || sellReviewError" title="卖出复核">
-            <template #extra>
-              <n-button size="tiny" quaternary :loading="sellReviewLoading" @click="loadSellReviews">刷新</n-button>
-            </template>
-            <n-alert v-if="sellReviewError" type="error" :bordered="false" title="卖出复核读取失败">
-              {{ sellReviewError }}
-            </n-alert>
-            <div v-else class="review-list">
-              <div v-for="r in sellReviews" :key="r.id" class="review-row">
-                <div class="review-main">
-                  <div class="review-head">
-                    <n-tag size="tiny" round :bordered="false" :type="severityType(r.severity)">{{
-                      severityLabel(r.severity)
-                    }}</n-tag>
-                    <n-tag size="tiny" round :bordered="false">{{ triggerLabel(r.trigger) }}</n-tag>
-                    <span class="review-name">{{ r.name || r.symbol }}</span>
-                    <span class="review-symbol qv-mono">{{ r.symbol }}</span>
-                    <span class="review-date">{{ r.trade_date }}</span>
-                  </div>
-                  <div class="review-detail">{{ r.detail }}</div>
-                </div>
-                <div class="review-actions">
-                  <n-button size="small" :loading="sellReviewActing === r.id" @click="doSellReview(r, 'resolved')"
-                    >已复核</n-button
-                  >
-                  <n-button size="small" quaternary @click="doSellReview(r, 'dismissed')">忽略</n-button>
-                </div>
-              </div>
-            </div>
-          </SectionCard>
-
           <!-- D17 AI 卖出建议：逐笔持仓的 hold/trim/exit 封闭结论。
                无当前有效行情的仓位不参与（不基于旧价出割/守/补结论）。 -->
-          <SectionCard title="AI 卖出建议">
+          <SectionCard id="position-advice-panel" title="AI 卖出建议">
             <template #extra>
-              <n-button size="tiny" type="primary" ghost :loading="adviceLoading" @click="runAdvice">
-                {{ advice ? '重新生成' : '生成建议' }}
+              <n-button size="tiny" type="primary" ghost :loading="adviceLoading" @click="runAdvice()">
+                分析全部持仓
               </n-button>
             </template>
             <n-alert v-if="adviceError" type="error" :bordered="false" title="AI 建议生成失败">
@@ -1559,6 +1500,12 @@ onBeforeUnmount(() => {
                         <span class="r-title">{{ p.name || p.symbol }}</span>
                         <span class="r-symbol qv-mono">{{ p.symbol }}</span>
                         <n-tag v-if="p.status === 'closed'" size="tiny" :bordered="false">已卖出</n-tag>
+                        <n-tag
+                          v-if="p.status === 'holding' && p.exit_assessment"
+                          size="tiny"
+                          :bordered="false"
+                          :type="exitLevelType(p.exit_assessment.level)"
+                        >{{ exitLevelLabel[p.exit_assessment.level] }}</n-tag>
                         <n-tag v-if="p.below_stop_loss" size="tiny" type="error" :bordered="false">破止损</n-tag>
                         <n-tag v-else-if="p.near_stop_loss" size="tiny" type="warning" :bordered="false">近止损</n-tag>
                         <FreshnessTag
@@ -1606,6 +1553,40 @@ onBeforeUnmount(() => {
                         <span v-else-if="!p.quote_ok"> · 回撤未知（无当前有效行情）</span>
                         <span v-if="p.peak.from"> · 自 {{ p.peak.from }} 起算</span>
                         <span v-if="p.peak.backfilled" class="r-peak-note" :title="p.peak.note">（含日线回填）</span>
+                      </div>
+                      <div
+                        v-if="p.status === 'holding' && p.exit_assessment"
+                        class="exit-assessment"
+                        :class="`is-${p.exit_assessment.level}`"
+                      >
+                        <div class="exit-assessment-head">
+                          <span class="exit-reason">{{ p.exit_assessment.primary_reason }}</span>
+                          <span class="exit-asof qv-tnum">
+                            行情 {{ p.exit_assessment.quote_as_of || '未知' }} · 日线
+                            {{ p.exit_assessment.bars_as_of || '未知' }}
+                          </span>
+                        </div>
+                        <div v-if="p.exit_assessment.evidence.length" class="exit-evidence">
+                          <span v-for="(item, index) in p.exit_assessment.evidence" :key="index">{{ item }}</span>
+                        </div>
+                        <div v-if="p.exit_assessment.data_gaps.length" class="exit-gaps">
+                          {{ p.exit_assessment.data_gaps.join('；') }}
+                        </div>
+                        <div class="exit-action">
+                          <span>{{ p.exit_assessment.next_action }}</span>
+                          <n-button
+                            v-if="p.exit_assessment.level === 'review' || p.exit_assessment.level === 'urgent'"
+                            size="tiny"
+                            type="primary"
+                            ghost
+                            :loading="adviceLoading && adviceTargetPositionID === p.id"
+                            :disabled="adviceLoading && adviceTargetPositionID !== p.id"
+                            @click="runAdvice(p)"
+                          >AI 复核</n-button>
+                        </div>
+                      </div>
+                      <div v-else-if="p.status === 'holding'" class="exit-assessment-empty">
+                        卖出风险评估尚未生成
                       </div>
                       <div v-if="p.status === 'closed' && p.review_note" class="r-review">
                         复盘：{{ p.review_note }}
@@ -2261,6 +2242,36 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 768px) {
+  .rows,
+  .row-wrap,
+  .row,
+  .r-title-line,
+  .exit-assessment {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+  .row {
+    align-items: stretch;
+    gap: 10px;
+  }
+  .r-name,
+  .r-figures,
+  .r-actions {
+    flex: 1 1 100%;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+  }
+  .r-title,
+  .r-sub,
+  .r-review,
+  .r-hint {
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
   /* 行操作区（卖出/分析/复盘/删除等 6 个 tiny 按钮）加大触摸目标 */
   .r-actions {
     flex-wrap: wrap;
@@ -2268,12 +2279,20 @@ onBeforeUnmount(() => {
     row-gap: 4px;
   }
   .r-actions :deep(.n-button) {
+    flex: 0 1 auto;
+    max-width: 100%;
     height: 30px;
     padding: 0 10px;
   }
   .r-figures {
     gap: 14px;
     flex-wrap: wrap;
+    justify-content: space-between;
+  }
+  .r-fig {
+    flex: 1 1 64px;
+    min-width: 0;
+    text-align: center;
   }
 }
 .modal-footer {
@@ -2613,53 +2632,92 @@ onBeforeUnmount(() => {
   cursor: help;
 }
 
-/* D16 卖出复核 */
-.review-list {
-  display: flex;
-  flex-direction: column;
-}
-.review-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 0;
-}
-.review-row + .review-row {
-  border-top: 1px solid var(--qv-divider);
-}
-.review-main {
-  flex: 1;
+/* 统一持仓卖出风险事实 */
+.exit-assessment {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--qv-divider);
+  background: rgba(128, 128, 128, 0.06);
   min-width: 0;
 }
-.review-head {
+.exit-assessment.is-watch,
+.exit-assessment.is-review {
+  border-left-color: v-bind('vars.warningColor');
+}
+.exit-assessment.is-urgent {
+  border-left-color: v-bind('vars.errorColor');
+}
+.exit-assessment.is-normal {
+  border-left-color: v-bind('vars.successColor');
+}
+.exit-assessment-head,
+.exit-action {
   display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
 }
-.review-name {
-  font-size: 14px;
-  font-weight: 600;
-}
-.review-symbol {
-  font-size: 12px;
-  opacity: 0.5;
-}
-.review-date {
-  font-size: 12px;
-  opacity: 0.5;
-}
-.review-detail {
+.exit-reason {
+  min-width: 0;
   font-size: 13px;
-  opacity: 0.8;
-  margin-top: 4px;
-  line-height: 1.6;
+  line-height: 1.55;
+  font-weight: 600;
+  overflow-wrap: anywhere;
 }
-.review-actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+.exit-asof,
+.exit-assessment-empty {
+  font-size: 11px;
+  opacity: 0.58;
+}
+.exit-asof {
   flex-shrink: 0;
+  text-align: right;
+}
+.exit-evidence {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 5px;
+  font-size: 12px;
+  line-height: 1.5;
+  opacity: 0.76;
+  overflow-wrap: anywhere;
+}
+.exit-gaps {
+  margin-top: 5px;
+  color: v-bind('vars.warningColor');
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.exit-action {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  opacity: 0.78;
+}
+.exit-action > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.exit-action :deep(.n-button) {
+  flex-shrink: 0;
+}
+.exit-assessment-empty {
+  margin-top: 5px;
+}
+@media (max-width: 768px) {
+  .exit-assessment-head,
+  .exit-action {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .exit-asof {
+    text-align: left;
+  }
+  .exit-action :deep(.n-button) {
+    align-self: flex-start;
+  }
 }
 
 /* D17 AI 卖出建议 */
