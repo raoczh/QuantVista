@@ -90,7 +90,7 @@ export interface PositionExitAssessment {
   primary_signal: string
   primary_reason: string
   next_action: string
-  data_status: 'ready' | 'unknown'
+  data_status: 'ready' | 'partial' | 'unknown'
   trend: 'intact' | 'weak' | 'broken' | 'unknown'
   quote_as_of: string
   bars_as_of: string

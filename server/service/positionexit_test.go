@@ -26,6 +26,21 @@ func freshExitQuote(now time.Time, price, high, low float64) FreshQuoteResult {
 	return FreshQuoteResult{Quote: &datasource.Quote{Symbol: "600901", Market: "cn", Price: price, High: high, Low: low, DataTime: now}, Fresh: quoteFreshInfo{Status: freshStatusFresh, ExpectedDate: now.Format("2006-01-02")}}
 }
 
+func TestCompletedPositionExitBarsUsesQuoteTradeDate(t *testing.T) {
+	rows := []model.DailyBar{
+		{TradeDate: "2026-08-06", Open: 10, High: 11, Low: 9, Close: 10},
+		{TradeDate: "2026-08-07", Open: 10, High: 11, Low: 9, Close: 10},
+	}
+	intraday, gaps := completedPositionExitBars(rows, "2026-08-07", model.PositionExitSessionIntraday)
+	if len(gaps) != 0 || len(intraday) != 1 || intraday[0].TradeDate != "2026-08-06" {
+		t.Fatalf("盘中指标必须排除行情所属交易日，而不是按服务器墙上日期截断: rows=%+v gaps=%v", intraday, gaps)
+	}
+	closeRows, gaps := completedPositionExitBars(rows, "2026-08-07", model.PositionExitSessionClose)
+	if len(gaps) != 0 || len(closeRows) != 2 {
+		t.Fatalf("盘后快照应包含行情所属交易日完整日线: rows=%+v gaps=%v", closeRows, gaps)
+	}
+}
+
 func TestPositionExitAssessmentMatrixAndIdempotency(t *testing.T) {
 	setupTestDB(t)
 	now := time.Date(2026, 8, 10, 16, 0, 0, 0, time.Local)
@@ -99,13 +114,20 @@ func TestPositionExitUnknownStaleInsufficientBadBarsAndLongBelowNoRepeat(t *test
 		t.Fatalf("stale 必须 unknown 且不进 Todo: %+v", unknown)
 	}
 	input.quote.Fresh.Status = freshStatusFresh
-	if got := evaluatePositionExit(input, defaultPositionExitParams); got.Level != model.PositionExitLevelUnknown {
-		t.Fatalf("日线不足必须 unknown")
+	if got := evaluatePositionExit(input, defaultPositionExitParams); got.Level != model.PositionExitLevelUnknown || got.DataStatus != model.PositionExitDataPartial {
+		t.Fatalf("日线不足且无独立风险事实必须 unknown/partial: level=%s data=%s", got.Level, got.DataStatus)
 	}
 	input.barRows[2].High = 1
 	input.barRows[2].Low = 99
 	if got := evaluatePositionExit(input, defaultPositionExitParams); got.Level != model.PositionExitLevelUnknown {
 		t.Fatalf("坏 OHLC 必须 unknown")
+	}
+	input.position.PlanStopLoss = 8.5
+	input.position.PeakPrice = 0
+	input.loadErrs = []string{"卖出复核查询失败"}
+	if got := evaluatePositionExit(input, defaultPositionExitParams); got.Level != model.PositionExitLevelUrgent ||
+		got.PrimarySignal != "plan_stop" || got.DataStatus != model.PositionExitDataPartial || !got.ShouldTodo {
+		t.Fatalf("fresh 行情已触发计划止损时，不得被坏日线/峰值缺失/旁路失败吞掉: %+v", got)
 	}
 
 	// 只在首次跌破时产生 MA20 信号；长期位于均线下方没有新的 crossing。
@@ -342,10 +364,16 @@ func TestPositionExitNotificationDedupAndUpgrade(t *testing.T) {
 	if got := notifier.calls.Load(); got != 2 {
 		t.Fatalf("review 升 urgent 应允许再次提醒，got %d", got)
 	}
+	row.PositionID = 9092
+	row.Level, row.PrimaryReason = model.PositionExitLevelReview, "同标的另一笔成本持仓"
+	svc.notifyAssessment(context.Background(), row)
+	if got := notifier.calls.Load(); got != 3 {
+		t.Fatalf("同标的不同 position_id 必须分别提醒，got %d", got)
+	}
 	var events int64
 	common.DB.Model(&model.GuardEvent{}).Where("user_id = ?", userID).Count(&events)
-	if events != 2 {
-		t.Fatalf("统一通知台账应仅保留 review/urgent 两条，got %d", events)
+	if events != 3 {
+		t.Fatalf("统一通知台账应按持仓保留两笔 review 和一笔 urgent，got %d", events)
 	}
 }
 

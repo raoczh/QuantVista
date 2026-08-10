@@ -15,6 +15,7 @@ const (
 	PositionExitSessionClose    = "close"
 
 	PositionExitDataReady   = "ready"
+	PositionExitDataPartial = "partial"
 	PositionExitDataUnknown = "unknown"
 
 	PositionExitAssessmentVersion = "pea1"

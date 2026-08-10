@@ -108,6 +108,14 @@ func Migrate() error {
 	if err := common.DB.AutoMigrate(AllModels()...); err != nil {
 		return err
 	}
+	// GuardEvent v2 把 position_id 纳入唯一键，使同一股票的多笔持仓可分别发送统一
+	// 卖出风险通知。AutoMigrate 不会删除旧索引；保留 idx_guard_key 会继续按 symbol
+	// 冲突并吞掉第二笔持仓。普通守护事件的 position_id 均为 0，原有去重语义不变。
+	if m := common.DB.Migrator(); m.HasIndex(&GuardEvent{}, "idx_guard_key") {
+		if err := m.DropIndex(&GuardEvent{}, "idx_guard_key"); err != nil {
+			return err
+		}
+	}
 	// P0-4 存量自定义策略迁移（幂等）：为旧可变行固化 revision 1，并回填当前
 	// revision 指针。失败时阻断启动，避免新扫描继续从兼容字段读取无版本内容。
 	if err := MigrateScreenerStrategyRevisions(); err != nil {

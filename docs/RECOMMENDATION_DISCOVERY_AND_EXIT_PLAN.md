@@ -74,7 +74,7 @@
 1. **推荐是研究对象，不等于用户已买入。** 未建立实际 `Position` 血缘的推荐，不创建主动卖出提醒；其后续表现只留在推荐追踪页。
 2. **卖出决策只面向真实 `holding` 持仓。** 平仓、删除或不属于本人的持仓不得继续产生新状态或通知。
 3. **系统永不自动下单。** `normal/watch/review/urgent` 是风险复核等级，不是券商交易指令；AI 输出也是研究建议。
-4. **数据不可用不等于风险正常。** stale、unknown、样本不足必须单列 `unknown`，不得写成“无风险”或默认 `hold`。
+4. **数据不可用不等于风险正常。** 没有 fresh 行情时必须为 `unknown`；技术样本或旁路事实不完整时必须显式 `partial`，不得写成“无风险”或默认 `hold`。但 fresh 行情已经触发的用户计划止损等独立硬事实不能被其他缺口吞掉，仍保留风险等级，缺失证据不参与共振。
 5. **高频层零 LLM。** 盘中只做本地确定性判断；AI 仅在程序已判定 `review/urgent` 后按需运行，第一批默认由用户触发，避免每两分钟烧 token。
 6. **全市场扫描全局只跑一次。** 日更发现是系统级共享事实，用户偏好在消费时过滤；严禁每个用户各扫 5500 只股票。
 7. **历史复盘严格 point-in-time。** 解释昨日为何漏选只能读取昨日收盘前可知的快照、事件和新闻；今日涨幅只作为结果标签，不得倒灌昨日输入。
@@ -125,7 +125,7 @@
 - 身份：`user_id/position_id/symbol/market/trade_date/evaluated_at/session`；
 - 结论：`level=normal|watch|review|urgent|unknown`、`action=hold_observe|review_trim|review_exit|unavailable`、`primary_signal`；
 - 证据：版本化 `signals_json`、引用的 `alert_event_ids/sell_review_ids`、计划价、成本、现价、盈亏、峰值回撤、MA/ATR/趋势值；
-- 时点：`quote_as_of/bars_as_of/data_status`，任何 stale/缺失项显式记录；
+- 时点：`quote_as_of/bars_as_of/data_status=ready|partial|unknown`，任何 stale/缺失项显式记录；
 - 版本：`assessment_version`、参数快照/哈希；
 - 通知：是否为等级升级、是否需进入 Todo。通知是否送达仍由既有通道事实负责，不在本表冒充；
 - 可选 AI 关联：只保存已有 `llm_task/job_run` 引用和最终合法枚举，不复制 prompt 或完整响应。
@@ -187,7 +187,7 @@
 - **动态保护**：持仓峰值回撤、ATR 波动止损线、盈利回撤后跌破短中期趋势。单看“涨了多少”不自动要求卖出。
 - **趋势破坏**：刚跌破 MA20/MA60、短中期均线转弱、放量下跌；长期在均线下不每天重复报。
 - **事件风险**：业绩变脸、大比例解禁、龙虎榜明显净卖等既有 `SellReview`；除权只提示账面口径变化，不凭除权本身升级为清仓复核。
-- **数据质量**：行情 stale、日线不足或关键事件读取失败时为 `unknown`；禁止从 unknown 降为 normal。
+- **数据质量**：行情 stale 时为 `unknown`；日线不足或关键事件读取失败时为 `partial`，技术/缺失来源不参与判断。若没有任何可独立确认的风险事实，结论仍为 `unknown`；若 fresh 行情已明确触发计划止损等硬事实，则保留对应等级并同时展示缺口。禁止把 incomplete 降为 normal。
 
 聚合原则：单一弱信号通常为 `watch`，强信号或两个独立中等信号为 `review`，明确计划止损触达或强风险共振为 `urgent`。任何分级都附具体事实和失效/恢复条件，不输出裸分数。
 
@@ -202,7 +202,8 @@
 | MA60 刚跌破或 ATR14 动态保护线被首次有效跌破 | `review` | 两者同时或叠加高风险事件时升 `urgent` |
 | `SellReview` high / med | `review` / `watch` | 与 MA/ATR/亏损风险共振时最多升一级 |
 | 除权口径事件 | 仅提示口径，不单独形成卖出等级 | 只由其他独立风险决定等级 |
-| stale/样本不足/关键查询失败 | `unknown` | 不得与其他缺失项凑成风险共振 |
+| stale/无 fresh 行情 | `unknown` | 不得与其他事实凑成风险共振 |
+| 样本不足/关键查询失败 | 无独立事实时 `unknown` + `partial`；已有独立硬事实时保留其等级 + `partial` | 缺失项不得充当风险证据或凑共振 |
 
 ATR 只使用本地、截至评估时点已完成的日线计算 ATR14；动态保护线参数按短线/长线与风险偏好集中映射并写入 `assessment_version` 参数快照。盘中判断使用上一已完成交易日算出的保护线和 fresh 现价，盘后再用完整日线确认；不得把盘中未完成 K 线混入日线 ATR/MA。
 
@@ -251,10 +252,11 @@ ATR 只使用本地、截至评估时点已完成的日线计算 ATR14；动态�
 #### 第一大批实施记录（2026-08-10）
 
 - **已完成止噪**：日报推荐、推荐追踪和历史事实全部保留，但新日报不再创建推荐止盈/止损 `AlertRule`；启动迁移只暂停名称严格匹配“收盘日报 YYYY-MM-DD 推荐止盈/止损卖点”、方向/阈值/一次性语义也符合旧系统生成特征的 active 规则。规则与 `AlertEvent` 不删除，重复启动幂等，普通手工到价规则不受影响。
-- **已完成统一事实闭环**：新增 append-only `PositionExitAssessment`（参数版本 `pea1`），仅评估本人仍为 holding 的真实持仓，落库前在事务内重验用户、持仓状态、symbol 与 market。输入聚合计划价、成本/盈亏、峰值/回撤、AlertEvent、SellReview、MA20/MA60、ATR14 保护线、趋势和数据时点；日线只取评估时点前已完成的本地 K 线，stale、样本不足、坏根或关键查询失败统一为 unknown。
+- **已完成统一事实闭环**：新增 append-only `PositionExitAssessment`（参数版本 `pea1`），仅评估本人仍为 holding 的真实持仓，落库前在事务内重验用户、持仓状态、symbol 与 market。输入聚合计划价、成本/盈亏、峰值/回撤、AlertEvent、SellReview、MA20/MA60、ATR14 保护线、趋势和数据时点；日线严格按 fresh 行情自身交易日截断，盘中不混入观测日未完成 K 线。stale 为 unknown；样本、坏根或旁路查询不完整标 partial，不参与技术共振且不得吞掉已触发的计划止损等独立硬事实。
 - **已完成消费收口**：提醒轮复用已取得的持仓行情，19:40 盘后轮复用同一行情快照；相同事实不刷库，只在等级、主因、关键阈值首次穿越或盘后快照等有意义变化时追加。持仓页、Today ledger Todo 和通知均消费同一评估事实；normal/watch 仅展示，review/urgent 按统一通知总闸去重，unknown 不进 Todo、不推送。原始 Alert/Guard/SellReview 继续保留审计和兼容状态机，但在已有统一评估后不再重复占用 Today 或直接发送卖出风险通知。
 - **已完成精确 AI 复核**：`PositionAdviceRequest` 支持 `position_id`，服务端同时核验 `user_id + position_id + symbol + holding`，只给 review/urgent 卡片提供逐笔入口并注入最新评估。既有“分析全部持仓”入口继续兼容；高频评估不调用 LLM，AI 结论不能改写或降低程序风险等级，非法枚举、空理由、证据失败继续 fail-closed。版本更新为 `pa3`。
 - **实际实现边界**：未新建控制器或路由，复用并扩展现有持仓列表和持仓建议接口；未新建调度循环或行情请求链路。ATR/MA 第一版采用集中、版本化的保守基线并把参数快照固化到每条评估，后续只有在真实样本支持下才按周期/风险偏好分层，不能无版本静默改阈值。
+- **统一审查修复**：`GuardEvent` 自动迁移新增 `position_id` 并把通知唯一键升级为 `(user_id, position_id, symbol, kind, trade_date)`；普通守护事件固定为 0，原有去重不变，同一股票的不同成本持仓可分别通知。评估按行情实际交易日分组补峰值和截取日线，避免周末/休市日发生 as-of 偏移。
 - **程序化验证**：定向后端测试覆盖旧规则精准暂停、矩阵与共振、unknown、迁移/隔离/平仓竞态/幂等、Todo 状态及逐笔 AI 范围；`powershell -ExecutionPolicy Bypass -File scripts/verify.ps1 -Mode full` 已通过全部 Go 测试与前端生产构建。浏览器用真实 CSS viewport 目验 375×812 与 1440×1000，风险证据、时点、状态和操作区均无横向溢出或重叠；临时服务、浏览器和数据已清理。
 - **提交信息**：`推荐提醒止噪与统一持仓卖出决策`；提交哈希以本批完成后的 `git log` 为准。
 

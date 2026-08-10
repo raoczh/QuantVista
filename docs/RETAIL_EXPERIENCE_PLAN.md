@@ -363,7 +363,7 @@ https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600000,m1,,240
    由 B9 盘后轮推，新增 `pos_ma_break`（跌破 MA20/MA60）与 `pos_lhb_sell`（席位净卖出）
    两个 GuardKind 直推。2026-08-10 起 GuardKind 与 SellReview 只保留事实/审计，卖出风险
    必须经 `PositionExitAssessment` 定级后统一推送，不得恢复这条旧直推路径。
-   **去重维度与 guard 不同**：guard 按 `(user, symbol, kind, 事件日)`，SellReview 按
+   **去重维度与 guard 不同**：普通 guard 按 `(user, 0, symbol, kind, 事件日)`，逐笔统一风险通知按 `(user, position, symbol, kind, 事件日)`，SellReview 按
    `(user, **position**, trigger, 事件日)`——同一个利空对不同成本的两笔仓位含义完全不同。
 9. **跌破均线只报「刚跌破」那一天**（前一根收盘仍在均线上、最新一根掉到均线下）：
    长期在均线下方的票每天报一次毫无意义，跌破那天才是决策点；同时跌破 MA20 与 MA60 时

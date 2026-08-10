@@ -26,18 +26,21 @@ const (
 )
 
 // GuardEvent 自选/持仓异动守护推送的去重台账（阶段 D）。
-// 唯一索引 (user_id, symbol, kind, trade_date)：同一用户同一标的同类事件当日只推一次——
+// 唯一索引 (user_id, position_id, symbol, kind, trade_date)：普通守护事件的 position_id=0，
+// 仍保持同一用户同一标的同类事件当日只推一次；逐笔持仓风险事件带 position_id，避免
+// 同一股票的不同成本持仓互相吞掉通知。
 // 15min 一轮评估反复命中同一止损/异动时不刷屏（与 alert_events 的同日去重同思路，但
 // 这里的去重键内建唯一索引，靠 INSERT 冲突跳过而非查旧时间戳）。
 // TradeDate 语义：盘中事件=评估当日；盘后事件=事件自身日期（公告发布日/上榜日/预约披露日），
 // 这样窗口重复扫描（每日 19:35 查近几天窗口）天然幂等——同一事件跨天也只推一次。
 // 市场按 symbol 隐含 cn（守护只覆盖 A 股持仓/自选），仍存 Market 便于跳转与排查。
 type GuardEvent struct {
-	ID        int64  `gorm:"primaryKey" json:"id"`
-	UserID    int64  `gorm:"uniqueIndex:idx_guard_key;index" json:"user_id"`
-	Symbol    string `gorm:"size:16;uniqueIndex:idx_guard_key" json:"symbol"`
-	Kind      string `gorm:"size:16;uniqueIndex:idx_guard_key" json:"kind"`
-	TradeDate string `gorm:"size:10;uniqueIndex:idx_guard_key" json:"trade_date"`
+	ID         int64  `gorm:"primaryKey" json:"id"`
+	UserID     int64  `gorm:"uniqueIndex:idx_guard_key_v2;index" json:"user_id"`
+	PositionID int64  `gorm:"uniqueIndex:idx_guard_key_v2;index;default:0" json:"position_id,omitempty"`
+	Symbol     string `gorm:"size:16;uniqueIndex:idx_guard_key_v2" json:"symbol"`
+	Kind       string `gorm:"size:16;uniqueIndex:idx_guard_key_v2" json:"kind"`
+	TradeDate  string `gorm:"size:10;uniqueIndex:idx_guard_key_v2" json:"trade_date"`
 
 	Market  string  `gorm:"size:8" json:"market"`
 	Name    string  `gorm:"size:64" json:"name"`

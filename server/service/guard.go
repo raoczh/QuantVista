@@ -128,15 +128,16 @@ type guardObs struct {
 
 // guardHit 一条命中的守护事件（待去重落库 + 推送）。
 type guardHit struct {
-	Symbol    string
-	Market    string
-	Name      string
-	Kind      string
-	Price     float64
-	Message   string
-	Priority  int    // ntfy 优先级；止损/持仓跌停=4，其余=0（默认）
-	Route     string // 点击跳转路由
-	EventDate string // 盘后事件自身日期（去重台账 trade_date）；空=盘中事件，用评估当日
+	PositionID int64 // 仅逐笔持仓风险使用；普通守护事件保持 0
+	Symbol     string
+	Market     string
+	Name       string
+	Kind       string
+	Price      float64
+	Message    string
+	Priority   int    // ntfy 优先级；止损/持仓跌停=4，其余=0（默认）
+	Route      string // 点击跳转路由
+	EventDate  string // 盘后事件自身日期（去重台账 trade_date）；空=盘中事件，用评估当日
 }
 
 // evalPositionGuard 评估持仓的止损/止盈触达与当日异动，返回命中列表（可多条并存）。
@@ -296,10 +297,11 @@ func guardTitle(kind string) string {
 // ---------- 台账去重 ----------
 
 // recordGuardEvent 落库守护事件，唯一索引冲突时跳过。返回是否为「本轮新事件」
-// （RowsAffected>0）——同日同标的同类事件只在首次命中返回 true，用于驱动推送。
+// （RowsAffected>0）——普通事件按同日同标的同类去重，逐笔风险事件再按 position_id
+// 区分，用于驱动推送。
 func recordGuardEvent(userID int64, tradeDate string, h guardHit) bool {
 	ev := model.GuardEvent{
-		UserID: userID, Symbol: h.Symbol, Kind: h.Kind, TradeDate: tradeDate,
+		UserID: userID, PositionID: h.PositionID, Symbol: h.Symbol, Kind: h.Kind, TradeDate: tradeDate,
 		Market: h.Market, Name: h.Name, Price: round4(h.Price), Message: truncateRunes(h.Message, 256),
 	}
 	res := common.DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&ev)

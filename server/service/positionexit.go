@@ -133,7 +133,7 @@ func (s *PositionExitAssessmentService) EvaluateUserWithSnapshot(
 	if params.Version == "" {
 		params = defaultPositionExitParams
 	}
-	_, peakErr := syncPositionPeaksBefore(ctx, userID, positions, evaluatedAt.In(time.Local).Format("2006-01-02"))
+	peakErr := syncPositionExitPeaks(ctx, userID, positions, quotes, evaluatedAt)
 	created := 0
 	var errs []error
 	for _, p := range positions {
@@ -195,7 +195,7 @@ func (s *PositionExitAssessmentService) notifyAssessment(ctx context.Context, ro
 	message := truncateRunes(fmt.Sprintf("%s(%s) 风险等级 %s：%s。%s",
 		orSymbol(row.Name, row.Symbol), row.Symbol, row.Level, row.PrimaryReason, row.NextAction), 256)
 	hit := guardHit{
-		Symbol: row.Symbol, Market: row.Market, Name: orSymbol(row.Name, row.Symbol),
+		PositionID: row.PositionID, Symbol: row.Symbol, Market: row.Market, Name: orSymbol(row.Name, row.Symbol),
 		Kind: kind, Price: row.QuotePrice, Message: message,
 		Route: fmt.Sprintf("/positions?position_id=%d", row.PositionID), Priority: priority,
 	}
@@ -216,8 +216,58 @@ func effectivePositionExitTradeDate(fq FreshQuoteResult, now time.Time) string {
 	return effectiveQuoteTradeDate(fq, wall)
 }
 
-func completedPositionExitBars(rows []model.DailyBar, now time.Time, session string) ([]model.DailyBar, []string) {
-	today := now.In(time.Local).Format("2006-01-02")
+// syncPositionExitPeaks 按每笔 fresh 行情自己的观测交易日补峰值。周末/休市日不能
+// 用服务器墙上日期把上一交易日的 High 提前并入“历史”，否则后续 MA/ATR 与现价
+// 不再处于同一个 as-of。positions 是可变快照，补齐结果会写回供本轮评估使用。
+func syncPositionExitPeaks(
+	ctx context.Context,
+	userID int64,
+	positions []model.Position,
+	quotes map[string]FreshQuoteResult,
+	evaluatedAt time.Time,
+) error {
+	type peakGroup struct {
+		indices []int
+		rows    []model.Position
+	}
+	wallDate := evaluatedAt.In(time.Local).Format("2006-01-02")
+	groups := map[string]*peakGroup{}
+	for i, p := range positions {
+		fq, ok := quotes[QuoteKey(p.Market, p.Symbol)]
+		if !ok || fq.Quote == nil || fq.Quote.Price <= 0 || fq.Fresh.Status != freshStatusFresh {
+			continue
+		}
+		date := effectivePositionExitTradeDate(fq, evaluatedAt)
+		if date == "" {
+			date = wallDate
+		}
+		group := groups[date]
+		if group == nil {
+			group = &peakGroup{}
+			groups[date] = group
+		}
+		group.indices = append(group.indices, i)
+		group.rows = append(group.rows, p)
+	}
+	dates := make([]string, 0, len(groups))
+	for date := range groups {
+		dates = append(dates, date)
+	}
+	sort.Strings(dates)
+	var errs []error
+	for _, date := range dates {
+		group := groups[date]
+		if _, err := syncPositionPeaksBefore(ctx, userID, group.rows, date); err != nil {
+			errs = append(errs, fmt.Errorf("%s 峰值查询失败: %w", date, err))
+		}
+		for i, positionIndex := range group.indices {
+			positions[positionIndex] = group.rows[i]
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func completedPositionExitBars(rows []model.DailyBar, cutoffDate, session string) ([]model.DailyBar, []string) {
 	out := make([]model.DailyBar, 0, len(rows))
 	var gaps []string
 	lastDate := ""
@@ -227,10 +277,10 @@ func completedPositionExitBars(rows []model.DailyBar, now time.Time, session str
 			return nil, []string{"本地日线存在无效 OHLC 或日期乱序"}
 		}
 		lastDate = b.TradeDate
-		if session == model.PositionExitSessionIntraday && b.TradeDate >= today {
+		if session == model.PositionExitSessionIntraday && b.TradeDate >= cutoffDate {
 			continue
 		}
-		if session == model.PositionExitSessionClose && b.TradeDate > today {
+		if session == model.PositionExitSessionClose && b.TradeDate > cutoffDate {
 			continue
 		}
 		out = append(out, b)
@@ -297,7 +347,7 @@ func evaluatePositionExit(in positionExitInput, params positionExitParams) model
 		}
 	}
 
-	bars, barGaps := completedPositionExitBars(in.barRows, now, in.session)
+	bars, barGaps := completedPositionExitBars(in.barRows, tradeDate, in.session)
 	gaps = append(gaps, barGaps...)
 	if len(bars) > 0 {
 		row.BarsAsOf = bars[len(bars)-1].TradeDate
@@ -316,43 +366,11 @@ func evaluatePositionExit(in positionExitInput, params positionExitParams) model
 		reviewIDs = append(reviewIDs, r.ID)
 	}
 
-	if len(gaps) == 0 && quoteOK {
-		closes := make([]float64, 0, len(bars))
-		for _, b := range bars {
-			closes = append(closes, b.Close)
-		}
-		currentPrice := q.Price
-		var prevCloses []float64
-		var prevClose float64
-		if in.session == model.PositionExitSessionClose && bars[len(bars)-1].TradeDate == tradeDate {
-			currentPrice = bars[len(bars)-1].Close
-			prevCloses = closes[:len(closes)-1]
-			prevClose = bars[len(bars)-2].Close
-		} else {
-			prevCloses = closes
-			prevClose = bars[len(bars)-1].Close
-		}
-		row.MA20, _ = movingAverage(closes, params.MA20Period)
-		row.MA60, _ = movingAverage(closes, params.MA60Period)
-		prevMA20, ok20 := movingAverage(prevCloses, params.MA20Period)
-		prevMA60, ok60 := movingAverage(prevCloses, params.MA60Period)
-		ma20Cross := ok20 && prevClose >= prevMA20 && currentPrice < row.MA20
-		ma60Cross := ok60 && prevClose >= prevMA60 && currentPrice < row.MA60
-		if ma20Cross {
-			signals = append(signals, PositionExitSignal{Key: "ma20_break", Label: "刚跌破 MA20", Detail: fmt.Sprintf("现价 %.2f，MA20 %.2f", currentPrice, row.MA20), Severity: model.PositionExitLevelWatch, Value: currentPrice, Threshold: row.MA20, Crossing: true})
-		}
-		if ma60Cross {
-			signals = append(signals, PositionExitSignal{Key: "ma60_break", Label: "刚跌破 MA60", Detail: fmt.Sprintf("现价 %.2f，MA60 %.2f", currentPrice, row.MA60), Severity: model.PositionExitLevelReview, Value: currentPrice, Threshold: row.MA60, Crossing: true})
-		}
-		row.ATR14, _ = positionExitATR14(bars, params.ATRPeriod)
-		if p.PeakPrice > 0 && row.ATR14 > 0 {
-			row.ATRLine = round4(p.PeakPrice - params.ATRMultiplier*row.ATR14)
-			atrCross := prevClose >= row.ATRLine && currentPrice < row.ATRLine
-			if atrCross {
-				signals = append(signals, PositionExitSignal{Key: "atr14_break", Label: "首次跌破 ATR14 保护线", Detail: fmt.Sprintf("现价 %.2f，保护线 %.2f（峰值 - %.1f×ATR14）", currentPrice, row.ATRLine, params.ATRMultiplier), Severity: model.PositionExitLevelReview, Value: currentPrice, Threshold: row.ATRLine, Crossing: true})
-			}
-		}
-
+	// 评估按证据能力分层：fresh 行情可独立确认计划价和成本类硬事实；MA/ATR
+	// 只在已完成日线充分且有效时参与。旁路查询或技术数据不完整不能反向吞掉
+	// 已经明确触发的计划止损，但缺口仍会落库并把 DataStatus 标为 partial。
+	technicalReady := quoteOK && len(barGaps) == 0 && len(bars) >= params.MinBars
+	if quoteOK {
 		dayHigh, dayLow := q.Price, q.Price
 		if q.High > dayHigh {
 			dayHigh = q.High
@@ -415,6 +433,45 @@ func evaluatePositionExit(in positionExitInput, params positionExitParams) model
 			}
 			signals = append(signals, PositionExitSignal{Key: "sell_review:" + review.Trigger, Label: review.Title, Detail: review.Detail, Severity: severity})
 		}
+	}
+
+	row.Trend = "unknown"
+	if technicalReady {
+		closes := make([]float64, 0, len(bars))
+		for _, b := range bars {
+			closes = append(closes, b.Close)
+		}
+		currentPrice := q.Price
+		var prevCloses []float64
+		var prevClose float64
+		if in.session == model.PositionExitSessionClose && bars[len(bars)-1].TradeDate == tradeDate {
+			currentPrice = bars[len(bars)-1].Close
+			prevCloses = closes[:len(closes)-1]
+			prevClose = bars[len(bars)-2].Close
+		} else {
+			prevCloses = closes
+			prevClose = bars[len(bars)-1].Close
+		}
+		row.MA20, _ = movingAverage(closes, params.MA20Period)
+		row.MA60, _ = movingAverage(closes, params.MA60Period)
+		prevMA20, ok20 := movingAverage(prevCloses, params.MA20Period)
+		prevMA60, ok60 := movingAverage(prevCloses, params.MA60Period)
+		ma20Cross := ok20 && prevClose >= prevMA20 && currentPrice < row.MA20
+		ma60Cross := ok60 && prevClose >= prevMA60 && currentPrice < row.MA60
+		if ma20Cross {
+			signals = append(signals, PositionExitSignal{Key: "ma20_break", Label: "刚跌破 MA20", Detail: fmt.Sprintf("现价 %.2f，MA20 %.2f", currentPrice, row.MA20), Severity: model.PositionExitLevelWatch, Value: currentPrice, Threshold: row.MA20, Crossing: true})
+		}
+		if ma60Cross {
+			signals = append(signals, PositionExitSignal{Key: "ma60_break", Label: "刚跌破 MA60", Detail: fmt.Sprintf("现价 %.2f，MA60 %.2f", currentPrice, row.MA60), Severity: model.PositionExitLevelReview, Value: currentPrice, Threshold: row.MA60, Crossing: true})
+		}
+		row.ATR14, _ = positionExitATR14(bars, params.ATRPeriod)
+		if p.PeakPrice > 0 && row.ATR14 > 0 {
+			row.ATRLine = round4(p.PeakPrice - params.ATRMultiplier*row.ATR14)
+			atrCross := prevClose >= row.ATRLine && currentPrice < row.ATRLine
+			if atrCross {
+				signals = append(signals, PositionExitSignal{Key: "atr14_break", Label: "首次跌破 ATR14 保护线", Detail: fmt.Sprintf("现价 %.2f，保护线 %.2f（峰值 - %.1f×ATR14）", currentPrice, row.ATRLine, params.ATRMultiplier), Severity: model.PositionExitLevelReview, Value: currentPrice, Threshold: row.ATRLine, Crossing: true})
+			}
+		}
 		row.Trend = "intact"
 		if currentPrice < row.MA20 {
 			row.Trend = "weak"
@@ -422,8 +479,14 @@ func evaluatePositionExit(in positionExitInput, params positionExitParams) model
 		if currentPrice < row.MA60 || row.MA20 < row.MA60 {
 			row.Trend = "broken"
 		}
+	}
+
+	if quoteOK && (len(signals) > 0 || len(gaps) == 0) {
 		row.Level, row.PrimarySignal = positionExitLevel(signals, row.Trend)
 		row.DataStatus = model.PositionExitDataReady
+		if len(gaps) > 0 {
+			row.DataStatus = model.PositionExitDataPartial
+		}
 		row.ShouldTodo = row.Level == model.PositionExitLevelReview || row.Level == model.PositionExitLevelUrgent
 		for _, signal := range signals {
 			evidence = append(evidence, signal.Label+"："+signal.Detail)
@@ -436,10 +499,14 @@ func evaluatePositionExit(in positionExitInput, params positionExitParams) model
 		}
 		row.NextAction = positionExitNextAction(row.Level)
 	} else {
-		row.Trend = "unknown"
 		row.PrimarySignal = "data_gap"
 		row.PrimaryReason = strings.Join(uniqueStrings(gaps), "；")
-		row.NextAction = "补齐 fresh 行情和已完成日线后再判断；当前不要据此执行卖出。"
+		if quoteOK {
+			row.DataStatus = model.PositionExitDataPartial
+			row.NextAction = "当前可用事实未触发中高风险；补齐缺失数据后再完成判断。"
+		} else {
+			row.NextAction = "补齐 fresh 行情后再判断；当前不要据此执行卖出。"
+		}
 	}
 
 	row.SignalsJSON = mustPositionExitJSON(signals)

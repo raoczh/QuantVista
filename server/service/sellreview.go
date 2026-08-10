@@ -20,9 +20,9 @@ import (
 //   - guard 与 SellReview 继续分别保存事件推送台账和逐持仓复核事实；
 //   - PositionExitAssessment 聚合这些事实，统一决定持仓页、Today 与卖出风险推送。
 //
-// 两者的去重维度也不同：guard 按 (user, symbol, kind, 事件日) —— 同一标的多笔持仓
-// 只推一次；SellReview 按 (user, **position**, trigger, 事件日) —— 每一笔持仓各自
-// 需要复核（成本不同，同一个利空对不同成本的仓位含义完全不同）。
+// 两者的去重维度也不同：普通 guard 事件按 (user, 0, symbol, kind, 事件日)，逐笔统一
+// 风险通知按 (user, position, symbol, kind, 事件日)；SellReview 按
+// (user, **position**, trigger, 事件日) 管复核事实。成本不同的多笔仓位不能互相吞通知。
 //
 // 原始 SellReview 不再直接进入 Today 或推送；它只保留审计与人工状态机语义。
 // review/urgent 的待办与推送必须消费同一条 PositionExitAssessment 事实。
