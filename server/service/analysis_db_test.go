@@ -1,6 +1,7 @@
 package service
 
 import (
+	"sync"
 	"testing"
 
 	"quantvista/common"
@@ -10,17 +11,26 @@ import (
 	"gorm.io/gorm"
 )
 
-// setupTestDB 用内存 SQLite 建库并迁移，供需要落库的测试使用。
+var (
+	sharedTestDB     *gorm.DB
+	sharedTestDBErr  error
+	sharedTestDBOnce sync.Once
+)
+
+// setupTestDB 复用同一个内存 SQLite。service 测试本来就通过 cache=shared 共用数据，
+// 单进程只执行一次全模型迁移可避免数百个用例重复 AutoMigrate。
 func setupTestDB(t *testing.T) {
 	t.Helper()
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("打开内存库失败: %v", err)
+	sharedTestDBOnce.Do(func() {
+		sharedTestDB, sharedTestDBErr = gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+		if sharedTestDBErr == nil {
+			sharedTestDBErr = sharedTestDB.AutoMigrate(model.AllModels()...)
+		}
+	})
+	if sharedTestDBErr != nil {
+		t.Fatalf("初始化共享内存库失败: %v", sharedTestDBErr)
 	}
-	if err := db.AutoMigrate(model.AllModels()...); err != nil {
-		t.Fatalf("迁移失败: %v", err)
-	}
-	common.DB = db
+	common.DB = sharedTestDB
 }
 
 // TestAnalysisHistoryAndGet 验证 History 的显式选列列名正确、Get 能取回详情、Delete 生效。

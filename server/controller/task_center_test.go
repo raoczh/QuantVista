@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -85,6 +86,19 @@ type taskCenterJobsStub struct {
 	events   []service.JobEventView
 }
 
+type heartbeatCancelRecorder struct {
+	*httptest.ResponseRecorder
+	cancel context.CancelFunc
+}
+
+func (r *heartbeatCancelRecorder) Write(p []byte) (int, error) {
+	n, err := r.ResponseRecorder.Write(p)
+	if bytes.Contains(p, []byte(": heartbeat\n\n")) {
+		r.cancel()
+	}
+	return n, err
+}
+
 func (s *taskCenterJobsStub) GetJob(userID, id int64) (*service.JobRunView, error) {
 	return &service.JobRunView{ID: id, Kind: service.JobKindQA, Status: model.JobStatusRunning}, nil
 }
@@ -113,11 +127,12 @@ func TestTaskCenterEventStreamResumesAndHeartbeats(t *testing.T) {
 	stub := &taskCenterJobsStub{events: []service.JobEventView{{
 		ID: 9, JobRunID: 3, Type: "status", Status: model.JobStatusSuccess, CreatedAt: time.Now(),
 	}}}
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
 	base := httptest.NewRequest("GET", "/api/tasks/events", nil)
 	base.Header.Set("Last-Event-ID", "8")
-	ctx, cancel := context.WithCancel(base.Context())
+	ctx, cancel := context.WithTimeout(base.Context(), time.Second)
+	defer cancel()
+	w := &heartbeatCancelRecorder{ResponseRecorder: httptest.NewRecorder(), cancel: cancel}
+	c, _ := gin.CreateTestContext(w)
 	c.Request = base.WithContext(ctx)
 	c.Set("uid", int64(7))
 	c.Set("role", model.RoleUser)
@@ -129,7 +144,6 @@ func TestTaskCenterEventStreamResumesAndHeartbeats(t *testing.T) {
 		taskEventPollInterval = oldPoll
 		taskEventHeartbeatInterval = oldHeartbeat
 	})
-	time.AfterFunc(100*time.Millisecond, cancel)
 	NewTaskCenterController(stub).Events(c)
 
 	body := w.Body.String()

@@ -57,12 +57,16 @@ func newOnboardingProgress(userID int64, version, run int) model.OnboardingProgr
 	}
 }
 
-func seededOnboardingProgress(tx *gorm.DB, userID int64, version, run int) model.OnboardingProgress {
+func seededOnboardingProgress(tx *gorm.DB, userID int64, version, run int) (model.OnboardingProgress, error) {
 	now := time.Now()
 	progress := newOnboardingProgress(userID, version, run)
 	// 兼容功能上线前已经明确完成/跳过三问的用户；数据库默认值不参与判断。
 	var preference model.UserPreference
-	if err := tx.Where("user_id = ?", userID).First(&preference).Error; err == nil && preference.InvestmentGuideVersion > 0 {
+	err := tx.Where("user_id = ?", userID).First(&preference).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return progress, err
+	}
+	if err == nil && preference.InvestmentGuideVersion > 0 {
 		switch preference.InvestmentGuideStatus {
 		case InvestmentGuideCompleted:
 			progress.PreferenceStatus, progress.PreferenceAt = model.OnboardingStepCompleted, &now
@@ -72,12 +76,16 @@ func seededOnboardingProgress(tx *gorm.DB, userID int64, version, run int) model
 	}
 	// 只依据真实业务行恢复第二步，不从偏好或默认字段猜测。
 	var watchCount, positionCount int64
-	_ = tx.Model(&model.WatchlistItem{}).Where("user_id = ?", userID).Count(&watchCount).Error
-	_ = tx.Model(&model.Position{}).Where("user_id = ?", userID).Count(&positionCount).Error
+	if err := tx.Model(&model.WatchlistItem{}).Where("user_id = ?", userID).Count(&watchCount).Error; err != nil {
+		return progress, err
+	}
+	if err := tx.Model(&model.Position{}).Where("user_id = ?", userID).Count(&positionCount).Error; err != nil {
+		return progress, err
+	}
 	if watchCount > 0 || positionCount > 0 {
 		progress.PortfolioStatus, progress.PortfolioAt = model.OnboardingStepCompleted, &now
 	}
-	return progress
+	return progress, nil
 }
 
 func currentOnboardingProgressTx(tx *gorm.DB, userID int64, version int, create bool) (*model.OnboardingProgress, error) {
@@ -95,7 +103,10 @@ func currentOnboardingProgressTx(tx *gorm.DB, userID int64, version int, create 
 	if !create {
 		return nil, errors.New("引导进度不存在")
 	}
-	progress = seededOnboardingProgress(tx, userID, version, 1)
+	progress, err = seededOnboardingProgress(tx, userID, version, 1)
+	if err != nil {
+		return nil, err
+	}
 	created := tx.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "user_id"}, {Name: "version"}, {Name: "run"}}, DoNothing: true,
 	}).Create(&progress)

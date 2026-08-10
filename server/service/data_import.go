@@ -858,7 +858,17 @@ func (s *DataImportService) normalizeTradePreview(userID int64, cells []string, 
 			_ = common.DB.Where("user_id = ? AND position_id = ?", userID, p.ID).Order("trade_date DESC, id DESC").First(&last).Error
 			state = &importPreviewState{Position: p, Ledger: ledgerFromPosition(&p), LastTradeDate: last.TradeDate, DependencyHash: dep}
 			states[key] = state
-			states[p.Market+":"+p.Symbol] = state
+			// 只有该标的恰好一笔在持仓位时，才允许后续未填 position_id 的行复用它。
+			// 多笔持仓下不能让前一行显式指定的 ID 替后续行消除歧义。
+			var holdingCount int64
+			if err := common.DB.Model(&model.Position{}).
+				Where("user_id = ? AND market = ? AND symbol = ? AND status = ?", userID, p.Market, p.Symbol, model.PositionStatusHolding).
+				Count(&holdingCount).Error; err != nil {
+				return n, "database_error", "检查同标的持仓失败"
+			}
+			if holdingCount == 1 {
+				states[p.Market+":"+p.Symbol] = state
+			}
 		}
 		if state.ClosedInBatch {
 			return n, "ledger_conflict", "指定持仓已被本批前序流水全部卖出，不能用同一持仓 ID 重新买入"
@@ -1295,15 +1305,31 @@ func (s *DataImportService) Rollback(userID int64, batchID string) (*ImportRollb
 	if err := common.DB.Where("batch_id = ? AND user_id = ?", batchID, userID).Order("id ASC").Find(&effects).Error; err != nil {
 		return nil, err
 	}
-	if len(effects) < batch.TotalRows {
-		return nil, errors.New("回滚审计事实不完整，已拒绝自动回滚")
-	}
-	var claimCount int64
-	if err := common.DB.Model(&model.ImportRowClaim{}).Where("batch_id = ? AND user_id = ?", batchID, userID).Count(&claimCount).Error; err != nil {
+	var claims []model.ImportRowClaim
+	if err := common.DB.Where("batch_id = ? AND user_id = ?", batchID, userID).Order("row_number ASC").Find(&claims).Error; err != nil {
 		return nil, err
 	}
-	if claimCount != int64(batch.TotalRows) {
+	if len(claims) != batch.TotalRows {
 		return nil, errors.New("回滚幂等事实不完整，已拒绝自动回滚")
+	}
+	claimRows := make(map[int]struct{}, len(claims))
+	for _, claim := range claims {
+		if _, exists := claimRows[claim.RowNumber]; exists {
+			return nil, errors.New("回滚幂等事实不完整，已拒绝自动回滚")
+		}
+		claimRows[claim.RowNumber] = struct{}{}
+	}
+	effectRows := make(map[int]struct{}, len(effects))
+	for _, effect := range effects {
+		if _, claimed := claimRows[effect.RowNumber]; !claimed {
+			return nil, errors.New("回滚审计事实不完整，已拒绝自动回滚")
+		}
+		effectRows[effect.RowNumber] = struct{}{}
+	}
+	for rowNumber := range claimRows {
+		if _, exists := effectRows[rowNumber]; !exists {
+			return nil, errors.New("回滚审计事实不完整，已拒绝自动回滚")
+		}
 	}
 	var err error
 	result.Conflicts, err = s.rollbackConflicts(common.DB, userID, effects, false)

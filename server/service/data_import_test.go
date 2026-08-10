@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -309,6 +310,36 @@ func TestDataImportTradeReopensAsNewLedgerAndRollsBack(t *testing.T) {
 	}
 }
 
+func TestDataImportTradeExplicitPositionDoesNotHideLaterAmbiguity(t *testing.T) {
+	resetImportTestData(t)
+	positions := []model.Position{
+		{UserID: 1, Symbol: "600012", Market: "cn", Name: "同标的一", PositionType: model.PositionTypeLongTerm, Status: model.PositionStatusHolding, Currency: "CNY", BuyPrice: 10, BuyDate: "2026-07-01", Quantity: 100, TotalBuyCost: 1000, TotalBuyQty: 100, RemainingCost: 1000},
+		{UserID: 1, Symbol: "600012", Market: "cn", Name: "同标的二", PositionType: model.PositionTypeLongTerm, Status: model.PositionStatusHolding, Currency: "CNY", BuyPrice: 12, BuyDate: "2026-07-02", Quantity: 100, TotalBuyCost: 1200, TotalBuyQty: 100, RemainingCost: 1200},
+	}
+	for i := range positions {
+		if err := common.DB.Create(&positions[i]).Error; err != nil {
+			t.Fatal(err)
+		}
+		initial := buildInitialTrade(&positions[i])
+		if err := common.DB.Create(&initial).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	svc := NewDataImportService()
+	csvText := "position_id,symbol,market,side,quantity,price,trade_date\n" +
+		fmt.Sprintf("%d,600012,cn,buy,10,11,2026-07-03\n", positions[0].ID) +
+		",600012,cn,sell,10,13,2026-07-04\n"
+	uploaded, err := svc.Upload(1, model.ImportKindTrade, "ambiguous.csv", strings.NewReader(csvText))
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview := previewWithSuggestions(t, svc, 1, uploaded, 0)
+	if preview.ValidRows != 1 || preview.ConflictRows != 1 || preview.Rows[1].ErrorCode != "ambiguous_position" {
+		t.Fatalf("显式持仓 ID 不得替后续未指定行消除歧义: %+v", preview.Rows)
+	}
+}
+
 func TestDataImportTradeEditBlocksRollback(t *testing.T) {
 	resetImportTestData(t)
 	position := model.Position{UserID: 1, Symbol: "000004", Market: "cn", Name: "测试", PositionType: model.PositionTypeLongTerm, Status: model.PositionStatusHolding, Currency: "CNY", BuyPrice: 10, BuyDate: "2026-07-01", Quantity: 100, TotalBuyCost: 1000, TotalBuyQty: 100, RemainingCost: 1000}
@@ -372,6 +403,41 @@ func TestDataImportIncompleteAuditBlocksRollback(t *testing.T) {
 	common.DB.Model(&model.Position{}).Where("user_id = ? AND symbol = ?", 1, "600011").Count(&count)
 	if count != 1 {
 		t.Fatalf("拒绝回滚不得删除业务数据，得到 %d", count)
+	}
+}
+
+func TestDataImportRollbackRequiresEffectForEveryClaimedRow(t *testing.T) {
+	resetImportTestData(t)
+	svc := NewDataImportService()
+	uploaded, err := svc.Upload(1, model.ImportKindPosition, "audit-row-gap.csv", strings.NewReader(
+		"symbol,price,quantity,trade_date\n600013,10,100,2026-08-01\n600014,11,100,2026-08-01\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview := previewWithSuggestions(t, svc, 1, uploaded, 0)
+	confirmed, err := svc.Confirm(context.Background(), 1, preview.ID, ImportConfirmInput{Version: preview.Version})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secondClaim model.ImportRowClaim
+	if err := common.DB.Where("batch_id = ? AND user_id = ?", confirmed.ID, 1).Order("row_number DESC").First(&secondClaim).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := common.DB.Where("batch_id = ? AND user_id = ? AND row_number = ?", confirmed.ID, 1, secondClaim.RowNumber).Delete(&model.ImportEffect{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	var remainingEffects int64
+	common.DB.Model(&model.ImportEffect{}).Where("batch_id = ? AND user_id = ?", confirmed.ID, 1).Count(&remainingEffects)
+	if remainingEffects < int64(confirmed.TotalRows) {
+		t.Fatalf("用例必须覆盖旧的总数校验盲区，剩余效果=%d 总行数=%d", remainingEffects, confirmed.TotalRows)
+	}
+	if _, err := svc.Rollback(1, confirmed.ID); err == nil || !strings.Contains(err.Error(), "审计事实不完整") {
+		t.Fatalf("任一已声明行缺少效果事实时必须拒绝回滚: %v", err)
+	}
+	var positionCount int64
+	common.DB.Model(&model.Position{}).Where("user_id = ? AND symbol IN ?", 1, []string{"600013", "600014"}).Count(&positionCount)
+	if positionCount != 2 {
+		t.Fatalf("拒绝回滚不得产生部分删除，剩余持仓=%d", positionCount)
 	}
 }
 

@@ -870,7 +870,8 @@ func flushAlertNotification(sourceCtx context.Context, notifier alertNotifier, u
 func (s *AlertService) EvaluateUser(ctx context.Context, userID int64) (int, error) {
 	onboardingRuleID, err := activeOnboardingAlertRule(userID)
 	if err != nil {
-		return 0, errors.New("提醒检查准备失败，请重试")
+		common.SysWarn("提醒检查读取引导进度失败 user=%d: %v", userID, err)
+		onboardingRuleID = 0
 	}
 	hits, err := s.evaluateUserMarket(ctx, userID)
 	if err != nil {
@@ -882,7 +883,7 @@ func (s *AlertService) EvaluateUser(ctx context.Context, userID int64) (int, err
 	}
 	hits += earnHits
 	if err := completeOnboardingAlertTest(userID, onboardingRuleID); err != nil {
-		return hits, errors.New("提醒检查已完成，但引导进度保存失败，请重试")
+		common.SysWarn("提醒检查完成后保存引导进度失败 user=%d rule=%d: %v", userID, onboardingRuleID, err)
 	}
 	return hits, nil
 }

@@ -126,6 +126,11 @@ func TestNewsInsertFailNoRegister(t *testing.T) {
 	if err := common.DB.Migrator().DropTable(&model.News{}); err != nil {
 		t.Fatalf("drop news: %v", err)
 	}
+	t.Cleanup(func() {
+		if err := common.DB.AutoMigrate(&model.News{}); err != nil {
+			t.Errorf("restore news: %v", err)
+		}
+	})
 	if s.dedupeSeen("cls", "2", "标题乙事件") {
 		t.Fatal("新条目不应判重")
 	}
