@@ -549,6 +549,10 @@ func importIssueStatus(code string) string {
 
 func positionImportFingerprint(p model.Position) string {
 	p.CreatedAt, p.UpdatedAt = time.Time{}, time.Time{}
+	// 峰值三列由 16:25 盘后任务自动抬升，不是账本语义：留在指纹里会让“导入后任一
+	// 交易日创新高”的持仓永久不可回滚，且把系统后台写入误归因为“后续交易或人工
+	// 编辑”。回滚后峰值可由盘后任务重建，剔除无损。
+	p.PeakPrice, p.PeakDate, p.PeakBackfilled = 0, "", false
 	b, _ := json.Marshal(p)
 	return hashBytes(b)
 }

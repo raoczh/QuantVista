@@ -2770,12 +2770,58 @@ func compactForLLM(recType string, cands []candidate) []map[string]any {
 
 // compactScoreBlindForLLM 保持调用方已用 seed 固化的顺序；只保留真实原始事实，
 // 明确不投影 score/rank/score_dims/bonus/strategy_notes。
+// sb2 追加净化：discovery 记忆携带同一评分体系的 best_score(0-100) 与名次/变化量，
+// 通道名与 daily/recent_discovery 来源标签携带「量化扫描器选中」语义——盲化不彻底
+// 实验即作废，这里只保留“何时出现过、连续几天”的时序事实。
 func compactScoreBlindForLLM(recType string, cands []candidate) []map[string]any {
 	rows := make([]map[string]any, 0, len(cands))
 	for _, c := range cands {
-		rows = append(rows, compactRawCandidateForLLM(c))
+		row := compactRawCandidateForLLM(c)
+		row["sources"] = scoreBlindSources(c.Sources)
+		if c.Discovery != nil {
+			row["discovery_history"] = scoreBlindDiscoverySummary(c.Discovery)
+		}
+		rows = append(rows, row)
 	}
 	return rows
+}
+
+// scoreBlindSources 把发现来源替换为中性 daily_scan（去掉今日/近日与通道语义）；
+// 其余真实来源（榜单/自选/策略信号）维持 sb1 既有边界不变。
+func scoreBlindSources(sources []string) []string {
+	out := make([]string, 0, len(sources))
+	replaced := false
+	for _, s := range sources {
+		if s == "daily_discovery" || s == "recent_discovery" {
+			if !replaced {
+				replaced = true
+				out = append(out, "daily_scan")
+			}
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// scoreBlindDiscoverySummary 只保留时序事实：出现日期与连续性；分数、名次、
+// 变化量与通道全部剥除。
+func scoreBlindDiscoverySummary(d *CandidateDiscoverySummary) map[string]any {
+	out := map[string]any{
+		"first_seen_date": d.FirstSeenDate, "last_seen_date": d.LastSeenDate,
+		"seen_days_5d": d.SeenDays5D, "consecutive_days": d.ConsecutiveDays,
+	}
+	if d.DataStatus != "" {
+		out["data_status"] = d.DataStatus
+	}
+	dates := make([]string, 0, len(d.Days))
+	for _, day := range d.Days {
+		dates = append(dates, day.TradeDate)
+	}
+	if len(dates) > 0 {
+		out["seen_dates"] = dates
+	}
+	return out
 }
 
 // composeBatchTitle 用筛选条件组合生成批次标题（落库固化，历史列表稳定展示）。

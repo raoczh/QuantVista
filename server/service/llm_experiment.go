@@ -62,7 +62,10 @@ const (
 	llmExperimentPickSchemaVersion = "ep1"
 	// scoreBlindInputSchemaVersion 是 recommendation 输入剥锚契约。字段、提示词净化
 	// 或顺序/hash 语义变化时必须递增；输出逐标的事实仍复用 ep1。
-	scoreBlindInputSchemaVersion = "sb1"
+	// sb2：discovery_history 剥除 best_score/best_rank/变化量/通道，sources 的
+	// daily/recent_discovery 中性化为 daily_scan——sb1 经 4b667df 引入 discovery
+	// 记忆后盲化已不彻底（泄漏同评分体系数值），sb1 样本不得与 sb2 混算。
+	scoreBlindInputSchemaVersion = "sb2"
 	// 上游推荐任务 deadline 为 6 分钟；超过此窗口的 running 占位视为进程中断遗留，
 	// 新采样可清理，避免永久占满实验 target。
 	llmExperimentRunClaimTTL = 15 * time.Minute

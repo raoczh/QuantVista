@@ -265,6 +265,15 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 	}
 
 	matched := 0
+	adviceIDs := make([]int64, 0, len(views))
+	for _, v := range views {
+		adviceIDs = append(adviceIDs, v.ID)
+	}
+	pendingAdjust, pendingAdjustErr := positionsWithUnconfirmedShareAction(
+		ctx, userID, adviceIDs, time.Now().In(time.Local).Format("2006-01-02"))
+	if pendingAdjustErr != nil {
+		return nil, fmt.Errorf("除权折算状态查询失败: %w", pendingAdjustErr)
+	}
 	rows := make([]positionAdviceRow, 0, len(views))
 	for _, v := range views {
 		if req.PositionID > 0 && v.ID != req.PositionID {
@@ -277,6 +286,13 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 		if !v.QuoteOK {
 			// fail-closed：没有当前有效行情就不给这一笔出结论（旧价上的割/守/补有害）。
 			res.Skipped++
+			continue
+		}
+		if pendingAdjust[v.ID] {
+			// fail-closed：除权折算未确认时成本/盈亏是旧口径，喂给 LLM 会得出
+			// “-50% 赶紧清仓”式的错误建议；先要求用户在持仓页确认折算。
+			res.Skipped++
+			res.Notes = append(res.Notes, fmt.Sprintf("%s 存在未确认的除权折算，已跳过；请先在持仓页确认后再获取建议", orSymbol(v.Name, v.Symbol)))
 			continue
 		}
 		row := positionAdviceRow{

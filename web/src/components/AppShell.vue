@@ -20,7 +20,7 @@ import { useAppStore } from '@/stores/app'
 import { useThemeStore } from '@/stores/theme'
 import { useAuthStore } from '@/stores/auth'
 import { getOverview } from '@/api/market'
-import { getTodos } from '@/api/todo'
+import { getTodoInbox } from '@/api/todo'
 import { useUi, withAlpha } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import { setMarketTitle } from '@/lib/pageTitle'
@@ -56,10 +56,10 @@ const todoBadgeText = computed(() => {
 
 async function refreshTodoCount() {
   try {
-    // 不传 scope = 默认 ledger（D18）：徽标只数「与我的账本有关」的条目，
-    // 与点进去的今日待办默认视图**同口径**。别改成 all——徽标 12 条、
-    // 点进去只有 3 条会让用户以为丢了东西。
-    const result = await getTodos()
+    // 徽标与今日待办默认首屏**同口径**（all + needs_action）：徽标 12 条、
+    // 点进去只有 3 条会让用户以为丢了东西，反过来漏计 research 侧的失败任务
+    // 也会让该处理的事悄悄积压。改口径前先改 Today.vue 的默认筛选。
+    const result = await getTodoInbox({ scope: 'all', status: 'needs_action' })
     todoCount.value = result.total
     todoIncomplete.value = !result.complete
   } catch {

@@ -19,6 +19,11 @@ import (
 func resetTaskCenterTestDB(t *testing.T) {
 	t.Helper()
 	setupTestDB(t)
+	// stale 清扫按用户 1 分钟节流；测试间共享进程内状态，先复位才能断言本次
+	// List 确实触发了收敛。
+	staleSweepMu.Lock()
+	staleSweepAt = map[int64]time.Time{}
+	staleSweepMu.Unlock()
 	for _, table := range []string{
 		"job_events", "job_steps", "llm_tasks", "job_runs", "analysis_records",
 		"recommendation_batches", "daily_reports", "data_sync_logs",

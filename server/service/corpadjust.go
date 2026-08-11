@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -164,6 +165,29 @@ func positionSellOnOrAfterAction(trades []model.PositionTrade, action model.Corp
 		}
 	}
 	return false
+}
+
+// positionsWithUnconfirmedShareAction 返回给定持仓中「除权日已到、含送转、用户尚未
+// 确认折算」的持仓 ID 集合。B8 纪律是程序绝不静默改账；确认之前持仓成本/峰值仍是
+// 除权前口径，而行情已是除权后价格——任何基于成本/峰值/计划价的提醒与建议此时都是
+// 假信号（10 转 10 会凭空显示 -50%），评估链路必须先跳过并引导用户确认折算。
+// 查询失败时返回错误，由调用方决定按数据缺口降级还是保持原行为。
+func positionsWithUnconfirmedShareAction(ctx context.Context, userID int64, positionIDs []int64, tradeDate string) (map[int64]bool, error) {
+	out := map[int64]bool{}
+	if common.DB == nil || len(positionIDs) == 0 || tradeDate == "" {
+		return out, nil
+	}
+	var rows []model.PositionCorpAdjust
+	if err := common.DB.WithContext(ctx).Select("position_id").Where(
+		"user_id = ? AND position_id IN ? AND status IN ? AND ex_date <= ? AND (bonus_ratio > 0 OR transfer_ratio > 0)",
+		userID, positionIDs, []string{model.CorpAdjustPending, model.CorpAdjustReverted}, tradeDate,
+	).Find(&rows).Error; err != nil {
+		return out, err
+	}
+	for _, row := range rows {
+		out[row.PositionID] = true
+	}
+	return out, nil
 }
 
 // ensurePositionShareActionsProcessedTx 是加减仓的前向时序闸门。送转必须发生在除权日
@@ -388,9 +412,10 @@ func GenerateCorpAdjusts(userID int64, asOf string) (int, error) {
 					writeErrs = append(writeErrs, fmt.Errorf("刷新 pos=%d action=%d 建议: %w", p.ID, a.ID, e))
 				}
 			}
-			if manualReview {
-				writeErrs = append(writeErrs, fmt.Errorf("pos=%d action=%d: %s", p.ID, a.ID, reviewReason))
-			}
+			// manualReview 是正常业务态（已平仓含送转、除权后已卖出等，可长期存在），
+			// 事实已落在行上的 manual_review/review_reason 供持仓页展示。不能进
+			// writeErrs：那会让今日待办每天误报「除权除息调整读取失败、数据不完整」，
+			// 并把真实写入错误淹没在告警噪音里。
 		}
 	}
 	return created, errors.Join(writeErrs...)

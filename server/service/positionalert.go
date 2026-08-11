@@ -220,6 +220,18 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 		return 0, err
 	}
 
+	// 未确认的除权折算（B8）：成本/峰值是旧口径、行情是新口径，本轮跳过这些持仓
+	// 的成本/峰值类规则，防止 10 转 10 当日凭空 -50% 的假止损推送。查询失败按原
+	// 行为继续（罕见 DB 错误不应吞掉真实触发），只记警告。
+	alertPositionIDs := make([]int64, 0, len(positions))
+	for _, p := range positions {
+		alertPositionIDs = append(alertPositionIDs, p.ID)
+	}
+	pendingAdjust, pendingAdjustErr := positionsWithUnconfirmedShareAction(ctx, userID, alertPositionIDs, wallDate)
+	if pendingAdjustErr != nil {
+		common.SysWarn("持仓提醒除权折算状态查询失败 user=%d: %v", userID, pendingAdjustErr)
+	}
+
 	hits := 0
 	for _, rule := range rules {
 		if err := ctx.Err(); err != nil {
@@ -240,6 +252,9 @@ func (s *AlertService) evaluatePositionRules(ctx context.Context, userID int64, 
 			tradeDate := effectiveQuoteTradeDate(fq, wallDate)
 			if p.PeakFrom != "" && p.PeakFrom > tradeDate {
 				continue // 最近有效行情早于建仓/加仓起算日，不能拿持仓前行情做判断
+			}
+			if pendingAdjust[p.ID] {
+				continue // 除权折算未确认，成本/峰值口径与行情不一致，先不评这一笔
 			}
 			if tradeDate > ruleCheckDate {
 				ruleCheckDate = tradeDate

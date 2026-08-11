@@ -19,12 +19,13 @@ const (
 )
 
 type auditSeedSymbol struct {
-	symbol    string
-	name      string
-	close     float64
-	amount    float64
-	isST      bool
-	suspended bool
+	symbol     string
+	name       string
+	close      float64
+	amount     float64
+	isST       bool
+	suspended  bool
+	skipFactor bool
 }
 
 func cleanCandidateAuditFixture(t *testing.T) {
@@ -89,6 +90,7 @@ func seedCandidateAuditFixture(t *testing.T) (shortBatch, longBatch model.Recomm
 		{symbol: "600110", name: "停牌排除", close: 10.8, amount: 8e7, suspended: true},
 		{symbol: "600111", name: "低流动性", close: 10.8, amount: 1e7},
 		{symbol: "600112", name: "一字涨停", close: 11, amount: 8e7},
+		{symbol: "600113", name: "因子缺口龙头", close: 10.6, amount: 8e7, skipFactor: true},
 	}
 	var universes []model.StockUniverseDaily
 	var factors []model.FactorSnapshotDaily
@@ -99,9 +101,11 @@ func seedCandidateAuditFixture(t *testing.T) (shortBatch, longBatch model.Recomm
 				Market: "cn", Name: symbol.name, IsST: symbol.isST, Suspended: symbol.suspended,
 				Close: 10, PrevClose: 10, Amount: symbol.amount, TurnoverRate: 3})
 		}
-		factors = append(factors, model.FactorSnapshotDaily{TradeDate: auditSignalDate, Symbol: symbol.symbol,
-			Market: "cn", Name: symbol.name, LastBarDate: auditSignalDate, FactorsJSON: `{}`,
-			FactorVersion: factorSnapshotVersion})
+		if !symbol.skipFactor {
+			factors = append(factors, model.FactorSnapshotDaily{TradeDate: auditSignalDate, Symbol: symbol.symbol,
+				Market: "cn", Name: symbol.name, LastBarDate: auditSignalDate, FactorsJSON: `{}`,
+				FactorVersion: factorSnapshotVersion})
+		}
 		bars = append(bars, model.DailyBar{Symbol: symbol.symbol, Market: "cn", TradeDate: auditSignalDate,
 			Open: 10, High: 10.1, Low: 9.9, Close: 10, Volume: 1e6, Amount: symbol.amount})
 		outOpen, outHigh, outLow := 10.0, symbol.close+0.1, symbol.close-0.1
@@ -123,6 +127,9 @@ func seedCandidateAuditFixture(t *testing.T) (shortBatch, longBatch model.Recomm
 
 	var discoveryItems []model.CandidateDiscoveryItem
 	for i, symbol := range symbols[1:] {
+		if symbol.skipFactor {
+			continue
+		}
 		discoveryItems = append(discoveryItems, model.CandidateDiscoveryItem{RunID: discoveryRuns[0].ID,
 			TradeDate: auditSignalDate, Market: "cn", DiscoveryVersion: DiscoveryVersion,
 			Channel: "momentum_breakout", Symbol: symbol.symbol, Name: symbol.name, Rank: i + 1,
@@ -240,7 +247,7 @@ func TestCandidateAuditEndToEndIdempotentPITIsolationAndConclusions(t *testing.T
 	}
 	wantReasons := map[string]string{"600101": "not_discovered_marketwide", "600102": "discovered_not_in_user_pool",
 		"600103": "user_price_filter", "600104": "pool_capacity", "600105": "quant_rank_below_cutoff",
-		"600106": "llm_rejected_recorded"}
+		"600106": "llm_rejected_recorded", "600113": "signal_factor_snapshot_missing"}
 	for symbol, want := range wantReasons {
 		if reasons[symbol] != want {
 			t.Fatalf("%s 主原因 want=%s got=%s all=%v", symbol, want, reasons[symbol], reasons)
@@ -257,6 +264,13 @@ func TestCandidateAuditEndToEndIdempotentPITIsolationAndConclusions(t *testing.T
 	}
 	if shortBad.ConclusionCode != "false_positive_next_day" || longBad.ConclusionCode != "early_adverse_observation" {
 		t.Fatalf("short/long 结论不得混用: short=%s long=%s", shortBad.ConclusionCode, longBad.ConclusionCode)
+	}
+	if runs[0].FalsePositiveCount != 1 {
+		t.Fatalf("运行级假阳性只能统计短线次日假阳性，得到 %d", runs[0].FalsePositiveCount)
+	}
+	if _, err := ExecuteCandidateAudit(context.Background(), nil, runs[0].ID+999, req); err == nil ||
+		!strings.Contains(err.Error(), "结果引用错配") {
+		t.Fatalf("结果引用错配必须在复用或重置审计事实前拒绝: %v", err)
 	}
 
 	beforeHash := runs[0].ContentHash
@@ -276,6 +290,49 @@ func TestCandidateAuditEndToEndIdempotentPITIsolationAndConclusions(t *testing.T
 }
 
 func TestCandidateAuditReasonStagesUnknownAndSampleDiscipline(t *testing.T) {
+	params := candidateAuditParams()
+	if params.DiscoveryParameterHash == "" || params.DiscoveryParameterHash != discoveryParameterHash() {
+		t.Fatalf("审计身份必须绑定当前发现参数 hash: %+v", params)
+	}
+	if !isSystemDurableJobKind(JobKindCandidateAudit) || dataSyncTaskTitle(JobKindCandidateAudit) != "每日候选审计" {
+		t.Fatal("候选审计必须登记为可恢复、可重跑且可识别的系统任务")
+	}
+	// partial 语义：空运行（未封存明细）可补跑重算；已封存明细的 partial 与
+	// success 一样是 PIT 终态，不得因数据订正重写历史观测。
+	cleanCandidateAuditFixture(t)
+	finished := time.Now()
+	sealed := model.CandidateAuditRun{OwnerType: model.JobOwnerSystem, Market: "cn",
+		SignalDate: "2044-05-04", OutcomeDate: "2044-05-05", AuditVersion: CandidateAuditVersion,
+		ParameterHash: candidateAuditParameterHash(), DiscoveryVersion: DiscoveryVersion,
+		FactorVersion: factorSnapshotVersion, OutcomeVersion: candidateAuditOutcomeVersion,
+		ParameterJSON: candidateAuditParameterJSON(), DataAsOf: finished,
+		Status: model.CandidateAuditStatusPartial, ItemCount: 3, StartedAt: finished, FinishedAt: &finished}
+	if err := common.DB.Create(&sealed).Error; err != nil {
+		t.Fatalf("准备已封存 partial 失败: %v", err)
+	}
+	if candidateAuditNeedsBackfill("2044-05-04", "2044-05-05") {
+		t.Fatal("已封存明细的 partial 是 PIT 终态，不得判定为需要补跑")
+	}
+	empty := model.CandidateAuditRun{OwnerType: model.JobOwnerSystem, Market: "cn",
+		SignalDate: "2044-05-05", OutcomeDate: "2044-05-06", AuditVersion: CandidateAuditVersion,
+		ParameterHash: candidateAuditParameterHash(), DiscoveryVersion: DiscoveryVersion,
+		FactorVersion: factorSnapshotVersion, OutcomeVersion: candidateAuditOutcomeVersion,
+		ParameterJSON: candidateAuditParameterJSON(), DataAsOf: finished,
+		Status: model.CandidateAuditStatusPartial, ItemCount: 0, StartedAt: finished, FinishedAt: &finished}
+	if err := common.DB.Create(&empty).Error; err != nil {
+		t.Fatalf("准备空运行 partial 失败: %v", err)
+	}
+	if !candidateAuditNeedsBackfill("2044-05-05", "2044-05-06") {
+		t.Fatal("空运行 partial 未封存任何明细，上游补齐后必须允许补跑重算")
+	}
+	cleanCandidateAuditFixture(t)
+	nonDiscoveryPick := model.CandidateAuditItem{CandidateEventID: 1, FunnelStage: model.CandStagePicked}
+	if values := auditAttributionValues(nonDiscoveryPick, false); len(values) != 1 || values[0] != "not_discovered_marketwide" {
+		t.Fatalf("非发现来源命中的标的不能伪装成已发现通道: %v", values)
+	}
+	if values := auditAttributionValues(nonDiscoveryPick, true); len(values) != 1 || values[0] != "source_unknown" {
+		t.Fatalf("事件来源缺失应明确 unknown: %v", values)
+	}
 	tests := []struct {
 		name       string
 		event      *model.RecommendationCandidateEvent

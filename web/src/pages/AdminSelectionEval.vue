@@ -273,6 +273,7 @@ const AUDIT_REASON_LABEL: Record<string, string> = {
   llm_not_selected: 'LLM 未入选',
   candidate_facts_missing: '候选事实缺失',
   candidate_facts_ambiguous: '候选事实冲突',
+  signal_factor_snapshot_missing: '信号日因子快照缺失',
   unknown: '事实不足',
 }
 </script>

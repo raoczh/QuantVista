@@ -16,7 +16,7 @@ type LLMTask struct {
 	Kind   string `gorm:"size:64;index:idx_llm_task_lookup,priority:2" json:"kind"`
 	// JobRunID 非空表示该兼容结果行已由统一作业事实接管。任务中心据此排除旧行，
 	// /llm-tasks 仍可用原 ID 读取结果，保证历史页面与深链兼容。
-	JobRunID *int64 `gorm:"uniqueIndex;index" json:"-"`
+	JobRunID *int64 `gorm:"uniqueIndex" json:"-"`
 
 	RequestHash string `gorm:"size:64;index:idx_llm_task_lookup,priority:3" json:"-"`
 	// ActiveKey 仅 processing 时有值；终态清空。唯一索引把同请求防重扩展到多实例。

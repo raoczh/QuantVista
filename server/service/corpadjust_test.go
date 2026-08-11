@@ -500,8 +500,8 @@ func TestGenerateCorpAdjustsCreatesManualReviewForPostExSell(t *testing.T) {
 	}
 	var before model.Position
 	common.DB.First(&before, p.ID)
-	if n, err := GenerateCorpAdjusts(1, today); err == nil || n != 1 {
-		t.Fatalf("已有除权后卖出时应生成可操作的人工核对记录并显式报错: n=%d err=%v", n, err)
+	if n, err := GenerateCorpAdjusts(1, today); err != nil || n != 1 {
+		t.Fatalf("已有除权后卖出时应生成可操作的人工核对记录（正常业务态不报错，否则今日待办每天误报数据不完整）: n=%d err=%v", n, err)
 	}
 	var after model.Position
 	common.DB.First(&after, p.ID)
@@ -553,8 +553,8 @@ func TestClosedShareActionCreatesManualReview(t *testing.T) {
 	if err := common.DB.Create(&action).Error; err != nil {
 		t.Fatal(err)
 	}
-	if n, err := GenerateCorpAdjusts(1, today); err == nil || n != 1 {
-		t.Fatalf("已平仓送转应生成不可自动确认的人工核对记录: n=%d err=%v", n, err)
+	if n, err := GenerateCorpAdjusts(1, today); err != nil || n != 1 {
+		t.Fatalf("已平仓送转应生成不可自动确认的人工核对记录（正常业务态不报错）: n=%d err=%v", n, err)
 	}
 	rows, err := ListCorpAdjusts(1, model.CorpAdjustPending)
 	if err != nil || len(rows) != 1 || !rows[0].ManualReview || rows[0].ReviewReason == "" {

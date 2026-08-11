@@ -963,7 +963,7 @@ func TestScoreBlindProtocolAndPromptReleaseIsolation(t *testing.T) {
 	}
 	if tampered.ProtocolLockedAt == nil || tampered.ProtocolHash == "" ||
 		tampered.InputSchemaVersion != scoreBlindInputSchemaVersion {
-		t.Fatalf("创建时应固化并锁定协议/sb1: %+v", tampered)
+		t.Fatalf("创建时应固化并锁定协议与输入版本: %+v", tampered)
 	}
 	if err := common.DB.Model(&model.LLMExperiment{}).Where("id = ?", tampered.ID).
 		UpdateColumn("protocol_json", strings.Replace(tampered.ProtocolJSON, `"max_coverage_drop_pct":10`, `"max_coverage_drop_pct":11`, 1)).Error; err != nil {
@@ -1353,7 +1353,7 @@ func TestScoreBlindShadowConcurrentSingleCallAndFrozenInput(t *testing.T) {
 		t.Fatalf("同批应恰一条样本: %d", len(rows))
 	}
 	row := rows[0]
-	if row.ExperimentType != model.LLMExperimentTypeScoreBlind || row.InputSchemaVersion != "sb1" ||
+	if row.ExperimentType != model.LLMExperimentTypeScoreBlind || row.InputSchemaVersion != scoreBlindInputSchemaVersion ||
 		row.RunStatus != model.LLMExperimentRunSuccess || row.Seed <= 0 || row.InputHash == "" {
 		t.Fatalf("score-blind 身份/运行事实未固化: %+v", row)
 	}

@@ -192,8 +192,13 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 				if e.PositionID == 0 || !heldPositionIDs[e.PositionID] {
 					continue
 				}
-				if _, assessed := latestExit[e.PositionID]; assessed {
-					continue // 有统一事实后，持仓类 AlertEvent 只作审计
+				// 只有统一事实自己会生成卖出待办（review/urgent）时才抑制原始事件，
+				// 避免同仓双条。normal/watch 级统一事实没有替代出口，用户显式订阅的
+				// 规则命中（如 cost_gain）必须保留；unknown 是数据缺口，更不能反过
+				// 来把已确认的风险从待办里挤掉。
+				if a, assessed := latestExit[e.PositionID]; assessed &&
+					(a.Level == model.PositionExitLevelReview || a.Level == model.PositionExitLevelUrgent) {
+					continue
 				}
 			}
 			t := e.TriggeredAt
@@ -385,11 +390,13 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 		fail("打新日历", err)
 	}
 
-	// 兼容升级窗口：尚无统一评估事实的旧 SellReview 仍可处理；该持仓一旦生成
-	// 任一统一事实（包括 unknown），底层 SellReview 不再重复投影到 Today。
+	// 旧 SellReview 的投影只在统一事实已生成本仓卖出待办（review/urgent，会把
+	// review 作为证据纳入）时抑制；normal/watch/unknown 下旧 review 仍需自己的
+	// 出口，数据缺口不能挤掉已确认的利空事件。
 	if reviews, err := ListSellReviews(userID, model.SellReviewStatusOpen); err == nil {
 		for _, r := range reviews {
-			if _, assessed := latestExit[r.PositionID]; assessed {
+			if a, assessed := latestExit[r.PositionID]; assessed &&
+				(a.Level == model.PositionExitLevelReview || a.Level == model.PositionExitLevelUrgent) {
 				continue
 			}
 			priority := 2

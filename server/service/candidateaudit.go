@@ -17,6 +17,7 @@ import (
 	"quantvista/model"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -36,27 +37,29 @@ const (
 )
 
 type candidateAuditParameters struct {
-	AuditVersion          string  `json:"audit_version"`
-	OutcomeVersion        string  `json:"outcome_version"`
-	DiscoveryVersion      string  `json:"discovery_version"`
-	FactorVersion         string  `json:"factor_version"`
-	SelectionVersion      string  `json:"selection_outcome_version"`
-	LabelVersion          string  `json:"label_version"`
-	OpportunityTopK       int     `json:"opportunity_top_k"`
-	MinimumAmount         float64 `json:"minimum_amount"`
-	LeaderNetPct          float64 `json:"leader_net_pct"`
-	LeaderAlphaPct        float64 `json:"leader_alpha_pct"`
-	FalsePositiveNetPct   float64 `json:"false_positive_net_pct"`
-	FalsePositiveAlphaPct float64 `json:"false_positive_alpha_pct"`
-	FalsePositiveMaePct   float64 `json:"false_positive_mae_pct"`
-	MinimumDays           int     `json:"minimum_days"`
-	MinimumSamples        int     `json:"minimum_samples"`
+	AuditVersion           string  `json:"audit_version"`
+	OutcomeVersion         string  `json:"outcome_version"`
+	DiscoveryVersion       string  `json:"discovery_version"`
+	DiscoveryParameterHash string  `json:"discovery_parameter_hash"`
+	FactorVersion          string  `json:"factor_version"`
+	SelectionVersion       string  `json:"selection_outcome_version"`
+	LabelVersion           string  `json:"label_version"`
+	OpportunityTopK        int     `json:"opportunity_top_k"`
+	MinimumAmount          float64 `json:"minimum_amount"`
+	LeaderNetPct           float64 `json:"leader_net_pct"`
+	LeaderAlphaPct         float64 `json:"leader_alpha_pct"`
+	FalsePositiveNetPct    float64 `json:"false_positive_net_pct"`
+	FalsePositiveAlphaPct  float64 `json:"false_positive_alpha_pct"`
+	FalsePositiveMaePct    float64 `json:"false_positive_mae_pct"`
+	MinimumDays            int     `json:"minimum_days"`
+	MinimumSamples         int     `json:"minimum_samples"`
 }
 
 func candidateAuditParams() candidateAuditParameters {
 	return candidateAuditParameters{
 		AuditVersion: CandidateAuditVersion, OutcomeVersion: candidateAuditOutcomeVersion,
-		DiscoveryVersion: DiscoveryVersion, FactorVersion: factorSnapshotVersion,
+		DiscoveryVersion: DiscoveryVersion, DiscoveryParameterHash: discoveryParameterHash(),
+		FactorVersion:    factorSnapshotVersion,
 		SelectionVersion: model.SelectionOutcomeVersion, LabelVersion: labelVersion,
 		OpportunityTopK: candidateAuditTopK, MinimumAmount: candidateAuditMinAmount,
 		LeaderNetPct: candidateAuditLeaderNetPct, LeaderAlphaPct: candidateAuditLeaderAlphaPct,
@@ -90,6 +93,7 @@ type auditSymbolObservation struct {
 	SignalUniverseID  int64
 	OutcomeUniverseID int64
 	FactorSnapshotID  int64
+	FactorReady       bool
 	EntryDate         string
 	EntryPrice        float64
 	ClosePrice        float64
@@ -260,6 +264,7 @@ func loadAuditObservations(ctx context.Context, market *MarketService, signalDat
 		if factorOK {
 			obs.FactorSnapshotID = factor.ID
 		}
+		obs.FactorReady = factorOK && factor.LastBarDate == signalDate
 		switch {
 		case signal.IsST || (outcomeOK && outcome.IsST):
 			obs.Status = "excluded_st"
@@ -273,11 +278,14 @@ func loadAuditObservations(ctx context.Context, market *MarketService, signalDat
 		case !outcomeOK:
 			obs.Status = "no_data"
 			coverage["excluded_no_data"]++
-		case !factorOK || factor.LastBarDate != signalDate:
-			obs.Status = "factor_snapshot_missing"
-			coverage["excluded_no_data"]++
-			gaps["factor_snapshot_missing"]++
 		default:
+			// 因子缺口本身正是“为什么没有被全市场发现”的可审计原因，不能把这类
+			// 后来走强的股票从机会集分母里删掉，否则会静默抬高召回率。只要两日
+			// 宇宙和行情足够完成可执行观测，就保留机会并把运行标为 partial。
+			if !obs.FactorReady {
+				coverage["factor_snapshot_missing"]++
+				gaps["factor_snapshot_missing"]++
+			}
 			sigBar, sigOK := barsBy[signal.Symbol][signalDate]
 			outBar, outOK := barsBy[signal.Symbol][outcomeDate]
 			if !sigOK || !outOK {
@@ -334,16 +342,43 @@ func buildAuditOpportunities(observations map[string]auditSymbolObservation) []a
 	return rows
 }
 
-func loadAuditDiscoveryFacts(runID int64) (map[string]auditDiscoveryFact, error) {
+func loadAuditDiscoveryFacts(signalRun model.CandidateDiscoveryRun) (map[string]auditDiscoveryFact, error) {
+	// 口径对齐：推荐建池消费的是「近 5 个有效交易日的发现记忆」（recentDiscoveryCandidates），
+	// 审计判 discovered 若只看信号日单日事实，会把“3 天前被发现、信号日未复现且未进
+	// 用户池”的漏选错归因为 not_discovered_marketwide，低估发现层召回。这里按同样的
+	// 5 日窗口取事实（全部早于等于信号日，PIT 合规）；Primary 取最新一日的最优行。
+	dates := recentOpenDates(signalRun.Market, signalRun.TradeDate, 5)
+	if len(dates) == 0 || dates[len(dates)-1] != signalRun.TradeDate {
+		dates = append(dates, signalRun.TradeDate)
+	}
+	if len(dates) > 5 {
+		dates = dates[len(dates)-5:]
+	}
+	var runs []model.CandidateDiscoveryRun
+	if err := common.DB.Where("market = ? AND trade_date IN ? AND owner_type = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ? AND status IN ?",
+		signalRun.Market, dates, model.JobOwnerSystem, signalRun.DiscoveryVersion, signalRun.FactorVersion, signalRun.ParameterHash,
+		[]string{DiscoveryRunStatusOK, DiscoveryRunStatusPart}).Find(&runs).Error; err != nil {
+		return nil, err
+	}
+	runIDs := make([]int64, 0, len(runs))
+	for _, run := range runs {
+		runIDs = append(runIDs, run.ID)
+	}
+	if len(runIDs) == 0 {
+		return map[string]auditDiscoveryFact{}, nil
+	}
 	var rows []model.CandidateDiscoveryItem
-	if err := common.DB.Where("run_id = ?", runID).Order("rank, channel, symbol").Find(&rows).Error; err != nil {
+	// rank 是 MySQL 8.0.2+ 保留字，裸 ORDER BY rank 生产必挂（SQLite 单测不覆盖），
+	// 必须走 OrderByColumn 由方言加引号——同 mood.go 人气榜先例。
+	if err := common.DB.Where("run_id IN ?", runIDs).Order("trade_date DESC").
+		Order(clause.OrderByColumn{Column: clause.Column{Name: "rank"}}).
+		Order("channel, symbol").Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	out := map[string]auditDiscoveryFact{}
 	for _, row := range rows {
 		fact := out[row.Symbol]
-		if fact.Primary.ID == 0 || row.Rank < fact.Primary.Rank ||
-			(row.Rank == fact.Primary.Rank && row.Channel < fact.Primary.Channel) {
+		if fact.Primary.ID == 0 {
 			fact.Primary = row
 		}
 		fact.Channels = append(fact.Channels, row.Channel)
@@ -534,6 +569,7 @@ func ExecuteCandidateAudit(ctx context.Context, market *MarketService, expectedR
 	}
 
 	var run model.CandidateAuditRun
+	created := false
 	err = common.DB.Where("market = ? AND signal_date = ? AND outcome_date = ? AND audit_version = ? AND parameter_hash = ?",
 		request.Market, request.SignalDate, request.OutcomeDate, CandidateAuditVersion, request.ParameterHash).First(&run).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -547,11 +583,23 @@ func ExecuteCandidateAudit(ctx context.Context, market *MarketService, expectedR
 		if err := common.DB.Create(&run).Error; err != nil {
 			return nil, err
 		}
+		created = true
 	} else if err != nil {
 		return nil, err
-	} else if (run.Status == model.CandidateAuditStatusSuccess || run.Status == model.CandidateAuditStatusPartial) && run.FinishedAt != nil {
+	}
+	if expectedResultID > 0 && run.ID != expectedResultID {
+		return nil, fmt.Errorf("审计作业结果引用错配: expected=%d actual=%d", expectedResultID, run.ID)
+	}
+	// success 与「已封存明细的 partial」是终态：观测一旦落库就是 PIT 事实，结果日
+	// 数据被订正（前复权重锚等）后重算会让历史报表漂移。只有**空运行 partial**
+	//（如信号日发现缺失，未封存任何明细）允许在上游数据补齐后幂等重算，否则一次
+	// 瞬时缺口会把该日对永久冻结成空报表。
+	if !created && run.FinishedAt != nil &&
+		(run.Status == model.CandidateAuditStatusSuccess ||
+			(run.Status == model.CandidateAuditStatusPartial && run.ItemCount > 0)) {
 		return &run, nil
-	} else {
+	}
+	if !created {
 		now := time.Now()
 		if err := common.DB.Model(&run).Updates(map[string]any{"status": model.CandidateAuditStatusProcessing,
 			"error": "", "gap_json": "", "started_at": now, "finished_at": nil, "updated_at": now}).Error; err != nil {
@@ -560,9 +608,6 @@ func ExecuteCandidateAudit(ctx context.Context, market *MarketService, expectedR
 		if err := common.DB.Where("run_id = ?", run.ID).Delete(&model.CandidateAuditItem{}).Error; err != nil {
 			return nil, err
 		}
-	}
-	if expectedResultID > 0 && run.ID != expectedResultID {
-		return nil, fmt.Errorf("审计作业结果引用错配: expected=%d actual=%d", expectedResultID, run.ID)
 	}
 
 	outcomeDiscovery, err := candidateAuditDiscoveryRun(request.OutcomeDate)
@@ -573,6 +618,12 @@ func ExecuteCandidateAudit(ctx context.Context, market *MarketService, expectedR
 	run.DataAsOf = outcomeDiscovery.AsOf
 	signalDiscovery, signalErr := candidateAuditDiscoveryRun(request.SignalDate)
 	if signalErr != nil {
+		// 只有「确实不存在信号日发现事实」才是合法降级；瞬时 DB 错误必须让作业
+		// 失败重试，不能固化成 partial 空运行。
+		if !errors.Is(signalErr, gorm.ErrRecordNotFound) {
+			markCandidateAuditFailed(run.ID, signalErr)
+			return &run, signalErr
+		}
 		gaps := map[string]int{"signal_discovery_missing": 1}
 		if err := finishCandidateAuditWithoutItems(&run, model.CandidateAuditStatusPartial, gaps); err != nil {
 			return &run, err
@@ -595,7 +646,7 @@ func ExecuteCandidateAudit(ctx context.Context, market *MarketService, expectedR
 		return &run, err
 	}
 	opportunities := buildAuditOpportunities(observations)
-	discoveryBy, err := loadAuditDiscoveryFacts(signalDiscovery.ID)
+	discoveryBy, err := loadAuditDiscoveryFacts(signalDiscovery)
 	if err != nil {
 		markCandidateAuditFailed(run.ID, err)
 		return &run, err
@@ -698,6 +749,9 @@ func ExecuteCandidateAudit(ctx context.Context, market *MarketService, expectedR
 			}
 			discovery, discovered := discoveryBy[opportunity.Symbol]
 			stage, reason := candidateAuditReason("", event, discovered, batch.FactsRecorded && len(batchEvents) > 0, ambiguous)
+			if event == nil && batch.FactsRecorded && len(batchEvents) > 0 && !opportunity.Obs.FactorReady {
+				stage, reason = "absent", "signal_factor_snapshot_missing"
+			}
 			rec, recOK := recBy[key]
 			label, labelOK := labelBy[key]
 			selection, selectionOK := selectionBy[key]
@@ -718,7 +772,13 @@ func ExecuteCandidateAudit(ctx context.Context, market *MarketService, expectedR
 			items = append(items, item)
 		}
 
-		for symbol, facts := range batchEvents {
+		batchSymbols := make([]string, 0, len(batchEvents))
+		for symbol := range batchEvents {
+			batchSymbols = append(batchSymbols, symbol)
+		}
+		sort.Strings(batchSymbols)
+		for _, symbol := range batchSymbols {
+			facts := batchEvents[symbol]
 			if leaderSymbols[symbol] || len(facts) == 0 {
 				continue
 			}
@@ -792,7 +852,7 @@ func ExecuteCandidateAudit(ctx context.Context, market *MarketService, expectedR
 		if item.AuditType == model.CandidateAuditTypeMissedLeader {
 			missed++
 		}
-		if item.AuditType == model.CandidateAuditTypeFalsePositive {
+		if item.ConclusionCode == "false_positive_next_day" {
 			falsePos++
 		}
 	}
@@ -873,6 +933,9 @@ func registerCandidateAuditBinding() durableJobBinding {
 			if req.Market == "" {
 				req.Market = "cn"
 			}
+			if req.ParameterHash == "" {
+				req.ParameterHash = candidateAuditParameterHash()
+			}
 			var row model.CandidateAuditRun
 			err := tx.Where("market = ? AND signal_date = ? AND outcome_date = ? AND audit_version = ? AND parameter_hash = ?",
 				req.Market, req.SignalDate, req.OutcomeDate, CandidateAuditVersion, req.ParameterHash).First(&row).Error
@@ -896,7 +959,8 @@ func registerCandidateAuditBinding() durableJobBinding {
 				}
 			} else if err != nil {
 				return 0, err
-			} else if row.Status != model.CandidateAuditStatusSuccess && row.Status != model.CandidateAuditStatusPartial {
+			} else if row.Status != model.CandidateAuditStatusSuccess &&
+				!(row.Status == model.CandidateAuditStatusPartial && row.ItemCount > 0) {
 				if err := tx.Model(&row).Updates(map[string]any{"job_run_id": job.ID,
 					"status": model.CandidateAuditStatusProcessing, "error": "", "finished_at": nil}).Error; err != nil {
 					return 0, err
@@ -948,8 +1012,7 @@ func RegisterCandidateAuditJobHandler(market *MarketService) {
 			if run.Status == model.CandidateAuditStatusPartial {
 				status = model.JobStatusDegraded
 			}
-			return DurableJobResult{Status: status, Total: run.ItemCount, Succeeded: run.ItemCount,
-				Failed: run.ExcludedNoData}, nil
+			return DurableJobResult{Status: status, Total: run.ItemCount, Succeeded: run.ItemCount}, nil
 		})
 }
 
@@ -960,7 +1023,11 @@ func candidateAuditNeedsBackfill(signalDate, outcomeDate string) bool {
 	var run model.CandidateAuditRun
 	err := common.DB.Where("market = ? AND signal_date = ? AND outcome_date = ? AND audit_version = ? AND parameter_hash = ?",
 		"cn", signalDate, outcomeDate, CandidateAuditVersion, candidateAuditParameterHash()).First(&run).Error
-	return err != nil || (run.Status != model.CandidateAuditStatusSuccess && run.Status != model.CandidateAuditStatusPartial) || run.FinishedAt == nil
+	// 空运行 partial（未封存明细）不算完成：缺口可能已被补齐，补跑幂等重算；
+	// 已封存明细的 partial 与 success 一样是 PIT 终态。
+	return err != nil || run.FinishedAt == nil ||
+		(run.Status != model.CandidateAuditStatusSuccess &&
+			!(run.Status == model.CandidateAuditStatusPartial && run.ItemCount > 0))
 }
 
 func ScheduleCandidateAudit(outcomeDate, trigger string) {
@@ -977,23 +1044,37 @@ func ScheduleCandidateAudit(outcomeDate, trigger string) {
 	}
 	req := candidateAuditJobRequest{Version: 1, Market: "cn", SignalDate: signalDate,
 		OutcomeDate: outcomeDate, TriggerSource: trigger, ParameterHash: candidateAuditParameterHash()}
-	if _, err := defaultJobRuntime.startSystemWithBinding(nil, JobKindCandidateAudit, req, nil); err != nil {
+	scheduleRetry := func() {
+		key := signalDate + ":" + outcomeDate + ":" + req.ParameterHash
+		candidateAuditScheduleMu.Lock()
+		if !candidateAuditSchedulePending[key] {
+			candidateAuditSchedulePending[key] = true
+			time.AfterFunc(systemScheduleRetryDelay, func() {
+				candidateAuditScheduleMu.Lock()
+				delete(candidateAuditSchedulePending, key)
+				candidateAuditScheduleMu.Unlock()
+				ScheduleCandidateAudit(outcomeDate, trigger)
+			})
+		}
+		candidateAuditScheduleMu.Unlock()
+	}
+	run, err := defaultJobRuntime.startSystemWithBinding(nil, JobKindCandidateAudit, req, nil)
+	if err != nil {
 		if errors.Is(err, ErrJobQueueBusy) || errors.Is(err, ErrJobAlreadyRunning) {
-			key := signalDate + ":" + outcomeDate + ":" + req.ParameterHash
-			candidateAuditScheduleMu.Lock()
-			if !candidateAuditSchedulePending[key] {
-				candidateAuditSchedulePending[key] = true
-				time.AfterFunc(systemScheduleRetryDelay, func() {
-					candidateAuditScheduleMu.Lock()
-					delete(candidateAuditSchedulePending, key)
-					candidateAuditScheduleMu.Unlock()
-					ScheduleCandidateAudit(outcomeDate, trigger)
-				})
-			}
-			candidateAuditScheduleMu.Unlock()
+			scheduleRetry()
 			return
 		}
 		common.SysWarn("提交每日候选审计作业失败: %v", err)
+		return
+	}
+	// system 同 kind 全局互斥：命中在途作业时 runtime 返回的是**原 run**（可能是
+	// 另一日对的请求），静默当“已受理”会让本日对审计永久漏掉（startup backfill
+	// 只补最新一对）。比对快照身份，不一致必须延迟补交。
+	var accepted candidateAuditJobRequest
+	if run == nil || json.Unmarshal(snapshotJSONRequest([]byte(run.RequestSnapshot)), &accepted) != nil ||
+		accepted.SignalDate != req.SignalDate || accepted.OutcomeDate != req.OutcomeDate ||
+		accepted.ParameterHash != req.ParameterHash {
+		scheduleRetry()
 	}
 }
 

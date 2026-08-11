@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"quantvista/common"
@@ -110,7 +111,7 @@ func (s *TaskCenterService) List(userID int64, role string, options TaskCenterLi
 	if err != nil {
 		return nil, err
 	}
-	if err := expireStaleUserTasks(userID); err != nil {
+	if err := expireStaleUserTasksThrottled(userID); err != nil {
 		return nil, fmt.Errorf("收敛遗留任务失败: %w", err)
 	}
 	if filters.jobID > 0 {
@@ -225,6 +226,25 @@ func normalizeTaskCenterFilters(options TaskCenterListOptions) (taskCenterFilter
 		return taskCenterFilters{}, errors.New("任务状态须为 queued、running、success、degraded、failed 或 canceled")
 	}
 	return f, nil
+}
+
+var (
+	staleSweepMu sync.Mutex
+	staleSweepAt = map[int64]time.Time{}
+)
+
+// expireStaleUserTasksThrottled 按用户 1 分钟节流。清扫是兜底修复（stale 行本就
+// 罕见），前端最近任务货架 4 秒轮询 × 每轮 3 个请求会把 4 条 UPDATE + 多个
+// NOT EXISTS 子查询放大成常态负载，没必要每次列表请求都执行。
+func expireStaleUserTasksThrottled(userID int64) error {
+	staleSweepMu.Lock()
+	if last, ok := staleSweepAt[userID]; ok && time.Since(last) < time.Minute {
+		staleSweepMu.Unlock()
+		return nil
+	}
+	staleSweepAt[userID] = time.Now()
+	staleSweepMu.Unlock()
+	return expireStaleUserTasks(userID)
 }
 
 func expireStaleUserTasks(userID int64) error {
@@ -694,6 +714,10 @@ func dataSyncTaskTitle(kind string) string {
 		return "初始化市场历史"
 	case JobKindDailyDiscovery:
 		return "全市场候选发现"
+	case JobKindCandidateAudit:
+		return "每日候选审计"
+	case JobKindFactorRebuild:
+		return "因子宽表重建"
 	default:
 		return "系统数据任务"
 	}

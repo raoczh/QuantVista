@@ -174,18 +174,27 @@ func migrateScreenerStrategyRevisions(db *gorm.DB) error {
 			switch {
 			case err == nil:
 				if baseline.UserID != strategy.UserID {
-					return fmt.Errorf("revision 1 用户不匹配（strategy user=%d, revision user=%d）", strategy.UserID, baseline.UserID)
+					// 数据固有污染：重启永远在同一行失败，一行脏数据不值得永久阻断
+					// 整个服务启动。不写指针、告警跳过，待人工修复。
+					common.SysWarn("迁移选股策略 revision 跳过 strategy_id=%d：revision 1 用户不匹配（strategy user=%d, revision user=%d）",
+						strategy.ID, strategy.UserID, baseline.UserID)
+					return nil
 				}
 			case errors.Is(err, gorm.ErrRecordNotFound):
 				canonicalTree, canonicalErr := CanonicalScreenerTreeJSON(strategy.TreeJSON)
 				if canonicalErr != nil {
-					return canonicalErr
+					// 存量坏行（NULL/空串/非法 JSON）同上：跳过并告警。该策略在修复前
+					// 没有 revision 1，扫描执行侧 validateCondTree 会继续拒绝非法树，
+					// 不会因跳过而静默放行。
+					common.SysWarn("迁移选股策略 revision 跳过坏行 strategy_id=%d: %v", strategy.ID, canonicalErr)
+					return nil
 				}
 				hash, hashErr := ScreenerStrategyContentHash(
 					strategy.Name, strategy.Desc, strategy.Period, strategy.Risk, canonicalTree,
 				)
 				if hashErr != nil {
-					return hashErr
+					common.SysWarn("迁移选股策略 revision 跳过坏行 strategy_id=%d: %v", strategy.ID, hashErr)
+					return nil
 				}
 				candidate := ScreenerStrategyRevision{
 					UserID: strategy.UserID, StrategyID: strategy.ID, Revision: 1,
@@ -203,7 +212,9 @@ func migrateScreenerStrategyRevisions(db *gorm.DB) error {
 					return err
 				}
 				if baseline.UserID != strategy.UserID {
-					return fmt.Errorf("revision 1 用户不匹配（strategy user=%d, revision user=%d）", strategy.UserID, baseline.UserID)
+					common.SysWarn("迁移选股策略 revision 跳过 strategy_id=%d：revision 1 用户不匹配（strategy user=%d, revision user=%d）",
+						strategy.ID, strategy.UserID, baseline.UserID)
+					return nil
 				}
 			default:
 				return err

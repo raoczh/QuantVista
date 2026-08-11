@@ -465,11 +465,9 @@ func (s *RecommendationService) RecRecallReport(ctx context.Context, userID int6
 		rep.Notes = append(rep.Notes, fmt.Sprintf("%d 个观测因退市/长停按末根收盘强平（真实中卖不出，收益不可靠）——已排除出机会集与收益分布，单独计数", rep.Forced))
 	}
 	rep.ElapsedMs = time.Since(start).Milliseconds()
-	if dailyAudit, err := LoadCandidateAuditUserReport(userID, recType, candidateAuditReportMaxRuns); err == nil {
-		rep.DailyAudit = dailyAudit
-	} else {
-		rep.Notes = append(rep.Notes, "每日漏选/误选审计暂不可用："+err.Error())
-	}
+	// DailyAudit 不在此内嵌计算：前端 loadRecall 并行请求 /daily-audits 并以其结果
+	// 覆盖本字段，内嵌版是纯冗余的重复计算（召回本身已是数秒级重扫）。字段保留
+	// omitempty 以兼容 API 契约。
 	common.SysLog("召回评估完成: %d 批次，%d 评估日，Recall@%d 池 %.1f%%/名单 %.1f%%/入选 %.1f%%，耗时 %dms",
 		rep.Batches, len(dates), k, rep.RecallPoolPct, rep.RecallLLMPct, rep.RecallPickedPct, rep.ElapsedMs)
 	return rep, nil

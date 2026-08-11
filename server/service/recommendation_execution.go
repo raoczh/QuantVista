@@ -141,9 +141,8 @@ func applyRiskPreferenceSizing(picks []recPick, snap recommendationPreferenceSna
 }
 
 func formatMultiplier(v float64) string {
-	if v == math.Trunc(v) {
-		return "1.00"
-	}
+	// 整数倍数也要如实显示（2.0 → "2"）；曾硬编码返回 "1.00"，默认参数下恰好只有
+	// v=1 命中才没暴露，一旦某档位调成整数就会把错误标签写进历史批次解释。
 	return strings.TrimRight(strings.TrimRight(formatFloat(v, 2), "0"), ".")
 }
 

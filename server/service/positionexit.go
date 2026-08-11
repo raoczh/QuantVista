@@ -81,6 +81,15 @@ type positionExitInput struct {
 	events   []model.AlertEvent
 	reviews  []model.SellReview
 	loadErrs []string
+	// pendingCorpAdjust：存在除权日已到、未确认的送转折算。成本/峰值/计划价仍是
+	// 除权前口径，价格与技术信号全部按数据缺口处理，防止 -50% 假止损。
+	pendingCorpAdjust bool
+	// hasPrevAssessment/prevBelowATR：上一条评估事实是否存在、其时点是否已处于
+	// ATR14 保护线下方。保护线随峰值上移，纯 crossing（前收盘在线上）会在峰值刷新
+	// 日恒 false 且此后永不触发；改用「上次不在线下 → 本次在线下」的状态迁移判定，
+	// 无历史时退回前收盘判定。
+	hasPrevAssessment bool
+	prevBelowATR      bool
 }
 
 func (s *PositionExitAssessmentService) EvaluateUser(ctx context.Context, userID int64, session string) (int, error) {
@@ -91,7 +100,9 @@ func (s *PositionExitAssessmentService) EvaluateUser(ctx context.Context, userID
 		session = model.PositionExitSessionIntraday
 	}
 	var positions []model.Position
-	if err := common.DB.WithContext(ctx).Where("user_id = ? AND status = ?", userID, model.PositionStatusHolding).
+	// 只评 cn：日历/日线/ATR/事件语义都是 A 股口径，与 guard/sellreview 一致；
+	// hk/us 持仓用 A 股交易日评估会产生错误的 as-of 与假信号。
+	if err := common.DB.WithContext(ctx).Where("user_id = ? AND status = ? AND market = ?", userID, model.PositionStatusHolding, "cn").
 		Order("id ASC").Find(&positions).Error; err != nil {
 		return 0, fmt.Errorf("读取持仓失败: %w", err)
 	}
@@ -134,15 +145,25 @@ func (s *PositionExitAssessmentService) EvaluateUserWithSnapshot(
 		params = defaultPositionExitParams
 	}
 	peakErr := syncPositionExitPeaks(ctx, userID, positions, quotes, evaluatedAt)
+	positionIDs := make([]int64, 0, len(positions))
+	for _, p := range positions {
+		positionIDs = append(positionIDs, p.ID)
+	}
+	pendingAdjust, pendingAdjustErr := positionsWithUnconfirmedShareAction(
+		ctx, userID, positionIDs, evaluatedAt.In(time.Local).Format("2006-01-02"))
 	created := 0
 	var errs []error
 	for _, p := range positions {
-		if p.UserID != userID || p.Status != model.PositionStatusHolding {
+		if p.UserID != userID || p.Status != model.PositionStatusHolding || p.Market != "cn" {
 			continue
 		}
-		in := positionExitInput{position: p, quote: quotes[QuoteKey(p.Market, p.Symbol)], now: evaluatedAt, session: session}
+		in := positionExitInput{position: p, quote: quotes[QuoteKey(p.Market, p.Symbol)], now: evaluatedAt, session: session,
+			pendingCorpAdjust: pendingAdjust[p.ID]}
 		if peakErr != nil {
 			in.loadErrs = append(in.loadErrs, "持仓峰值查询失败")
+		}
+		if pendingAdjustErr != nil {
+			in.loadErrs = append(in.loadErrs, "除权折算状态查询失败")
 		}
 		if err := common.DB.WithContext(ctx).Where("symbol = ? AND market = ?", p.Symbol, p.Market).
 			Order("trade_date DESC").Limit(params.BarLimit).Find(&in.barRows).Error; err != nil {
@@ -164,15 +185,29 @@ func (s *PositionExitAssessmentService) EvaluateUserWithSnapshot(
 			userID, p.ID, model.SellReviewStatusOpen).Order("trade_date DESC, id DESC").Find(&in.reviews).Error; err != nil {
 			in.loadErrs = append(in.loadErrs, "卖出复核查询失败")
 		}
+		var prevRow model.PositionExitAssessment
+		if err := common.DB.WithContext(ctx).Select("signals_json").
+			Where("user_id = ? AND position_id = ?", userID, p.ID).
+			Order("evaluated_at DESC, id DESC").First(&prevRow).Error; err == nil {
+			in.hasPrevAssessment = true
+			in.prevBelowATR = strings.Contains(prevRow.SignalsJSON, `"atr14_break"`)
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			in.loadErrs = append(in.loadErrs, "上一条评估查询失败")
+		}
 		row := evaluatePositionExit(in, params)
-		inserted, err := persistPositionExitAssessment(ctx, row)
+		inserted, notifyNeeded, err := persistPositionExitAssessment(ctx, row)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("持仓 %d 落库失败: %w", p.ID, err))
 			continue
 		}
 		if inserted {
 			created++
-			s.notifyAssessment(ctx, row)
+			// 事实每次有意义变化都追加，但通知只在首次、等级升级或主因变化时发：
+			// 逐日重算（open SellReview 逐日换 trade_date、ATR 线下逐日快照）不能
+			// 变成每天一条重复推送。
+			if notifyNeeded {
+				s.notifyAssessment(ctx, row)
+			}
 		}
 	}
 	return created, errors.Join(errs...)
@@ -187,10 +222,13 @@ func (s *PositionExitAssessmentService) notifyAssessment(ctx context.Context, ro
 		return
 	}
 	kind := model.GuardKindPosExitReview
+	// ntfy 语义（notify.go）：1=最低、5=最高、0=通道默认(3)。urgent 对齐旧
+	// stop_loss 守护推送的高优先级 4；review 走默认。写 1 会把最紧急的止损
+	// 触达降成静默级。
 	priority := 0
 	if row.Level == model.PositionExitLevelUrgent {
 		kind = model.GuardKindPosExitUrgent
-		priority = 1
+		priority = 4
 	}
 	message := truncateRunes(fmt.Sprintf("%s(%s) 风险等级 %s：%s。%s",
 		orSymbol(row.Name, row.Symbol), row.Symbol, row.Level, row.PrimaryReason, row.NextAction), 256)
@@ -369,14 +407,32 @@ func evaluatePositionExit(in positionExitInput, params positionExitParams) model
 	// 评估按证据能力分层：fresh 行情可独立确认计划价和成本类硬事实；MA/ATR
 	// 只在已完成日线充分且有效时参与。旁路查询或技术数据不完整不能反向吞掉
 	// 已经明确触发的计划止损，但缺口仍会落库并把 DataStatus 标为 partial。
-	technicalReady := quoteOK && len(barGaps) == 0 && len(bars) >= params.MinBars
-	if quoteOK {
+	//
+	// 建仓时点防护（与 positionalert.go 规则路径同口径，否则两条链路对同一仓
+	// 结论矛盾）：行情有效日早于建仓/加仓起算日时，价格与技术判断全部发生在
+	// 持仓之前，不能作为本仓风险证据；建仓当日整日 High/Low 可能发生在成交
+	// 之前，一律只用现价——宁可漏掉盘中触达，也不制造持仓前假信号。
+	priorQuote := quoteOK && p.PeakFrom != "" && p.PeakFrom > tradeDate
+	sameDayEntry := p.PeakFrom != "" && p.PeakFrom == tradeDate
+	if priorQuote {
+		gaps = append(gaps, "行情早于建仓起算日，价格与技术信号不参与本次评估")
+	}
+	// 未确认的除权折算：成本/峰值/计划价是旧口径、行情是新口径，价格与技术信号
+	// 全部暂缓（10 转 10 会凭空 -50% 假止损）；独立事件事实（SellReview）保留。
+	if in.pendingCorpAdjust {
+		gaps = append(gaps, "存在未确认的除权折算，成本/价格类信号暂缓评估，请先在持仓页确认")
+	}
+	priceBlocked := priorQuote || in.pendingCorpAdjust
+	technicalReady := quoteOK && !priceBlocked && len(barGaps) == 0 && len(bars) >= params.MinBars
+	if quoteOK && !priceBlocked {
 		dayHigh, dayLow := q.Price, q.Price
-		if q.High > dayHigh {
-			dayHigh = q.High
-		}
-		if q.Low > 0 && q.Low < dayLow {
-			dayLow = q.Low
+		if !sameDayEntry {
+			if q.High > dayHigh {
+				dayHigh = q.High
+			}
+			if q.Low > 0 && q.Low < dayLow {
+				dayLow = q.Low
+			}
 		}
 		if p.PlanStopLoss > 0 && dayLow <= p.PlanStopLoss {
 			signals = append(signals, PositionExitSignal{Key: "plan_stop", Label: "触达计划止损", Detail: fmt.Sprintf("当日最低 %.2f，计划止损 %.2f", dayLow, p.PlanStopLoss), Severity: model.PositionExitLevelUrgent, Value: dayLow, Threshold: p.PlanStopLoss, Crossing: true})
@@ -386,6 +442,9 @@ func evaluatePositionExit(in positionExitInput, params positionExitParams) model
 		}
 		for _, rule := range in.rules {
 			input := positionAlertEval{AvgCost: p.BuyPrice, Price: q.Price, DayHigh: q.High, DayLow: q.Low, Peak: p.PeakPrice, PeakDate: p.PeakDate}
+			if sameDayEntry {
+				input.DayHigh, input.DayLow = 0, 0
+			}
 			hit, value, detail := evaluatePositionAlert(rule, p.Name, input)
 			if !hit {
 				continue
@@ -467,9 +526,17 @@ func evaluatePositionExit(in positionExitInput, params positionExitParams) model
 		row.ATR14, _ = positionExitATR14(bars, params.ATRPeriod)
 		if p.PeakPrice > 0 && row.ATR14 > 0 {
 			row.ATRLine = round4(p.PeakPrice - params.ATRMultiplier*row.ATR14)
-			atrCross := prevClose >= row.ATRLine && currentPrice < row.ATRLine
-			if atrCross {
-				signals = append(signals, PositionExitSignal{Key: "atr14_break", Label: "首次跌破 ATR14 保护线", Detail: fmt.Sprintf("现价 %.2f，保护线 %.2f（峰值 - %.1f×ATR14）", currentPrice, row.ATRLine, params.ATRMultiplier), Severity: model.PositionExitLevelReview, Value: currentPrice, Threshold: row.ATRLine, Crossing: true})
+			// 保护线随峰值上移：peak 刷新后线可能直接越过前收盘，纯「前收盘在线上→
+			// 现价在线下」判定会在最需要保护的 V 型反转日恒 false 且此后永不触发。
+			// 有上一条评估事实时用状态迁移（上次不在线下→本次在线下）判「刚跌破」；
+			// 无历史时退回前收盘判定。持续在线下不重复成信号（长期在线下不天天报）。
+			belowNow := currentPrice < row.ATRLine
+			atrBreak := belowNow && !in.prevBelowATR
+			if !in.hasPrevAssessment {
+				atrBreak = belowNow && prevClose >= row.ATRLine
+			}
+			if atrBreak {
+				signals = append(signals, PositionExitSignal{Key: "atr14_break", Label: "跌破 ATR14 保护线", Detail: fmt.Sprintf("现价 %.2f，保护线 %.2f（峰值 - %.1f×ATR14）", currentPrice, row.ATRLine, params.ATRMultiplier), Severity: model.PositionExitLevelReview, Value: currentPrice, Threshold: row.ATRLine, Crossing: true})
 			}
 		}
 		row.Trend = "intact"
@@ -638,8 +705,9 @@ func positionExitNextAction(level string) string {
 	}
 }
 
-func persistPositionExitAssessment(ctx context.Context, row model.PositionExitAssessment) (bool, error) {
+func persistPositionExitAssessment(ctx context.Context, row model.PositionExitAssessment) (bool, bool, error) {
 	inserted := false
+	notifyNeeded := false
 	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var holding model.Position
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ? AND status = ?",
@@ -658,6 +726,9 @@ func persistPositionExitAssessment(ctx context.Context, row model.PositionExitAs
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			notifyNeeded = true // 首次评估
+		}
 		if err == nil {
 			if previous.Level == row.Level && previous.PrimarySignal == row.PrimarySignal && previous.FactHash == row.FactHash {
 				if row.Session != model.PositionExitSessionClose || previous.Session == model.PositionExitSessionClose && previous.TradeDate == row.TradeDate {
@@ -666,6 +737,8 @@ func persistPositionExitAssessment(ctx context.Context, row model.PositionExitAs
 			}
 			row.PreviousID = previous.ID
 			row.IsUpgrade = positionExitRank(row.Level) > positionExitRank(previous.Level)
+			// 等级升级或主因变化才重新提醒；同等级同主因的逐日事实只落库不再推送。
+			notifyNeeded = row.IsUpgrade || previous.PrimarySignal != row.PrimarySignal
 		}
 		row.EventKey = stablePositionExitHash(struct {
 			PositionID                   int64
@@ -679,7 +752,7 @@ func persistPositionExitAssessment(ctx context.Context, row model.PositionExitAs
 		inserted = result.RowsAffected == 1
 		return nil
 	})
-	return inserted, err
+	return inserted, inserted && notifyNeeded, err
 }
 
 func positionExitRank(level string) int {

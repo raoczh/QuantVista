@@ -50,6 +50,19 @@ func (s *DailyReportService) registerDurableJobHandler() {
 				return 0, findErr
 			}
 			if report.Status == model.ReportStatusProcessing && report.PreviousStatus == "" {
+				// 收养只服务「升级前遗留的无主 processing 行」。auto 与手动的
+				// request_hash 不同，可各建一个在途 JobRun；若该行已被另一在途
+				// 作业绑定，这里收养会让两个 worker 双跑同一份日报。
+				var owners int64
+				if err := tx.Model(&model.JobRun{}).
+					Where("result_type = ? AND result_id = ? AND status IN ?",
+						JobResultDailyReport, report.ID, []string{model.JobStatusQueued, model.JobStatusRunning}).
+					Count(&owners).Error; err != nil {
+					return 0, err
+				}
+				if owners > 0 {
+					return 0, errors.New("日报已被其他作业接管")
+				}
 				return report.ID, nil
 			}
 			previous := report.Status

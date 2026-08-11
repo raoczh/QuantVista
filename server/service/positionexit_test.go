@@ -185,7 +185,7 @@ func TestPositionExitAllModelsMigrateNoHoldingAndCloseRace(t *testing.T) {
 	}
 	row := evaluatePositionExit(positionExitInput{position: p, quote: freshExitQuote(now, 10, 10.1, 9.9), barRows: exitTestBars(now, 10, 10.5, 9.5, 70), now: now, session: model.PositionExitSessionIntraday}, defaultPositionExitParams)
 	common.DB.Model(&model.Position{}).Where("id = ?", p.ID).Update("status", model.PositionStatusClosed)
-	inserted, err := persistPositionExitAssessment(context.Background(), row)
+	inserted, _, err := persistPositionExitAssessment(context.Background(), row)
 	if err != nil || inserted {
 		t.Fatalf("扫描中平仓不得落孤儿事实: inserted=%v err=%v", inserted, err)
 	}
@@ -200,7 +200,7 @@ func TestPositionExitAllModelsMigrateNoHoldingAndCloseRace(t *testing.T) {
 	}
 	leaked := row
 	leaked.UserID, leaked.PositionID, leaked.Symbol = 903, other.ID, other.Symbol
-	if inserted, err := persistPositionExitAssessment(context.Background(), leaked); err != nil || inserted {
+	if inserted, _, err := persistPositionExitAssessment(context.Background(), leaked); err != nil || inserted {
 		t.Fatalf("落库前用户归属复核必须阻止跨用户事实: inserted=%v err=%v", inserted, err)
 	}
 }
@@ -299,16 +299,16 @@ func TestPositionExitConsumesAlertEventAndPersistsMeaningfulTransitions(t *testi
 	if first.Level != model.PositionExitLevelReview || first.PrimarySignal != model.AlertKindCostDrawdown {
 		t.Fatalf("已落库 AlertEvent 在规则暂停后仍必须参与统一风险: level=%s primary=%s", first.Level, first.PrimarySignal)
 	}
-	if inserted, err := persistPositionExitAssessment(context.Background(), first); err != nil || !inserted {
-		t.Fatalf("首次评估应落库: inserted=%v err=%v", inserted, err)
+	if inserted, notify, err := persistPositionExitAssessment(context.Background(), first); err != nil || !inserted || !notify {
+		t.Fatalf("首次评估应落库并允许通知: inserted=%v notify=%v err=%v", inserted, notify, err)
 	}
 	closeSnapshot := first
 	closeSnapshot.Session = model.PositionExitSessionClose
 	closeSnapshot.EvaluatedAt = now.Add(2 * time.Hour)
-	if inserted, err := persistPositionExitAssessment(context.Background(), closeSnapshot); err != nil || !inserted {
-		t.Fatalf("盘后收盘快照即使事实相同也应追加: inserted=%v err=%v", inserted, err)
+	if inserted, notify, err := persistPositionExitAssessment(context.Background(), closeSnapshot); err != nil || !inserted || notify {
+		t.Fatalf("盘后收盘快照即使事实相同也应追加，但同级同主因不得重复通知: inserted=%v notify=%v err=%v", inserted, notify, err)
 	}
-	if inserted, err := persistPositionExitAssessment(context.Background(), closeSnapshot); err != nil || inserted {
+	if inserted, _, err := persistPositionExitAssessment(context.Background(), closeSnapshot); err != nil || inserted {
 		t.Fatalf("相同盘后槽位必须幂等: inserted=%v err=%v", inserted, err)
 	}
 
@@ -316,17 +316,17 @@ func TestPositionExitConsumesAlertEventAndPersistsMeaningfulTransitions(t *testi
 	changedPrimary.Session = model.PositionExitSessionIntraday
 	changedPrimary.EvaluatedAt = now.Add(3 * time.Hour)
 	changedPrimary.PrimarySignal = "atr14_break"
-	changedPrimary.PrimaryReason = "首次跌破 ATR14 保护线"
+	changedPrimary.PrimaryReason = "跌破 ATR14 保护线"
 	changedPrimary.FactHash = "changed-primary-fact"
-	if inserted, err := persistPositionExitAssessment(context.Background(), changedPrimary); err != nil || !inserted {
-		t.Fatalf("同级主因变化必须追加: inserted=%v err=%v", inserted, err)
+	if inserted, notify, err := persistPositionExitAssessment(context.Background(), changedPrimary); err != nil || !inserted || !notify {
+		t.Fatalf("同级主因变化必须追加并允许重新通知: inserted=%v notify=%v err=%v", inserted, notify, err)
 	}
 	recovered := changedPrimary
 	recovered.EvaluatedAt = now.Add(4 * time.Hour)
 	recovered.Level, recovered.PrimarySignal = model.PositionExitLevelNormal, "normal"
 	recovered.PrimaryReason, recovered.FactHash = "当前没有新触发的卖出风险事实", "recovered-normal-fact"
 	recovered.ShouldTodo = false
-	if inserted, err := persistPositionExitAssessment(context.Background(), recovered); err != nil || !inserted {
+	if inserted, _, err := persistPositionExitAssessment(context.Background(), recovered); err != nil || !inserted {
 		t.Fatalf("风险恢复为 normal 必须追加: inserted=%v err=%v", inserted, err)
 	}
 }

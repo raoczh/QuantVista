@@ -549,6 +549,11 @@ func (r *jobRuntime) startOwned(ownerType string, userID int64, triggeredBy *int
 		if parentID != nil && found {
 			return nil, ErrJobAlreadyRunning
 		}
+		// system 作业按 kind 全局互斥（activeKey 不含请求 hash），命中的在途 run 可能
+		// 是另一个业务身份（如另一交易日）的请求。这里保持“返回在途 run”的复用语义
+		//（管理员手动触发要看到“已在跑”的原 run）；**要求业务身份唯一的调用方**
+		//（如 ScheduleDailyDiscovery / ScheduleCandidateAudit）必须自行比对返回 run
+		// 的快照身份，不一致时走延迟补交，不得把静默合并当作提交成功。
 		return active, err
 	}
 	r.startWorkers()
@@ -630,21 +635,6 @@ func snapshotJSONRequest(snapshot []byte) json.RawMessage {
 		return append(json.RawMessage(nil), persisted.Request...)
 	}
 	return nil
-}
-
-func findActiveJobForStart(userID int64, kind, requestHash string, retry bool) (*LLMTaskView, bool, error) {
-	view, found, err := findActiveJobResult(userID, kind, requestHash)
-	if err != nil || !found {
-		return view, found, err
-	}
-	if retry {
-		return nil, true, ErrJobAlreadyRunning
-	}
-	return view, true, nil
-}
-
-func findActiveJobRun(userID int64, kind, requestHash string) (*model.JobRun, bool, error) {
-	return findActiveJobRunOwned(model.JobOwnerUser, userID, kind, requestHash)
 }
 
 func findActiveJobRunOwned(ownerType string, userID int64, kind, requestHash string) (*model.JobRun, bool, error) {
@@ -1114,6 +1104,10 @@ func (r *jobRuntime) failQueued(jobID int64, code, message string) {
 	r.notifyFailedJob(run.ID)
 }
 
+// recoverPersisted 启动恢复。**单活实例假设**：本方法把全库 running 无条件视为
+// 上一进程崩溃遗留并收敛为 interrupted——同库同时起第二个实例（蓝绿重叠/误起双进程）
+// 会误杀另一实例正在执行的作业（业务结果可能已提交而 JobRun 显示中断）。部署必须
+// 保证同一数据库同时只有一个服务进程；引入多实例前需先给作业加租约/心跳。
 func (r *jobRuntime) recoverPersisted() error {
 	if common.DB == nil {
 		return errors.New("数据库尚未初始化")

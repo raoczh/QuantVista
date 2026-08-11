@@ -479,7 +479,7 @@ func enrichTodoItem(userID int64, today string, item *TodoItem) error {
 		item.eventDate = row.ApplyDate
 		item.DueAt = parseLocalDate(row.ApplyDate)
 		item.CanComplete = true
-		item.DeepLink = "/today?source=ipo"
+		item.DeepLink = "/today?source=ipo&status=awareness"
 	case TodoKindSellReview:
 		var row model.SellReview
 		if err := common.DB.Where("id = ? AND user_id = ?", item.RefID, userID).First(&row).Error; err != nil {

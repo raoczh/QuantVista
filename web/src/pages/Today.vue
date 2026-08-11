@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NAlert,
@@ -138,8 +138,15 @@ async function load() {
 
 function changeFilter() {
   page.value = 1
-  void load()
 }
+
+// 加载统一由状态 watch 驱动：URL 驱动的变化（点导航清空 query、浏览器前进/后退）
+// 会经 useRouteQueryState 写回这些 ref，若只靠 UI 事件触发加载，页面会停在
+// “筛选已复位、列表还是旧数据”的错位视图。同一 tick 的多个变更（如切筛选同时
+// 重置页码）由 Vue 批处理合并为一次加载；in-flight 请求由 load 内的 abort 兜底。
+watch([status, scope, source, page], () => {
+  void load()
+})
 
 function kindMeta(kind: string) {
   switch (kind) {
@@ -468,7 +475,6 @@ onBeforeUnmount(() => {
           :page-size="20"
           :item-count="data?.matched_total || 0"
           class="pagination"
-          @update:page="load"
         />
       </SectionCard>
 

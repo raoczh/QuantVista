@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -964,12 +965,29 @@ func TestPopularityDailyNamePriority(t *testing.T) {
 func TestPopularityDailyOrderSQLDialectSafe(t *testing.T) {
 	setupTestDB(t)
 
-	src, err := os.ReadFile("mood.go")
+	// 源码级铁丝网扫描整个 service 目录：mood.go 修过的坑在 discovery.go /
+	// candidateaudit.go 又复发过一次，只盯单文件拦不住新代码。限定名
+	// （table.rank）MySQL 允许，不算违例。
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("读取 mood.go 失败: %v", err)
+		t.Fatalf("读取 service 目录失败: %v", err)
 	}
-	if strings.Contains(string(src), `Order("rank`) {
-		t.Fatal(`mood.go 出现裸 Order("rank...")：rank 是 MySQL 保留字，须用 clause.OrderByColumn 让方言加引号`)
+	orderRe := regexp.MustCompile(`Order\("([^"]*)"`)
+	bareRankRe := regexp.MustCompile(`(^|[^.\w])rank\b`)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("读取 %s 失败: %v", name, err)
+		}
+		for _, m := range orderRe.FindAllStringSubmatch(string(src), -1) {
+			if bareRankRe.MatchString(m[1]) {
+				t.Errorf(`%s 出现裸 Order 含 rank（MySQL 保留字，生产 1064）: %s —— 须用 clause.OrderByColumn 让方言加引号`, name, m[0])
+			}
+		}
 	}
 
 	var rows []model.PopularityRank

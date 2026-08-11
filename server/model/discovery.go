@@ -11,7 +11,7 @@ import (
 // owner_type 固定为 system，owner_user_id 保持 NULL，供所有用户消费同一份结果。
 type CandidateDiscoveryRun struct {
 	ID               int64      `gorm:"primaryKey" json:"id"`
-	JobRunID         *int64     `gorm:"uniqueIndex;index" json:"job_run_id,omitempty"`
+	JobRunID         *int64     `gorm:"uniqueIndex" json:"job_run_id,omitempty"`
 	OwnerType        string     `gorm:"size:16;not null;default:system;index" json:"owner_type"`
 	OwnerUserID      *int64     `gorm:"column:owner_user_id;index" json:"owner_user_id,omitempty"`
 	Market           string     `gorm:"size:8;not null;uniqueIndex:idx_cdr_identity_v2,priority:1" json:"market"`

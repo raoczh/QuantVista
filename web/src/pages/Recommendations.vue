@@ -999,6 +999,7 @@ const AUDIT_REASON_LABEL: Record<string, string> = {
   picked_adverse_next_day: '入选后次日不利',
   candidate_facts_missing: '候选事实缺失',
   candidate_facts_ambiguous: '候选事实冲突',
+  signal_factor_snapshot_missing: '信号日因子快照缺失',
   unknown: '事实不足',
 }
 function auditReasonLabel(reason: string): string {
@@ -1018,6 +1019,8 @@ const recallStages = computed(() => {
 async function loadRecall() {
   recallLoading.value = true
   recallError.value = ''
+  // 切换推荐类型或重新打开时先清空旧报表；请求失败不能残留上一类型的数据。
+  dailyAudit.value = null
   const [recallResult, auditResult] = await Promise.allSettled([
     getRecallReport(form.value.type, recallHorizon.value, recallK.value),
     getDailyAuditReport(form.value.type),

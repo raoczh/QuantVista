@@ -23,7 +23,7 @@ const (
 // 它只负责编排共享市场事实；用户明细保存在 CandidateAuditItem 并按 user_id 隔离。
 type CandidateAuditRun struct {
 	ID          int64  `gorm:"primaryKey" json:"id"`
-	JobRunID    *int64 `gorm:"uniqueIndex;index" json:"job_run_id,omitempty"`
+	JobRunID    *int64 `gorm:"uniqueIndex" json:"job_run_id,omitempty"`
 	OwnerType   string `gorm:"size:16;not null;default:system;index" json:"owner_type"`
 	OwnerUserID *int64 `gorm:"column:owner_user_id;index" json:"owner_user_id,omitempty"`
 

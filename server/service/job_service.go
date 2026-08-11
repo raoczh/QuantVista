@@ -314,7 +314,8 @@ func isDurableJobKind(kind string) bool {
 func isSystemDurableJobKind(kind string) bool {
 	switch strings.TrimSpace(kind) {
 	case JobKindSyncDailyBars, JobKindBackfillCalendar, JobKindSnapshotMarket,
-		JobKindSyncMarketWide, JobKindInitMarketHistory, JobKindFactorRebuild, JobKindDailyDiscovery:
+		JobKindSyncMarketWide, JobKindInitMarketHistory, JobKindFactorRebuild, JobKindDailyDiscovery,
+		JobKindCandidateAudit:
 		return true
 	default:
 		return false

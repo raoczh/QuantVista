@@ -352,15 +352,11 @@ func auditAttributionValues(item model.CandidateAuditItem, bySource bool) []stri
 	if raw == "" {
 		raw = item.Channel
 	}
-	fallback := "not_discovered_marketwide"
 	if bySource {
 		raw = item.SourceSet
 		if raw == "" {
 			raw = item.Source
 		}
-	}
-	if item.FunnelStage != "absent" || item.PrimaryReasonCode == "discovered_not_in_user_pool" {
-		fallback = "discovered_not_in_user_pool"
 	}
 	values := make([]string, 0)
 	for _, value := range strings.Split(raw, ",") {
@@ -369,6 +365,19 @@ func auditAttributionValues(item model.CandidateAuditItem, bySource bool) []stri
 		}
 	}
 	if len(values) == 0 {
+		fallback := "channel_unknown"
+		if bySource {
+			fallback = "source_unknown"
+			if item.CandidateEventID == 0 {
+				if item.DiscoveryItemID > 0 {
+					fallback = "discovered_not_in_user_pool"
+				} else {
+					fallback = "not_discovered_marketwide"
+				}
+			}
+		} else if item.DiscoveryItemID == 0 {
+			fallback = "not_discovered_marketwide"
+		}
 		values = append(values, fallback)
 	}
 	sort.Strings(values)
@@ -381,6 +390,10 @@ func candidateAuditBucketLabel(key string) string {
 		return "未被全市场发现"
 	case "discovered_not_in_user_pool":
 		return "已发现但未进用户池"
+	case "source_unknown":
+		return "来源事实缺失"
+	case "channel_unknown":
+		return "发现通道事实缺失"
 	default:
 		return sourceLabelOrKey(key)
 	}

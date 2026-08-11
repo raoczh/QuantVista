@@ -17,6 +17,7 @@ import (
 	"quantvista/model"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // CandidateDiscovery 是共享的全市场候选发现事实。它只读取因子宽表一次，
@@ -375,8 +376,15 @@ func loadDiscoveryHistory(tradeDate, parameterHash string, signals map[string][]
 		symbols = append(symbols, symbol)
 	}
 	// 当前固定通道很少，按通道/代码成对读取，再在内存中筛选，避免 SQL 方言对复合 IN 的依赖。
+	// 只需要每个 (channel,symbol) 的**最新一行**：FirstSeenDate 在写入时逐日传承，
+	// 无须全史求最早日期。查询按 90 个自然日封窗保持有界（行数随运行天数线性膨胀，
+	// 全史扫描是增长性隐患）；超过窗口未再入选的股重新起算首见日，属声明过的取舍。
+	windowStart := tradeDate
+	if t, err := time.ParseInLocation("2006-01-02", tradeDate, time.Local); err == nil {
+		windowStart = t.AddDate(0, 0, -90).Format("2006-01-02")
+	}
 	var rows []model.CandidateDiscoveryItem
-	query := common.DB.Joins("JOIN candidate_discovery_runs AS history_run ON history_run.id = candidate_discovery_items.run_id").Where("candidate_discovery_items.market = ? AND candidate_discovery_items.discovery_version = ? AND candidate_discovery_items.trade_date < ? AND candidate_discovery_items.channel IN ? AND candidate_discovery_items.symbol IN ?", "cn", DiscoveryVersion, tradeDate, channels, symbols)
+	query := common.DB.Joins("JOIN candidate_discovery_runs AS history_run ON history_run.id = candidate_discovery_items.run_id").Where("candidate_discovery_items.market = ? AND candidate_discovery_items.discovery_version = ? AND candidate_discovery_items.trade_date < ? AND candidate_discovery_items.trade_date >= ? AND candidate_discovery_items.channel IN ? AND candidate_discovery_items.symbol IN ?", "cn", DiscoveryVersion, tradeDate, windowStart, channels, symbols)
 	if parameterHash != "" {
 		query = query.Where("history_run.factor_version = ? AND history_run.parameter_hash = ?", factorSnapshotVersion, parameterHash)
 	}
@@ -384,24 +392,17 @@ func loadDiscoveryHistory(tradeDate, parameterHash string, signals map[string][]
 		return out
 	}
 	latest := map[string]bool{}
-	first := map[string]string{}
 	for _, row := range rows {
 		key := row.Channel + "\x00" + row.Symbol
-		if !seen[key] {
+		if !seen[key] || latest[key] {
 			continue
 		}
-		if first[key] == "" || row.TradeDate < first[key] {
-			first[key] = row.TradeDate
+		latest[key] = true
+		first := row.FirstSeenDate
+		if first == "" {
+			first = row.TradeDate
 		}
-		if !latest[key] {
-			latest[key] = true
-			out[key] = discoveryHistoryState{FirstDate: first[key], PrevDate: row.TradeDate, PrevConsecutive: row.ConsecutiveDays, PrevRank: row.Rank, PrevScore: row.Score}
-		}
-	}
-	for key, date := range first {
-		state := out[key]
-		state.FirstDate = date
-		out[key] = state
+		out[key] = discoveryHistoryState{FirstDate: first, PrevDate: row.TradeDate, PrevConsecutive: row.ConsecutiveDays, PrevRank: row.Rank, PrevScore: row.Score}
 	}
 	return out
 }
@@ -443,17 +444,25 @@ func ExecuteDailyDiscovery(ctx context.Context, expectedResultID int64, market, 
 	}
 	now := time.Now()
 	var run model.CandidateDiscoveryRun
+	created := false
 	err := common.DB.Where("market = ? AND trade_date = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ?", market, tradeDate, DiscoveryVersion, factorSnapshotVersion, parameterHash).First(&run).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		run = model.CandidateDiscoveryRun{OwnerType: model.JobOwnerSystem, Market: market, TradeDate: tradeDate, AsOf: now, DiscoveryVersion: DiscoveryVersion, FactorVersion: factorSnapshotVersion, ParameterHash: parameterHash, Status: DiscoveryRunStatusProc, StartedAt: now}
 		if err := common.DB.Create(&run).Error; err != nil {
 			return nil, err
 		}
+		created = true
 	} else if err != nil {
 		return nil, err
-	} else if run.Status == DiscoveryRunStatusOK && run.FinishedAt != nil {
+	}
+	// 结果引用错配必须在复用或重置事实之前拒绝：错配时旧运行的 items 不能先被清掉。
+	if expectedResultID > 0 && run.ID != expectedResultID {
+		return nil, fmt.Errorf("发现作业结果引用错配: expected=%d actual=%d", expectedResultID, run.ID)
+	}
+	if !created && run.Status == DiscoveryRunStatusOK && run.FinishedAt != nil {
 		return &run, nil
-	} else {
+	}
+	if !created {
 		run.Status, run.Error, run.PartialReason, run.AsOf, run.StartedAt, run.FinishedAt = DiscoveryRunStatusProc, "", "", now, now, nil
 		if err := common.DB.Model(&run).Updates(map[string]any{"status": run.Status, "error": "", "partial_reason": "", "as_of": now, "started_at": now, "finished_at": nil}).Error; err != nil {
 			return nil, err
@@ -461,9 +470,6 @@ func ExecuteDailyDiscovery(ctx context.Context, expectedResultID int64, market, 
 		if err := common.DB.Where("run_id = ?", run.ID).Delete(&model.CandidateDiscoveryItem{}).Error; err != nil {
 			return nil, err
 		}
-	}
-	if expectedResultID > 0 && run.ID != expectedResultID {
-		return nil, fmt.Errorf("发现作业结果引用错配: expected=%d actual=%d", expectedResultID, run.ID)
 	}
 	signals := BuildDiscoverySignals(t, discoveryTopN)
 	history := loadDiscoveryHistory(tradeDate, parameterHash, signals)
@@ -493,9 +499,16 @@ func ExecuteDailyDiscovery(ctx context.Context, expectedResultID int64, market, 
 				}
 			}
 			prevRank, prevScore := state.PrevRank, state.PrevScore
+			rankChange, scoreChange := 0, 0.0
+			if state.PrevDate != "" {
+				// 首次入选没有“变化”可言：PrevRank/PrevScore 零值会伪造出
+				// “排名变化 -N / 分数变化 +score”，只有真实历史才计算变化量。
+				rankChange = prevRank - (rank + 1)
+				scoreChange = round2(signal.Score - prevScore)
+			}
 			facts, _ := json.Marshal(signal.SourceFacts)
 			factors, _ := json.Marshal(signal.FactorSummary)
-			items = append(items, model.CandidateDiscoveryItem{RunID: run.ID, TradeDate: tradeDate, Market: signal.Market, DiscoveryVersion: DiscoveryVersion, Channel: channel, Symbol: signal.Symbol, Name: signal.Name, Rank: rank + 1, Score: signal.Score, FirstSeenDate: first, ConsecutiveDays: consecutive, RankChange: prevRank - (rank + 1), ScoreChange: round2(signal.Score - prevScore), SourceFacts: string(facts), FactorSummary: string(factors), DataStatus: signal.DataStatus, PartialReason: signal.PartialReason, AsOf: now})
+			items = append(items, model.CandidateDiscoveryItem{RunID: run.ID, TradeDate: tradeDate, Market: signal.Market, DiscoveryVersion: DiscoveryVersion, Channel: channel, Symbol: signal.Symbol, Name: signal.Name, Rank: rank + 1, Score: signal.Score, FirstSeenDate: first, ConsecutiveDays: consecutive, RankChange: rankChange, ScoreChange: scoreChange, SourceFacts: string(facts), FactorSummary: string(factors), DataStatus: signal.DataStatus, PartialReason: signal.PartialReason, AsOf: now})
 		}
 	}
 	scanned := discoveryScannedCount(t)
@@ -548,6 +561,11 @@ func registerDiscoveryBinding() durableJobBinding {
 			}
 			if req.Version == 0 {
 				req.Version = 1
+			}
+			if req.ParameterHash == "" {
+				// 旧队列快照可能缺参数 hash；执行侧会补当前默认，这里同步补齐，
+				// 否则 binding 以空 hash 建行、执行侧按默认 hash 查询会身份错开。
+				req.ParameterHash = discoveryParameterHash()
 			}
 			var row model.CandidateDiscoveryRun
 			err := tx.Where("market = ? AND trade_date = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ?", req.Market, req.TradeDate, DiscoveryVersion, factorSnapshotVersion, req.ParameterHash).First(&row).Error
@@ -630,25 +648,39 @@ func ScheduleDailyDiscovery(tradeDate, trigger string) {
 	if err := common.DB.Where("market = ? AND trade_date = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ?", req.Market, req.TradeDate, DiscoveryVersion, factorSnapshotVersion, req.ParameterHash).First(&existing).Error; err == nil && existing.Status == DiscoveryRunStatusOK && existing.FinishedAt != nil {
 		return
 	}
-	if _, err := defaultJobRuntime.startSystemWithBinding(nil, JobKindDailyDiscovery, req, nil); err != nil {
-		// 同 kind 在途去重不能丢掉另一个交易日：队列繁忙或已有运行时都记一次
-		// 有界延迟补交；若同日任务已经成功，重试入口会在查库后直接返回。
+	// 同 kind 在途去重不能丢掉另一个交易日：队列繁忙、已有运行或被合并到不同
+	// 身份的在途作业时，都记一次有界延迟补交；若同日任务已经成功，重试入口会
+	// 在查库后直接返回。
+	scheduleRetry := func() {
+		key := tradeDate + ":" + req.ParameterHash
+		discoveryScheduleMu.Lock()
+		if !discoverySchedulePending[key] {
+			discoverySchedulePending[key] = true
+			time.AfterFunc(systemScheduleRetryDelay, func() {
+				discoveryScheduleMu.Lock()
+				delete(discoverySchedulePending, key)
+				discoveryScheduleMu.Unlock()
+				ScheduleDailyDiscovery(tradeDate, trigger)
+			})
+		}
+		discoveryScheduleMu.Unlock()
+	}
+	run, err := defaultJobRuntime.startSystemWithBinding(nil, JobKindDailyDiscovery, req, nil)
+	if err != nil {
 		if errors.Is(err, ErrJobQueueBusy) || errors.Is(err, ErrJobAlreadyRunning) {
-			key := tradeDate + ":" + req.ParameterHash
-			discoveryScheduleMu.Lock()
-			if !discoverySchedulePending[key] {
-				discoverySchedulePending[key] = true
-				time.AfterFunc(systemScheduleRetryDelay, func() {
-					discoveryScheduleMu.Lock()
-					delete(discoverySchedulePending, key)
-					discoveryScheduleMu.Unlock()
-					ScheduleDailyDiscovery(tradeDate, trigger)
-				})
-			}
-			discoveryScheduleMu.Unlock()
+			scheduleRetry()
 			return
 		}
 		common.SysWarn("提交全市场发现作业失败: %v", err)
+		return
+	}
+	// system 同 kind 全局互斥：命中在途作业时 runtime 返回的是**原 run**（可能是
+	// 另一交易日/参数的请求），静默把它当“已受理”会让本交易日的发现永久缺失、
+	// 相邻日审计也不再触发。比对快照身份，不一致必须延迟补交。
+	var accepted discoveryJobRequest
+	if run == nil || json.Unmarshal(snapshotJSONRequest([]byte(run.RequestSnapshot)), &accepted) != nil ||
+		accepted.TradeDate != req.TradeDate || accepted.ParameterHash != req.ParameterHash {
+		scheduleRetry()
 	}
 }
 
@@ -693,8 +725,23 @@ func LatestDiscoveryStatus(limit int) (*model.CandidateDiscoveryRun, []model.Can
 		return nil, nil, err
 	}
 	var items []model.CandidateDiscoveryItem
-	if err := common.DB.Where("run_id = ?", run.ID).Order("channel, rank, symbol").Limit(limit).Find(&items).Error; err != nil {
+	// rank 是 MySQL 8.0.2+ 保留字，须 OrderByColumn 加引号（同 mood.go 先例）。
+	// limit 按**每通道**生效：单一全局 limit 会在满池时只返回字母序靠前的通道，
+	// 把其余通道显示成空池、与 run.success_count 矛盾。
+	perChannel := limit
+	var rows []model.CandidateDiscoveryItem
+	if err := common.DB.Where("run_id = ?", run.ID).Order("channel").
+		Order(clause.OrderByColumn{Column: clause.Column{Name: "rank"}}).
+		Order("symbol").Find(&rows).Error; err != nil {
 		return nil, nil, err
+	}
+	counts := map[string]int{}
+	for _, row := range rows {
+		if counts[row.Channel] >= perChannel {
+			continue
+		}
+		counts[row.Channel]++
+		items = append(items, row)
 	}
 	return &run, items, nil
 }

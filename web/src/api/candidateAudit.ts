@@ -2,6 +2,7 @@ export interface CandidateAuditParameters {
   audit_version: string
   outcome_version: string
   discovery_version: string
+  discovery_parameter_hash: string
   factor_version: string
   selection_outcome_version: string
   label_version: string
