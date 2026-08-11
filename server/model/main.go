@@ -118,6 +118,21 @@ func Migrate() error {
 			return err
 		}
 	}
+	// 发现明细最初按“交易日+版本+通道+股票”唯一，参数或因子版本在同日升级时，
+	// 新运行会与旧事实撞索引。现改为 run+channel+symbol；旧索引必须显式删除，
+	// AutoMigrate 只会创建新索引，不会移除旧约束。
+	if m := common.DB.Migrator(); m.HasIndex(&CandidateDiscoveryItem{}, "idx_cdi_day_channel_symbol") {
+		if err := m.DropIndex(&CandidateDiscoveryItem{}, "idx_cdi_day_channel_symbol"); err != nil {
+			return err
+		}
+	}
+	// 运行身份 v2 把 factor_version 纳入唯一键；旧同名约束无法由 AutoMigrate 原地
+	// 改列，改用新索引名创建后再删除旧索引，升级过程不需要用户手工 SQL。
+	if m := common.DB.Migrator(); m.HasIndex(&CandidateDiscoveryRun{}, "idx_cdr_identity") {
+		if err := m.DropIndex(&CandidateDiscoveryRun{}, "idx_cdr_identity"); err != nil {
+			return err
+		}
+	}
 	// P0-4 存量自定义策略迁移（幂等）：为旧可变行固化 revision 1，并回填当前
 	// revision 指针。失败时阻断启动，避免新扫描继续从兼容字段读取无版本内容。
 	if err := MigrateScreenerStrategyRevisions(); err != nil {

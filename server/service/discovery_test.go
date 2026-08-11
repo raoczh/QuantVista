@@ -18,17 +18,17 @@ func discoveryTestTable(date string, symbols ...string) *FactorTable {
 	if len(symbols) == 0 {
 		symbols = []string{"600003", "600001", "600002"}
 	}
-	keys := []string{"close", "chg_pct", "chg_5d", "chg_20d", "ma20", "ma60", "vol_boost", "vol_5v20", "pos_60", "volatility_20", "div_yield", "atr_pct", "amount_yi", "turnover_rate", "high_20d", "bull_align", "above_ma20", "above_ma60", "is_st"}
+	keys := []string{"close", "chg_pct", "chg_5d", "chg_20d", "chg_60d", "ma20", "ma60", "bias_20", "vol_boost", "vol_5v20", "pos_60", "volatility_20", "div_yield", "atr_pct", "amount_yi", "turnover_rate", "high_20d", "bull_align", "above_ma20", "above_ma60", "chip_profit", "chip_bars", "is_st"}
 	cols := make(map[string][]float64, len(keys))
 	for _, key := range keys {
 		cols[key] = make([]float64, len(symbols))
 	}
 	for i := range symbols {
 		values := map[string]float64{
-			"close": 10, "chg_pct": 4, "chg_5d": -2, "chg_20d": 12, "ma20": 9, "ma60": 8,
+			"close": 10, "chg_pct": 4, "chg_5d": -2, "chg_20d": 12, "chg_60d": 20, "ma20": 9, "ma60": 8,
 			"vol_boost": 2, "vol_5v20": 0.8, "pos_60": 40, "volatility_20": 2, "div_yield": 3,
 			"atr_pct": 2, "amount_yi": 3, "turnover_rate": 5, "high_20d": 1, "bull_align": 1,
-			"above_ma20": 1, "above_ma60": 1, "is_st": 0,
+			"bias_20": 3, "above_ma20": 1, "above_ma60": 1, "chip_profit": 5, "chip_bars": 210, "is_st": 0,
 		}
 		for key, value := range values {
 			cols[key][i] = value
@@ -103,7 +103,7 @@ func TestExecuteDailyDiscoveryIdempotentConcurrentAndSystemOwner(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			gotRun, err := ExecuteDailyDiscovery(context.Background(), int64(i+1), "cn", date, "test-param")
+			gotRun, err := ExecuteDailyDiscovery(context.Background(), 0, "cn", date, "test-param")
 			got[i], errs[i] = gotRun, err
 		}(i)
 	}
@@ -126,7 +126,7 @@ func TestExecuteDailyDiscoveryIdempotentConcurrentAndSystemOwner(t *testing.T) {
 	if count != int64(len(discoveryChannels)*len(discoveryTestTable(date).Symbols)) {
 		t.Fatalf("发现 item 数量错误: %d", count)
 	}
-	second, err := ExecuteDailyDiscovery(context.Background(), 99, "cn", date, "test-param")
+	second, err := ExecuteDailyDiscovery(context.Background(), 0, "cn", date, "test-param")
 	if err != nil || second.ID != runs[0].ID {
 		t.Fatalf("同日 success 重复执行应直接复用，run=%+v err=%v", second, err)
 	}
@@ -134,6 +134,43 @@ func TestExecuteDailyDiscoveryIdempotentConcurrentAndSystemOwner(t *testing.T) {
 	common.DB.Model(&model.CandidateDiscoveryItem{}).Where("trade_date = ?", date).Count(&countAfter)
 	if countAfter != count {
 		t.Fatalf("同日幂等重复插入 item: before=%d after=%d", count, countAfter)
+	}
+}
+
+func TestDiscoveryZeroHitChannelIsCompleteAndMissingFactorIsPartial(t *testing.T) {
+	setupTestDB(t)
+	dateOK := "2043-02-04"
+	cleanDiscoveryDate(t, dateOK)
+	table := discoveryTestTable(dateOK)
+	for i := range table.cols["div_yield"] {
+		table.cols["div_yield"][i] = 0 // 数据完整但价值通道合法零命中。
+	}
+	installDiscoveryTestTable(t, table)
+	run, err := ExecuteDailyDiscovery(context.Background(), 0, "cn", dateOK, "zero-hit-param")
+	if err != nil || run.Status != DiscoveryRunStatusOK {
+		t.Fatalf("合法零命中通道不应误报 partial: run=%+v err=%v", run, err)
+	}
+
+	datePartial := "2043-02-05"
+	cleanDiscoveryDate(t, datePartial)
+	broken := discoveryTestTable(datePartial)
+	delete(broken.cols, "div_yield")
+	installDiscoveryTestTable(t, broken)
+	run, err = ExecuteDailyDiscovery(context.Background(), 0, "cn", datePartial, "missing-factor-param")
+	if err != nil || run.Status != DiscoveryRunStatusPart || !strings.Contains(run.PartialReason, "value_dividend") {
+		t.Fatalf("通道必需因子缺失必须 partial: run=%+v err=%v", run, err)
+	}
+}
+
+func TestDiscoveryRejectsMismatchedFactorTradeDate(t *testing.T) {
+	setupTestDB(t)
+	installDiscoveryTestTable(t, discoveryTestTable("2043-02-07"))
+	if _, err := ExecuteDailyDiscovery(context.Background(), 0, "cn", "2043-02-06", "date-mismatch-param"); err == nil || !strings.Contains(err.Error(), "交易日不匹配") {
+		t.Fatalf("不得把新宽表冒充旧交易日发现事实: %v", err)
+	}
+	var count int64
+	if err := common.DB.Model(&model.CandidateDiscoveryRun{}).Where("trade_date = ?", "2043-02-06").Count(&count).Error; err != nil || count != 0 {
+		t.Fatalf("日期不匹配时不应创建运行事实: count=%d err=%v", count, err)
 	}
 }
 
@@ -254,6 +291,7 @@ func TestDiscoveryFailedAndStartupBackfillDecision(t *testing.T) {
 
 func TestRecentDiscoveryWindowRecomputesScoreAndKeepsGlobalPool(t *testing.T) {
 	setupTestDB(t)
+	parameterHash := discoveryParameterHash()
 	dates := []string{"2043-04-01", "2043-04-02", "2043-04-03", "2043-04-04", "2043-04-05", "2043-04-06", "2043-04-07"}
 	for _, date := range dates {
 		cleanDiscoveryDate(t, date)
@@ -274,7 +312,7 @@ func TestRecentDiscoveryWindowRecomputesScoreAndKeepsGlobalPool(t *testing.T) {
 			}
 		}
 		installDiscoveryTestTable(t, table)
-		if _, err := ExecuteDailyDiscovery(context.Background(), 0, "cn", date, "window-param"); err != nil {
+		if _, err := ExecuteDailyDiscovery(context.Background(), 0, "cn", date, parameterHash); err != nil {
 			t.Fatalf("%s 发现失败: %v", date, err)
 		}
 	}
@@ -329,6 +367,30 @@ func TestRecentDiscoveryWindowRecomputesScoreAndKeepsGlobalPool(t *testing.T) {
 	common.DB.Model(&model.CandidateDiscoveryRun{}).Where("trade_date IN ?", dates).Count(&after)
 	if before != after {
 		t.Fatalf("用户消费发现事实不应重复创建 run: %d -> %d", before, after)
+	}
+}
+
+func TestDiscoveryCandidateDefersHistoricalLiquidityUntilFreshQuote(t *testing.T) {
+	base := candidateFilter{minAmount: 1e8}
+	c := candidate{Symbol: "600001", Market: "cn", Name: "ST旧名称", Price: 8, Amount: 5e7, Discovery: &CandidateDiscoverySummary{LastSeenDate: "2043-04-07"}}
+	if !candidateEligibleBeforeFresh(c, base) {
+		t.Fatal("发现候选不能因历史名称/价格/成交额提前出池，应等待当前行情复判")
+	}
+	c.Amount = 0
+	if reason := applyFreshQuoteToCand(&c, &datasource.Quote{Name: "测试股份", Price: 10, Amount: 5e7, DataTime: time.Now()}, RecFilters{}); reason != "" {
+		t.Fatalf("行情筛选不应代替基础流动性门: %s", reason)
+	}
+	if c.Name != "测试股份" {
+		t.Fatalf("fresh quote 应覆盖历史名称: %q", c.Name)
+	}
+	if reason := candidateEligibilityReason(c, base); !strings.Contains(reason, "流动性门槛") {
+		t.Fatalf("fresh 当前成交额不足必须透明排除: %q", reason)
+	}
+	if reason := applyFreshQuoteToCand(&c, &datasource.Quote{Name: "ST测试股份", Price: 10, Amount: 2e8, DataTime: time.Now()}, RecFilters{}); reason != "" {
+		t.Fatalf("行情筛选不应代替基础身份门: %s", reason)
+	}
+	if reason := candidateEligibilityReason(c, base); !strings.Contains(reason, "ST/退市") {
+		t.Fatalf("当天新戴帽的发现候选必须在 fresh 后排除: %q", reason)
 	}
 }
 

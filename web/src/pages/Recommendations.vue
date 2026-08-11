@@ -297,7 +297,9 @@ const current = ref<RecommendationView | null>(null)
 const showAllReady = ref(false)
 const discoveryStatus = ref<DiscoveryStatusView | null>(null)
 const visibleDiscoveryChannels = computed(() => [
-  ...new Set((discoveryStatus.value?.items || []).map((item) => item.channel)),
+  ...new Set(discoveryStatus.value?.channels?.length
+    ? discoveryStatus.value.channels
+    : (discoveryStatus.value?.items || []).map((item) => item.channel)),
 ])
 
 async function loadDiscoveryStatus() {
@@ -311,6 +313,7 @@ async function loadDiscoveryStatus() {
       reason: '发现状态暂不可用',
       run: null,
       items: [],
+      channels: [],
     }
   }
 }
@@ -576,6 +579,8 @@ const SOURCE_LABEL: Record<string, string> = {
   dipper: '回调榜',
   lowpb: '低PB榜',
   strategy_signal: '策略信号',
+  daily_discovery: '今日全市场发现',
+  recent_discovery: '近5日候选记忆',
 }
 function sourceText(c: PoolCandidate) {
   const arr = c.sources && c.sources.length ? c.sources : c.source ? [c.source] : []
@@ -1356,10 +1361,10 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
                 {{ discoveryRunLabel(discoveryStatus?.status || 'unavailable') }}
               </n-tag>
               <span v-if="discoveryStatus?.run" class="discovery-status-meta">
-                {{ discoveryStatus.run.trade_date }} · 覆盖 {{ discoveryStatus.run.universe_count }} 只 · 候选 {{ discoveryStatus.run.success_count }} 条
+                {{ discoveryStatus.run.trade_date }} · 覆盖 {{ discoveryStatus.run.universe_count }} 只 · 通道命中 {{ discoveryStatus.run.success_count }} 条
               </span>
             </div>
-            <div v-if="discoveryStatus?.items?.length" class="discovery-channels">
+            <div v-if="visibleDiscoveryChannels.length" class="discovery-channels">
               <span v-for="channel in visibleDiscoveryChannels" :key="channel">
                 {{ discoveryChannelLabel(channel) }}
               </span>

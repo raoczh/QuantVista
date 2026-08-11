@@ -14,13 +14,13 @@ type CandidateDiscoveryRun struct {
 	JobRunID         *int64     `gorm:"uniqueIndex;index" json:"job_run_id,omitempty"`
 	OwnerType        string     `gorm:"size:16;not null;default:system;index" json:"owner_type"`
 	OwnerUserID      *int64     `gorm:"column:owner_user_id;index" json:"owner_user_id,omitempty"`
-	Market           string     `gorm:"size:8;not null;uniqueIndex:idx_cdr_identity,priority:1" json:"market"`
-	TradeDate        string     `gorm:"size:10;not null;uniqueIndex:idx_cdr_identity,priority:2" json:"trade_date"`
+	Market           string     `gorm:"size:8;not null;uniqueIndex:idx_cdr_identity_v2,priority:1" json:"market"`
+	TradeDate        string     `gorm:"size:10;not null;uniqueIndex:idx_cdr_identity_v2,priority:2" json:"trade_date"`
 	AsOf             time.Time  `gorm:"not null;index" json:"as_of"`
-	DiscoveryVersion string     `gorm:"size:16;not null;uniqueIndex:idx_cdr_identity,priority:3" json:"discovery_version"`
-	FactorVersion    string     `gorm:"size:16;not null" json:"factor_version"`
+	DiscoveryVersion string     `gorm:"size:16;not null;uniqueIndex:idx_cdr_identity_v2,priority:3" json:"discovery_version"`
+	FactorVersion    string     `gorm:"size:16;not null;uniqueIndex:idx_cdr_identity_v2,priority:4" json:"factor_version"`
 	SourceVersions   string     `gorm:"type:text" json:"source_versions,omitempty"`
-	ParameterHash    string     `gorm:"size:64;not null;uniqueIndex:idx_cdr_identity,priority:4" json:"parameter_hash"`
+	ParameterHash    string     `gorm:"size:64;not null;uniqueIndex:idx_cdr_identity_v2,priority:5" json:"parameter_hash"`
 	Status           string     `gorm:"size:16;not null;default:processing;index" json:"status"` // processing/success/partial/failed
 	UniverseCount    int        `json:"universe_count"`
 	ScannedCount     int        `json:"scanned_count"`
@@ -39,12 +39,12 @@ type CandidateDiscoveryRun struct {
 // 历史 score 只表示当日通道排序事实，消费推荐时必须重新读取行情并重新过硬门。
 type CandidateDiscoveryItem struct {
 	ID               int64     `gorm:"primaryKey" json:"id"`
-	RunID            int64     `gorm:"not null;index:idx_cdi_run" json:"run_id"`
-	TradeDate        string    `gorm:"size:10;not null;uniqueIndex:idx_cdi_day_channel_symbol,priority:1" json:"trade_date"`
-	Market           string    `gorm:"size:8;not null;uniqueIndex:idx_cdi_day_channel_symbol,priority:2" json:"market"`
-	DiscoveryVersion string    `gorm:"size:16;not null;uniqueIndex:idx_cdi_day_channel_symbol,priority:3" json:"discovery_version"`
-	Channel          string    `gorm:"size:32;not null;uniqueIndex:idx_cdi_day_channel_symbol,priority:4" json:"channel"`
-	Symbol           string    `gorm:"size:16;not null;uniqueIndex:idx_cdi_day_channel_symbol,priority:5" json:"symbol"`
+	RunID            int64     `gorm:"not null;index:idx_cdi_run;uniqueIndex:idx_cdi_run_channel_symbol,priority:1" json:"run_id"`
+	TradeDate        string    `gorm:"size:10;not null;index:idx_cdi_market_date,priority:2" json:"trade_date"`
+	Market           string    `gorm:"size:8;not null;index:idx_cdi_market_date,priority:1" json:"market"`
+	DiscoveryVersion string    `gorm:"size:16;not null;index" json:"discovery_version"`
+	Channel          string    `gorm:"size:32;not null;uniqueIndex:idx_cdi_run_channel_symbol,priority:2" json:"channel"`
+	Symbol           string    `gorm:"size:16;not null;uniqueIndex:idx_cdi_run_channel_symbol,priority:3;index" json:"symbol"`
 	Name             string    `gorm:"size:64" json:"name"`
 	Rank             int       `gorm:"not null" json:"rank"`
 	Score            float64   `gorm:"type:decimal(12,4);not null" json:"score"`

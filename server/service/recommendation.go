@@ -1733,27 +1733,43 @@ func loadCandidateFilter(userID int64) candidateFilter {
 // 流动性不足、用户黑名单中的标的。候选池是反编造的根基——
 // 无行情数据的标的只会诱导 LLM 编造依据，一并拒之门外。
 func candidateEligible(c candidate, f candidateFilter) bool {
-	name := strings.ToUpper(c.Name)
-	if strings.Contains(name, "ST") || strings.Contains(name, "退") {
-		return false
+	return candidateEligibilityReason(c, f) == ""
+}
+
+func candidateEligibleBeforeFresh(c candidate, f candidateFilter) bool {
+	if c.Discovery == nil {
+		return candidateEligible(c, f)
 	}
-	// 北交所前缀（与 limitUpPctFor 口径一致）：43/83/87 及 920 新段。
+	// 名称中的 ST/退市标记、价格和成交额都可能自发现日后变化，留到 fresh quote
+	// 覆盖名称与行情后再判；这里只执行不会随行情变化的市场范围和用户黑名单门。
 	if strings.HasPrefix(c.Symbol, "4") || strings.HasPrefix(c.Symbol, "8") || strings.HasPrefix(c.Symbol, "92") {
 		return false
 	}
+	return !f.blacklist[c.Market+":"+c.Symbol]
+}
+
+func candidateEligibilityReason(c candidate, f candidateFilter) string {
+	name := strings.ToUpper(c.Name)
+	if strings.Contains(name, "ST") || strings.Contains(name, "退") {
+		return "ST/退市风险标的不进入推荐候选池"
+	}
+	// 北交所前缀（与 limitUpPctFor 口径一致）：43/83/87 及 920 新段。
+	if strings.HasPrefix(c.Symbol, "4") || strings.HasPrefix(c.Symbol, "8") || strings.HasPrefix(c.Symbol, "92") {
+		return "北交所标的不进入当前 A 股推荐范围"
+	}
 	if c.Price <= 0 {
-		return false
+		return "当前有效行情缺失"
 	}
 	// S0-4：Amount 缺失（=0）不再绕过流动性门槛——旧逻辑 `c.Amount > 0 &&` 让无成交额
 	// 数据的自选股全部免检。自选进池前已按近 20 日日线中位数补齐成交额（buildPool），
 	// 补不到（无日线）的标的与流动性不足同样拒绝：无数据只会诱导 LLM 编造依据。
 	if f.minAmount > 0 && c.Amount < f.minAmount {
-		return false
+		return fmt.Sprintf("当前成交额 %.2f 亿低于候选流动性门槛 %.2f 亿", c.Amount/1e8, f.minAmount/1e8)
 	}
 	if f.blacklist[c.Market+":"+c.Symbol] {
-		return false
+		return "已在用户黑名单中"
 	}
-	return true
+	return ""
 }
 
 // medianAmountsFor 批量取一批标的近 20 根日线成交额的中位数（元）。自选股无榜单
@@ -1796,6 +1812,9 @@ const quoteFreshGateVersion = "qf4"
 // 刷新 Price/ChangePct/Amount 等 quote 派生字段并记 QuoteAsOf，随后复筛用户价格/涨停
 // 条件（applyQuoteFilters，基于新价与当日涨停价）。返回复筛排除原因（空=存活）。
 func applyFreshQuoteToCand(c *candidate, q *datasource.Quote, filters RecFilters) string {
+	if name := strings.TrimSpace(q.Name); name != "" {
+		c.Name = name
+	}
 	c.Price = round2(q.Price)
 	c.ChangePct = round2(q.ChangePct)
 	if q.Amount > 0 {
@@ -1843,6 +1862,11 @@ func (s *RecommendationService) freshenCandidates(ctx context.Context, pool []ca
 			})
 			continue
 		}
+		// 发现池里的成交额来自历史因子，只能用于历史摘要。当前 fresh quote 未提供
+		// 成交额时必须保持 0 并在下面的流动性复判中 fail-closed，不能沿用旧值。
+		if pool[i].Discovery != nil {
+			pool[i].Amount = 0
+		}
 		if reason := applyFreshQuoteToCand(&pool[i], fq.Quote, filters); reason != "" {
 			pool[i].Excluded = reason
 			continue
@@ -1858,7 +1882,7 @@ func (s *RecommendationService) freshenCandidates(ctx context.Context, pool []ca
 // 的行情上。stale/取不到 → 透明排除 + quote_stale 事件（影子标签自然结算可回验误伤）。
 // 名额分配（assignScanQuota）在此之后进行，天然只发给存活者，无需补位轮
 // （qf2 的「先发名额再刷新参评者+池满补位」顺序漏洞由此根治）。
-func (s *RecommendationService) freshenPool(ctx context.Context, pool []candidate, filters RecFilters) []gateNote {
+func (s *RecommendationService) freshenPool(ctx context.Context, pool []candidate, filters RecFilters, base candidateFilter) []gateNote {
 	if s.market == nil {
 		return nil
 	}
@@ -1868,7 +1892,15 @@ func (s *RecommendationService) freshenPool(ctx context.Context, pool []candidat
 			idxs = append(idxs, i)
 		}
 	}
-	_, gates := s.freshenCandidates(ctx, pool, idxs, filters)
+	alive, gates := s.freshenCandidates(ctx, pool, idxs, filters)
+	for _, i := range alive {
+		if pool[i].Excluded != "" {
+			continue
+		}
+		if reason := candidateEligibilityReason(pool[i], base); reason != "" {
+			pool[i].Excluded = reason
+		}
+	}
 	return gates
 }
 
@@ -1976,7 +2008,10 @@ func (s *RecommendationService) buildPool(ctx context.Context, userID int64, mar
 		if len(pool) >= maxPoolIntake {
 			return // 总量护栏：极端规模的自选不再扩池（估值批量请求与快照体积都有界）
 		}
-		if !candidateEligible(c, base) {
+		// 发现候选的历史价/成交额只作身份证据，不能在 fresh quote 之前把“昨日不合格、
+		// 今日已合格”的股票提前丢掉；这里只执行不会随行情变化的身份门，当前价格和
+		// 流动性统一在 freshenPool 后复判。其他实时来源保持既有前置准入。
+		if !candidateEligibleBeforeFresh(c, base) {
 			return // 基础准入不合格（ST/退市/北交所/停牌/流动性/黑名单）：噪声，不进池快照
 		}
 		c.Sources = []string{source}
@@ -2129,7 +2164,7 @@ func (s *RecommendationService) buildPool(ctx context.Context, userID int64, mar
 	// 换手/涨停等用户筛选与后续评分排名一律建立在刷新后的当前有效行情上——qf2 把
 	// 刷新放在旧价筛选之后，旧价 9 元被「最低 10 元」排除的候选即使新价已达标也
 	// 永远失去翻案机会（排除原因还是基于旧价的假账）。stale 透明排除记事件。
-	freshGates := s.freshenPool(ctx, pool, filters)
+	freshGates := s.freshenPool(ctx, pool, filters, base)
 	// 用户筛选（透明标记式排除，基于刷新后行情），随后按来源轮转发放评分名额。
 	for i := range pool {
 		if pool[i].Excluded == "" {

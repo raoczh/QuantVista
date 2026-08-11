@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"math"
 	"runtime"
 	"sort"
@@ -870,9 +871,12 @@ func RebuildFactorTableAsync(reason string) {
 		// 分批初始化不冻结不完整快照）。
 		if n, err := SnapshotFactorTable(t); err != nil {
 			common.SysWarn("因子快照落库失败 %s: %v", t.TradeDate, err)
+			return
 		} else if n > 0 {
 			common.SysLog("因子快照落库完成: %s，%d 行（累计 %d 个交易日）", t.TradeDate, n, FactorSnapshotDays())
 		}
+		// 非 JobRun 的兼容调用同样只能在快照成功后提交发现；推荐请求本身不触发扫描。
+		ScheduleDailyDiscovery(t.TradeDate, "factor_rebuild_async")
 	}()
 }
 
@@ -901,6 +905,7 @@ func RebuildFactorTable(ctx context.Context, reason string) (*FactorTable, error
 	common.SysLog("因子宽表重建完成（%s）: %s，%d 只，耗时 %dms", reason, table.TradeDate, table.Len(), table.BuildMs)
 	if _, err := SnapshotFactorTable(table); err != nil {
 		common.SysWarn("因子快照落库失败 %s: %v", table.TradeDate, err)
+		return nil, fmt.Errorf("因子快照落库失败: %w", err)
 	}
 	return table, nil
 }

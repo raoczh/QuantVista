@@ -36,6 +36,16 @@ func TestCandidateDiscoveryModelsMigrateAndEnforceGlobalIdentity(t *testing.T) {
 	dup := *item
 	dup.ID = 0
 	if err := db.Create(&dup).Error; err == nil {
-		t.Fatal("同日、同版本、同通道、同标的应由唯一约束拒绝重复")
+		t.Fatal("同一运行、同通道、同标的应由唯一约束拒绝重复")
+	}
+	// 同日参数/因子版本升级会建立新运行，必须允许相同标的在新运行中留下独立事实。
+	run2 := &CandidateDiscoveryRun{OwnerType: JobOwnerSystem, Market: "cn", TradeDate: run.TradeDate, AsOf: now, DiscoveryVersion: run.DiscoveryVersion, FactorVersion: "fv-next", ParameterHash: "hash-next", Status: "success", StartedAt: now}
+	if err := db.Create(run2).Error; err != nil {
+		t.Fatalf("创建同日新因子版本 run 失败: %v", err)
+	}
+	item2 := *item
+	item2.ID, item2.RunID = 0, run2.ID
+	if err := db.Create(&item2).Error; err != nil {
+		t.Fatalf("同日新运行应允许保存同一通道标的: %v", err)
 	}
 }

@@ -210,6 +210,7 @@ export interface DiscoveryStatusView {
   reason?: string
   run: DiscoveryRun | null
   items: DiscoveryItem[]
+  channels: string[]
 }
 
 export type ExecutionStatus = 'ready' | 'wait' | 'not_suitable'

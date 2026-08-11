@@ -69,7 +69,7 @@ func recentDiscoveryCandidates(market string, limit int) []discoveryPoolCandidat
 		limit = maxDiscoveryPoolIntake
 	}
 	var latest model.CandidateDiscoveryRun
-	if err := common.DB.Where("market = ? AND owner_type = ? AND status IN ?", market, model.JobOwnerSystem, []string{DiscoveryRunStatusOK, DiscoveryRunStatusPart}).Order("trade_date DESC, id DESC").First(&latest).Error; err != nil {
+	if err := common.DB.Where("market = ? AND owner_type = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ? AND status IN ?", market, model.JobOwnerSystem, DiscoveryVersion, factorSnapshotVersion, discoveryParameterHash(), []string{DiscoveryRunStatusOK, DiscoveryRunStatusPart}).Order("trade_date DESC, id DESC").First(&latest).Error; err != nil {
 		return nil
 	}
 	dates := recentOpenDates(market, latest.TradeDate, 5)
@@ -82,7 +82,7 @@ func recentDiscoveryCandidates(market string, limit int) []discoveryPoolCandidat
 	var rows []model.CandidateDiscoveryItem
 	query := common.DB.Joins("JOIN candidate_discovery_runs AS discovery_run ON discovery_run.id = candidate_discovery_items.run_id").
 		Where("candidate_discovery_items.market = ? AND candidate_discovery_items.trade_date IN ? AND candidate_discovery_items.discovery_version = ? AND candidate_discovery_items.data_status IN ?", market, dates, latest.DiscoveryVersion, []string{DiscoveryItemReady, DiscoveryItemPartial}).
-		Where("discovery_run.owner_type = ? AND discovery_run.status IN ? AND discovery_run.parameter_hash = ?", model.JobOwnerSystem, []string{DiscoveryRunStatusOK, DiscoveryRunStatusPart}, latest.ParameterHash)
+		Where("discovery_run.owner_type = ? AND discovery_run.status IN ? AND discovery_run.factor_version = ? AND discovery_run.parameter_hash = ?", model.JobOwnerSystem, []string{DiscoveryRunStatusOK, DiscoveryRunStatusPart}, latest.FactorVersion, latest.ParameterHash)
 	if err := query.Order("candidate_discovery_items.trade_date DESC, candidate_discovery_items.channel ASC, candidate_discovery_items.rank ASC, candidate_discovery_items.symbol ASC").Find(&rows).Error; err != nil {
 		return nil
 	}
@@ -168,9 +168,7 @@ func recentDiscoveryCandidates(market string, limit int) []discoveryPoolCandidat
 		}
 		summary.SeenDays5D = len(summary.Days)
 		latestItems := a.byDate[a.last]
-		var factors map[string]float64
 		if len(latestItems) > 0 {
-			_ = json.Unmarshal([]byte(latestItems[0].FactorSummary), &factors)
 			for _, item := range latestItems {
 				if item.ConsecutiveDays > summary.ConsecutiveDays {
 					summary.ConsecutiveDays = item.ConsecutiveDays
@@ -178,11 +176,6 @@ func recentDiscoveryCandidates(market string, limit int) []discoveryPoolCandidat
 			}
 		}
 		c := candidate{Symbol: symbol, Market: market, Name: a.name, Discovery: summary}
-		if factors != nil {
-			c.Price = factors["close"]
-			c.Amount = factors["amount_yi"] * 1e8
-			c.TurnoverRate = factors["turnover_rate"]
-		}
 		source := "recent_discovery"
 		if a.last == latest.TradeDate {
 			source = "daily_discovery"

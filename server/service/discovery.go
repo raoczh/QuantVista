@@ -61,15 +61,16 @@ type DiscoverySignal struct {
 }
 
 type discoveryChannelSpec struct {
-	name  string
-	match func(*FactorTable, int) bool
-	score func(*FactorTable, int) float64
-	facts func(*FactorTable, int) map[string]any
+	name     string
+	required []string
+	match    func(*FactorTable, int) bool
+	score    func(*FactorTable, int) float64
+	facts    func(*FactorTable, int) map[string]any
 }
 
 func discoveryParameterHash() string {
 	// 参数内容明确版本化，避免只改阈值却复用旧日事实。
-	raw := strings.Join([]string{DiscoveryVersion, "top=100", "trend=v1", "pullback=v1", "value=v1", "strategy=v1"}, "|")
+	raw := strings.Join([]string{DiscoveryVersion, factorSnapshotVersion, "top=100", "trend=v1", "pullback=v1", "value=v1", "strategy=v1"}, "|")
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])
 }
@@ -85,7 +86,8 @@ func finiteFactor(t *FactorTable, key string, i int) (float64, bool) {
 func discoverySpecs() []discoveryChannelSpec {
 	return []discoveryChannelSpec{
 		{
-			name: "trend_breakout",
+			name:     "trend_breakout",
+			required: []string{"close", "ma20", "bull_align", "high_20d", "chg_20d", "vol_boost", "bias_20"},
 			match: func(t *FactorTable, i int) bool {
 				close, cOK := finiteFactor(t, "close", i)
 				ma20, mOK := finiteFactor(t, "ma20", i)
@@ -105,7 +107,8 @@ func discoverySpecs() []discoveryChannelSpec {
 			},
 		},
 		{
-			name: "pullback_repair",
+			name:     "pullback_repair",
+			required: []string{"chg_20d", "chg_5d", "above_ma20", "vol_5v20"},
 			match: func(t *FactorTable, i int) bool {
 				chg20, a := finiteFactor(t, "chg_20d", i)
 				chg5, b := finiteFactor(t, "chg_5d", i)
@@ -124,7 +127,8 @@ func discoverySpecs() []discoveryChannelSpec {
 			},
 		},
 		{
-			name: "value_dividend",
+			name:     "value_dividend",
+			required: []string{"div_yield", "pos_60", "volatility_20", "close"},
 			match: func(t *FactorTable, i int) bool {
 				y, yOK := finiteFactor(t, "div_yield", i)
 				pos, pOK := finiteFactor(t, "pos_60", i)
@@ -144,15 +148,10 @@ func discoverySpecs() []discoveryChannelSpec {
 			},
 		},
 		{
-			name: "strategy_signal",
+			name:     "strategy_signal",
+			required: []string{"high_20d", "vol_boost", "chg_pct", "amount_yi", "chg_20d", "above_ma20", "chg_5d", "vol_5v20", "pos_60", "chip_profit", "chip_bars", "chg_60d", "volatility_20", "above_ma60", "bull_align"},
 			match: func(t *FactorTable, i int) bool {
-				for _, key := range []string{"vol-break-20d", "shrink-pullback-ma20", "mild-vol-start", "deep-oversold-chip", "steady-uptrend", "bull-align-trend"} {
-					b, ok := builtinScreenByKey(key)
-					if ok && evalCondRow(t, &b.Tree, i) {
-						return true
-					}
-				}
-				return false
+				return len(matchedDiscoveryStrategies(t, i)) > 0
 			},
 			score: func(t *FactorTable, i int) float64 {
 				amount, _ := finiteFactor(t, "amount_yi", i)
@@ -160,10 +159,50 @@ func discoverySpecs() []discoveryChannelSpec {
 				return clampDiscoveryScore(50 + minFloat(amount, 20)*1.5 + chg*0.4)
 			},
 			facts: func(t *FactorTable, i int) map[string]any {
-				return map[string]any{"rule": "builtin_strategy_tree", "strategies": []string{"vol-break-20d", "shrink-pullback-ma20", "mild-vol-start", "deep-oversold-chip", "steady-uptrend", "bull-align-trend"}}
+				return map[string]any{"rule": "builtin_strategy_tree", "strategies": matchedDiscoveryStrategies(t, i)}
 			},
 		},
 	}
+}
+
+var discoveryStrategyKeys = []string{"vol-break-20d", "shrink-pullback-ma20", "mild-vol-start", "deep-oversold-chip", "steady-uptrend", "bull-align-trend"}
+
+func matchedDiscoveryStrategies(t *FactorTable, i int) []string {
+	matched := make([]string, 0, len(discoveryStrategyKeys))
+	for _, key := range discoveryStrategyKeys {
+		b, ok := builtinScreenByKey(key)
+		if ok && evalCondRow(t, &b.Tree, i) {
+			matched = append(matched, key)
+		}
+	}
+	return matched
+}
+
+// discoveryChannelDataIssue 区分“合法零命中”与“通道所需因子不可用”。只有后者
+// 才把运行标为 partial；安静市场没有符合阈值的股票是完整的空结果。
+func discoveryChannelDataIssue(t *FactorTable, spec discoveryChannelSpec) string {
+	if t == nil || t.Len() == 0 {
+		return "因子宽表为空"
+	}
+	for _, key := range spec.required {
+		col := t.Col(key)
+		if col == nil {
+			return "缺少因子 " + key
+		}
+		available := false
+		for i := range t.Symbols {
+			if t.Fresh(i) {
+				if _, ok := finiteFactor(t, key, i); ok {
+					available = true
+					break
+				}
+			}
+		}
+		if !available {
+			return "因子无可用值 " + key
+		}
+	}
+	return ""
 }
 
 func clampDiscoveryScore(v float64) float64 {
@@ -268,6 +307,23 @@ func discoveryScannedCount(t *FactorTable) int {
 	return n
 }
 
+func discoveryFailedCount(t *FactorTable) int {
+	if t == nil {
+		return 0
+	}
+	st := t.Col("is_st")
+	n := 0
+	for i := range t.Symbols {
+		if st != nil && finiteOrZero(st[i]) == 1 {
+			continue // ST 是明确排除的宇宙成员，不是扫描失败。
+		}
+		if !t.Fresh(i) {
+			n++
+		}
+	}
+	return n
+}
+
 func discoveryDates(tradeDate string) []string {
 	dates := recentOpenDates("cn", tradeDate, 6)
 	if len(dates) == 0 || dates[len(dates)-1] != tradeDate {
@@ -322,7 +378,7 @@ func loadDiscoveryHistory(tradeDate, parameterHash string, signals map[string][]
 	var rows []model.CandidateDiscoveryItem
 	query := common.DB.Joins("JOIN candidate_discovery_runs AS history_run ON history_run.id = candidate_discovery_items.run_id").Where("candidate_discovery_items.market = ? AND candidate_discovery_items.discovery_version = ? AND candidate_discovery_items.trade_date < ? AND candidate_discovery_items.channel IN ? AND candidate_discovery_items.symbol IN ?", "cn", DiscoveryVersion, tradeDate, channels, symbols)
 	if parameterHash != "" {
-		query = query.Where("history_run.parameter_hash = ?", parameterHash)
+		query = query.Where("history_run.factor_version = ? AND history_run.parameter_hash = ?", factorSnapshotVersion, parameterHash)
 	}
 	if err := query.Order("candidate_discovery_items.trade_date DESC, candidate_discovery_items.id DESC").Find(&rows).Error; err != nil {
 		return out
@@ -350,8 +406,9 @@ func loadDiscoveryHistory(tradeDate, parameterHash string, signals map[string][]
 	return out
 }
 
-// ExecuteDailyDiscovery 在单个全局互斥段内创建/重试同日运行。runID 由 JobRun 结果引用传入。
-func ExecuteDailyDiscovery(ctx context.Context, runID int64, market, tradeDate, parameterHash string) (*model.CandidateDiscoveryRun, error) {
+// ExecuteDailyDiscovery 在单个全局互斥段内创建/重试同日运行。expectedResultID 是
+// JobRun 已绑定的 CandidateDiscoveryRun.ID，只用于防止任务快照串到别的结果事实。
+func ExecuteDailyDiscovery(ctx context.Context, expectedResultID int64, market, tradeDate, parameterHash string) (*model.CandidateDiscoveryRun, error) {
 	discoveryRunMu.Lock()
 	defer discoveryRunMu.Unlock()
 	if common.DB == nil {
@@ -371,8 +428,10 @@ func ExecuteDailyDiscovery(ctx context.Context, runID int64, market, tradeDate, 
 	if tradeDate == "" {
 		tradeDate = t.TradeDate
 	}
-	if tradeDate == "" || t.TradeDate < tradeDate {
-		return nil, errors.New("因子宽表尚未发布目标交易日")
+	if tradeDate == "" || t.TradeDate != tradeDate {
+		// 当前宽表是单日内存快照，不能拿较新的表冒充延迟作业请求的旧交易日。
+		// 旧日若已错过，只能明确失败并由最新快照的启动补跑接管。
+		return nil, fmt.Errorf("因子宽表交易日不匹配: 当前 %s，目标 %s", t.TradeDate, tradeDate)
 	}
 	if parameterHash == "" {
 		parameterHash = discoveryParameterHash()
@@ -384,7 +443,7 @@ func ExecuteDailyDiscovery(ctx context.Context, runID int64, market, tradeDate, 
 	}
 	now := time.Now()
 	var run model.CandidateDiscoveryRun
-	err := common.DB.Where("market = ? AND trade_date = ? AND discovery_version = ? AND parameter_hash = ?", market, tradeDate, DiscoveryVersion, parameterHash).First(&run).Error
+	err := common.DB.Where("market = ? AND trade_date = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ?", market, tradeDate, DiscoveryVersion, factorSnapshotVersion, parameterHash).First(&run).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		run = model.CandidateDiscoveryRun{OwnerType: model.JobOwnerSystem, Market: market, TradeDate: tradeDate, AsOf: now, DiscoveryVersion: DiscoveryVersion, FactorVersion: factorSnapshotVersion, ParameterHash: parameterHash, Status: DiscoveryRunStatusProc, StartedAt: now}
 		if err := common.DB.Create(&run).Error; err != nil {
@@ -403,22 +462,22 @@ func ExecuteDailyDiscovery(ctx context.Context, runID int64, market, tradeDate, 
 			return nil, err
 		}
 	}
-	if runID > 0 && run.JobRunID == nil {
-		if err := common.DB.Model(&run).Updates(map[string]any{"job_run_id": runID}).Error; err != nil {
-			return nil, err
-		}
+	if expectedResultID > 0 && run.ID != expectedResultID {
+		return nil, fmt.Errorf("发现作业结果引用错配: expected=%d actual=%d", expectedResultID, run.ID)
 	}
 	signals := BuildDiscoverySignals(t, discoveryTopN)
 	history := loadDiscoveryHistory(tradeDate, parameterHash, signals)
 	items := make([]model.CandidateDiscoveryItem, 0, len(discoveryChannels)*discoveryTopN)
 	eligible := 0
-	missingChannels := make([]string, 0, len(discoveryChannels))
-	for _, channel := range discoveryChannels {
+	channelIssues := make([]string, 0, len(discoveryChannels))
+	for _, spec := range discoverySpecs() {
+		channel := spec.name
 		rows := signals[channel]
 		if len(rows) > 0 {
 			eligible += len(rows)
-		} else {
-			missingChannels = append(missingChannels, channel)
+		}
+		if issue := discoveryChannelDataIssue(t, spec); issue != "" {
+			channelIssues = append(channelIssues, channel+":"+issue)
 		}
 		for rank, signal := range rows {
 			state := history[channel+"\x00"+signal.Symbol]
@@ -440,15 +499,15 @@ func ExecuteDailyDiscovery(ctx context.Context, runID int64, market, tradeDate, 
 		}
 	}
 	scanned := discoveryScannedCount(t)
-	failed := t.Len() - scanned
+	failed := discoveryFailedCount(t)
 	status := DiscoveryRunStatusOK
 	reason := ""
 	if t.Len() == 0 {
 		status, reason = DiscoveryRunStatusFail, "全市场因子宽表为空"
 	} else if t.LagOpenDays != 0 || t.FreshCoverage < 0.98 {
 		status, reason = DiscoveryRunStatusPart, fmt.Sprintf("因子覆盖 %.1f%%，数据截至 %s，应有 %s", t.FreshCoverage*100, t.TradeDate, t.ExpectedDate)
-	} else if len(missingChannels) > 0 {
-		status, reason = DiscoveryRunStatusPart, "固定通道无命中："+strings.Join(missingChannels, ",")+"；不能视为完整 success"
+	} else if len(channelIssues) > 0 {
+		status, reason = DiscoveryRunStatusPart, "通道数据不完整："+strings.Join(channelIssues, ",")
 	}
 	finished := time.Now()
 	if err := ctx.Err(); err != nil {
@@ -491,7 +550,7 @@ func registerDiscoveryBinding() durableJobBinding {
 				req.Version = 1
 			}
 			var row model.CandidateDiscoveryRun
-			err := tx.Where("market = ? AND trade_date = ? AND discovery_version = ? AND parameter_hash = ?", req.Market, req.TradeDate, DiscoveryVersion, req.ParameterHash).First(&row).Error
+			err := tx.Where("market = ? AND trade_date = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ?", req.Market, req.TradeDate, DiscoveryVersion, factorSnapshotVersion, req.ParameterHash).First(&row).Error
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				row = model.CandidateDiscoveryRun{OwnerType: model.JobOwnerSystem, JobRunID: &run.ID, Market: req.Market, TradeDate: req.TradeDate, AsOf: time.Now(), DiscoveryVersion: DiscoveryVersion, FactorVersion: factorSnapshotVersion, ParameterHash: req.ParameterHash, Status: DiscoveryRunStatusProc, StartedAt: time.Now()}
 				if err := tx.Create(&row).Error; err != nil {
@@ -566,11 +625,13 @@ func ScheduleDailyDiscovery(tradeDate, trigger string) {
 	}
 	req := discoveryJobRequest{Version: 1, Market: "cn", TradeDate: tradeDate, TriggerSource: trigger, ParameterHash: discoveryParameterHash()}
 	var existing model.CandidateDiscoveryRun
-	if err := common.DB.Where("market = ? AND trade_date = ? AND discovery_version = ? AND parameter_hash = ?", req.Market, req.TradeDate, DiscoveryVersion, req.ParameterHash).First(&existing).Error; err == nil && existing.Status == DiscoveryRunStatusOK && existing.FinishedAt != nil {
+	if err := common.DB.Where("market = ? AND trade_date = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ?", req.Market, req.TradeDate, DiscoveryVersion, factorSnapshotVersion, req.ParameterHash).First(&existing).Error; err == nil && existing.Status == DiscoveryRunStatusOK && existing.FinishedAt != nil {
 		return
 	}
 	if _, err := defaultJobRuntime.startSystemWithBinding(nil, JobKindDailyDiscovery, req, nil); err != nil {
-		if errors.Is(err, ErrJobQueueBusy) {
+		// 同 kind 在途去重不能丢掉另一个交易日：队列繁忙或已有运行时都记一次
+		// 有界延迟补交；若同日任务已经成功，重试入口会在查库后直接返回。
+		if errors.Is(err, ErrJobQueueBusy) || errors.Is(err, ErrJobAlreadyRunning) {
 			key := tradeDate + ":" + req.ParameterHash
 			discoveryScheduleMu.Lock()
 			if !discoverySchedulePending[key] {
@@ -585,9 +646,7 @@ func ScheduleDailyDiscovery(tradeDate, trigger string) {
 			discoveryScheduleMu.Unlock()
 			return
 		}
-		if !errors.Is(err, ErrJobAlreadyRunning) {
-			common.SysWarn("提交全市场发现作业失败: %v", err)
-		}
+		common.SysWarn("提交全市场发现作业失败: %v", err)
 	}
 }
 
@@ -598,7 +657,7 @@ func discoveryNeedsBackfill(tradeDate string) bool {
 		return false
 	}
 	var run model.CandidateDiscoveryRun
-	err := common.DB.Where("market = ? AND trade_date = ? AND discovery_version = ? AND parameter_hash = ?", "cn", tradeDate, DiscoveryVersion, discoveryParameterHash()).First(&run).Error
+	err := common.DB.Where("market = ? AND trade_date = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ?", "cn", tradeDate, DiscoveryVersion, factorSnapshotVersion, discoveryParameterHash()).First(&run).Error
 	return err != nil || run.Status != DiscoveryRunStatusOK || run.FinishedAt == nil
 }
 
@@ -628,7 +687,7 @@ func LatestDiscoveryStatus(limit int) (*model.CandidateDiscoveryRun, []model.Can
 		limit = 100
 	}
 	var run model.CandidateDiscoveryRun
-	if err := common.DB.Where("owner_type = ?", model.JobOwnerSystem).Order("trade_date DESC, id DESC").First(&run).Error; err != nil {
+	if err := common.DB.Where("owner_type = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ?", model.JobOwnerSystem, DiscoveryVersion, factorSnapshotVersion, discoveryParameterHash()).Order("trade_date DESC, id DESC").First(&run).Error; err != nil {
 		return nil, nil, err
 	}
 	var items []model.CandidateDiscoveryItem
@@ -636,4 +695,8 @@ func LatestDiscoveryStatus(limit int) (*model.CandidateDiscoveryRun, []model.Can
 		return nil, nil, err
 	}
 	return &run, items, nil
+}
+
+func DiscoveryChannelKeys() []string {
+	return append([]string(nil), discoveryChannels...)
 }

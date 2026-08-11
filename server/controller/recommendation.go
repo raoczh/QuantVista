@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"strconv"
 
 	"quantvista/common"
@@ -8,6 +9,7 @@ import (
 	"quantvista/service"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 // RecommendationController 短线/长线推荐（均限当前登录用户）。
@@ -38,11 +40,15 @@ func (rc *RecommendationController) DiscoveryStatus(c *gin.Context) {
 	}
 	run, items, err := service.LatestDiscoveryStatus(limit)
 	if err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			common.ApiError(c, err)
+			return
+		}
 		// 首次部署尚未发布发现运行时仍返回可渲染的空状态，避免被误显示为“空池”。
-		common.ApiSuccess(c, gin.H{"scope": "global", "market": "cn", "status": "unavailable", "reason": "尚未发布全市场发现运行", "run": nil, "items": []any{}})
+		common.ApiSuccess(c, gin.H{"scope": "global", "market": "cn", "status": "unavailable", "reason": "尚未发布全市场发现运行", "run": nil, "items": []any{}, "channels": service.DiscoveryChannelKeys()})
 		return
 	}
-	common.ApiSuccess(c, gin.H{"scope": "global", "market": "cn", "status": run.Status, "run": run, "items": items})
+	common.ApiSuccess(c, gin.H{"scope": "global", "market": "cn", "status": run.Status, "run": run, "items": items, "channels": service.DiscoveryChannelKeys()})
 }
 
 // Generate POST /api/recommendations —— 生成一批推荐。
