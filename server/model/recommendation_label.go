@@ -147,6 +147,7 @@ type RecommendationCandidateEvent struct {
 
 	RejectionReason  string  `gorm:"size:256" json:"rejection_reason"` // excluded 原因 / LLM 落选理由
 	Source           string  `gorm:"size:32" json:"source"`            // 候选首来源
+	SourceSet        string  `gorm:"size:256" json:"source_set"`       // 候选全部来源，逗号分隔，供召回归因
 	SentToLLM        bool    `json:"sent_to_llm"`
 	RefPrice         float64 `gorm:"type:decimal(20,4)" json:"ref_price"` // 事件时点现价（影子标签入场锚）
 	OpportunitySetID string  `gorm:"size:32" json:"opportunity_set_id"`   // S3 召回评估预留

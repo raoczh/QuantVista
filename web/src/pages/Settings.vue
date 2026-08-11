@@ -494,6 +494,12 @@ async function doExport(kind: ExportKind) {
           <n-form-item label="默认市场">
             <n-select v-model:value="pref.default_market" :options="marketOptions" />
           </n-form-item>
+          <n-form-item label="自动发现范围">
+            <div class="notify-switch">
+              <n-tag type="info" :bordered="false" size="small">A 股全市场</n-tag>
+              <span class="notify-hint">系统盘后统一扫描一次，推荐生成只读取共享发现事实，再按你的筛选与风险偏好复核</span>
+            </div>
+          </n-form-item>
           <n-form-item label="默认周期">
             <n-select v-model:value="pref.horizon_pref" :options="horizonOptions" />
           </n-form-item>
@@ -510,7 +516,7 @@ async function doExport(kind: ExportKind) {
             <div class="notify-switch">
               <n-switch v-model:value="pref.enable_daily_report" />
               <span class="notify-hint"
-                >交易日 15:35 后自动生成今日复盘 + 明日选股推荐（消耗你的 LLM token，不占次数配额；含自动卖点提醒）</span
+                >交易日 15:35 后自动生成今日复盘 + 明日选股推荐（消耗你的 LLM token，不占次数配额；未持有的推荐不会创建卖出提醒）</span
               >
             </div>
           </n-form-item>

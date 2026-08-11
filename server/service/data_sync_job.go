@@ -236,6 +236,9 @@ func (s *MarketService) dataSyncJobHandler(ctx context.Context, _ int64, _ bool,
 			log.Status, log.Total, log.Succeeded = "success", table.Len(), table.Len()
 			log.RangeSummary = table.TradeDate
 			log.Message = fmt.Sprintf("因子宽表 %s 共 %d 只", table.TradeDate, table.Len())
+			// 因子宽表与不可变快照已经成功发布，随后提交全局一次的候选发现。
+			// 推荐生成只读发现表，永远不会在用户请求路径触发全市场扫描。
+			ScheduleDailyDiscovery(table.TradeDate, "factor_rebuild")
 		}
 		s.recordSyncLog(ctx, log)
 	}

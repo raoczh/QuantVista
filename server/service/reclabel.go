@@ -149,7 +149,7 @@ func recordBatchFacts(batch *model.RecommendationBatch, pool []candidate, items 
 			Symbol: c.Symbol, Market: c.Market, Name: c.Name,
 			RawScore: c.Score, ScoreRank: c.Rank, LLMInputOrder: c.LLMInputOrder,
 			RankingVersion: candidateRankingVersion,
-			Source:         firstSource(c), SentToLLM: c.SentToLLM,
+			Source:         firstSource(c), SourceSet: strings.Join(c.Sources, ","), SentToLLM: c.SentToLLM,
 			RefPrice: c.Price,
 		}
 		switch {

@@ -27,6 +27,24 @@ func (rc *RecommendationController) Strategies(c *gin.Context) {
 	common.ApiSuccess(c, service.StrategiesFor(recType))
 }
 
+// DiscoveryStatus GET /api/recommendations/discovery-status —— 全局发现运行状态与短名单。
+// 返回的是 system/global 共享事实，不按用户扫描或复制。
+func (rc *RecommendationController) DiscoveryStatus(c *gin.Context) {
+	limit := 100
+	if raw := c.Query("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			limit = n
+		}
+	}
+	run, items, err := service.LatestDiscoveryStatus(limit)
+	if err != nil {
+		// 首次部署尚未发布发现运行时仍返回可渲染的空状态，避免被误显示为“空池”。
+		common.ApiSuccess(c, gin.H{"scope": "global", "market": "cn", "status": "unavailable", "reason": "尚未发布全市场发现运行", "run": nil, "items": []any{}})
+		return
+	}
+	common.ApiSuccess(c, gin.H{"scope": "global", "market": "cn", "status": run.Status, "run": run, "items": items})
+}
+
 // Generate POST /api/recommendations —— 生成一批推荐。
 func (rc *RecommendationController) Generate(c *gin.Context) {
 	var req service.RecommendRequest

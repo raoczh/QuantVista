@@ -33,6 +33,9 @@ const (
 	JobKindSyncMarketWide    = "sync_market_wide"
 	JobKindInitMarketHistory = "init_market_history"
 	JobKindFactorRebuild     = "factor_rebuild"
+	JobKindDailyDiscovery    = "daily_discovery"
+	// JobKindCandidateDiscovery 是业务文档使用的完整名称别名。
+	JobKindCandidateDiscovery = JobKindDailyDiscovery
 
 	JobResultLLMTask        = "llm_task"
 	JobResultAnalysis       = "analysis"
@@ -40,6 +43,7 @@ const (
 	JobResultDailyReport    = "daily_report"
 	JobResultDataSync       = "data_sync"
 	JobResultStrategyRun    = "strategy_run"
+	JobResultDiscovery      = "candidate_discovery"
 
 	jobSnapshotVersion  = 1
 	jobSnapshotMaxBytes = 16 << 10

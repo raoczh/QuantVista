@@ -692,6 +692,8 @@ func dataSyncTaskTitle(kind string) string {
 		return "同步全市场数据"
 	case "init_market_history":
 		return "初始化市场历史"
+	case JobKindDailyDiscovery:
+		return "全市场候选发现"
 	default:
 		return "系统数据任务"
 	}

@@ -142,6 +142,74 @@ export interface RecDetail {
   quality_gate?: QualityGateShadow
   // 非空 = 降级生成（quant_fallback：AI 精选超时后按量化排名规则合成，未经 AI 解读）
   degraded_source?: string
+  discovery?: CandidateDiscoverySummary
+}
+
+export interface CandidateDiscoveryDay {
+  trade_date: string
+  channels: string[]
+  best_rank: number
+  best_score: number
+  rank_change: number
+  score_change: number
+}
+
+export interface CandidateDiscoverySummary {
+  first_seen_date: string
+  last_seen_date: string
+  seen_days_5d: number
+  consecutive_days: number
+  days: CandidateDiscoveryDay[]
+  data_status: string
+  partial_reason?: string
+}
+
+export interface DiscoveryRun {
+  id: number
+  owner_type: string
+  market: string
+  trade_date: string
+  as_of: string
+  discovery_version: string
+  factor_version: string
+  status: 'processing' | 'success' | 'partial' | 'failed' | string
+  universe_count: number
+  scanned_count: number
+  eligible_count: number
+  success_count: number
+  failed_count: number
+  partial_reason?: string
+  error?: string
+  started_at: string
+  finished_at?: string
+}
+
+export interface DiscoveryItem {
+  id: number
+  run_id: number
+  trade_date: string
+  market: string
+  discovery_version: string
+  channel: string
+  symbol: string
+  name: string
+  rank: number
+  score: number
+  first_seen_date: string
+  consecutive_days: number
+  rank_change: number
+  score_change: number
+  data_status: string
+  partial_reason?: string
+}
+
+export interface DiscoveryStatusView {
+  scope: 'global' | string
+  market: string
+  status: string
+  reason?: string
+  run: DiscoveryRun | null
+  items: DiscoveryItem[]
 }
 
 export type ExecutionStatus = 'ready' | 'wait' | 'not_suitable'
@@ -394,6 +462,14 @@ export interface ReflectionLayers {
 
 export function listStrategies(type: RecType) {
   return request<Strategy[]>({ url: '/recommendations/strategies', method: 'get', params: { type } })
+}
+
+export function getDiscoveryStatus(limit = 100) {
+  return request<DiscoveryStatusView>({
+    url: '/recommendations/discovery-status',
+    method: 'get',
+    params: { limit },
+  })
 }
 
 // 生成推荐。2026-07-14 异步任务化：接口立即返回 processing 批次（建池/评分/AI 精选

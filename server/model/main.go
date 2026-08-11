@@ -99,6 +99,8 @@ func AllModels() []any {
 		&PaperCorpAdjust{},
 		&SellReview{},
 		&PositionExitAssessment{},
+		&CandidateDiscoveryRun{},
+		&CandidateDiscoveryItem{},
 	}
 }
 

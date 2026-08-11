@@ -53,8 +53,10 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	// D17 持仓卖出决策 AI 建议（逐笔 hold|trim|exit，走统一作业与兼容结果行）
 	positionAdviceSvc := service.NewPositionAdviceService(positionSvc, llmSvc)
 	service.RegisterDataSyncJobHandlers(marketSvc)
+	service.RegisterCandidateDiscoveryJobHandler()
 	// 七类用户作业 handler 均已注册；此时再收敛 running 并按持久顺序恢复 queued。
 	service.StartJobRuntime()
+	service.ScheduleDiscoveryStartupBackfill()
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc, scoreSvc, indicatorSvc, chipSvc, intradaySvc)
@@ -275,6 +277,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 			recommendations := authed.Group("/recommendations")
 			{
 				recommendations.GET("/strategies", recommendationCtl.Strategies)
+				recommendations.GET("/discovery-status", recommendationCtl.DiscoveryStatus)
 				recommendations.GET("/performance", recommendationCtl.Performance)
 				recommendations.GET("/attribution", recommendationCtl.Attribution)
 				recommendations.GET("/shadow-report", recommendationCtl.ShadowReport)

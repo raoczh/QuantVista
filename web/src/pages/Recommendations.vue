@@ -32,6 +32,7 @@ import {
   getAttribution,
   getShadowReport,
   getRecallReport,
+  getDiscoveryStatus,
   createStopLossAlert,
   ackRecommendationReview,
   emptyRecFilters,
@@ -51,6 +52,8 @@ import {
   type ReflectionMatch,
   type ReflectionLayers,
   type ExecutionStatus,
+  type DiscoveryStatusView,
+  type CandidateDiscoverySummary,
 } from '@/api/recommendation'
 import { getPreference, updatePreference, type UserPreference } from '@/api/user'
 import { getTodos, type TodoItem } from '@/api/todo'
@@ -292,6 +295,42 @@ async function loadLLM() {
 const running = ref(false)
 const current = ref<RecommendationView | null>(null)
 const showAllReady = ref(false)
+const discoveryStatus = ref<DiscoveryStatusView | null>(null)
+const visibleDiscoveryChannels = computed(() => [
+  ...new Set((discoveryStatus.value?.items || []).map((item) => item.channel)),
+])
+
+async function loadDiscoveryStatus() {
+  try {
+    discoveryStatus.value = await getDiscoveryStatus(120)
+  } catch {
+    discoveryStatus.value = {
+      scope: 'global',
+      market: 'cn',
+      status: 'unavailable',
+      reason: '发现状态暂不可用',
+      run: null,
+      items: [],
+    }
+  }
+}
+
+function discoveryChannelLabel(channel: string) {
+  return ({
+    trend_breakout: '趋势/突破',
+    pullback_repair: '回调/修复',
+    value_dividend: '价值/红利',
+    strategy_signal: '策略信号',
+  } as Record<string, string>)[channel] || channel
+}
+
+function discoveryRunLabel(status: string) {
+  return ({ success: '完整', partial: '部分可用', failed: '失败', processing: '运行中', unavailable: '不可用' } as Record<string, string>)[status] || status
+}
+
+function latestDiscoveryDay(summary: CandidateDiscoverySummary) {
+  return summary.days?.length ? summary.days[summary.days.length - 1] : null
+}
 
 function executionStatus(item: RecommendationItem): ExecutionStatus {
   // 旧记录没有 execution_plan：保留可读，但不能用当前偏好补算后直接执行。
@@ -616,7 +655,7 @@ function fmtTime(t: string) {
 }
 
 onMounted(async () => {
-  await Promise.all([loadStrategies(), loadLLM(), loadHistory(), loadPerformance(), loadPrefFilters(), loadReviews()])
+  await Promise.all([loadStrategies(), loadLLM(), loadHistory(), loadPerformance(), loadPrefFilters(), loadReviews(), loadDiscoveryStatus()])
   // 任务中心指定的批次优先，避免被最近一个 processing 批次覆盖。
   if (await openRouteBatch()) {
     await restoreScroll()
@@ -1122,7 +1161,7 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
             </n-button>
             <div class="hint">
               流水线：自选 + 随策略组合的榜单（涨幅/成交额/换手率/回调/低PB，深度取数并补「不热」方向）→ 你的筛选 →
-              本地量化评分排序（零 AI 成本）→ AI 只在 Top16 里精选并强制引用数据 → 程序核验证据数字。候选池全程透明，可在结果页展开查看每只股为什么进/为什么被筛掉。
+              本地量化评分排序（零 AI 成本）→ AI 只在 Top10 里精选并强制引用数据 → 程序核验证据数字。候选池全程透明，可在结果页展开查看每只股为什么进/为什么被筛掉。
             </div>
           </n-form>
         </SectionCard>
@@ -1310,6 +1349,25 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
       <!-- 右：结果 -->
       <div class="col-result">
         <SectionCard title="推荐结果">
+          <div class="discovery-status" :data-status="discoveryStatus?.status || 'unavailable'">
+            <div class="discovery-status-main">
+              <span>自动发现：A 股全市场</span>
+              <n-tag size="tiny" :type="discoveryStatus?.status === 'success' ? 'success' : discoveryStatus?.status === 'partial' ? 'warning' : 'default'" :bordered="false">
+                {{ discoveryRunLabel(discoveryStatus?.status || 'unavailable') }}
+              </n-tag>
+              <span v-if="discoveryStatus?.run" class="discovery-status-meta">
+                {{ discoveryStatus.run.trade_date }} · 覆盖 {{ discoveryStatus.run.universe_count }} 只 · 候选 {{ discoveryStatus.run.success_count }} 条
+              </span>
+            </div>
+            <div v-if="discoveryStatus?.items?.length" class="discovery-channels">
+              <span v-for="channel in visibleDiscoveryChannels" :key="channel">
+                {{ discoveryChannelLabel(channel) }}
+              </span>
+            </div>
+            <div v-if="discoveryStatus?.run?.partial_reason || discoveryStatus?.run?.error || discoveryStatus?.reason" class="discovery-gap">
+              {{ discoveryStatus?.run?.partial_reason || discoveryStatus?.run?.error || discoveryStatus?.reason }}
+            </div>
+          </div>
           <n-spin :show="running">
             <n-empty
               v-if="!current"
@@ -1446,6 +1504,26 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
                       </span>
                       <n-tag v-if="it.position.status === 'closed'" size="tiny" :bordered="false">已卖出</n-tag>
                     </template>
+                  </div>
+
+                  <div v-if="it.detail?.discovery" class="discovery-memory">
+                    <div class="discovery-memory-head">
+                      <span>候选记忆</span>
+                      <span>首次 {{ it.detail.discovery.first_seen_date }}</span>
+                      <span>近5日 {{ it.detail.discovery.seen_days_5d }} 次</span>
+                      <span>连续 {{ it.detail.discovery.consecutive_days }} 日</span>
+                      <span v-if="latestDiscoveryDay(it.detail.discovery)">
+                        排名变化 {{ latestDiscoveryDay(it.detail.discovery)!.rank_change > 0 ? '+' : '' }}{{ latestDiscoveryDay(it.detail.discovery)!.rank_change }}
+                      </span>
+                    </div>
+                    <div class="discovery-memory-days">
+                      <span v-for="day in it.detail.discovery.days" :key="day.trade_date">
+                        {{ day.trade_date.slice(5) }} {{ day.channels.map(discoveryChannelLabel).join('/') }} #{{ day.best_rank }}
+                      </span>
+                    </div>
+                    <div v-if="it.detail.discovery.data_status !== 'ready'" class="discovery-gap">
+                      {{ it.detail.discovery.partial_reason || '候选历史存在数据缺口' }}
+                    </div>
                   </div>
 
                   <div v-if="it.detail" class="execution-summary" :data-status="executionStatus(it)">
@@ -2233,6 +2311,53 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
 .res-meta {
   font-size: 12px;
   opacity: 0.5;
+}
+.discovery-status {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 0 12px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--qv-divider);
+}
+.discovery-status-main,
+.discovery-channels,
+.discovery-memory-head,
+.discovery-memory-days {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.discovery-status-main > span:first-child,
+.discovery-memory-head > span:first-child {
+  font-weight: 600;
+}
+.discovery-status-meta,
+.discovery-channels,
+.discovery-memory-days {
+  font-size: 12px;
+  opacity: 0.68;
+}
+.discovery-channels span,
+.discovery-memory-days span {
+  padding-right: 8px;
+  border-right: 1px solid var(--qv-divider);
+}
+.discovery-gap {
+  color: v-bind('vars.warningColor');
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.discovery-memory {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 0;
+  margin-bottom: 12px;
+  border-top: 1px solid var(--qv-divider);
+  border-bottom: 1px solid var(--qv-divider);
+  font-size: 12px;
 }
 /* 卡片 */
 .cards {

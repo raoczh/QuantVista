@@ -35,7 +35,7 @@ func NewRecommendationService(market *MarketService, watchlist *WatchlistService
 }
 
 const (
-	recPromptVersion   = "p15" // p15: 撤销 p14 输出体积限制（用户定夺：不为省 token 限制输出——预算已放开+截断自动扩容 repair，恢复全量落选理由与不限条数）；p14: 控制结构化输出体积（已撤销）；p13: P1-2 长线 pick 新增 invalidation 失效条件字段（短线既有；schema recommendation.v2）；p12: 移除推荐与推荐复核输出字段的字数/条数限制；p11: 首轮输出瘦身 + LLM 名单 16→10；p10: M3b 盘中因子字段说明（尾盘涨幅/量占比/早盘/VWAP）
+	recPromptVersion   = "p16" // p16: 候选输入增加近5日发现记忆与7日内标题级真实新闻（不扩候选边界/条数/token预算）；p15: 撤销 p14 输出体积限制（用户定夺：不为省 token 限制输出——预算已放开+截断自动扩容 repair，恢复全量落选理由与不限条数）；p14: 控制结构化输出体积（已撤销）；p13: P1-2 长线 pick 新增 invalidation 失效条件字段（短线既有；schema recommendation.v2）
 	recStrategyVersion = "s9"  // s9: S1-3 名单去相关（相关性去重+同行业≤2 只，被挤出者记反事实事件）；s8: M3b 盘中因子短线加分项（尾盘放量拉升/跳水/收盘vs VWAP/午后重心上移/早盘强势）；s7: M3a 龙虎榜净买/机构席位/人气跃升/主力连续净流入加分项 + 量能维融合主力资金分；s6: F2 财务加分项（value ROE/growth 双增速/leader 盈利质量 + 业绩恶化通用扣分）；s5: T1 指标加分项 + 筹码超跌 + 五维动量/风险维升级；s4: 消息面情绪因子；s3: 策略-来源映射 + 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
 	maxScanCandidates  = 48    // 进入量化评分的候选上限（约束日线拉取量：48 只 × 1 次 HTTP，并发 6 约 3~8s）
 	maxLLMCandidates   = 10    // 量化排序后进入 LLM 精选的名单上限（控上下文体积与位置偏差）
@@ -166,6 +166,11 @@ type candidate struct {
 	// 终选名单喂 LLM 前会再次全源核验有效性，但不单独覆盖现价制造「新价+旧分」。
 	// 此字段随池快照/pick 明细落库，标明整套评分与推荐建立在哪个一致快照上。
 	QuoteAsOf string `json:"quote_as_of,omitempty"`
+	// Discovery 是全局日更发现的有界历史摘要。历史分数只作证据，scorePool 仍用
+	// 当前行情与当前日线重算 Score/Rank，禁止旧分直接进入今天的推荐排序。
+	Discovery *CandidateDiscoverySummary `json:"discovery,omitempty"`
+	// NewsBrief 只保存明确关联当前 symbol、7 日内、最多 3 条的标题级事实。
+	NewsBrief []CandidateNewsBrief `json:"news_brief,omitempty"`
 
 	// 进程内工作字段（小写不序列化，不进池快照）：closes/closeDates 尾部收盘序列及
 	// 其交易日（S1-3 相关性去重与 S1-2 相关性系数——按交易日交集对齐，任一股停牌
@@ -180,13 +185,15 @@ type candidate struct {
 
 // sourceLabelCN 候选来源的中文标签（落库英文 key，前端映射展示）。
 var sourceLabelCN = map[string]string{
-	"watchlist":       "自选",
-	"gainer":          "涨幅榜",
-	"active":          "成交额榜",
-	"turnover":        "换手率榜",
-	"dipper":          "回调榜",
-	"lowpb":           "低PB榜",
-	"strategy_signal": "策略信号",
+	"watchlist":        "自选",
+	"gainer":           "涨幅榜",
+	"active":           "成交额榜",
+	"turnover":         "换手率榜",
+	"dipper":           "回调榜",
+	"lowpb":            "低PB榜",
+	"strategy_signal":  "策略信号",
+	"daily_discovery":  "今日全市场发现",
+	"recent_discovery": "近5日候选记忆",
 }
 
 // sourceSpec 一路榜单来源的取数规格。
@@ -318,6 +325,8 @@ type recPick struct {
 	DegradedSource string `json:"degraded_source,omitempty"`
 	// QuoteAsOf 该条推荐所依据行情的数据源时刻（服务端从候选回填，模型无权自附）。
 	QuoteAsOf string `json:"quote_as_of,omitempty"`
+	// Discovery 是服务端从全局发现事实回填的历史摘要，模型自附值会在 normalizePick 清除。
+	Discovery *CandidateDiscoverySummary `json:"discovery,omitempty"`
 	// ExecutionPlan 用户偏好与现有仓位适配后的纯程序研究计划。它不参与模型输入，
 	// 不改写原始 action/confidence；随 DetailJSON 固化，历史详情不按当前偏好回算。
 	ExecutionPlan *executionPlan `json:"execution_plan,omitempty"`
@@ -721,6 +730,9 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	// 冻结真正的模型输入顺序。必须与 compactForLLM 共用 rank 排序口径，并在
 	// 终选门之后写回 pool；候选池快照、事件事实与 prompt 才能稳定重建同一机会集。
 	llmCands = freezeLLMInputOrder(pool, llmCands)
+	// 历史候选摘要随建池已冻结；新闻在真正送模前按当前 as_of 查询，限定 7 日、
+	// 每标的最多 3 条标题，不读取正文，也不改变候选边界和量化排序。
+	enrichCandidatePromptContext(llmCands, time.Now())
 	poolBySymbol := make(map[string]candidate, len(llmCands))
 	for _, c := range llmCands {
 		poolBySymbol[c.Symbol] = c
@@ -895,6 +907,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		picks[i].PoolSize = kept
 		picks[i].LotCost = round2(c.Price * 100)
 		picks[i].QuoteAsOf = c.QuoteAsOf // 行情时效硬门核验过的数据源行情时刻
+		picks[i].Discovery = c.Discovery
 		// 计划价与用户筛选阈值并入证据核验值域：模型在 evidence 里复述自己给出的
 		// 止盈/止损/买入区间、或用户设定的价格/换手/市值/追高阈值，均为合法引用而非幻觉。
 		// Origin 标注（plan/user）让前端区分「被快照数据佐证」与「模型复述自身结论」。
@@ -1615,7 +1628,7 @@ func normalizePick(p recPick, sym string, c candidate) recPick {
 	// 反方与质量门控链路回填——模型在输出 JSON 里自附这些字段会被 Unmarshal 吃进来，
 	// verify/bear 关闭时无人覆盖就会以「复核通过/反方低危」的假面落库展示。
 	// DegradedSource 不在此清（quant_fallback 构造路径先设值再过本函数）。
-	p.Review, p.Bear, p.QualityGate, p.ExecutionPlan = nil, nil, nil, nil
+	p.Review, p.Bear, p.QualityGate, p.ExecutionPlan, p.Discovery = nil, nil, nil, nil, nil
 	p.QuoteAsOf = ""      // 服务端回填字段，模型自附一律剥除
 	p.RawConfidence = nil // 服务端快照字段（复核前置信度），模型自附一律剥除
 	p.RawAction = nil     // 服务端快照字段（复核前动作），模型自附一律剥除
@@ -1955,6 +1968,9 @@ func (s *RecommendationService) buildPool(ctx context.Context, userID int64, mar
 			if pool[i].FloatCap == 0 && c.FloatCap > 0 {
 				pool[i].FloatCap = c.FloatCap
 			}
+			if c.Discovery != nil {
+				pool[i].Discovery = c.Discovery
+			}
 			return
 		}
 		if len(pool) >= maxPoolIntake {
@@ -1991,6 +2007,31 @@ func (s *RecommendationService) buildPool(ctx context.Context, userID int64, mar
 					Price: round2(it.Price), ChangePct: round2(it.ChangePct),
 					Amount: medAmt[it.Symbol]}, "watchlist")
 			}
+		}
+	}
+
+	// 全局候选发现只读消费：扫描由 factor_rebuild 后的 system JobRun 每日执行一次，
+	// 推荐生成绝不触发全市场扫描。近 5 日身份先聚合，再批量重读当前行情；旧发现
+	// score 不写入 candidate.Score，后续仍由 scorePool 用当前因子重算。
+	if market == "cn" {
+		discovered := recentDiscoveryCandidates(market, maxDiscoveryPoolIntake)
+		refs := make([]QuoteRef, 0, len(discovered))
+		for _, item := range discovered {
+			refs = append(refs, QuoteRef{Market: market, Symbol: item.candidate.Symbol})
+		}
+		quotes := map[string]*datasource.Quote{}
+		if s.market != nil {
+			quotes = s.market.QuotesFor(ctx, refs)
+		}
+		for _, item := range discovered {
+			c := item.candidate
+			if q := quotes[QuoteKey(market, c.Symbol)]; q != nil && q.Price > 0 {
+				c.Price, c.ChangePct = round2(q.Price), round2(q.ChangePct)
+				if q.Amount > 0 {
+					c.Amount = round2(q.Amount)
+				}
+			}
+			add(c, item.source)
 		}
 	}
 
@@ -2663,6 +2704,12 @@ func compactRawCandidateForLLM(c candidate) map[string]any {
 	}
 	if c.FinStatus != "" {
 		row["finance_status"] = c.FinStatus
+	}
+	if c.Discovery != nil {
+		row["discovery_history"] = c.Discovery
+	}
+	if len(c.NewsBrief) > 0 {
+		row["news_brief_7d"] = c.NewsBrief
 	}
 	return row
 }
