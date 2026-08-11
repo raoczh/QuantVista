@@ -2,7 +2,10 @@
 import { computed, h, onMounted, ref } from 'vue'
 import { NAlert, NButton, NDataTable, NSpin, NTag, useMessage, type DataTableColumns } from 'naive-ui'
 import {
+  getPositionExitOutcomes,
   getSelectionEval,
+  type PositionExitOutcomeBucket,
+  type PositionExitOutcomeReport,
   type SelectionBootstrapCI,
   type SelectionChallengerEval,
   type SelectionEvalReport,
@@ -22,6 +25,7 @@ const { upColor, downColor } = useUi()
 
 const report = ref<SelectionEvalReport | null>(null)
 const loading = ref(false)
+const exitOutcome = ref<PositionExitOutcomeReport | null>(null)
 
 async function load(refresh: boolean) {
   loading.value = true
@@ -32,7 +36,37 @@ async function load(refresh: boolean) {
   } finally {
     loading.value = false
   }
+  try {
+    exitOutcome.value = await getPositionExitOutcomes()
+  } catch {
+    exitOutcome.value = null
+  }
 }
+
+const EXIT_LEVEL_LABEL: Record<string, string> = {
+  urgent: '紧急', review: '需复核', watch: '关注', normal: '正常（对照）', unknown: '数据不足',
+}
+const exitOutcomeColumns = computed<DataTableColumns<PositionExitOutcomeBucket>>(() => [
+  { title: '窗口', key: 'horizon', width: 64, render: (r) => `${r.horizon}日` },
+  { title: '等级', key: 'level', width: 110, render: (r) => EXIT_LEVEL_LABEL[r.level] || r.level },
+  { title: '主信号', key: 'primary_signal', render: (r) => r.primary_signal || '—' },
+  { title: '样本', key: 'samples', width: 64 },
+  {
+    title: '前向均值%', key: 'avg_forward_pct', width: 96,
+    render: (r) =>
+      h('span', { style: { color: r.avg_forward_pct >= 0 ? upColor.value : downColor.value } },
+        r.samples ? r.avg_forward_pct.toFixed(2) : '—'),
+  },
+  { title: '中位%', key: 'median_forward_pct', width: 80, render: (r) => (r.samples ? r.median_forward_pct.toFixed(2) : '—') },
+  { title: '均MAE%', key: 'avg_mae_pct', width: 84, render: (r) => (r.samples ? r.avg_mae_pct.toFixed(2) : '—') },
+  { title: '下跌占比%', key: 'down_ratio_pct', width: 92, render: (r) => (r.samples ? r.down_ratio_pct.toFixed(1) : '—') },
+  {
+    title: '状态', key: 'evaluated', width: 84,
+    render: (r) =>
+      h(NTag, { size: 'small', type: r.evaluated ? 'success' : 'default' },
+        { default: () => (r.evaluated ? '已评估' : '样本不足') }),
+  },
+])
 
 onMounted(() => void load(false))
 
@@ -694,6 +728,36 @@ const AUDIT_REASON_LABEL: Record<string, string> = {
           </div>
         </SectionCard>
       </template>
+
+      <SectionCard v-if="exitOutcome" title="卖出信号效果台账">
+        <div class="se-notes">
+          <div>
+            成熟结果 {{ exitOutcome.total }} 条 · 分组样本 ≥{{ exitOutcome.min_samples }} 才算已评估 ·
+            {{ exitOutcome.generated_at }}
+          </div>
+          <div v-for="(note, i) in exitOutcome.notes || []" :key="i">{{ note }}</div>
+        </div>
+        <n-data-table
+          v-if="(exitOutcome.levels || []).length"
+          size="small"
+          :columns="exitOutcomeColumns"
+          :data="exitOutcome.levels || []"
+          :bordered="false"
+          :scroll-x="720"
+        />
+        <n-data-table
+          v-if="(exitOutcome.signals || []).length"
+          size="small"
+          :columns="exitOutcomeColumns"
+          :data="exitOutcome.signals || []"
+          :bordered="false"
+          :scroll-x="720"
+          style="margin-top: 12px"
+        />
+        <div v-if="!(exitOutcome.levels || []).length" class="se-inline-empty">
+          暂无成熟的卖出评估前向结果（评估落库满 5 个交易日后开始积累）。
+        </div>
+      </SectionCard>
     </div>
   </PageContainer>
 </template>

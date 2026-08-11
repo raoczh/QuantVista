@@ -736,6 +736,10 @@ func StartSellReviewJob(market *MarketService) *SellReviewService {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer cancel()
 			svc.RunSellReviewRound(ctx)
+			// 卖出评估前向结果台账：只回填 ≥5 交易日前的成熟评估行，幂等、纯测量。
+			if _, err := BackfillPositionExitOutcomes(ctx); err != nil {
+				common.SysWarn("卖出评估前向结果回填失败: %v", err)
+			}
 		}
 		runOnce()
 		for {

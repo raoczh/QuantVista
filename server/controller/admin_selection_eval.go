@@ -24,3 +24,15 @@ func (mc *MarketController) SelectionEval(c *gin.Context) {
 	}
 	common.ApiSuccess(c, rep)
 }
+
+// PositionExitOutcomes GET /api/admin/position-exit-outcomes —— 卖出评估前向结果
+// 台账的跨用户脱敏聚合（level 对照 + 单信号预测力）。纯读、零 LLM；样本达标前
+// 只作观察，不据此调 pea1 阈值。
+func (mc *MarketController) PositionExitOutcomes(c *gin.Context) {
+	rep, err := service.PositionExitOutcomeReport()
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, rep)
+}

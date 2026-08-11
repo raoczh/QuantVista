@@ -716,6 +716,33 @@ export function getSelectionEval(refresh = false) {
   })
 }
 
+// ---------- 卖出评估前向结果台账（pea1 阈值后验证据，只读、跨用户脱敏聚合） ----------
+
+export interface PositionExitOutcomeBucket {
+  horizon: number
+  level: string
+  primary_signal?: string
+  samples: number
+  avg_forward_pct: number
+  median_forward_pct: number
+  avg_mae_pct: number
+  down_ratio_pct: number
+  evaluated: boolean
+}
+
+export interface PositionExitOutcomeReport {
+  generated_at: string
+  total: number
+  min_samples: number
+  levels: PositionExitOutcomeBucket[] | null
+  signals: PositionExitOutcomeBucket[] | null
+  notes: string[] | null
+}
+
+export function getPositionExitOutcomes() {
+  return request<PositionExitOutcomeReport>({ url: '/admin/position-exit-outcomes' })
+}
+
 // ---------- P1-7 校准与后验标签报表（管理端只读，纯测量零门控） ----------
 
 export interface CalibBucket {
