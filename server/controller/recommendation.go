@@ -193,6 +193,23 @@ func (rc *RecommendationController) RecallReport(c *gin.Context) {
 	common.ApiSuccess(c, rep)
 }
 
+// DailyAuditReport GET /api/recommendations/daily-audits?type=&limit=
+// 返回当前用户的每日漏选/误选事实及确定性聚合，不触发市场重算或 LLM。
+func (rc *RecommendationController) DailyAuditReport(c *gin.Context) {
+	limit := 30
+	if s := c.Query("limit"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			limit = n
+		}
+	}
+	rep, err := service.LoadCandidateAuditUserReport(currentUserID(c), c.Query("type"), limit)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, rep)
+}
+
 // StopLossAlert POST /api/recommendations/items/:id/stop-alert —— S1-4 执行纪律：
 // 对推荐条目的止损价一键创建到价提醒。
 func (rc *RecommendationController) StopLossAlert(c *gin.Context) {

@@ -1,5 +1,6 @@
 import { request, HEAVY_TIMEOUT } from './client'
 import type { AuthUser } from './auth'
+import type { CandidateAuditAdminReport } from './candidateAudit'
 
 export interface SystemSettings {
   registration_open: boolean
@@ -566,23 +567,6 @@ export interface SelectionBootstrapCI {
   high_95: number
 }
 
-export interface SelectionBatchDiff {
-  batch_id: number
-  signal_date: string
-  k: number
-  left_symbols: string[] | null
-  right_symbols: string[] | null
-  avg_net_diff_pct: number
-  median_net_diff_pct: number
-  p10_net_diff_pct: number
-  net_positive_diff_pct: number
-  severe_loss_diff_pct: number
-  avg_mfe_diff_pct: number
-  avg_mae_diff_pct: number
-  has_alpha: boolean
-  avg_alpha_diff_pct: number
-}
-
 export interface SelectionPairedRow {
   pair: string
   label: string
@@ -600,7 +584,6 @@ export interface SelectionPairedRow {
   severe_loss_pct: SelectionBootstrapCI
   avg_mfe_pct: SelectionBootstrapCI
   avg_mae_pct: SelectionBootstrapCI
-  batch_diffs: SelectionBatchDiff[] | null
 }
 
 export interface SelectionSectionCoverage {
@@ -612,24 +595,6 @@ export interface SelectionSectionCoverage {
   skipped_excluded: number
   no_data_excluded: number
   forced_excluded: number
-}
-
-export interface SelectionPickView {
-  symbol: string
-  name: string
-  action?: string
-  order: number
-  score_rank: number
-}
-
-export interface SelectionBatchView {
-  batch_id: number
-  signal_date: string
-  n: number
-  ai: SelectionPickView[] | null
-  quant: SelectionPickView[] | null
-  comparable: boolean
-  exclusion?: string
 }
 
 export interface SelectionActionRow {
@@ -720,7 +685,6 @@ export interface SelectionEvalSection {
   coverage: SelectionSectionCoverage
   groups: SelectionMetric[] | null
   pairs: SelectionPairedRow[] | null
-  batches: SelectionBatchView[] | null
   action_veto: SelectionActionRow[] | null
   action_transitions: SelectionActionTransition[] | null
   plan: SelectionPlanPanel
@@ -740,6 +704,7 @@ export interface SelectionEvalReport {
   sections: SelectionEvalSection[] | null
   notes: string[] | null
   elapsed_ms: number
+  daily_audit?: CandidateAuditAdminReport
 }
 
 // 默认取进程内缓存；refresh=true 推进 outcome 并全量重算，计算路径不调用 LLM。

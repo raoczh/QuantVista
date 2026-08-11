@@ -34,6 +34,22 @@ type holdOutcome struct {
 	Forced    bool
 }
 
+// nextDayObservation 是信号次日可执行入场后的收盘观察，不表示当日真实卖出。
+// 入场、涨停不可买、停牌、整手与费率全部复用统一执行模拟器；净收益按收盘价计入
+// 一次假设退出成本，使不同标的可比较，但结论只能称为“次日观察”。
+type nextDayObservation struct {
+	Status     string
+	EntryDate  string
+	EntryPrice float64
+	ClosePrice float64
+	GrossPct   float64
+	NetPct     float64
+	MfePct     float64
+	MaePct     float64
+}
+
+const btObserved = "observed"
+
 const (
 	btTraded      = "traded"
 	btSkipLimitUp = "skip_limit_up"
@@ -48,7 +64,7 @@ func isOneWordLimitDown(b, prev datasource.Bar, limitPct float64) bool {
 	if prev.Close <= 0 || b.High <= 0 {
 		return false
 	}
-	return b.High == b.Low && (b.Close/prev.Close-1)*100 <= -(limitPct - 0.5)
+	return b.High == b.Low && (b.Close/prev.Close-1)*100 <= -(limitPct-0.5)
 }
 
 // simEntry 统一入场段：信号日下标 i，次日开盘买入。返回买入根下标、股数与总成本；
@@ -80,6 +96,27 @@ func simEntry(bars []datasource.Bar, i int, symbol, name string, perCap float64,
 	buyAmount := buy.Open * qty
 	buyFee, buyTax := tradeFee("cn", model.PaperSideBuy, symbol, buyAmount)
 	return i + 1, qty, buyAmount + buyFee + buyTax, ""
+}
+
+func simulateNextDayObservation(bars []datasource.Bar, i int, symbol, name string,
+	perCap float64, nextDate string) nextDayObservation {
+	buyIdx, qty, cost, skip := simEntry(bars, i, symbol, name, perCap, nextDate)
+	if skip != "" {
+		return nextDayObservation{Status: skip}
+	}
+	buy := bars[buyIdx]
+	if buy.Close <= 0 {
+		return nextDayObservation{Status: btPending, EntryDate: buy.TradeDate, EntryPrice: buy.Open}
+	}
+	sellAmount := buy.Close * qty
+	sellFee, sellTax := tradeFee("cn", model.PaperSideSell, symbol, sellAmount)
+	proceeds := sellAmount - sellFee - sellTax
+	mfe, mae := excursion(bars, buyIdx, buyIdx, buy.Open)
+	return nextDayObservation{
+		Status: btObserved, EntryDate: buy.TradeDate, EntryPrice: buy.Open, ClosePrice: buy.Close,
+		GrossPct: round2((buy.Close - buy.Open) / buy.Open * 100),
+		NetPct:   round2((proceeds - cost) / cost * 100), MfePct: mfe, MaePct: mae,
+	}
 }
 
 // simulateHold 从信号日下标 i 起模拟一笔「次日开盘买入、持有 holdN 交易日收盘卖出」。
@@ -173,7 +210,7 @@ type labelOutcome struct {
 }
 
 // simulateLabelHold 标签结算：信号日下标 i 次日开盘买入，卖出根 = 买入根 + horizon
-//（买入根之后第 horizon 个交易日收盘卖出，horizon=1 即买入次日卖出，满足 A 股 T+1）；
+// （买入根之后第 horizon 个交易日收盘卖出，horizon=1 即买入次日卖出，满足 A 股 T+1）；
 // takeProfit/stopLoss > 0 时启用三重障碍——自买入次日（T+1）起按当日 high/low 判盘中
 // 触达，先触者出场、同日双触保守取止损、成交按障碍价（不取更优的 high/low）。
 // 止损出场日若一字跌停按五件套③顺延。horizon 未走完且数据未覆盖返回 pending。

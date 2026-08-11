@@ -101,6 +101,8 @@ func AllModels() []any {
 		&PositionExitAssessment{},
 		&CandidateDiscoveryRun{},
 		&CandidateDiscoveryItem{},
+		&CandidateAuditRun{},
+		&CandidateAuditItem{},
 	}
 }
 

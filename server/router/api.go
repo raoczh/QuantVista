@@ -54,9 +54,11 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	positionAdviceSvc := service.NewPositionAdviceService(positionSvc, llmSvc)
 	service.RegisterDataSyncJobHandlers(marketSvc)
 	service.RegisterCandidateDiscoveryJobHandler()
+	service.RegisterCandidateAuditJobHandler(marketSvc)
 	// 七类用户作业 handler 均已注册；此时再收敛 running 并按持久顺序恢复 queued。
 	service.StartJobRuntime()
 	service.ScheduleDiscoveryStartupBackfill()
+	service.ScheduleCandidateAuditStartupBackfill()
 
 	// controllers
 	marketCtl := controller.NewMarketController(marketSvc, scoreSvc, indicatorSvc, chipSvc, intradaySvc)
@@ -282,6 +284,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				recommendations.GET("/attribution", recommendationCtl.Attribution)
 				recommendations.GET("/shadow-report", recommendationCtl.ShadowReport)
 				recommendations.GET("/recall-report", recommendationCtl.RecallReport)
+				recommendations.GET("/daily-audits", recommendationCtl.DailyAuditReport)
 				recommendations.PUT("/review-ack/:id", recommendationCtl.AckReview)
 				recommendations.POST("", middleware.RateLimit(15, time.Minute), recommendationCtl.Generate)
 				recommendations.GET("", recommendationCtl.List)

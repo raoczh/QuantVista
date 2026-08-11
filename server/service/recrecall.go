@@ -32,10 +32,10 @@ import (
 // 纯程序批次零 LLM 调用；全库流式单遍扫描（数秒级），全局互斥防并发重跑。
 
 const (
-	recallMaxBatches = 12   // 最多评估最近 N 个成功批次（每批一次全市场重建，控制耗时）
-	recallDefaultK   = 50   // Top-K 默认值
-	recallPerCap     = 2e4  // 模拟每标的拨款（与回测默认一致的量级，够一手即可）
-	recallMinAmount  = 3e7  // 机会集流动性门槛：成交额 ≥3000 万（对齐 riskgate 警示阈值）
+	recallMaxBatches = 12  // 最多评估最近 N 个成功批次（每批一次全市场重建，控制耗时）
+	recallDefaultK   = 50  // Top-K 默认值
+	recallPerCap     = 2e4 // 模拟每标的拨款（与回测默认一致的量级，够一手即可）
+	recallMinAmount  = 3e7 // 机会集流动性门槛：成交额 ≥3000 万（对齐 riskgate 警示阈值）
 )
 
 // recallHorizons 支持的收益窗口。
@@ -52,24 +52,24 @@ type RecallDist struct {
 
 // RecallSourceAblation 单来源消融行。
 type RecallSourceAblation struct {
-	Source        string  `json:"source"`
-	Label         string  `json:"label"`
-	PoolCount     int     `json:"pool_count"`      // 该来源贡献的池内候选数（首来源口径，跨批累计）
-	RecallPct     float64 `json:"recall_pct"`      // 保留全部来源的池召回（对照基线，各行相同）
-	AblatedPct    float64 `json:"ablated_pct"`     // 去掉该来源后的池召回
-	DropPct       float64 `json:"drop_pct"`        // 召回损失（RecallPct − AblatedPct）
+	Source     string  `json:"source"`
+	Label      string  `json:"label"`
+	PoolCount  int     `json:"pool_count"`  // 该来源贡献的池内候选数（首来源口径，跨批累计）
+	RecallPct  float64 `json:"recall_pct"`  // 保留全部来源的池召回（对照基线，各行相同）
+	AblatedPct float64 `json:"ablated_pct"` // 去掉该来源后的池召回
+	DropPct    float64 `json:"drop_pct"`    // 召回损失（RecallPct − AblatedPct）
 }
 
 // RecallBatchRow 单批次明细行。
 type RecallBatchRow struct {
-	BatchID    int64   `json:"batch_id"`
-	SignalDate string  `json:"signal_date"` // 落到交易日轴后的信号日
-	OppSize    int     `json:"opp_size"`    // 当日机会集规模（可交易+流动性达标）
-	PoolSize   int     `json:"pool_size"`
-	KEff       int     `json:"k_eff"`
-	HitPool    int     `json:"hit_pool"`
-	HitLLM     int     `json:"hit_llm"`
-	HitPicked  int     `json:"hit_picked"`
+	BatchID    int64  `json:"batch_id"`
+	SignalDate string `json:"signal_date"` // 落到交易日轴后的信号日
+	OppSize    int    `json:"opp_size"`    // 当日机会集规模（可交易+流动性达标）
+	PoolSize   int    `json:"pool_size"`
+	KEff       int    `json:"k_eff"`
+	HitPool    int    `json:"hit_pool"`
+	HitLLM     int    `json:"hit_llm"`
+	HitPicked  int    `json:"hit_picked"`
 }
 
 // RecallReport 召回评估报表。
@@ -97,10 +97,11 @@ type RecallReport struct {
 
 	Forced int `json:"forced"` // 退市/长停末根强平的观测数（收益不可靠，已排除出机会集）
 
-	SourceAblation []RecallSourceAblation `json:"source_ablation"`
-	BatchRows      []RecallBatchRow       `json:"batch_rows"`
-	Notes          []string               `json:"notes"`
-	ElapsedMs      int64                  `json:"elapsed_ms"`
+	SourceAblation []RecallSourceAblation    `json:"source_ablation"`
+	BatchRows      []RecallBatchRow          `json:"batch_rows"`
+	Notes          []string                  `json:"notes"`
+	ElapsedMs      int64                     `json:"elapsed_ms"`
+	DailyAudit     *CandidateAuditUserReport `json:"daily_audit,omitempty"`
 }
 
 var recallInflight atomic.Bool
@@ -464,6 +465,11 @@ func (s *RecommendationService) RecRecallReport(ctx context.Context, userID int6
 		rep.Notes = append(rep.Notes, fmt.Sprintf("%d 个观测因退市/长停按末根收盘强平（真实中卖不出，收益不可靠）——已排除出机会集与收益分布，单独计数", rep.Forced))
 	}
 	rep.ElapsedMs = time.Since(start).Milliseconds()
+	if dailyAudit, err := LoadCandidateAuditUserReport(userID, recType, candidateAuditReportMaxRuns); err == nil {
+		rep.DailyAudit = dailyAudit
+	} else {
+		rep.Notes = append(rep.Notes, "每日漏选/误选审计暂不可用："+err.Error())
+	}
 	common.SysLog("召回评估完成: %d 批次，%d 评估日，Recall@%d 池 %.1f%%/名单 %.1f%%/入选 %.1f%%，耗时 %dms",
 		rep.Batches, len(dates), k, rep.RecallPoolPct, rep.RecallLLMPct, rep.RecallPickedPct, rep.ElapsedMs)
 	return rep, nil

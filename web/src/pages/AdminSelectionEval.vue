@@ -3,8 +3,6 @@ import { computed, h, onMounted, ref } from 'vue'
 import { NAlert, NButton, NDataTable, NSpin, NTag, useMessage, type DataTableColumns } from 'naive-ui'
 import {
   getSelectionEval,
-  type SelectionBatchView,
-  type SelectionBatchDiff,
   type SelectionBootstrapCI,
   type SelectionChallengerEval,
   type SelectionEvalReport,
@@ -12,7 +10,6 @@ import {
   type LLMExperimentProtocol,
   type SelectionMetric,
   type SelectionPairedRow,
-  type SelectionPickView,
   type SelectionScoreBlindProtocolStatus,
   type SelectionSliceRow,
 } from '@/api/admin'
@@ -48,14 +45,6 @@ const ACTION_LABEL: Record<string, string> = {
   buy: 'buy',
   watch: 'watch',
   reject: '未选 / veto',
-}
-
-const EXCLUSION_LABEL: Record<string, string> = {
-  missing: '缺结果',
-  pending: '待成熟',
-  skipped: '不可成交',
-  no_data: '无数据',
-  forced: 'forced',
 }
 
 function sectionTitle(sec: SelectionEvalSection): string {
@@ -148,51 +137,7 @@ const metricColumns = computed<DataTableColumns<SelectionMetric>>(() => [
   },
 ])
 
-const batchDiffColumns = computed<DataTableColumns<SelectionBatchDiff>>(() => [
-  { title: '批次', key: 'batch_id', width: 76, fixed: 'left', render: (r) => h('span', { class: 'qv-tnum' }, `#${r.batch_id}`) },
-  { title: '信号日', key: 'signal_date', width: 104, render: (r) => h('span', { class: 'qv-tnum' }, r.signal_date) },
-  { title: 'K', key: 'k', width: 50, render: (r) => h('span', { class: 'qv-tnum' }, String(r.k)) },
-  {
-    title: '左组标的',
-    key: 'left_symbols',
-    width: 230,
-    ellipsis: { tooltip: true },
-    render: (r) => h('span', { class: 'qv-mono se-symbols' }, (r.left_symbols || []).join(', ') || '—'),
-  },
-  {
-    title: '右组标的',
-    key: 'right_symbols',
-    width: 230,
-    ellipsis: { tooltip: true },
-    render: (r) => h('span', { class: 'qv-mono se-symbols' }, (r.right_symbols || []).join(', ') || '—'),
-  },
-  { title: '净收益均值差', key: 'avg_net', width: 112, render: (r) => pctNode(r.avg_net_diff_pct, true) },
-  { title: '中位差', key: 'median_net', width: 86, render: (r) => pctNode(r.median_net_diff_pct, true) },
-  { title: 'P10 差', key: 'p10_net', width: 82, render: (r) => pctNode(r.p10_net_diff_pct, true) },
-  { title: 'net>0 差', key: 'positive', width: 88, render: (r) => pctNode(r.net_positive_diff_pct, false, 'pt') },
-  { title: 'Alpha 差', key: 'alpha', width: 88, render: (r) => pctNode(r.avg_alpha_diff_pct, true, '%', r.has_alpha) },
-  { title: 'net<-5% 差', key: 'severe', width: 94, render: (r) => pctNode(r.severe_loss_diff_pct, false, 'pt') },
-  { title: 'MFE 差', key: 'mfe', width: 78, render: (r) => pctNode(r.avg_mfe_diff_pct) },
-  { title: 'MAE 差', key: 'mae', width: 78, render: (r) => pctNode(r.avg_mae_diff_pct) },
-])
-
 const pairColumns = computed<DataTableColumns<SelectionPairedRow>>(() => [
-  {
-    type: 'expand',
-    width: 42,
-    renderExpand: (row) =>
-      h('div', { class: 'se-diff-expand' }, [
-        h('div', { class: 'se-expand-title' }, `逐批差：${row.left_group} - ${row.right_group}`),
-        h(NDataTable, {
-          columns: batchDiffColumns.value,
-          data: row.batch_diffs || [],
-          rowKey: (r: SelectionBatchDiff) => r.batch_id,
-          size: 'small',
-          scrollX: 1400,
-          maxHeight: 360,
-        }),
-      ]),
-  },
   { title: '配对', key: 'label', width: 190, fixed: 'left' },
   { title: '批次', key: 'batches', width: 66, render: (r) => h('span', { class: 'qv-tnum' }, String(r.batches)) },
   {
@@ -209,47 +154,6 @@ const pairColumns = computed<DataTableColumns<SelectionPairedRow>>(() => [
   { title: 'net<-5% 差 [95% CI]', key: 'severe', width: 188, render: (r) => ciNode(r.severe_loss_pct, false, 'pt') },
   { title: 'MFE 差 [95% CI]', key: 'mfe', width: 172, render: (r) => ciNode(r.avg_mfe_pct) },
   { title: 'MAE 差 [95% CI]', key: 'mae', width: 172, render: (r) => ciNode(r.avg_mae_pct) },
-])
-
-function pickSummary(picks: SelectionPickView[] | null, showAction: boolean): string {
-  return (picks || [])
-    .map((pick) => {
-      const name = pick.name ? `${pick.name} ` : ''
-      const action = showAction && pick.action ? ` ${pick.action}` : ''
-      return `#${pick.order} ${name}${pick.symbol}${action} · rank ${pick.score_rank}`
-    })
-    .join('；')
-}
-
-const batchColumns = computed<DataTableColumns<SelectionBatchView>>(() => [
-  { title: '批次', key: 'batch_id', width: 76, fixed: 'left', render: (r) => h('span', { class: 'qv-tnum' }, `#${r.batch_id}`) },
-  { title: '信号日', key: 'signal_date', width: 104, render: (r) => h('span', { class: 'qv-tnum' }, r.signal_date) },
-  { title: 'N', key: 'n', width: 50, render: (r) => h('span', { class: 'qv-tnum' }, String(r.n)) },
-  {
-    title: '状态',
-    key: 'comparable',
-    width: 86,
-    render: (r) =>
-      h(
-        NTag,
-        { size: 'tiny', type: r.comparable ? 'success' : 'warning', bordered: false },
-        { default: () => (r.comparable ? '可比' : EXCLUSION_LABEL[r.exclusion || ''] || r.exclusion || '剔除') },
-      ),
-  },
-  {
-    title: 'AI 最终 picks',
-    key: 'ai',
-    width: 420,
-    ellipsis: { tooltip: true },
-    render: (r) => h('span', { class: 'se-picks' }, pickSummary(r.ai, true) || '—'),
-  },
-  {
-    title: 'Quant Top-N',
-    key: 'quant',
-    width: 420,
-    ellipsis: { tooltip: true },
-    render: (r) => h('span', { class: 'se-picks' }, pickSummary(r.quant, false) || '—'),
-  },
 ])
 
 const sliceColumns = computed<DataTableColumns<SelectionSliceRow>>(() => [
@@ -349,6 +253,28 @@ function protocolSummary(protocol: LLMExperimentProtocol): string {
 function transitionLabel(from: string, to: string): string {
   return `${ACTION_LABEL[from] || from} → ${ACTION_LABEL[to] || to}`
 }
+
+const AUDIT_STAGE_LABEL: Record<string, string> = {
+  absent: '缺席',
+  filtered: '筛选排除',
+  pool_full: '池容量',
+  scored: '量化评分',
+  llm_list: 'LLM 名单',
+  picked: '最终入选',
+  unknown: '事实不足',
+}
+
+const AUDIT_REASON_LABEL: Record<string, string> = {
+  not_discovered_marketwide: '未被全市场发现',
+  discovered_not_in_user_pool: '已发现但未进用户池',
+  pool_capacity: '候选池名额已满',
+  quant_rank_below_cutoff: '量化排名未达截断位',
+  llm_rejected_recorded: '当时 LLM 已记录拒选',
+  llm_not_selected: 'LLM 未入选',
+  candidate_facts_missing: '候选事实缺失',
+  candidate_facts_ambiguous: '候选事实冲突',
+  unknown: '事实不足',
+}
 </script>
 
 <template>
@@ -427,6 +353,79 @@ function transitionLabel(from: string, to: string): string {
         </n-spin>
       </SectionCard>
 
+      <SectionCard v-if="report?.daily_audit" title="每日漏选 / 误选聚合">
+        <div class="se-version-row">
+          <n-tag size="small" type="success" :bordered="false">audit {{ report.daily_audit.audit_version }}</n-tag>
+          <n-tag size="small" :bordered="false">observation {{ report.daily_audit.outcome_version }}</n-tag>
+          <n-tag size="small" :type="report.daily_audit.outcome.evaluated ? 'success' : 'warning'" :bordered="false">
+            {{ report.daily_audit.outcome.evaluated ? '已评估' : '样本不足 · 未评估' }}
+          </n-tag>
+        </div>
+        <div class="se-coverage-grid">
+          <div class="se-coverage-line">
+            <span class="se-coverage-label">覆盖</span>
+            <span class="qv-tnum">
+              {{ report.daily_audit.runs }} 次运行 · {{ report.daily_audit.outcome_days }} 个结果日 ·
+              {{ report.daily_audit.users }} 名用户 · {{ report.daily_audit.batches }} 个批次
+            </span>
+          </div>
+          <div class="se-coverage-line">
+            <span class="se-coverage-label">全部观测</span>
+            <span class="qv-tnum">
+              可执行 {{ report.daily_audit.outcome.samples }} · 平均净收益 {{ report.daily_audit.outcome.avg_net_pct.toFixed(2) }}% ·
+              平均 Alpha {{ report.daily_audit.outcome.has_alpha ? `${report.daily_audit.outcome.avg_alpha_pct.toFixed(2)}%` : '—' }} · no_data {{ report.daily_audit.outcome.no_data }} ·
+              forced {{ report.daily_audit.outcome.forced }} · pending {{ report.daily_audit.outcome.pending }}
+            </span>
+          </div>
+          <div class="se-coverage-line">
+            <span class="se-coverage-label">LLM 拒选</span>
+            <span class="qv-tnum">
+              {{ report.daily_audit.llm_rejected.samples }} 条可执行观测 · 平均净收益
+              {{ report.daily_audit.llm_rejected.avg_net_pct.toFixed(2) }}% · Alpha
+              {{ report.daily_audit.llm_rejected.has_alpha ? `${report.daily_audit.llm_rejected.avg_alpha_pct.toFixed(2)}%` : '—' }}
+              · {{ report.daily_audit.llm_rejected.evaluated ? '已评估' : '未评估' }}
+            </span>
+          </div>
+        </div>
+
+        <div v-if="report.daily_audit.funnel?.length" class="se-audit-funnel">
+          <n-tag v-for="row in report.daily_audit.funnel" :key="`${row.stage}-${row.reason_code}`" size="small" :bordered="false">
+            {{ AUDIT_STAGE_LABEL[row.stage] || row.stage }} · {{ AUDIT_REASON_LABEL[row.reason_code] || row.reason_code }} · {{ row.count }}
+          </n-tag>
+        </div>
+
+        <div class="se-audit-rates">
+          <div v-if="report.daily_audit.source_recall?.length">
+            <div class="se-sub">来源召回</div>
+            <div v-for="row in report.daily_audit.source_recall" :key="row.key" class="se-audit-rate-row">
+              <span>{{ row.label }}</span>
+              <span class="qv-tnum">漏选 {{ row.missed }}/{{ row.total }} · {{ row.evaluated ? `${row.missed_pct.toFixed(2)}%` : '未评估' }}</span>
+            </div>
+          </div>
+          <div v-if="report.daily_audit.channel_recall?.length">
+            <div class="se-sub">发现通道召回</div>
+            <div v-for="row in report.daily_audit.channel_recall" :key="row.key" class="se-audit-rate-row">
+              <span>{{ row.label }}</span>
+              <span class="qv-tnum">漏选 {{ row.missed }}/{{ row.total }} · {{ row.evaluated ? `${row.missed_pct.toFixed(2)}%` : '未评估' }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="report.daily_audit.slices?.length" class="se-layer">
+          <div class="se-sub">日审计分层</div>
+          <div class="se-audit-slices">
+            <span v-for="row in report.daily_audit.slices" :key="`${row.dimension}-${row.key}`">
+              {{ row.dimension }}={{ row.key }} · {{ row.samples }} 条 / {{ row.outcome_days }} 日 ·
+              {{ row.evaluated ? `净收益 ${row.avg_net_pct.toFixed(2)}%` : '未评估' }}
+            </span>
+          </div>
+        </div>
+
+        <div class="se-notes">
+          <div v-for="(note, i) in report.daily_audit.notes || []" :key="i">{{ note }}</div>
+        </div>
+      </SectionCard>
+
       <template v-if="report">
         <SectionCard
           v-for="sec in report.sections || []"
@@ -454,7 +453,7 @@ function transitionLabel(from: string, to: string): string {
           />
           <div v-if="!hasEvaluatedMetric(sec.groups)" class="se-inline-empty">暂无成熟且非 forced 的同批可比样本。</div>
 
-          <div class="se-sub">Selection 逐批配对差与 95% CI（左组 - 右组）</div>
+          <div class="se-sub">Selection 脱敏配对差与 95% CI（左组 - 右组）</div>
           <n-data-table
             v-if="comparablePairs(sec.pairs).length"
             :columns="pairColumns"
@@ -464,18 +463,6 @@ function transitionLabel(from: string, to: string): string {
             :scroll-x="1890"
           />
           <div v-else class="se-inline-empty">暂无可用于 paired bootstrap 的批次。</div>
-
-          <div class="se-sub">批次选择与剔除核对</div>
-          <n-data-table
-            v-if="sec.batches?.length"
-            :columns="batchColumns"
-            :data="sec.batches"
-            :row-key="(r: SelectionBatchView) => r.batch_id"
-            size="small"
-            :scroll-x="1160"
-            :max-height="360"
-          />
-          <div v-else class="se-inline-empty">暂无 AI 非零 picks 的完整事实批次。</div>
 
           <div class="se-layer">
             <div class="se-sub">Action / Veto（独立 fixed-hold 统计）</div>
@@ -900,6 +887,32 @@ function transitionLabel(from: string, to: string): string {
 .se-notes-compact {
   margin-top: 7px;
 }
+.se-audit-funnel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+.se-audit-rates {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 24px;
+}
+.se-audit-rate-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--qv-border, rgba(128, 128, 128, 0.18));
+  font-size: 12px;
+}
+.se-audit-slices {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 20px;
+  font-size: 12px;
+  line-height: 1.6;
+}
 
 @media (max-width: 768px) {
   .se-toolbar {
@@ -918,6 +931,10 @@ function transitionLabel(from: string, to: string): string {
   }
   .se-section-coverage {
     align-items: flex-start;
+  }
+  .se-audit-rates,
+  .se-audit-slices {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 </style>

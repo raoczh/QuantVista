@@ -32,6 +32,7 @@ import {
   getAttribution,
   getShadowReport,
   getRecallReport,
+  getDailyAuditReport,
   getDiscoveryStatus,
   createStopLossAlert,
   ackRecommendationReview,
@@ -45,6 +46,7 @@ import {
   type AttributionReport,
   type ShadowReport,
   type RecallReport,
+  type CandidateAuditUserReport,
   type RecReject,
   type RecFilters,
   type PoolCandidate,
@@ -961,6 +963,8 @@ watch(shadowHorizon, () => {
 const showRecall = ref(false)
 const recallLoading = ref(false)
 const recallReport = ref<RecallReport | null>(null)
+const dailyAudit = ref<CandidateAuditUserReport | null>(null)
+const recallError = ref('')
 const recallHorizon = ref(10)
 const recallK = ref(50)
 const recallHorizonOptions = [5, 10, 20].map((h) => ({ label: `${h} 交易日`, value: h }))
@@ -973,6 +977,38 @@ const RECALL_STAGE_LABEL: Record<string, string> = {
   filtered: '被筛选排除',
   absent: '从未进池',
 }
+const AUDIT_REASON_LABEL: Record<string, string> = {
+  not_discovered_marketwide: '未被全市场发现',
+  discovered_not_in_user_pool: '已发现但未进入该用户推荐池',
+  user_blacklist: '用户黑名单',
+  user_price_filter: '价格筛选',
+  user_market_cap_filter: '市值筛选',
+  user_turnover_filter: '换手筛选',
+  liquidity_filter: '流动性筛选',
+  st_or_delisted_filter: 'ST / 退市筛选',
+  suspended_filter: '停牌筛选',
+  unexecutable_filter: '不可成交筛选',
+  quote_stale: '行情过期',
+  filtered_recorded_other: '已记录的其他筛选',
+  pool_capacity: '候选池名额已满',
+  correlation_gate: '相关性门控',
+  industry_cap: '行业上限',
+  quant_rank_below_cutoff: '量化排名未达截断位',
+  llm_rejected_recorded: '当时 LLM 已记录拒选',
+  llm_not_selected: '进入名单但未入选',
+  picked_adverse_next_day: '入选后次日不利',
+  candidate_facts_missing: '候选事实缺失',
+  candidate_facts_ambiguous: '候选事实冲突',
+  unknown: '事实不足',
+}
+function auditReasonLabel(reason: string): string {
+  return AUDIT_REASON_LABEL[reason] || reason || '事实不足'
+}
+function auditConclusionLabel(code: string): string {
+  if (code === 'early_adverse_observation') return '早期不利观察'
+  if (code === 'false_positive_next_day') return '误选（次日不利）'
+  return '漏选强势机会'
+}
 const recallStages = computed(() => {
   const counts = recallReport.value?.topk_stage_counts || {}
   return Object.keys(RECALL_STAGE_LABEL)
@@ -981,14 +1017,27 @@ const recallStages = computed(() => {
 })
 async function loadRecall() {
   recallLoading.value = true
-  try {
-    recallReport.value = await getRecallReport(form.value.type, recallHorizon.value, recallK.value)
-  } catch (e) {
+  recallError.value = ''
+  const [recallResult, auditResult] = await Promise.allSettled([
+    getRecallReport(form.value.type, recallHorizon.value, recallK.value),
+    getDailyAuditReport(form.value.type),
+  ])
+  if (recallResult.status === 'fulfilled') {
+    recallReport.value = recallResult.value
+    dailyAudit.value = recallResult.value.daily_audit || dailyAudit.value
+  } else {
     recallReport.value = null
-    message.error((e as Error).message)
-  } finally {
-    recallLoading.value = false
+    recallError.value = recallResult.reason instanceof Error ? recallResult.reason.message : '召回评估暂不可用'
   }
+  if (auditResult.status === 'fulfilled') {
+    dailyAudit.value = auditResult.value
+  } else if (!dailyAudit.value) {
+    dailyAudit.value = null
+  }
+  if (recallResult.status === 'rejected' && auditResult.status === 'rejected') {
+    message.error(recallError.value)
+  }
+  recallLoading.value = false
 }
 function openRecall() {
   showRecall.value = true
@@ -1984,15 +2033,18 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
     </n-modal>
 
     <!-- S3-2 候选池召回评估：Recall@K / 来源消融 / 错失机会率 / 机会集 vs 池收益分布 -->
-    <n-modal v-model:show="showRecall" preset="card" title="候选池召回评估" class="attr-modal" :style="{ maxWidth: '860px', width: 'calc(100vw - 32px)' }">
+    <n-modal v-model:show="showRecall" preset="card" title="候选召回与每日复盘" class="attr-modal" :style="{ maxWidth: '980px', width: 'calc(100vw - 24px)' }">
       <div class="attr-toolbar">
         <n-select v-model:value="recallHorizon" :options="recallHorizonOptions" size="small" style="width: 120px" />
         <n-select v-model:value="recallK" :options="recallKOptions" size="small" style="width: 110px" />
         <span class="attr-meta" v-if="recallReport">评估 {{ recallReport.batches }} 个批次 · 耗时 {{ recallReport.elapsed_ms }}ms</span>
       </div>
       <n-spin :show="recallLoading">
-        <n-empty v-if="!recallLoading && !recallReport" description="暂无可评估批次：需要已走完持有期的成功推荐批次" />
-        <div v-else-if="recallReport" class="attr-body">
+        <n-empty v-if="!recallLoading && !recallReport && !dailyAudit" description="暂无可评估的召回或日审计事实" />
+        <n-alert v-if="recallError && dailyAudit" type="warning" :show-icon="false" :bordered="false" class="audit-alert">
+          长周期召回暂不可用：{{ recallError }}。每日复盘仍可查看。
+        </n-alert>
+        <div v-if="recallReport" class="attr-body">
           <div class="attr-dim">
             <div class="attr-dim-title">Recall@{{ recallReport.k }}（未来 {{ recallReport.horizon_days }} 日全市场 Top-{{ recallReport.k }} 净收益股）</div>
             <div class="pool-scroll">
@@ -2086,6 +2138,92 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
           </div>
           <div class="pool-note">
             <div v-for="(n, i) in recallReport.notes" :key="i">{{ n }}</div>
+          </div>
+        </div>
+
+        <div v-if="dailyAudit" class="audit-body">
+          <div class="audit-heading">
+            <div>
+              <div class="attr-dim-title">每日漏选 / 误选复盘</div>
+              <div class="attr-meta">{{ dailyAudit.audit_version }} · 结果 {{ dailyAudit.outcome_version }} · 截至 {{ dailyAudit.generated_at }}</div>
+            </div>
+            <n-tag size="small" :type="dailyAudit.outcome.evaluated ? 'success' : 'warning'" :bordered="false">
+              {{ dailyAudit.outcome.evaluated ? '已评估' : '样本不足 · 未评估' }}
+            </n-tag>
+          </div>
+
+          <div v-if="dailyAudit.runs?.length" class="audit-days">
+            <div v-for="run in dailyAudit.runs" :key="run.id" class="audit-day">
+              <div class="audit-day-date">{{ run.signal_date }} → {{ run.outcome_date }}</div>
+              <div class="audit-day-metrics qv-tnum">
+                强势机会 {{ run.opportunity_count }} · 漏选 {{ run.missed_count }} · {{ form.type === 'long_term' ? '早期不利' : '误选' }} {{ run.adverse_count }}
+              </div>
+              <n-tag v-if="run.status === 'partial'" size="tiny" type="warning" :bordered="false">覆盖不完整</n-tag>
+            </div>
+          </div>
+          <n-empty v-else description="尚无属于当前用户的日审计批次" size="small" />
+
+          <div class="audit-summary" v-if="dailyAudit.outcome.samples || dailyAudit.outcome.no_data || dailyAudit.outcome.forced">
+            <span>可执行观测 <b class="qv-tnum">{{ dailyAudit.outcome.samples }}</b></span>
+            <span>结果日 <b class="qv-tnum">{{ dailyAudit.outcome.outcome_days }}</b></span>
+            <span>平均净收益 <b class="qv-tnum" :style="{ color: pctColorOf(dailyAudit.outcome.avg_net_pct) }">{{ signedPct(dailyAudit.outcome.avg_net_pct) }}</b></span>
+            <span>平均 Alpha <b v-if="dailyAudit.outcome.has_alpha" class="qv-tnum" :style="{ color: pctColorOf(dailyAudit.outcome.avg_alpha_pct) }">{{ signedPct(dailyAudit.outcome.avg_alpha_pct) }}</b><b v-else>—</b></span>
+            <span>无数据 {{ dailyAudit.outcome.no_data }} · forced {{ dailyAudit.outcome.forced }} · 长期 pending {{ dailyAudit.outcome.pending }}</span>
+          </div>
+
+          <div class="attr-dim" v-if="dailyAudit.funnel?.length">
+            <div class="attr-dim-title">漏斗主原因</div>
+            <div class="audit-funnel">
+              <n-tag v-for="row in dailyAudit.funnel" :key="`${row.stage}-${row.reason_code}`" size="small" :bordered="false">
+                {{ RECALL_STAGE_LABEL[row.stage] || row.stage }} · {{ auditReasonLabel(row.reason_code) }} · {{ row.count }}
+              </n-tag>
+            </div>
+          </div>
+
+          <div class="audit-rate-grid">
+            <div class="audit-rate" v-if="dailyAudit.source_recall?.length">
+              <div class="attr-dim-title">来源漏选率</div>
+              <div v-for="row in dailyAudit.source_recall" :key="row.key" class="audit-rate-row">
+                <span>{{ row.label }}</span>
+                <span class="qv-tnum">{{ row.missed }}/{{ row.total }} · {{ row.evaluated ? `${row.missed_pct.toFixed(1)}%` : '未评估' }}</span>
+              </div>
+            </div>
+            <div class="audit-rate" v-if="dailyAudit.channel_recall?.length">
+              <div class="attr-dim-title">发现通道漏选率</div>
+              <div v-for="row in dailyAudit.channel_recall" :key="row.key" class="audit-rate-row">
+                <span>{{ row.label }}</span>
+                <span class="qv-tnum">{{ row.missed }}/{{ row.total }} · {{ row.evaluated ? `${row.missed_pct.toFixed(1)}%` : '未评估' }}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="attr-dim" v-if="dailyAudit.items?.length">
+            <div class="attr-dim-title">昨日事实下钻</div>
+            <div class="audit-items">
+              <div v-for="item in dailyAudit.items" :key="item.id" class="audit-item">
+                <div class="audit-item-main">
+                  <span class="audit-symbol">{{ item.name || item.symbol }} <span class="qv-mono">{{ item.symbol }}</span></span>
+                  <n-tag size="tiny" :type="item.audit_type === 'missed_leader' ? 'warning' : 'error'" :bordered="false">
+                    {{ auditConclusionLabel(item.conclusion_code) }}
+                  </n-tag>
+                  <span class="qv-tnum" :style="{ color: pctColorOf(item.net_return_pct) }">净 {{ signedPct(item.net_return_pct) }}</span>
+                  <span class="qv-tnum">MFE {{ signedPct(item.mfe_pct) }} · MAE {{ signedPct(item.mae_pct) }}</span>
+                </div>
+                <div class="audit-item-facts">
+                  <span>{{ item.signal_date }} → {{ item.outcome_date }}</span>
+                  <span>批次 #{{ item.batch_id }}</span>
+                  <span>阶段 {{ RECALL_STAGE_LABEL[item.funnel_stage] || item.funnel_stage }}</span>
+                  <span>主因 {{ auditReasonLabel(item.primary_reason_code) }}</span>
+                  <span v-if="item.opportunity_rank">机会排名 #{{ item.opportunity_rank }}</span>
+                  <span v-if="item.score_rank">量化排名 #{{ item.score_rank }}</span>
+                  <span v-if="item.source_set">来源 {{ item.source_set }}</span>
+                  <span v-if="item.channel_set">通道 {{ item.channel_set }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="pool-note">
+            <div v-for="(n, i) in dailyAudit.notes || []" :key="i">{{ n }}</div>
           </div>
         </div>
       </n-spin>
@@ -2744,10 +2882,111 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
   gap: 6px;
   margin-top: 8px;
 }
+.audit-alert {
+  margin-bottom: 12px;
+}
+.audit-body {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--qv-divider);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.audit-heading,
+.audit-day,
+.audit-item-main,
+.audit-item-facts,
+.audit-summary,
+.audit-funnel {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.audit-heading {
+  justify-content: space-between;
+  gap: 10px;
+}
+.audit-days {
+  border-top: 1px solid var(--qv-divider);
+}
+.audit-day {
+  min-height: 42px;
+  gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--qv-divider);
+  font-size: 12px;
+}
+.audit-day-date {
+  flex: 0 0 180px;
+  font-weight: 600;
+}
+.audit-day-metrics {
+  flex: 1 1 280px;
+}
+.audit-summary {
+  gap: 8px 20px;
+  font-size: 12px;
+  line-height: 1.7;
+}
+.audit-funnel {
+  gap: 6px;
+}
+.audit-rate-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 24px;
+}
+.audit-rate-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--qv-divider);
+  font-size: 12px;
+}
+.audit-item {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--qv-divider);
+}
+.audit-item-main {
+  gap: 8px 12px;
+}
+.audit-symbol {
+  font-weight: 600;
+}
+.audit-symbol .qv-mono {
+  margin-left: 4px;
+  font-size: 11px;
+  opacity: 0.55;
+}
+.audit-item-facts {
+  gap: 4px 14px;
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.6;
+  opacity: 0.64;
+}
 .attr-body {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+@media (max-width: 600px) {
+  .audit-rate-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+  .audit-day-date {
+    flex-basis: 100%;
+  }
+  .audit-heading {
+    align-items: flex-start;
+  }
+  .audit-item-main > .qv-tnum:last-child {
+    flex-basis: 100%;
+  }
 }
 .attr-dim-title {
   font-size: 13px;

@@ -1,5 +1,6 @@
 import { request, HEAVY_TIMEOUT } from './client'
 import type { EvidenceCheck, TrustReview } from './trust'
+import type { CandidateAuditUserReport } from './candidateAudit'
 
 // 信任层类型统一收敛到 trust.ts；此处 re-export 保持既有 import 路径不炸。
 export type { EvidenceCheck } from './trust'
@@ -607,6 +608,7 @@ export interface RecallReport {
   batch_rows: RecallBatchRow[] | null
   notes: string[]
   elapsed_ms: number
+  daily_audit?: CandidateAuditUserReport
 }
 
 // S3-2 候选池召回评估（数秒级重活，服务端全局互斥）。
@@ -618,3 +620,14 @@ export function getRecallReport(type?: string, horizon = 10, k = 50) {
     timeout: HEAVY_TIMEOUT,
   })
 }
+
+// 每日漏选/误选持久事实。快速查询，不触发市场扫描或 LLM。
+export function getDailyAuditReport(type?: string, limit = 30) {
+  return request<CandidateAuditUserReport>({
+    url: '/recommendations/daily-audits',
+    method: 'get',
+    params: { type, limit },
+  })
+}
+
+export type { CandidateAuditUserReport } from './candidateAudit'

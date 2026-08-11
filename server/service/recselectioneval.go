@@ -120,7 +120,7 @@ type SelectionPairedRow struct {
 	SevereLossPct  SelectionBootstrapCI `json:"severe_loss_pct"`
 	AvgMfePct      SelectionBootstrapCI `json:"avg_mfe_pct"`
 	AvgMaePct      SelectionBootstrapCI `json:"avg_mae_pct"`
-	BatchDiffs     []SelectionBatchDiff `json:"batch_diffs"`
+	BatchDiffs     []SelectionBatchDiff `json:"-"`
 }
 
 type SelectionSectionCoverage struct {
@@ -239,7 +239,7 @@ type SelectionEvalSection struct {
 	Coverage          SelectionSectionCoverage    `json:"coverage"`
 	Groups            []SelectionMetric           `json:"groups"`
 	Pairs             []SelectionPairedRow        `json:"pairs"`
-	Batches           []SelectionBatchView        `json:"batches"`
+	Batches           []SelectionBatchView        `json:"-"`
 	ActionVeto        []SelectionActionRow        `json:"action_veto"`
 	ActionTransitions []SelectionActionTransition `json:"action_transitions"`
 	Plan              SelectionPlanPanel          `json:"plan"`
@@ -249,16 +249,17 @@ type SelectionEvalSection struct {
 }
 
 type SelectionEvalReport struct {
-	GeneratedAt             string                 `json:"generated_at"`
-	OutcomeVersion          string                 `json:"outcome_version"`
-	SchemaVersion           string                 `json:"schema_version"`
-	RankingVersion          string                 `json:"ranking_version"`
-	ChallengerSchemaVersion string                 `json:"challenger_schema_version"`
-	Bootstrap               SelectionBootstrapSpec `json:"bootstrap"`
-	Coverage                SelectionEvalCoverage  `json:"coverage"`
-	Sections                []SelectionEvalSection `json:"sections"`
-	Notes                   []string               `json:"notes"`
-	ElapsedMs               int64                  `json:"elapsed_ms"`
+	GeneratedAt             string                     `json:"generated_at"`
+	OutcomeVersion          string                     `json:"outcome_version"`
+	SchemaVersion           string                     `json:"schema_version"`
+	RankingVersion          string                     `json:"ranking_version"`
+	ChallengerSchemaVersion string                     `json:"challenger_schema_version"`
+	Bootstrap               SelectionBootstrapSpec     `json:"bootstrap"`
+	Coverage                SelectionEvalCoverage      `json:"coverage"`
+	Sections                []SelectionEvalSection     `json:"sections"`
+	Notes                   []string                   `json:"notes"`
+	ElapsedMs               int64                      `json:"elapsed_ms"`
+	DailyAudit              *CandidateAuditAdminReport `json:"daily_audit,omitempty"`
 }
 
 var (
@@ -478,6 +479,11 @@ func buildSelectionEvalReport(batches []selectionBatchFacts, now time.Time) (*Se
 		"prompt 影子指标仅纳入 valid+ep1 且两份逐标的 JSON 完整的 run；score-blind 协议覆盖率纳入通过 sb1 seed/order/精确输入 hash 校验的全部成功、空选、失败与越池终态，失败/越池只进分母不进收益指标；两类按实验类型与 experiment_id 独立分组，matched-K 不补造标的",
 		fmt.Sprintf("策略/regime/provider·model/prompt 分层至少 %d 个可比批次才评估，否则明确标记不确定", selectionSliceMinBatches),
 		"本报表计算路径不调用 LLM，不改推荐、prompt、权重、门控或模型路由",
+	}
+	if dailyAudit, err := LoadCandidateAuditAdminReport(candidateAuditReportMaxRuns); err == nil {
+		rep.DailyAudit = dailyAudit
+	} else {
+		rep.Notes = append(rep.Notes, "每日候选审计聚合暂不可用："+err.Error())
 	}
 	return rep, nil
 }

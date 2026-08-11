@@ -614,6 +614,8 @@ func RegisterCandidateDiscoveryJobHandler() {
 			if row.Status == DiscoveryRunStatusPart {
 				status = model.JobStatusDegraded
 			}
+			// 只有当前交易日发现事实已经持久化，才尝试审计严格相邻的上一有效交易日。
+			ScheduleCandidateAudit(row.TradeDate, "discovery")
 			return DurableJobResult{Status: status, Total: row.UniverseCount, Succeeded: row.SuccessCount, Failed: row.FailedCount}, nil
 		})
 }
