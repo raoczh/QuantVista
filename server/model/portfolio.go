@@ -64,6 +64,7 @@ const (
 type Position struct {
 	ID           int64  `gorm:"primaryKey" json:"id"`
 	UserID       int64  `gorm:"index" json:"user_id"`
+	AccountID    int64  `gorm:"index;index:idx_position_account_status,priority:1" json:"account_id"`
 	Symbol       string `gorm:"size:16;index" json:"symbol"`
 	Market       string `gorm:"size:8" json:"market"`
 	Name         string `gorm:"size:64" json:"name"`
@@ -163,6 +164,7 @@ const (
 type PositionTrade struct {
 	ID         int64 `gorm:"primaryKey" json:"id"`
 	UserID     int64 `gorm:"index;index:idx_ptrade_pos" json:"user_id"`
+	AccountID  int64 `gorm:"index;index:idx_ptrade_account_date,priority:1" json:"account_id"`
 	PositionID int64 `gorm:"index:idx_ptrade_pos" json:"position_id"`
 
 	Side     string  `gorm:"size:8" json:"side"` // buy=加仓 / sell=减仓
@@ -171,7 +173,7 @@ type PositionTrade struct {
 	Fee      float64 `gorm:"type:decimal(20,4)" json:"fee"`
 	Tax      float64 `gorm:"type:decimal(20,4)" json:"tax"`
 
-	TradeDate string `gorm:"size:10" json:"trade_date"`
+	TradeDate string `gorm:"size:10;index:idx_ptrade_account_date,priority:2" json:"trade_date"`
 	Note      string `gorm:"size:255" json:"note"`
 
 	// RealizedPnl 该笔卖出结转的已实现盈亏（元）。买入笔恒 0。
@@ -215,9 +217,10 @@ const (
 // 单位：金额=元。
 type PortfolioSnapshot struct {
 	ID        int64  `gorm:"primaryKey" json:"id"`
-	UserID    int64  `gorm:"index;index:idx_psnap_uniq,unique" json:"user_id"`
-	Kind      string `gorm:"size:8;index:idx_psnap_uniq,unique" json:"kind"`        // real / paper
-	TradeDate string `gorm:"size:10;index:idx_psnap_uniq,unique" json:"trade_date"` // YYYY-MM-DD
+	UserID    int64  `gorm:"index;index:idx_psnap_account_uniq,unique,priority:1" json:"user_id"`
+	AccountID int64  `gorm:"index;index:idx_psnap_account_uniq,unique,priority:2" json:"account_id"`
+	Kind      string `gorm:"size:8;index" json:"kind"`                                                 // real / paper，冗余用于兼容与审计
+	TradeDate string `gorm:"size:10;index:idx_psnap_account_uniq,unique,priority:3" json:"trade_date"` // YYYY-MM-DD
 
 	MarketValue   float64 `gorm:"type:decimal(20,4)" json:"market_value"`   // 持仓市值（已定价部分）
 	Cost          float64 `gorm:"type:decimal(20,4)" json:"cost"`           // 持仓成本（已定价部分）

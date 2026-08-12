@@ -24,7 +24,12 @@ func NewPositionController(svc *service.PositionService) *PositionController {
 // List GET /api/positions?status=holding|closed|all
 func (pc *PositionController) List(c *gin.Context) {
 	status := strings.ToLower(c.DefaultQuery("status", "all"))
-	list, err := pc.svc.List(c.Request.Context(), currentUserID(c), status)
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+	if err != nil {
+		common.ApiErrorMsg(c, "组合不存在")
+		return
+	}
+	list, err := pc.svc.ListByAccount(c.Request.Context(), currentUserID(c), account.ID, status)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -34,7 +39,12 @@ func (pc *PositionController) List(c *gin.Context) {
 
 // Overview GET /api/positions/overview —— 组合总览 + 个人风控信号。
 func (pc *PositionController) Overview(c *gin.Context) {
-	ov, err := pc.svc.Overview(c.Request.Context(), currentUserID(c))
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+	if err != nil {
+		common.ApiErrorMsg(c, "组合不存在")
+		return
+	}
+	ov, err := pc.svc.OverviewByAccount(c.Request.Context(), currentUserID(c), account.ID)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -49,7 +59,12 @@ func (pc *PositionController) Create(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	p, err := pc.svc.Create(c.Request.Context(), currentUserID(c), in)
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+	if err != nil {
+		common.ApiErrorMsg(c, "组合不存在")
+		return
+	}
+	p, err := pc.svc.CreateByAccount(c.Request.Context(), currentUserID(c), account.ID, in)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -66,6 +81,11 @@ func (pc *PositionController) Update(c *gin.Context) {
 	var in service.PositionInput
 	if err := c.ShouldBindJSON(&in); err != nil {
 		common.ApiErrorMsg(c, "请求格式错误")
+		return
+	}
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+	if err != nil || service.ValidatePositionAccount(currentUserID(c), account.ID, id) != nil {
+		common.ApiErrorMsg(c, "持仓不存在")
 		return
 	}
 	p, err := pc.svc.Update(currentUserID(c), id, in)
@@ -87,6 +107,11 @@ func (pc *PositionController) Close(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+	if err != nil || service.ValidateWritablePositionAccount(currentUserID(c), account.ID, id) != nil {
+		common.ApiErrorMsg(c, "持仓不存在")
+		return
+	}
 	p, err := pc.svc.Close(currentUserID(c), id, in)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
@@ -101,6 +126,11 @@ func (pc *PositionController) Delete(c *gin.Context) {
 	if !ok {
 		return
 	}
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+	if err != nil || service.ValidateWritablePositionAccount(currentUserID(c), account.ID, id) != nil {
+		common.ApiErrorMsg(c, "持仓不存在")
+		return
+	}
 	if err := pc.svc.Delete(currentUserID(c), id); err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -112,6 +142,11 @@ func (pc *PositionController) Delete(c *gin.Context) {
 func (pc *PositionController) Trades(c *gin.Context) {
 	id, ok := parseIDParam(c, "id")
 	if !ok {
+		return
+	}
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+	if err != nil || service.ValidateWritablePositionAccount(currentUserID(c), account.ID, id) != nil {
+		common.ApiErrorMsg(c, "持仓不存在")
 		return
 	}
 	rows, err := pc.svc.ListTrades(currentUserID(c), id)
@@ -134,6 +169,11 @@ func (pc *PositionController) AddTrade(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+	if err != nil || service.ValidateWritablePositionAccount(currentUserID(c), account.ID, id) != nil {
+		common.ApiErrorMsg(c, "持仓不存在")
+		return
+	}
 	p, err := pc.svc.AddTrade(currentUserID(c), id, in)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
@@ -144,7 +184,12 @@ func (pc *PositionController) AddTrade(c *gin.Context) {
 
 // Stats GET /api/positions/stats?range= —— 个人交易复盘统计（B6，纯读时聚合）。
 func (pc *PositionController) Stats(c *gin.Context) {
-	out, err := pc.svc.TradeStats(c.Request.Context(), currentUserID(c), c.Query("range"))
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+	if err != nil {
+		common.ApiErrorMsg(c, "组合不存在")
+		return
+	}
+	out, err := pc.svc.TradeStatsByAccount(c.Request.Context(), currentUserID(c), account.ID, c.Query("range"))
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -160,7 +205,12 @@ func (pc *PositionController) Curve(c *gin.Context) {
 			days = n
 		}
 	}
-	out, err := service.PortfolioCurve(currentUserID(c), model.SnapshotKindReal, days)
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+	if err != nil {
+		common.ApiErrorMsg(c, "组合不存在")
+		return
+	}
+	out, err := service.PortfolioCurveByAccount(currentUserID(c), account.ID, model.SnapshotKindReal, days)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -172,13 +222,18 @@ func (pc *PositionController) Curve(c *gin.Context) {
 // 顺带按今日除权日生成一次（幂等），保证用户打开持仓页就能看到今天该确认的调整。
 func (pc *PositionController) CorpAdjusts(c *gin.Context) {
 	uid := currentUserID(c)
+	account, err := service.ResolvePortfolioAccount(uid, optionalAccountID(c), model.PortfolioKindReal)
+	if err != nil {
+		common.ApiErrorMsg(c, "组合不存在")
+		return
+	}
 	status := strings.ToLower(strings.TrimSpace(c.Query("status")))
 	if status == "" || status == model.CorpAdjustPending {
-		if _, err := service.GenerateCorpAdjusts(uid, time.Now().Format("2006-01-02")); err != nil {
+		if _, err := service.GenerateCorpAdjustsForAccount(uid, account.ID, time.Now().Format("2006-01-02")); err != nil {
 			common.SysWarn("生成除权调整建议失败 user=%d: %v", uid, err)
 		}
 	}
-	rows, err := service.ListCorpAdjusts(uid, status)
+	rows, err := service.ListCorpAdjustsForAccount(uid, account.ID, status)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -194,15 +249,20 @@ func (pc *PositionController) CorpAdjustAction(c *gin.Context) {
 		return
 	}
 	uid := currentUserID(c)
+	account, accountErr := service.ResolvePortfolioAccount(uid, optionalAccountID(c), model.PortfolioKindReal)
+	if accountErr != nil {
+		common.ApiErrorMsg(c, "组合不存在")
+		return
+	}
 	var out *model.PositionCorpAdjust
 	var err error
 	switch strings.ToLower(c.Param("action")) {
 	case "confirm":
-		out, err = pc.svc.ConfirmCorpAdjust(uid, id)
+		out, err = pc.svc.ConfirmCorpAdjustForAccount(uid, account.ID, id)
 	case "revert":
-		out, err = pc.svc.RevertCorpAdjust(uid, id)
+		out, err = pc.svc.RevertCorpAdjustForAccount(uid, account.ID, id)
 	case "dismiss":
-		out, err = pc.svc.DismissCorpAdjust(uid, id)
+		out, err = pc.svc.DismissCorpAdjustForAccount(uid, account.ID, id)
 	default:
 		common.ApiErrorMsg(c, "不支持的操作")
 		return

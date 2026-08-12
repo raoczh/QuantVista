@@ -65,7 +65,7 @@ func (ctl *DataImportController) Upload(c *gin.Context) {
 		return
 	}
 	defer f.Close()
-	view, err := ctl.svc.Upload(currentUserID(c), c.PostForm("kind"), fh.Filename, f)
+	view, err := ctl.svc.UploadByAccount(currentUserID(c), optionalAccountID(c), c.PostForm("kind"), fh.Filename, f)
 	if err != nil {
 		common.ApiErrorMsg(c, publicImportError(err))
 		return

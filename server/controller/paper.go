@@ -21,7 +21,12 @@ func NewPaperController(svc *service.PaperService) *PaperController {
 
 // Overview GET /api/paper/overview —— 账户总览（现金 + 持仓估值 + 盈亏）。
 func (pc *PaperController) Overview(c *gin.Context) {
-	ov, err := pc.svc.Overview(c.Request.Context(), currentUserID(c))
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindPaper)
+	if err != nil {
+		common.ApiErrorMsg(c, "组合不存在")
+		return
+	}
+	ov, err := pc.svc.OverviewByAccount(c.Request.Context(), currentUserID(c), account.ID)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -36,7 +41,12 @@ func (pc *PaperController) Trade(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	t, err := pc.svc.Trade(c.Request.Context(), currentUserID(c), in)
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindPaper)
+	if err != nil {
+		common.ApiErrorMsg(c, "组合不存在")
+		return
+	}
+	t, err := pc.svc.TradeByAccount(c.Request.Context(), currentUserID(c), account.ID, in)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -52,7 +62,12 @@ func (pc *PaperController) Trades(c *gin.Context) {
 			limit = n
 		}
 	}
-	rows, err := pc.svc.Trades(currentUserID(c), limit)
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindPaper)
+	if err != nil {
+		common.ApiErrorMsg(c, "组合不存在")
+		return
+	}
+	rows, err := pc.svc.TradesByAccount(currentUserID(c), account.ID, limit)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -66,7 +81,12 @@ func (pc *PaperController) Reset(c *gin.Context) {
 		InitialCash float64 `json:"initial_cash"`
 	}
 	_ = c.ShouldBindJSON(&body)
-	acc, err := pc.svc.Reset(currentUserID(c), body.InitialCash)
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindPaper)
+	if err != nil {
+		common.ApiErrorMsg(c, "组合不存在")
+		return
+	}
+	acc, err := pc.svc.ResetByAccount(currentUserID(c), account.ID, body.InitialCash)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -82,7 +102,12 @@ func (pc *PaperController) Curve(c *gin.Context) {
 			days = n
 		}
 	}
-	out, err := service.PortfolioCurve(currentUserID(c), model.SnapshotKindPaper, days)
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindPaper)
+	if err != nil {
+		common.ApiErrorMsg(c, "组合不存在")
+		return
+	}
+	out, err := service.PortfolioCurveByAccount(currentUserID(c), account.ID, model.SnapshotKindPaper, days)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return

@@ -192,8 +192,20 @@ func countOpenTradeDaysBetween(market, from, to string) (int, bool) {
 
 // TradeStats 个人交易复盘统计（仅本人已平仓持仓 + 其流水）。
 func (s *PositionService) TradeStats(ctx context.Context, userID int64, rangeKey string) (*TradeStats, error) {
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
+	if err != nil {
+		return nil, err
+	}
+	return s.TradeStatsByAccount(ctx, userID, account.ID, rangeKey)
+}
+
+// TradeStatsByAccount 只聚合指定真实账户。旧接口由 TradeStats 幂等解析默认账户。
+func (s *PositionService) TradeStatsByAccount(ctx context.Context, userID, accountID int64, rangeKey string) (*TradeStats, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
+	}
+	if _, err := PortfolioAccountByID(userID, accountID, model.PortfolioKindReal); err != nil {
+		return nil, err
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -209,7 +221,7 @@ func (s *PositionService) TradeStats(ctx context.Context, userID int64, rangeKey
 	if !valid {
 		out.Notes = append(out.Notes, fmt.Sprintf("未识别的时间范围 %q，已回落为全部历史", rangeKey))
 	}
-	q := common.DB.WithContext(ctx).Where("user_id = ? AND status = ?", userID, model.PositionStatusClosed)
+	q := common.DB.WithContext(ctx).Where("user_id = ? AND account_id = ? AND status = ?", userID, accountID, model.PositionStatusClosed)
 	if days > 0 {
 		from := time.Now().AddDate(0, 0, -days).Format("2006-01-02")
 		out.RangeFrom = from
@@ -228,7 +240,7 @@ func (s *PositionService) TradeStats(ctx context.Context, userID int64, rangeKey
 	// 补齐账本：老持仓无流水时 TotalBuyCost=0，先补建再统计，否则收益率分母为 0。
 	backfillPositionLedgers(userID, positions)
 	// 重读补建后的汇总列。user_id 条件不可省（全链路隔离铁律，即使 ids 已来自本人）。
-	if err := common.DB.WithContext(ctx).Where("user_id = ? AND id IN ?", userID, positionIDs(positions)).
+	if err := common.DB.WithContext(ctx).Where("user_id = ? AND account_id = ? AND id IN ?", userID, accountID, positionIDs(positions)).
 		Order("sell_date DESC, id DESC").Find(&positions).Error; err != nil {
 		return nil, err
 	}

@@ -20,16 +20,17 @@ const (
 // ImportBatch 是统一导入的审计根事实。原文件不落盘；CSV 表头与每行原始单元格保存在
 // ImportRow.RawJSON，映射预检后再冻结 NormalizedJSON，确认接口不接收前端解析结果。
 type ImportBatch struct {
-	ID     string `gorm:"primaryKey;size:36" json:"id"`
-	UserID int64  `gorm:"index;uniqueIndex:idx_import_dedupe,priority:1" json:"user_id"`
-	Kind   string `gorm:"size:16;index;uniqueIndex:idx_import_dedupe,priority:2" json:"kind"`
+	ID        string `gorm:"primaryKey;size:36" json:"id"`
+	UserID    int64  `gorm:"index;uniqueIndex:idx_import_dedupe_account,priority:1" json:"user_id"`
+	AccountID int64  `gorm:"index;uniqueIndex:idx_import_dedupe_account,priority:2" json:"account_id"`
+	Kind      string `gorm:"size:16;index;uniqueIndex:idx_import_dedupe_account,priority:3" json:"kind"`
 
 	SchemaVersion int    `gorm:"default:1" json:"schema_version"`
-	Attempt       int    `gorm:"not null;default:1;uniqueIndex:idx_import_dedupe,priority:4" json:"attempt"`
+	Attempt       int    `gorm:"not null;default:1;uniqueIndex:idx_import_dedupe_account,priority:5" json:"attempt"`
 	Version       int    `gorm:"default:1" json:"version"`
 	Status        string `gorm:"size:16;index" json:"status"`
 	FileName      string `gorm:"size:255" json:"file_name"`
-	FileDigest    string `gorm:"size:64;uniqueIndex:idx_import_dedupe,priority:3" json:"file_digest"`
+	FileDigest    string `gorm:"size:64;uniqueIndex:idx_import_dedupe_account,priority:4" json:"file_digest"`
 	HeaderJSON    string `gorm:"type:text" json:"-"`
 	MappingJSON   string `gorm:"type:text" json:"-"`
 	MappingDigest string `gorm:"size:64" json:"mapping_digest"`
@@ -71,9 +72,10 @@ type ImportRow struct {
 // 不同映射或并发确认也不能重复写入同一业务行；批次成功回滚后删除声明，审计行仍保留。
 type ImportRowClaim struct {
 	ID        int64     `gorm:"primaryKey" json:"id"`
-	UserID    int64     `gorm:"uniqueIndex:idx_import_claim,priority:1" json:"user_id"`
-	Kind      string    `gorm:"size:16;uniqueIndex:idx_import_claim,priority:2" json:"kind"`
-	RowDigest string    `gorm:"size:64;uniqueIndex:idx_import_claim,priority:3" json:"row_digest"`
+	UserID    int64     `gorm:"uniqueIndex:idx_import_claim_account,priority:1" json:"user_id"`
+	AccountID int64     `gorm:"uniqueIndex:idx_import_claim_account,priority:2" json:"account_id"`
+	Kind      string    `gorm:"size:16;uniqueIndex:idx_import_claim_account,priority:3" json:"kind"`
+	RowDigest string    `gorm:"size:64;uniqueIndex:idx_import_claim_account,priority:4" json:"row_digest"`
 	BatchID   string    `gorm:"size:36;index" json:"batch_id"`
 	RowNumber int       `json:"row"`
 	CreatedAt time.Time `json:"created_at"`
@@ -85,6 +87,7 @@ type ImportRowClaim struct {
 type ImportEffect struct {
 	ID         int64     `gorm:"primaryKey" json:"id"`
 	UserID     int64     `gorm:"index;uniqueIndex:idx_import_effect,priority:1" json:"user_id"`
+	AccountID  int64     `gorm:"index" json:"account_id"`
 	BatchID    string    `gorm:"size:36;index;uniqueIndex:idx_import_effect,priority:2" json:"batch_id"`
 	RowNumber  int       `gorm:"index" json:"row"`
 	RecordKind string    `gorm:"size:24;uniqueIndex:idx_import_effect,priority:3" json:"record_kind"`

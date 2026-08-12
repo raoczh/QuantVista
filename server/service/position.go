@@ -130,6 +130,14 @@ func positionCurrentCost(p model.Position) float64 {
 
 // List 列出持仓（status: holding/closed/all），富化实时盈亏。
 func (s *PositionService) List(ctx context.Context, userID int64, status string) ([]PositionView, error) {
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
+	if err != nil {
+		return nil, err
+	}
+	return s.ListByAccount(ctx, userID, account.ID, status)
+}
+
+func (s *PositionService) ListByAccount(ctx context.Context, userID, accountID int64, status string) ([]PositionView, error) {
 	switch status {
 	case model.PositionStatusHolding, model.PositionStatusClosed, "", "all":
 	default:
@@ -137,7 +145,7 @@ func (s *PositionService) List(ctx context.Context, userID int64, status string)
 	}
 	// 每次重建查询：GORM 链式对象执行后不可复用（条件会累积）。
 	loadPositions := func() ([]model.Position, error) {
-		q := common.DB.Where("user_id = ?", userID)
+		q := common.DB.Where("user_id = ? AND account_id = ?", userID, accountID)
 		if status == model.PositionStatusHolding || status == model.PositionStatusClosed {
 			q = q.Where("status = ?", status)
 		}
@@ -339,7 +347,15 @@ const topWeightWarnPct = 40.0
 
 // Overview 组合总览与个人风控提示（基于 List 的富化结果聚合，读时计算不落库）。
 func (s *PositionService) Overview(ctx context.Context, userID int64) (*PortfolioOverview, error) {
-	views, err := s.List(ctx, userID, "all")
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
+	if err != nil {
+		return nil, err
+	}
+	return s.OverviewByAccount(ctx, userID, account.ID)
+}
+
+func (s *PositionService) OverviewByAccount(ctx context.Context, userID, accountID int64) (*PortfolioOverview, error) {
+	views, err := s.ListByAccount(ctx, userID, accountID, "all")
 	if err != nil {
 		return nil, err
 	}
@@ -561,6 +577,17 @@ func resolveRecommendationLink(userID, recID int64) int64 {
 
 // Create 新建持仓。
 func (s *PositionService) Create(ctx context.Context, userID int64, in PositionInput) (*model.Position, error) {
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
+	if err != nil {
+		return nil, err
+	}
+	return s.CreateByAccount(ctx, userID, account.ID, in)
+}
+
+func (s *PositionService) CreateByAccount(ctx context.Context, userID, accountID int64, in PositionInput) (*model.Position, error) {
+	if _, err := ActivePortfolioAccountByID(userID, accountID, model.PortfolioKindReal); err != nil {
+		return nil, err
+	}
 	symbol, market, err := normalizeSymbolMarket(in.Symbol, in.Market)
 	if err != nil {
 		return nil, err
@@ -582,6 +609,7 @@ func (s *PositionService) Create(ctx context.Context, userID int64, in PositionI
 	in.RecommendationID = resolveRecommendationLink(userID, in.RecommendationID)
 	p := &model.Position{
 		UserID:       userID,
+		AccountID:    accountID,
 		Symbol:       symbol,
 		Market:       market,
 		Name:         name,

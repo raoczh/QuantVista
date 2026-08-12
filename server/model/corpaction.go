@@ -141,10 +141,11 @@ const (
 // 保证「一次除权只调一次」在任何重跑顺序下都成立。
 type PositionCorpAdjust struct {
 	ID         int64 `gorm:"primaryKey" json:"id"`
-	UserID     int64 `gorm:"index;uniqueIndex:idx_corpadj_uniq" json:"user_id"`
-	PositionID int64 `gorm:"index;uniqueIndex:idx_corpadj_uniq" json:"position_id"`
+	UserID     int64 `gorm:"index;uniqueIndex:idx_corpadj_account_uniq,priority:1" json:"user_id"`
+	AccountID  int64 `gorm:"index;uniqueIndex:idx_corpadj_account_uniq,priority:2" json:"account_id"`
+	PositionID int64 `gorm:"index;uniqueIndex:idx_corpadj_account_uniq,priority:3" json:"position_id"`
 	// CorporateActionID 来源公司行动（显式外键列，撤销/重复确认判定与审计都靠它）。
-	CorporateActionID int64 `gorm:"index;uniqueIndex:idx_corpadj_uniq" json:"corporate_action_id"`
+	CorporateActionID int64 `gorm:"index;uniqueIndex:idx_corpadj_account_uniq,priority:4" json:"corporate_action_id"`
 
 	Symbol     string `gorm:"size:16;index" json:"symbol"`
 	Market     string `gorm:"size:8" json:"market"`
@@ -197,8 +198,9 @@ type PositionCorpAdjust struct {
 // 仍只执行一次。模拟账户 Reset 必须连本表一并清空，否则新账户会被旧审计误判已处理。
 type PaperCorpAdjust struct {
 	ID                int64 `gorm:"primaryKey" json:"id"`
-	UserID            int64 `gorm:"index;uniqueIndex:idx_papercorpadj_uniq" json:"user_id"`
-	CorporateActionID int64 `gorm:"index;uniqueIndex:idx_papercorpadj_uniq" json:"corporate_action_id"`
+	UserID            int64 `gorm:"index;uniqueIndex:idx_papercorpadj_account_uniq,priority:1" json:"user_id"`
+	AccountID         int64 `gorm:"index;uniqueIndex:idx_papercorpadj_account_uniq,priority:2" json:"account_id"`
+	CorporateActionID int64 `gorm:"index;uniqueIndex:idx_papercorpadj_account_uniq,priority:3" json:"corporate_action_id"`
 
 	Symbol     string `gorm:"size:16;index" json:"symbol"`
 	Market     string `gorm:"size:8" json:"market"`

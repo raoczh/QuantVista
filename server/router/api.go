@@ -21,6 +21,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	adminSvc := service.NewAdminService()
 	watchlistSvc := service.NewWatchlistService(marketSvc)
 	positionSvc := service.NewPositionService(marketSvc)
+	portfolioAccountSvc := service.NewPortfolioAccountService()
+	portfolioRiskSvc := service.NewPortfolioRiskService(marketSvc, positionSvc)
 	boardSvc := service.NewBoardService() // 在 analysisSvc 之前创建（P3b：板块分析注入板块资金流）
 	analysisSvc := service.NewAnalysisService(marketSvc, watchlistSvc, positionSvc, llmSvc, boardSvc)
 	recommendationSvc := service.NewRecommendationService(marketSvc, watchlistSvc, llmSvc)
@@ -72,6 +74,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	adminCtl := controller.NewAdminController(adminSvc)
 	watchlistCtl := controller.NewWatchlistController(watchlistSvc)
 	positionCtl := controller.NewPositionController(positionSvc)
+	portfolioCtl := controller.NewPortfolioController(portfolioAccountSvc, portfolioRiskSvc)
 	positionAdviceCtl := controller.NewPositionAdviceController(positionAdviceSvc)
 	analysisCtl := controller.NewAnalysisController(analysisSvc)
 	recommendationCtl := controller.NewRecommendationController(recommendationSvc, trackingSvc, alertSvc)
@@ -160,6 +163,25 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 		authed := api.Group("")
 		authed.Use(middleware.JWTAuth())
 		{
+			portfolios := authed.Group("/portfolios")
+			{
+				portfolios.GET("", portfolioCtl.List)
+				portfolios.POST("", portfolioCtl.Create)
+				portfolios.PUT("/:id", portfolioCtl.Update)
+				portfolios.DELETE("/:id", portfolioCtl.Delete)
+				portfolios.POST("/:id/archive", portfolioCtl.Archive)
+				portfolios.POST("/:id/default", portfolioCtl.Default)
+				portfolios.GET("/:id/overview", portfolioCtl.Overview)
+				portfolios.GET("/:id/risk", portfolioCtl.Risk)
+				portfolios.GET("/:id/holdings", portfolioCtl.Holdings)
+				portfolios.GET("/:id/cash-flows", portfolioCtl.CashFlows)
+				portfolios.POST("/:id/cash-flows", portfolioCtl.CreateCashFlow)
+				portfolios.POST("/:id/cash-flows/:flow_id/reverse", portfolioCtl.ReverseCashFlow)
+				portfolios.POST("/:id/stress-tests", portfolioCtl.Stress)
+				portfolios.GET("/:id/targets", portfolioCtl.Targets)
+				portfolios.POST("/:id/targets", portfolioCtl.SaveTargets)
+				portfolios.GET("/:id/rebalance", portfolioCtl.Rebalance)
+			}
 			// 全局股票搜索（只读本地股票宇宙，不触发行情或外部数据源）。
 			authed.GET("/stocks/search", middleware.RateLimit(120, time.Minute), stockSearchCtl.Search)
 			// 统一任务中心：JobRun 事实、操作与带 Last-Event-ID 的事件流；旧业务任务仍作兼容投影。

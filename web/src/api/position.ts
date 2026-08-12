@@ -157,6 +157,11 @@ export interface PortfolioExposure {
   industry: ExposureDim
   cap_style: ExposureDim
   value_style: ExposureDim
+  window_days?: number
+  sample_count?: number
+  as_of?: string
+  factor_version?: string
+  data_version?: string
 }
 
 export interface PortfolioOverview {

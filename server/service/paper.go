@@ -51,7 +51,7 @@ func tradeFee(market, side, symbol string, amount float64) (fee, tax float64) {
 // lockedAccount 事务内按 user_id 重读账户；MySQL 加 FOR UPDATE 行锁串行化并发交易，
 // SQLite 不支持该子句（单写者天然串行），跳过。
 func lockedAccount(tx *gorm.DB, userID int64, acc *model.PaperAccount) error {
-	q := tx.Where("user_id = ?", userID)
+	q := tx.Where("user_id = ? AND account_id = ?", userID, acc.AccountID)
 	if !common.UsingSQLite {
 		q = q.Clauses(clause.Locking{Strength: "UPDATE"})
 	}
@@ -60,35 +60,33 @@ func lockedAccount(tx *gorm.DB, userID int64, acc *model.PaperAccount) error {
 
 // GetOrCreateAccount 取用户模拟账户，无则以默认初始资金创建。
 func (s *PaperService) GetOrCreateAccount(userID int64) (*model.PaperAccount, error) {
-	var acc model.PaperAccount
-	err := common.DB.Where("user_id = ?", userID).First(&acc).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		acc = model.PaperAccount{UserID: userID, InitialCash: model.PaperDefaultCash, Cash: model.PaperDefaultCash}
-		res := common.DB.Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "user_id"}},
-			DoNothing: true,
-		}).Create(&acc)
-		if res.Error != nil {
-			return nil, res.Error
-		}
-		if res.RowsAffected == 0 {
-			// 并发首建由另一请求抢先成功，重读唯一行即可。
-			if err := common.DB.Where("user_id = ?", userID).First(&acc).Error; err != nil {
-				return nil, err
-			}
-		}
-		if acc.ID == 0 {
-			return nil, errors.New("模拟账户创建失败")
-		}
-		if err := common.DB.Where("user_id = ?", userID).First(&acc).Error; err != nil {
-			return nil, err
-		}
-		return &acc, nil
-	}
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindPaper)
 	if err != nil {
 		return nil, err
 	}
-	return &acc, nil
+	return s.GetOrCreateAccountByID(userID, account.ID)
+}
+
+func (s *PaperService) GetOrCreateAccountByID(userID, accountID int64) (*model.PaperAccount, error) {
+	account, err := PortfolioAccountByID(userID, accountID, model.PortfolioKindPaper)
+	if err != nil {
+		return nil, err
+	}
+	if account.Status != model.PortfolioStatusActive {
+		return nil, errors.New("模拟账户已归档")
+	}
+	var acc model.PaperAccount
+	err = common.DB.Where("user_id = ? AND account_id = ?", userID, accountID).First(&acc).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		acc = model.PaperAccount{UserID: userID, AccountID: accountID, InitialCash: model.PaperDefaultCash, Cash: model.PaperDefaultCash}
+		if err := common.DB.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "account_id"}}, DoNothing: true}).Create(&acc).Error; err != nil {
+			return nil, err
+		}
+		if err := common.DB.Where("user_id = ? AND account_id = ?", userID, accountID).First(&acc).Error; err != nil {
+			return nil, err
+		}
+	}
+	return &acc, err
 }
 
 // TradeInput 下单入参。Price<=0 时用实时行情价成交。
@@ -103,6 +101,13 @@ type TradeInput struct {
 
 // Trade 执行一次模拟买/卖（事务：更新现金、持仓、流水）。
 func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (*model.PaperTrade, error) {
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindPaper)
+	if err != nil {
+		return nil, err
+	}
+	return s.TradeByAccount(ctx, userID, account.ID, in)
+}
+func (s *PaperService) TradeByAccount(ctx context.Context, userID, accountID int64, in TradeInput) (*model.PaperTrade, error) {
 	symbol, market, err := normalizeSymbolMarket(in.Symbol, in.Market)
 	if err != nil {
 		return nil, err
@@ -115,7 +120,7 @@ func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (
 		return nil, errors.New("数量必须大于 0")
 	}
 	tradeDate := time.Now().In(time.Local).Format("2006-01-02")
-	if err := ensurePaperCorpAdjustBeforeTrade(userID, symbol, market, tradeDate); err != nil {
+	if err := ensurePaperCorpAdjustBeforeTradeForAccount(userID, accountID, symbol, market, tradeDate); err != nil {
 		return nil, err
 	}
 
@@ -146,13 +151,13 @@ func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (
 		name = strings.TrimSpace(in.Name)
 	}
 
-	acc, err := s.GetOrCreateAccount(userID)
+	acc, err := s.GetOrCreateAccountByID(userID, accountID)
 	if err != nil {
 		return nil, err
 	}
 
 	trade := &model.PaperTrade{
-		UserID: userID, Symbol: symbol, Market: market, Name: name,
+		UserID: userID, AccountID: accountID, Symbol: symbol, Market: market, Name: name,
 		Side: side, Price: price, Quantity: in.Quantity,
 		TradeDate: tradeDate,
 	}
@@ -163,7 +168,7 @@ func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (
 		if err := lockedAccount(tx, userID, acc); err != nil {
 			return err
 		}
-		if err := verifyPaperCorpAdjustBeforeTradeTx(tx, userID, symbol, market, tradeDate); err != nil {
+		if err := verifyPaperCorpAdjustBeforeTradeTx(tx, userID, accountID, symbol, market, tradeDate); err != nil {
 			return err
 		}
 		amount := round2(price * in.Quantity)
@@ -171,7 +176,7 @@ func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (
 		trade.Amount, trade.Fee, trade.Tax = amount, fee, tax
 
 		var holding model.PaperHolding
-		hErr := tx.Where("user_id = ? AND symbol = ? AND market = ?", userID, symbol, market).First(&holding).Error
+		hErr := tx.Where("user_id = ? AND account_id = ? AND symbol = ? AND market = ?", userID, accountID, symbol, market).First(&holding).Error
 		hasHolding := hErr == nil
 		if hErr != nil && !errors.Is(hErr, gorm.ErrRecordNotFound) {
 			return hErr
@@ -196,7 +201,7 @@ func (s *PaperService) Trade(ctx context.Context, userID int64, in TradeInput) (
 				}
 			} else {
 				holding = model.PaperHolding{
-					UserID: userID, Symbol: symbol, Market: market, Name: name,
+					UserID: userID, AccountID: accountID, Symbol: symbol, Market: market, Name: name,
 					Quantity: in.Quantity, AvgCost: round4(costBasis / in.Quantity),
 				}
 				if err := tx.Create(&holding).Error; err != nil {
@@ -264,8 +269,15 @@ type PaperOverview struct {
 }
 
 func paperRealizedPnl(db *gorm.DB, userID int64) (float64, error) {
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindPaper)
+	if err != nil {
+		return 0, err
+	}
+	return paperRealizedPnlByAccount(db, userID, account.ID)
+}
+func paperRealizedPnlByAccount(db *gorm.DB, userID, accountID int64) (float64, error) {
 	var realized float64
-	err := db.Model(&model.PaperTrade{}).Where("user_id = ? AND side IN ?", userID,
+	err := db.Model(&model.PaperTrade{}).Where("user_id = ? AND account_id = ? AND side IN ?", userID, accountID,
 		[]string{model.PaperSideSell, model.PaperSideAdjust}).
 		Select("COALESCE(SUM(realized_pnl),0)").Scan(&realized).Error
 	return round2(realized), err
@@ -275,12 +287,19 @@ func paperRealizedPnl(db *gorm.DB, userID int64) (float64, error) {
 // fail-closed：非 fresh（stale/unknown/失败）的持仓按成本估值、浮盈记 0 并透明计数
 // ——旧价市值冒充「实时资产」会让总资产与盈亏虚高/虚低。
 func (s *PaperService) Overview(ctx context.Context, userID int64) (*PaperOverview, error) {
-	acc, err := s.GetOrCreateAccount(userID)
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindPaper)
+	if err != nil {
+		return nil, err
+	}
+	return s.OverviewByAccount(ctx, userID, account.ID)
+}
+func (s *PaperService) OverviewByAccount(ctx context.Context, userID, accountID int64) (*PaperOverview, error) {
+	acc, err := s.GetOrCreateAccountByID(userID, accountID)
 	if err != nil {
 		return nil, err
 	}
 	var holdings []model.PaperHolding
-	if err := common.DB.Where("user_id = ?", userID).Order("id").Find(&holdings).Error; err != nil {
+	if err := common.DB.Where("user_id = ? AND account_id = ?", userID, accountID).Order("id").Find(&holdings).Error; err != nil {
 		return nil, err
 	}
 
@@ -343,7 +362,7 @@ func (s *PaperService) Overview(ctx context.Context, userID int64) (*PaperOvervi
 	}
 
 	// 累计已实现盈亏（卖出兑现 + 除权现金分红）。
-	realized, err := paperRealizedPnl(common.DB, userID)
+	realized, err := paperRealizedPnlByAccount(common.DB, userID, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -353,6 +372,16 @@ func (s *PaperService) Overview(ctx context.Context, userID int64) (*PaperOvervi
 
 // Trades 成交流水（倒序）。
 func (s *PaperService) Trades(userID int64, limit int) ([]model.PaperTrade, error) {
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindPaper)
+	if err != nil {
+		return nil, err
+	}
+	return s.TradesByAccount(userID, account.ID, limit)
+}
+func (s *PaperService) TradesByAccount(userID, accountID int64, limit int) ([]model.PaperTrade, error) {
+	if _, err := PortfolioAccountByID(userID, accountID, model.PortfolioKindPaper); err != nil {
+		return nil, err
+	}
 	if limit <= 0 {
 		limit = 50
 	}
@@ -360,12 +389,19 @@ func (s *PaperService) Trades(userID int64, limit int) ([]model.PaperTrade, erro
 		limit = 200
 	}
 	var rows []model.PaperTrade
-	err := common.DB.Where("user_id = ?", userID).Order("id DESC").Limit(limit).Find(&rows).Error
+	err := common.DB.Where("user_id = ? AND account_id = ?", userID, accountID).Order("id DESC").Limit(limit).Find(&rows).Error
 	return rows, err
 }
 
 // Reset 重置账户：清空持仓与流水，现金恢复到指定初始资金（<=0 用默认）。
 func (s *PaperService) Reset(userID int64, initialCash float64) (*model.PaperAccount, error) {
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindPaper)
+	if err != nil {
+		return nil, err
+	}
+	return s.ResetByAccount(userID, account.ID, initialCash)
+}
+func (s *PaperService) ResetByAccount(userID, accountID int64, initialCash float64) (*model.PaperAccount, error) {
 	if initialCash <= 0 {
 		initialCash = model.PaperDefaultCash
 	}
@@ -373,7 +409,7 @@ func (s *PaperService) Reset(userID int64, initialCash float64) (*model.PaperAcc
 		return nil, errors.New("初始资金过大")
 	}
 	initialCash = round2(initialCash)
-	acc, err := s.GetOrCreateAccount(userID)
+	acc, err := s.GetOrCreateAccountByID(userID, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -381,16 +417,16 @@ func (s *PaperService) Reset(userID int64, initialCash float64) (*model.PaperAcc
 		if err := lockedAccount(tx, userID, acc); err != nil {
 			return err
 		}
-		if err := tx.Where("user_id = ?", userID).Delete(&model.PaperHolding{}).Error; err != nil {
+		if err := tx.Where("user_id = ? AND account_id = ?", userID, accountID).Delete(&model.PaperHolding{}).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("user_id = ?", userID).Delete(&model.PaperTrade{}).Error; err != nil {
+		if err := tx.Where("user_id = ? AND account_id = ?", userID, accountID).Delete(&model.PaperTrade{}).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("user_id = ?", userID).Delete(&model.PaperCorpAdjust{}).Error; err != nil {
+		if err := tx.Where("user_id = ? AND account_id = ?", userID, accountID).Delete(&model.PaperCorpAdjust{}).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("user_id = ? AND kind = ?", userID, model.SnapshotKindPaper).
+		if err := tx.Where("user_id = ? AND account_id = ? AND kind = ?", userID, accountID, model.SnapshotKindPaper).
 			Delete(&model.PortfolioSnapshot{}).Error; err != nil {
 			return err
 		}

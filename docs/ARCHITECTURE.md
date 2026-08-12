@@ -213,11 +213,14 @@ Go API Server
 职责：
 
 - 管理已购入持仓（**带流水的账本**：分批加仓/减仓、加权成本重算、已实现盈亏结转）。
+- 管理用户级命名真实/模拟账户、默认账户、归档状态及旧事实的幂等归属迁移。
 - 记录买入和卖出。
+- 记录真实账户不可变外部现金流，按资金流调整口径构造完整净值。
 - 计算当前盈亏。
 - 关联 AI 推荐记录。
 - 每交易日盘后落资产快照，供资产曲线。
 - 组合层暴露分析（行业 / 市值风格 / 估值风格三维分布，读时计算不落库）。
+- 组合层历史风险、相关性、风险贡献、压力测试与版本化目标配置/再平衡草案。
 
 **账本口径铁律（B5，改代码前必读）**：`positions.buy_price` 恒为**当前持仓**的加权平均成本、
 `positions.quantity` 恒为**当前持仓**数量（全部卖出后为 0）、`buy_fee/buy_tax` 恒为当前持仓尚未
@@ -228,9 +231,21 @@ Go API Server
 持仓按卖出流水恒等式迁移余额，`adjust` 现金分红不参与成本反推。
 `position_trades` 是唯一明细来源，汇总值在同一事务内回写 positions。
 
-**相关表（B5~B7 新增）**：
+**相关表（B5~B7 + P2）**：
 
-- `position_trades`：`user_id / position_id / side(buy|sell|adjust) / price / quantity / fee / tax /
+- `portfolio_accounts`：`user_id / name / kind(real|paper) / currency / status(active|archived) /
+  is_default / default_key / archived_at`。`default_key` 只在默认账户上取 `user:kind`，唯一索引保证
+  每用户每 kind 至多一个默认账户；严禁 `user_id=0`。首次访问幂等创建默认账户，启动归属迁移只
+  回填 `account_id IS NULL/0` 的旧事实，重复启动不新建账户、不改已有归属。归档后历史可读、事实写入
+  拒绝；有持仓、流水、快照、现金流、导入批次或目标 revision 时禁止硬删除。
+- `portfolio_cash_flows`：`user_id / account_id / type(deposit|withdrawal|fee_adjustment|reversal) /
+  amount / trade_date / note / idempotency_key / reversal_of_id`。唯一键 `(user_id, account_id,
+  idempotency_key)`；行创建后禁止更新/删除，只能新增金额相反的 reversal。仅 real 账户可写。
+- `target_allocation_revisions`：`user_id / account_id / revision / content_hash / items_json`，唯一键
+  `(user_id, account_id, revision)`。每次编辑追加不可变 revision，历史重算严格读取该 revision 的
+  JSON，不得拿当前配置覆盖。
+
+- `position_trades`：`user_id / account_id / position_id / side(buy|sell|adjust) / price / quantity / fee / tax /
   trade_date / note / realized_pnl / avg_cost_after / quantity_after / backfilled`
   + B8 折算审计列 `avg_cost_before / quantity_before / corporate_action_id / adjust_id`，
   索引 `(user_id, position_id)`。单位：price=元/股、quantity=股、fee/tax=元。
@@ -238,9 +253,9 @@ Go API Server
   不改动任何既有汇总值。`side=adjust` 是**除权除息折算**（不是买卖）：price/fee/tax 恒 0，
   quantity 记数量变化量，realized_pnl 记到手税前现金分红；前后账面在
   `*_before/*_after` 四列，来源在 `corporate_action_id`——**审计信息一律成列，不塞进 note**。
-- `portfolio_snapshots`：`user_id / kind(real|paper) / trade_date / market_value / cost /
+- `portfolio_snapshots`：`user_id / account_id / kind(real|paper) / trade_date / market_value / cost /
   unrealized_pnl / realized_cum / cash / position_count / partial / missing_count / note`，
-  唯一键 `(user_id, kind, trade_date)`。交易日 16:20 job 幂等 upsert（错峰：16:10 全市场日线、
+  唯一键 `(user_id, account_id, trade_date)`。交易日 16:20 job 按活跃账户幂等 upsert（错峰：16:10 全市场日线、
   16:35 涨停池、18:45 龙虎榜）。**fail-closed**：市值走 `FreshQuotesFor`，stale/失败的标的
   既不进市值也不进成本，该日快照标 `partial` 并记缺口数——绝不用旧价冒充。
 
@@ -345,6 +360,34 @@ Go API Server
   ③集中度提示须过覆盖率闸门（≥60%）——只查到一小部分持仓的行业就断言赛道集中是拿局部当整体。
 - 行情 stale/失败的持仓既不进市值也不进分布（与 `Overview.TotalValue` 同口径），未计入笔数在
   `base_note` 里如实声明。
+
+**组合风险、压力测试与再平衡（P2，2026-08-12）**：
+
+- `service/portfoliorisk_core.go` 只含稳定纯函数；`portfoliorisk.go` 负责按 `user_id + account_id`
+  读取快照、现金流、当前持仓和本地 `daily_bars`。无插值、partial 点不参与完整区间，样本不足和
+  基准缺失均返回 `unavailable + reason`，不得用 0 冒充。参数快照固定
+  `annualization/risk_free_rate_pct/window_days/benchmark_code/as_of/version` 并计算稳定 hash。
+- 区间收益为 `(V_end - external_flow_at_end) / V_start - 1`，TWR 链式相乘；真实账户现金由外部
+  现金流加买卖/费税/现金分红重建，缺有效初始入金即拒绝完整总资产、TWR 与相关派生指标。
+  Beta/年化 Jensen Alpha 只在组合与指定基准共同交易日上计算。
+- 风险贡献按全部持仓共同收益样本协方差矩阵计算：`sigma_p=sqrt(w'Σw)`、
+  `MRC_i=(Σw)_i/sigma_p`、`CRC_i=w_i*MRC_i`、`PCR_i=CRC_i/sigma_p`；权重分母为完整组合总资产，
+  现金保留为零波动权重。任一持仓缺 fresh 价格、真实现金不完整或共同样本不足时整块 fail-closed。
+- 压力测试只读地应用市场、行业、单票或计划止损冲击并返回损失金额/比例、逐持仓贡献和未知项。
+  目标配置草案按 symbol/industry 比较当前与目标，以 fresh 价格换算 A 股整百股，程序估算费税；
+  stale、停牌、涨停和缺价返回 unavailable。两者均不写 `positions/position_trades`、不提醒、
+  不调用 LLM、不创建 JobRun 或 ResearchArtifact。它们是即时可重算的有界研究响应，不是异步业务事实。
+
+账户接口：
+
+- `GET/POST /api/portfolios`、`PUT/DELETE /api/portfolios/:id`
+- `POST /api/portfolios/:id/archive`、`POST /api/portfolios/:id/default`
+- `GET /api/portfolios/:id/{overview,risk,holdings,cash-flows,targets,rebalance}`
+- `POST /api/portfolios/:id/cash-flows`、`POST /api/portfolios/:id/cash-flows/:flow_id/reverse`
+- `POST /api/portfolios/:id/stress-tests`、`POST /api/portfolios/:id/targets`
+
+旧 positions/paper/curve/stats/import 接口继续兼容可选 `account_id`；未传时只解析本人同 kind 默认账户。
+显式 ID 必须同时匹配本人和 kind，跨用户、跨账户、real/paper 混用均按不存在处理。
 
 **股息率（C10，第六十二批）**：`corporate_actions.dividend_yield` 的**唯一**取值口径是
 `service/dividendyield.go` 的 `pickLatestDividendYield`——取最近一期 `dividend_yield > 0`

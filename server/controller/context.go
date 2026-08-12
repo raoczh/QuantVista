@@ -1,6 +1,10 @@
 package controller
 
-import "github.com/gin-gonic/gin"
+import (
+	"strconv"
+
+	"github.com/gin-gonic/gin"
+)
 
 // currentUserID 取鉴权中间件写入的当前用户 ID。
 func currentUserID(c *gin.Context) int64 {
@@ -15,6 +19,18 @@ func currentUserID(c *gin.Context) int64 {
 // currentRole 取当前用户角色。
 func currentRole(c *gin.Context) string {
 	return c.GetString("role")
+}
+
+func optionalAccountID(c *gin.Context) int64 {
+	raw := c.Query("account_id")
+	if raw == "" {
+		return 0
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 {
+		return -1
+	}
+	return id
 }
 
 // clientUA 取请求 User-Agent（落库刷新令牌时记录来源设备）。

@@ -18,6 +18,7 @@ func cleanLedgerTables(t *testing.T) {
 	wipe := func() {
 		for _, m := range []any{&model.Position{}, &model.PositionTrade{}, &model.PortfolioSnapshot{},
 			&model.PaperAccount{}, &model.PaperHolding{}, &model.PaperTrade{},
+			&model.PortfolioCashFlow{}, &model.TargetAllocationRevision{}, &model.PortfolioAccount{},
 			&model.CorporateAction{}, &model.PositionCorpAdjust{}, &model.PaperCorpAdjust{}} {
 			common.DB.Where("1 = 1").Delete(m)
 		}

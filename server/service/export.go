@@ -34,11 +34,25 @@ const (
 
 // Export 按 kind 导出当前用户数据，返回（CSV 字节、建议文件名）。
 func (s *ExportService) Export(userID int64, kind string) ([]byte, string, error) {
+	accountID := int64(0)
+	if kind == "positions" {
+		account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
+		if err != nil {
+			return nil, "", err
+		}
+		accountID = account.ID
+	}
+	return s.ExportByAccount(userID, accountID, kind)
+}
+
+func (s *ExportService) ExportByAccount(userID, accountID int64, kind string) ([]byte, string, error) {
 	var rows [][]string
 	var err error
 	switch kind {
 	case "positions":
-		rows, err = s.positionRows(userID)
+		if _, err = PortfolioAccountByID(userID, accountID, model.PortfolioKindReal); err == nil {
+			rows, err = s.positionRows(userID, accountID)
+		}
 	case "watchlist":
 		rows, err = s.watchlistRows(userID)
 	case "recommendations":
@@ -94,9 +108,9 @@ func f2(v float64) string {
 	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
-func (s *ExportService) positionRows(userID int64) ([][]string, error) {
+func (s *ExportService) positionRows(userID, accountID int64) ([][]string, error) {
 	var ps []model.Position
-	if err := common.DB.Where("user_id = ?", userID).Order("id ASC").Limit(exportMaxRows).Find(&ps).Error; err != nil {
+	if err := common.DB.Where("user_id = ? AND account_id = ?", userID, accountID).Order("id ASC").Limit(exportMaxRows).Find(&ps).Error; err != nil {
 		return nil, err
 	}
 	rows := [][]string{{
@@ -219,6 +233,17 @@ var PositionImportTemplate = []string{"symbol", "market", "type", "buy_price", "
 // ImportPositions 从 CSV 导入持仓。逐行校验，坏行跳过并报告，好行全部入库。
 // 不逐行打行情源取名（500 行会打爆免费源），name 记 symbol、由列表页行情富化展示。
 func (s *ExportService) ImportPositions(userID int64, r io.Reader) (*ImportResult, error) {
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
+	if err != nil {
+		return nil, err
+	}
+	return s.ImportPositionsByAccount(userID, account.ID, r)
+}
+
+func (s *ExportService) ImportPositionsByAccount(userID, accountID int64, r io.Reader) (*ImportResult, error) {
+	if _, err := ActivePortfolioAccountByID(userID, accountID, model.PortfolioKindReal); err != nil {
+		return nil, err
+	}
 	reader := csv.NewReader(io.LimitReader(r, importMaxSize))
 	reader.FieldsPerRecord = -1 // 行内列数自适应，逐行校验
 	reader.TrimLeadingSpace = true
@@ -271,7 +296,7 @@ func (s *ExportService) ImportPositions(userID int64, r io.Reader) (*ImportResul
 		if len(pending)+1 > importMaxRows {
 			return nil, fmt.Errorf("超出单次导入上限 %d 行，请分批导入", importMaxRows)
 		}
-		p, perr := parseImportRow(userID, rec, get)
+		p, perr := parseImportRow(userID, accountID, rec, get)
 		if perr != nil {
 			res.Failed = append(res.Failed, ImportRowError{Row: line, Error: perr.Error()})
 			continue
@@ -290,7 +315,7 @@ func (s *ExportService) ImportPositions(userID int64, r io.Reader) (*ImportResul
 		trades := make([]model.PositionTrade, 0, len(pending))
 		for i := range pending {
 			trades = append(trades, model.PositionTrade{
-				UserID: pending[i].UserID, PositionID: pending[i].ID, Side: model.PositionTradeBuy,
+				UserID: pending[i].UserID, AccountID: accountID, PositionID: pending[i].ID, Side: model.PositionTradeBuy,
 				Price: pending[i].BuyPrice, Quantity: pending[i].Quantity,
 				Fee: pending[i].BuyFee, Tax: pending[i].BuyTax, TradeDate: pending[i].BuyDate,
 				Note: "CSV 导入建仓", AvgCostAfter: pending[i].BuyPrice, QuantityAfter: pending[i].Quantity,
@@ -305,7 +330,7 @@ func (s *ExportService) ImportPositions(userID int64, r io.Reader) (*ImportResul
 }
 
 // parseImportRow 校验并组装单行持仓。
-func parseImportRow(userID int64, rec []string, get func([]string, string) string) (*model.Position, error) {
+func parseImportRow(userID, accountID int64, rec []string, get func([]string, string) string) (*model.Position, error) {
 	symbol, market, err := normalizeSymbolMarket(get(rec, "symbol"), orDefaultStr(get(rec, "market"), "cn"))
 	if err != nil {
 		return nil, err
@@ -343,7 +368,7 @@ func parseImportRow(userID int64, rec []string, get func([]string, string) strin
 		}
 	}
 	return &model.Position{
-		UserID: userID, Symbol: symbol, Market: market, Name: symbol,
+		UserID: userID, AccountID: accountID, Symbol: symbol, Market: market, Name: symbol,
 		PositionType: ptype, Status: model.PositionStatusHolding,
 		Currency: defaultCurrencyFor(market),
 		BuyPrice: buyPrice, BuyDate: buyDate, Quantity: qty, BuyFee: fee, BuyTax: tax,

@@ -105,6 +105,7 @@ const menuOptions = computed<MenuOption[]>(() => [
   { label: navLink('/watchlist', '自选'), key: 'watchlist' },
   { label: navLink('/screener', '选股'), key: 'screener' },
   { label: navLink('/positions', '持仓'), key: 'positions' },
+  { label: navLink('/portfolio-risk', '组合风险'), key: 'portfolio-risk' },
   {
     label: '市场',
     key: 'market-group',

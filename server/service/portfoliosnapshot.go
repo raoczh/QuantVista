@@ -58,6 +58,14 @@ type PortfolioCurveView struct {
 // 快照由每交易日 16:20 的 job 落库；**查询侧不即时计算**——曲线要的是历史各日的
 // 当时价，读时算只能拿到今天的价格，那是另一回事。
 func PortfolioCurve(userID int64, kind string, days int) (*PortfolioCurveView, error) {
+	account, err := ResolvePortfolioAccount(userID, 0, kind)
+	if err != nil {
+		return nil, err
+	}
+	return PortfolioCurveByAccount(userID, account.ID, kind, days)
+}
+
+func PortfolioCurveByAccount(userID, accountID int64, kind string, days int) (*PortfolioCurveView, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
@@ -72,7 +80,7 @@ func PortfolioCurve(userID int64, kind string, days int) (*PortfolioCurveView, e
 	}
 	from := time.Now().AddDate(0, 0, -days).Format("2006-01-02")
 	var rows []model.PortfolioSnapshot
-	if err := common.DB.Where("user_id = ? AND kind = ? AND trade_date >= ?", userID, kind, from).
+	if err := common.DB.Where("user_id = ? AND account_id = ? AND kind = ? AND trade_date >= ?", userID, accountID, kind, from).
 		Order("trade_date ASC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -108,7 +116,11 @@ func PortfolioCurve(userID int64, kind string, days int) (*PortfolioCurveView, e
 // realSnapshotFrom 由「该用户全部持仓 + 已取到的行情」算真实持仓快照（纯函数，
 // 手工验算与 partial 反例的单测锚点）。定价 fail-closed：非 fresh 一律不计入。
 func realSnapshotFrom(userID int64, tradeDate string, positions []model.Position, quotes map[string]FreshQuoteResult) *model.PortfolioSnapshot {
-	snap := &model.PortfolioSnapshot{UserID: userID, Kind: model.SnapshotKindReal, TradeDate: tradeDate}
+	accountID := int64(0)
+	if len(positions) > 0 {
+		accountID = positions[0].AccountID
+	}
+	snap := &model.PortfolioSnapshot{UserID: userID, AccountID: accountID, Kind: model.SnapshotKindReal, TradeDate: tradeDate}
 	var realizedCum float64
 	for _, p := range positions {
 		realizedCum += p.RealizedPnl
@@ -138,8 +150,15 @@ func realSnapshotFrom(userID int64, tradeDate string, positions []model.Position
 
 // buildRealSnapshot 计算某用户当日真实持仓快照。定价 fail-closed。
 func (s *PositionService) buildRealSnapshot(ctx context.Context, userID int64, tradeDate string) (*model.PortfolioSnapshot, error) {
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
+	if err != nil {
+		return nil, err
+	}
+	return s.buildRealSnapshotForAccount(ctx, userID, account.ID, tradeDate)
+}
+func (s *PositionService) buildRealSnapshotForAccount(ctx context.Context, userID, accountID int64, tradeDate string) (*model.PortfolioSnapshot, error) {
 	var positions []model.Position
-	if err := common.DB.WithContext(ctx).Where("user_id = ?", userID).Find(&positions).Error; err != nil {
+	if err := common.DB.WithContext(ctx).Where("user_id = ? AND account_id = ?", userID, accountID).Find(&positions).Error; err != nil {
 		return nil, err
 	}
 	// 先补齐账本再算：从未打开过持仓页的老用户，RealizedPnl 全为 0，
@@ -149,7 +168,7 @@ func (s *PositionService) buildRealSnapshot(ctx context.Context, userID int64, t
 		return nil, err
 	}
 	if wrote {
-		if err := common.DB.WithContext(ctx).Where("user_id = ?", userID).Find(&positions).Error; err != nil {
+		if err := common.DB.WithContext(ctx).Where("user_id = ? AND account_id = ?", userID, accountID).Find(&positions).Error; err != nil {
 			return nil, err
 		}
 	}
@@ -173,7 +192,9 @@ func (s *PositionService) buildRealSnapshot(ctx context.Context, userID int64, t
 			refs = append(refs, QuoteRef{Market: p.Market, Symbol: p.Symbol})
 		}
 	}
-	return realSnapshotFrom(userID, tradeDate, positions, s.market.FreshQuotesFor(ctx, refs)), nil
+	snap := realSnapshotFrom(userID, tradeDate, positions, s.market.FreshQuotesFor(ctx, refs))
+	snap.AccountID = accountID
+	return snap, nil
 }
 
 // paperSnapshotFrom 由「模拟账户 + 持仓 + 行情 + 累计已实现」算模拟盘快照（纯函数）。
@@ -182,7 +203,7 @@ func (s *PositionService) buildRealSnapshot(ctx context.Context, userID int64, t
 func paperSnapshotFrom(userID int64, tradeDate string, acc model.PaperAccount, holdings []model.PaperHolding,
 	quotes map[string]FreshQuoteResult, realizedCum float64) *model.PortfolioSnapshot {
 	snap := &model.PortfolioSnapshot{
-		UserID: userID, Kind: model.SnapshotKindPaper, TradeDate: tradeDate,
+		UserID: userID, AccountID: acc.AccountID, Kind: model.SnapshotKindPaper, TradeDate: tradeDate,
 		Cash: round2(acc.Cash), PositionCount: len(holdings), RealizedCum: round2(realizedCum),
 	}
 	for _, h := range holdings {
@@ -204,6 +225,13 @@ func paperSnapshotFrom(userID int64, tradeDate string, acc model.PaperAccount, h
 
 // buildPaperSnapshot 计算某用户当日模拟盘快照。
 func (s *PaperService) buildPaperSnapshot(ctx context.Context, userID int64, tradeDate string) (*model.PortfolioSnapshot, error) {
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindPaper)
+	if err != nil {
+		return nil, err
+	}
+	return s.buildPaperSnapshotForAccount(ctx, userID, account.ID, tradeDate)
+}
+func (s *PaperService) buildPaperSnapshotForAccount(ctx context.Context, userID, accountID int64, tradeDate string) (*model.PortfolioSnapshot, error) {
 	// 公司行动 job 在 19:25，而资产快照在 16:20。快照必须主动结算当日及近期
 	// 已到期行动，否则会把除权后的价格配上除权前数量/成本，永久冻结一个假点。
 	var symbols []struct {
@@ -212,7 +240,7 @@ func (s *PaperService) buildPaperSnapshot(ctx context.Context, userID int64, tra
 	}
 	if err := common.DB.WithContext(ctx).Raw(
 		"SELECT symbol, market FROM paper_holdings WHERE user_id = ? "+
-			"UNION SELECT symbol, market FROM paper_trades WHERE user_id = ?", userID, userID,
+			"AND account_id = ? UNION SELECT symbol, market FROM paper_trades WHERE user_id = ? AND account_id = ?", userID, accountID, userID, accountID,
 	).Scan(&symbols).Error; err != nil {
 		return nil, err
 	}
@@ -220,23 +248,23 @@ func (s *PaperService) buildPaperSnapshot(ctx context.Context, userID int64, tra
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if err := ensurePaperCorpAdjustBeforeTrade(userID, item.Symbol, item.Market, tradeDate); err != nil {
+		if err := ensurePaperCorpAdjustBeforeTradeForAccount(userID, accountID, item.Symbol, item.Market, tradeDate); err != nil {
 			return nil, fmt.Errorf("模拟盘公司行动结算失败 %s/%s: %w", item.Market, item.Symbol, err)
 		}
 	}
 	var acc model.PaperAccount
-	if err := common.DB.WithContext(ctx).Where("user_id = ?", userID).First(&acc).Error; err != nil {
+	if err := common.DB.WithContext(ctx).Where("user_id = ? AND account_id = ?", userID, accountID).First(&acc).Error; err != nil {
 		return nil, err
 	}
 	var holdings []model.PaperHolding
-	if err := common.DB.WithContext(ctx).Where("user_id = ?", userID).Find(&holdings).Error; err != nil {
+	if err := common.DB.WithContext(ctx).Where("user_id = ? AND account_id = ?", userID, accountID).Find(&holdings).Error; err != nil {
 		return nil, err
 	}
 	refs := make([]QuoteRef, 0, len(holdings))
 	for _, h := range holdings {
 		refs = append(refs, QuoteRef{Market: h.Market, Symbol: h.Symbol})
 	}
-	realized, err := paperRealizedPnl(common.DB.WithContext(ctx), userID)
+	realized, err := paperRealizedPnlByAccount(common.DB.WithContext(ctx), userID, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -246,8 +274,15 @@ func (s *PaperService) buildPaperSnapshot(ctx context.Context, userID int64, tra
 // upsertPortfolioSnapshot 按 (user_id, kind, trade_date) 幂等 upsert。
 // 同日重跑覆盖（盘后重启补跑取最后一次结果），绝不产生重复点。
 func upsertPortfolioSnapshot(snap *model.PortfolioSnapshot) error {
+	if snap.AccountID == 0 {
+		account, err := ResolvePortfolioAccount(snap.UserID, 0, snap.Kind)
+		if err != nil {
+			return err
+		}
+		snap.AccountID = account.ID
+	}
 	return common.DB.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "user_id"}, {Name: "kind"}, {Name: "trade_date"}},
+		Columns: []clause.Column{{Name: "user_id"}, {Name: "account_id"}, {Name: "trade_date"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"market_value", "cost", "unrealized_pnl", "realized_cum", "cash",
 			"position_count", "partial", "missing_count", "note", "updated_at",
@@ -270,6 +305,30 @@ func snapshotUserIDs() (real, paper []int64, err error) {
 	return real, paper, nil
 }
 
+func snapshotAccounts() (real, paper []model.PortfolioAccount, err error) {
+	realUsers, paperUsers, err := snapshotUserIDs()
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, uid := range realUsers {
+		if _, e := ResolvePortfolioAccount(uid, 0, model.PortfolioKindReal); e != nil {
+			return nil, nil, e
+		}
+	}
+	for _, uid := range paperUsers {
+		if _, e := ResolvePortfolioAccount(uid, 0, model.PortfolioKindPaper); e != nil {
+			return nil, nil, e
+		}
+	}
+	if err = common.DB.Where("kind = ? AND status = ? AND id IN (?)", model.PortfolioKindReal, model.PortfolioStatusActive,
+		common.DB.Model(&model.Position{}).Select("DISTINCT account_id").Where("account_id > 0")).Find(&real).Error; err != nil {
+		return
+	}
+	err = common.DB.Where("kind = ? AND status = ? AND id IN (?)", model.PortfolioKindPaper, model.PortfolioStatusActive,
+		common.DB.Model(&model.PaperAccount{}).Select("DISTINCT account_id").Where("account_id > 0")).Find(&paper).Error
+	return
+}
+
 // RunPortfolioSnapshots 为全部相关用户落当日快照（幂等；供 job 与测试调用）。
 // 返回成功落库的快照条数。单个用户失败只告警不中断——一个用户的行情故障不该让
 // 其他人当天的曲线整体缺点。
@@ -277,13 +336,14 @@ func RunPortfolioSnapshots(ctx context.Context, posSvc *PositionService, paperSv
 	if common.DB == nil || tradeDate == "" {
 		return 0
 	}
-	realUsers, paperUsers, err := snapshotUserIDs()
+	realAccounts, paperAccounts, err := snapshotAccounts()
 	if err != nil {
 		common.SysWarn("资产快照候选用户读取失败: %v", err)
 		return 0
 	}
 	n := 0
-	for _, uid := range realUsers {
+	for _, account := range realAccounts {
+		uid := account.UserID
 		if err := ctx.Err(); err != nil {
 			common.SysWarn("资产快照中止: %v", err)
 			return n
@@ -291,7 +351,7 @@ func RunPortfolioSnapshots(ctx context.Context, posSvc *PositionService, paperSv
 		if posSvc == nil {
 			break
 		}
-		snap, err := posSvc.buildRealSnapshot(ctx, uid, tradeDate)
+		snap, err := posSvc.buildRealSnapshotForAccount(ctx, uid, account.ID, tradeDate)
 		if err != nil {
 			common.SysWarn("用户 %d 持仓资产快照失败: %v", uid, err)
 			continue
@@ -302,7 +362,8 @@ func RunPortfolioSnapshots(ctx context.Context, posSvc *PositionService, paperSv
 		}
 		n++
 	}
-	for _, uid := range paperUsers {
+	for _, account := range paperAccounts {
+		uid := account.UserID
 		if err := ctx.Err(); err != nil {
 			common.SysWarn("资产快照中止: %v", err)
 			return n
@@ -310,7 +371,7 @@ func RunPortfolioSnapshots(ctx context.Context, posSvc *PositionService, paperSv
 		if paperSvc == nil {
 			break
 		}
-		snap, err := paperSvc.buildPaperSnapshot(ctx, uid, tradeDate)
+		snap, err := paperSvc.buildPaperSnapshotForAccount(ctx, uid, account.ID, tradeDate)
 		if err != nil {
 			common.SysWarn("用户 %d 模拟盘资产快照失败: %v", uid, err)
 			continue

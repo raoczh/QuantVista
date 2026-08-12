@@ -1,6 +1,10 @@
 package model
 
-import "quantvista/common"
+import (
+	"quantvista/common"
+
+	"gorm.io/gorm"
+)
 
 // AllModels 需要 AutoMigrate 的模型清单。新增表只往这里加。
 // AutoMigrate 会执行当前 GORM 支持的兼容性变更（包括放宽非空约束），但不会
@@ -33,6 +37,7 @@ func AllModels() []any {
 		&WatchlistItem{},
 		&WatchlistBatch{},
 		&WatchlistBatchItem{},
+		&PortfolioAccount{},
 		&Position{},
 		&PositionTrade{},
 		&ImportBatch{},
@@ -40,6 +45,8 @@ func AllModels() []any {
 		&ImportRowClaim{},
 		&ImportEffect{},
 		&PortfolioSnapshot{},
+		&PortfolioCashFlow{},
+		&TargetAllocationRevision{},
 		&AnalysisRecord{},
 		&RecommendationBatch{},
 		&Recommendation{},
@@ -110,8 +117,35 @@ func AllModels() []any {
 // Migrate 启动时自动迁移表结构。
 func Migrate() error {
 	common.SysLog("开始数据库自动迁移 ...")
+	// P2 账户维度是一次需要“先补列和数据、后建唯一索引”的升级。若直接对旧库执行
+	// 全量 AutoMigrate，多条 paper_accounts 会先得到相同的 account_id=0，新唯一索引
+	// 将在归属迁移运行前冲突。这里仍只用 GORM 表达 DDL，业务数据回填保持幂等。
+	if err := preparePortfolioAccountMigration(); err != nil {
+		return err
+	}
 	if err := common.DB.AutoMigrate(AllModels()...); err != nil {
 		return err
+	}
+	// 账户维度升级后，旧的 user/kind 级唯一索引会阻止同一用户拥有多个账户。
+	// AutoMigrate 只创建新索引，不保证移除这些遗留约束。
+	for _, old := range []struct {
+		model any
+		name  string
+	}{
+		{&PortfolioSnapshot{}, "idx_psnap_uniq"},
+		{&PaperHolding{}, "idx_ph_uniq"},
+		{&PaperAccount{}, "idx_paper_accounts_user_id"},
+		{&PaperAccount{}, "uni_paper_accounts_user_id"},
+		{&PaperCorpAdjust{}, "idx_papercorpadj_uniq"},
+		{&PositionCorpAdjust{}, "idx_corpadj_uniq"},
+		{&ImportBatch{}, "idx_import_dedupe"},
+		{&ImportRowClaim{}, "idx_import_claim"},
+	} {
+		if common.DB.Migrator().HasIndex(old.model, old.name) {
+			if err := common.DB.Migrator().DropIndex(old.model, old.name); err != nil {
+				return err
+			}
+		}
 	}
 	// GuardEvent v2 把 position_id 纳入唯一键，使同一股票的多笔持仓可分别发送统一
 	// 卖出风险通知。AutoMigrate 不会删除旧索引；保留 idx_guard_key 会继续按 symbol
@@ -172,4 +206,166 @@ func Migrate() error {
 	}
 	common.SysLog("数据库自动迁移完成")
 	return nil
+}
+
+func preparePortfolioAccountMigration() error {
+	if err := common.DB.AutoMigrate(&PortfolioAccount{}); err != nil {
+		return err
+	}
+	for _, row := range []any{
+		&Position{}, &PositionTrade{}, &PortfolioSnapshot{},
+		&PaperAccount{}, &PaperHolding{}, &PaperTrade{},
+		&PositionCorpAdjust{}, &PaperCorpAdjust{},
+		&ImportBatch{}, &ImportRowClaim{}, &ImportEffect{},
+	} {
+		if !common.DB.Migrator().HasTable(row) || common.DB.Migrator().HasColumn(row, "AccountID") {
+			continue
+		}
+		if err := common.DB.Migrator().AddColumn(row, "AccountID"); err != nil {
+			return err
+		}
+	}
+	return MigratePortfolioAccounts()
+}
+
+// MigratePortfolioAccounts 把升级前按 user_id 隔离的真实/模拟账本归入各自默认账户。
+// 全部 UPDATE 都只触及 account_id=0，默认账户由唯一 DefaultKey 防重复，重复启动无副作用。
+func MigratePortfolioAccounts() error {
+	if common.DB == nil {
+		return nil
+	}
+	type ownerKind struct {
+		UserID int64
+		Kind   string
+	}
+	owners := map[ownerKind]struct{}{}
+	collect := func(table string, kind string) error {
+		var ids []int64
+		if !common.DB.Migrator().HasTable(table) {
+			return nil
+		}
+		if err := common.DB.Table(table).Where("user_id > 0").Distinct().Pluck("user_id", &ids).Error; err != nil {
+			return err
+		}
+		for _, id := range ids {
+			owners[ownerKind{UserID: id, Kind: kind}] = struct{}{}
+		}
+		return nil
+	}
+	for _, item := range []struct{ table, kind string }{
+		{"positions", PortfolioKindReal}, {"position_trades", PortfolioKindReal},
+		{"position_corp_adjusts", PortfolioKindReal},
+		{"paper_accounts", PortfolioKindPaper}, {"paper_holdings", PortfolioKindPaper}, {"paper_trades", PortfolioKindPaper}, {"paper_corp_adjusts", PortfolioKindPaper},
+	} {
+		if err := collect(item.table, item.kind); err != nil {
+			return err
+		}
+	}
+	if common.DB.Migrator().HasTable(&ImportBatch{}) {
+		var ids []int64
+		if err := common.DB.Model(&ImportBatch{}).Where("user_id > 0 AND kind IN ?", []string{ImportKindPosition, ImportKindTrade}).Distinct().Pluck("user_id", &ids).Error; err != nil {
+			return err
+		}
+		for _, id := range ids {
+			owners[ownerKind{UserID: id, Kind: PortfolioKindReal}] = struct{}{}
+		}
+	}
+	if common.DB.Migrator().HasTable(&PortfolioSnapshot{}) {
+		var rows []ownerKind
+		if err := common.DB.Model(&PortfolioSnapshot{}).Select("DISTINCT user_id, kind").Where("user_id > 0").Scan(&rows).Error; err != nil {
+			return err
+		}
+		for _, row := range rows {
+			if row.Kind == PortfolioKindReal || row.Kind == PortfolioKindPaper {
+				owners[row] = struct{}{}
+			}
+		}
+	}
+
+	return common.DB.Transaction(func(tx *gorm.DB) error {
+		for owner := range owners {
+			key := portfolioDefaultKey(owner.UserID, owner.Kind)
+			name := "默认真实账户"
+			if owner.Kind == PortfolioKindPaper {
+				name = "默认模拟账户"
+			}
+			row := PortfolioAccount{UserID: owner.UserID, Name: name, Kind: owner.Kind, Currency: "CNY",
+				Status: PortfolioStatusActive, IsDefault: true, DefaultKey: &key}
+			if err := tx.Where("default_key = ?", key).FirstOrCreate(&row).Error; err != nil {
+				return err
+			}
+			updates := []struct {
+				model any
+				where string
+				args  []any
+			}{
+				{&PortfolioSnapshot{}, "user_id = ? AND kind = ? AND (account_id = 0 OR account_id IS NULL)", []any{owner.UserID, owner.Kind}},
+			}
+			if owner.Kind == PortfolioKindReal {
+				updates = append(updates,
+					struct {
+						model any
+						where string
+						args  []any
+					}{&Position{}, "user_id = ? AND (account_id = 0 OR account_id IS NULL)", []any{owner.UserID}},
+					struct {
+						model any
+						where string
+						args  []any
+					}{&PositionTrade{}, "user_id = ? AND (account_id = 0 OR account_id IS NULL)", []any{owner.UserID}},
+					struct {
+						model any
+						where string
+						args  []any
+					}{&PositionCorpAdjust{}, "user_id = ? AND (account_id = 0 OR account_id IS NULL)", []any{owner.UserID}},
+				)
+			} else {
+				updates = append(updates,
+					struct {
+						model any
+						where string
+						args  []any
+					}{&PaperAccount{}, "user_id = ? AND (account_id = 0 OR account_id IS NULL)", []any{owner.UserID}},
+					struct {
+						model any
+						where string
+						args  []any
+					}{&PaperHolding{}, "user_id = ? AND (account_id = 0 OR account_id IS NULL)", []any{owner.UserID}},
+					struct {
+						model any
+						where string
+						args  []any
+					}{&PaperTrade{}, "user_id = ? AND (account_id = 0 OR account_id IS NULL)", []any{owner.UserID}},
+					struct {
+						model any
+						where string
+						args  []any
+					}{&PaperCorpAdjust{}, "user_id = ? AND (account_id = 0 OR account_id IS NULL)", []any{owner.UserID}},
+				)
+			}
+			for _, update := range updates {
+				if !tx.Migrator().HasTable(update.model) {
+					continue
+				}
+				if err := tx.Model(update.model).Where(update.where, update.args...).UpdateColumn("account_id", row.ID).Error; err != nil {
+					return err
+				}
+			}
+			if owner.Kind == PortfolioKindReal && tx.Migrator().HasTable(&ImportBatch{}) {
+				if err := tx.Model(&ImportBatch{}).Where("user_id = ? AND kind IN ? AND (account_id = 0 OR account_id IS NULL)", owner.UserID, []string{ImportKindPosition, ImportKindTrade}).UpdateColumn("account_id", row.ID).Error; err != nil {
+					return err
+				}
+				batchIDs := tx.Model(&ImportBatch{}).Select("id").Where("user_id = ? AND account_id = ?", owner.UserID, row.ID)
+				for _, audit := range []any{&ImportRowClaim{}, &ImportEffect{}} {
+					if !tx.Migrator().HasTable(audit) {
+						continue
+					}
+					if err := tx.Model(audit).Where("user_id = ? AND batch_id IN (?) AND (account_id = 0 OR account_id IS NULL)", owner.UserID, batchIDs).UpdateColumn("account_id", row.ID).Error; err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	})
 }

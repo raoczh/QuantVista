@@ -200,9 +200,9 @@ func ensurePositionShareActionsProcessedTx(tx *gorm.DB, p model.Position, tradeD
 	// 等到第 31 天，未入账送转便会绕过卖出闸门。
 	var pending model.PositionCorpAdjust
 	err := tx.Where(
-		"user_id = ? AND position_id = ? AND status IN ? AND ex_date <= ? "+
+		"user_id = ? AND account_id = ? AND position_id = ? AND status IN ? AND ex_date <= ? "+
 			"AND (bonus_ratio > 0 OR transfer_ratio > 0)",
-		p.UserID, p.ID, []string{model.CorpAdjustPending, model.CorpAdjustReverted}, tradeDate,
+		p.UserID, p.AccountID, p.ID, []string{model.CorpAdjustPending, model.CorpAdjustReverted}, tradeDate,
 	).Order("ex_date ASC, corporate_action_id ASC").First(&pending).Error
 	if err == nil {
 		if pending.ManualReview {
@@ -231,7 +231,7 @@ func ensurePositionShareActionsProcessedTx(tx *gorm.DB, p model.Position, tradeD
 		return nil
 	}
 	var trades []model.PositionTrade
-	if err := tx.Where("position_id = ? AND user_id = ?", p.ID, p.UserID).
+	if err := tx.Where("position_id = ? AND user_id = ? AND account_id = ?", p.ID, p.UserID, p.AccountID).
 		Order("trade_date ASC, id ASC").Find(&trades).Error; err != nil {
 		return err
 	}
@@ -240,8 +240,8 @@ func ensurePositionShareActionsProcessedTx(tx *gorm.DB, p model.Position, tradeD
 			continue
 		}
 		var adj model.PositionCorpAdjust
-		err := tx.Where("user_id = ? AND position_id = ? AND corporate_action_id = ?",
-			p.UserID, p.ID, action.ID).First(&adj).Error
+		err := tx.Where("user_id = ? AND account_id = ? AND position_id = ? AND corporate_action_id = ?",
+			p.UserID, p.AccountID, p.ID, action.ID).First(&adj).Error
 		if err == nil && (adj.Status == model.CorpAdjustConfirmed || adj.Status == model.CorpAdjustDismissed) {
 			continue
 		}
@@ -261,16 +261,27 @@ func ensurePositionShareActionsProcessedTx(tx *gorm.DB, p model.Position, tradeD
 // A 股 holding 全部处理；closed 只处理可独立入账的纯现金分红。已平仓且含送转的
 // 历史账无法在不重放流水的前提下安全修复，显式报错而不是静默漏权或倒序改成本。
 func GenerateCorpAdjusts(userID int64, asOf string) (int, error) {
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
+	if err != nil {
+		return 0, err
+	}
+	return GenerateCorpAdjustsForAccount(userID, account.ID, asOf)
+}
+
+func GenerateCorpAdjustsForAccount(userID, accountID int64, asOf string) (int, error) {
 	if common.DB == nil {
 		return 0, errors.New("数据库不可用")
+	}
+	if _, err := PortfolioAccountByID(userID, accountID, model.PortfolioKindReal); err != nil {
+		return 0, err
 	}
 	asOfDate, err := time.ParseInLocation("2006-01-02", asOf, time.Local)
 	if err != nil {
 		return 0, errors.New("判定日期格式应为 YYYY-MM-DD")
 	}
 	var positions []model.Position
-	if err := common.DB.Where("user_id = ? AND status IN ? AND market = ?",
-		userID, []string{model.PositionStatusHolding, model.PositionStatusClosed}, "cn").
+	if err := common.DB.Where("user_id = ? AND account_id = ? AND status IN ? AND market = ?",
+		userID, accountID, []string{model.PositionStatusHolding, model.PositionStatusClosed}, "cn").
 		Order("id ASC").Find(&positions).Error; err != nil {
 		return 0, err
 	}
@@ -290,7 +301,7 @@ func GenerateCorpAdjusts(userID int64, asOf string) (int, error) {
 		positionIDs = append(positionIDs, p.ID)
 	}
 	var allTrades []model.PositionTrade
-	if err := common.DB.Where("user_id = ? AND position_id IN ?", userID, positionIDs).
+	if err := common.DB.Where("user_id = ? AND account_id = ? AND position_id IN ?", userID, accountID, positionIDs).
 		Order("trade_date ASC, id ASC").Find(&allTrades).Error; err != nil {
 		return 0, err
 	}
@@ -327,8 +338,8 @@ func GenerateCorpAdjusts(userID int64, asOf string) (int, error) {
 				continue
 			}
 			var existing model.PositionCorpAdjust
-			err := common.DB.Where("user_id = ? AND position_id = ? AND corporate_action_id = ?",
-				userID, p.ID, a.ID).First(&existing).Error
+			err := common.DB.Where("user_id = ? AND account_id = ? AND position_id = ? AND corporate_action_id = ?",
+				userID, accountID, p.ID, a.ID).First(&existing).Error
 			hasExisting := err == nil
 			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 				writeErrs = append(writeErrs, fmt.Errorf("读取 pos=%d action=%d 建议: %w", p.ID, a.ID, err))
@@ -377,7 +388,7 @@ func GenerateCorpAdjusts(userID int64, asOf string) (int, error) {
 				}
 			}
 			adj := model.PositionCorpAdjust{
-				UserID: userID, PositionID: p.ID, CorporateActionID: a.ID,
+				UserID: userID, AccountID: accountID, PositionID: p.ID, CorporateActionID: a.ID,
 				Symbol: p.Symbol, Market: p.Market, Name: orSymbol(p.Name, a.Name),
 				ExDate: a.ExDate, RecordDate: a.RecordDate,
 				BonusRatio: a.BonusRatio, TransferRatio: a.TransferRatio,
@@ -406,7 +417,7 @@ func GenerateCorpAdjusts(userID int64, asOf string) (int, error) {
 					"manual_review": adj.ManualReview, "review_reason": adj.ReviewReason,
 				}
 				if e := common.DB.Model(&model.PositionCorpAdjust{}).
-					Where("id = ? AND user_id = ? AND status IN ?", existing.ID, userID,
+					Where("id = ? AND user_id = ? AND account_id = ? AND status IN ?", existing.ID, userID, accountID,
 						[]string{model.CorpAdjustPending, model.CorpAdjustReverted}).
 					Updates(updates).Error; e != nil {
 					writeErrs = append(writeErrs, fmt.Errorf("刷新 pos=%d action=%d 建议: %w", p.ID, a.ID, e))
@@ -423,10 +434,21 @@ func GenerateCorpAdjusts(userID int64, asOf string) (int, error) {
 
 // ListCorpAdjusts 列出用户的调整建议（status 空=全部 pending）。仅本人。
 func ListCorpAdjusts(userID int64, status string) ([]model.PositionCorpAdjust, error) {
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
+	if err != nil {
+		return nil, err
+	}
+	return ListCorpAdjustsForAccount(userID, account.ID, status)
+}
+
+func ListCorpAdjustsForAccount(userID, accountID int64, status string) ([]model.PositionCorpAdjust, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
-	q := common.DB.Where("user_id = ?", userID)
+	if _, err := PortfolioAccountByID(userID, accountID, model.PortfolioKindReal); err != nil {
+		return nil, err
+	}
+	q := common.DB.Where("user_id = ? AND account_id = ?", userID, accountID)
 	pendingOnly := false
 	switch status {
 	case "", model.CorpAdjustPending:
@@ -457,8 +479,8 @@ func ListCorpAdjusts(userID int64, status string) ([]model.PositionCorpAdjust, e
 
 // lockedCorpAdjust 事务内按 (id, user_id) 重读建议并加行锁。
 // **user_id 条件不可省**——全链路隔离铁律，锁的同时完成归属校验（越权直接查不到）。
-func lockedCorpAdjust(tx *gorm.DB, userID, id int64, adj *model.PositionCorpAdjust) error {
-	q := tx.Where("id = ? AND user_id = ?", id, userID)
+func lockedCorpAdjust(tx *gorm.DB, userID, accountID, id int64, adj *model.PositionCorpAdjust) error {
+	q := tx.Where("id = ? AND user_id = ? AND account_id = ?", id, userID, accountID)
 	if !common.UsingSQLite {
 		q = q.Clauses(clause.Locking{Strength: "UPDATE"})
 	}
@@ -474,13 +496,24 @@ func lockedCorpAdjust(tx *gorm.DB, userID, id int64, adj *model.PositionCorpAdju
 //   - 已平仓：纯现金分红可落零数量审计并增加已实现收益，含送转则拒绝倒序改账；
 //   - 时序：送转前若已有除权日后卖出，拒绝并要求人工核对，绝不按当前聚合态硬套。
 func (s *PositionService) ConfirmCorpAdjust(userID, adjustID int64) (*model.PositionCorpAdjust, error) {
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
+	if err != nil {
+		return nil, err
+	}
+	return s.ConfirmCorpAdjustForAccount(userID, account.ID, adjustID)
+}
+
+func (s *PositionService) ConfirmCorpAdjustForAccount(userID, accountID, adjustID int64) (*model.PositionCorpAdjust, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
+	}
+	if _, err := ActivePortfolioAccountByID(userID, accountID, model.PortfolioKindReal); err != nil {
+		return nil, err
 	}
 	var out model.PositionCorpAdjust
 	err := common.DB.Transaction(func(tx *gorm.DB) error {
 		var adj model.PositionCorpAdjust
-		if err := lockedCorpAdjust(tx, userID, adjustID, &adj); err != nil {
+		if err := lockedCorpAdjust(tx, userID, accountID, adjustID, &adj); err != nil {
 			return errors.New("调整建议不存在")
 		}
 		switch adj.Status {
@@ -501,6 +534,9 @@ func (s *PositionService) ConfirmCorpAdjust(userID, adjustID int64) (*model.Posi
 		if err := lockedPosition(tx, userID, adj.PositionID, &p); err != nil {
 			return errors.New("持仓不存在")
 		}
+		if p.AccountID != accountID {
+			return errors.New("持仓不存在")
+		}
 		shareAdjustment := adj.BonusRatio > 0 || adj.TransferRatio > 0
 		// 更早送转会改变本次登记日的有权数量，即使当前建议只是纯现金分红也必须
 		// 先处理前序。相同除权日通常共享此前的登记日基数，不强制互相复利。
@@ -509,6 +545,7 @@ func (s *PositionService) ConfirmCorpAdjust(userID, adjustID int64) (*model.Posi
 				"AND (bonus_ratio > 0 OR transfer_ratio > 0)",
 			userID, p.ID, adj.ID, []string{model.CorpAdjustPending, model.CorpAdjustReverted},
 		)
+		earlierQ = earlierQ.Where("account_id = ?", accountID)
 		if adj.RecordDate != "" {
 			earlierQ = earlierQ.Where("ex_date <> '' AND ex_date <= ?", adj.RecordDate)
 		} else {
@@ -538,7 +575,7 @@ func (s *PositionService) ConfirmCorpAdjust(userID, adjustID int64) (*model.Posi
 				p.Quantity, p.BuyPrice, adj.QtyBefore, adj.CostBefore)
 		}
 		var trades []model.PositionTrade
-		if err := tx.Where("position_id = ? AND user_id = ?", p.ID, userID).
+		if err := tx.Where("position_id = ? AND user_id = ? AND account_id = ?", p.ID, userID, accountID).
 			Order("trade_date ASC, id ASC").Find(&trades).Error; err != nil {
 			return err
 		}
@@ -595,7 +632,7 @@ func (s *PositionService) ConfirmCorpAdjust(userID, adjustID int64) (*model.Posi
 			note += peakAdjustNote(peakBefore, peakAfter)
 		}
 		trade := model.PositionTrade{
-			UserID: userID, PositionID: p.ID, Side: model.PositionTradeAdjust,
+			UserID: userID, AccountID: accountID, PositionID: p.ID, Side: model.PositionTradeAdjust,
 			Price: 0, Quantity: round4(res.QtyAfter - p.Quantity), Fee: 0, Tax: 0,
 			TradeDate: adj.ExDate,
 			Note:      truncateRunes(note, 200),
@@ -654,13 +691,24 @@ func (s *PositionService) ConfirmCorpAdjust(userID, adjustID int64) (*model.Posi
 // **只有在「当前状态仍精确等于该次调整的结果、且其后没有任何其它交易/调整」时才允许撤销**——
 // 否则回滚会把后续交易的账面一并改坏。拒绝时明确告知原因，不做尽力而为的部分回滚。
 func (s *PositionService) RevertCorpAdjust(userID, adjustID int64) (*model.PositionCorpAdjust, error) {
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
+	if err != nil {
+		return nil, err
+	}
+	return s.RevertCorpAdjustForAccount(userID, account.ID, adjustID)
+}
+
+func (s *PositionService) RevertCorpAdjustForAccount(userID, accountID, adjustID int64) (*model.PositionCorpAdjust, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
+	}
+	if _, err := ActivePortfolioAccountByID(userID, accountID, model.PortfolioKindReal); err != nil {
+		return nil, err
 	}
 	var out model.PositionCorpAdjust
 	err := common.DB.Transaction(func(tx *gorm.DB) error {
 		var adj model.PositionCorpAdjust
-		if err := lockedCorpAdjust(tx, userID, adjustID, &adj); err != nil {
+		if err := lockedCorpAdjust(tx, userID, accountID, adjustID, &adj); err != nil {
 			return errors.New("调整建议不存在")
 		}
 		if adj.Status != model.CorpAdjustConfirmed {
@@ -668,6 +716,9 @@ func (s *PositionService) RevertCorpAdjust(userID, adjustID int64) (*model.Posit
 		}
 		var p model.Position
 		if err := lockedPosition(tx, userID, adj.PositionID, &p); err != nil {
+			return errors.New("持仓不存在")
+		}
+		if p.AccountID != accountID {
 			return errors.New("持仓不存在")
 		}
 		shareAdjustment := adj.BonusRatio > 0 || adj.TransferRatio > 0
@@ -681,7 +732,7 @@ func (s *PositionService) RevertCorpAdjust(userID, adjustID int64) (*model.Posit
 		// 都意味着后续账面建立在折算结果之上，回滚会连带改坏它们。
 		var laterCount int64
 		if err := tx.Model(&model.PositionTrade{}).
-			Where("position_id = ? AND user_id = ? AND id > ?", p.ID, userID, adj.TradeID).
+			Where("position_id = ? AND user_id = ? AND account_id = ? AND id > ?", p.ID, userID, accountID, adj.TradeID).
 			Count(&laterCount).Error; err != nil {
 			return err
 		}
@@ -695,8 +746,8 @@ func (s *PositionService) RevertCorpAdjust(userID, adjustID int64) (*model.Posit
 		}
 		// 删流水（按 id + 归属双条件，绝不按 adjust_id 批量删）。
 		if adj.TradeID > 0 {
-			if err := tx.Where("id = ? AND user_id = ? AND position_id = ?",
-				adj.TradeID, userID, p.ID).Delete(&model.PositionTrade{}).Error; err != nil {
+			if err := tx.Where("id = ? AND user_id = ? AND account_id = ? AND position_id = ?",
+				adj.TradeID, userID, accountID, p.ID).Delete(&model.PositionTrade{}).Error; err != nil {
 				return err
 			}
 		}
@@ -731,13 +782,24 @@ func (s *PositionService) RevertCorpAdjust(userID, adjustID int64) (*model.Posit
 // DismissCorpAdjust 忽略一条待确认建议（终态，不再提示）。已确认的不能直接忽略——
 // 先撤销再忽略，避免「账本已改但建议显示已忽略」的错位。
 func (s *PositionService) DismissCorpAdjust(userID, adjustID int64) (*model.PositionCorpAdjust, error) {
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
+	if err != nil {
+		return nil, err
+	}
+	return s.DismissCorpAdjustForAccount(userID, account.ID, adjustID)
+}
+
+func (s *PositionService) DismissCorpAdjustForAccount(userID, accountID, adjustID int64) (*model.PositionCorpAdjust, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
+	}
+	if _, err := ActivePortfolioAccountByID(userID, accountID, model.PortfolioKindReal); err != nil {
+		return nil, err
 	}
 	var out model.PositionCorpAdjust
 	err := common.DB.Transaction(func(tx *gorm.DB) error {
 		var adj model.PositionCorpAdjust
-		if err := lockedCorpAdjust(tx, userID, adjustID, &adj); err != nil {
+		if err := lockedCorpAdjust(tx, userID, accountID, adjustID, &adj); err != nil {
 			return errors.New("调整建议不存在")
 		}
 		switch adj.Status {
@@ -834,24 +896,25 @@ func RunPaperCorpAdjust() int {
 	}
 	type paperCandidate struct {
 		UserID         int64
+		AccountID      int64
 		Symbol, Market string
 		Name           string
 	}
-	keyFor := func(userID int64, symbol, market string) string {
-		return fmt.Sprintf("%d\x00%s\x00%s", userID, market, symbol)
+	keyFor := func(userID, accountID int64, symbol, market string) string {
+		return fmt.Sprintf("%d\x00%d\x00%s\x00%s", userID, accountID, market, symbol)
 	}
 	candidates := map[string]paperCandidate{}
 	holdingByKey := map[string]model.PaperHolding{}
 	tradesByKey := map[string][]model.PaperTrade{}
 	for _, h := range holdings {
-		key := keyFor(h.UserID, h.Symbol, h.Market)
-		candidates[key] = paperCandidate{UserID: h.UserID, Symbol: h.Symbol, Market: h.Market, Name: h.Name}
+		key := keyFor(h.UserID, h.AccountID, h.Symbol, h.Market)
+		candidates[key] = paperCandidate{UserID: h.UserID, AccountID: h.AccountID, Symbol: h.Symbol, Market: h.Market, Name: h.Name}
 		holdingByKey[key] = h
 	}
 	for _, trade := range trades {
-		key := keyFor(trade.UserID, trade.Symbol, trade.Market)
+		key := keyFor(trade.UserID, trade.AccountID, trade.Symbol, trade.Market)
 		candidate := candidates[key]
-		candidate.UserID, candidate.Symbol, candidate.Market = trade.UserID, trade.Symbol, trade.Market
+		candidate.UserID, candidate.AccountID, candidate.Symbol, candidate.Market = trade.UserID, trade.AccountID, trade.Symbol, trade.Market
 		if candidate.Name == "" {
 			candidate.Name = trade.Name
 		}
@@ -876,7 +939,7 @@ func RunPaperCorpAdjust() int {
 				continue
 			}
 			if hasShareAdjustment(action) {
-				exists, err := paperCorpAdjustExists(common.DB, candidate.UserID, action.ID)
+				exists, err := paperCorpAdjustExists(common.DB, candidate.UserID, candidate.AccountID, action.ID)
 				if err != nil {
 					common.SysWarn("模拟盘读取除权审计失败 user=%d symbol=%s action=%d: %v",
 						candidate.UserID, candidate.Symbol, action.ID, err)
@@ -889,7 +952,7 @@ func RunPaperCorpAdjust() int {
 					candidate.UserID, candidate.Symbol, action.ID)
 				continue
 			}
-			if applyPaperCashDividend(candidate.UserID, candidate.Symbol, candidate.Market,
+			if applyPaperCashDividend(candidate.UserID, candidate.AccountID, candidate.Symbol, candidate.Market,
 				orSymbol(candidate.Name, action.Name), action) {
 				done++
 			}
@@ -940,10 +1003,10 @@ func paperSellOnOrAfterAction(trades []model.PaperTrade, action model.CorporateA
 	return false
 }
 
-func paperCorpAdjustExists(db *gorm.DB, userID, actionID int64) (bool, error) {
+func paperCorpAdjustExists(db *gorm.DB, userID, accountID, actionID int64) (bool, error) {
 	var count int64
 	err := db.Model(&model.PaperCorpAdjust{}).
-		Where("user_id = ? AND corporate_action_id = ?", userID, actionID).Count(&count).Error
+		Where("user_id = ? AND account_id = ? AND corporate_action_id = ?", userID, accountID, actionID).Count(&count).Error
 	return count > 0, err
 }
 
@@ -955,10 +1018,11 @@ func applyPaperCorpAdjust(h model.PaperHolding, a model.CorporateAction) bool {
 	err := common.DB.Transaction(func(tx *gorm.DB) error {
 		// 全部模拟盘写事务统一 account -> holding 的加锁顺序，避免与交易/Reset 互锁。
 		var acc model.PaperAccount
+		acc.AccountID = h.AccountID
 		if err := lockedAccount(tx, h.UserID, &acc); err != nil {
 			return err
 		}
-		if exists, err := paperCorpAdjustExists(tx, h.UserID, a.ID); err != nil {
+		if exists, err := paperCorpAdjustExists(tx, h.UserID, h.AccountID, a.ID); err != nil {
 			return err
 		} else if exists {
 			return nil
@@ -973,7 +1037,7 @@ func applyPaperCorpAdjust(h model.PaperHolding, a model.CorporateAction) bool {
 			return err
 		}
 		var trades []model.PaperTrade
-		if err := tx.Where("user_id = ? AND symbol = ? AND market = ?", h.UserID, h.Symbol, h.Market).
+		if err := tx.Where("user_id = ? AND account_id = ? AND symbol = ? AND market = ?", h.UserID, h.AccountID, h.Symbol, h.Market).
 			Order("trade_date ASC, id ASC").Find(&trades).Error; err != nil {
 			return err
 		}
@@ -993,7 +1057,7 @@ func applyPaperCorpAdjust(h model.PaperHolding, a model.CorporateAction) bool {
 		}
 		// 幂等闸门：唯一键冲突即本 action 已调过（DoNothing 不覆盖历史审计）。
 		audit := model.PaperCorpAdjust{
-			UserID: h.UserID, CorporateActionID: a.ID,
+			UserID: h.UserID, AccountID: h.AccountID, CorporateActionID: a.ID,
 			Symbol: h.Symbol, Market: h.Market, Name: orSymbol(h.Name, a.Name),
 			ExDate: a.ExDate, RecordDate: a.RecordDate, EntitledQty: entitledQty,
 			PlanProfile: a.PlanProfile,
@@ -1023,7 +1087,7 @@ func applyPaperCorpAdjust(h model.PaperHolding, a model.CorporateAction) bool {
 			}
 		}
 		trade := model.PaperTrade{
-			UserID: h.UserID, Symbol: h.Symbol, Market: h.Market, Name: audit.Name,
+			UserID: h.UserID, AccountID: h.AccountID, Symbol: h.Symbol, Market: h.Market, Name: audit.Name,
 			Side: model.PaperSideAdjust, Price: 0, Quantity: round4(calc.QtyAfter - audit.QtyBefore),
 			Amount: 0, Fee: 0, Tax: 0, RealizedPnl: round2(calc.CashDividend), TradeDate: a.ExDate,
 		}
@@ -1043,7 +1107,7 @@ func applyPaperCorpAdjust(h model.PaperHolding, a model.CorporateAction) bool {
 
 // applyPaperCashDividend 为已清仓的模拟持仓补发纯现金分红。现金与送转可分离处理，
 // 这里不创建/复活 holding，只落零数量 adjust 审计并增加账户现金。
-func applyPaperCashDividend(userID int64, symbol, market, name string, a model.CorporateAction) bool {
+func applyPaperCashDividend(userID, accountID int64, symbol, market, name string, a model.CorporateAction) bool {
 	if a.DividendPretax <= 0 || hasShareAdjustment(a) {
 		return false
 	}
@@ -1051,16 +1115,17 @@ func applyPaperCashDividend(userID int64, symbol, market, name string, a model.C
 	err := common.DB.Transaction(func(tx *gorm.DB) error {
 		// 与交易、Reset、持仓折算保持相同的账户优先锁序。
 		var acc model.PaperAccount
+		acc.AccountID = accountID
 		if err := lockedAccount(tx, userID, &acc); err != nil {
 			return err
 		}
-		if exists, err := paperCorpAdjustExists(tx, userID, a.ID); err != nil {
+		if exists, err := paperCorpAdjustExists(tx, userID, accountID, a.ID); err != nil {
 			return err
 		} else if exists {
 			return nil
 		}
 		var trades []model.PaperTrade
-		if err := tx.Where("user_id = ? AND symbol = ? AND market = ?", userID, symbol, market).
+		if err := tx.Where("user_id = ? AND account_id = ? AND symbol = ? AND market = ?", userID, accountID, symbol, market).
 			Order("trade_date ASC, id ASC").Find(&trades).Error; err != nil {
 			return err
 		}
@@ -1070,7 +1135,7 @@ func applyPaperCashDividend(userID int64, symbol, market, name string, a model.C
 		}
 		cash := round4(a.DividendPretax * entitledQty / 10)
 		audit := model.PaperCorpAdjust{
-			UserID: userID, CorporateActionID: a.ID,
+			UserID: userID, AccountID: accountID, CorporateActionID: a.ID,
 			Symbol: symbol, Market: market, Name: name,
 			ExDate: a.ExDate, RecordDate: a.RecordDate,
 			EntitledQty: entitledQty, CashDividend: cash, PlanProfile: a.PlanProfile,
@@ -1087,7 +1152,7 @@ func applyPaperCashDividend(userID int64, symbol, market, name string, a model.C
 			return err
 		}
 		trade := model.PaperTrade{
-			UserID: userID, Symbol: symbol, Market: market, Name: name,
+			UserID: userID, AccountID: accountID, Symbol: symbol, Market: market, Name: name,
 			Side: model.PaperSideAdjust, RealizedPnl: round2(cash), TradeDate: a.ExDate,
 		}
 		if err := tx.Create(&trade).Error; err != nil {
@@ -1117,7 +1182,7 @@ func paperDueActions(db *gorm.DB, symbol, market, tradeDate string) ([]model.Cor
 
 // paperHistoricalUnprocessedShareAction 查找已滑出自动结算窗口、但仍未处理的送转。
 // 这些记录不能自动倒序套当前聚合态，也不能靠等待第 8 天绕过交易闸门。
-func paperHistoricalUnprocessedShareAction(db *gorm.DB, userID int64, symbol, market, tradeDate string,
+func paperHistoricalUnprocessedShareAction(db *gorm.DB, userID, accountID int64, symbol, market, tradeDate string,
 	trades []model.PaperTrade, holding model.PaperHolding, hasHolding bool) (*model.CorporateAction, error) {
 	date, err := time.ParseInLocation("2006-01-02", tradeDate, time.Local)
 	if err != nil {
@@ -1140,7 +1205,7 @@ func paperHistoricalUnprocessedShareAction(db *gorm.DB, userID int64, symbol, ma
 		if entitledQty <= positionQtyEps {
 			continue
 		}
-		exists, err := paperCorpAdjustExists(db, userID, action.ID)
+		exists, err := paperCorpAdjustExists(db, userID, accountID, action.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -1154,6 +1219,14 @@ func paperHistoricalUnprocessedShareAction(db *gorm.DB, userID int64, symbol, ma
 // ensurePaperCorpAdjustBeforeTrade 在模拟盘下单前主动结算到期公司行动。外层交易随后
 // 还会在账户行锁内复验审计行，避免并发请求从预处理与正式下单之间穿过。
 func ensurePaperCorpAdjustBeforeTrade(userID int64, symbol, market, tradeDate string) error {
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindPaper)
+	if err != nil {
+		return err
+	}
+	return ensurePaperCorpAdjustBeforeTradeForAccount(userID, account.ID, symbol, market, tradeDate)
+}
+
+func ensurePaperCorpAdjustBeforeTradeForAccount(userID, accountID int64, symbol, market, tradeDate string) error {
 	if common.DB == nil {
 		return errors.New("数据库不可用")
 	}
@@ -1165,14 +1238,14 @@ func ensurePaperCorpAdjustBeforeTrade(userID int64, symbol, market, tradeDate st
 		return err
 	}
 	var holding model.PaperHolding
-	hErr := common.DB.Where("user_id = ? AND symbol = ? AND market = ?", userID, symbol, market).
+	hErr := common.DB.Where("user_id = ? AND account_id = ? AND symbol = ? AND market = ?", userID, accountID, symbol, market).
 		First(&holding).Error
 	hasHolding := hErr == nil
 	if hErr != nil && !errors.Is(hErr, gorm.ErrRecordNotFound) {
 		return hErr
 	}
 	var trades []model.PaperTrade
-	if err := common.DB.Where("user_id = ? AND symbol = ? AND market = ?", userID, symbol, market).
+	if err := common.DB.Where("user_id = ? AND account_id = ? AND symbol = ? AND market = ?", userID, accountID, symbol, market).
 		Order("trade_date ASC, id ASC").Find(&trades).Error; err != nil {
 		return err
 	}
@@ -1184,7 +1257,7 @@ func ensurePaperCorpAdjustBeforeTrade(userID int64, symbol, market, tradeDate st
 		if !action.HasAdjustment() || entitledQty <= positionQtyEps {
 			continue
 		}
-		if exists, err := paperCorpAdjustExists(common.DB, userID, action.ID); err != nil {
+		if exists, err := paperCorpAdjustExists(common.DB, userID, accountID, action.ID); err != nil {
 			return err
 		} else if exists {
 			continue
@@ -1193,13 +1266,13 @@ func ensurePaperCorpAdjustBeforeTrade(userID int64, symbol, market, tradeDate st
 		if hasHolding {
 			executed = applyPaperCorpAdjust(holding, action)
 		} else if !hasShareAdjustment(action) {
-			executed = applyPaperCashDividend(userID, symbol, market,
+			executed = applyPaperCashDividend(userID, accountID, symbol, market,
 				orSymbol(holding.Name, action.Name), action)
 		}
 		if executed {
 			continue
 		}
-		if exists, err := paperCorpAdjustExists(common.DB, userID, action.ID); err != nil {
+		if exists, err := paperCorpAdjustExists(common.DB, userID, accountID, action.ID); err != nil {
 			return err
 		} else if exists {
 			continue
@@ -1207,7 +1280,7 @@ func ensurePaperCorpAdjustBeforeTrade(userID int64, symbol, market, tradeDate st
 		return fmt.Errorf("%s 存在 %s 到期公司行动尚未安全入账；若已发生除权后卖出，请重置或人工核对模拟账本",
 			symbol, action.ExDate)
 	}
-	if action, err := paperHistoricalUnprocessedShareAction(common.DB, userID, symbol, market, tradeDate,
+	if action, err := paperHistoricalUnprocessedShareAction(common.DB, userID, accountID, symbol, market, tradeDate,
 		trades, holding, hasHolding); err != nil {
 		return err
 	} else if action != nil {
@@ -1217,7 +1290,7 @@ func ensurePaperCorpAdjustBeforeTrade(userID int64, symbol, market, tradeDate st
 	return nil
 }
 
-func verifyPaperCorpAdjustBeforeTradeTx(tx *gorm.DB, userID int64, symbol, market, tradeDate string) error {
+func verifyPaperCorpAdjustBeforeTradeTx(tx *gorm.DB, userID, accountID int64, symbol, market, tradeDate string) error {
 	if market != "cn" {
 		return nil
 	}
@@ -1226,12 +1299,12 @@ func verifyPaperCorpAdjustBeforeTradeTx(tx *gorm.DB, userID int64, symbol, marke
 		return err
 	}
 	var trades []model.PaperTrade
-	if err := tx.Where("user_id = ? AND symbol = ? AND market = ?", userID, symbol, market).
+	if err := tx.Where("user_id = ? AND account_id = ? AND symbol = ? AND market = ?", userID, accountID, symbol, market).
 		Order("trade_date ASC, id ASC").Find(&trades).Error; err != nil {
 		return err
 	}
 	var holding model.PaperHolding
-	hErr := tx.Where("user_id = ? AND symbol = ? AND market = ?", userID, symbol, market).First(&holding).Error
+	hErr := tx.Where("user_id = ? AND account_id = ? AND symbol = ? AND market = ?", userID, accountID, symbol, market).First(&holding).Error
 	hasHolding := hErr == nil
 	if hErr != nil && !errors.Is(hErr, gorm.ErrRecordNotFound) {
 		return hErr
@@ -1244,7 +1317,7 @@ func verifyPaperCorpAdjustBeforeTradeTx(tx *gorm.DB, userID int64, symbol, marke
 		if !action.HasAdjustment() || entitledQty <= positionQtyEps {
 			continue
 		}
-		exists, err := paperCorpAdjustExists(tx, userID, action.ID)
+		exists, err := paperCorpAdjustExists(tx, userID, accountID, action.ID)
 		if err != nil {
 			return err
 		}
@@ -1252,7 +1325,7 @@ func verifyPaperCorpAdjustBeforeTradeTx(tx *gorm.DB, userID int64, symbol, marke
 			return fmt.Errorf("%s 的 %s 公司行动尚未入账，请重试", symbol, action.ExDate)
 		}
 	}
-	if action, err := paperHistoricalUnprocessedShareAction(tx, userID, symbol, market, tradeDate,
+	if action, err := paperHistoricalUnprocessedShareAction(tx, userID, accountID, symbol, market, tradeDate,
 		trades, holding, hasHolding); err != nil {
 		return err
 	} else if action != nil {

@@ -194,10 +194,24 @@ func lockedPosition(tx *gorm.DB, userID, id int64, p *model.Position) error {
 	return q.First(p).Error
 }
 
+func positionInAccount(userID, accountID, positionID int64) error {
+	if accountID <= 0 {
+		return gorm.ErrRecordNotFound
+	}
+	var n int64
+	if err := common.DB.Model(&model.Position{}).Where("id = ? AND user_id = ? AND account_id = ?", positionID, userID, accountID).Count(&n).Error; err != nil {
+		return err
+	}
+	if n == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
 // buildInitialTrade 建仓时的首笔 buy 流水（Create 内联调用，保证账本从第一天就自洽）。
 func buildInitialTrade(p *model.Position) model.PositionTrade {
 	return model.PositionTrade{
-		UserID: p.UserID, PositionID: p.ID, Side: model.PositionTradeBuy,
+		UserID: p.UserID, AccountID: p.AccountID, PositionID: p.ID, Side: model.PositionTradeBuy,
 		Price: p.BuyPrice, Quantity: p.Quantity, Fee: p.BuyFee, Tax: p.BuyTax,
 		TradeDate: p.BuyDate, Note: "建仓",
 		AvgCostAfter: p.BuyPrice, QuantityAfter: p.Quantity,
@@ -246,7 +260,7 @@ func ensurePositionTradesTx(tx *gorm.DB, p *model.Position) error {
 	}
 	buyCost := round4(p.BuyPrice*p.Quantity + p.BuyFee + p.BuyTax)
 	trades := []model.PositionTrade{{
-		UserID: p.UserID, PositionID: p.ID, Side: model.PositionTradeBuy,
+		UserID: p.UserID, AccountID: p.AccountID, PositionID: p.ID, Side: model.PositionTradeBuy,
 		Price: p.BuyPrice, Quantity: p.Quantity, Fee: p.BuyFee, Tax: p.BuyTax,
 		TradeDate: p.BuyDate, Note: "历史建仓（补建）", Backfilled: true,
 		AvgCostAfter: p.BuyPrice, QuantityAfter: p.Quantity,
@@ -257,7 +271,7 @@ func ensurePositionTradesTx(tx *gorm.DB, p *model.Position) error {
 	if p.Status == model.PositionStatusClosed && p.SellPrice > 0 {
 		sellNet := round4(p.SellPrice*p.Quantity - p.SellFee - p.SellTax)
 		trades = append(trades, model.PositionTrade{
-			UserID: p.UserID, PositionID: p.ID, Side: model.PositionTradeSell,
+			UserID: p.UserID, AccountID: p.AccountID, PositionID: p.ID, Side: model.PositionTradeSell,
 			Price: p.SellPrice, Quantity: p.Quantity, Fee: p.SellFee, Tax: p.SellTax,
 			TradeDate: p.SellDate, Note: "历史平仓（补建）", Backfilled: true,
 			RealizedPnl: round4(sellNet - buyCost), AvgCostAfter: p.BuyPrice, QuantityAfter: 0,
@@ -449,7 +463,7 @@ func (s *PositionService) AddTrade(userID, positionID int64, in PositionTradeInp
 			return err
 		}
 		trade := model.PositionTrade{
-			UserID: userID, PositionID: p.ID, Side: side,
+			UserID: userID, AccountID: p.AccountID, PositionID: p.ID, Side: side,
 			Price: in.Price, Quantity: in.Quantity, Fee: in.Fee, Tax: in.Tax,
 			TradeDate: in.TradeDate, Note: truncateRunes(strings.TrimSpace(in.Note), 200),
 		}

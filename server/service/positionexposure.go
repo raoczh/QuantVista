@@ -86,11 +86,16 @@ type ExposureDim struct {
 // PortfolioExposure 组合的三维暴露（C13）。
 type PortfolioExposure struct {
 	// Base 计算基数 = 已定价（fresh 行情）持仓市值合计（元），与 Overview.TotalValue 同口径。
-	Base       float64     `json:"base"`
-	BaseNote   string      `json:"base_note"`
-	Industry   ExposureDim `json:"industry"`
-	CapStyle   ExposureDim `json:"cap_style"`
-	ValueStyle ExposureDim `json:"value_style"`
+	Base          float64     `json:"base"`
+	BaseNote      string      `json:"base_note"`
+	Industry      ExposureDim `json:"industry"`
+	CapStyle      ExposureDim `json:"cap_style"`
+	ValueStyle    ExposureDim `json:"value_style"`
+	WindowDays    int         `json:"window_days,omitempty"`
+	SampleCount   int         `json:"sample_count,omitempty"`
+	AsOf          string      `json:"as_of,omitempty"`
+	FactorVersion string      `json:"factor_version,omitempty"`
+	DataVersion   string      `json:"data_version,omitempty"`
 }
 
 // exposureInput 单只标的（按 symbol 聚合后）参与暴露计算的输入。

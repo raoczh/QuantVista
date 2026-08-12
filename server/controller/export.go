@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"quantvista/common"
+	"quantvista/model"
 	"quantvista/service"
 
 	"github.com/gin-gonic/gin"
@@ -21,7 +22,17 @@ func NewExportController(svc *service.ExportService) *ExportController {
 // Export GET /api/export/:kind —— kind=positions|watchlist|recommendations|analyses。
 // 返回 text/csv（带 UTF-8 BOM），浏览器直接下载。
 func (ec *ExportController) Export(c *gin.Context) {
-	data, filename, err := ec.svc.Export(currentUserID(c), c.Param("kind"))
+	kind := c.Param("kind")
+	accountID := int64(0)
+	if kind == "positions" {
+		account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+		if err != nil {
+			common.ApiErrorMsg(c, "组合不存在")
+			return
+		}
+		accountID = account.ID
+	}
+	data, filename, err := ec.svc.ExportByAccount(currentUserID(c), accountID, kind)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -51,7 +62,12 @@ func (ec *ExportController) ImportPositions(c *gin.Context) {
 		return
 	}
 	defer f.Close()
-	res, err := ec.svc.ImportPositions(currentUserID(c), f)
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+	if err != nil {
+		common.ApiErrorMsg(c, "组合不存在")
+		return
+	}
+	res, err := ec.svc.ImportPositionsByAccount(currentUserID(c), account.ID, f)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
