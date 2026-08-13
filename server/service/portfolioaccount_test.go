@@ -13,14 +13,46 @@ import (
 
 func cleanPortfolioAccountTables(t *testing.T) {
 	t.Helper()
-	for _, m := range []any{&model.PortfolioCashFlow{}, &model.TargetAllocationRevision{}, &model.PortfolioSnapshot{}, &model.PositionTrade{}, &model.Position{}, &model.PaperTrade{}, &model.PaperHolding{}, &model.PaperAccount{}, &model.PortfolioAccount{}} {
+	for _, m := range []any{&model.PortfolioCashFlow{}, &model.TargetAllocationRevision{}, &model.PortfolioSnapshot{}, &model.PositionTrade{}, &model.PositionCorpAdjust{}, &model.Position{}, &model.PaperTrade{}, &model.PaperHolding{}, &model.PaperCorpAdjust{}, &model.PaperAccount{}, &model.PortfolioAccount{}} {
 		common.DB.Where("1=1").Delete(m)
 	}
 	t.Cleanup(func() {
-		for _, m := range []any{&model.PortfolioCashFlow{}, &model.TargetAllocationRevision{}, &model.PortfolioSnapshot{}, &model.PositionTrade{}, &model.Position{}, &model.PaperTrade{}, &model.PaperHolding{}, &model.PaperAccount{}, &model.PortfolioAccount{}} {
+		for _, m := range []any{&model.PortfolioCashFlow{}, &model.TargetAllocationRevision{}, &model.PortfolioSnapshot{}, &model.PositionTrade{}, &model.PositionCorpAdjust{}, &model.Position{}, &model.PaperTrade{}, &model.PaperHolding{}, &model.PaperCorpAdjust{}, &model.PaperAccount{}, &model.PortfolioAccount{}} {
 			common.DB.Where("1=1").Delete(m)
 		}
 	})
+}
+
+func TestPortfolioAccountDeleteAllowsOnlyEmptyAccount(t *testing.T) {
+	setupTestDB(t)
+	cleanPortfolioAccountTables(t)
+	svc := NewPortfolioAccountService()
+	if _, err := svc.Create(100, PortfolioAccountInput{Name: "默认模拟账户", Kind: model.PortfolioKindPaper, Currency: "CNY"}); err != nil {
+		t.Fatal(err)
+	}
+	empty, err := svc.Create(100, PortfolioAccountInput{Name: "空模拟账户", Kind: model.PortfolioKindPaper, Currency: "CNY"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Delete(100, empty.ID); err != nil {
+		t.Fatalf("系统自动创建的空资金账户不应阻止删除: %v", err)
+	}
+	var paperCount int64
+	common.DB.Model(&model.PaperAccount{}).Where("account_id = ?", empty.ID).Count(&paperCount)
+	if paperCount != 0 {
+		t.Fatalf("删除组合后不应残留模拟资金账户: %d", paperCount)
+	}
+
+	withFact, err := svc.Create(100, PortfolioAccountInput{Name: "有事实账户", Kind: model.PortfolioKindPaper, Currency: "CNY"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := common.DB.Create(&model.PaperHolding{UserID: 100, AccountID: withFact.ID, Symbol: "600000", Market: "cn", Quantity: 100}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Delete(100, withFact.ID); err == nil {
+		t.Fatal("已有持仓事实的账户必须拒绝删除")
+	}
 }
 
 func TestPortfolioAccountIsolationAndKinds(t *testing.T) {
@@ -192,6 +224,32 @@ func TestStressAndRebalanceAreReadOnlyAndRevisionStable(t *testing.T) {
 	}
 	if after := countFacts(); after != before {
 		t.Fatalf("压力测试/再平衡不得写入持仓或流水: before=%v after=%v", before, after)
+	}
+}
+
+func TestRealCashBalanceCanReadLegacyHoldingWithoutWritingLedger(t *testing.T) {
+	setupTestDB(t)
+	cleanPortfolioAccountTables(t)
+	account, err := NewPortfolioAccountService().Create(407, PortfolioAccountInput{Name: "旧真实账户", Kind: model.PortfolioKindReal, Currency: "CNY"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreatePortfolioCashFlow(407, account.ID, CashFlowInput{Type: model.CashFlowDeposit, Amount: 10000, TradeDate: "2026-08-01", IdempotencyKey: "legacy-cash"}); err != nil {
+		t.Fatal(err)
+	}
+	position := model.Position{UserID: 407, AccountID: account.ID, Symbol: "600000", Market: "cn", Status: model.PositionStatusHolding,
+		BuyPrice: 10, BuyDate: "2026-08-01", Quantity: 100}
+	if err := common.DB.Create(&position).Error; err != nil {
+		t.Fatal(err)
+	}
+	cash, reason, err := realCashBalance(common.DB, 407, account.ID, "2026-08-02")
+	if err != nil || reason != "" || cash != 9000 {
+		t.Fatalf("旧持仓现金应按字段只读重建: cash=%v reason=%q err=%v", cash, reason, err)
+	}
+	var tradeCount int64
+	common.DB.Model(&model.PositionTrade{}).Where("position_id = ?", position.ID).Count(&tradeCount)
+	if tradeCount != 0 {
+		t.Fatalf("风险计算不得为旧持仓补写流水: %d", tradeCount)
 	}
 }
 

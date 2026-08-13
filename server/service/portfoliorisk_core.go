@@ -218,37 +218,54 @@ func SortinoRatio(returns []float64, annualization int, riskFreeRate float64) Ri
 func MaxDrawdown(points []EquityPoint) (DrawdownResult, []EquityPoint) {
 	out := append([]EquityPoint(nil), points...)
 	peak, maxDD, peakDate, troughDate := 0.0, 0.0, "", ""
-	activePeakDate := ""
+	activePeakDate, recovery := "", ""
+	peakAtMax := 0.0
+	segment, maxSegment := 0, -1
+	previous := -1
+	nav := 1.0
+	intervals := 0
 	for i := range out {
 		if out[i].Partial || out[i].Assets <= 0 {
+			previous = -1
+			peak, activePeakDate = 0, ""
+			segment++
 			continue
 		}
-		if out[i].Assets > peak {
-			peak, activePeakDate = out[i].Assets, out[i].TradeDate
+		if previous < 0 {
+			nav, peak, activePeakDate = 1, 1, out[i].TradeDate
+			dd := 0.0
+			out[i].DrawdownPct = &dd
+			previous = i
+			continue
 		}
-		dd := (out[i].Assets/peak - 1) * 100
+		r := (out[i].Assets-out[i].CashFlow)/out[previous].Assets - 1
+		if r <= -1 || math.IsNaN(r) || math.IsInf(r, 0) {
+			previous = i
+			nav, peak, activePeakDate = 1, 1, out[i].TradeDate
+			segment++
+			dd := 0.0
+			out[i].DrawdownPct = &dd
+			continue
+		}
+		nav *= 1 + r
+		intervals++
+		if nav > peak {
+			peak, activePeakDate = nav, out[i].TradeDate
+		}
+		dd := (nav/peak - 1) * 100
 		out[i].DrawdownPct = &dd
 		if dd < maxDD {
 			maxDD, peakDate, troughDate = dd, activePeakDate, out[i].TradeDate
+			peakAtMax, maxSegment, recovery = peak, segment, ""
+		} else if recovery == "" && troughDate != "" && segment == maxSegment && out[i].TradeDate > troughDate && nav >= peakAtMax {
+			recovery = out[i].TradeDate
 		}
+		previous = i
 	}
-	if peak == 0 || len(points) < 2 {
-		return DrawdownResult{Metric: unavailable("完整资产快照不足 2 个", len(points))}, out
+	if intervals == 0 {
+		return DrawdownResult{Metric: unavailable("相邻完整资产快照不足 2 个", 0)}, out
 	}
-	recovery := ""
-	if troughDate != "" {
-		var peakValue float64
-		for _, p := range out {
-			if p.TradeDate == peakDate {
-				peakValue = p.Assets
-			}
-			if p.TradeDate > troughDate && !p.Partial && p.Assets >= peakValue {
-				recovery = p.TradeDate
-				break
-			}
-		}
-	}
-	return DrawdownResult{Metric: available(maxDD, len(points)), PeakDate: peakDate, TroughDate: troughDate, RecoveryDate: recovery}, out
+	return DrawdownResult{Metric: available(maxDD, intervals), PeakDate: peakDate, TroughDate: troughDate, RecoveryDate: recovery}, out
 }
 
 // BetaAlpha 对已经按共同交易日对齐的收益序列计算 beta 与年化 Jensen alpha。
@@ -574,6 +591,9 @@ type RebalanceDraftItem struct {
 	Name             string  `json:"name"`
 	CurrentWeightPct float64 `json:"current_weight_pct"`
 	TargetWeightPct  float64 `json:"target_weight_pct"`
+	MinWeightPct     float64 `json:"min_weight_pct"`
+	MaxWeightPct     float64 `json:"max_weight_pct"`
+	DeviationPct     float64 `json:"deviation_pct"`
 	AmountChange     float64 `json:"amount_change"`
 	QuantityChange   float64 `json:"quantity_change"`
 	EstimatedFee     float64 `json:"estimated_fee"`
@@ -600,7 +620,8 @@ func BuildRebalanceDraft(holdings []RebalanceHolding, targets []TargetAllocation
 		if !t.Enabled {
 			continue
 		}
-		row := RebalanceDraftItem{Type: t.Type, Key: t.Key, TargetWeightPct: t.TargetWeightPct, Status: RiskStatusAvailable}
+		row := RebalanceDraftItem{Type: t.Type, Key: t.Key, TargetWeightPct: t.TargetWeightPct,
+			MinWeightPct: t.MinWeightPct, MaxWeightPct: t.MaxWeightPct, Status: RiskStatusAvailable}
 		current := 0.0
 		var h RebalanceHolding
 		if t.Type == "symbol" {
@@ -613,6 +634,17 @@ func BuildRebalanceDraft(holdings []RebalanceHolding, targets []TargetAllocation
 		}
 		if totalAssets > 0 {
 			row.CurrentWeightPct = round2(current / totalAssets * 100)
+		}
+		row.DeviationPct = round2(row.CurrentWeightPct - row.TargetWeightPct)
+		hasBand := t.MinWeightPct > 0 || (t.MaxWeightPct > 0 && t.MaxWeightPct < 100)
+		maxWeight := t.MaxWeightPct
+		if maxWeight <= 0 {
+			maxWeight = 100
+		}
+		if hasBand && row.CurrentWeightPct >= t.MinWeightPct && row.CurrentWeightPct <= maxWeight {
+			row.Reason = "当前权重在目标区间内，无需调整"
+			out = append(out, row)
+			continue
 		}
 		row.AmountChange = round2(totalAssets*t.TargetWeightPct/100 - current)
 		if t.Type == "industry" {

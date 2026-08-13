@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, computed, nextTick, watch } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed, nextTick, watch, defineAsyncComponent } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -69,6 +69,8 @@ import SectionCard from '@/components/SectionCard.vue'
 import StatCard from '@/components/StatCard.vue'
 import FreshnessTag from '@/components/FreshnessTag.vue'
 import DataImportWizard from '@/components/DataImportWizard.vue'
+
+const PortfolioRisk = defineAsyncComponent(() => import('@/pages/PortfolioRisk.vue'))
 
 const message = useMessage()
 const route = useRoute()
@@ -622,7 +624,7 @@ async function revertAdjustTrade(t: PositionTrade, positionId: number) {
 }
 
 // ---------- B6 复盘统计 ----------
-const mainTabQuery = enumQuery<'list' | 'stats'>('list', ['list', 'stats'])
+const mainTabQuery = enumQuery<'list' | 'stats' | 'risk'>('list', ['list', 'stats', 'risk'])
 const statsRangeQuery = enumQuery<'all' | '30d' | '90d' | '180d' | '1y'>('all', [
   'all',
   '30d',
@@ -1235,7 +1237,7 @@ onBeforeUnmount(() => {
 
 <template>
   <PageContainer title="持仓" subtitle="短线 / 长线 · 盈亏跟踪 · 卖出复盘">
-    <template #actions>
+    <template v-if="mainTab !== 'risk'" #actions>
       <n-button size="small" type="primary" @click="openCreate()">+ 新建持仓</n-button>
       <n-button size="small" quaternary @click="openImport">导入</n-button>
       <n-button size="small" quaternary :loading="loading" @click="load()">刷新</n-button>
@@ -1243,7 +1245,7 @@ onBeforeUnmount(() => {
 
     <div class="pos" :style="styleVars">
       <!-- 汇总（组合总览：全组合口径） -->
-      <n-grid cols="2 s:4" :x-gap="14" :y-gap="14" responsive="screen">
+      <n-grid v-if="mainTab !== 'risk'" cols="2 s:4" :x-gap="14" :y-gap="14" responsive="screen">
         <n-gi>
           <StatCard label="持仓成本" :value="overview ? fmtMoney(overview.total_cost) : '—'" />
         </n-gi>
@@ -1287,12 +1289,12 @@ onBeforeUnmount(() => {
         </n-gi>
       </n-grid>
 
-      <n-alert v-if="loadError" type="error" :bordered="false" title="持仓读取失败">
+      <n-alert v-if="mainTab !== 'risk' && loadError" type="error" :bordered="false" title="持仓读取失败">
         {{ loadError }}
       </n-alert>
 
       <!-- 组合风控信号（集中度/止损/未分析） -->
-      <n-alert v-if="overview?.signals?.length" type="warning" title="组合风控信号">
+      <n-alert v-if="mainTab !== 'risk' && overview?.signals?.length" type="warning" title="组合风控信号">
         <div v-for="(s, i) in overview.signals" :key="i" class="signal-line">{{ s }}</div>
       </n-alert>
 
@@ -1842,6 +1844,9 @@ onBeforeUnmount(() => {
               </template>
             </n-spin>
           </SectionCard>
+        </n-tab-pane>
+        <n-tab-pane name="risk" tab="组合风险" display-directive="show:lazy">
+          <PortfolioRisk embedded />
         </n-tab-pane>
       </n-tabs>
     </div>

@@ -1020,6 +1020,29 @@ func TestRunPortfolioSnapshotsIdempotent(t *testing.T) {
 	}
 }
 
+func TestRunPortfolioSnapshotsIncludesCashOnlyRealAccount(t *testing.T) {
+	setupTestDB(t)
+	cleanLedgerTables(t)
+	account, err := NewPortfolioAccountService().Create(3, PortfolioAccountInput{Name: "纯现金账户", Kind: model.PortfolioKindReal, Currency: "CNY"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := common.DB.Create(&model.PortfolioCashFlow{UserID: 3, AccountID: account.ID, Type: model.CashFlowDeposit,
+		Amount: 50000, TradeDate: "2026-07-28", IdempotencyKey: "cash-only"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if n := RunPortfolioSnapshots(context.Background(), &PositionService{}, &PaperService{}, "2026-07-28"); n != 1 {
+		t.Fatalf("纯现金真实账户也必须落快照，得到 %d", n)
+	}
+	var snap model.PortfolioSnapshot
+	if err := common.DB.Where("user_id = ? AND account_id = ?", 3, account.ID).First(&snap).Error; err != nil {
+		t.Fatal(err)
+	}
+	if snap.Kind != model.PortfolioKindReal || snap.MarketValue != 0 || snap.Partial {
+		t.Fatalf("纯现金快照口径错误: %+v", snap)
+	}
+}
+
 func TestSnapshotUserIDsPropagatesQueryErrors(t *testing.T) {
 	setupTestDB(t)
 	cleanLedgerTables(t)

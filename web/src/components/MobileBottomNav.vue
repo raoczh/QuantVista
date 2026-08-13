@@ -19,7 +19,9 @@ const todayAriaLabel = computed(() => {
 })
 
 function isRouteActive(name: MobileRouteName) {
-  return !props.searchActive && route.name === name
+  if (props.searchActive) return false
+  if (name === 'positions' && route.name === 'portfolio-risk') return true
+  return route.name === name
 }
 </script>
 

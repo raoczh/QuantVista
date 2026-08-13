@@ -310,8 +310,8 @@ func portfolioAccountFactCounts(tx *gorm.DB, userID, accountID int64) (map[strin
 	counts := map[string]int64{}
 	for key, value := range map[string]any{
 		"持仓": &model.Position{}, "持仓流水": &model.PositionTrade{}, "资产快照": &model.PortfolioSnapshot{},
-		"模拟资金账户": &model.PaperAccount{}, "模拟持仓": &model.PaperHolding{}, "模拟流水": &model.PaperTrade{}, "现金流": &model.PortfolioCashFlow{},
-		"除权调整": &model.PositionCorpAdjust{}, "导入批次": &model.ImportBatch{}, "目标配置": &model.TargetAllocationRevision{},
+		"模拟持仓": &model.PaperHolding{}, "模拟流水": &model.PaperTrade{}, "现金流": &model.PortfolioCashFlow{},
+		"真实除权调整": &model.PositionCorpAdjust{}, "模拟除权调整": &model.PaperCorpAdjust{}, "导入批次": &model.ImportBatch{}, "目标配置": &model.TargetAllocationRevision{},
 	} {
 		var n int64
 		if err := tx.Model(value).Where("user_id = ? AND account_id = ?", userID, accountID).Count(&n).Error; err != nil {
@@ -343,23 +343,28 @@ func (s *PortfolioAccountService) Archive(userID, accountID int64) (*model.Portf
 }
 
 func (s *PortfolioAccountService) Delete(userID, accountID int64) error {
-	row, err := PortfolioAccountByID(userID, accountID, "")
-	if err != nil {
-		return err
-	}
-	if row.IsDefault {
-		return errors.New("默认账户不能删除")
-	}
-	counts, err := portfolioAccountFactCounts(common.DB, userID, accountID)
-	if err != nil {
-		return err
-	}
-	for label, n := range counts {
-		if n > 0 {
-			return fmt.Errorf("账户已有%s，不能删除，只能归档", label)
+	return common.DB.Transaction(func(tx *gorm.DB) error {
+		var row model.PortfolioAccount
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ?", accountID, userID).First(&row).Error; err != nil {
+			return err
 		}
-	}
-	return common.DB.Where("id = ? AND user_id = ?", accountID, userID).Delete(&model.PortfolioAccount{}).Error
+		if row.IsDefault {
+			return errors.New("默认账户不能删除")
+		}
+		counts, err := portfolioAccountFactCounts(tx, userID, accountID)
+		if err != nil {
+			return err
+		}
+		for label, n := range counts {
+			if n > 0 {
+				return fmt.Errorf("账户已有%s，不能删除，只能归档", label)
+			}
+		}
+		if err := tx.Where("user_id = ? AND account_id = ?", userID, accountID).Delete(&model.PaperAccount{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("id = ? AND user_id = ?", accountID, userID).Delete(&model.PortfolioAccount{}).Error
+	})
 }
 
 type CashFlowInput struct {
@@ -452,6 +457,9 @@ func ReversePortfolioCashFlow(userID, accountID, cashFlowID int64, idempotencyKe
 	idempotencyKey, note = strings.TrimSpace(idempotencyKey), strings.TrimSpace(note)
 	if idempotencyKey == "" || len(idempotencyKey) > 128 {
 		return nil, errors.New("idempotency_key 不能为空且不能超过 128 字符")
+	}
+	if len([]rune(note)) > 255 {
+		return nil, errors.New("备注不能超过 255 个字符")
 	}
 	var out model.PortfolioCashFlow
 	err := common.DB.Transaction(func(tx *gorm.DB) error {

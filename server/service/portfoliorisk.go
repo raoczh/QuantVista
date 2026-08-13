@@ -320,7 +320,9 @@ func realCashBalance(db *gorm.DB, userID, accountID int64, asOf string) (float64
 	if err := db.Where("user_id = ? AND account_id = ? AND trade_date <= ?", userID, accountID, asOf).Find(&trades).Error; err != nil {
 		return 0, "", err
 	}
+	tradePositionIDs := make(map[int64]struct{}, len(trades))
 	for _, t := range trades {
+		tradePositionIDs[t.PositionID] = struct{}{}
 		switch t.Side {
 		case model.PositionTradeBuy:
 			cash -= t.Price*t.Quantity + t.Fee + t.Tax
@@ -329,6 +331,48 @@ func realCashBalance(db *gorm.DB, userID, accountID int64, asOf string) (float64
 		case model.PositionTradeAdjust:
 			cash += t.RealizedPnl
 		}
+	}
+	// 旧持仓在账本升级前没有 position_trades。风险计算必须保持只读，不能像持仓
+	// 列表那样惰性补建；这里仅对可由现有字段无歧义重建的买入现金做等价回放。
+	var positions []model.Position
+	if err := db.Where("user_id = ? AND account_id = ? AND (buy_date = '' OR buy_date <= ?)", userID, accountID, asOf).Find(&positions).Error; err != nil {
+		return 0, "", err
+	}
+	for _, p := range positions {
+		if _, ok := tradePositionIDs[p.ID]; ok {
+			continue
+		}
+		if p.Status == model.PositionStatusHolding && p.Quantity > positionQtyEps {
+			if p.TotalSellNet != 0 {
+				return 0, "旧持仓缺少可回放的分批卖出流水", nil
+			}
+			cash -= p.BuyPrice*p.Quantity + p.BuyFee + p.BuyTax
+			continue
+		}
+		if p.Status == model.PositionStatusClosed && p.TotalBuyCost > 0 {
+			cash -= p.TotalBuyCost
+			if p.SellDate != "" && p.SellDate <= asOf {
+				if p.TotalSellNet != 0 {
+					cash += p.TotalSellNet
+				} else if p.SellPrice > 0 && p.TotalBuyQty > 0 {
+					cash += p.SellPrice*p.TotalBuyQty - p.SellFee - p.SellTax
+				} else {
+					return 0, "旧平仓记录缺少可回放的卖出事实", nil
+				}
+			}
+			continue
+		}
+		if p.Status == model.PositionStatusClosed && p.Quantity > positionQtyEps && p.BuyPrice > 0 {
+			cash -= p.BuyPrice*p.Quantity + p.BuyFee + p.BuyTax
+			if p.SellDate != "" && p.SellDate <= asOf {
+				if p.SellPrice <= 0 {
+					return 0, "旧平仓记录缺少可回放的卖出事实", nil
+				}
+				cash += p.SellPrice*p.Quantity - p.SellFee - p.SellTax
+			}
+			continue
+		}
+		return 0, "存在无法由旧持仓字段重建的历史现金影响", nil
 	}
 	return round2(cash), "", nil
 }
@@ -341,26 +385,25 @@ func isReversedFlow(flows []model.PortfolioCashFlow, id int64) bool {
 	return false
 }
 
-func riskWindowStart(asOf string, days int) string {
-	end, err := time.ParseInLocation("2006-01-02", asOf, time.Local)
-	if err != nil {
-		end = time.Now()
-	}
-	return end.AddDate(0, 0, -days).Format("2006-01-02")
-}
-
 func (s *PortfolioRiskService) equityPoints(account *model.PortfolioAccount, days int, asOf string) ([]EquityPoint, int, []string, error) {
-	from := riskWindowStart(asOf, days)
 	var snaps []model.PortfolioSnapshot
-	if err := common.DB.Where("user_id = ? AND account_id = ? AND trade_date >= ? AND trade_date <= ?", account.UserID, account.ID, from, asOf).Order("trade_date ASC").Find(&snaps).Error; err != nil {
+	if err := common.DB.Where("user_id = ? AND account_id = ? AND trade_date <= ?", account.UserID, account.ID, asOf).
+		Order("trade_date DESC").Limit(days + 1).Find(&snaps).Error; err != nil {
 		return nil, 0, nil, err
+	}
+	for i, j := 0, len(snaps)-1; i < j; i, j = i+1, j-1 {
+		snaps[i], snaps[j] = snaps[j], snaps[i]
 	}
 	points := make([]EquityPoint, 0, len(snaps))
 	partial := 0
 	reasons := []string{}
 	var flows []model.PortfolioCashFlow
 	if account.Kind == model.PortfolioKindReal {
-		if err := common.DB.Where("user_id = ? AND account_id = ? AND trade_date >= ?", account.UserID, account.ID, from).Find(&flows).Error; err != nil {
+		from := asOf
+		if len(snaps) > 0 {
+			from = snaps[0].TradeDate
+		}
+		if err := common.DB.Where("user_id = ? AND account_id = ? AND trade_date >= ? AND trade_date <= ?", account.UserID, account.ID, from, asOf).Find(&flows).Error; err != nil {
 			return nil, 0, nil, err
 		}
 	}
@@ -425,10 +468,17 @@ func returnsByDate(points []EquityPoint) map[string]float64 {
 	}
 	return out
 }
-func localBarReturns(symbol, market, from, asOf string) (map[string]float64, error) {
+func localBarReturns(symbol, market string, limit int, asOf string) (map[string]float64, error) {
 	var bars []model.DailyBar
-	if err := common.DB.Where("symbol = ? AND market = ? AND trade_date >= ? AND trade_date <= ?", symbol, market, from, asOf).Order("trade_date ASC").Find(&bars).Error; err != nil {
+	if limit < 2 {
+		limit = 2
+	}
+	if err := common.DB.Where("symbol = ? AND market = ? AND trade_date <= ?", symbol, market, asOf).
+		Order("trade_date DESC").Limit(limit + 1).Find(&bars).Error; err != nil {
 		return nil, err
+	}
+	for i, j := 0, len(bars)-1; i < j; i, j = i+1, j-1 {
+		bars[i], bars[j] = bars[j], bars[i]
 	}
 	out := map[string]float64{}
 	for i := 1; i < len(bars); i++ {
@@ -465,13 +515,19 @@ func (s *PortfolioRiskService) Risk(ctx context.Context, userID, accountID int64
 		out.Beta = unavailable("未指定基准代码", 0)
 		out.Alpha = unavailable("未指定基准代码", 0)
 	} else {
-		from := riskWindowStart(params.AsOf, params.WindowDays+10)
-		bench, err := localBarReturns(params.BenchmarkCode, "cn", from, params.AsOf)
+		bench, err := localBarReturns(params.BenchmarkCode, "cn", params.WindowDays, params.AsOf)
 		if err != nil {
 			return nil, err
 		}
 		p, b, _ := alignReturnsByDate(portfolioReturns, bench)
 		out.Beta, out.Alpha = BetaAlpha(p, b, params.Annualization, params.RiskFreeRatePct/100)
+	}
+	if params.AsOf < time.Now().Format("2006-01-02") {
+		reason := "历史 as_of 缺少逐标的持仓快照，相关性、暴露和风险贡献不可复现"
+		out.UnknownReasons = uniqueRiskStrings(append(out.UnknownReasons, reason))
+		out.Correlation = CorrelationMatrix{Symbols: []string{}, Cells: [][]CorrelationCell{}, WindowDays: params.WindowDays, AsOf: params.AsOf, DataVersion: "daily-bars-v1"}
+		out.RiskContribution = RiskContributionResult{PredictedVolatility: unavailable(reason, 0), Items: []RiskContributionItem{}, WindowDays: params.WindowDays, AsOf: params.AsOf, DataVersion: "daily-bars-covariance-v1"}
+		return out, nil
 	}
 	holdings, _, exposure, err := s.currentHoldings(ctx, account)
 	if err != nil {
@@ -483,13 +539,12 @@ func (s *PortfolioRiskService) Risk(ctx context.Context, userID, accountID int64
 	totalAssets := 0.0
 	weightsComplete := true
 	weightReason := ""
-	from := riskWindowStart(params.AsOf, params.WindowDays+10)
 	for _, h := range holdings {
-		r, err := localBarReturns(h.Symbol, h.Market, from, params.AsOf)
+		r, err := localBarReturns(h.Symbol, h.Market, params.WindowDays, params.AsOf)
 		if err != nil {
 			return nil, err
 		}
-		series[h.Symbol] = r
+		series[QuoteKey(h.Market, h.Symbol)] = r
 		if h.Status != RiskStatusAvailable {
 			weightsComplete = false
 		} else {
@@ -531,7 +586,7 @@ func (s *PortfolioRiskService) Risk(ctx context.Context, userID, accountID int64
 	}
 	if weightsComplete && marketValue > 0 && totalAssets > 0 {
 		for _, h := range holdings {
-			weights[h.Symbol] = h.Value / totalAssets
+			weights[QuoteKey(h.Market, h.Symbol)] = h.Value / totalAssets
 		}
 		out.RiskContribution = ComputeRiskContributions(series, weights, params.Annualization, params.WindowDays, params.AsOf)
 	} else {
@@ -552,7 +607,7 @@ func (s *PortfolioRiskService) Stress(ctx context.Context, userID, accountID int
 	if err != nil {
 		return nil, err
 	}
-	if scenario.ShockPct > 0 || scenario.ShockPct < -100 {
+	if math.IsNaN(scenario.ShockPct) || math.IsInf(scenario.ShockPct, 0) || scenario.ShockPct > 0 || scenario.ShockPct < -100 {
 		return nil, errors.New("冲击比例须在 -100% 到 0% 之间")
 	}
 	allowed := map[string]bool{"market": true, "industry": true, "symbol": true, "plan_stop_loss": true}
@@ -593,7 +648,12 @@ func normalizeTargets(items []TargetAllocationItem) ([]TargetAllocationItem, err
 		if (items[i].Type != "symbol" && items[i].Type != "industry") || items[i].Key == "" {
 			return nil, errors.New("目标配置类型或标识无效")
 		}
-		if items[i].TargetWeightPct < 0 || items[i].TargetWeightPct > 100 || items[i].MinWeightPct < 0 || items[i].MaxWeightPct > 100 || items[i].MinWeightPct > items[i].TargetWeightPct || (items[i].MaxWeightPct > 0 && items[i].TargetWeightPct > items[i].MaxWeightPct) {
+		if math.IsNaN(items[i].TargetWeightPct) || math.IsInf(items[i].TargetWeightPct, 0) ||
+			math.IsNaN(items[i].MinWeightPct) || math.IsInf(items[i].MinWeightPct, 0) ||
+			math.IsNaN(items[i].MaxWeightPct) || math.IsInf(items[i].MaxWeightPct, 0) ||
+			items[i].TargetWeightPct < 0 || items[i].TargetWeightPct > 100 || items[i].MinWeightPct < 0 ||
+			items[i].MaxWeightPct < 0 || items[i].MaxWeightPct > 100 || items[i].MinWeightPct > items[i].TargetWeightPct ||
+			(items[i].MaxWeightPct > 0 && (items[i].MinWeightPct > items[i].MaxWeightPct || items[i].TargetWeightPct > items[i].MaxWeightPct)) {
 			return nil, errors.New("目标权重或上下限无效")
 		}
 		key := items[i].Type + ":" + items[i].Key
@@ -627,8 +687,14 @@ func (s *PortfolioRiskService) SaveTargets(userID, accountID int64, items []Targ
 	b, _ := json.Marshal(items)
 	row := model.TargetAllocationRevision{UserID: userID, AccountID: accountID, ItemsJSON: string(b), ContentHash: stableHash(items)}
 	err = common.DB.Transaction(func(tx *gorm.DB) error {
+		// revision 通过账户行锁串行化；首个 revision 没有可锁的历史行，
+		// 锁账户本身可避免两个空账户同时生成 revision=1。
+		var account model.PortfolioAccount
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ?", accountID, userID).First(&account).Error; err != nil {
+			return err
+		}
 		var latest model.TargetAllocationRevision
-		e := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("user_id = ? AND account_id = ?", userID, accountID).Order("revision DESC").First(&latest).Error
+		e := tx.Where("user_id = ? AND account_id = ?", userID, accountID).Order("revision DESC").First(&latest).Error
 		if e != nil && !errors.Is(e, gorm.ErrRecordNotFound) {
 			return e
 		}
@@ -754,9 +820,12 @@ func ValidatePortfolioRiskAsOf(asOf string) error {
 	if asOf == "" {
 		return nil
 	}
-	d, err := time.Parse("2006-01-02", asOf)
+	d, err := time.ParseInLocation("2006-01-02", asOf, time.Local)
 	if err != nil || d.Format("2006-01-02") != asOf {
 		return fmt.Errorf("as_of 格式应为 YYYY-MM-DD")
+	}
+	if asOf > time.Now().Format("2006-01-02") {
+		return fmt.Errorf("as_of 不能晚于今天")
 	}
 	return nil
 }

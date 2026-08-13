@@ -130,7 +130,15 @@ func (pc *PortfolioController) Risk(c *gin.Context) {
 	}
 	window, _ := strconv.Atoi(c.DefaultQuery("window", "252"))
 	annualization, _ := strconv.Atoi(c.DefaultQuery("annualization", "252"))
-	riskFree, _ := strconv.ParseFloat(c.DefaultQuery("risk_free_rate_pct", "0"), 64)
+	riskFree, parseErr := strconv.ParseFloat(c.DefaultQuery("risk_free_rate_pct", "0"), 64)
+	if parseErr != nil || riskFree != riskFree || riskFree > 100 || riskFree < -100 {
+		common.ApiErrorMsg(c, "无风险利率参数无效")
+		return
+	}
+	if window < 30 || window > 730 || annualization < 1 || annualization > 1000 {
+		common.ApiErrorMsg(c, "风险窗口或年化参数无效")
+		return
+	}
 	asOf := strings.TrimSpace(c.Query("as_of"))
 	if err := service.ValidatePortfolioRiskAsOf(asOf); err != nil {
 		common.ApiErrorMsg(c, err.Error())
@@ -229,6 +237,12 @@ func (pc *PortfolioController) Targets(c *gin.Context) {
 	revision, _ := strconv.Atoi(c.Query("revision"))
 	row, items, err := service.LoadTargetRevision(currentUserID(c), id, revision)
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			if _, accountErr := service.PortfolioAccountByID(currentUserID(c), id, ""); accountErr == nil {
+				common.ApiSuccess(c, gin.H{"revision": nil, "items": []service.TargetAllocationItem{}})
+				return
+			}
+		}
 		portfolioError(c, err)
 		return
 	}

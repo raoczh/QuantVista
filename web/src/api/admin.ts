@@ -722,6 +722,7 @@ export interface PositionExitOutcomeBucket {
   horizon: number
   level: string
   primary_signal?: string
+  params_hash: string
   samples: number
   avg_forward_pct: number
   median_forward_pct: number

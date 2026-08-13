@@ -17,13 +17,14 @@ export interface StressScenario { type:'market'|'industry'|'symbol'|'plan_stop_l
 export interface StressResult { scenario:StressScenario; estimated_loss_amount:number; estimated_loss_pct:number; contributions:{symbol:string;name:string;loss_amount:number;loss_pct:number}[]; unknown:string[]; base_value:number; generated_at:string; read_only:boolean }
 export interface TargetItem { type:'symbol'|'industry'; key:string; target_weight_pct:number; min_weight_pct:number; max_weight_pct:number; enabled:boolean }
 export interface TargetRevision { id:number; account_id:number; revision:number; content_hash:string; created_at:string }
-export interface RebalanceItem { type:string; key:string; name:string; current_weight_pct:number; target_weight_pct:number; amount_change:number; quantity_change:number; estimated_fee:number; estimated_tax:number; status:string; reason?:string }
+export interface RebalanceItem { type:string; key:string; name:string; current_weight_pct:number; target_weight_pct:number; min_weight_pct:number; max_weight_pct:number; deviation_pct:number; amount_change:number; quantity_change:number; estimated_fee:number; estimated_tax:number; status:string; reason?:string }
 export interface RebalanceDraft { account_id:number; revision:number; revision_hash:string; as_of:string; total_assets:RiskMetric; items:RebalanceItem[]; read_only:boolean; note:string }
 
 export const listPortfolios=()=>request<PortfolioAccount[]>({url:'/portfolios'})
 export const createPortfolio=(data:{name:string;kind:PortfolioKind;currency:string})=>request<PortfolioAccount>({url:'/portfolios',method:'post',data})
 export const updatePortfolio=(id:number,name:string)=>request<PortfolioAccount>({url:`/portfolios/${id}`,method:'put',data:{name}})
 export const archivePortfolio=(id:number)=>request<PortfolioAccount>({url:`/portfolios/${id}/archive`,method:'post'})
+export const deletePortfolio=(id:number)=>request<void>({url:`/portfolios/${id}`,method:'delete'})
 export const setDefaultPortfolio=(id:number)=>request<PortfolioAccount>({url:`/portfolios/${id}/default`,method:'post'})
 export const getPortfolioOverview=(id:number)=>request<PortfolioOverview>({url:`/portfolios/${id}/overview`})
 export const getPortfolioRisk=(id:number,params:Record<string,unknown>)=>request<PortfolioRisk>({url:`/portfolios/${id}/risk`,params})
@@ -31,6 +32,6 @@ export const listCashFlows=(id:number)=>request<CashFlow[]>({url:`/portfolios/${
 export const addCashFlow=(id:number,data:{type:string;amount:number;trade_date:string;note:string;idempotency_key:string})=>request<CashFlow>({url:`/portfolios/${id}/cash-flows`,method:'post',data})
 export const reverseCashFlow=(id:number,flowId:number,data:{idempotency_key:string;note:string})=>request<CashFlow>({url:`/portfolios/${id}/cash-flows/${flowId}/reverse`,method:'post',data})
 export const runStress=(id:number,data:StressScenario)=>request<StressResult>({url:`/portfolios/${id}/stress-tests`,method:'post',data})
-export const getTargets=(id:number,revision?:number)=>request<{revision:TargetRevision;items:TargetItem[]}>({url:`/portfolios/${id}/targets`,params:{revision}})
+export const getTargets=(id:number,revision?:number)=>request<{revision:TargetRevision|null;items:TargetItem[]}>({url:`/portfolios/${id}/targets`,params:{revision}})
 export const saveTargets=(id:number,items:TargetItem[])=>request<TargetRevision>({url:`/portfolios/${id}/targets`,method:'post',data:{items}})
 export const getRebalance=(id:number,revision?:number)=>request<RebalanceDraft>({url:`/portfolios/${id}/rebalance`,params:{revision}})

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"quantvista/common"
 	"quantvista/model"
 )
 
@@ -74,6 +75,21 @@ func TestCashFlowBetweenSnapshotsUsesNextInterval(t *testing.T) {
 	}
 }
 
+func TestMaxDrawdownRemovesExternalCashFlowFromCurve(t *testing.T) {
+	points := []EquityPoint{
+		{TradeDate: "d1", Assets: 100},
+		{TradeDate: "d2", Assets: 200, CashFlow: 100},
+		{TradeDate: "d3", Assets: 180},
+	}
+	dd, curve := MaxDrawdown(points)
+	if dd.Metric.Status != RiskStatusAvailable || !closeEnough(dd.Metric.Value, -10, 1e-9) {
+		t.Fatalf("入金不应制造假峰值/回撤: %+v", dd)
+	}
+	if curve[1].DrawdownPct == nil || !closeEnough(*curve[1].DrawdownPct, 0, 1e-9) || curve[2].DrawdownPct == nil || !closeEnough(*curve[2].DrawdownPct, -10, 1e-9) {
+		t.Fatalf("资金流调整曲线错误: %+v", curve)
+	}
+}
+
 func TestRiskContributions(t *testing.T) {
 	series := map[string]map[string]float64{
 		"A": {"d1": 0.01, "d2": 0.02, "d3": -0.01},
@@ -139,6 +155,11 @@ func TestCorrelationStressAndRebalance(t *testing.T) {
 	if sell[0].QuantityChange != -200 || sell[0].EstimatedFee <= 0 || sell[0].EstimatedTax <= 0 {
 		t.Fatalf("卖出费用与税费估算错误: %+v", sell)
 	}
+	band := BuildRebalanceDraft([]RebalanceHolding{{Symbol: "600006", Market: "cn", Value: 10000, Quantity: 1000, Price: 10, Fresh: true}},
+		[]TargetAllocationItem{{Type: "symbol", Key: "600006", TargetWeightPct: 40, MinWeightPct: 40, MaxWeightPct: 60, Enabled: true}}, 20000)
+	if len(band) != 1 || band[0].AmountChange != 0 || band[0].Reason == "" {
+		t.Fatalf("目标上下限内不应生成交易缺口: %+v", band)
+	}
 }
 
 func TestStressInputRequiresTarget(t *testing.T) {
@@ -154,5 +175,40 @@ func TestStressInputRequiresTarget(t *testing.T) {
 	}
 	if _, err := risk.Stress(t.Context(), 406, account.ID, StressScenario{Type: "symbol", ShockPct: -10}); err == nil {
 		t.Fatal("单票场景缺代码必须拒绝")
+	}
+}
+
+func TestValidatePortfolioRiskAsOfRejectsFutureDate(t *testing.T) {
+	future := time.Now().AddDate(0, 0, 1).Format("2006-01-02")
+	if err := ValidatePortfolioRiskAsOf(future); err == nil {
+		t.Fatal("未来 as_of 必须拒绝")
+	}
+}
+
+func TestHistoricalRiskDoesNotUseCurrentHoldings(t *testing.T) {
+	setupTestDB(t)
+	cleanPortfolioAccountTables(t)
+	account, err := NewPortfolioAccountService().Create(408, PortfolioAccountInput{Name: "历史风险", Kind: model.PortfolioKindPaper, Currency: "CNY"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, snap := range []model.PortfolioSnapshot{
+		{UserID: 408, AccountID: account.ID, Kind: model.PortfolioKindPaper, TradeDate: "2026-01-02", Cash: 10000},
+		{UserID: 408, AccountID: account.ID, Kind: model.PortfolioKindPaper, TradeDate: "2026-01-05", Cash: 10100},
+	} {
+		if err := common.DB.Create(&snap).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	risk := NewPortfolioRiskService(&MarketService{}, NewPositionService(&MarketService{}))
+	out, err := risk.Risk(t.Context(), 408, account.ID, NewPortfolioRiskParameters(30, 252, 0, "", "2026-01-05"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.TWR.Status != RiskStatusAvailable || out.RiskContribution.PredictedVolatility.Status != RiskStatusUnavailable || out.Exposure != nil {
+		t.Fatalf("历史收益可复现，但逐标的风险必须 fail-closed: %+v", out)
+	}
+	if len(out.UnknownReasons) == 0 {
+		t.Fatal("历史逐标的风险不可用必须返回原因")
 	}
 }

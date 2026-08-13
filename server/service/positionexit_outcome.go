@@ -38,7 +38,18 @@ func BackfillPositionExitOutcomes(ctx context.Context) (int, error) {
 		Where("session = ? AND market = ?", model.PositionExitSessionClose, "cn").
 		Where("NOT EXISTS (SELECT 1 FROM position_exit_outcomes o WHERE o.assessment_id = position_exit_assessments.id AND o.horizon = ?)",
 			exitOutcomeHorizonLong).
-		Order("id ASC").Limit(exitOutcomeBatchLimit).Find(&rows).Error; err != nil {
+		Where(`EXISTS (
+			SELECT 1 FROM daily_bars anchor
+			WHERE anchor.market = position_exit_assessments.market AND anchor.symbol = position_exit_assessments.symbol
+			AND anchor.trade_date <= position_exit_assessments.trade_date AND anchor.close > 0
+		)`).
+		Where(`(
+			NOT EXISTS (SELECT 1 FROM position_exit_outcomes short WHERE short.assessment_id = position_exit_assessments.id AND short.horizon = ?)
+			AND (SELECT COUNT(*) FROM daily_bars future WHERE future.market = position_exit_assessments.market AND future.symbol = position_exit_assessments.symbol AND future.trade_date > position_exit_assessments.trade_date AND future.close > 0) >= ?
+		) OR (
+			SELECT COUNT(*) FROM daily_bars future WHERE future.market = position_exit_assessments.market AND future.symbol = position_exit_assessments.symbol AND future.trade_date > position_exit_assessments.trade_date AND future.close > 0
+		) >= ?`, exitOutcomeHorizonShort, exitOutcomeHorizonShort, exitOutcomeHorizonLong).
+		Order("trade_date ASC, id ASC").Limit(exitOutcomeBatchLimit).Find(&rows).Error; err != nil {
 		return 0, err
 	}
 	if len(rows) == 0 {
@@ -58,7 +69,11 @@ func BackfillPositionExitOutcomes(ctx context.Context) (int, error) {
 	}
 	var bars []model.DailyBar
 	if err := common.DB.WithContext(ctx).
-		Where("market = ? AND symbol IN ? AND trade_date >= ?", "cn", symbols, minDate).
+		Where("market = ? AND symbol IN ?", "cn", symbols).
+		Where(`trade_date >= ? OR trade_date = (
+			SELECT MAX(anchor.trade_date) FROM daily_bars anchor
+			WHERE anchor.market = daily_bars.market AND anchor.symbol = daily_bars.symbol AND anchor.trade_date < ?
+		)`, minDate, minDate).
 		Order("symbol ASC, trade_date ASC").Find(&bars).Error; err != nil {
 		return 0, err
 	}
@@ -137,6 +152,7 @@ type PositionExitOutcomeBucket struct {
 	Horizon          int     `json:"horizon"`
 	Level            string  `json:"level"`
 	PrimarySignal    string  `json:"primary_signal,omitempty"`
+	ParamsHash       string  `json:"params_hash"`
 	Samples          int     `json:"samples"`
 	AvgForwardPct    float64 `json:"avg_forward_pct"`
 	MedianForwardPct float64 `json:"median_forward_pct"`
@@ -170,8 +186,8 @@ func PositionExitOutcomeReport() (*PositionExitOutcomeReportView, error) {
 		maeSum   float64
 		down     int
 	}
-	levelAcc := map[[2]string]*acc{}
-	signalAcc := map[[3]string]*acc{}
+	levelAcc := map[[3]string]*acc{}
+	signalAcc := map[[4]string]*acc{}
 	horizonKey := func(h int) string {
 		if h == exitOutcomeHorizonShort {
 			return "5"
@@ -179,11 +195,11 @@ func PositionExitOutcomeReport() (*PositionExitOutcomeReportView, error) {
 		return "10"
 	}
 	for _, row := range rows {
-		lk := [2]string{horizonKey(row.Horizon), row.Level}
+		lk := [3]string{horizonKey(row.Horizon), row.ParamsHash, row.Level}
 		if levelAcc[lk] == nil {
 			levelAcc[lk] = &acc{}
 		}
-		sk := [3]string{horizonKey(row.Horizon), row.Level, row.PrimarySignal}
+		sk := [4]string{horizonKey(row.Horizon), row.ParamsHash, row.Level, row.PrimarySignal}
 		if signalAcc[sk] == nil {
 			signalAcc[sk] = &acc{}
 		}
@@ -195,7 +211,7 @@ func PositionExitOutcomeReport() (*PositionExitOutcomeReportView, error) {
 			}
 		}
 	}
-	build := func(horizon int, level, signal string, a *acc) PositionExitOutcomeBucket {
+	build := func(horizon int, paramsHash, level, signal string, a *acc) PositionExitOutcomeBucket {
 		n := len(a.forwards)
 		sum := 0.0
 		for _, v := range a.forwards {
@@ -211,7 +227,7 @@ func PositionExitOutcomeReport() (*PositionExitOutcomeReportView, error) {
 				median = (sorted[n/2-1] + sorted[n/2]) / 2
 			}
 		}
-		b := PositionExitOutcomeBucket{Horizon: horizon, Level: level, PrimarySignal: signal, Samples: n,
+		b := PositionExitOutcomeBucket{Horizon: horizon, Level: level, PrimarySignal: signal, ParamsHash: paramsHash, Samples: n,
 			Evaluated: n >= exitOutcomeMinSamples}
 		if n > 0 {
 			b.AvgForwardPct = round2(sum / float64(n))
@@ -232,18 +248,22 @@ func PositionExitOutcomeReport() (*PositionExitOutcomeReportView, error) {
 		MinSamples: exitOutcomeMinSamples,
 		Notes: []string{
 			"研究口径：Base 与前向收盘同源于当前前复权日线序列，不代表真实可成交价；normal 级为对照分母",
+			"不同 params_hash 独立聚合，禁止把不同参数版本的样本混为同一组",
 			"样本不足分组标记未评估；在样本达标前不得据此调整 pea1 阈值",
 		},
 	}
 	for key, a := range levelAcc {
-		rep.Levels = append(rep.Levels, build(parseHorizon(key[0]), key[1], "", a))
+		rep.Levels = append(rep.Levels, build(parseHorizon(key[0]), key[1], key[2], "", a))
 	}
 	for key, a := range signalAcc {
-		rep.Signals = append(rep.Signals, build(parseHorizon(key[0]), key[1], key[2], a))
+		rep.Signals = append(rep.Signals, build(parseHorizon(key[0]), key[1], key[2], key[3], a))
 	}
 	sort.Slice(rep.Levels, func(i, j int) bool {
 		if rep.Levels[i].Horizon != rep.Levels[j].Horizon {
 			return rep.Levels[i].Horizon < rep.Levels[j].Horizon
+		}
+		if rep.Levels[i].ParamsHash != rep.Levels[j].ParamsHash {
+			return rep.Levels[i].ParamsHash < rep.Levels[j].ParamsHash
 		}
 		return positionExitRank(rep.Levels[i].Level) > positionExitRank(rep.Levels[j].Level)
 	})
@@ -251,6 +271,9 @@ func PositionExitOutcomeReport() (*PositionExitOutcomeReportView, error) {
 		a, b := rep.Signals[i], rep.Signals[j]
 		if a.Horizon != b.Horizon {
 			return a.Horizon < b.Horizon
+		}
+		if a.ParamsHash != b.ParamsHash {
+			return a.ParamsHash < b.ParamsHash
 		}
 		if a.Level != b.Level {
 			return positionExitRank(a.Level) > positionExitRank(b.Level)

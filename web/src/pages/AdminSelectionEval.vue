@@ -48,6 +48,7 @@ const EXIT_LEVEL_LABEL: Record<string, string> = {
 }
 const exitOutcomeColumns = computed<DataTableColumns<PositionExitOutcomeBucket>>(() => [
   { title: '窗口', key: 'horizon', width: 64, render: (r) => `${r.horizon}日` },
+  { title: '参数版本', key: 'params_hash', width: 112, ellipsis: { tooltip: true }, render: (r) => r.params_hash || '旧版未记录' },
   { title: '等级', key: 'level', width: 110, render: (r) => EXIT_LEVEL_LABEL[r.level] || r.level },
   { title: '主信号', key: 'primary_signal', render: (r) => r.primary_signal || '—' },
   { title: '样本', key: 'samples', width: 64 },

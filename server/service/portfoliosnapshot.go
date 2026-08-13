@@ -320,8 +320,10 @@ func snapshotAccounts() (real, paper []model.PortfolioAccount, err error) {
 			return nil, nil, e
 		}
 	}
-	if err = common.DB.Where("kind = ? AND status = ? AND id IN (?)", model.PortfolioKindReal, model.PortfolioStatusActive,
-		common.DB.Model(&model.Position{}).Select("DISTINCT account_id").Where("account_id > 0")).Find(&real).Error; err != nil {
+	positionAccounts := common.DB.Model(&model.Position{}).Select("DISTINCT account_id").Where("account_id > 0")
+	cashFlowAccounts := common.DB.Model(&model.PortfolioCashFlow{}).Select("DISTINCT account_id").Where("account_id > 0")
+	if err = common.DB.Where("kind = ? AND status = ? AND (id IN (?) OR id IN (?))", model.PortfolioKindReal, model.PortfolioStatusActive,
+		positionAccounts, cashFlowAccounts).Find(&real).Error; err != nil {
 		return
 	}
 	err = common.DB.Where("kind = ? AND status = ? AND id IN (?)", model.PortfolioKindPaper, model.PortfolioStatusActive,

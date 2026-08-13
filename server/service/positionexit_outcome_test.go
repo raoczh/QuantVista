@@ -92,3 +92,83 @@ func TestPositionExitOutcomeBackfillMaturityIdempotencyAndReport(t *testing.T) {
 		t.Fatal("signal 层缺少 atr14_break 分组")
 	}
 }
+
+func TestPositionExitOutcomeBackfillSkipsImmatureBatchAndUsesSuspensionAnchor(t *testing.T) {
+	setupTestDB(t)
+	for _, table := range []string{"position_exit_outcomes", "position_exit_assessments", "daily_bars"} {
+		if err := common.DB.Exec("DELETE FROM " + table).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, table := range []string{"position_exit_outcomes", "position_exit_assessments", "daily_bars"} {
+			_ = common.DB.Exec("DELETE FROM " + table).Error
+		}
+	})
+
+	blocked := make([]model.PositionExitAssessment, exitOutcomeBatchLimit)
+	for i := range blocked {
+		blocked[i] = model.PositionExitAssessment{
+			UserID: 2, PositionID: int64(2000 + i), Symbol: "NO_BARS", Market: "cn",
+			TradeDate: "2044-01-01", Session: model.PositionExitSessionClose, EvaluatedAt: time.Now(),
+			Level: model.PositionExitLevelNormal, PrimarySignal: "normal", ParamsHash: "ph1",
+			DataStatus: model.PositionExitDataReady, EventKey: "blocked-" + time.Unix(int64(i), 0).Format("150405.000000000"), Version: model.PositionExitAssessmentVersion,
+		}
+	}
+	if err := common.DB.CreateInBatches(&blocked, 100).Error; err != nil {
+		t.Fatal(err)
+	}
+	dates := []string{"2044-05-31", "2044-06-03", "2044-06-04", "2044-06-05", "2044-06-06", "2044-06-07", "2044-06-10", "2044-06-11", "2044-06-12", "2044-06-13", "2044-06-14"}
+	for i, date := range dates {
+		price := 20 + float64(i)
+		if err := common.DB.Create(&model.DailyBar{Symbol: "600901", Market: "cn", TradeDate: date, Open: price, High: price, Low: price, Close: price}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	mature := model.PositionExitAssessment{
+		UserID: 2, PositionID: 9999, Symbol: "600901", Market: "cn",
+		TradeDate: "2044-06-01", Session: model.PositionExitSessionClose, EvaluatedAt: time.Now(),
+		Level: model.PositionExitLevelReview, PrimarySignal: "ma20_break", ParamsHash: "ph2",
+		DataStatus: model.PositionExitDataReady, EventKey: "mature-after-blocked", Version: model.PositionExitAssessmentVersion,
+	}
+	if err := common.DB.Create(&mature).Error; err != nil {
+		t.Fatal(err)
+	}
+	created, err := BackfillPositionExitOutcomes(context.Background())
+	if err != nil || created != 2 {
+		t.Fatalf("未成熟批次不得阻塞成熟记录: created=%d err=%v", created, err)
+	}
+	var h5 model.PositionExitOutcome
+	if err := common.DB.Where("assessment_id = ? AND horizon = ?", mature.ID, 5).First(&h5).Error; err != nil {
+		t.Fatal(err)
+	}
+	if h5.BasePrice != 20 || h5.ForwardReturnPct != 25 {
+		t.Fatalf("停牌评估应使用 T 日前最近收盘为同源锚点: %+v", h5)
+	}
+}
+
+func TestPositionExitOutcomeReportSeparatesParameterHashes(t *testing.T) {
+	setupTestDB(t)
+	if err := common.DB.Exec("DELETE FROM position_exit_outcomes").Error; err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = common.DB.Exec("DELETE FROM position_exit_outcomes").Error })
+	rows := []model.PositionExitOutcome{
+		{AssessmentID: 10001, Horizon: 5, UserID: 1, PositionID: 1, Symbol: "600001", Market: "cn", TradeDate: "2044-01-01", Level: model.PositionExitLevelReview, PrimarySignal: "ma20_break", ParamsHash: "ph1", ForwardReturnPct: -2},
+		{AssessmentID: 10002, Horizon: 5, UserID: 1, PositionID: 2, Symbol: "600002", Market: "cn", TradeDate: "2044-01-01", Level: model.PositionExitLevelReview, PrimarySignal: "ma20_break", ParamsHash: "ph2", ForwardReturnPct: 4},
+	}
+	if err := common.DB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	rep, err := PositionExitOutcomeReport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]float64{}
+	for _, bucket := range rep.Signals {
+		seen[bucket.ParamsHash] = bucket.AvgForwardPct
+	}
+	if seen["ph1"] != -2 || seen["ph2"] != 4 {
+		t.Fatalf("不同参数版本不得混合聚合: %+v", rep.Signals)
+	}
+}
