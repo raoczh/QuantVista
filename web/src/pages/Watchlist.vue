@@ -44,6 +44,7 @@ import {
 } from '@/composables/useListPageState'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
 import FreshnessTag from '@/components/FreshnessTag.vue'
 import DataImportWizard from '@/components/DataImportWizard.vue'
@@ -560,8 +561,7 @@ onMounted(async () => {
                     <n-tag v-if="it.is_pinned" size="tiny" type="warning" round :bordered="false"
                       >重点</n-tag
                     >
-                    <span class="it-title">{{ it.name || it.symbol }}</span>
-                    <span class="it-symbol qv-mono">{{ it.symbol }}</span>
+                    <StockIdentity :symbol="it.symbol" :market="it.market" :name="it.name" density="table" />
                     <n-popselect
                       :value="it.research_stage"
                       :options="stageOptions"
@@ -705,8 +705,7 @@ onMounted(async () => {
           <div v-for="m in missedRows" :key="m.id" class="missed-row">
             <div class="missed-main">
               <div class="missed-name">
-                <span class="it-title">{{ m.name || m.symbol }}</span>
-                <span class="it-symbol qv-mono">{{ m.symbol }}</span>
+                <StockIdentity :symbol="m.symbol" :market="m.market" :name="m.name" density="table" clickable actions />
                 <n-tag size="tiny" :type="verdictMeta[m.verdict]?.type" round :bordered="false">
                   {{ verdictMeta[m.verdict]?.label }}
                 </n-tag>

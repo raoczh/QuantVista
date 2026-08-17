@@ -22,6 +22,7 @@ import {
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -181,8 +182,7 @@ const columns = computed<DataTableColumns<BoardStock>>(() => [
       if (row.is_leader) tags.push(h(NTag, { size: 'tiny', type: 'error', bordered: false, round: true }, () => '龙头'))
       if (row.is_top_gainer) tags.push(h(NTag, { size: 'tiny', type: 'warning', bordered: false, round: true }, () => '领涨'))
       return h('div', { class: 'cell-name' }, [
-        h('span', { class: 'cn-title' }, row.name),
-        h('span', { class: 'cn-symbol qv-mono' }, row.symbol),
+        h(StockIdentity, { symbol: row.symbol, market: 'cn', name: row.name, density: 'table', clickable: true }),
         ...tags,
       ])
     },

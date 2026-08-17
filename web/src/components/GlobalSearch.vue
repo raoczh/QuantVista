@@ -11,6 +11,8 @@ import {
 import { useAuthStore } from '@/stores/auth'
 import { useUi } from '@/composables/useUi'
 import StockActionMenu from './StockActionMenu.vue'
+import StockIdentity from './StockIdentity.vue'
+import AIQuickActions from './AIQuickActions.vue'
 
 const props = defineProps<{ show: boolean }>()
 const emit = defineEmits<{ (e: 'update:show', value: boolean): void }>()
@@ -201,10 +203,6 @@ function optionID(stock: DisplayStock) {
   return `gs-stock-${stock.market}-${stock.symbol}`.replace(/[^a-zA-Z0-9_-]/g, '-')
 }
 
-function marketLabel(market: string) {
-  return ({ cn: 'A 股', hk: '港股', us: '美股' } as Record<string, string>)[market.toLowerCase()] || market.toUpperCase()
-}
-
 function visitTime(value: string) {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return ''
@@ -281,14 +279,10 @@ onUnmounted(() => {
               @click="openStock(stock)"
             >
               <div class="gs-result-main">
-                <div class="gs-primary-line">
-                  <span class="gs-name" :title="stock.name">{{ stock.name }}</span>
-                  <span class="gs-symbol qv-mono">{{ stock.symbol }}</span>
-                </div>
+                <StockIdentity :symbol="stock.symbol" :market="stock.market" :name="stock.name" />
                 <div class="gs-meta-line">
-                  <span>{{ marketLabel(stock.market) }}</span>
                   <span v-if="stock.industry" class="gs-industry" :title="stock.industry">{{ stock.industry }}</span>
-                  <span>{{ stock.as_of ? `截至 ${stock.as_of}` : '数据日期未知' }}</span>
+                  <span>{{ stock.as_of ? `数据截止时间 ${stock.as_of}` : '数据截止时间暂时无法判断' }}</span>
                 </div>
                 <div v-if="stock.in_watchlist || stock.has_position" class="gs-relations">
                   <n-tag v-if="stock.in_watchlist" size="small" :bordered="false">自选</n-tag>
@@ -306,13 +300,15 @@ onUnmounted(() => {
           </div>
         </template>
 
-        <n-empty
-          v-else-if="normalizedKeyword"
-          class="gs-empty"
-          description="没有找到相关股票"
-        />
+        <template v-else-if="normalizedKeyword">
+          <n-empty class="gs-empty" description="没有找到相关股票" />
+          <div class="gs-section-head"><span>AI 快捷操作</span></div>
+          <AIQuickActions class="gs-ai-actions" @navigated="close" />
+        </template>
 
         <template v-else>
+          <div class="gs-section-head"><span>AI 快捷操作</span></div>
+          <AIQuickActions class="gs-ai-actions" @navigated="close" />
           <div class="gs-section-head">
             <span>最近访问</span>
             <n-button v-if="recentStocks.length" size="tiny" quaternary @click="clearHistory">清空</n-button>
@@ -330,12 +326,8 @@ onUnmounted(() => {
               @click="openStock(stock)"
             >
               <div class="gs-result-main">
-                <div class="gs-primary-line">
-                  <span class="gs-name" :title="stock.name">{{ stock.name }}</span>
-                  <span class="gs-symbol qv-mono">{{ stock.symbol }}</span>
-                </div>
+                <StockIdentity :symbol="stock.symbol" :market="stock.market" :name="stock.name" />
                 <div class="gs-meta-line">
-                  <span>{{ marketLabel(stock.market) }}</span>
                   <span>最近于 {{ visitTime(stock.lastVisitedAt) }}</span>
                 </div>
               </div>
@@ -398,6 +390,10 @@ onUnmounted(() => {
   font-size: 12px;
   font-weight: 600;
   color: var(--gs-muted);
+}
+.gs-ai-actions {
+  display: block;
+  margin: 0 4px 12px;
 }
 .gs-count {
   font-variant-numeric: tabular-nums;

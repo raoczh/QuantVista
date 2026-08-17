@@ -38,6 +38,7 @@ import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import StatCard from '@/components/StatCard.vue'
 import FreshnessTag from '@/components/FreshnessTag.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
 
 const message = useMessage()
 const { pctColor, vars, isDark } = useUi()
@@ -409,8 +410,7 @@ onBeforeUnmount(() => {
               <div v-for="h in overview.holdings" :key="h.id" class="hold">
                 <div class="hold-main">
                   <div class="hold-title">
-                    <span class="hold-name">{{ h.name || h.symbol }}</span>
-                    <span class="hold-symbol qv-mono">{{ h.symbol }}</span>
+                    <StockIdentity :symbol="h.symbol" market="cn" :name="h.name" density="table" clickable actions />
                     <n-tag v-if="isEtfSymbol(h.symbol)" size="tiny" round :bordered="false" type="info">ETF</n-tag>
                     <FreshnessTag :status="h.freshness_status" :as-of="h.quote_as_of" :reason="h.stale_reason" />
                   </div>
@@ -443,7 +443,7 @@ onBeforeUnmount(() => {
             <n-tag size="tiny" round :bordered="false" :type="tradeSideType(t.side)">{{
               tradeSideLabel(t.side)
             }}</n-tag>
-            <span class="tr-name">{{ t.name || t.symbol }}</span>
+            <StockIdentity :symbol="t.symbol" market="cn" :name="t.name" density="table" clickable />
             <n-tag v-if="isEtfSymbol(t.symbol)" size="tiny" round :bordered="false" type="info">ETF</n-tag>
             <span v-if="t.side === 'adjust'" class="tr-detail">
               {{ t.quantity ? `数量调整 ${t.quantity > 0 ? '+' : ''}${t.quantity} 股` : '除权除息成本折算' }}

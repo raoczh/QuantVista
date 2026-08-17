@@ -31,12 +31,14 @@ import { useUi, withAlpha } from '@/composables/useUi'
 import { useAuthStore } from '@/stores/auth'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import { useDisplayMode } from '@/composables/useDisplayMode'
 
 const router = useRouter()
 const route = useRoute()
 const authStore = useAuthStore()
 const { isAdmin } = storeToRefs(authStore)
 const { vars } = useUi()
+const { label } = useDisplayMode()
 
 const tasks = ref<TaskCenterItem[]>([])
 const runtimeMetrics = ref<JobRuntimeMetrics | null>(null)
@@ -365,7 +367,7 @@ function openTask(task: TaskCenterItem) {
                   <th>任务</th>
                   <th>状态 / 阶段</th>
                   <th>模型</th>
-                  <th class="num-cell">Token</th>
+                  <th class="num-cell">{{ label('AI 用量', 'Token') }}</th>
                   <th class="num-cell">耗时</th>
                   <th>业务计数</th>
                   <th>状态说明</th>
@@ -486,7 +488,7 @@ function openTask(task: TaskCenterItem) {
                   <dd>{{ providerModel(task) }}</dd>
                 </div>
                 <div>
-                  <dt>Token</dt>
+                  <dt>{{ label('AI 用量', 'Token') }}</dt>
                   <dd class="qv-tnum">{{ task.total_tokens ? task.total_tokens.toLocaleString() : '-' }}</dd>
                 </div>
                 <div v-if="task.total > 0">

@@ -66,6 +66,7 @@ import { useStockActions } from '@/composables/useStockActions'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
 
 const message = useMessage()
 const router = useRouter()
@@ -1056,8 +1057,7 @@ async function removeCustom(id: number) {
             <thead>
               <tr>
                 <th class="select-col">选择</th>
-                <th>代码</th>
-                <th>名称</th>
+                <th colspan="2">股票</th>
                 <th class="num">现价</th>
                 <th class="num">涨跌</th>
                 <th class="num">成交额(亿)</th>
@@ -1076,12 +1076,7 @@ async function removeCustom(id: number) {
                     @update:checked="(checked) => toggleResultSymbol(h.symbol, checked)"
                   />
                 </td>
-                <td class="qv-tnum">{{ h.symbol }}</td>
-                <td>
-                  <a class="stock-link" @click="actions.goDetail({ symbol: h.symbol, market: 'cn', name: h.name })">{{
-                    h.name || h.symbol
-                  }}</a>
-                </td>
+                <td colspan="2"><StockIdentity :symbol="h.symbol" market="cn" :name="h.name" density="table" clickable actions /></td>
                 <td class="num qv-tnum">{{ h.price.toFixed(2) }}</td>
                 <td class="num"><ChangeTag :value="h.chg_pct" size="small" /></td>
                 <td class="num qv-tnum">{{ h.amount_yi.toFixed(2) }}</td>
@@ -1956,7 +1951,7 @@ async function removeCustom(id: number) {
   margin-bottom: 14px;
   padding: 10px 12px;
   border: 1px dashed var(--qv-divider);
-  border-radius: 10px;
+  border-radius: 8px;
 }
 .ai-input-row {
   display: flex;

@@ -80,12 +80,16 @@ import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
 import InvestmentPreferenceGuide from '@/components/InvestmentPreferenceGuide.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
+import TermHelp from '@/components/TermHelp.vue'
+import { useDisplayMode } from '@/composables/useDisplayMode'
 
 const message = useMessage()
 const route = useRoute()
 const router = useRouter()
 const { upColor, downColor, flatColor, vars, withAlpha } = useUi()
 const { llmLabel } = useLlmLabel()
+const { isPlain } = useDisplayMode()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const filterQueryFields: Array<[string, keyof RecFilters]> = [
@@ -525,14 +529,6 @@ function buildPosition(item: RecommendationItem) {
       rec_id: String(item.id),
       quantity: quantity >= 100 ? String(quantity) : undefined,
     },
-  })
-}
-
-// 当前页进入个股详情，浏览器返回时由 URL + history 条目恢复本批结果与滚动位置。
-function openStockDetail(item: RecommendationItem) {
-  router.push({
-    name: 'stock-detail',
-    params: { market: item.market || 'cn', symbol: item.symbol },
   })
 }
 
@@ -1246,8 +1242,7 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
                     <n-tag size="tiny" round :bordered="false" :type="it.priority === 1 ? 'error' : 'default'">{{
                       it.priority === 1 ? '止损' : '复盘'
                     }}</n-tag>
-                    <span class="review-name">{{ it.name || it.symbol }}</span>
-                    <span class="review-symbol qv-mono">{{ it.symbol }}</span>
+                    <StockIdentity :symbol="it.symbol" :market="it.market || 'cn'" :name="it.name" density="table" clickable />
                   </div>
                   <div class="review-sub">{{ it.title }} · {{ it.detail }}</div>
                 </div>
@@ -1306,7 +1301,7 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
 
         <SectionCard v-if="performance && performance.sample > 0">
           <n-collapse>
-            <n-collapse-item :title="`历史统计（样本 n=${performance.sample}）`" name="performance">
+            <n-collapse-item :title="`${isPlain ? '历史表现' : '历史统计'}（样本 n=${performance.sample}）`" name="performance">
               <div class="perf">
             <!-- S0-4 买入成熟口径（主指标）：只统计 action=buy 且已成熟（止盈/止损/过期）的样本，
                  watch 与未成熟不再混入分母虚增胜率。 -->
@@ -1524,10 +1519,7 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
                   <!-- 头 -->
                   <div class="card-head">
                     <div class="card-title">
-                      <span class="ct-name ct-link" title="打开个股详情" @click="openStockDetail(it)">{{
-                        it.name || it.symbol
-                      }}</span>
-                      <span class="ct-symbol qv-mono ct-link" @click="openStockDetail(it)">{{ it.symbol }}</span>
+                      <StockIdentity :symbol="it.symbol" :market="it.market" :name="it.name" clickable actions />
                       <n-tag v-if="it.detail?.degraded_source" size="tiny" type="warning" :bordered="false" round
                         >量化降级</n-tag
                       >
@@ -1866,8 +1858,7 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
                         <tr v-for="c in poolRanked" :key="c.symbol">
                           <td class="qv-tnum">{{ c.rank || '—' }}</td>
                           <td>
-                            <span class="pool-name">{{ c.name || c.symbol }}</span>
-                            <span class="pool-symbol qv-mono">{{ c.symbol }}</span>
+                            <StockIdentity :symbol="c.symbol" :market="c.market || 'cn'" :name="c.name" density="table" clickable />
                           </td>
                           <td class="qv-tnum">{{ c.price.toFixed(2) }}</td>
                           <td class="qv-tnum" :style="{ color: pctColorOf(c.change_pct) }">{{ signedPct(c.change_pct) }}</td>
@@ -1886,8 +1877,7 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
                         <tr v-for="c in poolExcluded" :key="'x-' + c.symbol" class="pool-excluded">
                           <td>—</td>
                           <td>
-                            <span class="pool-name">{{ c.name || c.symbol }}</span>
-                            <span class="pool-symbol qv-mono">{{ c.symbol }}</span>
+                            <StockIdentity :symbol="c.symbol" :market="c.market || 'cn'" :name="c.name" density="table" clickable />
                           </td>
                           <td class="qv-tnum">{{ c.price.toFixed(2) }}</td>
                           <td class="qv-tnum">{{ signedPct(c.change_pct) }}</td>
@@ -1913,7 +1903,7 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
               <n-collapse v-if="rejectedList.length" v-model:value="resultSections" class="rejected">
                 <n-collapse-item :title="`为什么没选它（${rejectedList.length}）`" name="rejected">
                   <div v-for="(r, i) in rejectedList" :key="i" class="rej-row">
-                    <span class="rej-name">{{ r.name || r.symbol }}<span class="rej-symbol qv-mono"> {{ r.symbol }}</span></span>
+                    <StockIdentity :symbol="r.symbol" market="cn" :name="r.name" density="table" clickable />
                     <span class="rej-reason">{{ r.reason }}</span>
                   </div>
                 </n-collapse-item>
@@ -2170,7 +2160,7 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
             <span>可执行观测 <b class="qv-tnum">{{ dailyAudit.outcome.samples }}</b></span>
             <span>结果日 <b class="qv-tnum">{{ dailyAudit.outcome.outcome_days }}</b></span>
             <span>平均净收益 <b class="qv-tnum" :style="{ color: pctColorOf(dailyAudit.outcome.avg_net_pct) }">{{ signedPct(dailyAudit.outcome.avg_net_pct) }}</b></span>
-            <span>平均 Alpha <b v-if="dailyAudit.outcome.has_alpha" class="qv-tnum" :style="{ color: pctColorOf(dailyAudit.outcome.avg_alpha_pct) }">{{ signedPct(dailyAudit.outcome.avg_alpha_pct) }}</b><b v-else>—</b></span>
+            <span><TermHelp term="alpha" /> <b v-if="dailyAudit.outcome.has_alpha" class="qv-tnum" :style="{ color: pctColorOf(dailyAudit.outcome.avg_alpha_pct) }">{{ signedPct(dailyAudit.outcome.avg_alpha_pct) }}</b><b v-else>—</b></span>
             <span>无数据 {{ dailyAudit.outcome.no_data }} · forced {{ dailyAudit.outcome.forced }} · 长期 pending {{ dailyAudit.outcome.pending }}</span>
           </div>
 
@@ -2205,12 +2195,12 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
             <div class="audit-items">
               <div v-for="item in dailyAudit.items" :key="item.id" class="audit-item">
                 <div class="audit-item-main">
-                  <span class="audit-symbol">{{ item.name || item.symbol }} <span class="qv-mono">{{ item.symbol }}</span></span>
+                  <StockIdentity :symbol="item.symbol" market="cn" :name="item.name" density="table" clickable />
                   <n-tag size="tiny" :type="item.audit_type === 'missed_leader' ? 'warning' : 'error'" :bordered="false">
                     {{ auditConclusionLabel(item.conclusion_code) }}
                   </n-tag>
                   <span class="qv-tnum" :style="{ color: pctColorOf(item.net_return_pct) }">净 {{ signedPct(item.net_return_pct) }}</span>
-                  <span class="qv-tnum">MFE {{ signedPct(item.mfe_pct) }} · MAE {{ signedPct(item.mae_pct) }}</span>
+                  <span class="qv-tnum"><TermHelp term="mfe" /> {{ signedPct(item.mfe_pct) }} · <TermHelp term="mae" /> {{ signedPct(item.mae_pct) }}</span>
                 </div>
                 <div class="audit-item-facts">
                   <span>{{ item.signal_date }} → {{ item.outcome_date }}</span>
@@ -2521,7 +2511,7 @@ const { restoreScroll } = useListPageScroll(route, 'recommendations')
 }
 .card {
   border: 1px solid var(--qv-divider);
-  border-radius: 12px;
+  border-radius: 8px;
   padding: 16px;
 }
 .card-head {

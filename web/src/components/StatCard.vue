@@ -10,18 +10,13 @@ const props = defineProps<{
   sub?: string
 }>()
 
-const { vars, isDark, pctColor, primaryAlpha } = useUi()
+const { vars, pctColor } = useUi()
 const valueColor = computed(() =>
   props.changePct === undefined ? vars.value.textColorBase : pctColor(props.changePct),
 )
-// 与 SectionCard 同一套质感语言：浅色柔和投影、深色顶部内高光。
 const styleVars = computed(() => ({
   '--stat-border': vars.value.borderColor,
   '--stat-bg': vars.value.cardColor,
-  '--stat-shadow-rest': isDark.value
-    ? 'inset 0 1px 0 rgba(255, 255, 255, 0.045)'
-    : '0 1px 2px rgba(0, 0, 0, 0.03), 0 3px 12px rgba(0, 0, 0, 0.04)',
-  '--stat-glow': primaryAlpha(0.12),
 }))
 </script>
 
@@ -39,17 +34,9 @@ const styleVars = computed(() => ({
 <style scoped>
 .stat-card {
   padding: 16px;
-  border-radius: 12px;
+  border-radius: 8px;
   border: 1px solid var(--stat-border);
   background: var(--stat-bg);
-  box-shadow: var(--stat-shadow-rest);
-  transition:
-    box-shadow 0.2s ease,
-    transform 0.2s ease;
-}
-.stat-card:hover {
-  box-shadow: var(--stat-shadow-rest), 0 6px 18px var(--stat-glow);
-  transform: translateY(-1px);
 }
 .stat-label {
   font-size: 13px;

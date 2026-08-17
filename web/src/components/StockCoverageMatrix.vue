@@ -12,7 +12,7 @@ const statusMeta: Record<StockCoverageStatus, { label: string; type: 'success' |
   missing: { label: '缺失', type: 'warning' },
   error: { label: '错误', type: 'error' },
   stale: { label: '过期', type: 'warning' },
-  unknown: { label: '未知', type: 'default' },
+  unknown: { label: '暂时无法判断', type: 'default' },
 }
 </script>
 
@@ -35,7 +35,7 @@ const statusMeta: Record<StockCoverageStatus, { label: string; type: 'success' |
           </n-tag>
         </div>
         <div class="coverage-source"><span>来源</span>{{ item.source || '—' }}</div>
-        <div class="coverage-asof qv-tnum"><span>as_of</span>{{ item.asOf || '—' }}</div>
+        <div class="coverage-asof qv-tnum"><span>数据截止时间</span>{{ item.asOf || '—' }}</div>
       </div>
     </div>
   </SectionCard>

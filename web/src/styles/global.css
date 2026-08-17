@@ -8,7 +8,7 @@
     Consolas, 'Roboto Mono', monospace;
 
   --qv-content-max: 1440px;
-  --qv-radius-card: 14px;
+  --qv-radius-card: 8px;
   --qv-radius-sm: 8px;
   --qv-gap: 16px;
 }

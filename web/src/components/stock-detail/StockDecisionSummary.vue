@@ -6,6 +6,7 @@ import ChangeTag from '@/components/ChangeTag.vue'
 import FreshnessTag from '@/components/FreshnessTag.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import { useUi } from '@/composables/useUi'
+import { useDisplayMode } from '@/composables/useDisplayMode'
 import type {
   DecisionItem,
   DecisionSummary,
@@ -33,6 +34,9 @@ const emit = defineEmits<{
 }>()
 
 const { vars, flatColor, pctColor } = useUi()
+const { label } = useDisplayMode()
+const unknownText = () => label('暂时无法判断', 'unknown（暂时无法判断）')
+const asOfText = () => label('数据截止时间', 'as_of（数据截止时间）')
 const allEvidence = computed(() => [
   ...props.summary.changes,
   ...props.summary.risks,
@@ -63,7 +67,7 @@ function money(value: number) {
           <ChangeTag :value="quote.change_pct" />
         </div>
         <div class="quote-time">
-          <span>{{ quote.source || '行情聚合' }} · {{ quote.data_time || 'as_of unknown' }}</span>
+          <span>{{ quote.source || '行情聚合' }} · {{ asOfText() }} {{ quote.data_time || unknownText() }}</span>
           <FreshnessTag
             :status="quote.freshness?.freshness_status || 'unknown'"
             :as-of="quote.data_time"
@@ -81,14 +85,14 @@ function money(value: number) {
       </n-alert>
 
       <div class="quote-facts" aria-label="关键行情">
-        <div><span>今开</span><strong>{{ quote ? quote.open.toFixed(2) : 'unknown' }}</strong></div>
-        <div><span>最高</span><strong>{{ quote ? quote.high.toFixed(2) : 'unknown' }}</strong></div>
-        <div><span>最低</span><strong>{{ quote ? quote.low.toFixed(2) : 'unknown' }}</strong></div>
-        <div><span>昨收</span><strong>{{ quote ? quote.prev_close.toFixed(2) : 'unknown' }}</strong></div>
+        <div><span>今开</span><strong>{{ quote ? quote.open.toFixed(2) : unknownText() }}</strong></div>
+        <div><span>最高</span><strong>{{ quote ? quote.high.toFixed(2) : unknownText() }}</strong></div>
+        <div><span>最低</span><strong>{{ quote ? quote.low.toFixed(2) : unknownText() }}</strong></div>
+        <div><span>昨收</span><strong>{{ quote ? quote.prev_close.toFixed(2) : unknownText() }}</strong></div>
       </div>
     </div>
     <n-alert v-if="quote && quoteError" type="warning" :bordered="false" class="quote-refresh-warning">
-      刷新失败，当前继续展示 {{ quote.data_time || 'unknown' }} 的最近已知值：{{ quoteError }}
+      刷新失败，当前继续展示 {{ quote.data_time || unknownText() }} 的最近已知值：{{ quoteError }}
       <n-button text type="primary" class="inline-retry" @click="emit('retry-quote')">稍后重试</n-button>
     </n-alert>
 
@@ -98,20 +102,20 @@ function money(value: number) {
         <n-skeleton width="90px" text /><n-skeleton width="180px" text />
       </div>
       <n-alert v-else-if="relationshipPhase === 'error'" type="warning" :bordered="false">
-        {{ relationshipError || '账户关系读取失败' }}，自选和持仓状态均为 unknown。
+        {{ relationshipError || '账户关系读取失败' }}，自选和持仓状态均为{{ unknownText() }}。
       </n-alert>
       <div v-else class="relationship-content">
         <n-alert v-if="relationshipError" type="warning" :bordered="false" class="relationship-warning">
-          {{ relationshipError }}；已读取的账户数据继续显示，失败部分为 unknown。
+          {{ relationshipError }}；已读取的账户数据继续显示，失败部分为{{ unknownText() }}。
         </n-alert>
         <div class="relation-tags">
           <n-tag size="small" round :bordered="false" :type="watchlistKnown && inWatchlist ? 'success' : 'default'">
-            {{ watchlistKnown ? (inWatchlist ? '已自选' : '未自选') : '自选 unknown' }}
+            {{ watchlistKnown ? (inWatchlist ? '已自选' : '未自选') : `自选${unknownText()}` }}
           </n-tag>
           <n-tag size="small" round :bordered="false" :type="positionKnown && position ? 'info' : 'default'">
-            {{ positionKnown ? (position ? `持仓 ${position.quantity.toFixed(0)} 股` : '未持仓') : '持仓 unknown' }}
+            {{ positionKnown ? (position ? `持仓 ${position.quantity.toFixed(0)} 股` : '未持仓') : `持仓${unknownText()}` }}
           </n-tag>
-          <span class="relation-asof">账户关系 as_of {{ relationshipAsOf || 'unknown' }}</span>
+          <span class="relation-asof">账户关系{{ asOfText() }} {{ relationshipAsOf || unknownText() }}</span>
         </div>
         <div v-if="position" class="position-facts">
           <div><span>平均成本</span><strong>{{ position.averageCost.toFixed(2) }} 元</strong></div>
@@ -121,10 +125,10 @@ function money(value: number) {
               {{ position.profitPct > 0 ? '+' : '' }}{{ position.profitPct.toFixed(2) }}%
               · {{ money(position.profitAmount || 0) }}
             </strong>
-            <strong v-else>unknown</strong>
+            <strong v-else>{{ unknownText() }}</strong>
           </div>
           <div><span>已实现盈亏</span><strong :style="{ color: pctColor(position.realizedPnl) }">{{ money(position.realizedPnl) }}</strong></div>
-          <div><span>行情时点</span><strong>{{ position.asOf || 'unknown' }}</strong></div>
+          <div><span>行情时点</span><strong>{{ position.asOf || unknownText() }}</strong></div>
         </div>
       </div>
     </section>
@@ -139,10 +143,10 @@ function money(value: number) {
               <span class="decision-value qv-tnum" :style="{ color: itemColor(item) }">{{ item.value }}</span>
             </div>
             <p>{{ item.detail }}</p>
-            <div class="evidence-meta">来源 {{ item.source }} · as_of {{ item.asOf }}</div>
+            <div class="evidence-meta">来源 {{ item.source }} · {{ asOfText() }} {{ item.asOf }}</div>
           </article>
         </div>
-        <n-empty v-else description="主要变化 unknown：尚无可核验数据" size="small" />
+        <n-empty v-else :description="`主要变化${unknownText()}：尚无可核验数据`" size="small" />
       </section>
 
       <section class="decision-block risks" aria-labelledby="risks-title">
@@ -154,7 +158,7 @@ function money(value: number) {
               <span class="decision-value qv-tnum" :style="{ color: itemColor(item) }">{{ item.value }}</span>
             </div>
             <p>{{ item.detail }}</p>
-            <div class="evidence-meta">来源 {{ item.source }} · as_of {{ item.asOf }}</div>
+            <div class="evidence-meta">来源 {{ item.source }} · {{ asOfText() }} {{ item.asOf }}</div>
           </article>
         </div>
         <n-empty v-else description="未命中可核验规则风险；不代表没有风险" size="small" />
@@ -171,7 +175,7 @@ function money(value: number) {
           </div>
           <p>{{ summary.recentEvent.detail }}</p>
           <div class="evidence-meta">
-            来源 {{ summary.recentEvent.source }} · as_of {{ summary.recentEvent.asOf }}
+            来源 {{ summary.recentEvent.source }} · {{ asOfText() }} {{ summary.recentEvent.asOf }}
           </div>
         </article>
       </section>
@@ -192,10 +196,10 @@ function money(value: number) {
           <div v-for="item in allEvidence" :key="`evidence-${item.id}`" class="evidence-row">
             <strong>{{ item.title }}</strong>
             <span>{{ item.evidence }}</span>
-            <small>来源 {{ item.source }} · as_of {{ item.asOf }}</small>
+            <small>来源 {{ item.source }} · {{ asOfText() }} {{ item.asOf }}</small>
           </div>
         </div>
-        <div class="boundary-row"><strong>最大风险</strong>{{ summary.risks[0]?.detail || 'unknown' }}</div>
+        <div class="boundary-row"><strong>最大风险</strong>{{ summary.risks[0]?.detail || unknownText() }}</div>
         <div class="boundary-row"><strong>失效条件</strong>{{ summary.invalidation }}</div>
       </n-collapse-item>
     </n-collapse>

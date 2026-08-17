@@ -59,7 +59,7 @@ export function generateDailyReport() {
   return request<DailyReportView>({ url: '/daily-reports/generate', method: 'post' })
 }
 
-// 删除一份日报（生成中的任务拒删；关联推荐批次与卖点提醒不级联删）。
+// 删除一份日报（生成中的任务拒删；关联推荐批次与研究追踪事实不级联删）。
 export function deleteDailyReport(id: number) {
   return request<{ ok: boolean }>({ url: `/daily-reports/${id}`, method: 'delete' })
 }

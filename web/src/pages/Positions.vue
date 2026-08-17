@@ -69,6 +69,7 @@ import SectionCard from '@/components/SectionCard.vue'
 import StatCard from '@/components/StatCard.vue'
 import FreshnessTag from '@/components/FreshnessTag.vue'
 import DataImportWizard from '@/components/DataImportWizard.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
 
 const PortfolioRisk = defineAsyncComponent(() => import('@/pages/PortfolioRisk.vue'))
 
@@ -1319,8 +1320,7 @@ onBeforeUnmount(() => {
                 <div v-for="a in corpAdjusts" :key="a.id" class="adjust-row">
                   <div class="adjust-main">
                     <div class="adjust-head">
-                      <span class="adjust-name">{{ a.name || a.symbol }}</span>
-                      <span class="adjust-symbol qv-mono">{{ a.symbol }}</span>
+                      <StockIdentity :symbol="a.symbol" :market="a.market || 'cn'" :name="a.name" density="table" clickable />
                       <n-tag v-if="a.manual_review" size="tiny" round :bordered="false" type="error">需人工核对</n-tag>
                       <n-tag v-if="a.record_date" size="tiny" round :bordered="false">登记日 {{ a.record_date }}</n-tag>
                       <n-tag size="tiny" round :bordered="false" type="warning">除权日 {{ a.ex_date }}</n-tag>
@@ -1387,8 +1387,7 @@ onBeforeUnmount(() => {
                     <n-tag size="small" round :bordered="false" :type="verdictType(a.verdict)">{{
                       verdictLabel(a.verdict)
                     }}</n-tag>
-                    <span class="advice-name">{{ a.name || a.symbol }}</span>
-                    <span class="advice-symbol qv-mono">{{ a.symbol }}</span>
+                    <StockIdentity :symbol="a.symbol" market="cn" :name="a.name" density="table" clickable />
                     <span class="advice-position qv-tnum">
                       {{ advicePositionType(a.position_type) }} · 成本 {{ a.cost.toFixed(2) }} · {{ a.quantity }} 股
                     </span>
@@ -1499,8 +1498,7 @@ onBeforeUnmount(() => {
                           :type="p.position_type === 'short_term' ? 'warning' : 'info'"
                           >{{ typeLabel(p.position_type) }}</n-tag
                         >
-                        <span class="r-title">{{ p.name || p.symbol }}</span>
-                        <span class="r-symbol qv-mono">{{ p.symbol }}</span>
+                        <StockIdentity :symbol="p.symbol" :market="p.market" :name="p.name" density="table" clickable actions />
                         <n-tag v-if="p.status === 'closed'" size="tiny" :bordered="false">已卖出</n-tag>
                         <n-tag
                           v-if="p.status === 'holding' && p.exit_assessment"
@@ -1808,7 +1806,7 @@ onBeforeUnmount(() => {
                       <div class="dist-title">最赚 Top{{ stats.top_winners.length }}</div>
                       <n-empty v-if="!stats.top_winners.length" size="small" description="窗口内无盈利交易" />
                       <div v-for="t in stats.top_winners" :key="'w' + t.position_id" class="top-row">
-                        <span class="top-name">{{ t.name || t.symbol }}<span class="r-symbol qv-mono">{{ t.symbol }}</span></span>
+                        <StockIdentity :symbol="t.symbol" market="cn" :name="t.name" density="table" clickable />
                         <span class="qv-tnum" :style="{ color: pctColor(t.realized_pnl) }">{{ fmtMoney(t.realized_pnl) }}</span>
                         <span class="qv-tnum" :style="{ color: pctColor(t.return_pct) }">{{ t.return_pct.toFixed(2) }}%</span>
                         <span class="top-meta qv-tnum">{{ t.hold_trade_days ? t.hold_trade_days + ' 交易日' : '—' }}</span>
@@ -1818,7 +1816,7 @@ onBeforeUnmount(() => {
                       <div class="dist-title">最亏 Top{{ stats.top_losers.length }}</div>
                       <n-empty v-if="!stats.top_losers.length" size="small" description="窗口内无亏损交易" />
                       <div v-for="t in stats.top_losers" :key="'l' + t.position_id" class="top-row">
-                        <span class="top-name">{{ t.name || t.symbol }}<span class="r-symbol qv-mono">{{ t.symbol }}</span></span>
+                        <StockIdentity :symbol="t.symbol" market="cn" :name="t.name" density="table" clickable />
                         <span class="qv-tnum" :style="{ color: pctColor(t.realized_pnl) }">{{ fmtMoney(t.realized_pnl) }}</span>
                         <span class="qv-tnum" :style="{ color: pctColor(t.return_pct) }">{{ t.return_pct.toFixed(2) }}%</span>
                         <span class="top-meta qv-tnum">{{ t.hold_trade_days ? t.hold_trade_days + ' 交易日' : '—' }}</span>
@@ -1831,7 +1829,7 @@ onBeforeUnmount(() => {
                     <n-empty v-if="!stats.lessons.length" size="small" description="还没有填写过「下次策略调整点」" />
                     <div v-for="l in stats.lessons" :key="l.position_id" class="lesson-row">
                       <span class="lesson-date qv-tnum">{{ l.sell_date || '—' }}</span>
-                      <span class="top-name">{{ l.name || l.symbol }}</span>
+                      <StockIdentity :symbol="l.symbol" market="cn" :name="l.name" density="table" clickable />
                       <span class="qv-tnum" :style="{ color: pctColor(l.realized_pnl) }">{{ fmtMoney(l.realized_pnl) }}</span>
                       <span class="lesson-text">{{ l.lesson }}</span>
                     </div>

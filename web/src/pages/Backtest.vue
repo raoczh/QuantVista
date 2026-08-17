@@ -47,6 +47,8 @@ import { isPollCancelled, pollUntil } from '@/lib/poll'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
+import TermHelp from '@/components/TermHelp.vue'
 
 const message = useMessage()
 const route = useRoute()
@@ -599,13 +601,13 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
                       <th>买入</th>
                       <th>卖出</th>
                       <th>收益</th>
-                      <th>α</th>
+                      <th><TermHelp term="alpha" /></th>
                       <th>备注</th>
                     </tr>
                   </thead>
                   <tbody>
                     <tr v-for="tr in [...(st.best_trades ?? []), ...(st.worst_trades ?? [])]" :key="`${tr.symbol}-${tr.signal_date}-${tr.return_pct}`">
-                      <td>{{ tr.name || tr.symbol }} <span class="dim qv-tnum">{{ tr.symbol }}</span></td>
+                      <td><StockIdentity :symbol="tr.symbol" market="cn" :name="tr.name" density="table" clickable /></td>
                       <td class="qv-tnum">{{ tr.signal_date }}</td>
                       <td class="qv-tnum">{{ tr.buy_date }} @ {{ tr.buy_price.toFixed(2) }}</td>
                       <td class="qv-tnum">{{ tr.sell_date }} @ {{ tr.sell_price.toFixed(2) }}</td>
@@ -735,13 +737,13 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
                       <th>批次</th>
                       <th>标的</th>
                       <th>信号日</th>
-                      <th v-for="st in recResult.stats" :key="st.hold_days">{{ st.hold_days }}日收益 / α</th>
+                      <th v-for="st in recResult.stats" :key="st.hold_days">{{ st.hold_days }}日收益 / <TermHelp term="alpha" /></th>
                     </tr>
                   </thead>
                   <tbody>
                     <tr v-for="(r, i) in recResult.rows" :key="i">
                       <td class="dim">#{{ r.batch_id }} {{ r.batch_title }}</td>
-                      <td>{{ r.name || r.symbol }} <span class="dim qv-tnum">{{ r.symbol }}</span></td>
+                      <td><StockIdentity :symbol="r.symbol" market="cn" :name="r.name" density="table" clickable /></td>
                       <td class="qv-tnum">{{ r.signal_date || '—' }}</td>
                       <td v-for="st in recResult.stats" :key="st.hold_days" class="qv-tnum">
                         <template v-if="r.holds[String(st.hold_days)]?.status === 'traded'">

@@ -26,6 +26,7 @@ import SectionCard from '@/components/SectionCard.vue'
 import StatCard from '@/components/StatCard.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
 import FreshnessTag from '@/components/FreshnessTag.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
 
 const message = useMessage()
 const { pctColor, vars } = useUi()
@@ -157,8 +158,7 @@ onMounted(load)
             <thead>
               <tr>
                 <th>类别</th>
-                <th>代码</th>
-                <th>名称</th>
+                <th colspan="2">ETF</th>
                 <th>跟踪指数</th>
                 <th>现价</th>
                 <th>涨跌幅</th>
@@ -170,8 +170,7 @@ onMounted(load)
                 <td>
                   <n-tag size="tiny" round :bordered="false">{{ e.category }}</n-tag>
                 </td>
-                <td class="qv-mono">{{ e.symbol }}</td>
-                <td>{{ e.name }}</td>
+                <td colspan="2"><StockIdentity :symbol="e.symbol" market="cn" :name="e.name" density="table" clickable actions /></td>
                 <td class="etf-index">{{ e.index }}</td>
                 <td class="qv-tnum">
                   {{ e.quote_ok ? fmt(e.price) : '—' }}
@@ -211,8 +210,7 @@ onMounted(load)
           <tbody>
             <tr v-for="h in etfHoldings" :key="h.id">
               <td>
-                <span class="hold-name">{{ h.name || h.symbol }}</span>
-                <span class="qv-mono hold-symbol">{{ h.symbol }}</span>
+                <StockIdentity :symbol="h.symbol" market="cn" :name="h.name" density="table" clickable actions />
               </td>
               <td class="qv-tnum">{{ h.quantity }}</td>
               <td class="qv-tnum">{{ fmt(h.avg_cost) }}</td>

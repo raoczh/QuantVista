@@ -34,7 +34,7 @@ type DailyReport struct {
 	ReviewJSON   string `gorm:"type:text" json:"review_json"`
 	SnapshotJSON string `gorm:"type:text" json:"snapshot_json"`
 
-	// 明日推荐批次（0=未生成/失败）；卖点提醒规则以 note 前缀「收盘日报」标记。
+	// 明日推荐批次（0=未生成/失败）；未持有推荐只保留研究追踪，不创建卖点提醒。
 	RecommendationBatchID int64 `gorm:"index" json:"recommendation_batch_id"`
 
 	Error       string    `gorm:"size:500" json:"error"`

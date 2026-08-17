@@ -42,6 +42,7 @@ import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { getApiErrorCode } from '@/api/client'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
+import { useDisplayMode } from '@/composables/useDisplayMode'
 import {
   enumQuery,
   queryRef,
@@ -53,7 +54,10 @@ import { pollUntil, isPollCancelled } from '@/lib/poll'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
+import StockPicker from '@/components/StockPicker.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
 import type { RiskFlag } from '@/api/trust'
+import type { StockRef } from '@/composables/useStockActions'
 
 const message = useMessage()
 const dialog = useDialog()
@@ -61,6 +65,7 @@ const route = useRoute()
 const router = useRouter()
 const { upColor, downColor, flatColor, vars, withAlpha, pctColor } = useUi()
 const { llmLabel } = useLlmLabel()
+const { label } = useDisplayMode()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const moduleOptions: { label: string; value: AnalysisModule }[] = [
@@ -83,6 +88,12 @@ const form = ref<AnalyzeRequest>({
   llm_config_id: undefined,
   question: '',
 })
+const selectedStock = ref<StockRef | null>(null)
+function updateSelectedStock(stock: StockRef | null) {
+  selectedStock.value = stock
+  form.value.symbol = stock?.symbol || ''
+  if (stock) form.value.market = stock.market
+}
 const needSymbol = computed(() => form.value.module === 'stock')
 const needMarket = computed(() =>
   form.value.module === 'stock' || form.value.module === 'market' || form.value.module === 'sector',
@@ -135,7 +146,7 @@ const current = ref<AnalysisView | null>(null)
 
 function analysisPayload(allowStale = false): AnalyzeRequest | null {
   if (form.value.module === 'stock' && !form.value.symbol?.trim()) {
-    message.warning('请输入股票代码')
+    message.warning('请先搜索并选择股票')
     return null
   }
   const payload: AnalyzeRequest = {
@@ -464,7 +475,7 @@ function askFromAnalysis() {
       from_analysis: String(current.value.id),
       symbol: current.value.symbol,
       market: current.value.market || 'cn',
-      name: current.value.target || current.value.symbol,
+      name: current.value.target || '',
     },
   })
 }
@@ -476,7 +487,7 @@ function askFromAnalysisFresh() {
     query: {
       symbol: current.value.symbol,
       market: current.value.market || 'cn',
-      name: current.value.target || current.value.symbol,
+      name: current.value.target || '',
     },
   })
 }
@@ -537,8 +548,13 @@ function fmtSignedPct(v: number | undefined | null): string {
 
 function applyStockActionQuery() {
   if (route.query.module) form.value.module = String(route.query.module) as AnalysisModule
-  if (route.query.symbol) form.value.symbol = String(route.query.symbol)
-  if (route.query.market) form.value.market = String(route.query.market)
+  if (route.query.symbol) {
+    updateSelectedStock({
+      symbol: String(route.query.symbol),
+      market: String(route.query.market || 'cn'),
+      name: String(route.query.name || ''),
+    })
+  } else if (route.query.market) form.value.market = String(route.query.market)
 }
 
 watch(() => route.query._stock_action, applyStockActionQuery)
@@ -574,11 +590,11 @@ onMounted(async () => {
             <n-form-item label="分析模块">
               <n-select v-model:value="form.module" :options="moduleOptions" />
             </n-form-item>
-            <n-form-item v-if="needMarket" label="市场">
+            <n-form-item v-if="needMarket && !needSymbol" label="市场">
               <n-select v-model:value="form.market" :options="marketOptions" />
             </n-form-item>
-            <n-form-item v-if="needSymbol" label="股票代码">
-              <n-input v-model:value="form.symbol" placeholder="如 600000" />
+            <n-form-item v-if="needSymbol" label="选择股票">
+              <StockPicker :model-value="selectedStock" @update:model-value="updateSelectedStock" />
             </n-form-item>
             <n-form-item v-if="needTarget" label="关注板块（可选）">
               <n-input v-model:value="form.target" placeholder="如 半导体 / 银行" />
@@ -1074,7 +1090,7 @@ onMounted(async () => {
               <div class="meta">
                 <n-space size="small" :wrap="true" align="center">
                   <span>模型 {{ llmLabel(current) || current.model || '—' }}</span>
-                  <span v-if="current.total_tokens">· token {{ current.total_tokens }}</span>
+                  <span v-if="current.total_tokens">· {{ label('AI 用量', 'Token') }} {{ current.total_tokens }}</span>
                   <span v-if="current.latency_ms">· 耗时 {{ (current.latency_ms / 1000).toFixed(1) }}s</span>
                   <span>· 版本 {{ current.prompt_version }}/{{ current.strategy_version }}</span>
                   <span>· {{ fmtTime(current.created_at) }}</span>
@@ -1161,8 +1177,7 @@ onMounted(async () => {
         <n-empty v-if="!hindsight" description="加载中…" />
         <div v-else class="hs">
           <div class="hs-meta">
-            <span class="hs-name">{{ hindsight.name || hindsight.symbol }}</span>
-            <span class="dim qv-tnum">{{ hindsight.symbol }}</span>
+            <StockIdentity :symbol="hindsight.symbol" market="cn" :name="hindsight.name" density="table" clickable />
             <n-tag size="small" :bordered="false" type="warning">基准日 {{ hindsight.base_date }}</n-tag>
             <span class="dim">基准价 {{ hindsight.base_price.toFixed(2) }}（当日收盘）</span>
           </div>
@@ -1361,7 +1376,7 @@ onMounted(async () => {
 /* 反方观点等强调块 */
 .anti-block {
   border: 1px solid transparent;
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 10px 12px;
 }
 /* 多角色 */
@@ -1372,7 +1387,7 @@ onMounted(async () => {
 }
 .panel-role {
   border: 1px solid var(--qv-divider);
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 12px;
 }
 .pr-head {

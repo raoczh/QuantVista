@@ -29,6 +29,7 @@ import GlobalSearch from '@/components/GlobalSearch.vue'
 import MobileBottomNav from '@/components/MobileBottomNav.vue'
 import RecentTasks from '@/components/RecentTasks.vue'
 import OnboardingGuide from '@/components/OnboardingGuide.vue'
+import AIQuickActions from '@/components/AIQuickActions.vue'
 
 // 应用主外壳：必须挂在 n-config-provider 内部，useThemeVars 才能取到主题 override。
 const route = useRoute()
@@ -259,14 +260,13 @@ watchEffect(() => {
   el.style.setProperty('--qv-primary-selection', withAlpha(vars.value.primaryColor, 0.22))
 })
 
-// 外壳专用变量：毛玻璃顶栏 / 胶囊菜单 / 氛围光晕，全部源自主题，兼容 6 套。
+// 外壳专用变量全部源自主题，兼容 6 套主题。
 const shellVars = computed(() => ({
   '--qv-header-bg': withAlpha(vars.value.cardColor, 0.72),
   '--qv-header-border': vars.value.dividerColor,
   '--qv-menu-active': primaryAlpha(0.13),
   '--qv-menu-active-text': vars.value.primaryColor,
   '--qv-menu-hover': isDark.value ? 'rgba(255, 255, 255, 0.07)' : 'rgba(128, 128, 128, 0.1)',
-  '--qv-glow': primaryAlpha(isDark.value ? 0.12 : 0.08),
   '--qv-badge-bg': vars.value.errorColor,
   '--qv-badge-incomplete-bg': vars.value.warningColor,
 }))
@@ -287,8 +287,6 @@ onUnmounted(() => {
 
 <template>
   <div class="app-shell" :style="shellVars">
-    <div class="app-glow" aria-hidden="true" />
-
     <header class="app-header">
       <button class="nav-burger" type="button" aria-label="打开导航菜单" @click="showNav = true">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
@@ -317,6 +315,8 @@ onUnmounted(() => {
           <span class="st-text">搜股票</span>
           <span class="st-kbd">Ctrl K</span>
         </button>
+
+        <AIQuickActions variant="toolbar" />
 
         <RecentTasks />
 
@@ -412,18 +412,6 @@ onUnmounted(() => {
   min-height: 100vh;
 }
 
-/* 顶部主色氛围光晕：随主题变色，不挡交互 */
-.app-glow {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 46vh;
-  pointer-events: none;
-  z-index: 0;
-  background: radial-gradient(ellipse 72% 100% at 50% -12%, var(--qv-glow), transparent 68%);
-}
-
 /* sticky 毛玻璃顶栏 */
 .app-header {
   position: sticky;
@@ -451,10 +439,10 @@ onUnmounted(() => {
   width: 100%;
 }
 
-/* 菜单项胶囊化：激活主色浅底、hover 中性浅底 */
+/* 菜单保持紧凑矩形层级，激活态只做克制强调。 */
 .app-menu-wrap :deep(.n-menu-item-content) {
   padding: 0 14px !important;
-  border-radius: 999px;
+  border-radius: 4px;
   transition: background-color 0.18s ease;
 }
 .app-menu-wrap :deep(.n-menu-item-content:hover) {
@@ -506,7 +494,7 @@ onUnmounted(() => {
   gap: 7px;
   height: 30px;
   padding: 0 6px 0 10px;
-  border-radius: 999px;
+  border-radius: 6px;
   border: 1px solid var(--qv-header-border);
   background: rgba(128, 128, 128, 0.07);
   color: inherit;
@@ -573,7 +561,7 @@ onUnmounted(() => {
   gap: 8px;
   padding: 3px 10px 3px 3px;
   border: 0;
-  border-radius: 999px;
+  border-radius: 6px;
   background: transparent;
   color: inherit;
   font: inherit;
@@ -660,6 +648,9 @@ onUnmounted(() => {
   }
   /* 搜索由固定底栏承载，避免 320px 顶栏出现重复入口和拥挤。 */
   .search-trigger {
+    display: none;
+  }
+  .header-right > :deep(.variant-toolbar) {
     display: none;
   }
   /* 主题按钮只留色块，用户菜单只留头像 */

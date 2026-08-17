@@ -22,18 +22,20 @@ import {
 } from '@/api/report'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
-import { useStockActions } from '@/composables/useStockActions'
 import { pollUntil, isPollCancelled } from '@/lib/poll'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
+import TermHelp from '@/components/TermHelp.vue'
+import { useDisplayMode } from '@/composables/useDisplayMode'
 
 const message = useMessage()
 const route = useRoute()
 const router = useRouter()
 const { pctColor } = useUi()
 const { llmLabel } = useLlmLabel()
-const { goDetail } = useStockActions()
+const { label } = useDisplayMode()
 
 const rows = ref<DailyReportRow[]>([])
 const current = ref<DailyReportView | null>(null)
@@ -49,7 +51,7 @@ const historyOptions = computed(() =>
 )
 
 function statusText(s: string) {
-  return s === 'success' ? '完整' : s === 'partial' ? '部分成功' : s === 'processing' ? '生成中' : '失败'
+  return s === 'success' ? '完整' : s === 'partial' ? label('数据不完整', '部分成功（partial）') : s === 'processing' ? '生成中' : '失败'
 }
 function statusType(s: string): 'success' | 'warning' | 'error' | 'info' {
   return s === 'success' ? 'success' : s === 'partial' ? 'warning' : s === 'processing' ? 'info' : 'error'
@@ -286,7 +288,7 @@ onMounted(() => void load(routeReportID()))
           <template #trigger>
             <n-button size="small" quaternary type="error" :loading="deleting" :disabled="!current">删除</n-button>
           </template>
-          删除当前展示的这份日报？关联的推荐批次与卖点提醒不受影响；若删的是今日日报且开着自动生成，收盘窗口内可能会自动重新生成。
+          删除当前展示的这份日报？关联的推荐批次与研究追踪事实不会删除；若删的是今日日报且开着自动生成，收盘窗口内可能会自动重新生成。
         </n-popconfirm>
       </div>
     </template>
@@ -303,7 +305,7 @@ onMounted(() => void load(routeReportID()))
             <span class="head-date qv-figure">{{ current.trade_date }}</span>
             <n-tag :type="statusType(current.status)" round :bordered="false">{{ statusText(current.status) }}</n-tag>
             <span v-if="current.status !== 'processing'" class="meta"
-              >耗时 {{ (current.latency_ms / 1000).toFixed(1) }}s · {{ current.total_tokens }} tokens<template
+              >耗时 {{ (current.latency_ms / 1000).toFixed(1) }}s · {{ label('AI 用量', 'Token') }} {{ current.total_tokens }}<template
                 v-if="llmLabel(current)"
               >
                 · {{ llmLabel(current) }}</template
@@ -377,13 +379,11 @@ onMounted(() => void load(routeReportID()))
           <div v-if="recItems.length" class="recs">
             <div v-for="it in recItems" :key="it.id" class="rec">
               <div class="rec-head">
-                <span class="rec-name" @click="goDetail({ symbol: it.symbol, market: it.market, name: it.name })"
-                  >{{ it.name }} <span class="qv-mono rec-sym">{{ it.symbol }}</span></span
-                >
+                <StockIdentity :symbol="it.symbol" :market="it.market" :name="it.name" clickable actions />
                 <n-tag size="small" round :bordered="false" :type="it.action === 'buy' ? 'error' : 'default'">
                   {{ it.action === 'buy' ? '买入关注' : '观察' }}
                 </n-tag>
-                <span class="rec-conf">置信 {{ it.confidence }}%</span>
+                <span class="rec-conf"><TermHelp term="ai_confidence" /> {{ it.confidence }}%</span>
               </div>
               <div v-if="it.detail" class="rec-prices">
                 <span
@@ -412,7 +412,7 @@ onMounted(() => void load(routeReportID()))
               <p class="rec-summary">{{ it.summary }}</p>
             </div>
             <p class="sell-hint">
-              已按止盈/止损价自动创建到价卖点提醒（见「条件提醒」，note 标注「收盘日报」；命中即进今日待办并推送）。
+              未持有推荐只做研究追踪；建立真实持仓后，由持仓卖出风险体系统一判断并提醒。
             </p>
           </div>
           <n-spin v-else-if="current.status === 'processing'" size="small" style="width: 100%; padding: 24px 0">

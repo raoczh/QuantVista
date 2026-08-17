@@ -57,11 +57,12 @@ async function selectAction(key: string | number) {
       <n-button
         size="small"
         quaternary
+        circle
         :loading="adding"
         aria-label="股票操作"
         title="股票操作"
       >
-        操作
+        ⋯
       </n-button>
     </n-dropdown>
   </span>

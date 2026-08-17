@@ -37,7 +37,7 @@ export function useStockActions(onNavigate?: () => void) {
     return {
       symbol: s.symbol,
       market: s.market || 'cn',
-      name: s.name || s.symbol,
+      name: s.name || '',
       ...extra,
       _stock_action: `${Date.now().toString(36)}-${++stockActionSequence}`,
     }

@@ -19,9 +19,10 @@ function normalizeRecentStock(value: unknown): RecentStock | null {
   const input = value as Partial<RecentStock>
   const symbol = typeof input.symbol === 'string' ? input.symbol.trim().slice(0, 16) : ''
   const market = typeof input.market === 'string' ? input.market.trim().toLowerCase().slice(0, 8) : ''
-  const name = typeof input.name === 'string' ? input.name.trim().slice(0, 64) : ''
+  const rawName = typeof input.name === 'string' ? input.name.trim().slice(0, 64) : ''
+  const name = rawName.toLowerCase() === symbol.toLowerCase() ? '' : rawName
   const lastVisitedAt = typeof input.lastVisitedAt === 'string' ? input.lastVisitedAt : ''
-  if (!symbol || !market || !name || Number.isNaN(Date.parse(lastVisitedAt))) return null
+  if (!symbol || !market || Number.isNaN(Date.parse(lastVisitedAt))) return null
   return { symbol, market, name, lastVisitedAt }
 }
 
@@ -40,8 +41,9 @@ export function recordRecentStock(userID: number, stock: StockRef): RecentStock[
   if (!userID) return []
   const symbol = stock.symbol.trim().slice(0, 16)
   const market = (stock.market || 'cn').trim().toLowerCase().slice(0, 8)
-  const name = (stock.name || symbol).trim().slice(0, 64)
-  if (!symbol || !market || !name) return readRecentStocks(userID)
+  const rawName = stock.name.trim().slice(0, 64)
+  const name = rawName.toLowerCase() === symbol.toLowerCase() ? '' : rawName
+  if (!symbol || !market) return readRecentStocks(userID)
 
   const key = `${market}\u0000${symbol.toLowerCase()}`
   const next: RecentStock[] = [

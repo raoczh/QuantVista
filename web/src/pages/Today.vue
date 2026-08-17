@@ -40,6 +40,7 @@ import {
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
 import StatCard from '@/components/StatCard.vue'
 
 const message = useMessage()
@@ -412,7 +413,7 @@ onBeforeUnmount(() => {
                     :color="{ color: withAlpha(kindMeta(item.kind).color, 0.14), textColor: kindMeta(item.kind).color }"
                   >{{ kindMeta(item.kind).label }}</n-tag>
                   <strong>{{ item.title }}</strong>
-                  <span v-if="item.symbol" class="stock">{{ item.name || item.symbol }} <span class="qv-mono">{{ item.symbol }}</span></span>
+                  <StockIdentity v-if="item.symbol" :symbol="item.symbol" :market="item.market || 'cn'" :name="item.name" density="table" clickable />
                 </div>
                 <p>{{ item.detail }}</p>
                 <div class="meta">
@@ -498,7 +499,7 @@ onBeforeUnmount(() => {
                 <span class="event-head">
                   <n-tag size="tiny" :bordered="false">{{ eventMeta(event.kind).label }}</n-tag>
                   <n-tag v-if="event.relation !== 'market'" size="tiny" :bordered="false" type="info">{{ relationLabel(event.relation) }}</n-tag>
-                  <strong>{{ event.name || event.symbol }} <span class="qv-mono">{{ event.symbol }}</span></strong>
+                  <StockIdentity :symbol="event.symbol" :market="event.market || 'cn'" :name="event.name" density="table" clickable />
                 </span>
                 <small>{{ event.detail }}</small>
               </span>

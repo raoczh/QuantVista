@@ -74,7 +74,7 @@ Go API Server
 | `dark-amber` | 暖夜橙（深） | 暗 | `#f0a020` |
 | `light-rose` | 樱桃红（浅） | 亮 | `#d03050` |
 
-实现：主题预设集中在 `web/src/theme/presets.ts`，全局状态在 `stores/theme.ts`，由根部 `n-config-provider` 统一下发 `theme` + `theme-overrides`，并配 `n-global-style` 联动 body 背景。应用外壳在 `components/AppShell.vue`——**必须位于 `n-config-provider` 内部**（`useThemeVars()` 只在 provider 子树内能取到 override 后的变量，App.vue 顶层取不到）。每套预设除主色四件套外还定义**背景分层**：浅色 = 带主色倾向的浅灰底 + 纯白卡片，深色 = 品牌色调深底 + 浮起一档的卡片（同时对齐 `tableColor`/`tableHeaderColor`/`codeColor`，避免 Naive 暗色固定灰黑与带色调卡片打架）；另统一 `borderRadius: 8px` 控件圆角。
+实现：主题预设集中在 `web/src/theme/presets.ts`，全局状态在 `stores/theme.ts`，由根部 `n-config-provider` 统一下发 `theme` + `theme-overrides`，并配 `n-global-style` 联动 body 背景。应用外壳在 `components/AppShell.vue`——**必须位于 `n-config-provider` 内部**（`useThemeVars()` 只在 provider 子树内能取到 override 后的变量，App.vue 顶层取不到）。每套预设除主色四件套外还定义**背景分层**：浅色 = 带主色倾向的浅灰底 + 纯白分区，深色 = 品牌色调深底 + 可读的内容层（同时对齐 `tableColor`/`tableHeaderColor`/`codeColor`，避免 Naive 暗色固定灰黑与带色调内容层打架）；控件和实体卡片圆角不超过 8px。
 
 **后续所有页面 / 组件样式必须兼容全部 6 套主题（强制规则）：**
 
@@ -92,29 +92,34 @@ Go API Server
 
 **基础层**
 
-- `web/src/styles/global.css`（在 `main.ts` 引入）：设计 token（`--qv-content-max: 1440px`、`--qv-radius-card: 14px`、字体栈）、`.qv-tnum`/`.qv-mono`/`.qv-figure` 等宽数字工具类、细滚动条、`qv-fade-up` 入场动画与 `::selection`（主色由 AppShell 注入 `--qv-primary-selection`，裸布局回落中性灰）。只放**与主题无关**的排版；颜色一律不写死。
+- `web/src/styles/global.css`（在 `main.ts` 引入）：设计 token（`--qv-content-max: 1440px`、`--qv-radius-card: 8px`、字体栈）、`.qv-tnum`/`.qv-mono`/`.qv-figure` 等宽数字工具类、细滚动条、`qv-fade-up` 入场动画与 `::selection`（主色由 AppShell 注入 `--qv-primary-selection`，裸布局回落中性灰）。只放**与主题无关**的排版；颜色一律不写死。
 - `web/src/composables/useUi.ts`：全站取色入口，颜色全部来自 `useThemeVars()`，自动兼容 6 套主题。导出 `pctColor/pctBg`（涨红 `errorColor`/跌绿 `successColor`/平 `textColor3`）、`primaryAlpha(a)`、`withAlpha(color,a)`、`upColor/downColor`、`isDark`、`vars`。**任何涨跌/主色透明度需求走它，禁止硬编码 hex。**
 - `web/src/composables/useAutoRefresh.ts`：盘中自动刷新（仅交易时段周一~五 09:15–15:05 + 页面可见时轮询，切后台暂停；数据源有限流，**间隔不得低于 60s**）。Home/Watchlist/Positions 已接入，行情类新页面照用。
 - `web/src/composables/useStockActions.ts`：个股快捷动作（跳 AI 分析/问答/对比/设提醒 query 预填、加自选到第一分组）。Home 速查、GlobalSearch 复用；新入口一律走它。
+- `web/src/composables/useDisplayMode.ts`：按账号隔离的“简明/专业”显示偏好，统一管理 `localStorage` 键；页面不得自行读写显示模式存储。
 - `web/src/components/home/homeWorkspace.ts` + `HomeWorkspaceSection.vue`：首页盘前/盘中/盘后排序、默认展开与个人区块外壳。自动模式只认后端行情新鲜度的 `market_state`；缺失时上海时钟仅用于展示排序且状态保持 `unknown`。模式偏好按用户写本地存储，不落服务端、不改变业务事实。
 - `web/src/lib/pageTitle.ts`：标签页标题统一拼装（页面名 + 大盘行情两段互不覆盖），router.afterEach 与 AppShell 轮询各自 set。
 
 **外壳与导航**（`components/AppShell.vue`）
 
-- 整页滚动 + sticky 毛玻璃顶栏（半透明 cardColor + backdrop-filter）+ 顶部主色氛围光晕 + 路由切换淡入上移过渡。
+- 整页滚动 + sticky 毛玻璃顶栏（半透明 cardColor + backdrop-filter）+ 路由切换淡入上移过渡；不使用装饰性径向光晕。
 - 桌面导航保留首页 / 今日（复用 `/todos` total 徽标）/ 自选 / 选股 / 持仓 5 个高频直达项；情绪、快讯、热力图与 ETF 归“市场”，推荐、分析、日报、问答与对比归“研究”，其余低频功能归“更多”。设置与管理后台只在右上角用户菜单。
-- 顶栏「搜股票」按钮或 `Ctrl/Cmd+K` 唤起 `GlobalSearch`；≤768px 改用首页 / 自选 / 搜索 / 今日 / 持仓固定底栏，汉堡抽屉保留完整功能入口。搜索支持名称、代码与拼音模糊匹配，并复用统一股票动作。
+- 顶栏「搜股票」按钮或 `Ctrl/Cmd+K` 唤起 `GlobalSearch`，搜索旁提供 AI 快捷操作；≤768px 仍固定为首页 / 自选 / 搜索 / 今日 / 持仓五项，不增加第六项，AI 操作从搜索面板或首页两步内进入。搜索支持名称、代码与拼音模糊匹配，并复用统一股票动作。
 
 **通用组件**（`web/src/components/`）
 
 - `PageContainer`：页面外层，`max-width` 居中 + 标题/副标题 + `#actions` 插槽 + 页头入场动画。**每个业务页最外层都用它。**
-- `SectionCard`：带主色渐变标题条 + 静态质感阴影（浅色柔和投影/深色顶部内高光）+ hover 抬升的卡片（包 `NCard`），`title` / `#extra` 插槽 / `:hoverable`。替代裸 `n-card`。
+- `SectionCard`：克制的平面分区（包 `NCard`），默认无阴影、无装饰性标题条、无 hover 抬升，圆角 8px；只有明确传入 `:hoverable="true"` 的交互对象才改变边框。
 - `StatCard`：指标卡（label + 大号数值 + 涨跌），数值色随涨跌，质感语言与 SectionCard 一致。
 - `RankList` + `#row` 插槽：带名次徽标的榜单（第 1 名主色渐变徽标），替代原始 `<table>`。
 - `ChangeTag`：涨跌幅 pill（`:value` 百分比，自动 +号/配色）。
 - `BrandLogo`：主色渐变方块 + 折线 mark + 双色字标，顶栏/认证页共用。
 - `AuthShell`：认证页统一外壳（主题感知渐变背景 + 品牌 + 角落主题切换），登录/首启/回调复用。
 - `GlobalSearch`：全局速查命令面板（Ctrl+K），挂在 AppShell。
+- `StockIdentity`：股票名称为主、代码和市场为次的统一身份展示；缺名称显示“名称待补全”，支持普通/紧凑/表格密度、键盘进入详情及可选 `StockActionMenu`。
+- `StockPicker`：基于既有名称/代码/拼音搜索接口的共享选股器，保持 `symbol/market/name` 深链与 API 参数兼容。
+- `TermHelp` + `termDictionary.ts`：简明/专业名称和“一句话回答什么问题”的统一术语入口；风险、缺失和时效信息不得被白话化隐藏。
+- `AIQuickActions`：统一提供 AI 选股、分析一只股票、AI 检查持仓和个股追问；导航本身不发起 AI 请求，股票类操作先经过 `StockPicker`。
 
 **约定**
 
@@ -493,6 +498,8 @@ AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yiel
 - `GET /api/export/:kind`（kind=positions|watchlist|recommendations|analyses，CSV 带 BOM，限流 10/min）
 - `GET /api/admin/datasources`（数据源健康滑窗状态，S1；`data_source_configs` 死表已删，数据源无用户级配置）
 
+前端唯一可编辑通知入口为 `/settings?tab=notifications`：推送总闸、智能守护和 Server酱/Webhook/ntfy 通道 CRUD、启停、删除、测试均复用以上接口。`/alerts` 只负责提醒规则、立即检查和命中历史，并跳转到该设置页；不得再放第二套通道表单。ntfy 密钥不回显，保存失败保留表单和最近已加载列表。浏览器 Notification API、Service Worker、VAPID 与 Web Push **尚未实现**，不得展示占位开关。
+
 ### 5.8.1 条件提醒与命中事件（阶段 7 + 批次 H；D14/D15 起含持仓类）
 
 - `GET/POST /api/alerts`，`PUT/DELETE /api/alerts/:id`，`PUT /api/alerts/:id/status`（暂停/恢复），`POST /api/alerts/evaluate`（手动评估，限流 20/min）
@@ -760,12 +767,12 @@ AI 结果：
 - `/qa`：个股 AI 问答
 - `/compare`：个股横向对比
 - `/tasks`：统一任务中心（九类用户 JobRun 与六类 system JobRun 支持真实步骤、取消、父子重跑、恢复与 SSE；原业务结果、策略运行结果和 DataSyncLog 通过引用去重并保留历史深链，legacy 同步日志仅作兼容投影）
-- `/alerts`：提醒规则 + 推送通道
+- `/alerts`：提醒规则、立即检查和命中历史（通道管理仅跳转设置）
 - `/paper`：模拟交易
 - `/etf`：指数 ETF 交易（精选指数 ETF 行情 + 复用模拟盘买卖，2026-07-05）
 - `/thesis`：投资逻辑卡
 - `/notes`：投资笔记
 - `/prompt-templates`：自定义分析提示词模板（用户菜单进入）
-- `/settings`：设置（LLM/偏好/AI 用量/账号安全）
+- `/settings`：设置（LLM/偏好/通知/AI 用量/账号安全；`?tab=notifications` 可直达通知设置）
 - `/admin`：管理员后台（注册开关/新闻采集/LLM 回退/GitHub 凭证/用户与配额/同步日志）
 - `/admin/llm-calls`：LLM 调用审计记录（筛选+分页+全文详情，2026-07 杂项批）

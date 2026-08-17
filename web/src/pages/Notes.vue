@@ -15,6 +15,9 @@ import { listNotes, createNote, updateNote, deleteNote, type ResearchNote, type 
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import StockPicker from '@/components/StockPicker.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
+import type { StockRef } from '@/composables/useStockActions'
 
 const message = useMessage()
 const route = useRoute()
@@ -43,6 +46,7 @@ const kindMeta = computed(() => {
 const notes = ref<ResearchNote[]>([])
 const loading = ref(false)
 const filterSymbol = ref('')
+const filterStock = ref<StockRef | null>(null)
 const keyword = ref('')
 
 async function load() {
@@ -71,9 +75,21 @@ const form = ref<{ symbol: string; market: string; kind: NoteKind; title: string
   title: '',
   content: '',
 })
+const noteStock = ref<StockRef | null>(null)
+function updateNoteStock(stock: StockRef | null) {
+  noteStock.value = stock
+  form.value.symbol = stock?.symbol || ''
+  form.value.market = stock?.market || 'cn'
+}
+function updateFilterStock(stock: StockRef | null) {
+  filterStock.value = stock
+  filterSymbol.value = stock?.symbol || ''
+  void load()
+}
 function resetForm() {
   editingId.value = null
   form.value = { symbol: '', market: 'cn', kind: '', title: '', content: '' }
+  noteStock.value = null
 }
 // 顶部按钮切换：收起时无条件清空编辑态，再点开即为新建，不会残留上次的“保存修改”态。
 function toggleForm() {
@@ -87,6 +103,7 @@ function toggleForm() {
 function editNote(n: ResearchNote) {
   editingId.value = n.id
   form.value = { symbol: n.symbol, market: n.market || 'cn', kind: n.kind, title: n.title, content: n.content }
+  noteStock.value = n.symbol ? { symbol: n.symbol, market: n.market || 'cn', name: n.name || '' } : null
   showForm.value = true
 }
 
@@ -140,11 +157,18 @@ function applyStockActionQuery() {
   if (route.query.symbol) {
     if (route.query.add === '1') {
       resetForm()
-      form.value.symbol = String(route.query.symbol)
-      form.value.market = String(route.query.market || 'cn')
+      updateNoteStock({
+        symbol: String(route.query.symbol),
+        market: String(route.query.market || 'cn'),
+        name: String(route.query.name || ''),
+      })
       showForm.value = true
     } else {
-      filterSymbol.value = String(route.query.symbol)
+      updateFilterStock({
+        symbol: String(route.query.symbol),
+        market: String(route.query.market || 'cn'),
+        name: String(route.query.name || ''),
+      })
     }
     void router.replace({ query: {} })
   }
@@ -164,7 +188,7 @@ onMounted(() => {
       <SectionCard title="笔记时间线">
         <template #extra>
           <div class="toolbar">
-            <n-input v-model:value="filterSymbol" size="small" placeholder="按代码筛选" style="width: 130px" clearable @keyup.enter="load" @clear="load()" />
+            <StockPicker :model-value="filterStock" class="note-filter-picker" placeholder="按股票筛选" @update:model-value="updateFilterStock" />
             <n-input v-model:value="keyword" size="small" placeholder="搜标题/内容" style="width: 150px" clearable @keyup.enter="load" @clear="load()" />
             <n-button size="small" secondary @click="load">筛选</n-button>
             <n-button size="small" type="primary" @click="toggleForm">
@@ -175,7 +199,7 @@ onMounted(() => {
 
         <div v-if="showForm" class="form">
           <div class="form-row">
-            <n-input v-model:value="form.symbol" placeholder="关联代码（可选），如 600000" style="max-width: 200px" />
+            <StockPicker :model-value="noteStock" class="note-stock-picker" placeholder="关联股票（可选）" @update:model-value="updateNoteStock" />
             <n-select v-model:value="form.kind" :options="kindOptions" placeholder="类别" style="max-width: 140px" />
             <n-input v-model:value="form.title" placeholder="标题（可选）" style="flex: 1" />
           </div>
@@ -200,9 +224,7 @@ onMounted(() => {
                   >
                     {{ kindMeta[n.kind].label }}
                   </n-tag>
-                  <span v-if="n.symbol" class="note-symbol qv-mono" @click="filterSymbol = n.symbol; load()">
-                    {{ n.name || n.symbol }}
-                  </span>
+                  <StockIdentity v-if="n.symbol" :symbol="n.symbol" :market="n.market" :name="n.name" density="table" clickable />
                   <span class="note-time">{{ fmtTime(n.created_at) }}</span>
                 </div>
                 <div class="note-ops">

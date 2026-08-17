@@ -3,6 +3,8 @@ import { computed, ref } from 'vue'
 import { NTooltip, NModal, NCollapse, NCollapseItem, NEmpty } from 'naive-ui'
 import { useUi } from '@/composables/useUi'
 import type { EvidenceCheck, TrustReview, SysConfidence } from '@/api/trust'
+import { useDisplayMode } from '@/composables/useDisplayMode'
+import { TERM_DICTIONARY } from './termDictionary'
 
 // 全站统一信任徽章：量化分/排名 · 一手成本 · 数值核验 · 综合置信 · AI 复核。
 // 五处 LLM 链路（推荐/分析/问答/对比/日报）共用；所有 props 可选，缺省不渲染对应徽章。
@@ -19,8 +21,14 @@ const props = defineProps<{
 }>()
 
 const { upColor, downColor, flatColor, vars, withAlpha } = useUi()
+const { isPlain } = useDisplayMode()
 
 const SYS_CONF_LABEL: Record<string, string> = { high: '综合置信 高', medium: '综合置信 中', low: '综合置信 低' }
+function sysConfidenceLabel(level: string) {
+  if (!isPlain.value) return SYS_CONF_LABEL[level] || level
+  const suffix = ({ high: '高', medium: '中', low: '低' } as Record<string, string>)[level] || level
+  return `${TERM_DICTIONARY.confidence.plain} ${suffix}`
+}
 function sysConfColor(level: string | undefined) {
   if (level === 'high') return upColor.value
   if (level === 'low') return downColor.value
@@ -125,7 +133,7 @@ const hasAny = computed(
       class="trust-chip"
       :style="{ background: withAlpha(vars.primaryColor, 0.1), color: vars.primaryColor }"
     >
-      量化分 {{ quantScore.toFixed(1) }}<template v-if="quantRank"> · 第{{ quantRank }}/{{ poolSize }}</template>
+      {{ isPlain ? TERM_DICTIONARY.quant_score.plain : TERM_DICTIONARY.quant_score.professional }} {{ quantScore.toFixed(1) }}<template v-if="quantRank"> · 第{{ quantRank }}/{{ poolSize }}</template>
     </span>
     <span v-if="lotCost" class="trust-chip trust-plain">一手约 ¥{{ lotCost.toFixed(0) }}</span>
     <n-tooltip v-if="ev && ev.total > 0" trigger="hover">
@@ -164,7 +172,7 @@ const hasAny = computed(
         <span
           class="trust-chip"
           :style="{ background: withAlpha(sysConfColor(sysConfidence), 0.12), color: sysConfColor(sysConfidence) }"
-          >{{ SYS_CONF_LABEL[sysConfidence] || sysConfidence }}</span
+          >{{ sysConfidenceLabel(sysConfidence) }}</span
         >
       </template>
       由程序合成（证据核验×数据完备度×排名等客观信号），与 AI 口头置信度相互独立：{{ sysConfidenceWhy || '—' }}

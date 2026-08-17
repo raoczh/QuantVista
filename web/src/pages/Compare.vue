@@ -3,7 +3,6 @@ import { ref, computed, onBeforeUnmount, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
-  NInput,
   NSelect,
   NSwitch,
   NSpin,
@@ -21,6 +20,9 @@ import { useLlmLabel } from '@/composables/useLlmLabel'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
+import StockPicker from '@/components/StockPicker.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
+import type { StockRef } from '@/composables/useStockActions'
 
 const message = useMessage()
 const route = useRoute()
@@ -29,19 +31,16 @@ const { pctColor, upColor, vars, withAlpha } = useUi()
 const { llmLabel } = useLlmLabel()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
-const marketOptions = [
-  { label: 'A 股', value: 'cn' },
-  { label: '港股', value: 'hk' },
-  { label: '美股', value: 'us' },
-]
-
 // ---------- 输入 ----------
-const inputs = ref<{ symbol: string; market: string }[]>([
-  { symbol: '', market: 'cn' },
-  { symbol: '', market: 'cn' },
+const inputs = ref<StockRef[]>([
+  { symbol: '', market: 'cn', name: '' },
+  { symbol: '', market: 'cn', name: '' },
 ])
 function addRow() {
-  if (inputs.value.length < 6) inputs.value.push({ symbol: '', market: 'cn' })
+  if (inputs.value.length < 6) inputs.value.push({ symbol: '', market: 'cn', name: '' })
+}
+function setCompareStock(index: number, stock: StockRef | null) {
+  inputs.value[index] = stock || { symbol: '', market: 'cn', name: '' }
 }
 function removeRow(i: number) {
   if (inputs.value.length > 2) inputs.value.splice(i, 1)
@@ -59,9 +58,10 @@ function applyStockActionQuery() {
     .filter(Boolean)
     .slice(0, 6)
   if (!syms.length) return
-  while (inputs.value.length < Math.max(2, syms.length)) inputs.value.push({ symbol: '', market: 'cn' })
+  while (inputs.value.length < Math.max(2, syms.length)) inputs.value.push({ symbol: '', market: 'cn', name: '' })
   syms.forEach((s, i) => {
     inputs.value[i].symbol = s
+    if (i === 0 && route.query.name) inputs.value[i].name = String(route.query.name)
     if (i === 0 && route.query.market) inputs.value[i].market = String(route.query.market)
   })
   const query = { ...route.query }
@@ -104,7 +104,7 @@ function applyCompareResult(value: CompareResult) {
 async function run() {
   const symbols = inputs.value.map((r) => ({ symbol: r.symbol.trim(), market: r.market })).filter((r) => r.symbol)
   if (symbols.length < 2) {
-    message.warning('请至少填写两只股票代码')
+    message.warning('请至少搜索并选择两只股票')
     return
   }
   if (withAI.value && !llmConfigs.value.length) {
@@ -314,8 +314,12 @@ function aiRefusalText(code: string) {
       <SectionCard title="选择标的">
         <div class="inputs">
           <div v-for="(row, i) in inputs" :key="i" class="in-row">
-            <n-input v-model:value="row.symbol" :placeholder="`股票 ${i + 1}，如 600000`" style="max-width: 200px" />
-            <n-select v-model:value="row.market" :options="marketOptions" style="width: 100px" />
+            <StockPicker
+              :model-value="row.symbol ? row : null"
+              :placeholder="`搜索第 ${i + 1} 只股票`"
+              class="compare-picker"
+              @update:model-value="setCompareStock(i, $event)"
+            />
             <n-button v-if="inputs.length > 2" size="small" quaternary type="error" @click="removeRow(i)">移除</n-button>
           </div>
           <n-button v-if="inputs.length < 6" size="small" dashed @click="addRow">＋ 增加一只（最多 6）</n-button>
@@ -351,10 +355,9 @@ function aiRefusalText(code: string) {
                   <th class="metric-col">指标</th>
                   <th v-for="r in rows" :key="r.symbol">
                     <div class="th-name">
-                      {{ r.name || r.symbol }}
+                      <StockIdentity :symbol="r.symbol" :market="r.market" :name="r.name" density="table" clickable />
                       <n-tag v-if="r.is_st" size="tiny" type="warning" :bordered="false">ST</n-tag>
                     </div>
-                    <div class="th-symbol qv-mono">{{ r.symbol }}</div>
                   </th>
                 </tr>
               </thead>
@@ -559,7 +562,7 @@ function aiRefusalText(code: string) {
 .ai {
   margin-top: 16px;
   padding: 14px 16px;
-  border-radius: 10px;
+  border-radius: 8px;
   background: v-bind('withAlpha(vars.primaryColor, 0.06)');
 }
 .ai-title {

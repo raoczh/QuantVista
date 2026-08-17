@@ -17,6 +17,8 @@ import {
   NSwitch,
   NPopconfirm,
   NEmpty,
+  NRadioGroup,
+  NRadioButton,
   useMessage,
 } from 'naive-ui'
 import {
@@ -45,6 +47,11 @@ import { useIsMobile } from '@/composables/useIsMobile'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import InvestmentPreferenceGuide from '@/components/InvestmentPreferenceGuide.vue'
+import NotificationSettings from '@/components/settings/NotificationSettings.vue'
+import StockPicker from '@/components/StockPicker.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
+import { useDisplayMode } from '@/composables/useDisplayMode'
+import type { StockRef } from '@/composables/useStockActions'
 
 const message = useMessage()
 const router = useRouter()
@@ -52,9 +59,10 @@ const route = useRoute()
 const auth = useAuthStore()
 // 手机上左标签表单太挤，切换为上下堆叠。
 const { isMobile } = useIsMobile()
+const { displayMode, setMode } = useDisplayMode()
 
 // 深链 ?tab=account 直达指定页签（GitHub 绑定回调后跳回账号安全）。
-const initialTab = ['llm', 'pref', 'account'].includes(String(route.query.tab)) ? String(route.query.tab) : 'llm'
+const initialTab = ['llm', 'pref', 'notifications', 'account'].includes(String(route.query.tab)) ? String(route.query.tab) : 'llm'
 
 /* ---------------- GitHub 绑定 ---------------- */
 const ghBusy = ref(false)
@@ -219,7 +227,6 @@ async function loadPref() {
     pref.value = await getPreference()
     parseBlacklist(pref.value.blacklist_json)
     parseRecFilters(pref.value.rec_filters_json)
-    parseGuardConfig(pref.value.guard_config_json)
   } catch (e) {
     message.error((e as Error).message)
   }
@@ -229,12 +236,12 @@ function applyGuidePreference(value: UserPreference) {
   pref.value = value
   parseBlacklist(value.blacklist_json)
   parseRecFilters(value.rec_filters_json)
-  parseGuardConfig(value.guard_config_json)
 }
 
 /* ---------------- 候选池回避规则（黑名单 + 成交额门槛） ---------------- */
 const blacklist = ref<BlacklistEntry[]>([])
-const newBlack = reactive({ symbol: '', reason: '' })
+const newBlack = reactive({ reason: '' })
+const newBlackStock = ref<StockRef | null>(null)
 
 function parseBlacklist(raw: string) {
   try {
@@ -245,17 +252,18 @@ function parseBlacklist(raw: string) {
   }
 }
 function addBlack() {
-  const sym = newBlack.symbol.trim()
+  const sym = newBlackStock.value?.symbol.trim() || ''
   if (!sym) {
-    message.warning('请输入股票代码')
+    message.warning('请先搜索并选择股票')
     return
   }
-  if (blacklist.value.some((b) => b.symbol === sym)) {
-    message.warning('该代码已在黑名单中')
+  const market = newBlackStock.value?.market || 'cn'
+  if (blacklist.value.some((b) => b.symbol === sym && b.market === market)) {
+    message.warning('该股票已在黑名单中')
     return
   }
-  blacklist.value.push({ symbol: sym, market: 'cn', reason: newBlack.reason.trim() })
-  newBlack.symbol = ''
+  blacklist.value.push({ symbol: sym, market, reason: newBlack.reason.trim() })
+  newBlackStock.value = null
   newBlack.reason = ''
 }
 function removeBlack(i: number) {
@@ -299,26 +307,6 @@ function parseRecFilters(raw: string) {
   }
 }
 
-/* ---------------- 智能守护（持仓止损止盈/异动 + 重点自选异动 + 持仓盘后事件主动推送） ---------------- */
-// 初值须与后端 defaultGuardConfig 对齐（默认全开、pos±5%/watch±7%、止损止盈与盘后事件子开关开）。
-const guardCfg = reactive({
-  enabled: true,
-  pos_pct: 5,
-  watch_pct: 7,
-  stop_loss: true,
-  take_profit: true,
-  evening: true,
-})
-function parseGuardConfig(raw: string) {
-  if (!raw) return
-  try {
-    const c = JSON.parse(raw)
-    if (c && typeof c === 'object') Object.assign(guardCfg, c)
-  } catch {
-    /* 坏数据用默认 */
-  }
-}
-
 /* ---------------- AI 配额用量 ---------------- */
 const quota = ref<UserQuota | null>(null)
 async function loadQuota() {
@@ -333,13 +321,16 @@ async function savePref() {
   if (!pref.value) return
   savingPref.value = true
   try {
+    const latest = await getPreference()
     pref.value.blacklist_json = blacklist.value.length ? JSON.stringify(blacklist.value) : ''
     pref.value.rec_filters_json = JSON.stringify(recFilters)
-    pref.value.guard_config_json = JSON.stringify(guardCfg)
-    pref.value = await updatePreference(pref.value)
+    pref.value = await updatePreference({
+      ...pref.value,
+      enable_notify: latest.enable_notify,
+      guard_config_json: latest.guard_config_json,
+    })
     parseBlacklist(pref.value.blacklist_json)
     parseRecFilters(pref.value.rec_filters_json)
-    parseGuardConfig(pref.value.guard_config_json)
     message.success('偏好已保存')
   } catch (e) {
     message.error((e as Error).message)
@@ -401,7 +392,7 @@ async function doExport(kind: ExportKind) {
 </script>
 
 <template>
-  <PageContainer title="设置" subtitle="模型 · 偏好 · 账号安全">
+  <PageContainer title="设置" subtitle="模型 · 偏好 · 通知 · 账号安全">
     <n-tabs type="line" animated :default-value="initialTab">
     <!-- LLM 配置 -->
     <n-tab-pane name="llm" tab="LLM 配置">
@@ -506,59 +497,21 @@ async function doExport(kind: ExportKind) {
           <n-form-item label="默认推荐数量">
             <n-input-number v-model:value="pref.default_rec_count" :min="3" :max="5" />
           </n-form-item>
-          <n-form-item label="开启提醒">
+          <n-form-item label="显示模式">
             <div class="notify-switch">
-              <n-switch v-model:value="pref.enable_notify" />
-              <span class="notify-hint">推送总闸：关闭后提醒命中仅在站内展示，不再外推到 Server酱/Webhook/ntfy</span>
+              <n-radio-group :value="displayMode" size="small" @update:value="setMode">
+                <n-radio-button value="plain">简明</n-radio-button>
+                <n-radio-button value="professional">专业</n-radio-button>
+              </n-radio-group>
+              <span class="notify-hint">简明模式优先显示白话名称；风险、数据缺失和时效信息不会隐藏。</span>
             </div>
           </n-form-item>
           <n-form-item label="收盘日报">
             <div class="notify-switch">
               <n-switch v-model:value="pref.enable_daily_report" />
               <span class="notify-hint"
-                >交易日 15:35 后自动生成今日复盘 + 明日选股推荐（消耗你的 LLM token，不占次数配额；未持有的推荐不会创建卖出提醒）</span
+                >交易日 15:35 后自动生成今日复盘 + 明日选股推荐（消耗你的 {{ displayMode === 'plain' ? 'AI 用量' : 'LLM Token' }}，不占次数配额；未持有的推荐不会创建卖出提醒）</span
               >
-            </div>
-          </n-form-item>
-          <n-form-item label="智能守护">
-            <div class="guard">
-              <div class="guard-row">
-                <n-switch v-model:value="guardCfg.enabled" size="small" />
-                <span class="notify-hint"
-                  >交易时段（09:30~15:05）每 15 分钟自动盯持仓与重点自选，触发止损/止盈或异动时主动推送（同日同标的去重，仅推到已启用的推送通道，受上方「开启提醒」总闸控制）</span
-                >
-              </div>
-              <template v-if="guardCfg.enabled">
-                <div class="guard-row">
-                  <span class="guard-label">持仓异动阈值</span>
-                  <n-input-number v-model:value="guardCfg.pos_pct" :min="1" :max="30" :precision="1" :step="0.5" size="small" style="width: 120px">
-                    <template #suffix>%</template>
-                  </n-input-number>
-                  <span class="notify-hint">持仓当日|涨跌幅|达此值推送</span>
-                </div>
-                <div class="guard-row">
-                  <span class="guard-label">自选异动阈值</span>
-                  <n-input-number v-model:value="guardCfg.watch_pct" :min="1" :max="30" :precision="1" :step="0.5" size="small" style="width: 120px">
-                    <template #suffix>%</template>
-                  </n-input-number>
-                  <span class="notify-hint">重点自选（重点关注或等待价格/已生成计划）当日|涨跌幅|达此值或涨跌停推送</span>
-                </div>
-                <div class="guard-row">
-                  <span class="guard-label">止损触达</span>
-                  <n-switch v-model:value="guardCfg.stop_loss" size="small" />
-                  <span class="guard-sep" />
-                  <span class="guard-label">止盈触达</span>
-                  <n-switch v-model:value="guardCfg.take_profit" size="small" />
-                  <span class="notify-hint">按持仓建仓时填写的计划止损/止盈价（当日最低/最高触及即推）</span>
-                </div>
-                <div class="guard-row">
-                  <span class="guard-label">持仓盘后事件</span>
-                  <n-switch v-model:value="guardCfg.evening" size="small" />
-                  <span class="notify-hint"
-                    >每日 19:35 推送持仓股的当日公告、龙虎榜上榜、财报披露临近（3 天内）、新业绩预告（同一事件只推一次；盘中涨跌幅达阈值或涨跌停由上方异动即时推送）</span
-                  >
-                </div>
-              </template>
             </div>
           </n-form-item>
           <n-form-item label="总投资资金">
@@ -580,12 +533,12 @@ async function doExport(kind: ExportKind) {
           <n-form-item label="候选池黑名单">
             <div class="blacklist">
               <div v-for="(b, i) in blacklist" :key="b.market + ':' + b.symbol" class="black-row">
-                <span class="qv-mono black-symbol">{{ b.symbol }}</span>
+                <StockIdentity :symbol="b.symbol" :market="b.market" density="table" clickable />
                 <span class="black-reason">{{ b.reason || '—' }}</span>
                 <n-button size="tiny" quaternary type="error" @click="removeBlack(i)">移除</n-button>
               </div>
               <div class="black-add">
-                <n-input v-model:value="newBlack.symbol" placeholder="代码，如 600000" size="small" style="width: 140px" />
+                <StockPicker v-model="newBlackStock" class="black-picker" />
                 <n-input v-model:value="newBlack.reason" placeholder="回避原因（可选）" size="small" style="flex: 1" @keyup.enter="addBlack" />
                 <n-button size="small" @click="addBlack">加入</n-button>
               </div>
@@ -640,9 +593,13 @@ async function doExport(kind: ExportKind) {
             >次数上限：<b class="qv-tnum">{{ quota.action_limit }}</b>（用尽后 AI 功能将被熔断）</span
           >
           <span v-else>次数上限：不限</span>
-          <span>累计消耗 token：<b class="qv-tnum">{{ quota.token_used.toLocaleString() }}</b>（参考）</span>
+          <span>{{ displayMode === 'plain' ? '累计 AI 用量' : '累计 Token' }}：<b class="qv-tnum">{{ quota.token_used.toLocaleString() }}</b>（参考）</span>
         </div>
       </SectionCard>
+    </n-tab-pane>
+
+    <n-tab-pane name="notifications" tab="通知设置">
+      <NotificationSettings />
     </n-tab-pane>
 
     <!-- 账号安全 -->
@@ -817,7 +774,7 @@ async function doExport(kind: ExportKind) {
   gap: 6px;
   padding: 12px;
   border: 1px solid rgba(128, 128, 128, 0.18);
-  border-radius: 10px;
+  border-radius: 8px;
 }
 .llm-head {
   display: flex;
@@ -880,27 +837,6 @@ async function doExport(kind: ExportKind) {
 .recf-sep {
   opacity: 0.5;
 }
-/* 智能守护 */
-.guard {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  width: 100%;
-}
-.guard-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-.guard-label {
-  font-size: 12px;
-  opacity: 0.75;
-  min-width: 88px;
-}
-.guard-sep {
-  width: 8px;
-}
 .blacklist {
   display: flex;
   flex-direction: column;
@@ -913,9 +849,6 @@ async function doExport(kind: ExportKind) {
   gap: 12px;
   font-size: 13px;
 }
-.black-symbol {
-  min-width: 70px;
-}
 .black-reason {
   flex: 1;
   opacity: 0.7;
@@ -924,8 +857,11 @@ async function doExport(kind: ExportKind) {
   display: flex;
   align-items: center;
   gap: 8px;
-  /* 360px 下代码输入 140px + 原因输入 + 按钮同行会把原因挤到 80px，允许换行 */
   flex-wrap: wrap;
+}
+.black-picker {
+  flex: 1 1 240px;
+  min-width: 0;
 }
 .quota {
   display: flex;

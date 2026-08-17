@@ -180,7 +180,7 @@ docker exec -it quantvista-ntfy ntfy access quantvista "qv-*" rw       # 仅授�
 docker exec -it quantvista-ntfy ntfy token add quantvista              # 输出 tk_xxx，后端发布用
 ```
 
-- `tk_xxx` token 填在 QuantVista「条件提醒 → 推送通道」的 ntfy 通道里（整串配置加密落库）；
+- `tk_xxx` token 填在 QuantVista「设置 → 通知设置」的 ntfy 通道里（整串配置加密落库）；
 - 手机 ntfy App 用「用户名 quantvista + 密码」登录订阅；
 - 验证 deny-all 生效：`curl -d test https://ntfy.<域名>/qv-test` 应返回 403。
 
@@ -203,6 +203,6 @@ CF 加 `ntfy` 子域 A 记录指向服务器（橙云代理即可——免费版
 ### 8.5 应用侧接线
 
 - **管理后台 → 站点地址**：填 `https://<主域名>`（SiteBaseURL）。推送通知的点击跳转链接由它拼接；不填则通知不带跳转。
-- **用户侧**：条件提醒页 → 推送通道 → 类型选「ntfy（App 推送）」，填服务地址 `https://ntfy.<域名>`、
+- **用户侧**：设置页 → 通知设置 → 类型选「ntfy」，填服务地址 `https://ntfy.<域名>`、
   topic（如 `qv-u1`，须 `qv-` 前缀）、token（8.2 生成的 `tk_xxx`），添加后点「测试」验证可达。
 - **手机端**：ntfy App 安装、订阅与国产 ROM 保活配置见 `mobile/README.md`。

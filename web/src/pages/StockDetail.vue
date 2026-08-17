@@ -53,6 +53,7 @@ import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
 import StockCoverageMatrix from '@/components/StockCoverageMatrix.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
 import { createLoadEpoch, resolveCoverageStatus, type StockCoverageItem } from '@/components/stockCoverage'
 import StockDecisionSummary from '@/components/stock-detail/StockDecisionSummary.vue'
 import StockTabState from '@/components/stock-detail/StockTabState.vue'
@@ -157,7 +158,7 @@ function markCoverage(key: CoverageKey, error?: unknown) {
 const stockRef = computed(() => ({
   symbol: symbol.value,
   market: market.value,
-  name: quote.value?.name || symbol.value,
+  name: quote.value?.name || '',
 }))
 
 function sameStock(item: { symbol: string; market?: string }) {
@@ -1375,7 +1376,10 @@ function scoreType(total: number) {
 </script>
 
 <template>
-  <PageContainer :title="quote ? `${quote.name} ${symbol}` : `个股详情 ${symbol}`" subtitle="决策摘要 · 分区研究 · 原始证据">
+  <PageContainer :title="quote?.name || '名称待补全'" subtitle="决策摘要 · 分区研究 · 原始证据">
+    <template #title>
+      <StockIdentity :symbol="symbol" :market="market" :name="quote?.name" />
+    </template>
     <template #actions>
       <n-button size="small" quaternary :loading="pageRefreshing" @click="refreshVisible">刷新当前</n-button>
     </template>

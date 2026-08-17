@@ -29,6 +29,7 @@ import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import StatCard from '@/components/StatCard.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
 
 const router = useRouter()
 const { vars, isDark, pctColor, upColor } = useUi()
@@ -198,11 +199,7 @@ const lhbColumns = computed<DataTableColumns<LhbTableRow>>(() => [
     key: 'name',
     width: 130,
     fixed: 'left',
-    render: (row) =>
-      h('button', { class: 'stock-link', onClick: () => goStock(row.symbol) }, [
-        h('span', { class: 'stock-name' }, row.name || row.symbol),
-        h('span', { class: 'stock-symbol qv-mono' }, row.symbol),
-      ]),
+    render: (row) => h(StockIdentity, { symbol: row.symbol, market: 'cn', name: row.name, density: 'table', clickable: true }),
   },
   { title: '收盘', key: 'close', align: 'right', width: 88, render: (row) => row.close.toFixed(2) },
   {
@@ -256,11 +253,7 @@ const popularityColumns = computed<DataTableColumns<PopularityDailyItem>>(() => 
     title: '股票',
     key: 'name',
     width: 128,
-    render: (row) =>
-      h('button', { class: 'stock-link is-row', onClick: () => goStock(row.symbol) }, [
-        h('span', { class: 'stock-name' }, row.name || row.symbol),
-        h('span', { class: 'stock-symbol qv-mono' }, row.symbol),
-      ]),
+    render: (row) => h(StockIdentity, { symbol: row.symbol, market: 'cn', name: row.name, density: 'table', clickable: true }),
   },
   {
     title: '排名变化',
@@ -340,7 +333,7 @@ onBeforeUnmount(() => {
                   @click="goStock(stock.symbol)"
                 >
                   <span class="fund-rank qv-figure">{{ index + 1 }}</span>
-                  <span class="fund-stock"><strong>{{ stock.name }}</strong><small class="qv-mono">{{ stock.symbol }}</small></span>
+                  <span class="fund-stock"><StockIdentity :symbol="stock.symbol" market="cn" :name="stock.name" density="table" /></span>
                   <span class="fund-industry">{{ stock.industry || '行业未知' }}</span>
                   <span class="fund-value qv-tnum" :style="{ color: upColor }">{{ fmtAmount(stock.seal_fund) }}</span>
                 </button>
@@ -371,7 +364,7 @@ onBeforeUnmount(() => {
                   type="button"
                   @click="goStock(stock.symbol)"
                 >
-                  <span class="ladder-head"><strong>{{ stock.name }}</strong><span class="qv-mono">{{ stock.symbol }}</span></span>
+                  <span class="ladder-head"><StockIdentity :symbol="stock.symbol" market="cn" :name="stock.name" density="table" /></span>
                   <span class="ladder-meta">{{ stock.industry || '行业未知' }} · 封单 {{ fmtAmount(stock.seal_fund) }}</span>
                   <span class="ladder-meta">首次封板 {{ fmtSealTime(stock.first_seal_at) }} · 炸板 {{ stock.break_count }} 次</span>
                 </button>

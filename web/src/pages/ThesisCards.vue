@@ -25,6 +25,9 @@ import {
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import StockPicker from '@/components/StockPicker.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
+import type { StockRef } from '@/composables/useStockActions'
 
 const message = useMessage()
 const route = useRoute()
@@ -88,10 +91,18 @@ const form = ref({
   track_metrics: '',
   next_review_ts: null as number | null,
 })
+const selectedStock = ref<StockRef | null>(null)
+function updateSelectedStock(stock: StockRef | null) {
+  selectedStock.value = stock
+  form.value.symbol = stock?.symbol || ''
+  if (stock) form.value.market = stock.market
+}
 function resetForm() {
   form.value = { symbol: '', market: 'cn', thesis: '', key_evidence: '', risks: '', kill_switches: '', track_metrics: '', next_review_ts: null }
+  selectedStock.value = null
 }
 function editCard(c: ThesisCard) {
+  selectedStock.value = { symbol: c.symbol, market: c.market, name: c.name || '' }
   form.value = {
     symbol: c.symbol,
     market: c.market,
@@ -107,7 +118,7 @@ function editCard(c: ThesisCard) {
 
 async function submit() {
   if (!form.value.symbol.trim()) {
-    message.warning('请输入股票代码')
+    message.warning('请先搜索并选择股票')
     return
   }
   if (!form.value.thesis.trim()) {
@@ -189,8 +200,11 @@ onMounted(() => {
   load()
   // 深链预填：/thesis?add=1&symbol=&market=（自选/持仓行内入口）
   if (route.query.add === '1' && route.query.symbol) {
-    form.value.symbol = String(route.query.symbol)
-    form.value.market = String(route.query.market || 'cn')
+    updateSelectedStock({
+      symbol: String(route.query.symbol),
+      market: String(route.query.market || 'cn'),
+      name: String(route.query.name || ''),
+    })
     showForm.value = true
     router.replace({ query: {} })
   }
@@ -214,7 +228,7 @@ onMounted(() => {
         <!-- 新建/编辑表单 -->
         <div v-if="showForm" class="form">
           <div class="form-row">
-            <n-input v-model:value="form.symbol" placeholder="股票代码，如 600000" style="max-width: 180px" />
+            <StockPicker :model-value="selectedStock" class="thesis-stock-picker" @update:model-value="updateSelectedStock" />
             <n-date-picker v-model:value="form.next_review_ts" type="date" placeholder="下次复盘日期（可选）" clearable style="max-width: 200px" />
           </div>
           <n-input v-model:value="form.thesis" type="textarea" :rows="2" placeholder="核心逻辑（必填）：为什么值得关注/持有？一句到三句说清" />
@@ -233,8 +247,7 @@ onMounted(() => {
             <div v-for="c in cards" :key="c.id" class="card" :class="{ due: isDue(c) }">
               <div class="card-head">
                 <div class="card-title">
-                  <span class="name">{{ c.name || c.symbol }}</span>
-                  <span class="symbol qv-mono">{{ c.symbol }}</span>
+                  <StockIdentity :symbol="c.symbol" :market="c.market" :name="c.name" density="table" clickable actions />
                   <n-tag size="tiny" :type="statusTag[c.status]?.type" :bordered="false" round>
                     {{ statusTag[c.status]?.label }}
                   </n-tag>
@@ -361,7 +374,7 @@ onMounted(() => {
 }
 .card {
   border: 1px solid var(--qv-divider);
-  border-radius: 10px;
+  border-radius: 8px;
   padding: 14px 16px;
   display: flex;
   flex-direction: column;

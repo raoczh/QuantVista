@@ -100,7 +100,7 @@ function applyStockContext(context: AlertStockContext | null) {
   form.value.market = context.market.trim() || 'cn'
   form.value.name = context.name.trim()
   selectedStock.value = context.symbol
-    ? { symbol: context.symbol, market: context.market || 'cn', name: context.name || context.symbol, as_of: '', in_watchlist: false, has_position: false }
+    ? { symbol: context.symbol, market: context.market || 'cn', name: context.name || '', as_of: '', in_watchlist: false, has_position: false }
     : null
 }
 
@@ -168,7 +168,7 @@ const stockOptions = computed<SelectOption[]>(() => {
     rows.unshift(selectedStock.value)
   }
   return rows.map((item) => ({
-    label: `${item.name || item.symbol} · ${item.symbol}`,
+    label: `${item.name || '名称待补全'} · ${item.symbol}`,
     value: stockKey(item),
   }))
 })
@@ -221,11 +221,11 @@ const positionOptions = computed<SelectOption[]>(() => {
     const key = `${position.market}:${position.symbol}`
     if (seen.has(key)) continue
     seen.add(key)
-    options.push({ label: `${position.name || position.symbol} · ${position.symbol}`, value: key })
+    options.push({ label: `${position.name || '名称待补全'} · ${position.symbol}`, value: key })
   }
   if (form.value.symbol) {
     const key = `${form.value.market}:${form.value.symbol}`
-    if (!seen.has(key)) options.unshift({ label: `${form.value.name || form.value.symbol} · ${form.value.symbol}（当前列表未找到）`, value: key })
+    if (!seen.has(key)) options.unshift({ label: `${form.value.name || '名称待补全'} · ${form.value.symbol}（当前列表未找到）`, value: key })
   }
   return options
 })
@@ -268,7 +268,7 @@ function changePositionScope(value: string | number) {
   } else if (props.stockContext?.symbol && !editingId.value) {
     form.value.symbol = props.stockContext.symbol
     form.value.market = props.stockContext.market || 'cn'
-    form.value.name = props.stockContext.name || props.stockContext.symbol
+    form.value.name = props.stockContext.name || ''
   } else {
     form.value.symbol = ''
     form.value.name = ''
@@ -424,7 +424,7 @@ watch(
     expertExpanded.value = inferred == null
     positionScope.value = isPositionAlertKind(rule.kind) && !rule.symbol ? 'all' : 'single'
     selectedStock.value = rule.symbol
-      ? { symbol: rule.symbol, market: rule.market, name: rule.name || rule.symbol, as_of: '', in_watchlist: false, has_position: isPositionAlertKind(rule.kind) }
+      ? { symbol: rule.symbol, market: rule.market, name: rule.name || '', as_of: '', in_watchlist: false, has_position: isPositionAlertKind(rule.kind) }
       : null
     wizardStep.value = 3
     saveError.value = ''
@@ -804,6 +804,12 @@ onMounted(() => void loadPositions())
   line-height: 1.7;
 }
 @media (max-width: 480px) {
+  .wizard-steps :deep(.n-step) {
+    min-width: 0;
+  }
+  .wizard-steps :deep(.n-step-content) {
+    display: none;
+  }
   .template-grid {
     grid-template-columns: 1fr;
   }

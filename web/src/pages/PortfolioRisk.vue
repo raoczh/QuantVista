@@ -23,6 +23,10 @@ import * as echarts from 'echarts'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import StatCard from '@/components/StatCard.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
+import { TERM_DICTIONARY, type TermKey } from '@/components/termDictionary'
+import { useDisplayMode } from '@/composables/useDisplayMode'
+import TermHelp from '@/components/TermHelp.vue'
 import { useUi } from '@/composables/useUi'
 import {
   addCashFlow,
@@ -58,6 +62,11 @@ const message = useMessage()
 const route = useRoute()
 const router = useRouter()
 const { vars, isDark } = useUi()
+const { isPlain } = useDisplayMode()
+function metricLabel(term: TermKey) {
+  const definition = TERM_DICTIONARY[term]
+  return isPlain.value ? definition.plain : definition.professional
+}
 const accounts = ref<PortfolioAccount[]>([])
 const accountId = ref<number | null>(null)
 const overview = ref<PortfolioOverview | null>(null)
@@ -649,7 +658,7 @@ const enabledWeight = computed(() =>
                     :key="`${h.market}:${h.symbol}`"
                   >
                     <td>
-                      {{ h.name || h.symbol }}<small>{{ h.symbol }}</small>
+                      <StockIdentity :symbol="h.symbol" market="cn" :name="h.name" density="table" clickable />
                     </td>
                     <td>{{ h.industry || '未知' }}</td>
                     <td class="num">{{ h.quantity }}</td>
@@ -691,9 +700,13 @@ const enabledWeight = computed(() =>
           </div>
         </n-tab-pane>
         <n-tab-pane name="risk" tab="风险与相关性">
+          <div class="risk-term-help">
+            <TermHelp term="twr" /> · <TermHelp term="sharpe" /> · <TermHelp term="sortino" /> ·
+            <TermHelp term="beta" /> · <TermHelp term="alpha" />
+          </div>
           <div class="metric-grid">
             <StatCard
-              label="TWR"
+              :label="metricLabel('twr')"
               :value="metric(risk?.twr_pct, '%')"
             /><StatCard
               label="年化波动"
@@ -706,11 +719,11 @@ const enabledWeight = computed(() =>
             /><StatCard
               label="下行波动"
               :value="metric(risk?.downside_volatility_pct, '%')"
-            /><StatCard label="Sharpe" :value="metric(risk?.sharpe)" /><StatCard
-              label="Sortino"
+            /><StatCard :label="metricLabel('sharpe')" :value="metric(risk?.sharpe)" /><StatCard
+              :label="metricLabel('sortino')"
               :value="metric(risk?.sortino)"
-            /><StatCard label="Beta" :value="metric(risk?.beta)" /><StatCard
-              label="Alpha"
+            /><StatCard :label="metricLabel('beta')" :value="metric(risk?.beta)" /><StatCard
+              :label="metricLabel('alpha')"
               :value="metric(risk?.alpha_pct, '%')"
             /><StatCard
               label="最大回撤"
@@ -789,7 +802,7 @@ const enabledWeight = computed(() =>
                     v-for="item in risk.risk_contribution.items"
                     :key="item.symbol"
                   >
-                    <td>{{ item.symbol }}</td>
+                    <td><StockIdentity :symbol="item.symbol" market="cn" density="table" clickable /></td>
                     <td class="num">{{ item.weight_pct.toFixed(2) }}%</td>
                     <td class="num">
                       {{
@@ -889,7 +902,7 @@ const enabledWeight = computed(() =>
                 </thead>
                 <tbody>
                   <tr v-for="c in stress.contributions" :key="c.symbol">
-                    <td>{{ c.name || c.symbol }}</td>
+                    <td><StockIdentity :symbol="c.symbol" market="cn" :name="c.name" density="table" clickable /></td>
                     <td class="num">{{ c.loss_pct }}%</td>
                     <td class="num">{{ money(c.loss_amount) }}</td>
                   </tr>

@@ -3,10 +3,6 @@ import { ref, onMounted, computed, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
-  NInput,
-  NSelect,
-  NForm,
-  NFormItem,
   NTag,
   NSpin,
   NEmpty,
@@ -35,20 +31,12 @@ import {
   type AlertEvent,
   type AlertEventStatus,
 } from '@/api/alert'
-import {
-  listChannels,
-  createChannel,
-  updateChannel,
-  deleteChannel,
-  testChannel,
-  type NotifyChannel,
-  type NotifyKind,
-} from '@/api/notify'
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import AlertWizard from '@/components/alerts/AlertWizard.vue'
 import type { AlertStockContext } from '@/components/alerts/alertTemplates'
+import StockIdentity from '@/components/StockIdentity.vue'
 
 const message = useMessage()
 const dialog = useDialog()
@@ -238,7 +226,7 @@ watch(() => route.query._stock_action, applyStockActionQuery)
 onMounted(async () => {
   // 从自选/持仓「设提醒」跳转预填。
   applyStockActionQuery()
-  await Promise.all([load(), loadChannels(), loadEvents()])
+  await Promise.all([load(), loadEvents()])
   await openRouteEvent()
 })
 
@@ -404,11 +392,11 @@ function operatorLabel(op?: string) {
   return op || ''
 }
 function contextNumber(value: number | undefined, unit = '') {
-  if (value == null) return 'unknown'
+  if (value == null) return '暂时无法判断'
   return `${Number(value.toFixed(4))}${unit}`
 }
 function contextTime(value?: string) {
-  if (!value) return 'unknown'
+  if (!value) return '暂时无法判断'
   const parsed = new Date(value)
   return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString('zh-CN', { hour12: false })
 }
@@ -423,95 +411,15 @@ function metricLabel(name: string) {
   return labels[name] || name
 }
 
-// ---------- 推送通道 ----------
-const channels = ref<NotifyChannel[]>([])
-const chForm = ref<{ kind: NotifyKind; name: string; target: string; enabled: boolean }>({
-  kind: 'serverchan',
-  name: '',
-  target: '',
-  enabled: true,
-})
-// ntfy 通道三字段（提交时拼 JSON 作 target，整串加密落库）。
-const ntfyForm = ref({ url: '', topic: '', token: '' })
-const kindNotifyOptions = [
-  { label: 'Server酱', value: 'serverchan' },
-  { label: '自定义 Webhook', value: 'webhook' },
-  { label: 'ntfy（App 推送）', value: 'ntfy' },
-]
-async function loadChannels() {
-  try {
-    channels.value = await listChannels()
-  } catch (error) {
-    message.error(alertRequestMessage('action', error))
-  }
-}
-const chAdding = ref(false)
-async function addChannel() {
-  if (chAdding.value) return
-  let target = chForm.value.target.trim()
-  if (chForm.value.kind === 'ntfy') {
-    const { url, topic, token } = ntfyForm.value
-    if (!url.trim() || !topic.trim()) {
-      message.warning('请填写 ntfy 服务地址与 topic')
-      return
-    }
-    target = JSON.stringify({ url: url.trim(), topic: topic.trim(), token: token.trim() })
-  } else if (!target) {
-    message.warning(chForm.value.kind === 'serverchan' ? '请输入 Server酱 SendKey' : '请输入 Webhook 地址')
-    return
-  }
-  chAdding.value = true
-  try {
-    await createChannel({ ...chForm.value, target })
-    chForm.value.target = ''
-    chForm.value.name = ''
-    ntfyForm.value = { url: '', topic: '', token: '' }
-    await loadChannels()
-    message.success('已添加推送通道')
-  } catch (error) {
-    message.error(alertRequestMessage('action', error))
-  } finally {
-    chAdding.value = false
-  }
-}
-async function toggleChannel(ch: NotifyChannel) {
-  try {
-    await updateChannel(ch.id, { kind: ch.kind, name: ch.name, enabled: !ch.enabled })
-    await loadChannels()
-  } catch (error) {
-    message.error(alertRequestMessage('action', error))
-  }
-}
-async function testCh(ch: NotifyChannel) {
-  try {
-    await testChannel(ch.id)
-    message.success('测试推送已发送，请查收')
-  } catch (error) {
-    message.error(alertRequestMessage('action', error))
-  }
-}
-async function removeChannel(ch: NotifyChannel) {
-  try {
-    await deleteChannel(ch.id)
-    await loadChannels()
-    message.success('已删除')
-  } catch (error) {
-    message.error(alertRequestMessage('action', error))
-  }
-}
-function channelKindLabel(k: string) {
-  if (k === 'serverchan') return 'Server酱'
-  if (k === 'ntfy') return 'ntfy'
-  return 'Webhook'
-}
 </script>
 
 <template>
   <PageContainer
     title="条件提醒"
-    subtitle="持仓成本止盈止损 / 移动止盈 · 到价 / 异动 / 均线 / 突破 · 可配推送通道主动通知"
+    subtitle="持仓成本止盈止损 / 移动止盈 · 到价 / 异动 / 均线 / 突破 · 命中历史"
   >
     <template #actions>
+      <n-button size="small" secondary @click="router.push({ name: 'settings', query: { tab: 'notifications' } })">通知设置</n-button>
       <n-button size="small" quaternary :loading="evaluating" @click="runEvaluate">立即检查</n-button>
       <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>
     </template>
@@ -528,66 +436,6 @@ function channelKindLabel(k: string) {
           />
         </SectionCard>
 
-        <SectionCard title="推送通道">
-          <n-form label-placement="top" :show-feedback="false" class="form">
-            <n-form-item label="通道类型">
-              <n-select v-model:value="chForm.kind" :options="kindNotifyOptions" />
-            </n-form-item>
-            <template v-if="chForm.kind === 'ntfy'">
-              <n-form-item label="ntfy 服务地址">
-                <n-input v-model:value="ntfyForm.url" placeholder="https://ntfy.example.com（自建，必须 https）" />
-              </n-form-item>
-              <n-form-item label="Topic">
-                <n-input v-model:value="ntfyForm.topic" placeholder="如 qv-u1（与手机 ntfy App 订阅一致）" />
-              </n-form-item>
-              <n-form-item label="访问令牌 Token">
-                <n-input v-model:value="ntfyForm.token" placeholder="tk_xxx（服务端 ntfy token add 生成，可空）" />
-              </n-form-item>
-            </template>
-            <n-form-item v-else :label="chForm.kind === 'serverchan' ? 'SendKey' : 'Webhook 地址'">
-              <n-input
-                v-model:value="chForm.target"
-                :placeholder="chForm.kind === 'serverchan' ? 'Server酱 SendKey' : 'https://...'"
-              />
-            </n-form-item>
-            <n-button type="primary" ghost block :loading="chAdding" @click="addChannel">添加通道</n-button>
-            <div class="hint">
-              提醒命中时会主动推送到已启用的通道（同一提醒每天最多推一次）。密钥加密存储、不回显。ntfy
-              为自建 App 系统级推送，服务端部署与手机配置见 mobile/README.md。
-            </div>
-          </n-form>
-
-          <div v-if="channels.length" class="channels">
-            <div v-for="ch in channels" :key="ch.id" class="channel">
-              <div class="ch-main">
-                <div class="ch-title">
-                  <n-tag
-                    size="tiny"
-                    round
-                    :bordered="false"
-                    :type="ch.kind === 'serverchan' ? 'info' : ch.kind === 'ntfy' ? 'success' : 'default'"
-                    >{{ channelKindLabel(ch.kind) }}</n-tag
-                  >
-                  <span class="ch-name">{{ ch.name }}</span>
-                  <n-tag size="tiny" round :bordered="false" :type="ch.enabled ? 'success' : 'default'">{{
-                    ch.enabled ? '启用' : '停用'
-                  }}</n-tag>
-                </div>
-                <div v-if="ch.last_error" class="ch-err">上次推送失败，请测试通道或检查配置</div>
-              </div>
-              <div class="ch-actions">
-                <n-button size="tiny" quaternary @click="testCh(ch)">测试</n-button>
-                <n-button size="tiny" quaternary @click="toggleChannel(ch)">{{ ch.enabled ? '停用' : '启用' }}</n-button>
-                <n-popconfirm @positive-click="removeChannel(ch)">
-                  <template #trigger>
-                    <n-button size="tiny" quaternary type="error">删</n-button>
-                  </template>
-                  删除该推送通道？
-                </n-popconfirm>
-              </div>
-            </div>
-          </div>
-        </SectionCard>
       </div>
 
       <!-- 右：规则列表 + 命中历史 -->
@@ -603,8 +451,8 @@ function channelKindLabel(k: string) {
               <div v-for="r in rules" :key="r.id" class="rule" :class="{ hit: isHitToday(r) }">
                 <div class="rule-main">
                   <div class="rule-title">
-                    <span class="rule-name">{{ ruleScope(r) }}</span>
-                    <span v-if="r.symbol" class="rule-symbol qv-mono">{{ r.symbol }}</span>
+                    <StockIdentity v-if="r.symbol" :symbol="r.symbol" :name="r.name" density="table" clickable />
+                    <span v-else class="rule-name">{{ ruleScope(r) }}</span>
                     <n-tag size="tiny" round :bordered="false" :type="statusTag(r).type">{{
                       statusTag(r).text
                     }}</n-tag>
@@ -667,8 +515,7 @@ function channelKindLabel(k: string) {
                 <div class="ev-main">
                   <div class="ev-title">
                     <n-tag size="tiny" round :bordered="false">{{ kindLabelMap[ev.kind] || ev.kind }}</n-tag>
-                    <span class="ev-name">{{ ev.name || ev.symbol }}</span>
-                    <span class="ev-symbol qv-mono">{{ ev.symbol }}</span>
+                    <StockIdentity :symbol="ev.symbol" :name="ev.name" density="table" clickable />
                     <n-tag size="tiny" round :bordered="false" :type="eventStatusTag(ev.status).type">{{
                       eventStatusTag(ev.status).text
                     }}</n-tag>
@@ -712,10 +559,7 @@ function channelKindLabel(k: string) {
         </n-alert>
         <template v-if="selectedEvent">
           <div class="detail-head">
-            <div>
-              <strong>{{ selectedEvent.name || selectedEvent.symbol }}</strong>
-              <span class="detail-symbol qv-mono">{{ selectedEvent.symbol }}</span>
-            </div>
+            <StockIdentity :symbol="selectedEvent.symbol" :name="selectedEvent.name" clickable actions />
             <n-tag size="small" :type="eventStatusTag(selectedEvent.status).type">
               {{ eventStatusTag(selectedEvent.status).text }}
             </n-tag>
@@ -731,7 +575,7 @@ function channelKindLabel(k: string) {
                 <span>实际值</span><b class="qv-tnum">{{ selectedEvent.context.trigger.value == null ? '见下方财报事实' : contextNumber(selectedEvent.context.trigger.value, selectedEvent.context.trigger.unit) }}</b>
                 <span>判断条件</span><b class="qv-tnum">{{ operatorLabel(selectedEvent.context.trigger.operator) }}<template v-if="selectedEvent.context.trigger.threshold != null"> {{ contextNumber(selectedEvent.context.trigger.threshold, selectedEvent.context.trigger.unit) }}</template></b>
                 <span>数据时点</span><b>{{ contextTime(selectedEvent.context.as_of) }}</b>
-                <span>数据来源</span><b>{{ selectedEvent.context.source || 'unknown' }}</b>
+                <span>数据来源</span><b>{{ selectedEvent.context.source || '暂时无法判断' }}</b>
               </div>
             </div>
 
@@ -741,17 +585,17 @@ function channelKindLabel(k: string) {
                 <span>现价</span><b class="qv-tnum">{{ contextNumber(selectedEvent.context.quote.price, ' 元') }}</b>
                 <span>最高 / 最低</span><b class="qv-tnum">{{ contextNumber(selectedEvent.context.quote.high, ' 元') }} / {{ contextNumber(selectedEvent.context.quote.low, ' 元') }}</b>
                 <span>涨跌幅</span><b class="qv-tnum">{{ contextNumber(selectedEvent.context.quote.change_pct, '%') }}</b>
-                <span>来源 / 时点</span><b>{{ selectedEvent.context.quote.source || 'unknown' }} / {{ contextTime(selectedEvent.context.quote.as_of) }}</b>
+                <span>来源 / 数据截止时间</span><b>{{ selectedEvent.context.quote.source || '暂时无法判断' }} / {{ contextTime(selectedEvent.context.quote.as_of) }}</b>
               </div>
             </div>
 
             <div v-if="selectedEvent.context.bar" class="detail-section">
               <div class="detail-section-title">日线依据</div>
               <div class="detail-grid">
-                <span>交易日</span><b>{{ selectedEvent.context.bar.trade_date || 'unknown' }}</b>
+                <span>交易日</span><b>{{ selectedEvent.context.bar.trade_date || '暂时无法判断' }}</b>
                 <span>开 / 高 / 低 / 收</span><b class="qv-tnum">{{ contextNumber(selectedEvent.context.bar.open) }} / {{ contextNumber(selectedEvent.context.bar.high) }} / {{ contextNumber(selectedEvent.context.bar.low) }} / {{ contextNumber(selectedEvent.context.bar.close) }}</b>
-                <span>样本数</span><b class="qv-tnum">{{ selectedEvent.context.bar.sample_size ?? 'unknown' }}</b>
-                <span>数据来源</span><b>{{ selectedEvent.context.bar.source || 'unknown' }}</b>
+                <span>样本数</span><b class="qv-tnum">{{ selectedEvent.context.bar.sample_size ?? '暂时无法判断' }}</b>
+                <span>数据来源</span><b>{{ selectedEvent.context.bar.source || '暂时无法判断' }}</b>
               </div>
             </div>
 
@@ -761,7 +605,7 @@ function channelKindLabel(k: string) {
                 <span>指标</span><b>{{ metricLabel(selectedEvent.context.indicator.name) }}<template v-if="selectedEvent.context.indicator.period">（{{ selectedEvent.context.indicator.period }} 日）</template></b>
                 <span>指标值</span><b class="qv-tnum">{{ contextNumber(selectedEvent.context.indicator.value, selectedEvent.context.indicator.unit) }}</b>
                 <span v-if="selectedEvent.context.indicator.reference != null">参考值</span><b v-if="selectedEvent.context.indicator.reference != null" class="qv-tnum">{{ contextNumber(selectedEvent.context.indicator.reference) }}</b>
-                <span>来源 / 时点</span><b>{{ selectedEvent.context.indicator.source || 'unknown' }} / {{ contextTime(selectedEvent.context.indicator.as_of) }}</b>
+                <span>来源 / 数据截止时间</span><b>{{ selectedEvent.context.indicator.source || '暂时无法判断' }} / {{ contextTime(selectedEvent.context.indicator.as_of) }}</b>
               </div>
             </div>
 
@@ -787,7 +631,7 @@ function channelKindLabel(k: string) {
                 <span v-if="selectedEvent.context.financial.predict_type">预告类型</span><b v-if="selectedEvent.context.financial.predict_type">{{ selectedEvent.context.financial.predict_type }}</b>
                 <span v-if="selectedEvent.context.financial.predict_finance">预测指标</span><b v-if="selectedEvent.context.financial.predict_finance">{{ selectedEvent.context.financial.predict_finance }}</b>
                 <span v-if="selectedEvent.context.financial.amp_lower != null || selectedEvent.context.financial.amp_upper != null">预计变动</span><b v-if="selectedEvent.context.financial.amp_lower != null || selectedEvent.context.financial.amp_upper != null" class="qv-tnum">{{ contextNumber(selectedEvent.context.financial.amp_lower, '%') }} 至 {{ contextNumber(selectedEvent.context.financial.amp_upper, '%') }}</b>
-                <span>来源 / 时点</span><b>{{ selectedEvent.context.financial.source || 'unknown' }} / {{ contextTime(selectedEvent.context.financial.as_of) }}</b>
+                <span>来源 / 数据截止时间</span><b>{{ selectedEvent.context.financial.source || '暂时无法判断' }} / {{ contextTime(selectedEvent.context.financial.as_of) }}</b>
               </div>
             </div>
 
@@ -903,47 +747,6 @@ function channelKindLabel(k: string) {
 }
 .mobile-actions {
   display: none;
-}
-/* 推送通道 */
-.channels {
-  display: flex;
-  flex-direction: column;
-  margin-top: 8px;
-  border-top: 1px solid var(--qv-divider);
-}
-.channel {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 4px;
-  border-bottom: 1px solid var(--qv-divider);
-}
-.channel:last-child {
-  border-bottom: none;
-}
-.ch-main {
-  flex: 1;
-  min-width: 0;
-}
-.ch-title {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.ch-name {
-  font-size: 13px;
-  font-weight: 500;
-}
-.ch-err {
-  font-size: 11px;
-  color: v-bind('upColor');
-  margin-top: 3px;
-}
-.ch-actions {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex-shrink: 0;
 }
 /* 命中历史 */
 .ev-toolbar {

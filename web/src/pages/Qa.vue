@@ -34,11 +34,15 @@ import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { getApiErrorCode } from '@/api/client'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
+import { useDisplayMode } from '@/composables/useDisplayMode'
 import { renderMarkdown } from '@/lib/markdown'
 import { pollUntil, isPollCancelled } from '@/lib/poll'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
+import StockPicker from '@/components/StockPicker.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
+import type { StockRef } from '@/composables/useStockActions'
 
 const message = useMessage()
 const dialog = useDialog()
@@ -46,16 +50,19 @@ const route = useRoute()
 const router = useRouter()
 const { vars, withAlpha } = useUi()
 const { llmLabel } = useLlmLabel()
+const { label } = useDisplayMode()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
-
-const marketOptions = [
-  { label: 'A 股', value: 'cn' },
-]
 
 // ---------- 当前会话 ----------
 const current = ref<QaConversationView | null>(null)
 const symbol = ref('')
 const market = ref('cn')
+const selectedStock = ref<StockRef | null>(null)
+function updateSelectedStock(stock: StockRef | null) {
+  selectedStock.value = stock
+  symbol.value = stock?.symbol || ''
+  if (stock) market.value = stock.market
+}
 const question = ref('')
 const asking = ref(false)
 const scrollBox = ref<HTMLElement | null>(null)
@@ -100,7 +107,7 @@ async function send(allowStale?: boolean | Event) {
   const q = question.value.trim()
   if (!q) return
   if (!current.value && !symbol.value.trim()) {
-    message.warning('请输入要提问的股票代码')
+    message.warning('请先搜索并选择要提问的股票')
     return
   }
   releaseRouteTask()
@@ -428,7 +435,7 @@ function ctxSummary(c: QaContextLayers): string {
 
 function ctxDetail(c: QaContextLayers): string {
   const lines = [
-    `本轮注入上下文 ≈${c.approx_tokens} token（粗估）`,
+    `本轮注入上下文 ≈${c.approx_tokens} ${label('AI 用量单位', 'Token')}（粗估）`,
     `Tier1 最近消息全文：${c.tier1_msgs} 条（${c.tier1_chars} 字）`,
   ]
   if (c.tier2_rounds) lines.push(`Tier2 更早轮次索引：${c.tier2_rounds} 轮（${c.tier2_chars} 字）`)
@@ -471,10 +478,13 @@ function applyStockRouteQuery() {
     const id = Number(route.query.from_analysis)
     if (Number.isFinite(id) && id > 0) {
       fromAnalysisId.value = id
-      fromAnalysisName.value = String(route.query.name || route.query.symbol || '')
+      fromAnalysisName.value = String(route.query.name || '')
     }
-    symbol.value = String(route.query.symbol || '')
-    market.value = String(route.query.market || 'cn')
+    updateSelectedStock(route.query.symbol ? {
+      symbol: String(route.query.symbol),
+      market: String(route.query.market || 'cn'),
+      name: String(route.query.name || ''),
+    } : null)
     current.value = null // 深链进入新会话上下文
     clearStockRouteQuery()
   } else if (route.query.symbol) {
@@ -522,7 +532,7 @@ onMounted(async () => {
                 @click="openConv(c)"
               >
                 <div class="conv-main">
-                  <div class="conv-title">{{ c.name || c.symbol }}<span class="conv-symbol qv-mono"> {{ c.symbol }}</span></div>
+                  <div class="conv-title"><StockIdentity :symbol="c.symbol" :market="c.market" :name="c.name" density="table" /></div>
                   <div class="conv-sub">{{ c.title }}</div>
                   <div class="conv-meta">{{ c.message_count }} 条 · {{ fmtTime(c.updated_at) }}</div>
                 </div>
@@ -540,14 +550,25 @@ onMounted(async () => {
 
       <!-- 右：对话 -->
       <div class="col-chat">
-        <SectionCard :title="current ? `${current.name || current.symbol}（${current.symbol}）` : '新问答'">
+        <SectionCard :title="current ? '当前问答' : '新问答'">
           <template v-if="current" #extra>
             <div class="extra-row">
               <n-button size="tiny" quaternary @click="newChatFromCurrent">按最新数据新建会话</n-button>
               <n-button size="tiny" quaternary @click="openSnapshot">数据快照</n-button>
-              <span class="chat-meta">{{ llmLabel(current) || current.model }} · {{ current.total_tokens }} tokens</span>
+              <span class="chat-meta">{{ llmLabel(current) || current.model }} · {{ label('AI 用量', 'Token') }} {{ current.total_tokens }}</span>
             </div>
           </template>
+
+          <StockIdentity
+            v-if="current"
+            :symbol="current.symbol"
+            :market="current.market"
+            :name="current.name"
+            density="compact"
+            clickable
+            actions
+            class="chat-stock"
+          />
 
           <n-alert v-if="taskError" type="error" title="后台问答失败" :bordered="false" style="margin-bottom: 12px">
             {{ taskError }}<span v-if="taskErrorCode" class="task-code">（{{ taskErrorCode }}）</span>
@@ -601,13 +622,13 @@ onMounted(async () => {
           <!-- 新会话：选择标的 -->
           <div v-if="!current" class="starter">
             <div class="starter-row">
-              <n-input
-                v-model:value="symbol"
-                placeholder="股票代码，如 600000"
-                style="max-width: 200px"
+              <StockPicker
+                :model-value="selectedStock"
+                class="qa-stock-picker"
                 :disabled="!!fromAnalysisId"
+                :clearable="!fromAnalysisId"
+                @update:model-value="updateSelectedStock"
               />
-              <n-select v-model:value="market" :options="marketOptions" style="width: 110px" :disabled="!!fromAnalysisId" />
               <n-select v-model:value="llmId" :options="llmOptions" :placeholder="llmConfigs.length ? 'LLM 配置' : '默认配置'" style="width: 180px" />
             </div>
             <n-alert v-if="fromAnalysisId" type="info" :bordered="false" style="margin-top: 10px">
@@ -765,6 +786,9 @@ onMounted(async () => {
 .chat-meta {
   font-size: 12px;
   opacity: 0.55;
+}
+.chat-stock {
+  margin-bottom: 12px;
 }
 .starter {
   margin-bottom: 12px;
