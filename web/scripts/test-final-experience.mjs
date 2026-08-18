@@ -83,5 +83,7 @@ for (const operation of ['createChannel', 'updateChannel', 'deleteChannel', 'tes
   assert.match(settings, new RegExp(operation), `通知设置缺少 ${operation}`)
 }
 assert.match(settings, /全部留空会保留原配置/)
+assert.match(settings, /前台 Notification API 不依赖 Service Worker/, '不支持 Service Worker 时仍必须保留前台通知降级')
+assert.match(read('src/composables/useBrowserNotifications.ts'), /只有服务端确认了当前设备的投递，才能推进游标/, '前台通知确认失败不得推进游标')
 
 console.log('剩余页面体验收口契约测试通过')

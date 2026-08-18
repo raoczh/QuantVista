@@ -48,7 +48,9 @@ type WebPushSubscription struct {
 	DeviceID int64 `gorm:"index;uniqueIndex:idx_webpush_owner_device,priority:2" json:"device_id"`
 
 	EndpointHash   string `gorm:"size:64;uniqueIndex:idx_webpush_endpoint" json:"-"`
-	EndpointCipher string `gorm:"size:2048" json:"-"`
+	// 加密后的 endpoint 会比原始 URL 增长约三分之一；原始输入允许到 2000
+	// 字符，2048 在极长但合法的浏览器 endpoint 上不够容纳密文。
+	EndpointCipher string `gorm:"size:4096" json:"-"`
 	P256dhCipher   string `gorm:"size:512" json:"-"`
 	AuthCipher     string `gorm:"size:512" json:"-"`
 	Enabled        bool   `gorm:"not null;default:true;index" json:"enabled"`

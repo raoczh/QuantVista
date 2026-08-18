@@ -2,6 +2,8 @@
 
 > 2026-08-18：剩余页面重构与全站体验收口已进入本地完成阶段；逐页状态与线上待验边界见 `docs/RETAIL_FINAL_PAGE_MATRIX.md`。生产真实数据、Web Push、OAuth、交易日任务和移动真机不得由本地检查替代。
 
+> 2026-08-18 最终审查：修复 Notification API 前台降级被 Service Worker 注册失败阻断、前台投递确认失败仍推进游标，以及极长 Web Push endpoint 加密后可能超过数据库字段容量的问题；前端契约/类型/生产构建、Go test/vet/build 与 compose 解析均通过。完整 Docker 镜像构建仍需在 Docker daemon 可用的发布机执行。
+
 > **文档状态：当前总入口。** 已实现能力、防回归边界、未完成项和线上验收状态以本文为准；当前推荐业务施工批次见 `RECOMMENDATION_DISCOVERY_AND_EXIT_PLAN.md`。历史批次计划和调研文档只作追溯，不得据其旧状态反推当前待办。
 >
 > 本文档原为实施路线图。原路线中的阶段 0~8 与当时的增强批次已**全部完成并入库**（历史流水账见 git log 与各 commit message），

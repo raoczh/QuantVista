@@ -315,11 +315,14 @@ async function enableBrowserNotification(force = false) {
       return
     }
 
-    const registration = await ensureNotificationServiceWorker()
+    // 前台 Notification API 不依赖 Service Worker。只有在服务端已配置
+    // VAPID 且当前浏览器支持 PushManager 时，才尝试注册并订阅 Web Push；
+    // 注册或订阅失败仍要保留前台通知能力。
     let pushInput: { endpoint?: string; p256dh?: string; auth?: string } = {}
-    let pushFallback = false
+    let pushFallback = !!browserConfig.value?.vapid_configured && !pushSupported
     if (browserConfig.value?.vapid_configured && pushSupported) {
       try {
+        const registration = await ensureNotificationServiceWorker()
         let subscription = await registration.pushManager.getSubscription()
         if (force && subscription) {
           await subscription.unsubscribe()

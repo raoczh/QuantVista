@@ -100,9 +100,16 @@ export function useBrowserNotificationRuntime(userID: () => number, router: Rout
   async function handleEvent(item: BrowserNotificationEvent, fromServiceWorker = false) {
     if (!fromServiceWorker) showForegroundNotification(item, router)
     message.info(item.event.title, { duration: 4500, closable: true })
-    lastEventID.value = Math.max(lastEventID.value, item.event.id)
     const key = browserDeviceKey(userID())
-    await ackBrowserNotification(item.delivery_id, key).catch(() => undefined)
+    try {
+      await ackBrowserNotification(item.delivery_id, key)
+      // 只有服务端确认了当前设备的投递，才能推进游标；否则下一轮仍要
+      // 重试这条事件，避免一次网络抖动把通知永久跳过。
+      lastEventID.value = Math.max(lastEventID.value, item.event.id)
+      return true
+    } catch {
+      return false
+    }
   }
 
   async function poll() {
@@ -115,7 +122,10 @@ export function useBrowserNotificationRuntime(userID: () => number, router: Rout
     try {
       const key = browserDeviceKey(userID())
       const rows = await listBrowserNotificationEvents(key, lastEventID.value)
-      for (const row of rows) await handleEvent(row)
+      for (const row of rows) {
+        const acknowledged = await handleEvent(row)
+        if (!acknowledged) break
+      }
     } catch {
       // 轮询是旁路，设置页会提供明确恢复状态；外壳不持续打扰用户。
     } finally {

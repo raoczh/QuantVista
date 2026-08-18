@@ -24,8 +24,8 @@ mkdir -p /www/wwwroot/quantvista/{data,redis-data}
 
 ### 1.3 GitHub OAuth App（可选，登录需要时再配）
 
-到 GitHub → Settings → Developer settings → OAuth Apps 新建应用，
-**Authorization callback URL 填 `http://<你的域名或IP>:3002/login/callback`**（前端回调页，注意不是 `/api/...`）。
+到 GitHub → Settings → Developer settings → OAuth Apps 新建应用。生产环境应先配置 HTTPS，
+**Authorization callback URL 填 `https://<你的主域名>/login/callback`**（前端回调页，注意不是 `/api/...`，也不是容器内部端口）。
 
 凭证（Client ID / Secret）**不必写进 `deploy/.env`**：首次用密码登录管理员后，到
 **管理后台 → GitHub 登录** 填入并保存（secret 加密落库、可运行时修改）。
