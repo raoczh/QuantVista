@@ -117,6 +117,9 @@ function money(value: number) {
           </n-tag>
           <span class="relation-asof">账户关系{{ asOfText() }} {{ relationshipAsOf || unknownText() }}</span>
         </div>
+        <n-alert v-if="positionKnown && !position" type="info" :bordered="false" class="research-only">
+          当前未持有这只股票，以下内容仅用于研究，不是本人持仓卖出建议。
+        </n-alert>
         <div v-if="position" class="position-facts">
           <div><span>平均成本</span><strong>{{ position.averageCost.toFixed(2) }} 元</strong></div>
           <div>

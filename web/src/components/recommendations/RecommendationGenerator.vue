@@ -115,7 +115,7 @@ const callBudget = computed(() => 1 + (form.value.verify ? 1 : 0) + (form.value.
       <n-form-item label="模型配置">
         <n-select v-model:value="form.llm_config_id" :options="llmOptions" :placeholder="llmConfigured ? '选择模型配置' : '未配置将使用系统默认配置'" />
       </n-form-item>
-      <n-button type="primary" block :loading="running" :disabled="running" @click="emit('generate')">
+      <n-button class="generate-button" type="primary" block :loading="running" :disabled="running" @click="emit('generate')">
         {{ running ? '任务处理中' : '明确生成推荐' }}
       </n-button>
       <p class="submit-note">进入页面、切换周期、打开历史和导航到其他页面都不会创建 AI 任务。任何操作都不会自动下单或修改真实持仓。</p>
@@ -178,6 +178,11 @@ const callBudget = computed(() => 1 + (form.value.verify ? 1 : 0) + (form.value.
   .form-grid,
   .filter-grid {
     grid-template-columns: 1fr;
+  }
+  .generate-button {
+    position: sticky;
+    z-index: 7;
+    bottom: calc(64px + env(safe-area-inset-bottom));
   }
 }
 </style>

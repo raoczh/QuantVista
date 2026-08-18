@@ -391,7 +391,7 @@ async function addStopAlert(item: RecommendationItem) {
   stopAlerting.value = { ...stopAlerting.value, [item.id]: true }
   try {
     await createStopLossAlert(item.id)
-    message.success(`已为 ${item.name || item.symbol} 设置止损提醒；不会自动下单`)
+    message.success(`已为 ${item.name || '名称待补全'}（${item.symbol}）设置止损提醒；不会自动下单`)
   } catch (reason) { message.error((reason as Error).message) }
   finally { stopAlerting.value = { ...stopAlerting.value, [item.id]: false } }
 }

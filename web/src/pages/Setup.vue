@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { NForm, NFormItem, NInput, NButton, NAlert, useMessage } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
 import AuthShell from '@/components/AuthShell.vue'
+import { authErrorText } from '@/lib/authError'
 
 const router = useRouter()
 const message = useMessage()
@@ -24,7 +25,7 @@ async function submit() {
     message.success('管理员账号已创建，欢迎使用 QuantVista')
     router.replace('/')
   } catch (e) {
-    message.error((e as Error).message)
+    message.error(authErrorText(e, '初始化失败，请检查输入后重试'))
   } finally {
     loading.value = false
   }

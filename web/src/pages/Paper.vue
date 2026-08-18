@@ -99,7 +99,7 @@ async function submitTrade() {
       price: form.value.price,
       quantity: form.value.quantity,
     })
-    message.success(`${t.side === 'buy' ? '买入' : '卖出'} ${t.name || t.symbol} ${t.quantity} 股 @ ${t.price.toFixed(2)}`)
+    message.success(`${t.side === 'buy' ? '买入' : '卖出'} ${t.name || '名称待补全'}（${t.symbol}）${t.quantity} 股 @ ${t.price.toFixed(2)}`)
     form.value.quantity = undefined
     form.value.price = undefined
     await load()
@@ -299,6 +299,9 @@ onBeforeUnmount(() => {
     </template>
 
     <div class="paper" :style="styleVars">
+      <n-alert type="info" :bordered="false" title="模拟账户">
+        下方持仓、订单和资产曲线全部属于模拟账户，与真实持仓、真实订单和卖出决策中心隔离。
+      </n-alert>
       <!-- 账户总览 -->
       <n-grid cols="2 s:4" :x-gap="14" :y-gap="14" responsive="screen">
         <n-gi>

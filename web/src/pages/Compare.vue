@@ -22,6 +22,7 @@ import SectionCard from '@/components/SectionCard.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
 import StockPicker from '@/components/StockPicker.vue'
 import StockIdentity from '@/components/StockIdentity.vue'
+import TermHelp from '@/components/TermHelp.vue'
 import type { StockRef } from '@/composables/useStockActions'
 
 const message = useMessage()
@@ -241,8 +242,9 @@ onMounted(async () => {
 })
 
 // ---------- 展示辅助 ----------
-const rows = computed(() => result.value?.rows.filter((r) => r.quote_ok) || [])
-const failed = computed(() => result.value?.rows.filter((r) => !r.quote_ok) || [])
+const rows = computed(() => result.value?.rows.filter((r) => r.quote_ok && r.freshness_status !== 'stale' && r.freshness_status !== 'unknown') || [])
+const failed = computed(() => result.value?.rows.filter((r) => !r.quote_ok || r.freshness_status === 'stale' || r.freshness_status === 'unknown') || [])
+const comparisonAsOf = computed(() => rows.value.map((row) => row.quote_as_of).filter(Boolean).sort().at(-1) || '未知')
 
 function fmt(n: number) {
   return n === 0 ? '—' : n.toFixed(2)
@@ -347,6 +349,10 @@ function aiRefusalText(code: string) {
 
       <SectionCard v-if="result" title="对比结果">
         <n-spin :show="running">
+          <p class="result-status">
+            参与比较 {{ rows.length }} 只 · 数据截止时间 {{ comparisonAsOf }} · stale/unknown/失败标的不会进入正常排名。
+            <TermHelp term="ma" />
+          </p>
           <n-empty v-if="!rows.length" description="没有取到有效行情" />
           <div v-else class="table-wrap">
             <table class="cmp-table">
@@ -408,7 +414,7 @@ function aiRefusalText(code: string) {
                   </td>
                 </tr>
                 <tr>
-                  <td class="metric-col">MA5 / 10 / 20</td>
+                  <td class="metric-col"><TermHelp term="ma" /> MA5 / 10 / 20</td>
                   <td v-for="r in rows" :key="r.symbol">{{ fmt(r.ma5) }} / {{ fmt(r.ma10) }} / {{ fmt(r.ma20) }}</td>
                 </tr>
                 <tr>
@@ -450,7 +456,7 @@ function aiRefusalText(code: string) {
           </div>
 
           <div v-if="failed.length" class="failed">
-            未参与对比：{{ failed.map((f) => `${f.symbol}（${f.error || '行情暂不可用'}）`).join('、') }}
+            未参与对比：{{ failed.map((f) => `${f.name || '名称待补全'}（${f.symbol}，${f.error || f.freshness_status || '行情暂不可用'}）`).join('、') }}
           </div>
 
           <n-alert v-if="result.ai_refusal_code" type="warning" :bordered="false" class="ai-refusal">
@@ -481,6 +487,7 @@ function aiRefusalText(code: string) {
   flex-direction: column;
   gap: 16px;
 }
+.result-status { margin: 0 0 12px; font-size: 12px; opacity: .68; }
 .inputs {
   display: flex;
   flex-direction: column;

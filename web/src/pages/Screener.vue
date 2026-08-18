@@ -15,13 +15,10 @@ import {
   NSelect,
   NRadioGroup,
   NRadioButton,
-  NSwitch,
   NSpin,
   NEmpty,
-  NPopover,
   NPopconfirm,
   NAlert,
-  NCheckbox,
   useMessage,
 } from 'naive-ui'
 import {
@@ -55,18 +52,17 @@ import {
   type WatchlistBatch,
 } from '@/api/screener'
 import { listWatchlists, type WatchlistGroup } from '@/api/watchlist'
-import { taskStatusLabel } from '@/api/taskCenter'
 import { ApiRequestError } from '@/api/client'
 import { getLLMTask, listLLMTasks, type LLMTask } from '@/api/llmTask'
 import { isPollCancelled, pollUntil } from '@/lib/poll'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
 import { useIsMobile } from '@/composables/useIsMobile'
-import { useStockActions } from '@/composables/useStockActions'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
-import ChangeTag from '@/components/ChangeTag.vue'
-import StockIdentity from '@/components/StockIdentity.vue'
+import ScreenerQuickSelect from '@/components/screener/ScreenerQuickSelect.vue'
+import ScreenerScanResults from '@/components/screener/ScreenerScanResults.vue'
+import ScreenerHistory from '@/components/screener/ScreenerHistory.vue'
 
 const message = useMessage()
 const router = useRouter()
@@ -74,7 +70,6 @@ const route = useRoute()
 const { vars } = useUi()
 const { llmLabel } = useLlmLabel()
 const { isMobile } = useIsMobile()
-const actions = useStockActions()
 const styleVars = computed(() => ({
   '--qv-divider': vars.value.dividerColor,
   '--qv-warning': vars.value.warningColor,
@@ -87,6 +82,7 @@ const data = ref<StrategiesView | null>(null)
 const status = ref<FactorTableStatus | null>(null)
 const scanHistory = ref<StrategyRun<ScanResult>[]>([])
 const loading = ref(false)
+const loadError = ref('')
 
 const periodFilter = ref<'all' | 'short' | 'swing' | 'mid'>('all')
 const builtinFiltered = computed<BuiltinStrategy[]>(() => {
@@ -99,8 +95,14 @@ const retailTemplates = computed<RetailTemplate[]>(() => data.value?.retail_temp
 const factors = computed<FactorDef[]>(() => data.value?.factors ?? [])
 const retailParamValues = ref<Record<string, Record<string, number>>>({})
 
+function updateRetailParam(templateKey: string, paramKey: string, value: number | null) {
+  if (value == null || !retailParamValues.value[templateKey]) return
+  retailParamValues.value[templateKey][paramKey] = value
+}
+
 async function load() {
   loading.value = true
+  loadError.value = ''
   try {
     ;[data.value, status.value, scanHistory.value] = await Promise.all([
       getScreenerStrategies(),
@@ -114,7 +116,8 @@ async function load() {
     const resultId = Number(Array.isArray(route.query.result_id) ? route.query.result_id[0] : route.query.result_id)
     if (Number.isSafeInteger(resultId) && resultId > 0) await openScanResult(resultId, true)
   } catch (e) {
-    message.error((e as Error).message)
+    loadError.value = (e as Error).message || '常用策略读取失败'
+    message.error(loadError.value)
   } finally {
     loading.value = false
   }
@@ -261,39 +264,6 @@ const watchlistBatch = ref<WatchlistBatch | null>(null)
 const watchlistBatchIssues = computed(() =>
   (watchlistBatch.value?.items ?? []).filter((item) => item.status === 'failed' || item.status === 'conflict'),
 )
-const displayedSymbols = computed(() => (result.value?.items ?? []).map((item) => item.symbol))
-const allDisplayedSelected = computed(
-  () => displayedSymbols.value.length > 0 && displayedSymbols.value.every((symbol) => selectedSymbols.value.includes(symbol)),
-)
-const someDisplayedSelected = computed(
-  () => !allDisplayedSelected.value && displayedSymbols.value.some((symbol) => selectedSymbols.value.includes(symbol)),
-)
-
-function toggleResultSymbol(symbol: string, checked: boolean) {
-  if (checked) {
-    if (selectedSymbols.value.includes(symbol)) return
-    if (selectedSymbols.value.length >= 100) {
-      message.warning('单次最多选择 100 只股票')
-      return
-    }
-    selectedSymbols.value = [...selectedSymbols.value, symbol]
-    return
-  }
-  selectedSymbols.value = selectedSymbols.value.filter((item) => item !== symbol)
-}
-
-function toggleAllResults(checked: boolean) {
-  if (!checked) {
-    selectedSymbols.value = []
-    return
-  }
-  if (displayedSymbols.value.length > 100) {
-    message.warning('当前结果超过 100 只，请先缩小范围后批量加入')
-    return
-  }
-  selectedSymbols.value = [...displayedSymbols.value]
-}
-
 async function openWatchlistBatch() {
   if (!currentResultId.value || !selectedSymbols.value.length) {
     message.warning('请先选择要加入自选的股票')
@@ -947,178 +917,29 @@ async function removeCustom(id: number) {
         <span class="status-text">{{ statusText }}</span>
       </div>
 
-      <SectionCard title="按目标选股" class="block">
-        <n-spin :show="loading">
-          <div class="retail-grid">
-            <section v-for="template in retailTemplates" :key="template.key" class="retail-template">
-              <div class="sc-head">
-                <span class="sc-name">{{ template.name }}</span>
-                <span class="sc-tags">
-                  <n-tag size="tiny" :bordered="false">{{ PERIOD_LABEL[template.period] || template.period }}</n-tag>
-                  <n-tag size="tiny" :bordered="false" :type="RISK_TAG_TYPE[template.risk_level] || 'default'">
-                    {{ RISK_LABEL[template.risk_level] || template.risk_level }}
-                  </n-tag>
-                </span>
-              </div>
-              <dl class="retail-notes">
-                <div><dt>适用</dt><dd>{{ template.scenario }}</dd></div>
-                <div><dt>风险</dt><dd>{{ template.risk }}</dd></div>
-                <div><dt>数据</dt><dd>{{ template.data_requirements }}</dd></div>
-              </dl>
-              <div class="retail-params">
-                <label v-for="param in template.params" :key="param.key">
-                  <span>{{ param.label }}</span>
-                  <n-input-number
-                    v-model:value="retailParamValues[template.key][param.key]"
-                    :min="param.min"
-                    :max="param.max"
-                    :step="param.step"
-                    size="small"
-                  >
-                    <template v-if="param.unit" #suffix>{{ param.unit }}</template>
-                  </n-input-number>
-                </label>
-              </div>
-              <div class="sc-conds">
-                <n-tag v-for="condition in template.conditions" :key="condition" size="small" :bordered="false" class="cond-tag">
-                  {{ condition }}
-                </n-tag>
-              </div>
-              <div class="retail-action">
-                <n-button
-                  size="small"
-                  type="primary"
-                  secondary
-                  :loading="scanning === `retail-${template.key}`"
-                  :disabled="!!scanning && scanning !== `retail-${template.key}`"
-                  @click="runRetailTemplate(template)"
-                >
-                  开始扫描
-                </n-button>
-              </div>
-            </section>
-          </div>
-        </n-spin>
-      </SectionCard>
+      <ScreenerQuickSelect
+        :templates="retailTemplates"
+        :values="retailParamValues"
+        :loading="loading"
+        :error="loadError"
+        :scanning="scanning"
+        @scan="runRetailTemplate"
+        @retry="load"
+        @update-param="updateRetailParam"
+      />
 
       <!-- 扫描结果 -->
-      <SectionCard v-if="result" :title="`扫描结果 · ${result.strategy}`" class="block">
-        <template #extra>
-          <div class="result-switches">
-            <label class="switch-item">
-              <n-switch v-model:value="includeST" size="small" @update:value="rescan" />
-              <span>含ST</span>
-            </label>
-            <label class="switch-item">
-              <n-switch v-model:value="includeStale" size="small" @update:value="rescan" />
-              <span>含停牌</span>
-            </label>
-          </div>
-        </template>
-        <p class="result-stats">
-          {{ resultStats }}
-          <span class="muted">（数据为 {{ result.trade_date }} 收盘口径）</span>
-        </p>
-        <p v-if="result.strategy_revision_id" class="revision-meta">
-          固定快照
-          <n-tag size="tiny" type="info" :bordered="false">v{{ result.strategy_revision }}</n-tag>
-          <code>{{ shortHash(result.strategy_hash) }}</code>
-        </p>
-        <p v-if="result.conditions?.length" class="result-conds">
-          条件：<n-tag v-for="c in result.conditions" :key="c" size="small" :bordered="false" class="cond-tag">{{ c }}</n-tag>
-        </p>
-        <div v-if="result.items?.length" class="batch-toolbar">
-          <div class="batch-selection">
-            <n-checkbox
-              :checked="allDisplayedSelected"
-              :indeterminate="someDisplayedSelected"
-              @update:checked="toggleAllResults"
-            >
-              全选当前结果
-            </n-checkbox>
-            <span>已选 {{ selectedSymbols.length }} / 100</span>
-          </div>
-          <div class="batch-actions">
-            <n-button v-if="selectedSymbols.length" size="small" quaternary @click="selectedSymbols = []">清空</n-button>
-            <n-button
-              size="small"
-              type="primary"
-              :disabled="!selectedSymbols.length"
-              :loading="batchLoading"
-              @click="openWatchlistBatch"
-            >
-              批量加入自选
-            </n-button>
-          </div>
-        </div>
-        <n-empty v-if="!result.items?.length" description="无命中标的" class="empty-pad" />
-        <div v-else class="qv-scroll-x">
-          <n-table size="small" :single-line="false" class="hits-table">
-            <thead>
-              <tr>
-                <th class="select-col">选择</th>
-                <th colspan="2">股票</th>
-                <th class="num">现价</th>
-                <th class="num">涨跌</th>
-                <th class="num">成交额(亿)</th>
-                <th v-if="!isMobile" class="num">换手%</th>
-                <th v-if="!isMobile" class="num">60日位置</th>
-                <th>命中原因</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="h in result.items" :key="h.symbol">
-                <td class="select-col">
-                  <n-checkbox
-                    :checked="selectedSymbols.includes(h.symbol)"
-                    :aria-label="`选择 ${h.name || h.symbol}`"
-                    @update:checked="(checked) => toggleResultSymbol(h.symbol, checked)"
-                  />
-                </td>
-                <td colspan="2"><StockIdentity :symbol="h.symbol" market="cn" :name="h.name" density="table" clickable actions /></td>
-                <td class="num qv-tnum">{{ h.price.toFixed(2) }}</td>
-                <td class="num"><ChangeTag :value="h.chg_pct" size="small" /></td>
-                <td class="num qv-tnum">{{ h.amount_yi.toFixed(2) }}</td>
-                <td v-if="!isMobile" class="num qv-tnum">{{ h.turnover_rate ? h.turnover_rate.toFixed(2) : '—' }}</td>
-                <td v-if="!isMobile" class="num qv-tnum">{{ h.pos_60 ? h.pos_60.toFixed(0) + '%' : '—' }}</td>
-                <td class="reasons-cell">
-                  <n-popover trigger="hover" placement="top" :disabled="h.reasons.length <= 2">
-                    <template #trigger>
-                      <span class="reasons-brief">
-                        <n-tag v-for="r in h.reasons.slice(0, 2)" :key="r" size="small" :bordered="false" class="cond-tag">{{ r }}</n-tag>
-                        <n-tag v-if="h.reasons.length > 2" size="small" :bordered="false" class="cond-tag more-tag"
-                          >+{{ h.reasons.length - 2 }}</n-tag
-                        >
-                      </span>
-                    </template>
-                    <div class="reasons-full">
-                      <div v-for="r in h.reasons" :key="r">{{ r }}</div>
-                    </div>
-                  </n-popover>
-                </td>
-                <td>
-                  <div class="row-actions">
-                    <n-button size="tiny" quaternary @click="actions.goDetail({ symbol: h.symbol, market: 'cn', name: h.name })"
-                      >详情</n-button
-                    >
-                    <n-button size="tiny" quaternary @click="actions.goAnalysis({ symbol: h.symbol, market: 'cn', name: h.name })"
-                      >AI分析</n-button
-                    >
-                    <n-button
-                      size="tiny"
-                      quaternary
-                      :loading="actions.adding.value"
-                      @click="actions.addToWatchlist({ symbol: h.symbol, market: 'cn', name: h.name })"
-                      >加自选</n-button
-                    >
-                  </div>
-                </td>
-              </tr>
-            </tbody>
-          </n-table>
-        </div>
-      </SectionCard>
+      <ScreenerScanResults
+        v-if="result"
+        v-model:include-s-t="includeST"
+        v-model:include-stale="includeStale"
+        v-model:selected-symbols="selectedSymbols"
+        :result="result"
+        :stats="resultStats"
+        :batch-loading="batchLoading"
+        @rescan="rescan"
+        @batch="openWatchlistBatch"
+      />
 
       <n-modal
         v-model:show="batchShow"
@@ -1180,24 +1001,7 @@ async function removeCustom(id: number) {
         </template>
       </n-modal>
 
-      <SectionCard title="扫描历史" class="block">
-        <n-empty v-if="!scanHistory.length" description="暂无持久扫描结果" />
-        <div v-else class="qv-scroll-x">
-          <n-table size="small" :single-line="false">
-            <thead><tr><th>策略</th><th>版本</th><th>状态</th><th>数据时点</th><th>完成时间</th><th>操作</th></tr></thead>
-            <tbody>
-              <tr v-for="item in scanHistory" :key="item.id">
-                <td>{{ item.strategy_name }}</td>
-                <td><span v-if="item.strategy_revision">v{{ item.strategy_revision }} · </span><code>{{ shortHash(item.strategy_hash) }}</code></td>
-                <td><n-tag size="small" :type="item.status === 'success' ? 'success' : item.status === 'failed' ? 'error' : 'info'">{{ taskStatusLabel(item.status) }}</n-tag></td>
-                <td>{{ item.as_of?.slice(0, 10) || '—' }}</td>
-                <td>{{ (item.finished_at || item.created_at).replace('T', ' ').slice(0, 16) }}</td>
-                <td><n-button size="tiny" quaternary @click="openScanHistory(item)">{{ item.status === 'success' ? '查看' : '任务详情' }}</n-button></td>
-              </tr>
-            </tbody>
-          </n-table>
-        </div>
-      </SectionCard>
+      <ScreenerHistory :items="scanHistory" @open="openScanHistory" />
 
       <!-- 策略广场 -->
       <SectionCard title="进阶内置策略" class="block">

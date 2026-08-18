@@ -8,7 +8,7 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "type-check": "vue-tsc --noEmit",
-    "test": "node scripts/test-stock-coverage.mjs && node scripts/test-retail-experience.mjs && node scripts/test-ai-workspaces.mjs"
+    "test": "node scripts/test-stock-coverage.mjs && node scripts/test-retail-experience.mjs && node scripts/test-ai-workspaces.mjs && node scripts/test-final-experience.mjs"
   },
   "dependencies": {
     "@capacitor/app": "^8.1.0",

@@ -7,6 +7,7 @@ import { githubMobileCallback } from '@/api/auth'
 import { isNativeApp } from '@/config/runtime'
 import AuthShell from '@/components/AuthShell.vue'
 import { safeInternalRoute } from '@/lib/internalRoute'
+import { authErrorText } from '@/lib/authError'
 
 const router = useRouter()
 const route = useRoute()
@@ -41,7 +42,7 @@ async function runMobileBrowserLeg() {
     deepLink.value = `quantvista://oauth/callback?code=${encodeURIComponent(auth_code)}`
     location.href = deepLink.value
   } catch (e) {
-    error.value = (e as Error).message
+    error.value = authErrorText(e, 'GitHub 授权暂不可用，请重新发起登录')
   }
 }
 
@@ -63,7 +64,7 @@ async function runMobileAppLeg() {
     sessionStorage.removeItem('qv_login_redirect')
     router.replace(redirect)
   } catch (e) {
-    error.value = (e as Error).message
+    error.value = authErrorText(e, 'App 登录交换失败，请重新发起登录')
   }
 }
 
@@ -116,7 +117,7 @@ async function run() {
       router.replace(redirect)
     }
   } catch (e) {
-    error.value = (e as Error).message
+    error.value = authErrorText(e, binding.value ? 'GitHub 绑定失败，请稍后重试' : 'GitHub 登录失败，请重新发起授权')
   }
 }
 </script>

@@ -91,7 +91,7 @@ function monthlyColumns(): DataTableColumns<WFMonthlyRow> {
           { class: 'wf-items' },
           (row.items || []).map((it: WFMonthlyItem) =>
             h('span', { key: it.symbol, class: 'wf-item' }, [
-              h('span', null, `${it.name} ${it.symbol}`),
+              h('span', null, `${it.name || '名称待补全'} ${it.symbol}`),
               h('span', { class: 'qv-tnum wf-item-score' }, ` 评分${it.score.toFixed(1)} `),
               it.status === 'traded' && it.net_pct != null
                 ? pctSpan(it.net_pct)

@@ -1697,7 +1697,7 @@ onBeforeUnmount(() => {
                         <template #trigger>
                           <n-button size="tiny" quaternary type="error">删除</n-button>
                         </template>
-                        删除持仓「{{ p.name || p.symbol }}」？流水明细一并删除。
+                        删除持仓「{{ p.name || '名称待补全' }}（{{ p.symbol }}）」？流水明细一并删除。
                       </n-popconfirm>
                     </div>
                   </div>
@@ -2032,7 +2032,7 @@ onBeforeUnmount(() => {
     <n-modal
       v-model:show="closeModal"
       preset="card"
-      :title="`卖出 · ${closing?.name || closing?.symbol || ''}`"
+      :title="`卖出 · ${closing?.name || '名称待补全'}${closing?.symbol ? `（${closing.symbol}）` : ''}`"
       style="max-width: 480px"
     >
       <n-form label-placement="top">
@@ -2107,7 +2107,7 @@ onBeforeUnmount(() => {
     <n-modal
       v-model:show="tradeModal"
       preset="card"
-      :title="`${tradeForm.side === 'buy' ? '加仓' : '减仓'} · ${tradeTarget?.name || tradeTarget?.symbol || ''}`"
+      :title="`${tradeForm.side === 'buy' ? '加仓' : '减仓'} · ${tradeTarget?.name || '名称待补全'}${tradeTarget?.symbol ? `（${tradeTarget.symbol}）` : ''}`"
       style="max-width: 500px"
     >
       <n-form label-placement="top">

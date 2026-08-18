@@ -3,6 +3,7 @@ import type { StockCorpEvents } from '@/api/event'
 import type { StockFinance } from '@/api/finance'
 import type { Bar, Quote, StockFundFlow, StockScore, Valuation } from '@/api/market'
 import type { NewsItem } from '@/api/news'
+import type { PositionExitAssessment } from '@/api/position'
 
 export type StockSectionPhase = 'idle' | 'loading' | 'refreshing' | 'ready' | 'empty' | 'error'
 export type DecisionTone = 'positive' | 'negative' | 'warning' | 'neutral' | 'unknown'
@@ -17,9 +18,7 @@ export interface PositionRelationSummary {
   realizedPnl: number
   quoteFresh: boolean
   asOf?: string
-  belowStopLoss: boolean
-  nearStopLoss: boolean
-  stopLoss?: number
+  exitAssessment?: PositionExitAssessment
 }
 
 export interface DecisionItem {
@@ -54,6 +53,7 @@ export interface DecisionSummaryInput {
   eventPhase: StockSectionPhase
   eventPartial: boolean
   fundamentalPhase: StockSectionPhase
+  exitAssessment?: PositionExitAssessment
   now?: Date
 }
 
@@ -199,6 +199,30 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
     })
   }
 
+  if (position && input.exitAssessment) {
+    const assessment = input.exitAssessment
+    const levelLabel: Record<string, string> = { normal: '正常观察', watch: '留意', review: '需要复核', urgent: '优先处理', unknown: '暂无法判断' }
+    const tone: DecisionTone = assessment.level === 'urgent' || assessment.level === 'review'
+      ? 'negative'
+      : assessment.level === 'watch'
+        ? 'warning'
+        : assessment.level === 'unknown' || assessment.data_status !== 'ready'
+          ? 'unknown'
+          : 'neutral'
+    risks.unshift({
+      id: `exit-assessment-${assessment.id}`,
+      title: '持仓卖出风险（统一评估）',
+      value: `${levelLabel[assessment.level] || '暂无法判断'} · ${assessment.data_status}`,
+      detail: assessment.data_status === 'ready'
+        ? `${assessment.primary_reason || '当前没有更高等级的程序化信号'}；下一步：${assessment.next_action || '继续观察'}`
+        : `评估数据${assessment.data_status}，不能把缺口当作安全；${assessment.data_gaps?.join('；') || '请稍后重试'}`,
+      evidence: assessment.evidence?.join('；') || '统一 PositionExitAssessment',
+      source: 'PositionExitAssessment',
+      asOf: assessment.evaluated_at || assessment.quote_as_of || 'unknown',
+      tone,
+    })
+  }
+
   if (q) {
     const quoteFresh = q.freshness?.freshness_status === 'fresh'
     changes.push({
@@ -274,19 +298,6 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
       evidence: `数据源时间 ${q?.data_time || 'unknown'}；期望时点 ${q?.freshness?.expected_as_of || 'unknown'}`,
       source: q?.source || '行情聚合',
       asOf: q?.data_time || 'unknown',
-      tone: 'warning',
-    })
-  }
-
-  if (position?.belowStopLoss || position?.nearStopLoss) {
-    risks.push({
-      id: 'position-stop',
-      title: position.belowStopLoss ? '已跌破账本止损价' : '接近账本止损价',
-      value: position.stopLoss ? `${position.stopLoss.toFixed(2)} 元` : '已触发',
-      detail: '该状态由持仓服务根据当前有效行情和用户账本计划计算。',
-      evidence: `平均成本 ${position.averageCost.toFixed(2)} 元；计划止损 ${position.stopLoss?.toFixed(2) || 'unknown'} 元`,
-      source: '个人持仓账本 + 有效行情',
-      asOf: position.asOf || 'unknown',
       tone: 'warning',
     })
   }

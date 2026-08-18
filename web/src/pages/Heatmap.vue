@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { NRadioGroup, NRadioButton, NButton, NSpin, NEmpty, useMessage } from 'naive-ui'
+import { NRadioGroup, NRadioButton, NButton, NSpin, NEmpty, NAlert, useMessage } from 'naive-ui'
 import * as echarts from 'echarts'
 import { getBoardHeatmap, type BoardHeat, type BoardKind } from '@/api/market'
 import { useUi } from '@/composables/useUi'
@@ -15,6 +15,7 @@ const { vars, isDark, upColor, downColor, flatColor, withAlpha } = useUi()
 const kind = ref<BoardKind>('industry')
 const boards = ref<BoardHeat[]>([])
 const loading = ref(false)
+const loadError = ref('')
 
 const chartEl = ref<HTMLDivElement | null>(null)
 let chart: echarts.ECharts | null = null
@@ -29,11 +30,13 @@ async function load(silent = false) {
     const data = await getBoardHeatmap('cn', kind.value)
     if (mySeq !== loadSeq) return
     boards.value = data
+    loadError.value = ''
     await nextTick()
     renderChart()
   } catch (e) {
     if (mySeq !== loadSeq) return
     boards.value = []
+    loadError.value = (e as Error).message
     if (!silent) message.error('板块热度加载失败：' + (e as Error).message)
   } finally {
     if (mySeq === loadSeq && !silent) loading.value = false
@@ -157,6 +160,12 @@ onUnmounted(() => {
     </template>
 
     <SectionCard :title="kind === 'industry' ? '行业板块（成交额 Top100）' : '概念板块（成交额 Top100）'">
+      <n-alert v-if="loadError" type="error" :bordered="false" title="板块数据读取失败">
+        {{ loadError }}。数据时间未知，请重试后再判断市场变化。
+      </n-alert>
+      <p v-else class="heatmap-status">
+        {{ boards.length ? `已载入 ${boards.length} 个板块 · 数据时间由行情源返回，当前接口未提供统一时间` : '等待板块行情' }}；点击色块进入板块详情。
+      </p>
       <n-spin :show="loading && !boards.length">
         <div v-show="boards.length" ref="chartEl" class="heatmap-chart"></div>
         <n-empty
@@ -173,6 +182,7 @@ onUnmounted(() => {
   width: 100%;
   height: 620px;
 }
+.heatmap-status { margin: 0 0 12px; font-size: 12px; opacity: .62; }
 
 @media (max-width: 768px) {
   .heatmap-chart {

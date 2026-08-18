@@ -164,7 +164,7 @@ export function useStockActions(onNavigate?: () => void) {
       }
       await addItem(groups[0].id, { symbol: s.symbol, market: s.market, name: s.name })
       remember(userID, s)
-      message.success(`已将 ${s.name || s.symbol} 加入「${groups[0].name}」`)
+      message.success(`已将 ${s.name || '名称待补全'}（${s.symbol}）加入「${groups[0].name}」`)
       return true
     } catch (e) {
       message.error((e as Error).message)

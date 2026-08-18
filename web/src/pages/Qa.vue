@@ -632,7 +632,7 @@ onMounted(async () => {
               <n-select v-model:value="llmId" :options="llmOptions" :placeholder="llmConfigs.length ? 'LLM 配置' : '默认配置'" style="width: 180px" />
             </div>
             <n-alert v-if="fromAnalysisId" type="info" :bordered="false" style="margin-top: 10px">
-              将基于「{{ fromAnalysisName || symbol }}」分析记录 #{{ fromAnalysisId }}
+              将基于「{{ fromAnalysisName || '名称待补全' }}（{{ symbol }}）」分析记录 #{{ fromAnalysisId }}
               的数据快照提问——问答所见与分析所见完全一致，可直接追问分析结论。
             </n-alert>
             <div v-else class="starter-hint">

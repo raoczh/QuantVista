@@ -24,9 +24,8 @@ import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import StatCard from '@/components/StatCard.vue'
 import StockIdentity from '@/components/StockIdentity.vue'
-import { TERM_DICTIONARY, type TermKey } from '@/components/termDictionary'
-import { useDisplayMode } from '@/composables/useDisplayMode'
-import TermHelp from '@/components/TermHelp.vue'
+import PortfolioRiskConclusion from '@/components/portfolio-risk/PortfolioRiskConclusion.vue'
+import PortfolioProfessionalMetrics from '@/components/portfolio-risk/PortfolioProfessionalMetrics.vue'
 import { useUi } from '@/composables/useUi'
 import {
   addCashFlow,
@@ -50,7 +49,6 @@ import {
   type PortfolioOverview,
   type PortfolioRisk,
   type RebalanceDraft,
-  type RiskMetric,
   type StressResult,
   type TargetItem,
 } from '@/api/portfolio'
@@ -62,11 +60,6 @@ const message = useMessage()
 const route = useRoute()
 const router = useRouter()
 const { vars, isDark } = useUi()
-const { isPlain } = useDisplayMode()
-function metricLabel(term: TermKey) {
-  const definition = TERM_DICTIONARY[term]
-  return isPlain.value ? definition.plain : definition.professional
-}
 const accounts = ref<PortfolioAccount[]>([])
 const accountId = ref<number | null>(null)
 const overview = ref<PortfolioOverview | null>(null)
@@ -75,7 +68,7 @@ const loadingAccounts = ref(false)
 const loading = ref(false)
 const loadError = ref('')
 const tabQueryKey = props.embedded ? 'risk_tab' : 'tab'
-const allowedTabs = new Set(['overview', 'stress', 'targets', 'cash'])
+const allowedTabs = new Set(['overview', 'risk', 'stress', 'targets', 'cash'])
 const initialTab = String(route.query[tabQueryKey] || 'overview')
 const tab = ref(allowedTabs.has(initialTab) ? initialTab : 'overview')
 const windowDays = ref(Number(route.query.window) || 252)
@@ -101,11 +94,6 @@ function money(v: number | undefined) {
         minimumFractionDigits: 2,
         maximumFractionDigits: 2,
       })
-}
-function metric(v: RiskMetric | undefined, suffix = '') {
-  return v?.status === 'available' && v.value != null
-    ? `${v.value.toFixed(2)}${suffix}`
-    : '不可用'
 }
 const exposureDims = computed(() =>
   overview.value?.exposure
@@ -603,6 +591,12 @@ const enabledWeight = computed(() =>
         risk?.parameter_hash?.slice(0, 12) || '-'
       }}</span>
     </div>
+    <PortfolioRiskConclusion
+      :account="currentAccount"
+      :overview="overview"
+      :risk="risk"
+      :reasons="riskReasons"
+    />
     <n-spin :show="loading">
       <n-tabs v-model:value="tab" type="line" animated>
         <n-tab-pane name="overview" tab="总览">
@@ -700,42 +694,7 @@ const enabledWeight = computed(() =>
           </div>
         </n-tab-pane>
         <n-tab-pane name="risk" tab="风险与相关性">
-          <div class="risk-term-help">
-            <TermHelp term="twr" /> · <TermHelp term="sharpe" /> · <TermHelp term="sortino" /> ·
-            <TermHelp term="beta" /> · <TermHelp term="alpha" />
-          </div>
-          <div class="metric-grid">
-            <StatCard
-              :label="metricLabel('twr')"
-              :value="metric(risk?.twr_pct, '%')"
-            /><StatCard
-              label="年化波动"
-              :value="metric(risk?.annualized_volatility_pct, '%')"
-            /><StatCard
-              label="预测波动"
-              :value="
-                metric(risk?.risk_contribution.predicted_volatility_pct, '%')
-              "
-            /><StatCard
-              label="下行波动"
-              :value="metric(risk?.downside_volatility_pct, '%')"
-            /><StatCard :label="metricLabel('sharpe')" :value="metric(risk?.sharpe)" /><StatCard
-              :label="metricLabel('sortino')"
-              :value="metric(risk?.sortino)"
-            /><StatCard :label="metricLabel('beta')" :value="metric(risk?.beta)" /><StatCard
-              :label="metricLabel('alpha')"
-              :value="metric(risk?.alpha_pct, '%')"
-            /><StatCard
-              label="最大回撤"
-              :value="metric(risk?.max_drawdown.metric, '%')"
-            />
-          </div>
-          <n-alert
-            v-if="riskReasons.length"
-            type="warning"
-            title="部分指标不可用"
-            >{{ riskReasons.join('；') }}</n-alert
-          >
+          <PortfolioProfessionalMetrics :risk="risk" :reasons="riskReasons" />
           <div class="chart-grid">
             <SectionCard title="资金流调整后资产曲线"
               ><div ref="curveEl" class="chart"></div></SectionCard

@@ -808,7 +808,7 @@ function onResize() {
                   >
                     <span class="work-main">
                       <strong>{{ item.title }}</strong>
-                      <small>{{ item.detail || item.name || item.symbol }}</small>
+                    <small>{{ item.detail || item.name || (item.symbol ? `名称待补全 · ${item.symbol}` : '暂无详情') }}</small>
                     </span>
                     <span class="work-side">
                       <n-tag v-if="item.kind === 'alert'" size="tiny" type="warning" :bordered="false">提醒</n-tag>
@@ -1218,7 +1218,7 @@ function onResize() {
           :show-icon="false"
           class="inline-state"
         >
-          {{ quote ? `查询失败，继续显示 ${quote.name || quote.symbol} 的最近已知结果：` : '行情读取失败：' }}{{ quoteError }}。
+          {{ quote ? `查询失败，继续显示 ${quote.name || '名称待补全'}（${quote.symbol}）的最近已知结果：` : '行情读取失败：' }}{{ quoteError }}。
           来源 {{ quote?.source || '行情聚合' }} · {{ asOfText() }} {{ quote?.freshness?.source_data_time || quote?.data_time || unknownText() }}。
         </n-alert>
         <n-alert v-if="barsError" type="warning" :bordered="false" :show-icon="false" class="inline-state">

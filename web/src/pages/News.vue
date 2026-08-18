@@ -5,13 +5,12 @@ import { NButton, NEmpty, NInput, NRadioButton, NRadioGroup, NSpin, NTag } from 
 import { getNews, newsSourceLabel, parseRelatedSymbols, sentimentTag, type NewsItem } from '@/api/news'
 import { useUi, withAlpha } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
-import { useStockActions } from '@/composables/useStockActions'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import StockIdentity from '@/components/StockIdentity.vue'
 
 const route = useRoute()
 const { vars, isDark, pctColor } = useUi()
-const { goDetail } = useStockActions()
 
 // 情绪标签（N2）：利好/利空才渲染，颜色随涨跌色主题。
 function sentiView(n: NewsItem): { text: string; color: string } | null {
@@ -174,6 +173,7 @@ const feedVars = computed(() => ({
     </template>
 
     <SectionCard :hoverable="false">
+      <p class="feed-status">当前 {{ items.length }} 条 · 最新发布时间 {{ items[0]?.publish_time || '未知' }} · 来源与关联标的均按原始快讯记录展示</p>
       <!-- 筛选行 -->
       <div class="filters">
         <n-radio-group :value="source" size="small" @update:value="onSourceChange">
@@ -237,15 +237,15 @@ const feedVars = computed(() => ({
                     class="fi-senti"
                     :style="{ color: sentiView(n)!.color, background: withAlpha(sentiView(n)!.color, isDark ? 0.16 : 0.1) }"
                   >{{ sentiView(n)!.text }}</span>
-                  <button
+                  <StockIdentity
                     v-for="s in parseRelatedSymbols(n.related_symbols).slice(0, 4)"
                     :key="s"
-                    type="button"
-                    class="fi-sym qv-tnum"
-                    @click="goDetail({ symbol: s, market: 'cn', name: s })"
-                  >
-                    {{ s }}
-                  </button>
+                    :symbol="s"
+                    market="cn"
+                    name=""
+                    density="compact"
+                    clickable
+                  />
                   <span v-if="parseRelatedSymbols(n.related_symbols).length > 4" class="fi-sym-more">
                     +{{ parseRelatedSymbols(n.related_symbols).length - 4 }}
                   </span>
@@ -276,6 +276,7 @@ const feedVars = computed(() => ({
   flex-wrap: wrap;
   margin-bottom: 14px;
 }
+.feed-status { margin: 0 0 12px; font-size: 12px; opacity: .62; }
 .sym-input {
   width: 260px;
   max-width: 100%;

@@ -13,6 +13,7 @@ import {
   NRadioButton,
   NCheckboxGroup,
   NCheckbox,
+  NAlert,
   NSwitch,
   NSpin,
   NEmpty,
@@ -511,6 +512,9 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
                 宇宙 {{ result.universe }} 只（ST 跳过 {{ result.st_skipped }}，复权可疑剔除 {{ result.adjust_suspect }}）·
                 耗时 {{ (result.elapsed_ms / 1000).toFixed(1) }}s
               </div>
+              <n-alert type="warning" :bordered="false" title="历史回测边界">
+                结果只描述历史样本，不代表未来收益；未走完、强平、停牌、无数据和样本不足均不会被当作可靠成功。
+              </n-alert>
               <div v-if="result.conditions?.length" class="cond-line">
                 <n-tag v-for="(c, i) in result.conditions" :key="i" size="small" :bordered="false" style="margin: 0 6px 6px 0">
                   {{ c }}

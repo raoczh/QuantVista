@@ -5,6 +5,7 @@ import {
   NButton,
   NDataTable,
   NEmpty,
+  NAlert,
   NSpin,
   NTag,
   useMessage,
@@ -35,6 +36,7 @@ const boardName = computed(() => String(route.query.name || code.value))
 const detail = ref<BoardDetail | null>(null)
 const fundflow = ref<BoardFundFlow | null>(null)
 const loading = ref(false)
+const loadError = ref('')
 
 const chartEl = ref<HTMLDivElement | null>(null)
 let chart: echarts.ECharts | null = null
@@ -66,11 +68,13 @@ async function load(silent = false) {
     const d = await getBoardDetail('cn', code.value)
     if (mySeq !== loadSeq) return
     detail.value = d
+    loadError.value = ''
     await nextTick()
     if (detail.value.bars?.length) renderChart(detail.value.bars)
   } catch (e) {
     if (mySeq !== loadSeq) return
     detail.value = null
+    loadError.value = (e as Error).message
     if (!silent) message.error('板块详情加载失败：' + (e as Error).message)
   } finally {
     if (mySeq === loadSeq && !silent) loading.value = false
@@ -251,6 +255,10 @@ onUnmounted(() => {
     </template>
 
     <n-spin :show="loading && !detail">
+      <n-alert v-if="loadError" type="error" :bordered="false" title="板块详情读取失败">
+        {{ loadError }}。请重试；数据时间未知，不应据此判断板块强弱。
+      </n-alert>
+      <p v-else class="board-status">行情数据截止 {{ detail?.bars?.at(-1)?.trade_date || '未知' }} · 下一步可查看成分股或进入相关个股详情</p>
       <div class="board-grid">
         <SectionCard title="板块指数日线">
           <div v-show="!barsUnavailable" ref="chartEl" class="board-chart"></div>
@@ -328,6 +336,7 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 16px;
 }
+.board-status { margin: 0 0 12px; font-size: 12px; opacity: .62; }
 .board-chart {
   width: 100%;
   height: 360px;

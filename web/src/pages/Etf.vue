@@ -53,6 +53,7 @@ const etfValueSub = computed(() =>
 const etfProfitSub = computed(() =>
   etfStaleCount.value > 0 ? `不含 ${etfStaleCount.value} 笔行情非最新持仓（盈亏未知）` : undefined,
 )
+const latestQuoteTime = computed(() => etfs.value.map((item) => item.quote_as_of).filter(Boolean).sort().at(-1) || '未知')
 
 async function loadQuotes() {
   try {
@@ -91,7 +92,7 @@ function tradeFromEtf(e: EtfItem, side: 'buy' | 'sell') {
   openTrade(e.symbol, e.name, side)
 }
 function tradeFromHolding(h: PaperHolding, side: 'buy' | 'sell') {
-  openTrade(h.symbol, h.name || h.symbol, side, side === 'sell' ? h.quantity : undefined)
+  openTrade(h.symbol, h.name || '名称待补全', side, side === 'sell' ? h.quantity : undefined)
 }
 
 async function submitTrade() {
@@ -109,7 +110,7 @@ async function submitTrade() {
       price: form.value.price,
       quantity: form.value.quantity,
     })
-    message.success(`${t.side === 'buy' ? '买入' : '卖出'} ${t.name || t.symbol} ${t.quantity} 份 @ ${t.price.toFixed(3)}`)
+    message.success(`${t.side === 'buy' ? '买入' : '卖出'} ${t.name || '名称待补全'}（${t.symbol}）${t.quantity} 份 @ ${t.price.toFixed(3)}`)
     tradeModal.value = false
     await load()
   } catch (e) {
@@ -137,6 +138,10 @@ onMounted(load)
     </template>
 
     <div class="etf" :style="styleVars">
+      <n-alert v-if="!loading && !etfs.length" type="warning" :bordered="false" title="ETF 行情暂不可用">
+        请重试；模拟账户余额和历史模拟持仓仍与真实持仓分开。数据时间：未知。
+      </n-alert>
+      <p v-else class="data-status">行情时间 {{ latestQuoteTime }} · 模拟账户仅用于研究练习，不会写入真实持仓</p>
       <!-- 账户概览（ETF 口径） -->
       <n-grid cols="1 s:3" :x-gap="14" :y-gap="14" responsive="screen">
         <n-gi>
@@ -320,6 +325,7 @@ onMounted(load)
   flex-direction: column;
   gap: 16px;
 }
+.data-status { margin: -6px 0 0; font-size: 12px; opacity: .62; }
 .etf-ops {
   display: flex;
   gap: 6px;

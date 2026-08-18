@@ -612,7 +612,7 @@ onMounted(async () => {
                     <template #trigger>
                       <n-button size="tiny" quaternary type="error">移除</n-button>
                     </template>
-                    从自选中移除「{{ it.name || it.symbol }}」？
+                    从自选中移除「{{ it.name || '名称待补全' }}（{{ it.symbol }}）」？
                   </n-popconfirm>
                 </div>
               </div>
@@ -680,7 +680,7 @@ onMounted(async () => {
     <!-- 标记放弃：记录原因与当时价格 -->
     <n-modal v-model:show="passModal" preset="card" title="标记放弃" style="max-width: 460px">
       <p class="pass-hint">
-        将「{{ passTarget?.name || passTarget?.symbol }}」标记为已放弃。系统会记录当前价格，
+        将「{{ passTarget?.name || '名称待补全' }}（{{ passTarget?.symbol || '代码未知' }}）」标记为已放弃。系统会记录当前价格，
         之后可在「错过机会」中复盘：是正确回避了风险，还是错过了机会。
       </p>
       <n-input

@@ -6,6 +6,7 @@ import { useAuthStore } from '@/stores/auth'
 import { isNativeApp } from '@/config/runtime'
 import AuthShell from '@/components/AuthShell.vue'
 import { safeInternalRoute } from '@/lib/internalRoute'
+import { authErrorText } from '@/lib/authError'
 
 const router = useRouter()
 const route = useRoute()
@@ -29,7 +30,7 @@ async function submit() {
     message.success('登录成功')
     go()
   } catch (e) {
-    message.error((e as Error).message)
+    message.error(authErrorText(e, '登录失败，请检查账号和密码'))
   } finally {
     loading.value = false
   }
@@ -41,7 +42,7 @@ async function github() {
     // App 内走移动流（系统浏览器授权 + 深链回跳，阶段 B）；浏览器走原 Web 流。
     await (isNativeApp ? auth.startMobileGithubLogin() : auth.startGithubLogin())
   } catch (e) {
-    message.error((e as Error).message)
+    message.error(authErrorText(e, 'GitHub 登录暂不可用，请稍后重试'))
   }
 }
 </script>

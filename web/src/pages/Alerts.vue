@@ -161,7 +161,7 @@ function selectRuleAction(key: string | number, rule: AlertRule) {
 // ---------- 展示辅助 ----------
 // 持仓类规则的作用域：未绑定代码 = 我的全部持仓。
 function ruleScope(r: AlertRule) {
-  return r.symbol ? r.name || r.symbol : '我的全部持仓'
+  return r.symbol ? `${r.name || '名称待补全'} · ${r.symbol}` : '我的全部持仓'
 }
 function describe(r: AlertRule) {
   const p = (n: number) => n.toFixed(2)

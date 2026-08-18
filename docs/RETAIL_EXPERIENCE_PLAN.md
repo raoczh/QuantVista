@@ -1,5 +1,7 @@
 # 散户日常体验补齐计划
 
+> 2026-08-18 最后一批页面实现补记：Screener、StockDetail、PortfolioRisk 已完成职责拆分，市场发现、研究验证、模拟盘和认证错误状态完成收口；逐页矩阵见 `RETAIL_FINAL_PAGE_MATRIX.md`。该记录仅代表本地实现与检查，不代表线上真实数据验收完成。
+
 > **文档状态：散户体验领域设计与历史交付记录。** 已交付能力和防回归认知继续有效，但本文不再作为新的待办总表；当前状态看 `ROADMAP.md`，推荐召回与持仓卖出后续施工看 `RECOMMENDATION_DISCOVERY_AND_EXIT_PLAN.md`。
 >
 > **定位**：本项目前 57 批开发集中在 AI 链路准确性（`LLM_ACCURACY_OPTIMIZATION_PLAN.md`）与推荐测准

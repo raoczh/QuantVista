@@ -101,7 +101,7 @@ export const TASK_STATUS_LABELS: Record<TaskStatus, string> = {
   queued: '排队中',
   running: '运行中',
   success: '成功',
-  degraded: '降级',
+  degraded: '部分成功',
   failed: '失败',
   canceled: '已取消',
 }
@@ -287,7 +287,7 @@ export function taskRecoveryAdvice(task: TaskCenterItem): string {
   if (task.status === 'queued') return '任务正在等待工作器分派。'
   if (task.status === 'running') return task.cancel_requested ? '已请求取消，正在等待执行器协作收敛。' : '任务正在后台执行。'
   if (task.status === 'success') return '结果已保存，可随时打开查看。'
-  if (task.status === 'degraded') return '已保留可用的降级结果，打开后请留意限制说明。'
+  if (task.status === 'degraded') return '部分结果可用，打开后请同时核对失败项和限制说明。'
   if (task.status === 'canceled') return '任务已取消，未生成新的业务结果。'
   if (task.source === 'data_sync') return '返回管理后台的数据健康区域检查数据源后重新触发同步。'
 

@@ -17,9 +17,10 @@ assert.doesNotMatch(stockActions, /name:\s*s\.name\s*\|\|\s*s\.symbol/, '股票�
 const picker = read('src/components/StockPicker.vue')
 assert.match(picker, /searchStocks/, '共享选股器必须复用现有股票搜索接口')
 
-for (const page of ['Home', 'Today', 'Watchlist', 'StockDetail', 'Qa', 'Compare', 'DailyReport', 'Positions', 'PortfolioRisk', 'Alerts', 'Screener', 'Backtest', 'Mood', 'BoardDetail', 'Etf', 'Paper', 'ThesisCards', 'Notes', 'Settings']) {
+for (const page of ['Home', 'Today', 'Watchlist', 'StockDetail', 'Qa', 'Compare', 'DailyReport', 'Positions', 'PortfolioRisk', 'Alerts', 'Backtest', 'Mood', 'BoardDetail', 'Etf', 'Paper', 'ThesisCards', 'Notes', 'Settings']) {
   assert.match(read(`src/pages/${page}.vue`), /StockIdentity/, `${page} 必须接入统一股票身份组件`)
 }
+assert.match(read('src/components/screener/ScreenerScanResults.vue'), /StockIdentity/, 'Screener 结果职责组件必须接入统一股票身份')
 for (const page of ['Compare', 'ThesisCards', 'Notes', 'Settings']) {
   assert.match(read(`src/pages/${page}.vue`), /StockPicker/, `${page} 的常用选股入口必须使用共享选股器`)
 }

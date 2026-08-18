@@ -5,13 +5,10 @@ import {
   NAlert,
   NButton,
   NButtonGroup,
-  NDropdown,
   NEmpty,
   NGi,
   NGrid,
   NSpin,
-  NTabPane,
-  NTabs,
   NTag,
   NTooltip,
   type DropdownOption,
@@ -56,7 +53,8 @@ import StockCoverageMatrix from '@/components/StockCoverageMatrix.vue'
 import StockIdentity from '@/components/StockIdentity.vue'
 import { createLoadEpoch, resolveCoverageStatus, type StockCoverageItem } from '@/components/stockCoverage'
 import StockDecisionSummary from '@/components/stock-detail/StockDecisionSummary.vue'
-import StockTabState from '@/components/stock-detail/StockTabState.vue'
+import StockDetailResearchTabs from '@/components/stock-detail/StockDetailResearchTabs.vue'
+import StockMobileActions from '@/components/stock-detail/StockMobileActions.vue'
 import {
   buildDecisionSummary,
   type PositionRelationSummary,
@@ -179,7 +177,11 @@ const positionSummary = computed<PositionRelationSummary | null>(() => {
   }, 0)
   const quoteFresh = items.every((item) => item.quote_ok)
   const profitAmount = quoteFresh ? items.reduce((sum, item) => sum + item.profit_amount, 0) : null
-  const triggered = items.find((item) => item.below_stop_loss || item.near_stop_loss)
+  const levelRank: Record<string, number> = { urgent: 4, review: 3, watch: 2, normal: 1, unknown: 0 }
+  const exitAssessment = items
+    .map((item) => item.exit_assessment)
+    .filter((item): item is NonNullable<Position['exit_assessment']> => !!item)
+    .sort((a, b) => (levelRank[b.level] || 0) - (levelRank[a.level] || 0))[0]
   return {
     lots: items.length,
     quantity,
@@ -190,9 +192,7 @@ const positionSummary = computed<PositionRelationSummary | null>(() => {
     realizedPnl: items.reduce((sum, item) => sum + item.realized_pnl, 0),
     quoteFresh,
     asOf: latestAsOf(items.map((item) => item.quote_as_of)),
-    belowStopLoss: items.some((item) => item.below_stop_loss),
-    nearStopLoss: items.some((item) => item.near_stop_loss),
-    stopLoss: triggered?.plan_stop_loss || undefined,
+    exitAssessment,
   }
 })
 
@@ -222,6 +222,7 @@ const decisionSummary = computed(() => buildDecisionSummary({
   eventPhase: eventSummaryPhase.value,
   eventPartial: eventSummaryPartial.value,
   fundamentalPhase: tabStates.fundamental.phase,
+  exitAssessment: positionSummary.value?.exitAssessment,
 }))
 
 const tabDataState = computed(() => ({
@@ -1401,15 +1402,13 @@ function scoreType(total: number) {
         @action="handleSummaryAction"
       />
 
-      <n-tabs v-model:value="activeTab" type="line" :animated="false" pane-class="stock-tab-pane">
-        <n-tab-pane name="trend" tab="走势" display-directive="show:lazy">
-          <StockTabState
-            :phase="tabStates.trend.phase"
-            :error="tabStates.trend.error"
-            :has-data="tabDataState.trend"
-            @retry="loadTab('trend', true)"
-          >
-            <div class="tab-content">
+      <StockDetailResearchTabs
+        v-model="activeTab"
+        :states="tabStates"
+        :has-data="tabDataState"
+        @retry="loadTab($event, true)"
+      >
+        <template #trend>
         <!-- 分时与日 K 共用稳定尺寸图表容器，切换时重绘。 -->
         <SectionCard title="行情走势">
           <template #extra>
@@ -1514,18 +1513,9 @@ function scoreType(total: number) {
           <n-empty v-else description="近期无上榜记录（覆盖近 30 天龙虎榜采集）" />
         </SectionCard>
 
-            </div>
-          </StockTabState>
-        </n-tab-pane>
+        </template>
 
-        <n-tab-pane name="event" tab="事件" display-directive="show:lazy">
-          <StockTabState
-            :phase="tabStates.event.phase"
-            :error="tabStates.event.error"
-            :has-data="tabDataState.event"
-            @retry="loadTab('event', true)"
-          >
-            <div class="tab-content">
+        <template #event>
         <!-- 解禁 / 分红（B9）：每日 19:25 同步的本地表。
              **状态三分**：读取失败 / 数据不可用 / 确实没有——空态文案严格区分，
              绝不把「查不到」显示成「无解禁」（与 AI 侧 riskGateNoteFor 同一纪律）。 -->
@@ -1620,18 +1610,9 @@ function scoreType(total: number) {
           </div>
           <n-empty v-else description="请求成功，当前没有相关新闻记录" />
         </SectionCard>
-            </div>
-          </StockTabState>
-        </n-tab-pane>
+        </template>
 
-        <n-tab-pane name="fundamental" tab="基本面" display-directive="show:lazy">
-          <StockTabState
-            :phase="tabStates.fundamental.phase"
-            :error="tabStates.fundamental.error"
-            :has-data="tabDataState.fundamental"
-            @retry="loadTab('fundamental', true)"
-          >
-            <div class="tab-content">
+        <template #fundamental>
         <!-- 估值 + 评分 -->
         <n-grid cols="1 m:2" :x-gap="16" :y-gap="16" responsive="screen">
           <n-gi>
@@ -1721,18 +1702,9 @@ function scoreType(total: number) {
           <n-empty v-else description="暂无财务数据（东财 F10，A 股标的；首次访问自动拉取，可稍后刷新）" />
         </SectionCard>
 
-            </div>
-          </StockTabState>
-        </n-tab-pane>
+        </template>
 
-        <n-tab-pane name="research" tab="研究" display-directive="show:lazy">
-          <StockTabState
-            :phase="tabStates.research.phase"
-            :error="tabStates.research.error"
-            :has-data="tabDataState.research"
-            @retry="loadTab('research', true)"
-          >
-            <div class="tab-content">
+        <template #research>
         <StockCoverageMatrix :items="coverageItems" />
 
         <!-- 机构观点（P3a）：研报评级分布/变动/目标价 + 机构调研；按需拉取首访可能为空 -->
@@ -1780,22 +1752,17 @@ function scoreType(total: number) {
           </div>
           <n-empty v-else description="暂无机构观点数据（研报/调研覆盖 A 股，首次访问自动拉取，可稍后刷新）" />
         </SectionCard>
-            </div>
-          </StockTabState>
-        </n-tab-pane>
-      </n-tabs>
+        </template>
+      </StockDetailResearchTabs>
     </div>
 
-    <nav class="mobile-action-bar" aria-label="当前股票快捷动作">
-      <button type="button" :disabled="adding" @click="handleSummaryAction('watch')">
-        {{ inWatchlist ? '观察中' : '观察' }}
-      </button>
-      <button type="button" @click="handleSummaryAction('alert')">提醒</button>
-      <button type="button" class="primary" @click="handleSummaryAction('analysis')">分析</button>
-      <n-dropdown trigger="click" placement="top-end" :options="moreOptions" @select="selectMoreAction">
-        <button type="button" aria-label="更多股票操作" title="更多股票操作">⋯</button>
-      </n-dropdown>
-    </nav>
+    <StockMobileActions
+      :adding="adding"
+      :in-watchlist="inWatchlist"
+      :more-options="moreOptions"
+      @action="handleSummaryAction"
+      @more="selectMoreAction"
+    />
   </PageContainer>
 </template>
 
