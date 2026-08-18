@@ -11,6 +11,7 @@ import {
   NDrawer,
   NDrawerContent,
   useThemeVars,
+  useMessage,
   type MenuOption,
   type DropdownOption,
 } from 'naive-ui'
@@ -30,6 +31,7 @@ import MobileBottomNav from '@/components/MobileBottomNav.vue'
 import RecentTasks from '@/components/RecentTasks.vue'
 import OnboardingGuide from '@/components/OnboardingGuide.vue'
 import AIQuickActions from '@/components/AIQuickActions.vue'
+import { useBrowserNotificationRuntime } from '@/composables/useBrowserNotifications'
 
 // 应用主外壳：必须挂在 n-config-provider 内部，useThemeVars 才能取到主题 override。
 const route = useRoute()
@@ -42,6 +44,8 @@ const { currentKey, preset } = storeToRefs(themeStore)
 
 const authStore = useAuthStore()
 const { user, isAdmin, isLoggedIn } = storeToRefs(authStore)
+const message = useMessage()
+const browserNotifications = useBrowserNotificationRuntime(() => user.value?.id || 0, router, message)
 
 const vars = useThemeVars()
 const { isDark, primaryAlpha } = useUi()
@@ -279,9 +283,11 @@ onMounted(() => {
   refreshTodoCount()
   refreshMarketTitle()
   healthTimer = window.setInterval(() => appStore.refreshStatus(), 90_000)
+  browserNotifications.start()
 })
 onUnmounted(() => {
   if (healthTimer !== undefined) clearInterval(healthTimer)
+  browserNotifications.stop()
 })
 </script>
 

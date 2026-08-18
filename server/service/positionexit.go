@@ -217,7 +217,7 @@ func (s *PositionExitAssessmentService) notifyAssessment(ctx context.Context, ro
 	if s.notify == nil || (row.Level != model.PositionExitLevelReview && row.Level != model.PositionExitLevelUrgent) {
 		return
 	}
-	enabled, err := alertNotificationsEnabled(ctx, row.UserID)
+	enabled, err := notificationsEnabledFor(ctx, row.UserID, model.BrowserNotifyCategoryExitRisk)
 	if err != nil || !enabled {
 		return
 	}
@@ -230,20 +230,42 @@ func (s *PositionExitAssessmentService) notifyAssessment(ctx context.Context, ro
 		kind = model.GuardKindPosExitUrgent
 		priority = 4
 	}
-	message := truncateRunes(fmt.Sprintf("%s(%s) 风险等级 %s：%s。%s",
-		orSymbol(row.Name, row.Symbol), row.Symbol, row.Level, row.PrimaryReason, row.NextAction), 256)
+	levelName := "需要复核"
+	if row.Level == model.PositionExitLevelUrgent {
+		levelName = "紧急处理"
+	}
+	dataTime := strings.TrimSpace(row.QuoteAsOf)
+	if row.BarsAsOf != "" && row.BarsAsOf != dataTime {
+		dataTime = strings.TrimSpace(dataTime + " / 日线 " + row.BarsAsOf)
+	}
+	message := truncateRunes(fmt.Sprintf("%s(%s) · %s：%s。数据时间：%s。下一步：%s",
+		orSymbol(row.Name, row.Symbol), row.Symbol, levelName, row.PrimaryReason, orSymbol(dataTime, "待补全"), row.NextAction), 512)
 	hit := guardHit{
 		PositionID: row.PositionID, Symbol: row.Symbol, Market: row.Market, Name: orSymbol(row.Name, row.Symbol),
 		Kind: kind, Price: row.QuotePrice, Message: message,
-		Route: fmt.Sprintf("/positions?position_id=%d", row.PositionID), Priority: priority,
+		Route: fmt.Sprintf("/positions?position_id=%d&assessment_id=%d", row.PositionID, row.ID), Priority: priority,
 	}
 	if !recordGuardEvent(row.UserID, row.TradeDate, hit) {
 		return
 	}
-	s.notify.SendMsgContext(ctx, row.UserID, NotifyMessage{
+	msg := NotifyMessage{
 		Title: "QuantVista 持仓卖出风险复核", Content: message,
 		Route: hit.Route, Kind: NotifyMsgKindGuard, Priority: priority,
-	})
+		BrowserEvents: []BrowserNotificationInput{{
+			SourceType: "position_exit_assessment", SourceID: row.ID,
+			FactKey:  BrowserFactKey("position_exit_assessment", fmt.Sprint(row.ID), row.Level, row.FactHash),
+			Category: model.BrowserNotifyCategoryExitRisk, Level: row.Level,
+			Title: fmt.Sprintf("%s（%s）· %s", orSymbol(row.Name, row.Symbol), row.Symbol, levelName),
+			Body:  message, Route: hit.Route,
+		}},
+	}
+	if detached, ok := s.notify.(interface {
+		SendMsgDetached(context.Context, int64, NotifyMessage)
+	}); ok {
+		detached.SendMsgDetached(ctx, row.UserID, msg)
+		return
+	}
+	s.notify.SendMsgContext(ctx, row.UserID, msg)
 }
 
 func effectivePositionExitTradeDate(fq FreshQuoteResult, now time.Time) string {
@@ -776,6 +798,19 @@ func LatestPositionExitAssessment(ctx context.Context, userID, positionID int64)
 		Order("evaluated_at DESC, id DESC").First(&row).Error
 	if err != nil {
 		return nil, err
+	}
+	view := decodePositionExitAssessment(row)
+	return &view, nil
+}
+
+// PositionExitAssessmentByID 返回精确的历史评估事实。三个 ID 同时约束，避免仅凭
+// assessment_id 读取到其他用户或同用户其他持仓的记录。
+func PositionExitAssessmentByID(ctx context.Context, userID, positionID, assessmentID int64) (*PositionExitAssessmentView, error) {
+	var row model.PositionExitAssessment
+	if err := common.DB.WithContext(ctx).
+		Where("id = ? AND user_id = ? AND position_id = ?", assessmentID, userID, positionID).
+		First(&row).Error; err != nil {
+		return nil, errors.New("卖出风险评估不存在")
 	}
 	view := decodePositionExitAssessment(row)
 	return &view, nil

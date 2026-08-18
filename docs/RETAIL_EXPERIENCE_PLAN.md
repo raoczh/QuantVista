@@ -21,6 +21,8 @@
 > [`RECOMMENDATION_DISCOVERY_AND_EXIT_PLAN.md`](./RECOMMENDATION_DISCOVERY_AND_EXIT_PLAN.md) 后续批次实施。
 >
 > **2026-08-17 全局体验地基补记（代码已实现、待线上验收）**：新增统一股票身份/共享选股器、术语字典与简明/专业模式、AI 快捷操作，并把通知总闸、智能守护和现有三类推送通道完整收口到设置页。共享外壳改为安静的 8px 平面分区，日报错误卖点说明已修正。本批未实现浏览器通知/Web Push，也不代表推荐、分析或持仓整体信息架构已经重构。
+>
+> **2026-08-18 卖出决策与浏览器通知补记（代码已实现、待线上真机验收）**：持仓页按需要处理/全部持仓/交易与复盘/组合风险重排，review/urgent 卡、Today 和通知只消费 `PositionExitAssessment`，并以 position+assessment 精确定位。浏览器前台 Notification、事件轮询、Service Worker 和配置持久 VAPID 后的 Web Push 已接通，多设备/逐事实投递独立幂等；VAPID 未配置仍可使用前台通知。Server酱/Webhook/ntfy 的编辑能力没有删除，只集中在设置页。提醒页改规则/命中页签与按需向导。程序化与本地浏览器验收不能替代生产 HTTPS、真实 VAPID/endpoint 和 iOS/Android 真机验收。
 
 ---
 
@@ -398,6 +400,11 @@ https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=sh600000,m1,,240
     review/urgent 才产生统一 Todo/通知，unknown 只显示缺口。D17 保留全持仓手动分析，同时新增
     `position_id` 精确复核并校验 user、symbol 与 holding；AI 不能覆盖程序风险。除权继续只提示
     口径变化，不能单独升级卖出风险。
+15. **2026-08-18 浏览器通知仍是消费出口，不是第四套业务状态**：浏览器事件只保存稳定来源、等级、
+    路由与逐设备投递审计；手工提醒仍由 `AlertEvent` 管已读/忽略，智能守护仍由 `GuardEvent` 去重，
+    卖出风险仍由 `PositionExitAssessment` 定级，Today 仍是统一审计入口。浏览器设备可独立成为通知目的地，
+    但所有分类仍受通知总闸控制；同一事实同设备只投一次，review 升 urgent 因等级与评估事实变化可再投。
+    endpoint/p256dh/auth 加密且不回显，VAPID 只能持久配置，禁止启动时临时生成。
 
 ---
 

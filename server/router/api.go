@@ -275,6 +275,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				positions.POST("/:id/close", positionCtl.Close)
 				positions.GET("/:id/trades", positionCtl.Trades)    // B5 流水明细
 				positions.POST("/:id/trades", positionCtl.AddTrade) // B5 加仓/减仓
+				positions.GET("/:id/exit-assessments/:assessment_id", positionCtl.ExitAssessment)
 				// B8 除权除息调整建议：列表 + confirm/revert/dismiss 三动作
 				//（静态段 corp-adjusts 与 :id 同层，gin 通配约束下动作并入 :action 分支）
 				positions.GET("/corp-adjusts", positionCtl.CorpAdjusts)
@@ -437,6 +438,17 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				notify.PUT("/:id", notifyCtl.Update)
 				notify.DELETE("/:id", notifyCtl.Delete)
 				notify.POST("/:id/test", middleware.RateLimit(10, time.Minute), notifyCtl.Test)
+			}
+			// 浏览器通知：前台 Notification API 设备、Web Push 订阅、事件轮询与确认。
+			browserNotify := authed.Group("/browser-notifications")
+			{
+				browserNotify.GET("/config", notifyCtl.BrowserConfig)
+				browserNotify.PUT("/settings", notifyCtl.UpdateBrowserSettings)
+				browserNotify.POST("/subscriptions", notifyCtl.UpsertBrowserSubscription)
+				browserNotify.DELETE("/subscriptions/:id", notifyCtl.RemoveBrowserDevice)
+				browserNotify.GET("/events", notifyCtl.BrowserEvents)
+				browserNotify.PUT("/events/:id/ack", notifyCtl.AckBrowserEvent)
+				browserNotify.POST("/test", middleware.RateLimit(10, time.Minute), notifyCtl.TestBrowserNotification)
 			}
 
 			// 自定义分析提示词模板（启用后覆盖对应模块默认指引）

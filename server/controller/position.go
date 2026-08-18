@@ -157,6 +157,25 @@ func (pc *PositionController) Trades(c *gin.Context) {
 	common.ApiSuccess(c, rows)
 }
 
+// ExitAssessment GET /api/positions/:id/exit-assessments/:assessment_id
+// 用于通知、Today 的精确深链恢复，不把历史通知悄悄替换为最新评估。
+func (pc *PositionController) ExitAssessment(c *gin.Context) {
+	positionID, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	assessmentID, ok := parseIDParam(c, "assessment_id")
+	if !ok {
+		return
+	}
+	view, err := service.PositionExitAssessmentByID(c.Request.Context(), currentUserID(c), positionID, assessmentID)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, view)
+}
+
 // AddTrade POST /api/positions/:id/trades —— 加仓 / 减仓（B5）。
 // 减到 0 自动平仓，请求体可一并带复盘字段。
 func (pc *PositionController) AddTrade(c *gin.Context) {

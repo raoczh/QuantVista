@@ -20,6 +20,11 @@ export const TERM_DICTIONARY = {
     professional: 'ATR',
     help: '回答这只股票近期一天通常波动多大，常用于设置保护距离。',
   },
+  ma: {
+    plain: '一段时间的平均价格',
+    professional: '移动平均线（MA）',
+    help: '回答当前价格相对一段时间平均成本的位置，跌破或站上只是一项条件，不代表交易已经执行。',
+  },
   rps: {
     plain: '相对市场强弱',
     professional: 'RPS',

@@ -6,6 +6,7 @@ import { useAuthStore } from '@/stores/auth'
 import { githubMobileCallback } from '@/api/auth'
 import { isNativeApp } from '@/config/runtime'
 import AuthShell from '@/components/AuthShell.vue'
+import { safeInternalRoute } from '@/lib/internalRoute'
 
 const router = useRouter()
 const route = useRoute()
@@ -58,7 +59,9 @@ async function runMobileAppLeg() {
   }
   try {
     await auth.finishMobileExchange(authCode)
-    router.replace('/')
+    const redirect = safeInternalRoute(sessionStorage.getItem('qv_login_redirect'))
+    sessionStorage.removeItem('qv_login_redirect')
+    router.replace(redirect)
   } catch (e) {
     error.value = (e as Error).message
   }
@@ -108,7 +111,9 @@ async function run() {
       router.replace('/settings?tab=account')
     } else {
       await auth.finishGithubLogin(code, state)
-      router.replace('/')
+      const redirect = safeInternalRoute(sessionStorage.getItem('qv_login_redirect'))
+      sessionStorage.removeItem('qv_login_redirect')
+      router.replace(redirect)
     }
   } catch (e) {
     error.value = (e as Error).message

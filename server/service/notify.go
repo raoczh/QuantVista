@@ -17,11 +17,36 @@ import (
 	"quantvista/setting"
 )
 
-// NotifyService 主动推送：管理用户的推送通道（Server酱/自定义 webhook），提醒命中时推送。
+// NotifyService 主动推送：管理用户的推送通道，并把带稳定事实来源的消息同步声明为
+// 浏览器通知事件。外部通道与各浏览器设备逐一隔离，任一失败都不回滚业务事实。
 // target（sendkey/url）加密落库；推送走 SafeHTTPClient 防 SSRF（禁内网，用户配置的外部通道）。
-type NotifyService struct{}
+type NotifyService struct {
+	browser       *BrowserNotificationService
+	channelSender notifyChannelSender
+}
 
-func NewNotifyService() *NotifyService { return &NotifyService{} }
+func NewNotifyService() *NotifyService {
+	return &NotifyService{browser: NewBrowserNotificationService(), channelSender: productionNotifyChannelSender{}}
+}
+
+type notifyChannelSender interface {
+	Send(context.Context, string, string, NotifyMessage) error
+}
+
+type productionNotifyChannelSender struct{}
+
+func (productionNotifyChannelSender) Send(ctx context.Context, kind, target string, msg NotifyMessage) error {
+	switch kind {
+	case model.NotifyKindServerChan:
+		return sendServerChan(ctx, target, msg.Title, msg.Content)
+	case model.NotifyKindWebhook:
+		return sendWebhook(ctx, target, msg.Title, msg.Content)
+	case model.NotifyKindNtfy:
+		return sendNtfy(ctx, target, msg)
+	default:
+		return errors.New("未知通道类型")
+	}
+}
 
 const (
 	notifyTimeout      = 10 * time.Second
@@ -42,6 +67,9 @@ type NotifyMessage struct {
 	Route    string // 站内路由（/alerts、/daily-reports、/stock/600519）；ntfy 拼 click=<SiteBaseURL>+Route，SiteBaseURL 未配置则不带
 	Kind     string // 消息类别（映射 ntfy tags 图标）：alert / earn / report / guard
 	Priority int    // ntfy 优先级 1~5；0=默认（不下发字段）。止损触达等紧急事件给 4
+	// BrowserEvents 为浏览器通知使用的稳定业务事实。外部通道仍只发送上面的
+	// title/content 一次；批量提醒可在这里逐事件声明，避免用正文猜测去重。
+	BrowserEvents []BrowserNotificationInput
 }
 
 // 消息类别（NotifyMessage.Kind）。
@@ -253,6 +281,49 @@ func (s *NotifyService) SendMsgContext(ctx context.Context, userID int64, msg No
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	s.declareBrowserEvents(ctx, userID, msg)
+	s.sendExternalContext(ctx, userID, msg)
+}
+
+// SendMsgDetached 先把浏览器事件和逐设备投递台账同步落库，再把所有网络 I/O
+// 放到独立有界上下文。持仓评估等业务事实不会因外部通道慢或失败而阻塞。
+func (s *NotifyService) SendMsgDetached(ctx context.Context, userID int64, msg NotifyMessage) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.declareBrowserEvents(ctx, userID, msg)
+	go func() {
+		deliveryCtx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+		defer cancel()
+		s.sendExternalContext(deliveryCtx, userID, msg)
+	}()
+}
+
+func (s *NotifyService) declareBrowserEvents(ctx context.Context, userID int64, msg NotifyMessage) {
+	if len(msg.BrowserEvents) > 0 {
+		browser := s.browser
+		if browser == nil {
+			browser = NewBrowserNotificationService()
+		}
+		for _, event := range msg.BrowserEvents {
+			if ctx.Err() != nil {
+				break
+			}
+			if event.Title == "" {
+				event.Title = msg.Title
+			}
+			if event.Body == "" {
+				event.Body = msg.Content
+			}
+			if event.Route == "" {
+				event.Route = msg.Route
+			}
+			_, _ = browser.CreateAndDispatch(ctx, userID, event, "")
+		}
+	}
+}
+
+func (s *NotifyService) sendExternalContext(ctx context.Context, userID int64, msg NotifyMessage) {
 	var rows []model.NotifyChannel
 	if err := common.DB.WithContext(ctx).Where("user_id = ? AND enabled = ?", userID, true).Find(&rows).Error; err != nil {
 		return
@@ -277,6 +348,19 @@ func (s *NotifyService) HasEnabledChannel(userID int64) bool {
 	return cnt > 0
 }
 
+// HasEnabledDestination 判断指定类别是否至少有一个有效目的地。外部通道接收所有
+// 既有类别；浏览器设备还需对应分类开关开启。
+func (s *NotifyService) HasEnabledDestination(userID int64, category string) bool {
+	if s.HasEnabledChannel(userID) {
+		return true
+	}
+	browser := s.browser
+	if browser == nil {
+		browser = NewBrowserNotificationService()
+	}
+	return browser.HasEnabledDestination(userID, category)
+}
+
 // sendTo 向单个通道发送，并回写 last_sent_at/last_error。
 func (s *NotifyService) sendTo(ch model.NotifyChannel, msg NotifyMessage) error {
 	return s.sendToContext(context.Background(), ch, msg)
@@ -297,16 +381,11 @@ func (s *NotifyService) sendToContext(ctx context.Context, ch model.NotifyChanne
 	sendCtx, cancel := context.WithTimeout(ctx, notifyTimeout)
 	defer cancel()
 
-	switch ch.Kind {
-	case model.NotifyKindServerChan:
-		err = sendServerChan(sendCtx, target, msg.Title, msg.Content)
-	case model.NotifyKindWebhook:
-		err = sendWebhook(sendCtx, target, msg.Title, msg.Content)
-	case model.NotifyKindNtfy:
-		err = sendNtfy(sendCtx, target, msg)
-	default:
-		err = errors.New("未知通道类型")
+	sender := s.channelSender
+	if sender == nil {
+		sender = productionNotifyChannelSender{}
 	}
+	err = sender.Send(sendCtx, ch.Kind, target, msg)
 	s.recordResultContext(ctx, ch.ID, err)
 	return err
 }

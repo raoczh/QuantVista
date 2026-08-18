@@ -326,6 +326,13 @@ Go API Server
   下轮扫描拉回 open（同 B8 先例）。`detail` 必须回答「这件事对**我这笔持仓**意味着什么」
   （含我的成本与浮盈亏）；`quote_ok=false` 时 `price/profit_pct` 恒 0 且 detail 如实声明
   行情不可用——绝不用旧价冒充。
+- 浏览器通知分为事实、设备和投递三层：`browser_notification_events` 用
+  `(user_id, fact_key)` 固化稳定来源类型、来源 ID、分类、等级、站内路由和创建时间；
+  `browser_notification_devices` 与 `web_push_subscriptions` 以用户+本地随机设备标识隔离多设备，
+  endpoint/p256dh/auth 全部用 `ENCRYPTION_KEY` 加密且 API 不回显；
+  `browser_notification_deliveries` 用 `(user_id, device_id, event_id)` 保证同一事实同一设备只投递一次。
+  review 升 urgent 使用包含新评估 ID/等级/事实 hash 的新 fact key，因此允许再次提醒。任一设备失败不影响
+  其他设备或业务事实，Web Push 返回 404/410 会禁用对应订阅。
 
 **除权除息折算公式（B8，改动前先读；D15 起含峰值）**：
 
@@ -494,11 +501,31 @@ AI 个股快照 `corp_events.latest_dividend_yield_pct` / 选股因子 `div_yiel
 - `GET/POST /api/llm-configs`，`PUT/DELETE /api/llm-configs/:id`，`POST /api/llm-configs/:id/test`
 - `GET/PUT /api/user/preference`，`GET /api/user/quota`
 - `GET/POST /api/notify-channels`，`PUT/DELETE /api/notify-channels/:id`，`POST /api/notify-channels/:id/test`
+- `GET /api/browser-notifications/config`，`PUT /api/browser-notifications/settings`，
+  `POST/DELETE /api/browser-notifications/subscriptions`，`GET /api/browser-notifications/events`，
+  `PUT /api/browser-notifications/events/:id/ack`，`POST /api/browser-notifications/test`
 - `GET/PUT /api/admin/users/:id/quota`（管理员查看/调整用户 AI 次数上限、手工清零已用量；2026-07-03 起配额为次数制，token 仅审计）
 - `GET /api/export/:kind`（kind=positions|watchlist|recommendations|analyses，CSV 带 BOM，限流 10/min）
 - `GET /api/admin/datasources`（数据源健康滑窗状态，S1；`data_source_configs` 死表已删，数据源无用户级配置）
 
-前端唯一可编辑通知入口为 `/settings?tab=notifications`：推送总闸、智能守护和 Server酱/Webhook/ntfy 通道 CRUD、启停、删除、测试均复用以上接口。`/alerts` 只负责提醒规则、立即检查和命中历史，并跳转到该设置页；不得再放第二套通道表单。ntfy 密钥不回显，保存失败保留表单和最近已加载列表。浏览器 Notification API、Service Worker、VAPID 与 Web Push **尚未实现**，不得展示占位开关。
+前端唯一可编辑通知入口为 `/settings?tab=notifications`：推送总闸、智能守护和 Server酱/Webhook/ntfy 通道 CRUD、启停、删除、测试均复用以上接口。通道管理只是从提醒页集中到设置页，**编辑能力没有删除**；同类型编辑时敏感字段留空保留原密文，ntfy 三项全部留空保留整套原配置，重新填写时校验完整地址与 Topic。`/alerts` 只负责提醒规则、立即检查和命中历史，并提供“通知接收设置”跳转；不得再放第二套通道表单。
+
+### 5.8.0 浏览器通知（2026-08-18）
+
+- `GET /api/browser-notifications/config` 返回 VAPID 可用状态、分类偏好和脱敏设备列表；
+  `POST/DELETE /subscriptions` 新增、更新或移除本人设备，`GET /events` + `PUT /events/:id/ack`
+  为前台事件轮询与逐设备确认，`POST /test` 只测试当前设备。全部接口按当前用户与设备归属校验。
+- 网站打开或后台标签页时，AppShell 每 20 秒轮询待投递事件并用 Notification API 发系统通知，
+  同时给出克制的站内提示；权限请求只允许设置页按钮触发。VAPID 未配置或浏览器不支持 PushManager
+  不影响此前台降级路径。
+- 网站关闭后的投递由 `/sw.js` 的 `push`/`notificationclick` 处理。点击只接受同源相对路径；未登录时
+  路由守卫带 `redirect` 进入登录，密码/GitHub 登录完成后经同一站内路径校验恢复目标。
+- VAPID 只从 `VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY/VAPID_SUBJECT` 读取，并校验 P-256 密钥对与
+  `mailto:/https:` subject；三项缺失或无效时服务端正常启动且不临时生成密钥。生产 Web Push 要求 HTTPS
+  （localhost 可用于本地），iOS/iPadOS 通常还要求先添加到主屏幕。
+- 浏览器事件至少消费 `PositionExitAssessment` review/urgent、`AlertEvent` 手工规则命中和 `GuardEvent`
+  智能守护。卖出风险、手工提醒默认开启，智能守护分类默认关闭；三者继续受 `UserPreference.EnableNotify`
+  总闸控制。浏览器设备本身就是有效目的地，不要求先配置外部通道。
 
 ### 5.8.1 条件提醒与命中事件（阶段 7 + 批次 H；D14/D15 起含持仓类）
 

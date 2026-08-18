@@ -47,7 +47,9 @@ import {
   actCorpAdjust,
   type PositionCorpAdjust,
   requestPositionAdvice,
+  getPositionExitAssessment,
   type PositionAdviceResult,
+  type PositionExitAssessment,
   type PositionExitLevel,
   POSITION_VERDICT_LABEL,
 } from '@/api/position'
@@ -70,6 +72,7 @@ import StatCard from '@/components/StatCard.vue'
 import FreshnessTag from '@/components/FreshnessTag.vue'
 import DataImportWizard from '@/components/DataImportWizard.vue'
 import StockIdentity from '@/components/StockIdentity.vue'
+import PositionDecisionCenter from '@/components/positions/PositionDecisionCenter.vue'
 
 const PortfolioRisk = defineAsyncComponent(() => import('@/pages/PortfolioRisk.vue'))
 
@@ -625,7 +628,12 @@ async function revertAdjustTrade(t: PositionTrade, positionId: number) {
 }
 
 // ---------- B6 复盘统计 ----------
-const mainTabQuery = enumQuery<'list' | 'stats' | 'risk'>('list', ['list', 'stats', 'risk'])
+const mainTabQuery = enumQuery<'needs_action' | 'all' | 'review' | 'risk'>('needs_action', [
+  'needs_action',
+  'all',
+  'review',
+  'risk',
+])
 const statsRangeQuery = enumQuery<'all' | '30d' | '90d' | '180d' | '1y'>('all', [
   'all',
   '30d',
@@ -667,15 +675,15 @@ async function loadStats() {
   }
 }
 watch(mainTab, (t) => {
-  if (t === 'stats' && !stats.value) loadStats()
-  if (t === 'list')
+  if (t === 'review' && !stats.value) loadStats()
+  if (t === 'all')
     nextTick(() => {
       renderCurve()
       renderExposure()
     })
 })
 watch(statsRange, () => {
-  if (mainTab.value === 'stats') loadStats()
+  if (mainTab.value === 'review') loadStats()
 })
 // 盈亏比无定义（窗口内没有亏损交易）时如实显示「—」，不写 0 也不写 ∞。
 const profitFactorText = computed(() => {
@@ -1075,6 +1083,8 @@ watch([isDark, vars], () => {
 })
 
 const highlightedPositionID = ref<number | null>(null)
+const focusedAssessment = ref<PositionExitAssessment | null>(null)
+const focusedAssessmentError = ref('')
 let lastConsumedStockAction = ''
 let activeStockAction = ''
 
@@ -1097,7 +1107,7 @@ const { restoreScroll } = useListPageScroll(route, 'positions')
 
 async function restoreExpandedTrade() {
   const id = expandedTrades.value
-  if (!id || mainTab.value !== 'list') return
+  if (!id || mainTab.value !== 'all') return
   // query 同步会先更新筛选再发请求；旧范围列表不能据此把新范围的展开项判成无效。
   if (loadedStatus !== statusFilter.value) return
   const target = positions.value.find((position) => position.id === id)
@@ -1114,7 +1124,12 @@ watch(expandedTrades, () => void restoreExpandedTrade())
 function stockActionKey() {
   if (route.query.import === '1') return 'import'
   const positionID = Number(route.query.position_id)
-  if (Number.isInteger(positionID) && positionID > 0) return `position:${positionID}`
+  if (Number.isInteger(positionID) && positionID > 0) {
+    const assessmentID = Number(route.query.assessment_id)
+    return Number.isInteger(assessmentID) && assessmentID > 0
+      ? `position:${positionID}:assessment:${assessmentID}`
+      : `position:${positionID}`
+  }
   const symbol = String(route.query.symbol || '').trim()
   if (!symbol && route.query.add !== '1') return ''
   return String(route.query._stock_action || '') || [symbol, route.query.market || 'cn', route.query.add || '', route.query.quantity || ''].join(':')
@@ -1132,7 +1147,24 @@ function stockRouteRemainder() {
 }
 
 function positionElementID(id: number) {
-  return `position-item-${id}`
+  return mainTab.value === 'needs_action' ? `position-item-${id}` : `position-ledger-item-${id}`
+}
+
+function assessmentRouteID() {
+  const value = Number(route.query.assessment_id)
+  return Number.isInteger(value) && value > 0 ? value : null
+}
+
+async function loadFocusedAssessment(positionID: number) {
+  const assessmentID = assessmentRouteID()
+  focusedAssessment.value = null
+  focusedAssessmentError.value = ''
+  if (!assessmentID) return
+  try {
+    focusedAssessment.value = await getPositionExitAssessment(positionID, assessmentID)
+  } catch (error) {
+    focusedAssessmentError.value = (error as Error).message || '通知对应的卖出风险评估读取失败'
+  }
 }
 
 async function applyStockActionQuery(): Promise<boolean> {
@@ -1182,6 +1214,13 @@ async function applyStockActionQuery(): Promise<boolean> {
     lastConsumedStockAction = actionKey
     if (target) {
       highlightedPositionID.value = target.id
+      if (assessmentRouteID()) {
+        mainTab.value = 'needs_action'
+        await loadFocusedAssessment(target.id)
+      } else {
+        mainTab.value = 'all'
+        focusedAssessment.value = null
+      }
       await nextTick()
       document.getElementById(positionElementID(target.id))?.scrollIntoView({
         behavior: 'smooth',
@@ -1204,7 +1243,10 @@ async function applyStockActionQuery(): Promise<boolean> {
   }
 }
 
-watch(() => route.query._stock_action, () => void applyStockActionQuery())
+watch(
+  () => [route.query._stock_action, route.query.position_id, route.query.assessment_id],
+  () => void applyStockActionQuery(),
+)
 
 onMounted(async () => {
   const hasExplicitTask = routeTaskID() !== null
@@ -1212,7 +1254,7 @@ onMounted(async () => {
   // 股票动作先核对当前持仓：已有记录定位高亮，否则预填建仓；rec_id 保留推荐血缘。
   if (!(await applyStockActionQuery())) await load()
   await Promise.all([loadCurve(), loadCorpAdjusts()])
-  if (mainTab.value === 'stats' && !stats.value) await loadStats()
+  if (mainTab.value === 'review' && !stats.value) await loadStats()
   if (hasExplicitTask) void restoreRouteAdvice()
   window.addEventListener('resize', onResize)
   if (!hadStockAction) await restoreScroll()
@@ -1237,7 +1279,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <PageContainer title="持仓" subtitle="短线 / 长线 · 盈亏跟踪 · 卖出复盘">
+  <PageContainer title="持仓卖出决策中心" subtitle="先处理风险，再管理账本与复盘">
     <template v-if="mainTab !== 'risk'" #actions>
       <n-button size="small" type="primary" @click="openCreate()">+ 新建持仓</n-button>
       <n-button size="small" quaternary @click="openImport">导入</n-button>
@@ -1246,7 +1288,7 @@ onBeforeUnmount(() => {
 
     <div class="pos" :style="styleVars">
       <!-- 汇总（组合总览：全组合口径） -->
-      <n-grid v-if="mainTab !== 'risk'" cols="2 s:4" :x-gap="14" :y-gap="14" responsive="screen">
+      <n-grid v-if="mainTab === 'all'" cols="2 s:4" :x-gap="14" :y-gap="14" responsive="screen">
         <n-gi>
           <StatCard label="持仓成本" :value="overview ? fmtMoney(overview.total_cost) : '—'" />
         </n-gi>
@@ -1290,17 +1332,33 @@ onBeforeUnmount(() => {
         </n-gi>
       </n-grid>
 
-      <n-alert v-if="mainTab !== 'risk' && loadError" type="error" :bordered="false" title="持仓读取失败">
+      <n-alert v-if="mainTab === 'all' && loadError" type="error" :bordered="false" title="持仓读取失败">
         {{ loadError }}
       </n-alert>
 
       <!-- 组合风控信号（集中度/止损/未分析） -->
-      <n-alert v-if="mainTab !== 'risk' && overview?.signals?.length" type="warning" title="组合风控信号">
+      <n-alert v-if="mainTab === 'all' && overview?.signals?.length" type="warning" title="组合风控信号">
         <div v-for="(s, i) in overview.signals" :key="i" class="signal-line">{{ s }}</div>
       </n-alert>
 
       <n-tabs v-model:value="mainTab" type="line" animated>
-        <n-tab-pane name="list" tab="持仓明细">
+        <n-tab-pane name="needs_action" tab="需要处理">
+          <PositionDecisionCenter
+            :positions="positions"
+            :overview="overview"
+            :loading="loading"
+            :error="loadError || focusedAssessmentError"
+            :focused-position-id="highlightedPositionID"
+            :focused-assessment="focusedAssessment"
+            :advice="advice"
+            :advice-loading="adviceLoading"
+            :advice-error="adviceError"
+            :advice-target-position-id="adviceTargetPositionID"
+            @refresh="load()"
+            @review="runAdvice"
+          />
+        </n-tab-pane>
+        <n-tab-pane name="all" tab="全部持仓">
           <!-- B8 除权除息待确认折算：仅在有 pending 建议时出现。
                **不确认的话本页盈亏就是错的数字**（10 转 10 后显示 -50%），
                所以放在最顶部；但程序绝不代替用户改账本。 -->
@@ -1483,7 +1541,7 @@ onBeforeUnmount(() => {
               <div v-if="filtered.length" class="rows">
                 <div
                   v-for="p in filtered"
-                  :id="positionElementID(p.id)"
+                  :id="`position-ledger-item-${p.id}`"
                   :key="p.id"
                   class="row-wrap"
                   :class="{ 'is-stock-action-target': highlightedPositionID === p.id }"
@@ -1728,7 +1786,7 @@ onBeforeUnmount(() => {
         </n-tab-pane>
 
         <!-- B6 复盘统计：用户执行口径，与推荐追踪的模型口径不混算 -->
-        <n-tab-pane name="stats" tab="复盘统计">
+        <n-tab-pane name="review" tab="交易与复盘">
           <SectionCard title="交易复盘统计">
             <template #extra>
               <div class="filters">

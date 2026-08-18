@@ -244,6 +244,12 @@ export function listPositions(status: 'holding' | 'closed' | 'all' = 'all') {
   return request<Position[]>({ url: '/positions', params: { status } })
 }
 
+export function getPositionExitAssessment(positionID: number, assessmentID: number) {
+  return request<PositionExitAssessment>({
+    url: `/positions/${positionID}/exit-assessments/${assessmentID}`,
+  })
+}
+
 export function getPortfolioOverview() {
   return request<PortfolioOverview>({ url: '/positions/overview' })
 }

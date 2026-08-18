@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -346,8 +347,9 @@ func TestPositionExitNotificationDedupAndUpgrade(t *testing.T) {
 	notifier := &recordingAlertNotifier{userID: userID}
 	svc := NewPositionExitAssessmentService(nil)
 	svc.notify = notifier
-	row := model.PositionExitAssessment{UserID: userID, PositionID: 9091, Symbol: "600909", Market: "cn", Name: "通知持仓",
-		TradeDate: "2026-08-10", Level: model.PositionExitLevelWatch, PrimaryReason: "仅观察", NextAction: "继续观察"}
+	row := model.PositionExitAssessment{ID: 9901, UserID: userID, PositionID: 9091, Symbol: "600909", Market: "cn", Name: "通知持仓",
+		TradeDate: "2026-08-10", Level: model.PositionExitLevelWatch, PrimaryReason: "仅观察", NextAction: "继续观察",
+		QuoteAsOf: "2026-08-10 14:55", BarsAsOf: "2026-08-09", FactHash: "review-fact"}
 	svc.notifyAssessment(context.Background(), row)
 	if got := notifier.calls.Load(); got != 0 {
 		t.Fatalf("watch 不得推送，got %d", got)
@@ -359,12 +361,35 @@ func TestPositionExitNotificationDedupAndUpgrade(t *testing.T) {
 	if got := notifier.calls.Load(); got != 1 {
 		t.Fatalf("review 同日应按统一 GuardEvent 去重一次，got %d", got)
 	}
+	if got := notifier.lastMessage.Route; got != "/positions?position_id=9091&assessment_id=9901" {
+		t.Fatalf("卖出通知必须使用持仓与评估精确深链，得到 %q", got)
+	}
+	if !strings.Contains(notifier.lastMessage.Content, "通知持仓(600909)") ||
+		!strings.Contains(notifier.lastMessage.Content, "需要复核") ||
+		!strings.Contains(notifier.lastMessage.Content, "数据时间：2026-08-10 14:55 / 日线 2026-08-09") ||
+		!strings.Contains(notifier.lastMessage.Content, "下一步：继续观察") {
+		t.Fatalf("卖出通知内容未复用评估事实: %q", notifier.lastMessage.Content)
+	}
+	if len(notifier.lastMessage.BrowserEvents) != 1 {
+		t.Fatalf("卖出通知应声明一个浏览器事件: %+v", notifier.lastMessage.BrowserEvents)
+	}
+	browserEvent := notifier.lastMessage.BrowserEvents[0]
+	if browserEvent.SourceType != "position_exit_assessment" || browserEvent.SourceID != row.ID ||
+		browserEvent.Level != model.PositionExitLevelReview || browserEvent.Route != notifier.lastMessage.Route {
+		t.Fatalf("浏览器事件等级、来源与深链必须和评估一致: %+v", browserEvent)
+	}
 	row.Level, row.PrimaryReason = model.PositionExitLevelUrgent, "风险升级"
+	row.ID, row.FactHash = 9902, "urgent-fact"
 	svc.notifyAssessment(context.Background(), row)
 	if got := notifier.calls.Load(); got != 2 {
 		t.Fatalf("review 升 urgent 应允许再次提醒，got %d", got)
 	}
+	if len(notifier.lastMessage.BrowserEvents) != 1 || notifier.lastMessage.BrowserEvents[0].Level != model.PositionExitLevelUrgent ||
+		notifier.lastMessage.BrowserEvents[0].Route != "/positions?position_id=9091&assessment_id=9902" {
+		t.Fatalf("urgent 浏览器通知应保持新等级和新评估深链: %+v", notifier.lastMessage.BrowserEvents)
+	}
 	row.PositionID = 9092
+	row.ID, row.FactHash = 9903, "review-other-position"
 	row.Level, row.PrimaryReason = model.PositionExitLevelReview, "同标的另一笔成本持仓"
 	svc.notifyAssessment(context.Background(), row)
 	if got := notifier.calls.Load(); got != 3 {
@@ -374,6 +399,29 @@ func TestPositionExitNotificationDedupAndUpgrade(t *testing.T) {
 	common.DB.Model(&model.GuardEvent{}).Where("user_id = ?", userID).Count(&events)
 	if events != 3 {
 		t.Fatalf("统一通知台账应按持仓保留两笔 review 和一笔 urgent，got %d", events)
+	}
+}
+
+func TestPositionExitAssessmentByIDIsolation(t *testing.T) {
+	setupTestDB(t)
+	const userID int64 = 909019
+	common.DB.Where("user_id IN ?", []int64{userID, userID + 1}).Delete(&model.PositionExitAssessment{})
+	row := model.PositionExitAssessment{UserID: userID, PositionID: 9191, Symbol: "600919", Market: "cn",
+		Name: "精确评估", TradeDate: "2026-08-18", Session: model.PositionExitSessionIntraday,
+		Level: model.PositionExitLevelReview, PrimaryReason: "需要核对", DataStatus: model.PositionExitDataReady,
+		Version: model.PositionExitAssessmentVersion, EventKey: "assessment-deep-link-test"}
+	if err := common.DB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	view, err := PositionExitAssessmentByID(context.Background(), userID, row.PositionID, row.ID)
+	if err != nil || view.ID != row.ID || view.PrimaryReason != row.PrimaryReason {
+		t.Fatalf("精确评估读取失败: view=%+v err=%v", view, err)
+	}
+	if _, err := PositionExitAssessmentByID(context.Background(), userID+1, row.PositionID, row.ID); err == nil {
+		t.Fatal("跨用户读取评估应拒绝")
+	}
+	if _, err := PositionExitAssessmentByID(context.Background(), userID, row.PositionID+1, row.ID); err == nil {
+		t.Fatal("同用户跨持仓读取评估应拒绝")
 	}
 }
 

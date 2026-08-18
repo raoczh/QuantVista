@@ -46,6 +46,24 @@ openssl rand -base64 36   # 再生成一个作 ENCRYPTION_KEY
 应用才会采信代理传来的 `X-Forwarded-For`。**不设置时不信任任何代理头**——反代场景下
 所有请求会被视为来自代理 IP，限流会整体误伤；直连部署则保持留空即可。
 
+### 1.6 浏览器 Web Push（可选）
+
+网站打开或后台标签页时的 Notification API+事件轮询不要求 VAPID；只有网站关闭后的 Web Push 需要。
+在发布前生成一次 P-256 VAPID 密钥对：
+
+```bash
+cd server
+go run ./cmd/vapidgen
+```
+
+把输出的 `VAPID_PUBLIC_KEY`、`VAPID_PRIVATE_KEY` 与联系地址
+`VAPID_SUBJECT=mailto:ops@example.com` 一起写入长期保存的 `deploy/.env`。三项必须一起配置，密钥轮换会让
+已有浏览器订阅全部失效；**禁止容器每次启动临时生成**。缺失、格式错误或公私钥不匹配时应用仍正常启动，
+设置页会显示 Web Push 未配置，前台通知继续可用。
+
+生产站必须使用 HTTPS，`localhost` 只用于本地开发。反向代理需要正常提供根路径 `/sw.js`，不要给它设置
+长期 immutable 缓存。iPhone/iPad 通常还需先“添加到主屏幕”再授权，具体支持取决于系统与浏览器版本。
+
 ## 2. 配置文件说明
 
 | 文件 | 是否提交 | 作用 |
@@ -113,7 +131,7 @@ openssl rand -base64 36   # 再生成一个作 ENCRYPTION_KEY
 
 **用户数据表（必须备份——丢了无法找回）：**
 
-- 账号与配置：`users`、`user_preferences`、`user_quotas`、`refresh_tokens`（可不备，重新登录即可）、`options`（系统设置，GitHub secret 为密文）、`llm_configs`（API Key 为密文，恢复后需同一 `ENCRYPTION_KEY` 才能解密）、`prompt_templates`、`notify_channels`（target 为密文，同上）
+- 账号与配置：`users`、`user_preferences`、`user_quotas`、`refresh_tokens`（可不备，重新登录即可）、`options`（系统设置，GitHub secret 为密文）、`llm_configs`（API Key 为密文，恢复后需同一 `ENCRYPTION_KEY` 才能解密）、`prompt_templates`、`notify_channels`（target 为密文，同上）、`browser_notification_preferences`、`browser_notification_devices`、`web_push_subscriptions`（endpoint/p256dh/auth 为密文）、`browser_notification_events`、`browser_notification_deliveries`
 - 研究与交易记录：`watchlists`、`watchlist_items`、`positions`、`thesis_cards`、`research_notes`、`screener_strategies`（自定义选股策略）
 - AI 产出：`analysis_records`、`recommendation_batches`、`recommendations`、`recommendation_statuses`、`ai_conversations`、`ai_conversation_messages`、`daily_reports`
 - 提醒与任务通知：`alert_rules`、`alert_events`、`job_failure_notifications`
@@ -136,6 +154,8 @@ docker exec mysql mysqldump -uquantvista -p'密码' --single-transaction quantvi
 # 只备用户数据表（体积敏感时）
 docker exec mysql mysqldump -uquantvista -p'密码' --single-transaction quantvista \
   users user_preferences user_quotas options llm_configs prompt_templates notify_channels \
+  browser_notification_preferences browser_notification_devices web_push_subscriptions \
+  browser_notification_events browser_notification_deliveries \
   watchlists watchlist_items positions thesis_cards research_notes screener_strategies \
   analysis_records recommendation_batches recommendations recommendation_statuses \
   ai_conversations ai_conversation_messages daily_reports alert_rules alert_events job_failure_notifications \
@@ -154,7 +174,7 @@ gunzip < qv-2026-07-03.sql.gz | docker exec -i mysql mysql -uquantvista -p'密�
 
 **两个密钥必须与备份时一致，否则密文字段作废：**
 
-- `ENCRYPTION_KEY`：解密 `llm_configs.api_key`、`notify_channels.target`、`options` 里的 GitHub secret。丢失则需在页面重新录入这些密钥。
+- `ENCRYPTION_KEY`：解密 `llm_configs.api_key`、`notify_channels.target`、Web Push 订阅敏感字段和 `options` 里的 GitHub secret。丢失则需在页面重新录入这些密钥并重新订阅浏览器设备。
 - `SESSION_SECRET`：影响 JWT 与 OAuth state 签名，换掉只是让所有人重新登录，无数据损失。
 
 另：页面内的「设置 → 数据导出」可随时导出持仓/自选/推荐/分析历史为 CSV，作为轻量的二级备份（人可读，但不含账号/密钥，不能替代 SQL 备份）。

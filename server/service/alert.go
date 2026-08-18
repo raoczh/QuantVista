@@ -810,6 +810,10 @@ func persistAlertEvaluation(ctx context.Context, rule model.AlertRule, value flo
 }
 
 func alertNotificationsEnabled(ctx context.Context, userID int64) (bool, error) {
+	return notificationsEnabledFor(ctx, userID, model.BrowserNotifyCategoryAlert)
+}
+
+func notificationsEnabledFor(ctx context.Context, userID int64, category string) (bool, error) {
 	db := common.DB.WithContext(ctx)
 	var cnt int64
 	if err := db.Model(&model.NotifyChannel{}).
@@ -817,7 +821,10 @@ func alertNotificationsEnabled(ctx context.Context, userID int64) (bool, error) 
 		return false, err
 	}
 	if cnt == 0 {
-		return false, nil
+		browser := NewBrowserNotificationService()
+		if !browser.HasEnabledDestination(userID, category) {
+			return false, nil
+		}
 	}
 	var pref model.UserPreference
 	if err := db.Where("user_id = ?", userID).First(&pref).Error; err != nil {
@@ -832,6 +839,7 @@ func alertNotificationsEnabled(ctx context.Context, userID int64) (bool, error) 
 // flushAlertNotification 在评估返回前同步尝试推送。WithoutCancel 保留调用链上的值，
 // 但不继承已经触发的取消/deadline；外层总超时保证用户锁不会被通知网络无限占用。
 type alertNotificationItem struct {
+	EventID  int64
 	Summary  string
 	DeepLink string
 }
@@ -859,9 +867,18 @@ func flushAlertNotification(sourceCtx context.Context, notifier alertNotifier, u
 	if len(items) > limit {
 		lines = append(lines, fmt.Sprintf("另有 %d 条命中，请打开提醒页查看", len(items)-limit))
 	}
+	browserEvents := make([]BrowserNotificationInput, 0, len(items))
+	for _, item := range items {
+		browserEvents = append(browserEvents, BrowserNotificationInput{
+			SourceType: "alert_event", SourceID: item.EventID,
+			FactKey:  BrowserFactKey("alert_event", fmt.Sprint(item.EventID)),
+			Category: model.BrowserNotifyCategoryAlert, Level: "review",
+			Title: "QuantVista 提醒命中", Body: truncateRunes(item.Summary, 240), Route: item.DeepLink,
+		})
+	}
 	notifier.SendMsgContext(ctx, userID, NotifyMessage{
 		Title: title, Content: strings.Join(lines, "\n"),
-		Route: items[0].DeepLink, Kind: kind,
+		Route: items[0].DeepLink, Kind: kind, BrowserEvents: browserEvents,
 	})
 }
 
@@ -1081,6 +1098,7 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 				name = rule.Symbol
 			}
 			pushItems = append(pushItems, alertNotificationItem{
+				EventID:  persisted.eventID,
 				Summary:  name + "(" + rule.Symbol + ")：" + msg,
 				DeepLink: alertEventDeepLink(persisted.eventID),
 			})
@@ -1488,6 +1506,7 @@ func (s *AlertService) evaluateEarnRulesForUserUnlocked(ctx context.Context, use
 				name = rule.Symbol
 			}
 			pushItems = append(pushItems, alertNotificationItem{
+				EventID:  persisted.eventID,
 				Summary:  name + "(" + rule.Symbol + ")：" + msg,
 				DeepLink: alertEventDeepLink(persisted.eventID),
 			})

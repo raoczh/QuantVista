@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, nextTick, watch } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -10,6 +10,8 @@ import {
   NRadioGroup,
   NRadioButton,
   NModal,
+  NTabs,
+  NTabPane,
   NAlert,
   NDropdown,
   useMessage,
@@ -37,6 +39,7 @@ import SectionCard from '@/components/SectionCard.vue'
 import AlertWizard from '@/components/alerts/AlertWizard.vue'
 import type { AlertStockContext } from '@/components/alerts/alertTemplates'
 import StockIdentity from '@/components/StockIdentity.vue'
+import TermHelp from '@/components/TermHelp.vue'
 
 const message = useMessage()
 const dialog = useDialog()
@@ -51,19 +54,31 @@ const styleVars = computed(() => ({
 // ---------- 模板向导 / 编辑入口 ----------
 const editingRule = ref<AlertRule | null>(null)
 const stockContext = ref<AlertStockContext | null>(null)
+const wizardOpen = ref(false)
+const activeSection = ref<'rules' | 'events'>(route.query.event_id ? 'events' : 'rules')
+
+function createRule() {
+  editingRule.value = null
+  stockContext.value = null
+  activeSection.value = 'rules'
+  wizardOpen.value = true
+}
 
 function editRule(r: AlertRule) {
   editingRule.value = r
-  void nextTick(() => document.querySelector('.alert-wizard')?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+  activeSection.value = 'rules'
+  wizardOpen.value = true
 }
 
 async function handleWizardSaved() {
   editingRule.value = null
+  wizardOpen.value = false
   await load()
 }
 
 function cancelWizardEdit() {
   editingRule.value = null
+  wizardOpen.value = false
 }
 
 // ---------- 列表 ----------
@@ -80,6 +95,9 @@ async function load() {
   } finally {
     loading.value = false
   }
+}
+function refreshAll() {
+  void Promise.all([load(), loadEvents()])
 }
 const evaluating = ref(false)
 async function runEvaluate() {
@@ -212,6 +230,8 @@ function applyStockActionQuery() {
     name: String(route.query.name || ''),
     nonce: String(route.query._stock_action || Date.now()),
   }
+  activeSection.value = 'rules'
+  wizardOpen.value = true
   const query = { ...route.query }
   delete query.add
   delete query.symbol
@@ -232,6 +252,15 @@ onMounted(async () => {
 
 // ---------- 命中历史（明细事件状态机） ----------
 const events = ref<AlertEvent[]>([])
+const sortedEvents = computed(() =>
+  [...events.value].sort((left, right) => {
+    if (left.status !== right.status) {
+      if (left.status === 'unread') return -1
+      if (right.status === 'unread') return 1
+    }
+    return new Date(right.triggered_at).getTime() - new Date(left.triggered_at).getTime()
+  }),
+)
 const eventsLoading = ref(false)
 const eventsError = ref('')
 const eventFilter = ref<'unread' | 'all' | 'read' | 'dismissed'>('unread')
@@ -330,6 +359,7 @@ async function openRouteEvent() {
     return
   }
   const seq = ++detailSeq
+  activeSection.value = 'events'
   const cached = events.value.find((event) => event.id === id)
   if (cached) selectedEvent.value = cached
   else if (selectedEvent.value?.id !== id) selectedEvent.value = null
@@ -415,38 +445,26 @@ function metricLabel(name: string) {
 
 <template>
   <PageContainer
-    title="条件提醒"
-    subtitle="持仓成本止盈止损 / 移动止盈 · 到价 / 异动 / 均线 / 突破 · 命中历史"
+    title="提醒中心"
+    subtitle="管理提醒条件，处理每次命中的事实记录"
   >
     <template #actions>
-      <n-button size="small" secondary @click="router.push({ name: 'settings', query: { tab: 'notifications' } })">通知设置</n-button>
+      <n-button size="small" type="primary" @click="createRule">新建提醒</n-button>
+      <n-button size="small" secondary @click="router.push({ name: 'settings', query: { tab: 'notifications' } })">通知接收设置</n-button>
       <n-button size="small" quaternary :loading="evaluating" @click="runEvaluate">立即检查</n-button>
-      <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>
+      <n-button size="small" quaternary :loading="loading || eventsLoading" @click="refreshAll">刷新</n-button>
     </template>
 
     <div class="alerts" :style="styleVars">
-      <!-- 左：新建/编辑 -->
-      <div class="col-form">
-        <SectionCard :title="editingRule ? '编辑提醒' : '新建提醒'">
-          <AlertWizard
-            :editing-rule="editingRule"
-            :stock-context="stockContext"
-            @saved="handleWizardSaved"
-            @cancel-edit="cancelWizardEdit"
-          />
-        </SectionCard>
-
-      </div>
-
-      <!-- 右：规则列表 + 命中历史 -->
-      <div class="col-list">
+      <n-tabs v-model:value="activeSection" type="segment" animated>
+        <n-tab-pane name="rules" tab="提醒规则">
         <SectionCard title="我的提醒">
           <n-spin :show="loading && !rules.length">
             <n-alert v-if="rulesError" type="warning" title="提醒规则加载失败" :bordered="false" class="section-error">
               {{ rules.length ? '仍展示上次加载的规则，刷新失败。' : rulesError }}
               <div class="recovery-action"><n-button size="small" :loading="loading" @click="load">重试加载提醒</n-button></div>
             </n-alert>
-            <n-empty v-if="!rules.length && !rulesError" description="暂无提醒规则，在左侧添加一条" />
+            <n-empty v-if="!rules.length && !rulesError" description="暂无提醒规则，点击“新建提醒”添加" />
             <div v-else class="rules">
               <div v-for="r in rules" :key="r.id" class="rule" :class="{ hit: isHitToday(r) }">
                 <div class="rule-main">
@@ -460,7 +478,10 @@ function metricLabel(name: string) {
                       kindLabelMap[r.kind] || r.kind
                     }}</n-tag>
                   </div>
-                  <div class="rule-cond">{{ describe(r) }}</div>
+                  <div class="rule-cond">
+                    {{ describe(r) }}
+                    <TermHelp v-if="r.kind === 'ma'" term="ma" label="条件说明" />
+                  </div>
                   <div v-if="isHitToday(r) && r.trigger_msg" class="rule-hit" :style="{ color: upColor }">
                     ⚡ {{ r.trigger_msg }}<span class="rule-hit-time"> · {{ fmtTime(r.triggered_at) }}</span>
                   </div>
@@ -488,9 +509,11 @@ function metricLabel(name: string) {
             </div>
           </n-spin>
         </SectionCard>
-
-        <SectionCard title="命中历史">
-          <template #extra>
+        </n-tab-pane>
+        <n-tab-pane name="events" tab="命中记录">
+        <SectionCard>
+          <div class="events-section-head">
+            <h2>命中历史</h2>
             <div class="ev-toolbar">
               <n-radio-group v-model:value="eventFilter" size="small" @update:value="loadEvents">
                 <n-radio-button v-for="opt in eventFilterOptions" :key="opt.value" :value="opt.value">{{
@@ -499,7 +522,7 @@ function metricLabel(name: string) {
               </n-radio-group>
               <n-button size="small" quaternary :loading="readingAll" @click="markAllRead">全部已读</n-button>
             </div>
-          </template>
+          </div>
           <n-spin :show="eventsLoading && !events.length">
             <n-alert v-if="eventsError" type="warning" title="命中记录加载失败" :bordered="false" class="section-error">
               {{ events.length ? '仍展示上次加载的命中记录，刷新失败。' : eventsError }}
@@ -511,7 +534,7 @@ function metricLabel(name: string) {
               style="padding: 24px 0"
             />
             <div v-else class="events">
-              <div v-for="ev in events" :key="ev.id" class="event" :class="{ unread: ev.status === 'unread' }">
+              <div v-for="ev in sortedEvents" :key="ev.id" class="event" :class="{ unread: ev.status === 'unread' }">
                 <div class="ev-main">
                   <div class="ev-title">
                     <n-tag size="tiny" round :bordered="false">{{ kindLabelMap[ev.kind] || ev.kind }}</n-tag>
@@ -541,8 +564,25 @@ function metricLabel(name: string) {
             </div>
           </n-spin>
         </SectionCard>
-      </div>
+        </n-tab-pane>
+      </n-tabs>
     </div>
+
+    <n-modal
+      v-model:show="wizardOpen"
+      preset="card"
+      :title="editingRule ? '编辑提醒' : '新建提醒'"
+      class="rule-wizard-modal"
+      :style="{ width: 'min(760px, calc(100vw - 24px))' }"
+      @after-leave="editingRule = null"
+    >
+      <AlertWizard
+        :editing-rule="editingRule"
+        :stock-context="stockContext"
+        @saved="handleWizardSaved"
+        @cancel-edit="cancelWizardEdit"
+      />
+    </n-modal>
 
     <n-modal
       :show="detailOpen"
@@ -650,22 +690,12 @@ function metricLabel(name: string) {
 
 <style scoped>
 .alerts {
-  display: grid;
-  grid-template-columns: minmax(400px, 440px) minmax(0, 1fr);
-  gap: 16px;
-  align-items: start;
-}
-@media (max-width: 900px) {
-  .alerts {
-    grid-template-columns: 1fr;
-  }
-}
-.col-form,
-.col-list {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
   min-width: 0;
+}
+:global(.rule-wizard-modal .n-card__content) {
+  max-height: min(78vh, 820px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .form {
   display: flex;
@@ -716,6 +746,10 @@ function metricLabel(name: string) {
   opacity: 0.5;
 }
 .rule-cond {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
   font-size: 13px;
   margin-top: 4px;
   opacity: 0.85;
@@ -749,6 +783,19 @@ function metricLabel(name: string) {
   display: none;
 }
 /* 命中历史 */
+.events-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.events-section-head h2 {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.4;
+  letter-spacing: 0;
+}
 .ev-toolbar {
   display: flex;
   align-items: center;
@@ -872,6 +919,13 @@ function metricLabel(name: string) {
   .rules,
   .events {
     gap: 8px;
+  }
+  .events-section-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .ev-toolbar {
+    justify-content: space-between;
   }
   .rule,
   .event {

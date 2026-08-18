@@ -5,6 +5,7 @@ import { NForm, NFormItem, NInput, NButton, NDivider, NIcon, useMessage } from '
 import { useAuthStore } from '@/stores/auth'
 import { isNativeApp } from '@/config/runtime'
 import AuthShell from '@/components/AuthShell.vue'
+import { safeInternalRoute } from '@/lib/internalRoute'
 
 const router = useRouter()
 const route = useRoute()
@@ -16,7 +17,7 @@ const password = ref('')
 const loading = ref(false)
 
 function go() {
-  const redirect = (route.query.redirect as string) || '/'
+  const redirect = safeInternalRoute(route.query.redirect)
   router.replace(redirect)
 }
 
@@ -36,6 +37,7 @@ async function submit() {
 
 async function github() {
   try {
+    sessionStorage.setItem('qv_login_redirect', safeInternalRoute(route.query.redirect))
     // App 内走移动流（系统浏览器授权 + 深链回跳，阶段 B）；浏览器走原 Web 流。
     await (isNativeApp ? auth.startMobileGithubLogin() : auth.startGithubLogin())
   } catch (e) {

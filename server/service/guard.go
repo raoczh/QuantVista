@@ -128,6 +128,7 @@ type guardObs struct {
 
 // guardHit 一条命中的守护事件（待去重落库 + 推送）。
 type guardHit struct {
+	EventID    int64 // 已落库 GuardEvent ID；只用于稳定浏览器通知来源
 	PositionID int64 // 仅逐笔持仓风险使用；普通守护事件保持 0
 	Symbol     string
 	Market     string
@@ -300,12 +301,33 @@ func guardTitle(kind string) string {
 // （RowsAffected>0）——普通事件按同日同标的同类去重，逐笔风险事件再按 position_id
 // 区分，用于驱动推送。
 func recordGuardEvent(userID int64, tradeDate string, h guardHit) bool {
+	created, _ := recordGuardEventWithID(userID, tradeDate, h)
+	return created
+}
+
+func recordGuardEventWithID(userID int64, tradeDate string, h guardHit) (bool, int64) {
 	ev := model.GuardEvent{
 		UserID: userID, PositionID: h.PositionID, Symbol: h.Symbol, Kind: h.Kind, TradeDate: tradeDate,
 		Market: h.Market, Name: h.Name, Price: round4(h.Price), Message: truncateRunes(h.Message, 256),
 	}
 	res := common.DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&ev)
-	return res.Error == nil && res.RowsAffected > 0
+	return res.Error == nil && res.RowsAffected > 0, ev.ID
+}
+
+func guardBrowserEvent(h guardHit) []BrowserNotificationInput {
+	if h.EventID <= 0 {
+		return nil
+	}
+	level := "info"
+	if h.Priority >= 4 {
+		level = "urgent"
+	}
+	return []BrowserNotificationInput{{
+		SourceType: "guard_event", SourceID: h.EventID,
+		FactKey:  BrowserFactKey("guard_event", fmt.Sprint(h.EventID), h.Kind),
+		Category: model.BrowserNotifyCategoryGuard, Level: level,
+		Title: guardTitle(h.Kind), Body: h.Message, Route: h.Route,
+	}}
 }
 
 // ---------- 评估编排 ----------
@@ -392,7 +414,8 @@ func (s *GuardService) evaluateGuardUser(ctx context.Context, userID int64, cfg 
 		}
 		obs := guardObs{Price: q.Price, DayHigh: q.High, DayLow: q.Low, ChangePct: q.ChangePct}
 		for _, h := range evalPositionGuard(p, cfg, obs, limitUpPctFor(p.Symbol, p.Name)) {
-			if recordGuardEvent(userID, tradeDate, h) {
+			if created, eventID := recordGuardEventWithID(userID, tradeDate, h); created {
+				h.EventID = eventID
 				newHits = append(newHits, h)
 			}
 		}
@@ -407,7 +430,8 @@ func (s *GuardService) evaluateGuardUser(ctx context.Context, userID int64, cfg 
 		}
 		obs := guardObs{Price: q.Price, DayHigh: q.High, DayLow: q.Low, ChangePct: q.ChangePct}
 		if h := evalWatchGuard(it, cfg, obs, limitUpPctFor(it.Symbol, it.Name)); h != nil {
-			if recordGuardEvent(userID, tradeDate, *h) {
+			if created, eventID := recordGuardEventWithID(userID, tradeDate, *h); created {
+				h.EventID = eventID
 				newHits = append(newHits, *h)
 			}
 		}
@@ -421,6 +445,7 @@ func (s *GuardService) evaluateGuardUser(ctx context.Context, userID int64, cfg 
 		s.notify.SendMsg(userID, NotifyMessage{
 			Title: guardTitle(h.Kind), Content: h.Message,
 			Route: h.Route, Kind: NotifyMsgKindGuard, Priority: h.Priority,
+			BrowserEvents: guardBrowserEvent(h),
 		})
 	}
 	return len(newHits)
@@ -857,7 +882,8 @@ func (s *GuardService) evaluateGuardUserEvening(userID int64, today, since strin
 			if date == "" {
 				date = today // 兜底：事件日期缺失按评估日去重（正常路径六类纯函数都必填）
 			}
-			if recordGuardEvent(userID, date, h) {
+			if created, eventID := recordGuardEventWithID(userID, date, h); created {
+				h.EventID = eventID
 				newHits = append(newHits, h)
 			}
 		}
@@ -882,6 +908,7 @@ func (s *GuardService) evaluateGuardUserEvening(userID int64, today, since strin
 		s.notify.SendMsg(userID, NotifyMessage{
 			Title: guardTitle(h.Kind), Content: h.Message,
 			Route: h.Route, Kind: NotifyMsgKindGuard, Priority: h.Priority,
+			BrowserEvents: guardBrowserEvent(h),
 		})
 		pushed++
 	}
@@ -902,7 +929,7 @@ func (s *GuardService) runGuardEveningRound() {
 		Where("status = ? AND market = ?", model.PositionStatusHolding, "cn").
 		Distinct().Pluck("user_id", &ids)
 	for _, uid := range ids {
-		if !userNotifyEnabled(uid) || !s.notify.HasEnabledChannel(uid) {
+		if !userNotifyEnabled(uid) || !s.notify.HasEnabledDestination(uid, model.BrowserNotifyCategoryGuard) {
 			continue
 		}
 		cfg := loadGuardConfig(uid)
@@ -931,15 +958,27 @@ func (s *GuardService) runIpoRound(today string) {
 	if len(hits) == 0 {
 		return
 	}
-	var uids []int64
-	// 有启用推送通道的用户即为候选（打新与持仓无关）。
+	var externalUIDs, browserUIDs []int64
 	if err := common.DB.Model(&model.NotifyChannel{}).Where("enabled = ?", true).
-		Distinct().Pluck("user_id", &uids).Error; err != nil {
+		Distinct().Pluck("user_id", &externalUIDs).Error; err != nil {
 		common.SysWarn("打新提醒读取用户失败: %v", err)
 		return
 	}
+	if err := common.DB.Model(&model.BrowserNotificationDevice{}).Where("enabled = ?", true).
+		Distinct().Pluck("user_id", &browserUIDs).Error; err != nil {
+		common.SysWarn("打新提醒读取浏览器设备用户失败: %v", err)
+		return
+	}
+	uidSet := map[int64]bool{}
+	for _, uid := range append(externalUIDs, browserUIDs...) {
+		uidSet[uid] = true
+	}
+	var uids []int64
+	for uid := range uidSet {
+		uids = append(uids, uid)
+	}
 	for _, uid := range uids {
-		if !userNotifyEnabled(uid) || !s.notify.HasEnabledChannel(uid) {
+		if !userNotifyEnabled(uid) || !s.notify.HasEnabledDestination(uid, model.BrowserNotifyCategoryGuard) {
 			continue
 		}
 		cfg := loadGuardConfig(uid)
@@ -948,12 +987,15 @@ func (s *GuardService) runIpoRound(today string) {
 		}
 		n := 0
 		for _, h := range hits {
-			if !recordGuardEvent(uid, h.EventDate, h) {
+			created, eventID := recordGuardEventWithID(uid, h.EventDate, h)
+			if !created {
 				continue // 已推过
 			}
+			h.EventID = eventID
 			s.notify.SendMsg(uid, NotifyMessage{
 				Title: guardTitle(h.Kind), Content: h.Message,
 				Route: h.Route, Kind: NotifyMsgKindGuard, Priority: h.Priority,
+				BrowserEvents: guardBrowserEvent(h),
 			})
 			n++
 		}
@@ -984,7 +1026,7 @@ func (s *GuardService) runGuardRound() {
 	tradeDate := now.Format("2006-01-02")
 	for _, uid := range guardCandidateUserIDs() {
 		// 推送前置：总闸开 + 有启用通道。守护是纯推送，无通道的用户跳过评估省行情请求。
-		if !userNotifyEnabled(uid) || !s.notify.HasEnabledChannel(uid) {
+		if !userNotifyEnabled(uid) || !s.notify.HasEnabledDestination(uid, model.BrowserNotifyCategoryGuard) {
 			continue
 		}
 		cfg := loadGuardConfig(uid)
