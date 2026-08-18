@@ -12,6 +12,8 @@ const props = withDefaults(
     stock: StockRef
     watchlistState?: 'in' | 'out'
     positionState?: 'held' | 'none'
+    positionId?: number
+    recommendationId?: number
   }>(),
   {},
 )
@@ -35,8 +37,14 @@ const options = computed<DropdownOption[]>(() => [
       ? '持仓入口'
       : props.positionState === 'held' ? '持仓管理' : '建仓',
   },
-  { key: 'alert', label: '创建预警' },
-  { key: 'analysis', label: 'AI 分析' },
+  ...(props.positionState === 'held' && props.positionId
+    ? [{ key: 'position-decision', label: '进入持仓卖出决策' }]
+    : []),
+  { key: 'alert', label: '设置提醒' },
+  { key: 'analysis', label: 'AI 解读此股票' },
+  ...(props.recommendationId
+    ? [{ key: 'recommendation-review', label: 'AI 复核当前推荐' }]
+    : []),
   { key: 'compare', label: '股票对比' },
   { key: 'note', label: '添加笔记' },
 ])
@@ -46,6 +54,8 @@ async function selectAction(key: string | number) {
   const success = await runStockAction(action, props.stock, {
     inWatchlist: props.watchlistState === undefined ? undefined : props.watchlistState === 'in',
     hasPosition: props.positionState === undefined ? undefined : props.positionState === 'held',
+    positionID: props.positionId,
+    recommendationID: props.recommendationId,
   })
   emit('completed', { action, success: !!success })
 }

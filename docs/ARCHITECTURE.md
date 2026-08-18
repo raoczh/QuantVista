@@ -138,6 +138,15 @@ Go API Server
   - 行式列表（自选条目/待办/提醒规则）手机上 `flex-wrap`、操作按钮组 `flex-basis:100%` 换行；弹窗内 `n-grid` 一律 `cols="1 s:N" responsive="screen"`。
   - ECharts tooltip 加 `confine: true`（否则被卡片横滚容器剪裁），并挂 window resize → `chart.resize()`。
 
+### 4.4 AI 推荐与分析工作台（散户体验第三批，2026-08-18）
+
+- **页面编排边界**：`pages/Recommendations.vue` 只负责路由 query、页面级数据加载、任务轮询和动作协调；`components/recommendations/` 分别承载生成参数、今日结果卡、候选池/召回审计、历史追踪和专业审计。`pages/Analysis.vue` 对应拆为 `AnalysisLauncher`、`AnalysisResultWorkspace`、`AnalysisHistory`。页面不再承载大段结果模板或表格细节。
+- **状态与调用边界**：`useBusinessTask` 只读统一 JobRun，`useResultPolling` 只 GET 已存在的业务结果；取消、重试、生成和分析都必须由用户按钮触发。进入页面、切换标签、打开历史、导航和刷新只恢复已有 ID/状态，不创建新的 LLM 调用；提交锁在第一次 `await` 前生效，避免重复任务。
+- **股票身份规则**：所有工作台动作复用 `StockIdentity`/`StockActionMenu`/`useStockActions`，名称为主、代码和市场为次，名称缺失显示明确状态。推荐复核深链携带 `recommendation_id` 和上下文；持仓卖出决策只接受准确的 `position_id`，禁止按 symbol 猜测。按推荐建仓只预填 `rec_id` 与研究数量，不自动下单或写真实持仓。
+- **事实展示规则**：推荐将今日可操作结果、历史事实、追踪成熟度、候选池和排除原因分开；未成熟、数据不足、部分成功和失效不得包装成“准确/失败”。分析首屏先显示结论、行动、依据、风险、数据时点和有效时间，AI 观点与程序事实、行情事实、本人持仓事实分层；AI 复核不得改写程序风险等级、持仓卖出等级或任务状态。
+- **术语与新鲜度**：专业指标统一通过 `TermHelp` 和术语字典解释，默认折叠原始指标/快照/审计字段；`as_of`、`partial`、`unknown`、`stale` 均显示白话说明，缺失不当作中性。简明/专业模式复用 `useDisplayMode`，按账号隔离。
+- **线上边界**：本批已完成源码、契约测试、构建和本地 Chrome 四视口/双主题检查；生产真实数据、长任务恢复、权限隔离和移动真机仍须线上验收，不得以本地检查代替。
+
 ## 5. 后端模块
 
 ### 5.1 Auth Service

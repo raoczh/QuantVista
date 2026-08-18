@@ -1,68 +1,32 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useMessage } from 'naive-ui'
 import {
-  NButton,
-  NSelect,
-  NRadioGroup,
-  NRadioButton,
-  NInputNumber,
-  NForm,
-  NFormItem,
-  NTag,
-  NSpin,
-  NEmpty,
-  NPopconfirm,
-  NAlert,
-  NCollapse,
-  NCollapseItem,
-  NSwitch,
-  NModal,
-  NTooltip,
-  useMessage,
-} from 'naive-ui'
-import {
-  listStrategies,
-  generateRecommendations,
-  listRecommendations,
-  getRecommendation,
-  deleteRecommendation,
-  trackRecommendation,
-  getPerformance,
-  getAttribution,
-  getShadowReport,
-  getRecallReport,
-  getDailyAuditReport,
-  getDiscoveryStatus,
-  createStopLossAlert,
   ackRecommendationReview,
+  createStopLossAlert,
+  deleteRecommendation,
   emptyRecFilters,
-  type Strategy,
+  generateRecommendations,
+  getDiscoveryStatus,
+  getPerformance,
+  getRecommendation,
+  listRecommendations,
+  listStrategies,
+  trackRecommendation,
+  type DiscoveryStatusView,
+  type PerformanceStats,
+  type RecFilters,
   type RecommendRequest,
-  type RecommendationView,
   type RecommendationBatch,
   type RecommendationItem,
-  type PerformanceStats,
-  type AttributionReport,
-  type ShadowReport,
-  type RecallReport,
-  type CandidateAuditUserReport,
-  type RecReject,
-  type RecFilters,
-  type PoolCandidate,
-  type RecCoverageDiag,
-  type ReflectionMatch,
-  type ReflectionLayers,
-  type ExecutionStatus,
-  type DiscoveryStatusView,
-  type CandidateDiscoverySummary,
+  type RecommendationView,
+  type Strategy,
 } from '@/api/recommendation'
-import { getPreference, updatePreference, type UserPreference } from '@/api/user'
-import { getTodos, type TodoItem } from '@/api/todo'
 import { isAbortError } from '@/api/client'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
-import { useUi } from '@/composables/useUi'
-import { useLlmLabel } from '@/composables/useLlmLabel'
+import { getTodos, type TodoItem } from '@/api/todo'
+import { getPreference, updatePreference, type UserPreference } from '@/api/user'
 import {
   booleanQuery,
   enumListQuery,
@@ -75,22 +39,20 @@ import {
   useListPageScroll,
   useRouteQueryState,
 } from '@/composables/useListPageState'
-import { pollUntil, isPollCancelled } from '@/lib/poll'
+import { useBusinessTask } from '@/composables/useBusinessTask'
+import { useResultPolling } from '@/composables/useResultPolling'
 import PageContainer from '@/components/PageContainer.vue'
-import SectionCard from '@/components/SectionCard.vue'
-import TrustBadges from '@/components/TrustBadges.vue'
+import DisplayModeSwitch from '@/components/DisplayModeSwitch.vue'
 import InvestmentPreferenceGuide from '@/components/InvestmentPreferenceGuide.vue'
-import StockIdentity from '@/components/StockIdentity.vue'
-import TermHelp from '@/components/TermHelp.vue'
-import { useDisplayMode } from '@/composables/useDisplayMode'
+import AiTaskStatusPanel from '@/components/ai/AiTaskStatusPanel.vue'
+import RecommendationGenerator from '@/components/recommendations/RecommendationGenerator.vue'
+import RecommendationHistoryTracking from '@/components/recommendations/RecommendationHistoryTracking.vue'
+import RecommendationResearchAudit from '@/components/recommendations/RecommendationResearchAudit.vue'
+import RecommendationResultsWorkspace from '@/components/recommendations/RecommendationResultsWorkspace.vue'
 
 const message = useMessage()
 const route = useRoute()
 const router = useRouter()
-const { upColor, downColor, flatColor, vars, withAlpha } = useUi()
-const { llmLabel } = useLlmLabel()
-const { isPlain } = useDisplayMode()
-const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 
 const filterQueryFields: Array<[string, keyof RecFilters]> = [
   ['price_min', 'price_min'],
@@ -104,15 +66,8 @@ const filterQueryFields: Array<[string, keyof RecFilters]> = [
   ['exclude_gem_star', 'exclude_gem_star'],
 ]
 const explicitFilterFields = new Set(
-  filterQueryFields.filter(([queryKey]) => route.query[queryKey] !== undefined).map(([, field]) => field),
+  filterQueryFields.filter(([key]) => route.query[key] !== undefined).map(([, field]) => field),
 )
-
-const marketOptions = [
-  { label: 'A 股', value: 'cn' },
-]
-
-// ---------- 表单 ----------
-// 必须在 query 状态规范化前记录是否由调用者显式覆盖；缺省值不能冒充显式选择。
 const recTypeExplicitInURL = route.query.rec_type !== undefined
 const countExplicitInURL = route.query.count !== undefined
 const recTypeQuery = enumQuery<'short_term' | 'long_term'>('short_term', ['short_term', 'long_term'])
@@ -121,1000 +76,344 @@ const countQuery = integerQuery(5, 3, 5)
 const verifyQuery = booleanQuery(false)
 const bearCheckQuery = booleanQuery(false)
 const initialVerify = verifyQuery.parse(route.query.verify)
+
 const form = ref<RecommendRequest>({
   type: recTypeQuery.parse(route.query.rec_type),
   market: 'cn',
   strategy: strategyQuery.parse(route.query.strategy),
-  llm_config_id: undefined,
   count: countQuery.parse(route.query.count),
   verify: initialVerify,
-  bear_check:
-    route.query.bear_check === undefined ? initialVerify : bearCheckQuery.parse(route.query.bear_check),
+  bear_check: route.query.bear_check === undefined ? initialVerify : bearCheckQuery.parse(route.query.bear_check),
 })
-// 反方研究员默认关联复核开关（后端 bear_check 未传时同款语义；这里显式联动便于用户单独调整）。
-watch(
-  () => form.value.verify,
-  (v) => {
-    form.value.bear_check = v
-  },
-)
+watch(() => form.value.verify, (value) => { form.value.bear_check = value })
 
-// ---------- 筛选条件（阶段②用户硬过滤，默认从偏好读，可临时改随请求提交） ----------
 const filters = ref<RecFilters>(emptyRecFilters())
 const pref = ref<UserPreference | null>(null)
 const savingFilters = ref(false)
 const showInvestmentGuide = ref(false)
-
-// 价格快捷档（解决「资金少买不起高价股」的一键入口）。
+const marketOptions = [{ label: 'A 股', value: 'cn' }]
 const pricePresets = [
   { label: '价格不限', value: 0 },
-  { label: '≤10元', value: 10 },
-  { label: '≤20元', value: 20 },
-  { label: '≤30元', value: 30 },
-  { label: '≤50元', value: 50 },
+  { label: '不高于 10 元', value: 10 },
+  { label: '不高于 20 元', value: 20 },
+  { label: '不高于 30 元', value: 30 },
+  { label: '不高于 50 元', value: 50 },
 ]
 const priceCustom = ref(false)
 const pricePreset = computed({
-  get: () => {
-    if (priceCustom.value) return -1
-    if (filters.value.price_min === 0 && pricePresets.some((p) => p.value === filters.value.price_max)) {
-      return filters.value.price_max
-    }
-    return -1 // 当前值不属于任何快捷档 → 显示自定义
-  },
-  set: (v: number) => {
-    if (v === -1) {
-      priceCustom.value = true
-      return
-    }
-    priceCustom.value = false
-    filters.value.price_min = 0
-    filters.value.price_max = v
+  get: () => !priceCustom.value && filters.value.price_min === 0 && pricePresets.some((item) => item.value === filters.value.price_max)
+    ? filters.value.price_max
+    : -1,
+  set: (value: number) => {
+    priceCustom.value = value === -1
+    if (value !== -1) filters.value = { ...filters.value, price_min: 0, price_max: value }
   },
 })
-const pricePresetOptions = [...pricePresets.map((p) => ({ label: p.label, value: p.value })), { label: '自定义区间', value: -1 }]
-
-// 市值快捷档（解决「觉得推的都是大票」）。
+const pricePresetOptions = [...pricePresets, { label: '自定义价格区间', value: -1 }]
 const capPresets = [
   { label: '市值不限', min: 0, max: 0 },
-  { label: '≤50亿(小盘)', min: 0, max: 50 },
-  { label: '30~200亿(中小盘)', min: 30, max: 200 },
-  { label: '200~800亿', min: 200, max: 800 },
-  { label: '≥800亿(大盘)', min: 800, max: 0 },
+  { label: '不高于 50 亿', min: 0, max: 50 },
+  { label: '30 - 200 亿', min: 30, max: 200 },
+  { label: '200 - 800 亿', min: 200, max: 800 },
+  { label: '不低于 800 亿', min: 800, max: 0 },
 ]
 const capCustom = ref(false)
 const capPreset = computed({
   get: () => {
     if (capCustom.value) return -1
-    const i = capPresets.findIndex((p) => p.min === filters.value.float_cap_min_yi && p.max === filters.value.float_cap_max_yi)
-    return i >= 0 ? i : -1
+    const index = capPresets.findIndex((item) => item.min === filters.value.float_cap_min_yi && item.max === filters.value.float_cap_max_yi)
+    return index >= 0 ? index : -1
   },
-  set: (i: number) => {
-    if (i === -1) {
-      capCustom.value = true
-      return
+  set: (value: number) => {
+    capCustom.value = value === -1
+    if (value !== -1) {
+      filters.value = {
+        ...filters.value,
+        float_cap_min_yi: capPresets[value].min,
+        float_cap_max_yi: capPresets[value].max,
+      }
     }
-    capCustom.value = false
-    filters.value.float_cap_min_yi = capPresets[i].min
-    filters.value.float_cap_max_yi = capPresets[i].max
   },
 })
-const capPresetOptions = [...capPresets.map((p, i) => ({ label: p.label, value: i })), { label: '自定义区间', value: -1 }]
+const capPresetOptions = [...capPresets.map((item, value) => ({ label: item.label, value })), { label: '自定义市值区间', value: -1 }]
 
-function parseFiltersJSON(raw: string | undefined | null): RecFilters | null {
+function parseFilters(raw?: string | null): RecFilters | null {
   if (!raw) return null
-  try {
-    const f = JSON.parse(raw)
-    return { ...emptyRecFilters(), ...f }
-  } catch {
-    return null
-  }
+  try { return { ...emptyRecFilters(), ...JSON.parse(raw) } }
+  catch { return null }
 }
-
-async function loadPrefFilters() {
+async function loadPreference() {
   try {
-    pref.value = await getPreference()
-    // URL 显式值只影响本次；URL 未覆盖时才真正消费已保存的周期与推荐数量。
-    if (!recTypeExplicitInURL) {
-      form.value.type = pref.value.horizon_pref === 'short_term' ? 'short_term' : 'long_term'
-    }
-    if (!countExplicitInURL && pref.value.default_rec_count >= 3 && pref.value.default_rec_count <= 5) {
-      form.value.count = pref.value.default_rec_count
-    }
-    const f = parseFiltersJSON(pref.value.rec_filters_json)
-    if (f) {
-      const fromQuery = filters.value
-      const merged = { ...f }
+    const value = await getPreference()
+    pref.value = value
+    if (!recTypeExplicitInURL) form.value.type = value.horizon_pref === 'short_term' ? 'short_term' : 'long_term'
+    if (!countExplicitInURL && value.default_rec_count >= 3 && value.default_rec_count <= 5) form.value.count = value.default_rec_count
+    const saved = parseFilters(value.rec_filters_json)
+    if (saved) {
+      const merged = { ...saved }
       for (const [, field] of filterQueryFields) {
-        if (explicitFilterFields.has(field)) Object.assign(merged, { [field]: fromQuery[field] })
+        if (explicitFilterFields.has(field)) Object.assign(merged, { [field]: filters.value[field] })
       }
       filters.value = merged
     }
-  } catch {
-    /* 偏好读取失败用默认，不打扰 */
-  }
+  } catch { /* 内置默认值仍可明确提交 */ }
 }
-
 function applyGuidePreference(value: UserPreference) {
   pref.value = value
-  if (!recTypeExplicitInURL) {
-    form.value.type = value.horizon_pref === 'short_term' ? 'short_term' : 'long_term'
-  }
-  if (!countExplicitInURL && value.default_rec_count >= 3 && value.default_rec_count <= 5) {
-    form.value.count = value.default_rec_count
-  }
+  if (!recTypeExplicitInURL) form.value.type = value.horizon_pref === 'short_term' ? 'short_term' : 'long_term'
+  if (!countExplicitInURL) form.value.count = value.default_rec_count
 }
-
-// 把当前筛选保存为默认（写入偏好 rec_filters_json，之后日报的自动推荐也走同一筛选）。
 async function saveFiltersDefault() {
   if (!pref.value) {
-    message.warning('偏好未加载，请稍后重试')
+    message.warning('投资偏好尚未加载，请稍后重试')
     return
   }
   savingFilters.value = true
   try {
     pref.value = await updatePreference({ ...pref.value, rec_filters_json: JSON.stringify(filters.value) })
-    message.success('已保存为默认筛选（收盘日报的自动推荐同样生效）')
-  } catch (e) {
-    message.error((e as Error).message)
-  } finally {
-    savingFilters.value = false
-  }
+    message.success('已保存为默认筛选；收盘日报自动推荐会使用同一设置')
+  } catch (reason) { message.error((reason as Error).message) }
+  finally { savingFilters.value = false }
 }
 
-// 策略随类型联动。
 const strategies = ref<Strategy[]>([])
-const strategyOptions = computed(() =>
-  strategies.value.map((s) => ({ label: `${s.name} · ${s.desc}`, value: s.key })),
-)
+const strategyOptions = computed(() => strategies.value.map((item) => ({ label: `${item.name} · ${item.desc}`, value: item.key })))
 async function loadStrategies() {
   try {
     strategies.value = await listStrategies(form.value.type)
-    if (strategies.value.length && !strategies.value.find((s) => s.key === form.value.strategy)) {
-      form.value.strategy = strategies.value[0].key
-    }
-  } catch (e) {
-    message.error((e as Error).message)
-  }
+    if (strategies.value.length && !strategies.value.some((item) => item.key === form.value.strategy)) form.value.strategy = strategies.value[0].key
+  } catch (reason) { message.error((reason as Error).message) }
 }
-watch(() => form.value.type, loadStrategies)
+watch(() => form.value.type, () => void loadStrategies())
 
-// ---------- LLM ----------
 const llmConfigs = ref<LLMConfig[]>([])
-const llmOptions = computed(() =>
-  llmConfigs.value.map((c) => ({
-    label: c.is_default ? `${c.name}（默认）` : c.name,
-    value: c.id,
-  })),
-)
+const llmOptions = computed(() => llmConfigs.value.map((item) => ({ label: item.is_default ? `${item.name}（默认）` : item.name, value: item.id })))
 async function loadLLM() {
   try {
     llmConfigs.value = await listLLMConfigs()
-    const def = llmConfigs.value.find((c) => c.is_default) || llmConfigs.value[0]
-    if (def && form.value.llm_config_id === undefined) form.value.llm_config_id = def.id
-  } catch (e) {
-    message.error((e as Error).message)
-  }
+    const fallback = llmConfigs.value.find((item) => item.is_default) || llmConfigs.value[0]
+    if (fallback && form.value.llm_config_id === undefined) form.value.llm_config_id = fallback.id
+  } catch (reason) { message.error((reason as Error).message) }
 }
 
-// ---------- 生成 ----------
-const running = ref(false)
 const current = ref<RecommendationView | null>(null)
-const showAllReady = ref(false)
-const discoveryStatus = ref<DiscoveryStatusView | null>(null)
-const visibleDiscoveryChannels = computed(() => [
-  ...new Set(discoveryStatus.value?.channels?.length
-    ? discoveryStatus.value.channels
-    : (discoveryStatus.value?.items || []).map((item) => item.channel)),
-])
-
-async function loadDiscoveryStatus() {
-  try {
-    discoveryStatus.value = await getDiscoveryStatus(120)
-  } catch {
-    discoveryStatus.value = {
-      scope: 'global',
-      market: 'cn',
-      status: 'unavailable',
-      reason: '发现状态暂不可用',
-      run: null,
-      items: [],
-      channels: [],
-    }
-  }
-}
-
-function discoveryChannelLabel(channel: string) {
-  return ({
-    trend_breakout: '趋势/突破',
-    pullback_repair: '回调/修复',
-    value_dividend: '价值/红利',
-    strategy_signal: '策略信号',
-  } as Record<string, string>)[channel] || channel
-}
-
-function discoveryRunLabel(status: string) {
-  return ({ success: '完整', partial: '部分可用', failed: '失败', processing: '运行中', unavailable: '不可用' } as Record<string, string>)[status] || status
-}
-
-function latestDiscoveryDay(summary: CandidateDiscoverySummary) {
-  return summary.days?.length ? summary.days[summary.days.length - 1] : null
-}
-
-function executionStatus(item: RecommendationItem): ExecutionStatus {
-  // 旧记录没有 execution_plan：保留可读，但不能用当前偏好补算后直接执行。
-  return item.detail?.execution_plan?.status || 'wait'
-}
-
-const readyItems = computed(() => current.value?.items.filter((item) => executionStatus(item) === 'ready') || [])
-const waitItems = computed(() => current.value?.items.filter((item) => executionStatus(item) === 'wait') || [])
-const unsuitableItems = computed(
-  () => current.value?.items.filter((item) => executionStatus(item) === 'not_suitable') || [],
-)
-const visibleResultItems = computed(() => [
-  ...(showAllReady.value ? readyItems.value : readyItems.value.slice(0, 3)),
-  ...waitItems.value,
-  ...unsuitableItems.value,
-])
-
-function executionGroupTitle(item: RecommendationItem) {
-  const status = executionStatus(item)
-  if (status === 'ready') return `当前可执行（${readyItems.value.length}）`
-  if (status === 'not_suitable') return `暂不适合（${unsuitableItems.value.length}）`
-  return `等待条件（${waitItems.value.length}）`
-}
-
-function executionStatusLabel(item: RecommendationItem) {
-  const status = executionStatus(item)
-  if (!item.detail?.execution_plan) return '旧记录 · 待人工核验'
-  if (status === 'ready') return '当前可执行'
-  if (status === 'not_suitable') return '暂不适合'
-  return '等待条件'
-}
-
-function startsExecutionGroup(index: number) {
-  if (index === 0) return true
-  return executionStatus(visibleResultItems.value[index]) !== executionStatus(visibleResultItems.value[index - 1])
-}
-
-watch(() => current.value?.id, () => {
-  showAllReady.value = false
-})
-
-async function generate() {
-  // 偏好接口慢/失败时表单仍是内置默认——生成前补一次加载，避免用户以为提交的是自己保存的偏好。
-  if (!pref.value) await loadPrefFilters()
-  running.value = true
-  try {
-    // 2026-07-14 异步任务化：接口立即返回 processing 批次（建池/评分/AI 精选在服务端
-    // 后台执行），轮询详情直到脱离 processing——浏览器超时/刷新不再中断任务。
-    const v = await generateRecommendations({ ...form.value, filters: { ...filters.value } })
-    current.value = v
-    await replaceRouteQuery(route, router, { batch_id: v.id })
-    if (v.status === 'processing') {
-      message.info('任务已创建，正在后台生成（刷新或关闭页面不影响任务）')
-      await loadHistory()
-      await trackBatch(v.id)
-      return
-    }
-    notifyResult(v)
-  } catch (e) {
-    message.error((e as Error).message)
-  } finally {
-    running.value = false
-    await loadHistory()
-  }
-}
-
-// trackBatch 轮询后台任务直到脱离 processing；页面刷新后凭历史里的 processing 批次恢复跟踪。
-// 页面卸载时取消轮询，避免后台请求空转与已销毁组件的状态回填。
-let pollAbort: AbortController | null = null
-onBeforeUnmount(() => {
-  pollAbort?.abort()
-  reviewsAbort?.abort()
-  reviewsAbort = null
-})
-
-async function trackBatch(id: number) {
-  running.value = true
-  pollAbort?.abort()
-  const controller = new AbortController()
-  pollAbort = controller
-  try {
-    const v = await pollUntil(
-      () => getRecommendation(id),
-      (r) => r.status !== 'processing',
-      { signal: controller.signal },
-    )
-    if (!current.value || current.value.id === id) current.value = v
-    notifyResult(v)
-  } catch (e) {
-    if (isPollCancelled(e)) return
-    message.error((e as Error).message)
-  } finally {
-    if (pollAbort === controller) {
-      pollAbort = null
-      running.value = false
-      await loadHistory()
-    }
-  }
-}
-
-function notifyResult(v: RecommendationView) {
-  if (v.status === 'failed') {
-    message.error(v.error || '生成失败')
-  } else if (v.status === 'degraded') {
-    message.warning(
-      v.items.length
-        ? 'AI 精选超时，已生成量化降级推荐（规则生成，未经 AI 解读）'
-        : '模型未给出候选池内的有效推荐，请调整策略或稍后重试',
-    )
-  } else if (v.items.length) {
-    message.success(`已生成 ${v.items.length} 个${v.type === 'short_term' ? '短线' : '长线'}标的`)
-  }
-}
-
-// ---------- 历史 ----------
+const submitting = ref(false)
+const currentID = computed(() => current.value?.id || null)
 const history = ref<RecommendationBatch[]>([])
 const historyLoading = ref(false)
+const discovery = ref<DiscoveryStatusView | null>(null)
+
 async function loadHistory() {
   historyLoading.value = true
-  try {
-    history.value = await listRecommendations('', 30)
-  } catch (e) {
-    message.error((e as Error).message)
-  } finally {
-    historyLoading.value = false
+  try { history.value = await listRecommendations('', 30) }
+  catch (reason) { message.error((reason as Error).message) }
+  finally { historyLoading.value = false }
+}
+async function loadDiscovery() {
+  try { discovery.value = await getDiscoveryStatus(120) }
+  catch {
+    discovery.value = { scope: 'global', market: 'cn', status: 'unavailable', reason: '发现状态暂不可用', run: null, items: [], channels: [] }
   }
 }
-async function openBatch(b: RecommendationBatch) {
+function notifyResult(value: RecommendationView) {
+  if (value.status === 'failed') message.error(value.error || '推荐生成失败')
+  else if (value.status === 'degraded') message.warning(value.error || '推荐部分成功，请查看缺失原因')
+  else if (value.items.length) message.success(`已生成 ${value.items.length} 条推荐研究结果`)
+}
+
+const { polling, track, stop } = useResultPolling<RecommendationView>({
+  load: getRecommendation,
+  isDone: (value) => value.status !== 'processing',
+  onResult: (id, value) => {
+    if (!current.value || current.value.id === id) current.value = value
+    notifyResult(value)
+  },
+  onError: (error) => message.error(error.message),
+  onSettled: async () => {
+    await Promise.all([loadHistory(), refreshTask()])
+  },
+})
+const running = computed(() => submitting.value || polling.value)
+const {
+  task,
+  loading: taskLoading,
+  actionLoading: taskActionLoading,
+  error: taskError,
+  refresh: refreshTask,
+  cancel: cancelTask,
+  retry: retryTask,
+} = useBusinessTask('recommendation', currentID)
+
+let submitLocked = false
+async function generate() {
+  if (submitLocked || running.value) return
+  submitLocked = true
+  submitting.value = true
   try {
-    current.value = await getRecommendation(b.id)
-    await replaceRouteQuery(route, router, { batch_id: b.id })
-  } catch (e) {
-    message.error((e as Error).message)
+    if (!pref.value) await loadPreference()
+    const created = await generateRecommendations({ ...form.value, filters: { ...filters.value } })
+    current.value = created
+    await replaceRouteQuery(route, router, { batch_id: created.id })
+    await Promise.all([loadHistory(), refreshTask()])
+    if (created.status === 'processing') {
+      message.info('任务已创建；刷新或关闭页面不影响后台执行')
+      void track(created.id)
+    } else notifyResult(created)
+  } catch (reason) {
+    message.error((reason as Error).message)
+  } finally {
+    submitLocked = false
+    submitting.value = false
   }
 }
 
 function routeBatchID(): number | null {
   const raw = Array.isArray(route.query.batch_id) ? route.query.batch_id[0] : route.query.batch_id
   const id = Number(raw)
-  return Number.isInteger(id) && id > 0 ? id : null
+  return Number.isSafeInteger(id) && id > 0 ? id : null
 }
-
-let routeBatchSeq = 0
+let routeSequence = 0
 async function openRouteBatch(): Promise<boolean> {
   const id = routeBatchID()
   if (!id) return false
   if (current.value?.id === id) return true
-
-  const seq = ++routeBatchSeq
-  pollAbort?.abort()
+  const sequence = ++routeSequence
+  stop()
   try {
-    const view = await getRecommendation(id)
-    if (seq !== routeBatchSeq || routeBatchID() !== id) return true
-    current.value = view
-    if (view.status === 'processing') void trackBatch(id)
-  } catch (e) {
-    if (seq === routeBatchSeq && routeBatchID() === id) message.error((e as Error).message)
+    const value = await getRecommendation(id)
+    if (sequence !== routeSequence || routeBatchID() !== id) return true
+    current.value = value
+    if (value.status === 'processing') void track(id)
+  } catch (reason) {
+    if (sequence === routeSequence) message.error((reason as Error).message)
   }
   return true
 }
-
 watch(() => route.query.batch_id, () => void openRouteBatch())
-async function removeBatch(b: RecommendationBatch) {
+async function openBatch(item: RecommendationBatch) {
   try {
-    await deleteRecommendation(b.id)
-    if (current.value?.id === b.id) {
+    stop()
+    current.value = await getRecommendation(item.id)
+    await replaceRouteQuery(route, router, { batch_id: item.id })
+    if (current.value.status === 'processing') void track(item.id)
+  } catch (reason) { message.error((reason as Error).message) }
+}
+async function removeBatch(item: RecommendationBatch) {
+  try {
+    await deleteRecommendation(item.id)
+    if (current.value?.id === item.id) {
       current.value = null
       await replaceRouteQuery(route, router, { batch_id: undefined })
     }
     await loadHistory()
-    message.success('已删除')
-  } catch (e) {
-    message.error((e as Error).message)
-  }
+    message.success('本人推荐记录已删除')
+  } catch (reason) { message.error((reason as Error).message) }
 }
-
-// 一键建仓：跳持仓页预填（带 rec_id 血缘，落库后详情可见「已建仓」与价格对比）。
-function buildPosition(item: RecommendationItem) {
-  const quantity = item.detail?.execution_plan?.quantity || 0
-  router.push({
-    name: 'positions',
-    query: {
-      add: '1',
-      symbol: item.symbol,
-      market: item.market,
-      name: item.name,
-      rec_id: String(item.id),
-      quantity: quantity >= 100 ? String(quantity) : undefined,
-    },
-  })
-}
-
-// 推荐参考价 vs 实际买入价 偏离 %。
-function buyDeviationPct(item: RecommendationItem) {
-  if (!item.position || !item.ref_price) return null
-  return ((item.position.buy_price - item.ref_price) / item.ref_price) * 100
-}
-
-// 「为什么没选它」：详情接口返回的池内落选理由。
-const rejectedList = computed<RecReject[]>(() => {
-  const raw = current.value?.rejected_json
-  if (!raw) return []
+async function cancelCurrentTask() {
   try {
-    const parsed = JSON.parse(raw) as RecReject[]
-    return Array.isArray(parsed) ? parsed : []
-  } catch {
-    return []
-  }
-})
-
-// ---------- 候选池全景（透明化核心：来源/量化分/排名/被筛原因全可见） ----------
-const poolList = computed<PoolCandidate[]>(() => {
-  const raw = current.value?.candidate_pool
-  if (!raw) return []
+    await cancelTask()
+    if (current.value) current.value = await getRecommendation(current.value.id).catch(() => current.value)
+    message.success('已提交取消请求')
+  } catch (reason) { message.error((reason as Error).message) }
+}
+async function retryCurrentTask() {
   try {
-    const parsed = JSON.parse(raw) as PoolCandidate[]
-    return Array.isArray(parsed) ? parsed : []
-  } catch {
-    return []
-  }
-})
-// 参与排名的（未被筛掉）按 rank 升序；被筛掉的排后面。
-const poolRanked = computed(() =>
-  poolList.value
-    .filter((c) => !c.excluded)
-    .sort((a, b) => (a.rank || 999) - (b.rank || 999)),
-)
-const poolExcluded = computed(() => poolList.value.filter((c) => !!c.excluded))
-
-const SOURCE_LABEL: Record<string, string> = {
-  watchlist: '自选',
-  gainer: '涨幅榜',
-  active: '成交额榜',
-  turnover: '换手率榜',
-  dipper: '回调榜',
-  lowpb: '低PB榜',
-  strategy_signal: '策略信号',
-  daily_discovery: '今日全市场发现',
-  recent_discovery: '近5日候选记忆',
-}
-function sourceText(c: PoolCandidate) {
-  const arr = c.sources && c.sources.length ? c.sources : c.source ? [c.source] : []
-  return arr.map((s) => SOURCE_LABEL[s] || s).join('+') || '—'
-}
-function fmtCapYi(v: number | undefined) {
-  return v && v > 0 ? (v / 1e8).toFixed(0) : '—'
-}
-
-// 详情接口 filters_json：生效条件回显 + 池快照容量保护的省略计数，同源解析。
-const filtersPayload = computed<{ applied?: string[]; pool_omitted?: number }>(() => {
-  const raw = current.value?.filters_json
-  if (!raw) return {}
-  try {
-    return JSON.parse(raw) as { applied?: string[]; pool_omitted?: number }
-  } catch {
-    return {}
-  }
-})
-// 本次生效的筛选条件。
-const appliedFilters = computed<string[]>(() =>
-  Array.isArray(filtersPayload.value.applied) ? filtersPayload.value.applied : [],
-)
-// 池快照被省略的条数（快照 >150 时的容量保护，被筛掉者按序截断）。
-const poolOmitted = computed<number>(() => filtersPayload.value.pool_omitted || 0)
-
-// AI 复核整体点评（verify 模式）。
-const reviewOverall = computed<string>(() => {
-  const raw = current.value?.review_json
-  if (!raw) return ''
-  try {
-    const parsed = JSON.parse(raw) as { overall?: string }
-    return parsed.overall || ''
-  } catch {
-    return ''
-  }
-})
-
-// ---------- 展示辅助 ----------
-function typeLabel(t: string) {
-  return t === 'short_term' ? '短线' : '长线'
-}
-// 全量静态字典：历史列表两种类型混排，绝不能用「当前所选类型的策略列表」查名
-// （旧版跨类型批次会显示原始 key 如 "value"，且随类型切换变化）。
-const STRATEGY_NAME: Record<string, string> = {
-  momentum: '动量突破',
-  pullback: '强势回踩',
-  active: '热点活跃',
-  value: '价值低估',
-  growth: '成长趋势',
-  leader: '龙头优选',
-}
-function strategyName(key: string) {
-  return STRATEGY_NAME[key] || strategies.value.find((s) => s.key === key)?.name || key
-}
-// 历史/结果标题：后端固化的 title 优先（含筛选条件），旧记录回退策略名。
-function batchTitle(b: { title?: string; strategy: string }) {
-  return b.title || strategyName(b.strategy)
-}
-function actionText(a: string) {
-  return a === 'buy' ? '可考虑' : '观察'
-}
-function actionColor(a: string) {
-  return a === 'buy' ? upColor.value : flatColor.value
-}
-function fmt(n: number | undefined) {
-  return n == null || n === 0 ? '—' : n.toFixed(2)
-}
-function fmtMoney(n: number | undefined) {
-  return n && n > 0 ? `${n.toLocaleString('zh-CN', { maximumFractionDigits: 0 })} 元` : '—'
-}
-// 本地日期（YYYY-MM-DD）：追踪价归属日早于它 = 后端拿不到当日 fresh 行情、回退末根
-// 日线收盘，展示须标「X 收盘价」而非「现价」。
-const todayStr = new Date().toLocaleDateString('sv-SE')
-function fmtTime(t: string) {
-  return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : ''
-}
-
-onMounted(async () => {
-  await Promise.all([loadStrategies(), loadLLM(), loadHistory(), loadPerformance(), loadPrefFilters(), loadReviews(), loadDiscoveryStatus()])
-  // 任务中心指定的批次优先，避免被最近一个 processing 批次覆盖。
-  if (await openRouteBatch()) {
-    await restoreScroll()
-    return
-  }
-  // 页面刷新恢复：仍在后台生成中的批次自动恢复跟踪（后端对陈旧 processing 会惰性判 failed）。
-  const processing = history.value.find((h) => h.status === 'processing')
-  if (processing) {
-    current.value = await getRecommendation(processing.id).catch(() => null)
-    if (current.value) {
-      await replaceRouteQuery(route, router, { batch_id: processing.id })
-      void trackBatch(processing.id)
+    const rerun = await retryTask()
+    if (!rerun?.result_id) {
+      await refreshTask()
+      message.info('重试任务已创建，可在任务中心查看')
+      return
     }
-  }
-  await restoreScroll()
-})
+    const value = await getRecommendation(rerun.result_id)
+    current.value = value
+    await replaceRouteQuery(route, router, { batch_id: value.id })
+    await loadHistory()
+    if (value.status === 'processing') void track(value.id)
+  } catch (reason) { message.error((reason as Error).message) }
+}
+function openTaskAudit() {
+  void router.push({ name: 'tasks', query: task.value ? { job_id: String(task.value.source_id) } : { source: 'job', kind: 'recommendation' } })
+}
 
-// ---------- D18 待复盘提示（从今日待办搬过来的推荐复盘区） ----------
-// 今日待办默认只显示与账本有关的条目——「AI 推过就追踪、我没买也天天提示」的推荐复盘
-// 是那里的噪音主体，搬到这里它自己的页面上。**数据一条没删**，只换了消费出口。
 const reviews = ref<TodoItem[]>([])
 const reviewsLoading = ref(false)
 const reviewsError = ref('')
 const reviewAcking = ref<number | null>(null)
-let reviewsAbort: AbortController | null = null
-
+let reviewsController: AbortController | null = null
 async function loadReviews() {
-  reviewsAbort?.abort()
-  const ctrl = new AbortController()
-  reviewsAbort = ctrl
+  reviewsController?.abort()
+  const controller = new AbortController()
+  reviewsController = controller
   reviewsLoading.value = true
   reviewsError.value = ''
   try {
-    const res = await getTodos('research', ctrl.signal)
-    if (reviewsAbort !== ctrl) return
-    reviews.value = res.items.filter((it) => it.kind === 'rec_review')
-    if (!res.complete) {
-      reviewsError.value = res.errors?.filter(Boolean).join('；') || '部分待办数据暂时不可用，列表可能不完整'
-    }
-  } catch (e) {
-    if (reviewsAbort === ctrl && !isAbortError(e)) {
-      reviews.value = []
-      reviewsError.value = (e as Error).message
-    }
+    const result = await getTodos('research', controller.signal)
+    if (reviewsController !== controller) return
+    reviews.value = result.items.filter((item) => item.kind === 'rec_review')
+    if (!result.complete) reviewsError.value = result.errors?.filter(Boolean).join('；') || '部分追踪数据暂不可用'
+  } catch (reason) {
+    if (reviewsController === controller && !isAbortError(reason)) reviewsError.value = (reason as Error).message
   } finally {
-    if (reviewsAbort === ctrl) reviewsLoading.value = false
+    if (reviewsController === controller) reviewsLoading.value = false
   }
 }
-
 async function ackReview(item: TodoItem) {
   if (reviewAcking.value) return
   reviewAcking.value = item.ref_id
   try {
     await ackRecommendationReview(item.ref_id)
-    message.success('已标记已读')
     await loadReviews()
-  } catch (e) {
-    message.error((e as Error).message)
-  } finally {
-    reviewAcking.value = null
-  }
+  } catch (reason) { message.error((reason as Error).message) }
+  finally { reviewAcking.value = null }
 }
+onBeforeUnmount(() => reviewsController?.abort())
 
-// ---------- 追踪 + 表现统计 ----------
 const performance = ref<PerformanceStats | null>(null)
 const tracking = ref(false)
 async function loadPerformance() {
-  try {
-    performance.value = await getPerformance(form.value.type)
-  } catch {
-    performance.value = null
-  }
+  try { performance.value = await getPerformance(form.value.type) }
+  catch { performance.value = null }
 }
-watch(() => form.value.type, loadPerformance)
-
+watch(() => form.value.type, () => void loadPerformance())
 async function refreshTracking() {
-  if (!current.value) return
+  if (!current.value || tracking.value) return
   tracking.value = true
   try {
     current.value = await trackRecommendation(current.value.id)
     await loadPerformance()
-    message.success('追踪已刷新')
-  } catch (e) {
-    message.error((e as Error).message)
-  } finally {
-    tracking.value = false
-  }
+    message.success('已追加最新追踪状态；历史推荐内容未改写')
+  } catch (reason) { message.error((reason as Error).message) }
+  finally { tracking.value = false }
 }
-
-const OUTCOME_LABEL: Record<string, string> = {
-  active: '进行中',
-  take_profit: '已达止盈',
-  stop_loss: '已触止损',
-  expired: '已过有效期',
-  tracking: '跟踪中',
-  no_data: '暂无数据',
-}
-function outcomeLabel(o: string) {
-  return OUTCOME_LABEL[o] || o
-}
-function outcomeColor(o: string) {
-  if (o === 'take_profit') return upColor.value
-  if (o === 'stop_loss') return downColor.value
-  if (o === 'expired') return downColor.value
-  return flatColor.value
-}
-// 收益率着色：涨红跌绿（沿用全站口径）。
-function pctColorOf(n: number) {
-  if (n > 0) return upColor.value
-  if (n < 0) return downColor.value
-  return flatColor.value
-}
-function signedPct(n: number | undefined) {
-  if (n == null) return '—'
-  const s = n.toFixed(2)
-  return (n > 0 ? '+' : '') + s + '%'
-}
-
-// ---------- S1-1 市场状态（regime，影子模式只展示不改写） ----------
-const REGIME_LABEL: Record<string, string> = { offense: '进攻', neutral: '中性', defense: '防守' }
-function regimeLabel(r: string | undefined) {
-  return r ? REGIME_LABEL[r] || r : ''
-}
-function regimeTagType(r: string | undefined): 'success' | 'warning' | 'error' | 'default' {
-  if (r === 'offense') return 'success'
-  if (r === 'defense') return 'error'
-  if (r === 'neutral') return 'warning'
-  return 'default'
-}
-// regime 判定依据明细（详情接口 regime_json）。
-const regimeSignals = computed<string[]>(() => {
-  const raw = current.value?.regime_json
-  if (!raw) return []
-  try {
-    const parsed = JSON.parse(raw) as { signals?: string[] }
-    return Array.isArray(parsed.signals) ? parsed.signals : []
-  } catch {
-    return []
-  }
-})
-
-// ---------- P1-5 反思记忆影子（详情接口 reflection_json） ----------
-// 影子纪律：教训只记录展示，未注入 prompt、不影响本批结果（tag 与 tooltip 均如实声明）。
-const reflectionMatches = computed<ReflectionMatch[]>(() => {
-  const raw = current.value?.reflection_json
-  if (!raw) return []
-  try {
-    const parsed = JSON.parse(raw) as { matched?: ReflectionMatch[] }
-    return Array.isArray(parsed.matched) ? parsed.matched : []
-  } catch {
-    return []
-  }
-})
-// P2-3 分层元数据（rf2 快照；旧 rf1 快照无 layers 则不展示）。
-const reflectionLayers = computed<ReflectionLayers | null>(() => {
-  const raw = current.value?.reflection_json
-  if (!raw) return null
-  try {
-    const parsed = JSON.parse(raw) as { layers?: ReflectionLayers }
-    return parsed.layers || null
-  } catch {
-    return null
-  }
-})
-function reflectionLayerLine(l: ReflectionLayers): string {
-  const parts = [`同标的 ${l.tier1_count} · 同策略 ${l.tier2_count}`]
-  if (l.trimmed_count > 0) parts.push(`候选 ${l.candidates_total} 条（超名额裁剪 ${l.trimmed_count} 条）`)
-  const s = l.tier3_stats
-  if (s && s.total > 0)
-    parts.push(
-      `同策略全历史 ${s.total} 条教训：盈利 ${s.wins + s.take_profit}/亏损 ${s.losses + s.stop_loss}，均收益 ${s.avg_return_pct > 0 ? '+' : ''}${s.avg_return_pct.toFixed(1)}%`,
-    )
-  return parts.join('；')
-}
-function reflectionOutcomeLabel(o: string): string {
-  const names: Record<string, string> = { win: '盈利', loss: '亏损', take_profit: '止盈', stop_loss: '止损' }
-  return names[o] || o
-}
-
-// ---------- P1-1 AI 输出 coverage/越池诊断（llm_run_json 推荐主调 run） ----------
-// 程序化计数：越池/乱码/重复条目服务端已剥除，这里让「剥除」可见（观测非门控）。
-const coverageDiag = computed<RecCoverageDiag | null>(() => {
-  const raw = current.value?.llm_run_json
-  if (!raw) return null
-  try {
-    const runs = JSON.parse(raw) as Array<{ module?: string; coverage?: RecCoverageDiag }>
-    for (const r of runs) {
-      if (r.module === 'recommendation' && r.coverage) return r.coverage
-    }
-    return null
-  } catch {
-    return null
-  }
-})
-// 仅异常时展示（正常批次 coverage=1 不加噪声；完整诊断恒在批次 llm_run_json 可查）。
-const coverageIssues = computed<string[]>(() => {
-  const d = coverageDiag.value
-  if (!d) return []
-  const parts: string[] = []
-  if (d.out_of_pool_count) parts.push(`越池 ${d.out_of_pool_count}`)
-  if (d.unknown_count) parts.push(`无法识别 ${d.unknown_count}`)
-  if (d.duplicate_count) parts.push(`重复 ${d.duplicate_count}`)
-  if (d.truncated_count) parts.push(`超量 ${d.truncated_count}`)
-  return parts
-})
-const coverageTipLines = computed<string[]>(() => {
-  const d = coverageDiag.value
-  if (!d) return []
-  const lines: string[] = [
-    `模型输出 ${d.input_count} 条，池内合法保留 ${d.covered_count} 条（coverage ${Math.round((d.coverage ?? 0) * 100)}%）`,
-  ]
-  if (d.out_of_pool_symbols?.length) lines.push(`越池样本：${d.out_of_pool_symbols.join('、')}`)
-  if (d.unknown_symbols?.length) lines.push(`无法识别样本：${d.unknown_symbols.join('、')}`)
-  if (d.duplicate_symbols?.length) lines.push(`重复样本：${d.duplicate_symbols.join('、')}`)
-  if (d.prompt_trimmed && d.prompt_trimmed_note) lines.push(d.prompt_trimmed_note)
-  return lines
-})
-
-// ---------- S1-4 一键挂止损提醒 ----------
 const stopAlerting = ref<Record<number, boolean>>({})
-async function addStopAlert(it: RecommendationItem) {
-  stopAlerting.value[it.id] = true
+async function addStopAlert(item: RecommendationItem) {
+  if (stopAlerting.value[item.id]) return
+  stopAlerting.value = { ...stopAlerting.value, [item.id]: true }
   try {
-    await createStopLossAlert(it.id)
-    message.success(`已创建止损提醒：${it.name || it.symbol} ≤ ${it.detail?.stop_loss?.toFixed(2)}（命中自动暂停，可在「提醒」页管理）`)
-  } catch (e) {
-    message.error((e as Error).message)
-  } finally {
-    stopAlerting.value[it.id] = false
-  }
-}
-
-// ---------- S0-6 归因报表 ----------
-const showAttribution = ref(false)
-const attrLoading = ref(false)
-const attrReport = ref<AttributionReport | null>(null)
-const attrHorizon = ref(10)
-const attrHorizonOptions = [1, 5, 10, 20, 60].map((h) => ({ label: `${h} 交易日`, value: h }))
-const ATTR_DIM_LABEL: Record<string, string> = {
-  action: '动作',
-  chg5d_bucket: '入场特征（近5日涨幅）',
-  regime: '市场状态',
-  strategy: '策略',
-  source: '来源',
-  industry: '行业',
-}
-const attrDims = computed(() => {
-  const groups = attrReport.value?.groups || []
-  const byDim = new Map<string, typeof groups>()
-  for (const g of groups) {
-    if (!byDim.has(g.dim)) byDim.set(g.dim, [])
-    byDim.get(g.dim)!.push(g)
-  }
-  return [...byDim.entries()].map(([dim, cells]) => ({ dim, label: ATTR_DIM_LABEL[dim] || dim, cells }))
-})
-async function loadAttribution() {
-  attrLoading.value = true
-  try {
-    attrReport.value = await getAttribution(form.value.type, attrHorizon.value)
-  } catch (e) {
-    message.error((e as Error).message)
-  } finally {
-    attrLoading.value = false
-  }
-}
-function openAttribution() {
-  showAttribution.value = true
-  void loadAttribution()
-}
-watch(attrHorizon, () => {
-  if (showAttribution.value) void loadAttribution()
-})
-
-// ---------- S2-4 影子门控对照报表 ----------
-const showShadow = ref(false)
-const shadowLoading = ref(false)
-const shadowReport = ref<ShadowReport | null>(null)
-const shadowHorizon = ref(10)
-async function loadShadow() {
-  shadowLoading.value = true
-  try {
-    shadowReport.value = await getShadowReport(form.value.type, shadowHorizon.value)
-  } catch (e) {
-    message.error((e as Error).message)
-  } finally {
-    shadowLoading.value = false
-  }
-}
-function openShadow() {
-  showShadow.value = true
-  void loadShadow()
-}
-watch(shadowHorizon, () => {
-  if (showShadow.value) void loadShadow()
-})
-
-// ---------- S3-2 候选池召回评估 ----------
-const showRecall = ref(false)
-const recallLoading = ref(false)
-const recallReport = ref<RecallReport | null>(null)
-const dailyAudit = ref<CandidateAuditUserReport | null>(null)
-const recallError = ref('')
-const recallHorizon = ref(10)
-const recallK = ref(50)
-const recallHorizonOptions = [5, 10, 20].map((h) => ({ label: `${h} 交易日`, value: h }))
-const recallKOptions = [20, 50, 100].map((k) => ({ label: `Top ${k}`, value: k }))
-const RECALL_STAGE_LABEL: Record<string, string> = {
-  picked: '最终入选',
-  llm_list: '进 LLM 名单未选',
-  scored: '完成评分未进名单',
-  pool_full: '评分名额已满',
-  filtered: '被筛选排除',
-  absent: '从未进池',
-}
-const AUDIT_REASON_LABEL: Record<string, string> = {
-  not_discovered_marketwide: '未被全市场发现',
-  discovered_not_in_user_pool: '已发现但未进入该用户推荐池',
-  user_blacklist: '用户黑名单',
-  user_price_filter: '价格筛选',
-  user_market_cap_filter: '市值筛选',
-  user_turnover_filter: '换手筛选',
-  liquidity_filter: '流动性筛选',
-  st_or_delisted_filter: 'ST / 退市筛选',
-  suspended_filter: '停牌筛选',
-  unexecutable_filter: '不可成交筛选',
-  quote_stale: '行情过期',
-  filtered_recorded_other: '已记录的其他筛选',
-  pool_capacity: '候选池名额已满',
-  correlation_gate: '相关性门控',
-  industry_cap: '行业上限',
-  quant_rank_below_cutoff: '量化排名未达截断位',
-  llm_rejected_recorded: '当时 LLM 已记录拒选',
-  llm_not_selected: '进入名单但未入选',
-  picked_adverse_next_day: '入选后次日不利',
-  candidate_facts_missing: '候选事实缺失',
-  candidate_facts_ambiguous: '候选事实冲突',
-  signal_factor_snapshot_missing: '信号日因子快照缺失',
-  unknown: '事实不足',
-}
-function auditReasonLabel(reason: string): string {
-  return AUDIT_REASON_LABEL[reason] || reason || '事实不足'
-}
-function auditConclusionLabel(code: string): string {
-  if (code === 'early_adverse_observation') return '早期不利观察'
-  if (code === 'false_positive_next_day') return '误选（次日不利）'
-  return '漏选强势机会'
-}
-const recallStages = computed(() => {
-  const counts = recallReport.value?.topk_stage_counts || {}
-  return Object.keys(RECALL_STAGE_LABEL)
-    .filter((k) => counts[k] > 0)
-    .map((k) => ({ key: k, label: RECALL_STAGE_LABEL[k], count: counts[k] }))
-})
-async function loadRecall() {
-  recallLoading.value = true
-  recallError.value = ''
-  // 切换推荐类型或重新打开时先清空旧报表；请求失败不能残留上一类型的数据。
-  dailyAudit.value = null
-  const [recallResult, auditResult] = await Promise.allSettled([
-    getRecallReport(form.value.type, recallHorizon.value, recallK.value),
-    getDailyAuditReport(form.value.type),
-  ])
-  if (recallResult.status === 'fulfilled') {
-    recallReport.value = recallResult.value
-    dailyAudit.value = recallResult.value.daily_audit || dailyAudit.value
-  } else {
-    recallReport.value = null
-    recallError.value = recallResult.reason instanceof Error ? recallResult.reason.message : '召回评估暂不可用'
-  }
-  if (auditResult.status === 'fulfilled') {
-    dailyAudit.value = auditResult.value
-  } else if (!dailyAudit.value) {
-    dailyAudit.value = null
-  }
-  if (recallResult.status === 'rejected' && auditResult.status === 'rejected') {
-    message.error(recallError.value)
-  }
-  recallLoading.value = false
-}
-function openRecall() {
-  showRecall.value = true
-  void loadRecall()
-}
-watch([recallHorizon, recallK], () => {
-  if (showRecall.value) void loadRecall()
-})
-
-// S2-2/S2-3 severity 与缺失面展示辅助。
-function bearSeverityColor(sev: string): string {
-  if (sev === 'high') return downColor.value
-  if (sev === 'med') return vars.value.warningColor
-  return flatColor.value
-}
-function bearSeverityLabel(sev: string): string {
-  return sev === 'high' ? '高危' : sev === 'med' ? '中危' : '低危'
-}
-const QG_FIELD_LABEL: Record<string, string> = {
-  quote: '有效行情',
-  daily_bars: '日线数据',
-  daily_bars_stale: '日线过期',
-  daily_bars_short: '日线样本不足',
-  amount: '成交额',
-  fin: '财务数据',
-}
-function qgFieldLabels(fields?: string[]): string {
-  return (fields || []).map((f) => QG_FIELD_LABEL[f] || f).join('、')
+    await createStopLossAlert(item.id)
+    message.success(`已为 ${item.name || item.symbol} 设置止损提醒；不会自动下单`)
+  } catch (reason) { message.error((reason as Error).message) }
+  finally { stopAlerting.value = { ...stopAlerting.value, [item.id]: false } }
 }
 
 type ResultSection = 'pool' | 'rejected'
 const resultSectionsQuery = enumListQuery<ResultSection>(['pool', 'rejected'], 2)
 const resultSections = ref<ResultSection[]>(resultSectionsQuery.parse(route.query.sections))
-const recTypeState = computed({
-  get: () => form.value.type,
-  set: (value: 'short_term' | 'long_term') => {
-    form.value.type = value
-  },
-})
-const strategyState = computed<string>({
-  get: () => form.value.strategy || '',
-  set: (value) => {
-    form.value.strategy = value
-  },
-})
-const countState = computed<number>({
-  get: () => form.value.count || 5,
-  set: (value) => {
-    form.value.count = value
-  },
-})
-const verifyState = computed<boolean>({
-  get: () => !!form.value.verify,
-  set: (value) => {
-    form.value.verify = value
-  },
-})
-const bearCheckState = computed<boolean>({
-  get: () => !!form.value.bear_check,
-  set: (value) => {
-    form.value.bear_check = value
-  },
-})
+const auditMode = ref<'' | 'attribution' | 'shadow' | 'recall'>('')
+const recTypeState = computed({ get: () => form.value.type, set: (value: 'short_term' | 'long_term') => { form.value.type = value } })
+const strategyState = computed({ get: () => form.value.strategy || '', set: (value: string) => { form.value.strategy = value } })
+const countState = computed({ get: () => form.value.count || 5, set: (value: number) => { form.value.count = value } })
+const verifyState = computed({ get: () => !!form.value.verify, set: (value: boolean) => { form.value.verify = value } })
+const bearState = computed({ get: () => !!form.value.bear_check, set: (value: boolean) => { form.value.bear_check = value } })
 function filterState<K extends keyof RecFilters>(key: K) {
-  return computed<RecFilters[K]>({
-    get: () => filters.value[key],
-    set: (value) => {
-      filters.value = { ...filters.value, [key]: value }
-    },
-  })
+  return computed<RecFilters[K]>({ get: () => filters.value[key], set: (value) => { filters.value = { ...filters.value, [key]: value } } })
 }
-
 useRouteQueryState(route, router, [
   queryRef('rec_type', recTypeState, recTypeQuery),
   queryRef('strategy', strategyState, strategyQuery),
   queryRef('count', countState, countQuery),
   queryRef('verify', verifyState, verifyQuery),
-  queryRef('bear_check', bearCheckState, bearCheckQuery),
+  queryRef('bear_check', bearState, bearCheckQuery),
   queryRef('price_min', filterState('price_min'), numberQuery(0, 0, 1_000_000)),
   queryRef('price_max', filterState('price_max'), numberQuery(50, 0, 1_000_000)),
   queryRef('cap_min', filterState('float_cap_min_yi'), numberQuery(0, 0, 100_000_000)),
@@ -1128,1958 +427,112 @@ useRouteQueryState(route, router, [
 ])
 const { restoreScroll } = useListPageScroll(route, 'recommendations')
 
+onMounted(async () => {
+  await Promise.all([loadStrategies(), loadLLM(), loadHistory(), loadPerformance(), loadPreference(), loadReviews(), loadDiscovery()])
+  if (await openRouteBatch()) {
+    await restoreScroll()
+    return
+  }
+  const processing = history.value.find((item) => item.status === 'processing')
+  if (processing) {
+    current.value = await getRecommendation(processing.id).catch(() => null)
+    if (current.value) {
+      await replaceRouteQuery(route, router, { batch_id: processing.id })
+      void track(processing.id)
+    }
+  }
+  await restoreScroll()
+})
 </script>
 
 <template>
-  <PageContainer title="短线 / 长线推荐" subtitle="候选池内精选 · 结构化输出 · 不编造池外标的">
-    <div class="rec" :style="styleVars">
-      <!-- 左：生成 + 历史 -->
-      <div class="col-form">
-        <SectionCard title="生成推荐">
-          <div class="pref-entry">
-            <span v-if="pref">{{ pref.horizon_pref === 'short_term' ? '短线' : pref.horizon_pref === 'mid_term' ? '中线' : '长线' }} · {{ pref.risk_level === 'conservative' ? '保守' : pref.risk_level === 'aggressive' ? '激进' : '均衡' }}</span>
-            <n-button size="tiny" quaternary @click="showInvestmentGuide = true">投资偏好</n-button>
-            <n-button size="tiny" quaternary @click="router.push({ query: { ...route.query, onboarding: '1' } })">首次使用引导</n-button>
-          </div>
-          <n-form label-placement="top" :show-feedback="false" class="form">
-            <n-form-item label="类型">
-              <n-radio-group v-model:value="form.type">
-                <n-radio-button value="short_term">短线</n-radio-button>
-                <n-radio-button value="long_term">长线</n-radio-button>
-              </n-radio-group>
-            </n-form-item>
-            <n-form-item label="策略">
-              <n-select v-model:value="form.strategy" :options="strategyOptions" />
-            </n-form-item>
-            <n-form-item label="市场">
-              <n-select v-model:value="form.market" :options="marketOptions" />
-            </n-form-item>
-            <n-form-item label="数量（3-5）">
-              <n-input-number v-model:value="form.count" :min="3" :max="5" style="width: 100%" />
-            </n-form-item>
-            <n-form-item label="筛选条件（硬过滤，被筛掉的股票会在结果页列出原因）">
-              <div class="filters">
-                <n-select v-model:value="pricePreset" :options="pricePresetOptions" size="small" />
-                <div v-if="pricePreset === -1" class="filters-row">
-                  <n-input-number v-model:value="filters.price_min" :min="0" size="small" placeholder="价格下限" style="width: 100%" />
-                  <span class="filters-sep">~</span>
-                  <n-input-number v-model:value="filters.price_max" :min="0" size="small" placeholder="上限，0=不限" style="width: 100%" />
-                </div>
-                <n-select v-model:value="capPreset" :options="capPresetOptions" size="small" />
-                <div v-if="capPreset === -1" class="filters-row">
-                  <n-input-number v-model:value="filters.float_cap_min_yi" :min="0" size="small" placeholder="流通市值下限(亿)" style="width: 100%" />
-                  <span class="filters-sep">~</span>
-                  <n-input-number v-model:value="filters.float_cap_max_yi" :min="0" size="small" placeholder="上限(亿)，0=不限" style="width: 100%" />
-                </div>
-                <div class="filters-row">
-                  <n-input-number v-model:value="filters.turnover_min" :min="0" :max="25" size="small" placeholder="换手%下限" style="width: 100%" />
-                  <span class="filters-sep">~</span>
-                  <n-input-number v-model:value="filters.turnover_max" :min="0" :max="30" size="small" placeholder="换手%上限" style="width: 100%" />
-                </div>
-                <div class="filters-hint">换手 >30% 一律排除；20~30% 仅高位（60日区间 ≥65%）判「死亡换手」排除，低位保留并标注风险</div>
-                <div class="filters-switch">
-                  <span>排除已涨停（买不进）</span>
-                  <n-switch v-model:value="filters.exclude_limit_up" size="small" />
-                </div>
-                <div class="filters-switch">
-                  <span>排除创业板/科创板（仅主板个股）</span>
-                  <n-switch v-model:value="filters.exclude_gem_star" size="small" />
-                </div>
-                <div class="filters-switch">
-                  <span>追高保护：近5日涨幅上限%（0=不限）</span>
-                  <n-input-number v-model:value="filters.max_gain_5d_pct" :min="0" :max="100" size="small" style="width: 90px" />
-                </div>
-                <n-button size="tiny" tertiary :loading="savingFilters" @click="saveFiltersDefault">
-                  保存为默认筛选（日报自动推荐同样生效）
-                </n-button>
-              </div>
-            </n-form-item>
-            <n-form-item label="AI 复核（更可信，多一次调用）">
-              <div class="filters-switch">
-                <n-switch v-model:value="form.verify" size="small" />
-                <span class="verify-hint">开启后由独立「风控复核员」逐条核对证据与价位，可否决推荐</span>
-              </div>
-            </n-form-item>
-            <n-form-item label="反方研究员（影子，多一次调用）">
-              <div class="filters-switch">
-                <n-switch v-model:value="form.bear_check" size="small" />
-                <span class="verify-hint">对每只 buy 独立构建最强反方论证（bear case）。影子期只展示、不改写结论；默认随 AI 复核联动</span>
-              </div>
-            </n-form-item>
-            <n-form-item label="LLM 配置">
-              <n-select v-model:value="form.llm_config_id" :options="llmOptions" :placeholder="llmConfigs.length ? '选择模型配置' : '未配置将使用系统默认配置'" />
-            </n-form-item>
-            <n-button type="primary" block :loading="running" :disabled="running" @click="generate">
-              {{ running ? '生成中…' : '生成推荐' }}
-            </n-button>
-            <div class="hint">
-              流水线：自选 + 随策略组合的榜单（涨幅/成交额/换手率/回调/低PB，深度取数并补「不热」方向）→ 你的筛选 →
-              本地量化评分排序（零 AI 成本）→ AI 只在 Top10 里精选并强制引用数据 → 程序核验证据数字。候选池全程透明，可在结果页展开查看每只股为什么进/为什么被筛掉。
-            </div>
-          </n-form>
-        </SectionCard>
-
-        <!-- D18：推荐复盘提示的新家。今日待办默认只显示与账本有关的条目，
-             「AI 推过就追踪、我没买也天天提示」的复盘提醒搬到这里；数据一条没删。 -->
-        <SectionCard v-if="reviews.length || reviewsLoading || reviewsError" title="待复盘提示">
-          <template #extra>
-            <n-button size="tiny" quaternary :loading="reviewsLoading" @click="loadReviews">刷新</n-button>
-          </template>
-          <n-alert
-            v-if="reviewsError"
-            :type="reviews.length ? 'warning' : 'error'"
-            :bordered="false"
-            :title="reviews.length ? '待复盘提示可能不完整' : '待复盘提示读取失败'"
-          >
-            {{ reviewsError }}
-          </n-alert>
-          <n-spin :show="reviewsLoading && !reviews.length">
-            <n-empty v-if="!reviews.length && !reviewsError" description="没有需要复盘的推荐" size="small" />
-            <div v-if="reviews.length" class="review-list">
-              <div v-for="it in reviews" :key="it.ref_id" class="review-item">
-                <div class="review-main">
-                  <div class="review-title">
-                    <n-tag size="tiny" round :bordered="false" :type="it.priority === 1 ? 'error' : 'default'">{{
-                      it.priority === 1 ? '止损' : '复盘'
-                    }}</n-tag>
-                    <StockIdentity :symbol="it.symbol" :market="it.market || 'cn'" :name="it.name" density="table" clickable />
-                  </div>
-                  <div class="review-sub">{{ it.title }} · {{ it.detail }}</div>
-                </div>
-                <n-button size="tiny" quaternary :loading="reviewAcking === it.ref_id" @click="ackReview(it)"
-                  >已读</n-button
-                >
-              </div>
-            </div>
-          </n-spin>
-        </SectionCard>
-
-        <SectionCard title="历史记录">
-          <template #extra>
-            <n-button size="tiny" quaternary :loading="historyLoading" @click="loadHistory">刷新</n-button>
-          </template>
-          <n-spin :show="historyLoading && !history.length">
-            <n-empty v-if="!history.length" description="暂无推荐记录" size="small" />
-            <div v-else class="hist">
-              <div
-                v-for="h in history"
-                :key="h.id"
-                class="hist-item"
-                :class="{ active: current?.id === h.id }"
-                @click="openBatch(h)"
-              >
-                <div class="hist-main">
-                  <div class="hist-title">
-                    <n-tag size="tiny" round :bordered="false" :type="h.type === 'short_term' ? 'warning' : 'info'">{{
-                      typeLabel(h.type)
-                    }}</n-tag>
-                    <span class="hist-name">{{ batchTitle(h) }}</span>
-                  </div>
-                  <div class="hist-sub">
-                    {{ fmtTime(h.created_at) }} · 候选 {{ h.candidate_count }}<template v-if="llmLabel(h)"> · {{ llmLabel(h) }}</template>
-                  </div>
-                </div>
-                <div class="hist-side">
-                  <n-tag
-                    v-if="h.status !== 'success'"
-                    size="tiny"
-                    :type="h.status === 'failed' ? 'error' : h.status === 'processing' ? 'info' : 'warning'"
-                    :bordered="false"
-                    >{{ h.status === 'failed' ? '失败' : h.status === 'processing' ? '生成中' : '降级' }}</n-tag
-                  >
-                  <n-popconfirm @positive-click="removeBatch(h)">
-                    <template #trigger>
-                      <n-button size="tiny" quaternary type="error" @click.stop>删</n-button>
-                    </template>
-                    删除这条推荐记录？
-                  </n-popconfirm>
-                </div>
-              </div>
-            </div>
-          </n-spin>
-        </SectionCard>
-
-        <SectionCard v-if="performance && performance.sample > 0">
-          <n-collapse>
-            <n-collapse-item :title="`${isPlain ? '历史表现' : '历史统计'}（样本 n=${performance.sample}）`" name="performance">
-              <div class="perf">
-            <!-- S0-4 买入成熟口径（主指标）：只统计 action=buy 且已成熟（止盈/止损/过期）的样本，
-                 watch 与未成熟不再混入分母虚增胜率。 -->
-            <div class="perf-row">
-              <span class="perf-label">买入胜率（已成熟）</span>
-              <span class="perf-val"
-                >{{ performance.buy_matured > 0 ? performance.buy_win_rate.toFixed(1) + '%' : '—' }}
-                <span class="perf-sub">n={{ performance.buy_matured }}</span></span
-              >
-            </div>
-            <div v-if="performance.buy_matured > 0" class="perf-row">
-              <span class="perf-label">买入平均/中位收益</span>
-              <span class="perf-val" :style="{ color: pctColorOf(performance.buy_avg_return_pct) }">
-                {{ signedPct(performance.buy_avg_return_pct) }}
-                <span class="perf-sub">中位 {{ signedPct(performance.buy_median_pct) }}</span>
-              </span>
-            </div>
-            <div v-if="performance.buy_bench_sample > 0" class="perf-row">
-              <span class="perf-label">买入平均超额(alpha)</span>
-              <span class="perf-val" :style="{ color: pctColorOf(performance.buy_avg_alpha_pct) }"
-                >{{ signedPct(performance.buy_avg_alpha_pct) }}
-                <span class="perf-sub">n={{ performance.buy_bench_sample }}</span></span
-              >
-            </div>
-            <div v-if="performance.watch_sample > 0" class="perf-row">
-              <span class="perf-label">观察(watch)后续上涨占比</span>
-              <span class="perf-val"
-                >{{ performance.watch_win_rate.toFixed(1) }}%
-                <span class="perf-sub">n={{ performance.watch_sample }}</span></span
-              >
-            </div>
-            <div class="perf-row">
-              <span class="perf-label">全样本胜率（含未成熟，参考）</span>
-              <span class="perf-val perf-secondary">{{ performance.win_rate.toFixed(1) }}%</span>
-            </div>
-            <div class="perf-row">
-              <span class="perf-label">平均收益</span>
-              <span class="perf-val" :style="{ color: pctColorOf(performance.avg_return_pct) }">{{
-                signedPct(performance.avg_return_pct)
-              }}</span>
-            </div>
-            <div class="perf-row">
-              <span class="perf-label">平均超额(alpha)</span>
-              <span class="perf-val" :style="{ color: pctColorOf(performance.avg_alpha_pct) }"
-                >{{ signedPct(performance.avg_alpha_pct) }}
-                <span class="perf-sub">n={{ performance.bench_sample }}</span></span
-              >
-            </div>
-            <div class="perf-row">
-              <span class="perf-label">平均最大回撤</span>
-              <span class="perf-val" :style="{ color: downColor }">-{{ performance.avg_max_drawdown_pct.toFixed(2) }}%</span>
-            </div>
-            <div v-if="performance.sample_7d > 0" class="perf-row">
-              <span class="perf-label">7 交易日均值</span>
-              <span class="perf-val" :style="{ color: pctColorOf(performance.avg_7d_pct) }"
-                >{{ signedPct(performance.avg_7d_pct) }} <span class="perf-sub">n={{ performance.sample_7d }}</span></span
-              >
-            </div>
-            <div v-if="performance.sample_14d > 0" class="perf-row">
-              <span class="perf-label">14 交易日均值</span>
-              <span class="perf-val" :style="{ color: pctColorOf(performance.avg_14d_pct) }"
-                >{{ signedPct(performance.avg_14d_pct) }} <span class="perf-sub">n={{ performance.sample_14d }}</span></span
-              >
-            </div>
-            <div v-if="performance.sample_30d > 0" class="perf-row">
-              <span class="perf-label">30 交易日均值</span>
-              <span class="perf-val" :style="{ color: pctColorOf(performance.avg_30d_pct) }"
-                >{{ signedPct(performance.avg_30d_pct) }} <span class="perf-sub">n={{ performance.sample_30d }}</span></span
-              >
-            </div>
-            <div class="perf-tags">
-              <n-tag size="tiny" :bordered="false" round :color="{ color: withAlpha(upColor, 0.14), textColor: upColor }"
-                >止盈 {{ performance.take_profit }}</n-tag
-              >
-              <n-tag size="tiny" :bordered="false" round :color="{ color: withAlpha(downColor, 0.14), textColor: downColor }"
-                >止损 {{ performance.stop_loss }}</n-tag
-              >
-              <n-tag size="tiny" :bordered="false" round>过期 {{ performance.expired }}</n-tag>
-              <n-tag size="tiny" :bordered="false" round>进行 {{ performance.active }}</n-tag>
-              <n-tag v-if="performance.degraded_excluded > 0" size="tiny" :bordered="false" round
-                >降级批次剔除 {{ performance.degraded_excluded }}</n-tag
-              >
-            </div>
-            <n-button size="tiny" tertiary block @click="openAttribution">错误归因报表（按持有期/特征分组）</n-button>
-            <n-button size="tiny" tertiary block style="margin-top: 6px" @click="openShadow">影子门控对照（闸门/反方/质量转正评审）</n-button>
-            <n-button size="tiny" tertiary block style="margin-top: 6px" @click="openRecall">召回评估（好股票有没有进池）</n-button>
-            <div class="perf-note">
-              仅统计有价格数据的推荐（量化降级批次单独剔除）；超额收益以上证指数为基准；买入胜率只计已成熟样本（短线终态/长线超复盘周期）。
-            </div>
-            <div v-if="performance.buy_matured < 10" class="perf-note">成熟买入样本较少（n&lt;10），统计结果波动大，仅供参考。</div>
-              </div>
-            </n-collapse-item>
-          </n-collapse>
-        </SectionCard>
-      </div>
-
-      <!-- 右：结果 -->
-      <div class="col-result">
-        <SectionCard title="推荐结果">
-          <div class="discovery-status" :data-status="discoveryStatus?.status || 'unavailable'">
-            <div class="discovery-status-main">
-              <span>自动发现：A 股全市场</span>
-              <n-tag size="tiny" :type="discoveryStatus?.status === 'success' ? 'success' : discoveryStatus?.status === 'partial' ? 'warning' : 'default'" :bordered="false">
-                {{ discoveryRunLabel(discoveryStatus?.status || 'unavailable') }}
-              </n-tag>
-              <span v-if="discoveryStatus?.run" class="discovery-status-meta">
-                {{ discoveryStatus.run.trade_date }} · 覆盖 {{ discoveryStatus.run.universe_count }} 只 · 通道命中 {{ discoveryStatus.run.success_count }} 条
-              </span>
-            </div>
-            <div v-if="visibleDiscoveryChannels.length" class="discovery-channels">
-              <span v-for="channel in visibleDiscoveryChannels" :key="channel">
-                {{ discoveryChannelLabel(channel) }}
-              </span>
-            </div>
-            <div v-if="discoveryStatus?.run?.partial_reason || discoveryStatus?.run?.error || discoveryStatus?.reason" class="discovery-gap">
-              {{ discoveryStatus?.run?.partial_reason || discoveryStatus?.run?.error || discoveryStatus?.reason }}
-            </div>
-          </div>
-          <n-spin :show="running">
-            <n-empty
-              v-if="!current"
-              description="选择类型与策略并生成，或点击左侧历史查看"
-              style="padding: 40px 0"
-            />
-            <div v-else>
-              <div class="res-head">
-                <n-tag size="small" round :bordered="false" :type="current.type === 'short_term' ? 'warning' : 'info'">{{
-                  typeLabel(current.type)
-                }}</n-tag>
-                <n-tooltip v-if="current.regime" trigger="hover" placement="bottom">
-                  <template #trigger>
-                    <n-tag size="small" round :bordered="false" :type="regimeTagType(current.regime)"
-                      >市场状态：{{ regimeLabel(current.regime) }}</n-tag
-                    >
-                  </template>
-                  <div class="regime-tip">
-                    <div v-for="(s, i) in regimeSignals" :key="i">{{ s }}</div>
-                    <div class="regime-tip-note">
-                      三档判定为影子模式：仅提示，不改写推荐动作；防守档建议整体保守、降低仓位。
-                    </div>
-                  </div>
-                </n-tooltip>
-                <!-- P1-1 AI 输出诊断：仅异常时显示（越池/乱码/重复/超量已被程序剥除，这里是剥除的可见记录） -->
-                <n-tooltip v-if="coverageIssues.length" trigger="hover" placement="bottom">
-                  <template #trigger>
-                    <n-tag size="small" round :bordered="false" type="warning">AI 输出剥除：{{ coverageIssues.join(' / ') }}</n-tag>
-                  </template>
-                  <div class="regime-tip">
-                    <div v-for="(s, i) in coverageTipLines" :key="i">{{ s }}</div>
-                    <div class="regime-tip-note">
-                      越池/无法识别的标的已被程序剥除，不进入展示与追踪；本诊断为观测记录（不改变推荐行为），完整数据随批次运行元数据落库。
-                    </div>
-                  </div>
-                </n-tooltip>
-                <!-- P1-5 反思记忆影子：本批生成时检索到的适用历史教训（未注入 prompt 不影响结果） -->
-                <n-tooltip v-if="reflectionMatches.length" trigger="hover" placement="bottom">
-                  <template #trigger>
-                    <n-tag size="small" round :bordered="false" type="default">反思记忆（影子）× {{ reflectionMatches.length }}</n-tag>
-                  </template>
-                  <div class="regime-tip">
-                    <div v-for="m in reflectionMatches" :key="m.id">
-                      #{{ m.id }} {{ m.symbol }}（{{ reflectionOutcomeLabel(m.outcome) }} {{ m.return_pct > 0 ? '+' : '' }}{{ m.return_pct.toFixed(1) }}%·{{ m.matched_by === 'symbol' ? '同标的' : '同策略' }}）：{{ m.lesson }}
-                    </div>
-                    <!-- P2-3 分层元数据（rf2）：命中分布/候选与被裁剪计数/同策略全历史结局统计 -->
-                    <div v-if="reflectionLayers" class="regime-tip-note">分层：{{ reflectionLayerLine(reflectionLayers) }}</div>
-                    <div class="regime-tip-note">
-                      影子层：历史教训仅记录，未注入提示词、不影响本批推荐结果；注入转正需影子配对评审。
-                    </div>
-                  </div>
-                </n-tooltip>
-                <span class="res-strategy">{{ batchTitle(current) }}</span>
-                <span class="res-meta"
-                  >候选池 {{ current.candidate_count }} · {{ fmtTime(current.created_at)
-                  }}<template v-if="llmLabel(current)"> · {{ llmLabel(current) }}</template></span
-                >
-                <n-button
-                  v-if="current.items.length"
-                  class="res-track"
-                  size="tiny"
-                  tertiary
-                  :loading="tracking"
-                  @click="refreshTracking"
-                  >刷新追踪</n-button
-                >
-              </div>
-
-              <div v-if="appliedFilters.length" class="applied-filters">
-                <span class="af-label">本次筛选</span>
-                <n-tag v-for="(f, i) in appliedFilters" :key="i" size="tiny" round :bordered="false">{{ f }}</n-tag>
-              </div>
-
-              <n-alert v-if="reviewOverall" type="info" :bordered="false" style="margin-bottom: 12px">
-                AI 复核员：{{ reviewOverall }}
-              </n-alert>
-
-              <n-alert v-if="current.status === 'processing'" type="info" :bordered="false" style="margin-bottom: 12px">
-                正在后台生成（建池 → 量化评分 → AI 精选）…… 关闭或刷新页面不影响任务，完成后自动展示。
-              </n-alert>
-
-              <n-alert v-if="current.status === 'degraded'" type="warning" :bordered="false" style="margin-bottom: 12px">
-                {{ current.error || '模型未给出候选池内的有效推荐' }}
-              </n-alert>
-
-              <n-empty
-                v-if="!current.items.length && current.status !== 'degraded' && current.status !== 'processing'"
-                description="本批无有效标的"
-              />
-
-              <div class="cards">
-                <template v-for="(it, itemIndex) in visibleResultItems" :key="it.id">
-                  <div v-if="startsExecutionGroup(itemIndex)" class="execution-group-head">
-                    {{ executionGroupTitle(it) }}
-                  </div>
-                  <div class="card">
-                  <!-- 头 -->
-                  <div class="card-head">
-                    <div class="card-title">
-                      <StockIdentity :symbol="it.symbol" :market="it.market" :name="it.name" clickable actions />
-                      <n-tag v-if="it.detail?.degraded_source" size="tiny" type="warning" :bordered="false" round
-                        >量化降级</n-tag
-                      >
-                      <n-tag v-if="it.position" size="tiny" type="success" :bordered="false" round>已建仓</n-tag>
-                    </div>
-                    <div class="card-badges">
-                      <span
-                        class="action-badge"
-                        :style="{ color: actionColor(it.action), background: withAlpha(actionColor(it.action), 0.12) }"
-                        >{{ actionText(it.action) }}</span
-                      >
-                      <!-- 「AI 自评」而非「置信度」：避免与综合置信（程序合成）并列成两个主指标
-                           被普通用户误读为胜率——AI 口头置信度系统性过度自信，仅作参考。 -->
-                      <span class="confidence">AI 自评 {{ it.confidence }}</span>
-                    </div>
-                  </div>
-
-                  <div class="card-sub">
-                    生成时现价 <b>{{ fmt(it.ref_price) }}</b>
-                    <span
-                      v-if="it.detail?.quote_as_of"
-                      class="quote-asof"
-                      title="该条推荐所依据行情的数据源时刻（行情时效硬门核验通过）"
-                      >（行情时点 {{ it.detail.quote_as_of.slice(5) }}）</span
-                    >
-                    <template v-if="it.position">
-                      · 实际买入 <b>{{ fmt(it.position.buy_price) }}</b> × {{ it.position.quantity }}
-                      <span v-if="it.position.buy_date">（{{ it.position.buy_date }}）</span>
-                      <span v-if="buyDeviationPct(it) != null" :style="{ color: pctColorOf(buyDeviationPct(it)!) }">
-                        较推荐价 {{ signedPct(buyDeviationPct(it)!) }}
-                      </span>
-                      <n-tag v-if="it.position.status === 'closed'" size="tiny" :bordered="false">已卖出</n-tag>
-                    </template>
-                  </div>
-
-                  <div v-if="it.detail?.discovery" class="discovery-memory">
-                    <div class="discovery-memory-head">
-                      <span>候选记忆</span>
-                      <span>首次 {{ it.detail.discovery.first_seen_date }}</span>
-                      <span>近5日 {{ it.detail.discovery.seen_days_5d }} 次</span>
-                      <span>连续 {{ it.detail.discovery.consecutive_days }} 日</span>
-                      <span v-if="latestDiscoveryDay(it.detail.discovery)">
-                        排名变化 {{ latestDiscoveryDay(it.detail.discovery)!.rank_change > 0 ? '+' : '' }}{{ latestDiscoveryDay(it.detail.discovery)!.rank_change }}
-                      </span>
-                    </div>
-                    <div class="discovery-memory-days">
-                      <span v-for="day in it.detail.discovery.days" :key="day.trade_date">
-                        {{ day.trade_date.slice(5) }} {{ day.channels.map(discoveryChannelLabel).join('/') }} #{{ day.best_rank }}
-                      </span>
-                    </div>
-                    <div v-if="it.detail.discovery.data_status !== 'ready'" class="discovery-gap">
-                      {{ it.detail.discovery.partial_reason || '候选历史存在数据缺口' }}
-                    </div>
-                  </div>
-
-                  <div v-if="it.detail" class="execution-summary" :data-status="executionStatus(it)">
-                    <div class="execution-summary-head">
-                      <n-tag
-                        size="small"
-                        :type="executionStatus(it) === 'ready' ? 'success' : executionStatus(it) === 'wait' ? 'warning' : 'default'"
-                        :bordered="false"
-                        round
-                      >{{ executionStatusLabel(it) }}</n-tag>
-                      <span v-if="it.detail.execution_plan" class="execution-asof">
-                        数据 {{ it.detail.execution_plan.data_as_of || '时点未知' }} · {{ it.detail.execution_plan.version }}
-                      </span>
-                    </div>
-                    <div v-if="it.detail.reason?.[0]" class="execution-row">
-                      <span>理由</span><b>{{ it.detail.reason[0] }}</b>
-                    </div>
-                    <div v-if="it.detail.risks?.[0]" class="execution-row risk-row">
-                      <span>最大风险</span><b>{{ it.detail.risks[0] }}</b>
-                    </div>
-                    <div v-if="it.detail.invalidation" class="execution-row">
-                      <span>失效条件</span><b>{{ it.detail.invalidation }}</b>
-                    </div>
-                    <div v-if="it.detail.execution_plan" class="execution-money">
-                      <div><span>计划金额</span><b>{{ fmtMoney(it.detail.execution_plan.planned_capital) }}</b></div>
-                      <div><span>整手数量</span><b>{{ it.detail.execution_plan.quantity ? `${it.detail.execution_plan.quantity} 股` : '—' }}</b></div>
-                      <div><span>预计占用</span><b>{{ fmtMoney(it.detail.execution_plan.estimated_capital) }}</b></div>
-                      <div><span>最大计划亏损</span><b>{{ fmtMoney(it.detail.execution_plan.max_planned_loss) }}</b></div>
-                    </div>
-                    <div v-if="it.detail.execution_plan?.preference_explanation?.length" class="execution-pref">
-                      <span v-for="(line, i) in it.detail.execution_plan.preference_explanation" :key="i">{{ line }}</span>
-                    </div>
-                    <div v-if="it.detail.execution_plan?.unavailable_reasons?.length" class="execution-reasons">
-                      {{ it.detail.execution_plan.unavailable_reasons.join('；') }}
-                    </div>
-                    <div v-if="!it.detail.execution_plan" class="execution-reasons">
-                      该批生成于执行计划版本上线前，保留原推荐与操作入口，但不标记为当前可执行。
-                    </div>
-                  </div>
-
-                  <!-- 信任徽章：量化分/排名 · 一手成本 · 证据核验 · 综合置信 · AI 复核 -->
-                  <TrustBadges
-                    v-if="it.detail"
-                    class="trust-mb"
-                    :quant-score="it.detail.quant_score"
-                    :quant-rank="it.detail.quant_rank"
-                    :pool-size="it.detail.pool_size"
-                    :lot-cost="it.detail.lot_cost || it.ref_price * 100"
-                    :evidence-check="it.detail.evidence_check"
-                    :sys-confidence="it.detail.sys_confidence"
-                    :sys-confidence-why="it.detail.sys_confidence_why"
-                    :review="it.detail.review"
-                  />
-
-                  <!-- 追踪状态（阶段6） -->
-                  <div v-if="it.status && it.status.outcome !== 'no_data'" class="track">
-                    <div class="track-head">
-                      <span
-                        class="track-outcome"
-                        :style="{
-                          color: outcomeColor(it.status.outcome),
-                          background: withAlpha(outcomeColor(it.status.outcome), 0.12),
-                        }"
-                        >{{ outcomeLabel(it.status.outcome) }}</span
-                      >
-                      <span v-if="it.status.review_needed" class="track-review" :style="{ color: downColor }"
-                        >建议复盘</span
-                      >
-                      <!-- 追踪价的归属日（last_eval_date）非今日=后端拿不到当日 fresh 行情、
-                           回退末根日线收盘——如实标「收盘价」而非「现价」。 -->
-                      <span class="track-updated">
-                        <template v-if="it.status.last_eval_date && it.status.last_eval_date < todayStr">
-                          {{ it.status.last_eval_date.slice(5) }} 收盘价 {{ fmt(it.status.current_price) }}
-                        </template>
-                        <template v-else>现价 {{ fmt(it.status.current_price) }}</template>
-                      </span>
-                    </div>
-                    <div class="track-grid">
-                      <div class="tk">
-                        <span class="tk-label">收益</span>
-                        <span class="tk-val" :style="{ color: pctColorOf(it.status.return_pct) }">{{
-                          signedPct(it.status.return_pct)
-                        }}</span>
-                      </div>
-                      <div v-if="it.status.actual_return_pct != null" class="tk">
-                        <span class="tk-label">实际收益（按你的买入价）</span>
-                        <span class="tk-val" :style="{ color: pctColorOf(it.status.actual_return_pct) }">{{
-                          signedPct(it.status.actual_return_pct)
-                        }}</span>
-                      </div>
-                      <div class="tk">
-                        <span class="tk-label">最大涨幅</span>
-                        <span class="tk-val" :style="{ color: upColor }">{{ signedPct(it.status.max_gain_pct) }}</span>
-                      </div>
-                      <div class="tk">
-                        <span class="tk-label">最大回撤</span>
-                        <span class="tk-val" :style="{ color: downColor }">-{{ it.status.max_drawdown_pct.toFixed(2) }}%</span>
-                      </div>
-                      <div class="tk">
-                        <span class="tk-label">超额(alpha)</span>
-                        <span class="tk-val" :style="{ color: pctColorOf(it.status.alpha_pct) }">{{
-                          signedPct(it.status.alpha_pct)
-                        }}</span>
-                      </div>
-                      <div v-if="current.type === 'short_term'" class="tk">
-                        <span class="tk-label">交易日</span>
-                        <span class="tk-val"
-                          >{{ it.status.elapsed_trade_days }}<template v-if="it.status.valid_days > 0">/{{ it.status.valid_days }}</template></span
-                        >
-                      </div>
-                    </div>
-                    <div v-if="it.status.note" class="track-note">{{ it.status.note }}</div>
-                  </div>
-
-                  <template v-if="it.detail">
-                    <!-- 短线关键价位 -->
-                    <div v-if="current.type === 'short_term'" class="levels">
-                      <div class="lv">
-                        <span class="lv-label">买入区间</span>
-                        <span class="lv-val">{{ fmt(it.detail.buy_zone_low) }} ~ {{ fmt(it.detail.buy_zone_high) }}</span>
-                      </div>
-                      <div class="lv">
-                        <span class="lv-label">止盈</span>
-                        <span class="lv-val" :style="{ color: upColor }">{{ fmt(it.detail.take_profit) }}</span>
-                      </div>
-                      <div class="lv">
-                        <span class="lv-label">止损</span>
-                        <span class="lv-val" :style="{ color: downColor }">{{ fmt(it.detail.stop_loss) }}</span>
-                      </div>
-                      <div class="lv">
-                        <span class="lv-label">有效期</span>
-                        <span class="lv-val">{{ it.detail.valid_days || '—' }} 交易日</span>
-                      </div>
-                      <div v-if="it.detail.position_pct" class="lv">
-                        <span class="lv-label">建议仓位</span>
-                        <n-tooltip trigger="hover" placement="top">
-                          <template #trigger>
-                            <span class="lv-val lv-help">{{ it.detail.position_pct.toFixed(1) }}%</span>
-                          </template>
-                          <div class="pos-tip">
-                            目标波动模型（程序计算，非 AI 输出）：{{ it.detail.position_why }}
-                          </div>
-                        </n-tooltip>
-                      </div>
-                    </div>
-                    <!-- 长线关键信息 -->
-                    <div v-else class="levels">
-                      <div class="lv">
-                        <span class="lv-label">估值区间</span>
-                        <span class="lv-val"
-                          >{{ fmt(it.detail.valuation_low) }} ~ {{ fmt(it.detail.valuation_high) }}</span
-                        >
-                      </div>
-                      <div class="lv">
-                        <span class="lv-label">复盘周期</span>
-                        <span class="lv-val">{{ it.detail.review_cycle || '—' }}</span>
-                      </div>
-                      <div v-if="it.detail.position_pct" class="lv">
-                        <span class="lv-label">建议仓位</span>
-                        <n-tooltip trigger="hover" placement="top">
-                          <template #trigger>
-                            <span class="lv-val lv-help">{{ it.detail.position_pct.toFixed(1) }}%</span>
-                          </template>
-                          <div class="pos-tip">
-                            目标波动模型（程序计算，非 AI 输出）：{{ it.detail.position_why }}
-                          </div>
-                        </n-tooltip>
-                      </div>
-                    </div>
-
-                    <p v-if="current.type === 'long_term' && it.detail.thesis" class="thesis">
-                      {{ it.detail.thesis }}
-                    </p>
-
-                    <n-collapse class="item-research">
-                      <n-collapse-item title="完整理由、证据与反方核验" name="research">
-                        <div v-if="it.detail.reason?.length" class="block">
-                          <div class="block-title">完整理由</div>
-                          <ul>
-                            <li v-for="(x, i) in it.detail.reason" :key="i">{{ x }}</li>
-                          </ul>
-                        </div>
-                        <div v-if="it.detail.risks?.length" class="block">
-                          <div class="block-title" :style="{ color: downColor }">完整风险</div>
-                          <ul>
-                            <li v-for="(x, i) in it.detail.risks" :key="i">{{ x }}</li>
-                          </ul>
-                        </div>
-                    <!-- S2-2 反方研究员（影子）：最强 bear case 只展示，不改写结论 -->
-                    <div v-if="it.detail.bear" class="block bear-block" :style="{ borderColor: withAlpha(bearSeverityColor(it.detail.bear.severity), 0.35) }">
-                      <div class="block-title bear-title">
-                        <span :style="{ color: bearSeverityColor(it.detail.bear.severity) }">反方论证</span>
-                        <n-tag size="tiny" :bordered="false" :color="{ color: withAlpha(bearSeverityColor(it.detail.bear.severity), 0.14), textColor: bearSeverityColor(it.detail.bear.severity) }">
-                          {{ bearSeverityLabel(it.detail.bear.severity) }}
-                        </n-tag>
-                        <span class="bear-shadow-note">影子：不改写结论{{ it.detail.bear.severity === 'high' && it.detail.action === 'buy' ? '（若转正将降为观察）' : '' }}</span>
-                      </div>
-                      <p class="bear-case">{{ it.detail.bear.bear_case }}</p>
-                    </div>
-                    <!-- S2-3 数据质量门控（影子）：缺失面与 would-be 封顶只读展示 -->
-                    <div v-if="it.detail.quality_gate" class="qg-note">
-                      <template v-if="it.detail.quality_gate.missing_critical_fields?.length">
-                        数据质量（影子）：缺失 {{ qgFieldLabels(it.detail.quality_gate.missing_critical_fields) }}，若门控转正置信度将封顶至
-                        {{ it.detail.quality_gate.would_be_confidence_cap }}（当前未封顶）。
-                      </template>
-                      <template v-if="it.detail.quality_gate.senti_missing">当日无相关新闻（情绪数据缺失，不代表情绪中性）。</template>
-                    </div>
-                    <div v-if="it.detail.evidence?.length" class="block">
-                      <div class="block-title">数据依据</div>
-                      <ul>
-                        <li v-for="(x, i) in it.detail.evidence" :key="i">{{ x }}</li>
-                      </ul>
-                    </div>
-                    <div v-if="current.type === 'long_term' && it.detail.key_metrics?.length" class="block">
-                      <div class="block-title">跟踪指标</div>
-                      <div class="metrics">
-                        <n-tag v-for="(m, i) in it.detail.key_metrics" :key="i" size="small" :bordered="false" round>{{ m }}</n-tag>
-                      </div>
-                    </div>
-                      </n-collapse-item>
-                    </n-collapse>
-                    <!-- S1-4 执行纪律三条（固定展示：截住「推荐胜率」与「用户执行」的偏差） -->
-                    <div v-if="current.type === 'short_term' && it.detail.buy_zone_high > 0" class="discipline">
-                      执行纪律：① 买入区间外不追（高于 {{ fmt(it.detail.buy_zone_high) }} 放弃本次机会）；②
-                      止损价一键挂提醒，触达坚决执行；③ T+1 首日不满仓（建议首日 ≤ 建议仓位的一半）。
-                    </div>
-                    <p class="disclaimer">{{ it.detail.disclaimer }}</p>
-                  </template>
-
-                  <div class="card-actions">
-                    <n-button
-                      v-if="current.type === 'short_term' && it.detail && it.detail.stop_loss > 0"
-                      size="small"
-                      tertiary
-                      :loading="stopAlerting[it.id]"
-                      @click="addStopAlert(it)"
-                      >挂止损提醒</n-button
-                    >
-                    <n-button
-                      v-if="!it.position && it.detail?.execution_plan && executionStatus(it) === 'ready'"
-                      size="small"
-                      type="primary"
-                      ghost
-                      @click="buildPosition(it)"
-                    >一键建仓</n-button>
-                    <n-button v-else-if="!it.position" size="small" disabled>条件未满足</n-button>
-                    <n-button v-else size="small" tertiary @click="router.push({ name: 'positions' })">查看持仓</n-button>
-                  </div>
-                </div>
-                  <n-button
-                    v-if="itemIndex === 2 && readyItems.length > 3 && !showAllReady"
-                    class="show-more-ready"
-                    size="small"
-                    tertiary
-                    @click="showAllReady = true"
-                  >展开其余 {{ readyItems.length - 3 }} 条可执行项</n-button>
-                </template>
-              </div>
-
-              <!-- 候选池全景：每只股为什么进、为什么被筛掉、量化分排第几，全透明 -->
-              <n-collapse v-if="poolList.length" v-model:value="resultSections" class="rejected">
-                <n-collapse-item
-                  :title="`候选池全景（参与排名 ${poolRanked.length} 只 · 被筛掉 ${poolExcluded.length} 只）`"
-                  name="pool"
-                >
-                  <div class="pool-scroll">
-                    <table class="pool-table">
-                      <thead>
-                        <tr>
-                          <th>#</th>
-                          <th>名称</th>
-                          <th>现价</th>
-                          <th>涨跌%</th>
-                          <th>换手%</th>
-                          <th>量比</th>
-                          <th>流通市值(亿)</th>
-                          <th>量化分</th>
-                          <th>来源</th>
-                          <th>状态</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <tr v-for="c in poolRanked" :key="c.symbol">
-                          <td class="qv-tnum">{{ c.rank || '—' }}</td>
-                          <td>
-                            <StockIdentity :symbol="c.symbol" :market="c.market || 'cn'" :name="c.name" density="table" clickable />
-                          </td>
-                          <td class="qv-tnum">{{ c.price.toFixed(2) }}</td>
-                          <td class="qv-tnum" :style="{ color: pctColorOf(c.change_pct) }">{{ signedPct(c.change_pct) }}</td>
-                          <td class="qv-tnum">{{ c.turnover_rate ? c.turnover_rate.toFixed(1) : '—' }}</td>
-                          <td class="qv-tnum">{{ c.volume_ratio ? c.volume_ratio.toFixed(1) : '—' }}</td>
-                          <td class="qv-tnum">{{ fmtCapYi(c.float_cap) }}</td>
-                          <td class="qv-tnum pool-score" :title="(c.bonus || []).join('；') || '无策略加分项'">
-                            {{ c.score ? c.score.toFixed(1) : '—' }}
-                          </td>
-                          <td>{{ sourceText(c) }}</td>
-                          <td>
-                            <n-tag v-if="c.sent_to_llm" size="tiny" type="primary" :bordered="false" round>AI 名单</n-tag>
-                            <span v-else class="pool-dim">已评分</span>
-                          </td>
-                        </tr>
-                        <tr v-for="c in poolExcluded" :key="'x-' + c.symbol" class="pool-excluded">
-                          <td>—</td>
-                          <td>
-                            <StockIdentity :symbol="c.symbol" :market="c.market || 'cn'" :name="c.name" density="table" clickable />
-                          </td>
-                          <td class="qv-tnum">{{ c.price.toFixed(2) }}</td>
-                          <td class="qv-tnum">{{ signedPct(c.change_pct) }}</td>
-                          <td class="qv-tnum">{{ c.turnover_rate ? c.turnover_rate.toFixed(1) : '—' }}</td>
-                          <td class="qv-tnum">{{ c.volume_ratio ? c.volume_ratio.toFixed(1) : '—' }}</td>
-                          <td class="qv-tnum">{{ fmtCapYi(c.float_cap) }}</td>
-                          <td>—</td>
-                          <td>{{ sourceText(c) }}</td>
-                          <td class="pool-reason">{{ c.excluded }}</td>
-                        </tr>
-                      </tbody>
-                    </table>
-                  </div>
-                  <div class="pool-note">
-                    来源=进池原因（自选/涨幅榜/成交额榜/换手率榜/回调榜/低PB榜/策略信号[全市场因子扫描命中]，随策略组合、可叠加）；量化分=五维技术评分+策略加分（0-100，悬停查看加分明细，仅排序参考不代表预期收益）；「AI
-                    名单」=量化排序 Top16 交给 AI 精选，其余仅参与排名对照。
-                    <template v-if="poolOmitted > 0">另有 {{ poolOmitted }} 只被筛掉的标的未展示（快照容量保护）。</template>
-                  </div>
-                </n-collapse-item>
-              </n-collapse>
-
-              <!-- 为什么没选它：池内落选标的的一句话理由（复盘筛选逻辑用） -->
-              <n-collapse v-if="rejectedList.length" v-model:value="resultSections" class="rejected">
-                <n-collapse-item :title="`为什么没选它（${rejectedList.length}）`" name="rejected">
-                  <div v-for="(r, i) in rejectedList" :key="i" class="rej-row">
-                    <StockIdentity :symbol="r.symbol" market="cn" :name="r.name" density="table" clickable />
-                    <span class="rej-reason">{{ r.reason }}</span>
-                  </div>
-                </n-collapse-item>
-              </n-collapse>
-            </div>
-          </n-spin>
-        </SectionCard>
-      </div>
-    </div>
-
-    <!-- S0-6 确定性错误归因报表：成熟标签按维度分组的胜率/中位/尾部亏损 -->
-    <n-modal v-model:show="showAttribution" preset="card" title="错误归因报表" class="attr-modal" :style="{ maxWidth: '860px', width: 'calc(100vw - 32px)' }">
-      <div class="attr-toolbar">
-        <n-select v-model:value="attrHorizon" :options="attrHorizonOptions" size="small" style="width: 140px" />
-        <span class="attr-meta" v-if="attrReport"
-          >成熟样本 {{ attrReport.sample }}（买入 {{ attrReport.sample_buy }}） · 未成熟 {{ attrReport.pending }} · 无法成交 {{ attrReport.skipped }}</span
-        >
-      </div>
-      <n-spin :show="attrLoading">
-        <n-empty v-if="attrReport && attrReport.sample === 0" description="暂无成熟样本：标签自本批功能上线起积累，需等推荐走完持有期" />
-        <div v-else-if="attrReport" class="attr-body">
-          <div v-for="d in attrDims" :key="d.dim" class="attr-dim">
-            <div class="attr-dim-title">{{ d.label }}</div>
-            <div class="pool-scroll">
-              <table class="pool-table attr-table">
-                <thead>
-                  <tr>
-                    <th>分组</th>
-                    <th>样本</th>
-                    <th>胜率(净)</th>
-                    <th>净收益均值</th>
-                    <th>中位</th>
-                    <th>P10(尾部)</th>
-                    <th>严重亏损&lt;-5%</th>
-                    <th>均alpha</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="c in d.cells" :key="c.key" :class="{ 'attr-thin': c.sample < 5 }">
-                    <td>{{ c.key }}<span v-if="c.sample < 5" class="pool-dim">（样本不足）</span></td>
-                    <td class="qv-tnum">{{ c.sample }}</td>
-                    <td class="qv-tnum">{{ c.win_rate.toFixed(0) }}%</td>
-                    <td class="qv-tnum" :style="{ color: pctColorOf(c.avg_net_pct) }">{{ signedPct(c.avg_net_pct) }}</td>
-                    <td class="qv-tnum" :style="{ color: pctColorOf(c.median_net_pct) }">{{ signedPct(c.median_net_pct) }}</td>
-                    <td class="qv-tnum" :style="{ color: pctColorOf(c.p10_net_pct) }">{{ signedPct(c.p10_net_pct) }}</td>
-                    <td class="qv-tnum">{{ c.severe_loss_pct.toFixed(0) }}%</td>
-                    <td class="qv-tnum" :style="{ color: pctColorOf(c.avg_alpha_pct) }">
-                      {{ c.alpha_sample > 0 ? signedPct(c.avg_alpha_pct) : '—' }}
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-          <div class="pool-note">
-            <div v-for="(n, i) in attrReport.notes" :key="i">{{ n }}</div>
-          </div>
-        </div>
-      </n-spin>
-    </n-modal>
-
-    <!-- S2-4 影子门控对照：gated vs ungated 成熟收益分布 + 覆盖率（门控转正评审的数据地基） -->
-    <n-modal v-model:show="showShadow" preset="card" title="影子门控对照报表" class="attr-modal" :style="{ maxWidth: '860px', width: 'calc(100vw - 32px)' }">
-      <div class="attr-toolbar">
-        <n-select v-model:value="shadowHorizon" :options="attrHorizonOptions" size="small" style="width: 140px" />
-        <span class="attr-meta" v-if="shadowReport"
-          >入选 buy {{ shadowReport.picked_buy }} · 已成熟 {{ shadowReport.picked_buy_matured }}</span
-        >
-      </div>
-      <n-spin :show="shadowLoading">
-        <n-empty
-          v-if="shadowReport && !shadowReport.groups?.length"
-          description="暂无门控标记样本：影子事件自第一批功能上线起积累（防守档/反方高危/数据缺失场景才会产生标记）"
+  <PageContainer title="AI 推荐工作台" subtitle="今天能研究什么、任务为什么这样运行、历史结果后来怎样">
+    <template #actions><DisplayModeSwitch /></template>
+    <div class="workspace">
+      <div class="main-column">
+        <RecommendationResultsWorkspace
+          v-model:sections="resultSections"
+          :current="current"
+          :discovery="discovery"
+          :loading="running"
+          :tracking="tracking"
+          :stop-alerting="stopAlerting"
+          @refresh-tracking="refreshTracking"
+          @stop-alert="addStopAlert"
         />
-        <div v-else-if="shadowReport" class="attr-body">
-          <div v-for="g in shadowReport.groups" :key="g.gate_type" class="attr-dim">
-            <div class="attr-dim-title">
-              {{ g.gate_label }}
-              <span class="shadow-cover">标记 {{ g.marked }} · 若强制损失 buy {{ g.would_rewrite }} / {{ shadowReport.picked_buy }}</span>
-            </div>
-            <div class="pool-scroll">
-              <table class="pool-table attr-table">
-                <thead>
-                  <tr>
-                    <th>组</th>
-                    <th>成熟样本</th>
-                    <th>胜率(净)</th>
-                    <th>净收益均值</th>
-                    <th>中位</th>
-                    <th>P10(尾部)</th>
-                    <th>严重亏损&lt;-5%</th>
-                    <th>均alpha</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="c in [g.gated, g.ungated]" :key="c.key" :class="{ 'attr-thin': c.sample < 5 }">
-                    <td>
-                      {{ c.key === 'gated' ? '被门控标记' : '未标记入选（对照）' }}
-                      <span v-if="c.sample < 5" class="pool-dim">（样本不足）</span>
-                    </td>
-                    <td class="qv-tnum">{{ c.sample }}</td>
-                    <td class="qv-tnum">{{ c.win_rate.toFixed(0) }}%</td>
-                    <td class="qv-tnum" :style="{ color: pctColorOf(c.avg_net_pct) }">{{ signedPct(c.avg_net_pct) }}</td>
-                    <td class="qv-tnum" :style="{ color: pctColorOf(c.median_net_pct) }">{{ signedPct(c.median_net_pct) }}</td>
-                    <td class="qv-tnum" :style="{ color: pctColorOf(c.p10_net_pct) }">{{ signedPct(c.p10_net_pct) }}</td>
-                    <td class="qv-tnum">{{ c.severe_loss_pct.toFixed(0) }}%</td>
-                    <td class="qv-tnum" :style="{ color: pctColorOf(c.avg_alpha_pct) }">
-                      {{ c.alpha_sample > 0 ? signedPct(c.avg_alpha_pct) : '—' }}
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-          <div class="pool-note">
-            <div v-for="(n, i) in shadowReport.notes" :key="i">{{ n }}</div>
-          </div>
-        </div>
-      </n-spin>
-    </n-modal>
-
-    <!-- S3-2 候选池召回评估：Recall@K / 来源消融 / 错失机会率 / 机会集 vs 池收益分布 -->
-    <n-modal v-model:show="showRecall" preset="card" title="候选召回与每日复盘" class="attr-modal" :style="{ maxWidth: '980px', width: 'calc(100vw - 24px)' }">
-      <div class="attr-toolbar">
-        <n-select v-model:value="recallHorizon" :options="recallHorizonOptions" size="small" style="width: 120px" />
-        <n-select v-model:value="recallK" :options="recallKOptions" size="small" style="width: 110px" />
-        <span class="attr-meta" v-if="recallReport">评估 {{ recallReport.batches }} 个批次 · 耗时 {{ recallReport.elapsed_ms }}ms</span>
+        <RecommendationHistoryTracking
+          :history="history"
+          :current-i-d="current?.id"
+          :history-loading="historyLoading"
+          :reviews="reviews"
+          :reviews-loading="reviewsLoading"
+          :reviews-error="reviewsError"
+          :review-acking="reviewAcking"
+          :performance="performance"
+          @open="openBatch"
+          @remove="removeBatch"
+          @refresh-history="loadHistory"
+          @refresh-reviews="loadReviews"
+          @ack-review="ackReview"
+          @audit="auditMode = $event"
+        />
       </div>
-      <n-spin :show="recallLoading">
-        <n-empty v-if="!recallLoading && !recallReport && !dailyAudit" description="暂无可评估的召回或日审计事实" />
-        <n-alert v-if="recallError && dailyAudit" type="warning" :show-icon="false" :bordered="false" class="audit-alert">
-          长周期召回暂不可用：{{ recallError }}。每日复盘仍可查看。
-        </n-alert>
-        <div v-if="recallReport" class="attr-body">
-          <div class="attr-dim">
-            <div class="attr-dim-title">Recall@{{ recallReport.k }}（未来 {{ recallReport.horizon_days }} 日全市场 Top-{{ recallReport.k }} 净收益股）</div>
-            <div class="pool-scroll">
-              <table class="pool-table attr-table">
-                <thead>
-                  <tr><th>进过候选池</th><th>进过 LLM 名单</th><th>被最终入选</th><th>错失机会率</th><th>错失影子收益（已成熟）</th></tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td class="qv-tnum">{{ recallReport.recall_pool_pct.toFixed(1) }}%</td>
-                    <td class="qv-tnum">{{ recallReport.recall_llm_pct.toFixed(1) }}%</td>
-                    <td class="qv-tnum">{{ recallReport.recall_picked_pct.toFixed(1) }}%</td>
-                    <td class="qv-tnum">{{ recallReport.missed_rate_pct.toFixed(1) }}%</td>
-                    <td class="qv-tnum">
-                      <template v-if="recallReport.missed_labels">
-                        均值 <span :style="{ color: pctColorOf(recallReport.missed_labels.mean_pct) }">{{ signedPct(recallReport.missed_labels.mean_pct) }}</span>
-                        （{{ recallReport.missed_labels.n }} 条）
-                      </template>
-                      <template v-else>—</template>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-            <div class="recall-stages" v-if="recallStages.length">
-              <n-tag v-for="s in recallStages" :key="s.key" size="small" :bordered="false" round>
-                {{ s.label }} {{ s.count }}
-              </n-tag>
-            </div>
-          </div>
-          <div class="attr-dim" v-if="recallReport.source_ablation?.length">
-            <div class="attr-dim-title">来源消融（去掉该路来源后池召回掉多少）</div>
-            <div class="pool-scroll">
-              <table class="pool-table attr-table">
-                <thead>
-                  <tr><th>来源</th><th>池内候选数</th><th>基线召回</th><th>去掉后</th><th>召回损失</th></tr>
-                </thead>
-                <tbody>
-                  <tr v-for="a in recallReport.source_ablation" :key="a.source">
-                    <td>{{ a.label }}</td>
-                    <td class="qv-tnum">{{ a.pool_count }}</td>
-                    <td class="qv-tnum">{{ a.recall_pct.toFixed(1) }}%</td>
-                    <td class="qv-tnum">{{ a.ablated_pct.toFixed(1) }}%</td>
-                    <td class="qv-tnum" :style="{ color: a.drop_pct > 0 ? downColor : undefined }">−{{ a.drop_pct.toFixed(1) }}pt</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-          <div class="attr-dim">
-            <div class="attr-dim-title">净收益分布：全市场机会集 vs 候选池</div>
-            <div class="pool-scroll">
-              <table class="pool-table attr-table">
-                <thead>
-                  <tr><th>组</th><th>样本</th><th>均值</th><th>中位</th><th>P10</th><th>P90</th></tr>
-                </thead>
-                <tbody>
-                  <tr v-for="row in [{ label: '机会集（可交易+流动性达标）', d: recallReport.opp_dist }, { label: '候选池', d: recallReport.pool_dist }]" :key="row.label">
-                    <td>{{ row.label }}</td>
-                    <td class="qv-tnum">{{ row.d.n }}</td>
-                    <td class="qv-tnum" :style="{ color: pctColorOf(row.d.mean_pct) }">{{ signedPct(row.d.mean_pct) }}</td>
-                    <td class="qv-tnum" :style="{ color: pctColorOf(row.d.median_pct) }">{{ signedPct(row.d.median_pct) }}</td>
-                    <td class="qv-tnum" :style="{ color: pctColorOf(row.d.p10_pct) }">{{ signedPct(row.d.p10_pct) }}</td>
-                    <td class="qv-tnum" :style="{ color: pctColorOf(row.d.p90_pct) }">{{ signedPct(row.d.p90_pct) }}</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-          <div class="attr-dim" v-if="recallReport.batch_rows?.length">
-            <div class="attr-dim-title">批次明细</div>
-            <div class="pool-scroll">
-              <table class="pool-table attr-table">
-                <thead>
-                  <tr><th>批次</th><th>信号日</th><th>机会集</th><th>池</th><th>K</th><th>进池</th><th>进名单</th><th>入选</th></tr>
-                </thead>
-                <tbody>
-                  <tr v-for="r in recallReport.batch_rows" :key="r.batch_id">
-                    <td class="qv-tnum">#{{ r.batch_id }}</td>
-                    <td>{{ r.signal_date }}</td>
-                    <td class="qv-tnum">{{ r.opp_size }}</td>
-                    <td class="qv-tnum">{{ r.pool_size }}</td>
-                    <td class="qv-tnum">{{ r.k_eff }}</td>
-                    <td class="qv-tnum">{{ r.hit_pool }}</td>
-                    <td class="qv-tnum">{{ r.hit_llm }}</td>
-                    <td class="qv-tnum">{{ r.hit_picked }}</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-          <div class="pool-note">
-            <div v-for="(n, i) in recallReport.notes" :key="i">{{ n }}</div>
-          </div>
-        </div>
-
-        <div v-if="dailyAudit" class="audit-body">
-          <div class="audit-heading">
-            <div>
-              <div class="attr-dim-title">每日漏选 / 误选复盘</div>
-              <div class="attr-meta">{{ dailyAudit.audit_version }} · 结果 {{ dailyAudit.outcome_version }} · 截至 {{ dailyAudit.generated_at }}</div>
-            </div>
-            <n-tag size="small" :type="dailyAudit.outcome.evaluated ? 'success' : 'warning'" :bordered="false">
-              {{ dailyAudit.outcome.evaluated ? '已评估' : '样本不足 · 未评估' }}
-            </n-tag>
-          </div>
-
-          <div v-if="dailyAudit.runs?.length" class="audit-days">
-            <div v-for="run in dailyAudit.runs" :key="run.id" class="audit-day">
-              <div class="audit-day-date">{{ run.signal_date }} → {{ run.outcome_date }}</div>
-              <div class="audit-day-metrics qv-tnum">
-                强势机会 {{ run.opportunity_count }} · 漏选 {{ run.missed_count }} · {{ form.type === 'long_term' ? '早期不利' : '误选' }} {{ run.adverse_count }}
-              </div>
-              <n-tag v-if="run.status === 'partial'" size="tiny" type="warning" :bordered="false">覆盖不完整</n-tag>
-            </div>
-          </div>
-          <n-empty v-else description="尚无属于当前用户的日审计批次" size="small" />
-
-          <div class="audit-summary" v-if="dailyAudit.outcome.samples || dailyAudit.outcome.no_data || dailyAudit.outcome.forced">
-            <span>可执行观测 <b class="qv-tnum">{{ dailyAudit.outcome.samples }}</b></span>
-            <span>结果日 <b class="qv-tnum">{{ dailyAudit.outcome.outcome_days }}</b></span>
-            <span>平均净收益 <b class="qv-tnum" :style="{ color: pctColorOf(dailyAudit.outcome.avg_net_pct) }">{{ signedPct(dailyAudit.outcome.avg_net_pct) }}</b></span>
-            <span><TermHelp term="alpha" /> <b v-if="dailyAudit.outcome.has_alpha" class="qv-tnum" :style="{ color: pctColorOf(dailyAudit.outcome.avg_alpha_pct) }">{{ signedPct(dailyAudit.outcome.avg_alpha_pct) }}</b><b v-else>—</b></span>
-            <span>无数据 {{ dailyAudit.outcome.no_data }} · forced {{ dailyAudit.outcome.forced }} · 长期 pending {{ dailyAudit.outcome.pending }}</span>
-          </div>
-
-          <div class="attr-dim" v-if="dailyAudit.funnel?.length">
-            <div class="attr-dim-title">漏斗主原因</div>
-            <div class="audit-funnel">
-              <n-tag v-for="row in dailyAudit.funnel" :key="`${row.stage}-${row.reason_code}`" size="small" :bordered="false">
-                {{ RECALL_STAGE_LABEL[row.stage] || row.stage }} · {{ auditReasonLabel(row.reason_code) }} · {{ row.count }}
-              </n-tag>
-            </div>
-          </div>
-
-          <div class="audit-rate-grid">
-            <div class="audit-rate" v-if="dailyAudit.source_recall?.length">
-              <div class="attr-dim-title">来源漏选率</div>
-              <div v-for="row in dailyAudit.source_recall" :key="row.key" class="audit-rate-row">
-                <span>{{ row.label }}</span>
-                <span class="qv-tnum">{{ row.missed }}/{{ row.total }} · {{ row.evaluated ? `${row.missed_pct.toFixed(1)}%` : '未评估' }}</span>
-              </div>
-            </div>
-            <div class="audit-rate" v-if="dailyAudit.channel_recall?.length">
-              <div class="attr-dim-title">发现通道漏选率</div>
-              <div v-for="row in dailyAudit.channel_recall" :key="row.key" class="audit-rate-row">
-                <span>{{ row.label }}</span>
-                <span class="qv-tnum">{{ row.missed }}/{{ row.total }} · {{ row.evaluated ? `${row.missed_pct.toFixed(1)}%` : '未评估' }}</span>
-              </div>
-            </div>
-          </div>
-
-          <div class="attr-dim" v-if="dailyAudit.items?.length">
-            <div class="attr-dim-title">昨日事实下钻</div>
-            <div class="audit-items">
-              <div v-for="item in dailyAudit.items" :key="item.id" class="audit-item">
-                <div class="audit-item-main">
-                  <StockIdentity :symbol="item.symbol" market="cn" :name="item.name" density="table" clickable />
-                  <n-tag size="tiny" :type="item.audit_type === 'missed_leader' ? 'warning' : 'error'" :bordered="false">
-                    {{ auditConclusionLabel(item.conclusion_code) }}
-                  </n-tag>
-                  <span class="qv-tnum" :style="{ color: pctColorOf(item.net_return_pct) }">净 {{ signedPct(item.net_return_pct) }}</span>
-                  <span class="qv-tnum"><TermHelp term="mfe" /> {{ signedPct(item.mfe_pct) }} · <TermHelp term="mae" /> {{ signedPct(item.mae_pct) }}</span>
-                </div>
-                <div class="audit-item-facts">
-                  <span>{{ item.signal_date }} → {{ item.outcome_date }}</span>
-                  <span>批次 #{{ item.batch_id }}</span>
-                  <span>阶段 {{ RECALL_STAGE_LABEL[item.funnel_stage] || item.funnel_stage }}</span>
-                  <span>主因 {{ auditReasonLabel(item.primary_reason_code) }}</span>
-                  <span v-if="item.opportunity_rank">机会排名 #{{ item.opportunity_rank }}</span>
-                  <span v-if="item.score_rank">量化排名 #{{ item.score_rank }}</span>
-                  <span v-if="item.source_set">来源 {{ item.source_set }}</span>
-                  <span v-if="item.channel_set">通道 {{ item.channel_set }}</span>
-                </div>
-              </div>
-            </div>
-          </div>
-          <div class="pool-note">
-            <div v-for="(n, i) in dailyAudit.notes || []" :key="i">{{ n }}</div>
-          </div>
-        </div>
-      </n-spin>
-    </n-modal>
-    <InvestmentPreferenceGuide
-      v-model="showInvestmentGuide"
-      :preference="pref"
-      @updated="applyGuidePreference"
-    />
+      <aside class="side-column">
+        <RecommendationGenerator
+          v-model:form="form"
+          v-model:filters="filters"
+          v-model:price-preset="pricePreset"
+          v-model:cap-preset="capPreset"
+          :pref="pref"
+          :strategy-options="strategyOptions"
+          :market-options="marketOptions"
+          :price-preset-options="pricePresetOptions"
+          :cap-preset-options="capPresetOptions"
+          :llm-options="llmOptions"
+          :llm-configured="!!llmConfigs.length"
+          :running="running"
+          :saving-filters="savingFilters"
+          @generate="generate"
+          @save-filters="saveFiltersDefault"
+          @preferences="showInvestmentGuide = true"
+          @onboarding="router.push({ query: { ...route.query, onboarding: '1' } })"
+        />
+        <AiTaskStatusPanel
+          :task="task"
+          :loading="taskLoading"
+          :action-loading="taskActionLoading"
+          :error="taskError"
+          @refresh="refreshTask"
+          @cancel="cancelCurrentTask"
+          @retry="retryCurrentTask"
+          @audit="openTaskAudit"
+        />
+      </aside>
+    </div>
+    <RecommendationResearchAudit v-model="auditMode" :type="form.type" />
+    <InvestmentPreferenceGuide v-model="showInvestmentGuide" :preference="pref" @updated="applyGuidePreference" />
   </PageContainer>
 </template>
 
 <style scoped>
-.rec {
+.workspace {
   display: grid;
-  grid-template-columns: 340px 1fr;
-  gap: 16px;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 380px);
   align-items: start;
-}
-@media (max-width: 900px) {
-  .rec {
-    grid-template-columns: 1fr;
-  }
-}
-.col-form,
-.col-result {
-  display: flex;
-  flex-direction: column;
   gap: 16px;
-  min-width: 0;
 }
-/* 整页滚动下左栏固定：长结果滚动时生成表单与历史始终可见，历史在栏内滚动 */
-.col-form {
+.main-column,
+.side-column {
+  display: grid;
+  min-width: 0;
+  gap: 16px;
+}
+.side-column {
   position: sticky;
   top: 76px;
-  max-height: calc(100vh - 100px);
-  overflow-y: auto;
-  padding: 4px;
-  margin: -4px;
 }
-@media (max-width: 900px) {
-  .col-form {
-    position: static;
-    max-height: none;
-    overflow: visible;
-  }
-}
-.form {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-.pref-entry {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 10px;
-  font-size: 12px;
-  opacity: 0.75;
-}
-.hint {
-  font-size: 12px;
-  opacity: 0.55;
-  margin-top: 8px;
-  line-height: 1.5;
-}
-/* 筛选条件区 */
-.filters {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  width: 100%;
-}
-.filters-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.filters-sep {
-  opacity: 0.5;
-  flex-shrink: 0;
-}
-.filters-switch {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  font-size: 12px;
-  opacity: 0.85;
-}
-.filters-hint {
-  font-size: 12px;
-  opacity: 0.55;
-  line-height: 1.4;
-}
-.verify-hint {
-  font-size: 12px;
-  opacity: 0.6;
-  line-height: 1.4;
-}
-/* 本次筛选回显 */
-.applied-filters {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  margin-bottom: 12px;
-}
-.af-label {
-  font-size: 12px;
-  opacity: 0.55;
-}
-/* 信任徽章 */
-.trust-mb {
-  margin-bottom: 12px;
-}
-/* 候选池全景 */
-.pool-scroll {
-  overflow-x: auto;
-}
-.pool-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12px;
-  min-width: 720px;
-}
-.pool-table th {
-  text-align: left;
-  font-weight: 600;
-  opacity: 0.6;
-  padding: 6px 8px;
-  border-bottom: 1px solid var(--qv-divider);
-  white-space: nowrap;
-}
-.pool-table td {
-  padding: 6px 8px;
-  border-bottom: 1px dashed var(--qv-divider);
-  white-space: nowrap;
-}
-.pool-name {
-  font-weight: 500;
-}
-.pool-symbol {
-  font-size: 11px;
-  opacity: 0.5;
-  margin-left: 4px;
-}
-.pool-score {
-  font-weight: 600;
-  cursor: help;
-}
-.pool-dim {
-  opacity: 0.45;
-  font-size: 11px;
-}
-.pool-excluded td {
-  opacity: 0.5;
-}
-.pool-reason {
-  font-size: 11px;
-  white-space: normal;
-  min-width: 160px;
-}
-.pool-note {
-  font-size: 11px;
-  opacity: 0.5;
-  line-height: 1.6;
-  margin-top: 8px;
-}
-/* 历史 */
-.hist {
-  display: flex;
-  flex-direction: column;
-}
-.hist-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 6px;
-  border-bottom: 1px solid var(--qv-divider);
-  cursor: pointer;
-  border-radius: 6px;
-}
-.hist-item:last-child {
-  border-bottom: none;
-}
-.hist-item:hover,
-.hist-item.active {
-  background: v-bind('withAlpha(vars.primaryColor, 0.08)');
-}
-.hist-main {
-  flex: 1;
-  min-width: 0;
-}
-.hist-title {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.hist-name {
-  font-size: 13px;
-  font-weight: 500;
-}
-.hist-sub {
-  font-size: 11px;
-  opacity: 0.5;
-  margin-top: 2px;
-}
-.hist-side {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-shrink: 0;
-}
-/* 结果头 */
-.res-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 14px;
-  flex-wrap: wrap;
-}
-.res-strategy {
-  font-size: 16px;
-  font-weight: 600;
-}
-.res-meta {
-  font-size: 12px;
-  opacity: 0.5;
-}
-.discovery-status {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 10px 0 12px;
-  margin-bottom: 12px;
-  border-bottom: 1px solid var(--qv-divider);
-}
-.discovery-status-main,
-.discovery-channels,
-.discovery-memory-head,
-.discovery-memory-days {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.discovery-status-main > span:first-child,
-.discovery-memory-head > span:first-child {
-  font-weight: 600;
-}
-.discovery-status-meta,
-.discovery-channels,
-.discovery-memory-days {
-  font-size: 12px;
-  opacity: 0.68;
-}
-.discovery-channels span,
-.discovery-memory-days span {
-  padding-right: 8px;
-  border-right: 1px solid var(--qv-divider);
-}
-.discovery-gap {
-  color: v-bind('vars.warningColor');
-  font-size: 12px;
-  overflow-wrap: anywhere;
-}
-.discovery-memory {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 10px 0;
-  margin-bottom: 12px;
-  border-top: 1px solid var(--qv-divider);
-  border-bottom: 1px solid var(--qv-divider);
-  font-size: 12px;
-}
-/* 卡片 */
-.cards {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-.execution-group-head {
-  padding: 2px 2px 0;
-  font-size: 14px;
-  font-weight: 700;
-}
-.show-more-ready {
-  align-self: flex-start;
-}
-.card {
-  border: 1px solid var(--qv-divider);
-  border-radius: 8px;
-  padding: 16px;
-}
-.card-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-.card-title {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-}
-.ct-name {
-  font-size: 16px;
-  font-weight: 600;
-}
-.ct-symbol {
-  font-size: 12px;
-  opacity: 0.5;
-}
-.ct-link {
-  cursor: pointer;
-}
-.ct-link:hover {
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
-.card-badges {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.action-badge {
-  font-size: 13px;
-  font-weight: 700;
-  padding: 2px 10px;
-  border-radius: 20px;
-}
-.confidence {
-  font-size: 12px;
-  opacity: 0.6;
-}
-.card-sub {
-  font-size: 12px;
-  opacity: 0.7;
-  margin: 6px 0 12px;
-}
-.execution-summary {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 12px;
-  margin-bottom: 12px;
-  border: 1px solid var(--qv-divider);
-  border-left: 3px solid v-bind('vars.warningColor');
-  border-radius: 8px;
-  background: v-bind('withAlpha(vars.warningColor, 0.035)');
-}
-.execution-summary[data-status='ready'] {
-  border-left-color: v-bind('vars.successColor');
-  background: v-bind('withAlpha(vars.successColor, 0.035)');
-}
-.execution-summary[data-status='not_suitable'] {
-  border-left-color: v-bind('vars.textColor3');
-  background: v-bind('withAlpha(vars.textColor3, 0.025)');
-}
-.execution-summary-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.execution-asof {
-  font-size: 11px;
-  opacity: 0.55;
-}
-.execution-row {
-  display: grid;
-  grid-template-columns: 70px minmax(0, 1fr);
-  gap: 8px;
-  font-size: 12px;
-  line-height: 1.5;
-}
-.execution-row > span,
-.execution-money span {
-  opacity: 0.55;
-}
-.execution-row > b {
-  font-weight: 500;
-}
-.risk-row > b {
-  color: v-bind('vars.errorColor');
-}
-.execution-money {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(110px, 1fr));
-  gap: 8px;
-}
-.execution-money > div {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-  font-size: 12px;
-}
-.execution-money b {
-  font-size: 14px;
-}
-.execution-pref {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  font-size: 11px;
-  opacity: 0.65;
-}
-.execution-reasons {
-  font-size: 12px;
-  line-height: 1.5;
-  color: v-bind('vars.warningColor');
-}
-.item-research {
-  margin: 4px 0 8px;
-}
-/* 追踪状态 */
-.track {
-  border: 1px solid var(--qv-divider);
-  border-radius: 8px;
-  padding: 10px 12px;
-  margin-bottom: 12px;
-  background: v-bind('withAlpha(vars.primaryColor, 0.04)');
-}
-.track-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin-bottom: 8px;
-}
-.track-outcome {
-  font-size: 12px;
-  font-weight: 700;
-  padding: 2px 10px;
-  border-radius: 20px;
-}
-.track-review {
-  font-size: 12px;
-  font-weight: 600;
-}
-.track-updated {
-  font-size: 12px;
-  opacity: 0.6;
-  margin-left: auto;
-}
-.track-grid {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 16px;
-}
-.tk {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.tk-label {
-  font-size: 11px;
-  opacity: 0.55;
-}
-.tk-val {
-  font-size: 14px;
-  font-weight: 600;
-}
-.track-note {
-  font-size: 11px;
-  opacity: 0.55;
-  margin-top: 8px;
-}
-/* 历史表现 */
-.perf {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.perf-n {
-  font-size: 12px;
-  opacity: 0.6;
-}
-.perf-row {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-}
-.perf-label {
-  font-size: 12px;
-  opacity: 0.6;
-}
-.perf-val {
-  font-size: 15px;
-  font-weight: 600;
-}
-.perf-sub {
-  font-size: 11px;
-  opacity: 0.5;
-  font-weight: 400;
-}
-.perf-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 2px;
-}
-.perf-note {
-  font-size: 11px;
-  opacity: 0.5;
-  line-height: 1.5;
-}
-.res-track {
-  margin-left: auto;
-}
-.levels {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 18px;
-  padding: 10px 12px;
-  border-radius: 8px;
-  background: v-bind('withAlpha(vars.primaryColor, 0.05)');
-  margin-bottom: 12px;
-}
-.lv {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.lv-label {
-  font-size: 11px;
-  opacity: 0.55;
-}
-.lv-val {
-  font-size: 14px;
-  font-weight: 600;
-}
-.thesis {
-  font-size: 13px;
-  line-height: 1.6;
-  margin: 0 0 12px;
-}
-.block {
-  margin-bottom: 10px;
-}
-.block-title {
-  font-size: 12px;
-  font-weight: 600;
-  margin-bottom: 4px;
-  opacity: 0.85;
-}
-.block ul {
-  margin: 0;
-  padding-left: 18px;
-}
-.block li {
-  font-size: 13px;
-  line-height: 1.6;
-  opacity: 0.9;
-}
-.metrics {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.invalid {
-  font-size: 12px;
-  opacity: 0.7;
-  margin: 8px 0;
-}
-/* S1-4 执行纪律 */
-.discipline {
-  font-size: 12px;
-  line-height: 1.6;
-  padding: 8px 10px;
-  border-radius: 8px;
-  background: v-bind('withAlpha(vars.warningColor, 0.08)');
-  margin: 8px 0;
-}
-/* S2-2 反方研究员（影子） */
-.bear-block {
-  border: 1px solid transparent;
-  border-radius: 8px;
-  padding: 8px 10px;
-}
-.bear-title {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-.bear-shadow-note {
-  font-size: 11px;
-  font-weight: 400;
-  opacity: 0.55;
-}
-.bear-case {
-  margin: 4px 0 0;
-  font-size: 12.5px;
-  line-height: 1.7;
-}
-/* S2-3 数据质量门控（影子） */
-.qg-note {
-  font-size: 12px;
-  opacity: 0.75;
-  line-height: 1.6;
-  padding: 6px 10px;
-  border-radius: 8px;
-  background: v-bind('withAlpha(flatColor, 0.1)');
-  margin: 8px 0;
-}
-/* S2-4 影子对照 */
-.shadow-cover {
-  font-size: 12px;
-  font-weight: 400;
-  opacity: 0.6;
-  margin-left: 8px;
-}
-/* S1-1 regime tooltip 与 S1-2 仓位 tooltip */
-.regime-tip,
-.pos-tip {
-  max-width: 320px;
-  font-size: 12px;
-  line-height: 1.6;
-}
-.regime-tip-note {
-  opacity: 0.7;
-  margin-top: 6px;
-}
-.lv-help {
-  cursor: help;
-  text-decoration: underline dotted;
-  text-underline-offset: 3px;
-}
-.perf-secondary {
-  opacity: 0.6;
-  font-weight: 500;
-}
-/* S0-6 归因报表 */
-.attr-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-  margin-bottom: 12px;
-}
-.attr-meta {
-  font-size: 12px;
-  opacity: 0.6;
-}
-/* S3-2 召回评估：Top-K 去向分桶 tag 行 */
-.recall-stages {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 8px;
-}
-.audit-alert {
-  margin-bottom: 12px;
-}
-.audit-body {
-  margin-top: 20px;
-  padding-top: 16px;
-  border-top: 1px solid var(--qv-divider);
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-.audit-heading,
-.audit-day,
-.audit-item-main,
-.audit-item-facts,
-.audit-summary,
-.audit-funnel {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-}
-.audit-heading {
-  justify-content: space-between;
-  gap: 10px;
-}
-.audit-days {
-  border-top: 1px solid var(--qv-divider);
-}
-.audit-day {
-  min-height: 42px;
-  gap: 12px;
-  padding: 7px 0;
-  border-bottom: 1px solid var(--qv-divider);
-  font-size: 12px;
-}
-.audit-day-date {
-  flex: 0 0 180px;
-  font-weight: 600;
-}
-.audit-day-metrics {
-  flex: 1 1 280px;
-}
-.audit-summary {
-  gap: 8px 20px;
-  font-size: 12px;
-  line-height: 1.7;
-}
-.audit-funnel {
-  gap: 6px;
-}
-.audit-rate-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 24px;
-}
-.audit-rate-row {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 6px 0;
-  border-bottom: 1px solid var(--qv-divider);
-  font-size: 12px;
-}
-.audit-item {
-  padding: 10px 0;
-  border-bottom: 1px solid var(--qv-divider);
-}
-.audit-item-main {
-  gap: 8px 12px;
-}
-.audit-symbol {
-  font-weight: 600;
-}
-.audit-symbol .qv-mono {
-  margin-left: 4px;
-  font-size: 11px;
-  opacity: 0.55;
-}
-.audit-item-facts {
-  gap: 4px 14px;
-  margin-top: 6px;
-  font-size: 11px;
-  line-height: 1.6;
-  opacity: 0.64;
-}
-.attr-body {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-@media (max-width: 600px) {
-  .audit-rate-grid {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 16px;
-  }
-  .audit-day-date {
-    flex-basis: 100%;
-  }
-  .audit-heading {
-    align-items: flex-start;
-  }
-  .audit-item-main > .qv-tnum:last-child {
-    flex-basis: 100%;
-  }
-}
-.attr-dim-title {
-  font-size: 13px;
-  font-weight: 600;
-  margin-bottom: 6px;
-}
-.attr-table {
-  min-width: 620px;
-}
-.attr-thin td {
-  opacity: 0.55;
-}
-.disclaimer {
-  font-size: 11px;
-  opacity: 0.45;
-  line-height: 1.5;
-  margin: 12px 0 0;
-  padding-top: 10px;
-  border-top: 1px solid var(--qv-divider);
-}
-.card-actions {
-  display: flex;
-  justify-content: flex-end;
-  margin-top: 12px;
-}
-.rejected {
-  margin-top: 16px;
-}
-.rej-row {
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-  padding: 6px 0;
-  border-bottom: 1px dashed var(--qv-divider);
-  font-size: 13px;
-}
-.rej-row:last-child {
-  border-bottom: none;
-}
-.rej-name {
-  font-weight: 500;
-  flex-shrink: 0;
-  min-width: 120px;
-}
-.rej-symbol {
-  font-size: 11px;
-  opacity: 0.5;
-}
-.rej-reason {
-  opacity: 0.75;
-  line-height: 1.5;
-}
-
-/* D18 待复盘提示（从今日待办搬来的推荐复盘区） */
-.review-list {
-  display: flex;
-  flex-direction: column;
-}
-.review-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 9px 0;
-}
-.review-item + .review-item {
-  border-top: 1px solid var(--qv-divider);
-}
-.review-main {
-  flex: 1;
-  min-width: 0;
-}
-.review-title {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-.review-name {
-  font-size: 13px;
-  font-weight: 600;
-}
-.review-symbol {
-  font-size: 11px;
-  opacity: 0.5;
-}
-.review-sub {
-  font-size: 12px;
-  opacity: 0.7;
-  margin-top: 3px;
-}
-@media (max-width: 768px) {
-  .execution-money {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-  .execution-row {
-    grid-template-columns: 64px minmax(0, 1fr);
-  }
-  .review-item {
-    flex-wrap: wrap;
-    row-gap: 4px;
-  }
+@media (max-width: 1050px) {
+  .workspace { grid-template-columns: 1fr; }
+  .side-column { position: static; grid-row: 1; }
 }
 </style>

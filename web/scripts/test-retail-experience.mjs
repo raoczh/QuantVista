@@ -17,12 +17,20 @@ assert.doesNotMatch(stockActions, /name:\s*s\.name\s*\|\|\s*s\.symbol/, '股票�
 const picker = read('src/components/StockPicker.vue')
 assert.match(picker, /searchStocks/, '共享选股器必须复用现有股票搜索接口')
 
-for (const page of ['Home', 'Today', 'Watchlist', 'StockDetail', 'Recommendations', 'Analysis', 'Qa', 'Compare', 'DailyReport', 'Positions', 'PortfolioRisk', 'Alerts', 'Screener', 'Backtest', 'Mood', 'BoardDetail', 'Etf', 'Paper', 'ThesisCards', 'Notes', 'Settings']) {
+for (const page of ['Home', 'Today', 'Watchlist', 'StockDetail', 'Qa', 'Compare', 'DailyReport', 'Positions', 'PortfolioRisk', 'Alerts', 'Screener', 'Backtest', 'Mood', 'BoardDetail', 'Etf', 'Paper', 'ThesisCards', 'Notes', 'Settings']) {
   assert.match(read(`src/pages/${page}.vue`), /StockIdentity/, `${page} 必须接入统一股票身份组件`)
 }
-for (const page of ['Analysis', 'Compare', 'ThesisCards', 'Notes', 'Settings']) {
+for (const page of ['Compare', 'ThesisCards', 'Notes', 'Settings']) {
   assert.match(read(`src/pages/${page}.vue`), /StockPicker/, `${page} 的常用选股入口必须使用共享选股器`)
 }
+const recommendationCard = read('src/components/recommendations/RecommendationCard.vue')
+const recommendationAudit = read('src/components/recommendations/RecommendationCandidateAudit.vue')
+const analysisLauncher = read('src/components/analysis/AnalysisLauncher.vue')
+const analysisResult = read('src/components/analysis/AnalysisResultWorkspace.vue')
+for (const component of [recommendationCard, recommendationAudit, analysisResult]) {
+  assert.match(component, /StockIdentity/, '推荐/分析工作区必须通过职责组件复用统一股票身份')
+}
+assert.match(analysisLauncher, /StockPicker/, '分析发起区必须复用共享选股器')
 
 const settings = read('src/pages/Settings.vue')
 const notifications = read('src/components/settings/NotificationSettings.vue')

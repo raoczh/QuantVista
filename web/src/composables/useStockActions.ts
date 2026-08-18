@@ -11,11 +11,22 @@ export interface StockRef {
   name: string
 }
 
-export type StockActionKey = 'detail' | 'watchlist' | 'position' | 'alert' | 'analysis' | 'compare' | 'note'
+export type StockActionKey =
+  | 'detail'
+  | 'watchlist'
+  | 'position'
+  | 'position-decision'
+  | 'alert'
+  | 'analysis'
+  | 'recommendation-review'
+  | 'compare'
+  | 'note'
 
 export interface StockActionContext {
   inWatchlist?: boolean
   hasPosition?: boolean
+  positionID?: number
+  recommendationID?: number
 }
 
 let stockActionSequence = 0
@@ -61,6 +72,20 @@ export function useStockActions(onNavigate?: () => void) {
   function goAnalysis(s: StockRef) {
     return go({ name: 'analysis', query: stockQuery(s, { module: 'stock' }) }, s)
   }
+  function goRecommendationReview(s: StockRef, recommendationID: number, context = '') {
+    return go(
+      {
+        name: 'analysis',
+        query: stockQuery(s, {
+          module: 'stock',
+          recommendation_id: String(recommendationID),
+          review_context: 'recommendation',
+          ...(context.trim() ? { recommendation_context: context.trim().slice(0, 320) } : {}),
+        }),
+      },
+      s,
+    )
+  }
   function goQa(s: StockRef) {
     return go({ name: 'qa', query: stockQuery(s) }, s)
   }
@@ -78,6 +103,39 @@ export function useStockActions(onNavigate?: () => void) {
   }
   function goPosition(s: StockRef, hasPosition?: boolean) {
     return go({ name: 'positions', query: stockQuery(s, hasPosition === false ? { add: '1' } : {}) }, s)
+  }
+  function goPositionFromRecommendation(s: StockRef, recommendationID: number, quantity?: number) {
+    if (!Number.isSafeInteger(recommendationID) || recommendationID <= 0) {
+      message.error('缺少准确的推荐 ID，无法保留建仓血缘')
+      return Promise.resolve(false)
+    }
+    return go(
+      {
+        name: 'positions',
+        query: stockQuery(s, {
+          add: '1',
+          rec_id: String(recommendationID),
+          ...(quantity && quantity > 0 ? { quantity: String(quantity) } : {}),
+        }),
+      },
+      s,
+    )
+  }
+  function goPositionDecision(s: StockRef, positionID: number) {
+    if (!Number.isSafeInteger(positionID) || positionID <= 0) {
+      message.error('缺少准确的持仓 ID，无法进入卖出决策')
+      return Promise.resolve(false)
+    }
+    return go(
+      {
+        name: 'positions',
+        query: stockQuery(s, {
+          tab: 'needs_action',
+          position_id: String(positionID),
+        }),
+      },
+      s,
+    )
   }
   function goNote(s: StockRef) {
     return go({ name: 'notes', query: stockQuery(s, { add: '1' }) }, s)
@@ -124,10 +182,14 @@ export function useStockActions(onNavigate?: () => void) {
         return context.inWatchlist === false ? addToWatchlist(s) : goWatchlist(s)
       case 'position':
         return goPosition(s, context.hasPosition)
+      case 'position-decision':
+        return goPositionDecision(s, context.positionID || 0)
       case 'alert':
         return goAlert(s)
       case 'analysis':
         return goAnalysis(s)
+      case 'recommendation-review':
+        return goRecommendationReview(s, context.recommendationID || 0)
       case 'compare':
         return goCompare(s)
       case 'note':
@@ -144,8 +206,11 @@ export function useStockActions(onNavigate?: () => void) {
     goThesis,
     goWatchlist,
     goPosition,
+    goPositionFromRecommendation,
+    goPositionDecision,
     goNote,
     goDetail,
+    goRecommendationReview,
     addToWatchlist,
     runStockAction,
   }

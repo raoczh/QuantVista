@@ -13,6 +13,8 @@ const props = withDefaults(
     actions?: boolean
     inWatchlist?: boolean
     hasPosition?: boolean
+    positionId?: number
+    recommendationId?: number
   }>(),
   {
     market: 'cn',
@@ -62,6 +64,8 @@ function openDetail() {
       :stock="stock"
       :watchlist-state="inWatchlist === undefined ? undefined : inWatchlist ? 'in' : 'out'"
       :position-state="hasPosition === undefined ? undefined : hasPosition ? 'held' : 'none'"
+      :position-id="positionId"
+      :recommendation-id="recommendationId"
     />
   </span>
 </template>
