@@ -107,6 +107,7 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 			Model:        cfg.Model,
 			EndpointType: cfg.EndpointType,
 			Temperature:  cfg.Temperature,
+			ReasoningEffort: cfg.ReasoningEffort,
 			MaxTokens:    requestMax,
 			Messages:     convo,
 			JSONMode:     true,

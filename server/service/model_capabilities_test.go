@@ -234,7 +234,7 @@ func TestJSONModeSmokeProbe(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		r := svc.testOpenAICompatibleForUser(1, 0, "gw", "", srv.URL, "k", "m", true)
+		r := svc.testOpenAICompatibleForUser(llmProbeTarget{UserID: 1, Provider: "gw", BaseURL: srv.URL, APIKey: "k", Model: "m", AllowPrivate: true})
 		if !r.OK || !strings.Contains(r.Message, "JSON 结构化：支持") {
 			t.Fatalf("应连接成功且 smoke 判支持: %+v", r)
 		}
@@ -265,7 +265,7 @@ func TestJSONModeSmokeProbe(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		r := svc.testOpenAICompatibleForUser(1, 0, "gw", "", srv.URL, "k", "m", true)
+		r := svc.testOpenAICompatibleForUser(llmProbeTarget{UserID: 1, Provider: "gw", BaseURL: srv.URL, APIKey: "k", Model: "m", AllowPrivate: true})
 		if !r.OK || !strings.Contains(r.Message, "JSON 结构化：不支持") {
 			t.Fatalf("基础连通成功 + smoke 判不支持: %+v", r)
 		}
@@ -286,7 +286,7 @@ func TestJSONModeSmokeProbe(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		r := svc.testOpenAICompatibleForUser(1, 0, "gw", "", srv.URL, "k", "m", true)
+		r := svc.testOpenAICompatibleForUser(llmProbeTarget{UserID: 1, Provider: "gw", BaseURL: srv.URL, APIKey: "k", Model: "m", AllowPrivate: true})
 		if !r.OK || !strings.Contains(r.Message, "未能确认") {
 			t.Fatalf("5xx 属非结论性失败: %+v", r)
 		}

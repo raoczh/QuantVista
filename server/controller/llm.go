@@ -99,6 +99,36 @@ func (lc *LLMController) Test(c *gin.Context) {
 	common.ApiSuccess(c, res)
 }
 
+// SetDefault POST /api/llm-configs/:id/default —— 列表页一键设为默认。
+func (lc *LLMController) SetDefault(c *gin.Context) {
+	id, ok := lc.idParam(c)
+	if !ok {
+		return
+	}
+	v, err := lc.svc.SetDefault(currentUserID(c), id)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, v)
+}
+
+// FetchModels POST /api/llm-config-models —— 拉取上游可用模型列表。
+// 用 POST 而非 GET：Base URL 与 API Key 是请求体参数（密钥不进 URL，避免落日志/历史）。
+func (lc *LLMController) FetchModels(c *gin.Context) {
+	var in service.LLMConfigInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		common.ApiErrorMsg(c, "请求格式错误")
+		return
+	}
+	models, truncated, err := lc.svc.FetchModels(currentUserID(c), in, lc.allowPrivate(c))
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, gin.H{"models": models, "truncated": truncated})
+}
+
 // TestDraft POST /api/llm-configs/test —— 测试未保存的表单配置。
 func (lc *LLMController) TestDraft(c *gin.Context) {
 	var in service.LLMConfigInput

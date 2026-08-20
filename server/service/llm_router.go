@@ -310,6 +310,9 @@ func applyModelRouting(p chatParams) chatParams {
 	p.BaseURL, p.APIKey = rt.cfg.BaseURL, rt.apiKey
 	p.Model, p.EndpointType = rt.cfg.Model, rt.cfg.EndpointType
 	p.Temperature = rt.cfg.Temperature
+	// 思考档位跟随路由目标配置（与 Temperature 同款语义）：档位是「用哪个模型怎么想」的
+	// 一部分，换目标就该用目标的配置。MaxTokens 的例外规则不适用于此。
+	p.ReasoningEffort = rt.cfg.ReasoningEffort
 	// MaxTokens 是业务层已经计算完成的本次预算（含 length repair 扩容）。路由只换
 	// 调用目标，不得再用目标配置的默认值压低或放大它。
 	// AllowPrivate 按路由目标配置所有者重判（路由目标恒属启用管理员，llm 回退同款语义）。

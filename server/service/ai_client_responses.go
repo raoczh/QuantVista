@@ -64,6 +64,7 @@ func buildResponsesPayload(p chatParams, jsonMode, stream, promptCache bool) map
 	if p.MaxTokens > 0 {
 		payload["max_output_tokens"] = p.requestTokenBudget()
 	}
+	p.addReasoningEffortField(payload)
 	p.addPromptCacheField(payload, promptCache)
 	if jsonMode {
 		payload["text"] = map[string]any{"format": map[string]string{"type": "json_object"}}
@@ -215,6 +216,11 @@ func responsesCompletion(ctx context.Context, p chatParams) (*chatResult, error)
 			p.markTemperatureOmitted()
 			reason := fmt.Sprintf("responses 非流式 HTTP %d 拒绝 temperature", status)
 			capConfirms = append(capConfirms, func() { p.observeTemperatureUnsupported(reason) })
+			changed = true
+		case p.sendsReasoningEffort() && looksLikeUnsupportedReasoningEffort(status, raw):
+			reason := p.reasoningEffortRejectReason("responses 非流式", status, raw)
+			p.markReasoningEffortOmitted()
+			capConfirms = append(capConfirms, func() { p.observeReasoningEffortUnsupported(reason) })
 			changed = true
 		case cacheOn && looksLikeUnsupportedPromptCache(status, raw):
 			cacheOn = false
@@ -445,8 +451,9 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 		resp.Body.Close()
 		dropJSON := jsonOn && looksLikeUnsupportedJSONMode(status, raw)
 		dropTemp := !p.temperatureOmitted() && looksLikeUnsupportedTemperature(status, raw)
+		dropEffort := p.sendsReasoningEffort() && looksLikeUnsupportedReasoningEffort(status, raw)
 		dropCache := cacheOn && looksLikeUnsupportedPromptCache(status, raw)
-		if !dropJSON && !dropTemp && !dropCache {
+		if !dropJSON && !dropTemp && !dropEffort && !dropCache {
 			return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", status, statusHint(status), extractErr(raw))
 		}
 		if dropJSON {
@@ -459,6 +466,11 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 			p.markTemperatureOmitted()
 			reason := fmt.Sprintf("responses 流式 HTTP %d 拒绝 temperature", status)
 			capConfirms = append(capConfirms, func() { p.observeTemperatureUnsupported(reason) })
+		}
+		if dropEffort {
+			reason := p.reasoningEffortRejectReason("responses 流式", status, raw)
+			p.markReasoningEffortOmitted()
+			capConfirms = append(capConfirms, func() { p.observeReasoningEffortUnsupported(reason) })
 		}
 		if dropCache {
 			cacheOn = false

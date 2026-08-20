@@ -600,6 +600,7 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, run 
 			Model:        cfg.Model,
 			EndpointType: cfg.EndpointType,
 			Temperature:  cfg.Temperature,
+			ReasoningEffort: cfg.ReasoningEffort,
 			MaxTokens:    requestMax,
 			Messages:     convo,
 			JSONMode:     true,
@@ -826,6 +827,7 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 	for attempt := 0; attempt <= repairLimit; attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
+			ReasoningEffort: cfg.ReasoningEffort,
 			Temperature: cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）

@@ -7,9 +7,19 @@ import (
 )
 
 // 推理/思考侧适配（对标 new-api relaykit 的请求转换与响应归一实践）：
-//   - 请求侧不主动注入 reasoning_effort/thinking_budget 等思考控制参数——new-api 作为
-//     中继同样只透传客户端显式携带的字段，客户端不发即用网关/模型默认行为；本项目
-//     有意保持该默认（思考控制交给网关侧模型名约定，如 -thinking/-nothinking 后缀）。
+//   - 请求侧的思考控制由**用户在 LLM 配置里显式指定**（LLMConfig.ReasoningEffort）：
+//     chat 端发 reasoning_effort、responses 端发 reasoning.effort（addReasoningEffortField）。
+//     **空值 = 不发送该参数**，沿用网关/模型默认档位——存量配置与不配档位的调用请求字节
+//     与本能力上线前完全一致。（此前本项目一律不注入该类参数、把思考控制交给网关侧模型名
+//     约定如 -thinking/-nothinking 后缀；该约定仍可用，两者不冲突。）
+//   - 档位取值不做枚举校验：各家档位在持续扩（o 系列只认 low/medium/high、GPT-5 加
+//     minimal、GPT-5.5 到 none/xhigh，部分中转网关另有 max/ultra），与 provider 同样按
+//     「用户自由填写 + 运行时能力观察」处理。
+//   - 上游拒绝档位时**无害降级**：四处 fallback 点（chat/responses × 流式/非流式）去掉该
+//     参数重试，业务照常出结果；两类拒绝都覆盖——参数本身不认（非推理模型）与所配档位不在
+//     取值集合内（looksLikeUnsupportedReasoningEffort）。去参重试成功后才落 capReasoningEffort
+//     观察（12h TTL），值被拒时另打系统日志带上游列出的合法档位——否则用户会以为档位生效、
+//     实际一直在用网关默认档位。连接测试也做同款探测并在结果里如实说明（llm.go effortNote）。
 //   - 已知按 max_completion_tokens 计数的模型（o 系列/GPT-5）主动切换字段，并由
 //     requestTokenBudget 为隐藏 reasoning token 预留空间（new-api 是原值搬移，正文
 //     预算会被思考挤占——这里显式补偿）。

@@ -200,6 +200,7 @@ func RunLLMExperimentAudit(ctx context.Context, expID int64) (*model.LLMReleaseA
 	for attempt := 0; attempt <= repairLimit; attempt++ {
 		res, cerr := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
+			ReasoningEffort: cfg.ReasoningEffort,
 			Temperature: cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: llmAllowPrivate(false, cfg),
 			Repair: attempt > 0,

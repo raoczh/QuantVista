@@ -376,6 +376,7 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 	for attempt := 0; attempt <= repairLimit; attempt++ {
 		result, cerr := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
+			ReasoningEffort: cfg.ReasoningEffort,
 			Temperature: cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0

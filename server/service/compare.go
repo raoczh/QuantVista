@@ -368,6 +368,7 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 	run.hashPrompt(messages)
 	res, err := chatCompletion(ctx, chatParams{
 		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
+		ReasoningEffort: cfg.ReasoningEffort,
 		Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("compare", cfg.MaxTokens),
 		Messages: messages,
 		JSONMode: false, AllowPrivate: allowPrivate,

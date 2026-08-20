@@ -955,6 +955,11 @@ type scoreBlindInputSnapshot struct {
 	MaxCompletionTokens bool            `json:"max_completion_tokens"`
 	Route               LLMRouteApplied `json:"route"`
 	Messages            []chatMessage   `json:"messages"`
+	// 思考档位两字段一律 omitempty：未配档位（历史与存量批次的常态）时序列化字节与
+	// InputHash 完全不变，sb2 样本继续可比，无需递增 scoreBlindInputSchemaVersion。
+	// 一旦某配置配上档位，其后续批次快照随之变化——那是真实的单变量变更，本就该体现。
+	ReasoningEffort        string `json:"reasoning_effort,omitempty"`
+	ReasoningEffortOmitted bool   `json:"reasoning_effort_omitted,omitempty"`
 }
 
 func marshalLLMExperimentPicks(picks []recPick) string {
@@ -1315,6 +1320,7 @@ func (s *RecommendationService) maybeChallengerShadow(ctx context.Context, plan 
 	cfg, apiKey := plan.cfg, plan.apiKey
 	params := chatParams{
 		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
+		ReasoningEffort: cfg.ReasoningEffort,
 		Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("experiment", cfg.MaxTokens),
 		Messages: messages, JSONMode: true, AllowPrivate: plan.allowPrivate,
 		Meta: run.chatMeta(plan.userID, cfg, 1),
@@ -1334,7 +1340,9 @@ func (s *RecommendationService) maybeChallengerShadow(ctx context.Context, plan 
 			AccuracyContract:    target.AccuracyContract,
 			TemperatureOmitted:  prepared.temperatureOmitted(),
 			MaxCompletionTokens: prepared.usesMaxCompletionTokens(), Route: run.routeApplied,
-			Messages: append([]chatMessage(nil), prepared.Messages...),
+			ReasoningEffort:        prepared.ReasoningEffort,
+			ReasoningEffortOmitted: prepared.reasoningEffortOmitted(),
+			Messages:               append([]chatMessage(nil), prepared.Messages...),
 		})
 		if snapshotErr != nil {
 			common.SysWarn("score_blind 实验 #%d 精确输入序列化失败：%v", exp.ID, snapshotErr)

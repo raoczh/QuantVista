@@ -27,10 +27,10 @@ const (
 	aiCallTimeout                = 90 * time.Second
 	aiRetryBackoff               = 800 * time.Millisecond
 	aiResponseBodyLimit          = 1 << 20
-	chatPlainFallbackLimit       = 4 // response_format、temperature、token、prompt_cache_key
-	chatStreamingFallbackLimit   = 5 // 流式路径再多一个 stream_options 兼容维度
-	responsesPlainFallbackLimit  = 3 // text.format、temperature、prompt_cache_key
-	responsesStreamFallbackLimit = 3 // 同上；token 预算不允许删除
+	chatPlainFallbackLimit       = 5 // response_format、temperature、reasoning_effort、token、prompt_cache_key
+	chatStreamingFallbackLimit   = 6 // 流式路径再多一个 stream_options 兼容维度
+	responsesPlainFallbackLimit  = 4 // text.format、temperature、reasoning.effort、prompt_cache_key
+	responsesStreamFallbackLimit = 4 // 同上；token 预算不允许删除
 )
 
 // 包级复用两个 client（allowPrivate 两态），避免每次调用重建 Transport——
@@ -137,9 +137,13 @@ type chatParams struct {
 	EndpointType string // model.LLMEndpointChat（默认，空值同）/ model.LLMEndpointResponses
 	Temperature  float64
 	MaxTokens    int
-	Messages     []chatMessage
-	JSONMode     bool // 请求 response_format=json_object（不支持则由调用逻辑 fallback）
-	AllowPrivate bool // 管理员可放行内网自建模型
+	// ReasoningEffort 思考控制档位（空=不发送该参数，沿用网关/模型默认）。chat 端为
+	// reasoning_effort、responses 端为 reasoning.effort；上游拒绝该参数或该值时由
+	// 四处 fallback 点去参重试（无害降级：回到网关默认档位，业务照常出结果）。
+	ReasoningEffort string
+	Messages        []chatMessage
+	JSONMode        bool // 请求 response_format=json_object（不支持则由调用逻辑 fallback）
+	AllowPrivate    bool // 管理员可放行内网自建模型
 	// Repair 本次请求是否为 repair 轮（首轮之后的结构修复请求）：契约开启时温度固定 0
 	//（llm_contract.go）。由各模块 repair 循环在 attempt>0 时置 true；次数上限仍归模块管。
 	Repair bool
@@ -153,7 +157,10 @@ type chatParams struct {
 	// omitTemperature 参数省略观测（P0-5 修复批）：声明化路由或运行时 fallback
 	// 判定上游不接受该参数时置位。token 参数不允许省略：chat 端会在旧字段被拒后
 	// 切换到等价的 max_completion_tokens，始终保留模块输出预算。
+	// omitReasoningEffort 同款语义：上游拒绝 reasoning_effort 参数本身或拒绝所配档位
+	// 时置位，去参后回到网关默认档位（无害降级）。
 	omitTemperature     *bool
+	omitReasoningEffort *bool
 	maxCompletionTokens *bool
 	// finalRequestBody 最终实际发送的请求体 JSON（审计观测）：每次真正发出 HTTP 请求前
 	// 由各路径写入（fallback 重试覆盖为最终形态），writeLLMCallLog 落 RequestBody——
@@ -189,6 +196,40 @@ func (p chatParams) markTemperatureOmitted() {
 
 func (p chatParams) temperatureOmitted() bool {
 	return p.omitTemperature != nil && *p.omitTemperature
+}
+
+// markReasoningEffortOmitted / reasoningEffortOmitted 思考档位参数省略观测（nil 安全）。
+// 与 temperature 同款：置位后本次请求不再携带该参数，审计快照如实记录最终形态。
+func (p chatParams) markReasoningEffortOmitted() {
+	if p.omitReasoningEffort != nil {
+		*p.omitReasoningEffort = true
+	}
+	if p.Meta.TargetSnapshot != nil {
+		p.Meta.TargetSnapshot.ReasoningEffortOmitted = true
+	}
+}
+
+func (p chatParams) reasoningEffortOmitted() bool {
+	return p.omitReasoningEffort != nil && *p.omitReasoningEffort
+}
+
+// sendsReasoningEffort 本次请求是否应携带思考档位参数：用户配了值且未被省略。
+func (p chatParams) sendsReasoningEffort() bool {
+	return strings.TrimSpace(p.ReasoningEffort) != "" && !p.reasoningEffortOmitted()
+}
+
+// addReasoningEffortField 按端点形态写入思考档位参数（chat: 平铺 reasoning_effort；
+// responses: 嵌套 reasoning.effort）。两处 payload 构造共用，避免形态漂移。
+func (p chatParams) addReasoningEffortField(payload map[string]any) {
+	if !p.sendsReasoningEffort() {
+		return
+	}
+	effort := strings.TrimSpace(p.ReasoningEffort)
+	if p.isResponsesEndpoint() {
+		payload["reasoning"] = map[string]any{"effort": effort}
+		return
+	}
+	payload["reasoning_effort"] = effort
 }
 
 // markMaxCompletionTokens 切换 Chat Completions 的 token 参数变体（nil 安全）。
@@ -317,6 +358,7 @@ func prepareChatCompletionForAcceptedTarget(p chatParams, target llmCallTarget) 
 	p.BaseURL, p.APIKey = target.BaseURL, target.APIKey
 	p.Model, p.EndpointType = target.Model, target.EndpointType
 	p.Temperature, p.MaxTokens = target.Temperature, target.MaxTokens
+	p.ReasoningEffort = target.ReasoningEffort
 	p.JSONMode, p.AllowPrivate = target.JSONMode, target.AllowPrivate
 	p.Meta.ConfigID, p.Meta.Provider = target.ConfigID, target.Provider
 	p = applyAccuracyContractSnapshot(p, target.AccuracyContract)
@@ -326,6 +368,9 @@ func prepareChatCompletionForAcceptedTarget(p chatParams, target llmCallTarget) 
 	}
 	if target.TemperatureOmitted {
 		p.markTemperatureOmitted()
+	}
+	if target.ReasoningEffortOmitted {
+		p.markReasoningEffortOmitted()
 	}
 	if target.MaxCompletionTokens {
 		p.markMaxCompletionTokens()
@@ -340,10 +385,11 @@ func (p chatParams) snapshotPreparedTarget() {
 	}
 	*p.Meta.TargetSnapshot = llmCallTarget{
 		BaseURL: p.BaseURL, APIKey: p.APIKey, Model: p.Model, EndpointType: p.EndpointType,
-		Temperature: p.Temperature, MaxTokens: p.MaxTokens,
+		Temperature: p.Temperature, MaxTokens: p.MaxTokens, ReasoningEffort: p.ReasoningEffort,
 		AccuracyContract: p.accuracyContractEnabled(), JSONMode: p.JSONMode,
-		TemperatureOmitted: p.temperatureOmitted(), MaxCompletionTokens: p.usesMaxCompletionTokens(),
-		AllowPrivate: p.AllowPrivate, ConfigID: p.Meta.ConfigID, Provider: p.Meta.Provider,
+		TemperatureOmitted: p.temperatureOmitted(), ReasoningEffortOmitted: p.reasoningEffortOmitted(),
+		MaxCompletionTokens: p.usesMaxCompletionTokens(),
+		AllowPrivate:        p.AllowPrivate, ConfigID: p.Meta.ConfigID, Provider: p.Meta.Provider,
 	}
 }
 
@@ -357,13 +403,14 @@ func chatCompletionPrepared(ctx context.Context, p chatParams) (res *chatResult,
 	return chatCompletionInner(ctx, p, &streamed)
 }
 
-// initCallObservers 公开出口初始化本次调用的观测指针（structured/temperature/token
-// 参数的实际生效形态 + 最终请求体），供内部 fallback 点回写、审计层读取。
+// initCallObservers 公开出口初始化本次调用的观测指针（structured/temperature/思考档位/
+// token 参数的实际生效形态 + 最终请求体），供内部 fallback 点回写、审计层读取。
 func initCallObservers(p chatParams) chatParams {
 	effJSON := p.JSONMode
 	p.effectiveJSONMode = &effJSON
-	omitTemp, useMaxCompletion := false, false
+	omitTemp, useMaxCompletion, omitEffort := false, false, false
 	p.omitTemperature, p.maxCompletionTokens = &omitTemp, &useMaxCompletion
+	p.omitReasoningEffort = &omitEffort
 	finalBody := ""
 	p.finalRequestBody = &finalBody
 	return p
@@ -439,6 +486,11 @@ func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error)
 			reason := fmt.Sprintf("chat 非流式 HTTP %d 拒绝 temperature", status)
 			capConfirms = append(capConfirms, func() { p.observeTemperatureUnsupported(reason) })
 			changed = true
+		case p.sendsReasoningEffort() && looksLikeUnsupportedReasoningEffort(status, raw):
+			reason := p.reasoningEffortRejectReason("chat 非流式", status, raw)
+			p.markReasoningEffortOmitted()
+			capConfirms = append(capConfirms, func() { p.observeReasoningEffortUnsupported(reason) })
+			changed = true
 		case p.MaxTokens > 0 && !p.usesMaxCompletionTokens() && looksLikeUnsupportedMaxTokens(status, raw):
 			p.markMaxCompletionTokens()
 			reason := fmt.Sprintf("chat 非流式 HTTP %d 拒绝 max_tokens，改用 max_completion_tokens", status)
@@ -498,6 +550,7 @@ func doChat(ctx context.Context, p chatParams, jsonMode, promptCache bool) (*cha
 	if p.MaxTokens > 0 {
 		payload[p.maxTokensField()] = p.requestTokenBudget()
 	}
+	p.addReasoningEffortField(payload)
 	p.addPromptCacheField(payload, promptCache)
 	if jsonMode {
 		payload["response_format"] = map[string]string{"type": "json_object"}
@@ -686,6 +739,75 @@ func looksLikeUnsupportedMaxTokens(status int, raw []byte) bool {
 	return matchUnsupportedParam(msg, "max_tokens", "max_output_tokens")
 }
 
+// invalidParamValueHints 「值不在取值集合内」的措辞集合（区别于「参数本身不认」）。
+var invalidParamValueHints = []string{
+	"invalid value", "invalid_value", "supported values", "must be one of", "one of the following",
+	"allowed values", "not a valid", "invalid enum",
+}
+
+// looksLikeUnsupportedReasoningEffort 判断 4xx 是否因上游不接受思考档位引起。**两类都算**：
+//  1. 参数本身不认（"unknown parameter: reasoning_effort"）——非推理模型的典型形态；
+//  2. 所配档位不在其取值集合内（"Invalid value: 'max'. Supported values are: 'low','medium','high'"）
+//     ——各家档位不同代际不一致（o 系列只认 low/medium/high、GPT-5 加 minimal、GPT-5.5 到
+//     none/xhigh，max/ultra 仅部分中转网关支持），用户配了上游不认的档位是常见情形。
+//
+// 第 2 类的归因难点：这类报错常**不含字段名**（OpenAI 把字段名放在 error.param、部分网关
+// 干脆只回 message）。若强制要求字段名命中，配了 max/ultra 的调用会直接失败而非降级——而
+// 这正是本参数最需要兜住的路径。因此改为排除法：本函数只在请求确实携带档位时才被调用
+// （调用点都带 p.sendsReasoningEffort() 前置条件），而档位是我们发送的唯一一个**取值由
+// 用户自由填写**的枚举参数（response_format 的值由代码硬编码，temperature/max_tokens 是
+// 数值），所以带档位的请求收到「值非法」且文案未指向结构化字段时，归因到档位高概率正确。
+//
+// 这与 looksLikeUnsupportedMaxTokens **故意排除「值超限」的做法相反**，原因不同：去掉
+// max_tokens 会丢失输出预算（有害，宁可明确失败）；而去掉 reasoning_effort 只是回到网关
+// 默认档位，业务照常出结果（无害降级，符合项目 best-effort 纪律）。代价是「用户以为档位
+// 生效、实际在用默认档位」——由调用方在提交观察时打系统日志（含上游列出的合法值）消除盲区。
+func looksLikeUnsupportedReasoningEffort(status int, raw []byte) bool {
+	if status < 400 || status >= 500 {
+		return false
+	}
+	msg := strings.ToLower(string(raw))
+	fields := []string{"reasoning_effort", "reasoning.effort", "reasoning"}
+	if matchUnsupportedParam(msg, fields...) {
+		return true
+	}
+	if !looksLikeInvalidParamValue(msg) {
+		return false
+	}
+	// 文案明确指向档位字段：确定是它。
+	for _, f := range fields {
+		if strings.Contains(msg, f) {
+			return true
+		}
+	}
+	// 未指明字段：只排除「明确指向结构化参数取值」的情形（那条路由给 JSON mode 回落处理），
+	// 其余归因到档位。
+	return !looksLikeUnsupportedJSONMode(status, raw)
+}
+
+// looksLikeInvalidParamValue 错误文案是否属于「值不在取值集合内」（区别于「参数本身不认」）。
+func looksLikeInvalidParamValue(lowerMsg string) bool {
+	for _, h := range invalidParamValueHints {
+		if strings.Contains(lowerMsg, h) {
+			return true
+		}
+	}
+	return false
+}
+
+// reasoningEffortRejectReason 生成思考档位被拒的归因文案，并对「值不被接受」的情形补一条
+// 系统日志——带上游原文（含它列出的合法档位），否则用户会以为所配档位生效、实际每次静默
+// 降级到网关默认。审计侧 request_body 记的是最终形态（已无该参数），两者配合才能归因。
+func (p chatParams) reasoningEffortRejectReason(path string, status int, raw []byte) string {
+	effort := strings.TrimSpace(p.ReasoningEffort)
+	if looksLikeInvalidParamValue(strings.ToLower(string(raw))) {
+		common.SysWarn("LLM 思考档位被上游拒绝：模型 %s 不接受 reasoning_effort=%q，本次已去参重试并回落网关默认档位（HTTP %d：%s）——请按上游提示改配档位",
+			p.Model, effort, status, extractErr(raw))
+		return fmt.Sprintf("%s HTTP %d 拒绝档位 %q（值不在取值集合内）", path, status, effort)
+	}
+	return fmt.Sprintf("%s HTTP %d 拒绝 reasoning_effort 参数", path, status)
+}
+
 func looksLikeUnsupportedPromptCache(status int, raw []byte) bool {
 	if status < 400 || status >= 500 {
 		return false
@@ -846,6 +968,7 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 		if p.MaxTokens > 0 {
 			payload[p.maxTokensField()] = p.requestTokenBudget()
 		}
+		p.addReasoningEffortField(payload)
 		p.addPromptCacheField(payload, cacheOn)
 		if withUsageOpt {
 			payload["stream_options"] = map[string]bool{"include_usage": true}
@@ -904,9 +1027,10 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 		dropUsage := usageOpt && strings.Contains(msg, "stream_options")
 		dropJSON := jsonOn && looksLikeUnsupportedJSONMode(status, raw)
 		dropTemp := !p.temperatureOmitted() && looksLikeUnsupportedTemperature(status, raw)
+		dropEffort := p.sendsReasoningEffort() && looksLikeUnsupportedReasoningEffort(status, raw)
 		switchMaxTok := p.MaxTokens > 0 && !p.usesMaxCompletionTokens() && looksLikeUnsupportedMaxTokens(status, raw)
 		dropCache := cacheOn && looksLikeUnsupportedPromptCache(status, raw)
-		if !dropUsage && !dropJSON && !dropTemp && !switchMaxTok && !dropCache {
+		if !dropUsage && !dropJSON && !dropTemp && !dropEffort && !switchMaxTok && !dropCache {
 			return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", status, statusHint(status), extractErr(raw))
 		}
 		if dropUsage {
@@ -922,6 +1046,11 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 			p.markTemperatureOmitted()
 			reason := fmt.Sprintf("chat 流式 HTTP %d 拒绝 temperature", status)
 			capConfirms = append(capConfirms, func() { p.observeTemperatureUnsupported(reason) })
+		}
+		if dropEffort {
+			reason := p.reasoningEffortRejectReason("chat 流式", status, raw)
+			p.markReasoningEffortOmitted()
+			capConfirms = append(capConfirms, func() { p.observeReasoningEffortUnsupported(reason) })
 		}
 		if switchMaxTok {
 			p.markMaxCompletionTokens()

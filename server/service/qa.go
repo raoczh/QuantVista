@@ -191,6 +191,7 @@ func (s *QaService) ask(ctx context.Context, userID int64, allowPrivate bool, re
 	}
 	res, callErr := chatCompletion(ctx, chatParams{
 		BaseURL: ac.cfg.BaseURL, APIKey: ac.apiKey, Model: ac.cfg.Model, EndpointType: ac.cfg.EndpointType,
+		ReasoningEffort: ac.cfg.ReasoningEffort,
 		Temperature: ac.cfg.Temperature, MaxTokens: moduleTokenCap("qa", ac.cfg.MaxTokens),
 		Messages: ac.messages, JSONMode: false, AllowPrivate: llmAllowPrivate(allowPrivate, ac.cfg),
 		Meta: ac.run.chatMeta(userID, ac.cfg, 1),
@@ -228,6 +229,7 @@ func (s *QaService) AskStream(ctx context.Context, userID int64, allowPrivate bo
 	}
 	params := chatParams{
 		BaseURL: ac.cfg.BaseURL, APIKey: ac.apiKey, Model: ac.cfg.Model, EndpointType: ac.cfg.EndpointType,
+		ReasoningEffort: ac.cfg.ReasoningEffort,
 		Temperature: ac.cfg.Temperature, MaxTokens: moduleTokenCap("qa", ac.cfg.MaxTokens),
 		Messages: ac.messages, JSONMode: false, AllowPrivate: llmAllowPrivate(allowPrivate, ac.cfg),
 		Meta: ac.run.chatMeta(userID, ac.cfg, 1),

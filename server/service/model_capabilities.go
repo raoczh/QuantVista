@@ -48,6 +48,10 @@ const (
 	capFreeText llmCapability = "free_text"
 	// capTemperature temperature 参数。
 	capTemperature llmCapability = "temperature"
+	// capReasoningEffort 思考档位参数（chat: reasoning_effort / responses: reasoning.effort）。
+	// unsupported 涵盖两种上游拒绝：参数本身不认，或所配档位不在其取值集合内——两者
+	// 的补救动作相同（去参回到网关默认档位），故合用一个维度，归因差异靠系统日志区分。
+	capReasoningEffort llmCapability = "reasoning_effort"
 	// capMaxTokens 记录 Chat 端旧字段 max_tokens 是否被拒。unsupported 表示应改用
 	// 等价的 max_completion_tokens，而不是省略输出预算。target 含 endpoint，Responses
 	// 的 max_output_tokens 不复用这项回落。
@@ -61,23 +65,28 @@ const (
 // llmModelCapabilities 一个 (provider, model, endpoint) 目标的能力声明快照
 // （内置声明与运行时观察合并后的视图）。
 type llmModelCapabilities struct {
-	JSONObject  llmCapState
-	FreeText    llmCapState
-	Temperature llmCapState
-	MaxTokens   llmCapState
-	Endpoint    llmCapState // 本次调用所选端点的可用性
+	JSONObject      llmCapState
+	FreeText        llmCapState
+	Temperature     llmCapState
+	ReasoningEffort llmCapState
+	MaxTokens       llmCapState
+	Endpoint        llmCapState // 本次调用所选端点的可用性
 }
 
 // builtinProviderCapabilities 内置 provider 声明（key 为小写 provider 名）。
 // openai 官方口径 json_object/温度/token 参数全支持；其余任意兼容中转（含空 provider）
 // 结构化支持情况不可静态断言，json_object 记 unknown 由运行时观察补齐。
+// ReasoningEffort 一律 unknown（含 openai）：同一 provider 下推理模型接受该参数、非推理
+// 模型直接拒绝，且各代际取值集合不同——只能按 (配置,模型,端点) 目标逐个观察，不可按 provider 断言。
 var builtinProviderCapabilities = map[string]llmModelCapabilities{
-	"openai": {JSONObject: capSupported, FreeText: capSupported, Temperature: capSupported, MaxTokens: capSupported, Endpoint: capSupported},
+	"openai": {JSONObject: capSupported, FreeText: capSupported, Temperature: capSupported,
+		ReasoningEffort: capUnknown, MaxTokens: capSupported, Endpoint: capSupported},
 }
 
 // defaultProviderCapabilities 未登记 provider 的缺省声明。
 var defaultProviderCapabilities = llmModelCapabilities{
-	JSONObject: capUnknown, FreeText: capSupported, Temperature: capSupported, MaxTokens: capSupported, Endpoint: capUnknown,
+	JSONObject: capUnknown, FreeText: capSupported, Temperature: capSupported,
+	ReasoningEffort: capUnknown, MaxTokens: capSupported, Endpoint: capUnknown,
 }
 
 // llmCapObservationTTL 运行时观察的有效期：期内声明化路由生效，到期恢复 unknown
@@ -165,6 +174,9 @@ func capabilitiesFor(provider string, target string) llmModelCapabilities {
 	if obs, ok := lookupLLMCapability(target, capTemperature); ok {
 		caps.Temperature = obs.State
 	}
+	if obs, ok := lookupLLMCapability(target, capReasoningEffort); ok {
+		caps.ReasoningEffort = obs.State
+	}
 	if obs, ok := lookupLLMCapability(target, capMaxTokens); ok {
 		caps.MaxTokens = obs.State
 	}
@@ -190,6 +202,11 @@ func applyCapabilityRouting(p chatParams) chatParams {
 	if caps.Temperature == capUnsupported {
 		p.markTemperatureOmitted()
 	}
+	// 思考档位：已观察到该目标拒绝该参数（或拒绝所配档位）时直接不发，省掉一次注定
+	// 失败的请求。观察带 TTL，到期恢复 unknown 重新乐观尝试——上游换模型/升级后能自动恢复。
+	if p.sendsReasoningEffort() && caps.ReasoningEffort == capUnsupported {
+		p.markReasoningEffortOmitted()
+	}
 	if p.MaxTokens > 0 && !p.isResponsesEndpoint() && caps.MaxTokens == capUnsupported {
 		p.markMaxCompletionTokens()
 	}
@@ -213,4 +230,10 @@ func (p chatParams) observeTemperatureUnsupported(reason string) {
 
 func (p chatParams) observeMaxTokensUnsupported(reason string) {
 	observeLLMCapability(capabilityTargetOf(p), capMaxTokens, capUnsupported, reason)
+}
+
+// observeReasoningEffortUnsupported 思考档位能力观察提交（去参重试成功后调用）。
+// 只在去参重试成功后调用：4xx 文案里的字样只是猜测，重试成功才证明失败确实源于该参数。
+func (p chatParams) observeReasoningEffortUnsupported(reason string) {
+	observeLLMCapability(capabilityTargetOf(p), capReasoningEffort, capUnsupported, reason)
 }

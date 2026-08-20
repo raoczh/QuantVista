@@ -221,9 +221,12 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				llm.PUT("/:id", llmCtl.Update)
 				llm.DELETE("/:id", llmCtl.Delete)
 				llm.POST("/:id/test", llmCtl.Test)
+				llm.POST("/:id/default", llmCtl.SetDefault)
 			}
 			// 草稿测试单独成路径，避免与 /llm-configs/:id 的参数段冲突。
 			authed.POST("/llm-config-test", llmCtl.TestDraft)
+			// 拉取上游模型列表：同样避开 :id 参数段；限流因为它会向外部地址发起请求。
+			authed.POST("/llm-config-models", middleware.RateLimit(10, time.Minute), llmCtl.FetchModels)
 
 			llmTasks := authed.Group("/llm-tasks")
 			{

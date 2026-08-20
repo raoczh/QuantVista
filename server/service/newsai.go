@@ -222,6 +222,7 @@ func enhanceBatchLLM(ctx context.Context, cfg *model.LLMConfig, apiKey string, a
 	run.hashPrompt(messages)
 	res, err := chatCompletion(ctx, chatParams{
 		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
+		ReasoningEffort: cfg.ReasoningEffort,
 		Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("news", cfg.MaxTokens),
 		Messages: messages,
 		JSONMode: true, AllowPrivate: allowPrivate,

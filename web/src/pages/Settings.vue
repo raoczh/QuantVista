@@ -8,7 +8,11 @@ import {
   NSpace,
   NTable,
   NTag,
-  NModal,
+  NDrawer,
+  NDrawerContent,
+  NDivider,
+  NCheckbox,
+  NAlert,
   NForm,
   NFormItem,
   NInput,
@@ -28,8 +32,12 @@ import {
   deleteLLMConfig,
   testLLMConfig,
   testLLMDraft,
+  setDefaultLLMConfig,
+  fetchLLMModels,
   type LLMConfig,
   type LLMConfigInput,
+  type LLMModelOption,
+  type TestResult,
 } from '@/api/llm'
 import {
   getPreference,
@@ -90,34 +98,64 @@ async function doUnbindGithub() {
 /* ---------------- LLM 配置 ---------------- */
 const configs = ref<LLMConfig[]>([])
 const loadingConfigs = ref(false)
-const showModal = ref(false)
+const showDrawer = ref(false)
 const editingId = ref<number | null>(null)
 const testing = ref(false)
 const saving = ref(false)
+const settingDefaultId = ref<number | null>(null)
+// 抽屉内就地显示的测试结果（替代只弹 toast）：档位是否被上游接受、JSON 结构化能力
+// 都在 message 里，是用户确认配置真实可用性的主入口。
+const draftTestResult = ref<TestResult | null>(null)
+
+// 模型选择态：勾选=手工输入，未勾选=从拉取到的列表里选。
+// 有意不落库：编辑已有配置时无法确认其模型是否来自列表，故默认走「选择」模式并把当前
+// 值预置为唯一选项（值正确显示、绝不丢），点「拉取模型」才展开完整列表。
+const customModel = ref(false)
+const modelOptions = ref<LLMModelOption[]>([])
+const fetchingModels = ref(false)
+const modelsTruncated = ref(false)
 
 const blankForm = (): LLMConfigInput => ({
   name: '',
-  provider: 'openai',
   base_url: '',
   api_key: '',
   model: '',
   endpoint_type: 'chat_completions',
   temperature: 0.7,
   max_tokens: 8192,
+  reasoning_effort: 'max',
   stream: true,
   is_default: false,
 })
 const form = reactive<LLMConfigInput>(blankForm())
 
-const providerOptions = [
-  { label: 'OpenAI 兼容（OpenAI/DeepSeek/Moonshot/中转等）', value: 'openai' },
-  { label: '其他', value: 'other' },
-]
-
 const endpointOptions = [
   { label: 'Chat Completions（/v1/chat/completions，默认）', value: 'chat_completions' },
   { label: 'Responses（/v1/responses，OpenAI 新端点）', value: 'responses' },
 ]
+
+// 思考档位预设。可直接键入自定义值（:tag），清空=不发送该参数。
+const effortOptions = [
+  { label: 'low — 少量思考', value: 'low' },
+  { label: 'medium — 中等（多数模型默认）', value: 'medium' },
+  { label: 'high — 深度思考', value: 'high' },
+  { label: 'xhigh — 更深（GPT-5.5+）', value: 'xhigh' },
+  { label: 'max — 拉满', value: 'max' },
+  { label: 'ultra — 拉满（部分网关口径）', value: 'ultra' },
+]
+
+// 模型下拉项：拉取结果 + 兜住当前值（不在列表里也不能丢）。
+const modelSelectOptions = computed(() => {
+  const opts = modelOptions.value.map((m) => ({
+    label: m.owned_by ? `${m.id}（${m.owned_by}）` : m.id,
+    value: m.id,
+  }))
+  const current = form.model.trim()
+  if (current && !opts.some((o) => o.value === current)) {
+    opts.unshift({ label: `${current}（当前配置值，不在上游列表中）`, value: current })
+  }
+  return opts
+})
 
 async function loadConfigs() {
   loadingConfigs.value = true
@@ -130,27 +168,38 @@ async function loadConfigs() {
   }
 }
 
+// resetDrawerState 每次开抽屉都清掉上一条配置遗留的模型列表与测试结果，
+// 避免把 A 配置的上游模型列表当成 B 配置的可选项。
+function resetDrawerState() {
+  modelOptions.value = []
+  modelsTruncated.value = false
+  draftTestResult.value = null
+  customModel.value = false
+}
+
 function openCreate() {
   editingId.value = null
   Object.assign(form, blankForm())
-  showModal.value = true
+  resetDrawerState()
+  showDrawer.value = true
 }
 
 function openEdit(cfg: LLMConfig) {
   editingId.value = cfg.id
   Object.assign(form, {
     name: cfg.name,
-    provider: cfg.provider || 'openai',
     base_url: cfg.base_url,
     api_key: '', // 留空表示保留原密钥
     model: cfg.model,
     endpoint_type: cfg.endpoint_type || 'chat_completions',
     temperature: cfg.temperature,
     max_tokens: cfg.max_tokens,
+    reasoning_effort: cfg.reasoning_effort || '',
     stream: cfg.stream,
     is_default: cfg.is_default,
   })
-  showModal.value = true
+  resetDrawerState()
+  showDrawer.value = true
 }
 
 async function save() {
@@ -163,7 +212,7 @@ async function save() {
       await createLLMConfig({ ...form })
       message.success('已创建')
     }
-    showModal.value = false
+    showDrawer.value = false
     await loadConfigs()
   } catch (e) {
     message.error((e as Error).message)
@@ -182,10 +231,23 @@ async function remove(cfg: LLMConfig) {
   }
 }
 
+async function makeDefault(cfg: LLMConfig) {
+  settingDefaultId.value = cfg.id
+  try {
+    await setDefaultLLMConfig(cfg.id)
+    message.success(`已将「${cfg.name}」设为默认`)
+    await loadConfigs()
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    settingDefaultId.value = null
+  }
+}
+
 async function testSaved(cfg: LLMConfig) {
   try {
     const r = await testLLMConfig(cfg.id)
-    r.ok ? message.success(`连接成功（${r.latency_ms}ms）`) : message.error(`失败：${r.message}`)
+    r.ok ? message.success(`连接成功（${r.latency_ms}ms）${r.message.replace(/^连接成功/, '')}`) : message.error(`失败：${r.message}`)
   } catch (e) {
     message.error((e as Error).message)
   }
@@ -194,13 +256,36 @@ async function testSaved(cfg: LLMConfig) {
 async function testDraft() {
   if (!form.api_key) return message.warning('即时测试需填写 API Key（保存后可对已存配置直接测试）')
   testing.value = true
+  draftTestResult.value = null
   try {
-    const r = await testLLMDraft({ ...form })
-    r.ok ? message.success(`连接成功（${r.latency_ms}ms）`) : message.error(`失败：${r.message}`)
+    draftTestResult.value = await testLLMDraft({ ...form })
   } catch (e) {
     message.error((e as Error).message)
   } finally {
     testing.value = false
+  }
+}
+
+// loadModels 拉取上游可用模型。编辑已有配置且密钥留空时，后端复用已存密钥
+//（config_id 三态取密钥），因此改了 Base URL 也不必重填 key。
+async function loadModels() {
+  if (!form.base_url.trim()) return message.warning('请先填写 Base URL')
+  if (!form.api_key && !editingId.value) return message.warning('请先填写 API Key')
+  fetchingModels.value = true
+  try {
+    const r = await fetchLLMModels({
+      base_url: form.base_url,
+      api_key: form.api_key,
+      config_id: editingId.value ?? 0,
+    })
+    modelOptions.value = r.models
+    modelsTruncated.value = r.truncated
+    customModel.value = false
+    message.success(`已拉取 ${r.models.length} 个模型${r.truncated ? '（已截断）' : ''}`)
+  } catch (e) {
+    message.error(`${(e as Error).message}——也可勾选「自定义模型」手工填写`)
+  } finally {
+    fetchingModels.value = false
   }
 }
 
@@ -415,12 +500,21 @@ async function doExport(kind: ExportKind) {
               <n-tag :type="c.has_api_key ? 'success' : 'warning'" size="small" round>
                 {{ c.has_api_key ? '密钥已设置' : '密钥未设置' }}
               </n-tag>
+              <n-tag v-if="c.reasoning_effort" size="small" round>思考 {{ c.reasoning_effort }}</n-tag>
             </div>
             <div class="llm-model qv-mono">{{ c.model }}</div>
             <div class="llm-url">{{ c.base_url }}</div>
             <div class="llm-ops">
               <n-button size="small" @click="testSaved(c)">测试</n-button>
               <n-button size="small" @click="openEdit(c)">编辑</n-button>
+              <n-button
+                v-if="!c.is_default"
+                size="small"
+                secondary
+                :loading="settingDefaultId === c.id"
+                @click="makeDefault(c)"
+                >设为默认</n-button
+              >
               <n-popconfirm @positive-click="remove(c)">
                 <template #trigger><n-button size="small" type="error">删除</n-button></template>
                 确认删除「{{ c.name }}」？
@@ -434,6 +528,7 @@ async function doExport(kind: ExportKind) {
               <th>名称</th>
               <th>模型</th>
               <th>Base URL</th>
+              <th>思考档位</th>
               <th>密钥</th>
               <th>默认</th>
               <th>操作</th>
@@ -444,6 +539,10 @@ async function doExport(kind: ExportKind) {
               <td>{{ c.name }}</td>
               <td>{{ c.model }}</td>
               <td>{{ c.base_url }}</td>
+              <td>
+                <n-tag v-if="c.reasoning_effort" size="small" round>{{ c.reasoning_effort }}</n-tag>
+                <span v-else class="llm-muted">未设置</span>
+              </td>
               <td>
                 <n-tag :type="c.has_api_key ? 'success' : 'warning'" size="small" round>
                   {{ c.has_api_key ? '已设置' : '未设置' }}
@@ -456,6 +555,14 @@ async function doExport(kind: ExportKind) {
                 <n-space :size="6">
                   <n-button size="tiny" @click="testSaved(c)">测试</n-button>
                   <n-button size="tiny" @click="openEdit(c)">编辑</n-button>
+                  <n-button
+                    v-if="!c.is_default"
+                    size="tiny"
+                    secondary
+                    :loading="settingDefaultId === c.id"
+                    @click="makeDefault(c)"
+                    >设为默认</n-button
+                  >
                   <n-popconfirm @positive-click="remove(c)">
                     <template #trigger><n-button size="tiny" type="error">删除</n-button></template>
                     确认删除「{{ c.name }}」？
@@ -668,60 +775,138 @@ async function doExport(kind: ExportKind) {
       :preference="pref"
       @updated="applyGuidePreference"
     />
-    <n-modal v-model:show="showModal" preset="card" :title="editingId ? '编辑 LLM 配置' : '新增 LLM 配置'" style="max-width: 520px">
-      <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 96">
-        <n-form-item label="名称">
-          <n-input v-model:value="form.name" placeholder="如 我的 DeepSeek" />
-        </n-form-item>
-        <n-form-item label="类型">
-          <n-select v-model:value="form.provider" :options="providerOptions" />
-        </n-form-item>
-        <n-form-item label="Base URL">
-          <div style="width: 100%">
-            <n-input v-model:value="form.base_url" placeholder="如 https://api.deepseek.com 或中转站根地址" />
-            <div class="field-hint">填根地址即可，请求时按下方端点类型自动补全路径；以 /v1 结尾或填完整端点也支持。</div>
-          </div>
-        </n-form-item>
-        <n-form-item label="接口端点">
-          <div style="width: 100%">
-            <n-select v-model:value="form.endpoint_type" :options="endpointOptions" />
-            <div class="field-hint">普通中转/兼容服务选 Chat Completions；仅在上游明确支持 OpenAI Responses API 时选 Responses。</div>
-          </div>
-        </n-form-item>
-        <n-form-item label="API Key">
-          <n-input
-            v-model:value="form.api_key"
-            type="password"
-            show-password-on="click"
-            :placeholder="editingId ? '留空表示保留原密钥' : 'sk-...'"
-          />
-        </n-form-item>
-        <n-form-item label="模型">
-          <n-input v-model:value="form.model" placeholder="如 deepseek-chat" />
-        </n-form-item>
-        <n-form-item label="Temperature">
-          <n-input-number v-model:value="form.temperature" :min="0" :max="2" :step="0.1" />
-        </n-form-item>
-        <n-form-item label="Max Tokens">
-          <n-input-number v-model:value="form.max_tokens" :min="1" :precision="0" />
-        </n-form-item>
-        <n-form-item label="流式输出">
-          <n-switch v-model:value="form.stream" />
-        </n-form-item>
-        <n-form-item label="设为默认">
-          <n-switch v-model:value="form.is_default" />
-        </n-form-item>
-      </n-form>
-      <template #footer>
-        <n-space justify="space-between">
-          <n-button :loading="testing" @click="testDraft">测试连接</n-button>
-          <n-space>
-            <n-button @click="showModal = false">取消</n-button>
-            <n-button type="primary" :loading="saving" @click="save">保存</n-button>
+    <!-- LLM 配置抽屉：桌面右侧、手机底部上拉（§4.3 断点 768px）。
+         必须留在 PageContainer 内部——页面单根硬约束，双根会让离开本页时整个应用白屏。 -->
+    <n-drawer
+      v-model:show="showDrawer"
+      :placement="isMobile ? 'bottom' : 'right'"
+      :width="isMobile ? undefined : 'min(560px, 92vw)'"
+      :height="isMobile ? '88vh' : undefined"
+      :native-scrollbar="false"
+    >
+      <n-drawer-content :title="editingId ? '编辑 LLM 配置' : '新增 LLM 配置'" closable>
+        <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 104">
+          <n-divider title-placement="left" class="drawer-divider">基础连接</n-divider>
+          <n-form-item label="名称">
+            <n-input v-model:value="form.name" placeholder="如 我的 DeepSeek" />
+          </n-form-item>
+          <n-form-item label="Base URL">
+            <div class="field-block">
+              <n-input v-model:value="form.base_url" placeholder="如 https://api.deepseek.com 或中转站根地址" />
+              <div class="field-hint">填根地址即可，请求时按下方端点类型自动补全路径；以 /v1 结尾或填完整端点也支持。</div>
+            </div>
+          </n-form-item>
+          <n-form-item label="API Key">
+            <div class="field-block">
+              <n-input
+                v-model:value="form.api_key"
+                type="password"
+                show-password-on="click"
+                :placeholder="editingId ? '留空表示保留原密钥' : 'sk-...'"
+              />
+              <div v-if="editingId" class="field-hint">留空保留原密钥；拉取模型与保存都不需要重填。</div>
+            </div>
+          </n-form-item>
+          <n-form-item label="接口端点">
+            <div class="field-block">
+              <n-select v-model:value="form.endpoint_type" :options="endpointOptions" />
+              <div class="field-hint">普通中转/兼容服务选 Chat Completions；仅在上游明确支持 OpenAI Responses API 时选 Responses。</div>
+            </div>
+          </n-form-item>
+
+          <n-divider title-placement="left" class="drawer-divider">模型</n-divider>
+          <n-form-item label="模型来源">
+            <div class="field-block">
+              <n-checkbox v-model:checked="customModel">自定义模型（手工输入模型名）</n-checkbox>
+              <div class="field-hint">
+                不勾选时从上游拉取的列表里选；网关未开放 /v1/models 或想用列表外的模型名时勾选手填。
+              </div>
+            </div>
+          </n-form-item>
+          <n-form-item label="模型">
+            <div class="field-block">
+              <n-input v-if="customModel" v-model:value="form.model" placeholder="如 deepseek-chat" />
+              <div v-else class="model-picker">
+                <n-select
+                  v-model:value="form.model"
+                  :options="modelSelectOptions"
+                  filterable
+                  placeholder="先拉取模型，再选择"
+                  :loading="fetchingModels"
+                />
+                <n-button :loading="fetchingModels" @click="loadModels">拉取模型</n-button>
+              </div>
+              <div v-if="modelsTruncated" class="field-hint">
+                上游模型过多，列表已截断至前 500 个（按名称排序）；要用未列出的模型请勾选「自定义模型」。
+              </div>
+            </div>
+          </n-form-item>
+
+          <n-divider title-placement="left" class="drawer-divider">生成参数</n-divider>
+          <n-form-item label="Temperature">
+            <div class="field-block">
+              <n-input-number v-model:value="form.temperature" :min="0" :max="2" :step="0.1" />
+              <div class="field-hint">0~2。部分推理模型只接受默认温度，被上游拒绝时系统会自动去掉该参数重试。</div>
+            </div>
+          </n-form-item>
+          <n-form-item label="Max Tokens">
+            <div class="field-block">
+              <n-input-number v-model:value="form.max_tokens" :min="1" :precision="0" />
+              <div class="field-hint">
+                单次输出预算。推理模型（GPT-5/o 系列）按「正文 + 隐藏思考」合计计费，系统会自动为思考预留一倍空间。
+              </div>
+            </div>
+          </n-form-item>
+          <n-form-item label="思考档位">
+            <div class="field-block">
+              <n-select
+                v-model:value="form.reasoning_effort"
+                :options="effortOptions"
+                filterable
+                tag
+                clearable
+                placeholder="清空 = 不发送该参数（沿用网关默认）"
+              />
+              <div class="field-hint">
+                请求时作为 <code>reasoning_effort</code>（Responses 端为 <code>reasoning.effort</code>）发送，可直接键入自定义值。<br />
+                OpenAI 官方档位为 none/minimal/low/medium/high/xhigh（o 系列只认 low/medium/high）；max、ultra 仅部分中转网关支持。<br />
+                <strong>上游不接受所配档位时系统会自动去参重试</strong>——业务不受影响，但实际用的是网关默认档位。以「测试连接」结果与调用审计为准。
+              </div>
+            </div>
+          </n-form-item>
+
+          <n-divider title-placement="left" class="drawer-divider">默认与流式</n-divider>
+          <n-form-item label="流式输出">
+            <n-switch v-model:value="form.stream" />
+          </n-form-item>
+          <n-form-item label="设为默认">
+            <div class="field-block">
+              <n-switch v-model:value="form.is_default" />
+              <div class="field-hint">未指定配置的 AI 功能默认走这一条。</div>
+            </div>
+          </n-form-item>
+        </n-form>
+
+        <n-alert
+          v-if="draftTestResult"
+          class="drawer-test-result"
+          :type="draftTestResult.ok ? 'success' : 'error'"
+          :title="draftTestResult.ok ? `连接成功（${draftTestResult.latency_ms}ms）` : '连接失败'"
+        >
+          {{ draftTestResult.message }}
+        </n-alert>
+
+        <template #footer>
+          <n-space justify="space-between" style="width: 100%">
+            <n-button :loading="testing" @click="testDraft">测试连接</n-button>
+            <n-space>
+              <n-button @click="showDrawer = false">取消</n-button>
+              <n-button type="primary" :loading="saving" @click="save">保存</n-button>
+            </n-space>
           </n-space>
-        </n-space>
-      </template>
-    </n-modal>
+        </template>
+      </n-drawer-content>
+    </n-drawer>
   </PageContainer>
 </template>
 
@@ -751,6 +936,36 @@ async function doExport(kind: ExportKind) {
   opacity: 0.55;
   margin-top: 6px;
   line-height: 1.5;
+}
+/* 抽屉内的字段块：控件占满 + 下方说明文案（表单项宽度由 n-form-item 控制） */
+.field-block {
+  width: 100%;
+}
+.drawer-divider {
+  margin-top: 4px !important;
+  margin-bottom: 14px !important;
+}
+.drawer-divider :deep(.n-divider__title) {
+  font-size: 13px;
+  font-weight: 600;
+  opacity: 0.8;
+}
+/* 模型选择：下拉自适应 + 拉取按钮不被压缩 */
+.model-picker {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.model-picker > :first-child {
+  flex: 1;
+  min-width: 0;
+}
+.drawer-test-result {
+  margin-top: 4px;
+}
+.llm-muted {
+  font-size: 12px;
+  opacity: 0.45;
 }
 .card-toolbar {
   display: flex;

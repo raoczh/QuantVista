@@ -633,6 +633,12 @@ P0-5 为 user owner 的 failed 终态增加 `job_failure_notifications` 幂等�
 > **HTTP 客户端加固（2026-07-03；2026-07-22 长流修订）**：`service/ai_client.go` 复用包级连接池（allowPrivate 两态各一个 client，repair/panel 连发请求不再重复 TLS 握手）；全部业务 `chatCompletion` 默认先发真正 SSE 请求，流式 client 不设整体 `Timeout`，只以 90s `ResponseHeaderTimeout` 防建连挂死、以后台任务总 deadline 控制全程。SSE 请求固定携带 `Accept: text/event-stream`、`Cache-Control: no-cache`、`Accept-Encoding: identity`，Transport 禁用自动压缩，避免兼容网关/反代缓冲分片后触发 60s 空闲超时。瞬时失败只重试未达上游的网络错误与 429/500/502/503；504 视为真实超时不自动重试。错误按状态码归类并透传上游 error.message；usage 缺失时按字符粗估，仅用于审计。
 >
 > **双端点类型（2026-07-09）**：LLM 配置新增 `endpoint_type`（`chat_completions` 默认 / `responses`）。`responses` 走 `ai_client_responses.go` 按 new-api relayconvert 口径适配 `/v1/responses`（system→instructions 合并、messages→input、max_tokens→max_output_tokens、response_format→text.format、output 取 message+assistant 的 output_text、usage input/output_tokens 映射；流式按事件 type 分派）。两端点共用 `chatCompletion`/`chatCompletionStream` 入口，对 caller 透明。
+>
+> **思考档位可配（2026-08-20，推翻此前「不暴露用户配置」的定夺）**：LLM 配置新增 `reasoning_effort`——chat 端发平铺 `reasoning_effort`、responses 端发嵌套 `reasoning.effort`（`addReasoningEffortField`）。**空值 = 不发送该参数**，沿用网关/模型默认档位；前端新建配置预填 `max`，下拉 low/medium/high/xhigh/max/ultra 且允许自定义键入，存量配置保持空、未做批量迁移。取值**不做枚举校验**（只校验格式：小写字母数字与 `-_`、≤16 字符），因为各家档位在持续扩且中转网关口径不一，与 provider 同样按「用户自由填写 + 运行时能力观察」处理。
+>
+> 上游拒绝档位时**无害降级**：四处 fallback 点（chat/responses × 流式/非流式）去参重试，业务照常出结果。**两类拒绝都覆盖**——①参数本身不认（非推理模型）②所配档位不在取值集合内（`max`/`ultra` 不是 OpenAI 官方档位，官方为 none/minimal/low/medium/high/xhigh，o 系列只认 low/medium/high，故这是常态路径）。第 ②类的报错常不含字段名，`looksLikeUnsupportedReasoningEffort` 用排除法归因（档位是唯一取值由用户自由填写的枚举参数）。这与 `max_tokens` **故意排除「值超限」的做法相反**：去掉 token 预算有害，去掉档位只是回到默认档位。去参重试成功后才落 `capReasoningEffort` 观察（12h TTL，声明化路由据此直接不发）；值被拒时另打 `SysWarn` 带上游列出的合法档位，连接测试结果也如实标注「已接受 / 上游不接受」——否则用户会以为档位生效、实际一直在用网关默认档位。
+>
+> **配置面板（2026-08-20）**：编辑弹框改为右侧抽屉（移动端底部上拉），分「基础连接 / 模型 / 生成参数 / 默认与流式」四段并逐项配说明，测试结果就地展示。模型支持 `POST /api/llm-config-models` 从上游 `/v1/models` 拉取后选择，或勾「自定义模型」手填；密钥三态（入参 → 该配置已存密钥 → 报错）让「改了 Base URL 不必重填 key」成立。列表行加「设为默认」（`POST /api/llm-configs/:id/default`，与增改同一「单默认」事务纪律）。表单撤除「类型」选择（原 openai/other 走的本就是同一条兼容路径），但**后端 `provider` 字段保留**——它仍参与能力矩阵初始声明、审计标签与校准分层键，新建填 `openai`、更新入参空则沿用原值。
 
 ### 6.1 推荐流程（四阶段流水线，2026-07-04 重构；2026-07-06 来源随策略组合）
 

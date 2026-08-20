@@ -13,19 +13,21 @@ import (
 // llmCallTarget 是一次 attempt 经模型路由后的进程内目标快照。APIKey 仅供同批
 // score-blind 配对调用复用，禁止序列化或落库。
 type llmCallTarget struct {
-	BaseURL             string
-	APIKey              string
-	Model               string
-	EndpointType        string
-	Temperature         float64
-	MaxTokens           int
-	AccuracyContract    bool
-	JSONMode            bool
-	TemperatureOmitted  bool
-	MaxCompletionTokens bool
-	AllowPrivate        bool
-	ConfigID            int64
-	Provider            string
+	BaseURL                string
+	APIKey                 string
+	Model                  string
+	EndpointType           string
+	Temperature            float64
+	MaxTokens              int
+	ReasoningEffort        string
+	AccuracyContract       bool
+	JSONMode               bool
+	TemperatureOmitted     bool
+	ReasoningEffortOmitted bool
+	MaxCompletionTokens    bool
+	AllowPrivate           bool
+	ConfigID               int64
+	Provider               string
 }
 
 // P0-2 统一运行元数据 + P0-8 调用关联/完整性元数据（docs/LLM_ACCURACY_OPTIMIZATION_PLAN.md §5.1/§7.1）。
