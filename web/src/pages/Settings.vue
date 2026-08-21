@@ -145,17 +145,29 @@ const effortOptions = [
 ]
 
 // 模型下拉项：拉取结果 + 兜住当前值（不在列表里也不能丢）。
+// `?? ''` 不是多余的防御：这个 computed 在抽屉渲染路径上，一旦抛错整个抽屉 body 都渲染
+// 不出来，代价远大于一次空值兜底（model 走 n-select 时被清空即为 null）。
 const modelSelectOptions = computed(() => {
   const opts = modelOptions.value.map((m) => ({
     label: m.owned_by ? `${m.id}（${m.owned_by}）` : m.id,
     value: m.id,
   }))
-  const current = form.model.trim()
+  const current = (form.model ?? '').trim()
   if (current && !opts.some((o) => o.value === current)) {
     opts.unshift({ label: `${current}（当前配置值，不在上游列表中）`, value: current })
   }
   return opts
 })
+
+// normalizeForm 提交/测试前归一化自由输入字段。
+// 思考档位由 n-select 的 tag 模式手工键入，用户很自然会写成 "High"、" max "，而后端只收
+// 小写（格式校验 ^[a-z0-9][a-z0-9_-]*$）；clearable 清空时值是 null，也在这里落回空串。
+function normalizeForm() {
+  form.name = (form.name ?? '').trim()
+  form.base_url = (form.base_url ?? '').trim()
+  form.model = (form.model ?? '').trim()
+  form.reasoning_effort = (form.reasoning_effort ?? '').trim().toLowerCase()
+}
 
 async function loadConfigs() {
   loadingConfigs.value = true
@@ -203,6 +215,7 @@ function openEdit(cfg: LLMConfig) {
 }
 
 async function save() {
+  normalizeForm()
   saving.value = true
   try {
     if (editingId.value) {
@@ -253,12 +266,17 @@ async function testSaved(cfg: LLMConfig) {
   }
 }
 
+// testDraft 测试抽屉里当前这份表单。编辑已有配置时密钥可留空——带上 config_id 后端复用
+// 已存密钥（与 loadModels 同一套三态），否则「只改了思考档位想测一下」得先重填 key。
 async function testDraft() {
-  if (!form.api_key) return message.warning('即时测试需填写 API Key（保存后可对已存配置直接测试）')
+  normalizeForm()
+  if (!form.base_url) return message.warning('请先填写 Base URL')
+  if (!form.model) return message.warning('请先选择或填写模型')
+  if (!form.api_key && !editingId.value) return message.warning('新建配置的测试需先填写 API Key')
   testing.value = true
   draftTestResult.value = null
   try {
-    draftTestResult.value = await testLLMDraft({ ...form })
+    draftTestResult.value = await testLLMDraft({ ...form, config_id: editingId.value ?? 0 })
   } catch (e) {
     message.error((e as Error).message)
   } finally {
@@ -269,7 +287,8 @@ async function testDraft() {
 // loadModels 拉取上游可用模型。编辑已有配置且密钥留空时，后端复用已存密钥
 //（config_id 三态取密钥），因此改了 Base URL 也不必重填 key。
 async function loadModels() {
-  if (!form.base_url.trim()) return message.warning('请先填写 Base URL')
+  form.base_url = (form.base_url ?? '').trim()
+  if (!form.base_url) return message.warning('请先填写 Base URL')
   if (!form.api_key && !editingId.value) return message.warning('请先填写 API Key')
   fetchingModels.value = true
   try {
@@ -782,17 +801,28 @@ async function doExport(kind: ExportKind) {
       :placement="isMobile ? 'bottom' : 'right'"
       :width="isMobile ? undefined : 'min(560px, 92vw)'"
       :height="isMobile ? '88vh' : undefined"
-      :native-scrollbar="false"
     >
-      <n-drawer-content :title="editingId ? '编辑 LLM 配置' : '新增 LLM 配置'" closable>
+      <!-- native-scrollbar 必须落在 n-drawer-content 上，不能给 n-drawer：给 n-drawer 传 false 会
+           摘掉根元素的 n-drawer--native-scrollbar 类，而该类是 .n-drawer-content-wrapper 拿到
+           height:100% 的唯一来源；父高度变 auto 后 .n-drawer-body 的 flex:1 0 0 分不到剩余空间，
+           body 高度塌成 0，整个表单被 overflow:hidden 裁掉（表现为抽屉里只剩标题和按钮）。 -->
+      <n-drawer-content
+        :title="editingId ? '编辑 LLM 配置' : '新增 LLM 配置'"
+        closable
+        :native-scrollbar="false"
+      >
         <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 104">
           <n-divider title-placement="left" class="drawer-divider">基础连接</n-divider>
           <n-form-item label="名称">
-            <n-input v-model:value="form.name" placeholder="如 我的 DeepSeek" />
+            <n-input v-model:value="form.name" placeholder="如 我的 DeepSeek" :maxlength="64" />
           </n-form-item>
           <n-form-item label="Base URL">
             <div class="field-block">
-              <n-input v-model:value="form.base_url" placeholder="如 https://api.deepseek.com 或中转站根地址" />
+              <n-input
+                v-model:value="form.base_url"
+                placeholder="如 https://api.deepseek.com 或中转站根地址"
+                :maxlength="256"
+              />
               <div class="field-hint">填根地址即可，请求时按下方端点类型自动补全路径；以 /v1 结尾或填完整端点也支持。</div>
             </div>
           </n-form-item>
@@ -804,7 +834,7 @@ async function doExport(kind: ExportKind) {
                 show-password-on="click"
                 :placeholder="editingId ? '留空表示保留原密钥' : 'sk-...'"
               />
-              <div v-if="editingId" class="field-hint">留空保留原密钥；拉取模型与保存都不需要重填。</div>
+              <div v-if="editingId" class="field-hint">留空保留原密钥；测试连接、拉取模型与保存都不必重填。</div>
             </div>
           </n-form-item>
           <n-form-item label="接口端点">
@@ -825,7 +855,12 @@ async function doExport(kind: ExportKind) {
           </n-form-item>
           <n-form-item label="模型">
             <div class="field-block">
-              <n-input v-if="customModel" v-model:value="form.model" placeholder="如 deepseek-chat" />
+              <n-input
+                v-if="customModel"
+                v-model:value="form.model"
+                placeholder="如 deepseek-chat"
+                :maxlength="64"
+              />
               <div v-else class="model-picker">
                 <n-select
                   v-model:value="form.model"

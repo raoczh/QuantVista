@@ -129,7 +129,9 @@ func (lc *LLMController) FetchModels(c *gin.Context) {
 	common.ApiSuccess(c, gin.H{"models": models, "truncated": truncated})
 }
 
-// TestDraft POST /api/llm-configs/test —— 测试未保存的表单配置。
+// TestDraft POST /api/llm-config-test —— 测试表单里的配置（可以是未保存的新建草稿，也可以是
+// 编辑中的已有配置；后者密钥留空即复用已存密钥，需前端带上 config_id）。
+// 路径与 /llm-configs/:id 分开，避免 "test" 被当成 :id 参数段。
 func (lc *LLMController) TestDraft(c *gin.Context) {
 	var in service.LLMConfigInput
 	if err := c.ShouldBindJSON(&in); err != nil {

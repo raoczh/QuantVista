@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"quantvista/common"
 	"quantvista/model"
@@ -108,6 +109,21 @@ func normalizeEndpointType(v string) string {
 // 由请求层去参降级并落能力观察（looksLikeUnsupportedReasoningEffort）。
 var llmReasoningEffortPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 
+// 字段长度上限，与 model.LLMConfig 的 gorm size 标签一一对应。改列宽时必须同步改这里，
+// 否则要么白拦合法值、要么把超长值放到 DB 层才炸。
+const (
+	llmNameMaxLen    = 64
+	llmBaseURLMaxLen = 256
+	llmModelMaxLen   = 64
+)
+
+// normalizeBaseURL 去首尾空白再去尾部斜杠。**顺序不能反**：只 TrimRight("/") 的话，从别处
+// 复制来的 " https://api.x.com " 会带着空格落库，之后 url.Parse 解不出 scheme，用户看着地址
+// 明明是对的却一直报「Base URL 非法」，极难自查。
+func normalizeBaseURL(v string) string {
+	return strings.TrimRight(strings.TrimSpace(v), "/")
+}
+
 // defaultProviderName 新建配置的 provider 缺省值。表单已不再让用户选「类型」（原 openai/other
 // 两项走的本就是同一条 OpenAI 兼容代码路径），但该字段在后端仍有实际语义——参与能力矩阵
 // 初始声明（builtinProviderCapabilities）、审计标签与校准分层键，故保留并按兼容口径填 openai。
@@ -147,6 +163,19 @@ func (s *LLMService) validate(in LLMConfigInput) error {
 	if strings.TrimSpace(in.Model) == "" {
 		return errors.New("模型名不能为空")
 	}
+	// 长度按 DB 列宽拦在业务层（model.LLMConfig：Name/Model varchar(64)、BaseURL varchar(256)）。
+	// 不拦的话 MySQL 严格模式抛 Error 1406 原始报错、SQLite 却静默存下，两端行为还不一致。
+	// 模型名尤其需要——「从上游拉取模型」会把聚合中转的长模型名（accounts/xxx/models/yyy 形态）
+	// 直接灌进表单，是本次新增的可达路径。按字符数计以对齐 varchar 语义（Go 的 len 是字节）。
+	if n := utf8.RuneCountInString(strings.TrimSpace(in.Name)); n > llmNameMaxLen {
+		return fmt.Errorf("名称过长（%d 字符，最多 %d）", n, llmNameMaxLen)
+	}
+	if n := utf8.RuneCountInString(strings.TrimSpace(in.BaseURL)); n > llmBaseURLMaxLen {
+		return fmt.Errorf("Base URL 过长（%d 字符，最多 %d）", n, llmBaseURLMaxLen)
+	}
+	if n := utf8.RuneCountInString(strings.TrimSpace(in.Model)); n > llmModelMaxLen {
+		return fmt.Errorf("模型名过长（%d 字符，最多 %d）——若确需使用该模型请联系管理员放宽列宽", n, llmModelMaxLen)
+	}
 	if in.Temperature < 0 || in.Temperature > 2 {
 		return errors.New("temperature 需在 0~2 之间")
 	}
@@ -177,11 +206,11 @@ func (s *LLMService) Create(userID int64, in LLMConfigInput) (*LLMConfigView, er
 	}
 	cfg := model.LLMConfig{
 		UserID:          userID,
-		Name:            in.Name,
+		Name:            strings.TrimSpace(in.Name),
 		Provider:        defaultProviderName(in.Provider),
-		BaseURL:         strings.TrimRight(in.BaseURL, "/"),
+		BaseURL:         normalizeBaseURL(in.BaseURL),
 		APIKeyCipher:    cipher,
-		Model:           in.Model,
+		Model:           strings.TrimSpace(in.Model),
 		EndpointType:    normalizeEndpointType(in.EndpointType),
 		Temperature:     in.Temperature,
 		MaxTokens:       in.MaxTokens,
@@ -215,14 +244,14 @@ func (s *LLMService) Update(userID, id int64, in LLMConfigInput) (*LLMConfigView
 	if err != nil {
 		return nil, err
 	}
-	cfg.Name = in.Name
+	cfg.Name = strings.TrimSpace(in.Name)
 	// provider 已从表单撤除（只保留接口端点），入参空时沿用原值：它仍参与能力矩阵初始
 	// 声明、审计标签与校准分层键，静默改写会让历史记录的这些维度漂移。
 	if p := strings.TrimSpace(in.Provider); p != "" {
 		cfg.Provider = p
 	}
-	cfg.BaseURL = strings.TrimRight(in.BaseURL, "/")
-	cfg.Model = in.Model
+	cfg.BaseURL = normalizeBaseURL(in.BaseURL)
+	cfg.Model = strings.TrimSpace(in.Model)
 	cfg.EndpointType = normalizeEndpointType(in.EndpointType)
 	cfg.Temperature = in.Temperature
 	cfg.MaxTokens = in.MaxTokens
@@ -271,9 +300,7 @@ func (s *LLMService) SetDefault(userID, id int64) (*LLMConfigView, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !cfg.IsDefault {
-		cfg.IsDefault = true
-	}
+	cfg.IsDefault = true
 	err = common.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(cfg).Update("is_default", true).Error; err != nil {
 			return err
@@ -287,6 +314,32 @@ func (s *LLMService) SetDefault(userID, id int64) (*LLMConfigView, error) {
 	return &v, nil
 }
 
+// resolveProbeKey 探测类请求（拉取模型 / 草稿测试连接）的密钥三态解析：入参 APIKey 非空
+// 用它；留空且带 ConfigID 时解密该配置已存的密钥（覆盖「编辑时改了 Base URL 或只改了档位，
+// 不想重填密钥」）；两者皆无则报错。allowPrivate 一并按配置所有者重判，与测试连接一致。
+//
+// 抽出来是为了让「拉取模型」和「测试连接」在同一个抽屉里行为一致——只有一边支持复用已存
+// 密钥的话，用户会以为测试连接坏了。missingKeyMsg 由调用方给，便于文案贴合各自场景。
+func (s *LLMService) resolveProbeKey(userID int64, in LLMConfigInput, allowPrivate bool, missingKeyMsg string) (string, bool, error) {
+	apiKey := strings.TrimSpace(in.APIKey)
+	if apiKey == "" && in.ConfigID > 0 {
+		cfg, err := s.getOwned(userID, in.ConfigID) // 已限本人，拿不到别人的配置
+		if err != nil {
+			return "", allowPrivate, err
+		}
+		key, derr := common.Decrypt(cfg.APIKeyCipher)
+		if derr != nil {
+			return "", allowPrivate, errors.New("密钥解密失败")
+		}
+		apiKey = strings.TrimSpace(key)
+		allowPrivate = llmAllowPrivate(allowPrivate, cfg)
+	}
+	if apiKey == "" {
+		return "", allowPrivate, errors.New(missingKeyMsg)
+	}
+	return apiKey, allowPrivate, nil
+}
+
 // LLMModelOption 上游可用模型列表条目。
 type LLMModelOption struct {
 	ID      string `json:"id"`
@@ -297,31 +350,16 @@ type LLMModelOption struct {
 // 全量灌给前端下拉既慢也无用。超限时截断——调用方文案如实说明已截断。
 const llmModelsFetchLimit = 500
 
-// FetchModels 拉取上游可用模型列表（OpenAI 兼容 GET /v1/models）。
-// 密钥三态：入参 APIKey 非空用它；留空且带 ConfigID 时解密该配置已存的密钥（覆盖
-// 「编辑时改了 Base URL 但不想重填密钥」）；两者皆无则报错。
+// FetchModels 拉取上游可用模型列表（OpenAI 兼容 GET /v1/models）。密钥三态见 resolveProbeKey。
 func (s *LLMService) FetchModels(userID int64, in LLMConfigInput, allowPrivate bool) ([]LLMModelOption, bool, error) {
-	baseURL := strings.TrimRight(strings.TrimSpace(in.BaseURL), "/")
+	baseURL := normalizeBaseURL(in.BaseURL)
 	if baseURL == "" {
 		return nil, false, errors.New("拉取模型需要先填写 Base URL")
 	}
-	apiKey := strings.TrimSpace(in.APIKey)
-	if apiKey == "" && in.ConfigID > 0 {
-		cfg, err := s.getOwned(userID, in.ConfigID)
-		if err != nil {
-			return nil, false, err
-		}
-		key, derr := common.Decrypt(cfg.APIKeyCipher)
-		if derr != nil {
-			return nil, false, errors.New("密钥解密失败")
-		}
-		apiKey = strings.TrimSpace(key)
-		// 该配置本身是管理员的（普通用户不可能拿到别人的配置，getOwned 已限本人），
-		// 内网放行判定沿用调用方角色，与测试连接一致。
-		allowPrivate = llmAllowPrivate(allowPrivate, cfg)
-	}
-	if apiKey == "" {
-		return nil, false, errors.New("拉取模型需要 API Key（新建配置请先填写，编辑已有配置可留空复用原密钥）")
+	apiKey, allowPrivate, err := s.resolveProbeKey(userID, in, allowPrivate,
+		"拉取模型需要 API Key（新建配置请先填写，编辑已有配置可留空复用原密钥）")
+	if err != nil {
+		return nil, false, err
 	}
 
 	u, err := url.Parse(baseURL)
@@ -416,14 +454,24 @@ func (s *LLMService) TestByID(userID, id int64, allowPrivate bool) (*TestResult,
 	}), nil
 }
 
-// TestByInput 测试未保存的配置（前端表单即时测试）。
+// TestByInput 测试未保存的配置（前端表单即时测试）。密钥三态见 resolveProbeKey：编辑
+// 已有配置时留空即复用原密钥，否则「只改了思考档位就想测一下」必须先重填 key 才能测，
+// 而同一抽屉里的「拉取模型」却不用——那种不一致会被当成测试连接坏了。
 func (s *LLMService) TestByInput(userID int64, in LLMConfigInput, allowPrivate bool) (*TestResult, error) {
-	if in.BaseURL == "" || in.Model == "" || in.APIKey == "" {
-		return nil, errors.New("测试需要 base_url、model 与 api_key")
+	baseURL := normalizeBaseURL(in.BaseURL)
+	if baseURL == "" || strings.TrimSpace(in.Model) == "" {
+		return nil, errors.New("测试需要 base_url 与 model")
+	}
+	apiKey, allowPrivate, err := s.resolveProbeKey(userID, in, allowPrivate,
+		"测试需要 API Key（新建配置请先填写，编辑已有配置可留空复用原密钥）")
+	if err != nil {
+		return nil, err
 	}
 	return s.testConnection(llmProbeTarget{
-		UserID: userID, Provider: in.Provider, EndpointType: in.EndpointType,
-		BaseURL: strings.TrimRight(in.BaseURL, "/"), APIKey: in.APIKey, Model: in.Model,
+		// ConfigID 带上：草稿的能力观察 key 含 base_url/model/endpoint 四维，不会与其他目标
+		// 串味，而带上它审计侧才能把这次 module=test 调用归因到具体哪条配置。
+		UserID: userID, ConfigID: in.ConfigID, Provider: in.Provider, EndpointType: in.EndpointType,
+		BaseURL: baseURL, APIKey: apiKey, Model: strings.TrimSpace(in.Model),
 		ReasoningEffort: strings.TrimSpace(in.ReasoningEffort), AllowPrivate: allowPrivate,
 	}), nil
 }

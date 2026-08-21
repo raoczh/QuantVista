@@ -32,6 +32,9 @@ export interface LLMConfigInput {
   reasoning_effort: string
   stream: boolean
   is_default: boolean
+  // config_id 只在「测试连接」时带上：编辑已有配置且密钥留空时，后端复用该配置已存的密钥
+  // （与拉取模型同一套三态）。增改路径后端忽略此字段。
+  config_id?: number
 }
 
 export interface TestResult {
