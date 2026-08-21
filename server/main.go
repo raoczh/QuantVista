@@ -57,6 +57,10 @@ func main() {
 	service.StartIntradayJobs()
 	service.StartLLMLogJobs()
 	service.StartJobMaintenanceJobs()
+	// daily_bars 保留期清理：每日 03:50 删除超出 400 天的日线（约 270 交易日，覆盖
+	// ma250/pos_250/板块分位等 250 交易日窗口）。错在 03:35 作业事件清理之后、盘前
+	// 同步之前，避开所有读写 daily_bars 的盘后链路。
+	service.StartDailyBarRetentionJob()
 	// B8/B9 公司行动与打新日历：每日 19:25 同步四张 RPT_* 报表
 	//（错峰在 19:05 财报之后、19:35 盘后守护轮之前——守护轮要消费本轮落库的解禁/除权数据）。
 	service.StartCorpActionJobs()

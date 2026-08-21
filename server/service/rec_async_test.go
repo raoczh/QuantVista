@@ -98,11 +98,8 @@ func TestRecommendationAsyncShell(t *testing.T) {
 	if b.Status != model.RecStatusFailed || !strings.Contains(b.Error, "该市场暂无行情数据源支持") {
 		t.Fatalf("后台应回写 failed 与原因: %+v", b)
 	}
-	var runs []model.JobRun
-	if err := common.DB.Where("user_id = ? AND result_type = ? AND result_id = ?", int64(31), JobResultRecommendation, v.ID).Find(&runs).Error; err != nil {
-		t.Fatal(err)
-	}
-	if len(runs) != 1 || runs[0].Status != model.JobStatusFailed {
+	runs := waitTerminalJobRuns(t, 31, JobResultRecommendation, v.ID, 1)
+	if runs[0].Status != model.JobStatusFailed {
 		t.Fatalf("推荐必须有唯一失败 JobRun 结果引用: %+v", runs)
 	}
 }

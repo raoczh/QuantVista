@@ -197,6 +197,10 @@ func syncPositionPeaksBefore(ctx context.Context, userID int64, positions []mode
 	byKey := map[string][]int{}
 	seenSymbols := map[string]bool{}
 	var symbols []string
+	// 市场集合与 symbol 一起收集：daily_bars 的索引都以 (symbol, market) 或 (market, ...)
+	// 起头，只给 symbol 的查询拿不到 trade_date 那一段，等于逐股扫全历史再在内存里筛日期。
+	seenMarkets := map[string]bool{}
+	var markets []string
 	globalLower := before
 	for i := range positions {
 		p := positions[i]
@@ -221,6 +225,10 @@ func syncPositionPeaksBefore(ctx context.Context, userID int64, positions []mode
 			seenSymbols[candidate.Symbol] = true
 			symbols = append(symbols, candidate.Symbol)
 		}
+		if !seenMarkets[candidate.Market] {
+			seenMarkets[candidate.Market] = true
+			markets = append(markets, candidate.Market)
+		}
 		if lower < globalLower {
 			globalLower = lower
 		}
@@ -230,8 +238,10 @@ func syncPositionPeaksBefore(ctx context.Context, userID int64, positions []mode
 	}
 	var bars []model.DailyBar
 	if len(symbols) > 0 && globalLower < before {
+		// market 一并入条件走索引；跨市场同名代码的行仍按 QuoteKey 归并，不会错配。
 		if err := common.DB.WithContext(ctx).Where(
-			"symbol IN ? AND trade_date > ? AND trade_date < ? AND high > 0", symbols, globalLower, before,
+			"market IN ? AND symbol IN ? AND trade_date > ? AND trade_date < ? AND high > 0",
+			markets, symbols, globalLower, before,
 		).Order("trade_date ASC, id ASC").Find(&bars).Error; err != nil {
 			return updated, err
 		}
@@ -355,17 +365,24 @@ func RunPositionPeakUpdate(tradeDate string) int {
 		common.SysWarn("持仓峰值更新补历史缺口失败: %v", err)
 		return 0
 	}
-	// 一次批量取当日全部相关日线（绝不逐仓查库）。
+	// 一次批量取当日全部相关日线（绝不逐仓查库）。market 同样入条件：只给 symbol 的话
+	// idx_bar_market_date 完全用不上，只能按 symbol 前缀逐股取全历史再在内存里筛当天。
 	seen := map[string]bool{}
 	var syms []string
+	seenMkt := map[string]bool{}
+	var mkts []string
 	for _, p := range positions {
 		if !seen[p.Symbol] {
 			seen[p.Symbol] = true
 			syms = append(syms, p.Symbol)
 		}
+		if !seenMkt[p.Market] {
+			seenMkt[p.Market] = true
+			mkts = append(mkts, p.Market)
+		}
 	}
 	var bars []model.DailyBar
-	if err := common.DB.Where("symbol IN ? AND trade_date = ?", syms, tradeDate).
+	if err := common.DB.Where("market IN ? AND symbol IN ? AND trade_date = ?", mkts, syms, tradeDate).
 		Find(&bars).Error; err != nil {
 		common.SysWarn("持仓峰值更新读取日线失败: %v", err)
 		return 0

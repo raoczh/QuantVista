@@ -298,9 +298,13 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 	if err := JobStepTransition(ctx, "evaluate_signals"); err != nil {
 		return nil, err
 	}
-	// 流式读 daily_bars（与 buildFactorTable 同款：ORDER BY symbol, trade_date 恰合
-	// 唯一索引序免 filesort，列清单共用 dailyBarScanCols 别改列序）→ 逐股 worker
-	// 处理，内存 O(单股)。
+	// 流式读 daily_bars（与 buildFactorTable 同款读法，列清单共用 dailyBarScanCols
+	// 别改列序）→ 逐股 worker 处理，内存 O(单股)。
+	// ORDER BY symbol, trade_date 依赖 idx_market_symbol_date (market, symbol, trade_date)
+	// 免 filesort——原注释说的「恰合唯一索引序」是错的：唯一索引是
+	// (symbol, market, trade_date)，market 挡在中间，等值条件在中列时 MySQL 无法用它
+	// 满足排序。线上 EXPLAIN 实测正是走 idx_bar_market_date + Using filesort 排 27 万行，
+	// 单次 4~9 秒，为此才补了 idx_market_symbol_date。
 	rows, err := common.DB.Model(&model.DailyBar{}).
 		Select(dailyBarScanCols).
 		Where("market = ?", "cn").

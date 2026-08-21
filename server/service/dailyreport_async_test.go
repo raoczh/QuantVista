@@ -89,6 +89,42 @@ func waitReportStatus(t *testing.T, id int64) model.DailyReport {
 	return model.DailyReport{}
 }
 
+// waitTerminalJobRuns 等某个业务结果对应的 JobRun 落到终态后返回。
+//
+// 不能直接查一次就断言：业务结果（DailyReport/Recommendation）与 JobRun 是两个写入点，
+// 报告已脱离 processing 时 JobRun 可能还停在 running。默认顺序下两者间隔极小，测试一直
+// 是绿的；`go test ./... -shuffle=on` 并行争 CPU 时就会读到中间态（实测 Status:running）。
+func waitTerminalJobRuns(t *testing.T, userID int64, resultType string, resultID int64, want int) []model.JobRun {
+	t.Helper()
+	terminal := map[string]bool{
+		model.JobStatusSuccess: true, model.JobStatusDegraded: true,
+		model.JobStatusFailed: true, model.JobStatusCanceled: true,
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	var runs []model.JobRun
+	for time.Now().Before(deadline) {
+		if err := common.DB.Where("user_id = ? AND result_type = ? AND result_id = ?",
+			userID, resultType, resultID).Find(&runs).Error; err != nil {
+			t.Fatal(err)
+		}
+		if len(runs) == want {
+			allTerminal := true
+			for _, r := range runs {
+				if !terminal[r.Status] {
+					allTerminal = false
+					break
+				}
+			}
+			if allTerminal {
+				return runs
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("等待 %s#%d 的 JobRun 到终态超时，当前: %+v", resultType, resultID, runs)
+	return nil
+}
+
 const reportOKReview = `{"choices":[{"message":{"content":"{\"summary\":\"今日震荡\",\"market_review\":\"缩量\",\"events_review\":\"无\",\"position_review\":\"无持仓\",\"watch_review\":\"无自选\",\"risk_warnings\":[\"注意风险\"],\"tomorrow_plan\":\"观望\"}"}}],"usage":{"prompt_tokens":50,"completion_tokens":30,"total_tokens":80}}`
 
 // TestDailyReportAsyncParallel 手动生成：立即返回 processing；复盘与推荐两路证实
@@ -145,11 +181,8 @@ func TestDailyReportAsyncParallel(t *testing.T) {
 	if q.ActionUsed != 1 {
 		t.Fatalf("手动生成应计 1 次动作: %+v", q)
 	}
-	var runs []model.JobRun
-	if err := common.DB.Where("user_id = ? AND result_type = ? AND result_id = ?", int64(51), JobResultDailyReport, v.ID).Find(&runs).Error; err != nil {
-		t.Fatal(err)
-	}
-	if len(runs) != 1 || runs[0].Status != model.JobStatusDegraded {
+	runs := waitTerminalJobRuns(t, 51, JobResultDailyReport, v.ID, 1)
+	if runs[0].Status != model.JobStatusDegraded {
 		t.Fatalf("日报 partial 必须映射为唯一 degraded JobRun: %+v", runs)
 	}
 	jobView, err := GetJobRun(51, runs[0].ID, true)

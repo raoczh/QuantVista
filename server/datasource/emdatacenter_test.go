@@ -98,6 +98,14 @@ func TestDataCenterIterNoData(t *testing.T) {
 }
 
 // 限流：全局最小间隔生效——连续两页请求的服务端观测间隔不小于 dcMinInterval。
+//
+// 两处时序陷阱，缺一个都会让这个测试在 Windows 上随机失败（实测服务端间隔被压到 60ms
+// 甚至 24ms，而节流其实是好的）：
+//   - 首次建连开销（实测约 20ms）全落在第一个请求上，服务端 handler 的观测时刻相对
+//     「客户端发出时刻」被推迟，直接把测得的间隔压缩同等幅度。故先做一次预热请求把
+//     连接池建好，再测后两次的间隔。
+//   - dcLast 是包级状态，同包其他用例（如把 dcMinInterval 设为 0 连发请求的除权测试）
+//     会留下残值，导致本用例首个请求的等待量不确定。故显式清零。
 func TestDataCenterThrottle(t *testing.T) {
 	const interval = 80 * time.Millisecond
 	var times []time.Time
@@ -106,8 +114,19 @@ func TestDataCenterThrottle(t *testing.T) {
 		fmt.Fprint(w, dcPage(2, `{"A":1}`))
 	}, interval)
 
-	it := NewEastMoneyAdapter().DataCenterQuery(DataCenterQuery{ReportName: "RPT_TEST"})
+	dcMu.Lock()
+	dcLast = time.Time{}
+	dcMu.Unlock()
+
 	ctx := context.Background()
+	// 预热：建连 + 让 dcLast 落到一个确定的时刻。这一发的观测时刻不参与断言。
+	warm := NewEastMoneyAdapter().DataCenterQuery(DataCenterQuery{ReportName: "RPT_TEST"})
+	if _, err := warm.Next(ctx); err != nil {
+		t.Fatal(err)
+	}
+	times = nil
+
+	it := NewEastMoneyAdapter().DataCenterQuery(DataCenterQuery{ReportName: "RPT_TEST"})
 	if _, err := it.Next(ctx); err != nil {
 		t.Fatal(err)
 	}

@@ -543,6 +543,11 @@ type factorRowResult struct {
 // 别改列序。turnover_rate 是后加列（2026-07-07，AutoMigrate 只加列不回填），此前初始化
 // 的存量行该列为 NULL——必须 COALESCE 归一为 0（0=缺失 是 DailyBar.TurnoverRate 的既有
 // 约定），否则裸 float64 扫描遇 NULL 直接中断整个流式读。
+//
+// 这四处共用 `WHERE market='cn' ORDER BY symbol, trade_date`，靠
+// idx_market_symbol_date (market, symbol, trade_date) 免 filesort。**这些列都不在索引里**，
+// 所以仍需回表；要做成覆盖索引得把 7 个数值列全塞进索引键（MySQL 无 INCLUDE），
+// 索引体积会接近半张表，不划算。
 var dailyBarScanCols = []string{"symbol", "trade_date", "open", "high", "low", "close",
 	"volume", "amount", "COALESCE(turnover_rate, 0) AS turnover_rate"}
 

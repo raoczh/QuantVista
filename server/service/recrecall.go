@@ -507,8 +507,9 @@ func summarizeRecallDist(rets []float64) RecallDist {
 	return d
 }
 
-// streamCNDailyBars 全市场日线流式单遍扫描（ORDER BY symbol, trade_date 恰合唯一
-// 索引序免 filesort），逐股回调 process。召回评估等轻计算消费方共用。
+// streamCNDailyBars 全市场日线流式单遍扫描，逐股回调 process。召回评估等轻计算消费方共用。
+// ORDER BY symbol, trade_date 由 idx_market_symbol_date (market, symbol, trade_date) 直接
+// 满足，免 filesort；不是唯一索引 (symbol, market, trade_date) —— market 在中列时无法用于排序。
 func streamCNDailyBars(ctx context.Context, process func(symbol string, bars []datasource.Bar)) error {
 	rows, err := common.DB.Model(&model.DailyBar{}).
 		Select(dailyBarScanCols).

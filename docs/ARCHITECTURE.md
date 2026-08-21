@@ -204,6 +204,8 @@ Go API Server
 - **MVP 只实现一个市场、一个源**的原则已按此落地：当前东财→腾讯→新浪三源互备，仅覆盖 A 股沪深（含沪深 ETF/LOF 场内基金）。
 - 每条数据携带 `source` 与 `data_time`；同步失败写 `data_sync_logs`。
 - 日线行情写入 `daily_bars`（OHLC，东财前复权主源），供追踪、因子宽表与回撤计算使用；`corporate_actions` 复权因子表未建，现行方案为除权检测+整股重锚（见 ROADMAP 边界区）。
+- **`daily_bars` 索引与保留期（2026-08-21）**：三个索引各有不可替代的职责，**都不能删**——`idx_bar_symbol_date (symbol, market, trade_date) UNIQUE` 既服务单股取序列、也是两处 upsert 的 `ON CONFLICT` 冲突目标（缺失或丢掉 UNIQUE 时每日同步不报错、而是静默插入重复行，属正确性依赖）；`idx_bar_market_date (market, trade_date)` 服务**不带 symbol** 的按市场+日期查询（数据健康缺口检查、宇宙 join、候选审计、保留期清理），这些用不上下面那个索引；`idx_market_symbol_date (market, symbol, trade_date)` 给四处全市场流式读（`buildFactorTable` / `RunFactorIC` / `streamCNDailyBars` / M2 回测）消除 filesort——线上 EXPLAIN 实测 `WHERE market='cn' ORDER BY symbol, trade_date` 走 `idx_bar_market_date` 过滤后仍 `Using filesort` 排 27 万+ 行、单次 4~9 秒（此前代码注释误称「恰合唯一索引序免 filesort」，唯一索引把 `market` 放在中列，等值条件在中列时 MySQL 无法用它满足排序）。三索引现状可用 `SQL_DSN=... go run ./cmd/barscheck` 只读核对（含唯一性、自然键重复、保留期跨度），可直接对生产库执行。
+- 保留期 **400 天**（`model.DailyBarRetentionDays`，约 270 个交易日），每日 03:50 按市场分批清理（`StartDailyBarRetentionJob`，每批 5000 行、先取 id 再按主键删以兼容三种方言）。此前无任何按日期的删除路径，每日增约 5500 行、每年约 135 万行只增不减。**400 不是随手取的整数**：系统多处硬依赖 250 个交易日历史（`ma250`/`pos_250`/年内新高、`boardValHistWindow`、`indicatorMaxLimit`、`fflowBarLimit`、`asOfBarLimit`、除权重锚的 `wideBarLimit`），250 交易日按每年约 243 个交易日折算需约 375 自然日，400 天留出长假与停牌余量。**下调此值会静默改变上述因子口径**（窗口不足时按现有样本算，不报错），`TestDailyBarRetentionCutoffCovers250TradingDays` 为此设了防回归下界。
 - **Tushare 分档接入**：第一阶段以东财 + 新浪为主，Tushare 非前置；免费档（120，股票清单/日线/交易日历）与低 cost 档（2000，财务三表/复权因子/指数日线，长线财务深度来源）按需启用，高级档（5000，分钟线/融资融券明细等）暂不实现。详见 [数据源选型](docs/DATA_SOURCES.md)。
 
 接口示例（与实际路由一致；行情为公开端点、带宽松限流）：

@@ -34,11 +34,26 @@ type StockQuote struct {
 }
 
 // DailyBar 日线 OHLC，供追踪/回撤/复权计算复用。
+//
+// 三个索引各有不可替代的职责，**都不能删**：
+//   - idx_bar_symbol_date (symbol, market, trade_date) UNIQUE：既是单股取序列的主索引，
+//     也是 market.go / marketwide.go 两处 upsert 的 ON CONFLICT 冲突目标。缺失或丢掉
+//     UNIQUE 时每日同步不报错、而是静默插入重复行，属于正确性依赖（cmd/barscheck 可核对）。
+//   - idx_bar_market_date (market, trade_date)：服务只按市场+日期、**不带 symbol** 的查询
+//     ——数据健康缺口检查（datahealth.go）、宇宙 join、候选审计、以及保留期清理的
+//     WHERE market=? AND trade_date < ?。这些用不上下面那个新索引（symbol 挡在中间）。
+//   - idx_market_symbol_date (market, symbol, trade_date)：给四处全市场流式读
+//     （buildFactorTable / RunFactorIC / streamCNDailyBars / M2 回测）消除 filesort。
+//     线上 EXPLAIN 实测：WHERE market='cn' ORDER BY symbol, trade_date 走
+//     idx_bar_market_date 过滤后仍要 Using filesort 排 27 万+ 行，单次 4~9 秒；本索引
+//     的列序恰好等于「过滤列 + 排序列」，B+Tree 天然有序，排序整段消掉。仍需回表取
+//     OHLC 各列，所以不会到毫秒级，但流式读不必再等全量排序完才拿到第一行。
 type DailyBar struct {
-	ID        int64   `gorm:"primaryKey" json:"id"`
-	Symbol    string  `gorm:"size:16;index:idx_bar_symbol_date,unique" json:"symbol"`
-	Market    string  `gorm:"size:8;index:idx_bar_symbol_date,unique;index:idx_bar_market_date,priority:1" json:"market"`
-	TradeDate string  `gorm:"size:10;index:idx_bar_symbol_date,unique;index:idx_bar_market_date,priority:2" json:"trade_date"` // YYYY-MM-DD
+	ID     int64  `gorm:"primaryKey" json:"id"`
+	Symbol string `gorm:"size:16;index:idx_bar_symbol_date,unique;index:idx_market_symbol_date,priority:2" json:"symbol"`
+	Market string `gorm:"size:8;index:idx_bar_symbol_date,unique;index:idx_bar_market_date,priority:1;index:idx_market_symbol_date,priority:1" json:"market"`
+	// TradeDate YYYY-MM-DD
+	TradeDate string  `gorm:"size:10;index:idx_bar_symbol_date,unique;index:idx_bar_market_date,priority:2;index:idx_market_symbol_date,priority:3" json:"trade_date"`
 	Open      float64 `gorm:"type:decimal(20,4)" json:"open"`
 	High      float64 `gorm:"type:decimal(20,4)" json:"high"`
 	Low       float64 `gorm:"type:decimal(20,4)" json:"low"`
@@ -50,6 +65,28 @@ type DailyBar struct {
 	TurnoverRate float64   `gorm:"type:decimal(10,4)" json:"turnover_rate"`
 	Source       string    `gorm:"size:16" json:"source"`
 	CreatedAt    time.Time `json:"created_at"`
+}
+
+// DailyBarRetentionDays daily_bars 保留天数（自然日）。
+//
+// 400 天 ≈ 270 个交易日，是「覆盖全部既有计算窗口」推出来的下限，不是随手取的整数：
+// 系统多处硬依赖 250 个交易日的历史——ma250 / pos_250 / 年内新高（factortable.go）、
+// 板块估值时序分位（boardValHistWindow）、技术指标与资金流窗口（indicatorMaxLimit /
+// fflowBarLimit）、as-of 快照（asOfBarLimit）、以及除权重锚重建的 wideBarLimit=250。
+// 250 个交易日按 A 股每年约 243 个交易日折算约需 375 自然日，400 天留出约 25 天余量
+// 兜住长假与停牌。**下调此值会静默改变上述因子的口径**（窗口不足时按现有样本算，
+// 不会报错），调整前必须同步评估那些窗口。
+const DailyBarRetentionDays = 400
+
+// DailyBarRetentionCutoff 保留下限日期（YYYY-MM-DD）：早于此日期的日线可被清理。
+// 与清理任务、体检工具（cmd/barscheck）共用同一口径，避免两处各算一次而漂移。
+func DailyBarRetentionCutoff() string {
+	return DailyBarRetentionCutoffAt(time.Now())
+}
+
+// DailyBarRetentionCutoffAt 按给定基准时刻算保留下限，便于测试注入固定时间。
+func DailyBarRetentionCutoffAt(now time.Time) string {
+	return now.AddDate(0, 0, -DailyBarRetentionDays).Format("2006-01-02")
 }
 
 // TradingCalendar 交易日历，用于按交易日计算有效期、持有周期和数据新鲜度。

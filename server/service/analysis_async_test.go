@@ -82,11 +82,8 @@ func TestAnalysisAsyncShell(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("后台应更新原 processing 行，实际记录数 %d", count)
 	}
-	var runs []model.JobRun
-	if err := common.DB.Where("user_id = ? AND result_type = ? AND result_id = ?", userID, JobResultAnalysis, v.ID).Find(&runs).Error; err != nil {
-		t.Fatal(err)
-	}
-	if len(runs) != 1 || runs[0].Status != model.JobStatusSuccess {
+	runs := waitTerminalJobRuns(t, userID, JobResultAnalysis, v.ID, 1)
+	if runs[0].Status != model.JobStatusSuccess {
 		t.Fatalf("分析必须有唯一成功 JobRun 结果引用: %+v", runs)
 	}
 	items, err := NewTaskCenterService().List(userID, model.RoleAdmin, TaskCenterListOptions{Source: TaskSourceJob, IncludeSteps: true, Limit: 20})

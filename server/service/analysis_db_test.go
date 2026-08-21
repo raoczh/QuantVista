@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"sync"
 	"testing"
 
@@ -15,10 +16,19 @@ var (
 	sharedTestDB     *gorm.DB
 	sharedTestDBErr  error
 	sharedTestDBOnce sync.Once
+	// lastPreparedTest 上一次清库时所属的顶层测试名。共享内存库要在「每个测试函数
+	// 开始时」清空，而不是「每次 setupTestDB 调用时」——有 7 处用例在 t.Run 子测试里
+	// 再次调用 setupTestDB，逐次清理会把父测试刚建好的数据抹掉。
+	lastPreparedTest string
 )
 
 // setupTestDB 复用同一个内存 SQLite。service 测试本来就通过 cache=shared 共用数据，
 // 单进程只执行一次全模型迁移可避免数百个用例重复 AutoMigrate。
+//
+// 每个测试函数首次调用时清空全部表。此前不清表，用例间靠「各用自己的 user_id」隐式
+// 隔离，凡是按表全量断言的用例（如「用户1 应只见自己的 1 条」、幂等 upsert 的行数）
+// 就依赖了执行顺序：默认顺序恒绿，`go test -shuffle=on` 随机失败。清库让隔离变成结构
+// 保证，而不是巧合。
 func setupTestDB(t *testing.T) {
 	t.Helper()
 	sharedTestDBOnce.Do(func() {
@@ -31,6 +41,39 @@ func setupTestDB(t *testing.T) {
 		t.Fatalf("初始化共享内存库失败: %v", sharedTestDBErr)
 	}
 	common.DB = sharedTestDB
+	if root := rootTestName(t.Name()); root != lastPreparedTest {
+		truncateAllTestTables(t)
+		lastPreparedTest = root
+	}
+}
+
+// rootTestName 取顶层测试名（去掉 t.Run 的子测试后缀）。
+func rootTestName(name string) string {
+	if i := strings.IndexByte(name, '/'); i >= 0 {
+		return name[:i]
+	}
+	return name
+}
+
+// truncateAllTestTables 清空全部业务表。顺序无关——SQLite 驱动未开启外键约束，
+// 且这里是全表清空而非选择性删除，不存在残留引用。
+func truncateAllTestTables(t *testing.T) {
+	t.Helper()
+	for _, m := range model.AllModels() {
+		stmt := &gorm.Statement{DB: sharedTestDB}
+		if err := stmt.Parse(m); err != nil {
+			t.Fatalf("解析模型表名失败: %v", err)
+		}
+		if err := sharedTestDB.Exec("DELETE FROM " + stmt.Schema.Table).Error; err != nil {
+			t.Fatalf("清空测试表 %s 失败: %v", stmt.Schema.Table, err)
+		}
+	}
+	// 自增主键归零：不少用例断言「首条记录 id=1」或依赖 id 排序，沿用上一个测试的
+	// 自增游标会让这类断言随执行顺序漂移。
+	if err := sharedTestDB.Exec("DELETE FROM sqlite_sequence").Error; err != nil &&
+		!strings.Contains(err.Error(), "no such table") {
+		t.Fatalf("重置自增序列失败: %v", err)
+	}
 }
 
 // TestAnalysisHistoryAndGet 验证 History 的显式选列列名正确、Get 能取回详情、Delete 生效。
