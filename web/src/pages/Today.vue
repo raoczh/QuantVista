@@ -594,6 +594,8 @@ onBeforeUnmount(() => {
 .item-head strong {
   font-size: 14px;
   line-height: 1.45;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .stock,
 .meta,
@@ -620,6 +622,8 @@ onBeforeUnmount(() => {
 .desktop-actions {
   gap: 4px;
   flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 .mobile-actions {
   display: none;

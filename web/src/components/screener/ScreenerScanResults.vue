@@ -111,9 +111,9 @@ function updateIncludeStale(value: boolean) {
             <td v-if="!isMobile" class="num qv-tnum">{{ hit.turnover_rate ? hit.turnover_rate.toFixed(2) : '未知' }}</td>
             <td v-if="!isMobile" class="num qv-tnum">{{ hit.pos_60 ? `${hit.pos_60.toFixed(0)}%` : '未知' }}</td>
             <td>
-              <n-popover trigger="hover" placement="top" :disabled="hit.reasons.length <= 2">
+              <n-popover trigger="hover" placement="top" :disabled="hit.reasons.length <= 2" style="max-width: 320px">
                 <template #trigger><span class="condition-list"><n-tag v-for="reason in hit.reasons.slice(0, 2)" :key="reason" size="small" :bordered="false">{{ reason }}</n-tag><n-tag v-if="hit.reasons.length > 2" size="small" :bordered="false">+{{ hit.reasons.length - 2 }}</n-tag></span></template>
-                <div v-for="reason in hit.reasons" :key="reason">{{ reason }}</div>
+                <div v-for="reason in hit.reasons" :key="reason" class="reason-line">{{ reason }}</div>
               </n-popover>
               <small class="risk-note">主要风险：命中条件不等于买入结论，需继续核对行情时效与个股基本面。</small>
             </td>
@@ -139,7 +139,8 @@ function updateIncludeStale(value: boolean) {
 .result-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 0 0 10px; }
 .result-meta span { opacity: .62; }
 .result-warning { margin-bottom: 10px; }
-.risk-note { display: block; margin-top: 6px; opacity: .62; line-height: 1.45; }
+.risk-note { display: block; margin-top: 6px; opacity: .62; line-height: 1.45; overflow-wrap: anywhere; }
+.reason-line { line-height: 1.55; overflow-wrap: anywhere; }
 .batch-toolbar { justify-content: space-between; margin: 12px 0; }
 .num { text-align: right; white-space: nowrap; }
 @media (max-width: 768px) {

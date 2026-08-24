@@ -110,5 +110,12 @@ const columns = computed<DataTableColumns<FactorICStat>>(() => [
   font-size: 12px;
   opacity: 0.6;
   line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+/* 卡头 extra 里的 meta 文本在窄屏会把筛选控件挤出视口，让它独占一行 */
+@media (max-width: 768px) {
+  .ic-meta {
+    width: 100%;
+  }
 }
 </style>

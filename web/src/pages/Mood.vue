@@ -98,6 +98,9 @@ function errorText(reason: unknown) {
   return reason instanceof Error ? reason.message : '数据加载失败，请稍后重试'
 }
 
+// 最近一次渲染用的窄屏档位（决定是否显示轴名）。跨 768px 时必须重绘，见 onResize。
+let compactRendered = window.innerWidth <= 768
+
 function renderTrend() {
   if (activeTab.value !== 'overview' || !trendEl.value || !mood.value?.trend.length) {
     trendChart?.dispose()
@@ -108,6 +111,7 @@ function renderTrend() {
   trendChart = echarts.init(trendEl.value, isDark.value ? 'dark' : undefined)
   const trend = mood.value.trend
   const compact = window.innerWidth <= 768
+  compactRendered = compact
   trendChart.setOption({
     backgroundColor: 'transparent',
     tooltip: { trigger: 'axis', axisPointer: { type: 'cross' }, confine: true },
@@ -270,7 +274,15 @@ const popularityColumns = computed<DataTableColumns<PopularityDailyItem>>(() => 
   { title: '昨日排名', key: 'prev_rank', align: 'right', width: 100, render: (row) => row.prev_rank > 0 ? row.prev_rank : '-' },
 ])
 
+// compact（轴名是否显示）在 renderTrend 里按视口宽度求值一次，跨 768px 时
+// 只 resize 会让轴名不跟着切换（桌面缩窄仍占轴名位、手机转横屏丢轴名），
+// 档位翻转必须重绘。
 function onResize() {
+  const compactNow = window.innerWidth <= 768
+  if (compactNow !== compactRendered && mood.value?.trend?.length) {
+    renderTrend()
+    return
+  }
   trendChart?.resize()
 }
 
@@ -458,6 +470,9 @@ onBeforeUnmount(() => {
 .ladder-stock:hover {
   background: var(--mood-hover);
 }
+.fund-row:last-child {
+  border-bottom: 0;
+}
 .fund-rank {
   font-size: 18px;
   font-weight: 700;
@@ -469,10 +484,6 @@ onBeforeUnmount(() => {
   align-items: baseline;
   gap: 8px;
   min-width: 0;
-}
-.fund-stock small,
-:deep(.stock-symbol) {
-  opacity: 0.55;
 }
 .fund-industry {
   opacity: 0.68;
@@ -507,34 +518,16 @@ onBeforeUnmount(() => {
 .ladder-head {
   display: flex;
   align-items: baseline;
-  justify-content: space-between;
   gap: 8px;
+  min-width: 0;
 }
-.ladder-head span,
+/* 只对元信息降级——不能写 `.ladder-head span`：Vue scoped CSS 会把父级 scope id
+ * 带到子组件根节点上，那条泛选择器会命中 StockIdentity 的根 span，
+ * 把股票名压成 12px/0.62 与元信息同级，卡片层次全丢。 */
 .ladder-meta {
   font-size: 12px;
   opacity: 0.62;
-}
-:deep(.stock-link) {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 1px;
-  padding: 0;
-  color: inherit;
-  border: 0;
-  background: transparent;
-  text-align: left;
-  cursor: pointer;
-}
-:deep(.stock-link:hover .stock-name) {
-  color: var(--mood-primary);
-}
-:deep(.stock-name) {
-  font-weight: 600;
-}
-:deep(.stock-symbol) {
-  font-size: 11px;
+  overflow-wrap: anywhere;
 }
 :deep(.rank-number) {
   color: var(--mood-primary);

@@ -825,10 +825,13 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
   flex-direction: row;
   align-items: center;
   justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 .form-label {
   font-size: 13px;
   opacity: 0.75;
+  min-width: 0;
 }
 .revision-hint {
   font-size: 11px;
@@ -845,11 +848,14 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
   font-size: 13px;
   opacity: 0.75;
   margin-bottom: 10px;
+  overflow-wrap: anywhere;
 }
 .result-revision {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
   margin-bottom: 7px;
   font-size: 12px;
   opacity: 0.82;
@@ -909,6 +915,7 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
 }
 .rec-hold-line {
   font-size: 13px;
+  overflow-wrap: anywhere;
 }
 .hist {
   display: flex;
@@ -919,6 +926,7 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
   display: flex;
   align-items: center;
   gap: 10px;
+  min-width: 0;
 }
 .hist-label {
   width: 92px;
@@ -951,6 +959,11 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
   .bt-side {
     width: 100%;
     position: static;
+  }
+  /* 分布直方图：92px 右对齐标签 + 36px 计数在 360px 下把条形挤没了 */
+  .hist-label {
+    width: 72px;
+    font-size: 12px;
   }
 }
 </style>

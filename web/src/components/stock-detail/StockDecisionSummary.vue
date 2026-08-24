@@ -232,6 +232,8 @@ function money(value: number) {
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 .quote-price {
   font-size: 36px;
@@ -345,9 +347,13 @@ function money(value: number) {
   display: flex;
   justify-content: space-between;
   gap: 12px;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 .decision-heading strong {
   font-size: 14px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .decision-value {
   flex: 0 0 auto;

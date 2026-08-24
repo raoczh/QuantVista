@@ -549,10 +549,6 @@ function aiRefusalText(code: string) {
   font-size: 14px;
   font-weight: 600;
 }
-.th-symbol {
-  font-size: 11px;
-  opacity: 0.5;
-}
 .score-val {
   font-size: 16px;
   font-weight: 700;
@@ -579,11 +575,15 @@ function aiRefusalText(code: string) {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 .ai-model {
   font-size: 12px;
   font-weight: 400;
   opacity: 0.55;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .check-chip {
   font-size: 12px;
@@ -596,5 +596,6 @@ function aiRefusalText(code: string) {
   margin: 0;
   font-size: 14px;
   line-height: 1.7;
+  overflow-wrap: anywhere;
 }
 </style>

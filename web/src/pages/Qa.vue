@@ -710,11 +710,6 @@ onMounted(async () => {
   gap: 16px;
   align-items: start;
 }
-@media (max-width: 900px) {
-  .qa {
-    grid-template-columns: 1fr;
-  }
-}
 .col-side,
 .col-chat {
   min-width: 0;
@@ -728,7 +723,12 @@ onMounted(async () => {
   padding: 4px;
   margin: -4px;
 }
+/* 900px 是布局驱动断点（左侧会话栏定宽 260px，早于 768px 就放不下双列），
+ * 与 Recommendations/Analysis 的 1050px 同理，不是移动端适配断点。 */
 @media (max-width: 900px) {
+  .qa {
+    grid-template-columns: 1fr;
+  }
   .col-side {
     position: static;
     max-height: none;
@@ -764,11 +764,7 @@ onMounted(async () => {
 .conv-title {
   font-size: 13px;
   font-weight: 600;
-}
-.conv-symbol {
-  opacity: 0.5;
-  font-weight: 400;
-  font-size: 12px;
+  min-width: 0;
 }
 .conv-sub {
   font-size: 12px;
@@ -784,8 +780,10 @@ onMounted(async () => {
   margin-top: 2px;
 }
 .chat-meta {
+  min-width: 0;
   font-size: 12px;
   opacity: 0.55;
+  overflow-wrap: anywhere;
 }
 .chat-stock {
   margin-bottom: 12px;
@@ -797,6 +795,14 @@ onMounted(async () => {
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
+  align-items: center;
+}
+/* StockPicker 内部是 n-select（默认 width:100%），在 flex 行里必须显式给宽，
+ * 否则会撑满整行把右侧 LLM 下拉挤到下一行。 */
+.qa-stock-picker {
+  flex: 1 1 220px;
+  min-width: 0;
+  max-width: 300px;
 }
 .starter-hint {
   font-size: 12px;
@@ -838,11 +844,13 @@ onMounted(async () => {
 }
 .bubble {
   padding: 10px 14px;
+  /* 对话气泡刻意用 12px：§4.1 的「圆角不超过 8px」约束的是控件与实体卡片，
+   * 气泡是独立视觉语汇，别当成越界项改回 8px。 */
   border-radius: 12px;
   font-size: 14px;
   line-height: 1.6;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 /* markdown 气泡：块级元素自带间距，关闭 pre-wrap 防双重换行 */
 .bubble.md {
@@ -906,6 +914,13 @@ onMounted(async () => {
   font-size: 12px;
   color: v-bind('vars.textColor3');
 }
+/* 本页最长的一段行内文案（行情/指标/来源三段拼接）：作为 flex 子项
+ * min-width 默认是 auto 无法收缩，必须显式放开才会换行。 */
+.fresh-text {
+  min-width: 0;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
 .fresh-dim {
   opacity: 0.75;
 }
@@ -919,12 +934,15 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+  justify-content: flex-end;
 }
 .snapshot-pre {
   font-size: 12px;
   line-height: 1.5;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   max-height: 60vh;
   overflow: auto;
   margin: 0;
@@ -942,13 +960,31 @@ onMounted(async () => {
   display: flex;
   gap: 10px;
   align-items: flex-end;
+  min-width: 0;
   margin-top: 14px;
   padding-top: 12px;
   border-top: 1px solid var(--qv-divider);
+}
+/* textarea 作为 flex 子项，min-width 默认 auto + 有固有最小宽度，极窄屏收不回来 */
+.composer :deep(.n-input) {
+  min-width: 0;
+}
+.composer :deep(.n-button) {
+  flex-shrink: 0;
 }
 .composer-hint {
   font-size: 11px;
   opacity: 0.45;
   margin-top: 6px;
+  line-height: 1.5;
+}
+@media (max-width: 768px) {
+  .starter-row .qa-stock-picker {
+    flex-basis: 100%;
+    max-width: none;
+  }
+  .starter-row :deep(.n-select) {
+    min-width: 0;
+  }
 }
 </style>

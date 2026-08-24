@@ -386,6 +386,16 @@ async function refreshTracking() {
   finally { tracking.value = false }
 }
 const stopAlerting = ref<Record<number, boolean>>({})
+/**
+ * 补关联持仓血缘后重载当前批次。
+ *
+ * 只需轻量 Get——补关联接口已同步回填追踪状态里的实际买入价/收益（终态推荐被冻结，
+ * 走 refreshTracking 也补不上），这里重载只为拿到 position 血缘字段，不必再发上游请求。
+ */
+async function reloadAfterLink() {
+  if (!current.value) return
+  current.value = await getRecommendation(current.value.id).catch(() => current.value)
+}
 async function addStopAlert(item: RecommendationItem) {
   if (stopAlerting.value[item.id]) return
   stopAlerting.value = { ...stopAlerting.value, [item.id]: true }
@@ -459,6 +469,7 @@ onMounted(async () => {
           :stop-alerting="stopAlerting"
           @refresh-tracking="refreshTracking"
           @stop-alert="addStopAlert"
+          @linked="reloadAfterLink"
         />
         <RecommendationHistoryTracking
           :history="history"

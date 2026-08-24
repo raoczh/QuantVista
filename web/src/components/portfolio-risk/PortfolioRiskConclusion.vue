@@ -51,10 +51,11 @@ const nextCheck = computed(() => {
 </template>
 
 <style scoped>
-.risk-intro { display: grid; grid-template-columns: 1.4fr 1fr; gap: 12px; margin: 0 0 16px; }
-.conclusion-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-.conclusion-head strong { line-height: 1.55; }
-p { margin: 10px 0 0; line-height: 1.6; }
-small { display: block; margin-top: 10px; opacity: .62; }
+/* 轨道必须用 minmax(0, …)：默认 min 是 auto，长结论句会把列撑破而不是换行 */
+.risk-intro { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 12px; margin: 0 0 16px; }
+.conclusion-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.conclusion-head strong { min-width: 0; line-height: 1.55; overflow-wrap: anywhere; }
+p { margin: 10px 0 0; line-height: 1.6; overflow-wrap: anywhere; }
+small { display: block; margin-top: 10px; opacity: .62; overflow-wrap: anywhere; }
 @media (max-width: 768px) { .risk-intro { grid-template-columns: 1fr; } }
 </style>

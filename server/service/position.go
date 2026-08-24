@@ -63,6 +63,11 @@ type PositionView struct {
 
 	// 最新统一卖出风险评估事实。仅 holding 持仓返回；等级不冗余到 positions 表。
 	ExitAssessment *PositionExitAssessmentView `json:"exit_assessment,omitempty"`
+
+	// RecLink 来源推荐摘要（血缘可见性；手动建仓或血缘指向的推荐已删除时为 nil）。
+	// 前端据此展示「来自推荐」徽章——否则 recommendation_id 只是个不可见的数字，
+	// 用户无法察觉血缘断了（见 positionreclink.go）。
+	RecLink *PositionRecLink `json:"rec_link,omitempty"`
 }
 
 // shortHoldReviewDays 短线持仓超过该交易日数则提示复盘（短线一般不宜久拖）。
@@ -199,6 +204,8 @@ func (s *PositionService) ListByAccount(ctx context.Context, userID, accountID i
 	if err != nil {
 		return nil, fmt.Errorf("读取持仓卖出风险评估失败: %w", err)
 	}
+	// 来源推荐摘要（血缘可见性；一次批量查，无 N+1）。
+	recLinks := positionRecLinksFor(userID, positions)
 
 	out := make([]PositionView, 0, len(positions))
 	now := time.Now()
@@ -276,6 +283,10 @@ func (s *PositionService) ListByAccount(ctx context.Context, userID, accountID i
 			}
 			// D15 持仓期最高价与回撤（price=0 时只给峰值不给回撤，fail-closed）。
 			v.Peak = peakViewFor(p, price, dayHigh, quoteTradeDate)
+		}
+		// 来源推荐血缘（已平仓也保留——复盘时要能看出这笔是不是照推荐买的）。
+		if link, exists := recLinks[p.ID]; exists {
+			v.RecLink = link
 		}
 		out = append(out, v)
 	}

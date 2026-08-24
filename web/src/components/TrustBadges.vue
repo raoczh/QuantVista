@@ -167,7 +167,7 @@ const hasAny = computed(
         >
       </div>
     </n-tooltip>
-    <n-tooltip v-if="sysConfidence" trigger="hover">
+    <n-tooltip v-if="sysConfidence" trigger="hover" style="max-width: 320px">
       <template #trigger>
         <span
           class="trust-chip"
@@ -177,7 +177,7 @@ const hasAny = computed(
       </template>
       由程序合成（证据核验×数据完备度×排名等客观信号），与 AI 口头置信度相互独立：{{ sysConfidenceWhy || '—' }}
     </n-tooltip>
-    <n-tooltip v-if="review" trigger="hover">
+    <n-tooltip v-if="review" trigger="hover" style="max-width: 320px">
       <template #trigger>
         <span
           class="trust-chip"

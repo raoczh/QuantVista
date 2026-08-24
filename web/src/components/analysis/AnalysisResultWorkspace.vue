@@ -422,6 +422,9 @@ function exportResult() {
   .role-row span { grid-column: 1 / -1; }
   .metric-row { grid-template-columns: 1fr; gap: 3px; }
   .return-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .diff-highlight { grid-template-columns: minmax(0, 1fr); gap: 3px; }
+  .diff-highlight > span:nth-child(3) { display: none; }
+  .touch-form :deep(.n-input-number) { width: auto; flex: 1 1 120px; min-width: 0; }
   .actions > * { flex: 1 1 auto; }
 }
 </style>

@@ -274,6 +274,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				positions.POST("", positionCtl.Create)
 				positions.POST("/import", middleware.RateLimit(10, time.Minute), exportCtl.ImportPositions)
 				positions.PUT("/:id", positionCtl.Update)
+				positions.PUT("/:id/recommendation-link", positionCtl.LinkRecommendation) // 事后补/改/解除推荐血缘
 				positions.DELETE("/:id", positionCtl.Delete)
 				positions.POST("/:id/close", positionCtl.Close)
 				positions.GET("/:id/trades", positionCtl.Trades)    // B5 流水明细
@@ -311,6 +312,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				recommendations.GET("/shadow-report", recommendationCtl.ShadowReport)
 				recommendations.GET("/recall-report", recommendationCtl.RecallReport)
 				recommendations.GET("/daily-audits", recommendationCtl.DailyAuditReport)
+				recommendations.GET("/link-candidates", recommendationCtl.LinkCandidates) // 静态段必须先于 :id
 				recommendations.PUT("/review-ack/:id", recommendationCtl.AckReview)
 				recommendations.POST("", middleware.RateLimit(15, time.Minute), recommendationCtl.Generate)
 				recommendations.GET("", recommendationCtl.List)

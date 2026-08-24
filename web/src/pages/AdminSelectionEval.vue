@@ -824,16 +824,6 @@ const AUDIT_REASON_LABEL: Record<string, string> = {
   padding-top: 2px;
   border-top: 1px dashed var(--qv-border, rgba(128, 128, 128, 0.22));
 }
-.se-label-cell {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.se-ci,
-.se-symbols,
-.se-picks {
-  white-space: nowrap;
-}
 .se-diff-expand {
   padding: 6px 0 8px;
 }
@@ -1002,5 +992,19 @@ const AUDIT_REASON_LABEL: Record<string, string> = {
   .se-audit-slices {
     grid-template-columns: minmax(0, 1fr);
   }
+}
+</style>
+
+<!-- 这两个类只在 n-data-table 的列 render（h() 调用）里使用：列渲染函数由 naive-ui
+     内部组件执行，vnode 拿不到本组件的 data-v-xxx，scoped 选择器永不匹配。
+     必须放非 scoped 块，se- 前缀避免全局撞名。 -->
+<style>
+.se-label-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.se-ci {
+  white-space: nowrap;
 }
 </style>

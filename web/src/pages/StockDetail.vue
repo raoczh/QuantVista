@@ -1815,12 +1815,6 @@ function scoreType(total: number) {
   opacity: 0.55;
   margin-left: 2px;
 }
-.actions {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-top: 14px;
-}
 .kchart {
   width: 100%;
   height: 460px;

@@ -313,6 +313,21 @@ export interface RecommendationItem {
   detail: RecDetail | null
   status: RecTracking | null
   position: RecPositionLink | null
+  // 同标的在持仓中、但未关联到本条推荐的记录（软匹配，仅在 position 为 null 时可能有值）。
+  // 手动录入的持仓 recommendation_id=0，靠血缘查不出来，只能按代码提示用户补关联。
+  unlinked_position?: RecPositionLink | null
+}
+
+// 可关联的推荐候选（按标的过滤，供持仓补关联时选择）。
+export interface RecLinkCandidate {
+  recommendation_id: number
+  batch_id: number
+  type: string // short_term / long_term
+  action: RecAction
+  summary: string
+  ref_price: number
+  created_at: string
+  linked_position_id: number // 已被哪笔持仓关联（0=未被关联）；不禁止改指
 }
 
 // 推荐历史表现统计（带样本量）。
@@ -500,6 +515,15 @@ export function deleteRecommendation(id: number) {
 // 独立 60s 超时：逐条拉日线+实时行情（服务端已并发 4），全局 20s 对多标的批次不够。
 export function trackRecommendation(id: number) {
   return request<RecommendationView>({ url: `/recommendations/${id}/track`, method: 'post', timeout: 60000 })
+}
+
+// 查某标的近 90 天可关联的推荐候选（供持仓页事后补关联时选择）。
+export function listRecommendationLinkCandidates(symbol: string, market: string) {
+  return request<RecLinkCandidate[]>({
+    url: '/recommendations/link-candidates',
+    method: 'get',
+    params: { symbol, market },
+  })
 }
 
 // 推荐历史表现统计（带样本量）。

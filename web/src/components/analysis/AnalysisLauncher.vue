@@ -99,12 +99,16 @@ function dateDisabled(ts: number) {
 
 <style scoped>
 .scope-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.scope-facts span { flex: 1 1 200px; min-width: 0; }
 .scope-facts span,
 .field-help,
 .switch-help,
-.submit-note { font-size: 12px; line-height: 1.55; opacity: .68; }
-.selected-stock { margin: -4px 0 14px; padding: 9px 10px; border: 1px solid rgba(128,128,128,.24); border-radius: 6px; }
+.submit-note { font-size: 12px; line-height: 1.55; opacity: .68; overflow-wrap: anywhere; }
+.selected-stock { margin: -4px 0 14px; padding: 9px 10px; border: 1px solid rgba(128,128,128,.24); border-radius: 6px; min-width: 0; }
 .field-help { margin: -7px 0 12px; }
-.switch-help { margin-left: 8px; }
+/* n-form-item 的 blank 区是 display:flex 且不换行（naive 内置），开关旁的长说明会被
+ * 压成一列竖字。允许该行换行，说明整段落到下一行。 */
+:deep(.n-form-item-blank) { flex-wrap: wrap; }
+.switch-help { flex: 1 1 200px; min-width: 0; margin-left: 8px; }
 .submit-note { margin: 8px 0 0; }
 </style>

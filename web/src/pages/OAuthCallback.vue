@@ -22,9 +22,13 @@ const mobile = ref<'' | 'browser' | 'app'>('')
 const deepLink = ref('')
 
 // GitHub 侧未完成授权（用户取消等）会带 error/error_description 回跳。
+// error_description 是外部可构造的 URL 参数：必须走 authErrorText 做长度上限与敏感词
+// 过滤（同本页其余错误路径口径一致），不能直接插值到页面。
 function githubSideError(): string {
   const ghErr = (route.query.error_description || route.query.error) as string | undefined
-  return ghErr ? `GitHub 授权未完成：${ghErr}` : '回调参数缺失'
+  if (!ghErr) return '回调参数缺失'
+  const safe = authErrorText(new Error(String(ghErr)), '授权未完成，请重新发起登录')
+  return `GitHub 授权未完成：${safe}`
 }
 
 // mode=mobile：本页运行在系统浏览器（无原生桥、无登录态）。用 code+state 换
@@ -126,7 +130,7 @@ async function run() {
   <AuthShell>
     <!-- 移动流·系统浏览器侧：换短码成功即深链回 App，常驻兜底按钮 -->
     <template v-if="mobile === 'browser' && !error">
-      <n-spin v-if="!deepLink" description="正在完成 GitHub 登录 ..." style="width: 100%; padding: 24px 0" />
+      <n-spin v-if="!deepLink" description="正在完成 GitHub 登录 ..." class="oauth-spin" />
       <n-result v-else status="success" title="授权成功" description="正在返回 QuantVista App ...">
         <template #footer>
           <n-button tag="a" :href="deepLink" type="primary">未自动跳转？点此返回 App</n-button>
@@ -141,12 +145,12 @@ async function run() {
       :description="error"
     >
       <template #footer>
-        <span style="font-size: 13px; opacity: 0.7">请回到 QuantVista App 重新发起 GitHub 登录</span>
+        <span class="oauth-tip">请回到 QuantVista App 重新发起 GitHub 登录</span>
       </template>
     </n-result>
     <!-- 非移动流原样 + 移动流·App 侧（错误按钮回 App 内登录页，语义成立） -->
     <template v-else>
-      <n-spin v-if="!error" :description="binding ? '正在完成 GitHub 绑定 ...' : '正在完成 GitHub 登录 ...'" style="width: 100%; padding: 24px 0" />
+      <n-spin v-if="!error" :description="binding ? '正在完成 GitHub 绑定 ...' : '正在完成 GitHub 登录 ...'" class="oauth-spin" />
       <n-result v-else status="error" :title="binding ? '绑定失败' : '登录失败'" :description="error">
         <template #footer>
           <n-button @click="router.replace(binding ? '/settings' : '/login')">{{ binding ? '返回设置' : '返回登录' }}</n-button>
@@ -155,3 +159,19 @@ async function run() {
     </template>
   </AuthShell>
 </template>
+
+<style scoped>
+.oauth-spin {
+  width: 100%;
+  padding: 24px 0;
+}
+.oauth-tip {
+  font-size: 13px;
+  opacity: 0.7;
+}
+/* n-result 的 description 只有 margin/text-align/font-size，没有换行兜底：
+   错误文案含长不可断串时会撑破 AuthShell 那张 400px 卡片。 */
+:deep(.n-result-header__description) {
+  overflow-wrap: anywhere;
+}
+</style>

@@ -174,6 +174,8 @@ const callBudget = computed(() => 1 + (form.value.verify ? 1 : 0) + (form.value.
 .submit-note {
   margin: 8px 0 0;
 }
+/* 560px 是 768 之下的二级细化：本组件在 <1050px 时已占满整宽，
+ * 560~768 区间两列每列仍有 240~350px，够放表单控件，不必提前降到单列。 */
 @media (max-width: 560px) {
   .form-grid,
   .filter-grid {

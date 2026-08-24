@@ -52,11 +52,12 @@ function statusType(value: string) { return value === 'success' ? 'success' : va
 </template>
 
 <style scoped>
-.module-filter { width: 128px; }
+.module-filter { width: 128px; flex: 0 1 128px; min-width: 0; }
 .history-list { display: grid; }
 .history-row { display: flex; width: 100%; min-width: 0; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 0; border: 0; border-bottom: 1px solid rgba(128,128,128,.2); background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
 .history-row.active { padding-left: 10px; box-shadow: inset 3px 0 var(--qv-primary); }
 .history-main { display: grid; min-width: 0; gap: 4px; }
+.history-main > b { min-width: 0; overflow-wrap: anywhere; }
 .history-main > span:last-child { font-size: 11px; opacity: .6; overflow-wrap: anywhere; }
 .history-side { display: flex; flex: 0 0 auto; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
 @media (max-width: 520px) {

@@ -310,7 +310,9 @@ async function toggleModelRouting(v: boolean) {
 const routes = ref<LLMRouteView[]>([])
 const routeModules = ref<LLMRouteModuleOption[]>([])
 const routeSaving = ref(false)
-const routeForm = reactive({ module: '', config_id: 0, enabled: true, note: '', max_cost_ratio: 0 })
+// module/config_id 用 null 而非 ''/0 表示「未选择」：n-select 默认 fallbackOption 会把
+// 非 null 的值兜成 String(value) 当作已选项（'' → 空白、0 → 字面「0」），placeholder 反而不显示。
+const routeForm = reactive({ module: null as string | null, config_id: null as number | null, enabled: true, note: '', max_cost_ratio: 0 })
 const routeModuleOptions = computed(() =>
   routeModules.value.map((m) => ({ label: `${m.label}（${m.module}）`, value: m.module })),
 )
@@ -341,8 +343,8 @@ async function saveRoute() {
       max_cost_ratio: routeForm.max_cost_ratio || 0,
     })
     message.success('路由已保存（自动回退状态已清除）')
-    routeForm.module = ''
-    routeForm.config_id = 0
+    routeForm.module = null
+    routeForm.config_id = null
     routeForm.note = ''
     routeForm.max_cost_ratio = 0
     routeForm.enabled = true
@@ -1243,7 +1245,8 @@ onMounted(() => {
           >
         </div>
         <n-empty v-if="!filteredHealthItems.length" description="暂无数据" size="small" style="padding: 20px 0" />
-        <n-table v-else-if="!isMobile" class="ops-table health-table" :bordered="false" :single-line="false" size="small">
+        <div v-else-if="!isMobile" class="health-table-wrap">
+        <n-table class="ops-table health-table" :bordered="false" :single-line="false" size="small">
           <thead>
             <tr>
               <th>数据域</th>
@@ -1280,7 +1283,7 @@ onMounted(() => {
               </td>
               <td>
                 <div class="gap-calendar">
-                  <n-tooltip v-for="day in it.gap_calendar || []" :key="day.date" trigger="hover">
+                  <n-tooltip v-for="day in it.gap_calendar || []" :key="day.date" trigger="hover" style="max-width: 320px">
                     <template #trigger><span class="gap-day" :class="`gap-${day.status}`"></span></template>
                     {{ gapDayTitle(day) }}
                   </n-tooltip>
@@ -1297,6 +1300,7 @@ onMounted(() => {
             </tr>
           </tbody>
         </n-table>
+        </div>
         <div v-else class="ops-cards">
           <article v-for="it in filteredHealthItems" :key="it.key" class="ops-card">
             <div class="ops-card-head">
@@ -1309,7 +1313,7 @@ onMounted(() => {
             <div class="ops-kv"><span>水位</span><span class="qv-tnum">{{ it.observed_date || '—' }} / {{ it.expected_date || '—' }}</span></div>
             <div class="ops-kv"><span>覆盖</span><span>{{ it.coverage || '—' }}</span></div>
             <div class="gap-calendar gap-calendar-mobile">
-              <n-tooltip v-for="day in it.gap_calendar || []" :key="day.date" trigger="hover">
+              <n-tooltip v-for="day in it.gap_calendar || []" :key="day.date" trigger="hover" style="max-width: 320px">
                 <template #trigger><span class="gap-day" :class="`gap-${day.status}`"></span></template>
                 {{ gapDayTitle(day) }}
               </n-tooltip>
@@ -1483,9 +1487,21 @@ onMounted(() => {
   flex-direction: column;
   gap: 16px;
 }
+/* 本页大量表单项是「控件 + 右侧长说明」，而 n-form-item 的 blank 区是 naive 内置的
+ * display:flex 且不换行——窄屏下说明会被压成一列竖字。统一放开换行，
+ * 并让说明文案作为可伸缩项独占下一行。 */
+.admin-stack :deep(.n-form-item-blank) {
+  flex-wrap: wrap;
+}
+.admin-stack :deep(.n-form-item-blank) > span {
+  flex: 1 1 240px;
+  min-width: 0;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
 .note {
   margin-bottom: 16px;
-  border-radius: 10px;
+  border-radius: 8px;
 }
 .log-time {
   white-space: nowrap;
@@ -1517,6 +1533,17 @@ onMounted(() => {
 .ops-table {
   width: 100%;
   table-layout: fixed;
+}
+/* 数据健康表比其余两张宽（含 15 格缺口日历列），table-layout:fixed 下不会自己横滚，
+ * 给它一个下限宽并让容器可横滚，否则各列被压到 ~110px、日历列首当其冲。
+ * 之前模板上写了 .health-table 但样式里没有定义（漏定义）。 */
+.health-table {
+  min-width: 1080px;
+}
+.health-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 .ops-wrap {
   white-space: normal;
@@ -1580,13 +1607,16 @@ onMounted(() => {
   gap: 6px;
   margin-top: 10px;
 }
+/* 固定轨道 repeat(15, 10px) 实宽恒为 192px，max-width:100% 对固定轨道不起压缩作用，
+ * 在 table-layout:fixed 的 7 列表里（每列约 150px）会溢出压到邻列。
+ * 用 auto-fill 让列数随可用宽度自适应换行。 */
 .gap-calendar {
   display: grid;
-  grid-template-columns: repeat(15, 10px);
+  grid-template-columns: repeat(auto-fill, 10px);
   grid-auto-rows: 10px;
   gap: 3px;
-  width: max-content;
   max-width: 100%;
+  min-width: 0;
 }
 .gap-day {
   display: block;
@@ -1601,6 +1631,7 @@ onMounted(() => {
 .gap-suspended { background: var(--ops-muted); }
 .gap-closed { background: var(--ops-closed); }
 .gap-unknown { background: var(--ops-info); }
+/* 移动端卡片里宽度充裕，固定 15 列即为一行 15 天，读起来更规整 */
 .gap-calendar-mobile {
   grid-template-columns: repeat(15, 10px);
   margin-top: 10px;

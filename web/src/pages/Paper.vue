@@ -498,7 +498,7 @@ onBeforeUnmount(() => {
   gap: 16px;
   align-items: start;
 }
-@media (max-width: 900px) {
+@media (max-width: 768px) {
   .cols {
     grid-template-columns: 1fr;
   }
@@ -536,24 +536,19 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: baseline;
   gap: 8px;
+  min-width: 0;
   /* 长名 ETF（名称+代码+标签 >200px）在移动端 150px 主列里换行而非溢出压到盈亏列 */
   flex-wrap: wrap;
-}
-.hold-name {
-  font-size: 14px;
-  font-weight: 600;
-}
-.hold-symbol {
-  font-size: 12px;
-  opacity: 0.5;
 }
 .hold-sub {
   font-size: 12px;
   opacity: 0.65;
   margin-top: 3px;
+  overflow-wrap: anywhere;
 }
 .hold-pnl {
   text-align: right;
+  flex-shrink: 0;
 }
 .pnl-val {
   font-size: 14px;
@@ -577,10 +572,6 @@ onBeforeUnmount(() => {
 }
 .trade:last-child {
   border-bottom: none;
-}
-.tr-name {
-  font-weight: 500;
-  min-width: 80px;
 }
 .tr-detail {
   opacity: 0.7;
@@ -612,6 +603,8 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 .curve-chart {
   width: 100%;

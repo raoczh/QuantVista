@@ -3,6 +3,7 @@ package controller
 import (
 	"errors"
 	"strconv"
+	"strings"
 
 	"quantvista/common"
 	"quantvista/model"
@@ -96,6 +97,23 @@ func (rc *RecommendationController) Get(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, v)
+}
+
+// LinkCandidates GET /api/recommendations/link-candidates?symbol=&market= —— 某标的近 90 天
+// 可关联的推荐候选（供持仓补关联时选择）。**路由必须注册在 /:id 之前**，否则
+// gin 会把 "link-candidates" 当成 :id。
+func (rc *RecommendationController) LinkCandidates(c *gin.Context) {
+	symbol := strings.TrimSpace(c.Query("symbol"))
+	if symbol == "" {
+		common.ApiErrorMsg(c, "请提供股票代码")
+		return
+	}
+	list, err := rc.svc.RecommendationLinkCandidates(currentUserID(c), symbol, c.Query("market"))
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, list)
 }
 
 // Delete DELETE /api/recommendations/:id

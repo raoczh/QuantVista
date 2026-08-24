@@ -350,19 +350,11 @@ onMounted(() => {
   font-size: 12px;
   opacity: 0.82;
 }
-@media (max-width: 640px) {
+@media (max-width: 768px) {
   .filter-item,
   .filter-status {
     width: calc(50% - 5px);
   }
-}
-.cell-time {
-  font-size: 12px;
-  white-space: nowrap;
-}
-.cell-dim {
-  font-size: 12px;
-  opacity: 0.75;
 }
 .detail {
   display: flex;
@@ -406,5 +398,19 @@ onMounted(() => {
   max-height: 32vh;
   overflow: auto;
   margin: 0;
+}
+</style>
+
+<!-- 这两个类只在 n-data-table 的列 render（h() 调用）里使用。列渲染函数由 naive-ui
+     内部组件执行，vnode 拿不到本组件的 data-v-xxx，scoped 选择器永不匹配——
+     必须放非 scoped 块。类名带 cell- 前缀且仅用于本页表格。 -->
+<style>
+.cell-time {
+  font-size: 12px;
+  white-space: nowrap;
+}
+.cell-dim {
+  font-size: 12px;
+  opacity: 0.75;
 }
 </style>

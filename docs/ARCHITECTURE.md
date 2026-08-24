@@ -80,7 +80,7 @@ Go API Server
 
 - **禁止硬编码颜色**（文字、背景、边框）。颜色一律取自 Naive UI 主题：组件优先用 Naive 组件自带样式；确需取色时用 `useThemeVars()` 拿主题变量，或用 `n-config-provider` 的 override。
 - **明暗都要可读**：6 套里有亮有暗，任何新页面在亮色和暗色基调下都要对比度达标，不能只在某一种下好看。
-- **图表（ECharts）必须主题感知**：按当前 `isDark` 选明/暗主题，主题切换时重建（见 `pages/Home.vue` 的 `watch(isDark)` 范式）；语义色（涨红跌绿等）可固定，但坐标轴/背景/文字跟随主题。
+- **图表（ECharts）必须主题感知**：按当前 `isDark` 选明/暗主题，主题切换时重建——**必须 `watch([isDark, vars], …)` 同时监听两者**（见 `pages/Home.vue` 范式）。只监听 `isDark` 是隐性 bug：6 套主题里 3 亮 3 暗，同明暗档内换主题（如浅蓝→樱桃红）`isDark` 不变，但 `primaryColor`/`bodyColor`/`textColor*` 全变，图表会滞留上一套主题的颜色。语义色（涨红跌绿等）可固定，但坐标轴/背景/文字跟随主题。
 - **第三方/自绘组件**接入前先确认能跟随主题，否则需包一层主题适配。
 - 新增主题只在 `presets.ts` 加一项即可，不改页面代码——页面不得对“当前是哪套主题”做硬编码假设。
 
@@ -125,7 +125,8 @@ Go API Server
 
 - 新页面骨架 = `PageContainer` → 若干 `SectionCard`；列表优先 `RankList`，指标优先 `StatCard`，涨跌用 `ChangeTag`/`useUi().pctColor`。
 - 数字加 `.qv-tnum`（或 `.qv-figure` 用于大号），保证对齐。
-- 图表主题感知照 §4.1（`isDark` 初始化 + `watch` 重建，语义色取 `vars.errorColor/successColor`）。
+- 图表主题感知照 §4.1（`isDark` 初始化 + `watch([isDark, vars])` 重建，语义色取 `vars.errorColor/successColor`）。渲染函数里若按视口宽度分档（轴名/字号/边距），`resize` 监听中必须判断该档位是否翻转并重绘，只调 `chart.resize()` 会让窄屏专属配置跨断点后失效。
+- **`h()` 渲染函数里不能用 `<style scoped>` 的类**：`n-data-table` 的列 `render`/`renderExpand` 由 naive-ui 内部组件执行，vnode 拿不到本组件的 `data-v-xxx`，scoped 选择器永不匹配（样式静默失效，无任何报错）。只能用 `global.css` 的全局类（`qv-tnum` 等）、内联 `style`，或把规则放进额外的非 scoped `<style>` 块并加页面前缀。
 - 仍受 §4.1 硬约束约束：组件内所有色值来自主题变量，中性描边/阴影可用 `rgba(128,128,128,…)` / `rgba(0,0,0,…)`。
 
 ### 4.3 页面单根与移动端适配（硬约束，2026-07-04）

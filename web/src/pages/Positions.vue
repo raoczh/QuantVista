@@ -48,11 +48,13 @@ import {
   type PositionCorpAdjust,
   requestPositionAdvice,
   getPositionExitAssessment,
+  linkPositionRecommendation,
   type PositionAdviceResult,
   type PositionExitAssessment,
   type PositionExitLevel,
   POSITION_VERDICT_LABEL,
 } from '@/api/position'
+import { listRecommendationLinkCandidates, type RecLinkCandidate } from '@/api/recommendation'
 import { getLLMTask, type LLMTask } from '@/api/llmTask'
 import { pollUntil } from '@/lib/poll'
 import { isAbortError } from '@/api/client'
@@ -301,7 +303,72 @@ function openEdit(p: Position) {
     plan_take_profit: p.plan_take_profit || undefined,
   }
   checklistFromJSON(p.checklist_json)
+  // 血缘不进 form：后端 Update 不处理 recommendation_id，改动走独立接口，
+  // 编辑持仓因此不会误清已有血缘（既有的正确行为，别把它破坏掉）。
+  openLinkEditor(p)
   editModal.value = true
+}
+
+function goRecommendationBatch(batchID: number) {
+  if (!batchID) return
+  void router.push({ name: 'recommendations', query: { batch_id: String(batchID) } })
+}
+
+// ---------- 推荐血缘（事后补关联；建仓时的即时血缘由 openCreate 的 recId 带入）----------
+const linkTarget = ref<Position | null>(null)
+const linkCandidates = ref<RecLinkCandidate[]>([])
+const linkLoading = ref(false)
+const linkSaving = ref(false)
+const linkSelected = ref<number>(0)
+
+/** 打开编辑弹窗时按标的拉候选推荐。best-effort：拉不到只是没得选，不阻塞编辑。 */
+async function openLinkEditor(p: Position) {
+  linkTarget.value = p
+  linkSelected.value = p.rec_link?.recommendation_id || p.recommendation_id || 0
+  linkCandidates.value = []
+  if (p.status === 'closed') return // 已平仓不再改血缘，避免改写历史归因
+  linkLoading.value = true
+  try {
+    linkCandidates.value = await listRecommendationLinkCandidates(p.symbol, p.market)
+  } catch {
+    linkCandidates.value = []
+  } finally {
+    linkLoading.value = false
+  }
+}
+
+const linkOptions = computed(() => [
+  { label: '不关联任何推荐（自主决定买入）', value: 0 },
+  ...linkCandidates.value.map((c) => ({
+    label:
+      `#${c.recommendation_id} · ${c.created_at.slice(0, 10)} · ` +
+      `${c.type === 'short_term' ? '短线' : '长线'}${c.action === 'buy' ? '买入' : '观察'}` +
+      ` · 参考价 ${c.ref_price > 0 ? c.ref_price.toFixed(2) : '未知'}` +
+      (c.linked_position_id && c.linked_position_id !== linkTarget.value?.id
+        ? `（已关联持仓 #${c.linked_position_id}）`
+        : ''),
+    value: c.recommendation_id,
+  })),
+])
+const linkDirty = computed(
+  () => !!linkTarget.value && linkSelected.value !== (linkTarget.value.recommendation_id || 0),
+)
+
+async function saveLink() {
+  const target = linkTarget.value
+  if (!target || linkSaving.value || !linkDirty.value) return
+  linkSaving.value = true
+  try {
+    await linkPositionRecommendation(target.id, linkSelected.value)
+    message.success(linkSelected.value > 0 ? '已关联到该推荐' : '已解除推荐关联')
+    await load()
+    const fresh = positions.value.find((p) => p.id === target.id)
+    if (fresh) linkTarget.value = fresh
+  } catch (e) {
+    message.error((e as Error).message)
+  } finally {
+    linkSaving.value = false
+  }
 }
 const submitting = ref(false)
 async function submit() {
@@ -1566,6 +1633,18 @@ onBeforeUnmount(() => {
                         >{{ exitLevelLabel[p.exit_assessment.level] }}</n-tag>
                         <n-tag v-if="p.below_stop_loss" size="tiny" type="error" :bordered="false">破止损</n-tag>
                         <n-tag v-else-if="p.near_stop_loss" size="tiny" type="warning" :bordered="false">近止损</n-tag>
+                        <!-- 血缘可见性：有来源推荐才显示，无血缘不加徽章（避免每行都是噪音）。
+                             没有这个徽章，recommendation_id 只是个不可见的数字，用户无从
+                             察觉「我照推荐买的，但系统没记住」。 -->
+                        <n-tag
+                          v-if="p.rec_link"
+                          size="tiny"
+                          type="info"
+                          :bordered="false"
+                          class="tag-click"
+                          :title="`来自推荐 #${p.rec_link.recommendation_id}（${p.rec_link.created_at.slice(0, 10)} · 参考价 ${p.rec_link.ref_price > 0 ? p.rec_link.ref_price.toFixed(2) : '未知'}），点击查看该批推荐`"
+                          @click="goRecommendationBatch(p.rec_link.batch_id)"
+                        >来自推荐</n-tag>
                         <FreshnessTag
                           v-if="p.status === 'holding'"
                           :status="p.freshness_status"
@@ -1980,6 +2059,31 @@ onBeforeUnmount(() => {
           <n-input v-model:value="form.user_note" placeholder="补充备注（可选）" maxlength="512" />
         </n-form-item>
 
+        <!-- 推荐血缘：仅编辑已有持仓时可改（新建时由推荐页「按推荐记录建仓」自动带入）。
+             独立保存按钮——本项走 recommendation-link 接口，不随表单一起提交。 -->
+        <n-form-item v-if="editing && !editingClosed" label="关联推荐">
+          <div class="link-editor">
+            <n-select
+              v-model:value="linkSelected"
+              :options="linkOptions"
+              :loading="linkLoading"
+              :disabled="linkSaving"
+              size="small"
+            />
+            <div class="link-actions">
+              <n-button size="tiny" type="primary" secondary :disabled="!linkDirty" :loading="linkSaving" @click="saveLink">
+                保存关联
+              </n-button>
+              <span v-if="!linkCandidates.length && !linkLoading" class="link-hint">
+                近 90 天没有该股票的推荐记录，无可关联项。
+              </span>
+              <span v-else class="link-hint">
+                关联后该笔的实际买入价与收益会计入对应推荐的追踪事实；本项独立保存，不受下方「保存」影响。
+              </span>
+            </div>
+          </div>
+        </n-form-item>
+
         <!-- 风险计划 + 仓位风险计算器（实时纯前端计算） -->
         <template v-if="!editingClosed">
           <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
@@ -2242,14 +2346,7 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-}
-.r-title {
-  font-size: 14px;
-  font-weight: 500;
-}
-.r-symbol {
-  font-size: 12px;
-  opacity: 0.5;
+  min-width: 0;
 }
 .r-sub {
   font-size: 12px;
@@ -2269,12 +2366,32 @@ onBeforeUnmount(() => {
 .tag-click {
   cursor: pointer;
 }
+/* 关联推荐编辑器：下拉 + 独立保存按钮（本项不随表单提交，见模板注释） */
+.link-editor {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  gap: 6px;
+}
+.link-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.link-hint {
+  font-size: 11px;
+  opacity: 0.62;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
 .signal-line {
   line-height: 1.7;
 }
 .r-figures {
   display: flex;
   gap: 22px;
+  flex-wrap: wrap;
 }
 .r-fig {
   display: flex;
@@ -2300,6 +2417,7 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 4px;
+  flex-wrap: wrap;
 }
 
 @media (max-width: 768px) {
@@ -2386,6 +2504,8 @@ onBeforeUnmount(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
   font-weight: 600;
 }
 .check-item {
@@ -2565,16 +2685,6 @@ onBeforeUnmount(() => {
   padding: 4px 0;
   border-bottom: 1px dashed var(--qv-divider);
 }
-.top-name {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .top-meta {
   font-size: 11px;
   opacity: 0.5;
@@ -2640,24 +2750,19 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-}
-.adjust-name {
-  font-size: 14px;
-  font-weight: 600;
-}
-.adjust-symbol {
-  font-size: 12px;
-  opacity: 0.5;
+  min-width: 0;
 }
 .adjust-plan {
   font-size: 13px;
   opacity: 0.8;
   margin-top: 3px;
+  overflow-wrap: anywhere;
 }
 .adjust-calc {
   font-size: 12px;
   opacity: 0.72;
   margin-top: 3px;
+  overflow-wrap: anywhere;
 }
 .adjust-review {
   margin-top: 5px;
@@ -2811,14 +2916,7 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-}
-.advice-name {
-  font-size: 14px;
-  font-weight: 600;
-}
-.advice-symbol {
-  font-size: 12px;
-  opacity: 0.5;
+  min-width: 0;
 }
 .advice-position {
   font-size: 12px;
@@ -2829,11 +2927,13 @@ onBeforeUnmount(() => {
   opacity: 0.85;
   margin-top: 5px;
   line-height: 1.7;
+  overflow-wrap: anywhere;
 }
 .advice-invalid {
   font-size: 12px;
   opacity: 0.65;
   margin-top: 4px;
+  overflow-wrap: anywhere;
 }
 .advice-foot {
   font-size: 11px;

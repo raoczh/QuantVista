@@ -396,20 +396,6 @@ a.fi-title:hover {
   padding: 1px 8px;
   border-radius: 999px;
 }
-.fi-sym {
-  font-size: 11px;
-  padding: 1px 8px;
-  border-radius: 999px;
-  border: none;
-  background: var(--nf-tag-bg);
-  color: var(--qv-primary);
-  cursor: pointer;
-  font-weight: 600;
-  transition: opacity 0.15s ease;
-}
-.fi-sym:hover {
-  opacity: 0.75;
-}
 .fi-sym-more {
   font-size: 11px;
   opacity: 0.5;

@@ -49,6 +49,19 @@ withDefaults(
   font-size: 15px;
 }
 
+/* Naive 的 .n-card-header__extra 是 display:flex 但没有 gap / flex-wrap / min-width:0，
+ * 直接往 #extra 塞多个按钮会贴死、窄屏还会把标题挤没。在这里统一兜住，
+ * 各页就不必每处都包一层 xx-toolbar（已包的也不受影响）。 */
+.section-card :deep(.n-card-header) {
+  gap: 12px;
+}
+.section-card :deep(.n-card-header__extra) {
+  min-width: 0;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 /* 移动端：卡片内容区可横向滚动，宽表格不撑破整页布局；
  * 表格单元格不折行（挤压成一列一字反而没法看），滚动查看。 */
 @media (max-width: 768px) {

@@ -740,10 +740,8 @@ function metricLabel(name: string) {
 .rule-name {
   font-size: 14px;
   font-weight: 600;
-}
-.rule-symbol {
-  font-size: 12px;
-  opacity: 0.5;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .rule-cond {
   display: flex;
@@ -832,18 +830,11 @@ function metricLabel(name: string) {
   gap: 8px;
   flex-wrap: wrap;
 }
-.ev-name {
-  font-size: 13px;
-  font-weight: 600;
-}
-.ev-symbol {
-  font-size: 12px;
-  opacity: 0.5;
-}
 .ev-msg {
   font-size: 13px;
   margin-top: 3px;
   opacity: 0.85;
+  overflow-wrap: anywhere;
 }
 .ev-time {
   font-size: 11px;
@@ -866,16 +857,14 @@ function metricLabel(name: string) {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-}
-.detail-symbol {
-  margin-left: 8px;
-  font-size: 12px;
-  opacity: 0.55;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 .detail-reason {
   margin-top: 10px;
   font-size: 14px;
   line-height: 1.6;
+  overflow-wrap: anywhere;
 }
 .detail-meta,
 .detail-unknown {
@@ -965,9 +954,6 @@ function metricLabel(name: string) {
   }
   .event .ev-main {
     flex-basis: 100%;
-  }
-  .event .ev-symbol {
-    display: none;
   }
   .event .ev-mobile-actions {
     position: static;

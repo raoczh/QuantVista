@@ -103,13 +103,18 @@ onMounted(async () => {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+  /* naive collapse 的 __header-main 只有 flex:1、没有 min-width:0 */
+  min-width: 0;
 }
 .role-id {
   font-size: 12px;
   opacity: 0.75;
+  overflow-wrap: anywhere;
 }
 .role-name {
   font-weight: 600;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .role-budget {
   font-size: 12px;
@@ -125,12 +130,18 @@ onMounted(async () => {
   display: flex;
   gap: 10px;
   align-items: flex-start;
+  min-width: 0;
 }
 .role-k {
   flex: 0 0 84px;
   font-size: 12px;
   opacity: 0.55;
   padding-top: 1px;
+}
+/* 值侧：内含 n-tag（naive 写死 nowrap），必须显式放开收缩，否则窄屏溢出 */
+.role-row > :last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .role-tag {
   margin: 0 6px 4px 0;
@@ -139,6 +150,7 @@ onMounted(async () => {
   margin: 0;
   padding-left: 16px;
   line-height: 1.7;
+  overflow-wrap: anywhere;
 }
 .role-forbid li {
   opacity: 0.85;
@@ -147,11 +159,22 @@ onMounted(async () => {
   font-size: 12px;
   opacity: 0.7;
   margin-right: 10px;
-  word-break: break-all;
+  /* 用 anywhere 而非 break-all：后者会把中文和短单词也随意截断 */
+  overflow-wrap: anywhere;
 }
 .roles-empty {
   padding: 24px 0;
   opacity: 0.6;
   font-size: 13px;
+}
+/* 84px 定宽左标签在 375px 下吃掉近三成宽度，手机改上下堆叠（等同表单 label-placement=top） */
+@media (max-width: 768px) {
+  .role-row {
+    flex-direction: column;
+    gap: 2px;
+  }
+  .role-k {
+    flex: none;
+  }
 }
 </style>

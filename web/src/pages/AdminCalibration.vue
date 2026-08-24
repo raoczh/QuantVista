@@ -247,6 +247,7 @@ function prLine(rep: RecCalibReport): string {
   font-size: 12px;
   opacity: 0.65;
   margin: 2px 0;
+  overflow-wrap: anywhere;
 }
 .calib-sub {
   font-size: 13px;
@@ -257,16 +258,29 @@ function prLine(rep: RecCalibReport): string {
   font-size: 12px;
   opacity: 0.65;
   margin-top: 6px;
+  overflow-wrap: anywhere;
 }
 .calib-notes {
   margin-top: 10px;
   font-size: 12px;
   opacity: 0.55;
   line-height: 1.8;
+  /* notes 由服务端下发，可能含 provider·model/prompt_version 这类无空格长串 */
+  overflow-wrap: anywhere;
 }
 .calib-empty {
   padding: 24px 0;
   opacity: 0.6;
   font-size: 13px;
+}
+/* 卡头 extra 里的 meta 文本在窄屏会把筛选控件挤出视口，让它独占一行 */
+@media (max-width: 768px) {
+  .calib-meta {
+    width: 100%;
+  }
+  .calib-toolbar :deep(.n-select) {
+    flex: 1 1 140px;
+    min-width: 0;
+  }
 }
 </style>

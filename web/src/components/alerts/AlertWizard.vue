@@ -715,6 +715,7 @@ onMounted(() => void loadPositions())
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
+  flex-wrap: wrap;
   margin-bottom: 16px;
 }
 .step-heading > div:first-child {
@@ -802,6 +803,13 @@ onMounted(() => void loadPositions())
 .preview-sentence {
   font-size: 14px;
   line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+/* 弹窗内两列模板卡在 768px 以下每列仅约 160px，标题+说明会挤成竖条，提前降到单列 */
+@media (max-width: 768px) {
+  .template-grid {
+    grid-template-columns: 1fr;
+  }
 }
 @media (max-width: 480px) {
   .wizard-steps :deep(.n-step) {
@@ -809,9 +817,6 @@ onMounted(() => void loadPositions())
   }
   .wizard-steps :deep(.n-step-content) {
     display: none;
-  }
-  .template-grid {
-    grid-template-columns: 1fr;
   }
   .template-option {
     min-height: 66px;

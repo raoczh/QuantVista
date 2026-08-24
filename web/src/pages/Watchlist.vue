@@ -791,6 +791,8 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 .items {
   display: flex;
@@ -858,14 +860,8 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 8px;
-}
-.it-title {
-  font-size: 14px;
-  font-weight: 500;
-}
-.it-symbol {
-  font-size: 12px;
-  opacity: 0.5;
+  min-width: 0;
+  flex-wrap: wrap;
 }
 .it-note {
   font-size: 12px;
@@ -961,19 +957,27 @@ onMounted(async () => {
 .missed-row:last-child {
   border-bottom: none;
 }
+.missed-main {
+  flex: 1;
+  min-width: 0;
+}
 .missed-name {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 .missed-reason {
   font-size: 12px;
   opacity: 0.65;
   margin-top: 2px;
+  overflow-wrap: anywhere;
 }
 .missed-nums {
   display: flex;
   gap: 12px;
+  flex-shrink: 0;
   font-size: 12.5px;
   white-space: nowrap;
 }

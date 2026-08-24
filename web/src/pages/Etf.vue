@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import {
+  NAlert,
   NButton,
   NInput,
   NInputNumber,
@@ -29,8 +30,7 @@ import FreshnessTag from '@/components/FreshnessTag.vue'
 import StockIdentity from '@/components/StockIdentity.vue'
 
 const message = useMessage()
-const { pctColor, vars } = useUi()
-const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
+const { pctColor } = useUi()
 
 const etfs = ref<EtfItem[]>([])
 const overview = ref<PaperOverview | null>(null)
@@ -137,13 +137,15 @@ onMounted(load)
       <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>
     </template>
 
-    <div class="etf" :style="styleVars">
+    <div class="etf">
       <n-alert v-if="!loading && !etfs.length" type="warning" :bordered="false" title="ETF 行情暂不可用">
         请重试；模拟账户余额和历史模拟持仓仍与真实持仓分开。数据时间：未知。
       </n-alert>
       <p v-else class="data-status">行情时间 {{ latestQuoteTime }} · 模拟账户仅用于研究练习，不会写入真实持仓</p>
       <!-- 账户概览（ETF 口径） -->
-      <n-grid cols="1 s:3" :x-gap="14" :y-gap="14" responsive="screen">
+      <!-- 用 m:（1024px）而非 s:（640px）：三张卡的 sub 文案较长，
+           640~1024px 每列仅约 200px 会挤成竖条。§4.3 的 `cols="1 s:N"` 约定针对弹窗内栅格。 -->
+      <n-grid cols="1 m:3" :x-gap="14" :y-gap="14" responsive="screen">
         <n-gi>
           <StatCard label="模拟盘现金" :value="fmtMoney(overview?.account.cash ?? 0)" />
         </n-gi>
@@ -329,17 +331,10 @@ onMounted(load)
 .etf-ops {
   display: flex;
   gap: 6px;
+  flex-wrap: wrap;
 }
 .etf-index {
   opacity: 0.6;
-}
-.hold-name {
-  font-weight: 600;
-}
-.hold-symbol {
-  margin-left: 8px;
-  font-size: 12px;
-  opacity: 0.5;
 }
 .hold-pct {
   font-size: 12px;

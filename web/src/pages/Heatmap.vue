@@ -55,6 +55,10 @@ function fmtYi(n: number): string {
   return (n / 1e8).toFixed(1) + ' 亿'
 }
 
+// 最近一次渲染用的窄屏档位。窄屏专属配置在 renderChart 里只求值一次，
+// 跨 768px 时必须重绘而非仅 resize（见 onResize）。
+let narrowRendered = window.matchMedia('(max-width: 768px)').matches
+
 function renderChart() {
   if (!chartEl.value) return
   if (chart) {
@@ -65,6 +69,7 @@ function renderChart() {
   // 窄屏格子小（Top100 挤 ~360×460）：标签只出名称单行、字号降档、缝隙收窄，
   // 涨跌幅靠色深与 tooltip（confine 已开）承载。
   const isNarrow = window.matchMedia('(max-width: 768px)').matches
+  narrowRendered = isNarrow
   const data = boards.value.map((b) => ({
     name: b.name,
     value: Math.max(b.amount, 1), // 面积=成交额（0 值兜底防不显示）
@@ -130,11 +135,22 @@ function renderChart() {
 }
 
 watch(kind, () => load())
-watch(isDark, () => {
+// 必须同时监听 vars：treemap 的格子缝隙色取 vars.bodyColor，3 套浅色主题各不相同
+// （#f3f5fa / #f7f5fb / #faf5f6）。只监听 isDark 时同档换主题不重建，
+// 缝隙会留着上一套主题的底色，在新底色上显出一整片错色网格线。
+watch([isDark, vars], () => {
   if (boards.value.length) renderChart()
 })
 
+// 窄屏专属配置（标签单行/字号/缝隙）在 renderChart 里按视口宽度分档求值一次，
+// 所以跨过 768px 时不能只 resize——档位翻转必须重绘，否则桌面缩窄后
+// Top100 小格子仍按 12px 双行排版糊成一团。
 function onResize() {
+  const narrowNow = window.matchMedia('(max-width: 768px)').matches
+  if (narrowNow !== narrowRendered && boards.value.length) {
+    renderChart()
+    return
+  }
   chart?.resize()
 }
 

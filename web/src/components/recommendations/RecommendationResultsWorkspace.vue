@@ -18,6 +18,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (event: 'refresh-tracking'): void
   (event: 'stop-alert', item: RecommendationItem): void
+  (event: 'linked'): void
   (event: 'update:sections', value: string[]): void
 }>()
 
@@ -72,15 +73,18 @@ const discoveryLabel = computed(() => ({ success: '完整', partial: '部分可�
         <n-alert v-else-if="current.status === 'degraded'" type="warning" :bordered="false">{{ current.error || '部分数据或 AI 结果不可用，已保留可用结果。' }}</n-alert>
         <n-alert v-else-if="current.status === 'failed'" type="error" :bordered="false">{{ current.error || '推荐生成失败，请查看任务状态中的真实原因和下一步。' }}</n-alert>
         <n-empty v-if="!current.items.length && current.status !== 'processing'" description="本批没有有效推荐，候选与排除事实仍可在下方查看。" />
-        <RecommendationCard
-          v-for="item in visible"
-          :key="item.id"
-          :item="item"
-          :type="current.type"
-          :candidate="poolMap.get(`${item.market || 'cn'}:${item.symbol}`)"
-          @stop-alert="emit('stop-alert', $event)"
-        />
-        <n-button v-if="ordered.length > visible.length" block tertiary @click="showAll = true">查看其余 {{ ordered.length - visible.length }} 条</n-button>
+        <div v-if="visible.length" class="rec-list">
+          <RecommendationCard
+            v-for="item in visible"
+            :key="item.id"
+            :item="item"
+            :type="current.type"
+            :candidate="poolMap.get(`${item.market || 'cn'}:${item.symbol}`)"
+            @stop-alert="emit('stop-alert', $event)"
+            @linked="emit('linked')"
+          />
+        </div>
+        <n-button v-if="ordered.length > visible.length" block tertiary class="more-btn" @click="showAll = true">查看其余 {{ ordered.length - visible.length }} 条</n-button>
         <RecommendationCandidateAudit v-model:sections="sectionModel" :current="current" />
       </template>
     </n-spin>
@@ -96,4 +100,13 @@ const discoveryLabel = computed(() => ({ success: '完整', partial: '部分可�
 .batch-head { margin-bottom: 12px; }
 .batch-title { font-size: 17px; font-weight: 650; }
 .batch-meta { margin-top: 4px; font-size: 12px; opacity: .62; overflow-wrap: anywhere; }
+/* 推荐卡列表：与上方批次信息/告警、下方「查看其余」按钮和审计区都留出间距，
+ * 卡与卡之间的间隔由 RecommendationCard 的 `+` 选择器负责。 */
+.rec-list {
+  display: block;
+  margin: 14px 0;
+}
+.more-btn {
+  margin-bottom: 14px;
+}
 </style>

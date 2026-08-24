@@ -605,7 +605,19 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
   line-height: 1.55;
+}
+.switch-row > span {
+  flex: 1 1 240px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* n-form-item 的 blank 区是 naive 内置的 display:flex 且不换行，
+ * 「开关 + 长说明」在窄屏会被压成竖条 */
+:deep(.n-form-item-blank) {
+  flex-wrap: wrap;
 }
 .guard-settings {
   display: grid;
@@ -658,6 +670,12 @@ onMounted(() => {
 .channel-meta {
   font-size: 12px;
   opacity: 0.62;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.channel-title > strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .channels {
   display: grid;
@@ -720,7 +738,7 @@ onMounted(() => {
 .channel-error {
   margin-top: 3px;
 }
-@media (max-width: 680px) {
+@media (max-width: 768px) {
   .channel-fields,
   .ntfy-fields {
     grid-template-columns: 1fr;

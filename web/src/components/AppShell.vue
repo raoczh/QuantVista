@@ -258,10 +258,15 @@ useAutoRefresh(refreshMarketTitle, 60_000)
 
 // ---------- 主题变量下发 ----------
 // 注入到 :root，global.css（::selection）与弹层内容也能取到。
+// --qv-border / --qv-hover 曾是「幽灵变量」：多个后台页 var(--qv-border, rgba(128,128,128,.2))
+// 只有读取、全站零声明，永远回落到硬编码 fallback，看着像主题感知实则 6 套主题同色。
+// 在这里统一注入后，那些读取点即刻跟随主题。
 watchEffect(() => {
   const el = document.documentElement
   el.style.setProperty('--qv-primary', vars.value.primaryColor)
   el.style.setProperty('--qv-primary-selection', withAlpha(vars.value.primaryColor, 0.22))
+  el.style.setProperty('--qv-border', vars.value.dividerColor)
+  el.style.setProperty('--qv-hover', isDark.value ? 'rgba(255, 255, 255, 0.07)' : 'rgba(128, 128, 128, 0.1)')
 })
 
 // 外壳专用变量全部源自主题，兼容 6 套主题。
@@ -584,6 +589,11 @@ onUnmounted(() => {
 .user-name {
   font-size: 13px;
   font-weight: 500;
+  /* 长昵称（如第三方登录带来的长 display_name）不得把顶栏操作区顶出视口 */
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .app-main {

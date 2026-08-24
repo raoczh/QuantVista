@@ -363,6 +363,13 @@ onMounted(() => {
   gap: 10px;
   flex-wrap: wrap;
 }
+/* StockPicker 内部是 n-select（默认 width:100%），在 flex 行里必须显式给宽，
+ * 否则会撑满整行把日期选择器挤到下一行。 */
+.thesis-stock-picker {
+  flex: 1 1 240px;
+  min-width: 0;
+  max-width: 300px;
+}
 .form-actions {
   display: flex;
   justify-content: flex-end;
@@ -395,13 +402,7 @@ onMounted(() => {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-}
-.name {
-  font-weight: 600;
-}
-.symbol {
-  font-size: 12px;
-  opacity: 0.65;
+  min-width: 0;
 }
 .card-ops {
   display: flex;
@@ -411,14 +412,21 @@ onMounted(() => {
 .invalid-input {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
+}
+.invalid-input :deep(.n-input) {
+  flex: 1 1 200px;
+  min-width: 0;
 }
 .thesis-text {
   margin: 0;
   font-size: 13.5px;
   line-height: 1.65;
+  overflow-wrap: anywhere;
 }
 .block {
   font-size: 12.5px;
+  min-width: 0;
 }
 .block-label {
   font-weight: 600;
@@ -428,23 +436,41 @@ onMounted(() => {
   margin: 4px 0 0;
   padding-left: 18px;
   line-height: 1.6;
+  overflow-wrap: anywhere;
 }
 .block.kill .block-label {
   color: v-bind('vars.warningColor');
 }
 .invalid-reason {
   margin: 4px 0 0;
+  overflow-wrap: anywhere;
 }
 .check {
   border-top: 1px dashed var(--qv-divider);
   padding-top: 8px;
   font-size: 12.5px;
 }
+.check-quote {
+  display: block;
+  overflow-wrap: anywhere;
+}
 .card-foot {
   display: flex;
   justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
   font-size: 12px;
   opacity: 0.6;
   margin-top: auto;
+}
+@media (max-width: 768px) {
+  .thesis-stock-picker {
+    flex-basis: 100%;
+    max-width: none;
+  }
+  .form-row :deep(.n-date-picker) {
+    max-width: none !important;
+    width: 100%;
+  }
 }
 </style>

@@ -1500,36 +1500,8 @@ async function removeCustom(id: number) {
 .batch-issues {
   margin-top: 12px;
 }
-.select-col {
-  width: 52px;
-  text-align: center;
-}
 .cond-tag {
   font-size: 11px;
-}
-.more-tag {
-  opacity: 0.75;
-}
-.hits-table th.num,
-.hits-table td.num {
-  text-align: right;
-}
-.hits-table td,
-.hits-table th {
-  white-space: nowrap;
-}
-.reasons-cell {
-  max-width: 340px;
-}
-.reasons-brief {
-  display: inline-flex;
-  gap: 4px;
-  flex-wrap: wrap;
-}
-.reasons-full {
-  max-width: 380px;
-  font-size: 12px;
-  line-height: 1.9;
 }
 .stock-link {
   cursor: pointer;
@@ -1537,10 +1509,6 @@ async function removeCustom(id: number) {
 }
 .stock-link:hover {
   text-decoration: underline;
-}
-.row-actions {
-  display: flex;
-  gap: 2px;
 }
 .empty-pad {
   padding: 22px 0;
@@ -1565,10 +1533,13 @@ async function removeCustom(id: number) {
 .sc-name {
   font-weight: 600;
   font-size: 14px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .sc-tags {
   display: inline-flex;
   gap: 4px;
+  flex-wrap: wrap;
 }
 .sc-desc {
   margin: 0;
@@ -1873,9 +1844,6 @@ async function removeCustom(id: number) {
   .w-num {
     flex: 1;
     min-width: 96px;
-  }
-  .reasons-cell {
-    max-width: 220px;
   }
 }
 </style>

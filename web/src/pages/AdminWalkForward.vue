@@ -221,6 +221,20 @@ function specLine(sec: WFSectionReport): string {
   font-size: 13px;
   font-weight: 600;
 }
+
+/* 移动端：卡头 extra 里的 meta 文本独占一行，否则会把按钮挤出视口 */
+@media (max-width: 768px) {
+  .wf-meta {
+    width: 100%;
+  }
+}
+</style>
+
+<!-- 下面这些类只在 n-data-table 的列 render/renderExpand（h() 调用）里使用。
+     列渲染函数由 naive-ui 内部组件执行，vnode 拿不到本组件的 data-v-xxx，
+     scoped 选择器 `.wf-items[data-v-xxx]` 永不匹配——必须放在非 scoped 块里。
+     类名统一 wf- 前缀，避免全局污染。 -->
+<style>
 .wf-range {
   font-size: 12px;
 }

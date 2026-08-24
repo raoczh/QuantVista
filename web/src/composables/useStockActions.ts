@@ -181,6 +181,16 @@ export function useStockActions(onNavigate?: () => void) {
       case 'watchlist':
         return context.inWatchlist === false ? addToWatchlist(s) : goWatchlist(s)
       case 'position':
+        // 带推荐血缘的建仓（从推荐卡片的动作菜单进入时）：未持仓且已知推荐 ID 时
+        // 走血缘路径，否则退回普通建仓。漏掉这一步会让菜单里的「建仓」永久写
+        // recommendation_id=0，推荐追踪从此认不出这笔持仓。
+        if (
+          context.hasPosition !== true &&
+          context.recommendationID &&
+          context.recommendationID > 0
+        ) {
+          return goPositionFromRecommendation(s, context.recommendationID)
+        }
         return goPosition(s, context.hasPosition)
       case 'position-decision':
         return goPositionDecision(s, context.positionID || 0)

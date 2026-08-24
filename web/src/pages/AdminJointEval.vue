@@ -113,10 +113,13 @@ const sliceColumns = computed<DataTableColumns<CalibSliceRow>>(() => [
             <div v-for="sec in report.sections" :key="sec.type" class="je-block">
               <div class="je-head">
                 <span class="je-title">{{ typeLabel[sec.type] || sec.type }} · 持有 {{ sec.horizon_days }} 交易日</span>
-                <n-tag size="small" :bordered="false">
+                <!-- 这段是一整句带两个百分数的说明（约 420px），不是标签语义：
+                     n-tag 写死 white-space:nowrap + 固定 height，375px 下必然溢出并让
+                     整个卡片内容区出现横滚。用普通文本节点承载。 -->
+                <span class="je-turnover">
                   换手{{ report.include_locked ? '（全量日期）' : '（开发段日期界内）' }}：相邻批次新进 {{ sec.turnover.pairs > 0 ? pct(sec.turnover.avg_new_pct) : '—' }} · 重合
                   {{ sec.turnover.pairs > 0 ? pct(sec.turnover.avg_overlap_pct) : '—' }}（{{ sec.turnover.pairs }} 对）
-                </n-tag>
+                </span>
               </div>
               <div class="je-cov">
                 标签覆盖：共 {{ sec.coverage.total }} 条 · 成熟 {{ sec.coverage.matured }}（{{ sec.coverage.matured_ratio_pct.toFixed(1) }}%）·
@@ -188,11 +191,22 @@ const sliceColumns = computed<DataTableColumns<CalibSliceRow>>(() => [
 }
 .je-title {
   font-weight: 600;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.je-turnover {
+  flex: 1 1 260px;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  opacity: 0.7;
+  overflow-wrap: anywhere;
 }
 .je-cov {
   font-size: 12px;
   opacity: 0.65;
   margin: 2px 0 8px;
+  overflow-wrap: anywhere;
 }
 .je-sub {
   font-size: 13px;
@@ -205,17 +219,32 @@ const sliceColumns = computed<DataTableColumns<CalibSliceRow>>(() => [
   margin-top: 8px;
   padding: 8px 10px;
   border: 1px dashed var(--qv-border, rgba(128, 128, 128, 0.3));
-  border-radius: 6px;
+  border-radius: 8px;
+  overflow-wrap: anywhere;
 }
 .je-notes {
   margin-top: 10px;
   font-size: 12px;
   opacity: 0.55;
   line-height: 1.8;
+  overflow-wrap: anywhere;
 }
 .je-empty {
   padding: 24px 0;
   opacity: 0.6;
   font-size: 13px;
+}
+/* 卡头 extra 里的 meta 与「锁定段已读…（时间戳）」标签在窄屏会把按钮挤出视口 */
+@media (max-width: 768px) {
+  .je-meta {
+    width: 100%;
+  }
+  .je-toolbar > :deep(.n-tag) {
+    max-width: 100%;
+    height: auto;
+    white-space: normal;
+    line-height: 1.5;
+    padding-block: 3px;
+  }
 }
 </style>

@@ -185,7 +185,7 @@ const columns = computed<DataTableColumns<BoardStock>>(() => [
       const tags = []
       if (row.is_leader) tags.push(h(NTag, { size: 'tiny', type: 'error', bordered: false, round: true }, () => '龙头'))
       if (row.is_top_gainer) tags.push(h(NTag, { size: 'tiny', type: 'warning', bordered: false, round: true }, () => '领涨'))
-      return h('div', { class: 'cell-name' }, [
+      return h('div', { class: 'bd-cell-name' }, [
         h(StockIdentity, { symbol: row.symbol, market: 'cn', name: row.name, density: 'table', clickable: true }),
         ...tags,
       ])
@@ -223,7 +223,9 @@ function rowProps(row: BoardStock) {
   }
 }
 
-watch(isDark, () => {
+// 必须同时监听 vars：6 套主题里 3 亮 3 暗，同明暗档内换主题（如浅蓝→樱桃红）
+// isDark 不变但 primaryColor/textColor3 等全变，只监听 isDark 图表会滞留旧主题色。
+watch([isDark, vars], () => {
   if (detail.value?.bars?.length) renderChart(detail.value.bars)
   if (fundflow.value?.days.length) renderFundFlowChart()
 })
@@ -341,18 +343,6 @@ onUnmounted(() => {
   width: 100%;
   height: 360px;
 }
-.cell-name {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.cn-title {
-  font-weight: 500;
-}
-.cn-symbol {
-  font-size: 12px;
-  opacity: 0.5;
-}
 /* 主力资金 / 估值卡（口径对齐 StockDetail 同名卡样式） */
 .ff-wrap {
   display: flex;
@@ -390,5 +380,28 @@ onUnmounted(() => {
   font-size: 12px;
   opacity: 0.55;
   line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+/* 图表容器窄屏降高：360px 宽屏塞 360px 高的 K 线可读性差（全站范式见 Home/StockDetail） */
+@media (max-width: 768px) {
+  .board-chart {
+    height: 260px;
+  }
+  .ff-chart {
+    height: 220px;
+  }
+}
+</style>
+
+<!-- .cell-name 只在 n-data-table 的列 render（h() 调用）里使用：列渲染函数由 naive-ui
+     内部组件执行，vnode 拿不到本组件的 data-v-xxx，scoped 选择器永不匹配。
+     必须放非 scoped 块，类名加 bd- 前缀避免全局撞名。 -->
+<style>
+.bd-cell-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
 }
 </style>

@@ -22,7 +22,7 @@ const statusMeta: Record<StockCoverageStatus, { label: string; type: 'success' |
       <div v-for="item in items" :key="item.key" class="coverage-item">
         <div class="coverage-head">
           <strong>{{ item.label }}</strong>
-          <n-tooltip v-if="item.note" trigger="hover">
+          <n-tooltip v-if="item.note" trigger="hover" style="max-width: 320px">
             <template #trigger>
               <n-tag :type="statusMeta[item.status].type" size="small" round :bordered="false">
                 {{ statusMeta[item.status].label }}

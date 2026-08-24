@@ -422,25 +422,6 @@ onUnmounted(() => {
 .gs-result-main {
   min-width: 0;
 }
-.gs-primary-line {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  min-width: 0;
-}
-.gs-name {
-  min-width: 0;
-  overflow: hidden;
-  font-size: 15px;
-  font-weight: 650;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.gs-symbol {
-  flex: 0 0 auto;
-  font-size: 12px;
-  color: var(--gs-muted);
-}
 .gs-meta-line {
   display: flex;
   flex-wrap: wrap;
@@ -503,15 +484,6 @@ onUnmounted(() => {
   .gs-result-row {
     gap: 4px;
     padding-inline: 8px 4px;
-  }
-  .gs-primary-line {
-    flex-wrap: wrap;
-    gap: 2px 7px;
-  }
-  .gs-name {
-    max-width: 100%;
-    white-space: normal;
-    overflow-wrap: anywhere;
   }
   .gs-industry {
     max-width: 120px;

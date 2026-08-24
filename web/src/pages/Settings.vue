@@ -1006,11 +1006,14 @@ async function doExport(kind: ExportKind) {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
   margin-bottom: 14px;
 }
 .ct-title {
   font-size: 14px;
   font-weight: 600;
+  min-width: 0;
 }
 /* LLM 配置移动端卡片（≤768px 由 isMobile 切换，桌面仍为表格） */
 .llm-cards {
@@ -1048,12 +1051,24 @@ async function doExport(kind: ExportKind) {
 .llm-ops {
   display: flex;
   gap: 10px;
+  flex-wrap: wrap;
   margin-top: 4px;
+}
+/* 开关/输入 + 右侧长说明文案：窄屏必须允许说明整行换行，否则文案会挤成一列竖字。
+ * n-form-item 的 blank 区本身是 display:flex 且不换行（naive 内置），一并放开。 */
+:deep(.n-form-item-blank) {
+  flex-wrap: wrap;
 }
 .notify-switch {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.notify-switch > .notify-hint {
+  flex: 1 1 240px;
+  min-width: 0;
 }
 .guide-entry {
   display: flex;
@@ -1065,6 +1080,8 @@ async function doExport(kind: ExportKind) {
 .notify-hint {
   font-size: 12px;
   opacity: 0.65;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
 }
 /* 推荐筛选默认值 */
 .recf {
@@ -1097,11 +1114,15 @@ async function doExport(kind: ExportKind) {
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
   font-size: 13px;
+  min-width: 0;
 }
 .black-reason {
-  flex: 1;
+  flex: 1 1 140px;
+  min-width: 0;
   opacity: 0.7;
+  overflow-wrap: anywhere;
 }
 .black-add {
   display: flex;
@@ -1118,5 +1139,31 @@ async function doExport(kind: ExportKind) {
   flex-wrap: wrap;
   gap: 18px;
   font-size: 13px;
+}
+.quota > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* 推荐筛选与黑名单的数字输入在 360px 下会顶出表单项，统一压到可用宽度 */
+@media (max-width: 768px) {
+  .recf-row :deep(.n-input-number) {
+    width: auto !important;
+    flex: 1 1 96px;
+    min-width: 0;
+  }
+  .recf-label {
+    min-width: 0;
+    flex-basis: 100%;
+  }
+  .recf-sep:empty {
+    display: none;
+  }
+  .black-picker {
+    flex-basis: 100%;
+  }
+  .black-add :deep(.n-input) {
+    flex: 1 1 140px;
+    min-width: 0;
+  }
 }
 </style>

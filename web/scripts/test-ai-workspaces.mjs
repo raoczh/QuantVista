@@ -78,7 +78,21 @@ assert.match(stockActions, /缺少准确的持仓 ID/, '缺 position_id 必须 f
 assert.match(stockActions, /goPositionFromRecommendation/, '推荐建仓入口必须保留推荐血缘深链')
 assert.match(stockActions, /rec_id: String\(recommendationID\)/, '推荐建仓深链必须携带 rec_id')
 assert.match(recCard, /item\.position!\.position_id/, '推荐持仓入口必须使用关联持仓 ID')
-assert.match(recCard, /按推荐记录建仓/, '推荐卡必须保留显式建仓入口')
+// 建仓入口的文案由 recommendationPresentation.positionEntryAction 分层给出（断言见下方
+// 纯函数区）。这里只锁模板结构：入口必须按状态分层而不是直接隐藏，且两个分支都走带血缘
+// 的深链——登记既成事实不该被执行计划闸门挡住，否则偏好未完成/行情 stale 时用户没有任何
+// 带血缘的建仓入口，推荐追踪直接漏账。
+assert.match(recCard, /entry\.ready/, '推荐卡建仓入口必须按执行计划状态分层，而非直接隐藏')
+assert.match(recCard, /goPositionFromRecommendation\(stock, item\.id\)/, '非 ready 分支也必须走带血缘的建仓深链')
+assert.doesNotMatch(
+  recCard,
+  /v-else-if="item\.detail\?\.execution_plan\?\.status === 'ready'"/,
+  '建仓入口不得只在执行计划 ready 时出现',
+)
+// 血缘断裂的补救入口：手动录入的持仓 recommendation_id=0，只能按标的软匹配后由用户确认。
+assert.match(recCard, /你持有该股票，但未关联到本条推荐/, '疑似未登记持仓必须给出可见提示')
+assert.match(recCard, /linkPositionRecommendation/, '推荐卡必须提供补关联动作')
+assert.match(stockActions, /context\.recommendationID > 0/, '动作菜单建仓必须沿用推荐血缘')
 assert.match(candidateAudit, /technicalDiagnostics/, '推荐运行诊断必须保留为只读折叠字段')
 
 // AI 复核与程序事实分层，失败不清空已有结果。
@@ -96,9 +110,30 @@ assert.doesNotMatch(stockActions, /createAnalysis|generateRecommendations|reques
 const recPresentation = loadTypeScript('src/components/recommendations/recommendationPresentation.ts')
 assert.equal(recPresentation.confidenceExplanation(20, 'low'), '把握较低，需要补数据或等待更多信号')
 assert.equal(recPresentation.trackingState({ outcome: 'active' }), 'immature')
-assert.equal(recPresentation.trackingState({ outcome: 'no_data' }), 'insufficient')
+// no_data 是混合态，必须按已过交易日数拆开：当天生成（elapsed=0）是必然且会自愈的正常
+// 情况，不能显示成「数据不足」警告；已过交易日却仍无日线才是真的取数异常。
+assert.equal(recPresentation.trackingState({ outcome: 'no_data', elapsed_trade_days: 0 }), 'pending')
+assert.equal(recPresentation.trackingState({ outcome: 'no_data', elapsed_trade_days: 3 }), 'insufficient')
+assert.equal(recPresentation.trackingState(null), 'insufficient')
 assert.equal(recPresentation.trackingState({ outcome: 'take_profit' }), 'settled')
 assert.equal(recPresentation.exclusionReason('股票停牌'), '停牌：股票停牌')
+
+// 建仓入口分层：ready 预填计划数量；不可执行时仍可登记既成事实，但不预填数量
+// （系统没算出计划量，硬编一个反而误导），并把不可执行原因原样带出。
+const readyEntry = recPresentation.positionEntryAction({
+  detail: { execution_plan: { status: 'ready', quantity: 300 } },
+})
+assert.equal(readyEntry.ready, true)
+assert.equal(readyEntry.label, '按推荐记录建仓')
+assert.equal(readyEntry.prefillQuantity, 300)
+const blockedEntry = recPresentation.positionEntryAction({
+  detail: { execution_plan: { status: 'not_suitable', quantity: 300, unavailable_reasons: ['投资偏好未完成'] } },
+})
+assert.equal(blockedEntry.ready, false)
+assert.equal(blockedEntry.label, '我已买入，登记到这条推荐')
+assert.equal(blockedEntry.prefillQuantity, 0, '计划不可执行时不得预填数量')
+assert.deepEqual(blockedEntry.reasons, ['投资偏好未完成'], '必须原样带出不可执行原因')
+assert.equal(recPresentation.positionEntryAction({ detail: null }).ready, false, '无执行计划也要能登记事实')
 
 const analysisPresentation = loadTypeScript('src/components/analysis/analysisPresentation.ts')
 assert.equal(analysisPresentation.recordStockName({ symbol: '600000', target: '600000', title: '浦发银行' }), '浦发银行')

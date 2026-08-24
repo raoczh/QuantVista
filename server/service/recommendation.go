@@ -451,6 +451,10 @@ type RecommendationItemView struct {
 	Detail   *recPick                    `json:"detail"`
 	Status   *model.RecommendationStatus `json:"status"`
 	Position *RecPositionLink            `json:"position"`
+	// UnlinkedPosition 同标的在持仓中、但**未关联到本条推荐**的记录（软匹配，仅在
+	// Position 为 nil 时可能有值）。用于提示「你买了但没登记血缘，要补关联吗」——
+	// 系统不自动认定因果，写血缘必须由用户显式确认（见 unlinkedHoldingsFor）。
+	UnlinkedPosition *RecPositionLink `json:"unlinked_position,omitempty"`
 }
 
 // Generate 生成一批推荐（用户手动发起，计 1 次配额）：同步段只做参数校验、
@@ -1017,7 +1021,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		cancelShadow()
 	}
 
-	return s.assembleView(*batch, items, nil, nil), nil
+	return s.assembleView(*batch, items, nil, nil, nil), nil
 }
 
 // failEmptyShortlist 名单为空时的失败收尾（P0-3）：提前失败也必须落可复核快照与事实
@@ -3109,6 +3113,7 @@ func (s *RecommendationService) Get(userID, id int64) (*RecommendationView, erro
 	}
 	// 附对应持仓（血缘：一键建仓写入 recommendation_id；同一推荐多笔建仓取最早一笔）。
 	posLinks := map[int64]RecPositionLink{}
+	unlinked := map[int64]RecPositionLink{}
 	if len(items) > 0 {
 		recIDs := make([]int64, 0, len(items))
 		for _, it := range items {
@@ -3124,8 +3129,11 @@ func (s *RecommendationService) Get(userID, id int64) (*RecommendationView, erro
 				}
 			}
 		}
+		// 无血缘的条目再按标的软匹配持仓：手动录入的持仓 recommendation_id=0，
+		// 靠血缘永远查不出来，只能按 symbol 提示用户「你买了但没登记」。
+		unlinked = unlinkedHoldingsFor(userID, items, posLinks)
 	}
-	return s.assembleView(batch, items, statuses, posLinks), nil
+	return s.assembleView(batch, items, statuses, posLinks, unlinked), nil
 }
 
 // Delete 删除推荐批次及其条目（仅本人，事务）。
@@ -3145,8 +3153,8 @@ func (s *RecommendationService) Delete(userID, id int64) error {
 	})
 }
 
-// assembleView 组装批次视图（解析条目明细，附可选追踪状态与持仓血缘）。
-func (s *RecommendationService) assembleView(batch model.RecommendationBatch, items []model.Recommendation, statuses map[int64]model.RecommendationStatus, posLinks map[int64]RecPositionLink) *RecommendationView {
+// assembleView 组装批次视图（解析条目明细，附可选追踪状态、持仓血缘与软匹配未登记持仓）。
+func (s *RecommendationService) assembleView(batch model.RecommendationBatch, items []model.Recommendation, statuses map[int64]model.RecommendationStatus, posLinks, unlinked map[int64]RecPositionLink) *RecommendationView {
 	views := make([]RecommendationItemView, 0, len(items))
 	for _, it := range items {
 		iv := RecommendationItemView{Recommendation: it}
@@ -3161,6 +3169,10 @@ func (s *RecommendationService) assembleView(batch model.RecommendationBatch, it
 		if pl, ok := posLinks[it.ID]; ok {
 			p := pl
 			iv.Position = &p
+		} else if ul, ok := unlinked[it.ID]; ok {
+			// 仅在无血缘时提示软匹配结果，两者互斥（有血缘就该显示血缘）。
+			u := ul
+			iv.UnlinkedPosition = &u
 		}
 		views = append(views, iv)
 	}

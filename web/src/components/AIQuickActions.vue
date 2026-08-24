@@ -84,6 +84,16 @@ async function selectStock(stock: StockRef) {
   gap: 8px;
   width: 100%;
 }
+/* 「分析一只股票」比其余三项长，4 列等宽下必须允许按钮内文本收缩换行，
+ * 否则 n-button 的默认 nowrap 会把网格顶宽、溢出卡片。 */
+.ai-panel :deep(.n-button) {
+  min-width: 0;
+}
+.ai-panel :deep(.n-button__content) {
+  min-width: 0;
+  white-space: normal;
+  text-align: center;
+}
 :global(.ai-picker-modal) {
   width: min(520px, calc(100vw - 24px));
 }

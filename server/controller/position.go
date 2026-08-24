@@ -201,6 +201,37 @@ func (pc *PositionController) AddTrade(c *gin.Context) {
 	common.ApiSuccess(c, p)
 }
 
+// LinkRecommendation PUT /api/positions/:id/recommendation-link —— 事后补/改/解除
+// 推荐血缘（body {recommendation_id}，0=解除）。建仓时的即时血缘走 Create，不经此接口。
+func (pc *PositionController) LinkRecommendation(c *gin.Context) {
+	id, ok := parseIDParam(c, "id")
+	if !ok {
+		return
+	}
+	var in struct {
+		RecommendationID int64 `json:"recommendation_id"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		common.ApiErrorMsg(c, "请求格式错误")
+		return
+	}
+	if in.RecommendationID < 0 {
+		common.ApiErrorMsg(c, "非法的推荐 ID")
+		return
+	}
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+	if err != nil || service.ValidateWritablePositionAccount(currentUserID(c), account.ID, id) != nil {
+		common.ApiErrorMsg(c, "持仓不存在")
+		return
+	}
+	p, err := pc.svc.LinkRecommendation(currentUserID(c), id, in.RecommendationID)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, p)
+}
+
 // Stats GET /api/positions/stats?range= —— 个人交易复盘统计（B6，纯读时聚合）。
 func (pc *PositionController) Stats(c *gin.Context) {
 	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)

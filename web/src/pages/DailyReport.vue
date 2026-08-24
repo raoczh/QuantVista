@@ -336,7 +336,7 @@ onMounted(() => void load(routeReportID()))
                   <span v-if="e.sentiment && sentiColor(e.sentiment)" class="ev-senti" :style="{ color: sentiColor(e.sentiment) }">{{
                     e.sentiment
                   }}</span>
-                  <n-tooltip trigger="hover">
+                  <n-tooltip trigger="hover" style="max-width: 320px">
                     <template #trigger>
                       <span class="ev-score qv-tnum">{{ e.score }}</span>
                     </template>
@@ -475,12 +475,15 @@ onMounted(() => void load(routeReportID()))
   display: flex;
   gap: 10px;
   margin-bottom: 10px;
+  min-width: 0;
 }
 .block p,
 .block ul {
   margin: 0;
   line-height: 1.7;
   flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .block ul {
   padding-left: 18px;
@@ -505,6 +508,8 @@ onMounted(() => void load(routeReportID()))
   display: flex;
   align-items: baseline;
   gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
   padding: 3px 0;
   font-size: 13px;
   line-height: 1.6;
@@ -543,14 +548,8 @@ onMounted(() => void load(routeReportID()))
   display: flex;
   align-items: center;
   gap: 10px;
-}
-.rec-name {
-  font-weight: 600;
-  cursor: pointer;
-}
-.rec-sym {
-  font-size: 12px;
-  opacity: 0.55;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 .rec-conf {
   font-size: 12px;
@@ -582,7 +581,7 @@ onMounted(() => void load(routeReportID()))
   font-size: 12px;
   line-height: 1.5;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   max-height: 60vh;
   overflow: auto;
   margin: 0;
@@ -591,10 +590,26 @@ onMounted(() => void load(routeReportID()))
   font-size: 12px;
   opacity: 0.55;
   margin: 4px 0 0;
+  line-height: 1.55;
 }
 .disclaimer {
   font-size: 12px;
   opacity: 0.5;
   margin: 0;
+  line-height: 1.55;
+}
+/* 62px 定宽小标题在 360px 下吃掉近两成宽度，手机改上下堆叠 */
+@media (max-width: 768px) {
+  .block {
+    flex-direction: column;
+    gap: 3px;
+  }
+  .bk {
+    width: auto;
+    padding-top: 0;
+  }
+  .head-date {
+    font-size: 20px;
+  }
 }
 </style>

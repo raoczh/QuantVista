@@ -623,7 +623,8 @@ function renderChart(bars: Bar[]) {
   })
 }
 
-watch(isDark, () => {
+// 必须同时监听 vars：同明暗档内换主题时 isDark 不变，但图表用的主色/文字色全变。
+watch([isDark, vars], () => {
   if (lastBars.value.length) renderChart(lastBars.value)
 })
 

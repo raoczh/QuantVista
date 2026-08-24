@@ -286,7 +286,7 @@ function renderCharts() {
     curveChart = echarts.init(curveEl.value, isDark.value ? 'dark' : undefined)
     curveChart.setOption({
       backgroundColor: 'transparent',
-      tooltip: { trigger: 'axis' },
+      tooltip: { trigger: 'axis', confine: true },
       grid: { left: 58, right: 20, top: 20, bottom: 42 },
       xAxis: { type: 'category', data: complete.map((p) => p.trade_date) },
       yAxis: { type: 'value', scale: true },
@@ -308,7 +308,7 @@ function renderCharts() {
     ddChart = echarts.init(ddEl.value, isDark.value ? 'dark' : undefined)
     ddChart.setOption({
       backgroundColor: 'transparent',
-      tooltip: { trigger: 'axis' },
+      tooltip: { trigger: 'axis', confine: true },
       grid: { left: 58, right: 20, top: 20, bottom: 42 },
       xAxis: { type: 'category', data: complete.map((p) => p.trade_date) },
       yAxis: { type: 'value', max: 0 },
@@ -329,7 +329,9 @@ function resize() {
   curveChart?.resize()
   ddChart?.resize()
 }
-watch(isDark, () => nextTick(renderCharts))
+// 必须同时监听 vars：曲线用 vars.primaryColor、回撤用 vars.errorColor，
+// 同明暗档内换主题时 isDark 不变，只监听它图表会滞留旧主题色。
+watch([isDark, vars], () => nextTick(renderCharts))
 onMounted(async () => {
   window.addEventListener('resize', resize)
   await loadAccounts()
@@ -1078,7 +1080,7 @@ const enabledWeight = computed(() =>
       v-model:show="accountModal"
       preset="card"
       :title="editingAccount ? '组合改名' : '新建组合'"
-      style="width: 460px"
+      style="width: min(460px, calc(100vw - 24px))"
       ><n-form
         ><n-form-item label="名称"
           ><n-input
@@ -1108,7 +1110,7 @@ const enabledWeight = computed(() =>
       v-model:show="flowModal"
       preset="card"
       title="新增现金流"
-      style="width: 500px"
+      style="width: min(500px, calc(100vw - 24px))"
       ><n-form
         ><n-form-item label="类型"
           ><n-select
@@ -1152,15 +1154,24 @@ const enabledWeight = computed(() =>
   justify-content: space-between;
   gap: 16px;
   align-items: flex-start;
+  flex-wrap: wrap;
   margin-bottom: 16px;
 }
+.workspace-head > div:first-child {
+  min-width: 0;
+}
+/* 字号与 PageContainer 的 .page-title 对齐（24px/700），别在这里另起一套 */
 .workspace-head h1 {
-  font-size: 26px;
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.25;
   margin: 0;
 }
 .workspace-head p {
   margin: 6px 0 0;
   color: var(--n-text-color-3);
+  font-size: 13px;
+  overflow-wrap: anywhere;
 }
 .head-actions,
 .parameter-bar,
@@ -1245,8 +1256,14 @@ const enabledWeight = computed(() =>
 .exposure-row {
   display: flex;
   justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
   padding: 7px 0;
   border-bottom: 1px solid v-bind('vars.dividerColor');
+}
+.exposure-row > :first-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .stress-controls,
 .target-toolbar {

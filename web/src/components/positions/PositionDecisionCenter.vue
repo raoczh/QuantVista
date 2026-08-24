@@ -253,16 +253,22 @@ function levelType(level: PositionExitAssessment['level']) {
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
+  flex-wrap: wrap;
+}
+.decision-header > div:first-child {
+  min-width: 0;
 }
 .decision-header h2 {
   margin: 0;
   font-size: 20px;
   letter-spacing: 0;
+  overflow-wrap: anywhere;
 }
 .decision-header p {
   margin: 5px 0 0;
   color: var(--decision-muted);
   line-height: 1.55;
+  overflow-wrap: anywhere;
 }
 .decision-tools,
 .heading-tags {
@@ -400,6 +406,9 @@ function levelType(level: PositionExitAssessment['level']) {
   .decision-header,
   .card-heading,
   .next-action { flex-direction: column; }
+  .decision-summary { grid-template-columns: 1fr; }
+  .summary-item { border-right: 0; }
+  .summary-item:not(:last-child) { border-bottom: 1px solid var(--decision-border); }
   .decision-tools,
   .next-action :deep(.n-button) { width: 100%; }
   .next-action :deep(.n-button) { min-height: 36px; }

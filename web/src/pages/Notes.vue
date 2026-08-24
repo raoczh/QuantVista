@@ -258,6 +258,18 @@ onMounted(() => {
   gap: 8px;
   align-items: center;
   flex-wrap: wrap;
+  justify-content: flex-end;
+}
+/* StockPicker 内部是 n-select（默认 width:100%），在 flex 工具栏/表单行里必须显式给宽，
+ * 否则筛选器会撑满整行把按钮挤下去。 */
+.note-filter-picker {
+  flex: 0 1 190px;
+  min-width: 0;
+}
+.note-stock-picker {
+  flex: 1 1 200px;
+  min-width: 0;
+  max-width: 260px;
 }
 .form {
   display: flex;
@@ -298,14 +310,8 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 10px;
-}
-.note-symbol {
-  font-size: 12.5px;
-  font-weight: 600;
-  cursor: pointer;
-}
-.note-symbol:hover {
-  text-decoration: underline;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 .note-time {
   font-size: 12px;
@@ -314,16 +320,32 @@ onMounted(() => {
 .note-ops {
   display: flex;
   gap: 2px;
+  flex-shrink: 0;
 }
 .note-title {
   font-weight: 600;
   margin-top: 6px;
   font-size: 13.5px;
+  overflow-wrap: anywhere;
 }
 .note-content {
   margin: 6px 0 0;
   font-size: 13px;
   line-height: 1.7;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 768px) {
+  .form-row :deep(.n-select),
+  .form-row :deep(.n-input) {
+    min-width: 0;
+  }
+  .note-stock-picker {
+    flex-basis: 100%;
+    max-width: none;
+  }
+  .note-ops {
+    margin-left: auto;
+  }
 }
 </style>

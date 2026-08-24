@@ -130,14 +130,15 @@ header p { margin: 4px 0 12px; font-size: 12px; opacity: 0.66; }
 .candidate-row.excluded,
 .candidate-row.rejected { grid-template-columns: minmax(180px, 0.7fr) minmax(120px, 0.5fr) minmax(240px, 1fr); }
 .candidate-row.rejected { grid-template-columns: minmax(180px, 0.7fr) minmax(240px, 1.5fr); }
+.candidate-row > * { min-width: 0; }
 .reason { overflow-wrap: anywhere; }
 .version-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 16px; margin: 0; }
 .version-grid div { min-width: 0; }
 .version-grid dt { font-size: 11px; opacity: 0.58; }
 .version-grid dd { margin: 2px 0 0; overflow-wrap: anywhere; }
-.raw-note { margin: 14px 0 6px; font-size: 12px; opacity: .66; }
+.raw-note { margin: 14px 0 6px; font-size: 12px; opacity: .66; overflow-wrap: anywhere; }
 .raw-diagnostics { max-width: 100%; max-height: 360px; margin: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
-@media (max-width: 760px) {
+@media (max-width: 768px) {
   .candidate-row,
   .candidate-row.excluded,
   .candidate-row.rejected { grid-template-columns: 1fr; gap: 3px; }

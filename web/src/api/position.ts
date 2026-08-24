@@ -62,6 +62,19 @@ export interface Position {
   // D15 持仓期最高价与回撤（未初始化/已平仓时缺席）
   peak?: PositionPeak
   exit_assessment?: PositionExitAssessment
+  // 来源推荐摘要（血缘可见性）。手动建仓、或血缘指向的推荐已被删除时缺席。
+  rec_link?: PositionRecLink
+}
+
+// 来源推荐摘要：让「这笔是不是照推荐买的」在持仓页可见。
+// recommendation_id 单独存在时只是个不可见的数字，用户无法察觉血缘断了。
+export interface PositionRecLink {
+  recommendation_id: number
+  batch_id: number
+  type: string // short_term / long_term
+  action: string // buy / watch
+  ref_price: number
+  created_at: string
 }
 
 export type PositionExitLevel = 'normal' | 'watch' | 'review' | 'urgent' | 'unknown'
@@ -238,6 +251,7 @@ export type PositionBase = Omit<
   | 'analysis_stale'
   | 'peak'
   | 'exit_assessment'
+  | 'rec_link'
 >
 
 export function listPositions(status: 'holding' | 'closed' | 'all' = 'all') {
@@ -268,6 +282,21 @@ export function closePosition(id: number, input: CloseInput) {
 
 export function deletePosition(id: number) {
   return request<{ ok: boolean }>({ url: `/positions/${id}`, method: 'delete' })
+}
+
+/**
+ * 事后补 / 改 / 解除持仓的推荐血缘（recommendationID=0 解除）。
+ *
+ * 走独立接口而非塞进 updatePosition：后端 Update 不处理 recommendation_id
+ * （编辑持仓不会误清血缘，这是既有的正确行为），且本接口会同步回填追踪状态里的
+ * 实际买入价/实际收益——已止盈止损的推荐被终态冻结，靠刷新永远补不上。
+ */
+export function linkPositionRecommendation(id: number, recommendationID: number) {
+  return request<PositionBase>({
+    url: `/positions/${id}/recommendation-link`,
+    method: 'put',
+    data: { recommendation_id: recommendationID },
+  })
 }
 
 // ---------- B5 分批加仓 / 减仓 ----------

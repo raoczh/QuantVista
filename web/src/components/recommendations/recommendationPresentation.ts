@@ -2,7 +2,7 @@ import type { RecommendationItem, RecStatus, RecTracking } from '@/api/recommend
 import type { TaskStatus } from '@/api/taskCenter'
 
 export type RecommendationDecisionState = 'buy_research' | 'watch' | 'no_action' | 'insufficient' | 'expired'
-export type TrackingState = 'immature' | 'tracking' | 'expired' | 'insufficient' | 'settled'
+export type TrackingState = 'pending' | 'immature' | 'tracking' | 'expired' | 'insufficient' | 'settled'
 
 export function recommendationDecisionState(item: RecommendationItem): RecommendationDecisionState {
   const plan = item.detail?.execution_plan
@@ -27,8 +27,22 @@ export function confidenceExplanation(value: number, system?: string): string {
   return '有一定依据，仍可能因行情变化而失效'
 }
 
+/**
+ * 追踪状态分档。
+ *
+ * `no_data` 在后端是一个混合态，前端必须按已过交易日数把它拆开——否则「今天刚生成」
+ * 这种必然且会自愈的正常情况会被显示成警告：
+ *   - 推荐日之后还没有任何交易日 → pending。追踪要求 `trade_date > 推荐日` 的日线，
+ *     当天生成必然查不到；当日实时行情也被 `today <= recDate` 挡住不追加。次日日线
+ *     到位后后台任务（每 2 小时）会自动推进，用户无需做任何事。
+ *   - 已过交易日却仍无日线 → insufficient。这才是真的取数异常（或参考价缺失），
+ *     值得提示用户手动刷新。
+ */
 export function trackingState(status: RecTracking | null): TrackingState {
-  if (!status || status.outcome === 'no_data') return 'insufficient'
+  if (!status) return 'insufficient'
+  if (status.outcome === 'no_data') {
+    return status.elapsed_trade_days > 0 ? 'insufficient' : 'pending'
+  }
   if (status.outcome === 'take_profit' || status.outcome === 'stop_loss') return 'settled'
   if (status.outcome === 'expired') return 'expired'
   if (status.outcome === 'tracking') return 'tracking'
@@ -36,11 +50,51 @@ export function trackingState(status: RecTracking | null): TrackingState {
 }
 
 export const TRACKING_STATE_LABEL: Record<TrackingState, string> = {
+  pending: '等待首个交易日',
   immature: '尚未成熟',
   tracking: '正常跟踪',
   expired: '已失效',
   insufficient: '数据不足',
   settled: '已结算',
+}
+
+/**
+ * 建仓入口的文案与预填行为。
+ *
+ * 登记既成事实与「系统建议你买入」是两件事，不该共用 execution_plan.status 这一个闸门。
+ * 原先按钮只在 status==='ready' 时出现，于是偏好未完成、资金未设置、行情 stale、原动作
+ * 为观察等情况下，用户即使真的买了也**没有任何带血缘的建仓入口**，追踪体系直接漏账。
+ *
+ * 现在按钮恒显，只做语气分层：ready 才是「按推荐记录建仓」并预填计划数量；其余一律降级
+ * 为「我已买入，登记到这条推荐」且不预填数量——系统没算出计划量，硬编一个反而误导。
+ */
+export interface PositionEntryAction {
+  ready: boolean
+  label: string
+  /** 预填买入数量；0 表示不预填（由用户按实际成交填写）。 */
+  prefillQuantity: number
+  /** 非 ready 时的原因，挂 tooltip 说明「这不是买入建议」。 */
+  reasons: string[]
+}
+
+export function positionEntryAction(item: RecommendationItem): PositionEntryAction {
+  const plan = item.detail?.execution_plan
+  if (plan?.status === 'ready') {
+    return {
+      ready: true,
+      label: '按推荐记录建仓',
+      prefillQuantity: plan.quantity > 0 ? plan.quantity : 0,
+      reasons: [],
+    }
+  }
+  return {
+    ready: false,
+    label: '我已买入，登记到这条推荐',
+    prefillQuantity: 0,
+    reasons: plan?.unavailable_reasons?.length
+      ? plan.unavailable_reasons
+      : ['系统未给出可执行计划，此处仅登记你的实际买入事实，不代表买入建议'],
+  }
 }
 
 export function businessStatusLabel(status: RecStatus): string {
