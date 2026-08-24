@@ -391,9 +391,25 @@ func (s *NewsService) CleanupExpired() {
 
 // --- 查询 ---
 
+// NewsRelatedStock 快讯关联标的：原始快讯只记 6 位代码，名称由本地字典补全。
+// Name 为空表示两张字典都查不到（新股/退市/代码非 A 股），前端按纯代码展示，
+// 不要伪造名称也不要显示「名称待补全」——对快讯而言名称是附加信息，缺失是常态。
+type NewsRelatedStock struct {
+	Symbol string `json:"symbol"`
+	Market string `json:"market"`
+	Name   string `json:"name"`
+}
+
+// NewsView 快讯条目 + 关联标的（含名称）。RelatedSymbols 原样保留兼容既有消费方。
+type NewsView struct {
+	model.News
+	RelatedStocks []NewsRelatedStock `json:"related_stocks"`
+}
+
 // ListNews 新闻查询：可选 symbol（RelatedSymbols JSON LIKE 匹配）、source、limit。
 // 列表按发布时间倒序；正文大字段列表页不需要，排除以省流量。
-func (s *NewsService) ListNews(symbol, source string, limit int) ([]model.News, error) {
+// 关联标的名称批量补全（两次字典查询，与条数无关，不产生 N+1）。
+func (s *NewsService) ListNews(symbol, source string, limit int) ([]NewsView, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
@@ -410,7 +426,92 @@ func (s *NewsService) ListNews(symbol, source string, limit int) ([]model.News, 
 	if err := q.Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	return rows, nil
+
+	// 先收集全部关联代码去重，再一次性查名称字典。
+	perRow := make([][]string, len(rows))
+	uniq := map[string]bool{}
+	all := make([]string, 0, len(rows))
+	for i, r := range rows {
+		syms := parseRelatedSymbols(r.RelatedSymbols)
+		perRow[i] = syms
+		for _, sym := range syms {
+			if !uniq[sym] {
+				uniq[sym] = true
+				all = append(all, sym)
+			}
+		}
+	}
+	names := newsStockNames(all)
+
+	out := make([]NewsView, 0, len(rows))
+	for i, r := range rows {
+		v := NewsView{News: r, RelatedStocks: make([]NewsRelatedStock, 0, len(perRow[i]))}
+		for _, sym := range perRow[i] {
+			v.RelatedStocks = append(v.RelatedStocks, NewsRelatedStock{
+				Symbol: sym, Market: newsRelatedMarket, Name: names[sym],
+			})
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+// newsRelatedMarket 快讯 related_symbols 恒为 A 股 6 位代码（采集侧只解析沪深标的），
+// 故关联标的市场固定 cn。若日后接入港美股快讯，需改为随采集来源判定。
+const newsRelatedMarket = "cn"
+
+// parseRelatedSymbols 解析 related_symbols JSON 数组，容错空串/坏 JSON。
+func parseRelatedSymbols(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var arr []string
+	if err := json.Unmarshal([]byte(raw), &arr); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, s := range arr {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// newsStockNames 批量补 A 股名称：先查 stocks 基础表，未覆盖的再查全市场宇宙字典
+// （market_sync_states，覆盖面更广但只在开启全市场同步后才有数据）。两张表都查不到
+// 的留空，由前端按纯代码展示。
+func newsStockNames(symbols []string) map[string]string {
+	out := map[string]string{}
+	if common.DB == nil || len(symbols) == 0 {
+		return out
+	}
+	var stocks []model.Stock
+	common.DB.Select("symbol", "name").
+		Where("market = ? AND symbol IN ?", newsRelatedMarket, symbols).Find(&stocks)
+	for _, r := range stocks {
+		if r.Name != "" {
+			out[r.Symbol] = r.Name
+		}
+	}
+	missing := make([]string, 0, len(symbols))
+	for _, sym := range symbols {
+		if out[sym] == "" {
+			missing = append(missing, sym)
+		}
+	}
+	if len(missing) == 0 {
+		return out
+	}
+	var states []model.MarketSyncState
+	common.DB.Select("symbol", "name").
+		Where("market = ? AND symbol IN ?", newsRelatedMarket, missing).Find(&states)
+	for _, r := range states {
+		if r.Name != "" {
+			out[r.Symbol] = r.Name
+		}
+	}
+	return out
 }
 
 // StartNewsJobs 新闻后台任务：

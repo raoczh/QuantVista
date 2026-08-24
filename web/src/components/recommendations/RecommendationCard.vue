@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, nextTick, ref } from 'vue'
 import { NButton, NCollapse, NCollapseItem, NTag, NTooltip, useMessage } from 'naive-ui'
 import type { PoolCandidate, RecommendationItem, RecType } from '@/api/recommendation'
 import { linkPositionRecommendation } from '@/api/position'
@@ -55,8 +55,20 @@ const actionLabel = computed(() => props.item.action === 'buy' ? '继续研究�
 const firstReason = computed(() => props.item.detail?.reason?.[0] || props.item.summary || '暂无可复述的推荐理由')
 const firstRisk = computed(() => props.item.detail?.risks?.[0] || '风险信息不足，不能按无风险处理')
 
-function revealEvidence() {
-  detailSections.value = detailSections.value.includes('evidence') ? [] : ['evidence']
+const evidenceOpen = computed(() => detailSections.value.includes('evidence'))
+const evidenceRef = ref<HTMLElement | null>(null)
+/**
+ * 展开/收起完整依据。
+ *
+ * 折叠区在 DOM 上位于操作条**上方**，展开时新内容出现在按钮上方、按钮自身被推下去，
+ * 而按钮文案又一成不变——用户点了看不到任何变化，观感就是「点了没反应」。
+ * 所以这里既要切文案给出即时反馈，也要把展开的区域滚进视口。
+ */
+async function revealEvidence() {
+  detailSections.value = evidenceOpen.value ? [] : ['evidence']
+  if (!detailSections.value.length) return
+  await nextTick()
+  evidenceRef.value?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
 }
 
 const linking = ref(false)
@@ -169,56 +181,64 @@ async function linkExistingPosition() {
       :review="item.detail.review"
     />
 
-    <n-collapse v-if="item.detail" v-model:value="detailSections" class="evidence-collapse">
-      <n-collapse-item title="完整依据与专业信息" name="evidence">
-        <div class="evidence-grid">
-          <section>
-            <h4>完整理由</h4>
-            <ul><li v-for="(line, index) in item.detail.reason || []" :key="index">{{ line }}</li></ul>
-          </section>
-          <section>
-            <h4>完整风险</h4>
-            <ul><li v-for="(line, index) in item.detail.risks || []" :key="index">{{ line }}</li></ul>
-          </section>
-          <section v-if="item.detail.evidence?.length">
-            <h4>行情与程序证据</h4>
-            <ul><li v-for="(line, index) in item.detail.evidence" :key="index">{{ line }}</li></ul>
-          </section>
-          <section v-if="item.detail.bear">
-            <h4>AI 反方观点</h4>
-            <p>{{ item.detail.bear.bear_case }}</p>
-            <small>影子意见，不改写推荐动作、风险事实或程序评分。</small>
-          </section>
-          <section v-if="item.detail.quality_gate">
-            <h4>数据完整度</h4>
-            <p v-if="item.detail.quality_gate.missing_critical_fields?.length">缺少：{{ item.detail.quality_gate.missing_critical_fields.join('、') }}</p>
-            <p v-if="item.detail.quality_gate.senti_missing">新闻情绪缺失，不代表情绪中性。</p>
-          </section>
-          <section v-if="item.detail.execution_plan">
-            <h4>研究预算适配</h4>
-            <p v-if="item.detail.execution_plan.status === 'ready'">研究预算 {{ item.detail.execution_plan.planned_capital.toFixed(2) }}，参考数量 {{ item.detail.execution_plan.quantity }} 股，估算占用 {{ item.detail.execution_plan.estimated_capital.toFixed(2) }}。</p>
-            <p v-else>{{ item.detail.execution_plan.unavailable_reasons?.join('；') || '当前不适合形成数量参考。' }}</p>
-            <small>这是研究预算估算，不读取券商现金，也不会自动下单。</small>
-          </section>
-          <section v-if="item.detail.discovery">
-            <h4>候选召回轨迹</h4>
-            <p>近 5 日出现 {{ item.detail.discovery.seen_days_5d }} 天，连续出现 {{ item.detail.discovery.consecutive_days }} 天；首次 {{ item.detail.discovery.first_seen_date }}，最近 {{ item.detail.discovery.last_seen_date }}。</p>
-            <small v-if="item.detail.discovery.partial_reason">数据不完整：{{ item.detail.discovery.partial_reason }}</small>
-          </section>
-          <section>
-            <h4>有效条件</h4>
-            <p>{{ item.detail.invalidation || '未提供明确失效条件，应按数据不足处理。' }}</p>
-            <p v-if="type === 'short_term'">买入区间 {{ item.detail.buy_zone_low }} - {{ item.detail.buy_zone_high }}；止盈 {{ item.detail.take_profit }}；止损 {{ item.detail.stop_loss }}；有效 {{ item.detail.valid_days || '未知' }} 个交易日。</p>
-            <p v-else>估值区间 {{ item.detail.valuation_low }} - {{ item.detail.valuation_high }}；复盘周期 {{ item.detail.review_cycle || '未知' }}。</p>
-          </section>
-        </div>
-        <p class="disclaimer">{{ item.detail.disclaimer }}</p>
-      </n-collapse-item>
-    </n-collapse>
+    <!-- wrapper 承载 ref：scrollIntoView 需要 DOM 元素，挂在 n-collapse 上拿到的是组件实例 -->
+    <div v-if="item.detail" ref="evidenceRef">
+      <n-collapse v-model:value="detailSections" class="evidence-collapse">
+        <n-collapse-item title="完整依据与专业信息" name="evidence">
+          <div class="evidence-grid">
+            <section>
+              <h4>完整理由</h4>
+              <ul><li v-for="(line, index) in item.detail.reason || []" :key="index">{{ line }}</li></ul>
+            </section>
+            <section>
+              <h4>完整风险</h4>
+              <ul><li v-for="(line, index) in item.detail.risks || []" :key="index">{{ line }}</li></ul>
+            </section>
+            <section v-if="item.detail.evidence?.length">
+              <h4>行情与程序证据</h4>
+              <ul><li v-for="(line, index) in item.detail.evidence" :key="index">{{ line }}</li></ul>
+            </section>
+            <section v-if="item.detail.bear">
+              <h4>AI 反方观点</h4>
+              <p>{{ item.detail.bear.bear_case }}</p>
+              <small>影子意见，不改写推荐动作、风险事实或程序评分。</small>
+            </section>
+            <section v-if="item.detail.quality_gate">
+              <h4>数据完整度</h4>
+              <p v-if="item.detail.quality_gate.missing_critical_fields?.length">缺少：{{ item.detail.quality_gate.missing_critical_fields.join('、') }}</p>
+              <p v-if="item.detail.quality_gate.senti_missing">新闻情绪缺失，不代表情绪中性。</p>
+            </section>
+            <section v-if="item.detail.execution_plan">
+              <h4>研究预算适配</h4>
+              <p v-if="item.detail.execution_plan.status === 'ready'">研究预算 {{ item.detail.execution_plan.planned_capital.toFixed(2) }}，参考数量 {{ item.detail.execution_plan.quantity }} 股，估算占用 {{ item.detail.execution_plan.estimated_capital.toFixed(2) }}。</p>
+              <p v-else>{{ item.detail.execution_plan.unavailable_reasons?.join('；') || '当前不适合形成数量参考。' }}</p>
+              <small>这是研究预算估算，不读取券商现金，也不会自动下单。</small>
+            </section>
+            <section v-if="item.detail.discovery">
+              <h4>候选召回轨迹</h4>
+              <p>近 5 日出现 {{ item.detail.discovery.seen_days_5d }} 天，连续出现 {{ item.detail.discovery.consecutive_days }} 天；首次 {{ item.detail.discovery.first_seen_date }}，最近 {{ item.detail.discovery.last_seen_date }}。</p>
+              <small v-if="item.detail.discovery.partial_reason">数据不完整：{{ item.detail.discovery.partial_reason }}</small>
+            </section>
+            <section>
+              <h4>有效条件</h4>
+              <p>{{ item.detail.invalidation || '未提供明确失效条件，应按数据不足处理。' }}</p>
+              <p v-if="type === 'short_term'">买入区间 {{ item.detail.buy_zone_low }} - {{ item.detail.buy_zone_high }}；止盈 {{ item.detail.take_profit }}；止损 {{ item.detail.stop_loss }}；有效 {{ item.detail.valid_days || '未知' }} 个交易日。</p>
+              <p v-else>估值区间 {{ item.detail.valuation_low }} - {{ item.detail.valuation_high }}；复盘周期 {{ item.detail.review_cycle || '未知' }}。</p>
+            </section>
+          </div>
+          <p class="disclaimer">{{ item.detail.disclaimer }}</p>
+        </n-collapse-item>
+      </n-collapse>
+    </div>
 
     <footer class="actions">
       <n-button size="small" type="primary" secondary @click="goRecommendationReview(stock, item.id, `${item.summary}；主要理由：${firstReason}；主要风险：${firstRisk}`)">AI 复核当前推荐</n-button>
-      <n-button size="small" @click="revealEvidence">查看推荐依据</n-button>
+      <n-button
+        size="small"
+        :disabled="!item.detail"
+        :title="item.detail ? undefined : '本条推荐没有留存结构化明细，无依据可展开'"
+        @click="revealEvidence"
+      >{{ evidenceOpen ? '收起推荐依据' : '查看推荐依据' }}</n-button>
       <n-button size="small" @click="goDetail(stock)">进入个股详情</n-button>
       <n-button size="small" @click="addToWatchlist(stock)">加入自选</n-button>
       <n-button size="small" @click="goAlert(stock)">设置提醒</n-button>

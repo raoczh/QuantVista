@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { NButton, NEmpty, NInput, NRadioButton, NRadioGroup, NSpin, NTag } from 'naive-ui'
-import { getNews, newsSourceLabel, parseRelatedSymbols, sentimentTag, type NewsItem } from '@/api/news'
+import { getNews, newsSourceLabel, relatedStocks, sentimentTag, type NewsItem, type NewsRelatedStock } from '@/api/news'
 import { useUi, withAlpha } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import PageContainer from '@/components/PageContainer.vue'
@@ -110,10 +110,18 @@ onMounted(() => {
 useAutoRefresh(() => refresh(true), 60_000)
 
 // ---------- 展示 ----------
+// 关联标的在 groups 里一次算好：模板里要用 3 次（截断渲染 + 溢出计数），
+// 逐次调用会对每条快讯重复解析一遍（老响应还要 JSON.parse）。
+const MAX_RELATED = 4
+interface FeedEntry {
+  news: NewsItem
+  stocks: NewsRelatedStock[]
+  moreCount: number
+}
 interface FeedGroup {
   key: string
   label: string
-  items: NewsItem[]
+  items: FeedEntry[]
 }
 
 function dateLabel(d: Date): string {
@@ -139,7 +147,12 @@ const groups = computed<FeedGroup[]>(() => {
       cur = { key, label: dateLabel(d), items: [] }
       out.push(cur)
     }
-    cur.items.push(n)
+    const all = relatedStocks(n)
+    cur.items.push({
+      news: n,
+      stocks: all.slice(0, MAX_RELATED),
+      moreCount: Math.max(0, all.length - MAX_RELATED),
+    })
   }
   return out
 })
@@ -211,43 +224,44 @@ const feedVars = computed(() => ({
               <span class="fd-pill">{{ g.label }}</span>
             </div>
             <article
-              v-for="n in g.items"
-              :key="n.id"
+              v-for="e in g.items"
+              :key="e.news.id"
               class="feed-item"
-              :class="{ 'is-important': n.important_mark }"
+              :class="{ 'is-important': e.news.important_mark }"
             >
-              <span class="fi-time qv-tnum">{{ fmtTime(n.publish_time) }}</span>
+              <span class="fi-time qv-tnum">{{ fmtTime(e.news.publish_time) }}</span>
               <div class="fi-body">
                 <div class="fi-title-row">
-                  <span v-if="n.important_mark" class="fi-imp-mark">重要</span>
+                  <span v-if="e.news.important_mark" class="fi-imp-mark">重要</span>
                   <a
-                    v-if="n.url"
-                    :href="n.url"
+                    v-if="e.news.url"
+                    :href="e.news.url"
                     target="_blank"
                     rel="noopener noreferrer"
                     class="fi-title"
-                  >{{ n.title }}</a>
-                  <span v-else class="fi-title">{{ n.title }}</span>
+                  >{{ e.news.title }}</a>
+                  <span v-else class="fi-title">{{ e.news.title }}</span>
                 </div>
-                <p v-if="showSummary(n)" class="fi-summary">{{ n.summary }}</p>
+                <p v-if="showSummary(e.news)" class="fi-summary">{{ e.news.summary }}</p>
                 <div class="fi-meta">
-                  <span class="fi-src">{{ newsSourceLabel(n) }}</span>
+                  <span class="fi-src">{{ newsSourceLabel(e.news) }}</span>
                   <span
-                    v-if="sentiView(n)"
+                    v-if="sentiView(e.news)"
                     class="fi-senti"
-                    :style="{ color: sentiView(n)!.color, background: withAlpha(sentiView(n)!.color, isDark ? 0.16 : 0.1) }"
-                  >{{ sentiView(n)!.text }}</span>
+                    :style="{ color: sentiView(e.news)!.color, background: withAlpha(sentiView(e.news)!.color, isDark ? 0.16 : 0.1) }"
+                  >{{ sentiView(e.news)!.text }}</span>
                   <StockIdentity
-                    v-for="s in parseRelatedSymbols(n.related_symbols).slice(0, 4)"
-                    :key="s"
-                    :symbol="s"
-                    market="cn"
-                    name=""
+                    v-for="s in e.stocks"
+                    :key="s.symbol"
+                    :symbol="s.symbol"
+                    :market="s.market"
+                    :name="s.name"
                     density="compact"
                     clickable
+                    name-optional
                   />
-                  <span v-if="parseRelatedSymbols(n.related_symbols).length > 4" class="fi-sym-more">
-                    +{{ parseRelatedSymbols(n.related_symbols).length - 4 }}
+                  <span v-if="e.moreCount" class="fi-sym-more">
+                    +{{ e.moreCount }}
                   </span>
                 </div>
               </div>

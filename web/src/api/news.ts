@@ -15,6 +15,17 @@ export interface NewsItem {
   sentiment: string
   sentiment_score: number
   important_mark: boolean
+  // 关联标的（服务端按本地字典补全名称后的结构化形式）。优先用它渲染，
+  // 免去重复解析 related_symbols。name 为空=字典查不到，按纯代码展示。
+  related_stocks?: NewsRelatedStock[]
+}
+
+// 快讯关联标的。原始快讯只记 6 位代码，名称由服务端字典补全；查不到时 name 为空串，
+// 此时应只展示代码——对快讯而言名称是附加信息，缺失是常态，不该显示「名称待补全」。
+export interface NewsRelatedStock {
+  symbol: string
+  market: string
+  name: string
 }
 
 export interface NewsQuery {
@@ -36,6 +47,15 @@ export function parseRelatedSymbols(raw: string): string[] {
   } catch {
     return []
   }
+}
+
+/**
+ * 关联标的的统一读法：优先用服务端补好名称的 related_stocks，
+ * 老响应（无该字段）回退解析 related_symbols，此时只有代码没有名称。
+ */
+export function relatedStocks(n: Pick<NewsItem, 'related_stocks' | 'related_symbols'>): NewsRelatedStock[] {
+  if (n.related_stocks?.length) return n.related_stocks
+  return parseRelatedSymbols(n.related_symbols).map((symbol) => ({ symbol, market: 'cn', name: '' }))
 }
 
 /** 来源展示名：cls=财联社电报；eastmoney 按 category 细分快讯/个股新闻。 */

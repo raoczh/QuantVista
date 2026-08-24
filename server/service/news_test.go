@@ -144,3 +144,84 @@ func TestNewsInsertFailNoRegister(t *testing.T) {
 		t.Fatal("写库失败不应登记去重（否则该条永久丢失）")
 	}
 }
+
+// TestListNewsFillsRelatedStockNames 快讯关联标的必须补全名称：原始快讯只记 6 位代码，
+// 名称来自本地字典（stocks 优先，未覆盖的回落 market_sync_states）。两张表都查不到的
+// 留空串，由前端按纯代码展示——对快讯而言名称是附加信息，缺失是常态，不能显示成
+// 「名称待补全」占满一行。
+func TestListNewsFillsRelatedStockNames(t *testing.T) {
+	setupTestDB(t)
+	for _, m := range []any{&model.News{}, &model.Stock{}, &model.MarketSyncState{}} {
+		common.DB.Where("1 = 1").Delete(m)
+	}
+	t.Cleanup(func() {
+		for _, m := range []any{&model.News{}, &model.Stock{}, &model.MarketSyncState{}} {
+			common.DB.Where("1 = 1").Delete(m)
+		}
+	})
+
+	// 600519 只在 stocks；000002 只在宇宙字典（验证回落）；999999 两处都没有。
+	common.DB.Create(&model.Stock{Symbol: "600519", Market: "cn", Name: "贵州茅台"})
+	common.DB.Create(&model.MarketSyncState{Symbol: "000002", Market: "cn", Name: "万科A"})
+	now := time.Now()
+	common.DB.Create(&model.News{
+		Title: "关联多标的快讯", Source: "cls", SourceID: "n1",
+		ContentHash: newsContentHash("关联多标的快讯", "a"),
+		PublishTime: now, CollectTime: now,
+		RelatedSymbols: `["600519","000002","999999"]`,
+	})
+	common.DB.Create(&model.News{
+		Title: "无关联标的快讯", Source: "cls", SourceID: "n2",
+		ContentHash: newsContentHash("无关联标的快讯", "b"),
+		PublishTime: now.Add(-time.Minute), CollectTime: now,
+		RelatedSymbols: "",
+	})
+
+	rows, err := NewNewsService().ListNews("", "", 10)
+	if err != nil {
+		t.Fatalf("查快讯失败: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("应有 2 条快讯: got %d", len(rows))
+	}
+	got := map[string]string{}
+	for _, s := range rows[0].RelatedStocks {
+		got[s.Symbol] = s.Name
+		if s.Market != "cn" {
+			t.Fatalf("A 股快讯关联标的市场应为 cn: %+v", s)
+		}
+	}
+	if len(rows[0].RelatedStocks) != 3 {
+		t.Fatalf("关联标的应保留全部 3 个（含无名称的）: %+v", rows[0].RelatedStocks)
+	}
+	if got["600519"] != "贵州茅台" {
+		t.Fatalf("stocks 表名称未补上: %q", got["600519"])
+	}
+	if got["000002"] != "万科A" {
+		t.Fatalf("宇宙字典回落未生效: %q", got["000002"])
+	}
+	if got["999999"] != "" {
+		t.Fatalf("查不到名称的必须留空串而不是伪造/兜底文案: %q", got["999999"])
+	}
+	if len(rows[1].RelatedStocks) != 0 {
+		t.Fatalf("无关联标的应为空数组: %+v", rows[1].RelatedStocks)
+	}
+}
+
+// TestParseRelatedSymbolsTolerant 坏 JSON / 空串 / 空元素都不得让快讯查询炸掉。
+func TestParseRelatedSymbolsTolerant(t *testing.T) {
+	cases := map[string]int{
+		"":                    0,
+		"not-json":            0,
+		"[]":                  0,
+		`["600519"]`:          1,
+		`["600519",""]`:       1,
+		`["600519","000002"]`: 2,
+		`{"a":1}`:             0,
+	}
+	for raw, want := range cases {
+		if got := len(parseRelatedSymbols(raw)); got != want {
+			t.Errorf("parseRelatedSymbols(%q)=%d want %d", raw, got, want)
+		}
+	}
+}

@@ -15,6 +15,13 @@ const props = withDefaults(
     hasPosition?: boolean
     positionId?: number
     recommendationId?: number
+    /**
+     * 名称是否为可缺省的附加信息。默认 false：名称缺失时显示「名称待补全」，
+     * 在持仓/自选/推荐等本该有名称的场景里，这个兜底是有意义的数据缺口告警。
+     * 置 true 用于名称天然可能缺失的场景（如快讯关联标的）——此时只展示代码，
+     * 不再用兜底文案占位，避免一行里挤满「名称待补全」把真正的信息挤掉。
+     */
+    nameOptional?: boolean
   }>(),
   {
     market: 'cn',
@@ -22,11 +29,14 @@ const props = withDefaults(
     density: 'normal',
     clickable: false,
     actions: false,
+    nameOptional: false,
   },
 )
 
 const { goDetail } = useStockActions()
-const displayName = computed(() => props.name?.trim() || '名称待补全')
+const trimmedName = computed(() => props.name?.trim() || '')
+const showName = computed(() => !!trimmedName.value || !props.nameOptional)
+const displayName = computed(() => trimmedName.value || '名称待补全')
 const marketLabel = computed(() => {
   const labels: Record<string, string> = { cn: 'A 股', hk: '港股', us: '美股' }
   return labels[props.market.toLowerCase()] || props.market.toUpperCase()
@@ -34,9 +44,13 @@ const marketLabel = computed(() => {
 const stock = computed(() => ({
   symbol: props.symbol,
   market: props.market,
-  name: props.name?.trim() || '',
+  name: trimmedName.value,
 }))
-const accessibleLabel = computed(() => `${displayName.value}，${props.symbol}，${marketLabel.value}`)
+const accessibleLabel = computed(() =>
+  showName.value
+    ? `${displayName.value}，${props.symbol}，${marketLabel.value}`
+    : `${props.symbol}，${marketLabel.value}`,
+)
 
 function openDetail() {
   if (props.clickable && props.symbol) void goDetail(stock.value)
@@ -52,11 +66,11 @@ function openDetail() {
       :aria-label="`打开${accessibleLabel}详情`"
       @click="openDetail"
     >
-      <span class="identity-name" :title="displayName">{{ displayName }}</span>
+      <span v-if="showName" class="identity-name" :title="displayName">{{ displayName }}</span>
       <span class="identity-meta"><span class="qv-mono">{{ symbol }}</span><span>{{ marketLabel }}</span></span>
     </button>
     <span v-else class="identity-main" :aria-label="accessibleLabel">
-      <span class="identity-name" :title="displayName">{{ displayName }}</span>
+      <span v-if="showName" class="identity-name" :title="displayName">{{ displayName }}</span>
       <span class="identity-meta"><span class="qv-mono">{{ symbol }}</span><span>{{ marketLabel }}</span></span>
     </span>
     <StockActionMenu
