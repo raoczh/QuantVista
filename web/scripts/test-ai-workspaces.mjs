@@ -78,6 +78,12 @@ assert.match(stockActions, /缺少准确的持仓 ID/, '缺 position_id 必须 f
 assert.match(stockActions, /goPositionFromRecommendation/, '推荐建仓入口必须保留推荐血缘深链')
 assert.match(stockActions, /rec_id: String\(recommendationID\)/, '推荐建仓深链必须携带 rec_id')
 assert.match(recCard, /item\.position!\.position_id/, '推荐持仓入口必须使用关联持仓 ID')
+// 推荐依据走弹层，不做卡内折叠：一批推荐有多张卡，卡内已有结论/理由风险/持仓/追踪/
+// 信任徽章/操作条，就地展开一大块会把卡片撑得没法扫读；而且折叠区曾放在卡片中部，
+// 点底部按钮时内容在按钮上方展开，用户盯着按钮什么都看不到，观感就是「点了没反应」。
+assert.match(recCard, /n-modal[\s\S]{0,200}evidenceShow/, '推荐依据必须走弹层展示')
+assert.doesNotMatch(recCard, /n-collapse/, '推荐依据不得回退成卡内折叠区')
+assert.match(recCard, /:disabled="!item\.detail"/, '无结构化明细时依据按钮必须禁用而非空点')
 // 建仓入口的文案由 recommendationPresentation.positionEntryAction 分层给出（断言见下方
 // 纯函数区）。这里只锁模板结构：入口必须按状态分层而不是直接隐藏，且两个分支都走带血缘
 // 的深链——登记既成事实不该被执行计划闸门挡住，否则偏好未完成/行情 stale 时用户没有任何

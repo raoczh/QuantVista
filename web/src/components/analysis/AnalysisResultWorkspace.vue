@@ -351,6 +351,9 @@ function exportResult() {
 .actions,
 .term-index,
 .touch-form { display: flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 8px; }
+/* 风险标志可换行撑高（见下方 .fact-tags :deep(.n-tag)），居中对齐会让高矮不一的
+ * 标签错位，改为顶端对齐。 */
+.fact-tags { align-items: flex-start; }
 .result-head { justify-content: space-between; margin-bottom: 12px; }
 .decision-first { display: grid; gap: 16px; margin-top: 14px; }
 .conclusion,
@@ -382,7 +385,18 @@ function exportResult() {
 .snapshot-pre { max-width: 100%; max-height: 62vh; margin: 12px 0 0; overflow: auto; white-space: pre-wrap; word-break: break-word; }
 .fact-layers { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .fact-layers h3 { margin: 0 0 8px; font-size: 14px; }
-.fact-layers p { margin: 6px 0 0; font-size: 12px; line-height: 1.55; opacity: .72; }
+.fact-layers p { margin: 6px 0 0; font-size: 12px; line-height: 1.55; opacity: .72; overflow-wrap: anywhere; }
+/* 风险标志是整句说明而非短标签（如「该股为 ST/风险警示标的，存在退市风险，禁止给出
+ * 买入建议；评级不得为 bullish。」），n-tag 默认 nowrap + 固定高度会让它撑出卡片被截断。
+ * 这里放开换行让标签按内容撑高——文字必须完整可读，风险说明不能只露半句。 */
+.fact-tags :deep(.n-tag) {
+  max-width: 100%;
+  height: auto;
+  padding-block: 4px;
+  white-space: normal;
+  line-height: 1.55;
+}
+.fact-tags :deep(.n-tag__content) { overflow-wrap: anywhere; }
 .full-grid h4,
 .debate-grid h4 { margin: 0 0 6px; }
 .full-grid section,
