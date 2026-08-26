@@ -89,7 +89,7 @@ function dateDisabled(ts: number) {
       <n-form-item label="附加问题（可选）">
         <n-input v-model:value="form.question" type="textarea" :autosize="{ minRows: 2, maxRows: 5 }" maxlength="500" placeholder="希望重点回答什么" />
       </n-form-item>
-      <n-button type="primary" block :loading="running" :disabled="running" @click="emit('analyze')">
+      <n-button class="analyze-button" type="primary" block :loading="running" :disabled="running" @click="emit('analyze')">
         {{ running ? '任务处理中' : '明确开始分析' }}
       </n-button>
       <p class="submit-note">选股、切换范围、打开历史和进入页面都不会发起 AI 请求。失败时已显示的历史或快照数据不会被清空。</p>
@@ -110,5 +110,8 @@ function dateDisabled(ts: number) {
  * 压成一列竖字。允许该行换行，说明整段落到下一行。 */
 :deep(.n-form-item-blank) { flex-wrap: wrap; }
 .switch-help { flex: 1 1 200px; min-width: 0; margin-left: 8px; }
+/* :show-feedback="false" 把 naive 的 form-item 底部间距压成 0，
+ * 末尾主按钮自己拉开与上方「附加问题」输入框的距离。 */
+.analyze-button { margin-top: 14px; }
 .submit-note { margin: 8px 0 0; }
 </style>

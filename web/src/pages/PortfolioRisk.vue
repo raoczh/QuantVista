@@ -973,6 +973,7 @@ const enabledWeight = computed(() =>
               ><n-alert
                 v-if="rebalance"
                 type="info"
+                class="draft-alert"
                 :title="`revision ${rebalance.revision} · 只读`"
                 >{{ rebalance.note }}</n-alert
               >
@@ -1196,11 +1197,21 @@ const enabledWeight = computed(() =>
   margin-left: auto;
   color: v-bind('vars.textColor3');
 }
+/* 每个 tab 内的区块统一节奏。原先靠各元素零散 margin 打补丁，漏挂的就贴死了：
+ * 「风险与相关性」tab 的 PortfolioProfessionalMetrics / .chart-grid / 两张 SectionCard
+ * 四块连排无一有外边距；「压力测试」的 alert↔表格↔alert、「目标配置」的表格↔草案卡同理。
+ * 本页 tabs 是最内层（内部无嵌套 n-tabs），deep 命中范围可控；targets tab 内还套了
+ * 一层 n-spin，gap 穿不透它，故一并给 .n-spin-content。 */
+.risk-page :deep(.n-tab-pane),
+.risk-page :deep(.n-tab-pane .n-spin-content) {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 12px;
-  margin: 16px 0;
 }
 .chart-grid,
 .exposure-grid {
@@ -1210,11 +1221,15 @@ const enabledWeight = computed(() =>
 }
 .exposure-grid {
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  margin-top: 16px;
 }
 .chart {
   height: 300px;
   width: 100%;
+}
+/* 「再平衡草案」卡内的说明 alert 与下方表格：卡片内容区不在 tab-pane 的
+ * flex 层级上，拿不到上面那条 gap，需自己留白。 */
+.draft-alert {
+  margin-bottom: 12px;
 }
 .data-table,
 .corr-table {
@@ -1264,10 +1279,6 @@ const enabledWeight = computed(() =>
 .exposure-row > :first-child {
   min-width: 0;
   overflow-wrap: anywhere;
-}
-.stress-controls,
-.target-toolbar {
-  margin: 16px 0;
 }
 .stress-controls .n-select,
 .stress-controls .n-input {

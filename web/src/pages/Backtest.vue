@@ -512,7 +512,7 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
                 宇宙 {{ result.universe }} 只（ST 跳过 {{ result.st_skipped }}，复权可疑剔除 {{ result.adjust_suspect }}）·
                 耗时 {{ (result.elapsed_ms / 1000).toFixed(1) }}s
               </div>
-              <n-alert type="warning" :bordered="false" title="历史回测边界">
+              <n-alert type="warning" :bordered="false" title="历史回测边界" class="boundary-alert">
                 结果只描述历史样本，不代表未来收益；未走完、强平、停牌、无数据和样本不足均不会被当作可靠成功。
               </n-alert>
               <div v-if="result.conditions?.length" class="cond-line">
@@ -811,6 +811,14 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
   flex-direction: column;
   gap: 16px;
 }
+/* .bt-main 的 gap 只作用于它的直接子元素（n-spin 与「回测历史」卡），
+ * 穿不透 n-spin——而结果区的 4~5 张卡片全在 n-spin 内部，此前彼此贴死。
+ * 给 spin 的内容层补上同一节奏（DailyReport 是靠里面那层 .report 做到的）。 */
+.bt-main :deep(.n-spin-content) {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
 .form-col {
   display: flex;
   flex-direction: column;
@@ -862,6 +870,10 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
 }
 .cond-line {
   margin-bottom: 8px;
+}
+/* 「历史回测边界」提示在卡片内容区，拿不到 spin 内容层那条 gap，自己留白 */
+.boundary-alert {
+  margin-bottom: 10px;
 }
 .hold-block {
   padding: 12px 0;

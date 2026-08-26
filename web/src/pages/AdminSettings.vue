@@ -845,7 +845,7 @@ onMounted(() => {
               开启：采集后自动调用管理员 LLM 做新闻情绪增强；关闭：只做关键词规则分析，不消耗 token。
             </span>
           </n-form-item>
-          <n-button type="primary" :loading="savingNews" style="margin-top: 8px" @click="saveNews">保存新闻设置</n-button>
+          <n-button type="primary" :loading="savingNews" class="form-submit" @click="saveNews">保存新闻设置</n-button>
         </n-form>
       </SectionCard>
 
@@ -866,7 +866,7 @@ onMounted(() => {
               该配置同时作为系统后台任务（新闻情绪分析等）的默认 LLM；后台任务不受"允许回退"开关影响。指定配置失效时自动回落"首个管理员的默认配置"。
             </span>
           </n-form-item>
-          <n-button type="primary" :loading="savingFb" @click="saveFallback">保存回退设置</n-button>
+          <n-button type="primary" :loading="savingFb" class="form-submit" @click="saveFallback">保存回退设置</n-button>
         </n-form>
       </SectionCard>
 
@@ -999,7 +999,7 @@ onMounted(() => {
           <n-form-item label="启用">
             <n-switch v-model:value="routeForm.enabled" />
           </n-form-item>
-          <n-button type="primary" :loading="routeSaving" @click="saveRoute">保存路由</n-button>
+          <n-button type="primary" :loading="routeSaving" class="form-submit" @click="saveRoute">保存路由</n-button>
         </n-form>
       </SectionCard>
 
@@ -1038,7 +1038,7 @@ onMounted(() => {
               App 推送通知（ntfy 通道）的点击跳转链接 = 该地址 + 站内路由；留空则通知不带跳转链接。须为 http/https 完整地址，尾部斜杠自动去除。
             </span>
           </n-form-item>
-          <n-button type="primary" :loading="savingSite" @click="saveSite">保存站点地址</n-button>
+          <n-button type="primary" :loading="savingSite" class="form-submit" @click="saveSite">保存站点地址</n-button>
         </n-form>
       </SectionCard>
 
@@ -1466,7 +1466,7 @@ onMounted(() => {
         </n-form-item>
       </n-form>
       <template #footer>
-        <div style="display: flex; justify-content: flex-end; gap: 10px">
+        <div class="modal-actions">
           <n-button @click="quotaModal = false">取消</n-button>
           <n-button type="primary" :loading="quotaSaving || quotaLoading" @click="saveQuota">保存</n-button>
         </div>
@@ -1502,6 +1502,12 @@ onMounted(() => {
 .note {
   margin-bottom: 16px;
   border-radius: 8px;
+}
+/* 本页表单多为 :show-feedback="false"，naive 的 form-item 底部间距被压成 0，
+ * 末尾的保存按钮必须自己拉开与上方表单项的距离（此前只有「保存新闻设置」
+ * 挂了 inline margin，其余三个贴死，间距还三种值——统一收到这里）。 */
+.form-submit {
+  margin-top: 14px;
 }
 .log-time {
   white-space: nowrap;

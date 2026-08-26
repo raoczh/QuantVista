@@ -61,7 +61,7 @@ function statusType(value: string) {
 
     <SectionCard title="追踪与待复盘">
       <template #extra><n-button size="tiny" quaternary :loading="reviewsLoading" @click="emit('refresh-reviews')">刷新</n-button></template>
-      <n-alert v-if="reviewsError" :type="reviews.length ? 'warning' : 'error'" :bordered="false">{{ reviewsError }}，已有追踪数据仍保留。</n-alert>
+      <n-alert v-if="reviewsError" :type="reviews.length ? 'warning' : 'error'" :bordered="false" class="reviews-alert">{{ reviewsError }}，已有追踪数据仍保留。</n-alert>
       <n-empty v-if="!reviews.length && !reviewsLoading" description="没有需要处理的推荐复盘" size="small" />
       <div v-else class="review-list">
         <div v-for="item in reviews" :key="item.ref_id" class="review-row">
@@ -99,6 +99,11 @@ function statusType(value: string) {
 
 <style scoped>
 .history-stack { display: grid; gap: 14px; }
+/* 追踪读取失败提示与下方列表/空态之间留白：.review-list 是无 gap 的 grid，
+ * 只靠首行 .review-row 的 padding 顶着，太贴 */
+.reviews-alert { margin-bottom: 12px; }
+/* 复盘读取失败提示与下方列表之间留白（列表行只有 padding，没有上边距） */
+.reviews-alert { margin-bottom: 10px; }
 .history-list,
 .review-list { display: grid; }
 .history-row {

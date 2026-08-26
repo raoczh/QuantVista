@@ -335,7 +335,7 @@ onBeforeUnmount(() => {
           </div>
         </template>
         <n-spin :show="curveLoading && !curve">
-          <n-alert v-if="curveError" type="error" :bordered="false" title="资产曲线读取失败">
+          <n-alert v-if="curveError" type="error" :bordered="false" title="资产曲线读取失败" class="curve-alert">
             {{ curveError }}
           </n-alert>
           <div v-show="!!curve?.points.length" ref="curveEl" class="curve-chart"></div>
@@ -359,7 +359,7 @@ onBeforeUnmount(() => {
                 <n-radio-button value="sell">卖出</n-radio-button>
               </n-radio-group>
             </n-form-item>
-            <n-grid cols="1 s:2" responsive="screen" :x-gap="10">
+            <n-grid cols="1 s:2" responsive="screen" :x-gap="10" :y-gap="10">
               <n-gi>
                 <n-form-item label="代码">
                   <n-input v-model:value="form.symbol" placeholder="如 600000" />
@@ -371,7 +371,7 @@ onBeforeUnmount(() => {
                 </n-form-item>
               </n-gi>
             </n-grid>
-            <n-grid cols="1 s:2" responsive="screen" :x-gap="10">
+            <n-grid cols="1 s:2" responsive="screen" :x-gap="10" :y-gap="10">
               <n-gi>
                 <n-form-item label="价格（留空按市价）">
                   <n-input-number v-model:value="form.price" :min="0" :precision="3" style="width: 100%" placeholder="市价" />
@@ -468,9 +468,11 @@ onBeforeUnmount(() => {
     <!-- 重置弹窗 -->
     <n-modal v-model:show="resetModal" preset="card" title="重置模拟账户" style="max-width: 380px">
       <p class="reset-tip">将清空所有模拟持仓与成交流水，现金恢复为初始资金。</p>
-      <n-form-item label="初始资金">
-        <n-input-number v-model:value="resetCash" :min="1000" :step="10000" style="width: 100%" />
-      </n-form-item>
+      <n-form label-placement="top" :show-feedback="false">
+        <n-form-item label="初始资金">
+          <n-input-number v-model:value="resetCash" :min="1000" :step="10000" style="width: 100%" />
+        </n-form-item>
+      </n-form>
       <template #footer>
         <div class="modal-footer">
           <n-button @click="resetModal = false">取消</n-button>
@@ -615,6 +617,10 @@ onBeforeUnmount(() => {
   font-size: 12px;
   opacity: 0.6;
   line-height: 1.7;
+}
+/* 读取失败时 alert 与图表容器同时在流内（不是互斥分支），需自己留白 */
+.curve-alert {
+  margin-bottom: 10px;
 }
 @media (max-width: 768px) {
   .curve-chart {

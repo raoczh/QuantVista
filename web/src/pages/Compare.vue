@@ -498,9 +498,21 @@ function aiRefusalText(code: string) {
   gap: 10px;
   align-items: center;
 }
+/* StockPicker 内部是 n-select（默认 width:100%），在 flex 行里必须显式给宽，
+ * 否则会撑满整行把「移除」按钮挤到下一行（同 Notes/ThesisCards/Qa 的处理）。
+ * 此前这个 class 在模板上挂着但样式里没有定义。 */
+.compare-picker {
+  flex: 1 1 240px;
+  min-width: 0;
+  max-width: 320px;
+}
 @media (max-width: 768px) {
   .in-row {
     flex-wrap: wrap;
+  }
+  .compare-picker {
+    flex-basis: 100%;
+    max-width: none;
   }
   .in-row :deep(.n-input) {
     flex: 1;

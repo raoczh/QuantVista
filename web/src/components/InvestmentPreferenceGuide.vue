@@ -145,7 +145,7 @@ async function skip() {
           <template #suffix>万元</template>
         </n-input-number>
       </n-form-item>
-      <n-alert type="info" :bordered="false">
+      <n-alert type="info" :bordered="false" class="capital-note">
         总资金仅用于研究预算、仓位和整手数量估算，不读取也不代表券商账户可用现金。
       </n-alert>
     </n-form>
@@ -157,3 +157,11 @@ async function skip() {
     </template>
   </n-modal>
 </template>
+
+<style scoped>
+/* 表单是 :show-feedback="false"，naive 的 form-item 底部间距被压成 0，
+ * 这条说明紧跟「总资金」输入框，需自己拉开距离。 */
+.capital-note {
+  margin-top: 12px;
+}
+</style>

@@ -176,7 +176,7 @@ onUnmounted(() => {
     </template>
 
     <SectionCard :title="kind === 'industry' ? '行业板块（成交额 Top100）' : '概念板块（成交额 Top100）'">
-      <n-alert v-if="loadError" type="error" :bordered="false" title="板块数据读取失败">
+      <n-alert v-if="loadError" type="error" :bordered="false" title="板块数据读取失败" class="load-alert">
         {{ loadError }}。数据时间未知，请重试后再判断市场变化。
       </n-alert>
       <p v-else class="heatmap-status">
@@ -199,6 +199,8 @@ onUnmounted(() => {
   height: 620px;
 }
 .heatmap-status { margin: 0 0 12px; font-size: 12px; opacity: .62; }
+/* 与 .heatmap-status 互斥的报错分支，同样需要下边距，否则紧贴热力图 */
+.load-alert { margin-bottom: 12px; }
 
 @media (max-width: 768px) {
   .heatmap-chart {

@@ -257,7 +257,7 @@ onUnmounted(() => {
     </template>
 
     <n-spin :show="loading && !detail">
-      <n-alert v-if="loadError" type="error" :bordered="false" title="板块详情读取失败">
+      <n-alert v-if="loadError" type="error" :bordered="false" title="板块详情读取失败" class="load-alert">
         {{ loadError }}。请重试；数据时间未知，不应据此判断板块强弱。
       </n-alert>
       <p v-else class="board-status">行情数据截止 {{ detail?.bars?.at(-1)?.trade_date || '未知' }} · 下一步可查看成分股或进入相关个股详情</p>
@@ -339,6 +339,9 @@ onUnmounted(() => {
   gap: 16px;
 }
 .board-status { margin: 0 0 12px; font-size: 12px; opacity: .62; }
+/* 报错分支与 .board-status 是互斥的两条路，后者有 margin-bottom，
+ * alert 也要有，否则出错时紧贴下方卡片组 */
+.load-alert { margin-bottom: 12px; }
 .board-chart {
   width: 100%;
   height: 360px;

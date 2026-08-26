@@ -377,7 +377,7 @@ onBeforeUnmount(() => {
         </div>
 
         <n-spin :show="loading && !data">
-          <n-alert v-if="todoError" type="error" :bordered="false" title="收件箱读取失败">
+          <n-alert v-if="todoError" type="error" :bordered="false" class="partial" title="收件箱读取失败">
             {{ todoError }}
           </n-alert>
           <n-alert

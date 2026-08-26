@@ -205,7 +205,9 @@ const sliceColumns = computed<DataTableColumns<CalibSliceRow>>(() => [
 .je-cov {
   font-size: 12px;
   opacity: 0.65;
-  margin: 2px 0 8px;
+  /* 上边距不能收到 2px：本类既用在 .je-head 之后（那里已有 mb:6），
+   * 也用在 n-data-table 之后（原始口径说明），后者只有 2px 会贴住表格底边。 */
+  margin: 8px 0;
   overflow-wrap: anywhere;
 }
 .je-sub {

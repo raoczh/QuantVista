@@ -1440,7 +1440,9 @@ function onResize() {
   align-items: start;
 }
 .inline-state {
-  margin-top: 10px;
+  /* 只有 margin-top 时，降级/失败提示会紧贴下方的 .work-list / .quote-panel
+   * （它们自身都没有上边距），上下都要留白 */
+  margin: 10px 0;
   font-size: 12px;
 }
 .work-list {

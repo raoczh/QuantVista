@@ -123,66 +123,76 @@ function specLine(sec: WFSectionReport): string {
     title="Walk-Forward 基线"
     subtitle="S3-5 评估基线：手工评分（五维+策略加分）按历史 as-of 切片重放，训练/验证/测试滚动切分；纯测量不改写任何推荐行为"
   >
-    <SectionCard title="评估概览">
-      <template #extra>
-        <div class="wf-toolbar">
-          <span v-if="report" class="wf-meta">
-            数据末日 {{ report.trade_date }} · Top{{ report.top_k }} 组合 · 宇宙 {{ report.universe }} 只 · 耗时
-            {{ (report.elapsed_ms / 1000).toFixed(1) }}s
-          </span>
-          <n-button size="small" :loading="loading" @click="load(true)">重新计算</n-button>
-        </div>
-      </template>
-      <n-spin :show="loading">
-        <div v-if="report" class="wf-notes">
-          <div v-for="(n, i) in report.notes" :key="i">{{ n }}</div>
-          <div v-if="report.st_skipped || report.adjust_suspect">
-            已剔除：ST {{ report.st_skipped }} 只、复权断层 {{ report.adjust_suspect }} 只。
+    <div class="wf-stack">
+      <SectionCard title="评估概览">
+        <template #extra>
+          <div class="wf-toolbar">
+            <span v-if="report" class="wf-meta">
+              数据末日 {{ report.trade_date }} · Top{{ report.top_k }} 组合 · 宇宙 {{ report.universe }} 只 · 耗时
+              {{ (report.elapsed_ms / 1000).toFixed(1) }}s
+            </span>
+            <n-button size="small" :loading="loading" @click="load(true)">重新计算</n-button>
           </div>
-        </div>
-        <div v-else-if="!loading" class="wf-empty">暂无数据：需全市场日线就绪后点「重新计算」（每信号日一次全市场重算，约数十秒）。</div>
-      </n-spin>
-    </SectionCard>
-
-    <template v-if="report">
-      <SectionCard v-for="sec in report.sections || []" :key="sec.rec_type" :title="secTitle(sec)">
-        <div class="wf-spec">
-          <n-tag v-if="sec.adapted" size="small" type="warning" :bordered="false">窗口已缩放</n-tag>
-          <n-tag v-else size="small" type="success" :bordered="false">目标窗口</n-tag>
-          <span class="qv-tnum">{{ specLine(sec) }}</span>
-        </div>
-        <div class="wf-spec-note">{{ sec.spec_note }}</div>
-
-        <template v-if="sec.folds?.length">
-          <div class="wf-sub">切分（{{ sec.folds.length }} 折，右对齐保证最新数据被测试）</div>
-          <n-data-table :columns="foldColumns()" :data="sec.folds" :row-key="(r: any) => r.fold" size="small" :scroll-x="740" />
-          <div class="wf-sub">评估指标（Precision_net@K 与 Precision_alpha@K 分开；净收益中位数与严重亏损率 net&lt;-5% 并列）</div>
-          <n-data-table
-            :columns="rowColumns()"
-            :data="sec.rows || []"
-            :row-key="(r: WFSegRow) => `${r.fold}-${r.segment}-${r.strategy}-${r.hold}`"
-            size="small"
-            :scroll-x="1000"
-          />
         </template>
-
-        <template v-if="sec.monthly?.length">
-          <div class="wf-sub">评分 Top{{ report.top_k }} 组合月度走查（每月首个交易日建仓，点行首展开组合成员）</div>
-          <n-data-table
-            :columns="monthlyColumns()"
-            :data="sec.monthly"
-            :row-key="(r: WFMonthlyRow) => `${r.month}-${r.strategy}`"
-            size="small"
-            :scroll-x="920"
-            :max-height="420"
-          />
-        </template>
+        <n-spin :show="loading">
+          <div v-if="report" class="wf-notes">
+            <div v-for="(n, i) in report.notes" :key="i">{{ n }}</div>
+            <div v-if="report.st_skipped || report.adjust_suspect">
+              已剔除：ST {{ report.st_skipped }} 只、复权断层 {{ report.adjust_suspect }} 只。
+            </div>
+          </div>
+          <div v-else-if="!loading" class="wf-empty">暂无数据：需全市场日线就绪后点「重新计算」（每信号日一次全市场重算，约数十秒）。</div>
+        </n-spin>
       </SectionCard>
-    </template>
+
+      <template v-if="report">
+        <SectionCard v-for="sec in report.sections || []" :key="sec.rec_type" :title="secTitle(sec)">
+          <div class="wf-spec">
+            <n-tag v-if="sec.adapted" size="small" type="warning" :bordered="false">窗口已缩放</n-tag>
+            <n-tag v-else size="small" type="success" :bordered="false">目标窗口</n-tag>
+            <span class="qv-tnum">{{ specLine(sec) }}</span>
+          </div>
+          <div class="wf-spec-note">{{ sec.spec_note }}</div>
+
+          <template v-if="sec.folds?.length">
+            <div class="wf-sub">切分（{{ sec.folds.length }} 折，右对齐保证最新数据被测试）</div>
+            <n-data-table :columns="foldColumns()" :data="sec.folds" :row-key="(r: any) => r.fold" size="small" :scroll-x="740" />
+            <div class="wf-sub">评估指标（Precision_net@K 与 Precision_alpha@K 分开；净收益中位数与严重亏损率 net&lt;-5% 并列）</div>
+            <n-data-table
+              :columns="rowColumns()"
+              :data="sec.rows || []"
+              :row-key="(r: WFSegRow) => `${r.fold}-${r.segment}-${r.strategy}-${r.hold}`"
+              size="small"
+              :scroll-x="1000"
+            />
+          </template>
+
+          <template v-if="sec.monthly?.length">
+            <div class="wf-sub">评分 Top{{ report.top_k }} 组合月度走查（每月首个交易日建仓，点行首展开组合成员）</div>
+            <n-data-table
+              :columns="monthlyColumns()"
+              :data="sec.monthly"
+              :row-key="(r: WFMonthlyRow) => `${r.month}-${r.strategy}`"
+              size="small"
+              :scroll-x="920"
+              :max-height="420"
+            />
+          </template>
+        </SectionCard>
+      </template>
+    </div>
   </PageContainer>
 </template>
 
 <style scoped>
+/* 「评估概览」+ 每个 rec_type 一张的 section 卡此前直接摊在 PageContainer 的 slot 里，
+ * 而 .page 本身没有 gap——全站范式是页面自己包一层 flex 容器承载间距
+ * （同目录的 .calib-wrap / .je-wrap / .se-wrap），这页漏了，卡片彼此贴死。 */
+.wf-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
 .wf-toolbar {
   display: flex;
   align-items: center;

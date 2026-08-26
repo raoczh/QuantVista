@@ -171,6 +171,11 @@ const callBudget = computed(() => 1 + (form.value.verify ? 1 : 0) + (form.value.
 .ai-options {
   margin: 10px 0 14px;
 }
+/* :show-feedback="false" 把 naive 的 form-item 底部间距压成 0，
+ * 末尾的主按钮必须自己拉开与上方「模型配置」下拉的距离，否则贴死。 */
+.generate-button {
+  margin-top: 14px;
+}
 .submit-note {
   margin: 8px 0 0;
 }

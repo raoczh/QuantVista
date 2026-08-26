@@ -66,7 +66,7 @@ function signed(value: number) { return `${value > 0 ? '+' : ''}${value.toFixed(
       <n-select v-if="mode === 'recall'" v-model:value="k" :options="kOptions" size="small" />
       <span>读取历史事实和程序统计，不会调用 AI，也不会改写推荐或结算标签。</span>
     </div>
-    <n-alert v-if="error" type="warning" :bordered="false">{{ error }}；已成功读取的部分仍保留。</n-alert>
+    <n-alert v-if="error" type="warning" :bordered="false" class="audit-alert">{{ error }}；已成功读取的部分仍保留。</n-alert>
     <n-spin :show="loading">
       <template v-if="mode === 'attribution'">
         <n-empty v-if="attribution && !attribution.sample" description="暂无成熟样本" />
@@ -113,6 +113,13 @@ function signed(value: number) { return `${value > 0 ? '+' : ''}${value.toFixed(
 
 <style scoped>
 .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+/* 读取失败提示在 n-spin 之外，拿不到 .audit-body 那条 gap */
+.audit-alert { margin-bottom: 12px; }
+/* 召回概览与「每日漏选/误选复盘」两块之间此前只靠 .recall-summary > div 的
+ * padding 兜着，h4 的默认上边距又被置 0，两块贴得太近 */
+.daily-section { margin-top: 14px; }
+/* 读取失败提示与下方 n-spin 内容之间留白（alert 在 spin 之外，拿不到 .audit-body 的 gap） */
+.audit-alert { margin-bottom: 12px; }
 .toolbar :deep(.n-select) { width: 130px; }
 .toolbar span { flex: 1 1 240px; min-width: 0; font-size: 12px; opacity: .65; line-height: 1.5; overflow-wrap: anywhere; }
 .audit-body { display: grid; gap: 8px; }
@@ -125,6 +132,7 @@ function signed(value: number) { return `${value > 0 ? '+' : ''}${value.toFixed(
 .recall-summary > div { display: grid; gap: 3px; padding: 10px 0; min-width: 0; }
 .recall-summary span { font-size: 11px; opacity: .62; }
 .recall-summary b { font-size: 20px; }
+.daily-section { margin-top: 16px; }
 .daily-section header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
 .daily-section header h4 { margin: 0 0 8px; font-size: 13px; min-width: 0; }
 .daily-row { grid-template-columns: minmax(160px, 1fr) auto auto minmax(180px, 1fr); }

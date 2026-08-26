@@ -731,7 +731,7 @@ const AUDIT_REASON_LABEL: Record<string, string> = {
       </template>
 
       <SectionCard v-if="exitOutcome" title="卖出信号效果台账">
-        <div class="se-notes">
+        <div class="se-notes se-notes-lead">
           <div>
             成熟结果 {{ exitOutcome.total }} 条 · 分组样本 ≥{{ exitOutcome.min_samples }} 才算已评估 ·
             {{ exitOutcome.generated_at }}
@@ -942,6 +942,12 @@ const AUDIT_REASON_LABEL: Record<string, string> = {
 }
 .se-notes-compact {
   margin-top: 7px;
+}
+/* .se-notes 通常是区块的收尾（只需 margin-top），但「卖出信号效果台账」里它
+ * 排在表格之前，缺下边距会让说明文字贴住表头。 */
+.se-notes-lead {
+  margin-top: 0;
+  margin-bottom: 12px;
 }
 .se-audit-funnel {
   display: flex;

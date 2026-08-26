@@ -1426,442 +1426,444 @@ onBeforeUnmount(() => {
           />
         </n-tab-pane>
         <n-tab-pane name="all" tab="全部持仓">
-          <!-- B8 除权除息待确认折算：仅在有 pending 建议时出现。
-               **不确认的话本页盈亏就是错的数字**（10 转 10 后显示 -50%），
-               所以放在最顶部；但程序绝不代替用户改账本。 -->
-          <SectionCard v-if="corpAdjusts.length || corpAdjustError" title="除权除息待确认">
-            <template #extra>
-              <n-button size="tiny" quaternary :loading="corpAdjustLoading" @click="loadCorpAdjusts">刷新</n-button>
-            </template>
-            <n-alert v-if="corpAdjustError" type="error" :bordered="false" title="调整建议读取失败">
-              {{ corpAdjustError }}
-            </n-alert>
-            <template v-else>
-              <n-alert type="warning" :bordered="false" style="margin-bottom: 10px" :show-icon="false">
-                以下持仓已到除权除息日。普通建议核对后可确认折算；标记“需人工核对”的历史错序记录不会自动改账，
-                只有明确确认已自行核对后才能忽略并解除交易拦截。
+          <div class="tab-stack">
+            <!-- B8 除权除息待确认折算：仅在有 pending 建议时出现。
+                 **不确认的话本页盈亏就是错的数字**（10 转 10 后显示 -50%），
+                 所以放在最顶部；但程序绝不代替用户改账本。 -->
+            <SectionCard v-if="corpAdjusts.length || corpAdjustError" title="除权除息待确认">
+              <template #extra>
+                <n-button size="tiny" quaternary :loading="corpAdjustLoading" @click="loadCorpAdjusts">刷新</n-button>
+              </template>
+              <n-alert v-if="corpAdjustError" type="error" :bordered="false" title="调整建议读取失败">
+                {{ corpAdjustError }}
               </n-alert>
-              <div class="adjust-list">
-                <div v-for="a in corpAdjusts" :key="a.id" class="adjust-row">
-                  <div class="adjust-main">
-                    <div class="adjust-head">
-                      <StockIdentity :symbol="a.symbol" :market="a.market || 'cn'" :name="a.name" density="table" clickable />
-                      <n-tag v-if="a.manual_review" size="tiny" round :bordered="false" type="error">需人工核对</n-tag>
-                      <n-tag v-if="a.record_date" size="tiny" round :bordered="false">登记日 {{ a.record_date }}</n-tag>
-                      <n-tag size="tiny" round :bordered="false" type="warning">除权日 {{ a.ex_date }}</n-tag>
+              <template v-else>
+                <n-alert type="warning" :bordered="false" style="margin-bottom: 10px" :show-icon="false">
+                  以下持仓已到除权除息日。普通建议核对后可确认折算；标记“需人工核对”的历史错序记录不会自动改账，
+                  只有明确确认已自行核对后才能忽略并解除交易拦截。
+                </n-alert>
+                <div class="adjust-list">
+                  <div v-for="a in corpAdjusts" :key="a.id" class="adjust-row">
+                    <div class="adjust-main">
+                      <div class="adjust-head">
+                        <StockIdentity :symbol="a.symbol" :market="a.market || 'cn'" :name="a.name" density="table" clickable />
+                        <n-tag v-if="a.manual_review" size="tiny" round :bordered="false" type="error">需人工核对</n-tag>
+                        <n-tag v-if="a.record_date" size="tiny" round :bordered="false">登记日 {{ a.record_date }}</n-tag>
+                        <n-tag size="tiny" round :bordered="false" type="warning">除权日 {{ a.ex_date }}</n-tag>
+                      </div>
+                      <div class="adjust-plan">{{ adjustPlanText(a) }}</div>
+                      <div v-if="a.manual_review" class="adjust-review">
+                        {{ a.review_reason }}。忽略只解除拦截，不会自动修正数量、成本或已实现盈亏。
+                      </div>
+                      <div v-else class="adjust-calc qv-tnum">
+                        <template v-if="a.entitled_qty > 0">登记日有权 {{ a.entitled_qty }} 股 · </template>
+                        当前数量 {{ a.qty_before }} → <b>{{ a.qty_after }}</b> 股 · 成本
+                        {{ a.cost_before.toFixed(4) }} → <b>{{ a.cost_after.toFixed(4) }}</b> 元
+                        <span v-if="a.cash_dividend > 0"> · 现金分红 {{ a.cash_dividend.toFixed(2) }} 元（税前）</span>
+                      </div>
                     </div>
-                    <div class="adjust-plan">{{ adjustPlanText(a) }}</div>
-                    <div v-if="a.manual_review" class="adjust-review">
-                      {{ a.review_reason }}。忽略只解除拦截，不会自动修正数量、成本或已实现盈亏。
-                    </div>
-                    <div v-else class="adjust-calc qv-tnum">
-                      <template v-if="a.entitled_qty > 0">登记日有权 {{ a.entitled_qty }} 股 · </template>
-                      当前数量 {{ a.qty_before }} → <b>{{ a.qty_after }}</b> 股 · 成本
-                      {{ a.cost_before.toFixed(4) }} → <b>{{ a.cost_after.toFixed(4) }}</b> 元
-                      <span v-if="a.cash_dividend > 0"> · 现金分红 {{ a.cash_dividend.toFixed(2) }} 元（税前）</span>
-                    </div>
-                  </div>
-                  <div class="adjust-actions">
-                    <n-button
-                      v-if="!a.manual_review"
-                      size="small"
-                      type="primary"
-                      :loading="corpAdjustActing === a.id"
-                      @click="doCorpAdjust(a, 'confirm')"
-                      >确认折算</n-button
-                    >
-                    <n-popconfirm
-                      v-if="a.manual_review"
-                      positive-text="确认已核对"
-                      negative-text="取消"
-                      @positive-click="doCorpAdjust(a, 'dismiss')"
-                    >
-                      <template #trigger>
-                        <n-button size="small" type="warning" :loading="corpAdjustActing === a.id">已核对并忽略</n-button>
-                      </template>
-                      确认已自行核对历史流水。系统不会自动修正账本，忽略后将允许继续交易。
-                    </n-popconfirm>
-                    <n-button v-else size="small" quaternary @click="doCorpAdjust(a, 'dismiss')">忽略</n-button>
-                  </div>
-                </div>
-              </div>
-            </template>
-          </SectionCard>
-
-          <!-- D17 AI 卖出建议：逐笔持仓的 hold/trim/exit 封闭结论。
-               无当前有效行情的仓位不参与（不基于旧价出割/守/补结论）。 -->
-          <SectionCard id="position-advice-panel" title="AI 卖出建议">
-            <template #extra>
-              <n-button size="tiny" type="primary" ghost :loading="adviceLoading" @click="runAdvice()">
-                分析全部持仓
-              </n-button>
-            </template>
-            <n-alert v-if="adviceError" type="error" :bordered="false" title="AI 建议生成失败">
-              {{ adviceError }}
-            </n-alert>
-            <div v-else-if="!advice" class="advice-empty">
-              针对<b>每一笔持仓</b>给出「继续持有 / 减仓 / 清仓」的结论、理由与失效条件。
-              成本、浮动盈亏、持有交易日、自最高点回撤等数值由服务端算好后喂给模型，模型只做判断不做算术；
-              无当前有效行情的持仓不参与（不基于旧价给出割/守/补结论）。
-            </div>
-            <div v-else class="advice-box">
-              <div v-for="(n, i) in advice.notes || []" :key="i" class="advice-note">{{ n }}</div>
-              <div class="advice-list">
-                <div v-for="a in advice.advices" :key="a.position_id" class="advice-row">
-                  <div class="advice-head">
-                    <n-tag size="small" round :bordered="false" :type="verdictType(a.verdict)">{{
-                      verdictLabel(a.verdict)
-                    }}</n-tag>
-                    <StockIdentity :symbol="a.symbol" market="cn" :name="a.name" density="table" clickable />
-                    <span class="advice-position qv-tnum">
-                      {{ advicePositionType(a.position_type) }} · 成本 {{ a.cost.toFixed(2) }} · {{ a.quantity }} 股
-                    </span>
-                  </div>
-                  <div class="advice-reason">{{ a.reason }}</div>
-                  <div v-if="a.invalidation" class="advice-invalid">失效条件：{{ a.invalidation }}</div>
-                </div>
-              </div>
-              <div class="advice-foot">
-                本次分析 {{ advice.analyzed }} 笔<span v-if="advice.skipped > 0">，跳过 {{ advice.skipped }} 笔</span>
-                <span v-if="advice.evidence_check">
-                  · 证据核验 {{ advice.evidence_check.matched }}/{{ advice.evidence_check.total }} 项与数据一致</span
-                >
-                <span v-if="advice.model"> · {{ advice.model }}</span>
-                <span v-if="adviceGeneratedAt"> · 生成于 {{ adviceGeneratedAt }}</span>
-                。研究参考，不构成投资建议。
-              </div>
-            </div>
-          </SectionCard>
-
-          <!-- C13 行业 / 风格暴露：回答「我是不是把钱全压在一个赛道上」。
-               缺数据的维度整块缺席（那是「不知道」不是「均匀」），
-               缺失部分显式成「未知」桶且恒排最后。 -->
-          <SectionCard v-if="exposureAnyAvailable" title="行业 / 风格暴露">
-            <template #extra>
-              <n-radio-group v-model:value="exposureDimKey" size="small">
-                <n-radio-button v-for="o in exposureDimOptions" :key="o.value" :value="o.value">
-                  {{ o.label }}
-                </n-radio-button>
-              </n-radio-group>
-            </template>
-            <template v-if="exposureDim">
-              <div ref="exposureEl" class="exposure-chart"></div>
-              <div class="exposure-meta qv-tnum">
-                已定价市值 {{ fmtMoney(exposure?.base ?? 0) }} · 本维覆盖
-                {{ exposureDim.known_pct.toFixed(1) }}%
-              </div>
-              <div v-if="exposureDim.note" class="exposure-note">{{ exposureDim.note }}</div>
-              <div class="exposure-note">{{ exposure?.base_note }}</div>
-            </template>
-            <n-empty v-else :description="exposureEmptyText" />
-          </SectionCard>
-
-          <!-- B7 资产曲线：读每交易日 16:20 落库的快照，不做插值补造 -->
-          <SectionCard title="资产曲线">
-            <template #extra>
-              <div class="filters">
-                <n-select
-                  v-model:value="curveDays"
-                  :options="curveDayOptions"
-                  size="small"
-                  style="width: 120px"
-                />
-                <n-button size="tiny" quaternary :loading="curveLoading" @click="loadCurve">刷新</n-button>
-              </div>
-            </template>
-            <n-spin :show="curveLoading && !curve">
-              <n-alert v-if="curveError" type="error" :bordered="false" title="资产曲线读取失败">
-                {{ curveError }}
-              </n-alert>
-              <div v-show="!!curve?.points.length" ref="curveEl" class="curve-chart"></div>
-              <n-empty
-                v-if="!curveLoading && !curveError && curve && !curve.points.length"
-                description="暂无资产快照——曲线自启用之日起按交易日盘后积累，不回溯历史"
-              />
-              <div v-if="curve?.notes?.length" class="curve-notes">
-                <div v-for="(n, i) in curve.notes" :key="i">{{ n }}</div>
-              </div>
-            </n-spin>
-          </SectionCard>
-
-          <SectionCard title="持仓明细">
-            <template #extra>
-              <div class="filters">
-                <n-radio-group v-model:value="typeFilter" size="small">
-                  <n-radio-button value="all">全部</n-radio-button>
-                  <n-radio-button value="short_term">短线</n-radio-button>
-                  <n-radio-button value="long_term">长线</n-radio-button>
-                </n-radio-group>
-                <n-radio-group v-model:value="statusFilter" size="small">
-                  <n-radio-button value="holding">持仓中</n-radio-button>
-                  <n-radio-button value="closed">已卖出</n-radio-button>
-                  <n-radio-button value="all">全部</n-radio-button>
-                </n-radio-group>
-              </div>
-            </template>
-
-            <n-spin :show="loading && !positions.length">
-              <n-empty
-                v-if="!loading && !loadError && !filtered.length"
-                description="暂无持仓，点击「新建持仓」记录一笔买入"
-              />
-              <div v-if="filtered.length" class="rows">
-                <div
-                  v-for="p in filtered"
-                  :id="`position-ledger-item-${p.id}`"
-                  :key="p.id"
-                  class="row-wrap"
-                  :class="{ 'is-stock-action-target': highlightedPositionID === p.id }"
-                >
-                  <div class="row">
-                    <div class="r-name">
-                      <div class="r-title-line">
-                        <n-tag
-                          size="tiny"
-                          round
-                          :bordered="false"
-                          :type="p.position_type === 'short_term' ? 'warning' : 'info'"
-                          >{{ typeLabel(p.position_type) }}</n-tag
-                        >
-                        <StockIdentity :symbol="p.symbol" :market="p.market" :name="p.name" density="table" clickable actions />
-                        <n-tag v-if="p.status === 'closed'" size="tiny" :bordered="false">已卖出</n-tag>
-                        <n-tag
-                          v-if="p.status === 'holding' && p.exit_assessment"
-                          size="tiny"
-                          :bordered="false"
-                          :type="exitLevelType(p.exit_assessment.level)"
-                        >{{ exitLevelLabel[p.exit_assessment.level] }}</n-tag>
-                        <n-tag v-if="p.below_stop_loss" size="tiny" type="error" :bordered="false">破止损</n-tag>
-                        <n-tag v-else-if="p.near_stop_loss" size="tiny" type="warning" :bordered="false">近止损</n-tag>
-                        <!-- 血缘可见性：有来源推荐才显示，无血缘不加徽章（避免每行都是噪音）。
-                             没有这个徽章，recommendation_id 只是个不可见的数字，用户无从
-                             察觉「我照推荐买的，但系统没记住」。 -->
-                        <n-tag
-                          v-if="p.rec_link"
-                          size="tiny"
-                          type="info"
-                          :bordered="false"
-                          class="tag-click"
-                          :title="`来自推荐 #${p.rec_link.recommendation_id}（${p.rec_link.created_at.slice(0, 10)} · 参考价 ${p.rec_link.ref_price > 0 ? p.rec_link.ref_price.toFixed(2) : '未知'}），点击查看该批推荐`"
-                          @click="goRecommendationBatch(p.rec_link.batch_id)"
-                        >来自推荐</n-tag>
-                        <FreshnessTag
-                          v-if="p.status === 'holding'"
-                          :status="p.freshness_status"
-                          :as-of="p.quote_as_of"
-                          :reason="p.stale_reason"
-                        />
-                        <n-tag
-                          v-if="p.status === 'holding' && p.analysis_stale"
-                          size="tiny"
-                          :bordered="false"
-                          class="tag-click"
-                          title="点击发起个股分析"
-                          @click="goAnalysis(p)"
-                          >{{ staleLabel(p) }}</n-tag
-                        >
-                      </div>
-                      <div class="r-sub">
-                        <template v-if="p.status === 'closed'">
-                          累计买入 {{ p.total_buy_qty || p.quantity }} 股 · 均价 {{ fmt(p.buy_price) }}
-                        </template>
-                        <template v-else> 持有 {{ p.quantity }} 股 · 均价 {{ fmt(p.buy_price) }} </template>
-                        <span v-if="p.buy_date">· {{ p.buy_date }}</span>
-                        <span v-if="p.status === 'holding' && p.held_trade_days > 0">· 持有 {{ p.held_trade_days }} 交易日</span>
-                        <span v-if="p.status === 'closed'"> · 末笔卖出 {{ fmt(p.sell_price) }}</span>
-                        <span v-if="p.status === 'holding' && p.realized_pnl" :style="{ color: pctColor(p.realized_pnl) }">
-                          · 已兑现 {{ fmtMoney(p.realized_pnl) }}
-                        </span>
-                      </div>
-                      <div v-if="p.short_term_review" class="r-hint" :style="{ color: warnColor }">
-                        ⚠ 短线已持有 {{ p.held_trade_days }} 交易日，建议复盘是否止盈/止损或转长线
-                      </div>
-                      <!-- D15 持仓期最高价与回撤：回答「我赚过多少、现在回吐了多少」。
-                           峰值自建仓起算（买入日之前的高点不算），加仓后按新成本重新起算。 -->
-                      <div v-if="p.status === 'holding' && p.peak" class="r-peak">
-                        持仓期最高 <span class="qv-tnum">{{ fmt(p.peak.price) }}</span>
-                        <span v-if="p.peak.date">（{{ p.peak.date }}）</span>
-                        <template v-if="p.quote_ok && p.peak.drawdown_pct > 0">
-                          · 已回撤
-                          <span class="qv-tnum" :style="{ color: pctColor(-p.peak.drawdown_pct) }"
-                            >{{ p.peak.drawdown_pct.toFixed(2) }}%</span
-                          >
-                        </template>
-                        <span v-else-if="!p.quote_ok"> · 回撤未知（无当前有效行情）</span>
-                        <span v-if="p.peak.from"> · 自 {{ p.peak.from }} 起算</span>
-                        <span v-if="p.peak.backfilled" class="r-peak-note" :title="p.peak.note">（含日线回填）</span>
-                      </div>
-                      <div
-                        v-if="p.status === 'holding' && p.exit_assessment"
-                        class="exit-assessment"
-                        :class="`is-${p.exit_assessment.level}`"
+                    <div class="adjust-actions">
+                      <n-button
+                        v-if="!a.manual_review"
+                        size="small"
+                        type="primary"
+                        :loading="corpAdjustActing === a.id"
+                        @click="doCorpAdjust(a, 'confirm')"
+                        >确认折算</n-button
                       >
-                        <div class="exit-assessment-head">
-                          <span class="exit-reason">{{ p.exit_assessment.primary_reason }}</span>
-                          <span class="exit-asof qv-tnum">
-                            行情 {{ p.exit_assessment.quote_as_of || '未知' }} · 日线
-                            {{ p.exit_assessment.bars_as_of || '未知' }}
+                      <n-popconfirm
+                        v-if="a.manual_review"
+                        positive-text="确认已核对"
+                        negative-text="取消"
+                        @positive-click="doCorpAdjust(a, 'dismiss')"
+                      >
+                        <template #trigger>
+                          <n-button size="small" type="warning" :loading="corpAdjustActing === a.id">已核对并忽略</n-button>
+                        </template>
+                        确认已自行核对历史流水。系统不会自动修正账本，忽略后将允许继续交易。
+                      </n-popconfirm>
+                      <n-button v-else size="small" quaternary @click="doCorpAdjust(a, 'dismiss')">忽略</n-button>
+                    </div>
+                  </div>
+                </div>
+              </template>
+            </SectionCard>
+
+            <SectionCard title="持仓明细">
+              <template #extra>
+                <div class="filters">
+                  <n-radio-group v-model:value="typeFilter" size="small">
+                    <n-radio-button value="all">全部</n-radio-button>
+                    <n-radio-button value="short_term">短线</n-radio-button>
+                    <n-radio-button value="long_term">长线</n-radio-button>
+                  </n-radio-group>
+                  <n-radio-group v-model:value="statusFilter" size="small">
+                    <n-radio-button value="holding">持仓中</n-radio-button>
+                    <n-radio-button value="closed">已卖出</n-radio-button>
+                    <n-radio-button value="all">全部</n-radio-button>
+                  </n-radio-group>
+                </div>
+              </template>
+
+              <n-spin :show="loading && !positions.length">
+                <n-empty
+                  v-if="!loading && !loadError && !filtered.length"
+                  description="暂无持仓，点击「新建持仓」记录一笔买入"
+                />
+                <div v-if="filtered.length" class="rows">
+                  <div
+                    v-for="p in filtered"
+                    :id="`position-ledger-item-${p.id}`"
+                    :key="p.id"
+                    class="row-wrap"
+                    :class="{ 'is-stock-action-target': highlightedPositionID === p.id }"
+                  >
+                    <div class="row">
+                      <div class="r-name">
+                        <div class="r-title-line">
+                          <n-tag
+                            size="tiny"
+                            round
+                            :bordered="false"
+                            :type="p.position_type === 'short_term' ? 'warning' : 'info'"
+                            >{{ typeLabel(p.position_type) }}</n-tag
+                          >
+                          <StockIdentity :symbol="p.symbol" :market="p.market" :name="p.name" density="table" clickable actions />
+                          <n-tag v-if="p.status === 'closed'" size="tiny" :bordered="false">已卖出</n-tag>
+                          <n-tag
+                            v-if="p.status === 'holding' && p.exit_assessment"
+                            size="tiny"
+                            :bordered="false"
+                            :type="exitLevelType(p.exit_assessment.level)"
+                          >{{ exitLevelLabel[p.exit_assessment.level] }}</n-tag>
+                          <n-tag v-if="p.below_stop_loss" size="tiny" type="error" :bordered="false">破止损</n-tag>
+                          <n-tag v-else-if="p.near_stop_loss" size="tiny" type="warning" :bordered="false">近止损</n-tag>
+                          <!-- 血缘可见性：有来源推荐才显示，无血缘不加徽章（避免每行都是噪音）。
+                               没有这个徽章，recommendation_id 只是个不可见的数字，用户无从
+                               察觉「我照推荐买的，但系统没记住」。 -->
+                          <n-tag
+                            v-if="p.rec_link"
+                            size="tiny"
+                            type="info"
+                            :bordered="false"
+                            class="tag-click"
+                            :title="`来自推荐 #${p.rec_link.recommendation_id}（${p.rec_link.created_at.slice(0, 10)} · 参考价 ${p.rec_link.ref_price > 0 ? p.rec_link.ref_price.toFixed(2) : '未知'}），点击查看该批推荐`"
+                            @click="goRecommendationBatch(p.rec_link.batch_id)"
+                          >来自推荐</n-tag>
+                          <FreshnessTag
+                            v-if="p.status === 'holding'"
+                            :status="p.freshness_status"
+                            :as-of="p.quote_as_of"
+                            :reason="p.stale_reason"
+                          />
+                          <n-tag
+                            v-if="p.status === 'holding' && p.analysis_stale"
+                            size="tiny"
+                            :bordered="false"
+                            class="tag-click"
+                            title="点击发起个股分析"
+                            @click="goAnalysis(p)"
+                            >{{ staleLabel(p) }}</n-tag
+                          >
+                        </div>
+                        <div class="r-sub">
+                          <template v-if="p.status === 'closed'">
+                            累计买入 {{ p.total_buy_qty || p.quantity }} 股 · 均价 {{ fmt(p.buy_price) }}
+                          </template>
+                          <template v-else> 持有 {{ p.quantity }} 股 · 均价 {{ fmt(p.buy_price) }} </template>
+                          <span v-if="p.buy_date">· {{ p.buy_date }}</span>
+                          <span v-if="p.status === 'holding' && p.held_trade_days > 0">· 持有 {{ p.held_trade_days }} 交易日</span>
+                          <span v-if="p.status === 'closed'"> · 末笔卖出 {{ fmt(p.sell_price) }}</span>
+                          <span v-if="p.status === 'holding' && p.realized_pnl" :style="{ color: pctColor(p.realized_pnl) }">
+                            · 已兑现 {{ fmtMoney(p.realized_pnl) }}
                           </span>
                         </div>
-                        <div v-if="p.exit_assessment.evidence.length" class="exit-evidence">
-                          <span v-for="(item, index) in p.exit_assessment.evidence" :key="index">{{ item }}</span>
+                        <div v-if="p.short_term_review" class="r-hint" :style="{ color: warnColor }">
+                          ⚠ 短线已持有 {{ p.held_trade_days }} 交易日，建议复盘是否止盈/止损或转长线
                         </div>
-                        <div v-if="p.exit_assessment.data_gaps.length" class="exit-gaps">
-                          {{ p.exit_assessment.data_gaps.join('；') }}
+                        <!-- D15 持仓期最高价与回撤：回答「我赚过多少、现在回吐了多少」。
+                             峰值自建仓起算（买入日之前的高点不算），加仓后按新成本重新起算。 -->
+                        <div v-if="p.status === 'holding' && p.peak" class="r-peak">
+                          持仓期最高 <span class="qv-tnum">{{ fmt(p.peak.price) }}</span>
+                          <span v-if="p.peak.date">（{{ p.peak.date }}）</span>
+                          <template v-if="p.quote_ok && p.peak.drawdown_pct > 0">
+                            · 已回撤
+                            <span class="qv-tnum" :style="{ color: pctColor(-p.peak.drawdown_pct) }"
+                              >{{ p.peak.drawdown_pct.toFixed(2) }}%</span
+                            >
+                          </template>
+                          <span v-else-if="!p.quote_ok"> · 回撤未知（无当前有效行情）</span>
+                          <span v-if="p.peak.from"> · 自 {{ p.peak.from }} 起算</span>
+                          <span v-if="p.peak.backfilled" class="r-peak-note" :title="p.peak.note">（含日线回填）</span>
                         </div>
-                        <div class="exit-action">
-                          <span>{{ p.exit_assessment.next_action }}</span>
-                          <n-button
-                            v-if="p.exit_assessment.level === 'review' || p.exit_assessment.level === 'urgent'"
-                            size="tiny"
-                            type="primary"
-                            ghost
-                            :loading="adviceLoading && adviceTargetPositionID === p.id"
-                            :disabled="adviceLoading && adviceTargetPositionID !== p.id"
-                            @click="runAdvice(p)"
-                          >AI 复核</n-button>
-                        </div>
-                      </div>
-                      <div v-else-if="p.status === 'holding'" class="exit-assessment-empty">
-                        卖出风险评估尚未生成
-                      </div>
-                      <div v-if="p.status === 'closed' && p.review_note" class="r-review">
-                        复盘：{{ p.review_note }}
-                      </div>
-                    </div>
-
-                    <div class="r-figures">
-                      <div class="r-fig">
-                        <span class="r-fig-label">{{ p.status === 'closed' ? '卖出价' : '现价' }}</span>
-                        <span class="r-fig-val qv-tnum">{{ p.quote_ok ? fmt(p.current_price) : '—' }}</span>
-                        <span
-                          v-if="!p.quote_ok && p.status === 'holding' && p.last_price"
-                          class="r-fig-stale qv-tnum"
-                          :title="`最近已知价（截至 ${p.quote_as_of || '未知'}，已过期，不代表当前价格）`"
-                          >旧 {{ fmt(p.last_price) }}</span
+                        <div
+                          v-if="p.status === 'holding' && p.exit_assessment"
+                          class="exit-assessment"
+                          :class="`is-${p.exit_assessment.level}`"
                         >
+                          <div class="exit-assessment-head">
+                            <span class="exit-reason">{{ p.exit_assessment.primary_reason }}</span>
+                            <span class="exit-asof qv-tnum">
+                              行情 {{ p.exit_assessment.quote_as_of || '未知' }} · 日线
+                              {{ p.exit_assessment.bars_as_of || '未知' }}
+                            </span>
+                          </div>
+                          <div v-if="p.exit_assessment.evidence.length" class="exit-evidence">
+                            <span v-for="(item, index) in p.exit_assessment.evidence" :key="index">{{ item }}</span>
+                          </div>
+                          <div v-if="p.exit_assessment.data_gaps.length" class="exit-gaps">
+                            {{ p.exit_assessment.data_gaps.join('；') }}
+                          </div>
+                          <div class="exit-action">
+                            <span>{{ p.exit_assessment.next_action }}</span>
+                            <n-button
+                              v-if="p.exit_assessment.level === 'review' || p.exit_assessment.level === 'urgent'"
+                              size="tiny"
+                              type="primary"
+                              ghost
+                              :loading="adviceLoading && adviceTargetPositionID === p.id"
+                              :disabled="adviceLoading && adviceTargetPositionID !== p.id"
+                              @click="runAdvice(p)"
+                            >AI 复核</n-button>
+                          </div>
+                        </div>
+                        <div v-else-if="p.status === 'holding'" class="exit-assessment-empty">
+                          卖出风险评估尚未生成
+                        </div>
+                        <div v-if="p.status === 'closed' && p.review_note" class="r-review">
+                          复盘：{{ p.review_note }}
+                        </div>
                       </div>
-                      <div class="r-fig">
-                        <span class="r-fig-label">{{ p.status === 'closed' ? '已实现盈亏' : '盈亏' }}</span>
-                        <span class="r-fig-val qv-tnum" :style="{ color: pctColor(p.profit_amount) }">
-                          {{ p.quote_ok ? fmtMoney(p.profit_amount) : '—' }}
-                        </span>
+
+                      <div class="r-figures">
+                        <div class="r-fig">
+                          <span class="r-fig-label">{{ p.status === 'closed' ? '卖出价' : '现价' }}</span>
+                          <span class="r-fig-val qv-tnum">{{ p.quote_ok ? fmt(p.current_price) : '—' }}</span>
+                          <span
+                            v-if="!p.quote_ok && p.status === 'holding' && p.last_price"
+                            class="r-fig-stale qv-tnum"
+                            :title="`最近已知价（截至 ${p.quote_as_of || '未知'}，已过期，不代表当前价格）`"
+                            >旧 {{ fmt(p.last_price) }}</span
+                          >
+                        </div>
+                        <div class="r-fig">
+                          <span class="r-fig-label">{{ p.status === 'closed' ? '已实现盈亏' : '盈亏' }}</span>
+                          <span class="r-fig-val qv-tnum" :style="{ color: pctColor(p.profit_amount) }">
+                            {{ p.quote_ok ? fmtMoney(p.profit_amount) : '—' }}
+                          </span>
+                        </div>
+                        <div class="r-fig">
+                          <span class="r-fig-label">收益率</span>
+                          <span class="r-fig-val qv-tnum" :style="{ color: pctColor(p.profit_pct) }">
+                            {{ p.quote_ok ? p.profit_pct.toFixed(2) + '%' : '—' }}
+                          </span>
+                        </div>
                       </div>
-                      <div class="r-fig">
-                        <span class="r-fig-label">收益率</span>
-                        <span class="r-fig-val qv-tnum" :style="{ color: pctColor(p.profit_pct) }">
-                          {{ p.quote_ok ? p.profit_pct.toFixed(2) + '%' : '—' }}
-                        </span>
+
+                      <div class="r-actions">
+                        <n-button v-if="p.status === 'holding'" size="tiny" type="primary" ghost @click="openTrade(p, 'buy')"
+                          >加仓</n-button
+                        >
+                        <n-button v-if="p.status === 'holding'" size="tiny" type="warning" ghost @click="openTrade(p, 'sell')"
+                          >减仓</n-button
+                        >
+                        <n-button v-if="p.status === 'holding'" size="tiny" type="primary" ghost @click="openClose(p)"
+                          >清仓</n-button
+                        >
+                        <n-button size="tiny" quaternary @click="toggleTrades(p)">
+                          {{ expandedTrades === p.id ? '收起流水' : '流水' }}
+                        </n-button>
+                        <n-button size="tiny" quaternary @click="goAnalysis(p)">分析</n-button>
+                        <n-button size="tiny" quaternary @click="goAlert(p)">提醒</n-button>
+                        <n-button size="tiny" quaternary @click="goThesis(p)">逻辑卡</n-button>
+                        <n-button size="tiny" quaternary @click="openEdit(p)">编辑</n-button>
+                        <n-popconfirm @positive-click="remove(p)">
+                          <template #trigger>
+                            <n-button size="tiny" quaternary type="error">删除</n-button>
+                          </template>
+                          删除持仓「{{ p.name || '名称待补全' }}（{{ p.symbol }}）」？流水明细一并删除。
+                        </n-popconfirm>
                       </div>
                     </div>
 
-                    <div class="r-actions">
-                      <n-button v-if="p.status === 'holding'" size="tiny" type="primary" ghost @click="openTrade(p, 'buy')"
-                        >加仓</n-button
-                      >
-                      <n-button v-if="p.status === 'holding'" size="tiny" type="warning" ghost @click="openTrade(p, 'sell')"
-                        >减仓</n-button
-                      >
-                      <n-button v-if="p.status === 'holding'" size="tiny" type="primary" ghost @click="openClose(p)"
-                        >清仓</n-button
-                      >
-                      <n-button size="tiny" quaternary @click="toggleTrades(p)">
-                        {{ expandedTrades === p.id ? '收起流水' : '流水' }}
-                      </n-button>
-                      <n-button size="tiny" quaternary @click="goAnalysis(p)">分析</n-button>
-                      <n-button size="tiny" quaternary @click="goAlert(p)">提醒</n-button>
-                      <n-button size="tiny" quaternary @click="goThesis(p)">逻辑卡</n-button>
-                      <n-button size="tiny" quaternary @click="openEdit(p)">编辑</n-button>
-                      <n-popconfirm @positive-click="remove(p)">
-                        <template #trigger>
-                          <n-button size="tiny" quaternary type="error">删除</n-button>
-                        </template>
-                        删除持仓「{{ p.name || '名称待补全' }}（{{ p.symbol }}）」？流水明细一并删除。
-                      </n-popconfirm>
+                    <!-- B5 流水明细（展开一行） -->
+                    <div v-if="expandedTrades === p.id" class="trade-panel">
+                      <n-spin :show="tradesLoading && !tradesById[p.id]">
+                        <n-alert
+                          v-if="tradesErrorById[p.id]"
+                          type="error"
+                          :bordered="false"
+                          title="流水读取失败"
+                        >
+                          {{ tradesErrorById[p.id] }}
+                        </n-alert>
+                        <n-empty
+                          v-else-if="!tradesLoading && tradesById[p.id] && !tradesById[p.id].length"
+                          size="small"
+                          description="暂无流水"
+                        />
+                        <table v-else class="trade-table qv-tnum">
+                          <thead>
+                            <tr>
+                              <th>日期</th>
+                              <th>方向</th>
+                              <th class="ta-r">价格</th>
+                              <th class="ta-r">数量</th>
+                              <th class="ta-r">费用</th>
+                              <th class="ta-r">税费</th>
+                              <th class="ta-r">已实现</th>
+                              <th class="ta-r">持仓后</th>
+                              <th class="ta-r">均价后</th>
+                              <th>备注</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <tr v-for="t in tradesById[p.id]" :key="t.id">
+                              <td>{{ t.trade_date || '—' }}</td>
+                              <td>
+                                <span :style="{ color: sideColor(t.side) }">{{ sideLabel(t.side) }}</span>
+                              </td>
+                              <td class="ta-r">{{ t.side === 'adjust' ? '—' : fmt(t.price) }}</td>
+                              <td
+                                class="ta-r"
+                                :title="t.side === 'adjust' ? '除权折算导致的持仓数量变化，不是一次买卖' : ''"
+                              >
+                                {{
+                                  t.side === 'adjust'
+                                    ? t.quantity
+                                      ? `${t.quantity > 0 ? '+' : ''}${t.quantity}`
+                                      : '—'
+                                    : t.quantity
+                                }}
+                              </td>
+                              <td class="ta-r">{{ t.side === 'adjust' ? '—' : fmt(t.fee) }}</td>
+                              <td class="ta-r">{{ t.side === 'adjust' ? '—' : fmt(t.tax) }}</td>
+                              <td
+                                class="ta-r"
+                                :style="{ color: t.side === 'sell' ? pctColor(t.realized_pnl) : undefined }"
+                                :title="t.side === 'adjust' ? '除权折算笔记的是到手税前现金分红' : ''"
+                              >
+                                {{ t.side === 'buy' || (t.side === 'adjust' && !t.realized_pnl) ? '—' : fmtMoney(t.realized_pnl) }}
+                              </td>
+                              <td class="ta-r">{{ t.quantity_after }}</td>
+                              <td class="ta-r">{{ fmt(t.avg_cost_after) }}</td>
+                              <td class="t-note">
+                                {{ t.note || '—' }}
+                                <n-tag v-if="t.backfilled" size="tiny" :bordered="false" title="旧持仓惰性补建的等价记录，非用户录入">补建</n-tag>
+                                <n-popconfirm v-if="t.side === 'adjust' && t.adjust_id" @positive-click="revertAdjustTrade(t, p.id)">
+                                  <template #trigger>
+                                    <n-button size="tiny" quaternary :loading="revertingTrade === t.id">撤销折算</n-button>
+                                  </template>
+                                  撤销后数量与成本回滚到折算前（{{ t.quantity_before }} 股 / {{ fmt(t.avg_cost_before || 0) }}
+                                  元）。若此后已有新交易，后端会拒绝撤销。
+                                </n-popconfirm>
+                              </td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </n-spin>
                     </div>
-                  </div>
-
-                  <!-- B5 流水明细（展开一行） -->
-                  <div v-if="expandedTrades === p.id" class="trade-panel">
-                    <n-spin :show="tradesLoading && !tradesById[p.id]">
-                      <n-alert
-                        v-if="tradesErrorById[p.id]"
-                        type="error"
-                        :bordered="false"
-                        title="流水读取失败"
-                      >
-                        {{ tradesErrorById[p.id] }}
-                      </n-alert>
-                      <n-empty
-                        v-else-if="!tradesLoading && tradesById[p.id] && !tradesById[p.id].length"
-                        size="small"
-                        description="暂无流水"
-                      />
-                      <table v-else class="trade-table qv-tnum">
-                        <thead>
-                          <tr>
-                            <th>日期</th>
-                            <th>方向</th>
-                            <th class="ta-r">价格</th>
-                            <th class="ta-r">数量</th>
-                            <th class="ta-r">费用</th>
-                            <th class="ta-r">税费</th>
-                            <th class="ta-r">已实现</th>
-                            <th class="ta-r">持仓后</th>
-                            <th class="ta-r">均价后</th>
-                            <th>备注</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          <tr v-for="t in tradesById[p.id]" :key="t.id">
-                            <td>{{ t.trade_date || '—' }}</td>
-                            <td>
-                              <span :style="{ color: sideColor(t.side) }">{{ sideLabel(t.side) }}</span>
-                            </td>
-                            <td class="ta-r">{{ t.side === 'adjust' ? '—' : fmt(t.price) }}</td>
-                            <td
-                              class="ta-r"
-                              :title="t.side === 'adjust' ? '除权折算导致的持仓数量变化，不是一次买卖' : ''"
-                            >
-                              {{
-                                t.side === 'adjust'
-                                  ? t.quantity
-                                    ? `${t.quantity > 0 ? '+' : ''}${t.quantity}`
-                                    : '—'
-                                  : t.quantity
-                              }}
-                            </td>
-                            <td class="ta-r">{{ t.side === 'adjust' ? '—' : fmt(t.fee) }}</td>
-                            <td class="ta-r">{{ t.side === 'adjust' ? '—' : fmt(t.tax) }}</td>
-                            <td
-                              class="ta-r"
-                              :style="{ color: t.side === 'sell' ? pctColor(t.realized_pnl) : undefined }"
-                              :title="t.side === 'adjust' ? '除权折算笔记的是到手税前现金分红' : ''"
-                            >
-                              {{ t.side === 'buy' || (t.side === 'adjust' && !t.realized_pnl) ? '—' : fmtMoney(t.realized_pnl) }}
-                            </td>
-                            <td class="ta-r">{{ t.quantity_after }}</td>
-                            <td class="ta-r">{{ fmt(t.avg_cost_after) }}</td>
-                            <td class="t-note">
-                              {{ t.note || '—' }}
-                              <n-tag v-if="t.backfilled" size="tiny" :bordered="false" title="旧持仓惰性补建的等价记录，非用户录入">补建</n-tag>
-                              <n-popconfirm v-if="t.side === 'adjust' && t.adjust_id" @positive-click="revertAdjustTrade(t, p.id)">
-                                <template #trigger>
-                                  <n-button size="tiny" quaternary :loading="revertingTrade === t.id">撤销折算</n-button>
-                                </template>
-                                撤销后数量与成本回滚到折算前（{{ t.quantity_before }} 股 / {{ fmt(t.avg_cost_before || 0) }}
-                                元）。若此后已有新交易，后端会拒绝撤销。
-                              </n-popconfirm>
-                            </td>
-                          </tr>
-                        </tbody>
-                      </table>
-                    </n-spin>
                   </div>
                 </div>
+              </n-spin>
+            </SectionCard>
+
+            <!-- D17 AI 卖出建议：逐笔持仓的 hold/trim/exit 封闭结论。
+                 无当前有效行情的仓位不参与（不基于旧价出割/守/补结论）。 -->
+            <SectionCard id="position-advice-panel" title="AI 卖出建议">
+              <template #extra>
+                <n-button size="tiny" type="primary" ghost :loading="adviceLoading" @click="runAdvice()">
+                  分析全部持仓
+                </n-button>
+              </template>
+              <n-alert v-if="adviceError" type="error" :bordered="false" title="AI 建议生成失败">
+                {{ adviceError }}
+              </n-alert>
+              <div v-else-if="!advice" class="advice-empty">
+                针对<b>每一笔持仓</b>给出「继续持有 / 减仓 / 清仓」的结论、理由与失效条件。
+                成本、浮动盈亏、持有交易日、自最高点回撤等数值由服务端算好后喂给模型，模型只做判断不做算术；
+                无当前有效行情的持仓不参与（不基于旧价给出割/守/补结论）。
               </div>
-            </n-spin>
-          </SectionCard>
+              <div v-else class="advice-box">
+                <div v-for="(n, i) in advice.notes || []" :key="i" class="advice-note">{{ n }}</div>
+                <div class="advice-list">
+                  <div v-for="a in advice.advices" :key="a.position_id" class="advice-row">
+                    <div class="advice-head">
+                      <n-tag size="small" round :bordered="false" :type="verdictType(a.verdict)">{{
+                        verdictLabel(a.verdict)
+                      }}</n-tag>
+                      <StockIdentity :symbol="a.symbol" market="cn" :name="a.name" density="table" clickable />
+                      <span class="advice-position qv-tnum">
+                        {{ advicePositionType(a.position_type) }} · 成本 {{ a.cost.toFixed(2) }} · {{ a.quantity }} 股
+                      </span>
+                    </div>
+                    <div class="advice-reason">{{ a.reason }}</div>
+                    <div v-if="a.invalidation" class="advice-invalid">失效条件：{{ a.invalidation }}</div>
+                  </div>
+                </div>
+                <div class="advice-foot">
+                  本次分析 {{ advice.analyzed }} 笔<span v-if="advice.skipped > 0">，跳过 {{ advice.skipped }} 笔</span>
+                  <span v-if="advice.evidence_check">
+                    · 证据核验 {{ advice.evidence_check.matched }}/{{ advice.evidence_check.total }} 项与数据一致</span
+                  >
+                  <span v-if="advice.model"> · {{ advice.model }}</span>
+                  <span v-if="adviceGeneratedAt"> · 生成于 {{ adviceGeneratedAt }}</span>
+                  。研究参考，不构成投资建议。
+                </div>
+              </div>
+            </SectionCard>
+
+            <!-- C13 行业 / 风格暴露：回答「我是不是把钱全压在一个赛道上」。
+                 缺数据的维度整块缺席（那是「不知道」不是「均匀」），
+                 缺失部分显式成「未知」桶且恒排最后。 -->
+            <SectionCard v-if="exposureAnyAvailable" title="行业 / 风格暴露">
+              <template #extra>
+                <n-radio-group v-model:value="exposureDimKey" size="small">
+                  <n-radio-button v-for="o in exposureDimOptions" :key="o.value" :value="o.value">
+                    {{ o.label }}
+                  </n-radio-button>
+                </n-radio-group>
+              </template>
+              <template v-if="exposureDim">
+                <div ref="exposureEl" class="exposure-chart"></div>
+                <div class="exposure-meta qv-tnum">
+                  已定价市值 {{ fmtMoney(exposure?.base ?? 0) }} · 本维覆盖
+                  {{ exposureDim.known_pct.toFixed(1) }}%
+                </div>
+                <div v-if="exposureDim.note" class="exposure-note">{{ exposureDim.note }}</div>
+                <div class="exposure-note">{{ exposure?.base_note }}</div>
+              </template>
+              <n-empty v-else :description="exposureEmptyText" />
+            </SectionCard>
+
+            <!-- B7 资产曲线：读每交易日 16:20 落库的快照，不做插值补造 -->
+            <SectionCard title="资产曲线">
+              <template #extra>
+                <div class="filters">
+                  <n-select
+                    v-model:value="curveDays"
+                    :options="curveDayOptions"
+                    size="small"
+                    style="width: 120px"
+                  />
+                  <n-button size="tiny" quaternary :loading="curveLoading" @click="loadCurve">刷新</n-button>
+                </div>
+              </template>
+              <n-spin :show="curveLoading && !curve">
+                <n-alert v-if="curveError" type="error" :bordered="false" title="资产曲线读取失败" class="curve-alert">
+                  {{ curveError }}
+                </n-alert>
+                <div v-show="!!curve?.points.length" ref="curveEl" class="curve-chart"></div>
+                <n-empty
+                  v-if="!curveLoading && !curveError && curve && !curve.points.length"
+                  description="暂无资产快照——曲线自启用之日起按交易日盘后积累，不回溯历史"
+                />
+                <div v-if="curve?.notes?.length" class="curve-notes">
+                  <div v-for="(n, i) in curve.notes" :key="i">{{ n }}</div>
+                </div>
+              </n-spin>
+            </SectionCard>
+          </div>
         </n-tab-pane>
 
         <!-- B6 复盘统计：用户执行口径，与推荐追踪的模型口径不混算 -->
@@ -1998,7 +2000,7 @@ onBeforeUnmount(() => {
           已平仓持仓仅可修改「买入理由」与「备注」，其余成交数据不可再更改。
         </n-alert>
         <template v-if="!editingClosed">
-          <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
+          <n-grid cols="1 s:2" responsive="screen" :x-gap="12" :y-gap="12">
             <n-gi>
               <n-form-item label="股票代码">
                 <n-input v-model:value="form.symbol" placeholder="如 600000" :disabled="editing" />
@@ -2016,7 +2018,7 @@ onBeforeUnmount(() => {
               <n-radio-button value="long_term">长线</n-radio-button>
             </n-radio-group>
           </n-form-item>
-          <n-grid cols="1 s:3" responsive="screen" :x-gap="12">
+          <n-grid cols="1 s:3" responsive="screen" :x-gap="12" :y-gap="12">
             <n-gi>
               <n-form-item label="买入价">
                 <n-input-number v-model:value="form.buy_price" :min="0" :precision="4" style="width: 100%" />
@@ -2033,7 +2035,7 @@ onBeforeUnmount(() => {
               </n-form-item>
             </n-gi>
           </n-grid>
-          <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
+          <n-grid cols="1 s:2" responsive="screen" :x-gap="12" :y-gap="12">
             <n-gi>
               <n-form-item label="买入手续费">
                 <n-input-number v-model:value="form.buy_fee" :min="0" :precision="2" style="width: 100%" />
@@ -2086,7 +2088,7 @@ onBeforeUnmount(() => {
 
         <!-- 风险计划 + 仓位风险计算器（实时纯前端计算） -->
         <template v-if="!editingClosed">
-          <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
+          <n-grid cols="1 s:2" responsive="screen" :x-gap="12" :y-gap="12">
             <n-gi>
               <n-form-item label="计划止损价（可选）">
                 <n-input-number v-model:value="form.plan_stop_loss" :min="0" :precision="4" style="width: 100%" />
@@ -2140,7 +2142,7 @@ onBeforeUnmount(() => {
       style="max-width: 480px"
     >
       <n-form label-placement="top">
-        <n-grid cols="1 s:3" responsive="screen" :x-gap="12">
+        <n-grid cols="1 s:3" responsive="screen" :x-gap="12" :y-gap="12">
           <n-gi>
             <n-form-item label="卖出价">
               <n-input-number
@@ -2170,7 +2172,7 @@ onBeforeUnmount(() => {
         </n-form-item>
 
         <!-- 结构化复盘：固定维度，供跨笔统计与自我校准 -->
-        <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
+        <n-grid cols="1 s:2" responsive="screen" :x-gap="12" :y-gap="12">
           <n-gi>
             <n-form-item label="是否按计划卖出">
               <n-select v-model:value="closeForm.sell_planned" :options="sellPlannedOptions" placeholder="（可选）" clearable />
@@ -2227,7 +2229,7 @@ onBeforeUnmount(() => {
             <n-radio-button value="sell">减仓</n-radio-button>
           </n-radio-group>
         </n-form-item>
-        <n-grid cols="1 s:3" responsive="screen" :x-gap="12">
+        <n-grid cols="1 s:3" responsive="screen" :x-gap="12" :y-gap="12">
           <n-gi>
             <n-form-item label="成交价">
               <n-input-number v-model:value="tradeForm.price" :min="0" :precision="4" style="width: 100%" />
@@ -2244,7 +2246,7 @@ onBeforeUnmount(() => {
             </n-form-item>
           </n-gi>
         </n-grid>
-        <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
+        <n-grid cols="1 s:2" responsive="screen" :x-gap="12" :y-gap="12">
           <n-gi>
             <n-form-item label="手续费">
               <n-input-number v-model:value="tradeForm.fee" :min="0" :precision="2" style="width: 100%" />
@@ -2268,7 +2270,7 @@ onBeforeUnmount(() => {
           <n-form-item label="卖出原因">
             <n-input v-model:value="tradeForm.sell_reason" placeholder="止盈 / 止损 / 逻辑变化…（可选）" maxlength="512" />
           </n-form-item>
-          <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
+          <n-grid cols="1 s:2" responsive="screen" :x-gap="12" :y-gap="12">
             <n-gi>
               <n-form-item label="是否按计划卖出">
                 <n-select v-model:value="tradeForm.sell_planned" :options="sellPlannedOptions" placeholder="（可选）" clearable />
@@ -2313,6 +2315,15 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .pos {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+/* tab 内多个 SectionCard 的纵向节奏：与 .pos 的 gap 同为 16px，
+ * 让「概览 → tab → 卡片」三层看起来是一套间距。
+ * 不用 :deep(.n-tab-pane) 统一处理——「组合风险」tab 里嵌着 PortfolioRisk
+ * 自己的一层 n-tabs，deep 会一并污染它内部 5 个 pane 的布局。 */
+.tab-stack {
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -2531,6 +2542,10 @@ onBeforeUnmount(() => {
   opacity: 0.6;
   line-height: 1.7;
 }
+/* 读取失败时 alert 与图表容器同时在流内（不是互斥分支），需自己留白 */
+.curve-alert {
+  margin-bottom: 10px;
+}
 
 /* ---------- C13 行业 / 风格暴露 ---------- */
 .exposure-chart {
@@ -2593,6 +2608,11 @@ onBeforeUnmount(() => {
   white-space: normal;
   min-width: 120px;
   opacity: 0.75;
+}
+/* 备注文本 + 「补建」标签 + 「撤销折算」按钮同格排列，
+ * 此前只靠标签间 HTML 空白折叠出的一个空格分隔，太挤 */
+.trade-table .t-note > * {
+  margin-left: 5px;
 }
 .trade-tip {
   font-size: 12.5px;

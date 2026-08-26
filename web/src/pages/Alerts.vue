@@ -958,6 +958,8 @@ function metricLabel(name: string) {
   .event .ev-mobile-actions {
     position: static;
     display: flex;
+    /* 「详情」按钮 + 「⋯」下拉两个触点，缺 gap 会贴在一起 */
+    gap: 8px;
     width: 100%;
     justify-content: flex-end;
   }

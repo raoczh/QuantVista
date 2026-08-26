@@ -410,7 +410,7 @@ onMounted(() => {
   <div class="notification-settings">
     <SectionCard title="通知总览" :hoverable="false">
       <n-spin :show="preferenceLoading && !preference">
-        <n-alert v-if="preferenceError" type="warning" title="通知设置需要处理" :bordered="false">
+        <n-alert v-if="preferenceError" type="warning" title="通知设置需要处理" :bordered="false" class="section-alert">
           {{ preferenceError }}
           <div class="recover-row">
             <n-button size="small" :loading="preferenceLoading" @click="loadPreference">重新加载</n-button>
@@ -458,7 +458,7 @@ onMounted(() => {
 
     <SectionCard title="浏览器通知" :hoverable="false">
       <n-spin :show="browserLoading && !browserConfig">
-        <n-alert v-if="browserError" type="warning" title="浏览器通知需要处理" :bordered="false">
+        <n-alert v-if="browserError" type="warning" title="浏览器通知需要处理" :bordered="false" class="section-alert">
           {{ browserError }}
           <div class="recover-row"><n-button size="small" @click="loadBrowserConfig">重新加载</n-button></div>
         </n-alert>
@@ -518,7 +518,7 @@ onMounted(() => {
     </SectionCard>
 
     <SectionCard title="推送通道" :hoverable="false">
-      <n-alert v-if="channelsError" type="warning" title="推送通道需要处理" :bordered="false">
+      <n-alert v-if="channelsError" type="warning" title="推送通道需要处理" :bordered="false" class="section-alert">
         {{ channelsError }}
         <div class="recover-row">
           <n-button size="small" :loading="channelsLoading" @click="loadChannels">重新加载</n-button>
@@ -600,6 +600,18 @@ onMounted(() => {
 }
 .notify-form {
   max-width: 720px;
+}
+/* :show-feedback="false" 把 naive 的 form-item 底部间距压成 0，表单末尾的
+ * 保存按钮/按钮组必须自己拉开与上方表单项的距离，否则贴死。
+ * 子组件根节点会继承本组件的 scope 属性，故 > .n-button 可直接命中。 */
+.notify-form > .n-button,
+.browser-category-form > .n-button,
+.channel-form > .form-actions {
+  margin-top: 14px;
+}
+/* 读取失败提示与下方表单/网格之间统一留白（同 StockTabState 的范式） */
+.section-alert {
+  margin-bottom: 12px;
 }
 .switch-row {
   display: flex;
@@ -742,7 +754,9 @@ onMounted(() => {
   .channel-fields,
   .ntfy-fields {
     grid-template-columns: 1fr;
-    gap: 0;
+    /* 不能收成 0：本表单是 :show-feedback="false"，naive 的 form-item 底部间距
+     * 已被关掉，单列后行间只剩 grid gap，收 0 会让几个输入框上下贴死。 */
+    gap: 12px;
   }
   .channel-row {
     flex-direction: column;

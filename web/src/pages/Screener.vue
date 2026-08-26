@@ -1239,7 +1239,7 @@ async function removeCustom(id: number) {
           <template v-else>正在编辑 v{{ editorLoadedRevision }}；保存不会覆盖该版本。</template>
         </n-alert>
         <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 76">
-          <n-grid cols="1 s:2" responsive="screen" :x-gap="12">
+          <n-grid cols="1 s:2" responsive="screen" :x-gap="12" :y-gap="12">
             <n-gi>
               <n-form-item label="名称" required>
                 <n-input v-model:value="editorForm.name" placeholder="如：温和放量低位股" maxlength="32" />
@@ -1559,6 +1559,8 @@ async function removeCustom(id: number) {
 .sc-foot {
   margin-top: auto;
   display: flex;
+  /* 「一键扫描」+「回测」两个按钮，缺 gap 会贴成一坨 */
+  gap: 8px;
   justify-content: flex-end;
 }
 /* 自定义策略行 */

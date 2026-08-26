@@ -712,7 +712,7 @@ async function doExport(kind: ExportKind) {
           <n-button type="primary" :loading="savingPref" @click="savePref">保存偏好</n-button>
         </n-form>
       </SectionCard>
-      <SectionCard v-if="quota" title="AI 用量" :hoverable="false" style="margin-top: 16px">
+      <SectionCard v-if="quota" title="AI 用量" :hoverable="false">
         <div class="quota">
           <span>已用次数：<b class="qv-tnum">{{ quota.action_used }}</b>（按手动发起的分析/推荐/问答/点评计次）</span>
           <span v-if="quota.action_limit > 0"
@@ -744,7 +744,7 @@ async function doExport(kind: ExportKind) {
           <n-button type="primary" :loading="savingPw" @click="submitChangePassword">修改密码</n-button>
         </n-form>
       </SectionCard>
-      <SectionCard title="GitHub 绑定" :hoverable="false" style="margin-top: 16px">
+      <SectionCard title="GitHub 绑定" :hoverable="false">
         <!-- App 内隐藏绑定/解绑操作：绑定流需要已登录态跨浏览器传递，第一版不做
              （docs/ANDROID_APP_PLAN.md §5.6）。密码登录与 GitHub 登录不受影响。 -->
         <div v-if="isNativeApp" class="gh-bind">
@@ -771,7 +771,7 @@ async function doExport(kind: ExportKind) {
           <span v-if="!auth.githubEnabled" class="gh-hint">（管理员尚未启用 GitHub 登录）</span>
         </div>
       </SectionCard>
-      <SectionCard title="数据导出" :hoverable="false" style="margin-top: 16px">
+      <SectionCard title="数据导出" :hoverable="false">
         <div class="export-row">
           <n-button
             v-for="opt in exportOptions"
@@ -946,6 +946,15 @@ async function doExport(kind: ExportKind) {
 </template>
 
 <style scoped>
+/* 每个 tab 内的卡片纵向节奏。此前「偏好设置」「账号安全」两个 tab 靠逐个卡片挂
+ * inline style="margin-top:16px" 打补丁——漏挂就贴死，也与全站 wrapper+gap 范式不一致。
+ * 本页 n-tabs 是最内层（notifications tab 里的 NotificationSettings 自带 grid gap，
+ * 且不含嵌套 n-tabs），deep 命中范围可控。 */
+:deep(.n-tab-pane) {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
 .gh-bind {
   display: flex;
   align-items: center;

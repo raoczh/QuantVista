@@ -414,6 +414,9 @@ function exportResult() {
 .meta-grid dt { font-size: 11px; opacity: .58; }
 .meta-grid dd { margin: 2px 0 0; overflow-wrap: anywhere; }
 .disclaimer { font-size: 11px; opacity: .58; }
+/* 「完整 AI 观点」折叠区里的复盘备注：此前是个无样式的空 class，
+ * 紧贴下方 .full-grid（后者只有内部 gap，没有外边距）。 */
+.review-note { margin-bottom: 12px; }
 .actions { margin-top: 14px; }
 .diff-highlight { display: grid; grid-template-columns: 100px 1fr auto 1fr; gap: 8px; padding: 8px 0; }
 .return-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }

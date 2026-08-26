@@ -43,7 +43,7 @@ const missingFacts = computed(() => {
       <n-button size="tiny" quaternary :loading="loading" @click="emit('refresh')">刷新状态</n-button>
       <n-button size="tiny" quaternary @click="emit('audit')">查看调用审计</n-button>
     </template>
-    <n-alert v-if="error" type="warning" :bordered="false">{{ error }}，已有页面数据仍保留。</n-alert>
+    <n-alert v-if="error" type="warning" :bordered="false" class="panel-alert">{{ error }}，已有页面数据仍保留。</n-alert>
     <n-spin :show="!!loading">
       <div v-if="!task" class="not-started">
         <n-tag size="small" :bordered="false">未开始</n-tag>
@@ -99,6 +99,10 @@ const missingFacts = computed(() => {
 .task-content {
   display: grid;
   gap: 10px;
+}
+/* 读取失败提示在 .task-content 之外（n-spin 之前），拿不到那条 gap */
+.panel-alert {
+  margin-bottom: 12px;
 }
 .steps {
   display: flex;

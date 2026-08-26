@@ -1824,6 +1824,9 @@ function scoreType(total: number) {
   align-items: center;
   gap: 8px 16px;
   min-height: 24px;
+  /* 分时元信息（日期/累计量/高低/基准线口径）在 K 线容器正上方，
+   * 缺下边距会贴住图表顶边 */
+  margin-bottom: 8px;
   flex-wrap: wrap;
   font-size: 12px;
   opacity: 0.68;
