@@ -565,6 +565,53 @@ func renderPromptTemplate(content string, vars map[string]string) string {
 	})
 }
 
+// splitPromptStableBlocks 把模板原文按空行分块，逐块判定并渲染：不含「会被实际替换的
+// 占位符」的块归稳定段，其余归动态段，两段内部各自保持模板原序。
+// 用途（p21 前缀缓存）：稳定段可以进 system（上游前缀缓存要求逐字节相同），含占位符的
+// 块随本次请求变化，必须留在 user 段，否则 system 变成「每只标的一份」缓存必挂。
+// 整段无有效占位符时直接返回已渲染的整段（stable=rendered、dynamic=""）——绝大多数模板
+// 走这条短路，与拆分前逐字节一致；先按原文分块再渲染，变量值里的空行不影响分块结果。
+// 分块前统一行尾：模板正文按用户提交原样入库（normalizePromptInput 只 TrimSpace 不规范
+// 行尾），CRLF 模板的空行是 "\r\n\r\n"、不含 "\n\n" 子串——不归一会整段分不开，于是
+// 含占位符的模板全量落到动态段，稳定块白白离开 system（不影响正确性，但拆分等于没做）。
+func splitPromptStableBlocks(raw, rendered string, vars map[string]string) (stable, dynamic string) {
+	if !promptBlockSubstituted(raw, vars) {
+		return rendered, ""
+	}
+	var stableBlocks, dynBlocks []string
+	for _, block := range strings.Split(normalizeLineEndings(raw), "\n\n") {
+		if strings.TrimSpace(block) == "" {
+			continue
+		}
+		out := strings.TrimSpace(renderPromptTemplate(block, vars))
+		if promptBlockSubstituted(block, vars) {
+			dynBlocks = append(dynBlocks, out)
+			continue
+		}
+		stableBlocks = append(stableBlocks, out)
+	}
+	return strings.Join(stableBlocks, "\n\n"), strings.Join(dynBlocks, "\n\n")
+}
+
+// normalizeLineEndings 统一 CRLF/CR 为 LF（仅用于分块判定与其产出，不改写入库正文）。
+func normalizeLineEndings(s string) string {
+	if !strings.ContainsRune(s, '\r') {
+		return s
+	}
+	return strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n")
+}
+
+// promptBlockSubstituted 文本内是否含会被 renderPromptTemplate 实际替换的占位符（key 在
+// vars 内）。未知或拼错的占位符原样保留、不随输入变化，不算动态。
+func promptBlockSubstituted(text string, vars map[string]string) bool {
+	for _, m := range promptPlaceholderRe.FindAllStringSubmatch(text, -1) {
+		if _, ok := vars[m[1]]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // promptOverrideFor 兼容读取链（一次独立查询）：取用户自定义模板并做占位符渲染；无自定义
 // 返回 ("", false)。⚠️ P0-6 修复批起，需要「正文与版本同源」的消费点（分析/推荐/日报/问答/
 // 复核的业务链路）必须先 loadPromptRuntime 固化快照，再从同一快照 Render+Version——

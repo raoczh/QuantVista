@@ -52,7 +52,7 @@ func NewAnalysisService(market *MarketService, watchlist *WatchlistService, posi
 
 // 版本号：数据快照 + 这两个版本号共同保证「凭版本号复现」。改 prompt/策略时递增。
 const (
-	analysisPromptVersion   = "p20" // p20: P1-2 交易计划失效条件 invalidators（tradePlanSystem 要求输出计划作废信号，schema trade_plan.v2）+ 结论级 claims 服务端推导（ev5，非 prompt 变化）；p19: 移除输出字段字数/条数限制，保留 JSON schema 与分析语义；p18: 输出瘦身（结构化数组条数/单条字数、panel 共识与分歧字数上限）；p17: 历史解释模式程序化硬约束（enforceStaleModeResult：summary 强制「截至 X 的历史数据解释」前缀、suggestions 剔除当前买卖行动词；panel 模式非 fresh 直接拒绝不接受 allow_stale）；p16: 行情时效 fail-closed——持仓割/守/补三选一仅限有当前有效行情的仓（stale/失败仓禁三选一）、个股 stale 禁当前评级（改历史解释模式或数据不足）、快照逐项 freshness 元数据；p15: 个股快照行情新鲜度元数据（captured_at/quote_as_of/quote_source/bars_as_of/market_state/freshness_status），stale 必须声明行情截至时间、非交易时段按收盘口径；p14: P3b 板块模块 board_valuation（中位 PE/PB+横截面/时序分位+积累天数）与 board_flow（板块主力资金）两段进 sector guidance；p13: P3a 机构观点 org_view 段（评级分布/评级变动/目标价偏离/调研密度）进个股 guidance + trade_plan 机构目标价对照锚；p12: M3c 交易员阶段（个股标准分析追加交易计划二次调用+量化仓位公式，计划价位与仓位数字进核验值域）；p11: M3a 市场模块情绪温度计 mood 段（连板分布/炸板率/昨涨停溢价）；p10: M2 回溯诊断 as_of 模式（截断快照+回溯声明段）；p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁用先验记忆；p3: 反方观点/失效条件/数据盲区
+	analysisPromptVersion   = "p21" // p21: 前缀缓存分工——固定的数据时点/输出收束两段从 user 段前移进 system（指代随位置修正）、自定义模板中含占位符的块留在 user 段（system 不再随标的变化）；p20: P1-2 交易计划失效条件 invalidators（tradePlanSystem 要求输出计划作废信号，schema trade_plan.v2）+ 结论级 claims 服务端推导（ev5，非 prompt 变化）；p19: 移除输出字段字数/条数限制，保留 JSON schema 与分析语义；p18: 输出瘦身（结构化数组条数/单条字数、panel 共识与分歧字数上限）；p17: 历史解释模式程序化硬约束（enforceStaleModeResult：summary 强制「截至 X 的历史数据解释」前缀、suggestions 剔除当前买卖行动词；panel 模式非 fresh 直接拒绝不接受 allow_stale）；p16: 行情时效 fail-closed——持仓割/守/补三选一仅限有当前有效行情的仓（stale/失败仓禁三选一）、个股 stale 禁当前评级（改历史解释模式或数据不足）、快照逐项 freshness 元数据；p15: 个股快照行情新鲜度元数据（captured_at/quote_as_of/quote_source/bars_as_of/market_state/freshness_status），stale 必须声明行情截至时间、非交易时段按收盘口径；p14: P3b 板块模块 board_valuation（中位 PE/PB+横截面/时序分位+积累天数）与 board_flow（板块主力资金）两段进 sector guidance；p13: P3a 机构观点 org_view 段（评级分布/评级变动/目标价偏离/调研密度）进个股 guidance + trade_plan 机构目标价对照锚；p12: M3c 交易员阶段（个股标准分析追加交易计划二次调用+量化仓位公式，计划价位与仓位数字进核验值域）；p11: M3a 市场模块情绪温度计 mood 段（连板分布/炸板率/昨涨停溢价）；p10: M2 回溯诊断 as_of 模式（截断快照+回溯声明段）；p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁用先验记忆；p3: 反方观点/失效条件/数据盲区
 	analysisStrategyVersion = "s1"
 	analysisJobTimeout      = 10 * time.Minute
 	// 兼容包内既有异步测试；实际 stale 口径由 taskProcessingStaleAfter 唯一定义。
@@ -1091,52 +1091,87 @@ func ratingCN(rating string) string {
 // buildMessages 组装系统提示 + 用户消息（含数据快照 JSON）。系统提示按模块定制，且尊重用户自定义模板
 // （modulePrompt 为调用方一次固化的模板快照——与版本归因同源，P0-6 修复批）；
 // panel 模式使用专属多角色系统提示（不套用用户模板——panel 是固定编排）。
+//
+// p21（前缀缓存批）消息分工不变式——**system 段不得含任何随本次请求变化的内容**：
+//
+//	system = 角色总纲 + 模块维度指引（或 panel 编排）+ 输出 schema + 固定的数据时点/输出纪律
+//	user   = 本次对象标题 + 用户关注问题 + 自定义模板的动态段 + 数据快照 + 回溯声明
+//
+// 依据：上游自动 prompt 缓存要求前缀逐字节相同且 ≥1024 token，system 是本模块唯一可能
+// 达到该门槛的稳定前缀（每次的数据快照都不同，注定不可缓存）。固定文本留在 user 段等于
+// 每次全价重付，前移进 system 后随稳定前缀一起被缓存。
 func (s *AnalysisService) buildMessages(modulePrompt promptRuntime, req AnalyzeRequest, actx *analysisContext, snapshotJSON string) []chatMessage {
-	var b strings.Builder
-	fmt.Fprintf(&b, "请对以下【%s】进行分析。\n\n", s.title(req.Module, req.Mode, actx.Label))
-	if q := strings.TrimSpace(req.Question); q != "" {
-		fmt.Fprintf(&b, "用户特别关注的问题（请在分析中优先回应）：%s\n\n", q)
-	}
-	b.WriteString("【数据】（JSON，数值为近似值，价格为货币单位，金额单位为元）：\n")
-	b.WriteString(snapshotJSON)
-	b.WriteString("\n\n数据时间：以快照内 data_as_of 为采集时刻、各字段 data_time/trade_date（如有）为准；" +
-		"非交易时段采集的数据反映最近一个交易日，不代表实时状态，分析措辞须体现这一点。")
-	if req.AsOf != "" {
-		fmt.Fprintf(&b, "\n\n【回溯声明】本次为历史回溯分析，数据截至 %s：快照仅含该日及之前的日线衍生数据，"+
-			"估值/新闻/公告/财务/实时盘面均不可得，不得臆测。严禁使用你训练记忆中该日期之后的任何行情、"+
-			"事件或结果信息，严禁任何「事后视角」表述——请完全以 %s 当天所能看到的信息作判断。", req.AsOf, req.AsOf)
-	}
-	b.WriteString("\n请严格按系统要求的 JSON schema 输出，只依据以上数据分析。")
-
-	sysPrompt := analysisSystemPromptFrom(modulePrompt, req.Module, map[string]string{
+	sysPrompt, customDynamic := analysisSystemPromptParts(modulePrompt, req.Module, map[string]string{
 		"market": normalizeMarketOnly(req.Market),
 		"symbol": strings.TrimSpace(req.Symbol),
 		"target": actx.Label,
 	})
 	if req.Mode == model.AnalysisModePanel {
-		sysPrompt = analysisRoleIntro + "\n\n" + panelGuidance + "\n\n" + panelOutputSpec
+		// panel 是固定编排，不套用用户模板——自然也没有自定义动态段。
+		sysPrompt, customDynamic = analysisRoleIntro+"\n\n"+panelGuidance+"\n\n"+panelOutputSpec, ""
 	}
+	sysPrompt += "\n\n" + analysisFixedTail
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "请对以下【%s】进行分析。\n\n", s.title(req.Module, req.Mode, actx.Label))
+	if q := strings.TrimSpace(req.Question); q != "" {
+		fmt.Fprintf(&b, "用户特别关注的问题（请在分析中优先回应）：%s\n\n", q)
+	}
+	if customDynamic != "" {
+		b.WriteString(analysisCustomDynamicHeader + "\n" + customDynamic + "\n\n")
+	}
+	b.WriteString("【数据】（JSON，数值为近似值，价格为货币单位，金额单位为元）：\n")
+	b.WriteString(snapshotJSON)
+	if req.AsOf != "" {
+		fmt.Fprintf(&b, "\n\n【回溯声明】本次为历史回溯分析，数据截至 %s：快照仅含该日及之前的日线衍生数据，"+
+			"估值/新闻/公告/财务/实时盘面均不可得，不得臆测。严禁使用你训练记忆中该日期之后的任何行情、"+
+			"事件或结果信息，严禁任何「事后视角」表述——请完全以 %s 当天所能看到的信息作判断。", req.AsOf, req.AsOf)
+	}
+
 	return []chatMessage{
 		{Role: "system", Content: sysPrompt},
 		{Role: "user", Content: b.String()},
 	}
 }
 
-// analysisSystemPrompt 按模块拼接系统提示（独立查询一次模板）。业务链路请改用
-// analysisSystemPromptFrom（正文与版本共用同一 loadPromptRuntime 快照）。
+// analysisSystemPrompt 按模块拼接系统提示的稳定段（独立查询一次模板）。
+// ⚠️ p21 起本函数与 analysisSystemPromptFrom 都**不是完整的系统提示**：既不含固定尾段
+// （analysisFixedTail），也丢掉自定义模板中随本次对象变化的块（那部分由 buildMessages
+// 放进 user 段）。两者当前无业务调用方，仅供单测取稳定段——新的业务链路一律走
+// buildMessages / analysisSystemPromptParts，别照这两个函数的返回值发请求。
 func analysisSystemPrompt(userID int64, module string, vars map[string]string) string {
 	return analysisSystemPromptFrom(loadPromptRuntime(userID, module), module, vars)
 }
 
-// analysisSystemPromptFrom 由模板快照拼接系统提示：通用身份 + 模块专属分析维度 + 通用输出/合规约束。
-// 快照命中自定义模板时用其替换默认分析维度指引（占位符宽容渲染）。
+// analysisSystemPromptFrom 同上，消费已固化的模板快照（正文与版本同源）。返回值同样
+// 只是稳定段，完整形态见 analysisSystemPromptParts 的两个返回值 + analysisFixedTail。
 func analysisSystemPromptFrom(pr promptRuntime, module string, vars map[string]string) string {
+	system, _ := analysisSystemPromptParts(pr, module, vars)
+	return system
+}
+
+// analysisSystemPromptParts 拆出「进 system 的稳定段」与「进 user 段的动态段」：
+// 通用身份 + 模块专属分析维度 + 通用输出/合规约束为稳定段；快照命中自定义模板时按空行
+// 分块，含会被实际替换的占位符（{{market}}/{{symbol}}/{{target}}）的块随本次对象变化，
+// 必须留在 user 段——否则 system 变成「每只标的一份」，上游前缀缓存必挂（p21）。
+// 默认 moduleGuidance 与无有效占位符的自定义模板：dynamic 恒空，system 与拆分前逐字节一致。
+func analysisSystemPromptParts(pr promptRuntime, module string, vars map[string]string) (system, dynamic string) {
 	guidance := moduleGuidance[module]
 	if custom, ok := pr.Render(vars); ok {
-		guidance = custom
+		guidance, dynamic = splitPromptStableBlocks(pr.Raw, custom, vars)
 	}
-	return analysisRoleIntro + "\n\n" + guidance + "\n\n" + analysisOutputSpec
+	parts := make([]string, 0, 3)
+	for _, p := range []string{analysisRoleIntro, guidance, analysisOutputSpec} {
+		if strings.TrimSpace(p) != "" {
+			parts = append(parts, p)
+		}
+	}
+	return strings.Join(parts, "\n\n"), dynamic
 }
+
+// analysisCustomDynamicHeader 自定义模板动态段在 user 段的分界头（仅自定义模板用了
+// 占位符时出现；拆分规则见 prompt.go 的 splitPromptStableBlocks）。
+const analysisCustomDynamicHeader = "【自定义分析要求（本次对象相关）】以下与系统提示中的分析维度指引同等生效："
 
 // analysisRoleIntro 通用身份与总纲。
 const analysisRoleIntro = `你是一名严谨的证券研究助理，服务于个人投资研究工具。你的输出仅供研究参考，不构成任何投资建议或买卖指令。
@@ -1223,6 +1258,16 @@ const analysisOutputSpec = `输出要求：
 - unknowns: 字符串数组，数据盲区——本次数据看不到、但对结论重要的信息
 - disclaimer: 字符串，风险与免责提示
 不得重复同一观点或额外增加字段。`
+
+// analysisFixedTail 数据时点纪律 + 输出收束（完全固定的文本，与本次对象/数据/问题无关）。
+// p21：这两段原先拼在 user 消息里（快照之后），每次调用都全价重付；前移到 system 尾部后
+// 随稳定前缀一起被上游缓存。标准与 panel 两种系统提示都追加（panel 原来同样在 user 段拿到）。
+// 措辞只改一处指代：原文「请严格按系统要求的 JSON schema 输出，只依据以上数据分析」的
+// 「以上数据」指 user 段内位于其上方的快照，前移后其上方已无数据，改指「本次提供的【数据】」，
+// 「系统要求的」改「上述」（schema 就在本段上方），语义不变。
+const analysisFixedTail = `数据时间：以快照内 data_as_of 为采集时刻、各字段 data_time/trade_date（如有）为准；非交易时段采集的数据反映最近一个交易日，不代表实时状态，分析措辞须体现这一点。
+
+请严格按上述 JSON schema 输出，只依据本次提供的【数据】分析。`
 
 // panelGuidance 多角色观点（mode=panel，仅个股模块）：一次调用同时输出四个立场角色的独立结论。
 const panelGuidance = `本次任务是【个股多角色观点】：你需要同时扮演四位立场不同的研究员，对同一只个股各自独立给出观点，再总结共识与分歧。可用数据与个股分析相同：实时行情快照、估值与盘面快照 valuation（缺失表示估值数据暂不可得）、技术指标（MA5/MA10/MA20、区间高低、近 5/20 日涨跌幅）、近期日 K 明细，以及 news 舆情段（最近相关新闻标题+情绪标签，标注「暂无直接相关新闻」时按 market_signals 判断）与可能存在的 finance 财务段（F10 最新期指标与近几期趋势）；不含财务全表明细与个股资金流，任何角色都不得虚构这些数据，引用新闻只能复述给出的标题。

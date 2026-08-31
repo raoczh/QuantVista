@@ -93,6 +93,12 @@ type llmRun struct {
 	PromptVersion string // 业务 prompt 版本（p19/d4/q12/sp3/-custom 等，与既有版本号同源）
 	PromptHash    string
 	DataHash      string // 输入数据快照 hash（喂给模型的数据 JSON）
+	// CacheScope prompt_cache_key 的可选细化维度（透传 chatMeta.CacheScope，由
+	// promptCacheKey() 拼到 module:promptVersion 尾部）。只有「多次调用共享同一段稳定
+	// 前缀」的模块才该填——当前仅 QA 填会话标识（同会话多轮 system 逐字节相同）；
+	// analysis/推荐等每次数据快照都不同，稳定前缀只有 system 那段，加维度只会把 key
+	// 打散降低命中率。⚠️ 值随请求发往上游：只允许内部标识，禁止用户可识别信息。
+	CacheScope string
 
 	Attempts       int    // 实际发出的上游请求次数（1 基计数的最大 attempt）
 	FinishState    string // 最后一次请求的规范化终态（normalizeLLMFinishState）
@@ -153,6 +159,7 @@ func (r *llmRun) chatMeta(userID int64, cfg *model.LLMConfig, attempt int) chatM
 		Module: r.Module, Attempt: attempt,
 		SchemaVersion: r.SchemaVersion, PromptVersion: r.PromptVersion,
 		PromptHash: r.PromptHash, DataHash: r.DataHash,
+		CacheScope:        r.CacheScope,
 		StructuredDropped: &r.structuredDropped, // 中央客户端回落时置位，manifest 消费
 		RouteApplied:      &r.routeApplied,      // P2-4 模型路由观测（applyModelRouting 回写）
 		TargetSnapshot:    &r.targetSnapshot,

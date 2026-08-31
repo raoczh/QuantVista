@@ -34,7 +34,24 @@ const (
 	qaHistoryLimit     = 12  // 每次调用最多带入的历史消息条数（控上下文）
 	qaMaxMessages      = 100 // 单会话消息上限
 	qaJobTimeout       = 10 * time.Minute
+	// qaHistoryDropStep Tier1 窗口的分段滑动步长（条）。逐条滑动时每轮都会丢掉最旧的
+	// 一轮 → 消息序列前缀每轮都变 → 上游前缀缓存只能命中到 system 那一段（历史段每轮
+	// 全价重付）。攒够本步长再一次性丢，start 只在整批边界前移：history 每轮 +2 条，
+	// 故每 step/2 轮才有一个断点，其余轮次连历史消息一起命中缓存。
+	// 代价是窗口大小在 [qaHistoryLimit, qaHistoryLimit+step-2] 间浮动（只会比现状多带
+	// 历史，不会更少）。想把命中比从 1/2 提到 3/4 就把这里改成 8（窗口浮动到 18 条，
+	// 长会话上下文相应变长）——同时须递增 qaCtxVersion。
+	qaHistoryDropStep = 4
 )
+
+// qaWindowStart Tier1 窗口起点（分段滑动）：需要丢弃的条数按 qaHistoryDropStep 向下取整，
+// 攒不满一批就先不丢（窗口临时超过 qaHistoryLimit）。n<=limit 时恒 0。
+func qaWindowStart(n int) int {
+	if n <= qaHistoryLimit {
+		return 0
+	}
+	return ((n - qaHistoryLimit) / qaHistoryDropStep) * qaHistoryDropStep
+}
 
 // QaAskRequest 提问入参。ConversationID=0 表示新建会话（需 Symbol/Market，
 // 或给 AnalysisRecordID 复用该分析记录的数据快照——从分析结果一键「继续问答」）。
@@ -329,7 +346,8 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 		common.DB.Model(&model.AiConversation{}).Where("id = ?", conv.ID).Update("trace_id", conv.TraceID)
 	}
 
-	// 组装消息：系统提示（角色 + 数据快照 + P2-3 分层历史段）+ Tier1 历史 + 本轮提问。
+	// 组装消息：system（角色 + 数据快照，会话内稳定）+ Tier1 历史 + 本轮 user 段
+	// （分层历史段/时效重判段/本轮问题——随本轮输入变化的内容全在这里，见 buildMessagesFrom）。
 	history, err := s.loadMessages(userID, conv.ID)
 	if err != nil {
 		return nil, err
@@ -342,6 +360,10 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 		}
 	}
 	run := newLLMRun(conv.TraceID, "", "qa", "qa.free_text.v1", promptVersion)
+	// 前缀缓存分片（P0-6 前缀缓存批）：同一会话多轮的 system 前缀逐字节相同（角色/契约 +
+	// 固定快照），值得固定到同一缓存分片；其他模块每次数据快照都不同，module:promptVersion
+	// 已是正确粒度，不填。⚠️ 该值随请求发往上游，只允许内部标识——不得放用户可识别信息。
+	run.CacheScope = qaCacheScope(conv.ID)
 	run.hashData(conv.DataSnapshot)
 	run.hashPrompt(messages)
 	return &qaAskContext{
@@ -358,6 +380,15 @@ func (s *QaService) abortNewConv(ac *qaAskContext) {
 	if ac.isNew && ac.conv.ID > 0 {
 		common.DB.Delete(&model.AiConversation{}, ac.conv.ID)
 	}
+}
+
+// qaCacheScope 会话级 prompt 缓存分片维度（prompt_cache_key 尾部）。会话 ID 是内部自增
+// 标识，不含用户可识别信息；<=0（未落库）返回空=只到 module:promptVersion 粒度。
+func qaCacheScope(convID int64) string {
+	if convID <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("conv%d", convID)
 }
 
 // finalizeAsk 调用成功后的统一收尾：证据核验 → 事务落库两条消息 → 配额 → 返回会话视图。
@@ -505,10 +536,22 @@ func (s *QaService) buildMessages(conv model.AiConversation, history []model.AiC
 
 // buildMessagesFrom 由模板快照组装消息序列。系统提示含个股数据快照，历史仅取最近若干条。
 // P0-6：module=qa 的自定义模板是 L3 任务段（替换默认角色行，占位符宽容渲染），要求
-// 契约段恒由系统追加不可覆盖；快照注入与时效重判段不变。
+// 契约段恒由系统追加不可覆盖；快照注入不变，时效重判段 q14 起移到本轮 user 段（见下）。
 // P2-3（q13）：被 qaHistoryLimit 裁剪的更早轮次不再静默丢弃——flag 开时注入程序化
-// Tier2 索引/Tier3 按需检索段（qa_context.go），并返回分层快照供落库观测；flag 关时
-// 消息序列与旧版逐字节一致（返回的分层快照仍统计 Tier1，观测不受 flag 控制）。
+// Tier2 索引/Tier3 按需检索段（qa_context.go），并返回分层快照供落库观测。
+//
+// q14（前缀缓存批）消息分工不变式——**system 段不得含任何随本轮输入变化的内容**：
+//
+//	system      = 角色/契约段 + 【个股数据快照】 + 对象行（会话内逐字节稳定，可被上游前缀缓存命中）
+//	中间         = Tier1 窗口内历史消息原样
+//	最后一条 user = [分层历史摘录（随本轮问题检索）] + [时效重判声明（随提问时刻变化）] + 本轮问题
+//
+// 分层段（Tier3 按本轮问题相关性检索）与时效重判段（跨午休/收盘/隔天会变）此前都拼在
+// system 里，等于每轮把整份快照的前缀作废、多轮问答缓存命中率恒为 0；两段都只移动位置、
+// 措辞不变（时效段含「历史数据解释」关键词，属前端识别锚点语义域，禁止改措辞）。
+// 自定义模板的 {{symbol}}/{{name}}/{{market}} 渲染结果留在 system：三者在会话内固定，
+// 且 system 本就含会话专属快照——缓存粒度本来就是「一个会话一份」，无需外移（与
+// analysis 不同：那边 system 无快照，占位符会让 system 变成每股一份）。
 func (s *QaService) buildMessagesFrom(qaPrompt promptRuntime, conv model.AiConversation, history []model.AiConversationMessage, question string) ([]chatMessage, *QaContextLayers) {
 	var sys strings.Builder
 	intro := qaRoleIntro
@@ -520,24 +563,17 @@ func (s *QaService) buildMessagesFrom(qaPrompt promptRuntime, conv model.AiConve
 	sys.WriteString(intro)
 	sys.WriteString("\n\n【个股数据快照】（本次会话固定，供多轮问答复用；JSON，价格为货币单位、金额单位为元）：\n")
 	sys.WriteString(conv.DataSnapshot)
-	// 快照时效按「本轮提问时刻」重判注入（q10）：快照内的 freshness_status 是创建时的
-	// 历史事实，续问跨午休/收盘/隔天后必须以当前重判为准声明——否则昨天 fresh 的会话
-	// 今天仍向模型声明 fresh。
-	if st, note := s.qaCurrentFreshness(conv.Market, parseSnapshotMeta(conv.DataSnapshot, conv.CreatedAt)); st != "" && st != freshStatusFresh {
-		sys.WriteString("\n\n【行情时效（按本轮提问时刻重新核验，优先级高于快照内 freshness_status）】" + note +
-			"。本轮回答涉及价格/涨跌/盘面必须先声明「行情截至 " + orStr(quoteAsOfOf(conv), "快照采集时刻") +
-			"」，一律按历史数据解释口径表述，严禁以「当前/现在/实时」口径描述该快照行情，严禁给出基于当前盘面的买入/卖出/加减仓行动参考。")
-	}
+	sys.WriteString("\n\n对象：" + conv.Name + "（" + conv.Symbol + "）。请只依据以上数据回答，缺失的数据如实说明。")
 
-	// 历史窗口切分：Tier1=最近 qaHistoryLimit 条全文（消息流位置与旧版一致）。
-	start := 0
-	if len(history) > qaHistoryLimit {
-		start = len(history) - qaHistoryLimit
-	}
+	// 历史窗口切分：Tier1=最近 qaHistoryLimit 条全文，按 qaHistoryDropStep 分段滑动。
+	start := qaWindowStart(len(history))
 	older, recent := history[:start], history[start:]
 	layered := buildQaLayeredContext(older, recent, question)
+
+	// 本轮 user 消息：随本轮输入变化的三段全部集中在这里（前缀缓存的作废点后移到末尾）。
+	var turn strings.Builder
 	if setting.LLMLayeredContext() && layered.Segment != "" {
-		sys.WriteString("\n\n" + layered.Segment)
+		turn.WriteString(layered.Segment + "\n\n")
 	} else if layered.Layers != nil && !setting.LLMLayeredContext() {
 		// flag 关：回退旧的静默截断——分层段清零如实反映「未注入」（观测照落）。
 		l := layered.Layers
@@ -545,13 +581,28 @@ func (s *QaService) buildMessagesFrom(qaPrompt promptRuntime, conv model.AiConve
 		l.Tier2Rounds, l.Tier2Chars, l.Tier3Rounds, l.Tier3Chars, l.Tier3Matched = 0, 0, 0, 0, nil
 		l.Tier2DroppedRounds = l.InvisibleRounds
 	}
-	sys.WriteString("\n\n对象：" + conv.Name + "（" + conv.Symbol + "）。请只依据以上数据回答，缺失的数据如实说明。")
+	// 快照时效按「本轮提问时刻」重判注入（q10）：快照内的 freshness_status 是创建时的
+	// 历史事实，续问跨午休/收盘/隔天后必须以当前重判为准声明——否则昨天 fresh 的会话
+	// 今天仍向模型声明 fresh。q14 起位于本轮 user 段（原在 system）：位置更靠后、
+	// 「优先级高于快照内 freshness_status」的语义因此更强，措辞逐字不变。
+	if st, note := s.qaCurrentFreshness(conv.Market, parseSnapshotMeta(conv.DataSnapshot, conv.CreatedAt)); st != "" && st != freshStatusFresh {
+		turn.WriteString("【行情时效（按本轮提问时刻重新核验，优先级高于快照内 freshness_status）】" + note +
+			"。本轮回答涉及价格/涨跌/盘面必须先声明「行情截至 " + orStr(quoteAsOfOf(conv), "快照采集时刻") +
+			"」，一律按历史数据解释口径表述，严禁以「当前/现在/实时」口径描述该快照行情，严禁给出基于当前盘面的买入/卖出/加减仓行动参考。\n\n")
+	}
+	// 无前置段时本轮 user 消息 = 纯问题（与 q13 逐字节一致）；有前置段才加标题分界，
+	// 否则模型无从分辨哪段是本轮真正要回答的问题。
+	if turn.Len() > 0 {
+		turn.WriteString("【本轮问题】" + question)
+	} else {
+		turn.WriteString(question)
+	}
 
 	msgs := []chatMessage{{Role: "system", Content: sys.String()}}
 	for _, m := range recent {
 		msgs = append(msgs, chatMessage{Role: m.Role, Content: m.Content})
 	}
-	msgs = append(msgs, chatMessage{Role: "user", Content: question})
+	msgs = append(msgs, chatMessage{Role: "user", Content: turn.String()})
 	if layered.Layers != nil {
 		layered.Layers.ApproxTokens = qaApproxTokens(msgs)
 	}
@@ -567,10 +618,12 @@ func quoteAsOfOf(conv model.AiConversation) string {
 }
 
 // qaPromptVersion 问答系统提示版本（会话不落库版本列，仅供代码内追溯）。
-// q13: P2-3 多层上下文——被 qaHistoryLimit 裁剪的更早轮次注入程序化「历史会话分层
+// q14: 前缀缓存分工重排——system 只留角色/契约+固定快照+对象行（会话内逐字节稳定），
+// 分层历史摘录段与时效重判段移到本轮 user 消息（措辞逐字未改，仅位置），有前置段时本轮
+// 问题加【本轮问题】分界头；prompt_cache_key 追加会话级 scope。q13: P2-3 多层上下文——被 qaHistoryLimit 裁剪的更早轮次注入程序化「历史会话分层
 // 上下文」段（Tier2 截断索引 + Tier3 按本轮问题相关性检索的原文摘录），flag
 // llm_layered_context 关闭回退 q12 的静默截断；q12: 移除回答正文 800 汉字限制；q11: 回答正文长度纪律；q10: 首答新鲜度门（全源无 fresh 默认拒绝、allow_stale 才生成且快照打 stale_mode）+ 快照时效按每轮提问时刻重判注入（旧会话跨天不再向模型声明 fresh）；q9: 快照新鲜度元数据（captured_at/quote_as_of/bars_as_of/quote_source/freshness_status/market_state），stale 时必须声明行情截至时间、非交易时段按收盘口径表述；q8: P3a org_view 机构观点段进快照说明（卖方乐观偏差纪律）；q7: F2 finance 财务段（F10 最新期主要指标与近几期趋势）进快照说明；q6: risk_gate 风险闸门段、允许轻量 Markdown（流式渲染配套）；q5: announcements 公告段；q4: news 舆情段；q3: 回答引用的数字会被程序化核验，威慑幻觉；q2: 快照含五维量化评分锚点、要求引用数值、禁用先验记忆。
-const qaPromptVersion = "q13"
+const qaPromptVersion = "q14"
 
 // qaRoleTaskSeg 问答角色任务段（L3）：module=qa 自定义模板替换的部分——角色定位与
 // 回答风格。P0-6 起自定义不再整段替换，要求契约段恒由系统追加。

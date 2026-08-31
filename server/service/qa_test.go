@@ -8,7 +8,8 @@ import (
 	"quantvista/model"
 )
 
-// TestQaBuildMessages 系统消息含快照，历史仅带最近 qaHistoryLimit 条，末尾为本轮提问。
+// TestQaBuildMessages 系统消息含快照，历史仅带 Tier1 窗口内的最近若干条（分段滑动），
+// 末尾为本轮提问。
 func TestQaBuildMessages(t *testing.T) {
 	svc := &QaService{}
 	conv := model.AiConversation{Symbol: "600000", Name: "浦发银行", DataSnapshot: `{"symbol":"600000","quote":{"price":10}}`}
@@ -30,12 +31,15 @@ func TestQaBuildMessages(t *testing.T) {
 	if !strings.Contains(msgs[0].Content, "600000") || !strings.Contains(msgs[0].Content, "个股数据快照") {
 		t.Fatalf("系统消息应含快照与说明")
 	}
-	// 1 system + qaHistoryLimit 历史 + 1 本轮提问。
-	if len(msgs) != 1+qaHistoryLimit+1 {
-		t.Fatalf("消息数应为 %d，得到 %d", 1+qaHistoryLimit+1, len(msgs))
+	// 1 system + Tier1 窗口内历史（分段滑动，可能比 qaHistoryLimit 多带几条）+ 1 本轮提问。
+	wantMsgs := 1 + (len(history) - qaWindowStart(len(history))) + 1
+	if len(msgs) != wantMsgs {
+		t.Fatalf("消息数应为 %d，得到 %d", wantMsgs, len(msgs))
 	}
-	if msgs[len(msgs)-1].Role != "user" || msgs[len(msgs)-1].Content != "现在的均线怎么样？" {
-		t.Fatalf("末条应为本轮用户提问")
+	// q14：本轮问题恒为最后一条 user 消息的结尾（前面可能有分层历史/时效重判段）。
+	last := msgs[len(msgs)-1]
+	if last.Role != "user" || !strings.HasSuffix(last.Content, "现在的均线怎么样？") {
+		t.Fatalf("末条应为本轮用户提问: %q", last.Content)
 	}
 }
 

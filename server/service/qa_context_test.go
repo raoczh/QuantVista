@@ -135,9 +135,10 @@ func TestQaLayeredContextBudgetDrop(t *testing.T) {
 	}
 }
 
-// TestQaBuildMessagesLayeredFlagOff flag 关=回退旧静默截断：system 不含分层段且与
-// flag 开时「去掉分层段后的 system」逐字节一致；消息条数/顺序不变；分层快照仍产出
+// TestQaBuildMessagesLayeredFlagOff flag 关=回退旧静默截断：本轮 user 段不含分层段且
+// 与 flag 开时「去掉分层段后的本轮问题」逐字节一致；消息条数/顺序不变；分层快照仍产出
 // （观测不受 flag 控）且如实反映「未注入」。
+// q14 追加锁定：分层段（随本轮问题检索）恒不得进 system——它是会话内稳定的缓存前缀。
 func TestQaBuildMessagesLayeredFlagOff(t *testing.T) {
 	setLayeredContextFlag(t, true)
 	conv := model.AiConversation{UserID: 1, Symbol: "600000", Market: "cn", Name: "浦发银行",
@@ -156,31 +157,38 @@ func TestQaBuildMessagesLayeredFlagOff(t *testing.T) {
 		t.Fatalf("flag 开应有 Tier2 索引: %+v", layersOn)
 	}
 	sysOn := msgsOn[0].Content
-	if !strings.Contains(sysOn, "【历史会话分层上下文】") {
-		t.Fatalf("flag 开 system 应含分层段")
+	if strings.Contains(sysOn, "【历史会话分层上下文】") {
+		t.Fatalf("q14：分层段随本轮问题变化，不得写进 system")
+	}
+	turnOn := msgsOn[len(msgsOn)-1].Content
+	if !strings.Contains(turnOn, "【历史会话分层上下文】") || !strings.HasSuffix(turnOn, "【本轮问题】新问题") {
+		t.Fatalf("flag 开本轮 user 段应为分层段+本轮问题: %q", turnOn)
 	}
 
 	if err := setting.SetLLMLayeredContext(false); err != nil {
 		t.Fatalf("关 flag 失败: %v", err)
 	}
 	msgsOff, layersOff := svc.buildMessagesFrom(pr, conv, history, "新问题")
-	sysOff := msgsOff[0].Content
-	if strings.Contains(sysOff, "【历史会话分层上下文】") {
-		t.Fatalf("flag 关 system 不得含分层段")
+	sysOff, turnOff := msgsOff[0].Content, msgsOff[len(msgsOff)-1].Content
+	if sysOff != sysOn {
+		t.Fatalf("system 不含随输入变化的内容，不应受 flag 影响")
 	}
-	// 逐字节等价锁定：sysOn 去掉分层段（\n\n+segment）后 == sysOff。
-	start := strings.Index(sysOn, "\n\n【历史会话分层上下文】")
-	end := strings.Index(sysOn, "\n\n对象：")
-	if start < 0 || end <= start {
-		t.Fatalf("分层段定位失败")
+	if strings.Contains(turnOff, "【历史会话分层上下文】") {
+		t.Fatalf("flag 关不得含分层段: %q", turnOff)
 	}
-	if sysOn[:start]+sysOn[end:] != sysOff {
-		t.Fatalf("flag 关的 system 应与旧版逐字节一致")
+	// 逐字节等价锁定：flag 关时本轮 user 段就是纯问题（与 q13 一致）；flag 开时
+	// 去掉分层段与分界头后与之相同。
+	if turnOff != "新问题" {
+		t.Fatalf("flag 关本轮 user 段应为纯问题: %q", turnOff)
+	}
+	if i := strings.LastIndex(turnOn, "【本轮问题】"); i < 0 ||
+		turnOn[i+len("【本轮问题】"):] != turnOff {
+		t.Fatalf("flag 开去掉前置段后应与 flag 关一致: %q", turnOn)
 	}
 	if len(msgsOn) != len(msgsOff) || len(msgsOff) != 1+qaHistoryLimit+1 {
 		t.Fatalf("消息条数不符: on=%d off=%d", len(msgsOn), len(msgsOff))
 	}
-	for i := 1; i < len(msgsOff); i++ {
+	for i := 1; i < len(msgsOff)-1; i++ {
 		if msgsOff[i] != msgsOn[i] {
 			t.Fatalf("历史窗口消息应一致: idx=%d", i)
 		}

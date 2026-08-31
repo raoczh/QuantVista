@@ -38,8 +38,9 @@ type chatMeta struct {
 	PromptHash    string
 	DataHash      string
 	// CacheScope prompt_cache_key 的可选细化维度（会话/标的等）。空=key 只到
-	// module:promptVersion 粒度；非空时由 promptCacheKey() 拼到尾部。当前无调用点填充，
-	// 预留给 QA/analysis 的 prompt 分层改造（避免二次改签名）。不进业务 prompt。
+	// module:promptVersion 粒度；非空时由 promptCacheKey() 拼到尾部。当前仅 QA 填充
+	// （会话标识，llmRun.CacheScope 透传）——同会话多轮 system 前缀逐字节相同。
+	// 不进业务 prompt；⚠️ 会随请求发往上游，禁止放用户可识别信息。
 	CacheScope string
 	// StructuredDropped run 级结构化回落观测（P0-2 修复批）：JSON mode 在本 run 任一
 	// attempt 因端点不支持回落 free_text 时，中央客户端经 markJSONModeDropped 置位——

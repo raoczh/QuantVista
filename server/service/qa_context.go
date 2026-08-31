@@ -11,7 +11,8 @@ import (
 //
 // 现状问题：QA 每轮只带最近 qaHistoryLimit 条历史，更早轮次被静默丢弃——模型不知道
 // 有更早讨论，用户也不知道模型没看到（不可见截断）。本文件把截断升级为程序化三层：
-//   - Tier1 当前层：最近 qaHistoryLimit 条历史全文（消息流位置与截断行为不变）；
+//   - Tier1 当前层：最近 qaHistoryLimit 条历史全文（qc2 起按 qaHistoryDropStep 分段滑动——
+//     攒够一批再一次性丢，保住上游前缀缓存；见 qa.go 的 qaWindowStart）；
 //   - Tier2 经验层：被裁剪轮次的程序化索引（每轮一行「Q 要点/A 要点」，预算内从近到远）；
 //   - Tier3 按需层：本轮问题与被裁剪轮次做相关性匹配（rune bigram 重合），命中的旧轮
 //     注入更完整摘录——「按需历史」不靠模型自取，由程序按当前问题检索。
@@ -27,7 +28,9 @@ import (
 
 const (
 	// qaCtxVersion 分层上下文结构版本（改分层规则/预算/匹配算法须递增）。
-	qaCtxVersion = "qc1"
+	// qc2: Tier1 窗口改分段滑动（qaHistoryDropStep）——Tier1/Tier2 边界不再每轮前移，
+	// 窗口大小在 [qaHistoryLimit, qaHistoryLimit+step-2] 间浮动；qc1: 初版三层。
+	qaCtxVersion = "qc2"
 	// qaTier2CharBudget Tier2 索引层总字符预算（rune 数）；超出从最早轮开始丢弃并计数。
 	qaTier2CharBudget = 1200
 	// qaTier2QMax / qaTier2AMax 单轮索引行内 Q/A 摘录上限（rune）。
