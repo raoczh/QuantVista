@@ -24,6 +24,7 @@ type llmCallTarget struct {
 	JSONMode               bool
 	TemperatureOmitted     bool
 	ReasoningEffortOmitted bool
+	PromptCacheKeyOmitted  bool
 	MaxCompletionTokens    bool
 	AllowPrivate           bool
 	ConfigID               int64

@@ -56,6 +56,10 @@ const (
 	// 等价的 max_completion_tokens，而不是省略输出预算。target 含 endpoint，Responses
 	// 的 max_output_tokens 不复用这项回落。
 	capMaxTokens llmCapability = "max_tokens"
+	// capPromptCacheKey prompt_cache_key 参数（缓存亲和提示）。unsupported = 该目标做严格
+	// 字段校验、不认这个非必需参数（国产上游常见形态：中文「未知请求字段」4xx），去参即可
+	// 无害降级——只是失去缓存亲和，正文语义完全不受影响。
+	capPromptCacheKey llmCapability = "prompt_cache_key"
 	// capEndpointChat / capEndpointResponses 端点可用性（smoke 观察；业务不自动改写
 	// 用户显式选择的端点类型，仅作可观察声明）。
 	capEndpointChat      llmCapability = "endpoint_chat_completions"
@@ -70,6 +74,7 @@ type llmModelCapabilities struct {
 	Temperature     llmCapState
 	ReasoningEffort llmCapState
 	MaxTokens       llmCapState
+	PromptCacheKey  llmCapState
 	Endpoint        llmCapState // 本次调用所选端点的可用性
 }
 
@@ -78,15 +83,19 @@ type llmModelCapabilities struct {
 // 结构化支持情况不可静态断言，json_object 记 unknown 由运行时观察补齐。
 // ReasoningEffort 一律 unknown（含 openai）：同一 provider 下推理模型接受该参数、非推理
 // 模型直接拒绝，且各代际取值集合不同——只能按 (配置,模型,端点) 目标逐个观察，不可按 provider 断言。
+// PromptCacheKey 是 provider 级的字段校验行为（与模型无关），openai 官方支持故记 supported；
+// 任意兼容中转是否放行这个非必需字段不可静态断言，记 unknown 由观察补齐。
 var builtinProviderCapabilities = map[string]llmModelCapabilities{
 	"openai": {JSONObject: capSupported, FreeText: capSupported, Temperature: capSupported,
-		ReasoningEffort: capUnknown, MaxTokens: capSupported, Endpoint: capSupported},
+		ReasoningEffort: capUnknown, MaxTokens: capSupported, PromptCacheKey: capSupported,
+		Endpoint: capSupported},
 }
 
 // defaultProviderCapabilities 未登记 provider 的缺省声明。
 var defaultProviderCapabilities = llmModelCapabilities{
 	JSONObject: capUnknown, FreeText: capSupported, Temperature: capSupported,
-	ReasoningEffort: capUnknown, MaxTokens: capSupported, Endpoint: capUnknown,
+	ReasoningEffort: capUnknown, MaxTokens: capSupported, PromptCacheKey: capUnknown,
+	Endpoint: capUnknown,
 }
 
 // llmCapObservationTTL 运行时观察的有效期：期内声明化路由生效，到期恢复 unknown
@@ -161,8 +170,8 @@ func resetLLMCapabilityStore() {
 
 // capabilitiesFor 合并「内置 provider 声明 + 运行时观察」输出能力快照：观察优先于声明
 // （观察来自该目标的真实响应，比按 provider 名的静态假设可信）。json_object 之外，
-// temperature/max_tokens 参数能力同样由观察覆盖（P0-5 修复批）。其中 max_tokens 的
-// unsupported 在 Chat 端表示改用 max_completion_tokens，模块预算始终保留。
+// temperature/reasoning_effort/max_tokens/prompt_cache_key 参数能力同样由观察覆盖。
+// 其中 max_tokens 的 unsupported 在 Chat 端表示改用 max_completion_tokens，模块预算始终保留。
 func capabilitiesFor(provider string, target string) llmModelCapabilities {
 	caps, ok := builtinProviderCapabilities[strings.ToLower(strings.TrimSpace(provider))]
 	if !ok {
@@ -180,6 +189,9 @@ func capabilitiesFor(provider string, target string) llmModelCapabilities {
 	if obs, ok := lookupLLMCapability(target, capMaxTokens); ok {
 		caps.MaxTokens = obs.State
 	}
+	if obs, ok := lookupLLMCapability(target, capPromptCacheKey); ok {
+		caps.PromptCacheKey = obs.State
+	}
 	return caps
 }
 
@@ -188,6 +200,8 @@ func capabilitiesFor(provider string, target string) llmModelCapabilities {
 //     ——省掉一次注定失败的请求与隐式回落，审计 structured_method 如实记 free_text；
 //   - temperature 已声明不支持时省略；Chat 的 max_tokens 已知被拒时改用
 //     max_completion_tokens。Responses 的 max_output_tokens 没有等价替代，不做省略回落。
+//   - reasoning_effort / prompt_cache_key 已声明不支持时省略（都是无害降级：分别回到网关
+//     默认档位与无缓存亲和）。
 //
 // 必须在 effectiveJSONMode 观测指针初始化之后调用；flag 关闭时原样返回（保留旧隐式回落路径）。
 func applyCapabilityRouting(p chatParams) chatParams {
@@ -206,6 +220,11 @@ func applyCapabilityRouting(p chatParams) chatParams {
 	// 失败的请求。观察带 TTL，到期恢复 unknown 重新乐观尝试——上游换模型/升级后能自动恢复。
 	if p.sendsReasoningEffort() && caps.ReasoningEffort == capUnsupported {
 		p.markReasoningEffortOmitted()
+	}
+	// 缓存亲和 key：同款语义。已观察到该目标做严格字段校验（拒 prompt_cache_key）时直接
+	// 不发，省掉一次注定 400 的请求——这是本参数最贵的成本，因为它命中在**每一次**调用上。
+	if p.sendsPromptCacheKey() && caps.PromptCacheKey == capUnsupported {
+		p.markPromptCacheKeyOmitted()
 	}
 	if p.MaxTokens > 0 && !p.isResponsesEndpoint() && caps.MaxTokens == capUnsupported {
 		p.markMaxCompletionTokens()
@@ -236,4 +255,11 @@ func (p chatParams) observeMaxTokensUnsupported(reason string) {
 // 只在去参重试成功后调用：4xx 文案里的字样只是猜测，重试成功才证明失败确实源于该参数。
 func (p chatParams) observeReasoningEffortUnsupported(reason string) {
 	observeLLMCapability(capabilityTargetOf(p), capReasoningEffort, capUnsupported, reason)
+}
+
+// observePromptCacheKeyUnsupported 缓存亲和参数能力观察提交（去参重试成功后调用）。
+// 同款纪律：4xx 文案里的字样只是猜测，重试成功才证明失败确实源于该参数——否则一次误判
+// 会让该目标 12h 内都不发 prompt_cache_key（无害但白丢缓存亲和）。
+func (p chatParams) observePromptCacheKeyUnsupported(reason string) {
+	observeLLMCapability(capabilityTargetOf(p), capPromptCacheKey, capUnsupported, reason)
 }

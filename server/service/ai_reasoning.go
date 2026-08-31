@@ -151,23 +151,43 @@ func requiresMaxCompletionTokens(modelName string) bool {
 		strings.HasPrefix(name, "o3") || strings.HasPrefix(name, "o4")
 }
 
+// promptCacheKey 本次调用的缓存亲和 key（OpenAI 语义：相同 key 的请求尽量落到同一缓存
+// 分片/后端）。全部业务模块都发——各模块的 system prompt 在同一 promptVersion 内是稳定
+// 前缀，key 发全了在支持该约定的网关上才有命中率可谈；不支持该字段的渠道由四处降级点
+// 无害去参（capPromptCacheKey 观察写入后由声明化路由直接省略）。
+//
+// 两条排除：module=test 是 llm.go 的连接测试探针（不注入任何业务语义，探针请求不该参与
+// 业务缓存分片）；空 module 是未接线路径，无可归因的缓存维度。
+// PromptVersion 为空（自定义 prompt/未登记版本）时不放弃发送，降级用 module 单独做 key
+// ——粗粒度亲和仍优于完全没有。Meta.CacheScope 非空时拼到尾部细化（会话/标的维度）。
 func (p chatParams) promptCacheKey() string {
-	if (p.Meta.Module != "recommendation" && p.Meta.Module != "analysis") ||
-		strings.TrimSpace(p.Meta.PromptVersion) == "" {
+	module := strings.TrimSpace(p.Meta.Module)
+	if module == "" || module == "test" {
 		return ""
 	}
-	return p.Meta.Module + ":" + strings.TrimSpace(p.Meta.PromptVersion)
+	key := module
+	if version := strings.TrimSpace(p.Meta.PromptVersion); version != "" {
+		key += ":" + version
+	}
+	if scope := strings.TrimSpace(p.Meta.CacheScope); scope != "" {
+		key += ":" + scope
+	}
+	return key
 }
 
-// addPromptCacheField system prompt 稳定的模块携带 prompt_cache_key（OpenAI 兼容缓存
-// 亲和提示；上游 4xx 拒绝该参数时由调用路径回落重试并去掉）。
-func (p chatParams) addPromptCacheField(payload map[string]any, include bool) {
-	if !include {
+// sendsPromptCacheKey 本次请求是否应携带 prompt_cache_key：有可用 key 且未被省略
+// （声明化路由或运行时 fallback 判定上游不接受该参数）。与 sendsReasoningEffort 同款语义。
+func (p chatParams) sendsPromptCacheKey() bool {
+	return !p.promptCacheKeyOmitted() && p.promptCacheKey() != ""
+}
+
+// addPromptCacheField 按 params 级省略状态写入 prompt_cache_key（上游 4xx 拒绝该参数时
+// 由四处降级点 markPromptCacheKeyOmitted 置位，本函数随之不再写入）。
+func (p chatParams) addPromptCacheField(payload map[string]any) {
+	if !p.sendsPromptCacheKey() {
 		return
 	}
-	if key := p.promptCacheKey(); key != "" {
-		payload["prompt_cache_key"] = key
-	}
+	payload["prompt_cache_key"] = p.promptCacheKey()
 }
 
 func joinReasoningContent(parts ...string) string {

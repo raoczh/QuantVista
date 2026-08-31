@@ -37,6 +37,10 @@ type chatMeta struct {
 	PromptVersion string
 	PromptHash    string
 	DataHash      string
+	// CacheScope prompt_cache_key 的可选细化维度（会话/标的等）。空=key 只到
+	// module:promptVersion 粒度；非空时由 promptCacheKey() 拼到尾部。当前无调用点填充，
+	// 预留给 QA/analysis 的 prompt 分层改造（避免二次改签名）。不进业务 prompt。
+	CacheScope string
 	// StructuredDropped run 级结构化回落观测（P0-2 修复批）：JSON mode 在本 run 任一
 	// attempt 因端点不支持回落 free_text 时，中央客户端经 markJSONModeDropped 置位——
 	// 业务 manifest 据此记录「最终实际生效」的 structured_method，而非入口意图。

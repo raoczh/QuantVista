@@ -159,8 +159,11 @@ type chatParams struct {
 	// 切换到等价的 max_completion_tokens，始终保留模块输出预算。
 	// omitReasoningEffort 同款语义：上游拒绝 reasoning_effort 参数本身或拒绝所配档位
 	// 时置位，去参后回到网关默认档位（无害降级）。
+	// omitPromptCacheKey 同款语义：上游做严格字段校验、不认 prompt_cache_key 时置位，
+	// 去参后失去缓存亲和但正文语义不变（无害降级）。
 	omitTemperature     *bool
 	omitReasoningEffort *bool
+	omitPromptCacheKey  *bool
 	maxCompletionTokens *bool
 	// finalRequestBody 最终实际发送的请求体 JSON（审计观测）：每次真正发出 HTTP 请求前
 	// 由各路径写入（fallback 重试覆盖为最终形态），writeLLMCallLog 落 RequestBody——
@@ -211,6 +214,23 @@ func (p chatParams) markReasoningEffortOmitted() {
 
 func (p chatParams) reasoningEffortOmitted() bool {
 	return p.omitReasoningEffort != nil && *p.omitReasoningEffort
+}
+
+// markPromptCacheKeyOmitted / promptCacheKeyOmitted 缓存亲和参数省略观测（nil 安全）。
+// 与 temperature/思考档位同款：置位后本次请求不再携带 prompt_cache_key，审计快照如实
+// 记录最终形态。sendsPromptCacheKey/addPromptCacheField 在 ai_reasoning.go 消费本状态
+// ——降级只有这一套状态，不存在与之并行的局部开关。
+func (p chatParams) markPromptCacheKeyOmitted() {
+	if p.omitPromptCacheKey != nil {
+		*p.omitPromptCacheKey = true
+	}
+	if p.Meta.TargetSnapshot != nil {
+		p.Meta.TargetSnapshot.PromptCacheKeyOmitted = true
+	}
+}
+
+func (p chatParams) promptCacheKeyOmitted() bool {
+	return p.omitPromptCacheKey != nil && *p.omitPromptCacheKey
 }
 
 // sendsReasoningEffort 本次请求是否应携带思考档位参数：用户配了值且未被省略。
@@ -372,6 +392,9 @@ func prepareChatCompletionForAcceptedTarget(p chatParams, target llmCallTarget) 
 	if target.ReasoningEffortOmitted {
 		p.markReasoningEffortOmitted()
 	}
+	if target.PromptCacheKeyOmitted {
+		p.markPromptCacheKeyOmitted()
+	}
 	if target.MaxCompletionTokens {
 		p.markMaxCompletionTokens()
 	}
@@ -388,8 +411,9 @@ func (p chatParams) snapshotPreparedTarget() {
 		Temperature: p.Temperature, MaxTokens: p.MaxTokens, ReasoningEffort: p.ReasoningEffort,
 		AccuracyContract: p.accuracyContractEnabled(), JSONMode: p.JSONMode,
 		TemperatureOmitted: p.temperatureOmitted(), ReasoningEffortOmitted: p.reasoningEffortOmitted(),
-		MaxCompletionTokens: p.usesMaxCompletionTokens(),
-		AllowPrivate:        p.AllowPrivate, ConfigID: p.Meta.ConfigID, Provider: p.Meta.Provider,
+		PromptCacheKeyOmitted: p.promptCacheKeyOmitted(),
+		MaxCompletionTokens:   p.usesMaxCompletionTokens(),
+		AllowPrivate:          p.AllowPrivate, ConfigID: p.Meta.ConfigID, Provider: p.Meta.Provider,
 	}
 }
 
@@ -404,13 +428,13 @@ func chatCompletionPrepared(ctx context.Context, p chatParams) (res *chatResult,
 }
 
 // initCallObservers 公开出口初始化本次调用的观测指针（structured/temperature/思考档位/
-// token 参数的实际生效形态 + 最终请求体），供内部 fallback 点回写、审计层读取。
+// 缓存亲和/token 参数的实际生效形态 + 最终请求体），供内部 fallback 点回写、审计层读取。
 func initCallObservers(p chatParams) chatParams {
 	effJSON := p.JSONMode
 	p.effectiveJSONMode = &effJSON
-	omitTemp, useMaxCompletion, omitEffort := false, false, false
+	omitTemp, useMaxCompletion, omitEffort, omitCacheKey := false, false, false, false
 	p.omitTemperature, p.maxCompletionTokens = &omitTemp, &useMaxCompletion
-	p.omitReasoningEffort = &omitEffort
+	p.omitReasoningEffort, p.omitPromptCacheKey = &omitEffort, &omitCacheKey
 	finalBody := ""
 	p.finalRequestBody = &finalBody
 	return p
@@ -456,8 +480,7 @@ func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error)
 		return nil, errors.New("Base URL 非法（仅支持 http/https）")
 	}
 
-	cacheOn := p.promptCacheKey() != ""
-	res, status, raw, latency, err := doChat(ctx, p, p.JSONMode, cacheOn)
+	res, status, raw, latency, err := doChat(ctx, p, p.JSONMode)
 	if err != nil {
 		if res != nil {
 			res.Usage = usageOrEstimate(p.Messages, res.Content, res.Usage)
@@ -465,10 +488,10 @@ func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error)
 		}
 		return res, err
 	}
-	// 参数兼容性 fallback（P0-5 修复批）：4xx 错误明确指向 response_format/temperature
-	// 时去掉命中参数；max_tokens 被拒时携同一预算切到 max_completion_tokens。
-	// 至多 3 轮，覆盖上游逐个报参数错的形态。能力观察只在回落请求成功时统一提交——
-	// fallback 失败说明错误另有原因，
+	// 参数兼容性 fallback（P0-5 修复批）：4xx 错误明确指向 response_format/temperature/
+	// reasoning_effort/prompt_cache_key 时去掉命中参数；max_tokens 被拒时携同一预算切到
+	// max_completion_tokens。至多 chatPlainFallbackLimit 轮，覆盖上游逐个报参数错的形态。
+	// 能力观察只在回落请求成功时统一提交——fallback 失败说明错误另有原因，
 	// 提交观察会让一次误判污染该目标 12h 的能力状态。
 	jsonOn := p.JSONMode
 	var capConfirms []func()
@@ -496,14 +519,16 @@ func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error)
 			reason := fmt.Sprintf("chat 非流式 HTTP %d 拒绝 max_tokens，改用 max_completion_tokens", status)
 			capConfirms = append(capConfirms, func() { p.observeMaxTokensUnsupported(reason) })
 			changed = true
-		case cacheOn && looksLikeUnsupportedPromptCache(status, raw):
-			cacheOn = false
+		case p.sendsPromptCacheKey() && looksLikeUnsupportedPromptCache(status, raw):
+			p.markPromptCacheKeyOmitted()
+			reason := fmt.Sprintf("chat 非流式 HTTP %d 拒绝 prompt_cache_key", status)
+			capConfirms = append(capConfirms, func() { p.observePromptCacheKeyUnsupported(reason) })
 			changed = true
 		}
 		if !changed {
 			break
 		}
-		res, status, raw, latency, err = doChat(ctx, p, jsonOn, cacheOn)
+		res, status, raw, latency, err = doChat(ctx, p, jsonOn)
 		if err != nil {
 			if res != nil {
 				res.Usage = usageOrEstimate(p.Messages, res.Content, res.Usage)
@@ -536,7 +561,7 @@ func chatCompletionPlain(ctx context.Context, p chatParams) (*chatResult, error)
 
 // doChat 执行单次 HTTP 调用，返回解析后的结果、HTTP 状态码、原始响应体、耗时。
 // 解析/门禁类错误发生时结果仍尽量带出（audit outcome：正文/usage/原始终态供审计保留）。
-func doChat(ctx context.Context, p chatParams, jsonMode, promptCache bool) (*chatResult, int, []byte, int64, error) {
+func doChat(ctx context.Context, p chatParams, jsonMode bool) (*chatResult, int, []byte, int64, error) {
 	endpoint := chatCompletionsURL(p.BaseURL)
 
 	payload := map[string]any{
@@ -551,7 +576,7 @@ func doChat(ctx context.Context, p chatParams, jsonMode, promptCache bool) (*cha
 		payload[p.maxTokensField()] = p.requestTokenBudget()
 	}
 	p.addReasoningEffortField(payload)
-	p.addPromptCacheField(payload, promptCache)
+	p.addPromptCacheField(payload)
 	if jsonMode {
 		payload["response_format"] = map[string]string{"type": "json_object"}
 	}
@@ -693,8 +718,24 @@ func looksLikeUnsupportedJSONMode(status int, raw []byte) bool {
 
 // unsupportedParamHints 参数类 4xx 的「不被接受」措辞集合：字段名之外还须命中其一，
 // 防把「值超限」（max_tokens is too large）、字段回显等误判成参数不支持。
+// **中文措辞必须齐备**：做严格字段校验的国产上游回的是中文原文（「未知请求字段：
+// prompt_cache_key」），只匹配英文会让字段名命中但措辞全落空 → 不降级 → 原样重发再报
+// 400 → 抛给用户。本集合被全部五个维度共享（response_format/temperature/
+// reasoning_effort/max_tokens/prompt_cache_key），补齐中文对全部维度同时生效。
 var unsupportedParamHints = []string{
 	"not support", "unsupported", "unknown parameter", "unrecognized", "unexpected", "invalid parameter", "extra_forbidden",
+	"未知请求字段", "未知参数", "未知字段", "不支持的参数", "不支持该参数", "无效参数", "非法参数", "参数不支持",
+}
+
+// paramErrorText 参数判定用的错误文案（统一小写；中文不受 ToLower 影响）。原样响应体
+// 之外，上游把非 ASCII 转义成 \uXXXX 时（部分网关 JSON 序列化的默认行为）再附上解码后的
+// message——否则上面的中文措辞对这类上游恒不命中，中文降级等于没修。
+func paramErrorText(raw []byte) string {
+	msg := strings.ToLower(string(raw))
+	if strings.Contains(msg, `\u`) {
+		msg += "\n" + strings.ToLower(extractErr(raw))
+	}
+	return msg
 }
 
 func matchUnsupportedParam(msg string, fieldHints ...string) bool {
@@ -722,19 +763,22 @@ func looksLikeUnsupportedTemperature(status int, raw []byte) bool {
 	if status < 400 || status >= 500 {
 		return false
 	}
-	return matchUnsupportedParam(strings.ToLower(string(raw)), "temperature")
+	return matchUnsupportedParam(paramErrorText(raw), "temperature")
 }
 
 // looksLikeUnsupportedMaxTokens 判断 4xx 是否因上游不接受 max_tokens/max_output_tokens
 // 参数本身（如要求改用 max_completion_tokens 的模型）。「值超限」类错误不算——去掉
-// 参数解决不了值超限，反而丢失输出预算。
+// 参数解决不了值超限，反而丢失输出预算。排除项中英文并列，理由同 unsupportedParamHints。
 func looksLikeUnsupportedMaxTokens(status int, raw []byte) bool {
 	if status < 400 || status >= 500 {
 		return false
 	}
-	msg := strings.ToLower(string(raw))
-	if strings.Contains(msg, "too large") || strings.Contains(msg, "maximum value") || strings.Contains(msg, "exceed") {
-		return false
+	msg := paramErrorText(raw)
+	for _, over := range []string{"too large", "maximum value", "exceed",
+		"超过最大", "超出最大", "超出范围", "超过范围", "超出取值范围", "过大"} {
+		if strings.Contains(msg, over) {
+			return false
+		}
 	}
 	return matchUnsupportedParam(msg, "max_tokens", "max_output_tokens")
 }
@@ -743,6 +787,7 @@ func looksLikeUnsupportedMaxTokens(status int, raw []byte) bool {
 var invalidParamValueHints = []string{
 	"invalid value", "invalid_value", "supported values", "must be one of", "one of the following",
 	"allowed values", "not a valid", "invalid enum",
+	"无效的值", "无效值", "不支持的值", "可选值", "取值范围", "必须是", "取值必须", "只能是",
 }
 
 // looksLikeUnsupportedReasoningEffort 判断 4xx 是否因上游不接受思考档位引起。**两类都算**：
@@ -766,7 +811,7 @@ func looksLikeUnsupportedReasoningEffort(status int, raw []byte) bool {
 	if status < 400 || status >= 500 {
 		return false
 	}
-	msg := strings.ToLower(string(raw))
+	msg := paramErrorText(raw)
 	fields := []string{"reasoning_effort", "reasoning.effort", "reasoning"}
 	if matchUnsupportedParam(msg, fields...) {
 		return true
@@ -800,7 +845,7 @@ func looksLikeInvalidParamValue(lowerMsg string) bool {
 // 降级到网关默认。审计侧 request_body 记的是最终形态（已无该参数），两者配合才能归因。
 func (p chatParams) reasoningEffortRejectReason(path string, status int, raw []byte) string {
 	effort := strings.TrimSpace(p.ReasoningEffort)
-	if looksLikeInvalidParamValue(strings.ToLower(string(raw))) {
+	if looksLikeInvalidParamValue(paramErrorText(raw)) {
 		common.SysWarn("LLM 思考档位被上游拒绝：模型 %s 不接受 reasoning_effort=%q，本次已去参重试并回落网关默认档位（HTTP %d：%s）——请按上游提示改配档位",
 			p.Model, effort, status, extractErr(raw))
 		return fmt.Sprintf("%s HTTP %d 拒绝档位 %q（值不在取值集合内）", path, status, effort)
@@ -808,11 +853,14 @@ func (p chatParams) reasoningEffortRejectReason(path string, status int, raw []b
 	return fmt.Sprintf("%s HTTP %d 拒绝 reasoning_effort 参数", path, status)
 }
 
+// looksLikeUnsupportedPromptCache 判断 4xx 是否因上游不接受 prompt_cache_key 参数。
+// 这是最常被严格字段校验拒掉的一个（非 OpenAI 官方以外的兼容端多按白名单校验字段），
+// 且报错常是中文原文——中文措辞见 unsupportedParamHints。
 func looksLikeUnsupportedPromptCache(status int, raw []byte) bool {
 	if status < 400 || status >= 500 {
 		return false
 	}
-	return matchUnsupportedParam(strings.ToLower(string(raw)), "prompt_cache_key")
+	return matchUnsupportedParam(paramErrorText(raw), "prompt_cache_key")
 }
 
 // transientNetErr 是否为值得重试的瞬时网络错误：排除调用方取消、
@@ -955,7 +1003,6 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 	}
 	endpoint := chatCompletionsURL(p.BaseURL)
 
-	cacheOn := p.promptCacheKey() != ""
 	buildBody := func(withUsageOpt, withJSON bool) []byte {
 		payload := map[string]any{
 			"model":    p.Model,
@@ -969,7 +1016,7 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 			payload[p.maxTokensField()] = p.requestTokenBudget()
 		}
 		p.addReasoningEffortField(payload)
-		p.addPromptCacheField(payload, cacheOn)
+		p.addPromptCacheField(payload)
 		if withUsageOpt {
 			payload["stream_options"] = map[string]bool{"include_usage": true}
 		}
@@ -1029,7 +1076,7 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 		dropTemp := !p.temperatureOmitted() && looksLikeUnsupportedTemperature(status, raw)
 		dropEffort := p.sendsReasoningEffort() && looksLikeUnsupportedReasoningEffort(status, raw)
 		switchMaxTok := p.MaxTokens > 0 && !p.usesMaxCompletionTokens() && looksLikeUnsupportedMaxTokens(status, raw)
-		dropCache := cacheOn && looksLikeUnsupportedPromptCache(status, raw)
+		dropCache := p.sendsPromptCacheKey() && looksLikeUnsupportedPromptCache(status, raw)
 		if !dropUsage && !dropJSON && !dropTemp && !dropEffort && !switchMaxTok && !dropCache {
 			return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", status, statusHint(status), extractErr(raw))
 		}
@@ -1058,7 +1105,9 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 			capConfirms = append(capConfirms, func() { p.observeMaxTokensUnsupported(reason) })
 		}
 		if dropCache {
-			cacheOn = false
+			p.markPromptCacheKeyOmitted()
+			reason := fmt.Sprintf("chat 流式 HTTP %d 拒绝 prompt_cache_key", status)
+			capConfirms = append(capConfirms, func() { p.observePromptCacheKeyUnsupported(reason) })
 		}
 		body = buildBody(usageOpt, jsonOn)
 		r2, e2 := send()

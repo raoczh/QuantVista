@@ -767,6 +767,150 @@ func TestTokenBudgetNeverDropped(t *testing.T) {
 	})
 }
 
+// unicodeEscapedUnknownFieldBody 「未知请求字段：prompt_cache_key」的 \uXXXX 转义形态
+// （拼接而非字面量，避免源码里的转义序列被工具链再解码一次）。
+var unicodeEscapedUnknownFieldBody = `{"error":{"message":"` +
+	"\\u672a\\u77e5\\u8bf7\\u6c42\\u5b57\\u6bb5\\uff1a" + `prompt_cache_key"}}`
+
+// TestUnsupportedParamHintsChinese 中文 4xx 必须能触发参数降级。unsupportedParamHints 被
+// 五个维度共享，所以同一处修复对 prompt_cache_key 与 temperature 同时生效（各取一例）。
+// 「值超限」类中文报错不得被误判成参数不支持——去掉 max_tokens 解决不了值超限，只会丢预算。
+func TestUnsupportedParamHintsChinese(t *testing.T) {
+	cases := []struct {
+		name                    string
+		body                    string
+		cache, temperature, tok bool
+	}{
+		{"未知请求字段 prompt_cache_key",
+			`{"error":{"message":"未知请求字段：prompt_cache_key"}}`, true, false, false},
+		{"不支持的参数 temperature（共享 hints 生效）",
+			`{"error":{"message":"不支持的参数：temperature"}}`, false, true, false},
+		{"措辞后置：参数不支持",
+			`{"error":{"message":"请求参数 prompt_cache_key 参数不支持"}}`, true, false, false},
+		{"非法参数",
+			`{"error":{"message":"非法参数 prompt_cache_key"}}`, true, false, false},
+		// 上游把非 ASCII 转义成 \uXXXX（部分网关的 JSON 序列化默认行为）时同样要命中：
+		// 字段名是 ASCII 照旧命中，中文措辞则须解码后才匹配得上。
+		{"unicode 转义的中文报错", unicodeEscapedUnknownFieldBody, true, false, false},
+		{"未知参数 max_tokens",
+			`{"error":{"message":"未知参数：max_tokens，请改用 max_completion_tokens"}}`, false, false, true},
+		{"max_tokens 超过最大值（反例）",
+			`{"error":{"message":"max_tokens 超过最大值，本模型最多 4096"}}`, false, false, false},
+		{"max_tokens 取值过大 + 参数措辞（反例：排除项优先）",
+			`{"error":{"message":"参数 max_tokens 取值过大，不支持的参数值"}}`, false, false, false},
+		{"仅回显字段名无措辞（反例）",
+			`{"error":{"message":"prompt_cache_key: qa:q13"}}`, false, false, false},
+		{"中文措辞但字段名不匹配（反例）",
+			`{"error":{"message":"未知请求字段：top_k"}}`, false, false, false},
+	}
+	for _, c := range cases {
+		if got := looksLikeUnsupportedPromptCache(400, []byte(c.body)); got != c.cache {
+			t.Errorf("%s: prompt_cache_key=%v want %v", c.name, got, c.cache)
+		}
+		if got := looksLikeUnsupportedTemperature(400, []byte(c.body)); got != c.temperature {
+			t.Errorf("%s: temperature=%v want %v", c.name, got, c.temperature)
+		}
+		if got := looksLikeUnsupportedMaxTokens(400, []byte(c.body)); got != c.tok {
+			t.Errorf("%s: max_tokens=%v want %v", c.name, got, c.tok)
+		}
+	}
+	// 5xx 一律不判参数不支持（上游抖动不是字段校验问题）。
+	if looksLikeUnsupportedPromptCache(500, []byte(`{"error":{"message":"未知请求字段：prompt_cache_key"}}`)) {
+		t.Fatal("5xx 不得判参数不支持")
+	}
+	// 中文「值不在取值集合内」措辞同样要认（思考档位的第 2 类拒绝走这条）。
+	for _, raw := range []string{
+		`{"error":{"message":"reasoning_effort 无效的值，可选值：low、medium、high"}}`,
+		`{"error":{"message":"reasoning.effort 取值范围：low/medium/high"}}`,
+	} {
+		if !looksLikeUnsupportedReasoningEffort(400, []byte(raw)) {
+			t.Errorf("中文档位取值报错应触发降级: %s", raw)
+		}
+	}
+}
+
+// TestPromptCacheKeyCapabilityFallback 缓存亲和参数能力贯通端到端：首次调用被中文 4xx 拒
+// → 去参重试成功 → 提交观察；第二次调用声明化路由**直接不发**该参数（这是本维度最贵的
+// 成本：它命中在每一次调用上），审计 RequestBody 记录最终形态。
+func TestPromptCacheKeyCapabilityFallback(t *testing.T) {
+	setCapRoutingFlag(t, true)
+	resetLLMCapabilityStore()
+	t.Cleanup(resetLLMCapabilityStore)
+	srv, bodies := promptCacheUpstream(t, "", promptCacheRejectCN)
+
+	params := chatParams{
+		BaseURL: srv.URL, APIKey: "k", Model: "m", MaxTokens: 256, AllowPrivate: true,
+		Messages: []chatMessage{{Role: "user", Content: "hi"}},
+		Meta:     chatMeta{CallerUserID: 1, Module: "captest_cache", PromptVersion: "v3"},
+	}
+	if _, err := chatCompletion(context.Background(), params); err != nil {
+		t.Fatalf("prompt_cache_key fallback 应成功: %v", err)
+	}
+	if len(*bodies) != 2 {
+		t.Fatalf("应 2 个请求（带 key 被拒 + 去参成功）: %d", len(*bodies))
+	}
+	if !strings.Contains((*bodies)[0], `"prompt_cache_key":"captest_cache:v3"`) ||
+		strings.Contains((*bodies)[1], "prompt_cache_key") {
+		t.Fatalf("首轮带 key、次轮去参: %#v", *bodies)
+	}
+	obs, ok := lookupLLMCapability(capabilityTargetOf(params), capPromptCacheKey)
+	if !ok || obs.State != capUnsupported {
+		t.Fatalf("fallback 成功后应提交 prompt_cache_key 观察: %+v ok=%v", obs, ok)
+	}
+	// 第二次调用：声明化路由直接省略，不再白付一轮注定 400 的请求。
+	if _, err := chatCompletion(context.Background(), params); err != nil {
+		t.Fatalf("路由后调用应成功: %v", err)
+	}
+	if len(*bodies) != 3 || strings.Contains((*bodies)[2], "prompt_cache_key") {
+		t.Fatalf("路由后应只发 1 个不带 prompt_cache_key 的请求: n=%d", len(*bodies))
+	}
+	var lastLog model.LLMCallLog
+	if err := common.DB.Where("module = ?", "captest_cache").Order("id desc").First(&lastLog).Error; err != nil {
+		t.Fatalf("查审计失败: %v", err)
+	}
+	if strings.Contains(lastLog.RequestBody, "prompt_cache_key") ||
+		!strings.Contains(lastLog.RequestBody, `"model"`) {
+		t.Fatalf("审计 RequestBody 应为最终省略该参数的 payload: %.160s", lastLog.RequestBody)
+	}
+}
+
+// TestPromptCacheKeyNoObservationOnRetryFailure 去参重试仍失败时不得落观察——错误另有
+// 原因（如模型名不存在），一次误判会让该目标 12h 内都不发 prompt_cache_key（白丢缓存亲和）。
+func TestPromptCacheKeyNoObservationOnRetryFailure(t *testing.T) {
+	setCapRoutingFlag(t, true)
+	resetLLMCapabilityStore()
+	t.Cleanup(resetLLMCapabilityStore)
+
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		w.WriteHeader(http.StatusBadRequest)
+		if strings.Contains(string(b), "prompt_cache_key") {
+			_, _ = w.Write([]byte(promptCacheRejectCN))
+			return
+		}
+		// 去参后仍失败：真正的原因是模型名不存在。
+		_, _ = w.Write([]byte(`{"error":{"message":"model m not found"}}`))
+	}))
+	defer srv.Close()
+
+	params := chatParams{
+		BaseURL: srv.URL, APIKey: "k", Model: "m", MaxTokens: 256, AllowPrivate: true,
+		Messages: []chatMessage{{Role: "user", Content: "hi"}},
+		Meta:     chatMeta{CallerUserID: 1, Module: "captest_cache_fail", PromptVersion: "v1"},
+	}
+	if _, err := chatCompletion(context.Background(), params); err == nil {
+		t.Fatal("去参后仍 4xx 应报错")
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("应 2 个请求（带 key + 去参）后即止: %d", len(bodies))
+	}
+	if _, ok := lookupLLMCapability(capabilityTargetOf(params), capPromptCacheKey); ok {
+		t.Fatal("重试仍失败不得提交 unsupported 观察")
+	}
+}
+
 // TestSequentialCapabilityFallback 模拟兼容网关逐次只报告一个未知参数。默认流式
 // 入口必须一直保持 stream=true 与 token 上限，直到所有可兼容字段处理完；整包回落
 // 路径也须具备同样的有限进展语义。

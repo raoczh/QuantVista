@@ -36,7 +36,7 @@ func responsesURL(baseURL string) string {
 
 // buildResponsesPayload chat 语义 → responses 请求体。temperature/max_output_tokens 按
 // 能力观测省略（P0-5 修复批）；最终形态经 noteFinalRequestBody 记入审计。
-func buildResponsesPayload(p chatParams, jsonMode, stream, promptCache bool) map[string]any {
+func buildResponsesPayload(p chatParams, jsonMode, stream bool) map[string]any {
 	var instructions []string
 	input := make([]map[string]any, 0, len(p.Messages))
 	for _, m := range p.Messages {
@@ -65,7 +65,7 @@ func buildResponsesPayload(p chatParams, jsonMode, stream, promptCache bool) map
 		payload["max_output_tokens"] = p.requestTokenBudget()
 	}
 	p.addReasoningEffortField(payload)
-	p.addPromptCacheField(payload, promptCache)
+	p.addPromptCacheField(payload)
 	if jsonMode {
 		payload["text"] = map[string]any{"format": map[string]string{"type": "json_object"}}
 	}
@@ -73,8 +73,8 @@ func buildResponsesPayload(p chatParams, jsonMode, stream, promptCache bool) map
 }
 
 // marshalResponsesPayload 序列化 payload 并记录最终请求体审计观测。
-func marshalResponsesPayload(p chatParams, jsonMode, stream, promptCache bool) []byte {
-	body, _ := json.Marshal(buildResponsesPayload(p, jsonMode, stream, promptCache))
+func marshalResponsesPayload(p chatParams, jsonMode, stream bool) []byte {
+	body, _ := json.Marshal(buildResponsesPayload(p, jsonMode, stream))
 	p.noteFinalRequestBody(body)
 	return body
 }
@@ -184,16 +184,15 @@ func extractResponsesRefusal(output []responsesOutputItem) (string, bool) {
 }
 
 // responsesCompletion 非流式补全（与 chatCompletion 同语义同返回）。参数兼容性 fallback
-// 仅允许去掉 text.format/temperature；max_output_tokens 没有标准等价字段，若上游拒绝
-// 就明确失败，不能删掉模块预算后无上限生成。
+// 仅允许去掉 text.format/temperature/reasoning.effort/prompt_cache_key；max_output_tokens
+// 没有标准等价字段，若上游拒绝就明确失败，不能删掉模块预算后无上限生成。
 func responsesCompletion(ctx context.Context, p chatParams) (*chatResult, error) {
 	u, err := url.Parse(p.BaseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, errors.New("Base URL 非法（仅支持 http/https）")
 	}
 
-	cacheOn := p.promptCacheKey() != ""
-	res, status, raw, latency, err := doResponses(ctx, p, p.JSONMode, cacheOn)
+	res, status, raw, latency, err := doResponses(ctx, p, p.JSONMode)
 	if err != nil {
 		if res != nil {
 			res.Usage = usageOrEstimate(p.Messages, res.Content, res.Usage)
@@ -222,14 +221,16 @@ func responsesCompletion(ctx context.Context, p chatParams) (*chatResult, error)
 			p.markReasoningEffortOmitted()
 			capConfirms = append(capConfirms, func() { p.observeReasoningEffortUnsupported(reason) })
 			changed = true
-		case cacheOn && looksLikeUnsupportedPromptCache(status, raw):
-			cacheOn = false
+		case p.sendsPromptCacheKey() && looksLikeUnsupportedPromptCache(status, raw):
+			p.markPromptCacheKeyOmitted()
+			reason := fmt.Sprintf("responses 非流式 HTTP %d 拒绝 prompt_cache_key", status)
+			capConfirms = append(capConfirms, func() { p.observePromptCacheKeyUnsupported(reason) })
 			changed = true
 		}
 		if !changed {
 			break
 		}
-		res, status, raw, latency, err = doResponses(ctx, p, jsonOn, cacheOn)
+		res, status, raw, latency, err = doResponses(ctx, p, jsonOn)
 		if err != nil {
 			if res != nil {
 				res.Usage = usageOrEstimate(p.Messages, res.Content, res.Usage)
@@ -256,9 +257,9 @@ func responsesCompletion(ctx context.Context, p chatParams) (*chatResult, error)
 
 // doResponses 单次 /responses HTTP 调用；重试策略与 doChat 一致（瞬时网络错误 +
 // 429/500/502/503 各重试一次，504 不重试）。解析/门禁类错误时结果仍尽量带出（audit outcome）。
-func doResponses(ctx context.Context, p chatParams, jsonMode, promptCache bool) (*chatResult, int, []byte, int64, error) {
+func doResponses(ctx context.Context, p chatParams, jsonMode bool) (*chatResult, int, []byte, int64, error) {
 	endpoint := responsesURL(p.BaseURL)
-	body := marshalResponsesPayload(p, jsonMode, false, promptCache)
+	body := marshalResponsesPayload(p, jsonMode, false)
 
 	client := aiHTTPClient(p.AllowPrivate)
 	send := func() (*http.Response, error) {
@@ -399,8 +400,9 @@ func upstreamLLMError(rawErr json.RawMessage) error {
 // responsesCompletionStream 流式补全：SSE data 行按事件 type 分派——
 // response.output_text.delta 取 delta 追加、response.completed/incomplete 取最终 usage、
 // response.failed/error 判失败。流中断即失败不落半截，与 chat 端纪律一致。
-// 4xx 明确拒绝 text.format/temperature 时逐项去掉后继续建流（能力观察在最终建流
-// 成功后提交）；max_output_tokens 始终保留。上游忽略 stream 返回整包 JSON 时兼容解析。
+// 4xx 明确拒绝 text.format/temperature/reasoning.effort/prompt_cache_key 时逐项去掉后
+// 继续建流（能力观察在最终建流成功后提交）；max_output_tokens 始终保留。上游忽略 stream
+// 返回整包 JSON 时兼容解析。
 func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(string)) (*chatResult, error) {
 	u, err := url.Parse(p.BaseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
@@ -408,8 +410,7 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	}
 	endpoint := responsesURL(p.BaseURL)
 	jsonOn := p.JSONMode
-	cacheOn := p.promptCacheKey() != ""
-	body := marshalResponsesPayload(p, jsonOn, true, cacheOn)
+	body := marshalResponsesPayload(p, jsonOn, true)
 
 	client := aiStreamHTTPClient(p.AllowPrivate)
 	send := func() (*http.Response, error) {
@@ -452,7 +453,7 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 		dropJSON := jsonOn && looksLikeUnsupportedJSONMode(status, raw)
 		dropTemp := !p.temperatureOmitted() && looksLikeUnsupportedTemperature(status, raw)
 		dropEffort := p.sendsReasoningEffort() && looksLikeUnsupportedReasoningEffort(status, raw)
-		dropCache := cacheOn && looksLikeUnsupportedPromptCache(status, raw)
+		dropCache := p.sendsPromptCacheKey() && looksLikeUnsupportedPromptCache(status, raw)
 		if !dropJSON && !dropTemp && !dropEffort && !dropCache {
 			return nil, fmt.Errorf("LLM 返回 HTTP %d%s：%s", status, statusHint(status), extractErr(raw))
 		}
@@ -473,9 +474,11 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 			capConfirms = append(capConfirms, func() { p.observeReasoningEffortUnsupported(reason) })
 		}
 		if dropCache {
-			cacheOn = false
+			p.markPromptCacheKeyOmitted()
+			reason := fmt.Sprintf("responses 流式 HTTP %d 拒绝 prompt_cache_key", status)
+			capConfirms = append(capConfirms, func() { p.observePromptCacheKeyUnsupported(reason) })
 		}
-		body = marshalResponsesPayload(p, jsonOn, true, cacheOn)
+		body = marshalResponsesPayload(p, jsonOn, true)
 		r2, e2 := send()
 		if e2 != nil {
 			return nil, fmt.Errorf("请求失败: %w", e2)

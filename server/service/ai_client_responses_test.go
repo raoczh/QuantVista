@@ -190,6 +190,72 @@ func TestChatStreamOptionsFallback(t *testing.T) {
 	}
 }
 
+// TestPromptCacheKeyRejectFallbackResponses responses 两处降级点（非流式 + 流式）：与 chat
+// 端同款纪律——中文 4xx 拒绝 prompt_cache_key 时去参重试成功，确认 200 后才落观察。
+func TestPromptCacheKeyRejectFallbackResponses(t *testing.T) {
+	tests := []struct {
+		name   string
+		stream bool
+	}{
+		{name: "responses_plain"},
+		{name: "responses_stream", stream: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resetLLMCapabilityStore()
+			t.Cleanup(resetLLMCapabilityStore)
+			srv, bodies := promptCacheUpstream(t, model.LLMEndpointResponses, promptCacheRejectCN)
+
+			p := chatParams{BaseURL: srv.URL, APIKey: "k", Model: "m",
+				EndpointType: model.LLMEndpointResponses, MaxTokens: 256, AllowPrivate: true,
+				Messages: []chatMessage{{Role: "user", Content: "hi"}},
+				Meta:     chatMeta{Module: "cache_fb_resp", PromptVersion: "v2"}}
+			var res *chatResult
+			var err error
+			if tc.stream {
+				res, err = chatCompletionStream(context.Background(), p, nil)
+			} else {
+				res, err = responsesCompletion(context.Background(), initCallObservers(p))
+			}
+			if err != nil {
+				t.Fatalf("prompt_cache_key 被拒应去参重试成功，实际失败: %v", err)
+			}
+			if res == nil || res.Content != "ok" {
+				t.Fatalf("应拿到上游正文: %+v", res)
+			}
+			if len(*bodies) != 2 {
+				t.Fatalf("应 2 个请求（带 key 被拒 + 去参成功）: %d", len(*bodies))
+			}
+			if !strings.Contains((*bodies)[0], `"prompt_cache_key":"cache_fb_resp:v2"`) {
+				t.Fatalf("首轮应携带 module:promptVersion 形态的 key: %s", (*bodies)[0])
+			}
+			if strings.Contains((*bodies)[1], "prompt_cache_key") {
+				t.Fatalf("重试请求不得再带该参数: %s", (*bodies)[1])
+			}
+			// 预算永不参与去参 fallback：两轮都必须保留 max_output_tokens。
+			for i, body := range *bodies {
+				if !strings.Contains(body, `"max_output_tokens":256`) {
+					t.Fatalf("第 %d 个请求丢失输出预算: %s", i+1, body)
+				}
+			}
+			wantStream := `"stream":true`
+			if !tc.stream {
+				wantStream = `"stream":false`
+			}
+			for i, body := range *bodies {
+				if !strings.Contains(body, wantStream) {
+					t.Fatalf("第 %d 个请求应为 %s: %s", i+1, wantStream, body)
+				}
+			}
+			obs, ok := lookupLLMCapability(
+				llmCapabilityTarget(0, "", srv.URL, "m", model.LLMEndpointResponses), capPromptCacheKey)
+			if !ok || obs.State != capUnsupported {
+				t.Fatalf("去参重试成功后应落 unsupported 观察: %+v ok=%v", obs, ok)
+			}
+		})
+	}
+}
+
 // TestExtractErrTolerant 错误体宽容解析：error 对象/裸字符串、顶层 message/msg/error_msg/detail。
 func TestExtractErrTolerant(t *testing.T) {
 	cases := []struct{ raw, want string }{
