@@ -150,7 +150,7 @@ func wfParityBars(n int, turnover float64) []datasource.Bar {
 }
 
 // TestWFScoreStockParity wfScoreStock 必须与 scorePool 的组装口径逐策略一致：
-// 五维分吃尾 90 根、candFactors 吃尾 210 根、筹码本地复算、strategyAdjust、
+// 五维分吃尾 90 根、candFactors 吃尾 210 根、筹码本地复算、策略权重合成（s10）、strategyAdjust、
 // 低位高换手分级扣分（20~25 → -5 / 25~30 → -8）。手工侧独立复刻组装再对拍，
 // 锁死窗口与顺序不漂移。
 func TestWFScoreStockParity(t *testing.T) {
@@ -184,7 +184,7 @@ func TestWFScoreStockParity(t *testing.T) {
 					delta -= 5
 				}
 			}
-			want := round2(clamp0100(sc.Total + delta))
+			want := round2(clamp0100(strategyScoreTotal(def.recType, def.key, sc) + delta))
 			if math.Abs(got[si]-want) > 1e-9 {
 				t.Fatalf("turnover=%.0f 策略 %s/%s：应 %v，得到 %v", turnover, def.recType, def.key, want, got[si])
 			}

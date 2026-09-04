@@ -25,9 +25,15 @@ func NewRecommendationController(svc *service.RecommendationService, tracking *s
 }
 
 // Strategies GET /api/recommendations/strategies?type=short_term|long_term
+// 返回内置推荐策略 + 选股页全部策略（内置选股策略/新手模板/本人自建策略）。
 func (rc *RecommendationController) Strategies(c *gin.Context) {
 	recType := c.DefaultQuery("type", model.RecTypeShortTerm)
-	common.ApiSuccess(c, service.StrategiesFor(recType))
+	list, err := service.StrategiesForUser(currentUserID(c), recType)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccess(c, list)
 }
 
 // DiscoveryStatus GET /api/recommendations/discovery-status —— 全局发现运行状态与短名单。

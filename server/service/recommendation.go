@@ -36,7 +36,7 @@ func NewRecommendationService(market *MarketService, watchlist *WatchlistService
 
 const (
 	recPromptVersion   = "p16" // p16: 候选输入增加近5日发现记忆与7日内标题级真实新闻（不扩候选边界/条数/token预算）；p15: 撤销 p14 输出体积限制（用户定夺：不为省 token 限制输出——预算已放开+截断自动扩容 repair，恢复全量落选理由与不限条数）；p14: 控制结构化输出体积（已撤销）；p13: P1-2 长线 pick 新增 invalidation 失效条件字段（短线既有；schema recommendation.v2）
-	recStrategyVersion = "s9"  // s9: S1-3 名单去相关（相关性去重+同行业≤2 只，被挤出者记反事实事件）；s8: M3b 盘中因子短线加分项（尾盘放量拉升/跳水/收盘vs VWAP/午后重心上移/早盘强势）；s7: M3a 龙虎榜净买/机构席位/人气跃升/主力连续净流入加分项 + 量能维融合主力资金分；s6: F2 财务加分项（value ROE/growth 双增速/leader 盈利质量 + 业绩恶化通用扣分）；s5: T1 指标加分项 + 筹码超跌 + 五维动量/风险维升级；s4: 消息面情绪因子；s3: 策略-来源映射 + 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
+	recStrategyVersion = "s10" // s10: 五维基础分按策略意图重加权（strategyDimWeights：回踩/价值降动量与位置权重、升风险权重；活跃升量能权重）+ 选股类推荐策略条件命中度加分（全中 +12/部分按比例/明显不符 -4，与选股引擎同因子同求值）；s9: S1-3 名单去相关（相关性去重+同行业≤2 只，被挤出者记反事实事件）；s8: M3b 盘中因子短线加分项（尾盘放量拉升/跳水/收盘vs VWAP/午后重心上移/早盘强势）；s7: M3a 龙虎榜净买/机构席位/人气跃升/主力连续净流入加分项 + 量能维融合主力资金分；s6: F2 财务加分项（value ROE/growth 双增速/leader 盈利质量 + 业绩恶化通用扣分）；s5: T1 指标加分项 + 筹码超跌 + 五维动量/风险维升级；s4: 消息面情绪因子；s3: 策略-来源映射 + 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
 	maxScanCandidates  = 48    // 进入量化评分的候选上限（约束日线拉取量：48 只 × 1 次 HTTP，并发 6 约 3~8s）
 	maxLLMCandidates   = 10    // 量化排序后进入 LLM 精选的名单上限（控上下文体积与位置偏差）
 	factorBarLimit     = 90    // 五维评分/窗口因子的日线口径（MA60 需 ≥60，留余量）；实际拉取按 chipBarLimit=210，评分前截尾
@@ -52,62 +52,7 @@ const (
 // poolFullPrefix 「评分名额已满」排除原因前缀（scorePool 补位时按它识别可回补的标的）。
 const poolFullPrefix = "候选池已满"
 
-// strategyTemplate 策略模板。
-type strategyTemplate struct {
-	Key   string `json:"key"`
-	Name  string `json:"name"`
-	Desc  string `json:"desc"`
-	guide string // 注入 prompt 的选股导向（不外泄给前端）
-}
-
-var shortStrategies = []strategyTemplate{
-	{Key: "momentum", Name: "动量突破", Desc: "顺势追强，关注突破与量价配合",
-		guide: "优先选择处于上升趋势、价格站上均线、近日放量突破关键位、动能强的标的；回避明显滞涨或量价背离者。"},
-	{Key: "pullback", Name: "强势回踩", Desc: "强势股回调至支撑的低吸机会",
-		guide: "优先选择整体强势、近期健康回调至均线/前高支撑附近、缩量企稳的标的；给出更靠近支撑的买入观察区间。"},
-	{Key: "active", Name: "热点活跃", Desc: "资金聚焦的高活跃标的",
-		guide: "优先选择成交额显著放大、市场关注度高、处于热点板块的活跃标的；严格设置止损以控回撤。"},
-}
-
-var longStrategies = []strategyTemplate{
-	{Key: "value", Name: "价值低估", Desc: "偏防御，关注估值与稳健",
-		guide: "优先选择商业模式稳健、估值相对合理或偏低的标的，弱化短期涨幅；以中长期持有视角评估。"},
-	{Key: "growth", Name: "成长趋势", Desc: "关注景气与成长持续性",
-		guide: "优先选择处于景气赛道、成长趋势明确、中长期逻辑清晰的标的；说明关键的成长驱动与验证指标。"},
-	{Key: "leader", Name: "龙头优选", Desc: "行业龙头与确定性",
-		guide: "优先选择行业地位领先、确定性较高的龙头标的；强调竞争壁垒与长期跟踪要点。"},
-}
-
-// StrategiesFor 返回某类型的可选策略（供前端下拉，不含内部 guide）。
-func StrategiesFor(recType string) []strategyTemplate {
-	src := longStrategies
-	if recType == model.RecTypeShortTerm {
-		src = shortStrategies
-	}
-	out := make([]strategyTemplate, 0, len(src))
-	for _, s := range src {
-		out = append(out, strategyTemplate{Key: s.Key, Name: s.Name, Desc: s.Desc})
-	}
-	return out
-}
-
-// strategyByKey 按类型查策略模板：空 key 用第一个缺省；非空但查不到报错
-// （旧版静默回退第一个，用户传跨类型 key 时会无感知地跑错策略）。
-func strategyByKey(recType, key string) (*strategyTemplate, error) {
-	src := longStrategies
-	if recType == model.RecTypeShortTerm {
-		src = shortStrategies
-	}
-	if key == "" {
-		return &src[0], nil
-	}
-	for i := range src {
-		if src[i].Key == key {
-			return &src[i], nil
-		}
-	}
-	return nil, fmt.Errorf("策略 %s 与推荐类型不匹配，请重新选择", key)
-}
+// 策略模板目录（内置推荐策略 + 选股页全部策略）见 recommendation_strategy.go。
 
 // candidate 候选池条目（均为真实行情数据；估值字段为腾讯免费源 best-effort，缺失为 0）。
 // 阶段②③会补充：Sources 来源、Excluded 被过滤原因、Factors 技术因子、Score/Rank 量化评分与排名、
@@ -171,6 +116,8 @@ type candidate struct {
 	Discovery *CandidateDiscoverySummary `json:"discovery,omitempty"`
 	// NewsBrief 只保存明确关联当前 symbol、7 日内、最多 3 条的标题级事实。
 	NewsBrief []CandidateNewsBrief `json:"news_brief,omitempty"`
+	// StrategyHit 选股类推荐策略的条件命中评估（与选股引擎同因子同求值；内置推荐策略为 nil）。
+	StrategyHit *StrategyHit `json:"strategy_hit,omitempty"`
 
 	// 进程内工作字段（小写不序列化，不进池快照）：closes/closeDates 尾部收盘序列及
 	// 其交易日（S1-3 相关性去重与 S1-2 相关性系数——按交易日交集对齐，任一股停牌
@@ -537,7 +484,7 @@ func (s *RecommendationService) prepareGenerationWithSnapshot(userID int64, allo
 		return nil, errors.New("推荐类型须为 short_term 或 long_term")
 	}
 	market := normalizeMarketOnly(req.Market)
-	strat, serr := strategyByKey(req.Type, strings.TrimSpace(req.Strategy))
+	strat, serr := resolveRecStrategy(userID, req.Type, strings.TrimSpace(req.Strategy))
 	if serr != nil {
 		return nil, serr
 	}
@@ -2076,9 +2023,10 @@ func (s *RecommendationService) buildPool(ctx context.Context, userID int64, mar
 		}
 	}
 
-	// 榜单来源按策略组合（strategySources）：热度榜之外补「不热」方向（回调榜/低PB榜），
-	// 升序榜前排的极端值由 keep 行级过滤。单榜失败降级不阻断。
-	for _, src := range strategySources(recType, strat.Key) {
+	// 榜单来源按策略组合（strategySources，选股类策略沿用其基础推荐策略的来源组合）：
+	// 热度榜之外补「不热」方向（回调榜/低PB榜），升序榜前排的极端值由 keep 行级过滤。
+	// 单榜失败降级不阻断。
+	for _, src := range strategySources(recType, strat.baseKey) {
 		rows, err := s.market.GetRanking(ctx, market, src.sort, src.asc, src.limit)
 		if err != nil {
 			continue
@@ -2094,12 +2042,13 @@ func (s *RecommendationService) buildPool(ctx context.Context, userID int64, mar
 		}
 	}
 
-	// M1 策略信号来源：因子宽表按推荐策略对应的内置选股策略全市场扫描，命中进池
+	// M1 策略信号来源：因子宽表全市场扫描命中进池——内置推荐策略按映射的内置选股
+	// 策略扫描；选股类推荐策略直接扫描用户所选的那个选股策略（主供给，名额更高）。
 	//（榜单只见「当天最热/最冷」，策略信号补上「形态对但不在榜上」的全市场供给）。
 	// 宽表行情是最近收盘日口径，盘中生成会滞后——对新增标的批量拉实时行情覆盖，
 	// 拉不到时保留收盘口径（best-effort；涨停判定等用户筛选按可得数据判）。
 	if market == "cn" {
-		if hits := strategySignalHits(ctx, recType, strat.Key, strategySignalPoolLimit); len(hits) > 0 {
+		if hits := strategySignalHits(ctx, userID, recType, strat, strategySignalPoolLimitFor(strat)); len(hits) > 0 {
 			refs := make([]QuoteRef, 0, len(hits))
 			for _, h := range hits {
 				if _, exists := byKey[h.Symbol]; !exists {
@@ -2267,10 +2216,39 @@ func marshalPoolSnapshot(pool []candidate) (string, int) {
 	return string(b), omitted
 }
 
+// hitBarsWithQuote 选股类策略命中评估用的日线：新浪兜底日线无成交额/换手率（恒 0），
+// 末根若为当日则用行情快照的成交额/换手补齐，否则 amount_yi/turnover_rate 类条件会
+// 因「数据缺失=0」而恒不命中，把本该全中的候选评成部分命中。只补末根、只补零值，
+// 不改变其它根与价格序列（返回副本，不污染调用方持有的切片）。
+func hitBarsWithQuote(bars []datasource.Bar, c candidate, today string) []datasource.Bar {
+	n := len(bars)
+	if n == 0 || bars[n-1].TradeDate != today || (c.Amount <= 0 && c.TurnoverRate <= 0) {
+		return bars
+	}
+	last := bars[n-1]
+	if last.Amount > 0 && last.TurnoverRate > 0 {
+		return bars
+	}
+	out := append([]datasource.Bar(nil), bars...)
+	if out[n-1].Amount <= 0 && c.Amount > 0 {
+		out[n-1].Amount = c.Amount
+	}
+	if out[n-1].TurnoverRate <= 0 && c.TurnoverRate > 0 {
+		out[n-1].TurnoverRate = c.TurnoverRate
+	}
+	return out
+}
+
 // adjustedCandidateScore 在给定五维分上叠加现有策略规则与低位高换手扣分。
 // 预热优先级与富化后的最终评分共用该组装，区别只在候选是否已写入 flow/finance。
 func adjustedCandidateScore(recType string, strat *strategyTemplate, c candidate, factors *candFactors, sc ScoreResult) (float64, []string) {
-	delta, notes := strategyAdjust(recType, strat.Key, c, factors)
+	delta, notes := strategyAdjust(recType, strat.baseKey, c, factors)
+	// 选股类策略：用户明确指定的形态条件命中度是主加分项（全中 +12 / 部分按比例 / 明显不符 -4）。
+	if strat.screen != nil {
+		d, n := screenStrategyBonus(c.StrategyHit)
+		delta += d
+		notes = append(notes, n...)
+	}
 	if c.TurnoverRate > deadTurnoverPct {
 		// 低位高换手分级扣分：25~30% 比 20~25% 更接近极端换手，扣更重，
 		// 抵消五维量能维对爆量的加分（否则净效应近乎中性，惩罚失真）。
@@ -2281,7 +2259,7 @@ func adjustedCandidateScore(recType string, strat *strategyTemplate, c candidate
 		delta -= penalty
 		notes = append(notes, fmt.Sprintf("低位高换手 %.1f%%（%s 档）：放量启动与对倒出货并存，需谨慎（-%.0f）", c.TurnoverRate, band, penalty))
 	}
-	return round2(clamp0100(sc.Total + delta)), notes
+	return round2(clamp0100(strategyScoreTotal(recType, strat.baseKey, sc) + delta)), notes
 }
 
 // scorePool 阶段③：对未被排除的候选拉日线算技术因子，五维评分 + 策略加分合成量化分，
@@ -2315,6 +2293,13 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 		// B9 限售解禁批量注入（本地表一次查询）：bear 论据框架首条就是解禁，
 		// 此前无数据可依只能提示自行核查，现在有数据要能引用具体数字。
 		liftSigs, liftAvailable := liftSignalsFor(syms)
+		// 选股类策略引用 div_yield（C10）时需要股息率元数据（本地分红方案表一次查询）。
+		divYields := map[string]float64{}
+		if strat.screen != nil {
+			if y, err := DividendYieldsFor(syms, scoreNow); err == nil {
+				divYields = y
+			}
+		}
 		for _, i := range idxs {
 			if sig, ok := lhbSigs[pool[i].Symbol]; ok {
 				pool[i].LhbNetYi = sig.NetBuyYi
@@ -2384,6 +2369,14 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 			baseScores[i] = sc
 			factorsBy[i] = factors
 			computed = append(computed, i)
+			// 选股类策略：用与选股引擎完全相同的因子行对该候选评估条件命中度（收盘口径）。
+			if strat.screen != nil {
+				meta := wideStockMeta{Name: pool[i].Name, ST: isSTName(pool[i].Name)}
+				if y, ok := divYields[pool[i].Symbol]; ok {
+					meta.DivYield, meta.DivYieldOK = y, true
+				}
+				pool[i].StrategyHit = evaluateStrategyHit(strat, pool[i].Symbol, meta, hitBarsWithQuote(bars, pool[i], sentiDate))
+			}
 			// S0-4 价格版本 + S1-3 相关性序列：保存尾部收盘与交易日（61 根足够 60 日
 			// 收益相关；日期供停牌错位下的交集对齐）与最近收盘日锚点（防前复权重锚
 			// 的比对基准）。
@@ -2736,6 +2729,9 @@ func compactRawCandidateForLLM(c candidate) map[string]any {
 	}
 	if c.Factors != nil {
 		row["factors"] = c.Factors
+	}
+	if c.StrategyHit != nil {
+		row["strategy_hit"] = c.StrategyHit
 	}
 	if c.FlowStatus != "" {
 		row["flow_status"] = c.FlowStatus

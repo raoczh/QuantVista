@@ -1001,7 +1001,7 @@ function onResize() {
                 </div>
 
                 <button v-if="mineRec" type="button" class="latest-rec" @click="router.push('/recommendations')">
-                  <span><strong>最新推荐</strong> · {{ recTypeText(mineRec.type) }}策略 · {{ mineRec.strategy }}</span>
+                  <span><strong>最新推荐</strong> · {{ mineRec.title || `${recTypeText(mineRec.type)}策略 · ${mineRec.strategy}` }}</span>
                   <small>来源 推荐追踪 · {{ relDay(mineRec.created_at) }}</small>
                 </button>
                 <n-alert v-else-if="mineRecError" type="warning" :bordered="false" :show-icon="false" class="inline-state">

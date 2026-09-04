@@ -18,6 +18,7 @@ defineProps<{
 
 const emit = defineEmits<{
   scan: [template: RetailTemplate]
+  recommend: [template: RetailTemplate]
   retry: []
   'update-param': [templateKey: string, paramKey: string, value: number | null]
 }>()
@@ -69,16 +70,19 @@ const emit = defineEmits<{
               {{ condition }}
             </n-tag>
           </div>
-          <n-button
-            size="small"
-            type="primary"
-            secondary
-            :loading="scanning === `retail-${template.key}`"
-            :disabled="!!scanning && scanning !== `retail-${template.key}`"
-            @click="emit('scan', template)"
-          >
-            开始扫描
-          </n-button>
+          <div class="template-actions">
+            <n-button size="small" quaternary @click="emit('recommend', template)">AI 推荐</n-button>
+            <n-button
+              size="small"
+              type="primary"
+              secondary
+              :loading="scanning === `retail-${template.key}`"
+              :disabled="!!scanning && scanning !== `retail-${template.key}`"
+              @click="emit('scan', template)"
+            >
+              开始扫描
+            </n-button>
+          </div>
         </section>
       </div>
     </n-spin>
@@ -114,15 +118,22 @@ const emit = defineEmits<{
 .template-notes div { display: grid; grid-template-columns: 64px 1fr; gap: 8px; }
 .template-notes dt { opacity: .62; }
 .template-notes dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+/* 参数框最少要放下「数值 + 单位 + 加减按钮」：三列均分在 300px 卡片里每列不到 90px，
+ * 数字会被单位后缀挤到只剩一位（截图实证「1(」「3.°」）——改按 130px 最小宽自动换行。 */
 .template-params {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   gap: 8px;
 }
-.template-params label { display: grid; gap: 4px; font-size: 12px; }
-.template-item > .n-button { align-self: flex-end; }
+.template-params label { display: grid; gap: 4px; font-size: 12px; min-width: 0; }
+.template-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: auto;
+}
 @media (max-width: 768px) {
   .template-params { grid-template-columns: 1fr; }
-  .template-item > .n-button { width: 100%; }
+  .template-actions > .n-button { flex: 1 1 0; }
 }
 </style>

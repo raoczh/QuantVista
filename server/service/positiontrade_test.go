@@ -894,9 +894,12 @@ func TestPaperSnapshotFailClosed(t *testing.T) {
 func TestPortfolioSnapshotUpsertAndCurve(t *testing.T) {
 	setupTestDB(t)
 	cleanLedgerTables(t)
+	// 曲线按 days 相对今天取窗，日期必须相对生成，否则写死日期会随时间滑出窗口。
+	d1 := time.Now().AddDate(0, 0, -2).Format("2006-01-02")
+	d2 := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
 
 	base := &model.PortfolioSnapshot{
-		UserID: 1, Kind: model.SnapshotKindReal, TradeDate: "2026-07-27",
+		UserID: 1, Kind: model.SnapshotKindReal, TradeDate: d1,
 		MarketValue: 10000, Cost: 9000, UnrealizedPnl: 1000, RealizedCum: 500, PositionCount: 2,
 	}
 	if err := upsertPortfolioSnapshot(base); err != nil {
@@ -904,7 +907,7 @@ func TestPortfolioSnapshotUpsertAndCurve(t *testing.T) {
 	}
 	// 同日重跑：覆盖而非新增。
 	base2 := &model.PortfolioSnapshot{
-		UserID: 1, Kind: model.SnapshotKindReal, TradeDate: "2026-07-27",
+		UserID: 1, Kind: model.SnapshotKindReal, TradeDate: d1,
 		MarketValue: 10500, Cost: 9000, UnrealizedPnl: 1500, RealizedCum: 500, PositionCount: 2,
 		Partial: true, MissingCount: 1, Note: "1 笔无有效行情",
 	}
@@ -924,19 +927,19 @@ func TestPortfolioSnapshotUpsertAndCurve(t *testing.T) {
 
 	// 另一日 + 另一账户类型 + 另一用户。
 	if err := upsertPortfolioSnapshot(&model.PortfolioSnapshot{
-		UserID: 1, Kind: model.SnapshotKindReal, TradeDate: "2026-07-28",
+		UserID: 1, Kind: model.SnapshotKindReal, TradeDate: d2,
 		MarketValue: 11000, Cost: 9000, UnrealizedPnl: 2000, RealizedCum: 500, PositionCount: 2,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := upsertPortfolioSnapshot(&model.PortfolioSnapshot{
-		UserID: 1, Kind: model.SnapshotKindPaper, TradeDate: "2026-07-28",
+		UserID: 1, Kind: model.SnapshotKindPaper, TradeDate: d2,
 		MarketValue: 60000, Cash: 40000, Cost: 55000, UnrealizedPnl: 5000, PositionCount: 3,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := upsertPortfolioSnapshot(&model.PortfolioSnapshot{
-		UserID: 2, Kind: model.SnapshotKindReal, TradeDate: "2026-07-28", MarketValue: 999,
+		UserID: 2, Kind: model.SnapshotKindReal, TradeDate: d2, MarketValue: 999,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -948,7 +951,7 @@ func TestPortfolioSnapshotUpsertAndCurve(t *testing.T) {
 	if len(curve.Points) != 2 {
 		t.Fatalf("real 曲线应 2 点（跨用户/跨 kind 不混）: %d", len(curve.Points))
 	}
-	if curve.Points[0].TradeDate != "2026-07-27" || curve.Points[1].TradeDate != "2026-07-28" {
+	if curve.Points[0].TradeDate != d1 || curve.Points[1].TradeDate != d2 {
 		t.Fatalf("必须日期升序: %+v", curve.Points)
 	}
 	if curve.PartialCount != 1 || !containsNote(curve.Notes, "partial") {

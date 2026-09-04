@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, h, type VNode } from 'vue'
 import {
   NButton,
   NCollapse,
@@ -12,6 +12,7 @@ import {
   NSelect,
   NSwitch,
   NTag,
+  type SelectOption,
 } from 'naive-ui'
 import type { RecFilters, RecommendRequest } from '@/api/recommendation'
 import type { UserPreference } from '@/api/user'
@@ -24,7 +25,8 @@ const capPreset = defineModel<number>('capPreset', { required: true })
 
 const props = defineProps<{
   pref: UserPreference | null
-  strategyOptions: Array<{ label: string; value: string }>
+  strategyOptions: SelectOption[]
+  strategyDesc?: string
   marketOptions: Array<{ label: string; value: string }>
   pricePresetOptions: Array<{ label: string; value: number }>
   capPresetOptions: Array<{ label: string; value: number }>
@@ -43,6 +45,13 @@ const emit = defineEmits<{
 const riskLabel = computed(() => ({ conservative: '保守', aggressive: '激进', balanced: '均衡' })[props.pref?.risk_level || 'balanced'])
 const horizonLabel = computed(() => ({ short_term: '短线', mid_term: '中线', long_term: '长线' })[props.pref?.horizon_pref || 'long_term'])
 const callBudget = computed(() => 1 + (form.value.verify ? 1 : 0) + (form.value.bear_check ? 1 : 0))
+/** 下拉菜单项：名称 + 副标题（周期·风险·讲解首句）。只作用于菜单（render-option），
+ * 选中后输入框内仍显示纯名称——render-label 会同时用于输入框，双行块会把选框撑爆。 */
+function renderStrategyOption({ node, option }: { node: VNode; option: SelectOption }) {
+  const desc = (option as SelectOption & { desc?: string }).desc
+  if (option.type === 'group' || !desc) return node
+  return h('div', { class: 'strategy-option' }, [node, h('small', { class: 'strategy-option-desc' }, desc)])
+}
 </script>
 
 <template>
@@ -66,8 +75,17 @@ const callBudget = computed(() => 1 + (form.value.verify ? 1 : 0) + (form.value.
             <n-radio-button value="long_term">长线</n-radio-button>
           </n-radio-group>
         </n-form-item>
-        <n-form-item label="策略">
-          <n-select v-model:value="form.strategy" :options="strategyOptions" />
+        <n-form-item label="策略" class="strategy-item">
+          <div class="strategy-field">
+            <n-select
+              v-model:value="form.strategy"
+              :options="strategyOptions"
+              :render-option="renderStrategyOption"
+              filterable
+              placeholder="选择策略（含选股页全部策略）"
+            />
+            <small v-if="strategyDesc" class="strategy-desc">{{ strategyDesc }}</small>
+          </div>
         </n-form-item>
         <n-form-item label="市场">
           <n-select v-model:value="form.market" :options="marketOptions" />
@@ -136,6 +154,29 @@ const callBudget = computed(() => 1 + (form.value.verify ? 1 : 0) + (form.value.
   flex-wrap: wrap;
   font-size: 12px;
   opacity: 0.72;
+}
+.strategy-field {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  width: 100%;
+}
+.strategy-desc {
+  font-size: 12px;
+  line-height: 1.5;
+  opacity: 0.66;
+  overflow-wrap: anywhere;
+}
+/* 下拉项副标题：naive 的 option 默认单行，副标题紧贴其下、与 option 同缩进并压低字号 */
+:global(.strategy-option .strategy-option-desc) {
+  display: block;
+  margin: -4px 0 0;
+  padding: 0 14px 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  opacity: 0.62;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .form-grid,
 .filter-grid {

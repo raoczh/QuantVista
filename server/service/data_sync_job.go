@@ -72,7 +72,9 @@ func dataSyncJobBinding() durableJobBinding {
 		} else if status == model.JobStatusFailed {
 			logStatus = model.JobStatusFailed
 		}
-		if strings.TrimSpace(log.Message) == "" {
+		// 成功日志允许空消息；只有失败/取消才用作业错误兜底（sanitizeJobError 对空串会
+		// 回「作业执行失败」，曾把 800/800 成功的同步日志写成失败文案）。
+		if strings.TrimSpace(log.Message) == "" && logStatus != "success" && logStatus != "partial" {
 			log.Message = sanitizeJobError(message)
 		}
 		updates := map[string]any{

@@ -1114,9 +1114,15 @@ func StartMarketJobs(mgr *datasource.Manager) {
 		})
 	}()
 
-	// 市场情绪快照：每 10 分钟一次。
+	// 市场情绪快照：每 10 分钟一次。交易日 09:25 前（集合竞价未出价）与非交易日整天，
+	// 上游涨跌分布恒为空——跳过而不是排一个必然失败的作业（生产曾每天早晨固定
+	// 4 个 failed 作业刷任务中心）。
 	go func() {
 		snapshot := func() {
+			now := time.Now().In(time.Local)
+			if !isTradingDayToday(now) || now.Hour()*60+now.Minute() < sessionQuoteReadyMin {
+				return
+			}
 			ScheduleSystemDataSyncJob(JobKindSnapshotMarket, DataSyncJobRequest{
 				Version: dataSyncJobSnapshotVersion, Market: market, TriggerSource: "scheduler",
 				ParameterSummary: "interval=10m",
@@ -1187,6 +1193,41 @@ func StartMarketJobs(mgr *datasource.Manager) {
 				continue
 			}
 			runWide()
+		}
+	}()
+
+	// 历史初始化夜间补跑：16:10 增量后立即触发的初始化正撞上游盘后高峰（clist 56 页刚
+	// 刷完、板块估值聚合并发），连续限流中止后当天不再重试，宇宙缺口会长期滞留
+	//（生产实测 2/3 标的一个月无 250 日历史）。每晚 21:30（含非交易日）若仍有 pending
+	// 再补一轮；system 作业按 kind 互斥，白天那轮仍在跑时本次自然复用不重复。
+	go func() {
+		if common.DB == nil {
+			return
+		}
+		schedulePendingInit := func(reason string) {
+			var pending int64
+			common.DB.Model(&model.MarketSyncState{}).
+				Where("market = ? AND init_status = ?", market, "pending").Count(&pending)
+			if pending == 0 {
+				return
+			}
+			ScheduleSystemDataSyncJob(JobKindInitMarketHistory, DataSyncJobRequest{
+				Version: dataSyncJobSnapshotVersion, Market: market, TriggerSource: "scheduler",
+				ParameterSummary: fmt.Sprintf("pending=%d", pending), Reason: reason,
+			})
+		}
+		// 启动补跑：部署/重启后 3 分钟（避开首屏冷启与启动恢复）若仍有缺口立即续跑，
+		// 不必等到夜间。
+		time.Sleep(3 * time.Minute)
+		schedulePendingInit("启动补跑历史初始化")
+		for {
+			now := time.Now()
+			next := time.Date(now.Year(), now.Month(), now.Day(), 21, 30, 0, 0, now.Location())
+			if !next.After(now) {
+				next = next.AddDate(0, 0, 1)
+			}
+			time.Sleep(next.Sub(now))
+			schedulePendingInit("夜间补跑历史初始化")
 		}
 	}()
 }

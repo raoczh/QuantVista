@@ -177,7 +177,21 @@ async function saveFiltersDefault() {
 }
 
 const strategies = ref<Strategy[]>([])
-const strategyOptions = computed(() => strategies.value.map((item) => ({ label: `${item.name} · ${item.desc}`, value: item.key })))
+// 策略下拉分组：推荐内置 / 我的策略 / 选股内置 / 新手模板（选股页全部策略均可作推荐策略）。
+const strategyGroupLabels: Record<string, string> = { rec: '推荐策略', custom: '我的选股策略', screen: '内置选股策略', template: '新手模板' }
+const selectedStrategy = computed(() => strategies.value.find((item) => item.key === form.value.strategy) || null)
+const strategyOptions = computed(() => {
+  const groups = new Map<string, Array<{ label: string; value: string; desc?: string }>>()
+  for (const item of strategies.value) {
+    const group = item.group || 'rec'
+    if (!groups.has(group)) groups.set(group, [])
+    // 选股类策略的 desc 已带「周期 · 风险 · 讲解首句」，与名称拼在一起会很长；label 只放名称，
+    // desc 交给下拉项副标题（renderLabel）与选中后的说明行展示。
+    groups.get(group)!.push({ label: item.name, value: item.key, desc: item.desc })
+  }
+  if (groups.size <= 1) return [...groups.values()].flat()
+  return [...groups.entries()].map(([key, children]) => ({ type: 'group' as const, label: strategyGroupLabels[key] || key, key, children }))
+})
 async function loadStrategies() {
   try {
     strategies.value = await listStrategies(form.value.type)
@@ -496,6 +510,7 @@ onMounted(async () => {
           v-model:cap-preset="capPreset"
           :pref="pref"
           :strategy-options="strategyOptions"
+          :strategy-desc="selectedStrategy?.desc || ''"
           :market-options="marketOptions"
           :price-preset-options="pricePresetOptions"
           :cap-preset-options="capPresetOptions"

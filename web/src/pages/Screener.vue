@@ -575,6 +575,12 @@ function restoreRevision(revision: ScreenerStrategyRevision) {
   editorShow.value = true
 }
 
+/** 用该选股策略作为推荐策略打开推荐工作台：短线/波段 → 短线推荐，中线 → 长线推荐。 */
+function goRecommend(strategyKey: string, period?: string) {
+  const recType = period === 'mid' ? 'long_term' : 'short_term'
+  void router.push({ name: 'recommendations', query: { rec_type: recType, strategy: strategyKey } })
+}
+
 async function scanHistoryRevision(revision: ScreenerStrategyRevision) {
   historyShow.value = false
   await runScan(
@@ -924,6 +930,7 @@ async function removeCustom(id: number) {
         :error="loadError"
         :scanning="scanning"
         @scan="runRetailTemplate"
+        @recommend="(t) => goRecommend(`tpl:${t.key}`, t.period)"
         @retry="load"
         @update-param="updateRetailParam"
       />
@@ -1041,6 +1048,7 @@ async function removeCustom(id: number) {
                     >一键扫描</n-button
                   >
                   <n-button size="small" quaternary @click="router.push(`/backtest?strategy_key=${b.key}`)">回测</n-button>
+                  <n-button size="small" quaternary @click="goRecommend(`screen:${b.key}`, b.period)">AI 推荐</n-button>
                 </div>
               </div>
             </n-gi>
@@ -1087,6 +1095,7 @@ async function removeCustom(id: number) {
                 @click="router.push({ path: '/backtest', query: { strategy_id: String(cs.id), strategy_revision_id: String(cs.current_revision_id) } })"
                 >回测</n-button
               >
+              <n-button size="small" quaternary @click="goRecommend(`screen:u${cs.id}`, cs.period)">AI 推荐</n-button>
               <n-button size="small" quaternary @click="openHistory(cs)">版本</n-button>
               <n-button size="small" quaternary @click="openEdit(cs)">编辑</n-button>
               <n-popconfirm @positive-click="removeCustom(cs.id)">

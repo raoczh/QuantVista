@@ -224,6 +224,20 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 	var statuses []model.RecommendationStatus
 	if err := common.DB.Where("user_id = ? AND review_needed = ? AND review_ack = ?", userID, true, false).
 		Order("updated_at DESC").Find(&statuses).Error; err == nil {
+		// 追踪状态表不存名称；一次批量回查推荐条目补齐（否则待办里只显示代码）。
+		nameByRec := map[int64]string{}
+		if len(statuses) > 0 {
+			recIDs := make([]int64, 0, len(statuses))
+			for _, st := range statuses {
+				recIDs = append(recIDs, st.RecommendationID)
+			}
+			var recs []model.Recommendation
+			if err := common.DB.Select("id", "name").Where("user_id = ? AND id IN ?", userID, recIDs).Find(&recs).Error; err == nil {
+				for _, r := range recs {
+					nameByRec[r.ID] = r.Name
+				}
+			}
+		}
 		for _, st := range statuses {
 			title := recReviewTitle[st.Outcome]
 			if title == "" {
@@ -237,7 +251,7 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 			// 跳转不依赖 ref_id（去处理仍整页跳推荐页）。
 			res.Items = append(res.Items, TodoItem{
 				Kind: TodoKindRecReview, Scope: TodoScopeResearch, Priority: pri,
-				Symbol: st.Symbol, Market: st.Market, Name: st.Symbol,
+				Symbol: st.Symbol, Market: st.Market, Name: orSymbol(nameByRec[st.RecommendationID], st.Symbol),
 				Title: title, Detail: recReviewDetail(st),
 				RefID: st.ID, RefType: "recommendations",
 			})

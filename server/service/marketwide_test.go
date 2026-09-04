@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"context"
 	"errors"
 	"fmt"
@@ -474,12 +475,15 @@ func TestInitMarketWideHistorySourceAbort(t *testing.T) {
 		fake.barsErr[fmt.Sprintf("6001%02d", i)] = errors.New("EOF")
 	}
 	svc := &MarketService{wide: fake}
+	oldBackoff := wideInitBackoff
+	wideInitBackoff = 5 * time.Millisecond
+	t.Cleanup(func() { wideInitBackoff = oldBackoff })
 	log, err := svc.initMarketWideHistory(context.Background())
 	if err != nil {
 		t.Fatalf("源故障中止不应返回错误: %v", err)
 	}
-	if log.Status != "failed" || log.Total != 0 {
-		t.Fatalf("中止日志不符: status=%s total=%d", log.Status, log.Total)
+	if log.Status != "failed" || log.Total != 0 || !strings.Contains(log.Message, "EOF") {
+		t.Fatalf("中止日志不符（须带最后错误便于排查）: status=%s total=%d msg=%s", log.Status, log.Total, log.Message)
 	}
 	var touched int64
 	common.DB.Model(&model.MarketSyncState{}).
@@ -487,9 +491,58 @@ func TestInitMarketWideHistorySourceAbort(t *testing.T) {
 	if touched != 0 {
 		t.Fatalf("源故障不应记到标的头上, 被动过的行 = %d", touched)
 	}
-	// 只探测了阈值只数就停手（不再空扫加速打上游）。
+	// 每段连续失败达阈值即退避并从失败段起点重取，退避 wideInitMaxBackoffs 次后再撞一段
+	// 才中止：只碰过前 wideInitAbortStreak 只（不空扫全宇宙），每只 (退避次数+1) 次。
 	if calls := len(fake.barsCalls); calls != wideInitAbortStreak {
-		t.Fatalf("中止前拉取次数 = %d, want %d", calls, wideInitAbortStreak)
+		t.Fatalf("中止前触及标的数 = %d, want %d", calls, wideInitAbortStreak)
+	}
+	total := 0
+	for _, c := range fake.barsCalls {
+		total += c
+	}
+	if total != wideInitAbortStreak*(wideInitMaxBackoffs+1) {
+		t.Fatalf("中止前总拉取次数 = %d, want %d", total, wideInitAbortStreak*(wideInitMaxBackoffs+1))
+	}
+}
+
+// TestInitMarketWideHistoryBackoffRecovers 源短暂限流：首段连续失败触发退避，退避后源恢复，
+// 同一轮内从失败段起点续跑并全部建史（生产复盘：旧逻辑一撞即中止，宇宙缺口滞留数周）。
+func TestInitMarketWideHistoryBackoffRecovers(t *testing.T) {
+	setupTestDB(t)
+	cleanWideTables(t)
+	end := time.Date(2026, 7, 7, 0, 0, 0, 0, time.Local)
+	dates := wideGenDates(250, end)
+	n := wideInitAbortStreak + 3
+	fake := &fakeWideSource{bars: map[string][]datasource.Bar{}, barsErr: map[string]error{}}
+	for i := 0; i < n; i++ {
+		sym := fmt.Sprintf("6002%02d", i)
+		common.DB.Create(&model.MarketSyncState{Symbol: sym, Market: "cn", InitStatus: "pending"})
+		fake.bars[sym] = wideGenBars(dates, 8.0)
+		fake.barsErr[sym] = errors.New("EOF") // 初始全部限流
+	}
+	// 首段 wideInitAbortStreak 次失败后「源恢复」：清空错误表（钩子在取数前触发）。
+	calls := 0
+	fake.onBars = func(string, int) {
+		calls++
+		if calls > wideInitAbortStreak {
+			fake.barsErr = map[string]error{}
+		}
+	}
+	oldBackoff := wideInitBackoff
+	wideInitBackoff = 5 * time.Millisecond
+	t.Cleanup(func() { wideInitBackoff = oldBackoff })
+	svc := &MarketService{wide: fake}
+	log, err := svc.initMarketWideHistory(context.Background())
+	if err != nil {
+		t.Fatalf("退避恢复轮不应返回错误: %v", err)
+	}
+	if log.Status != "success" || log.Succeeded != n || log.Failed != 0 {
+		t.Fatalf("退避后应全部建史: %+v", log)
+	}
+	var pending int64
+	common.DB.Model(&model.MarketSyncState{}).Where("init_status = ?", "pending").Count(&pending)
+	if pending != 0 {
+		t.Fatalf("退避恢复后不应残留 pending: %d", pending)
 	}
 }
 

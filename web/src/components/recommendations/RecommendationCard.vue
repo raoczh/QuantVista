@@ -55,6 +55,8 @@ const firstReason = computed(() => props.item.detail?.reason?.[0] || props.item.
 const firstRisk = computed(() => props.item.detail?.risks?.[0] || '风险信息不足，不能按无风险处理')
 
 const evidenceShow = ref(false)
+const strategyHit = computed(() => props.candidate?.strategy_hit || null)
+const strategyNotes = computed(() => props.candidate?.bonus || [])
 
 const linking = ref(false)
 /** 把已持有但未登记血缘的持仓补关联到本条推荐。 */
@@ -90,6 +92,10 @@ async function linkExistingPosition() {
       <div class="state-tags">
         <n-tag size="small" round :bordered="false" :type="decision === 'buy_research' ? 'success' : decision === 'insufficient' ? 'warning' : 'default'">
           {{ RECOMMENDATION_DECISION_LABEL[decision] }}
+        </n-tag>
+        <!-- 选股类推荐策略：该股对所选策略条件的命中度（与选股页扫描同因子同求值） -->
+        <n-tag v-if="strategyHit" size="small" round :bordered="false" :type="strategyHit.full ? 'success' : 'default'">
+          策略条件 {{ strategyHit.hit }}/{{ strategyHit.total }}
         </n-tag>
         <n-tag v-if="item.detail?.degraded_source" size="small" type="warning" :bordered="false">规则降级结果</n-tag>
       </div>
@@ -223,6 +229,17 @@ async function linkExistingPosition() {
           <section v-if="item.detail.evidence?.length">
             <h4>行情与程序证据</h4>
             <ul><li v-for="(line, index) in item.detail.evidence" :key="index">{{ line }}</li></ul>
+          </section>
+          <section v-if="strategyHit">
+            <h4>策略条件命中（{{ strategyHit.hit }}/{{ strategyHit.total }}<template v-if="strategyHit.trade_date">，按 {{ strategyHit.trade_date }} 收盘</template>）</h4>
+            <ul>
+              <li v-for="(line, index) in strategyHit.matched || []" :key="`m${index}`">{{ line }}</li>
+              <li v-for="(line, index) in strategyHit.missed || []" :key="`x${index}`" :style="{ color: downColor }">✗ {{ line }}</li>
+            </ul>
+          </section>
+          <section v-if="strategyNotes.length">
+            <h4>量化加减分明细</h4>
+            <ul><li v-for="(line, index) in strategyNotes" :key="index">{{ line }}</li></ul>
           </section>
           <section v-if="item.detail.bear">
             <h4>AI 反方观点</h4>

@@ -24,7 +24,7 @@ type RecommendationBatch struct {
 	UserID   int64  `gorm:"index:idx_rb_user" json:"user_id"`
 	Type     string `gorm:"size:16;index:idx_rb_user" json:"type"` // short_term / long_term
 	Market   string `gorm:"size:8" json:"market"`
-	Strategy string `gorm:"size:32" json:"strategy"` // 策略模板 key
+	Strategy string `gorm:"size:64" json:"strategy"` // 策略模板 key（内置推荐策略 / screen:<key> / tpl:<key> / screen:u<id>）
 	// Title 生成时由筛选条件组合固化（如「短线·动量突破·≤30元·3只」）。
 	// 历史列表直接展示，不再依赖前端用「当前所选类型的策略列表」动态查名
 	//（旧做法导致跨类型批次显示原始 key 如 "value"，且随类型切换变化）。

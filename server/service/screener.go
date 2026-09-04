@@ -1027,16 +1027,26 @@ func validScreenRisk(r string) bool   { return r == "low" || r == "mid" || r == 
 // 名额分配仍由 assignScanQuota 轮转控制）。
 const strategySignalPoolLimit = 30
 
-// strategySignalHits 推荐池的策略信号来源：按推荐策略映射的内置选股策略
-// （recStrategySignalKey）做全市场扫描，返回成交额降序的前 n 只命中。
+// strategySignalHits 推荐池的策略信号来源：内置推荐策略按映射的内置选股策略
+// （recStrategySignalKey）扫描；选股类推荐策略直接扫描用户所选的选股策略（自建策略
+// 按 userID 解析当前 revision）。返回成交额降序的前 n 只命中。
 // 宽表未就绪/全市场日线未初始化时返回 nil——best-effort，不阻断建池
 // （与榜单来源单路失败降级同款纪律）。
 // P1 fail-closed：宽表数据落后应有交易日超过 1 个开市日时放弃本路来源——
 // 旧形态命中的「策略信号」会把过期技术形态当最新供给喂进推荐池。
-func strategySignalHits(ctx context.Context, recType, stratKey string, n int) []ScanHit {
-	key := recStrategySignalKey(recType, stratKey)
+func strategySignalHits(ctx context.Context, userID int64, recType string, strat *strategyTemplate, n int) []ScanHit {
+	req := ScanRequest{Limit: n}
+	key := strat.Key
+	if strat.screen != nil {
+		req = strat.scanRequest(n)
+	} else {
+		key = recStrategySignalKey(recType, strat.Key)
+		req.StrategyKey = key
+	}
 	svc := ScreenerService{}
-	res, err := svc.Scan(ctx, 0, ScanRequest{StrategyKey: key, Limit: n})
+	// 嵌套在推荐作业内：剥离作业执行上下文，否则 Scan 的 load_strategy/factor_table/
+	// scan_universe 会以推荐 JobRun 的顶层步骤写入，把 candidate_pool 提前收敛为成功。
+	res, err := svc.Scan(withoutJobExecution(ctx), userID, req)
 	if err != nil {
 		common.SysDebug("策略信号来源跳过（%s）: %v", key, err)
 		return nil

@@ -63,7 +63,7 @@ const discoveryLabel = computed(() => ({ success: '完整', partial: '部分可�
         <header class="batch-head">
           <div>
             <div class="batch-title">{{ current.title || (current.type === 'short_term' ? '短线推荐' : '长线推荐') }}</div>
-            <div class="batch-meta">生成 {{ new Date(current.created_at).toLocaleString('zh-CN', { hour12: false }) }} · 策略 {{ current.strategy_version || current.strategy }} · Prompt {{ current.prompt_version || '未知' }}</div>
+            <div class="batch-meta">生成 {{ new Date(current.created_at).toLocaleString('zh-CN', { hour12: false }) }} · 量化版本 {{ current.strategy_version || '未知' }} · Prompt {{ current.prompt_version || '未知' }}</div>
           </div>
           <n-tag :type="current.status === 'success' ? 'success' : current.status === 'failed' ? 'error' : current.status === 'degraded' ? 'warning' : 'info'" :bordered="false">
             {{ businessStatusLabel(current.status) }}

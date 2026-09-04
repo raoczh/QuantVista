@@ -163,3 +163,51 @@ func TestSystemConfidence(t *testing.T) {
 		t.Fatalf("中间情形应为 medium，得到 %s", lvl)
 	}
 }
+
+// TestStrategyDimWeights s10 策略权重：每组合计 1；回踩/价值的动量+位置权重必须低于默认
+// 且风险权重更高（不奖励追高）；活跃的量能权重最高；未知 key 回退到该类型默认策略权重。
+func TestStrategyDimWeights(t *testing.T) {
+	sum := func(ws ...float64) float64 {
+		s := 0.0
+		for _, w := range ws {
+			s += w
+		}
+		return s
+	}
+	for _, c := range []struct{ rt, key string }{
+		{model.RecTypeShortTerm, "momentum"}, {model.RecTypeShortTerm, "pullback"}, {model.RecTypeShortTerm, "active"},
+		{model.RecTypeLongTerm, "value"}, {model.RecTypeLongTerm, "growth"}, {model.RecTypeLongTerm, "leader"},
+		{model.RecTypeShortTerm, ""}, {model.RecTypeLongTerm, "nope"},
+	} {
+		tr, mo, po, vo, ri := strategyDimWeights(c.rt, c.key)
+		if s := sum(tr, mo, po, vo, ri); s < 0.999 || s > 1.001 {
+			t.Fatalf("%s/%s 权重合计 %.3f ≠ 1", c.rt, c.key, s)
+		}
+	}
+	_, mMo, mPo, _, mRi := strategyDimWeights(model.RecTypeShortTerm, "momentum")
+	_, pMo, pPo, _, pRi := strategyDimWeights(model.RecTypeShortTerm, "pullback")
+	if pMo >= mMo || pPo >= mPo || pRi <= mRi {
+		t.Fatalf("回踩策略应降动量/位置、升风险权重: pullback=(%v,%v,%v) momentum=(%v,%v,%v)", pMo, pPo, pRi, mMo, mPo, mRi)
+	}
+	_, gMo, gPo, _, gRi := strategyDimWeights(model.RecTypeLongTerm, "growth")
+	_, vMo, vPo, _, vRi := strategyDimWeights(model.RecTypeLongTerm, "value")
+	if vMo >= gMo || vPo >= gPo || vRi <= gRi {
+		t.Fatalf("价值策略应降动量/位置、升风险权重")
+	}
+	aTr, aMo, aPo, aVo, aRi := strategyDimWeights(model.RecTypeShortTerm, "active")
+	if aVo <= aTr || aVo <= aMo || aVo <= aPo || aVo <= aRi {
+		t.Fatalf("活跃策略量能权重应最高: %v", aVo)
+	}
+	// 同一五维分下，全部维度相等时任何权重合成结果不变（合计 1 的不变量）。
+	sc := ScoreResult{Trend: 60, Momentum: 60, Position: 60, Volume: 60, Risk: 60}
+	for _, key := range []string{"momentum", "pullback", "active"} {
+		if got := strategyScoreTotal(model.RecTypeShortTerm, key, sc); got < 59.999 || got > 60.001 {
+			t.Fatalf("%s 等分合成应为 60，得到 %v", key, got)
+		}
+	}
+	// 高位强动量 + 高风险的候选：回踩策略基础分应显著低于动量策略。
+	hot := ScoreResult{Trend: 90, Momentum: 95, Position: 95, Volume: 80, Risk: 20}
+	if strategyScoreTotal(model.RecTypeShortTerm, "pullback", hot) >= strategyScoreTotal(model.RecTypeShortTerm, "momentum", hot) {
+		t.Fatalf("追高型候选在回踩策略下不应得到不低于动量策略的基础分")
+	}
+}

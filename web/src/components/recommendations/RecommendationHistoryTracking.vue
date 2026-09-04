@@ -45,7 +45,7 @@ function statusType(value: string) {
           <button v-for="item in history" :key="item.id" type="button" class="history-row" :class="{ active: currentID === item.id }" @click="emit('open', item)">
             <span class="history-main">
               <span class="history-title">{{ item.title || (item.type === 'short_term' ? '短线推荐' : '长线推荐') }}</span>
-              <span class="history-meta">{{ time(item.created_at) }} · 数据截止见结果卡 · 策略 {{ item.strategy_version || item.strategy }}</span>
+              <span class="history-meta">{{ time(item.created_at) }} · 数据截止见结果卡 · 量化版本 {{ item.strategy_version || '未知' }}</span>
             </span>
             <span class="history-side">
               <n-tag size="tiny" :type="statusType(item.status)" :bordered="false">{{ businessStatusLabel(item.status) }}</n-tag>

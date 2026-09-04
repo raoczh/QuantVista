@@ -584,8 +584,11 @@ func TestRecordBatchFactsAndAdvance(t *testing.T) {
 	setupTestDB(t)
 	cleanLabelTables(t)
 
-	signalDate := "2026-06-01"
-	created, _ := time.Parse("2006-01-02 15:04", "2026-06-01 15:30")
+	// 信号日取「今天 - 40 天」的相对日期：标签推进对 signal 90 日外仍数据不足的 horizon 会
+	// 终态化（no_data/forced），写死历史日期的断言会随日历流逝失效。
+	signalDay := time.Now().AddDate(0, 0, -40)
+	signalDate := signalDay.Format("2006-01-02")
+	created := time.Date(signalDay.Year(), signalDay.Month(), signalDay.Day(), 15, 30, 0, 0, time.UTC)
 	batch := &model.RecommendationBatch{
 		UserID: 1, Type: model.RecTypeShortTerm, Market: "cn", Strategy: "momentum",
 		Status: model.RecStatusSuccess, Regime: RegimeDefense, CreatedAt: created,

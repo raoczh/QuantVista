@@ -17,6 +17,10 @@ export interface Strategy {
   key: string
   name: string
   desc: string
+  // 分组：rec（推荐内置）/ screen（选股内置）/ template（新手模板）/ custom（我的策略）；旧版无此字段
+  group?: 'rec' | 'screen' | 'template' | 'custom'
+  period?: 'short' | 'swing' | 'mid'
+  risk?: 'low' | 'mid' | 'high'
 }
 
 // 候选筛选条件（阶段②用户硬过滤；0 = 不限）。
@@ -97,6 +101,8 @@ export interface PoolCandidate {
     bar_count: number
   }
   score_dims?: { trend: number; momentum: number; position: number; volume: number; risk: number }
+  // 选股类推荐策略的条件命中评估（与选股引擎同因子同求值；内置推荐策略无此字段）
+  strategy_hit?: { total: number; hit: number; full: boolean; matched?: string[]; missed?: string[]; trade_date?: string }
 }
 
 // 证据数字核验结果与 AI 复核结论类型统一由 trust.ts 提供（见文件顶部 re-export）。

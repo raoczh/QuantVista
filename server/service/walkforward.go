@@ -312,7 +312,7 @@ func wfScoreStock(symbol, name string, sub []datasource.Bar, defs []wfStrategyDe
 				delta -= 5
 			}
 		}
-		scores[si] = round2(clamp0100(sc.Total + delta))
+		scores[si] = round2(clamp0100(strategyScoreTotal(def.recType, def.key, sc) + delta))
 	}
 	return scores
 }

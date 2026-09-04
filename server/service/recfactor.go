@@ -225,6 +225,44 @@ func stddev(xs []float64) float64 {
 	return math.Sqrt(ss / float64(len(xs)-1))
 }
 
+// strategyDimWeights 五维基础分按策略意图重加权（合计 1.0）。s10 起启用：computeScore
+// 的默认权重（趋势 .30/动量 .25/位置 .15/量能 .15/风险 .15）是动量导向，位置维「越高越强」、
+// 动量维「越涨越强」对回踩/价值策略会系统性奖励追高——与「回调至支撑低吸」「估值低位
+// 防御」的选股意图正交甚至相反，±20 分的策略加分项难以扭转基础分排序。这里让基础分先
+// 与策略意图对齐，加分项只做细化；computeScore 本身不动（个股详情/对比/走查复刻共用）。
+// 选股类推荐策略沿用其映射的基础推荐策略权重。
+func strategyDimWeights(recType, baseKey string) (trend, momentum, position, volume, risk float64) {
+	if recType == model.RecTypeShortTerm {
+		switch baseKey {
+		case "pullback":
+			// 强势回踩：趋势仍要强（前期强势），动量与位置弱化（回调中本就不涨、不在高位），
+			// 风险维加重（回撤/ATR 可控才是健康回踩）。
+			return 0.35, 0.10, 0.05, 0.10, 0.40
+		case "active":
+			// 热点活跃：量能是主信号，动量次之。
+			return 0.20, 0.25, 0.10, 0.35, 0.10
+		default: // momentum
+			return 0.30, 0.30, 0.15, 0.15, 0.10
+		}
+	}
+	switch baseKey {
+	case "value":
+		// 价值低估：稳健优先——风险维主导，趋势/动量只作确认，位置几乎不计（低位是特征不是缺陷）。
+		return 0.15, 0.10, 0.05, 0.10, 0.60
+	case "leader":
+		// 龙头优选：确定性与稳定性——趋势 + 风险。
+		return 0.30, 0.15, 0.10, 0.10, 0.35
+	default: // growth
+		return 0.35, 0.25, 0.15, 0.10, 0.15
+	}
+}
+
+// strategyScoreTotal 按策略权重合成五维基础总分（0-100）。
+func strategyScoreTotal(recType, baseKey string, sc ScoreResult) float64 {
+	wt, wm, wp, wv, wr := strategyDimWeights(recType, baseKey)
+	return clamp0100(wt*sc.Trend + wm*sc.Momentum + wp*sc.Position + wv*sc.Volume + wr*sc.Risk)
+}
+
 // strategyAdjust 策略加分/扣分（逐条给中文说明，随候选落库展示——评分可解释是信任的根基）。
 // 返回分数增量与说明列表。参数阈值来自社区实战共识（量比 1.5~5 温和/有效放量、
 // 换手 3~15% 活跃、BIAS20>12% 超买、近 20 日涨幅 ≥15% 为前期强势 等）。

@@ -139,7 +139,8 @@ func Migrate() error {
 	}{
 		{&PortfolioSnapshot{}, "idx_psnap_uniq"},
 		{&PaperHolding{}, "idx_ph_uniq"},
-		{&PaperAccount{}, "idx_paper_accounts_user_id"},
+		// 只删旧的 user_id **唯一**索引；同名普通索引是 PaperAccount.UserID 的 gorm:"index"
+		// 每次 AutoMigrate 重建的合法索引，曾被一并列入而每次启动都「建了再删」。
 		{&PaperAccount{}, "uni_paper_accounts_user_id"},
 		{&PaperCorpAdjust{}, "idx_papercorpadj_uniq"},
 		{&PositionCorpAdjust{}, "idx_corpadj_uniq"},

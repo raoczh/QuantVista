@@ -19,7 +19,7 @@ type RecommendationReflection struct {
 
 	UserID   int64  `gorm:"index:idx_rr_user" json:"user_id"`
 	Symbol   string `gorm:"size:16;index:idx_rr_symbol" json:"symbol"`
-	Strategy string `gorm:"size:32" json:"strategy"`
+	Strategy string `gorm:"size:64" json:"strategy"`
 	RecType  string `gorm:"size:16" json:"rec_type"` // short_term / long_term
 
 	Outcome   string  `gorm:"size:16" json:"outcome"` // win / loss / take_profit / stop_loss（成熟标签结算口径）

@@ -41,9 +41,14 @@ const (
 	// wideInitBatch 每批从 states 取的行数（游标向前，防失败行在同轮内反复被取）。
 	wideInitBatch = 100
 	// wideInitAbortStreak 连续源类失败（网络/限流，非 ErrNoData）达此值判定"源故障"，
-	// 本轮中止且不把失败记到标的头上——push2his 被限流时逐只硬扫会把全宇宙误标
-	// failed，还等于加速打上游。中止后下一轮 job/手动再试。
+	// 不把失败记到标的头上——push2his 被限流时逐只硬扫会把全宇宙误标 failed，还等于
+	// 加速打上游。判定后先退避（wideInitBackoff，覆盖东财断路器 2 分钟熔断窗）再续跑，
+	// 退避 wideInitMaxBackoffs 次仍连续失败才中止本轮。
+	// 生产复盘（2026-09）：旧逻辑一撞限流即中止、每日仅在 16:10 增量后触发一次，
+	// 连续 17 天「连续 10 只失败中止」，2/3 宇宙始终无 250 日历史（宽表 MA60/MA250/
+	// 筹码全 NaN，选股与推荐信号供给被静默腰斩）。
 	wideInitAbortStreak = 10
+	wideInitMaxBackoffs = 4
 	// rebaseTolerance close 相对偏差超过该比例判除权（前复权重锚偏差通常 >1%；
 	// 跨批浮点/decimal(20,4) 精度误差 <0.01%。更小的分红除权偏差会漏检，
 	// 但量级 <0.5% 对因子影响可忽略，属承认的简化）。
@@ -56,6 +61,9 @@ const (
 	// wideRebaseThrottle 增量轮内逐只重锚的节流。
 	wideRebaseThrottle = 300 * time.Millisecond
 )
+
+// wideInitBackoff 历史初始化源故障退避时长（变量便于单测调小；覆盖东财断路器 2 分钟熔断窗）。
+var wideInitBackoff = 150 * time.Second
 
 // wideSyncRunning / wideInitRunning 并发防抖（手动触发与后台任务共用）。
 var (
@@ -540,8 +548,11 @@ func (s *MarketService) initMarketWideHistory(ctx context.Context) (*model.DataS
 	canceled, srcAborted := false, false
 	// 源类失败（网络/限流）与标的失败（ErrNoData/代码非法）分开记：前者攒着，
 	// 有成功夹杂说明源活着才落库（零散网络失败也算标的一次尝试）；连续达阈值
-	// 判源故障，整批丢弃不怪标的。
+	// 判源故障，整批丢弃不怪标的，退避后从当前游标续跑。
 	srcFailStreak := 0
+	backoffs := 0
+	lastSrcErr := ""
+	lastGoodID := int64(0) // 连续源失败段之前最后一个已处理标的的 id（退避后从此续跑）
 	var srcFails []model.MarketSyncState
 	var srcFailErrs []string
 	recordFail := func(st *model.MarketSyncState, msg string) {
@@ -580,6 +591,9 @@ loop:
 			}
 			lastID = st.ID
 			bars, err := s.wideDailyBars(ctx, "cn", st.Symbol, wideBarLimit)
+			if err == nil || errors.Is(err, datasource.ErrNoData) || errors.Is(err, datasource.ErrSymbolInvalid) {
+				lastGoodID = st.ID // 非源类结果：该标的已定案，退避回退不必重取
+			}
 			switch {
 			case err != nil && ctx.Err() != nil: // 预算用尽/暂停不是标的问题，不记失败
 				canceled = true
@@ -594,12 +608,28 @@ loop:
 				recordFail(st, err.Error())
 			case err != nil:
 				srcFailStreak++
+				lastSrcErr = err.Error()
 				srcFails = append(srcFails, *st)
 				srcFailErrs = append(srcFailErrs, err.Error())
 				if srcFailStreak >= wideInitAbortStreak {
 					srcFails, srcFailErrs = nil, nil // 源故障不怪标的
-					srcAborted = true
-					break loop
+					srcFailStreak = 0
+					if backoffs >= wideInitMaxBackoffs {
+						srcAborted = true
+						break loop
+					}
+					backoffs++
+					common.SysWarn("全市场历史初始化：东财日线连续 %d 只失败（%s），退避 %v 后续跑（第 %d/%d 次）",
+						wideInitAbortStreak, truncate(lastSrcErr, 120), wideInitBackoff, backoffs, wideInitMaxBackoffs)
+					// 游标回退到连续失败段之前：这些标的未被记失败，退避后重取。
+					lastID = lastGoodID
+					select {
+					case <-ctx.Done():
+						canceled = true
+						break loop
+					case <-time.After(wideInitBackoff):
+					}
+					continue loop
 				}
 			default:
 				flushSrcFails()
@@ -636,9 +666,9 @@ loop:
 	switch {
 	case srcAborted:
 		log.Status = "failed"
-		log.Message = truncate(fmt.Sprintf("东财日线连续 %d 只失败，疑似源限流，本轮中止（标的状态未记失败，断点续传）: 本轮处理 %d/%d",
-			wideInitAbortStreak, log.Total, pendingTotal), 512)
-		common.SysWarn("全市场历史初始化中止：东财日线疑似被限流（连续 %d 只失败）", wideInitAbortStreak)
+		log.Message = truncate(fmt.Sprintf("东财日线连续 %d 只失败且退避 %d 次仍未恢复（最后错误：%s），本轮中止（标的状态未记失败，断点续传）: 本轮处理 %d/%d",
+			wideInitAbortStreak, wideInitMaxBackoffs, lastSrcErr, log.Total, pendingTotal), 512)
+		common.SysWarn("全市场历史初始化中止：东财日线疑似被限流（连续 %d 只失败，最后错误 %s）", wideInitAbortStreak, lastSrcErr)
 	case canceled:
 		log.Message = truncate(fmt.Sprintf("已暂停/超时（断点续传）: 本轮处理 %d/%d", log.Total, pendingTotal), 512)
 	default:

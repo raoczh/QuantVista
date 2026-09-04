@@ -80,7 +80,7 @@ type RecommendationLabel struct {
 	ActualBuyPrice float64 `gorm:"type:decimal(20,4)" json:"actual_buy_price"`
 
 	// 归因维度冗余（S0-6 确定性错误归因报表直接分组，免 join 快照 JSON）。
-	Strategy      string  `gorm:"size:32" json:"strategy"`
+	Strategy      string  `gorm:"size:64" json:"strategy"`
 	Source        string  `gorm:"size:32" json:"source"`   // 候选首来源
 	Industry      string  `gorm:"size:32" json:"industry"` // 生成时行业（宇宙快照口径，可空）
 	Regime        string  `gorm:"size:16" json:"regime"`   // 生成时市场状态（S1-1）

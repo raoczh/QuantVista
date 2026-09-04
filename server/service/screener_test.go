@@ -896,7 +896,8 @@ func TestStrategySignalHits(t *testing.T) {
 	defer resetFactorTable()
 
 	// 无日线：best-effort 空，不报错。
-	if hits := strategySignalHits(context.Background(), model.RecTypeLongTerm, "leader", 10); hits != nil {
+	leader, _ := strategyByKey(model.RecTypeLongTerm, "leader")
+	if hits := strategySignalHits(context.Background(), 0, model.RecTypeLongTerm, leader, 10); hits != nil {
 		t.Fatalf("无数据应返回 nil, got %d", len(hits))
 	}
 	// 有数据：leader → bull-align-trend 命中上升趋势股。
@@ -910,7 +911,7 @@ func TestStrategySignalHits(t *testing.T) {
 	seedWideStock(t, "600100", "甲股", trendBars)
 	pinCalendarTo(t, trendBars[len(trendBars)-1].TradeDate, time.Now().Format("2006-01-02"))
 	resetFreshCacheOnly()
-	hits := strategySignalHits(context.Background(), model.RecTypeLongTerm, "leader", 10)
+	hits := strategySignalHits(context.Background(), 0, model.RecTypeLongTerm, leader, 10)
 	if len(hits) != 1 || hits[0].Symbol != "600100" {
 		t.Fatalf("策略信号命中异常: %+v", hits)
 	}

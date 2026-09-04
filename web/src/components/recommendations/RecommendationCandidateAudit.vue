@@ -69,6 +69,10 @@ function sources(item: PoolCandidate) {
             <StockIdentity :symbol="item.symbol" :market="item.market || 'cn'" :name="item.name" density="table" clickable />
             <span>{{ sources(item) }}</span>
             <span class="qv-tnum">排名 {{ item.rank || '—' }} · 量化分 {{ item.score?.toFixed(1) || '—' }}</span>
+            <n-tag v-if="item.strategy_hit" size="tiny" :type="item.strategy_hit.full ? 'success' : 'default'" :bordered="false"
+              :title="[...(item.strategy_hit.matched || []), ...(item.strategy_hit.missed || []).map((m) => '✗ ' + m)].join('；')">
+              策略条件 {{ item.strategy_hit.hit }}/{{ item.strategy_hit.total }}
+            </n-tag>
             <span class="qv-tnum" :style="{ color: pctColor(item.change_pct) }">{{ item.change_pct > 0 ? '+' : '' }}{{ item.change_pct.toFixed(2) }}%</span>
             <n-tag v-if="selectedSymbols.has(`${item.market || 'cn'}:${item.symbol}`)" size="tiny" type="success" :bordered="false">最终推荐</n-tag>
             <n-tag v-else-if="item.sent_to_llm" size="tiny" type="info" :bordered="false">进入 AI 名单</n-tag>
@@ -119,7 +123,7 @@ header p { margin: 4px 0 12px; font-size: 12px; opacity: 0.66; }
 .candidate-list { display: grid; }
 .candidate-row {
   display: grid;
-  grid-template-columns: minmax(180px, 1.2fr) minmax(120px, 1fr) auto auto auto;
+  grid-template-columns: minmax(180px, 1.2fr) minmax(120px, 1fr) auto auto auto auto;
   min-width: 0;
   align-items: center;
   gap: 8px 14px;
