@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NAlert,
@@ -22,6 +22,8 @@ import {
   type HindsightView,
 } from '@/api/analysis'
 import type { RiskFlag } from '@/api/trust'
+import { getSessionEpoch } from '@/api/token'
+import { formatPrice } from '@/lib/formatPrice'
 import { useUi } from '@/composables/useUi'
 import SectionCard from '@/components/SectionCard.vue'
 import StockIdentity from '@/components/StockIdentity.vue'
@@ -37,7 +39,8 @@ import {
   suggestedAction,
 } from './analysisPresentation'
 
-const props = defineProps<{ current: AnalysisView | null; loading: boolean }>()
+const props = defineProps<{ current: AnalysisView | null; loading: boolean; canExplainHistory?: boolean }>()
+const emit = defineEmits<{ 'explain-history': [] }>()
 const router = useRouter()
 const message = useMessage()
 const { upColor, downColor, flatColor, pctColor, vars, withAlpha } = useUi()
@@ -52,11 +55,54 @@ const hindsightLoading = ref(false)
 const hindsight = ref<HindsightView | null>(null)
 const targetPrice = ref<number | null>(null)
 const stopPrice = ref<number | null>(null)
+const hindsightError = ref('')
+const checkedPrices = ref<{ target: number | null; stop: number | null } | null>(null)
+const sessionEpoch = getSessionEpoch()
+let active = true
+const pageIsCurrent = () => active && sessionEpoch === getSessionEpoch()
+let diffSequence = 0
+let hindsightSequence = 0
+function resetRecordDetails() {
+  ++diffSequence
+  ++hindsightSequence
+  details.value = []
+  snapshotShow.value = rawShow.value = diffShow.value = hindsightShow.value = false
+  diffLoading.value = hindsightLoading.value = false
+  diff.value = null
+  hindsight.value = null
+  hindsightError.value = ''
+  checkedPrices.value = null
+  targetPrice.value = stopPrice.value = null
+}
+watch(() => props.current?.id, resetRecordDetails, { flush: 'sync' })
+watch([targetPrice, stopPrice], () => {
+  ++hindsightSequence
+  hindsightLoading.value = false
+  hindsightError.value = ''
+  checkedPrices.value = null
+  if (hindsight.value) {
+    const { target_touch: _target, stop_touch: _stop, ...facts } = hindsight.value
+    hindsight.value = facts
+  }
+}, { flush: 'sync' })
+watch(hindsightShow, shown => {
+  if (!shown) {
+    ++hindsightSequence
+    hindsightLoading.value = false
+  }
+}, { flush: 'sync' })
+watch(diffShow, shown => {
+  if (!shown) {
+    ++diffSequence
+    diffLoading.value = false
+  }
+}, { flush: 'sync' })
+onBeforeUnmount(() => { active = false; resetRecordDetails() })
 
 const freshness = computed(() => parseSnapshotFreshness(props.current?.data_snapshot))
 const snapshotObject = computed<Record<string, unknown> | null>(() => {
   if (!props.current?.data_snapshot) return null
-  try { return JSON.parse(props.current.data_snapshot) as Record<string, unknown> }
+  try { return asObject(JSON.parse(props.current.data_snapshot)) }
   catch { return null }
 })
 const snapshotText = computed(() => {
@@ -72,17 +118,27 @@ const validUntil = computed(() => {
   return '行情、持仓或风险事实发生变化即需重新评估'
 })
 const canDiff = computed(() => props.current?.status === 'success' && props.current.mode !== 'panel')
-const canHindsight = computed(() => props.current?.status !== 'processing' && props.current?.module === 'stock' && !!props.current.symbol)
+const canHindsight = computed(() => props.current?.status !== 'processing' && props.current?.module === 'stock' && props.current.market === 'cn' && !!props.current.symbol)
+const canVerifyTouches = computed(() => (targetPrice.value ?? 0) > 0 || (stopPrice.value ?? 0) > 0)
+function asObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
 const metrics = computed(() => {
   const snapshot = snapshotObject.value
-  const quote = snapshot?.quote as Record<string, unknown> | undefined
-  const indicators = snapshot?.indicators as Record<string, unknown> | undefined
-  const valuation = snapshot?.valuation as Record<string, unknown> | undefined
-  const score = snapshot?.quant_score as Record<string, unknown> | undefined
+  const quote = asObject(snapshot?.quote)
+  const indicators = asObject(snapshot?.technicals)
+  const valuation = asObject(snapshot?.valuation)
+  const score = asObject(snapshot?.quant_score)
+  const price = quote?.price ?? snapshot?.price
+  const hasIndicators = typeof indicators?.bar_count === 'number' && indicators.bar_count > 0
+  const hasValuation = ['pe_ttm', 'pe_dynamic', 'pb', 'total_cap', 'float_cap', 'turnover_rate', 'amplitude', 'volume_ratio', 'limit_up', 'limit_down']
+    .some(key => typeof valuation?.[key] === 'number' && Number.isFinite(valuation[key]))
+  const valuationNote = typeof valuation?.note === 'string' ? valuation.note : ''
+  const valuationStale = typeof valuation?.valuation_stale === 'string' ? valuation.valuation_stale : ''
   return [
-    { label: '行情价格', value: quote?.price ?? snapshot?.price, asOf: freshness.value.quoteAsOf, range: '单点行情', missing: !(quote?.price ?? snapshot?.price) },
-    { label: '日线与技术指标', value: indicators ? '已提供' : '', asOf: freshness.value.barsAsOf, range: indicators?.bar_count ? `${indicators.bar_count} 根日线` : '范围未记录', missing: !indicators },
-    { label: '估值', value: valuation ? '已提供' : '', asOf: freshness.value.capturedAt, range: '快照字段', missing: !valuation },
+    { label: '行情价格', value: formatPrice(typeof price === 'number' ? price : null), asOf: freshness.value.quoteAsOf, range: '单点行情', missing: typeof price !== 'number' || !Number.isFinite(price) || price <= 0 },
+    { label: '日线与技术指标', value: hasIndicators ? '已提供' : '', asOf: freshness.value.barsAsOf, range: hasIndicators ? `${indicators!.bar_count} 根日线` : '范围未记录', missing: !hasIndicators },
+    { label: '估值', value: hasValuation ? (valuationStale ? '已提供（已过期）' : '已提供') : valuationNote, asOf: valuation?.source_data_time, range: valuationStale || valuationNote || '快照字段', missing: !hasValuation && !valuationNote },
     { label: '程序量化评分', value: score?.total ?? (score ? '已提供' : ''), asOf: freshness.value.barsAsOf || freshness.value.capturedAt, range: '统一规则评分', missing: !score },
   ]
 })
@@ -102,28 +158,44 @@ function formatTime(value: string) { return value ? new Date(value).toLocaleStri
 function signed(value: number | undefined | null) { return value == null ? '—' : `${value > 0 ? '+' : ''}${value.toFixed(2)}%` }
 
 async function openDiff() {
-  if (!props.current) return
+  if (!props.current || !pageIsCurrent() || diffLoading.value) return
+  const id = props.current.id
+  const sequence = ++diffSequence
   diffLoading.value = true
   try {
-    diff.value = await getAnalysisDiff(props.current.id)
+    const value = await getAnalysisDiff(id)
+    if (!pageIsCurrent() || sequence !== diffSequence || props.current?.id !== id) return
+    diff.value = value
     diffShow.value = true
-  } catch (reason) { message.warning((reason as Error).message) }
-  finally { diffLoading.value = false }
+  } catch (reason) {
+    if (pageIsCurrent() && sequence === diffSequence) message.warning((reason as Error).message)
+  } finally { if (sequence === diffSequence) diffLoading.value = false }
 }
 async function openHindsight(refresh = false) {
-  if (!props.current) return
-  hindsightLoading.value = true
+  if (!props.current || !pageIsCurrent() || hindsightLoading.value || (refresh && !canVerifyTouches.value)) return
   if (!refresh) {
     hindsight.value = null
     targetPrice.value = null
     stopPrice.value = null
     hindsightShow.value = true
   }
-  try { hindsight.value = await getAnalysisHindsight(props.current.id, targetPrice.value || undefined, stopPrice.value || undefined) }
+  const id = props.current.id
+  const sequence = ++hindsightSequence
+  const requested = { target: targetPrice.value, stop: stopPrice.value }
+  const isCurrent = () => pageIsCurrent() && hindsightShow.value && sequence === hindsightSequence && props.current?.id === id
+  hindsightLoading.value = true
+  hindsightError.value = ''
+  checkedPrices.value = null
+  try {
+    const value = await getAnalysisHindsight(id, requested.target || undefined, requested.stop || undefined)
+    if (!isCurrent()) return
+    hindsight.value = value
+    if (refresh) checkedPrices.value = requested
+  }
   catch (reason) {
-    message.warning((reason as Error).message)
-    if (!refresh) hindsightShow.value = false
-  } finally { hindsightLoading.value = false }
+    if (!isCurrent()) return
+    hindsightError.value = (reason as Error).message || '回溯读取失败，请重试'
+  } finally { if (sequence === hindsightSequence) hindsightLoading.value = false }
 }
 function ask(useSnapshot: boolean) {
   if (!props.current?.symbol) return
@@ -138,11 +210,12 @@ function ask(useSnapshot: boolean) {
   })
 }
 async function copyResult() {
-  if (!props.current) return
+  if (!props.current || !pageIsCurrent()) return
+  const id = props.current.id
   try {
     await navigator.clipboard.writeText(JSON.stringify(props.current, null, 2))
-    message.success('分析结果已复制')
-  } catch { message.error('复制失败，请检查浏览器剪贴板权限') }
+    if (pageIsCurrent() && props.current?.id === id) message.success('分析结果已复制')
+  } catch { if (pageIsCurrent() && props.current?.id === id) message.error('复制失败，请检查浏览器剪贴板权限') }
 }
 function exportResult() {
   if (!props.current) return
@@ -160,7 +233,7 @@ function exportResult() {
   <SectionCard title="分析结论">
     <template #extra>
       <n-button v-if="canDiff" size="tiny" quaternary :loading="diffLoading" @click="openDiff">快照比较</n-button>
-      <n-button v-if="canHindsight" size="tiny" quaternary @click="openHindsight()">回溯结果</n-button>
+      <n-button v-if="canHindsight" size="tiny" quaternary :loading="hindsightLoading" @click="openHindsight()">回溯结果</n-button>
       <n-button v-if="current" size="tiny" quaternary @click="copyResult">复制</n-button>
       <n-button v-if="current" size="tiny" quaternary @click="exportResult">导出</n-button>
     </template>
@@ -180,6 +253,9 @@ function exportResult() {
         <n-alert v-if="current.status === 'processing'" type="info" :bordered="false">任务正在后台采集证据并分析，刷新页面后可以恢复；页面不会重复提交。</n-alert>
         <n-alert v-else-if="current.status === 'failed'" type="error" :bordered="false">
           {{ current.error || '分析失败' }}。请先核对任务状态中的数据缺口和错误码，再由按钮明确重试。
+          <div v-if="canExplainHistory">
+            <n-button size="small" :disabled="loading" @click="emit('explain-history')">按历史数据解释</n-button>
+          </div>
         </n-alert>
         <n-alert v-else-if="current.status === 'degraded'" type="warning" :bordered="false">结构化结果不完整，已保留模型原文；这不是正常或中性结论。</n-alert>
         <n-alert v-if="current.stale_mode" type="warning" :bordered="false">{{ current.stale_mode_note || '这是过期行情的历史解释，不是当前盘面建议。' }}</n-alert>
@@ -238,7 +314,7 @@ function exportResult() {
           </div>
         </section>
 
-        <n-collapse v-model:value="details" class="details">
+        <n-collapse v-model:expanded-names="details" class="details">
           <n-collapse-item v-if="current.result" title="完整 AI 观点、风险和失效条件" name="full-result">
             <div v-if="current.result.review" class="review-note">
               <n-alert :type="reviewType(current.result.review.verdict)" :bordered="false">AI 复核：{{ current.result.review.comment || '未补充说明' }}。复核不能修改程序风险等级。</n-alert>
@@ -327,15 +403,33 @@ function exportResult() {
     </n-modal>
     <n-modal v-model:show="hindsightShow" preset="card" title="回溯结果（不属于实时建议）" :style="{ width: 'min(680px, calc(100vw - 24px))' }">
       <n-spin :show="hindsightLoading">
-        <n-empty v-if="!hindsight" description="正在读取已落库行情事实" />
-        <div v-else class="hindsight-body">
+          <n-alert v-if="hindsightError" type="error" :bordered="false">
+            {{ hindsightError }}
+            <n-button v-if="!hindsight" size="small" :loading="hindsightLoading" @click="openHindsight()">重新读取</n-button>
+          </n-alert>
+          <n-empty v-if="!hindsight && !hindsightError" description="正在读取已落库行情事实" />
+          <div v-if="hindsight" class="hindsight-body">
           <StockIdentity :symbol="hindsight.symbol" market="cn" :name="hindsight.name" />
-          <p>分析基准 {{ hindsight.base_date }} · 基准价 {{ hindsight.base_price.toFixed(2) }} · 已经过 {{ hindsight.elapsed_bars }} 个交易日</p>
+          <p>分析基准 {{ hindsight.base_date }} · 基准价 {{ formatPrice(hindsight.base_price) }} · 已经过 {{ hindsight.elapsed_bars }} 个交易日</p>
           <div class="return-grid">
             <div v-for="key in ['d5', 'd10', 'd20', 'd60'] as const" :key="key"><span>+{{ key.slice(1) }} 日</span><b :style="{ color: hindsight.returns[key] ? pctColor(hindsight.returns[key]!.return_pct) : undefined }">{{ hindsight.returns[key] ? signed(hindsight.returns[key]!.return_pct) : '尚未成熟' }}</b></div>
           </div>
           <p>最大上涨 {{ signed(hindsight.max_gain_pct) }} · 最大回撤 -{{ hindsight.max_drawdown_pct.toFixed(2) }}% · <TermHelp term="alpha" /> {{ signed(hindsight.alpha_pct) }}</p>
-          <div class="touch-form"><n-input-number v-model:value="targetPrice" :min="0" placeholder="目标价" /><n-input-number v-model:value="stopPrice" :min="0" placeholder="止损价" /><n-button :loading="hindsightLoading" @click="openHindsight(true)">验证价位首触</n-button></div>
+          <div class="touch-form"><n-input-number v-model:value="targetPrice" :min="0" placeholder="目标价" /><n-input-number v-model:value="stopPrice" :min="0" placeholder="止损价" /><n-button :loading="hindsightLoading" :disabled="!canVerifyTouches" @click="openHindsight(true)">验证价位首触</n-button></div>
+          <div v-if="checkedPrices" class="touch-results">
+            <p v-if="(checkedPrices.target ?? 0) > 0">
+              目标价 {{ formatPrice(checkedPrices.target) }}：
+              <template v-if="hindsight.target_touch">首次触及 {{ hindsight.target_touch.date }}（第 {{ hindsight.target_touch.day_index }} 个交易日）</template>
+              <template v-else-if="hindsight.elapsed_bars > 0">观察窗口 {{ Math.min(hindsight.elapsed_bars, 60) }} 个交易日内未触及</template>
+              <template v-else>暂无后续日线，尚不能核验</template>
+            </p>
+            <p v-if="(checkedPrices.stop ?? 0) > 0">
+              止损价 {{ formatPrice(checkedPrices.stop) }}：
+              <template v-if="hindsight.stop_touch">首次触及 {{ hindsight.stop_touch.date }}（第 {{ hindsight.stop_touch.day_index }} 个交易日）</template>
+              <template v-else-if="hindsight.elapsed_bars > 0">观察窗口 {{ Math.min(hindsight.elapsed_bars, 60) }} 个交易日内未触及</template>
+              <template v-else>暂无后续日线，尚不能核验</template>
+            </p>
+          </div>
           <p>{{ hindsight.note }}</p>
         </div>
       </n-spin>
@@ -407,7 +501,8 @@ function exportResult() {
 .debate-grid p { display: grid; gap: 3px; }
 .debate-grid small { opacity: .6; }
 .metric-table { display: grid; }
-.metric-row { display: grid; grid-template-columns: minmax(130px,.7fr) minmax(160px,1fr) minmax(180px,1fr) minmax(130px,.8fr); gap: 8px; padding: 9px 0; border-bottom: 1px solid v-bind('vars.dividerColor'); font-size: 12px; }
+.metric-row { display: grid; grid-template-columns: minmax(0,.7fr) minmax(0,1fr) minmax(0,1fr) minmax(0,.8fr); gap: 8px; padding: 9px 0; border-bottom: 1px solid v-bind('vars.dividerColor'); font-size: 12px; }
+.metric-row > * { min-width: 0; overflow-wrap: anywhere; }
 .term-index { margin: 14px 0; gap: 8px 14px; }
 .meta-grid { margin: 0 0 12px; }
 .meta-grid div { min-width: 0; }

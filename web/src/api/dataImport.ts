@@ -16,11 +16,29 @@ export interface DataImportRow {
   error_code?: string
   message?: string
   raw: Record<string, string>
-  normalized?: Record<string, unknown>
+  normalized?: DataImportNormalized
+}
+
+export interface DataImportNormalized {
+  symbol: string
+  market: string
+  name?: string
+  position_type?: string
+  position_id?: number
+  virtual_key?: string
+  side?: string
+  price?: number
+  quantity?: number
+  trade_date?: string
+  fee?: number
+  tax?: number
+  note?: string
+  focus_reason?: string
 }
 
 export interface DataImportBatch {
   id: string
+  account_id?: number
   user_id: number
   kind: DataImportKind
   schema_version: number
@@ -60,7 +78,7 @@ export interface DataImportRollbackResult {
   conflicts: DataImportRollbackConflict[]
 }
 
-export function uploadDataImport(kind: DataImportKind, file: File) {
+export function uploadDataImport(kind: DataImportKind, file: File, accountId?: number) {
   const data = new FormData()
   data.append('kind', kind)
   data.append('file', file)
@@ -68,13 +86,14 @@ export function uploadDataImport(kind: DataImportKind, file: File) {
     url: '/imports',
     method: 'post',
     data,
+    params: { account_id: kind === 'watchlist' ? undefined : accountId },
     headers: { 'Content-Type': 'multipart/form-data' },
     timeout: 60_000,
   })
 }
 
-export function listDataImports(limit = 20) {
-  return request<DataImportBatchSummary[]>({ url: '/imports', params: { limit } })
+export function listDataImports(limit = 20, accountId?: number) {
+  return request<DataImportBatchSummary[]>({ url: '/imports', params: { limit, account_id: accountId } })
 }
 
 export function getDataImport(id: string) {

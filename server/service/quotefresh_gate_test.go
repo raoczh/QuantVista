@@ -390,9 +390,9 @@ func TestQaCurrentFreshness(t *testing.T) {
 	if note == "" || !strings.Contains(note, "2026-07-08") {
 		t.Fatalf("说明应含快照行情时刻: %q", note)
 	}
-	// 无行情时间：不判（空状态），不误报。
-	if st, _ := svc.qaCurrentFreshness("cn", &qaSnapshotMeta{}); st != "" {
-		t.Fatalf("无行情时间不应判定, got %s", st)
+	// 无行情时间：未知，不能沿用创建时的 fresh。
+	if st, _ := svc.qaCurrentFreshness("cn", &qaSnapshotMeta{}); st != freshStatusUnknown {
+		t.Fatalf("无行情时间应明确未知, got %s", st)
 	}
 	// 非 cn 市场：unknown（无日历），fail-closed 交给消费方。
 	if st, _ := svc.qaCurrentFreshness("us", meta); st != freshStatusUnknown {

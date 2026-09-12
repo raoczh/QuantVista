@@ -42,8 +42,10 @@ func TestParseSnapshotMetaLegacy(t *testing.T) {
 	if m == nil {
 		t.Fatalf("旧快照应兜底出 meta")
 	}
-	if m.QuoteAsOf != "2026-07-10 14:55:00" {
-		t.Fatalf("quote_as_of 兜底不符: %q", m.QuoteAsOf)
+	// 展示时间使用部署地时区，但必须保留输入的同一时刻，不能假设测试机为东八区。
+	quoteAt, err := time.ParseInLocation("2006-01-02 15:04:05", m.QuoteAsOf, time.Local)
+	if err != nil || !quoteAt.Equal(time.Date(2026, 7, 10, 6, 55, 0, 0, time.UTC)) {
+		t.Fatalf("quote_as_of 兜底未保留原始时刻: %q err=%v", m.QuoteAsOf, err)
 	}
 	if m.QuoteSource != "sina" {
 		t.Fatalf("quote_source 兜底不符: %q", m.QuoteSource)

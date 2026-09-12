@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onBeforeUnmount, onMounted } from 'vue'
+import { ref, computed, onBeforeUnmount, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -53,6 +53,8 @@ import {
 } from '@/api/screener'
 import { listWatchlists, type WatchlistGroup } from '@/api/watchlist'
 import { ApiRequestError } from '@/api/client'
+import { getSessionEpoch } from '@/api/token'
+import { useAuthStore } from '@/stores/auth'
 import { getLLMTask, listLLMTasks, type LLMTask } from '@/api/llmTask'
 import { isPollCancelled, pollUntil } from '@/lib/poll'
 import { useUi } from '@/composables/useUi'
@@ -67,6 +69,12 @@ import ScreenerHistory from '@/components/screener/ScreenerHistory.vue'
 const message = useMessage()
 const router = useRouter()
 const route = useRoute()
+const auth = useAuthStore()
+const ownerID = auth.user?.id
+const session = getSessionEpoch()
+let disposed = false
+const active = () => !disposed && !!ownerID && route.name === 'screener' && auth.user?.id === ownerID && getSessionEpoch() === session
+const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 const { vars } = useUi()
 const { llmLabel } = useLlmLabel()
 const { isMobile } = useIsMobile()
@@ -83,6 +91,12 @@ const status = ref<FactorTableStatus | null>(null)
 const scanHistory = ref<StrategyRun<ScanResult>[]>([])
 const loading = ref(false)
 const loadError = ref('')
+const statusError = ref('')
+const scanHistoryError = ref('')
+const scanHistoryLoading = ref(false)
+let strategySequence = 0
+let statusSequence = 0
+let scanHistorySequence = 0
 
 const periodFilter = ref<'all' | 'short' | 'swing' | 'mid'>('all')
 const builtinFiltered = computed<BuiltinStrategy[]>(() => {
@@ -100,29 +114,57 @@ function updateRetailParam(templateKey: string, paramKey: string, value: number 
   retailParamValues.value[templateKey][paramKey] = value
 }
 
-async function load() {
+async function loadStrategies() {
+  if (!active() || editorSaving.value || archiving.value) return
+  const sequence = ++strategySequence
   loading.value = true
   loadError.value = ''
   try {
-    ;[data.value, status.value, scanHistory.value] = await Promise.all([
-      getScreenerStrategies(),
-      getScreenerStatus(),
-      listScreenerResults(20).catch(() => scanHistory.value),
-    ])
+    const value = await getScreenerStrategies()
+    if (!active() || sequence !== strategySequence) return
+    data.value = value
     for (const template of data.value?.retail_templates ?? []) {
       if (retailParamValues.value[template.key]) continue
       retailParamValues.value[template.key] = Object.fromEntries(template.params.map((param) => [param.key, param.default]))
     }
-    const resultId = Number(Array.isArray(route.query.result_id) ? route.query.result_id[0] : route.query.result_id)
-    if (Number.isSafeInteger(resultId) && resultId > 0) await openScanResult(resultId, true)
   } catch (e) {
+    if (!active() || sequence !== strategySequence) return
     loadError.value = (e as Error).message || '常用策略读取失败'
-    message.error(loadError.value)
   } finally {
-    loading.value = false
+    if (active() && sequence === strategySequence) loading.value = false
   }
 }
-onMounted(load)
+
+async function loadStatus() {
+  const sequence = ++statusSequence
+  try {
+    const value = await getScreenerStatus()
+    if (!active() || sequence !== statusSequence) return
+    status.value = value
+    statusError.value = ''
+  } catch (e) {
+    if (active() && sequence === statusSequence) statusError.value = (e as Error).message || '数据状态读取失败'
+  }
+}
+
+async function loadScanHistory() {
+  const sequence = ++scanHistorySequence
+  scanHistoryLoading.value = true
+  try {
+    const value = await listScreenerResults(20)
+    if (!active() || sequence !== scanHistorySequence) return
+    scanHistory.value = value
+    scanHistoryError.value = ''
+  } catch (e) {
+    if (active() && sequence === scanHistorySequence) scanHistoryError.value = (e as Error).message || '扫描历史读取失败'
+  } finally {
+    if (active() && sequence === scanHistorySequence) scanHistoryLoading.value = false
+  }
+}
+
+async function load() {
+  await Promise.all([loadStrategies(), loadStatus(), loadScanHistory()])
+}
 
 const statusText = computed(() => {
   const s = status.value
@@ -138,6 +180,8 @@ const scanning = ref('') // 正在扫描的 strategy_key / `custom-{id}` / 'temp
 const result = ref<ScanResult | null>(null)
 const includeST = ref(false)
 const includeStale = ref(false)
+const resultIncludesStale = ref(false)
+const scanError = ref('')
 interface ScanTarget {
   template_key?: string
   template_version?: number
@@ -150,7 +194,32 @@ interface ScanTarget {
 // 最近一次扫描目标（开关切换后重扫用）。
 let lastScanTarget: ScanTarget | null = null
 let scanPollAbort: AbortController | null = null
-onBeforeUnmount(() => scanPollAbort?.abort())
+let scanSequence = 0
+let ownResultRoute = ''
+
+interface ReadOperation { current: () => boolean; controller: AbortController }
+
+function beginScan(tag: string): ReadOperation {
+  scanPollAbort?.abort()
+  const controller = new AbortController()
+  scanPollAbort = controller
+  const sequence = ++scanSequence
+  scanning.value = tag
+  scanError.value = ''
+  return { controller, current: () => active() && scanSequence === sequence && !controller.signal.aborted }
+}
+
+async function setResultRoute(id: number, operation: ReadOperation) {
+  if (!operation.current()) return
+  const value = String(id)
+  if (String(route.query.result_id || '') === value) return
+  ownResultRoute = value
+  try {
+    await router.replace({ name: 'screener', query: { ...route.query, result_id: value } })
+  } finally {
+    if (ownResultRoute === value) ownResultRoute = ''
+  }
+}
 
 function scanTargetFromRequest(request?: ScanRequest | Record<string, unknown>): ScanTarget | null {
   if (!request) return null
@@ -159,40 +228,62 @@ function scanTargetFromRequest(request?: ScanRequest | Record<string, unknown>):
     return {
       template_key: req.template_key,
       template_version: req.template_version,
-      template_params: req.template_params,
+      template_params: req.template_params ? clone(req.template_params) : undefined,
     }
   }
   if (req.strategy_key) return { strategy_key: req.strategy_key }
   if (req.strategy_id) return { strategy_id: req.strategy_id, strategy_revision_id: req.strategy_revision_id }
-  if (req.tree) return { tree: req.tree }
+  if (req.tree) return { tree: clone(req.tree) }
   return null
 }
 
 async function openScanResult(id: number, trackRunning = false) {
-  scanPollAbort?.abort()
-  const controller = new AbortController()
-  scanPollAbort = controller
+  if (!active()) return
+  const operation = beginScan(`result-${id}`)
+  batchShow.value = false
   try {
-    let run = await getScreenerResult(id)
-    if (trackRunning && (run.status === 'queued' || run.status === 'running')) {
-      run = await pollUntil(() => getScreenerResult(id), (value) => value.status !== 'queued' && value.status !== 'running', {
-        intervalMs: 1500,
-        timeoutMs: 15 * 60 * 1000,
-        signal: controller.signal,
-      })
-    }
-    if (run.status !== 'success' || !run.result) throw new Error(run.error || '扫描未生成可用结果')
-    result.value = run.result
-    currentResultId.value = run.id
-    selectedSymbols.value = []
-    watchlistBatch.value = null
-    includeST.value = Boolean((run.request as ScanRequest | undefined)?.include_st)
-    includeStale.value = Boolean((run.request as ScanRequest | undefined)?.include_stale)
-    lastScanTarget = scanTargetFromRequest(run.request)
-    void router.replace({ query: { ...route.query, result_id: String(run.id) } })
+    await setResultRoute(id, operation)
+    await readScanResult(id, trackRunning, operation)
+  } catch (e) {
+    reportScanError(e, operation)
   } finally {
-    if (scanPollAbort === controller) scanPollAbort = null
+    finishScan(operation)
   }
+}
+
+async function readScanResult(id: number, trackRunning: boolean, operation: ReadOperation) {
+  if (!operation.current()) return
+  const { signal } = operation.controller
+  let run = await getScreenerResult(id, signal)
+  if (!operation.current()) return
+  if (trackRunning && (run.status === 'queued' || run.status === 'running')) {
+    run = await pollUntil(() => getScreenerResult(id, signal), (value) => value.status !== 'queued' && value.status !== 'running', {
+      intervalMs: 1500,
+      timeoutMs: 15 * 60 * 1000,
+      signal,
+    })
+  }
+  if (!operation.current()) return
+  if (run.status !== 'success' || !run.result) throw new Error(run.error || '扫描未生成可用结果')
+  result.value = run.result
+  currentResultId.value = run.id
+  selectedSymbols.value = []
+  watchlistBatch.value = null
+  includeST.value = Boolean((run.request as ScanRequest | undefined)?.include_st)
+  includeStale.value = Boolean((run.request as ScanRequest | undefined)?.include_stale)
+  resultIncludesStale.value = includeStale.value
+  lastScanTarget = scanTargetFromRequest(run.request)
+}
+
+function reportScanError(error: unknown, operation: ReadOperation) {
+  if (!operation.current() || isPollCancelled(error)) return
+  scanError.value = (error as Error).message || '扫描结果读取失败'
+  message.error(scanError.value + (result.value ? '；页面保留上次成功结果，请核对下方策略及日期' : ''))
+}
+
+function finishScan(operation: ReadOperation) {
+  if (operation.current()) scanning.value = ''
+  if (scanPollAbort === operation.controller) scanPollAbort = null
 }
 
 function runRetailTemplate(template: RetailTemplate) {
@@ -204,38 +295,39 @@ function runRetailTemplate(template: RetailTemplate) {
 }
 
 function openScanHistory(item: StrategyRun<ScanResult>) {
+  if (!active() || batchWriting.value) return
   if (item.status === 'success') {
-    void openScanResult(item.id, false).catch((error) => message.error((error as Error).message))
+    void openScanResult(item.id, false)
     return
   }
   void router.push({ name: 'tasks', query: { job_id: String(item.job_run_id) } })
 }
 
 async function runScan(target: ScanTarget, tag: string) {
-  scanning.value = tag
+  if (!active() || scanning.value || batchWriting.value) return
+  const operation = beginScan(tag)
+  const request = clone({ ...target, include_st: includeST.value, include_stale: includeStale.value })
   try {
-    const run = await screenerScan({
-      ...target,
-      include_st: includeST.value,
-      include_stale: includeStale.value,
-    })
-    void router.replace({ query: { ...route.query, result_id: String(run.id) } })
+    const run = await screenerScan(request)
+    if (!operation.current()) return
+    await setResultRoute(run.id, operation)
+    if (!operation.current()) return
     message.info('扫描任务已创建，可在任务中心查看或取消')
-    await openScanResult(run.id, true)
-    lastScanTarget = target
-    status.value = await getScreenerStatus().catch(() => status.value)
-    scanHistory.value = await listScreenerResults(20).catch(() => scanHistory.value)
+    await readScanResult(run.id, true, operation)
+    if (!operation.current()) return
+    void loadStatus()
+    void loadScanHistory()
     if (!result.value?.matched) {
       message.info('本次扫描无命中（条件较严或市况不配合，属正常情况）')
     }
   } catch (e) {
-    if (!isPollCancelled(e)) message.error(`${(e as Error).message}；最近一次成功结果仍保留在页面和扫描历史中`)
+    reportScanError(e, operation)
   } finally {
-    scanning.value = ''
+    finishScan(operation)
   }
 }
 function rescan() {
-  if (lastScanTarget) runScan(lastScanTarget, 'rescan')
+  if (lastScanTarget) return runScan(lastScanTarget, 'rescan')
 }
 
 const resultStats = computed(() => {
@@ -258,6 +350,9 @@ const currentResultId = ref(0)
 const selectedSymbols = ref<string[]>([])
 const batchShow = ref(false)
 const batchLoading = ref(false)
+const batchWriting = ref(false)
+const batchSelection = ref<{ resultId: number; symbols: string[] }>({ resultId: 0, symbols: [] })
+let batchSequence = 0
 const watchlistGroups = ref<WatchlistGroup[]>([])
 const batchGroupId = ref<number | null>(null)
 const watchlistBatch = ref<WatchlistBatch | null>(null)
@@ -265,56 +360,85 @@ const watchlistBatchIssues = computed(() =>
   (watchlistBatch.value?.items ?? []).filter((item) => item.status === 'failed' || item.status === 'conflict'),
 )
 async function openWatchlistBatch() {
+  if (!active() || scanning.value || batchShow.value || batchLoading.value) return
   if (!currentResultId.value || !selectedSymbols.value.length) {
     message.warning('请先选择要加入自选的股票')
     return
   }
+  const sequence = ++batchSequence
+  batchSelection.value = { resultId: currentResultId.value, symbols: [...selectedSymbols.value] }
+  const current = () => active() && batchShow.value && sequence === batchSequence && currentResultId.value === batchSelection.value.resultId
+  watchlistBatch.value = null
+  batchGroupId.value = null
+  watchlistGroups.value = []
+  batchShow.value = true
   batchLoading.value = true
   try {
-    watchlistGroups.value = await listWatchlists()
+    const groups = await listWatchlists()
+    if (!current()) return
+    watchlistGroups.value = groups
     batchGroupId.value = watchlistGroups.value[0]?.id ?? null
-    watchlistBatch.value = null
-    batchShow.value = true
   } catch (error) {
-    message.error((error as Error).message)
+    if (current()) message.error((error as Error).message)
   } finally {
-    batchLoading.value = false
+    if (current()) batchLoading.value = false
   }
 }
 
 async function applyWatchlistBatch() {
+  if (!active() || !batchShow.value || batchLoading.value || watchlistBatch.value) return
   if (!batchGroupId.value) {
     message.warning('请选择自选分组')
     return
   }
+  const sequence = batchSequence
+  const selection = clone(batchSelection.value)
+  if (selection.resultId !== currentResultId.value || !selection.symbols.length) return
+  const current = () => active() && batchShow.value && sequence === batchSequence
   batchLoading.value = true
+  batchWriting.value = true
   try {
-    watchlistBatch.value = await createWatchlistBatch(currentResultId.value, batchGroupId.value, selectedSymbols.value)
-    const batch = watchlistBatch.value
-    message.success(`批量处理完成：新增 ${batch.created}，已存在 ${batch.existed}，失败 ${batch.failed}`)
+    const batch = await createWatchlistBatch(selection.resultId, batchGroupId.value, selection.symbols)
+    if (!current()) return
+    watchlistBatch.value = batch
+    const text = `批量处理完成：新增 ${batch.created}，已存在 ${batch.existed}，失败 ${batch.failed}`
+    if (batch.failed) message.warning(text)
+    else message.success(text)
   } catch (error) {
-    message.error((error as Error).message)
+    if (current()) message.error((error as Error).message)
   } finally {
-    batchLoading.value = false
+    if (current()) batchLoading.value = batchWriting.value = false
   }
 }
 
 async function undoCurrentWatchlistBatch() {
-  if (!watchlistBatch.value) return
+  if (!active() || !batchShow.value || batchLoading.value || watchlistBatch.value?.status !== 'applied') return
+  const sequence = batchSequence
+  const current = () => active() && batchShow.value && sequence === batchSequence
   batchLoading.value = true
+  batchWriting.value = true
   try {
-    watchlistBatch.value = await undoWatchlistBatch(watchlistBatch.value.id)
+    const batch = await undoWatchlistBatch(watchlistBatch.value.id)
+    if (!current()) return
+    watchlistBatch.value = batch
     if (watchlistBatch.value.conflicts) {
       message.warning(`已撤销 ${watchlistBatch.value.removed} 项，${watchlistBatch.value.conflicts} 项因后续变更而保留`)
     } else {
       message.success(`已撤销本批新建的 ${watchlistBatch.value.removed} 项`)
     }
   } catch (error) {
-    message.error((error as Error).message)
+    if (current()) message.error((error as Error).message)
   } finally {
-    batchLoading.value = false
+    if (current()) batchLoading.value = batchWriting.value = false
   }
 }
+
+watch(batchShow, (show) => {
+  if (!show) {
+    ++batchSequence
+    batchLoading.value = batchWriting.value = false
+  }
+}, { flush: 'sync' })
 
 // ---------- 自定义策略编辑器 ----------
 
@@ -328,6 +452,12 @@ interface CondRow {
 }
 const editorShow = ref(false)
 const editorSaving = ref(false)
+const archiving = ref(0)
+let editorSequence = 0
+const ownEditor = () => {
+  const sequence = editorSequence
+  return () => active() && editorShow.value && sequence === editorSequence
+}
 const editorForm = ref<{ id: number; name: string; desc: string; period: string; risk: string }>({
   id: 0,
   name: '',
@@ -450,6 +580,8 @@ function flattenTree(tree: CondNode | null): CondRow[] | null {
 }
 
 function openCreate() {
+  if (!active() || editorSaving.value || archiving.value) return
+  ++editorSequence
   editorForm.value = { id: 0, name: '', desc: '', period: 'swing', risk: 'mid' }
   editorRows.value = [{ factor: 'chg_pct', op: 'between', value: 1, value2: 6 }]
   editorBaseRevisionId.value = undefined
@@ -462,6 +594,8 @@ function openCreate() {
   editorShow.value = true
 }
 function openEdit(cs: CustomStrategy) {
+  if (!active() || editorSaving.value || archiving.value || !cs.tree) return
+  ++editorSequence
   const rows = flattenTree(cs.tree)
   resetAiGen()
   editorForm.value = { id: cs.id, name: cs.name, desc: cs.desc, period: cs.period || 'swing', risk: cs.risk || 'mid' }
@@ -475,8 +609,8 @@ function openEdit(cs: CustomStrategy) {
     editorRows.value = rows
   } else {
     editorRows.value = []
-    aiAdvancedTree.value = cs.tree
-    aiAdvancedConditions.value = cs.conditions ?? []
+    aiAdvancedTree.value = clone(cs.tree)
+    aiAdvancedConditions.value = [...(cs.conditions ?? [])]
     message.info('该版本含嵌套条件组，条件树将以只读方式保留，可修改基本信息并保存新版本')
   }
   editorShow.value = true
@@ -516,7 +650,9 @@ async function openHistory(
   preferredLeftId?: number,
   preferredRightId?: number,
 ): Promise<boolean> {
+  if (!active() || editorSaving.value) return false
   const requestSequence = ++historyRequestSequence
+  const current = () => active() && historyShow.value && requestSequence === historyRequestSequence
   const strategyId = typeof strategy === 'number' ? strategy : strategy.id
   historyName.value = typeof strategy === 'number' ? editorForm.value.name : strategy.name
   historyShow.value = true
@@ -525,7 +661,7 @@ async function openHistory(
   strategyHistory.value = null
   try {
     const view = await getScreenerStrategyHistory(strategyId)
-    if (requestSequence !== historyRequestSequence) return false
+    if (!current()) return false
     strategyHistory.value = view
     const revisions = view.revisions
     const currentId = view.current_revision_id || revisions[0]?.id || null
@@ -534,15 +670,16 @@ async function openHistory(
     historyRightId.value = revisions.some((revision) => revision.id === preferredRightId) ? preferredRightId! : fallbackRight
     return true
   } catch (e) {
-    if (requestSequence !== historyRequestSequence) return false
+    if (!current()) return false
     historyError.value = (e as Error).message
     return false
   } finally {
-    if (requestSequence === historyRequestSequence) historyLoading.value = false
+    if (current()) historyLoading.value = false
   }
 }
 
 function restoreRevision(revision: ScreenerStrategyRevision) {
+  if (!active() || editorSaving.value || archiving.value || !historyShow.value) return
   const history = strategyHistory.value
   if (!history || !revision.tree) {
     message.error('该版本没有可恢复的条件树快照')
@@ -550,6 +687,7 @@ function restoreRevision(revision: ScreenerStrategyRevision) {
   }
   const current = history.revisions.find((item) => item.id === history.current_revision_id) ?? history.revisions[0]
   const rows = flattenTree(revision.tree)
+  ++editorSequence
   resetAiGen()
   editorForm.value = {
     id: revision.strategy_id,
@@ -568,8 +706,8 @@ function restoreRevision(revision: ScreenerStrategyRevision) {
     editorRows.value = rows
   } else {
     editorRows.value = []
-    aiAdvancedTree.value = revision.tree
-    aiAdvancedConditions.value = revision.conditions ?? []
+    aiAdvancedTree.value = clone(revision.tree)
+    aiAdvancedConditions.value = [...(revision.conditions ?? [])]
   }
   historyShow.value = false
   editorShow.value = true
@@ -582,6 +720,7 @@ function goRecommend(strategyKey: string, period?: string) {
 }
 
 async function scanHistoryRevision(revision: ScreenerStrategyRevision) {
+  if (scanning.value || !revision.tree) return
   historyShow.value = false
   await runScan(
     { strategy_id: revision.strategy_id, strategy_revision_id: revision.id },
@@ -661,8 +800,11 @@ function historyFieldChanged(field: 'name' | 'desc' | 'period' | 'risk'): boolea
 
 async function compareConflict() {
   const conflict = editorConflict.value
-  if (!conflict) return
-  conflictCompared.value = await openHistory(editorForm.value.id, conflict.currentRevisionId, conflict.staleRevisionId)
+  if (!conflict || editorSaving.value) return
+  const current = ownEditor()
+  const compared = await openHistory(editorForm.value.id, conflict.currentRevisionId, conflict.staleRevisionId)
+  if (!current() || editorConflict.value !== conflict) return
+  conflictCompared.value = compared
   if (conflictCompared.value && strategyHistory.value) {
     const current = strategyHistory.value.revisions.find(
       (revision) => revision.id === strategyHistory.value?.current_revision_id,
@@ -695,44 +837,61 @@ const aiResult = ref<ParseStrategyResult | null>(null)
 const aiTask = ref<LLMTask<ParseStrategyResult> | null>(null)
 const aiTaskError = ref('')
 let aiPollAbort: AbortController | null = null
-onBeforeUnmount(() => aiPollAbort?.abort())
+let aiSequence = 0
 // 套用的嵌套树（行式编辑器只支持一层 all 的既有约束）：非空时行编辑区切只读展示。
 const aiAdvancedTree = ref<CondNode | null>(null)
 const aiAdvancedConditions = ref<string[]>([])
 
-function resetAiGen() {
+function invalidateAiPreview() {
+  ++aiSequence
   aiPollAbort?.abort()
   aiPollAbort = null
-  aiText.value = ''
   aiParsing.value = false
   aiResult.value = null
   aiTask.value = null
   aiTaskError.value = ''
+}
+
+function resetAiGen() {
+  invalidateAiPreview()
+  aiText.value = ''
   aiAdvancedTree.value = null
   aiAdvancedConditions.value = []
 }
 
+function beginAiRead(): ReadOperation {
+  invalidateAiPreview()
+  const sequence = aiSequence
+  const editorCurrent = ownEditor()
+  const controller = new AbortController()
+  aiPollAbort = controller
+  aiParsing.value = true
+  return { controller, current: () => editorCurrent() && sequence === aiSequence && !controller.signal.aborted }
+}
+
+watch(aiText, invalidateAiPreview, { flush: 'sync' })
+
 async function runAiParse() {
+  if (!active() || !editorShow.value || editorSaving.value || aiParsing.value) return
   const text = aiText.value.trim()
   if (!text) {
     message.warning('请先用白话描述选股条件')
     return
   }
-  aiParsing.value = true
-  aiResult.value = null
-  aiTaskError.value = ''
+  const operation = beginAiRead()
   try {
     const task = await parseScreenerStrategy(text)
+    if (!operation.current()) return
     aiTask.value = task
     message.info('解析任务已创建，正在后台执行（刷新或关闭页面不影响任务）')
-    await trackParseTask(task)
+    await trackParseTask(task, false, operation)
   } catch (e) {
-    if (!isPollCancelled(e)) {
+    if (operation.current() && !isPollCancelled(e)) {
       aiTaskError.value = (e as Error).message
       message.error(aiTaskError.value)
     }
   } finally {
-    aiParsing.value = false
+    if (operation.current()) aiParsing.value = false
   }
 }
 
@@ -744,10 +903,9 @@ function applyParseResult(value: ParseStrategyResult) {
   }
 }
 
-async function trackParseTask(initial: LLMTask<ParseStrategyResult>, silentFailure = false) {
-  aiPollAbort?.abort()
-  const controller = new AbortController()
-  aiPollAbort = controller
+async function trackParseTask(initial: LLMTask<ParseStrategyResult>, silentFailure = false, operation = beginAiRead()) {
+  if (!operation.current()) return
+  const controller = operation.controller
   aiTask.value = initial
   aiParsing.value = initial.status === 'processing'
   try {
@@ -757,46 +915,40 @@ async function trackParseTask(initial: LLMTask<ParseStrategyResult>, silentFailu
             signal: controller.signal,
           })
         : initial
+    if (!operation.current()) return
     aiTask.value = task
     if (task.status === 'failed') throw new Error(task.error || '自然语言选股解析失败')
     if (!task.result) throw new Error('解析任务已完成，但未返回结果')
     applyParseResult(task.result)
   } catch (e) {
-    if (isPollCancelled(e)) return
+    if (!operation.current() || isPollCancelled(e)) return
     aiTaskError.value = (e as Error).message
     if (!silentFailure) message.error(aiTaskError.value)
   } finally {
-    if (aiPollAbort === controller) {
-      aiPollAbort = null
-      aiParsing.value = false
-    }
+    if (operation.current()) aiParsing.value = false
+    if (aiPollAbort === controller) aiPollAbort = null
   }
 }
 
 async function restoreParseTask() {
+  const editorVersion = editorSequence
+  const aiVersion = aiSequence
+  const current = () => active() && editorVersion === editorSequence && aiVersion === aiSequence && !editorShow.value
   const tasks = await listLLMTasks<ParseStrategyResult>({ kind: 'screener_parse', limit: 1 }).catch(() => [])
+  if (!current()) return
   const summary = tasks[0]
   if (!summary) return
   const terminalIsRecent = Date.now() - new Date(summary.updated_at || summary.created_at).getTime() < 15 * 60 * 1000
   if (summary.status !== 'processing' && !terminalIsRecent) return
   const task =
     summary.status === 'processing' ? summary : await getLLMTask<ParseStrategyResult>(summary.id).catch(() => summary)
-  editorShow.value = true
-  if (!editorRows.value.length) editorRows.value = [{ factor: 'chg_pct', op: 'between', value: 1, value2: 6 }]
-  if (task.status === 'processing') {
-    void trackParseTask(task)
-  } else if (task.status === 'success' && task.result) {
-    aiTask.value = task
-    aiResult.value = task.result
-  } else if (task.status === 'failed') {
-    aiTask.value = task
-    aiTaskError.value = task.error || '自然语言选股解析失败'
-  }
+  if (!current()) return
+  openCreate()
+  void trackParseTask(task, true)
 }
 
-onMounted(() => void restoreParseTask())
-
 function adoptAiResult() {
+  if (!active() || !editorShow.value || editorSaving.value || aiParsing.value) return
   const r = aiResult.value
   if (!r?.tree) return
   const rows = flattenTree(r.tree)
@@ -805,8 +957,8 @@ function adoptAiResult() {
     aiAdvancedTree.value = null
     aiAdvancedConditions.value = []
   } else {
-    aiAdvancedTree.value = r.tree
-    aiAdvancedConditions.value = r.conditions ?? []
+    aiAdvancedTree.value = clone(r.tree)
+    aiAdvancedConditions.value = [...(r.conditions ?? [])]
     message.info('AI 生成了嵌套条件组（满足其一），已按只读方式套用，可直接保存或试扫')
   }
   if (!editorForm.value.desc && r.explain) {
@@ -832,6 +984,7 @@ function isRevisionConflict(error: unknown): boolean {
 }
 
 async function saveEditor() {
+  if (!active() || !editorShow.value || editorSaving.value || archiving.value) return
   const tree = editorTree()
   if (!editorForm.value.name.trim()) {
     message.warning('请填写策略名称')
@@ -842,6 +995,10 @@ async function saveEditor() {
     return
   }
   editorSaving.value = true
+  const current = ownEditor()
+  const savedID = editorForm.value.id
+  ++strategySequence
+  loading.value = false
   const savedBaseRevisionId = editorBaseRevisionId.value
   try {
     const saved = await saveScreenerStrategy({
@@ -851,26 +1008,32 @@ async function saveEditor() {
       desc: editorForm.value.desc,
       period: editorForm.value.period,
       risk: editorForm.value.risk,
-      tree,
+      tree: clone(tree),
     })
-    if (editorForm.value.id && saved.current_revision_id === savedBaseRevisionId) {
+    if (!current()) return
+    if (savedID && saved.current_revision_id === savedBaseRevisionId) {
       message.info(`内容未变化，继续使用 v${saved.revision}`)
     } else {
       message.success(`策略已保存为 v${saved.revision}`)
     }
+    editorSaving.value = false
     editorShow.value = false
-    await load()
+    void loadStrategies()
   } catch (e) {
-    if (editorForm.value.id && isRevisionConflict(e)) {
+    if (!current()) return
+    if (savedID && isRevisionConflict(e)) {
       editorConflict.value = {
         staleRevisionId: savedBaseRevisionId ?? 0,
         currentRevisionId: 0,
         currentRevision: 0,
       }
       conflictCompared.value = false
+      const sequence = ++strategySequence
       try {
-        data.value = await getScreenerStrategies()
-        const latest = customList.value.find((strategy) => strategy.id === editorForm.value.id)
+        const value = await getScreenerStrategies()
+        if (!current()) return
+        if (sequence === strategySequence) data.value = value
+        const latest = value.custom?.find((strategy) => strategy.id === savedID)
         if (latest) {
           editorConflict.value = {
             staleRevisionId: savedBaseRevisionId ?? 0,
@@ -881,34 +1044,86 @@ async function saveEditor() {
       } catch {
         // 保留编辑内容和原始冲突提示，历史比较按钮仍可再次主动加载。
       }
+      if (!current()) return
       message.error('策略已被其他页面更新。当前编辑内容已保留，请刷新并比较版本后再决定是否保存')
     } else {
       message.error((e as Error).message)
     }
   } finally {
-    editorSaving.value = false
+    if (current()) editorSaving.value = false
   }
 }
 
 async function tryScanEditor() {
+  if (!active() || !editorShow.value || editorSaving.value || scanning.value) return
   const tree = editorTree()
   if (!tree) {
     message.warning('请补全条件后再试扫')
     return
   }
+  const snapshot = clone(tree)
   editorShow.value = false
-  await runScan({ tree }, 'temp')
+  await runScan({ tree: snapshot }, 'temp')
 }
 
 async function removeCustom(id: number) {
+  if (!active() || archiving.value || editorSaving.value) return
+  archiving.value = id
+  ++strategySequence
+  loading.value = false
   try {
     await deleteScreenerStrategy(id)
+    if (!active()) return
     message.success('策略已归档，历史版本和既有研究不受影响')
-    await load()
+    archiving.value = 0
+    void loadStrategies()
   } catch (e) {
-    message.error((e as Error).message)
+    if (active()) message.error((e as Error).message)
+  } finally {
+    if (active()) archiving.value = 0
   }
 }
+
+watch(editorShow, (show) => {
+  if (!show) {
+    ++editorSequence
+    invalidateAiPreview()
+  }
+}, { flush: 'sync' })
+watch(historyShow, (show) => {
+  if (!show) { ++historyRequestSequence; historyLoading.value = false }
+}, { flush: 'sync' })
+
+function readResultRoute() {
+  if (!active()) return
+  const raw = route.query.result_id
+  const id = typeof raw === 'string' && /^\d+$/.test(raw) ? Number(raw) : 0
+  ++scanSequence
+  scanPollAbort?.abort()
+  scanning.value = ''
+  batchShow.value = false
+  if (Number.isSafeInteger(id) && id > 0) {
+    void openScanResult(id, true)
+  } else {
+    result.value = null
+    currentResultId.value = 0
+    selectedSymbols.value = []
+    lastScanTarget = null
+    scanError.value = raw == null ? '' : '扫描结果编号无效，请从历史记录重新打开'
+  }
+}
+watch(() => route.query.result_id, (value) => {
+  if (typeof value === 'string' && value === ownResultRoute) return
+  readResultRoute()
+}, { flush: 'sync' })
+function dispose() {
+  disposed = true
+  scanPollAbort?.abort()
+  aiPollAbort?.abort()
+}
+watch(() => route.name, (name) => { if (name !== 'screener') dispose() }, { flush: 'sync' })
+onBeforeUnmount(dispose)
+onMounted(() => { void load(); readResultRoute(); void restoreParseTask() })
 </script>
 
 <template>
@@ -920,7 +1135,8 @@ async function removeCustom(id: number) {
       <!-- 宽表状态条 -->
       <div class="status-line qv-anim-in">
         <n-spin v-if="status?.building || scanning" :size="14" />
-        <span class="status-text">{{ statusText }}</span>
+        <span class="status-text">{{ statusError || statusText }}</span>
+        <n-button v-if="statusError" size="tiny" @click="loadStatus">重试读取状态</n-button>
       </div>
 
       <ScreenerQuickSelect
@@ -936,6 +1152,11 @@ async function removeCustom(id: number) {
       />
 
       <!-- 扫描结果 -->
+      <n-alert v-if="scanError" type="error" :bordered="false">
+        {{ scanError }}<span v-if="result">；下方保留上次成功快照，请核对策略及日期。</span>
+        <n-button size="small" :disabled="!!scanning" @click="readResultRoute">重新读取快照</n-button>
+      </n-alert>
+      <n-alert v-if="scanning" type="info" :bordered="false">正在读取或扫描，完成后更新结果。任务可在任务中心查看。</n-alert>
       <ScreenerScanResults
         v-if="result"
         v-model:include-s-t="includeST"
@@ -944,6 +1165,8 @@ async function removeCustom(id: number) {
         :result="result"
         :stats="resultStats"
         :batch-loading="batchLoading"
+        :scanning="!!scanning"
+        :result-includes-stale="resultIncludesStale"
         @rescan="rescan"
         @batch="openWatchlistBatch"
       />
@@ -952,11 +1175,14 @@ async function removeCustom(id: number) {
         v-model:show="batchShow"
         preset="card"
         title="批量加入自选"
-        :mask-closable="!batchLoading"
+        class="screener-batch-modal batch-modal"
+        :mask-closable="!batchWriting"
+        :close-on-esc="!batchWriting"
+        :closable="!batchWriting"
         :style="[styleVars, { width: 'min(620px, calc(100vw - 24px))' }]"
       >
         <template v-if="!watchlistBatch">
-          <n-form label-placement="top">
+          <n-form label-placement="top" :disabled="batchLoading">
             <n-form-item label="目标分组" required>
               <n-select
                 v-model:value="batchGroupId"
@@ -965,13 +1191,9 @@ async function removeCustom(id: number) {
               />
             </n-form-item>
           </n-form>
-          <p class="batch-modal-summary">本次处理 {{ selectedSymbols.length }} 只股票</p>
-          <div class="batch-modal-actions">
-            <n-button :disabled="batchLoading" @click="batchShow = false">取消</n-button>
-            <n-button type="primary" :loading="batchLoading" :disabled="!batchGroupId" @click="applyWatchlistBatch">
-              确认加入
-            </n-button>
-          </div>
+          <p class="batch-modal-summary">本次处理 {{ batchSelection.symbols.length }} 只股票</p>
+          <n-spin v-if="batchLoading && !batchWriting" size="small" />
+          <p v-else-if="!watchlistGroups.length">未取得可用分组，请关闭后重试或先在自选页创建分组。</p>
         </template>
         <template v-else>
           <n-alert
@@ -995,7 +1217,13 @@ async function removeCustom(id: number) {
               </tbody>
             </n-table>
           </div>
-          <div class="batch-modal-actions">
+        </template>
+        <template #footer>
+          <div v-if="!watchlistBatch" class="batch-modal-actions">
+            <n-button :disabled="batchWriting" @click="batchShow = false">取消</n-button>
+            <n-button type="primary" :loading="batchLoading" :disabled="!batchGroupId || batchLoading" @click="applyWatchlistBatch">确认加入</n-button>
+          </div>
+          <div v-else class="batch-modal-actions">
             <n-popconfirm
               v-if="watchlistBatch.status === 'applied' && watchlistBatch.created > 0"
               @positive-click="undoCurrentWatchlistBatch"
@@ -1003,12 +1231,12 @@ async function removeCustom(id: number) {
               <template #trigger><n-button :loading="batchLoading">撤销本批新增</n-button></template>
               只移除本批新建且之后未被修改的自选项；原有项不会删除。
             </n-popconfirm>
-            <n-button type="primary" @click="batchShow = false">完成</n-button>
+            <n-button type="primary" :disabled="batchWriting" @click="batchShow = false">完成</n-button>
           </div>
         </template>
       </n-modal>
 
-      <ScreenerHistory :items="scanHistory" @open="openScanHistory" />
+      <ScreenerHistory :items="scanHistory" :loading="scanHistoryLoading" :error="scanHistoryError" @open="openScanHistory" @retry="loadScanHistory" />
 
       <!-- 策略广场 -->
       <SectionCard title="进阶内置策略" class="block">
@@ -1021,6 +1249,7 @@ async function removeCustom(id: number) {
           </n-radio-group>
         </template>
         <n-spin :show="loading">
+          <n-alert v-if="loadError" type="error" :bordered="false">策略读取失败：{{ loadError }}</n-alert>
           <n-grid cols="1 s:2 l:3" responsive="screen" :x-gap="12" :y-gap="12">
             <n-gi v-for="b in builtinFiltered" :key="b.key">
               <div class="strategy-card">
@@ -1059,10 +1288,12 @@ async function removeCustom(id: number) {
       <!-- 我的策略 -->
       <SectionCard title="我的自定义策略" class="block">
         <template #extra>
-          <n-button size="small" @click="openCreate">新建策略</n-button>
+          <n-button size="small" :disabled="loading || !!loadError || editorSaving || !!archiving" @click="openCreate">新建策略</n-button>
         </template>
-        <n-empty v-if="!customList.length" description="还没有自定义策略：点右上角「新建策略」，用因子条件组合自己的选股逻辑" class="empty-pad" />
-        <div v-else class="custom-list">
+        <n-alert v-if="loadError" type="error" :bordered="false">自定义策略读取失败：{{ loadError }}</n-alert>
+        <n-spin v-if="loading" size="small" />
+        <n-empty v-else-if="!loadError && !customList.length" description="还没有自定义策略：点右上角「新建策略」，用因子条件组合自己的选股逻辑" class="empty-pad" />
+        <div v-if="customList.length" class="custom-list">
           <div v-for="cs in customList" :key="cs.id" class="custom-row">
             <div class="cr-main">
               <div class="cr-head">
@@ -1075,6 +1306,7 @@ async function removeCustom(id: number) {
                 }}</n-tag>
               </div>
               <p v-if="cs.desc" class="sc-desc">{{ cs.desc }}</p>
+              <n-alert v-if="!cs.tree" type="warning" :bordered="false">该版本条件不可用，请查看历史版本或新建策略。</n-alert>
               <div class="sc-conds">
                 <n-tag v-for="c in cs.conditions" :key="c" size="small" :bordered="false" class="cond-tag">{{ c }}</n-tag>
               </div>
@@ -1085,7 +1317,7 @@ async function removeCustom(id: number) {
                 type="primary"
                 secondary
                 :loading="scanning === `custom-${cs.id}`"
-                :disabled="!!scanning && scanning !== `custom-${cs.id}`"
+                :disabled="!cs.tree || !!scanning"
                 @click="runScan({ strategy_id: cs.id, strategy_revision_id: cs.current_revision_id }, `custom-${cs.id}`)"
                 >扫描</n-button
               >
@@ -1097,10 +1329,10 @@ async function removeCustom(id: number) {
               >
               <n-button size="small" quaternary @click="goRecommend(`screen:u${cs.id}`, cs.period)">AI 推荐</n-button>
               <n-button size="small" quaternary @click="openHistory(cs)">版本</n-button>
-              <n-button size="small" quaternary @click="openEdit(cs)">编辑</n-button>
+              <n-button size="small" quaternary :disabled="!cs.tree || editorSaving || !!archiving" @click="openEdit(cs)">编辑</n-button>
               <n-popconfirm @positive-click="removeCustom(cs.id)">
                 <template #trigger>
-                  <n-button size="small" quaternary type="error">归档</n-button>
+                  <n-button size="small" quaternary type="error" :disabled="editorSaving || !!archiving" :loading="archiving === cs.id">归档</n-button>
                 </template>
                 归档策略「{{ cs.name }}」？归档后默认列表不再显示，历史版本和既有研究不受影响。
               </n-popconfirm>
@@ -1114,8 +1346,8 @@ async function removeCustom(id: number) {
         v-model:show="historyShow"
         preset="card"
         :title="`版本历史 · ${historyName}`"
-        class="history-modal"
-        :style="[styleVars, { width: 'min(980px, calc(100vw - 24px))', maxHeight: 'calc(100vh - 32px)' }]"
+        class="screener-history-modal history-modal"
+        :style="[styleVars, { width: 'min(980px, calc(100vw - 24px))' }]"
       >
         <n-spin :show="historyLoading">
           <n-alert v-if="historyError" type="error" :bordered="false">{{ historyError }}</n-alert>
@@ -1229,8 +1461,11 @@ async function removeCustom(id: number) {
         v-model:show="editorShow"
         preset="card"
         :title="editorForm.id ? '编辑策略' : '新建策略'"
-        class="editor-modal"
+        class="screener-editor-modal editor-modal"
         :style="[styleVars, { maxWidth: '760px' }]"
+        :mask-closable="!editorSaving"
+        :close-on-esc="!editorSaving"
+        :closable="!editorSaving"
       >
         <n-alert v-if="editorConflict" type="error" :bordered="false" class="editor-revision-alert">
           <div>策略已被其他页面更新。当前编辑内容已保留；请刷新并比较后，再显式采用最新版本作为保存基线。</div>
@@ -1247,7 +1482,7 @@ async function removeCustom(id: number) {
           </template>
           <template v-else>正在编辑 v{{ editorLoadedRevision }}；保存不会覆盖该版本。</template>
         </n-alert>
-        <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 76">
+        <n-form :disabled="editorSaving" :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 76">
           <n-grid cols="1 s:2" responsive="screen" :x-gap="12" :y-gap="12">
             <n-gi>
               <n-form-item label="名称" required>
@@ -1287,13 +1522,14 @@ async function removeCustom(id: number) {
           <div class="ai-input-row">
             <n-input
               v-model:value="aiText"
+              :disabled="editorSaving"
               type="textarea"
               :rows="2"
               maxlength="300"
               show-count
               placeholder="例：量比 2 以上放量突破 20 日新高，换手率别超过 20%"
             />
-            <n-button size="small" type="primary" secondary :loading="aiParsing" @click="runAiParse">AI 生成</n-button>
+            <n-button size="small" type="primary" secondary :disabled="editorSaving" :loading="aiParsing" @click="runAiParse">AI 生成</n-button>
           </div>
           <n-alert v-if="aiTask?.status === 'processing'" type="info" :bordered="false">
             正在后台解析选股条件，页面刷新或关闭不会中断任务。
@@ -1312,24 +1548,25 @@ async function removeCustom(id: number) {
               >
             </div>
             <div v-if="aiResult.tree" class="ai-adopt">
-              <n-button size="small" type="primary" @click="adoptAiResult">套用到编辑器</n-button>
+              <n-button size="small" type="primary" :disabled="editorSaving" @click="adoptAiResult">套用到编辑器</n-button>
             </div>
           </div>
         </div>
         <div v-if="aiAdvancedTree" class="editor-rows">
           <p class="rows-hint">
-            AI 生成的条件含嵌套组（满足其一），不支持逐行编辑，以下为只读条件清单——可直接保存或试扫。
+            当前条件树包含行式编辑器不支持的结构，以下只读保留完整条件，可直接保存或试扫。
           </p>
           <div class="sc-conds">
             <n-tag v-for="c in aiAdvancedConditions" :key="c" size="small" :bordered="false" class="cond-tag">{{ c }}</n-tag>
           </div>
-          <n-button size="small" quaternary @click="clearAdvancedTree">放弃嵌套条件，改用逐行编辑</n-button>
+          <n-button size="small" quaternary :disabled="editorSaving" @click="clearAdvancedTree">放弃嵌套条件，改用逐行编辑</n-button>
         </div>
         <div v-else class="editor-rows">
           <p class="rows-hint">条件之间为「且」（全部满足才命中）；布尔因子选「为是/为否」，数值因子可与固定值或另一因子比较。</p>
           <div v-for="(row, i) in editorRows" :key="i" class="cond-row">
             <n-select
               v-model:value="row.factor"
+              :disabled="editorSaving"
               :options="factorOptions"
               filterable
               placeholder="因子"
@@ -1337,15 +1574,16 @@ async function removeCustom(id: number) {
               class="w-factor"
               @update:value="onRowFactorChange(row)"
             />
-            <n-select v-model:value="row.op" :options="opOptions(row.factor)" size="small" class="w-op" />
+            <n-select v-model:value="row.op" :disabled="editorSaving" :options="opOptions(row.factor)" size="small" class="w-op" />
             <template v-if="row.op === 'between'">
-              <n-input-number v-model:value="row.value" size="small" class="w-num" placeholder="下限" />
+              <n-input-number v-model:value="row.value" :disabled="editorSaving" size="small" class="w-num" placeholder="下限" />
               <span class="tilde">~</span>
-              <n-input-number v-model:value="row.value2" size="small" class="w-num" placeholder="上限" />
+              <n-input-number v-model:value="row.value2" :disabled="editorSaving" size="small" class="w-num" placeholder="上限" />
             </template>
             <n-select
               v-else-if="row.op === '>ref' || row.op === '<ref'"
               v-model:value="row.ref"
+              :disabled="editorSaving"
               :options="refFactorOptions"
               filterable
               placeholder="对比因子"
@@ -1355,17 +1593,19 @@ async function removeCustom(id: number) {
             <n-input-number
               v-else-if="row.op !== 'is_true' && row.op !== 'is_false'"
               v-model:value="row.value"
+              :disabled="editorSaving"
               size="small"
               class="w-num"
               placeholder="值"
             />
-            <n-button size="small" quaternary type="error" :disabled="editorRows.length <= 1" @click="removeRow(i)">删</n-button>
+            <n-button size="small" quaternary type="error" :disabled="editorSaving || editorRows.length <= 1" @click="removeRow(i)">删</n-button>
           </div>
-          <n-button size="small" dashed block @click="addRow">+ 添加条件</n-button>
+          <n-button size="small" :disabled="editorSaving || editorRows.length >= 32" dashed block @click="addRow">+ 添加条件</n-button>
         </div>
         <template #footer>
           <div class="editor-foot">
-            <n-button size="small" @click="tryScanEditor">先试扫一次</n-button>
+            <n-button size="small" :disabled="editorSaving" @click="editorShow = false">取消</n-button>
+            <n-button size="small" :disabled="editorSaving || !!scanning" @click="tryScanEditor">先试扫一次</n-button>
             <n-button size="small" type="primary" :loading="editorSaving" @click="saveEditor">
               {{ editorForm.id ? '保存为新版本' : '保存策略' }}
             </n-button>
@@ -1388,6 +1628,7 @@ async function removeCustom(id: number) {
   gap: 8px;
   font-size: 13px;
   opacity: 0.75;
+  flex-wrap: wrap;
 }
 .block {
   width: 100%;
@@ -1619,7 +1860,17 @@ async function removeCustom(id: number) {
   line-height: 1.7;
   opacity: 0.7;
 }
-.history-modal :deep(.n-card__content) {
+:global(.screener-history-modal),
+:global(.screener-editor-modal),
+:global(.screener-batch-modal) {
+  max-height: calc(100dvh - 24px);
+  overflow: hidden;
+}
+.batch-issues td:first-child { white-space: nowrap; }
+:global(.screener-history-modal > .n-card-content),
+:global(.screener-editor-modal > .n-card-content),
+:global(.screener-batch-modal > .n-card-content) {
+  min-height: 0;
   overflow: auto;
 }
 .history-selects {
@@ -1805,6 +2056,7 @@ async function removeCustom(id: number) {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+  flex-wrap: wrap;
 }
 @media (max-width: 768px) {
   .retail-grid,

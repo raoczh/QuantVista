@@ -78,14 +78,16 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 	}
 	text := req.Text
 
-	cfg, apiKey, err := s.llm.ResolveForUse(userID, req.LLMConfigID)
+	cfg, apiKey, err := s.llm.ResolveForUse(userID, req.LLMConfigID, ctx)
 	if err != nil {
 		return nil, err
 	}
 	allowPrivate = llmAllowPrivate(allowPrivate, cfg)
-	if err := checkQuota(userID); err != nil {
+	ctx, finishQuota, err := beginManualQuotaAction(ctx, userID)
+	if err != nil {
 		return nil, err
 	}
+	defer finishQuota()
 
 	convo := []chatMessage{
 		{Role: "system", Content: buildParseStrategySystemPrompt()},
@@ -102,18 +104,18 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 	requestMax := moduleTokenCap("screener_parse", cfg.MaxTokens)
 	for attempt := 0; attempt <= repairLimit; attempt++ {
 		res, callErr := chatCompletion(ctx, chatParams{
-			BaseURL:      cfg.BaseURL,
-			APIKey:       apiKey,
-			Model:        cfg.Model,
-			EndpointType: cfg.EndpointType,
-			Temperature:  cfg.Temperature,
+			BaseURL:         cfg.BaseURL,
+			APIKey:          apiKey,
+			Model:           cfg.Model,
+			EndpointType:    cfg.EndpointType,
+			Temperature:     cfg.Temperature,
 			ReasoningEffort: cfg.ReasoningEffort,
-			MaxTokens:    requestMax,
-			Messages:     convo,
-			JSONMode:     true,
-			AllowPrivate: allowPrivate,
-			Repair:       attempt > 0, // repair 轮：契约开启时温度固定 0
-			Meta:         run.chatMeta(userID, cfg, attempt+1),
+			MaxTokens:       requestMax,
+			Messages:        convo,
+			JSONMode:        true,
+			AllowPrivate:    allowPrivate,
+			Repair:          attempt > 0, // repair 轮：契约开启时温度固定 0
+			Meta:            run.chatMeta(userID, cfg, attempt+1),
 		})
 		run.record(res, callErr)
 		if res != nil {
@@ -129,7 +131,7 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 			}
 			// 网络/鉴权类失败：已消耗的 token 照记（审计），动作照计次（与分析口径一致）。
 			if acc.TotalTokens > 0 {
-				consumeQuota(userID, acc.TotalTokens, true)
+				consumeQuota(userID, acc.TotalTokens)
 			}
 			return nil, callErr
 		}
@@ -141,7 +143,7 @@ func (s *ScreenerAIService) ParseStrategy(ctx context.Context, userID int64, all
 			"上一条输出不符合要求："+lastPerr.Error()+"。"+parseStrategyRepairHint)
 	}
 	if acc.TotalTokens > 0 {
-		consumeQuota(userID, acc.TotalTokens, true)
+		consumeQuota(userID, acc.TotalTokens)
 	}
 	if lastPerr != nil {
 		// P0-9：repair 打满仍无合法输出进统一机读码（交互式动作，报错让用户重试，不出降级半成品）。

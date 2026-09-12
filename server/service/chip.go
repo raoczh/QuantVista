@@ -247,7 +247,7 @@ func computeChipDistribution(bars []datasource.Bar, floatShares float64) (*ChipR
 		DataLimited: len(bars) < chipBarLimit,
 	}
 	for i := range prices {
-		out.Prices[i] = round3(prices[i])
+		out.Prices[i] = round4(prices[i])
 		out.Chips[i] = math.Round(chips[i]*1e6) / 1e6
 	}
 	return out, nil
@@ -268,11 +268,11 @@ func chipDayStats(b datasource.Bar, prices, chips []float64, level float64) chip
 		return d
 	}
 	d.Profit = round2(below / total * 100)
-	d.AvgCost = round2(costSum / total)
-	d.C90Low = round2(chipQuantile(prices, chips, level, total, 0.05))
-	d.C90High = round2(chipQuantile(prices, chips, level, total, 0.95))
-	d.C70Low = round2(chipQuantile(prices, chips, level, total, 0.15))
-	d.C70High = round2(chipQuantile(prices, chips, level, total, 0.85))
+	d.AvgCost = round4(costSum / total)
+	d.C90Low = round4(chipQuantile(prices, chips, level, total, 0.05))
+	d.C90High = round4(chipQuantile(prices, chips, level, total, 0.95))
+	d.C70Low = round4(chipQuantile(prices, chips, level, total, 0.15))
+	d.C70High = round4(chipQuantile(prices, chips, level, total, 0.85))
 	if s := d.C90High + d.C90Low; s > 0 {
 		d.Conc90 = round2((d.C90High - d.C90Low) / s * 100)
 	}

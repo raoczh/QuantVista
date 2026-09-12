@@ -72,12 +72,12 @@ router.onError((error, to) => {
 router.beforeEach(async (to) => {
   const auth = useAuthStore()
 
-  // 首次导航先确认系统初始化状态（失败时放行，避免后端不可达卡死）。
+  // 首次导航先确认系统初始化状态；探测失败仍继续验证登录与角色。
   if (!auth.statusLoaded) {
     try {
       await auth.fetchSetupStatus()
     } catch {
-      return true
+      // 后端暂时不可达不应成为受保护页面绕过鉴权守卫的条件。
     }
   }
 

@@ -4,6 +4,7 @@ import type { EvidenceCheck } from './trust'
 
 export interface Position {
   id: number
+  account_id?: number
   user_id: number
   symbol: string
   market: string
@@ -52,6 +53,7 @@ export interface Position {
   quote_as_of?: string // 行情数据源时刻（含 stale 的最近已知）
   freshness_status?: string // fresh | stale | unknown
   stale_reason?: string // 非 fresh 的原因说明
+  valuation_unavailable_reason?: string
   last_price?: number // 最近已知价（stale 展示用，不参与盈亏）
   held_trade_days: number // 已持有交易日（按交易日历）
   short_term_review: boolean // 短线持仓超阈值，建议复盘
@@ -91,6 +93,7 @@ export interface PositionExitSignal {
 
 export interface PositionExitAssessment {
   id: number
+  account_id?: number
   user_id: number
   position_id: number
   symbol: string
@@ -141,6 +144,7 @@ export interface PositionPeak {
   drawdown_pct: number
   backfilled: boolean
   note?: string
+  data_quality?: string
 }
 
 // C13 行业 / 市值风格 / 估值风格暴露。
@@ -178,6 +182,10 @@ export interface PortfolioExposure {
 }
 
 export interface PortfolioOverview {
+  account_id: number
+  account_name?: string
+  currency_unavailable_reason?: string // 非空时组合金额及盈亏汇总不可用。
+  valuation_unavailable_reason?: string // 非空时完整市值、浮盈及权重不可用。
   holding_count: number
   total_cost: number
   total_value: number
@@ -254,34 +262,35 @@ export type PositionBase = Omit<
   | 'rec_link'
 >
 
-export function listPositions(status: 'holding' | 'closed' | 'all' = 'all') {
-  return request<Position[]>({ url: '/positions', params: { status } })
+export function listPositions(status: 'holding' | 'closed' | 'all' = 'all', accountId?: number, signal?: AbortSignal) {
+  return request<Position[]>({ url: '/positions', params: { status, account_id: accountId }, signal })
 }
 
-export function getPositionExitAssessment(positionID: number, assessmentID: number) {
+export function getPositionExitAssessment(positionID: number, assessmentID: number, signal?: AbortSignal) {
   return request<PositionExitAssessment>({
     url: `/positions/${positionID}/exit-assessments/${assessmentID}`,
+    signal,
   })
 }
 
-export function getPortfolioOverview() {
-  return request<PortfolioOverview>({ url: '/positions/overview' })
+export function getPortfolioOverview(accountId?: number, signal?: AbortSignal) {
+  return request<PortfolioOverview>({ url: '/positions/overview', params: { account_id: accountId }, signal })
 }
 
-export function createPosition(input: PositionInput) {
-  return request<PositionBase>({ url: '/positions', method: 'post', data: input })
+export function createPosition(input: PositionInput, accountId?: number) {
+  return request<PositionBase>({ url: '/positions', method: 'post', data: input, params: { account_id: accountId } })
 }
 
-export function updatePosition(id: number, input: PositionInput) {
-  return request<PositionBase>({ url: `/positions/${id}`, method: 'put', data: input })
+export function updatePosition(id: number, input: PositionInput, accountId?: number) {
+  return request<PositionBase>({ url: `/positions/${id}`, method: 'put', data: input, params: { account_id: accountId } })
 }
 
-export function closePosition(id: number, input: CloseInput) {
-  return request<PositionBase>({ url: `/positions/${id}/close`, method: 'post', data: input })
+export function closePosition(id: number, input: CloseInput, accountId?: number) {
+  return request<PositionBase>({ url: `/positions/${id}/close`, method: 'post', data: input, params: { account_id: accountId } })
 }
 
-export function deletePosition(id: number) {
-  return request<{ ok: boolean }>({ url: `/positions/${id}`, method: 'delete' })
+export function deletePosition(id: number, accountId?: number) {
+  return request<{ ok: boolean }>({ url: `/positions/${id}`, method: 'delete', params: { account_id: accountId } })
 }
 
 /**
@@ -291,11 +300,12 @@ export function deletePosition(id: number) {
  * （编辑持仓不会误清血缘，这是既有的正确行为），且本接口会同步回填追踪状态里的
  * 实际买入价/实际收益——已止盈止损的推荐被终态冻结，靠刷新永远补不上。
  */
-export function linkPositionRecommendation(id: number, recommendationID: number) {
+export function linkPositionRecommendation(id: number, recommendationID: number, accountId?: number) {
   return request<PositionBase>({
     url: `/positions/${id}/recommendation-link`,
     method: 'put',
     data: { recommendation_id: recommendationID },
+    params: { account_id: accountId },
   })
 }
 
@@ -303,6 +313,7 @@ export function linkPositionRecommendation(id: number, recommendationID: number)
 
 export interface PositionTrade {
   id: number
+  account_id?: number
   user_id: number
   position_id: number
   side: string // buy=加仓 / sell=减仓 / adjust=除权除息折算（B8）
@@ -341,12 +352,12 @@ export interface PositionTradeInput {
   lesson_learned?: string
 }
 
-export function listPositionTrades(id: number) {
-  return request<PositionTrade[]>({ url: `/positions/${id}/trades` })
+export function listPositionTrades(id: number, accountId?: number, signal?: AbortSignal) {
+  return request<PositionTrade[]>({ url: `/positions/${id}/trades`, params: { account_id: accountId }, signal })
 }
 
-export function addPositionTrade(id: number, input: PositionTradeInput) {
-  return request<PositionBase>({ url: `/positions/${id}/trades`, method: 'post', data: input })
+export function addPositionTrade(id: number, input: PositionTradeInput, accountId?: number) {
+  return request<PositionBase>({ url: `/positions/${id}/trades`, method: 'post', data: input, params: { account_id: accountId } })
 }
 
 // ---------- B6 个人交易复盘统计 ----------
@@ -415,8 +426,8 @@ export interface TradeStats {
   notes: string[]
 }
 
-export function getTradeStats(range = 'all') {
-  return request<TradeStats>({ url: '/positions/stats', params: { range } })
+export function getTradeStats(range = 'all', accountId?: number, signal?: AbortSignal) {
+  return request<TradeStats>({ url: '/positions/stats', params: { range, account_id: accountId }, signal })
 }
 
 // ---------- B7 资产曲线 ----------
@@ -443,8 +454,8 @@ export interface PortfolioCurve {
   notes: string[]
 }
 
-export function getPositionCurve(days = 90, signal?: AbortSignal) {
-  return request<PortfolioCurve>({ url: '/positions/curve', params: { days }, signal })
+export function getPositionCurve(days = 90, signal?: AbortSignal, accountId?: number) {
+  return request<PortfolioCurve>({ url: '/positions/curve', params: { days, account_id: accountId }, signal })
 }
 
 // ---------- B8 除权除息持仓调整 ----------
@@ -455,6 +466,8 @@ export type CorpAdjustStatus = 'pending' | 'confirmed' | 'reverted' | 'dismissed
 
 export interface PositionCorpAdjust {
   id: number
+  context_version: string
+  account_id?: number
   user_id: number
   position_id: number
   corporate_action_id: number
@@ -485,14 +498,14 @@ export interface PositionCorpAdjust {
   updated_at: string
 }
 
-export function listCorpAdjusts(status = 'pending', signal?: AbortSignal) {
-  return request<PositionCorpAdjust[]>({ url: '/positions/corp-adjusts', params: { status }, signal })
+export function listCorpAdjusts(status = 'pending', signal?: AbortSignal, accountId?: number) {
+  return request<PositionCorpAdjust[]>({ url: '/positions/corp-adjusts', params: { status, account_id: accountId }, signal })
 }
 
 // 确认 / 撤销 / 忽略。撤销仅在「当前账面仍等于折算结果且其后无新交易」时被接受，
 // 否则后端明确拒绝并给出原因（不做部分回滚）。
-export function actCorpAdjust(id: number, action: 'confirm' | 'revert' | 'dismiss') {
-  return request<PositionCorpAdjust>({ url: `/positions/corp-adjusts/${id}/${action}`, method: 'post' })
+export function actCorpAdjust(id: number, action: 'confirm' | 'revert' | 'dismiss', accountId?: number, contextVersion?: string) {
+  return request<PositionCorpAdjust>({ url: `/positions/corp-adjusts/${id}/${action}`, method: 'post', params: { account_id: accountId }, data: { context_version: contextVersion } })
 }
 
 // ---------- D16 卖出复核 ----------
@@ -569,7 +582,7 @@ export interface PositionAdviceResult {
 }
 
 /** 发起建议（后台任务，秒回任务 id；用 getLLMTask 轮询结果）。 */
-export function requestPositionAdvice(input: { llm_config_id?: number; symbol?: string; position_id?: number } = {}) {
+export function requestPositionAdvice(input: { llm_config_id?: number; symbol?: string; position_id?: number; account_id?: number } = {}) {
   return request<LLMTask<PositionAdviceResult>>({ url: '/positions/advice', method: 'post', data: input })
 }
 

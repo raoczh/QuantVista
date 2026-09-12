@@ -73,6 +73,9 @@ func cleanBrowserNotificationTables(t *testing.T, userIDs ...int64) {
 	if len(userIDs) == 0 {
 		userIDs = []int64{71001, 71002, 71003}
 	}
+	for _, userID := range userIDs {
+		seedNotificationReviewUser(t, userID)
+	}
 	for _, table := range []string{
 		"browser_notification_deliveries", "browser_notification_events", "web_push_subscriptions",
 		"browser_notification_devices", "browser_notification_preferences", "notify_channels", "user_preferences",

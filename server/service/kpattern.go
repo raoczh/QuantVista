@@ -156,8 +156,7 @@ func patMaBullAlign(bars []datasource.Bar) patternResult {
 		closes[i] = b.Close
 	}
 	ma := func(w int) (float64, bool) {
-		v, ok := movingAverage(closes, w)
-		return round2(v), ok
+		return movingAverage(closes, w)
 	}
 	ma5, ok5 := ma(5)
 	ma10, ok10 := ma(10)
@@ -166,7 +165,7 @@ func patMaBullAlign(bars []datasource.Bar) patternResult {
 	if !ok5 || !ok10 || !ok20 || !ok60 {
 		return patUnknown()
 	}
-	price := round2(closes[n-1])
+	price := closes[n-1]
 	return patHit(ma5 > ma10 && ma10 > ma20 && ma20 > ma60 && price >= ma5)
 }
 

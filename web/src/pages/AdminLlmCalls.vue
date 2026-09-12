@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, h, onMounted, reactive, ref } from 'vue'
+import { computed, h, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import {
+  NAlert,
   NButton,
   NDataTable,
   NInput,
@@ -8,15 +9,19 @@ import {
   NSelect,
   NSpin,
   NTag,
-  useMessage,
   type DataTableColumns,
 } from 'naive-ui'
 import { getLlmCall, listLlmCalls, listUsers, type LLMCallLogItem } from '@/api/admin'
 import type { AuthUser } from '@/api/auth'
+import { getSessionEpoch } from '@/api/token'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 
-const message = useMessage()
+const sessionEpoch = getSessionEpoch()
+let active = true
+let loadSequence = 0
+const pageIsCurrent = () => active && sessionEpoch === getSessionEpoch()
+onUnmounted(() => { active = false; loadSequence++ })
 
 /* 模块取值与埋点侧（service/llm_call_log.go 的 Meta.Module）一一对应 */
 const moduleLabel: Record<string, string> = {
@@ -63,6 +68,9 @@ const userOptions = computed(() => [
 const rows = ref<LLMCallLogItem[]>([])
 const lengthStats = reactive({ reasoning_exhausted: 0, content_exhausted: 0 })
 const loading = ref(false)
+const loadError = ref('')
+const usersError = ref('')
+const usersLoading = ref(false)
 const pagination = reactive({
   page: 1,
   pageSize: 20,
@@ -81,7 +89,14 @@ const pagination = reactive({
 })
 
 async function load() {
+  if (!pageIsCurrent()) return
+  const sequence = ++loadSequence
+  const isCurrent = () => pageIsCurrent() && sequence === loadSequence
   loading.value = true
+  loadError.value = ''
+  rows.value = []
+  pagination.itemCount = 0
+  Object.assign(lengthStats, { reasoning_exhausted: 0, content_exhausted: 0 })
   try {
     const res = await listLlmCalls({
       user_id: filters.user_id || undefined,
@@ -91,13 +106,14 @@ async function load() {
       page: pagination.page,
       page_size: pagination.pageSize,
     })
+    if (!isCurrent()) return
     rows.value = res.items
     pagination.itemCount = res.total
     Object.assign(lengthStats, res.length_stats || { reasoning_exhausted: 0, content_exhausted: 0 })
   } catch (e) {
-    message.error((e as Error).message)
+    if (isCurrent()) loadError.value = e instanceof Error ? e.message : '调用记录读取失败'
   } finally {
-    loading.value = false
+    if (isCurrent()) loading.value = false
   }
 }
 
@@ -107,10 +123,16 @@ function onFilterChange() {
 }
 
 async function loadUsers() {
+  if (usersLoading.value || !pageIsCurrent()) return
+  usersLoading.value = true
+  usersError.value = ''
   try {
-    users.value = await listUsers()
-  } catch {
-    /* 用户列表拉不到时仍可按模块/状态筛 */
+    const result = await listUsers()
+    if (pageIsCurrent()) users.value = result
+  } catch (e) {
+    if (pageIsCurrent()) usersError.value = e instanceof Error ? e.message : '用户筛选项读取失败'
+  } finally {
+    if (pageIsCurrent()) usersLoading.value = false
   }
 }
 
@@ -211,17 +233,34 @@ const rowProps = (row: LLMCallLogItem) => ({
 const detailShow = ref(false)
 const detailLoading = ref(false)
 const detail = ref<LLMCallLogItem | null>(null)
+const detailError = ref('')
+let detailSequence = 0
+let detailId = 0
+watch(detailShow, (show) => {
+  if (!show) {
+    detailSequence++
+    detail.value = null
+    detailError.value = ''
+    detailLoading.value = false
+    detailId = 0
+  }
+}, { flush: 'sync' })
 async function openDetail(id: number) {
+  if (!pageIsCurrent() || id <= 0) return
+  const sequence = ++detailSequence
+  const isCurrent = () => pageIsCurrent() && detailShow.value && sequence === detailSequence
+  detailId = id
   detailShow.value = true
   detailLoading.value = true
   detail.value = null
+  detailError.value = ''
   try {
-    detail.value = await getLlmCall(id)
+    const result = await getLlmCall(id)
+    if (isCurrent()) detail.value = result
   } catch (e) {
-    message.error((e as Error).message)
-    detailShow.value = false
+    if (isCurrent()) detailError.value = e instanceof Error ? e.message : '调用详情读取失败'
   } finally {
-    detailLoading.value = false
+    if (isCurrent()) detailLoading.value = false
   }
 }
 // 请求体是 messages JSON：能解析就美化缩进，坏体（截断过的）原样展示。
@@ -258,12 +297,21 @@ onMounted(() => {
         />
         <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>
       </div>
+      <n-alert v-if="usersError" type="warning" style="margin-bottom: 12px">
+        用户筛选项读取失败：{{ usersError }}
+        <n-button text :loading="usersLoading" @click="loadUsers">重试</n-button>
+      </n-alert>
+      <n-alert v-if="loadError" type="error" style="margin-bottom: 12px">
+        调用记录读取失败：{{ loadError }}
+        <n-button text @click="load">重试</n-button>
+      </n-alert>
       <div v-if="lengthStats.reasoning_exhausted + lengthStats.content_exhausted > 0" class="length-stats">
         <span>Token 截断归因</span>
         <n-tag size="small" type="warning" :bordered="false">思考吃光预算 {{ lengthStats.reasoning_exhausted }}</n-tag>
         <n-tag size="small" :bordered="false">正文写满 {{ lengthStats.content_exhausted }}</n-tag>
       </div>
       <n-data-table
+        v-if="!loadError"
         :columns="columns"
         :data="rows"
         :loading="loading"
@@ -278,6 +326,10 @@ onMounted(() => {
 
     <n-modal v-model:show="detailShow" preset="card" title="调用详情" class="detail-modal" style="max-width: 760px">
       <n-spin :show="detailLoading">
+        <n-alert v-if="detailError" type="error">
+          调用详情读取失败：{{ detailError }}
+          <n-button text @click="openDetail(detailId)">重试</n-button>
+        </n-alert>
         <div v-if="detail" class="detail">
           <div class="meta">
             <span>{{ fmtTime(detail.created_at) }}</span>
@@ -321,7 +373,7 @@ onMounted(() => {
             <pre class="body-pre">{{ detail.reasoning_content }}</pre>
           </template>
         </div>
-        <div v-else class="detail-empty">加载中…</div>
+        <div v-else-if="!detailError" class="detail-empty">加载中…</div>
       </n-spin>
     </n-modal>
   </PageContainer>

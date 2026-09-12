@@ -28,18 +28,18 @@ export function getOnboardingProgress() {
   return request<OnboardingProgress>({ url: '/onboarding', method: 'get' })
 }
 
-export function skipOnboardingStep(step: OnboardingStep) {
-  return request<OnboardingProgress>({ url: `/onboarding/steps/${step}/skip`, method: 'post' })
+export function skipOnboardingStep(step: OnboardingStep, progressID: number) {
+  return request<OnboardingProgress>({ url: `/onboarding/steps/${step}/skip`, method: 'post', data: { progress_id: progressID } })
 }
 
-export function finishOnboarding() {
-  return request<OnboardingProgress>({ url: '/onboarding/finish', method: 'post' })
+export function finishOnboarding(progressID: number) {
+  return request<OnboardingProgress>({ url: '/onboarding/finish', method: 'post', data: { progress_id: progressID } })
 }
 
-export function restartOnboarding() {
-  return request<OnboardingProgress>({ url: '/onboarding/restart', method: 'post' })
+export function restartOnboarding(progressID: number) {
+  return request<OnboardingProgress>({ url: '/onboarding/restart', method: 'post', data: { progress_id: progressID } })
 }
 
-export function deferOnboarding() {
-  return request<OnboardingProgress>({ url: '/onboarding/defer', method: 'post' })
+export function deferOnboarding(progressID: number) {
+  return request<OnboardingProgress>({ url: '/onboarding/defer', method: 'post', data: { progress_id: progressID } })
 }

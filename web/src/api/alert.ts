@@ -57,8 +57,8 @@ export interface AlertInput {
   note?: string
 }
 
-export function listAlerts(status?: string) {
-  return request<AlertRule[]>({ url: '/alerts', method: 'get', params: { status } })
+export function listAlerts(status?: string, signal?: AbortSignal) {
+  return request<AlertRule[]>({ url: '/alerts', method: 'get', params: { status }, signal })
 }
 
 export function createAlert(input: AlertInput) {
@@ -175,12 +175,12 @@ export interface AlertEventContext {
   unknown?: string[]
 }
 
-export function listAlertEvents(status?: string, limit?: number) {
-  return request<AlertEvent[]>({ url: '/alerts/events', method: 'get', params: { status, limit } })
+export function listAlertEvents(status?: string, limit?: number, signal?: AbortSignal) {
+  return request<AlertEvent[]>({ url: '/alerts/events', method: 'get', params: { status, limit }, signal })
 }
 
-export function getAlertEvent(id: number) {
-  return request<AlertEvent>({ url: `/alerts/events/${id}`, method: 'get' })
+export function getAlertEvent(id: number, signal?: AbortSignal) {
+  return request<AlertEvent>({ url: `/alerts/events/${id}`, method: 'get', signal })
 }
 
 export function setAlertEventStatus(id: number, status: AlertEventStatus) {

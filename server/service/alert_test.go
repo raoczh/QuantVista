@@ -659,6 +659,11 @@ func TestAlertEvents(t *testing.T) {
 	if err := common.DB.Model(&model.AlertRule{}).Where("id = ?", rule.ID).Update("triggered_at", old).Error; err != nil {
 		t.Fatal(err)
 	}
+	// 跨日场景也必须把历史事件设为昨日；仅回拨规则时间、保留今日事件不能算新交易日。
+	if err := common.DB.Model(&model.AlertEvent{}).Where("rule_id = ?", rule.ID).
+		Updates(map[string]any{"trade_date": old.Format("2006-01-02"), "triggered_at": old}).Error; err != nil {
+		t.Fatal(err)
+	}
 	res, err = persistAlertEvaluation(context.Background(), rule, 11.2, true, "次日再命中", today, now)
 	if err != nil || !res.eventCreated {
 		t.Fatalf("跨日再命中应落事件: res=%+v err=%v", res, err)

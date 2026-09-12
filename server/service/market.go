@@ -232,15 +232,18 @@ func (s *MarketService) FreshnessView(market string, q *datasource.Quote) *Quote
 // GetDailyBars 取日线序列。加 10 分钟缓存：推荐评分/个股分析/对比/评分卡会在短时间内
 // 反复拉同一批标的的日线（收盘后日线不变、盘中仅末根在动），缓存显著降低对免费源的压力。
 func (s *MarketService) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]datasource.Bar, error) {
-	cacheKey := fmt.Sprintf("bars:%s:%s:%d", market, symbol, limit)
+	cacheKey := fmt.Sprintf("bars:qfq-v1:%s:%s:%d", market, symbol, limit)
 	if cached, ok := common.RedisGet(cacheKey); ok {
 		var bars []datasource.Bar
-		if json.Unmarshal([]byte(cached), &bars) == nil && len(bars) > 0 {
+		if json.Unmarshal([]byte(cached), &bars) == nil && len(bars) > 0 && validateAdjustedBars(market, bars) == nil {
 			return bars, nil
 		}
 	}
 	bars, err := s.mgr.GetDailyBars(ctx, market, symbol, limit)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateAdjustedBars(market, bars); err != nil {
 		return nil, err
 	}
 	// 在线读路径 best-effort 落库：拉取成功即向调用方返回行情，落库失败只告警
@@ -466,7 +469,40 @@ func (s *MarketService) GetOverview(ctx context.Context, market string) *Overvie
 	return ov
 }
 
+var errUnadjustedBars = errors.New("日线包含新浪不复权历史，前复权序列需完整重建后才能用于分析")
+
+func validateAdjustedBars(market string, bars []datasource.Bar) error {
+	if market == "cn" {
+		for _, bar := range bars {
+			if bar.Source == "sina" {
+				return errUnadjustedBars
+			}
+		}
+	}
+	return nil
+}
+
+func validateLocalAdjustedBars(market string, bars []model.DailyBar) error {
+	if market == "cn" {
+		for _, bar := range bars {
+			if bar.Source == "sina" {
+				return errUnadjustedBars
+			}
+		}
+	}
+	return nil
+}
+
 func (s *MarketService) persistDailyBars(ctx context.Context, market, symbol string, bars []datasource.Bar) error {
+	return s.persistDailyBarsWithState(ctx, market, symbol, bars, false)
+}
+
+func (s *MarketService) persistDailyBarsWithState(ctx context.Context, market, symbol string, bars []datasource.Bar, initialized bool) error {
+	return s.persistDailyBarsChecked(ctx, market, symbol, bars, bars, initialized)
+}
+
+// 写入计划可以只包含缺口，但复权校验必须保留上游返回的完整窗口作为重叠锚点。
+func (s *MarketService) persistDailyBarsChecked(ctx context.Context, market, symbol string, bars, reference []datasource.Bar, initialized bool) error {
 	if common.DB == nil || len(bars) == 0 {
 		return nil
 	}
@@ -476,14 +512,54 @@ func (s *MarketService) persistDailyBars(ctx context.Context, market, symbol str
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	db := common.DB.WithContext(ctx)
+	// daily_bars 是选股、回测和追踪共用的前复权地基。新浪日线无复权参数，
+	// 既不能覆盖已有窗口，也不能补缺口后与东财窗口拼接。在线读取也使用相同校验。
+	if err := validateAdjustedBars(market, bars); err != nil {
+		return err
+	}
+	if err := validateAdjustedBars(market, reference); err != nil {
+		return err
+	}
+	err := withDailyBarWriteTx(ctx, market, []string{symbol}, func(tx *gorm.DB) error {
+		if err := s.persistDailyBarsTx(ctx, tx, market, symbol, bars, reference); err != nil {
+			return err
+		}
+		var state struct {
+			Count int
+			Last  string
+		}
+		if err := tx.Model(&model.DailyBar{}).Select("COUNT(*) AS count, COALESCE(MAX(trade_date), '') AS last").
+			Where("market = ? AND symbol = ?", market, symbol).Scan(&state).Error; err != nil {
+			return err
+		}
+		// 在线读取/有限窗口补采也会推进实际日线，已有宇宙水位必须与之原子更新。
+		// 只有明确完成全历史初始化的调用才能升级 init_status。
+		updates := map[string]any{"bars_count": state.Count, "last_bar_date": state.Last}
+		if initialized {
+			updates["init_status"], updates["fail_count"], updates["last_error"] = "done", 0, ""
+		}
+		return tx.Model(&model.MarketSyncState{}).Where("market = ? AND symbol = ?", market, symbol).Updates(updates).Error
+	})
+	if errors.Is(err, errBarBasisUnverified) && ctx.Err() == nil && !errors.Is(err, errRebaseInProgress) {
+		err = errors.Join(err, s.markStatePending(ctx, market, symbol))
+	}
+	return err
+}
 
+// 调用方已持有同一标的的事务锁；历史校验与窗口写入必须共用 db。
+func (s *MarketService) persistDailyBarsTx(ctx context.Context, db *gorm.DB, market, symbol string, bars, reference []datasource.Bar) error {
 	// M1 除权检测（防"部分窗口重写"漏检）：本次拉取若与 DB 内已有窗口的 close 多点
 	// 比对出现偏差，说明发生了除权/送转（东财前复权序列整体重锚）——此时只 upsert
 	// 本窗会留下"窗口内新基准、窗口外旧基准"的断层。检测命中即全量重锚（250 根删+插）
 	// 后直接返回。仅东财源检测：新浪日线不复权，与前复权基准比对必然偏差，会误判。
-	if market == "cn" && bars[0].Source == "eastmoney" && s.detectAndRebase(ctx, market, symbol, bars) {
-		return nil
+	if market == "cn" && len(reference) > 0 && reference[0].Source == "eastmoney" {
+		rebased, err := s.detectAndRebase(ctx, db, market, symbol, reference)
+		if err != nil {
+			return err
+		}
+		if rebased {
+			return nil
+		}
 	}
 
 	dailyRows := make([]model.DailyBar, 0, len(bars))
@@ -593,14 +669,22 @@ func (s *MarketService) persist(ctx context.Context, q *datasource.Quote) {
 	quote := model.StockQuote{
 		Symbol: q.Symbol, Market: q.Market, Price: q.Price, ChangePct: q.ChangePct,
 		Open: q.Open, High: q.High, Low: q.Low, PrevClose: q.PrevClose,
-		Volume: q.Volume, Amount: q.Amount, Source: q.Source, DataTime: dataTime,
+		Volume: q.Volume, Amount: q.Amount, Source: q.Source, DataTime: dataTime, UpdatedAt: time.Now(),
+	}
+	updates := clause.Assignments(map[string]any{
+		"price": quote.Price, "change_pct": quote.ChangePct, "open": quote.Open, "high": quote.High,
+		"low": quote.Low, "prev_close": quote.PrevClose, "volume": quote.Volume, "amount": quote.Amount,
+		"source": quote.Source, "data_time": quote.DataTime, "updated_at": quote.UpdatedAt,
+	})
+	// 原子比较数据源时间。慢请求或另一来源的旧值不能把“最近已知行情”向后覆盖；
+	// 零时间的 epoch 哨兵仍可用于首次落库，但不能替代已有有效时间。
+	for i := range updates {
+		updates[i].Value = gorm.Expr("CASE WHEN data_time IS NULL OR data_time <= ? THEN ? ELSE ? END",
+			dataTime, updates[i].Value, clause.Column{Name: updates[i].Column.Name})
 	}
 	if err := db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "symbol"}, {Name: "market"}},
-		DoUpdates: clause.AssignmentColumns([]string{
-			"price", "change_pct", "open", "high", "low", "prev_close",
-			"volume", "amount", "source", "data_time", "updated_at",
-		}),
+		Columns:   []clause.Column{{Name: "symbol"}, {Name: "market"}},
+		DoUpdates: updates,
 	}).Create(&quote).Error; err != nil && err != gorm.ErrEmptySlice {
 		common.SysWarn("落库 quote 失败 %s: %v", q.Symbol, err)
 	}

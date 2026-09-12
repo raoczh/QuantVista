@@ -323,7 +323,7 @@ func recommendationTypeLabel(recType string) string {
 
 func loadHoldingSymbolSet(userID int64) (map[string]bool, error) {
 	var rows []model.Position
-	if err := common.DB.Select("market", "symbol").
+	if err := common.DB.Scopes(withActivePositionAccount).Select("market", "symbol").
 		Where("user_id = ? AND status = ? AND quantity > 0", userID, model.PositionStatusHolding).
 		Find(&rows).Error; err != nil {
 		return nil, err

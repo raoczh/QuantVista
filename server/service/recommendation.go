@@ -16,6 +16,7 @@ import (
 	"quantvista/model"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // RecommendationService 短线/长线推荐编排。
@@ -36,7 +37,7 @@ func NewRecommendationService(market *MarketService, watchlist *WatchlistService
 
 const (
 	recPromptVersion   = "p16" // p16: 候选输入增加近5日发现记忆与7日内标题级真实新闻（不扩候选边界/条数/token预算）；p15: 撤销 p14 输出体积限制（用户定夺：不为省 token 限制输出——预算已放开+截断自动扩容 repair，恢复全量落选理由与不限条数）；p14: 控制结构化输出体积（已撤销）；p13: P1-2 长线 pick 新增 invalidation 失效条件字段（短线既有；schema recommendation.v2）
-	recStrategyVersion = "s10" // s10: 五维基础分按策略意图重加权（strategyDimWeights：回踩/价值降动量与位置权重、升风险权重；活跃升量能权重）+ 选股类推荐策略条件命中度加分（全中 +12/部分按比例/明显不符 -4，与选股引擎同因子同求值）；s9: S1-3 名单去相关（相关性去重+同行业≤2 只，被挤出者记反事实事件）；s8: M3b 盘中因子短线加分项（尾盘放量拉升/跳水/收盘vs VWAP/午后重心上移/早盘强势）；s7: M3a 龙虎榜净买/机构席位/人气跃升/主力连续净流入加分项 + 量能维融合主力资金分；s6: F2 财务加分项（value ROE/growth 双增速/leader 盈利质量 + 业绩恶化通用扣分）；s5: T1 指标加分项 + 筹码超跌 + 五维动量/风险维升级；s4: 消息面情绪因子；s3: 策略-来源映射 + 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
+	recStrategyVersion = "s11" // s11: 选股类策略固定250根因子窗口并优先保证所选策略入池/评分名额；s10: 五维基础分按策略意图重加权（strategyDimWeights：回踩/价值降动量与位置权重、升风险权重；活跃升量能权重）+ 选股类推荐策略条件命中度加分（全中 +12/部分按比例/明显不符 -4，与选股引擎同因子同求值）；s9: S1-3 名单去相关（相关性去重+同行业≤2 只，被挤出者记反事实事件）；s8: M3b 盘中因子短线加分项（尾盘放量拉升/跳水/收盘vs VWAP/午后重心上移/早盘强势）；s7: M3a 龙虎榜净买/机构席位/人气跃升/主力连续净流入加分项 + 量能维融合主力资金分；s6: F2 财务加分项（value ROE/growth 双增速/leader 盈利质量 + 业绩恶化通用扣分）；s5: T1 指标加分项 + 筹码超跌 + 五维动量/风险维升级；s4: 消息面情绪因子；s3: 策略-来源映射 + 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
 	maxScanCandidates  = 48    // 进入量化评分的候选上限（约束日线拉取量：48 只 × 1 次 HTTP，并发 6 约 3~8s）
 	maxLLMCandidates   = 10    // 量化排序后进入 LLM 精选的名单上限（控上下文体积与位置偏差）
 	factorBarLimit     = 90    // 五维评分/窗口因子的日线口径（MA60 需 ≥60，留余量）；实际拉取按 chipBarLimit=210，评分前截尾
@@ -213,13 +214,14 @@ func strategySources(recType, stratKey string) []sourceSpec {
 
 // RecommendRequest 生成推荐入参。
 type RecommendRequest struct {
-	Type        string      `json:"type"` // short_term / long_term
-	Market      string      `json:"market"`
-	Strategy    string      `json:"strategy"`
-	LLMConfigID int64       `json:"llm_config_id"`
-	Count       int         `json:"count"`   // 期望 3-5
-	Filters     *RecFilters `json:"filters"` // 候选筛选条件；nil = 用用户偏好（无偏好则按类型默认）
-	Verify      bool        `json:"verify"`  // AI 复核：额外一次「风控复核员」调用逐条挑刺（多耗一次 LLM 请求）
+	Type               string      `json:"type"` // short_term / long_term
+	Market             string      `json:"market"`
+	Strategy           string      `json:"strategy"`
+	StrategyRevisionID int64       `json:"strategy_revision_id,omitempty"`
+	LLMConfigID        int64       `json:"llm_config_id"`
+	Count              int         `json:"count"`   // 期望 3-5
+	Filters            *RecFilters `json:"filters"` // 候选筛选条件；nil = 用用户偏好（无偏好则按类型默认）
+	Verify             bool        `json:"verify"`  // AI 复核：额外一次「风控复核员」调用逐条挑刺（多耗一次 LLM 请求）
 	// BearCheck S2-2 反方研究员（影子）：对每只 buy 额外一次独立调用构建最强 bear case，
 	// 只展示不改写。nil = 默认关联 Verify（复核开则反方也开）；显式 true/false 覆盖。
 	BearCheck *bool `json:"bear_check"`
@@ -398,6 +400,8 @@ type RecommendationItemView struct {
 	Detail   *recPick                    `json:"detail"`
 	Status   *model.RecommendationStatus `json:"status"`
 	Position *RecPositionLink            `json:"position"`
+	// 历史执行事实仍对应 Position 中最早一笔；当前操作另取活动真实账户中仍持有的一笔。
+	HoldingPosition *RecPositionLink `json:"holding_position"`
 	// UnlinkedPosition 同标的在持仓中、但**未关联到本条推荐**的记录（软匹配，仅在
 	// Position 为 nil 时可能有值）。用于提示「你买了但没登记血缘，要补关联吗」——
 	// 系统不自动认定因果，写血缘必须由用户显式确认（见 unlinkedHoldingsFor）。
@@ -410,39 +414,53 @@ type RecommendationItemView struct {
 // 掐断、页面刷新都不再中断任务；前端轮询 GET /recommendations/:id 直到脱离 processing。
 // allowPrivate 由调用方按角色决定（管理员可访问内网自建模型）。
 func (s *RecommendationService) Generate(ctx context.Context, userID int64, allowPrivate bool, req RecommendRequest) (*RecommendationView, error) {
-	plan, err := s.prepareGeneration(userID, allowPrivate, req, true)
+	ctx = jobSubmissionContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	plan, err := s.prepareGeneration(userID, allowPrivate, req, true, ctx)
 	if err != nil {
 		return nil, err
 	}
 	// 幂等防重：该用户仍有生成中的批次时直接复用（重复点击/刷新不重复建任务烧 token）。
-	if v := s.reuseProcessingBatch(userID); v != nil {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if v, err := s.reuseProcessingBatchContext(ctx, userID); err != nil {
+		return nil, err
+	} else if v != nil {
 		return v, nil
 	}
 	jobReq := recommendationJobRequestFromPlan(req, plan, true)
-	run, err := startDurableBusinessJob(userID, JobKindRecommendation, jobReq, allowPrivate)
+	var view *RecommendationView
+	_, err = startDurableBusinessJobContext(ctx, userID, JobKindRecommendation, jobReq, allowPrivate, func(tx *gorm.DB, run *model.JobRun) error {
+		if run.ResultID == nil {
+			return errors.New("推荐作业缺少结果引用")
+		}
+		var err error
+		view, err = s.getViewTx(tx, userID, *run.ResultID)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
-	if run.ResultID == nil {
-		return nil, errors.New("推荐作业缺少结果引用")
-	}
-	var batch model.RecommendationBatch
-	if err := common.DB.Where("id = ? AND user_id = ?", *run.ResultID, userID).First(&batch).Error; err != nil {
-		return nil, err
-	}
-	return &RecommendationView{RecommendationBatch: batch, Items: []RecommendationItemView{}}, nil
+	return view, nil
 }
 
 // GenerateAuto 后台任务（收盘日报）代用户生成：token 照记审计，但不消耗次数配额。
 // 调用方已在日报 JobRun 的有界双路阶段与 deadline 内，保持同步执行返回最终结果；
 // 批次同样先落 processing 行再回写，与手动路径完全同链路。
 func (s *RecommendationService) GenerateAuto(ctx context.Context, userID int64, allowPrivate bool, req RecommendRequest) (*RecommendationView, error) {
-	plan, err := s.prepareGeneration(userID, allowPrivate, req, false)
+	ctx = jobSubmissionContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	plan, err := s.prepareGeneration(userID, allowPrivate, req, false, ctx)
 	if err != nil {
 		return nil, err
 	}
 	batch := plan.newProcessingBatch()
-	if err := common.DB.Create(batch).Error; err != nil {
+	if err := common.DB.WithContext(ctx).Create(batch).Error; err != nil {
 		return nil, err
 	}
 	return s.runGeneration(ctx, batch, plan)
@@ -471,20 +489,24 @@ type recGenPlan struct {
 
 // prepareGeneration 同步段：参数校验、LLM 配置解析、配额熔断、筛选条件装载。
 // 确定性错误（类型/策略非法、无 LLM、配额尽）立即返回给用户，不建任务。
-func (s *RecommendationService) prepareGeneration(userID int64, allowPrivate bool, req RecommendRequest, manualAction bool) (*recGenPlan, error) {
-	return s.prepareGenerationWithSnapshot(userID, allowPrivate, req, manualAction, nil)
+func (s *RecommendationService) prepareGeneration(userID int64, allowPrivate bool, req RecommendRequest, manualAction bool, contexts ...context.Context) (*recGenPlan, error) {
+	return s.prepareGenerationWithSnapshot(userID, allowPrivate, req, manualAction, nil, contexts...)
 }
 
 // prepareGenerationWithSnapshot 供持久化作业复用同步请求时已冻结的偏好；frozen=nil
 // 才读取当前偏好。这样排队期间修改设置不会改变已创建批次的执行适配语义。
 func (s *RecommendationService) prepareGenerationWithSnapshot(userID int64, allowPrivate bool, req RecommendRequest,
-	manualAction bool, frozen *recommendationPreferenceSnapshot) (*recGenPlan, error) {
+	manualAction bool, frozen *recommendationPreferenceSnapshot, contexts ...context.Context) (*recGenPlan, error) {
+	ctx := jobSubmissionContext(contexts...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	req.Type = strings.ToLower(strings.TrimSpace(req.Type))
 	if req.Type != model.RecTypeShortTerm && req.Type != model.RecTypeLongTerm {
 		return nil, errors.New("推荐类型须为 short_term 或 long_term")
 	}
 	market := normalizeMarketOnly(req.Market)
-	strat, serr := resolveRecStrategy(userID, req.Type, strings.TrimSpace(req.Strategy))
+	strat, serr := resolveRecStrategyRevision(userID, req.Type, req.Strategy, req.StrategyRevisionID)
 	if serr != nil {
 		return nil, serr
 	}
@@ -509,13 +531,13 @@ func (s *RecommendationService) prepareGenerationWithSnapshot(userID int64, allo
 		count = 5
 	}
 
-	cfg, apiKey, err := s.llm.ResolveForUse(userID, req.LLMConfigID)
+	cfg, apiKey, err := s.llm.ResolveForUse(userID, req.LLMConfigID, ctx)
 	if err != nil {
 		return nil, err
 	}
 	allowPrivate = llmAllowPrivate(allowPrivate, cfg) // 回退到管理员配置时按配置所有者放行内网
 
-	if err := checkQuota(userID); err != nil {
+	if err := checkQuota(userID, contexts...); err != nil {
 		return nil, err
 	}
 
@@ -524,7 +546,10 @@ func (s *RecommendationService) prepareGenerationWithSnapshot(userID int64, allo
 	if req.Filters != nil {
 		filters = sanitizeRecFilters(*req.Filters)
 	} else {
-		filters = loadUserRecFilters(userID, req.Type)
+		filters, err = loadUserRecFilters(userID, req.Type, contexts...)
+		if err != nil {
+			return nil, err
+		}
 	}
 	// S2-2 反方研究员开关：未显式指定时关联 verify（复核开则反方也开），
 	// 调用预算 = 主调 1 + 复核 1 + 反方 1 ≤ 3 次上限。
@@ -532,12 +557,16 @@ func (s *RecommendationService) prepareGenerationWithSnapshot(userID int64, allo
 	if req.BearCheck != nil {
 		bear = *req.BearCheck
 	}
+	prompt := loadPromptRuntime(userID, model.PromptModuleRecommend)
+	if prompt.ReadError != nil {
+		return nil, prompt.ReadError
+	}
 	return &recGenPlan{
 		userID: userID, allowPrivate: allowPrivate, manualAction: manualAction,
 		recType: req.Type, market: market, count: count, strat: strat,
 		filters: filters, verify: req.Verify, bear: bear, cfg: cfg, apiKey: apiKey,
 		preference: prefSnapshot,
-		prompt:     loadPromptRuntime(userID, model.PromptModuleRecommend),
+		prompt:     prompt,
 	}, nil
 }
 
@@ -546,9 +575,10 @@ func (s *RecommendationService) prepareGenerationWithSnapshot(userID int64, allo
 func (p *recGenPlan) newProcessingBatch() *model.RecommendationBatch {
 	return &model.RecommendationBatch{
 		UserID: p.userID, Type: p.recType, Market: p.market, Strategy: p.strat.Key,
-		Title:       composeBatchTitle(p.recType, p.strat, p.filters, p.count),
-		Status:      model.RecStatusProcessing,
-		LLMConfigID: p.cfg.ID, Provider: p.cfg.Provider, Model: p.cfg.Model,
+		StrategyRevisionID: p.strat.StrategyRevisionID,
+		Title:              composeBatchTitle(p.recType, p.strat, p.filters, p.count),
+		Status:             model.RecStatusProcessing,
+		LLMConfigID:        p.cfg.ID, Provider: p.cfg.Provider, Model: p.cfg.Model,
 		// M3c：启用 recommend 自定义模板时版本号加 -custom 后缀（同分析域前例，历史可归因）。
 		// P0-6 修复批：版本出自 plan.prompt 快照——后台 buildMessages 用同一快照渲染正文，
 		// 版本与实际发送的模板内容必然一致（不再各自查库）。
@@ -561,9 +591,9 @@ func (p *recGenPlan) newProcessingBatch() *model.RecommendationBatch {
 }
 
 // expireStaleRecommendationBatches 将进程重启/崩溃遗留的 processing 批次惰性收敛。
-func expireStaleRecommendationBatches(userID int64) error {
+func expireStaleRecommendationBatches(userID int64, contexts ...context.Context) error {
 	now := time.Now()
-	return common.DB.Model(&model.RecommendationBatch{}).
+	return common.DB.WithContext(jobSubmissionContext(contexts...)).Model(&model.RecommendationBatch{}).
 		Where("user_id = ? AND status = ? AND updated_at < ?",
 			userID, model.RecStatusProcessing, now.Add(-taskProcessingStaleAfter)).
 		Where("NOT EXISTS (SELECT 1 FROM job_runs jr WHERE jr.user_id = recommendation_batches.user_id AND jr.result_type = ? AND jr.result_id = recommendation_batches.id AND jr.status IN ?)",
@@ -578,15 +608,23 @@ func expireStaleRecommendationBatches(userID int64) error {
 // reuseProcessingBatch 幂等防重：该用户仍在生成中的批次直接复用；超过共享 stale TTL
 // 未回写的 processing 批次视为死任务（进程重启/崩溃遗留）惰性判 failed，放行新任务。
 func (s *RecommendationService) reuseProcessingBatch(userID int64) *RecommendationView {
-	if err := expireStaleRecommendationBatches(userID); err != nil {
-		common.SysWarn("推荐死任务清理失败 user=%d: %v", userID, err)
+	view, _ := s.reuseProcessingBatchContext(context.Background(), userID)
+	return view
+}
+
+func (s *RecommendationService) reuseProcessingBatchContext(ctx context.Context, userID int64) (*RecommendationView, error) {
+	if err := expireStaleRecommendationBatches(userID, ctx); err != nil {
+		return nil, err
 	}
 	var b model.RecommendationBatch
-	if err := common.DB.Where("user_id = ? AND status = ?", userID, model.RecStatusProcessing).
+	if err := common.DB.WithContext(ctx).Where("user_id = ? AND status = ?", userID, model.RecStatusProcessing).
 		Order("id DESC").First(&b).Error; err != nil {
-		return nil
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
 	}
-	return &RecommendationView{RecommendationBatch: b, Items: []RecommendationItemView{}}
+	return &RecommendationView{RecommendationBatch: b, Items: []RecommendationItemView{}}, nil
 }
 
 // applyBatchRouteAttribution P2-4 审查修复批：主调被模型路由改写时，批次归因列回写
@@ -683,7 +721,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	llmCands = freezeLLMInputOrder(pool, llmCands)
 	// 历史候选摘要随建池已冻结；新闻在真正送模前按当前 as_of 查询，限定 7 日、
 	// 每标的最多 3 条标题，不读取正文，也不改变候选边界和量化排序。
-	enrichCandidatePromptContext(llmCands, time.Now())
+	enrichCandidatePromptContext(llmCands, time.Now(), ctx)
 	poolBySymbol := make(map[string]candidate, len(llmCands))
 	for _, c := range llmCands {
 		poolBySymbol[c.Symbol] = c
@@ -715,7 +753,16 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	batch.FiltersJSON = string(filtersJSON)
 	// P1-5 反思记忆影子检索（三不纪律：不注入 prompt——messages 已在上方构造完毕、
 	// 不改写 picks/置信度、拒选与降级路径同样随批次落库）。best-effort，空=无匹配零噪声。
-	batch.ReflectionJSON = reflectionShadowJSON(userID, recType, strat.Key, llmCands)
+	batch.ReflectionJSON = reflectionShadowJSON(userID, recType, strat.Key, llmCands, ctx)
+	if plan.manualAction {
+		var finishQuota func()
+		ctx, finishQuota, err = beginManualQuotaAction(ctx, userID)
+		if err != nil {
+			s.failBatch(batch, chatUsage{}, 0, err.Error())
+			return nil, err
+		}
+		defer finishQuota()
+	}
 
 	// P0-2 调用关联：主调一个 run（repair 同 run 按 attempt 区分），复核/反方派生 run
 	// 回指主调；manifest 数组随批次落库，llm_call_logs 凭 batch.TraceID 双向可查。
@@ -784,12 +831,17 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	batch.TotalTokens = usage.TotalTokens
 	batch.LatencyMs = latency
 	if usage.TotalTokens > 0 {
-		consumeQuota(userID, usage.TotalTokens, plan.manualAction)
+		consumeQuota(userID, usage.TotalTokens)
 	}
 
 	// AI 主调用失败：上游超时/网络类失败降级为量化推荐（量化系统已完成筛选与排序，
 	// AI 挂掉不该让整个功能不可用）；鉴权/路径/配额类确定性错误直接失败，让用户修配置。
 	degradedNote := ""
+	if err := ctx.Err(); err != nil {
+		fillBatchRunMeta()
+		s.failBatch(batch, usage, latency, err.Error())
+		return nil, err
+	}
 	if callErr != nil {
 		if quantFallbackEligible(callErr) {
 			if fb := buildQuantFallbackPicks(recType, llmCands, count); len(fb) > 0 {
@@ -829,7 +881,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 			mainRun.DegradedReason = "llm_output_invalid"
 		}
 		fillBatchRunMeta()
-		if err := common.DB.Save(batch).Error; err != nil {
+		if err := withJobResultTransaction(ctx, func(tx *gorm.DB) error { return tx.Save(batch).Error }); err != nil {
 			return nil, err
 		}
 		// #9 零推荐批次同样落全池候选事件 + 影子标签：无 picks/items（picked 分支自动
@@ -926,7 +978,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 	}
 	fillBatchRunMeta()
 	items := make([]model.Recommendation, 0, len(picks))
-	err = common.DB.Transaction(func(tx *gorm.DB) error {
+	err = withJobResultTransaction(ctx, func(tx *gorm.DB) error {
 		if err := tx.Save(batch).Error; err != nil {
 			return err
 		}
@@ -968,7 +1020,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		cancelShadow()
 	}
 
-	return s.assembleView(*batch, items, nil, nil, nil), nil
+	return s.assembleView(*batch, items, nil, nil, nil, nil), nil
 }
 
 // failEmptyShortlist 名单为空时的失败收尾（P0-3）：提前失败也必须落可复核快照与事实
@@ -1072,7 +1124,7 @@ func applyBuyPositionSizing(picks []recPick, poolBySymbol map[string]candidate, 
 // 流中断/空内容这类「上游临时不可用」降级兜底；鉴权/路径/Base URL/配额类确定性
 // 错误不降级——降级会掩盖需要用户修配置的问题。
 func quantFallbackEligible(err error) bool {
-	if err == nil {
+	if err == nil || errors.Is(err, context.Canceled) {
 		return false
 	}
 	msg := err.Error()
@@ -1161,7 +1213,7 @@ func (s *RecommendationService) callWithRepair(ctx context.Context, userID int64
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			ReasoningEffort: cfg.ReasoningEffort,
-			Temperature: cfg.Temperature, MaxTokens: requestMax,
+			Temperature:     cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
@@ -1222,7 +1274,9 @@ const recReviewSystemPrompt = `你是一名独立的风控复核员，逐条审�
 func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, cfg *model.LLMConfig, apiKey string, allowPrivate bool, recType string, picks []recPick, pool map[string]candidate, traceID, parentRunID string) ([]pickReview, string, chatUsage, *llmRun) {
 	var usage chatUsage
 	rows := make([]map[string]any, 0, len(picks))
+	requested := make(map[string]bool, len(picks))
 	for _, p := range picks {
+		requested[p.Symbol] = true
 		c := pool[p.Symbol]
 		rows = append(rows, map[string]any{
 			"pick": newRecReviewPickInput(p),
@@ -1256,7 +1310,7 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			ReasoningEffort: cfg.ReasoningEffort,
-			Temperature: cfg.Temperature, MaxTokens: requestMax,
+			Temperature:     cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
@@ -1286,7 +1340,7 @@ func (s *RecommendationService) reviewPicks(ctx context.Context, userID int64, c
 				if r.Verdict != "pass" && r.Verdict != "warn" && r.Verdict != "reject" {
 					continue
 				}
-				if _, ok := pool[r.Symbol]; !ok || seen[r.Symbol] {
+				if _, ok := pool[r.Symbol]; !ok || !requested[r.Symbol] || seen[r.Symbol] {
 					continue
 				}
 				if r.Confidence < 0 {
@@ -1533,6 +1587,8 @@ func parseAndFilterPicks(content string, pool map[string]candidate, maxCount int
 			continue
 		}
 		seen[sym] = true
+		// 降级归属由实际执行路径决定，模型无权把自己的输出伪装为规则生成。
+		p.DegradedSource = ""
 		out = append(out, normalizePick(p, sym, pool[sym]))
 		diag.CoveredCount++
 	}
@@ -1580,7 +1636,7 @@ func normalizePick(p recPick, sym string, c candidate) recPick {
 	// 服务端专属字段先清零（防模型伪造）：Review/Bear/QualityGate 只能由服务端复核、
 	// 反方与质量门控链路回填——模型在输出 JSON 里自附这些字段会被 Unmarshal 吃进来，
 	// verify/bear 关闭时无人覆盖就会以「复核通过/反方低危」的假面落库展示。
-	// DegradedSource 不在此清（quant_fallback 构造路径先设值再过本函数）。
+	// DegradedSource 在模型解析入口清除；规则降级构造路径保留真实来源。
 	p.Review, p.Bear, p.QualityGate, p.ExecutionPlan, p.Discovery = nil, nil, nil, nil, nil
 	p.QuoteAsOf = ""      // 服务端回填字段，模型自附一律剥除
 	p.RawConfidence = nil // 服务端快照字段（复核前置信度），模型自附一律剥除
@@ -1656,20 +1712,30 @@ func defaultCandidateFilter() candidateFilter {
 	return candidateFilter{minAmount: minCandidateAmount}
 }
 
-// loadCandidateFilter 读取用户偏好中的回避规则；偏好缺失/解析失败回退默认。
-func loadCandidateFilter(userID int64) candidateFilter {
+// 用户回避规则不可在读库或解析失败时被当成空规则；仅缺少配置时使用默认。
+func loadCandidateFilter(userID int64, contexts ...context.Context) (candidateFilter, error) {
 	f := defaultCandidateFilter()
 	if common.DB == nil {
-		return f
+		return f, errors.New("数据库不可用")
 	}
 	var pref model.UserPreference
-	if err := common.DB.Where("user_id = ?", userID).First(&pref).Error; err != nil {
-		return f
+	if err := common.DB.WithContext(jobSubmissionContext(contexts...)).Where("user_id = ?", userID).First(&pref).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return f, nil
+		}
+		return f, err
 	}
 	f.minAmount = pref.MinCandidateAmount
 	if strings.TrimSpace(pref.BlacklistJSON) != "" {
+		raw, err := normalizeBlacklist(pref.BlacklistJSON)
+		if err != nil {
+			return f, errors.New("黑名单数据无效，请在设置中重新保存")
+		}
 		var entries []BlacklistEntry
-		if json.Unmarshal([]byte(pref.BlacklistJSON), &entries) == nil {
+		if raw != "" {
+			if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+				return f, err
+			}
 			f.blacklist = make(map[string]bool, len(entries))
 			for _, e := range entries {
 				if e.Symbol != "" {
@@ -1678,7 +1744,7 @@ func loadCandidateFilter(userID int64) candidateFilter {
 			}
 		}
 	}
-	return f
+	return f, nil
 }
 
 // candidateEligible PRD 3.6 推荐前置筛选：排除退市风险（ST/*ST/退市整理）、
@@ -1928,7 +1994,10 @@ func (s *RecommendationService) applyQuoteFreshGate(ctx context.Context, market 
 // 返回 全量池（含被筛掉者）、quote_stale 门控记录；未被筛掉的数量超过
 // maxScanCandidates 时后来者标注「池满」。
 func (s *RecommendationService) buildPool(ctx context.Context, userID int64, market, recType string, strat *strategyTemplate, filters RecFilters) ([]candidate, []gateNote, error) {
-	base := loadCandidateFilter(userID)
+	base, err := loadCandidateFilter(userID, ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	byKey := map[string]int{} // symbol → pool 下标
 	pool := make([]candidate, 0, 64)
 
@@ -1971,6 +2040,38 @@ func (s *RecommendationService) buildPool(ctx context.Context, userID int64, mar
 		byKey[c.Symbol] = len(pool)
 		pool = append(pool, c)
 	}
+	addStrategySignals := func() {
+		if market != "cn" {
+			return
+		}
+		hits := strategySignalHits(ctx, userID, recType, strat, strategySignalPoolLimitFor(strat))
+		refs := make([]QuoteRef, 0, len(hits))
+		for _, h := range hits {
+			if _, exists := byKey[h.Symbol]; !exists {
+				refs = append(refs, QuoteRef{Market: market, Symbol: h.Symbol})
+			}
+		}
+		quotes := s.market.QuotesFor(ctx, refs)
+		for _, h := range hits {
+			c := candidate{Symbol: h.Symbol, Market: market, Name: h.Name,
+				Price: round2(h.Price), ChangePct: round2(h.ChgPct),
+				Amount: round2(h.AmountYi * 1e8)}
+			if h.TurnoverRate != nil {
+				c.TurnoverRate = round2(*h.TurnoverRate)
+			}
+			if q := quotes[QuoteKey(market, h.Symbol)]; q != nil && q.Price > 0 {
+				c.Price, c.ChangePct = round2(q.Price), round2(q.ChangePct)
+				if q.Amount > 0 {
+					c.Amount = round2(q.Amount)
+				}
+			}
+			add(c, "strategy_signal")
+		}
+	}
+	// 用户显式选择的选股策略先占入池名额，避免被自选/发现/榜单耗尽总量护栏。
+	if strat.screen != nil {
+		addStrategySignals()
+	}
 
 	// 自选股（用户已研究的标的，优先纳入）——仅限当前 market，且必须有实时行情
 	// （取不到行情可能是停牌，且无数据会诱导 LLM 编造依据）。
@@ -2002,7 +2103,7 @@ func (s *RecommendationService) buildPool(ctx context.Context, userID int64, mar
 	// 推荐生成绝不触发全市场扫描。近 5 日身份先聚合，再批量重读当前行情；旧发现
 	// score 不写入 candidate.Score，后续仍由 scorePool 用当前因子重算。
 	if market == "cn" {
-		discovered := recentDiscoveryCandidates(market, maxDiscoveryPoolIntake)
+		discovered := recentDiscoveryCandidates(market, maxDiscoveryPoolIntake, ctx)
 		refs := make([]QuoteRef, 0, len(discovered))
 		for _, item := range discovered {
 			refs = append(refs, QuoteRef{Market: market, Symbol: item.candidate.Symbol})
@@ -2042,34 +2143,9 @@ func (s *RecommendationService) buildPool(ctx context.Context, userID int64, mar
 		}
 	}
 
-	// M1 策略信号来源：因子宽表全市场扫描命中进池——内置推荐策略按映射的内置选股
-	// 策略扫描；选股类推荐策略直接扫描用户所选的那个选股策略（主供给，名额更高）。
-	//（榜单只见「当天最热/最冷」，策略信号补上「形态对但不在榜上」的全市场供给）。
-	// 宽表行情是最近收盘日口径，盘中生成会滞后——对新增标的批量拉实时行情覆盖，
-	// 拉不到时保留收盘口径（best-effort；涨停判定等用户筛选按可得数据判）。
-	if market == "cn" {
-		if hits := strategySignalHits(ctx, userID, recType, strat, strategySignalPoolLimitFor(strat)); len(hits) > 0 {
-			refs := make([]QuoteRef, 0, len(hits))
-			for _, h := range hits {
-				if _, exists := byKey[h.Symbol]; !exists {
-					refs = append(refs, QuoteRef{Market: market, Symbol: h.Symbol})
-				}
-			}
-			quotes := s.market.QuotesFor(ctx, refs)
-			for _, h := range hits {
-				c := candidate{Symbol: h.Symbol, Market: market, Name: h.Name,
-					Price: round2(h.Price), ChangePct: round2(h.ChgPct),
-					Amount: round2(h.AmountYi * 1e8), TurnoverRate: round2(h.TurnoverRate)}
-				if q := quotes[QuoteKey(market, h.Symbol)]; q != nil && q.Price > 0 {
-					c.Price = round2(q.Price)
-					c.ChangePct = round2(q.ChangePct)
-					if q.Amount > 0 {
-						c.Amount = round2(q.Amount)
-					}
-				}
-				add(c, "strategy_signal")
-			}
-		}
+	// 内置推荐策略仍将映射信号作为补充来源；显式选股策略已在池首加入。
+	if strat.screen == nil {
+		addStrategySignals()
 	}
 	if len(pool) == 0 {
 		return pool, nil, nil
@@ -2128,16 +2204,24 @@ func (s *RecommendationService) buildPool(ctx context.Context, userID int64, mar
 			}
 		}
 	}
-	assignScanQuota(pool)
+	if strat.screen != nil {
+		assignScanQuota(pool, "strategy_signal")
+	} else {
+		assignScanQuota(pool)
+	}
 	return pool, freshGates, nil
 }
 
 // assignScanQuota 评分名额分配：通过用户筛选的候选按「首来源」分组（保池序），
-// 自选整组优先（用户已研究的标的不参与竞争），其余组逐轮各出一只轮转发放，
+// 默认自选整组优先；显式指定选股策略时，改为该策略命中优先。其余组逐轮轮转发放，
 // 直到发满 maxScanCandidates，落选者标「池满」（scorePool 补位轮按前缀识别回补）。
 // 不轮转的话名额按进池顺序先到先得，第一路榜单会垄断整个量化窗口（如 pullback
 // 的回调票 50+ 只吃掉全部 48 席，成交额/涨幅路的强势票全部沦为「池满」）。
-func assignScanQuota(pool []candidate) {
+func assignScanQuota(pool []candidate, prioritySources ...string) {
+	priority := "watchlist"
+	if len(prioritySources) > 0 && prioritySources[0] != "" {
+		priority = prioritySources[0]
+	}
 	var order []string
 	groups := map[string][]int{}
 	for i := range pool {
@@ -2148,16 +2232,19 @@ func assignScanQuota(pool []candidate) {
 		if len(pool[i].Sources) > 0 {
 			src = pool[i].Sources[0]
 		}
+		if hasSource(pool[i].Sources, priority) {
+			src = priority
+		}
 		if _, ok := groups[src]; !ok {
 			order = append(order, src)
 		}
 		groups[src] = append(groups[src], i)
 	}
 
-	seq := append([]int(nil), groups["watchlist"]...)
+	seq := append([]int(nil), groups[priority]...)
 	rest := make([][]int, 0, len(order))
 	for _, src := range order {
-		if src != "watchlist" {
+		if src != priority {
 			rest = append(rest, groups[src])
 		}
 	}
@@ -2271,6 +2358,11 @@ func adjustedCandidateScore(recType string, strat *strategyTemplate, c candidate
 func (s *RecommendationService) scorePool(ctx context.Context, recType string, strat *strategyTemplate, pool []candidate, filters RecFilters, industryBy map[string]string) []gateNote {
 	scoreNow := time.Now().In(time.Local)
 	sentiDate := scoreNow.Format("2006-01-02")
+	barLimit := chipBarLimit
+	if strat.screen != nil {
+		// 选股支持年线、年内位置和新高；必须与宽表使用相同的 250 根窗口。
+		barLimit = wideBarLimit
+	}
 	// F2 财务拉取预算（仅长线消耗）：单次生成最多回上游拉 finRecFetchBudget 只 F10，
 	// 其余只吃本地缓存（缺失不惩罚），多次生成/详情页访问会逐步焐热缓存。
 	finBudget := finRecFetchBudget
@@ -2289,7 +2381,7 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 		popSigs := popSignalsFor(ctx, syms)
 		// M3b 盘中因子批量注入（本地表一次查询，最近已同步交易日 T-1 口径）；
 		// 写回点在下方 Factors 创建之后。
-		intraSigs := intradaySignalsFor(syms)
+		intraSigs := intradaySignalsFor(syms, ctx)
 		// B9 限售解禁批量注入（本地表一次查询）：bear 论据框架首条就是解禁，
 		// 此前无数据可依只能提示自行核查，现在有数据要能引用具体数字。
 		liftSigs, liftAvailable := liftSignalsFor(syms)
@@ -2333,9 +2425,8 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 			go func(i int) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				// 拉 chipBarLimit=210 根：同一个上游请求（仅行数差异），一次取数
-				// 同时满足筹码累积窗口（210）与技术因子窗口（尾部 90）。
-				bars, err := s.market.GetDailyBars(ctx, pool[i].Market, pool[i].Symbol, chipBarLimit)
+				// 选股策略取 250 根，其余策略取 210 根；筹码与五维评分仍按各自窗口截尾。
+				bars, err := s.market.GetDailyBars(ctx, pool[i].Market, pool[i].Symbol, barLimit)
 				if err != nil {
 					return
 				}
@@ -3050,8 +3141,11 @@ func poolSymbolList(pool map[string]candidate) string {
 // 命中自动暂停），复用现有 alert 链路。仅本人；无止损价的条目明确报错。
 func (s *RecommendationService) CreateStopLossAlert(ctx context.Context, userID, recID int64, alerts *AlertService) (*model.AlertRule, error) {
 	var rec model.Recommendation
-	if err := common.DB.Where("id = ? AND user_id = ?", recID, userID).First(&rec).Error; err != nil {
-		return nil, errors.New("推荐条目不存在")
+	if err := common.DB.WithContext(ctx).Where("id = ? AND user_id = ?", recID, userID).First(&rec).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("推荐条目不存在")
+		}
+		return nil, err
 	}
 	var d recPick
 	if rec.DetailJSON == "" || json.Unmarshal([]byte(rec.DetailJSON), &d) != nil || d.StopLoss <= 0 {
@@ -3068,15 +3162,19 @@ func (s *RecommendationService) CreateStopLossAlert(ctx context.Context, userID,
 
 // History 列出推荐批次（不返回重字段）。
 func (s *RecommendationService) History(userID int64, recType string, limit int) ([]model.RecommendationBatch, error) {
+	return s.HistoryContext(context.Background(), userID, recType, limit)
+}
+
+func (s *RecommendationService) HistoryContext(ctx context.Context, userID int64, recType string, limit int) ([]model.RecommendationBatch, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 30
 	}
-	q := common.DB.Where("user_id = ?", userID)
+	q := common.DB.WithContext(ctx).Where("user_id = ?", userID)
 	if recType == model.RecTypeShortTerm || recType == model.RecTypeLongTerm {
 		q = q.Where("type = ?", recType)
 	}
 	var rows []model.RecommendationBatch
-	err := q.Select("id", "user_id", "type", "market", "strategy", "title", "status", "error",
+	err := q.Select("id", "user_id", "type", "market", "strategy", "strategy_revision_id", "title", "status", "error",
 		"candidate_count", "regime", "llm_config_id", "provider", "model", "prompt_version", "strategy_version",
 		"prompt_tokens", "completion_tokens", "total_tokens", "latency_ms", "created_at", "updated_at").
 		Order("id DESC").Limit(limit).Find(&rows).Error
@@ -3088,8 +3186,25 @@ func (s *RecommendationService) History(userID int64, recType string, limit int)
 
 // Get 取单批推荐详情（含条目）。仅本人。
 func (s *RecommendationService) Get(userID, id int64) (*RecommendationView, error) {
+	return s.GetContext(context.Background(), userID, id)
+}
+
+func (s *RecommendationService) GetContext(ctx context.Context, userID, id int64) (*RecommendationView, error) {
+	var view *RecommendationView
+	err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		view, err = s.getViewTx(tx, userID, id)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return view, nil
+}
+
+func (s *RecommendationService) getViewTx(tx *gorm.DB, userID, id int64) (*RecommendationView, error) {
 	var batch model.RecommendationBatch
-	err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&batch).Error
+	err := tx.Where("id = ? AND user_id = ?", id, userID).First(&batch).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, errors.New("推荐记录不存在")
 	}
@@ -3097,18 +3212,21 @@ func (s *RecommendationService) Get(userID, id int64) (*RecommendationView, erro
 		return nil, err
 	}
 	var items []model.Recommendation
-	if err := common.DB.Where("batch_id = ? AND user_id = ?", id, userID).Order("sort_order, id").Find(&items).Error; err != nil {
+	if err := tx.Where("batch_id = ? AND user_id = ?", id, userID).Order("sort_order, id").Find(&items).Error; err != nil {
 		return nil, err
 	}
 	// 附追踪状态（若后台/手动已评估）。
 	statuses := map[int64]model.RecommendationStatus{}
 	var srows []model.RecommendationStatus
-	common.DB.Where("batch_id = ? AND user_id = ?", id, userID).Find(&srows)
+	if err := tx.Where("batch_id = ? AND user_id = ?", id, userID).Find(&srows).Error; err != nil {
+		return nil, err
+	}
 	for _, r := range srows {
 		statuses[r.RecommendationID] = r
 	}
-	// 附对应持仓（血缘：一键建仓写入 recommendation_id；同一推荐多笔建仓取最早一笔）。
+	// 历史收益所对应的血缘保持最早一笔，当前持仓操作单独按活动账户筛选。
 	posLinks := map[int64]RecPositionLink{}
+	holdingLinks := map[int64]RecPositionLink{}
 	unlinked := map[int64]RecPositionLink{}
 	if len(items) > 0 {
 		recIDs := make([]int64, 0, len(items))
@@ -3116,29 +3234,63 @@ func (s *RecommendationService) Get(userID, id int64) (*RecommendationView, erro
 			recIDs = append(recIDs, it.ID)
 		}
 		var prows []model.Position
-		common.DB.Where("user_id = ? AND recommendation_id IN ?", userID, recIDs).Order("id").Find(&prows)
+		if err := tx.Where("user_id = ? AND recommendation_id IN ?", userID, recIDs).Order("id").Find(&prows).Error; err != nil {
+			return nil, err
+		}
+		active, err := activePositionSnapshotIDs(tx, prows)
+		if err != nil {
+			return nil, err
+		}
 		for _, p := range prows {
+			link := RecPositionLink{
+				PositionID: p.ID, BuyPrice: p.BuyPrice, BuyDate: p.BuyDate,
+				Quantity: p.Quantity, Status: p.Status,
+			}
 			if _, ok := posLinks[p.RecommendationID]; !ok {
-				posLinks[p.RecommendationID] = RecPositionLink{
-					PositionID: p.ID, BuyPrice: p.BuyPrice, BuyDate: p.BuyDate,
-					Quantity: p.Quantity, Status: p.Status,
-				}
+				posLinks[p.RecommendationID] = link
+			}
+			if _, ok := holdingLinks[p.RecommendationID]; !ok && active[p.ID] {
+				holdingLinks[p.RecommendationID] = link
 			}
 		}
 		// 无血缘的条目再按标的软匹配持仓：手动录入的持仓 recommendation_id=0，
 		// 靠血缘永远查不出来，只能按 symbol 提示用户「你买了但没登记」。
-		unlinked = unlinkedHoldingsFor(userID, items, posLinks)
+		unlinked, err = unlinkedHoldingsFor(tx, userID, items, posLinks)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return s.assembleView(batch, items, statuses, posLinks, unlinked), nil
+	return s.assembleView(batch, items, statuses, posLinks, holdingLinks, unlinked), nil
 }
 
 // Delete 删除推荐批次及其条目（仅本人，事务）。
 func (s *RecommendationService) Delete(userID, id int64) error {
-	var batch model.RecommendationBatch
-	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&batch).Error; err != nil {
-		return errors.New("推荐记录不存在")
-	}
-	return common.DB.Transaction(func(tx *gorm.DB) error {
+	return s.DeleteContext(context.Background(), userID, id)
+}
+
+func (s *RecommendationService) DeleteContext(ctx context.Context, userID, id int64) error {
+	return common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var batch model.RecommendationBatch
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ?", id, userID).First(&batch).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("推荐记录不存在")
+			}
+			return err
+		}
+		if batch.Status == model.RecStatusProcessing {
+			return errors.New("推荐正在后台执行，请等任务结束后再删除")
+		}
+		// 批次可能已成功，但 worker 仍在落事实或研究工件，须等待作业也收敛。
+		var active int64
+		if err := tx.Model(&model.JobRun{}).
+			Where("user_id = ? AND result_type = ? AND result_id = ? AND status IN ?",
+				userID, JobResultRecommendation, id, []string{model.JobStatusQueued, model.JobStatusRunning}).
+			Count(&active).Error; err != nil {
+			return err
+		}
+		if active > 0 {
+			return errors.New("推荐正在后台执行，请等任务结束后再删除")
+		}
 		if err := tx.Where("batch_id = ? AND user_id = ?", id, userID).Delete(&model.Recommendation{}).Error; err != nil {
 			return err
 		}
@@ -3150,7 +3302,7 @@ func (s *RecommendationService) Delete(userID, id int64) error {
 }
 
 // assembleView 组装批次视图（解析条目明细，附可选追踪状态、持仓血缘与软匹配未登记持仓）。
-func (s *RecommendationService) assembleView(batch model.RecommendationBatch, items []model.Recommendation, statuses map[int64]model.RecommendationStatus, posLinks, unlinked map[int64]RecPositionLink) *RecommendationView {
+func (s *RecommendationService) assembleView(batch model.RecommendationBatch, items []model.Recommendation, statuses map[int64]model.RecommendationStatus, posLinks, holdingLinks, unlinked map[int64]RecPositionLink) *RecommendationView {
 	views := make([]RecommendationItemView, 0, len(items))
 	for _, it := range items {
 		iv := RecommendationItemView{Recommendation: it}
@@ -3169,6 +3321,10 @@ func (s *RecommendationService) assembleView(batch model.RecommendationBatch, it
 			// 仅在无血缘时提示软匹配结果，两者互斥（有血缘就该显示血缘）。
 			u := ul
 			iv.UnlinkedPosition = &u
+		}
+		if pl, ok := holdingLinks[it.ID]; ok {
+			p := pl
+			iv.HoldingPosition = &p
 		}
 		views = append(views, iv)
 	}

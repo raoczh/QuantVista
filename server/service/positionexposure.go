@@ -268,6 +268,9 @@ func computeExposure(views []PositionView, industries map[string]string,
 	}
 
 	out.Industry = buildExposureDim(items, base, func(it exposureInput) string {
+		if it.Market != "cn" {
+			return ""
+		}
 		return industries[it.Symbol]
 	}, nil, nil, "行业未知")
 	if out.Industry.Available {

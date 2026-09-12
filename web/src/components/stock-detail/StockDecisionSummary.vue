@@ -7,6 +7,7 @@ import FreshnessTag from '@/components/FreshnessTag.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import { useUi } from '@/composables/useUi'
 import { useDisplayMode } from '@/composables/useDisplayMode'
+import { formatPrice } from '@/lib/formatPrice'
 import type {
   DecisionItem,
   DecisionSummary,
@@ -62,7 +63,7 @@ function money(value: number) {
       <div v-if="quote" class="quote-primary">
         <div class="quote-price-row">
           <span class="quote-price qv-figure" :style="{ color: pctColor(quote.change_pct) }">
-            {{ quote.price.toFixed(2) }}
+            {{ formatPrice(quote.price) }}
           </span>
           <ChangeTag :value="quote.change_pct" />
         </div>
@@ -85,10 +86,10 @@ function money(value: number) {
       </n-alert>
 
       <div class="quote-facts" aria-label="关键行情">
-        <div><span>今开</span><strong>{{ quote ? quote.open.toFixed(2) : unknownText() }}</strong></div>
-        <div><span>最高</span><strong>{{ quote ? quote.high.toFixed(2) : unknownText() }}</strong></div>
-        <div><span>最低</span><strong>{{ quote ? quote.low.toFixed(2) : unknownText() }}</strong></div>
-        <div><span>昨收</span><strong>{{ quote ? quote.prev_close.toFixed(2) : unknownText() }}</strong></div>
+        <div><span>今开</span><strong>{{ quote ? formatPrice(quote.open) : unknownText() }}</strong></div>
+        <div><span>最高</span><strong>{{ quote ? formatPrice(quote.high) : unknownText() }}</strong></div>
+        <div><span>最低</span><strong>{{ quote ? formatPrice(quote.low) : unknownText() }}</strong></div>
+        <div><span>昨收</span><strong>{{ quote ? formatPrice(quote.prev_close) : unknownText() }}</strong></div>
       </div>
     </div>
     <n-alert v-if="quote && quoteError" type="warning" :bordered="false" class="quote-refresh-warning">
@@ -121,7 +122,7 @@ function money(value: number) {
           当前未持有这只股票，以下内容仅用于研究，不是本人持仓卖出建议。
         </n-alert>
         <div v-if="position" class="position-facts">
-          <div><span>平均成本</span><strong>{{ position.averageCost.toFixed(2) }} 元</strong></div>
+          <div><span>平均成本</span><strong>{{ formatPrice(position.averageCost) }} 元</strong></div>
           <div>
             <span>浮盈亏</span>
             <strong v-if="position.profitPct != null" :style="{ color: pctColor(position.profitPct) }">

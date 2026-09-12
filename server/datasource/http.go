@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -35,6 +36,31 @@ const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 // 东财把行情接口分流到 {1..99}.push2(.his).eastmoney.com 这些负载节点。
 // 轮询节点可分散单节点限流（akshare 同款做法），比裸 push2.eastmoney.com 更不易被掐。
 var emNodeCounter uint32
+
+// waitSourceInterval 为共享数据源逐次放行请求。等待期间释放锁，唤醒后必须重查
+// 最后放行时刻，否则并发等待者会在同一刻全部通过，形成超出限额的请求突发。
+func waitSourceInterval(ctx context.Context, mu *sync.Mutex, last *time.Time, interval time.Duration) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		mu.Lock()
+		wait := interval - time.Since(*last)
+		if wait <= 0 {
+			*last = time.Now()
+			mu.Unlock()
+			return nil
+		}
+		mu.Unlock()
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
 
 func emNode() int {
 	return int(atomic.AddUint32(&emNodeCounter, 1)%99) + 1
@@ -78,7 +104,7 @@ func doGet(ctx context.Context, url string, headers map[string]string) ([]byte, 
 // 不放开整个 '1' 前缀：10x/11x 为沪深可转债，代码规则不同，须排除（否则误当基金查行情）。
 func cnSecid(symbol string) (string, bool) {
 	s := strings.TrimSpace(symbol)
-	if len(s) != 6 {
+	if !isSixDigitSymbol(s) {
 		return "", false
 	}
 	switch s[0] {
@@ -100,7 +126,7 @@ func cnSecid(symbol string) (string, bool) {
 // 深市基金 15x/16x/18x 同 cnSecid：放行为深市（sz），排除 10x/11x 可转债。
 func sinaCNSymbol(symbol string) (string, bool) {
 	s := strings.TrimSpace(symbol)
-	if len(s) != 6 {
+	if !isSixDigitSymbol(s) {
 		return "", false
 	}
 	switch s[0] {
@@ -116,4 +142,16 @@ func sinaCNSymbol(symbol string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func isSixDigitSymbol(symbol string) bool {
+	if len(symbol) != 6 {
+		return false
+	}
+	for i := range symbol {
+		if symbol[i] < '0' || symbol[i] > '9' {
+			return false
+		}
+	}
+	return true
 }

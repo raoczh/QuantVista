@@ -77,7 +77,7 @@ assert.match(stockActions, /position_id: String\(positionID\)/, '卖出决策必
 assert.match(stockActions, /缺少准确的持仓 ID/, '缺 position_id 必须 fail-closed')
 assert.match(stockActions, /goPositionFromRecommendation/, '推荐建仓入口必须保留推荐血缘深链')
 assert.match(stockActions, /rec_id: String\(recommendationID\)/, '推荐建仓深链必须携带 rec_id')
-assert.match(recCard, /item\.position!\.position_id/, '推荐持仓入口必须使用关联持仓 ID')
+assert.match(recCard, /holdingPosition!\.position_id/, '推荐持仓入口必须使用活动账户中仍持有的关联持仓 ID')
 // 推荐依据走弹层，不做卡内折叠：一批推荐有多张卡，卡内已有结论/理由风险/持仓/追踪/
 // 信任徽章/操作条，就地展开一大块会把卡片撑得没法扫读；而且折叠区曾放在卡片中部，
 // 点底部按钮时内容在按钮上方展开，用户盯着按钮什么都看不到，观感就是「点了没反应」。
@@ -140,11 +140,38 @@ assert.equal(blockedEntry.label, '我已买入，登记到这条推荐')
 assert.equal(blockedEntry.prefillQuantity, 0, '计划不可执行时不得预填数量')
 assert.deepEqual(blockedEntry.reasons, ['投资偏好未完成'], '必须原样带出不可执行原因')
 assert.equal(recPresentation.positionEntryAction({ detail: null }).ready, false, '无执行计划也要能登记事实')
+for (const outcome of ['take_profit', 'stop_loss', 'expired']) {
+  const expired = recPresentation.positionEntryAction({ status: { outcome }, detail: { execution_plan: { status: 'ready', quantity: 300 } } })
+  assert.equal(expired.ready, false, '终态推荐不能按旧计划建仓')
+  assert.equal(expired.prefillQuantity, 0, '终态推荐仅登记实际成交，不预填旧数量')
+  assert.equal(expired.label, '我已买入，登记到这条推荐')
+}
+const validCandidate = { symbol: '600000', market: 'cn', name: '本地样本', change_pct: 0, score: 0 }
+for (const bad of [null, 1, { ...validCandidate, score: 'bad' }, { ...validCandidate, sources: 'watchlist' }, { ...validCandidate, strategy_hit: { total: 1, hit: 1, full: true, missed: 'bad' } }]) {
+  const parsed = recPresentation.parseCandidateSnapshot(JSON.stringify([bad, validCandidate]))
+  assert.equal(parsed.invalid, true, '坏快照必须明确披露')
+  assert.deepEqual(parsed.items, [validCandidate], '保留合法零值候选，不掺入坏数据')
+}
+assert.deepEqual(recPresentation.parseCandidateSnapshot(''), { items: [], invalid: false })
+assert.equal(recPresentation.parseRejectedSnapshot('[null]').invalid, true)
+assert.equal(recPresentation.rankedScore(undefined, 1), 0, '旧快照遗漏零分时按已计算排名恢复真实零值')
+assert.equal(recPresentation.rankedScore(undefined, undefined), undefined, '未计算排名不能伪造零分')
+assert.equal(recPresentation.omittedCandidates('{"pool_omitted":90}'), 90)
+assert.equal(recPresentation.omittedCandidates('{"pool_omitted":"90"}'), 0)
 
 const analysisPresentation = loadTypeScript('src/components/analysis/analysisPresentation.ts')
 assert.equal(analysisPresentation.recordStockName({ symbol: '600000', target: '600000', title: '浦发银行' }), '浦发银行')
 assert.equal(analysisPresentation.parseSnapshotFreshness('{"freshness_status":"partial"}').freshness, 'partial')
 assert.equal(analysisPresentation.parseSnapshotFreshness('{}').freshness, 'unknown')
+const historicalFreshness = analysisPresentation.parseSnapshotFreshness(JSON.stringify({
+  as_of: '2026-09-06',
+  quote: { trade_date: '2026-09-04', source: 'daily_bars', price: 4.0375 },
+  technicals: { bar_count: 60 },
+  as_of_note: '采用前一个交易日的数据',
+}))
+assert.equal(historicalFreshness.quoteAsOf, '2026-09-04', '回溯选了周末时，行情日期必须是实际交易日')
+assert.equal(historicalFreshness.barsAsOf, '2026-09-04', '历史技术指标不能忽略实际日线截止日')
+assert.equal(historicalFreshness.quoteSource, 'daily_bars', '历史快照应显示真实来源')
 
 // 术语帮助与简明/专业模式。
 const modeSwitch = read('src/components/DisplayModeSwitch.vue')

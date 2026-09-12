@@ -39,20 +39,7 @@ var (
 )
 
 func repThrottle(ctx context.Context) error {
-	repMu.Lock()
-	wait := repMinInterval - time.Since(repLast)
-	if wait > 0 {
-		repMu.Unlock()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(wait):
-		}
-		repMu.Lock()
-	}
-	repLast = time.Now()
-	repMu.Unlock()
-	return nil
+	return waitSourceInterval(ctx, &repMu, &repLast, repMinInterval)
 }
 
 const (
@@ -64,7 +51,7 @@ const (
 
 // ReportRow 一份卖方研报的评级要素。
 type ReportRow struct {
-	InfoCode     string  // 全局唯一（防重拉的天然唯一键）
+	InfoCode     string // 全局唯一（防重拉的天然唯一键）
 	Title        string
 	Symbol       string  // 6 位代码
 	OrgName      string  // 机构简称（orgSName）

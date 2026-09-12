@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { NAlert, NEmpty, NModal, NSelect, NSpin, NTag } from 'naive-ui'
 import {
   getAttribution,
@@ -15,6 +15,7 @@ import {
 import TermHelp from '@/components/TermHelp.vue'
 import StockIdentity from '@/components/StockIdentity.vue'
 import { useUi } from '@/composables/useUi'
+import { getSessionEpoch } from '@/api/token'
 
 type AuditMode = '' | 'attribution' | 'shadow' | 'recall'
 const mode = defineModel<AuditMode>({ default: '' })
@@ -28,39 +29,66 @@ const attribution = ref<AttributionReport | null>(null)
 const shadow = ref<ShadowReport | null>(null)
 const recall = ref<RecallReport | null>(null)
 const daily = ref<CandidateAuditUserReport | null>(null)
-const horizonOptions = [5, 10, 20, 60].map((value) => ({ label: `${value} 交易日`, value }))
+const horizonOptions = computed(() => (mode.value === 'recall' ? [5, 10, 20] : [5, 10, 20, 60])
+  .map((value) => ({ label: `${value} 交易日`, value })))
 const kOptions = [20, 50, 100].map((value) => ({ label: `Top ${value}`, value }))
 const title = computed(() => mode.value === 'attribution' ? '错误归因报表' : mode.value === 'shadow' ? '影子门控对照' : '候选召回与每日复盘')
+const pageSession = getSessionEpoch()
+let disposed = false
+let readSequence = 0
+const pageActive = () => !disposed && getSessionEpoch() === pageSession
+onBeforeUnmount(() => { disposed = true; readSequence++ })
+const errorMessage = (reason: unknown) => reason instanceof Error ? reason.message : '审计数据读取失败'
 
 async function load() {
-  if (!mode.value) return
-  loading.value = true
+  const sequence = ++readSequence
+  loading.value = false
+  attribution.value = null
+  shadow.value = null
+  recall.value = null
+  daily.value = null
   error.value = ''
+  if (!mode.value || !pageActive()) return
+  if (mode.value === 'recall' && ![5, 10, 20].includes(horizon.value)) {
+    horizon.value = 20
+    return // 持有期变更后的 watcher 再发起一次合法请求。
+  }
+  const requested = { mode: mode.value, type: props.type, horizon: horizon.value, k: k.value }
+  const current = () => pageActive() && sequence === readSequence && requested.mode === mode.value &&
+    requested.type === props.type && requested.horizon === horizon.value && requested.k === k.value
+  loading.value = true
   try {
-    if (mode.value === 'attribution') attribution.value = await getAttribution(props.type, horizon.value)
-    else if (mode.value === 'shadow') shadow.value = await getShadowReport(props.type, horizon.value)
-    else {
+    if (requested.mode === 'attribution') {
+      const result = await getAttribution(requested.type, requested.horizon)
+      if (current()) attribution.value = result
+    } else if (requested.mode === 'shadow') {
+      const result = await getShadowReport(requested.type, requested.horizon)
+      if (current()) shadow.value = result
+    } else {
       const [recallResult, dailyResult] = await Promise.allSettled([
-        getRecallReport(props.type, horizon.value, k.value),
-        getDailyAuditReport(props.type, 30),
+        getRecallReport(requested.type, requested.horizon, requested.k),
+        getDailyAuditReport(requested.type, 30),
       ])
+      if (!current()) return
       if (recallResult.status === 'fulfilled') recall.value = recallResult.value
       if (dailyResult.status === 'fulfilled') daily.value = dailyResult.value
-      if (recallResult.status === 'rejected' && dailyResult.status === 'rejected') throw recallResult.reason
-      if (recallResult.status === 'rejected') error.value = (recallResult.reason as Error).message
+      error.value = [
+        recallResult.status === 'rejected' ? `召回报表：${errorMessage(recallResult.reason)}` : '',
+        dailyResult.status === 'rejected' ? `每日复盘：${errorMessage(dailyResult.reason)}` : '',
+      ].filter(Boolean).join('；')
     }
   } catch (reason) {
-    error.value = (reason as Error).message || '审计数据读取失败'
+    if (current()) error.value = errorMessage(reason)
   } finally {
-    loading.value = false
+    if (sequence === readSequence) loading.value = false
   }
 }
-watch([mode, horizon, k], () => void load())
+watch([mode, horizon, k, () => props.type], () => void load(), { immediate: true })
 function signed(value: number) { return `${value > 0 ? '+' : ''}${value.toFixed(2)}%` }
 </script>
 
 <template>
-  <n-modal :show="!!mode" preset="card" :title="title" class="audit-modal" :style="{ width: 'min(980px, calc(100vw - 24px))' }" @update:show="(show) => { if (!show) mode = '' }">
+  <n-modal :show="!!mode" preset="card" :title="title" class="audit-modal recommendation-audit-modal" :style="{ width: 'min(980px, calc(100vw - 24px))' }" @update:show="(show) => { if (!show) mode = '' }">
     <div class="toolbar">
       <n-select v-model:value="horizon" :options="horizonOptions" size="small" />
       <n-select v-if="mode === 'recall'" v-model:value="k" :options="kOptions" size="small" />
@@ -80,11 +108,11 @@ function signed(value: number) { return `${value > 0 ? '+' : ''}${value.toFixed(
       <template v-else-if="mode === 'shadow'">
         <n-empty v-if="shadow && !shadow.groups?.length" description="暂无影子门控成熟样本" />
         <div v-else-if="shadow" class="audit-body">
-          <div class="summary">入选 buy {{ shadow.picked_buy }} · 已成熟 {{ shadow.picked_buy_matured }}</div>
+          <div class="summary">入选 buy {{ shadow.picked_buy }} · 已成熟 {{ shadow.picked_buy_matured }} · 收益样本剔除强平 {{ shadow.forced_excluded ?? 0 }}</div>
           <section v-for="group in shadow.groups || []" :key="group.gate_type">
             <h4>{{ group.gate_label }} · 标记 {{ group.marked }} · 若转正会改写 {{ group.would_rewrite }}</h4>
             <div v-for="cell in [group.gated, group.ungated]" :key="cell.key" class="audit-row">
-              <b>{{ cell.key === 'gated' ? '被标记' : '未标记对照' }}</b><span>n={{ cell.sample }}</span><span>胜率 {{ cell.win_rate.toFixed(1) }}%</span><span :style="{ color: pctColor(cell.avg_net_pct) }">均值 {{ signed(cell.avg_net_pct) }}</span>
+              <b>{{ cell.key === 'gated' ? '被标记' : '未标记对照' }}</b><span>n={{ cell.sample }}</span><span>胜率 {{ cell.sample ? cell.win_rate.toFixed(1) + '%' : '—' }}</span><span :style="{ color: cell.sample ? pctColor(cell.avg_net_pct) : undefined }">均值 {{ cell.sample ? signed(cell.avg_net_pct) : '—' }}</span>
             </div>
           </section>
         </div>
@@ -105,20 +133,17 @@ function signed(value: number) { return `${value > 0 ? '+' : ''}${value.toFixed(
             <span><TermHelp term="mfe" /> {{ signed(item.mfe_pct) }} · <TermHelp term="mae" /> {{ signed(item.mae_pct) }}</span>
           </div>
         </section>
-        <n-empty v-if="!loading && !recall && !daily" description="暂无召回或每日审计事实" />
+        <n-empty v-if="!loading && !error && !recall && !daily" description="暂无召回或每日审计事实" />
       </template>
     </n-spin>
   </n-modal>
 </template>
 
 <style scoped>
+:global(.recommendation-audit-modal) { max-height: calc(100dvh - 24px); overflow: hidden; }
+:global(.recommendation-audit-modal > .n-card-content) { min-height: 0; overflow: auto; }
 .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 /* 读取失败提示在 n-spin 之外，拿不到 .audit-body 那条 gap */
-.audit-alert { margin-bottom: 12px; }
-/* 召回概览与「每日漏选/误选复盘」两块之间此前只靠 .recall-summary > div 的
- * padding 兜着，h4 的默认上边距又被置 0，两块贴得太近 */
-.daily-section { margin-top: 14px; }
-/* 读取失败提示与下方 n-spin 内容之间留白（alert 在 spin 之外，拿不到 .audit-body 的 gap） */
 .audit-alert { margin-bottom: 12px; }
 .toolbar :deep(.n-select) { width: 130px; }
 .toolbar span { flex: 1 1 240px; min-width: 0; font-size: 12px; opacity: .65; line-height: 1.5; overflow-wrap: anywhere; }

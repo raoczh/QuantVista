@@ -16,6 +16,8 @@ import (
 	"quantvista/common"
 	"quantvista/datasource"
 	"quantvista/model"
+
+	"gorm.io/gorm"
 )
 
 // M1 第二部分：全市场因子宽表（列式内存缓存）。
@@ -179,6 +181,7 @@ type FactorTable struct {
 	Names         []string
 	LastDates     []string // 各股末根交易日（= TradeDate 为 fresh）
 	cols          map[string][]float64
+	snapshotReady map[string]bool // 与因子输入共享读视图；构建后完成初始化不能升级旧短史的快照资格。
 }
 
 // Len 行数（宇宙内标的数）。
@@ -231,7 +234,7 @@ func computeWideRowOpts(symbol string, meta wideStockMeta, bars []datasource.Bar
 	}
 
 	n := len(bars)
-	if n == 0 {
+	if n == 0 || validateAdjustedBars("cn", bars) != nil {
 		return vals
 	}
 	// 与因子窗口对齐：极老库存可能超 250 根，截尾（所有窗口 ≤250）。
@@ -252,10 +255,10 @@ func computeWideRowOpts(symbol string, meta wideStockMeta, bars []datasource.Bar
 	}
 
 	// 行情
-	set("close", round2(price))
-	set("open", round2(last.Open))
-	set("high", round2(last.High))
-	set("low", round2(last.Low))
+	set("close", price)
+	set("open", last.Open)
+	set("high", last.High)
+	set("low", last.Low)
 	set("amount_yi", round2(last.Amount/1e8))
 	if last.TurnoverRate > 0 {
 		set("turnover_rate", round2(last.TurnoverRate))
@@ -271,9 +274,8 @@ func computeWideRowOpts(symbol string, meta wideStockMeta, bars []datasource.Bar
 		n   int
 	}{{"ma5", 5}, {"ma10", 10}, {"ma20", 20}, {"ma60", 60}, {"ma120", 120}, {"ma250", 250}} {
 		if v, ok := movingAverage(closes, w.n); ok {
-			r := round2(v)
-			set(w.key, r)
-			mas[w.key] = r
+			set(w.key, v)
+			mas[w.key] = v
 		}
 	}
 	if v, ok := mas["ma20"]; ok {
@@ -435,14 +437,14 @@ func computeWideRowOpts(symbol string, meta wideStockMeta, bars []datasource.Bar
 	}
 	if n >= atrMinBars {
 		atr := atrSeries(bars, 14)
-		set("atr_14", round2(atr[n-1])) // round2 与 computeIndicatorSnapshot 对齐（对拍口径）
+		set("atr_14", round4(atr[n-1])) // 与指标快照一致，保留基金等低价标的的有效价格精度。
 		set("atr_pct", round2(atr[n-1]/price*100))
 	}
 	if n >= bollMinBars {
 		up, mid, low := bollSeries(closes, 20, 2)
-		set("boll_up", round2(up[n-1]))
-		set("boll_mid", round2(mid[n-1]))
-		set("boll_low", round2(low[n-1]))
+		set("boll_up", round4(up[n-1]))
+		set("boll_mid", round4(mid[n-1]))
+		set("boll_low", round4(low[n-1]))
 		if band := up[n-1] - low[n-1]; band > 0 {
 			set("boll_pos", round2((price-low[n-1])/band*100))
 		}
@@ -549,7 +551,7 @@ type factorRowResult struct {
 // 所以仍需回表；要做成覆盖索引得把 7 个数值列全塞进索引键（MySQL 无 INCLUDE），
 // 索引体积会接近半张表，不划算。
 var dailyBarScanCols = []string{"symbol", "trade_date", "open", "high", "low", "close",
-	"volume", "amount", "COALESCE(turnover_rate, 0) AS turnover_rate"}
+	"volume", "amount", "COALESCE(turnover_rate, 0) AS turnover_rate", "COALESCE(source, '') AS source"}
 
 // buildFactorTable 全量构建宽表：流式读 daily_bars（ORDER BY symbol 分组连续）→
 // 并行算行 → 按 symbol 排序 → 转列。
@@ -557,26 +559,43 @@ func buildFactorTable(ctx context.Context) (*FactorTable, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
+	var table *FactorTable
+	err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		table, err = buildFactorTableSnapshot(ctx, tx)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return table, nil
+}
+
+// 日期、宇宙、初始化状态、股息率及日线必须来自同一一致性读；否则并发同步可能
+// 把新日期的因子固化到旧日期。ctx 同时约束数据库等待和计算阶段。
+func buildFactorTableSnapshot(ctx context.Context, db *gorm.DB) (*FactorTable, error) {
 	start := time.Now()
-	tradeDate, err := wideFreshDate()
+	tradeDate, err := wideFreshDateDB(db)
 	if err != nil {
 		return nil, err
 	}
 
 	// 宇宙元数据：name/ST（5500 行小表一次读全）。
 	var states []model.MarketSyncState
-	if err := common.DB.Select("symbol", "name").Where("market = ?", "cn").Find(&states).Error; err != nil {
+	if err := db.Select("symbol", "name", "init_status").Where("market = ?", "cn").Find(&states).Error; err != nil {
 		return nil, err
 	}
 	// C10 股息率：全市场一次读全（窗口内有股息率的方案行，量级 ≤2 万）。
 	// 查询失败必须阻断构建：因子快照首写胜且同日不可覆盖，若降级为空 map 继续落库，
 	// 会把当天全市场的 div_yield 永久冻结为缺失。
-	divYields, err := DividendYieldsFor(nil, time.Now())
+	divYields, err := dividendYieldsForDB(db, nil, time.Now())
 	if err != nil {
 		return nil, err
 	}
 	metaBy := make(map[string]wideStockMeta, len(states))
+	snapshotReady := make(map[string]bool, len(states))
 	for _, st := range states {
+		snapshotReady[st.Symbol] = st.InitStatus == "done"
 		m := wideStockMeta{Name: st.Name, ST: isSTName(st.Name)}
 		if y, ok := divYields[st.Symbol]; ok {
 			m.DivYield, m.DivYieldOK = y, true
@@ -585,7 +604,7 @@ func buildFactorTable(ctx context.Context) (*FactorTable, error) {
 	}
 
 	// 流式读 + 并行计算。
-	rows, err := common.DB.Model(&model.DailyBar{}).
+	rows, err := db.Model(&model.DailyBar{}).
 		Select(dailyBarScanCols).
 		Where("market = ?", "cn").
 		Order("symbol, trade_date").Rows()
@@ -606,11 +625,18 @@ func buildFactorTable(ctx context.Context) (*FactorTable, error) {
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
+				if ctx.Err() != nil {
+					continue
+				}
 				meta := metaBy[j.symbol] // 缺失时零值：name 空、非 ST（daily_bars 有而宇宙无的旧标的）
+				lastDate := j.bars[len(j.bars)-1].TradeDate
+				if validateAdjustedBars("cn", j.bars) != nil {
+					lastDate = "" // 保留宇宙行数，但不得视作可用新鲜行情或固化因子快照。
+				}
 				results <- factorRowResult{
 					symbol:   j.symbol,
 					name:     meta.Name,
-					lastDate: j.bars[len(j.bars)-1].TradeDate,
+					lastDate: lastDate,
 					vals:     computeWideRow(j.symbol, meta, j.bars),
 				}
 			}
@@ -630,7 +656,11 @@ func buildFactorTable(ctx context.Context) (*FactorTable, error) {
 	curSymbol := ""
 	flush := func() {
 		if curSymbol != "" && len(cur) > 0 {
-			jobs <- job{symbol: curSymbol, bars: cur}
+			select {
+			case jobs <- job{symbol: curSymbol, bars: cur}:
+			case <-ctx.Done():
+				scanErr = ctx.Err()
+			}
 		}
 		cur = nil
 	}
@@ -640,10 +670,10 @@ func buildFactorTable(ctx context.Context) (*FactorTable, error) {
 			scanErr = ctx.Err()
 			break
 		}
-		var sym, td string
+		var sym, td, source string
 		var open, high, low, closeP, amount, turnover float64
 		var volume int64
-		if err := rows.Scan(&sym, &td, &open, &high, &low, &closeP, &volume, &amount, &turnover); err != nil {
+		if err := rows.Scan(&sym, &td, &open, &high, &low, &closeP, &volume, &amount, &turnover, &source); err != nil {
 			scanErr = err
 			break
 		}
@@ -654,12 +684,13 @@ func buildFactorTable(ctx context.Context) (*FactorTable, error) {
 		}
 		cur = append(cur, datasource.Bar{
 			TradeDate: td, Open: open, High: high, Low: low, Close: closeP,
-			Volume: volume, Amount: amount, TurnoverRate: turnover,
+			Volume: volume, Amount: amount, TurnoverRate: turnover, Source: source,
 		})
 	}
 	if scanErr == nil {
 		scanErr = rows.Err()
 	}
+	rows.Close()
 	flush()
 	scanMs := time.Since(scanStart).Milliseconds()
 	close(jobs)
@@ -669,16 +700,20 @@ func buildFactorTable(ctx context.Context) (*FactorTable, error) {
 	if scanErr != nil {
 		return nil, scanErr
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	sort.Slice(collected, func(i, j int) bool { return collected[i].symbol < collected[j].symbol })
 	t := &FactorTable{
-		TradeDate: tradeDate,
-		BuiltAt:   time.Now(),
-		ScanMs:    scanMs,
-		Symbols:   make([]string, len(collected)),
-		Names:     make([]string, len(collected)),
-		LastDates: make([]string, len(collected)),
-		cols:      make(map[string][]float64, len(factorDefs)),
+		TradeDate:     tradeDate,
+		BuiltAt:       time.Now(),
+		ScanMs:        scanMs,
+		Symbols:       make([]string, len(collected)),
+		Names:         make([]string, len(collected)),
+		LastDates:     make([]string, len(collected)),
+		cols:          make(map[string][]float64, len(factorDefs)),
+		snapshotReady: snapshotReady,
 	}
 	for _, d := range factorDefs {
 		t.cols[d.Key] = make([]float64, len(collected))
@@ -694,8 +729,8 @@ func buildFactorTable(ctx context.Context) (*FactorTable, error) {
 	t.BuildMs = time.Since(start).Milliseconds()
 	// P1 新鲜度对照：与「按交易日历应有的交易日」比较（库内 MAX 只反映自身进度），
 	// 并统计 fresh 行覆盖率——消费方（选股/策略信号/状态页）据此判断与提示滞后。
-	t.ExpectedDate = wideExpectedDate(time.Now())
-	t.LagOpenDays = openDaysBehind(t.TradeDate, t.ExpectedDate)
+	t.ExpectedDate = wideExpectedDateDB(db, time.Now())
+	t.LagOpenDays = openDaysBehindDB(db, t.TradeDate, t.ExpectedDate)
 	if n := len(t.LastDates); n > 0 {
 		freshRows := 0
 		for _, d := range t.LastDates {
@@ -705,17 +740,24 @@ func buildFactorTable(ctx context.Context) (*FactorTable, error) {
 		}
 		t.FreshCoverage = float64(freshRows) / float64(n)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return t, nil
 }
 
 // wideExpectedDate 全市场日线「应有交易日」（按交易日历，非库内自身 MAX）：
 // 交易日 16:30（16:10 增量 job 完成余量）后应有今日 bar；其余时刻应有最近上一开市日。
 func wideExpectedDate(now time.Time) string {
+	return wideExpectedDateDB(common.DB, now)
+}
+
+func wideExpectedDateDB(db *gorm.DB, now time.Time) string {
 	today := now.Format("2006-01-02")
-	if isTradingDayToday(now) && now.Hour()*60+now.Minute() >= 16*60+30 {
+	if isTradingDayTodayDB(db, now) && now.Hour()*60+now.Minute() >= 16*60+30 {
 		return today
 	}
-	return prevOpenTradeDate(today)
+	return prevOpenTradeDateDB(db, today)
 }
 
 // openDaysBehind dbMax 相对 expected 落后的开市日数（0=齐平或超前；-1=日历不可用，
@@ -723,14 +765,18 @@ func wideExpectedDate(now time.Time) string {
 // dbMax < expected 而区间内日历无开市日记录时返回 -1 而非 0：日历缺失时把「明明落后」
 // 判成「齐平」，会让真正落后的数据（旧因子表/旧信号）永久冒充新鲜。
 func openDaysBehind(dbMax, expected string) int {
+	return openDaysBehindDB(common.DB, dbMax, expected)
+}
+
+func openDaysBehindDB(db *gorm.DB, dbMax, expected string) int {
 	if dbMax == "" || expected == "" || dbMax >= expected {
 		return 0
 	}
-	if common.DB == nil {
+	if db == nil {
 		return -1
 	}
 	var n int64
-	if err := common.DB.Model(&model.TradingCalendar{}).
+	if err := db.Model(&model.TradingCalendar{}).
 		Where("market = ? AND is_open = ? AND trade_date > ? AND trade_date <= ?", "cn", true, dbMax, expected).
 		Count(&n).Error; err != nil {
 		return -1
@@ -751,8 +797,15 @@ func isSTName(name string) bool {
 // wideFreshDate 全市场"最新交易日"基准：states MAX(last_bar_date)。
 // states 为空（第一部分未部署）时回退 daily_bars MAX（行数也少，代价可接受）。
 func wideFreshDate() (string, error) {
+	return wideFreshDateDB(common.DB)
+}
+
+func wideFreshDateDB(db *gorm.DB) (string, error) {
+	if db == nil {
+		return "", errors.New("数据库不可用")
+	}
 	var d sql.NullString
-	if err := common.DB.Model(&model.MarketSyncState{}).
+	if err := db.Model(&model.MarketSyncState{}).
 		Where("market = ? AND last_bar_date <> ''", "cn").
 		Select("MAX(last_bar_date)").Scan(&d).Error; err != nil {
 		return "", err
@@ -760,7 +813,7 @@ func wideFreshDate() (string, error) {
 	if d.Valid && d.String != "" {
 		return d.String, nil
 	}
-	if err := common.DB.Model(&model.DailyBar{}).
+	if err := db.Model(&model.DailyBar{}).
 		Where("market = ?", "cn").
 		Select("MAX(trade_date)").Scan(&d).Error; err != nil {
 		return "", err
@@ -778,6 +831,10 @@ var (
 	factorTableCur *FactorTable
 	factorBuildMu  sync.Mutex  // 构建互斥：懒加载调用方阻塞等待同一次构建
 	factorBuilding atomic.Bool // 状态展示 + 异步触发防抖
+	// 异步触发先登记再等待构建锁；正在构建时的新请求合并成下一轮，不能直接丢弃。
+	factorAsyncMu      sync.Mutex
+	factorAsyncRunning bool
+	factorAsyncPending *string
 	// factorFreshCache 新鲜日期的 60s 缓存（防每次扫描都查 states MAX）。
 	factorFreshMu  sync.Mutex
 	factorFreshVal string
@@ -786,10 +843,27 @@ var (
 )
 
 // CurrentFactorTable 当前宽表（可能 nil / 过期；扫描走 ensureFactorTable）。
+// 列数据可跨日复用，日历时效不能沿用构建时的值：同步失败时数据日期不前进，
+// ensureFactorTable 仍命中缓存，必须在读取时重新核验应有日期和滞后天数。
+// 元数据变化时只复制表头，不修改其他请求正在读取的不可变表及因子列。
 func CurrentFactorTable() *FactorTable {
 	factorTableMu.RLock()
-	defer factorTableMu.RUnlock()
-	return factorTableCur
+	t := factorTableCur
+	factorTableMu.RUnlock()
+	if t == nil {
+		return nil
+	}
+	expected, lag := t.ExpectedDate, -1
+	if common.DB != nil {
+		expected = wideExpectedDate(time.Now())
+		lag = openDaysBehind(t.TradeDate, expected)
+	}
+	if t.ExpectedDate == expected && t.LagOpenDays == lag {
+		return t
+	}
+	view := *t
+	view.ExpectedDate, view.LagOpenDays = expected, lag
+	return &view
 }
 
 // FactorTableBuilding 是否正在构建（状态端点展示）。
@@ -844,44 +918,48 @@ func ensureFactorTable(ctx context.Context) (*FactorTable, error) {
 }
 
 // RebuildFactorTableAsync 异步重建（增量同步完成后/管理端手动触发挂这里）。
-// TryLock 防抖：已有构建在跑则跳过（它会建出同样新鲜的表）。
+// 在途请求合并：等当前构建完成后至少再读一次新数据，同日多轮初始化也不会漏更。
 func RebuildFactorTableAsync(reason string) {
 	if common.DB == nil {
 		return
 	}
+	factorAsyncMu.Lock()
+	factorAsyncPending = &reason
+	if factorAsyncRunning {
+		factorAsyncMu.Unlock()
+		return
+	}
+	factorAsyncRunning = true
+	factorAsyncMu.Unlock()
 	go func() {
-		if !factorBuildMu.TryLock() {
-			return
+		for {
+			factorBuildMu.Lock()
+			factorAsyncMu.Lock()
+			reason := *factorAsyncPending
+			factorAsyncPending = nil
+			factorAsyncMu.Unlock()
+			factorBuilding.Store(true)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			t, err := rebuildFactorTableLocked(ctx, reason)
+			cancel()
+			if err != nil {
+				common.SysWarn("因子宽表重建失败（%s）: %v", reason, err)
+			} else {
+				// 快照成功后提交发现；推荐请求本身不触发扫描。
+				ScheduleDailyDiscovery(t.TradeDate, "factor_rebuild_async")
+			}
+			factorBuilding.Store(false)
+			factorAsyncMu.Lock()
+			pending := factorAsyncPending != nil
+			if !pending {
+				factorAsyncRunning = false
+			}
+			factorAsyncMu.Unlock()
+			factorBuildMu.Unlock()
+			if !pending {
+				return
+			}
 		}
-		defer factorBuildMu.Unlock()
-		factorBuilding.Store(true)
-		defer factorBuilding.Store(false)
-		// 使缓存的新鲜日期失效（增量刚推进了 last_bar_date）。
-		factorFreshMu.Lock()
-		factorFreshVal = ""
-		factorFreshMu.Unlock()
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		t, err := buildFactorTable(ctx)
-		if err != nil {
-			common.SysWarn("因子宽表重建失败（%s）: %v", reason, err)
-			return
-		}
-		factorTableMu.Lock()
-		factorTableCur = t
-		factorTableMu.Unlock()
-		common.SysLog("因子宽表重建完成（%s）: %s，%d 只，耗时 %dms（DB 读 %dms）",
-			reason, t.TradeDate, t.Len(), t.BuildMs, t.ScanMs)
-		// S3-1 每日因子快照：新表发布后固化落库（已有行不可变；同日只补缺失 symbol，
-		// 分批初始化不冻结不完整快照）。
-		if n, err := SnapshotFactorTable(t); err != nil {
-			common.SysWarn("因子快照落库失败 %s: %v", t.TradeDate, err)
-			return
-		} else if n > 0 {
-			common.SysLog("因子快照落库完成: %s，%d 行（累计 %d 个交易日）", t.TradeDate, n, FactorSnapshotDays())
-		}
-		// 非 JobRun 的兼容调用同样只能在快照成功后提交发现；推荐请求本身不触发扫描。
-		ScheduleDailyDiscovery(t.TradeDate, "factor_rebuild_async")
 	}()
 }
 
@@ -897,6 +975,10 @@ func RebuildFactorTable(ctx context.Context, reason string) (*FactorTable, error
 	defer factorBuildMu.Unlock()
 	factorBuilding.Store(true)
 	defer factorBuilding.Store(false)
+	return rebuildFactorTableLocked(ctx, reason)
+}
+
+func rebuildFactorTableLocked(ctx context.Context, reason string) (*FactorTable, error) {
 	factorFreshMu.Lock()
 	factorFreshVal = ""
 	factorFreshMu.Unlock()
@@ -908,7 +990,7 @@ func RebuildFactorTable(ctx context.Context, reason string) (*FactorTable, error
 	factorTableCur = table
 	factorTableMu.Unlock()
 	common.SysLog("因子宽表重建完成（%s）: %s，%d 只，耗时 %dms", reason, table.TradeDate, table.Len(), table.BuildMs)
-	if _, err := SnapshotFactorTable(table); err != nil {
+	if _, err := snapshotFactorTableDB(common.DB.WithContext(ctx), table); err != nil {
 		common.SysWarn("因子快照落库失败 %s: %v", table.TradeDate, err)
 		return nil, fmt.Errorf("因子快照落库失败: %w", err)
 	}

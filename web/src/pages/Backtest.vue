@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onBeforeUnmount, onMounted } from 'vue'
+import { ref, computed, onBeforeUnmount, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -30,6 +30,7 @@ import {
   type BacktestHoldStat,
   type BacktestTrade,
   type BatchBacktestResult,
+  type BacktestRequest,
 } from '@/api/backtest'
 import {
   getScreenerStrategies,
@@ -39,12 +40,15 @@ import {
   type ScreenerStrategyRevision,
   type StrategiesView,
   type StrategyRun,
+  type CondNode,
 } from '@/api/screener'
 import { taskStatusLabel } from '@/api/taskCenter'
 import { listRecommendations, type RecommendationBatch } from '@/api/recommendation'
 import { useUi } from '@/composables/useUi'
 import { useIsMobile } from '@/composables/useIsMobile'
 import { isPollCancelled, pollUntil } from '@/lib/poll'
+import { getSessionEpoch } from '@/api/token'
+import { useAuthStore } from '@/stores/auth'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import ChangeTag from '@/components/ChangeTag.vue'
@@ -54,6 +58,12 @@ import TermHelp from '@/components/TermHelp.vue'
 const message = useMessage()
 const route = useRoute()
 const router = useRouter()
+const auth = useAuthStore()
+const ownerID = auth.user?.id
+const session = getSessionEpoch()
+let disposed = false
+const active = () => !disposed && !!ownerID && route.name === 'backtest' && auth.user?.id === ownerID && getSessionEpoch() === session
+const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 const { vars, pctColor } = useUi()
 const { isMobile } = useIsMobile()
 const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
@@ -63,6 +73,11 @@ const tab = ref<'strategy' | 'recs'>('strategy')
 // ---------- 策略回测 ----------
 
 const strategies = ref<StrategiesView | null>(null)
+const strategiesLoading = ref(false)
+const strategiesError = ref('')
+let strategiesSequence = 0
+let routeSequence = 0
+let selectionSequence = 0
 const strategyValue = ref<string>('') // `b:{key}` 内置 / `c:{id}` 自定义
 const lookbackDays = ref(60)
 const signalCount = ref(8)
@@ -72,6 +87,14 @@ const includeST = ref(false)
 const running = ref(false)
 const result = ref<BacktestResult | null>(null)
 const backtestHistory = ref<StrategyRun<BacktestResult>[]>([])
+const historyLoading = ref(false)
+const historyError = ref('')
+const resultError = ref('')
+const currentResultId = ref(0)
+const snapshotTree = ref<CondNode | null>(null)
+let historySequence = 0
+let backtestSequence = 0
+let ownResultRoute = ''
 let backtestPollAbort: AbortController | null = null
 const strategyRevisions = ref<ScreenerStrategyRevision[]>([])
 const strategyRevisionId = ref<number | null>(null)
@@ -153,8 +176,7 @@ function customStrategyLabel(strategy: Pick<CustomStrategyOptionMeta, 'name' | '
 }
 
 const strategyOptions = computed<SelectOption[]>(() => {
-  const s = strategies.value
-  if (!s) return []
+  const s = strategies.value ?? { builtin: [], custom: [] }
   const groups: SelectOption[] = []
   const byPeriod: Record<string, SelectOption[]> = {}
   for (const b of s.builtin) {
@@ -179,10 +201,12 @@ const strategyOptions = computed<SelectOption[]>(() => {
       children: [{ label: customStrategyLabel(historyStrategy), value: `c:${historyStrategy.id}` }],
     })
   }
+  if (snapshotTree.value) groups.push({ label: '临时条件快照', value: 't:snapshot' })
   return groups
 })
 
 async function loadStrategyRevisions(strategyId: number, preferredRevisionId?: number): Promise<boolean> {
+  if (!active()) return false
   const sequence = ++revisionRequestSequence
   const listed = strategies.value?.custom?.find((strategy) => strategy.id === strategyId)
   strategyRevisions.value = []
@@ -202,7 +226,7 @@ async function loadStrategyRevisions(strategyId: number, preferredRevisionId?: n
   revisionLoading.value = true
   try {
     const history = await getScreenerStrategyHistory(strategyId)
-    if (sequence !== revisionRequestSequence || selectedCustomID() !== strategyId) return false
+    if (!active() || sequence !== revisionRequestSequence || selectedCustomID() !== strategyId) return false
     strategyRevisions.value = history.revisions
     historyCurrentRevisionId.value = history.current_revision_id || null
     listedRevisionFallback.value = null
@@ -222,7 +246,7 @@ async function loadStrategyRevisions(strategyId: number, preferredRevisionId?: n
     strategyRevisionId.value = preferredRevisionId ?? (history.current_revision_id || history.revisions[0]?.id || null)
     return strategyRevisionId.value !== null
   } catch (e) {
-    if (sequence !== revisionRequestSequence || selectedCustomID() !== strategyId) return false
+    if (!active() || sequence !== revisionRequestSequence || selectedCustomID() !== strategyId) return false
     if (preferredRevisionId !== undefined) {
       message.warning(`版本历史加载失败，将把显式 revision 交由后端校验：${(e as Error).message}`)
       return true
@@ -236,11 +260,12 @@ async function loadStrategyRevisions(strategyId: number, preferredRevisionId?: n
     message.warning(`版本历史加载失败：${(e as Error).message}`)
     return false
   } finally {
-    if (sequence === revisionRequestSequence) revisionLoading.value = false
+    if (active() && sequence === revisionRequestSequence) revisionLoading.value = false
   }
 }
 
 function onStrategyChange(value: string | null) {
+  ++selectionSequence
   strategyValue.value = value ?? ''
   const customId = selectedCustomID(strategyValue.value)
   if (customId) {
@@ -257,71 +282,127 @@ function onStrategyChange(value: string | null) {
 }
 
 async function loadStrategies() {
+  if (!active()) return
+  const sequence = ++strategiesSequence
+  strategiesLoading.value = true
+  strategiesError.value = ''
   try {
-    strategies.value = await getScreenerStrategies()
-    const resultId = Number(Array.isArray(route.query.result_id) ? route.query.result_id[0] : route.query.result_id)
-    if (Number.isSafeInteger(resultId) && resultId > 0) {
-      await openBacktestResult(resultId, true)
-      return
-    }
-    // 深链 ?strategy_key=xxx（选股页「回测」按钮跳转）。
-    const key = route.query.strategy_key as string
-    if (key && strategies.value.builtin.some((b) => b.key === key)) {
-      strategyValue.value = `b:${key}`
-      void run()
-    } else {
-      const customId = Number(route.query.strategy_id)
-      if (Number.isInteger(customId) && customId > 0) {
-        strategyValue.value = `c:${customId}`
-        const requestedRevisionId = Number(route.query.strategy_revision_id)
-        const revisionReady = await loadStrategyRevisions(
-          customId,
-          Number.isInteger(requestedRevisionId) && requestedRevisionId > 0 ? requestedRevisionId : undefined,
-        )
-        if (revisionReady) void run()
-      } else if (!strategyValue.value && strategies.value.builtin.length) {
-        strategyValue.value = `b:${strategies.value.builtin[0].key}`
-      }
-    }
+    const value = await getScreenerStrategies()
+    if (!active() || sequence !== strategiesSequence) return
+    strategies.value = value
+    if (!strategyValue.value && !route.query.result_id && !route.query.strategy_id && !route.query.strategy_key && value.builtin.length) strategyValue.value = `b:${value.builtin[0].key}`
   } catch (e) {
-    message.error((e as Error).message)
+    if (active() && sequence === strategiesSequence) strategiesError.value = (e as Error).message || '策略列表读取失败'
+  } finally {
+    if (active() && sequence === strategiesSequence) strategiesLoading.value = false
   }
 }
 
 async function loadBacktestHistory() {
-  backtestHistory.value = await listBacktestResults(20).catch(() => backtestHistory.value)
+  const sequence = ++historySequence
+  historyLoading.value = true
+  try {
+    const value = await listBacktestResults(20)
+    if (!active() || sequence !== historySequence) return
+    backtestHistory.value = value
+    historyError.value = ''
+  } catch (e) {
+    if (active() && sequence === historySequence) historyError.value = (e as Error).message || '回测历史读取失败'
+  } finally {
+    if (active() && sequence === historySequence) historyLoading.value = false
+  }
 }
 
-async function openBacktestResult(id: number, trackRunning = false) {
+interface ResultOperation { current: () => boolean; controller: AbortController }
+function beginResult(): ResultOperation {
   backtestPollAbort?.abort()
   const controller = new AbortController()
   backtestPollAbort = controller
+  const sequence = ++backtestSequence
+  running.value = true
+  resultError.value = ''
+  return { controller, current: () => active() && backtestSequence === sequence && !controller.signal.aborted }
+}
+
+async function setResultRoute(id: number, operation: ResultOperation) {
+  if (!operation.current()) return
+  const value = String(id)
+  if (String(route.query.result_id || '') === value) return
+  ownResultRoute = value
   try {
-    let run = await getBacktestResult(id)
-    if (trackRunning && (run.status === 'queued' || run.status === 'running')) {
-      run = await pollUntil(() => getBacktestResult(id), (value) => value.status !== 'queued' && value.status !== 'running', {
-        intervalMs: 1500,
-        timeoutMs: 20 * 60 * 1000,
-        signal: controller.signal,
-      })
-    }
-    if (run.status !== 'success' || !run.result) throw new Error(run.error || '回测未生成可用结果')
-    result.value = run.result
-    void router.replace({ query: { ...route.query, result_id: String(run.id) } })
+    await router.replace({ name: 'backtest', query: { ...route.query, result_id: value } })
   } finally {
-    if (backtestPollAbort === controller) backtestPollAbort = null
+    if (ownResultRoute === value) ownResultRoute = ''
+  }
+}
+
+async function readBacktestResult(id: number, trackRunning: boolean, operation: ResultOperation) {
+  if (!operation.current()) return
+  const signal = operation.controller.signal
+  let value = await getBacktestResult(id, signal)
+  if (!operation.current()) return
+  if (trackRunning && (value.status === 'queued' || value.status === 'running')) {
+    value = await pollUntil(() => getBacktestResult(id, signal), (row) => row.status !== 'queued' && row.status !== 'running', {
+      intervalMs: 1500,
+      timeoutMs: 20 * 60 * 1000,
+      signal,
+    })
+  }
+  if (!operation.current()) return
+  if (value.status !== 'success' || !value.result) throw new Error(value.error || '回测未生成可用结果')
+  result.value = value.result
+  currentResultId.value = value.id
+  const request = value.request as BacktestRequest | undefined
+  if (!request) return
+  lookbackDays.value = request.lookback_days ?? lookbackDays.value
+  signalCount.value = request.signal_count ?? signalCount.value
+  holdDays.value = request.hold_days?.length ? [...request.hold_days] : holdDays.value
+  perStockCap.value = request.per_stock_cap ?? perStockCap.value
+  includeST.value = Boolean(request.include_st)
+  snapshotTree.value = null
+  if (request.strategy_id) {
+    strategyValue.value = `c:${request.strategy_id}`
+    void loadStrategyRevisions(request.strategy_id, request.strategy_revision_id)
+  } else if (request.strategy_key) {
+    onStrategyChange(`b:${request.strategy_key}`)
+  } else if (request.tree) {
+    snapshotTree.value = clone(request.tree)
+    onStrategyChange('t:snapshot')
+  }
+}
+
+function finishResult(operation: ResultOperation) {
+  if (operation.current()) running.value = false
+  if (backtestPollAbort === operation.controller) backtestPollAbort = null
+}
+function reportResultError(error: unknown, operation: ResultOperation) {
+  if (!operation.current() || isPollCancelled(error)) return
+  resultError.value = (error as Error).message || '回测结果读取失败'
+  message.error(resultError.value)
+}
+async function openBacktestResult(id: number, trackRunning = false) {
+  if (!active()) return
+  const operation = beginResult()
+  try {
+    await setResultRoute(id, operation)
+    await readBacktestResult(id, trackRunning, operation)
+  } catch (e) {
+    reportResultError(e, operation)
+  } finally {
+    finishResult(operation)
   }
 }
 
 function openBacktestHistory(item: StrategyRun<BacktestResult>) {
   if (item.status === 'success') {
-    void openBacktestResult(item.id, false).catch((error) => message.error((error as Error).message))
+    void openBacktestResult(item.id, false)
     return
   }
   void router.push({ name: 'tasks', query: { job_id: String(item.job_run_id) } })
 }
 
 async function run() {
+  if (!active() || running.value || revisionLoading.value) return
   if (!strategyValue.value) {
     message.warning('请先选择策略')
     return
@@ -330,7 +411,11 @@ async function run() {
     message.warning('请至少选择一个持有期')
     return
   }
-  running.value = true
+  if (!Number.isInteger(lookbackDays.value) || lookbackDays.value < 10 || lookbackDays.value > 180 || !Number.isInteger(signalCount.value) || signalCount.value < 1 || signalCount.value > 16 || !Number.isFinite(perStockCap.value) || perStockCap.value < 5000 || perStockCap.value > 1000000) {
+    message.warning('请填写完整的回看窗口、信号日数和每标的拨款')
+    return
+  }
+  const operation = beginResult()
   try {
     const [kind, id] = [strategyValue.value.slice(0, 1), strategyValue.value.slice(2)]
     if (kind === 'c' && !strategyRevisionId.value) {
@@ -341,21 +426,34 @@ async function run() {
       strategy_key: kind === 'b' ? id : undefined,
       strategy_id: kind === 'c' ? Number(id) : undefined,
       strategy_revision_id: kind === 'c' ? strategyRevisionId.value ?? undefined : undefined,
+      tree: kind === 't' && snapshotTree.value ? clone(snapshotTree.value) : undefined,
       lookback_days: lookbackDays.value,
       signal_count: signalCount.value,
       hold_days: [...holdDays.value].sort((a, b) => a - b),
       per_stock_cap: perStockCap.value,
       include_st: includeST.value,
     })
-    void router.replace({ query: { ...route.query, result_id: String(created.id) } })
+    if (!operation.current()) return
+    await setResultRoute(created.id, operation)
+    if (!operation.current()) return
     message.info('回测任务已创建，可在任务中心查看或取消')
-    await openBacktestResult(created.id, true)
-    await loadBacktestHistory()
+    await readBacktestResult(created.id, true, operation)
+    if (operation.current()) void loadBacktestHistory()
   } catch (e) {
-    if (!isPollCancelled(e)) message.error(`${(e as Error).message}；最近一次成功结果仍保留在页面和回测历史中`)
+    reportResultError(e, operation)
   } finally {
-    running.value = false
+    finishResult(operation)
   }
+}
+
+function extremeTrades(stat: BacktestHoldStat) {
+  const seen = new Set<string>()
+  return [...(stat.best_trades ?? []), ...(stat.worst_trades ?? [])].filter((trade) => {
+    const key = `${trade.symbol}-${trade.signal_date}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
 }
 
 function skipSummary(st: BacktestHoldStat): string {
@@ -384,11 +482,18 @@ const batches = ref<RecommendationBatch[]>([])
 const batchValue = ref<number>(0) // 0=近 90 天全部
 const recRunning = ref(false)
 const recResult = ref<BatchBacktestResult | null>(null)
+const batchesError = ref('')
+const batchesLoading = ref(false)
+const recError = ref('')
+const recResultScope = ref('')
+let batchesSequence = 0
+let recSequence = 0
+let recAbort: AbortController | null = null
 
 const batchOptions = computed<SelectOption[]>(() => [
-  { label: '近 90 天全部成功批次', value: 0 },
+  { label: '近 90 天全部成功的 A 股批次', value: 0 },
   ...batches.value
-    .filter((b) => b.status === 'success')
+    .filter((b) => b.status === 'success' && (!b.market || b.market.trim().toLowerCase() === 'cn'))
     .map((b) => ({
       label: `#${b.id} ${b.title || b.strategy}（${(b.created_at || '').slice(0, 10)}）`,
       value: b.id,
@@ -396,21 +501,44 @@ const batchOptions = computed<SelectOption[]>(() => [
 ])
 
 async function loadBatches() {
+  const sequence = ++batchesSequence
+  batchesLoading.value = true
   try {
-    batches.value = await listRecommendations(undefined, 50)
-  } catch {
-    /* 批次列表拉不到不阻断（下拉仅剩「全部」选项） */
+    const value = await listRecommendations(undefined, 50)
+    if (!active() || sequence !== batchesSequence) return
+    batches.value = value
+    batchesError.value = ''
+  } catch (e) {
+    if (active() && sequence === batchesSequence) batchesError.value = (e as Error).message || '推荐批次读取失败'
+  } finally {
+    if (active() && sequence === batchesSequence) batchesLoading.value = false
   }
 }
 
 async function runRecs() {
+  if (!active() || recRunning.value) return
+  const sequence = ++recSequence
+  recAbort?.abort()
+  const controller = new AbortController()
+  recAbort = controller
+  const current = () => active() && sequence === recSequence && !controller.signal.aborted
+  const batchID = batchValue.value
+  const scope = batchID ? `#${batchID} ${batches.value.find((batch) => batch.id === batchID)?.title || '指定批次'}` : '近 90 天全部成功的 A 股批次'
   recRunning.value = true
+  recError.value = ''
   try {
-    recResult.value = await backtestRecommendations(batchValue.value)
+    const value = await backtestRecommendations(batchID, controller.signal)
+    if (!current()) return
+    recResult.value = value
+    recResultScope.value = scope
   } catch (e) {
-    message.error((e as Error).message)
+    if (current()) {
+      recError.value = (e as Error).message || '推荐回验失败'
+      if (tab.value === 'recs') message.error(recError.value)
+    }
   } finally {
-    recRunning.value = false
+    if (current()) recRunning.value = false
+    if (recAbort === controller) recAbort = null
   }
 }
 
@@ -421,13 +549,73 @@ function histMax(hist: { count: number }[] | null | undefined): number {
 const recHold = ref('20') // 直方图/明细展示的持有期
 const recHoldStat = computed(() => recResult.value?.stats.find((s) => String(s.hold_days) === recHold.value))
 
+function queryID(value: unknown): number | null {
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) return null
+  const id = Number(value)
+  return Number.isSafeInteger(id) && id > 0 ? id : null
+}
+
+async function readRoute(autoRun = false) {
+  if (!active()) return
+  const sequence = ++routeSequence
+  const selection = selectionSequence
+  const current = () => active() && sequence === routeSequence && selection === selectionSequence
+  const rawResult = route.query.result_id
+  const resultID = queryID(rawResult)
+  ++backtestSequence
+  backtestPollAbort?.abort()
+  running.value = false
+  if (resultID) { tab.value = 'strategy'; await openBacktestResult(resultID, true); return }
+  if (rawResult != null) { resultError.value = '回测结果编号无效，请从历史记录重新打开'; return }
+  result.value = null
+  currentResultId.value = 0
+  resultError.value = ''
+  const key = typeof route.query.strategy_key === 'string' ? route.query.strategy_key : ''
+  const customID = queryID(route.query.strategy_id)
+  const revisionID = queryID(route.query.strategy_revision_id)
+  if (route.query.strategy_revision_id != null && (!customID || !revisionID)) {
+    resultError.value = '策略版本编号无效，请重新选择策略及版本'
+    return
+  }
+  if (route.query.strategy_id != null && !customID) {
+    resultError.value = '策略编号无效，请重新选择'
+    return
+  }
+  if (!key && !customID) return
+  if (!strategies.value) await loadStrategies()
+  if (!current() || !strategies.value) return
+  // 保留选股页发起回测的深链；列表重试仅重读，不自动新建任务。
+  if (key && strategies.value.builtin.some((strategy) => strategy.key === key)) {
+    strategyValue.value = `b:${key}`
+  } else if (customID) {
+    strategyValue.value = `c:${customID}`
+    const ready = await loadStrategyRevisions(customID, revisionID ?? undefined)
+    if (!current() || !ready) return
+  } else {
+    resultError.value = '指定策略不可用，请重新选择'
+    return
+  }
+  if (current() && autoRun) void run()
+}
+
+watch(() => [route.query.result_id, route.query.strategy_key, route.query.strategy_id, route.query.strategy_revision_id], () => {
+  if (typeof route.query.result_id === 'string' && route.query.result_id === ownResultRoute) return
+  void readRoute()
+}, { flush: 'sync' })
+function dispose() {
+  disposed = true
+  backtestPollAbort?.abort()
+  recAbort?.abort()
+}
+watch(() => route.name, (name) => { if (name !== 'backtest') dispose() }, { flush: 'sync' })
 onMounted(() => {
-  loadStrategies()
-  loadBatches()
-  loadBacktestHistory()
+  if (route.query.result_id || (!route.query.strategy_key && !route.query.strategy_id)) void loadStrategies()
+  void loadBatches()
+  void loadBacktestHistory()
+  void readRoute(true)
 })
 
-onBeforeUnmount(() => backtestPollAbort?.abort())
+onBeforeUnmount(dispose)
 </script>
 
 <template>
@@ -445,11 +633,14 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
     <div v-if="tab === 'strategy'" class="bt-layout">
       <div class="bt-side">
         <SectionCard title="回测参数">
+          <n-alert v-if="strategiesError" type="error" :bordered="false" class="load-error">策略读取失败：{{ strategiesError }} <n-button size="small" @click="loadStrategies">重试</n-button></n-alert>
           <div class="form-col">
             <div class="form-row">
               <span class="form-label">选股策略</span>
               <n-select
                 v-model:value="strategyValue"
+                :loading="strategiesLoading"
+                :disabled="running || strategiesLoading"
                 :options="strategyOptions"
                 filterable
                 placeholder="选择策略"
@@ -460,6 +651,7 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
               <span class="form-label">策略版本</span>
               <n-select
                 v-model:value="strategyRevisionId"
+                :disabled="running || revisionLoading"
                 :options="revisionOptions"
                 :loading="revisionLoading"
                 placeholder="选择当前或历史版本"
@@ -468,15 +660,15 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
             </div>
             <div class="form-row">
               <span class="form-label">回看窗口（交易日）</span>
-              <n-input-number v-model:value="lookbackDays" :min="10" :max="180" :step="10" style="width: 100%" />
+              <n-input-number v-model:value="lookbackDays" :disabled="running" :min="10" :max="180" :step="10" style="width: 100%" />
             </div>
             <div class="form-row">
               <span class="form-label">采样信号日数</span>
-              <n-input-number v-model:value="signalCount" :min="1" :max="16" style="width: 100%" />
+              <n-input-number v-model:value="signalCount" :disabled="running" :min="1" :max="16" style="width: 100%" />
             </div>
             <div class="form-row">
               <span class="form-label">持有期（交易日）</span>
-              <n-checkbox-group v-model:value="holdDays">
+              <n-checkbox-group v-model:value="holdDays" :disabled="running">
                 <n-checkbox :value="5" label="5 日" />
                 <n-checkbox :value="10" label="10 日" />
                 <n-checkbox :value="20" label="20 日" />
@@ -484,13 +676,13 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
             </div>
             <div class="form-row">
               <span class="form-label">每标的拨款（元）</span>
-              <n-input-number v-model:value="perStockCap" :min="5000" :max="1000000" :step="5000" style="width: 100%" />
+              <n-input-number v-model:value="perStockCap" :disabled="running" :min="5000" :max="1000000" :step="5000" style="width: 100%" />
             </div>
             <div class="form-row form-row-inline">
               <span class="form-label">包含 ST/风险警示</span>
-              <n-switch v-model:value="includeST" size="small" />
+              <n-switch v-model:value="includeST" :disabled="running" size="small" />
             </div>
-            <n-button type="primary" block :loading="running" @click="run">开始回测</n-button>
+            <n-button type="primary" block :loading="running" :disabled="strategiesLoading || revisionLoading || !strategyValue" @click="run">开始回测</n-button>
             <div class="hint">
               回测为数秒级计算且全局互斥；信号日按窗口等距采样，每信号日按成交额取前 200 只命中进入模拟。
             </div>
@@ -499,6 +691,7 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
       </div>
 
       <div class="bt-main">
+        <n-alert v-if="resultError" type="error" :bordered="false">{{ resultError }}<span v-if="result">；下方保留上次成功快照，请核对策略及日期。</span> <n-button v-if="route.query.result_id" size="small" :disabled="running" @click="readRoute()">重新读取快照</n-button></n-alert>
         <n-spin :show="running">
           <template v-if="result">
             <SectionCard :title="`回测结果 · ${result.strategy}`">
@@ -565,7 +758,7 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
 
             <SectionCard title="逐信号日">
               <div class="qv-scroll-x">
-                <n-table size="small" :single-line="false">
+                <n-table size="small" :single-line="false" class="backtest-days-table">
                   <thead>
                     <tr>
                       <th>信号日</th>
@@ -597,7 +790,7 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
             <SectionCard v-for="st in result.stats" :key="`s-${st.hold_days}`" :title="`持有 ${st.hold_days} 日 · 最好/最差样本`">
               <n-empty v-if="!st.best_trades?.length" description="无成交样本" />
               <div v-else class="qv-scroll-x">
-                <n-table size="small" :single-line="false">
+                <n-table size="small" :single-line="false" class="backtest-samples-table">
                   <thead>
                     <tr>
                       <th>标的</th>
@@ -610,7 +803,7 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
                     </tr>
                   </thead>
                   <tbody>
-                    <tr v-for="tr in [...(st.best_trades ?? []), ...(st.worst_trades ?? [])]" :key="`${tr.symbol}-${tr.signal_date}-${tr.return_pct}`">
+                    <tr v-for="tr in extremeTrades(st)" :key="`${tr.symbol}-${tr.signal_date}`">
                       <td><StockIdentity :symbol="tr.symbol" market="cn" :name="tr.name" density="table" clickable /></td>
                       <td class="qv-tnum">{{ tr.signal_date }}</td>
                       <td class="qv-tnum">{{ tr.buy_date }} @ {{ tr.buy_price.toFixed(2) }}</td>
@@ -638,9 +831,11 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
           </SectionCard>
         </n-spin>
         <SectionCard title="回测历史">
-          <n-empty v-if="!backtestHistory.length" description="暂无持久回测结果" />
-          <div v-else class="qv-scroll-x">
-            <n-table size="small" :single-line="false">
+          <n-alert v-if="historyError" type="error" :bordered="false">历史读取失败：{{ historyError }} <n-button size="small" @click="loadBacktestHistory">重试</n-button></n-alert>
+          <n-spin v-if="historyLoading" size="small" />
+          <n-empty v-else-if="!historyError && !backtestHistory.length" description="暂无持久回测结果" />
+          <div v-if="backtestHistory.length" class="qv-scroll-x">
+            <n-table size="small" :single-line="false" class="backtest-history-table">
               <thead><tr><th>策略</th><th>版本</th><th>状态</th><th>数据时点</th><th>完成时间</th><th>操作</th></tr></thead>
               <tbody>
                 <tr v-for="item in backtestHistory" :key="item.id">
@@ -662,14 +857,15 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
     <div v-else class="bt-layout">
       <div class="bt-side">
         <SectionCard title="回验对象">
+          <n-alert v-if="batchesError" type="error" :bordered="false" class="load-error">推荐批次读取失败：{{ batchesError }} <n-button size="small" @click="loadBatches">重试</n-button></n-alert>
           <div class="form-col">
             <div class="form-row">
               <span class="form-label">推荐批次</span>
-              <n-select v-model:value="batchValue" :options="batchOptions" />
+              <n-select v-model:value="batchValue" :disabled="recRunning" :loading="batchesLoading" :options="batchOptions" />
             </div>
             <n-button type="primary" block :loading="recRunning" @click="runRecs">开始回验</n-button>
             <div class="hint">
-              把历史推荐的标的按「推荐日次日开盘买入、持有 5/10/20 日」重演，输出相对上证的超额收益（alpha）分布——
+              把 A 股历史推荐的标的按「推荐日次日开盘买入、持有 5/10/20 日」重演，输出相对上证的超额收益（alpha）分布——
               与推荐追踪的前向视角互补。
             </div>
           </div>
@@ -677,9 +873,11 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
       </div>
 
       <div class="bt-main">
+        <n-alert v-if="recError" type="error" :bordered="false">{{ recError }}<span v-if="recResult">；下方仍为上次回验结果。</span></n-alert>
         <n-spin :show="recRunning">
           <template v-if="recResult">
             <SectionCard :title="`回验结果 · ${recResult.batches} 个批次 / ${recResult.picks} 条推荐`">
+              <p class="meta-line">本次回验：{{ recResultScope }}；候选统一模拟买入，明细保留当时的买入或观察建议。</p>
               <n-grid :cols="isMobile ? 1 : 3" :x-gap="12" :y-gap="12">
                 <n-gi v-for="st in recResult.stats" :key="st.hold_days">
                   <div class="rec-hold-card">
@@ -733,14 +931,16 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
             </SectionCard>
 
             <SectionCard title="逐条明细">
+              <p v-if="(recResult.rows?.length ?? 0) < recResult.picks" class="meta-line">明细仅展示前 {{ recResult.rows?.length ?? 0 }} 条；上方统计包含全部 {{ recResult.picks }} 条推荐。</p>
               <n-empty v-if="!recResult.rows?.length" description="无明细" />
               <div v-else class="qv-scroll-x">
-                <n-table size="small" :single-line="false">
+                <n-table size="small" :single-line="false" class="backtest-detail-table">
                   <thead>
                     <tr>
                       <th>批次</th>
                       <th>标的</th>
                       <th>信号日</th>
+                      <th>当时建议</th>
                       <th v-for="st in recResult.stats" :key="st.hold_days">{{ st.hold_days }}日收益 / <TermHelp term="alpha" /></th>
                     </tr>
                   </thead>
@@ -749,6 +949,7 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
                       <td class="dim">#{{ r.batch_id }} {{ r.batch_title }}</td>
                       <td><StockIdentity :symbol="r.symbol" market="cn" :name="r.name" density="table" clickable /></td>
                       <td class="qv-tnum">{{ r.signal_date || '—' }}</td>
+                      <td>{{ r.action === 'buy' ? '可考虑买入' : r.action === 'watch' ? '观察等待' : '未知' }}</td>
                       <td v-for="st in recResult.stats" :key="st.hold_days" class="qv-tnum">
                         <template v-if="r.holds[String(st.hold_days)]?.status === 'traded'">
                           <span :style="{ color: pctColor(r.holds[String(st.hold_days)].return_pct) }">
@@ -807,6 +1008,7 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
 .bt-main {
   flex: 1;
   min-width: 0;
+  max-width: 100%;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -875,6 +1077,13 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
 .boundary-alert {
   margin-bottom: 10px;
 }
+.load-error { margin-bottom: 12px; }
+.backtest-days-table { min-width: 460px; }
+.backtest-history-table { min-width: 700px; }
+.backtest-samples-table { min-width: 860px; }
+.backtest-detail-table { min-width: 980px; }
+.backtest-samples-table .qv-tnum { white-space: nowrap; }
+.backtest-samples-table td:first-child, .backtest-detail-table td:nth-child(2) { min-width: 180px; }
 .hold-block {
   padding: 12px 0;
   border-top: 1px dashed var(--qv-divider);
@@ -954,7 +1163,6 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
 .hist-bar {
   height: 16px;
   border-radius: 4px;
-  min-width: 2px;
   opacity: 0.85;
   transition: width 0.3s;
 }
@@ -964,7 +1172,7 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
   flex-shrink: 0;
 }
 
-@media (max-width: 768px) {
+@media (max-width: 1100px) {
   .bt-layout {
     flex-direction: column;
   }
@@ -972,6 +1180,12 @@ onBeforeUnmount(() => backtestPollAbort?.abort())
     width: 100%;
     position: static;
   }
+  .bt-main { width: 100%; }
+}
+@media (max-height: 700px) {
+  .bt-side { position: static; }
+}
+@media (max-width: 768px) {
   /* 分布直方图：92px 右对齐标签 + 36px 计数在 360px 下把条形挤没了 */
   .hist-label {
     width: 72px;

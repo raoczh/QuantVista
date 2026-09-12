@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"quantvista/datasource"
 	"quantvista/model"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -93,27 +95,51 @@ func sanitizeGuardConfig(c guardConfig) guardConfig {
 	return c
 }
 
-// parseGuardConfig 解析存储的配置 JSON。空串或坏格式回退默认（全开）；
-// 反序列化基于默认值填充——缺失布尔字段保持默认 true（子开关不因半份 JSON 被静默关闭）。
-func parseGuardConfig(raw string) guardConfig {
+// 空配置沿用默认；损坏配置不能开启通知。保存和运行时使用相同的缺省字段语义。
+func decodeGuardConfig(raw string) (guardConfig, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return defaultGuardConfig()
+		return defaultGuardConfig(), nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil || fields == nil {
+		return guardConfig{}, errors.New("智能守护配置必须是 JSON 对象")
+	}
+	for key, value := range fields {
+		if strings.TrimSpace(string(value)) == "null" {
+			return guardConfig{}, fmt.Errorf("智能守护配置 %s 不能为空", key)
+		}
 	}
 	c := defaultGuardConfig()
-	if json.Unmarshal([]byte(raw), &c) != nil {
-		return defaultGuardConfig()
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		return guardConfig{}, errors.New("智能守护配置格式错误")
 	}
-	return sanitizeGuardConfig(c)
+	return sanitizeGuardConfig(c), nil
+}
+
+func parseGuardConfig(raw string) guardConfig {
+	c, _ := decodeGuardConfig(raw)
+	return c
 }
 
 // loadGuardConfig 读取用户偏好里的守护配置。
-func loadGuardConfig(userID int64) guardConfig {
+func loadGuardConfig(userID int64, contexts ...context.Context) guardConfig {
 	var pref model.UserPreference
-	if err := common.DB.Select("guard_config_json").Where("user_id = ?", userID).First(&pref).Error; err != nil {
-		return defaultGuardConfig()
+	if common.DB == nil {
+		return guardConfig{}
 	}
-	return parseGuardConfig(pref.GuardConfigJSON)
+	if err := common.DB.WithContext(jobSubmissionContext(contexts...)).Select("guard_config_json").Where("user_id = ?", userID).First(&pref).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return defaultGuardConfig()
+		}
+		common.SysWarn("读取守护配置失败 user=%d: %v", userID, err)
+		return guardConfig{}
+	}
+	c, err := decodeGuardConfig(pref.GuardConfigJSON)
+	if err != nil {
+		common.SysWarn("守护配置不可用 user=%d: %v", userID, err)
+	}
+	return c
 }
 
 // ---------- 纯函数评估（单测锚点） ----------
@@ -305,13 +331,28 @@ func recordGuardEvent(userID int64, tradeDate string, h guardHit) bool {
 	return created
 }
 
-func recordGuardEventWithID(userID int64, tradeDate string, h guardHit) (bool, int64) {
+func recordGuardEventWithID(userID int64, tradeDate string, h guardHit, positions ...model.Position) (bool, int64) {
+	return recordGuardEventWithIDContext(context.Background(), userID, tradeDate, h, positions...)
+}
+
+func recordGuardEventWithIDContext(ctx context.Context, userID int64, tradeDate string, h guardHit, positions ...model.Position) (bool, int64) {
 	ev := model.GuardEvent{
 		UserID: userID, PositionID: h.PositionID, Symbol: h.Symbol, Kind: h.Kind, TradeDate: tradeDate,
 		Market: h.Market, Name: h.Name, Price: round4(h.Price), Message: truncateRunes(h.Message, 256),
 	}
-	res := common.DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&ev)
-	return res.Error == nil && res.RowsAffected > 0, ev.ID
+	created := false
+	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := verifyPositionRiskBasesTx(tx, userID, positions); err != nil {
+			return err
+		}
+		res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&ev)
+		created = res.Error == nil && res.RowsAffected > 0
+		return res.Error
+	})
+	if err != nil && !errors.Is(err, errPositionRiskChanged) {
+		common.SysWarn("守护事件写入失败 user=%d symbol=%s: %v", userID, h.Symbol, err)
+	}
+	return err == nil && created, ev.ID
 }
 
 func guardBrowserEvent(h guardHit) []BrowserNotificationInput {
@@ -334,20 +375,27 @@ func guardBrowserEvent(h guardHit) []BrowserNotificationInput {
 
 // guardCandidateUserIDs 有守护对象的用户（持仓 holding ∪ 守护范围自选），去重。
 // 守护范围自选：IsPinned=true 或 ResearchStage ∈ {waiting_price, planned}——普通自选不推，防疲劳。
-func guardCandidateUserIDs() []int64 {
+func guardCandidateUserIDs(contexts ...context.Context) []int64 {
+	db := common.DB.WithContext(jobSubmissionContext(contexts...))
 	set := map[int64]bool{}
 	var ids []int64
-	common.DB.Model(&model.Position{}).
+	if err := db.Model(&model.Position{}).Scopes(withActivePositionAccount).
 		Where("status = ? AND market = ?", model.PositionStatusHolding, "cn").
-		Distinct().Pluck("user_id", &ids)
+		Distinct().Pluck("user_id", &ids).Error; err != nil {
+		common.SysWarn("读取持仓守护用户失败: %v", err)
+		return nil
+	}
 	for _, id := range ids {
 		set[id] = true
 	}
 	var wids []int64
-	common.DB.Model(&model.WatchlistItem{}).
+	if err := db.Model(&model.WatchlistItem{}).
 		Where("market = ? AND (is_pinned = ? OR research_stage IN ?)",
 			"cn", true, []string{model.StageWaitingPrice, model.StagePlanned}).
-		Distinct().Pluck("user_id", &wids)
+		Distinct().Pluck("user_id", &wids).Error; err != nil {
+		common.SysWarn("读取自选守护用户失败: %v", err)
+		return nil
+	}
 	for _, id := range wids {
 		set[id] = true
 	}
@@ -361,12 +409,32 @@ func guardCandidateUserIDs() []int64 {
 // evaluateGuardUser 评估单个用户的持仓与守护自选，落库新事件并推送。返回新事件数。
 // 同一 symbol 同为持仓与自选时，持仓侧已评估（pos_move），自选侧跳过避免重复推。
 func (s *GuardService) evaluateGuardUser(ctx context.Context, userID int64, cfg guardConfig, tradeDate string) int {
+	if common.DB == nil || s.market == nil || !cfg.Enabled || ctx.Err() != nil {
+		return 0
+	}
 	var positions []model.Position
-	common.DB.Where("user_id = ? AND status = ? AND market = ?",
-		userID, model.PositionStatusHolding, "cn").Find(&positions)
 	var items []model.WatchlistItem
-	common.DB.Where("user_id = ? AND market = ? AND (is_pinned = ? OR research_stage IN ?)",
-		userID, "cn", true, []string{model.StageWaitingPrice, model.StagePlanned}).Find(&items)
+	var unconfirmed map[int64]bool
+	if err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		if err := tx.Scopes(withActivePositionAccount).Where("user_id = ? AND status = ? AND market = ?",
+			userID, model.PositionStatusHolding, "cn").Find(&positions).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ? AND market = ? AND (is_pinned = ? OR research_stage IN ?)",
+			userID, "cn", true, []string{model.StageWaitingPrice, model.StagePlanned}).Find(&items).Error; err != nil {
+			return err
+		}
+		ids := make([]int64, 0, len(positions))
+		for _, p := range positions {
+			ids = append(ids, p.ID)
+		}
+		var err error
+		unconfirmed, err = positionsWithUnconfirmedShareActionDB(tx, userID, ids, tradeDate)
+		return err
+	}); err != nil {
+		common.SysWarn("读取守护对象失败 user=%d: %v", userID, err)
+		return 0
+	}
 	if len(positions) == 0 && len(items) == 0 {
 		return 0
 	}
@@ -413,8 +481,12 @@ func (s *GuardService) evaluateGuardUser(ctx context.Context, userID int64, cfg 
 			continue
 		}
 		obs := guardObs{Price: q.Price, DayHigh: q.High, DayLow: q.Low, ChangePct: q.ChangePct}
-		for _, h := range evalPositionGuard(p, cfg, obs, limitUpPctFor(p.Symbol, p.Name)) {
-			if created, eventID := recordGuardEventWithID(userID, tradeDate, h); created {
+		posConfig := cfg
+		if unconfirmed[p.ID] || positionCurrencyIssue(p, defaultCurrencyFor(p.Market)) != "" {
+			posConfig.StopLoss, posConfig.TakeProfit = false, false
+		}
+		for _, h := range evalPositionGuard(p, posConfig, obs, limitUpPctFor(p.Symbol, orSymbol(q.Name, p.Name))) {
+			if created, eventID := recordGuardEventWithIDContext(ctx, userID, tradeDate, h, p); created {
 				h.EventID = eventID
 				newHits = append(newHits, h)
 			}
@@ -429,8 +501,8 @@ func (s *GuardService) evaluateGuardUser(ctx context.Context, userID int64, cfg 
 			continue
 		}
 		obs := guardObs{Price: q.Price, DayHigh: q.High, DayLow: q.Low, ChangePct: q.ChangePct}
-		if h := evalWatchGuard(it, cfg, obs, limitUpPctFor(it.Symbol, it.Name)); h != nil {
-			if created, eventID := recordGuardEventWithID(userID, tradeDate, *h); created {
+		if h := evalWatchGuard(it, cfg, obs, limitUpPctFor(it.Symbol, orSymbol(q.Name, it.Name))); h != nil {
+			if created, eventID := recordGuardEventWithIDContext(ctx, userID, tradeDate, *h); created {
 				h.EventID = eventID
 				newHits = append(newHits, *h)
 			}
@@ -442,7 +514,7 @@ func (s *GuardService) evaluateGuardUser(ctx context.Context, userID int64, cfg 
 		if guardKindUsesExitAssessment(h.Kind) {
 			continue
 		}
-		s.notify.SendMsg(userID, NotifyMessage{
+		s.notify.SendMsgContext(ctx, userID, NotifyMessage{
 			Title: guardTitle(h.Kind), Content: h.Message,
 			Route: h.Route, Kind: NotifyMsgKindGuard, Priority: h.Priority,
 			BrowserEvents: guardBrowserEvent(h),
@@ -703,7 +775,7 @@ func evalPosExDiv(symbol, name string, rows []model.CorporateAction, today strin
 	var best *model.CorporateAction
 	for i := range rows {
 		r := rows[i]
-		if r.ExDate == "" || !r.HasAdjustment() {
+		if r.ExDate == "" || !r.HasAdjustment() || (r.Progress != "" && r.Progress != model.CorpActionProgressImplemented) {
 			continue
 		}
 		ed, perr := time.ParseInLocation("2006-01-02", r.ExDate, time.Local)
@@ -781,7 +853,7 @@ func evalIpoToday(rows []model.IpoSubscription, today string) []guardHit {
 		hits = append(hits, guardHit{
 			// Symbol 用申购代码：这是用户实际下单敲的代码，也天然构成同日多只的去重键。
 			Symbol: r.ApplyCode, Market: "cn", Name: r.Name, Kind: model.GuardKindIpoToday,
-			Route: "/todos", EventDate: r.ApplyDate, Priority: 0,
+			Route: "/today", EventDate: r.ApplyDate, Priority: 0,
 			Message: truncateRunes(fmt.Sprintf("🎫 今日打新：%s %s（申购代码 %s）今日可申购，%s%s",
 				label, r.Name, r.ApplyCode, priceTxt, extra), 256),
 		})
@@ -791,44 +863,64 @@ func evalIpoToday(rows []model.IpoSubscription, today string) []guardHit {
 
 // evaluateGuardUserEvening 单用户盘后事件评估：持仓 symbol 集合 → 六类本地表批量查询 →
 // 纯函数评估 → 台账去重 → 推送（cap 限流防冷启动存量刷屏）。返回新事件数。
-func (s *GuardService) evaluateGuardUserEvening(userID int64, today, since string) int {
-	var positions []model.Position
-	common.DB.Where("user_id = ? AND status = ? AND market = ?",
-		userID, model.PositionStatusHolding, "cn").Find(&positions)
-	if len(positions) == 0 {
+func (s *GuardService) evaluateGuardUserEvening(userID int64, today, since string, contexts ...context.Context) int {
+	ctx := jobSubmissionContext(contexts...)
+	if common.DB == nil || ctx.Err() != nil {
 		return 0
 	}
-	// 同 symbol 多笔持仓只评一次（盘后事件与持仓行的止损价等无关，只看标的）。
+	var positions []model.Position
 	nameBySym := map[string]string{}
+	positionsBySym := map[string][]model.Position{}
 	var syms []string
-	for _, p := range positions {
-		if _, ok := nameBySym[p.Symbol]; !ok {
-			syms = append(syms, p.Symbol)
-			nameBySym[p.Symbol] = p.Name
-		}
-	}
-
-	// 六类数据一次性批量查询（symbol IN），绝不逐 symbol 循环查。
 	var anns []model.Announcement
-	common.DB.Where("symbol IN ? AND notice_date >= ?", syms, since).
-		Order("notice_date, id").Find(&anns)
 	var lhbs []model.LhbEntry
-	common.DB.Where("symbol IN ? AND trade_date >= ?", syms, since).
-		Order("trade_date, id").Find(&lhbs)
-	untilDate := mustAddDays(today, guardEarnAheadDays)
 	var scheds []model.DisclosureSchedule
-	common.DB.Where("symbol IN ? AND is_published = ? AND appoint_date BETWEEN ? AND ?",
-		syms, false, today, untilDate).Order("appoint_date").Find(&scheds)
 	var fcs []model.EarningsForecast
-	common.DB.Where("symbol IN ? AND notice_date >= ?", syms, since).
-		Order("notice_date DESC, id DESC").Find(&fcs)
-	// B9：解禁（提前 10 天）与除权除息（提前 3 天）——查询窗口与各自提前量一致。
 	var lifts []model.RestrictedRelease
-	common.DB.Where("symbol IN ? AND market = ? AND free_date BETWEEN ? AND ?",
-		syms, "cn", today, mustAddDays(today, guardLiftAheadDays)).Order("free_date, id").Find(&lifts)
 	var exdivs []model.CorporateAction
-	common.DB.Where("symbol IN ? AND market = ? AND ex_date BETWEEN ? AND ?",
-		syms, "cn", today, mustAddDays(today, guardExDivAheadDays)).Order("ex_date, id").Find(&exdivs)
+	// 持仓与六类本地事件共享快照，读失败不落部分台账，也不将未来发布事实提前推送。
+	err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		if err := tx.Scopes(withActivePositionAccount).Where("user_id = ? AND status = ? AND market = ?",
+			userID, model.PositionStatusHolding, "cn").Find(&positions).Error; err != nil {
+			return err
+		}
+		if len(positions) == 0 {
+			return nil
+		}
+		for _, p := range positions {
+			positionsBySym[p.Symbol] = append(positionsBySym[p.Symbol], p)
+			if _, ok := nameBySym[p.Symbol]; !ok {
+				syms = append(syms, p.Symbol)
+				nameBySym[p.Symbol] = p.Name
+			}
+		}
+		if err := tx.Where("symbol IN ? AND market = ? AND notice_date BETWEEN ? AND ?", syms, "cn", since, today).
+			Order("notice_date, id").Find(&anns).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("symbol IN ? AND market = ? AND trade_date BETWEEN ? AND ?", syms, "cn", since, today).
+			Order("trade_date, id").Find(&lhbs).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("symbol IN ? AND market = ? AND is_published = ? AND appoint_date BETWEEN ? AND ?",
+			syms, "cn", false, today, mustAddDays(today, guardEarnAheadDays)).Order("appoint_date").Find(&scheds).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("symbol IN ? AND market = ? AND notice_date BETWEEN ? AND ?", syms, "cn", since, today).
+			Order("notice_date DESC, id DESC").Find(&fcs).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("symbol IN ? AND market = ? AND free_date BETWEEN ? AND ?",
+			syms, "cn", today, mustAddDays(today, guardLiftAheadDays)).Order("free_date, id").Find(&lifts).Error; err != nil {
+			return err
+		}
+		return tx.Where("symbol IN ? AND market = ? AND ex_date BETWEEN ? AND ?",
+			syms, "cn", today, mustAddDays(today, guardExDivAheadDays)).Order("ex_date, id").Find(&exdivs).Error
+	})
+	if err != nil {
+		common.SysWarn("读取盘后守护事实失败 user=%d: %v", userID, err)
+		return 0
+	}
 
 	annBySym := map[string][]model.Announcement{}
 	for _, a := range anns {
@@ -882,7 +974,7 @@ func (s *GuardService) evaluateGuardUserEvening(userID int64, today, since strin
 			if date == "" {
 				date = today // 兜底：事件日期缺失按评估日去重（正常路径六类纯函数都必填）
 			}
-			if created, eventID := recordGuardEventWithID(userID, date, h); created {
+			if created, eventID := recordGuardEventWithIDContext(ctx, userID, date, h, positionsBySym[sym]...); created {
 				h.EventID = eventID
 				newHits = append(newHits, h)
 			}
@@ -905,7 +997,7 @@ func (s *GuardService) evaluateGuardUserEvening(userID int64, today, since strin
 			common.SysLog("用户 %d 盘后守护事件超推送上限，%d 条只落台账", userID, len(pushable)-pushed)
 			break
 		}
-		s.notify.SendMsg(userID, NotifyMessage{
+		s.notify.SendMsgContext(ctx, userID, NotifyMessage{
 			Title: guardTitle(h.Kind), Content: h.Message,
 			Route: h.Route, Kind: NotifyMsgKindGuard, Priority: h.Priority,
 			BrowserEvents: guardBrowserEvent(h),
@@ -918,38 +1010,43 @@ func (s *GuardService) evaluateGuardUserEvening(userID int64, today, since strin
 // runGuardEveningRound 盘后事件轮：每天 19:35（含周末——公告周末也发布；龙虎榜等
 // 非交易日自然无数据）。数据依赖 18:45 龙虎榜 job 与 19:05 财报+公告 job 已跑完。
 func (s *GuardService) runGuardEveningRound() {
+	s.runGuardEveningRoundAt(time.Now())
+}
+
+func (s *GuardService) runGuardEveningRoundAt(now time.Time) {
 	if common.DB == nil {
 		return
 	}
-	now := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
 	today := now.Format("2006-01-02")
 	since := now.AddDate(0, 0, -guardEventWindowDays).Format("2006-01-02")
-	var ids []int64
-	common.DB.Model(&model.Position{}).
-		Where("status = ? AND market = ?", model.PositionStatusHolding, "cn").
-		Distinct().Pluck("user_id", &ids)
+	ids, err := sellReviewUserIDs(ctx)
+	if err != nil {
+		common.SysWarn("读取盘后守护用户失败: %v", err)
+		return
+	}
 	for _, uid := range ids {
-		if !userNotifyEnabled(uid) || !s.notify.HasEnabledDestination(uid, model.BrowserNotifyCategoryGuard) {
+		if !userNotifyEnabledContext(ctx, uid) || !s.notify.HasEnabledDestination(uid, model.BrowserNotifyCategoryGuard) {
 			continue
 		}
-		cfg := loadGuardConfig(uid)
+		cfg := loadGuardConfig(uid, ctx)
 		if !cfg.Enabled || !cfg.Evening {
 			continue
 		}
-		if n := s.evaluateGuardUserEvening(uid, today, since); n > 0 {
+		if n := s.evaluateGuardUserEvening(uid, today, since, ctx); n > 0 {
 			common.SysLog("用户 %d 盘后守护事件 %d 条", uid, n)
 		}
 	}
-	// 打新提醒（B9）：**不依赖持仓**，用户集合与上面不同——遍历全部有推送通道的用户。
-	s.runIpoRound(today)
 }
 
 // runIpoRound 今日打新提醒（B9）。与持仓事件轮分开：打新不依赖持仓，
 // 一个从没建过仓的用户同样该收到「今天有新股可申购」。
 // 幂等靠 GuardEvent 台账（键含申购代码 + 申购日），一只新股对一个用户只推一次。
-func (s *GuardService) runIpoRound(today string) {
+func (s *GuardService) runIpoRound(today string, contexts ...context.Context) {
+	ctx := jobSubmissionContext(contexts...)
 	var subs []model.IpoSubscription
-	if err := common.DB.Where("apply_date = ?", today).
+	if err := common.DB.WithContext(ctx).Where("apply_date = ?", today).
 		Order("kind, code").Find(&subs).Error; err != nil {
 		common.SysWarn("打新提醒读取申购清单失败: %v", err)
 		return
@@ -959,12 +1056,12 @@ func (s *GuardService) runIpoRound(today string) {
 		return
 	}
 	var externalUIDs, browserUIDs []int64
-	if err := common.DB.Model(&model.NotifyChannel{}).Where("enabled = ?", true).
+	if err := common.DB.WithContext(ctx).Model(&model.NotifyChannel{}).Where("enabled = ?", true).
 		Distinct().Pluck("user_id", &externalUIDs).Error; err != nil {
 		common.SysWarn("打新提醒读取用户失败: %v", err)
 		return
 	}
-	if err := common.DB.Model(&model.BrowserNotificationDevice{}).Where("enabled = ?", true).
+	if err := common.DB.WithContext(ctx).Model(&model.BrowserNotificationDevice{}).Where("enabled = ?", true).
 		Distinct().Pluck("user_id", &browserUIDs).Error; err != nil {
 		common.SysWarn("打新提醒读取浏览器设备用户失败: %v", err)
 		return
@@ -978,21 +1075,21 @@ func (s *GuardService) runIpoRound(today string) {
 		uids = append(uids, uid)
 	}
 	for _, uid := range uids {
-		if !userNotifyEnabled(uid) || !s.notify.HasEnabledDestination(uid, model.BrowserNotifyCategoryGuard) {
+		if !userNotifyEnabledContext(ctx, uid) || !s.notify.HasEnabledDestination(uid, model.BrowserNotifyCategoryGuard) {
 			continue
 		}
-		cfg := loadGuardConfig(uid)
+		cfg := loadGuardConfig(uid, ctx)
 		if !cfg.Enabled || !cfg.Ipo {
 			continue
 		}
 		n := 0
 		for _, h := range hits {
-			created, eventID := recordGuardEventWithID(uid, h.EventDate, h)
+			created, eventID := recordGuardEventWithIDContext(ctx, uid, h.EventDate, h)
 			if !created {
 				continue // 已推过
 			}
 			h.EventID = eventID
-			s.notify.SendMsg(uid, NotifyMessage{
+			s.notify.SendMsgContext(ctx, uid, NotifyMessage{
 				Title: guardTitle(h.Kind), Content: h.Message,
 				Route: h.Route, Kind: NotifyMsgKindGuard, Priority: h.Priority,
 				BrowserEvents: guardBrowserEvent(h),
@@ -1016,24 +1113,33 @@ func mustAddDays(date string, days int) string {
 
 // runGuardRound 一轮评估：非交易时段/非交易日直接返回；否则遍历有推送意愿的候选用户。
 func (s *GuardService) runGuardRound() {
+	s.runGuardRoundAt(time.Now())
+}
+
+func (s *GuardService) runGuardRoundAt(now time.Time) {
 	if common.DB == nil {
 		return
 	}
-	now := time.Now()
 	if !inGuardWindow(now) || !isTradingDayToday(now) {
 		return
 	}
 	tradeDate := now.Format("2006-01-02")
-	for _, uid := range guardCandidateUserIDs() {
+	roundCtx, roundCancel := context.WithTimeout(context.Background(), guardTickMinutes*time.Minute)
+	defer roundCancel()
+	// 打新不依赖持仓，在申购时段首轮推送；15:00 后不再发送“今日可申购”。
+	if now.Hour()*60+now.Minute() < 15*60 {
+		s.runIpoRound(tradeDate, roundCtx)
+	}
+	for _, uid := range guardCandidateUserIDs(roundCtx) {
 		// 推送前置：总闸开 + 有启用通道。守护是纯推送，无通道的用户跳过评估省行情请求。
-		if !userNotifyEnabled(uid) || !s.notify.HasEnabledDestination(uid, model.BrowserNotifyCategoryGuard) {
+		if !userNotifyEnabledContext(roundCtx, uid) || !s.notify.HasEnabledDestination(uid, model.BrowserNotifyCategoryGuard) {
 			continue
 		}
-		cfg := loadGuardConfig(uid)
+		cfg := loadGuardConfig(uid, roundCtx)
 		if !cfg.Enabled {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		ctx, cancel := context.WithTimeout(roundCtx, 2*time.Minute)
 		n := s.evaluateGuardUser(ctx, uid, cfg, tradeDate)
 		cancel()
 		if n > 0 {

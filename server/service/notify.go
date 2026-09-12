@@ -11,10 +11,14 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"quantvista/common"
 	"quantvista/model"
 	"quantvista/setting"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // NotifyService 主动推送：管理用户的推送通道，并把带稳定事实来源的消息同步声明为
@@ -127,12 +131,23 @@ type NotifyChannelInput struct {
 	Enabled bool   `json:"enabled"`
 }
 
+type NotifyChannelUpdateInput struct {
+	Kind    *string `json:"kind"`
+	Name    *string `json:"name"`
+	Target  *string `json:"target"`
+	Enabled *bool   `json:"enabled"`
+}
+
 func (s *NotifyService) validate(in *NotifyChannelInput, requireTarget bool) error {
 	in.Kind = strings.ToLower(strings.TrimSpace(in.Kind))
 	if !validNotifyKind[in.Kind] {
 		return errors.New("不支持的推送类型")
 	}
 	in.Target = strings.TrimSpace(in.Target)
+	in.Name = strings.TrimSpace(in.Name)
+	if utf8.RuneCountInString(in.Name) > 64 || len(in.Target) > 8192 {
+		return errors.New("推送名称不能超过 64 字，地址配置不能超过 8192 字节")
+	}
 	if requireTarget && in.Target == "" {
 		if in.Kind == model.NotifyKindNtfy {
 			return errors.New("请填写 ntfy 服务地址与 topic")
@@ -155,11 +170,38 @@ func (s *NotifyService) validate(in *NotifyChannelInput, requireTarget bool) err
 
 // userNotifyEnabled 用户偏好「开启提醒」是否打开（推送总闸，见 Settings 页开关）。
 func userNotifyEnabled(userID int64) bool {
+	return userNotifyEnabledContext(context.Background(), userID)
+}
+
+func userNotifyEnabledContext(ctx context.Context, userID int64) bool {
 	var pref model.UserPreference
-	if err := common.DB.Where("user_id = ?", userID).First(&pref).Error; err != nil {
+	if err := common.DB.WithContext(ctx).Where("user_id = ?", userID).First(&pref).Error; err != nil {
 		return false
 	}
 	return pref.EnableNotify
+}
+
+// 配置数量和启用状态在用户锁下变更，避免并发创建、重新启用绕过数量上限。
+func lockNotificationUser(tx *gorm.DB, userID int64) error {
+	var user model.User
+	if userID <= 0 {
+		return errors.New("用户无效")
+	}
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id", "status").First(&user, userID).Error; err != nil {
+		return err
+	}
+	if user.Status != model.StatusEnabled {
+		return errors.New("用户已停用")
+	}
+	return nil
+}
+
+func enableNotificationsTx(tx *gorm.DB, userID int64) error {
+	pref := model.UserPreference{UserID: userID, MinCandidateAmount: defaultMinCandidateAmount}
+	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&pref).Error; err != nil {
+		return err
+	}
+	return tx.Model(&model.UserPreference{}).Where("user_id = ?", userID).Update("enable_notify", true).Error
 }
 
 // List 列出用户的推送通道（不含密文）。
@@ -180,11 +222,6 @@ func (s *NotifyService) Create(userID int64, in NotifyChannelInput) (*NotifyChan
 	if err := s.validate(&in, true); err != nil {
 		return nil, err
 	}
-	var cnt int64
-	common.DB.Model(&model.NotifyChannel{}).Where("user_id = ?", userID).Count(&cnt)
-	if cnt >= maxChannelsPerUser {
-		return nil, fmt.Errorf("推送通道数量已达上限（%d）", maxChannelsPerUser)
-	}
 	cipher, err := common.Encrypt(in.Target)
 	if err != nil {
 		return nil, errors.New("加密失败")
@@ -196,14 +233,26 @@ func (s *NotifyService) Create(userID int64, in NotifyChannelInput) (*NotifyChan
 	if ch.Name == "" {
 		ch.Name = defaultChannelName(in.Kind)
 	}
-	if err := common.DB.Create(&ch).Error; err != nil {
+	if err := common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockNotificationUser(tx, userID); err != nil {
+			return err
+		}
+		var count int64
+		if err := tx.Model(&model.NotifyChannel{}).Where("user_id = ?", userID).Count(&count).Error; err != nil {
+			return err
+		}
+		if count >= maxChannelsPerUser {
+			return fmt.Errorf("推送通道数量已达上限（%d）", maxChannelsPerUser)
+		}
+		if err := tx.Create(&ch).Error; err != nil {
+			return err
+		}
+		if ch.Enabled {
+			return enableNotificationsTx(tx, userID)
+		}
+		return nil
+	}); err != nil {
 		return nil, err
-	}
-	// 新配置启用通道即视为明确的推送意愿，顺手打开偏好总闸
-	// （否则 enable_notify 默认 false，配好通道也收不到推送，易误判为故障）。
-	if ch.Enabled {
-		common.DB.Model(&model.UserPreference{}).Where("user_id = ?", userID).
-			Update("enable_notify", true)
 	}
 	v := toChannelView(ch)
 	return &v, nil
@@ -211,12 +260,30 @@ func (s *NotifyService) Create(userID int64, in NotifyChannelInput) (*NotifyChan
 
 // Update 更新通道。Target 留空保留原密文。
 func (s *NotifyService) Update(userID, id int64, in NotifyChannelInput) (*NotifyChannelView, error) {
-	if err := s.validate(&in, false); err != nil {
-		return nil, err
-	}
+	return s.UpdateFields(userID, id, NotifyChannelUpdateInput{Kind: &in.Kind, Name: &in.Name, Target: &in.Target, Enabled: &in.Enabled})
+}
+
+func (s *NotifyService) UpdateFields(userID, id int64, fields NotifyChannelUpdateInput) (*NotifyChannelView, error) {
 	var ch model.NotifyChannel
 	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&ch).Error; err != nil {
 		return nil, errors.New("推送通道不存在")
+	}
+	before := ch
+	in := NotifyChannelInput{Kind: ch.Kind, Name: ch.Name, Enabled: ch.Enabled}
+	if fields.Kind != nil {
+		in.Kind = *fields.Kind
+	}
+	if fields.Name != nil {
+		in.Name = *fields.Name
+	}
+	if fields.Target != nil {
+		in.Target = *fields.Target
+	}
+	if fields.Enabled != nil {
+		in.Enabled = *fields.Enabled
+	}
+	if err := s.validate(&in, false); err != nil {
+		return nil, err
 	}
 	// kind 变化时旧密文是「旧类型」的地址（如 webhook URL），留空会被当新类型（如 ntfy
 	// topic）解析——强制要求随类型切换一并提供新地址；kind 不变时留空保留原密文的语义不变。
@@ -237,7 +304,30 @@ func (s *NotifyService) Update(userID, id int64, in NotifyChannelInput) (*Notify
 		}
 		ch.TargetCipher = cipher
 	}
-	if err := common.DB.Save(&ch).Error; err != nil {
+	ch.UpdatedAt = time.Now()
+	updates := map[string]any{"kind": ch.Kind, "name": ch.Name, "enabled": ch.Enabled, "target_cipher": ch.TargetCipher, "updated_at": ch.UpdatedAt}
+	if kindChanged || ch.TargetCipher != before.TargetCipher {
+		ch.LastSentAt, ch.LastError = nil, ""
+		updates["last_sent_at"], updates["last_error"] = nil, ""
+	}
+	if err := common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockNotificationUser(tx, userID); err != nil {
+			return err
+		}
+		res := tx.Model(&model.NotifyChannel{}).
+			Where("id = ? AND user_id = ? AND kind = ? AND name = ? AND enabled = ? AND target_cipher = ?",
+				id, userID, before.Kind, before.Name, before.Enabled, before.TargetCipher).Updates(updates)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected != 1 {
+			return errors.New("推送通道已删除或配置已变化，请刷新后重试")
+		}
+		if ch.Enabled && !before.Enabled {
+			return enableNotificationsTx(tx, userID)
+		}
+		return nil
+	}); err != nil {
 		return nil, err
 	}
 	v := toChannelView(ch)
@@ -324,6 +414,9 @@ func (s *NotifyService) declareBrowserEvents(ctx context.Context, userID int64, 
 }
 
 func (s *NotifyService) sendExternalContext(ctx context.Context, userID int64, msg NotifyMessage) {
+	if !userNotifyEnabledContext(ctx, userID) {
+		return
+	}
 	var rows []model.NotifyChannel
 	if err := common.DB.WithContext(ctx).Where("user_id = ? AND enabled = ?", userID, true).Find(&rows).Error; err != nil {
 		return
@@ -375,7 +468,7 @@ func (s *NotifyService) sendToContext(ctx context.Context, ch model.NotifyChanne
 		if err == nil {
 			err = errors.New("通道密钥缺失或解密失败")
 		}
-		s.recordResultContext(ctx, ch.ID, err)
+		s.recordResultContext(ctx, ch, err)
 		return err
 	}
 	sendCtx, cancel := context.WithTimeout(ctx, notifyTimeout)
@@ -385,16 +478,12 @@ func (s *NotifyService) sendToContext(ctx context.Context, ch model.NotifyChanne
 	if sender == nil {
 		sender = productionNotifyChannelSender{}
 	}
-	err = sender.Send(sendCtx, ch.Kind, target, msg)
-	s.recordResultContext(ctx, ch.ID, err)
+	err = sanitizeNotifyError(sender.Send(sendCtx, ch.Kind, target, msg), ch.Kind, target)
+	s.recordResultContext(ctx, ch, err)
 	return err
 }
 
-func (s *NotifyService) recordResult(id int64, err error) {
-	s.recordResultContext(context.Background(), id, err)
-}
-
-func (s *NotifyService) recordResultContext(ctx context.Context, id int64, err error) {
+func (s *NotifyService) recordResultContext(ctx context.Context, ch model.NotifyChannel, err error) {
 	now := time.Now()
 	upd := map[string]any{"last_sent_at": &now}
 	if err != nil {
@@ -402,7 +491,34 @@ func (s *NotifyService) recordResultContext(ctx context.Context, id int64, err e
 	} else {
 		upd["last_error"] = ""
 	}
-	common.DB.WithContext(ctx).Model(&model.NotifyChannel{}).Where("id = ?", id).Updates(upd)
+	common.DB.WithContext(ctx).Model(&model.NotifyChannel{}).
+		Where("id = ? AND user_id = ? AND kind = ? AND target_cipher = ?", ch.ID, ch.UserID, ch.Kind, ch.TargetCipher).Updates(upd)
+}
+
+func sanitizeNotifyError(err error, kind, target string) error {
+	if err == nil {
+		return nil
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		err = urlErr.Err // url.Error.Error() 会附上包含 sendkey / webhook 密钥的完整 URL。
+	}
+	message := err.Error()
+	secrets := []string{target}
+	if kind == model.NotifyKindNtfy {
+		if parsed, parseErr := parseNtfyTarget(target); parseErr == nil {
+			secrets = append(secrets, parsed.Token, parsed.URL)
+		}
+	}
+	for _, secret := range secrets {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[已隐藏]")
+		}
+	}
+	if message == err.Error() {
+		return err
+	}
+	return errors.New(message)
 }
 
 // sendServerChan 走 Server酱 sctapi.ftqq.com/{sendkey}.send（表单 title+desp）。
@@ -420,9 +536,25 @@ func sendServerChan(ctx context.Context, sendkey, title, content string) error {
 		return err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Server酱 HTTP %d: %s", resp.StatusCode, extractErr(raw))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return fmt.Errorf("读取 Server酱响应失败: %w", err)
+	}
+	return serverChanResponseError(resp.StatusCode, raw)
+}
+
+func serverChanResponseError(status int, raw []byte) error {
+	if status != http.StatusOK {
+		return fmt.Errorf("Server酱 HTTP %d", status)
+	}
+	var result struct {
+		Code *int `json:"code"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil || result.Code == nil {
+		return errors.New("Server酱响应格式无效，无法确认投递")
+	}
+	if *result.Code != 0 {
+		return fmt.Errorf("Server酱未接受推送（代码 %d）", *result.Code)
 	}
 	return nil
 }
@@ -441,9 +573,9 @@ func sendWebhook(ctx context.Context, target, title, content string) error {
 		return err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("webhook HTTP %d: %s", resp.StatusCode, extractErr(raw))
+		return fmt.Errorf("webhook HTTP %d", resp.StatusCode)
 	}
 	return nil
 }
@@ -478,7 +610,7 @@ func buildNtfyPayload(t ntfyTarget, msg NotifyMessage, siteBaseURL string) map[s
 }
 
 // sendNtfy POST JSON 到自建 ntfy 服务根路径（https://docs.ntfy.sh/publish/ Publish as JSON）。
-// token 仅进 Authorization 头，绝不进错误信息/日志（错误只含 HTTP 状态与响应摘要）。
+// token 仅进 Authorization 头；不回显可能包含凭证的上游错误正文。
 func sendNtfy(ctx context.Context, rawTarget string, msg NotifyMessage) error {
 	t, err := parseNtfyTarget(rawTarget)
 	if err != nil {
@@ -499,9 +631,9 @@ func sendNtfy(ctx context.Context, rawTarget string, msg NotifyMessage) error {
 		return err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("ntfy HTTP %d: %s", resp.StatusCode, extractErr(raw))
+		return fmt.Errorf("ntfy HTTP %d", resp.StatusCode)
 	}
 	return nil
 }

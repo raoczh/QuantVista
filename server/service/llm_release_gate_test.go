@@ -198,7 +198,10 @@ func TestLLMExperimentAuditGate(t *testing.T) {
 	if got.PrePromoteEnabled {
 		t.Fatal("晋级前无自定义模板，回滚锚应为默认态")
 	}
-	audits := ListLLMReleaseAudits(exp.ID)
+	audits, err := ListLLMReleaseAudits(exp.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(audits) != 4 {
 		t.Fatalf("审计工件应全量保留: %d", len(audits))
 	}
@@ -246,7 +249,10 @@ func TestReleaseAuditCannotAppendFailAfterPromote(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("等待迟到审计结束超时")
 	}
-	audits := ListLLMReleaseAudits(exp.ID)
+	audits, err := ListLLMReleaseAudits(exp.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(audits) != 1 || audits[0].Verdict != model.ReleaseAuditPass {
 		t.Fatalf("promote 后不得追加迟到 FAIL: %+v", audits)
 	}

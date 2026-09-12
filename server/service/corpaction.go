@@ -76,11 +76,11 @@ func corporateActionReferenced(tx *gorm.DB, actionID int64) (bool, error) {
 // 上游订正，因此不能直接作为 upsert 身份；PLAN_NOTICE_DATE 相同的行必须就地更新。
 // 上游偶发漏稳定字段时，只在 NoticeDate/ExDate 能唯一消歧且候选尚未被账本引用时接续；
 // 两个日期都变化时无法区分“订正”与“独立方案”，必须报错，不能猜测复用或新建幽灵记录。
-func storeCorporateActions(recs []model.CorporateAction) error {
+func storeCorporateActions(recs []model.CorporateAction, contexts ...context.Context) error {
 	if common.DB == nil {
 		return errors.New("数据库不可用")
 	}
-	return common.DB.Transaction(func(tx *gorm.DB) error {
+	return common.DB.WithContext(jobSubmissionContext(contexts...)).Transaction(func(tx *gorm.DB) error {
 		for i := range recs {
 			rec := recs[i]
 			base := tx.Where("symbol = ? AND market = ? AND report_date = ?",
@@ -275,11 +275,11 @@ func liftStoreKey(r model.RestrictedRelease) string {
 
 // storeRestrictedReleases 把一次完整窗口查询当作权威集合：先 upsert 返回行，再删除窗口内
 // 已不在上游集合的旧行。只有完整拉取成功才调用本函数，网络/分页/解析失败绝不清数据。
-func storeRestrictedReleases(recs []model.RestrictedRelease, from, to string) error {
+func storeRestrictedReleases(recs []model.RestrictedRelease, from, to string, contexts ...context.Context) error {
 	if common.DB == nil {
 		return errors.New("数据库不可用")
 	}
-	return common.DB.Transaction(func(tx *gorm.DB) error {
+	return common.DB.WithContext(jobSubmissionContext(contexts...)).Transaction(func(tx *gorm.DB) error {
 		if len(recs) > 0 {
 			if err := tx.Clauses(clause.OnConflict{
 				Columns: []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "free_date"}, {Name: "free_type"}},
@@ -313,11 +313,11 @@ func storeRestrictedReleases(recs []model.RestrictedRelease, from, to string) er
 
 // storeIpoSubscriptions 以 (kind, code) 作为稳定发行身份就地更新时间，并对该来源的完整
 // 查询窗口单独对账。股票源和转债源互不借用结果，避免一源失败时误清另一源数据。
-func storeIpoSubscriptions(kind string, recs []model.IpoSubscription, from, to string) error {
+func storeIpoSubscriptions(kind string, recs []model.IpoSubscription, from, to string, contexts ...context.Context) error {
 	if common.DB == nil {
 		return errors.New("数据库不可用")
 	}
-	return common.DB.Transaction(func(tx *gorm.DB) error {
+	return common.DB.WithContext(jobSubmissionContext(contexts...)).Transaction(func(tx *gorm.DB) error {
 		for i := range recs {
 			rec := recs[i]
 			var existing []model.IpoSubscription
@@ -376,6 +376,9 @@ func storeIpoSubscriptions(kind string, recs []model.IpoSubscription, from, to s
 
 // SyncCorporateActions 同步分红送转（近 N 天公告窗口）。返回入库行数。
 func (s *CorpActionService) SyncCorporateActions(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	em, err := s.emAdapter()
 	if err != nil {
 		return 0, err
@@ -402,7 +405,7 @@ func (s *CorpActionService) SyncCorporateActions(ctx context.Context) (int, erro
 	if len(recs) == 0 {
 		return 0, nil
 	}
-	if err := storeCorporateActions(recs); err != nil {
+	if err := storeCorporateActions(recs, ctx); err != nil {
 		return 0, err
 	}
 	return len(recs), nil
@@ -410,6 +413,9 @@ func (s *CorpActionService) SyncCorporateActions(ctx context.Context) (int, erro
 
 // SyncRestrictedReleases 同步未来 N 天的限售解禁。返回入库行数。
 func (s *CorpActionService) SyncRestrictedReleases(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	em, err := s.emAdapter()
 	if err != nil {
 		return 0, err
@@ -430,7 +436,7 @@ func (s *CorpActionService) SyncRestrictedReleases(ctx context.Context) (int, er
 			FreeRatio: r.FreeRatio, TotalRatio: r.TotalRatio,
 		})
 	}
-	if err := storeRestrictedReleases(recs, from, to); err != nil {
+	if err := storeRestrictedReleases(recs, from, to, ctx); err != nil {
 		return 0, err
 	}
 	return len(recs), nil
@@ -439,6 +445,9 @@ func (s *CorpActionService) SyncRestrictedReleases(ctx context.Context) (int, er
 // SyncIpoSubscriptions 同步未来 N 天的新股 + 可转债申购。返回入库行数。
 // 两类各自独立：新股失败不影响可转债落库（反之亦然），错误合并返回。
 func (s *CorpActionService) SyncIpoSubscriptions(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	em, err := s.emAdapter()
 	if err != nil {
 		return 0, err
@@ -464,7 +473,7 @@ func (s *CorpActionService) SyncIpoSubscriptions(ctx context.Context) (int, erro
 				Board: r.Board,
 			})
 		}
-		if err := storeIpoSubscriptions(model.IpoKindStock, recs, from, to); err != nil {
+		if err := storeIpoSubscriptions(model.IpoKindStock, recs, from, to, ctx); err != nil {
 			errs = append(errs, fmt.Errorf("新股申购入库: %w", err))
 		} else {
 			total += len(recs)
@@ -485,7 +494,7 @@ func (s *CorpActionService) SyncIpoSubscriptions(ctx context.Context) (int, erro
 				Rating: r.Rating, IssueScaleYi: r.IssueScaleYi,
 			})
 		}
-		if err := storeIpoSubscriptions(model.IpoKindCb, recs, from, to); err != nil {
+		if err := storeIpoSubscriptions(model.IpoKindCb, recs, from, to, ctx); err != nil {
 			errs = append(errs, fmt.Errorf("可转债申购入库: %w", err))
 		} else {
 			total += len(recs)
@@ -496,7 +505,7 @@ func (s *CorpActionService) SyncIpoSubscriptions(ctx context.Context) (int, erro
 
 // RunCorpActionSync 跑一轮完整同步。四类互不阻断，返回是否**全部成功**（供游标推进判定）。
 func (s *CorpActionService) RunCorpActionSync(ctx context.Context) bool {
-	if common.DB == nil {
+	if common.DB == nil || ctx.Err() != nil {
 		return false
 	}
 	allOK := true
@@ -518,11 +527,14 @@ func (s *CorpActionService) RunCorpActionSync(ctx context.Context) bool {
 	} else if n > 0 {
 		common.SysLog("打新日历同步入库 %d 行", n)
 	}
+	if ctx.Err() != nil {
+		return false
+	}
 	// 模拟盘除权自动调整：数据落库后立刻跑（真实持仓走用户确认，不在这里动）。
-	if n := RunPaperCorpAdjust(); n > 0 {
+	if n := RunPaperCorpAdjust(ctx); n > 0 {
 		common.SysLog("模拟盘除权除息自动调整 %d 笔", n)
 	}
-	return allOK
+	return allOK && ctx.Err() == nil
 }
 
 // StartCorpActionJobs 每日 19:25 同步公司行动与打新日历。

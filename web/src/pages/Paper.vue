@@ -32,6 +32,8 @@ import {
 } from '@/api/paper'
 import type { PortfolioCurve } from '@/api/position'
 import { isAbortError } from '@/api/client'
+import { getSessionEpoch } from '@/api/token'
+import { formatPrice } from '@/lib/formatPrice'
 import { isEtfSymbol } from '@/api/etf'
 import { useUi, withAlpha } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
@@ -49,22 +51,30 @@ const marketOptions = [
 ]
 
 const overview = ref<PaperOverview | null>(null)
+const accountId = ref<number>()
 const trades = ref<PaperTrade[]>([])
 const loading = ref(false)
 const loadError = ref('')
 let loadSeq = 0
+let disposed = false
+const isCurrent = (owner: number) => !disposed && owner === getSessionEpoch()
 
 async function load() {
+  if (disposed) return
+  const owner = getSessionEpoch()
   const mySeq = ++loadSeq
   loading.value = true
   loadError.value = ''
   try {
-    const [nextOverview, nextTrades] = await Promise.all([getPaperOverview(), getPaperTrades(50)])
-    if (mySeq !== loadSeq) return
+    const nextOverview = await getPaperOverview(accountId.value)
+    if (mySeq !== loadSeq || !isCurrent(owner)) return
+    const nextTrades = await getPaperTrades(50, nextOverview.account.account_id)
+    if (mySeq !== loadSeq || !isCurrent(owner)) return
+    accountId.value = nextOverview.account.account_id
     overview.value = nextOverview
     trades.value = nextTrades
   } catch (e) {
-    if (mySeq === loadSeq) {
+    if (mySeq === loadSeq && isCurrent(owner)) {
       // 两个接口任一失败时都不能继续展示上一轮账户值，否则旧值会看起来像本次成功读取。
       overview.value = null
       trades.value = []
@@ -79,8 +89,21 @@ async function load() {
 // ---------- 下单 ----------
 type TradeForm = { symbol: string; market: string; name?: string; side: 'buy' | 'sell'; price?: number; quantity?: number }
 const form = ref<TradeForm>({ symbol: '', market: 'cn', side: 'buy', price: undefined, quantity: undefined })
+function updateTradeSymbol(value: string) {
+  form.value.symbol = value
+  form.value.name = undefined
+}
+function updateTradeMarket(value: string) {
+  form.value.market = value
+  form.value.name = undefined
+}
 const trading = ref(false)
 async function submitTrade() {
+  if (trading.value || resetting.value) return
+  if (!overview.value || !accountId.value) {
+    message.warning('请先成功加载模拟账户，再提交交易')
+    return
+  }
   if (!form.value.symbol.trim()) {
     message.warning('请输入股票代码')
     return
@@ -90,6 +113,7 @@ async function submitTrade() {
     return
   }
   trading.value = true
+  const owner = getSessionEpoch()
   try {
     const t = await paperTrade({
       symbol: form.value.symbol.trim(),
@@ -98,41 +122,57 @@ async function submitTrade() {
       side: form.value.side,
       price: form.value.price,
       quantity: form.value.quantity,
-    })
-    message.success(`${t.side === 'buy' ? '买入' : '卖出'} ${t.name || '名称待补全'}（${t.symbol}）${t.quantity} 股 @ ${t.price.toFixed(2)}`)
+    }, accountId.value)
+    if (!isCurrent(owner)) return
+    message.success(`${t.side === 'buy' ? '买入' : '卖出'} ${t.name || '名称待补全'}（${t.symbol}）${t.quantity} ${isEtfSymbol(t.symbol) ? '份' : '股'} @ ${formatPrice(t.price)}`)
     form.value.quantity = undefined
     form.value.price = undefined
-    await load()
+    clearCurve()
+    await Promise.all([load(), loadCurve()])
   } catch (e) {
-    message.error((e as Error).message)
+    if (isCurrent(owner)) message.error((e as Error).message)
   } finally {
-    trading.value = false
+    if (isCurrent(owner)) trading.value = false
   }
 }
 // 从持仓快捷卖出预填。
 function sellFrom(h: PaperHolding) {
+  if (trading.value || resetting.value) return
   form.value = { symbol: h.symbol, market: h.market, name: h.name, side: 'sell', price: undefined, quantity: h.quantity }
 }
 
 // ---------- 重置 ----------
 const resetModal = ref(false)
 const resetCash = ref(100000)
+const resetting = ref(false)
 async function doReset() {
+  if (resetting.value || trading.value) return
+  if (!overview.value || !accountId.value) {
+    message.warning('请先成功加载模拟账户，再重置')
+    return
+  }
+  if (!Number.isFinite(resetCash.value) || resetCash.value <= 0) {
+    message.warning('请输入有效的初始资金')
+    return
+  }
+  resetting.value = true
+  const owner = getSessionEpoch()
   try {
-    await resetPaper(resetCash.value)
+    await resetPaper(resetCash.value, accountId.value)
+    if (!isCurrent(owner)) return
     resetModal.value = false
-    await load()
+    clearCurve()
     message.success('账户已重置')
+    await Promise.all([load(), loadCurve()])
   } catch (e) {
-    message.error((e as Error).message)
+    if (isCurrent(owner)) message.error((e as Error).message)
+  } finally {
+    if (isCurrent(owner)) resetting.value = false
   }
 }
 
 function fmtMoney(n: number) {
   return (n >= 0 ? '' : '-') + Math.abs(n).toLocaleString('zh-CN', { maximumFractionDigits: 2 })
-}
-function fmt(n: number) {
-  return n == null ? '-' : n.toFixed(2)
 }
 function fmtTime(t: string) {
   return t ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : ''
@@ -174,6 +214,7 @@ const curveDayOptions = [
 ]
 
 async function loadCurve() {
+  if (disposed || !accountId.value) return
   curveAbort?.abort()
   const myAbort = new AbortController()
   curveAbort = myAbort
@@ -183,10 +224,11 @@ async function loadCurve() {
   curveLoading.value = true
   curveError.value = ''
   try {
-    const data = await getPaperCurve(requestedDays, myAbort.signal)
+    const data = await getPaperCurve(requestedDays, myAbort.signal, accountId.value)
     if (mySeq !== curveSeq) return
     curve.value = data
     await nextTick()
+    if (mySeq !== curveSeq) return
     renderCurve()
   } catch (e) {
     if (mySeq !== curveSeq || isAbortError(e)) return
@@ -199,6 +241,15 @@ async function loadCurve() {
   }
 }
 watch(curveDays, () => loadCurve())
+watch(accountId, () => loadCurve())
+
+function clearCurve() {
+  curveSeq++
+  curveAbort?.abort()
+  curve.value = null
+  curveChart?.dispose()
+  curveChart = null
+}
 
 function renderCurve() {
   const c = curve.value
@@ -219,9 +270,9 @@ function renderCurve() {
       formatter: (ps: { axisValue: string; seriesName: string; value: number; dataIndex: number }[]) => {
         if (!ps.length) return ''
         const p = c.points[ps[0].dataIndex]
-        const lines = ps.map((s) => `${s.seriesName} ${fmtMoney(s.value)}`)
-        if (p?.partial) lines.push(`⚠ ${p.note || '当日部分标的无有效行情，非完整净值'}`)
-        return `${ps[0].axisValue}<br/>${lines.join('<br/>')}`
+        const lines = ps.map((s) => `${echarts.format.encodeHTML(s.seriesName)} ${fmtMoney(s.value)}`)
+        if (p?.partial) lines.push(`⚠ ${echarts.format.encodeHTML(p.note || '当日部分标的无有效行情，非完整净值')}`)
+        return `${echarts.format.encodeHTML(ps[0].axisValue)}<br/>${lines.join('<br/>')}`
       },
     },
     legend: {
@@ -248,9 +299,9 @@ function renderCurve() {
       {
         name: '总资产',
         type: 'line',
-        data: c.points.map((p) => p.total_assets),
+        data: c.points.map((p) => p.partial ? null : p.total_assets),
         symbol: 'circle',
-        // partial 点用空心大点标出：那天有标的没有有效行情，不是完整净值。
+        // 缺价、账本或币种不完整的日期保留缺口，不连成完整净值。
         symbolSize: (_v: number, params: { dataIndex: number }) => (c.points[params.dataIndex]?.partial ? 8 : 3),
         itemStyle: {
           color: (params: { dataIndex: number }) => (c.points[params.dataIndex]?.partial ? warn : primary),
@@ -261,7 +312,7 @@ function renderCurve() {
       {
         name: '持仓市值',
         type: 'line',
-        data: c.points.map((p) => p.market_value),
+        data: c.points.map((p) => p.partial ? null : p.market_value),
         symbol: 'none',
         lineStyle: { width: 1.5, type: 'dashed', color: warn },
         itemStyle: { color: warn },
@@ -277,10 +328,10 @@ watch([isDark, vars], () => renderCurve())
 
 onMounted(() => {
   load()
-  loadCurve()
   window.addEventListener('resize', onResize)
 })
 onBeforeUnmount(() => {
+  disposed = true
   window.removeEventListener('resize', onResize)
   loadSeq++
   curveSeq++
@@ -294,7 +345,7 @@ onBeforeUnmount(() => {
 <template>
   <PageContainer title="模拟交易" subtitle="虚拟账户 · 按当前有效行情成交与估值 · 练手不担风险">
     <template #actions>
-      <n-button size="small" quaternary @click="resetModal = true">重置账户</n-button>
+      <n-button size="small" quaternary :disabled="trading || resetting || !overview" @click="resetModal = true">重置账户</n-button>
       <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>
     </template>
 
@@ -305,20 +356,20 @@ onBeforeUnmount(() => {
       <!-- 账户总览 -->
       <n-grid cols="2 s:4" :x-gap="14" :y-gap="14" responsive="screen">
         <n-gi>
-          <StatCard label="总资产" :value="overview ? fmtMoney(overview.total_assets) : '—'" />
+          <StatCard label="总资产" :value="overview && !overview.currency_unavailable_reason && !overview.valuation_unavailable_reason ? fmtMoney(overview.total_assets) : '—'" />
         </n-gi>
         <n-gi>
-          <StatCard label="可用现金" :value="overview ? fmtMoney(overview.account.cash) : '—'" />
+          <StatCard label="可用现金" :value="overview && !overview.currency_unavailable_reason ? fmtMoney(overview.account.cash) : '—'" />
         </n-gi>
         <n-gi>
           <StatCard
             label="总盈亏"
-            :value="overview ? fmtMoney(overview.total_profit) : '—'"
-            :change-pct="overview ? overview.total_profit_pct : undefined"
+            :value="overview && !overview.currency_unavailable_reason && !overview.valuation_unavailable_reason ? fmtMoney(overview.total_profit) : '—'"
+            :change-pct="overview && !overview.currency_unavailable_reason && !overview.valuation_unavailable_reason ? overview.total_profit_pct : undefined"
           />
         </n-gi>
         <n-gi>
-          <StatCard label="累计已实现" :value="overview ? fmtMoney(overview.realized_pnl) : '—'" />
+          <StatCard label="累计已实现" :value="overview && !overview.currency_unavailable_reason && !overview.realized_unavailable_reason ? fmtMoney(overview.realized_pnl) : '—'" :sub="overview?.realized_unavailable_reason" />
         </n-gi>
       </n-grid>
 
@@ -352,7 +403,7 @@ onBeforeUnmount(() => {
       <div class="cols">
         <!-- 下单 -->
         <SectionCard title="下单">
-          <n-form label-placement="top" :show-feedback="false" class="form">
+          <n-form label-placement="top" :show-feedback="false" :disabled="trading || resetting" class="form">
             <n-form-item label="方向">
               <n-radio-group v-model:value="form.side">
                 <n-radio-button value="buy">买入</n-radio-button>
@@ -362,12 +413,12 @@ onBeforeUnmount(() => {
             <n-grid cols="1 s:2" responsive="screen" :x-gap="10" :y-gap="10">
               <n-gi>
                 <n-form-item label="代码">
-                  <n-input v-model:value="form.symbol" placeholder="如 600000" />
+                  <n-input :value="form.symbol" placeholder="如 600000" @update:value="updateTradeSymbol" />
                 </n-form-item>
               </n-gi>
               <n-gi>
                 <n-form-item label="市场">
-                  <n-select v-model:value="form.market" :options="marketOptions" />
+                  <n-select :value="form.market" :options="marketOptions" @update:value="updateTradeMarket" />
                 </n-form-item>
               </n-gi>
             </n-grid>
@@ -379,7 +430,7 @@ onBeforeUnmount(() => {
               </n-gi>
               <n-gi>
                 <n-form-item label="数量">
-                  <n-input-number v-model:value="form.quantity" :min="0" style="width: 100%" />
+                  <n-input-number v-model:value="form.quantity" :min="0" :precision="4" style="width: 100%" />
                 </n-form-item>
               </n-gi>
             </n-grid>
@@ -387,6 +438,7 @@ onBeforeUnmount(() => {
               :type="form.side === 'buy' ? 'error' : 'success'"
               block
               :loading="trading"
+              :disabled="resetting"
               @click="submitTrade"
             >
               {{ form.side === 'buy' ? '模拟买入' : '模拟卖出' }}
@@ -413,22 +465,24 @@ onBeforeUnmount(() => {
               <div v-for="h in overview.holdings" :key="h.id" class="hold">
                 <div class="hold-main">
                   <div class="hold-title">
-                    <StockIdentity :symbol="h.symbol" market="cn" :name="h.name" density="table" clickable actions />
+                    <StockIdentity :symbol="h.symbol" :market="h.market" :name="h.name" density="table" clickable actions />
                     <n-tag v-if="isEtfSymbol(h.symbol)" size="tiny" round :bordered="false" type="info">ETF</n-tag>
                     <FreshnessTag :status="h.freshness_status" :as-of="h.quote_as_of" :reason="h.stale_reason" />
                   </div>
                   <div class="hold-sub">
-                    {{ h.quantity }} 股 · 成本 {{ fmt(h.avg_cost) }} · 现价
-                    {{ h.quote_ok ? fmt(h.price) : '—' }}
-                    <template v-if="!h.quote_ok">（按成本估值，浮盈未知）</template>
+                    {{ h.quantity }} {{ isEtfSymbol(h.symbol) ? '份' : '股' }} · 成本 {{ h.cost_basis_note ? '—（待核验）' : formatPrice(h.avg_cost) }} · 现价
+                    {{ h.quote_ok ? formatPrice(h.price) : '—' }}
+                    <template v-if="h.valuation_unavailable_reason"> · {{ h.valuation_unavailable_reason }}</template>
+                    <template v-else-if="!h.quote_ok">（按成本估值，浮盈未知）</template>
+                    <template v-if="h.cost_basis_note"> · {{ h.cost_basis_note }}</template>
                   </div>
                 </div>
                 <div class="hold-pnl">
                   <div class="pnl-val" :style="{ color: pctColor(h.profit_amount) }">
-                    {{ h.quote_ok ? fmtMoney(h.profit_amount) : '—' }}
+                    {{ h.quote_ok && !h.cost_basis_note ? fmtMoney(h.profit_amount) : '—' }}
                   </div>
                   <div class="pnl-pct" :style="{ color: pctColor(h.profit_pct) }">
-                    {{ h.quote_ok ? h.profit_pct.toFixed(2) + '%' : '—' }}
+                    {{ h.quote_ok && !h.cost_basis_note ? h.profit_pct.toFixed(2) + '%' : '—' }}
                   </div>
                 </div>
                 <n-button size="tiny" tertiary @click="sellFrom(h)">卖出</n-button>
@@ -446,12 +500,12 @@ onBeforeUnmount(() => {
             <n-tag size="tiny" round :bordered="false" :type="tradeSideType(t.side)">{{
               tradeSideLabel(t.side)
             }}</n-tag>
-            <StockIdentity :symbol="t.symbol" market="cn" :name="t.name" density="table" clickable />
+            <StockIdentity :symbol="t.symbol" :market="t.market" :name="t.name" density="table" clickable />
             <n-tag v-if="isEtfSymbol(t.symbol)" size="tiny" round :bordered="false" type="info">ETF</n-tag>
             <span v-if="t.side === 'adjust'" class="tr-detail">
               {{ t.quantity ? `数量调整 ${t.quantity > 0 ? '+' : ''}${t.quantity} 股` : '除权除息成本折算' }}
             </span>
-            <span v-else class="tr-detail">{{ t.quantity }} 股 @ {{ fmt(t.price) }}</span>
+            <span v-else class="tr-detail">{{ t.quantity }} {{ isEtfSymbol(t.symbol) ? '份' : '股' }} @ {{ formatPrice(t.price) }}</span>
             <span v-if="t.side !== 'adjust'" class="tr-amount">{{ fmtMoney(t.amount) }}</span>
             <span v-if="t.side === 'sell'" class="tr-pnl" :style="{ color: pctColor(t.realized_pnl) }">
               盈亏 {{ fmtMoney(t.realized_pnl) }}
@@ -466,19 +520,19 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- 重置弹窗 -->
-    <n-modal v-model:show="resetModal" preset="card" title="重置模拟账户" style="max-width: 380px">
+    <n-modal v-model:show="resetModal" preset="card" title="重置模拟账户" style="width: calc(100vw - 32px); max-width: 380px" :mask-closable="!resetting" :close-on-esc="!resetting" :closable="!resetting">
       <p class="reset-tip">将清空所有模拟持仓与成交流水，现金恢复为初始资金。</p>
       <n-form label-placement="top" :show-feedback="false">
         <n-form-item label="初始资金">
-          <n-input-number v-model:value="resetCash" :min="1000" :step="10000" style="width: 100%" />
+          <n-input-number v-model:value="resetCash" :min="1000" :step="10000" :precision="2" :disabled="resetting" style="width: 100%" />
         </n-form-item>
       </n-form>
       <template #footer>
         <div class="modal-footer">
-          <n-button @click="resetModal = false">取消</n-button>
+          <n-button :disabled="resetting" @click="resetModal = false">取消</n-button>
           <n-popconfirm @positive-click="doReset">
             <template #trigger>
-              <n-button type="primary">确认重置</n-button>
+              <n-button type="primary" :loading="resetting">确认重置</n-button>
             </template>
             确定清空并重置账户？
           </n-popconfirm>

@@ -65,7 +65,7 @@ func (ctl *DataImportController) Upload(c *gin.Context) {
 		return
 	}
 	defer f.Close()
-	view, err := ctl.svc.UploadByAccount(currentUserID(c), optionalAccountID(c), c.PostForm("kind"), fh.Filename, f)
+	view, err := ctl.svc.UploadByAccountContext(c.Request.Context(), currentUserID(c), optionalAccountID(c), c.PostForm("kind"), fh.Filename, f)
 	if err != nil {
 		common.ApiErrorMsg(c, publicImportError(err))
 		return
@@ -74,7 +74,7 @@ func (ctl *DataImportController) Upload(c *gin.Context) {
 }
 
 func (ctl *DataImportController) Get(c *gin.Context) {
-	view, err := ctl.svc.Get(currentUserID(c), c.Param("id"))
+	view, err := ctl.svc.GetContext(c.Request.Context(), currentUserID(c), c.Param("id"))
 	if err != nil {
 		common.ApiErrorMsg(c, publicImportError(err))
 		return
@@ -84,7 +84,7 @@ func (ctl *DataImportController) Get(c *gin.Context) {
 
 func (ctl *DataImportController) List(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.Query("limit"))
-	rows, err := ctl.svc.List(currentUserID(c), limit)
+	rows, err := ctl.svc.ListByAccountContext(c.Request.Context(), currentUserID(c), optionalAccountID(c), limit)
 	if err != nil {
 		common.ApiErrorMsg(c, publicImportError(err))
 		return
@@ -99,7 +99,7 @@ func (ctl *DataImportController) Preview(c *gin.Context) {
 		common.ApiErrorMsg(c, "列映射请求格式错误")
 		return
 	}
-	view, err := ctl.svc.Preview(currentUserID(c), c.Param("id"), in)
+	view, err := ctl.svc.PreviewContext(c.Request.Context(), currentUserID(c), c.Param("id"), in)
 	if err != nil {
 		common.ApiErrorMsg(c, publicImportError(err))
 		return
@@ -123,7 +123,7 @@ func (ctl *DataImportController) Confirm(c *gin.Context) {
 }
 
 func (ctl *DataImportController) Rollback(c *gin.Context) {
-	result, err := ctl.svc.Rollback(currentUserID(c), c.Param("id"))
+	result, err := ctl.svc.RollbackContext(c.Request.Context(), currentUserID(c), c.Param("id"))
 	if err != nil {
 		common.ApiErrorMsg(c, publicImportError(err))
 		return

@@ -1,9 +1,9 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"strings"
-	"sync"
 	"time"
 
 	"quantvista/common"
@@ -21,7 +21,19 @@ const (
 	OnboardingStepAlert      = "alert"
 )
 
-var onboardingMutationMu sync.Mutex
+var onboardingMutationGate = make(chan struct{}, 1)
+
+func lockOnboardingMutation(ctx context.Context) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case onboardingMutationGate <- struct{}{}:
+		return func() { <-onboardingMutationGate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
 type OnboardingView struct {
 	model.OnboardingProgress
@@ -89,11 +101,26 @@ func seededOnboardingProgress(tx *gorm.DB, userID int64, version, run int) (mode
 }
 
 func currentOnboardingProgressTx(tx *gorm.DB, userID int64, version int, create bool) (*model.OnboardingProgress, error) {
+	return readOnboardingProgressTx(tx, userID, version, create, false)
+}
+
+func lockedOnboardingProgressTx(tx *gorm.DB, userID int64, version int, create bool) (*model.OnboardingProgress, error) {
+	return readOnboardingProgressTx(tx, userID, version, create, true)
+}
+
+func readOnboardingProgressTx(tx *gorm.DB, userID int64, version int, create, locking bool) (*model.OnboardingProgress, error) {
 	if userID <= 0 || version <= 0 {
 		return nil, errors.New("引导进度不存在")
 	}
+	query := func() *gorm.DB {
+		q := tx.Where("user_id = ? AND version = ?", userID, version).Order("run DESC")
+		if locking && !common.UsingSQLite {
+			q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		return q
+	}
 	var progress model.OnboardingProgress
-	err := tx.Where("user_id = ? AND version = ?", userID, version).Order("run DESC").First(&progress).Error
+	err := query().First(&progress).Error
 	if err == nil {
 		return &progress, nil
 	}
@@ -113,19 +140,23 @@ func currentOnboardingProgressTx(tx *gorm.DB, userID int64, version int, create 
 	if created.Error != nil {
 		return nil, created.Error
 	}
-	if created.RowsAffected == 0 {
-		if err := tx.Where("user_id = ? AND version = ?", userID, version).Order("run DESC").First(&progress).Error; err != nil {
-			return nil, err
-		}
+	// 冲突时使用实际持久化进度；不要依赖不同驱动的 RowsAffected/LastInsertID 语义。
+	progress = model.OnboardingProgress{}
+	if err := query().First(&progress).Error; err != nil {
+		return nil, err
 	}
 	return &progress, nil
 }
 
 func getOnboardingProgressVersion(userID int64, version int) (*OnboardingView, error) {
+	return getOnboardingProgressVersionContext(context.Background(), userID, version)
+}
+
+func getOnboardingProgressVersionContext(ctx context.Context, userID int64, version int) (*OnboardingView, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
-	progress, err := currentOnboardingProgressTx(common.DB, userID, version, true)
+	progress, err := currentOnboardingProgressTx(common.DB.WithContext(ctx), userID, version, true)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +164,11 @@ func getOnboardingProgressVersion(userID int64, version int) (*OnboardingView, e
 }
 
 func GetOnboardingProgress(userID int64) (*OnboardingView, error) {
-	return getOnboardingProgressVersion(userID, OnboardingCurrentVersion)
+	return GetOnboardingProgressContext(context.Background(), userID)
+}
+
+func GetOnboardingProgressContext(ctx context.Context, userID int64) (*OnboardingView, error) {
+	return getOnboardingProgressVersionContext(ctx, userID, OnboardingCurrentVersion)
 }
 
 func onboardingStepColumns(step string) (string, string, error) {
@@ -150,16 +185,21 @@ func onboardingStepColumns(step string) (string, string, error) {
 }
 
 func setOnboardingStepTx(tx *gorm.DB, userID int64, step, status string, alertRuleID int64) error {
+	progress, err := lockedOnboardingProgressTx(tx, userID, OnboardingCurrentVersion, true)
+	if err != nil {
+		return err
+	}
+	return setOnboardingProgressStepTx(tx, progress, step, status, alertRuleID)
+}
+
+func setOnboardingProgressStepTx(tx *gorm.DB, progress *model.OnboardingProgress, step, status string, alertRuleID int64) error {
+	step = strings.TrimSpace(step)
 	statusColumn, timeColumn, err := onboardingStepColumns(step)
 	if err != nil {
 		return err
 	}
 	if status != model.OnboardingStepCompleted && status != model.OnboardingStepSkipped {
 		return errors.New("非法的引导步骤状态")
-	}
-	progress, err := currentOnboardingProgressTx(tx, userID, OnboardingCurrentVersion, true)
-	if err != nil {
-		return err
 	}
 	if progress.Status == model.OnboardingStatusCompleted {
 		return nil
@@ -183,7 +223,7 @@ func setOnboardingStepTx(tx *gorm.DB, userID int64, step, status string, alertRu
 			updates["alert_tested_at"] = &now
 		}
 	}
-	query := tx.Model(&model.OnboardingProgress{}).Where("id = ? AND user_id = ?", progress.ID, userID)
+	query := tx.Model(&model.OnboardingProgress{}).Where("id = ? AND user_id = ?", progress.ID, progress.UserID)
 	if status == model.OnboardingStepSkipped {
 		// 业务动作的 completed 在并发下优先，跳过不能覆盖已经完成的事实。
 		query = query.Where(statusColumn+" <> ?", model.OnboardingStepCompleted)
@@ -198,14 +238,46 @@ func markOnboardingStepCompleted(userID int64, step string, alertRuleID int64) e
 }
 
 func SkipOnboardingStep(userID int64, step string) (*OnboardingView, error) {
-	onboardingMutationMu.Lock()
-	defer onboardingMutationMu.Unlock()
-	if err := common.DB.Transaction(func(tx *gorm.DB) error {
-		return setOnboardingStepTx(tx, userID, step, model.OnboardingStepSkipped, 0)
-	}); err != nil {
+	return SkipOnboardingStepContext(context.Background(), userID, step, 0)
+}
+
+func SkipOnboardingStepContext(ctx context.Context, userID int64, step string, progressID int64) (*OnboardingView, error) {
+	return mutateOnboardingContext(ctx, userID, progressID, func(tx *gorm.DB, progress *model.OnboardingProgress) error {
+		return setOnboardingProgressStepTx(tx, progress, step, model.OnboardingStepSkipped, 0)
+	})
+}
+
+// 先锁当前轮次、核对页面看到的进度，再修改并在提交前构造完整返回值。
+func mutateOnboardingContext(ctx context.Context, userID, progressID int64, mutate func(*gorm.DB, *model.OnboardingProgress) error) (*OnboardingView, error) {
+	unlock, err := lockOnboardingMutation(ctx)
+	if err != nil {
 		return nil, err
 	}
-	return GetOnboardingProgress(userID)
+	defer unlock()
+	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
+	}
+	var result model.OnboardingProgress
+	err = common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		progress, err := lockedOnboardingProgressTx(tx, userID, OnboardingCurrentVersion, progressID == 0)
+		if err != nil {
+			return err
+		}
+		if progressID != 0 && progress.ID != progressID {
+			return errors.New("引导轮次已变化，请重新加载")
+		}
+		if err := mutate(tx, progress); err != nil {
+			return err
+		}
+		return tx.Where("id = ? AND user_id = ?", progress.ID, userID).First(&result).Error
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, err
+	}
+	return onboardingView(result, time.Now()), nil
 }
 
 func RecordOnboardingAlertCreated(userID, ruleID int64) error {
@@ -213,13 +285,17 @@ func RecordOnboardingAlertCreated(userID, ruleID int64) error {
 		return nil
 	}
 	return common.DB.Transaction(func(tx *gorm.DB) error {
-		progress, err := currentOnboardingProgressTx(tx, userID, OnboardingCurrentVersion, true)
-		if err != nil || progress.Status == model.OnboardingStatusCompleted || progress.AlertStatus == model.OnboardingStepSkipped {
-			return err
-		}
-		return tx.Model(&model.OnboardingProgress{}).Where("id = ? AND user_id = ?", progress.ID, userID).
-			Updates(map[string]any{"alert_rule_id": ruleID, "deferred_until": nil}).Error
+		return recordOnboardingAlertCreatedTx(tx, userID, ruleID)
 	})
+}
+
+func recordOnboardingAlertCreatedTx(tx *gorm.DB, userID, ruleID int64) error {
+	progress, err := lockedOnboardingProgressTx(tx, userID, OnboardingCurrentVersion, true)
+	if err != nil || progress.Status == model.OnboardingStatusCompleted || stepTerminal(progress.AlertStatus) {
+		return err
+	}
+	return tx.Model(&model.OnboardingProgress{}).Where("id = ? AND user_id = ?", progress.ID, userID).
+		Updates(map[string]any{"alert_rule_id": ruleID, "deferred_until": nil}).Error
 }
 
 func activeOnboardingAlertRule(userID int64) (int64, error) {
@@ -245,7 +321,7 @@ func completeOnboardingAlertTest(userID, testedRuleID int64) error {
 		return nil
 	}
 	return common.DB.Transaction(func(tx *gorm.DB) error {
-		progress, err := currentOnboardingProgressTx(tx, userID, OnboardingCurrentVersion, true)
+		progress, err := lockedOnboardingProgressTx(tx, userID, OnboardingCurrentVersion, true)
 		if err != nil {
 			return err
 		}
@@ -260,7 +336,7 @@ func completeOnboardingAlertTest(userID, testedRuleID int64) error {
 			}
 			return err
 		}
-		return setOnboardingStepTx(tx, userID, OnboardingStepAlert, model.OnboardingStepCompleted, rule.ID)
+		return setOnboardingProgressStepTx(tx, progress, OnboardingStepAlert, model.OnboardingStepCompleted, rule.ID)
 	})
 }
 
@@ -273,13 +349,11 @@ func CompleteOnboardingAlertTest(userID int64) error {
 }
 
 func FinishOnboarding(userID int64) (*OnboardingView, error) {
-	onboardingMutationMu.Lock()
-	defer onboardingMutationMu.Unlock()
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
-		progress, err := currentOnboardingProgressTx(tx, userID, OnboardingCurrentVersion, true)
-		if err != nil {
-			return err
-		}
+	return FinishOnboardingContext(context.Background(), userID, 0)
+}
+
+func FinishOnboardingContext(ctx context.Context, userID, progressID int64) (*OnboardingView, error) {
+	return mutateOnboardingContext(ctx, userID, progressID, func(tx *gorm.DB, progress *model.OnboardingProgress) error {
 		if progress.Status == model.OnboardingStatusCompleted {
 			return nil
 		}
@@ -291,23 +365,35 @@ func FinishOnboarding(userID int64) (*OnboardingView, error) {
 			"status": model.OnboardingStatusCompleted, "completed_at": &now, "deferred_until": nil,
 		}).Error
 	})
-	if err != nil {
-		return nil, err
-	}
-	return GetOnboardingProgress(userID)
 }
 
 func RestartOnboarding(userID int64) (*OnboardingView, error) {
-	onboardingMutationMu.Lock()
-	defer onboardingMutationMu.Unlock()
+	return RestartOnboardingContext(context.Background(), userID, 0)
+}
+
+func RestartOnboardingContext(ctx context.Context, userID, progressID int64) (*OnboardingView, error) {
+	if userID <= 0 {
+		return nil, errors.New("引导进度不存在")
+	}
+	unlock, err := lockOnboardingMutation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
+	}
 	var created model.OnboardingProgress
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
+	err = common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var latest model.OnboardingProgress
 		query := tx.Where("user_id = ? AND version = ?", userID, OnboardingCurrentVersion).Order("run DESC")
 		if !common.UsingSQLite {
 			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
 		}
 		err := query.First(&latest).Error
+		if progressID != 0 && (errors.Is(err, gorm.ErrRecordNotFound) || err == nil && latest.ID != progressID) {
+			return errors.New("引导轮次已变化，请重新加载")
+		}
 		nextRun := 1
 		if err == nil {
 			nextRun = latest.Run + 1
@@ -320,24 +406,25 @@ func RestartOnboarding(userID int64) (*OnboardingView, error) {
 		return tx.Create(&created).Error
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
 	}
 	return onboardingView(created, time.Now()), nil
 }
 
 func DeferOnboarding(userID int64) (*OnboardingView, error) {
-	onboardingMutationMu.Lock()
-	defer onboardingMutationMu.Unlock()
-	progress, err := currentOnboardingProgressTx(common.DB, userID, OnboardingCurrentVersion, true)
-	if err != nil {
-		return nil, err
-	}
-	if progress.Status != model.OnboardingStatusCompleted {
-		until := time.Now().Add(24 * time.Hour)
-		if err := common.DB.Model(&model.OnboardingProgress{}).Where("id = ? AND user_id = ?", progress.ID, userID).
-			Update("deferred_until", &until).Error; err != nil {
-			return nil, err
+	return DeferOnboardingContext(context.Background(), userID, 0)
+}
+
+func DeferOnboardingContext(ctx context.Context, userID, progressID int64) (*OnboardingView, error) {
+	return mutateOnboardingContext(ctx, userID, progressID, func(tx *gorm.DB, progress *model.OnboardingProgress) error {
+		if progress.Status != model.OnboardingStatusCompleted {
+			until := time.Now().Add(24 * time.Hour)
+			return tx.Model(&model.OnboardingProgress{}).Where("id = ? AND user_id = ?", progress.ID, userID).
+				Update("deferred_until", &until).Error
 		}
-	}
-	return GetOnboardingProgress(userID)
+		return nil
+	})
 }

@@ -22,7 +22,7 @@ func NewWatchlistController(svc *service.WatchlistService) *WatchlistController 
 func (wc *WatchlistController) List(c *gin.Context) {
 	groups, err := wc.svc.List(c.Request.Context(), currentUserID(c))
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "自选操作未完成，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, groups)
@@ -30,7 +30,7 @@ func (wc *WatchlistController) List(c *gin.Context) {
 
 type groupReq struct {
 	Name      string `json:"name"`
-	SortOrder int    `json:"sort_order"`
+	SortOrder *int   `json:"sort_order"`
 }
 
 // CreateGroup POST /api/watchlists
@@ -40,9 +40,9 @@ func (wc *WatchlistController) CreateGroup(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	g, err := wc.svc.CreateGroup(currentUserID(c), req.Name)
+	g, err := wc.svc.CreateGroup(currentUserID(c), req.Name, c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "自选操作未完成，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, g)
@@ -59,9 +59,9 @@ func (wc *WatchlistController) UpdateGroup(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	g, err := wc.svc.UpdateGroup(currentUserID(c), id, req.Name, req.SortOrder)
+	g, err := wc.svc.UpdateGroup(currentUserID(c), id, req.Name, req.SortOrder, c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "自选操作未完成，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, g)
@@ -73,8 +73,8 @@ func (wc *WatchlistController) DeleteGroup(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := wc.svc.DeleteGroup(currentUserID(c), id); err != nil {
-		common.ApiErrorMsg(c, err.Error())
+	if err := wc.svc.DeleteGroup(currentUserID(c), id, c.Request.Context()); err != nil {
+		common.ApiErrorMsg(c, publicWorkflowError(err, "自选操作未完成，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, gin.H{"ok": true})
@@ -93,7 +93,7 @@ func (wc *WatchlistController) AddItem(c *gin.Context) {
 	}
 	item, err := wc.svc.AddItem(c.Request.Context(), currentUserID(c), groupID, in)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "自选操作未完成，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, item)
@@ -105,14 +105,14 @@ func (wc *WatchlistController) UpdateItem(c *gin.Context) {
 	if !ok {
 		return
 	}
-	var in service.WatchlistItemInput
+	var in service.WatchlistItemUpdateInput
 	if err := c.ShouldBindJSON(&in); err != nil {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	item, err := wc.svc.UpdateItem(currentUserID(c), id, in)
+	item, err := wc.svc.UpdateItem(currentUserID(c), id, in, c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "自选操作未完成，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, item)
@@ -124,8 +124,8 @@ func (wc *WatchlistController) DeleteItem(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := wc.svc.DeleteItem(currentUserID(c), id); err != nil {
-		common.ApiErrorMsg(c, err.Error())
+	if err := wc.svc.DeleteItem(currentUserID(c), id, c.Request.Context()); err != nil {
+		common.ApiErrorMsg(c, publicWorkflowError(err, "自选操作未完成，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, gin.H{"ok": true})
@@ -147,7 +147,7 @@ func (wc *WatchlistController) SetItemStage(c *gin.Context) {
 	}
 	item, err := wc.svc.SetItemStage(c.Request.Context(), currentUserID(c), id, body.Stage, body.Reason)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "自选操作未完成，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, item)
@@ -157,7 +157,7 @@ func (wc *WatchlistController) SetItemStage(c *gin.Context) {
 func (wc *WatchlistController) Missed(c *gin.Context) {
 	rows, err := wc.svc.MissedOpportunities(c.Request.Context(), currentUserID(c))
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "自选操作未完成，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, rows)

@@ -37,6 +37,7 @@ export interface DailyReportView extends DailyReportRow {
   snapshot_json: string
   review: DailyReview | null
   recommendation: RecommendationView | null
+  recommendation_error?: string
 }
 
 export function listDailyReports(limit = 20) {
@@ -48,8 +49,8 @@ export function getDailyReport(id: number) {
 }
 
 // 无日报时 data 为 null。
-export function getLatestDailyReport() {
-  return request<DailyReportView | null>({ url: '/daily-reports/latest' })
+export function getLatestDailyReport(signal?: AbortSignal) {
+  return request<DailyReportView | null>({ url: '/daily-reports/latest', signal })
 }
 
 // 手动生成/重生成当日日报（计 1 次配额）。2026-07-14 异步任务化：接口立即返回

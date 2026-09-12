@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"quantvista/datasource"
@@ -57,7 +58,6 @@ const riskGateNote = riskGateNoteBase
 
 // 风险闸门阈值。
 const (
-	riskLimitBoardPct   = 9.5  // 涨跌幅 ≥9.5% 视为触板
 	riskLimitBoardAmpl  = 1.0  // 且振幅 <1% 判一字板
 	riskLowLiquidityAmt = 3e7  // 日成交额 <3000 万判流动性不足
 	riskSmallCapTotal   = 30e8 // 总市值 <30 亿提示小盘
@@ -75,9 +75,13 @@ func computeRiskGate(q *datasource.Quote, v *datasource.Valuation) []riskFlag {
 	if q == nil {
 		return flags
 	}
+	if q.Market != "" && q.Market != "cn" {
+		return flags // 这些涨跌停、ST 与人民币金额规则仅适用于 A 股。
+	}
 
 	// ST/退市风险警示：block 级——prompt 会禁止给出买入倾向。
-	if v != nil && v.IsST {
+	st := (v != nil && v.IsST) || strings.Contains(strings.ToUpper(q.Name), "ST")
+	if st {
 		flags = append(flags, riskFlag{
 			Level: "block", Code: "st",
 			Text: "该股为 ST/风险警示标的，存在退市风险，禁止给出买入建议；评级不得为 bullish。",
@@ -89,14 +93,21 @@ func computeRiskGate(q *datasource.Quote, v *datasource.Valuation) []riskFlag {
 		})
 	}
 
-	// 一字板：涨跌幅 ≥9.5% 且振幅 <1%（全天钉死在涨/跌停价，单边流动性）。
+	// 一字板阈值与推荐执行器共用板块口径；振幅缺失不能当作零振幅。
 	ampl := 0.0
+	amplitudeKnown := false
 	if v != nil && v.Amplitude > 0 {
 		ampl = v.Amplitude
-	} else if q.PrevClose > 0 && q.High >= q.Low && q.High > 0 {
+		amplitudeKnown = true
+	} else if q.PrevClose > 0 && q.High >= q.Low && q.Low > 0 {
 		ampl = (q.High - q.Low) / q.PrevClose * 100
+		amplitudeKnown = true
 	}
-	if abs(q.ChangePct) >= riskLimitBoardPct && ampl < riskLimitBoardAmpl && ampl >= 0 {
+	limitName := q.Name
+	if st {
+		limitName = "ST" + limitName
+	}
+	if amplitudeKnown && abs(q.ChangePct) >= limitUpPctFor(q.Symbol, limitName)-0.5 && ampl < riskLimitBoardAmpl && ampl >= 0 {
 		if q.ChangePct > 0 {
 			flags = append(flags, riskFlag{
 				Level: "warn", Code: "limit_board",

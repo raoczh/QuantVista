@@ -1,24 +1,48 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import {
   NAlert, NButton, NCollapse, NCollapseItem, NForm, NFormItem, NInput, NInputNumber,
   NModal, NRadioButton, NRadioGroup, NSelect, NSpin, NTag, useDialog, useMessage,
 } from 'naive-ui'
 import {
   actLLMExperiment, auditLLMExperiment, createLLMExperiment, getLLMExperiment, listLLMExperiments,
+  SCORE_BLIND_INPUT_SCHEMA_VERSION,
   type LLMExperiment, type LLMExperimentActual, type LLMExperimentInput, type LLMExperimentRun,
   type LLMExperimentProtocol, type LLMExperimentType, type LLMReleaseAudit, type LLMReleaseAuditFinding,
 } from '@/api/admin'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import { useUi } from '@/composables/useUi'
+import { getSessionEpoch } from '@/api/token'
+import { useAuthStore } from '@/stores/auth'
 
 const message = useMessage()
 const dialog = useDialog()
 const { vars } = useUi()
+const auth = useAuthStore()
+const pageSession = getSessionEpoch()
+let disposed = false
+const pageActive = () => !disposed && getSessionEpoch() === pageSession
+let confirmation: ReturnType<typeof dialog.warning> | null = null
+onBeforeUnmount(() => {
+  disposed = true
+  confirmation?.destroy()
+})
 
 const rows = ref<LLMExperiment[]>([])
 const loading = ref(false)
+const loadError = ref('')
+let listSequence = 0
+const detailSequence = new Map<number, number>()
+const busy = computed(() => acting.value || auditing.value || creating.value)
+function invalidateReads(id?: number) {
+  listSequence++
+  loading.value = false
+  if (id !== undefined) {
+    detailSequence.set(id, (detailSequence.get(id) || 0) + 1)
+    detailLoading[id] = false
+  }
+}
 
 const STATUS_LABEL: Record<string, string> = {
   draft: '草稿', running: '采样中', completed: '已完成', promoted: '已晋级', abandoned: '已废弃', rolled_back: '已回滚',
@@ -57,7 +81,7 @@ function isKnownExperiment(exp: Pick<LLMExperiment, 'experiment_type'>): boolean
 function scoreBlindProtocolIssue(exp: LLMExperiment): string {
   if (!isScoreBlind(exp)) return ''
   if (exp.champion_custom) return 'score-blind 仅支持默认推荐任务段，当前 champion 为自定义任务段'
-  if (exp.input_schema_version !== 'sb1') return `不支持的输入 schema：${exp.input_schema_version || '缺失'}`
+  if (exp.input_schema_version !== SCORE_BLIND_INPUT_SCHEMA_VERSION) return `不支持的输入 schema：${exp.input_schema_version || '缺失'}`
   if (!exp.protocol_hash) return 'protocol hash 缺失'
   if (!exp.protocol_locked_at) return '协议尚未锁定'
   const protocol = parseProtocol(exp)
@@ -93,15 +117,20 @@ function conclusionType(exp: LLMExperiment): 'default' | 'info' | 'success' | 'w
 }
 
 async function load() {
+  if (!pageActive()) return
+  const sequence = ++listSequence
   loading.value = true
   try {
-    rows.value = await listLLMExperiments()
-    const loadedIDs = Object.keys(detailRuns).map(Number)
+    const result = await listLLMExperiments()
+    if (!pageActive() || sequence !== listSequence) return
+    rows.value = result
+    loadError.value = ''
+    const loadedIDs = Object.keys(detailRuns).map(Number).filter(id => result.some(row => row.id === id))
     await Promise.all(loadedIDs.map((id) => loadDetail(id, true)))
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive() && sequence === listSequence) loadError.value = (e as Error).message
   } finally {
-    loading.value = false
+    if (sequence === listSequence) loading.value = false
   }
 }
 onMounted(load)
@@ -201,14 +230,23 @@ function formatInputOrder(run: LLMExperimentRun): string {
 /* 明细（影子样本 + 发布审计工件） */
 const detailRuns = reactive<Record<number, LLMExperimentRun[]>>({})
 const detailAudits = reactive<Record<number, LLMReleaseAudit[]>>({})
+const detailLoading = reactive<Record<number, boolean>>({})
+const detailErrors = reactive<Record<number, string>>({})
 async function loadDetail(id: number, force = false) {
-  if (detailRuns[id] && !force) return
+  if (!pageActive() || (!force && (detailRuns[id] || detailLoading[id]))) return
+  const sequence = (detailSequence.get(id) || 0) + 1
+  detailSequence.set(id, sequence)
+  detailLoading[id] = true
   try {
     const res = await getLLMExperiment(id)
+    if (!pageActive() || detailSequence.get(id) !== sequence) return
     detailRuns[id] = res.runs
     detailAudits[id] = res.audits ?? []
+    detailErrors[id] = ''
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive() && detailSequence.get(id) === sequence) detailErrors[id] = (e as Error).message
+  } finally {
+    if (detailSequence.get(id) === sequence) detailLoading[id] = false
   }
 }
 
@@ -226,17 +264,20 @@ const AUDIT_LABEL: Record<string, string> = { pass: 'PASS', fail: 'FAIL', error:
 /* P2-6 发布审计（LLM 只复核程序硬检覆盖不了的缺口；一次真实 LLM 调用） */
 const auditing = ref(false)
 async function runAudit(exp: LLMExperiment) {
+  if (!pageActive() || busy.value) return
   if (!isPromptExperiment(exp)) {
     message.error('仅已识别的 prompt challenger 可以执行发布审计')
     return
   }
   auditing.value = true
+  invalidateReads(exp.id)
   try {
     const a = await auditLLMExperiment(exp.id)
+    if (!pageActive()) return
     message.success(`发布审计完成：${AUDIT_LABEL[a.verdict] || a.verdict}`)
     await loadDetail(exp.id, true)
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   } finally {
     auditing.value = false
   }
@@ -249,6 +290,7 @@ function onHeaderClick(data: { name: string | number }) {
 /* 动作 */
 const acting = ref(false)
 async function act(exp: LLMExperiment, action: 'start' | 'promote' | 'rollback' | 'abandon') {
+  if (!pageActive() || busy.value) return
   if (!isKnownExperiment(exp)) {
     message.error(`未知实验类型 ${experimentType(exp)}，前端已拒绝执行状态变更`)
     return
@@ -265,42 +307,48 @@ async function act(exp: LLMExperiment, action: 'start' | 'promote' | 'rollback' 
     }
   }
   acting.value = true
+  invalidateReads(exp.id)
   try {
     await actLLMExperiment(exp.id, action)
+    if (!pageActive()) return
     message.success('已执行')
     await load()
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   } finally {
     acting.value = false
   }
 }
 
 function confirmPromote(exp: LLMExperiment) {
+  if (!pageActive() || busy.value || confirmation) return
   if (!isPromptExperiment(exp)) {
     message.error('仅已识别的 prompt challenger 可以晋级 champion')
     return
   }
-  dialog.warning({
+  confirmation = dialog.warning({
     title: '晋级为 champion',
     content: '将把 challenger 内容落为该模块启用中的自定义模板（生成新的不可变 revision 快照并切换指针）。发布质量门（样本量/结构化有效率/结论/内容 hash/发布审计 PASS）不通过会被拒绝。回滚 = 本页「一键切回 champion」。',
     positiveText: '晋级',
     negativeText: '取消',
     onPositiveClick: () => act(exp, 'promote'),
+    onAfterLeave: () => { confirmation = null },
   })
 }
 
 function confirmRollback(exp: LLMExperiment) {
+  if (!pageActive() || busy.value || confirmation) return
   if (!isPromptExperiment(exp)) {
     message.error('仅已识别的 prompt challenger 可以回滚 champion')
     return
   }
-  dialog.warning({
+  confirmation = dialog.warning({
     title: '一键切回 champion',
     content: '将恢复晋级前的模板状态（晋级前有自定义模板则恢复其内容并生成新 revision；晋级前为默认模板则停用当前自定义模板）。实验进入「已回滚」终态，工件全部保留。',
     positiveText: '回滚',
     negativeText: '取消',
     onPositiveClick: () => act(exp, 'rollback'),
+    onAfterLeave: () => { confirmation = null },
   })
 }
 
@@ -308,6 +356,7 @@ function confirmRollback(exp: LLMExperiment) {
 const completeTarget = ref<LLMExperiment | null>(null)
 const completeForm = reactive({ conclusion: 'no_improvement', failure_reason: '' })
 function openComplete(exp: LLMExperiment) {
+  if (!pageActive() || busy.value) return
   if (!isKnownExperiment(exp)) {
     message.error(`未知实验类型 ${experimentType(exp)}，前端已拒绝完成操作`)
     return
@@ -319,25 +368,27 @@ function openComplete(exp: LLMExperiment) {
 
 async function submitComplete() {
   const target = completeTarget.value
-  if (!target) return
+  if (!pageActive() || busy.value || !target) return
   if (!isKnownExperiment(target)) {
     message.error(`未知实验类型 ${experimentType(target)}，前端已拒绝完成操作`)
     completeTarget.value = null
     return
   }
   acting.value = true
+  invalidateReads(target.id)
   try {
     await actLLMExperiment(target.id, 'complete', {
       conclusion: completeForm.conclusion,
       failure_reason: completeForm.failure_reason.trim(),
     })
+    if (!pageActive()) return
     message.success(isScoreBlind(target)
       ? 'score-blind 管理员结论已记录（非协议判定）'
       : '实验已完成（聚合报表见卡片）')
-    completeTarget.value = null
+    if (completeTarget.value?.id === target.id) completeTarget.value = null
     await load()
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   } finally {
     acting.value = false
   }
@@ -356,9 +407,10 @@ const createForm = reactive({
   multiple_testing_method: '',
 })
 const parentOptions = computed(() =>
-	rows.value.filter(isPromptExperiment).map((r) => ({ label: `#${r.id} ${r.name}`, value: r.id })))
+  rows.value.filter(r => isPromptExperiment(r) && r.user_id === auth.user?.id).map((r) => ({ label: `#${r.id} ${r.name}`, value: r.id })))
 const scoreBlindSampleTargetMin = computed(() => Math.max(5, (createForm.min_effective_batches ?? 1) * 2))
 async function submitCreate() {
+  if (!pageActive() || busy.value || !showCreate.value) return
   const scoreBlind = createForm.experiment_type === 'score_blind'
   if (scoreBlind && (
     createForm.min_effective_batches === null || createForm.max_coverage_drop_pct === null ||
@@ -392,8 +444,10 @@ async function submitCreate() {
     input.parent_id = createForm.parent_id || 0
   }
   creating.value = true
+  invalidateReads()
   try {
     const res = await createLLMExperiment(input)
+    if (!pageActive()) return
     res.warnings?.forEach((w) => message.warning(w))
     message.success(`实验 #${res.experiment.id} 已创建（draft）`)
     showCreate.value = false
@@ -408,7 +462,7 @@ async function submitCreate() {
     createForm.multiple_testing_method = ''
     await load()
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   } finally {
     creating.value = false
   }
@@ -425,9 +479,10 @@ async function submitCreate() {
         <template #extra>
           <div class="exp-toolbar">
             <n-button size="small" @click="load">刷新</n-button>
-            <n-button size="small" type="primary" @click="showCreate = true">新建实验</n-button>
+            <n-button size="small" type="primary" :disabled="busy" @click="showCreate = true">新建实验</n-button>
           </div>
         </template>
+        <n-alert v-if="loadError" type="error" :bordered="false">{{ loadError }}</n-alert>
         <n-spin :show="loading">
           <n-collapse v-if="rows.length" display-directive="show" @item-header-click="onHeaderClick">
             <n-collapse-item v-for="r in rows" :key="r.id" :name="r.id">
@@ -448,6 +503,9 @@ async function submitCreate() {
                 </span>
               </template>
               <div class="exp-body">
+                <n-alert v-if="detailErrors[r.id]" type="error" :bordered="false">
+                  {{ detailErrors[r.id] }} <n-button size="tiny" :loading="detailLoading[r.id]" @click="loadDetail(r.id, true)">重试明细</n-button>
+                </n-alert>
                 <n-alert v-if="isScoreBlind(r)" type="warning" :show-icon="false" :bordered="false" class="exp-shadow-alert">
                   纯影子、不影响推荐。该输入实验不属于 prompt 晋级路径，不能发布审计、晋级或回滚为 champion。
                 </n-alert>
@@ -475,7 +533,7 @@ async function submitCreate() {
                 </div>
                 <div v-if="isPromptExperiment(r)" class="exp-row"><span class="exp-k">challenger 任务段</span><span class="exp-content">{{ r.challenger_content }}</span></div>
                 <div v-if="r.failure_reason" class="exp-row"><span class="exp-k">失败原因</span><span>{{ r.failure_reason }}</span></div>
-                <div v-if="isPromptExperiment(r) && r.baseline_stale" class="exp-row exp-row-warning">
+                <div v-if="isKnownExperiment(r) && r.baseline_stale" class="exp-row exp-row-warning">
                   <span class="exp-k">基线已失效</span>
                   <span>{{ r.baseline_stale }}（该实验不可再启动、审计或晋级，请基于当前 champion 新建实验）</span>
                 </div>
@@ -497,15 +555,15 @@ async function submitCreate() {
                     size="tiny"
                     type="primary"
                     :loading="acting"
-                    :disabled="(isPromptExperiment(r) && !!r.baseline_stale) || !!scoreBlindProtocolIssue(r)"
-                    :title="isPromptExperiment(r) ? r.baseline_stale || undefined : scoreBlindProtocolIssue(r) || undefined"
+                    :disabled="busy || !!r.baseline_stale || !!scoreBlindProtocolIssue(r)"
+                    :title="r.baseline_stale || scoreBlindProtocolIssue(r) || undefined"
                     @click="act(r, 'start')"
                   >启动采样</n-button>
-                  <n-button v-if="isKnownExperiment(r) && r.status === 'running'" size="tiny" type="warning" :loading="acting" @click="openComplete(r)">完成实验</n-button>
-                  <n-button v-if="isPromptExperiment(r) && r.status === 'completed'" size="tiny" type="info" :loading="auditing" :disabled="!!r.baseline_stale" :title="r.baseline_stale || undefined" @click="runAudit(r)">发布审计</n-button>
-                  <n-button v-if="isPromptExperiment(r) && r.status === 'completed'" size="tiny" type="success" :loading="acting" :disabled="!!r.baseline_stale" :title="r.baseline_stale || undefined" @click="confirmPromote(r)">晋级 champion</n-button>
-                  <n-button v-if="isPromptExperiment(r) && r.status === 'promoted'" size="tiny" type="error" :loading="acting" :disabled="!!r.rollback_stale" @click="confirmRollback(r)">一键切回 champion</n-button>
-                  <n-button v-if="isKnownExperiment(r) && r.status !== 'promoted' && r.status !== 'abandoned' && r.status !== 'rolled_back'" size="tiny" :loading="acting" @click="act(r, 'abandon')">废弃</n-button>
+                  <n-button v-if="isKnownExperiment(r) && r.status === 'running'" size="tiny" type="warning" :loading="acting" :disabled="busy" @click="openComplete(r)">完成实验</n-button>
+                  <n-button v-if="isPromptExperiment(r) && r.status === 'completed'" size="tiny" type="info" :loading="auditing" :disabled="busy || !!r.baseline_stale" :title="r.baseline_stale || undefined" @click="runAudit(r)">发布审计</n-button>
+                  <n-button v-if="isPromptExperiment(r) && r.status === 'completed'" size="tiny" type="success" :loading="acting" :disabled="busy || !!r.baseline_stale" :title="r.baseline_stale || undefined" @click="confirmPromote(r)">晋级 champion</n-button>
+                  <n-button v-if="isPromptExperiment(r) && r.status === 'promoted'" size="tiny" type="error" :loading="acting" :disabled="busy || !!r.rollback_stale" @click="confirmRollback(r)">一键切回 champion</n-button>
+                  <n-button v-if="isKnownExperiment(r) && r.status !== 'promoted' && r.status !== 'abandoned' && r.status !== 'rolled_back'" size="tiny" :loading="acting" :disabled="busy" @click="act(r, 'abandon')">废弃</n-button>
                 </div>
                 <div v-if="isPromptExperiment(r) && detailAudits[r.id]?.length" class="exp-runs">
                   <div class="exp-runs-title">发布审计工件（{{ detailAudits[r.id].length }} 次，晋级门只认最新且要求内容 hash 匹配）</div>
@@ -548,13 +606,13 @@ async function submitCreate() {
               </div>
             </n-collapse-item>
           </n-collapse>
-          <div v-else class="exp-empty">暂无实验。新建后由「推荐影子实验采样」总开关控制是否实际采样。</div>
+          <div v-else-if="!loading && !loadError" class="exp-empty">暂无实验。新建后由「推荐影子实验采样」总开关控制是否实际采样。</div>
         </n-spin>
       </SectionCard>
     </div>
 
-    <n-modal v-model:show="showCreate" preset="card" title="新建推荐影子实验" class="exp-modal">
-      <n-form label-placement="top">
+    <n-modal v-model:show="showCreate" preset="card" title="新建推荐影子实验" class="exp-modal" :closable="!creating" :mask-closable="!creating" :close-on-esc="!creating">
+      <n-form label-placement="top" :disabled="creating">
         <n-form-item label="实验类型">
           <n-radio-group v-model:value="createForm.experiment_type">
             <n-radio-button value="prompt">Prompt challenger</n-radio-button>
@@ -597,14 +655,14 @@ async function submitCreate() {
       </n-form>
       <template #footer>
         <div class="exp-toolbar">
-          <n-button @click="showCreate = false">取消</n-button>
+          <n-button :disabled="creating" @click="showCreate = false">取消</n-button>
           <n-button type="primary" :loading="creating" @click="submitCreate">创建（draft）</n-button>
         </div>
       </template>
     </n-modal>
 
-    <n-modal :show="!!completeTarget" preset="card" title="完成实验" class="exp-modal" @update:show="(v: boolean) => { if (!v) completeTarget = null }">
-      <n-form label-placement="top">
+    <n-modal :show="!!completeTarget" preset="card" title="完成实验" class="exp-modal" :closable="!acting" :mask-closable="!acting" :close-on-esc="!acting" @update:show="(v: boolean) => { if (!v && !acting) completeTarget = null }">
+      <n-form label-placement="top" :disabled="acting">
         <n-alert v-if="completeTarget && isScoreBlind(completeTarget)" type="warning" :show-icon="false" :bordered="false" class="exp-create-alert">
 		  此处仅记录管理员的人工判断，不代表已满足锁定协议，也不会开放 prompt 晋级动作；协议成熟度与护栏以“选股配对评估”页为准。
         </n-alert>
@@ -621,7 +679,7 @@ async function submitCreate() {
       </n-form>
       <template #footer>
         <div class="exp-toolbar">
-          <n-button @click="completeTarget = null">取消</n-button>
+          <n-button :disabled="acting" @click="completeTarget = null">取消</n-button>
           <n-button type="primary" :loading="acting" @click="submitComplete">提交</n-button>
         </div>
       </template>

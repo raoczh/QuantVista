@@ -52,9 +52,17 @@ const { displayMode, setMode } = useDisplayMode()
 const rows = computed(() =>
   buildPositionDecisionRows(props.positions, props.focusedPositionId, props.focusedAssessment),
 )
-const urgentCount = computed(() => rows.value.filter((row) => row.assessment.level === 'urgent').length)
-const reviewCount = computed(() => rows.value.filter((row) => row.assessment.level === 'review').length)
-const lastEvaluatedAt = computed(() => latestDecisionTime(rows.value))
+const holdingPositions = computed(() => props.positions.filter((position) => position.status === 'holding'))
+const currentAssessments = computed(() => holdingPositions.value
+  .map((position) => position.exit_assessment)
+  .filter((assessment): assessment is PositionExitAssessment => !!assessment))
+const urgentCount = computed(() => currentAssessments.value.filter((assessment) => assessment.level === 'urgent').length)
+const reviewCount = computed(() => currentAssessments.value.filter((assessment) => assessment.level === 'review').length)
+const lastEvaluatedAt = computed(() => latestDecisionTime(currentAssessments.value.map((assessment) => ({ assessment }))))
+const incompleteCount = computed(() => holdingPositions.value.filter((position) =>
+  !position.exit_assessment || position.exit_assessment.data_status !== 'ready' || position.exit_assessment.level === 'unknown').length)
+const countsKnown = computed(() => props.positions.length > 0 || (!!props.overview && !props.loading && !props.error))
+const missingQuotes = computed(() => (props.overview?.quote_failed_count || 0) + (props.overview?.quote_stale_count || 0))
 const styleVars = computed(() => ({
   '--decision-border': themeVars.value.dividerColor,
   '--decision-muted': themeVars.value.textColor3,
@@ -83,7 +91,7 @@ function dataStatusType(status: PositionExitAssessment['data_status']) {
 }
 
 function levelType(level: PositionExitAssessment['level']) {
-  return level === 'urgent' ? 'error' : 'warning'
+  return level === 'urgent' ? 'error' : level === 'normal' ? 'success' : level === 'unknown' ? 'default' : 'warning'
 }
 </script>
 
@@ -111,32 +119,38 @@ function levelType(level: PositionExitAssessment['level']) {
     <div class="decision-summary" aria-label="持仓风险摘要">
       <div class="summary-item is-urgent">
         <span>紧急处理</span>
-        <strong class="qv-tnum">{{ urgentCount }}</strong>
+        <strong class="qv-tnum">{{ countsKnown ? urgentCount : '—' }}</strong>
       </div>
       <div class="summary-item is-review">
         <span>需要复核</span>
-        <strong class="qv-tnum">{{ reviewCount }}</strong>
+        <strong class="qv-tnum">{{ countsKnown ? reviewCount : '—' }}</strong>
       </div>
       <div class="summary-item">
         <span>持仓总盈亏</span>
         <strong class="qv-tnum" :style="{ color: pctColor(overview?.total_profit || 0) }">
-          {{ overview ? fmtMoney(overview.total_profit) : '—' }}
+          {{ overview && !overview.currency_unavailable_reason && !overview.valuation_unavailable_reason && (!overview.holding_count || missingQuotes < overview.holding_count) ? fmtMoney(overview.total_profit) : '—' }}
         </strong>
+        <small v-if="overview?.currency_unavailable_reason">{{ overview.currency_unavailable_reason }}</small>
+        <small v-else-if="overview?.valuation_unavailable_reason">{{ overview.valuation_unavailable_reason }}</small>
+        <small v-else-if="missingQuotes">{{ missingQuotes }} 笔行情不可用，盈亏仅含已定价部分</small>
       </div>
       <div class="summary-item">
         <span>最后评估</span>
-        <strong>{{ fmtTime(lastEvaluatedAt) }}</strong>
+        <strong>{{ countsKnown ? fmtTime(lastEvaluatedAt) : '暂时未知' }}</strong>
       </div>
     </div>
 
     <n-alert v-if="error" type="error" :bordered="false" title="持仓风险读取失败">
-      {{ error }}
+      {{ error }}<template v-if="positions.length">。以下保留最近读取的持仓与评估。</template>
+    </n-alert>
+    <n-alert v-else-if="incompleteCount" type="warning" :bordered="false">
+      {{ incompleteCount }} 笔持仓尚无完整风险评估，请到“全部持仓”核对行情和评估状态。
     </n-alert>
 
     <n-spin :show="loading && !positions.length">
       <n-empty
         v-if="!loading && !error && !rows.length"
-        description="当前没有需要处理的持仓"
+        :description="incompleteCount ? '当前没有已确认的处理项，仍有持仓待完成评估' : '当前没有需要处理的持仓'"
       />
       <div v-else class="decision-list">
         <article
@@ -167,7 +181,7 @@ function levelType(level: PositionExitAssessment['level']) {
 
           <div class="decision-facts">
             <div>
-              <span>当前盈亏</span>
+              <span>{{ row.position.status === 'closed' ? '已实现盈亏' : '当前盈亏' }}</span>
               <strong class="qv-tnum" :style="{ color: pctColor(row.position.profit_amount) }">
                 {{ row.position.quote_ok ? fmtMoney(row.position.profit_amount) : '暂时未知' }}
               </strong>
@@ -188,10 +202,11 @@ function levelType(level: PositionExitAssessment['level']) {
             <p>{{ row.assessment.primary_reason || '当前评估没有提供主因' }}</p>
           </div>
           <div class="asof-line">
+            最近评估 {{ fmtTime(row.assessment.evaluated_at) }} ·
             <TermHelp term="as_of" />：行情 {{ row.assessment.quote_as_of || '未知' }} · 日线
             {{ row.assessment.bars_as_of || '未知' }}
           </div>
-          <div v-if="row.assessment.data_gaps.length" class="data-gaps">
+          <div v-if="row.assessment.data_gaps?.length" class="data-gaps">
             <TermHelp :term="row.assessment.data_status === 'partial' ? 'partial' : 'unknown'" />：
             {{ row.assessment.data_gaps.join('；') }}
           </div>
@@ -204,7 +219,7 @@ function levelType(level: PositionExitAssessment['level']) {
               type="primary"
               size="small"
               :loading="adviceLoading && adviceTargetPositionId === row.position.id"
-              :disabled="adviceLoading && adviceTargetPositionId !== row.position.id"
+              :disabled="row.position.status !== 'holding' || (adviceLoading && adviceTargetPositionId !== row.position.id)"
               @click="emit('review', row.position)"
             >AI 复核</n-button>
           </div>
@@ -218,7 +233,7 @@ function levelType(level: PositionExitAssessment['level']) {
                 <p>MA20：{{ row.assessment.ma20 || '未知' }}；MA60：{{ row.assessment.ma60 || '未知' }}</p>
                 <p>趋势状态：{{ row.assessment.trend }}；评估版本：{{ row.assessment.version || '未知' }}</p>
               </template>
-              <p v-if="!row.assessment.evidence.length">本次没有额外原始证据。</p>
+              <p v-if="!row.assessment.evidence?.length">本次没有额外原始证据。</p>
             </div>
           </details>
         </article>
@@ -232,6 +247,7 @@ function levelType(level: PositionExitAssessment['level']) {
       {{ adviceError }}
     </n-alert>
     <section v-if="advice" class="advice-result" aria-label="AI 复核结果">
+      <small>基于生成时的持仓与行情 · {{ fmtTime(advice.generated_at) }}</small>
       <div v-for="item in advice.advices" :key="item.position_id" class="advice-row">
         <StockIdentity :symbol="item.symbol" market="cn" :name="item.name" density="table" />
         <n-tag size="small" :bordered="false">{{ POSITION_VERDICT_LABEL[item.verdict] }}</n-tag>
@@ -406,9 +422,7 @@ function levelType(level: PositionExitAssessment['level']) {
   .decision-header,
   .card-heading,
   .next-action { flex-direction: column; }
-  .decision-summary { grid-template-columns: 1fr; }
-  .summary-item { border-right: 0; }
-  .summary-item:not(:last-child) { border-bottom: 1px solid var(--decision-border); }
+  .summary-item { padding: 11px 12px; }
   .decision-tools,
   .next-action :deep(.n-button) { width: 100%; }
   .next-action :deep(.n-button) { min-height: 36px; }

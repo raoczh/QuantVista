@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -172,27 +173,12 @@ func normalizeTradeStatRange(raw string) (string, int, bool) {
 	return tradeStatRangeAll, 0, false
 }
 
-// countOpenTradeDaysBetween 统计 (from, to] 的开市日数；日历不可用或日期非法返回 false。
-// 与 countOpenTradeDaysAfter 同源口径（交易日历唯一权威，不用自然日近似）。
-func countOpenTradeDaysBetween(market, from, to string) (int, bool) {
-	if common.DB == nil || from == "" || to == "" || to < from {
-		return 0, false
-	}
-	var total int64
-	common.DB.Model(&model.TradingCalendar{}).Where("market = ?", market).Count(&total)
-	if total == 0 {
-		return 0, false
-	}
-	var n int64
-	common.DB.Model(&model.TradingCalendar{}).
-		Where("market = ? AND is_open = ? AND trade_date > ? AND trade_date <= ?", market, true, from, to).
-		Count(&n)
-	return int(n), true
-}
-
 // TradeStats 个人交易复盘统计（仅本人已平仓持仓 + 其流水）。
 func (s *PositionService) TradeStats(ctx context.Context, userID int64, rangeKey string) (*TradeStats, error) {
-	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	account, err := ResolvePortfolioAccountContext(ctx, userID, 0, model.PortfolioKindReal)
 	if err != nil {
 		return nil, err
 	}
@@ -203,9 +189,6 @@ func (s *PositionService) TradeStats(ctx context.Context, userID int64, rangeKey
 func (s *PositionService) TradeStatsByAccount(ctx context.Context, userID, accountID int64, rangeKey string) (*TradeStats, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
-	}
-	if _, err := PortfolioAccountByID(userID, accountID, model.PortfolioKindReal); err != nil {
-		return nil, err
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -221,57 +204,46 @@ func (s *PositionService) TradeStatsByAccount(ctx context.Context, userID, accou
 	if !valid {
 		out.Notes = append(out.Notes, fmt.Sprintf("未识别的时间范围 %q，已回落为全部历史", rangeKey))
 	}
-	q := common.DB.WithContext(ctx).Where("user_id = ? AND account_id = ? AND status = ?", userID, accountID, model.PositionStatusClosed)
+	now := time.Now()
 	if days > 0 {
-		from := time.Now().AddDate(0, 0, -days).Format("2006-01-02")
-		out.RangeFrom = from
+		out.RangeFrom = now.AddDate(0, 0, -days).Format("2006-01-02")
 		// 无卖出日期的老记录在限定窗口下无法归期：如实排除并在 Notes 说明。
-		q = q.Where("sell_date >= ?", from)
+		out.Notes = append(out.Notes, "无卖出日期的历史记录无法归入时间窗口，仅在「全部历史」下可见")
 	}
-	var positions []model.Position
-	if err := q.Order("sell_date DESC, id DESC").Limit(tradeStatMaxRows).Find(&positions).Error; err != nil {
+	facts, err := readTradeStatFacts(ctx, userID, accountID, out.RangeFrom, now.Format("2006-01-02"))
+	if err != nil {
 		return nil, err
 	}
+	positions := facts.positions
 	if len(positions) == 0 {
 		out.Notes = append(out.Notes, tradeStatBaseNotes(normalized)...)
 		out.Notes = append(out.Notes, "当前窗口内没有已平仓记录，各项指标暂无法计算（不是 0%，是没有样本）")
 		return out, nil
 	}
-	// 补齐账本：老持仓无流水时 TotalBuyCost=0，先补建再统计，否则收益率分母为 0。
-	backfillPositionLedgers(userID, positions)
-	// 重读补建后的汇总列。user_id 条件不可省（全链路隔离铁律，即使 ids 已来自本人）。
-	if err := common.DB.WithContext(ctx).Where("user_id = ? AND account_id = ? AND id IN ?", userID, accountID, positionIDs(positions)).
-		Order("sell_date DESC, id DESC").Find(&positions).Error; err != nil {
-		return nil, err
-	}
-
-	symbols := make([]string, 0, len(positions))
-	for _, p := range positions {
-		symbols = append(symbols, p.Symbol)
-	}
-	industries := industriesFor(symbols)
-
 	rows := make([]tradeStatRow, 0, len(positions))
-	missingIndustry, missingSellDate := 0, 0
+	missingIndustry, missingCurrency, missingLedger := 0, 0, 0
 	for _, p := range positions {
-		r := tradeStatRow{pos: p, industry: industries[p.Symbol]}
-		if r.industry == "" {
-			missingIndustry++
+		if positionCurrencyIssue(p, "CNY") != "" {
+			missingCurrency++
+			continue
 		}
-		// 账本口径优先；旧记录（补建失败等）回退原算式，绝不因缺列少算一笔。
+		r := tradeStatRow{pos: p, industry: facts.industries[p.Symbol]}
+		// 已有汇总优先。仅无成交明细且原始买卖字段完整的旧记录可按原式只读验算。
 		if p.TotalBuyCost > 0 {
 			r.realizedPnl, r.buyCost = p.RealizedPnl, p.TotalBuyCost
-		} else {
+		} else if !facts.legacyHasTrades[p.ID] && p.BuyPrice > 0 && p.SellPrice > 0 && p.Quantity > 0 {
 			r.buyCost = round4(p.BuyPrice*p.Quantity + p.BuyFee + p.BuyTax)
 			r.realizedPnl = round4(p.SellPrice*p.Quantity - p.SellFee - p.SellTax - r.buyCost)
 		}
-		if r.buyCost > 0 {
-			r.returnPct = round2(r.realizedPnl / r.buyCost * 100)
+		if r.buyCost <= 0 || math.IsNaN(r.buyCost) || math.IsInf(r.buyCost, 0) || math.IsNaN(r.realizedPnl) || math.IsInf(r.realizedPnl, 0) {
+			missingLedger++
+			continue
 		}
-		if p.SellDate == "" {
-			missingSellDate++
+		r.returnPct = round2(r.realizedPnl / r.buyCost * 100)
+		if r.industry == "" {
+			missingIndustry++
 		}
-		if d, ok := countOpenTradeDaysBetween(p.Market, p.BuyDate, p.SellDate); ok && p.BuyDate != "" && p.SellDate != "" {
+		if d, ok := facts.calendars[tradeStatMarket(p.Market)].count(p.BuyDate, p.SellDate); ok {
 			r.holdDays, r.hasHoldDays = d, true
 		}
 		rows = append(rows, r)
@@ -314,21 +286,24 @@ func (s *PositionService) TradeStatsByAccount(ctx context.Context, userID, accou
 	out.Lessons = tradeStatLessons(rows)
 
 	out.Notes = append(out.Notes, tradeStatBaseNotes(normalized)...)
+	if missingCurrency > 0 {
+		out.Notes = append(out.Notes, fmt.Sprintf("%d 笔记录的币种不能与 CNY 合计，未计入本页盈亏、胜率和分布；当前统计仅包含可核验的 CNY 样本", missingCurrency))
+	}
+	if missingLedger > 0 {
+		out.Notes = append(out.Notes, fmt.Sprintf("%d 笔记录缺少可核验的累计成本或成交事实，未计入统计；请先核对历史账本", missingLedger))
+	}
 	if out.ProfitFactor == nil {
 		out.Notes = append(out.Notes, "窗口内没有亏损交易，盈亏比无定义（分母为 0）——不是「无穷大」，是样本不足以给出该比值")
 	}
 	if out.HoldSample < out.Closed {
 		out.Notes = append(out.Notes, fmt.Sprintf(
-			"%d/%d 笔缺买卖日期或所在市场无交易日历，未计入平均持有交易日", out.Closed-out.HoldSample, out.Closed))
+			"%d/%d 笔买卖日期无效或所在市场交易日历不完整，未计入平均持有交易日", out.Closed-out.HoldSample, out.Closed))
 	}
 	if missingIndustry > 0 {
 		out.Notes = append(out.Notes, fmt.Sprintf(
 			"%d 笔标的行业未知（宇宙快照未覆盖），已单列「行业未知」不摊派到其它行业", missingIndustry))
 	}
-	if missingSellDate > 0 && days > 0 {
-		out.Notes = append(out.Notes, "无卖出日期的历史记录无法归入时间窗口，仅在「全部历史」下可见")
-	}
-	if len(positions) >= tradeStatMaxRows {
+	if facts.truncated {
 		out.Notes = append(out.Notes, fmt.Sprintf("样本超过 %d 笔上限，仅统计最近的部分", tradeStatMaxRows))
 	}
 	return out, nil

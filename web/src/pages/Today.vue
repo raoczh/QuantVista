@@ -29,6 +29,8 @@ import {
   type TodoStatus,
 } from '@/api/todo'
 import { getEventCalendar, type CalendarEvent, type CalendarResult } from '@/api/event'
+import { isAbortError } from '@/api/client'
+import { getSessionEpoch } from '@/api/token'
 import {
   enumQuery,
   integerQuery,
@@ -61,10 +63,13 @@ const status = ref<TodoStatus>('needs_action')
 const scope = ref<TodoScope>('all')
 const source = ref('')
 const page = ref(1)
+const paginationTotal = ref(0)
 const selected = ref<string[]>([])
 const acting = ref('')
 let todoAbort: AbortController | null = null
 let todoSeq = 0
+let disposed = false
+const isCurrent = (owner: number) => !disposed && owner === getSessionEpoch()
 
 const statusOptions: { label: string; value: TodoStatus }[] = [
   { label: '需处理', value: 'needs_action' },
@@ -98,18 +103,16 @@ const sourceOptions = computed(() => [
     .map((value) => ({ label: sourceLabels[value] || value, value })),
 ])
 
-function isAbortError(error: unknown) {
-  const value = error as { name?: string; code?: string }
-  return value?.name === 'AbortError' || value?.code === 'ERR_CANCELED'
-}
-
 async function load() {
+  if (disposed) return
+  const owner = getSessionEpoch()
   todoAbort?.abort()
   const ctrl = new AbortController()
   todoAbort = ctrl
   const seq = ++todoSeq
-  if (data.value && (data.value.scope !== scope.value || data.value.status !== status.value || data.value.source !== source.value)) {
+  if (data.value && (data.value.scope !== scope.value || data.value.status !== status.value || data.value.source !== source.value || data.value.page !== page.value)) {
     data.value = null
+    selected.value = []
   }
   loading.value = true
   todoError.value = ''
@@ -125,15 +128,16 @@ async function load() {
       },
       ctrl.signal,
     )
-    if (seq !== todoSeq) return
+    if (seq !== todoSeq || !isCurrent(owner)) return
     data.value = result
+    paginationTotal.value = result.matched_total
     selected.value = []
   } catch (error) {
-    if (seq !== todoSeq || isAbortError(error)) return
+    if (seq !== todoSeq || !isCurrent(owner) || isAbortError(error)) return
     todoError.value = (error as Error).message
     message.error(todoError.value)
   } finally {
-    if (seq === todoSeq) loading.value = false
+    if (seq === todoSeq && isCurrent(owner)) loading.value = false
   }
 }
 
@@ -147,6 +151,9 @@ function changeFilter() {
 // 重置页码）由 Vue 批处理合并为一次加载；in-flight 请求由 load 内的 abort 兜底。
 watch([status, scope, source, page], () => {
   void load()
+})
+watch([status, scope, source], () => {
+  paginationTotal.value = 0
 })
 
 function kindMeta(kind: string) {
@@ -206,16 +213,18 @@ const canBatchRead = computed(
 )
 
 async function runAction(action: TodoInboxAction, refs: TodoSourceRef[], key: string) {
-  if (acting.value) return
+  if (disposed || acting.value) return
+  const owner = getSessionEpoch()
   acting.value = key
   try {
     await updateTodoInbox(action, refs)
+    if (!isCurrent(owner)) return
     message.success(action === 'read' ? '已收下' : action === 'snooze' ? '已安排明天再说' : '今天不再提醒')
     await load()
   } catch (error) {
-    message.error((error as Error).message)
+    if (isCurrent(owner) && !isAbortError(error)) message.error((error as Error).message)
   } finally {
-    acting.value = ''
+    if (isCurrent(owner)) acting.value = ''
   }
 }
 
@@ -280,8 +289,9 @@ useRouteQueryState(route, router, [
 const { restoreScroll } = useListPageScroll(route, 'today')
 
 onMounted(async () => {
+  const owner = getSessionEpoch()
   await load()
-  await restoreScroll()
+  if (isCurrent(owner)) await restoreScroll()
 })
 
 const calendar = ref<CalendarResult | null>(null)
@@ -291,17 +301,20 @@ let calAbort: AbortController | null = null
 const futureEvents = computed(() => (calendar.value?.events || []).filter((event) => event.days_left >= 0))
 
 async function loadCalendar() {
+  if (disposed) return
+  const owner = getSessionEpoch()
   calAbort?.abort()
   const ctrl = new AbortController()
   calAbort = ctrl
   calLoading.value = true
   calError.value = ''
   try {
-    calendar.value = await getEventCalendar(30, ctrl.signal)
+    const result = await getEventCalendar(30, ctrl.signal)
+    if (calAbort === ctrl && isCurrent(owner)) calendar.value = result
   } catch (error) {
-    if (!isAbortError(error)) calError.value = (error as Error).message
+    if (calAbort === ctrl && isCurrent(owner) && !isAbortError(error)) calError.value = (error as Error).message
   } finally {
-    if (calAbort === ctrl) calLoading.value = false
+    if (calAbort === ctrl && isCurrent(owner)) calLoading.value = false
   }
 }
 
@@ -338,6 +351,7 @@ function openEvent(event: CalendarEvent) {
 
 onMounted(loadCalendar)
 onBeforeUnmount(() => {
+  disposed = true
   todoSeq++
   todoAbort?.abort()
   calAbort?.abort()
@@ -391,7 +405,7 @@ onBeforeUnmount(() => {
           </n-alert>
 
           <n-empty
-            v-if="data && !data.items.length"
+            v-if="data && !data.items.length && !loading && !todoError"
             :description="data.partial ? '当前没有已知事项，部分来源状态未知' : '这个筛选下没有事项'"
             class="empty"
           />
@@ -459,22 +473,21 @@ onBeforeUnmount(() => {
                 <n-button v-if="item.ref_type !== 'ipo'" size="small" tertiary @click="handle(item)">去处理</n-button>
               </div>
               <n-dropdown
-                class="mobile-actions"
                 trigger="click"
                 :options="actionOptions(item)"
                 @select="(key) => handleGroupMenu(item, String(key))"
               >
-                <n-button circle quaternary title="事项操作" aria-label="事项操作">⋯</n-button>
+                <n-button class="mobile-actions" circle quaternary title="事项操作" aria-label="事项操作">⋯</n-button>
               </n-dropdown>
             </article>
           </div>
         </n-spin>
 
         <n-pagination
-          v-if="(status === 'completed' || status === 'all') && (data?.matched_total || 0) > 20"
+          v-if="(status === 'completed' || status === 'all') && paginationTotal > 20"
           v-model:page="page"
           :page-size="20"
-          :item-count="data?.matched_total || 0"
+          :item-count="paginationTotal"
           class="pagination"
         />
       </SectionCard>
@@ -490,7 +503,7 @@ onBeforeUnmount(() => {
           <n-alert v-else-if="calendar?.complete === false" type="warning" :bordered="false" class="partial" title="事件清单不完整">
             <div v-for="(error, index) in calendar.errors || []" :key="index">{{ error }}</div>
           </n-alert>
-          <n-empty v-if="calendar && !futureEvents.length" description="后续 30 天没有已知事件" class="empty" />
+          <n-empty v-if="calendar && !futureEvents.length && !calLoading && !calError" description="后续 30 天没有已知事件" class="empty" />
           <div v-else class="events">
             <button v-for="event in futureEvents" :key="`${event.kind}-${event.date}-${event.symbol}`" type="button" class="event" @click="openEvent(event)">
               <span class="event-date"><strong class="qv-tnum">{{ event.date.slice(5) }}</strong><small>{{ daysLabel(event.days_left) }}</small></span>
@@ -499,7 +512,7 @@ onBeforeUnmount(() => {
                 <span class="event-head">
                   <n-tag size="tiny" :bordered="false">{{ eventMeta(event.kind).label }}</n-tag>
                   <n-tag v-if="event.relation !== 'market'" size="tiny" :bordered="false" type="info">{{ relationLabel(event.relation) }}</n-tag>
-                  <StockIdentity :symbol="event.symbol" :market="event.market || 'cn'" :name="event.name" density="table" clickable />
+                  <StockIdentity :symbol="event.symbol" :market="event.market || 'cn'" :name="event.name" density="table" />
                 </span>
                 <small>{{ event.detail }}</small>
               </span>
@@ -727,6 +740,14 @@ onBeforeUnmount(() => {
   .mobile-actions {
     display: block;
     flex: 0 0 auto;
+  }
+  .child {
+    align-items: flex-start;
+  }
+  .child-main {
+    display: flex;
+    flex-direction: column;
+    overflow-wrap: anywhere;
   }
   .batch-bar {
     flex-wrap: wrap;

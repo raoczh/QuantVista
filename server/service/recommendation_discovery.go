@@ -1,13 +1,17 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"sort"
 	"strings"
 	"time"
 
 	"quantvista/common"
 	"quantvista/model"
+
+	"gorm.io/gorm"
 )
 
 const maxDiscoveryPoolIntake = 120
@@ -61,29 +65,41 @@ type discoveryAggregate struct {
 
 // recentDiscoveryCandidates 只读已落库事实，不调用宽表扫描。历史 score 仅进入摘要，
 // 返回 candidate.Score 保持零值，后续由 scorePool 基于当前行情重算。
-func recentDiscoveryCandidates(market string, limit int) []discoveryPoolCandidate {
-	if common.DB == nil || market != "cn" {
+func recentDiscoveryCandidates(market string, limit int, contexts ...context.Context) []discoveryPoolCandidate {
+	return recentDiscoveryCandidatesAt(jobSubmissionContext(contexts...), market, limit, time.Now())
+}
+
+func recentDiscoveryCandidatesAt(ctx context.Context, market string, limit int, asOf time.Time) []discoveryPoolCandidate {
+	if common.DB == nil || market != "cn" || ctx.Err() != nil {
 		return nil
 	}
 	if limit <= 0 || limit > maxDiscoveryPoolIntake {
 		limit = maxDiscoveryPoolIntake
 	}
 	var latest model.CandidateDiscoveryRun
-	if err := common.DB.Where("market = ? AND owner_type = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ? AND status IN ?", market, model.JobOwnerSystem, DiscoveryVersion, factorSnapshotVersion, discoveryParameterHash(), []string{DiscoveryRunStatusOK, DiscoveryRunStatusPart}).Order("trade_date DESC, id DESC").First(&latest).Error; err != nil {
-		return nil
-	}
-	dates := recentOpenDates(market, latest.TradeDate, 5)
-	if len(dates) == 0 || dates[len(dates)-1] != latest.TradeDate {
-		dates = append(dates, latest.TradeDate)
-	}
-	if len(dates) > 5 {
-		dates = dates[len(dates)-5:]
-	}
+	var dates []string
 	var rows []model.CandidateDiscoveryItem
-	query := common.DB.Joins("JOIN candidate_discovery_runs AS discovery_run ON discovery_run.id = candidate_discovery_items.run_id").
-		Where("candidate_discovery_items.market = ? AND candidate_discovery_items.trade_date IN ? AND candidate_discovery_items.discovery_version = ? AND candidate_discovery_items.data_status IN ?", market, dates, latest.DiscoveryVersion, []string{DiscoveryItemReady, DiscoveryItemPartial}).
-		Where("discovery_run.owner_type = ? AND discovery_run.status IN ? AND discovery_run.factor_version = ? AND discovery_run.parameter_hash = ?", model.JobOwnerSystem, []string{DiscoveryRunStatusOK, DiscoveryRunStatusPart}, latest.FactorVersion, latest.ParameterHash)
-	if err := query.Order("candidate_discovery_items.trade_date DESC, candidate_discovery_items.channel ASC, candidate_discovery_items.rank ASC, candidate_discovery_items.symbol ASC").Find(&rows).Error; err != nil {
+	err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		if err := tx.Where("market = ? AND owner_type = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ? AND status IN ? AND trade_date <= ? AND as_of <= ?",
+			market, model.JobOwnerSystem, DiscoveryVersion, factorSnapshotVersion, discoveryParameterHash(), []string{DiscoveryRunStatusOK, DiscoveryRunStatusPart}, asOf.Format("2006-01-02"), asOf).
+			Order("trade_date DESC, id DESC").First(&latest).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		var err error
+		dates, err = recentOpenDatesDB(tx, market, asOf.Format("2006-01-02"), 5)
+		if err != nil || len(dates) == 0 {
+			return err
+		}
+		query := tx.Joins("JOIN candidate_discovery_runs AS discovery_run ON discovery_run.id = candidate_discovery_items.run_id").
+			Where("candidate_discovery_items.market = ? AND candidate_discovery_items.trade_date IN ? AND candidate_discovery_items.discovery_version = ? AND candidate_discovery_items.data_status IN ?", market, dates, latest.DiscoveryVersion, []string{DiscoveryItemReady, DiscoveryItemPartial}).
+			Where("discovery_run.owner_type = ? AND discovery_run.market = ? AND discovery_run.status IN ? AND discovery_run.factor_version = ? AND discovery_run.parameter_hash = ? AND discovery_run.as_of <= ?", model.JobOwnerSystem, market, []string{DiscoveryRunStatusOK, DiscoveryRunStatusPart}, latest.FactorVersion, latest.ParameterHash, asOf)
+		return query.Order("candidate_discovery_items.trade_date DESC, candidate_discovery_items.channel ASC, candidate_discovery_items.rank ASC, candidate_discovery_items.symbol ASC").Find(&rows).Error
+	})
+	if err != nil {
+		common.SysWarn("读取近期发现候选失败: %v", err)
 		return nil
 	}
 	aggs := map[string]*discoveryAggregate{}
@@ -187,7 +203,8 @@ func recentDiscoveryCandidates(market string, limit int) []discoveryPoolCandidat
 
 // enrichCandidatePromptContext 注入标题级真实新闻。窗口、条数和字段都有硬上限，
 // 不读取 Content/Summary，避免正文进入 prompt；RelatedSymbols 需精确包含当前代码。
-func enrichCandidatePromptContext(cands []candidate, asOf time.Time) {
+func enrichCandidatePromptContext(cands []candidate, asOf time.Time, contexts ...context.Context) {
+	ctx := jobSubmissionContext(contexts...)
 	if common.DB == nil || len(cands) == 0 {
 		return
 	}
@@ -197,7 +214,7 @@ func enrichCandidatePromptContext(cands []candidate, asOf time.Time) {
 	from := asOf.AddDate(0, 0, -7)
 	for i := range cands {
 		var rows []model.News
-		if err := common.DB.Select("title", "source", "publish_time", "sentiment", "sentiment_score", "related_symbols").Where("publish_time >= ? AND publish_time <= ? AND related_symbols LIKE ?", from, asOf, "%\""+cands[i].Symbol+"\"%").Order("publish_time DESC, source_priority ASC, id DESC").Limit(3).Find(&rows).Error; err != nil {
+		if err := common.DB.WithContext(ctx).Select("title", "source", "publish_time", "sentiment", "sentiment_score", "related_symbols").Where("publish_time >= ? AND publish_time <= ? AND related_symbols LIKE ?", from, asOf, "%\""+cands[i].Symbol+"\"%").Order("publish_time DESC, source_priority ASC, id DESC").Limit(3).Find(&rows).Error; err != nil {
 			continue
 		}
 		for _, row := range rows {

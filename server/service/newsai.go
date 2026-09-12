@@ -14,6 +14,7 @@ import (
 	"quantvista/model"
 	"quantvista/setting"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -152,11 +153,11 @@ func filterSectors(in []string) []string {
 
 // resolveNewsLLM 新闻增强用的系统级 LLM：首个管理员的默认配置。
 // 返回 (cfg, key, adminID, error)。无管理员/无配置时报错，调用方降级规则表。
-func resolveNewsLLM() (*model.LLMConfig, string, int64, error) {
+func resolveNewsLLM(contexts ...context.Context) (*model.LLMConfig, string, int64, error) {
 	// 系统默认 LLM：管理后台指定的回退配置优先，否则首个启用管理员的默认配置。
 	// 不受"LLM 回退"用户开关控制（新闻分析是系统后台任务，由 news_auto_llm 总闸管）。
 	var cfg model.LLMConfig
-	if err := resolveSystemFallbackConfig(&cfg); err != nil {
+	if err := resolveSystemFallbackConfig(&cfg, contexts...); err != nil {
 		return nil, "", 0, err
 	}
 	key, err := common.Decrypt(cfg.APIKeyCipher)
@@ -223,7 +224,7 @@ func enhanceBatchLLM(ctx context.Context, cfg *model.LLMConfig, apiKey string, a
 	res, err := chatCompletion(ctx, chatParams{
 		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 		ReasoningEffort: cfg.ReasoningEffort,
-		Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("news", cfg.MaxTokens),
+		Temperature:     cfg.Temperature, MaxTokens: moduleTokenCap("news", cfg.MaxTokens),
 		Messages: messages,
 		JSONMode: true, AllowPrivate: allowPrivate,
 		Meta: run.chatMeta(adminID, cfg, 1),
@@ -233,7 +234,7 @@ func enhanceBatchLLM(ctx context.Context, cfg *model.LLMConfig, apiKey string, a
 		return nil, err
 	}
 	if res.Usage.TotalTokens > 0 {
-		consumeQuota(adminID, res.Usage.TotalTokens, false) // 后台任务：只记 token 审计，不扣次数
+		consumeQuota(adminID, res.Usage.TotalTokens) // 后台任务：只记 token 审计，不扣次数
 	}
 	var out struct {
 		Items []newsEnhanceItem `json:"items"`
@@ -270,6 +271,9 @@ func normalizeEnhance(it newsEnhanceItem) newsEnhanceItem {
 		(it.Sentiment == "negative" && it.SentimentScore > 0) {
 		it.SentimentScore = 0
 	}
+	if it.Sentiment == "neutral" {
+		it.SentimentScore = max(-0.1, min(0.1, it.SentimentScore))
+	}
 	switch strings.ToLower(strings.TrimSpace(it.ImpactScope)) {
 	case "market", "sector", "stock":
 		it.ImpactScope = strings.ToLower(strings.TrimSpace(it.ImpactScope))
@@ -284,36 +288,39 @@ func normalizeEnhance(it newsEnhanceItem) newsEnhanceItem {
 }
 
 // persistEnhance 落库一条增强结果（幂等：只更新增强字段）。
-func persistEnhance(id int64, sentiment string, score float64, sectors []string, scope string, level int) {
+func persistEnhance(ctx context.Context, id int64, sentiment string, score float64, sectors []string, scope string, level int) bool {
 	sectorsJSON := ""
 	if len(sectors) > 0 {
 		if b, err := json.Marshal(sectors); err == nil {
 			sectorsJSON = string(b)
 		}
 	}
-	if err := common.DB.Model(&model.News{}).Where("id = ?", id).Updates(map[string]any{
+	res := common.DB.WithContext(ctx).Model(&model.News{}).Where("id = ? AND sentiment = ''", id).Updates(map[string]any{
 		"sentiment": sentiment, "sentiment_score": round2(score),
 		"related_sectors": sectorsJSON, "impact_scope": scope, "policy_level": level,
-	}).Error; err != nil {
-		common.SysWarn("新闻情绪增强落库失败(id=%d): %v", id, err)
+	})
+	if res.Error != nil {
+		common.SysWarn("新闻情绪增强落库失败(id=%d): %v", id, res.Error)
 	}
+	return res.Error == nil && res.RowsAffected > 0
 }
 
 // EnhanceNewsRound 一轮情绪增强：挑近 48h 未增强的新闻（Sentiment 为空），
 // 按来源优先级分流 LLM / 规则。挂新闻采集定时器之后调用。
 func (s *NewsService) EnhanceNewsRound(ctx context.Context) {
-	if common.DB == nil {
+	if common.DB == nil || ctx.Err() != nil {
 		return
 	}
 	var rows []model.News
-	if err := common.DB.
+	now := time.Now()
+	if err := common.DB.WithContext(ctx).
 		Select("id, title, summary, content, source_priority, related_symbols").
-		Where("sentiment = '' AND publish_time > ?", time.Now().Add(-newsAIWindow)).
+		Where("sentiment = '' AND publish_time > ? AND publish_time <= ?", now.Add(-newsAIWindow), now).
 		Order("source_priority ASC, id ASC").Limit(newsAIRoundCap).Find(&rows).Error; err != nil || len(rows) == 0 {
 		return
 	}
 
-	cfg, apiKey, adminID, llmErr := resolveNewsLLM()
+	cfg, apiKey, adminID, llmErr := resolveNewsLLM(ctx)
 	// 管理后台总闸：关闭自动 LLM 时等价于"LLM 不可用"，走既有的纯规则降级通路。
 	if llmErr == nil && !setting.NewsAutoLLM() {
 		llmErr = errors.New("已关闭自动 LLM 新闻分析")
@@ -324,6 +331,9 @@ func (s *NewsService) EnhanceNewsRound(ctx context.Context) {
 	var llmQueue []model.News
 	simplifiedUsed := 0
 	for _, n := range rows {
+		if ctx.Err() != nil {
+			return
+		}
 		switch {
 		case n.SourcePriority <= 2 && llmErr == nil:
 			llmQueue = append(llmQueue, n)
@@ -334,12 +344,14 @@ func (s *NewsService) EnhanceNewsRound(ctx context.Context) {
 				llmQueue = append(llmQueue, n)
 				continue
 			}
-			persistEnhance(n.ID, senti, score, sectors, "stock", 0)
-			atomic.AddInt64(&newsAIEnhanced, 1)
+			if persistEnhance(ctx, n.ID, senti, score, sectors, "stock", 0) {
+				atomic.AddInt64(&newsAIEnhanced, 1)
+			}
 		default:
 			senti, score, sectors, _ := applySentimentRules(n.Title, n.Summary)
-			persistEnhance(n.ID, senti, score, sectors, "", 0)
-			atomic.AddInt64(&newsAIEnhanced, 1)
+			if persistEnhance(ctx, n.ID, senti, score, sectors, "", 0) {
+				atomic.AddInt64(&newsAIEnhanced, 1)
+			}
 		}
 	}
 
@@ -347,26 +359,34 @@ func (s *NewsService) EnhanceNewsRound(ctx context.Context) {
 	// P0-2：同一增强轮共享一个 trace（每批一个 run），管理端按 trace 可看整轮调用。
 	roundTrace := newLLMTraceID()
 	for i := 0; i < len(llmQueue); i += newsAIBatchSize {
+		if ctx.Err() != nil {
+			return
+		}
 		end := i + newsAIBatchSize
 		if end > len(llmQueue) {
 			end = len(llmQueue)
 		}
 		batch := llmQueue[i:end]
 		results, err := enhanceBatchLLM(ctx, cfg, apiKey, allowPrivate, batch, adminID, roundTrace)
+		if ctx.Err() != nil {
+			return // 超时/取消的未处理条目留给下一轮，不永久降级成规则结果。
+		}
 		for _, n := range batch {
 			if err == nil {
 				if it, ok := results[n.ID]; ok {
 					it = normalizeEnhance(it)
-					persistEnhance(n.ID, it.Sentiment, it.SentimentScore, it.RelatedSectors, it.ImpactScope, it.PolicyLevel)
-					atomic.AddInt64(&newsAILLMCalls, 1)
-					atomic.AddInt64(&newsAIEnhanced, 1)
+					if persistEnhance(ctx, n.ID, it.Sentiment, it.SentimentScore, it.RelatedSectors, it.ImpactScope, it.PolicyLevel) {
+						atomic.AddInt64(&newsAILLMCalls, 1)
+						atomic.AddInt64(&newsAIEnhanced, 1)
+					}
 					continue
 				}
 			}
 			// LLM 失败或漏了这条：规则兜底。
 			senti, score, sectors, _ := applySentimentRules(n.Title, n.Summary)
-			persistEnhance(n.ID, senti, score, sectors, "", 0)
-			atomic.AddInt64(&newsAIEnhanced, 1)
+			if persistEnhance(ctx, n.ID, senti, score, sectors, "", 0) {
+				atomic.AddInt64(&newsAIEnhanced, 1)
+			}
 		}
 		if err != nil {
 			common.SysWarn("新闻情绪增强 LLM 批次失败，本批已降级规则: %v", err)
@@ -406,7 +426,8 @@ func sentimentAggregateCacheFresh(row *model.StockSentiment, date string, now ti
 	}
 	today := now.In(time.Local).Format("2006-01-02")
 	if date < today {
-		return true
+		dayStart, err := time.ParseInLocation("2006-01-02", date, time.Local)
+		return err == nil && !row.UpdatedAt.Before(dayStart.AddDate(0, 0, 1))
 	}
 	if date > today {
 		return false
@@ -450,7 +471,7 @@ func stockDailySentimentAt(symbol, date string, now time.Time) (float64, int, bo
 		// 新闻永远进不了当日情绪。空结果不落库、每次现算（轻查询），新闻到位自然生效。
 		// 非空结果按采集间隔 upsert；每个推荐批次仍把实际结果固化进候选快照。
 		if count > 0 {
-			row = model.StockSentiment{Symbol: symbol, Date: date, Score: score, NewsCount: count, DetailJSON: detail}
+			row = model.StockSentiment{Symbol: symbol, Date: date, Score: score, NewsCount: count, DetailJSON: detail, UpdatedAt: now}
 			common.DB.Clauses(clause.OnConflict{
 				Columns:   []clause.Column{{Name: "symbol"}, {Name: "date"}},
 				DoUpdates: clause.AssignmentColumns([]string{"score", "news_count", "detail_json", "updated_at"}),
@@ -562,13 +583,17 @@ const newsBriefMaxAge = 7 * 24 * time.Hour
 // P1-4 起经 latestNewsWindow 消费（briefs 与窗口声明同刻构建）。查询失败以 error 区分
 // 「确无」与「没查到」（审查修复批：不再吞错——window_meta.source_query_status 消费）。
 func latestNewsBriefsAt(symbol string, limit int, now time.Time) ([]newsBrief, error) {
-	if common.DB == nil || len(symbol) != 6 {
+	return latestNewsBriefsDB(common.DB, symbol, limit, now)
+}
+
+func latestNewsBriefsDB(db *gorm.DB, symbol string, limit int, now time.Time) ([]newsBrief, error) {
+	if db == nil || !validNewsSymbol(symbol) {
 		return nil, nil
 	}
 	var rows []model.News
-	if err := common.DB.Select("title, sentiment, publish_time, source, category, source_priority, impact_scope").
+	if err := db.Select("title, sentiment, publish_time, source, category, source_priority, impact_scope").
 		Where("related_symbols LIKE ? AND publish_time >= ? AND publish_time <= ?", "%\""+symbol+"\"%", now.Add(-newsBriefMaxAge), now).
-		Order("publish_time DESC").Limit(limit).Find(&rows).Error; err != nil {
+		Order("publish_time DESC, id DESC").Limit(limit).Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	out := make([]newsBrief, 0, len(rows))
@@ -592,7 +617,8 @@ func latestNewsBriefsAt(symbol string, limit int, now time.Time) ([]newsBrief, e
 // 不再冒充多源一致）；③全部无情绪标注（未增强）时 alignment=unavailable（无从判定，
 // 不再误标 aligned）；④新增 total_in_window/injected_count/source_query_status——
 // 查询失败与「窗口内确无」显式分开。nw1：注入条目口径、主导比 0.7。
-const newsWindowVersion = "nw2"
+// nw3：只有身份明确且已有情绪标注的独立来源才能参与多源对齐。
+const newsWindowVersion = "nw3"
 
 // newsAlignmentDominantRatio 对齐分类阈值：正负两方向并存时，主导方向占
 // 方向性样本的比例 ≥ 该值为 mixed（主导但有杂音），否则 divergent（显著分歧）。
@@ -669,7 +695,7 @@ func buildNewsWindowMeta(stats []newsWindowStat, total, injected int, queryOK bo
 	return m
 }
 
-// computeSourceAlignment 方向对齐分类（nw2，完整窗口口径）：
+// computeSourceAlignment 方向对齐分类（nw3，完整窗口口径）：
 //   - 0 条=unavailable；
 //   - 独立来源 ≤1（无论条数）=single_source——同一媒体连发多条同向新闻不构成交叉验证；
 //   - 无任何方向样本：全部显式中性=aligned（多源一致中性），否则（含未增强/无标注条目
@@ -682,7 +708,10 @@ func computeSourceAlignment(stats []newsWindowStat) string {
 	srcs := map[string]bool{}
 	pos, neg, neutral := 0, 0, 0
 	for _, s := range stats {
-		srcs[strings.TrimSpace(s.Source)] = true
+		source := strings.TrimSpace(s.Source)
+		if source == "" {
+			continue
+		}
 		switch s.Sentiment {
 		case "positive":
 			pos++
@@ -690,7 +719,13 @@ func computeSourceAlignment(stats []newsWindowStat) string {
 			neg++
 		case "neutral":
 			neutral++
+		default:
+			continue
 		}
+		srcs[source] = true
+	}
+	if len(srcs) == 0 {
+		return newsAlignUnavailable
 	}
 	if len(srcs) <= 1 {
 		return newsAlignSingleSource
@@ -718,10 +753,14 @@ func computeSourceAlignment(stats []newsWindowStat) string {
 // prompt 预算，统计覆盖全窗口（取样上限 newsWindowStatMax）才能代表「7 日窗口的来源
 // 覆盖与方向对齐」。
 func loadNewsWindowStats(symbol string, now time.Time) ([]newsWindowStat, int, error) {
-	if common.DB == nil || len(symbol) != 6 {
+	return loadNewsWindowStatsDB(common.DB, symbol, now)
+}
+
+func loadNewsWindowStatsDB(db *gorm.DB, symbol string, now time.Time) ([]newsWindowStat, int, error) {
+	if db == nil || !validNewsSymbol(symbol) {
 		return nil, 0, nil
 	}
-	q := common.DB.Model(&model.News{}).
+	q := db.Model(&model.News{}).
 		Where("related_symbols LIKE ? AND publish_time >= ? AND publish_time <= ?",
 			"%\""+symbol+"\"%", now.Add(-newsBriefMaxAge), now)
 	var total int64
@@ -730,7 +769,7 @@ func loadNewsWindowStats(symbol string, now time.Time) ([]newsWindowStat, int, e
 	}
 	var rows []model.News
 	if err := q.Select("sentiment, source, source_priority").
-		Order("publish_time DESC").Limit(newsWindowStatMax).Find(&rows).Error; err != nil {
+		Order("publish_time DESC, id DESC").Limit(newsWindowStatMax).Find(&rows).Error; err != nil {
 		return nil, 0, err
 	}
 	stats := make([]newsWindowStat, 0, len(rows))
@@ -747,13 +786,25 @@ func latestNewsWindow(symbol string, limit int) ([]newsBrief, newsWindowMeta) {
 }
 
 func latestNewsWindowAt(symbol string, limit int, now time.Time) ([]newsBrief, newsWindowMeta) {
-	briefs, berr := latestNewsBriefsAt(symbol, limit, now)
-	stats, total, serr := loadNewsWindowStats(symbol, now)
-	queryOK := berr == nil && serr == nil
-	if !queryOK {
-		common.SysWarn("新闻窗口查询失败 %s: brief=%v stats=%v", symbol, berr, serr)
+	if common.DB == nil {
+		return nil, buildNewsWindowMeta(nil, 0, 0, false, now)
 	}
-	return briefs, buildNewsWindowMeta(stats, total, len(briefs), queryOK, now)
+	var briefs []newsBrief
+	var stats []newsWindowStat
+	var total int
+	err := readSnapshotTx(common.DB.Statement.Context, func(tx *gorm.DB) error {
+		var err error
+		briefs, err = latestNewsBriefsDB(tx, symbol, limit, now)
+		if err != nil {
+			return err
+		}
+		stats, total, err = loadNewsWindowStatsDB(tx, symbol, now)
+		return err
+	})
+	if err != nil {
+		common.SysWarn("新闻窗口查询失败 %s: %v", symbol, err)
+	}
+	return briefs, buildNewsWindowMeta(stats, total, len(briefs), err == nil, now)
 }
 
 // newsTitleTexts 从个股快照的 news 块提取标题等文本（信任层：标题里的小数是

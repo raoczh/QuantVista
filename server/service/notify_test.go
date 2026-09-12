@@ -10,6 +10,7 @@ import (
 // TestNotifyChannelCRUD 通道 CRUD + 密文不外泄 + 校验 + 隔离。
 func TestNotifyChannelCRUD(t *testing.T) {
 	setupTestDB(t)
+	seedNotificationReviewUser(t, 1)
 	common.DB.Exec("DELETE FROM notify_channels")
 	// 加密依赖 ENCRYPTION_KEY；测试里直接设置包变量。
 	common.EncryptionKey = "test-encryption-key-1234567890"
@@ -97,6 +98,7 @@ func TestNotifyChannelCRUD(t *testing.T) {
 // TestNotifyNtfyChannel ntfy 通道：target JSON 校验 + 创建落库 + 更新留空保留 + 老通道零回归。
 func TestNotifyNtfyChannel(t *testing.T) {
 	setupTestDB(t)
+	seedNotificationReviewUser(t, 1)
 	common.DB.Exec("DELETE FROM notify_channels")
 	common.EncryptionKey = "test-encryption-key-1234567890"
 	svc := &NotifyService{}
@@ -166,6 +168,7 @@ func TestNotifyNtfyChannel(t *testing.T) {
 // 留空会被当新类型解析。kind 不变留空保留旧密文的既有语义不动。
 func TestNotifyChannelSwitchKind(t *testing.T) {
 	setupTestDB(t)
+	seedNotificationReviewUser(t, 1)
 	common.DB.Exec("DELETE FROM notify_channels")
 	common.EncryptionKey = "test-encryption-key-1234567890"
 	svc := &NotifyService{}

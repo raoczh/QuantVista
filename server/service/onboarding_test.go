@@ -124,10 +124,10 @@ func TestOnboardingPreferenceHookDeferAndVersionUpgrade(t *testing.T) {
 	cleanOnboardingUser(t, userID)
 
 	input := PreferenceInput{
-		RiskLevel: "balanced", DefaultMarket: "cn", HorizonPref: HorizonLongTerm,
-		DefaultRecCount: 3, MinCandidateAmount: defaultMinCandidateAmount,
-		TotalCapital: 100000, InvestmentGuideVersion: InvestmentGuideCurrentVersion,
-		InvestmentGuideStatus: InvestmentGuideCompleted,
+		RiskLevel: preferenceReviewValue("balanced"), DefaultMarket: preferenceReviewValue("cn"), HorizonPref: preferenceReviewValue(HorizonLongTerm),
+		DefaultRecCount: preferenceReviewValue(3), MinCandidateAmount: preferenceReviewValue(float64(defaultMinCandidateAmount)),
+		TotalCapital: preferenceReviewValue(float64(100000)), InvestmentGuideVersion: preferenceReviewValue(InvestmentGuideCurrentVersion),
+		InvestmentGuideStatus: preferenceReviewValue(InvestmentGuideCompleted),
 	}
 	if _, err := NewUserService().UpdatePreference(userID, input); err != nil {
 		t.Fatalf("UpdatePreference: %v", err)

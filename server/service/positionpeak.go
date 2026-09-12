@@ -109,6 +109,16 @@ func peakFromLocalBarsDB(db *gorm.DB, market, symbol, from, before string) (floa
 	if db == nil || symbol == "" || from == "" || before == "" || from >= before {
 		return 0, "", false, nil
 	}
+	if market == "cn" {
+		var invalid int64
+		if err := db.Model(&model.DailyBar{}).Where("market = ? AND symbol = ? AND trade_date > ? AND trade_date < ? AND source = ?",
+			market, symbol, from, before, "sina").Count(&invalid).Error; err != nil {
+			return 0, "", false, err
+		}
+		if invalid > 0 {
+			return 0, "", false, errUnadjustedBars
+		}
+	}
 	var row struct {
 		High      float64
 		TradeDate string
@@ -141,11 +151,14 @@ func peakHistoryLower(from, before string) string {
 // fillPositionPeakFromLocalBars 用起算日之后、before 之前的本地日线抬升内存中的峰值。
 // 调用方负责把 p 保存到同一事务；返回是否发生变化。
 func fillPositionPeakFromLocalBars(db *gorm.DB, p *model.Position, before string) (bool, error) {
-	if p == nil || p.PeakFrom == "" || p.PeakPrice <= 0 {
+	if p == nil || p.PeakFrom == "" || trustedPositionPeak(*p) <= 0 {
 		return false, nil
 	}
 	lower := peakHistoryLower(p.PeakFrom, before)
 	hi, date, ok, err := peakFromLocalBarsDB(db, p.Market, p.Symbol, lower, before)
+	if errors.Is(err, errUnadjustedBars) {
+		return false, nil // 峰值为派生信息；历史不可用时保留已知成交价，不能阻止真实交易记账。
+	}
 	if err != nil || !ok || hi <= p.PeakPrice {
 		return false, err
 	}
@@ -166,6 +179,7 @@ func ensurePositionPeakTx(tx *gorm.DB, p *model.Position, today string) (bool, e
 		return false, nil // 无买入价（异常数据）：不猜，留空等下次
 	}
 	p.PeakPrice, p.PeakDate, p.PeakFrom, p.PeakBackfilled = price, from, from, false
+	p.PeakDataQuality = ""
 	if _, err := fillPositionPeakFromLocalBars(tx, p, today); err != nil {
 		return false, err
 	}
@@ -173,6 +187,7 @@ func ensurePositionPeakTx(tx *gorm.DB, p *model.Position, today string) (bool, e
 		Updates(map[string]any{
 			"peak_price": p.PeakPrice, "peak_date": p.PeakDate,
 			"peak_from": p.PeakFrom, "peak_backfilled": p.PeakBackfilled,
+			"peak_data_quality": p.PeakDataQuality,
 		}).Error
 }
 
@@ -187,11 +202,16 @@ func syncPositionPeaksBefore(ctx context.Context, userID int64, positions []mode
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	activeIDs, err := activePositionSnapshotIDs(common.DB.WithContext(ctx), positions)
+	if err != nil {
+		return updated, err
+	}
 	type target struct {
 		index       int
 		original    model.Position
 		candidate   model.Position
 		searchAfter string
+		unadjusted  bool
 	}
 	targets := make([]target, 0, len(positions))
 	byKey := map[string][]int{}
@@ -204,7 +224,7 @@ func syncPositionPeaksBefore(ctx context.Context, userID int64, positions []mode
 	globalLower := before
 	for i := range positions {
 		p := positions[i]
-		if p.Status != model.PositionStatusHolding || (userID > 0 && p.UserID != userID) {
+		if !activeIDs[p.ID] || p.Status != model.PositionStatusHolding || (userID > 0 && p.UserID != userID) || positionCurrencyIssue(p, defaultCurrencyFor(p.Market)) != "" {
 			continue
 		}
 		candidate := p
@@ -215,6 +235,7 @@ func syncPositionPeaksBefore(ctx context.Context, userID int64, positions []mode
 			}
 			candidate.PeakPrice, candidate.PeakDate = price, from
 			candidate.PeakFrom, candidate.PeakBackfilled = from, false
+			candidate.PeakDataQuality = ""
 		}
 		lower := peakHistoryLower(candidate.PeakFrom, before)
 		targets = append(targets, target{index: i, original: p, candidate: candidate, searchAfter: lower})
@@ -229,8 +250,8 @@ func syncPositionPeaksBefore(ctx context.Context, userID int64, positions []mode
 			seenMarkets[candidate.Market] = true
 			markets = append(markets, candidate.Market)
 		}
-		if lower < globalLower {
-			globalLower = lower
+		if candidate.PeakFrom < globalLower {
+			globalLower = candidate.PeakFrom // 旧峰值的来源核验不能被回填窗口下限截断。
 		}
 	}
 	if len(targets) == 0 {
@@ -240,16 +261,30 @@ func syncPositionPeaksBefore(ctx context.Context, userID int64, positions []mode
 	if len(symbols) > 0 && globalLower < before {
 		// market 一并入条件走索引；跨市场同名代码的行仍按 QuoteKey 归并，不会错配。
 		if err := common.DB.WithContext(ctx).Where(
-			"market IN ? AND symbol IN ? AND trade_date > ? AND trade_date < ? AND high > 0",
+			"market IN ? AND symbol IN ? AND trade_date > ? AND trade_date < ?",
 			markets, symbols, globalLower, before,
 		).Order("trade_date ASC, id ASC").Find(&bars).Error; err != nil {
 			return updated, err
 		}
 	}
 	for _, bar := range bars {
+		if bar.Market == "cn" && bar.Source == "sina" {
+			for _, ti := range byKey[QuoteKey(bar.Market, bar.Symbol)] {
+				t := &targets[ti]
+				if bar.TradeDate > t.candidate.PeakFrom {
+					t.unadjusted = true
+					if (t.candidate.PeakBackfilled || t.candidate.PeakDate > t.candidate.PeakFrom) &&
+						(t.candidate.PeakDate == "" || bar.TradeDate <= t.candidate.PeakDate) {
+						t.candidate.PeakDataQuality = model.FactorQualityUnverifiedAdjustment
+					}
+				}
+			}
+		}
+	}
+	for _, bar := range bars {
 		for _, ti := range byKey[QuoteKey(bar.Market, bar.Symbol)] {
 			t := &targets[ti]
-			if bar.TradeDate <= t.searchAfter || bar.TradeDate <= t.candidate.PeakFrom || bar.TradeDate >= before {
+			if t.unadjusted || trustedPositionPeak(t.candidate) <= 0 || bar.TradeDate <= t.searchAfter || bar.TradeDate <= t.candidate.PeakFrom || bar.TradeDate >= before {
 				continue
 			}
 			if bar.High > t.candidate.PeakPrice {
@@ -261,37 +296,62 @@ func syncPositionPeaksBefore(ctx context.Context, userID int64, positions []mode
 	}
 	for _, t := range targets {
 		if t.candidate.PeakPrice == t.original.PeakPrice && t.candidate.PeakDate == t.original.PeakDate &&
-			t.candidate.PeakFrom == t.original.PeakFrom && t.candidate.PeakBackfilled == t.original.PeakBackfilled {
+			t.candidate.PeakFrom == t.original.PeakFrom && t.candidate.PeakBackfilled == t.original.PeakBackfilled &&
+			t.candidate.PeakDataQuality == t.original.PeakDataQuality {
 			continue
 		}
-		res := common.DB.WithContext(ctx).Model(&model.Position{}).
-			Where("id = ? AND user_id = ? AND status = ? AND peak_from = ? AND peak_price = ?",
-				t.original.ID, t.original.UserID, model.PositionStatusHolding,
-				t.original.PeakFrom, t.original.PeakPrice).
-			Updates(map[string]any{
-				"peak_price": t.candidate.PeakPrice, "peak_date": t.candidate.PeakDate,
-				"peak_from": t.candidate.PeakFrom, "peak_backfilled": t.candidate.PeakBackfilled,
-			})
-		if res.Error != nil {
-			return updated, res.Error
+		wrote, err := commitPositionPeak(ctx, t.original, map[string]any{
+			"peak_price": t.candidate.PeakPrice, "peak_date": t.candidate.PeakDate,
+			"peak_from": t.candidate.PeakFrom, "peak_backfilled": t.candidate.PeakBackfilled,
+			"peak_data_quality": t.candidate.PeakDataQuality,
+		})
+		if err != nil {
+			return updated, err
 		}
-		if res.RowsAffected > 0 {
+		if wrote {
 			positions[t.index] = t.candidate
 			updated[t.original.ID] = true
+		} else {
+			var current model.Position
+			if err := common.DB.WithContext(ctx).Where("id = ? AND user_id = ?", t.original.ID, t.original.UserID).First(&current).Error; err != nil {
+				return updated, err
+			}
+			positions[t.index] = current // 并发加仓或质量审计胜出后，消费端也必须使用最新状态。
 		}
 	}
 	return updated, nil
+}
+
+// 峰值也属于持仓事实：等待期间归档、改仓或质量标记变化时，候选结果不再提交。
+func commitPositionPeak(ctx context.Context, original model.Position, updates map[string]any) (bool, error) {
+	wrote := false
+	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := verifyPositionRiskBasesTx(tx, original.UserID, []model.Position{original}); err != nil {
+			return err
+		}
+		res := tx.Model(&model.Position{}).Where("id = ? AND user_id = ?", original.ID, original.UserID).Updates(updates)
+		wrote = res.Error == nil && res.RowsAffected > 0
+		return res.Error
+	})
+	if errors.Is(err, errPositionRiskChanged) {
+		return false, nil
+	}
+	return wrote && err == nil, err
 }
 
 // backfillPositionPeaks 列表读取时的批量惰性初始化（同 backfillPositionLedgers 的形态）。
 // 逐笔独立事务：单条失败不影响其它，也不阻断列表返回。
 // 返回是否确有写入（调用方据此决定要不要重读）。
 func backfillPositionPeaks(userID int64, positions []model.Position) bool {
+	return backfillPositionPeaksContext(context.Background(), userID, positions)
+}
+
+func backfillPositionPeaksContext(ctx context.Context, userID int64, positions []model.Position) bool {
 	if common.DB == nil || len(positions) == 0 {
 		return false
 	}
 	today := time.Now().In(time.Local).Format("2006-01-02")
-	updated, err := syncPositionPeaksBefore(context.Background(), userID, positions, today)
+	updated, err := syncPositionPeaksBefore(ctx, userID, positions, today)
 	if err != nil {
 		common.SysWarn("用户 %d 补齐持仓期峰值失败: %v", userID, err)
 		return false
@@ -317,6 +377,7 @@ func resetPeakOnBuy(p *model.Position, price float64, tradeDate, today string) {
 	p.PeakDate = date
 	p.PeakFrom = date
 	p.PeakBackfilled = false
+	p.PeakDataQuality = ""
 }
 
 // rebuildPositionPeakOnBuyTx 按修正后的首笔买入/历史加仓重建峰值，并补齐起算日之后、
@@ -351,7 +412,7 @@ func RunPositionPeakUpdate(tradeDate string) int {
 		return 0
 	}
 	var positions []model.Position
-	if err := common.DB.Where("status = ?", model.PositionStatusHolding).Find(&positions).Error; err != nil {
+	if err := common.DB.Scopes(withActivePositionAccount).Where("status = ?", model.PositionStatusHolding).Find(&positions).Error; err != nil {
 		common.SysWarn("持仓峰值更新读取持仓失败: %v", err)
 		return 0
 	}
@@ -389,12 +450,15 @@ func RunPositionPeakUpdate(tradeDate string) int {
 	}
 	barByKey := map[string]model.DailyBar{}
 	for _, b := range bars {
+		if b.Market == "cn" && b.Source == "sina" {
+			continue
+		}
 		barByKey[QuoteKey(b.Market, b.Symbol)] = b
 	}
 
 	for _, p := range positions {
 		bar, ok := barByKey[QuoteKey(p.Market, p.Symbol)]
-		if !ok {
+		if !ok || p.PeakDataQuality == model.FactorQualityUnverifiedAdjustment || positionCurrencyIssue(p, defaultCurrencyFor(p.Market)) != "" {
 			continue
 		}
 		// 起算日整日 OHLC 含建仓/加仓前波动，无法判断先后；当天峰值只允许
@@ -408,15 +472,12 @@ func RunPositionPeakUpdate(tradeDate string) int {
 		}
 		// 条件更新：只在峰值仍是我们读到的那个值时才写，避免与用户加仓（重置峰值）
 		// 并发时把刚重置的峰值又抬回旧高点。
-		res := common.DB.Model(&model.Position{}).
-			Where("id = ? AND status = ? AND peak_from = ? AND peak_price = ?",
-				p.ID, model.PositionStatusHolding, p.PeakFrom, p.PeakPrice).
-			Updates(map[string]any{"peak_price": next, "peak_date": nextDate})
-		if res.Error != nil {
-			common.SysWarn("持仓 %d 峰值更新失败: %v", p.ID, res.Error)
+		wrote, err := commitPositionPeak(context.Background(), p, map[string]any{"peak_price": next, "peak_date": nextDate})
+		if err != nil {
+			common.SysWarn("持仓 %d 峰值更新失败: %v", p.ID, err)
 			continue
 		}
-		if res.RowsAffected > 0 {
+		if wrote {
 			updatedIDs[p.ID] = true
 		}
 	}
@@ -455,12 +516,23 @@ type PeakView struct {
 	DrawdownPct float64 `json:"drawdown_pct"`   // 自峰值回撤 %（仅 fresh 行情时有值）
 	Backfilled  bool    `json:"backfilled"`     // 由前复权日线回填（口径提示）
 	Note        string  `json:"note,omitempty"` // 口径说明
+	DataQuality string  `json:"data_quality,omitempty"`
+}
+
+func trustedPositionPeak(p model.Position) float64 {
+	if p.PeakDataQuality == model.FactorQualityUnverifiedAdjustment {
+		return 0
+	}
+	return p.PeakPrice
 }
 
 // peakViewFor 组装峰值视图。盘中用 max(落库峰值, fresh High, 现价) 展示，避免
 // 16:25 落库前出现负回撤或 AI 漏掉盘中新高；起算交易日整日 OHLC 不可判序，仍只用现价。
 // price<=0（无 fresh 行情）时 DrawdownPct 留空，不用旧价算。
 func peakViewFor(p model.Position, price, dayHigh float64, tradeDate string) *PeakView {
+	if p.PeakDataQuality == model.FactorQualityUnverifiedAdjustment {
+		return &PeakView{From: p.PeakFrom, DataQuality: p.PeakDataQuality, Note: "历史日线复权口径待核验，持仓期最高价及回撤暂不可用"}
+	}
 	if p.PeakFrom == "" || p.PeakPrice <= 0 {
 		return nil
 	}
@@ -477,7 +549,7 @@ func peakViewFor(p model.Position, price, dayHigh float64, tradeDate string) *Pe
 			peakDate = tradeDate
 		}
 	}
-	v := &PeakView{Price: round2(peak), Date: peakDate, From: p.PeakFrom, Backfilled: p.PeakBackfilled}
+	v := &PeakView{Price: round4(peak), Date: peakDate, From: p.PeakFrom, Backfilled: p.PeakBackfilled}
 	if price > 0 {
 		v.DrawdownPct = peakDrawdownPct(peak, price)
 	}
@@ -506,5 +578,5 @@ func peakAdjustNote(before, after float64) string {
 	if before <= 0 {
 		return ""
 	}
-	return fmt.Sprintf("；持仓期最高价同步折算 %.4g → %.4g", before, after)
+	return fmt.Sprintf("；持仓期最高价同步折算 %.4f → %.4f", before, after)
 }

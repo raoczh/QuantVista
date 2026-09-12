@@ -1,7 +1,10 @@
 package controller
 
 import (
+	"math"
 	"strconv"
+
+	"quantvista/common"
 
 	"github.com/gin-gonic/gin"
 )
@@ -36,4 +39,17 @@ func optionalAccountID(c *gin.Context) int64 {
 // clientUA 取请求 User-Agent（落库刷新令牌时记录来源设备）。
 func clientUA(c *gin.Context) string {
 	return c.Request.UserAgent()
+}
+
+func optionalNonnegativeFloat(c *gin.Context, key string) (float64, bool) {
+	raw := c.Query(key)
+	if raw == "" {
+		return 0, true
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		common.ApiErrorMsg(c, key+" 须为有限的非负数")
+		return 0, false
+	}
+	return value, true
 }

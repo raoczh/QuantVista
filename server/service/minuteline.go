@@ -127,7 +127,7 @@ func buildMinuteLine(market, symbol string, bars []datasource.Min5Bar, prec floa
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Time < sorted[j].Time })
 
 	day := min5Date(sorted[len(sorted)-1].Time)
-	if day == "" {
+	if day == "" || day > time.Now().Format("2006-01-02") {
 		return nil, datasource.ErrNoData
 	}
 	out := &MinuteLine{
@@ -196,6 +196,9 @@ func formatMinuteClock(t string) string {
 func waitMinuteLineFlight(ctx context.Context, key string, flight *minuteLineFlight) (*MinuteLine, error) {
 	select {
 	case <-flight.done:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return flight.line, flight.err
 	case <-ctx.Done():
 		minuteLineMu.Lock()
@@ -249,6 +252,9 @@ func (s *IntradayService) fetchMinuteLineFlight(ctx context.Context, key, market
 func (s *IntradayService) MinuteLine(ctx context.Context, market, symbol string) (*MinuteLine, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	market = strings.ToLower(strings.TrimSpace(market))
 	symbol = strings.TrimSpace(symbol)

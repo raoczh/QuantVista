@@ -40,6 +40,7 @@ func TestJobFailureNotificationsIdempotentMergedMutedAuthorizedAndRedacted(t *te
 		}
 	}
 	for _, userID := range []int64{920001, 920002} {
+		seedNotificationReviewUser(t, userID)
 		if err := common.DB.Create(&model.UserPreference{UserID: userID, EnableNotify: true}).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -154,6 +155,7 @@ func TestJobFailureNoticeMergeWindowCrossesBucketBoundary(t *testing.T) {
 	common.DB.Exec("DELETE FROM job_failure_notifications")
 	common.DB.Exec("DELETE FROM job_runs")
 	const userID int64 = 920010
+	seedNotificationReviewUser(t, userID)
 	createRun := func(hashChar string) model.JobRun {
 		run := model.JobRun{
 			UserID: userID, OwnerType: model.JobOwnerUser, Kind: JobKindAnalysis,

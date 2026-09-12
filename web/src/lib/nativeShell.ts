@@ -10,6 +10,20 @@ import type { Router } from 'vue-router'
 // naive-ui 弹层遮罩（弹窗/抽屉/图片预览）。返回键先关最上层弹层，与 Android 用户直觉一致。
 const overlayMaskSelector = '.n-modal-mask, .n-drawer-mask, .n-image-preview-container'
 
+export function nativeLinkRoute(raw: string, siteOrigin: string): string | null {
+  try {
+    const target = new URL(raw)
+    if (target.protocol === 'quantvista:' && target.hostname === 'oauth' && target.pathname === '/callback') {
+      const code = target.searchParams.get('code')
+      return code ? `/login/callback?mode=mobile-exchange&code=${encodeURIComponent(code)}` : null
+    }
+    if (target.protocol === 'https:' && target.origin === siteOrigin) {
+      return target.pathname + target.search + target.hash
+    }
+  } catch { /* 非法深链忽略 */ }
+  return null
+}
+
 function closeTopOverlay(): boolean {
   if (!document.querySelector(overlayMaskSelector)) return false
   // naive-ui 弹层默认 close-on-esc：派发合成 Escape 让其自行关闭一层。
@@ -38,24 +52,18 @@ export async function setupNativeShell(router: Router): Promise<void> {
   //     翻译进回调页 mobile-exchange 分支，兑换逻辑与错误 UI 全复用 OAuthCallback.vue；
   //   https —— App Links（阶段 C 通知点击）直达站内路由。
   // appUrlOpen（热启动）与 getLaunchUrl（冷启动兜底：授权期间壳被系统回收，
-  // 深链重新拉起 App 时监听注册晚于事件）可能双投递同一 URL，Set 去重。
-  const handled = new Set<string>()
+  // 深链重新拉起 App 时监听注册晚于事件）可能短时间双投递同一 URL。
+  // 仅去重两秒内的重复投递，之后再次点击相同通知仍须正常导航。
+  let lastURL = ''
+  let lastHandledAt = 0
   const handleUrl = (url: string) => {
-    if (!url || handled.has(url)) return
-    handled.add(url)
-    try {
-      if (url.startsWith('quantvista://oauth/callback')) {
-        const code = new URL(url).searchParams.get('code') || ''
-        void router.push({ path: '/login/callback', query: { mode: 'mobile-exchange', code } })
-        return
-      }
-      const target = new URL(url)
-      if (target.protocol === 'https:') {
-        void router.push(target.pathname + target.search + target.hash)
-      }
-    } catch {
-      /* 非法深链忽略 */
-    }
+    const target = nativeLinkRoute(url, location.origin)
+    if (!target) return
+    const now = Date.now()
+    if (url === lastURL && now - lastHandledAt < 2000) return
+    lastURL = url
+    lastHandledAt = now
+    void router.push(target)
   }
 
   await App.addListener('appUrlOpen', ({ url }) => handleUrl(url))

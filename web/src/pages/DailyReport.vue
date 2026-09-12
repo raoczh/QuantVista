@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
+  NAlert,
   NButton,
   NEmpty,
   NModal,
@@ -20,6 +21,7 @@ import {
   type DailyReportRow,
   type DailyReportView,
 } from '@/api/report'
+import { getSessionEpoch } from '@/api/token'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
 import { pollUntil, isPollCancelled } from '@/lib/poll'
@@ -40,8 +42,20 @@ const { label } = useDisplayMode()
 const rows = ref<DailyReportRow[]>([])
 const current = ref<DailyReportView | null>(null)
 const loading = ref(false)
-const generating = ref(false)
+const submitting = ref(false)
+const polling = ref(false)
+const generating = computed(() => submitting.value || polling.value)
 const selectedId = ref<number | null>(null)
+const listLoading = ref(false)
+const listError = ref('')
+const detailError = ref('')
+const deleting = ref(false)
+const sessionEpoch = getSessionEpoch()
+let active = true
+let listSequence = 0
+let selectionSeq = 0
+let pollAbort: AbortController | null = null
+const pageIsCurrent = () => active && sessionEpoch === getSessionEpoch()
 
 const historyOptions = computed(() =>
   rows.value.map((r) => ({
@@ -57,125 +71,186 @@ function statusType(s: string): 'success' | 'warning' | 'error' | 'info' {
   return s === 'success' ? 'success' : s === 'partial' ? 'warning' : s === 'processing' ? 'info' : 'error'
 }
 
-let selectionSeq = 0
-async function load(preferredId: number | null = null) {
-  const seq = ++selectionSeq
+function stopPolling() {
   pollAbort?.abort()
-  loading.value = true
+  pollAbort = null
+  polling.value = false
+}
+function rememberReport(view: DailyReportView) {
+  ++listSequence
+  listLoading.value = false
+  rows.value = [view, ...rows.value.filter(row => row.id !== view.id)]
+    .sort((a, b) => b.trade_date.localeCompare(a.trade_date) || b.id - a.id)
+}
+function syncReportRoute(id: number) {
+  if (pageIsCurrent() && routeReportID() !== id) void router.replace({ query: { ...route.query, report_id: String(id) } })
+}
+function notifyReport(view: DailyReportView) {
+  if (view.status === 'failed') message.error(view.error || '日报生成失败')
+  else if (view.status === 'partial' || view.error) message.warning(view.error || '日报部分生成成功，请核对缺失部分')
+  else message.success('日报已生成')
+}
+async function refreshRows(): Promise<boolean> {
+  if (!pageIsCurrent()) return false
+  const seq = ++listSequence
+  listLoading.value = true
+  listError.value = ''
   try {
     const nextRows = await listDailyReports(30)
-    if (seq !== selectionSeq) return
+    if (!pageIsCurrent() || seq !== listSequence) return false
     rows.value = nextRows
-    const targetId = preferredId || rows.value[0]?.id || null
+    return true
+  } catch (e) {
+    if (pageIsCurrent() && seq === listSequence) listError.value = (e as Error).message || '日报列表读取失败'
+    return false
+  } finally {
+    if (pageIsCurrent() && seq === listSequence) listLoading.value = false
+  }
+}
+async function load(preferredId: number | null = null) {
+  if (!pageIsCurrent()) return
+  const seq = ++selectionSeq
+  stopPolling()
+  loading.value = true
+  detailError.value = ''
+  try {
+    const listed = await refreshRows()
+    if (!pageIsCurrent() || seq !== selectionSeq) return
+    const targetId = preferredId || (listed ? rows.value[0]?.id : current.value?.id) || null
     if (targetId) {
       selectedId.value = targetId
+      if (current.value?.id !== targetId) current.value = null
       const view = await getDailyReport(targetId)
-      if (seq !== selectionSeq) return
+      if (!pageIsCurrent() || seq !== selectionSeq) return
       current.value = view
-      if (!rows.value.some((row) => row.id === view.id)) rows.value = [view, ...rows.value]
-      // 页面刷新恢复：最新报告仍在后台生成中，继续轮询跟踪。
-      if (current.value.status === 'processing') {
-        void trackProcessing(current.value.id)
-      }
-    } else {
+      rememberReport(view)
+      syncReportRoute(view.id)
+      if (view.status === 'processing') void trackProcessing(view.id, seq)
+    } else if (listed) {
       current.value = null
+      selectedId.value = null
     }
   } catch (e) {
-    if (seq === selectionSeq) message.error((e as Error).message)
+    if (pageIsCurrent() && seq === selectionSeq) detailError.value = (e as Error).message || '日报详情读取失败'
   } finally {
-    if (seq === selectionSeq) loading.value = false
+    if (pageIsCurrent() && seq === selectionSeq) loading.value = false
   }
 }
 
 async function pick(id: number | null) {
-  if (!id) return
+  if (!id || !pageIsCurrent()) return
   const seq = ++selectionSeq
-  pollAbort?.abort()
+  stopPolling()
+  selectedId.value = id
+  current.value = null
   loading.value = true
+  detailError.value = ''
   try {
     const view = await getDailyReport(id)
-    if (seq !== selectionSeq) return
+    if (!pageIsCurrent() || seq !== selectionSeq) return
     current.value = view
-    selectedId.value = id
-    if (view.status === 'processing') void trackProcessing(id)
+    rememberReport(view)
+    syncReportRoute(id)
+    if (view.status === 'processing') void trackProcessing(id, seq)
   } catch (e) {
-    if (seq === selectionSeq) message.error((e as Error).message)
+    if (pageIsCurrent() && seq === selectionSeq) detailError.value = (e as Error).message || '日报详情读取失败'
   } finally {
-    if (seq === selectionSeq) loading.value = false
+    if (pageIsCurrent() && seq === selectionSeq) loading.value = false
   }
 }
 
 // trackProcessing 轮询后台任务直到脱离 processing（生成接口现在立即返回任务，
 // 复盘+推荐在服务端后台并行执行——关闭/刷新页面都不影响任务本身）。
 // 页面卸载时取消轮询，避免后台请求空转与已销毁组件的状态回填。
-let pollAbort: AbortController | null = null
-onBeforeUnmount(() => pollAbort?.abort())
+onBeforeUnmount(() => {
+  active = false
+  ++selectionSeq
+  ++listSequence
+  stopPolling()
+})
 
-async function trackProcessing(id: number) {
-  generating.value = true
-  pollAbort?.abort()
+async function trackProcessing(id: number, seq = selectionSeq) {
+  stopPolling()
+  polling.value = true
   const controller = new AbortController()
   pollAbort = controller
+  const isCurrent = () => pageIsCurrent() && seq === selectionSeq && pollAbort === controller && !controller.signal.aborted && selectedId.value === id
   try {
     const v = await pollUntil(
       () => getDailyReport(id),
       (r) => r.status !== 'processing',
       { signal: controller.signal },
     )
-    if (selectedId.value === id || !selectedId.value) {
-      current.value = v
-      selectedId.value = id
-    }
-    rows.value = await listDailyReports(30)
-    if (v.status === 'failed') {
-      message.error(v.error || '日报生成失败')
-    } else {
-      message.success('日报已生成')
-    }
+    if (!isCurrent()) return
+    current.value = v
+    rememberReport(v)
+    notifyReport(v)
+    void refreshRows()
   } catch (e) {
-    if (isPollCancelled(e)) return
-    message.error((e as Error).message)
+    if (!isCurrent() || isPollCancelled(e)) return
+    detailError.value = (e as Error).message || '日报跟踪读取失败，可重新读取当前日报'
   } finally {
     if (pollAbort === controller) {
       pollAbort = null
-      generating.value = false
+      polling.value = false
     }
   }
 }
 
 async function doGenerate() {
-  generating.value = true
+  if (!pageIsCurrent() || generating.value || deleting.value || loading.value) return
+  submitting.value = true
+  const seq = selectionSeq
   try {
     const v = await generateDailyReport()
-    selectedId.value = v.id
-    current.value = v
-    rows.value = await listDailyReports(30)
-    if (v.status === 'processing') {
-      message.info('任务已创建，正在后台生成（刷新或关闭页面不影响任务）')
-      await trackProcessing(v.id)
-      return
+    if (!pageIsCurrent()) return
+    rememberReport(v)
+    if (seq === selectionSeq) {
+      selectedId.value = v.id
+      current.value = v
+      detailError.value = ''
+      syncReportRoute(v.id)
+      if (v.status === 'processing') {
+        message.info('任务已创建，正在后台生成（刷新或关闭页面不影响任务）')
+        void trackProcessing(v.id, seq)
+      } else notifyReport(v)
     }
-    message.success('日报已生成')
+    void refreshRows()
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageIsCurrent() && seq === selectionSeq) message.error((e as Error).message)
   } finally {
-    generating.value = false
+    submitting.value = false
   }
 }
 
 // 删除当前展示的日报（生成中的任务后端会拒删）。
-const deleting = ref(false)
 async function doDelete() {
-  if (!current.value) return
+  if (!current.value || !pageIsCurrent() || deleting.value || submitting.value || current.value.status === 'processing') return
+  const id = current.value.id
+  const seq = selectionSeq
   deleting.value = true
   try {
-    await deleteDailyReport(current.value.id)
+    await deleteDailyReport(id)
+    if (!pageIsCurrent()) return
+    ++listSequence
+    listLoading.value = false
+    rows.value = rows.value.filter(row => row.id !== id)
+    if (current.value?.id === id) current.value = null
+    if (selectedId.value === id) {
+      selectedId.value = null
+      ++selectionSeq
+      stopPolling()
+      loading.value = false
+      detailError.value = ''
+      const nextId = rows.value[0]?.id
+      if (nextId) await pick(nextId)
+      else if (routeReportID() === id) void router.replace({ query: { ...route.query, report_id: undefined } })
+    }
+    if (!pageIsCurrent()) return
     message.success('已删除')
-    current.value = null
-    selectedId.value = null
-    await load()
+    void refreshRows()
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageIsCurrent() && seq === selectionSeq) message.error((e as Error).message)
   } finally {
     deleting.value = false
   }
@@ -186,11 +261,12 @@ const recItems = computed(() => current.value?.recommendation?.items ?? [])
 // 复盘证据核验（复盘 JSON 内 evidence_check）。
 const reviewCheck = computed(() => {
   const c = current.value?.review?.evidence_check
-  return c && c.total > 0 ? c : null
+  return c || null
 })
 
 // ---------- 数据快照透明面板（详情已带 snapshot_json） ----------
 const snapshotShow = ref(false)
+watch(() => current.value?.id, () => { snapshotShow.value = false })
 const snapshotText = computed(() => {
   const raw = current.value?.snapshot_json
   if (!raw) return ''
@@ -248,16 +324,26 @@ const disclosures = computed<string[]>(() => {
   }
 })
 
+const dataDeficiencies = computed<string[]>(() => {
+  try {
+    const snapshot = JSON.parse(current.value?.snapshot_json || '{}')
+    return Array.isArray(snapshot.data_deficiencies) ? snapshot.data_deficiencies.filter((item: unknown) => typeof item === 'string') : []
+  } catch {
+    return []
+  }
+})
+
 function routeReportID(): number | null {
   const raw = Array.isArray(route.query.report_id) ? route.query.report_id[0] : route.query.report_id
   const id = Number(raw)
-  return Number.isInteger(id) && id > 0 ? id : null
+  return Number.isSafeInteger(id) && id > 0 ? id : null
 }
 
 watch(
   () => route.query.report_id,
   () => {
     const id = routeReportID()
+    if (id && current.value?.id === id && selectedId.value === id) return
     if (id) void pick(id)
     else void load()
   },
@@ -273,6 +359,7 @@ onMounted(() => void load(routeReportID()))
         <n-select
           v-model:value="selectedId"
           :options="historyOptions"
+          :loading="listLoading"
           placeholder="历史日报"
           size="small"
           style="width: min(220px, 100%)"
@@ -280,26 +367,28 @@ onMounted(() => void load(routeReportID()))
         />
         <n-popconfirm @positive-click="doGenerate">
           <template #trigger>
-            <n-button size="small" type="primary" ghost :loading="generating">生成 / 重生成今日</n-button>
+            <n-button size="small" type="primary" ghost :loading="generating" :disabled="generating || deleting || loading">生成 / 重生成今日</n-button>
           </template>
           将调用你的 LLM 生成当日复盘与明日推荐（计 1 次配额），已有今日日报会被覆盖，继续？
         </n-popconfirm>
         <n-popconfirm @positive-click="doDelete">
           <template #trigger>
-            <n-button size="small" quaternary type="error" :loading="deleting" :disabled="!current">删除</n-button>
+            <n-button size="small" quaternary type="error" :loading="deleting" :disabled="!current || current.status === 'processing' || deleting || submitting">删除</n-button>
           </template>
           删除当前展示的这份日报？关联的推荐批次与研究追踪事实不会删除；若删的是今日日报且开着自动生成，收盘窗口内可能会自动重新生成。
         </n-popconfirm>
       </div>
     </template>
 
+    <n-alert v-if="listError" type="error" :bordered="false" class="load-error">{{ listError }} <n-button size="tiny" :loading="listLoading" @click="refreshRows">重新读取历史列表</n-button></n-alert>
+    <n-alert v-if="detailError" type="error" :bordered="false" class="load-error">{{ detailError }} <n-button size="tiny" :loading="loading" @click="pick(selectedId)">重新读取当前日报</n-button></n-alert>
     <n-spin :show="loading">
       <n-empty
-        v-if="!current"
+        v-if="!current && !listError && !detailError && !loading"
         description="还没有日报。交易日收盘后自动生成（需在 设置→偏好 开启「收盘日报」），或点右上角立即生成。"
         style="padding: 48px 0"
       />
-      <div v-else class="report">
+      <div v-if="current" class="report">
         <SectionCard :hoverable="false">
           <div class="head">
             <span class="head-date qv-figure">{{ current.trade_date }}</span>
@@ -316,6 +405,10 @@ onMounted(() => void load(routeReportID()))
           </div>
           <div v-if="current.error" class="err">{{ current.error }}</div>
         </SectionCard>
+
+        <n-alert v-if="dataDeficiencies.length" type="warning" :bordered="false" title="本次数据缺口">
+          <ul class="deficiencies"><li v-for="item in dataDeficiencies" :key="item">{{ item }}</li></ul>
+        </n-alert>
 
         <!-- 今日复盘 -->
         <SectionCard v-if="current.review" title="今日复盘">
@@ -372,10 +465,12 @@ onMounted(() => void load(routeReportID()))
         <!-- 明日推荐 -->
         <SectionCard title="明日选股推荐（短线）">
           <template #extra>
-            <n-button v-if="current.recommendation" size="tiny" quaternary type="primary" @click="router.push('/recommendations')"
+            <n-button v-if="current.recommendation" size="tiny" quaternary type="primary" @click="router.push({ path: '/recommendations', query: { batch_id: String(current.recommendation_batch_id) } })"
               >完整详情与追踪 →</n-button
             >
           </template>
+          <n-alert v-if="current.recommendation_error" type="error" :bordered="false">{{ current.recommendation_error }} <n-button size="tiny" @click="pick(selectedId)">重新读取</n-button></n-alert>
+          <n-alert v-else-if="current.recommendation?.error" type="warning" :bordered="false">{{ current.recommendation.error }}</n-alert>
           <div v-if="recItems.length" class="recs">
             <div v-for="it in recItems" :key="it.id" class="rec">
               <div class="rec-head">
@@ -418,7 +513,7 @@ onMounted(() => void load(routeReportID()))
           <n-spin v-else-if="current.status === 'processing'" size="small" style="width: 100%; padding: 24px 0">
             <template #description>明日推荐生成中…</template>
           </n-spin>
-          <n-empty v-else description="推荐未生成（候选池为空或 LLM 失败），可重生成重试" />
+          <n-empty v-else-if="!current.recommendation_error" :description="current.recommendation ? '本次没有可展示的推荐，请查看批次说明与完整详情' : '推荐未生成（见上方错误），可重生成重试'" />
         </SectionCard>
 
         <p class="disclaimer">本内容为 AI 生成的研究参考，不构成投资建议；数据可能延迟或不完整，决策风险自担。</p>
@@ -433,12 +528,14 @@ onMounted(() => void load(routeReportID()))
 </template>
 
 <style scoped>
+.load-error { margin-bottom: 12px; }
+.deficiencies { margin: 0; padding-left: 18px; overflow-wrap: anywhere; }
 .toolbar {
   display: flex;
   gap: 10px;
   align-items: center;
   /* 220px 下拉+两按钮合计 ~425px，360px 页头必换行否则整页横滚 */
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 .report {
   display: flex;
@@ -600,6 +697,7 @@ onMounted(() => void load(routeReportID()))
 }
 /* 62px 定宽小标题在 360px 下吃掉近两成宽度，手机改上下堆叠 */
 @media (max-width: 768px) {
+  .toolbar { flex-wrap: wrap; }
   .block {
     flex-direction: column;
     gap: 3px;

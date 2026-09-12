@@ -1,9 +1,13 @@
 package model
 
 import (
+	"errors"
+	"sort"
+
 	"quantvista/common"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // AllModels 需要 AutoMigrate 的模型清单。新增表只往这里加。
@@ -30,6 +34,7 @@ func AllModels() []any {
 		&Stock{},
 		&StockQuote{},
 		&DailyBar{},
+		&DailyBarWriteLock{},
 		&TradingCalendar{},
 		&MarketSnapshot{},
 		&DataSyncLog{},
@@ -122,6 +127,9 @@ func AllModels() []any {
 // Migrate 启动时自动迁移表结构。
 func Migrate() error {
 	common.SysLog("开始数据库自动迁移 ...")
+	if err := prepareGitHubIdentityMigration(); err != nil {
+		return err
+	}
 	// P2 账户维度是一次需要“先补列和数据、后建唯一索引”的升级。若直接对旧库执行
 	// 全量 AutoMigrate，多条 paper_accounts 会先得到相同的 account_id=0，新唯一索引
 	// 将在归属迁移运行前冲突。这里仍只用 GORM 表达 DDL，业务数据回填保持幂等。
@@ -214,6 +222,25 @@ func Migrate() error {
 	return nil
 }
 
+// prepareGitHubIdentityMigration 在唯一索引创建前将未绑定身份归一为 NULL。
+// 历史非空重复必须人工核对归属，不能在迁移时猜测应该保留哪个账号。
+func prepareGitHubIdentityMigration() error {
+	if !common.DB.Migrator().HasTable(&User{}) || !common.DB.Migrator().HasColumn(&User{}, "GithubID") {
+		return nil
+	}
+	return common.DB.Transaction(func(tx *gorm.DB) error {
+		var duplicates []struct{ GithubID string }
+		if err := tx.Model(&User{}).Select("github_id").Where("github_id IS NOT NULL AND github_id <> ?", "").
+			Group("github_id").Having("COUNT(*) > 1").Limit(1).Find(&duplicates).Error; err != nil {
+			return err
+		}
+		if len(duplicates) != 0 {
+			return errors.New("存在同一 GitHub 身份绑定多个账号的历史记录，请核对归属后再迁移；绑定关系未改动")
+		}
+		return tx.Model(&User{}).Where("github_id = ?", "").UpdateColumn("github_id", nil).Error
+	})
+}
+
 func preparePortfolioAccountMigration() error {
 	if err := common.DB.AutoMigrate(&PortfolioAccount{}); err != nil {
 		return err
@@ -288,8 +315,19 @@ func MigratePortfolioAccounts() error {
 		}
 	}
 
+	orderedOwners := make([]ownerKind, 0, len(owners))
+	for owner := range owners {
+		orderedOwners = append(orderedOwners, owner)
+	}
+	sort.Slice(orderedOwners, func(i, j int) bool {
+		if orderedOwners[i].UserID != orderedOwners[j].UserID {
+			return orderedOwners[i].UserID < orderedOwners[j].UserID
+		}
+		return orderedOwners[i].Kind < orderedOwners[j].Kind
+	})
 	return common.DB.Transaction(func(tx *gorm.DB) error {
-		for owner := range owners {
+		// 多实例按同一顺序获取默认账户锁，避免随机 map 顺序造成交叉等待。
+		for _, owner := range orderedOwners {
 			key := portfolioDefaultKey(owner.UserID, owner.Kind)
 			name := "默认真实账户"
 			if owner.Kind == PortfolioKindPaper {
@@ -297,7 +335,12 @@ func MigratePortfolioAccounts() error {
 			}
 			row := PortfolioAccount{UserID: owner.UserID, Name: name, Kind: owner.Kind, Currency: "CNY",
 				Status: PortfolioStatusActive, IsDefault: true, DefaultKey: &key}
-			if err := tx.Where("default_key = ?", key).FirstOrCreate(&row).Error; err != nil {
+			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "default_key"}}, DoNothing: true}).Create(&row).Error; err != nil {
+				return err
+			}
+			// 冲突不改已有账户；MySQL 使用当前读，避免旧快照漏掉并发创建的默认账户。
+			row = PortfolioAccount{}
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("default_key = ?", key).First(&row).Error; err != nil {
 				return err
 			}
 			updates := []struct {

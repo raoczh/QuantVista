@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import {
   NAlert,
   NButton,
@@ -28,6 +29,9 @@ import {
 } from '@/api/alert'
 import { listPositions, type Position } from '@/api/position'
 import { searchStocks, type StockSearchItem } from '@/api/stockSearch'
+import { isAbortError } from '@/api/client'
+import { getSessionEpoch } from '@/api/token'
+import { useUi } from '@/composables/useUi'
 import {
   ALERT_KIND_OPTIONS,
   ALERT_TEMPLATE_GROUPS,
@@ -49,6 +53,7 @@ import {
 } from './alertTemplates'
 
 const props = defineProps<{
+  active: boolean
   editingRule: AlertRule | null
   stockContext: AlertStockContext | null
 }>()
@@ -58,6 +63,16 @@ const emit = defineEmits<{
 }>()
 
 const message = useMessage()
+const route = useRoute()
+const sessionOwner = getSessionEpoch()
+let disposed = false
+let editorSeq = 0
+const editorActive = () => !disposed && props.active && route.name === 'alerts' && sessionOwner === getSessionEpoch()
+const { vars } = useUi()
+const styleVars = computed(() => ({
+  '--qv-divider': vars.value.dividerColor,
+  '--qv-primary': vars.value.primaryColor,
+}))
 const root = ref<HTMLElement | null>(null)
 const wizardStep = ref(1)
 const selectedTemplateId = ref<AlertTemplateId | null>(null)
@@ -84,6 +99,7 @@ const expertKindOptions = computed<SelectOption[]>(() => {
 })
 
 function resetWizard() {
+  invalidateEditor()
   wizardStep.value = 1
   selectedTemplateId.value = null
   expertMode.value = false
@@ -105,6 +121,7 @@ function applyStockContext(context: AlertStockContext | null) {
 }
 
 function selectTemplate(template: AlertTemplate) {
+  if (!editorActive() || saving.value) return
   const target = {
     symbol: form.value.symbol,
     market: form.value.market,
@@ -116,6 +133,7 @@ function selectTemplate(template: AlertTemplate) {
   expertExpanded.value = false
   if (isPositionAlertKind(template.kind)) {
     positionScope.value = target.symbol ? 'single' : 'all'
+    if (positionScope.value === 'all') changePositionScope('all')
   } else {
     positionScope.value = 'single'
   }
@@ -124,6 +142,7 @@ function selectTemplate(template: AlertTemplate) {
 }
 
 function startExpertMode() {
+  if (!editorActive() || saving.value) return
   selectedTemplateId.value = null
   expertMode.value = true
   expertExpanded.value = true
@@ -144,6 +163,7 @@ function selectExpertKind(value: string) {
     form.value.op = 'gte'
     form.value.once = false
     positionScope.value = form.value.symbol ? 'single' : 'all'
+    if (positionScope.value === 'all') changePositionScope('all')
   } else if (isEarnAlertKind(kind)) {
     form.value.op = 'gte'
   }
@@ -156,6 +176,17 @@ const stockResults = ref<StockSearchItem[]>([])
 const selectedStock = ref<StockSearchItem | null>(null)
 const lastStockQuery = ref('')
 let stockSearchSeq = 0
+let stockSearchController: AbortController | null = null
+
+function clearStockSearch() {
+  stockSearchSeq++
+  stockSearchController?.abort()
+  stockSearchController = null
+  stockResults.value = []
+  stockSearchLoading.value = false
+  stockSearchError.value = ''
+  lastStockQuery.value = ''
+}
 
 function stockKey(stock: Pick<StockSearchItem, 'market' | 'symbol'>): string {
   return `${stock.market}:${stock.symbol}`
@@ -174,27 +205,36 @@ const stockOptions = computed<SelectOption[]>(() => {
 })
 
 async function runStockSearch(query: string) {
+  if (!editorActive()) return
   const keyword = query.trim()
-  if (!keyword) return
+  if (!keyword) {
+    clearStockSearch()
+    return
+  }
   const seq = ++stockSearchSeq
+  stockSearchController?.abort()
+  const controller = new AbortController()
+  stockSearchController = controller
   lastStockQuery.value = keyword
   stockSearchLoading.value = true
   stockSearchError.value = ''
   try {
-    const result = await searchStocks(keyword, 20)
-    if (seq !== stockSearchSeq) return
+    const result = await searchStocks(keyword, 20, controller.signal)
+    if (seq !== stockSearchSeq || !editorActive()) return
     stockResults.value = result.items || []
   } catch (error) {
-    if (seq !== stockSearchSeq) return
+    if (seq !== stockSearchSeq || !editorActive() || isAbortError(error)) return
     stockSearchError.value = alertRequestMessage('stocks', error)
   } finally {
-    if (seq === stockSearchSeq) stockSearchLoading.value = false
+    if (seq === stockSearchSeq && editorActive()) stockSearchLoading.value = false
   }
 }
 
 function chooseStock(value: string | number | null) {
   if (!value) {
+    clearStockSearch()
     form.value.symbol = ''
+    form.value.market = 'cn'
     form.value.name = ''
     selectedStock.value = null
     return
@@ -213,11 +253,13 @@ function chooseStock(value: string | number | null) {
 const positions = ref<Position[]>([])
 const positionsLoading = ref(false)
 const positionsError = ref('')
+let positionsSeq = 0
 
 const positionOptions = computed<SelectOption[]>(() => {
   const seen = new Set<string>()
   const options: SelectOption[] = []
   for (const position of positions.value) {
+    if (position.market !== 'cn') continue
     const key = `${position.market}:${position.symbol}`
     if (seen.has(key)) continue
     seen.add(key)
@@ -233,14 +275,17 @@ const positionOptions = computed<SelectOption[]>(() => {
 const selectedPositionKey = computed(() => (form.value.symbol ? `${form.value.market}:${form.value.symbol}` : null))
 
 async function loadPositions() {
+  if (!editorActive()) return
+  const seq = ++positionsSeq
   positionsLoading.value = true
   positionsError.value = ''
   try {
-    positions.value = await listPositions('holding')
+    const rows = await listPositions('holding')
+    if (seq === positionsSeq && editorActive()) positions.value = rows
   } catch (error) {
-    positionsError.value = alertRequestMessage('positions', error)
+    if (seq === positionsSeq && editorActive() && !isAbortError(error)) positionsError.value = alertRequestMessage('positions', error)
   } finally {
-    positionsLoading.value = false
+    if (seq === positionsSeq && editorActive()) positionsLoading.value = false
   }
 }
 
@@ -281,6 +326,7 @@ const directionOptions = computed(() => {
     case 'price':
       return [{ label: '向上到价', value: 'gte' }, { label: '向下到价', value: 'lte' }]
     case 'pct_change':
+      if (expertMode.value) return [{ label: '大于等于', value: 'gte' }, { label: '小于等于', value: 'lte' }]
       return [{ label: '上涨', value: 'gte' }, { label: '下跌', value: 'lte' }]
     case 'ma':
       return [{ label: '站上均线', value: 'gte' }, { label: '跌破均线', value: 'lte' }]
@@ -308,7 +354,7 @@ const pctMagnitude = computed<number | null>({
 
 function setDirection(value: string | number) {
   form.value.op = value === 'lte' ? 'lte' : 'gte'
-  if (form.value.kind === 'pct_change' && form.value.threshold != null) {
+  if (form.value.kind === 'pct_change' && !expertMode.value && form.value.threshold != null) {
     form.value.threshold = form.value.op === 'lte'
       ? -Math.abs(form.value.threshold)
       : Math.abs(form.value.threshold)
@@ -318,7 +364,7 @@ function setDirection(value: string | number) {
 const thresholdLabel = computed(() => {
   switch (form.value.kind) {
     case 'price': return '目标价（元）'
-    case 'pct_change': return '涨跌幅（%）'
+    case 'pct_change': return expertMode.value ? '涨跌幅阈值（%，负数表示下跌）' : '涨跌幅（%）'
     case 'volume_surge': return '20 日均量倍数'
     case 'amplitude': return '振幅（%）'
     case 'earn_date': return '提前天数'
@@ -332,13 +378,18 @@ const thresholdLabel = computed(() => {
 const thresholdMax = computed(() => {
   if (form.value.kind === 'earn_date') return 30
   if (form.value.kind === 'cost_gain') return 1000
+  if (form.value.kind === 'pct_change' && expertMode.value) return undefined
   if (['pct_change', 'volume_surge', 'amplitude'].includes(form.value.kind)) return 100
-  if (['cost_drawdown', 'peak_drawdown'].includes(form.value.kind)) return 99.99
+  if (['cost_drawdown', 'peak_drawdown'].includes(form.value.kind)) return 99.9999
   return undefined
 })
 
 function validateTarget(): boolean {
   if (isPositionKind.value && positionScope.value === 'all') return true
+  if ((isPositionKind.value || isEarnKind.value) && form.value.market !== 'cn') {
+    message.warning(isPositionKind.value ? '持仓类提醒目前支持 A 股持仓，请选择 A 股或全部持仓' : '财报类提醒目前支持 A 股，请选择 A 股')
+    return false
+  }
   if (!form.value.symbol.trim()) {
     message.warning(isPositionKind.value ? '请选择一只当前持仓' : '请选择股票')
     return false
@@ -349,7 +400,8 @@ function validateTarget(): boolean {
 function validateParameters(): boolean {
   if (needsThreshold.value) {
     const value = Number(form.value.threshold)
-    if (!Number.isFinite(value) || value === 0 || (form.value.kind !== 'pct_change' && value < 0)) {
+    const signedThreshold = form.value.kind === 'pct_change' && expertMode.value
+    if (form.value.threshold == null || !Number.isFinite(value) || (!signedThreshold && value === 0) || (form.value.kind !== 'pct_change' && value < 0)) {
       message.warning(`请填写${thresholdLabel.value}`)
       return false
     }
@@ -367,12 +419,12 @@ function validateParameters(): boolean {
 }
 
 function goToParameters() {
-  if (!validateTarget()) return
+  if (!editorActive() || saving.value || !validateTarget()) return
   wizardStep.value = 3
 }
 
 function goToConfirm() {
-  if (!validateTarget() || !validateParameters()) return
+  if (!editorActive() || saving.value || !validateTarget() || !validateParameters()) return
   wizardStep.value = 4
 }
 
@@ -388,24 +440,37 @@ const preview = computed(() => alertPreview(form.value, targetLabel.value))
 const saving = ref(false)
 const saveError = ref('')
 
+function invalidateEditor() {
+  editorSeq++
+  saving.value = false
+  saveError.value = ''
+  selectedStock.value = null
+  clearStockSearch()
+}
+
 async function submit() {
-  if (!validateTarget() || !validateParameters() || saving.value) return
+  if (!editorActive() || saving.value || !validateTarget() || !validateParameters()) return
+  const seq = editorSeq
+  const id = editingId.value
+  const payload = { ...form.value }
+  const ownsSave = () => seq === editorSeq && id === editingId.value && editorActive()
   saving.value = true
   saveError.value = ''
   try {
-    if (editingId.value) await updateAlert(editingId.value, form.value)
-    else await createAlert(form.value)
-    message.success(editingId.value ? '提醒已更新' : '提醒已创建')
+    if (id) await updateAlert(id, payload)
+    else await createAlert(payload)
+    if (!ownsSave()) return
+    message.success(id ? '提醒已更新' : '提醒已创建')
     emit('saved')
-    resetWizard()
   } catch (error) {
-    saveError.value = alertRequestMessage('save', error)
+    if (ownsSave() && !isAbortError(error)) saveError.value = alertRequestMessage('save', error)
   } finally {
-    saving.value = false
+    if (ownsSave()) saving.value = false
   }
 }
 
 function cancelEditing() {
+  if (!editorActive() || saving.value) return
   emit('cancel-edit')
   resetWizard()
 }
@@ -417,6 +482,7 @@ watch(
       resetWizard()
       return
     }
+    invalidateEditor()
     form.value = inputFromRule(rule)
     const inferred = inferAlertTemplate(rule)
     selectedTemplateId.value = inferred
@@ -428,22 +494,42 @@ watch(
       : null
     wizardStep.value = 3
     saveError.value = ''
-    void nextTick(() => root.value?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+    const seq = editorSeq
+    void nextTick(() => {
+      if (seq === editorSeq && editorActive()) root.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
   },
-  { immediate: true },
+  { immediate: true, flush: 'sync' },
 )
 
 watch(
   () => props.stockContext,
-  (context) => applyStockContext(context),
-  { deep: true },
+  (context) => {
+    if (editingId.value) return
+    invalidateEditor()
+    applyStockContext(context)
+  },
+  { deep: true, flush: 'sync' },
 )
 
+watch(() => props.active, (active) => {
+  if (!active) {
+    invalidateEditor()
+    positionsSeq++
+  }
+}, { flush: 'sync' })
+
 onMounted(() => void loadPositions())
+onBeforeUnmount(() => {
+  disposed = true
+  editorSeq++
+  positionsSeq++
+  clearStockSearch()
+})
 </script>
 
 <template>
-  <div ref="root" class="alert-wizard">
+  <div ref="root" class="alert-wizard" :style="styleVars">
     <n-steps :current="wizardStep" size="small" class="wizard-steps">
       <n-step title="选模板" />
       <n-step title="选范围" />
@@ -549,7 +635,7 @@ onMounted(() => void loadPositions())
         <n-tag v-if="expertMode" size="small" type="warning">专家模式</n-tag>
       </div>
 
-      <n-form label-placement="top" :show-feedback="false" class="parameter-form">
+      <n-form label-placement="top" :show-feedback="false" :disabled="saving" class="parameter-form">
         <n-form-item v-if="expertMode" label="规则类型">
           <n-select :value="form.kind" :options="expertKindOptions" @update:value="selectExpertKind" />
         </n-form-item>
@@ -564,19 +650,19 @@ onMounted(() => void loadPositions())
 
         <n-form-item v-if="needsThreshold" :label="thresholdLabel">
           <n-input-number
-            v-if="form.kind === 'pct_change'"
+            v-if="form.kind === 'pct_change' && !expertMode"
             v-model:value="pctMagnitude"
-            :min="0.01"
+            :min="0.0001"
             :max="thresholdMax"
-            :precision="2"
+            :precision="4"
             style="width: 100%"
           />
           <n-input-number
             v-else
             v-model:value="form.threshold"
-            :min="form.kind === 'earn_date' ? 1 : 0.01"
+            :min="form.kind === 'earn_date' ? 1 : form.kind === 'pct_change' && expertMode ? undefined : 0.0001"
             :max="thresholdMax"
-            :precision="form.kind === 'earn_date' ? 0 : 2"
+            :precision="form.kind === 'earn_date' ? 0 : 4"
             style="width: 100%"
           />
         </n-form-item>
@@ -622,9 +708,9 @@ onMounted(() => void loadPositions())
       </n-form>
 
       <div class="wizard-actions">
-        <n-button @click="wizardStep = 2">返回</n-button>
-        <n-button v-if="editingId" quaternary @click="cancelEditing">取消编辑</n-button>
-        <n-button type="primary" @click="goToConfirm">查看确认</n-button>
+        <n-button :disabled="saving" @click="wizardStep = 2">返回</n-button>
+        <n-button v-if="editingId" :disabled="saving" quaternary @click="cancelEditing">取消编辑</n-button>
+        <n-button type="primary" :disabled="saving" @click="goToConfirm">查看确认</n-button>
       </div>
     </section>
 
@@ -641,8 +727,8 @@ onMounted(() => void loadPositions())
         <div class="recovery-action"><n-button size="small" :loading="saving" @click="submit">重试保存</n-button></div>
       </n-alert>
       <div class="wizard-actions">
-        <n-button @click="wizardStep = 3">返回修改</n-button>
-        <n-button v-if="editingId" quaternary @click="cancelEditing">取消编辑</n-button>
+        <n-button :disabled="saving" @click="wizardStep = 3">返回修改</n-button>
+        <n-button v-if="editingId" :disabled="saving" quaternary @click="cancelEditing">取消编辑</n-button>
         <n-button type="primary" :loading="saving" @click="submit">
           {{ editingId ? '保存修改' : '创建提醒' }}
         </n-button>

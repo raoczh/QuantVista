@@ -15,11 +15,25 @@ import (
 func resetAsyncLLMTasks(t *testing.T) {
 	t.Helper()
 	setupTestDB(t)
+	isolateAsyncLLMTestRuntime(t)
 	for _, table := range []string{"job_failure_notifications", "job_events", "job_steps", "llm_tasks", "job_runs"} {
 		if err := common.DB.Exec("DELETE FROM " + table).Error; err != nil {
 			t.Fatalf("清理任务表 %s 失败: %v", table, err)
 		}
 	}
+}
+
+// 每个异步用例拥有自己的 worker；数据库终态出现后仍可能有通知等收尾查询。
+// 等 worker 真正退出再恢复全局运行时，避免下一用例清库时旧任务仍在执行。
+func isolateAsyncLLMTestRuntime(t *testing.T) {
+	t.Helper()
+	previous := defaultJobRuntime
+	runtime := newJobRuntime(jobWorkerCount, jobCapacity)
+	defaultJobRuntime = runtime
+	t.Cleanup(func() {
+		runtime.close()
+		defaultJobRuntime = previous
+	})
 }
 
 func waitAsyncLLMTask(t *testing.T, userID, id int64) *LLMTaskView {

@@ -136,6 +136,10 @@ export interface ScanResult {
   items: ScanHit[] | null
   build_ms: number
   conditions: string[]
+  expected_date?: string
+  lag_open_days?: number
+  fresh_coverage?: number
+  stale_note?: string
 }
 
 export type StrategyRunStatus = 'queued' | 'running' | 'success' | 'failed' | 'canceled'
@@ -243,8 +247,8 @@ export function listScreenerResults(limit = 20) {
   return request<StrategyRun<ScanResult>[]>({ url: '/screener/results', method: 'get', params: { limit } })
 }
 
-export function getScreenerResult(id: number) {
-  return request<StrategyRun<ScanResult>>({ url: `/screener/results/${id}`, method: 'get' })
+export function getScreenerResult(id: number, signal?: AbortSignal) {
+  return request<StrategyRun<ScanResult>>({ url: `/screener/results/${id}`, method: 'get', signal })
 }
 
 export type WatchlistBatchStatus = 'applied' | 'undone' | 'undo_conflict'

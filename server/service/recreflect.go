@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"quantvista/common"
@@ -37,7 +39,7 @@ import (
 
 const (
 	// reflectionVersion 反思生成版本（prompt/三问结构/输入摘要口径变更时递增）。
-	reflectionVersion = "rf1"
+	reflectionVersion = "rf2"
 	// reflectionMinMatured 启用门槛：全库成熟标签（l2/next_open/真实推荐）不足此数不生成
 	//（S2-1 排序原则「确定性统计先行」——样本太少时 LLM 教训是噪声放大器）。
 	reflectionMinMatured = 30
@@ -91,32 +93,38 @@ type reflectionCandidate struct {
 // 门槛校验 → 挑未反思的新成熟标签（代表持有期）→ 批量一次 LLM → 落库。
 // best-effort：LLM 不可用/解析失败只记日志，下轮再试（无未消化状态残留）。
 func GenerateRecommendationReflections(ctx context.Context) (int, error) {
+	ctx = jobSubmissionContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if common.DB == nil {
 		return 0, errors.New("数据库不可用")
 	}
 	if !setting.LLMReflectionShadow() {
 		return 0, nil
 	}
-	// 启用门槛：成熟标签（l2 / next_open / 真实推荐）总量 ≥30。
+	// 门槛和候选共享同一读取时点；强平估价不充当完整结算样本。
 	var matured int64
-	if err := common.DB.Model(&model.RecommendationLabel{}).
-		Where("maturity_status = ? AND entry_mode = ? AND recommendation_id > 0 AND label_version = ?",
-			model.LabelMatured, model.EntryModeNextOpen, labelVersion).
-		Count(&matured).Error; err != nil {
-		return 0, err
-	}
-	if matured < reflectionMinMatured {
-		return 0, nil
-	}
-
-	cands, err := loadReflectionCandidates(reflectionBatchMax)
+	var cands []reflectionCandidate
+	asOf := time.Now()
+	err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		if err := reflectionMaturedQuery(tx, asOf).Count(&matured).Error; err != nil {
+			return err
+		}
+		if matured < reflectionMinMatured {
+			return nil
+		}
+		var err error
+		cands, err = loadReflectionCandidatesDB(tx, asOf, reflectionBatchMax)
+		return err
+	})
 	if err != nil || len(cands) == 0 {
 		return 0, err
 	}
 
 	// 系统默认 LLM（resolveNewsLLM：管理后台指定回退配置优先，否则首个管理员默认配置）。
 	// 反思与新闻情绪同为系统后台任务：token 记配置所有者审计、不扣次数配额。
-	cfg, apiKey, adminID, err := resolveNewsLLM()
+	cfg, apiKey, adminID, err := resolveNewsLLM(ctx)
 	if err != nil {
 		common.SysWarn("反思生成跳过：%v", err)
 		return 0, nil
@@ -124,56 +132,19 @@ func GenerateRecommendationReflections(ctx context.Context) (int, error) {
 
 	items, usage, err := callReflectionLLM(ctx, adminID, cfg, apiKey, cands)
 	if usage.TotalTokens > 0 {
-		consumeQuota(adminID, usage.TotalTokens, false)
+		consumeQuota(adminID, usage.TotalTokens)
+	}
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
 	}
 	if err != nil {
 		common.SysWarn("反思生成 LLM 失败（下轮再试）：%v", err)
 		return 0, nil
 	}
 
-	now := time.Now()
-	saved := 0
-	for idx, lesson := range items {
-		if idx < 0 || idx >= len(cands) {
-			continue // idx 越界=模型伪造关联，丢弃
-		}
-		c := cands[idx]
-		digest, _ := json.Marshal(map[string]any{
-			"strategy": c.label.Strategy, "source": c.label.Source, "regime": c.label.Regime,
-			"industry": c.label.Industry, "entry_chg_5d_pct": c.label.EntryChg5dPct,
-			"entry_turnover": c.label.EntryTurnover, "entry_score": c.label.EntryScore,
-		})
-		row := model.RecommendationReflection{
-			RecommendationID: c.label.RecommendationID,
-			HorizonDays:      c.label.HorizonDays,
-			UserID:           c.label.UserID,
-			Symbol:           c.label.Symbol,
-			Strategy:         c.label.Strategy,
-			RecType:          c.label.Type,
-			Outcome:          reflectionOutcome(c.label),
-			ReturnPct:        c.label.NetReturnPct,
-			AlphaPct:         c.label.AlphaPct,
-			Lesson:           truncateRunes(strings.TrimSpace(lesson), reflectionLessonMax),
-			FactorDigest:     string(digest),
-			// LabelMaturedAt=标签结算时刻；AvailableFrom=教训生成时刻（防回放泄漏的
-			// 注入下界——教训在生成之前不存在，回放注入早于此即未来泄漏）。
-			LabelMaturedAt:    c.label.UpdatedAt,
-			AvailableFrom:     now,
-			ReflectionVersion: reflectionVersion,
-		}
-		if row.Lesson == "" {
-			continue
-		}
-		// 唯一键 (recommendation_id, horizon_days) 冲突忽略：候选查询已排除已反思行，
-		// 冲突只可能来自并发重入，DoNothing 保幂等。
-		res := common.DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&row)
-		if res.Error != nil {
-			common.SysWarn("反思落库失败 rec=%d h=%d: %v", row.RecommendationID, row.HorizonDays, res.Error)
-			continue
-		}
-		if res.RowsAffected > 0 {
-			saved++
-		}
+	saved, err := saveRecommendationReflections(ctx, cands, items)
+	if err != nil {
+		return 0, err
 	}
 	if saved > 0 {
 		common.SysLog("推荐反思生成完成：本轮 %d 条（累计成熟标签 %d）", saved, matured)
@@ -181,35 +152,95 @@ func GenerateRecommendationReflections(ctx context.Context) (int, error) {
 	return saved, nil
 }
 
-// loadReflectionCandidates 挑未反思的成熟标签：l2 / next_open / 真实推荐 / 代表持有期，
-// 按结算时间倒序（最新成熟优先），LEFT JOIN 排除已反思行。
-func loadReflectionCandidates(limit int) ([]reflectionCandidate, error) {
-	var labels []model.RecommendationLabel
-	if err := common.DB.
-		Where("maturity_status = ? AND entry_mode = ? AND recommendation_id > 0 AND label_version = ?",
-			model.LabelMatured, model.EntryModeNextOpen, labelVersion).
-		Where("(type = ? AND horizon_days = 10) OR (type = ? AND horizon_days = 20)",
-			model.RecTypeShortTerm, model.RecTypeLongTerm).
-		Where("NOT EXISTS (SELECT 1 FROM recommendation_reflections rr WHERE rr.recommendation_id = recommendation_labels.recommendation_id AND rr.horizon_days = recommendation_labels.horizon_days)").
-		// 孤儿标签排除（审查修复批）：推荐条目被用户删除后标签仍在（标签是测量事实
-		// 不级联删），若只在取出后逐条跳过，「最新 5 条全是孤儿」会让每轮都重复选中
-		// 它们，更早的有效候选永远排不上队——必须在 SQL 侧排除孤儿行。
-		Where("EXISTS (SELECT 1 FROM recommendations r WHERE r.id = recommendation_labels.recommendation_id)").
-		// id ASC 是确定性 tiebreaker：同一轮结算的标签 updated_at 常落同一毫秒，
-		// 无 tiebreaker 时顺序退化为物理页序（不可复现，测试也曾因此 flaky）。
-		Order("updated_at DESC, id ASC").Limit(limit).
-		Find(&labels).Error; err != nil {
-		return nil, err
-	}
-	out := make([]reflectionCandidate, 0, len(labels))
-	for _, l := range labels {
-		var rec model.Recommendation
-		if err := common.DB.First(&rec, l.RecommendationID).Error; err != nil {
-			continue // 推荐条目已删：无理由上下文，跳过不反思
+// 网络请求结束后锁定并重验实际使用过的推荐和成熟事实，来源改变则下轮重算。
+func saveRecommendationReflections(ctx context.Context, cands []reflectionCandidate, items map[int]string) (int, error) {
+	indices := make([]int, 0, len(items))
+	for idx, lesson := range items {
+		if idx >= 0 && idx < len(cands) && strings.TrimSpace(lesson) != "" {
+			indices = append(indices, idx)
 		}
-		out = append(out, reflectionCandidate{label: l, rec: rec})
 	}
-	return out, nil
+	// 多执行器统一按推荐主键取锁，避免相反候选顺序造成锁冲突。
+	sort.Slice(indices, func(i, j int) bool { return cands[indices[i]].rec.ID < cands[indices[j]].rec.ID })
+	saved := 0
+	err := withJobResultTransaction(ctx, func(tx *gorm.DB) error {
+		for _, idx := range indices {
+			c := cands[idx]
+			var rec model.Recommendation
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&rec, c.rec.ID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					continue
+				}
+				return err
+			}
+			rec.CreatedAt, c.rec.CreatedAt = rec.CreatedAt.UTC(), c.rec.CreatedAt.UTC()
+			if rec != c.rec {
+				continue
+			}
+			var label model.RecommendationLabel
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&label, c.label.ID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					continue
+				}
+				return err
+			}
+			if !sameReflectionLabel(label, c.label) {
+				continue
+			}
+			now := time.Now()
+			digest, err := json.Marshal(map[string]any{
+				"strategy": c.label.Strategy, "source": c.label.Source, "regime": c.label.Regime,
+				"industry": c.label.Industry, "entry_chg_5d_pct": c.label.EntryChg5dPct,
+				"entry_turnover": c.label.EntryTurnover, "entry_score": c.label.EntryScore,
+				"has_bench": c.label.HasBench,
+			})
+			if err != nil {
+				return err
+			}
+			row := model.RecommendationReflection{
+				RecommendationID: c.label.RecommendationID,
+				HorizonDays:      c.label.HorizonDays,
+				UserID:           c.label.UserID,
+				Symbol:           c.label.Symbol,
+				Strategy:         c.label.Strategy,
+				RecType:          c.label.Type,
+				Outcome:          reflectionOutcome(c.label),
+				ReturnPct:        c.label.NetReturnPct,
+				AlphaPct:         c.label.AlphaPct,
+				Lesson:           truncateRunes(strings.TrimSpace(items[idx]), reflectionLessonMax),
+				FactorDigest:     string(digest),
+				// LabelMaturedAt=标签结算时刻；AvailableFrom=教训生成时刻（防回放泄漏的
+				// 注入下界——教训在生成之前不存在，回放注入早于此即未来泄漏）。
+				LabelMaturedAt:    c.label.UpdatedAt,
+				AvailableFrom:     now,
+				ReflectionVersion: reflectionVersion,
+			}
+			if !c.label.HasBench {
+				row.AlphaPct = 0
+			}
+			// 唯一键 (recommendation_id, horizon_days) 冲突忽略：候选查询已排除已反思行，
+			// 冲突只可能来自并发重入，DoNothing 保幂等。
+			res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row)
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected > 0 {
+				saved++
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return saved, nil
+}
+
+func sameReflectionLabel(a, b model.RecommendationLabel) bool {
+	a.SignalAsOf, b.SignalAsOf = a.SignalAsOf.UTC(), b.SignalAsOf.UTC()
+	a.CreatedAt, b.CreatedAt = a.CreatedAt.UTC(), b.CreatedAt.UTC()
+	a.UpdatedAt, b.UpdatedAt = a.UpdatedAt.UTC(), b.UpdatedAt.UTC()
+	return a == b
 }
 
 // callReflectionLLM 批量一次 LLM 反思调用。返回 idx→lesson（程序校验 idx，越界丢弃在
@@ -218,13 +249,17 @@ func callReflectionLLM(ctx context.Context, userID int64, cfg *model.LLMConfig, 
 	var usage chatUsage
 	rows := make([]map[string]any, 0, len(cands))
 	for i, c := range cands {
+		var alpha any
+		if c.label.HasBench {
+			alpha = c.label.AlphaPct
+		}
 		rows = append(rows, map[string]any{
 			"idx": i, "symbol": c.label.Symbol, "name": c.rec.Name,
 			"action": c.label.Action, "strategy": c.label.Strategy, "rec_type": c.label.Type,
 			"reason_then": c.rec.Summary, // 推荐当时的首条理由（生成时点固化）
 			"outcome": map[string]any{
 				"horizon_days": c.label.HorizonDays, "net_return_pct": c.label.NetReturnPct,
-				"alpha_pct": c.label.AlphaPct, "mfe_pct": c.label.MfePct, "mae_pct": c.label.MaePct,
+				"alpha_pct": alpha, "has_bench": c.label.HasBench, "mfe_pct": c.label.MfePct, "mae_pct": c.label.MaePct,
 				"hit_take_profit": c.label.HitTakeProfit, "hit_stop_loss": c.label.HitStopLoss,
 				"result": reflectionOutcome(c.label),
 			},
@@ -248,7 +283,7 @@ func callReflectionLLM(ctx context.Context, userID int64, cfg *model.LLMConfig, 
 	run.hashPrompt(convo)
 	type reflOut struct {
 		Reflections []struct {
-			Idx    int    `json:"idx"`
+			Idx    *int   `json:"idx"`
 			Lesson string `json:"lesson"`
 		} `json:"reflections"`
 	}
@@ -259,7 +294,7 @@ func callReflectionLLM(ctx context.Context, userID int64, cfg *model.LLMConfig, 
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			ReasoningEffort: cfg.ReasoningEffort,
-			Temperature: cfg.Temperature, MaxTokens: requestMax,
+			Temperature:     cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: llmAllowPrivate(false, cfg),
 			Repair: attempt > 0,
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
@@ -281,11 +316,20 @@ func callReflectionLLM(ctx context.Context, userID int64, cfg *model.LLMConfig, 
 		var out reflOut
 		if jerr := json.Unmarshal([]byte(extractJSONObject(res.Content)), &out); jerr == nil && len(out.Reflections) > 0 {
 			items := make(map[int]string, len(out.Reflections))
+			seen := make(map[int]bool, len(out.Reflections))
 			for _, r := range out.Reflections {
-				if strings.TrimSpace(r.Lesson) == "" {
+				if r.Idx == nil || *r.Idx < 0 || *r.Idx >= len(cands) {
 					continue
 				}
-				items[r.Idx] = r.Lesson
+				idx := *r.Idx
+				if seen[idx] {
+					delete(items, idx) // 重复关联有歧义，该序号整组丢弃。
+					continue
+				}
+				seen[idx] = true
+				if strings.TrimSpace(r.Lesson) != "" {
+					items[idx] = r.Lesson
+				}
 			}
 			if len(items) > 0 {
 				return items, usage, nil
@@ -327,7 +371,7 @@ type reflectionShadowSnapshot struct {
 }
 
 // reflectionShadowVersion 影子检索快照版本（与生成版本 reflectionVersion 自 P2-3 起
-// 拆分：生成逻辑 rf1 未变，检索快照升 rf2=分层可观测；改检索/分层结构递增此常量）。
+// 拆分：检索快照 rf2=分层可观测；改检索/分层结构递增此常量）。
 const reflectionShadowVersion = "rf2"
 
 // reflectionLayers 影子检索分层元数据（Tier1=同标的教训、Tier2=同策略教训、
@@ -355,7 +399,7 @@ type reflectionTier3Stats struct {
 
 // reflectionLayerStats 计算分层元数据（纯查询；恒带 userID 与 available_from 过滤——
 // 用户隔离与防回放泄漏铁律对分层统计同样生效，严禁移除）。
-func reflectionLayerStats(asOf time.Time, userID int64, recType, strategy string, symbols []string, matched []reflectionMatch) *reflectionLayers {
+func reflectionLayerStats(db *gorm.DB, asOf time.Time, userID int64, recType, strategy string, symbols []string, matched []reflectionMatch) (*reflectionLayers, error) {
 	l := &reflectionLayers{}
 	for _, m := range matched {
 		switch m.MatchedBy {
@@ -367,39 +411,33 @@ func reflectionLayerStats(asOf time.Time, userID int64, recType, strategy string
 		l.ApproxChars += len([]rune(m.Lesson))
 	}
 	var total int64
-	if err := common.DB.Model(&model.RecommendationReflection{}).
+	if err := db.Model(&model.RecommendationReflection{}).
 		Where("user_id = ? AND available_from <= ? AND (symbol IN ? OR (rec_type = ? AND strategy = ?))",
 			userID, asOf, symbols, recType, strategy).
-		Count(&total).Error; err == nil {
-		l.CandidatesTotal = int(total)
-		if trimmed := l.CandidatesTotal - len(matched); trimmed > 0 {
-			l.TrimmedCount = trimmed
-		}
+		Count(&total).Error; err != nil {
+		return nil, err
 	}
-	var rows []model.RecommendationReflection
-	if err := common.DB.Select("outcome", "return_pct").
+	l.CandidatesTotal = int(total)
+	if trimmed := l.CandidatesTotal - len(matched); trimmed > 0 {
+		l.TrimmedCount = trimmed
+	}
+	var stats reflectionTier3Stats
+	if err := db.Model(&model.RecommendationReflection{}).
+		Select(`COUNT(*) AS total,
+			COALESCE(SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END), 0) AS wins,
+			COALESCE(SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END), 0) AS losses,
+			COALESCE(SUM(CASE WHEN outcome = 'take_profit' THEN 1 ELSE 0 END), 0) AS take_profit,
+			COALESCE(SUM(CASE WHEN outcome = 'stop_loss' THEN 1 ELSE 0 END), 0) AS stop_loss,
+			COALESCE(AVG(return_pct), 0) AS avg_return_pct`).
 		Where("user_id = ? AND available_from <= ? AND rec_type = ? AND strategy = ?", userID, asOf, recType, strategy).
-		Find(&rows).Error; err == nil && len(rows) > 0 {
-		st := &reflectionTier3Stats{Total: len(rows)}
-		var sum float64
-		for _, r := range rows {
-			sum += r.ReturnPct
-			// 结局串与 reflectionOutcome 程序归类同源（win/loss/take_profit/stop_loss）。
-			switch r.Outcome {
-			case "win":
-				st.Wins++
-			case "loss":
-				st.Losses++
-			case "take_profit":
-				st.TakeProfit++
-			case "stop_loss":
-				st.StopLoss++
-			}
-		}
-		st.AvgReturnPct = round2(sum / float64(len(rows)))
-		l.Tier3Stats = st
+		Scan(&stats).Error; err != nil {
+		return nil, err
 	}
-	return l
+	if stats.Total > 0 {
+		stats.AvgReturnPct = round2(stats.AvgReturnPct)
+		l.Tier3Stats = &stats
+	}
+	return l, nil
 }
 
 // reflectionShadowJSON 推荐生成时的影子检索快照（runGeneration 调用，best-effort）：
@@ -407,25 +445,37 @@ func reflectionLayerStats(asOf time.Time, userID int64, recType, strategy string
 // 不碰 picks**——影子纪律的代码形态就是「返回值只赋给 batch.ReflectionJSON」。
 // P2-3：llm_layered_context 开时快照升 rf2（补分层元数据与 Tier3 聚合统计），关时
 // 保持 rf1 形态——两 flag 正交（reflection_shadow 控检索与否、layered_context 控分层）。
-func reflectionShadowJSON(userID int64, recType, strategy string, llmCands []candidate) string {
-	if !setting.LLMReflectionShadow() {
+func reflectionShadowJSON(userID int64, recType, strategy string, llmCands []candidate, contexts ...context.Context) string {
+	if common.DB == nil || !setting.LLMReflectionShadow() {
 		return ""
 	}
 	symbols := make([]string, 0, len(llmCands))
 	for _, c := range llmCands {
 		symbols = append(symbols, c.Symbol)
 	}
-	matched := lookupReflections(time.Now(), userID, recType, strategy, symbols)
-	if len(matched) == 0 {
-		return ""
-	}
 	snap := reflectionShadowSnapshot{
-		Version: reflectionVersion, CheckedAt: time.Now(), Matched: matched,
+		Version: "rf1", CheckedAt: time.Now(),
 		Note: "影子层：历史教训仅记录未注入 prompt，不影响本批推荐结果；注入转正需影子配对评审",
 	}
-	if setting.LLMLayeredContext() {
-		snap.Version = reflectionShadowVersion
-		snap.Layers = reflectionLayerStats(time.Now(), userID, recType, strategy, symbols, matched)
+	layered := setting.LLMLayeredContext()
+	err := readSnapshotTx(jobSubmissionContext(contexts...), func(tx *gorm.DB) error {
+		var err error
+		snap.Matched, err = lookupReflectionsDB(tx, snap.CheckedAt, userID, recType, strategy, symbols)
+		if err != nil || len(snap.Matched) == 0 {
+			return err
+		}
+		if layered {
+			snap.Version = reflectionShadowVersion
+			snap.Layers, err = reflectionLayerStats(tx, snap.CheckedAt, userID, recType, strategy, symbols, snap.Matched)
+		}
+		return err
+	})
+	if err != nil {
+		common.SysWarn("反思影子读取失败 user=%d: %v", userID, err)
+		return ""
+	}
+	if len(snap.Matched) == 0 {
+		return ""
 	}
 	b, err := json.Marshal(snap)
 	if err != nil {
@@ -438,9 +488,26 @@ func reflectionShadowJSON(userID int64, recType, strategy string, llmCands []can
 // 铁律；同标的教训优先，名额未满再补同策略教训（symbol 命中语义更强）。
 // userID 过滤是用户隔离铁律（审查修复批）：反思行携带来源用户的标的/收益结局/教训文本，
 // 跨用户返回=把 A 的持仓线索泄漏进 B 的批次快照并在前端展示——严禁移除该条件。
-func lookupReflections(asOf time.Time, userID int64, recType, strategy string, symbols []string) []reflectionMatch {
+func lookupReflections(asOf time.Time, userID int64, recType, strategy string, symbols []string, contexts ...context.Context) []reflectionMatch {
 	if common.DB == nil || len(symbols) == 0 {
 		return nil
+	}
+	var out []reflectionMatch
+	err := readSnapshotTx(jobSubmissionContext(contexts...), func(tx *gorm.DB) error {
+		var err error
+		out, err = lookupReflectionsDB(tx, asOf, userID, recType, strategy, symbols)
+		return err
+	})
+	if err != nil {
+		common.SysWarn("反思教训读取失败 user=%d: %v", userID, err)
+		return nil
+	}
+	return out
+}
+
+func lookupReflectionsDB(db *gorm.DB, asOf time.Time, userID int64, recType, strategy string, symbols []string) ([]reflectionMatch, error) {
+	if len(symbols) == 0 {
+		return nil, nil
 	}
 	out := make([]reflectionMatch, 0, reflectionShadowMax)
 	seen := map[int64]bool{}
@@ -463,16 +530,18 @@ func lookupReflections(asOf time.Time, userID int64, recType, strategy string, s
 	//（reflectionBatchMax=5 条一次落库），时间戳完全相同；无 tiebreaker 时候选超过名额
 	// 选中哪几条退化为 SQLite 物理页序，影子快照不可复现。同 loadReflectionCandidates
 	// 的 id ASC 先例（那处曾导致测试 flaky）。
-	if err := common.DB.Where("user_id = ? AND available_from <= ? AND symbol IN ?", userID, asOf, symbols).
-		Order("available_from DESC, id DESC").Limit(reflectionShadowMax).Find(&bySymbol).Error; err == nil {
-		appendRows(bySymbol, "symbol")
+	if err := db.Where("user_id = ? AND available_from <= ? AND symbol IN ?", userID, asOf, symbols).
+		Order("available_from DESC, id DESC").Limit(reflectionShadowMax).Find(&bySymbol).Error; err != nil {
+		return nil, err
 	}
+	appendRows(bySymbol, "symbol")
 	if len(out) < reflectionShadowMax {
 		var byStrategy []model.RecommendationReflection
-		if err := common.DB.Where("user_id = ? AND available_from <= ? AND rec_type = ? AND strategy = ?", userID, asOf, recType, strategy).
-			Order("available_from DESC, id DESC").Limit(reflectionShadowMax).Find(&byStrategy).Error; err == nil {
-			appendRows(byStrategy, "strategy")
+		if err := db.Where("user_id = ? AND available_from <= ? AND rec_type = ? AND strategy = ?", userID, asOf, recType, strategy).
+			Order("available_from DESC, id DESC").Limit(reflectionShadowMax).Find(&byStrategy).Error; err != nil {
+			return nil, err
 		}
+		appendRows(byStrategy, "strategy")
 	}
-	return out
+	return out, nil
 }

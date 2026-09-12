@@ -316,7 +316,7 @@ func TestRecentDiscoveryWindowRecomputesScoreAndKeepsGlobalPool(t *testing.T) {
 			t.Fatalf("%s 发现失败: %v", date, err)
 		}
 	}
-	first := recentDiscoveryCandidates("cn", 20)
+	first := recentDiscoveryCandidatesAt(t.Context(), "cn", 20, time.Date(2043, 4, 7, 18, 0, 0, 0, time.Local))
 	if len(first) == 0 {
 		t.Fatal("最近发现不应为空")
 	}
@@ -362,8 +362,8 @@ func TestRecentDiscoveryWindowRecomputesScoreAndKeepsGlobalPool(t *testing.T) {
 	// 两个用户只读取同一份 global 事实，不应改变 run 数量。
 	var before, after int64
 	common.DB.Model(&model.CandidateDiscoveryRun{}).Where("trade_date IN ?", dates).Count(&before)
-	_ = recentDiscoveryCandidates("cn", 20)
-	_ = recentDiscoveryCandidates("cn", 20)
+	_ = recentDiscoveryCandidatesAt(t.Context(), "cn", 20, time.Date(2043, 4, 7, 18, 0, 0, 0, time.Local))
+	_ = recentDiscoveryCandidatesAt(t.Context(), "cn", 20, time.Date(2043, 4, 7, 18, 0, 0, 0, time.Local))
 	common.DB.Model(&model.CandidateDiscoveryRun{}).Where("trade_date IN ?", dates).Count(&after)
 	if before != after {
 		t.Fatalf("用户消费发现事实不应重复创建 run: %d -> %d", before, after)

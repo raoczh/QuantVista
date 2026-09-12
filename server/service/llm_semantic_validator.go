@@ -96,7 +96,7 @@ func recPickRRRatio(p recPick) float64 {
 	if risk <= 0 {
 		return 0
 	}
-	return round2((p.TakeProfit - entry) / risk)
+	return (p.TakeProfit - entry) / risk
 }
 
 // applyRecPickSemantics 推荐 pick 的跨字段纪律（normalizePick 尾部调用，价位已归一）：
@@ -110,9 +110,9 @@ func applyRecPickSemantics(p recPick) recPick {
 		return p
 	}
 	rr := recPickRRRatio(p)
-	if rr > 0 && rr < recPickMinRR {
+	if rr > 0 && rr < recPickMinRR-1e-9 {
 		p.Action = model.RecActionWatch
-		p.Risks = append(p.Risks, fmt.Sprintf("盈亏比 %.2f 低于 %.1f 纪律线（止盈到止损的赔率不足），已降级为观察", rr, recPickMinRR))
+		p.Risks = append(p.Risks, fmt.Sprintf("盈亏比 %.4f 低于 %.1f 纪律线（止盈到止损的赔率不足），已降级为观察", rr, recPickMinRR))
 	}
 	return p
 }

@@ -14,6 +14,7 @@ import (
 	"quantvista/setting"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // QaService 个股 AI 问答：首轮采集一次个股数据快照并落库，之后多轮追问复用该快照，
@@ -130,7 +131,7 @@ type qaAskContext struct {
 // qaConvLocks 会话级进程内互斥：同一会话的并发追问必须串行，否则两问会各自
 // loadMessages 到相同历史（上下文重复）、消息落库交错倒序、并各自通过 qaMaxMessages
 // 检查后 +2 突破上限。个人自用单实例，进程内锁足够，无需 DB 锁。key=conversationID。
-// 新会话（ConversationID<=0）不加锁：其 ID 未返回前无第二个请求能引用它，天然无竞争。
+// 新会话创建后也会出现在列表中，最终提交仍须锁定数据库父行并复验会话与消息版本。
 var qaConvLocks sync.Map // int64 -> *sync.Mutex
 
 func qaConvLock(convID int64) *sync.Mutex {
@@ -152,7 +153,10 @@ func (s *QaService) AskAsync(userID int64, allowPrivate bool, req QaAskRequest) 
 }
 
 func (s *QaService) registerDurableJobHandler() {
-	RegisterDurableLLMJobHandler(JobKindQA, qaJobTimeout,
+	binding := defaultLLMTaskBinding(JobKindQA)
+	// 问答正文已经由 finalizeAsk 的取消保护事务提交；后到取消不能把已保存回答报成失败。
+	binding.resultCommittedByHandler = true
+	defaultJobRuntime.registerWithBinding(JobKindQA, qaJobTimeout,
 		func(ctx context.Context, userID int64, allowPrivate bool, raw json.RawMessage) (DurableJobResult, error) {
 			var req QaAskRequest
 			if err := json.Unmarshal(raw, &req); err != nil {
@@ -176,7 +180,7 @@ func (s *QaService) registerDurableJobHandler() {
 				}
 			}
 			return result, nil
-		})
+		}, binding, true)
 }
 
 // Ask 提问（非流式）：新建会话（首轮采集快照）或在已有会话上追问。返回会话全量视图。
@@ -206,19 +210,24 @@ func (s *QaService) ask(ctx context.Context, userID int64, allowPrivate bool, re
 		mu.Lock()
 		defer mu.Unlock()
 	}
+	defer s.abortNewConv(ac)
+	ctx, finishQuota, err := beginManualQuotaAction(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer finishQuota()
 	res, callErr := chatCompletion(ctx, chatParams{
 		BaseURL: ac.cfg.BaseURL, APIKey: ac.apiKey, Model: ac.cfg.Model, EndpointType: ac.cfg.EndpointType,
 		ReasoningEffort: ac.cfg.ReasoningEffort,
-		Temperature: ac.cfg.Temperature, MaxTokens: moduleTokenCap("qa", ac.cfg.MaxTokens),
+		Temperature:     ac.cfg.Temperature, MaxTokens: moduleTokenCap("qa", ac.cfg.MaxTokens),
 		Messages: ac.messages, JSONMode: false, AllowPrivate: llmAllowPrivate(allowPrivate, ac.cfg),
 		Meta: ac.run.chatMeta(userID, ac.cfg, 1),
 	})
 	ac.run.record(res, callErr)
 	if callErr != nil {
-		s.abortNewConv(ac)
 		return nil, callErr
 	}
-	return s.finalizeAsk(userID, ac, res)
+	return s.finalizeAsk(ctx, userID, ac, res)
 }
 
 // AskStream 流式提问（S1）：delta 增量经 onDelta 回调吐给调用方（controller 逐行推 NDJSON），
@@ -244,10 +253,16 @@ func (s *QaService) AskStream(ctx context.Context, userID int64, allowPrivate bo
 		mu.Lock()
 		defer mu.Unlock()
 	}
+	defer s.abortNewConv(ac)
+	ctx, finishQuota, err := beginManualQuotaAction(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer finishQuota()
 	params := chatParams{
 		BaseURL: ac.cfg.BaseURL, APIKey: ac.apiKey, Model: ac.cfg.Model, EndpointType: ac.cfg.EndpointType,
 		ReasoningEffort: ac.cfg.ReasoningEffort,
-		Temperature: ac.cfg.Temperature, MaxTokens: moduleTokenCap("qa", ac.cfg.MaxTokens),
+		Temperature:     ac.cfg.Temperature, MaxTokens: moduleTokenCap("qa", ac.cfg.MaxTokens),
 		Messages: ac.messages, JSONMode: false, AllowPrivate: llmAllowPrivate(allowPrivate, ac.cfg),
 		Meta: ac.run.chatMeta(userID, ac.cfg, 1),
 	}
@@ -263,10 +278,9 @@ func (s *QaService) AskStream(ctx context.Context, userID int64, allowPrivate bo
 	}
 	ac.run.record(res, callErr)
 	if callErr != nil {
-		s.abortNewConv(ac)
 		return nil, callErr
 	}
-	return s.finalizeAsk(userID, ac, res)
+	return s.finalizeAsk(ctx, userID, ac, res)
 }
 
 // prepareAsk 校验入参、解析 LLM 配置与配额、取得/新建会话、组装消息序列。
@@ -274,11 +288,11 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 	question := req.Question
 
 	// LLM 配置 + 配额熔断。
-	cfg, apiKey, err := s.llm.ResolveForUse(userID, req.LLMConfigID)
+	cfg, apiKey, err := s.llm.ResolveForUse(userID, req.LLMConfigID, ctx)
 	if err != nil {
 		return nil, err
 	}
-	if err := checkQuota(userID); err != nil {
+	if err := checkQuota(userID, ctx); err != nil {
 		return nil, err
 	}
 
@@ -286,6 +300,9 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 	// run 的 prompt 版本全部消费同一份（此前三处各查一次库，模板中途编辑会造成
 	// 「正文与版本不一致」或同一次提问内版本漂移）。
 	qaPrompt := loadPromptRuntime(userID, model.PromptModuleQa)
+	if qaPrompt.ReadError != nil {
+		return nil, qaPrompt.ReadError
+	}
 	promptVersion := qaPrompt.Version(qaPromptVersion)
 
 	// 取得或新建会话。
@@ -295,7 +312,7 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 		if err := common.DB.Where("id = ? AND user_id = ?", req.ConversationID, userID).First(&conv).Error; err != nil {
 			return nil, errors.New("会话不存在")
 		}
-		if conv.MessageCount >= qaMaxMessages {
+		if conv.MessageCount+2 > qaMaxMessages {
 			return nil, errors.New("该会话消息已达上限，请新建会话")
 		}
 	} else if req.AnalysisRecordID > 0 {
@@ -350,6 +367,7 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 	// （分层历史段/时效重判段/本轮问题——随本轮输入变化的内容全在这里，见 buildMessagesFrom）。
 	history, err := s.loadMessages(userID, conv.ID)
 	if err != nil {
+		s.abortNewConv(&qaAskContext{conv: conv, isNew: isNewConv})
 		return nil, err
 	}
 	messages, ctxLayers := s.buildMessagesFrom(qaPrompt, conv, history, question)
@@ -378,7 +396,8 @@ func (s *QaService) prepareAsk(ctx context.Context, userID int64, req QaAskReque
 // abortNewConv 调用失败时清理刚建的空会话，避免列表堆积 0 消息的孤儿会话。
 func (s *QaService) abortNewConv(ac *qaAskContext) {
 	if ac.isNew && ac.conv.ID > 0 {
-		common.DB.Delete(&model.AiConversation{}, ac.conv.ID)
+		common.DB.Where("id = ? AND user_id = ? AND message_count = 0", ac.conv.ID, ac.conv.UserID).
+			Delete(&model.AiConversation{})
 	}
 }
 
@@ -392,7 +411,7 @@ func qaCacheScope(convID int64) string {
 }
 
 // finalizeAsk 调用成功后的统一收尾：证据核验 → 事务落库两条消息 → 配额 → 返回会话视图。
-func (s *QaService) finalizeAsk(userID int64, ac *qaAskContext, res *chatResult) (*QaConversationView, error) {
+func (s *QaService) finalizeAsk(ctx context.Context, userID int64, ac *qaAskContext, res *chatResult) (*QaConversationView, error) {
 	answer := strings.TrimSpace(res.Content)
 	if answer == "" {
 		answer = "（模型未返回内容，请重试或调整问题）"
@@ -432,7 +451,27 @@ func (s *QaService) finalizeAsk(userID int64, ac *qaAskContext, res *chatResult)
 	// 事务落库：user 提问 + assistant 回答，并更新会话计数/token。
 	// 不变式：conv.DataSnapshot 永不回写——旧会话快照原地覆盖会让历史回答与核验结果
 	// 失去可复现性；「按最新数据」一律以新会话（新快照新 ID）承载。
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
+	ac.run.acceptRouteAttribution()
+	provider, modelName := ac.cfg.Provider, ac.cfg.Model
+	if target := ac.run.acceptedTarget; target.Model != "" {
+		provider, modelName = target.Provider, target.Model
+	}
+	var conv model.AiConversation
+	var msgs []model.AiConversationMessage
+	err := withJobResultTransaction(ctx, func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND user_id = ?", ac.conv.ID, userID).First(&conv).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("会话不存在")
+			}
+			return err
+		}
+		if conv.MessageCount+2 > qaMaxMessages {
+			return errors.New("该会话消息已达上限，请新建会话")
+		}
+		if conv.MessageCount != ac.conv.MessageCount {
+			return errors.New("会话已有新消息，请刷新后重试")
+		}
 		um := model.AiConversationMessage{ConversationID: ac.conv.ID, UserID: userID, Role: model.QaRoleUser, Content: ac.question}
 		if err := tx.Create(&um).Error; err != nil {
 			return err
@@ -446,22 +485,37 @@ func (s *QaService) finalizeAsk(userID int64, ac *qaAskContext, res *chatResult)
 		if err := tx.Create(&am).Error; err != nil {
 			return err
 		}
-		return tx.Model(&model.AiConversation{}).Where("id = ?", ac.conv.ID).Updates(map[string]any{
-			"message_count": gorm.Expr("message_count + 2"),
-			"total_tokens":  gorm.Expr("total_tokens + ?", res.Usage.TotalTokens),
+		conv.MessageCount += 2
+		conv.TotalTokens += res.Usage.TotalTokens
+		conv.PromptVersion = ac.promptVersion
+		conv.LLMConfigID, conv.Provider, conv.Model = ac.cfg.ID, provider, modelName
+		conv.UpdatedAt = time.Now()
+		if err := tx.Model(&model.AiConversation{}).Where("id = ? AND user_id = ?", conv.ID, userID).Updates(map[string]any{
+			"message_count": conv.MessageCount,
+			"total_tokens":  conv.TotalTokens,
 			// P0-6 修复批：刷新用 prepare 阶段固化的版本（与本轮 buildMessages 正文同快照），
 			// 不再重新查库——落库版本必然对应本轮实际使用的模板内容。
 			"prompt_version": ac.promptVersion,
-		}).Error
+			"llm_config_id":  conv.LLMConfigID,
+			"provider":       provider,
+			"model":          modelName,
+			"updated_at":     conv.UpdatedAt,
+		}).Error; err != nil {
+			return err
+		}
+		msgs = append(append(append([]model.AiConversationMessage{}, ac.history...), um), am)
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	ac.isNew = false
 	if res.Usage.TotalTokens > 0 {
-		consumeQuota(userID, res.Usage.TotalTokens, true)
+		consumeQuota(userID, res.Usage.TotalTokens)
 	}
 
-	return s.Get(userID, ac.conv.ID)
+	// 成功已由事务确定，返回本次已提交的视图，不再让后续读取故障把成功写入报成失败。
+	return s.conversationView(conv, msgs), nil
 }
 
 // qaConversationFromAnalysis 从分析记录新建问答会话：复用其数据快照（已 fitBudget），
@@ -503,14 +557,17 @@ func qaPromptVersionFor(userID int64) string {
 
 // qaCurrentFreshness 按「当前时刻」重判会话固定快照的行情时效（P0 第二轮：会话快照
 // 固化不回写，但时效声明必须随时间演进——昨天 fresh 的快照今天不能继续声明 fresh）。
-// 返回 状态（fresh/stale/unknown；空=快照无行情时间或无法判定）与人话说明。
+// 返回状态（fresh/stale/unknown）与说明；无法核验不能回退到创建时的 fresh。
 func (s *QaService) qaCurrentFreshness(market string, meta *qaSnapshotMeta) (string, string) {
-	if s.market == nil || meta == nil || meta.QuoteAsOf == "" {
-		return "", ""
+	if meta == nil || meta.QuoteAsOf == "" {
+		return freshStatusUnknown, "快照缺少行情时间，无法核验当前时效"
+	}
+	if s.market == nil {
+		return freshStatusUnknown, "行情时效服务不可用，无法核验当前时效"
 	}
 	t, err := time.ParseInLocation("2006-01-02 15:04:05", meta.QuoteAsOf, time.Local)
 	if err != nil {
-		return "", ""
+		return freshStatusUnknown, "快照行情时间无法解析，无法核验当前时效"
 	}
 	fi := s.market.QuoteFreshnessOf(orStr(market, "cn"), t)
 	switch fi.Status {
@@ -623,7 +680,7 @@ func quoteAsOfOf(conv model.AiConversation) string {
 // 问题加【本轮问题】分界头；prompt_cache_key 追加会话级 scope。q13: P2-3 多层上下文——被 qaHistoryLimit 裁剪的更早轮次注入程序化「历史会话分层
 // 上下文」段（Tier2 截断索引 + Tier3 按本轮问题相关性检索的原文摘录），flag
 // llm_layered_context 关闭回退 q12 的静默截断；q12: 移除回答正文 800 汉字限制；q11: 回答正文长度纪律；q10: 首答新鲜度门（全源无 fresh 默认拒绝、allow_stale 才生成且快照打 stale_mode）+ 快照时效按每轮提问时刻重判注入（旧会话跨天不再向模型声明 fresh）；q9: 快照新鲜度元数据（captured_at/quote_as_of/bars_as_of/quote_source/freshness_status/market_state），stale 时必须声明行情截至时间、非交易时段按收盘口径表述；q8: P3a org_view 机构观点段进快照说明（卖方乐观偏差纪律）；q7: F2 finance 财务段（F10 最新期主要指标与近几期趋势）进快照说明；q6: risk_gate 风险闸门段、允许轻量 Markdown（流式渲染配套）；q5: announcements 公告段；q4: news 舆情段；q3: 回答引用的数字会被程序化核验，威慑幻觉；q2: 快照含五维量化评分锚点、要求引用数值、禁用先验记忆。
-const qaPromptVersion = "q14"
+const qaPromptVersion = "q15" // q15：无法核验当前时效时也明确限制为历史数据解释。
 
 // qaRoleTaskSeg 问答角色任务段（L3）：module=qa 自定义模板替换的部分——角色定位与
 // 回答风格。P0-6 起自定义不再整段替换，要求契约段恒由系统追加。
@@ -666,25 +723,33 @@ func (s *QaService) List(userID int64, limit int) ([]model.AiConversation, error
 // Get 取会话详情（含消息）。仅本人。
 func (s *QaService) Get(userID, id int64) (*QaConversationView, error) {
 	var conv model.AiConversation
-	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&conv).Error; err != nil {
-		return nil, errors.New("会话不存在")
-	}
-	msgs, err := s.loadMessages(userID, id)
+	var msgs []model.AiConversationMessage
+	err := readSnapshotTx(context.Background(), func(tx *gorm.DB) error {
+		if err := tx.Where("id = ? AND user_id = ?", id, userID).First(&conv).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("会话不存在")
+			}
+			return err
+		}
+		return tx.Where("conversation_id = ? AND user_id = ?", id, userID).Order("id ASC").Find(&msgs).Error
+	})
 	if err != nil {
 		return nil, err
 	}
+	return s.conversationView(conv, msgs), nil
+}
+
+func (s *QaService) conversationView(conv model.AiConversation, msgs []model.AiConversationMessage) *QaConversationView {
 	flags := parseRiskFlagsFromSnapshot(conv.DataSnapshot)
 	meta := parseSnapshotMeta(conv.DataSnapshot, conv.CreatedAt)
 	// 详情读取时按当前时刻重判快照时效（P0 第二轮）：快照内 freshness_status 是创建时
 	// 的历史事实，昨天 fresh 的会话今天必须能显示「行情非最新」。
-	if meta != nil {
-		if st, note := s.qaCurrentFreshness(conv.Market, meta); st != "" {
-			meta.CurrentStatus = st
-			meta.CurrentNote = note
-		}
+	if meta == nil {
+		meta = &qaSnapshotMeta{}
 	}
+	meta.CurrentStatus, meta.CurrentNote = s.qaCurrentFreshness(conv.Market, meta)
 	conv.DataSnapshot = "" // 详情不必回传大快照
-	return &QaConversationView{AiConversation: conv, Messages: msgs, RiskFlags: flags, SnapshotMeta: meta}, nil
+	return &QaConversationView{AiConversation: conv, Messages: msgs, RiskFlags: flags, SnapshotMeta: meta}
 }
 
 // parseSnapshotMeta 从会话固定快照 JSON 解析行情新鲜度元数据。新快照直接读顶层键；
@@ -771,11 +836,15 @@ func (s *QaService) Delete(userID, id int64) error {
 	}
 	defer mu.Unlock()
 
-	var conv model.AiConversation
-	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&conv).Error; err != nil {
-		return errors.New("会话不存在")
-	}
 	return common.DB.Transaction(func(tx *gorm.DB) error {
+		var conv model.AiConversation
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND user_id = ?", id, userID).First(&conv).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("会话不存在")
+			}
+			return err
+		}
 		if err := tx.Where("conversation_id = ? AND user_id = ?", id, userID).Delete(&model.AiConversationMessage{}).Error; err != nil {
 			return err
 		}

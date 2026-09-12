@@ -14,6 +14,7 @@ import (
 	"quantvista/model"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // FlexInt 容忍模型把整数字段输出成小数或带引号字符串（如 "confidence": 72.5 / "80"），
@@ -134,6 +135,7 @@ type PanelResult struct {
 // AnalysisView 返回给前端：记录 + 解析后的结构化结果。
 type AnalysisView struct {
 	model.AnalysisRecord
+	Request   *AnalyzeRequest `json:"request,omitempty"`    // 原始入参，仅从本人作业快照恢复
 	Result    *AnalysisResult `json:"result"`               // 结构化结果；degraded/failed 时可能为 nil
 	Panel     *PanelResult    `json:"panel"`                // 多角色观点（mode=panel 且 success 时非 nil）
 	Raw       string          `json:"raw"`                  // 降级时的模型原文
@@ -157,7 +159,7 @@ type analysisPlan struct {
 
 // Analyze 保留同步执行语义，供服务内调用与既有测试使用。HTTP 入口统一走 AnalyzeAsync。
 func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivate bool, req AnalyzeRequest) (*AnalysisView, error) {
-	plan, err := s.prepareAnalysis(userID, allowPrivate, req)
+	plan, err := s.prepareAnalysis(userID, allowPrivate, req, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -167,31 +169,51 @@ func (s *AnalysisService) Analyze(ctx context.Context, userID int64, allowPrivat
 // AnalyzeAsync 发起后台分析：同步段只做确定性校验、配置解析与 processing 落库，
 // 数据采集及全部 LLM 阶段使用独立于 HTTP 请求的 Context。浏览器、反代断开不会取消任务。
 func (s *AnalysisService) AnalyzeAsync(userID int64, allowPrivate bool, req AnalyzeRequest) (*AnalysisView, error) {
-	plan, err := s.prepareAnalysis(userID, allowPrivate, req)
+	return s.AnalyzeAsyncContext(context.Background(), userID, allowPrivate, req)
+}
+
+func (s *AnalysisService) AnalyzeAsyncContext(ctx context.Context, userID int64, allowPrivate bool, req AnalyzeRequest) (*AnalysisView, error) {
+	ctx = jobSubmissionContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	plan, err := s.prepareAnalysis(userID, allowPrivate, req, ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if v := s.reuseProcessingAnalysis(userID); v != nil {
-		return v, nil
+		return s.Get(userID, v.ID)
 	}
 	// 只把经过规范化的业务参数放入快照；配置密钥、prompt、消息和 allow_private
 	// 均由执行器重新读取。占位行与 JobRun 在同一事务创建。
-	run, err := startDurableBusinessJob(userID, JobKindAnalysis, plan.req, allowPrivate)
+	var view *AnalysisView
+	_, err = startDurableBusinessJobContext(ctx, userID, JobKindAnalysis, plan.req, allowPrivate, func(tx *gorm.DB, run *model.JobRun) error {
+		if run.ResultID == nil {
+			return errors.New("分析作业缺少结果引用")
+		}
+		var rec model.AnalysisRecord
+		if err := tx.Where("id = ? AND user_id = ?", *run.ResultID, userID).First(&rec).Error; err != nil {
+			return err
+		}
+		var err error
+		view, err = s.viewWithRequestTx(tx, rec)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
-	if run.ResultID == nil {
-		return nil, errors.New("分析作业缺少结果引用")
-	}
-	var rec model.AnalysisRecord
-	if err := common.DB.Where("id = ? AND user_id = ?", *run.ResultID, userID).First(&rec).Error; err != nil {
-		return nil, err
-	}
-	return s.toView(rec), nil
+	return view, nil
 }
 
 // prepareAnalysis 完成无需访问行情/模型的确定性准备，非法输入、无配置与配额用尽立即返回。
-func (s *AnalysisService) prepareAnalysis(userID int64, allowPrivate bool, req AnalyzeRequest) (*analysisPlan, error) {
+func (s *AnalysisService) prepareAnalysis(userID int64, allowPrivate bool, req AnalyzeRequest, contexts ...context.Context) (*analysisPlan, error) {
+	ctx := jobSubmissionContext(contexts...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	req.Module = strings.ToLower(strings.TrimSpace(req.Module))
 	if !validAnalysisModule[req.Module] {
 		return nil, errors.New("不支持的分析模块")
@@ -231,35 +253,42 @@ func (s *AnalysisService) prepareAnalysis(userID int64, allowPrivate bool, req A
 	req.Target = strings.TrimSpace(req.Target)
 
 	// LLM 配置（含解密密钥）。
-	cfg, apiKey, err := s.llm.ResolveForUse(userID, req.LLMConfigID)
+	cfg, apiKey, err := s.llm.ResolveForUse(userID, req.LLMConfigID, ctx)
 	if err != nil {
 		return nil, err
 	}
 	allowPrivate = llmAllowPrivate(allowPrivate, cfg) // 回退到管理员配置时按配置所有者放行内网
 
 	// 配额熔断：次数额度用尽直接拒绝（不发起调用）。
-	if err := checkQuota(userID); err != nil {
+	if err := checkQuota(userID, ctx); err != nil {
 		return nil, err
+	}
+	prompt := loadPromptRuntime(userID, req.Module)
+	if prompt.ReadError != nil {
+		return nil, prompt.ReadError
 	}
 	return &analysisPlan{
 		userID: userID, allowPrivate: allowPrivate, req: req,
-		cfg: cfg, apiKey: apiKey, prompt: loadPromptRuntime(userID, req.Module),
+		cfg: cfg, apiKey: apiKey, prompt: prompt,
 	}, nil
+}
+
+func (p *analysisPlan) promptVersion() string {
+	if p.req.Mode == model.AnalysisModeStandard {
+		return p.prompt.Version(analysisPromptVersion)
+	}
+	return analysisPromptVersion
 }
 
 func (p *analysisPlan) newProcessingRecord(s *AnalysisService) *model.AnalysisRecord {
 	label := analysisRequestLabel(p.req)
-	promptVersion := analysisPromptVersion
-	if p.req.Mode == model.AnalysisModeStandard {
-		promptVersion = p.prompt.Version(analysisPromptVersion)
-	}
 	return &model.AnalysisRecord{
 		UserID: p.userID, Module: p.req.Module, Mode: p.req.Mode, AsOf: p.req.AsOf,
 		Market: p.req.Market, Symbol: p.req.Symbol, Target: label,
 		Title: s.analysisTitle(p.req, label), Status: model.AnalysisStatusProcessing,
 		Summary:     "正在后台分析",
 		LLMConfigID: p.cfg.ID, Provider: p.cfg.Provider, Model: p.cfg.Model,
-		PromptVersion: promptVersion, StrategyVersion: analysisStrategyVersion,
+		PromptVersion: p.promptVersion(), StrategyVersion: analysisStrategyVersion,
 		TraceID: newLLMTraceID(),
 	}
 }
@@ -334,6 +363,11 @@ func (s *AnalysisService) runAnalysis(ctx context.Context, plan *analysisPlan, r
 		}
 	}
 	snapshotJSON, _ := json.Marshal(actx.Snapshot)
+	ctx, finishQuota, err := beginManualQuotaAction(ctx, userID)
+	if err != nil {
+		return s.failAnalysisRun(rec, err)
+	}
+	defer finishQuota()
 
 	// 4) 构造消息并调用 + 结构化校验/repair。
 	// P0-6 修复批：模块模板一次 loadPromptRuntime 固化快照——正文渲染（buildMessages）与
@@ -461,7 +495,7 @@ func (s *AnalysisService) runAnalysis(ctx context.Context, plan *analysisPlan, r
 
 	// 消耗了 token 就记账（无论成功/降级）；一次分析动作计 1 次配额。
 	if usage.TotalTokens > 0 {
-		consumeQuota(userID, usage.TotalTokens, true)
+		consumeQuota(userID, usage.TotalTokens)
 	}
 
 	switch {
@@ -472,7 +506,7 @@ func (s *AnalysisService) runAnalysis(ctx context.Context, plan *analysisPlan, r
 		rec.ErrorCode = asyncLLMTaskErrorCode(callErr)
 		rec.Summary = "分析失败"
 		fillRunMeta()
-		if err := persistAnalysisRecord(rec); err != nil {
+		if err := persistAnalysisRecord(common.DB, rec); err != nil {
 			return nil, err
 		}
 		// 保留中央客户端返回的 RefusalError 错误链，供 controller/common.ApiError
@@ -506,17 +540,17 @@ func (s *AnalysisService) runAnalysis(ctx context.Context, plan *analysisPlan, r
 	}
 
 	fillRunMeta()
-	if err := persistAnalysisRecord(rec); err != nil {
+	if err := withJobResultTransaction(ctx, func(tx *gorm.DB) error { return persistAnalysisRecord(tx, rec) }); err != nil {
 		return nil, err
 	}
 	return s.toView(*rec), nil
 }
 
-func persistAnalysisRecord(rec *model.AnalysisRecord) error {
+func persistAnalysisRecord(db *gorm.DB, rec *model.AnalysisRecord) error {
 	if rec.ID == 0 {
-		return common.DB.Create(rec).Error
+		return db.Create(rec).Error
 	}
-	return common.DB.Save(rec).Error
+	return db.Save(rec).Error
 }
 
 // failAnalysisRun 将异步 processing 记录收敛为 failed；同步调用在数据采集阶段失败时
@@ -595,18 +629,18 @@ func (s *AnalysisService) callWithRepair(ctx context.Context, userID int64, run 
 	requestMax := moduleTokenCap(run.Module, cfg.MaxTokens)
 	for attempt := 0; attempt <= repairLimit; attempt++ {
 		res, err := chatCompletion(ctx, chatParams{
-			BaseURL:      cfg.BaseURL,
-			APIKey:       apiKey,
-			Model:        cfg.Model,
-			EndpointType: cfg.EndpointType,
-			Temperature:  cfg.Temperature,
+			BaseURL:         cfg.BaseURL,
+			APIKey:          apiKey,
+			Model:           cfg.Model,
+			EndpointType:    cfg.EndpointType,
+			Temperature:     cfg.Temperature,
 			ReasoningEffort: cfg.ReasoningEffort,
-			MaxTokens:    requestMax,
-			Messages:     convo,
-			JSONMode:     true,
-			AllowPrivate: allowPrivate,
-			Repair:       attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）
-			Meta:         run.chatMeta(userID, cfg, attempt+1),
+			MaxTokens:       requestMax,
+			Messages:        convo,
+			JSONMode:        true,
+			AllowPrivate:    allowPrivate,
+			Repair:          attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）
+			Meta:            run.chatMeta(userID, cfg, attempt+1),
 		})
 		run.record(res, err)
 		if res != nil {
@@ -790,6 +824,10 @@ const analysisReviewSystem = analysisReviewTaskSeg + "\n" + analysisReviewContra
 // 快照（一次查询）——模板在两者之间被编辑不会造成正文/版本错位。独立成函数供单测。
 func analysisReviewSystemFor(userID int64, module string) (string, string) {
 	pr := loadPromptRuntime(userID, model.PromptModuleReview)
+	return analysisReviewSystemFrom(pr, module)
+}
+
+func analysisReviewSystemFrom(pr promptRuntime, module string) (string, string) {
 	sys := analysisReviewSystem
 	if custom, ok := pr.Render(map[string]string{"module": module}); ok {
 		sys = composeCustomTaskPrompt(custom, analysisReviewContract)
@@ -809,9 +847,15 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 	resForReview.TradePlan = nil
 	resJSON, _ := json.Marshal(resForReview)
 
-	sys, reviewPromptVersion := analysisReviewSystemFor(userID, module)
+	prompt := loadPromptRuntime(userID, model.PromptModuleReview)
+	sys, reviewPromptVersion := analysisReviewSystemFrom(prompt, module)
 	run := newLLMRun(traceID, parentRunID, "analysis_review", "analysis_review.v1", reviewPromptVersion)
 	run.hashData(string(snapJSON))
+	if prompt.ReadError != nil {
+		run.DegradedReason = "prompt_read_failed"
+		run.record(nil, prompt.ReadError)
+		return nil, usage, run
+	}
 
 	convo := []chatMessage{
 		{Role: "system", Content: sys},
@@ -828,7 +872,7 @@ func (s *AnalysisService) reviewAnalysis(ctx context.Context, userID int64, cfg 
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			ReasoningEffort: cfg.ReasoningEffort,
-			Temperature: cfg.Temperature, MaxTokens: requestMax,
+			Temperature:     cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
@@ -909,20 +953,55 @@ func (s *AnalysisService) Get(userID, id int64) (*AnalysisView, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.toView(rec), nil
+	return s.viewWithRequest(rec)
+}
+
+func (s *AnalysisService) viewWithRequest(rec model.AnalysisRecord) (*AnalysisView, error) {
+	return s.viewWithRequestTx(common.DB, rec)
+}
+
+func (s *AnalysisService) viewWithRequestTx(tx *gorm.DB, rec model.AnalysisRecord) (*AnalysisView, error) {
+	view := s.toView(rec)
+	var run model.JobRun
+	err := tx.Select("kind", "request_snapshot").Where("user_id = ? AND owner_type = ? AND kind = ? AND result_type = ? AND result_id = ?",
+		rec.UserID, model.JobOwnerUser, JobKindAnalysis, JobResultAnalysis, rec.ID).Order("id DESC").First(&run).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	var req AnalyzeRequest
+	snapshot, snapshotErr := decodePersistedJobSnapshot(run)
+	if err == nil && snapshotErr == nil && json.Unmarshal(snapshot.Request, &req) == nil &&
+		req.Module == rec.Module && req.Symbol == rec.Symbol && req.Market == rec.Market {
+		view.Request = &req
+	}
+	return view, nil
 }
 
 // Delete 删除分析记录（仅本人）。
 func (s *AnalysisService) Delete(userID, id int64) error {
 	s.expireStaleAnalyses(userID)
-	var rec model.AnalysisRecord
-	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&rec).Error; err != nil {
-		return errors.New("分析记录不存在")
-	}
-	if rec.Status == model.AnalysisStatusProcessing {
-		return errors.New("分析正在后台执行，请等任务结束后再删除")
-	}
-	return common.DB.Delete(&rec).Error
+	return common.DB.Transaction(func(tx *gorm.DB) error {
+		var rec model.AnalysisRecord
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ?", id, userID).First(&rec).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("分析记录不存在")
+			}
+			return err
+		}
+		if rec.Status == model.AnalysisStatusProcessing {
+			return errors.New("分析正在后台执行，请等任务结束后再删除")
+		}
+		// 业务成功后仍有工件保存和 JobRun 终态提交，不能在此窗口删除它们依赖的记录。
+		var active int64
+		if err := tx.Model(&model.JobRun{}).Where("user_id = ? AND result_type = ? AND result_id = ? AND status IN ?",
+			userID, JobResultAnalysis, id, []string{model.JobStatusQueued, model.JobStatusRunning}).Count(&active).Error; err != nil {
+			return err
+		}
+		if active > 0 {
+			return errors.New("分析任务正在收尾，请等任务结束后再删除")
+		}
+		return tx.Delete(&rec).Error
+	})
 }
 
 // AnalysisDiff 与上一份同对象成功分析的差异（变化检测）。

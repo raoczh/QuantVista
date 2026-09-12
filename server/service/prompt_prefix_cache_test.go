@@ -39,11 +39,11 @@ func TestQaSystemPrefixStableAcrossTurns(t *testing.T) {
 	}
 	pr := loadPromptRuntime(1, model.PromptModuleQa)
 	staleSvc := &QaService{market: NewMarketService(nil)} // 时效可判 → stale 段注入
-	freshSvc := &QaService{}                              // 无 market → 不判时效，无该段
+	unknownSvc := &QaService{}                            // 无 market → 时效未知，仍限制为历史解释。
 
 	msgsA, _ := staleSvc.buildMessagesFrom(pr, conv, history, "均线怎么样")
 	msgsB, _ := staleSvc.buildMessagesFrom(pr, conv, history, "换个完全不同的问题：这家公司的估值水位如何")
-	msgsC, _ := freshSvc.buildMessagesFrom(pr, conv, history, "均线怎么样")
+	msgsC, _ := unknownSvc.buildMessagesFrom(pr, conv, history, "均线怎么样")
 
 	sysA, sysB, sysC := msgsA[0].Content, msgsB[0].Content, msgsC[0].Content
 	if sysA != sysB {
@@ -72,8 +72,8 @@ func TestQaSystemPrefixStableAcrossTurns(t *testing.T) {
 	if !strings.Contains(turnA, "【历史会话分层上下文】") || !strings.HasSuffix(turnA, "【本轮问题】均线怎么样") {
 		t.Fatalf("本轮 user 段应为 分层段+时效段+本轮问题: %q", turnA)
 	}
-	if strings.Contains(msgsC[len(msgsC)-1].Content, "【行情时效") {
-		t.Fatalf("无法判定时效时不应注入该段")
+	if !strings.Contains(msgsC[len(msgsC)-1].Content, "历史数据解释") {
+		t.Fatalf("无法判定时效时仍须限制为历史解释")
 	}
 }
 

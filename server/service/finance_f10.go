@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -68,7 +69,15 @@ func finFresh(mdl any, symbol string) bool {
 // ensureFinanceIndicators F10 主要财务指标按需同步（best-effort：失败静默，
 // 消费方按「缓存里有什么用什么」处理）。返回是否发生了上游拉取。
 func ensureFinanceIndicators(ctx context.Context, symbol string) bool {
-	return syncFinanceIndicators(ctx, symbol, false)
+	if common.DB == nil || !isSixDigits(symbol) {
+		return false
+	}
+	now := time.Now()
+	probe := inspectFinanceFactor(symbol, now.In(time.Local).Format("2006-01-02"), now)
+	if !probe.RefreshNeeded {
+		return false
+	}
+	return syncFinanceIndicators(ctx, symbol, probe.Cached == nil || probe.RequiredReport != "")
 }
 
 // syncFinanceIndicators 执行实际同步。force 只用于已有代码证据表明缓存不可用的场景：
@@ -130,22 +139,43 @@ func fetchFinanceIndicators(ctx context.Context, symbol string) bool {
 // 可用时点；上游缺公告日时，必须由披露日历证明同报告期已实际发布，不能仅凭较新的
 // ReportDate 猜测可用性。
 func financeIndicatorAsOf(symbol, asOf string) *model.FinanceIndicator {
+	rows, err := readFinanceIndicatorsAsOf(context.Background(), symbol, asOf, 1)
+	if err != nil || len(rows) == 0 {
+		return nil
+	}
+	return &rows[0]
+}
+
+// 推荐、详情与 AI 快照共用同一披露证据筛选，并在 LIMIT 前排除未披露行。
+func readFinanceIndicatorsAsOf(ctx context.Context, symbol, asOf string, limit int) ([]model.FinanceIndicator, error) {
+	rows := []model.FinanceIndicator{}
 	if common.DB == nil {
-		return nil
+		return nil, errors.New("数据库不可用")
 	}
-	var rows []model.FinanceIndicator
-	res := common.DB.Where("symbol = ? AND market = ?", symbol, "cn").
-		Where("notice_date = '' OR notice_date IS NULL OR notice_date <= ?", asOf).
-		Order("report_date DESC, id DESC").Limit(finIndicatorKeep).Find(&rows)
-	if res.Error != nil || res.RowsAffected == 0 {
-		return nil
+	err := common.DB.WithContext(ctx).Where("symbol = ? AND market = ? AND report_date <= ?", symbol, "cn", asOf).
+		Where(`(notice_date <> '' AND notice_date <= ?) OR
+			((notice_date = '' OR notice_date IS NULL) AND EXISTS (
+				SELECT 1 FROM disclosure_schedules ds
+				WHERE ds.symbol = finance_indicators.symbol AND ds.market = finance_indicators.market
+				AND ds.report_date = finance_indicators.report_date
+				AND (`+financePublishedAsOfClause+`)))`, asOf, asOf, true, asOf).
+		Order("report_date DESC, id DESC").Limit(limit).Find(&rows).Error
+	return rows, err
+}
+
+// 三表没有公告日期，只交付同报告期已有披露证据的科目，避免新旧口径错配。
+func readFinanceStatementsForIndicators(ctx context.Context, symbol string, indicators []model.FinanceIndicator) ([]model.FinanceStatement, error) {
+	rows := []model.FinanceStatement{}
+	dates := make([]string, 0, len(indicators))
+	for _, row := range indicators {
+		dates = append(dates, row.ReportDate)
 	}
-	for i := range rows {
-		if rows[i].NoticeDate != "" || financeReportPublishedAsOf(symbol, rows[i].ReportDate, asOf) {
-			return &rows[i]
-		}
+	if len(dates) == 0 {
+		return rows, nil
 	}
-	return nil
+	err := common.DB.WithContext(ctx).Where("symbol = ? AND market = ? AND report_date IN ?", symbol, "cn", dates).
+		Order("report_date DESC, id DESC").Limit(finTrendPeriods).Find(&rows).Error
+	return rows, err
 }
 
 const financePublishedAsOfClause = `(actual_date <> '' AND actual_date <= ?)
@@ -186,7 +216,17 @@ func ensureFinanceStatements(ctx context.Context, symbol string) {
 	if common.DB == nil || !isSixDigits(symbol) {
 		return
 	}
-	if finFresh(&model.FinanceStatement{}, symbol) || !finTryAllowed("stmt:"+symbol) {
+	fresh := finFresh(&model.FinanceStatement{}, symbol)
+	if fresh {
+		var latest model.FinanceStatement
+		err := common.DB.WithContext(ctx).Where("symbol = ? AND market = ?", symbol, "cn").
+			Order("report_date DESC").First(&latest).Error
+		asOf := time.Now().In(time.Local).Format("2006-01-02")
+		indicator := financeIndicatorAsOf(symbol, asOf)
+		fresh = err == nil && publishedFinanceReportAfter(symbol, latest.ReportDate, asOf) == "" &&
+			(indicator == nil || indicator.ReportDate <= latest.ReportDate)
+	}
+	if fresh || !finTryAllowed("stmt:"+symbol) {
 		return
 	}
 	rows, err := fetchStatements(ctx, symbol)
@@ -230,13 +270,25 @@ func (s *FinanceService) FinanceOverview(ctx context.Context, symbol string) (ma
 	}
 	ensureFinanceIndicators(ctx, symbol)
 	ensureFinanceStatements(ctx, symbol)
-	var inds []model.FinanceIndicator
-	common.DB.Where("symbol = ?", symbol).Order("report_date DESC").Limit(finTrendPeriods).Find(&inds)
-	var stmts []model.FinanceStatement
-	common.DB.Where("symbol = ?", symbol).Order("report_date DESC").Limit(finTrendPeriods).Find(&stmts)
+	now := time.Now()
+	asOf := now.In(time.Local).Format("2006-01-02")
+	inds, err := readFinanceIndicatorsAsOf(ctx, symbol, asOf, finTrendPeriods)
+	if err != nil {
+		return nil, err
+	}
+	stmts, err := readFinanceStatementsForIndicators(ctx, symbol, inds)
+	if err != nil {
+		return nil, err
+	}
+	note := ""
+	if len(inds) == 0 {
+		note = "尚未读取到有披露依据的财务指标，数据缺失不代表没有财报"
+	} else if !financeIndicatorRowFreshAt(&inds[0], now) || publishedFinanceReportAfter(symbol, inds[0].ReportDate, asOf) != "" {
+		note = "财务缓存尚未更新，以下仅展示已确认披露的历史数据，请核对报告期"
+	}
 	reverseSlice(inds)
 	reverseSlice(stmts)
-	return map[string]any{"indicators": inds, "statements": stmts}, nil
+	return map[string]any{"indicators": inds, "statements": stmts, "note": note}, nil
 }
 
 func reverseSlice[T any](s []T) {
@@ -254,14 +306,19 @@ func financeBrief(ctx context.Context, symbol string) map[string]any {
 		return nil
 	}
 	ensureFinanceIndicators(ctx, symbol)
-	var inds []model.FinanceIndicator
-	if err := common.DB.Where("symbol = ?", symbol).
-		Order("report_date DESC").Limit(finTrendPeriods).Find(&inds).Error; err != nil || len(inds) == 0 {
+	now := time.Now()
+	asOf := now.In(time.Local).Format("2006-01-02")
+	inds, err := readFinanceIndicatorsAsOf(ctx, symbol, asOf, finTrendPeriods)
+	if err != nil || len(inds) == 0 {
 		return nil
 	}
 	latest := inds[0]
+	if !financeIndicatorRowFreshAt(&latest, now) || publishedFinanceReportAfter(symbol, latest.ReportDate, asOf) != "" {
+		return nil
+	}
 	brief := map[string]any{
 		"report":      latest.ReportName,
+		"report_date": latest.ReportDate,
 		"notice_date": latest.NoticeDate,
 		"latest": map[string]any{
 			"eps":               round2(latest.EPS),
@@ -284,6 +341,8 @@ func financeBrief(ctx context.Context, symbol string) map[string]any {
 		r := inds[i]
 		trend = append(trend, map[string]any{
 			"report":         r.ReportName,
+			"report_date":    r.ReportDate,
+			"notice_date":    r.NoticeDate,
 			"revenue_yi":     round2(r.Revenue / 1e8),
 			"revenue_yoy":    round2(r.RevenueYoY),
 			"net_profit_yi":  round2(r.NetProfit / 1e8),
@@ -295,8 +354,8 @@ func financeBrief(ctx context.Context, symbol string) map[string]any {
 	brief["trend"] = trend
 
 	// 三表补充（只读缓存，详情页访问过才有）：现金流与资产负债的绝对科目。
-	var st model.FinanceStatement
-	if err := common.DB.Where("symbol = ?", symbol).Order("report_date DESC").First(&st).Error; err == nil {
+	if statements, err := readFinanceStatementsForIndicators(ctx, symbol, inds); err == nil && len(statements) > 0 {
+		st := statements[0]
 		brief["statement_latest"] = map[string]any{
 			"report_date":        st.ReportDate,
 			"monetary_funds_yi":  round2(st.MonetaryFunds / 1e8),

@@ -9,6 +9,7 @@ import (
 	"quantvista/common"
 	"quantvista/model"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -66,6 +67,10 @@ func PortfolioCurve(userID int64, kind string, days int) (*PortfolioCurveView, e
 }
 
 func PortfolioCurveByAccount(userID, accountID int64, kind string, days int) (*PortfolioCurveView, error) {
+	return PortfolioCurveByAccountContext(context.Background(), userID, accountID, kind, days)
+}
+
+func PortfolioCurveByAccountContext(ctx context.Context, userID, accountID int64, kind string, days int) (*PortfolioCurveView, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
@@ -78,14 +83,31 @@ func PortfolioCurveByAccount(userID, accountID int64, kind string, days int) (*P
 	if days > curveMaxDays {
 		days = curveMaxDays
 	}
-	from := time.Now().AddDate(0, 0, -days).Format("2006-01-02")
+	now := time.Now()
+	from, through := now.AddDate(0, 0, -days).Format("2006-01-02"), now.Format("2006-01-02")
 	var rows []model.PortfolioSnapshot
-	if err := common.DB.Where("user_id = ? AND account_id = ? AND kind = ? AND trade_date >= ?", userID, accountID, kind, from).
-		Order("trade_date ASC").Find(&rows).Error; err != nil {
+	var currencyGap portfolioCurrencyGap
+	err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		if err := tx.Where("user_id = ? AND account_id = ? AND kind = ? AND trade_date >= ? AND trade_date <= ?", userID, accountID, kind, from, through).
+			Order("trade_date ASC").Find(&rows).Error; err != nil {
+			return err
+		}
+		var err error
+		currencyGap, err = portfolioCurrencyGapFor(tx, userID, accountID, kind)
+		return err
+	})
+	if err != nil {
 		return nil, err
 	}
 	out := &PortfolioCurveView{Kind: kind, Days: days, Points: []PortfolioCurvePoint{}, Notes: []string{}}
 	for _, r := range rows {
+		if currencyGap.affects(r.TradeDate) {
+			r.Partial = true
+			if r.Note != "" {
+				r.Note += "；"
+			}
+			r.Note += currencyGap.Reason
+		}
 		total := r.MarketValue
 		if kind == model.SnapshotKindPaper {
 			total = round2(r.Cash + r.MarketValue)
@@ -104,7 +126,7 @@ func PortfolioCurveByAccount(userID, accountID int64, kind string, days int) (*P
 		"快照由每交易日 16:20 盘后任务落库；非交易日与服务未运行的日期如实缺席，不做插值补造")
 	if out.PartialCount > 0 {
 		out.Notes = append(out.Notes, fmt.Sprintf(
-			"%d 个交易日存在无当前有效行情的标的（标记 partial）：那些标的未计入当日市值，该点不可当作完整净值",
+			"%d 个交易日的行情、账本或币种口径不完整（标记 partial），这些点不可当作完整净值",
 			out.PartialCount))
 	}
 	if len(out.Points) == 0 {
@@ -116,21 +138,41 @@ func PortfolioCurveByAccount(userID, accountID int64, kind string, days int) (*P
 // realSnapshotFrom 由「该用户全部持仓 + 已取到的行情」算真实持仓快照（纯函数，
 // 手工验算与 partial 反例的单测锚点）。定价 fail-closed：非 fresh 一律不计入。
 func realSnapshotFrom(userID int64, tradeDate string, positions []model.Position, quotes map[string]FreshQuoteResult) *model.PortfolioSnapshot {
+	return realSnapshotWithShareGaps(userID, tradeDate, positions, quotes, nil)
+}
+
+func realSnapshotWithShareGaps(userID int64, tradeDate string, positions []model.Position, quotes map[string]FreshQuoteResult, pendingShares map[int64]bool) *model.PortfolioSnapshot {
 	accountID := int64(0)
 	if len(positions) > 0 {
 		accountID = positions[0].AccountID
 	}
 	snap := &model.PortfolioSnapshot{UserID: userID, AccountID: accountID, Kind: model.SnapshotKindReal, TradeDate: tradeDate}
 	var realizedCum float64
+	currencyGapCount, currencyHoldingCount := 0, 0
 	for _, p := range positions {
+		if positionCurrencyIssue(p, "CNY") != "" {
+			currencyGapCount++
+			continue
+		}
 		realizedCum += p.RealizedPnl
 	}
 	snap.RealizedCum = round2(realizedCum)
+	shareGapCount := 0
 	for _, p := range positions {
 		if p.Status != model.PositionStatusHolding {
 			continue
 		}
 		snap.PositionCount++
+		if positionCurrencyIssue(p, "CNY") != "" {
+			snap.MissingCount++
+			currencyHoldingCount++
+			continue
+		}
+		if pendingShares[p.ID] {
+			snap.MissingCount++
+			shareGapCount++
+			continue
+		}
 		fq, ok := quotes[QuoteKey(p.Market, p.Symbol)]
 		if !ok || fq.Quote == nil || fq.Quote.Price <= 0 || fq.Fresh.Status != freshStatusFresh {
 			// fail-closed：非 fresh 一律不计入市值**与成本**（只剔市值会让浮亏 = −成本）。
@@ -143,7 +185,22 @@ func realSnapshotFrom(userID int64, tradeDate string, positions []model.Position
 	snap.UnrealizedPnl = round2(snap.MarketValue - snap.Cost)
 	if snap.MissingCount > 0 {
 		snap.Partial = true
-		snap.Note = fmt.Sprintf("%d 笔持仓当日无当前有效行情，未计入市值与成本（不用旧价冒充）", snap.MissingCount)
+		if quoteGaps := snap.MissingCount - shareGapCount - currencyHoldingCount; quoteGaps > 0 {
+			snap.Note = fmt.Sprintf("%d 笔持仓当日无当前有效行情，未计入市值与成本（不用旧价冒充）", quoteGaps)
+		}
+		if shareGapCount > 0 {
+			if snap.Note != "" {
+				snap.Note += "；"
+			}
+			snap.Note += fmt.Sprintf("%d 笔持仓到期送转尚未处理，未将除权前股数用于当前估值", shareGapCount)
+		}
+	}
+	if currencyGapCount > 0 {
+		snap.Partial = true
+		if snap.Note != "" {
+			snap.Note += "；"
+		}
+		snap.Note += fmt.Sprintf("%d 笔记录的币种无法与 CNY 合计，未计入市值、成本和已实现盈亏", currencyGapCount)
 	}
 	return snap
 }
@@ -157,6 +214,11 @@ func (s *PositionService) buildRealSnapshot(ctx context.Context, userID int64, t
 	return s.buildRealSnapshotForAccount(ctx, userID, account.ID, tradeDate)
 }
 func (s *PositionService) buildRealSnapshotForAccount(ctx context.Context, userID, accountID int64, tradeDate string) (*model.PortfolioSnapshot, error) {
+	return s.captureRealSnapshot(ctx, userID, accountID, tradeDate, false)
+}
+
+// 行情请求在事务外；请求结束后锁账户，重读账本并在同一事务内落快照。
+func (s *PositionService) captureRealSnapshot(ctx context.Context, userID, accountID int64, tradeDate string, persist bool) (*model.PortfolioSnapshot, error) {
 	var positions []model.Position
 	if err := common.DB.WithContext(ctx).Where("user_id = ? AND account_id = ?", userID, accountID).Find(&positions).Error; err != nil {
 		return nil, err
@@ -172,14 +234,6 @@ func (s *PositionService) buildRealSnapshotForAccount(ctx context.Context, userI
 			return nil, err
 		}
 	}
-	for _, p := range positions {
-		if p.TotalBuyCost <= 0 {
-			return nil, fmt.Errorf("持仓 %d 账本未就绪：累计买入成本为空", p.ID)
-		}
-		if p.Status == model.PositionStatusHolding && p.Quantity > positionQtyEps && p.RemainingCost <= 0 {
-			return nil, fmt.Errorf("持仓 %d 账本未就绪：剩余成本为空", p.ID)
-		}
-	}
 	refs := make([]QuoteRef, 0, len(positions))
 	seen := map[string]bool{}
 	for _, p := range positions {
@@ -192,9 +246,42 @@ func (s *PositionService) buildRealSnapshotForAccount(ctx context.Context, userI
 			refs = append(refs, QuoteRef{Market: p.Market, Symbol: p.Symbol})
 		}
 	}
-	snap := realSnapshotFrom(userID, tradeDate, positions, s.market.FreshQuotesFor(ctx, refs))
-	snap.AccountID = accountID
-	return snap, nil
+	quotes := s.market.FreshQuotesFor(ctx, refs)
+	var snap *model.PortfolioSnapshot
+	err = common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockActivePortfolioAccount(tx, userID, accountID, model.PortfolioKindReal); err != nil {
+			return err
+		}
+		var current []model.Position
+		if err := tx.Where("user_id = ? AND account_id = ?", userID, accountID).Find(&current).Error; err != nil {
+			return err
+		}
+		pendingShares := map[int64]bool{}
+		for _, p := range current {
+			if p.TotalBuyCost <= 0 {
+				return fmt.Errorf("持仓 %d 账本未就绪：累计买入成本为空", p.ID)
+			}
+			if p.Status != model.PositionStatusHolding {
+				continue
+			}
+			if p.Quantity > positionQtyEps && p.RemainingCost <= 0 {
+				return fmt.Errorf("持仓 %d 账本未就绪：剩余成本为空", p.ID)
+			}
+			if err := ensurePositionShareActionsProcessedTx(tx, p, tradeDate); err != nil {
+				if !errors.Is(err, errPositionShareActionPending) {
+					return err
+				}
+				pendingShares[p.ID] = true
+			}
+		}
+		snap = realSnapshotWithShareGaps(userID, tradeDate, current, quotes, pendingShares)
+		snap.AccountID = accountID
+		if persist {
+			return upsertPortfolioSnapshotTx(tx, snap)
+		}
+		return nil
+	})
+	return snap, err
 }
 
 // paperSnapshotFrom 由「模拟账户 + 持仓 + 行情 + 累计已实现」算模拟盘快照（纯函数）。
@@ -202,23 +289,41 @@ func (s *PositionService) buildRealSnapshotForAccount(ctx context.Context, userI
 // 「真实市值」与「按成本顶上的估值」，否则一段停牌期会画出一条平直的假净值。
 func paperSnapshotFrom(userID int64, tradeDate string, acc model.PaperAccount, holdings []model.PaperHolding,
 	quotes map[string]FreshQuoteResult, realizedCum float64) *model.PortfolioSnapshot {
+	return paperSnapshotWithValuationGaps(userID, tradeDate, acc, holdings, quotes, realizedCum, nil)
+}
+
+func paperSnapshotWithValuationGaps(userID int64, tradeDate string, acc model.PaperAccount, holdings []model.PaperHolding,
+	quotes map[string]FreshQuoteResult, realizedCum float64, gaps map[int64]string) *model.PortfolioSnapshot {
 	snap := &model.PortfolioSnapshot{
 		UserID: userID, AccountID: acc.AccountID, Kind: model.SnapshotKindPaper, TradeDate: tradeDate,
 		Cash: round2(acc.Cash), PositionCount: len(holdings), RealizedCum: round2(realizedCum),
 	}
 	for _, h := range holdings {
+		if reason := gaps[h.ID]; reason != "" {
+			snap.MissingCount++
+			snap.Note = reason
+			continue
+		}
+		if positionCurrencyIssue(model.Position{Market: h.Market}, "CNY") != "" {
+			snap.MissingCount++
+			snap.Partial = true
+			snap.Note = "模拟持仓含非 CNY 标的，缺少汇率事实，市值与现金口径待核验"
+			continue
+		}
 		fq, ok := quotes[QuoteKey(h.Market, h.Symbol)]
 		if !ok || fq.Quote == nil || fq.Quote.Price <= 0 || fq.Fresh.Status != freshStatusFresh {
 			snap.MissingCount++
 			continue
 		}
 		snap.MarketValue = round2(snap.MarketValue + fq.Quote.Price*h.Quantity)
-		snap.Cost = round2(snap.Cost + h.AvgCost*h.Quantity)
+		snap.Cost = round2(snap.Cost + paperHoldingCost(h))
 	}
 	snap.UnrealizedPnl = round2(snap.MarketValue - snap.Cost)
 	if snap.MissingCount > 0 {
 		snap.Partial = true
-		snap.Note = fmt.Sprintf("%d 笔模拟持仓当日无当前有效行情，未计入市值与成本（不用旧价冒充）", snap.MissingCount)
+		if snap.Note == "" {
+			snap.Note = fmt.Sprintf("%d 笔模拟持仓当日无当前有效行情，未计入市值与成本（不用旧价冒充）", snap.MissingCount)
+		}
 	}
 	return snap
 }
@@ -232,6 +337,10 @@ func (s *PaperService) buildPaperSnapshot(ctx context.Context, userID int64, tra
 	return s.buildPaperSnapshotForAccount(ctx, userID, account.ID, tradeDate)
 }
 func (s *PaperService) buildPaperSnapshotForAccount(ctx context.Context, userID, accountID int64, tradeDate string) (*model.PortfolioSnapshot, error) {
+	return s.capturePaperSnapshot(ctx, userID, accountID, tradeDate, false)
+}
+
+func (s *PaperService) capturePaperSnapshot(ctx context.Context, userID, accountID int64, tradeDate string, persist bool) (*model.PortfolioSnapshot, error) {
 	// 公司行动 job 在 19:25，而资产快照在 16:20。快照必须主动结算当日及近期
 	// 已到期行动，否则会把除权后的价格配上除权前数量/成本，永久冻结一个假点。
 	var symbols []struct {
@@ -252,10 +361,6 @@ func (s *PaperService) buildPaperSnapshotForAccount(ctx context.Context, userID,
 			return nil, fmt.Errorf("模拟盘公司行动结算失败 %s/%s: %w", item.Market, item.Symbol, err)
 		}
 	}
-	var acc model.PaperAccount
-	if err := common.DB.WithContext(ctx).Where("user_id = ? AND account_id = ?", userID, accountID).First(&acc).Error; err != nil {
-		return nil, err
-	}
 	var holdings []model.PaperHolding
 	if err := common.DB.WithContext(ctx).Where("user_id = ? AND account_id = ?", userID, accountID).Find(&holdings).Error; err != nil {
 		return nil, err
@@ -264,14 +369,72 @@ func (s *PaperService) buildPaperSnapshotForAccount(ctx context.Context, userID,
 	for _, h := range holdings {
 		refs = append(refs, QuoteRef{Market: h.Market, Symbol: h.Symbol})
 	}
-	realized, err := paperRealizedPnlByAccount(common.DB.WithContext(ctx), userID, accountID)
-	if err != nil {
-		return nil, err
-	}
-	return paperSnapshotFrom(userID, tradeDate, acc, holdings, s.market.FreshQuotesFor(ctx, refs), realized), nil
+	quotes := s.market.FreshQuotesFor(ctx, refs)
+	var snap *model.PortfolioSnapshot
+	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockActivePortfolioAccount(tx, userID, accountID, model.PortfolioKindPaper); err != nil {
+			return err
+		}
+		var acc model.PaperAccount
+		if err := tx.Where("user_id = ? AND account_id = ?", userID, accountID).First(&acc).Error; err != nil {
+			return err
+		}
+		var current []model.PaperHolding
+		if err := tx.Where("user_id = ? AND account_id = ?", userID, accountID).Find(&current).Error; err != nil {
+			return err
+		}
+		costIncomplete := false
+		for i := range current {
+			note, err := restorePaperHoldingCost(tx, &current[i])
+			if err != nil {
+				return err
+			}
+			costIncomplete = costIncomplete || note != ""
+		}
+		realized, err := paperRealizedPnlByAccount(tx, userID, accountID)
+		if err != nil {
+			return err
+		}
+		valuationGaps, err := paperPortfolioValuationGaps(tx, current, tradeDate)
+		if err != nil {
+			return err
+		}
+		snap = paperSnapshotWithValuationGaps(userID, tradeDate, acc, current, quotes, realized, valuationGaps)
+		accountingNote, err := paperRealizedAccountingNote(tx, userID, accountID)
+		if err != nil {
+			return err
+		}
+		if costIncomplete || accountingNote != "" {
+			snap.Partial = true
+			if snap.Note != "" {
+				snap.Note += "；"
+			}
+			if accountingNote != "" {
+				snap.Note += accountingNote
+			} else {
+				snap.Note += "存量模拟持仓成本缺少成交明细，盈亏待核验"
+			}
+		}
+		currencyGap, err := portfolioCurrencyGapFor(tx, userID, accountID, model.PortfolioKindPaper)
+		if err != nil {
+			return err
+		}
+		if currencyGap.affects(tradeDate) {
+			snap.Partial = true
+			if snap.Note != "" {
+				snap.Note += "；"
+			}
+			snap.Note += currencyGap.Reason
+		}
+		if persist {
+			return upsertPortfolioSnapshotTx(tx, snap)
+		}
+		return nil
+	})
+	return snap, err
 }
 
-// upsertPortfolioSnapshot 按 (user_id, kind, trade_date) 幂等 upsert。
+// upsertPortfolioSnapshot 按 (user_id, account_id, trade_date) 幂等 upsert。
 // 同日重跑覆盖（盘后重启补跑取最后一次结果），绝不产生重复点。
 func upsertPortfolioSnapshot(snap *model.PortfolioSnapshot) error {
 	if snap.AccountID == 0 {
@@ -281,13 +444,35 @@ func upsertPortfolioSnapshot(snap *model.PortfolioSnapshot) error {
 		}
 		snap.AccountID = account.ID
 	}
-	return common.DB.Clauses(clause.OnConflict{
+	return common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockActivePortfolioAccount(tx, snap.UserID, snap.AccountID, snap.Kind); err != nil {
+			return err
+		}
+		return upsertPortfolioSnapshotTx(tx, snap)
+	})
+}
+
+func upsertPortfolioSnapshotTx(tx *gorm.DB, snap *model.PortfolioSnapshot) error {
+	return tx.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "user_id"}, {Name: "account_id"}, {Name: "trade_date"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"market_value", "cost", "unrealized_pnl", "realized_cum", "cash",
 			"position_count", "partial", "missing_count", "note", "updated_at",
 		}),
 	}).Create(snap).Error
+}
+
+// 补录或更正交易会改变历史股数与现金回放；已有市值快照没有逐标的明细，不能据
+// 今天的价格重造历史点。与账本同事务标记受影响日期，后续盘后重跑可恢复当日点。
+func invalidatePortfolioSnapshotsTx(tx *gorm.DB, userID, accountID int64, fromDate string) error {
+	q := tx.Model(&model.PortfolioSnapshot{}).Where("user_id = ? AND account_id = ?", userID, accountID)
+	if fromDate != "" {
+		q = q.Where("trade_date >= ?", fromDate)
+	}
+	return q.Updates(map[string]any{
+		"partial": true,
+		"note":    "快照生成后补录或更正了交易，历史资产需重新核对，暂不参与完整收益统计",
+	}).Error
 }
 
 // snapshotUserIDs 需要落快照的用户：有持仓（含已平仓，累计已实现盈亏要继续画）
@@ -353,13 +538,9 @@ func RunPortfolioSnapshots(ctx context.Context, posSvc *PositionService, paperSv
 		if posSvc == nil {
 			break
 		}
-		snap, err := posSvc.buildRealSnapshotForAccount(ctx, uid, account.ID, tradeDate)
+		_, err := posSvc.captureRealSnapshot(ctx, uid, account.ID, tradeDate, true)
 		if err != nil {
 			common.SysWarn("用户 %d 持仓资产快照失败: %v", uid, err)
-			continue
-		}
-		if err := upsertPortfolioSnapshot(snap); err != nil {
-			common.SysWarn("用户 %d 持仓资产快照落库失败: %v", uid, err)
 			continue
 		}
 		n++
@@ -373,13 +554,9 @@ func RunPortfolioSnapshots(ctx context.Context, posSvc *PositionService, paperSv
 		if paperSvc == nil {
 			break
 		}
-		snap, err := paperSvc.buildPaperSnapshotForAccount(ctx, uid, account.ID, tradeDate)
+		_, err := paperSvc.capturePaperSnapshot(ctx, uid, account.ID, tradeDate, true)
 		if err != nil {
 			common.SysWarn("用户 %d 模拟盘资产快照失败: %v", uid, err)
-			continue
-		}
-		if err := upsertPortfolioSnapshot(snap); err != nil {
-			common.SysWarn("用户 %d 模拟盘资产快照落库失败: %v", uid, err)
 			continue
 		}
 		n++

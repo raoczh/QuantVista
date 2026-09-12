@@ -25,7 +25,7 @@ func (s *AnalysisService) registerDurableJobHandler() {
 			if err := json.Unmarshal(raw, &req); err != nil {
 				return 0, fmt.Errorf("分析作业快照无效: %w", err)
 			}
-			plan, err := s.prepareAnalysis(run.UserID, isAdminUser(run.UserID), req)
+			plan, err := s.prepareAnalysis(run.UserID, isAdminUser(run.UserID), req, tx.Statement.Context)
 			if err != nil {
 				return 0, err
 			}
@@ -80,7 +80,7 @@ func (s *AnalysisService) registerDurableJobHandler() {
 			if err := json.Unmarshal(raw, &req); err != nil {
 				return DurableJobResult{}, fmt.Errorf("分析作业快照无效: %w", err)
 			}
-			plan, err := s.prepareAnalysis(userID, allowPrivate, req)
+			plan, err := s.prepareAnalysis(userID, allowPrivate, req, ctx)
 			if err != nil {
 				return DurableJobResult{}, err
 			}
@@ -94,7 +94,7 @@ func (s *AnalysisService) registerDurableJobHandler() {
 			}
 			// 配置、角色和模板均在执行时重读；旧提交参数只负责定位同一业务请求。
 			rec.LLMConfigID, rec.Provider, rec.Model = plan.cfg.ID, plan.cfg.Provider, plan.cfg.Model
-			rec.PromptVersion = plan.prompt.Version(analysisPromptVersion)
+			rec.PromptVersion = plan.promptVersion()
 			view, err := s.runAnalysis(ctx, plan, &rec)
 			if err != nil {
 				return DurableJobResult{}, err
@@ -108,12 +108,12 @@ func (s *AnalysisService) registerDurableJobHandler() {
 		})
 }
 
-func ensureEnabledJobUser(userID int64) error {
+func ensureEnabledJobUser(userID int64, contexts ...context.Context) error {
 	var user model.User
 	if common.DB == nil {
 		return errors.New("账号已禁用，作业未执行")
 	}
-	err := common.DB.Select("status").First(&user, userID).Error
+	err := common.DB.WithContext(jobSubmissionContext(contexts...)).Select("status").First(&user, userID).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return errors.New("账号不存在或已禁用，作业未执行")
 	}

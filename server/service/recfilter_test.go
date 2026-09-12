@@ -48,7 +48,7 @@ func TestDefaultRecFilters(t *testing.T) {
 	}
 }
 
-// TestApplyQuoteFilters 用户筛选逐条：价格/市值/换手/死亡换手/涨停；缺失字段跳过不判。
+// TestApplyQuoteFilters 用户筛选逐条：显式约束遇到缺失字段不能被当作已满足。
 func TestApplyQuoteFilters(t *testing.T) {
 	base := candidate{Symbol: "600000", Name: "浦发银行", Price: 8.5, TurnoverRate: 5, FloatCap: 100e8}
 	cases := []struct {
@@ -62,7 +62,7 @@ func TestApplyQuoteFilters(t *testing.T) {
 		{"价格超上限", candidate{Symbol: "601318", Name: "中国平安", Price: 55}, RecFilters{PriceMax: 30}, true, "上限"},
 		{"价格低于下限", candidate{Symbol: "600000", Price: 2.5, Name: "x"}, RecFilters{PriceMin: 3}, true, "下限"},
 		{"市值超上限", base, RecFilters{FloatCapMaxYi: 50}, true, "流通市值"},
-		{"市值缺失不判", candidate{Symbol: "600001", Name: "x", Price: 8, TurnoverRate: 5}, RecFilters{FloatCapMaxYi: 50}, false, ""},
+		{"市值缺失拒绝", candidate{Symbol: "600001", Name: "x", Price: 8, TurnoverRate: 5}, RecFilters{FloatCapMaxYi: 50}, true, "无法核验"},
 		{"换手低于下限", base, RecFilters{TurnoverMin: 8}, true, "换手率"},
 		{"换手20~30放行待阶段③位置判定", candidate{Symbol: "600002", Name: "x", Price: 8, TurnoverRate: 25}, RecFilters{}, false, ""},
 		{"极端换手硬拦", candidate{Symbol: "600004", Name: "x", Price: 8, TurnoverRate: 35}, RecFilters{}, true, "极端换手"},

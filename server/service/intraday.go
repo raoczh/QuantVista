@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"quantvista/model"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // M3b 盘中因子：腾讯 5 分钟线盘后全市场同步 + 五件盘中因子聚合落库。
@@ -77,6 +79,9 @@ func min5Date(t string) string {
 	if len(t) != 12 {
 		return ""
 	}
+	if _, err := time.Parse("200601021504", t); err != nil {
+		return ""
+	}
 	return t[:4] + "-" + t[4:6] + "-" + t[6:8]
 }
 
@@ -118,8 +123,21 @@ func computeIntradayFactors(bars []datasource.Min5Bar) (model.IntradayFactorDail
 		return out, false
 	}
 	byClock := make(map[string]datasource.Min5Bar, len(bars))
+	day := min5Date(bars[0].Time)
 	for _, b := range bars {
-		byClock[min5Clock(b.Time)] = b
+		clock := min5Clock(b.Time)
+		if day == "" || min5Date(b.Time) != day || b.Volume < 0 ||
+			!barValid(datasource.Bar{Open: b.Open, High: b.High, Low: b.Low, Close: b.Close}) ||
+			math.IsInf(b.Open, 0) || math.IsInf(b.High, 0) || math.IsInf(b.Low, 0) || math.IsInf(b.Close, 0) {
+			return out, false
+		}
+		if !((clock >= "0935" && clock <= "1130") || (clock >= "1305" && clock <= "1500")) || (clock[3] != '0' && clock[3] != '5') {
+			return out, false
+		}
+		if _, exists := byClock[clock]; exists {
+			return out, false
+		}
+		byClock[clock] = b
 	}
 	openBar, ok1 := byClock["0935"]  // 首根（含集合竞价）
 	amEnd, ok2 := byClock["1030"]    // 早盘 1 小时末根
@@ -187,19 +205,38 @@ func min5CountForDays(n int) int {
 // 宇宙=market_sync_states cn 全体，每股一次请求覆盖全部目标日，8 worker 并发。
 // 返回落库总行数。连续源类失败达阈值中止（返回已完成部分与错误）。
 func (s *IntradayService) SyncIntradayFactors(ctx context.Context, dates []string) (int, error) {
+	ctx = jobSubmissionContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if common.DB == nil {
 		return 0, errors.New("数据库不可用")
 	}
 	if len(dates) == 0 {
 		return 0, nil
 	}
+	dateSet := make(map[string]bool, len(dates))
+	now := time.Now()
+	for _, date := range dates {
+		parsed, err := time.Parse("2006-01-02", date)
+		if err != nil || parsed.Format("2006-01-02") != date || date > now.Format("2006-01-02") ||
+			(date == now.Format("2006-01-02") && now.Hour()*60+now.Minute() < intradayCutoffMin) {
+			return 0, errors.New("盘中因子仅能同步已经收盘的有效日期")
+		}
+		dateSet[date] = true
+	}
+	dates = make([]string, 0, len(dateSet))
+	for date := range dateSet {
+		dates = append(dates, date)
+	}
+	sort.Strings(dates)
 	if !intradaySyncRunning.CompareAndSwap(false, true) {
 		return 0, ErrSyncInProgress
 	}
 	defer intradaySyncRunning.Store(false)
 
 	var symbols []string
-	if err := common.DB.Model(&model.MarketSyncState{}).
+	if err := common.DB.WithContext(ctx).Model(&model.MarketSyncState{}).
 		Where("market = ?", "cn").Order("symbol").Pluck("symbol", &symbols).Error; err != nil {
 		return 0, err
 	}
@@ -207,16 +244,13 @@ func (s *IntradayService) SyncIntradayFactors(ctx context.Context, dates []strin
 		return 0, errors.New("宇宙字典为空（全市场日线尚未初始化）")
 	}
 
-	dateSet := make(map[string]bool, len(dates))
-	for _, d := range dates {
-		dateSet[d] = true
-	}
 	count := min5CountForDays(len(dates))
 
 	var (
 		mu      sync.Mutex
 		rows    []model.IntradayFactorDaily
 		srcFail atomic.Int64 // 连续源类失败（ErrNoData/ErrSymbolInvalid 不算）
+		failed  atomic.Int64 // 总源故障数；单股失败同样不能推进成功游标。
 		aborted atomic.Bool
 		wg      sync.WaitGroup
 	)
@@ -251,11 +285,15 @@ func (s *IntradayService) SyncIntradayFactors(ctx context.Context, dates []strin
 			case ctx.Err() != nil:
 				// 整体取消/超时，非源故障。
 			default:
+				failed.Add(1)
 				if srcFail.Add(1) >= intradayAbortStreak {
 					aborted.Store(true)
 				}
 			}
-			time.Sleep(intradayThrottle)
+			select {
+			case <-ctx.Done():
+			case <-time.After(intradayThrottle):
+			}
 		}
 	}
 	wg.Add(intradayWorkers)
@@ -278,18 +316,30 @@ func (s *IntradayService) SyncIntradayFactors(ctx context.Context, dates []strin
 		return 0, err
 	}
 
-	// 先删目标日再插（事务）：盘中/重复触发的重跑以最终拉取为准，幂等。
-	if err := common.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("market = ? AND trade_date IN ?", "cn", dates).
-			Delete(&model.IntradayFactorDaily{}).Error; err != nil {
-			return err
+	// 仅替换本次确实取得的有效事实；临时故障或缺根不能删除已有历史。
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Symbol != rows[j].Symbol {
+			return rows[i].Symbol < rows[j].Symbol
 		}
+		return rows[i].TradeDate < rows[j].TradeDate
+	})
+	if err := withJobResultTransaction(ctx, func(tx *gorm.DB) error {
 		if len(rows) == 0 {
 			return nil
 		}
-		return tx.CreateInBatches(rows, 500).Error
+		return tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "trade_date"}},
+			DoUpdates: clause.AssignmentColumns([]string{"tail30_chg", "tail30_vol_pct", "morning_chg", "close_vs_vwap", "pm_vwap_up", "vwap", "bar_count", "updated_at"}),
+		}).CreateInBatches(rows, 500).Error
 	}); err != nil {
 		return 0, err
+	}
+	covered := map[string]bool{}
+	for _, row := range rows {
+		covered[row.TradeDate] = true
+	}
+	if failed.Load() > 0 || len(covered) < len(dates) {
+		return len(rows), fmt.Errorf("盘中因子部分完成：有效 %d 行，源故障 %d 只，无有效数据日期 %d 天", len(rows), failed.Load(), len(dates)-len(covered))
 	}
 	return len(rows), nil
 }
@@ -298,30 +348,56 @@ func (s *IntradayService) SyncIntradayFactors(ctx context.Context, dates []strin
 // 上限 intradayBackfillMaxDays（超出的更早日子诚实放弃——上游深度有限）。
 // cursor 为空（首轮部署）只做 target 一日。
 func intradayPendingDates(cursor, target string) []string {
-	if target == "" {
-		return nil
+	dates, err := intradayPendingDatesContext(context.Background(), cursor, target)
+	if err != nil {
+		common.SysWarn("盘中因子补采日期读取失败: %v", err)
 	}
-	if cursor == "" || cursor >= target {
-		if cursor == target {
-			return nil
+	return dates
+}
+
+func intradayPendingDatesContext(ctx context.Context, cursor, target string) ([]string, error) {
+	if target == "" {
+		return nil, nil
+	}
+	end, err := time.Parse("2006-01-02", target)
+	if err != nil {
+		return nil, errors.New("盘中因子目标日期无效")
+	}
+	if cursor >= target {
+		return nil, nil
+	}
+	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
+	}
+	if cursor == "" {
+		var day model.TradingCalendar
+		if err := common.DB.WithContext(ctx).Where("market = ? AND trade_date = ? AND is_open = ?", "cn", target, true).First(&day).Error; err != nil {
+			return nil, err
 		}
-		return []string{target}
+		return []string{target}, nil
+	}
+	start, err := time.Parse("2006-01-02", cursor)
+	if err != nil {
+		return nil, errors.New("盘中因子游标日期无效")
+	}
+	var calendar []model.TradingCalendar
+	if err := common.DB.WithContext(ctx).Where("market = ? AND trade_date > ? AND trade_date <= ?", "cn", cursor, target).
+		Order("trade_date ASC").Find(&calendar).Error; err != nil {
+		return nil, err
+	}
+	if len(calendar) != int(end.Sub(start).Hours()/24) {
+		return nil, errors.New("盘中因子补采区间交易日历不完整")
 	}
 	var dates []string
-	if common.DB != nil {
-		if err := common.DB.Model(&model.TradingCalendar{}).
-			Where("market = ? AND is_open = ? AND trade_date > ? AND trade_date <= ?", "cn", true, cursor, target).
-			Order("trade_date ASC").Pluck("trade_date", &dates).Error; err != nil {
-			dates = nil
+	for _, day := range calendar {
+		if day.IsOpen {
+			dates = append(dates, day.TradeDate)
 		}
-	}
-	if len(dates) == 0 {
-		dates = []string{target} // 无日历回退：至少补目标日
 	}
 	if len(dates) > intradayBackfillMaxDays {
 		dates = dates[len(dates)-intradayBackfillMaxDays:]
 	}
-	return dates
+	return dates, nil
 }
 
 // IntradayAccumulatedDays 已积累的盘中因子交易日数（盘中策略回测 60 日门槛的进度）。
@@ -330,8 +406,10 @@ func IntradayAccumulatedDays() int64 {
 		return 0
 	}
 	var n int64
-	common.DB.Model(&model.IntradayFactorDaily{}).Where("market = ?", "cn").
-		Distinct("trade_date").Count(&n)
+	if err := common.DB.Model(&model.IntradayFactorDaily{}).Where("market = ? AND trade_date <= ?", "cn", time.Now().Format("2006-01-02")).
+		Distinct("trade_date").Count(&n).Error; err != nil {
+		common.SysWarn("盘中因子积累天数读取失败: %v", err)
+	}
 	return n
 }
 
@@ -340,17 +418,25 @@ func IntradayAccumulatedDays() int64 {
 func StartIntradayJobs() *IntradayService {
 	svc := NewIntradayService()
 	run := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		defer cancel()
 		target := moodTargetDate(time.Now(), intradayCutoffMin)
-		cursor := optionValue(optIntradayDay)
+		cursor, err := model.LoadOption(ctx, optIntradayDay)
+		if err != nil {
+			common.SysWarn("盘中因子游标读取失败: %v", err)
+			return
+		}
 		if cursor == target {
 			return
 		}
-		dates := intradayPendingDates(cursor, target)
+		dates, err := intradayPendingDatesContext(ctx, cursor, target)
+		if err != nil {
+			common.SysWarn("盘中因子补采计划失败: %v", err)
+			return
+		}
 		if len(dates) == 0 {
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-		defer cancel()
 		start := time.Now()
 		n, err := svc.SyncIntradayFactors(ctx, dates)
 		if err != nil {
@@ -360,7 +446,10 @@ func StartIntradayJobs() *IntradayService {
 			common.SysWarn("盘中因子同步失败 %s: %v", strings.Join(dates, ","), err)
 			return
 		}
-		_ = model.UpsertOption(optIntradayDay, target)
+		if err := model.UpsertOption(optIntradayDay, target, ctx); err != nil {
+			common.SysWarn("盘中因子游标保存失败: %v", err)
+			return
+		}
 		common.SysLog("盘中因子同步完成 %s：%d 行，耗时 %v；累计 %d 个交易日（盘中策略回测需满 %d 日才开放）",
 			strings.Join(dates, ","), n, time.Since(start).Round(time.Second), IntradayAccumulatedDays(), intradayBacktestMinDays)
 	}
@@ -384,19 +473,27 @@ func StartIntradayJobs() *IntradayService {
 // 今日 job 未跑，按 MAX(trade_date) 查询最近已同步交易日，与 lhbSignalsFor 同款）。
 // P1 水位：库内最新日期落后应有交易日超过容忍值时按无信号处理（signalDateUsable），
 // 旧盘中形态不冒充近期信号。
-func intradaySignalsFor(symbols []string) map[string]model.IntradayFactorDaily {
+func intradaySignalsFor(symbols []string, contexts ...context.Context) map[string]model.IntradayFactorDaily {
 	out := map[string]model.IntradayFactorDaily{}
 	if common.DB == nil || len(symbols) == 0 {
 		return out
 	}
-	var latest string
-	common.DB.Model(&model.IntradayFactorDaily{}).Where("market = ?", "cn").
-		Select("MAX(trade_date)").Scan(&latest)
-	if !signalDateUsable(latest) {
+	var rows []model.IntradayFactorDaily
+	err := readSnapshotTx(jobSubmissionContext(contexts...), func(tx *gorm.DB) error {
+		var latest string
+		if err := tx.Model(&model.IntradayFactorDaily{}).Where("market = ? AND trade_date <= ?", "cn", time.Now().Format("2006-01-02")).
+			Select("COALESCE(MAX(trade_date), '')").Scan(&latest).Error; err != nil {
+			return err
+		}
+		if !signalDateUsableDB(tx, latest) {
+			return nil
+		}
+		return tx.Where("market = ? AND trade_date = ? AND symbol IN ?", "cn", latest, symbols).Find(&rows).Error
+	})
+	if err != nil {
+		common.SysWarn("盘中因子信号读取失败: %v", err)
 		return out
 	}
-	var rows []model.IntradayFactorDaily
-	common.DB.Where("market = ? AND trade_date = ? AND symbol IN ?", "cn", latest, symbols).Find(&rows)
 	for _, r := range rows {
 		out[r.Symbol] = r
 	}

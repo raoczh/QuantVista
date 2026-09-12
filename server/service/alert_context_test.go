@@ -31,7 +31,7 @@ func TestMarketAlertEventContextsCoverEveryKind(t *testing.T) {
 			return &datasource.Quote{
 				Symbol: "600000", Market: "cn", Price: 12, Open: 10, High: 15, Low: 10,
 				PrevClose: 10, ChangePct: 6, Volume: 300, Source: "eastmoney", DataTime: now,
-			}, quoteFreshInfo{Status: freshStatusFresh}, nil
+			}, quoteFreshInfo{Status: freshStatusFresh, ExpectedDate: now.Format("2006-01-02"), MarketState: marketStateClosed}, nil
 		},
 		getDailyBars: func(context.Context, string, string, int) ([]datasource.Bar, error) {
 			return bars, nil

@@ -61,12 +61,13 @@ function onSelectTheme(key: string) {
 
 <style scoped>
 .auth-shell {
+  box-sizing: border-box;
   position: relative;
   min-height: 100vh;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  padding: 64px 24px 24px;
 }
 .auth-topbar {
   position: absolute;

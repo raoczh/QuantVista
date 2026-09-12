@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, ref, watch } from 'vue'
+import { computed, h, onUnmounted, ref, watch } from 'vue'
 import { NSelect, type SelectOption } from 'naive-ui'
 import { searchStocks, type StockSearchItem } from '@/api/stockSearch'
 import type { StockRef } from '@/composables/useStockActions'
@@ -60,6 +60,7 @@ async function handleSearch(query: string) {
   const keyword = query.trim()
   const seq = ++requestSeq
   if (!keyword) {
+    loading.value = false
     options.value = props.modelValue?.symbol ? [toOption(props.modelValue)] : []
     return
   }
@@ -78,6 +79,8 @@ async function handleSearch(query: string) {
     if (seq === requestSeq) loading.value = false
   }
 }
+
+onUnmounted(() => { requestSeq++ })
 
 function handleUpdate(value: string | null) {
   if (!value) {

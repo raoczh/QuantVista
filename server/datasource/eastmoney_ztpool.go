@@ -28,19 +28,19 @@ const (
 type ZTPoolItem struct {
 	Symbol       string  `json:"symbol"`
 	Name         string  `json:"name"`
-	Price        float64 `json:"price"`          // 收盘价（上游 ×1000 已还原）
-	ChangePct    float64 `json:"change_pct"`     // 涨跌幅 %
-	Amount       float64 `json:"amount"`         // 成交额（元）
-	FloatCap     float64 `json:"float_cap"`      // 流通市值（元）
-	TurnoverRate float64 `json:"turnover_rate"`  // 换手率 %
-	Streak       int     `json:"streak"`         // 连板数（lbc）
-	FirstSealAt  int     `json:"first_seal_at"`  // 首次封板时间 HHMMSS
-	LastSealAt   int     `json:"last_seal_at"`   // 最后封板时间 HHMMSS
-	SealFund     float64 `json:"seal_fund"`      // 封板资金（元）
-	BreakCount   int     `json:"break_count"`    // 炸板次数（zbc）
-	Industry     string  `json:"industry"`       // 行业板块（hybk）
-	StatDays     int     `json:"stat_days"`      // 涨停统计：days 天
-	StatCount    int     `json:"stat_count"`     // 涨停统计：ct 板（如 5天3板）
+	Price        float64 `json:"price"`         // 收盘价（上游 ×1000 已还原）
+	ChangePct    float64 `json:"change_pct"`    // 涨跌幅 %
+	Amount       float64 `json:"amount"`        // 成交额（元）
+	FloatCap     float64 `json:"float_cap"`     // 流通市值（元）
+	TurnoverRate float64 `json:"turnover_rate"` // 换手率 %
+	Streak       int     `json:"streak"`        // 连板数（lbc）
+	FirstSealAt  int     `json:"first_seal_at"` // 首次封板时间 HHMMSS
+	LastSealAt   int     `json:"last_seal_at"`  // 最后封板时间 HHMMSS
+	SealFund     float64 `json:"seal_fund"`     // 封板资金（元）
+	BreakCount   int     `json:"break_count"`   // 炸板次数（zbc）
+	Industry     string  `json:"industry"`      // 行业板块（hybk）
+	StatDays     int     `json:"stat_days"`     // 涨停统计：days 天
+	StatCount    int     `json:"stat_count"`    // 涨停统计：ct 板（如 5天3板）
 }
 
 // ZBPoolItem 炸板池条目（曾封板但收盘未封住）。
@@ -58,8 +58,8 @@ type ZBPoolItem struct {
 type YZTPoolItem struct {
 	Symbol       string  `json:"symbol"`
 	Name         string  `json:"name"`
-	ChangePct    float64 `json:"change_pct"`  // 今日涨跌幅 %（昨涨停今表现）
-	YStreak      int     `json:"y_streak"`    // 昨日连板数（ylbc）
+	ChangePct    float64 `json:"change_pct"` // 今日涨跌幅 %（昨涨停今表现）
+	YStreak      int     `json:"y_streak"`   // 昨日连板数（ylbc）
 	TurnoverRate float64 `json:"turnover_rate"`
 	Industry     string  `json:"industry"`
 }
@@ -114,6 +114,9 @@ func (e *EastMoneyAdapter) fetchZTPoolPages(ctx context.Context, api, sort, date
 			break
 		}
 	}
+	if got < total {
+		return 0, fmt.Errorf("%w: %s 分页不完整 %d/%d", ErrUpstream, api, got, total)
+	}
 	return total, nil
 }
 
@@ -139,7 +142,7 @@ func (e *EastMoneyAdapter) GetZTPool(ctx context.Context, date string) ([]ZTPool
 		} `json:"zttj"`
 	}
 	var out []ZTPoolItem
-	_, err := e.fetchZTPoolPages(ctx, "getTopicZTPool", "fbt:asc", date, func(raw json.RawMessage) {
+	total, err := e.fetchZTPoolPages(ctx, "getTopicZTPool", "fbt:asc", date, func(raw json.RawMessage) {
 		var it row
 		if json.Unmarshal(raw, &it) != nil || it.C == "" {
 			return
@@ -165,6 +168,9 @@ func (e *EastMoneyAdapter) GetZTPool(ctx context.Context, date string) ([]ZTPool
 	if err != nil {
 		return nil, err
 	}
+	if len(out) != total {
+		return nil, fmt.Errorf("%w: 涨停池有效条目不完整 %d/%d", ErrUpstream, len(out), total)
+	}
 	return out, nil
 }
 
@@ -180,7 +186,7 @@ func (e *EastMoneyAdapter) GetZBPool(ctx context.Context, date string) ([]ZBPool
 		Hybk string          `json:"hybk"`
 	}
 	var out []ZBPoolItem
-	_, err := e.fetchZTPoolPages(ctx, "getTopicZBPool", "fbt:asc", date, func(raw json.RawMessage) {
+	total, err := e.fetchZTPoolPages(ctx, "getTopicZBPool", "fbt:asc", date, func(raw json.RawMessage) {
 		var it row
 		if json.Unmarshal(raw, &it) != nil || it.C == "" {
 			return
@@ -197,6 +203,9 @@ func (e *EastMoneyAdapter) GetZBPool(ctx context.Context, date string) ([]ZBPool
 	if err != nil {
 		return nil, err
 	}
+	if len(out) != total {
+		return nil, fmt.Errorf("%w: 炸板池有效条目不完整 %d/%d", ErrUpstream, len(out), total)
+	}
 	return out, nil
 }
 
@@ -211,7 +220,7 @@ func (e *EastMoneyAdapter) GetYesterdayZTPool(ctx context.Context, date string) 
 		Hybk string          `json:"hybk"`
 	}
 	var out []YZTPoolItem
-	_, err := e.fetchZTPoolPages(ctx, "getYesterdayZTPool", "zs:desc", date, func(raw json.RawMessage) {
+	total, err := e.fetchZTPoolPages(ctx, "getYesterdayZTPool", "zs:desc", date, func(raw json.RawMessage) {
 		var it row
 		if json.Unmarshal(raw, &it) != nil || it.C == "" {
 			return
@@ -226,6 +235,9 @@ func (e *EastMoneyAdapter) GetYesterdayZTPool(ctx context.Context, date string) 
 	})
 	if err != nil {
 		return nil, err
+	}
+	if len(out) != total {
+		return nil, fmt.Errorf("%w: 昨日涨停池有效条目不完整 %d/%d", ErrUpstream, len(out), total)
 	}
 	return out, nil
 }

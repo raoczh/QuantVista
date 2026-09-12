@@ -118,25 +118,55 @@ type auditOpportunity struct {
 	Rank   int
 }
 
-var candidateAuditRunMu sync.Mutex
+var candidateAuditRunMu jobCreateLock
 var candidateAuditScheduleMu sync.Mutex
 var candidateAuditSchedulePending = map[string]bool{}
 
-func candidateAuditAdjacentSignalDate(market, outcomeDate string) (string, error) {
+func candidateAuditAdjacentSignalDate(market, outcomeDate string, contexts ...context.Context) (string, error) {
 	if common.DB == nil {
 		return "", errors.New("数据库不可用")
 	}
+	ctx := jobSubmissionContext(contexts...)
+	var date string
+	err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		date, err = candidateAuditAdjacentSignalDateDB(tx, market, outcomeDate)
+		return err
+	})
+	return date, err
+}
+
+func candidateAuditAdjacentSignalDateDB(db *gorm.DB, market, outcomeDate string) (string, error) {
+	if db == nil {
+		return "", errors.New("数据库不可用")
+	}
 	var current model.TradingCalendar
-	if err := common.DB.Where("market = ? AND trade_date = ?", market, outcomeDate).First(&current).Error; err != nil {
+	if err := db.Where("market = ? AND trade_date = ?", market, outcomeDate).First(&current).Error; err != nil {
 		return "", fmt.Errorf("结果日交易日历缺失: %w", err)
 	}
 	if !current.IsOpen {
 		return "", errors.New("结果日不是有效交易日")
 	}
 	var previous model.TradingCalendar
-	if err := common.DB.Where("market = ? AND is_open = ? AND trade_date < ?", market, true, outcomeDate).
+	if err := db.Where("market = ? AND is_open = ? AND trade_date < ?", market, true, outcomeDate).
 		Order("trade_date DESC").First(&previous).Error; err != nil {
 		return "", fmt.Errorf("上一有效交易日不可用: %w", err)
+	}
+	start, startErr := auditDateStart(previous.TradeDate)
+	end, endErr := auditDateStart(outcomeDate)
+	if startErr != nil || endErr != nil || !start.Before(end) {
+		return "", errors.New("审计日期无效")
+	}
+	var known int64
+	if err := db.Model(&model.TradingCalendar{}).Where("market = ? AND trade_date > ? AND trade_date <= ?", market, previous.TradeDate, outcomeDate).Count(&known).Error; err != nil {
+		return "", err
+	}
+	expected := int64(0)
+	for day := start.AddDate(0, 0, 1); !day.After(end); day = day.AddDate(0, 0, 1) {
+		expected++
+	}
+	if known != expected {
+		return "", errors.New("中间交易日历缺失，不能确认相邻交易日")
 	}
 	return previous.TradeDate, nil
 }
@@ -145,9 +175,9 @@ func auditDateStart(date string) (time.Time, error) {
 	return time.ParseInLocation("2006-01-02", date, time.Local)
 }
 
-func candidateAuditDiscoveryRun(date string) (model.CandidateDiscoveryRun, error) {
+func candidateAuditDiscoveryRunDB(db *gorm.DB, date string) (model.CandidateDiscoveryRun, error) {
 	var run model.CandidateDiscoveryRun
-	err := common.DB.Where("market = ? AND trade_date = ? AND owner_type = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ? AND status IN ?",
+	err := db.Where("market = ? AND trade_date = ? AND owner_type = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ? AND status IN ?",
 		"cn", date, model.JobOwnerSystem, DiscoveryVersion, factorSnapshotVersion, discoveryParameterHash(),
 		[]string{DiscoveryRunStatusOK, DiscoveryRunStatusPart}).Order("id DESC").First(&run).Error
 	return run, err
@@ -170,21 +200,33 @@ func markCandidateAuditFailed(runID int64, err error) {
 		return
 	}
 	now := time.Now()
-	_ = common.DB.Model(&model.CandidateAuditRun{}).Where("id = ?", runID).Updates(map[string]any{
-		"status": model.CandidateAuditStatusFailed, "error": truncate(err.Error(), 512),
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if writeErr := common.DB.WithContext(ctx).Model(&model.CandidateAuditRun{}).Where("id = ? AND status = ?", runID, model.CandidateAuditStatusProcessing).Updates(map[string]any{
+		"status": model.CandidateAuditStatusFailed, "error": sanitizeJobError(err.Error()),
 		"finished_at": now, "updated_at": now,
-	}).Error
+	}).Error; writeErr != nil {
+		common.SysWarn("候选审计失败状态写入失败 run=%d: %v", runID, writeErr)
+	}
 }
 
-func finishCandidateAuditWithoutItems(run *model.CandidateAuditRun, status string, gaps map[string]int) error {
+func finishCandidateAuditWithoutItems(ctx context.Context, run *model.CandidateAuditRun, status string, gaps map[string]int) error {
 	now := time.Now()
-	run.Status, run.GapJSON, run.FinishedAt = status, auditMarshal(gaps), &now
-	return common.DB.Model(&model.CandidateAuditRun{}).Where("id = ?", run.ID).Updates(map[string]any{
-		"status": status, "gap_json": run.GapJSON, "coverage_json": auditMarshal(map[string]int{}),
-		"data_as_of": run.DataAsOf,
-		"item_count": 0, "missed_count": 0, "false_positive_count": 0,
-		"error": "", "finished_at": now, "updated_at": now,
-	}).Error
+	return withJobResultTransaction(ctx, func(tx *gorm.DB) error {
+		result := tx.Model(&model.CandidateAuditRun{}).Where("id = ? AND status = ?", run.ID, model.CandidateAuditStatusProcessing).Updates(map[string]any{
+			"status": status, "gap_json": auditMarshal(gaps), "coverage_json": auditMarshal(map[string]int{}),
+			"data_as_of": run.DataAsOf,
+			"item_count": 0, "missed_count": 0, "false_positive_count": 0,
+			"error": "", "finished_at": now, "updated_at": now,
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errors.New("候选审计运行状态已改变")
+		}
+		return tx.First(run, run.ID).Error
+	})
 }
 
 func auditBenchmarkObservation(ctx context.Context, market *MarketService, outcomeDate string) (float64, bool) {
@@ -201,11 +243,23 @@ func auditBenchmarkObservation(ctx context.Context, market *MarketService, outco
 
 func loadAuditObservations(ctx context.Context, market *MarketService, signalDate, outcomeDate string,
 	factorVersion string, coverage, gaps map[string]int) (map[string]auditSymbolObservation, error) {
+	benchPct, hasBench := auditBenchmarkObservation(ctx, market, outcomeDate)
+	var out map[string]auditSymbolObservation
+	err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		out, err = loadAuditObservationsDB(ctx, tx, signalDate, outcomeDate, factorVersion, coverage, gaps, benchPct, hasBench)
+		return err
+	})
+	return out, err
+}
+
+func loadAuditObservationsDB(ctx context.Context, db *gorm.DB, signalDate, outcomeDate string,
+	factorVersion string, coverage, gaps map[string]int, benchPct float64, hasBench bool) (map[string]auditSymbolObservation, error) {
 	var signalUniverse, outcomeUniverse []model.StockUniverseDaily
-	if err := common.DB.Where("market = ? AND trade_date = ?", "cn", signalDate).Find(&signalUniverse).Error; err != nil {
+	if err := db.Where("market = ? AND trade_date = ?", "cn", signalDate).Find(&signalUniverse).Error; err != nil {
 		return nil, err
 	}
-	if err := common.DB.Where("market = ? AND trade_date = ?", "cn", outcomeDate).Find(&outcomeUniverse).Error; err != nil {
+	if err := db.Where("market = ? AND trade_date = ?", "cn", outcomeDate).Find(&outcomeUniverse).Error; err != nil {
 		return nil, err
 	}
 	coverage["signal_universe"] = len(signalUniverse)
@@ -221,7 +275,7 @@ func loadAuditObservations(ctx context.Context, market *MarketService, signalDat
 		outcomeBy[row.Symbol] = row
 	}
 	var factors []model.FactorSnapshotDaily
-	if err := common.DB.Where("market = ? AND trade_date = ? AND factor_version = ?", "cn", signalDate, factorVersion).
+	if err := usableFactorSnapshots(db).Where("market = ? AND trade_date = ? AND factor_version = ?", "cn", signalDate, factorVersion).
 		Find(&factors).Error; err != nil {
 		return nil, err
 	}
@@ -232,7 +286,7 @@ func loadAuditObservations(ctx context.Context, market *MarketService, signalDat
 	coverage["factor_snapshots"] = len(factors)
 
 	var barRows []model.DailyBar
-	if err := common.DB.Where("market = ? AND trade_date IN ?", "cn", []string{signalDate, outcomeDate}).
+	if err := db.Where("market = ? AND trade_date IN ?", "cn", []string{signalDate, outcomeDate}).
 		Order("symbol, trade_date").Find(&barRows).Error; err != nil {
 		return nil, err
 	}
@@ -245,7 +299,6 @@ func loadAuditObservations(ctx context.Context, market *MarketService, signalDat
 			High: row.High, Low: row.Low, Close: row.Close, Volume: row.Volume, Amount: row.Amount,
 			TurnoverRate: row.TurnoverRate, Source: row.Source}
 	}
-	benchPct, hasBench := auditBenchmarkObservation(ctx, market, outcomeDate)
 	if !hasBench {
 		gaps["benchmark_missing"]++
 	}
@@ -342,12 +395,15 @@ func buildAuditOpportunities(observations map[string]auditSymbolObservation) []a
 	return rows
 }
 
-func loadAuditDiscoveryFacts(signalRun model.CandidateDiscoveryRun) (map[string]auditDiscoveryFact, error) {
+func loadAuditDiscoveryFactsDB(db *gorm.DB, signalRun model.CandidateDiscoveryRun) (map[string]auditDiscoveryFact, error) {
 	// 口径对齐：推荐建池消费的是「近 5 个有效交易日的发现记忆」（recentDiscoveryCandidates），
 	// 审计判 discovered 若只看信号日单日事实，会把“3 天前被发现、信号日未复现且未进
 	// 用户池”的漏选错归因为 not_discovered_marketwide，低估发现层召回。这里按同样的
 	// 5 日窗口取事实（全部早于等于信号日，PIT 合规）；Primary 取最新一日的最优行。
-	dates := recentOpenDates(signalRun.Market, signalRun.TradeDate, 5)
+	dates, err := recentOpenDatesDB(db, signalRun.Market, signalRun.TradeDate, 5)
+	if err != nil {
+		return nil, err
+	}
 	if len(dates) == 0 || dates[len(dates)-1] != signalRun.TradeDate {
 		dates = append(dates, signalRun.TradeDate)
 	}
@@ -355,7 +411,7 @@ func loadAuditDiscoveryFacts(signalRun model.CandidateDiscoveryRun) (map[string]
 		dates = dates[len(dates)-5:]
 	}
 	var runs []model.CandidateDiscoveryRun
-	if err := common.DB.Where("market = ? AND trade_date IN ? AND owner_type = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ? AND status IN ?",
+	if err := db.Where("market = ? AND trade_date IN ? AND owner_type = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ? AND status IN ?",
 		signalRun.Market, dates, model.JobOwnerSystem, signalRun.DiscoveryVersion, signalRun.FactorVersion, signalRun.ParameterHash,
 		[]string{DiscoveryRunStatusOK, DiscoveryRunStatusPart}).Find(&runs).Error; err != nil {
 		return nil, err
@@ -370,7 +426,7 @@ func loadAuditDiscoveryFacts(signalRun model.CandidateDiscoveryRun) (map[string]
 	var rows []model.CandidateDiscoveryItem
 	// rank 是 MySQL 8.0.2+ 保留字，裸 ORDER BY rank 生产必挂（SQLite 单测不覆盖），
 	// 必须走 OrderByColumn 由方言加引号——同 mood.go 人气榜先例。
-	if err := common.DB.Where("run_id IN ?", runIDs).Order("trade_date DESC").
+	if err := db.Where("run_id IN ? AND market = ? AND trade_date IN ? AND discovery_version = ? AND data_status IN ?", runIDs, signalRun.Market, dates, signalRun.DiscoveryVersion, []string{DiscoveryItemReady, DiscoveryItemPartial}).Order("trade_date DESC").
 		Order(clause.OrderByColumn{Column: clause.Column{Name: "rank"}}).
 		Order("channel, symbol").Find(&rows).Error; err != nil {
 		return nil, err
@@ -544,7 +600,9 @@ func auditMapKey(batchID int64, symbol string) string {
 
 func ExecuteCandidateAudit(ctx context.Context, market *MarketService, expectedResultID int64,
 	request candidateAuditJobRequest) (*model.CandidateAuditRun, error) {
-	candidateAuditRunMu.Lock()
+	if err := candidateAuditRunMu.Lock(ctx); err != nil {
+		return nil, err
+	}
 	defer candidateAuditRunMu.Unlock()
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
@@ -558,7 +616,7 @@ func ExecuteCandidateAudit(ctx context.Context, market *MarketService, expectedR
 	if request.Market != "cn" || request.SignalDate == "" || request.OutcomeDate == "" {
 		return nil, errors.New("审计交易日对或市场无效")
 	}
-	previous, err := candidateAuditAdjacentSignalDate(request.Market, request.OutcomeDate)
+	previous, err := candidateAuditAdjacentSignalDate(request.Market, request.OutcomeDate, ctx)
 	if err != nil {
 		return nil, fmt.Errorf("审计日期不是相邻有效交易日: signal=%s outcome=%s: %w",
 			request.SignalDate, request.OutcomeDate, err)
@@ -570,132 +628,78 @@ func ExecuteCandidateAudit(ctx context.Context, market *MarketService, expectedR
 
 	var run model.CandidateAuditRun
 	created := false
-	err = common.DB.Where("market = ? AND signal_date = ? AND outcome_date = ? AND audit_version = ? AND parameter_hash = ?",
-		request.Market, request.SignalDate, request.OutcomeDate, CandidateAuditVersion, request.ParameterHash).First(&run).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		now := time.Now()
-		run = model.CandidateAuditRun{OwnerType: model.JobOwnerSystem, Market: request.Market,
-			SignalDate: request.SignalDate, OutcomeDate: request.OutcomeDate,
-			AuditVersion: CandidateAuditVersion, ParameterHash: request.ParameterHash,
-			DiscoveryVersion: DiscoveryVersion, FactorVersion: factorSnapshotVersion,
-			OutcomeVersion: candidateAuditOutcomeVersion, ParameterJSON: candidateAuditParameterJSON(),
-			DataAsOf: now, Status: model.CandidateAuditStatusProcessing, StartedAt: now}
-		if err := common.DB.Create(&run).Error; err != nil {
-			return nil, err
+	err = withJobResultTransaction(ctx, func(tx *gorm.DB) error {
+		readErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("market = ? AND signal_date = ? AND outcome_date = ? AND audit_version = ? AND parameter_hash = ?",
+			request.Market, request.SignalDate, request.OutcomeDate, CandidateAuditVersion, request.ParameterHash).First(&run).Error
+		if errors.Is(readErr, gorm.ErrRecordNotFound) {
+			if expectedResultID > 0 {
+				return fmt.Errorf("审计作业结果引用错配: expected=%d actual=missing", expectedResultID)
+			}
+			now := time.Now()
+			run = model.CandidateAuditRun{OwnerType: model.JobOwnerSystem, Market: request.Market,
+				SignalDate: request.SignalDate, OutcomeDate: request.OutcomeDate,
+				AuditVersion: CandidateAuditVersion, ParameterHash: request.ParameterHash,
+				DiscoveryVersion: DiscoveryVersion, FactorVersion: factorSnapshotVersion,
+				OutcomeVersion: candidateAuditOutcomeVersion, ParameterJSON: candidateAuditParameterJSON(),
+				DataAsOf: now, Status: model.CandidateAuditStatusProcessing, StartedAt: now}
+			if err := tx.Create(&run).Error; err != nil {
+				return err
+			}
+			created = true
+		} else if readErr != nil {
+			return readErr
 		}
-		created = true
-	} else if err != nil {
+		if expectedResultID > 0 && run.ID != expectedResultID {
+			return fmt.Errorf("审计作业结果引用错配: expected=%d actual=%d", expectedResultID, run.ID)
+		}
+		// success 与「已封存明细的 partial」是终态：观测一旦落库就是 PIT 事实，结果日
+		// 数据被订正（前复权重锚等）后重算会让历史报表漂移。只有**空运行 partial**
+		//（如信号日发现缺失，未封存任何明细）允许在上游数据补齐后幂等重算，否则一次
+		// 瞬时缺口会把该日对永久冻结成空报表。
+		if !created && run.FinishedAt != nil &&
+			(run.Status == model.CandidateAuditStatusSuccess ||
+				(run.Status == model.CandidateAuditStatusPartial && run.ItemCount > 0)) {
+			return nil
+		}
+		if !created {
+			now := time.Now()
+			if err := tx.Model(&run).Updates(map[string]any{"status": model.CandidateAuditStatusProcessing,
+				"error": "", "gap_json": "", "started_at": now, "finished_at": nil, "updated_at": now}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("run_id = ?", run.ID).Delete(&model.CandidateAuditItem{}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	if expectedResultID > 0 && run.ID != expectedResultID {
-		return nil, fmt.Errorf("审计作业结果引用错配: expected=%d actual=%d", expectedResultID, run.ID)
-	}
-	// success 与「已封存明细的 partial」是终态：观测一旦落库就是 PIT 事实，结果日
-	// 数据被订正（前复权重锚等）后重算会让历史报表漂移。只有**空运行 partial**
-	//（如信号日发现缺失，未封存任何明细）允许在上游数据补齐后幂等重算，否则一次
-	// 瞬时缺口会把该日对永久冻结成空报表。
 	if !created && run.FinishedAt != nil &&
-		(run.Status == model.CandidateAuditStatusSuccess ||
-			(run.Status == model.CandidateAuditStatusPartial && run.ItemCount > 0)) {
+		(run.Status == model.CandidateAuditStatusSuccess || (run.Status == model.CandidateAuditStatusPartial && run.ItemCount > 0)) {
 		return &run, nil
 	}
-	if !created {
-		now := time.Now()
-		if err := common.DB.Model(&run).Updates(map[string]any{"status": model.CandidateAuditStatusProcessing,
-			"error": "", "gap_json": "", "started_at": now, "finished_at": nil, "updated_at": now}).Error; err != nil {
-			return nil, err
-		}
-		if err := common.DB.Where("run_id = ?", run.ID).Delete(&model.CandidateAuditItem{}).Error; err != nil {
-			return nil, err
-		}
-	}
-
-	outcomeDiscovery, err := candidateAuditDiscoveryRun(request.OutcomeDate)
+	inputs, err := readCandidateAuditInputs(ctx, market, request)
 	if err != nil {
 		markCandidateAuditFailed(run.ID, err)
-		return &run, errors.New("结果日发现事实不可用")
+		return &run, err
 	}
+	outcomeDiscovery, signalDiscovery := inputs.outcome, inputs.signal
 	run.DataAsOf = outcomeDiscovery.AsOf
-	signalDiscovery, signalErr := candidateAuditDiscoveryRun(request.SignalDate)
-	if signalErr != nil {
-		// 只有「确实不存在信号日发现事实」才是合法降级；瞬时 DB 错误必须让作业
-		// 失败重试，不能固化成 partial 空运行。
-		if !errors.Is(signalErr, gorm.ErrRecordNotFound) {
-			markCandidateAuditFailed(run.ID, signalErr)
-			return &run, signalErr
-		}
-		gaps := map[string]int{"signal_discovery_missing": 1}
-		if err := finishCandidateAuditWithoutItems(&run, model.CandidateAuditStatusPartial, gaps); err != nil {
+	if inputs.missingSignal {
+		if err := finishCandidateAuditWithoutItems(ctx, &run, model.CandidateAuditStatusPartial, map[string]int{"signal_discovery_missing": 1}); err != nil {
+			markCandidateAuditFailed(run.ID, err)
 			return &run, err
 		}
 		return &run, nil
 	}
 	run.SignalDataAsOf = &signalDiscovery.AsOf
-
-	coverage, gaps := map[string]int{}, map[string]int{}
-	if signalDiscovery.Status == DiscoveryRunStatusPart {
-		gaps["signal_discovery_partial"]++
-	}
-	if outcomeDiscovery.Status == DiscoveryRunStatusPart {
-		gaps["outcome_discovery_partial"]++
-	}
-	observations, err := loadAuditObservations(ctx, market, request.SignalDate, request.OutcomeDate,
-		signalDiscovery.FactorVersion, coverage, gaps)
-	if err != nil {
-		markCandidateAuditFailed(run.ID, err)
-		return &run, err
-	}
+	coverage, gaps := inputs.coverage, inputs.gaps
+	observations, discoveryBy := inputs.observations, inputs.discovery
 	opportunities := buildAuditOpportunities(observations)
-	discoveryBy, err := loadAuditDiscoveryFacts(signalDiscovery)
-	if err != nil {
-		markCandidateAuditFailed(run.ID, err)
-		return &run, err
-	}
-
-	start, err := auditDateStart(request.SignalDate)
-	if err != nil {
-		markCandidateAuditFailed(run.ID, err)
-		return &run, err
-	}
-	end, err := auditDateStart(request.OutcomeDate)
-	if err != nil {
-		markCandidateAuditFailed(run.ID, err)
-		return &run, err
-	}
-	var batches []model.RecommendationBatch
-	if err := common.DB.Where("market = ? AND created_at >= ? AND created_at < ? AND status IN ?", "cn", start, end,
-		[]string{model.RecStatusSuccess, model.RecStatusDegraded}).Order("id").Find(&batches).Error; err != nil {
-		markCandidateAuditFailed(run.ID, err)
-		return &run, err
-	}
-	batchIDs := make([]int64, 0, len(batches))
-	for _, batch := range batches {
-		batchIDs = append(batchIDs, batch.ID)
-	}
-	var events []model.RecommendationCandidateEvent
-	var recommendations []model.Recommendation
-	var labels []model.RecommendationLabel
-	var selections []model.RecommendationSelectionOutcome
-	if len(batchIDs) > 0 {
-		if err := common.DB.Where("batch_id IN ?", batchIDs).Order("batch_id, id").Find(&events).Error; err != nil {
-			markCandidateAuditFailed(run.ID, err)
-			return &run, err
-		}
-		if err := common.DB.Where("batch_id IN ?", batchIDs).Order("batch_id, sort_order, id").Find(&recommendations).Error; err != nil {
-			markCandidateAuditFailed(run.ID, err)
-			return &run, err
-		}
-		if err := common.DB.Where("batch_id IN ? AND horizon_days = ? AND entry_mode = ? AND label_version = ?",
-			batchIDs, 1, model.EntryModeNextOpen, labelVersion).Find(&labels).Error; err != nil {
-			markCandidateAuditFailed(run.ID, err)
-			return &run, err
-		}
-		if err := common.DB.Where("batch_id IN ? AND outcome_version = ?", batchIDs,
-			model.SelectionOutcomeVersion).Find(&selections).Error; err != nil {
-			markCandidateAuditFailed(run.ID, err)
-			return &run, err
-		}
-	}
+	batches, events := inputs.batches, inputs.events
+	recommendations, labels, selections := inputs.recommendations, inputs.labels, inputs.selections
 	eventBy := map[string][]model.RecommendationCandidateEvent{}
 	for _, event := range events {
 		eventBy[auditMapKey(event.BatchID, event.Symbol)] = append(eventBy[auditMapKey(event.BatchID, event.Symbol)], event)
@@ -862,7 +866,7 @@ func ExecuteCandidateAudit(ctx context.Context, market *MarketService, expectedR
 	if len(gaps) > 0 {
 		status = model.CandidateAuditStatusPartial
 	}
-	err = common.DB.Transaction(func(tx *gorm.DB) error {
+	err = withJobResultTransaction(ctx, func(tx *gorm.DB) error {
 		if len(items) > 0 {
 			if err := tx.CreateInBatches(items, 300).Error; err != nil {
 				return err
@@ -881,13 +885,17 @@ func ExecuteCandidateAudit(ctx context.Context, market *MarketService, expectedR
 			"gap_json": auditMarshal(gaps), "content_hash": hex.EncodeToString(contentHash[:]), "error": "",
 			"finished_at": finished, "updated_at": finished,
 		}
-		return tx.Model(&model.CandidateAuditRun{}).Where("id = ?", run.ID).Updates(updates).Error
+		result := tx.Model(&model.CandidateAuditRun{}).Where("id = ? AND status = ?", run.ID, model.CandidateAuditStatusProcessing).Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errors.New("候选审计运行状态已改变")
+		}
+		return tx.First(&run, run.ID).Error
 	})
 	if err != nil {
 		markCandidateAuditFailed(run.ID, err)
-		return &run, err
-	}
-	if err := common.DB.First(&run, run.ID).Error; err != nil {
 		return &run, err
 	}
 	common.SysLog("每日候选审计完成 market=%s signal=%s outcome=%s run_id=%d status=%s batches=%d missed=%d false_positive=%d",
@@ -943,10 +951,13 @@ func registerCandidateAuditBinding() durableJobBinding {
 				now := time.Now()
 				dataAsOf := now
 				var outcomeDiscovery model.CandidateDiscoveryRun
-				if tx.Where("market = ? AND trade_date = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ?",
+				readErr := tx.Where("market = ? AND trade_date = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ?",
 					req.Market, req.OutcomeDate, DiscoveryVersion, factorSnapshotVersion, discoveryParameterHash()).
-					Order("id DESC").First(&outcomeDiscovery).Error == nil {
+					Order("id DESC").First(&outcomeDiscovery).Error
+				if readErr == nil {
 					dataAsOf = outcomeDiscovery.AsOf
+				} else if !errors.Is(readErr, gorm.ErrRecordNotFound) {
+					return 0, readErr
 				}
 				row = model.CandidateAuditRun{OwnerType: model.JobOwnerSystem, JobRunID: &job.ID,
 					Market: req.Market, SignalDate: req.SignalDate, OutcomeDate: req.OutcomeDate,
@@ -985,7 +996,7 @@ func registerCandidateAuditBinding() durableJobBinding {
 			if job.ResultID == nil {
 				return errors.New("候选审计作业缺少结果引用")
 			}
-			return tx.Model(&model.CandidateAuditRun{}).Where("id = ?", *job.ResultID).Updates(map[string]any{
+			return tx.Model(&model.CandidateAuditRun{}).Where("id = ? AND job_run_id = ? AND status = ?", *job.ResultID, job.ID, model.CandidateAuditStatusProcessing).Updates(map[string]any{
 				"status": model.CandidateAuditStatusFailed, "error": truncate(message, 512), "finished_at": now,
 			}).Error
 		},

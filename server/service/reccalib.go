@@ -985,23 +985,24 @@ func buildAnalysisCalibReport(ctx context.Context) (*AnalysisCalibReport, error)
 		if baseDate == "" {
 			baseDate = r.CreatedAt.In(time.Local).Format("2006-01-02")
 		}
-		if key := r.Symbol + "|" + baseDate; seenEvent[key] {
-			rep.DupSkipped++
+		base, after, err := cnBarsAfterBaseline(ctx, r.Symbol, baseDate, calibAnalysisHorizon)
+		if errors.Is(err, errUnadjustedBars) {
+			rep.NoDataSkipped++
 			continue
-		} else {
-			seenEvent[key] = true
 		}
-		base := cnBarsUpTo(r.Symbol, baseDate, 1)
+		if err != nil {
+			return nil, err
+		}
 		if len(base) == 0 || base[0].Close <= 0 {
 			rep.NoDataSkipped++
 			continue
 		}
-		var after []model.DailyBar
-		if err := common.DB.Select("trade_date", "close").
-			Where("market = ? AND symbol = ? AND trade_date > ?", "cn", r.Symbol, baseDate).
-			Order("trade_date").Limit(calibAnalysisHorizon).
-			Find(&after).Error; err != nil {
-			return nil, err
+		// 周末/停牌期间的创建日期可能不同，但实际价格基准仍是同一根日线。
+		if key := r.Symbol + "|" + base[0].TradeDate; seenEvent[key] {
+			rep.DupSkipped++
+			continue
+		} else {
+			seenEvent[key] = true
 		}
 		if len(after) < calibAnalysisHorizon || after[calibAnalysisHorizon-1].Close <= 0 {
 			rep.ImmatureSkipped++

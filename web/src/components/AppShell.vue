@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch, watchEffect, h } from 'vue'
+import { computed, onMounted, onBeforeUnmount, ref, watch, watchEffect, h } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NMenu,
@@ -22,6 +22,7 @@ import { useThemeStore } from '@/stores/theme'
 import { useAuthStore } from '@/stores/auth'
 import { getOverview } from '@/api/market'
 import { getTodoInbox } from '@/api/todo'
+import { getSessionEpoch } from '@/api/token'
 import { useUi, withAlpha } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import { setMarketTitle } from '@/lib/pageTitle'
@@ -53,6 +54,10 @@ const { isDark, primaryAlpha } = useUi()
 // ---------- 导航：高频一级直达，市场/研究与低频项归组，设置/管理后台只留用户菜单 ----------
 const todoCount = ref(0)
 const todoIncomplete = ref(false)
+let disposed = false
+let todoSeq = 0
+let marketSeq = 0
+const isCurrent = (owner: number) => !disposed && owner === getSessionEpoch()
 const todoBadgeText = computed(() => {
   if (todoCount.value <= 0 && !todoIncomplete.value) return null
   if (todoIncomplete.value) return todoCount.value > 0 ? `${todoCount.value}+` : '!'
@@ -60,14 +65,19 @@ const todoBadgeText = computed(() => {
 })
 
 async function refreshTodoCount() {
+  if (disposed || !isLoggedIn.value) return
+  const seq = ++todoSeq
+  const owner = getSessionEpoch()
   try {
     // 徽标与今日待办默认首屏**同口径**（all + needs_action）：徽标 12 条、
     // 点进去只有 3 条会让用户以为丢了东西，反过来漏计 research 侧的失败任务
     // 也会让该处理的事悄悄积压。改口径前先改 Today.vue 的默认筛选。
     const result = await getTodoInbox({ scope: 'all', status: 'needs_action' })
+    if (seq !== todoSeq || !isCurrent(owner)) return
     todoCount.value = result.total
     todoIncomplete.value = !result.complete
   } catch {
+    if (seq !== todoSeq || !isCurrent(owner)) return
     todoCount.value = 0
     todoIncomplete.value = true
   }
@@ -243,15 +253,20 @@ watch(
 
 // ---------- 标签页标题带大盘：挂后台也能瞟一眼盘面 ----------
 async function refreshMarketTitle() {
-  if (!isLoggedIn.value) return
+  if (disposed || !isLoggedIn.value) return
+  const seq = ++marketSeq
+  const owner = getSessionEpoch()
   try {
     const ix = (await getOverview('cn')).indices?.[0]
+    if (seq !== marketSeq || !isCurrent(owner)) return
     if (ix) {
       const sign = ix.change_pct > 0 ? '+' : ''
       setMarketTitle(`${ix.name} ${ix.price.toFixed(2)} ${sign}${ix.change_pct.toFixed(2)}%`)
+    } else {
+      setMarketTitle('')
     }
   } catch {
-    setMarketTitle('')
+    if (seq === marketSeq && isCurrent(owner)) setMarketTitle('')
   }
 }
 useAutoRefresh(refreshMarketTitle, 60_000)
@@ -290,7 +305,11 @@ onMounted(() => {
   healthTimer = window.setInterval(() => appStore.refreshStatus(), 90_000)
   browserNotifications.start()
 })
-onUnmounted(() => {
+onBeforeUnmount(() => {
+  disposed = true
+  todoSeq++
+  marketSeq++
+  setMarketTitle('')
   if (healthTimer !== undefined) clearInterval(healthTimer)
   browserNotifications.stop()
 })
@@ -681,6 +700,15 @@ onUnmounted(() => {
   }
   .app-main {
     padding: 16px 12px calc(72px + env(safe-area-inset-bottom, 0px));
+  }
+}
+@media (max-width: 359px) {
+  .app-header {
+    padding: 0 6px;
+    gap: 4px;
+  }
+  .header-right {
+    gap: 0;
   }
 }
 </style>

@@ -23,7 +23,7 @@ self.addEventListener('push', (event) => {
   const options = {
     body: String(payload.body || ''),
     tag: payload.event_id ? `qv-event-${payload.event_id}` : undefined,
-    data: { route },
+    data: { route, user_id: payload.user_id },
   }
   event.waitUntil(Promise.all([
     self.registration.showNotification(title, options),
@@ -42,7 +42,7 @@ self.addEventListener('notificationclick', (event) => {
     for (const client of clients) {
       if ('focus' in client) {
         await client.focus()
-        client.postMessage({ type: 'qv-browser-notification', payload: { route, title: event.notification.title, focus: true } })
+        client.postMessage({ type: 'qv-browser-notification', payload: { route, user_id: event.notification.data?.user_id, title: event.notification.title, focus: true } })
         return
       }
     }

@@ -152,6 +152,8 @@ const TASK_KIND_LABELS: Record<string, string> = {
   sync_market_wide: '全市场增量同步',
   init_market_history: '全市场历史初始化',
   factor_rebuild: '因子宽表重建',
+  daily_discovery: '全市场候选发现',
+  candidate_daily_audit: '每日候选审计',
 }
 
 export function taskSourceLabel(source: TaskSource): string {
@@ -288,7 +290,9 @@ export function taskRecoveryAdvice(task: TaskCenterItem): string {
   if (task.status === 'running') return task.cancel_requested ? '已请求取消，正在等待执行器协作收敛。' : '任务正在后台执行。'
   if (task.status === 'success') return '结果已保存，可随时打开查看。'
   if (task.status === 'degraded') return '部分结果可用，打开后请同时核对失败项和限制说明。'
-  if (task.status === 'canceled') return '任务已取消，未生成新的业务结果。'
+  if (task.status === 'canceled') return task.succeeded > 0
+    ? `任务已取消，已完成的 ${task.succeeded} 项结果保留。`
+    : '任务已取消，已有结果会保留。'
   if (task.source === 'data_sync') return '返回管理后台的数据健康区域检查数据源后重新触发同步。'
 
   switch (task.error_code) {

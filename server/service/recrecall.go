@@ -156,7 +156,10 @@ func (s *RecommendationService) RecRecallReport(ctx context.Context, userID int6
 		return nil, err
 	}
 	bt := NewBacktestService(s.market)
-	axis, _, _ := bt.marketAxis(ctx, freshDate)
+	axis, _, _, err := bt.marketAxis(ctx, freshDate)
+	if err != nil {
+		return nil, err
+	}
 	if len(axis) < horizon+3 {
 		return nil, errors.New("交易日轴数据不足，无法评估")
 	}
@@ -511,7 +514,7 @@ func summarizeRecallDist(rets []float64) RecallDist {
 // ORDER BY symbol, trade_date 由 idx_market_symbol_date (market, symbol, trade_date) 直接
 // 满足，免 filesort；不是唯一索引 (symbol, market, trade_date) —— market 在中列时无法用于排序。
 func streamCNDailyBars(ctx context.Context, process func(symbol string, bars []datasource.Bar)) error {
-	rows, err := common.DB.Model(&model.DailyBar{}).
+	rows, err := common.DB.WithContext(ctx).Model(&model.DailyBar{}).
 		Select(dailyBarScanCols).
 		Where("market = ?", "cn").
 		Order("symbol, trade_date").Rows()
@@ -532,10 +535,10 @@ func streamCNDailyBars(ctx context.Context, process func(symbol string, bars []d
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		var sym, td string
+		var sym, td, source string
 		var open, high, low, closeP, amount, turnover float64
 		var volume int64
-		if err := rows.Scan(&sym, &td, &open, &high, &low, &closeP, &volume, &amount, &turnover); err != nil {
+		if err := rows.Scan(&sym, &td, &open, &high, &low, &closeP, &volume, &amount, &turnover, &source); err != nil {
 			return err
 		}
 		if sym != curSymbol {
@@ -545,7 +548,7 @@ func streamCNDailyBars(ctx context.Context, process func(symbol string, bars []d
 		}
 		cur = append(cur, datasource.Bar{
 			TradeDate: td, Open: open, High: high, Low: low, Close: closeP,
-			Volume: volume, Amount: amount, TurnoverRate: turnover,
+			Volume: volume, Amount: amount, TurnoverRate: turnover, Source: source,
 		})
 	}
 	if err := rows.Err(); err != nil {

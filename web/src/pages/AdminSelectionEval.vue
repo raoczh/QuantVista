@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, h, onMounted, ref } from 'vue'
+import { computed, h, onBeforeUnmount, onMounted, ref } from 'vue'
 import { NAlert, NButton, NDataTable, NSpin, NTag, useMessage, type DataTableColumns } from 'naive-ui'
 import {
   getPositionExitOutcomes,
   getSelectionEval,
+  SCORE_BLIND_INPUT_SCHEMA_VERSION,
   type PositionExitOutcomeBucket,
   type PositionExitOutcomeReport,
   type SelectionBootstrapCI,
@@ -19,6 +20,7 @@ import {
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import { useUi } from '@/composables/useUi'
+import { getSessionEpoch } from '@/api/token'
 
 const message = useMessage()
 const { upColor, downColor } = useUi()
@@ -26,20 +28,37 @@ const { upColor, downColor } = useUi()
 const report = ref<SelectionEvalReport | null>(null)
 const loading = ref(false)
 const exitOutcome = ref<PositionExitOutcomeReport | null>(null)
+const loadError = ref('')
+const exitError = ref('')
+const pageSession = getSessionEpoch()
+let disposed = false
+let readSequence = 0
+const pageActive = () => !disposed && getSessionEpoch() === pageSession
+onBeforeUnmount(() => { disposed = true; readSequence++ })
 
 async function load(refresh: boolean) {
+  if (!pageActive() || loading.value) return
+  const sequence = ++readSequence
   loading.value = true
   try {
-    report.value = await getSelectionEval(refresh)
+    const [selection, exits] = await Promise.allSettled([getSelectionEval(refresh), getPositionExitOutcomes()])
+    if (!pageActive() || sequence !== readSequence) return
+    if (selection.status === 'fulfilled') {
+      report.value = selection.value
+      loadError.value = ''
+    } else {
+      loadError.value = selection.reason instanceof Error ? selection.reason.message : '评估报表读取失败'
+    }
+    if (exits.status === 'fulfilled') {
+      exitOutcome.value = exits.value
+      exitError.value = ''
+    } else {
+      exitError.value = exits.reason instanceof Error ? exits.reason.message : '卖出效果台账读取失败'
+    }
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   } finally {
-    loading.value = false
-  }
-  try {
-    exitOutcome.value = await getPositionExitOutcomes()
-  } catch {
-    exitOutcome.value = null
+    if (sequence === readSequence) loading.value = false
   }
 }
 
@@ -244,7 +263,7 @@ function unknownChallengers(sec: SelectionEvalSection): SelectionChallengerEval[
 }
 
 function protocolLockComplete(challenger: SelectionChallengerEval): boolean {
-  return !!challenger.protocol && !!challenger.protocol_hash && challenger.input_schema_version === 'sb1'
+  return !!challenger.protocol && !!challenger.protocol_hash && challenger.input_schema_version === SCORE_BLIND_INPUT_SCHEMA_VERSION
 }
 
 function protocolReadinessType(status: SelectionScoreBlindProtocolStatus): 'info' | 'warning' {
@@ -252,13 +271,13 @@ function protocolReadinessType(status: SelectionScoreBlindProtocolStatus): 'info
 }
 
 function protocolGuardrailType(status: SelectionScoreBlindProtocolStatus): 'default' | 'info' | 'success' | 'error' {
-  if (!status.ready) return 'default'
+  if (!status.ready || status.severe_loss_rate_pct == null) return 'default'
   if (!status.guardrails_passed) return 'error'
   return status.multiple_testing_applied ? 'success' : 'info'
 }
 
 function protocolGuardrailLabel(status: SelectionScoreBlindProtocolStatus): string {
-  if (!status.ready) return '数值护栏待评估'
+  if (!status.ready || status.severe_loss_rate_pct == null) return '数值护栏待评估'
   if (!status.guardrails_passed) return '数值护栏未通过'
   return status.multiple_testing_applied ? '协议护栏通过' : '数值护栏通过，显著性未检验'
 }
@@ -316,7 +335,7 @@ const AUDIT_REASON_LABEL: Record<string, string> = {
 <template>
   <PageContainer
     title="选股配对评估"
-    subtitle="S3-6B/C：so1 fixed-hold 同批配对；Prompt challenger 与 score-blind 输入实验独立分组，重算零 LLM 调用"
+    subtitle="按固定持有口径进行同批配对；Prompt challenger 与 score-blind 输入实验独立分组，重算零 LLM 调用"
   >
     <div class="se-wrap">
       <SectionCard title="评估概览">
@@ -330,6 +349,7 @@ const AUDIT_REASON_LABEL: Record<string, string> = {
           </div>
         </template>
 
+        <n-alert v-if="loadError" type="error" :bordered="false">{{ loadError }}</n-alert>
         <n-spin :show="loading">
           <template v-if="report">
             <div class="se-version-row">
@@ -383,7 +403,7 @@ const AUDIT_REASON_LABEL: Record<string, string> = {
               <div v-for="(note, i) in report.notes || []" :key="i">{{ note }}</div>
             </div>
           </template>
-          <div v-else-if="!loading" class="se-empty">
+          <div v-else-if="!loading && !loadError" class="se-empty">
             暂无缓存报表。点「重新计算」推进 fixed-hold outcome 并生成统计；该过程不会调用 LLM。
           </div>
         </n-spin>
@@ -524,7 +544,7 @@ const AUDIT_REASON_LABEL: Record<string, string> = {
           </div>
 
           <div class="se-layer">
-            <div class="se-sub">Plan 辅助面板：同一 AI picks 的 l2 vs so1 fixed-hold</div>
+            <div class="se-sub">Plan 辅助面板：同一 AI picks 的计划执行与固定持有对照</div>
             <div class="se-coverage-inline qv-tnum">
               同批交集 {{ sec.plan.coverage.comparable_batches }} / {{ sec.plan.coverage.candidate_batches }}（{{ sec.plan.coverage.coverage_pct.toFixed(2) }}%）·
               缺标签 {{ sec.plan.coverage.missing_excluded }} · pending {{ sec.plan.coverage.pending_excluded }} · skipped
@@ -547,7 +567,7 @@ const AUDIT_REASON_LABEL: Record<string, string> = {
               size="small"
               :scroll-x="1890"
             />
-            <div v-else class="se-inline-empty">暂无 l2 与 so1 同时成熟的同一 picks 样本。</div>
+            <div v-else class="se-inline-empty">暂无计划执行与固定持有均已成熟的同一 picks 样本。</div>
             <div class="se-notes se-notes-compact">
               <div v-for="(note, i) in sec.plan.notes || []" :key="i">{{ note }}</div>
             </div>
@@ -642,7 +662,7 @@ const AUDIT_REASON_LABEL: Record<string, string> = {
                     {{ challenger.protocol_status.score_blind_coverage_pct.toFixed(2) }}% · 下降
                     {{ challenger.protocol_status.coverage_drop_pct.toFixed(2) }} / 上限
                     {{ challenger.protocol_status.max_coverage_drop_pct.toFixed(2) }} pt · 严重亏损率
-                    {{ challenger.protocol_status.severe_loss_rate_pct.toFixed(2) }}% / 上限
+                    {{ challenger.protocol_status.severe_loss_rate_pct == null ? '—' : challenger.protocol_status.severe_loss_rate_pct.toFixed(2) + '%' }} / 上限
                     {{ challenger.protocol_status.max_severe_loss_rate_pct.toFixed(2) }}% ·
                     预注册 {{ multipleTestingLabel(challenger.protocol_status.multiple_testing_method) }} · 检验族
                     {{ challenger.protocol_status.multiple_testing_family }} 个窗口 ·
@@ -730,6 +750,7 @@ const AUDIT_REASON_LABEL: Record<string, string> = {
         </SectionCard>
       </template>
 
+      <n-alert v-if="exitError" type="error" :bordered="false">{{ exitError }}</n-alert>
       <SectionCard v-if="exitOutcome" title="卖出信号效果台账">
         <div class="se-notes se-notes-lead">
           <div>

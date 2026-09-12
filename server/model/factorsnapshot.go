@@ -38,7 +38,11 @@ type FactorSnapshotDaily struct {
 	// FactorsJSON {"close":10.5,"rsi_14":56.2,...}——键为 factorDefs 的 key，
 	// NaN（样本不足/筹码拒算）不落键；布尔因子 1/0。
 	FactorsJSON string `gorm:"type:text" json:"factors_json"`
+	// DataQuality 是独立质量审计标记，可在发现历史来源问题后补记；因子值与时点不改写。
+	DataQuality string `gorm:"size:32" json:"data_quality,omitempty"`
 
 	FactorVersion string    `gorm:"size:8" json:"factor_version"`
 	CreatedAt     time.Time `json:"created_at"`
 }
+
+const FactorQualityUnverifiedAdjustment = "unverified_adjustment"

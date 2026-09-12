@@ -59,14 +59,13 @@ type LhbOrgRow struct {
 	Reason    string  // 上榜原因
 }
 
-// lhbStockRow 该行是否 A 股股票：类型码 058 前缀（060=可转债等衍生品）+ 代码可映射 secid。
-// 双保险防上游类型码漂移；B 股（900/200 前缀）cnSecid 不识别自然排除。
+// lhbStockRow 该行是否沪深 A 股：类型码 058 前缀 + A 股代码段。
+// cnSecid 还支持 B 股与基金，不能用作 A 股白名单。
 func lhbStockRow(typeCode, symbol string) bool {
 	if !strings.HasPrefix(typeCode, "058") {
 		return false
 	}
-	_, ok := cnSecid(symbol)
-	return ok
+	return cnAShareCode(symbol)
 }
 
 // GetLhbDaily 拉取某交易日全市场龙虎榜详情（已过滤为 A 股股票行）。
@@ -205,7 +204,7 @@ func parseLhbOrgRowStrict(r DcRow) (LhbOrgRow, bool, error) {
 	if len(sym) != 6 || tradeDate == "" || name == "" {
 		return LhbOrgRow{}, false, errors.New("缺少或非法的代码/日期/名称必填字段")
 	}
-	if _, ok := cnSecid(sym); !ok {
+	if !cnAShareCode(sym) {
 		return LhbOrgRow{}, false, nil
 	}
 	return LhbOrgRow{

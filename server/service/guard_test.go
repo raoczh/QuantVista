@@ -10,7 +10,7 @@ import (
 	"quantvista/model"
 )
 
-// TestParseGuardConfig 空串/坏格式回退默认全开；合法 JSON 阈值钳制；缺字段保持默认布尔。
+// TestParseGuardConfig 空串默认全开，坏配置停止通知；合法 JSON 阈值钳制；缺字段保持默认布尔。
 func TestParseGuardConfig(t *testing.T) {
 	def := defaultGuardConfig()
 	if !def.Enabled || def.PosPct != 5 || def.WatchPct != 7 || !def.StopLoss || !def.TakeProfit || !def.Evening {
@@ -20,8 +20,8 @@ func TestParseGuardConfig(t *testing.T) {
 	if c := parseGuardConfig(""); c != def {
 		t.Fatalf("空串应回退默认，得到 %+v", c)
 	}
-	if c := parseGuardConfig("{bad json"); c != def {
-		t.Fatalf("坏格式应回退默认，得到 %+v", c)
+	if c := parseGuardConfig("{bad json"); c.Enabled {
+		t.Fatalf("坏格式不能默认开启通知，得到 %+v", c)
 	}
 
 	// 合法完整配置。

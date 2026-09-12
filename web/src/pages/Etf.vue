@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed } from 'vue'
 import {
   NAlert,
   NButton,
@@ -20,6 +20,8 @@ import {
 } from 'naive-ui'
 import { getPaperOverview, paperTrade, type PaperOverview, type PaperHolding } from '@/api/paper'
 import { getEtfList, isEtfSymbol, type EtfItem } from '@/api/etf'
+import { getSessionEpoch } from '@/api/token'
+import { formatPrice } from '@/lib/formatPrice'
 import { useUi } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import PageContainer from '@/components/PageContainer.vue'
@@ -35,10 +37,15 @@ const { pctColor } = useUi()
 const etfs = ref<EtfItem[]>([])
 const overview = ref<PaperOverview | null>(null)
 const loading = ref(false)
+const loadError = ref('')
+const accountId = ref<number>()
+let loadSeq = 0
+let disposed = false
+const isCurrent = (owner: number) => !disposed && owner === getSessionEpoch()
 
 // ETF 持仓：从模拟账户总览里按代码前缀过滤（后端持仓不区分资产类型）。
 const etfHoldings = computed<PaperHolding[]>(() =>
-  (overview.value?.holdings ?? []).filter((h) => isEtfSymbol(h.symbol)),
+  (overview.value?.holdings ?? []).filter((h) => h.market === 'cn' && isEtfSymbol(h.symbol)),
 )
 const etfMarketValue = computed(() =>
   etfHoldings.value.reduce((s, h) => s + (h.quote_ok ? h.market_value : h.cost), 0),
@@ -47,6 +54,9 @@ const etfProfit = computed(() => etfHoldings.value.reduce((s, h) => s + h.profit
 // 行情非 fresh 的持仓：后端按成本估值、盈亏记 0（fail-closed）。前端必须如实标注，
 // 不得把成本冒充「市值」、把 0 冒充「盈亏」。
 const etfStaleCount = computed(() => etfHoldings.value.filter((h) => !h.quote_ok).length)
+const etfAllQuotesMissing = computed(() => etfHoldings.value.length > 0 && etfStaleCount.value === etfHoldings.value.length)
+const etfCostUnknownCount = computed(() => etfHoldings.value.filter((h) => !!h.cost_basis_note).length)
+const etfValuationReason = computed(() => etfHoldings.value.find((h) => h.valuation_unavailable_reason)?.valuation_unavailable_reason)
 const etfValueSub = computed(() =>
   etfStaleCount.value > 0 ? `${etfStaleCount.value} 笔行情非最新，按成本计入（非实时市值）` : undefined,
 )
@@ -55,28 +65,36 @@ const etfProfitSub = computed(() =>
 )
 const latestQuoteTime = computed(() => etfs.value.map((item) => item.quote_as_of).filter(Boolean).sort().at(-1) || '未知')
 
-async function loadQuotes() {
-  try {
-    // 同时刷新 ETF 行情与模拟盘概览，否则汇总（持仓市值/盈亏）盘中不动。
-    ;[etfs.value, overview.value] = await Promise.all([getEtfList(), getPaperOverview()])
-  } catch (e) {
-    message.error((e as Error).message)
-  }
-}
-
-async function load() {
+async function load(silent = false) {
+  if (disposed) return
+  const owner = getSessionEpoch()
+  const seq = ++loadSeq
   loading.value = true
   try {
-    ;[etfs.value, overview.value] = await Promise.all([getEtfList(), getPaperOverview()])
-  } catch (e) {
-    message.error((e as Error).message)
+    const [quotes, account] = await Promise.allSettled([getEtfList(), getPaperOverview(accountId.value)])
+    if (seq !== loadSeq || !isCurrent(owner)) return
+    const errors: string[] = []
+    if (quotes.status === 'fulfilled') etfs.value = quotes.value
+    else {
+      etfs.value = []
+      errors.push('ETF 行情：' + (quotes.reason as Error).message)
+    }
+    if (account.status === 'fulfilled') {
+      overview.value = account.value
+      accountId.value = account.value.account.account_id
+    } else {
+      overview.value = null
+      errors.push('模拟账户：' + (account.reason as Error).message)
+    }
+    loadError.value = errors.join('；')
+    if (loadError.value && !silent) message.error(loadError.value)
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 
 // 盘中每 60s 自动刷新行情（切后台/非交易时段自动暂停）。
-useAutoRefresh(loadQuotes, 60_000)
+useAutoRefresh(() => load(true), 60_000)
 
 // ---------- 交易弹窗 ----------
 type TradeForm = { symbol: string; name: string; side: 'buy' | 'sell'; price?: number; quantity?: number }
@@ -85,6 +103,7 @@ const trading = ref(false)
 const form = ref<TradeForm>({ symbol: '', name: '', side: 'buy', price: undefined, quantity: undefined })
 
 function openTrade(symbol: string, name: string, side: 'buy' | 'sell', quantity?: number) {
+  if (trading.value) return
   form.value = { symbol, name, side, price: undefined, quantity }
   tradeModal.value = true
 }
@@ -96,11 +115,17 @@ function tradeFromHolding(h: PaperHolding, side: 'buy' | 'sell') {
 }
 
 async function submitTrade() {
+  if (trading.value) return
+  if (!overview.value || !accountId.value) {
+    message.warning('请先成功加载模拟账户，再提交交易')
+    return
+  }
   if (!form.value.quantity || form.value.quantity <= 0) {
     message.warning('请输入数量')
     return
   }
   trading.value = true
+  const owner = getSessionEpoch()
   try {
     const t = await paperTrade({
       symbol: form.value.symbol,
@@ -109,14 +134,15 @@ async function submitTrade() {
       side: form.value.side,
       price: form.value.price,
       quantity: form.value.quantity,
-    })
-    message.success(`${t.side === 'buy' ? '买入' : '卖出'} ${t.name || '名称待补全'}（${t.symbol}）${t.quantity} 份 @ ${t.price.toFixed(3)}`)
+    }, accountId.value)
+    if (!isCurrent(owner)) return
+    message.success(`${t.side === 'buy' ? '买入' : '卖出'} ${t.name || '名称待补全'}（${t.symbol}）${t.quantity} 份 @ ${formatPrice(t.price)}`)
     tradeModal.value = false
     await load()
   } catch (e) {
-    message.error((e as Error).message)
+    if (isCurrent(owner)) message.error((e as Error).message)
   } finally {
-    trading.value = false
+    if (isCurrent(owner)) trading.value = false
   }
 }
 
@@ -128,17 +154,19 @@ function fmt(n: number) {
   return n == null ? '-' : n.toFixed(3)
 }
 
-onMounted(load)
+onMounted(() => load())
+onBeforeUnmount(() => { disposed = true; loadSeq++ })
 </script>
 
 <template>
   <PageContainer title="指数 ETF" subtitle="精选宽基/行业/跨境 ETF · 一键模拟买卖 · 行情带时效标注">
     <template #actions>
-      <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>
+      <n-button size="small" quaternary :loading="loading" @click="load()">刷新</n-button>
     </template>
 
     <div class="etf">
-      <n-alert v-if="!loading && !etfs.length" type="warning" :bordered="false" title="ETF 行情暂不可用">
+      <n-alert v-if="loadError" type="error" :bordered="false" title="部分数据读取失败">{{ loadError }}</n-alert>
+      <n-alert v-if="!loading && !etfs.length && !loadError" type="warning" :bordered="false" title="ETF 行情暂不可用">
         请重试；模拟账户余额和历史模拟持仓仍与真实持仓分开。数据时间：未知。
       </n-alert>
       <p v-else class="data-status">行情时间 {{ latestQuoteTime }} · 模拟账户仅用于研究练习，不会写入真实持仓</p>
@@ -147,13 +175,13 @@ onMounted(load)
            640~1024px 每列仅约 200px 会挤成竖条。§4.3 的 `cols="1 s:N"` 约定针对弹窗内栅格。 -->
       <n-grid cols="1 m:3" :x-gap="14" :y-gap="14" responsive="screen">
         <n-gi>
-          <StatCard label="模拟盘现金" :value="fmtMoney(overview?.account.cash ?? 0)" />
+          <StatCard label="模拟盘现金" :value="overview && !overview.currency_unavailable_reason ? fmtMoney(overview.account.cash) : '—'" :sub="overview?.currency_unavailable_reason" />
         </n-gi>
         <n-gi>
-          <StatCard label="ETF 持仓市值" :value="fmtMoney(etfMarketValue)" :sub="etfValueSub" />
+          <StatCard label="ETF 持仓市值" :value="overview && !etfValuationReason ? fmtMoney(etfMarketValue) : '—'" :sub="etfValuationReason || etfValueSub" />
         </n-gi>
         <n-gi>
-          <StatCard label="ETF 持仓盈亏" :value="fmtMoney(etfProfit)" :sub="etfProfitSub" />
+          <StatCard label="ETF 持仓盈亏" :value="overview && !etfValuationReason && !etfCostUnknownCount && !etfAllQuotesMissing ? fmtMoney(etfProfit) : '—'" :sub="etfValuationReason || (etfCostUnknownCount ? '部分持仓成本待核验' : etfProfitSub)" />
         </n-gi>
       </n-grid>
 
@@ -161,7 +189,8 @@ onMounted(load)
       <SectionCard title="指数 ETF 行情">
         <n-spin :show="loading && !etfs.length">
           <n-empty v-if="!etfs.length && !loading" description="行情暂不可用" />
-          <n-table v-else :bordered="false" :single-line="false" size="small">
+          <div v-else class="table-scroll" tabindex="0" aria-label="ETF 行情表，可左右滚动">
+          <n-table :bordered="false" :single-line="false" size="small" class="etf-table">
             <thead>
               <tr>
                 <th>类别</th>
@@ -177,7 +206,7 @@ onMounted(load)
                 <td>
                   <n-tag size="tiny" round :bordered="false">{{ e.category }}</n-tag>
                 </td>
-                <td colspan="2"><StockIdentity :symbol="e.symbol" market="cn" :name="e.name" density="table" clickable actions /></td>
+                <td colspan="2" class="etf-identity"><StockIdentity :symbol="e.symbol" market="cn" :name="e.name" density="table" clickable actions /></td>
                 <td class="etf-index">{{ e.index }}</td>
                 <td class="qv-tnum">
                   {{ e.quote_ok ? fmt(e.price) : '—' }}
@@ -196,13 +225,16 @@ onMounted(load)
               </tr>
             </tbody>
           </n-table>
+          </div>
         </n-spin>
       </SectionCard>
 
       <!-- 我的 ETF 持仓 -->
       <SectionCard title="我的 ETF 持仓">
-        <n-empty v-if="!etfHoldings.length" description="暂无 ETF 持仓，在上方行情表买入" size="small" />
-        <n-table v-else :bordered="false" :single-line="false" size="small">
+        <n-empty v-if="!overview" description="模拟账户数据暂不可用，请刷新重试" size="small" />
+        <n-empty v-else-if="!etfHoldings.length" description="暂无 ETF 持仓，在上方行情表买入" size="small" />
+        <div v-else class="table-scroll" tabindex="0" aria-label="ETF 持仓表，可左右滚动">
+        <n-table :bordered="false" :single-line="false" size="small" class="etf-table">
           <thead>
             <tr>
               <th>名称</th>
@@ -216,11 +248,11 @@ onMounted(load)
           </thead>
           <tbody>
             <tr v-for="h in etfHoldings" :key="h.id">
-              <td>
+              <td class="etf-identity">
                 <StockIdentity :symbol="h.symbol" market="cn" :name="h.name" density="table" clickable actions />
               </td>
               <td class="qv-tnum">{{ h.quantity }}</td>
-              <td class="qv-tnum">{{ fmt(h.avg_cost) }}</td>
+              <td class="qv-tnum">{{ h.cost_basis_note ? '—（待核验）' : formatPrice(h.avg_cost) }}</td>
               <td class="qv-tnum">
                 <template v-if="h.quote_ok">{{ fmt(h.price) }}</template>
                 <template v-else>
@@ -236,17 +268,18 @@ onMounted(load)
               <!-- 行情非最新：后端用成本代市值、盈亏置 0——如实标「≈成本」与「未知」，
                    不冒充实时市值/真实盈亏。 -->
               <td class="qv-tnum">
-                <template v-if="h.quote_ok">{{ fmtMoney(h.market_value) }}</template>
+                <template v-if="h.valuation_unavailable_reason">—</template>
+                <template v-else-if="h.quote_ok">{{ fmtMoney(h.market_value) }}</template>
                 <template v-else>
                   {{ fmtMoney(h.cost) }}<span class="hold-approx">（按成本，非实时）</span>
                 </template>
               </td>
-              <td v-if="h.quote_ok" class="qv-tnum" :style="{ color: pctColor(h.profit_amount) }">
+              <td v-if="h.quote_ok && !h.cost_basis_note" class="qv-tnum" :style="{ color: pctColor(h.profit_amount) }">
                 {{ fmtMoney(h.profit_amount) }}
                 <span class="hold-pct">({{ h.profit_pct.toFixed(2) }}%)</span>
               </td>
               <td v-else class="qv-tnum">
-                <span class="hold-approx">未知（行情非最新）</span>
+                <span class="hold-approx">{{ h.valuation_unavailable_reason || h.cost_basis_note || '未知（行情非最新）' }}</span>
               </td>
               <td>
                 <div class="etf-ops">
@@ -257,15 +290,16 @@ onMounted(load)
             </tr>
           </tbody>
         </n-table>
+        </div>
       </SectionCard>
 
       <!-- 交易说明 -->
       <SectionCard title="ETF 交易说明" :hoverable="false">
         <ul class="etf-notes">
-          <li>T+1 交易：当日买入次日才可卖出（模拟盘不强制校验，仅提示）。</li>
+          <li>境内股票型 ETF 通常为 T+1，黄金、跨境等部分 ETF 支持 T+0；模拟盘当前不限制当日卖出。</li>
           <li>免征印花税：ETF/场内基金买卖均不收印花税（个股卖出另计万 5）。</li>
           <li>佣金：按万 2.5 计，单笔最低 5 元（与个股一致）。</li>
-          <li>申购单位：场内买卖以 100 份为整数倍。</li>
+          <li>场内交易通常以 100 份为单位；模拟盘允许输入自定义数量。</li>
         </ul>
       </SectionCard>
     </div>
@@ -275,9 +309,12 @@ onMounted(load)
       v-model:show="tradeModal"
       preset="card"
       :title="`${form.side === 'buy' ? '买入' : '卖出'} ${form.name}`"
-      style="max-width: 400px"
+      style="width: calc(100vw - 32px); max-width: 400px"
+      :mask-closable="!trading"
+      :close-on-esc="!trading"
+      :closable="!trading"
     >
-      <n-form label-placement="top" :show-feedback="false" class="trade-form">
+      <n-form label-placement="top" :show-feedback="false" :disabled="trading" class="trade-form">
         <n-grid cols="1 s:2" responsive="screen" :x-gap="10" :y-gap="10">
           <n-gi>
             <n-form-item label="代码">
@@ -304,7 +341,7 @@ onMounted(load)
           </n-gi>
           <n-gi>
             <n-form-item label="数量（份）">
-              <n-input-number v-model:value="form.quantity" :min="0" :step="100" style="width: 100%" />
+              <n-input-number v-model:value="form.quantity" :min="0" :step="100" :precision="4" style="width: 100%" />
             </n-form-item>
           </n-gi>
         </n-grid>
@@ -326,7 +363,11 @@ onMounted(load)
   display: flex;
   flex-direction: column;
   gap: 16px;
+  min-width: 0;
 }
+.table-scroll { width: 100%; max-width: 100%; overflow-x: auto; }
+.etf-table { min-width: 880px; }
+.etf-identity { min-width: 210px; }
 .data-status { margin: -6px 0 0; font-size: 12px; opacity: .62; }
 .etf-ops {
   display: flex;

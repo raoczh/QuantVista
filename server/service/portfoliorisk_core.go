@@ -16,7 +16,7 @@ const (
 	RiskStatusAvailable    = "available"
 	RiskStatusPartial      = "partial"
 	RiskStatusUnavailable  = "unavailable"
-	portfolioRiskVersion   = "pr1"
+	portfolioRiskVersion   = "pr2"
 	portfolioFactorVersion = "position-exposure-v1"
 )
 
@@ -27,13 +27,31 @@ type RiskMetric struct {
 	SampleCount int     `json:"sample_count,omitempty"`
 }
 
+// 数值为零也可能是有效结果；只按状态省略未知值，不能用 float 的 omitempty
+// 把零现金、零波动、零相关性等与数据缺失混为一谈。
+func riskJSONValue(status string, value float64) *float64 {
+	if status == RiskStatusAvailable || status == RiskStatusPartial {
+		return &value
+	}
+	return nil
+}
+
+func (m RiskMetric) MarshalJSON() ([]byte, error) {
+	type plain RiskMetric
+	return json.Marshal(struct {
+		plain
+		Value *float64 `json:"value,omitempty"`
+	}{plain(m), riskJSONValue(m.Status, m.Value)})
+}
+
 type EquityPoint struct {
-	TradeDate   string   `json:"trade_date"`
-	Assets      float64  `json:"assets"`
-	CashFlow    float64  `json:"cash_flow,omitempty"`
-	Return      *float64 `json:"return,omitempty"`
-	DrawdownPct *float64 `json:"drawdown_pct,omitempty"`
-	Partial     bool     `json:"partial"`
+	TradeDate               string   `json:"trade_date"`
+	Assets                  float64  `json:"assets"`
+	CashFlow                float64  `json:"cash_flow,omitempty"`
+	Return                  *float64 `json:"return,omitempty"`
+	DrawdownPct             *float64 `json:"drawdown_pct,omitempty"`
+	Partial                 bool     `json:"partial"`
+	ReturnUnavailableReason string   `json:"return_unavailable_reason,omitempty"`
 }
 
 type DrawdownResult struct {
@@ -96,7 +114,7 @@ func ComputeTWR(points []EquityPoint) RiskMetric {
 	n := 0
 	for i := 1; i < len(points); i++ {
 		prev, cur := points[i-1], points[i]
-		if prev.Partial || cur.Partial || prev.Assets <= 0 {
+		if prev.Partial || cur.Partial || prev.Assets <= 0 || cur.ReturnUnavailableReason != "" {
 			continue
 		}
 		r := (cur.Assets-cur.CashFlow)/prev.Assets - 1
@@ -109,15 +127,19 @@ func ComputeTWR(points []EquityPoint) RiskMetric {
 	if n == 0 {
 		return unavailable("没有相邻的完整资产快照", 0)
 	}
+	if n != len(points)-1 {
+		return unavailable("窗口内存在缺失或无法核验的收益区间，不能计算完整区间 TWR", n)
+	}
 	return available((product-1)*100, n)
 }
 
-// DailyReturns 不补交易日，只计算输入中相邻的完整净值点。
+// DailyReturns 不补交易日；调用方用日历标注缺口，只计算可核验的相邻交易日。
 func DailyReturns(points []EquityPoint) ([]float64, []EquityPoint) {
-	returns := make([]float64, 0, len(points)-1)
+	returns := make([]float64, 0, max(0, len(points)-1))
 	out := append([]EquityPoint(nil), points...)
 	for i := 1; i < len(out); i++ {
-		if out[i-1].Partial || out[i].Partial || out[i-1].Assets <= 0 {
+		out[i].Return = nil
+		if out[i-1].Partial || out[i].Partial || out[i-1].Assets <= 0 || out[i].ReturnUnavailableReason != "" {
 			continue
 		}
 		r := (out[i].Assets-out[i].CashFlow)/out[i-1].Assets - 1
@@ -225,9 +247,16 @@ func MaxDrawdown(points []EquityPoint) (DrawdownResult, []EquityPoint) {
 	nav := 1.0
 	intervals := 0
 	for i := range out {
+		out[i].DrawdownPct = nil
 		if out[i].Partial || out[i].Assets <= 0 {
 			previous = -1
 			peak, activePeakDate = 0, ""
+			segment++
+			continue
+		}
+		if out[i].ReturnUnavailableReason != "" {
+			previous = i
+			nav, peak, activePeakDate = 1, 1, out[i].TradeDate
 			segment++
 			continue
 		}
@@ -265,7 +294,12 @@ func MaxDrawdown(points []EquityPoint) (DrawdownResult, []EquityPoint) {
 	if intervals == 0 {
 		return DrawdownResult{Metric: unavailable("相邻完整资产快照不足 2 个", 0)}, out
 	}
-	return DrawdownResult{Metric: available(maxDD, intervals), PeakDate: peakDate, TroughDate: troughDate, RecoveryDate: recovery}, out
+	metric := available(maxDD, intervals)
+	if intervals != len(points)-1 {
+		metric.Status = RiskStatusPartial
+		metric.Reason = "仅统计连续完整区间的回撤，缺失区间可能存在更大回撤"
+	}
+	return DrawdownResult{Metric: metric, PeakDate: peakDate, TroughDate: troughDate, RecoveryDate: recovery}, out
 }
 
 // BetaAlpha 对已经按共同交易日对齐的收益序列计算 beta 与年化 Jensen alpha。
@@ -319,6 +353,14 @@ type CorrelationCell struct {
 	Reason      string  `json:"reason,omitempty"`
 }
 
+func (c CorrelationCell) MarshalJSON() ([]byte, error) {
+	type plain CorrelationCell
+	return json.Marshal(struct {
+		plain
+		Value *float64 `json:"value,omitempty"`
+	}{plain(c), riskJSONValue(c.Status, c.Value)})
+}
+
 type CorrelationMatrix struct {
 	Symbols     []string            `json:"symbols"`
 	Cells       [][]CorrelationCell `json:"cells"`
@@ -335,6 +377,17 @@ type RiskContributionItem struct {
 	RiskContributionPct    float64 `json:"risk_contribution_pct,omitempty"`
 	Status                 string  `json:"status"`
 	Reason                 string  `json:"reason,omitempty"`
+}
+
+func (r RiskContributionItem) MarshalJSON() ([]byte, error) {
+	type plain RiskContributionItem
+	return json.Marshal(struct {
+		plain
+		Marginal  *float64 `json:"marginal_volatility_pct,omitempty"`
+		Component *float64 `json:"component_volatility_pct,omitempty"`
+		Share     *float64 `json:"risk_contribution_pct,omitempty"`
+	}{plain(r), riskJSONValue(r.Status, r.MarginalVolatilityPct),
+		riskJSONValue(r.Status, r.ComponentVolatilityPct), riskJSONValue(r.Status, r.RiskContributionPct)})
 }
 
 type RiskContributionResult struct {
@@ -508,6 +561,8 @@ type StressResult struct {
 
 func ComputeStress(holdings []StressHolding, scenario StressScenario, generatedAt time.Time) StressResult {
 	out := StressResult{Scenario: scenario, Contributions: []StressContribution{}, Unknown: []string{}, GeneratedAt: generatedAt.UTC().Format(time.RFC3339), ReadOnly: true}
+	contributionIndex := map[string]int{}
+	contributionValue := map[string]float64{}
 	for _, h := range holdings {
 		if h.Known && h.Value > 0 {
 			out.BaseValue += h.Value
@@ -551,8 +606,21 @@ func ComputeStress(holdings []StressHolding, scenario StressScenario, generatedA
 		}
 		loss := h.Value * shock / 100
 		out.EstimatedLossAmount += loss
-		out.Contributions = append(out.Contributions, StressContribution{Symbol: h.Symbol, Name: h.Name, LossAmount: round2(loss), LossPct: shock})
+		index, exists := contributionIndex[h.Symbol]
+		if !exists {
+			index = len(out.Contributions)
+			contributionIndex[h.Symbol] = index
+			out.Contributions = append(out.Contributions, StressContribution{Symbol: h.Symbol, Name: h.Name})
+		}
+		out.Contributions[index].LossAmount += loss
+		contributionValue[h.Symbol] += h.Value
 	}
+	for i := range out.Contributions {
+		row := &out.Contributions[i]
+		row.LossPct = round2(row.LossAmount / contributionValue[row.Symbol] * 100)
+		row.LossAmount = round2(row.LossAmount)
+	}
+	out.Unknown = uniqueRiskStrings(out.Unknown)
 	out.BaseValue = round2(out.BaseValue)
 	out.EstimatedLossAmount = round2(out.EstimatedLossAmount)
 	if out.BaseValue > 0 {
@@ -681,12 +749,14 @@ func BuildRebalanceDraft(holdings []RebalanceHolding, targets []TargetAllocation
 				qty = -h.Quantity
 			}
 			row.QuantityChange = round4(qty)
-			amount := math.Abs(qty * h.Price)
+			amount := math.Abs(row.QuantityChange * h.Price)
 			side := model.PaperSideBuy
 			if qty < 0 {
 				side = model.PaperSideSell
 			}
-			row.EstimatedFee, row.EstimatedTax = tradeFee(h.Market, side, h.Symbol, amount)
+			if row.QuantityChange != 0 {
+				row.EstimatedFee, row.EstimatedTax = tradeFee(h.Market, side, h.Symbol, amount)
+			}
 		}
 		out = append(out, row)
 	}

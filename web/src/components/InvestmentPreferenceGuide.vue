@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import {
   NAlert,
   NButton,
@@ -16,7 +16,10 @@ import {
   INVESTMENT_GUIDE_VERSION,
   updatePreference,
   type UserPreference,
+  type UserPreferenceUpdate,
 } from '@/api/user'
+import { getSessionEpoch } from '@/api/token'
+import { useAuthStore } from '@/stores/auth'
 
 const props = defineProps<{
   modelValue: boolean
@@ -24,10 +27,17 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
-  updated: [value: UserPreference]
+  updated: [value: UserPreference, fields: UserPreferenceUpdate]
 }>()
 
 const message = useMessage()
+const auth = useAuthStore()
+const ownerID = auth.user?.id || 0
+const session = getSessionEpoch()
+let disposed = false
+let dialogEpoch = 0
+const active = () => !disposed && props.modelValue && ownerID > 0 && auth.user?.id === ownerID && props.preference?.user_id === ownerID && getSessionEpoch() === session
+onBeforeUnmount(() => { disposed = true })
 const saving = ref(false)
 const draft = ref({
   horizon_pref: 'long_term',
@@ -47,6 +57,8 @@ const totalCapitalWan = computed({
 watch(
   () => props.modelValue,
   (show) => {
+    dialogEpoch++
+    saving.value = false
     if (!show || !props.preference) return
     draft.value = {
       horizon_pref: props.preference.horizon_pref || 'long_term',
@@ -54,7 +66,7 @@ watch(
       total_capital: props.preference.total_capital || 0,
     }
   },
-  { immediate: true },
+  { immediate: true, flush: 'sync' },
 )
 
 function close() {
@@ -62,48 +74,52 @@ function close() {
 }
 
 async function saveCompleted() {
-  if (!props.preference || saving.value) return
-  if (draft.value.total_capital <= 0) {
+  if (!active() || saving.value) return
+  if (!Number.isFinite(draft.value.total_capital) || draft.value.total_capital <= 0) {
     message.warning('请填写大于 0 的总投资资金；暂时不填可选择跳过')
     return
   }
   saving.value = true
+  const epoch = dialogEpoch
+  const fields: UserPreferenceUpdate = {
+    ...draft.value,
+    investment_guide_version: INVESTMENT_GUIDE_VERSION,
+    investment_guide_status: 'completed',
+  }
   try {
-    const updated = await updatePreference({
-      ...props.preference,
-      ...draft.value,
-      investment_guide_version: INVESTMENT_GUIDE_VERSION,
-      investment_guide_status: 'completed',
-    })
-    emit('updated', updated)
+    const updated = await updatePreference(fields)
+    if (!active() || epoch !== dialogEpoch) return
+    emit('updated', updated, fields)
     close()
     message.success('投资偏好已保存')
   } catch (error) {
-    message.error((error as Error).message)
+    if (active() && epoch === dialogEpoch) message.error((error as Error).message)
   } finally {
-    saving.value = false
+    if (epoch === dialogEpoch) saving.value = false
   }
 }
 
 async function skip() {
-  if (!props.preference || saving.value) return
+  if (!active() || saving.value) return
   if (!firstRun.value) {
     close()
     return
   }
   saving.value = true
+  const epoch = dialogEpoch
+  const fields: UserPreferenceUpdate = {
+    investment_guide_version: INVESTMENT_GUIDE_VERSION,
+    investment_guide_status: 'skipped',
+  }
   try {
-    const updated = await updatePreference({
-      ...props.preference,
-      investment_guide_version: INVESTMENT_GUIDE_VERSION,
-      investment_guide_status: 'skipped',
-    })
-    emit('updated', updated)
+    const updated = await updatePreference(fields)
+    if (!active() || epoch !== dialogEpoch) return
+    emit('updated', updated, fields)
     close()
   } catch (error) {
-    message.error((error as Error).message)
+    if (active() && epoch === dialogEpoch) message.error((error as Error).message)
   } finally {
-    saving.value = false
+    if (epoch === dialogEpoch) saving.value = false
   }
 }
 </script>
@@ -112,13 +128,13 @@ async function skip() {
   <n-modal
     :show="modelValue"
     preset="card"
+    class="investment-preference-modal"
     title="我的投资偏好"
     :mask-closable="false"
     :close-on-esc="false"
     :closable="false"
-    style="width: min(560px, calc(100vw - 24px))"
   >
-    <n-form label-placement="top" :show-feedback="false">
+    <n-form :disabled="saving" label-placement="top" :show-feedback="false">
       <n-form-item label="1. 通常准备持有多久？">
         <n-radio-group v-model:value="draft.horizon_pref">
           <n-radio-button value="short_term">短线</n-radio-button>
@@ -159,6 +175,18 @@ async function skip() {
 </template>
 
 <style scoped>
+:global(.investment-preference-modal) {
+  width: min(560px, calc(100vw - 24px));
+  max-height: calc(100dvh - 24px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+:global(.investment-preference-modal > .n-card-content) {
+  min-height: 0;
+  overflow-y: auto;
+}
+:global(.investment-preference-modal > .n-card__footer) { flex-shrink: 0; }
 /* 表单是 :show-feedback="false"，naive 的 form-item 底部间距被压成 0，
  * 这条说明紧跟「总资金」输入框，需自己拉开距离。 */
 .capital-note {

@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { h, onMounted, ref } from 'vue'
-import { NButton, NDataTable, NSpin, NTag, useMessage, type DataTableColumns } from 'naive-ui'
+import { h, onBeforeUnmount, onMounted, ref } from 'vue'
+import { NAlert, NButton, NDataTable, NSpin, NTag, type DataTableColumns } from 'naive-ui'
 import {
   getWalkForward,
   type WalkForwardReport,
@@ -12,19 +12,27 @@ import {
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import { useUi } from '@/composables/useUi'
+import { getSessionEpoch } from '@/api/token'
 
-const message = useMessage()
 const { upColor, downColor } = useUi()
 
 const report = ref<WalkForwardReport | null>(null)
 const loading = ref(false)
+const loadError = ref('')
+const pageSession = getSessionEpoch()
+let disposed = false
+const pageActive = () => !disposed && getSessionEpoch() === pageSession
+onBeforeUnmount(() => { disposed = true })
 
 async function load(refresh: boolean) {
+  if (!pageActive() || loading.value) return
   loading.value = true
+  loadError.value = ''
   try {
-    report.value = await getWalkForward(refresh)
+    const next = await getWalkForward(refresh)
+    if (pageActive()) report.value = next
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) loadError.value = e instanceof Error ? e.message : 'Walk-Forward 报表读取失败'
   } finally {
     loading.value = false
   }
@@ -43,6 +51,7 @@ const STATUS_LABEL: Record<string, string> = {
   skip_cash: '不足一手',
   skip_suspend: '停牌',
   pending: '未走完',
+  forced: '强平估值（已剔除）',
 }
 
 function pctColor(v: number): string | undefined {
@@ -72,7 +81,7 @@ function rowColumns(): DataTableColumns<WFSegRow> {
     { title: '策略', key: 'strategy_name', width: 100 },
     { title: '持有', key: 'hold', width: 60, render: (r) => `${r.hold}日` },
     { title: '信号', key: 'signals', width: 60 },
-    { title: '成交/跳过', key: 'trades', width: 90, render: (r) => `${r.trades} / ${r.skipped}${r.pending ? ` (+${r.pending}未走完)` : ''}` },
+    { title: '成交/跳过', key: 'trades', width: 140, render: (r) => `${r.trades} / ${r.skipped}${r.forced ? ` · 强平剔除 ${r.forced}` : ''}${r.pending ? ` (+${r.pending}未走完)` : ''}` },
     { title: 'Precision_net@K', key: 'pnet', width: 130, render: (r) => (r.trades ? pctSpan(r.precision_net_pct) : '—') },
     { title: '净收益中位', key: 'mnet', width: 100, render: (r) => (r.trades ? pctSpan(r.median_net_pct) : '—') },
     { title: '严重亏损率', key: 'severe', width: 100, render: (r) => (r.trades ? h('span', { class: 'qv-tnum', style: r.severe_loss_pct > 0 ? `color:${downColor.value}` : '' }, `${r.severe_loss_pct.toFixed(1)}%`) : '—') },
@@ -104,7 +113,7 @@ function monthlyColumns(): DataTableColumns<WFMonthlyRow> {
     { title: '信号日', key: 'signal_date', width: 100, render: (r) => h('span', { class: 'qv-tnum' }, r.signal_date) },
     { title: '策略', key: 'strategy_name', width: 100 },
     { title: '持有', key: 'hold', width: 60, render: (r) => `${r.hold}日` },
-    { title: '成交/跳过', key: 'trades', width: 90, render: (r) => `${r.trades} / ${r.skipped}${r.pending ? ` (+${r.pending})` : ''}` },
+    { title: '成交/跳过', key: 'trades', width: 140, render: (r) => `${r.trades} / ${r.skipped}${r.forced ? ` · 强平剔除 ${r.forced}` : ''}${r.pending ? ` (+${r.pending})` : ''}` },
     { title: 'Precision_net', key: 'pnet', width: 110, render: (r) => (r.trades ? pctSpan(r.precision_net_pct) : '—') },
     { title: '净收益中位', key: 'mnet', width: 100, render: (r) => (r.trades ? pctSpan(r.median_net_pct) : '—') },
     { title: '严重亏损率', key: 'severe', width: 100, render: (r) => (r.trades ? `${r.severe_loss_pct.toFixed(1)}%` : '—') },
@@ -121,7 +130,7 @@ function specLine(sec: WFSectionReport): string {
 <template>
   <PageContainer
     title="Walk-Forward 基线"
-    subtitle="S3-5 评估基线：手工评分（五维+策略加分）按历史 as-of 切片重放，训练/验证/测试滚动切分；纯测量不改写任何推荐行为"
+    subtitle="按历史时点重放评分与策略，滚动划分训练、验证和测试区间，观察各阶段的收益与风险"
   >
     <div class="wf-stack">
       <SectionCard title="评估概览">
@@ -131,17 +140,18 @@ function specLine(sec: WFSectionReport): string {
               数据末日 {{ report.trade_date }} · Top{{ report.top_k }} 组合 · 宇宙 {{ report.universe }} 只 · 耗时
               {{ (report.elapsed_ms / 1000).toFixed(1) }}s
             </span>
-            <n-button size="small" :loading="loading" @click="load(true)">重新计算</n-button>
+            <n-button size="small" :loading="loading" :disabled="loading" @click="load(true)">重新计算</n-button>
           </div>
         </template>
         <n-spin :show="loading">
+          <n-alert v-if="loadError" type="error" :show-icon="false">{{ loadError }}</n-alert>
           <div v-if="report" class="wf-notes">
             <div v-for="(n, i) in report.notes" :key="i">{{ n }}</div>
             <div v-if="report.st_skipped || report.adjust_suspect">
               已剔除：ST {{ report.st_skipped }} 只、复权断层 {{ report.adjust_suspect }} 只。
             </div>
           </div>
-          <div v-else-if="!loading" class="wf-empty">暂无数据：需全市场日线就绪后点「重新计算」（每信号日一次全市场重算，约数十秒）。</div>
+          <div v-else-if="!loading && !loadError" class="wf-empty">暂无数据：需全市场日线就绪后点「重新计算」（每信号日一次全市场重算，约数十秒）。</div>
         </n-spin>
       </SectionCard>
 

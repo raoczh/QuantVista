@@ -14,6 +14,9 @@ import (
 	"quantvista/common"
 	"quantvista/datasource"
 	"quantvista/model"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // 收盘日报：交易日 15:35 后为开启偏好的用户自动生成「今日复盘 + 明日选股推荐」。
@@ -88,17 +91,27 @@ func inReportWindow(t time.Time) bool {
 
 // isTradingDayToday cn 市场今天是否交易日：优先查交易日历；无日历数据时回退「周一~五」。
 func isTradingDayToday(now time.Time) bool {
+	return isTradingDayTodayDB(common.DB, now)
+}
+
+func isTradingDayTodayDB(db *gorm.DB, now time.Time) bool {
 	date := now.Format("2006-01-02")
 	var cal model.TradingCalendar
-	err := common.DB.Where("market = ? AND trade_date = ?", "cn", date).First(&cal).Error
-	if err == nil {
-		return cal.IsOpen
+	if db != nil {
+		if err := db.Where("market = ? AND trade_date = ?", "cn", date).First(&cal).Error; err == nil {
+			return cal.IsOpen
+		}
 	}
 	wd := now.Weekday()
 	return wd >= time.Monday && wd <= time.Friday
 }
 
 type dailyTradingDayState string
+
+// 生成尚未入队时遇到临时存储故障，保留下一轮自动调度的重试机会。
+type dailyReportRetryableError struct{ error }
+
+func (e *dailyReportRetryableError) Unwrap() error { return e.error }
 
 const (
 	dailyTradingDayOpen    dailyTradingDayState = "open"
@@ -161,14 +174,28 @@ func (s *DailyReportService) Delete(userID, id int64) error {
 	if err := expireStaleDailyReports(userID); err != nil {
 		return err
 	}
-	var r model.DailyReport
-	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&r).Error; err != nil {
-		return errors.New("日报不存在")
-	}
-	if r.Status == model.ReportStatusProcessing {
-		return refusalErr(RefusalReportProcessing, "日报正在生成中，请等任务结束后再删除")
-	}
-	return common.DB.Delete(&r).Error
+	return common.DB.Transaction(func(tx *gorm.DB) error {
+		var r model.DailyReport
+		// 与强制重新生成共用日报行锁，等待后重新核验当前状态。
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ?", id, userID).First(&r).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("日报不存在")
+			}
+			return err
+		}
+		if r.Status == model.ReportStatusProcessing {
+			return refusalErr(RefusalReportProcessing, "日报正在生成中，请等任务结束后再删除")
+		}
+		var active int64
+		if err := tx.Model(&model.JobRun{}).Where("user_id = ? AND result_type = ? AND result_id = ? AND status IN ?",
+			userID, JobResultDailyReport, id, []string{model.JobStatusQueued, model.JobStatusRunning}).Count(&active).Error; err != nil {
+			return err
+		}
+		if active > 0 {
+			return refusalErr(RefusalReportProcessing, "日报任务正在收尾，请等任务结束后再删除")
+		}
+		return tx.Delete(&r).Error
+	})
 }
 
 // Get 日报详情（含复盘全文与推荐批次视图）。
@@ -178,7 +205,10 @@ func (s *DailyReportService) Get(userID, id int64) (*DailyReportView, error) {
 	}
 	var r model.DailyReport
 	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&r).Error; err != nil {
-		return nil, errors.New("日报不存在")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("日报不存在")
+		}
+		return nil, err
 	}
 	return s.assembleView(&r), nil
 }
@@ -190,8 +220,11 @@ func (s *DailyReportService) Latest(userID int64) (*DailyReportView, error) {
 	}
 	var r model.DailyReport
 	err := common.DB.Where("user_id = ?", userID).Order("trade_date DESC, id DESC").First(&r).Error
-	if err != nil {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 	return s.assembleView(&r), nil
 }
@@ -199,8 +232,9 @@ func (s *DailyReportService) Latest(userID int64) (*DailyReportView, error) {
 // DailyReportView 详情视图：复盘解析 + 推荐批次（复用推荐域视图）。
 type DailyReportView struct {
 	model.DailyReport
-	Review         *dailyReview        `json:"review"`
-	Recommendation *RecommendationView `json:"recommendation"`
+	Review              *dailyReview        `json:"review"`
+	Recommendation      *RecommendationView `json:"recommendation"`
+	RecommendationError string              `json:"recommendation_error,omitempty"`
 }
 
 func (s *DailyReportService) assembleView(r *model.DailyReport) *DailyReportView {
@@ -214,6 +248,8 @@ func (s *DailyReportService) assembleView(r *model.DailyReport) *DailyReportView
 	if r.RecommendationBatchID > 0 {
 		if rec, err := s.rec.Get(r.UserID, r.RecommendationBatchID); err == nil {
 			v.Recommendation = rec
+		} else {
+			v.RecommendationError = "推荐详情读取失败：" + err.Error()
 		}
 	}
 	return v
@@ -225,8 +261,12 @@ func (s *DailyReportService) assembleView(r *model.DailyReport) *DailyReportView
 // 重生成不再「先删旧报告再生成」，旧报告内容原地保留，双败时状态回滚（旧报告不丢）。
 // manual=false（自动 job）：已存在即跳过；新任务同样进入统一固定 worker。
 func (s *DailyReportService) GenerateFor(ctx context.Context, userID int64, manual bool) (*DailyReportView, error) {
-	if err := expireStaleDailyReports(userID); err != nil {
+	ctx = jobSubmissionContext(ctx)
+	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if err := expireStaleDailyReports(userID); err != nil {
+		return nil, &dailyReportRetryableError{err}
 	}
 	now := s.now()
 	switch dailyTradingDayStatus(now) {
@@ -244,7 +284,11 @@ func (s *DailyReportService) GenerateFor(ctx context.Context, userID int64, manu
 	date := now.Format("2006-01-02")
 
 	var existing model.DailyReport
-	exists := common.DB.Where("user_id = ? AND trade_date = ?", userID, date).First(&existing).Error == nil
+	readErr := common.DB.WithContext(ctx).Where("user_id = ? AND trade_date = ?", userID, date).First(&existing).Error
+	if readErr != nil && !errors.Is(readErr, gorm.ErrRecordNotFound) {
+		return nil, &dailyReportRetryableError{readErr}
+	}
+	exists := readErr == nil
 	if exists && !manual {
 		return s.assembleView(&existing), nil
 	}
@@ -255,7 +299,7 @@ func (s *DailyReportService) GenerateFor(ctx context.Context, userID int64, manu
 
 	// LLM 配置解析 + 配额熔断（确定性错误立即返回，不建任务；自动生成不占次数，
 	// 但额度用尽也不再代烧 token）。
-	cfg, _, err := s.llm.ResolveForUse(userID, 0)
+	cfg, _, err := s.llm.ResolveForUse(userID, 0, ctx)
 	if err != nil {
 		return nil, fmt.Errorf("未配置可用的 LLM：%w", err)
 	}
@@ -264,18 +308,22 @@ func (s *DailyReportService) GenerateFor(ctx context.Context, userID int64, manu
 	}
 	_ = cfg // 工厂在同一事务内再次解析并只保留非敏感元数据
 	jobReq := dailyReportJobRequest{Version: 1, TradeDate: date, Manual: manual}
-	run, err := startDurableBusinessJob(userID, JobKindDailyReport, jobReq, isAdminUser(userID))
+	var view *DailyReportView
+	_, err = startDurableBusinessJobContext(ctx, userID, JobKindDailyReport, jobReq, isAdminUser(userID), func(tx *gorm.DB, run *model.JobRun) error {
+		if run.ResultID == nil {
+			return errors.New("日报作业缺少结果引用")
+		}
+		var report model.DailyReport
+		if err := tx.Where("id = ? AND user_id = ?", *run.ResultID, userID).First(&report).Error; err != nil {
+			return err
+		}
+		view = s.assembleView(&report)
+		return nil
+	})
 	if err != nil {
-		return nil, err
+		return nil, &dailyReportRetryableError{err}
 	}
-	if run.ResultID == nil {
-		return nil, errors.New("日报作业缺少结果引用")
-	}
-	var report model.DailyReport
-	if err := common.DB.Where("id = ? AND user_id = ?", *run.ResultID, userID).First(&report).Error; err != nil {
-		return nil, err
-	}
-	return s.assembleView(&report), nil
+	return view, nil
 }
 
 // reportGenPlan 同步段产出、后台段消费的生成计划。
@@ -314,6 +362,14 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 	// P0-6 修复批：daily 模板一次固化快照——callReview 的系统提示、run 的 prompt 版本与
 	// report.PromptVersion 消费同一份，模板在复盘生成期间被编辑不会造成正文/版本错位。
 	dailyPrompt := loadPromptRuntime(userID, model.PromptModuleDaily)
+	if plan.manual {
+		quotaCtx, finishQuota, err := beginManualQuotaAction(ctx, userID)
+		if err != nil {
+			return nil, err
+		}
+		ctx = quotaCtx
+		defer finishQuota()
+	}
 
 	// 复盘与推荐并行（2026-07-14）：两路 LLM 链路互不依赖、互不阻断（单方失败 partial
 	// 的语义早已存在），串行只是白白把总时长翻倍。单用户瞬时并发=2，可接受。
@@ -349,7 +405,8 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 		recView, recErr = recFn(withoutJobExecution(ctx), userID, plan.allowPrivate, recReq)
 	}()
 	wg.Wait()
-	if reviewErr == nil && recErr == nil {
+	recDegraded := recErr == nil && recView != nil && recView.Status == model.RecStatusDegraded
+	if reviewErr == nil && recErr == nil && !recDegraded {
 		_ = JobStepFinish(ctx, "dual_generation", model.JobStatusSuccess)
 	} else {
 		_ = JobStepFinish(ctx, "dual_generation", model.JobStatusDegraded)
@@ -372,17 +429,22 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 		review.EvidenceCheck = dailyReviewEvidence(review, snapshot) // 信任层回填后随 ReviewJSON 一起落库
 		b, _ := json.Marshal(review)
 		report.ReviewJSON = string(b)
+	} else {
+		// 部分重生成只交付本次成功的部分；旧复盘不能与本次新快照拼在一起。
+		report.ReviewJSON = ""
 	}
 	if reviewTokens > 0 {
-		consumeQuota(userID, reviewTokens, false) // 复盘 token 记审计；次数在末尾按 manual 记一次
+		consumeQuota(userID, reviewTokens) // 复盘 token 记审计；手动动作已在两路执行前统一预留。
 	}
 	if recErr == nil && recView != nil {
 		report.RecommendationBatchID = recView.ID
+	} else {
+		report.RecommendationBatchID = 0
 	}
 
-	// 状态归纳：双成 success / 单成 partial / 双败 failed。
+	// 状态归纳：双成 success / 单成或推荐降级 partial / 双败 failed。
 	switch {
-	case reviewErr == nil && recErr == nil:
+	case reviewErr == nil && recErr == nil && !recDegraded:
 		report.Status = model.ReportStatusSuccess
 	case reviewErr != nil && recErr != nil:
 		report.Status = model.ReportStatusFailed
@@ -395,13 +457,11 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 	}
 	if recErr != nil {
 		errParts = append(errParts, "推荐失败: "+recErr.Error())
+	} else if recDegraded {
+		errParts = append(errParts, "推荐降级: "+orStr(recView.Error, "仅有降级结果，请核对推荐详情"))
 	}
 	report.Error = truncateRunes(strings.Join(errParts, "；"), 500)
 	report.LatencyMs = time.Since(start).Milliseconds()
-
-	if plan.manual {
-		chargeAction(userID) // 手动生成计 1 次（token 已在各环节以 manual=false 记过审计）
-	}
 
 	// 双败 + 重生成：不覆盖旧报告任何内容字段，状态回滚（旧报告依然可看），错误带说明。
 	if report.Status == model.ReportStatusFailed && plan.oldStatus != "" {
@@ -413,7 +473,7 @@ func (s *DailyReportService) runGeneration(ctx context.Context, report *model.Da
 
 	_ = JobStepTransition(ctx, "finalize")
 	report.PreviousStatus = ""
-	if err := common.DB.Save(report).Error; err != nil {
+	if err := withJobResultTransaction(ctx, func(tx *gorm.DB) error { return tx.Save(report).Error }); err != nil {
 		return nil, err
 	}
 
@@ -546,11 +606,15 @@ func (s *DailyReportService) buildSnapshot(ctx context.Context, userID int64, da
 			p.ReviewFlags = strings.Join(flags, "、")
 			snap.Positions = append(snap.Positions, p)
 		}
+	} else {
+		snap.Deficiencies = append(snap.Deficiencies, "持仓读取失败，账户持仓情况未知，不得推断用户没有持仓")
 	}
 
 	// 自选异动：全部分组条目按当日涨跌绝对值取前 8。
 	if groups, err := s.watchlist.List(ctx, userID); err == nil {
 		snap.Watch = selectReportWatchItems(groups)
+	} else {
+		snap.Deficiencies = append(snap.Deficiencies, "自选读取失败，关注名单及异动情况未知，不得推断用户没有自选")
 	}
 
 	// 今日命中提醒（事件表按触发时间过滤，含已读——复盘看全天）。
@@ -560,25 +624,35 @@ func (s *DailyReportService) buildSnapshot(ctx context.Context, userID int64, da
 	if now := s.now(); now.Before(dayEnd) {
 		dayEnd = now
 	}
-	if err := common.DB.Where("user_id = ? AND triggered_at >= ? AND triggered_at < ?",
+	if err := common.DB.WithContext(ctx).Where("user_id = ? AND triggered_at >= ? AND triggered_at < ?",
 		userID, dayStart, dayEnd).Limit(20).Find(&events).Error; err == nil {
 		for _, e := range events {
 			snap.Alerts = append(snap.Alerts, fmt.Sprintf("%s(%s) %s", e.Name, e.Symbol, e.Message))
 		}
+	} else {
+		snap.Deficiencies = append(snap.Deficiencies, "今日提醒读取失败，触发情况未知，不得推断今日没有提醒")
 	}
 
 	// N2 今日重要事件：4 步硬规则（降噪→三维打分→同主线合并→截断），LLM 只写摘要。
-	snap.Events = buildTodayEventsAt(date, s.now())
+	if events, err := buildTodayEventsAt(date, s.now()); err == nil {
+		snap.Events = events
+	} else {
+		snap.Deficiencies = append(snap.Deficiencies, "今日重要事件读取失败，不得推断今日无入选重要事件")
+	}
 
 	// F1 明日披露名单：自选∪持仓中次日预约披露财报的标的（数据来自预约披露表）。
 	if d, err := time.ParseInLocation("2006-01-02", date, time.Local); err == nil {
-		snap.Disclosures = TomorrowDisclosures(userID, d.AddDate(0, 0, 1).Format("2006-01-02"))
+		if disclosures, err := TomorrowDisclosures(userID, d.AddDate(0, 0, 1).Format("2006-01-02")); err == nil {
+			snap.Disclosures = disclosures
+		} else {
+			snap.Deficiencies = append(snap.Deficiencies, "明日披露名单读取失败，不得推断关注标的明日没有财报披露")
+		}
 	}
 
 	if snap.Market == nil && len(snap.Positions) == 0 && len(snap.Watch) == 0 {
 		snap.Note = "数据源暂不可用或无持仓自选，仅按已有信息复盘"
 	}
-	snap.Deficiencies = reportDataDeficiencies(snap, date)
+	snap.Deficiencies = append(snap.Deficiencies, reportDataDeficiencies(snap, date)...)
 	return snap
 }
 
@@ -858,10 +932,17 @@ func dailyReviewSystemFrom(pr promptRuntime, date string) string {
 // 首轮与 repair 轮共享同一 run_id，P0-2 关联元数据随审计与日报落库。
 // dailyPrompt 为调用方一次固化的模板快照（正文与版本同源，P0-6 修复批）。
 func (s *DailyReportService) callReview(ctx context.Context, userID int64, date string, dailyPrompt promptRuntime, cfg *model.LLMConfig, apiKey string, allowPrivate bool, snapshotJSON, traceID string) (*dailyReview, int, *llmRun, error) {
+	if dailyPrompt.ReadError != nil {
+		run := newLLMRun(traceID, "", "daily_report", "daily_report.v1", "")
+		run.DegradedReason = "prompt_read_failed"
+		run.record(nil, dailyPrompt.ReadError)
+		return nil, 0, run, dailyPrompt.ReadError
+	}
 	sys := dailyReviewSystemFrom(dailyPrompt, date)
 	messages := []chatMessage{
 		{Role: "system", Content: sys},
-		{Role: "user", Content: fmt.Sprintf("今日收盘数据如下（JSON）：\n%s", truncateRunes(snapshotJSON, contextBudgetChars))},
+		// 与保存和核验的快照一致，不能按字符截断 JSON 并丢掉尾部数据缺口。
+		{Role: "user", Content: fmt.Sprintf("今日收盘数据如下（JSON）：\n%s", snapshotJSON)},
 	}
 	run := newLLMRun(traceID, "", "daily_report", "daily_report.v1",
 		dailyPrompt.Version(dailyReviewPromptVersion))
@@ -887,7 +968,7 @@ func (s *DailyReportService) callReview(ctx context.Context, userID int64, date 
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			ReasoningEffort: cfg.ReasoningEffort,
-			Temperature: cfg.Temperature, MaxTokens: requestMax,
+			Temperature:     cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0,
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
@@ -1018,7 +1099,10 @@ func (s *DailyReportService) runAutoOnce(ctx context.Context) {
 	date := now.Format("2006-01-02")
 	for _, uid := range userIDs {
 		var cnt int64
-		common.DB.Model(&model.DailyReport{}).Where("user_id = ? AND trade_date = ?", uid, date).Count(&cnt)
+		if err := common.DB.WithContext(ctx).Model(&model.DailyReport{}).Where("user_id = ? AND trade_date = ?", uid, date).Count(&cnt).Error; err != nil {
+			common.SysWarn("用户 %d 日报存在性读取失败，本轮跳过: %v", uid, err)
+			continue
+		}
 		if cnt > 0 {
 			continue
 		}
@@ -1040,13 +1124,20 @@ func recordAutoDailyFailure(userID int64, date string, err error) {
 	}
 	// 队列容量是瞬时背压，不是用户日报的业务失败。此时 JobRun 和结果行都
 	// 尚未创建，保留“当日无报告”才能让下一轮 10 分钟调度继续尝试。
-	if errors.Is(err, ErrJobQueueBusy) {
+	var retryable *dailyReportRetryableError
+	var configReadErr *llmConfigReadError
+	code := RefusalCodeOf(err)
+	if errors.Is(err, ErrJobQueueBusy) || errors.As(err, &retryable) || errors.As(err, &configReadErr) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		code == RefusalQuotaUnavailable || code == RefusalMarketCalendarUnknown || code == RefusalReportProcessing {
 		return
 	}
 	// 确定性失败落一条 failed 记录，避免每 10 分钟反复重试烧 token。生成流程可能
 	// 已自建行（processing→failed 回写），已有行时跳过（user+trade_date 唯一）。
 	var count int64
-	common.DB.Model(&model.DailyReport{}).Where("user_id = ? AND trade_date = ?", userID, date).Count(&count)
+	if err := common.DB.Model(&model.DailyReport{}).Where("user_id = ? AND trade_date = ?", userID, date).Count(&count).Error; err != nil {
+		common.SysWarn("用户 %d 日报失败占位前查询失败，未写入: %v", userID, err)
+		return
+	}
 	if count == 0 {
 		common.DB.Create(&model.DailyReport{
 			UserID: userID, TradeDate: date, Market: "cn",

@@ -3,11 +3,13 @@ package model
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"time"
 
 	"quantvista/common"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // PromptTemplate 用户自定义提示词模板：按模块覆盖默认指引，调 prompt 无需重编译。
@@ -104,7 +106,17 @@ func migratePromptTemplateBaselines(db *gorm.DB) error {
 	migrated := 0
 	for _, row := range rows {
 		row := row
+		changed := false
 		err := db.Transaction(func(tx *gorm.DB) error {
+			// 另一实例仍可在线编辑；外层扫描只定位行，不能用扫描时旧正文回填新行元数据。
+			var current PromptTemplate
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", row.ID).First(&current).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil
+				}
+				return err
+			}
+			row = current
 			wantHash := PromptContentHash(row.Content)
 			newHash, newRev := row.ContentHash, row.Revision
 			rowDirty := false
@@ -121,10 +133,13 @@ func migratePromptTemplateBaselines(db *gorm.DB) error {
 			var match PromptTemplateRevision
 			matchErr := tx.Where("template_id = ? AND content_hash = ?", row.ID, wantHash).
 				Order("revision DESC").First(&match).Error
+			if matchErr == nil && match.Content != row.Content {
+				matchErr = gorm.ErrRecordNotFound
+			}
 			switch {
 			case matchErr == nil:
-				// 已有基线：行 revision 为零值时与命中快照对齐（部分迁移状态修复）。
-				if row.Revision <= 0 && match.Revision > 0 {
+				// 当前指针必须确实对应当前正文；旧迁移可能把新正文标成其他内容的版本。
+				if row.Revision != match.Revision && match.Revision > 0 {
 					newRev = match.Revision
 					rowDirty = true
 				}
@@ -146,18 +161,24 @@ func migratePromptTemplateBaselines(db *gorm.DB) error {
 				}).Error; err != nil {
 					return err
 				}
+				changed = true
 			default:
 				return matchErr
 			}
 			if !rowDirty {
 				return nil
 			}
-			migrated++
-			return tx.Model(&PromptTemplate{}).Where("id = ?", row.ID).
-				Updates(map[string]any{"content_hash": newHash, "revision": newRev}).Error
+			if err := tx.Model(&PromptTemplate{}).Where("id = ?", row.ID).
+				Updates(map[string]any{"content_hash": newHash, "revision": newRev}).Error; err != nil {
+				return err
+			}
+			changed = true
+			return nil
 		})
 		if err != nil {
 			common.SysWarn("prompt 模板基线迁移失败（template=%d module=%s，下次启动重试）: %v", row.ID, row.Module, err)
+		} else if changed {
+			migrated++
 		}
 	}
 	if migrated > 0 {
@@ -179,15 +200,10 @@ func migratePromptChampionStates(db *gorm.DB) error {
 		if generation < 1 {
 			generation = 1
 		}
-		var count int64
-		if err := db.Model(&PromptChampionState{}).
-			Where("user_id = ? AND module = ?", row.UserID, row.Module).Count(&count).Error; err != nil {
-			return err
-		}
-		if count > 0 {
-			continue
-		}
-		if err := db.Create(&PromptChampionState{
+		// 在线编辑或另一实例可以先建立锚；冲突时保留其代次，继续处理后续模板。
+		if err := db.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "user_id"}, {Name: "module"}}, DoNothing: true,
+		}).Create(&PromptChampionState{
 			UserID: row.UserID, Module: row.Module, Generation: generation,
 		}).Error; err != nil {
 			return err

@@ -35,6 +35,7 @@ import {
   getTradeStats,
   getPositionCurve,
   type Position,
+  type PositionBase,
   type PositionInput,
   type PortfolioOverview,
   type PositionTrade,
@@ -58,6 +59,8 @@ import { listRecommendationLinkCandidates, type RecLinkCandidate } from '@/api/r
 import { getLLMTask, type LLMTask } from '@/api/llmTask'
 import { pollUntil } from '@/lib/poll'
 import { isAbortError } from '@/api/client'
+import { getSessionEpoch } from '@/api/token'
+import { formatPrice } from '@/lib/formatPrice'
 import { useUi, withAlpha } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 import {
@@ -91,6 +94,29 @@ const warnColor = computed(() => vars.value.warningColor)
 
 const positions = ref<Position[]>([])
 const overview = ref<PortfolioOverview | null>(null)
+function routeAccountID() {
+  const raw = Array.isArray(route.query.account_id) ? route.query.account_id[0] : route.query.account_id
+  if (raw == null || raw === '') return undefined
+  const value = Number(raw)
+  return Number.isSafeInteger(value) && value > 0 ? value : null
+}
+const accountId = ref<number | undefined>(routeAccountID() ?? undefined)
+let disposed = false
+const sessionOwner = getSessionEpoch()
+let accountEpoch = 0
+const pageActive = () => !disposed && route.name === 'positions' && sessionOwner === getSessionEpoch()
+function captureOwner() {
+  const epoch = accountEpoch
+  return () => pageActive() && accountEpoch === epoch
+}
+const readControllers = new Map<string, AbortController>()
+function beginRead(key: string) {
+  readControllers.get(key)?.abort()
+  const controller = new AbortController()
+  readControllers.set(key, controller)
+  const owner = captureOwner()
+  return { signal: controller.signal, active: () => owner() && readControllers.get(key) === controller }
+}
 const loading = ref(false)
 const loadError = ref('')
 const statusQuery = enumQuery<'holding' | 'closed' | 'all'>('holding', ['holding', 'closed', 'all'])
@@ -100,37 +126,54 @@ const typeFilter = ref(typeQuery.parse(route.query.type))
 let positionLoadSeq = 0
 let loadedStatus: typeof statusFilter.value | null = null
 let suspendStatusReload = false
+function requestedPositionStatus() {
+  return assessmentRouteID() ? 'all' : mainTab.value === 'needs_action' ? 'holding' : statusFilter.value
+}
 
 const marketOptions = [
   { label: 'A 股', value: 'cn' },
 ]
 
 async function load(silent = false) {
+  if (!pageActive()) return
+  if (routeAccountID() === null) {
+    loadError.value = '账户参数无效，请从组合列表重新打开'
+    return
+  }
   // 自动刷新不抢占正在进行的手动刷新，否则它可能让手动轮次失效且把错误静默吞掉。
   if (silent && loading.value) return
-  const requestedStatus = statusFilter.value
+  const requestedStatus = requestedPositionStatus()
   const mySeq = ++positionLoadSeq
+  const read = beginRead('positions')
   // 切换状态筛选时先清掉上一范围的持仓，避免请求期间把“持仓中”数据显示在“已卖出”下。
   if (loadedStatus !== requestedStatus) positions.value = []
   if (!silent) loading.value = true
   loadError.value = ''
   try {
-    const [list, ov] = await Promise.all([listPositions(requestedStatus), getPortfolioOverview()])
-    if (mySeq !== positionLoadSeq || requestedStatus !== statusFilter.value) return
+    let firstOverview: PortfolioOverview | undefined
+    if (!accountId.value) {
+      firstOverview = await getPortfolioOverview(undefined, read.signal)
+      if (!read.active() || mySeq !== positionLoadSeq) return
+      if (!firstOverview.account_id) throw new Error('无法识别当前组合，请刷新后重试')
+      accountId.value = firstOverview.account_id
+    }
+    const [list, ov] = await Promise.all([
+      listPositions(requestedStatus, accountId.value, read.signal),
+      firstOverview ? Promise.resolve(firstOverview) : getPortfolioOverview(accountId.value, read.signal),
+    ])
+    if (!read.active() || mySeq !== positionLoadSeq || requestedStatus !== requestedPositionStatus()) return
     positions.value = list
     overview.value = ov
     loadedStatus = requestedStatus
     await restoreExpandedTrade()
   } catch (e) {
-    if (mySeq === positionLoadSeq) {
-      positions.value = []
-      overview.value = null
+    if (read.active() && mySeq === positionLoadSeq && !isAbortError(e)) {
       loadError.value = (e as Error).message
       if (!silent) message.error(loadError.value)
     }
   } finally {
     // 静默自动刷新可能在手动刷新期间接管最新轮次；最新轮次无论是否 silent 都要收起旧 loading。
-    if (mySeq === positionLoadSeq) loading.value = false
+    if (read.active() && mySeq === positionLoadSeq) loading.value = false
   }
 }
 
@@ -150,7 +193,7 @@ const filtered = computed(() =>
 // 汇总改为后端组合总览（GET /positions/overview：全组合口径，不随筛选变化）。
 const mixLabel = computed(() => {
   const ov = overview.value
-  if (!ov || ov.total_value <= 0) return '—'
+  if (!ov || ov.currency_unavailable_reason || ov.valuation_unavailable_reason || ov.total_value <= 0) return '—'
   const short = (ov.short_value / ov.total_value) * 100
   return `${short.toFixed(0)}% / ${(100 - short).toFixed(0)}%`
 })
@@ -159,6 +202,8 @@ const mixLabel = computed(() => {
 const pricedLabel = computed(() => {
   const ov = overview.value
   if (!ov) return ''
+  if (ov.currency_unavailable_reason) return ov.currency_unavailable_reason
+  if (ov.valuation_unavailable_reason) return ov.valuation_unavailable_reason
   const failed = ov.quote_failed_count ?? 0
   const stale = ov.quote_stale_count ?? 0
   if (failed + stale <= 0) return ''
@@ -180,7 +225,7 @@ function typeLabel(t: string) {
   return t === 'short_term' ? '短线' : '长线'
 }
 function fmt(n: number | undefined) {
-  return n == null ? '-' : n.toFixed(2)
+  return n == null || !Number.isFinite(n) ? '—' : n.toFixed(2)
 }
 function fmtMoney(n: number) {
   return (n >= 0 ? '' : '-') + Math.abs(n).toLocaleString('zh-CN', { maximumFractionDigits: 2 })
@@ -194,7 +239,7 @@ const editModal = ref(false)
 const editing = ref(false)
 // 编辑已平仓持仓：后端仅接受 buy_reason/user_note，其余字段隐藏，避免“保存成功”误导。
 const editingClosed = ref(false)
-const form = ref<PositionInput & { id: number | null }>({
+const form = ref<PositionInput & { id: number | null; account_id?: number }>({
   id: null,
   symbol: '',
   market: 'cn',
@@ -261,10 +306,12 @@ const riskCalc = computed(() => {
 })
 
 function openCreate(prefill?: { symbol?: string; market?: string; name?: string; recId?: number; quantity?: number }) {
+  if (!pageActive() || submitting.value || linkSaving.value) return
   editing.value = false
   editingClosed.value = false
   form.value = {
     id: null,
+    account_id: accountId.value,
     symbol: prefill?.symbol || '',
     market: prefill?.market || 'cn',
     name: prefill?.name || '',
@@ -284,10 +331,12 @@ function openCreate(prefill?: { symbol?: string; market?: string; name?: string;
   editModal.value = true
 }
 function openEdit(p: Position) {
+  if (!pageActive() || submitting.value || linkSaving.value) return
   editing.value = true
   editingClosed.value = p.status === 'closed'
   form.value = {
     id: p.id,
+    account_id: p.account_id || accountId.value,
     symbol: p.symbol,
     market: p.market,
     name: p.name,
@@ -320,20 +369,38 @@ const linkCandidates = ref<RecLinkCandidate[]>([])
 const linkLoading = ref(false)
 const linkSaving = ref(false)
 const linkSelected = ref<number>(0)
+const linkError = ref('')
+let linkSeq = 0
+
+watch(editModal, (show) => {
+  if (!show) {
+    linkSeq++
+    linkLoading.value = false
+  }
+})
 
 /** 打开编辑弹窗时按标的拉候选推荐。best-effort：拉不到只是没得选，不阻塞编辑。 */
 async function openLinkEditor(p: Position) {
+  if (!pageActive()) return
+  const owner = captureOwner()
+  const seq = ++linkSeq
   linkTarget.value = p
   linkSelected.value = p.rec_link?.recommendation_id || p.recommendation_id || 0
   linkCandidates.value = []
+  linkError.value = ''
+  linkLoading.value = false
   if (p.status === 'closed') return // 已平仓不再改血缘，避免改写历史归因
   linkLoading.value = true
   try {
-    linkCandidates.value = await listRecommendationLinkCandidates(p.symbol, p.market)
-  } catch {
+    const candidates = await listRecommendationLinkCandidates(p.symbol, p.market)
+    if (!owner() || seq !== linkSeq) return
+    linkCandidates.value = candidates
+  } catch (error) {
+    if (!owner() || seq !== linkSeq) return
     linkCandidates.value = []
+    linkError.value = (error as Error).message
   } finally {
-    linkLoading.value = false
+    if (owner() && seq === linkSeq) linkLoading.value = false
   }
 }
 
@@ -343,7 +410,7 @@ const linkOptions = computed(() => [
     label:
       `#${c.recommendation_id} · ${c.created_at.slice(0, 10)} · ` +
       `${c.type === 'short_term' ? '短线' : '长线'}${c.action === 'buy' ? '买入' : '观察'}` +
-      ` · 参考价 ${c.ref_price > 0 ? c.ref_price.toFixed(2) : '未知'}` +
+      ` · 参考价 ${c.ref_price > 0 ? formatPrice(c.ref_price) : '未知'}` +
       (c.linked_position_id && c.linked_position_id !== linkTarget.value?.id
         ? `（已关联持仓 #${c.linked_position_id}）`
         : ''),
@@ -354,26 +421,80 @@ const linkDirty = computed(
   () => !!linkTarget.value && linkSelected.value !== (linkTarget.value.recommendation_id || 0),
 )
 
+// 写入成功后立即作废旧读取和派生缓存，后续刷新失败也不能让旧账本重新出现。
+function applyPositionCommit(result?: PositionBase, removedID?: number) {
+  for (const key of ['positions', 'trades', 'stats', 'assessment']) {
+    readControllers.get(key)?.abort()
+    readControllers.delete(key)
+  }
+  positionLoadSeq++
+  tradesSeq++
+  statsSeq++
+  stats.value = null
+  statsError.value = ''
+  tradesById.value = {}
+  tradesErrorById.value = {}
+  tradesLoading.value = false
+  overview.value = null
+  focusedAssessmentSeq++
+  focusedAssessment.value = null
+  invalidateAdvice()
+  if (removedID) positions.value = positions.value.filter((item) => item.id !== removedID)
+  // 导入、折算和撤销折算不返回新的持仓模型；必须重新取得账本后才能展示数量和风险。
+  if (!result && !removedID) positions.value = []
+  if (result) {
+    const previous = positions.value.find((item) => item.id === result.id)
+    const current: Position = {
+      ...result,
+      current_price: 0, quote_ok: false, cost: result.remaining_cost,
+      market_value: 0, profit_amount: 0, profit_pct: 0, realized: result.status === 'closed',
+      day_change_pct: 0, held_trade_days: 0, short_term_review: false,
+      below_stop_loss: false, near_stop_loss: false, last_analyzed_at: null, analysis_stale: true,
+      freshness_status: 'unknown', stale_reason: '账本已保存，等待刷新行情与汇总',
+      last_price: previous?.current_price || previous?.last_price,
+      quote_as_of: previous?.quote_as_of,
+    }
+    const status = mainTab.value === 'needs_action' ? 'holding' : statusFilter.value
+    positions.value = positions.value.filter((item) => item.id !== result.id)
+    if (status === 'all' || result.status === status) positions.value.unshift(current)
+  }
+}
+
+async function refreshAfterPositionCommit() {
+  await Promise.all([load(), loadCorpAdjusts(), loadCurve(), ...(mainTab.value === 'review' ? [loadStats()] : [])])
+}
+
 async function saveLink() {
   const target = linkTarget.value
-  if (!target || linkSaving.value || !linkDirty.value) return
+  if (!pageActive() || !target || linkSaving.value || submitting.value || linkLoading.value || !linkDirty.value) return
+  const owner = captureOwner()
+  const selected = linkSelected.value
+  const seq = linkSeq
   linkSaving.value = true
   try {
-    await linkPositionRecommendation(target.id, linkSelected.value)
-    message.success(linkSelected.value > 0 ? '已关联到该推荐' : '已解除推荐关联')
-    await load()
+    const result = await linkPositionRecommendation(target.id, selected, target.account_id || accountId.value)
+    if (!owner() || seq !== linkSeq) return
+    applyPositionCommit(result)
+    message.success(selected > 0 ? '已关联到该推荐' : '已解除推荐关联')
+    await refreshAfterPositionCommit()
+    if (!owner()) return
     const fresh = positions.value.find((p) => p.id === target.id)
-    if (fresh) linkTarget.value = fresh
+    if (fresh && seq === linkSeq) linkTarget.value = fresh
   } catch (e) {
-    message.error((e as Error).message)
+    if (owner() && seq === linkSeq && !isAbortError(e)) message.error((e as Error).message)
   } finally {
-    linkSaving.value = false
+    if (owner()) linkSaving.value = false
   }
 }
 const submitting = ref(false)
 async function submit() {
-  if (submitting.value) return
-  const f = form.value
+  if (!pageActive() || submitting.value || linkSaving.value) return
+  const owner = captureOwner()
+  if (!accountId.value) {
+    message.warning('请先成功加载当前组合，再保存持仓')
+    return
+  }
+  const f = { ...form.value }
   if (!editing.value && !f.symbol?.trim()) {
     message.warning('请输入股票代码')
     return
@@ -418,16 +539,18 @@ async function submit() {
             checklist_json: checklistToJSON(),
             recommendation_id: f.recommendation_id || 0,
           }
-    if (editing.value && f.id) await updatePosition(f.id, payload)
-    else await createPosition(payload)
+    const result = editing.value && f.id
+      ? await updatePosition(f.id, payload, f.account_id || accountId.value)
+      : await createPosition(payload, f.account_id || accountId.value)
+    if (!owner()) return
     editModal.value = false
-    invalidateAdvice()
-    await load()
+    applyPositionCommit(result)
     message.success('已保存')
+    await refreshAfterPositionCommit()
   } catch (e) {
-    message.error((e as Error).message)
+    if (owner() && !isAbortError(e)) message.error((e as Error).message)
   } finally {
-    submitting.value = false
+    if (owner()) submitting.value = false
   }
 }
 
@@ -457,6 +580,7 @@ const aiVerdictOptions = [
   { label: '未参考 AI', value: 'unused' },
 ]
 function openClose(p: Position) {
+  if (!pageActive() || closingSubmit.value) return
   closing.value = p
   closeForm.value = {
     sell_price: p.current_price || undefined,
@@ -473,14 +597,15 @@ function openClose(p: Position) {
 }
 const closingSubmit = ref(false)
 async function submitClose() {
-  if (!closing.value || closingSubmit.value) return
+  if (!pageActive() || !closing.value || closingSubmit.value) return
+  const owner = captureOwner()
   if (!closeForm.value.sell_price || closeForm.value.sell_price <= 0) {
     message.warning('请输入卖出价格')
     return
   }
   closingSubmit.value = true
   try {
-    await closePosition(closing.value.id, {
+    const result = await closePosition(closing.value.id, {
       sell_price: closeForm.value.sell_price,
       sell_date: closeForm.value.sell_date,
       sell_fee: closeForm.value.sell_fee,
@@ -490,26 +615,34 @@ async function submitClose() {
       sell_planned: closeForm.value.sell_planned,
       ai_verdict: closeForm.value.ai_verdict,
       lesson_learned: closeForm.value.lesson_learned,
-    })
+    }, closing.value.account_id || accountId.value)
+    if (!owner()) return
     closeModal.value = false
-    invalidateAdvice()
-    await load()
+    applyPositionCommit(result)
     message.success('已标记卖出')
+    await refreshAfterPositionCommit()
   } catch (e) {
-    message.error((e as Error).message)
+    if (owner() && !isAbortError(e)) message.error((e as Error).message)
   } finally {
-    closingSubmit.value = false
+    if (owner()) closingSubmit.value = false
   }
 }
 
+const removing = ref(new Set<number>())
 async function remove(p: Position) {
+  if (!pageActive() || removing.value.has(p.id)) return
+  const owner = captureOwner()
+  removing.value.add(p.id)
   try {
-    await deletePosition(p.id)
-    invalidateAdvice()
-    await load()
+    await deletePosition(p.id, p.account_id || accountId.value)
+    if (!owner()) return
+    applyPositionCommit(undefined, p.id)
     message.success('已删除')
+    await refreshAfterPositionCommit()
   } catch (e) {
-    message.error((e as Error).message)
+    if (owner() && !isAbortError(e)) message.error((e as Error).message)
+  } finally {
+    if (owner()) removing.value.delete(p.id)
   }
 }
 
@@ -526,12 +659,19 @@ function goThesis(p: Position) {
 
 // ---------- U10/P09 统一导入向导 ----------
 const importModal = ref(false)
-function openImport() {
+async function openImport() {
+  if (!pageActive()) return
+  const owner = captureOwner()
+  if (!accountId.value) await load()
+  if (!owner() || !accountId.value) return
   importModal.value = true
 }
 async function onImportChanged(kind?: string) {
-  invalidateAdvice()
-  await load()
+  if (!pageActive()) return
+  const owner = captureOwner()
+  applyPositionCommit()
+  await refreshAfterPositionCommit()
+  if (!owner()) return
   if (route.query.onboarding_return === '1' && kind === 'position') {
     await router.push({ name: 'home', query: { onboarding: '1' } })
   }
@@ -563,6 +703,7 @@ const tradeWillClose = computed(() => {
 })
 
 function openTrade(p: Position, side: 'buy' | 'sell') {
+  if (!pageActive() || tradeSubmitting.value) return
   tradeTarget.value = p
   tradeForm.value = {
     side,
@@ -583,8 +724,9 @@ function openTrade(p: Position, side: 'buy' | 'sell') {
 
 async function submitTrade() {
   const p = tradeTarget.value
-  if (!p || tradeSubmitting.value) return
-  const f = tradeForm.value
+  if (!pageActive() || !p || tradeSubmitting.value) return
+  const owner = captureOwner()
+  const f = { ...tradeForm.value }
   if (!f.price || f.price <= 0) {
     message.warning('请输入成交价格')
     return
@@ -599,7 +741,7 @@ async function submitTrade() {
   }
   tradeSubmitting.value = true
   try {
-    await addPositionTrade(p.id, {
+    const result = await addPositionTrade(p.id, {
       side: f.side,
       price: f.price,
       quantity: f.quantity,
@@ -612,16 +754,16 @@ async function submitTrade() {
       sell_planned: f.sell_planned,
       ai_verdict: f.ai_verdict,
       lesson_learned: f.lesson_learned,
-    })
+    }, p.account_id || accountId.value)
+    if (!owner()) return
     tradeModal.value = false
-    invalidateAdvice()
-    await load()
-    if (expandedTrades.value === p.id) await loadTrades(p.id)
+    applyPositionCommit(result)
     message.success(f.side === 'buy' ? '已记录加仓' : '已记录减仓')
+    await refreshAfterPositionCommit()
   } catch (e) {
-    message.error((e as Error).message)
+    if (owner() && !isAbortError(e)) message.error((e as Error).message)
   } finally {
-    tradeSubmitting.value = false
+    if (owner()) tradeSubmitting.value = false
   }
 }
 
@@ -633,6 +775,7 @@ const tradesLoading = ref(false)
 let tradesSeq = 0
 
 async function toggleTrades(p: Position) {
+  if (!pageActive()) return
   if (expandedTrades.value === p.id) {
     tradesSeq++
     tradesLoading.value = false
@@ -646,24 +789,26 @@ async function toggleTrades(p: Position) {
   if (!tradesById.value[p.id]) await loadTrades(p.id)
 }
 async function loadTrades(id: number) {
+  if (!pageActive()) return
   const mySeq = ++tradesSeq
+  const read = beginRead('trades')
   const nextTrades = { ...tradesById.value }
   delete nextTrades[id]
   tradesById.value = nextTrades
   tradesErrorById.value = { ...tradesErrorById.value, [id]: '' }
   tradesLoading.value = true
   try {
-    const rows = await listPositionTrades(id)
-    if (mySeq !== tradesSeq || expandedTrades.value !== id) return
+    const rows = await listPositionTrades(id, accountId.value, read.signal)
+    if (!read.active() || mySeq !== tradesSeq || expandedTrades.value !== id) return
     tradesById.value = { ...tradesById.value, [id]: rows }
   } catch (e) {
-    if (mySeq === tradesSeq) {
+    if (read.active() && mySeq === tradesSeq && !isAbortError(e)) {
       const error = (e as Error).message
       tradesErrorById.value = { ...tradesErrorById.value, [id]: error }
       message.error(error)
     }
   } finally {
-    if (mySeq === tradesSeq) tradesLoading.value = false
+    if (read.active() && mySeq === tradesSeq) tradesLoading.value = false
   }
 }
 function sideLabel(side: string) {
@@ -679,18 +824,20 @@ function sideColor(side: string) {
 // 撤销一笔已确认的折算（入口放在流水里——用户看到那笔 adjust 才会想撤）。
 // 后端只在「账面仍等于折算结果且其后无新交易」时接受，否则明确拒绝、不做部分回滚。
 const revertingTrade = ref<number | null>(null)
-async function revertAdjustTrade(t: PositionTrade, positionId: number) {
-  if (!t.adjust_id || revertingTrade.value) return
+async function revertAdjustTrade(t: PositionTrade) {
+  if (!pageActive() || !t.adjust_id || revertingTrade.value) return
+  const owner = captureOwner()
   revertingTrade.value = t.id
   try {
-    await actCorpAdjust(t.adjust_id, 'revert')
+    await actCorpAdjust(t.adjust_id, 'revert', t.account_id || accountId.value)
+    if (!owner()) return
     message.success('已撤销该次折算，账本回滚')
-    invalidateAdvice()
-    await Promise.all([load(), loadTrades(positionId), loadCorpAdjusts()])
+    applyPositionCommit()
+    await refreshAfterPositionCommit()
   } catch (e) {
-    message.error((e as Error).message)
+    if (owner() && !isAbortError(e)) message.error((e as Error).message)
   } finally {
-    revertingTrade.value = null
+    if (owner()) revertingTrade.value = null
   }
 }
 
@@ -722,26 +869,29 @@ const rangeOptions = [
   { label: '近 1 年', value: '1y' },
 ]
 async function loadStats() {
+  if (!accountId.value || !pageActive()) return
+  const read = beginRead('stats')
   const requestedRange = statsRange.value
   const mySeq = ++statsSeq
   if (stats.value?.range !== requestedRange) stats.value = null
   statsLoading.value = true
   statsError.value = ''
   try {
-    const result = await getTradeStats(requestedRange)
-    if (mySeq !== statsSeq || requestedRange !== statsRange.value) return
+    const result = await getTradeStats(requestedRange, accountId.value, read.signal)
+    if (!read.active() || mySeq !== statsSeq || requestedRange !== statsRange.value) return
     stats.value = result
   } catch (e) {
-    if (mySeq === statsSeq) {
+    if (read.active() && mySeq === statsSeq && !isAbortError(e)) {
       statsError.value = (e as Error).message
       message.error(statsError.value)
       stats.value = null
     }
   } finally {
-    if (mySeq === statsSeq) statsLoading.value = false
+    if (read.active() && mySeq === statsSeq) statsLoading.value = false
   }
 }
 watch(mainTab, (t) => {
+  if (t === 'needs_action' || t === 'all') void load()
   if (t === 'review' && !stats.value) loadStats()
   if (t === 'all')
     nextTick(() => {
@@ -804,6 +954,7 @@ const exposureEmptyText = computed(() => {
 })
 
 function renderExposure() {
+  if (!pageActive()) return
   const dim = exposureDim.value
   if (!exposureEl.value || !dim || !dim.buckets.length) {
     exposureChart?.dispose()
@@ -830,7 +981,7 @@ function renderExposure() {
         const b = dim.buckets[p.dataIndex]
         if (!b) return ''
         const tail = b.unknown ? '<br/>（数据缺失，不代表分布均匀）' : ''
-        return `${b.label}<br/>占比 ${b.weight_pct.toFixed(1)}% · ${b.count} 只<br/>市值 ${fmtMoney(b.value)}${tail}`
+        return `${echarts.format.encodeHTML(b.label)}<br/>占比 ${b.weight_pct.toFixed(1)}% · ${b.count} 只<br/>市值 ${fmtMoney(b.value)}${tail}`
       },
     },
     grid: { left: 8, right: 46, top: 6, bottom: 6, containLabel: true },
@@ -882,33 +1033,41 @@ const corpAdjustActing = ref<number | null>(null)
 let corpAdjustAbort: AbortController | null = null
 
 async function loadCorpAdjusts() {
+  if (!accountId.value || !pageActive()) return
+  const owner = captureOwner()
   corpAdjustAbort?.abort()
   const ctrl = new AbortController()
   corpAdjustAbort = ctrl
   corpAdjustLoading.value = true
   corpAdjustError.value = ''
   try {
-    corpAdjusts.value = await listCorpAdjusts('pending', ctrl.signal)
+    const rows = await listCorpAdjusts('pending', ctrl.signal, accountId.value)
+    if (!owner() || corpAdjustAbort !== ctrl || ctrl.signal.aborted) return
+    corpAdjusts.value = rows
   } catch (e) {
-    if (isAbortError(e)) return
+    if (!owner() || isAbortError(e) || corpAdjustAbort !== ctrl || ctrl.signal.aborted) return
+    corpAdjusts.value = []
     corpAdjustError.value = (e as Error).message
   } finally {
-    if (corpAdjustAbort === ctrl) corpAdjustLoading.value = false
+    if (owner() && corpAdjustAbort === ctrl) corpAdjustLoading.value = false
   }
 }
 
 async function doCorpAdjust(row: PositionCorpAdjust, action: 'confirm' | 'dismiss') {
-  if (corpAdjustActing.value) return
+  if (!pageActive() || corpAdjustActing.value) return
+  const owner = captureOwner()
   corpAdjustActing.value = row.id
   try {
-    await actCorpAdjust(row.id, action)
+    await actCorpAdjust(row.id, action, row.account_id || accountId.value, row.context_version)
+    if (!owner()) return
     message.success(action === 'confirm' ? '已按方案折算持仓' : '已忽略该调整')
-    invalidateAdvice()
-    await Promise.all([loadCorpAdjusts(), load()])
+    corpAdjusts.value = corpAdjusts.value.filter((item) => item.id !== row.id)
+    applyPositionCommit()
+    await refreshAfterPositionCommit()
   } catch (e) {
-    message.error((e as Error).message)
+    if (owner() && !isAbortError(e)) message.error((e as Error).message)
   } finally {
-    corpAdjustActing.value = null
+    if (owner()) corpAdjustActing.value = null
   }
 }
 
@@ -938,10 +1097,16 @@ function invalidateAdvice() {
   adviceLoading.value = false
   advice.value = null
   adviceError.value = ''
+  adviceTargetPositionID.value = null
 }
 
 async function runAdvice(target?: Position) {
-  if (adviceLoading.value) return
+  if (!pageActive() || adviceLoading.value) return
+  const owner = captureOwner()
+  if (!accountId.value) {
+    message.warning('请先成功加载当前组合')
+    return
+  }
   adviceAbort?.abort()
   const ctrl = new AbortController()
   adviceAbort = ctrl
@@ -950,16 +1115,18 @@ async function runAdvice(target?: Position) {
   adviceError.value = ''
   try {
     const task = await requestPositionAdvice(
-      target ? { position_id: target.id, symbol: target.symbol } : {},
+      target ? { position_id: target.id, symbol: target.symbol, account_id: target.account_id || accountId.value } : { account_id: accountId.value },
     )
     await resolveAdviceTask(task, ctrl)
+    if (!owner() || ctrl.signal.aborted || adviceAbort !== ctrl) return
     await nextTick()
+    if (!owner() || ctrl.signal.aborted || adviceAbort !== ctrl) return
     document.getElementById('position-advice-panel')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   } catch (e) {
-    if (isAbortError(e) || (e as Error).name === 'PollCancelled') return
+    if (!owner() || ctrl.signal.aborted || adviceAbort !== ctrl || isAbortError(e) || (e as Error).name === 'PollCancelled') return
     adviceError.value = (e as Error).message
   } finally {
-    if (adviceAbort === ctrl) {
+    if (owner() && adviceAbort === ctrl) {
       adviceLoading.value = false
       adviceTargetPositionID.value = null
     }
@@ -981,6 +1148,8 @@ async function resolveAdviceTask(
   ctrl: AbortController,
   expectedRouteTaskID: number | null = null,
 ) {
+  const owner = captureOwner()
+  if (!owner() || ctrl.signal.aborted || adviceAbort !== ctrl) return
   if (initial.kind !== 'position_advice') throw new Error('该任务不是持仓建议任务，无法在此页面打开')
   const final =
     initial.status === 'processing'
@@ -990,7 +1159,7 @@ async function resolveAdviceTask(
           { signal: ctrl.signal },
         )
       : initial
-  if (expectedRouteTaskID !== null && routeTaskID() !== expectedRouteTaskID) return
+  if (!owner() || ctrl.signal.aborted || adviceAbort !== ctrl || (expectedRouteTaskID !== null && routeTaskID() !== expectedRouteTaskID)) return
   if (final.kind !== 'position_advice') throw new Error('该任务不是持仓建议任务，无法在此页面打开')
   if (final.status !== 'success' || !final.result) {
     const detail = final.error || 'AI 建议生成失败'
@@ -1002,12 +1171,14 @@ async function resolveAdviceTask(
 function routeTaskID(): number | null {
   const raw = Array.isArray(route.query.task_id) ? route.query.task_id[0] : route.query.task_id
   const id = Number(raw)
-  return Number.isInteger(id) && id > 0 ? id : null
+  return Number.isSafeInteger(id) && id > 0 ? id : null
 }
 
 let restoredAdviceTaskID: number | null = null
 let restoringAdviceTaskID: number | null = null
 async function restoreRouteAdvice(): Promise<boolean> {
+  if (!pageActive()) return false
+  const owner = captureOwner()
   const id = routeTaskID()
   if (!id) {
     restoredAdviceTaskID = null
@@ -1025,15 +1196,15 @@ async function restoreRouteAdvice(): Promise<boolean> {
   adviceError.value = ''
   try {
     const task = await getLLMTask<PositionAdviceResult>(id)
-    if (routeTaskID() !== id) return true
-    restoredAdviceTaskID = id
+    if (!owner() || routeTaskID() !== id) return true
     await resolveAdviceTask(task, ctrl, id)
+    if (owner() && !ctrl.signal.aborted && adviceAbort === ctrl && routeTaskID() === id) restoredAdviceTaskID = id
   } catch (e) {
-    if (isAbortError(e) || (e as Error).name === 'PollCancelled') return true
+    if (!owner() || ctrl.signal.aborted || adviceAbort !== ctrl || isAbortError(e) || (e as Error).name === 'PollCancelled') return true
     if (routeTaskID() === id) adviceError.value = (e as Error).message || '持仓建议任务状态读取失败'
   } finally {
     if (restoringAdviceTaskID === id) restoringAdviceTaskID = null
-    if (adviceAbort === ctrl) {
+    if (owner() && adviceAbort === ctrl) {
       adviceAbort = null
       adviceLoading.value = false
     }
@@ -1052,6 +1223,8 @@ const adviceGeneratedAt = computed(() => {
 })
 
 async function loadCurve() {
+  if (!accountId.value || !pageActive()) return
+  const owner = captureOwner()
   curveAbort?.abort()
   const myAbort = new AbortController()
   curveAbort = myAbort
@@ -1061,24 +1234,32 @@ async function loadCurve() {
   curveLoading.value = true
   curveError.value = ''
   try {
-    const data = await getPositionCurve(requestedDays, myAbort.signal)
-    if (mySeq !== curveSeq) return
+    const data = await getPositionCurve(requestedDays, myAbort.signal, accountId.value)
+    if (!owner() || mySeq !== curveSeq) return
     curve.value = data
     await nextTick()
+    if (!owner() || mySeq !== curveSeq) return
     renderCurve()
   } catch (e) {
-    if (mySeq !== curveSeq || isAbortError(e)) return
+    if (!owner() || mySeq !== curveSeq || isAbortError(e)) return
     curve.value = null
     curveError.value = (e as Error).message
     curveChart?.dispose()
     curveChart = null
   } finally {
-    if (mySeq === curveSeq) curveLoading.value = false
+    if (owner() && mySeq === curveSeq) curveLoading.value = false
   }
 }
 watch(curveDays, () => loadCurve())
+watch(accountId, (id) => {
+  if (!id) return
+  void loadCurve()
+  void loadCorpAdjusts()
+  if (mainTab.value === 'review') void loadStats()
+}, { immediate: true })
 
 function renderCurve() {
+  if (!pageActive()) return
   const c = curve.value
   if (!curveEl.value || !c?.points.length) {
     curveChart?.dispose()
@@ -1098,9 +1279,9 @@ function renderCurve() {
       formatter: (ps: { axisValue: string; seriesName: string; value: number; dataIndex: number }[]) => {
         if (!ps.length) return ''
         const p = c.points[ps[0].dataIndex]
-        const lines = ps.map((s) => `${s.seriesName} ${fmtMoney(s.value)}`)
-        if (p?.partial) lines.push(`⚠ ${p.note || '当日部分标的无有效行情，非完整净值'}`)
-        return `${ps[0].axisValue}<br/>${lines.join('<br/>')}`
+        const lines = ps.map((s) => `${echarts.format.encodeHTML(s.seriesName)} ${fmtMoney(s.value)}`)
+        if (p?.partial) lines.push(`⚠ ${echarts.format.encodeHTML(p.note || '当日部分标的无有效行情，非完整净值')}`)
+        return `${echarts.format.encodeHTML(ps[0].axisValue)}<br/>${lines.join('<br/>')}`
       },
     },
     legend: {
@@ -1117,9 +1298,9 @@ function renderCurve() {
       {
         name: '持仓市值',
         type: 'line',
-        data: c.points.map((p) => p.market_value),
+        data: c.points.map((p) => p.partial ? null : p.market_value),
         symbol: 'circle',
-        // partial 点用空心大点标出：那天有标的没有有效行情，不是完整净值。
+        // 不完整快照保留缺口，不能把缺价或币种不明的点连成完整净值。
         symbolSize: (_v: number, params: { dataIndex: number }) => (c.points[params.dataIndex]?.partial ? 8 : 3),
         itemStyle: {
           color: (params: { dataIndex: number }) => (c.points[params.dataIndex]?.partial ? warn : primary),
@@ -1130,7 +1311,7 @@ function renderCurve() {
       {
         name: '累计已实现',
         type: 'line',
-        data: c.points.map((p) => p.realized_cum),
+        data: c.points.map((p) => p.partial ? null : p.realized_cum),
         symbol: 'none',
         lineStyle: { width: 1.5, type: 'dashed', color: warn },
         itemStyle: { color: warn },
@@ -1152,8 +1333,50 @@ watch([isDark, vars], () => {
 const highlightedPositionID = ref<number | null>(null)
 const focusedAssessment = ref<PositionExitAssessment | null>(null)
 const focusedAssessmentError = ref('')
+const stockActionError = ref('')
 let lastConsumedStockAction = ''
 let activeStockAction = ''
+let focusedAssessmentSeq = 0
+
+watch(() => route.query.account_id, () => {
+  if (!pageActive()) return
+  const id = routeAccountID()
+  if (id != null && id === accountId.value) return
+  accountEpoch++
+  for (const controller of readControllers.values()) controller.abort()
+  readControllers.clear()
+  positionLoadSeq++
+  statsSeq++
+  tradesSeq++
+  curveSeq++
+  linkSeq++
+  focusedAssessmentSeq++
+  curveAbort?.abort()
+  corpAdjustAbort?.abort()
+  invalidateAdvice()
+  positions.value = []
+  overview.value = null
+  loadedStatus = null
+  stats.value = null
+  curve.value = null
+  corpAdjusts.value = []
+  tradesById.value = {}
+  tradesErrorById.value = {}
+  expandedTrades.value = null
+  highlightedPositionID.value = null
+  focusedAssessment.value = null
+  focusedAssessmentError.value = ''
+  stockActionError.value = ''
+  editModal.value = closeModal.value = tradeModal.value = importModal.value = false
+  submitting.value = closingSubmit.value = tradeSubmitting.value = linkSaving.value = false
+  loading.value = statsLoading.value = tradesLoading.value = curveLoading.value = corpAdjustLoading.value = false
+  removing.value.clear()
+  corpAdjustActing.value = revertingTrade.value = null
+  lastConsumedStockAction = ''
+  restoredAdviceTaskID = restoringAdviceTaskID = null
+  accountId.value = id ?? undefined
+  void load()
+})
 
 const expandedTradeID = computed<number>({
   get: () => expandedTrades.value || 0,
@@ -1189,17 +1412,19 @@ watch(typeFilter, () => void restoreExpandedTrade())
 watch(expandedTrades, () => void restoreExpandedTrade())
 
 function stockActionKey() {
+  if (!pageActive()) return ''
   if (route.query.import === '1') return 'import'
   const positionID = Number(route.query.position_id)
-  if (Number.isInteger(positionID) && positionID > 0) {
+  if (Number.isSafeInteger(positionID) && positionID > 0) {
     const assessmentID = Number(route.query.assessment_id)
-    return Number.isInteger(assessmentID) && assessmentID > 0
-      ? `position:${positionID}:assessment:${assessmentID}`
-      : `position:${positionID}`
+    const base = `account:${route.query.account_id || ''}:position:${positionID}`
+    return Number.isSafeInteger(assessmentID) && assessmentID > 0
+      ? `${base}:assessment:${assessmentID}`
+      : base
   }
   const symbol = String(route.query.symbol || '').trim()
   if (!symbol && route.query.add !== '1') return ''
-  return String(route.query._stock_action || '') || [symbol, route.query.market || 'cn', route.query.add || '', route.query.quantity || ''].join(':')
+  return String(route.query._stock_action || '') || [symbol, route.query.market || 'cn', route.query.add || '', route.query.quantity || '', route.query.rec_id || ''].join(':')
 }
 
 function routeSuggestedQuantity(): number | undefined {
@@ -1219,30 +1444,42 @@ function positionElementID(id: number) {
 
 function assessmentRouteID() {
   const value = Number(route.query.assessment_id)
-  return Number.isInteger(value) && value > 0 ? value : null
+  return Number.isSafeInteger(value) && value > 0 ? value : null
 }
 
 async function loadFocusedAssessment(positionID: number) {
+  if (!pageActive()) return
+  const read = beginRead('assessment')
+  const seq = ++focusedAssessmentSeq
   const assessmentID = assessmentRouteID()
   focusedAssessment.value = null
   focusedAssessmentError.value = ''
   if (!assessmentID) return
   try {
-    focusedAssessment.value = await getPositionExitAssessment(positionID, assessmentID)
+    const assessment = await getPositionExitAssessment(positionID, assessmentID, read.signal)
+    if (!read.active() || seq !== focusedAssessmentSeq) return
+    focusedAssessment.value = assessment
   } catch (error) {
+    if (!read.active() || seq !== focusedAssessmentSeq || isAbortError(error)) return
     focusedAssessmentError.value = (error as Error).message || '通知对应的卖出风险评估读取失败'
   }
 }
 
 async function applyStockActionQuery(): Promise<boolean> {
+  if (!pageActive()) return false
+  const owner = captureOwner()
+  const requestedTab = mainTab.value
   const actionKey = stockActionKey()
   if (!actionKey || actionKey === lastConsumedStockAction || actionKey === activeStockAction) return false
 
   activeStockAction = actionKey
+  stockActionError.value = ''
+  highlightedPositionID.value = null
   try {
     if (route.query.import === '1') {
       lastConsumedStockAction = actionKey
-      openImport()
+      await openImport()
+      if (!owner()) return true
       await router.replace({ name: 'positions', query: stockRouteRemainder() })
       return false
     }
@@ -1265,12 +1502,12 @@ async function applyStockActionQuery(): Promise<boolean> {
     typeFilter.value = 'all'
     suspendStatusReload = false
     await load()
-    if (loadError.value || stockActionKey() !== actionKey) return true
+    if (!owner() || loadError.value || stockActionKey() !== actionKey) return true
 
     const requestedPositionID = Number(route.query.position_id)
     const symbol = String(route.query.symbol || '').trim().toLowerCase()
     const market = String(route.query.market || 'cn').trim().toLowerCase()
-    const target = Number.isInteger(requestedPositionID) && requestedPositionID > 0
+    const target = Number.isSafeInteger(requestedPositionID) && requestedPositionID > 0
       ? positions.value.find((position) => position.id === requestedPositionID)
       : positions.value.find(
           (position) =>
@@ -1281,7 +1518,7 @@ async function applyStockActionQuery(): Promise<boolean> {
     lastConsumedStockAction = actionKey
     if (target) {
       highlightedPositionID.value = target.id
-      if (assessmentRouteID()) {
+      if (assessmentRouteID() || (requestedTab === 'needs_action' && target.exit_assessment)) {
         mainTab.value = 'needs_action'
         await loadFocusedAssessment(target.id)
       } else {
@@ -1289,11 +1526,12 @@ async function applyStockActionQuery(): Promise<boolean> {
         focusedAssessment.value = null
       }
       await nextTick()
+      if (!owner() || stockActionKey() !== actionKey) return true
       document.getElementById(positionElementID(target.id))?.scrollIntoView({
         behavior: 'smooth',
         block: 'center',
       })
-    } else if (!(Number.isInteger(requestedPositionID) && requestedPositionID > 0)) {
+    } else if (!(Number.isSafeInteger(requestedPositionID) && requestedPositionID > 0)) {
       highlightedPositionID.value = null
       openCreate({
         symbol: String(route.query.symbol || ''),
@@ -1302,7 +1540,10 @@ async function applyStockActionQuery(): Promise<boolean> {
         recId: Number(route.query.rec_id) || 0,
         quantity: routeSuggestedQuantity(),
       })
+    } else {
+      stockActionError.value = '在当前账户中没有找到这笔持仓，请核对账户或持仓是否已删除。'
     }
+    if (!owner()) return true
     await router.replace({ name: 'positions', query: stockRouteRemainder() })
     return true
   } finally {
@@ -1311,22 +1552,37 @@ async function applyStockActionQuery(): Promise<boolean> {
 }
 
 watch(
-  () => [route.query._stock_action, route.query.position_id, route.query.assessment_id],
-  () => void applyStockActionQuery(),
+  () => stockActionKey(),
+  (key) => {
+    focusedAssessmentSeq++
+    if (!key) {
+      lastConsumedStockAction = ''
+      return
+    }
+    void applyStockActionQuery()
+  },
 )
 
 onMounted(async () => {
+  const owner = captureOwner()
+  window.addEventListener('resize', onResize)
   const hasExplicitTask = routeTaskID() !== null
   const hadStockAction = !!stockActionKey()
   // 股票动作先核对当前持仓：已有记录定位高亮，否则预填建仓；rec_id 保留推荐血缘。
-  if (!(await applyStockActionQuery())) await load()
-  await Promise.all([loadCurve(), loadCorpAdjusts()])
+  const handled = await applyStockActionQuery()
+  if (!owner()) return
+  if (!handled || !overview.value) await load()
+  if (!owner()) return
   if (mainTab.value === 'review' && !stats.value) await loadStats()
   if (hasExplicitTask) void restoreRouteAdvice()
-  window.addEventListener('resize', onResize)
   if (!hadStockAction) await restoreScroll()
 })
 onBeforeUnmount(() => {
+  disposed = true
+  for (const controller of readControllers.values()) controller.abort()
+  readControllers.clear()
+  linkSeq++
+  focusedAssessmentSeq++
   window.removeEventListener('resize', onResize)
   positionLoadSeq++
   statsSeq++
@@ -1346,7 +1602,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <PageContainer title="持仓卖出决策中心" subtitle="先处理风险，再管理账本与复盘">
+  <PageContainer title="持仓卖出决策中心" :subtitle="`${overview?.account_name ? overview.account_name + ' · ' : ''}先处理风险，再管理账本与复盘`">
     <template v-if="mainTab !== 'risk'" #actions>
       <n-button size="small" type="primary" @click="openCreate()">+ 新建持仓</n-button>
       <n-button size="small" quaternary @click="openImport">导入</n-button>
@@ -1357,34 +1613,34 @@ onBeforeUnmount(() => {
       <!-- 汇总（组合总览：全组合口径） -->
       <n-grid v-if="mainTab === 'all'" cols="2 s:4" :x-gap="14" :y-gap="14" responsive="screen">
         <n-gi>
-          <StatCard label="持仓成本" :value="overview ? fmtMoney(overview.total_cost) : '—'" />
+          <StatCard label="持仓成本（CNY）" :value="overview && !overview.currency_unavailable_reason ? fmtMoney(overview.total_cost) : '—'" />
         </n-gi>
         <n-gi>
           <StatCard
             label="当前市值"
-            :value="overview ? fmtMoney(overview.total_value) : '—'"
+            :value="overview && !overview.currency_unavailable_reason && !overview.valuation_unavailable_reason ? fmtMoney(overview.total_value) : '—'"
             :sub="pricedLabel"
           />
         </n-gi>
         <n-gi>
           <StatCard
             label="浮动盈亏"
-            :value="overview ? fmtMoney(overview.total_profit) : '—'"
-            :change-pct="overview ? overview.profit_pct : undefined"
+            :value="overview && !overview.currency_unavailable_reason && !overview.valuation_unavailable_reason ? fmtMoney(overview.total_profit) : '—'"
+            :change-pct="overview && !overview.currency_unavailable_reason && !overview.valuation_unavailable_reason ? overview.profit_pct : undefined"
           />
         </n-gi>
         <n-gi>
           <StatCard
             label="已实现盈亏"
-            :value="overview ? fmtMoney(overview.realized_profit) : '—'"
-            :sub="overview ? '已平仓累计' : ''"
+            :value="overview && !overview.currency_unavailable_reason ? fmtMoney(overview.realized_profit) : '—'"
+            :sub="overview ? '含部分卖出与现金分红' : ''"
           />
         </n-gi>
         <n-gi>
           <StatCard
             label="持仓笔数"
             :value="overview ? String(overview.holding_count) : '—'"
-            :sub="overview ? `盈 ${overview.win_count} · 亏 ${overview.lose_count}` : ''"
+            :sub="overview?.currency_unavailable_reason || overview?.valuation_unavailable_reason ? '盈亏汇总不可用' : overview ? `盈 ${overview.win_count} · 亏 ${overview.lose_count}` : ''"
           />
         </n-gi>
         <n-gi>
@@ -1393,15 +1649,16 @@ onBeforeUnmount(() => {
         <n-gi>
           <StatCard
             label="最大持仓占比"
-            :value="overview?.top_weight_pct ? overview.top_weight_pct.toFixed(1) + '%' : '—'"
+            :value="overview?.top_weight_pct && !overview.valuation_unavailable_reason ? overview.top_weight_pct.toFixed(1) + '%' : '—'"
             :sub="overview?.top_name || overview?.top_symbol || ''"
           />
         </n-gi>
       </n-grid>
 
       <n-alert v-if="mainTab === 'all' && loadError" type="error" :bordered="false" title="持仓读取失败">
-        {{ loadError }}
+        {{ loadError }}<template v-if="positions.length">。以下保留最近取得的账本，行情与汇总待刷新。</template>
       </n-alert>
+      <n-alert v-if="stockActionError" type="warning" :bordered="false">{{ stockActionError }}</n-alert>
 
       <!-- 组合风控信号（集中度/止损/未分析） -->
       <n-alert v-if="mainTab === 'all' && overview?.signals?.length" type="warning" title="组合风控信号">
@@ -1529,13 +1786,14 @@ onBeforeUnmount(() => {
                             >{{ typeLabel(p.position_type) }}</n-tag
                           >
                           <StockIdentity :symbol="p.symbol" :market="p.market" :name="p.name" density="table" clickable actions />
+                          <n-tag v-if="p.currency && p.currency !== 'CNY'" size="tiny" :bordered="false">金额单位 {{ p.currency }}</n-tag>
                           <n-tag v-if="p.status === 'closed'" size="tiny" :bordered="false">已卖出</n-tag>
                           <n-tag
                             v-if="p.status === 'holding' && p.exit_assessment"
                             size="tiny"
                             :bordered="false"
                             :type="exitLevelType(p.exit_assessment.level)"
-                          >{{ exitLevelLabel[p.exit_assessment.level] }}</n-tag>
+                          >最近评估 · {{ exitLevelLabel[p.exit_assessment.level] }}</n-tag>
                           <n-tag v-if="p.below_stop_loss" size="tiny" type="error" :bordered="false">破止损</n-tag>
                           <n-tag v-else-if="p.near_stop_loss" size="tiny" type="warning" :bordered="false">近止损</n-tag>
                           <!-- 血缘可见性：有来源推荐才显示，无血缘不加徽章（避免每行都是噪音）。
@@ -1547,8 +1805,12 @@ onBeforeUnmount(() => {
                             type="info"
                             :bordered="false"
                             class="tag-click"
-                            :title="`来自推荐 #${p.rec_link.recommendation_id}（${p.rec_link.created_at.slice(0, 10)} · 参考价 ${p.rec_link.ref_price > 0 ? p.rec_link.ref_price.toFixed(2) : '未知'}），点击查看该批推荐`"
+                            :title="`来自推荐 #${p.rec_link.recommendation_id}（${p.rec_link.created_at.slice(0, 10)} · 参考价 ${p.rec_link.ref_price > 0 ? formatPrice(p.rec_link.ref_price) : '未知'}），点击查看该批推荐`"
                             @click="goRecommendationBatch(p.rec_link.batch_id)"
+                            role="button"
+                            tabindex="0"
+                            @keydown.enter="goRecommendationBatch(p.rec_link.batch_id)"
+                            @keydown.space.prevent="goRecommendationBatch(p.rec_link.batch_id)"
                           >来自推荐</n-tag>
                           <FreshnessTag
                             v-if="p.status === 'holding'"
@@ -1562,18 +1824,22 @@ onBeforeUnmount(() => {
                             :bordered="false"
                             class="tag-click"
                             title="点击发起个股分析"
+                            role="button"
+                            tabindex="0"
+                            @keydown.enter="goAnalysis(p)"
+                            @keydown.space.prevent="goAnalysis(p)"
                             @click="goAnalysis(p)"
                             >{{ staleLabel(p) }}</n-tag
                           >
                         </div>
                         <div class="r-sub">
                           <template v-if="p.status === 'closed'">
-                            累计买入 {{ p.total_buy_qty || p.quantity }} 股 · 均价 {{ fmt(p.buy_price) }}
+                            累计买入 {{ p.total_buy_qty || p.quantity }} 股 · 均价 {{ formatPrice(p.buy_price) }}
                           </template>
-                          <template v-else> 持有 {{ p.quantity }} 股 · 均价 {{ fmt(p.buy_price) }} </template>
+                          <template v-else> 持有 {{ p.quantity }} 股 · 均价 {{ formatPrice(p.buy_price) }} </template>
                           <span v-if="p.buy_date">· {{ p.buy_date }}</span>
                           <span v-if="p.status === 'holding' && p.held_trade_days > 0">· 持有 {{ p.held_trade_days }} 交易日</span>
-                          <span v-if="p.status === 'closed'"> · 末笔卖出 {{ fmt(p.sell_price) }}</span>
+                          <span v-if="p.status === 'closed'"> · 末笔卖出 {{ formatPrice(p.sell_price) }}</span>
                           <span v-if="p.status === 'holding' && p.realized_pnl" :style="{ color: pctColor(p.realized_pnl) }">
                             · 已兑现 {{ fmtMoney(p.realized_pnl) }}
                           </span>
@@ -1584,7 +1850,9 @@ onBeforeUnmount(() => {
                         <!-- D15 持仓期最高价与回撤：回答「我赚过多少、现在回吐了多少」。
                              峰值自建仓起算（买入日之前的高点不算），加仓后按新成本重新起算。 -->
                         <div v-if="p.status === 'holding' && p.peak" class="r-peak">
-                          持仓期最高 <span class="qv-tnum">{{ fmt(p.peak.price) }}</span>
+                          <span v-if="p.peak.data_quality === 'unverified_adjustment'">{{ p.peak.note }}</span>
+                          <template v-else>
+                          持仓期最高 <span class="qv-tnum">{{ formatPrice(p.peak.price) }}</span>
                           <span v-if="p.peak.date">（{{ p.peak.date }}）</span>
                           <template v-if="p.quote_ok && p.peak.drawdown_pct > 0">
                             · 已回撤
@@ -1595,6 +1863,7 @@ onBeforeUnmount(() => {
                           <span v-else-if="!p.quote_ok"> · 回撤未知（无当前有效行情）</span>
                           <span v-if="p.peak.from"> · 自 {{ p.peak.from }} 起算</span>
                           <span v-if="p.peak.backfilled" class="r-peak-note" :title="p.peak.note">（含日线回填）</span>
+                          </template>
                         </div>
                         <div
                           v-if="p.status === 'holding' && p.exit_assessment"
@@ -1604,14 +1873,15 @@ onBeforeUnmount(() => {
                           <div class="exit-assessment-head">
                             <span class="exit-reason">{{ p.exit_assessment.primary_reason }}</span>
                             <span class="exit-asof qv-tnum">
+                              最近评估 {{ p.exit_assessment.evaluated_at || '未知' }} ·
                               行情 {{ p.exit_assessment.quote_as_of || '未知' }} · 日线
                               {{ p.exit_assessment.bars_as_of || '未知' }}
                             </span>
                           </div>
-                          <div v-if="p.exit_assessment.evidence.length" class="exit-evidence">
+                          <div v-if="p.exit_assessment.evidence?.length" class="exit-evidence">
                             <span v-for="(item, index) in p.exit_assessment.evidence" :key="index">{{ item }}</span>
                           </div>
-                          <div v-if="p.exit_assessment.data_gaps.length" class="exit-gaps">
+                          <div v-if="p.exit_assessment.data_gaps?.length" class="exit-gaps">
                             {{ p.exit_assessment.data_gaps.join('；') }}
                           </div>
                           <div class="exit-action">
@@ -1638,12 +1908,12 @@ onBeforeUnmount(() => {
                       <div class="r-figures">
                         <div class="r-fig">
                           <span class="r-fig-label">{{ p.status === 'closed' ? '卖出价' : '现价' }}</span>
-                          <span class="r-fig-val qv-tnum">{{ p.quote_ok ? fmt(p.current_price) : '—' }}</span>
+                          <span class="r-fig-val qv-tnum">{{ p.quote_ok ? formatPrice(p.current_price) : '—' }}</span>
                           <span
                             v-if="!p.quote_ok && p.status === 'holding' && p.last_price"
                             class="r-fig-stale qv-tnum"
                             :title="`最近已知价（截至 ${p.quote_as_of || '未知'}，已过期，不代表当前价格）`"
-                            >旧 {{ fmt(p.last_price) }}</span
+                            >旧 {{ formatPrice(p.last_price) }}</span
                           >
                         </div>
                         <div class="r-fig">
@@ -1679,7 +1949,7 @@ onBeforeUnmount(() => {
                         <n-button size="tiny" quaternary @click="openEdit(p)">编辑</n-button>
                         <n-popconfirm @positive-click="remove(p)">
                           <template #trigger>
-                            <n-button size="tiny" quaternary type="error">删除</n-button>
+                            <n-button size="tiny" quaternary type="error" :loading="removing.has(p.id)">删除</n-button>
                           </template>
                           删除持仓「{{ p.name || '名称待补全' }}（{{ p.symbol }}）」？流水明细一并删除。
                         </n-popconfirm>
@@ -1723,7 +1993,7 @@ onBeforeUnmount(() => {
                               <td>
                                 <span :style="{ color: sideColor(t.side) }">{{ sideLabel(t.side) }}</span>
                               </td>
-                              <td class="ta-r">{{ t.side === 'adjust' ? '—' : fmt(t.price) }}</td>
+                              <td class="ta-r">{{ t.side === 'adjust' ? '—' : formatPrice(t.price) }}</td>
                               <td
                                 class="ta-r"
                                 :title="t.side === 'adjust' ? '除权折算导致的持仓数量变化，不是一次买卖' : ''"
@@ -1746,15 +2016,15 @@ onBeforeUnmount(() => {
                                 {{ t.side === 'buy' || (t.side === 'adjust' && !t.realized_pnl) ? '—' : fmtMoney(t.realized_pnl) }}
                               </td>
                               <td class="ta-r">{{ t.quantity_after }}</td>
-                              <td class="ta-r">{{ fmt(t.avg_cost_after) }}</td>
+                              <td class="ta-r">{{ formatPrice(t.avg_cost_after) }}</td>
                               <td class="t-note">
                                 {{ t.note || '—' }}
                                 <n-tag v-if="t.backfilled" size="tiny" :bordered="false" title="旧持仓惰性补建的等价记录，非用户录入">补建</n-tag>
-                                <n-popconfirm v-if="t.side === 'adjust' && t.adjust_id" @positive-click="revertAdjustTrade(t, p.id)">
+                                <n-popconfirm v-if="t.side === 'adjust' && t.adjust_id" @positive-click="revertAdjustTrade(t)">
                                   <template #trigger>
                                     <n-button size="tiny" quaternary :loading="revertingTrade === t.id">撤销折算</n-button>
                                   </template>
-                                  撤销后数量与成本回滚到折算前（{{ t.quantity_before }} 股 / {{ fmt(t.avg_cost_before || 0) }}
+                                  撤销后数量与成本回滚到折算前（{{ t.quantity_before }} 股 / {{ formatPrice(t.avg_cost_before) }}
                                   元）。若此后已有新交易，后端会拒绝撤销。
                                 </n-popconfirm>
                               </td>
@@ -1779,12 +2049,13 @@ onBeforeUnmount(() => {
               <n-alert v-if="adviceError" type="error" :bordered="false" title="AI 建议生成失败">
                 {{ adviceError }}
               </n-alert>
-              <div v-else-if="!advice" class="advice-empty">
+              <div v-if="!advice && !adviceError" class="advice-empty">
                 针对<b>每一笔持仓</b>给出「继续持有 / 减仓 / 清仓」的结论、理由与失效条件。
                 成本、浮动盈亏、持有交易日、自最高点回撤等数值由服务端算好后喂给模型，模型只做判断不做算术；
                 无当前有效行情的持仓不参与（不基于旧价给出割/守/补结论）。
               </div>
-              <div v-else class="advice-box">
+              <div v-if="advice" class="advice-box">
+                <div v-if="adviceLoading || adviceError" class="advice-note">以下保留上次建议，可对照生成时间查看。</div>
                 <div v-for="(n, i) in advice.notes || []" :key="i" class="advice-note">{{ n }}</div>
                 <div class="advice-list">
                   <div v-for="a in advice.advices" :key="a.position_id" class="advice-row">
@@ -1794,7 +2065,7 @@ onBeforeUnmount(() => {
                       }}</n-tag>
                       <StockIdentity :symbol="a.symbol" market="cn" :name="a.name" density="table" clickable />
                       <span class="advice-position qv-tnum">
-                        {{ advicePositionType(a.position_type) }} · 成本 {{ a.cost.toFixed(2) }} · {{ a.quantity }} 股
+                        {{ advicePositionType(a.position_type) }} · 成本 {{ formatPrice(a.cost) }} · {{ a.quantity }} 股
                       </span>
                     </div>
                     <div class="advice-reason">{{ a.reason }}</div>
@@ -1905,8 +2176,8 @@ onBeforeUnmount(() => {
                   <n-gi>
                     <StatCard
                       label="平均持有"
-                      :value="stats.hold_sample ? stats.avg_hold_trade_days.toFixed(1) + ' 交易日' : '—'"
-                      :sub="`${stats.hold_sample}/${stats.closed} 笔可计算`"
+                      :value="stats.hold_sample ? stats.avg_hold_trade_days.toFixed(1) : '—'"
+                      :sub="`交易日 · ${stats.hold_sample}/${stats.closed} 笔可计算`"
                     />
                   </n-gi>
                 </n-grid>
@@ -1991,11 +2262,16 @@ onBeforeUnmount(() => {
     <!-- 建仓 / 编辑 -->
     <n-modal
       v-model:show="editModal"
+      class="position-modal"
+      :style="styleVars"
       preset="card"
       :title="editing ? '编辑持仓' : '新建持仓'"
       style="max-width: 520px"
+      :mask-closable="!submitting && !linkSaving"
+      :close-on-esc="!submitting && !linkSaving"
+      :closable="!submitting && !linkSaving"
     >
-      <n-form label-placement="top">
+      <n-form label-placement="top" :disabled="submitting || linkSaving">
         <n-alert v-if="editingClosed" type="info" :bordered="false" style="margin-bottom: 14px">
           已平仓持仓仅可修改「买入理由」与「备注」，其余成交数据不可再更改。
         </n-alert>
@@ -2026,7 +2302,7 @@ onBeforeUnmount(() => {
             </n-gi>
             <n-gi>
               <n-form-item label="数量">
-                <n-input-number v-model:value="form.quantity" :min="0" style="width: 100%" />
+                <n-input-number v-model:value="form.quantity" :min="0" :precision="4" style="width: 100%" />
               </n-form-item>
             </n-gi>
             <n-gi>
@@ -2069,14 +2345,18 @@ onBeforeUnmount(() => {
               v-model:value="linkSelected"
               :options="linkOptions"
               :loading="linkLoading"
-              :disabled="linkSaving"
+              :disabled="linkSaving || linkLoading || submitting"
               size="small"
             />
             <div class="link-actions">
-              <n-button size="tiny" type="primary" secondary :disabled="!linkDirty" :loading="linkSaving" @click="saveLink">
+              <n-button size="tiny" type="primary" secondary :disabled="!linkDirty || linkLoading || submitting" :loading="linkSaving" @click="saveLink">
                 保存关联
               </n-button>
-              <span v-if="!linkCandidates.length && !linkLoading" class="link-hint">
+              <span v-if="linkError" class="link-hint">
+                推荐候选读取失败：{{ linkError }}
+                <n-button v-if="linkTarget" size="tiny" quaternary @click="openLinkEditor(linkTarget)">重试</n-button>
+              </span>
+              <span v-else-if="!linkCandidates.length && !linkLoading" class="link-hint">
                 近 90 天没有该股票的推荐记录，无可关联项。
               </span>
               <span v-else class="link-hint">
@@ -2104,10 +2384,11 @@ onBeforeUnmount(() => {
             <span>投入 {{ riskCalc.cost.toFixed(0) }} 元</span>
             <template v-if="riskCalc.maxLoss != null">
               <span :style="{ color: vars.errorColor }">
-                触发止损亏 {{ riskCalc.maxLoss.toFixed(0) }} 元（-{{ riskCalc.maxLossPct!.toFixed(1) }}%）
+                按止损价估算亏 {{ riskCalc.maxLoss.toFixed(0) }} 元（-{{ riskCalc.maxLossPct!.toFixed(1) }}%）
               </span>
             </template>
-            <span v-else class="risk-hint">填写止损价即可预估最大亏损</span>
+            <span v-else class="risk-hint">填写止损价即可估算亏损</span>
+            <span class="risk-hint">未计卖出费税与滑点，实际亏损可能更高。</span>
             <span v-if="riskCalc.gain != null && riskCalc.maxLoss" >
               盈亏比 {{ (riskCalc.gain / riskCalc.maxLoss).toFixed(1) }}
             </span>
@@ -2120,7 +2401,7 @@ onBeforeUnmount(() => {
               <span class="risk-hint">勾选状态会随持仓保存，卖出复盘时对照</span>
             </div>
             <label v-for="(text, i) in CHECKLIST" :key="i" class="check-item">
-              <input v-model="checklist[i]" type="checkbox" />
+              <input v-model="checklist[i]" type="checkbox" :disabled="submitting || linkSaving" />
               <span>{{ text }}</span>
             </label>
           </div>
@@ -2128,8 +2409,8 @@ onBeforeUnmount(() => {
       </n-form>
       <template #footer>
         <div class="modal-footer">
-          <n-button @click="editModal = false">取消</n-button>
-          <n-button type="primary" :loading="submitting" @click="submit">保存</n-button>
+          <n-button :disabled="submitting || linkSaving" @click="editModal = false">取消</n-button>
+          <n-button type="primary" :loading="submitting" :disabled="linkSaving" @click="submit">保存</n-button>
         </div>
       </template>
     </n-modal>
@@ -2137,11 +2418,16 @@ onBeforeUnmount(() => {
     <!-- 平仓 -->
     <n-modal
       v-model:show="closeModal"
+      class="position-modal"
+      :style="styleVars"
       preset="card"
       :title="`卖出 · ${closing?.name || '名称待补全'}${closing?.symbol ? `（${closing.symbol}）` : ''}`"
       style="max-width: 480px"
+      :mask-closable="!closingSubmit"
+      :close-on-esc="!closingSubmit"
+      :closable="!closingSubmit"
     >
-      <n-form label-placement="top">
+      <n-form label-placement="top" :disabled="closingSubmit">
         <n-grid cols="1 s:3" responsive="screen" :x-gap="12" :y-gap="12">
           <n-gi>
             <n-form-item label="卖出价">
@@ -2203,7 +2489,7 @@ onBeforeUnmount(() => {
       </n-form>
       <template #footer>
         <div class="modal-footer">
-          <n-button @click="closeModal = false">取消</n-button>
+          <n-button :disabled="closingSubmit" @click="closeModal = false">取消</n-button>
           <n-button type="primary" :loading="closingSubmit" @click="submitClose">确认卖出</n-button>
         </div>
       </template>
@@ -2212,14 +2498,19 @@ onBeforeUnmount(() => {
     <!-- B5 加仓 / 减仓 -->
     <n-modal
       v-model:show="tradeModal"
+      class="position-modal"
+      :style="styleVars"
       preset="card"
       :title="`${tradeForm.side === 'buy' ? '加仓' : '减仓'} · ${tradeTarget?.name || '名称待补全'}${tradeTarget?.symbol ? `（${tradeTarget.symbol}）` : ''}`"
       style="max-width: 500px"
+      :mask-closable="!tradeSubmitting"
+      :close-on-esc="!tradeSubmitting"
+      :closable="!tradeSubmitting"
     >
-      <n-form label-placement="top">
+      <n-form label-placement="top" :disabled="tradeSubmitting">
         <div v-if="tradeTarget" class="trade-tip">
           当前持有 <b class="qv-tnum">{{ tradeTarget.quantity }}</b> 股 · 加权成本
-          <b class="qv-tnum">{{ fmt(tradeTarget.buy_price) }}</b>
+          <b class="qv-tnum">{{ formatPrice(tradeTarget.buy_price) }}</b>
           <span v-if="tradeForm.side === 'buy'">；加仓后成本按 (原成本×原数量 + 本次价×本次数量) / 新数量 重算</span>
           <span v-else>；减仓按当前加权成本结转已实现盈亏，卖出数量不能超过持仓</span>
         </div>
@@ -2237,7 +2528,7 @@ onBeforeUnmount(() => {
           </n-gi>
           <n-gi>
             <n-form-item label="数量">
-              <n-input-number v-model:value="tradeForm.quantity" :min="0" style="width: 100%" />
+              <n-input-number v-model:value="tradeForm.quantity" :min="0" :precision="4" style="width: 100%" />
             </n-form-item>
           </n-gi>
           <n-gi>
@@ -2298,7 +2589,7 @@ onBeforeUnmount(() => {
       </n-form>
       <template #footer>
         <div class="modal-footer">
-          <n-button @click="tradeModal = false">取消</n-button>
+          <n-button :disabled="tradeSubmitting" @click="tradeModal = false">取消</n-button>
           <n-button type="primary" :loading="tradeSubmitting" @click="submitTrade">确认</n-button>
         </div>
       </template>
@@ -2307,6 +2598,7 @@ onBeforeUnmount(() => {
     <DataImportWizard
       v-model:show="importModal"
       initial-kind="position"
+      :account-id="accountId"
       @confirmed="onImportChanged"
       @rolled-back="onImportChanged"
     />
@@ -2338,9 +2630,10 @@ onBeforeUnmount(() => {
   flex-direction: column;
 }
 .row {
-  display: flex;
-  align-items: center;
-  gap: 16px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px 16px;
   padding: 12px 4px;
   border-bottom: 1px solid var(--qv-divider);
   flex-wrap: wrap;
@@ -2349,8 +2642,8 @@ onBeforeUnmount(() => {
   border-bottom: none;
 }
 .r-name {
-  flex: 1;
-  min-width: 180px;
+  grid-column: 1 / -1;
+  min-width: 0;
 }
 .r-title-line {
   display: flex;
@@ -2376,6 +2669,10 @@ onBeforeUnmount(() => {
 }
 .tag-click {
   cursor: pointer;
+}
+.tag-click:focus-visible {
+  outline: 2px solid var(--qv-action-target-line);
+  outline-offset: 3px;
 }
 /* 关联推荐编辑器：下拉 + 独立保存按钮（本项不随表单提交，见模板注释） */
 .link-editor {
@@ -2427,6 +2724,8 @@ onBeforeUnmount(() => {
 .r-actions {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
   gap: 4px;
   flex-wrap: wrap;
 }
@@ -2443,6 +2742,7 @@ onBeforeUnmount(() => {
     box-sizing: border-box;
   }
   .row {
+    grid-template-columns: minmax(0, 1fr);
     align-items: stretch;
     gap: 10px;
   }
@@ -2489,6 +2789,16 @@ onBeforeUnmount(() => {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+/* preset="card" 的卡片由 NModal 内部创建，不带页面的 scoped 属性。 */
+:global(.position-modal) {
+  width: calc(100vw - 24px);
+  max-height: calc(100dvh - 32px);
+}
+:global(.position-modal > .n-card-content) {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .risk-calc {
   display: flex;
@@ -2842,8 +3152,10 @@ onBeforeUnmount(() => {
   align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
+  flex-wrap: wrap;
 }
 .exit-reason {
+  flex: 1 1 240px;
   min-width: 0;
   font-size: 13px;
   line-height: 1.55;
@@ -2856,7 +3168,9 @@ onBeforeUnmount(() => {
   opacity: 0.58;
 }
 .exit-asof {
-  flex-shrink: 0;
+  flex: 0 1 auto;
+  max-width: 100%;
+  overflow-wrap: anywhere;
   text-align: right;
 }
 .exit-evidence {
@@ -2900,6 +3214,9 @@ onBeforeUnmount(() => {
   }
   .exit-asof {
     text-align: left;
+  }
+  .exit-reason {
+    flex-basis: auto;
   }
   .exit-action :deep(.n-button) {
     align-self: flex-start;

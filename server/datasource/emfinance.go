@@ -59,6 +59,10 @@ type f10Resp struct {
 // TOTALOPERATEREVE(TZ)/PARENTNETPROFIT(TZ)/KCFJCXSYJLR(TZ)/ROEJQ/XSMLL/XSJLL/
 // ZCFZL/MGJYXJJE）。无数据返回 ErrNoData。
 func GetF10MainFinance(ctx context.Context, symbol string) ([]DcRow, error) {
+	symbol = strings.TrimSpace(symbol)
+	if !isSixDigitSymbol(symbol) {
+		return nil, ErrSymbolInvalid
+	}
 	v := url.Values{}
 	v.Set("type", "RPT_F10_FINANCE_MAINFINADATA")
 	v.Set("sty", "APP_F10_MAINFINADATA")
@@ -92,10 +96,10 @@ type EMStatementRow struct {
 	TotalLiabilities float64
 	TotalEquity      float64
 	// 利润表（lrb）
-	OperateIncome  float64 // 营业总收入
-	OperateCost    float64 // 营业成本
-	OperateProfit  float64 // 营业利润
-	RDExpense      float64 // 研发费用
+	OperateIncome float64 // 营业总收入
+	OperateCost   float64 // 营业成本
+	OperateProfit float64 // 营业利润
+	RDExpense     float64 // 研发费用
 	// 现金流量表（xjllb）
 	NetcashOperate float64 // 经营活动现金流净额
 	NetcashInvest  float64
@@ -110,6 +114,10 @@ const (
 // GetEMStatements 拉取某 A 股最近 8 期三大报表关键科目。
 // companyType 试探 4→3→2→1（通用/保险/券商/银行的模板不同，不匹配返回空 data）。
 func GetEMStatements(ctx context.Context, symbol string) ([]EMStatementRow, error) {
+	symbol = strings.TrimSpace(symbol)
+	if !isSixDigitSymbol(symbol) {
+		return nil, ErrSymbolInvalid
+	}
 	code := emwebCode(symbol)
 	dates, companyType, err := emStatementDates(ctx, code)
 	if err != nil {

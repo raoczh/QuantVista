@@ -29,6 +29,9 @@ func setupLLMConfigTest(t *testing.T) (*LLMService, int64) {
 	if err := common.DB.Exec("DELETE FROM llm_configs").Error; err != nil {
 		t.Fatalf("清理 LLM 配置失败: %v", err)
 	}
+	if err := common.DB.Create(&model.User{ID: 4201, Username: "llm-config-effort"}).Error; err != nil {
+		t.Fatal(err)
+	}
 	oldKey := common.EncryptionKey
 	common.EncryptionKey = "llm-effort-test-key"
 	t.Cleanup(func() {
@@ -200,7 +203,7 @@ func TestReasoningEffortRejectFallback(t *testing.T) {
 			if strings.Contains(last, "reasoning") {
 				t.Fatalf("重试请求不得再带思考参数: %s", last)
 			}
-			target := llmCapabilityTarget(0, "", srv.URL, "m", tc.endpoint)
+			target := reasoningCapabilityTarget(llmCapabilityTarget(0, "", srv.URL, "m", tc.endpoint), "max")
 			obs, ok := lookupLLMCapability(target, capReasoningEffort)
 			if !ok || obs.State != capUnsupported {
 				t.Fatalf("去参重试成功后应落 unsupported 观察: %+v ok=%v", obs, ok)
@@ -234,7 +237,7 @@ func TestReasoningEffortRejectNoObservationOnRetryFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("去参后仍 4xx 应报错")
 	}
-	if _, ok := lookupLLMCapability(llmCapabilityTarget(0, "", srv.URL, "m", ""), capReasoningEffort); ok {
+	if _, ok := lookupLLMCapability(reasoningCapabilityTarget(llmCapabilityTarget(0, "", srv.URL, "m", ""), "max"), capReasoningEffort); ok {
 		t.Fatal("重试仍失败不得落能力观察")
 	}
 }
@@ -247,7 +250,7 @@ func TestReasoningEffortCapabilityRouting(t *testing.T) {
 	t.Cleanup(resetLLMCapabilityStore)
 
 	srv, bodies := effortProbeUpstream(t, "", "")
-	target := llmCapabilityTarget(0, "", srv.URL, "m", "")
+	target := reasoningCapabilityTarget(llmCapabilityTarget(0, "", srv.URL, "m", ""), "max")
 	observeLLMCapability(target, capReasoningEffort, capUnsupported, "测试观察")
 
 	p := chatParams{BaseURL: srv.URL, APIKey: "k", Model: "m", ReasoningEffort: "max", MaxTokens: 256,
@@ -627,7 +630,7 @@ func TestTestConnectionEffortNote(t *testing.T) {
 		if len(*bodies) < 2 || strings.Contains((*bodies)[1], "reasoning") {
 			t.Fatalf("应去参重试: %v", *bodies)
 		}
-		obs, ok := lookupLLMCapability(llmCapabilityTarget(0, "gw", srv.URL, "m", ""), capReasoningEffort)
+		obs, ok := lookupLLMCapability(reasoningCapabilityTarget(llmCapabilityTarget(0, "gw", srv.URL, "m", ""), "max"), capReasoningEffort)
 		if !ok || obs.State != capUnsupported {
 			t.Fatalf("去参成功后应落观察: %+v ok=%v", obs, ok)
 		}

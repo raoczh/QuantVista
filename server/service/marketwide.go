@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,9 +73,10 @@ var (
 	// wideInitCancel 当前初始化任务的取消函数（暂停用）；与 wideInitRunning 同受 CAS 保护。
 	wideInitCancelMu sync.Mutex
 	wideInitCancel   context.CancelFunc
-	// rebaseInflight 除权重锚的进行中标记（key=market:symbol），防在线路径并发重复重拉。
-	rebaseInflight sync.Map
 )
+
+var errRebaseInProgress = errors.New("该标的正在写入日线或重锚，尚未完成，请稍后重试")
+var errBarBasisUnverified = errors.New("历史复权基准尚未完成核验")
 
 // ---------- 纯函数（单测锚点） ----------
 
@@ -127,18 +129,33 @@ func spotTradeDate(rows []datasource.SpotRow) (string, error) {
 	if maxTS <= 0 {
 		return "", errors.New("快照缺少行情时间戳（f124 口径漂移？）")
 	}
-	return time.Unix(maxTS, 0).Format("2006-01-02"), nil
+	date := time.Unix(maxTS, 0).Format("2006-01-02")
+	if date > time.Now().Format("2006-01-02") {
+		return "", errors.New("全市场快照日期晚于今天，拒绝写入日线与历史宇宙")
+	}
+	return date, nil
 }
 
 // ---------- 除权检测与全量重锚 ----------
 
 // detectAndRebase persistDailyBars 的检测钩子：DB 内与 fresh 重叠的日期采样比对 close，
 // 判定除权则全量重锚。返回 true 表示已重锚（调用方不必再写本窗）。
-// 重锚失败时返回 false 退回旧行为（本窗照写，至少最新窗口是新基准），并把 states
-// 置回 pending 交给初始化任务重试——那条路径拉全量 250 根，多点采样必能再次抓住断层。
-func (s *MarketService) detectAndRebase(ctx context.Context, market, symbol string, fresh []datasource.Bar) bool {
+// 重锚失败必须阻止本窗写入，不能留下半新半旧基准；状态置 pending 等待后续全量重试。
+func (s *MarketService) detectAndRebase(ctx context.Context, db *gorm.DB, market, symbol string, fresh []datasource.Bar) (bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	// 即使最近窗口价格恰好一致，旧新浪日线也不能靠局部覆盖洗掉来源后继续使用。
+	var unadjusted int64
+	if err := db.Model(&model.DailyBar{}).
+		Where("market = ? AND symbol = ? AND source = ?", market, symbol, "sina").Limit(1).Count(&unadjusted).Error; err != nil {
+		return false, err
+	}
+	if unadjusted > 0 {
+		if err := s.rebaseStockTx(ctx, db, market, symbol, fresh); err != nil {
+			return false, fmt.Errorf("%w，不复权历史尚未完整重建: %w", errBarBasisUnverified, err)
+		}
+		return true, nil
 	}
 	// 排除"今天"的根：当日 close 盘中持续变化（DB 里可能是早间价、fresh 是此刻价），
 	// 拿它比对会把盘中波动误判成除权。历史日的收盘值只有除权重锚才会变，才是可靠锚点。
@@ -150,13 +167,16 @@ func (s *MarketService) detectAndRebase(ctx context.Context, market, symbol stri
 		}
 	}
 	if len(dates) == 0 {
-		return false
+		return s.rebaseWithoutOverlap(ctx, db, market, symbol, fresh)
 	}
 	var rows []model.DailyBar
-	if err := common.DB.WithContext(ctx).Select("trade_date", "close").
+	if err := db.Select("trade_date", "close").
 		Where("symbol = ? AND market = ? AND trade_date IN ?", symbol, market, sampleDates(dates, rebaseSamplePoints)).
-		Find(&rows).Error; err != nil || len(rows) == 0 {
-		return false
+		Find(&rows).Error; err != nil {
+		return false, fmt.Errorf("核验历史复权基准失败: %w", err)
+	}
+	if len(rows) == 0 {
+		return s.rebaseWithoutOverlap(ctx, db, market, symbol, fresh)
 	}
 	dbClose := make(map[string]float64, len(rows))
 	for _, r := range rows {
@@ -164,19 +184,35 @@ func (s *MarketService) detectAndRebase(ctx context.Context, market, symbol stri
 	}
 	day, mismatch := closeMismatch(dbClose, fresh, rebaseTolerance)
 	if !mismatch {
-		return false
+		return false, nil
 	}
 	rebaseCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if err := s.rebaseStock(rebaseCtx, market, symbol, fresh); err != nil {
-		common.SysWarn("检测到除权 %s.%s（%s close 偏差）但重锚失败: %v；已标记待初始化任务重拉", market, symbol, day, err)
-		if ctx.Err() == nil {
-			s.markStatePending(ctx, market, symbol)
-		}
-		return false
+	if err := s.rebaseStockTx(rebaseCtx, db.WithContext(rebaseCtx), market, symbol, fresh); err != nil {
+		common.SysWarn("检测到除权 %s.%s（%s close 偏差）但重锚尚未完成，已拒绝局部覆盖: %v", market, symbol, day, err)
+		return false, fmt.Errorf("%w，复权重锚未完成，不能局部覆盖历史: %w", errBarBasisUnverified, err)
 	}
 	common.SysLog("检测到除权/送转 %s.%s（%s close 偏差超 %.1f%%），已全量重锚", market, symbol, day, rebaseTolerance*100)
-	return true
+	return true, nil
+}
+
+// 当前窗口没有可比较的历史锚点时，只能接受首次建史或完整替换；
+// 当日一根/缺口一根无法证明复权一致，不能把“没有重叠”当作“基准未变”。
+func (s *MarketService) rebaseWithoutOverlap(ctx context.Context, db *gorm.DB, market, symbol string, fresh []datasource.Bar) (bool, error) {
+	var existing int64
+	if err := db.Model(&model.DailyBar{}).Where("market = ? AND symbol = ? AND trade_date < ?", market, symbol, time.Now().Format("2006-01-02")).Count(&existing).Error; err != nil {
+		return false, err
+	}
+	if existing == 0 {
+		return false, nil
+	}
+	if len(fresh) < wideBarLimit*96/100 {
+		return false, errors.New("日线窗口缺少可比较的历史复权锚点，已保留原有序列；请使用完整历史窗口同步")
+	}
+	if err := s.rebaseStockTx(ctx, db, market, symbol, fresh); err != nil {
+		return false, fmt.Errorf("%w，无重叠窗口的完整重建失败: %w", errBarBasisUnverified, err)
+	}
+	return true, nil
 }
 
 // rebaseStock 全量重锚：fresh 不足全量时重拉东财 250 根（强制东财——mgr 路由的新浪
@@ -184,12 +220,12 @@ func (s *MarketService) detectAndRebase(ctx context.Context, market, symbol stri
 // 缓存说明：GetDailyBars 的 10 分钟缓存可能短暂残留旧基准序列（键带 limit 无法精确清），
 // TTL 到期自愈；除权日在线路径拉到的本就是上游新基准，误差窗口有限。
 func (s *MarketService) rebaseStock(ctx context.Context, market, symbol string, fresh []datasource.Bar) error {
-	key := market + ":" + symbol
-	if _, loaded := rebaseInflight.LoadOrStore(key, struct{}{}); loaded {
-		return nil // 已有并发重锚在做，本次静默让路
-	}
-	defer rebaseInflight.Delete(key)
+	return withDailyBarWriteTx(ctx, market, []string{symbol}, func(tx *gorm.DB) error {
+		return s.rebaseStockTx(ctx, tx, market, symbol, fresh)
+	})
+}
 
+func (s *MarketService) rebaseStockTx(ctx context.Context, tx *gorm.DB, market, symbol string, fresh []datasource.Bar) error {
 	// fresh 接近全量（≥96%）直接复用，免一次重复拉取（初始化路径命中检测时即此情形）。
 	if len(fresh) < wideBarLimit*96/100 {
 		var err error
@@ -200,6 +236,9 @@ func (s *MarketService) rebaseStock(ctx context.Context, market, symbol string, 
 	}
 	if len(fresh) == 0 {
 		return errors.New("重拉结果为空")
+	}
+	if err := validateAdjustedBars(market, fresh); err != nil {
+		return err
 	}
 
 	rows := make([]model.DailyBar, 0, len(fresh))
@@ -217,20 +256,26 @@ func (s *MarketService) rebaseStock(ctx context.Context, market, symbol string, 
 	if len(rows) == 0 {
 		return errors.New("重拉序列无有效交易日")
 	}
-	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// 整股删+插：窗口之外的更老数据已无法对齐新基准，留着就是断层毒数据；
-		// 因子宽表/筹码/回测的窗口均 ≤250 日，删除不损失有效信息。
-		if err := tx.Where("symbol = ? AND market = ?", symbol, market).Delete(&model.DailyBar{}).Error; err != nil {
-			return err
-		}
-		return tx.CreateInBatches(rows, 200).Error
-	})
-	if err != nil {
+	last := rows[len(rows)-1]
+	var latest string
+	if err := tx.Model(&model.DailyBar{}).Select("COALESCE(MAX(trade_date), '')").
+		Where("market = ? AND symbol = ?", market, symbol).Scan(&latest).Error; err != nil {
 		return err
 	}
-	last := rows[len(rows)-1]
-	s.touchStateAfterRebase(ctx, market, symbol, len(rows), last.TradeDate)
-	return nil
+	if latest > last.TradeDate {
+		return errors.New("重拉日线早于库内最新交易日，不能覆盖已提交的新数据")
+	}
+	if err := markUnadjustedFactorSnapshotsTx(tx, market, symbol); err != nil {
+		return err
+	}
+	// 整股删+插与质量审计、覆盖状态在同一事务中提交。
+	if err := tx.Where("symbol = ? AND market = ?", symbol, market).Delete(&model.DailyBar{}).Error; err != nil {
+		return err
+	}
+	if err := tx.CreateInBatches(rows, 200).Error; err != nil {
+		return err
+	}
+	return s.touchStateAfterRebase(tx, market, symbol, len(rows), last.TradeDate)
 }
 
 // wideDailyBars 东财直连拉日线并补 Source（直连不经 manager，Source 不会被自动填充；
@@ -240,6 +285,9 @@ func (s *MarketService) wideDailyBars(ctx context.Context, market, symbol string
 	if err != nil {
 		return nil, err
 	}
+	if len(bars) == 0 {
+		return nil, datasource.ErrNoData
+	}
 	for i := range bars {
 		bars[i].Source = "eastmoney"
 	}
@@ -248,21 +296,21 @@ func (s *MarketService) wideDailyBars(ctx context.Context, market, symbol string
 
 // touchStateAfterRebase 重锚成功后更新宇宙状态（无 states 行的标的如 ETF 静默跳过——
 // adjust_epoch 是审计字段，不影响正确性）。
-func (s *MarketService) touchStateAfterRebase(ctx context.Context, market, symbol string, barsCount int, lastDate string) {
+func (s *MarketService) touchStateAfterRebase(tx *gorm.DB, market, symbol string, barsCount int, lastDate string) error {
 	today := time.Now().Format("2006-01-02")
-	common.DB.WithContext(ctx).Model(&model.MarketSyncState{}).
+	return tx.Model(&model.MarketSyncState{}).
 		Where("symbol = ? AND market = ?", symbol, market).
 		Updates(map[string]any{
 			"adjust_epoch": today, "bars_count": barsCount, "last_bar_date": lastDate,
 			"init_status": "done", "fail_count": 0, "last_error": "",
-		})
+		}).Error
 }
 
 // markStatePending 重锚失败时把标的踢回 pending，让历史初始化任务下轮全量重拉修复断层。
-func (s *MarketService) markStatePending(ctx context.Context, market, symbol string) {
-	common.DB.WithContext(ctx).Model(&model.MarketSyncState{}).
+func (s *MarketService) markStatePending(ctx context.Context, market, symbol string) error {
+	return common.DB.WithContext(ctx).Model(&model.MarketSyncState{}).
 		Where("symbol = ? AND market = ?", symbol, market).
-		Updates(map[string]any{"init_status": "pending", "fail_count": 0})
+		Updates(map[string]any{"init_status": "pending", "fail_count": 0}).Error
 }
 
 // ---------- 每日增量 ----------
@@ -270,6 +318,10 @@ func (s *MarketService) markStatePending(ctx context.Context, market, symbol str
 // SyncMarketWide 全市场日线每日增量：clist 快照 → 当日 bar 批量 upsert → 宇宙字典
 // 维护 → 除权初筛与重锚。盘后（16:10 job）与手动触发共用，防并发重入。
 func (s *MarketService) SyncMarketWide(ctx context.Context) (*model.DataSyncLog, error) {
+	ctx = jobSubmissionContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
@@ -297,55 +349,61 @@ func (s *MarketService) SyncMarketWide(ctx context.Context) (*model.DataSyncLog,
 		return fail(err)
 	}
 	log.Total = len(rows)
-
+	// 先建立字典归属，重锚事务才能连同 bars_count/adjust_epoch 一起提交。
+	initialStates := append([]datasource.SpotRow(nil), rows...)
+	for i := range initialStates {
+		initialStates[i].Price, initialStates[i].Volume = 0, 0
+	}
+	if err := s.upsertSyncStates(ctx, initialStates, tradeDate); err != nil {
+		return fail(fmt.Errorf("维护宇宙字典失败: %w", err))
+	}
+	// 先修复历史基准，再接入当日未复权快照价。未完成重锚的股票保留旧完整序列，
+	// 不能先拼入当日 bar，再让异步宽表看到半新半旧的历史。
+	rebased, suspects, blocked, err := s.rebaseSuspects(ctx, rows, tradeDate)
+	if err != nil {
+		return fail(err)
+	}
 	// 1. 当日 bar：有效成交行（停牌 Price=0/Volume=0 不落当日 bar）。
-	bars := make([]model.DailyBar, 0, len(rows))
+	accepted := make([]datasource.SpotRow, 0, len(rows))
 	for _, r := range rows {
+		if blocked[r.Symbol] || r.DataTime <= 0 || time.Unix(r.DataTime, 0).Format("2006-01-02") != tradeDate {
+			continue
+		}
 		if r.Price <= 0 || r.Volume <= 0 {
 			continue
 		}
-		bars = append(bars, model.DailyBar{
-			Symbol: r.Symbol, Market: "cn", TradeDate: tradeDate,
-			Open: r.Open, High: r.High, Low: r.Low, Close: r.Price,
-			Volume: r.Volume, Amount: r.Amount, TurnoverRate: r.TurnoverRate,
-			Source: "eastmoney",
-		})
+		accepted = append(accepted, r)
 	}
-	if err := common.DB.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "trade_date"}},
-		DoUpdates: clause.AssignmentColumns([]string{
-			"open", "high", "low", "close", "volume", "amount", "turnover_rate", "source",
-		}),
-	}).CreateInBatches(bars, 500).Error; err != nil && err != gorm.ErrEmptySlice {
-		return fail(fmt.Errorf("落库当日 bar 失败: %w", err))
+	for start := 0; start < len(accepted); start += 500 {
+		end := min(start+500, len(accepted))
+		written, conflicts, err := persistWideBarBatch(ctx, accepted[start:end], tradeDate)
+		log.Succeeded += written
+		for _, symbol := range conflicts {
+			blocked[symbol] = true
+		}
+		if err != nil {
+			return fail(fmt.Errorf("落库当日 bar 失败: %w", err))
+		}
 	}
-	log.Succeeded = len(bars)
 
 	// 交易日历顺手补当日（快照日必为开市日）。
-	if err := common.DB.Select("Market", "TradeDate", "IsOpen").Clauses(clause.OnConflict{
+	if err := common.DB.WithContext(ctx).Select("Market", "TradeDate", "IsOpen").Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "market"}, {Name: "trade_date"}},
 		DoUpdates: clause.AssignmentColumns([]string{"is_open"}),
 	}).Create(&model.TradingCalendar{Market: "cn", TradeDate: tradeDate, IsOpen: true}).Error; err != nil {
-		common.SysWarn("补交易日历失败 %s: %v", tradeDate, err)
-	}
-
-	// 2. 宇宙字典：全部行（含停牌）upsert；有效成交行额外刷 last_bar_date。
-	if err := s.upsertSyncStates(rows, tradeDate); err != nil {
-		return fail(fmt.Errorf("维护宇宙字典失败: %w", err))
+		return fail(fmt.Errorf("补交易日历失败 %s: %w", tradeDate, err))
 	}
 
 	// 2b. S0-3 PIT 宇宙快照：全市场当日状态逐日固化（退市/ST/停牌/行业/估值），
-	// 历史回放的候选宇宙按 as_of 日重建的地基。best-effort：失败只记日志。
-	if err := s.upsertUniverseDaily(rows, tradeDate); err != nil {
-		common.SysWarn("宇宙快照落库失败 %s: %v", tradeDate, err)
+	// 历史回放依赖该事实；失败必须反馈到任务，保留明确的补跑入口。
+	if err := s.upsertUniverseDaily(rows, tradeDate, ctx); err != nil {
+		return fail(fmt.Errorf("宇宙快照落库失败 %s: %w", tradeDate, err))
 	}
 
-	// 3. 除权初筛 + 重锚。
-	rebased, suspects := s.rebaseSuspects(ctx, rows, tradeDate)
-	log.Failed = suspects - rebased // 初筛命中但重锚失败的（已标 pending 由初始化任务兜底）
+	log.Failed = len(blocked) // 尚未完成重锚的股票本轮不接入当日 bar。
 
-	log.Status = statusOf(log)
-	log.Message = truncate(fmt.Sprintf("%s：快照 %d 只，落 bar %d，除权重锚 %d/%d", tradeDate, len(rows), len(bars), rebased, suspects), 512)
+	log.Status = statusOf(log, ctx)
+	log.Message = truncate(fmt.Sprintf("%s：快照 %d 只，落 bar %d，除权重锚 %d/%d", tradeDate, len(rows), log.Succeeded, rebased, suspects), 512)
 	log.DurationMs = time.Since(start).Milliseconds()
 	s.recordSyncLog(ctx, log)
 	// M1 第二部分：增量落库完成后异步重建因子宽表（选股/推荐策略信号的数据地基）。
@@ -363,7 +421,7 @@ func (s *MarketService) SyncMarketWide(ctx context.Context) (*model.DataSyncLog,
 }
 
 // upsertSyncStates 宇宙字典维护：新标的建 pending 行，已有行只刷名称（与 last_bar_date）。
-func (s *MarketService) upsertSyncStates(rows []datasource.SpotRow, tradeDate string) error {
+func (s *MarketService) upsertSyncStates(ctx context.Context, rows []datasource.SpotRow, tradeDate string) error {
 	trading := make([]model.MarketSyncState, 0, len(rows))
 	suspended := make([]model.MarketSyncState, 0, 64)
 	for _, r := range rows {
@@ -375,13 +433,13 @@ func (s *MarketService) upsertSyncStates(rows []datasource.SpotRow, tradeDate st
 			suspended = append(suspended, st)
 		}
 	}
-	if err := common.DB.Clauses(clause.OnConflict{
+	if err := common.DB.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "symbol"}, {Name: "market"}},
 		DoUpdates: clause.AssignmentColumns([]string{"name", "last_bar_date", "updated_at"}),
 	}).CreateInBatches(trading, 500).Error; err != nil && err != gorm.ErrEmptySlice {
 		return err
 	}
-	if err := common.DB.Clauses(clause.OnConflict{
+	if err := common.DB.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "symbol"}, {Name: "market"}},
 		DoUpdates: clause.AssignmentColumns([]string{"name", "updated_at"}),
 	}).CreateInBatches(suspended, 500).Error; err != nil && err != gorm.ErrEmptySlice {
@@ -394,61 +452,110 @@ func (s *MarketService) upsertSyncStates(rows []datasource.SpotRow, tradeDate st
 // 逐只全量重锚。返回 (重锚成功数, 疑似总数)。
 // 该初筛只兜底"无人访问"的标的——被在线路径重写过窗口的股票已由 persistDailyBars
 // 的多点检测当场重锚，此处比对自然吻合，不会重复。
-func (s *MarketService) rebaseSuspects(ctx context.Context, rows []datasource.SpotRow, tradeDate string) (rebased, suspects int) {
+func (s *MarketService) rebaseSuspects(ctx context.Context, rows []datasource.SpotRow, tradeDate string) (rebased, suspects int, blocked map[string]bool, err error) {
+	blocked = map[string]bool{}
 	var prevDates []string
-	if err := common.DB.Model(&model.TradingCalendar{}).
+	if err := common.DB.WithContext(ctx).Model(&model.TradingCalendar{}).
 		Where("market = ? AND is_open = ? AND trade_date < ?", "cn", true, tradeDate).
-		Order("trade_date DESC").Limit(1).Pluck("trade_date", &prevDates).Error; err != nil || len(prevDates) == 0 {
-		common.SysDebug("除权初筛跳过：无上一交易日日历")
-		return 0, 0
+		Order("trade_date DESC").Limit(1).Pluck("trade_date", &prevDates).Error; err != nil {
+		return 0, 0, blocked, err
 	}
-	prevDate := prevDates[0]
+	if len(prevDates) == 0 {
+		// 日历尚未建全时对照最近已有历史，不能把查询缺失等同于无需核验。
+		if err := common.DB.WithContext(ctx).Model(&model.DailyBar{}).Where("market = ? AND trade_date < ?", "cn", tradeDate).
+			Order("trade_date DESC").Limit(1).Pluck("trade_date", &prevDates).Error; err != nil {
+			return 0, 0, blocked, err
+		}
+	}
+	prevDate := ""
 	var dbRows []model.DailyBar
-	if err := common.DB.Select("symbol", "close").
-		Where("market = ? AND trade_date = ?", "cn", prevDate).Find(&dbRows).Error; err != nil {
-		return 0, 0
+	if len(prevDates) > 0 {
+		prevDate = prevDates[0]
+		if err := common.DB.WithContext(ctx).Select("symbol", "close").
+			Where("market = ? AND trade_date = ?", "cn", prevDate).Find(&dbRows).Error; err != nil {
+			return 0, 0, blocked, err
+		}
 	}
 	spotPrev := make(map[string]float64, len(rows))
+	spotSymbols := make(map[string]bool, len(rows))
 	for _, r := range rows {
+		spotSymbols[r.Symbol] = true
 		if r.PrevClose > 0 {
 			spotPrev[r.Symbol] = r.PrevClose
 		}
 	}
-	var list []string
 	for _, r := range dbRows {
 		if pc, ok := spotPrev[r.Symbol]; ok && r.Close > 0 && relDiff(pc, r.Close) > rebaseTolerance {
-			list = append(list, r.Symbol)
+			blocked[r.Symbol] = true
 		}
 	}
+	var mixed []string
+	if err := common.DB.WithContext(ctx).Model(&model.DailyBar{}).Where("market = ? AND source = ?", "cn", "sina").
+		Distinct("symbol").Pluck("symbol", &mixed).Error; err != nil {
+		return 0, 0, blocked, err
+	}
+	for _, symbol := range mixed {
+		if spotSymbols[symbol] {
+			blocked[symbol] = true
+		}
+	}
+	list := make([]string, 0, len(blocked))
+	for symbol := range blocked {
+		list = append(list, symbol)
+	}
+	sort.Strings(list)
+	suspects = len(list)
 	if len(list) == 0 {
-		return 0, 0
+		return 0, 0, blocked, nil
 	}
 	if len(list) > wideRebaseMaxPerSync {
-		common.SysWarn("除权初筛命中 %d 只超上限 %d（上游口径整体漂移？），本轮拒绝批量重锚", len(list), wideRebaseMaxPerSync)
-		return 0, 0
-	}
-	suspects = len(list)
-	for _, sym := range list {
-		if ctx.Err() != nil {
-			break
+		if err := common.DB.WithContext(ctx).Model(&model.MarketSyncState{}).Where("market = ? AND symbol IN ?", "cn", list).
+			Updates(map[string]any{"init_status": "pending", "fail_count": 0}).Error; err != nil {
+			return 0, suspects, blocked, err
 		}
-		if err := s.rebaseStock(ctx, "cn", sym, nil); err != nil {
-			common.SysWarn("除权重锚失败 cn.%s: %v；已标记待初始化任务重拉", sym, err)
-			s.markStatePending(ctx, "cn", sym)
+		return 0, suspects, blocked, fmt.Errorf("待核验复权历史 %d 只超过单轮上限 %d，已留待历史初始化，本轮未接入新日线", suspects, wideRebaseMaxPerSync)
+	}
+	for i, sym := range list {
+		if ctx.Err() != nil {
+			return rebased, suspects, blocked, ctx.Err()
+		}
+		rebaseErr := s.rebaseStock(ctx, "cn", sym, nil)
+		if rebaseErr == nil && prevDate != "" && spotPrev[sym] > 0 {
+			var anchor model.DailyBar
+			rebaseErr = common.DB.WithContext(ctx).Select("close").Where("market = ? AND symbol = ? AND trade_date = ?", "cn", sym, prevDate).First(&anchor).Error
+			if rebaseErr == nil && relDiff(anchor.Close, spotPrev[sym]) > rebaseTolerance {
+				rebaseErr = errors.New("重拉日线与快照昨收基准仍不一致")
+			}
+		}
+		if rebaseErr != nil {
+			err := rebaseErr
+			common.SysWarn("除权重锚尚未完成 cn.%s: %v", sym, err)
+			if ctx.Err() == nil && !errors.Is(err, errRebaseInProgress) {
+				if stateErr := s.markStatePending(ctx, "cn", sym); stateErr != nil {
+					return rebased, suspects, blocked, errors.Join(err, stateErr)
+				}
+			}
 		} else {
 			rebased++
+			delete(blocked, sym)
 		}
-		time.Sleep(wideRebaseThrottle)
+		if i+1 < len(list) {
+			select {
+			case <-ctx.Done():
+				return rebased, suspects, blocked, ctx.Err()
+			case <-time.After(wideRebaseThrottle):
+			}
+		}
 	}
 	if suspects > 0 {
 		common.SysLog("除权初筛：疑似 %d 只，重锚成功 %d", suspects, rebased)
 	}
-	return rebased, suspects
+	return rebased, suspects, blocked, ctx.Err()
 }
 
 // upsertUniverseDaily S0-3 每日宇宙快照：clist 全市场行原样固化（同一次上游请求
 // 零额外成本）。唯一键 (trade_date, symbol) upsert 幂等，盘中重跑覆盖为最新快照。
-func (s *MarketService) upsertUniverseDaily(rows []datasource.SpotRow, tradeDate string) error {
+func (s *MarketService) upsertUniverseDaily(rows []datasource.SpotRow, tradeDate string, contexts ...context.Context) error {
 	snap := make([]model.StockUniverseDaily, 0, len(rows))
 	for _, r := range rows {
 		snap = append(snap, model.StockUniverseDaily{
@@ -460,7 +567,7 @@ func (s *MarketService) upsertUniverseDaily(rows []datasource.SpotRow, tradeDate
 			PE: r.PE, PETTM: r.PETTM, PB: r.PB, Industry: r.Industry,
 		})
 	}
-	err := common.DB.Clauses(clause.OnConflict{
+	err := common.DB.WithContext(jobSubmissionContext(contexts...)).Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "trade_date"}, {Name: "symbol"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			// PETTM 的 GORM 蛇形化列名是 pettm（连续大写视为一词，F1 YoY→yo_y 同款坑）；
@@ -532,10 +639,19 @@ func (s *MarketService) initMarketWideHistory(ctx context.Context) (*model.DataS
 	}
 	start := time.Now()
 	log := &model.DataSyncLog{Task: "init_market_history", Market: "cn"}
+	fail := func(err error) (*model.DataSyncLog, error) {
+		log.Total = log.Succeeded + log.Failed
+		log.Status, log.Message = "failed", truncate(err.Error(), 512)
+		log.DurationMs = time.Since(start).Milliseconds()
+		s.recordSyncLog(ctx, log)
+		return log, err
+	}
 
 	var pendingTotal int64
-	common.DB.Model(&model.MarketSyncState{}).
-		Where("market = ? AND init_status = ?", "cn", "pending").Count(&pendingTotal)
+	if err := common.DB.WithContext(ctx).Model(&model.MarketSyncState{}).
+		Where("market = ? AND init_status = ?", "cn", "pending").Count(&pendingTotal).Error; err != nil {
+		return fail(err)
+	}
 	if pendingTotal == 0 {
 		log.Status = "success"
 		log.Message = "无待初始化标的"
@@ -555,30 +671,40 @@ func (s *MarketService) initMarketWideHistory(ctx context.Context) (*model.DataS
 	lastGoodID := int64(0) // 连续源失败段之前最后一个已处理标的的 id（退避后从此续跑）
 	var srcFails []model.MarketSyncState
 	var srcFailErrs []string
-	recordFail := func(st *model.MarketSyncState, msg string) {
-		st.FailCount++
-		st.LastError = truncate(msg, 256)
+	recordFail := func(st *model.MarketSyncState, msg string, terminal bool) error {
+		nextFailCount := st.FailCount + 1
+		if terminal {
+			nextFailCount = wideInitMaxFail
+		}
 		status := st.InitStatus
-		if st.FailCount >= wideInitMaxFail {
+		if nextFailCount >= wideInitMaxFail {
 			status = "failed"
 		}
-		common.DB.Model(st).Updates(map[string]any{
-			"fail_count": st.FailCount, "last_error": st.LastError, "init_status": status,
-		})
-		log.Failed++
+		res := common.DB.WithContext(ctx).Model(st).Where("init_status = ? AND fail_count = ?", "pending", st.FailCount).
+			Updates(map[string]any{"fail_count": nextFailCount, "last_error": truncate(msg, 256), "init_status": status})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected > 0 {
+			log.Failed++
+		}
+		return nil
 	}
-	flushSrcFails := func() {
+	flushSrcFails := func() error {
 		for i := range srcFails {
-			recordFail(&srcFails[i], srcFailErrs[i])
+			if err := recordFail(&srcFails[i], srcFailErrs[i], false); err != nil {
+				return err
+			}
 		}
 		srcFails, srcFailErrs = nil, nil
+		return nil
 	}
 loop:
 	for {
 		var batch []model.MarketSyncState
-		if err := common.DB.Where("market = ? AND init_status = ? AND id > ?", "cn", "pending", lastID).
+		if err := common.DB.WithContext(ctx).Where("market = ? AND init_status = ? AND id > ?", "cn", "pending", lastID).
 			Order("id").Limit(wideInitBatch).Find(&batch).Error; err != nil {
-			return nil, err
+			return fail(err)
 		}
 		if len(batch) == 0 {
 			break
@@ -600,12 +726,13 @@ loop:
 				break loop
 			case errors.Is(err, datasource.ErrNoData) || errors.Is(err, datasource.ErrSymbolInvalid):
 				// 上游明确"无数据/代码非法"（退市整理、长期停牌）：直接记标的失败。
-				flushSrcFails()
-				srcFailStreak = 0
-				if errors.Is(err, datasource.ErrSymbolInvalid) {
-					st.FailCount = wideInitMaxFail - 1 // 代码非法重试无意义，本次即 failed
+				if err := flushSrcFails(); err != nil {
+					return fail(err)
 				}
-				recordFail(st, err.Error())
+				srcFailStreak = 0
+				if err := recordFail(st, err.Error(), errors.Is(err, datasource.ErrSymbolInvalid)); err != nil {
+					return fail(err)
+				}
 			case err != nil:
 				srcFailStreak++
 				lastSrcErr = err.Error()
@@ -632,19 +759,25 @@ loop:
 					continue loop
 				}
 			default:
-				flushSrcFails()
+				if err := flushSrcFails(); err != nil {
+					return fail(err)
+				}
 				srcFailStreak = 0
 				// 落库失败不标 done：否则该股永久缺口（宽表/因子/回测都读不到）。
 				// 保持 pending，走 recordFail 计一次尝试，下一轮 job/手动重试。
-				if perr := s.persistDailyBars(ctx, "cn", st.Symbol, bars); perr != nil { // 内部含除权检测：有旧基准数据时自动全量重锚
-					recordFail(st, perr.Error())
+				if perr := s.persistDailyBarsWithState(ctx, "cn", st.Symbol, bars, true); perr != nil { // 历史与完成状态原子提交
+					if ctx.Err() != nil {
+						canceled = true
+						break loop
+					}
+					if errors.Is(perr, errRebaseInProgress) {
+						break // 并发写入尚未完成，不记作股票数据失败。
+					}
+					if err := recordFail(st, perr.Error(), false); err != nil {
+						return fail(err)
+					}
 					break
 				}
-				last := bars[len(bars)-1]
-				common.DB.Model(st).Updates(map[string]any{
-					"init_status": "done", "fail_count": 0, "last_error": "",
-					"bars_count": len(bars), "last_bar_date": last.TradeDate,
-				})
 				log.Succeeded++
 			}
 			done := log.Succeeded + log.Failed
@@ -659,10 +792,14 @@ loop:
 			}
 		}
 	}
-	flushSrcFails()
+	if !canceled {
+		if err := flushSrcFails(); err != nil {
+			return fail(err)
+		}
+	}
 
 	log.Total = log.Succeeded + log.Failed
-	log.Status = statusOf(log)
+	log.Status = statusOf(log, ctx)
 	switch {
 	case srcAborted:
 		log.Status = "failed"
@@ -686,7 +823,7 @@ loop:
 		}
 	}
 	if canceled {
-		return log, context.Canceled
+		return log, ctx.Err()
 	}
 	return log, nil
 }
@@ -711,7 +848,7 @@ type MarketWideStatusView struct {
 }
 
 // MarketWideStatus 聚合宇宙字典状态与最近任务日志。
-func (s *MarketService) MarketWideStatus() (*MarketWideStatusView, error) {
+func (s *MarketService) MarketWideStatus(contexts ...context.Context) (*MarketWideStatusView, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
@@ -723,35 +860,36 @@ func (s *MarketService) MarketWideStatus() (*MarketWideStatusView, error) {
 		InitStatus string
 		N          int64
 	}
-	var cs []cnt
-	if err := common.DB.Model(&model.MarketSyncState{}).Select("init_status, COUNT(*) AS n").
-		Where("market = ?", "cn").Group("init_status").Find(&cs).Error; err != nil {
+	err := readSnapshotTx(jobSubmissionContext(contexts...), func(tx *gorm.DB) error {
+		var cs []cnt
+		if err := tx.Model(&model.MarketSyncState{}).Select("init_status, COUNT(*) AS n").
+			Where("market = ?", "cn").Group("init_status").Find(&cs).Error; err != nil {
+			return err
+		}
+		for _, c := range cs {
+			v.Total += c.N
+			switch c.InitStatus {
+			case "pending":
+				v.Pending = c.N
+			case "done":
+				v.Done = c.N
+			case "failed":
+				v.Failed = c.N
+			}
+		}
+		reader := &dataHealthReader{db: tx, now: time.Now()}
+		v.LastSync = reader.dhLastLog("sync_market_wide")
+		v.LastInit = reader.dhLastLog("init_market_history")
+		v.ObservedDate = reader.dhMaxDate(&model.MarketSyncState{}, "last_bar_date", "market = ? AND last_bar_date <> ''", "cn")
+		if v.ObservedDate == "" && reader.err == nil {
+			v.ObservedDate = reader.dhMaxDate(&model.DailyBar{}, "trade_date", "market = ?", "cn")
+		}
+		v.ExpectedDate = reader.wideExpectedDate(reader.now)
+		v.LagOpenDays = reader.openDaysBehind(v.ObservedDate, v.ExpectedDate)
+		return reader.err
+	})
+	if err != nil {
 		return nil, err
 	}
-	for _, c := range cs {
-		v.Total += c.N
-		switch c.InitStatus {
-		case "pending":
-			v.Pending = c.N
-		case "done":
-			v.Done = c.N
-		case "failed":
-			v.Failed = c.N
-		}
-	}
-	lastLog := func(task string) *model.DataSyncLog {
-		var l model.DataSyncLog
-		if err := common.DB.Where("task = ?", task).Order("id DESC").First(&l).Error; err != nil {
-			return nil
-		}
-		return &l
-	}
-	v.LastSync = lastLog("sync_market_wide")
-	v.LastInit = lastLog("init_market_history")
-	if d, err := wideFreshDate(); err == nil {
-		v.ObservedDate = d
-	}
-	v.ExpectedDate = wideExpectedDate(time.Now())
-	v.LagOpenDays = openDaysBehind(v.ObservedDate, v.ExpectedDate)
 	return v, nil
 }

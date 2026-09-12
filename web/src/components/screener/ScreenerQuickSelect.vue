@@ -65,13 +65,14 @@ const emit = defineEmits<{
               </n-input-number>
             </label>
           </div>
-          <div class="condition-list" aria-label="模板条件">
+          <div class="condition-list" aria-label="模板默认条件">
+            <span>默认条件参考（实际扫描以所填参数为准）</span>
             <n-tag v-for="condition in template.conditions" :key="condition" size="small" :bordered="false">
               {{ condition }}
             </n-tag>
           </div>
           <div class="template-actions">
-            <n-button size="small" quaternary @click="emit('recommend', template)">AI 推荐</n-button>
+            <n-button size="small" quaternary title="推荐工作台使用此模板的默认参数" @click="emit('recommend', template)">默认模板推荐</n-button>
             <n-button
               size="small"
               type="primary"

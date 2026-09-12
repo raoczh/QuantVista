@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"testing"
@@ -57,10 +58,10 @@ func TestICAggregate(t *testing.T) {
 	if _, _, _, ok := icAggregate(nil); ok {
 		t.Fatal("空序列应 !ok")
 	}
-	// 单样本：胜率可算、ICIR 无标准差为 0。
+	// 单样本：胜率可算，ICIR 无法定义。
 	mean, icir, win, ok = icAggregate([]float64{-0.2})
-	if !ok || mean != -0.2 || icir != 0 || win != 0 {
-		t.Fatalf("单样本应 -0.2/0/0，得到 %v/%v/%v", mean, icir, win)
+	if !ok || mean != -0.2 || !math.IsNaN(icir) || win != 0 {
+		t.Fatalf("单样本应 -0.2/NaN/0，得到 %v/%v/%v", mean, icir, win)
 	}
 }
 
@@ -162,5 +163,30 @@ func TestRunFactorICEndToEnd(t *testing.T) {
 	}
 	if CachedFactorICReport() != rep {
 		t.Fatal("结果应写入进程内缓存")
+	}
+	// 同一因子的各横截面 IC 恒为 1，标准差为零；API 不能把未定义 ICIR 冒充为 0。
+	raw, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var view struct {
+		Stats []struct {
+			Key      string `json:"key"`
+			Horizons map[string]struct {
+				ICIR *float64 `json:"icir"`
+			} `json:"horizons"`
+		} `json:"stats"`
+	}
+	if err := json.Unmarshal(raw, &view); err != nil {
+		t.Fatal(err)
+	}
+	for _, stat := range view.Stats {
+		if stat.Key == "chg_5d" {
+			for horizon, agg := range stat.Horizons {
+				if agg.ICIR != nil {
+					t.Errorf("%s 日 ICIR 未定义，应返回 null，实际为 %v", horizon, *agg.ICIR)
+				}
+			}
+		}
 	}
 }

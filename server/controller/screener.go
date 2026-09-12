@@ -21,6 +21,16 @@ func NewScreenerController(svc *service.ScreenerService, ai *service.ScreenerAIS
 	return &ScreenerController{svc: svc, ai: ai}
 }
 
+func screenerAPIError(c *gin.Context, err error) {
+	message := publicWorkflowError(err, "请求处理失败，请稍后重试")
+	if message != err.Error() {
+		common.ApiErrorMsg(c, message)
+		return
+	}
+	// 保留版本冲突及业务拒绝的机读码。
+	common.ApiError(c, err)
+}
+
 // Strategies GET /api/screener/strategies —— 内置策略 + 当前用户自定义 + 因子字典。
 func (sc *ScreenerController) Strategies(c *gin.Context) {
 	if c.Query("history") == "1" {
@@ -29,17 +39,17 @@ func (sc *ScreenerController) Strategies(c *gin.Context) {
 			common.ApiErrorMsg(c, "strategy_id 无效")
 			return
 		}
-		v, err := sc.svc.StrategyHistory(currentUserID(c), strategyID)
+		v, err := sc.svc.StrategyHistoryContext(c.Request.Context(), currentUserID(c), strategyID)
 		if err != nil {
-			common.ApiErrorMsg(c, err.Error())
+			screenerAPIError(c, err)
 			return
 		}
 		common.ApiSuccess(c, v)
 		return
 	}
-	v, err := sc.svc.Strategies(currentUserID(c))
+	v, err := sc.svc.StrategiesContext(c.Request.Context(), currentUserID(c))
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		screenerAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, v)
@@ -54,9 +64,9 @@ func (sc *ScreenerController) Scan(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	res, err := sc.svc.StartScanJob(currentUserID(c), req)
+	res, err := sc.svc.StartScanJob(currentUserID(c), req, c.Request.Context())
 	if err != nil {
-		common.ApiError(c, err)
+		screenerAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, res)
@@ -65,9 +75,9 @@ func (sc *ScreenerController) Scan(c *gin.Context) {
 // Results GET /api/screener/results —— 本人的扫描结果事实列表，不加载请求和结果正文。
 func (sc *ScreenerController) Results(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
-	rows, err := service.ListStrategyRuns(currentUserID(c), service.JobKindScreenerScan, limit)
+	rows, err := service.ListStrategyRuns(currentUserID(c), service.JobKindScreenerScan, limit, c.Request.Context())
 	if err != nil {
-		common.ApiError(c, err)
+		screenerAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, rows)
@@ -79,9 +89,9 @@ func (sc *ScreenerController) Result(c *gin.Context) {
 	if !ok {
 		return
 	}
-	row, err := service.GetStrategyRun(currentUserID(c), service.JobKindScreenerScan, id)
+	row, err := service.GetStrategyRun(currentUserID(c), service.JobKindScreenerScan, id, c.Request.Context())
 	if err != nil {
-		common.ApiError(c, err)
+		screenerAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, row)
@@ -89,14 +99,15 @@ func (sc *ScreenerController) Result(c *gin.Context) {
 
 // SaveStrategy POST /api/screener/strategies —— 新建/更新自定义策略。
 func (sc *ScreenerController) SaveStrategy(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
 	var req service.SaveStrategyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	v, err := sc.svc.SaveStrategy(currentUserID(c), req)
+	v, err := sc.svc.SaveStrategyContext(c.Request.Context(), currentUserID(c), req)
 	if err != nil {
-		common.ApiError(c, err)
+		screenerAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, v)
@@ -108,8 +119,8 @@ func (sc *ScreenerController) DeleteStrategy(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := sc.svc.DeleteStrategy(currentUserID(c), id); err != nil {
-		common.ApiErrorMsg(c, err.Error())
+	if err := sc.svc.DeleteStrategyContext(c.Request.Context(), currentUserID(c), id); err != nil {
+		screenerAPIError(c, err)
 		return
 	}
 	// 归档是当前语义；保留 deleted=true，避免旧前端把成功响应误判为失败。
@@ -119,6 +130,7 @@ func (sc *ScreenerController) DeleteStrategy(c *gin.Context) {
 // Parse POST /api/screener/parse —— AI 白话建策略：自然语言解析为条件树（P3c）。
 // 只生成不执行：树由用户在前端确认后才落编辑器/保存/扫描。
 func (sc *ScreenerController) Parse(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4<<10)
 	var req service.ParseStrategyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ApiErrorMsg(c, "请求格式错误")
@@ -128,7 +140,7 @@ func (sc *ScreenerController) Parse(c *gin.Context) {
 	allowPrivate := currentRole(c) == model.RoleAdmin
 	res, err := sc.ai.ParseStrategyAsync(currentUserID(c), allowPrivate, req)
 	if err != nil {
-		common.ApiError(c, err)
+		screenerAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, res)
@@ -144,9 +156,9 @@ func (sc *ScreenerController) FactorRebuild(c *gin.Context) {
 	actor := currentUserID(c)
 	job, started, err := service.StartSystemDataSyncJob(service.JobKindFactorRebuild, &actor, service.DataSyncJobRequest{
 		Version: 1, Market: "cn", TriggerSource: "admin", ParameterSummary: "manual_rebuild=true", Reason: "管理端手动触发",
-	})
+	}, c.Request.Context())
 	if err != nil {
-		common.ApiError(c, err)
+		screenerAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, gin.H{"started": started, "task": service.JobKindFactorRebuild, "job_run_id": job.ID})

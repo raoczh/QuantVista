@@ -23,9 +23,10 @@ type recommendationJobRequest struct {
 func recommendationJobRequestFromPlan(req RecommendRequest, plan *recGenPlan, manual bool) recommendationJobRequest {
 	filters := plan.filters
 	snapshot := plan.preference
-	return recommendationJobRequest{Version: 2, Manual: manual, PreferenceSnapshot: &snapshot, Request: RecommendRequest{
+	return recommendationJobRequest{Version: 3, Manual: manual, PreferenceSnapshot: &snapshot, Request: RecommendRequest{
 		Type: plan.recType, Market: plan.market, Strategy: plan.strat.Key, Count: plan.count,
-		Filters: &filters, Verify: plan.verify, BearCheck: boolPtr(plan.bear), LLMConfigID: req.LLMConfigID,
+		StrategyRevisionID: plan.strat.StrategyRevisionID,
+		Filters:            &filters, Verify: plan.verify, BearCheck: boolPtr(plan.bear), LLMConfigID: req.LLMConfigID,
 	}}
 }
 
@@ -128,6 +129,8 @@ func (s *RecommendationService) registerDurableJobHandler() {
 				return DurableJobResult{}, err
 			}
 			batch.LLMConfigID, batch.Provider, batch.Model = plan.cfg.ID, plan.cfg.Provider, plan.cfg.Model
+			// 模板按执行时配置读取，审计版本必须与实际发送正文一致。
+			batch.PromptVersion = plan.prompt.Version(recPromptVersion)
 			view, err := s.runGeneration(ctx, &batch, plan)
 			if err != nil {
 				return DurableJobResult{}, err

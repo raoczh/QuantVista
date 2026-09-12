@@ -130,16 +130,17 @@ export function listBacktestResults(limit = 20) {
   return request<StrategyRun<BacktestResult>[]>({ url: '/backtest/results', method: 'get', params: { limit } })
 }
 
-export function getBacktestResult(id: number) {
-  return request<StrategyRun<BacktestResult>>({ url: `/backtest/results/${id}`, method: 'get' })
+export function getBacktestResult(id: number, signal?: AbortSignal) {
+  return request<StrategyRun<BacktestResult>>({ url: `/backtest/results/${id}`, method: 'get', signal })
 }
 
-export function backtestRecommendations(batchId: number) {
+export function backtestRecommendations(batchId: number, signal?: AbortSignal) {
   return request<BatchBacktestResult>({
     url: '/backtest/recommendations',
     method: 'post',
     data: { batch_id: batchId },
     timeout: 120000,
+    signal,
   })
 }
 

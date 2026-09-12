@@ -22,10 +22,12 @@ import {
   taskStageLabel,
   type TaskCenterItem,
   type JobRuntimeMetrics,
+  type JobRun,
   type TaskSource,
   type TaskStatus,
 } from '@/api/taskCenter'
 import { isAbortError } from '@/api/client'
+import { getSessionEpoch } from '@/api/token'
 import { useVisibleTaskPolling } from '@/composables/useVisibleTaskPolling'
 import { useUi, withAlpha } from '@/composables/useUi'
 import { useAuthStore } from '@/stores/auth'
@@ -45,6 +47,7 @@ const runtimeMetrics = ref<JobRuntimeMetrics | null>(null)
 const loading = ref(false)
 const refreshing = ref(false)
 const loadError = ref('')
+const metricsError = ref('')
 const source = ref<TaskSource | ''>('')
 const kind = ref('')
 const status = ref<TaskStatus | ''>('')
@@ -57,6 +60,10 @@ const focusedJobID = computed(() => {
   return Number.isSafeInteger(id) && id > 0 ? id : null
 })
 let requestController: AbortController | null = null
+const pageSession = getSessionEpoch()
+let disposed = false
+const pageActive = () => !disposed && getSessionEpoch() === pageSession
+const filterIdentity = () => JSON.stringify([focusedJobID.value, source.value, kind.value, isAdmin.value && includeSystem.value])
 
 const knownKindsBySource: Record<TaskSource, string[]> = {
   analysis: ['market', 'sector', 'stock', 'watchlist', 'position'],
@@ -64,7 +71,7 @@ const knownKindsBySource: Record<TaskSource, string[]> = {
   daily_report: ['daily_report'],
   job: ['analysis', 'recommendation', 'daily_report', 'qa', 'compare', 'position_advice', 'screener_parse', 'screener_scan', 'strategy_backtest'],
   llm: ['qa', 'compare', 'position_advice', 'screener_parse'],
-  data_sync: ['sync_daily_bars', 'backfill_calendar', 'snapshot_market', 'sync_market_wide', 'init_market_history', 'factor_rebuild'],
+  data_sync: ['sync_daily_bars', 'backfill_calendar', 'snapshot_market', 'sync_market_wide', 'init_market_history', 'factor_rebuild', 'daily_discovery', 'candidate_daily_audit'],
 }
 
 const styleVars = computed(() => ({
@@ -159,13 +166,16 @@ const oldestQueuedText = computed(() => {
 })
 
 async function loadTaskRows() {
+  if (!pageActive()) return
   requestController?.abort()
   const controller = new AbortController()
+  const selection = filterIdentity()
   requestController = controller
   const initial = tasks.value.length === 0
   if (initial) loading.value = true
   refreshing.value = true
   loadError.value = ''
+  metricsError.value = ''
   try {
     const rowsPromise = listTasks(
       {
@@ -179,11 +189,17 @@ async function loadTaskRows() {
       controller.signal,
     )
     const metricsPromise = isAdmin.value ? getJobRuntimeMetrics(controller.signal) : Promise.resolve(null)
-    const [rows, metrics] = await Promise.all([rowsPromise, metricsPromise])
-    if (requestController === controller) tasks.value = rows
-    if (requestController === controller) runtimeMetrics.value = metrics
+    const [rows, metrics] = await Promise.allSettled([rowsPromise, metricsPromise])
+    if (!pageActive() || requestController !== controller || selection !== filterIdentity()) return
+    if (rows.status === 'fulfilled') tasks.value = rows.value
+    else if (!isAbortError(rows.reason)) loadError.value = rows.reason instanceof Error ? rows.reason.message : '任务列表读取失败'
+    if (metrics.status === 'fulfilled') runtimeMetrics.value = metrics.value
+    else if (!isAbortError(metrics.reason)) {
+      runtimeMetrics.value = null
+      metricsError.value = metrics.reason instanceof Error ? metrics.reason.message : '容量指标读取失败'
+    }
   } catch (error) {
-    if (!isAbortError(error) && requestController === controller) loadError.value = (error as Error).message
+    if (pageActive() && selection === filterIdentity() && !isAbortError(error) && requestController === controller) loadError.value = (error as Error).message
   } finally {
     if (requestController === controller) {
       requestController = null
@@ -230,7 +246,11 @@ watch(isAdmin, (admin) => {
   else resetSystemOnlyFilters()
 })
 
-onBeforeUnmount(() => requestController?.abort())
+onBeforeUnmount(() => {
+  disposed = true
+  requestController?.abort()
+  requestController = null
+})
 
 function statusTagType(value: TaskStatus): 'info' | 'success' | 'warning' | 'error' {
   if (value === 'queued' || value === 'running') return 'info'
@@ -267,29 +287,57 @@ function stepStatusText(status: TaskStatus) {
 }
 
 async function cancelTask(task: TaskCenterItem) {
+  if (!pageActive() || actionJobID.value !== null || !visibleTasks.value.some(row => row.id === task.id && row.can_cancel)) return false
+  const selection = filterIdentity()
   actionError.value = ''
   actionJobID.value = task.source_id
   try {
-    await cancelJob(task.source_id)
+    const job = await cancelJob(task.source_id)
+    if (!pageActive()) return false
+    requestController?.abort()
+    requestController = null // 取消前发出的列表响应不能回退已经接受的取消事实。
+    acceptJobState(task.id, job)
     await refreshNow()
   } catch (error) {
-    actionError.value = (error as Error).message
+    if (pageActive() && selection === filterIdentity()) actionError.value = (error as Error).message
   } finally {
     actionJobID.value = null
   }
 }
 
 async function rerunTask(task: TaskCenterItem) {
+  if (!pageActive() || actionJobID.value !== null || !visibleTasks.value.some(row => row.id === task.id && row.can_retry)) return
+  const selection = filterIdentity()
   actionError.value = ''
   actionJobID.value = task.source_id
   try {
-    await retryJob(task.source_id)
+    const child = await retryJob(task.source_id)
+    if (!pageActive()) return
+    requestController?.abort()
+    requestController = null
+    if (selection === filterIdentity() && focusedJobID.value === task.source_id) {
+      await router.replace({ name: 'tasks', query: { ...route.query, job_id: String(child.id) } })
+    }
     await refreshNow()
   } catch (error) {
-    actionError.value = (error as Error).message
+    if (pageActive() && selection === filterIdentity()) actionError.value = (error as Error).message
   } finally {
     actionJobID.value = null
   }
+}
+
+function acceptJobState(taskID: string, job: JobRun) {
+  const task = tasks.value.find(row => row.id === taskID && row.source_id === job.id)
+  if (!task) return
+  task.status = task.raw_status = job.status
+  task.stage = job.status === 'queued' ? 'queued' : job.status === 'running' ? 'running' : 'finished'
+  task.cancel_requested = job.cancel_requested
+  task.can_cancel = (job.status === 'queued' || job.status === 'running') && !job.cancel_requested
+  task.can_retry = false
+  task.error = job.error || ''
+  task.error_code = job.error_code || ''
+  task.updated_at = job.updated_at
+  if (job.steps) task.steps = job.steps
 }
 
 function openTask(task: TaskCenterItem) {
@@ -337,6 +385,8 @@ function openTask(task: TaskCenterItem) {
         </div>
       </section>
 
+      <n-alert v-if="isAdmin && metricsError" type="error" :bordered="false" title="容量指标读取失败">{{ metricsError }}</n-alert>
+
       <SectionCard :hoverable="false">
         <div class="filters">
           <n-select v-model:value="source" :options="sourceOptions" size="small" class="filter-control" />
@@ -358,9 +408,9 @@ function openTask(task: TaskCenterItem) {
         </n-alert>
 
         <n-spin :show="loading">
-          <n-empty v-if="!visibleTasks.length && !loading" description="当前筛选下没有任务" class="task-empty" />
+          <n-empty v-if="!visibleTasks.length && !loading && !loadError" description="当前筛选下没有任务" class="task-empty" />
 
-          <div v-else class="desktop-list qv-scroll-x">
+          <div v-else-if="visibleTasks.length" class="desktop-list qv-scroll-x">
             <table class="task-table">
               <thead>
                 <tr>
@@ -432,7 +482,7 @@ function openTask(task: TaskCenterItem) {
                       </n-button>
                       <n-popconfirm v-if="task.can_cancel" @positive-click="cancelTask(task)">
                         <template #trigger>
-                          <n-button size="tiny" quaternary type="warning" :loading="actionJobID === task.source_id">
+                          <n-button size="tiny" quaternary type="warning" :disabled="actionJobID !== null" :loading="actionJobID === task.source_id">
                             取消
                           </n-button>
                         </template>
@@ -444,6 +494,7 @@ function openTask(task: TaskCenterItem) {
                         quaternary
                         type="primary"
                         :loading="actionJobID === task.source_id"
+                        :disabled="actionJobID !== null"
                         @click="rerunTask(task)"
                       >
                         重跑
@@ -525,7 +576,7 @@ function openTask(task: TaskCenterItem) {
                   </n-button>
                   <n-popconfirm v-if="task.can_cancel" @positive-click="cancelTask(task)">
                     <template #trigger>
-                      <n-button size="small" tertiary type="warning" :loading="actionJobID === task.source_id">
+                      <n-button size="small" tertiary type="warning" :disabled="actionJobID !== null" :loading="actionJobID === task.source_id">
                         取消
                       </n-button>
                     </template>
@@ -537,6 +588,7 @@ function openTask(task: TaskCenterItem) {
                     tertiary
                     type="primary"
                     :loading="actionJobID === task.source_id"
+                    :disabled="actionJobID !== null"
                     @click="rerunTask(task)"
                   >
                     重跑

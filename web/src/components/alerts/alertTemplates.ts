@@ -224,6 +224,10 @@ export function inferAlertTemplate(rule: AlertRule): AlertTemplateId | null {
   const templateId = ALERT_TEMPLATE_KIND_MAP[rule.kind]
   const template = templateById(templateId)
   if (!template || template.kind !== rule.kind) return null
+  if (rule.kind === 'pct_change' && (
+    (rule.op === 'gte' && rule.threshold <= 0) ||
+    (rule.op === 'lte' && rule.threshold >= 0) || Math.abs(rule.threshold) > 100
+  )) return null
   if ((rule.kind === 'volume_surge' || rule.kind === 'amplitude') && rule.op !== 'gte') return null
   if (
     (rule.kind === 'earn_date' || rule.kind === 'earn_fcst' ||
@@ -247,7 +251,7 @@ export function alertNeedsPeriod(kind: string): boolean {
   return kind === 'ma' || kind === 'breakout'
 }
 
-function compactNumber(value: number | undefined, digits = 2): string {
+function compactNumber(value: number | undefined, digits = 4): string {
   if (value == null || !Number.isFinite(value)) return '未填写'
   return String(Number(value.toFixed(digits)))
 }
@@ -258,6 +262,9 @@ export function alertConditionText(input: AlertInput): string {
     case 'price':
       return `当日${input.op === 'gte' ? '最高价达到或超过' : '最低价达到或低于'} ${compactNumber(threshold)} 元`
     case 'pct_change':
+      if ((input.op === 'gte' && threshold <= 0) || (input.op === 'lte' && threshold >= 0)) {
+        return `当日涨跌幅 ${input.op === 'gte' ? '≥' : '≤'} ${compactNumber(threshold)}%`
+      }
       return input.op === 'gte'
         ? `当日涨幅达到 ${compactNumber(Math.abs(threshold))}%`
         : `当日跌幅达到 ${compactNumber(Math.abs(threshold))}%`

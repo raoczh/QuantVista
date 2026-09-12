@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
+	"sort"
 	"strconv"
+	"time"
 )
 
 // 腾讯分钟线（M3b 盘中因子 m5 / A1 分时图 m1）：ifzq.gtimg.cn/appstock/app/kline/mkline，免鉴权。
@@ -118,6 +121,7 @@ func parseMinuteResponse(raw []byte, code, period string) ([]Min5Bar, float64, e
 	}
 	prec := min5Atof(body.Prec)
 	out := make([]Min5Bar, 0, len(rows))
+	seen := make(map[string]Min5Bar, len(rows))
 	for _, row := range rows {
 		if len(row) < 6 {
 			continue // 坏行跳过
@@ -126,28 +130,55 @@ func parseMinuteResponse(raw []byte, code, period string) ([]Min5Bar, float64, e
 		if len(tstr) != 12 {
 			continue
 		}
+		if parsed, err := time.Parse("200601021504", tstr); err != nil || parsed.Format("200601021504") != tstr {
+			continue
+		}
 		o, c := min5Atof(row[1]), min5Atof(row[2])
 		h, l := min5Atof(row[3]), min5Atof(row[4])
-		if o <= 0 || c <= 0 || h <= 0 || l <= 0 {
+		vol, validVolume := minuteNumber(row[5])
+		if o <= 0 || c <= 0 || h <= 0 || l <= 0 || h < o || h < c || l > o || l > c ||
+			!validVolume || vol < 0 || vol >= float64(math.MaxInt64) {
 			continue // 价格缺失的脏行（停牌日上游直接缺根，正常数据不会出现）
 		}
-		out = append(out, Min5Bar{
+		bar := Min5Bar{
 			Time: tstr, Open: o, High: h, Low: l, Close: c,
-			Volume: int64(min5Atof(row[5])),
-		})
+			Volume: int64(vol),
+		}
+		if previous, exists := seen[tstr]; exists {
+			if previous != bar {
+				return nil, 0, fmt.Errorf("%w: 分钟线同一时刻存在冲突数据", ErrUpstream)
+			}
+			continue
+		}
+		seen[tstr] = bar
+		out = append(out, bar)
 	}
 	if len(out) == 0 {
 		return nil, 0, ErrNoData
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Time < out[j].Time })
 	return out, prec, nil
 }
 
 // min5Atof m5 行元素转 float（上游数值以字符串下发，{} 占位列断言失败返回 0）。
 func min5Atof(v any) float64 {
-	s, ok := v.(string)
-	if !ok {
-		return 0
-	}
-	f, _ := strconv.ParseFloat(s, 64)
+	f, _ := minuteNumber(v)
 	return f
+}
+
+func minuteNumber(v any) (float64, bool) {
+	var f float64
+	var err error
+	switch value := v.(type) {
+	case string:
+		f, err = strconv.ParseFloat(value, 64)
+	case float64:
+		f = value
+	default:
+		return 0, false
+	}
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	return f, true
 }

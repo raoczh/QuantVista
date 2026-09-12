@@ -2,6 +2,7 @@ package main
 
 import (
 	"embed"
+	"fmt"
 	"os"
 
 	"quantvista/common"
@@ -21,11 +22,8 @@ var webFS embed.FS
 
 func main() {
 	// 本地开发：尝试加载 .env（生产由容器环境变量注入，无文件不报错）。
-	for _, p := range []string{".env", "../deploy/.env"} {
-		if _, err := os.Stat(p); err == nil {
-			_ = godotenv.Load(p)
-			break
-		}
+	if err := loadEnvironmentFiles(".env", "../deploy/.env"); err != nil {
+		common.FatalLog("启动配置加载失败: %v", err)
 	}
 
 	common.InitConfig()
@@ -100,4 +98,22 @@ func main() {
 	if err := engine.Run(addr); err != nil {
 		common.FatalLog("服务启动失败: %v", err)
 	}
+}
+
+// loadEnvironmentFiles 只加载首个存在的文件；损坏或不可读的首选配置不能静默跳过。
+// dotenv 解析错误可能携带原文，因此错误中只保留路径，不转发文件内容。
+func loadEnvironmentFiles(paths ...string) error {
+	for _, path := range paths {
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("环境文件 %q 无法访问，请检查路径与读取权限", path)
+		}
+		if err := godotenv.Load(path); err != nil {
+			return fmt.Errorf("环境文件 %q 读取或解析失败，请检查文件格式与权限", path)
+		}
+		return nil
+	}
+	return nil
 }

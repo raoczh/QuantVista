@@ -14,7 +14,7 @@ withDefaults(
 <template>
   <n-card
     class="section-card"
-    :class="{ 'is-hoverable': hoverable }"
+    :class="{ 'is-hoverable': hoverable, 'has-title': !!title }"
     :size="size"
     :bordered="true"
   >
@@ -65,7 +65,19 @@ withDefaults(
 /* 移动端：卡片内容区可横向滚动，宽表格不撑破整页布局；
  * 表格单元格不折行（挤压成一列一字反而没法看），滚动查看。 */
 @media (max-width: 768px) {
-  .section-card :deep(.n-card__content) {
+  .section-card.has-title :deep(.n-card-header) {
+    flex-wrap: wrap;
+  }
+  .section-card.has-title :deep(.n-card-header__main) {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+  .section-card.has-title :deep(.n-card-header__extra) {
+    width: 100%;
+    margin-left: 0;
+    justify-content: flex-start;
+  }
+  .section-card :deep(.n-card-content) {
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
   }

@@ -144,7 +144,7 @@ func (ac *AlertController) SetEventStatus(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	ev, err := ac.svc.SetEventStatus(currentUserID(c), id, body.Status)
+	ev, err := ac.svc.SetEventStatusContext(c.Request.Context(), currentUserID(c), id, body.Status)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -154,7 +154,7 @@ func (ac *AlertController) SetEventStatus(c *gin.Context) {
 
 // ReadAllEvents PUT /api/alerts/events/read-all —— 全部未读标记已读。
 func (ac *AlertController) ReadAllEvents(c *gin.Context) {
-	n, err := ac.svc.MarkAllEventsRead(currentUserID(c))
+	n, err := ac.svc.MarkAllEventsReadContext(c.Request.Context(), currentUserID(c))
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return

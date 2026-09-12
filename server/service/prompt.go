@@ -1,7 +1,9 @@
 package service
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"sync"
@@ -230,12 +232,15 @@ func advancePromptChampionState(tx *gorm.DB, state *model.PromptChampionState) e
 	return nil
 }
 
-func promptChampionGeneration(db *gorm.DB, userID int64, module string) (int64, bool) {
+func promptChampionGeneration(db *gorm.DB, userID int64, module string) (int64, bool, error) {
 	var state model.PromptChampionState
 	if err := db.Where("user_id = ? AND module = ?", userID, module).First(&state).Error; err != nil {
-		return 0, false
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, err
 	}
-	return state.Generation, true
+	return state.Generation, true, nil
 }
 
 func normalizePromptInput(in PromptInput) (module, content, hash string, warnings []string, err error) {
@@ -267,14 +272,57 @@ func sameStoredPromptRow(a, b *model.PromptTemplate) bool {
 
 func promptTemplateCAS(tx *gorm.DB, tpl *model.PromptTemplate) *gorm.DB {
 	return tx.Model(&model.PromptTemplate{}).
-		Where("id = ? AND user_id = ? AND module = ? AND content = ? AND content_hash = ? AND revision = ? AND enabled = ?",
+		Where("id = ? AND user_id = ? AND module = ? AND content = ? AND COALESCE(content_hash, '') = ? AND COALESCE(revision, 0) = ? AND enabled = ?",
 			tpl.ID, tpl.UserID, tpl.Module, tpl.Content, tpl.ContentHash, tpl.Revision, tpl.Enabled)
+}
+
+// 启动时基线迁移可能只告警而继续服务。任何模板变更前都必须在同一事务保留
+// 旧正文；存档失败就回滚本次变更，不能仅保存新模板而永久丢失旧版本。
+func ensurePromptTemplateBaselineTx(tx *gorm.DB, tpl *model.PromptTemplate) error {
+	hash := promptContentHash(tpl.Content)
+	revision := tpl.Revision
+	if revision < 1 {
+		revision = 1
+	}
+	var existing model.PromptTemplateRevision
+	err := tx.Where("template_id = ? AND revision = ?", tpl.ID, revision).First(&existing).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	matched := err == nil && existing.Content == tpl.Content && existing.ContentHash == hash &&
+		existing.UserID == tpl.UserID && existing.Module == tpl.Module
+	if err == nil && !matched {
+		// 不覆盖已存在的历史快照；失步元数据使用新的可用版本号。
+		var maxRevision int
+		if err := tx.Model(&model.PromptTemplateRevision{}).Where("template_id = ?", tpl.ID).
+			Select("COALESCE(MAX(revision), 0)").Scan(&maxRevision).Error; err != nil {
+			return err
+		}
+		revision = maxRevision + 1
+	}
+	if !matched {
+		if err := tx.Create(&model.PromptTemplateRevision{TemplateID: tpl.ID, UserID: tpl.UserID, Module: tpl.Module,
+			Revision: revision, ContentHash: hash, Content: tpl.Content}).Error; err != nil {
+			return err
+		}
+	}
+	if tpl.ContentHash != hash || tpl.Revision != revision {
+		res := promptTemplateCAS(tx, tpl).Updates(map[string]any{"content_hash": hash, "revision": revision})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected != 1 {
+			return errPromptTemplateConcurrent
+		}
+		tpl.ContentHash, tpl.Revision = hash, revision
+	}
+	return nil
 }
 
 // upsertPromptTemplateTx 是模板 revision 写入的事务内内核。requireExpected=true 时，
 // expected（nil 表示期望仍无模板行）是调用方先前校验过的 CAS 锚；任何并发编辑都会令
-// 条件更新/唯一键创建失败，外层事务随之整体回滚。SQL 只使用条件 UPDATE/INSERT，兼容
-// SQLite 与 MySQL，不依赖 FOR UPDATE 方言。
+// 条件更新/唯一键创建失败，外层事务随之整体回滚。MySQL 按 champion→模板顺序锁定，
+// 同时与其他实例的基线迁移串行；SQLite 仍由外层短临界区与条件更新保护。
 func upsertPromptTemplateTx(tx *gorm.DB, userID int64, module, content, hash string, enabled bool,
 	expected *model.PromptTemplate, requireExpected bool) (*model.PromptTemplate, error) {
 	state, err := lockPromptChampionState(tx, userID, module)
@@ -282,7 +330,7 @@ func upsertPromptTemplateTx(tx *gorm.DB, userID int64, module, content, hash str
 		return nil, err
 	}
 	var tpl model.PromptTemplate
-	findErr := tx.Where("user_id = ? AND module = ?", userID, module).First(&tpl).Error
+	findErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("user_id = ? AND module = ?", userID, module).First(&tpl).Error
 	var current *model.PromptTemplate
 	if findErr == nil {
 		current = &tpl
@@ -316,6 +364,9 @@ func upsertPromptTemplateTx(tx *gorm.DB, userID int64, module, content, hash str
 		return &tpl, nil
 	}
 
+	if err := ensurePromptTemplateBaselineTx(tx, &tpl); err != nil {
+		return nil, err
+	}
 	oldHash := tpl.ContentHash
 	if oldHash == "" {
 		// 升级前旧行：hash 列为空，按现存内容补算再比较。
@@ -390,11 +441,14 @@ func (s *PromptService) Delete(userID, id int64) error {
 			return err
 		}
 		var current model.PromptTemplate
-		if err := tx.Where("id = ? AND user_id = ? AND module = ?", id, userID, probe.Module).
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ? AND module = ?", id, userID, probe.Module).
 			First(&current).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return errors.New("模板不存在")
 			}
+			return err
+		}
+		if err := ensurePromptTemplateBaselineTx(tx, &current); err != nil {
 			return err
 		}
 		res := promptTemplateCAS(tx, &current).Delete(&model.PromptTemplate{})
@@ -428,9 +482,7 @@ func promptTemplateRowHash(row *model.PromptTemplate) string {
 	if row == nil {
 		return ""
 	}
-	if row.ContentHash != "" {
-		return row.ContentHash
-	}
+	// 旧迁移或存量元数据可能失步，归因必须以本次实际读取的原文为准。
 	return promptContentHash(row.Content)
 }
 
@@ -447,28 +499,44 @@ type promptRuntime struct {
 	Revision        int
 	Generation      int64 // 用户/模块 champion 单调代际
 	GenerationKnown bool  // false 仅表示尚无 state 行；实验创建会先建立该行
+	ReadError       error `json:"-"` // 业务入口必须拒绝读取故障，不能把它解释为没有自定义模板。
 }
 
 // loadPromptRuntime 一次查询固化用户某模块的模板快照。无启用模板返回零值（Custom=false，
 // Render 回退默认、Version 回退裸 base）。升级前旧行 content_hash 为空时读取侧现算
 // （启动迁移 MigratePromptTemplateBaselines 已回填，这里是双保险）。
 func loadPromptRuntime(userID int64, module string) promptRuntime {
-	generation, generationKnown := promptChampionGeneration(common.DB, userID, module)
-	tpl := userPromptTemplateRow(userID, module)
-	if tpl == nil {
-		return promptRuntime{Module: module, Generation: generation, GenerationKnown: generationKnown}
+	pr := promptRuntime{Module: module}
+	if common.DB == nil {
+		pr.ReadError = errors.New("提示词数据库不可用")
+		return pr
 	}
-	h := promptTemplateRowHash(tpl)
-	return promptRuntime{
-		Module: module, Custom: true,
-		Raw: strings.TrimSpace(tpl.Content), Hash: h, Revision: tpl.Revision,
-		Generation: generation, GenerationKnown: generationKnown,
+	err := readSnapshotTx(context.Background(), func(tx *gorm.DB) error {
+		var state model.PromptChampionState
+		if err := tx.Where("user_id = ? AND module = ?", userID, module).First(&state).Error; err == nil {
+			pr.Generation, pr.GenerationKnown = state.Generation, true
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		var tpl model.PromptTemplate
+		if err := tx.Where("user_id = ? AND module = ? AND enabled = ?", userID, module, true).First(&tpl).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		pr.Custom, pr.Raw, pr.Hash, pr.Revision = true, strings.TrimSpace(tpl.Content), promptTemplateRowHash(&tpl), tpl.Revision
+		return nil
+	})
+	if err != nil {
+		pr.ReadError = fmt.Errorf("提示词读取失败：%w", err)
 	}
+	return pr
 }
 
 // Render 渲染快照正文（占位符宽容渲染）。Custom=false 返回 ("", false)，调用方回退默认。
 func (pr promptRuntime) Render(vars map[string]string) (string, bool) {
-	if !pr.Custom || pr.Raw == "" {
+	if pr.ReadError != nil || !pr.Custom || pr.Raw == "" {
 		return "", false
 	}
 	return renderPromptTemplate(pr.Raw, vars), true
@@ -477,6 +545,9 @@ func (pr promptRuntime) Render(vars map[string]string) (string, bool) {
 // Version 版本归因串：Custom 时 base+"-custom."+hash8（同一快照的正文与版本必然一致），
 // 否则裸 base。
 func (pr promptRuntime) Version(base string) string {
+	if pr.ReadError != nil {
+		return ""
+	}
 	if !pr.Custom {
 		return base
 	}

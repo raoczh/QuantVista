@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import {
   NAlert,
   NButton,
@@ -35,6 +35,7 @@ import {
 import SectionCard from '@/components/SectionCard.vue'
 import { useUi } from '@/composables/useUi'
 import { useAuthStore } from '@/stores/auth'
+import { getSessionEpoch } from '@/api/token'
 import {
   browserDeviceKey,
   browserNotificationSupported,
@@ -50,6 +51,15 @@ import {
 const message = useMessage()
 const { vars } = useUi()
 const auth = useAuthStore()
+const ownerID = auth.user?.id || 0
+const session = getSessionEpoch()
+let disposed = false
+const active = () => !disposed && ownerID > 0 && auth.user?.id === ownerID && getSessionEpoch() === session
+onBeforeUnmount(() => { disposed = true })
+const pendingWrite = ref(false)
+let preferenceRead = 0
+let channelsRead = 0
+let browserRead = 0
 
 const preference = ref<UserPreference | null>(null)
 const preferenceLoading = ref(false)
@@ -64,8 +74,13 @@ const guard = reactive({
   take_profit: true,
   evening: true,
 })
+const guardDefaults = { ...guard }
+const preferenceBaseline = ref('')
+const preferenceFingerprint = () => JSON.stringify({ enable_notify: preference.value?.enable_notify, guard })
+const preferenceDirty = computed(() => !!preference.value && preferenceFingerprint() !== preferenceBaseline.value)
 
 function parseGuard(raw: string) {
+  Object.assign(guard, guardDefaults)
   if (!raw) return
   try {
     const value = JSON.parse(raw)
@@ -76,40 +91,49 @@ function parseGuard(raw: string) {
 }
 
 async function loadPreference() {
+  if (!active()) return
+  const read = ++preferenceRead
   preferenceLoading.value = true
   preferenceError.value = ''
   try {
     const value = await getPreference()
-    preference.value = value
-    parseGuard(value.guard_config_json)
+    if (!active() || read !== preferenceRead) return
+    if (!preferenceDirty.value) {
+      preference.value = value
+      parseGuard(value.guard_config_json)
+      preferenceBaseline.value = preferenceFingerprint()
+    }
   } catch {
+    if (!active() || read !== preferenceRead) return
     preferenceError.value = preference.value
       ? '通知设置刷新失败，继续保留上次加载的数据。'
       : '通知设置加载失败，请重试。'
   } finally {
-    preferenceLoading.value = false
+    if (active() && read === preferenceRead) preferenceLoading.value = false
   }
 }
 
 async function savePreference() {
-  if (!preference.value) return
+  if (!preference.value || pendingWrite.value || !active()) return
+  const desired = { enable_notify: preference.value.enable_notify, guard_config_json: JSON.stringify(guard) }
+  pendingWrite.value = true
+  preferenceRead++
+  preferenceLoading.value = false
   preferenceSaving.value = true
   preferenceError.value = ''
   try {
-    const latest = await getPreference()
-    const payload = {
-      ...latest,
-      enable_notify: preference.value.enable_notify,
-      guard_config_json: JSON.stringify(guard),
-    }
-    const saved = await updatePreference(payload)
+    const saved = await updatePreference(desired)
+    if (!active()) return
     preference.value = saved
     parseGuard(saved.guard_config_json)
+    preferenceBaseline.value = preferenceFingerprint()
     message.success('通知设置已保存')
   } catch {
+    if (!active()) return
     preferenceError.value = '通知设置保存失败，已填写内容仍保留，可直接重试。'
   } finally {
     preferenceSaving.value = false
+    pendingWrite.value = false
   }
 }
 
@@ -138,13 +162,18 @@ function channelTypeLabel(kind: NotifyKind) {
   return 'Webhook'
 }
 
-function resetChannelForm() {
+function clearChannelForm() {
   editingID.value = null
   Object.assign(channelForm, { kind: 'serverchan', name: '', target: '', enabled: true })
   Object.assign(ntfyForm, { url: '', topic: '', token: '' })
 }
 
+function resetChannelForm() {
+  if (!pendingWrite.value) clearChannelForm()
+}
+
 function editChannel(channel: NotifyChannel) {
+  if (pendingWrite.value || !active()) return
   editingID.value = channel.id
   Object.assign(channelForm, {
     kind: channel.kind,
@@ -156,16 +185,21 @@ function editChannel(channel: NotifyChannel) {
 }
 
 async function loadChannels() {
+  if (!active()) return
+  const read = ++channelsRead
   channelsLoading.value = true
   channelsError.value = ''
   try {
-    channels.value = await listChannels()
+    const value = await listChannels()
+    if (!active() || read !== channelsRead) return
+    channels.value = value
   } catch {
+    if (!active() || read !== channelsRead) return
     channelsError.value = channels.value.length
       ? '通道刷新失败，继续保留上次加载的数据。'
       : '推送通道加载失败，请重试。'
   } finally {
-    channelsLoading.value = false
+    if (active() && read === channelsRead) channelsLoading.value = false
   }
 }
 
@@ -193,61 +227,84 @@ function buildTarget(): string | null {
 }
 
 async function saveChannel() {
-  if (channelSaving.value) return
+  if (pendingWrite.value || !active()) return
   const target = buildTarget()
   if (target === null) return
+  const id = editingID.value
+  const payload = { kind: channelForm.kind, name: channelForm.name.trim(), target, enabled: channelForm.enabled }
+  pendingWrite.value = true
+  channelsRead++
+  channelsLoading.value = false
   channelSaving.value = true
   channelsError.value = ''
   try {
-    const payload = {
-      kind: channelForm.kind,
-      name: channelForm.name.trim(),
-      target,
-      enabled: channelForm.enabled,
-    }
-    if (editingID.value) await updateChannel(editingID.value, payload)
+    if (id) await updateChannel(id, payload)
     else await createChannel(payload)
-    message.success(editingID.value ? '推送通道已更新' : '推送通道已添加')
-    resetChannelForm()
+    if (!active()) return
+    message.success(id ? '推送通道已更新' : '推送通道已添加')
+    clearChannelForm()
     await Promise.all([loadChannels(), loadPreference()])
   } catch {
+    if (!active()) return
     channelsError.value = '推送通道保存失败，已填写内容和现有通道仍保留。'
   } finally {
     channelSaving.value = false
+    pendingWrite.value = false
   }
 }
 
 async function toggleChannel(channel: NotifyChannel) {
+  if (pendingWrite.value || !active()) return
+  pendingWrite.value = true
+  channelsRead++
+  channelsLoading.value = false
   try {
     await updateChannel(channel.id, {
-      kind: channel.kind,
-      name: channel.name,
       enabled: !channel.enabled,
     })
-    await loadChannels()
+    if (!active()) return
+    await Promise.all([loadChannels(), loadPreference()])
   } catch {
+    if (!active()) return
     channelsError.value = '通道状态更新失败，现有状态未改动。'
+  } finally {
+    pendingWrite.value = false
   }
 }
 
 async function testSavedChannel(channel: NotifyChannel) {
+  if (pendingWrite.value || !active()) return
+  pendingWrite.value = true
   try {
     await testChannel(channel.id)
+    if (!active()) return
     message.success('测试推送已发送，请在对应客户端查收')
     await loadChannels()
   } catch {
+    if (!active()) return
     channelsError.value = '测试推送失败，请检查通道配置后重试。'
+  } finally {
+    pendingWrite.value = false
   }
 }
 
 async function removeChannel(channel: NotifyChannel) {
+  if (pendingWrite.value || !active()) return
+  pendingWrite.value = true
+  channelsRead++
+  channelsLoading.value = false
   try {
     await deleteChannel(channel.id)
-    if (editingID.value === channel.id) resetChannelForm()
+    if (!active()) return
+    if (editingID.value === channel.id) clearChannelForm()
     await loadChannels()
+    if (!active()) return
     message.success('推送通道已删除')
   } catch {
-    channelsError.value = '推送通道删除失败，原通道仍保留。'
+    if (!active()) return
+    channelsError.value = '推送通道删除结果暂时无法确认，请刷新后重试。'
+  } finally {
+    pendingWrite.value = false
   }
 }
 
@@ -256,6 +313,8 @@ const browserConfig = ref<BrowserNotificationConfig | null>(null)
 const browserLoading = ref(false)
 const browserSaving = ref(false)
 const browserError = ref('')
+const browserBaseline = ref('')
+const browserDirty = computed(() => !!browserConfig.value && JSON.stringify(browserConfig.value.settings) !== browserBaseline.value)
 const permission = ref(browserPermission())
 const browserSupported = browserNotificationSupported()
 const pushSupported = webPushSupported()
@@ -271,19 +330,26 @@ const permissionLabel = computed(() => {
 })
 
 async function loadBrowserConfig() {
+  if (!active()) return
+  const read = ++browserRead
   browserLoading.value = true
   browserError.value = ''
   permission.value = browserPermission()
   try {
-    browserConfig.value = await getBrowserNotificationConfig()
+    const value = await getBrowserNotificationConfig()
+    if (!active() || read !== browserRead) return
+    if (browserDirty.value && browserConfig.value) value.settings = { ...browserConfig.value.settings }
+    else browserBaseline.value = JSON.stringify(value.settings)
+    browserConfig.value = value
     if (currentDeviceID.value && !browserConfig.value.devices.some((item) => item.id === currentDeviceID.value)) {
       currentDeviceID.value = null
-      rememberBrowserDeviceID(auth.user?.id || 0, null)
+      rememberBrowserDeviceID(ownerID, null)
     }
   } catch {
+    if (!active() || read !== browserRead) return
     browserError.value = browserConfig.value ? '浏览器通知状态刷新失败，继续保留上次数据。' : '浏览器通知状态加载失败，请重试。'
   } finally {
-    browserLoading.value = false
+    if (active() && read === browserRead) browserLoading.value = false
   }
 }
 
@@ -293,7 +359,12 @@ function deviceName() {
 }
 
 async function enableBrowserNotification(force = false) {
-  if (browserSaving.value) return
+  if (pendingWrite.value || !active()) return
+  if (!browserConfig.value || browserLoading.value) {
+    browserError.value = '请先加载浏览器通知状态后重试。'
+    return
+  }
+  const config = browserConfig.value
   if (!browserSupported) {
     browserError.value = '当前浏览器不支持 Notification API。'
     return
@@ -303,10 +374,14 @@ async function enableBrowserNotification(force = false) {
     return
   }
   browserSaving.value = true
+  pendingWrite.value = true
+  browserRead++
+  browserLoading.value = false
   browserError.value = ''
   try {
     // 权限申请严格位于用户点击处理函数中，页面加载时绝不调用。
     const result = Notification.permission === 'granted' ? 'granted' : await Notification.requestPermission()
+    if (!active()) return
     permission.value = result
     if (result !== 'granted') {
       browserError.value = result === 'denied'
@@ -319,19 +394,22 @@ async function enableBrowserNotification(force = false) {
     // VAPID 且当前浏览器支持 PushManager 时，才尝试注册并订阅 Web Push；
     // 注册或订阅失败仍要保留前台通知能力。
     let pushInput: { endpoint?: string; p256dh?: string; auth?: string } = {}
-    let pushFallback = !!browserConfig.value?.vapid_configured && !pushSupported
-    if (browserConfig.value?.vapid_configured && pushSupported) {
+    let pushFallback = config.vapid_configured && !pushSupported
+    if (config.vapid_configured && pushSupported) {
       try {
         const registration = await ensureNotificationServiceWorker()
+        if (!active()) return
         let subscription = await registration.pushManager.getSubscription()
+        if (!active()) return
         if (force && subscription) {
           await subscription.unsubscribe()
+          if (!active()) return
           subscription = null
         }
         if (!subscription) {
           subscription = await registration.pushManager.subscribe({
             userVisibleOnly: true,
-            applicationServerKey: urlBase64ToUint8Array(browserConfig.value.vapid_public_key),
+            applicationServerKey: urlBase64ToUint8Array(config.vapid_public_key),
           })
         }
         pushInput = pushSubscriptionInput(subscription)
@@ -340,62 +418,101 @@ async function enableBrowserNotification(force = false) {
       }
     }
 
+    if (!active()) return
     const saved = await upsertBrowserSubscription({
-      device_key: browserDeviceKey(auth.user?.id || 0),
+      device_key: browserDeviceKey(ownerID),
       name: deviceName(),
       ...pushInput,
     })
+    if (!active()) return
     currentDeviceID.value = saved.id
-    rememberBrowserDeviceID(auth.user?.id || 0, saved.id)
+    rememberBrowserDeviceID(ownerID, saved.id)
     await Promise.all([loadBrowserConfig(), loadPreference()])
+    if (!active()) return
     if (pushFallback) message.warning('Web Push 订阅失败，已保留网站打开期间的浏览器通知。')
     else message.success(saved.has_web_push ? '浏览器通知和 Web Push 已开启' : '网站打开期间的浏览器通知已开启')
   } catch (error) {
+    if (!active()) return
     browserError.value = (error as Error).message || '浏览器通知开启失败，请重试。'
   } finally {
     browserSaving.value = false
+    pendingWrite.value = false
   }
 }
 
 async function removeDevice(device: BrowserNotificationDevice) {
+  if (pendingWrite.value || !active()) return
+  pendingWrite.value = true
+  browserSaving.value = true
+  browserRead++
+  browserLoading.value = false
+  const current = device.id === currentDeviceID.value
   try {
     await removeBrowserDevice(device.id)
-    if (device.id === currentDeviceID.value) {
+    if (!active()) return
+    if (current) {
       if ('serviceWorker' in navigator) {
-        const registration = await navigator.serviceWorker.getRegistration('/')
-        const subscription = await registration?.pushManager.getSubscription()
-        await subscription?.unsubscribe().catch(() => false)
+        try {
+          const registration = await navigator.serviceWorker.getRegistration('/')
+          if (!active()) return
+          const subscription = await registration?.pushManager.getSubscription()
+          if (!active()) return
+          await subscription?.unsubscribe().catch(() => false)
+        } catch { /* 服务端已移除设备，本地清理失败不改变该结果。 */ }
       }
+      if (!active()) return
       currentDeviceID.value = null
-      rememberBrowserDeviceID(auth.user?.id || 0, null)
+      rememberBrowserDeviceID(ownerID, null)
     }
     await loadBrowserConfig()
+    if (!active()) return
     message.success('浏览器通知设备已移除')
   } catch {
-    browserError.value = '设备移除失败，原订阅仍保留。'
+    if (!active()) return
+    browserError.value = '设备移除结果暂时无法确认，请刷新状态后重试。'
+  } finally {
+    browserSaving.value = false
+    pendingWrite.value = false
   }
 }
 
 async function saveBrowserSettings() {
-  if (!browserConfig.value) return
+  if (!browserConfig.value || pendingWrite.value || !active()) return
+  const settings = { ...browserConfig.value.settings }
+  pendingWrite.value = true
+  browserRead++
+  browserLoading.value = false
   browserSaving.value = true
+  browserError.value = ''
   try {
-    browserConfig.value.settings = await updateBrowserNotificationSettings(browserConfig.value.settings)
+    const saved = await updateBrowserNotificationSettings(settings)
+    if (!active() || !browserConfig.value) return
+    browserConfig.value.settings = saved
+    browserBaseline.value = JSON.stringify(saved)
     message.success('浏览器通知分类已保存')
   } catch {
+    if (!active()) return
     browserError.value = '浏览器通知分类保存失败，请重试。'
   } finally {
     browserSaving.value = false
+    pendingWrite.value = false
   }
 }
 
 async function sendBrowserTest() {
-  if (!currentDevice.value) return
+  if (!currentDevice.value || pendingWrite.value || !active()) return
+  pendingWrite.value = true
+  browserSaving.value = true
   try {
-    await testBrowserNotification(browserDeviceKey(auth.user?.id || 0))
+    await testBrowserNotification(browserDeviceKey(ownerID))
+    if (!active()) return
     message.success('测试通知已发送')
   } catch {
+    if (!active()) return
     browserError.value = '测试通知失败，请重新订阅后重试。'
+  } finally {
+    browserSaving.value = false
+    pendingWrite.value = false
   }
 }
 
@@ -413,11 +530,11 @@ onMounted(() => {
         <n-alert v-if="preferenceError" type="warning" title="通知设置需要处理" :bordered="false" class="section-alert">
           {{ preferenceError }}
           <div class="recover-row">
-            <n-button size="small" :loading="preferenceLoading" @click="loadPreference">重新加载</n-button>
-            <n-button v-if="preference" size="small" type="primary" :loading="preferenceSaving" @click="savePreference">重试保存</n-button>
+            <n-button :disabled="pendingWrite" size="small" :loading="preferenceLoading" @click="loadPreference">重新加载</n-button>
+            <n-button :disabled="pendingWrite" v-if="preference" size="small" type="primary" :loading="preferenceSaving" @click="savePreference">重试保存</n-button>
           </div>
         </n-alert>
-        <n-form v-if="preference" label-placement="top" :show-feedback="false" class="notify-form">
+        <n-form :disabled="pendingWrite" v-if="preference" label-placement="top" :show-feedback="false" class="notify-form">
           <n-form-item label="推送总闸">
             <div class="switch-row">
               <n-switch v-model:value="preference.enable_notify" />
@@ -451,7 +568,8 @@ onMounted(() => {
               </template>
             </div>
           </n-form-item>
-          <n-button type="primary" :loading="preferenceSaving" @click="savePreference">保存通知设置</n-button>
+          <p v-if="preferenceDirty" class="channel-hint">通知设置有未保存的修改。</p>
+          <n-button :disabled="pendingWrite" type="primary" :loading="preferenceSaving" @click="savePreference">保存通知设置</n-button>
         </n-form>
       </n-spin>
     </SectionCard>
@@ -460,14 +578,14 @@ onMounted(() => {
       <n-spin :show="browserLoading && !browserConfig">
         <n-alert v-if="browserError" type="warning" title="浏览器通知需要处理" :bordered="false" class="section-alert">
           {{ browserError }}
-          <div class="recover-row"><n-button size="small" @click="loadBrowserConfig">重新加载</n-button></div>
+          <div class="recover-row"><n-button :disabled="pendingWrite" size="small" @click="loadBrowserConfig">重新加载</n-button></div>
         </n-alert>
 
         <div class="browser-status-grid">
           <div><span>浏览器支持</span><n-tag size="small" :type="browserSupported ? 'success' : 'default'">{{ browserSupported ? '支持' : '不支持' }}</n-tag></div>
           <div><span>通知权限</span><n-tag size="small" :type="permission === 'granted' ? 'success' : permission === 'denied' ? 'error' : 'warning'">{{ permissionLabel }}</n-tag></div>
-          <div><span>Web Push 服务</span><n-tag size="small" :type="browserConfig?.vapid_configured ? 'success' : 'default'">{{ browserConfig?.vapid_configured ? '已配置' : '未配置' }}</n-tag></div>
-          <div><span>当前设备</span><n-tag size="small" :type="deviceActive ? 'success' : 'default'">{{ deviceActive ? (currentDevice?.has_web_push ? '已订阅 Web Push' : '仅前台通知') : '未订阅' }}</n-tag></div>
+          <div><span>Web Push 服务</span><n-tag size="small" :type="browserConfig?.vapid_configured ? 'success' : 'default'">{{ !browserConfig ? (browserLoading ? '读取中' : '未能读取') : browserConfig.vapid_configured ? '已配置' : '未配置' }}</n-tag></div>
+          <div><span>当前设备</span><n-tag size="small" :type="deviceActive ? 'success' : 'default'">{{ !browserConfig ? (browserLoading ? '读取中' : '未能读取') : deviceActive ? (currentDevice?.has_web_push ? '已订阅 Web Push' : '仅前台通知') : '未订阅' }}</n-tag></div>
         </div>
 
         <n-alert type="info" :bordered="false" class="browser-limit">
@@ -478,15 +596,15 @@ onMounted(() => {
         </n-alert>
 
         <div class="browser-actions">
-          <n-button v-if="!deviceActive" type="primary" :loading="browserSaving" @click="enableBrowserNotification(false)">开启浏览器通知</n-button>
+          <n-button :disabled="pendingWrite" v-if="!deviceActive" type="primary" :loading="browserSaving" @click="enableBrowserNotification(false)">开启浏览器通知</n-button>
           <template v-else>
-            <n-button type="primary" :loading="browserSaving" @click="enableBrowserNotification(true)">重新订阅</n-button>
-            <n-button :loading="browserSaving" @click="sendBrowserTest">发送测试通知</n-button>
-            <n-button @click="currentDevice && removeDevice(currentDevice)">关闭当前设备</n-button>
+            <n-button :disabled="pendingWrite" type="primary" :loading="browserSaving" @click="enableBrowserNotification(true)">重新订阅</n-button>
+            <n-button :disabled="pendingWrite" :loading="browserSaving" @click="sendBrowserTest">发送测试通知</n-button>
+            <n-button :disabled="pendingWrite" @click="currentDevice && removeDevice(currentDevice)">关闭当前设备</n-button>
           </template>
         </div>
 
-        <n-form v-if="browserConfig" label-placement="top" :show-feedback="false" class="browser-category-form">
+        <n-form :disabled="pendingWrite" v-if="browserConfig" label-placement="top" :show-feedback="false" class="browser-category-form">
           <n-form-item label="通知分类">
             <div class="switch-grid">
               <label><n-switch v-model:value="browserConfig.settings.exit_risk" size="small" /> 持仓卖出风险</label>
@@ -494,7 +612,8 @@ onMounted(() => {
               <label><n-switch v-model:value="browserConfig.settings.guard" size="small" /> 智能守护事件</label>
             </div>
           </n-form-item>
-          <n-button :loading="browserSaving" @click="saveBrowserSettings">保存通知分类</n-button>
+          <p v-if="browserDirty" class="channel-hint">通知分类有未保存的修改。</p>
+          <n-button :disabled="pendingWrite" :loading="browserSaving" @click="saveBrowserSettings">保存通知分类</n-button>
         </n-form>
 
         <div v-if="browserConfig?.devices.length" class="browser-devices">
@@ -509,7 +628,7 @@ onMounted(() => {
               <n-alert v-if="device.last_error_code" type="warning" :bordered="false">上次 Web Push 失败，建议重新订阅。</n-alert>
             </div>
             <n-popconfirm @positive-click="removeDevice(device)">
-              <template #trigger><n-button size="small" type="error" quaternary>移除设备</n-button></template>
+              <template #trigger><n-button :disabled="pendingWrite" size="small" type="error" quaternary>移除设备</n-button></template>
               移除“{{ device.name }}”的浏览器通知？
             </n-popconfirm>
           </div>
@@ -521,17 +640,17 @@ onMounted(() => {
       <n-alert v-if="channelsError" type="warning" title="推送通道需要处理" :bordered="false" class="section-alert">
         {{ channelsError }}
         <div class="recover-row">
-          <n-button size="small" :loading="channelsLoading" @click="loadChannels">重新加载</n-button>
+          <n-button :disabled="pendingWrite" size="small" :loading="channelsLoading" @click="loadChannels">重新加载</n-button>
         </div>
       </n-alert>
 
-      <n-form label-placement="top" :show-feedback="false" class="channel-form">
+      <n-form :disabled="pendingWrite" label-placement="top" :show-feedback="false" class="channel-form">
         <div class="channel-fields">
           <n-form-item label="通道类型">
-            <n-select v-model:value="channelForm.kind" :options="channelTypeOptions" :disabled="editingID !== null" />
+            <n-select v-model:value="channelForm.kind" :options="channelTypeOptions" :disabled="editingID !== null || pendingWrite" />
           </n-form-item>
           <n-form-item label="显示名称">
-            <n-input v-model:value="channelForm.name" placeholder="留空使用默认名称" />
+            <n-input v-model:value="channelForm.name" :maxlength="64" placeholder="留空使用默认名称" />
           </n-form-item>
         </div>
         <template v-if="channelForm.kind === 'ntfy'">
@@ -556,14 +675,14 @@ onMounted(() => {
           />
         </n-form-item>
         <div class="form-actions">
-          <n-button type="primary" :loading="channelSaving" @click="saveChannel">{{ editingID ? '保存修改' : '添加通道' }}</n-button>
-          <n-button v-if="editingID" @click="resetChannelForm">取消编辑</n-button>
+          <n-button :disabled="pendingWrite" type="primary" :loading="channelSaving" @click="saveChannel">{{ editingID ? '保存修改' : '添加通道' }}</n-button>
+          <n-button :disabled="pendingWrite" v-if="editingID" @click="resetChannelForm">取消编辑</n-button>
         </div>
         <p class="channel-hint">密钥和敏感地址只在保存时提交，服务端加密存储且不会回显。编辑 ntfy 时三项全部留空会保留原配置；如需更换，请重新填写完整的服务地址和 Topic。</p>
       </n-form>
 
       <n-spin :show="channelsLoading && !channels.length">
-        <n-empty v-if="!channels.length && !channelsLoading" description="还没有推送通道" />
+        <n-empty v-if="!channels.length && !channelsLoading && !channelsError" description="还没有推送通道" />
         <div v-else class="channels">
           <div v-for="channel in channels" :key="channel.id" class="channel-row">
             <div class="channel-main">
@@ -578,11 +697,11 @@ onMounted(() => {
               </n-alert>
             </div>
             <div class="channel-actions">
-              <n-button size="small" @click="testSavedChannel(channel)">测试</n-button>
-              <n-button size="small" @click="editChannel(channel)">编辑</n-button>
-              <n-button size="small" @click="toggleChannel(channel)">{{ channel.enabled ? '停用' : '启用' }}</n-button>
+              <n-button :disabled="pendingWrite" size="small" @click="testSavedChannel(channel)">测试</n-button>
+              <n-button :disabled="pendingWrite" size="small" @click="editChannel(channel)">编辑</n-button>
+              <n-button :disabled="pendingWrite" size="small" @click="toggleChannel(channel)">{{ channel.enabled ? '停用' : '启用' }}</n-button>
               <n-popconfirm @positive-click="removeChannel(channel)">
-                <template #trigger><n-button size="small" type="error" quaternary>删除</n-button></template>
+                <template #trigger><n-button :disabled="pendingWrite" size="small" type="error" quaternary>删除</n-button></template>
                 删除推送通道“{{ channel.name }}”？
               </n-popconfirm>
             </div>

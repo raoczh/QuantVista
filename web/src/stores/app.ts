@@ -7,16 +7,19 @@ export const useAppStore = defineStore('app', () => {
   const status = ref<StatusInfo | null>(null)
   const loading = ref(false)
   const error = ref('')
+  let requestSequence = 0
 
   async function refreshStatus() {
+    const sequence = ++requestSequence
     loading.value = true
     error.value = ''
     try {
-      status.value = await getStatus()
+      const value = await getStatus()
+      if (sequence === requestSequence) status.value = value
     } catch (e) {
-      error.value = (e as Error).message
+      if (sequence === requestSequence) error.value = (e as Error).message
     } finally {
-      loading.value = false
+      if (sequence === requestSequence) loading.value = false
     }
   }
 

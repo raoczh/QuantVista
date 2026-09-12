@@ -35,6 +35,9 @@ type PaperHolding struct {
 	Name      string  `gorm:"size:64" json:"name"`
 	Quantity  float64 `gorm:"type:decimal(20,4)" json:"quantity"`
 	AvgCost   float64 `gorm:"type:decimal(20,4)" json:"avg_cost"`
+	// 精确剩余总成本；均价仅供展示。NULL 表示旧数据，须从成交账本恢复或明确估算。
+	RemainingCost      *float64 `gorm:"type:decimal(20,4)" json:"remaining_cost,omitempty"`
+	CostBasisEstimated bool     `gorm:"default:false" json:"cost_basis_estimated"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`

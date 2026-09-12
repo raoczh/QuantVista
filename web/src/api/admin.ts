@@ -1,4 +1,4 @@
-import { request, HEAVY_TIMEOUT } from './client'
+import { request, AI_TIMEOUT, HEAVY_TIMEOUT } from './client'
 import type { AuthUser } from './auth'
 import type { CandidateAuditAdminReport } from './candidateAudit'
 
@@ -375,7 +375,7 @@ export function getLlmCall(id: number) {
 // S3-4 因子 RankIC 验证报表（管理端只读）。
 export interface ICHorizonAgg {
   mean_ic: number
-  icir: number
+  icir: number | null
   win_rate_pct: number
   days: number
 }
@@ -424,6 +424,7 @@ export interface WFMetricFields {
   picked: number
   trades: number
   skipped: number
+  forced: number
   pending: number
   precision_net_pct: number
   median_net_pct: number
@@ -654,7 +655,7 @@ export interface SelectionScoreBlindProtocolStatus {
   score_blind_coverage_pct: number
   coverage_drop_pct: number
   max_coverage_drop_pct: number
-  severe_loss_rate_pct: number
+  severe_loss_rate_pct: number | null
   max_severe_loss_rate_pct: number
   multiple_testing_method: string
   multiple_testing_family: number
@@ -990,6 +991,7 @@ export function getLLMRoles() {
 // ---------- P2-1/P2-2 prompt challenger + S3-6C score-blind 输入实验 ----------
 
 export type LLMExperimentType = 'prompt' | 'score_blind'
+export const SCORE_BLIND_INPUT_SCHEMA_VERSION = 'sb2'
 
 // 服务端历史行可以缺类型，未来版本也可能返回当前前端尚不认识的类型。读取模型保留
 // 未知字符串，页面必须显式 fail-closed；创建接口仍只接受上面的已知类型联合。
@@ -1140,7 +1142,7 @@ export interface LLMReleaseAudit {
 }
 
 export function auditLLMExperiment(id: number) {
-  return request<LLMReleaseAudit>({ url: `/admin/llm-experiments/${id}/audit`, method: 'post', data: {} })
+  return request<LLMReleaseAudit>({ url: `/admin/llm-experiments/${id}/audit`, method: 'post', data: {}, timeout: AI_TIMEOUT })
 }
 
 // ---------- P2-4 模型路由 ----------
@@ -1167,6 +1169,8 @@ export interface LLMRouteView {
   enabled: boolean
   note: string
   max_cost_ratio: number
+  revision: number
+  health_since?: string
   auto_fallback_at?: string
   auto_fallback_reason: string
   created_at: string

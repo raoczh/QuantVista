@@ -44,6 +44,7 @@ import { listPositions, type Position } from '@/api/position'
 import { listWatchlists, type WatchlistGroup } from '@/api/watchlist'
 import { useUi, withAlpha } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
+import { formatPrice } from '@/lib/formatPrice'
 import { useStockActions } from '@/composables/useStockActions'
 import { isEtfSymbol } from '@/api/etf'
 import PageContainer from '@/components/PageContainer.vue'
@@ -164,9 +165,10 @@ function sameStock(item: { symbol: string; market?: string }) {
     && (item.market || 'cn').toLowerCase() === market.value.toLowerCase()
 }
 
-const inWatchlist = computed(() => watchlistGroups.value.some((group) => group.items.some(sameStock)))
+const inWatchlist = computed(() => watchlistKnown.value && watchlistGroups.value.some((group) => group.items.some(sameStock)))
 const matchingPositions = computed(() => positions.value.filter((item) => item.status === 'holding' && item.quantity > 0 && sameStock(item)))
 const positionSummary = computed<PositionRelationSummary | null>(() => {
+  if (!positionsKnown.value) return null
   const items = matchingPositions.value
   if (!items.length) return null
   const quantity = items.reduce((sum, item) => sum + item.quantity, 0)
@@ -214,14 +216,16 @@ const decisionSummary = computed(() => buildDecisionSummary({
   bars: bars.value,
   valuation: valuation.value,
   score: score.value,
-  fundflow: fundflow.value,
+  fundflow: fundflow.value && coverageErrors.funds
+    ? { ...fundflow.value, fresh: false, note: `本次资金流读取失败，显示最近已知数据：${coverageErrors.funds}` }
+    : fundflow.value,
   finance: finance.value,
   corpEvents: corpEvents.value,
   announcements: announcements.value,
   news: news.value,
   eventPhase: eventSummaryPhase.value,
   eventPartial: eventSummaryPartial.value,
-  fundamentalPhase: tabStates.fundamental.phase,
+  fundamentalPhase: tabStates.fundamental.error ? 'error' : tabStates.fundamental.phase,
   exitAssessment: positionSummary.value?.exitAssessment,
 }))
 
@@ -290,7 +294,9 @@ function errorMessage(error: unknown) {
 }
 
 function observedAt() {
-  return new Date().toLocaleString('sv-SE', { hour12: false })
+  const now = new Date()
+  todayStr.value = now.toLocaleDateString('sv-SE')
+  return now.toLocaleString('sv-SE', { hour12: false })
 }
 
 function stockRequestIsCurrent(token: number, requestMarket: string, requestSymbol: string) {
@@ -355,7 +361,14 @@ async function loadQuote(silent = false, stockToken = currentStockToken) {
   } catch (error) {
     if (!stockRequestIsCurrent(stockToken, requestMarket, requestSymbol) || !quoteEpoch.isCurrent(requestToken)) return
     quoteState.error = errorMessage(error)
+    if (quote.value) {
+      quote.value = { ...quote.value, freshness: {
+        captured_at: '', market_state: 'unknown', ...quote.value.freshness,
+        freshness_status: 'unknown', stale_reason: `本次刷新失败，显示最近已知值：${quoteState.error}`,
+      } }
+    }
     quoteState.phase = quote.value ? 'ready' : 'error'
+    quoteState.updatedAt = observedAt()
     markCoverage('quote', error)
   }
 }
@@ -378,15 +391,17 @@ async function loadRelationships(silent = false, stockToken = currentStockToken)
     positions.value = positionResult.value
     positionsKnown.value = true
   } else {
+    positionsKnown.value = false
     errors.push(`持仓：${errorMessage(positionResult.reason)}`)
   }
   if (watchlistResult.status === 'fulfilled') {
     watchlistGroups.value = watchlistResult.value
     watchlistKnown.value = true
   } else {
+    watchlistKnown.value = false
     errors.push(`自选：${errorMessage(watchlistResult.reason)}`)
   }
-  relationshipAsOf.value = observedAt()
+  if (positionResult.status === 'fulfilled' || watchlistResult.status === 'fulfilled') relationshipAsOf.value = observedAt()
   relationshipState.updatedAt = relationshipAsOf.value
   relationshipState.error = errors.join('；')
   relationshipState.phase = positionsKnown.value || watchlistKnown.value ? 'ready' : 'error'
@@ -470,7 +485,7 @@ async function loadTab(tab: TabKey, force = false, stockToken = currentStockToke
         (result) => { minute.value = result },
         stockToken, requestToken, tab, requestMarket, requestSymbol,
       ).then((outcome) => {
-        if (outcome.error) minuteError.value = outcome.error
+        if (outcome.error && stockRequestIsCurrent(stockToken, requestMarket, requestSymbol) && tabEpochs[tab].isCurrent(requestToken)) minuteError.value = outcome.error
         return outcome
       }))
     } else {
@@ -514,7 +529,7 @@ async function loadTab(tab: TabKey, force = false, stockToken = currentStockToke
         },
         stockToken, requestToken, tab, requestMarket, requestSymbol,
       ).then((outcome) => {
-        if (outcome.error) corpEventsError.value = outcome.error
+        if (outcome.error && stockRequestIsCurrent(stockToken, requestMarket, requestSymbol) && tabEpochs[tab].isCurrent(requestToken)) corpEventsError.value = outcome.error
         return outcome
       }))
     }
@@ -548,7 +563,7 @@ async function loadTab(tab: TabKey, force = false, stockToken = currentStockToke
 
   const outcomes = await Promise.all(requests)
   if (!stockRequestIsCurrent(stockToken, requestMarket, requestSymbol) || !tabEpochs[tab].isCurrent(requestToken)) return
-  minuteLoading.value = false
+  if (tab === 'trend') minuteLoading.value = false
   const errors = outcomes.flatMap((outcome) => outcome.error ? [outcome.error] : [])
   const completed = outcomes.filter((outcome) => outcome.ok).length
   state.error = errors.join('；')
@@ -712,7 +727,7 @@ function renderMinuteChart() {
         const p = line.points[i]
         if (!p) return ''
         const change = line.prev_close ? ((p.price / line.prev_close - 1) * 100).toFixed(2) : '-'
-        return `${line.trade_date} ${p.time}<br/>价格 ${p.price.toFixed(2)}（${Number(change) > 0 ? '+' : ''}${change}%）<br/>估算均价 ${p.avg.toFixed(3)}<br/>成交量 ${fmtVol(p.volume)}`
+        return `${line.trade_date} ${p.time}<br/>价格 ${formatPrice(p.price)}（${Number(change) > 0 ? '+' : ''}${change}%）<br/>估算均价 ${formatPrice(p.avg)}<br/>成交量 ${fmtVol(p.volume)}`
       },
     },
     axisPointer: { link: [{ xAxisIndex: 'all' }] },
@@ -749,7 +764,7 @@ function renderMinuteChart() {
         min: Number((line.prev_close - maxDeviation).toFixed(3)),
         max: Number((line.prev_close + maxDeviation).toFixed(3)),
         scale: true,
-        axisLabel: { formatter: (v: number) => v.toFixed(2) },
+        axisLabel: { formatter: (v: number) => v.toFixed(isFund.value ? 3 : 2) },
         splitLine: { lineStyle: { color: vars.value.dividerColor } },
       },
       {
@@ -837,7 +852,7 @@ function renderChipCharts() {
       },
       yAxis: {
         type: 'category',
-        data: c.prices.map((p) => p.toFixed(2)),
+        data: c.prices.map(formatPrice),
         axisLabel: { interval: 29, fontSize: 10 },
         axisTick: { show: false },
       },
@@ -979,7 +994,7 @@ function fmtNetYi(n: number) {
 
 /* B9 解禁 / 分红展示辅助 */
 // 解禁按解禁日拆「未来」与「已过去」：未来的是决策变量，已过去的是背景（刚解禁完的抛压）。
-const todayStr = computed(() => new Date().toLocaleDateString('sv-SE'))
+const todayStr = ref(new Date().toLocaleDateString('sv-SE'))
 const upcomingLifts = computed(() => (corpEvents.value?.lifts || []).filter((l) => l.free_date >= todayStr.value))
 const pastLifts = computed(() => (corpEvents.value?.lifts || []).filter((l) => l.free_date < todayStr.value))
 // C10 当前股息率（后端 pickLatestDividendYield 统一挑选，前端不再自己从 actions 里挑，
@@ -1082,6 +1097,7 @@ const coverageItems = computed<StockCoverageItem[]>(() => {
     available: !!quote.value,
     error: coverageErrors.quote,
     stale: quote.value?.freshness?.freshness_status === 'stale',
+    unknown: !!quote.value && !['fresh', 'stale'].includes(quote.value.freshness?.freshness_status || ''),
   })
   const dailyStatus = resolveCoverageStatus({
     observed: coverageObserved.daily,
@@ -1093,7 +1109,8 @@ const coverageItems = computed<StockCoverageItem[]>(() => {
     observed: coverageObserved.finance,
     available: financeAvailable,
     error: coverageErrors.finance,
-    stale: financeAvailable && isOlderThan(financeAsOf, 220),
+    stale: financeAvailable && (!!finance.value?.note || isOlderThan(financeAsOf, 220)),
+    unknown: !financeAvailable && !!finance.value?.note,
   })
   const newsStatus = resolveCoverageStatus({
     observed: coverageObserved.news,
@@ -1138,7 +1155,7 @@ const coverageItems = computed<StockCoverageItem[]>(() => {
     {
       key: 'finance', label: '财务', status: financeStatus,
       source: '东财 F10', asOf: financeAsOf,
-      note: coverageNote('finance', financeStatus),
+      note: coverageNote('finance', financeStatus, finance.value?.note),
     },
     {
       key: 'news', label: '新闻', status: newsStatus,
@@ -1421,8 +1438,8 @@ function scoreType(total: number) {
             <div v-if="chartMode === 'minute' && minute" class="minute-meta">
               <span>{{ minute.trade_date }}</span>
               <span>累计 {{ fmtVol(minute.total_volume) }}</span>
-              <span>高 {{ fmt(minute.high) }}</span>
-              <span>低 {{ fmt(minute.low) }}</span>
+              <span>高 {{ formatPrice(minute.high) }}</span>
+              <span>低 {{ formatPrice(minute.low) }}</span>
               <span>{{ minute.base_from_open ? '昨收缺失，基准线使用开盘价' : '基准线为昨收' }}</span>
             </div>
             <div v-show="chartMode === 'daily' ? bars.length > 0 : !!minute?.points.length" ref="chartEl" class="kchart"></div>
@@ -1456,11 +1473,11 @@ function scoreType(total: number) {
                 </span>
               </div>
               <div class="quote-grid chip-grid">
-                <div class="qc"><span class="qc-k">平均成本</span><span class="qc-v qv-tnum">{{ chips.avg_cost.toFixed(2) }}</span></div>
-                <div class="qc"><span class="qc-k">现价</span><span class="qc-v qv-tnum">{{ chips.last_close.toFixed(2) }}</span></div>
-                <div class="qc"><span class="qc-k">90% 成本区间</span><span class="qc-v qv-tnum">{{ chips.c90_low.toFixed(2) }} ~ {{ chips.c90_high.toFixed(2) }}</span></div>
+                <div class="qc"><span class="qc-k">平均成本</span><span class="qc-v qv-tnum">{{ formatPrice(chips.avg_cost) }}</span></div>
+                <div class="qc"><span class="qc-k">日线收盘价</span><span class="qc-v qv-tnum">{{ formatPrice(chips.last_close) }}</span></div>
+                <div class="qc"><span class="qc-k">90% 成本区间</span><span class="qc-v qv-tnum">{{ formatPrice(chips.c90_low) }} ~ {{ formatPrice(chips.c90_high) }}</span></div>
                 <div class="qc"><span class="qc-k">90% 集中度</span><span class="qc-v qv-tnum">{{ chips.conc_90.toFixed(1) }}%</span></div>
-                <div class="qc"><span class="qc-k">70% 成本区间</span><span class="qc-v qv-tnum">{{ chips.c70_low.toFixed(2) }} ~ {{ chips.c70_high.toFixed(2) }}</span></div>
+                <div class="qc"><span class="qc-k">70% 成本区间</span><span class="qc-v qv-tnum">{{ formatPrice(chips.c70_low) }} ~ {{ formatPrice(chips.c70_high) }}</span></div>
                 <div class="qc"><span class="qc-k">70% 集中度</span><span class="qc-v qv-tnum">{{ chips.conc_70.toFixed(1) }}%</span></div>
               </div>
               <div class="chip-trend-block">
@@ -1480,6 +1497,8 @@ function scoreType(total: number) {
           <template #extra>
             <span class="src-hint">东财资金流 · 主力=超大单+大单</span>
           </template>
+          <n-alert v-if="coverageErrors.funds" type="warning" :bordered="false" class="state-note">资金流读取失败：{{ coverageErrors.funds }}</n-alert>
+          <n-alert v-else-if="fundflow?.note" type="warning" :bordered="false" class="state-note">{{ fundflow.note }}</n-alert>
           <div v-if="fundflow && fundflow.days.length" class="ff-wrap">
             <div class="quote-grid ff-grid">
               <div class="qc"><span class="qc-k">最新一日</span><span class="qc-v qv-tnum" :style="{ color: pctColor(fundflow.main_net_1d_yi) }">{{ fundflow.main_net_1d_yi.toFixed(2) }} 亿</span></div>
@@ -1493,7 +1512,7 @@ function scoreType(total: number) {
               主力净额=超大单+大单口径（东财），资金流向≠股价必然方向；数据截至 {{ fundflow.last_date }}<span v-if="!fundflow.fresh">（缓存偏旧，稍后自动刷新）</span>；仅研究参考。
             </div>
           </div>
-          <n-empty v-else description="暂无资金流数据（东财源，A 股标的；首次访问自动拉取，可稍后刷新）" />
+          <n-empty v-else-if="!coverageErrors.funds" description="暂无资金流数据（东财源，A 股标的；首次访问自动拉取，可稍后刷新）" />
         </SectionCard>
 
         <!-- 龙虎榜上榜记录（M3a）：本地缓存表（近 30 天回填 + 每日盘后采集） -->
@@ -1527,17 +1546,12 @@ function scoreType(total: number) {
             <n-alert v-if="corpEventsError" type="error" :bordered="false" title="解禁 / 分红读取失败">
               {{ corpEventsError }}——这不代表无解禁，请稍后刷新或自行核查公告。
             </n-alert>
-            <n-alert
-              v-else-if="corpEvents && corpEvents.lift_unavailable"
-              type="warning"
-              :bordered="false"
-              title="解禁数据本次不可用"
-            >
-              {{ corpEvents.note || '同步未完成或查询失败，无法判断解禁风险，请自行核查。' }}
-            </n-alert>
-            <template v-else-if="corpEvents">
+            <template v-if="corpEvents">
               <div class="corp-sub">限售解禁</div>
-              <div v-if="upcomingLifts.length || pastLifts.length" class="lhb-list">
+              <n-alert v-if="corpEvents.lift_unavailable" type="warning" :bordered="false" title="解禁数据本次不可用">
+                {{ corpEvents.note || '同步未完成或查询失败，无法判断解禁风险，请自行核查。' }}
+              </n-alert>
+              <div v-else-if="upcomingLifts.length || pastLifts.length" class="lhb-list">
                 <div v-for="(l, i) in upcomingLifts" :key="'u' + i" class="lhb-row">
                   <span class="news-time qv-tnum">{{ l.free_date }}</span>
                   <n-tag size="tiny" round :bordered="false" type="warning">{{ liftDaysLeft(l.free_date) }}</n-tag>
@@ -1556,7 +1570,7 @@ function scoreType(total: number) {
                   <span class="lhb-num qv-tnum">占流通 {{ l.free_ratio.toFixed(2) }}%</span>
                 </div>
               </div>
-              <n-empty v-else description="近 3 个月至未来半年内无解禁安排（数据已同步，非缺失）" :show-icon="false" />
+              <n-empty v-else-if="!corpEventsError" description="近 3 个月至未来半年内无解禁安排（数据已同步，非缺失）" :show-icon="false" />
 
               <div class="corp-sub">分红送转</div>
               <n-alert v-if="corpEvents.action_unavailable" type="warning" :bordered="false" :show-icon="false">
@@ -1574,9 +1588,9 @@ function scoreType(total: number) {
                   <n-tag v-if="a.progress" size="tiny" round :bordered="false">{{ a.progress }}</n-tag>
                 </div>
               </div>
-              <n-empty v-else description="暂无分红送转方案记录（数据已同步，非缺失）" :show-icon="false" />
+              <n-empty v-else-if="!corpEventsError" description="暂无分红送转方案记录（数据已同步，非缺失）" :show-icon="false" />
             </template>
-            <n-empty v-else description="解禁 / 分红数据加载中" :show-icon="false" />
+            <n-empty v-else-if="!corpEventsError" description="解禁 / 分红数据加载中" :show-icon="false" />
           </n-spin>
         </SectionCard>
 
@@ -1588,6 +1602,7 @@ function scoreType(total: number) {
               <span v-if="a.notice_type" class="news-src">{{ a.notice_type }}</span>
             </div>
           </div>
+          <n-alert v-else-if="coverageErrors.announcements" type="error" :bordered="false">公告读取失败：{{ coverageErrors.announcements }}</n-alert>
           <n-empty v-else description="请求成功，当前没有公告记录" />
         </SectionCard>
 
@@ -1608,6 +1623,7 @@ function scoreType(total: number) {
               <span class="news-src">{{ newsSourceLabel(n) }}</span>
             </div>
           </div>
+          <n-alert v-else-if="coverageErrors.news" type="error" :bordered="false">新闻读取失败：{{ coverageErrors.news }}</n-alert>
           <n-empty v-else description="请求成功，当前没有相关新闻记录" />
         </SectionCard>
         </template>
@@ -1647,7 +1663,7 @@ function scoreType(total: number) {
                 <div class="qc"><span class="qc-k">换手率</span><span class="qc-v qv-tnum">{{ fmt(valuation.turnover_rate) }}%</span></div>
                 <div class="qc"><span class="qc-k">振幅</span><span class="qc-v qv-tnum">{{ fmt(valuation.amplitude) }}%</span></div>
                 <div class="qc"><span class="qc-k">量比</span><span class="qc-v qv-tnum">{{ fmt(valuation.volume_ratio) }}</span></div>
-                <div class="qc"><span class="qc-k">涨停/跌停</span><span class="qc-v qv-tnum">{{ fmt(valuation.limit_up) }} / {{ fmt(valuation.limit_down) }}</span></div>
+                <div class="qc"><span class="qc-k">涨停/跌停</span><span class="qc-v qv-tnum">{{ formatPrice(valuation.limit_up) }} / {{ formatPrice(valuation.limit_down) }}</span></div>
               </div>
               <n-empty v-else description="估值数据暂不可用（腾讯源）" />
             </SectionCard>
@@ -1655,7 +1671,7 @@ function scoreType(total: number) {
           <n-gi>
             <SectionCard title="技术面评分">
               <template v-if="score" #extra>
-                <span class="src-hint">{{ score.trade_date }}</span>
+                <span class="src-hint">行情 {{ score.trade_date }} · 日线截至 {{ score.bars_as_of || '未知' }}</span>
               </template>
               <div v-if="score" class="score">
                 <div class="score-hero">
@@ -1684,6 +1700,7 @@ function scoreType(total: number) {
           <template #extra>
             <span class="src-hint">东财 F10 · 季报口径</span>
           </template>
+          <n-alert v-if="finance?.note" type="warning" :bordered="false" style="margin-bottom: 12px">{{ finance.note }}</n-alert>
           <div v-if="finance && finance.indicators.length" class="fin-wrap">
             <div v-if="finLatest" class="quote-grid fin-grid">
               <div class="qc"><span class="qc-k">报告期</span><span class="qc-v">{{ finLatest.report_name }}</span></div>
@@ -1699,7 +1716,8 @@ function scoreType(total: number) {
             <div ref="finEl" class="fin-chart"></div>
             <div class="src-hint">季报为累计口径且有披露滞后；0 值可能表示上游数据缺失；仅研究参考。</div>
           </div>
-          <n-empty v-else description="暂无财务数据（东财 F10，A 股标的；首次访问自动拉取，可稍后刷新）" />
+          <n-alert v-else-if="coverageErrors.finance" type="error" :bordered="false">财务读取失败：{{ coverageErrors.finance }}</n-alert>
+          <n-empty v-else description="暂无已确认披露的财务数据（东财 F10，可稍后刷新）" />
         </SectionCard>
 
         </template>

@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	auditSignalDate  = "2044-03-04"
-	auditOutcomeDate = "2044-03-07"
+	auditSignalDate  = "2022-03-04"
+	auditOutcomeDate = "2022-03-07"
 )
 
 type auditSeedSymbol struct {
@@ -54,16 +54,16 @@ func seedCandidateAuditFixture(t *testing.T) (shortBatch, longBatch model.Recomm
 	cleanCandidateAuditFixture(t)
 	calendars := []model.TradingCalendar{
 		{Market: "cn", TradeDate: auditSignalDate, IsOpen: true},
-		{Market: "cn", TradeDate: "2044-03-05", IsOpen: false},
-		{Market: "cn", TradeDate: "2044-03-06", IsOpen: false},
+		{Market: "cn", TradeDate: "2022-03-05", IsOpen: false},
+		{Market: "cn", TradeDate: "2022-03-06", IsOpen: false},
 		{Market: "cn", TradeDate: auditOutcomeDate, IsOpen: true},
-		{Market: "cn", TradeDate: "2044-03-08", IsOpen: true},
+		{Market: "cn", TradeDate: "2022-03-08", IsOpen: true},
 	}
 	if err := common.DB.Create(&calendars).Error; err != nil {
 		t.Fatalf("交易日历: %v", err)
 	}
 
-	now := time.Date(2044, 3, 7, 18, 0, 0, 0, time.Local)
+	now := time.Date(2022, 3, 7, 18, 0, 0, 0, time.Local)
 	finished := now
 	discoveryRuns := []model.CandidateDiscoveryRun{
 		{OwnerType: model.JobOwnerSystem, Market: "cn", TradeDate: auditSignalDate, AsOf: now.Add(-72 * time.Hour),
@@ -139,7 +139,7 @@ func seedCandidateAuditFixture(t *testing.T) (shortBatch, longBatch model.Recomm
 		t.Fatalf("发现明细: %v", err)
 	}
 
-	created := time.Date(2044, 3, 4, 17, 0, 0, 0, time.Local)
+	created := time.Date(2022, 3, 4, 17, 0, 0, 0, time.Local)
 	shortBatch = model.RecommendationBatch{UserID: 71, Type: model.RecTypeShortTerm, Market: "cn",
 		Status: model.RecStatusSuccess, FactsRecorded: true, Regime: "offense", CreatedAt: created}
 	longBatch = model.RecommendationBatch{UserID: 72, Type: model.RecTypeLongTerm, Market: "cn",
@@ -183,9 +183,9 @@ func TestCandidateAuditAdjacentTradingDaysAndExecutionExclusions(t *testing.T) {
 		t.Fatalf("周末后周一必须相邻到周五: previous=%s err=%v", previous, err)
 	}
 	if _, err := ExecuteCandidateAudit(context.Background(), nil, 0, candidateAuditJobRequest{
-		Market: "cn", SignalDate: auditSignalDate, OutcomeDate: "2044-03-08",
+		Market: "cn", SignalDate: auditSignalDate, OutcomeDate: "2022-03-08",
 		ParameterHash: candidateAuditParameterHash(),
-	}); err == nil || !strings.Contains(err.Error(), "previous=2044-03-07") {
+	}); err == nil || !strings.Contains(err.Error(), "previous=2022-03-07") {
 		t.Fatalf("停机日不得跳过周一回退周五: %v", err)
 	}
 
@@ -302,7 +302,7 @@ func TestCandidateAuditReasonStagesUnknownAndSampleDiscipline(t *testing.T) {
 	cleanCandidateAuditFixture(t)
 	finished := time.Now()
 	sealed := model.CandidateAuditRun{OwnerType: model.JobOwnerSystem, Market: "cn",
-		SignalDate: "2044-05-04", OutcomeDate: "2044-05-05", AuditVersion: CandidateAuditVersion,
+		SignalDate: "2022-05-04", OutcomeDate: "2022-05-05", AuditVersion: CandidateAuditVersion,
 		ParameterHash: candidateAuditParameterHash(), DiscoveryVersion: DiscoveryVersion,
 		FactorVersion: factorSnapshotVersion, OutcomeVersion: candidateAuditOutcomeVersion,
 		ParameterJSON: candidateAuditParameterJSON(), DataAsOf: finished,
@@ -310,11 +310,11 @@ func TestCandidateAuditReasonStagesUnknownAndSampleDiscipline(t *testing.T) {
 	if err := common.DB.Create(&sealed).Error; err != nil {
 		t.Fatalf("准备已封存 partial 失败: %v", err)
 	}
-	if candidateAuditNeedsBackfill("2044-05-04", "2044-05-05") {
+	if candidateAuditNeedsBackfill("2022-05-04", "2022-05-05") {
 		t.Fatal("已封存明细的 partial 是 PIT 终态，不得判定为需要补跑")
 	}
 	empty := model.CandidateAuditRun{OwnerType: model.JobOwnerSystem, Market: "cn",
-		SignalDate: "2044-05-05", OutcomeDate: "2044-05-06", AuditVersion: CandidateAuditVersion,
+		SignalDate: "2022-05-05", OutcomeDate: "2022-05-06", AuditVersion: CandidateAuditVersion,
 		ParameterHash: candidateAuditParameterHash(), DiscoveryVersion: DiscoveryVersion,
 		FactorVersion: factorSnapshotVersion, OutcomeVersion: candidateAuditOutcomeVersion,
 		ParameterJSON: candidateAuditParameterJSON(), DataAsOf: finished,
@@ -322,7 +322,7 @@ func TestCandidateAuditReasonStagesUnknownAndSampleDiscipline(t *testing.T) {
 	if err := common.DB.Create(&empty).Error; err != nil {
 		t.Fatalf("准备空运行 partial 失败: %v", err)
 	}
-	if !candidateAuditNeedsBackfill("2044-05-05", "2044-05-06") {
+	if !candidateAuditNeedsBackfill("2022-05-05", "2022-05-06") {
 		t.Fatal("空运行 partial 未封存任何明细，上游补齐后必须允许补跑重算")
 	}
 	cleanCandidateAuditFixture(t)
@@ -365,7 +365,7 @@ func TestCandidateAuditReasonStagesUnknownAndSampleDiscipline(t *testing.T) {
 		items := make([]model.CandidateAuditItem, count)
 		for i := range items {
 			items[i] = model.CandidateAuditItem{OutcomeStatus: btObserved,
-				OutcomeDate: time.Date(2044, 1, 1+i%days, 0, 0, 0, 0, time.Local).Format("2006-01-02"),
+				OutcomeDate: time.Date(2022, 1, 1+i%days, 0, 0, 0, 0, time.Local).Format("2006-01-02"),
 				RecType:     model.RecTypeShortTerm, Regime: "neutral", DiscoveryVersion: "dv1",
 				RankingVersion: "rv1", HoldingPeriodDays: 5, NetReturnPct: 1}
 		}
@@ -457,8 +457,8 @@ func TestCandidateAuditJobRunDedupTimeoutAndIdempotentRetry(t *testing.T) {
 		return DurableJobResult{Status: model.JobStatusSuccess}, nil
 	}
 	runtime.registerWithBinding(JobKindCandidateAudit, 40*time.Millisecond, handler, registerCandidateAuditBinding(), false)
-	req := candidateAuditJobRequest{Version: 1, Market: "cn", SignalDate: "2044-04-01",
-		OutcomeDate: "2044-04-04", ParameterHash: candidateAuditParameterHash()}
+	req := candidateAuditJobRequest{Version: 1, Market: "cn", SignalDate: "2022-04-01",
+		OutcomeDate: "2022-04-04", ParameterHash: candidateAuditParameterHash()}
 	first, created, err := runtime.startSystemWithBindingStatus(nil, JobKindCandidateAudit, req, nil)
 	if err != nil || !created {
 		t.Fatalf("首次审计作业: run=%+v created=%v err=%v", first, created, err)
@@ -502,10 +502,10 @@ func TestCandidateAuditJobRunDedupTimeoutAndIdempotentRetry(t *testing.T) {
 
 func TestSelectionEvalJSONDoesNotExposeCrossUserBatchDetails(t *testing.T) {
 	report := SelectionEvalReport{Sections: []SelectionEvalSection{{
-		Batches: []SelectionBatchView{{BatchID: 998877, SignalDate: "2044-05-06",
+		Batches: []SelectionBatchView{{BatchID: 998877, SignalDate: "2022-05-06",
 			AI: []SelectionPickView{{Symbol: "SENSITIVE_AI"}}, Quant: []SelectionPickView{{Symbol: "SENSITIVE_QUANT"}}}},
 		Pairs: []SelectionPairedRow{{Pair: "ai_minus_quant", Batches: 1,
-			BatchDiffs: []SelectionBatchDiff{{BatchID: 998877, SignalDate: "2044-05-06",
+			BatchDiffs: []SelectionBatchDiff{{BatchID: 998877, SignalDate: "2022-05-06",
 				LeftSymbols: []string{"SENSITIVE_AI"}, RightSymbols: []string{"SENSITIVE_QUANT"}}}}},
 	}}}
 	wire, err := json.Marshal(report)
@@ -513,7 +513,7 @@ func TestSelectionEvalJSONDoesNotExposeCrossUserBatchDetails(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(wire)
-	for _, sensitive := range []string{"998877", "2044-05-06", "SENSITIVE_AI", "SENSITIVE_QUANT", "batch_diffs"} {
+	for _, sensitive := range []string{"998877", "2022-05-06", "SENSITIVE_AI", "SENSITIVE_QUANT", "batch_diffs"} {
 		if strings.Contains(text, sensitive) {
 			t.Fatalf("SelectionEval JSON 泄露跨用户批次明细 %s: %s", sensitive, text)
 		}

@@ -158,6 +158,7 @@ func TestMaintenanceRangeHardLimitsAndCalendarPlan(t *testing.T) {
 
 func TestWidePlanIgnoresRowsOutsideCurrentUniverse(t *testing.T) {
 	setupPlanDB(t)
+	seedHealthCalendar(t, time.Now(), 3)
 	expected := wideExpectedDate(time.Now())
 	if err := common.DB.Create(&model.MarketSyncState{Symbol: "600001", Market: "cn", Name: "计划内"}).Error; err != nil {
 		t.Fatal(err)

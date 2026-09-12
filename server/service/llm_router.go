@@ -1,16 +1,20 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"quantvista/common"
 	"quantvista/model"
 	"quantvista/setting"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // P2-4 模型路由与成本优化（docs/LLM_ACCURACY_OPTIMIZATION_PLAN.md §7.3 P2-4、§10.2）。
@@ -82,7 +86,7 @@ type llmRouteEntry struct {
 }
 
 var (
-	llmRouteCacheMu sync.Mutex
+	llmRouteCacheMu jobCreateLock
 	llmRouteCacheAt time.Time
 	llmRouteCache   map[string]*llmRouteEntry // module -> entry（仅健康可用路由）
 )
@@ -96,11 +100,19 @@ func invalidateLLMRouteCache() {
 }
 
 // lookupLLMRoute 取某模块的可用路由（缓存 TTL 内直读；过期重载全表并逐条健康检查）。
-func lookupLLMRoute(module string) *llmRouteEntry {
-	llmRouteCacheMu.Lock()
+func lookupLLMRoute(module string, contexts ...context.Context) *llmRouteEntry {
+	ctx, cancel := context.WithTimeout(jobSubmissionContext(contexts...), 10*time.Second)
+	defer cancel()
+	if err := llmRouteCacheMu.Lock(ctx); err != nil {
+		return nil
+	}
 	defer llmRouteCacheMu.Unlock()
 	if llmRouteCache == nil || time.Since(llmRouteCacheAt) > llmRouteCacheTTL {
-		llmRouteCache = loadLLMRoutes()
+		loaded := loadLLMRoutes(ctx)
+		if ctx.Err() != nil {
+			return nil
+		}
+		llmRouteCache = loaded
 		llmRouteCacheAt = time.Now()
 	}
 	return llmRouteCache[module]
@@ -108,26 +120,49 @@ func lookupLLMRoute(module string) *llmRouteEntry {
 
 // loadLLMRoutes 重载路由表：启用且未自动回退的行 → 解密配置 → 健康检查。
 // 配置不可用（已删/所有者非启用管理员/密钥解密失败）与健康检查触发都持久化自动回退。
-func loadLLMRoutes() map[string]*llmRouteEntry {
+func loadLLMRoutes(contexts ...context.Context) map[string]*llmRouteEntry {
+	ctx := jobSubmissionContext(contexts...)
+	db := common.DB.WithContext(ctx)
 	out := map[string]*llmRouteEntry{}
 	var routes []model.LLMModuleRoute
-	if err := common.DB.Where("enabled = ? AND auto_fallback_at IS NULL", true).Find(&routes).Error; err != nil {
+	if err := db.Where("enabled = ? AND auto_fallback_at IS NULL", true).Find(&routes).Error; err != nil {
 		common.SysWarn("模型路由表加载失败（本轮不路由）: %v", err)
 		return out
 	}
 	for _, rt := range routes {
 		var cfg model.LLMConfig
-		if err := common.DB.First(&cfg, rt.ConfigID).Error; err != nil || !isEnabledAdmin(cfg.UserID) {
-			persistRouteFallback(rt.ID, "config_unavailable: 路由目标配置已删或所有者非启用管理员")
+		if err := db.First(&cfg, rt.ConfigID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				persistRouteFallback(rt, "config_unavailable: 路由目标配置已删除", ctx)
+			} else {
+				common.SysWarn("模型路由配置读取失败（本轮不路由）: %v", err)
+			}
+			continue
+		}
+		var owner model.User
+		if err := db.Select("role", "status").First(&owner, cfg.UserID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				persistRouteFallback(rt, "config_unavailable: 路由配置所有者不存在", ctx)
+			} else {
+				common.SysWarn("模型路由所有者读取失败（本轮不路由）: %v", err)
+			}
+			continue
+		}
+		if owner.Role != model.RoleAdmin || owner.Status != model.StatusEnabled {
+			persistRouteFallback(rt, "config_unavailable: 路由配置所有者非启用管理员", ctx)
 			continue
 		}
 		key, err := common.Decrypt(cfg.APIKeyCipher)
 		if err != nil || strings.TrimSpace(key) == "" {
-			persistRouteFallback(rt.ID, "config_unavailable: 路由目标配置 API Key 不可用")
+			persistRouteFallback(rt, "config_unavailable: 路由目标配置 API Key 不可用", ctx)
 			continue
 		}
-		if reason, ok := evaluateLLMRouteHealth(rt, cfg); !ok {
-			persistRouteFallback(rt.ID, reason)
+		if reason, ok := evaluateLLMRouteHealth(rt, cfg, ctx); !ok {
+			if strings.HasPrefix(reason, "health_unavailable:") {
+				common.SysWarn("模型路由健康状态读取失败（本轮不路由） route=%d", rt.ID)
+			} else {
+				persistRouteFallback(rt, reason, ctx)
+			}
 			continue
 		}
 		out[rt.Module] = &llmRouteEntry{route: rt, cfg: cfg, apiKey: key}
@@ -136,15 +171,20 @@ func loadLLMRoutes() map[string]*llmRouteEntry {
 }
 
 // persistRouteFallback 自动回退持久化（只置一次；管理端显式恢复才清除）。
-func persistRouteFallback(routeID int64, reason string) {
+func persistRouteFallback(route model.LLMModuleRoute, reason string, contexts ...context.Context) {
+	ctx, cancel := context.WithTimeout(jobSubmissionContext(contexts...), 5*time.Second)
+	defer cancel()
 	now := time.Now()
-	if err := common.DB.Model(&model.LLMModuleRoute{}).
-		Where("id = ? AND auto_fallback_at IS NULL", routeID).
-		Updates(map[string]any{"auto_fallback_at": now, "auto_fallback_reason": truncateRunes(reason, 250)}).Error; err != nil {
-		common.SysWarn("模型路由自动回退落库失败 route=%d: %v", routeID, err)
+	res := common.DB.WithContext(ctx).Model(&model.LLMModuleRoute{}).
+		Where("id = ? AND revision = ? AND config_id = ? AND enabled = ? AND auto_fallback_at IS NULL", route.ID, route.Revision, route.ConfigID, true).
+		Updates(map[string]any{"auto_fallback_at": now, "auto_fallback_reason": truncateRunes(reason, 250)})
+	if res.Error != nil {
+		common.SysWarn("模型路由自动回退落库失败 route=%d: %v", route.ID, res.Error)
 		return
 	}
-	common.SysWarn("模型路由自动回退 route=%d：%s（管理端显式恢复后才重新生效）", routeID, reason)
+	if res.RowsAffected > 0 {
+		common.SysWarn("模型路由自动回退 route=%d：%s（管理端显式恢复后才重新生效）", route.ID, reason)
+	}
 }
 
 // llmRouteCallStats 近窗口 (module, config) 的调用统计。
@@ -157,10 +197,27 @@ type llmRouteCallStats struct {
 
 // routeCallStats 查 llm_call_logs：configID>0 限定路由目标，configID=0 且 excludeID>0
 // 表示「同模块其他配置」的基线。
-func routeCallStats(module string, configID, excludeID int64) llmRouteCallStats {
+func routeCallStats(module string, configID, excludeID int64, cutoffs ...time.Time) llmRouteCallStats {
+	return routeCallStatsWindow(module, configID, excludeID, 0, cutoffs...)
+}
+
+func routeCallStatsWindow(module string, configID, excludeID, afterCallID int64, cutoffs ...time.Time) llmRouteCallStats {
+	s, err := routeCallStatsDB(common.DB, time.Now(), module, configID, excludeID, afterCallID, cutoffs...)
+	if err != nil {
+		common.SysWarn("模型路由统计读取失败: %v", err)
+	}
+	return s
+}
+
+func routeCallStatsDB(db *gorm.DB, asOf time.Time, module string, configID, excludeID, afterCallID int64, cutoffs ...time.Time) (llmRouteCallStats, error) {
 	var s llmRouteCallStats
-	since := time.Now().Add(-llmRouteHealthWindow)
-	q := common.DB.Model(&model.LLMCallLog{}).Where("module = ? AND created_at > ?", module, since)
+	since := asOf.Add(-llmRouteHealthWindow)
+	for _, cutoff := range cutoffs {
+		if cutoff.After(since) {
+			since = cutoff
+		}
+	}
+	q := db.Model(&model.LLMCallLog{}).Where("module = ? AND created_at >= ? AND created_at <= ? AND id > ?", module, since, asOf, afterCallID)
 	if configID > 0 {
 		q = q.Where("llm_config_id = ?", configID)
 	} else if excludeID > 0 {
@@ -179,13 +236,13 @@ func routeCallStats(module string, configID, excludeID int64) llmRouteCallStats 
 			"SUM(CASE WHEN status = 'success' THEN total_tokens ELSE 0 END) AS sum_tok, " +
 			"SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success_n").
 		Scan(&a).Error; err != nil {
-		return s
+		return s, err
 	}
 	s.Total, s.Errors, s.SuccessN = a.Total, a.Errors, a.SuccessN
 	if a.SuccessN > 0 {
 		s.AvgTokens = round2(a.SumTok / float64(a.SuccessN))
 	}
-	return s
+	return s, nil
 }
 
 // routeMaxCostRatio 路由行成本阈值（0=默认）。
@@ -212,6 +269,7 @@ func routeCalibBrierPair(module string, cfg model.LLMConfig) (routed, bestOther 
 		return 0, 0, false
 	}
 	var routedP, bestP *float64
+	worstRatio := -1.0
 	for _, rc := range rep.Recommendation {
 		if rc == nil {
 			continue
@@ -220,20 +278,33 @@ func routeCalibBrierPair(module string, cfg model.LLMConfig) (routed, bestOther 
 			if g.Dim != "provider_model" {
 				continue
 			}
+			var horizonRouted, horizonBest *float64
 			for _, row := range g.Rows {
 				if row.Brier == nil {
 					continue
 				}
 				if row.Key == key {
-					if routedP == nil || *row.Brier > *routedP {
+					if horizonRouted == nil || *row.Brier > *horizonRouted {
 						v := *row.Brier
-						routedP = &v // 双 horizon 取更差者（保守）
+						horizonRouted = &v
 					}
 					continue
 				}
-				if bestP == nil || *row.Brier < *bestP {
+				if horizonBest == nil || *row.Brier < *horizonBest {
 					v := *row.Brier
-					bestP = &v
+					horizonBest = &v
+				}
+			}
+			// 每个推荐类型/持有期内配对，再选择相对表现更差的一对。
+			if horizonRouted != nil && horizonBest != nil {
+				ratio := 1.0
+				if *horizonBest > 0 {
+					ratio = *horizonRouted / *horizonBest
+				} else if *horizonRouted > 0 {
+					ratio = math.Inf(1)
+				}
+				if ratio > worstRatio {
+					routedP, bestP, worstRatio = horizonRouted, horizonBest, ratio
 				}
 			}
 		}
@@ -246,8 +317,18 @@ func routeCalibBrierPair(module string, cfg model.LLMConfig) (routed, bestOther 
 
 // evaluateLLMRouteHealth 健康检查三信号（任一触发返回 ok=false 与机读原因）。
 // 全部只读：llm_call_logs 聚合 + 校准报表缓存；样本不足不下结论（继续路由）。
-func evaluateLLMRouteHealth(rt model.LLMModuleRoute, cfg model.LLMConfig) (string, bool) {
-	routedStats := routeCallStats(rt.Module, rt.ConfigID, 0)
+func evaluateLLMRouteHealth(rt model.LLMModuleRoute, cfg model.LLMConfig, contexts ...context.Context) (string, bool) {
+	var routedStats, base llmRouteCallStats
+	asOf := time.Now()
+	err := readSnapshotTx(jobSubmissionContext(contexts...), func(tx *gorm.DB) error {
+		var err error
+		routedStats, base, err = readLLMRouteStats(tx, asOf, rt, cfg)
+		return err
+	})
+	if err != nil {
+		common.SysWarn("模型路由健康统计读取失败 route=%d: %v", rt.ID, err)
+		return "health_unavailable: 健康统计暂不可用", false
+	}
 	// 1) 失败率（准确率下降的调用层代理：结构化拒收/完整性门禁/网络失败都进 error）。
 	if routedStats.Total >= llmRouteHealthMinCalls {
 		if rate := float64(routedStats.Errors) / float64(routedStats.Total); rate >= llmRouteMaxErrorRate {
@@ -256,7 +337,6 @@ func evaluateLLMRouteHealth(rt model.LLMModuleRoute, cfg model.LLMConfig) (strin
 		}
 	}
 	// 2) 成本比（对照=同模块其他配置的成功调用均值；双方都够样本才可比）。
-	base := routeCallStats(rt.Module, 0, rt.ConfigID)
 	if routedStats.SuccessN >= llmRouteHealthMinCalls && base.SuccessN >= llmRouteHealthMinCalls &&
 		base.AvgTokens > 0 {
 		if ratio := routedStats.AvgTokens / base.AvgTokens; ratio > routeMaxCostRatio(rt) {
@@ -265,7 +345,7 @@ func evaluateLLMRouteHealth(rt model.LLMModuleRoute, cfg model.LLMConfig) (strin
 		}
 	}
 	// 3) 校准分层 Brier（仅 recommendation；P2-5 provider·model 数据的路由消费点）。
-	if routed, best, ok := routeCalibBrierPair(rt.Module, cfg); ok && best > 0 {
+	if routed, best, ok := routeCalibBrierPair(rt.Module, cfg); ok {
 		if routed > best*llmRouteBrierDegradeRatio {
 			return fmt.Sprintf("brier_degraded: 路由目标 Brier %.4f 比最优层 %.4f 恶化超 %.0f%%",
 				routed, best, (llmRouteBrierDegradeRatio-1)*100), false
@@ -274,10 +354,19 @@ func evaluateLLMRouteHealth(rt model.LLMModuleRoute, cfg model.LLMConfig) (strin
 	return "", true
 }
 
+func readLLMRouteStats(db *gorm.DB, asOf time.Time, rt model.LLMModuleRoute, cfg model.LLMConfig) (llmRouteCallStats, llmRouteCallStats, error) {
+	routed, err := routeCallStatsDB(db, asOf, rt.Module, rt.ConfigID, 0, rt.HealthAfterCallID, rt.HealthSince, cfg.UpdatedAt)
+	if err != nil {
+		return routed, llmRouteCallStats{}, err
+	}
+	baseline, err := routeCallStatsDB(db, asOf, rt.Module, 0, rt.ConfigID, rt.HealthAfterCallID, rt.HealthSince, cfg.UpdatedAt)
+	return routed, baseline, err
+}
+
 // applyModelRouting 中央客户端出口的模块级模型路由（P2-4）。必须在
 // applyAccuracyContract/initCallObservers/applyCapabilityRouting **之前**调用：
 // 温度钳制与能力路由都要作用于路由后的最终目标。零命中时原样返回（逐字节不变）。
-func applyModelRouting(p chatParams) chatParams {
+func applyModelRouting(p chatParams, contexts ...context.Context) chatParams {
 	if !setting.LLMModelRouting() || common.DB == nil {
 		return p
 	}
@@ -288,7 +377,7 @@ func applyModelRouting(p chatParams) chatParams {
 	if alias, ok := llmRouteModuleAlias[module]; ok {
 		module = alias
 	}
-	rt := lookupLLMRoute(module)
+	rt := lookupLLMRoute(module, contexts...)
 	if rt == nil || rt.cfg.ID == p.Meta.ConfigID {
 		return p // 无路由 / 目标即当前配置：零改写
 	}
@@ -364,33 +453,45 @@ type LLMRouteView struct {
 }
 
 // ListLLMRoutes 全部路由 + 可选模块 + 健康快照（只读；健康快照即时计算不写回退）。
-func ListLLMRoutes() ([]LLMRouteView, []LLMRouteModuleOption, error) {
+func ListLLMRoutes(contexts ...context.Context) ([]LLMRouteView, []LLMRouteModuleOption, error) {
 	var routes []model.LLMModuleRoute
-	if err := common.DB.Order("module").Find(&routes).Error; err != nil {
-		return nil, nil, err
-	}
-	views := make([]LLMRouteView, 0, len(routes))
-	for _, rt := range routes {
-		v := LLMRouteView{LLMModuleRoute: rt}
-		var cfg model.LLMConfig
-		if err := common.DB.First(&cfg, rt.ConfigID).Error; err != nil {
-			v.ConfigMissing = true
-		} else {
-			v.ConfigName, v.ConfigProvider, v.ConfigModel = cfg.Name, cfg.Provider, cfg.Model
+	views := []LLMRouteView{}
+	asOf := time.Now()
+	err := readSnapshotTx(jobSubmissionContext(contexts...), func(tx *gorm.DB) error {
+		if err := tx.Order("module").Find(&routes).Error; err != nil {
+			return err
 		}
-		v.Health.Routed = routeCallStats(rt.Module, rt.ConfigID, 0)
-		v.Health.Baseline = routeCallStats(rt.Module, 0, rt.ConfigID)
-		if v.Health.Routed.SuccessN >= llmRouteHealthMinCalls && v.Health.Baseline.SuccessN >= llmRouteHealthMinCalls &&
-			v.Health.Baseline.AvgTokens > 0 {
-			v.Health.CostRatio = round2(v.Health.Routed.AvgTokens / v.Health.Baseline.AvgTokens)
-		}
-		if !v.ConfigMissing {
-			if routed, best, ok := routeCalibBrierPair(rt.Module, cfg); ok {
-				r, b := routed, best
-				v.Health.CalibBrier, v.Health.CalibBestPeer = &r, &b
+		for _, rt := range routes {
+			v := LLMRouteView{LLMModuleRoute: rt}
+			var cfg model.LLMConfig
+			if err := tx.First(&cfg, rt.ConfigID).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+				v.ConfigMissing = true
+			} else if err != nil {
+				return err
+			} else {
+				v.ConfigName, v.ConfigProvider, v.ConfigModel = cfg.Name, cfg.Provider, cfg.Model
 			}
+			var err error
+			v.Health.Routed, v.Health.Baseline, err = readLLMRouteStats(tx, asOf, rt, cfg)
+			if err != nil {
+				return err
+			}
+			if v.Health.Routed.SuccessN >= llmRouteHealthMinCalls && v.Health.Baseline.SuccessN >= llmRouteHealthMinCalls &&
+				v.Health.Baseline.AvgTokens > 0 {
+				v.Health.CostRatio = round2(v.Health.Routed.AvgTokens / v.Health.Baseline.AvgTokens)
+			}
+			if !v.ConfigMissing {
+				if routed, best, ok := routeCalibBrierPair(rt.Module, cfg); ok {
+					r, b := routed, best
+					v.Health.CalibBrier, v.Health.CalibBestPeer = &r, &b
+				}
+			}
+			views = append(views, v)
 		}
-		views = append(views, v)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
 	}
 	mods := make([]LLMRouteModuleOption, 0)
 	for _, m := range llmRoutableModules() {
@@ -414,7 +515,11 @@ type LLMRouteInput struct {
 
 // UpsertLLMRoute 建/改路由：模块须在可路由集合内、目标配置须属启用管理员；
 // 显式保存=清除自动回退状态（管理员已看过原因）。
-func UpsertLLMRoute(in LLMRouteInput) (*model.LLMModuleRoute, error) {
+func UpsertLLMRoute(in LLMRouteInput, contexts ...context.Context) (*model.LLMModuleRoute, error) {
+	ctx := jobSubmissionContext(contexts...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	module := strings.ToLower(strings.TrimSpace(in.Module))
 	if _, aliased := llmRouteModuleAlias[module]; aliased {
 		return nil, errors.New("experiment 模块不可单独配路由（challenger 恒跟随 recommendation 路由，单变量纪律）")
@@ -422,35 +527,46 @@ func UpsertLLMRoute(in LLMRouteInput) (*model.LLMModuleRoute, error) {
 	if _, ok := llmModuleBudgets[module]; !ok {
 		return nil, fmt.Errorf("未知模块 %q（须为预算表登记的业务模块）", in.Module)
 	}
-	var cfg model.LLMConfig
-	if err := common.DB.First(&cfg, in.ConfigID).Error; err != nil {
-		return nil, errors.New("路由目标 LLM 配置不存在")
-	}
-	if !isEnabledAdmin(cfg.UserID) {
-		return nil, errors.New("路由目标配置须属启用状态的管理员（AllowPrivate 与稳定性语义）")
+	var ref model.LLMConfig
+	if err := common.DB.WithContext(ctx).Select("id", "user_id").First(&ref, in.ConfigID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("路由目标 LLM 配置不存在")
+		}
+		return nil, err
 	}
 	if in.MaxCostRatio < 0 {
 		in.MaxCostRatio = 0
 	}
 	var rt model.LLMModuleRoute
-	err := common.DB.Where("module = ?", module).First(&rt).Error
-	if err != nil {
-		rt = model.LLMModuleRoute{Module: module}
-	}
-	rt.ConfigID = in.ConfigID
-	rt.Enabled = in.Enabled
-	rt.Note = truncateRunes(strings.TrimSpace(in.Note), 250)
-	rt.MaxCostRatio = in.MaxCostRatio
-	rt.AutoFallbackAt = nil
-	rt.AutoFallbackReason = ""
-	if rt.ID > 0 {
-		err = common.DB.Model(&model.LLMModuleRoute{}).Where("id = ?", rt.ID).Updates(map[string]any{
-			"config_id": rt.ConfigID, "enabled": rt.Enabled, "note": rt.Note,
-			"max_cost_ratio": rt.MaxCostRatio, "auto_fallback_at": nil, "auto_fallback_reason": "",
-		}).Error
-	} else {
-		err = common.DB.Create(&rt).Error
-	}
+	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		owner, err := lockEnabledAuthUser(tx, ref.UserID)
+		if err != nil {
+			return err
+		}
+		if owner.Role != model.RoleAdmin {
+			return errors.New("路由目标配置须属启用状态的管理员（AllowPrivate 与稳定性语义）")
+		}
+		if _, err := ownedLLMConfig(tx.Clauses(clause.Locking{Strength: "UPDATE"}), ref.UserID, in.ConfigID); err != nil {
+			return err
+		}
+		afterCallID, err := latestLLMCallID(tx)
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		rt = model.LLMModuleRoute{Module: module, ConfigID: in.ConfigID, Enabled: in.Enabled,
+			Note: truncateRunes(strings.TrimSpace(in.Note), 250), MaxCostRatio: in.MaxCostRatio,
+			Revision: 1, HealthSince: now, HealthAfterCallID: afterCallID}
+		if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "module"}}, DoUpdates: clause.Assignments(map[string]any{
+			"config_id": rt.ConfigID, "enabled": rt.Enabled, "note": rt.Note, "max_cost_ratio": rt.MaxCostRatio,
+			"auto_fallback_at": nil, "auto_fallback_reason": "", "revision": gorm.Expr("revision + 1"),
+			"health_since": now, "health_after_call_id": afterCallID, "updated_at": now,
+		})}).Create(&rt).Error; err != nil {
+			return err
+		}
+		rt = model.LLMModuleRoute{}
+		return tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("module = ?", module).First(&rt).Error
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -459,8 +575,8 @@ func UpsertLLMRoute(in LLMRouteInput) (*model.LLMModuleRoute, error) {
 }
 
 // DeleteLLMRoute 删除路由（回到默认配置链路）。
-func DeleteLLMRoute(id int64) error {
-	res := common.DB.Delete(&model.LLMModuleRoute{}, id)
+func DeleteLLMRoute(id int64, contexts ...context.Context) error {
+	res := common.DB.WithContext(jobSubmissionContext(contexts...)).Delete(&model.LLMModuleRoute{}, id)
 	if res.Error != nil {
 		return res.Error
 	}
@@ -472,17 +588,43 @@ func DeleteLLMRoute(id int64) error {
 }
 
 // ResetLLMRouteFallback 显式恢复自动回退的路由（管理员已阅原因）。
-func ResetLLMRouteFallback(id int64) (*model.LLMModuleRoute, error) {
+func ResetLLMRouteFallback(id int64, contexts ...context.Context) (*model.LLMModuleRoute, error) {
 	var rt model.LLMModuleRoute
-	if err := common.DB.First(&rt, id).Error; err != nil {
-		return nil, errors.New("路由不存在")
-	}
-	if err := common.DB.Model(&model.LLMModuleRoute{}).Where("id = ?", id).
-		Updates(map[string]any{"auto_fallback_at": nil, "auto_fallback_reason": ""}).Error; err != nil {
+	err := common.DB.WithContext(jobSubmissionContext(contexts...)).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&rt, id).Error; err != nil {
+			return err
+		}
+		afterCallID, err := latestLLMCallID(tx)
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		if err := tx.Model(&rt).Updates(map[string]any{"auto_fallback_at": nil, "auto_fallback_reason": "",
+			"health_since": now, "health_after_call_id": afterCallID, "revision": rt.Revision + 1}).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	rt.AutoFallbackAt = nil
-	rt.AutoFallbackReason = ""
 	invalidateLLMRouteCache()
 	return &rt, nil
+}
+
+func latestLLMCallID(tx *gorm.DB) (int64, error) {
+	var id int64
+	err := tx.Model(&model.LLMCallLog{}).Select("COALESCE(MAX(id), 0)").Scan(&id).Error
+	return id, err
+}
+
+// 配置变更与关联路由的观察代次同事务发布；旧配置上的迟到健康结论不再有权停用新配置。
+func refreshLLMRoutesForConfigTx(tx *gorm.DB, configID int64) error {
+	afterCallID, err := latestLLMCallID(tx)
+	if err != nil {
+		return err
+	}
+	return tx.Model(&model.LLMModuleRoute{}).Where("config_id = ?", configID).Updates(map[string]any{
+		"revision": gorm.Expr("revision + 1"), "health_since": time.Now(), "health_after_call_id": afterCallID,
+	}).Error
 }

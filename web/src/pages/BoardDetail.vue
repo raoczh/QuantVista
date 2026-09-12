@@ -43,8 +43,8 @@ let chart: echarts.ECharts | null = null
 const ffEl = ref<HTMLDivElement | null>(null)
 let ffChart: echarts.ECharts | null = null
 
-const barsUnavailable = computed(() => !!detail.value && !detail.value.bars?.length)
-const stocksUnavailable = computed(() => !!detail.value && !detail.value.stocks?.length)
+const barsUnavailable = computed(() => !detail.value?.bars?.length)
+const stocksUnavailable = computed(() => !detail.value?.stocks?.length)
 const valuation = computed(() => detail.value?.valuation || null)
 
 // 板块切换（路由 code 变化）竞态守卫：快速切板块时旧响应不覆盖新板块。
@@ -59,21 +59,34 @@ async function load(silent = false) {
     .then((r) => {
       if (mySeq !== loadSeq) return
       fundflow.value = r
-      nextTick(() => renderFundFlowChart())
+      ffChart?.dispose()
+      ffChart = null
+      nextTick(() => {
+        if (mySeq === loadSeq) renderFundFlowChart()
+      })
     })
     .catch(() => {
-      if (mySeq === loadSeq) fundflow.value = null
+      if (mySeq === loadSeq) {
+        fundflow.value = null
+        ffChart?.dispose()
+        ffChart = null
+      }
     })
   try {
     const d = await getBoardDetail('cn', code.value)
     if (mySeq !== loadSeq) return
     detail.value = d
     loadError.value = ''
+    chart?.dispose()
+    chart = null
     await nextTick()
-    if (detail.value.bars?.length) renderChart(detail.value.bars)
+    if (mySeq !== loadSeq) return
+    if (d.bars?.length) renderChart(d.bars)
   } catch (e) {
     if (mySeq !== loadSeq) return
     detail.value = null
+    chart?.dispose()
+    chart = null
     loadError.value = (e as Error).message
     if (!silent) message.error('板块详情加载失败：' + (e as Error).message)
   } finally {
@@ -127,7 +140,7 @@ function renderFundFlowChart() {
       confine: true,
       formatter: (ps: { axisValue: string; seriesName: string; value: number }[]) =>
         ps.length
-          ? `${ps[0].axisValue}<br/>` + ps.map((p) => `${p.seriesName} ${p.value} 亿`).join('<br/>')
+          ? `${echarts.format.encodeHTML(ps[0].axisValue)}<br/>` + ps.map((p) => `${echarts.format.encodeHTML(p.seriesName)} ${p.value} 亿`).join('<br/>')
           : '',
     },
     legend: {
@@ -229,7 +242,16 @@ watch([isDark, vars], () => {
   if (detail.value?.bars?.length) renderChart(detail.value.bars)
   if (fundflow.value?.days.length) renderFundFlowChart()
 })
-watch(code, () => load())
+watch(code, () => {
+  detail.value = null
+  fundflow.value = null
+  loadError.value = ''
+  chart?.dispose()
+  chart = null
+  ffChart?.dispose()
+  ffChart = null
+  load()
+})
 
 function onResize() {
   chart?.resize()
@@ -241,6 +263,7 @@ onMounted(() => {
   window.addEventListener('resize', onResize)
 })
 onUnmounted(() => {
+  loadSeq++
   window.removeEventListener('resize', onResize)
   chart?.dispose()
   chart = null
@@ -305,7 +328,7 @@ onUnmounted(() => {
               <div class="qc"><span class="qc-k">PE 样本</span><span class="qc-v qv-tnum">{{ valuation.pos_pe_count }} / {{ valuation.stock_count }} 只</span></div>
             </div>
             <div class="src-hint">
-              中位数只统计正 PE/PB 样本（亏损与停牌不计）；横截面分位=当日在全部行业板块中的位置（越高越贵）；时序分位窗口 ≤250 交易日，从 {{ valuation.hist_days }} 日起逐日积累，天数少时仅供参考。
+              中位数分别统计正 PE/PB 样本，缺失与非正值不计；横截面分位=当日在全部行业板块中的位置（越高越贵）；时序分位窗口 ≤250 交易日，已积累 {{ valuation.hist_days }} 日，天数少时仅供参考。
             </div>
           </div>
         </SectionCard>

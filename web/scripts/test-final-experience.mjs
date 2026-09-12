@@ -42,8 +42,10 @@ for (const name of ['Screener', 'StockDetail', 'PortfolioRisk', 'Backtest', 'Com
 assert.match(page('Screener'), /@click="runAiParse"/)
 assert.match(page('Compare'), /@click="run"/)
 assert.match(page('Qa'), /@click="send"/)
-assert.match(read('src/components/screener/ScreenerScanResults.vue'), /数据完整度未知|部分数据 · 完整度/)
-assert.match(read('src/components/screener/ScreenerScanResults.vue'), /允许停牌或滞后数据参与扫描/)
+assert.match(read('src/components/screener/ScreenerScanResults.vue'), /数据时效未知/)
+assert.doesNotMatch(read('src/components/screener/ScreenerScanResults.vue'), /完整度/, '主动过滤及结果截断不能当作数据缺失率')
+assert.match(read('src/components/screener/ScreenerScanResults.vue'), /resultIncludesStale/)
+assert.match(read('src/components/screener/ScreenerScanResults.vue'), /result\.stale_note/)
 
 // 股票身份与数据状态：名称缺失只能显示统一占位，非 fresh 结果不得进入正常比较。
 const identity = read('src/components/StockIdentity.vue')
@@ -60,9 +62,8 @@ for (const name of ['Alerts', 'Etf', 'Paper', 'Recommendations', 'Positions', 'W
 assert.doesNotMatch(read('src/composables/useStockActions.ts'), /s\.name\s*\|\|\s*s\.symbol/, '统一股票动作不得用代码冒充名称')
 assert.match(page('AdminWalkForward'), /it\.name \|\| '名称待补全'/)
 
-// 模拟账户与真实账本隔离，组合页允许 risk 深链。
+// 模拟账户与真实账本隔离；组合风险深链由 URL 状态测试和浏览器回归验证。
 assert.match(page('Paper'), /全部属于模拟账户.*真实持仓.*隔离/)
-assert.match(page('PortfolioRisk'), /allowedTabs = new Set\(\['overview', 'risk'/)
 assert.match(read('src/components/portfolio-risk/PortfolioRiskConclusion.vue'), /不会自动调仓|不会自动交易/)
 
 // 状态语义必须可见，失败后有重试或下一步。

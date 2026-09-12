@@ -37,8 +37,10 @@ var errMobileExchange = errors.New("登录凭证无效或已过期，请回到 A
 
 // mobileCodeRecord 短码兑换记录：短码必须绑定 PKCE challenge 与用户。
 type mobileCodeRecord struct {
-	UserID    int64  `json:"user_id"`
-	Challenge string `json:"challenge"`
+	UserID       int64  `json:"user_id"`
+	Challenge    string `json:"challenge"`
+	TokenVersion int    `json:"token_version"`
+	GithubID     string `json:"github_id"`
 }
 
 // GitHubAuthURLMobile 移动流授权地址：SignState 照旧，但 nonce 不种 cookie，
@@ -84,7 +86,8 @@ func (s *AuthService) MobileGitHubCallback(ctx context.Context, code, state, red
 		return "", err
 	}
 	authCode := common.RandomString(48)
-	rec, err := json.Marshal(mobileCodeRecord{UserID: user.ID, Challenge: challenge})
+	rec, err := json.Marshal(mobileCodeRecord{UserID: user.ID, Challenge: challenge,
+		TokenVersion: user.TokenVersion, GithubID: user.GithubID})
 	if err != nil {
 		return "", err
 	}
@@ -116,6 +119,10 @@ func (s *AuthService) MobileGitHubExchange(authCode, codeVerifier, ua string) (*
 	}
 	if user.Status != model.StatusEnabled {
 		return nil, errors.New("账号已被禁用")
+	}
+	// 短码代表回调时的认证事实，不能跨越改密/解绑后再用最新用户状态签发。
+	if rec.GithubID == "" || user.GithubID != rec.GithubID || user.TokenVersion != rec.TokenVersion {
+		return nil, errMobileExchange
 	}
 	return s.issueFor(&user, ua)
 }

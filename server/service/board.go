@@ -2,9 +2,11 @@ package service
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
+	"quantvista/common"
 	"quantvista/datasource"
 )
 
@@ -84,9 +86,9 @@ func (s *BoardService) cachedHeat(kind string) ([]datasource.BoardHeat, bool) {
 
 // BoardDetail 板块详情：指数日线 + 成分股 + 估值（各自可缺，errors 记录哪块失败）。
 type BoardDetail struct {
-	Code     string                  `json:"code"`
-	Bars     []datasource.Bar        `json:"bars"`   // 板块指数日线（120 根）
-	Stocks   []datasource.BoardStock `json:"stocks"` // 成分股（成交额降序 50 只）
+	Code   string                  `json:"code"`
+	Bars   []datasource.Bar        `json:"bars"`   // 板块指数日线（120 根）
+	Stocks []datasource.BoardStock `json:"stocks"` // 成分股（成交额降序 50 只）
 	// Valuation 板块估值（P3b 聚合表最新行；概念板块无 f100 覆盖自然缺席，前端 v-if 不渲染）。
 	Valuation *BoardValuationView `json:"valuation,omitempty"`
 	Errors    map[string]string   `json:"errors"` // 哪些块取数失败
@@ -126,7 +128,16 @@ func (s *BoardService) Detail(ctx context.Context, code string) *BoardDetail {
 	go func() {
 		defer wg.Done()
 		// 查库不打上游：无数据（概念板块/聚合未跑过）不算错误，Valuation 缺席即可。
-		d.Valuation = boardValuationFor(code)
+		if common.DB == nil {
+			return
+		}
+		view, _, err := loadBoardValuation(ctx, "", code)
+		if err != nil {
+			common.SysWarn("板块估值读取失败 code=%s: %v", code, err)
+			setErr("valuation", errors.New("板块估值读取失败，请稍后重试"))
+			return
+		}
+		d.Valuation = view
 	}()
 	wg.Wait()
 	return d
@@ -134,7 +145,7 @@ func (s *BoardService) Detail(ctx context.Context, code string) *BoardDetail {
 
 // markBoardStocks 标注成交额第一名（龙头）与涨幅第一名（领涨）。原地修改切片。
 // 数据守卫：上游 "-" 容错为 0 的退化行不硬标——龙头须成交额>0，领涨须涨幅>0
-//（全盘下跌的板块没有「领涨」是诚实展示，不是漏标）。
+// （全盘下跌的板块没有「领涨」是诚实展示，不是漏标）。
 func markBoardStocks(stocks []datasource.BoardStock) {
 	leaderIdx, gainerIdx := -1, -1
 	for i := range stocks {

@@ -4,7 +4,6 @@ package setting
 
 import (
 	"errors"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -12,6 +11,9 @@ import (
 
 	"quantvista/common"
 	"quantvista/model"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // 系统配置项 key。
@@ -92,28 +94,52 @@ var (
 
 // Init 从 DB 加载系统配置；首启时若 DB 缺 GitHub 凭证而 env 提供了，则种子回填到 DB。
 func Init() error {
+	mu.Lock()
+	defer mu.Unlock()
+	if common.DB == nil {
+		return errors.New("数据库尚未初始化")
+	}
 	opts, err := model.LoadOptions()
 	if err != nil {
 		return err
 	}
 
-	// env 种子（仅当 DB 尚无该值）：client_id 可放 env，secret 也支持 env 引导。
-	if _, ok := opts[keyGitHubClientID]; !ok {
-		if v := os.Getenv("GITHUB_CLIENT_ID"); v != "" {
-			_ = model.UpsertOption(keyGitHubClientID, v)
-			opts[keyGitHubClientID] = v
-		}
-	}
-	if _, ok := opts[keyGitHubClientSecret]; !ok {
-		if v := os.Getenv("GITHUB_CLIENT_SECRET"); v != "" {
-			if cipher, err := common.Encrypt(v); err == nil {
-				_ = model.UpsertOption(keyGitHubClientSecret, cipher)
-				opts[keyGitHubClientSecret] = cipher
+	// 种子整体持久化；另一实例先保存的值（包括显式空值）始终优先。
+	if err := common.DB.Transaction(func(tx *gorm.DB) error {
+		for _, seed := range []struct{ key, env string }{
+			{keyGitHubClientID, "GITHUB_CLIENT_ID"},
+			{keyGitHubClientSecret, "GITHUB_CLIENT_SECRET"},
+		} {
+			if _, exists := opts[seed.key]; exists {
+				continue
+			}
+			value := os.Getenv(seed.env)
+			if value == "" {
+				continue
+			}
+			if seed.key == keyGitHubClientSecret {
+				var err error
+				value, err = common.Encrypt(value)
+				if err != nil {
+					return err
+				}
+			}
+			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "key"}}, DoNothing: true}).
+				Create(&model.Option{Key: seed.key, Value: value}).Error; err != nil {
+				return err
 			}
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
-	apply(opts)
+	// 冲突时实际值可能来自另一实例，不能把环境候选值直接发布到内存。
+	opts, err = model.LoadOptions()
+	if err != nil {
+		return err
+	}
+	applyLocked(opts)
 	common.SysLog("系统设置已加载：注册开放=%v，GitHub 登录=%v", registrationOpen, gitHubOAuthEnabled)
 	return nil
 }
@@ -122,7 +148,10 @@ func Init() error {
 func apply(opts map[string]string) {
 	mu.Lock()
 	defer mu.Unlock()
+	applyLocked(opts)
+}
 
+func applyLocked(opts map[string]string) {
 	registrationOpen = opts[keyRegistrationOpen] == "true"
 	gitHubClientID = opts[keyGitHubClientID]
 
@@ -247,215 +276,67 @@ func LLMReflectionShadow() bool { mu.RLock(); defer mu.RUnlock(); return llmRefl
 // 检索注入 + 反思影子检索分层）。关闭回退旧的静默截断；上下文快照观测不受控。
 func LLMLayeredContext() bool { mu.RLock(); defer mu.RUnlock(); return llmLayeredContext }
 
-// ---- 写入（持久化 + 刷新内存）----
+// ---- 写入：统一经过事务，完整校验后再发布内存值 ----
 
-// SetRegistrationOpen 设置是否开放注册。
 func SetRegistrationOpen(v bool) error {
-	if err := model.UpsertOption(keyRegistrationOpen, strconv.FormatBool(v)); err != nil {
-		return err
-	}
-	mu.Lock()
-	registrationOpen = v
-	mu.Unlock()
-	return nil
+	return Update(UpdateInput{RegistrationOpen: &v})
 }
 
-// SetNewsCollectIntervalMin 设置新闻快讯采集间隔（分钟），越界钳制到 [1,120]。
-// 变更在采集 job 的下一轮生效（job 每轮结束重读本值）。
-func SetNewsCollectIntervalMin(v int) error {
-	if v < NewsIntervalMin {
-		v = NewsIntervalMin
-	}
-	if v > NewsIntervalMax {
-		v = NewsIntervalMax
-	}
-	if err := model.UpsertOption(keyNewsInterval, strconv.Itoa(v)); err != nil {
-		return err
-	}
-	mu.Lock()
-	newsIntervalMin = v
-	mu.Unlock()
-	return nil
+func SetNewsAutoLLM(v bool) error {
+	return Update(UpdateInput{NewsAutoLLM: &v})
 }
 
-// SetLLMAccuracyContract 设置 LLM 准确性契约开关。
 func SetLLMAccuracyContract(v bool) error {
-	if err := model.UpsertOption(keyLLMAccuracy, strconv.FormatBool(v)); err != nil {
-		return err
-	}
-	mu.Lock()
-	llmAccuracyContract = v
-	mu.Unlock()
-	return nil
+	return Update(UpdateInput{LLMAccuracyContract: &v})
 }
 
-// SetLLMEvidenceRefs 设置 P0-3 字段路径证据链开关。
 func SetLLMEvidenceRefs(v bool) error {
-	if err := model.UpsertOption(keyLLMEvidenceRefs, strconv.FormatBool(v)); err != nil {
-		return err
-	}
-	mu.Lock()
-	llmEvidenceRefs = v
-	mu.Unlock()
-	return nil
+	return Update(UpdateInput{LLMEvidenceRefs: &v})
 }
 
-// SetLLMSemanticValidator 设置 P0-4 跨模块语义校验开关。
 func SetLLMSemanticValidator(v bool) error {
-	if err := model.UpsertOption(keyLLMSemanticValid, strconv.FormatBool(v)); err != nil {
-		return err
-	}
-	mu.Lock()
-	llmSemanticValidator = v
-	mu.Unlock()
-	return nil
+	return Update(UpdateInput{LLMSemanticValidator: &v})
 }
 
-// SetLLMCapabilityRouting 设置 P0-5 能力矩阵声明化路由开关。
 func SetLLMCapabilityRouting(v bool) error {
-	if err := model.UpsertOption(keyLLMCapRouting, strconv.FormatBool(v)); err != nil {
-		return err
-	}
-	mu.Lock()
-	llmCapabilityRouting = v
-	mu.Unlock()
-	return nil
+	return Update(UpdateInput{LLMCapabilityRouting: &v})
 }
 
-// SetLLMConditionalDebate 设置 P1-3 条件式辩论开关。
 func SetLLMConditionalDebate(v bool) error {
-	if err := model.UpsertOption(keyLLMDebate, strconv.FormatBool(v)); err != nil {
-		return err
-	}
-	mu.Lock()
-	llmConditionalDebate = v
-	mu.Unlock()
-	return nil
+	return Update(UpdateInput{LLMConditionalDebate: &v})
 }
 
-// SetLLMReflectionShadow 设置 P1-5 反思记忆影子层开关。
 func SetLLMReflectionShadow(v bool) error {
-	if err := model.UpsertOption(keyLLMReflection, strconv.FormatBool(v)); err != nil {
-		return err
-	}
-	mu.Lock()
-	llmReflectionShadow = v
-	mu.Unlock()
-	return nil
+	return Update(UpdateInput{LLMReflectionShadow: &v})
 }
 
-// LLMChallenger P2-1/S3-6C 统一推荐影子实验开关（缺省关：额外 LLM 成本须显式启用）。
-func LLMChallenger() bool { mu.RLock(); defer mu.RUnlock(); return llmChallenger }
-
-// SetLLMChallenger 设置统一推荐影子实验采样开关。
 func SetLLMChallenger(v bool) error {
-	if err := model.UpsertOption(keyLLMChallenger, strconv.FormatBool(v)); err != nil {
-		return err
-	}
-	mu.Lock()
-	llmChallenger = v
-	mu.Unlock()
-	return nil
+	return Update(UpdateInput{LLMChallenger: &v})
 }
 
-// SetLLMLayeredContext 设置 P2-3 多层上下文检索开关。
 func SetLLMLayeredContext(v bool) error {
-	if err := model.UpsertOption(keyLLMLayeredContext, strconv.FormatBool(v)); err != nil {
-		return err
-	}
-	mu.Lock()
-	llmLayeredContext = v
-	mu.Unlock()
-	return nil
+	return Update(UpdateInput{LLMLayeredContext: &v})
 }
 
-// LLMModelRouting P2-4 模型路由开关（缺省关：改变业务调用目标须显式启用）。
+func SetLLMModelRouting(v bool) error {
+	return Update(UpdateInput{LLMModelRouting: &v})
+}
+
+func LLMChallenger() bool   { mu.RLock(); defer mu.RUnlock(); return llmChallenger }
 func LLMModelRouting() bool { mu.RLock(); defer mu.RUnlock(); return llmModelRouting }
 
-// SetLLMModelRouting 设置 P2-4 模型路由开关。
-func SetLLMModelRouting(v bool) error {
-	if err := model.UpsertOption(keyLLMModelRouting, strconv.FormatBool(v)); err != nil {
-		return err
-	}
-	mu.Lock()
-	llmModelRouting = v
-	mu.Unlock()
-	return nil
+func SetNewsCollectIntervalMin(v int) error {
+	return Update(UpdateInput{NewsCollectIntervalMin: &v})
 }
 
-// SetNewsAutoLLM 设置是否允许自动调 LLM 处理新闻。
-func SetNewsAutoLLM(v bool) error {
-	if err := model.UpsertOption(keyNewsAutoLLM, strconv.FormatBool(v)); err != nil {
-		return err
-	}
-	mu.Lock()
-	newsAutoLLM = v
-	mu.Unlock()
-	return nil
-}
-
-// SetLLMFallback 设置 LLM 回退开关与指定配置 id（负数归 0=自动）。
-// 配置 id 的合法性（存在且属于启用管理员）由调用方（AdminService）校验。
 func SetLLMFallback(enabled bool, configID int64) error {
-	if configID < 0 {
-		configID = 0
-	}
-	if err := model.UpsertOption(keyLLMFallbackEnabled, strconv.FormatBool(enabled)); err != nil {
-		return err
-	}
-	if err := model.UpsertOption(keyLLMFallbackID, strconv.FormatInt(configID, 10)); err != nil {
-		return err
-	}
-	mu.Lock()
-	llmFallbackEnabled = enabled
-	llmFallbackID = configID
-	mu.Unlock()
-	return nil
+	return Update(UpdateInput{LLMFallbackEnabled: &enabled, LLMFallbackConfigID: &configID})
 }
 
-// SetSiteBaseURL 设置站点对外基础 URL；空串 = 清除（推送通知不再带点击跳转）。
-// 非空时必须是合法的 http/https 地址；存储与内存值均规范化为无尾部斜杠。
 func SetSiteBaseURL(v string) error {
-	v = normalizeSiteBaseURL(v)
-	if v != "" {
-		u, err := url.Parse(v)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return errors.New("站点基础 URL 非法（须为 http/https 完整地址）")
-		}
-	}
-	if err := model.UpsertOption(keySiteBaseURL, v); err != nil {
-		return err
-	}
-	mu.Lock()
-	siteBaseURL = v
-	mu.Unlock()
-	return nil
+	return Update(UpdateInput{SiteBaseURL: &v})
 }
 
-// SetGitHubOAuth 更新 GitHub 凭证与开关。secret 为空表示保留原值（后台不必重复输入密钥）。
 func SetGitHubOAuth(clientID, clientSecret string, enabled bool) error {
-	if err := model.UpsertOption(keyGitHubClientID, clientID); err != nil {
-		return err
-	}
-	if clientSecret != "" {
-		cipher, err := common.Encrypt(clientSecret)
-		if err != nil {
-			return err
-		}
-		if err := model.UpsertOption(keyGitHubClientSecret, cipher); err != nil {
-			return err
-		}
-	}
-	if err := model.UpsertOption(keyGitHubOAuthEnabled, strconv.FormatBool(enabled)); err != nil {
-		return err
-	}
-
-	mu.Lock()
-	gitHubClientID = clientID
-	if clientSecret != "" {
-		gitHubClientSecret = clientSecret
-	}
-	gitHubOAuthEnabled = enabled
-	mu.Unlock()
-	return nil
+	return Update(UpdateInput{GitHubClientID: &clientID, GitHubClientSecret: &clientSecret, GitHubOAuthEnabled: &enabled})
 }

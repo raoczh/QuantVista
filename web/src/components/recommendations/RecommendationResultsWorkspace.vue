@@ -1,16 +1,17 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { NAlert, NButton, NEmpty, NSpin, NTag } from 'naive-ui'
 import type { DiscoveryStatusView, PoolCandidate, RecommendationItem, RecommendationView } from '@/api/recommendation'
 import SectionCard from '@/components/SectionCard.vue'
 import RecommendationCard from './RecommendationCard.vue'
 import RecommendationCandidateAudit from './RecommendationCandidateAudit.vue'
-import { businessStatusLabel, recommendationDecisionState } from './recommendationPresentation'
+import { businessStatusLabel, parseCandidateSnapshot, recommendationDecisionState } from './recommendationPresentation'
 
 const props = defineProps<{
   current: RecommendationView | null
   discovery: DiscoveryStatusView | null
   loading: boolean
+  error: string
   tracking: boolean
   stopAlerting: Record<number, boolean>
   sections: string[]
@@ -18,11 +19,13 @@ const props = defineProps<{
 const emit = defineEmits<{
   (event: 'refresh-tracking'): void
   (event: 'stop-alert', item: RecommendationItem): void
-  (event: 'linked'): void
+  (event: 'linked', batchID: number): void
+  (event: 'retry'): void
   (event: 'update:sections', value: string[]): void
 }>()
 
 const showAll = ref(false)
+watch(() => props.current?.id, () => { showAll.value = false })
 const sectionModel = computed({
   get: () => props.sections,
   set: (value: string[]) => emit('update:sections', value),
@@ -30,10 +33,7 @@ const sectionModel = computed({
 const poolMap = computed(() => {
   const map = new Map<string, PoolCandidate>()
   if (!props.current?.candidate_pool) return map
-  try {
-    const rows = JSON.parse(props.current.candidate_pool) as PoolCandidate[]
-    if (Array.isArray(rows)) rows.forEach((item) => map.set(`${item.market || 'cn'}:${item.symbol}`, item))
-  } catch { /* 历史坏快照按缺失显示 */ }
+  parseCandidateSnapshot(props.current.candidate_pool).items.forEach(item => map.set(`${item.market || 'cn'}:${item.symbol}`, item))
   return map
 })
 const ordered = computed(() => {
@@ -57,9 +57,13 @@ const discoveryLabel = computed(() => ({ success: '完整', partial: '部分可�
       <span v-if="discovery?.run?.partial_reason || discovery?.run?.error || discovery?.reason">{{ discovery?.run?.partial_reason || discovery?.run?.error || discovery?.reason }}</span>
     </div>
 
+    <n-alert v-if="error" type="error" :bordered="false" class="result-error">
+      {{ error }}<template v-if="current">；下方保留上次读取的批次</template>。
+      <n-button size="tiny" :loading="loading" @click="emit('retry')">重试</n-button>
+    </n-alert>
     <n-spin :show="loading && !current">
-      <n-empty v-if="!current" description="尚未选择推荐结果。进入页面不会自动生成，请主动点击生成或打开历史记录。" />
-      <template v-else>
+      <n-empty v-if="!current && !error && !loading" description="尚未选择推荐结果。进入页面不会自动生成，请主动点击生成或打开历史记录。" />
+      <template v-if="current">
         <header class="batch-head">
           <div>
             <div class="batch-title">{{ current.title || (current.type === 'short_term' ? '短线推荐' : '长线推荐') }}</div>
@@ -80,8 +84,9 @@ const discoveryLabel = computed(() => ({ success: '完整', partial: '部分可�
             :item="item"
             :type="current.type"
             :candidate="poolMap.get(`${item.market || 'cn'}:${item.symbol}`)"
+            :stop-alerting="!!stopAlerting[item.id]"
             @stop-alert="emit('stop-alert', $event)"
-            @linked="emit('linked')"
+            @linked="emit('linked', $event)"
           />
         </div>
         <n-button v-if="ordered.length > visible.length" block tertiary class="more-btn" @click="showAll = true">查看其余 {{ ordered.length - visible.length }} 条</n-button>
@@ -92,6 +97,7 @@ const discoveryLabel = computed(() => ({ success: '完整', partial: '部分可�
 </template>
 
 <style scoped>
+.result-error { margin-bottom: 12px; }
 .discovery-band,
 .batch-head { display: flex; min-width: 0; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 8px 16px; }
 .discovery-band { margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid rgba(128,128,128,.2); font-size: 12px; }

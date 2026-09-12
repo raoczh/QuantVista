@@ -146,6 +146,10 @@ type emSearchResp struct {
 // GetEMStockNews 按 6 位代码搜索个股新闻（最多 pageSize 条，按时间倒序）。
 // TLS 指纹被拒时返回错误，调用方降级不阻断其它源。
 func GetEMStockNews(ctx context.Context, symbol string, pageSize int) ([]EMNewsItem, error) {
+	symbol = strings.TrimSpace(symbol)
+	if !isSixDigitSymbol(symbol) {
+		return nil, ErrSymbolInvalid
+	}
 	if pageSize <= 0 || pageSize > 20 {
 		pageSize = 10
 	}

@@ -117,6 +117,10 @@ func normalizeTodoOptions(opts TodoListOptions) (TodoListOptions, error) {
 // BuildInbox 在现有 TodoService 上构建统一收件箱投影。所有正文均即时来自原业务表；
 // InboxState 只影响展示状态，不成为提醒、持仓或任务的第二事实来源。
 func (s *TodoService) BuildInbox(ctx context.Context, userID int64, options TodoListOptions) (*TodoResult, error) {
+	ctx = jobSubmissionContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	opts, err := normalizeTodoOptions(options)
 	if err != nil {
 		return nil, err
@@ -134,34 +138,34 @@ func (s *TodoService) BuildInbox(ctx context.Context, userID int64, options Todo
 		common.SysWarn("收件箱聚合读取%s失败 user=%d: %v", block, userID, cause)
 	}
 
-	if rows, readErr := loadActiveRevertedCorpAdjusts(userID); readErr != nil {
-		fail("已撤销公司行动", readErr)
-	} else {
-		res.Items = append(res.Items, rows...)
-	}
-	if rows, readErr := loadActiveJobFailures(userID, time.Now().AddDate(0, 0, -todoHistoryMaxDays)); readErr != nil {
+	if rows, readErr := loadActiveJobFailures(userID, time.Now().AddDate(0, 0, -todoHistoryMaxDays), res.Date, ctx); readErr != nil {
 		fail("用户任务失败", readErr)
 	} else {
 		res.Items = append(res.Items, rows...)
 	}
 
-	if readErr := enrichTodoItems(userID, res.Date, res.Items); readErr != nil {
-		fail("来源版本", readErr)
-	}
-	completed, completedErrs := loadCompletedTodoItems(userID, time.Now().AddDate(0, 0, -opts.HistoryDays))
+	completed, completedErrs := loadCompletedTodoItems(userID, time.Now().AddDate(0, 0, -opts.HistoryDays), res.Date, ctx)
 	for block, readErr := range completedErrs {
 		fail(block, readErr)
-	}
-	if readErr := enrichTodoItems(userID, res.Date, completed); readErr != nil {
-		fail("已完成来源版本", readErr)
 	}
 	for i := range completed {
 		completed[i].Status = TodoStatusCompleted
 		completed[i].CanComplete = false
 	}
-	res.Items = append(res.Items, completed...)
+	// 两次列表读取之间完成的同一来源只保留后读到的完成事实。
+	completedKeys := make(map[string]bool, len(completed))
+	for _, item := range completed {
+		completedKeys[todoStateKey(item.SourceKind, item.SourceID)] = true
+	}
+	active := res.Items[:0]
+	for _, item := range res.Items {
+		if !completedKeys[todoStateKey(item.SourceKind, item.SourceID)] {
+			active = append(active, item)
+		}
+	}
+	res.Items = append(active, completed...)
 
-	states, readErr := loadTodoInboxStates(userID)
+	states, readErr := loadTodoInboxStates(ctx, userID)
 	if readErr != nil {
 		fail("用户收件箱状态", readErr)
 	} else {
@@ -222,14 +226,11 @@ func (s *TodoService) BuildInbox(ctx context.Context, userID int64, options Todo
 	}
 
 	if opts.Status == TodoStatusCompleted || opts.Status == TodoStatusAll {
-		start := (opts.Page - 1) * opts.PageSize
-		if start > len(groups) {
-			start = len(groups)
+		start := len(groups)
+		if opts.Page-1 <= len(groups)/opts.PageSize {
+			start = (opts.Page - 1) * opts.PageSize
 		}
-		end := start + opts.PageSize
-		if end > len(groups) {
-			end = len(groups)
-		}
+		end := start + min(opts.PageSize, len(groups)-start)
 		res.HasMore = end < len(groups)
 		groups = groups[start:end]
 	}
@@ -239,6 +240,9 @@ func (s *TodoService) BuildInbox(ctx context.Context, userID int64, options Todo
 	}
 	res.Items = groups
 	res.Partial = !res.Complete
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return res, nil
 }
 
@@ -253,27 +257,9 @@ func todoStatusMatches(filter, status string) bool {
 	}
 }
 
-func loadActiveRevertedCorpAdjusts(userID int64) ([]TodoItem, error) {
-	rows, err := ListCorpAdjusts(userID, model.CorpAdjustReverted)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]TodoItem, 0, len(rows))
-	for _, row := range rows {
-		t := row.UpdatedAt
-		out = append(out, TodoItem{
-			Kind: TodoKindCorpAdjust, Scope: TodoScopeLedger, Priority: 1,
-			Symbol: row.Symbol, Market: row.Market, Name: row.Name,
-			Title: "公司行动折算已撤销", Detail: "账本折算已撤销，请回到持仓页重新确认或忽略",
-			RefID: row.ID, RefType: "positions", Time: &t,
-		})
-	}
-	return out, nil
-}
-
-func loadActiveJobFailures(userID int64, cutoff time.Time) ([]TodoItem, error) {
+func loadActiveJobFailures(userID int64, cutoff time.Time, today string, contexts ...context.Context) ([]TodoItem, error) {
 	var rows []model.JobFailureNotification
-	err := common.DB.Where("user_id = ? AND created_at >= ?", userID, cutoff).
+	err := common.DB.WithContext(jobSubmissionContext(contexts...)).Where("user_id = ? AND created_at >= ?", userID, cutoff).
 		Order("created_at DESC, id DESC").Find(&rows).Error
 	if err != nil {
 		return nil, err
@@ -284,21 +270,27 @@ func loadActiveJobFailures(userID int64, cutoff time.Time) ([]TodoItem, error) {
 		// 防止旧行或人工导入行把原始错误、请求或密钥带进收件箱。
 		detail := jobFailureSummary(row.ErrorCode)
 		t := row.CreatedAt
-		out = append(out, TodoItem{
+		out = append(out, todoItemFromSource(today, TodoItem{
 			Kind: TodoKindJobFailure, Scope: TodoScopeResearch, Priority: 2,
 			Title: "用户任务执行失败", Detail: detail,
 			RefID: row.ID, RefType: "tasks", DeepLink: fmt.Sprintf("/tasks?job_id=%d", row.JobRunID), Time: &t,
-		})
+		}, &row))
 	}
 	return out, nil
 }
 
-func loadCompletedTodoItems(userID int64, cutoff time.Time) ([]TodoItem, map[string]error) {
+func loadCompletedTodoItems(userID int64, cutoff time.Time, today string, contexts ...context.Context) ([]TodoItem, map[string]error) {
 	out := []TodoItem{}
 	errs := map[string]error{}
+	ctx := jobSubmissionContext(contexts...)
+	db := common.DB.WithContext(ctx)
+	heldSymbols, _, err := heldPositionStateFor(userID, ctx)
+	if err != nil {
+		errs["完成历史持仓归属"] = err
+	}
 	assessedPositions := map[int64]bool{}
 	var assessedIDs []int64
-	if err := common.DB.Model(&model.PositionExitAssessment{}).Where("user_id = ?", userID).
+	if err := db.Model(&model.PositionExitAssessment{}).Where("user_id = ?", userID).
 		Distinct().Pluck("position_id", &assessedIDs).Error; err != nil {
 		errs["持仓卖出风险完成历史"] = err
 	} else {
@@ -307,7 +299,7 @@ func loadCompletedTodoItems(userID int64, cutoff time.Time) ([]TodoItem, map[str
 		}
 	}
 	var events []model.AlertEvent
-	if err := common.DB.Where("user_id = ? AND status IN ? AND updated_at >= ?", userID,
+	if err := db.Where("user_id = ? AND status IN ? AND updated_at >= ?", userID,
 		[]string{model.AlertEventRead, model.AlertEventDismissed}, cutoff).Find(&events).Error; err != nil {
 		errs["提醒完成历史"] = err
 	} else {
@@ -317,16 +309,16 @@ func loadCompletedTodoItems(userID int64, cutoff time.Time) ([]TodoItem, map[str
 			}
 			t := event.UpdatedAt
 			scope := TodoScopeResearch
-			if isPositionAlertKind(event.Kind) {
+			if isPositionAlertKind(event.Kind) || heldSymbols[QuoteKey(event.Market, event.Symbol)] {
 				scope = TodoScopeLedger
 			}
-			out = append(out, TodoItem{Kind: TodoKindAlert, Scope: scope, Priority: 3,
+			out = append(out, todoItemFromSource(today, TodoItem{Kind: TodoKindAlert, Scope: scope, Priority: 3,
 				Symbol: event.Symbol, Market: event.Market, Name: event.Name, Title: "条件提醒已收下", Detail: event.Message,
-				RefID: event.ID, RefType: "alerts", DeepLink: alertEventDeepLink(event.ID), Time: &t})
+				RefID: event.ID, RefType: "alerts", DeepLink: alertEventDeepLink(event.ID), Time: &t}, &event))
 		}
 	}
 	var reviews []model.SellReview
-	if err := common.DB.Where("user_id = ? AND status IN ? AND updated_at >= ?", userID,
+	if err := db.Where("user_id = ? AND status IN ? AND updated_at >= ?", userID,
 		[]string{model.SellReviewStatusResolved, model.SellReviewStatusDismissed}, cutoff).Find(&reviews).Error; err != nil {
 		errs["卖出复核完成历史"] = err
 	} else {
@@ -335,196 +327,70 @@ func loadCompletedTodoItems(userID int64, cutoff time.Time) ([]TodoItem, map[str
 				continue
 			}
 			t := row.UpdatedAt
-			out = append(out, TodoItem{Kind: TodoKindSellReview, Scope: TodoScopeLedger, Priority: 3,
+			out = append(out, todoItemFromSource(today, TodoItem{Kind: TodoKindSellReview, Scope: TodoScopeLedger, Priority: 3,
 				Symbol: row.Symbol, Market: row.Market, Name: row.Name, Title: "卖出复核已完成 · " + row.Title, Detail: row.Detail,
-				RefID: row.ID, RefType: "positions", DeepLink: fmt.Sprintf("/positions?position_id=%d", row.PositionID), Time: &t})
+				RefID: row.ID, RefType: "positions", DeepLink: fmt.Sprintf("/positions?position_id=%d", row.PositionID), Time: &t}, &row))
 		}
 	}
 	var recs []model.RecommendationStatus
-	if err := common.DB.Where("user_id = ? AND review_needed = ? AND review_ack = ? AND updated_at >= ?",
+	if err := db.Where("user_id = ? AND review_needed = ? AND review_ack = ? AND updated_at >= ?",
 		userID, true, true, cutoff).Find(&recs).Error; err != nil {
 		errs["推荐复盘完成历史"] = err
 	} else {
 		for _, row := range recs {
 			t := row.UpdatedAt
-			out = append(out, TodoItem{Kind: TodoKindRecReview, Scope: TodoScopeResearch, Priority: 3,
+			out = append(out, todoItemFromSource(today, TodoItem{Kind: TodoKindRecReview, Scope: TodoScopeResearch, Priority: 3,
 				Symbol: row.Symbol, Market: row.Market, Name: row.Symbol, Title: "推荐复盘已收下", Detail: recReviewDetail(row),
-				RefID: row.ID, RefType: "recommendations", DeepLink: "/recommendations", Time: &t})
+				RefID: row.ID, RefType: "recommendations", DeepLink: "/recommendations", Time: &t}, &row))
 		}
 	}
 	var adjusts []model.PositionCorpAdjust
-	if err := common.DB.Where("user_id = ? AND status IN ? AND updated_at >= ?", userID,
+	if err := db.Where("user_id = ? AND status IN ? AND updated_at >= ?", userID,
 		[]string{model.CorpAdjustConfirmed, model.CorpAdjustDismissed}, cutoff).Find(&adjusts).Error; err != nil {
 		errs["公司行动完成历史"] = err
 	} else {
 		for _, row := range adjusts {
 			t := row.UpdatedAt
-			out = append(out, TodoItem{Kind: TodoKindCorpAdjust, Scope: TodoScopeLedger, Priority: 3,
+			out = append(out, todoItemFromSource(today, TodoItem{Kind: TodoKindCorpAdjust, Scope: TodoScopeLedger, Priority: 3,
 				Symbol: row.Symbol, Market: row.Market, Name: row.Name, Title: "公司行动已处理", Detail: row.PlanProfile,
-				RefID: row.ID, RefType: "positions", DeepLink: fmt.Sprintf("/positions?position_id=%d", row.PositionID), Time: &t})
+				RefID: row.ID, RefType: "positions", DeepLink: fmt.Sprintf("/positions?position_id=%d", row.PositionID), Time: &t}, &row))
 		}
 	}
 	return out, errs
 }
 
-func enrichTodoItems(userID int64, today string, items []TodoItem) error {
-	var firstErr error
-	for i := range items {
-		if err := enrichTodoItem(userID, today, &items[i]); err != nil && !errors.Is(err, gorm.ErrRecordNotFound) && firstErr == nil {
-			firstErr = err
-		}
-		if items[i].SourceVersion == "" {
-			items[i].SourceKind = items[i].Kind
-			items[i].SourceID = items[i].RefID
-			items[i].SourceVersion = fmt.Sprintf("legacy:%s:%d:%s", items[i].Kind, items[i].RefID, today)
-		}
-	}
-	return firstErr
-}
-
-func enrichTodoItem(userID int64, today string, item *TodoItem) error {
-	item.Status = TodoStatusNeedsAction
-	item.SourceKind, item.SourceID = item.Kind, item.RefID
-	item.SourceLabel = todoSourceLabel(item.Kind)
-	item.Severity, item.severityRank = "medium", 2
-	item.eventDate = today
-	item.groupCategory = item.Kind
-	item.CanComplete = false
-	item.sortBucket = 2
-
+func enrichTodoItemDB(db *gorm.DB, userID int64, today string, item *TodoItem) error {
+	var source any
 	switch item.Kind {
 	case TodoKindAlert:
-		var row model.AlertEvent
-		if err := common.DB.Where("id = ? AND user_id = ?", item.RefID, userID).First(&row).Error; err != nil {
-			return err
-		}
-		item.eventDate = row.TradeDate
-		if item.eventDate == "" {
-			item.eventDate = row.TriggeredAt.In(time.Local).Format("2006-01-02")
-		}
-		item.SourceVersion = todoVersion(row.Status, item.eventDate, row.ContextVersion, row.UpdatedAt)
-		item.groupCategory = "alert:" + row.Kind
-		item.CanComplete = row.Status == model.AlertEventUnread
-		if isPositionAlertKind(row.Kind) {
-			item.Scope, item.Status, item.sortBucket = TodoScopeLedger, TodoStatusNeedsAction, 1
-			item.Severity, item.severityRank = "high", 3
-		} else {
-			item.Status, item.sortBucket = TodoStatusAwareness, 3
-		}
-		if row.Status != model.AlertEventUnread {
-			item.Status = TodoStatusCompleted
-		}
+		source = &model.AlertEvent{}
 	case TodoKindRecReview:
-		var row model.RecommendationStatus
-		if err := common.DB.Where("id = ? AND user_id = ?", item.RefID, userID).First(&row).Error; err != nil {
-			return err
-		}
-		item.SourceVersion = todoVersion(row.Outcome, fmt.Sprint(row.ReviewAck), row.LastEvalDate, row.UpdatedAt)
-		item.CanComplete = row.ReviewNeeded && !row.ReviewAck
-		item.DeepLink = "/recommendations"
-		if row.Outcome == model.RecOutcomeStopLoss {
-			item.Severity, item.severityRank = "high", 3
-		}
-		if row.ReviewAck {
-			item.Status = TodoStatusCompleted
-		}
+		source = &model.RecommendationStatus{}
 	case TodoKindStopLoss, TodoKindPositionShort, TodoKindPositionLong:
-		var row model.Position
-		if err := common.DB.Where("id = ? AND user_id = ?", item.RefID, userID).First(&row).Error; err != nil {
-			return err
-		}
-		state := item.Kind
-		if item.Kind == TodoKindStopLoss {
-			item.sortBucket, item.groupCategory = 0, "position:stop_loss"
-			if strings.Contains(item.Title, "跌破") {
-				item.Severity, item.severityRank, state = "critical", 4, "below"
-			} else {
-				item.Severity, item.severityRank, state = "high", 3, "near"
-			}
-		} else {
-			item.Severity, item.severityRank = "low", 1
-			item.groupCategory = "position:review"
-		}
-		item.SourceVersion = todoVersion(today, state, row.UpdatedAt)
-		item.DeepLink = fmt.Sprintf("/positions?position_id=%d", row.ID)
+		source = &model.Position{}
 	case TodoKindThesisDue:
-		var row model.ThesisCard
-		if err := common.DB.Where("id = ? AND user_id = ?", item.RefID, userID).First(&row).Error; err != nil {
-			return err
-		}
-		item.SourceVersion = todoVersion(row.Status, row.NextReviewDate, row.UpdatedAt)
-		item.Severity, item.severityRank, item.sortBucket = "low", 1, 1
-		item.DueAt = parseLocalDate(row.NextReviewDate)
-		item.DeepLink = fmt.Sprintf("/thesis?card_id=%d", row.ID)
+		source = &model.ThesisCard{}
 	case TodoKindCorpAdjust:
-		var row model.PositionCorpAdjust
-		if err := common.DB.Where("id = ? AND user_id = ?", item.RefID, userID).First(&row).Error; err != nil {
-			return err
-		}
-		item.SourceVersion = todoVersion(row.Status, row.ExDate, row.UpdatedAt)
-		item.Severity, item.severityRank, item.sortBucket = "critical", 4, 0
-		item.groupCategory = "ledger:corp_adjust"
-		item.DueAt = parseLocalDate(row.ExDate)
-		item.DeepLink = fmt.Sprintf("/positions?position_id=%d", row.PositionID)
-		if row.Status == model.CorpAdjustConfirmed || row.Status == model.CorpAdjustDismissed {
-			item.Status = TodoStatusCompleted
-		}
+		source = &model.PositionCorpAdjust{}
 	case TodoKindIpo:
-		var row model.IpoSubscription
-		if err := common.DB.Where("id = ?", item.RefID).First(&row).Error; err != nil {
-			return err
-		}
-		item.SourceVersion = todoVersion(row.Kind, row.ApplyDate, row.ApplyCode, row.UpdatedAt)
-		item.Status, item.Severity, item.severityRank, item.sortBucket = TodoStatusAwareness, "info", 0, 3
-		item.eventDate = row.ApplyDate
-		item.DueAt = parseLocalDate(row.ApplyDate)
-		item.CanComplete = true
-		item.DeepLink = "/today?source=ipo&status=awareness"
+		source = &model.IpoSubscription{}
 	case TodoKindSellReview:
-		var row model.SellReview
-		if err := common.DB.Where("id = ? AND user_id = ?", item.RefID, userID).First(&row).Error; err != nil {
-			return err
-		}
-		item.SourceVersion = todoVersion(row.Status, row.Severity, row.TradeDate, row.UpdatedAt)
-		item.eventDate, item.groupCategory = row.TradeDate, "sell:"+row.Trigger
-		item.DeepLink = fmt.Sprintf("/positions?position_id=%d", row.PositionID)
-		item.CanComplete = row.Status == model.SellReviewStatusOpen
-		item.Severity, item.severityRank = row.Severity, severityRank(row.Severity)
-		if row.Severity == model.SellReviewSeverityHigh {
-			item.sortBucket = 0
-		}
-		if row.Status != model.SellReviewStatusOpen {
-			item.Status = TodoStatusCompleted
-		}
+		source = &model.SellReview{}
 	case TodoKindPositionExit:
-		var row model.PositionExitAssessment
-		if err := common.DB.Where("id = ? AND user_id = ?", item.RefID, userID).First(&row).Error; err != nil {
-			return err
-		}
-		// 同一持仓是稳定来源，评估事实哈希/交易日/等级才是版本。盘后为同一事实
-		// 追加 close 快照时 assessment_id 会变化，但用户已处理状态不能因此失效。
-		item.SourceID = row.PositionID
-		item.SourceVersion = todoVersion(row.FactHash, row.Level, row.TradeDate, row.Version)
-		item.eventDate = row.TradeDate
-		item.groupCategory = fmt.Sprintf("position_exit:%d", row.PositionID)
-		item.DeepLink = fmt.Sprintf("/positions?position_id=%d", row.PositionID)
-		item.CanComplete = row.ShouldTodo
-		if row.Level == model.PositionExitLevelUrgent {
-			item.Severity, item.severityRank, item.sortBucket = "critical", 4, 0
-		} else {
-			item.Severity, item.severityRank, item.sortBucket = "high", 3, 1
-		}
+		source = &model.PositionExitAssessment{}
 	case TodoKindJobFailure:
-		var row model.JobFailureNotification
-		if err := common.DB.Where("id = ? AND user_id = ?", item.RefID, userID).First(&row).Error; err != nil {
-			return err
-		}
-		item.SourceVersion = todoVersion(row.Status, row.MergeCount, row.ErrorCode, row.UpdatedAt)
-		item.groupCategory = "job_failure:" + row.Kind
-		item.eventDate = row.CreatedAt.In(time.Local).Format("2006-01-02")
-		item.Severity, item.severityRank = "high", 3
-		item.CanComplete = true
+		source = &model.JobFailureNotification{}
+	default:
+		return errors.New("未知的收件箱来源")
 	}
+	query := db.Where("id = ?", item.RefID)
+	if item.Kind != TodoKindIpo {
+		query = query.Where("user_id = ?", userID)
+	}
+	if err := query.First(source).Error; err != nil {
+		return err
+	}
+	*item = todoItemFromSource(today, *item, source)
 	return nil
 }
 
@@ -599,9 +465,9 @@ func todoSourceLabel(kind string) string {
 	}
 }
 
-func loadTodoInboxStates(userID int64) (map[string]model.TodoInboxState, error) {
+func loadTodoInboxStates(ctx context.Context, userID int64) (map[string]model.TodoInboxState, error) {
 	var rows []model.TodoInboxState
-	if err := common.DB.Where("user_id = ?", userID).Find(&rows).Error; err != nil {
+	if err := common.DB.WithContext(ctx).Where("user_id = ?", userID).Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	out := make(map[string]model.TodoInboxState, len(rows))
@@ -648,7 +514,7 @@ func suppressSnoozedAndMuted(items []TodoItem, now time.Time) []TodoItem {
 	for _, item := range items {
 		if item.Status != TodoStatusCompleted && item.mutedToday {
 			key := baseTodoGroupKey(item)
-			if item.severityRank > mutedRanks[key] {
+			if rank, exists := mutedRanks[key]; !exists || item.severityRank > rank {
 				mutedRanks[key] = item.severityRank
 			}
 		}
@@ -775,6 +641,13 @@ func groupHasReview(item TodoItem) bool {
 // ApplyInboxAction 对来源做版本校验后执行。可完成的来源调用原业务状态机；
 // 持仓风险、逻辑卡和公司行动只允许稍后/当日静默，不能伪造“已完成”。
 func (s *TodoService) ApplyInboxAction(userID int64, req TodoActionRequest) error {
+	return s.ApplyInboxActionContext(context.Background(), userID, req)
+}
+
+func (s *TodoService) ApplyInboxActionContext(ctx context.Context, userID int64, req TodoActionRequest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(req.Items) == 0 || len(req.Items) > 100 {
 		return errors.New("请选择 1 到 100 条事项")
 	}
@@ -783,7 +656,7 @@ func (s *TodoService) ApplyInboxAction(userID int64, req TodoActionRequest) erro
 	default:
 		return errors.New("非法的收件箱操作")
 	}
-	currentItems, err := s.activeTodoItems(userID)
+	currentItems, err := s.activeTodoItems(ctx, userID)
 	if err != nil {
 		return err
 	}
@@ -831,31 +704,81 @@ func (s *TodoService) ApplyInboxAction(userID int64, req TodoActionRequest) erro
 			seen[key] = true
 		}
 	}
-	for _, ref := range req.Items {
-		if err := s.applyOneInboxAction(userID, req.Action, ref); err != nil {
-			return err
+	// 固定锁顺序；版本校验、原业务状态和收件箱状态在同一事务内提交。
+	refs := append([]TodoSourceRef(nil), req.Items...)
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].SourceKind != refs[j].SourceKind {
+			return refs[i].SourceKind < refs[j].SourceKind
 		}
+		return refs[i].SourceID < refs[j].SourceID
+	})
+	err = common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for _, ref := range refs {
+			item := currentByKey[todoStateKey(ref.SourceKind, ref.SourceID)]
+			locked := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Session(&gorm.Session{})
+			if ref.SourceKind == TodoKindPositionExit {
+				var latest model.PositionExitAssessment
+				if err := locked.Where("user_id = ? AND position_id = ?", userID, ref.SourceID).
+					Order("evaluated_at DESC, id DESC").First(&latest).Error; err != nil {
+					return err
+				}
+				item.RefID = latest.ID
+			}
+			if err := enrichTodoItemDB(locked, userID, time.Now().In(time.Local).Format("2006-01-02"), &item); err != nil {
+				return err
+			}
+			if item.SourceVersion != ref.SourceVersion {
+				return errors.New("事项已有新版本，请刷新后再操作")
+			}
+			if req.Action == TodoActionRead && !item.CanComplete {
+				return errors.New("事项已完成或不能直接完成，请刷新后再操作")
+			}
+			var state model.TodoInboxState
+			stateErr := locked.Where("user_id = ? AND source_kind = ? AND source_id = ?", userID, ref.SourceKind, ref.SourceID).
+				First(&state).Error
+			if stateErr != nil && !errors.Is(stateErr, gorm.ErrRecordNotFound) {
+				return stateErr
+			}
+			if stateErr == nil && state.SourceVersion == ref.SourceVersion && state.Read {
+				return errors.New("事项已完成，请刷新后再操作")
+			}
+			if err := s.applyOneInboxActionDB(tx, userID, req.Action, ref); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil && ctx.Err() != nil {
+		return ctx.Err()
 	}
-	return nil
+	return err
 }
 
-func (s *TodoService) activeTodoItems(userID int64) ([]TodoItem, error) {
-	res, err := s.buildActive(context.Background(), userID, TodoScopeAll)
+func (s *TodoService) activeTodoItems(ctx context.Context, userID int64) ([]TodoItem, error) {
+	res, err := s.buildActive(ctx, userID, TodoScopeAll)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := loadActiveRevertedCorpAdjusts(userID)
-	if err == nil {
-		res.Items = append(res.Items, rows...)
+	if !res.Complete {
+		return nil, errors.New("收件箱来源读取不完整，请刷新后重试")
 	}
-	jobs, err := loadActiveJobFailures(userID, time.Now().AddDate(0, 0, -todoHistoryMaxDays))
-	if err == nil {
-		res.Items = append(res.Items, jobs...)
-	}
-	if err := enrichTodoItems(userID, res.Date, res.Items); err != nil {
+	jobs, err := loadActiveJobFailures(userID, time.Now().AddDate(0, 0, -todoHistoryMaxDays), res.Date, ctx)
+	if err != nil {
 		return nil, err
 	}
-	return res.Items, nil
+	res.Items = append(res.Items, jobs...)
+	states, err := loadTodoInboxStates(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	applyTodoInboxStates(res.Items, states)
+	active := res.Items[:0]
+	for _, item := range res.Items {
+		if item.Status != TodoStatusCompleted {
+			active = append(active, item)
+		}
+	}
+	return active, nil
 }
 
 func todoSourceCanComplete(kind string) bool {
@@ -867,7 +790,7 @@ func todoSourceCanComplete(kind string) bool {
 	}
 }
 
-func (s *TodoService) applyOneInboxAction(userID int64, action string, ref TodoSourceRef) error {
+func (s *TodoService) applyOneInboxActionDB(db *gorm.DB, userID int64, action string, ref TodoSourceRef) error {
 	state := model.TodoInboxState{UserID: userID, SourceKind: ref.SourceKind, SourceID: ref.SourceID, SourceVersion: ref.SourceVersion}
 	now := time.Now()
 	switch action {
@@ -879,33 +802,41 @@ func (s *TodoService) applyOneInboxAction(userID int64, action string, ref TodoS
 	case TodoActionRead:
 		switch ref.SourceKind {
 		case TodoKindAlert:
-			if _, err := s.alert.SetEventStatus(userID, ref.SourceID, model.AlertEventRead); err != nil {
+			if _, err := s.alert.setEventStatusDB(db, userID, ref.SourceID, model.AlertEventRead); err != nil {
 				return err
 			}
 		case TodoKindRecReview:
-			if err := NewTrackingService(nil).AckReview(userID, ref.SourceID); err != nil {
+			if err := ackReviewDB(db, userID, ref.SourceID); err != nil {
 				return err
 			}
 		case TodoKindSellReview:
-			if _, err := SetSellReviewStatus(userID, ref.SourceID, model.SellReviewStatusResolved); err != nil {
+			if _, err := setSellReviewStatusDB(db, userID, ref.SourceID, model.SellReviewStatusResolved); err != nil {
 				return err
 			}
 		case TodoKindPositionExit, TodoKindIpo, TodoKindJobFailure:
 		default:
 			return errors.New("该事项不能直接完成")
 		}
-		current, err := currentTodoSourceRef(userID, ref.SourceKind, ref.SourceID)
-		if err != nil {
-			return err
+		// 只为本事务实际改变了原状态的来源更新版本。纯收件箱确认必须保留用户
+		// 看过的版本，不能重读后顺带收下刚出现的新风险/新失败记录。
+		if ref.SourceKind == TodoKindAlert || ref.SourceKind == TodoKindRecReview || ref.SourceKind == TodoKindSellReview {
+			current, err := currentTodoSourceRefDB(db.Clauses(clause.Locking{Strength: "UPDATE"}), userID, ref.SourceKind, ref.SourceID)
+			if err != nil {
+				return err
+			}
+			state.SourceVersion = current.SourceVersion
 		}
-		state.SourceVersion = current.SourceVersion
 		state.Read = true
 	}
-	return upsertTodoInboxState(state)
+	return upsertTodoInboxStateDB(db, state)
 }
 
 func upsertTodoInboxState(state model.TodoInboxState) error {
-	return common.DB.Clauses(clause.OnConflict{
+	return upsertTodoInboxStateDB(common.DB, state)
+}
+
+func upsertTodoInboxStateDB(db *gorm.DB, state model.TodoInboxState) error {
+	return db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "user_id"}, {Name: "source_kind"}, {Name: "source_id"}},
 		DoUpdates: clause.Assignments(map[string]any{
 			"source_version": state.SourceVersion, "read": state.Read,
@@ -916,15 +847,20 @@ func upsertTodoInboxState(state model.TodoInboxState) error {
 }
 
 func currentTodoSourceRef(userID int64, kind string, id int64) (TodoSourceRef, error) {
+	return currentTodoSourceRefDB(common.DB, userID, kind, id)
+}
+
+func currentTodoSourceRefDB(db *gorm.DB, userID int64, kind string, id int64) (TodoSourceRef, error) {
 	if kind == TodoKindPositionExit {
-		latest, err := LatestPositionExitAssessment(context.Background(), userID, id)
-		if err != nil {
+		var latest model.PositionExitAssessment
+		if err := db.Where("user_id = ? AND position_id = ?", userID, id).
+			Order("evaluated_at DESC, id DESC").First(&latest).Error; err != nil {
 			return TodoSourceRef{}, err
 		}
 		id = latest.ID
 	}
 	item := TodoItem{Kind: kind, RefID: id}
-	if err := enrichTodoItem(userID, time.Now().In(time.Local).Format("2006-01-02"), &item); err != nil {
+	if err := enrichTodoItemDB(db, userID, time.Now().In(time.Local).Format("2006-01-02"), &item); err != nil {
 		return TodoSourceRef{}, err
 	}
 	return TodoSourceRef{SourceKind: item.SourceKind, SourceID: item.SourceID, SourceVersion: item.SourceVersion}, nil

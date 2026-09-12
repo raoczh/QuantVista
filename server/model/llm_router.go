@@ -28,6 +28,11 @@ type LLMModuleRoute struct {
 	// MaxCostRatio 成本回退阈值：路由目标平均 token / 同模块其他配置平均 token 超过该比值
 	// 即自动回退（0=默认 1.35，对齐 §8.1「token 成本增加不超过 35%」）。
 	MaxCostRatio float64 `json:"max_cost_ratio"`
+	// 显式保存/恢复开始新的观察窗口；代次防止旧目标的迟到健康结论覆盖新配置。
+	Revision    int64     `gorm:"default:1" json:"revision"`
+	HealthSince time.Time `gorm:"default:null" json:"health_since"`
+	// 同一时钟刻度内先后的调用通过主键区分，避免误排除新调用或复用旧故障。
+	HealthAfterCallID int64 `gorm:"default:0" json:"-"`
 
 	// 自动回退状态（触发后路由停用，管理员显式恢复才重新生效）。
 	AutoFallbackAt     *time.Time `json:"auto_fallback_at"`

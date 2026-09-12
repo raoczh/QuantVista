@@ -120,7 +120,7 @@ func EventCalendar(userID int64, days int) (*CalendarResult, error) {
 		}
 	}
 	var positions []model.Position
-	if err := common.DB.Where("user_id = ? AND status = ? AND market = ?",
+	if err := common.DB.Scopes(withActivePositionAccount).Where("user_id = ? AND status = ? AND market = ?",
 		userID, model.PositionStatusHolding, "cn").Find(&positions).Error; err != nil {
 		fail("持仓", err)
 	}

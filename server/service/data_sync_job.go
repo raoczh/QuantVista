@@ -188,7 +188,10 @@ func (s *MarketService) dataSyncJobHandler(ctx context.Context, _ int64, _ bool,
 	audit := SyncAudit{TriggerSource: req.TriggerSource, ParameterSummary: req.ParameterSummary}
 	if execution, ok := currentJobExecution(ctx); ok {
 		var run model.JobRun
-		if common.DB.Select("id", "triggered_by").First(&run, execution.jobID).Error == nil && run.TriggeredBy != nil {
+		if err := common.DB.WithContext(ctx).Select("id", "triggered_by").First(&run, execution.jobID).Error; err != nil {
+			return DurableJobResult{}, err
+		}
+		if run.TriggeredBy != nil {
 			audit.UserID = *run.TriggeredBy
 		}
 	}
@@ -215,8 +218,10 @@ func (s *MarketService) dataSyncJobHandler(ctx context.Context, _ int64, _ bool,
 		}
 		if err == nil && log != nil && log.Succeeded > 0 {
 			var pending int64
-			common.DB.Model(&model.MarketSyncState{}).
-				Where("market = ? AND init_status = ?", req.Market, "pending").Count(&pending)
+			if queryErr := common.DB.WithContext(ctx).Model(&model.MarketSyncState{}).
+				Where("market = ? AND init_status = ?", req.Market, "pending").Count(&pending).Error; queryErr != nil {
+				err = queryErr
+			}
 			if pending > 0 {
 				ScheduleSystemDataSyncJob(JobKindInitMarketHistory, DataSyncJobRequest{
 					Version: dataSyncJobSnapshotVersion, Market: req.Market, TriggerSource: "system",
@@ -266,8 +271,8 @@ func (s *MarketService) dataSyncJobHandler(ctx context.Context, _ int64, _ bool,
 	return result, err
 }
 
-func StartSystemDataSyncJob(task string, triggeredBy *int64, req DataSyncJobRequest) (*JobRunView, bool, error) {
-	run, created, err := startSystemDataSyncJobWithStatus(defaultJobRuntime, task, triggeredBy, req)
+func StartSystemDataSyncJob(task string, triggeredBy *int64, req DataSyncJobRequest, contexts ...context.Context) (*JobRunView, bool, error) {
+	run, created, err := startSystemDataSyncJobWithStatus(defaultJobRuntime, task, triggeredBy, req, contexts...)
 	if err != nil {
 		return nil, false, err
 	}
@@ -279,7 +284,7 @@ func startSystemDataSyncJob(runtime *jobRuntime, task string, triggeredBy *int64
 	return run, err
 }
 
-func startSystemDataSyncJobWithStatus(runtime *jobRuntime, task string, triggeredBy *int64, req DataSyncJobRequest) (*model.JobRun, bool, error) {
+func startSystemDataSyncJobWithStatus(runtime *jobRuntime, task string, triggeredBy *int64, req DataSyncJobRequest, contexts ...context.Context) (*model.JobRun, bool, error) {
 	if runtime == nil {
 		return nil, false, errors.New("作业运行时不可用")
 	}
@@ -288,7 +293,7 @@ func startSystemDataSyncJobWithStatus(runtime *jobRuntime, task string, triggere
 	if err != nil {
 		return nil, false, err
 	}
-	return runtime.startSystemWithBindingStatus(triggeredBy, task, normalized, nil)
+	return runtime.startSystemWithBindingStatus(triggeredBy, task, normalized, nil, contexts...)
 }
 
 // ScheduleSystemDataSyncJob 是定时器入口。队列背压时保留一个去重重试器，直到任务
@@ -342,12 +347,16 @@ func fnv32(value []byte) uint32 {
 	return hash
 }
 
-func CancelActiveSystemJob(actorID int64, kind string) (*JobRunView, error) {
+func CancelActiveSystemJob(actorID int64, kind string, contexts ...context.Context) (*JobRunView, error) {
+	ctx := jobSubmissionContext(contexts...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if !isSystemDurableJobKind(kind) || !isAdminUser(actorID) {
 		return nil, ErrJobNotFound
 	}
 	var run model.JobRun
-	err := common.DB.Where("owner_type = ? AND user_id IS NULL AND kind = ? AND status IN ?",
+	err := common.DB.WithContext(ctx).Where("owner_type = ? AND user_id IS NULL AND kind = ? AND status IN ?",
 		model.JobOwnerSystem, kind, []string{model.JobStatusQueued, model.JobStatusRunning}).
 		Order("id DESC").First(&run).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -356,5 +365,5 @@ func CancelActiveSystemJob(actorID int64, kind string) (*JobRunView, error) {
 	if err != nil {
 		return nil, err
 	}
-	return CancelJobRun(actorID, run.ID)
+	return CancelJobRun(actorID, run.ID, ctx)
 }

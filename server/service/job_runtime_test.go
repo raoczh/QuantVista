@@ -558,17 +558,19 @@ func TestBusinessResultCommitWinsLateCancellation(t *testing.T) {
 	binding := testAnalysisBusinessBinding()
 	runtime.registerWithBinding("business_cancel_race", time.Minute,
 		func(ctx context.Context, _ int64, _ bool, _ json.RawMessage) (DurableJobResult, error) {
-			close(entered)
-			<-ctx.Done()
 			resultID, ok := currentJobResultID(ctx)
 			if !ok {
 				return DurableJobResult{}, errors.New("missing result id")
 			}
 			// 模拟业务事实先于 JobRun 终态提交，随后才观察到迟到取消。
-			if err := common.DB.Model(&model.AnalysisRecord{}).Where("id = ?", resultID).
-				Updates(map[string]any{"status": model.AnalysisStatusSuccess, "summary": "done"}).Error; err != nil {
+			if err := withJobResultTransaction(ctx, func(tx *gorm.DB) error {
+				return tx.Model(&model.AnalysisRecord{}).Where("id = ?", resultID).
+					Updates(map[string]any{"status": model.AnalysisStatusSuccess, "summary": "done"}).Error
+			}); err != nil {
 				return DurableJobResult{}, err
 			}
+			close(entered)
+			<-ctx.Done()
 			return DurableJobResult{Status: model.JobStatusSuccess}, nil
 		}, binding, false)
 	run, err := runtime.startWithBinding(userID, "business_cancel_race", map[string]int{"version": 1}, false, nil, nil, nil)

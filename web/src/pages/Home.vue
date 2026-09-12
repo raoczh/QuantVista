@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, nextTick, watch, computed } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, onBeforeUnmount, onMounted, nextTick, watch, computed } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import {
   NInput,
   NButton,
@@ -46,7 +46,12 @@ import {
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
+import { useVisibleTaskPolling } from '@/composables/useVisibleTaskPolling'
 import { useStockActions } from '@/composables/useStockActions'
+import { positionExitLevelLabel } from '@/composables/usePositionDecisionCenter'
+import { isAbortError } from '@/api/client'
+import { getSessionEpoch } from '@/api/token'
+import { formatPrice } from '@/lib/formatPrice'
 import { useAuthStore } from '@/stores/auth'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
@@ -71,10 +76,30 @@ import {
 
 const message = useMessage()
 const router = useRouter()
+const route = useRoute()
 const auth = useAuthStore()
+const sessionOwner = getSessionEpoch()
+let disposed = false
+const pageActive = () => !disposed && route.name === 'home' && sessionOwner === getSessionEpoch()
+const readControllers = new Map<string, AbortController>()
+
+function invalidateRead(key: string) {
+  readControllers.get(key)?.abort()
+  readControllers.delete(key)
+}
+
+function beginRead(key: string) {
+  invalidateRead(key)
+  const controller = new AbortController()
+  readControllers.set(key, controller)
+  return {
+    signal: controller.signal,
+    active: () => pageActive() && readControllers.get(key) === controller,
+  }
+}
 const { vars, isDark, pctColor, upColor, downColor, flatColor, withAlpha } = useUi()
 const { llmLabel } = useLlmLabel()
-const { adding, goAnalysis, goQa, goCompare, goAlert, goDetail, addToWatchlist } = useStockActions()
+const { adding, goAnalysis, goQa, goCompare, goAlert, goDetail, goPositionDecision, addToWatchlist } = useStockActions()
 const { label } = useDisplayMode()
 const unknownText = () => label('暂时无法判断', 'unknown（暂时无法判断）')
 const asOfText = () => label('数据截止时间', 'as_of（数据截止时间）')
@@ -84,15 +109,18 @@ const overview = ref<Overview | null>(null)
 const ovLoading = ref(false)
 const ovError = ref('')
 
-async function loadOverview(silent = false) {
-  if (!silent) ovLoading.value = true
+async function loadOverview() {
+  if (!pageActive()) return
+  const read = beginRead('overview')
+  ovLoading.value = true
   ovError.value = ''
   try {
-    overview.value = await getOverview('cn')
+    const value = await getOverview('cn', read.signal)
+    if (read.active()) overview.value = value
   } catch (e) {
-    ovError.value = errorText(e, '市场概览暂不可用')
+    if (read.active() && !isAbortError(e)) ovError.value = errorText(e, '市场概览暂不可用')
   } finally {
-    if (!silent) ovLoading.value = false
+    if (read.active()) ovLoading.value = false
   }
 }
 
@@ -107,7 +135,6 @@ const valuationError = ref('')
 const chartEl = ref<HTMLDivElement | null>(null)
 let chart: echarts.ECharts | null = null
 const lastBars = ref<Bar[]>([])
-let stockLoadSeq = 0
 
 // ---------- 我的今日：每个数据块独立加载，刷新失败保留最近已知值 ----------
 const positions = ref<Position[]>([])
@@ -130,6 +157,7 @@ const latestReport = ref<DailyReportView | null>(null)
 const reportLoading = ref(false)
 const reportLoaded = ref(false)
 const reportError = ref('')
+const reportActionError = ref('')
 const reportGenerating = ref(false)
 const recentTasks = ref<TaskCenterItem[]>([])
 const tasksLoading = ref(false)
@@ -140,94 +168,121 @@ function errorText(error: unknown, fallback: string) {
   return error instanceof Error && error.message ? error.message : fallback
 }
 
-async function loadPositions(silent = false) {
-  if (!silent || !positions.value.length) positionsLoading.value = true
+async function loadPositions() {
+  if (!pageActive()) return
+  const read = beginRead('positions')
+  positionsLoading.value = true
   positionsError.value = ''
   try {
-    positions.value = await listPositions('holding')
+    const value = await listPositions('holding', undefined, read.signal)
+    if (read.active()) positions.value = value
   } catch (error) {
-    positionsError.value = errorText(error, '持仓数据暂不可用')
+    if (read.active() && !isAbortError(error)) positionsError.value = errorText(error, '持仓数据暂不可用')
   } finally {
-    positionsLoaded.value = true
-    positionsLoading.value = false
+    if (read.active()) {
+      positionsLoaded.value = true
+      positionsLoading.value = false
+    }
   }
 }
 
-async function loadTodos(silent = false) {
-  if (!silent || !mineTodo.value) mineTodoLoading.value = true
+async function loadTodos() {
+  if (!pageActive()) return
+  const read = beginRead('todos')
+  mineTodoLoading.value = true
   mineTodoError.value = ''
   try {
-    const value = await getTodoInbox({ scope: 'all', status: 'needs_action', limit: 3 })
+    const value = await getTodoInbox({ scope: 'all', status: 'needs_action', limit: 3 }, read.signal)
+    if (!read.active()) return
     mineTodo.value = value
     if (!value.complete) mineTodoError.value = value.errors?.join('；') || '待办清单读取不完整'
   } catch (error) {
-    mineTodoError.value = errorText(error, '待办数据暂不可用')
+    if (read.active() && !isAbortError(error)) mineTodoError.value = errorText(error, '待办数据暂不可用')
   } finally {
-    mineTodoLoaded.value = true
-    mineTodoLoading.value = false
+    if (read.active()) {
+      mineTodoLoaded.value = true
+      mineTodoLoading.value = false
+    }
   }
 }
 
-async function loadWatchlists(silent = false) {
-  if (!silent || !watchGroups.value.length) watchLoading.value = true
+async function loadWatchlists() {
+  if (!pageActive()) return
+  const read = beginRead('watchlist')
+  watchLoading.value = true
   watchError.value = ''
   try {
-    watchGroups.value = await listWatchlists()
+    const value = await listWatchlists(read.signal)
+    if (read.active()) watchGroups.value = value
   } catch (error) {
-    watchError.value = errorText(error, '自选数据暂不可用')
+    if (read.active() && !isAbortError(error)) watchError.value = errorText(error, '自选数据暂不可用')
   } finally {
-    watchLoaded.value = true
-    watchLoading.value = false
+    if (read.active()) {
+      watchLoaded.value = true
+      watchLoading.value = false
+    }
   }
 }
 
-async function loadRecommendations(silent = false) {
-  if (!silent || !mineRecLoaded.value) mineRecLoading.value = true
+async function loadRecommendations() {
+  if (!pageActive()) return
+  const read = beginRead('recommendations')
+  mineRecLoading.value = true
   mineRecError.value = ''
   try {
-    mineRec.value = (await listRecommendations(undefined, 1))[0] ?? null
+    const value = await listRecommendations(undefined, 1, read.signal)
+    if (read.active()) mineRec.value = value[0] ?? null
   } catch (error) {
-    mineRecError.value = errorText(error, '推荐结果暂不可用')
+    if (read.active() && !isAbortError(error)) mineRecError.value = errorText(error, '推荐结果暂不可用')
   } finally {
-    mineRecLoaded.value = true
-    mineRecLoading.value = false
+    if (read.active()) {
+      mineRecLoaded.value = true
+      mineRecLoading.value = false
+    }
   }
 }
 
-async function loadLatestReport(silent = false) {
-  if (!silent || !reportLoaded.value) reportLoading.value = true
+async function loadLatestReport() {
+  if (!pageActive()) return
+  const read = beginRead('report')
+  reportLoading.value = true
   reportError.value = ''
   try {
-    latestReport.value = await getLatestDailyReport()
+    const value = await getLatestDailyReport(read.signal)
+    if (read.active()) latestReport.value = value
   } catch (error) {
-    reportError.value = errorText(error, '收盘日报暂不可用')
+    if (read.active() && !isAbortError(error)) reportError.value = errorText(error, '收盘日报暂不可用')
   } finally {
-    reportLoaded.value = true
-    reportLoading.value = false
+    if (read.active()) {
+      reportLoaded.value = true
+      reportLoading.value = false
+    }
   }
 }
 
-async function loadRecentTasks(silent = false) {
-  if (!silent || !tasksLoaded.value) tasksLoading.value = true
+async function loadRecentTasks() {
+  if (!pageActive()) return
+  const read = beginRead('tasks')
+  tasksLoading.value = true
   tasksError.value = ''
   try {
-    recentTasks.value = await listTasks({ limit: 3 })
+    const value = await listTasks({ limit: 3 }, read.signal)
+    if (read.active()) recentTasks.value = value
   } catch (error) {
-    tasksError.value = errorText(error, '最近任务暂不可用')
+    if (read.active() && !isAbortError(error)) tasksError.value = errorText(error, '最近任务暂不可用')
   } finally {
-    tasksLoaded.value = true
-    tasksLoading.value = false
+    if (read.active()) {
+      tasksLoaded.value = true
+      tasksLoading.value = false
+    }
   }
 }
 
-async function loadPersonalWorkspace(silent = false) {
+async function loadPersonalWorkspace() {
   await Promise.allSettled([
-    loadPositions(silent),
-    loadTodos(silent),
-    loadWatchlists(silent),
-    loadRecommendations(silent),
-    loadLatestReport(silent),
-    loadRecentTasks(silent),
+    loadPositions(),
+    loadTodos(),
+    loadWatchlists(),
   ])
 }
 
@@ -265,10 +320,16 @@ const firstUseEmpty = computed(
 
 function positionRiskLabels(position: Position) {
   const labels: string[] = []
+  const assessment = position.exit_assessment
+  if (assessment && assessment.level !== 'normal' && assessment.level !== 'unknown') {
+    labels.push(`最近评估：${positionExitLevelLabel[assessment.level]}`)
+  }
   if (position.below_stop_loss) labels.push('已跌破计划止损')
   if (position.near_stop_loss) labels.push('接近计划止损')
   if (position.short_term_review) labels.push('短线持有待复盘')
-  if (position.analysis_stale) labels.push('研究结论超过 7 天')
+  if (position.analysis_stale) labels.push(position.last_analyzed_at ? '研究结论超过 7 天' : '尚无研究结论')
+  if (!assessment) labels.push('尚无统一评估')
+  else if (assessment.data_status !== 'ready' || assessment.level === 'unknown') labels.push('评估数据不足')
   return labels
 }
 
@@ -278,6 +339,8 @@ function newestAsOf(values: Array<string | undefined>) {
 
 const positionAsOf = computed(() => newestAsOf(holdingPositions.value.map((item) => item.quote_as_of)))
 const todoSummary = computed(() => {
+  if (mineTodoError.value) return mineTodo.value ? `最近已知 ${mineTodo.value.total} 项，当前状态${unknownText()}` : `状态${unknownText()}`
+  if (mineTodoLoading.value && !mineTodo.value?.total) return '正在核对'
   if (!mineTodo.value) return mineTodoError.value ? `状态${unknownText()}` : '正在读取'
   if (!mineTodo.value.total) return mineTodo.value.complete ? '今日已全部处理' : `最近已知 0 项，完整性${unknownText()}`
   return `${mineTodoError.value ? '最近已知 ' : mineTodo.value.complete ? '' : '至少 '}${mineTodo.value.total} 项待处理`
@@ -297,7 +360,7 @@ const watchSummary = computed(() => {
   return `${prefix}${focusedWatchItems.value.length} 只重点 · ${watchFreshCount.value}/${watchItems.value.length} 行情有效`
 })
 const researchSummary = computed(() => {
-  if (!tasksLoaded.value && tasksLoading.value) return '正在读取'
+  if ((!tasksLoaded.value && tasksLoading.value) || (!reportLoaded.value && reportLoading.value) || (!mineRecLoaded.value && mineRecLoading.value)) return '正在读取'
   const prefix = tasksError.value || reportError.value || mineRecError.value ? '最近已知 ' : ''
   const task = recentTasks.value[0]
   if (task) return `${prefix}${taskKindLabel(task.kind)} · ${taskStatusLabel(task.status)}`
@@ -433,14 +496,14 @@ const modeStatusText = computed(() => {
 const modeFocusText = computed(() => {
   if (effectiveMode.value === 'pre') {
     const planState = latestReport.value?.review?.tomorrow_plan
-      ? `${reportError.value ? '最近已知：' : ''}已就绪`
+      ? `${reportError.value ? '最近已知：' : ''}${latestReport.value.trade_date} 已就绪`
       : reportLoaded.value && !reportError.value
         ? '待补充'
         : unknownText()
     const todoCount = mineTodo.value
       ? `${mineTodoError.value ? '最近已知 ' : ''}${mineTodo.value.total}`
       : unknownText()
-    return `待办 ${todoCount} 项 · 明日计划 ${planState}`
+    return `待办 ${todoCount} 项 · 最近日报计划 ${planState}`
   }
   if (effectiveMode.value === 'intraday') {
     const riskCount = positionsLoaded.value && (!positionsError.value || holdingPositions.value.length)
@@ -455,7 +518,7 @@ const modeFocusText = computed(() => {
     return `持仓需关注 ${riskCount} 笔 · 行情缺口 ${gapCount} 笔 · 触发提醒 ${alertCount} 项`
   }
   const reportState = latestReport.value
-    ? `${reportError.value ? '最近已知：' : ''}已生成`
+    ? `${reportError.value ? '最近已知：' : ''}${latestReport.value.trade_date} ${reportStatusText(latestReport.value.status)}`
     : reportLoaded.value && !reportError.value
       ? '未生成'
       : unknownText()
@@ -491,23 +554,45 @@ function taskTagType(status: TaskStatus): 'info' | 'success' | 'warning' | 'erro
 }
 
 async function generateReportOnce() {
+  if (!pageActive() || reportGenerating.value) return
+  invalidateRead('report')
+  reportLoading.value = false
   reportGenerating.value = true
-  reportError.value = ''
+  reportActionError.value = ''
   try {
-    latestReport.value = await generateDailyReport()
+    const value = await generateDailyReport()
+    if (!pageActive()) return
+    invalidateRead('report')
+    reportLoading.value = false
+    reportError.value = ''
+    latestReport.value = value
     reportLoaded.value = true
     message.success('日报任务已提交，可在最近任务或日报页查看进度')
-    void loadRecentTasks(true)
+    void loadRecentTasks()
   } catch (error) {
-    reportError.value = errorText(error, '日报生成失败')
+    if (pageActive() && !isAbortError(error)) reportActionError.value = errorText(error, '日报生成失败')
   } finally {
-    reportGenerating.value = false
+    if (pageActive()) reportGenerating.value = false
   }
 }
 
 async function refreshResearch() {
   await Promise.allSettled([loadRecentTasks(), loadLatestReport(), loadRecommendations()])
 }
+
+function reportStatusText(status: DailyReportView['status']) {
+  return { processing: '生成中', success: '已生成', partial: '部分完成', failed: '生成失败' }[status]
+}
+
+// 日报主要在盘后生成，任务状态与研究结果刷新不能受行情交易时段限制。
+useVisibleTaskPolling(refreshResearch, () =>
+  latestReport.value?.status === 'processing' || mineRec.value?.status === 'processing' ||
+  recentTasks.value.some(task => task.status === 'running' || task.status === 'queued'), {
+  activeIntervalMs: 4000,
+  idleIntervalMs: 30_000,
+  events: false,
+  enabled: pageActive,
+})
 
 const homeVars = computed(() => ({
   '--home-border': vars.value.borderColor,
@@ -534,25 +619,25 @@ const homeRefreshing = computed(
 )
 
 async function refreshHome() {
-  await Promise.allSettled([loadPersonalWorkspace(), loadOverview(), loadStock()])
+  await Promise.allSettled([loadPersonalWorkspace(), refreshResearch(), loadOverview(), loadStock()])
 }
 
 // 盘中自动刷新：60s，仅交易时段 + 页面可见（见 useAutoRefresh），静默保留旧值。
 useAutoRefresh(() => {
-  void loadOverview(true)
-  void loadPositions(true)
-  void loadTodos(true)
-  void loadWatchlists(true)
-  void loadRecentTasks(true)
+  void loadOverview()
+  void loadPositions()
+  void loadTodos()
+  void loadWatchlists()
   void loadStock(true)
 }, 60_000)
 
 async function loadStock(silent = false) {
+  if (!pageActive()) return
   if (!symbol.value.trim()) {
     if (!silent) message.warning('请输入股票代码')
     return
   }
-  const seq = ++stockLoadSeq
+  const read = beginRead('stock')
   const sym = symbol.value.trim()
   const previousSymbol = quote.value?.symbol
   if (!silent || !quote.value) loading.value = true
@@ -561,11 +646,11 @@ async function loadStock(silent = false) {
   valuationError.value = ''
 
   const [quoteResult, barsResult, valuationResult] = await Promise.allSettled([
-    getQuote('cn', sym),
-    getDailyBars('cn', sym, 120),
-    getValuation('cn', sym),
+    getQuote('cn', sym, read.signal),
+    getDailyBars('cn', sym, 120, read.signal),
+    getValuation('cn', sym, read.signal),
   ])
-  if (seq !== stockLoadSeq) return
+  if (!read.active()) return
 
   if (quoteResult.status === 'fulfilled') {
     quote.value = quoteResult.value
@@ -579,7 +664,7 @@ async function loadStock(silent = false) {
     if (barsResult.status === 'fulfilled') {
       lastBars.value = barsResult.value
       await nextTick()
-      if (seq === stockLoadSeq) renderChart(barsResult.value)
+      if (read.active()) renderChart(barsResult.value)
     } else {
       const detail = errorText(barsResult.reason, '日线数据暂不可用')
       barsError.value = sameStock && lastBars.value.length
@@ -594,7 +679,7 @@ async function loadStock(silent = false) {
     quoteError.value = errorText(quoteResult.reason, '行情暂不可用')
     if (quote.value?.symbol !== sym) barsError.value = '本次查询未完成，继续显示上一只股票的最近已知结果'
   }
-  if (seq === stockLoadSeq) loading.value = false
+  if (read.active()) loading.value = false
 }
 
 function renderChart(bars: Bar[]) {
@@ -630,14 +715,20 @@ watch([isDark, vars], () => {
 
 // ---------- 展示辅助 ----------
 function fmt(n: number | undefined) {
-  return n == null ? '-' : n.toFixed(2)
+  return n == null || !Number.isFinite(n) ? '—' : n.toFixed(2)
+}
+function fmtQuotePrice(n: number | undefined) {
+  return formatPrice(n != null && n > 0 ? n : undefined)
+}
+function fmtValuationRatio(n: number | undefined) {
+  return n === 0 ? '—' : fmt(n)
 }
 function fmtAmount(n: number) {
-  if (!n) return '-'
+  if (n == null || !Number.isFinite(n) || n < 0) return '—'
   return (n / 1e8).toFixed(2) + ' 亿'
 }
 function fmtVol(n: number) {
-  if (!n) return '-'
+  if (n == null || !Number.isFinite(n) || n < 0) return '—'
   return n >= 1e4 ? (n / 1e4).toFixed(1) + ' 万手' : n + ' 手'
 }
 function fmtTime(t: string | undefined) {
@@ -678,8 +769,10 @@ onMounted(() => {
   }, 60_000)
   window.addEventListener('resize', onResize)
 })
-onUnmounted(() => {
-  stockLoadSeq++
+onBeforeUnmount(() => {
+  disposed = true
+  for (const controller of readControllers.values()) controller.abort()
+  readControllers.clear()
   if (clockTimer !== undefined) window.clearInterval(clockTimer)
   window.removeEventListener('resize', onResize)
   chart?.dispose()
@@ -802,7 +895,7 @@ function onResize() {
                 <div v-if="priorityTodos.length" class="work-list">
                   <button
                     v-for="item in priorityTodos"
-                    :key="`${item.kind}-${item.ref_id}`"
+                    :key="item.group_key"
                     type="button"
                     class="work-row"
                     @click="openTodo(item)"
@@ -820,12 +913,12 @@ function onResize() {
                     来源 今日收件箱（需处理） · {{ asOfText() }} {{ mineTodo?.date || unknownText() }}<template v-if="!mineTodo?.complete"> · 最近已知，数据不完整</template>
                   </div>
                 </div>
-                <div v-else-if="mineTodoLoaded && mineTodo?.complete" class="calm-state">
+                <div v-else-if="mineTodoLoaded && mineTodo?.complete && !mineTodoError && !mineTodoLoading" class="calm-state">
                   <strong>今日需处理事项已全部完成</strong>
                   <span>来源 今日收件箱 · {{ asOfText() }} {{ mineTodo.date }}</span>
                   <n-button size="small" secondary @click="router.push('/today')">查看已完成</n-button>
                 </div>
-                <n-empty v-else-if="mineTodoLoaded && !mineTodoError" size="small" :description="`待办状态${unknownText()}`" />
+                <n-empty v-else-if="mineTodoLoaded && !mineTodoError && !mineTodoLoading" size="small" :description="`待办状态${unknownText()}`" />
                 <div class="section-footer">
                   <n-button size="small" text type="primary" @click="router.push('/today')">查看全部待办</n-button>
                 </div>
@@ -869,21 +962,24 @@ function onResize() {
                       :key="item.id"
                       type="button"
                       class="work-row"
-                      @click="goDetail(item)"
+                      @click="goPositionDecision(item, item.id)"
                     >
                       <span class="work-main">
                         <StockIdentity :symbol="item.symbol" :market="item.market" :name="item.name" density="table" />
                         <small>{{ positionRiskLabels(item).join(' · ') }}</small>
+                        <small v-if="item.exit_assessment">
+                          最近评估 {{ item.exit_assessment.evaluated_at || unknownText() }}
+                        </small>
                       </span>
                       <ChangeTag v-if="item.quote_ok" :value="item.day_change_pct" size="small" />
                     </button>
                   </div>
-                  <div v-else class="calm-inline">当前接口未返回需处理的持仓风险标记</div>
+                  <div v-else class="calm-inline">最近评估与持仓标记未提示需关注事项</div>
 
                   <div v-if="quoteGapPositions.length" class="gap-list">
                     <div v-for="item in quoteGapPositions.slice(0, 3)" :key="item.id" class="gap-row">
                       <span><StockIdentity :symbol="item.symbol" :market="item.market" :name="item.name" density="table" /> · 行情不可用于盈亏或风险结论</span>
-                      <span v-if="item.last_price" class="qv-tnum">最近已知价 {{ fmt(item.last_price) }}</span>
+                      <span v-if="item.last_price" class="qv-tnum">最近已知价 {{ formatPrice(item.last_price) }}</span>
                       <FreshnessTag
                         :status="item.freshness_status || 'unknown'"
                         :as-of="item.quote_as_of"
@@ -893,7 +989,7 @@ function onResize() {
                     </div>
                   </div>
                 </template>
-                <div v-else-if="positionsLoaded && !positionsError" class="action-empty">
+                <div v-else-if="positionsLoaded && !positionsError && !positionsLoading" class="action-empty">
                   <strong>还没有持仓记录</strong>
                   <span>记录真实成交或导入现有账本后，这里才会计算盈亏与风险。</span>
                   <div class="empty-actions">
@@ -929,7 +1025,7 @@ function onResize() {
                     <span class="work-main">
                       <StockIdentity :symbol="item.symbol" :market="item.market" :name="item.name" density="table" />
                       <small>
-                        {{ item.quote_ok ? `行情 ${fmt(item.price)}` : `最近已知价 ${item.price ? fmt(item.price) : unknownText()}` }}
+                        {{ item.quote_ok ? `行情 ${formatPrice(item.price)}` : `最近已知价 ${item.price ? formatPrice(item.price) : unknownText()}` }}
                         · 来源 自选列表（具体行情源未返回） · {{ asOfText() }} {{ item.data_time || unknownText() }}
                       </small>
                     </span>
@@ -939,12 +1035,12 @@ function onResize() {
                     </span>
                   </button>
                 </div>
-                <div v-else-if="watchLoaded && !watchItems.length && !watchError" class="action-empty">
+                <div v-else-if="watchLoaded && !watchItems.length && !watchError && !watchLoading" class="action-empty">
                   <strong>还没有自选股</strong>
                   <span>从全局搜索添加第一只自选。</span>
                   <n-button size="small" type="primary" @click="openGlobalSearch">打开全局搜索</n-button>
                 </div>
-                <div v-else-if="watchLoaded && watchItems.length && !watchError" class="action-empty">
+                <div v-else-if="watchLoaded && watchItems.length && !watchError && !watchLoading" class="action-empty">
                   <strong>还没有重点自选</strong>
                   <span>已有 {{ watchItems.length }} 只普通自选，设为重点后会在这里优先展示。</span>
                   <n-button size="small" secondary @click="router.push('/watchlist')">管理重点自选</n-button>
@@ -977,12 +1073,13 @@ function onResize() {
                   </button>
                 </div>
 
-                <n-alert v-if="reportError" type="warning" :bordered="false" :show-icon="false" class="inline-state">
-                  日报读取或生成失败：{{ reportError }}。<template v-if="latestReport">继续显示 {{ latestReport.trade_date }} 的最近已知日报。</template><template v-else>来源 收盘日报 · {{ asOfText() }} {{ unknownText() }}。</template>
+                <n-alert v-if="reportError || reportActionError" type="warning" :bordered="false" :show-icon="false" class="inline-state">
+                  日报读取或生成失败：{{ reportActionError || reportError }}。<template v-if="latestReport">继续显示 {{ latestReport.trade_date }} 的最近已知日报。</template><template v-else>来源 收盘日报 · {{ asOfText() }} {{ unknownText() }}。</template>
                 </n-alert>
                 <div v-if="latestReport?.review" class="research-result">
                   <div class="result-head">
                     <strong>{{ latestReport.trade_date }} 收盘日报</strong>
+                    <n-tag v-if="latestReport.status !== 'success'" size="tiny" type="warning" :bordered="false">{{ reportStatusText(latestReport.status) }}</n-tag>
                     <span>{{ llmLabel(latestReport) || '模型信息未记录' }}</span>
                   </div>
                   <p>{{ latestReport.review.summary }}</p>
@@ -990,9 +1087,9 @@ function onResize() {
                   <div class="source-line">来源 收盘日报 · {{ asOfText() }} {{ latestReport.trade_date }}</div>
                 </div>
                 <div v-else-if="latestReport" class="calm-inline">
-                  日报任务 {{ latestReport.status }} · 来源 收盘日报 · {{ asOfText() }} {{ latestReport.trade_date }}
+                  日报任务 {{ reportStatusText(latestReport.status) }} · 来源 收盘日报 · {{ asOfText() }} {{ latestReport.trade_date }}
                 </div>
-                <div v-else-if="reportLoaded && !reportError" class="action-empty compact-empty">
+                <div v-else-if="reportLoaded && !reportError && !reportLoading" class="action-empty compact-empty">
                   <strong>还没有收盘日报</strong>
                   <div class="empty-actions">
                     <n-button size="small" type="primary" :loading="reportGenerating" @click="generateReportOnce">生成一次</n-button>
@@ -1004,7 +1101,7 @@ function onResize() {
                   <span><strong>最新推荐</strong> · {{ mineRec.title || `${recTypeText(mineRec.type)}策略 · ${mineRec.strategy}` }}</span>
                   <small>来源 推荐追踪 · {{ relDay(mineRec.created_at) }}</small>
                 </button>
-                <n-alert v-else-if="mineRecError" type="warning" :bordered="false" :show-icon="false" class="inline-state">
+                <n-alert v-if="mineRecError" type="warning" :bordered="false" :show-icon="false" class="inline-state">
                   推荐结果读取失败：{{ mineRecError }}。来源 推荐追踪 · {{ asOfText() }} {{ unknownText() }}。
                 </n-alert>
                 <div class="section-footer split-footer">
@@ -1052,7 +1149,7 @@ function onResize() {
               来源 {{ sourceText(overview.indices) }} · {{ asOfText() }} {{ newestAsOf(overview.indices.map((item) => item.data_time)) }}
             </div>
           </template>
-          <n-empty v-else description="指数数据暂不可用" />
+          <n-empty v-else-if="!ovLoading" description="指数数据暂不可用" />
         </n-spin>
       </SectionCard>
 
@@ -1063,19 +1160,19 @@ function onResize() {
             <template v-if="overview?.gainers?.length">
               <RankList :items="overview.gainers">
                 <template #row="{ item }">
-                  <div class="stock-row stock-row-link" @click="goDetail({ symbol: item.symbol, market: 'cn', name: item.name })">
+                  <button type="button" class="stock-row stock-row-link" @click="goDetail({ symbol: item.symbol, market: 'cn', name: item.name })">
                     <StockIdentity :symbol="item.symbol" market="cn" :name="item.name" density="table" />
                     <div class="sr-figures">
-                      <span class="sr-price qv-tnum">{{ fmt(item.price) }}</span>
+                      <span class="sr-price qv-tnum">{{ formatPrice(item.price) }}</span>
                       <ChangeTag :value="item.change_pct" size="small" />
                       <span class="sr-amount qv-tnum">{{ fmtAmount(item.amount) }}</span>
                     </div>
-                  </div>
+                  </button>
                 </template>
               </RankList>
               <div class="source-line">来源 {{ sourceText(overview.gainers) }} · 采集于 {{ fmtTime(overview.data_time) }}</div>
             </template>
-            <n-empty v-else description="暂不可用" />
+            <n-empty v-else-if="!ovLoading" description="暂不可用" />
           </SectionCard>
         </n-gi>
         <n-gi>
@@ -1083,19 +1180,19 @@ function onResize() {
             <template v-if="overview?.actives?.length">
               <RankList :items="overview.actives">
                 <template #row="{ item }">
-                  <div class="stock-row stock-row-link" @click="goDetail({ symbol: item.symbol, market: 'cn', name: item.name })">
+                  <button type="button" class="stock-row stock-row-link" @click="goDetail({ symbol: item.symbol, market: 'cn', name: item.name })">
                     <StockIdentity :symbol="item.symbol" market="cn" :name="item.name" density="table" />
                     <div class="sr-figures">
-                      <span class="sr-price qv-tnum">{{ fmt(item.price) }}</span>
+                      <span class="sr-price qv-tnum">{{ formatPrice(item.price) }}</span>
                       <ChangeTag :value="item.change_pct" size="small" />
                       <span class="sr-amount qv-tnum">{{ fmtAmount(item.amount) }}</span>
                     </div>
-                  </div>
+                  </button>
                 </template>
               </RankList>
               <div class="source-line">来源 {{ sourceText(overview.actives) }} · 采集于 {{ fmtTime(overview.data_time) }}</div>
             </template>
-            <n-empty v-else description="暂不可用" />
+            <n-empty v-else-if="!ovLoading" description="暂不可用" />
           </SectionCard>
         </n-gi>
       </n-grid>
@@ -1105,7 +1202,7 @@ function onResize() {
         <n-gi>
           <SectionCard title="板块涨跌榜">
             <template v-if="sectorsUnavailable" #extra>
-              <n-tag size="small" type="warning" round :bordered="false">数据源繁忙</n-tag>
+              <n-tag size="small" type="warning" round :bordered="false">数据暂缺</n-tag>
             </template>
             <template v-if="overview?.sectors?.length">
               <RankList :items="overview.sectors">
@@ -1121,14 +1218,14 @@ function onResize() {
               </RankList>
               <div class="source-line">来源 {{ sourceText(overview.sectors) }} · 采集于 {{ fmtTime(overview.data_time) }}</div>
             </template>
-            <n-empty v-else description="板块榜依赖东财接口，当前限流暂不可用，稍后重试" />
+            <n-empty v-else-if="!ovLoading" description="板块数据暂不可用，可稍后刷新" />
           </SectionCard>
         </n-gi>
         <n-gi>
           <SectionCard title="市场情绪">
             <template #extra>
               <div class="card-actions">
-                <n-tag v-if="breadthUnavailable" size="small" type="warning" round :bordered="false">数据源繁忙</n-tag>
+              <n-tag v-if="breadthUnavailable" size="small" type="warning" round :bordered="false">数据暂缺</n-tag>
                 <n-button size="tiny" quaternary type="primary" @click="router.push('/mood')">查看盘面</n-button>
               </div>
             </template>
@@ -1192,7 +1289,7 @@ function onResize() {
                 来源 {{ overview.breadth.source || unknownText() }} · {{ asOfText() }} {{ overview.breadth.data_time || overview.breadth.trade_date || unknownText() }}
               </div>
             </div>
-            <n-empty v-else description="涨跌家数依赖东财接口，当前限流暂不可用，稍后重试" />
+            <n-empty v-else-if="!ovLoading" description="涨跌家数暂不可用，可稍后刷新" />
           </SectionCard>
         </n-gi>
       </n-grid>
@@ -1240,7 +1337,7 @@ function onResize() {
           </div>
           <div class="quote-hero">
             <span class="qh-price qv-figure" :style="{ color: pctColor(quote.change_pct) }">
-              {{ fmt(quote.price) }}
+              {{ fmtQuotePrice(quote.price) }}
             </span>
             <ChangeTag :value="quote.change_pct" />
             <FreshnessTag
@@ -1256,19 +1353,19 @@ function onResize() {
           <div class="quote-grid">
             <div class="quote-cell">
               <span class="qc-label">今开</span>
-              <span class="qc-value qv-tnum">{{ fmt(quote.open) }}</span>
+              <span class="qc-value qv-tnum">{{ fmtQuotePrice(quote.open) }}</span>
             </div>
             <div class="quote-cell">
               <span class="qc-label">昨收</span>
-              <span class="qc-value qv-tnum">{{ fmt(quote.prev_close) }}</span>
+              <span class="qc-value qv-tnum">{{ fmtQuotePrice(quote.prev_close) }}</span>
             </div>
             <div class="quote-cell">
               <span class="qc-label">最高</span>
-              <span class="qc-value qv-tnum" :style="{ color: upColor }">{{ fmt(quote.high) }}</span>
+              <span class="qc-value qv-tnum" :style="{ color: upColor }">{{ fmtQuotePrice(quote.high) }}</span>
             </div>
             <div class="quote-cell">
               <span class="qc-label">最低</span>
-              <span class="qc-value qv-tnum" :style="{ color: downColor }">{{ fmt(quote.low) }}</span>
+              <span class="qc-value qv-tnum" :style="{ color: downColor }">{{ fmtQuotePrice(quote.low) }}</span>
             </div>
             <div class="quote-cell">
               <span class="qc-label">成交量</span>
@@ -1284,11 +1381,11 @@ function onResize() {
           <div v-if="valuation && valuation.symbol === quote.symbol" class="quote-grid valuation-grid">
             <div class="quote-cell">
               <span class="qc-label">PE-TTM</span>
-              <span class="qc-value qv-tnum">{{ valuation.pe_ttm < 0 ? '亏损' : fmt(valuation.pe_ttm) }}</span>
+              <span class="qc-value qv-tnum">{{ valuation.pe_ttm < 0 ? '亏损' : fmtValuationRatio(valuation.pe_ttm) }}</span>
             </div>
             <div class="quote-cell">
               <span class="qc-label">市净率</span>
-              <span class="qc-value qv-tnum">{{ fmt(valuation.pb) }}</span>
+              <span class="qc-value qv-tnum">{{ fmtValuationRatio(valuation.pb) }}</span>
             </div>
             <div class="quote-cell">
               <span class="qc-label">总市值</span>
@@ -1300,11 +1397,11 @@ function onResize() {
             </div>
             <div class="quote-cell">
               <span class="qc-label">量比</span>
-              <span class="qc-value qv-tnum">{{ fmt(valuation.volume_ratio) }}</span>
+              <span class="qc-value qv-tnum">{{ fmtValuationRatio(valuation.volume_ratio) }}</span>
             </div>
             <div class="quote-cell">
               <span class="qc-label">涨停 / 跌停</span>
-              <span class="qc-value qv-tnum">{{ fmt(valuation.limit_up) }} / {{ fmt(valuation.limit_down) }}</span>
+              <span class="qc-value qv-tnum">{{ fmtQuotePrice(valuation.limit_up) }} / {{ fmtQuotePrice(valuation.limit_down) }}</span>
             </div>
             <div class="source-line valuation-source">来源 {{ valuation.source || unknownText() }} · {{ asOfText() }} {{ valuation.data_time || unknownText() }}</div>
           </div>
@@ -1326,7 +1423,7 @@ function onResize() {
       <!-- AI 今日观点已上移到个人工作台；全市场资金仍完整保留在第二层。 -->
       <SectionCard title="资金流向">
         <template v-if="fundFlowUnavailable" #extra>
-          <n-tag size="small" type="warning" round :bordered="false">数据源繁忙</n-tag>
+          <n-tag size="small" type="warning" round :bordered="false">数据暂缺</n-tag>
         </template>
         <div v-if="overview?.fund_flow" class="fundflow">
           <div class="ff-hero">
@@ -1377,7 +1474,7 @@ function onResize() {
             来源 {{ overview.fund_flow.source || unknownText() }} · {{ asOfText() }} {{ overview.fund_flow.data_time || overview.fund_flow.trade_date || unknownText() }}
           </div>
         </div>
-        <n-empty v-else description="两市资金流依赖东财接口，当前限流暂不可用，稍后重试" />
+        <n-empty v-else-if="!ovLoading" description="两市资金流暂不可用，可稍后刷新" />
       </SectionCard>
 
       <n-alert type="warning" title="风险提示" :bordered="false">
@@ -1408,7 +1505,7 @@ function onResize() {
   margin-bottom: 12px;
 }
 .personal-workspace,
-.personal-workspace :deep(.n-card__content) {
+.personal-workspace :deep(.n-card-content) {
   min-width: 0;
 }
 .mode-current {
@@ -1636,11 +1733,14 @@ function onResize() {
 }
 .result-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   justify-content: space-between;
   gap: 8px;
 }
 .result-head span {
+  min-width: 0;
+  overflow-wrap: anywhere;
   color: var(--home-muted);
   font-size: 11px;
 }
@@ -1703,7 +1803,17 @@ function onResize() {
   width: 100%;
 }
 .stock-row-link {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
   cursor: pointer;
+}
+.stock-row-link:focus-visible {
+  outline: 2px solid var(--home-primary);
+  outline-offset: 3px;
 }
 .sr-name {
   display: flex;
@@ -1739,13 +1849,17 @@ function onResize() {
   min-width: 64px;
   text-align: right;
 }
-/* 超窄屏：右侧价格+涨跌+成交额三段不可收缩，名称列会被挤到 2~3 字，隐藏次要的成交额 */
+/* 窄屏把名称与数值分行，给完整股票名称留下宽度。 */
 @media (max-width: 480px) {
+  .stock-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+  }
   .sr-figures {
     gap: 8px;
-  }
-  .sr-amount {
-    display: none;
+    flex-wrap: wrap;
+    justify-content: flex-end;
   }
 }
 .sr-leader {
@@ -1935,7 +2049,7 @@ function onResize() {
   .first-use-entry .n-button {
     width: 100%;
   }
-  .personal-workspace :deep(.n-card__content) {
+  .personal-workspace :deep(.n-card-content) {
     overflow-x: hidden;
   }
   .mode-toolbar {

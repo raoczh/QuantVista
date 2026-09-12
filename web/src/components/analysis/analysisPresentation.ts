@@ -45,13 +45,15 @@ export function parseSnapshotFreshness(raw?: string): SnapshotFreshness {
   if (!raw) return fallback
   try {
     const value = JSON.parse(raw) as Record<string, unknown>
+    const quote = value.quote as Record<string, unknown> | undefined
+    const historicalDate = value.as_of ? quote?.trade_date : ''
     const status = String(value.freshness_status || '').toLowerCase()
     const freshness = status === 'fresh' ? 'fresh' : status === 'stale' ? 'stale' : status === 'partial' ? 'partial' : 'unknown'
     return {
       capturedAt: String(value.data_as_of || value.captured_at || ''),
-      quoteAsOf: String(value.quote_as_of || value.as_of || ''),
-      quoteSource: String(value.quote_source || ''),
-      barsAsOf: String(value.bars_as_of || ''),
+      quoteAsOf: String(value.quote_as_of || quote?.data_time || quote?.trade_date || value.as_of || ''),
+      quoteSource: String(value.quote_source || quote?.source || ''),
+      barsAsOf: String(value.bars_as_of || historicalDate || ''),
       freshness,
       note: String(value.freshness_note || value.as_of_note || fallback.note),
     }

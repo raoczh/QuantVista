@@ -37,8 +37,25 @@ export function loginByPassword(username: string, password: string) {
   return request<TokenPair>({ url: '/auth/login', method: 'post', data: { username, password } })
 }
 
-export function logout(refreshToken: string) {
-  return request<{ ok: boolean }>({ url: '/auth/logout', method: 'post', data: { refresh_token: refreshToken } })
+export async function logout(refreshToken: string): Promise<{ ok: boolean }> {
+  if (!refreshToken) return { ok: true }
+  // 吊销对象由旧 refresh token 固定，不随新的登录身份变化；页面卸载也应继续清理。
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 20_000)
+  try {
+    const response = await fetch('/api/auth/logout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+      keepalive: true,
+      signal: controller.signal,
+    })
+    const body = await response.json()
+    if (!response.ok || !body?.success) throw new Error(body?.message || '退出登录失败')
+    return body.data
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 export function getGithubAuthURL(redirectURI: string) {

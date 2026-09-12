@@ -187,8 +187,9 @@ func (s *BrowserNotificationService) Config(userID int64) (*BrowserNotificationC
 }
 
 func (s *BrowserNotificationService) UpdateSettings(userID int64, in BrowserNotificationSettingsInput) (BrowserNotificationSettingsInput, error) {
-	row := model.BrowserNotificationPreference{UserID: userID, ExitRisk: in.ExitRisk, ManualAlert: in.ManualAlert, Guard: in.Guard}
-	err := common.DB.Clauses(clause.OnConflict{
+	now := time.Now()
+	row := map[string]any{"user_id": userID, "exit_risk": in.ExitRisk, "manual_alert": in.ManualAlert, "guard": in.Guard, "created_at": now, "updated_at": now}
+	err := common.DB.Model(&model.BrowserNotificationPreference{}).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "user_id"}},
 		DoUpdates: clause.AssignmentColumns([]string{"exit_risk", "manual_alert", "guard", "updated_at"}),
 	}).Create(&row).Error
@@ -247,8 +248,15 @@ func (s *BrowserNotificationService) UpsertSubscription(userID int64, in Browser
 	now := s.now()
 	var device model.BrowserNotificationDevice
 	err = common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockNotificationUser(tx, userID); err != nil {
+			return err
+		}
+		// 用户行已串行化本用户配置；空设备范围不能再加间隙锁，以免阻塞其他用户首次订阅。
 		lookup := tx.Where("user_id = ? AND device_key_hash = ?", userID, deviceHash).First(&device).Error
-		if errors.Is(lookup, gorm.ErrRecordNotFound) {
+		if lookup != nil && !errors.Is(lookup, gorm.ErrRecordNotFound) {
+			return lookup
+		}
+		if errors.Is(lookup, gorm.ErrRecordNotFound) || !device.Enabled {
 			var count int64
 			if err := tx.Model(&model.BrowserNotificationDevice{}).Where("user_id = ? AND enabled = ?", userID, true).Count(&count).Error; err != nil {
 				return err
@@ -256,12 +264,12 @@ func (s *BrowserNotificationService) UpsertSubscription(userID int64, in Browser
 			if count >= maxBrowserDevices {
 				return fmt.Errorf("浏览器通知设备已达上限（%d）", maxBrowserDevices)
 			}
+		}
+		if errors.Is(lookup, gorm.ErrRecordNotFound) {
 			device = model.BrowserNotificationDevice{UserID: userID, DeviceKeyHash: deviceHash, Name: name, Enabled: true, HasWebPush: hasPush, LastSeenAt: &now}
 			if err := tx.Create(&device).Error; err != nil {
 				return err
 			}
-		} else if lookup != nil {
-			return lookup
 		} else {
 			if err := tx.Model(&device).Updates(map[string]any{"name": name, "enabled": true, "has_web_push": hasPush, "last_seen_at": &now}).Error; err != nil {
 				return err
@@ -290,11 +298,21 @@ func (s *BrowserNotificationService) UpsertSubscription(userID int64, in Browser
 			}
 			row := model.WebPushSubscription{UserID: userID, DeviceID: device.ID, EndpointHash: endpointHash,
 				EndpointCipher: endpointCipher, P256dhCipher: p256dhCipher, AuthCipher: authCipher, Enabled: true}
-			if err := tx.Clauses(clause.OnConflict{
-				Columns:   []clause.Column{{Name: "user_id"}, {Name: "device_id"}},
-				DoUpdates: clause.AssignmentColumns([]string{"endpoint_hash", "endpoint_cipher", "p256dh_cipher", "auth_cipher", "enabled", "last_error_code", "updated_at"}),
-			}).Create(&row).Error; err != nil {
-				return err
+			var existing model.WebPushSubscription
+			lookup := tx.Where("user_id = ? AND device_id = ?", userID, device.ID).First(&existing).Error
+			if errors.Is(lookup, gorm.ErrRecordNotFound) {
+				// MySQL 的 ON DUPLICATE KEY 会匹配任何唯一键，不能让 endpoint 冲突更新另一用户的订阅。
+				if err := tx.Create(&row).Error; err != nil {
+					return err
+				}
+			} else if lookup != nil {
+				return lookup
+			} else {
+				if err := tx.Model(&model.WebPushSubscription{}).Where("id = ? AND user_id = ? AND device_id = ?", existing.ID, userID, device.ID).
+					Updates(map[string]any{"endpoint_hash": endpointHash, "endpoint_cipher": endpointCipher, "p256dh_cipher": p256dhCipher,
+						"auth_cipher": authCipher, "enabled": true, "last_error_code": "", "last_success_at": nil, "last_failure_at": nil}).Error; err != nil {
+					return err
+				}
 			}
 		} else {
 			if err := tx.Where("user_id = ? AND device_id = ?", userID, device.ID).Delete(&model.WebPushSubscription{}).Error; err != nil {
@@ -303,12 +321,7 @@ func (s *BrowserNotificationService) UpsertSubscription(userID int64, in Browser
 		}
 		// 显式开启设备即表达接收意愿，与新增启用外部通道保持一致。老账号通常已有
 		// 偏好行；首次直接开启通知时也要先创建默认行，不能让 UPDATE 0 行后总闸仍关闭。
-		var pref model.UserPreference
-		if err := tx.Where(model.UserPreference{UserID: userID}).
-			Attrs(model.UserPreference{MinCandidateAmount: defaultMinCandidateAmount}).FirstOrCreate(&pref).Error; err != nil {
-			return err
-		}
-		return tx.Model(&pref).Update("enable_notify", true).Error
+		return enableNotificationsTx(tx, userID)
 	})
 	if err != nil {
 		return nil, err
@@ -351,6 +364,9 @@ func (s *BrowserNotificationService) ListDevices(userID int64) ([]BrowserDeviceV
 
 func (s *BrowserNotificationService) RemoveDevice(userID, deviceID int64) error {
 	return common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockNotificationUser(tx, userID); err != nil {
+			return err
+		}
 		res := tx.Model(&model.BrowserNotificationDevice{}).Where("id = ? AND user_id = ? AND enabled = ?", deviceID, userID, true).
 			Updates(map[string]any{"enabled": false, "has_web_push": false})
 		if res.Error != nil {
@@ -421,7 +437,7 @@ func sanitizeInternalRoute(raw string) string {
 }
 
 func (s *BrowserNotificationService) CreateAndDispatch(ctx context.Context, userID int64, in BrowserNotificationInput, onlyDeviceHash string) (*model.BrowserNotificationEvent, error) {
-	if !userNotifyEnabled(userID) {
+	if !userNotifyEnabledContext(ctx, userID) {
 		return nil, nil
 	}
 	enabled, err := s.categoryEnabled(userID, in.Category)
@@ -480,9 +496,15 @@ func (s *BrowserNotificationService) dispatchWebPush(ctx context.Context, event 
 	if s.sender == nil {
 		return
 	}
-	payload, _ := json.Marshal(map[string]any{"event_id": event.ID, "title": event.Title, "body": event.Body,
+	payload, _ := json.Marshal(map[string]any{"event_id": event.ID, "user_id": event.UserID, "title": event.Title, "body": event.Body,
 		"route": event.Route, "level": event.Level, "category": event.Category})
 	for _, device := range devices {
+		if ctx.Err() != nil || !userNotifyEnabledContext(ctx, event.UserID) {
+			return
+		}
+		if enabled, err := s.categoryEnabled(event.UserID, event.Category); err != nil || !enabled {
+			return
+		}
 		var sub model.WebPushSubscription
 		if err := common.DB.WithContext(ctx).Where("user_id = ? AND device_id = ? AND enabled = ?", event.UserID, device.ID, true).First(&sub).Error; err != nil {
 			continue
@@ -513,16 +535,36 @@ func (s *BrowserNotificationService) dispatchWebPush(ctx context.Context, event 
 			if status == http.StatusNotFound || status == http.StatusGone {
 				code = "subscription_expired"
 				subUpdates["enabled"] = false
-				common.DB.Model(&model.BrowserNotificationDevice{}).Where("id = ? AND user_id = ?", device.ID, event.UserID).Update("has_web_push", false)
 			}
 			deliveryUpdates["status"] = model.BrowserDeliveryFailed
 			deliveryUpdates["last_error_code"] = code
 			subUpdates["last_failure_at"] = &now
 			subUpdates["last_error_code"] = code
 		}
-		common.DB.Model(&model.BrowserNotificationDelivery{}).
-			Where("user_id = ? AND device_id = ? AND event_id = ?", event.UserID, device.ID, event.ID).Updates(deliveryUpdates)
-		common.DB.Model(&model.WebPushSubscription{}).Where("id = ? AND user_id = ?", sub.ID, event.UserID).Updates(subUpdates)
+		auditCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := common.DB.WithContext(auditCtx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Model(&model.BrowserNotificationDelivery{}).
+				Where("user_id = ? AND device_id = ? AND event_id = ?", event.UserID, device.ID, event.ID).Updates(deliveryUpdates).Error; err != nil {
+				return err
+			}
+			var current model.BrowserNotificationDevice
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ?", device.ID, event.UserID).First(&current).Error; err != nil {
+				return err
+			}
+			res := tx.Model(&model.WebPushSubscription{}).
+				Where("id = ? AND user_id = ? AND endpoint_cipher = ? AND p256dh_cipher = ? AND auth_cipher = ?",
+					sub.ID, event.UserID, sub.EndpointCipher, sub.P256dhCipher, sub.AuthCipher).Updates(subUpdates)
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected == 1 && (status == http.StatusNotFound || status == http.StatusGone) {
+				return tx.Model(&current).Update("has_web_push", false).Error
+			}
+			return nil
+		}); err != nil {
+			common.SysWarn("浏览器通知订阅状态回写失败 device=%d", device.ID)
+		}
+		cancel()
 	}
 }
 
@@ -533,6 +575,23 @@ func (s *BrowserNotificationService) PendingEvents(userID int64, deviceKey strin
 	}
 	if limit <= 0 || limit > maxBrowserEventPageSize {
 		limit = 20
+	}
+	if !userNotifyEnabled(userID) {
+		return []BrowserEventView{}, nil
+	}
+	settings, err := s.settings(userID)
+	if err != nil {
+		return nil, err
+	}
+	categories := []string{model.BrowserNotifyCategorySystem}
+	for category, enabled := range map[string]bool{
+		model.BrowserNotifyCategoryExitRisk: settings.ExitRisk,
+		model.BrowserNotifyCategoryAlert:    settings.ManualAlert,
+		model.BrowserNotifyCategoryGuard:    settings.Guard,
+	} {
+		if enabled {
+			categories = append(categories, category)
+		}
 	}
 	var device model.BrowserNotificationDevice
 	if err := common.DB.Where("user_id = ? AND device_key_hash = ? AND enabled = ?", userID, deviceHash, true).First(&device).Error; err != nil {
@@ -550,6 +609,7 @@ func (s *BrowserNotificationService) PendingEvents(userID int64, deviceKey strin
 		Joins("JOIN browser_notification_events AS e ON e.id = d.event_id AND e.user_id = d.user_id").
 		Where("d.user_id = ? AND d.device_id = ? AND d.foreground_ack_at IS NULL AND d.status IN ? AND e.id > ?",
 			userID, device.ID, []string{model.BrowserDeliveryPending, model.BrowserDeliveryFailed}, afterID).
+		Where("e.category IN ?", categories).
 		Order("e.id ASC").Limit(limit).Scan(&rows).Error
 	if err != nil {
 		return nil, err

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,8 +46,8 @@ func min5Clocks() []string {
 			}
 		}
 	}
-	push(9, 35, 24)  // 0935..1130
-	push(13, 5, 24)  // 1305..1500
+	push(9, 35, 24) // 0935..1130
+	push(13, 5, 24) // 1305..1500
 	return out
 }
 
@@ -60,11 +61,12 @@ func fullDay48(day string, priceAt func(clock string) float64, volAt func(clock 
 }
 
 // 场景一手工验算：上午首根 10.00、其余上午 10.30；下午 10.00、末根 9.80，量恒 100。
-//   morning = (10.30-10.00)/10.00 = +3.00%
-//   tail30  = (9.80-10.00)/10.00 = -2.00%（1430 收盘 10.00 → 1500 收盘 9.80）
-//   tail30VolPct = 600/4800 = 12.5%
-//   vwapAM = (10.00×100+10.30×2300)/2400 = 10.2875；vwapPM = (10.00×2300+9.80×100)/2400 ≈ 9.9917 → PmVwapUp=false
-//   vwap 全天 = 48670/4800 = 10.1396→ closeVsVwap = (9.80-10.1396)/10.1396 = -3.35%
+//
+//	morning = (10.30-10.00)/10.00 = +3.00%
+//	tail30  = (9.80-10.00)/10.00 = -2.00%（1430 收盘 10.00 → 1500 收盘 9.80）
+//	tail30VolPct = 600/4800 = 12.5%
+//	vwapAM = (10.00×100+10.30×2300)/2400 = 10.2875；vwapPM = (10.00×2300+9.80×100)/2400 ≈ 9.9917 → PmVwapUp=false
+//	vwap 全天 = 48670/4800 = 10.1396→ closeVsVwap = (9.80-10.1396)/10.1396 = -3.35%
 func TestComputeIntradayFactorsManual(t *testing.T) {
 	day := "20260708"
 	bars := fullDay48(day,
@@ -110,7 +112,8 @@ func TestComputeIntradayFactorsManual(t *testing.T) {
 }
 
 // 场景二：尾盘放量拉升（尾盘 6 根 10.50 量 200、其余 10.00 量 100）。
-//   tail30 = +5.00%、tail30VolPct = 1200/5400 = 22.22%、PmVwapUp=true
+//
+//	tail30 = +5.00%、tail30VolPct = 1200/5400 = 22.22%、PmVwapUp=true
 func TestComputeIntradayFactorsTailRush(t *testing.T) {
 	day := "20260708"
 	bars := fullDay48(day,
@@ -292,17 +295,23 @@ func TestSyncIntradayFactorsE2E(t *testing.T) {
 func TestSyncIntradayAbortOnSourceFailure(t *testing.T) {
 	setupTestDB(t)
 	cleanIntradayTables(t)
-	for i := 0; i < intradayAbortStreak+10; i++ {
-		common.DB.Create(&model.MarketSyncState{Symbol: fmt.Sprintf("%06d", 100000+i), Market: "cn", InitStatus: "done"})
+	const totalSymbols = intradayAbortStreak + intradayWorkers + 2
+	for i := 0; i < totalSymbols; i++ {
+		if err := common.DB.Create(&model.MarketSyncState{Symbol: fmt.Sprintf("%06d", 100000+i), Market: "cn", InitStatus: "done"}).Error; err != nil {
+			t.Fatal(err)
+		}
 	}
-	calls := 0
+	var calls atomic.Int32
 	svc := &IntradayService{fetchMin5: func(ctx context.Context, market, symbol string, count int) ([]datasource.Min5Bar, error) {
-		calls++
+		calls.Add(1)
 		return nil, errors.New("connection reset")
 	}}
 	_, err := svc.SyncIntradayFactors(context.Background(), []string{"2026-07-08"})
 	if err == nil || errors.Is(err, ErrSyncInProgress) {
 		t.Fatalf("源故障应报错, got %v", err)
+	}
+	if got := calls.Load(); got < intradayAbortStreak || got >= totalSymbols {
+		t.Fatalf("应达到故障阈值后提前中止，不能继续抓取全部 %d 个标的: calls=%d", totalSymbols, got)
 	}
 	var total int64
 	common.DB.Model(&model.IntradayFactorDaily{}).Count(&total)
@@ -318,6 +327,11 @@ func TestIntradayPendingDates(t *testing.T) {
 	t.Cleanup(func() { common.DB.Where("1 = 1").Delete(&model.TradingCalendar{}) })
 	for _, d := range []string{"2026-07-01", "2026-07-02", "2026-07-03", "2026-07-06", "2026-07-07", "2026-07-08"} {
 		common.DB.Select("Market", "TradeDate", "IsOpen").Create(&model.TradingCalendar{Market: "cn", TradeDate: d, IsOpen: true})
+	}
+	for _, d := range []string{"2026-07-04", "2026-07-05"} {
+		if err := common.DB.Select("Market", "TradeDate", "IsOpen").Create(&model.TradingCalendar{Market: "cn", TradeDate: d, IsOpen: false}).Error; err != nil {
+			t.Fatal(err)
+		}
 	}
 	// 游标已到位 → 空。
 	if got := intradayPendingDates("2026-07-08", "2026-07-08"); got != nil {

@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"quantvista/datasource"
 	"quantvista/model"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -38,6 +41,16 @@ func AggregateBoardValuationAsync(rows []datasource.SpotRow, tradeDate string) {
 	if common.DB == nil {
 		return
 	}
+	hasIndustry := false
+	for _, row := range rows {
+		if row.Industry != "" {
+			hasIndustry = true
+			break
+		}
+	}
+	if !hasIndustry {
+		return
+	}
 	go func() {
 		if !boardValMu.TryLock() {
 			return
@@ -53,8 +66,18 @@ func AggregateBoardValuationAsync(rows []datasource.SpotRow, tradeDate string) {
 
 // aggregateBoardValuation 聚合并落库（抽出便于单测注入假 lister/内存库）。
 func aggregateBoardValuation(ctx context.Context, src boardLister, rows []datasource.SpotRow, tradeDate string) error {
+	ctx = jobSubmissionContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if common.DB == nil {
+		return errors.New("数据库不可用")
+	}
 	if tradeDate == "" || len(rows) == 0 {
 		return fmt.Errorf("空快照或缺交易日")
+	}
+	if parsed, err := time.Parse("2006-01-02", tradeDate); err != nil || parsed.Format("2006-01-02") != tradeDate || tradeDate > time.Now().Format("2006-01-02") {
+		return errors.New("板块估值交易日无效或晚于当前日期")
 	}
 	boards, err := src.GetBoardList(ctx, "industry")
 	if err != nil {
@@ -62,7 +85,7 @@ func aggregateBoardValuation(ctx context.Context, src boardLister, rows []dataso
 	}
 	nameToCode := make(map[string]string, len(boards))
 	for _, b := range boards {
-		if b.Name != "" {
+		if b.Name != "" && b.Code != "" {
 			nameToCode[b.Name] = b.Code
 		}
 	}
@@ -85,7 +108,7 @@ func aggregateBoardValuation(ctx context.Context, src boardLister, rows []dataso
 		return fmt.Errorf("无可落库板块（快照 %d 行、映射 %d 个板块）", len(rows), len(nameToCode))
 	}
 	fillCrossSectionRank(recs)
-	if err := common.DB.Clauses(clause.OnConflict{
+	if err := common.DB.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "kind"}, {Name: "board_code"}, {Name: "trade_date"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"board_name", "median_pe_ttm", "median_pb", "pos_pe_count", "stock_count", "pct_rank", "updated_at",
@@ -130,10 +153,10 @@ func aggregateSpotByIndustry(rows []datasource.SpotRow) []boardValAgg {
 			byInd[r.Industry] = b
 		}
 		b.count++
-		if r.PETTM > 0 {
+		if r.PETTM > 0 && !math.IsInf(r.PETTM, 0) {
 			b.pes = append(b.pes, r.PETTM)
 		}
-		if r.PB > 0 {
+		if r.PB > 0 && !math.IsInf(r.PB, 0) {
 			b.pbs = append(b.pbs, r.PB)
 		}
 	}
@@ -213,46 +236,75 @@ type BoardValuationView struct {
 
 // boardValuationByName 按板块名精确匹配估值视图（板块 AI 分析的 focus 名→BK 码入口）。
 // 未匹配返回 (nil, "")——focus 是自由文本，匹配不上是常态不是错误。
-func boardValuationByName(name string) (*BoardValuationView, string) {
+func boardValuationByName(name string, contexts ...context.Context) (*BoardValuationView, string) {
 	if common.DB == nil || name == "" {
 		return nil, ""
 	}
-	var row model.BoardValuationDaily
-	if err := common.DB.Where("board_name = ?", name).
-		Order("trade_date DESC").First(&row).Error; err != nil {
+	view, code, err := loadBoardValuation(jobSubmissionContext(contexts...), name, "")
+	if err != nil {
+		common.SysWarn("按名称读取板块估值失败: %v", err)
 		return nil, ""
 	}
-	return boardValuationFor(row.BoardCode), row.BoardCode
+	return view, code
 }
 
 // boardValuationFor 查某板块估值视图（最新行 + 时序分位）。无数据返回 nil
-//（概念板块/聚合未跑过），调用方按缺席处理不算错误。
-func boardValuationFor(code string) *BoardValuationView {
+// （概念板块/聚合未跑过），调用方按缺席处理不算错误。
+func boardValuationFor(code string, contexts ...context.Context) *BoardValuationView {
 	if common.DB == nil {
 		return nil
 	}
+	view, _, err := loadBoardValuation(jobSubmissionContext(contexts...), "", code)
+	if err != nil {
+		common.SysWarn("板块估值读取失败 code=%s: %v", code, err)
+	}
+	return view
+}
+
+func loadBoardValuation(ctx context.Context, name, code string) (*BoardValuationView, string, error) {
+	if common.DB == nil {
+		return nil, "", errors.New("数据库不可用")
+	}
+	asOf := time.Now().Format("2006-01-02")
 	var hist []model.BoardValuationDaily
-	if err := common.DB.Where("board_code = ?", code).
-		Order("trade_date DESC").Limit(boardValHistWindow).Find(&hist).Error; err != nil || len(hist) == 0 {
-		return nil
+	err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		if name != "" {
+			var row model.BoardValuationDaily
+			err := tx.Where("kind = ? AND board_name = ? AND trade_date <= ?", "industry", name, asOf).
+				Order("trade_date DESC, id DESC").First(&row).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			code = row.BoardCode
+		}
+		return tx.Where("kind = ? AND board_code = ? AND trade_date <= ?", "industry", code, asOf).
+			Order("trade_date DESC").Limit(boardValHistWindow).Find(&hist).Error
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	if len(hist) == 0 {
+		return nil, "", nil
 	}
 	latest := hist[0]
 	view := &BoardValuationView{
 		TradeDate: latest.TradeDate, BoardName: latest.BoardName,
 		MedianPETTM: latest.MedianPETTM, MedianPB: latest.MedianPB,
 		PosPECount: latest.PosPECount, StockCount: latest.StockCount,
-		PctRank: latest.PctRank, HistDays: len(hist), HistPctRank: -1,
+		PctRank: latest.PctRank, HistPctRank: -1,
 	}
-	if latest.MedianPETTM > 0 {
-		vals := make([]float64, 0, len(hist))
-		for _, h := range hist {
-			if h.MedianPETTM > 0 {
-				vals = append(vals, h.MedianPETTM)
-			}
-		}
-		if len(vals) > 0 {
-			view.HistPctRank = percentileRank(vals, latest.MedianPETTM)
+	vals := make([]float64, 0, len(hist))
+	for _, h := range hist {
+		if h.MedianPETTM > 0 && h.PosPECount > 0 && !math.IsInf(h.MedianPETTM, 0) {
+			vals = append(vals, h.MedianPETTM)
 		}
 	}
-	return view
+	view.HistDays = len(vals)
+	if latest.MedianPETTM > 0 && latest.PosPECount > 0 && len(vals) > 0 {
+		view.HistPctRank = percentileRank(vals, latest.MedianPETTM)
+	}
+	return view, code, nil
 }

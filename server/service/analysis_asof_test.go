@@ -48,7 +48,7 @@ func TestAsOfSnapshotNoFutureLeak(t *testing.T) {
 	dates := seedAsOfBars(t, "600100", 40)
 	asOf := dates[19] // 第 20 根
 
-	_, snap1, err := buildStockSnapshotAsOf("600100", "cn", asOf)
+	_, snap1, err := buildStockSnapshotAsOf(context.Background(), "600100", "cn", asOf)
 	if err != nil {
 		t.Fatalf("构建 as_of 快照失败: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestAsOfSnapshotNoFutureLeak(t *testing.T) {
 		Updates(map[string]any{"close": 999.0, "high": 1000.0, "low": 998.0}).Error; err != nil {
 		t.Fatal(err)
 	}
-	_, snap2, err := buildStockSnapshotAsOf("600100", "cn", asOf)
+	_, snap2, err := buildStockSnapshotAsOf(context.Background(), "600100", "cn", asOf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestAsOfSnapshotContent(t *testing.T) {
 	dates := seedAsOfBars(t, "600100", 40)
 	asOf := dates[19]
 
-	label, snap, err := buildStockSnapshotAsOf("600100", "cn", asOf)
+	label, snap, err := buildStockSnapshotAsOf(context.Background(), "600100", "cn", asOf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,10 @@ func TestAsOfSnapshotContent(t *testing.T) {
 	}
 
 	// 与实时链路同函数对拍：technicals 喂相同截断序列必须一致。
-	bars := cnBarsUpTo("600100", asOf, asOfBarLimit)
+	bars, err := cnBarsUpTo(context.Background(), "600100", asOf, asOfBarLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(bars) != 20 {
 		t.Fatalf("截断读取应 20 根: %d", len(bars))
 	}
@@ -121,7 +124,7 @@ func TestAsOfSnapshotContent(t *testing.T) {
 	// 非交易日回退：as_of 取一个铺库范围后的日期字符串之间的空档不存在——
 	// 用最后日期+1 天之外无数据场景另测；此处测中间非交易日（铺的是连续自然日
 	// 无空档，改用早于首根的日期报错分支）。
-	if _, _, err := buildStockSnapshotAsOf("600100", "cn", "2024-06-01"); err == nil {
+	if _, _, err := buildStockSnapshotAsOf(context.Background(), "600100", "cn", "2024-06-01"); err == nil {
 		t.Fatal("首根之前的日期应报错（无日线数据）")
 	}
 }
@@ -133,7 +136,7 @@ func TestAsOfSnapshotFallbackNote(t *testing.T) {
 	// 删除中间一根制造非交易日（2025-01-05，index 4）。
 	common.DB.Where("symbol = ? AND trade_date = ?", "600100", dates[4]).Delete(&model.DailyBar{})
 
-	_, snap, err := buildStockSnapshotAsOf("600100", "cn", dates[4])
+	_, snap, err := buildStockSnapshotAsOf(context.Background(), "600100", "cn", dates[4])
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -30,7 +30,7 @@ func (sc *StockSearchController) Search(c *gin.Context) {
 	}
 	result, err := sc.svc.Search(c.Request.Context(), currentUserID(c), c.Query("q"), limit)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "股票搜索失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, result)

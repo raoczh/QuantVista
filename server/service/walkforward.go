@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math"
@@ -13,6 +14,8 @@ import (
 	"quantvista/common"
 	"quantvista/datasource"
 	"quantvista/model"
+
+	"gorm.io/gorm"
 )
 
 // S3-5 walk-forward 评估基线（RECOMMENDATION_ACCURACY_PLAN §5 S3-5 + S3-3 评估口径）：
@@ -493,7 +496,10 @@ func RunWalkForward(ctx context.Context, market *MarketService) (*WalkForwardRep
 		return nil, err
 	}
 	bt := NewBacktestService(market)
-	axis, benchClose, benchNote := bt.marketAxis(ctx, freshDate)
+	axis, benchClose, benchNote, err := bt.marketAxis(ctx, freshDate)
+	if err != nil {
+		return nil, err
+	}
 	if len(axis) < wfMinTrain {
 		return nil, errors.New("交易日轴数据不足，无法评估")
 	}
@@ -543,7 +549,10 @@ func RunWalkForward(ctx context.Context, market *MarketService) (*WalkForwardRep
 	}
 	// ST as-of（防前视/幸存者偏差）：优先宇宙快照（S0-3）按信号日判定——后来才变
 	// ST 的股票不得被提前从历史样本剔除；快照未覆盖的日期回退当前名称并在 Notes 声明。
-	stByDate := universeSTByDates(sigDates)
+	stByDate, err := universeSTByDates(ctx, sigDates)
+	if err != nil {
+		return nil, err
+	}
 	stFallback := len(stByDate) < len(sigDates)
 	defs := wfStrategyList()
 	allHolds := wfAllHolds()
@@ -839,7 +848,9 @@ func RunWalkForward(ctx context.Context, market *MarketService) (*WalkForwardRep
 				for _, o := range tops[si] {
 					item := WFMonthlyItem{Symbol: o.symbol, Name: o.name,
 						Score: o.scores[si], Status: o.holds[hi].status}
-					if r := o.holds[hi]; r.status == btTraded {
+					if r := o.holds[hi]; r.forced {
+						item.Status = "forced"
+					} else if r.status == btTraded {
 						net := r.netPct
 						item.NetPct = &net
 						if a := benchRet(r.buyDate, r.sellDate); a != nil {
@@ -901,26 +912,41 @@ func wfAllHolds() []int {
 // 返回 date → ST symbol 集合；快照未覆盖的日期不出现在结果里——调用方回退当前
 // 名称判定并声明偏差（后来才变 ST 的股票会被提前剔除）。walk-forward 与因子 IC
 // 的历史评估共用。
-func universeSTByDates(dates []string) map[string]map[string]bool {
+func universeSTByDates(ctx context.Context, dates []string) (map[string]map[string]bool, error) {
 	out := map[string]map[string]bool{}
 	if common.DB == nil {
-		return out
+		return nil, errors.New("数据库不可用")
 	}
-	for _, d := range dates {
-		var snapDay string
-		common.DB.Model(&model.StockUniverseDaily{}).
-			Where("trade_date <= ?", d).Select("MAX(trade_date)").Scan(&snapDay)
-		if snapDay == "" {
-			continue
+	err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		bySnapshot := map[string]map[string]bool{}
+		for _, d := range dates {
+			var snapDay sql.NullString
+			if err := tx.Model(&model.StockUniverseDaily{}).
+				Where("market = ? AND trade_date <= ?", "cn", d).Select("MAX(trade_date)").Scan(&snapDay).Error; err != nil {
+				return fmt.Errorf("读取 %s 历史股票快照日期失败: %w", d, err)
+			}
+			if !snapDay.Valid || snapDay.String == "" {
+				continue
+			}
+			if set, ok := bySnapshot[snapDay.String]; ok {
+				out[d] = set
+				continue
+			}
+			var syms []string
+			if err := tx.Model(&model.StockUniverseDaily{}).
+				Where("market = ? AND trade_date = ? AND is_st = ?", "cn", snapDay.String, true).Pluck("symbol", &syms).Error; err != nil {
+				return fmt.Errorf("读取 %s 历史 ST 名单失败: %w", snapDay.String, err)
+			}
+			set := make(map[string]bool, len(syms))
+			for _, s := range syms {
+				set[s] = true
+			}
+			out[d], bySnapshot[snapDay.String] = set, set
 		}
-		var syms []string
-		common.DB.Model(&model.StockUniverseDaily{}).
-			Where("trade_date = ? AND is_st = ?", snapDay, true).Pluck("symbol", &syms)
-		set := make(map[string]bool, len(syms))
-		for _, s := range syms {
-			set[s] = true
-		}
-		out[d] = set
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return out
+	return out, nil
 }

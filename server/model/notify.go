@@ -16,7 +16,7 @@ type NotifyChannel struct {
 	Kind   string `gorm:"size:16" json:"kind"`
 	Name   string `gorm:"size:64" json:"name"`
 
-	TargetCipher string `gorm:"size:512" json:"-"` // 加密的 sendkey/url，绝不回传
+	TargetCipher string `gorm:"type:text" json:"-"` // 加密的 sendkey/url；加密后长度会增长，不能套用 URL 字符上限。
 	Enabled      bool   `json:"enabled"`
 
 	LastSentAt *time.Time `json:"last_sent_at"`

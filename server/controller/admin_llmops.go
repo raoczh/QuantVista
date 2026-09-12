@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"errors"
+	"io"
 	"strconv"
 
 	"quantvista/common"
@@ -25,7 +27,7 @@ func (ac *AdminController) LLMCalibration(c *gin.Context) {
 	}
 	rep, err := service.RunLLMCalibration(c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "评估报告读取失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, rep)
@@ -54,7 +56,7 @@ func (ac *AdminController) LLMJointEval(c *gin.Context) {
 	}
 	rep, err := service.RunJointEval(includeLocked)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "评估报告读取失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, rep)
@@ -66,7 +68,7 @@ func (ac *AdminController) LLMJointEval(c *gin.Context) {
 func (ac *AdminController) LLMExperiments(c *gin.Context) {
 	rows, err := service.ListLLMExperiments()
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "模型实验请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, rows)
@@ -80,12 +82,12 @@ func (ac *AdminController) GetLLMExperiment(c *gin.Context) {
 		common.ApiErrorMsg(c, "非法的实验 id")
 		return
 	}
-	exp, runs, err := service.LLMExperimentDetail(id)
+	view, err := service.GetLLMExperimentDetail(id)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "模型实验请求失败，请稍后重试"))
 		return
 	}
-	common.ApiSuccess(c, gin.H{"experiment": exp, "runs": runs, "audits": service.ListLLMReleaseAudits(id)})
+	common.ApiSuccess(c, view)
 }
 
 // CreateLLMExperiment POST /api/admin/llm-experiments —— 创建（draft，challenger 快照固化）。
@@ -97,7 +99,7 @@ func (ac *AdminController) CreateLLMExperiment(c *gin.Context) {
 	}
 	exp, warns, err := service.CreateLLMExperiment(currentUserID(c), in)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "模型实验请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, gin.H{"experiment": exp, "warnings": warns})
@@ -117,11 +119,14 @@ func (ac *AdminController) LLMExperimentAction(c *gin.Context) {
 		Conclusion    string `json:"conclusion"`
 		FailureReason string `json:"failure_reason"`
 	}
-	_ = c.ShouldBindJSON(&body) // start/promote 无 body 合法
+	if err := c.ShouldBindJSON(&body); err != nil && !errors.Is(err, io.EOF) {
+		common.ApiErrorMsg(c, "请求格式错误")
+		return
+	} // start/promote 无 body 合法，但损坏或类型错误的 JSON 不得触发状态变更。
 	if c.Param("action") == "audit" {
 		audit, err := service.RunLLMExperimentAudit(c.Request.Context(), id)
 		if err != nil {
-			common.ApiErrorMsg(c, err.Error())
+			common.ApiErrorMsg(c, publicWorkflowError(err, "模型实验请求失败，请稍后重试"))
 			return
 		}
 		common.ApiSuccess(c, audit)
@@ -144,7 +149,7 @@ func (ac *AdminController) LLMExperimentAction(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "模型实验请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, exp)
@@ -154,9 +159,9 @@ func (ac *AdminController) LLMExperimentAction(c *gin.Context) {
 
 // LLMRoutes GET /api/admin/llm-routes —— 路由列表 + 可选模块 + 健康快照。
 func (ac *AdminController) LLMRoutes(c *gin.Context) {
-	routes, modules, err := service.ListLLMRoutes()
+	routes, modules, err := service.ListLLMRoutes(c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "模型路由请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, gin.H{"routes": routes, "modules": modules})
@@ -170,9 +175,9 @@ func (ac *AdminController) UpsertLLMRoute(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	rt, err := service.UpsertLLMRoute(in)
+	rt, err := service.UpsertLLMRoute(in, c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "模型路由请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, rt)
@@ -185,8 +190,8 @@ func (ac *AdminController) DeleteLLMRoute(c *gin.Context) {
 		common.ApiErrorMsg(c, "非法的路由 id")
 		return
 	}
-	if err := service.DeleteLLMRoute(id); err != nil {
-		common.ApiErrorMsg(c, err.Error())
+	if err := service.DeleteLLMRoute(id, c.Request.Context()); err != nil {
+		common.ApiErrorMsg(c, publicWorkflowError(err, "模型路由请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, gin.H{"deleted": true})
@@ -199,9 +204,9 @@ func (ac *AdminController) ResetLLMRoute(c *gin.Context) {
 		common.ApiErrorMsg(c, "非法的路由 id")
 		return
 	}
-	rt, err := service.ResetLLMRouteFallback(id)
+	rt, err := service.ResetLLMRouteFallback(id, c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "模型路由请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, rt)

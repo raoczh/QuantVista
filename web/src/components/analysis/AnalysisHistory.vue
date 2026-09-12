@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { NButton, NEmpty, NPopconfirm, NSelect, NSpin, NTag } from 'naive-ui'
+import { NAlert, NButton, NEmpty, NPopconfirm, NSelect, NSpin, NTag } from 'naive-ui'
 import type { AnalysisRecord } from '@/api/analysis'
 import SectionCard from '@/components/SectionCard.vue'
 import StockIdentity from '@/components/StockIdentity.vue'
@@ -9,6 +9,8 @@ defineProps<{
   history: AnalysisRecord[]
   currentID?: number
   loading: boolean
+  error?: string
+  deleting?: ReadonlySet<number>
   module: string
   moduleOptions: Array<{ label: string; value: string }>
 }>()
@@ -28,10 +30,11 @@ function statusType(value: string) { return value === 'success' ? 'success' : va
       <n-select :value="module" :options="moduleOptions" size="tiny" class="module-filter" @update:value="emit('update:module', $event)" />
       <n-button size="tiny" quaternary :loading="loading" @click="emit('refresh')">刷新</n-button>
     </template>
+    <n-alert v-if="error" type="error" :bordered="false">{{ error }}<template v-if="history.length">；下方保留上次成功读取的记录。</template></n-alert>
     <n-spin :show="loading && !history.length">
-      <n-empty v-if="!history.length" description="暂无分析记录" size="small" />
-      <div v-else class="history-list">
-        <button v-for="item in history" :key="item.id" type="button" class="history-row" :class="{ active: currentID === item.id }" @click="emit('open', item)">
+      <n-empty v-if="!history.length && !error && !loading" description="暂无分析记录" size="small" />
+      <div v-if="history.length" class="history-list">
+        <div v-for="item in history" :key="item.id" role="button" tabindex="0" class="history-row" :class="{ active: currentID === item.id }" @click="emit('open', item)" @keydown.enter.self="emit('open', item)" @keydown.space.prevent.self="emit('open', item)">
           <span class="history-main">
             <StockIdentity v-if="item.module === 'stock'" :symbol="item.symbol" :market="item.market || 'cn'" :name="recordStockName(item)" density="table" />
             <b v-else>{{ item.target || item.title || ANALYSIS_MODULE_LABELS[item.module] }}</b>
@@ -41,11 +44,11 @@ function statusType(value: string) { return value === 'success' ? 'success' : va
             <n-tag size="tiny" :type="statusType(item.status)" :bordered="false">{{ item.status === 'success' ? ratingLabel(item.rating) : analysisStatusLabel(item.status) }}</n-tag>
             <n-tag v-if="item.as_of" size="tiny" type="warning" :bordered="false">回溯 {{ item.as_of }}</n-tag>
             <n-popconfirm v-if="item.status !== 'processing'" @positive-click="emit('remove', item)">
-              <template #trigger><n-button size="tiny" quaternary type="error" @click.stop>删除记录</n-button></template>
+              <template #trigger><n-button size="tiny" quaternary type="error" :loading="deleting?.has(item.id)" :disabled="deleting?.has(item.id)" @click.stop>删除记录</n-button></template>
               删除这条本人分析记录？
             </n-popconfirm>
           </span>
-        </button>
+        </div>
       </div>
     </n-spin>
   </SectionCard>

@@ -44,10 +44,11 @@ type PositionView struct {
 	DayChangePct float64 `json:"day_change_pct"` // 当日涨跌幅 %（仅 fresh 时有值）
 
 	// 行情新鲜度（fail-closed 契约块）：
-	QuoteAsOf       string  `json:"quote_as_of,omitempty"`      // 行情数据源时刻（最近已知，含 stale）
-	FreshnessStatus string  `json:"freshness_status,omitempty"` // fresh | stale | unknown（持仓中才有）
-	StaleReason     string  `json:"stale_reason,omitempty"`     // 非 fresh 的原因说明
-	LastPrice       float64 `json:"last_price,omitempty"`       // 最近已知价（stale/unknown 展示用，不参与盈亏）
+	QuoteAsOf                  string  `json:"quote_as_of,omitempty"`      // 行情数据源时刻（最近已知，含 stale）
+	FreshnessStatus            string  `json:"freshness_status,omitempty"` // fresh | stale | unknown（持仓中才有）
+	StaleReason                string  `json:"stale_reason,omitempty"`     // 非 fresh 的原因说明
+	LastPrice                  float64 `json:"last_price,omitempty"`       // 最近已知价（stale/unknown 展示用，不参与盈亏）
+	ValuationUnavailableReason string  `json:"valuation_unavailable_reason,omitempty"`
 
 	HeldTradeDays   int  `json:"held_trade_days"`   // 已持有交易日（按交易日历；持仓中且有买入日期时计算）
 	ShortTermReview bool `json:"short_term_review"` // 短线持仓持有超阈值，建议复盘
@@ -87,6 +88,13 @@ const analysisStaleDays = 7
 //   - **旧记录兜底**（尚未惰性补流水）：保持原算式逐字节等价，避免补建前后数字跳变。
 func computeView(p model.Position, price float64, hasQuote bool) PositionView {
 	v := PositionView{Position: p}
+	if p.Status == model.PositionStatusHolding {
+		if reason := positionCurrencyIssue(p, defaultCurrencyFor(p.Market)); reason != "" {
+			hasQuote = false
+			v.FreshnessStatus, v.StaleReason = freshStatusUnknown, reason
+		}
+	}
+	v.PeakPrice = trustedPositionPeak(p)
 	v.Cost = positionCurrentCost(p)
 
 	if p.Status == model.PositionStatusClosed {
@@ -149,8 +157,8 @@ func (s *PositionService) ListByAccount(ctx context.Context, userID, accountID i
 		return nil, errors.New("非法的状态筛选")
 	}
 	// 每次重建查询：GORM 链式对象执行后不可复用（条件会累积）。
-	loadPositions := func() ([]model.Position, error) {
-		q := common.DB.Where("user_id = ? AND account_id = ?", userID, accountID)
+	loadPositions := func(db *gorm.DB) ([]model.Position, error) {
+		q := db.Where("user_id = ? AND account_id = ?", userID, accountID)
 		if status == model.PositionStatusHolding || status == model.PositionStatusClosed {
 			q = q.Where("status = ?", status)
 		}
@@ -158,7 +166,7 @@ func (s *PositionService) ListByAccount(ctx context.Context, userID, accountID i
 		err := q.Order("status, id DESC").Find(&rows).Error
 		return rows, err
 	}
-	positions, err := loadPositions()
+	positions, err := loadPositions(common.DB.WithContext(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -167,12 +175,26 @@ func (s *PositionService) ListByAccount(ctx context.Context, userID, accountID i
 	// 让本次响应就与库内一致，不必让用户刷第二次才看到流水。
 	// D15 同款惰性初始化持仓期峰值（存量持仓尽量用本地日线回填历史最高，标 backfilled）。
 	// 两个补建都必须执行，**不能写成 a() || b() 短路**——账本补建成功会跳过峰值初始化。
-	wroteLedger := backfillPositionLedgers(userID, positions)
-	wrotePeak := backfillPositionPeaks(userID, positions)
-	if wroteLedger || wrotePeak {
-		if positions, err = loadPositions(); err != nil {
-			return nil, err
+	backfillPositionLedgersContext(ctx, userID, positions)
+	backfillPositionPeaksContext(ctx, userID, positions)
+	var valuationGaps map[int64]string
+	var recLinks map[int64]*PositionRecLink
+	today := time.Now().In(time.Local).Format("2006-01-02")
+	if err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		positions, err = loadPositions(tx)
+		if err != nil {
+			return err
 		}
+		valuationGaps, err = realPortfolioValuationGaps(tx, positions, today)
+		if err != nil {
+			return err
+		}
+		// 来源推荐与持仓使用同一读取时点；不能把查询失败包装成没有血缘。
+		recLinks, err = positionRecLinksFor(tx, userID, positions)
+		return err
+	}); err != nil {
+		return nil, err
 	}
 
 	// 仅持仓中的需要现价。行情时效 fail-closed：走 FreshQuotesFor（全源换源找当前
@@ -204,12 +226,8 @@ func (s *PositionService) ListByAccount(ctx context.Context, userID, accountID i
 	if err != nil {
 		return nil, fmt.Errorf("读取持仓卖出风险评估失败: %w", err)
 	}
-	// 来源推荐摘要（血缘可见性；一次批量查，无 N+1）。
-	recLinks := positionRecLinksFor(userID, positions)
-
 	out := make([]PositionView, 0, len(positions))
 	now := time.Now()
-	today := now.In(time.Local).Format("2006-01-02")
 	for _, p := range positions {
 		price, ok := 0.0, false
 		dayHigh := 0.0
@@ -224,6 +242,11 @@ func (s *PositionService) ListByAccount(ctx context.Context, userID, accountID i
 				quoteTradeDate = effectiveQuoteTradeDate(fq, today)
 			}
 		}
+		valuationIssue := valuationGaps[p.ID]
+		currencyIssue := positionCurrencyIssue(p, defaultCurrencyFor(p.Market))
+		if currencyIssue != "" || valuationIssue != "" {
+			price, dayHigh, ok = 0, 0, false
+		}
 		v := computeView(p, price, ok)
 		// 新鲜度契约块（仅持仓中）：QuoteAsOf/FreshnessStatus/StaleReason 无论 fresh
 		// 与否都填，前端与 AI 快照据此展示「截至时间/过期原因」；stale 的最近已知价
@@ -237,7 +260,7 @@ func (s *PositionService) ListByAccount(ctx context.Context, userID, accountID i
 				if ok {
 					v.DayChangePct = round2(fq.Quote.ChangePct)
 				} else if fq.Quote.Price > 0 {
-					v.LastPrice = round2(fq.Quote.Price)
+					v.LastPrice = round4(fq.Quote.Price)
 					if note, _ := stockFreshnessNote(fq.Fresh, fq.Quote.DataTime); note != "" {
 						v.StaleReason = note
 					} else if fq.Fresh.Status == freshStatusUnknown {
@@ -248,6 +271,13 @@ func (s *PositionService) ListByAccount(ctx context.Context, userID, accountID i
 				v.FreshnessStatus = freshStatusStale
 				v.StaleReason = "行情获取失败（可能停牌/数据源故障），现价未知"
 			}
+		}
+		if currencyIssue != "" && p.Status == model.PositionStatusHolding {
+			v.FreshnessStatus, v.StaleReason = freshStatusUnknown, currencyIssue
+		}
+		if valuationIssue != "" {
+			v.FreshnessStatus, v.StaleReason = freshStatusUnknown, valuationIssue
+			v.ValuationUnavailableReason = valuationIssue
 		}
 		// 短线状态提示：持仓中且有买入日期时，按交易日历算已持有交易日，
 		// 短线持有超阈值给出复盘提示（阶段6：持仓页短线状态提示）。
@@ -270,7 +300,7 @@ func (s *PositionService) ListByAccount(ctx context.Context, userID, accountID i
 		}
 		// 分析时效：持仓中从未做过个股分析、或距上次分析超过阈值。
 		if p.Status == model.PositionStatusHolding {
-			if assessment, exists := latestAssessments[p.ID]; exists {
+			if assessment, exists := latestAssessments[p.ID]; exists && assessment.PositionStateHash == positionRiskBasisHash(p) {
 				copy := assessment
 				v.ExitAssessment = &copy
 			}
@@ -329,19 +359,23 @@ func lastStockAnalysisFor(userID int64, positions []model.Position) map[string]t
 
 // PortfolioOverview 组合总览：持仓聚合 + 集中度/风控信号（Ghostfolio 的组合层视角）。
 type PortfolioOverview struct {
-	HoldingCount   int     `json:"holding_count"`
-	TotalCost      float64 `json:"total_cost"`
-	TotalValue     float64 `json:"total_value"`
-	TotalProfit    float64 `json:"total_profit"`
-	ProfitPct      float64 `json:"profit_pct"`
-	RealizedProfit float64 `json:"realized_profit"` // 已平仓累计已实现盈亏
-	WinCount       int     `json:"win_count"`       // 盈利仓数（持仓中）
-	LoseCount      int     `json:"lose_count"`      // 亏损仓数（持仓中）
-	ShortValue     float64 `json:"short_value"`     // 短线市值
-	LongValue      float64 `json:"long_value"`      // 长线市值
-	TopSymbol      string  `json:"top_symbol"`
-	TopName        string  `json:"top_name"`
-	TopWeightPct   float64 `json:"top_weight_pct"` // 最大单一持仓占比 %
+	AccountID                  int64   `json:"account_id"`
+	AccountName                string  `json:"account_name,omitempty"`
+	HoldingCount               int     `json:"holding_count"`
+	TotalCost                  float64 `json:"total_cost"`
+	TotalValue                 float64 `json:"total_value"`
+	TotalProfit                float64 `json:"total_profit"`
+	ProfitPct                  float64 `json:"profit_pct"`
+	RealizedProfit             float64 `json:"realized_profit"`                       // 已平仓累计已实现盈亏
+	CurrencyUnavailableReason  string  `json:"currency_unavailable_reason,omitempty"` // 非空时全部金额汇总不可用，不能显示为 0。
+	ValuationUnavailableReason string  `json:"valuation_unavailable_reason,omitempty"`
+	WinCount                   int     `json:"win_count"`   // 盈利仓数（持仓中）
+	LoseCount                  int     `json:"lose_count"`  // 亏损仓数（持仓中）
+	ShortValue                 float64 `json:"short_value"` // 短线市值
+	LongValue                  float64 `json:"long_value"`  // 长线市值
+	TopSymbol                  string  `json:"top_symbol"`
+	TopName                    string  `json:"top_name"`
+	TopWeightPct               float64 `json:"top_weight_pct"` // 最大单一持仓占比 %
 
 	QuoteFailedCount int `json:"quote_failed_count"` // 行情拉取失败、未计入市值/收益的持仓数（前端可提示口径）
 	QuoteStaleCount  int `json:"quote_stale_count"`  // 行情已过期（取到但非当前有效）、未计入市值/收益的持仓数
@@ -370,7 +404,28 @@ func (s *PositionService) OverviewByAccount(ctx context.Context, userID, account
 	if err != nil {
 		return nil, err
 	}
-	ov := &PortfolioOverview{Signals: []string{}}
+	ov := &PortfolioOverview{AccountID: accountID, Signals: []string{}}
+	for _, v := range views {
+		if v.ValuationUnavailableReason != "" {
+			ov.ValuationUnavailableReason = v.ValuationUnavailableReason
+		}
+		if reason := positionCurrencyIssue(v.Position, "CNY"); reason != "" {
+			ov.CurrencyUnavailableReason = reason
+			break
+		}
+	}
+	if ov.CurrencyUnavailableReason != "" {
+		for _, v := range views {
+			if v.Status == model.PositionStatusHolding {
+				ov.HoldingCount++
+			}
+		}
+		ov.Signals = append(ov.Signals, ov.CurrencyUnavailableReason+"；请按各持仓原币种查看明细")
+		return ov, nil
+	}
+	if ov.ValuationUnavailableReason != "" {
+		ov.Signals = append(ov.Signals, ov.ValuationUnavailableReason)
+	}
 	// 按标的聚合市值算集中度（同一标的可能分批多仓）。
 	valueBySymbol := map[string]float64{}
 	nameBySymbol := map[string]string{}
@@ -515,7 +570,7 @@ var validCurrency = map[string]bool{"CNY": true, "USD": true, "HKD": true}
 
 // defaultCurrencyFor 按市场推导默认币种。
 func defaultCurrencyFor(market string) string {
-	switch market {
+	switch strings.ToLower(strings.TrimSpace(market)) {
 	case "us":
 		return "USD"
 	case "hk":
@@ -533,31 +588,34 @@ func normalizeCurrency(currency, market string) (string, error) {
 	if !validCurrency[c] {
 		return "", errors.New("币种须为 CNY / USD / HKD")
 	}
+	if c != defaultCurrencyFor(market) {
+		return "", fmt.Errorf("该市场按 %s 报价，持仓币种必须与市场一致", defaultCurrencyFor(market))
+	}
 	return c, nil
 }
 
 // validateBuy 校验买入核心字段。
 func validateBuy(in *PositionInput) error {
-	if in.BuyPrice <= 0 {
-		return errors.New("买入价格必须大于 0")
-	}
-	if in.Quantity <= 0 {
-		return errors.New("买入数量必须大于 0")
-	}
-	if in.BuyFee < 0 || in.BuyTax < 0 {
-		return errors.New("费用/税费不能为负")
+	if err := normalizePositionTradeValues(&in.BuyPrice, &in.Quantity, &in.BuyFee, &in.BuyTax); err != nil {
+		return err
 	}
 	if in.BuyDate != "" {
 		if _, err := time.Parse("2006-01-02", in.BuyDate); err != nil {
 			return errors.New("买入日期格式应为 YYYY-MM-DD")
+		}
+		if in.BuyDate > time.Now().In(time.Local).Format("2006-01-02") {
+			return errors.New("买入日期不能晚于今天")
 		}
 	}
 	if !validPositionType[in.PositionType] {
 		return errors.New("持仓类型须为 short_term 或 long_term")
 	}
 	// 风险计划：给了就必须与买入价自洽（止损 < 买价 < 止盈），否则计划无意义。
-	if in.PlanStopLoss < 0 || in.PlanTakeProfit < 0 {
-		return errors.New("止损/止盈价不能为负")
+	if err := normalizePositionNumber(&in.PlanStopLoss, "止损价", false); err != nil {
+		return err
+	}
+	if err := normalizePositionNumber(&in.PlanTakeProfit, "止盈价", false); err != nil {
+		return err
 	}
 	if in.PlanStopLoss > 0 && in.PlanStopLoss >= in.BuyPrice {
 		return errors.New("计划止损价应低于买入价")
@@ -571,23 +629,27 @@ func validateBuy(in *PositionInput) error {
 	return nil
 }
 
-// resolveRecommendationLink 校验推荐血缘归属：仅本人存在的推荐返回原 ID，
-// 否则返回 0（不存在/他人的推荐不落血缘，静默忽略、不阻断建仓）。
-func resolveRecommendationLink(userID, recID int64) int64 {
+// resolveRecommendationLink 仅保留本人、同一标的的推荐；无效关联不阻断建仓。
+func resolveRecommendationLink(tx *gorm.DB, userID, recID int64, symbol, market string) (int64, error) {
 	if recID <= 0 {
-		return 0
+		return 0, nil
 	}
 	var n int64
-	common.DB.Model(&model.Recommendation{}).
-		Where("id = ? AND user_id = ?", recID, userID).Count(&n)
-	if n == 0 {
-		return 0
+	if err := tx.Model(&model.Recommendation{}).
+		Where("id = ? AND user_id = ? AND symbol = ? AND market = ?", recID, userID, symbol, market).Count(&n).Error; err != nil {
+		return 0, err
 	}
-	return recID
+	if n == 0 {
+		return 0, nil
+	}
+	return recID, nil
 }
 
 // Create 新建持仓。
 func (s *PositionService) Create(ctx context.Context, userID int64, in PositionInput) (*model.Position, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
 	if err != nil {
 		return nil, err
@@ -596,6 +658,9 @@ func (s *PositionService) Create(ctx context.Context, userID int64, in PositionI
 }
 
 func (s *PositionService) CreateByAccount(ctx context.Context, userID, accountID int64, in PositionInput) (*model.Position, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if _, err := ActivePortfolioAccountByID(userID, accountID, model.PortfolioKindReal); err != nil {
 		return nil, err
 	}
@@ -616,8 +681,6 @@ func (s *PositionService) CreateByAccount(ctx context.Context, userID, accountID
 	if err != nil {
 		return nil, err
 	}
-	// 推荐血缘：校验归属（不存在/他人的推荐不落血缘，静默忽略、不阻断建仓）。
-	in.RecommendationID = resolveRecommendationLink(userID, in.RecommendationID)
 	p := &model.Position{
 		UserID:       userID,
 		AccountID:    accountID,
@@ -638,8 +701,6 @@ func (s *PositionService) CreateByAccount(ctx context.Context, userID, accountID
 		PlanStopLoss:   in.PlanStopLoss,
 		PlanTakeProfit: in.PlanTakeProfit,
 		ChecklistJSON:  strDeref(in.ChecklistJSON),
-
-		RecommendationID: in.RecommendationID,
 	}
 	// 建仓即写首笔 buy 流水（账本从第一天自洽），并初始化累计汇总列。
 	p.TotalBuyCost = round4(in.BuyPrice*in.Quantity + in.BuyFee + in.BuyTax)
@@ -648,7 +709,15 @@ func (s *PositionService) CreateByAccount(ctx context.Context, userID, accountID
 	// D15 持仓期最高价从建仓那一刻起算——买入日之前的高点不是我赚到过的利润。
 	p.PeakPrice, p.PeakFrom = peakInitFor(in.BuyPrice, in.BuyDate, time.Now().In(time.Local).Format("2006-01-02"))
 	p.PeakDate = p.PeakFrom
-	if err := common.DB.Transaction(func(tx *gorm.DB) error {
+	if err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockActivePortfolioAccount(tx, userID, accountID, model.PortfolioKindReal); err != nil {
+			return err
+		}
+		linkedRecID, err := resolveRecommendationLink(tx, userID, in.RecommendationID, symbol, market)
+		if err != nil {
+			return err
+		}
+		p.RecommendationID = linkedRecID
 		if _, err := fillPositionPeakFromLocalBars(tx, p, time.Now().In(time.Local).Format("2006-01-02")); err != nil {
 			return err
 		}
@@ -659,10 +728,14 @@ func (s *PositionService) CreateByAccount(ctx context.Context, userID, accountID
 		if err := tx.Create(&trade).Error; err != nil {
 			return err
 		}
+		if err := invalidatePortfolioSnapshotsTx(tx, userID, accountID, effectiveTradeDate(p.BuyDate, p.CreatedAt)); err != nil {
+			return err
+		}
 		return setOnboardingStepTx(tx, userID, OnboardingStepPortfolio, model.OnboardingStepCompleted, 0)
 	}); err != nil {
-		return nil, err
+		return nil, errors.Join(err, ctx.Err())
 	}
+	syncActualExecutionFact(userID, p.RecommendationID)
 	return p, nil
 }
 
@@ -674,11 +747,19 @@ func (s *PositionService) CreateByAccount(ctx context.Context, userID, accountID
 // 一律冻结，改数量走加仓/减仓，改错价走「删除重建」。只有「仅有建仓一笔流水」的持仓
 // 允许修正录入错误，且同一事务内把那笔流水一并改掉，保持流水↔汇总严格自洽。
 func (s *PositionService) Update(userID, id int64, in PositionInput) (*model.Position, error) {
+	return s.UpdateContext(context.Background(), userID, id, in)
+}
+
+func (s *PositionService) UpdateContext(ctx context.Context, userID, id int64, in PositionInput) (*model.Position, error) {
+	accountID, err := positionAccountIDContext(ctx, userID, id)
+	if err != nil {
+		return nil, err
+	}
 	var out model.Position
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
+	err = common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var p model.Position
-		if err := lockedPosition(tx, userID, id, &p); err != nil {
-			return errors.New("持仓不存在")
+		if err := lockedWritablePosition(tx, userID, id, accountID, &p); err != nil {
+			return err
 		}
 		if p.Status == model.PositionStatusClosed {
 			p.BuyReason = truncateRunes(strings.TrimSpace(in.BuyReason), 500)
@@ -697,14 +778,23 @@ func (s *PositionService) Update(userID, id int64, in PositionInput) (*model.Pos
 			Order("id ASC").Find(&trades).Error; err != nil {
 			return err
 		}
+		if err := validateBuy(&in); err != nil {
+			return err
+		}
 		peakBasisChanged := in.BuyPrice != p.BuyPrice || in.BuyDate != p.BuyDate
 		buyFieldsChanged := in.BuyPrice != p.BuyPrice || in.Quantity != p.Quantity ||
 			in.BuyFee != p.BuyFee || in.BuyTax != p.BuyTax || in.BuyDate != p.BuyDate
 		if len(trades) > 1 && buyFieldsChanged {
 			return errors.New("该持仓已有加/减仓流水，买入价格、数量与费税不能直接编辑（请用加仓/减仓，或删除持仓重建）")
 		}
-		if err := validateBuy(&in); err != nil {
-			return err
+		if buyFieldsChanged {
+			from := effectiveTradeDate(p.BuyDate, p.CreatedAt)
+			if changed := effectiveTradeDate(in.BuyDate, p.CreatedAt); from == "" || (changed != "" && changed < from) {
+				from = changed
+			}
+			if err := invalidatePortfolioSnapshotsTx(tx, userID, p.AccountID, from); err != nil {
+				return err
+			}
 		}
 		p.PositionType = in.PositionType
 		p.BuyPrice = in.BuyPrice
@@ -719,18 +809,23 @@ func (s *PositionService) Update(userID, id int64, in PositionInput) (*model.Pos
 		if in.ChecklistJSON != nil {
 			p.ChecklistJSON = *in.ChecklistJSON
 		}
-		if c := strings.TrimSpace(in.Currency); c != "" {
+		if c := strings.TrimSpace(in.Currency); c != "" && c != p.Currency {
+			// 未改动的存量币种可随备注保留；实际修正币种必须校验并使旧快照失效。
 			currency, err := normalizeCurrency(c, p.Market)
 			if err != nil {
 				return err
 			}
+			if err := invalidatePortfolioSnapshotsTx(tx, userID, p.AccountID, effectiveTradeDate(p.BuyDate, p.CreatedAt)); err != nil {
+				return err
+			}
 			p.Currency = currency
 		}
-		// 唯一那笔建仓流水与汇总列同步改写，账本保持自洽。
-		p.TotalBuyCost = round4(in.BuyPrice*in.Quantity + in.BuyFee + in.BuyTax)
-		p.TotalBuyQty = in.Quantity
-		p.RemainingCost = p.TotalBuyCost
+		// 只有单笔建仓可同步修正金额；多笔账本的备注/计划编辑必须保留原累计投入
+		// 与精确余额，不能再用当前剩余数量和四位均价反推历史总账。
 		if len(trades) == 1 {
+			p.TotalBuyCost = round4(in.BuyPrice*in.Quantity + in.BuyFee + in.BuyTax)
+			p.TotalBuyQty = in.Quantity
+			p.RemainingCost = p.TotalBuyCost
 			t := trades[0]
 			t.Price, t.Quantity, t.Fee, t.Tax = in.BuyPrice, in.Quantity, in.BuyFee, in.BuyTax
 			t.TradeDate = in.BuyDate
@@ -752,8 +847,9 @@ func (s *PositionService) Update(userID, id int64, in PositionInput) (*model.Pos
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, ctx.Err())
 	}
+	syncActualExecutionFact(userID, out.RecommendationID)
 	return &out, nil
 }
 
@@ -779,6 +875,10 @@ var validAiVerdict = map[string]bool{"": true, "right": true, "wrong": true, "mi
 // 复盘字段随该笔写入。绝不再直接改状态——否则「一键平仓」会绕过账本，
 // 已实现盈亏与流水明细当场对不上。
 func (s *PositionService) Close(userID, id int64, in CloseInput) (*model.Position, error) {
+	return s.CloseContext(context.Background(), userID, id, in)
+}
+
+func (s *PositionService) CloseContext(ctx context.Context, userID, id int64, in CloseInput) (*model.Position, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
@@ -799,7 +899,7 @@ func (s *PositionService) Close(userID, id int64, in CloseInput) (*model.Positio
 	if !validAiVerdict[in.AiVerdict] {
 		return nil, errors.New("AI 判断对错取值须为 right/wrong/mixed/unused")
 	}
-	return s.AddTrade(userID, id, PositionTradeInput{
+	return s.AddTradeContext(ctx, userID, id, PositionTradeInput{
 		Side: model.PositionTradeSell, Price: in.SellPrice, closeAll: true,
 		Fee: in.SellFee, Tax: in.SellTax, TradeDate: in.SellDate, Note: "平仓",
 		SellReason: in.SellReason, ReviewNote: in.ReviewNote,
@@ -810,12 +910,25 @@ func (s *PositionService) Close(userID, id int64, in CloseInput) (*model.Positio
 // Delete 删除持仓（仅本人）。流水是持仓的从属明细，随持仓一并删除（同一事务），
 // 否则会留下无主流水污染复盘统计。
 func (s *PositionService) Delete(userID, id int64) error {
-	return common.DB.Transaction(func(tx *gorm.DB) error {
+	return s.DeleteContext(context.Background(), userID, id)
+}
+
+func (s *PositionService) DeleteContext(ctx context.Context, userID, id int64) error {
+	accountID, err := positionAccountIDContext(ctx, userID, id)
+	if err != nil {
+		return err
+	}
+	var recID int64
+	err = common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// 全部涉及卖出信号的事务统一先锁 position、再更新 signal，避免与平仓、
 		// 扫描落库或恢复 open 并发时形成反向锁序。
 		var p model.Position
-		if err := lockedPosition(tx, userID, id, &p); err != nil {
-			return errors.New("持仓不存在")
+		if err := lockedWritablePosition(tx, userID, id, accountID, &p); err != nil {
+			return err
+		}
+		recID = p.RecommendationID
+		if err := invalidatePortfolioSnapshotsTx(tx, userID, p.AccountID, effectiveTradeDate(p.BuyDate, p.CreatedAt)); err != nil {
+			return err
 		}
 		if err := finalizePositionSellSignalsTx(tx, userID, id, true); err != nil {
 			return err
@@ -830,4 +943,10 @@ func (s *PositionService) Delete(userID, id int64) error {
 		return tx.Where("position_id = ? AND user_id = ?", id, userID).
 			Delete(&model.PositionTrade{}).Error
 	})
+	if err == nil {
+		syncActualExecutionFact(userID, recID)
+	} else {
+		err = errors.Join(err, ctx.Err())
+	}
+	return err
 }

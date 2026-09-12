@@ -28,9 +28,9 @@ func (bc *BacktestController) Run(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	res, err := bc.svc.StartBacktestJob(currentUserID(c), req)
+	res, err := bc.svc.StartBacktestJob(currentUserID(c), req, c.Request.Context())
 	if err != nil {
-		common.ApiError(c, err)
+		screenerAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, res)
@@ -39,9 +39,9 @@ func (bc *BacktestController) Run(c *gin.Context) {
 // Results GET /api/backtest/results —— 本人的策略回测结果事实列表，不加载正文。
 func (bc *BacktestController) Results(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
-	rows, err := service.ListStrategyRuns(currentUserID(c), service.JobKindStrategyBacktest, limit)
+	rows, err := service.ListStrategyRuns(currentUserID(c), service.JobKindStrategyBacktest, limit, c.Request.Context())
 	if err != nil {
-		common.ApiError(c, err)
+		screenerAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, rows)
@@ -53,9 +53,9 @@ func (bc *BacktestController) Result(c *gin.Context) {
 	if !ok {
 		return
 	}
-	row, err := service.GetStrategyRun(currentUserID(c), service.JobKindStrategyBacktest, id)
+	row, err := service.GetStrategyRun(currentUserID(c), service.JobKindStrategyBacktest, id, c.Request.Context())
 	if err != nil {
-		common.ApiError(c, err)
+		screenerAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, row)
@@ -71,7 +71,7 @@ func (bc *BacktestController) Recommendations(c *gin.Context) {
 	}
 	res, err := bc.svc.BatchBacktest(c.Request.Context(), currentUserID(c), req)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		screenerAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, res)

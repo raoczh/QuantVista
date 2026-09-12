@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,9 +27,12 @@ import (
 //  3. 标题相似度：归一化后 bigram Dice ≥ 0.85，比对最近 72h 内存标题池
 //     （拦"同一事件多源措辞微调"的跨源重复）。
 type NewsService struct {
-	mu     sync.Mutex
-	seen   map[string]struct{} // "src:id" 与 "t:"+titleHash
-	titles []titleEntry        // 最近 72h 标题池（相似度比对）
+	mu             sync.Mutex
+	seen           map[string]time.Time // "src:id" 与 "t:"+titleHash；标题带发布时间以执行 72h 窗口
+	titles         []titleEntry         // 最近 72h 标题池（相似度比对）
+	fetchCls       func(context.Context, int64, int) ([]datasource.ClsNewsItem, error)
+	fetchEMFast    func(context.Context, string, int) ([]datasource.EMNewsItem, string, error)
+	fetchStockNews func(context.Context, string, int) ([]datasource.EMNewsItem, error)
 }
 
 type titleEntry struct {
@@ -64,7 +68,11 @@ var newsTTLDays = map[string]int{
 const newsImportantTTLDays = 90
 
 func NewNewsService() *NewsService {
-	return &NewsService{seen: make(map[string]struct{})}
+	return &NewsService{
+		seen:     make(map[string]time.Time),
+		fetchCls: datasource.GetClsTelegraph, fetchEMFast: datasource.GetEMFastNews,
+		fetchStockNews: datasource.GetEMStockNews,
+	}
 }
 
 // --- 去重工具（纯函数，单测覆盖） ---
@@ -121,20 +129,26 @@ func bigramDice(a, b string) float64 {
 func (s *NewsService) dedupeSeen(source, sourceID, title string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.dedupeSeenLocked(source, sourceID, title)
+}
 
+func (s *NewsService) dedupeSeenLocked(source, sourceID, title string) bool {
 	idKey := source + ":" + sourceID
 	norm := normalizeNewsTitle(title)
+	cutoff := time.Now().Add(-newsTitleWindow)
 	if _, ok := s.seen[idKey]; ok {
 		return true
 	}
 	if norm != "" {
-		if _, ok := s.seen["t:"+norm]; ok {
-			return true
+		if at, ok := s.seen["t:"+norm]; ok {
+			if !at.Before(cutoff) {
+				return true
+			}
+			delete(s.seen, "t:"+norm)
 		}
 	}
 
 	// 标题池剪枝（过期项顺带清理）+ 相似度比对。
-	cutoff := time.Now().Add(-newsTitleWindow)
 	kept := s.titles[:0]
 	dup := false
 	for _, e := range s.titles {
@@ -155,7 +169,10 @@ func (s *NewsService) dedupeSeen(source, sourceID, title string) bool {
 func (s *NewsService) dedupeRegister(source, sourceID, title string, at time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.dedupeRegisterLocked(source, sourceID, title, at)
+}
 
+func (s *NewsService) dedupeRegisterLocked(source, sourceID, title string, at time.Time) {
 	idKey := source + ":" + sourceID
 	norm := normalizeNewsTitle(title)
 	if len(s.seen) >= newsSeenCap {
@@ -168,9 +185,9 @@ func (s *NewsService) dedupeRegister(source, sourceID, title string, at time.Tim
 			drop--
 		}
 	}
-	s.seen[idKey] = struct{}{}
+	s.seen[idKey] = at
 	if norm != "" {
-		s.seen["t:"+norm] = struct{}{}
+		s.seen["t:"+norm] = at
 		s.titles = append(s.titles, titleEntry{norm: norm, at: at})
 	}
 }
@@ -178,24 +195,26 @@ func (s *NewsService) dedupeRegister(source, sourceID, title string, at time.Tim
 // dedupeCheck 判重并在不重复时立即登记（原子语义）。保留供单测与不区分写库成败的
 // 场景使用；采集链路已改用 dedupeSeen + insertNews 成功后 dedupeRegister。
 func (s *NewsService) dedupeCheck(source, sourceID, title string, at time.Time) bool {
-	if s.dedupeSeen(source, sourceID, title) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dedupeSeenLocked(source, sourceID, title) {
 		return true
 	}
-	s.dedupeRegister(source, sourceID, title, at)
+	s.dedupeRegisterLocked(source, sourceID, title, at)
 	return false
 }
 
-// insertNews 落库（DB 唯一索引兜底：冲突静默忽略）。返回是否新插入。
-func insertNews(n *model.News) bool {
+// insertNews 区分新插入、已落库重复和写入失败，只有后者需要阻止游标推进。
+func insertNews(ctx context.Context, n *model.News) (bool, error) {
 	if common.DB == nil {
-		return false
+		return false, errors.New("新闻数据库不可用")
 	}
-	res := common.DB.Clauses(clause.OnConflict{DoNothing: true}).Create(n)
+	res := common.DB.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(n)
 	if res.Error != nil {
 		common.SysWarn("新闻入库失败: %v", res.Error)
-		return false
+		return false, res.Error
 	}
-	return res.RowsAffected > 0
+	return res.RowsAffected > 0, nil
 }
 
 func marshalSymbols(syms []string) string {
@@ -215,12 +234,13 @@ func marshalSymbols(syms []string) string {
 // 带 5 分钟重叠窗防同秒漏采，重叠部分由去重层吸收。
 func (s *NewsService) collectCls(ctx context.Context) (inserted int) {
 	cursor := readNewsCursor(optNewsCursorCls)
-	items, err := datasource.GetClsTelegraph(ctx, 0, 30)
+	items, err := s.fetchCls(ctx, 0, 30)
 	if err != nil {
 		common.SysDebug("财联社电报采集跳过: %v", err)
 		return 0
 	}
 	maxTs := cursor
+	failed := false
 	for _, it := range items {
 		ts := it.PublishTime.Unix()
 		if cursor > 0 && ts < cursor-300 {
@@ -245,16 +265,21 @@ func (s *NewsService) collectCls(ctx context.Context) (inserted int) {
 			SourcePriority: 1, ContentHash: newsContentHash(it.Title, it.Content),
 			ImportantMark: it.Important,
 		}
-		if !insertNews(n) {
-			continue // 写库失败：不登记去重、不推游标，靠下轮重叠窗重采
+		created, err := insertNews(ctx, n)
+		if err != nil {
+			failed = true
+			continue
 		}
 		s.dedupeRegister(newsSourceCls, it.SourceID, it.Title, it.PublishTime)
-		inserted++
+		if created {
+			inserted++
+		}
 		if ts > maxTs {
 			maxTs = ts
 		}
 	}
-	if maxTs > cursor {
+	// 任一条失败都保留旧游标，后续成功条目不能把失败条目挤出重叠窗。
+	if !failed && maxTs > cursor {
 		writeNewsCursor(optNewsCursorCls, maxTs)
 	}
 	return inserted
@@ -263,12 +288,13 @@ func (s *NewsService) collectCls(ctx context.Context) (inserted int) {
 // collectEMFast 东财 7×24 快讯一轮（只取第一页，增量靠轮询+去重）。
 func (s *NewsService) collectEMFast(ctx context.Context) (inserted int) {
 	cursor := readNewsCursor(optNewsCursorEM)
-	items, _, err := datasource.GetEMFastNews(ctx, "", 20)
+	items, _, err := s.fetchEMFast(ctx, "", 20)
 	if err != nil {
 		common.SysDebug("东财快讯采集跳过: %v", err)
 		return 0
 	}
 	maxTs := cursor
+	failed := false
 	for _, it := range items {
 		ts := it.PublishTime.Unix()
 		if cursor > 0 && ts < cursor-300 {
@@ -287,16 +313,20 @@ func (s *NewsService) collectEMFast(ctx context.Context) (inserted int) {
 			CollectTime: time.Now(), RelatedSymbols: marshalSymbols(it.Symbols),
 			SourcePriority: 2, ContentHash: newsContentHash(it.Title, it.Summary),
 		}
-		if !insertNews(n) {
-			continue // 写库失败：不登记去重、不推游标，靠下轮重叠窗重采
+		created, err := insertNews(ctx, n)
+		if err != nil {
+			failed = true
+			continue
 		}
 		s.dedupeRegister(newsSourceEM, it.SourceID, it.Title, it.PublishTime)
-		inserted++
+		if created {
+			inserted++
+		}
 		if ts > maxTs {
 			maxTs = ts
 		}
 	}
-	if maxTs > cursor {
+	if !failed && maxTs > cursor {
 		writeNewsCursor(optNewsCursorEM, maxTs)
 	}
 	return inserted
@@ -311,15 +341,18 @@ func (s *NewsService) collectStockNews(ctx context.Context) (inserted int) {
 	var syms []string
 	// 已平仓持仓不再是「在跟的标的」，排除避免占用 LIMIT 名额挤掉在持/自选股；
 	// 稳定排序保证 LIMIT 截断可复现。
-	common.DB.Raw(`SELECT DISTINCT symbol FROM (
-		SELECT symbol FROM watchlist_items
-		UNION SELECT symbol FROM positions WHERE status = 'holding'
-	) t ORDER BY symbol LIMIT 50`).Scan(&syms)
+	if err := common.DB.WithContext(ctx).Raw(`SELECT DISTINCT symbol FROM (
+		SELECT symbol FROM watchlist_items WHERE market = 'cn'
+		UNION SELECT symbol FROM positions WHERE market = 'cn' AND status = 'holding'
+	) t ORDER BY symbol LIMIT 50`).Scan(&syms).Error; err != nil {
+		common.SysWarn("个股新闻关注集合读取失败: %v", err)
+		return 0
+	}
 	for _, sym := range syms {
-		if len(sym) != 6 { // 只做 A 股 6 位代码口径
+		if !validNewsSymbol(sym) { // 只做 A 股 6 位数字代码口径
 			continue
 		}
-		items, err := datasource.GetEMStockNews(ctx, sym, 10)
+		items, err := s.fetchStockNews(ctx, sym, 10)
 		if err != nil {
 			common.SysDebug("个股新闻采集降级（本轮放弃）: %v", err)
 			return inserted
@@ -335,11 +368,14 @@ func (s *NewsService) collectStockNews(ctx context.Context) (inserted int) {
 				CollectTime: time.Now(), RelatedSymbols: marshalSymbols(it.Symbols),
 				SourcePriority: 3, ContentHash: newsContentHash(it.Title, it.Summary),
 			}
-			if !insertNews(n) {
+			created, err := insertNews(ctx, n)
+			if err != nil {
 				continue // 写库失败：不登记去重，下轮重采
 			}
 			s.dedupeRegister(newsSourceEM, "stock:"+it.SourceID, it.Title, it.PublishTime)
-			inserted++
+			if created {
+				inserted++
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -406,20 +442,39 @@ type NewsView struct {
 	RelatedStocks []NewsRelatedStock `json:"related_stocks"`
 }
 
+func validNewsSymbol(symbol string) bool {
+	if len(symbol) != 6 {
+		return false
+	}
+	for _, ch := range symbol {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // ListNews 新闻查询：可选 symbol（RelatedSymbols JSON LIKE 匹配）、source、limit。
 // 列表按发布时间倒序；正文大字段列表页不需要，排除以省流量。
 // 关联标的名称批量补全（两次字典查询，与条数无关，不产生 N+1）。
 func (s *NewsService) ListNews(symbol, source string, limit int) ([]NewsView, error) {
+	symbol = strings.TrimSpace(symbol)
+	if symbol != "" && !validNewsSymbol(symbol) {
+		return nil, errors.New("请输入 6 位 A 股代码")
+	}
+	if common.DB == nil {
+		return nil, errors.New("新闻数据库不可用")
+	}
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
 	q := common.DB.Model(&model.News{}).
 		Select("id, title, summary, url, source, category, publish_time, related_symbols, source_priority, sentiment, sentiment_score, important_mark").
-		Order("publish_time DESC").Limit(limit)
+		Order("publish_time DESC, id DESC").Limit(limit)
 	if source != "" {
 		q = q.Where("source = ?", source)
 	}
-	if symbol = strings.TrimSpace(symbol); symbol != "" {
+	if symbol != "" {
 		q = q.Where("related_symbols LIKE ?", "%\""+symbol+"\"%")
 	}
 	var rows []model.News

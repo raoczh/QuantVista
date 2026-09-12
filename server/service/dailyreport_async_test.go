@@ -48,6 +48,8 @@ func seedReportEnv(t *testing.T, userID int64, baseURL string) {
 	if err := common.DB.Create(cfg).Error; err != nil {
 		t.Fatalf("建配置失败: %v", err)
 	}
+	// 后注册的 cleanup 先执行，须先停止 worker，再清理本用例数据。
+	isolateAsyncLLMTestRuntime(t)
 }
 
 // fakeReportSvc 组装带注入点的日报服务：快照假实现（零上游）、推荐假实现、

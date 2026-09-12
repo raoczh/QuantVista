@@ -45,6 +45,7 @@ type ShadowReport struct {
 	// PickedBuy 入选 buy 标签总数（覆盖率分母，含未成熟）；PickedBuyMatured 其中已成熟数。
 	PickedBuy        int               `json:"picked_buy"`
 	PickedBuyMatured int               `json:"picked_buy_matured"`
+	ForcedExcluded   int               `json:"forced_excluded"`
 	Groups           []ShadowGateGroup `json:"groups"`
 	Notes            []string          `json:"notes"`
 }
@@ -126,6 +127,9 @@ func RecShadowReport(userID int64, recType string, horizon int) (*ShadowReport, 
 	var ungatedMatured []model.RecommendationLabel
 	for _, l := range labels {
 		k := key(l.BatchID, l.Symbol)
+		if l.MaturityStatus == model.LabelMatured && l.Forced {
+			rep.ForcedExcluded++
+		}
 		if l.RecommendationID > 0 && l.Action == model.RecActionBuy {
 			rep.PickedBuy++
 			if l.MaturityStatus == model.LabelMatured {
@@ -135,7 +139,7 @@ func RecShadowReport(userID int64, recType string, horizon int) (*ShadowReport, 
 		// 对照组限定 buy：入选 watch 的成熟收益与「被门控标记的 buy」不可比（watch
 		// 本就是更弱的信号），混入会让 gated vs ungated 的转正判断失真。
 		if l.RecommendationID > 0 && l.Action == model.RecActionBuy &&
-			!anyGate[k] && l.MaturityStatus == model.LabelMatured {
+			!anyGate[k] && l.MaturityStatus == model.LabelMatured && !l.Forced {
 			ungatedMatured = append(ungatedMatured, l)
 		}
 	}
@@ -167,7 +171,7 @@ func RecShadowReport(userID int64, recType string, horizon int) (*ShadowReport, 
 			if ev.WouldBeAction != "" && (gt == model.GateRegimeShadow || gt == model.GateBearShadow) {
 				grp.WouldRewrite++
 			}
-			if l.MaturityStatus == model.LabelMatured {
+			if l.MaturityStatus == model.LabelMatured && !l.Forced {
 				gatedMatured = append(gatedMatured, l)
 			}
 		}
@@ -179,6 +183,7 @@ func RecShadowReport(userID int64, recType string, horizon int) (*ShadowReport, 
 	}
 
 	rep.Notes = append(rep.Notes,
+		"收益统计剔除退市/长停的末根强平估值；名单覆盖与标签成熟度计数仍保留这些样本",
 		"口径：统一执行模拟标签（next_open）；gated 与对照组统一限定 buy（入选类门控），名单阶段被挤出者（相关性/行业）吃影子标签；对照组=未被任何门控标记的入选 buy",
 		"correlation/industry_cap 组的影子侧为无止盈止损的固定持有，对照侧为带障碍的入选 buy，该两组对照同时反映选股与退出策略差异，仅作方向参考",
 		"覆盖率语义：would_rewrite=若强制执行会失去的 buy 数（只计会改写动作的 regime/反方门控；质量门控只封顶置信度恒 0）；picked_buy 为分母",

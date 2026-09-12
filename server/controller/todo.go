@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"net/http"
 	"strconv"
 
 	"quantvista/common"
@@ -26,7 +27,7 @@ func (tc *TodoController) List(c *gin.Context) {
 		HistoryDays: queryInt(c, "history_days"), Limit: queryInt(c, "limit"),
 	})
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "待办请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, res)
@@ -34,13 +35,14 @@ func (tc *TodoController) List(c *gin.Context) {
 
 // Action PUT /api/todos/actions —— 批量收下、明天再说或当日同股同类静默。
 func (tc *TodoController) Action(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
 	var req service.TodoActionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ApiErrorMsg(c, "请求参数无效")
 		return
 	}
-	if err := tc.svc.ApplyInboxAction(currentUserID(c), req); err != nil {
-		common.ApiErrorMsg(c, err.Error())
+	if err := tc.svc.ApplyInboxActionContext(c.Request.Context(), currentUserID(c), req); err != nil {
+		common.ApiErrorMsg(c, publicWorkflowError(err, "待办请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, gin.H{"ok": true})

@@ -35,19 +35,19 @@ func TestInvestmentGuideStateIsExplicitAndVersioned(t *testing.T) {
 	t.Cleanup(func() { common.DB.Where("user_id = ?", userID).Delete(&model.UserPreference{}) })
 	svc := &UserService{}
 	base := PreferenceInput{
-		RiskLevel: "balanced", DefaultMarket: "cn", HorizonPref: HorizonLongTerm,
-		DefaultRecCount: 3, MinCandidateAmount: defaultMinCandidateAmount,
+		RiskLevel: preferenceReviewValue("balanced"), DefaultMarket: preferenceReviewValue("cn"), HorizonPref: preferenceReviewValue(HorizonLongTerm),
+		DefaultRecCount: preferenceReviewValue(3), MinCandidateAmount: preferenceReviewValue(float64(defaultMinCandidateAmount)),
 	}
 	completed := base
-	completed.InvestmentGuideVersion = InvestmentGuideCurrentVersion
-	completed.InvestmentGuideStatus = InvestmentGuideCompleted
+	completed.InvestmentGuideVersion = preferenceReviewValue(InvestmentGuideCurrentVersion)
+	completed.InvestmentGuideStatus = preferenceReviewValue(InvestmentGuideCompleted)
 	if _, err := svc.UpdatePreference(userID, completed); err == nil {
 		t.Fatal("资金为 0 时不得标记三问向导已完成")
 	}
 
 	skipped := base
-	skipped.InvestmentGuideVersion = InvestmentGuideCurrentVersion
-	skipped.InvestmentGuideStatus = InvestmentGuideSkipped
+	skipped.InvestmentGuideVersion = preferenceReviewValue(InvestmentGuideCurrentVersion)
+	skipped.InvestmentGuideStatus = preferenceReviewValue(InvestmentGuideSkipped)
 	pref, err := svc.UpdatePreference(userID, skipped)
 	if err != nil {
 		t.Fatalf("用户应可明确跳过向导: %v", err)
@@ -56,7 +56,7 @@ func TestInvestmentGuideStateIsExplicitAndVersioned(t *testing.T) {
 		t.Fatalf("跳过状态须独立于默认偏好显式保存: %+v", pref)
 	}
 
-	completed.TotalCapital = 200000
+	completed.TotalCapital = preferenceReviewValue(float64(200000))
 	pref, err = svc.UpdatePreference(userID, completed)
 	if err != nil || pref.InvestmentGuideStatus != InvestmentGuideCompleted || pref.TotalCapital != 200000 {
 		t.Fatalf("有效三问应保存完成版本及复用字段: pref=%+v err=%v", pref, err)

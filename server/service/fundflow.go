@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"quantvista/datasource"
 	"quantvista/model"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -33,9 +35,15 @@ const (
 // fflowSyncTry 包级共享的拉取冷却表（MoodService/ScoreService/推荐域多实例共用，
 // 照 F2 finSyncTry 先例——实例字段会让冷却互相看不见）。
 var (
-	fflowTryMu sync.Mutex
-	fflowTry   = map[string]time.Time{}
+	fflowTryMu    sync.Mutex
+	fflowTry      = map[string]time.Time{}
+	fflowAttempts = map[string]*fflowAttempt{}
 )
+
+type fflowAttempt struct {
+	done chan struct{}
+	err  error // done 关闭后只读。
+}
 
 func fflowTryAllowed(key string) bool {
 	fflowTryMu.Lock()
@@ -44,74 +52,148 @@ func fflowTryAllowed(key string) bool {
 		return false
 	}
 	fflowTry[key] = time.Now()
+	fflowAttempts[key] = &fflowAttempt{done: make(chan struct{})}
 	return true
 }
 
 // stockFundFlowProbe 是推荐轮在补拉前一次性读取并冻结的本地资金流状态。
 // Rows 可供详情页回退展示；只有 Fresh=true 才允许进入评分与 LLM 因子。
 type stockFundFlowProbe struct {
-	Market string
-	Symbol string
-	Rows   []model.FundFlowDaily
-	Fresh  bool
+	Market        string
+	Symbol        string
+	Rows          []model.FundFlowDaily
+	Fresh         bool
+	RefreshNeeded bool
+	Err           error
 }
 
 func inspectStockFundFlow(market, symbol string, now time.Time) stockFundFlowProbe {
+	return inspectStockFundFlowDB(common.DB, market, symbol, now)
+}
+
+func inspectStockFundFlowDB(db *gorm.DB, market, symbol string, now time.Time) stockFundFlowProbe {
 	p := stockFundFlowProbe{Market: market, Symbol: symbol}
-	if common.DB == nil || market != "cn" {
+	if market != "cn" {
 		return p
 	}
-	common.DB.Where("symbol = ? AND market = ?", symbol, market).
-		Order("trade_date DESC").Limit(fflowBarLimit).Find(&p.Rows)
+	if db == nil {
+		p.Err = errors.New("数据库不可用")
+		return p
+	}
+	today := now.Format("2006-01-02")
+	freshSince := prevOpenTradeDateDB(db, today)
+	completeThrough := freshSince
+	readThrough := now.AddDate(0, 0, -1).Format("2006-01-02")
+	if now.Hour() >= fflowStableHour && isTradingDayTodayDB(db, now) {
+		completeThrough = today
+		readThrough = today
+	}
+	// 日历可能只补入了旧日线日期；它可用于时效比较，不能把更近的已终态事实从
+	// 读取窗口中裁掉。排除今日盘中/未来数据的上界按当前自然日确定。
+	if err := db.Where("symbol = ? AND market = ? AND trade_date <= ?", symbol, market, readThrough).
+		Order("trade_date DESC").Limit(fflowBarLimit).Find(&p.Rows).Error; err != nil {
+		p.Rows, p.Err = nil, fmt.Errorf("资金流读取失败: %w", err)
+		return p
+	}
 	for left, right := 0, len(p.Rows)-1; left < right; left, right = left+1, right-1 {
 		p.Rows[left], p.Rows[right] = p.Rows[right], p.Rows[left]
 	}
-	freshSince := prevOpenTradeDate(now.Format("2006-01-02"))
 	p.Fresh = len(p.Rows) > 0 && p.Rows[len(p.Rows)-1].TradeDate >= freshSince
+	// T-1 仍可用于既有评分口径，但盘后详情必须尝试补上已终态的当日数据。
+	p.RefreshNeeded = len(p.Rows) == 0 || p.Rows[len(p.Rows)-1].TradeDate < completeThrough
 	return p
 }
 
 // fetchStockFundFlowReserved 执行一次已由推荐预热规划器占用冷却槽的真实请求。
-// 请求失败仍返回补拉前库存，Fresh 保持 false，并且不会在本轮继续尝试其他标的。
-func fetchStockFundFlowReserved(ctx context.Context, em *datasource.EastMoneyAdapter, p stockFundFlowProbe, now time.Time) stockFundFlowProbe {
+// 请求失败仍返回补拉前库存及其原有时效，并且不会在本轮继续尝试其他标的。
+func fetchStockFundFlowReserved(ctx context.Context, em *datasource.EastMoneyAdapter, p stockFundFlowProbe, now time.Time) (out stockFundFlowProbe) {
+	out = p
+	key := p.Market + ":" + p.Symbol
+	fflowTryMu.Lock()
+	attempt := fflowAttempts[key]
+	fflowTryMu.Unlock()
+	defer func() {
+		fflowTryMu.Lock()
+		defer fflowTryMu.Unlock()
+		if attempt != nil {
+			attempt.err = out.Err
+			close(attempt.done)
+		}
+		if ctx.Err() != nil && fflowAttempts[key] == attempt {
+			delete(fflowTry, key)
+		}
+	}()
 	fctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
 	bars, err := em.GetStockFundFlow(fctx, p.Market, p.Symbol, fflowBarLimit)
 	if err != nil {
 		if !errors.Is(err, datasource.ErrNoData) {
 			common.SysDebug("资金流历史拉取失败 %s: %v", p.Symbol, err)
+			out.Err = fmt.Errorf("资金流拉取失败: %w", err)
 		}
-		return p
+		return out
 	}
-	persistFundFlow(p.Market, p.Symbol, bars, now)
-	return inspectStockFundFlow(p.Market, p.Symbol, now)
+	if err := persistFundFlowDB(common.DB.WithContext(fctx), p.Market, p.Symbol, bars, now); err != nil {
+		out.Err = err
+		return out
+	}
+	return inspectStockFundFlowDB(common.DB.WithContext(fctx), p.Market, p.Symbol, now)
 }
 
 // ensureStockFundFlow 读取某股资金流序列（升序，≤fflowBarLimit 根）；库存不新鲜且
 // 预算允许时回上游补拉。budget 为 nil 表示不限预算（详情页单股场景）。
 // 返回序列与「数据是否新鲜」（末行 ≥ 上一开市日）。失败返回库存（stale 也比没有强）。
 func ensureStockFundFlow(ctx context.Context, em *datasource.EastMoneyAdapter, market, symbol string, budget *int) ([]model.FundFlowDaily, bool) {
-	now := time.Now()
-	probe := inspectStockFundFlow(market, symbol, now)
-	if common.DB == nil || market != "cn" {
-		return nil, false
+	return ensureStockFundFlowAt(ctx, em, market, symbol, budget, time.Now())
+}
+
+func ensureStockFundFlowAt(ctx context.Context, em *datasource.EastMoneyAdapter, market, symbol string, budget *int, now time.Time) ([]model.FundFlowDaily, bool) {
+	probe := ensureStockFundFlowProbe(ctx, em, market, symbol, budget, now)
+	return probe.Rows, probe.Fresh
+}
+
+func ensureStockFundFlowProbe(ctx context.Context, em *datasource.EastMoneyAdapter, market, symbol string, budget *int, now time.Time) stockFundFlowProbe {
+	if err := ctx.Err(); err != nil {
+		return stockFundFlowProbe{Market: market, Symbol: symbol, Err: err}
 	}
-	if probe.Fresh {
-		return probe.Rows, true
+	db := common.DB
+	if db != nil {
+		db = db.WithContext(ctx)
+	}
+	probe := inspectStockFundFlowDB(db, market, symbol, now)
+	if probe.Err != nil || !probe.RefreshNeeded {
+		return probe
 	}
 	if budget != nil && *budget <= 0 {
-		return probe.Rows, false
+		return probe
 	}
-	if !fflowTryAllowed(market + ":" + symbol) {
-		return probe.Rows, false
+	key := market + ":" + symbol
+	if !fflowTryAllowed(key) {
+		fflowTryMu.Lock()
+		attempt := fflowAttempts[key]
+		fflowTryMu.Unlock()
+		if attempt == nil {
+			probe.Err = errors.New("资金流刷新处于冷却期，请稍后重试")
+			return probe
+		}
+		select {
+		case <-ctx.Done():
+			probe.Err = ctx.Err()
+			return probe
+		case <-attempt.done:
+		}
+		probe = inspectStockFundFlowDB(db, market, symbol, now)
+		if probe.Err == nil {
+			probe.Err = attempt.err
+		}
+		return probe
 	}
 	// 预算表示实际发出的上游请求数。冷却命中没有 I/O，不得白白占掉名额并让
 	// 后续标的因遍历顺序失去补拉机会。
 	if budget != nil {
 		*budget--
 	}
-	probe = fetchStockFundFlowReserved(ctx, em, probe, now)
-	return probe.Rows, probe.Fresh
+	return fetchStockFundFlowReserved(ctx, em, probe, now)
 }
 
 // fundFlowForScoring 收紧评分消费口径：ensureStockFundFlow 为详情页保留 stale
@@ -124,12 +206,19 @@ func fundFlowForScoring(rows []model.FundFlowDaily, fresh bool) []model.FundFlow
 }
 
 // persistFundFlow 资金流序列 upsert。16:00 前丢弃「今天」的行（盘中半截值防残留）。
-func persistFundFlow(market, symbol string, bars []datasource.StockFundFlowBar, now time.Time) {
+func persistFundFlow(market, symbol string, bars []datasource.StockFundFlowBar, now time.Time) error {
+	return persistFundFlowDB(common.DB, market, symbol, bars, now)
+}
+
+func persistFundFlowDB(db *gorm.DB, market, symbol string, bars []datasource.StockFundFlowBar, now time.Time) error {
+	if db == nil {
+		return errors.New("数据库不可用")
+	}
 	today := now.Format("2006-01-02")
 	allowToday := now.Hour() >= fflowStableHour
 	recs := make([]model.FundFlowDaily, 0, len(bars))
 	for _, b := range bars {
-		if b.TradeDate == "" || (b.TradeDate == today && !allowToday) {
+		if b.TradeDate == "" || b.TradeDate > today || (b.TradeDate == today && !allowToday) {
 			continue
 		}
 		recs = append(recs, model.FundFlowDaily{
@@ -140,9 +229,9 @@ func persistFundFlow(market, symbol string, bars []datasource.StockFundFlowBar, 
 		})
 	}
 	if len(recs) == 0 {
-		return
+		return nil
 	}
-	if err := common.DB.Clauses(clause.OnConflict{
+	if err := db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "trade_date"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"main_net", "super_net", "large_net", "medium_net", "small_net",
@@ -150,7 +239,9 @@ func persistFundFlow(market, symbol string, bars []datasource.StockFundFlowBar, 
 		}),
 	}).CreateInBatches(recs, 200).Error; err != nil {
 		common.SysWarn("资金流历史落库失败 %s: %v", symbol, err)
+		return fmt.Errorf("资金流保存失败: %w", err)
 	}
+	return nil
 }
 
 // ---------- 纯函数（单测锚点） ----------
@@ -240,6 +331,7 @@ type StockFundFlowView struct {
 	StreakDays   int     `json:"streak_days"` // 正=连续净流入天数，负=连续净流出
 	Fresh        bool    `json:"fresh"`       // 末行是否 ≥ 上一开市日（false=缓存偏旧）
 	LastDate     string  `json:"last_date,omitempty"`
+	Note         string  `json:"note,omitempty"`
 }
 
 // StockFundFlowDay 单日行（金额单位亿元，前端直接可画）。
@@ -264,9 +356,18 @@ func (s *MoodService) StockFundFlow(ctx context.Context, market, symbol string, 
 	if market != "cn" || isCNFund(symbol) {
 		return view, nil // ETF/非 A 股无个股资金流口径，自然为空
 	}
-	flows, fresh := ensureStockFundFlow(ctx, s.em, market, symbol, nil)
+	probe := ensureStockFundFlowProbe(ctx, s.em, market, symbol, nil, time.Now())
+	flows, fresh := probe.Rows, probe.Fresh
 	if len(flows) == 0 {
+		if probe.Err != nil {
+			return nil, probe.Err
+		}
 		return view, nil
+	}
+	if probe.Err != nil {
+		view.Note = "刷新失败，以下展示最近已知数据：" + probe.Err.Error()
+	} else if probe.RefreshNeeded {
+		view.Note = "最新终态资金流尚未补齐，以下展示最近已知数据"
 	}
 	view.Fresh = fresh
 	view.LastDate = flows[len(flows)-1].TradeDate

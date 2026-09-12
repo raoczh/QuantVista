@@ -158,8 +158,8 @@ func TestPositionAlertAllPositionsAndFailClosed(t *testing.T) {
 	}
 
 	hits, err := svc.evaluatePositionRules(context.Background(), 1, []model.AlertRule{*rule})
-	if err != nil {
-		t.Fatalf("评估失败: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "行情") {
+		t.Fatalf("stale 持仓必须说明检查不完整，同时保留其余有效命中: %v", err)
 	}
 	if hits != 2 {
 		t.Fatalf("两只 fresh 持仓应各命中一次（stale 的不评），得到 %d", hits)
@@ -209,8 +209,8 @@ func TestPositionAlertAllPositionsAndFailClosed(t *testing.T) {
 	}
 
 	// 重复评估同一天：不再新增事件（去重键 rule+position+trade_date 幂等）。
-	if _, err := svc.evaluatePositionRules(context.Background(), 1, []model.AlertRule{saved}); err != nil {
-		t.Fatalf("重复评估失败: %v", err)
+	if hits, err := svc.evaluatePositionRules(context.Background(), 1, []model.AlertRule{saved}); hits != 0 || err == nil {
+		t.Fatalf("重复评估不新增事件，同时保留 stale 行情缺口: hits=%d err=%v", hits, err)
 	}
 	var again int64
 	common.DB.Model(&model.AlertEvent{}).Where("rule_id = ?", rule.ID).Count(&again)

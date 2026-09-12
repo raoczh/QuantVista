@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // 推理/思考侧适配（对标 new-api relaykit 的请求转换与响应归一实践）：
@@ -204,41 +205,58 @@ func joinReasoningContent(parts ...string) string {
 // 在确认闭合前必须暂存原文：未闭合时 Flush 将整段按 visible 原样返回；一旦确认
 // 开头不是 think 块，后续 chunk 全部直通，正文或 JSON 中的字面标签不会被误删。
 type thinkStreamFilter struct {
-	pending  string
-	resolved bool
+	pending   []byte
+	resolved  bool
+	leading   int
+	bodyStart int
+	searchAt  int
 }
 
 func (f *thinkStreamFilter) Push(chunk string) (visible, reasoning string) {
 	if f.resolved {
 		return chunk, ""
 	}
-	f.pending += chunk
-	trimmed := strings.TrimLeftFunc(f.pending, unicode.IsSpace)
-	if trimmed == "" {
-		return "", ""
-	}
-
+	f.pending = append(f.pending, chunk...)
 	const openTag = "<think>"
-	if len(trimmed) < len(openTag) {
-		if strings.EqualFold(trimmed, openTag[:len(trimmed)]) {
-			return "", ""
+	if f.bodyStart == 0 {
+		for f.leading < len(f.pending) {
+			tail := f.pending[f.leading:]
+			if !utf8.FullRune(tail) {
+				return "", ""
+			}
+			r, size := utf8.DecodeRune(tail)
+			if !unicode.IsSpace(r) {
+				break
+			}
+			f.leading += size
 		}
-		return f.resolveVisible(), ""
+		prefix := f.pending[f.leading:]
+		if len(prefix) < len(openTag) {
+			if strings.EqualFold(string(prefix), openTag[:len(prefix)]) {
+				return "", ""
+			}
+			return f.resolveVisible(), ""
+		}
+		if !strings.EqualFold(string(prefix[:len(openTag)]), openTag) {
+			return f.resolveVisible(), ""
+		}
+		f.bodyStart = f.leading + len(openTag)
+		f.searchAt = f.bodyStart
 	}
-	if !strings.EqualFold(trimmed[:len(openTag)], openTag) {
-		return f.resolveVisible(), ""
-	}
-
 	const closeTag = "</think>"
-	body := trimmed[len(openTag):]
-	closeAt := indexASCIIFold(body, closeTag)
+	closeAt := indexASCIIFold(string(f.pending[f.searchAt:]), closeTag)
 	if closeAt < 0 {
+		// 只保留可能跨分片的闭合标签后缀，避免每个小分片重扫全部思考正文。
+		f.searchAt = len(f.pending) - len(closeTag) + 1
+		if f.searchAt < f.bodyStart {
+			f.searchAt = f.bodyStart
+		}
 		return "", ""
 	}
-	leadingLen := len(f.pending) - len(trimmed)
-	visible = f.pending[:leadingLen] + body[closeAt+len(closeTag):]
-	reasoning = body[:closeAt]
-	f.pending = ""
+	closeAt += f.searchAt
+	visible = string(f.pending[:f.leading]) + string(f.pending[closeAt+len(closeTag):])
+	reasoning = string(f.pending[f.bodyStart:closeAt])
+	f.pending = nil
 	f.resolved = true
 	return visible, reasoning
 }
@@ -251,8 +269,8 @@ func (f *thinkStreamFilter) Flush() (visible, reasoning string) {
 }
 
 func (f *thinkStreamFilter) resolveVisible() string {
-	visible := f.pending
-	f.pending = ""
+	visible := string(f.pending)
+	f.pending = nil
 	f.resolved = true
 	return visible
 }

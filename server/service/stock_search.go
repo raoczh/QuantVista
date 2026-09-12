@@ -290,7 +290,7 @@ func enrichStockSearchRelations(ctx context.Context, userID int64, items []Stock
 		return err
 	}
 	var held []stockRef
-	if err := common.DB.WithContext(ctx).Model(&model.Position{}).
+	if err := common.DB.WithContext(ctx).Model(&model.Position{}).Scopes(withActivePositionAccount).
 		Select("symbol", "market").
 		Where("user_id = ? AND symbol IN ? AND status = ? AND quantity > 0",
 			userID, symbols, model.PositionStatusHolding).

@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"errors"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -11,6 +13,7 @@ import (
 	"quantvista/datasource"
 	"quantvista/model"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -55,24 +58,31 @@ func orgTryAllowed(key string) bool {
 }
 
 // ensureReportRatings 研报评级按需同步（best-effort：失败静默，消费方用缓存里有的）。
-func ensureReportRatings(ctx context.Context, symbol string) {
-	if common.DB == nil || !isSixDigits(symbol) {
-		return
+func ensureReportRatings(ctx context.Context, symbol string) error {
+	ctx = jobSubmissionContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	if finFresh(&model.ReportRating{}, symbol) || !orgTryAllowed("rep:"+symbol) {
-		return
+	if common.DB == nil || !isSixDigits(symbol) {
+		return nil
+	}
+	fresh, err := orgCacheFresh(ctx, &model.ReportRating{}, symbol)
+	if err != nil {
+		return err
+	}
+	if fresh || !orgTryAllowed("rep:"+symbol) {
+		return nil
 	}
 	rows, err := fetchOrgReports(ctx, symbol, orgFetchDays)
 	if err != nil {
 		common.SysDebug("研报评级拉取失败 %s: %v", symbol, err)
-		return
+		return ctx.Err()
 	}
-	if len(rows) > orgReportKeep {
-		rows = rows[:orgReportKeep]
-	}
+	today := time.Now().Format("2006-01-02")
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].PublishDate > rows[j].PublishDate })
 	recs := make([]model.ReportRating, 0, len(rows))
 	for _, r := range rows {
-		if r.InfoCode == "" || r.PublishDate == "" {
+		if r.InfoCode == "" || !orgDateVisible(r.PublishDate, today) || (r.Symbol != "" && r.Symbol != symbol) {
 			continue
 		}
 		recs = append(recs, model.ReportRating{
@@ -82,43 +92,84 @@ func ensureReportRatings(ctx context.Context, symbol string) {
 			Rating: truncateRunes(r.Rating, 16), LastRating: truncateRunes(r.LastRating, 16),
 			RatingChange: r.RatingChange, TargetPrice: r.TargetPrice,
 		})
+		if len(recs) >= orgReportKeep {
+			break
+		}
 	}
 	if len(recs) == 0 {
-		return
+		return nil
 	}
-	if err := common.DB.Clauses(clause.OnConflict{
+	if err := common.DB.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "info_code"}},
 		DoUpdates: clause.AssignmentColumns([]string{"report_date", "org_name", "researcher", "title",
 			"rating", "last_rating", "rating_change", "target_price", "updated_at"}),
 	}).CreateInBatches(recs, 100).Error; err != nil {
 		common.SysWarn("研报评级落库失败 %s: %v", symbol, err)
+		return err
 	}
+	return nil
 }
 
 // ensureOrgSurveys 机构调研按需同步：上游一机构一行明细，落库前按调研日聚合。
-func ensureOrgSurveys(ctx context.Context, symbol string) {
-	if common.DB == nil || !isSixDigits(symbol) {
-		return
+func ensureOrgSurveys(ctx context.Context, symbol string) error {
+	ctx = jobSubmissionContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	if finFresh(&model.OrgSurvey{}, symbol) || !orgTryAllowed("svy:"+symbol) {
-		return
+	if common.DB == nil || !isSixDigits(symbol) {
+		return nil
+	}
+	fresh, err := orgCacheFresh(ctx, &model.OrgSurvey{}, symbol)
+	if err != nil {
+		return err
+	}
+	if fresh || !orgTryAllowed("svy:"+symbol) {
+		return nil
 	}
 	rows, err := fetchOrgSurveys(ctx, symbol, orgFetchDays)
 	if err != nil {
 		common.SysDebug("机构调研拉取失败 %s: %v", symbol, err)
-		return
+		return ctx.Err()
 	}
-	recs := aggregateSurveys(symbol, rows)
+	today := time.Now().Format("2006-01-02")
+	visible := make([]datasource.SurveyRow, 0, len(rows))
+	for _, row := range rows {
+		if orgDateVisible(row.SurveyDate, today) && (row.NoticeDate == "" || orgDateVisible(row.NoticeDate, today)) {
+			visible = append(visible, row)
+		}
+	}
+	recs := aggregateSurveys(symbol, visible)
 	if len(recs) == 0 {
-		return
+		return nil
 	}
-	if err := common.DB.Clauses(clause.OnConflict{
+	if err := common.DB.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "survey_date"}},
 		DoUpdates: clause.AssignmentColumns([]string{"notice_date", "org_count", "org_names",
 			"receive_way", "updated_at"}),
 	}).CreateInBatches(recs, 100).Error; err != nil {
 		common.SysWarn("机构调研落库失败 %s: %v", symbol, err)
+		return err
 	}
+	return nil
+}
+
+func orgCacheFresh(ctx context.Context, table any, symbol string) (bool, error) {
+	var row struct{ UpdatedAt time.Time }
+	now := time.Now()
+	err := common.DB.WithContext(ctx).Model(table).Select("updated_at").
+		Where("market = ? AND symbol = ? AND updated_at <= ?", "cn", symbol, now).Order("updated_at DESC").Take(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !row.UpdatedAt.IsZero() && now.Sub(row.UpdatedAt) < orgFreshTTL, nil
+}
+
+func orgDateVisible(date, asOf string) bool {
+	parsed, err := time.Parse("2006-01-02", date)
+	return err == nil && parsed.Format("2006-01-02") == date && date <= asOf
 }
 
 // aggregateSurveys 明细按调研日聚合（纯函数）：org_count=当日参与机构行数，
@@ -126,6 +177,7 @@ func ensureOrgSurveys(ctx context.Context, symbol string) {
 func aggregateSurveys(symbol string, rows []datasource.SurveyRow) []model.OrgSurvey {
 	byDate := map[string]*model.OrgSurvey{}
 	names := map[string][]string{}
+	seen := map[string]map[string]bool{}
 	for _, r := range rows {
 		if r.SurveyDate == "" {
 			continue
@@ -137,10 +189,21 @@ func aggregateSurveys(symbol string, rows []datasource.SurveyRow) []model.OrgSur
 				NoticeDate: r.NoticeDate, ReceiveWay: truncateRunes(r.ReceiveWay, 128),
 			}
 			byDate[r.SurveyDate] = rec
+			seen[r.SurveyDate] = map[string]bool{}
+		}
+		if r.NoticeDate > rec.NoticeDate {
+			rec.NoticeDate = r.NoticeDate
+		}
+		name := strings.TrimSpace(r.OrgName)
+		if name != "" && seen[r.SurveyDate][name] {
+			continue
+		}
+		if name != "" {
+			seen[r.SurveyDate][name] = true
 		}
 		rec.OrgCount++
-		if r.OrgName != "" && len(names[r.SurveyDate]) < orgSurveySample {
-			names[r.SurveyDate] = append(names[r.SurveyDate], r.OrgName)
+		if name != "" && len(names[r.SurveyDate]) < orgSurveySample {
+			names[r.SurveyDate] = append(names[r.SurveyDate], name)
 		}
 	}
 	out := make([]model.OrgSurvey, 0, len(byDate))
@@ -185,6 +248,22 @@ const (
 // 输出为 AI 快照 org_view 段（数值叶子经 snapshotLabeledValues 自动进核验值域，
 // 文本字段刻意不含小数数字）。
 func computeOrgView(reports []model.ReportRating, surveys []model.OrgSurvey, price float64, now time.Time) map[string]any {
+	today := now.Format("2006-01-02")
+	visibleReports := make([]model.ReportRating, 0, len(reports))
+	for _, row := range reports {
+		if orgDateVisible(row.ReportDate, today) {
+			visibleReports = append(visibleReports, row)
+		}
+	}
+	visibleSurveys := make([]model.OrgSurvey, 0, len(surveys))
+	for _, row := range surveys {
+		if orgDateVisible(row.SurveyDate, today) && (row.NoticeDate == "" || orgDateVisible(row.NoticeDate, today)) {
+			visibleSurveys = append(visibleSurveys, row)
+		}
+	}
+	reports, surveys = visibleReports, visibleSurveys
+	sort.SliceStable(reports, func(i, j int) bool { return reports[i].ReportDate > reports[j].ReportDate })
+	sort.SliceStable(surveys, func(i, j int) bool { return surveys[i].SurveyDate > surveys[j].SurveyDate })
 	if len(reports) == 0 && len(surveys) == 0 {
 		return nil
 	}
@@ -192,7 +271,7 @@ func computeOrgView(reports []model.ReportRating, surveys []model.OrgSurvey, pri
 	d30, d90, d180 := day(30), day(90), day(180)
 
 	out := map[string]any{
-		"note": "卖方研报评级普遍乐观（九成为买入/增持），参考价值在评级变动（尤其下调）、目标价与现价的偏离、调研密度变化，而非买入家数本身",
+		"note": "卖方研报评级普遍乐观（九成为买入/增持），参考价值在评级变动（尤其下调）、目标价与现价的偏离、调研密度变化，而非买入家数本身。研报统计基于已获取的最多 200 份样本，不代表全市场完整覆盖",
 	}
 
 	if len(reports) > 0 {
@@ -258,7 +337,7 @@ func computeOrgView(reports []model.ReportRating, surveys []model.OrgSurvey, pri
 		// 目标价：近 180 天有目标价的研报取 min/中位/max 与现价偏离（缺失容错）。
 		var targets []float64
 		for _, r := range reports {
-			if r.ReportDate >= d180 && r.TargetPrice > 0 {
+			if r.ReportDate >= d180 && r.TargetPrice > 0 && !math.IsInf(r.TargetPrice, 0) {
 				targets = append(targets, r.TargetPrice)
 			}
 		}
@@ -275,7 +354,7 @@ func computeOrgView(reports []model.ReportRating, surveys []model.OrgSurvey, pri
 				"max":    round2(targets[len(targets)-1]),
 				"note":   "近 180 天给出目标价的研报统计（多数研报不给目标价，样本有限）",
 			}
-			if price > 0 {
+			if price > 0 && !math.IsInf(price, 0) {
 				tp["median_vs_price_pct"] = round2((median - price) / price * 100)
 			}
 			out["target_price"] = tp
@@ -310,28 +389,52 @@ func computeOrgView(reports []model.ReportRating, surveys []model.OrgSurvey, pri
 // orgViewBrief 个股 AI 快照的机构观点段（分析/问答共用）。缓存缺失时按需拉取
 // （研报 1~2 请求 + 调研 1 请求，interactive 路径可承受）。无数据返回 nil。
 func orgViewBrief(ctx context.Context, symbol string, price float64) map[string]any {
-	if common.DB == nil || !isSixDigits(symbol) {
+	if common.DB == nil || !isSixDigits(symbol) || isCNFund(symbol) {
 		return nil
 	}
-	ensureReportRatings(ctx, symbol)
-	ensureOrgSurveys(ctx, symbol)
-	reports, surveys := loadOrgRows(symbol, 0, 0)
-	return computeOrgView(reports, surveys, price, time.Now())
+	view, err := NewOrgViewService().OverviewContext(ctx, "cn", symbol, price)
+	if err != nil {
+		common.SysWarn("机构观点摘要读取失败 symbol=%s: %v", symbol, err)
+		return nil
+	}
+	summary, _ := view["summary"].(map[string]any)
+	return summary
 }
 
 // loadOrgRows 读库（降序）；repLimit/svyLimit <=0 时取组织窗口所需的全量上限。
 func loadOrgRows(symbol string, repLimit, svyLimit int) ([]model.ReportRating, []model.OrgSurvey) {
+	reports, surveys, err := loadOrgRowsAt(context.Background(), symbol, repLimit, svyLimit, time.Now())
+	if err != nil {
+		common.SysWarn("机构观点读取失败 symbol=%s: %v", symbol, err)
+	}
+	return reports, surveys
+}
+
+func loadOrgRowsAt(ctx context.Context, symbol string, repLimit, svyLimit int, asOf time.Time) ([]model.ReportRating, []model.OrgSurvey, error) {
+	if common.DB == nil {
+		return nil, nil, errors.New("数据库不可用")
+	}
 	if repLimit <= 0 {
 		repLimit = orgReportKeep
 	}
 	if svyLimit <= 0 {
-		svyLimit = 100
+		svyLimit = orgFetchDays // 每日一行，必须覆盖完整的 180 天环比窗口。
 	}
 	var reports []model.ReportRating
-	common.DB.Where("symbol = ?", symbol).Order("report_date DESC").Limit(repLimit).Find(&reports)
 	var surveys []model.OrgSurvey
-	common.DB.Where("symbol = ?", symbol).Order("survey_date DESC").Limit(svyLimit).Find(&surveys)
-	return reports, surveys
+	today, since := asOf.Format("2006-01-02"), asOf.AddDate(0, 0, -orgFetchDays).Format("2006-01-02")
+	err := readSnapshotTx(jobSubmissionContext(ctx), func(tx *gorm.DB) error {
+		if err := tx.Where("market = ? AND symbol = ? AND report_date >= ? AND report_date <= ?", "cn", symbol, since, today).
+			Order("report_date DESC, id DESC").Limit(repLimit).Find(&reports).Error; err != nil {
+			return err
+		}
+		return tx.Where("market = ? AND symbol = ? AND survey_date >= ? AND survey_date <= ? AND (notice_date = '' OR notice_date <= ?)", "cn", symbol, since, today, today).
+			Order("survey_date DESC, id DESC").Limit(svyLimit).Find(&surveys).Error
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return reports, surveys, nil
 }
 
 // OrgViewService 详情页机构观点块的薄服务壳。
@@ -341,16 +444,40 @@ func NewOrgViewService() *OrgViewService { return &OrgViewService{} }
 
 // Overview 详情页机构观点：汇总 + 研报/调研明细列表。非 A 股股票返回空结构。
 func (s *OrgViewService) Overview(ctx context.Context, market, symbol string, price float64) map[string]any {
-	empty := map[string]any{"summary": nil, "reports": []model.ReportRating{}, "surveys": []model.OrgSurvey{}}
-	symbol = strings.TrimSpace(symbol)
-	if common.DB == nil || market != "cn" || !isSixDigits(symbol) || isCNFund(symbol) {
-		return empty
+	view, err := s.OverviewContext(ctx, market, symbol, price)
+	if err != nil {
+		common.SysWarn("机构观点读取失败 symbol=%s: %v", symbol, err)
 	}
-	ensureReportRatings(ctx, symbol)
-	ensureOrgSurveys(ctx, symbol)
+	return view
+}
+
+func (s *OrgViewService) OverviewContext(ctx context.Context, market, symbol string, price float64) (map[string]any, error) {
+	empty := map[string]any{"summary": nil, "reports": []model.ReportRating{}, "surveys": []model.OrgSurvey{}}
+	ctx = jobSubmissionContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return empty, err
+	}
+	symbol = strings.TrimSpace(symbol)
+	market = strings.ToLower(strings.TrimSpace(market))
+	if market != "cn" || !isSixDigits(symbol) || isCNFund(symbol) {
+		return empty, nil
+	}
+	if common.DB == nil {
+		return empty, errors.New("数据库不可用")
+	}
+	if err := ensureReportRatings(ctx, symbol); err != nil {
+		return empty, err
+	}
+	if err := ensureOrgSurveys(ctx, symbol); err != nil {
+		return empty, err
+	}
 	// summary 基于全量窗口（180 天分布不能被明细截断），列表另行截前 30/20。
-	reports, surveys := loadOrgRows(symbol, 0, 0)
-	summary := computeOrgView(reports, surveys, price, time.Now())
+	asOf := time.Now()
+	reports, surveys, err := loadOrgRowsAt(ctx, symbol, 0, 0, asOf)
+	if err != nil {
+		return empty, err
+	}
+	summary := computeOrgView(reports, surveys, price, asOf)
 	if len(reports) > 30 {
 		reports = reports[:30]
 	}
@@ -367,5 +494,5 @@ func (s *OrgViewService) Overview(ctx context.Context, market, symbol string, pr
 		"summary": summary,
 		"reports": reports,
 		"surveys": surveys,
-	}
+	}, nil
 }

@@ -19,7 +19,7 @@ func (mc *MarketController) SelectionEval(c *gin.Context) {
 	}
 	rep, err := service.RunSelectionEval(c.Request.Context(), mc.svc)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "选股评估读取失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, rep)
@@ -29,9 +29,9 @@ func (mc *MarketController) SelectionEval(c *gin.Context) {
 // 台账的跨用户脱敏聚合（level 对照 + 单信号预测力）。纯读、零 LLM；样本达标前
 // 只作观察，不据此调 pea1 阈值。
 func (mc *MarketController) PositionExitOutcomes(c *gin.Context) {
-	rep, err := service.PositionExitOutcomeReport()
+	rep, err := service.PositionExitOutcomeReport(c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "卖出评估读取失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, rep)

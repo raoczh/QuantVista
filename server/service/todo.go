@@ -148,6 +148,10 @@ var recReviewTitle = map[string]string{
 // scope 为消费出口过滤器（D18）：默认 ledger（只看与我的账本有关的），
 // **全量数据照常生成**，过滤只发生在返回前——ScopeCounts 会告诉前端别处还有多少条。
 func (s *TodoService) buildActive(ctx context.Context, userID int64, scope string) (*TodoResult, error) {
+	ctx = jobSubmissionContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	scope, err := validTodoScope(scope)
 	if err != nil {
 		return nil, err
@@ -163,13 +167,30 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 		res.Errors = append(res.Errors, block+"读取失败，相关待办可能缺失")
 		common.SysWarn("待办聚合读取%s失败 user=%d: %v", block, userID, err)
 	}
+	// 先补齐旧持仓归属，再聚合全部活动真实账户；今日清单不跟随默认账户切换。
+	accounts, accountErr := todoActiveRealAccounts(ctx, userID)
+	if accountErr != nil {
+		fail("账本账户", accountErr)
+	}
+	var positionViews []PositionView
+	for _, account := range accounts {
+		rows, err := s.position.ListByAccount(ctx, userID, account.ID, model.PositionStatusHolding)
+		if err != nil {
+			fail("持仓", err)
+			continue
+		}
+		positionViews = append(positionViews, rows...)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// 我的持仓标的集合：决定「提醒/逻辑卡」这类跨域条目算不算与账本有关。
 	// 读取失败时按空集处理并留痕——宁可把持仓相关的提醒错分到 research
 	// （用户仍能在 all 范围看到），也不能凭空把非持仓标的说成持仓。
 	heldSymbols := map[string]bool{}
 	heldPositionIDs := map[int64]bool{}
-	if syms, ids, err := heldPositionStateFor(userID); err == nil {
+	if syms, ids, err := heldPositionStateFor(userID, ctx); err == nil {
 		heldSymbols, heldPositionIDs = syms, ids
 	} else {
 		fail("持仓标的", err)
@@ -184,9 +205,32 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 	} else {
 		fail("持仓卖出风险评估", err)
 	}
+	projectedExit := map[int64]bool{}
+	for _, positionID := range positionIDs {
+		a, ok := latestExit[positionID]
+		if !ok || !a.ShouldTodo || (a.Level != model.PositionExitLevelReview && a.Level != model.PositionExitLevelUrgent) {
+			continue
+		}
+		priority, title := 1, "持仓卖出风险待复核"
+		if a.Level == model.PositionExitLevelUrgent {
+			priority, title = 0, "持仓卖出风险紧急"
+		}
+		at := a.EvaluatedAt
+		item := todoItemFromSource(res.Date, TodoItem{
+			Kind: TodoKindPositionExit, Scope: TodoScopeLedger, Priority: priority,
+			Symbol: a.Symbol, Market: a.Market, Name: a.Name,
+			Title: title, Detail: a.PrimaryReason + "。" + a.NextAction,
+			RefID: a.ID, RefType: "positions", Time: &at,
+		}, &a.PositionExitAssessment)
+		if a.AccountID > 0 {
+			item.DeepLink = fmt.Sprintf("/positions?position_id=%d&account_id=%d", a.PositionID, a.AccountID)
+		}
+		res.Items = append(res.Items, item)
+		projectedExit[positionID] = true
+	}
 
 	// 1) 未读的提醒命中事件（alert_events 状态机，标记已读/忽略即完成待办）。
-	if events, err := s.alert.TriggeredForUser(userID); err == nil {
+	if events, err := s.alert.TriggeredForUser(userID, ctx); err == nil {
 		for _, e := range events {
 			if isPositionAlertKind(e.Kind) {
 				if e.PositionID == 0 || !heldPositionIDs[e.PositionID] {
@@ -196,23 +240,22 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 				// 避免同仓双条。normal/watch 级统一事实没有替代出口，用户显式订阅的
 				// 规则命中（如 cost_gain）必须保留；unknown 是数据缺口，更不能反过
 				// 来把已确认的风险从待办里挤掉。
-				if a, assessed := latestExit[e.PositionID]; assessed &&
-					(a.Level == model.PositionExitLevelReview || a.Level == model.PositionExitLevelUrgent) {
+				if projectedExit[e.PositionID] {
 					continue
 				}
 			}
 			t := e.TriggeredAt
 			// 持仓卖出决策类（D14/D15）天生属于账本；其余按标的是否在持仓中分流。
 			sc := TodoScopeResearch
-			if heldSymbols[e.Symbol] {
+			if heldSymbols[QuoteKey(e.Market, e.Symbol)] {
 				sc = TodoScopeLedger
 			}
-			res.Items = append(res.Items, TodoItem{
+			res.Items = append(res.Items, todoItemFromSource(res.Date, TodoItem{
 				Kind: TodoKindAlert, Scope: sc, Priority: 1,
 				Symbol: e.Symbol, Market: e.Market, Name: e.Name,
 				Title: "条件提醒命中", Detail: e.Message,
 				RefID: e.ID, RefType: "alerts", DeepLink: alertEventDeepLink(e.ID), Time: &t,
-			})
+			}, &e))
 		}
 	} else {
 		fail("提醒命中", err)
@@ -222,7 +265,7 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 	// **scope=research**（D18）：AI 推过就追踪，用户没买也天天提示——这是旧待办的
 	// 噪音主体。数据不动，只是搬到推荐追踪页自己的区域去。
 	var statuses []model.RecommendationStatus
-	if err := common.DB.Where("user_id = ? AND review_needed = ? AND review_ack = ?", userID, true, false).
+	if err := common.DB.WithContext(ctx).Where("user_id = ? AND review_needed = ? AND review_ack = ?", userID, true, false).
 		Order("updated_at DESC").Find(&statuses).Error; err == nil {
 		// 追踪状态表不存名称；一次批量回查推荐条目补齐（否则待办里只显示代码）。
 		nameByRec := map[int64]string{}
@@ -232,10 +275,12 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 				recIDs = append(recIDs, st.RecommendationID)
 			}
 			var recs []model.Recommendation
-			if err := common.DB.Select("id", "name").Where("user_id = ? AND id IN ?", userID, recIDs).Find(&recs).Error; err == nil {
+			if err := common.DB.WithContext(ctx).Select("id", "name").Where("user_id = ? AND id IN ?", userID, recIDs).Find(&recs).Error; err == nil {
 				for _, r := range recs {
 					nameByRec[r.ID] = r.Name
 				}
+			} else {
+				fail("推荐名称", err)
 			}
 		}
 		for _, st := range statuses {
@@ -249,92 +294,79 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 			}
 			// RefID=追踪状态行 id，供前端「已读」就地消项（与 alert 条目 ref_id=事件 id 同款）；
 			// 跳转不依赖 ref_id（去处理仍整页跳推荐页）。
-			res.Items = append(res.Items, TodoItem{
+			res.Items = append(res.Items, todoItemFromSource(res.Date, TodoItem{
 				Kind: TodoKindRecReview, Scope: TodoScopeResearch, Priority: pri,
 				Symbol: st.Symbol, Market: st.Market, Name: orSymbol(nameByRec[st.RecommendationID], st.Symbol),
 				Title: title, Detail: recReviewDetail(st),
 				RefID: st.ID, RefType: "recommendations",
-			})
+			}, &st))
 		}
 	} else {
 		fail("推荐复盘", err)
 	}
 
 	// 3) 需复盘的持仓（短线超阈值 / 长线持有较久）+ 止损计划风控（最高优先级）。
-	if views, err := s.position.List(ctx, userID, model.PositionStatusHolding); err == nil {
-		for _, v := range views {
-			if a := v.ExitAssessment; a != nil && a.ShouldTodo &&
-				(a.Level == model.PositionExitLevelReview || a.Level == model.PositionExitLevelUrgent) {
-				priority, title := 1, "持仓卖出风险待复核"
-				if a.Level == model.PositionExitLevelUrgent {
-					priority, title = 0, "持仓卖出风险紧急"
-				}
-				t := a.EvaluatedAt
-				res.Items = append(res.Items, TodoItem{
-					Kind: TodoKindPositionExit, Scope: TodoScopeLedger, Priority: priority,
-					Symbol: v.Symbol, Market: v.Market, Name: v.Name,
-					Title: title, Detail: a.PrimaryReason + "。" + a.NextAction,
-					RefID: a.ID, RefType: "positions", DeepLink: fmt.Sprintf("/positions?position_id=%d", v.ID), Time: &t,
-				})
-			} else if v.ExitAssessment == nil {
+	if len(positionViews) > 0 {
+		for _, v := range positionViews {
+			if !heldPositionIDs[v.ID] {
+				continue
+			}
+			if _, assessed := latestExit[v.ID]; !assessed {
 				// 升级后的首次统一评估完成前保留旧止损入口；一旦存在 normal/watch/
 				// review/urgent/unknown 任一事实，Today 只消费统一事实。
 				switch {
 				case v.BelowStopLoss:
-					res.Items = append(res.Items, TodoItem{
+					res.Items = append(res.Items, todoItemFromSource(res.Date, TodoItem{
 						Kind: TodoKindStopLoss, Scope: TodoScopeLedger, Priority: 1,
 						Symbol: v.Symbol, Market: v.Market, Name: v.Name,
 						Title: "持仓已跌破计划止损", Detail: fmt.Sprintf("现价 %.2f 已低于计划止损 %.2f，按纪律应复核是否离场", v.CurrentPrice, v.PlanStopLoss),
 						RefID: v.ID, RefType: "positions",
-					})
+					}, &v.Position))
 				case v.NearStopLoss:
-					res.Items = append(res.Items, TodoItem{
+					res.Items = append(res.Items, todoItemFromSource(res.Date, TodoItem{
 						Kind: TodoKindStopLoss, Scope: TodoScopeLedger, Priority: 1,
 						Symbol: v.Symbol, Market: v.Market, Name: v.Name,
 						Title: "持仓接近计划止损", Detail: fmt.Sprintf("现价 %.2f 距计划止损 %.2f 不足 3%%，请提前想好应对", v.CurrentPrice, v.PlanStopLoss),
 						RefID: v.ID, RefType: "positions",
-					})
+					}, &v.Position))
 				}
 			}
 			switch {
 			case v.ShortTermReview:
-				res.Items = append(res.Items, TodoItem{
+				res.Items = append(res.Items, todoItemFromSource(res.Date, TodoItem{
 					Kind: TodoKindPositionShort, Scope: TodoScopeLedger, Priority: 2,
 					Symbol: v.Symbol, Market: v.Market, Name: v.Name,
 					Title:  "短线持仓需复盘",
 					Detail: "已持有 " + strconv.Itoa(v.HeldTradeDays) + " 交易日，建议复盘是否止盈/止损或转长线",
 					RefID:  v.ID, RefType: "positions",
-				})
+				}, &v.Position))
 			case v.PositionType == model.PositionTypeLongTerm && v.HeldTradeDays > longHoldReviewDays:
-				res.Items = append(res.Items, TodoItem{
+				res.Items = append(res.Items, todoItemFromSource(res.Date, TodoItem{
 					Kind: TodoKindPositionLong, Scope: TodoScopeLedger, Priority: 3,
 					Symbol: v.Symbol, Market: v.Market, Name: v.Name,
 					Title:  "长线持仓定期复盘",
 					Detail: "已持有 " + strconv.Itoa(v.HeldTradeDays) + " 交易日，建议检查长期逻辑是否仍成立",
 					RefID:  v.ID, RefType: "positions",
-				})
+				}, &v.Position))
 			}
 		}
-	} else {
-		// 止损信号来源于此块，读取失败必须留痕（静默吞错会让「破止损」待办凭空消失）。
-		fail("持仓", err)
 	}
 
 	// 4) 到期待复盘的投资逻辑卡。持仓标的的逻辑卡属账本，其余属研究跟踪。
 	if s.thesis != nil {
-		if cards, err := s.thesis.DueForUser(userID); err == nil {
+		if cards, err := s.thesis.DueForUser(userID, ctx); err == nil {
 			for _, c := range cards {
 				sc := TodoScopeResearch
-				if heldSymbols[c.Symbol] {
+				if heldSymbols[QuoteKey(c.Market, c.Symbol)] {
 					sc = TodoScopeLedger
 				}
-				res.Items = append(res.Items, TodoItem{
+				res.Items = append(res.Items, todoItemFromSource(res.Date, TodoItem{
 					Kind: TodoKindThesisDue, Scope: sc, Priority: 3,
 					Symbol: c.Symbol, Market: c.Market, Name: c.Name,
 					Title:  "投资逻辑卡到期复盘",
 					Detail: "计划复盘日 " + c.NextReviewDate + "，请检查核心逻辑与失效条件是否仍成立",
 					RefID:  c.ID, RefType: "thesis",
-				})
+				}, &c))
 			}
 		} else {
 			fail("逻辑卡", err)
@@ -344,10 +376,18 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 	// 5) 除权除息待确认折算（B8）：先按今日除权日生成建议（幂等），再把 pending 的列出来。
 	// 优先级 1——不确认的话持仓页显示的盈亏就是**错的数字**（10 转 10 后 -50%），
 	// 比「接近止损」更该立刻处理。
-	if _, err := GenerateCorpAdjusts(userID, res.Date); err != nil {
-		fail("除权除息调整", err)
-	}
-	if adjusts, err := ListCorpAdjusts(userID, model.CorpAdjustPending); err == nil {
+	for _, account := range accounts {
+		if _, err := GenerateCorpAdjustsForAccountContext(ctx, userID, account.ID, res.Date); err != nil {
+			fail("除权除息调整", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		adjusts, err := ListCorpAdjustsForAccountContext(ctx, userID, account.ID, model.CorpAdjustPending)
+		if err != nil {
+			fail("除权除息调整", err)
+			continue
+		}
 		for _, a := range adjusts {
 			detail := fmt.Sprintf("%s 除权除息（%s）：数量 %g → %g 股，成本 %.4f → %.4f 元",
 				a.ExDate, orSymbol(a.PlanProfile, "方案详见公告"),
@@ -355,23 +395,28 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 			if a.CashDividend > 0 {
 				detail += fmt.Sprintf("，现金分红 %.2f 元（税前）", a.CashDividend)
 			}
-			res.Items = append(res.Items, TodoItem{
+			title := "除权除息待确认折算"
+			var at *time.Time
+			if a.Status == model.CorpAdjustReverted {
+				title, detail = "公司行动折算已撤销", "账本折算已撤销，请回到持仓页重新确认或忽略"
+				updated := a.UpdatedAt
+				at = &updated
+			}
+			res.Items = append(res.Items, todoItemFromSource(res.Date, TodoItem{
 				Kind: TodoKindCorpAdjust, Scope: TodoScopeLedger, Priority: 1,
 				Symbol: a.Symbol, Market: a.Market, Name: orSymbol(a.Name, a.Symbol),
-				Title:  "除权除息待确认折算",
+				Title:  title,
 				Detail: detail,
-				RefID:  a.ID, RefType: "positions",
-			})
+				RefID:  a.ID, RefType: "positions", Time: at,
+			}, &a))
 		}
-	} else {
-		fail("除权除息调整", err)
 	}
 
 	// 6) 今日打新（B9）：**不依赖持仓**，全市场公开信息，人人可见。
 	// scope=market（D18）——它是机会不是我的账本；默认范围不显示，
 	// 但 Today 页的事件日历卡仍照常列出打新，信息一条不丢。
 	var subs []model.IpoSubscription
-	if err := common.DB.Where("apply_date = ?", res.Date).Order("kind, code").Find(&subs).Error; err == nil {
+	if err := common.DB.WithContext(ctx).Where("apply_date = ?", res.Date).Order("kind, code").Find(&subs).Error; err == nil {
 		for _, sub := range subs {
 			label := "新股"
 			extra := sub.Board
@@ -392,13 +437,13 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 			} else {
 				extra = appendSep(extra, "发行价待定")
 			}
-			res.Items = append(res.Items, TodoItem{
+			res.Items = append(res.Items, todoItemFromSource(res.Date, TodoItem{
 				Kind: TodoKindIpo, Scope: TodoScopeMarket, Priority: 2,
 				Symbol: sub.ApplyCode, Market: "cn", Name: sub.Name,
 				Title:  "今日可申购" + label,
 				Detail: fmt.Sprintf("申购代码 %s，%s", sub.ApplyCode, extra),
 				RefID:  sub.ID, RefType: "ipo",
-			})
+			}, &sub))
 		}
 	} else {
 		fail("打新日历", err)
@@ -407,10 +452,9 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 	// 旧 SellReview 的投影只在统一事实已生成本仓卖出待办（review/urgent，会把
 	// review 作为证据纳入）时抑制；normal/watch/unknown 下旧 review 仍需自己的
 	// 出口，数据缺口不能挤掉已确认的利空事件。
-	if reviews, err := ListSellReviews(userID, model.SellReviewStatusOpen); err == nil {
+	if reviews, err := ListSellReviewsContext(ctx, userID, model.SellReviewStatusOpen); err == nil {
 		for _, r := range reviews {
-			if a, assessed := latestExit[r.PositionID]; assessed &&
-				(a.Level == model.PositionExitLevelReview || a.Level == model.PositionExitLevelUrgent) {
+			if projectedExit[r.PositionID] {
 				continue
 			}
 			priority := 2
@@ -418,12 +462,12 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 				priority = 1
 			}
 			t := r.CreatedAt
-			res.Items = append(res.Items, TodoItem{
+			res.Items = append(res.Items, todoItemFromSource(res.Date, TodoItem{
 				Kind: TodoKindSellReview, Scope: TodoScopeLedger, Priority: priority,
 				Symbol: r.Symbol, Market: r.Market, Name: r.Name,
 				Title: "卖出复核 · " + r.Title, Detail: r.Detail,
 				RefID: r.ID, RefType: "positions", Time: &t,
-			})
+			}, &r))
 		}
 	} else {
 		fail("卖出复核", err)
@@ -468,11 +512,24 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 	res.Items = kept
 	res.Total = len(kept)
 	res.Filtered = len(all) - len(kept)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return res, nil
 }
 
+func todoActiveRealAccounts(ctx context.Context, userID int64) ([]model.PortfolioAccount, error) {
+	if _, err := ResolvePortfolioAccountContext(ctx, userID, 0, model.PortfolioKindReal); err != nil {
+		return nil, err
+	}
+	var accounts []model.PortfolioAccount
+	err := common.DB.WithContext(ctx).Where("user_id = ? AND kind = ? AND status = ?", userID, model.PortfolioKindReal, model.PortfolioStatusActive).
+		Order("id").Find(&accounts).Error
+	return accounts, err
+}
+
 // heldPositionStateFor 返回用户当前持仓的标的与持仓 ID 集合。
-func heldPositionStateFor(userID int64) (map[string]bool, map[int64]bool, error) {
+func heldPositionStateFor(userID int64, contexts ...context.Context) (map[string]bool, map[int64]bool, error) {
 	symbols := map[string]bool{}
 	ids := map[int64]bool{}
 	if common.DB == nil {
@@ -481,14 +538,15 @@ func heldPositionStateFor(userID int64) (map[string]bool, map[int64]bool, error)
 	var rows []struct {
 		ID     int64
 		Symbol string
+		Market string
 	}
-	if err := common.DB.Model(&model.Position{}).
+	if err := common.DB.WithContext(jobSubmissionContext(contexts...)).Model(&model.Position{}).Scopes(withActivePositionAccount).
 		Where("user_id = ? AND status = ?", userID, model.PositionStatusHolding).
-		Select("id, symbol").Find(&rows).Error; err != nil {
+		Select("id, symbol, market").Find(&rows).Error; err != nil {
 		return symbols, ids, err
 	}
 	for _, row := range rows {
-		symbols[row.Symbol] = true
+		symbols[QuoteKey(row.Market, row.Symbol)] = true
 		ids[row.ID] = true
 	}
 	return symbols, ids, nil

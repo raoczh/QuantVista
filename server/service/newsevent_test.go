@@ -123,7 +123,10 @@ func TestBuildTodayEventsExcludesFutureRecords(t *testing.T) {
 	if err := common.DB.Create(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
-	events := buildTodayEventsAt("2026-07-21", now)
+	events, err := buildTodayEventsAt("2026-07-21", now)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(events) != 1 || events[0].Title != rows[0].Title {
 		t.Fatalf("日报事件窗口不得包含当前时刻之后的记录: %+v", events)
 	}

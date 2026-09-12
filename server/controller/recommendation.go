@@ -2,6 +2,7 @@ package controller
 
 import (
 	"errors"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -24,13 +25,22 @@ func NewRecommendationController(svc *service.RecommendationService, tracking *s
 	return &RecommendationController{svc: svc, tracking: tracking, alerts: alerts}
 }
 
+func recommendationAPIError(c *gin.Context, err error) {
+	message := publicWorkflowError(err, "请求处理失败，请稍后重试")
+	if message != err.Error() {
+		common.ApiErrorMsg(c, message)
+		return
+	}
+	common.ApiError(c, err)
+}
+
 // Strategies GET /api/recommendations/strategies?type=short_term|long_term
 // 返回内置推荐策略 + 选股页全部策略（内置选股策略/新手模板/本人自建策略）。
 func (rc *RecommendationController) Strategies(c *gin.Context) {
 	recType := c.DefaultQuery("type", model.RecTypeShortTerm)
 	list, err := service.StrategiesForUser(currentUserID(c), recType)
 	if err != nil {
-		common.ApiError(c, err)
+		recommendationAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, list)
@@ -45,22 +55,27 @@ func (rc *RecommendationController) DiscoveryStatus(c *gin.Context) {
 			limit = n
 		}
 	}
-	run, items, err := service.LatestDiscoveryStatus(limit)
+	run, items, err := service.LatestDiscoveryStatus(limit, c.Request.Context())
 	if err != nil {
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			common.ApiError(c, err)
+			recommendationAPIError(c, err)
 			return
 		}
 		// 首次部署尚未发布发现运行时仍返回可渲染的空状态，避免被误显示为“空池”。
 		common.ApiSuccess(c, gin.H{"scope": "global", "market": "cn", "status": "unavailable", "reason": "尚未发布全市场发现运行", "run": nil, "items": []any{}, "channels": service.DiscoveryChannelKeys()})
 		return
 	}
-	common.ApiSuccess(c, gin.H{"scope": "global", "market": "cn", "status": run.Status, "run": run, "items": items, "channels": service.DiscoveryChannelKeys()})
+	view := *run
+	if view.Error != "" {
+		view.Error = publicWorkflowError(errors.New(view.Error), "候选发现执行失败，请稍后重试")
+	}
+	common.ApiSuccess(c, gin.H{"scope": "global", "market": "cn", "status": view.Status, "run": view, "items": items, "channels": service.DiscoveryChannelKeys()})
 }
 
 // Generate POST /api/recommendations —— 生成一批推荐。
 func (rc *RecommendationController) Generate(c *gin.Context) {
 	var req service.RecommendRequest
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
@@ -68,7 +83,7 @@ func (rc *RecommendationController) Generate(c *gin.Context) {
 	allowPrivate := currentRole(c) == model.RoleAdmin
 	v, err := rc.svc.Generate(c.Request.Context(), currentUserID(c), allowPrivate, req)
 	if err != nil {
-		common.ApiError(c, err)
+		recommendationAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, v)
@@ -83,9 +98,9 @@ func (rc *RecommendationController) List(c *gin.Context) {
 			limit = n
 		}
 	}
-	rows, err := rc.svc.History(currentUserID(c), recType, limit)
+	rows, err := rc.svc.HistoryContext(c.Request.Context(), currentUserID(c), recType, limit)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		recommendationAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, rows)
@@ -97,9 +112,9 @@ func (rc *RecommendationController) Get(c *gin.Context) {
 	if !ok {
 		return
 	}
-	v, err := rc.svc.Get(currentUserID(c), id)
+	v, err := rc.svc.GetContext(c.Request.Context(), currentUserID(c), id)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		recommendationAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, v)
@@ -114,9 +129,9 @@ func (rc *RecommendationController) LinkCandidates(c *gin.Context) {
 		common.ApiErrorMsg(c, "请提供股票代码")
 		return
 	}
-	list, err := rc.svc.RecommendationLinkCandidates(currentUserID(c), symbol, c.Query("market"))
+	list, err := rc.svc.RecommendationLinkCandidatesContext(c.Request.Context(), currentUserID(c), symbol, c.Query("market"))
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		recommendationAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, list)
@@ -128,8 +143,8 @@ func (rc *RecommendationController) Delete(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := rc.svc.Delete(currentUserID(c), id); err != nil {
-		common.ApiErrorMsg(c, err.Error())
+	if err := rc.svc.DeleteContext(c.Request.Context(), currentUserID(c), id); err != nil {
+		recommendationAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, gin.H{"ok": true})
@@ -142,8 +157,8 @@ func (rc *RecommendationController) AckReview(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := rc.tracking.AckReview(currentUserID(c), id); err != nil {
-		common.ApiErrorMsg(c, err.Error())
+	if err := rc.tracking.AckReviewContext(c.Request.Context(), currentUserID(c), id); err != nil {
+		recommendationAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, gin.H{"ok": true})
@@ -151,9 +166,9 @@ func (rc *RecommendationController) AckReview(c *gin.Context) {
 
 // Performance GET /api/recommendations/performance?type= —— 推荐历史表现统计（带样本量）。
 func (rc *RecommendationController) Performance(c *gin.Context) {
-	stats, err := rc.tracking.Performance(currentUserID(c), c.Query("type"))
+	stats, err := rc.tracking.PerformanceContext(c.Request.Context(), currentUserID(c), c.Query("type"))
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		recommendationAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, stats)
@@ -170,7 +185,7 @@ func (rc *RecommendationController) Attribution(c *gin.Context) {
 	}
 	rep, err := service.RecAttribution(currentUserID(c), c.Query("type"), horizon)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		recommendationAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, rep)
@@ -187,7 +202,7 @@ func (rc *RecommendationController) ShadowReport(c *gin.Context) {
 	}
 	rep, err := service.RecShadowReport(currentUserID(c), c.Query("type"), horizon)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		recommendationAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, rep)
@@ -211,7 +226,7 @@ func (rc *RecommendationController) RecallReport(c *gin.Context) {
 	}
 	rep, err := rc.svc.RecRecallReport(c.Request.Context(), currentUserID(c), c.Query("type"), horizon, k)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		recommendationAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, rep)
@@ -226,9 +241,9 @@ func (rc *RecommendationController) DailyAuditReport(c *gin.Context) {
 			limit = n
 		}
 	}
-	rep, err := service.LoadCandidateAuditUserReport(currentUserID(c), c.Query("type"), limit)
+	rep, err := service.LoadCandidateAuditUserReport(currentUserID(c), c.Query("type"), limit, c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		recommendationAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, rep)
@@ -243,7 +258,7 @@ func (rc *RecommendationController) StopLossAlert(c *gin.Context) {
 	}
 	rule, err := rc.svc.CreateStopLossAlert(c.Request.Context(), currentUserID(c), id, rc.alerts)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		recommendationAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, rule)
@@ -257,12 +272,12 @@ func (rc *RecommendationController) Track(c *gin.Context) {
 	}
 	uid := currentUserID(c)
 	if _, err := rc.tracking.RefreshBatch(c.Request.Context(), uid, id); err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		recommendationAPIError(c, err)
 		return
 	}
-	v, err := rc.svc.Get(uid, id)
+	v, err := rc.svc.GetContext(c.Request.Context(), uid, id)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		recommendationAPIError(c, err)
 		return
 	}
 	common.ApiSuccess(c, v)

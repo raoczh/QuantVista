@@ -188,6 +188,8 @@ type PositionCorpAdjust struct {
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// ContextVersion 仅随读取生成，绑定用户已看到的方案与账面；普通刷新时间不改变它。
+	ContextVersion string `gorm:"-" json:"context_version,omitempty"`
 }
 
 // PaperCorpAdjust 模拟盘除权除息自动调整审计（B8）。

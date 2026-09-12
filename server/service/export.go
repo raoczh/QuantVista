@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"quantvista/common"
 	"quantvista/model"
@@ -34,34 +36,51 @@ const (
 
 // Export 按 kind 导出当前用户数据，返回（CSV 字节、建议文件名）。
 func (s *ExportService) Export(userID int64, kind string) ([]byte, string, error) {
+	return s.ExportContext(context.Background(), userID, kind)
+}
+
+func (s *ExportService) ExportContext(ctx context.Context, userID int64, kind string) ([]byte, string, error) {
 	accountID := int64(0)
 	if kind == "positions" {
-		account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
+		account, err := ResolvePortfolioAccountContext(ctx, userID, 0, model.PortfolioKindReal)
 		if err != nil {
 			return nil, "", err
 		}
 		accountID = account.ID
 	}
-	return s.ExportByAccount(userID, accountID, kind)
+	return s.ExportByAccountContext(ctx, userID, accountID, kind)
 }
 
 func (s *ExportService) ExportByAccount(userID, accountID int64, kind string) ([]byte, string, error) {
-	var rows [][]string
-	var err error
-	switch kind {
-	case "positions":
-		if _, err = PortfolioAccountByID(userID, accountID, model.PortfolioKindReal); err == nil {
-			rows, err = s.positionRows(userID, accountID)
-		}
-	case "watchlist":
-		rows, err = s.watchlistRows(userID)
-	case "recommendations":
-		rows, err = s.recommendationRows(userID)
-	case "analyses":
-		rows, err = s.analysisRows(userID)
-	default:
+	return s.ExportByAccountContext(context.Background(), userID, accountID, kind)
+}
+
+func (s *ExportService) ExportByAccountContext(ctx context.Context, userID, accountID int64, kind string) ([]byte, string, error) {
+	if kind != "positions" && kind != "watchlist" && kind != "recommendations" && kind != "analyses" {
 		return nil, "", errors.New("不支持的导出类型")
 	}
+	if common.DB == nil {
+		return nil, "", errors.New("数据库不可用")
+	}
+	var rows [][]string
+	err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		switch kind {
+		case "positions":
+			if _, err = portfolioAccountByIDDB(tx, userID, accountID, model.PortfolioKindReal); err == nil {
+				rows, err = s.positionRows(tx, userID, accountID)
+			}
+		case "watchlist":
+			rows, err = s.watchlistRows(tx, userID)
+		case "recommendations":
+			rows, err = s.recommendationRows(tx, userID)
+		case "analyses":
+			rows, err = s.analysisRows(tx, userID)
+		default:
+			return errors.New("不支持的导出类型")
+		}
+		return err
+	})
 	if err != nil {
 		return nil, "", err
 	}
@@ -108,10 +127,17 @@ func f2(v float64) string {
 	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
-func (s *ExportService) positionRows(userID, accountID int64) ([][]string, error) {
+func exportRowLimitError() error {
+	return fmt.Errorf("单次最多导出 %d 条，当前数据已超过上限，未生成不完整文件", exportMaxRows)
+}
+
+func (s *ExportService) positionRows(db *gorm.DB, userID, accountID int64) ([][]string, error) {
 	var ps []model.Position
-	if err := common.DB.Where("user_id = ? AND account_id = ?", userID, accountID).Order("id ASC").Limit(exportMaxRows).Find(&ps).Error; err != nil {
+	if err := db.Where("user_id = ? AND account_id = ?", userID, accountID).Order("id ASC").Limit(exportMaxRows + 1).Find(&ps).Error; err != nil {
 		return nil, err
+	}
+	if len(ps) > exportMaxRows {
+		return nil, exportRowLimitError()
 	}
 	rows := [][]string{{
 		"id", "symbol", "market", "name", "type", "status", "currency",
@@ -136,9 +162,9 @@ func (s *ExportService) positionRows(userID, accountID int64) ([][]string, error
 	return rows, nil
 }
 
-func (s *ExportService) watchlistRows(userID int64) ([][]string, error) {
+func (s *ExportService) watchlistRows(db *gorm.DB, userID int64) ([][]string, error) {
 	var lists []model.Watchlist
-	if err := common.DB.Where("user_id = ?", userID).Find(&lists).Error; err != nil {
+	if err := db.Where("user_id = ?", userID).Find(&lists).Error; err != nil {
 		return nil, err
 	}
 	groupName := make(map[int64]string, len(lists))
@@ -146,8 +172,11 @@ func (s *ExportService) watchlistRows(userID int64) ([][]string, error) {
 		groupName[l.ID] = l.Name
 	}
 	var items []model.WatchlistItem
-	if err := common.DB.Where("user_id = ?", userID).Order("id ASC").Limit(exportMaxRows).Find(&items).Error; err != nil {
+	if err := db.Where("user_id = ?", userID).Order("id ASC").Limit(exportMaxRows + 1).Find(&items).Error; err != nil {
 		return nil, err
+	}
+	if len(items) > exportMaxRows {
+		return nil, exportRowLimitError()
 	}
 	rows := [][]string{{
 		"group", "symbol", "market", "name", "is_pinned", "research_stage",
@@ -163,9 +192,9 @@ func (s *ExportService) watchlistRows(userID int64) ([][]string, error) {
 	return rows, nil
 }
 
-func (s *ExportService) recommendationRows(userID int64) ([][]string, error) {
+func (s *ExportService) recommendationRows(db *gorm.DB, userID int64) ([][]string, error) {
 	var batches []model.RecommendationBatch
-	if err := common.DB.Where("user_id = ?", userID).Find(&batches).Error; err != nil {
+	if err := db.Where("user_id = ?", userID).Find(&batches).Error; err != nil {
 		return nil, err
 	}
 	batchOf := make(map[int64]model.RecommendationBatch, len(batches))
@@ -173,8 +202,11 @@ func (s *ExportService) recommendationRows(userID int64) ([][]string, error) {
 		batchOf[b.ID] = b
 	}
 	var recs []model.Recommendation
-	if err := common.DB.Where("user_id = ?", userID).Order("id ASC").Limit(exportMaxRows).Find(&recs).Error; err != nil {
+	if err := db.Where("user_id = ?", userID).Order("id ASC").Limit(exportMaxRows + 1).Find(&recs).Error; err != nil {
 		return nil, err
+	}
+	if len(recs) > exportMaxRows {
+		return nil, exportRowLimitError()
 	}
 	rows := [][]string{{
 		"batch_id", "batch_type", "strategy", "market", "symbol", "name",
@@ -191,13 +223,16 @@ func (s *ExportService) recommendationRows(userID int64) ([][]string, error) {
 	return rows, nil
 }
 
-func (s *ExportService) analysisRows(userID int64) ([][]string, error) {
+func (s *ExportService) analysisRows(db *gorm.DB, userID int64) ([][]string, error) {
 	var recs []model.AnalysisRecord
-	if err := common.DB.Where("user_id = ?", userID).
+	if err := db.Where("user_id = ?", userID).
 		Select("id", "module", "mode", "market", "symbol", "target", "title", "status",
 			"rating", "confidence", "summary", "prompt_version", "model", "total_tokens", "created_at").
-		Order("id ASC").Limit(exportMaxRows).Find(&recs).Error; err != nil {
+		Order("id ASC").Limit(exportMaxRows + 1).Find(&recs).Error; err != nil {
 		return nil, err
+	}
+	if len(recs) > exportMaxRows {
+		return nil, exportRowLimitError()
 	}
 	rows := [][]string{{
 		"id", "module", "mode", "market", "symbol", "target", "title", "status",
@@ -233,18 +268,40 @@ var PositionImportTemplate = []string{"symbol", "market", "type", "buy_price", "
 // ImportPositions 从 CSV 导入持仓。逐行校验，坏行跳过并报告，好行全部入库。
 // 不逐行打行情源取名（500 行会打爆免费源），name 记 symbol、由列表页行情富化展示。
 func (s *ExportService) ImportPositions(userID int64, r io.Reader) (*ImportResult, error) {
-	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
+	return s.ImportPositionsContext(context.Background(), userID, r)
+}
+
+func (s *ExportService) ImportPositionsContext(ctx context.Context, userID int64, r io.Reader) (*ImportResult, error) {
+	account, err := ResolvePortfolioAccountContext(ctx, userID, 0, model.PortfolioKindReal)
 	if err != nil {
 		return nil, err
 	}
-	return s.ImportPositionsByAccount(userID, account.ID, r)
+	return s.ImportPositionsByAccountContext(ctx, userID, account.ID, r)
 }
 
 func (s *ExportService) ImportPositionsByAccount(userID, accountID int64, r io.Reader) (*ImportResult, error) {
-	if _, err := ActivePortfolioAccountByID(userID, accountID, model.PortfolioKindReal); err != nil {
+	return s.ImportPositionsByAccountContext(context.Background(), userID, accountID, r)
+}
+
+func (s *ExportService) ImportPositionsByAccountContext(ctx context.Context, userID, accountID int64, r io.Reader) (*ImportResult, error) {
+	db := common.DB.WithContext(ctx)
+	if _, err := activePortfolioAccountByIDDB(db, userID, accountID, model.PortfolioKindReal); err != nil {
 		return nil, err
 	}
-	reader := csv.NewReader(io.LimitReader(r, importMaxSize))
+	body, err := io.ReadAll(io.LimitReader(r, importMaxSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("读取 CSV 失败: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(body) > importMaxSize {
+		return nil, errors.New("CSV 文件超过 1MiB 上限，请分批导入")
+	}
+	if !utf8.Valid(body) || bytes.IndexByte(body, 0) >= 0 {
+		return nil, errors.New("CSV 必须使用 UTF-8 或 UTF-8 BOM 编码")
+	}
+	reader := csv.NewReader(bytes.NewReader(body))
 	reader.FieldsPerRecord = -1 // 行内列数自适应，逐行校验
 	reader.TrimLeadingSpace = true
 
@@ -257,7 +314,14 @@ func (s *ExportService) ImportPositionsByAccount(userID, accountID int64, r io.R
 	}
 	col := map[string]int{}
 	for i, h := range header {
-		col[strings.ToLower(strings.TrimSpace(h))] = i
+		name := strings.ToLower(strings.TrimSpace(h))
+		if name == "" {
+			continue
+		}
+		if _, exists := col[name]; exists {
+			return nil, fmt.Errorf("CSV 表头包含重复列 %s，无法确定采用哪一列", name)
+		}
+		col[name] = i
 	}
 	for _, need := range []string{"symbol", "buy_price", "buy_date", "quantity"} {
 		if _, ok := col[need]; !ok {
@@ -282,19 +346,29 @@ func (s *ExportService) ImportPositionsByAccount(userID, accountID int64, r io.R
 
 	res := &ImportResult{Failed: []ImportRowError{}}
 	var pending []model.Position
-	line := 1
+	records := 0
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		rec, rerr := reader.Read()
 		if rerr == io.EOF {
 			break
 		}
-		line++
+		records++
+		if records > importMaxRows {
+			return nil, fmt.Errorf("超出单次导入上限 %d 行，请分批导入", importMaxRows)
+		}
+		line := records + 1
 		if rerr != nil {
+			if parseErr, ok := rerr.(*csv.ParseError); ok {
+				line = parseErr.StartLine
+			}
 			res.Failed = append(res.Failed, ImportRowError{Row: line, Error: "CSV 解析失败：" + rerr.Error()})
 			continue
 		}
-		if len(pending)+1 > importMaxRows {
-			return nil, fmt.Errorf("超出单次导入上限 %d 行，请分批导入", importMaxRows)
+		if len(rec) > 0 {
+			line, _ = reader.FieldPos(0)
 		}
 		p, perr := parseImportRow(userID, accountID, rec, get)
 		if perr != nil {
@@ -308,7 +382,10 @@ func (s *ExportService) ImportPositionsByAccount(userID, accountID int64, r io.R
 	}
 	// 导入的持仓同样要有账本首笔 buy 流水（B5），否则「导入的仓位没有流水」会在
 	// 加减仓时才惰性补，且导入当下的汇总列为空。整批同事务：要么全成要么全不成。
-	if err := common.DB.Transaction(func(tx *gorm.DB) error {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := lockActivePortfolioAccount(tx, userID, accountID, model.PortfolioKindReal); err != nil {
+			return err
+		}
 		if err := tx.CreateInBatches(pending, 100).Error; err != nil {
 			return err
 		}
@@ -321,9 +398,18 @@ func (s *ExportService) ImportPositionsByAccount(userID, accountID int64, r io.R
 				Note: "CSV 导入建仓", AvgCostAfter: pending[i].BuyPrice, QuantityAfter: pending[i].Quantity,
 			})
 		}
-		return tx.CreateInBatches(trades, 100).Error
+		if err := tx.CreateInBatches(trades, 100).Error; err != nil {
+			return err
+		}
+		earliest := pending[0].BuyDate
+		for _, p := range pending[1:] {
+			if p.BuyDate < earliest {
+				earliest = p.BuyDate
+			}
+		}
+		return invalidatePortfolioSnapshotsTx(tx, userID, accountID, earliest)
 	}); err != nil {
-		return nil, err
+		return nil, errors.Join(err, ctx.Err())
 	}
 	res.Imported = len(pending)
 	return res, nil
@@ -367,6 +453,12 @@ func parseImportRow(userID, accountID int64, rec []string, get func([]string, st
 			return nil, errors.New("buy_tax 须为非负数")
 		}
 	}
+	in := PositionInput{BuyPrice: buyPrice, BuyDate: buyDate, Quantity: qty, BuyFee: fee, BuyTax: tax, PositionType: ptype}
+	if err := validateBuy(&in); err != nil {
+		return nil, err
+	}
+	buyPrice, qty, fee, tax = in.BuyPrice, in.Quantity, in.BuyFee, in.BuyTax
+	peak, peakFrom := peakInitFor(buyPrice, buyDate, time.Now().Format("2006-01-02"))
 	return &model.Position{
 		UserID: userID, AccountID: accountID, Symbol: symbol, Market: market, Name: symbol,
 		PositionType: ptype, Status: model.PositionStatusHolding,
@@ -376,6 +468,7 @@ func parseImportRow(userID, accountID int64, rec []string, get func([]string, st
 		// B5 账本汇总初值（与首笔 buy 流水同源）。
 		TotalBuyCost: round4(buyPrice*qty + fee + tax), TotalBuyQty: qty,
 		RemainingCost: round4(buyPrice*qty + fee + tax),
+		PeakPrice:     peak, PeakDate: peakFrom, PeakFrom: peakFrom,
 	}, nil
 }
 

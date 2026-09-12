@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -28,6 +28,8 @@ import SectionCard from '@/components/SectionCard.vue'
 import StockPicker from '@/components/StockPicker.vue'
 import StockIdentity from '@/components/StockIdentity.vue'
 import type { StockRef } from '@/composables/useStockActions'
+import { isAbortError } from '@/api/client'
+import { formatPrice } from '@/lib/formatPrice'
 
 const message = useMessage()
 const route = useRoute()
@@ -38,6 +40,9 @@ const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 // ---------- 列表 ----------
 const cards = ref<ThesisCard[]>([])
 const loading = ref(false)
+const loadError = ref('')
+let loadSeq = 0
+let disposed = false
 const statusFilter = ref<'active' | 'invalidated' | 'archived' | ''>('active')
 const statusOptions = [
   { label: '跟踪中', value: 'active' },
@@ -47,34 +52,65 @@ const statusOptions = [
 ]
 
 async function load() {
+  const seq = ++loadSeq
+  invalidateCheckup()
   loading.value = true
+  loadError.value = ''
+  cards.value = []
   try {
-    cards.value = await listThesisCards(statusFilter.value)
+    const rows = await listThesisCards(statusFilter.value)
+    if (!disposed && seq === loadSeq) cards.value = rows
   } catch (e) {
-    message.error((e as Error).message)
+    if (!disposed && seq === loadSeq) loadError.value = (e as Error).message
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 
 // ---------- 体检 ----------
 const checking = ref(false)
 const checkResults = ref<ThesisCheckItem[] | null>(null)
-const checkBySymbol = computed(() => {
-  const m = new Map<string, ThesisCheckItem>()
-  checkResults.value?.forEach((it) => m.set(it.card.symbol + ':' + it.card.market, it))
+let checkSeq = 0
+let checkController: AbortController | null = null
+function invalidateCheckup() {
+  checkSeq++
+  checkController?.abort()
+  checkController = null
+  checkResults.value = null
+  checking.value = false
+}
+const checkById = computed(() => {
+  const m = new Map<number, ThesisCheckItem>()
+  const current = new Map(cards.value.map(card => [card.id, card]))
+  checkResults.value?.forEach((it) => {
+    const card = current.get(it.card.id)
+    if (card?.status === 'active' && card.updated_at === it.card.updated_at) m.set(card.id, it)
+  })
   return m
 })
+function checksFor(card: ThesisCard) {
+  const result = checkById.value.get(card.id)
+  return result ? [result] : []
+}
 async function runCheckup() {
+  if (checking.value || saving.value || loading.value || mutating.value.size) return
+  const seq = ++checkSeq
+  const controller = new AbortController()
+  checkController = controller
   checking.value = true
   try {
-    checkResults.value = await checkupThesisCards()
-    const warn = checkResults.value.filter((r) => r.signals.length).length
+    const result = await checkupThesisCards(controller.signal)
+    if (disposed || seq !== checkSeq) return
+    checkResults.value = result
+    const warn = result.filter((r) => r.signals.length).length
     message.success(warn ? `体检完成：${warn} 张卡需要注意` : '体检完成：暂无需要注意的信号')
   } catch (e) {
-    message.error((e as Error).message)
+    if (!disposed && seq === checkSeq && !isAbortError(e)) message.error((e as Error).message)
   } finally {
-    checking.value = false
+    if (seq === checkSeq) {
+      checking.value = false
+      checkController = null
+    }
   }
 }
 
@@ -102,6 +138,7 @@ function resetForm() {
   selectedStock.value = null
 }
 function editCard(c: ThesisCard) {
+  if (saving.value || mutating.value.has(c.id)) return
   selectedStock.value = { symbol: c.symbol, market: c.market, name: c.name || '' }
   form.value = {
     symbol: c.symbol,
@@ -116,7 +153,14 @@ function editCard(c: ThesisCard) {
   showForm.value = true
 }
 
+function toggleForm() {
+  if (saving.value) return
+  showForm.value = !showForm.value
+  if (showForm.value) resetForm()
+}
+
 async function submit() {
+  if (saving.value) return
   if (!form.value.symbol.trim()) {
     message.warning('请先搜索并选择股票')
     return
@@ -126,6 +170,7 @@ async function submit() {
     return
   }
   saving.value = true
+  invalidateCheckup()
   try {
     const d = form.value.next_review_ts
     await upsertThesisCard({
@@ -138,12 +183,13 @@ async function submit() {
       track_metrics: form.value.track_metrics,
       next_review_date: d ? localDate(d) : '',
     })
-    message.success('逻辑卡已保存')
+    if (disposed) return
+    message.success('逻辑卡已保存，状态为跟踪中')
     showForm.value = false
     resetForm()
     await load()
   } catch (e) {
-    message.error((e as Error).message)
+    if (!disposed) message.error((e as Error).message)
   } finally {
     saving.value = false
   }
@@ -152,24 +198,48 @@ async function submit() {
 // ---------- 状态操作 ----------
 const invalidatingId = ref<number | null>(null)
 const invalidReason = ref('')
+const mutating = ref(new Set<number>())
+function toggleInvalidating(c: ThesisCard) {
+  if (saving.value || mutating.value.has(c.id)) return
+  invalidatingId.value = invalidatingId.value === c.id ? null : c.id
+  invalidReason.value = ''
+}
 async function doSetStatus(c: ThesisCard, status: string, reason = '') {
+  if (saving.value || mutating.value.has(c.id)) return
+  mutating.value.add(c.id)
+  invalidateCheckup()
   try {
     await setThesisStatus(c.id, status, reason)
+    if (disposed) return
     message.success('状态已更新')
-    invalidatingId.value = null
-    invalidReason.value = ''
+    if (invalidatingId.value === c.id) {
+      invalidatingId.value = null
+      invalidReason.value = ''
+    }
     await load()
   } catch (e) {
-    message.error((e as Error).message)
+    if (!disposed) message.error((e as Error).message)
+  } finally {
+    mutating.value.delete(c.id)
   }
 }
 async function doDelete(c: ThesisCard) {
+  if (saving.value || mutating.value.has(c.id)) return
+  mutating.value.add(c.id)
+  invalidateCheckup()
   try {
     await deleteThesisCard(c.id)
+    if (disposed) return
+    if (form.value.symbol === c.symbol && form.value.market === c.market) {
+      showForm.value = false
+      resetForm()
+    }
     message.success('已删除')
     await load()
   } catch (e) {
-    message.error((e as Error).message)
+    if (!disposed) message.error((e as Error).message)
+  } finally {
+    mutating.value.delete(c.id)
   }
 }
 
@@ -186,9 +256,11 @@ function localDate(d: string | number | Date): string {
   const dd = String(dt.getDate()).padStart(2, '0')
   return `${y}-${mm}-${dd}`
 }
-const today = localDate(new Date())
+const today = ref(localDate(new Date()))
+let reviewDayTimer: ReturnType<typeof setInterval> | undefined
+function refreshReviewDay() { today.value = localDate(new Date()) }
 function isDue(c: ThesisCard) {
-  return c.status === 'active' && !!c.next_review_date && c.next_review_date <= today
+  return c.status === 'active' && !!c.next_review_date && c.next_review_date <= today.value
 }
 const statusTag: Record<string, { label: string; type: 'success' | 'error' | 'default' }> = {
   active: { label: '跟踪中', type: 'success' },
@@ -196,18 +268,35 @@ const statusTag: Record<string, { label: string; type: 'success' | 'error' | 'de
   archived: { label: '已归档', type: 'default' },
 }
 
-onMounted(() => {
-  load()
+function applyStockActionQuery() {
+  if (saving.value) return
   // 深链预填：/thesis?add=1&symbol=&market=（自选/持仓行内入口）
   if (route.query.add === '1' && route.query.symbol) {
+    resetForm()
     updateSelectedStock({
       symbol: String(route.query.symbol),
       market: String(route.query.market || 'cn'),
       name: String(route.query.name || ''),
     })
     showForm.value = true
-    router.replace({ query: {} })
+    const query = { ...route.query }
+    for (const key of ['symbol', 'market', 'name', 'add', '_stock_action']) delete query[key]
+    void router.replace({ query })
   }
+}
+watch(() => [route.query._stock_action, route.query.symbol, route.query.market, route.query.add, saving.value], applyStockActionQuery)
+onMounted(() => {
+  void load()
+  applyStockActionQuery()
+  reviewDayTimer = setInterval(refreshReviewDay, 60_000)
+  document.addEventListener('visibilitychange', refreshReviewDay)
+})
+onUnmounted(() => {
+  disposed = true
+  loadSeq++
+  invalidateCheckup()
+  if (reviewDayTimer) clearInterval(reviewDayTimer)
+  document.removeEventListener('visibilitychange', refreshReviewDay)
 })
 </script>
 
@@ -217,9 +306,9 @@ onMounted(() => {
       <SectionCard title="逻辑卡">
         <template #extra>
           <div class="toolbar">
-            <n-select v-model:value="statusFilter" :options="statusOptions" size="small" style="width: 110px" @update:value="load" />
-            <n-button size="small" secondary :loading="checking" @click="runCheckup">一键体检</n-button>
-            <n-button size="small" type="primary" @click="showForm = !showForm; if (showForm) resetForm()">
+            <n-select v-model:value="statusFilter" :disabled="saving" :options="statusOptions" size="small" style="width: 110px" @update:value="load" />
+            <n-button size="small" secondary :loading="checking" :disabled="loading || saving || !!mutating.size" @click="runCheckup">一键体检</n-button>
+            <n-button size="small" type="primary" :disabled="saving" @click="toggleForm">
               {{ showForm ? '收起表单' : '＋ 新建逻辑卡' }}
             </n-button>
           </div>
@@ -228,21 +317,23 @@ onMounted(() => {
         <!-- 新建/编辑表单 -->
         <div v-if="showForm" class="form">
           <div class="form-row">
-            <StockPicker :model-value="selectedStock" class="thesis-stock-picker" @update:model-value="updateSelectedStock" />
-            <n-date-picker v-model:value="form.next_review_ts" type="date" placeholder="下次复盘日期（可选）" clearable style="max-width: 200px" />
+            <StockPicker :model-value="selectedStock" :disabled="saving" class="thesis-stock-picker" @update:model-value="updateSelectedStock" />
+            <n-date-picker v-model:value="form.next_review_ts" :disabled="saving" type="date" placeholder="下次复盘日期（可选）" clearable style="max-width: 200px" />
           </div>
-          <n-input v-model:value="form.thesis" type="textarea" :rows="2" placeholder="核心逻辑（必填）：为什么值得关注/持有？一句到三句说清" />
-          <n-input v-model:value="form.key_evidence" type="textarea" :rows="2" placeholder="关键证据（可选，一行一条）：支撑逻辑的事实或数据" />
-          <n-input v-model:value="form.risks" type="textarea" :rows="2" placeholder="主要风险（可选，一行一条）" />
-          <n-input v-model:value="form.kill_switches" type="textarea" :rows="2" placeholder="失效条件（强烈建议填写，一行一条）：出现什么情况说明逻辑不成立，应复盘或放弃" />
-          <n-input v-model:value="form.track_metrics" type="textarea" :rows="1" placeholder="跟踪指标（可选，一行一条）：需要持续验证的数据点" />
+          <n-input v-model:value="form.thesis" :disabled="saving" type="textarea" :rows="2" placeholder="核心逻辑（必填）：为什么值得关注/持有？一句到三句说清" />
+          <n-input v-model:value="form.key_evidence" :disabled="saving" type="textarea" :rows="2" placeholder="关键证据（可选，一行一条）：支撑逻辑的事实或数据" />
+          <n-input v-model:value="form.risks" :disabled="saving" type="textarea" :rows="2" placeholder="主要风险（可选，一行一条）" />
+          <n-input v-model:value="form.kill_switches" :disabled="saving" type="textarea" :rows="2" placeholder="失效条件（强烈建议填写，一行一条）：出现什么情况说明逻辑不成立，应复盘或放弃" />
+          <n-input v-model:value="form.track_metrics" :disabled="saving" type="textarea" :rows="1" placeholder="跟踪指标（可选，一行一条）：需要持续验证的数据点" />
           <div class="form-actions">
             <n-button type="primary" :loading="saving" @click="submit">保存（同标的自动覆盖）</n-button>
           </div>
         </div>
 
         <n-spin :show="loading">
-          <n-empty v-if="!cards.length" description="还没有逻辑卡——从自选或持仓页的「逻辑卡」入口为标的建立第一张" />
+          <n-alert v-if="loadError" type="warning">{{ loadError }}</n-alert>
+          <div v-else-if="loading && !cards.length">正在加载逻辑卡…</div>
+          <n-empty v-else-if="!cards.length" description="当前筛选下没有逻辑卡" />
           <div v-else class="cards">
             <div v-for="c in cards" :key="c.id" class="card" :class="{ due: isDue(c) }">
               <div class="card-head">
@@ -254,15 +345,15 @@ onMounted(() => {
                   <n-tag v-if="isDue(c)" size="tiny" type="warning" :bordered="false" round>复盘日已到</n-tag>
                 </div>
                 <div class="card-ops">
-                  <n-button size="tiny" quaternary @click="editCard(c)">编辑</n-button>
-                  <n-button v-if="c.status === 'active'" size="tiny" quaternary type="warning" @click="invalidatingId = invalidatingId === c.id ? null : c.id">
+                  <n-button size="tiny" quaternary :disabled="saving || mutating.has(c.id)" @click="editCard(c)">编辑</n-button>
+                  <n-button v-if="c.status === 'active'" size="tiny" quaternary type="warning" :disabled="saving || mutating.has(c.id)" @click="toggleInvalidating(c)">
                     置失效
                   </n-button>
-                  <n-button v-if="c.status === 'active'" size="tiny" quaternary @click="doSetStatus(c, 'archived')">归档</n-button>
-                  <n-button v-if="c.status !== 'active'" size="tiny" quaternary type="info" @click="doSetStatus(c, 'active')">恢复</n-button>
+                  <n-button v-if="c.status === 'active'" size="tiny" quaternary :disabled="saving || mutating.has(c.id)" @click="doSetStatus(c, 'archived')">归档</n-button>
+                  <n-button v-if="c.status !== 'active'" size="tiny" quaternary type="info" :disabled="saving || mutating.has(c.id)" @click="doSetStatus(c, 'active')">恢复</n-button>
                   <n-popconfirm @positive-click="doDelete(c)">
                     <template #trigger>
-                      <n-button size="tiny" quaternary type="error">删除</n-button>
+                      <n-button size="tiny" quaternary type="error" :disabled="saving || mutating.has(c.id)">删除</n-button>
                     </template>
                     确认删除这张逻辑卡？
                   </n-popconfirm>
@@ -271,8 +362,8 @@ onMounted(() => {
 
               <!-- 置失效原因输入 -->
               <div v-if="invalidatingId === c.id" class="invalid-input">
-                <n-input v-model:value="invalidReason" size="small" placeholder="失效原因（如：核心假设被财报证伪）" />
-                <n-button size="small" type="warning" @click="doSetStatus(c, 'invalidated', invalidReason)">确认失效</n-button>
+                <n-input v-model:value="invalidReason" :disabled="saving || mutating.has(c.id)" :maxlength="255" size="small" placeholder="失效原因（如：核心假设被财报证伪）" />
+                <n-button size="small" type="warning" :loading="mutating.has(c.id)" :disabled="saving" @click="doSetStatus(c, 'invalidated', invalidReason)">确认失效</n-button>
               </div>
 
               <p class="thesis-text">{{ c.thesis }}</p>
@@ -299,21 +390,24 @@ onMounted(() => {
               </div>
 
               <!-- 体检结果富化 -->
-              <div v-if="checkBySymbol.get(c.symbol + ':' + c.market)" class="check">
-                <template v-if="checkBySymbol.get(c.symbol + ':' + c.market)!.quote_ok">
+              <div v-for="check in checksFor(c)" :key="check.card.id" class="check">
+                <template v-if="check.quote_ok">
                   <span class="check-quote qv-tnum">
-                    现价 {{ checkBySymbol.get(c.symbol + ':' + c.market)!.price.toFixed(2) }}
-                    <span :style="{ color: pctColor(checkBySymbol.get(c.symbol + ':' + c.market)!.change_pct) }">
-                      {{ checkBySymbol.get(c.symbol + ':' + c.market)!.change_pct.toFixed(2) }}%
-                    </span>
-                    · 近20日
-                    <span :style="{ color: pctColor(checkBySymbol.get(c.symbol + ':' + c.market)!.change_pct_20d) }">
-                      {{ checkBySymbol.get(c.symbol + ':' + c.market)!.change_pct_20d.toFixed(2) }}%
+                    现价 {{ formatPrice(check.price) }}
+                    <span :style="{ color: pctColor(check.change_pct) }">
+                      {{ check.change_pct.toFixed(2) }}%
                     </span>
                   </span>
                 </template>
+                <span v-else-if="check.last_price" class="check-quote qv-tnum">最近已知价 {{ formatPrice(check.last_price) }}（截至 {{ check.quote_as_of || '未知' }}）</span>
+                <span class="check-quote qv-tnum">
+                  近20日
+                  <span v-if="check.change_pct_20d != null" :style="{ color: pctColor(check.change_pct_20d) }">{{ check.change_pct_20d.toFixed(2) }}%</span>
+                  <span v-else>—</span>
+                  <span v-if="check.bars_as_of"> · 日线截至 {{ check.bars_as_of }}</span>
+                </span>
                 <n-alert
-                  v-for="(sig, i) in checkBySymbol.get(c.symbol + ':' + c.market)!.signals"
+                  v-for="(sig, i) in check.signals"
                   :key="i"
                   type="warning"
                   :bordered="false"

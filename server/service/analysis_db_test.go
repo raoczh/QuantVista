@@ -1,9 +1,12 @@
 package service
 
 import (
+	"context"
+	"database/sql"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"quantvista/common"
 	"quantvista/model"
@@ -16,6 +19,9 @@ var (
 	sharedTestDB     *gorm.DB
 	sharedTestDBErr  error
 	sharedTestDBOnce sync.Once
+	// 保留到测试进程结束。取消事务可能丢弃连接，不能让最后一个池连接关闭时
+	// 连同内存库一起销毁，导致后续用例误报整库缺表。
+	sharedTestDBAnchor *sql.Conn
 	// lastPreparedTest 上一次清库时所属的顶层测试名。共享内存库要在「每个测试函数
 	// 开始时」清空，而不是「每次 setupTestDB 调用时」——有 7 处用例在 t.Run 子测试里
 	// 再次调用 setupTestDB，逐次清理会把父测试刚建好的数据抹掉。
@@ -34,16 +40,53 @@ func setupTestDB(t *testing.T) {
 	sharedTestDBOnce.Do(func() {
 		sharedTestDB, sharedTestDBErr = gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
 		if sharedTestDBErr == nil {
-			sharedTestDBErr = sharedTestDB.AutoMigrate(model.AllModels()...)
+			var sqlDB *sql.DB
+			sqlDB, sharedTestDBErr = sharedTestDB.DB()
+			if sharedTestDBErr == nil {
+				sharedTestDBAnchor, sharedTestDBErr = sqlDB.Conn(context.Background())
+			}
+			if sharedTestDBErr == nil {
+				sharedTestDBErr = sharedTestDB.AutoMigrate(model.AllModels()...)
+			}
 		}
 	})
 	if sharedTestDBErr != nil {
 		t.Fatalf("初始化共享内存库失败: %v", sharedTestDBErr)
 	}
-	common.DB = sharedTestDB
 	if root := rootTestName(t.Name()); root != lastPreparedTest {
+		waitForTestFactorRebuilds(t)
+		common.DB = sharedTestDB
+		resetFactorTable()
 		truncateAllTestTables(t)
 		lastPreparedTest = root
+		t.Cleanup(func() {
+			// 同步入口可能排队异步构建。必须等它收尾后才允许下个用例清库或切换 DB。
+			waitForTestFactorRebuilds(t)
+			lastPreparedTest = ""
+		})
+	} else {
+		common.DB = sharedTestDB
+	}
+}
+
+func waitForTestFactorRebuilds(t *testing.T) {
+	t.Helper()
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		factorAsyncMu.Lock()
+		running := factorAsyncRunning
+		factorAsyncMu.Unlock()
+		if !running {
+			return
+		}
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			t.Fatal("上一用例的异步因子构建未收尾，不能继续复用测试数据库")
+		}
 	}
 }
 
@@ -154,8 +197,14 @@ func TestConsumeQuota(t *testing.T) {
 	if q.ActionUsed != 0 || q.TokenUsed != 0 || q.RequestCount != 0 {
 		t.Fatalf("新配额应为 0: %+v", q)
 	}
-	consumeQuota(7, 120, true) // 用户手动动作
-	consumeQuota(7, 30, false) // 后台任务：只记 token 不扣次
+	ctx, finish, err := beginManualQuotaAction(t.Context(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noteManualQuotaResponse(ctx, &chatResult{Usage: chatUsage{TotalTokens: 120}})
+	consumeQuota(7, 120)
+	finish()
+	consumeQuota(7, 30) // 后台任务：只记 token 不扣次
 	q2, _ := getUserQuota(7)
 	if q2.TokenUsed != 150 || q2.RequestCount != 2 {
 		t.Fatalf("token 审计累计错误: used=%d req=%d", q2.TokenUsed, q2.RequestCount)

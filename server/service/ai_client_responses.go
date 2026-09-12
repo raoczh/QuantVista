@@ -512,7 +512,9 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 
 	var sb strings.Builder
 	var reasoningBuilder strings.Builder
+	var rawText strings.Builder
 	thinkFilter := thinkStreamFilter{}
+	outputBytes := 0
 	var usage chatUsage
 	var firstChunkMs int64
 	doneStatus := ""       // 终态事件 response 对象实际携带的 status；不得由事件名推断
@@ -531,6 +533,30 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 		return &chatResult{Content: sb.String() + visibleTail,
 			ReasoningContent: joinReasoningContent(reasoningBuilder.String(), reasoningTail), Usage: partialUsage,
 			LatencyMs: time.Since(start).Milliseconds(), FirstChunkMs: firstChunkMs, FinishReason: doneStatus}
+	}
+	appendText := func(delta string) error {
+		if err := takeStreamOutputBytes(&outputBytes, len(delta)); err != nil {
+			return err
+		}
+		rawText.WriteString(delta)
+		visible, embeddedReasoning := thinkFilter.Push(delta)
+		sb.WriteString(visible)
+		reasoningBuilder.WriteString(embeddedReasoning)
+		if onDelta != nil && visible != "" {
+			onDelta(visible)
+		}
+		return nil
+	}
+	appendFinalReasoning := func(output []responsesOutputItem) error {
+		if reasoningBuilder.Len() != 0 {
+			return nil
+		}
+		reasoning := extractResponsesReasoning(output)
+		if err := takeStreamOutputBytes(&outputBytes, len(reasoning)); err != nil {
+			return err
+		}
+		reasoningBuilder.WriteString(reasoning)
+		return nil
 	}
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -585,14 +611,14 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 		switch ev.Type {
 		case "response.output_text.delta":
 			if ev.Delta != "" {
-				visible, embeddedReasoning := thinkFilter.Push(ev.Delta)
-				sb.WriteString(visible)
-				reasoningBuilder.WriteString(embeddedReasoning)
-				if onDelta != nil && visible != "" {
-					onDelta(visible)
+				if err := appendText(ev.Delta); err != nil {
+					return partialResult(), err
 				}
 			}
 		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+			if err := takeStreamOutputBytes(&outputBytes, len(ev.Delta)); err != nil {
+				return partialResult(), err
+			}
 			reasoningBuilder.WriteString(ev.Delta)
 		case "response.refusal.delta", "response.refusal.done":
 			if contractEnabled {
@@ -610,8 +636,8 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 			if ev.Response != nil {
 				// 先记录事实（status/usage）再做拒收判定：拒收路径的审计结果也要带真实终态。
 				doneStatus = ev.Response.Status
-				if reasoningBuilder.Len() == 0 {
-					reasoningBuilder.WriteString(extractResponsesReasoning(ev.Response.Output))
+				if err := appendFinalReasoning(ev.Response.Output); err != nil {
+					return partialResult(), err
 				}
 				if contractEnabled {
 					if uerr := upstreamLLMError(ev.Response.Error); uerr != nil {
@@ -630,6 +656,22 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 					}
 					return partialResult(), refusalErr(RefusalLLMContentFiltered, "模型拒绝生成该内容："+refusal)
 				}
+				if full := extractResponsesText(ev.Response.Output); full != "" {
+					if strings.HasPrefix(full, rawText.String()) {
+						// 兼容只有结束事件、或结束事件补齐尾部的网关；增量不得重复发送。
+						if err := appendText(full[rawText.Len():]); err != nil {
+							return partialResult(), err
+						}
+					} else {
+						currentVisible, _ := splitThinkContent(rawText.String())
+						finalVisible, _ := splitThinkContent(full)
+						if currentVisible != finalVisible {
+							if rerr := streamProtocolReject(contractEnabled, "Responses 增量与完整输出冲突"); rerr != nil {
+								return partialResult(), rerr
+							}
+						}
+					}
+				}
 			}
 			if !contractEnabled {
 				// 兼容旧路径：历史实现仅凭事件名即视为 completed。
@@ -640,8 +682,8 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 			terminalEvent = ev.Type
 			if ev.Response != nil {
 				doneStatus = ev.Response.Status
-				if reasoningBuilder.Len() == 0 {
-					reasoningBuilder.WriteString(extractResponsesReasoning(ev.Response.Output))
+				if err := appendFinalReasoning(ev.Response.Output); err != nil {
+					return partialResult(), err
 				}
 				if ev.Response.IncompleteDetails != nil {
 					incompleteReason = ev.Response.IncompleteDetails.Reason
@@ -705,6 +747,9 @@ func responsesCompletionStream(ctx context.Context, p chatParams, onDelta func(s
 	visibleTail, reasoningTail := thinkFilter.Flush()
 	sb.WriteString(visibleTail)
 	reasoningBuilder.WriteString(reasoningTail)
+	if onDelta != nil && visibleTail != "" {
+		onDelta(visibleTail)
+	}
 	content := sb.String()
 	if strings.TrimSpace(content) == "" {
 		return partialResult(), errors.New("LLM 返回空内容")

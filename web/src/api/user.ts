@@ -39,8 +39,10 @@ export function getPreference() {
   return request<UserPreference>({ url: '/user/preference' })
 }
 
-// 后端 PUT 强校验完整偏好对象（缺字段按零值覆盖），必须传整对象而非部分补丁。
-export function updatePreference(p: UserPreference) {
+export type UserPreferenceUpdate = Partial<Omit<UserPreference, 'id' | 'user_id'>>
+
+// 仅提交本次修改的字段；服务端锁内合并，未提交字段保留最新值。
+export function updatePreference(p: UserPreferenceUpdate) {
   return request<UserPreference>({ url: '/user/preference', method: 'put', data: p })
 }
 

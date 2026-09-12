@@ -11,6 +11,7 @@ type UserQuota struct {
 	UserID       int64     `gorm:"primaryKey" json:"user_id"`
 	ActionLimit  int64     `gorm:"default:0" json:"action_limit"`  // 次数上限，0 表示不限
 	ActionUsed   int64     `gorm:"default:0" json:"action_used"`   // 已用次数（仅用户手动动作）
+	ActionEpoch  int64     `gorm:"not null;default:0" json:"-"`    // 管理员重置代次，旧请求不能冲减新周期用量。
 	TokenUsed    int64     `gorm:"default:0" json:"token_used"`    // 累计 token（审计参考）
 	RequestCount int64     `gorm:"default:0" json:"request_count"` // LLM 调用轮次（审计参考）
 	UpdatedAt    time.Time `json:"updated_at"`

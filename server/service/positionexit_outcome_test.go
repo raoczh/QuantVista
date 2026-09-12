@@ -23,9 +23,9 @@ func TestPositionExitOutcomeBackfillMaturityIdempotencyAndReport(t *testing.T) {
 	// 共享内存库：残留的评估行会触发 Todo 抑制逻辑，干扰后续测试，结束时清场。
 	t.Cleanup(cleanTables)
 	now := time.Now()
-	// 12 个连续交易日：T=第 1 根（2044-06-01），其后 11 根，5/10 日窗口均可成熟。
-	dates := []string{"2044-06-01", "2044-06-02", "2044-06-03", "2044-06-06", "2044-06-07",
-		"2044-06-08", "2044-06-09", "2044-06-10", "2044-06-13", "2044-06-14", "2044-06-15", "2044-06-16"}
+	// 12 个连续交易日：T=第 1 根（2025-06-01），其后 11 根，5/10 日窗口均可成熟。
+	dates := []string{"2025-06-01", "2025-06-02", "2025-06-03", "2025-06-06", "2025-06-07",
+		"2025-06-08", "2025-06-09", "2025-06-10", "2025-06-13", "2025-06-14", "2025-06-15", "2025-06-16"}
 	for i, d := range dates {
 		price := 10.0 + float64(i)*0.1
 		if err := common.DB.Create(&model.DailyBar{Symbol: "600900", Market: "cn", TradeDate: d,
@@ -110,7 +110,7 @@ func TestPositionExitOutcomeBackfillSkipsImmatureBatchAndUsesSuspensionAnchor(t 
 	for i := range blocked {
 		blocked[i] = model.PositionExitAssessment{
 			UserID: 2, PositionID: int64(2000 + i), Symbol: "NO_BARS", Market: "cn",
-			TradeDate: "2044-01-01", Session: model.PositionExitSessionClose, EvaluatedAt: time.Now(),
+			TradeDate: "2025-01-01", Session: model.PositionExitSessionClose, EvaluatedAt: time.Now(),
 			Level: model.PositionExitLevelNormal, PrimarySignal: "normal", ParamsHash: "ph1",
 			DataStatus: model.PositionExitDataReady, EventKey: "blocked-" + time.Unix(int64(i), 0).Format("150405.000000000"), Version: model.PositionExitAssessmentVersion,
 		}
@@ -118,7 +118,7 @@ func TestPositionExitOutcomeBackfillSkipsImmatureBatchAndUsesSuspensionAnchor(t 
 	if err := common.DB.CreateInBatches(&blocked, 100).Error; err != nil {
 		t.Fatal(err)
 	}
-	dates := []string{"2044-05-31", "2044-06-03", "2044-06-04", "2044-06-05", "2044-06-06", "2044-06-07", "2044-06-10", "2044-06-11", "2044-06-12", "2044-06-13", "2044-06-14"}
+	dates := []string{"2025-05-31", "2025-06-03", "2025-06-04", "2025-06-05", "2025-06-06", "2025-06-07", "2025-06-10", "2025-06-11", "2025-06-12", "2025-06-13", "2025-06-14"}
 	for i, date := range dates {
 		price := 20 + float64(i)
 		if err := common.DB.Create(&model.DailyBar{Symbol: "600901", Market: "cn", TradeDate: date, Open: price, High: price, Low: price, Close: price}).Error; err != nil {
@@ -127,7 +127,7 @@ func TestPositionExitOutcomeBackfillSkipsImmatureBatchAndUsesSuspensionAnchor(t 
 	}
 	mature := model.PositionExitAssessment{
 		UserID: 2, PositionID: 9999, Symbol: "600901", Market: "cn",
-		TradeDate: "2044-06-01", Session: model.PositionExitSessionClose, EvaluatedAt: time.Now(),
+		TradeDate: "2025-06-01", Session: model.PositionExitSessionClose, EvaluatedAt: time.Now(),
 		Level: model.PositionExitLevelReview, PrimarySignal: "ma20_break", ParamsHash: "ph2",
 		DataStatus: model.PositionExitDataReady, EventKey: "mature-after-blocked", Version: model.PositionExitAssessmentVersion,
 	}
@@ -154,8 +154,8 @@ func TestPositionExitOutcomeReportSeparatesParameterHashes(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = common.DB.Exec("DELETE FROM position_exit_outcomes").Error })
 	rows := []model.PositionExitOutcome{
-		{AssessmentID: 10001, Horizon: 5, UserID: 1, PositionID: 1, Symbol: "600001", Market: "cn", TradeDate: "2044-01-01", Level: model.PositionExitLevelReview, PrimarySignal: "ma20_break", ParamsHash: "ph1", ForwardReturnPct: -2},
-		{AssessmentID: 10002, Horizon: 5, UserID: 1, PositionID: 2, Symbol: "600002", Market: "cn", TradeDate: "2044-01-01", Level: model.PositionExitLevelReview, PrimarySignal: "ma20_break", ParamsHash: "ph2", ForwardReturnPct: 4},
+		{AssessmentID: 10001, Horizon: 5, UserID: 1, PositionID: 1, Symbol: "600001", Market: "cn", TradeDate: "2025-01-01", Level: model.PositionExitLevelReview, PrimarySignal: "ma20_break", ParamsHash: "ph1", ForwardReturnPct: -2},
+		{AssessmentID: 10002, Horizon: 5, UserID: 1, PositionID: 2, Symbol: "600002", Market: "cn", TradeDate: "2025-01-01", Level: model.PositionExitLevelReview, PrimarySignal: "ma20_break", ParamsHash: "ph2", ForwardReturnPct: 4},
 	}
 	if err := common.DB.Create(&rows).Error; err != nil {
 		t.Fatal(err)

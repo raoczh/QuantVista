@@ -101,6 +101,9 @@ func (m *Manager) beginProbe(ctx context.Context, key string) (func(), error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	m.probeMu.Lock()
 	if m.probeBusy == nil {
 		m.probeBusy = make(map[string]struct{})
@@ -338,9 +341,12 @@ func (m *Manager) Probe(ctx context.Context, source, capability, market string) 
 	result.SampleCount = 1
 	started := time.Now()
 	err = probeCall(pctx, a, spec)
+	if contextErr := pctx.Err(); contextErr != nil {
+		err = contextErr // 适配器包装错误不能丢失探测超时/用户取消的真实原因。
+	}
 	result.LatencyMs = time.Since(started).Milliseconds()
 	result.Code, result.Outcome = probeCode(err)
-	if m.health != nil {
+	if m.health != nil && ctx.Err() == nil {
 		if err == nil {
 			m.health.RecordForMarket(source, capability, market, outcomeSuccess, result.LatencyMs)
 		} else if errors.Is(err, ErrNoData) {

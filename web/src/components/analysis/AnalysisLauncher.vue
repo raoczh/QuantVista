@@ -32,7 +32,7 @@ const needMarket = computed(() => ['stock', 'market', 'sector'].includes(form.va
 const needTarget = computed(() => form.value.module === 'sector')
 const scopeExplanation = computed(() => ({
   stock: '只分析下方选中的一只股票；名称、代码和市场会一起确认。',
-  position: '分析当前账号全部持有中的仓位，不会按相同代码猜测某一笔持仓，也不会修改持仓。',
+  position: '分析默认真实账户的当前持仓，并参考该账户的平仓记录。',
   watchlist: '分析当前账号的自选组合，不读取其他用户数据。',
   market: '分析 A 股整体市场，不针对单只股票。',
   sector: '分析所填板块；板块名称为空时按全市场板块概览处理。',
@@ -79,7 +79,7 @@ function dateDisabled(ts: number) {
         <n-switch v-model:value="panelMode" />
         <span class="switch-help">技术 / 动量 / 风控 / 反方四个独立视角</span>
       </n-form-item>
-      <n-form-item v-if="!(form.module === 'stock' && panelMode)" label="AI 复核">
+      <n-form-item v-if="!(form.module === 'stock' && panelMode && !asOf)" label="AI 复核">
         <n-switch v-model:value="verifyMode" />
         <span class="switch-help">独立复核员只挑错，不改写程序风险等级或任务状态</span>
       </n-form-item>

@@ -120,6 +120,9 @@ func routeCap[T any](m *Manager, ctx context.Context, market, capability string,
 			lastErr = err
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return zero, err
+	}
 	if lastErr == nil {
 		lastErr = ErrNoData
 	}
@@ -135,6 +138,10 @@ func attemptSource[T any](m *Manager, ctx context.Context, market, capability st
 	start := time.Now()
 	r, err := call(sctx, a)
 	latency := time.Since(start).Milliseconds()
+	// 调用方取消或总预算用尽不代表数据源故障，不能污染共享健康滑窗。
+	if parentErr := ctx.Err(); parentErr != nil {
+		return zero, false, parentErr
+	}
 	if err == nil {
 		m.health.RecordForMarket(a.Name(), capability, market, outcomeSuccess, latency)
 		return r, true, nil
@@ -233,6 +240,9 @@ func (m *Manager) GetQuoteFresh(ctx context.Context, market, symbol string, acce
 			lastErr = err
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	if best != nil {
 		return best, false, nil
 	}
@@ -251,7 +261,7 @@ func (m *Manager) GetQuote(ctx context.Context, market, symbol string) (*Quote, 
 		}
 		return q, qerr
 	})
-	if err != nil && !errors.Is(err, ErrSymbolInvalid) {
+	if err != nil && !errors.Is(err, ErrSymbolInvalid) && !errors.Is(err, context.Canceled) {
 		common.SysWarn("所有数据源取行情失败 symbol=%s: %v", symbol, err)
 	}
 	return q, err
@@ -274,7 +284,7 @@ func (m *Manager) GetDailyBars(ctx context.Context, market, symbol string, limit
 		}
 		return bs, berr
 	})
-	if err != nil && !errors.Is(err, ErrSymbolInvalid) {
+	if err != nil && !errors.Is(err, ErrSymbolInvalid) && !errors.Is(err, context.Canceled) {
 		common.SysWarn("所有数据源取日线失败 symbol=%s: %v", symbol, err)
 	}
 	return bars, err

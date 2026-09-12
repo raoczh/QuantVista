@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"quantvista/common"
+	"quantvista/model"
 )
 
 func validLLMConfigInput() LLMConfigInput {
@@ -54,6 +55,9 @@ func TestLLMConfigCRUDPersistsLargeMaxTokens(t *testing.T) {
 	in := validLLMConfigInput()
 	in.APIKey = "sk-test"
 	in.MaxTokens = 1_000_000
+	if err := common.DB.Create(&model.User{ID: 101, Username: "llm-max-tokens"}).Error; err != nil {
+		t.Fatal(err)
+	}
 	created, err := svc.Create(101, in)
 	if err != nil {
 		t.Fatalf("创建配置失败: %v", err)

@@ -99,19 +99,19 @@ func (r *heartbeatCancelRecorder) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (s *taskCenterJobsStub) GetJob(userID, id int64) (*service.JobRunView, error) {
+func (s *taskCenterJobsStub) GetJob(userID, id int64, contexts ...context.Context) (*service.JobRunView, error) {
 	return &service.JobRunView{ID: id, Kind: service.JobKindQA, Status: model.JobStatusRunning}, nil
 }
 
-func (s *taskCenterJobsStub) CancelJob(userID, id int64) (*service.JobRunView, error) {
+func (s *taskCenterJobsStub) CancelJob(userID, id int64, contexts ...context.Context) (*service.JobRunView, error) {
 	return &service.JobRunView{ID: id, Kind: service.JobKindQA, Status: model.JobStatusCanceled}, nil
 }
 
-func (s *taskCenterJobsStub) RetryJob(userID, id int64) (*service.JobRunView, error) {
+func (s *taskCenterJobsStub) RetryJob(userID, id int64, contexts ...context.Context) (*service.JobRunView, error) {
 	return &service.JobRunView{ID: id + 1, ParentID: &id, Kind: service.JobKindQA, Status: model.JobStatusQueued}, nil
 }
 
-func (s *taskCenterJobsStub) Events(userID, afterID, limit int64) ([]service.JobEventView, error) {
+func (s *taskCenterJobsStub) Events(userID, afterID, limit int64, contexts ...context.Context) ([]service.JobEventView, error) {
 	s.afterIDs = append(s.afterIDs, afterID)
 	rows := make([]service.JobEventView, 0, len(s.events))
 	for _, event := range s.events {
@@ -124,11 +124,14 @@ func (s *taskCenterJobsStub) Events(userID, afterID, limit int64) ([]service.Job
 
 func TestTaskCenterEventStreamResumesAndHeartbeats(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	db := reviewControllerDB(t, &model.User{})
+	token := reviewStreamToken(t, db)
 	stub := &taskCenterJobsStub{events: []service.JobEventView{{
 		ID: 9, JobRunID: 3, Type: "status", Status: model.JobStatusSuccess, CreatedAt: time.Now(),
 	}}}
 	base := httptest.NewRequest("GET", "/api/tasks/events", nil)
 	base.Header.Set("Last-Event-ID", "8")
+	base.Header.Set("Authorization", "Bearer "+token)
 	ctx, cancel := context.WithTimeout(base.Context(), time.Second)
 	defer cancel()
 	w := &heartbeatCancelRecorder{ResponseRecorder: httptest.NewRecorder(), cancel: cancel}

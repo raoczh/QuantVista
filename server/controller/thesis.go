@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"net/http"
 	"strings"
 
 	"quantvista/common"
@@ -26,17 +27,17 @@ func (tc *ThesisController) List(c *gin.Context) {
 		if market == "" {
 			market = "cn"
 		}
-		card, err := tc.svc.GetBySymbol(currentUserID(c), symbol, market)
+		card, err := tc.svc.GetBySymbol(currentUserID(c), symbol, market, c.Request.Context())
 		if err != nil {
-			common.ApiErrorMsg(c, err.Error())
+			common.ApiErrorMsg(c, publicWorkflowError(err, "逻辑卡请求失败，请稍后重试"))
 			return
 		}
 		common.ApiSuccess(c, card)
 		return
 	}
-	rows, err := tc.svc.List(currentUserID(c), c.Query("status"))
+	rows, err := tc.svc.List(currentUserID(c), c.Query("status"), c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "逻辑卡请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, rows)
@@ -44,6 +45,7 @@ func (tc *ThesisController) List(c *gin.Context) {
 
 // Upsert POST /api/thesis-cards —— 按 symbol+market 唯一，存在即更新。
 func (tc *ThesisController) Upsert(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
 	var in service.ThesisUpsertRequest
 	if err := c.ShouldBindJSON(&in); err != nil {
 		common.ApiErrorMsg(c, "请求格式错误")
@@ -51,7 +53,7 @@ func (tc *ThesisController) Upsert(c *gin.Context) {
 	}
 	card, err := tc.svc.Upsert(c.Request.Context(), currentUserID(c), in)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "逻辑卡请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, card)
@@ -63,6 +65,7 @@ func (tc *ThesisController) SetStatus(c *gin.Context) {
 	if !ok {
 		return
 	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
 	var body struct {
 		Status string `json:"status"`
 		Reason string `json:"reason"`
@@ -71,9 +74,9 @@ func (tc *ThesisController) SetStatus(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	card, err := tc.svc.SetStatus(currentUserID(c), id, body.Status, body.Reason)
+	card, err := tc.svc.SetStatus(currentUserID(c), id, body.Status, body.Reason, c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "逻辑卡请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, card)
@@ -85,8 +88,8 @@ func (tc *ThesisController) Delete(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := tc.svc.Delete(currentUserID(c), id); err != nil {
-		common.ApiErrorMsg(c, err.Error())
+	if err := tc.svc.Delete(currentUserID(c), id, c.Request.Context()); err != nil {
+		common.ApiErrorMsg(c, publicWorkflowError(err, "逻辑卡请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, gin.H{"deleted": true})
@@ -96,7 +99,7 @@ func (tc *ThesisController) Delete(c *gin.Context) {
 func (tc *ThesisController) CheckUp(c *gin.Context) {
 	items, err := tc.svc.CheckUp(c.Request.Context(), currentUserID(c))
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "逻辑卡请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, items)

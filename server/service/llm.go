@@ -20,6 +20,7 @@ import (
 	"quantvista/setting"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type LLMService struct{}
@@ -53,6 +54,7 @@ type LLMConfigInput struct {
 // llmProbeTarget 一次连接/能力探测的目标参数。探测链路（连通 → JSON 结构化 smoke →
 // 思考档位）共用同一组参数且已达 9 项，收拢成结构体避免长签名（llmCallTarget 同款做法）。
 type llmProbeTarget struct {
+	ctx             context.Context
 	UserID          int64
 	ConfigID        int64
 	Provider        string
@@ -141,9 +143,9 @@ func toView(cfg model.LLMConfig) LLMConfigView {
 }
 
 // List 列出用户的 LLM 配置。
-func (s *LLMService) List(userID int64) ([]LLMConfigView, error) {
+func (s *LLMService) List(userID int64, contexts ...context.Context) ([]LLMConfigView, error) {
 	var rows []model.LLMConfig
-	if err := common.DB.Where("user_id = ?", userID).Order("id asc").Find(&rows).Error; err != nil {
+	if err := common.DB.WithContext(jobSubmissionContext(contexts...)).Where("user_id = ?", userID).Order("id asc").Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	out := make([]LLMConfigView, 0, len(rows))
@@ -196,7 +198,11 @@ func (s *LLMService) validate(in LLMConfigInput) error {
 }
 
 // Create 新建配置。API Key 加密落库。
-func (s *LLMService) Create(userID int64, in LLMConfigInput) (*LLMConfigView, error) {
+func (s *LLMService) Create(userID int64, in LLMConfigInput, contexts ...context.Context) (*LLMConfigView, error) {
+	ctx := jobSubmissionContext(contexts...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := s.validate(in); err != nil {
 		return nil, err
 	}
@@ -219,8 +225,15 @@ func (s *LLMService) Create(userID int64, in LLMConfigInput) (*LLMConfigView, er
 		IsDefault:       in.IsDefault,
 	}
 	// 设默认与清其他默认同一事务：中途失败不残留双默认。
-	err = common.DB.Transaction(func(tx *gorm.DB) error {
+	err = common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := lockEnabledAuthUser(tx, userID); err != nil {
+			return err
+		}
 		if err := tx.Create(&cfg).Error; err != nil {
+			return err
+		}
+		// GORM 的 default 标签会替换显式 0/false；同事务恢复用户实际提交值。
+		if err := tx.Model(&cfg).Updates(map[string]any{"temperature": in.Temperature, "stream": in.Stream}).Error; err != nil {
 			return err
 		}
 		if cfg.IsDefault {
@@ -232,41 +245,58 @@ func (s *LLMService) Create(userID int64, in LLMConfigInput) (*LLMConfigView, er
 		return nil, err
 	}
 	v := toView(cfg)
+	invalidateLLMRouteCache()
 	return &v, nil
 }
 
 // Update 更新配置。APIKey 留空则保留原密钥。
-func (s *LLMService) Update(userID, id int64, in LLMConfigInput) (*LLMConfigView, error) {
+func (s *LLMService) Update(userID, id int64, in LLMConfigInput, contexts ...context.Context) (*LLMConfigView, error) {
+	ctx := jobSubmissionContext(contexts...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := s.validate(in); err != nil {
 		return nil, err
 	}
-	cfg, err := s.getOwned(userID, id)
-	if err != nil {
-		return nil, err
-	}
-	cfg.Name = strings.TrimSpace(in.Name)
-	// provider 已从表单撤除（只保留接口端点），入参空时沿用原值：它仍参与能力矩阵初始
-	// 声明、审计标签与校准分层键，静默改写会让历史记录的这些维度漂移。
-	if p := strings.TrimSpace(in.Provider); p != "" {
-		cfg.Provider = p
-	}
-	cfg.BaseURL = normalizeBaseURL(in.BaseURL)
-	cfg.Model = strings.TrimSpace(in.Model)
-	cfg.EndpointType = normalizeEndpointType(in.EndpointType)
-	cfg.Temperature = in.Temperature
-	cfg.MaxTokens = in.MaxTokens
-	cfg.ReasoningEffort = strings.TrimSpace(in.ReasoningEffort)
-	cfg.Stream = in.Stream
-	cfg.IsDefault = in.IsDefault
+	var cipher string
 	if in.APIKey != "" {
-		cipher, err := common.Encrypt(in.APIKey)
+		var err error
+		cipher, err = common.Encrypt(in.APIKey)
 		if err != nil {
 			return nil, fmt.Errorf("API Key 加密失败: %w", err)
 		}
-		cfg.APIKeyCipher = cipher
 	}
-	err = common.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Save(cfg).Error; err != nil {
+	var cfg *model.LLMConfig
+	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := lockEnabledAuthUser(tx, userID); err != nil {
+			return err
+		}
+		var err error
+		cfg, err = ownedLLMConfig(tx.Clauses(clause.Locking{Strength: "UPDATE"}), userID, id)
+		if err != nil {
+			return err
+		}
+		cfg.Name = strings.TrimSpace(in.Name)
+		// 表单不再提交 provider；留空时保留锁后读到的当前值和当前密钥。
+		if p := strings.TrimSpace(in.Provider); p != "" {
+			cfg.Provider = p
+		}
+		cfg.BaseURL = normalizeBaseURL(in.BaseURL)
+		cfg.Model = strings.TrimSpace(in.Model)
+		cfg.EndpointType = normalizeEndpointType(in.EndpointType)
+		cfg.Temperature = in.Temperature
+		cfg.MaxTokens = in.MaxTokens
+		cfg.ReasoningEffort = strings.TrimSpace(in.ReasoningEffort)
+		cfg.Stream = in.Stream
+		cfg.IsDefault = in.IsDefault
+		if in.APIKey != "" {
+			cfg.APIKeyCipher = cipher
+		}
+		if err := tx.Model(&model.LLMConfig{}).Where("user_id = ? AND id = ?", userID, id).
+			Select("*").Omit("id", "user_id", "created_at").Updates(cfg).Error; err != nil {
+			return err
+		}
+		if err := refreshLLMRoutesForConfigTx(tx, cfg.ID); err != nil {
 			return err
 		}
 		if cfg.IsDefault {
@@ -278,30 +308,45 @@ func (s *LLMService) Update(userID, id int64, in LLMConfigInput) (*LLMConfigView
 		return nil, err
 	}
 	v := toView(*cfg)
+	invalidateLLMRouteCache()
 	return &v, nil
 }
 
 // Delete 删除配置。
-func (s *LLMService) Delete(userID, id int64) error {
-	res := common.DB.Where("user_id = ? AND id = ?", userID, id).Delete(&model.LLMConfig{})
-	if res.Error != nil {
-		return res.Error
+func (s *LLMService) Delete(userID, id int64, contexts ...context.Context) error {
+	err := common.DB.WithContext(jobSubmissionContext(contexts...)).Transaction(func(tx *gorm.DB) error {
+		if _, err := lockEnabledAuthUser(tx, userID); err != nil {
+			return err
+		}
+		res := tx.Where("user_id = ? AND id = ?", userID, id).Delete(&model.LLMConfig{})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return errors.New("配置不存在")
+		}
+		return nil
+	})
+	if err == nil {
+		invalidateLLMRouteCache()
 	}
-	if res.RowsAffected == 0 {
-		return errors.New("配置不存在")
-	}
-	return nil
+	return err
 }
 
 // SetDefault 把指定配置设为默认（列表页一键操作，无需进编辑面板）。
 // 与 Create/Update 同一原子纪律：置位与清其他默认在同一事务，中途失败不残留双默认。
-func (s *LLMService) SetDefault(userID, id int64) (*LLMConfigView, error) {
-	cfg, err := s.getOwned(userID, id)
-	if err != nil {
-		return nil, err
-	}
-	cfg.IsDefault = true
-	err = common.DB.Transaction(func(tx *gorm.DB) error {
+func (s *LLMService) SetDefault(userID, id int64, contexts ...context.Context) (*LLMConfigView, error) {
+	var cfg *model.LLMConfig
+	err := common.DB.WithContext(jobSubmissionContext(contexts...)).Transaction(func(tx *gorm.DB) error {
+		// 同一用户的首次创建、修改、删除和设默认使用同一父行锁。
+		if _, err := lockEnabledAuthUser(tx, userID); err != nil {
+			return err
+		}
+		var err error
+		cfg, err = ownedLLMConfig(tx.Clauses(clause.Locking{Strength: "UPDATE"}), userID, id)
+		if err != nil {
+			return err
+		}
 		if err := tx.Model(cfg).Update("is_default", true).Error; err != nil {
 			return err
 		}
@@ -320,18 +365,26 @@ func (s *LLMService) SetDefault(userID, id int64) (*LLMConfigView, error) {
 //
 // 抽出来是为了让「拉取模型」和「测试连接」在同一个抽屉里行为一致——只有一边支持复用已存
 // 密钥的话，用户会以为测试连接坏了。missingKeyMsg 由调用方给，便于文案贴合各自场景。
-func (s *LLMService) resolveProbeKey(userID int64, in LLMConfigInput, allowPrivate bool, missingKeyMsg string) (string, bool, error) {
+func (s *LLMService) resolveProbeKey(userID int64, in *LLMConfigInput, allowPrivate bool, missingKeyMsg string, contexts ...context.Context) (string, bool, error) {
 	apiKey := strings.TrimSpace(in.APIKey)
-	if apiKey == "" && in.ConfigID > 0 {
-		cfg, err := s.getOwned(userID, in.ConfigID) // 已限本人，拿不到别人的配置
+	if in.ConfigID < 0 {
+		return "", allowPrivate, errors.New("非法的配置 id")
+	}
+	if in.ConfigID > 0 {
+		cfg, err := s.getOwned(userID, in.ConfigID, contexts...) // 已限本人，拿不到别人的配置
 		if err != nil {
 			return "", allowPrivate, err
 		}
-		key, derr := common.Decrypt(cfg.APIKeyCipher)
-		if derr != nil {
-			return "", allowPrivate, errors.New("密钥解密失败")
+		if strings.TrimSpace(in.Provider) == "" {
+			in.Provider = cfg.Provider
 		}
-		apiKey = strings.TrimSpace(key)
+		if apiKey == "" {
+			key, derr := common.Decrypt(cfg.APIKeyCipher)
+			if derr != nil {
+				return "", allowPrivate, errors.New("密钥解密失败")
+			}
+			apiKey = strings.TrimSpace(key)
+		}
 		allowPrivate = llmAllowPrivate(allowPrivate, cfg)
 	}
 	if apiKey == "" {
@@ -351,13 +404,18 @@ type LLMModelOption struct {
 const llmModelsFetchLimit = 500
 
 // FetchModels 拉取上游可用模型列表（OpenAI 兼容 GET /v1/models）。密钥三态见 resolveProbeKey。
-func (s *LLMService) FetchModels(userID int64, in LLMConfigInput, allowPrivate bool) ([]LLMModelOption, bool, error) {
+func (s *LLMService) FetchModels(userID int64, in LLMConfigInput, allowPrivate bool, contexts ...context.Context) ([]LLMModelOption, bool, error) {
+	ctx, cancel := context.WithTimeout(jobSubmissionContext(contexts...), 20*time.Second)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	baseURL := normalizeBaseURL(in.BaseURL)
 	if baseURL == "" {
 		return nil, false, errors.New("拉取模型需要先填写 Base URL")
 	}
-	apiKey, allowPrivate, err := s.resolveProbeKey(userID, in, allowPrivate,
-		"拉取模型需要 API Key（新建配置请先填写，编辑已有配置可留空复用原密钥）")
+	apiKey, allowPrivate, err := s.resolveProbeKey(userID, &in, allowPrivate,
+		"拉取模型需要 API Key（新建配置请先填写，编辑已有配置可留空复用原密钥）", ctx)
 	if err != nil {
 		return nil, false, err
 	}
@@ -368,8 +426,6 @@ func (s *LLMService) FetchModels(userID int64, in LLMConfigInput, allowPrivate b
 	}
 	endpoint := modelsURL(baseURL)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, false, fmt.Errorf("构造请求失败: %w", err)
@@ -381,7 +437,10 @@ func (s *LLMService) FetchModels(userID int64, in LLMConfigInput, allowPrivate b
 		return nil, false, fmt.Errorf("请求失败: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := readLLMProbeBody(resp.Body, 1<<20)
+	if err != nil {
+		return nil, false, err
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("HTTP %d%s：%s", resp.StatusCode, statusHint(resp.StatusCode), extractErr(raw))
@@ -404,10 +463,15 @@ func (s *LLMService) FetchModels(userID int64, in LLMConfigInput, allowPrivate b
 	}
 
 	out := make([]LLMModelOption, 0, len(parsed.Data))
+	seen := make(map[string]bool, len(parsed.Data))
 	for _, m := range parsed.Data {
-		if id := strings.TrimSpace(m.ID); id != "" {
+		if id := strings.TrimSpace(m.ID); id != "" && !seen[id] {
+			seen[id] = true
 			out = append(out, LLMModelOption{ID: id, OwnedBy: strings.TrimSpace(m.OwnedBy)})
 		}
+	}
+	if len(out) == 0 {
+		return nil, false, errors.New("上游模型列表没有有效的模型名称，请手工填写")
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	truncated := false
@@ -421,13 +485,38 @@ func (s *LLMService) FetchModels(userID int64, in LLMConfigInput, allowPrivate b
 // /v1/models、以版本段结尾只补 /models、已是完整端点原样使用。
 func modelsURL(baseURL string) string {
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
-	if strings.HasSuffix(base, "/models") {
+	u, err := url.Parse(base)
+	if err != nil {
 		return base
 	}
-	if endsWithVersionSegment(base) {
-		return base + "/models"
+	path := strings.TrimRight(u.Path, "/")
+	if strings.HasSuffix(path, "/models") {
+		return base
 	}
-	return base + "/v1/models"
+	for _, suffix := range []string{"/chat/completions", "/responses"} {
+		if strings.HasSuffix(path, suffix) {
+			path = strings.TrimSuffix(path, suffix)
+			break
+		}
+	}
+	if endsWithVersionSegment(path) {
+		path += "/models"
+	} else {
+		path += "/v1/models"
+	}
+	u.Path, u.RawPath = path, ""
+	return u.String()
+}
+
+func readLLMProbeBody(body io.Reader, limit int64) ([]byte, error) {
+	raw, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("上游响应读取不完整: %w", err)
+	}
+	if int64(len(raw)) > limit {
+		return nil, errors.New("上游响应超过读取上限，请检查 API 地址")
+	}
+	return raw, nil
 }
 
 // TestResult 测试连接结果。
@@ -438,8 +527,12 @@ type TestResult struct {
 }
 
 // TestByID 测试已保存配置（解密存储的密钥）。allowPrivate 由调用方按角色决定（管理员放行内网）。
-func (s *LLMService) TestByID(userID, id int64, allowPrivate bool) (*TestResult, error) {
-	cfg, err := s.getOwned(userID, id)
+func (s *LLMService) TestByID(userID, id int64, allowPrivate bool, contexts ...context.Context) (*TestResult, error) {
+	ctx := jobSubmissionContext(contexts...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	cfg, err := s.getOwned(userID, id, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -447,33 +540,45 @@ func (s *LLMService) TestByID(userID, id int64, allowPrivate bool) (*TestResult,
 	if err != nil {
 		return nil, errors.New("密钥解密失败")
 	}
-	return s.testConnection(llmProbeTarget{
+	result := s.testConnection(llmProbeTarget{ctx: ctx,
 		UserID: userID, ConfigID: cfg.ID, Provider: cfg.Provider, EndpointType: cfg.EndpointType,
 		BaseURL: cfg.BaseURL, APIKey: key, Model: cfg.Model,
 		ReasoningEffort: cfg.ReasoningEffort, AllowPrivate: allowPrivate,
-	}), nil
+	})
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // TestByInput 测试未保存的配置（前端表单即时测试）。密钥三态见 resolveProbeKey：编辑
 // 已有配置时留空即复用原密钥，否则「只改了思考档位就想测一下」必须先重填 key 才能测，
 // 而同一抽屉里的「拉取模型」却不用——那种不一致会被当成测试连接坏了。
-func (s *LLMService) TestByInput(userID int64, in LLMConfigInput, allowPrivate bool) (*TestResult, error) {
+func (s *LLMService) TestByInput(userID int64, in LLMConfigInput, allowPrivate bool, contexts ...context.Context) (*TestResult, error) {
+	ctx := jobSubmissionContext(contexts...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	baseURL := normalizeBaseURL(in.BaseURL)
 	if baseURL == "" || strings.TrimSpace(in.Model) == "" {
 		return nil, errors.New("测试需要 base_url 与 model")
 	}
-	apiKey, allowPrivate, err := s.resolveProbeKey(userID, in, allowPrivate,
-		"测试需要 API Key（新建配置请先填写，编辑已有配置可留空复用原密钥）")
+	apiKey, allowPrivate, err := s.resolveProbeKey(userID, &in, allowPrivate,
+		"测试需要 API Key（新建配置请先填写，编辑已有配置可留空复用原密钥）", ctx)
 	if err != nil {
 		return nil, err
 	}
-	return s.testConnection(llmProbeTarget{
+	result := s.testConnection(llmProbeTarget{ctx: ctx,
 		// ConfigID 带上：草稿的能力观察 key 含 base_url/model/endpoint 四维，不会与其他目标
 		// 串味，而带上它审计侧才能把这次 module=test 调用归因到具体哪条配置。
 		UserID: userID, ConfigID: in.ConfigID, Provider: in.Provider, EndpointType: in.EndpointType,
 		BaseURL: baseURL, APIKey: apiKey, Model: strings.TrimSpace(in.Model),
 		ReasoningEffort: strings.TrimSpace(in.ReasoningEffort), AllowPrivate: allowPrivate,
-	}), nil
+	})
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // testConnection 目前仅实现 OpenAI 兼容口径（chat/completions 或 responses 最小请求）。
@@ -511,6 +616,12 @@ func buildProbeBody(t llmProbeTarget) []byte {
 }
 
 func (s *LLMService) testOpenAICompatibleForUser(t llmProbeTarget) (result *TestResult) {
+	ctx, cancel := context.WithTimeout(jobSubmissionContext(t.ctx), time.Minute)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return &TestResult{Message: err.Error()}
+	}
+	t.ctx = ctx
 	started := time.Now()
 	params := chatParams{
 		Model: t.Model, EndpointType: t.EndpointType, ReasoningEffort: t.ReasoningEffort,
@@ -542,7 +653,7 @@ func (s *LLMService) testOpenAICompatibleForUser(t llmProbeTarget) (result *Test
 
 	client := common.SafeHTTPClient(20*time.Second, t.AllowPrivate) // 防 SSRF（管理员可放行内网自建模型）
 	send := func(body []byte) (int, []byte, int64, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(t.ctx, 20*time.Second)
 		defer cancel()
 		req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if rerr != nil {
@@ -557,8 +668,8 @@ func (s *LLMService) testOpenAICompatibleForUser(t llmProbeTarget) (result *Test
 			return 0, nil, latency, derr
 		}
 		defer res.Body.Close()
-		raw, _ := io.ReadAll(io.LimitReader(res.Body, 64<<10))
-		return res.StatusCode, raw, latency, nil
+		raw, readErr := readLLMProbeBody(res.Body, 64<<10)
+		return res.StatusCode, raw, latency, readErr
 	}
 
 	status, raw, latency, err := send(buildProbeBody(t))
@@ -579,7 +690,7 @@ func (s *LLMService) testOpenAICompatibleForUser(t llmProbeTarget) (result *Test
 		}
 		if status == http.StatusOK {
 			// 去参后成功才证明失败确实源于该参数（与业务侧 capConfirms 同一纪律）。
-			observeLLMCapability(t.capabilityKey(), capReasoningEffort, capUnsupported, reason)
+			observeLLMCapability(reasoningCapabilityTarget(t.capabilityKey(), configuredEffort), capReasoningEffort, capUnsupported, reason)
 		}
 	}
 
@@ -611,6 +722,9 @@ func (s *LLMService) testOpenAICompatibleForUser(t llmProbeTarget) (result *Test
 				Message: "连通但响应不含 output（" + extractErr(raw) + "），可能不支持 Responses 端点"}
 		}
 		observeLLMCapability(capTarget, capEndpointResponses, capSupported, "连通探测成功")
+		if configuredEffort != "" && !effortRejected {
+			observeLLMCapability(reasoningCapabilityTarget(capTarget, configuredEffort), capReasoningEffort, capSupported, "连接探测接受该档位")
+		}
 		return &TestResult{OK: true, LatencyMs: latency,
 			Message: "连接成功" + s.jsonModeSmokeNote(t) + effortNote(configuredEffort, effortRejected)}
 	}
@@ -631,6 +745,9 @@ func (s *LLMService) testOpenAICompatibleForUser(t llmProbeTarget) (result *Test
 			Message: "连通但响应不含 choices（" + extractErr(raw) + "），可能不是 OpenAI 兼容接口"}
 	}
 	observeLLMCapability(capTarget, capEndpointChat, capSupported, "连通探测成功")
+	if configuredEffort != "" && !effortRejected {
+		observeLLMCapability(reasoningCapabilityTarget(capTarget, configuredEffort), capReasoningEffort, capSupported, "连接探测接受该档位")
+	}
 	return &TestResult{OK: true, LatencyMs: latency,
 		Message: "连接成功" + s.jsonModeSmokeNote(t) + effortNote(configuredEffort, effortRejected)}
 }
@@ -695,7 +812,7 @@ func (s *LLMService) probeJSONModeCapability(t llmProbeTarget) llmCapState {
 	var probeErr error
 	defer func() { writeLLMCallLog(params, false, probeRes, probeErr, time.Since(started)) }()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(jobSubmissionContext(t.ctx), 20*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
@@ -711,27 +828,19 @@ func (s *LLMService) probeJSONModeCapability(t llmProbeTarget) llmCapState {
 		return capUnknown
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	raw, err := readLLMProbeBody(resp.Body, 64<<10)
+	if err != nil {
+		probeErr = err
+		return capUnknown
+	}
 	target := t.capabilityKey()
 	if resp.StatusCode == http.StatusOK {
-		hasContent := false
-		if isResponses {
-			var parsed struct {
-				Output []json.RawMessage `json:"output"`
-			}
-			hasContent = json.Unmarshal(raw, &parsed) == nil && len(parsed.Output) > 0
-		} else {
-			var parsed struct {
-				Choices []json.RawMessage `json:"choices"`
-			}
-			hasContent = json.Unmarshal(raw, &parsed) == nil && len(parsed.Choices) > 0
-		}
-		if hasContent {
+		if probeHasCompleteJSONObject(raw, isResponses) {
 			observeLLMCapability(target, capJSONObject, capSupported, "provider smoke 结构化探测成功")
 			probeRes = &chatResult{Content: "json_object supported"}
 			return capSupported
 		}
-		probeErr = errors.New("结构化探测 200 但响应无内容")
+		probeErr = errors.New("结构化探测 200 但正文不是完整 JSON 对象")
 		return capUnknown
 	}
 	if looksLikeUnsupportedJSONMode(resp.StatusCode, raw) {
@@ -746,6 +855,55 @@ func (s *LLMService) probeJSONModeCapability(t llmProbeTarget) llmCapState {
 	// 网络/限流/5xx 等非结论性失败：不落观察（unknown 保持乐观路径 + 隐式回落兜底）。
 	probeErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, extractErr(raw))
 	return capUnknown
+}
+
+// 外层 choices/output 存在不代表模型输出了 JSON；空正文、纯思考和截断均不能确认为支持。
+func probeHasCompleteJSONObject(raw []byte, isResponses bool) bool {
+	var content string
+	if isResponses {
+		var parsed struct {
+			Status string `json:"status"`
+			Output []struct {
+				Type    string `json:"type"`
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"output"`
+		}
+		if json.Unmarshal(raw, &parsed) != nil || (parsed.Status != "" && parsed.Status != "completed") {
+			return false
+		}
+		for _, output := range parsed.Output {
+			if output.Type != "message" {
+				continue
+			}
+			for _, part := range output.Content {
+				if part.Type == "output_text" {
+					content += part.Text
+				}
+			}
+		}
+	} else {
+		var parsed struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+				FinishReason string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal(raw, &parsed) != nil || len(parsed.Choices) == 0 {
+			return false
+		}
+		choice := parsed.Choices[0]
+		if choice.FinishReason != "" && choice.FinishReason != "stop" {
+			return false
+		}
+		content = choice.Message.Content
+	}
+	var object map[string]json.RawMessage
+	return json.Unmarshal([]byte(content), &object) == nil && object != nil
 }
 
 // extractErr 从上游错误体里抽取 message：兼容 OpenAI 风格 {"error":{"message":...}}、
@@ -782,14 +940,23 @@ func extractErr(raw []byte) string {
 	return s
 }
 
-func (s *LLMService) getOwned(userID, id int64) (*model.LLMConfig, error) {
+func (s *LLMService) getOwned(userID, id int64, contexts ...context.Context) (*model.LLMConfig, error) {
+	return ownedLLMConfig(common.DB.WithContext(jobSubmissionContext(contexts...)), userID, id)
+}
+
+// 配置读取故障与“没有配置”分开，供自动调度保留重试机会。
+type llmConfigReadError struct{ error }
+
+func (e *llmConfigReadError) Unwrap() error { return e.error }
+
+func ownedLLMConfig(db *gorm.DB, userID, id int64) (*model.LLMConfig, error) {
 	var cfg model.LLMConfig
-	err := common.DB.Where("user_id = ? AND id = ?", userID, id).First(&cfg).Error
+	err := db.Where("user_id = ? AND id = ?", userID, id).First(&cfg).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, errors.New("配置不存在")
 	}
 	if err != nil {
-		return nil, err
+		return nil, &llmConfigReadError{err}
 	}
 	return &cfg, nil
 }
@@ -799,27 +966,53 @@ func (s *LLMService) getOwned(userID, id int64) (*model.LLMConfig, error) {
 // 本人一条配置都没有时，回退到首个启用管理员的默认配置——管理员代付 key，
 // 次数/token 配额仍按发起用户记（consumeQuota 在各调用方按发起 userID）。
 // 失败统一挂机读码 llm_unavailable（文案原样保留），供 API 包络 code 字段透出。
-func (s *LLMService) ResolveForUse(userID, id int64) (*model.LLMConfig, string, error) {
-	cfg, key, err := s.resolveForUseInner(userID, id)
+func (s *LLMService) ResolveForUse(userID, id int64, contexts ...context.Context) (*model.LLMConfig, string, error) {
+	cfg, key, err := s.resolveForUseInner(userID, id, contexts...)
 	if err != nil {
 		return nil, "", asLLMUnavailable(err)
 	}
 	return cfg, key, nil
 }
 
-func (s *LLMService) resolveForUseInner(userID, id int64) (*model.LLMConfig, string, error) {
+func (s *LLMService) resolveForUseInner(userID, id int64, contexts ...context.Context) (*model.LLMConfig, string, error) {
+	var cfg *model.LLMConfig
+	var key string
+	err := readLLMConfigSnapshot(jobSubmissionContext(contexts...), func(tx *gorm.DB) error {
+		var err error
+		cfg, key, err = s.resolveForUseDB(tx, userID, id)
+		return err
+	})
+	return cfg, key, err
+}
+
+// 开启或结束快照失败也属于临时读取故障，不能被调度器解释为“没有配置”。
+func readLLMConfigSnapshot(ctx context.Context, read func(*gorm.DB) error) error {
+	var readErr error
+	err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		readErr = read(tx)
+		return readErr
+	})
+	if err != nil && readErr == nil {
+		return &llmConfigReadError{err}
+	}
+	return err
+}
+
+func (s *LLMService) resolveForUseDB(db *gorm.DB, userID, id int64) (*model.LLMConfig, string, error) {
 	var cfg model.LLMConfig
 	if id > 0 {
-		c, err := s.getOwned(userID, id)
+		c, err := ownedLLMConfig(db, userID, id)
 		if err != nil {
 			return nil, "", err
 		}
 		cfg = *c
 	} else {
-		err := common.DB.Where("user_id = ?", userID).
+		err := db.Where("user_id = ?", userID).
 			Order("is_default DESC, id ASC").First(&cfg).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			err = s.adminFallback(userID, &cfg)
+			err = s.adminFallbackDB(db, userID, &cfg)
+		} else if err != nil {
+			err = &llmConfigReadError{err}
 		}
 		if err != nil {
 			return nil, "", err
@@ -843,18 +1036,29 @@ func asLLMUnavailable(err error) error {
 	if RefusalCodeOf(err) != "" {
 		return err
 	}
-	return refusalErr(RefusalLLMUnavailable, err.Error())
+	return &RefusalError{Code: RefusalLLMUnavailable, Msg: err.Error(), cause: err}
 }
 
 // adminFallback 无自有配置时的用户回退入口：受管理后台"LLM 回退"开关控制，
 // 关闭时保持"请先在设置中添加"的引导语义；发起者本人就是候选管理员时同样引导
 // （自己都没配置，回退到自己没有意义）。
-func (s *LLMService) adminFallback(userID int64, cfg *model.LLMConfig) error {
+func (s *LLMService) adminFallback(userID int64, cfg *model.LLMConfig, contexts ...context.Context) error {
+	return readLLMConfigSnapshot(jobSubmissionContext(contexts...), func(tx *gorm.DB) error { return s.adminFallbackDB(tx, userID, cfg) })
+}
+
+func (s *LLMService) adminFallbackDB(db *gorm.DB, userID int64, cfg *model.LLMConfig) error {
 	errGuide := errors.New("尚未配置任何 LLM，请先在设置中添加")
 	if !setting.LLMFallbackEnabled() {
 		return errGuide
 	}
-	if err := resolveSystemFallbackConfig(cfg); err != nil || cfg.UserID == userID {
+	if err := resolveSystemFallbackConfigDB(db, cfg); err != nil {
+		var readErr *llmConfigReadError
+		if errors.As(err, &readErr) {
+			return err
+		}
+		return errGuide
+	}
+	if cfg.UserID == userID {
 		return errGuide
 	}
 	return nil
@@ -863,33 +1067,57 @@ func (s *LLMService) adminFallback(userID int64, cfg *model.LLMConfig) error {
 // resolveSystemFallbackConfig 解析"系统默认 LLM"：管理后台指定的回退配置优先
 // （须仍存在且所有者是启用管理员，失效则静默回落），否则取首个启用管理员的默认配置。
 // 供用户回退（adminFallback）与新闻情绪分析（resolveNewsLLM）共用，不受回退开关控制。
-func resolveSystemFallbackConfig(cfg *model.LLMConfig) error {
+func resolveSystemFallbackConfig(cfg *model.LLMConfig, contexts ...context.Context) error {
+	return readLLMConfigSnapshot(jobSubmissionContext(contexts...), func(tx *gorm.DB) error { return resolveSystemFallbackConfigDB(tx, cfg) })
+}
+
+func resolveSystemFallbackConfigDB(db *gorm.DB, cfg *model.LLMConfig) error {
 	if id := setting.LLMFallbackConfigID(); id > 0 {
 		var c model.LLMConfig
-		if err := common.DB.First(&c, id).Error; err == nil && isEnabledAdmin(c.UserID) {
-			*cfg = c
-			return nil
+		err := db.First(&c, id).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return &llmConfigReadError{err}
+		}
+		if err == nil {
+			enabled, err := readEnabledAdminDB(db, c.UserID)
+			if err != nil {
+				return &llmConfigReadError{err}
+			}
+			if enabled {
+				*cfg = c
+				return nil
+			}
 		}
 		// 指定配置已删/所有者被禁用或降级：回落自动逻辑，不让系统 AI 能力瘫在死引用上。
 	}
-	adminID, err := firstEnabledAdminID()
+	adminID, err := firstEnabledAdminIDDB(db)
 	if err != nil {
 		return err
 	}
-	err = common.DB.Where("user_id = ?", adminID).
+	err = db.Where("user_id = ?", adminID).
 		Order("is_default DESC, id ASC").First(cfg).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return errors.New("管理员尚未配置默认 LLM")
 	}
-	return err
+	if err != nil {
+		return &llmConfigReadError{err}
+	}
+	return nil
 }
 
 // firstEnabledAdminID 首个启用状态的管理员 ID。
-func firstEnabledAdminID() (int64, error) {
+func firstEnabledAdminID(contexts ...context.Context) (int64, error) {
+	return firstEnabledAdminIDDB(common.DB.WithContext(jobSubmissionContext(contexts...)))
+}
+
+func firstEnabledAdminIDDB(db *gorm.DB) (int64, error) {
 	var admin model.User
-	if err := common.DB.Select("id").Where("role = ? AND status = ?", model.RoleAdmin, model.StatusEnabled).
+	if err := db.Select("id").Where("role = ? AND status = ?", model.RoleAdmin, model.StatusEnabled).
 		Order("id ASC").First(&admin).Error; err != nil {
-		return 0, errors.New("无可用管理员账号")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return 0, errors.New("无可用管理员账号")
+		}
+		return 0, &llmConfigReadError{err}
 	}
 	return admin.ID, nil
 }
@@ -897,11 +1125,23 @@ func firstEnabledAdminID() (int64, error) {
 // isEnabledAdmin 是否为启用状态的管理员。保留该语义别名，供回退配置所有者的
 // 合法性判断使用。
 func isEnabledAdmin(userID int64) bool {
+	enabled, err := readEnabledAdmin(userID)
+	return err == nil && enabled
+}
+
+func readEnabledAdmin(userID int64, contexts ...context.Context) (bool, error) {
+	return readEnabledAdminDB(common.DB.WithContext(jobSubmissionContext(contexts...)), userID)
+}
+
+func readEnabledAdminDB(db *gorm.DB, userID int64) (bool, error) {
 	var u model.User
-	if err := common.DB.Select("role, status").First(&u, userID).Error; err != nil {
-		return false
+	if err := db.Select("role, status").First(&u, userID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		return false, err
 	}
-	return u.Role == model.RoleAdmin && u.Status == model.StatusEnabled
+	return u.Role == model.RoleAdmin && u.Status == model.StatusEnabled, nil
 }
 
 // llmAllowPrivate 内网地址放行判定：发起者是管理员，或配置本身属于管理员

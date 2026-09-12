@@ -28,7 +28,7 @@ export function createChannel(input: NotifyChannelInput) {
   return request<NotifyChannel>({ url: '/notify-channels', method: 'post', data: input })
 }
 
-export function updateChannel(id: number, input: NotifyChannelInput) {
+export function updateChannel(id: number, input: Partial<NotifyChannelInput>) {
   return request<NotifyChannel>({ url: `/notify-channels/${id}`, method: 'put', data: input })
 }
 
@@ -69,6 +69,7 @@ export interface BrowserNotificationEvent {
   delivery_id: number
   event: {
     id: number
+    user_id: number
     source_type: string
     source_id: number
     fact_key: string
@@ -105,11 +106,12 @@ export function removeBrowserDevice(id: number) {
   return request<{ ok: boolean }>({ url: `/browser-notifications/subscriptions/${id}`, method: 'delete' })
 }
 
-export function listBrowserNotificationEvents(deviceKey: string, afterID = 0) {
+export function listBrowserNotificationEvents(deviceKey: string, afterID = 0, signal?: AbortSignal) {
   return request<BrowserNotificationEvent[]>({
     url: '/browser-notifications/events',
     method: 'get',
     params: { device_key: deviceKey, after_id: afterID, limit: 20 },
+    signal,
   })
 }
 

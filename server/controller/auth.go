@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"net/http"
 
 	"quantvista/common"
@@ -54,7 +55,11 @@ func (ac *AuthController) Refresh(c *gin.Context) {
 	}
 	pair, err := ac.svc.Refresh(req.RefreshToken, clientUA(c))
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		if errors.Is(err, service.ErrRefreshTokenInvalid) || errors.Is(err, service.ErrAuthAccountInactive) {
+			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "code": "auth_expired", "message": err.Error()})
+		} else {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "code": "auth_unavailable", "message": "登录服务暂时不可用，请稍后重试"})
+		}
 		return
 	}
 	common.ApiSuccess(c, pair)

@@ -221,14 +221,13 @@ func latestAlertBar(bars []datasource.Bar) *AlertContextBar {
 	return out
 }
 
-func alertIndicatorBars(kind string, bars []datasource.Bar) []datasource.Bar {
+func alertIndicatorBars(kind string, bars []datasource.Bar, tradeDate string) []datasource.Bar {
 	if kind != model.AlertKindBreakout && kind != model.AlertKindVolumeSurge {
 		return bars
 	}
-	today := time.Now().In(time.Local).Format("2006-01-02")
 	out := make([]datasource.Bar, 0, len(bars))
 	for _, bar := range bars {
-		if bar.TradeDate != today {
+		if bar.TradeDate < tradeDate {
 			out = append(out, bar)
 		}
 	}
@@ -286,7 +285,7 @@ func buildMarketAlertContext(rule model.AlertRule, in alertEval, q *datasource.Q
 	case model.AlertKindVolumeSurge:
 		field, unit = "indicator.volume_ratio", "倍"
 		if avg, ok := volumeAverage(in.Volumes, volumeAvgWindow); ok {
-			value = round2(float64(in.DayVolume) / avg)
+			value = float64(in.DayVolume) / avg
 			metric = &AlertContextMetric{
 				Name: "volume_ratio", Value: alertFloat(value), Reference: alertFloat(avg),
 				Period: volumeAvgWindow, Unit: "倍",
@@ -299,7 +298,11 @@ func buildMarketAlertContext(rule model.AlertRule, in alertEval, q *datasource.Q
 
 	ctx := newAlertEventContext(rule, field, alertFloat(value), alertFloat(threshold), unit, reason)
 	ctx.Quote, ctx.Unknown = quoteAlertContext(q)
-	ctx.Bar = latestAlertBar(alertIndicatorBars(rule.Kind, bars))
+	tradeDate := time.Now().In(time.Local).Format("2006-01-02")
+	if q != nil && !q.DataTime.IsZero() {
+		tradeDate = q.DataTime.In(time.Local).Format("2006-01-02")
+	}
+	ctx.Bar = latestAlertBar(alertIndicatorBars(rule.Kind, bars, tradeDate))
 	if ctx.Bar != nil {
 		switch rule.Kind {
 		case model.AlertKindMA, model.AlertKindBreakout:

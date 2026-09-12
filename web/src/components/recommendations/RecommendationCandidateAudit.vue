@@ -1,25 +1,15 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { NCollapse, NCollapseItem, NEmpty, NTag } from 'naive-ui'
-import type { PoolCandidate, RecommendationView, RecReject } from '@/api/recommendation'
+import { NAlert, NCollapse, NCollapseItem, NEmpty, NTag } from 'naive-ui'
+import type { PoolCandidate, RecommendationView } from '@/api/recommendation'
 import StockIdentity from '@/components/StockIdentity.vue'
 import TermHelp from '@/components/TermHelp.vue'
 import { useUi } from '@/composables/useUi'
-import { exclusionReason } from './recommendationPresentation'
+import { exclusionReason, omittedCandidates, parseCandidateSnapshot, parseRejectedSnapshot, rankedScore } from './recommendationPresentation'
 
 const props = defineProps<{ current: RecommendationView }>()
 const { pctColor, vars } = useUi()
 const sections = defineModel<string[]>('sections', { default: () => [] })
-
-function parseArray<T>(raw?: string): T[] {
-  if (!raw) return []
-  try {
-    const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) ? parsed : []
-  } catch {
-    return []
-  }
-}
 
 function parseObject(raw?: string): unknown {
   if (!raw) return null
@@ -27,10 +17,13 @@ function parseObject(raw?: string): unknown {
   catch { return raw }
 }
 
-const pool = computed(() => parseArray<PoolCandidate>(props.current.candidate_pool))
+const poolSnapshot = computed(() => parseCandidateSnapshot(props.current.candidate_pool))
+const pool = computed(() => poolSnapshot.value.items)
 const eligible = computed(() => pool.value.filter((item) => !item.excluded).sort((a, b) => (a.rank || 9999) - (b.rank || 9999)))
 const excluded = computed(() => pool.value.filter((item) => !!item.excluded))
-const rejected = computed(() => parseArray<RecReject>(props.current.rejected_json))
+const rejectedSnapshot = computed(() => parseRejectedSnapshot(props.current.rejected_json))
+const rejected = computed(() => rejectedSnapshot.value.items)
+const omitted = computed(() => omittedCandidates(props.current.filters_json))
 const selectedSymbols = computed(() => new Set(props.current.items.map((item) => `${item.market || 'cn'}:${item.symbol}`)))
 const technicalDiagnostics = computed(() => JSON.stringify({
   market_regime: parseObject(props.current.regime_json),
@@ -61,14 +54,16 @@ function sources(item: PoolCandidate) {
       </div>
     </header>
 
-    <n-collapse v-model:value="sections">
+    <n-alert v-if="poolSnapshot.invalid || rejectedSnapshot.invalid" type="warning" :bordered="false" class="snapshot-warning">部分历史候选或落选快照损坏，以下只展示可核验条目，数量不代表当时的完整候选池。</n-alert>
+    <n-alert v-if="omitted" type="info" :bordered="false" class="snapshot-warning">本批快照省略了 {{ omitted }} 条排除记录；下方排除数量仅统计已留存的条目。</n-alert>
+    <n-collapse v-model:expanded-names="sections">
       <n-collapse-item :title="`候选池（${eligible.length}）`" name="pool">
         <n-empty v-if="!eligible.length" description="本批没有保存可展示的候选池快照" size="small" />
         <div v-else class="candidate-list">
           <div v-for="item in eligible" :key="`${item.market}:${item.symbol}`" class="candidate-row">
             <StockIdentity :symbol="item.symbol" :market="item.market || 'cn'" :name="item.name" density="table" clickable />
             <span>{{ sources(item) }}</span>
-            <span class="qv-tnum">排名 {{ item.rank || '—' }} · 量化分 {{ item.score?.toFixed(1) || '—' }}</span>
+            <span class="qv-tnum">排名 {{ item.rank || '—' }} · 量化分 {{ rankedScore(item.score, item.rank)?.toFixed(1) ?? '—' }}</span>
             <n-tag v-if="item.strategy_hit" size="tiny" :type="item.strategy_hit.full ? 'success' : 'default'" :bordered="false"
               :title="[...(item.strategy_hit.matched || []), ...(item.strategy_hit.missed || []).map((m) => '✗ ' + m)].join('；')">
               策略条件 {{ item.strategy_hit.hit }}/{{ item.strategy_hit.total }}
@@ -115,6 +110,7 @@ function sources(item: PoolCandidate) {
 </template>
 
 <style scoped>
+.snapshot-warning { margin-bottom: 12px; }
 .candidate-audit { margin-top: 18px; padding-top: 16px; border-top: 1px solid v-bind('vars.dividerColor'); }
 header,
 .counts { display: flex; min-width: 0; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 8px; }

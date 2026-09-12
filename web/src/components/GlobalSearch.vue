@@ -22,11 +22,13 @@ const { vars, primaryAlpha } = useUi()
 const { goDetail } = useStockActions(() => emit('update:show', false))
 const keyword = ref('')
 const results = ref<StockSearchItem[]>([])
+const catalogSource = ref('')
 const recentStocks = ref<RecentStock[]>([])
 const loading = ref(false)
 const errorMessage = ref('')
 const selectedIndex = ref(0)
 const inputRef = ref<InstanceType<typeof NInput> | null>(null)
+const panelRef = ref<HTMLElement | null>(null)
 
 type DisplayStock = StockSearchItem | RecentStock
 
@@ -70,6 +72,7 @@ function resetSearch() {
   cancelSearch()
   keyword.value = ''
   results.value = []
+  catalogSource.value = ''
   errorMessage.value = ''
   loading.value = false
   selectedIndex.value = 0
@@ -83,8 +86,9 @@ watch(
       return
     }
     reloadRecent()
+    const seq = searchSeq
     await nextTick()
-    inputRef.value?.focus()
+    if (props.show && seq === searchSeq) inputRef.value?.focus()
   },
 )
 
@@ -99,6 +103,7 @@ watch(
 watch(keyword, (value) => {
   cancelSearch()
   results.value = []
+  catalogSource.value = ''
   errorMessage.value = ''
   selectedIndex.value = 0
   const query = value.trim()
@@ -124,6 +129,7 @@ async function performSearch(query = normalizedKeyword.value) {
   try {
     const result = await searchStocks(query, 20, controller.signal)
     if (mySeq !== searchSeq || query !== normalizedKeyword.value) return
+    catalogSource.value = result.source
     results.value = result.items || []
     selectedIndex.value = 0
   } catch (e) {
@@ -139,13 +145,15 @@ async function performSearch(query = normalizedKeyword.value) {
 }
 
 function onGlobalKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.keyCode === 229) return
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
     if (event.repeat) return
     event.preventDefault()
     emit('update:show', !props.show)
     return
   }
-  if (props.show && event.key === 'Escape' && !event.defaultPrevented) {
+  if (props.show && event.key === 'Escape' && !event.defaultPrevented &&
+    event.target instanceof Node && panelRef.value?.contains(event.target)) {
     event.preventDefault()
     close()
   }
@@ -181,6 +189,7 @@ function onInputKeydown(event: KeyboardEvent) {
 }
 
 async function openStock(stock: StockRef) {
+  if (!props.show || loading.value) return
   await goDetail(stock)
 }
 
@@ -226,10 +235,11 @@ onUnmounted(() => {
   <n-modal
     :show="show"
     :auto-focus="false"
+    :close-on-esc="false"
     transform-origin="center"
     @update:show="emit('update:show', $event)"
   >
-    <div class="gs-panel" :style="panelVars">
+    <div ref="panelRef" class="gs-panel" :style="panelVars">
       <div class="gs-input-row">
         <svg class="gs-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
           <circle cx="11" cy="11" r="7" />
@@ -243,11 +253,17 @@ onUnmounted(() => {
           :maxlength="64"
           :bordered="false"
           size="large"
-          aria-label="搜索股票"
-          aria-controls="gs-stock-list"
-          :aria-activedescendant="activeDescendant"
+          :input-props="{
+            role: 'combobox',
+            'aria-label': '搜索股票',
+            'aria-controls': 'gs-stock-list',
+            'aria-expanded': show,
+            'aria-autocomplete': 'list',
+            'aria-activedescendant': activeDescendant,
+          }"
           @keydown="onInputKeydown"
         />
+        <n-button class="gs-close" size="small" quaternary circle aria-label="关闭搜索" title="关闭搜索" @click="close">×</n-button>
       </div>
 
       <div class="gs-body">
@@ -301,7 +317,11 @@ onUnmounted(() => {
         </template>
 
         <template v-else-if="normalizedKeyword">
-          <n-empty class="gs-empty" description="没有找到相关股票" />
+          <n-empty class="gs-empty" :description="catalogSource ? '没有找到相关股票' : '股票目录尚未就绪'">
+            <template v-if="!catalogSource" #extra>
+              <n-button size="small" secondary @click="performSearch()">重试加载目录</n-button>
+            </template>
+          </n-empty>
           <div class="gs-section-head"><span>AI 快捷操作</span></div>
           <AIQuickActions class="gs-ai-actions" @navigated="close" />
         </template>
@@ -347,6 +367,9 @@ onUnmounted(() => {
 
 <style scoped>
 .gs-panel {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
   width: min(640px, calc(100vw - 32px));
   max-height: min(620px, calc(100dvh - 64px));
   margin-bottom: 12vh;
@@ -361,6 +384,7 @@ onUnmounted(() => {
   align-items: center;
   gap: 8px;
   min-width: 0;
+  flex-shrink: 0;
   padding: 7px 14px;
   border-bottom: 1px solid var(--gs-divider);
 }
@@ -375,12 +399,14 @@ onUnmounted(() => {
   flex: 1;
 }
 .gs-body {
-  min-height: 154px;
+  min-height: 0;
+  flex: 1 1 auto;
   max-height: min(500px, calc(100dvh - 142px));
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 10px;
 }
+.gs-close { flex: 0 0 auto; }
 .gs-section-head {
   display: flex;
   align-items: center;

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { NTooltip, NModal, NCollapse, NCollapseItem, NEmpty } from 'naive-ui'
 import { useUi } from '@/composables/useUi'
 import type { EvidenceCheck, TrustReview, SysConfidence } from '@/api/trust'
@@ -58,8 +58,8 @@ const evColor = computed(() => {
   if (evAllRestated.value) return flatColor.value
   return upColor.value
 })
-// 有 items 明细（ev2 起）才可点击展开；旧记录只显示 tooltip。
-const evHasItems = computed(() => !!ev.value?.items?.length)
+// 定性结论也可带有声明和数据缺口，是否可展开不依赖可核验数字的数量。
+const evHasDetails = computed(() => !!(ev.value?.items?.length || ev.value?.claims?.length || ev.value?.unknowns?.length))
 const evMatchedItems = computed(() => (ev.value?.items || []).filter((i) => i.matched))
 const evUnmatchedItems = computed(() => (ev.value?.items || []).filter((i) => !i.matched))
 // ev4：结构化数据缺口与关键结论段佐证（旧记录无这些字段时 v-if 兜底不渲染）。
@@ -83,8 +83,9 @@ function claimStatusColor(s: string) {
   return flatColor.value
 }
 const detailShow = ref(false)
+watch(ev, () => { detailShow.value = false })
 function openDetail() {
-  if (evHasItems.value) detailShow.value = true
+  if (evHasDetails.value) detailShow.value = true
 }
 function dirLabel(d?: string) {
   if (d === 'up') return '↑'
@@ -118,9 +119,9 @@ const evOriginSummary = computed(() => {
 // 全部徽章缺省时整行不渲染：旧记录（信任层上线前）无这些字段，空 flex 容器会留出多余空隙。
 const hasAny = computed(
   () =>
-    !!props.quantScore ||
+    props.quantScore != null ||
     !!props.lotCost ||
-    (!!ev.value && ev.value.total > 0) ||
+    (!!ev.value && (ev.value.total > 0 || evHasDetails.value)) ||
     !!props.sysConfidence ||
     !!props.review,
 )
@@ -129,22 +130,27 @@ const hasAny = computed(
 <template>
   <div v-if="hasAny" class="trust-row">
     <span
-      v-if="quantScore"
+      v-if="quantScore != null"
       class="trust-chip"
       :style="{ background: withAlpha(vars.primaryColor, 0.1), color: vars.primaryColor }"
     >
       {{ isPlain ? TERM_DICTIONARY.quant_score.plain : TERM_DICTIONARY.quant_score.professional }} {{ quantScore.toFixed(1) }}<template v-if="quantRank"> · 第{{ quantRank }}/{{ poolSize }}</template>
     </span>
     <span v-if="lotCost" class="trust-chip trust-plain">一手约 ¥{{ lotCost.toFixed(0) }}</span>
-    <n-tooltip v-if="ev && ev.total > 0" trigger="hover">
+    <n-tooltip v-if="ev && (ev.total > 0 || evHasDetails)" trigger="hover">
       <template #trigger>
         <span
           class="trust-chip"
-          :class="{ 'trust-clickable': evHasItems }"
-          :style="{ background: withAlpha(evColor, 0.12), color: evColor }"
+          :class="{ 'trust-clickable': evHasDetails }"
+          :style="{ background: withAlpha(ev.total > 0 ? evColor : flatColor, 0.12), color: ev.total > 0 ? evColor : flatColor }"
+          :role="evHasDetails ? 'button' : undefined"
+          :tabindex="evHasDetails ? 0 : undefined"
           @click="openDetail"
+          @keydown.enter="openDetail"
+          @keydown.space.prevent="openDetail"
         >
-          数值核验 {{ ev.matched }}/{{ ev.total }}
+          <template v-if="ev.total > 0">数值核验 {{ ev.matched }}/{{ ev.total }}</template>
+          <template v-else>证据与数据缺口</template>
         </span>
       </template>
       <div style="max-width: 320px">
@@ -162,7 +168,7 @@ const hasAny = computed(
           >另跳过 {{ ev.skipped_count }} 个（小整数/年份/代码等非核验对象）。</template
         >
         仅「数据快照佐证」表示数字有数据支撑；「AI 计划价/用户输入/上下文文本复述」只是合法引用，并非被快照数据证明。只验证数值是否存在，不代表字段语义与整段结论正确。<template
-          v-if="evHasItems"
+          v-if="evHasDetails"
           >点击查看逐项明细。</template
         >
       </div>
@@ -306,7 +312,7 @@ const hasAny = computed(
           </div>
         </n-collapse-item>
       </n-collapse>
-      <n-empty v-if="!evMatchedItems.length && !evUnmatchedItems.length" description="无明细" size="small" />
+      <n-empty v-if="!evHasDetails" description="无明细" size="small" />
       <div v-if="ev?.truncated" class="ev-trunc">明细已截断至 50 项</div>
     </n-modal>
   </div>

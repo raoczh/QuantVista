@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch } from 'vue'
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -9,6 +9,7 @@ import {
   NSpin,
   NEmpty,
   NPopconfirm,
+  NAlert,
   useMessage,
 } from 'naive-ui'
 import { listNotes, createNote, updateNote, deleteNote, type ResearchNote, type NoteKind } from '@/api/note'
@@ -48,19 +49,27 @@ const loading = ref(false)
 const filterSymbol = ref('')
 const filterStock = ref<StockRef | null>(null)
 const keyword = ref('')
+const loadError = ref('')
+let loadSeq = 0
+let disposed = false
 
 async function load() {
+  const seq = ++loadSeq
   loading.value = true
+  loadError.value = ''
+  notes.value = []
   try {
-    notes.value = await listNotes({
+    const rows = await listNotes({
       symbol: filterSymbol.value.trim() || undefined,
+      market: filterStock.value?.market || undefined,
       keyword: keyword.value.trim() || undefined,
       limit: 100,
     })
+    if (!disposed && seq === loadSeq) notes.value = rows
   } catch (e) {
-    message.error((e as Error).message)
+    if (!disposed && seq === loadSeq) loadError.value = (e as Error).message
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 
@@ -93,6 +102,7 @@ function resetForm() {
 }
 // 顶部按钮切换：收起时无条件清空编辑态，再点开即为新建，不会残留上次的“保存修改”态。
 function toggleForm() {
+  if (saving.value) return
   if (showForm.value) {
     showForm.value = false
     resetForm()
@@ -101,6 +111,7 @@ function toggleForm() {
   }
 }
 function editNote(n: ResearchNote) {
+  if (saving.value || deleting.value.has(n.id)) return
   editingId.value = n.id
   form.value = { symbol: n.symbol, market: n.market || 'cn', kind: n.kind, title: n.title, content: n.content }
   noteStock.value = n.symbol ? { symbol: n.symbol, market: n.market || 'cn', name: n.name || '' } : null
@@ -108,6 +119,7 @@ function editNote(n: ResearchNote) {
 }
 
 async function submit() {
+  if (saving.value) return
   if (!form.value.title.trim() && !form.value.content.trim()) {
     message.warning('标题与内容至少填一个')
     return
@@ -123,28 +135,40 @@ async function submit() {
     }
     if (editingId.value) {
       await updateNote(editingId.value, data)
+      if (disposed) return
       message.success('笔记已更新')
     } else {
       await createNote(data)
+      if (disposed) return
       message.success('笔记已保存')
     }
     showForm.value = false
     resetForm()
     await load()
   } catch (e) {
-    message.error((e as Error).message)
+    if (!disposed) message.error((e as Error).message)
   } finally {
     saving.value = false
   }
 }
 
+const deleting = ref(new Set<number>())
 async function doDelete(n: ResearchNote) {
+  if (saving.value || deleting.value.has(n.id)) return
+  deleting.value.add(n.id)
   try {
     await deleteNote(n.id)
+    if (disposed) return
+    if (editingId.value === n.id) {
+      showForm.value = false
+      resetForm()
+    }
     message.success('已删除')
     await load()
   } catch (e) {
-    message.error((e as Error).message)
+    if (!disposed) message.error((e as Error).message)
+  } finally {
+    deleting.value.delete(n.id)
   }
 }
 
@@ -153,8 +177,10 @@ function fmtTime(t: string) {
 }
 
 function applyStockActionQuery() {
+  if (saving.value) return false
   // 深链预填：/notes?add=1&symbol=（个股入口）；/notes?symbol= 直接过滤时间线。
   if (route.query.symbol) {
+    const filterOnly = route.query.add !== '1'
     if (route.query.add === '1') {
       resetForm()
       updateNoteStock({
@@ -170,16 +196,20 @@ function applyStockActionQuery() {
         name: String(route.query.name || ''),
       })
     }
-    void router.replace({ query: {} })
+    const query = { ...route.query }
+    for (const key of ['symbol', 'market', 'name', 'add', '_stock_action']) delete query[key]
+    void router.replace({ query })
+    return filterOnly
   }
+  return false
 }
 
-watch(() => route.query._stock_action, applyStockActionQuery)
+watch(() => [route.query._stock_action, route.query.symbol, route.query.market, route.query.add, saving.value], applyStockActionQuery)
 
 onMounted(() => {
-  applyStockActionQuery()
-  load()
+  if (!applyStockActionQuery()) void load()
 })
+onUnmounted(() => { disposed = true; loadSeq++ })
 </script>
 
 <template>
@@ -191,7 +221,7 @@ onMounted(() => {
             <StockPicker :model-value="filterStock" class="note-filter-picker" placeholder="按股票筛选" @update:model-value="updateFilterStock" />
             <n-input v-model:value="keyword" size="small" placeholder="搜标题/内容" style="width: 150px" clearable @keyup.enter="load" @clear="load()" />
             <n-button size="small" secondary @click="load">筛选</n-button>
-            <n-button size="small" type="primary" @click="toggleForm">
+            <n-button size="small" type="primary" :disabled="saving" @click="toggleForm">
               {{ showForm ? '收起' : '＋ 记一笔' }}
             </n-button>
           </div>
@@ -199,18 +229,20 @@ onMounted(() => {
 
         <div v-if="showForm" class="form">
           <div class="form-row">
-            <StockPicker :model-value="noteStock" class="note-stock-picker" placeholder="关联股票（可选）" @update:model-value="updateNoteStock" />
-            <n-select v-model:value="form.kind" :options="kindOptions" placeholder="类别" style="max-width: 140px" />
-            <n-input v-model:value="form.title" placeholder="标题（可选）" style="flex: 1" />
+            <StockPicker :model-value="noteStock" :disabled="saving" class="note-stock-picker" placeholder="关联股票（可选）" @update:model-value="updateNoteStock" />
+            <n-select v-model:value="form.kind" :disabled="saving" :options="kindOptions" placeholder="类别" style="max-width: 140px" />
+            <n-input v-model:value="form.title" :disabled="saving" :maxlength="128" placeholder="标题（可选）" style="flex: 1" />
           </div>
-          <n-input v-model:value="form.content" type="textarea" :rows="4" placeholder="正文：当下的判断、依据、情绪、计划……写给未来复盘的自己" />
+          <n-input v-model:value="form.content" :disabled="saving" type="textarea" :rows="4" placeholder="正文：当下的判断、依据、情绪、计划……写给未来复盘的自己" />
           <div class="form-actions">
             <n-button type="primary" :loading="saving" @click="submit">{{ editingId ? '保存修改' : '保存笔记' }}</n-button>
           </div>
         </div>
 
         <n-spin :show="loading">
-          <n-empty v-if="!notes.length" description="还没有笔记——研究中的判断与犹豫，都值得记下来" />
+          <n-alert v-if="loadError" type="warning">{{ loadError }}</n-alert>
+          <div v-else-if="loading && !notes.length" aria-live="polite">正在加载笔记…</div>
+          <n-empty v-else-if="!loading && !notes.length" description="当前筛选下没有笔记" />
           <div v-else class="timeline">
             <div v-for="n in notes" :key="n.id" class="note">
               <div class="note-head">
@@ -228,10 +260,10 @@ onMounted(() => {
                   <span class="note-time">{{ fmtTime(n.created_at) }}</span>
                 </div>
                 <div class="note-ops">
-                  <n-button size="tiny" quaternary @click="editNote(n)">编辑</n-button>
+                  <n-button size="tiny" quaternary :disabled="saving || deleting.has(n.id)" @click="editNote(n)">编辑</n-button>
                   <n-popconfirm @positive-click="doDelete(n)">
                     <template #trigger>
-                      <n-button size="tiny" quaternary type="error">删除</n-button>
+                      <n-button size="tiny" quaternary type="error" :disabled="saving || deleting.has(n.id)">删除</n-button>
                     </template>
                     确认删除这条笔记？
                   </n-popconfirm>

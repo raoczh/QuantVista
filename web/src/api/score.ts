@@ -15,6 +15,7 @@ export interface ScoreView {
   label: string
   bar_count: number
   data_limited: boolean
+  bars_as_of?: string
 }
 
 // 个股综合评分（趋势/动量/位置/量能/风险 5 维加权，纯技术面）。

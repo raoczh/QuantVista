@@ -18,7 +18,10 @@ const (
 	PositionExitDataPartial = "partial"
 	PositionExitDataUnknown = "unknown"
 
-	PositionExitAssessmentVersion = "pea1"
+	// pea2 增加历史复权/峰值质量隔离；已落库的 pea1 事实保持原版本。
+	// pea3 保留均线计算精度，旧版本事实不重写。
+	// pea4 固定 ATR 线侧状态并保留计算精度，核验日线时效及当前持仓依据。
+	PositionExitAssessmentVersion = "pea4"
 )
 
 type PositionExitAssessment struct {
@@ -51,6 +54,7 @@ type PositionExitAssessment struct {
 	MA60            float64 `gorm:"type:decimal(20,4)" json:"ma60"`
 	ATR14           float64 `gorm:"type:decimal(20,4)" json:"atr14"`
 	ATRLine         float64 `gorm:"type:decimal(20,4)" json:"atr_line"`
+	ATRState        string  `gorm:"size:8" json:"-"` // above/below/unknown；按未舍入保护线判断，独立于首次穿越信号。
 
 	SignalsJSON       string `gorm:"type:text" json:"-"`
 	EvidenceJSON      string `gorm:"type:text" json:"-"`
@@ -59,6 +63,7 @@ type PositionExitAssessment struct {
 	SellReviewIDsJSON string `gorm:"type:text" json:"-"`
 	ParamsJSON        string `gorm:"type:text" json:"-"`
 	ParamsHash        string `gorm:"size:64" json:"params_hash"`
+	PositionStateHash string `gorm:"size:64" json:"-"` // 评估时的持仓输入，提交前复验；不重写历史事实。
 	FactHash          string `gorm:"size:64" json:"fact_hash"`
 	EventKey          string `gorm:"size:64;uniqueIndex" json:"event_key"`
 	Version           string `gorm:"size:16" json:"version"`
@@ -72,7 +77,7 @@ type PositionExitAssessment struct {
 }
 
 // PositionExitOutcome 是卖出评估的前向结果台账（问题 1 补强）：pea1 的全部阈值
-//（ATR 倍数、MA 周期、共振升级规则）目前是保守拍定的基线，没有后验测量就永远
+// （ATR 倍数、MA 周期、共振升级规则）目前是保守拍定的基线，没有后验测量就永远
 // 无法基于证据调参。每条盘后（close）评估在 T+H 成熟后回填一次前向收益/最大
 // 不利与有利偏移；normal 级同样回填，作为「有信号 vs 无信号」的对照分母。
 // 纯测量、零 LLM、只写一次（幂等），不改任何生产提醒行为。
@@ -96,10 +101,12 @@ type PositionExitOutcome struct {
 	ParamsHash    string `gorm:"size:64" json:"params_hash"`
 
 	BasePrice        float64 `gorm:"type:decimal(20,4)" json:"base_price"`
+	ForwardPrice     float64 `gorm:"type:decimal(20,4)" json:"forward_price"`      // T+H 收盘原值，用于在收益率展示舍入后仍保留真实涨跌方向；历史行 0 表示未记录
 	ForwardReturnPct float64 `gorm:"type:decimal(12,4)" json:"forward_return_pct"` // T+H 收盘 vs T 收盘
 	MaePct           float64 `gorm:"type:decimal(12,4)" json:"mae_pct"`            // (T,T+H] 最低价 vs T 收盘
 	MfePct           float64 `gorm:"type:decimal(12,4)" json:"mfe_pct"`            // (T,T+H] 最高价 vs T 收盘
 	BarsUsed         int     `json:"bars_used"`
+	DataQuality      string  `gorm:"size:32" json:"data_quality,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
 }

@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { NButton, NEmpty, NInput, NRadioButton, NRadioGroup, NSpin, NTag } from 'naive-ui'
+import { NAlert, NButton, NEmpty, NInput, NRadioButton, NRadioGroup, NSpin, NTag } from 'naive-ui'
 import { getNews, newsSourceLabel, relatedStocks, sentimentTag, type NewsItem, type NewsRelatedStock } from '@/api/news'
 import { useUi, withAlpha } from '@/composables/useUi'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
@@ -39,75 +39,79 @@ const loadingMore = ref(false)
 const loadError = ref('')
 
 // 筛选切换/自动刷新竞态守卫：快速切来源或改代码时旧响应不覆盖新结果。
-// 返回是否成功，供 loadMore 感知刷新失败以回滚分页。
+// 分页上限只在相应请求成功后推进，失效请求不会回滚新筛选的状态。
 let refreshSeq = 0
-async function refresh(silent = false): Promise<boolean> {
+let filterSeq = 0
+async function refresh(silent = false, requestedLimit = limit.value) {
   const mySeq = ++refreshSeq
   if (!silent) loading.value = true
   try {
     const data = await getNews({
       symbol: symbol.value || undefined,
       source: source.value || undefined,
-      limit: limit.value,
+      limit: requestedLimit,
     })
-    if (mySeq !== refreshSeq) return false
+    if (mySeq !== refreshSeq) return
     items.value = data
+    limit.value = requestedLimit
     loadError.value = ''
-    return true
   } catch (e) {
-    if (mySeq !== refreshSeq) return false
-    if (!silent) loadError.value = (e as Error).message
-    return false
+    if (mySeq !== refreshSeq) return
+    loadError.value = e instanceof Error ? e.message : '新闻查询失败'
   } finally {
     if (mySeq === refreshSeq) loading.value = false
   }
 }
 
+function resetFeed() {
+  filterSeq++
+  limit.value = PAGE_SIZE
+  items.value = []
+  loadError.value = ''
+  loadingMore.value = false
+  void refresh()
+}
+
 function applyFilter() {
   symbol.value = symbolInput.value.trim()
-  limit.value = PAGE_SIZE
-  refresh()
+  resetFeed()
 }
 function onSourceChange(v: string) {
   source.value = v
-  limit.value = PAGE_SIZE
-  refresh()
+  resetFeed()
 }
 function clearSymbol() {
   symbolInput.value = ''
   if (symbol.value) {
     symbol.value = ''
-    limit.value = PAGE_SIZE
-    refresh()
+    resetFeed()
   }
 }
 
 // 返回条数打满当前 limit 才可能还有下一页；到后端上限为止。
 const hasMore = computed(() => items.value.length >= limit.value && limit.value < MAX_LIMIT)
 async function loadMore() {
+  if (loading.value || loadingMore.value || !hasMore.value) return
   loadingMore.value = true
-  const prevLimit = limit.value
-  const prevCount = items.value.length
-  limit.value = Math.min(limit.value + PAGE_SIZE, MAX_LIMIT)
+  const owner = filterSeq
   try {
-    const ok = await refresh(true)
-    // 刷新失败且未拿到更多条目：回滚 limit，让“加载更多”按钮保留、下次可重试。
-    if (!ok && items.value.length <= prevCount) limit.value = prevLimit
+    await refresh(true, Math.min(limit.value + PAGE_SIZE, MAX_LIMIT))
   } finally {
-    loadingMore.value = false
+    if (owner === filterSeq) loadingMore.value = false
   }
 }
 
-onMounted(() => {
+watch(() => route.query.symbol, value => {
   // 支持 /news?symbol= 深链（个股详情「更多」入口）。
-  const q = String(route.query.symbol || '').trim()
-  if (q) {
-    symbolInput.value = q
-    symbol.value = q
-  }
-  refresh()
+  const q = String((Array.isArray(value) ? value[0] : value) || '').trim()
+  symbolInput.value = q
+  symbol.value = q
+  resetFeed()
+}, { immediate: true })
+onBeforeUnmount(() => { refreshSeq++; filterSeq++ })
+useAutoRefresh(() => {
+  if (!loading.value && !loadingMore.value) return refresh(true)
 })
-useAutoRefresh(() => refresh(true), 60_000)
 
 // ---------- 展示 ----------
 // 关联标的在 groups 里一次算好：模板里要用 3 次（截断渲染 + 溢出计数），
@@ -163,6 +167,11 @@ function fmtTime(t: string): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
+const latestPublished = computed(() => {
+  const value = items.value[0]?.publish_time
+  return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '未知'
+})
+
 // 电报类 title 常是正文截断，summary 与 title 同头时不重复展示。
 function showSummary(n: NewsItem): boolean {
   const s = (n.summary || '').trim()
@@ -182,11 +191,11 @@ const feedVars = computed(() => ({
 <template>
   <PageContainer title="市场快讯" subtitle="财联社电报 · 东财 7×24 快讯 · 个股新闻，盘中自动更新">
     <template #actions>
-      <n-button size="small" secondary :loading="loading" @click="refresh()">刷新</n-button>
+      <n-button size="small" secondary :loading="loading" :disabled="loadingMore" @click="refresh()">刷新</n-button>
     </template>
 
     <SectionCard :hoverable="false">
-      <p class="feed-status">当前 {{ items.length }} 条 · 最新发布时间 {{ items[0]?.publish_time || '未知' }} · 来源与关联标的均按原始快讯记录展示</p>
+      <p class="feed-status">当前 {{ items.length }} 条 · 最新发布时间 {{ latestPublished }} · 来源与关联标的均按原始快讯记录展示</p>
       <!-- 筛选行 -->
       <div class="filters">
         <n-radio-group :value="source" size="small" @update:value="onSourceChange">
@@ -206,19 +215,18 @@ const feedVars = computed(() => ({
         </n-tag>
       </div>
 
+      <n-alert v-if="loadError" type="warning" class="feed-error" :title="items.length ? '刷新失败，以下为上次成功加载的快讯' : '加载失败'">
+        {{ loadError }}
+        <div class="feed-retry"><n-button size="small" :loading="loading" @click="refresh()">重试</n-button></div>
+      </n-alert>
       <n-spin :show="loading">
-        <n-empty v-if="loadError && !items.length" :description="`加载失败：${loadError}`" class="feed-empty">
-          <template #extra>
-            <n-button size="small" @click="refresh()">重试</n-button>
-          </template>
-        </n-empty>
         <n-empty
-          v-else-if="!items.length"
-          description="暂无快讯，采集任务每 5 分钟入库一轮，稍后再来"
+          v-if="!items.length && !loading && !loadError"
+          description="当前筛选下暂无快讯，采集任务会定期更新"
           class="feed-empty"
         />
 
-        <div v-else class="feed" :style="feedVars">
+        <div v-if="items.length" class="feed" :style="feedVars">
           <template v-for="g in groups" :key="g.key">
             <div class="feed-date">
               <span class="fd-pill">{{ g.label }}</span>
@@ -269,7 +277,7 @@ const feedVars = computed(() => ({
           </template>
 
           <div v-if="hasMore" class="feed-more">
-            <n-button size="small" quaternary :loading="loadingMore" @click="loadMore">
+            <n-button size="small" quaternary :loading="loadingMore" :disabled="loading" @click="loadMore">
               加载更多
             </n-button>
           </div>
@@ -291,6 +299,8 @@ const feedVars = computed(() => ({
   margin-bottom: 14px;
 }
 .feed-status { margin: 0 0 12px; font-size: 12px; opacity: .62; }
+.feed-error { margin-bottom: 14px; }
+.feed-retry { margin-top: 8px; }
 .sym-input {
   width: 260px;
   max-width: 100%;
@@ -437,5 +447,9 @@ a.fi-title:hover {
     width: 38px;
     margin-left: 8px;
   }
+}
+
+@media (max-width: 480px) {
+  .filters :deep(.n-radio-button) { padding: 0 8px; }
 }
 </style>

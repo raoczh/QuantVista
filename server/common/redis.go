@@ -29,6 +29,7 @@ func InitRedis() error {
 	ctx, cancel := context.WithTimeout(ctxBackground, 5*time.Second)
 	defer cancel()
 	if err := RDB.Ping(ctx).Err(); err != nil {
+		_ = RDB.Close()
 		RDB = nil
 		return err
 	}

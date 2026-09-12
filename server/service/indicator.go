@@ -83,11 +83,22 @@ func bollSeries(closes []float64, n int, k float64) (up, mid, low []float64) {
 	m := len(closes)
 	up, mid, low = make([]float64, m), make([]float64, m), make([]float64, m)
 	for i := 0; i < m; i++ {
-		if i < n-1 {
+		if n <= 0 || i < n-1 {
 			up[i], mid[i], low[i] = math.NaN(), math.NaN(), math.NaN()
 			continue
 		}
 		win := closes[i-n+1 : i+1]
+		flat := true
+		for _, value := range win[1:] {
+			if value != win[0] {
+				flat = false
+				break
+			}
+		}
+		if flat {
+			up[i], mid[i], low[i] = win[0], win[0], win[0]
+			continue
+		}
 		var sum float64
 		for _, c := range win {
 			sum += c
@@ -200,14 +211,14 @@ func computeIndicatorSnapshot(price float64, bars []datasource.Bar) *indicatorSn
 	}
 	if m >= atrMinBars {
 		atr := atrSeries(bars, 14)
-		snap.ATR14 = round2(atr[m-1])
+		snap.ATR14 = round4(atr[m-1])
 		snap.ATRPct = round2(atr[m-1] / price * 100)
 	}
 	if m >= bollMinBars {
 		up, mid, low := bollSeries(closes, 20, 2)
-		snap.BollUp = round2(up[m-1])
-		snap.BollMid = round2(mid[m-1])
-		snap.BollLow = round2(low[m-1])
+		snap.BollUp = round4(up[m-1])
+		snap.BollMid = round4(mid[m-1])
+		snap.BollLow = round4(low[m-1])
 		if band := up[m-1] - low[m-1]; band > 0 {
 			snap.BollPos = round2((price - low[m-1]) / band * 100)
 		}
@@ -315,7 +326,7 @@ func (s *IndicatorService) Series(ctx context.Context, market, symbol string, li
 	return &IndicatorSeriesView{
 		Symbol: symbol, Market: market, Dates: dates,
 		DIF: nanToNil(dif, tail, round3), DEA: nanToNil(dea, tail, round3), Hist: nanToNil(hist, tail, round3),
-		BollUp: nanToNil(up, tail, round2), BollMid: nanToNil(mid, tail, round2), BollLow: nanToNil(low, tail, round2),
-		RSI: nanToNil(rsi, tail, round2), ATR: nanToNil(atr, tail, round3),
+		BollUp: nanToNil(up, tail, round4), BollMid: nanToNil(mid, tail, round4), BollLow: nanToNil(low, tail, round4),
+		RSI: nanToNil(rsi, tail, round2), ATR: nanToNil(atr, tail, round4),
 	}, nil
 }

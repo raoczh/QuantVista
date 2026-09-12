@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"errors"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -49,6 +51,7 @@ func (pc *PositionController) Overview(c *gin.Context) {
 		common.ApiErrorMsg(c, err.Error())
 		return
 	}
+	ov.AccountName = account.Name
 	common.ApiSuccess(c, ov)
 }
 
@@ -84,11 +87,11 @@ func (pc *PositionController) Update(c *gin.Context) {
 		return
 	}
 	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
-	if err != nil || service.ValidatePositionAccount(currentUserID(c), account.ID, id) != nil {
+	if err != nil || service.ValidateWritablePositionAccount(currentUserID(c), account.ID, id) != nil {
 		common.ApiErrorMsg(c, "持仓不存在")
 		return
 	}
-	p, err := pc.svc.Update(currentUserID(c), id, in)
+	p, err := pc.svc.UpdateContext(c.Request.Context(), currentUserID(c), id, in)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -112,7 +115,7 @@ func (pc *PositionController) Close(c *gin.Context) {
 		common.ApiErrorMsg(c, "持仓不存在")
 		return
 	}
-	p, err := pc.svc.Close(currentUserID(c), id, in)
+	p, err := pc.svc.CloseContext(c.Request.Context(), currentUserID(c), id, in)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -131,7 +134,7 @@ func (pc *PositionController) Delete(c *gin.Context) {
 		common.ApiErrorMsg(c, "持仓不存在")
 		return
 	}
-	if err := pc.svc.Delete(currentUserID(c), id); err != nil {
+	if err := pc.svc.DeleteContext(c.Request.Context(), currentUserID(c), id); err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
 	}
@@ -145,11 +148,11 @@ func (pc *PositionController) Trades(c *gin.Context) {
 		return
 	}
 	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
-	if err != nil || service.ValidateWritablePositionAccount(currentUserID(c), account.ID, id) != nil {
+	if err != nil || service.ValidatePositionAccount(currentUserID(c), account.ID, id) != nil {
 		common.ApiErrorMsg(c, "持仓不存在")
 		return
 	}
-	rows, err := pc.svc.ListTrades(currentUserID(c), id)
+	rows, err := pc.svc.ListTradesContext(c.Request.Context(), currentUserID(c), id)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -193,7 +196,7 @@ func (pc *PositionController) AddTrade(c *gin.Context) {
 		common.ApiErrorMsg(c, "持仓不存在")
 		return
 	}
-	p, err := pc.svc.AddTrade(currentUserID(c), id, in)
+	p, err := pc.svc.AddTradeContext(c.Request.Context(), currentUserID(c), id, in)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -224,7 +227,7 @@ func (pc *PositionController) LinkRecommendation(c *gin.Context) {
 		common.ApiErrorMsg(c, "持仓不存在")
 		return
 	}
-	p, err := pc.svc.LinkRecommendation(currentUserID(c), id, in.RecommendationID)
+	p, err := pc.svc.LinkRecommendationContext(c.Request.Context(), currentUserID(c), id, in.RecommendationID)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -255,14 +258,14 @@ func (pc *PositionController) Curve(c *gin.Context) {
 			days = n
 		}
 	}
-	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+	account, err := service.ResolvePortfolioAccountContext(c.Request.Context(), currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
 	if err != nil {
 		common.ApiErrorMsg(c, "组合不存在")
 		return
 	}
-	out, err := service.PortfolioCurveByAccount(currentUserID(c), account.ID, model.SnapshotKindReal, days)
+	out, err := service.PortfolioCurveByAccountContext(c.Request.Context(), currentUserID(c), account.ID, model.SnapshotKindReal, days)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "资产曲线读取失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, out)
@@ -279,11 +282,12 @@ func (pc *PositionController) CorpAdjusts(c *gin.Context) {
 	}
 	status := strings.ToLower(strings.TrimSpace(c.Query("status")))
 	if status == "" || status == model.CorpAdjustPending {
-		if _, err := service.GenerateCorpAdjustsForAccount(uid, account.ID, time.Now().Format("2006-01-02")); err != nil {
-			common.SysWarn("生成除权调整建议失败 user=%d: %v", uid, err)
+		if _, err := service.GenerateCorpAdjustsForAccountContext(c.Request.Context(), uid, account.ID, time.Now().Format("2006-01-02")); err != nil {
+			common.ApiErrorMsg(c, "调整建议刷新失败："+err.Error())
+			return
 		}
 	}
-	rows, err := service.ListCorpAdjustsForAccount(uid, account.ID, status)
+	rows, err := service.ListCorpAdjustsForAccountContext(c.Request.Context(), uid, account.ID, status)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -306,13 +310,23 @@ func (pc *PositionController) CorpAdjustAction(c *gin.Context) {
 	}
 	var out *model.PositionCorpAdjust
 	var err error
-	switch strings.ToLower(c.Param("action")) {
+	action := strings.ToLower(c.Param("action"))
+	var body struct {
+		ContextVersion string `json:"context_version"`
+	}
+	if action == "confirm" || action == "dismiss" {
+		if err := c.ShouldBindJSON(&body); err != nil || strings.TrimSpace(body.ContextVersion) == "" {
+			common.ApiErrorMsg(c, "请先刷新调整建议，再核对并操作")
+			return
+		}
+	}
+	switch action {
 	case "confirm":
-		out, err = pc.svc.ConfirmCorpAdjustForAccount(uid, account.ID, id)
+		out, err = pc.svc.ConfirmCorpAdjustForAccountContext(c.Request.Context(), uid, account.ID, id, body.ContextVersion)
 	case "revert":
-		out, err = pc.svc.RevertCorpAdjustForAccount(uid, account.ID, id)
+		out, err = pc.svc.RevertCorpAdjustForAccountContext(c.Request.Context(), uid, account.ID, id)
 	case "dismiss":
-		out, err = pc.svc.DismissCorpAdjustForAccount(uid, account.ID, id)
+		out, err = pc.svc.DismissCorpAdjustForAccountContext(c.Request.Context(), uid, account.ID, id, body.ContextVersion)
 	default:
 		common.ApiErrorMsg(c, "不支持的操作")
 		return
@@ -343,9 +357,9 @@ func Calendar(c *gin.Context) {
 // SellReviews GET /api/positions/sell-reviews?status= —— 卖出复核清单（D16）。
 // status 默认 open；all / resolved / dismissed 可查历史。
 func SellReviews(c *gin.Context) {
-	rows, err := service.ListSellReviews(currentUserID(c), strings.ToLower(strings.TrimSpace(c.Query("status"))))
+	rows, err := service.ListSellReviewsContext(c.Request.Context(), currentUserID(c), strings.ToLower(strings.TrimSpace(c.Query("status"))))
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "卖出复核处理失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, rows)
@@ -364,9 +378,9 @@ func SellReviewAction(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	out, err := service.SetSellReviewStatus(currentUserID(c), id, strings.ToLower(strings.TrimSpace(body.Status)))
+	out, err := service.SetSellReviewStatusContext(c.Request.Context(), currentUserID(c), id, strings.ToLower(strings.TrimSpace(body.Status)))
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "卖出复核处理失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, out)
@@ -386,13 +400,11 @@ func NewPositionAdviceController(svc *service.PositionAdviceService) *PositionAd
 func (ac *PositionAdviceController) Advise(c *gin.Context) {
 	var req service.PositionAdviceRequest
 	// 允许空请求体（不带任何参数 = 分析全部持仓、用默认 LLM 配置）。
-	if c.Request.ContentLength > 0 {
-		if err := c.ShouldBindJSON(&req); err != nil {
-			common.ApiErrorMsg(c, "请求格式错误")
-			return
-		}
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		common.ApiErrorMsg(c, "请求格式错误")
+		return
 	}
-	task, err := ac.svc.AdviseAsync(currentUserID(c), currentRole(c) == model.RoleAdmin, req)
+	task, err := ac.svc.AdviseAsync(currentUserID(c), currentRole(c) == model.RoleAdmin, req, c.Request.Context())
 	if err != nil {
 		common.ApiError(c, err)
 		return

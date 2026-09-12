@@ -1,6 +1,6 @@
 import { onBeforeUnmount, onMounted, watch } from 'vue'
 import { refreshAccessToken } from '@/api/client'
-import { getAccessToken } from '@/api/token'
+import { getAccessToken, getSessionEpoch } from '@/api/token'
 
 interface VisibleTaskPollingOptions {
   activeIntervalMs?: number
@@ -23,6 +23,7 @@ export function useVisibleTaskPolling(
 ) {
   const activeIntervalMs = options.activeIntervalMs ?? 4000
   const idleIntervalMs = options.idleIntervalMs ?? 0
+  const owner = getSessionEpoch()
   let timer: number | undefined
   let inFlight: Promise<void> | null = null
   let rerun = false
@@ -31,6 +32,9 @@ export function useVisibleTaskPolling(
   let streamController: AbortController | null = null
   let reconnectTimer: number | undefined
   let reconnectAttempt = 0
+  const isCurrent = () => mounted && owner === getSessionEpoch()
+  const isCurrentStream = (controller: AbortController) =>
+    isCurrent() && streamController === controller && !controller.signal.aborted && options.enabled?.() !== false
 
   function clearTimer() {
     if (timer !== undefined) {
@@ -40,7 +44,7 @@ export function useVisibleTaskPolling(
   }
 
   function nextDelay() {
-    if (!mounted || document.visibilityState !== 'visible' || options.enabled?.() === false) return 0
+    if (!isCurrent() || document.visibilityState !== 'visible' || options.enabled?.() === false) return 0
     if (hasProcessing()) return activeIntervalMs
     if (streamConnected) return options.safetyIntervalMs ?? 30_000
     return idleIntervalMs
@@ -54,6 +58,7 @@ export function useVisibleTaskPolling(
 
   function refreshNow(): Promise<void> {
     clearTimer()
+    if (!isCurrent()) return Promise.resolve()
     if (inFlight) {
       rerun = true
       return inFlight
@@ -64,8 +69,8 @@ export function useVisibleTaskPolling(
       .finally(() => {
         if (inFlight !== run) return
         inFlight = null
-        if (!mounted) return
-        if (rerun && document.visibilityState === 'visible') {
+        if (!isCurrent()) return
+        if (rerun && document.visibilityState === 'visible' && options.enabled?.() !== false) {
           rerun = false
           void refreshNow()
           return
@@ -122,7 +127,7 @@ export function useVisibleTaskPolling(
 
   function scheduleReconnect() {
     clearReconnectTimer()
-    if (!mounted || document.visibilityState !== 'visible' || options.enabled?.() === false) return
+    if (!isCurrent() || document.visibilityState !== 'visible' || options.enabled?.() === false) return
     const delay = Math.min(15_000, 1000 * 2 ** Math.min(reconnectAttempt, 4))
     reconnectAttempt++
     reconnectTimer = window.setTimeout(() => startEventStream(), delay)
@@ -142,6 +147,7 @@ export function useVisibleTaskPolling(
   }
 
   async function openEventStream(controller: AbortController, retried = false): Promise<void> {
+    if (!isCurrentStream(controller)) return
     const headers = new Headers({ Accept: 'text/event-stream' })
     const token = getAccessToken()
     if (token) headers.set('Authorization', `Bearer ${token}`)
@@ -149,6 +155,10 @@ export function useVisibleTaskPolling(
     if (lastEventID) headers.set('Last-Event-ID', lastEventID)
 
     const response = await fetch('/api/tasks/events', { headers, signal: controller.signal })
+    if (!isCurrentStream(controller)) {
+      await response.body?.cancel().catch(() => undefined)
+      return
+    }
     if (response.status === 401 && !retried && (await refreshAccessToken())) {
       return openEventStream(controller, true)
     }
@@ -160,24 +170,30 @@ export function useVisibleTaskPolling(
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
-    while (true) {
-      const { value, done } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      buffer = buffer.replace(/\r\n/g, '\n')
-      let boundary = buffer.indexOf('\n\n')
-      while (boundary >= 0) {
-        processEventBlock(buffer.slice(0, boundary))
-        buffer = buffer.slice(boundary + 2)
-        boundary = buffer.indexOf('\n\n')
+    try {
+      while (isCurrentStream(controller)) {
+        const { value, done } = await reader.read()
+        if (!isCurrentStream(controller)) return
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        buffer = buffer.replace(/\r\n/g, '\n')
+        let boundary = buffer.indexOf('\n\n')
+        while (boundary >= 0) {
+          processEventBlock(buffer.slice(0, boundary))
+          buffer = buffer.slice(boundary + 2)
+          boundary = buffer.indexOf('\n\n')
+        }
       }
+      buffer += decoder.decode()
+      if (isCurrentStream(controller) && buffer.trim()) processEventBlock(buffer)
+    } finally {
+      await reader.cancel().catch(() => undefined)
+      reader.releaseLock()
     }
-    buffer += decoder.decode()
-    if (buffer.trim()) processEventBlock(buffer)
   }
 
   function startEventStream() {
-    if (options.events === false || streamController || !mounted || document.visibilityState !== 'visible') return
+    if (options.events === false || streamController || !isCurrent() || document.visibilityState !== 'visible') return
     if (options.enabled?.() === false) return
     clearReconnectTimer()
     const controller = new AbortController()

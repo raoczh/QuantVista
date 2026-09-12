@@ -221,7 +221,7 @@ func strategyRunSeedBinding(seed strategyRunSeed) durableJobBinding {
 }
 
 func loadStrategyRunForExecution(ctx context.Context, userID int64, kind string, raw json.RawMessage) (*model.StrategyRunResult, error) {
-	if err := ensureEnabledJobUser(userID); err != nil {
+	if err := ensureEnabledJobUser(userID, ctx); err != nil {
 		return nil, err
 	}
 	resultID, ok := currentJobResultID(ctx)
@@ -232,8 +232,9 @@ func loadStrategyRunForExecution(ctx context.Context, userID int64, kind string,
 	if err := json.Unmarshal(raw, &snapshot); err != nil || snapshot.Version != 1 {
 		return nil, errors.New("策略研究作业快照无效")
 	}
+	execution, _ := currentJobExecution(ctx)
 	var row model.StrategyRunResult
-	if err := common.DB.Where("id = ? AND user_id = ? AND kind = ?", resultID, userID, kind).First(&row).Error; err != nil {
+	if err := common.DB.WithContext(ctx).Where("id = ? AND user_id = ? AND kind = ? AND job_run_id = ?", resultID, userID, kind, execution.jobID).First(&row).Error; err != nil {
 		return nil, err
 	}
 	if len(row.RequestJSON) == 0 || len(row.RequestJSON) > strategyRunRequestMaxBytes ||
@@ -247,14 +248,20 @@ func loadStrategyRunForExecution(ctx context.Context, userID int64, kind string,
 		return nil, errors.New("策略研究作业快照与结果引用不一致")
 	}
 	now := time.Now()
-	res := common.DB.Model(&model.StrategyRunResult{}).
-		Where("id = ? AND user_id = ? AND job_run_id = ? AND status = ?", row.ID, userID, row.JobRunID, model.JobStatusQueued).
-		Updates(map[string]any{"status": model.JobStatusRunning, "started_at": now, "updated_at": now})
-	if res.Error != nil {
-		return nil, res.Error
-	}
-	if res.RowsAffected != 1 {
-		return nil, errors.New("策略研究结果已被其他执行器接管")
+	err := withJobResultTransaction(ctx, func(tx *gorm.DB) error {
+		res := tx.Model(&model.StrategyRunResult{}).
+			Where("id = ? AND user_id = ? AND job_run_id = ? AND status = ?", row.ID, userID, execution.jobID, model.JobStatusQueued).
+			Updates(map[string]any{"status": model.JobStatusRunning, "started_at": now, "updated_at": now})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected != 1 {
+			return errors.New("策略研究结果已被其他执行器接管")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	row.Status, row.StartedAt = model.JobStatusRunning, &now
 	return &row, nil
@@ -321,16 +328,16 @@ func finishStrategyRunFailure(tx *gorm.DB, run *model.JobRun, status, code, mess
 	return nil
 }
 
-func (s *ScreenerService) StartScanJob(userID int64, req ScanRequest) (*StrategyRunView, error) {
-	seed, snapshot, err := s.prepareScanJob(userID, req)
+func (s *ScreenerService) StartScanJob(userID int64, req ScanRequest, contexts ...context.Context) (*StrategyRunView, error) {
+	seed, snapshot, err := s.prepareScanJob(userID, req, contexts...)
 	if err != nil {
 		return nil, err
 	}
-	return startStrategyRunJob(userID, seed, snapshot)
+	return startStrategyRunJob(userID, seed, snapshot, contexts...)
 }
 
-func (s *ScreenerService) prepareScanJob(userID int64, req ScanRequest) (strategyRunSeed, strategyJobSnapshot, error) {
-	resolved, err := s.resolveStrategy(userID, req)
+func (s *ScreenerService) prepareScanJob(userID int64, req ScanRequest, contexts ...context.Context) (strategyRunSeed, strategyJobSnapshot, error) {
+	resolved, err := s.resolveStrategy(userID, req, contexts...)
 	if err != nil {
 		return strategyRunSeed{}, strategyJobSnapshot{}, err
 	}
@@ -369,18 +376,18 @@ func (s *ScreenerService) prepareScanJob(userID int64, req ScanRequest) (strateg
 	return finalizeStrategyRunSeed(seed, normalized)
 }
 
-func (s *BacktestService) StartBacktestJob(userID int64, req BacktestRequest) (*StrategyRunView, error) {
-	seed, snapshot, err := s.prepareBacktestJob(userID, req)
+func (s *BacktestService) StartBacktestJob(userID int64, req BacktestRequest, contexts ...context.Context) (*StrategyRunView, error) {
+	seed, snapshot, err := s.prepareBacktestJob(userID, req, contexts...)
 	if err != nil {
 		return nil, err
 	}
-	return startStrategyRunJob(userID, seed, snapshot)
+	return startStrategyRunJob(userID, seed, snapshot, contexts...)
 }
 
-func (s *BacktestService) prepareBacktestJob(userID int64, req BacktestRequest) (strategyRunSeed, strategyJobSnapshot, error) {
+func (s *BacktestService) prepareBacktestJob(userID int64, req BacktestRequest, contexts ...context.Context) (strategyRunSeed, strategyJobSnapshot, error) {
 	screener := &ScreenerService{}
 	resolved, err := screener.resolveStrategy(userID, ScanRequest{StrategyKey: req.StrategyKey,
-		StrategyID: req.StrategyID, StrategyRevisionID: req.StrategyRevisionID, Tree: req.Tree})
+		StrategyID: req.StrategyID, StrategyRevisionID: req.StrategyRevisionID, Tree: req.Tree}, contexts...)
 	if err != nil {
 		return strategyRunSeed{}, strategyJobSnapshot{}, err
 	}
@@ -436,19 +443,39 @@ func finalizeStrategyRunSeed(seed strategyRunSeed, request any) (strategyRunSeed
 	return seed, snapshot, nil
 }
 
-func startStrategyRunJob(userID int64, seed strategyRunSeed, snapshot strategyJobSnapshot) (*StrategyRunView, error) {
+func startStrategyRunJob(userID int64, seed strategyRunSeed, snapshot strategyJobSnapshot, contexts ...context.Context) (*StrategyRunView, error) {
 	binding := strategyRunSeedBinding(seed)
-	run, err := defaultJobRuntime.startWithBinding(userID, seed.Kind, snapshot, false, nil, nil, &binding)
+	create := binding.create
+	var submitted *StrategyRunView
+	// 新作业的完整回执在提交前读取；读取失败时随占位记录一起回滚。
+	// 已复用的在途作业没有本次新写入，仍按其已有引用读取。
+	binding.create = func(tx *gorm.DB, run *model.JobRun, raw json.RawMessage) (int64, error) {
+		id, err := create(tx, run, raw)
+		if err != nil {
+			return 0, err
+		}
+		var row model.StrategyRunResult
+		if err := tx.Where("id = ? AND user_id = ? AND job_run_id = ?", id, userID, run.ID).First(&row).Error; err != nil {
+			return 0, err
+		}
+		view := strategyRunView(row, true)
+		submitted = &view
+		return id, nil
+	}
+	run, err := defaultJobRuntime.startWithBinding(userID, seed.Kind, snapshot, false, nil, nil, &binding, contexts...)
 	if err != nil {
 		return nil, err
 	}
 	if run.ResultID == nil {
 		return nil, errors.New("策略研究作业缺少结果引用")
 	}
-	return GetStrategyRun(userID, seed.Kind, *run.ResultID)
+	if submitted != nil && submitted.JobRunID == run.ID && submitted.ID == *run.ResultID {
+		return submitted, nil
+	}
+	return GetStrategyRun(userID, seed.Kind, *run.ResultID, contexts...)
 }
 
-func ListStrategyRuns(userID int64, kind string, limit int) ([]StrategyRunView, error) {
+func ListStrategyRuns(userID int64, kind string, limit int, contexts ...context.Context) ([]StrategyRunView, error) {
 	if common.DB == nil || userID <= 0 {
 		return nil, errors.New("数据库不可用")
 	}
@@ -461,7 +488,7 @@ func ListStrategyRuns(userID int64, kind string, limit int) ([]StrategyRunView, 
 		limit = 100
 	}
 	var rows []model.StrategyRunResult
-	if err := common.DB.Model(&model.StrategyRunResult{}).
+	if err := common.DB.WithContext(jobSubmissionContext(contexts...)).Model(&model.StrategyRunResult{}).
 		Select("id", "job_run_id", "kind", "strategy_identity", "strategy_key", "strategy_id", "strategy_revision_id",
 			"strategy_revision", "strategy_hash", "strategy_name", "request_hash", "as_of", "content_hash", "status",
 			"error", "error_code", "started_at", "finished_at", "created_at", "updated_at").
@@ -475,7 +502,7 @@ func ListStrategyRuns(userID int64, kind string, limit int) ([]StrategyRunView, 
 	return views, nil
 }
 
-func GetStrategyRun(userID int64, kind string, id int64) (*StrategyRunView, error) {
+func GetStrategyRun(userID int64, kind string, id int64, contexts ...context.Context) (*StrategyRunView, error) {
 	if common.DB == nil || userID <= 0 || id <= 0 {
 		return nil, ErrJobNotFound
 	}
@@ -483,7 +510,7 @@ func GetStrategyRun(userID int64, kind string, id int64) (*StrategyRunView, erro
 		return nil, ErrJobNotFound
 	}
 	var row model.StrategyRunResult
-	if err := common.DB.Where("id = ? AND user_id = ? AND kind = ?", id, userID, kind).First(&row).Error; err != nil {
+	if err := common.DB.WithContext(jobSubmissionContext(contexts...)).Where("id = ? AND user_id = ? AND kind = ?", id, userID, kind).First(&row).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, ErrJobNotFound
 		}

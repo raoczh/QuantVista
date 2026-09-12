@@ -14,6 +14,10 @@ func TestIsWeakSecret(t *testing.T) {
 		"your-github-oauth-app-client-id",
 		"please-change-me",
 		"ChangeMe123",
+		"a",
+		"password",
+		"0123456789abcde", // 15 字节，不能因不含占位关键字就允许上线。
+		"                a                ",
 	}
 	for _, v := range weak {
 		if !isWeakSecret(v) {

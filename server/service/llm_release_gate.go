@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -96,9 +97,14 @@ func parseReleaseAudit(content string) (*releaseAuditResult, error) {
 			f.Severity = "med"
 		}
 		norm = append(norm, f)
-		if len(norm) >= releaseAuditMaxFindings {
-			break
-		}
+	}
+	// 展示条数限制不能变成判定范围：第九项及之后的 high 也必须阻止发布。
+	// 优先保留高风险说明，避免工件虽为 fail 却隐藏了实际否决原因。
+	sort.SliceStable(norm, func(i, j int) bool {
+		return norm[i].Severity == "high" && norm[j].Severity != "high"
+	})
+	if len(norm) > releaseAuditMaxFindings {
+		norm = norm[:releaseAuditMaxFindings]
 	}
 	out.Findings = norm
 	out.Summary = truncateRunes(strings.TrimSpace(out.Summary), 400)
@@ -163,7 +169,7 @@ func RunLLMExperimentAudit(ctx context.Context, expID int64) (*model.LLMReleaseA
 		markExperimentBaselineInvalid(common.DB, &exp, reason)
 		return nil, &experimentBaselineStaleError{reason: reason}
 	}
-	cfg, apiKey, adminID, err := resolveNewsLLM()
+	cfg, apiKey, adminID, err := resolveNewsLLM(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("发布审计不可用（系统默认 LLM 未就绪）：%v", err)
 	}
@@ -184,6 +190,11 @@ func RunLLMExperimentAudit(ctx context.Context, expID int64) (*model.LLMReleaseA
 	if err != nil {
 		return nil, err
 	}
+	ctx, finishQuota, err := beginManualQuotaAction(ctx, adminID)
+	if err != nil {
+		return nil, err
+	}
+	defer finishQuota()
 	convo := []chatMessage{
 		{Role: "system", Content: releaseAuditSystem},
 		{Role: "user", Content: "待审计的实验材料如下（JSON；champion_content 为实验创建时固化的对照基线任务段，challenger_content 为待晋级任务段）：\n" + string(inputJSON)},
@@ -201,7 +212,7 @@ func RunLLMExperimentAudit(ctx context.Context, expID int64) (*model.LLMReleaseA
 		res, cerr := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			ReasoningEffort: cfg.ReasoningEffort,
-			Temperature: cfg.Temperature, MaxTokens: requestMax,
+			Temperature:     cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: llmAllowPrivate(false, cfg),
 			Repair: attempt > 0,
 			Meta:   run.chatMeta(adminID, cfg, attempt+1),
@@ -231,7 +242,7 @@ func RunLLMExperimentAudit(ctx context.Context, expID int64) (*model.LLMReleaseA
 	}
 	if usage.TotalTokens > 0 {
 		// 手动管理员动作：token 记配置所有者并计一次动作（screener_parse 同款语义）。
-		consumeQuota(adminID, usage.TotalTokens, true)
+		consumeQuota(adminID, usage.TotalTokens)
 	}
 
 	row := model.LLMReleaseAudit{
@@ -306,13 +317,15 @@ func latestReleaseAudit(expID int64) *model.LLMReleaseAudit {
 	return latestReleaseAuditDB(common.DB, expID)
 }
 
-// ListLLMReleaseAudits 实验全部审计工件（详情页展示，倒序）。
-func ListLLMReleaseAudits(expID int64) []model.LLMReleaseAudit {
+// ListLLMReleaseAudits 实验最近 20 次审计工件（倒序），读取错误不能伪装成空工件。
+func ListLLMReleaseAudits(expID int64) ([]model.LLMReleaseAudit, error) {
+	return listLLMReleaseAuditsDB(common.DB, expID)
+}
+
+func listLLMReleaseAuditsDB(db *gorm.DB, expID int64) ([]model.LLMReleaseAudit, error) {
 	var rows []model.LLMReleaseAudit
-	if err := common.DB.Where("experiment_id = ?", expID).Order("id DESC").Limit(20).Find(&rows).Error; err != nil {
-		return nil
-	}
-	return rows
+	err := db.Where("experiment_id = ?", expID).Order("id DESC").Limit(20).Find(&rows).Error
+	return rows, err
 }
 
 // experimentRollbackStale 判定 promoted 实验的回滚是否已失去对象（审查修复批）：

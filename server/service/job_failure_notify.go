@@ -56,6 +56,13 @@ func reserveJobFailureNotice(run model.JobRun, enabled bool, now time.Time) (job
 	summary := jobFailureSummary(code)
 
 	err := common.DB.Transaction(func(tx *gorm.DB) error {
+		if enabled {
+			// 合并窗口必须在锁后建立读视图，否则等待期间另一失败已提交的 root
+			// 会被旧快照漏掉，后续当前读 UPDATE 反而释放它的组键，造成重复外发。
+			if err := lockNotificationUser(tx, userID); err != nil {
+				return err
+			}
+		}
 		var existing model.JobFailureNotification
 		if err := tx.Where("job_run_id = ?", run.ID).First(&existing).Error; err == nil {
 			claim.Notice = existing

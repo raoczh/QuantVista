@@ -39,10 +39,12 @@ export type WatchlistItemBase = Omit<
   'price' | 'change_pct' | 'quote_ok' | 'data_time' | 'freshness_status'
 >
 
-export interface MissedOpportunity extends WatchlistItem {
+export interface MissedOpportunity extends WatchlistItemBase {
+  quote_ok: boolean
   current_price: number
   change_since_pct: number
-  verdict: 'missed_gain' | 'avoided_loss' | 'neutral' | 'no_base' | 'stale_quote'
+  verdict: 'missed_gain' | 'avoided_loss' | 'neutral' | 'no_base' | 'stale_quote' | 'no_quote' | 'comparison_unknown'
+  comparison_note?: string
   quote_as_of?: string // 行情数据源时刻（stale 时为最近已知）
   last_price?: number // 最近已知价（stale 展示用，不参与结论）
 }
@@ -65,16 +67,16 @@ export interface WatchlistItemInput {
   watchlist_id?: number
 }
 
-export function listWatchlists() {
-  return request<WatchlistGroup[]>({ url: '/watchlists' })
+export function listWatchlists(signal?: AbortSignal) {
+  return request<WatchlistGroup[]>({ url: '/watchlists', signal })
 }
 
 export function createGroup(name: string) {
-  return request<WatchlistGroup>({ url: '/watchlists', method: 'post', data: { name } })
+  return request<Omit<WatchlistGroup, 'items'>>({ url: '/watchlists', method: 'post', data: { name } })
 }
 
-export function updateGroup(id: number, name: string, sortOrder = 0) {
-  return request<WatchlistGroup>({
+export function updateGroup(id: number, name: string, sortOrder?: number) {
+  return request<Omit<WatchlistGroup, 'items'>>({
     url: `/watchlists/${id}`,
     method: 'put',
     data: { name, sort_order: sortOrder },
@@ -106,7 +108,7 @@ export function deleteItem(itemId: number) {
 }
 
 export function setItemStage(itemId: number, stage: ResearchStage, reason = '') {
-  return request<WatchlistItem>({
+  return request<WatchlistItemBase>({
     url: `/watchlist-items/${itemId}/stage`,
     method: 'put',
     data: { stage, reason },

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -36,7 +37,7 @@ func (s *AnalysisService) buildContext(ctx context.Context, userID int64, req An
 	switch req.Module {
 	case model.AnalysisModuleStock:
 		if req.AsOf != "" {
-			ac, err = s.buildStockContextAsOf(req)
+			ac, err = s.buildStockContextAsOf(ctx, req)
 		} else {
 			ac, err = s.buildStockContext(ctx, req.Market, req.Symbol)
 		}
@@ -91,12 +92,12 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 		"market": mkt,
 		"name":   q.Name,
 		"quote": map[string]any{
-			"price":      round2(q.Price),
+			"price":      round4(q.Price),
 			"change_pct": round2(q.ChangePct),
-			"open":       round2(q.Open),
-			"high":       round2(q.High),
-			"low":        round2(q.Low),
-			"prev_close": round2(q.PrevClose),
+			"open":       round4(q.Open),
+			"high":       round4(q.High),
+			"low":        round4(q.Low),
+			"prev_close": round4(q.PrevClose),
 			"amount":     round2(q.Amount),
 			"data_time":  q.DataTime,
 			"source":     q.Source,
@@ -399,11 +400,13 @@ func stockCorpEventsBlock(mkt, symbol string, now time.Time) (map[string]any, []
 // computeTechnicals 从升序日线（最新在末尾）算常用技术指标。
 func computeTechnicals(bars []datasource.Bar) map[string]any {
 	n := len(bars)
+	if n == 0 {
+		return map[string]any{"bar_count": 0, "change_note": "日线数据不足，技术指标不可用"}
+	}
 	closes := make([]float64, n)
 	for i, b := range bars {
 		closes[i] = b.Close
 	}
-	last := closes[n-1]
 	// 区间高低与阶段涨跌。
 	hi, lo := bars[0].High, bars[0].Low
 	for _, b := range bars {
@@ -414,22 +417,17 @@ func computeTechnicals(bars []datasource.Bar) map[string]any {
 			lo = b.Low
 		}
 	}
-	changeOver := func(w int) float64 {
-		if n <= w {
-			return 0
-		}
-		prev := closes[n-1-w]
-		if prev == 0 {
-			return 0
-		}
-		return round2((last - prev) / prev * 100)
-	}
 	tech := map[string]any{
-		"period_high":    round2(hi),
-		"period_low":     round2(lo),
-		"change_pct_5d":  changeOver(5),
-		"change_pct_20d": changeOver(20),
-		"bar_count":      n,
+		"period_high": hi,
+		"period_low":  lo,
+		"bar_count":   n,
+	}
+	for _, period := range []int{5, 20} {
+		if n > period && closes[n-1-period] > 0 {
+			tech[fmt.Sprintf("change_pct_%dd", period)] = changeOverN(closes, period)
+		} else {
+			tech["change_note"] = "日线不足，未满窗口的阶段涨跌幅缺失"
+		}
 	}
 	// 均线：数据不足时省略该键而非注入 0——0 会被模型当成真实均价得出
 	// 「现价远高于 MA20」类幻觉结论。
@@ -438,11 +436,9 @@ func computeTechnicals(bars []datasource.Bar) map[string]any {
 			tech["ma_note"] = "日线不足，部分均线缺失"
 			continue
 		}
-		sum := 0.0
-		for _, c := range closes[n-w:] {
-			sum += c
+		if value, ok := movingAverage(closes, w); ok {
+			tech[fmt.Sprintf("ma%d", w)] = value
 		}
-		tech[fmt.Sprintf("ma%d", w)] = round2(sum / float64(w))
 	}
 	return tech
 }
@@ -457,10 +453,10 @@ func compactBars(bars []datasource.Bar, keep int) []map[string]any {
 	for _, b := range tail {
 		out = append(out, map[string]any{
 			"d": b.TradeDate,
-			"o": round2(b.Open),
-			"h": round2(b.High),
-			"l": round2(b.Low),
-			"c": round2(b.Close),
+			"o": b.Open,
+			"h": b.High,
+			"l": b.Low,
+			"c": b.Close,
 			"v": b.Volume,
 		})
 	}
@@ -520,7 +516,7 @@ func (s *AnalysisService) buildSectorContext(ctx context.Context, market, target
 	// P3b：focus 名精确匹配到行业板块（估值聚合表 board_name）时注入两段板块级数据。
 	// 概念板块/未匹配自然缺席，guidance 已声明按缺失处理；数值叶子经 snapshotLabeledValues
 	// 自动进核验值域，无需手工登记。
-	if bv, code := boardValuationByName(strings.TrimSpace(target)); bv != nil {
+	if bv, code := boardValuationByName(strings.TrimSpace(target), ctx); bv != nil {
 		snap["board_valuation"] = bv
 		if s.board != nil {
 			// 资金流只取近 10 日 + 汇总（板块级证据足够，控制快照预算）。
@@ -568,11 +564,11 @@ outer:
 					row["quote_as_of"] = it.DataTime.In(time.Local).Format("2006-01-02 15:04")
 				}
 				if it.FreshnessStatus == freshStatusFresh {
-					row["price"] = round2(it.Price)
+					row["price"] = round4(it.Price)
 					row["change_pct"] = round2(it.ChangePct)
 				} else {
 					staleCount++
-					row["last_known_price"] = round2(it.Price)
+					row["last_known_price"] = round4(it.Price)
 					row["quote_note"] = "行情已过期或时效无法核验：现价与当日涨跌未知，last_known_price 仅为最近已知价，不得当作当前价格参与结论"
 				}
 			}
@@ -602,7 +598,11 @@ outer:
 // --- 持仓 ---
 
 func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64) (*analysisContext, error) {
-	views, err := s.position.List(ctx, userID, "all")
+	account, err := ResolvePortfolioAccount(userID, 0, model.PortfolioKindReal)
+	if err != nil {
+		return nil, err
+	}
+	views, err := s.position.ListByAccount(ctx, userID, account.ID, "all")
 	if err != nil {
 		return nil, err
 	}
@@ -613,6 +613,29 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 	var totalCost, totalMV, totalPnL float64
 	quoteFailed := 0 // 行情失败/过期、未计入市值/盈亏的持仓数（部分估值透明化）
 	quoteStale := 0  // 其中「取到但已过期」的仓数（fail-closed：旧价不参与当前汇总）
+	holdingCount, pricedCount := 0, 0
+	// 汇总覆盖整个默认账户，不受喂给模型的明细条数上限影响。
+	for _, v := range views {
+		if v.Status != model.PositionStatusHolding {
+			continue
+		}
+		holdingCount++
+		if v.QuoteOK {
+			pricedCount++
+			totalCost += v.Cost
+			totalMV += v.MarketValue
+			totalPnL += v.ProfitAmount
+		} else {
+			quoteFailed++
+			if v.LastPrice > 0 {
+				quoteStale++
+			}
+		}
+	}
+	// 当前持仓优先于历史平仓，保留同状态内原有的新旧顺序。
+	sort.SliceStable(views, func(i, j int) bool {
+		return views[i].Status == model.PositionStatusHolding && views[j].Status != model.PositionStatusHolding
+	})
 	for _, v := range views {
 		// quantity 语义对 AI 保持不变：持仓中=当前持有股数；已平仓=**累计买入股数**
 		// （B5 后 Position.Quantity 在清仓时归 0，直接给 0 会让 AI 以为这笔从没买过；
@@ -625,10 +648,11 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 			"name":      v.Name,
 			"symbol":    v.Symbol,
 			"market":    v.Market,
+			"currency":  v.Currency,
 			"type":      v.PositionType,
 			"status":    v.Status,
-			"buy_price": round2(v.BuyPrice),
-			"quantity":  round2(qty),
+			"buy_price": round4(v.BuyPrice),
+			"quantity":  round4(qty),
 			"cost":      round2(v.Cost),
 		}
 		// 逐仓行情时效元数据（字符串值不进数值核验值域）：AI 必须能区分
@@ -640,14 +664,12 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 			}
 		}
 		if v.QuoteOK {
-			row["current_price"] = round2(v.CurrentPrice)
+			row["current_price"] = round4(v.CurrentPrice)
 			row["profit_amount"] = round2(v.ProfitAmount)
 			row["profit_pct"] = round2(v.ProfitPct)
 		} else if v.Status == model.PositionStatusHolding {
-			quoteFailed++
 			if v.LastPrice > 0 {
-				quoteStale++
-				row["last_known_price"] = round2(v.LastPrice)
+				row["last_known_price"] = round4(v.LastPrice)
 				row["quote_note"] = "行情已过期（数据失效，非当前盘面）：现价与盈亏未知，last_known_price 仅为最近已知价，禁止据此计算当前盈亏或给出割/守/补结论"
 				if v.StaleReason != "" {
 					row["stale_reason"] = v.StaleReason
@@ -660,11 +682,6 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 			row["buy_reason"] = v.BuyReason
 		}
 		rows = append(rows, row)
-		if v.Status == model.PositionStatusHolding && v.QuoteOK {
-			totalCost += v.Cost
-			totalMV += v.MarketValue
-			totalPnL += v.ProfitAmount
-		}
 		if len(rows) >= 60 {
 			break
 		}
@@ -674,14 +691,29 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 		pnlPct = totalPnL / totalCost * 100
 	}
 	snap := map[string]any{
-		"count": len(rows),
+		"count":      len(views),
+		"account":    map[string]any{"id": account.ID, "name": account.Name, "currency": account.Currency},
+		"scope_note": "本次仅分析默认真实账户，不代表该用户的全部账户",
 		"holding_summary": map[string]any{
-			"total_cost":   round2(totalCost),
-			"market_value": round2(totalMV),
-			"profit":       round2(totalPnL),
-			"profit_pct":   round2(pnlPct),
+			"total_cost":    round2(totalCost),
+			"market_value":  round2(totalMV),
+			"profit":        round2(totalPnL),
+			"profit_pct":    round2(pnlPct),
+			"holding_count": holdingCount,
+			"priced_count":  pricedCount,
+			"partial":       quoteFailed > 0,
 		},
 		"positions": rows,
+	}
+	if len(rows) < len(views) {
+		snap["positions_truncated"] = true
+	}
+	if holdingCount > 0 && pricedCount == 0 {
+		// 全部缺价时没有有效的金额观测，不能把“未知”写成四个零。
+		summary := snap["holding_summary"].(map[string]any)
+		for _, key := range []string{"total_cost", "market_value", "profit", "profit_pct"} {
+			delete(summary, key)
+		}
 	}
 	// 部分估值透明化：行情失败/过期的仓位被排除在汇总之外——组合并非完整定价时必须
 	// 告知模型，禁止其对现价未知的仓位强行给出割/守/补结论（禁骑墙纪律只约束有当前
@@ -701,15 +733,16 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 	// 决定「割/守/补」的容错空间（满仓亏损与三成仓亏损是两种处境）。
 	var pref model.UserPreference
 	if err := common.DB.Where("user_id = ?", userID).First(&pref).Error; err == nil && pref.TotalCapital > 0 {
-		ratio := 0.0
-		if pref.TotalCapital > 0 {
-			ratio = totalMV / pref.TotalCapital * 100
+		capital := map[string]any{
+			"total_capital": round2(pref.TotalCapital),
+			"note":          "total_capital 为用户设定的总投资资金（元）；holding_ratio_pct 仅表示本次默认账户市值占该资金的比例，不代表全账户仓位或可用现金，不能据此推算补仓余地",
 		}
-		snap["capital_context"] = map[string]any{
-			"total_capital":     round2(pref.TotalCapital),
-			"holding_ratio_pct": round2(ratio),
-			"note":              "total_capital 为用户设定的总投资资金（元）；holding_ratio_pct 为当前持仓市值占总资金比例(%)，反映仓位水平与补仓余地",
+		if quoteFailed == 0 {
+			capital["holding_ratio_pct"] = round2(totalMV / pref.TotalCapital * 100)
+		} else {
+			capital["holding_ratio_note"] = "存在未定价仓位，完整持仓比例未知，禁止按已定价部分推断轻仓或补仓资金"
 		}
+		snap["capital_context"] = capital
 	}
 	return &analysisContext{Label: "持仓", Snapshot: fitBudget(snap)}, nil
 }

@@ -2,6 +2,7 @@
 import { computed, h, type VNode } from 'vue'
 import {
   NButton,
+  NAlert,
   NCollapse,
   NCollapseItem,
   NForm,
@@ -25,25 +26,35 @@ const capPreset = defineModel<number>('capPreset', { required: true })
 
 const props = defineProps<{
   pref: UserPreference | null
+  preferenceLoading: boolean
+  preferenceError: string
   strategyOptions: SelectOption[]
+  strategiesLoading: boolean
+  strategiesError?: string
   strategyDesc?: string
   marketOptions: Array<{ label: string; value: string }>
   pricePresetOptions: Array<{ label: string; value: number }>
   capPresetOptions: Array<{ label: string; value: number }>
   llmOptions: Array<{ label: string; value: number }>
   llmConfigured: boolean
+  llmLoading: boolean
+  llmError: string
   running: boolean
+  submitting: boolean
   savingFilters: boolean
 }>()
 const emit = defineEmits<{
   (event: 'generate'): void
+  (event: 'reload-strategies'): void
+  (event: 'reload-preference'): void
+  (event: 'reload-llm'): void
   (event: 'save-filters'): void
   (event: 'preferences'): void
   (event: 'onboarding'): void
 }>()
 
-const riskLabel = computed(() => ({ conservative: '保守', aggressive: '激进', balanced: '均衡' })[props.pref?.risk_level || 'balanced'])
-const horizonLabel = computed(() => ({ short_term: '短线', mid_term: '中线', long_term: '长线' })[props.pref?.horizon_pref || 'long_term'])
+const riskLabel = computed(() => props.pref ? ({ conservative: '保守', aggressive: '激进', balanced: '均衡' })[props.pref.risk_level] : '未知')
+const horizonLabel = computed(() => props.pref ? ({ short_term: '短线', mid_term: '中线', long_term: '长线' })[props.pref.horizon_pref] : '偏好未读取')
 const callBudget = computed(() => 1 + (form.value.verify ? 1 : 0) + (form.value.bear_check ? 1 : 0))
 /** 下拉菜单项：名称 + 副标题（周期·风险·讲解首句）。只作用于菜单（render-option），
  * 选中后输入框内仍显示纯名称——render-label 会同时用于输入框，双行块会把选框撑爆。 */
@@ -57,7 +68,7 @@ function renderStrategyOption({ node, option }: { node: VNode; option: SelectOpt
 <template>
   <SectionCard title="推荐生成">
     <template #extra>
-      <n-button size="tiny" quaternary @click="emit('preferences')">投资偏好</n-button>
+      <n-button size="tiny" quaternary :disabled="savingFilters || submitting" @click="emit('preferences')">投资偏好</n-button>
       <n-button size="tiny" quaternary @click="emit('onboarding')">首次使用引导</n-button>
     </template>
 
@@ -67,7 +78,11 @@ function renderStrategyOption({ node, option }: { node: VNode; option: SelectOpt
       <span>本次最多启用 {{ callBudget }} 个 AI 角色；结构修复仍遵循服务端原预算。</span>
     </div>
 
-    <n-form label-placement="top" :show-feedback="false" class="form">
+    <n-alert v-if="preferenceError" type="warning" :bordered="false" class="read-error">
+      {{ preferenceError }}，本次仍可按表单中的参数明确生成。
+      <n-button size="tiny" :loading="preferenceLoading" @click="emit('reload-preference')">重试偏好读取</n-button>
+    </n-alert>
+    <n-form label-placement="top" :show-feedback="false" :disabled="submitting" class="form">
       <div class="form-grid">
         <n-form-item label="推荐周期">
           <n-radio-group v-model:value="form.type">
@@ -80,11 +95,15 @@ function renderStrategyOption({ node, option }: { node: VNode; option: SelectOpt
             <n-select
               v-model:value="form.strategy"
               :options="strategyOptions"
+              :loading="strategiesLoading"
+              :disabled="strategiesLoading"
               :render-option="renderStrategyOption"
               filterable
               placeholder="选择策略（含选股页全部策略）"
             />
             <small v-if="strategyDesc" class="strategy-desc">{{ strategyDesc }}</small>
+            <small v-if="strategiesError">{{ strategiesError }}</small>
+            <n-button v-if="strategiesError" size="tiny" @click="emit('reload-strategies')">重新加载策略</n-button>
           </div>
         </n-form-item>
         <n-form-item label="市场">
@@ -101,20 +120,20 @@ function renderStrategyOption({ node, option }: { node: VNode; option: SelectOpt
             <n-select v-model:value="pricePreset" :options="pricePresetOptions" size="small" />
             <n-select v-model:value="capPreset" :options="capPresetOptions" size="small" />
             <template v-if="pricePreset === -1">
-              <n-input-number v-model:value="filters.price_min" :min="0" size="small" placeholder="价格下限" />
-              <n-input-number v-model:value="filters.price_max" :min="0" size="small" placeholder="价格上限，0=不限" />
+              <n-input-number v-model:value="filters.price_min" :min="0" :max="100000" size="small" placeholder="价格下限" />
+              <n-input-number v-model:value="filters.price_max" :min="0" :max="100000" size="small" placeholder="价格上限，0=不限" />
             </template>
             <template v-if="capPreset === -1">
-              <n-input-number v-model:value="filters.float_cap_min_yi" :min="0" size="small" placeholder="流通市值下限（亿）" />
-              <n-input-number v-model:value="filters.float_cap_max_yi" :min="0" size="small" placeholder="流通市值上限（亿）" />
+              <n-input-number v-model:value="filters.float_cap_min_yi" :min="0" :max="1000000" size="small" placeholder="流通市值下限（亿）" />
+              <n-input-number v-model:value="filters.float_cap_max_yi" :min="0" :max="1000000" size="small" placeholder="流通市值上限（亿）" />
             </template>
             <n-input-number v-model:value="filters.turnover_min" :min="0" :max="25" size="small" placeholder="换手率下限%" />
             <n-input-number v-model:value="filters.turnover_max" :min="0" :max="30" size="small" placeholder="换手率上限%" />
-            <n-input-number v-model:value="filters.max_gain_5d_pct" :min="0" :max="100" size="small" placeholder="近5日涨幅上限%" />
+            <n-input-number v-model:value="filters.max_gain_5d_pct" :min="0" :max="1000" size="small" placeholder="近5日涨幅上限%" />
           </div>
           <label class="switch-line"><span>排除已涨停</span><n-switch v-model:value="filters.exclude_limit_up" size="small" /></label>
           <label class="switch-line"><span>排除创业板 / 科创板</span><n-switch v-model:value="filters.exclude_gem_star" size="small" /></label>
-          <div class="data-note">停牌、流动性不足、数据过期、黑名单和不满足策略的股票会保留排除原因，不会混入最终推荐。</div>
+          <div class="data-note">推荐会检查停牌、流动性、行情时效、黑名单和上述条件；已设置的市值或换手条件遇到缺失数据时会排除候选。候选池展示筛选原因与策略命中情况。</div>
           <n-button size="small" tertiary :loading="savingFilters" @click="emit('save-filters')">保存为默认筛选</n-button>
         </n-collapse-item>
       </n-collapse>
@@ -131,10 +150,14 @@ function renderStrategyOption({ node, option }: { node: VNode; option: SelectOpt
       </div>
 
       <n-form-item label="模型配置">
-        <n-select v-model:value="form.llm_config_id" :options="llmOptions" :placeholder="llmConfigured ? '选择模型配置' : '未配置将使用系统默认配置'" />
+        <n-select v-model:value="form.llm_config_id" :loading="llmLoading" :options="llmOptions" :placeholder="llmConfigured ? '选择模型配置' : llmError ? '模型配置未能读取' : '未配置将使用系统默认配置'" />
       </n-form-item>
-      <n-button class="generate-button" type="primary" block :loading="running" :disabled="running" @click="emit('generate')">
-        {{ running ? '任务处理中' : '明确生成推荐' }}
+      <n-alert v-if="llmError" type="warning" :bordered="false" class="read-error">
+        {{ llmError }}
+        <n-button size="tiny" :loading="llmLoading" @click="emit('reload-llm')">重试模型读取</n-button>
+      </n-alert>
+      <n-button class="generate-button" type="primary" block :loading="running || preferenceLoading || llmLoading || strategiesLoading" :disabled="running || preferenceLoading || llmLoading || strategiesLoading || !!strategiesError || !form.strategy" @click="emit('generate')">
+        {{ running ? '任务处理中' : preferenceLoading || llmLoading || strategiesLoading ? '正在读取生成参数' : '明确生成推荐' }}
       </n-button>
       <p class="submit-note">进入页面、切换周期、打开历史和导航到其他页面都不会创建 AI 任务。任何操作都不会自动下单或修改真实持仓。</p>
     </n-form>
@@ -142,6 +165,7 @@ function renderStrategyOption({ node, option }: { node: VNode; option: SelectOpt
 </template>
 
 <style scoped>
+.read-error { margin-bottom: 12px; }
 .preference-line,
 .switch-line {
   display: flex;

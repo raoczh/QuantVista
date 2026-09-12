@@ -318,11 +318,11 @@ func TestTomorrowDisclosures(t *testing.T) {
 	for i := range rows {
 		common.DB.Create(&rows[i])
 	}
-	got := TomorrowDisclosures(5, tomorrow)
-	if len(got) != 1 || got[0] != "平安银行(000001) 明日预约披露 2026年 半年报" {
-		t.Fatalf("明日披露名单口径错: %v", got)
+	got, err := TomorrowDisclosures(5, tomorrow)
+	if err != nil || len(got) != 1 || got[0] != "平安银行(000001) 明日预约披露 2026年 半年报" {
+		t.Fatalf("明日披露名单口径错: %v err=%v", got, err)
 	}
-	if out := TomorrowDisclosures(99, tomorrow); len(out) != 0 {
-		t.Fatalf("无自选持仓用户应为空: %v", out)
+	if out, err := TomorrowDisclosures(99, tomorrow); err != nil || len(out) != 0 {
+		t.Fatalf("无自选持仓用户应为空: %v err=%v", out, err)
 	}
 }

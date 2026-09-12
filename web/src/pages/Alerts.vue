@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
@@ -34,6 +34,9 @@ import {
   type AlertEventStatus,
 } from '@/api/alert'
 import { useUi } from '@/composables/useUi'
+import { isAbortError } from '@/api/client'
+import { getSessionEpoch } from '@/api/token'
+import { formatPrice } from '@/lib/formatPrice'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import AlertWizard from '@/components/alerts/AlertWizard.vue'
@@ -45,6 +48,9 @@ const message = useMessage()
 const dialog = useDialog()
 const route = useRoute()
 const router = useRouter()
+const sessionOwner = getSessionEpoch()
+let disposed = false
+const pageActive = () => !disposed && route.name === 'alerts' && sessionOwner === getSessionEpoch()
 const { upColor, vars, withAlpha } = useUi()
 const styleVars = computed(() => ({
   '--qv-divider': vars.value.dividerColor,
@@ -58,6 +64,7 @@ const wizardOpen = ref(false)
 const activeSection = ref<'rules' | 'events'>(route.query.event_id ? 'events' : 'rules')
 
 function createRule() {
+  if (!pageActive()) return
   editingRule.value = null
   stockContext.value = null
   activeSection.value = 'rules'
@@ -65,12 +72,14 @@ function createRule() {
 }
 
 function editRule(r: AlertRule) {
+  if (!pageActive() || actingRules.value.includes(r.id)) return
   editingRule.value = r
   activeSection.value = 'rules'
   wizardOpen.value = true
 }
 
 async function handleWizardSaved() {
+  if (!pageActive()) return
   editingRule.value = null
   wizardOpen.value = false
   await load()
@@ -81,19 +90,32 @@ function cancelWizardEdit() {
   wizardOpen.value = false
 }
 
+function afterWizardLeave() {
+  if (!wizardOpen.value) editingRule.value = null
+}
+
 // ---------- 列表 ----------
 const rules = ref<AlertRule[]>([])
 const loading = ref(false)
 const rulesError = ref('')
+const actingRules = ref<number[]>([])
+let rulesSeq = 0
+let rulesController: AbortController | null = null
 async function load() {
+  if (!pageActive()) return
+  const seq = ++rulesSeq
+  rulesController?.abort()
+  const controller = new AbortController()
+  rulesController = controller
   loading.value = true
   rulesError.value = ''
   try {
-    rules.value = await listAlerts()
+    const rows = await listAlerts(undefined, controller.signal)
+    if (seq === rulesSeq && pageActive()) rules.value = rows
   } catch (error) {
-    rulesError.value = alertRequestMessage('rules', error)
+    if (seq === rulesSeq && pageActive() && !isAbortError(error)) rulesError.value = alertRequestMessage('rules', error)
   } finally {
-    loading.value = false
+    if (seq === rulesSeq && pageActive()) loading.value = false
   }
 }
 function refreshAll() {
@@ -101,36 +123,58 @@ function refreshAll() {
 }
 const evaluating = ref(false)
 async function runEvaluate() {
+  if (!pageActive() || evaluating.value) return
+  const returnToOnboarding = route.query.onboarding_return === '1'
   evaluating.value = true
   try {
     const { hits } = await evaluateAlerts()
+    if (!pageActive()) return
     message.success(hits > 0 ? `本次命中 ${hits} 条` : '暂无命中')
     await Promise.all([load(), loadEvents()])
-    if (route.query.onboarding_return === '1') {
+    if (pageActive() && returnToOnboarding && route.query.onboarding_return === '1') {
       await router.push({ name: 'home', query: { onboarding: '1' } })
     }
   } catch (error) {
-    message.error(alertRequestMessage('evaluate', error))
+    if (pageActive() && !isAbortError(error)) {
+      message.error(alertRequestMessage('evaluate', error))
+      // 一部分规则缺行情时，其余已完成的命中仍会提交。
+      await Promise.all([load(), loadEvents()])
+    }
   } finally {
-    evaluating.value = false
+    if (pageActive()) evaluating.value = false
   }
 }
 async function toggle(r: AlertRule) {
+  if (!pageActive() || actingRules.value.includes(r.id)) return
+  actingRules.value = [...actingRules.value, r.id]
   try {
-    await setAlertStatus(r.id, r.status === 'paused' ? 'active' : 'paused')
+    const updated = await setAlertStatus(r.id, r.status === 'paused' ? 'active' : 'paused')
+    if (!pageActive()) return
+    rules.value = rules.value.map(rule => rule.id === updated.id ? updated : rule)
     await load()
   } catch (error) {
-    message.error(alertRequestMessage('action', error))
+    if (pageActive() && !isAbortError(error)) message.error(alertRequestMessage('action', error))
+  } finally {
+    if (pageActive()) actingRules.value = actingRules.value.filter(id => id !== r.id)
   }
 }
 async function remove(r: AlertRule) {
+  if (!pageActive() || actingRules.value.includes(r.id)) return
+  actingRules.value = [...actingRules.value, r.id]
   try {
     await deleteAlert(r.id)
-    if (editingRule.value?.id === r.id) editingRule.value = null
+    if (!pageActive()) return
+    rules.value = rules.value.filter(rule => rule.id !== r.id)
+    if (editingRule.value?.id === r.id) {
+      editingRule.value = null
+      wizardOpen.value = false
+    }
     await load()
-    message.success('已删除')
+    if (pageActive()) message.success('已删除')
   } catch (error) {
-    message.error(alertRequestMessage('action', error))
+    if (pageActive() && !isAbortError(error)) message.error(alertRequestMessage('action', error))
+  } finally {
+    if (pageActive()) actingRules.value = actingRules.value.filter(id => id !== r.id)
   }
 }
 
@@ -145,10 +189,11 @@ function confirmRemove(r: AlertRule) {
 }
 
 function ruleMenuOptions(r: AlertRule): DropdownOption[] {
+  const disabled = actingRules.value.includes(r.id)
   return [
-    { key: 'edit', label: '编辑' },
-    { key: 'toggle', label: r.status === 'paused' ? '恢复' : '暂停' },
-    { key: 'delete', label: '删除' },
+    { key: 'edit', label: '编辑', disabled },
+    { key: 'toggle', label: r.status === 'paused' ? '恢复' : '暂停', disabled },
+    { key: 'delete', label: '删除', disabled },
   ]
 }
 
@@ -164,11 +209,11 @@ function ruleScope(r: AlertRule) {
   return r.symbol ? `${r.name || '名称待补全'} · ${r.symbol}` : '我的全部持仓'
 }
 function describe(r: AlertRule) {
-  const p = (n: number) => n.toFixed(2)
-  const g = (n: number) => String(Number(n.toFixed(2)))
+  const p = formatPrice
+  const g = (n: number) => String(Number(n.toFixed(4)))
   switch (r.kind) {
     case 'price':
-      return `现价 ${r.op === 'gte' ? '≥' : '≤'} ${p(r.threshold)}`
+      return `当日${r.op === 'gte' ? '最高价 ≥' : '最低价 ≤'} ${formatPrice(r.threshold)}`
     case 'pct_change':
       return `当日涨跌幅 ${r.op === 'gte' ? '≥' : '≤'} ${p(r.threshold)}%`
     case 'ma':
@@ -222,7 +267,7 @@ function fmtTime(t: string | null) {
 }
 
 function applyStockActionQuery() {
-  if (route.query.add !== '1') return
+  if (!pageActive() || route.query.add !== '1') return
   editingRule.value = null
   stockContext.value = {
     symbol: String(route.query.symbol || ''),
@@ -263,7 +308,11 @@ const sortedEvents = computed(() =>
 )
 const eventsLoading = ref(false)
 const eventsError = ref('')
+const actingEvents = ref<number[]>([])
+let eventsSeq = 0
+let eventsController: AbortController | null = null
 const eventFilter = ref<'unread' | 'all' | 'read' | 'dismissed'>('unread')
+let lastEventFilter = eventFilter.value
 const eventFilterOptions = [
   { label: '未读', value: 'unread' },
   { label: '全部', value: 'all' },
@@ -271,35 +320,67 @@ const eventFilterOptions = [
   { label: '已忽略', value: 'dismissed' },
 ]
 async function loadEvents() {
+  if (!pageActive()) return
+  const seq = ++eventsSeq
+  const filter = eventFilter.value
+  if (filter !== lastEventFilter) events.value = []
+  lastEventFilter = filter
+  eventsController?.abort()
+  const controller = new AbortController()
+  eventsController = controller
   eventsLoading.value = true
   eventsError.value = ''
   try {
-    events.value = await listAlertEvents(eventFilter.value === 'all' ? undefined : eventFilter.value)
+    const rows = await listAlertEvents(filter === 'all' ? undefined : filter, undefined, controller.signal)
+    if (seq === eventsSeq && pageActive() && filter === eventFilter.value) events.value = rows
   } catch (error) {
-    eventsError.value = alertRequestMessage('events', error)
+    if (seq === eventsSeq && pageActive() && !isAbortError(error)) eventsError.value = alertRequestMessage('events', error)
   } finally {
-    eventsLoading.value = false
+    if (seq === eventsSeq && pageActive()) eventsLoading.value = false
   }
 }
 async function markEvent(ev: AlertEvent, status: AlertEventStatus) {
+  if (!pageActive() || readingAll.value || actingEvents.value.includes(ev.id)) return
+  actingEvents.value = [...actingEvents.value, ev.id]
   try {
-    await setAlertEventStatus(ev.id, status)
+    const updated = await setAlertEventStatus(ev.id, status)
+    if (!pageActive()) return
+    events.value = events.value.map(event => event.id === updated.id ? updated : event)
+      .filter(event => eventFilter.value === 'all' || event.status === eventFilter.value)
+    if (selectedEvent.value?.id === ev.id) {
+      detailSeq++
+      detailController?.abort()
+      detailLoading.value = false
+      selectedEvent.value = updated
+    }
     await loadEvents()
   } catch (error) {
-    message.error(alertRequestMessage('action', error))
+    if (pageActive() && !isAbortError(error)) message.error(alertRequestMessage('action', error))
+  } finally {
+    if (pageActive()) actingEvents.value = actingEvents.value.filter(id => id !== ev.id)
   }
 }
 const readingAll = ref(false)
 async function markAllRead() {
+  if (!pageActive() || readingAll.value || actingEvents.value.length) return
   readingAll.value = true
   try {
     const { updated } = await readAllAlertEvents()
+    if (!pageActive()) return
+    events.value = events.value.map(event => event.status === 'unread' ? { ...event, status: 'read' as const } : event)
+      .filter(event => eventFilter.value === 'all' || event.status === eventFilter.value)
+    if (selectedEvent.value?.status === 'unread') {
+      detailSeq++
+      detailController?.abort()
+      detailLoading.value = false
+      selectedEvent.value = { ...selectedEvent.value, status: 'read' }
+    }
     message.success(updated > 0 ? `已标记 ${updated} 条为已读` : '没有未读命中')
     await loadEvents()
   } catch (error) {
-    message.error(alertRequestMessage('action', error))
+    if (pageActive() && !isAbortError(error)) message.error(alertRequestMessage('action', error))
   } finally {
-    readingAll.value = false
+    if (pageActive()) readingAll.value = false
   }
 }
 function eventStatusTag(s: AlertEventStatus) {
@@ -309,13 +390,14 @@ function eventStatusTag(s: AlertEventStatus) {
 }
 
 function eventMenuOptions(ev: AlertEvent): DropdownOption[] {
+  const disabled = readingAll.value || actingEvents.value.includes(ev.id)
   if (ev.status === 'unread') {
     return [
-      { key: 'read', label: '标记已读' },
-      { key: 'dismissed', label: '忽略' },
+      { key: 'read', label: '标记已读', disabled },
+      { key: 'dismissed', label: '忽略', disabled },
     ]
   }
-  return [{ key: 'unread', label: '恢复未读' }]
+  return [{ key: 'unread', label: '恢复未读', disabled }]
 }
 
 function selectEventAction(key: string | number, event: AlertEvent) {
@@ -343,6 +425,7 @@ const detailLoading = ref(false)
 const detailError = ref('')
 const selectedEvent = ref<AlertEvent | null>(null)
 let detailSeq = 0
+let detailController: AbortController | null = null
 
 function routeEventID(): number | null {
   const raw = Array.isArray(route.query.event_id) ? route.query.event_id[0] : route.query.event_id
@@ -351,14 +434,19 @@ function routeEventID(): number | null {
 }
 
 async function openRouteEvent() {
+  if (!pageActive()) return
+  const seq = ++detailSeq
+  detailController?.abort()
   const id = routeEventID()
   if (!id) {
     detailOpen.value = false
     selectedEvent.value = null
     detailError.value = ''
+    detailLoading.value = false
     return
   }
-  const seq = ++detailSeq
+  const controller = new AbortController()
+  detailController = controller
   activeSection.value = 'events'
   const cached = events.value.find((event) => event.id === id)
   if (cached) selectedEvent.value = cached
@@ -367,19 +455,20 @@ async function openRouteEvent() {
   detailLoading.value = true
   detailError.value = ''
   try {
-    const event = await getAlertEvent(id)
-    if (seq !== detailSeq || routeEventID() !== id) return
+    const event = await getAlertEvent(id, controller.signal)
+    if (seq !== detailSeq || !pageActive() || routeEventID() !== id) return
     selectedEvent.value = event
     detailOpen.value = true
   } catch (error) {
-    if (seq !== detailSeq || routeEventID() !== id) return
+    if (seq !== detailSeq || !pageActive() || routeEventID() !== id || isAbortError(error)) return
     detailError.value = alertRequestMessage('detail', error)
   } finally {
-    if (seq === detailSeq) detailLoading.value = false
+    if (seq === detailSeq && pageActive()) detailLoading.value = false
   }
 }
 
 function openEventDetail(event: AlertEvent) {
+  if (!pageActive()) return
   selectedEvent.value = event
   detailError.value = ''
   detailOpen.value = true
@@ -387,7 +476,10 @@ function openEventDetail(event: AlertEvent) {
 }
 
 function closeEventDetail() {
+  if (!pageActive()) return
   detailSeq++
+  detailController?.abort()
+  detailLoading.value = false
   detailOpen.value = false
   selectedEvent.value = null
   detailError.value = ''
@@ -441,6 +533,16 @@ function metricLabel(name: string) {
   return labels[name] || name
 }
 
+onBeforeUnmount(() => {
+  disposed = true
+  rulesSeq++
+  eventsSeq++
+  detailSeq++
+  rulesController?.abort()
+  eventsController?.abort()
+  detailController?.abort()
+})
+
 </script>
 
 <template>
@@ -464,12 +566,12 @@ function metricLabel(name: string) {
               {{ rules.length ? '仍展示上次加载的规则，刷新失败。' : rulesError }}
               <div class="recovery-action"><n-button size="small" :loading="loading" @click="load">重试加载提醒</n-button></div>
             </n-alert>
-            <n-empty v-if="!rules.length && !rulesError" description="暂无提醒规则，点击“新建提醒”添加" />
+            <n-empty v-if="!rules.length && !rulesError && !loading" description="暂无提醒规则，点击“新建提醒”添加" />
             <div v-else class="rules">
               <div v-for="r in rules" :key="r.id" class="rule" :class="{ hit: isHitToday(r) }">
                 <div class="rule-main">
                   <div class="rule-title">
-                    <StockIdentity v-if="r.symbol" :symbol="r.symbol" :name="r.name" density="table" clickable />
+                    <StockIdentity v-if="r.symbol" :symbol="r.symbol" :market="r.market" :name="r.name" density="table" clickable />
                     <span v-else class="rule-name">{{ ruleScope(r) }}</span>
                     <n-tag size="tiny" round :bordered="false" :type="statusTag(r).type">{{
                       statusTag(r).text
@@ -486,23 +588,23 @@ function metricLabel(name: string) {
                     ⚡ {{ r.trigger_msg }}<span class="rule-hit-time"> · {{ fmtTime(r.triggered_at) }}</span>
                   </div>
                   <div v-else-if="r.last_check_date" class="rule-sub">
-                    最近检查 {{ r.last_check_date }}<span v-if="r.last_value"> · 观测值 {{ r.last_value.toFixed(2) }}</span>
+                    最近检查 {{ r.last_check_date }}<span v-if="r.last_value != null"> · 观测值 {{ contextNumber(r.last_value) }}</span>
                   </div>
                   <div v-if="r.note" class="rule-note">{{ r.note }}</div>
                 </div>
                 <div class="rule-actions desktop-actions">
-                  <n-button size="tiny" quaternary @click="toggle(r)">{{ r.status === 'paused' ? '恢复' : '暂停' }}</n-button>
-                  <n-button size="tiny" quaternary @click="editRule(r)">编辑</n-button>
+                  <n-button size="tiny" quaternary :loading="actingRules.includes(r.id)" @click="toggle(r)">{{ r.status === 'paused' ? '恢复' : '暂停' }}</n-button>
+                  <n-button size="tiny" quaternary :disabled="actingRules.includes(r.id)" @click="editRule(r)">编辑</n-button>
                   <n-popconfirm @positive-click="remove(r)">
                     <template #trigger>
-                      <n-button size="tiny" quaternary type="error">删除</n-button>
+                      <n-button size="tiny" quaternary type="error" :disabled="actingRules.includes(r.id)">删除</n-button>
                     </template>
                     删除提醒「{{ ruleScope(r) }}」？
                   </n-popconfirm>
                 </div>
                 <span class="mobile-actions">
                   <n-dropdown trigger="click" placement="bottom-end" :options="ruleMenuOptions(r)" @select="(key) => selectRuleAction(key, r)">
-                    <n-button quaternary circle size="small" aria-label="提醒操作" title="提醒操作">⋯</n-button>
+                    <n-button quaternary circle size="small" :disabled="actingRules.includes(r.id)" aria-label="提醒操作" title="提醒操作">⋯</n-button>
                   </n-dropdown>
                 </span>
               </div>
@@ -520,7 +622,7 @@ function metricLabel(name: string) {
                   opt.label
                 }}</n-radio-button>
               </n-radio-group>
-              <n-button size="small" quaternary :loading="readingAll" @click="markAllRead">全部已读</n-button>
+              <n-button size="small" quaternary :loading="readingAll" :disabled="actingEvents.length > 0" @click="markAllRead">全部已读</n-button>
             </div>
           </div>
           <n-spin :show="eventsLoading && !events.length">
@@ -529,7 +631,7 @@ function metricLabel(name: string) {
               <div class="recovery-action"><n-button size="small" :loading="eventsLoading" @click="loadEvents">重试加载记录</n-button></div>
             </n-alert>
             <n-empty
-              v-if="!events.length && !eventsError"
+              v-if="!events.length && !eventsError && !eventsLoading"
               :description="eventFilter === 'unread' ? '没有未读命中，规则命中后会在这里留档' : '暂无命中记录'"
               style="padding: 24px 0"
             />
@@ -538,7 +640,7 @@ function metricLabel(name: string) {
                 <div class="ev-main">
                   <div class="ev-title">
                     <n-tag size="tiny" round :bordered="false">{{ kindLabelMap[ev.kind] || ev.kind }}</n-tag>
-                    <StockIdentity :symbol="ev.symbol" :name="ev.name" density="table" clickable />
+                    <StockIdentity :symbol="ev.symbol" :market="ev.market" :name="ev.name" density="table" clickable />
                     <n-tag size="tiny" round :bordered="false" :type="eventStatusTag(ev.status).type">{{
                       eventStatusTag(ev.status).text
                     }}</n-tag>
@@ -549,15 +651,15 @@ function metricLabel(name: string) {
                 <div class="ev-actions desktop-actions">
                   <n-button size="tiny" quaternary @click="openEventDetail(ev)">详情</n-button>
                   <template v-if="ev.status === 'unread'">
-                    <n-button size="tiny" quaternary @click="markEvent(ev, 'read')">已读</n-button>
-                    <n-button size="tiny" quaternary @click="markEvent(ev, 'dismissed')">忽略</n-button>
+                    <n-button size="tiny" quaternary :disabled="readingAll || actingEvents.includes(ev.id)" @click="markEvent(ev, 'read')">已读</n-button>
+                    <n-button size="tiny" quaternary :disabled="readingAll || actingEvents.includes(ev.id)" @click="markEvent(ev, 'dismissed')">忽略</n-button>
                   </template>
-                  <n-button v-else size="tiny" quaternary @click="markEvent(ev, 'unread')">恢复未读</n-button>
+                  <n-button v-else size="tiny" quaternary :disabled="readingAll || actingEvents.includes(ev.id)" @click="markEvent(ev, 'unread')">恢复未读</n-button>
                 </div>
                 <div class="ev-mobile-actions mobile-actions">
                   <n-button size="small" quaternary @click="openEventDetail(ev)">详情</n-button>
                   <n-dropdown trigger="click" placement="bottom-end" :options="eventMenuOptions(ev)" @select="(key) => selectEventAction(key, ev)">
-                    <n-button quaternary circle size="small" aria-label="命中记录操作" title="命中记录操作">⋯</n-button>
+                    <n-button quaternary circle size="small" :disabled="readingAll || actingEvents.includes(ev.id)" aria-label="命中记录操作" title="命中记录操作">⋯</n-button>
                   </n-dropdown>
                 </div>
               </div>
@@ -574,9 +676,10 @@ function metricLabel(name: string) {
       :title="editingRule ? '编辑提醒' : '新建提醒'"
       class="rule-wizard-modal"
       :style="{ width: 'min(760px, calc(100vw - 24px))' }"
-      @after-leave="editingRule = null"
+      @after-leave="afterWizardLeave"
     >
       <AlertWizard
+        :active="wizardOpen"
         :editing-rule="editingRule"
         :stock-context="stockContext"
         @saved="handleWizardSaved"
@@ -599,7 +702,7 @@ function metricLabel(name: string) {
         </n-alert>
         <template v-if="selectedEvent">
           <div class="detail-head">
-            <StockIdentity :symbol="selectedEvent.symbol" :name="selectedEvent.name" clickable actions />
+            <StockIdentity :symbol="selectedEvent.symbol" :market="selectedEvent.market" :name="selectedEvent.name" clickable actions />
             <n-tag size="small" :type="eventStatusTag(selectedEvent.status).type">
               {{ eventStatusTag(selectedEvent.status).text }}
             </n-tag>
@@ -692,7 +795,7 @@ function metricLabel(name: string) {
 .alerts {
   min-width: 0;
 }
-:global(.rule-wizard-modal .n-card__content) {
+:global(.rule-wizard-modal .n-card-content) {
   max-height: min(78vh, 820px);
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -847,7 +950,7 @@ function metricLabel(name: string) {
   gap: 4px;
   flex-shrink: 0;
 }
-:global(.event-detail-modal .n-card__content) {
+:global(.event-detail-modal .n-card-content) {
   max-height: min(74vh, 760px);
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -963,7 +1066,7 @@ function metricLabel(name: string) {
     width: 100%;
     justify-content: flex-end;
   }
-  :global(.event-detail-modal .n-card__content) {
+  :global(.event-detail-modal .n-card-content) {
     max-height: calc(100dvh - 132px - env(safe-area-inset-bottom, 0px));
     padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
   }
@@ -972,7 +1075,7 @@ function metricLabel(name: string) {
   :global(.mobile-bottom-nav) {
     display: none;
   }
-  :global(.event-detail-modal .n-card__content) {
+  :global(.event-detail-modal .n-card-content) {
     max-height: calc(100dvh - 96px);
   }
 }

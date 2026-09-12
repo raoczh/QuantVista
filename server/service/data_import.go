@@ -16,7 +16,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -39,7 +38,20 @@ const (
 
 type DataImportService struct{}
 
-var dataImportMutationMu sync.Mutex
+var dataImportMutation = make(chan struct{}, 1)
+
+func lockDataImportMutation(ctx context.Context) (func(), error) {
+	select {
+	case dataImportMutation <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-dataImportMutation
+			return nil, err
+		}
+		return func() { <-dataImportMutation }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
 func NewDataImportService() *DataImportService { return &DataImportService{} }
 
@@ -215,9 +227,17 @@ func (s *DataImportService) Upload(userID int64, kind, fileName string, r io.Rea
 }
 
 func (s *DataImportService) UploadByAccount(userID, requestedAccountID int64, kind, fileName string, r io.Reader) (*ImportBatchView, error) {
+	return s.UploadByAccountContext(context.Background(), userID, requestedAccountID, kind, fileName, r)
+}
+
+func (s *DataImportService) UploadByAccountContext(ctx context.Context, userID, requestedAccountID int64, kind, fileName string, r io.Reader) (*ImportBatchView, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
+	db := common.DB.WithContext(ctx)
 	var err error
 	kind, err = normalizeImportKind(kind)
 	if err != nil {
@@ -225,9 +245,9 @@ func (s *DataImportService) UploadByAccount(userID, requestedAccountID int64, ki
 	}
 	accountID := int64(0)
 	if kind == model.ImportKindPosition || kind == model.ImportKindTrade {
-		account, accountErr := ResolvePortfolioAccount(userID, requestedAccountID, model.PortfolioKindReal)
+		account, accountErr := resolvePortfolioAccountDB(db, userID, requestedAccountID, model.PortfolioKindReal)
 		if accountErr != nil {
-			return nil, errors.New("组合不存在")
+			return nil, errors.Join(errors.New("组合不存在"), ctx.Err())
 		}
 		if account.Status != model.PortfolioStatusActive {
 			return nil, errors.New("组合已归档，仅允许读取历史数据")
@@ -252,9 +272,9 @@ func (s *DataImportService) UploadByAccount(userID, requestedAccountID int64, ki
 	digest := hashBytes(data)
 	var existing model.ImportBatch
 	attempt := 1
-	if err := common.DB.Where("user_id = ? AND account_id = ? AND kind = ? AND file_digest = ?", userID, accountID, kind, digest).Order("attempt DESC, created_at DESC").First(&existing).Error; err == nil {
+	if err := db.Where("user_id = ? AND account_id = ? AND kind = ? AND file_digest = ?", userID, accountID, kind, digest).Order("attempt DESC, created_at DESC").First(&existing).Error; err == nil {
 		if existing.Status != model.ImportStatusRolledBack {
-			return s.Get(userID, existing.ID)
+			return s.GetContext(ctx, userID, existing.ID)
 		}
 		attempt = existing.Attempt + 1
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -298,16 +318,19 @@ func (s *DataImportService) UploadByAccount(userID, requestedAccountID int64, ki
 		FileDigest: digest, HeaderJSON: string(headerJSON),
 	}
 	rows := make([]model.ImportRow, 0)
-	physicalRow := 1
 	for {
 		record, readErr := reader.Read()
 		if readErr == io.EOF {
 			break
 		}
-		physicalRow++
 		if readErr != nil {
-			return nil, fmt.Errorf("CSV 第 %d 行格式无法解析", physicalRow)
+			var parseErr *csv.ParseError
+			if errors.As(readErr, &parseErr) {
+				return nil, fmt.Errorf("CSV 第 %d 行格式无法解析", parseErr.Line)
+			}
+			return nil, errors.New("CSV 格式无法解析")
 		}
+		physicalRow, _ := reader.FieldPos(0)
 		if len(rows) >= dataImportMaxRows {
 			return nil, fmt.Errorf("单批最多导入 %d 行，请拆分文件", dataImportMaxRows)
 		}
@@ -332,19 +355,33 @@ func (s *DataImportService) UploadByAccount(userID, requestedAccountID int64, ki
 		return nil, errors.New("CSV 没有数据行")
 	}
 	batch.TotalRows = len(rows)
-	if err := common.DB.Transaction(func(tx *gorm.DB) error {
+	var view *ImportBatchView
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if accountID > 0 {
+			if err := lockActivePortfolioAccount(tx, userID, accountID, model.PortfolioKindReal); err != nil {
+				return err
+			}
+		}
 		if err := tx.Create(&batch).Error; err != nil {
 			return err
 		}
-		return tx.CreateInBatches(rows, 100).Error
+		if err := tx.CreateInBatches(rows, 100).Error; err != nil {
+			return err
+		}
+		var err error
+		view, err = loadImportBatchView(tx, userID, id)
+		return err
 	}); err != nil {
+		if ctx.Err() != nil {
+			return nil, errors.Join(err, ctx.Err())
+		}
 		// 并发重复上传以 user+kind+文件摘要+尝试次数的唯一索引收敛；已回滚的旧尝试不复用。
-		if e := common.DB.Where("user_id = ? AND account_id = ? AND kind = ? AND file_digest = ?", userID, accountID, kind, digest).Order("attempt DESC, created_at DESC").First(&existing).Error; e == nil && existing.Attempt >= attempt && existing.Status != model.ImportStatusRolledBack {
-			return s.Get(userID, existing.ID)
+		if e := db.Where("user_id = ? AND account_id = ? AND kind = ? AND file_digest = ?", userID, accountID, kind, digest).Order("attempt DESC, created_at DESC").First(&existing).Error; e == nil && existing.Attempt >= attempt && existing.Status != model.ImportStatusRolledBack {
+			return s.GetContext(ctx, userID, existing.ID)
 		}
 		return nil, err
 	}
-	return s.Get(userID, id)
+	return view, nil
 }
 
 func decodeHeaders(batch model.ImportBatch) ([]string, error) {
@@ -356,9 +393,28 @@ func decodeHeaders(batch model.ImportBatch) ([]string, error) {
 }
 
 func (s *DataImportService) Get(userID int64, batchID string) (*ImportBatchView, error) {
+	return s.GetContext(context.Background(), userID, batchID)
+}
+
+func (s *DataImportService) GetContext(ctx context.Context, userID int64, batchID string) (*ImportBatchView, error) {
+	var view *ImportBatchView
+	err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		view, err = loadImportBatchView(tx, userID, batchID)
+		return err
+	})
+	return view, err
+}
+
+// 写入入口在提交前构造完整返回值，避免提交后的读取失败被误报成导入失败。
+// 独立详情读取由调用方提供一致性快照，批次版本、映射和规范化行不能分开读取。
+func loadImportBatchView(db *gorm.DB, userID int64, batchID string) (*ImportBatchView, error) {
 	var batch model.ImportBatch
-	if err := common.DB.Where("id = ? AND user_id = ?", strings.TrimSpace(batchID), userID).First(&batch).Error; err != nil {
-		return nil, errors.New("导入批次不存在")
+	if err := db.Where("id = ? AND user_id = ?", strings.TrimSpace(batchID), userID).First(&batch).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("导入批次不存在")
+		}
+		return nil, err
 	}
 	headers, err := decodeHeaders(batch)
 	if err != nil {
@@ -372,7 +428,7 @@ func (s *DataImportService) Get(userID int64, batchID string) (*ImportBatchView,
 		mapping = map[string]string{}
 	}
 	var rows []model.ImportRow
-	if err := common.DB.Where("batch_id = ? AND user_id = ?", batch.ID, userID).Order("row_number ASC").Find(&rows).Error; err != nil {
+	if err := db.Where("batch_id = ? AND user_id = ?", batch.ID, userID).Order("row_number ASC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	views := make([]ImportRowView, 0, len(rows))
@@ -400,11 +456,30 @@ func (s *DataImportService) Get(userID int64, batchID string) (*ImportBatchView,
 
 // List 返回最近批次的轻量审计摘要，不读取原始行与规范化正文。
 func (s *DataImportService) List(userID int64, limit int) ([]model.ImportBatch, error) {
+	return s.ListByAccount(userID, 0, limit)
+}
+
+func (s *DataImportService) ListByAccount(userID, accountID int64, limit int) ([]model.ImportBatch, error) {
+	return s.ListByAccountContext(context.Background(), userID, accountID, limit)
+}
+
+func (s *DataImportService) ListByAccountContext(ctx context.Context, userID, accountID int64, limit int) ([]model.ImportBatch, error) {
+	if accountID < 0 {
+		return nil, errors.New("组合不存在")
+	}
+	db := common.DB.WithContext(ctx)
+	q := db.Where("user_id = ?", userID)
+	if accountID > 0 {
+		if _, err := portfolioAccountByIDDB(db, userID, accountID, model.PortfolioKindReal); err != nil {
+			return nil, err
+		}
+		q = q.Where("account_id = ? OR kind = ?", accountID, model.ImportKindWatchlist)
+	}
 	if limit <= 0 || limit > 50 {
 		limit = 20
 	}
 	var rows []model.ImportBatch
-	if err := common.DB.Select("id", "user_id", "account_id", "kind", "schema_version", "attempt", "version", "status", "file_name", "file_digest", "mapping_digest", "target_group_id", "total_rows", "valid_rows", "error_rows", "conflict_rows", "created_rows", "updated_rows", "confirmed_at", "rolled_back_at", "created_at", "updated_at").Where("user_id = ?", userID).Order("created_at DESC, id DESC").Limit(limit).Find(&rows).Error; err != nil {
+	if err := q.Select("id", "user_id", "account_id", "kind", "schema_version", "attempt", "version", "status", "file_name", "file_digest", "mapping_digest", "target_group_id", "total_rows", "valid_rows", "error_rows", "conflict_rows", "created_rows", "updated_rows", "confirmed_at", "rolled_back_at", "created_at", "updated_at").Order("created_at DESC, id DESC").Limit(limit).Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	if rows == nil {
@@ -514,10 +589,11 @@ func parseImportNumber(v, label string, required bool) (float64, error) {
 	if n > dataImportMaxNumber {
 		return 0, fmt.Errorf("%s数值过大", label)
 	}
+	n = round4(n)
 	if required && n <= 0 {
 		return 0, fmt.Errorf("%s必须大于 0", label)
 	}
-	return round4(n), nil
+	return n, nil
 }
 
 func parseImportSide(v string) (string, error) {
@@ -568,6 +644,7 @@ func positionImportFingerprint(p model.Position) string {
 	// 交易日创新高”的持仓永久不可回滚，且把系统后台写入误归因为“后续交易或人工
 	// 编辑”。回滚后峰值可由盘后任务重建，剔除无损。
 	p.PeakPrice, p.PeakDate, p.PeakBackfilled = 0, "", false
+	p.PeakDataQuality = ""
 	b, _ := json.Marshal(p)
 	return hashBytes(b)
 }
@@ -615,11 +692,19 @@ type importPreviewState struct {
 }
 
 func (s *DataImportService) Preview(userID int64, batchID string, in ImportMappingInput) (*ImportBatchView, error) {
+	return s.PreviewContext(context.Background(), userID, batchID, in)
+}
+
+func (s *DataImportService) PreviewContext(ctx context.Context, userID int64, batchID string, in ImportMappingInput) (*ImportBatchView, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	db := common.DB.WithContext(ctx)
 	if in.Version <= 0 {
 		return nil, errors.New("缺少有效的批次版本")
 	}
 	var batch model.ImportBatch
-	if err := common.DB.Where("id = ? AND user_id = ?", batchID, userID).First(&batch).Error; err != nil {
+	if err := db.Where("id = ? AND user_id = ?", batchID, userID).First(&batch).Error; err != nil {
 		return nil, errors.New("导入批次不存在")
 	}
 	if batch.Status == model.ImportStatusConfirmed || batch.Status == model.ImportStatusRolledBack {
@@ -638,14 +723,14 @@ func (s *DataImportService) Preview(userID int64, batchID string, in ImportMappi
 	}
 	if batch.Kind == model.ImportKindWatchlist {
 		var group model.Watchlist
-		if in.TargetGroupID <= 0 || common.DB.Where("id = ? AND user_id = ?", in.TargetGroupID, userID).First(&group).Error != nil {
+		if in.TargetGroupID <= 0 || db.Where("id = ? AND user_id = ?", in.TargetGroupID, userID).First(&group).Error != nil {
 			return nil, errors.New("请选择本人有效的自选分组")
 		}
 	} else {
 		in.TargetGroupID = 0
 	}
 	var rows []model.ImportRow
-	if err := common.DB.Where("batch_id = ? AND user_id = ?", batch.ID, userID).Order("row_number ASC").Find(&rows).Error; err != nil {
+	if err := db.Where("batch_id = ? AND user_id = ?", batch.ID, userID).Order("row_number ASC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	type result struct {
@@ -671,7 +756,7 @@ func (s *DataImportService) Preview(userID int64, batchID string, in ImportMappi
 		if results[i].status == model.ImportRowError {
 			continue
 		}
-		n, code, message := s.normalizePreviewRow(userID, batch.AccountID, batch.Kind, in.TargetGroupID, cells, indexes, states)
+		n, code, message := s.normalizePreviewRow(db, userID, batch.AccountID, batch.Kind, in.TargetGroupID, cells, indexes, states)
 		results[i].normalized = n
 		if message != "" {
 			results[i].status, results[i].code, results[i].message = importIssueStatus(code), code, message
@@ -697,7 +782,7 @@ func (s *DataImportService) Preview(userID int64, batchID string, in ImportMappi
 	}
 	var claims []model.ImportRowClaim
 	if len(digests) > 0 {
-		if err := common.DB.Where("user_id = ? AND account_id = ? AND kind = ? AND row_digest IN ?", userID, batch.AccountID, batch.Kind, digests).Find(&claims).Error; err != nil {
+		if err := db.Where("user_id = ? AND account_id = ? AND kind = ? AND row_digest IN ?", userID, batch.AccountID, batch.Kind, digests).Find(&claims).Error; err != nil {
 			return nil, err
 		}
 	}
@@ -716,7 +801,8 @@ func (s *DataImportService) Preview(userID int64, batchID string, in ImportMappi
 	mappingJSON, _ := canonicalJSON(in.Mapping)
 	mappingDigest := hashBytes(mappingJSON)
 	valid, invalid, conflicts := 0, 0, 0
-	err = common.DB.Transaction(func(tx *gorm.DB) error {
+	var view *ImportBatchView
+	err = db.Transaction(func(tx *gorm.DB) error {
 		var locked model.ImportBatch
 		q := tx.Where("id = ? AND user_id = ?", batch.ID, userID)
 		if !common.UsingSQLite {
@@ -724,6 +810,11 @@ func (s *DataImportService) Preview(userID int64, batchID string, in ImportMappi
 		}
 		if err := q.First(&locked).Error; err != nil {
 			return errors.New("导入批次不存在")
+		}
+		if locked.Kind == model.ImportKindPosition || locked.Kind == model.ImportKindTrade {
+			if err := lockActivePortfolioAccount(tx, userID, locked.AccountID, model.PortfolioKindReal); err != nil {
+				return err
+			}
 		}
 		if locked.Version != in.Version || (locked.Status != model.ImportStatusUploaded && locked.Status != model.ImportStatusPreviewed) {
 			return errors.New("批次已变化，请刷新后重试")
@@ -751,18 +842,23 @@ func (s *DataImportService) Preview(userID int64, batchID string, in ImportMappi
 				invalid++
 			}
 		}
-		return tx.Model(&model.ImportBatch{}).Where("id = ? AND user_id = ? AND version = ?", batch.ID, userID, in.Version).Updates(map[string]any{
+		if err := tx.Model(&model.ImportBatch{}).Where("id = ? AND user_id = ? AND version = ?", batch.ID, userID, in.Version).Updates(map[string]any{
 			"mapping_json": string(mappingJSON), "mapping_digest": mappingDigest, "target_group_id": in.TargetGroupID,
 			"status": model.ImportStatusPreviewed, "version": in.Version + 1, "valid_rows": valid, "error_rows": invalid, "conflict_rows": conflicts,
-		}).Error
+		}).Error; err != nil {
+			return err
+		}
+		var err error
+		view, err = loadImportBatchView(tx, userID, batch.ID)
+		return err
 	})
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, ctx.Err())
 	}
-	return s.Get(userID, batch.ID)
+	return view, nil
 }
 
-func (s *DataImportService) normalizePreviewRow(userID, accountID int64, kind string, groupID int64, cells []string, indexes map[string]int, states map[string]*importPreviewState) (importNormalized, string, string) {
+func (s *DataImportService) normalizePreviewRow(db *gorm.DB, userID, accountID int64, kind string, groupID int64, cells []string, indexes map[string]int, states map[string]*importPreviewState) (importNormalized, string, string) {
 	symbol, market, err := validateImportSymbol(importCell(cells, indexes, "symbol"), importCell(cells, indexes, "market"))
 	if err != nil {
 		return importNormalized{}, "invalid_symbol", err.Error()
@@ -773,7 +869,7 @@ func (s *DataImportService) normalizePreviewRow(userID, accountID int64, kind st
 		n.Note = truncateRunes(importCell(cells, indexes, "note"), 500)
 		n.FocusReason = truncateRunes(importCell(cells, indexes, "focus_reason"), 500)
 		var count int64
-		if err := common.DB.Model(&model.WatchlistItem{}).Where("user_id = ? AND watchlist_id = ? AND symbol = ? AND market = ?", userID, groupID, symbol, market).Count(&count).Error; err != nil {
+		if err := db.Model(&model.WatchlistItem{}).Where("user_id = ? AND watchlist_id = ? AND symbol = ? AND market = ?", userID, groupID, symbol, market).Count(&count).Error; err != nil {
 			return n, "database_error", "检查现有自选失败"
 		}
 		if count > 0 {
@@ -805,9 +901,12 @@ func (s *DataImportService) normalizePreviewRow(userID, accountID int64, kind st
 		if err != nil {
 			return n, "invalid_tax", err.Error()
 		}
+		if err := normalizePositionTradeValues(&n.Price, &n.Quantity, &n.Fee, &n.Tax); err != nil {
+			return n, "invalid_amount", err.Error()
+		}
 		n.Note = truncateRunes(importCell(cells, indexes, "note"), 500)
 		var count int64
-		if err := common.DB.Model(&model.Position{}).Where("user_id = ? AND account_id = ? AND symbol = ? AND market = ? AND status = ? AND buy_date = ? AND buy_price = ? AND quantity = ?", userID, accountID, symbol, market, model.PositionStatusHolding, n.TradeDate, n.Price, n.Quantity).Count(&count).Error; err != nil {
+		if err := db.Model(&model.Position{}).Where("user_id = ? AND account_id = ? AND symbol = ? AND market = ? AND status = ? AND buy_date = ? AND buy_price = ? AND quantity = ?", userID, accountID, symbol, market, model.PositionStatusHolding, n.TradeDate, n.Price, n.Quantity).Count(&count).Error; err != nil {
 			return n, "database_error", "检查现有持仓失败"
 		}
 		if count > 0 {
@@ -815,12 +914,12 @@ func (s *DataImportService) normalizePreviewRow(userID, accountID int64, kind st
 		}
 		return n, "", ""
 	case model.ImportKindTrade:
-		return s.normalizeTradePreview(userID, accountID, cells, indexes, n, states)
+		return s.normalizeTradePreview(db, userID, accountID, cells, indexes, n, states)
 	}
 	return n, "unsupported_kind", "不支持的导入类型"
 }
 
-func (s *DataImportService) normalizeTradePreview(userID, accountID int64, cells []string, indexes map[string]int, n importNormalized, states map[string]*importPreviewState) (importNormalized, string, string) {
+func (s *DataImportService) normalizeTradePreview(db *gorm.DB, userID, accountID int64, cells []string, indexes map[string]int, n importNormalized, states map[string]*importPreviewState) (importNormalized, string, string) {
 	var err error
 	n.Side, err = parseImportSide(importCell(cells, indexes, "side"))
 	if err != nil {
@@ -846,6 +945,9 @@ func (s *DataImportService) normalizeTradePreview(userID, accountID int64, cells
 	if err != nil {
 		return n, "invalid_tax", err.Error()
 	}
+	if err := normalizePositionTradeValues(&n.Price, &n.Quantity, &n.Fee, &n.Tax); err != nil {
+		return n, "invalid_amount", err.Error()
+	}
 	n.Note = truncateRunes(importCell(cells, indexes, "note"), 200)
 
 	positionIDRaw := importCell(cells, indexes, "position_id")
@@ -860,7 +962,7 @@ func (s *DataImportService) normalizeTradePreview(userID, accountID int64, cells
 		state = states[key]
 		if state == nil {
 			var p model.Position
-			if err := common.DB.Where("id = ? AND user_id = ? AND account_id = ?", id, userID, accountID).First(&p).Error; err != nil {
+			if err := db.Where("id = ? AND user_id = ? AND account_id = ?", id, userID, accountID).First(&p).Error; err != nil {
 				return n, "position_not_found", "指定持仓不存在"
 			}
 			if p.Status != model.PositionStatusHolding {
@@ -869,18 +971,20 @@ func (s *DataImportService) normalizeTradePreview(userID, accountID int64, cells
 			if p.Symbol != n.Symbol || p.Market != n.Market {
 				return n, "position_mismatch", "指定持仓与股票代码或市场不一致"
 			}
-			_, dep, err := positionDependency(common.DB, p)
+			_, dep, err := positionDependency(db, p)
 			if err != nil {
 				return n, "database_error", "检查持仓账本失败"
 			}
 			var last model.PositionTrade
-			_ = common.DB.Where("user_id = ? AND account_id = ? AND position_id = ?", userID, accountID, p.ID).Order("trade_date DESC, id DESC").First(&last).Error
+			if err := db.Where("user_id = ? AND account_id = ? AND position_id = ?", userID, accountID, p.ID).Order("trade_date DESC, id DESC").First(&last).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return n, "database_error", "检查最近一笔流水失败"
+			}
 			state = &importPreviewState{Position: p, Ledger: ledgerFromPosition(&p), LastTradeDate: last.TradeDate, DependencyHash: dep}
 			states[key] = state
 			// 只有该标的恰好一笔在持仓位时，才允许后续未填 position_id 的行复用它。
 			// 多笔持仓下不能让前一行显式指定的 ID 替后续行消除歧义。
 			var holdingCount int64
-			if err := common.DB.Model(&model.Position{}).
+			if err := db.Model(&model.Position{}).
 				Where("user_id = ? AND account_id = ? AND market = ? AND symbol = ? AND status = ?", userID, accountID, p.Market, p.Symbol, model.PositionStatusHolding).
 				Count(&holdingCount).Error; err != nil {
 				return n, "database_error", "检查同标的持仓失败"
@@ -904,7 +1008,7 @@ func (s *DataImportService) normalizeTradePreview(userID, accountID int64, cells
 		}
 		if state == nil {
 			var positions []model.Position
-			if err := common.DB.Where("user_id = ? AND account_id = ? AND symbol = ? AND market = ? AND status = ?", userID, accountID, n.Symbol, n.Market, model.PositionStatusHolding).Order("id ASC").Find(&positions).Error; err != nil {
+			if err := db.Where("user_id = ? AND account_id = ? AND symbol = ? AND market = ? AND status = ?", userID, accountID, n.Symbol, n.Market, model.PositionStatusHolding).Order("id ASC").Find(&positions).Error; err != nil {
 				return n, "database_error", "检查现有持仓失败"
 			}
 			if len(positions) > 1 {
@@ -912,12 +1016,14 @@ func (s *DataImportService) normalizeTradePreview(userID, accountID int64, cells
 			}
 			if len(positions) == 1 {
 				p := positions[0]
-				_, dep, err := positionDependency(common.DB, p)
+				_, dep, err := positionDependency(db, p)
 				if err != nil {
 					return n, "database_error", "检查持仓账本失败"
 				}
 				var last model.PositionTrade
-				_ = common.DB.Where("user_id = ? AND account_id = ? AND position_id = ?", userID, accountID, p.ID).Order("trade_date DESC, id DESC").First(&last).Error
+				if err := db.Where("user_id = ? AND account_id = ? AND position_id = ?", userID, accountID, p.ID).Order("trade_date DESC, id DESC").First(&last).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+					return n, "database_error", "检查最近一笔流水失败"
+				}
 				state = &importPreviewState{Position: p, Ledger: ledgerFromPosition(&p), LastTradeDate: last.TradeDate, DependencyHash: dep}
 				states["id:"+strconv.FormatInt(p.ID, 10)] = state
 			} else {
@@ -929,6 +1035,9 @@ func (s *DataImportService) normalizeTradePreview(userID, accountID int64, cells
 			}
 			states[key] = state
 		}
+	}
+	if state.Position.Symbol != n.Symbol || state.Position.Market != n.Market {
+		return n, "position_mismatch", "指定持仓与股票代码或市场不一致"
 	}
 	if state.Position.ID > 0 {
 		n.PositionID, n.DependencyHash = state.Position.ID, state.DependencyHash
@@ -958,12 +1067,17 @@ func (s *DataImportService) normalizeTradePreview(userID, accountID int64, cells
 }
 
 func (s *DataImportService) Confirm(ctx context.Context, userID int64, batchID string, in ImportConfirmInput) (*ImportBatchView, error) {
-	dataImportMutationMu.Lock()
-	defer dataImportMutationMu.Unlock()
+	unlock, err := lockDataImportMutation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	var recIDs []int64
+	var view *ImportBatchView
 	if in.Version <= 0 {
 		return nil, errors.New("缺少有效的批次版本")
 	}
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
+	err = common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var batch model.ImportBatch
 		q := tx.Where("id = ? AND user_id = ?", batchID, userID)
 		if !common.UsingSQLite {
@@ -973,13 +1087,14 @@ func (s *DataImportService) Confirm(ctx context.Context, userID int64, batchID s
 			return errors.New("导入批次不存在")
 		}
 		if batch.Kind == model.ImportKindPosition || batch.Kind == model.ImportKindTrade {
-			var account model.PortfolioAccount
-			if err := tx.Where("id = ? AND user_id = ? AND status = ?", batch.AccountID, userID, model.PortfolioStatusActive).First(&account).Error; err != nil {
+			if err := lockActivePortfolioAccount(tx, userID, batch.AccountID, model.PortfolioKindReal); err != nil {
 				return errors.New("组合不存在或已归档")
 			}
 		}
 		if batch.Status == model.ImportStatusConfirmed {
-			return nil
+			var err error
+			view, err = loadImportBatchView(tx, userID, batch.ID)
+			return err
 		}
 		if batch.Status == model.ImportStatusRolledBack {
 			return errors.New("已回滚批次不能再次确认")
@@ -994,6 +1109,9 @@ func (s *DataImportService) Confirm(ctx context.Context, userID int64, batchID s
 		if err := tx.Where("batch_id = ? AND user_id = ? AND status = ?", batch.ID, userID, model.ImportRowValid).Order("row_number ASC").Find(&rows).Error; err != nil {
 			return err
 		}
+		if len(rows) != batch.TotalRows || len(rows) == 0 {
+			return errors.New("预检行事实不完整，请重新预检")
+		}
 		for _, row := range rows {
 			var exists int64
 			if err := tx.Model(&model.ImportRowClaim{}).Where("user_id = ? AND account_id = ? AND kind = ? AND row_digest = ?", userID, batch.AccountID, batch.Kind, row.RowDigest).Count(&exists).Error; err != nil {
@@ -1007,7 +1125,14 @@ func (s *DataImportService) Confirm(ctx context.Context, userID int64, batchID s
 				return errors.New("检测到并发重复确认，请刷新批次")
 			}
 		}
-		created, updated, err := s.applyConfirmedRows(ctx, tx, batch, rows)
+		created, updated, err := s.applyConfirmedRows(tx, batch, rows)
+		if err != nil {
+			return err
+		}
+		if err := invalidateImportSnapshotsTx(tx, batch); err != nil {
+			return err
+		}
+		recIDs, err = importRecommendationIDs(tx, batch)
 		if err != nil {
 			return err
 		}
@@ -1017,12 +1142,53 @@ func (s *DataImportService) Confirm(ctx context.Context, userID int64, batchID s
 		}).Error; err != nil {
 			return err
 		}
-		return setOnboardingStepTx(tx, userID, OnboardingStepPortfolio, model.OnboardingStepCompleted, 0)
+		if err := setOnboardingStepTx(tx, userID, OnboardingStepPortfolio, model.OnboardingStepCompleted, 0); err != nil {
+			return err
+		}
+		view, err = loadImportBatchView(tx, userID, batch.ID)
+		return err
 	})
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, ctx.Err())
 	}
-	return s.Get(userID, batchID)
+	for _, recID := range recIDs {
+		syncActualExecutionFact(userID, recID)
+	}
+	return view, nil
+}
+
+func invalidateImportSnapshotsTx(tx *gorm.DB, batch model.ImportBatch) error {
+	if batch.Kind != model.ImportKindPosition && batch.Kind != model.ImportKindTrade {
+		return nil
+	}
+	var rows []model.ImportRow
+	if err := tx.Select("normalized_json").Where("user_id = ? AND batch_id = ?", batch.UserID, batch.ID).Find(&rows).Error; err != nil {
+		return err
+	}
+	from := ""
+	for _, row := range rows {
+		n, err := decodeNormalized(row)
+		if err != nil {
+			return err
+		}
+		if n.TradeDate == "" {
+			return invalidatePortfolioSnapshotsTx(tx, batch.UserID, batch.AccountID, "")
+		}
+		if from == "" || n.TradeDate < from {
+			from = n.TradeDate
+		}
+	}
+	return invalidatePortfolioSnapshotsTx(tx, batch.UserID, batch.AccountID, from)
+}
+
+func importRecommendationIDs(tx *gorm.DB, batch model.ImportBatch) ([]int64, error) {
+	var ids []int64
+	if batch.Kind != model.ImportKindPosition && batch.Kind != model.ImportKindTrade {
+		return ids, nil
+	}
+	effects := tx.Model(&model.ImportEffect{}).Select("record_id").Where("user_id = ? AND batch_id = ? AND record_kind = ?", batch.UserID, batch.ID, "position")
+	err := tx.Model(&model.Position{}).Where("user_id = ? AND account_id = ? AND recommendation_id > 0 AND id IN (?)", batch.UserID, batch.AccountID, effects).Distinct().Pluck("recommendation_id", &ids).Error
+	return ids, err
 }
 
 func decodeNormalized(row model.ImportRow) (importNormalized, error) {
@@ -1033,7 +1199,7 @@ func decodeNormalized(row model.ImportRow) (importNormalized, error) {
 	return n, nil
 }
 
-func (s *DataImportService) applyConfirmedRows(ctx context.Context, tx *gorm.DB, batch model.ImportBatch, rows []model.ImportRow) (int, int, error) {
+func (s *DataImportService) applyConfirmedRows(tx *gorm.DB, batch model.ImportBatch, rows []model.ImportRow) (int, int, error) {
 	switch batch.Kind {
 	case model.ImportKindWatchlist:
 		return s.confirmWatchlist(tx, batch, rows)
@@ -1051,9 +1217,9 @@ func createImportEffect(tx *gorm.DB, effect model.ImportEffect) error {
 }
 
 func (s *DataImportService) confirmWatchlist(tx *gorm.DB, batch model.ImportBatch, rows []model.ImportRow) (int, int, error) {
-	var group model.Watchlist
-	if err := tx.Where("id = ? AND user_id = ?", batch.TargetGroupID, batch.UserID).First(&group).Error; err != nil {
-		return 0, 0, errors.New("目标自选分组已不存在")
+	group, err := lockedWatchlistGroup(tx, batch.UserID, batch.TargetGroupID)
+	if err != nil {
+		return 0, 0, err
 	}
 	for _, row := range rows {
 		n, err := decodeNormalized(row)
@@ -1096,6 +1262,9 @@ func (s *DataImportService) confirmPositions(tx *gorm.DB, batch model.ImportBatc
 		n, err := decodeNormalized(row)
 		if err != nil {
 			return 0, 0, err
+		}
+		if err := normalizePositionTradeValues(&n.Price, &n.Quantity, &n.Fee, &n.Tax); err != nil {
+			return 0, 0, fmt.Errorf("第 %d 行冻结的成交数值无效，请重新预检：%w", row.RowNumber, err)
 		}
 		var count int64
 		if err := tx.Model(&model.Position{}).Where("user_id = ? AND account_id = ? AND symbol = ? AND market = ? AND status = ? AND buy_date = ? AND buy_price = ? AND quantity = ?", batch.UserID, batch.AccountID, n.Symbol, n.Market, model.PositionStatusHolding, n.TradeDate, n.Price, n.Quantity).Count(&count).Error; err != nil {
@@ -1150,6 +1319,9 @@ func (s *DataImportService) confirmTrades(tx *gorm.DB, batch model.ImportBatch, 
 		n, err := decodeNormalized(row)
 		if err != nil {
 			return 0, 0, err
+		}
+		if err := normalizePositionTradeValues(&n.Price, &n.Quantity, &n.Fee, &n.Tax); err != nil {
+			return 0, 0, fmt.Errorf("第 %d 行冻结的成交数值无效，请重新预检：%w", row.RowNumber, err)
 		}
 		positionID := n.PositionID
 		if n.VirtualKey != "" {
@@ -1252,6 +1424,9 @@ func (s *DataImportService) confirmTrades(tx *gorm.DB, batch model.ImportBatch, 
 }
 
 func applyImportedTradeTx(tx *gorm.DB, p *model.Position, n importNormalized) (*model.PositionTrade, error) {
+	if p.Symbol != n.Symbol || p.Market != n.Market {
+		return nil, errors.New("指定持仓与股票代码或市场不一致，请重新预检")
+	}
 	if p.Status != model.PositionStatusHolding {
 		return nil, errors.New("持仓已平仓")
 	}
@@ -1314,12 +1489,21 @@ func applyImportedTradeTx(tx *gorm.DB, p *model.Position, n importNormalized) (*
 }
 
 func (s *DataImportService) Rollback(userID int64, batchID string) (*ImportRollbackResult, error) {
-	dataImportMutationMu.Lock()
-	defer dataImportMutationMu.Unlock()
+	return s.RollbackContext(context.Background(), userID, batchID)
+}
+
+func (s *DataImportService) RollbackContext(ctx context.Context, userID int64, batchID string) (*ImportRollbackResult, error) {
+	unlock, err := lockDataImportMutation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	db := common.DB.WithContext(ctx)
 	result := &ImportRollbackResult{BatchID: batchID, Conflicts: []ImportRollbackConflict{}}
+	var recIDs []int64
 	// 先做只读冲突检查，逐项返回，不在发现第一个问题时丢失其余冲突。
 	var batch model.ImportBatch
-	if err := common.DB.Where("id = ? AND user_id = ?", batchID, userID).First(&batch).Error; err != nil {
+	if err := db.Where("id = ? AND user_id = ?", batchID, userID).First(&batch).Error; err != nil {
 		return nil, errors.New("导入批次不存在")
 	}
 	if batch.Status == model.ImportStatusRolledBack {
@@ -1327,7 +1511,7 @@ func (s *DataImportService) Rollback(userID int64, batchID string) (*ImportRollb
 		return result, nil
 	}
 	if (batch.Kind == model.ImportKindPosition || batch.Kind == model.ImportKindTrade) && batch.AccountID > 0 {
-		if _, err := ActivePortfolioAccountByID(userID, batch.AccountID, model.PortfolioKindReal); err != nil {
+		if account, err := portfolioAccountByIDDB(db, userID, batch.AccountID, model.PortfolioKindReal); err != nil || account.Status != model.PortfolioStatusActive {
 			return nil, errors.New("组合不存在或已归档")
 		}
 	}
@@ -1335,11 +1519,11 @@ func (s *DataImportService) Rollback(userID int64, batchID string) (*ImportRollb
 		return nil, errors.New("只有已确认批次可以回滚")
 	}
 	var effects []model.ImportEffect
-	if err := common.DB.Where("batch_id = ? AND user_id = ?", batchID, userID).Order("id ASC").Find(&effects).Error; err != nil {
+	if err := db.Where("batch_id = ? AND user_id = ?", batchID, userID).Order("id ASC").Find(&effects).Error; err != nil {
 		return nil, err
 	}
 	var claims []model.ImportRowClaim
-	if err := common.DB.Where("batch_id = ? AND user_id = ?", batchID, userID).Order("row_number ASC").Find(&claims).Error; err != nil {
+	if err := db.Where("batch_id = ? AND user_id = ?", batchID, userID).Order("row_number ASC").Find(&claims).Error; err != nil {
 		return nil, err
 	}
 	if len(claims) != batch.TotalRows {
@@ -1364,8 +1548,7 @@ func (s *DataImportService) Rollback(userID int64, batchID string) (*ImportRollb
 			return nil, errors.New("回滚审计事实不完整，已拒绝自动回滚")
 		}
 	}
-	var err error
-	result.Conflicts, err = s.rollbackConflicts(common.DB, userID, effects, false)
+	result.Conflicts, err = s.rollbackConflicts(db, userID, effects, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1373,7 +1556,7 @@ func (s *DataImportService) Rollback(userID int64, batchID string) (*ImportRollb
 		result.Status = "conflict"
 		return result, nil
 	}
-	err = common.DB.Transaction(func(tx *gorm.DB) error {
+	err = db.Transaction(func(tx *gorm.DB) error {
 		var locked model.ImportBatch
 		q := tx.Where("id = ? AND user_id = ?", batchID, userID)
 		if !common.UsingSQLite {
@@ -1388,6 +1571,11 @@ func (s *DataImportService) Rollback(userID int64, batchID string) (*ImportRollb
 		if locked.Status != model.ImportStatusConfirmed {
 			return errors.New("批次状态已变化")
 		}
+		if locked.Kind == model.ImportKindPosition || locked.Kind == model.ImportKindTrade {
+			if err := lockActivePortfolioAccount(tx, userID, locked.AccountID, model.PortfolioKindReal); err != nil {
+				return err
+			}
+		}
 		conflicts, err := s.rollbackConflicts(tx, userID, effects, true)
 		if err != nil {
 			return err
@@ -1395,14 +1583,24 @@ func (s *DataImportService) Rollback(userID int64, batchID string) (*ImportRollb
 		if len(conflicts) > 0 {
 			return errors.New("业务数据已变化，请刷新冲突清单")
 		}
+		recIDs, err = importRecommendationIDs(tx, locked)
+		if err != nil {
+			return err
+		}
 		if err := s.applyRollback(tx, userID, effects); err != nil {
+			return err
+		}
+		if err := invalidateImportSnapshotsTx(tx, locked); err != nil {
 			return err
 		}
 		now := time.Now()
 		return tx.Model(&model.ImportBatch{}).Where("id = ? AND user_id = ?", batchID, userID).Updates(map[string]any{"status": model.ImportStatusRolledBack, "version": locked.Version + 1, "rolled_back_at": &now}).Error
 	})
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, ctx.Err())
+	}
+	for _, recID := range recIDs {
+		syncActualExecutionFact(userID, recID)
 	}
 	result.Status = model.ImportStatusRolledBack
 	return result, nil

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -13,7 +14,7 @@ import (
 	"quantvista/datasource"
 	"quantvista/model"
 
-	"gorm.io/gorm/clause"
+	"gorm.io/gorm"
 )
 
 // TrackingService 推荐追踪：复用 daily_bars 作为价格序列，按当日 high/low 判止盈/止损盘中触达，
@@ -45,6 +46,7 @@ type trackInput struct {
 	IsShort          bool
 	ReviewAfterDays  int              // 长线：超过该交易日数提示复盘（<=0 不提示）
 	Bars             []datasource.Bar // 追踪期日线（升序）
+	TradeDates       []string         // 推荐日之后的完整市场交易日轴；生产评估必须提供
 	ElapsedTradeDays int              // 从推荐日到今的已过交易日
 	BenchStart       float64          // 基准区间起点收盘（推荐日或其后首个交易日）
 	BenchEnd         float64          // 基准最新收盘
@@ -78,6 +80,25 @@ type trackResult struct {
 // 触发判定仅在有效期窗口内进行——过期后再触达价位不算止盈/止损（PRD 3.7 expired 为独立终态）。
 func evaluateTracking(in trackInput) trackResult {
 	var r trackResult
+	if in.IsShort {
+		end := len(in.Bars)
+		for i, b := range in.Bars {
+			day := i + 1
+			if in.TradeDates != nil {
+				day = sort.SearchStrings(in.TradeDates, b.TradeDate) + 1
+			}
+			if in.ValidDays > 0 && day > in.ValidDays {
+				end = i
+				break
+			}
+			if in.TakeProfit > 0 && b.High >= in.TakeProfit || in.StopLoss > 0 && b.Low > 0 && b.Low <= in.StopLoss {
+				end = i + 1
+				break
+			}
+		}
+		// 首次刷新即使迟到，结算窗口也只能到首次触发日或有效期末。
+		in.Bars = in.Bars[:end]
+	}
 	r.BarsCount = len(in.Bars)
 	if in.RefPrice <= 0 || len(in.Bars) == 0 {
 		r.Outcome = model.RecOutcomeNoData
@@ -125,13 +146,26 @@ func evaluateTracking(in trackInput) trackResult {
 	r.MaxDrawdownPct = round2(-worstDD * 100)
 	r.CurrentPrice = round2(r.CurrentPrice)
 
-	// 时间节点收益：第 N 交易日收盘相对 ref（bars[i] 为推荐日后第 i+1 个交易日；
-	// 已过节点且日线足够时记录，停牌缺 bar 时顺延到日线补齐后计入）。
+	// 时间节点收益按市场交易日定位；该日缺少个股价格时保持未知，不能顺延。
 	nodeReturn := func(n int) *float64 {
-		if in.ElapsedTradeDays < n || len(in.Bars) < n || in.Bars[n-1].Close <= 0 {
+		if in.ElapsedTradeDays < n {
 			return nil
 		}
-		v := round2((in.Bars[n-1].Close - in.RefPrice) / in.RefPrice * 100)
+		index := n - 1
+		if in.TradeDates != nil {
+			if len(in.TradeDates) < n {
+				return nil
+			}
+			date := in.TradeDates[n-1]
+			index = sort.Search(len(in.Bars), func(i int) bool { return in.Bars[i].TradeDate >= date })
+			if index >= len(in.Bars) || in.Bars[index].TradeDate != date {
+				return nil
+			}
+		}
+		if index >= len(in.Bars) || in.Bars[index].Close <= 0 {
+			return nil
+		}
+		v := round2((in.Bars[index].Close - in.RefPrice) / in.RefPrice * 100)
 		return &v
 	}
 	r.Return7d = nodeReturn(7)
@@ -179,6 +213,7 @@ func evaluateTracking(in trackInput) trackResult {
 
 // RefreshUser 刷新某用户近 trackWindowDays 天内成功批次的全部推荐追踪状态。返回处理条目数。
 func (s *TrackingService) RefreshUser(ctx context.Context, userID int64) (int, error) {
+	ctx = jobSubmissionContext(ctx)
 	if common.DB == nil {
 		return 0, errors.New("数据库不可用")
 	}
@@ -186,30 +221,36 @@ func (s *TrackingService) RefreshUser(ctx context.Context, userID int64) (int, e
 	var batches []model.RecommendationBatch
 	// degraded 一并追踪：AI 超时量化降级的批次同样有条目与规则计划价（老式 degraded
 	// 无条目，读到空列表自然跳过）。
-	if err := common.DB.Where("user_id = ? AND status IN ? AND created_at >= ?",
+	if err := common.DB.WithContext(ctx).Where("user_id = ? AND status IN ? AND created_at >= ?",
 		userID, []string{model.RecStatusSuccess, model.RecStatusDegraded}, cutoff).Find(&batches).Error; err != nil {
 		return 0, err
 	}
-	return s.refreshBatches(ctx, batches), nil
+	return s.refreshBatches(ctx, batches)
 }
 
 // RefreshBatch 刷新单个批次（手动触发，校验归属）。
 func (s *TrackingService) RefreshBatch(ctx context.Context, userID, batchID int64) (int, error) {
+	ctx = jobSubmissionContext(ctx)
 	if common.DB == nil {
 		return 0, errors.New("数据库不可用")
 	}
 	var batch model.RecommendationBatch
-	if err := common.DB.Where("id = ? AND user_id = ?", batchID, userID).First(&batch).Error; err != nil {
-		return 0, errors.New("推荐记录不存在")
+	if err := common.DB.WithContext(ctx).Where("id = ? AND user_id = ?", batchID, userID).First(&batch).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return 0, errors.New("推荐记录不存在")
+		}
+		return 0, err
 	}
 	if batch.Status != model.RecStatusSuccess && batch.Status != model.RecStatusDegraded {
 		return 0, nil // 无条目可追踪（processing/failed；老式 degraded 空条目由下游自然跳过）
 	}
-	return s.refreshBatches(ctx, []model.RecommendationBatch{batch}), nil
+	return s.refreshBatches(ctx, []model.RecommendationBatch{batch})
 }
 
 // refreshBatches 逐批评估并 upsert 状态；基准日线按市场缓存一次，避免重复请求。
-func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.RecommendationBatch) int {
+func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.RecommendationBatch) (int, error) {
+	ctx = jobSubmissionContext(ctx)
+	db := common.DB.WithContext(ctx)
 	benchCache := map[string][]datasource.Bar{}
 	benchTried := map[string]bool{}
 	getBench := func(market string) []datasource.Bar {
@@ -228,10 +269,13 @@ func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.Re
 
 	count := 0
 	for _, b := range batches {
+		if err := ctx.Err(); err != nil {
+			return count, err
+		}
+		startedAt := time.Now()
 		var recs []model.Recommendation
-		if err := common.DB.Where("batch_id = ? AND user_id = ?", b.ID, b.UserID).Find(&recs).Error; err != nil {
-			common.SysWarn("追踪读取推荐条目失败 batch=%d: %v", b.ID, err)
-			continue
+		if err := db.Where("batch_id = ? AND user_id = ?", b.ID, b.UserID).Find(&recs).Error; err != nil {
+			return count, err
 		}
 		if len(recs) == 0 {
 			continue
@@ -242,8 +286,10 @@ func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.Re
 		// 暂态（新推荐当天必落此态），冻结会让其永远停在无数据。active/tracking 照旧重算。
 		frozen := map[int64]bool{}
 		var srows []model.RecommendationStatus
-		common.DB.Select("recommendation_id", "outcome").
-			Where("batch_id = ? AND user_id = ?", b.ID, b.UserID).Find(&srows)
+		if err := db.Select("recommendation_id", "outcome").
+			Where("batch_id = ? AND user_id = ?", b.ID, b.UserID).Find(&srows).Error; err != nil {
+			return count, err
+		}
 		for _, sr := range srows {
 			if frozenTerminal(sr.Outcome) {
 				frozen[sr.RecommendationID] = true
@@ -255,6 +301,9 @@ func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.Re
 		recIDs := make([]int64, 0, len(recs))
 		for _, r := range recs {
 			if frozen[r.ID] {
+				if err := syncActualExecutionFact(b.UserID, r.ID, ctx); err != nil {
+					return count, err
+				}
 				continue
 			}
 			active = append(active, r)
@@ -267,8 +316,10 @@ func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.Re
 		bench := getBench(b.Market)
 		posByRec := map[int64]model.Position{}
 		var prows []model.Position
-		common.DB.Where("user_id = ? AND recommendation_id IN ? AND buy_price > 0", b.UserID, recIDs).
-			Order("id").Find(&prows)
+		if err := db.Where("user_id = ? AND recommendation_id IN ? AND buy_price > 0", b.UserID, recIDs).
+			Order("id").Find(&prows).Error; err != nil {
+			return count, err
+		}
 		for _, p := range prows {
 			if _, ok := posByRec[p.RecommendationID]; !ok {
 				posByRec[p.RecommendationID] = p
@@ -280,9 +331,16 @@ func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.Re
 		sem := make(chan struct{}, 4)
 		var wg sync.WaitGroup
 		results := make([]*model.RecommendationStatus, len(active))
+		errorsByItem := make([]error, len(active))
 		for i, rec := range active {
 			wg.Add(1)
-			sem <- struct{}{}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				wg.Done()
+				wg.Wait()
+				return count, ctx.Err()
+			}
 			go func(i int, rec model.Recommendation) {
 				defer wg.Done()
 				defer func() { <-sem }()
@@ -291,22 +349,30 @@ func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.Re
 				if hasPos {
 					posPtr = &pos
 				}
-				results[i] = s.evaluateOne(ctx, b, rec, recDate, bench, posPtr)
+				results[i], errorsByItem[i] = s.evaluateOne(ctx, b, rec, recDate, bench, posPtr)
 			}(i, rec)
 		}
 		wg.Wait()
-		for _, st := range results {
+		for i, st := range results {
+			if errorsByItem[i] != nil {
+				return count, fmt.Errorf("推荐 %s 追踪失败: %w", active[i].Symbol, errorsByItem[i])
+			}
 			if st == nil {
 				continue
 			}
-			if err := s.upsertStatus(st); err != nil {
-				common.SysWarn("追踪落库失败 rec=%d: %v", st.RecommendationID, err)
-				continue
+			written, err := s.commitStatus(ctx, st, startedAt)
+			if err != nil {
+				return count, err
 			}
-			count++
+			if written {
+				count++
+			}
+			if err := syncActualExecutionFact(st.UserID, st.RecommendationID, ctx); err != nil {
+				return count, err
+			}
 		}
 	}
-	return count
+	return count, nil
 }
 
 // frozenTerminal 终态冻结判定（#6）：短线止盈/止损/过期是已闭合的成熟结局，其收益
@@ -322,11 +388,19 @@ func frozenTerminal(outcome string) bool {
 
 // evaluateOne 评估单条推荐：拉日线（落库）+ 追加当日实时行情 + 交易日历计过期 + 基准 → 状态。
 // pos 非 nil 时并列记录用户执行事实（实际买入价/实际收益，不与模拟口径混算）。
-func (s *TrackingService) evaluateOne(ctx context.Context, batch model.RecommendationBatch, rec model.Recommendation, recDate string, bench []datasource.Bar, pos *model.Position) *model.RecommendationStatus {
+func (s *TrackingService) evaluateOne(ctx context.Context, batch model.RecommendationBatch, rec model.Recommendation, recDate string, bench []datasource.Bar, pos *model.Position) (*model.RecommendationStatus, error) {
 	isShort := batch.Type == model.RecTypeShortTerm
 	var detail recPick
 	if rec.DetailJSON != "" {
-		_ = json.Unmarshal([]byte(rec.DetailJSON), &detail)
+		var parsed *recPick
+		if err := json.Unmarshal([]byte(rec.DetailJSON), &parsed); err != nil || parsed == nil {
+			return nil, errors.New("推荐计划数据损坏，暂不能更新追踪状态")
+		}
+		detail = *parsed
+	}
+	tradeDates, err := trackingTradeDates(ctx, rec.Market, recDate, time.Now().In(time.Local).Format("2006-01-02"))
+	if err != nil {
+		return nil, err
 	}
 
 	st := &model.RecommendationStatus{
@@ -342,7 +416,22 @@ func (s *TrackingService) evaluateOne(ctx context.Context, batch model.Recommend
 	}
 
 	// 推荐日之后的日线（升序）+ 生成时点收盘锚（重锚检测）。
-	bars, refAnchorClose := s.symbolBarsAfter(ctx, rec.Market, rec.Symbol, recDate, rec.RefDate)
+	bars, refAnchorClose, err := s.symbolBarsAfter(ctx, rec.Market, rec.Symbol, recDate, rec.RefDate)
+	if err != nil {
+		return nil, err
+	}
+	openDates := make(map[string]bool, len(tradeDates))
+	for _, date := range tradeDates {
+		openDates[date] = true
+	}
+	for _, b := range bars {
+		if !openDates[b.TradeDate] {
+			return nil, errors.New("推荐日线与市场交易日历不一致，暂不能更新追踪状态")
+		}
+	}
+	if len(bars) > 0 && rec.RefDate != "" && rec.RefClose > 0 && refAnchorClose <= 0 {
+		return nil, errors.New("缺少推荐基准日价格，无法核对复权口径")
+	}
 
 	// S0-4 防前复权重锚：生成时保存的收盘价版本与当前序列同日收盘比对，偏差超容差
 	// 说明历史序列已被重锚——RefPrice 与止盈/止损快照价按复权因子调整后再评估，
@@ -379,19 +468,26 @@ func (s *TrackingService) evaluateOne(ctx context.Context, batch model.Recommend
 		}
 	}
 
-	elapsed, hasCal := countOpenTradeDaysAfter(rec.Market, recDate)
-	if !hasCal {
-		elapsed = len(bars) // 日历不可用时以日线条数近似
-	}
+	elapsed := len(tradeDates)
 	st.ElapsedTradeDays = elapsed
 
-	benchStart, benchEnd := benchRange(bench, recDate)
 	res := evaluateTracking(trackInput{
 		RefPrice: refPrice, TakeProfit: takeProfit, StopLoss: stopLoss,
 		ValidDays: detail.ValidDays, IsShort: isShort, ReviewAfterDays: longRecReviewDays,
 		Bars:             bars,
-		ElapsedTradeDays: elapsed, BenchStart: benchStart, BenchEnd: benchEnd,
+		TradeDates:       tradeDates,
+		ElapsedTradeDays: elapsed,
 	})
+	benchDate := rec.RefDate
+	if benchDate == "" {
+		benchDate = recDate
+	}
+	benchStart, benchEnd := benchRange(bench, benchDate, res.LastDate)
+	if benchStart > 0 && benchEnd > 0 {
+		res.BenchReturnPct = round2((benchEnd - benchStart) / benchStart * 100)
+		res.AlphaPct = round2(res.ReturnPct - res.BenchReturnPct)
+		res.HasBench = true
+	}
 
 	st.CurrentPrice = res.CurrentPrice
 	st.PeriodHigh = res.PeriodHigh
@@ -435,7 +531,10 @@ func (s *TrackingService) evaluateOne(ctx context.Context, batch model.Recommend
 		}
 		st.Note = strings.Join(notes, "；")
 	}
-	return st
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return st, nil
 }
 
 // shouldAppendQuoteBar 是否把当日实时行情追加为一根 bar：仅在今天是交易日、今天晚于
@@ -468,10 +567,10 @@ func actualReturnEndPrice(pos model.Position, currentPrice float64) float64 {
 
 // symbolBarsAfter 拉取标的日线（落库），返回按日期升序、trade_date > afterDate 的部分，
 // 以及 refDate 当日的收盘价（重锚检测锚点；refDate 为空或无该日 bar 时为 0）。
-func (s *TrackingService) symbolBarsAfter(ctx context.Context, market, symbol, afterDate, refDate string) ([]datasource.Bar, float64) {
+func (s *TrackingService) symbolBarsAfter(ctx context.Context, market, symbol, afterDate, refDate string) ([]datasource.Bar, float64, error) {
 	bars, err := s.market.GetDailyBars(ctx, market, symbol, trackBarLimit)
 	if err != nil {
-		return nil, 0
+		return nil, 0, err
 	}
 	sort.Slice(bars, func(i, j int) bool { return bars[i].TradeDate < bars[j].TradeDate })
 	refClose := 0.0
@@ -480,27 +579,28 @@ func (s *TrackingService) symbolBarsAfter(ctx context.Context, market, symbol, a
 		if refDate != "" && b.TradeDate == refDate {
 			refClose = b.Close
 		}
-		if b.TradeDate > afterDate {
+		if b.TradeDate > afterDate && b.TradeDate <= time.Now().In(time.Local).Format("2006-01-02") {
 			out = append(out, b)
 		}
 	}
-	return out, refClose
+	return out, refClose, nil
 }
 
-// benchRange 返回基准区间起点（推荐日或其后首个交易日收盘）与最新收盘。
+// benchRange 取参考日之前最近收盘与本次评估终点同日收盘，不混入终点之后的指数收益。
 // 输入 bench 须按 trade_date 升序（getBench 缓存时已排序）——此处不再原地排序，
 // 避免 4 路并发 goroutine 竞争共享 slice（#27d）。
-func benchRange(bench []datasource.Bar, recDate string) (start, end float64) {
+func benchRange(bench []datasource.Bar, recDate, endDate string) (start, end float64) {
 	if len(bench) == 0 {
 		return 0, 0
 	}
 	for _, b := range bench {
-		if b.TradeDate >= recDate {
+		if b.TradeDate <= recDate {
 			start = b.Close
-			break
+		}
+		if b.TradeDate == endDate {
+			end = b.Close
 		}
 	}
-	end = bench[len(bench)-1].Close
 	return start, end
 }
 
@@ -511,45 +611,46 @@ func countOpenTradeDaysAfter(market, recDate string) (int, bool) {
 		return 0, false
 	}
 	var total int64
-	common.DB.Model(&model.TradingCalendar{}).Where("market = ?", market).Count(&total)
+	if common.DB.Model(&model.TradingCalendar{}).Where("market = ?", market).Count(&total).Error != nil {
+		return 0, false
+	}
 	if total == 0 {
 		return 0, false
 	}
 	today := time.Now().In(time.Local).Format("2006-01-02")
 	var n int64
-	common.DB.Model(&model.TradingCalendar{}).
+	if common.DB.Model(&model.TradingCalendar{}).
 		Where("market = ? AND is_open = ? AND trade_date > ? AND trade_date <= ?", market, true, recDate, today).
-		Count(&n)
+		Count(&n).Error != nil {
+		return 0, false
+	}
 	return int(n), true
 }
 
 // upsertStatus 幂等落库追踪状态（按 recommendation_id 覆盖更新）。
 func (s *TrackingService) upsertStatus(st *model.RecommendationStatus) error {
-	if common.DB == nil {
-		return errors.New("数据库不可用")
-	}
-	st.UpdatedAt = time.Now()
-	return common.DB.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "recommendation_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{
-			"batch_id", "user_id", "symbol", "market", "type", "action",
-			"ref_price", "current_price", "period_high", "period_low",
-			"return_pct", "max_gain_pct", "max_drawdown_pct", "bench_return_pct", "alpha_pct",
-			"outcome", "review_needed", "hit_take_profit", "hit_stop_loss",
-			"elapsed_trade_days", "valid_days", "bars_count", "last_eval_date", "note",
-			"actual_buy_price", "actual_return_pct",
-			"return_7d", "return_14d", "return_30d", "updated_at",
-		}),
-	}).Create(st).Error
+	_, err := s.commitStatus(context.Background(), st, time.Now())
+	return err
 }
 
 // AckReview 标记某条推荐复盘提示为已读（今日待办就地消项）。仅本人；
 // review_ack 不在 upsertStatus 覆盖列中，后台追踪刷新不会打回未读。
 func (s *TrackingService) AckReview(userID, statusID int64) error {
+	return ackReviewDB(common.DB, userID, statusID)
+}
+
+func (s *TrackingService) AckReviewContext(ctx context.Context, userID, statusID int64) error {
 	if common.DB == nil {
 		return errors.New("数据库不可用")
 	}
-	res := common.DB.Model(&model.RecommendationStatus{}).
+	return ackReviewDB(common.DB.WithContext(ctx), userID, statusID)
+}
+
+func ackReviewDB(db *gorm.DB, userID, statusID int64) error {
+	if db == nil {
+		return errors.New("数据库不可用")
+	}
+	res := db.Model(&model.RecommendationStatus{}).
 		Where("id = ? AND user_id = ?", statusID, userID).
 		Update("review_ack", true)
 	if res.Error != nil {
@@ -596,13 +697,14 @@ type PerformanceStats struct {
 	BenchSample       int     `json:"bench_sample"` // 有基准数据、alpha 有效的样本量
 
 	// 买入成熟口径（主指标）。
-	BuyMatured      int     `json:"buy_matured"`  // action=buy 且已成熟
-	BuyWinRate      float64 `json:"buy_win_rate"` // 成熟买入样本中收益>0 比例
-	BuyAvgReturnPct float64 `json:"buy_avg_return_pct"`
-	BuyMedianPct    float64 `json:"buy_median_pct"`    // 成熟买入收益中位数
-	BuyAvgAlphaPct  float64 `json:"buy_avg_alpha_pct"` // 基准有效的成熟买入样本
-	BuyBenchSample  int     `json:"buy_bench_sample"`
-	BuyActive       int     `json:"buy_active"` // 未成熟买入（不进胜率分母，透明计数）
+	BuyMatured           int     `json:"buy_matured"`  // action=buy 且已成熟
+	BuyWinRate           float64 `json:"buy_win_rate"` // 成熟买入样本中收益>0 比例
+	BuyAvgReturnPct      float64 `json:"buy_avg_return_pct"`
+	BuyAvgMaxDrawdownPct float64 `json:"buy_avg_max_drawdown_pct"`
+	BuyMedianPct         float64 `json:"buy_median_pct"`    // 成熟买入收益中位数
+	BuyAvgAlphaPct       float64 `json:"buy_avg_alpha_pct"` // 基准有效的成熟买入样本
+	BuyBenchSample       int     `json:"buy_bench_sample"`
+	BuyActive            int     `json:"buy_active"` // 未成熟买入（不进胜率分母，透明计数）
 
 	// 观察口径（watch 判断质量，与买入分开）。
 	WatchSample  int     `json:"watch_sample"`
@@ -641,23 +743,31 @@ func statusMatured(r model.RecommendationStatus) bool {
 
 // Performance 聚合某用户的推荐追踪表现（可按类型过滤）。样本仅计有价格数据（outcome != no_data）的条目。
 func (s *TrackingService) Performance(userID int64, recType string) (*PerformanceStats, error) {
+	return s.PerformanceContext(context.Background(), userID, recType)
+}
+
+func (s *TrackingService) PerformanceContext(ctx context.Context, userID int64, recType string) (*PerformanceStats, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
-	q := common.DB.Where("user_id = ?", userID)
-	if recType == model.RecTypeShortTerm || recType == model.RecTypeLongTerm {
-		q = q.Where("type = ?", recType)
-	}
 	var rows []model.RecommendationStatus
-	if err := q.Find(&rows).Error; err != nil {
-		return nil, err
-	}
 	// S0-4：success 与 degraded 分开报告——degraded 批次（量化降级）条目不混入统计。
 	degradedBatch := map[int64]bool{}
 	var degradedIDs []int64
-	common.DB.Model(&model.RecommendationBatch{}).
-		Where("user_id = ? AND status = ?", userID, model.RecStatusDegraded).
-		Pluck("id", &degradedIDs)
+	if err := readSnapshotTx(jobSubmissionContext(ctx), func(tx *gorm.DB) error {
+		q := tx.Where("user_id = ?", userID)
+		if recType == model.RecTypeShortTerm || recType == model.RecTypeLongTerm {
+			q = q.Where("type = ?", recType)
+		}
+		if err := q.Find(&rows).Error; err != nil {
+			return err
+		}
+		return tx.Model(&model.RecommendationBatch{}).
+			Where("user_id = ? AND status = ?", userID, model.RecStatusDegraded).
+			Pluck("id", &degradedIDs).Error
+	}); err != nil {
+		return nil, err
+	}
 	for _, id := range degradedIDs {
 		degradedBatch[id] = true
 	}
@@ -667,7 +777,7 @@ func (s *TrackingService) Performance(userID int64, recType string) (*Performanc
 	var sum7, sum14, sum30 float64
 	var wins int
 	var buyRets []float64
-	var buySumRet, buySumAlpha float64
+	var buySumRet, buySumAlpha, buySumDD float64
 	var buyWins, watchWins int
 	for _, r := range rows {
 		if r.Outcome == model.RecOutcomeNoData {
@@ -695,6 +805,7 @@ func (s *TrackingService) Performance(userID int64, recType string) (*Performanc
 			if matured {
 				stats.BuyMatured++
 				buySumRet += r.ReturnPct
+				buySumDD += r.MaxDrawdownPct
 				buyRets = append(buyRets, r.ReturnPct)
 				if r.ReturnPct > 0 {
 					buyWins++
@@ -747,6 +858,7 @@ func (s *TrackingService) Performance(userID int64, recType string) (*Performanc
 	if stats.BuyMatured > 0 {
 		stats.BuyWinRate = round2(float64(buyWins) / float64(stats.BuyMatured) * 100)
 		stats.BuyAvgReturnPct = round2(buySumRet / float64(stats.BuyMatured))
+		stats.BuyAvgMaxDrawdownPct = round2(buySumDD / float64(stats.BuyMatured))
 		sort.Float64s(buyRets)
 		stats.BuyMedianPct = round2(median(buyRets))
 	}
@@ -866,8 +978,11 @@ func scanBatchFactsHealth() {
 	}
 	// 有事件的批次视为「旧代码已落库、仅无 facts_recorded 标记」，不告警。
 	var withEvents []int64
-	common.DB.Model(&model.RecommendationCandidateEvent{}).
-		Where("batch_id IN ?", ids).Distinct().Pluck("batch_id", &withEvents)
+	if err := common.DB.Model(&model.RecommendationCandidateEvent{}).
+		Where("batch_id IN ?", ids).Distinct().Pluck("batch_id", &withEvents).Error; err != nil {
+		common.SysWarn("事实账本完整性巡检读取事件失败: %v", err)
+		return
+	}
 	has := make(map[int64]bool, len(withEvents))
 	for _, id := range withEvents {
 		has[id] = true

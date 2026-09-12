@@ -165,7 +165,7 @@ function renderTrend() {
         name: '昨涨停溢价',
         type: 'line',
         yAxisIndex: 1,
-        data: trend.map((p) => p.yzt_avg_chg),
+        data: trend.map((p) => p.yzt_count > 0 ? p.yzt_avg_chg : null),
         symbol: 'none',
         lineStyle: { width: 1.5, color: vars.value.primaryColor },
         itemStyle: { color: vars.value.primaryColor },
@@ -327,7 +327,7 @@ onBeforeUnmount(() => {
               <StatCard label="涨停家数" :value="mood.latest.limit_up_count" :sub="mood.latest.trade_date" />
               <StatCard label="炸板率" :value="fmtPct(mood.latest.broken_rate)" :sub="`${mood.latest.broken_count} 家炸板`" />
               <StatCard label="最高连板" :value="`${mood.latest.max_streak} 板`" :sub="`${Object.keys(mood.streak_dist).length} 个梯度`" />
-              <StatCard label="昨涨停溢价" :value="fmtPct(mood.latest.yzt_avg_chg)" :change-pct="mood.latest.yzt_avg_chg" :sub="`${mood.latest.yzt_up_ratio.toFixed(1)}% 红盘`" />
+              <StatCard label="昨涨停溢价" :value="mood.latest.yzt_count > 0 ? fmtPct(mood.latest.yzt_avg_chg) : '暂无样本'" :change-pct="mood.latest.yzt_count > 0 ? mood.latest.yzt_avg_chg : undefined" :sub="mood.latest.yzt_count > 0 ? `${mood.latest.yzt_up_ratio.toFixed(1)}% 红盘` : '未取得昨日涨停样本'" />
             </div>
 
             <SectionCard title="近 30 个情绪快照" :hoverable="false">
@@ -345,7 +345,7 @@ onBeforeUnmount(() => {
                   @click="goStock(stock.symbol)"
                 >
                   <span class="fund-rank qv-figure">{{ index + 1 }}</span>
-                  <span class="fund-stock"><StockIdentity :symbol="stock.symbol" market="cn" :name="stock.name" density="table" /></span>
+                  <span class="fund-stock"><StockIdentity :symbol="stock.symbol" market="cn" :name="stock.name" /></span>
                   <span class="fund-industry">{{ stock.industry || '行业未知' }}</span>
                   <span class="fund-value qv-tnum" :style="{ color: upColor }">{{ fmtAmount(stock.seal_fund) }}</span>
                 </button>
@@ -360,7 +360,8 @@ onBeforeUnmount(() => {
           <n-alert v-if="moodError" type="error" :bordered="false" title="梯队数据加载失败">
             {{ moodError }}
           </n-alert>
-          <div v-else-if="mood?.streak_ladders.length" class="ladder-list">
+           <div v-else-if="mood?.streak_ladders.length" class="ladder-list">
+              <span v-if="mood.latest" class="ladder-meta">快照日期 {{ mood.latest.trade_date }}</span>
             <SectionCard
               v-for="ladder in mood.streak_ladders"
               :key="ladder.streak"
@@ -542,7 +543,7 @@ onBeforeUnmount(() => {
     height: 280px;
   }
   .fund-row {
-    grid-template-columns: 28px minmax(120px, 1fr) 104px;
+    grid-template-columns: 28px minmax(0, 1fr) 104px;
     gap: 8px;
   }
   .fund-industry {

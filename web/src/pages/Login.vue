@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onUnmounted, ref } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { NForm, NFormItem, NInput, NButton, NDivider, NIcon, useMessage } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
@@ -16,6 +16,10 @@ const auth = useAuthStore()
 const username = ref('')
 const password = ref('')
 const loading = ref(false)
+const githubLoading = ref(false)
+let active = true
+onUnmounted(() => { active = false })
+const isCurrent = () => active && route.name === 'login'
 
 function go() {
   const redirect = safeInternalRoute(route.query.redirect)
@@ -23,26 +27,32 @@ function go() {
 }
 
 async function submit() {
-  if (!username.value || !password.value) return message.error('请输入用户名和密码')
+  if (loading.value || githubLoading.value || !isCurrent()) return
+  if (!username.value.trim() || !password.value) return message.error('请输入用户名和密码')
   loading.value = true
   try {
-    await auth.loginPassword(username.value.trim(), password.value)
+    await auth.loginPassword(username.value.trim(), password.value, isCurrent)
+    if (!isCurrent()) return
     message.success('登录成功')
     go()
   } catch (e) {
-    message.error(authErrorText(e, '登录失败，请检查账号和密码'))
+    if (isCurrent()) message.error(authErrorText(e, '登录失败，请检查账号和密码'))
   } finally {
     loading.value = false
   }
 }
 
 async function github() {
+  if (loading.value || githubLoading.value || !isCurrent()) return
+  githubLoading.value = true
   try {
     sessionStorage.setItem('qv_login_redirect', safeInternalRoute(route.query.redirect))
     // App 内走移动流（系统浏览器授权 + 深链回跳，阶段 B）；浏览器走原 Web 流。
-    await (isNativeApp ? auth.startMobileGithubLogin() : auth.startGithubLogin())
+    await (isNativeApp ? auth.startMobileGithubLogin(isCurrent) : auth.startGithubLogin(isCurrent))
   } catch (e) {
-    message.error(authErrorText(e, 'GitHub 登录暂不可用，请稍后重试'))
+    if (isCurrent()) message.error(authErrorText(e, 'GitHub 登录暂不可用，请稍后重试'))
+  } finally {
+    githubLoading.value = false
   }
 }
 </script>
@@ -63,12 +73,12 @@ async function github() {
           @keyup.enter="submit"
         />
       </n-form-item>
-      <n-button type="primary" block :loading="loading" @click="submit">登录</n-button>
+      <n-button type="primary" block :loading="loading" :disabled="githubLoading" @click="submit">登录</n-button>
     </n-form>
 
     <template v-if="auth.githubEnabled">
       <n-divider style="margin: 16px 0">或</n-divider>
-      <n-button block @click="github">
+      <n-button block :loading="githubLoading" :disabled="loading" @click="github">
         <template #icon>
           <n-icon>
             <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor">

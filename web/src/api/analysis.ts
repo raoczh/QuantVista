@@ -167,6 +167,7 @@ export interface AnalysisRecord {
 
 // 详情/发起返回的视图。
 export interface AnalysisView extends AnalysisRecord {
+  request?: AnalyzeRequest // 失败任务的原始请求快照；只供本人恢复历史解释选择
   result: AnalysisResult | null
   panel: PanelResult | null
   raw: string

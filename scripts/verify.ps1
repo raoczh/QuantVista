@@ -35,11 +35,18 @@ function Invoke-GoVerification {
 
 function Invoke-WebVerification {
     $buildOut = ""
+    $verifyTempRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot "build/web-verification"))
     Push-Location (Join-Path $repoRoot "web")
     try {
         if ($Mode -eq "full") {
+            Write-Host "[Web] Running regression tests"
+            & npm test
+            if ($LASTEXITCODE -ne 0) {
+                throw "Web tests failed with exit code $LASTEXITCODE"
+            }
             Write-Host "[Web] Running the production build"
-            $buildOut = Join-Path ([System.IO.Path]::GetTempPath()) ("quantvista-web-verify-" + [guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $verifyTempRoot -Force | Out-Null
+            $buildOut = Join-Path $verifyTempRoot ([guid]::NewGuid().ToString("N"))
             New-Item -ItemType Directory -Path $buildOut | Out-Null
             & npm run build -- --outDir $buildOut
         }
@@ -54,7 +61,12 @@ function Invoke-WebVerification {
     finally {
         Pop-Location
         if ($buildOut -and (Test-Path -LiteralPath $buildOut)) {
-            Remove-Item -LiteralPath $buildOut -Recurse -Force
+            $resolvedBuildOut = [System.IO.Path]::GetFullPath($buildOut)
+            $allowedPrefix = $verifyTempRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+            if (-not $resolvedBuildOut.StartsWith($allowedPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "Refusing to remove a build path outside the verification directory"
+            }
+            Remove-Item -LiteralPath $resolvedBuildOut -Recurse -Force
         }
     }
 }

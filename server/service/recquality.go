@@ -36,11 +36,11 @@ const (
 	qgMinBars        = 60 // 日线样本下限（MA60/波动率窗口；次新股不足时窗口因子失真）
 
 	// 各缺失项的 would-be 置信度上限（多项命中取最小）。
-	qgCapNoFactors  = 30 // 无日线/因子未算：技术面证据整体缺席
-	qgCapStaleBars  = 50 // 行情过期：所有价量因子都是旧的
-	qgCapNoAmount   = 50 // 成交额缺失：流动性无法判断
-	qgCapShortBars  = 60 // 日线样本不足：长窗口因子失真
-	qgCapLongNoFin  = 40 // 长线缺财务：长线逻辑的核心证据缺席
+	qgCapNoFactors = 30 // 无日线/因子未算：技术面证据整体缺席
+	qgCapStaleBars = 50 // 行情过期：所有价量因子都是旧的
+	qgCapNoAmount  = 50 // 成交额缺失：流动性无法判断
+	qgCapShortBars = 60 // 日线样本不足：长窗口因子失真
+	qgCapLongNoFin = 40 // 长线缺财务：长线逻辑的核心证据缺席
 )
 
 // qualityGateResult 单条推荐的数据质量影子输出（落 pick 明细 detail_json；
@@ -134,19 +134,32 @@ func tradeDaysBetween(openDays []string, from, to string) int {
 }
 
 // recentOpenDays 近 lookback 自然日内的升序开市日清单（供质量门控的交易日口径过期
-// 判定）；日历未回填/查询失败返回 nil（调用方回退自然日口径）。
+// 判定）；日历未完整回填/查询失败返回 nil（调用方回退自然日口径）。
 func recentOpenDays(today string, lookback int) []string {
-	if common.DB == nil {
+	if common.DB == nil || lookback <= 0 {
 		return nil
 	}
-	from := ""
-	if t, err := time.Parse("2006-01-02", today); err == nil {
-		from = t.AddDate(0, 0, -lookback).Format("2006-01-02")
+	end, err := time.Parse("2006-01-02", today)
+	if err != nil {
+		return nil
+	}
+	from := end.AddDate(0, 0, -lookback)
+	var rows []model.TradingCalendar
+	if err := common.DB.Select("trade_date", "is_open").
+		Where("market = ? AND trade_date > ? AND trade_date <= ?", "cn", from.Format("2006-01-02"), today).
+		Order("trade_date").Find(&rows).Error; err != nil || len(rows) != lookback {
+		return nil
 	}
 	var days []string
-	common.DB.Model(&model.TradingCalendar{}).
-		Where("market = ? AND is_open = ? AND trade_date > ? AND trade_date <= ?", "cn", true, from, today).
-		Order("trade_date").Pluck("trade_date", &days)
+	for i, row := range rows {
+		// 缺行代表未知，不能当成休市后低估已错过的交易日。
+		if row.TradeDate != from.AddDate(0, 0, i+1).Format("2006-01-02") {
+			return nil
+		}
+		if row.IsOpen {
+			days = append(days, row.TradeDate)
+		}
+	}
 	return days
 }
 

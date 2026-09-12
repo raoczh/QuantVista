@@ -98,7 +98,7 @@ func encodeDataSourceAuditSummary(summary dataSourceAuditSummary) string {
 
 // beginDataSourceAudit 必须在任何探测/解冷副作用前成功。初始行按中断失败记账，
 // 完成后再用白名单摘要收敛，确保不会出现已执行但完全没有审计记录的操作。
-func beginDataSourceAudit(task string, userID int64, tuple DataSourceProbeRequest, summary dataSourceAuditSummary) (*model.DataSyncLog, error) {
+func beginDataSourceAudit(ctx context.Context, task string, userID int64, tuple DataSourceProbeRequest, summary dataSourceAuditSummary) (*model.DataSyncLog, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库尚未初始化")
 	}
@@ -107,7 +107,10 @@ func beginDataSourceAudit(task string, userID int64, tuple DataSourceProbeReques
 		Message: "operation interrupted", TriggerSource: "admin", UserID: userID,
 		ParameterSummary: encodeDataSourceAuditSummary(summary),
 	}
-	if err := common.DB.Create(log).Error; err != nil {
+	if err := common.DB.WithContext(ctx).Create(log).Error; err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		common.SysWarn("写数据源运维审计失败 task=%s: %v", task, err)
 		return nil, errors.New("数据源运维审计写入失败")
 	}
@@ -138,6 +141,10 @@ func finishDataSourceAudit(log *model.DataSyncLog, status, message string, summa
 
 // ProbeDataSource 执行一次管理员主动探测，并无论成功、空响应还是上游错误都写安全审计。
 func (s *MarketService) ProbeDataSource(ctx context.Context, userID int64, in DataSourceProbeRequest) (DataSourceProbeOperation, error) {
+	ctx = jobSubmissionContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return DataSourceProbeOperation{}, err
+	}
 	if s == nil || s.mgr == nil {
 		return DataSourceProbeOperation{}, datasource.ErrProbeUnavailable
 	}
@@ -148,7 +155,7 @@ func (s *MarketService) ProbeDataSource(ctx context.Context, userID int64, in Da
 	}
 	started := time.Now()
 	summary := dataSourceAuditSummary{Provider: in.Provider, Capability: in.Capability, Market: in.Market, SampleCount: 1}
-	audit, err := beginDataSourceAudit(dataSourceProbeTask, userID, in, summary)
+	audit, err := beginDataSourceAudit(ctx, dataSourceProbeTask, userID, in, summary)
 	if err != nil {
 		return DataSourceProbeOperation{}, err
 	}
@@ -177,7 +184,11 @@ func (s *MarketService) ProbeDataSource(ctx context.Context, userID int64, in Da
 }
 
 // UncoolDataSource 只解除指定注册三元组的 cooldown，保留其历史窗口和观测记录。
-func (s *MarketService) UncoolDataSource(_ context.Context, userID int64, in DataSourceUncoolRequest) (DataSourceUncoolOperation, error) {
+func (s *MarketService) UncoolDataSource(ctx context.Context, userID int64, in DataSourceUncoolRequest) (DataSourceUncoolOperation, error) {
+	ctx = jobSubmissionContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return DataSourceUncoolOperation{}, err
+	}
 	if s == nil || s.mgr == nil {
 		return DataSourceUncoolOperation{}, datasource.ErrProbeUnavailable
 	}
@@ -191,9 +202,12 @@ func (s *MarketService) UncoolDataSource(_ context.Context, userID int64, in Dat
 	}
 	started := time.Now()
 	summary := dataSourceAuditSummary{Provider: tuple.Provider, Capability: tuple.Capability, Market: tuple.Market, Reason: reason}
-	audit, err := beginDataSourceAudit(dataSourceUncoolTask, userID, tuple, summary)
+	audit, err := beginDataSourceAudit(ctx, dataSourceUncoolTask, userID, tuple, summary)
 	if err != nil {
 		return DataSourceUncoolOperation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return DataSourceUncoolOperation{AuditID: audit.ID}, err
 	}
 	left, cleared, uncoolErr := s.mgr.ClearCooldown(tuple.Provider, tuple.Capability, tuple.Market)
 	status := "failed"

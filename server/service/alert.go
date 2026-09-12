@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -98,16 +99,17 @@ func alertKindNeedsBars(kind string) bool {
 
 // alertEval 评估的输入观测值（纯函数便于测试）。
 type alertEval struct {
-	Price     float64
-	DayHigh   float64
-	DayLow    float64
-	ChangePct float64
-	DayVolume int64     // 当日成交量（手），volume_surge 用
-	Amplitude float64   // 当日振幅 %，amplitude 用（估值源缺失时由 quote 计算）
-	Closes    []float64 // 升序日线收盘（最新在末尾），供 ma/breakout
-	Highs     []float64
-	Lows      []float64
-	Volumes   []int64 // 升序日线成交量（手，剔除当日在途 bar），供 volume_surge 均量
+	Price       float64
+	DayHigh     float64
+	DayLow      float64
+	ChangePct   float64
+	DayVolume   int64     // 当日成交量（手），volume_surge 用
+	Amplitude   float64   // 当日振幅 %，amplitude 用（估值源缺失时由 quote 计算）
+	AmplitudeOK bool      // 完整 OHLC 可确认有效的零振幅
+	Closes      []float64 // 升序日线收盘（最新在末尾），供 ma/breakout
+	Highs       []float64
+	Lows        []float64
+	Volumes     []int64 // 升序日线成交量（手，剔除当日在途 bar），供 volume_surge 均量
 }
 
 // evaluateAlert 纯函数判定规则是否命中，返回（命中、观测值、命中说明）。
@@ -121,7 +123,7 @@ func evaluateAlert(rule model.AlertRule, in alertEval) (bool, float64, string) {
 				hi = in.Price
 			}
 			if hi >= rule.Threshold {
-				return true, in.Price, fmt.Sprintf("当日最高 %.2f 触及目标价 ≥ %.2f", hi, rule.Threshold)
+				return true, in.Price, fmt.Sprintf("当日最高 %.4f 触及目标价 ≥ %.4f", hi, rule.Threshold)
 			}
 		} else {
 			lo := in.DayLow
@@ -129,7 +131,7 @@ func evaluateAlert(rule model.AlertRule, in alertEval) (bool, float64, string) {
 				lo = in.Price
 			}
 			if lo <= rule.Threshold {
-				return true, in.Price, fmt.Sprintf("当日最低 %.2f 触及目标价 ≤ %.2f", lo, rule.Threshold)
+				return true, in.Price, fmt.Sprintf("当日最低 %.4f 触及目标价 ≤ %.4f", lo, rule.Threshold)
 			}
 		}
 		return false, in.Price, ""
@@ -153,11 +155,11 @@ func evaluateAlert(rule model.AlertRule, in alertEval) (bool, float64, string) {
 		}
 		if rule.Op == model.AlertOpGTE {
 			if in.Price >= ma {
-				return true, in.Price, fmt.Sprintf("现价 %.2f 站上 MA%d（%.2f）", in.Price, rule.Period, ma)
+				return true, in.Price, fmt.Sprintf("现价 %.4f 站上 MA%d（%.4f）", in.Price, rule.Period, ma)
 			}
 		} else {
 			if in.Price <= ma {
-				return true, in.Price, fmt.Sprintf("现价 %.2f 跌破 MA%d（%.2f）", in.Price, rule.Period, ma)
+				return true, in.Price, fmt.Sprintf("现价 %.4f 跌破 MA%d（%.4f）", in.Price, rule.Period, ma)
 			}
 		}
 		return false, in.Price, ""
@@ -173,7 +175,7 @@ func evaluateAlert(rule model.AlertRule, in alertEval) (bool, float64, string) {
 				hi = in.Price
 			}
 			if hi >= hh {
-				return true, in.Price, fmt.Sprintf("当日最高 %.2f 创近 %d 日新高（前高 %.2f）", hi, rule.Period, hh)
+				return true, in.Price, fmt.Sprintf("当日最高 %.4f 创近 %d 日新高（前高 %.4f）", hi, rule.Period, hh)
 			}
 		} else {
 			ll, ok := windowMin(in.Lows, rule.Period)
@@ -185,7 +187,7 @@ func evaluateAlert(rule model.AlertRule, in alertEval) (bool, float64, string) {
 				lo = in.Price
 			}
 			if lo <= ll {
-				return true, in.Price, fmt.Sprintf("当日最低 %.2f 创近 %d 日新低（前低 %.2f）", lo, rule.Period, ll)
+				return true, in.Price, fmt.Sprintf("当日最低 %.4f 创近 %d 日新低（前低 %.4f）", lo, rule.Period, ll)
 			}
 		}
 		return false, in.Price, ""
@@ -196,7 +198,7 @@ func evaluateAlert(rule model.AlertRule, in alertEval) (bool, float64, string) {
 		if !ok || in.DayVolume <= 0 {
 			return false, 0, ""
 		}
-		ratio := round2(float64(in.DayVolume) / avg)
+		ratio := float64(in.DayVolume) / avg
 		if rule.Op == model.AlertOpGTE {
 			if ratio >= rule.Threshold {
 				return true, ratio, fmt.Sprintf("当日量达 %d 日均量的 %.2f 倍 ≥ %.2f 倍（放量）", volumeAvgWindow, ratio, rule.Threshold)
@@ -210,7 +212,7 @@ func evaluateAlert(rule model.AlertRule, in alertEval) (bool, float64, string) {
 
 	case model.AlertKindAmplitude:
 		// 当日振幅 %（(high-low)/prev_close，优先取估值源自带值）。缺数据（0）不判定。
-		if in.Amplitude <= 0 {
+		if in.Amplitude < 0 || (in.Amplitude == 0 && !in.AmplitudeOK) {
 			return false, 0, ""
 		}
 		if rule.Op == model.AlertOpGTE {
@@ -236,7 +238,12 @@ func movingAverage(closes []float64, period int) (float64, bool) {
 	for _, c := range closes[len(closes)-period:] {
 		sum += c
 	}
-	return round2(sum / float64(period)), true
+	mean := sum / float64(period)
+	if math.IsNaN(mean) || math.IsInf(mean, 0) {
+		return 0, false
+	}
+	// 均线用于比较，不能按显示格式截为两位；八位精度也消除相等均值的浮点求和噪声。
+	return math.Round(mean*1e8) / 1e8, true
 }
 
 // windowMax 取末尾 period 根的最高价上界（用于突破前高比较，排除当日：调用方用当日 high 与之比较）。
@@ -253,7 +260,7 @@ func windowMax(highs []float64, period int) (float64, bool) {
 	if m == 0 {
 		return 0, false
 	}
-	return round2(m), true
+	return m, true
 }
 
 func windowMin(lows []float64, period int) (float64, bool) {
@@ -269,7 +276,7 @@ func windowMin(lows []float64, period int) (float64, bool) {
 	if m <= 0 {
 		return 0, false
 	}
-	return round2(m), true
+	return m, true
 }
 
 // volumeAverage 取末尾 period 个成交量的均值（不足或均量为 0 则 false）。
@@ -303,6 +310,14 @@ type AlertInput struct {
 }
 
 func (s *AlertService) validate(in *AlertInput) error {
+	if math.IsNaN(in.Threshold) || math.IsInf(in.Threshold, 0) {
+		return errors.New("提醒阈值必须为有限数值")
+	}
+	// threshold 保存为 decimal(20,4)，先限幅再舍入，防止有限大数乘 1e4 后溢出。
+	if math.Abs(in.Threshold) >= 1e16 {
+		return errors.New("提醒阈值超出可保存范围")
+	}
+	in.Threshold = round4(in.Threshold)
 	in.Kind = strings.ToLower(strings.TrimSpace(in.Kind))
 	in.Op = strings.ToLower(strings.TrimSpace(in.Op))
 	if !validAlertKind[in.Kind] {
@@ -365,6 +380,9 @@ const positionAlertAllName = "我的全部持仓"
 // Create 新建提醒规则（校验代码 + 取名）。
 // **持仓卖出决策类允许 symbol 为空**（= 我的全部持仓），此时不校验代码、不拉行情取名。
 func (s *AlertService) Create(ctx context.Context, userID int64, in AlertInput) (*model.AlertRule, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := s.validate(&in); err != nil {
 		return nil, err
 	}
@@ -374,6 +392,9 @@ func (s *AlertService) Create(ctx context.Context, userID int64, in AlertInput) 
 		if market == "" {
 			market = "cn" // 持仓类只覆盖 A 股（与 guard/事件日历同口径）
 		}
+		if market != "cn" {
+			return nil, errors.New("持仓类提醒仅支持 A 股")
+		}
 	} else {
 		var err error
 		symbol, market, err = normalizeSymbolMarket(in.Symbol, in.Market)
@@ -381,34 +402,50 @@ func (s *AlertService) Create(ctx context.Context, userID int64, in AlertInput) 
 			return nil, err
 		}
 	}
+	if isPositionAlertKind(in.Kind) && market != "cn" {
+		return nil, errors.New("持仓类提醒仅支持 A 股")
+	}
+	if isEarnAlertKind(in.Kind) && market != "cn" {
+		return nil, errors.New("财报类提醒仅支持 A 股")
+	}
 	var cnt int64
-	common.DB.Model(&model.AlertRule{}).Where("user_id = ?", userID).Count(&cnt)
+	if err := common.DB.WithContext(ctx).Model(&model.AlertRule{}).Where("user_id = ?", userID).Count(&cnt).Error; err != nil {
+		return nil, err
+	}
 	if cnt >= maxAlertsPerUser {
 		return nil, fmt.Errorf("提醒规则数量已达上限（%d）", maxAlertsPerUser)
 	}
 	name := strings.TrimSpace(in.Name)
 	if allPositions {
 		name = positionAlertAllName
-	} else if q, e := s.market.GetQuote(ctx, market, symbol); e == nil && q.Name != "" {
+	} else if q, e := s.market.GetQuote(ctx, market, symbol); e == nil && q != nil && q.Name != "" {
 		name = q.Name
 	} else if errors.Is(e, datasource.ErrSymbolInvalid) {
 		return nil, errors.New("无法识别的股票代码")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	rule := &model.AlertRule{
-		UserID: userID, Symbol: symbol, Market: market, Name: name,
+		UserID: userID, Symbol: symbol, Market: market, Name: truncateRunes(name, 64),
 		Kind: in.Kind, Op: in.Op, Threshold: round4(in.Threshold), Period: in.Period,
 		Once: in.Once, Note: truncateRunes(strings.TrimSpace(in.Note), 250), Status: model.AlertStatusActive,
 	}
-	if err := common.DB.Transaction(func(tx *gorm.DB) error {
+	if err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 用户行是跨进程的创建锁；等待它之后再建立计数快照。
+		if _, err := lockEnabledAuthUser(tx, userID); err != nil {
+			return err
+		}
+		if err := tx.Model(&model.AlertRule{}).Where("user_id = ?", userID).Count(&cnt).Error; err != nil {
+			return err
+		}
+		if cnt >= maxAlertsPerUser {
+			return fmt.Errorf("提醒规则数量已达上限（%d）", maxAlertsPerUser)
+		}
 		if err := tx.Create(rule).Error; err != nil {
 			return err
 		}
-		progress, err := currentOnboardingProgressTx(tx, userID, OnboardingCurrentVersion, true)
-		if err != nil || progress.Status == model.OnboardingStatusCompleted || progress.AlertStatus == model.OnboardingStepSkipped {
-			return err
-		}
-		return tx.Model(&model.OnboardingProgress{}).Where("id = ? AND user_id = ?", progress.ID, userID).
-			Updates(map[string]any{"alert_rule_id": rule.ID, "deferred_until": nil}).Error
+		return recordOnboardingAlertCreatedTx(tx, userID, rule.ID)
 	}); err != nil {
 		return nil, err
 	}
@@ -462,10 +499,16 @@ func (s *AlertService) Update(ctx context.Context, userID, id int64, in AlertInp
 	db := common.DB.WithContext(ctx)
 	var rule model.AlertRule
 	if err := db.Where("id = ? AND user_id = ?", id, userID).First(&rule).Error; err != nil {
-		return nil, errors.New("提醒规则不存在")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("提醒规则不存在")
+		}
+		return nil, err
 	}
 	if err := s.validate(&in); err != nil {
 		return nil, err
+	}
+	if rule.Market != "cn" && (isPositionAlertKind(in.Kind) || isEarnAlertKind(in.Kind)) {
+		return nil, errors.New("持仓及财报类提醒仅支持 A 股，请保留当前类型或新建 A 股提醒")
 	}
 	// 未绑定 symbol 的规则（持仓类的「我的全部持仓」）不能被改成需要 symbol 的类型——
 	// 那样评估时会拿空代码去拉行情，规则永久空转。改类型请新建一条。
@@ -481,7 +524,16 @@ func (s *AlertService) Update(ctx context.Context, userID, id int64, in AlertInp
 	rule.Status = model.AlertStatusActive
 	rule.TriggeredAt = nil
 	rule.TriggerMsg = ""
-	if err := db.Save(&rule).Error; err != nil {
+	updated := db.Model(&model.AlertRule{}).Where("id = ? AND user_id = ? AND updated_at = ?", id, userID, rule.UpdatedAt).
+		Updates(map[string]any{"kind": rule.Kind, "op": rule.Op, "threshold": rule.Threshold, "period": rule.Period,
+			"once": rule.Once, "note": rule.Note, "status": rule.Status, "triggered_at": nil, "trigger_msg": ""})
+	if updated.Error != nil {
+		return nil, updated.Error
+	}
+	if updated.RowsAffected == 0 {
+		return nil, errors.New("提醒规则已修改或删除，请刷新后重试")
+	}
+	if err := db.Where("id = ? AND user_id = ?", id, userID).First(&rule).Error; err != nil {
 		return nil, err
 	}
 	return &rule, nil
@@ -501,14 +553,23 @@ func (s *AlertService) SetStatus(ctx context.Context, userID, id int64, status s
 	db := common.DB.WithContext(ctx)
 	var rule model.AlertRule
 	if err := db.Where("id = ? AND user_id = ?", id, userID).First(&rule).Error; err != nil {
-		return nil, errors.New("提醒规则不存在")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("提醒规则不存在")
+		}
+		return nil, err
 	}
-	rule.Status = status
+	updates := map[string]any{"status": status}
 	if status == model.AlertStatusActive {
-		rule.TriggeredAt = nil
-		rule.TriggerMsg = ""
+		updates["triggered_at"], updates["trigger_msg"] = nil, ""
 	}
-	if err := db.Save(&rule).Error; err != nil {
+	updated := db.Model(&model.AlertRule{}).Where("id = ? AND user_id = ? AND updated_at = ?", id, userID, rule.UpdatedAt).Updates(updates)
+	if updated.Error != nil {
+		return nil, updated.Error
+	}
+	if updated.RowsAffected == 0 {
+		return nil, errors.New("提醒规则已修改或删除，请刷新后重试")
+	}
+	if err := db.Where("id = ? AND user_id = ?", id, userID).First(&rule).Error; err != nil {
 		return nil, err
 	}
 	return &rule, nil
@@ -540,9 +601,9 @@ func (s *AlertService) Delete(ctx context.Context, userID, id int64) error {
 // TriggeredForUser 返回用户未读的命中事件（进入今日待办的提醒条目）。
 // 批次 H 起以 alert_events 明细为准：每次命中（同日去重）落一条事件，
 // 用户标记已读/忽略即从待办消失——替代旧的「按规则行 triggered_at 推断」口径。
-func (s *AlertService) TriggeredForUser(userID int64) ([]model.AlertEvent, error) {
+func (s *AlertService) TriggeredForUser(userID int64, contexts ...context.Context) ([]model.AlertEvent, error) {
 	var rows []model.AlertEvent
-	q := common.DB.Model(&model.AlertEvent{}).
+	q := common.DB.WithContext(jobSubmissionContext(contexts...)).Model(&model.AlertEvent{}).
 		Where("alert_events.user_id = ? AND alert_events.status = ?", userID, model.AlertEventUnread)
 	err := withActionablePositionAlertEvents(q).
 		Order("triggered_at DESC").Limit(alertEventMaxList).Find(&rows).Error
@@ -554,12 +615,9 @@ func (s *AlertService) TriggeredForUser(userID int64) ([]model.AlertEvent, error
 // withActionablePositionAlertEvents 过滤已无对应本人持仓的遗留未读事件。
 // PositionID=0 是普通提醒，不依赖持仓；历史状态查询不调用本函数，仍保留完整记录。
 func withActionablePositionAlertEvents(q *gorm.DB) *gorm.DB {
-	return q.Where(`alert_events.position_id = 0 OR EXISTS (
-		SELECT 1 FROM positions
-		WHERE positions.id = alert_events.position_id
-		  AND positions.user_id = alert_events.user_id
-		  AND positions.status = ?
-	)`, model.PositionStatusHolding)
+	return q.Where("alert_events.position_id = 0 OR EXISTS (?)", common.DB.Model(&model.Position{}).
+		Select("1").Scopes(withActivePositionAccount).
+		Where("positions.id = alert_events.position_id AND positions.user_id = alert_events.user_id AND positions.status = ?", model.PositionStatusHolding))
 }
 
 // ListEvents 命中历史（可按状态过滤，倒序）。
@@ -589,7 +647,10 @@ func (s *AlertService) ListEvents(userID int64, status string, limit int) ([]Ale
 func (s *AlertService) GetEvent(userID, id int64) (*AlertEventView, error) {
 	var event model.AlertEvent
 	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&event).Error; err != nil {
-		return nil, errors.New("命中记录不存在")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("命中记录不存在")
+		}
+		return nil, err
 	}
 	view := toAlertEventView(event)
 	return &view, nil
@@ -597,24 +658,38 @@ func (s *AlertService) GetEvent(userID, id int64) (*AlertEventView, error) {
 
 // SetEventStatus 标记事件已读/忽略（也允许恢复未读，仅本人）。
 func (s *AlertService) SetEventStatus(userID, id int64, status string) (*AlertEventView, error) {
+	return s.setEventStatusDB(common.DB, userID, id, status)
+}
+
+func (s *AlertService) SetEventStatusContext(ctx context.Context, userID, id int64, status string) (*AlertEventView, error) {
+	return s.setEventStatusDB(common.DB.WithContext(ctx), userID, id, status)
+}
+
+func (s *AlertService) setEventStatusDB(db *gorm.DB, userID, id int64, status string) (*AlertEventView, error) {
 	if status != model.AlertEventUnread && status != model.AlertEventRead && status != model.AlertEventDismissed {
 		return nil, errors.New("非法状态")
 	}
 	var ev model.AlertEvent
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("id = ? AND user_id = ?", id, userID).First(&ev).Error; err != nil {
-			return errors.New("命中记录不存在")
+	if err := db.Where("id = ? AND user_id = ?", id, userID).First(&ev).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("命中记录不存在")
 		}
-		if status == model.AlertEventUnread && ev.PositionID > 0 {
-			var p model.Position
-			q := tx.Where("id = ? AND user_id = ? AND status = ?",
-				ev.PositionID, userID, model.PositionStatusHolding)
-			if tx.Dialector.Name() != "sqlite" {
-				q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+		return nil, err
+	}
+	var p model.Position
+	if status == model.AlertEventUnread && ev.PositionID > 0 {
+		if err := db.Where("id = ? AND user_id = ? AND status = ?", ev.PositionID, userID, model.PositionStatusHolding).First(&p).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, errors.New("关联持仓已平仓或不存在，不能恢复为未读")
 			}
-			if err := q.First(&p).Error; err != nil {
-				if errors.Is(err, gorm.ErrRecordNotFound) {
-					return errors.New("关联持仓已平仓或不存在，不能恢复为未读")
+			return nil, err
+		}
+	}
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if status == model.AlertEventUnread && ev.PositionID > 0 {
+			if err := verifyPositionRiskBasesTx(tx, userID, []model.Position{p}); err != nil {
+				if errors.Is(err, errPositionRiskChanged) {
+					return errors.New("关联持仓已平仓、归档或发生变化，不能恢复为未读")
 				}
 				return err
 			}
@@ -633,7 +708,11 @@ func (s *AlertService) SetEventStatus(userID, id int64, status string) (*AlertEv
 
 // MarkAllEventsRead 全部未读事件标记已读，返回影响条数。
 func (s *AlertService) MarkAllEventsRead(userID int64) (int64, error) {
-	res := common.DB.Model(&model.AlertEvent{}).
+	return s.MarkAllEventsReadContext(context.Background(), userID)
+}
+
+func (s *AlertService) MarkAllEventsReadContext(ctx context.Context, userID int64) (int64, error) {
+	res := common.DB.WithContext(ctx).Model(&model.AlertEvent{}).
 		Where("user_id = ? AND status = ?", userID, model.AlertEventUnread).
 		Update("status", model.AlertEventRead)
 	return res.RowsAffected, res.Error
@@ -763,16 +842,50 @@ func persistAlertEvaluation(ctx context.Context, rule model.AlertRule, value flo
 		if err != nil {
 			return err
 		}
-		out.active = true
-		updates := map[string]any{"last_value": round2(value), "last_check_date": today}
-		if triggered {
-			updates["triggered_at"] = now
-			updates["trigger_msg"] = truncateRunes(msg, 256)
-			if current.Once {
-				updates["status"] = model.AlertStatusTriggered
+		if !sameAlertRuleDefinition(current, rule) || current.LastCheckDate > today {
+			return errAlertRuleChanged
+		}
+		financial := triggered && isEarnAlertKind(current.Kind) && eventContext != nil && eventContext.Financial != nil
+		if financial {
+			verified, err := readAlertFinancialEvaluation(tx, current, now, true)
+			if err != nil {
+				return err
 			}
-			alreadyToday := current.TriggeredAt != nil &&
-				current.TriggeredAt.In(time.Local).Format("2006-01-02") == today
+			if !verified.triggered || !sameAlertFinancialFact(verified.context, eventContext) {
+				return errAlertRuleChanged
+			}
+		}
+		out.active = true
+		updates := map[string]any{"last_value": round4(value), "last_check_date": today}
+		if triggered {
+			alreadyToday := false
+			if current.TriggeredAt != nil && financial {
+				alreadyToday, err = alertFinancialFactAlreadySeen(tx, current, eventContext, now)
+				if err != nil {
+					return err
+				}
+			} else if current.TriggeredAt != nil {
+				// 盘前/休市检查的执行日可晚于行情日，不能凭 triggered_at 占用新交易日。
+				dayStart, err := time.ParseInLocation("2006-01-02", today, time.Local)
+				if err != nil {
+					return err
+				}
+				var count int64
+				if err := tx.Model(&model.AlertEvent{}).
+					Where("rule_id = ? AND position_id = 0", current.ID).
+					Where("trade_date = ? OR (trade_date = '' AND triggered_at >= ? AND triggered_at < ?)", today, dayStart, dayStart.AddDate(0, 0, 1)).
+					Count(&count).Error; err != nil {
+					return err
+				}
+				alreadyToday = count > 0
+			}
+			if !financial || !alreadyToday {
+				updates["triggered_at"] = now
+				updates["trigger_msg"] = truncateRunes(msg, 256)
+				if current.Once {
+					updates["status"] = model.AlertStatusTriggered
+				}
+			}
 			if !alreadyToday {
 				contextVersion, contextJSON, err := marshalAlertEventContext(eventContext)
 				if err != nil {
@@ -893,14 +1006,18 @@ func (s *AlertService) EvaluateUser(ctx context.Context, userID int64) (int, err
 		onboardingRuleID = 0
 	}
 	hits, err := s.evaluateUserMarket(ctx, userID)
-	if err != nil {
-		return 0, err
+	var evidenceErr *alertEvidenceError
+	if err != nil && !errors.As(err, &evidenceErr) {
+		return hits, err
 	}
-	earnHits, err := s.evaluateEarnRulesForUserContext(ctx, userID)
+	earnHits, earnErr := s.evaluateEarnRulesForUserContext(ctx, userID)
+	if earnErr != nil {
+		return hits + earnHits, errors.Join(err, earnErr)
+	}
+	hits += earnHits
 	if err != nil {
 		return hits, err
 	}
-	hits += earnHits
 	if err := completeOnboardingAlertTest(userID, onboardingRuleID); err != nil {
 		common.SysWarn("提醒检查完成后保存引导进度失败 user=%d rule=%d: %v", userID, onboardingRuleID, err)
 	}
@@ -936,7 +1053,8 @@ func (s *AlertService) evaluateUserMarketUnlocked(ctx context.Context, userID in
 		return 0, err
 	}
 	hits, err := s.evaluateRules(ctx, rules)
-	if err != nil {
+	var evidenceErr *alertEvidenceError
+	if err != nil && !errors.As(err, &evidenceErr) {
 		return hits, err
 	}
 	// 持仓卖出决策类走独立编排（评估单元是持仓，不是 symbol）。
@@ -945,10 +1063,10 @@ func (s *AlertService) evaluateUserMarketUnlocked(ctx context.Context, userID in
 		userID, model.AlertStatusActive, positionAlertKinds).Order("id ASC").Find(&posRules).Error; err != nil {
 		return hits, err
 	}
-	posHits, err := s.evaluatePositionRules(ctx, userID, posRules)
+	posHits, posErr := s.evaluatePositionRules(ctx, userID, posRules)
 	hits += posHits
-	if err != nil {
-		return hits, err
+	if posErr != nil {
+		return hits, errors.Join(err, posErr)
 	}
 	// 有持仓类规则时 evaluatePositionRules 会把同一批 positions/quotes 直接交给
 	// 统一评估，避免提醒轮对同一用户重复拉行情；没有规则时仍需覆盖真实持仓。
@@ -957,15 +1075,24 @@ func (s *AlertService) evaluateUserMarketUnlocked(ctx context.Context, userID in
 			return hits, fmt.Errorf("统一持仓卖出风险评估失败: %w", exitErr)
 		}
 	}
-	return hits, nil
+	return hits, err
 }
+
+type alertEvidenceError struct{ cause error }
+
+func (e *alertEvidenceError) Error() string { return e.cause.Error() }
+func (e *alertEvidenceError) Unwrap() error { return e.cause }
 
 // evaluateRules 评估一批规则，按 symbol 缓存行情/日线/估值，避免重复请求。
 func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRule) (int, error) {
 	type md struct {
 		eval         alertEval
 		quote        *datasource.Quote
+		fresh        quoteFreshInfo
+		tradeDate    string
 		bars         []datasource.Bar
+		barsTried    bool
+		barsIssue    string
 		metricSource string
 		metricAsOf   string
 		ok           bool
@@ -974,14 +1101,26 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 	cache := map[string]md{}
 	today := time.Now().In(time.Local).Format("2006-01-02")
 	hits := 0
+	barLimits := map[string]int{}
+	for _, rule := range rules {
+		if alertKindNeedsBars(rule.Kind) {
+			key := QuoteKey(rule.Market, rule.Symbol)
+			// 预先按同股所有规则的最大窗口取数，包含可能存在的当日在途一根。
+			barLimits[key] = max(barLimits[key], alertBarLimit, min(rule.Period, 250)+1)
+		}
+	}
+	var dataErrors []error
 
 	// fillBars 组装 ma/breakout/volume_surge 的日线序列。breakout 的「前高/前低」与
 	// volume_surge 的「均量」窗口剔除当日在途 bar（否则当日 high 与含自身的窗口比较
 	// 恒成立、当日量参与均量会稀释放量信号）；MA 序列保留当日（现价参与均线是常用口径）。
-	fillBars := func(e *alertEval, bars []datasource.Bar) {
+	fillBars := func(e *alertEval, bars []datasource.Bar, tradeDate string) {
 		for _, b := range bars {
+			if b.TradeDate > tradeDate {
+				continue
+			}
 			e.Closes = append(e.Closes, b.Close)
-			if b.TradeDate != today {
+			if b.TradeDate < tradeDate {
 				e.Highs = append(e.Highs, b.High)
 				e.Lows = append(e.Lows, b.Low)
 				e.Volumes = append(e.Volumes, b.Volume)
@@ -1012,6 +1151,10 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 	}
 	userID := rules[0].UserID
 	err := walkAlertRules(ctx, userID, rules, func(rule model.AlertRule) error {
+		if (rule.Kind == model.AlertKindMA || rule.Kind == model.AlertKindBreakout) && (rule.Period < 2 || rule.Period > 250) {
+			dataErrors = append(dataErrors, fmt.Errorf("%s 的提醒周期无效，未完成检查", rule.Symbol))
+			return nil
+		}
 		key := QuoteKey(rule.Market, rule.Symbol)
 		data, cached := cache[key]
 		if !cached {
@@ -1023,20 +1166,22 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 			if quoteErr == nil && q != nil && q.Price > 0 && fi.Status == freshStatusFresh {
 				data.eval = alertEval{Price: q.Price, DayHigh: q.High, DayLow: q.Low, ChangePct: q.ChangePct, DayVolume: q.Volume}
 				data.quote = q
+				data.fresh = fi
+				data.tradeDate = fi.ExpectedDate
+				if data.tradeDate == "" {
+					data.tradeDate = today
+					if !q.DataTime.IsZero() {
+						data.tradeDate = q.DataTime.In(time.Local).Format("2006-01-02")
+					}
+				}
 				data.metricSource = q.Source
 				data.metricAsOf = alertContextTime(q.DataTime)
 				// 振幅回退基线：(high-low)/prev_close（估值源自带值优先，见下方按需覆盖）。
-				if q.PrevClose > 0 && q.High > 0 && q.High >= q.Low {
-					data.eval.Amplitude = round2((q.High - q.Low) / q.PrevClose * 100)
+				if q.PrevClose > 0 && q.Low > 0 && q.High >= q.Low {
+					data.eval.Amplitude = (q.High - q.Low) / q.PrevClose * 100
+					data.eval.AmplitudeOK = true
 				}
 				data.ok = true
-				// ma/breakout/volume_surge 才需要日线。
-				if alertKindNeedsBars(rule.Kind) {
-					if bars, berr := s.market.GetDailyBars(ctx, rule.Market, rule.Symbol, alertBarLimit); berr == nil {
-						fillBars(&data.eval, bars)
-						data.bars = bars
-					}
-				}
 			}
 			if err := ctx.Err(); err != nil {
 				return err
@@ -1044,17 +1189,48 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 			cache[key] = data
 		}
 		if !data.ok {
+			dataErrors = append(dataErrors, fmt.Errorf("%s 的当前行情不可用，未完成提醒检查", rule.Symbol))
 			return nil
 		}
-		// 若已缓存但缺日线而本规则需要，补拉一次。
-		if alertKindNeedsBars(rule.Kind) && len(data.eval.Closes) == 0 {
-			if bars, berr := s.market.GetDailyBars(ctx, rule.Market, rule.Symbol, alertBarLimit); berr == nil {
-				fillBars(&data.eval, bars)
-				data.bars = bars
-				cache[key] = data
+		// 每只股票只尝试一次共享日线；失败不反复请求，按规则报告缺口。
+		if alertKindNeedsBars(rule.Kind) && !data.barsTried {
+			data.barsTried = true
+			bars, berr := s.market.GetDailyBars(ctx, rule.Market, rule.Symbol, barLimits[key])
+			if berr != nil {
+				data.barsIssue = "日线读取失败"
+			} else {
+				data.barsIssue = technicalBarsIssue(ctx, rule.Market, data.quote.DataTime, data.fresh, bars)
+				if data.barsIssue == "" {
+					fillBars(&data.eval, bars, data.tradeDate)
+					data.bars = bars
+				}
 			}
 			if err := ctx.Err(); err != nil {
 				return err
+			}
+			cache[key] = data
+		}
+		if alertKindNeedsBars(rule.Kind) {
+			issue := data.barsIssue
+			if issue == "" {
+				switch rule.Kind {
+				case model.AlertKindMA:
+					if len(data.eval.Closes) < rule.Period {
+						issue = "均线日线样本不足"
+					}
+				case model.AlertKindBreakout:
+					if len(data.eval.Highs) < rule.Period {
+						issue = "突破参考日线样本不足"
+					}
+				case model.AlertKindVolumeSurge:
+					if _, ok := volumeAverage(data.eval.Volumes, volumeAvgWindow); !ok || data.eval.DayVolume <= 0 {
+						issue = "成交量样本不可用"
+					}
+				}
+			}
+			if issue != "" {
+				dataErrors = append(dataErrors, fmt.Errorf("%s：%s，未完成提醒检查", rule.Symbol, issue))
+				return nil
 			}
 		}
 		// 振幅规则优先用估值源自带振幅（腾讯行情串），每 symbol 只试一次，失败保留 quote 回退值。
@@ -1062,9 +1238,10 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 		// 过期估值（昨日/停滞口径）覆盖，等于把已验证的新数据换成旧数据。
 		if rule.Kind == model.AlertKindAmplitude && !data.valTried {
 			data.valTried = true
-			if v, verr := s.market.GetValuation(ctx, rule.Market, rule.Symbol); verr == nil && v.Amplitude > 0 &&
+			if v, verr := s.market.GetValuation(ctx, rule.Market, rule.Symbol); verr == nil && v != nil && v.Amplitude > 0 &&
 				s.market.QuoteFreshnessOf(rule.Market, v.DataTime).Status == freshStatusFresh {
 				data.eval.Amplitude = v.Amplitude
+				data.eval.AmplitudeOK = true
 				data.metricSource = v.Source
 				data.metricAsOf = alertContextTime(v.DataTime)
 			}
@@ -1072,6 +1249,10 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 				return err
 			}
 			cache[key] = data
+		}
+		if rule.Kind == model.AlertKindAmplitude && !data.eval.AmplitudeOK {
+			dataErrors = append(dataErrors, fmt.Errorf("%s 的振幅字段不足，未完成提醒检查", rule.Symbol))
+			return nil
 		}
 
 		if err := ctx.Err(); err != nil {
@@ -1085,7 +1266,7 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 				rule, data.eval, data.quote, data.bars, data.metricSource, data.metricAsOf, msg,
 			)
 		}
-		persisted, err := persistAlertEvaluation(ctx, rule, value, triggered, msg, today, now, eventContext)
+		persisted, err := persistAlertEvaluation(ctx, rule, value, triggered, msg, data.tradeDate, now, eventContext)
 		if err != nil {
 			return err
 		}
@@ -1107,6 +1288,9 @@ func (s *AlertService) evaluateRules(ctx context.Context, rules []model.AlertRul
 	})
 	if err != nil {
 		return hits, err
+	}
+	if issue := errors.Join(dataErrors...); issue != nil {
+		return hits, &alertEvidenceError{cause: issue}
 	}
 	return hits, nil
 }
@@ -1291,7 +1475,7 @@ func startAlertRound(now time.Time, svc *AlertService) {
 		}
 		var holdingUserIDs []int64
 		if err := common.DB.WithContext(dispatchCtx).Model(&model.Position{}).
-			Where("status = ?", model.PositionStatusHolding).
+			Scopes(withActivePositionAccount).Where("status = ?", model.PositionStatusHolding).
 			Distinct().Order("user_id ASC").Pluck("user_id", &holdingUserIDs).Error; err != nil {
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				common.SysWarn("持仓卖出评估列举用户失败: %v", err)
@@ -1463,51 +1647,26 @@ func (s *AlertService) evaluateEarnRulesForUserUnlocked(ctx context.Context, use
 		if err := ctx.Err(); err != nil {
 			return hits, err
 		}
-		var triggered bool
-		var value float64
-		var msg string
-		var eventContext *AlertEventContext
-		switch rule.Kind {
-		case model.AlertKindEarnDate:
-			var sched model.DisclosureSchedule
-			err := db.Where("symbol = ? AND appoint_date >= ? AND is_published = ?", rule.Symbol, today, false).
-				Order("appoint_date ASC").First(&sched).Error
-			if err == nil {
-				triggered, value, msg = evaluateEarnDate(rule, sched.AppointDate, sched.ReportTypeName, now)
-				if triggered {
-					eventContext = buildEarnDateAlertContext(rule, sched, value, msg)
-				}
-			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-				return hits, err
-			}
-		case model.AlertKindEarnFcst:
-			var forecast model.EarningsForecast
-			err := db.Where("symbol = ?", rule.Symbol).Order("notice_date DESC, id DESC").First(&forecast).Error
-			if err == nil {
-				triggered, value, msg = evaluateEarnFcst(rule, &forecast, now)
-				if triggered {
-					eventContext = buildEarnForecastAlertContext(rule, forecast, value, msg)
-				}
-			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-				return hits, err
-			}
-		}
-
-		persisted, err := persistAlertEvaluation(ctx, rule, value, triggered, msg, today, time.Now(), eventContext)
+		assessment, err := readAlertFinancialEvaluation(db, rule, now, false)
 		if err != nil {
 			return hits, err
 		}
-		if triggered && persisted.active {
+
+		persisted, err := persistAlertEvaluation(ctx, rule, assessment.value, assessment.triggered, assessment.message, today, time.Now(), assessment.context)
+		if err != nil {
+			return hits, err
+		}
+		if persisted.eventCreated {
 			hits++
 		}
-		if triggered && notifyOn && persisted.eventCreated {
+		if notifyOn && persisted.eventCreated {
 			name := rule.Name
 			if name == "" {
 				name = rule.Symbol
 			}
 			pushItems = append(pushItems, alertNotificationItem{
 				EventID:  persisted.eventID,
-				Summary:  name + "(" + rule.Symbol + ")：" + msg,
+				Summary:  name + "(" + rule.Symbol + ")：" + assessment.message,
 				DeepLink: alertEventDeepLink(persisted.eventID),
 			})
 		}

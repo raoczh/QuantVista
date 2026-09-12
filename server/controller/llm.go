@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"net/http"
 	"strconv"
 
 	"quantvista/common"
@@ -30,9 +31,9 @@ func (lc *LLMController) idParam(c *gin.Context) (int64, bool) {
 
 // List GET /api/llm-configs
 func (lc *LLMController) List(c *gin.Context) {
-	rows, err := lc.svc.List(currentUserID(c))
+	rows, err := lc.svc.List(currentUserID(c), c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "模型配置请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, rows)
@@ -41,13 +42,14 @@ func (lc *LLMController) List(c *gin.Context) {
 // Create POST /api/llm-configs
 func (lc *LLMController) Create(c *gin.Context) {
 	var in service.LLMConfigInput
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
 	if err := c.ShouldBindJSON(&in); err != nil {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	v, err := lc.svc.Create(currentUserID(c), in)
+	v, err := lc.svc.Create(currentUserID(c), in, c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "模型配置请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, v)
@@ -60,13 +62,14 @@ func (lc *LLMController) Update(c *gin.Context) {
 		return
 	}
 	var in service.LLMConfigInput
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
 	if err := c.ShouldBindJSON(&in); err != nil {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	v, err := lc.svc.Update(currentUserID(c), id, in)
+	v, err := lc.svc.Update(currentUserID(c), id, in, c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "模型配置请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, v)
@@ -78,8 +81,8 @@ func (lc *LLMController) Delete(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := lc.svc.Delete(currentUserID(c), id); err != nil {
-		common.ApiErrorMsg(c, err.Error())
+	if err := lc.svc.Delete(currentUserID(c), id, c.Request.Context()); err != nil {
+		common.ApiErrorMsg(c, publicWorkflowError(err, "模型配置请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, gin.H{"ok": true})
@@ -91,9 +94,9 @@ func (lc *LLMController) Test(c *gin.Context) {
 	if !ok {
 		return
 	}
-	res, err := lc.svc.TestByID(currentUserID(c), id, lc.allowPrivate(c))
+	res, err := lc.svc.TestByID(currentUserID(c), id, lc.allowPrivate(c), c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "模型配置请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, res)
@@ -105,9 +108,9 @@ func (lc *LLMController) SetDefault(c *gin.Context) {
 	if !ok {
 		return
 	}
-	v, err := lc.svc.SetDefault(currentUserID(c), id)
+	v, err := lc.svc.SetDefault(currentUserID(c), id, c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "模型配置请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, v)
@@ -117,13 +120,14 @@ func (lc *LLMController) SetDefault(c *gin.Context) {
 // 用 POST 而非 GET：Base URL 与 API Key 是请求体参数（密钥不进 URL，避免落日志/历史）。
 func (lc *LLMController) FetchModels(c *gin.Context) {
 	var in service.LLMConfigInput
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
 	if err := c.ShouldBindJSON(&in); err != nil {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	models, truncated, err := lc.svc.FetchModels(currentUserID(c), in, lc.allowPrivate(c))
+	models, truncated, err := lc.svc.FetchModels(currentUserID(c), in, lc.allowPrivate(c), c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "模型配置请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, gin.H{"models": models, "truncated": truncated})
@@ -134,13 +138,14 @@ func (lc *LLMController) FetchModels(c *gin.Context) {
 // 路径与 /llm-configs/:id 分开，避免 "test" 被当成 :id 参数段。
 func (lc *LLMController) TestDraft(c *gin.Context) {
 	var in service.LLMConfigInput
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
 	if err := c.ShouldBindJSON(&in); err != nil {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	res, err := lc.svc.TestByInput(currentUserID(c), in, lc.allowPrivate(c))
+	res, err := lc.svc.TestByInput(currentUserID(c), in, lc.allowPrivate(c), c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "模型配置请求失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, res)

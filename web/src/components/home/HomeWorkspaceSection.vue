@@ -32,6 +32,7 @@ defineEmits<{
         <button
           type="button"
           class="workspace-section-toggle"
+          :aria-expanded="expanded"
           :aria-label="`${expanded ? '收起' : '展开'}${title}`"
           @click="$emit('toggle')"
         >

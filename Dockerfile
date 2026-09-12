@@ -7,16 +7,16 @@
 # ============================================================
 
 # ---- 阶段 1：前端构建 ----
-FROM node:20-alpine AS webbuilder
+FROM node:24-alpine3.24 AS webbuilder
 WORKDIR /app/web
-COPY web/package.json ./
-RUN npm install
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
 COPY web/ ./
 # vite.config 的 outDir 为 ../server/web/dist，故产物落在 /app/server/web/dist
 RUN npm run build
 
 # ---- 阶段 2：后端编译（embed 前端产物）----
-FROM golang:1.25-alpine AS gobuilder
+FROM golang:1.26.8-alpine3.24 AS gobuilder
 ENV GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOPROXY=https://goproxy.cn,direct
 WORKDIR /src
 COPY server/go.mod server/go.sum ./
@@ -28,7 +28,7 @@ COPY --from=webbuilder /app/server/web/dist ./web/dist
 RUN go build -ldflags "-s -w -X 'quantvista/common.Version=$(cat ./VERSION)'" -o /quantvista .
 
 # ---- 阶段 3：运行镜像 ----
-FROM alpine:3.20
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates tzdata wget && update-ca-certificates
 ENV TZ=Asia/Shanghai
 COPY --from=gobuilder /quantvista /quantvista

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -67,56 +68,101 @@ type JobEventView struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-func (s *TaskCenterService) GetJob(userID, id int64) (*JobRunView, error) {
-	return GetJobRun(userID, id, true)
+func (s *TaskCenterService) GetJob(userID, id int64, contexts ...context.Context) (*JobRunView, error) {
+	return GetJobRun(userID, id, true, contexts...)
 }
 
-func (s *TaskCenterService) CancelJob(userID, id int64) (*JobRunView, error) {
-	return CancelJobRun(userID, id)
+func (s *TaskCenterService) CancelJob(userID, id int64, contexts ...context.Context) (*JobRunView, error) {
+	return CancelJobRun(userID, id, contexts...)
 }
 
-func (s *TaskCenterService) RetryJob(userID, id int64) (*JobRunView, error) {
-	return RetryJobRun(userID, id)
+func (s *TaskCenterService) RetryJob(userID, id int64, contexts ...context.Context) (*JobRunView, error) {
+	return RetryJobRun(userID, id, contexts...)
 }
 
-func (s *TaskCenterService) Events(userID, afterID, limit int64) ([]JobEventView, error) {
-	return ListJobEvents(userID, afterID, limit)
+func (s *TaskCenterService) Events(userID, afterID, limit int64, contexts ...context.Context) ([]JobEventView, error) {
+	return ListJobEvents(userID, afterID, limit, contexts...)
 }
 
 func (s *TaskCenterService) Metrics(actorID int64) (*JobRuntimeMetrics, error) {
 	return GetJobRuntimeMetrics(actorID)
 }
 
-func StartDurableLLMTask(userID int64, kind string, request any, allowPrivate bool) (*LLMTaskView, error) {
+func StartDurableLLMTask(userID int64, kind string, request any, allowPrivate bool, contexts ...context.Context) (*LLMTaskView, error) {
 	if !isLegacyDurableJobKind(kind) {
 		return nil, fmt.Errorf("%w: %s", ErrJobKindUnsupported, kind)
 	}
-	return defaultJobRuntime.start(userID, kind, request, allowPrivate, nil, nil)
+	return defaultJobRuntime.start(userID, kind, request, allowPrivate, nil, nil, contexts...)
 }
 
-// startDurableBusinessJob 是三类用户任务的统一提交入口。它返回 JobRun 与结果引用，
-// 业务服务再用原有详情查询组装响应，因而旧业务 ID/路由保持不变。
+// startDurableBusinessJob 保留内部调用兼容入口。
 func startDurableBusinessJob(userID int64, kind string, request any, allowPrivate bool) (*model.JobRun, error) {
+	return startDurableBusinessJobContext(context.Background(), userID, kind, request, allowPrivate, nil)
+}
+
+// 新作业的业务回执在创建事务内读取；复用已有作业时只读其已有引用。
+func startDurableBusinessJobContext(ctx context.Context, userID int64, kind string, request any, allowPrivate bool, receipt func(*gorm.DB, *model.JobRun) error) (*model.JobRun, error) {
+	ctx = jobSubmissionContext(ctx)
 	if !isBusinessDurableJobKind(kind) {
 		return nil, fmt.Errorf("%w: %s", ErrJobKindUnsupported, kind)
 	}
-	return defaultJobRuntime.startWithBinding(userID, kind, request, allowPrivate, nil, nil, nil)
+	var bindingOverride *durableJobBinding
+	var receiptRunID int64
+	if receipt != nil {
+		handler, ok := defaultJobRuntime.handler(kind)
+		if !ok {
+			return nil, ErrJobKindUnsupported
+		}
+		binding := handler.binding
+		binding.readSubmission = func(tx *gorm.DB, run *model.JobRun) error {
+			if err := receipt(tx, run); err != nil {
+				return err
+			}
+			receiptRunID = run.ID
+			return nil
+		}
+		bindingOverride = &binding
+	}
+	run, err := defaultJobRuntime.startWithBinding(userID, kind, request, allowPrivate, nil, nil, bindingOverride, ctx)
+	if err != nil {
+		return nil, err
+	}
+	if receipt != nil && receiptRunID != run.ID {
+		if err := readSnapshotTx(ctx, func(tx *gorm.DB) error { return receipt(tx, run) }); err != nil {
+			return nil, err
+		}
+	}
+	return run, nil
 }
 
-func GetJobRun(userID, id int64, withSteps bool) (*JobRunView, error) {
+func GetJobRun(userID, id int64, withSteps bool, contexts ...context.Context) (*JobRunView, error) {
+	ctx := jobSubmissionContext(contexts...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if common.DB == nil {
 		return nil, errors.New("数据库尚未初始化")
 	}
 	if userID <= 0 || id <= 0 {
 		return nil, ErrJobNotFound
 	}
-	run, err := loadAuthorizedJobRun(common.DB, userID, id)
+	var view *JobRunView
+	err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		var readErr error
+		view, readErr = getJobRunDB(tx, userID, id, withSteps)
+		return readErr
+	})
+	return view, err
+}
+
+func getJobRunDB(db *gorm.DB, userID, id int64, withSteps bool) (*JobRunView, error) {
+	run, err := loadAuthorizedJobRun(db, userID, id)
 	if err != nil {
 		return nil, err
 	}
 	view := jobRunView(*run)
 	if withSteps {
-		steps, err := listJobSteps([]int64{run.ID})
+		steps, err := listJobStepsDB(db, []int64{run.ID})
 		if err != nil {
 			return nil, err
 		}
@@ -125,7 +171,11 @@ func GetJobRun(userID, id int64, withSteps bool) (*JobRunView, error) {
 	return view, nil
 }
 
-func CancelJobRun(userID, id int64) (*JobRunView, error) {
+func CancelJobRun(userID, id int64, contexts ...context.Context) (*JobRunView, error) {
+	ctx := jobSubmissionContext(contexts...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if common.DB == nil {
 		return nil, errors.New("数据库尚未初始化")
 	}
@@ -134,56 +184,64 @@ func CancelJobRun(userID, id int64) (*JobRunView, error) {
 	}
 	now := time.Now()
 	runningCanceled := false
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
-		runPtr, err := loadAuthorizedJobRun(tx, userID, id)
-		if err != nil {
-			return err
-		}
-		run := *runPtr
-		switch run.Status {
-		case model.JobStatusQueued:
-			res := tx.Model(&model.JobRun{}).
-				Where("id = ? AND status = ?", id, model.JobStatusQueued).
-				Updates(map[string]any{
-					"status": model.JobStatusCanceled, "cancel_requested": true, "active_key": nil,
-					"error": "作业已取消", "error_code": JobErrorCanceled,
-					"finished_at": now, "updated_at": now,
-				})
-			if res.Error != nil {
-				return res.Error
-			}
-			if res.RowsAffected != 1 {
-				return ErrJobNotCancelable
-			}
-			if run.ResultID != nil {
-				binding := defaultJobRuntime.bindingForRun(run)
-				if binding.finishFailure == nil {
-					return errors.New("作业结果绑定不可用")
-				}
-				if err := binding.finishFailure(tx, &run, model.JobStatusCanceled, JobErrorCanceled, "作业已取消", now); err != nil {
-					return err
-				}
-			}
-			if err := finishRunningJobSteps(tx, id, model.JobStatusCanceled, JobErrorCanceled, "作业已取消", now); err != nil {
+	var view *JobRunView
+	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := func() error {
+			runPtr, err := loadAuthorizedJobRun(tx, userID, id)
+			if err != nil {
 				return err
 			}
-			return appendJobEventForRun(tx, &run, "status", model.JobStatusCanceled)
-		case model.JobStatusRunning:
-			res := tx.Model(&model.JobRun{}).
-				Where("id = ? AND status = ? AND cancel_requested = ?",
-					id, model.JobStatusRunning, false).
-				Updates(map[string]any{"cancel_requested": true, "updated_at": now})
-			if res.Error != nil {
-				return res.Error
-			}
-			if res.RowsAffected != 1 {
+			run := *runPtr
+			switch run.Status {
+			case model.JobStatusQueued:
+				res := tx.Model(&model.JobRun{}).
+					Where("id = ? AND status = ?", id, model.JobStatusQueued).
+					Updates(map[string]any{
+						"status": model.JobStatusCanceled, "cancel_requested": true, "active_key": nil,
+						"error": "作业已取消", "error_code": JobErrorCanceled,
+						"finished_at": now, "updated_at": now,
+					})
+				if res.Error != nil {
+					return res.Error
+				}
+				if res.RowsAffected != 1 {
+					return ErrJobNotCancelable
+				}
+				if run.ResultID != nil {
+					binding := defaultJobRuntime.bindingForRun(run)
+					if binding.finishFailure == nil {
+						return errors.New("作业结果绑定不可用")
+					}
+					if err := binding.finishFailure(tx, &run, model.JobStatusCanceled, JobErrorCanceled, "作业已取消", now); err != nil {
+						return err
+					}
+				}
+				if err := finishRunningJobSteps(tx, id, model.JobStatusCanceled, JobErrorCanceled, "作业已取消", now); err != nil {
+					return err
+				}
+				return appendJobEventForRun(tx, &run, "status", model.JobStatusCanceled)
+			case model.JobStatusRunning:
+				res := tx.Model(&model.JobRun{}).
+					Where("id = ? AND status = ? AND cancel_requested = ?",
+						id, model.JobStatusRunning, false).
+					Updates(map[string]any{"cancel_requested": true, "updated_at": now})
+				if res.Error != nil {
+					return res.Error
+				}
+				if res.RowsAffected != 1 {
+					return ErrJobNotCancelable
+				}
+				runningCanceled = true
+				return appendJobEventForRun(tx, &run, "cancel_requested", model.JobStatusRunning)
+			default:
 				return ErrJobNotCancelable
 			}
-			runningCanceled = true
-			return appendJobEventForRun(tx, &run, "cancel_requested", model.JobStatusRunning)
-		default:
-			return ErrJobNotCancelable
+		}(); err != nil {
+			return err
 		}
+		var err error
+		view, err = getJobRunDB(tx, userID, id, true)
+		return err
 	})
 	if err != nil {
 		return nil, err
@@ -191,14 +249,18 @@ func CancelJobRun(userID, id int64) (*JobRunView, error) {
 	if runningCanceled {
 		defaultJobRuntime.signalCancel(id)
 	}
-	return GetJobRun(userID, id, true)
+	return view, nil
 }
 
-func RetryJobRun(userID, id int64) (*JobRunView, error) {
+func RetryJobRun(userID, id int64, contexts ...context.Context) (*JobRunView, error) {
+	ctx := jobSubmissionContext(contexts...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if common.DB == nil {
 		return nil, errors.New("数据库尚未初始化")
 	}
-	parentPtr, err := loadAuthorizedJobRun(common.DB, userID, id)
+	parentPtr, err := loadAuthorizedJobRun(common.DB.WithContext(ctx), userID, id)
 	if err != nil {
 		return nil, err
 	}
@@ -216,21 +278,21 @@ func RetryJobRun(userID, id int64) (*JobRunView, error) {
 	var child *model.JobRun
 	if parent.OwnerType == model.JobOwnerSystem {
 		triggeredBy := userID
-		child, err = defaultJobRuntime.startSystemWithBinding(&triggeredBy, parent.Kind, json.RawMessage(snapshot.Request), &parent.ID)
+		child, err = defaultJobRuntime.startSystemWithBinding(&triggeredBy, parent.Kind, json.RawMessage(snapshot.Request), &parent.ID, ctx)
 	} else if isBusinessDurableJobKind(parent.Kind) {
-		child, err = defaultJobRuntime.startWithBinding(userID, parent.Kind, json.RawMessage(snapshot.Request), false, &parent.ID, nil, nil)
+		child, err = defaultJobRuntime.startWithBinding(userID, parent.Kind, json.RawMessage(snapshot.Request), false, &parent.ID, nil, nil, ctx)
 	} else {
 		var task *LLMTaskView
-		task, err = defaultJobRuntime.start(userID, parent.Kind, json.RawMessage(snapshot.Request), false, &parent.ID, nil)
+		task, err = defaultJobRuntime.start(userID, parent.Kind, json.RawMessage(snapshot.Request), false, &parent.ID, nil, ctx)
 		if err == nil {
 			var compatibility model.LLMTask
-			if lookupErr := common.DB.Select("job_run_id").Where("id = ? AND user_id = ?", task.ID, userID).First(&compatibility).Error; lookupErr != nil {
+			if lookupErr := common.DB.WithContext(ctx).Select("job_run_id").Where("id = ? AND user_id = ?", task.ID, userID).First(&compatibility).Error; lookupErr != nil {
 				return nil, lookupErr
 			}
 			if compatibility.JobRunID == nil {
 				return nil, errors.New("重跑作业缺少事实关联")
 			}
-			return GetJobRun(userID, *compatibility.JobRunID, true)
+			return GetJobRun(userID, *compatibility.JobRunID, true, ctx)
 		}
 	}
 	if err != nil {
@@ -239,10 +301,14 @@ func RetryJobRun(userID, id int64) (*JobRunView, error) {
 	if child == nil || child.ID == 0 {
 		return nil, errors.New("重跑作业缺少事实关联")
 	}
-	return GetJobRun(userID, child.ID, true)
+	return GetJobRun(userID, child.ID, true, ctx)
 }
 
-func ListJobEvents(userID, afterID, limit int64) ([]JobEventView, error) {
+func ListJobEvents(userID, afterID, limit int64, contexts ...context.Context) ([]JobEventView, error) {
+	ctx := jobSubmissionContext(contexts...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if common.DB == nil {
 		return nil, errors.New("数据库尚未初始化")
 	}
@@ -256,7 +322,7 @@ func ListJobEvents(userID, afterID, limit int64) ([]JobEventView, error) {
 		limit = 100
 	}
 	var events []model.JobEvent
-	if err := common.DB.Select("id", "job_run_id", "type", "status", "created_at").
+	if err := common.DB.WithContext(ctx).Select("id", "job_run_id", "type", "status", "created_at").
 		Where("user_id = ? AND id > ?", userID, afterID).
 		Order("id ASC").Limit(int(limit)).Find(&events).Error; err != nil {
 		return nil, err
@@ -272,12 +338,16 @@ func ListJobEvents(userID, afterID, limit int64) ([]JobEventView, error) {
 }
 
 func listJobSteps(jobIDs []int64) (map[int64][]JobStepView, error) {
+	return listJobStepsDB(common.DB, jobIDs)
+}
+
+func listJobStepsDB(db *gorm.DB, jobIDs []int64) (map[int64][]JobStepView, error) {
 	grouped := make(map[int64][]JobStepView, len(jobIDs))
 	if len(jobIDs) == 0 {
 		return grouped, nil
 	}
 	var steps []model.JobStep
-	if err := common.DB.Select("id", "job_run_id", "sequence", "name", "status", "error", "error_code", "started_at", "finished_at").
+	if err := db.Select("id", "job_run_id", "sequence", "name", "status", "error", "error_code", "started_at", "finished_at").
 		Where("job_run_id IN ?", jobIDs).Order("job_run_id ASC, sequence ASC").Find(&steps).Error; err != nil {
 		return nil, err
 	}
@@ -336,8 +406,17 @@ func loadAuthorizedJobRun(db *gorm.DB, actorID, id int64) (*model.JobRun, error)
 	if run.OwnerType == model.JobOwnerUser && run.OwnerUserID != nil && *run.OwnerUserID == actorID {
 		return &run, nil
 	}
-	if run.OwnerType == model.JobOwnerSystem && isAdminUser(actorID) {
-		return &run, nil
+	if run.OwnerType == model.JobOwnerSystem {
+		var actor model.User
+		if err := db.Select("role", "status").First(&actor, actorID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, ErrJobNotFound
+			}
+			return nil, err
+		}
+		if actor.Role == model.RoleAdmin && actor.Status == model.StatusEnabled {
+			return &run, nil
+		}
 	}
 	return nil, ErrJobNotFound
 }

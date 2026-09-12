@@ -564,16 +564,16 @@ func TestResolveRecommendationLink(t *testing.T) {
 	rec := &model.Recommendation{BatchID: 1, UserID: 1, Symbol: "600000", Market: "cn"}
 	common.DB.Create(rec)
 
-	if got := resolveRecommendationLink(1, rec.ID); got != rec.ID {
+	if got, err := resolveRecommendationLink(common.DB, 1, rec.ID, rec.Symbol, rec.Market); err != nil || got != rec.ID {
 		t.Fatalf("本人推荐应保留血缘，得到 %d", got)
 	}
-	if got := resolveRecommendationLink(2, rec.ID); got != 0 {
+	if got, err := resolveRecommendationLink(common.DB, 2, rec.ID, rec.Symbol, rec.Market); err != nil || got != 0 {
 		t.Fatalf("他人推荐应清零，得到 %d", got)
 	}
-	if got := resolveRecommendationLink(1, 99999); got != 0 {
+	if got, err := resolveRecommendationLink(common.DB, 1, 99999, rec.Symbol, rec.Market); err != nil || got != 0 {
 		t.Fatalf("不存在的推荐应清零，得到 %d", got)
 	}
-	if got := resolveRecommendationLink(1, 0); got != 0 {
+	if got, err := resolveRecommendationLink(common.DB, 1, 0, rec.Symbol, rec.Market); err != nil || got != 0 {
 		t.Fatalf("0 应原样返回 0，得到 %d", got)
 	}
 }
@@ -583,7 +583,10 @@ func TestLoadCandidateFilter(t *testing.T) {
 	setupTestDB(t)
 
 	// 无偏好行：回退默认（1e8 门槛、无黑名单）。
-	f := loadCandidateFilter(42)
+	f, err := loadCandidateFilter(42)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if f.minAmount != minCandidateAmount || len(f.blacklist) != 0 {
 		t.Fatalf("缺偏好应回退默认: %+v", f)
 	}
@@ -592,7 +595,10 @@ func TestLoadCandidateFilter(t *testing.T) {
 		UserID: 1, RiskLevel: "balanced", DefaultMarket: "cn", HorizonPref: "long_term", DefaultRecCount: 3,
 		BlacklistJSON: `[{"symbol":"600000","market":"cn","reason":"历史亏损严重"}]`, MinCandidateAmount: 5e8,
 	})
-	f = loadCandidateFilter(1)
+	f, err = loadCandidateFilter(1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if f.minAmount != 5e8 {
 		t.Fatalf("门槛应为用户配置 5e8，得到 %v", f.minAmount)
 	}

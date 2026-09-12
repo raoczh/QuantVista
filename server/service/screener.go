@@ -343,8 +343,8 @@ type ScanHit struct {
 	Price        float64  `json:"price"` // 宽表收盘价（数据日期见 ScanResult.TradeDate）
 	ChgPct       float64  `json:"chg_pct"`
 	AmountYi     float64  `json:"amount_yi"`
-	TurnoverRate float64  `json:"turnover_rate,omitempty"`
-	Pos60        float64  `json:"pos_60,omitempty"`
+	TurnoverRate *float64 `json:"turnover_rate,omitempty"`
+	Pos60        *float64 `json:"pos_60,omitempty"`
 	Reasons      []string `json:"reasons"`
 }
 
@@ -381,7 +381,7 @@ func (s *ScreenerService) Scan(ctx context.Context, userID int64, req ScanReques
 	if err := JobStepTransition(ctx, "load_strategy"); err != nil {
 		return nil, err
 	}
-	resolved, err := s.resolveStrategy(userID, req)
+	resolved, err := s.resolveStrategy(userID, req, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -475,6 +475,12 @@ func (s *ScreenerService) Scan(ctx context.Context, userID int64, req ScanReques
 		}
 		return v
 	}
+	optional := func(v float64) *float64 {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil
+		}
+		return &v
+	}
 	res.Items = make([]ScanHit, 0, len(matchedIdx))
 	for _, i := range matchedIdx {
 		hit := ScanHit{
@@ -483,8 +489,8 @@ func (s *ScreenerService) Scan(ctx context.Context, userID int64, req ScanReques
 			Price:        nz(closeCol[i]),
 			ChgPct:       nz(chgCol[i]),
 			AmountYi:     nz(amountCol[i]),
-			TurnoverRate: nz(turnCol[i]),
-			Pos60:        nz(posCol[i]),
+			TurnoverRate: optional(turnCol[i]),
+			Pos60:        optional(posCol[i]),
 		}
 		explainRow(t, tree, i, &hit.Reasons)
 		res.Items = append(res.Items, hit)
@@ -507,7 +513,11 @@ type resolvedScreenerStrategy struct {
 
 // resolveStrategy 在请求开始时把自定义策略解析成不可变 revision 快照。后续扫描或
 // 回测只持有内存中的树与元数据，运行期间主表指针变化不会造成条件漂移。
-func (s *ScreenerService) resolveStrategy(userID int64, req ScanRequest) (*resolvedScreenerStrategy, error) {
+func (s *ScreenerService) resolveStrategy(userID int64, req ScanRequest, contexts ...context.Context) (*resolvedScreenerStrategy, error) {
+	ctx := jobSubmissionContext(contexts...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	sources := 0
 	if req.TemplateKey != "" {
 		sources++
@@ -556,8 +566,11 @@ func (s *ScreenerService) resolveStrategy(userID int64, req ScanRequest) (*resol
 			return nil, errors.New("数据库不可用")
 		}
 		var strategy model.ScreenerStrategy
-		if err := common.DB.Where("id = ? AND user_id = ?", req.StrategyID, userID).First(&strategy).Error; err != nil {
-			return nil, errors.New("自定义策略不存在")
+		if err := common.DB.WithContext(ctx).Where("id = ? AND user_id = ?", req.StrategyID, userID).First(&strategy).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, errors.New("自定义策略不存在")
+			}
+			return nil, err
 		}
 		revisionID := req.StrategyRevisionID
 		if revisionID == 0 {
@@ -567,10 +580,13 @@ func (s *ScreenerService) resolveStrategy(userID int64, req ScanRequest) (*resol
 			return nil, errors.New("自定义策略尚无可执行版本")
 		}
 		var revision model.ScreenerStrategyRevision
-		if err := common.DB.Where(
+		if err := common.DB.WithContext(ctx).Where(
 			"id = ? AND user_id = ? AND strategy_id = ?", revisionID, userID, strategy.ID,
 		).First(&revision).Error; err != nil {
-			return nil, errors.New("策略版本不存在或不属于指定策略")
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, errors.New("策略版本不存在或不属于指定策略")
+			}
+			return nil, err
 		}
 		var tree CondNode
 		if err := json.Unmarshal([]byte(revision.TreeJSON), &tree); err != nil {
@@ -624,8 +640,8 @@ func canonicalCondTree(input *CondNode) (*CondNode, []byte, error) {
 }
 
 // resolveTree 保留给包内既有调用；新执行路径如需版本元数据应使用 resolveStrategy。
-func (s *ScreenerService) resolveTree(userID int64, req ScanRequest) (*CondNode, string, error) {
-	resolved, err := s.resolveStrategy(userID, req)
+func (s *ScreenerService) resolveTree(userID int64, req ScanRequest, contexts ...context.Context) (*CondNode, string, error) {
+	resolved, err := s.resolveStrategy(userID, req, contexts...)
 	if err != nil {
 		return nil, "", err
 	}
@@ -689,6 +705,13 @@ type StrategyHistoryView struct {
 
 // Strategies 列出策略广场内容。
 func (s *ScreenerService) Strategies(userID int64) (*StrategiesView, error) {
+	return s.StrategiesContext(context.Background(), userID)
+}
+
+func (s *ScreenerService) StrategiesContext(ctx context.Context, userID int64) (*StrategiesView, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	v := &StrategiesView{Factors: factorDefs}
 	for _, template := range retailTemplates {
 		defaults := make(map[string]float64, len(template.Params))
@@ -712,7 +735,7 @@ func (s *ScreenerService) Strategies(userID int64) (*StrategiesView, error) {
 		return v, nil
 	}
 	var rows []model.ScreenerStrategy
-	if err := common.DB.Where("user_id = ? AND archived_at IS NULL", userID).Order("id DESC").Find(&rows).Error; err != nil {
+	if err := common.DB.WithContext(ctx).Where("user_id = ? AND archived_at IS NULL", userID).Order("id DESC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	revisionIDs := make([]int64, 0, len(rows))
@@ -723,7 +746,7 @@ func (s *ScreenerService) Strategies(userID int64) (*StrategiesView, error) {
 	}
 	var revisions []model.ScreenerStrategyRevision
 	if len(revisionIDs) > 0 {
-		if err := common.DB.Where("user_id = ? AND id IN ?", userID, revisionIDs).Find(&revisions).Error; err != nil {
+		if err := common.DB.WithContext(ctx).Where("user_id = ? AND id IN ?", userID, revisionIDs).Find(&revisions).Error; err != nil {
 			return nil, err
 		}
 	}
@@ -744,16 +767,25 @@ func (s *ScreenerService) Strategies(userID int64) (*StrategiesView, error) {
 // StrategyHistory 返回当前用户指定策略最近 50 个不可变快照（新到旧）。归档策略仍可
 // 查询历史，便于既有研究与回测复现。
 func (s *ScreenerService) StrategyHistory(userID, strategyID int64) (*StrategyHistoryView, error) {
+	return s.StrategyHistoryContext(context.Background(), userID, strategyID)
+}
+
+func (s *ScreenerService) StrategyHistoryContext(ctx context.Context, userID, strategyID int64) (*StrategyHistoryView, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
 	var strategy model.ScreenerStrategy
-	if err := common.DB.Where("id = ? AND user_id = ?", strategyID, userID).First(&strategy).Error; err != nil {
-		return nil, errors.New("自定义策略不存在")
-	}
 	var rows []model.ScreenerStrategyRevision
-	if err := common.DB.Where("strategy_id = ? AND user_id = ?", strategyID, userID).
-		Order("revision DESC").Limit(50).Find(&rows).Error; err != nil {
+	if err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		if err := tx.Where("id = ? AND user_id = ?", strategyID, userID).First(&strategy).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("自定义策略不存在")
+			}
+			return err
+		}
+		return tx.Where("strategy_id = ? AND user_id = ?", strategyID, userID).
+			Order("revision DESC").Limit(50).Find(&rows).Error
+	}); err != nil {
 		return nil, err
 	}
 	view := &StrategyHistoryView{
@@ -788,6 +820,13 @@ var ErrStrategyRevisionConflict error = strategyRevisionConflictError{}
 
 // SaveStrategy 保存自定义策略（user_id 隔离；树先校验）。
 func (s *ScreenerService) SaveStrategy(userID int64, req SaveStrategyRequest) (*CustomStrategyView, error) {
+	return s.SaveStrategyContext(context.Background(), userID, req)
+}
+
+func (s *ScreenerService) SaveStrategyContext(ctx context.Context, userID int64, req SaveStrategyRequest) (*CustomStrategyView, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
@@ -826,7 +865,7 @@ func (s *ScreenerService) SaveStrategy(userID int64, req SaveStrategyRequest) (*
 
 	var out *CustomStrategyView
 	runTransaction := func() error {
-		return common.DB.Transaction(func(tx *gorm.DB) error {
+		return common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			if req.ID == 0 {
 				// MySQL 用当前用户已有策略行的 next-key lock 串行化“计数+创建”，
 				// 防止两个页面同时在 49 条时都越过上限。SQLite 由下方事务重试收敛。
@@ -933,7 +972,13 @@ func (s *ScreenerService) SaveStrategy(userID int64, req SaveStrategyRequest) (*
 			break
 		}
 		if attempt+1 < attempts {
-			time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
+			timer := time.NewTimer(time.Duration(attempt+1) * 10 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
 		}
 	}
 	if err != nil {
@@ -998,15 +1043,22 @@ func condTreeFromJSON(treeJSON string) *CondNode {
 	if err := json.Unmarshal([]byte(treeJSON), &tree); err != nil {
 		return nil
 	}
+	if _, err := validateCondTree(&tree, 1); err != nil {
+		return nil
+	}
 	return &tree
 }
 
 // DeleteStrategy 归档自定义策略（user_id 隔离）；历史 revision 永久保留。
 func (s *ScreenerService) DeleteStrategy(userID, id int64) error {
+	return s.DeleteStrategyContext(context.Background(), userID, id)
+}
+
+func (s *ScreenerService) DeleteStrategyContext(ctx context.Context, userID, id int64) error {
 	if common.DB == nil {
 		return errors.New("数据库不可用")
 	}
-	res := common.DB.Model(&model.ScreenerStrategy{}).
+	res := common.DB.WithContext(ctx).Model(&model.ScreenerStrategy{}).
 		Where("id = ? AND user_id = ? AND archived_at IS NULL", id, userID).
 		Update("archived_at", time.Now())
 	if res.Error != nil {

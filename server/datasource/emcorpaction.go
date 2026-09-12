@@ -173,6 +173,9 @@ func dcPages(ctx context.Context, e *EastMoneyAdapter, q DataCenterQuery, label 
 			}
 			rows++
 		}
+		if it.done {
+			return rows, nil
+		}
 	}
 	// 走满护栏页数仍未结束：如实报错而非静默截断（窗口内数据量异常时须被发现）。
 	return rows, fmt.Errorf("%w: %s 结果超过 %d 页护栏，窗口需收窄", ErrUpstream, label, corpActionMaxPages)

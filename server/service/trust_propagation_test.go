@@ -116,8 +116,8 @@ func TestAnalysisReviewRejectCascade(t *testing.T) {
 // TestCompareValueSetContainsRows 对比点评核验值域包含各行指标字段。
 func TestCompareValueSetContainsRows(t *testing.T) {
 	rows := []CompareRow{
-		{Symbol: "600000", QuoteOK: true, Price: 12.34, Score: 78, ChangePct5d: 3.21},
-		{Symbol: "000001", QuoteOK: true, Price: 45.67, Score: 52},
+		{Symbol: "600000", QuoteOK: true, Price: 12.34, Score: fptr(78), ChangePct5d: fptr(3.21)},
+		{Symbol: "000001", QuoteOK: true, Price: 45.67, Score: fptr(52)},
 	}
 	vals := snapshotLabeledValues(rows, nil)
 	for _, want := range []float64{12.34, 78, 3.21, 45.67, 52} {

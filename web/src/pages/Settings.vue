@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   NTabs,
@@ -21,6 +21,7 @@ import {
   NSwitch,
   NPopconfirm,
   NEmpty,
+  NSpin,
   NRadioGroup,
   NRadioButton,
   useMessage,
@@ -45,11 +46,13 @@ import {
   changePassword,
   getQuota,
   type UserPreference,
+  type UserPreferenceUpdate,
   type UserQuota,
   type BlacklistEntry,
 } from '@/api/user'
 import { downloadExport, type ExportKind } from '@/api/export'
 import { useAuthStore } from '@/stores/auth'
+import { getSessionEpoch } from '@/api/token'
 import { isNativeApp } from '@/config/runtime'
 import { useIsMobile } from '@/composables/useIsMobile'
 import PageContainer from '@/components/PageContainer.vue'
@@ -65,31 +68,42 @@ const message = useMessage()
 const router = useRouter()
 const route = useRoute()
 const auth = useAuthStore()
+const ownerID = auth.user?.id || 0
+const session = getSessionEpoch()
+let disposed = false
+const ownsSession = () => ownerID > 0 && auth.user?.id === ownerID && getSessionEpoch() === session
+const active = () => !disposed && ownsSession() && route.name === 'settings'
+onBeforeUnmount(() => { disposed = true })
 // 手机上左标签表单太挤，切换为上下堆叠。
 const { isMobile } = useIsMobile()
 const { displayMode, setMode } = useDisplayMode()
 
 // 深链 ?tab=account 直达指定页签（GitHub 绑定回调后跳回账号安全）。
-const initialTab = ['llm', 'pref', 'notifications', 'account'].includes(String(route.query.tab)) ? String(route.query.tab) : 'llm'
+const activeTab = computed({
+  get: () => ['llm', 'pref', 'notifications', 'account'].includes(String(route.query.tab)) ? String(route.query.tab) : 'llm',
+  set: (tab: string) => { void router.replace({ query: { ...route.query, tab: tab === 'llm' ? undefined : tab } }) },
+})
 
 /* ---------------- GitHub 绑定 ---------------- */
 const ghBusy = ref(false)
 async function doBindGithub() {
+  if (ghBusy.value || !active()) return
   ghBusy.value = true
   try {
-    await auth.startGithubBind() // 成功即整页跳转 GitHub，无需复位 loading
+    await auth.startGithubBind(active) // 成功即整页跳转 GitHub。
   } catch (e) {
-    message.error((e as Error).message)
+    if (active()) message.error((e as Error).message)
     ghBusy.value = false
   }
 }
 async function doUnbindGithub() {
+  if (ghBusy.value || !active()) return
   ghBusy.value = true
   try {
     await auth.removeGithubBind()
-    message.success('已解绑 GitHub')
+    if (active()) message.success('已解绑 GitHub')
   } catch (e) {
-    message.error((e as Error).message)
+    if (active()) message.error((e as Error).message)
   } finally {
     ghBusy.value = false
   }
@@ -98,6 +112,11 @@ async function doUnbindGithub() {
 /* ---------------- LLM 配置 ---------------- */
 const configs = ref<LLMConfig[]>([])
 const loadingConfigs = ref(false)
+const configsError = ref('')
+let configsRead = 0
+const configWriteBusy = ref(false)
+const removingId = ref<number | null>(null)
+const testingConfigIds = ref<number[]>([])
 const showDrawer = ref(false)
 const editingId = ref<number | null>(null)
 const testing = ref(false)
@@ -128,6 +147,21 @@ const blankForm = (): LLMConfigInput => ({
   is_default: false,
 })
 const form = reactive<LLMConfigInput>(blankForm())
+let drawerEpoch = 0
+watch(showDrawer, show => {
+  if (show) return
+  drawerEpoch++
+  testing.value = false
+  fetchingModels.value = false
+  draftTestResult.value = null
+}, { flush: 'sync' })
+const draftFingerprint = () => JSON.stringify({ ...form, config_id: editingId.value ?? 0 })
+const modelSourceFingerprint = () => JSON.stringify([editingId.value, form.base_url, form.api_key])
+watch(draftFingerprint, () => { draftTestResult.value = null }, { flush: 'sync' })
+watch(modelSourceFingerprint, () => {
+  modelOptions.value = []
+  modelsTruncated.value = false
+}, { flush: 'sync' })
 
 const endpointOptions = [
   { label: 'Chat Completions（/v1/chat/completions，默认）', value: 'chat_completions' },
@@ -170,19 +204,34 @@ function normalizeForm() {
 }
 
 async function loadConfigs() {
+  if (!active()) return
+  const read = ++configsRead
   loadingConfigs.value = true
+  configsError.value = ''
   try {
-    configs.value = await listLLMConfigs()
+    const value = await listLLMConfigs()
+    if (active() && read === configsRead) configs.value = value
   } catch (e) {
-    message.error((e as Error).message)
+    if (active() && read === configsRead) configsError.value = (e as Error).message
   } finally {
-    loadingConfigs.value = false
+    if (active() && read === configsRead) loadingConfigs.value = false
   }
+}
+
+function beginConfigWrite() {
+  configWriteBusy.value = true
+  configsRead++ // 作废写入前发出的列表，避免旧列表盖回新配置。
+  loadingConfigs.value = false
+  configsError.value = ''
 }
 
 // resetDrawerState 每次开抽屉都清掉上一条配置遗留的模型列表与测试结果，
 // 避免把 A 配置的上游模型列表当成 B 配置的可选项。
 function resetDrawerState() {
+  drawerEpoch++
+  testing.value = false
+  fetchingModels.value = false
+  saving.value = false
   modelOptions.value = []
   modelsTruncated.value = false
   draftTestResult.value = null
@@ -190,6 +239,7 @@ function resetDrawerState() {
 }
 
 function openCreate() {
+  if (configWriteBusy.value || !active()) return
   editingId.value = null
   Object.assign(form, blankForm())
   resetDrawerState()
@@ -197,6 +247,7 @@ function openCreate() {
 }
 
 function openEdit(cfg: LLMConfig) {
+  if (configWriteBusy.value || !active()) return
   editingId.value = cfg.id
   Object.assign(form, {
     name: cfg.name,
@@ -215,102 +266,138 @@ function openEdit(cfg: LLMConfig) {
 }
 
 async function save() {
+  if (configWriteBusy.value || !showDrawer.value || !active()) return
   normalizeForm()
+  const epoch = drawerEpoch
+  const fingerprint = draftFingerprint()
+  const id = editingId.value
+  beginConfigWrite()
   saving.value = true
   try {
-    if (editingId.value) {
-      await updateLLMConfig(editingId.value, { ...form })
-      message.success('已更新')
+    if (id) {
+      await updateLLMConfig(id, { ...form })
     } else {
       await createLLMConfig({ ...form })
-      message.success('已创建')
     }
-    showDrawer.value = false
+    if (!active()) return
+    if (epoch === drawerEpoch && showDrawer.value && fingerprint === draftFingerprint()) {
+      message.success(id ? '已更新' : '已创建')
+      showDrawer.value = false
+    }
     await loadConfigs()
   } catch (e) {
-    message.error((e as Error).message)
+    if (active() && epoch === drawerEpoch && showDrawer.value) message.error((e as Error).message)
   } finally {
     saving.value = false
+    configWriteBusy.value = false
   }
 }
 
 async function remove(cfg: LLMConfig) {
+  if (configWriteBusy.value || !active()) return
+  beginConfigWrite()
+  removingId.value = cfg.id
   try {
     await deleteLLMConfig(cfg.id)
+    if (!active()) return
     message.success('已删除')
     await loadConfigs()
   } catch (e) {
-    message.error((e as Error).message)
+    if (active()) message.error((e as Error).message)
+  } finally {
+    removingId.value = null
+    configWriteBusy.value = false
   }
 }
 
 async function makeDefault(cfg: LLMConfig) {
+  if (configWriteBusy.value || !active()) return
+  beginConfigWrite()
   settingDefaultId.value = cfg.id
   try {
     await setDefaultLLMConfig(cfg.id)
+    if (!active()) return
     message.success(`已将「${cfg.name}」设为默认`)
     await loadConfigs()
   } catch (e) {
-    message.error((e as Error).message)
+    if (active()) message.error((e as Error).message)
   } finally {
     settingDefaultId.value = null
+    configWriteBusy.value = false
   }
 }
 
 async function testSaved(cfg: LLMConfig) {
+  if (configWriteBusy.value || testingConfigIds.value.includes(cfg.id) || !active()) return
+  const read = configsRead
+  testingConfigIds.value.push(cfg.id)
   try {
     const r = await testLLMConfig(cfg.id)
-    r.ok ? message.success(`连接成功（${r.latency_ms}ms）${r.message.replace(/^连接成功/, '')}`) : message.error(`失败：${r.message}`)
+    if (!active() || read !== configsRead) return
+    r.ok ? message.success(`「${cfg.name}」连接成功（${r.latency_ms}ms）${r.message.replace(/^连接成功/, '')}`) : message.error(`「${cfg.name}」失败：${r.message}`)
   } catch (e) {
-    message.error((e as Error).message)
+    if (active() && read === configsRead) message.error(`「${cfg.name}」${(e as Error).message}`)
+  } finally {
+    testingConfigIds.value = testingConfigIds.value.filter(id => id !== cfg.id)
   }
 }
 
 // testDraft 测试抽屉里当前这份表单。编辑已有配置时密钥可留空——带上 config_id 后端复用
 // 已存密钥（与 loadModels 同一套三态），否则「只改了思考档位想测一下」得先重填 key。
 async function testDraft() {
+  if (testing.value || saving.value || !showDrawer.value || !active()) return
   normalizeForm()
   if (!form.base_url) return message.warning('请先填写 Base URL')
   if (!form.model) return message.warning('请先选择或填写模型')
   if (!form.api_key && !editingId.value) return message.warning('新建配置的测试需先填写 API Key')
   testing.value = true
   draftTestResult.value = null
+  const epoch = drawerEpoch
+  const fingerprint = draftFingerprint()
   try {
-    draftTestResult.value = await testLLMDraft({ ...form, config_id: editingId.value ?? 0 })
+    const result = await testLLMDraft({ ...form, config_id: editingId.value ?? 0 })
+    if (active() && epoch === drawerEpoch && showDrawer.value && fingerprint === draftFingerprint()) draftTestResult.value = result
   } catch (e) {
-    message.error((e as Error).message)
+    if (active() && epoch === drawerEpoch && showDrawer.value && fingerprint === draftFingerprint()) message.error((e as Error).message)
   } finally {
-    testing.value = false
+    if (epoch === drawerEpoch) testing.value = false
   }
 }
 
 // loadModels 拉取上游可用模型。编辑已有配置且密钥留空时，后端复用已存密钥
 //（config_id 三态取密钥），因此改了 Base URL 也不必重填 key。
 async function loadModels() {
+  if (fetchingModels.value || saving.value || !showDrawer.value || !active()) return
   form.base_url = (form.base_url ?? '').trim()
   if (!form.base_url) return message.warning('请先填写 Base URL')
   if (!form.api_key && !editingId.value) return message.warning('请先填写 API Key')
   fetchingModels.value = true
+  const epoch = drawerEpoch
+  const fingerprint = modelSourceFingerprint()
   try {
     const r = await fetchLLMModels({
       base_url: form.base_url,
       api_key: form.api_key,
       config_id: editingId.value ?? 0,
     })
+    if (!active() || epoch !== drawerEpoch || !showDrawer.value || fingerprint !== modelSourceFingerprint()) return
     modelOptions.value = r.models
     modelsTruncated.value = r.truncated
-    customModel.value = false
     message.success(`已拉取 ${r.models.length} 个模型${r.truncated ? '（已截断）' : ''}`)
   } catch (e) {
-    message.error(`${(e as Error).message}——也可勾选「自定义模型」手工填写`)
+    if (active() && epoch === drawerEpoch && showDrawer.value && fingerprint === modelSourceFingerprint()) message.error(`${(e as Error).message}——也可勾选「自定义模型」手工填写`)
   } finally {
-    fetchingModels.value = false
+    if (epoch === drawerEpoch) fetchingModels.value = false
   }
 }
 
 /* ---------------- 用户偏好 ---------------- */
 const pref = ref<UserPreference | null>(null)
+let preferenceBaseline: UserPreferenceUpdate = {}
 const savingPref = ref(false)
+const loadingPref = ref(false)
+const prefError = ref('')
+let prefRead = 0
 const showInvestmentGuide = ref(false)
 const riskOptions = [
   { label: '保守', value: 'conservative' },
@@ -327,19 +414,44 @@ const horizonOptions = [
 ]
 
 async function loadPref() {
+  if (!active()) return
+  const read = ++prefRead
+  loadingPref.value = true
+  prefError.value = ''
   try {
-    pref.value = await getPreference()
-    parseBlacklist(pref.value.blacklist_json)
-    parseRecFilters(pref.value.rec_filters_json)
+    const value = await getPreference()
+    if (active() && read === prefRead) mergePreference(value, preferenceBaseline)
   } catch (e) {
-    message.error((e as Error).message)
+    if (active() && read === prefRead) prefError.value = (e as Error).message
+  } finally {
+    if (active() && read === prefRead) loadingPref.value = false
   }
 }
 
-function applyGuidePreference(value: UserPreference) {
-  pref.value = value
+// 以服务端回复为新基线，逐字段保留此页面尚未提交的草稿。
+function mergePreference(value: UserPreference, baseline: UserPreferenceUpdate, savedFields: string[] = []) {
+  const pending = Object.fromEntries(Object.entries(preferenceDraft()).filter(
+    ([key, current]) => current !== baseline[key as keyof UserPreferenceUpdate] && !savedFields.includes(key),
+  ))
+  pref.value = { ...value }
   parseBlacklist(value.blacklist_json)
   parseRecFilters(value.rec_filters_json)
+  preferenceBaseline = preferenceDraft()
+  Object.assign(pref.value, pending)
+  parseBlacklist(pref.value.blacklist_json)
+  parseRecFilters(pref.value.rec_filters_json)
+}
+
+function openInvestmentGuide() {
+  if (!pref.value || savingPref.value || !active()) return
+  showInvestmentGuide.value = true
+}
+
+function applyGuidePreference(value: UserPreference, fields: UserPreferenceUpdate) {
+  if (!active()) return
+  prefRead++
+  loadingPref.value = false
+  mergePreference(value, preferenceBaseline, Object.keys(fields))
 }
 
 /* ---------------- 候选池回避规则（黑名单 + 成交额门槛） ---------------- */
@@ -356,6 +468,7 @@ function parseBlacklist(raw: string) {
   }
 }
 function addBlack() {
+  if (savingPref.value || !active()) return
   const sym = newBlackStock.value?.symbol.trim() || ''
   if (!sym) {
     message.warning('请先搜索并选择股票')
@@ -371,6 +484,7 @@ function addBlack() {
   newBlack.reason = ''
 }
 function removeBlack(i: number) {
+  if (savingPref.value || !active()) return
   blacklist.value.splice(i, 1)
 }
 // 总投资资金以万元展示，落库为元（S1：持仓 AI 的割/守/补资金上下文）。
@@ -390,7 +504,7 @@ const minAmountYi = computed({
 
 /* ---------------- 推荐筛选默认值（股价/市值/换手/追高保护/排除涨停） ---------------- */
 // 初值须与后端 defaultRecFilters 对齐（股价默认 ≤50 元），偏好里存过则被 parseRecFilters 覆盖。
-const recFilters = reactive({
+const defaultRecFilters = {
   price_min: 0,
   price_max: 50,
   float_cap_min_yi: 0,
@@ -400,8 +514,10 @@ const recFilters = reactive({
   max_gain_5d_pct: 25,
   exclude_limit_up: true,
   exclude_gem_star: false, // 排除创业板(30)/科创板(68)，仅推荐主板普通个股
-})
+}
+const recFilters = reactive({ ...defaultRecFilters })
 function parseRecFilters(raw: string) {
+  Object.assign(recFilters, defaultRecFilters)
   if (!raw) return
   try {
     const f = JSON.parse(raw)
@@ -415,29 +531,45 @@ function parseRecFilters(raw: string) {
 const quota = ref<UserQuota | null>(null)
 async function loadQuota() {
   try {
-    quota.value = await getQuota()
+    const value = await getQuota()
+    if (active()) quota.value = value
   } catch {
     /* 配额展示失败不打扰用户 */
   }
 }
 
+function preferenceDraft(): UserPreferenceUpdate {
+  if (!pref.value) return {}
+  return {
+    risk_level: pref.value.risk_level,
+    default_market: pref.value.default_market,
+    horizon_pref: pref.value.horizon_pref,
+    default_rec_count: pref.value.default_rec_count,
+    enable_daily_report: pref.value.enable_daily_report,
+    total_capital: pref.value.total_capital,
+    min_candidate_amount: pref.value.min_candidate_amount,
+    blacklist_json: blacklist.value.length ? JSON.stringify(blacklist.value) : '',
+    rec_filters_json: JSON.stringify(recFilters),
+  }
+}
+
 async function savePref() {
-  if (!pref.value) return
+  if (!pref.value || savingPref.value || showInvestmentGuide.value || !active()) return
+  const submitted = preferenceDraft()
+  const payload = Object.fromEntries(Object.entries(submitted).filter(
+    ([key, value]) => value !== preferenceBaseline[key as keyof UserPreferenceUpdate],
+  )) as UserPreferenceUpdate
   savingPref.value = true
+  prefRead++
+  loadingPref.value = false
+  prefError.value = ''
   try {
-    const latest = await getPreference()
-    pref.value.blacklist_json = blacklist.value.length ? JSON.stringify(blacklist.value) : ''
-    pref.value.rec_filters_json = JSON.stringify(recFilters)
-    pref.value = await updatePreference({
-      ...pref.value,
-      enable_notify: latest.enable_notify,
-      guard_config_json: latest.guard_config_json,
-    })
-    parseBlacklist(pref.value.blacklist_json)
-    parseRecFilters(pref.value.rec_filters_json)
+    const saved = await updatePreference(payload)
+    if (!active()) return
+    mergePreference(saved, submitted)
     message.success('偏好已保存')
   } catch (e) {
-    message.error((e as Error).message)
+    if (active()) message.error((e as Error).message)
   } finally {
     savingPref.value = false
   }
@@ -448,20 +580,23 @@ const pw = reactive({ old: '', next: '', confirm: '' })
 const savingPw = ref(false)
 
 async function submitChangePassword() {
+  if (savingPw.value || !active()) return
   if (pw.next.length < 8) return message.error('新密码至少 8 个字符')
   if (pw.next !== pw.confirm) return message.error('两次输入的新密码不一致')
   savingPw.value = true
   try {
     await changePassword(pw.old, pw.next)
+    // 密码成功修改会吊销旧会话；即使已离页，也须清理仍属于本次操作的会话。
+    if (!ownsSession()) return
     message.success('密码已修改，请用新密码重新登录')
     pw.old = ''
     pw.next = ''
     pw.confirm = ''
     // 改密后旧 access token 已失效，登出并跳转登录页。
-    await auth.logout()
-    router.replace('/login')
+    void auth.logout()
+    void router.replace('/login')
   } catch (e) {
-    message.error((e as Error).message)
+    if (active()) message.error((e as Error).message)
   } finally {
     savingPw.value = false
   }
@@ -483,12 +618,13 @@ const exportOptions: { kind: ExportKind; label: string }[] = [
 ]
 const exporting = ref<ExportKind | null>(null)
 async function doExport(kind: ExportKind) {
+  if (exporting.value || !active()) return
   exporting.value = kind
   try {
-    await downloadExport(kind)
-    message.success('已开始下载')
+    await downloadExport(kind, active)
+    if (active()) message.success('已开始下载')
   } catch (e) {
-    message.error((e as Error).message)
+    if (active()) message.error((e as Error).message)
   } finally {
     exporting.value = null
   }
@@ -497,21 +633,26 @@ async function doExport(kind: ExportKind) {
 
 <template>
   <PageContainer title="设置" subtitle="模型 · 偏好 · 通知 · 账号安全">
-    <n-tabs type="line" animated :default-value="initialTab">
+    <n-tabs v-model:value="activeTab" type="line" animated>
     <!-- LLM 配置 -->
     <n-tab-pane name="llm" tab="LLM 配置">
       <SectionCard :hoverable="false">
         <div class="card-toolbar">
           <span class="ct-title">已配置的模型服务</span>
-          <n-button type="primary" size="small" @click="openCreate">新增配置</n-button>
+          <n-button type="primary" size="small" :disabled="configWriteBusy" @click="openCreate">新增配置</n-button>
         </div>
-        <n-empty v-if="!loadingConfigs && configs.length === 0" description="还没有 LLM 配置">
+        <n-alert v-if="configsError" type="error" :bordered="false" class="load-error" title="模型配置加载失败">
+          {{ configsError }}
+          <n-button size="small" :disabled="configWriteBusy" :loading="loadingConfigs" @click="loadConfigs">重试加载配置</n-button>
+        </n-alert>
+        <div v-if="loadingConfigs" class="loading-state"><n-spin size="small" />正在加载模型配置…</div>
+        <n-empty v-else-if="!configsError && configs.length === 0" description="还没有 LLM 配置">
           <template #extra>
             <span style="font-size: 12px; opacity: 0.6">未配置时，AI 功能将自动使用管理员的默认 LLM 配置（次数配额仍按你的账号计）。</span>
           </template>
         </n-empty>
         <!-- 手机（≤768px）上 6 列表格即使横滚也看不全操作列，切换为卡片式列表。 -->
-        <div v-else-if="isMobile" class="llm-cards">
+        <div v-if="isMobile && configs.length" class="llm-cards">
           <div v-for="c in configs" :key="c.id" class="llm-card">
             <div class="llm-head">
               <span class="llm-name">{{ c.name }}</span>
@@ -524,24 +665,30 @@ async function doExport(kind: ExportKind) {
             <div class="llm-model qv-mono">{{ c.model }}</div>
             <div class="llm-url">{{ c.base_url }}</div>
             <div class="llm-ops">
-              <n-button size="small" @click="testSaved(c)">测试</n-button>
-              <n-button size="small" @click="openEdit(c)">编辑</n-button>
+              <n-button size="small" :loading="testingConfigIds.includes(c.id)" :disabled="configWriteBusy" @click="testSaved(c)">测试</n-button>
+              <n-button size="small" :disabled="configWriteBusy" @click="openEdit(c)">编辑</n-button>
               <n-button
                 v-if="!c.is_default"
                 size="small"
                 secondary
                 :loading="settingDefaultId === c.id"
+                :disabled="configWriteBusy"
                 @click="makeDefault(c)"
                 >设为默认</n-button
               >
               <n-popconfirm @positive-click="remove(c)">
-                <template #trigger><n-button size="small" type="error">删除</n-button></template>
+                <template #trigger><n-button size="small" type="error" :loading="removingId === c.id" :disabled="configWriteBusy">删除</n-button></template>
                 确认删除「{{ c.name }}」？
               </n-popconfirm>
             </div>
           </div>
         </div>
-        <n-table v-else :bordered="false" :single-line="false">
+        <div v-else-if="configs.length" class="llm-table-wrap">
+        <n-table class="llm-table" :bordered="false" :single-line="false">
+          <colgroup>
+            <col style="width: 130px" /><col style="width: 160px" /><col style="width: 220px" />
+            <col style="width: 120px" /><col style="width: 80px" /><col style="width: 65px" /><col style="width: 215px" />
+          </colgroup>
           <thead>
             <tr>
               <th>名称</th>
@@ -572,18 +719,19 @@ async function doExport(kind: ExportKind) {
               </td>
               <td>
                 <n-space :size="6">
-                  <n-button size="tiny" @click="testSaved(c)">测试</n-button>
-                  <n-button size="tiny" @click="openEdit(c)">编辑</n-button>
+                  <n-button size="tiny" :loading="testingConfigIds.includes(c.id)" :disabled="configWriteBusy" @click="testSaved(c)">测试</n-button>
+                  <n-button size="tiny" :disabled="configWriteBusy" @click="openEdit(c)">编辑</n-button>
                   <n-button
                     v-if="!c.is_default"
                     size="tiny"
                     secondary
                     :loading="settingDefaultId === c.id"
+                    :disabled="configWriteBusy"
                     @click="makeDefault(c)"
                     >设为默认</n-button
                   >
                   <n-popconfirm @positive-click="remove(c)">
-                    <template #trigger><n-button size="tiny" type="error">删除</n-button></template>
+                    <template #trigger><n-button size="tiny" type="error" :loading="removingId === c.id" :disabled="configWriteBusy">删除</n-button></template>
                     确认删除「{{ c.name }}」？
                   </n-popconfirm>
                 </n-space>
@@ -591,16 +739,22 @@ async function doExport(kind: ExportKind) {
             </tr>
           </tbody>
         </n-table>
+        </div>
       </SectionCard>
     </n-tab-pane>
 
     <!-- 用户偏好 -->
     <n-tab-pane name="pref" tab="偏好设置">
       <SectionCard :hoverable="false">
-        <n-form v-if="pref" :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 480px">
+        <n-alert v-if="prefError" type="error" :bordered="false" class="load-error" title="偏好加载失败">
+          {{ prefError }}
+          <n-button size="small" :loading="loadingPref" :disabled="savingPref" @click="loadPref">重试加载偏好</n-button>
+        </n-alert>
+        <div v-if="loadingPref" class="loading-state"><n-spin size="small" />正在加载偏好…</div>
+        <n-form v-if="pref" :disabled="savingPref" :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 480px">
           <div class="guide-entry">
-            <n-button size="small" secondary @click="showInvestmentGuide = true">重新填写三问投资偏好</n-button>
-            <n-button size="small" secondary @click="router.push({ query: { ...route.query, onboarding: '1' } })">首次使用引导</n-button>
+            <n-button size="small" secondary :disabled="savingPref" @click="openInvestmentGuide">重新填写三问投资偏好</n-button>
+            <n-button size="small" secondary :disabled="savingPref" @click="router.push({ query: { ...route.query, onboarding: '1' } })">首次使用引导</n-button>
             <span class="notify-hint">
               {{ pref.investment_guide_status === 'completed' ? '已完成' : pref.investment_guide_status === 'skipped' ? '已跳过' : '未完成' }}
             </span>
@@ -661,12 +815,12 @@ async function doExport(kind: ExportKind) {
               <div v-for="(b, i) in blacklist" :key="b.market + ':' + b.symbol" class="black-row">
                 <StockIdentity :symbol="b.symbol" :market="b.market" density="table" clickable />
                 <span class="black-reason">{{ b.reason || '—' }}</span>
-                <n-button size="tiny" quaternary type="error" @click="removeBlack(i)">移除</n-button>
+                <n-button size="tiny" quaternary type="error" :disabled="savingPref" @click="removeBlack(i)">移除</n-button>
               </div>
               <div class="black-add">
                 <StockPicker v-model="newBlackStock" class="black-picker" />
                 <n-input v-model:value="newBlack.reason" placeholder="回避原因（可选）" size="small" style="flex: 1" @keyup.enter="addBlack" />
-                <n-button size="small" @click="addBlack">加入</n-button>
+                <n-button size="small" :disabled="savingPref" @click="addBlack">加入</n-button>
               </div>
               <span class="notify-hint">生成推荐时黑名单标的将从候选池剔除（随「保存偏好」生效）</span>
             </div>
@@ -731,7 +885,7 @@ async function doExport(kind: ExportKind) {
     <!-- 账号安全 -->
     <n-tab-pane name="account" tab="账号安全">
       <SectionCard title="修改密码" :hoverable="false">
-        <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 480px">
+        <n-form :disabled="savingPw" :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 480px">
           <n-form-item label="原密码">
             <n-input v-model:value="pw.old" type="password" show-password-on="click" placeholder="纯 GitHub 账号首次设密码可留空" />
           </n-form-item>
@@ -778,11 +932,12 @@ async function doExport(kind: ExportKind) {
             :key="opt.kind"
             ghost
             :loading="exporting === opt.kind"
+            :disabled="exporting !== null"
             @click="doExport(opt.kind)"
             >{{ opt.label }}</n-button
           >
         </div>
-        <div class="export-hint">导出为 CSV（带 BOM，Excel 双击可读中文），仅含当前账号数据。</div>
+        <div class="export-hint">导出为 CSV（带 BOM，Excel 双击可读中文），仅含当前账号数据。持仓导出仅包含默认真实账户；每类单次最多 5000 条，超过上限会提示失败。</div>
       </SectionCard>
     </n-tab-pane>
     </n-tabs>
@@ -801,6 +956,8 @@ async function doExport(kind: ExportKind) {
       :placement="isMobile ? 'bottom' : 'right'"
       :width="isMobile ? undefined : 'min(560px, 92vw)'"
       :height="isMobile ? '88vh' : undefined"
+      :mask-closable="!saving"
+      :close-on-esc="!saving"
     >
       <!-- native-scrollbar 必须落在 n-drawer-content 上，不能给 n-drawer：给 n-drawer 传 false 会
            摘掉根元素的 n-drawer--native-scrollbar 类，而该类是 .n-drawer-content-wrapper 拿到
@@ -808,10 +965,10 @@ async function doExport(kind: ExportKind) {
            body 高度塌成 0，整个表单被 overflow:hidden 裁掉（表现为抽屉里只剩标题和按钮）。 -->
       <n-drawer-content
         :title="editingId ? '编辑 LLM 配置' : '新增 LLM 配置'"
-        closable
+        :closable="!saving"
         :native-scrollbar="false"
       >
-        <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 104">
+        <n-form :disabled="saving" :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 104">
           <n-divider title-placement="left" class="drawer-divider">基础连接</n-divider>
           <n-form-item label="名称">
             <n-input v-model:value="form.name" placeholder="如 我的 DeepSeek" :maxlength="64" />
@@ -869,7 +1026,7 @@ async function doExport(kind: ExportKind) {
                   placeholder="先拉取模型，再选择"
                   :loading="fetchingModels"
                 />
-                <n-button :loading="fetchingModels" @click="loadModels">拉取模型</n-button>
+                <n-button :loading="fetchingModels" :disabled="saving" @click="loadModels">拉取模型</n-button>
               </div>
               <div v-if="modelsTruncated" class="field-hint">
                 上游模型过多，列表已截断至前 500 个（按名称排序）；要用未列出的模型请勾选「自定义模型」。
@@ -933,9 +1090,9 @@ async function doExport(kind: ExportKind) {
 
         <template #footer>
           <n-space justify="space-between" style="width: 100%">
-            <n-button :loading="testing" @click="testDraft">测试连接</n-button>
+            <n-button :loading="testing" :disabled="saving" @click="testDraft">测试连接</n-button>
             <n-space>
-              <n-button @click="showDrawer = false">取消</n-button>
+              <n-button :disabled="saving" @click="showDrawer = false">取消</n-button>
               <n-button type="primary" :loading="saving" @click="save">保存</n-button>
             </n-space>
           </n-space>
@@ -1011,6 +1168,33 @@ async function doExport(kind: ExportKind) {
   font-size: 12px;
   opacity: 0.45;
 }
+.loading-state {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 0;
+}
+.load-error { margin-bottom: 14px; }
+.load-error :deep(.n-button) { margin-left: 10px; }
+.llm-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.llm-table {
+  min-width: 990px;
+  table-layout: fixed;
+}
+.llm-table :deep(td) {
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+.llm-table :deep(.n-tag) {
+  max-width: 100%;
+  height: auto;
+  min-height: 22px;
+  white-space: normal;
+}
+.llm-table :deep(.n-tag__content) { overflow-wrap: anywhere; }
 .card-toolbar {
   display: flex;
   align-items: center;

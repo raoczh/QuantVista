@@ -9,6 +9,7 @@ import (
 	"quantvista/model"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // jobExecution 只存在于当前 worker 的 context，不进入持久快照。
@@ -20,9 +21,39 @@ type jobExecution struct {
 }
 
 type jobExecutionKey struct{}
+type jobResultGuardKey struct{}
 
 func withJobExecution(ctx context.Context, execution jobExecution) context.Context {
+	ctx = context.WithValue(ctx, jobResultGuardKey{}, execution)
 	return context.WithValue(ctx, jobExecutionKey{}, execution)
+}
+
+// withJobResultTransaction 让业务结果提交与取消请求竞争同一 JobRun 行锁。
+// 取消先提交就不写结果；业务先提交则保持既有成功事实，运行时负责收敛迟到取消。
+// withoutJobExecution 隐藏子步骤但保留此闸，嵌套推荐不会提前完成父日报。
+func withJobResultTransaction(ctx context.Context, commit func(*gorm.DB) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if execution, ok := ctx.Value(jobResultGuardKey{}).(jobExecution); ok && execution.jobID > 0 {
+			var run model.JobRun
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Select("id", "status", "cancel_requested").First(&run, execution.jobID).Error; err != nil {
+				return err
+			}
+			if run.Status != model.JobStatusRunning || run.CancelRequested {
+				return context.Canceled
+			}
+		}
+		if err := commit(tx); err != nil {
+			return err
+		}
+		return ctx.Err()
+	})
 }
 
 // withoutJobExecution 保留取消/超时链路，但隔离嵌套业务调用的步骤写入。

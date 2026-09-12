@@ -244,6 +244,7 @@ type ScoreView struct {
 
 	QuoteAsOf       string `json:"quote_as_of,omitempty"`      // 行情数据源时刻
 	FreshnessStatus string `json:"freshness_status,omitempty"` // fresh | unknown（stale 不出评分）
+	BarsAsOf        string `json:"bars_as_of,omitempty"`
 }
 
 // Score 计算某只个股当日评分并落库快照。
@@ -271,7 +272,16 @@ func (s *ScoreService) Score(ctx context.Context, market, symbol string) (*Score
 		}
 		return nil, fmt.Errorf("行情已过期（仅更新至 %s，可能停牌或数据源故障），为避免用旧价计算并落库当日评分，本次不出分", asOf)
 	}
-	bars, _ := s.market.GetDailyBars(ctx, market, symbol, scoreBarLimit)
+	bars, err := s.market.GetDailyBars(ctx, market, symbol, scoreBarLimit)
+	if err != nil || len(bars) == 0 {
+		return nil, errors.New("日线数据暂不可用，本次不生成评分快照")
+	}
+	if len(bars) < 21 {
+		return nil, fmt.Errorf("日线仅有 %d 根，不足 20 日涨幅窗口，本次不生成评分快照", len(bars))
+	}
+	if issue := technicalBarsIssue(ctx, market, q.DataTime, fi, bars); issue != "" {
+		return nil, errors.New(issue)
+	}
 	res := computeScore(q.Price, bars)
 	// M3a 量能维融合主力资金分（A 股非基金；缓存优先按需补拉，缺失时评分原样）。
 	// computeScore 纯函数不动——融合是外层包装，既有对拍/单测口径不受影响。
@@ -283,9 +293,10 @@ func (s *ScoreService) Score(ctx context.Context, market, symbol string) (*Score
 	}
 
 	view := &ScoreView{
-		Symbol: symbol, Market: market, Name: q.Name, Price: round2(q.Price),
+		Symbol: symbol, Market: market, Name: q.Name, Price: q.Price,
 		Date: q.DataTime.In(time.Local).Format("2006-01-02"), ScoreResult: res,
 		FreshnessStatus: fi.Status,
+		BarsAsOf:        bars[len(bars)-1].TradeDate,
 	}
 	if !q.DataTime.IsZero() {
 		view.QuoteAsOf = q.DataTime.In(time.Local).Format("2006-01-02 15:04")

@@ -258,3 +258,44 @@ func TestPositionAdviceModuleBudget(t *testing.T) {
 		t.Fatalf("预算声明异常: %+v", b)
 	}
 }
+
+func TestPositionAdviceQueuePinsDisplayedAccount(t *testing.T) {
+	setupTestDB(t)
+	accounts := NewPortfolioAccountService()
+	first, err := accounts.Create(991, PortfolioAccountInput{Name: "提交时组合", Kind: "real"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := accounts.Create(991, PortfolioAccountInput{Name: "后续默认组合", Kind: "real"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRuntime := defaultJobRuntime
+	runtime := newJobRuntime(1, 4)
+	runtime.workers = 0 // 只验证排队事实，不启动 worker 或调用任何外部模型。
+	defaultJobRuntime = runtime
+	t.Cleanup(func() { runtime.close(); defaultJobRuntime = oldRuntime })
+	svc := &PositionAdviceService{position: &PositionService{}, llm: &LLMService{}}
+	task, err := svc.AdviseAsync(991, false, PositionAdviceRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := accounts.SetDefault(991, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	var job model.JobRun
+	if err := common.DB.Where("result_type = ? AND result_id = ? AND user_id = ?", JobResultLLMTask, task.ID, 991).First(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := decodePersistedJobSnapshot(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var queued PositionAdviceRequest
+	if err := json.Unmarshal(snapshot.Request, &queued); err != nil {
+		t.Fatal(err)
+	}
+	if queued.AccountID != first.ID || job.Status != model.JobStatusQueued {
+		t.Fatalf("排队建议必须保持提交时组合：account=%d wanted=%d status=%s", queued.AccountID, first.ID, job.Status)
+	}
+}

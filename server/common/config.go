@@ -71,10 +71,10 @@ func InitConfig() {
 	// 避免开发者被迫配齐密钥；容器化 MySQL 部署则强制 fail-fast。
 	if isProductionEnv() {
 		if isWeakSecret(SessionSecret) {
-			FatalLog("SESSION_SECRET 未设置或仍为占位值，生产环境拒绝启动；请用 `openssl rand -base64 36` 生成后写入环境变量")
+			FatalLog("SESSION_SECRET 未设置、少于 16 字节或仍为占位值，生产环境拒绝启动；请用 `openssl rand -base64 36` 生成后写入环境变量")
 		}
 		if isWeakSecret(EncryptionKey) {
-			FatalLog("ENCRYPTION_KEY 未设置或仍为占位值，生产环境拒绝启动；请用 `openssl rand -base64 36` 生成后写入环境变量")
+			FatalLog("ENCRYPTION_KEY 未设置、少于 16 字节或仍为占位值，生产环境拒绝启动；请用 `openssl rand -base64 36` 生成后写入环境变量")
 		}
 	} else {
 		// 开发环境放行，但缺失密钥必须显式告警，避免误部署时无声降级。
@@ -94,9 +94,10 @@ func isProductionEnv() bool {
 	return !IsLocalDSN(os.Getenv("SQL_DSN"))
 }
 
-// isWeakSecret 判定密钥是否为空或仍是模板占位值，生产环境一律拒绝。
+// isWeakSecret 拒绝明显过短的密钥和模板占位值。长度检查不能代替随机性；
+// 部署模板仍要求用密码学随机源生成 36 字节密钥。
 func isWeakSecret(v string) bool {
-	if strings.TrimSpace(v) == "" {
+	if len(strings.TrimSpace(v)) < 16 {
 		return true
 	}
 	lower := strings.ToLower(v)

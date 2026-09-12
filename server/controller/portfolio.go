@@ -28,11 +28,24 @@ func portfolioError(c *gin.Context, err error) {
 		common.ApiErrorMsg(c, "组合不存在")
 		return
 	}
-	common.ApiErrorMsg(c, err.Error())
+	common.ApiErrorMsg(c, publicWorkflowError(err, "组合处理失败，请稍后重试"))
+}
+
+func portfolioRevision(c *gin.Context) (int, bool) {
+	raw := strings.TrimSpace(c.Query("revision"))
+	if raw == "" {
+		return 0, true
+	}
+	revision, err := strconv.Atoi(raw)
+	if err != nil || revision < 0 {
+		common.ApiErrorMsg(c, "目标配置版本参数无效")
+		return 0, false
+	}
+	return revision, true
 }
 
 func (pc *PortfolioController) List(c *gin.Context) {
-	rows, err := pc.accounts.List(currentUserID(c))
+	rows, err := pc.accounts.ListContext(c.Request.Context(), currentUserID(c))
 	if err != nil {
 		portfolioError(c, err)
 		return
@@ -46,7 +59,7 @@ func (pc *PortfolioController) Create(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	row, err := pc.accounts.Create(currentUserID(c), in)
+	row, err := pc.accounts.CreateContext(c.Request.Context(), currentUserID(c), in)
 	if err != nil {
 		portfolioError(c, err)
 		return
@@ -64,7 +77,7 @@ func (pc *PortfolioController) Update(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	row, err := pc.accounts.Update(currentUserID(c), id, in)
+	row, err := pc.accounts.UpdateContext(c.Request.Context(), currentUserID(c), id, in)
 	if err != nil {
 		portfolioError(c, err)
 		return
@@ -77,7 +90,7 @@ func (pc *PortfolioController) Archive(c *gin.Context) {
 	if !ok {
 		return
 	}
-	row, err := pc.accounts.Archive(currentUserID(c), id)
+	row, err := pc.accounts.ArchiveContext(c.Request.Context(), currentUserID(c), id)
 	if err != nil {
 		portfolioError(c, err)
 		return
@@ -90,7 +103,7 @@ func (pc *PortfolioController) Default(c *gin.Context) {
 	if !ok {
 		return
 	}
-	row, err := pc.accounts.SetDefault(currentUserID(c), id)
+	row, err := pc.accounts.SetDefaultContext(c.Request.Context(), currentUserID(c), id)
 	if err != nil {
 		portfolioError(c, err)
 		return
@@ -103,7 +116,7 @@ func (pc *PortfolioController) Delete(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := pc.accounts.Delete(currentUserID(c), id); err != nil {
+	if err := pc.accounts.DeleteContext(c.Request.Context(), currentUserID(c), id); err != nil {
 		portfolioError(c, err)
 		return
 	}
@@ -160,7 +173,7 @@ func (pc *PortfolioController) CashFlows(c *gin.Context) {
 	if !ok {
 		return
 	}
-	rows, err := service.ListPortfolioCashFlows(currentUserID(c), id)
+	rows, err := service.ListPortfolioCashFlowsContext(c.Request.Context(), currentUserID(c), id)
 	if err != nil {
 		portfolioError(c, err)
 		return
@@ -178,7 +191,7 @@ func (pc *PortfolioController) CreateCashFlow(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	row, err := service.CreatePortfolioCashFlow(currentUserID(c), id, in)
+	row, err := service.CreatePortfolioCashFlowContext(c.Request.Context(), currentUserID(c), id, in)
 	if err != nil {
 		portfolioError(c, err)
 		return
@@ -203,7 +216,7 @@ func (pc *PortfolioController) ReverseCashFlow(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	row, err := service.ReversePortfolioCashFlow(currentUserID(c), id, flowID, in.IdempotencyKey, in.Note)
+	row, err := service.ReversePortfolioCashFlowContext(c.Request.Context(), currentUserID(c), id, flowID, in.IdempotencyKey, in.Note)
 	if err != nil {
 		portfolioError(c, err)
 		return
@@ -234,14 +247,23 @@ func (pc *PortfolioController) Targets(c *gin.Context) {
 	if !ok {
 		return
 	}
-	revision, _ := strconv.Atoi(c.Query("revision"))
-	row, items, err := service.LoadTargetRevision(currentUserID(c), id, revision)
+	revision, ok := portfolioRevision(c)
+	if !ok {
+		return
+	}
+	row, items, err := service.LoadTargetRevisionContext(c.Request.Context(), currentUserID(c), id, revision)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			if _, accountErr := service.PortfolioAccountByID(currentUserID(c), id, ""); accountErr == nil {
-				common.ApiSuccess(c, gin.H{"revision": nil, "items": []service.TargetAllocationItem{}})
+			if revision > 0 {
+				common.ApiErrorMsg(c, "目标配置版本不存在")
 				return
 			}
+			if _, accountErr := service.PortfolioAccountByIDContext(c.Request.Context(), currentUserID(c), id, ""); accountErr != nil {
+				portfolioError(c, accountErr)
+				return
+			}
+			common.ApiSuccess(c, gin.H{"revision": nil, "items": []service.TargetAllocationItem{}})
+			return
 		}
 		portfolioError(c, err)
 		return
@@ -261,7 +283,7 @@ func (pc *PortfolioController) SaveTargets(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	row, err := pc.risk.SaveTargets(currentUserID(c), id, in.Items)
+	row, err := pc.risk.SaveTargetsContext(c.Request.Context(), currentUserID(c), id, in.Items)
 	if err != nil {
 		portfolioError(c, err)
 		return
@@ -274,9 +296,16 @@ func (pc *PortfolioController) Rebalance(c *gin.Context) {
 	if !ok {
 		return
 	}
-	revision, _ := strconv.Atoi(c.Query("revision"))
+	revision, ok := portfolioRevision(c)
+	if !ok {
+		return
+	}
 	row, err := pc.risk.Rebalance(c.Request.Context(), currentUserID(c), id, revision)
 	if err != nil {
+		if revision > 0 && errors.Is(err, gorm.ErrRecordNotFound) {
+			common.ApiErrorMsg(c, "目标配置版本不存在")
+			return
+		}
 		portfolioError(c, err)
 		return
 	}

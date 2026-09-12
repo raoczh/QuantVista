@@ -6,7 +6,7 @@ export interface PortfolioAccount { id:number; user_id:number; name:string; kind
 export interface RiskMetric { status:'available'|'partial'|'unavailable'; value?:number; reason?:string; sample_count?:number }
 export interface HoldingWeight { symbol:string; market:string; name:string; industry?:string; quantity:number; price?:number; value?:number; weight_pct?:number; status:string; reason?:string; plan_stop_loss?:number; valuation_known:boolean }
 export interface PortfolioOverview { account:PortfolioAccount; as_of:string; total_assets:RiskMetric; market_value:number; cash:RiskMetric; holding_count:number; priced_count:number; coverage_pct:number; top_n_weight_pct:number; holdings:HoldingWeight[]; exposure?:PortfolioExposure; partial_reasons:string[]; data_version:string }
-export interface EquityPoint { trade_date:string; assets:number; cash_flow?:number; return?:number; drawdown_pct?:number; partial:boolean }
+export interface EquityPoint { trade_date:string; assets:number; cash_flow?:number; return?:number; drawdown_pct?:number; partial:boolean; return_unavailable_reason?:string }
 export interface DrawdownResult { metric:RiskMetric; peak_date?:string; trough_date?:string; recovery_date?:string }
 export interface CorrelationCell { status:string; value?:number; sample_count:number; reason?:string }
 export interface CorrelationMatrix { symbols:string[]; cells:CorrelationCell[][]; window_days:number; as_of:string; data_version:string }

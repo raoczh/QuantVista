@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 import { NButton, NModal, NTag, NTooltip, useMessage } from 'naive-ui'
 import type { PoolCandidate, RecommendationItem, RecType } from '@/api/recommendation'
 import { linkPositionRecommendation } from '@/api/position'
+import { getSessionEpoch } from '@/api/token'
 import { useUi } from '@/composables/useUi'
 import { useStockActions } from '@/composables/useStockActions'
 import StockIdentity from '@/components/StockIdentity.vue'
@@ -11,6 +12,7 @@ import TermHelp from '@/components/TermHelp.vue'
 import {
   confidenceExplanation,
   positionEntryAction,
+  rankedScore,
   recommendationDecisionState,
   RECOMMENDATION_DECISION_LABEL,
   trackingState,
@@ -21,13 +23,17 @@ const props = defineProps<{
   item: RecommendationItem
   type: RecType
   candidate?: PoolCandidate
+  stopAlerting: boolean
 }>()
 const emit = defineEmits<{
   (event: 'stop-alert', item: RecommendationItem): void
-  (event: 'linked'): void
+  (event: 'linked', batchID: number): void
 }>()
 
 const message = useMessage()
+const session = getSessionEpoch()
+let disposed = false
+onBeforeUnmount(() => { disposed = true })
 const { downColor, pctColor, vars, withAlpha } = useUi()
 const { goDetail, goRecommendationReview, goAlert, addToWatchlist, goPositionDecision, goPositionFromRecommendation } = useStockActions()
 const decision = computed(() => recommendationDecisionState(props.item))
@@ -46,7 +52,10 @@ const sourceText = computed(() => {
   return sources.map((source) => labels[source] || source).join(' / ') || '来源记录未提供'
 })
 const asOf = computed(() => props.item.detail?.quote_as_of || props.item.detail?.execution_plan?.data_as_of || '数据时点未知')
-const isHeld = computed(() => !!props.item.position && props.item.position.status === 'holding')
+const holdingPosition = computed(() => props.item.holding_position === undefined
+  ? (props.item.position?.status === 'holding' ? props.item.position : null)
+  : props.item.holding_position)
+const isHeld = computed(() => holdingPosition.value?.status === 'holding')
 // 同标的持仓但无血缘（手动录入的持仓 recommendation_id=0，血缘查不出来）。
 const unlinked = computed(() => (isHeld.value ? null : props.item.unlinked_position || null))
 const entry = computed(() => positionEntryAction(props.item))
@@ -62,14 +71,17 @@ const linking = ref(false)
 /** 把已持有但未登记血缘的持仓补关联到本条推荐。 */
 async function linkExistingPosition() {
   const positionID = props.item.unlinked_position?.position_id
-  if (!positionID) return
+  if (disposed || linking.value || getSessionEpoch() !== session || !positionID) return
+  const itemID = props.item.id, batchID = props.item.batch_id
+  const current = () => !disposed && getSessionEpoch() === session && props.item.id === itemID && props.item.unlinked_position?.position_id === positionID
   linking.value = true
   try {
-    await linkPositionRecommendation(positionID, props.item.id)
+    await linkPositionRecommendation(positionID, itemID)
+    if (!current()) return
     message.success('已关联，该笔持仓的实际买入价与收益将计入本条推荐的追踪')
-    emit('linked')
+    emit('linked', batchID)
   } catch (e) {
-    message.error((e as Error).message)
+    if (current()) message.error((e as Error).message)
   } finally {
     linking.value = false
   }
@@ -86,7 +98,7 @@ async function linkExistingPosition() {
         clickable
         actions
         :has-position="isHeld"
-        :position-id="item.position?.position_id"
+        :position-id="holdingPosition?.position_id"
         :recommendation-id="item.id"
       />
       <div class="state-tags">
@@ -126,9 +138,9 @@ async function linkExistingPosition() {
 
     <div v-if="isHeld" class="ownership held">
       <b>这是你的持仓</b>
-      <span>普通推荐结论不能当作卖出结论；卖出判断以该笔持仓 #{{ item.position?.position_id }} 的成本和风险事实为准。</span>
-      <span>持仓 {{ item.position?.quantity }} 股 · 成本 {{ item.position?.buy_price?.toFixed(2) }} · 买入日 {{ item.position?.buy_date || '未知' }}</span>
-      <span v-if="item.status?.actual_return_pct != null" class="qv-tnum" :style="{ color: pctColor(item.status.actual_return_pct) }">实际持仓收益 {{ item.status.actual_return_pct > 0 ? '+' : '' }}{{ item.status.actual_return_pct.toFixed(2) }}%</span>
+      <span>普通推荐结论不能当作卖出结论；卖出判断以该笔持仓 #{{ holdingPosition?.position_id }} 的成本和风险事实为准。</span>
+      <span>持仓 {{ holdingPosition?.quantity }} 股 · 成本 {{ holdingPosition?.buy_price?.toFixed(2) }} · 买入日 {{ holdingPosition?.buy_date || '未知' }}</span>
+      <span v-if="holdingPosition?.position_id === item.position?.position_id && item.status?.actual_return_pct != null" class="qv-tnum" :style="{ color: pctColor(item.status.actual_return_pct) }">实际持仓收益 {{ item.status.actual_return_pct > 0 ? '+' : '' }}{{ item.status.actual_return_pct.toFixed(2) }}%</span>
     </div>
     <!-- 软匹配：持有同一标的但没有血缘（手动录入持仓时 recommendation_id=0）。
          只提示、不自动关联——同一标的可能被多批推荐过，也可能是自主决定买的，
@@ -140,7 +152,7 @@ async function linkExistingPosition() {
       <n-button size="tiny" type="primary" secondary :loading="linking" @click="linkExistingPosition">补关联到本条推荐</n-button>
     </div>
     <div v-else class="ownership">
-      <b>当前未关联本人持仓</b>
+      <b>{{ item.position ? '历史持仓关联已保留，当前无活动持仓' : '当前未关联本人持仓' }}</b>
       <span>仅供研究追踪，不代表持仓建议，也不会自动下单。</span>
     </div>
 
@@ -162,7 +174,7 @@ async function linkExistingPosition() {
 
     <TrustBadges
       v-if="item.detail"
-      :quant-score="item.detail.quant_score"
+      :quant-score="rankedScore(item.detail.quant_score, item.detail.quant_rank)"
       :quant-rank="item.detail.quant_rank"
       :pool-size="item.detail.pool_size"
       :lot-cost="item.detail.lot_cost || item.ref_price * 100"
@@ -183,7 +195,7 @@ async function linkExistingPosition() {
       <n-button size="small" @click="goDetail(stock)">进入个股详情</n-button>
       <n-button size="small" @click="addToWatchlist(stock)">加入自选</n-button>
       <n-button size="small" @click="goAlert(stock)">设置提醒</n-button>
-      <n-button v-if="isHeld" size="small" type="warning" @click="goPositionDecision(stock, item.position!.position_id)">进入持仓卖出决策</n-button>
+      <n-button v-if="isHeld" size="small" type="warning" @click="goPositionDecision(stock, holdingPosition!.position_id)">进入持仓卖出决策</n-button>
       <!-- 建仓入口恒显（非持仓时）：登记「我已经买了」是事实登记，不该被执行计划
            是否 ready 挡住——否则偏好未完成/行情 stale 等情况下用户根本没有带血缘的
            入口，追踪体系直接漏账。ready 与否只体现在文案与是否预填数量上。 -->
@@ -203,7 +215,7 @@ async function linkExistingPosition() {
           <div v-for="(reason, i) in entry.reasons" :key="i">· {{ reason }}</div>
         </div>
       </n-tooltip>
-      <n-button v-if="type === 'short_term' && (item.detail?.stop_loss || 0) > 0" size="small" @click="emit('stop-alert', item)">设置止损提醒</n-button>
+      <n-button v-if="type === 'short_term' && (item.detail?.stop_loss || 0) > 0" size="small" :loading="stopAlerting" :disabled="stopAlerting" @click="emit('stop-alert', item)">设置止损提醒</n-button>
     </footer>
 
     <!-- 依据走弹层而非卡内折叠区：一批推荐有多张卡，卡内已有结论/理由风险/持仓/追踪/
@@ -213,6 +225,7 @@ async function linkExistingPosition() {
     <n-modal
       v-model:show="evidenceShow"
       preset="card"
+      class="recommendation-evidence-modal"
       :title="`推荐依据 · ${item.name || item.symbol}`"
       :style="{ width: 'min(880px, calc(100vw - 24px))' }"
     >
@@ -353,7 +366,8 @@ async function linkExistingPosition() {
 .tracking-band { padding: 9px 0; border-top: 1px dashed v-bind('vars.dividerColor'); border-bottom: 1px dashed v-bind('vars.dividerColor'); }
 /* 依据弹层内容自身滚动：证据/风险/失效条件加起来可能远超一屏，让弹层保持在视口内，
  * 不要把整页撑长。限高挂在自己渲染的容器上，不依赖 scoped 样式命中 naive-ui 内部结构。 */
-.evidence-body { max-height: 68vh; overflow-y: auto; }
+:global(.recommendation-evidence-modal) { max-height: calc(100dvh - 24px); overflow: hidden; }
+:global(.recommendation-evidence-modal > .n-card-content) { min-height: 0; overflow: auto; }
 .evidence-grid section { min-width: 0; }
 .evidence-grid h4 { margin: 0 0 6px; font-size: 13px; }
 .evidence-grid p,

@@ -1,8 +1,6 @@
 package controller
 
 import (
-	"strconv"
-
 	"quantvista/common"
 	"quantvista/service"
 
@@ -23,11 +21,14 @@ func NewOrgViewController(svc *service.OrgViewService) *OrgViewController {
 // price 为现价（可选，前端从行情带过来，用于目标价偏离计算；缺省不算偏离）。
 // 首次访问触发按需同步（研报 1~2 请求 + 调研 1 请求，冷却 1h），非 A 股口径返回空集。
 func (oc *OrgViewController) StockOrgView(c *gin.Context) {
-	price := 0.0
-	if s := c.Query("price"); s != "" {
-		if v, err := strconv.ParseFloat(s, 64); err == nil && v > 0 {
-			price = v
-		}
+	price, ok := optionalNonnegativeFloat(c, "price")
+	if !ok {
+		return
 	}
-	common.ApiSuccess(c, oc.svc.Overview(c.Request.Context(), c.Param("market"), c.Param("symbol"), price))
+	view, err := oc.svc.OverviewContext(c.Request.Context(), c.Param("market"), c.Param("symbol"), price)
+	if err != nil {
+		common.ApiErrorMsg(c, publicWorkflowError(err, "机构观点读取失败，请稍后重试"))
+		return
+	}
+	common.ApiSuccess(c, view)
 }

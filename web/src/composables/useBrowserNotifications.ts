@@ -1,6 +1,7 @@
 import { computed, ref } from 'vue'
 import type { Router } from 'vue-router'
 import type { MessageApiInjection } from 'naive-ui/es/message/src/MessageProvider'
+import { getSessionEpoch } from '@/api/token'
 import {
   ackBrowserNotification,
   listBrowserNotificationEvents,
@@ -75,7 +76,7 @@ function safeInternalRoute(raw: string) {
   }
 }
 
-function showForegroundNotification(item: BrowserNotificationEvent, router: Router) {
+function showForegroundNotification(item: BrowserNotificationEvent, router: Router, current: () => boolean) {
   if (!browserNotificationSupported() || Notification.permission !== 'granted') return
   const route = safeInternalRoute(item.event.route)
   const notification = new Notification(item.event.title, {
@@ -83,8 +84,10 @@ function showForegroundNotification(item: BrowserNotificationEvent, router: Rout
     tag: `qv-event-${item.event.id}`,
   })
   notification.onclick = () => {
-    window.focus()
-    void router.push(route)
+    if (current()) {
+      window.focus()
+      void router.push(route)
+    }
     notification.close()
   }
 }
@@ -94,15 +97,20 @@ export function useBrowserNotificationRuntime(userID: () => number, router: Rout
   const lastEventID = ref(0)
   let activeUserID = 0
   let timer: number | undefined
+  let started = false
+  let startedSession = 0
+  let generation = 0
+  let pollController: AbortController | null = null
 
   const enabled = computed(() => userID() > 0 && browserNotificationSupported() && Notification.permission === 'granted')
 
-  async function handleEvent(item: BrowserNotificationEvent, fromServiceWorker = false) {
-    if (!fromServiceWorker) showForegroundNotification(item, router)
+  async function handleEvent(item: BrowserNotificationEvent, key: string, owner: number, current: () => boolean) {
+    if (!current() || item.event.user_id !== owner) return false
+    showForegroundNotification(item, router, current)
     message.info(item.event.title, { duration: 4500, closable: true })
-    const key = browserDeviceKey(userID())
     try {
       await ackBrowserNotification(item.delivery_id, key)
+      if (!current()) return false
       // 只有服务端确认了当前设备的投递，才能推进游标；否则下一轮仍要
       // 重试这条事件，避免一次网络抖动把通知永久跳过。
       lastEventID.value = Math.max(lastEventID.value, item.event.id)
@@ -113,36 +121,50 @@ export function useBrowserNotificationRuntime(userID: () => number, router: Rout
   }
 
   async function poll() {
-    if (!enabled.value || running.value) return
+    if (!started || getSessionEpoch() !== startedSession || !enabled.value || running.value) return
+    const owner = userID()
+    const epoch = generation
+    const session = getSessionEpoch()
+    const controller = new AbortController()
+    pollController = controller
+    const current = () => started && generation === epoch && userID() === owner && getSessionEpoch() === session && !controller.signal.aborted
     if (activeUserID !== userID()) {
       activeUserID = userID()
       lastEventID.value = 0
     }
     running.value = true
     try {
-      const key = browserDeviceKey(userID())
-      const rows = await listBrowserNotificationEvents(key, lastEventID.value)
+      const key = browserDeviceKey(owner)
+      const rows = await listBrowserNotificationEvents(key, lastEventID.value, controller.signal)
+      if (!current()) return
       for (const row of rows) {
-        const acknowledged = await handleEvent(row)
+        const acknowledged = await handleEvent(row, key, owner, current)
         if (!acknowledged) break
       }
     } catch {
       // 轮询是旁路，设置页会提供明确恢复状态；外壳不持续打扰用户。
     } finally {
-      running.value = false
+      if (generation === epoch && pollController === controller) {
+        pollController = null
+        running.value = false
+      }
     }
   }
 
   function onWorkerMessage(event: MessageEvent) {
-    if (event.data?.type !== 'qv-browser-notification') return
+    if (!started || getSessionEpoch() !== startedSession || !enabled.value || event.data?.type !== 'qv-browser-notification') return
     const payload = event.data.payload || {}
+    if (payload.user_id !== userID()) return
     const route = safeInternalRoute(String(payload.route || '/'))
     message.info(String(payload.title || 'QuantVista 通知'), { duration: 4500, closable: true })
     if (payload.focus === true) void router.push(route)
   }
 
   function start() {
-    if (timer !== undefined) return
+    if (started) return
+    started = true
+    startedSession = getSessionEpoch()
+    generation++
     if ('serviceWorker' in navigator) navigator.serviceWorker.addEventListener('message', onWorkerMessage)
     void poll()
     timer = window.setInterval(poll, 20_000)
@@ -150,6 +172,11 @@ export function useBrowserNotificationRuntime(userID: () => number, router: Rout
   }
 
   function stop() {
+    started = false
+    generation++
+    pollController?.abort()
+    pollController = null
+    running.value = false
     if (timer !== undefined) window.clearInterval(timer)
     timer = undefined
     document.removeEventListener('visibilitychange', poll)

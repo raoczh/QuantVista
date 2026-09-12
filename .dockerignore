@@ -1,6 +1,14 @@
 # 构建上下文裁剪：避免把依赖、产物、密钥拷进镜像层
 .git
 **/node_modules
+**/.env
+**/.env.*
+**/*.env
+**/*.db
+**/*.db-*
+**/logs
+build
+mobile
 web/dist
 server/web/dist
 server/quantvista

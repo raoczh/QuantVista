@@ -4,6 +4,7 @@ import type { StockFinance } from '@/api/finance'
 import type { Bar, Quote, StockFundFlow, StockScore, Valuation } from '@/api/market'
 import type { NewsItem } from '@/api/news'
 import type { PositionExitAssessment } from '@/api/position'
+import { formatPrice } from '@/lib/formatPrice'
 
 export type StockSectionPhase = 'idle' | 'loading' | 'refreshing' | 'ready' | 'empty' | 'error'
 export type DecisionTone = 'positive' | 'negative' | 'warning' | 'neutral' | 'unknown'
@@ -111,7 +112,7 @@ function selectRecentEvent(input: DecisionSummaryInput): DecisionItem {
   const now = input.now || new Date()
   const candidates: Array<DecisionItem & { eventAt: number }> = []
 
-  for (const lift of input.corpEvents?.lifts || []) {
+  for (const lift of input.corpEvents?.lift_unavailable ? [] : input.corpEvents?.lifts || []) {
     const eventAt = timestamp(`${lift.free_date}T00:00:00`)
     if (!eventAt) continue
     candidates.push({
@@ -126,7 +127,7 @@ function selectRecentEvent(input: DecisionSummaryInput): DecisionItem {
       eventAt,
     })
   }
-  for (const action of input.corpEvents?.actions || []) {
+  for (const action of input.corpEvents?.action_unavailable ? [] : input.corpEvents?.actions || []) {
     const date = action.notice_date || action.report_date
     const eventAt = timestamp(`${date}T00:00:00`)
     if (!eventAt) continue
@@ -191,7 +192,7 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
       id: 'position-pnl',
       title: '持仓浮盈亏',
       value: `${signedPct(position.profitPct)} · ${signedAmount(position.profitAmount)}`,
-      detail: `按剩余持仓 ${position.quantity.toFixed(0)} 股、平均成本 ${position.averageCost.toFixed(2)} 元统计。`,
+      detail: `按剩余持仓 ${position.quantity.toFixed(0)} 股、平均成本 ${formatPrice(position.averageCost)} 元统计。`,
       evidence: `剩余成本 ${position.remainingCost.toFixed(2)} 元；${position.lots} 笔持仓账本`,
       source: '个人持仓账本 + 有效行情',
       asOf: position.asOf || 'unknown',
@@ -231,8 +232,8 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
         ? q.change_pct > 0 ? '今日上涨' : q.change_pct < 0 ? '今日下跌' : '今日平盘'
         : q.change_pct > 0 ? '最近已知上涨' : q.change_pct < 0 ? '最近已知下跌' : '最近已知平盘',
       value: signedPct(q.change_pct),
-      detail: `${quoteFresh ? '现价' : '最近已知价'} ${q.price.toFixed(2)} 元，昨收 ${q.prev_close.toFixed(2)} 元。`,
-      evidence: `(${q.price.toFixed(2)} - ${q.prev_close.toFixed(2)}) / ${q.prev_close.toFixed(2)}`,
+      detail: `${quoteFresh ? '现价' : '最近已知价'} ${formatPrice(q.price)} 元，昨收 ${formatPrice(q.prev_close)} 元。`,
+      evidence: `(${formatPrice(q.price)} - ${formatPrice(q.prev_close)}) / ${formatPrice(q.prev_close)}`,
       source: q.source || '行情聚合',
       asOf: q.data_time || 'unknown',
       tone: toneFor(q.change_pct),
@@ -249,7 +250,7 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
         id: 'period-change',
         title: `近 ${recent.length} 个交易日`,
         value: signedPct(pct),
-        detail: `收盘价由 ${first.close.toFixed(2)} 元变为 ${last.close.toFixed(2)} 元。`,
+        detail: `收盘价由 ${formatPrice(first.close)} 元变为 ${formatPrice(last.close)} 元。`,
         evidence: `前复权日线区间收益，${first.trade_date} 至 ${last.trade_date}`,
         source: '本地日线 / 行情源',
         asOf: last.trade_date,
@@ -259,12 +260,13 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
   }
 
   const latestFinance = input.finance?.indicators.at(-1)
+  const financeNote = input.finance?.note || (input.fundamentalPhase === 'error' ? '本次基本面读取未完成，请核对原始报告' : '')
   if (latestFinance) {
     changes.push({
       id: 'finance-change',
-      title: '最新财务变化',
+      title: financeNote ? '最近已知财务变化' : '最新财务变化',
       value: `营收 ${signedPct(latestFinance.revenue_yoy)} · 净利 ${signedPct(latestFinance.net_profit_yoy)}`,
-      detail: `${latestFinance.report_name}累计口径，财报披露存在滞后。`,
+      detail: `${latestFinance.report_name}累计口径，财报披露存在滞后。${financeNote}`,
       evidence: `ROE ${latestFinance.roe.toFixed(2)}%，毛利率 ${latestFinance.gross_margin.toFixed(2)}%`,
       source: '东财 F10',
       asOf: latestFinance.report_date,
@@ -273,15 +275,16 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
   }
 
   if (input.fundflow?.days.length) {
+    const flowNote = input.fundflow.note || (!input.fundflow.fresh ? '缓存偏旧，请核对数据日期。' : '')
     changes.push({
       id: 'fundflow-change',
-      title: '近 5 日主力资金',
+      title: flowNote ? '最近已知主力资金' : '近 5 日主力资金',
       value: `${input.fundflow.main_net_5d_yi > 0 ? '+' : ''}${input.fundflow.main_net_5d_yi.toFixed(2)} 亿元`,
-      detail: input.fundflow.streak_days > 0
+      detail: (input.fundflow.streak_days > 0
         ? `连续净流入 ${input.fundflow.streak_days} 天。`
         : input.fundflow.streak_days < 0
           ? `连续净流出 ${-input.fundflow.streak_days} 天。`
-          : '当前没有连续流入或流出记录。',
+          : '当前没有连续流入或流出记录。') + (flowNote ? ` ${flowNote}` : ''),
       evidence: '主力净额为超大单与大单净额之和，不代表价格必然方向',
       source: '东财资金流',
       asOf: input.fundflow.last_date || 'unknown',
@@ -302,8 +305,10 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
     })
   }
 
-  const nextLift = (input.corpEvents?.lifts || [])
-    .filter((item) => timestamp(`${item.free_date}T00:00:00`) >= (input.now || new Date()).getTime())
+  const today = new Date(input.now || new Date())
+  today.setHours(0, 0, 0, 0)
+  const nextLift = (input.corpEvents?.lift_unavailable ? [] : input.corpEvents?.lifts || [])
+    .filter((item) => timestamp(`${item.free_date}T00:00:00`) >= today.getTime())
     .sort((a, b) => a.free_date.localeCompare(b.free_date))[0]
   if (nextLift) {
     risks.push({
@@ -340,7 +345,7 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
       title: '日内波动较大',
       value: `${amplitude.toFixed(2)}%`,
       detail: '振幅达到 7% 规则阈值，价格波动风险需要额外关注。',
-      evidence: `最高 ${q.high.toFixed(2)} 元，最低 ${q.low.toFixed(2)} 元`,
+      evidence: `最高 ${formatPrice(q.high)} 元，最低 ${formatPrice(q.low)} 元`,
       source: input.valuation?.source || q.source || '行情聚合',
       asOf: input.valuation?.data_time || q.data_time || 'unknown',
       tone: 'warning',
@@ -389,6 +394,7 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
   if (input.eventPartial) invalidation.push('事件证据仅预取公司行动，公告与新闻尚未加载')
   else if (phaseUnknown(input.eventPhase)) invalidation.push('事件证据未完成加载')
   if (phaseUnknown(input.fundamentalPhase)) invalidation.push('基本面证据未完成加载')
+  else if (financeNote) invalidation.push(financeNote)
   if (input.score?.data_limited) invalidation.push('技术评分样本不足')
 
   return {

@@ -208,7 +208,13 @@ func migrateScreenerStrategyRevisions(db *gorm.DB) error {
 				}).Create(&candidate).Error; err != nil {
 					return err
 				}
-				if err := tx.Where("strategy_id = ? AND revision = ?", strategy.ID, 1).First(&baseline).Error; err != nil {
+				// 并发实例可能在上面的缺失查询后创建基线。MySQL 的 INSERT 冲突
+				// 等待结束后必须用当前读，不能继续使用查询缺失时的可重复读快照。
+				baselineQuery := tx.Where("strategy_id = ? AND revision = ?", strategy.ID, 1)
+				if tx.Dialector.Name() == "mysql" {
+					baselineQuery = baselineQuery.Clauses(clause.Locking{Strength: "UPDATE"})
+				}
+				if err := baselineQuery.First(&baseline).Error; err != nil {
 					return err
 				}
 				if baseline.UserID != strategy.UserID {

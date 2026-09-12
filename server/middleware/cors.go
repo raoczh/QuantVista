@@ -15,11 +15,12 @@ import (
 func CORS() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		origin := c.Request.Header.Get("Origin")
+		c.Writer.Header().Add("Vary", "Origin")
 		if origin != "" && corsAllowed(origin) {
 			c.Header("Access-Control-Allow-Origin", origin)
 			c.Header("Access-Control-Allow-Credentials", "true")
 			c.Header("Access-Control-Allow-Headers",
-				"Origin, Content-Type, Authorization, Accept")
+				"Origin, Content-Type, Authorization, Accept, Last-Event-ID")
 			c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		}
 		if c.Request.Method == http.MethodOptions {

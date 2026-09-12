@@ -15,8 +15,9 @@ function triggerDownload(blob: Blob, filename: string) {
 }
 
 // 下载 CSV 导出（走带鉴权的 axios 实例；window.open 带不上 Authorization）。
-export async function downloadExport(kind: ExportKind) {
+export async function downloadExport(kind: ExportKind, isCurrent = () => true) {
   const resp = await http.get(`/export/${kind}`, { responseType: 'blob' })
+  if (!isCurrent()) return
   const contentType = String(resp.headers['content-type'] || '')
   if (contentType.includes('application/json')) {
     // 出错时后端返回 JSON envelope，被 blob 包了一层。

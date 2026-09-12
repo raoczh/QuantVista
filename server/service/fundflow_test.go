@@ -108,28 +108,29 @@ func TestEnsureStockFundFlowCache(t *testing.T) {
 		called++
 		return nil, 0, errTestUpstream
 	})
-	// 库存末行 = 上一开市日（无日历回退往前工作日）→ 新鲜，不打上游。
-	fresh := prevOpenTradeDate(time.Now().Format("2006-01-02"))
+	// 固定盘中时钟；盘后缺今日数据应补拉，由独立盘后用例覆盖。
+	now := time.Date(2026, 9, 9, 10, 0, 0, 0, time.Local)
+	fresh := prevOpenTradeDate(now.Format("2006-01-02"))
 	common.DB.Create(&model.FundFlowDaily{Symbol: "000998", Market: "cn", TradeDate: fresh, MainNet: 1})
-	flows, ok := ensureStockFundFlow(context.Background(), em, "cn", "000998", nil)
+	flows, ok := ensureStockFundFlowAt(context.Background(), em, "cn", "000998", nil, now)
 	if !ok || len(flows) != 1 || called != 0 {
 		t.Errorf("新鲜库存应直接返回：ok=%v n=%d called=%d", ok, len(flows), called)
 	}
 	// 陈旧库存 + 上游失败：返回旧库存（stale 也比没有强）。
 	common.DB.Create(&model.FundFlowDaily{Symbol: "000999", Market: "cn", TradeDate: "2026-01-05", MainNet: 2})
-	flows2, ok2 := ensureStockFundFlow(context.Background(), em, "cn", "000999", nil)
+	flows2, ok2 := ensureStockFundFlowAt(context.Background(), em, "cn", "000999", nil, now)
 	if ok2 || len(flows2) != 1 || called != 1 {
 		t.Errorf("上游失败应返回旧库存：ok=%v n=%d called=%d", ok2, len(flows2), called)
 	}
 	// 冷却：1h 内同标的不再打上游。
-	ensureStockFundFlow(context.Background(), em, "cn", "000999", nil)
+	ensureStockFundFlowAt(context.Background(), em, "cn", "000999", nil, now)
 	if called != 1 {
 		t.Errorf("冷却期内不应再打上游，called=%d", called)
 	}
 	// 预算耗尽：不打上游。
 	budget := 0
 	common.DB.Create(&model.FundFlowDaily{Symbol: "000997", Market: "cn", TradeDate: "2026-01-05", MainNet: 3})
-	ensureStockFundFlow(context.Background(), em, "cn", "000997", &budget)
+	ensureStockFundFlowAt(context.Background(), em, "cn", "000997", &budget, now)
 	if called != 1 {
 		t.Errorf("预算 0 不应打上游，called=%d", called)
 	}

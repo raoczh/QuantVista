@@ -82,6 +82,7 @@ func resetRecommendationPreheatState(t *testing.T) {
 	finSyncMu.Unlock()
 	fflowTryMu.Lock()
 	fflowTry = map[string]time.Time{}
+	fflowAttempts = map[string]*fflowAttempt{}
 	fflowTryMu.Unlock()
 }
 

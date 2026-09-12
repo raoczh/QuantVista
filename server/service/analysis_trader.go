@@ -105,7 +105,7 @@ func (s *AnalysisService) attachTradePlan(ctx context.Context, userID int64, cfg
 	resJSON, _ := json.Marshal(result)
 	messages := []chatMessage{
 		{Role: "system", Content: tradePlanSystem},
-		{Role: "user", Content: fmt.Sprintf("现价：%.2f\n\n【数据快照】（JSON）：\n%s\n\n【分析结论】（JSON）：\n%s",
+		{Role: "user", Content: fmt.Sprintf("现价：%g\n\n【数据快照】（JSON）：\n%s\n\n【分析结论】（JSON）：\n%s",
 			px, string(snapJSON), string(resJSON))},
 	}
 	// P1-2：schema v2 = 输出新增 invalidators（计划失效条件）字段。
@@ -119,6 +119,15 @@ func (s *AnalysisService) attachTradePlan(ctx context.Context, userID int64, cfg
 			return perr
 		}
 		if !p.NoPlan {
+			// 用最终交付的最小价位先归一再校验，ETF 保留三位，股票保留两位。
+			roundPrice := round2
+			if normalizeMarketOnly(req.Market) == "cn" && isCNFund(req.Symbol) {
+				roundPrice = round3
+			}
+			p.BuyLow = roundPrice(p.BuyLow)
+			p.BuyHigh = roundPrice(p.BuyHigh)
+			p.TargetPrice = roundPrice(p.TargetPrice)
+			p.StopPrice = roundPrice(p.StopPrice)
 			// P0-4 统一收口：既有专属校验（validateTradePlan，恒开）+ 跨字段上下文
 			// 一致性（risk gate block/评级偏空反证，flag 控）。
 			if verr := validateTradePlanSemantics(px, p, result.Rating, snapshot); verr != nil {
@@ -144,10 +153,6 @@ func (s *AnalysisService) attachTradePlan(ctx context.Context, userID int64, cfg
 		return usage, run
 	}
 
-	plan.BuyLow = round2(plan.BuyLow)
-	plan.BuyHigh = round2(plan.BuyHigh)
-	plan.TargetPrice = round2(plan.TargetPrice)
-	plan.StopPrice = round2(plan.StopPrice)
 	plan.PlanNote = truncateRunes(strings.TrimSpace(plan.PlanNote), 300)
 	if len(plan.Checklist) > 8 {
 		plan.Checklist = plan.Checklist[:8]
@@ -221,7 +226,7 @@ func validateTradePlan(px float64, p *tradePlan) error {
 		return errors.New("buy_low 不得高于 buy_high")
 	}
 	if p.StopPrice >= px {
-		return fmt.Errorf("止损价 %.2f 必须低于现价 %.2f（硬纪律）", p.StopPrice, px)
+		return fmt.Errorf("止损价 %g 必须低于现价 %g（硬纪律）", p.StopPrice, px)
 	}
 	if p.StopPrice >= p.BuyLow {
 		return errors.New("止损价必须低于买入区间下沿")
@@ -248,7 +253,7 @@ func applyPlanDiscipline(p *tradePlan, pos *positionAdvice) {
 	}
 	rr := (p.TargetPrice - entry) / risk
 	p.RRRatio = round2(rr)
-	if rr < 2 {
+	if rr < 2-1e-9 {
 		if pos != nil && pos.PositionPct > 0 {
 			pos.PositionPct = round2(pos.PositionPct * 0.5)
 		}

@@ -65,7 +65,9 @@ export function enumListQuery<T extends string>(values: readonly T[], maxItems =
 export function integerQuery(fallback: number, min: number, max: number): QueryCodec<number> {
   return {
     parse: (raw) => {
-      const value = Number(queryString(raw))
+      const text = queryString(raw).trim()
+      if (!text) return fallback
+      const value = Number(text)
       return Number.isInteger(value) && value >= min && value <= max ? value : fallback
     },
     format: (value) =>
@@ -77,7 +79,9 @@ export function integerEnumQuery(fallback: number, values: readonly number[]): Q
   const allowed = new Set(values)
   return {
     parse: (raw) => {
-      const value = Number(queryString(raw))
+      const text = queryString(raw).trim()
+      if (!text) return fallback
+      const value = Number(text)
       return Number.isInteger(value) && allowed.has(value) ? value : fallback
     },
     format: (value) => (Number.isInteger(value) && allowed.has(value) && value !== fallback ? String(value) : undefined),
@@ -87,7 +91,9 @@ export function integerEnumQuery(fallback: number, values: readonly number[]): Q
 export function numberQuery(fallback: number, min: number, max: number): QueryCodec<number> {
   return {
     parse: (raw) => {
-      const value = Number(queryString(raw))
+      const text = queryString(raw).trim()
+      if (!text) return fallback
+      const value = Number(text)
       return Number.isFinite(value) && value >= min && value <= max ? value : fallback
     },
     format: (value) =>
@@ -146,6 +152,20 @@ function rawMatches(raw: RawQueryValue | undefined, expected: string | undefined
   return typeof raw === 'string' && raw === expected
 }
 
+// 父页和嵌入页可能各自拥有一组参数。串行合并当前路由，防止两次异步 replace
+// 都从旧 query 出发，使后一份导航抹掉前一份已提交的参数。
+const querySyncTurns = new WeakMap<Router, Promise<void>>()
+async function withQuerySyncTurn(router: Router, update: () => Promise<void>) {
+  const previous = querySyncTurns.get(router) || Promise.resolve()
+  const current = previous.then(update, update)
+  querySyncTurns.set(router, current)
+  try {
+    await current
+  } finally {
+    if (querySyncTurns.get(router) === current) querySyncTurns.delete(router)
+  }
+}
+
 // 只拥有 bindings 中声明的键；其余 query（包括一次性深链）始终从当前路由合并保留。
 export function useRouteQueryState(
   route: RouteLocationNormalizedLoaded,
@@ -156,8 +176,12 @@ export function useRouteQueryState(
   let applyingRoute = false
   let scheduled = false
   let active = true
+  let syncing = false
+  let resync = false
+  let syncTarget: { path: string; hash: string; values: Array<string | undefined> } | null = null
 
   function applyRoute() {
+    if (!active || route.name !== ownerName) return
     applyingRoute = true
     for (const binding of bindings) binding.write(binding.parse(route.query[binding.key]))
     applyingRoute = false
@@ -166,18 +190,31 @@ export function useRouteQueryState(
   async function syncQueryNow() {
     scheduled = false
     if (!active || applyingRoute || route.name !== ownerName) return
+    if (syncing) { resync = true; return }
 
-    const query = { ...route.query }
-    let changed = false
-    for (const binding of bindings) {
-      const expected = binding.format(binding.read())
-      if (rawMatches(route.query[binding.key], expected)) continue
-      changed = true
-      if (expected === undefined) delete query[binding.key]
-      else query[binding.key] = expected
+    syncing = true
+    try {
+      await withQuerySyncTurn(router, async () => {
+        if (!active || applyingRoute || route.name !== ownerName) return
+        const query = { ...route.query }
+        const values = bindings.map((binding) => binding.format(binding.read()))
+        let changed = false
+        for (const [index, binding] of bindings.entries()) {
+          const expected = values[index]
+          if (rawMatches(route.query[binding.key], expected)) continue
+          changed = true
+          if (expected === undefined) delete query[binding.key]
+          else query[binding.key] = expected
+        }
+        if (!changed) return
+        syncTarget = { path: route.path, hash: route.hash, values }
+        await router.replace({ path: route.path, query, hash: route.hash }).catch(() => undefined)
+      })
+    } finally {
+      syncing = false
+      syncTarget = null
+      if (resync) { resync = false; scheduleSync() }
     }
-    if (!changed) return
-    await router.replace({ path: route.path, query, hash: route.hash }).catch(() => undefined)
   }
 
   function scheduleSync() {
@@ -189,8 +226,23 @@ export function useRouteQueryState(
   applyRoute()
   watch(
     () => bindings.map((binding) => route.query[binding.key]),
-    () => {
-      applyRoute()
+    (values, previous) => {
+      if (!active || route.name !== ownerName) return
+      const target = syncTarget
+      const ownUpdate = target?.path === route.path && target.hash === route.hash &&
+        values.every((value, index) => rawMatches(value, target.values[index]))
+      applyingRoute = true
+      for (const [index, binding] of bindings.entries()) {
+        if (ownUpdate) {
+          // 写 URL 期间继续输入/加载偏好，只规范化仍等于本次提交快照的字段。
+          if (binding.format(binding.read()) !== target.values[index]) continue
+        } else if (JSON.stringify(values[index]) === JSON.stringify(previous[index])) {
+          // 另一参数的导航不能把尚未同步的草稿重置为旧 URL 默认值。
+          continue
+        }
+        binding.write(binding.parse(values[index]))
+      }
+      applyingRoute = false
       scheduleSync()
     },
     { flush: 'sync' },
@@ -217,16 +269,21 @@ export async function replaceRouteQuery(
   router: Router,
   patch: Record<string, string | number | undefined>,
 ) {
-  const query = { ...route.query }
-  let changed = false
-  for (const [key, value] of Object.entries(patch)) {
-    const expected = value === undefined ? undefined : String(value)
-    if (rawMatches(route.query[key], expected)) continue
-    changed = true
-    if (expected === undefined) delete query[key]
-    else query[key] = expected
-  }
-  if (changed) await router.replace({ path: route.path, query, hash: route.hash }).catch(() => undefined)
+  const ownerName = route.name
+  const ownerPath = route.path
+  await withQuerySyncTurn(router, async () => {
+    if (route.name !== ownerName || route.path !== ownerPath) return
+    const query = { ...route.query }
+    let changed = false
+    for (const [key, value] of Object.entries(patch)) {
+      const expected = value === undefined ? undefined : String(value)
+      if (rawMatches(route.query[key], expected)) continue
+      changed = true
+      if (expected === undefined) delete query[key]
+      else query[key] = expected
+    }
+    if (changed) await router.replace({ path: route.path, query, hash: route.hash }).catch(() => undefined)
+  })
 }
 
 interface ScrollEntry {
@@ -278,6 +335,7 @@ export function useListPageScroll(route: RouteLocationNormalizedLoaded, routeKey
   let currentEntry = browserEntryID()
   let currentPath = route.fullPath
   let scrollTimer = 0
+  let active = true
 
   function readStore(): ScrollStore {
     if (!userID) return { version: 1, entries: [] }
@@ -293,7 +351,7 @@ export function useListPageScroll(route: RouteLocationNormalizedLoaded, routeKey
         : []
       return { version: 1, entries }
     } catch {
-      sessionStorage.removeItem(storageKey)
+      try { sessionStorage.removeItem(storageKey) } catch { /* 禁用存储时清理同样可能失败。 */ }
       return { version: 1, entries: [] }
     }
   }
@@ -308,7 +366,7 @@ export function useListPageScroll(route: RouteLocationNormalizedLoaded, routeKey
   }
 
   function saveScroll() {
-    if (!userID || route.name !== ownerName) return
+    if (!active || !userID || auth.user?.id !== userID || route.name !== ownerName) return
     const now = Date.now()
     const top = Math.min(Math.max(window.scrollY || 0, 0), MAX_SCROLL_TOP)
     const store = readStore()
@@ -328,16 +386,18 @@ export function useListPageScroll(route: RouteLocationNormalizedLoaded, routeKey
   }
 
   async function restoreScroll() {
-    if (!userID || route.name !== ownerName) return false
+    if (!active || !userID || auth.user?.id !== userID || route.name !== ownerName) return false
+    const entryID = currentEntry
+    const path = currentPath
     const matched = readStore().entries.find(
-      (entry) => entry.entry === currentEntry && entry.path === currentPath,
+      (entry) => entry.entry === entryID && entry.path === path,
     )
     if (!matched) return false
     await nextTick()
     await new Promise<void>((resolve) =>
       window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())),
     )
-    if (route.name !== ownerName || route.fullPath !== currentPath) return false
+    if (!active || auth.user?.id !== userID || route.name !== ownerName || route.fullPath !== path || currentEntry !== entryID) return false
     window.scrollTo({ top: matched.top, behavior: 'auto' })
     return true
   }
@@ -365,6 +425,7 @@ export function useListPageScroll(route: RouteLocationNormalizedLoaded, routeKey
   )
   onBeforeUnmount(() => {
     saveScroll()
+    active = false
     window.removeEventListener('scroll', onScroll)
     if (scrollTimer) window.clearTimeout(scrollTimer)
   })

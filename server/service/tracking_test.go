@@ -277,9 +277,10 @@ func TestUpsertStatusIdempotent(t *testing.T) {
 	setupTestDB(t)
 	common.DB.Exec("DELETE FROM recommendation_statuses")
 	svc := &TrackingService{}
+	batch, rec := seedLinkFixture(t, 1, "600000", model.RecTypeShortTerm, model.RecStatusSuccess)
 
 	st := &model.RecommendationStatus{
-		RecommendationID: 1, BatchID: 1, UserID: 1, Symbol: "600000", Market: "cn",
+		RecommendationID: rec.ID, BatchID: batch.ID, UserID: 1, Symbol: "600000", Market: "cn",
 		Type: model.RecTypeShortTerm, Action: model.RecActionBuy, RefPrice: 10,
 		ReturnPct: 5, Outcome: model.RecOutcomeActive,
 	}
@@ -293,12 +294,12 @@ func TestUpsertStatusIdempotent(t *testing.T) {
 	}
 
 	var cnt int64
-	common.DB.Model(&model.RecommendationStatus{}).Where("recommendation_id = ?", 1).Count(&cnt)
+	common.DB.Model(&model.RecommendationStatus{}).Where("recommendation_id = ?", rec.ID).Count(&cnt)
 	if cnt != 1 {
 		t.Fatalf("应只有 1 行（幂等），得到 %d", cnt)
 	}
 	var got model.RecommendationStatus
-	common.DB.Where("recommendation_id = ?", 1).First(&got)
+	common.DB.Where("recommendation_id = ?", rec.ID).First(&got)
 	if got.ReturnPct != 12 || got.Outcome != model.RecOutcomeTakeProfit {
 		t.Fatalf("二次 upsert 应覆盖: %+v", got)
 	}
@@ -457,7 +458,10 @@ func TestRefreshBatchesFreezeTerminal(t *testing.T) {
 	}
 
 	svc := &TrackingService{} // nil market：终态冻结路径不得触碰上游，否则会 panic
-	n := svc.refreshBatches(context.Background(), []model.RecommendationBatch{batch})
+	n, err := svc.refreshBatches(context.Background(), []model.RecommendationBatch{batch})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if n != 0 {
 		t.Fatalf("全部终态冻结应处理 0 条，得到 %d", n)
 	}

@@ -751,7 +751,7 @@ func TestAlphaBucketIndex(t *testing.T) {
 			t.Errorf("alpha=%v 应落桶 %d，得到 %d", c.a, c.want, got)
 		}
 	}
-	if alphaBucketLabel(0) != "<-10%" || alphaBucketLabel(5) != ">+10%" {
+	if alphaBucketLabel(0) != "<-10%" || alphaBucketLabel(5) != "≥+10%" {
 		t.Errorf("端桶标签错误: %s / %s", alphaBucketLabel(0), alphaBucketLabel(5))
 	}
 }

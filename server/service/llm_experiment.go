@@ -112,7 +112,11 @@ func loadExperimentPromptBaselineMode(db *gorm.DB, userID int64, promptModule st
 		}
 		generation, generationKnown = state.Generation, true
 	} else {
-		generation, generationKnown = promptChampionGeneration(db, userID, promptModule)
+		var err error
+		generation, generationKnown, err = promptChampionGeneration(db, userID, promptModule)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var row model.PromptTemplate
 	err := db.Where("user_id = ? AND module = ?", userID, promptModule).First(&row).Error
@@ -890,40 +894,83 @@ type LLMExperimentView struct {
 
 // ListLLMExperiments 全部实验（管理端；按 id 倒序）。
 func ListLLMExperiments() ([]LLMExperimentView, error) {
-	var rows []model.LLMExperiment
-	if err := common.DB.Order("id DESC").Limit(200).Find(&rows).Error; err != nil {
+	var out []LLMExperimentView
+	err := readSnapshotTx(context.Background(), func(tx *gorm.DB) error {
+		var rows []model.LLMExperiment
+		if err := tx.Order("id DESC").Limit(200).Find(&rows).Error; err != nil {
+			return err
+		}
+		out = make([]LLMExperimentView, 0, len(rows))
+		type baselineKey struct {
+			userID int64
+			module string
+		}
+		baselines := make(map[baselineKey]*experimentPromptBaseline)
+		for i := range rows {
+			exp := &rows[i]
+			baselineStale, rollbackStale := exp.BaselineInvalidReason, ""
+			checkBaseline := baselineStale == "" && (exp.Status == model.ExpStatusDraft ||
+				exp.Status == model.ExpStatusRunning || exp.Status == model.ExpStatusCompleted)
+			if checkBaseline || exp.Status == model.ExpStatusPromoted {
+				key := baselineKey{userID: exp.UserID, module: exp.PromptModule}
+				current := baselines[key]
+				if current == nil {
+					var err error
+					current, err = loadExperimentPromptBaseline(tx, exp.UserID, exp.PromptModule)
+					if err != nil {
+						return err
+					}
+					baselines[key] = current
+				}
+				if checkBaseline {
+					baselineStale = experimentBaselineStaleReason(exp, current)
+				}
+				rollbackStale = experimentRollbackStaleForBaseline(exp, current)
+			}
+			out = append(out, LLMExperimentView{LLMExperiment: *exp, RollbackStale: rollbackStale, BaselineStale: baselineStale})
+		}
+		return nil
+	})
+	return out, err
+}
+
+type LLMExperimentDetailView struct {
+	Experiment *model.LLMExperiment     `json:"experiment"`
+	Runs       []model.LLMExperimentRun `json:"runs"`
+	Audits     []model.LLMReleaseAudit  `json:"audits"`
+}
+
+// GetLLMExperimentDetail 让实验状态、样本和最近审计来自同一只读快照。
+func GetLLMExperimentDetail(id int64) (*LLMExperimentDetailView, error) {
+	exp := &model.LLMExperiment{}
+	view := &LLMExperimentDetailView{Experiment: exp}
+	err := readSnapshotTx(context.Background(), func(tx *gorm.DB) error {
+		if err := tx.First(exp, id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("实验不存在")
+			}
+			return err
+		}
+		if err := tx.Where("experiment_id = ?", exp.ID).Order("id DESC").Limit(200).Find(&view.Runs).Error; err != nil {
+			return err
+		}
+		var err error
+		view.Audits, err = listLLMReleaseAuditsDB(tx, exp.ID)
+		return err
+	})
+	if err != nil {
 		return nil, err
 	}
-	out := make([]LLMExperimentView, 0, len(rows))
-	for i := range rows {
-		baselineStale := rows[i].BaselineInvalidReason
-		if baselineStale == "" && (rows[i].Status == model.ExpStatusDraft ||
-			rows[i].Status == model.ExpStatusRunning || rows[i].Status == model.ExpStatusCompleted) {
-			_, reason, err := validateExperimentCurrentBaseline(common.DB, &rows[i])
-			if err != nil {
-				return nil, err
-			}
-			baselineStale = reason
-		}
-		out = append(out, LLMExperimentView{
-			LLMExperiment: rows[i], RollbackStale: experimentRollbackStale(&rows[i]),
-			BaselineStale: baselineStale,
-		})
-	}
-	return out, nil
+	return view, nil
 }
 
 // LLMExperimentDetail 实验 + 影子样本明细。
 func LLMExperimentDetail(id int64) (*model.LLMExperiment, []model.LLMExperimentRun, error) {
-	var exp model.LLMExperiment
-	if err := common.DB.First(&exp, id).Error; err != nil {
-		return nil, nil, errors.New("实验不存在")
-	}
-	var runs []model.LLMExperimentRun
-	if err := common.DB.Where("experiment_id = ?", exp.ID).Order("id DESC").Limit(200).Find(&runs).Error; err != nil {
+	view, err := GetLLMExperimentDetail(id)
+	if err != nil {
 		return nil, nil, err
 	}
-	return &exp, runs, nil
+	return view.Experiment, view.Runs, nil
 }
 
 // ---------- 影子采样钩子（推荐 runGeneration 主调成功后调用） ----------
@@ -1321,7 +1368,7 @@ func (s *RecommendationService) maybeChallengerShadow(ctx context.Context, plan 
 	params := chatParams{
 		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 		ReasoningEffort: cfg.ReasoningEffort,
-		Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("experiment", cfg.MaxTokens),
+		Temperature:     cfg.Temperature, MaxTokens: moduleTokenCap("experiment", cfg.MaxTokens),
 		Messages: messages, JSONMode: true, AllowPrivate: plan.allowPrivate,
 		Meta: run.chatMeta(plan.userID, cfg, 1),
 	}
@@ -1373,7 +1420,7 @@ func (s *RecommendationService) maybeChallengerShadow(ctx context.Context, plan 
 	if res != nil {
 		row.ChallengerTokens = res.Usage.TotalTokens
 		if res.Usage.TotalTokens > 0 {
-			consumeQuota(plan.userID, res.Usage.TotalTokens, false)
+			consumeQuota(plan.userID, res.Usage.TotalTokens)
 		}
 	}
 	if callErr != nil {

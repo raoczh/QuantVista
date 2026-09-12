@@ -15,7 +15,6 @@ import (
 	"quantvista/model"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 type PortfolioRiskService struct {
@@ -81,12 +80,10 @@ type PortfolioRiskView struct {
 	DataVersion          string                 `json:"data_version"`
 }
 
-func (s *PortfolioRiskService) currentHoldings(ctx context.Context, account *model.PortfolioAccount) ([]PortfolioHoldingWeight, []RebalanceHolding, *PortfolioExposure, error) {
+func (s *PortfolioRiskService) currentHoldings(ctx context.Context, state *portfolioRiskLedger) ([]PortfolioHoldingWeight, []RebalanceHolding, *PortfolioExposure, error) {
+	account := &state.account
 	if account.Kind == model.PortfolioKindReal {
-		var rows []model.Position
-		if err := common.DB.Where("user_id = ? AND account_id = ? AND status = ?", account.UserID, account.ID, model.PositionStatusHolding).Order("id ASC").Find(&rows).Error; err != nil {
-			return nil, nil, nil, err
-		}
+		rows := state.realHoldings
 		refs := make([]QuoteRef, 0, len(rows))
 		symbols := make([]string, 0, len(rows))
 		seenRefs := map[string]bool{}
@@ -108,6 +105,12 @@ func (s *PortfolioRiskService) currentHoldings(ctx context.Context, account *mod
 		}
 		industries := industriesFor(symbols)
 		total := 0.0
+		currencyIssues := map[string]string{}
+		for _, p := range rows {
+			if reason := positionCurrencyIssue(p, account.Currency); reason != "" {
+				currencyIssues[QuoteKey(p.Market, p.Symbol)] = reason
+			}
+		}
 		agg := map[string]*PortfolioHoldingWeight{}
 		reb := map[string]*RebalanceHolding{}
 		exposureViews := make([]PositionView, 0, len(rows))
@@ -121,6 +124,12 @@ func (s *PortfolioRiskService) currentHoldings(ctx context.Context, account *mod
 				if note, _ := stockFreshnessNote(fq.Fresh, fq.Quote.DataTime); note != "" {
 					reason = note
 				}
+			}
+			if issue := currencyIssues[key]; issue != "" {
+				fresh, reason = false, issue
+			}
+			if issue := state.valuationGaps[key]; issue != "" {
+				fresh, reason = false, issue
 			}
 			if agg[key] == nil {
 				valuation := valuations[key]
@@ -166,10 +175,7 @@ func (s *PortfolioRiskService) currentHoldings(ctx context.Context, account *mod
 		}
 		return out, rb, computeExposure(exposureViews, industries, valuations, skipped), nil
 	}
-	var rows []model.PaperHolding
-	if err := common.DB.Where("user_id = ? AND account_id = ?", account.UserID, account.ID).Find(&rows).Error; err != nil {
-		return nil, nil, nil, err
-	}
+	rows := state.paperHoldings
 	refs := make([]QuoteRef, 0, len(rows))
 	symbols := make([]string, 0, len(rows))
 	for _, h := range rows {
@@ -191,11 +197,17 @@ func (s *PortfolioRiskService) currentHoldings(ctx context.Context, account *mod
 	total := 0.0
 	for _, h := range rows {
 		fq, ok := quotes[QuoteKey(h.Market, h.Symbol)]
+		currencyIssue := positionCurrencyIssue(model.Position{Market: h.Market}, account.Currency)
+		if issue := state.valuationGaps[QuoteKey(h.Market, h.Symbol)]; issue != "" {
+			currencyIssue = issue
+		}
 		valuation := valuations[QuoteKey(h.Market, h.Symbol)]
 		v := PortfolioHoldingWeight{Symbol: h.Symbol, Market: h.Market, Name: h.Name, Industry: industries[h.Symbol], Quantity: h.Quantity, Status: RiskStatusUnavailable, Reason: "缺少 fresh 价格", ValuationKnown: valuation != nil && valuation.PETTM != 0}
 		r := RebalanceHolding{Symbol: h.Symbol, Name: h.Name, Market: h.Market, Industry: industries[h.Symbol], Quantity: h.Quantity, FreshnessReason: "缺少 fresh 价格"}
 		exposureView := PositionView{Position: model.Position{UserID: account.UserID, AccountID: account.ID, Symbol: h.Symbol, Market: h.Market, Name: h.Name, Quantity: h.Quantity, BuyPrice: h.AvgCost, Status: model.PositionStatusHolding}}
-		if ok && fq.Quote != nil && fq.Quote.Price > 0 && fq.Fresh.Status == freshStatusFresh {
+		if currencyIssue != "" {
+			v.Reason, r.FreshnessReason = currencyIssue, currencyIssue
+		} else if ok && fq.Quote != nil && fq.Quote.Price > 0 && fq.Fresh.Status == freshStatusFresh {
 			v.Status = RiskStatusAvailable
 			v.Reason = ""
 			v.Price = fq.Quote.Price
@@ -238,15 +250,12 @@ func (s *PortfolioRiskService) currentHoldings(ctx context.Context, account *mod
 }
 
 func (s *PortfolioRiskService) Overview(ctx context.Context, userID, accountID int64) (*PortfolioOverviewView, error) {
-	account, err := PortfolioAccountByID(userID, accountID, "")
-	if err != nil {
-		return nil, err
-	}
-	holdings, _, exposure, err := s.currentHoldings(ctx, account)
-	if err != nil {
-		return nil, err
-	}
-	out := &PortfolioOverviewView{Account: account, AsOf: time.Now().Format("2006-01-02"), Holdings: holdings, Exposure: exposure, PartialReasons: []string{}, DataVersion: portfolioRiskVersion, HoldingCount: len(holdings)}
+	out, _, err := s.overviewWithHoldings(ctx, userID, accountID)
+	return out, err
+}
+
+func portfolioOverviewFromLedger(state *portfolioRiskLedger, holdings []PortfolioHoldingWeight, exposure *PortfolioExposure) *PortfolioOverviewView {
+	out := &PortfolioOverviewView{Account: &state.account, AsOf: state.asOf, Holdings: holdings, Exposure: exposure, PartialReasons: []string{}, DataVersion: portfolioRiskVersion, HoldingCount: len(holdings)}
 	for _, h := range holdings {
 		if h.Status == RiskStatusAvailable {
 			out.PricedCount++
@@ -261,29 +270,15 @@ func (s *PortfolioRiskService) Overview(ctx context.Context, userID, accountID i
 	} else {
 		out.CoveragePct = 100
 	}
-	if account.Kind == model.PortfolioKindPaper {
-		var cash model.PaperAccount
-		if err := common.DB.Where("user_id = ? AND account_id = ?", userID, accountID).First(&cash).Error; err != nil {
-			return nil, err
-		}
-		out.Cash = available(cash.Cash, 1)
-		out.TotalAssets = available(round2(cash.Cash+out.MarketValue), out.PricedCount)
+	out.Cash = state.cash
+	if out.Cash.Status == RiskStatusAvailable {
+		out.TotalAssets = available(round2(out.Cash.Value+out.MarketValue), out.PricedCount)
 	} else {
-		cash, reason, err := realCashBalance(common.DB, userID, accountID, out.AsOf)
-		if err != nil {
-			return nil, err
-		}
-		if reason != "" {
-			out.Cash = unavailable(reason, 0)
-			out.TotalAssets = unavailable("真实账户缺少完整现金流事实，不能给出完整总资产", out.PricedCount)
-			out.PartialReasons = append(out.PartialReasons, reason)
-		} else {
-			out.Cash = available(cash, 1)
-			out.TotalAssets = available(round2(cash+out.MarketValue), out.PricedCount)
-		}
+		out.TotalAssets = unavailable(out.Cash.Reason, out.PricedCount)
+		out.PartialReasons = append(out.PartialReasons, out.Cash.Reason)
 	}
 	if out.PricedCount < out.HoldingCount {
-		out.TotalAssets = unavailable("部分持仓缺少 fresh 价格，完整总资产不可用", out.PricedCount)
+		out.TotalAssets = unavailable("部分持仓价格或币种口径不可用，无法计算完整总资产", out.PricedCount)
 	}
 	if out.TotalAssets.Status == RiskStatusAvailable && out.TotalAssets.Value > 0 {
 		for i := range holdings {
@@ -297,7 +292,7 @@ func (s *PortfolioRiskService) Overview(ctx context.Context, userID, accountID i
 	}
 	out.TopNWeightPct = round2(out.TopNWeightPct)
 	out.Holdings = holdings
-	return out, nil
+	return out
 }
 
 func realCashBalance(db *gorm.DB, userID, accountID int64, asOf string) (float64, string, error) {
@@ -338,7 +333,12 @@ func realCashBalance(db *gorm.DB, userID, accountID int64, asOf string) (float64
 	if err := db.Where("user_id = ? AND account_id = ? AND (buy_date = '' OR buy_date <= ?)", userID, accountID, asOf).Find(&positions).Error; err != nil {
 		return 0, "", err
 	}
+	knownPositions := make(map[int64]bool, len(positions))
 	for _, p := range positions {
+		knownPositions[p.ID] = true
+		if reason := positionCurrencyIssue(p, "CNY"); reason != "" {
+			return 0, reason, nil
+		}
 		if _, ok := tradePositionIDs[p.ID]; ok {
 			continue
 		}
@@ -374,6 +374,11 @@ func realCashBalance(db *gorm.DB, userID, accountID int64, asOf string) (float64
 		}
 		return 0, "存在无法由旧持仓字段重建的历史现金影响", nil
 	}
+	for id := range tradePositionIDs {
+		if !knownPositions[id] {
+			return 0, "交易缺少对应持仓，无法核验现金币种口径", nil
+		}
+	}
 	return round2(cash), "", nil
 }
 func isReversedFlow(flows []model.PortfolioCashFlow, id int64) bool {
@@ -385,14 +390,26 @@ func isReversedFlow(flows []model.PortfolioCashFlow, id int64) bool {
 	return false
 }
 
-func (s *PortfolioRiskService) equityPoints(account *model.PortfolioAccount, days int, asOf string) ([]EquityPoint, int, []string, error) {
+func (s *PortfolioRiskService) equityPoints(db *gorm.DB, account *model.PortfolioAccount, days int, asOf string) ([]EquityPoint, int, []string, error) {
+	currencyGap, err := portfolioCurrencyGapFor(db, account.UserID, account.ID, account.Kind)
+	if err != nil {
+		return nil, 0, nil, err
+	}
 	var snaps []model.PortfolioSnapshot
-	if err := common.DB.Where("user_id = ? AND account_id = ? AND trade_date <= ?", account.UserID, account.ID, asOf).
+	if err := db.Where("user_id = ? AND account_id = ? AND trade_date <= ?", account.UserID, account.ID, asOf).
 		Order("trade_date DESC").Limit(days + 1).Find(&snaps).Error; err != nil {
 		return nil, 0, nil, err
 	}
 	for i, j := 0, len(snaps)-1; i < j; i, j = i+1, j-1 {
 		snaps[i], snaps[j] = snaps[j], snaps[i]
+	}
+	dates := make([]string, len(snaps))
+	for i, snap := range snaps {
+		dates[i] = snap.TradeDate
+	}
+	gaps, err := riskDailyIntervalGaps(db, "cn", dates)
+	if err != nil {
+		return nil, 0, nil, err
 	}
 	points := make([]EquityPoint, 0, len(snaps))
 	partial := 0
@@ -403,12 +420,19 @@ func (s *PortfolioRiskService) equityPoints(account *model.PortfolioAccount, day
 		if len(snaps) > 0 {
 			from = snaps[0].TradeDate
 		}
-		if err := common.DB.Where("user_id = ? AND account_id = ? AND trade_date >= ? AND trade_date <= ?", account.UserID, account.ID, from, asOf).Find(&flows).Error; err != nil {
+		if err := db.Where("user_id = ? AND account_id = ? AND trade_date >= ? AND trade_date <= ?", account.UserID, account.ID, from, asOf).Find(&flows).Error; err != nil {
 			return nil, 0, nil, err
 		}
 	}
 	for i, snap := range snaps {
-		p := EquityPoint{TradeDate: snap.TradeDate, Partial: snap.Partial}
+		p := EquityPoint{TradeDate: snap.TradeDate, Partial: snap.Partial, ReturnUnavailableReason: gaps[i]}
+		if currencyGap.affects(snap.TradeDate) {
+			p.Partial = true
+			reasons = append(reasons, snap.TradeDate+": "+currencyGap.Reason)
+		}
+		if gaps[i] != "" {
+			reasons = append(reasons, snap.TradeDate+": "+gaps[i])
+		}
 		if account.Kind == model.PortfolioKindReal && i > 0 {
 			previousDate := snaps[i-1].TradeDate
 			for _, flow := range flows {
@@ -424,7 +448,7 @@ func (s *PortfolioRiskService) equityPoints(account *model.PortfolioAccount, day
 		if account.Kind == model.PortfolioKindPaper {
 			p.Assets = round2(snap.MarketValue + snap.Cash)
 		} else {
-			cash, reason, err := realCashBalance(common.DB, account.UserID, account.ID, snap.TradeDate)
+			cash, reason, err := realCashBalance(db, account.UserID, account.ID, snap.TradeDate)
 			if err != nil {
 				return nil, 0, nil, err
 			}
@@ -454,11 +478,58 @@ func uniqueRiskStrings(in []string) []string {
 	return out
 }
 
+// riskDailyIntervalGaps 核对相邻记录是否相隔一个交易日，防止把多日变化当作日收益。
+// A 股周末确定休市；其他缺失日历不能用工作日近似，也不补造任何价格或快照。
+func riskDailyIntervalGaps(db *gorm.DB, market string, dates []string) ([]string, error) {
+	gaps := make([]string, len(dates))
+	if len(dates) < 2 {
+		return gaps, nil
+	}
+	var rows []model.TradingCalendar
+	if err := db.Where("market = ? AND trade_date >= ? AND trade_date <= ?", market, dates[0], dates[len(dates)-1]).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	calendar := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		calendar[row.TradeDate] = row.IsOpen
+	}
+	for i := 1; i < len(dates); i++ {
+		from, fromErr := time.Parse("2006-01-02", dates[i-1])
+		to, toErr := time.Parse("2006-01-02", dates[i])
+		if fromErr != nil || toErr != nil || !from.Before(to) {
+			gaps[i] = "日期无效，无法核验日收益区间"
+			continue
+		}
+		if !calendar[dates[i-1]] || !calendar[dates[i]] {
+			gaps[i] = "交易日历缺失或记录日期非交易日，无法核验日收益"
+			continue
+		}
+		openDays := 0
+		for date := from.AddDate(0, 0, 1); !date.After(to); date = date.AddDate(0, 0, 1) {
+			isOpen, known := calendar[date.Format("2006-01-02")]
+			if !known && market == "cn" && (date.Weekday() == time.Saturday || date.Weekday() == time.Sunday) {
+				continue
+			}
+			if !known {
+				gaps[i] = "区间内交易日历不完整，无法核验日收益"
+				break
+			}
+			if isOpen {
+				openDays++
+			}
+		}
+		if gaps[i] == "" && openDays != 1 {
+			gaps[i] = fmt.Sprintf("相邻记录跨越 %d 个交易日，缺少中间日收益", openDays)
+		}
+	}
+	return gaps, nil
+}
+
 func returnsByDate(points []EquityPoint) map[string]float64 {
 	out := map[string]float64{}
 	for i := 1; i < len(points); i++ {
 		a, b := points[i-1], points[i]
-		if a.Partial || b.Partial || a.Assets <= 0 {
+		if a.Partial || b.Partial || a.Assets <= 0 || b.ReturnUnavailableReason != "" {
 			continue
 		}
 		r := (b.Assets-b.CashFlow)/a.Assets - 1
@@ -477,12 +548,23 @@ func localBarReturns(symbol, market string, limit int, asOf string) (map[string]
 		Order("trade_date DESC").Limit(limit + 1).Find(&bars).Error; err != nil {
 		return nil, err
 	}
+	if err := validateLocalAdjustedBars(market, bars); err != nil {
+		return nil, err
+	}
 	for i, j := 0, len(bars)-1; i < j; i, j = i+1, j-1 {
 		bars[i], bars[j] = bars[j], bars[i]
 	}
+	dates := make([]string, len(bars))
+	for i, bar := range bars {
+		dates[i] = bar.TradeDate
+	}
+	gaps, err := riskDailyIntervalGaps(common.DB, market, dates)
+	if err != nil {
+		return nil, err
+	}
 	out := map[string]float64{}
 	for i := 1; i < len(bars); i++ {
-		if bars[i-1].Close > 0 && bars[i].Close > 0 {
+		if gaps[i] == "" && bars[i-1].Close > 0 && bars[i].Close > 0 {
 			out[bars[i].TradeDate] = bars[i].Close/bars[i-1].Close - 1
 		}
 	}
@@ -490,18 +572,15 @@ func localBarReturns(symbol, market string, limit int, asOf string) (map[string]
 }
 
 func (s *PortfolioRiskService) Risk(ctx context.Context, userID, accountID int64, params RiskParameters) (*PortfolioRiskView, error) {
-	account, err := PortfolioAccountByID(userID, accountID, "")
-	if err != nil {
-		return nil, err
-	}
 	params = params.normalized()
 	if params.AsOf == "" {
 		params.AsOf = time.Now().Format("2006-01-02")
 	}
-	points, partial, reasons, err := s.equityPoints(account, params.WindowDays, params.AsOf)
+	state, err := s.readRiskLedger(ctx, userID, accountID, params.AsOf, params.WindowDays)
 	if err != nil {
 		return nil, err
 	}
+	points, partial, reasons := state.points, state.partial, state.reasons
 	returns, pointsWithReturns := DailyReturns(points)
 	dd, pointsWithDD := MaxDrawdown(pointsWithReturns)
 	for i := range pointsWithDD {
@@ -522,6 +601,14 @@ func (s *PortfolioRiskService) Risk(ctx context.Context, userID, accountID int64
 		p, b, _ := alignReturnsByDate(portfolioReturns, bench)
 		out.Beta, out.Alpha = BetaAlpha(p, b, params.Annualization, params.RiskFreeRatePct/100)
 	}
+	if len(returns) < len(points)-1 {
+		for _, metric := range []*RiskMetric{&out.AnnualizedVolatility, &out.DownsideVolatility, &out.Sharpe, &out.Sortino, &out.Beta, &out.Alpha} {
+			if metric.Status == RiskStatusAvailable {
+				metric.Status = RiskStatusPartial
+				metric.Reason = "仅基于可核验的相邻交易日日收益，窗口内存在缺失区间"
+			}
+		}
+	}
 	if params.AsOf < time.Now().Format("2006-01-02") {
 		reason := "历史 as_of 缺少逐标的持仓快照，相关性、暴露和风险贡献不可复现"
 		out.UnknownReasons = uniqueRiskStrings(append(out.UnknownReasons, reason))
@@ -529,7 +616,7 @@ func (s *PortfolioRiskService) Risk(ctx context.Context, userID, accountID int64
 		out.RiskContribution = RiskContributionResult{PredictedVolatility: unavailable(reason, 0), Items: []RiskContributionItem{}, WindowDays: params.WindowDays, AsOf: params.AsOf, DataVersion: "daily-bars-covariance-v1"}
 		return out, nil
 	}
-	holdings, _, exposure, err := s.currentHoldings(ctx, account)
+	holdings, _, exposure, err := s.currentHoldings(ctx, state)
 	if err != nil {
 		return nil, err
 	}
@@ -561,25 +648,13 @@ func (s *PortfolioRiskService) Risk(ctx context.Context, userID, accountID int64
 		out.Exposure = exposure
 	}
 	if weightsComplete && marketValue > 0 {
-		if account.Kind == model.PortfolioKindPaper {
-			var cash model.PaperAccount
-			if err := common.DB.Where("user_id = ? AND account_id = ?", userID, accountID).First(&cash).Error; err != nil {
-				return nil, err
-			}
-			totalAssets = marketValue + cash.Cash
+		if state.cash.Status != RiskStatusAvailable {
+			weightsComplete = false
+			weightReason = state.cash.Reason + "，风险贡献不可用"
 		} else {
-			cash, reason, err := realCashBalance(common.DB, userID, accountID, params.AsOf)
-			if err != nil {
-				return nil, err
-			}
-			if reason != "" {
-				weightsComplete = false
-				weightReason = reason + "，风险贡献不可用"
-			} else {
-				totalAssets = marketValue + cash
-			}
+			totalAssets = marketValue + state.cash.Value
 		}
-		if totalAssets <= 0 {
+		if weightsComplete && totalAssets <= 0 {
 			weightsComplete = false
 			weightReason = "组合总资产非正数，风险贡献不可用"
 		}
@@ -603,10 +678,6 @@ func (s *PortfolioRiskService) Risk(ctx context.Context, userID, accountID int64
 }
 
 func (s *PortfolioRiskService) Stress(ctx context.Context, userID, accountID int64, scenario StressScenario) (*StressResult, error) {
-	account, err := PortfolioAccountByID(userID, accountID, "")
-	if err != nil {
-		return nil, err
-	}
 	if math.IsNaN(scenario.ShockPct) || math.IsInf(scenario.ShockPct, 0) || scenario.ShockPct > 0 || scenario.ShockPct < -100 {
 		return nil, errors.New("冲击比例须在 -100% 到 0% 之间")
 	}
@@ -620,18 +691,39 @@ func (s *PortfolioRiskService) Stress(ctx context.Context, userID, accountID int
 	if scenario.Type == "symbol" && strings.TrimSpace(scenario.Symbol) == "" {
 		return nil, errors.New("单票冲击必须指定股票代码")
 	}
-	holdings, _, _, err := s.currentHoldings(ctx, account)
+	state, err := s.readRiskLedger(ctx, userID, accountID, "", 0)
 	if err != nil {
 		return nil, err
 	}
+	holdings, _, exposure, err := s.currentHoldings(ctx, state)
+	if err != nil {
+		return nil, err
+	}
+	overview := portfolioOverviewFromLedger(state, holdings, exposure)
 	inputs := make([]StressHolding, 0, len(holdings))
-	for _, h := range holdings {
-		inputs = append(inputs, StressHolding{Symbol: h.Symbol, Name: h.Name, Industry: h.Industry, Value: h.Value, Quantity: h.Quantity, Price: h.Price, PlanStopLoss: h.PlanStopLoss, Known: h.Status == RiskStatusAvailable, ValuationKnown: h.ValuationKnown})
+	if scenario.Type == "plan_stop_loss" && state.account.Kind == model.PortfolioKindReal {
+		// 同一标的可以有多笔成本和计划，不能把聚合后的第一笔止损价套给全部数量。
+		bySymbol := make(map[string]PortfolioHoldingWeight, len(holdings))
+		for _, h := range holdings {
+			bySymbol[QuoteKey(h.Market, h.Symbol)] = h
+		}
+		for _, p := range state.realHoldings {
+			h := bySymbol[QuoteKey(p.Market, p.Symbol)]
+			inputs = append(inputs, StressHolding{Symbol: p.Symbol, Name: p.Name, Industry: h.Industry,
+				Value: round2(p.Quantity * h.Price), Quantity: p.Quantity, Price: h.Price, PlanStopLoss: p.PlanStopLoss,
+				Known: h.Status == RiskStatusAvailable, ValuationKnown: h.ValuationKnown})
+		}
+	} else {
+		for _, h := range holdings {
+			inputs = append(inputs, StressHolding{Symbol: h.Symbol, Name: h.Name, Industry: h.Industry, Value: h.Value, Quantity: h.Quantity, Price: h.Price, PlanStopLoss: h.PlanStopLoss, Known: h.Status == RiskStatusAvailable, ValuationKnown: h.ValuationKnown})
+		}
 	}
 	out := ComputeStress(inputs, scenario, time.Now())
-	if overview, overviewErr := s.Overview(ctx, userID, accountID); overviewErr == nil && overview.TotalAssets.Status == RiskStatusAvailable && overview.TotalAssets.Value > 0 {
+	if overview.TotalAssets.Status == RiskStatusAvailable && overview.TotalAssets.Value > 0 {
 		out.BaseValue = overview.TotalAssets.Value
 		out.EstimatedLossPct = round2(out.EstimatedLossAmount / out.BaseValue * 100)
+	} else if overview.TotalAssets.Reason != "" {
+		out.Unknown = append(out.Unknown, overview.TotalAssets.Reason+"，损失比例仅基于已知持仓市值")
 	}
 	return &out, nil
 }
@@ -677,7 +769,12 @@ func normalizeTargets(items []TargetAllocationItem) ([]TargetAllocationItem, err
 	return items, nil
 }
 func (s *PortfolioRiskService) SaveTargets(userID, accountID int64, items []TargetAllocationItem) (*model.TargetAllocationRevision, error) {
-	if _, err := ActivePortfolioAccountByID(userID, accountID, ""); err != nil {
+	return s.SaveTargetsContext(context.Background(), userID, accountID, items)
+}
+
+func (s *PortfolioRiskService) SaveTargetsContext(ctx context.Context, userID, accountID int64, items []TargetAllocationItem) (*model.TargetAllocationRevision, error) {
+	db := common.DB.WithContext(ctx)
+	if _, err := activePortfolioAccountByIDDB(db, userID, accountID, ""); err != nil {
 		return nil, err
 	}
 	items, err := normalizeTargets(items)
@@ -686,11 +783,10 @@ func (s *PortfolioRiskService) SaveTargets(userID, accountID int64, items []Targ
 	}
 	b, _ := json.Marshal(items)
 	row := model.TargetAllocationRevision{UserID: userID, AccountID: accountID, ItemsJSON: string(b), ContentHash: stableHash(items)}
-	err = common.DB.Transaction(func(tx *gorm.DB) error {
+	err = db.Transaction(func(tx *gorm.DB) error {
 		// revision 通过账户行锁串行化；首个 revision 没有可锁的历史行，
 		// 锁账户本身可避免两个空账户同时生成 revision=1。
-		var account model.PortfolioAccount
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ?", accountID, userID).First(&account).Error; err != nil {
+		if err := lockActivePortfolioAccount(tx, userID, accountID, ""); err != nil {
 			return err
 		}
 		var latest model.TargetAllocationRevision
@@ -704,10 +800,18 @@ func (s *PortfolioRiskService) SaveTargets(userID, accountID int64, items []Targ
 	return &row, err
 }
 func LoadTargetRevision(userID, accountID int64, revision int) (*model.TargetAllocationRevision, []TargetAllocationItem, error) {
-	if _, err := PortfolioAccountByID(userID, accountID, ""); err != nil {
+	return LoadTargetRevisionContext(context.Background(), userID, accountID, revision)
+}
+
+func LoadTargetRevisionContext(ctx context.Context, userID, accountID int64, revision int) (*model.TargetAllocationRevision, []TargetAllocationItem, error) {
+	if revision < 0 {
+		return nil, nil, errors.New("目标配置版本不能为负数")
+	}
+	db := common.DB.WithContext(ctx)
+	if _, err := portfolioAccountByIDDB(db, userID, accountID, ""); err != nil {
 		return nil, nil, err
 	}
-	q := common.DB.Where("user_id = ? AND account_id = ?", userID, accountID)
+	q := db.Where("user_id = ? AND account_id = ?", userID, accountID)
 	if revision > 0 {
 		q = q.Where("revision = ?", revision)
 	} else {
@@ -736,28 +840,20 @@ type RebalanceDraftView struct {
 }
 
 func (s *PortfolioRiskService) Rebalance(ctx context.Context, userID, accountID int64, revision int) (*RebalanceDraftView, error) {
-	account, err := PortfolioAccountByID(userID, accountID, "")
+	rev, targets, err := LoadTargetRevisionContext(ctx, userID, accountID, revision)
 	if err != nil {
 		return nil, err
 	}
-	rev, targets, err := LoadTargetRevision(userID, accountID, revision)
+	ov, holdings, err := s.overviewWithHoldings(ctx, userID, accountID)
 	if err != nil {
 		return nil, err
 	}
-	ov, err := s.Overview(ctx, userID, accountID)
-	if err != nil {
-		return nil, err
-	}
-	_, holdings, _, err := s.currentHoldings(ctx, account)
-	if err != nil {
-		return nil, err
-	}
-	holdings = s.addUnheldTargetQuotes(ctx, holdings, targets)
 	out := &RebalanceDraftView{AccountID: accountID, Revision: rev.Revision, RevisionHash: rev.ContentHash, AsOf: ov.AsOf, TotalAssets: ov.TotalAssets, ReadOnly: true, Note: "只读研究草案，不创建成交流水、不自动下单"}
 	if ov.TotalAssets.Status != RiskStatusAvailable {
 		out.Items = []RebalanceDraftItem{}
 		return out, nil
 	}
+	holdings = s.addUnheldTargetQuotes(ctx, holdings, targets)
 	out.Items = BuildRebalanceDraft(holdings, targets, ov.TotalAssets.Value)
 	return out, nil
 }

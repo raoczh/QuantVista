@@ -116,6 +116,7 @@ func icAggregate(ics []float64) (mean, icir, winRate float64, ok bool) {
 	if n == 0 {
 		return 0, 0, 0, false
 	}
+	icir = math.NaN() // 不足两个样本或标准差为零时，ICIR 不可定义。
 	var sum float64
 	wins := 0
 	for _, v := range ics {
@@ -142,10 +143,10 @@ func icAggregate(ics []float64) (mean, icir, winRate float64, ok bool) {
 
 // ICHorizonAgg 单因子单收益窗口的 IC 汇总。
 type ICHorizonAgg struct {
-	MeanIC     float64 `json:"mean_ic"`      // RankIC 均值
-	ICIR       float64 `json:"icir"`         // 均值/标准差
-	WinRatePct float64 `json:"win_rate_pct"` // IC>0 的横截面占比
-	Days       int     `json:"days"`         // 参与统计的横截面数
+	MeanIC     float64  `json:"mean_ic"`      // RankIC 均值
+	ICIR       *float64 `json:"icir"`         // 均值/标准差；nil=样本不足或标准差为零
+	WinRatePct float64  `json:"win_rate_pct"` // IC>0 的横截面占比
+	Days       int      `json:"days"`         // 参与统计的横截面数
 }
 
 // FactorICStat 单因子排行行。
@@ -158,16 +159,16 @@ type FactorICStat struct {
 
 // FactorICReport IC 验证报表（管理后台只读页）。
 type FactorICReport struct {
-	TradeDate    string         `json:"trade_date"`    // 数据末日
-	Dates        []string       `json:"dates"`         // 采样的横截面日期（升序）
-	Universe     int            `json:"universe"`      // 参与股票数（剔 ST/断层后）
-	StSkipped    int            `json:"st_skipped"`
-	Suspects     int            `json:"adjust_suspect"`
-	MinCross     int            `json:"min_cross"`
-	Stats        []FactorICStat `json:"stats"` // 按 |10日 IC 均值| 降序
-	Notes        []string       `json:"notes"`
-	ElapsedMs    int64          `json:"elapsed_ms"`
-	GeneratedAt  time.Time      `json:"generated_at"`
+	TradeDate   string         `json:"trade_date"` // 数据末日
+	Dates       []string       `json:"dates"`      // 采样的横截面日期（升序）
+	Universe    int            `json:"universe"`   // 参与股票数（剔 ST/断层后）
+	StSkipped   int            `json:"st_skipped"`
+	Suspects    int            `json:"adjust_suspect"`
+	MinCross    int            `json:"min_cross"`
+	Stats       []FactorICStat `json:"stats"` // 按 |10日 IC 均值| 降序
+	Notes       []string       `json:"notes"`
+	ElapsedMs   int64          `json:"elapsed_ms"`
+	GeneratedAt time.Time      `json:"generated_at"`
 }
 
 // ---------- 计算 ----------
@@ -209,7 +210,10 @@ func RunFactorIC(ctx context.Context, market *MarketService) (*FactorICReport, e
 		return nil, err
 	}
 	bt := NewBacktestService(market)
-	axis, _, _ := bt.marketAxis(ctx, freshDate)
+	axis, _, _, err := bt.marketAxis(ctx, freshDate)
+	if err != nil {
+		return nil, err
+	}
 	// 右边界收缩最长收益窗口（横截面日 i 的最远收益终点 i+20 须 ≤ 轴末），
 	// 从尾部按步长回采横截面日期。
 	eligible := len(axis) - icHorizonMax
@@ -242,7 +246,10 @@ func RunFactorIC(ctx context.Context, market *MarketService) (*FactorICReport, e
 		}
 	}
 	// ST as-of（防前视/幸存者偏差）：与 walk-forward 同款，快照未覆盖回退当前名称。
-	stByDate := universeSTByDates(dates)
+	stByDate, err := universeSTByDates(ctx, dates)
+	if err != nil {
+		return nil, err
+	}
 	stFallback := len(stByDate) < len(dates)
 
 	// 宇宙元数据（同 buildFactorTable）。
@@ -380,10 +387,10 @@ func RunFactorIC(ctx context.Context, market *MarketService) (*FactorICReport, e
 			scanErr = ctx.Err()
 			break
 		}
-		var sym, td string
+		var sym, td, source string
 		var open, high, low, closeP, amount, turnover float64
 		var volume int64
-		if err := rows.Scan(&sym, &td, &open, &high, &low, &closeP, &volume, &amount, &turnover); err != nil {
+		if err := rows.Scan(&sym, &td, &open, &high, &low, &closeP, &volume, &amount, &turnover, &source); err != nil {
 			scanErr = err
 			break
 		}
@@ -394,7 +401,7 @@ func RunFactorIC(ctx context.Context, market *MarketService) (*FactorICReport, e
 		}
 		cur = append(cur, datasource.Bar{
 			TradeDate: td, Open: open, High: high, Low: low, Close: closeP,
-			Volume: volume, Amount: amount, TurnoverRate: turnover,
+			Volume: volume, Amount: amount, TurnoverRate: turnover, Source: source,
 		})
 	}
 	if scanErr == nil {
@@ -438,8 +445,13 @@ func RunFactorIC(ctx context.Context, market *MarketService) (*FactorICReport, e
 				}
 			}
 			if mean, icir, win, ok := icAggregate(ics); ok {
+				var ratio *float64
+				if !math.IsNaN(icir) && !math.IsInf(icir, 0) {
+					value := round2(icir)
+					ratio = &value
+				}
 				st.Horizons[intKey(h)] = ICHorizonAgg{
-					MeanIC: round4(mean), ICIR: round2(icir), WinRatePct: round2(win), Days: len(ics),
+					MeanIC: round4(mean), ICIR: ratio, WinRatePct: round2(win), Days: len(ics),
 				}
 			}
 		}
@@ -457,6 +469,7 @@ func RunFactorIC(ctx context.Context, market *MarketService) (*FactorICReport, e
 	sort.SliceStable(rep.Stats, func(a, b int) bool { return rank(rep.Stats[a]) > rank(rep.Stats[b]) })
 	rep.ElapsedMs = time.Since(start).Milliseconds()
 	rep.Notes = append(rep.Notes,
+		"ICIR 在横截面不足 2 个或 IC 标准差为零时不可定义，以缺失值展示；均值和胜率仍可单独计算",
 		"口径：A 类因子按历史日线 as-of 切片重建（无未来泄露）；收益=因子日收盘→N 交易日后收盘（市场轴对齐，停牌观测剔除；不扣费，测区分度非可执行收益）",
 		"宇宙：剔除 ST（优先宇宙快照按横截面日 as-of 判定）与复权断层股，与推荐候选宇宙一致；单横截面有效样本 <"+strconv.Itoa(icMinCross)+" 不计当日 IC",
 		"防过拟合纪律：权重与加分项调整只以样本外结果为准；本报表只出数，不设「必须删几个因子」的指标（规划 §5 S3-4）",
@@ -475,4 +488,3 @@ func RunFactorIC(ctx context.Context, market *MarketService) (*FactorICReport, e
 }
 
 func intKey(h int) string { return strconv.Itoa(h) }
-

@@ -57,5 +57,5 @@ M3a/M3b/M3c 扩展数据与工作流增强（仅 M3a 的龙虎榜依赖 F1 网�
 
 - **版本号纪律**：prompt/策略每变一次递增（截至 2026-07-14：推荐 p11/s8、分析 p14、问答 q8、日报 d2、选股解析 sp1），历史记录可归因。
 - **新表一律 GORM AutoMigrate + user_id 隔离审查**（涉及用户数据的）；纯行情缓存表标注"可重建"进 DEPLOYMENT 备份清单。
-- **每批测试底线**：纯函数表驱动单测 + DB 集成测试（隔离/幂等）+ `go build/vet/test` 全绿 + `vue-tsc`+build 过；提交前 `git checkout -- server/web/dist/index.html`。
+- **每批测试底线**：纯函数表驱动单测 + DB 集成测试（隔离/幂等）+ `go build/vet/test` 全绿 + `vue-tsc`+build 过；前端验证使用临时输出目录（如 `npm run build -- --outDir ../build/web-check`），保留 `server/web/dist/index.html` 的既有修改。Windows 可使用 `scripts/verify.ps1 -Mode full`。
 - **每批收尾**：更新本文档状态列与 commit 号 → ROADMAP §3 增补防回归 → 记忆文件同步。

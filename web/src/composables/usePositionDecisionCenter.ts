@@ -49,16 +49,19 @@ export function buildPositionDecisionRows(
     }))
 
   const focusedPosition = positions.find((position) => position.id === focusedPositionID)
+  const requestedAssessment = focusedAssessment?.position_id === focusedPosition?.id
+    ? focusedAssessment
+    : focusedPosition?.exit_assessment
   if (
     focusedPosition &&
-    focusedAssessment &&
+    requestedAssessment &&
     !rows.some((row) => row.position.id === focusedPosition.id)
   ) {
     rows.push({
       position: focusedPosition,
-      assessment: focusedAssessment,
+      assessment: requestedAssessment,
       focused: true,
-      historical: focusedAssessment.id !== focusedPosition.exit_assessment?.id,
+      historical: requestedAssessment.id !== focusedPosition.exit_assessment?.id,
     })
   }
 
@@ -70,7 +73,7 @@ export function buildPositionDecisionRows(
   })
 }
 
-export function latestDecisionTime(rows: PositionDecisionRow[]) {
+export function latestDecisionTime(rows: Array<Pick<PositionDecisionRow, 'assessment'>>) {
   return rows.reduce((latest, row) => {
     const value = row.assessment.evaluated_at || ''
     return value > latest ? value : latest

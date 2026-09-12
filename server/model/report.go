@@ -32,7 +32,7 @@ type DailyReport struct {
 
 	// 今日复盘：LLM 结构化输出 + 输入数据快照（可复现）。列表查询时排除大字段。
 	ReviewJSON   string `gorm:"type:text" json:"review_json"`
-	SnapshotJSON string `gorm:"type:text" json:"snapshot_json"`
+	SnapshotJSON string `gorm:"type:mediumtext" json:"snapshot_json"` // 全部持仓与缺口说明可能超过 TEXT 的 64KB。
 
 	// 明日推荐批次（0=未生成/失败）；未持有推荐只保留研究追踪，不创建卖点提醒。
 	RecommendationBatchID int64 `gorm:"index" json:"recommendation_batch_id"`

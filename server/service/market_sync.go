@@ -215,8 +215,8 @@ func normalizeMaintenanceMarket(v string) (string, error) {
 	return market, nil
 }
 
-func maintenanceOpenDates(req MaintenanceRequest) (string, []string, string, string, error) {
-	if common.DB == nil {
+func maintenanceOpenDatesDB(db *gorm.DB, req MaintenanceRequest) (string, []string, string, string, error) {
+	if db == nil {
 		return "", nil, "", "", errors.New("数据库不可用")
 	}
 	market, err := normalizeMaintenanceMarket(req.Market)
@@ -229,7 +229,7 @@ func maintenanceOpenDates(req MaintenanceRequest) (string, []string, string, str
 	var dates []string
 	from, to := strings.TrimSpace(req.From), strings.TrimSpace(req.To)
 	if from == "" {
-		if err := common.DB.Model(&model.TradingCalendar{}).Where("market = ? AND is_open = ? AND trade_date <= ?", market, true, time.Now().Format("2006-01-02")).
+		if err := db.Model(&model.TradingCalendar{}).Where("market = ? AND is_open = ? AND trade_date <= ?", market, true, time.Now().Format("2006-01-02")).
 			Order("trade_date DESC").Limit(maintenanceDefaultOpenDays).Pluck("trade_date", &dates).Error; err != nil {
 			return "", nil, "", "", err
 		}
@@ -243,7 +243,7 @@ func maintenanceOpenDates(req MaintenanceRequest) (string, []string, string, str
 	if _, _, err := validateMaintenanceRange(from, to, maintenanceMaxNaturalDays); err != nil {
 		return "", nil, "", "", err
 	}
-	if err := common.DB.Model(&model.TradingCalendar{}).
+	if err := db.Model(&model.TradingCalendar{}).
 		Where("market = ? AND is_open = ? AND trade_date >= ? AND trade_date <= ?", market, true, from, to).
 		Order("trade_date").Limit(maintenanceMaxOpenDays+1).Pluck("trade_date", &dates).Error; err != nil {
 		return "", nil, "", "", err
@@ -254,13 +254,13 @@ func maintenanceOpenDates(req MaintenanceRequest) (string, []string, string, str
 	return market, dates, from, to, nil
 }
 
-func (s *MarketService) buildSyncBarsPlan(req MaintenanceRequest) (*preparedMaintenancePlan, error) {
-	market, dates, from, to, err := maintenanceOpenDates(req)
+func buildSyncBarsPlanDB(db *gorm.DB, req MaintenanceRequest) (*preparedMaintenancePlan, error) {
+	market, dates, from, to, err := maintenanceOpenDatesDB(db, req)
 	if err != nil {
 		return nil, err
 	}
 	var stocks []model.Stock
-	if err := common.DB.Select("id", "symbol", "market").Where("market = ?", market).
+	if err := db.Select("id", "symbol", "market").Where("market = ?", market).
 		Order("id").Limit(syncMaxStocks + 1).Find(&stocks).Error; err != nil {
 		return nil, err
 	}
@@ -277,7 +277,7 @@ func (s *MarketService) buildSyncBarsPlan(req MaintenanceRequest) (*preparedMain
 	maxCells := len(stocks) * len(dates)
 	var existingRows []cell
 	if maxCells > 0 {
-		if err := common.DB.Model(&model.DailyBar{}).Select("symbol", "trade_date").
+		if err := db.Model(&model.DailyBar{}).Select("symbol", "trade_date").
 			Where("market = ? AND trade_date IN ? AND symbol IN ?", market, dates, symbols).
 			Order("trade_date, symbol").Limit(maxCells + 1).Find(&existingRows).Error; err != nil {
 			return nil, err
@@ -293,7 +293,7 @@ func (s *MarketService) buildSyncBarsPlan(req MaintenanceRequest) (*preparedMain
 	type suspendedCell struct{ Symbol, TradeDate string }
 	var suspendedRows []suspendedCell
 	if maxCells > 0 {
-		if err := common.DB.Model(&model.StockUniverseDaily{}).Select("symbol", "trade_date").
+		if err := db.Model(&model.StockUniverseDaily{}).Select("symbol", "trade_date").
 			Where("market = ? AND suspended = ? AND trade_date IN ? AND symbol IN ?", market, true, dates, symbols).
 			Order("trade_date, symbol").Limit(maxCells + 1).Find(&suspendedRows).Error; err != nil {
 			return nil, err
@@ -393,8 +393,8 @@ func calendarRange(req MaintenanceRequest) (string, []string, string, string, er
 	return market, dates, from, to, nil
 }
 
-func (s *MarketService) buildCalendarPlan(req MaintenanceRequest) (*preparedMaintenancePlan, error) {
-	if common.DB == nil {
+func buildCalendarPlanDB(db *gorm.DB, req MaintenanceRequest) (*preparedMaintenancePlan, error) {
+	if db == nil {
 		return nil, errors.New("数据库不可用")
 	}
 	market, dates, from, to, err := calendarRange(req)
@@ -402,7 +402,7 @@ func (s *MarketService) buildCalendarPlan(req MaintenanceRequest) (*preparedMain
 		return nil, err
 	}
 	var rows []model.TradingCalendar
-	if err := common.DB.Select("trade_date", "is_open").Where("market = ? AND trade_date >= ? AND trade_date <= ?", market, from, to).
+	if err := db.Select("trade_date", "is_open").Where("market = ? AND trade_date >= ? AND trade_date <= ?", market, from, to).
 		Order("trade_date").Limit(len(dates) + 1).Find(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -441,15 +441,22 @@ func (s *MarketService) buildCalendarPlan(req MaintenanceRequest) (*preparedMain
 	return &preparedMaintenancePlan{view: view, dates: dates}, nil
 }
 
-func (s *MarketService) buildWidePlan(req MaintenanceRequest) (*preparedMaintenancePlan, error) {
-	if common.DB == nil {
+func buildWidePlanDB(db *gorm.DB, req MaintenanceRequest) (*preparedMaintenancePlan, error) {
+	if db == nil {
 		return nil, errors.New("数据库不可用")
 	}
 	market, err := normalizeMaintenanceMarket(req.Market)
 	if err != nil {
 		return nil, err
 	}
-	expected := wideExpectedDate(time.Now())
+	reader := &dataHealthReader{db: db, now: time.Now()}
+	expected := reader.wideExpectedDate(reader.now)
+	if reader.err != nil {
+		return nil, reader.err
+	}
+	if reader.calendarMissing {
+		return nil, errors.New("交易日历不完整，无法确定全市场快照补采日期")
+	}
 	from, to := strings.TrimSpace(req.From), strings.TrimSpace(req.To)
 	if (from == "") != (to == "") {
 		return nil, errors.New("from 与 to 必须同时提供")
@@ -464,7 +471,7 @@ func (s *MarketService) buildWidePlan(req MaintenanceRequest) (*preparedMaintena
 		return nil, fmt.Errorf("全市场快照接口只能补当前应有交易日 %s，历史范围请用日线初始化/批量补采", expected)
 	}
 	var states []string
-	if err := common.DB.Model(&model.MarketSyncState{}).Where("market = ?", market).Order("symbol").Limit(maintenanceMaxUniverseRows+1).Pluck("symbol", &states).Error; err != nil {
+	if err := db.Model(&model.MarketSyncState{}).Where("market = ?", market).Order("symbol").Limit(maintenanceMaxUniverseRows+1).Pluck("symbol", &states).Error; err != nil {
 		return nil, err
 	}
 	if len(states) > maintenanceMaxUniverseRows {
@@ -472,7 +479,7 @@ func (s *MarketService) buildWidePlan(req MaintenanceRequest) (*preparedMaintena
 	}
 	var bars []string
 	if len(states) > 0 {
-		if err := common.DB.Model(&model.DailyBar{}).Where("market = ? AND trade_date = ? AND symbol IN ?", market, expected, states).
+		if err := db.Model(&model.DailyBar{}).Where("market = ? AND trade_date = ? AND symbol IN ?", market, expected, states).
 			Order("symbol").Limit(maintenanceMaxUniverseRows+1).Pluck("symbol", &bars).Error; err != nil {
 			return nil, err
 		}
@@ -482,7 +489,7 @@ func (s *MarketService) buildWidePlan(req MaintenanceRequest) (*preparedMaintena
 	}
 	var suspended []string
 	if len(states) > 0 {
-		if err := common.DB.Model(&model.StockUniverseDaily{}).Where("market = ? AND trade_date = ? AND suspended = ? AND symbol IN ?", market, expected, true, states).
+		if err := db.Model(&model.StockUniverseDaily{}).Where("market = ? AND trade_date = ? AND suspended = ? AND symbol IN ?", market, expected, true, states).
 			Order("symbol").Limit(maintenanceMaxUniverseRows+1).Pluck("symbol", &suspended).Error; err != nil {
 			return nil, err
 		}
@@ -527,22 +534,31 @@ func (s *MarketService) buildWidePlan(req MaintenanceRequest) (*preparedMaintena
 	return &preparedMaintenancePlan{view: view, dates: []string{expected}}, nil
 }
 
-func (s *MarketService) prepareMaintenancePlan(task string, req MaintenanceRequest) (*preparedMaintenancePlan, error) {
-	switch task {
-	case MaintenanceSyncBars:
-		return s.buildSyncBarsPlan(req)
-	case MaintenanceBackfillCalendar:
-		return s.buildCalendarPlan(req)
-	case MaintenanceWideSync:
-		return s.buildWidePlan(req)
-	default:
-		return nil, errors.New("未知补采任务")
+func (s *MarketService) prepareMaintenancePlan(task string, req MaintenanceRequest, contexts ...context.Context) (*preparedMaintenancePlan, error) {
+	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
 	}
+	var prepared *preparedMaintenancePlan
+	err := readSnapshotTx(jobSubmissionContext(contexts...), func(tx *gorm.DB) error {
+		var err error
+		switch task {
+		case MaintenanceSyncBars:
+			prepared, err = buildSyncBarsPlanDB(tx, req)
+		case MaintenanceBackfillCalendar:
+			prepared, err = buildCalendarPlanDB(tx, req)
+		case MaintenanceWideSync:
+			prepared, err = buildWidePlanDB(tx, req)
+		default:
+			err = errors.New("未知补采任务")
+		}
+		return err
+	})
+	return prepared, err
 }
 
 // PlanMaintenance 只读本地库生成计划，不扫描上游。
-func (s *MarketService) PlanMaintenance(task string, req MaintenanceRequest) (*MaintenancePlan, error) {
-	prepared, err := s.prepareMaintenancePlan(task, req)
+func (s *MarketService) PlanMaintenance(task string, req MaintenanceRequest, contexts ...context.Context) (*MaintenancePlan, error) {
+	prepared, err := s.prepareMaintenancePlan(task, req, contexts...)
 	if err != nil {
 		return nil, err
 	}
@@ -550,11 +566,11 @@ func (s *MarketService) PlanMaintenance(task string, req MaintenanceRequest) (*M
 }
 
 // ValidateMaintenancePlan 在真正执行前用本地事实重算 hash。
-func (s *MarketService) ValidateMaintenancePlan(task string, req MaintenanceRequest) error {
+func (s *MarketService) ValidateMaintenancePlan(task string, req MaintenanceRequest, contexts ...context.Context) error {
 	if len(req.PlanHash) != 64 {
 		return errors.New("执行补采前必须提供 64 位 plan_hash")
 	}
-	prepared, err := s.prepareMaintenancePlan(task, req)
+	prepared, err := s.prepareMaintenancePlan(task, req, contexts...)
 	if err != nil {
 		return err
 	}
@@ -567,7 +583,7 @@ func (s *MarketService) ValidateMaintenancePlan(task string, req MaintenanceRequ
 // RunMarketWidePlan 在实际请求上游前重算计划；历史范围会在 buildWidePlan 阶段被拒绝，
 // 不把“只能补当日快照”伪装成历史补采能力。
 func (s *MarketService) RunMarketWidePlan(ctx context.Context, req MaintenanceRequest, audit SyncAudit) (*model.DataSyncLog, error) {
-	prepared, err := s.buildWidePlan(req)
+	prepared, err := s.prepareMaintenancePlan(MaintenanceWideSync, req, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -581,8 +597,8 @@ func (s *MarketService) RunMarketWidePlan(ctx context.Context, req MaintenanceRe
 }
 
 // RecordMaintenanceFailure 记录管理员确认后的执行拒绝/失败，不记录原始请求正文。
-func (s *MarketService) RecordMaintenanceFailure(task, market string, audit SyncAudit, err error) {
-	if err == nil {
+func (s *MarketService) RecordMaintenanceFailure(task, market string, audit SyncAudit, err error, contexts ...context.Context) {
+	if err == nil || jobSubmissionContext(contexts...).Err() != nil {
 		return
 	}
 	log := newSyncLog(task, market, audit)
@@ -649,6 +665,7 @@ func (s *MarketService) SyncTrackedDailyBars(ctx context.Context, market string,
 // SyncTrackedDailyBarsWithAudit 是旧版“最近 N 根”同步路径；用于完全无 body 的兼容调用
 // 和定时任务。有限范围的新调用走 RunSyncBarsPlan。
 func (s *MarketService) SyncTrackedDailyBarsWithAudit(ctx context.Context, market string, barLimit int, audit SyncAudit) (*model.DataSyncLog, error) {
+	ctx = jobSubmissionContext(ctx)
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
@@ -662,25 +679,30 @@ func (s *MarketService) SyncTrackedDailyBarsWithAudit(ctx context.Context, marke
 	}
 	start := time.Now()
 
-	fetch := func(afterID int64, limit int) ([]model.Stock, error) {
+	fetch := func(afterID, throughID int64, limit int) ([]model.Stock, error) {
 		var rows []model.Stock
-		q := common.DB.Model(&model.Stock{}).Where("id > ?", afterID).Order("id")
+		q := common.DB.WithContext(ctx).Model(&model.Stock{}).Where("id > ?", afterID).Order("id")
+		if throughID > 0 {
+			q = q.Where("id <= ?", throughID)
+		}
 		if market != "" {
 			q = q.Where("market = ?", market)
 		}
 		err := q.Limit(limit).Find(&rows).Error
 		return rows, err
 	}
-	stocks, err := fetch(syncCursor.Load(), syncMaxStocks)
+	cursor := syncCursor.Load()
+	stocks, err := fetch(cursor, 0, syncMaxStocks)
 	if err != nil {
 		return nil, err
 	}
-	// 到尾回绕：从头补齐剩余额度。
-	if len(stocks) < syncMaxStocks {
-		head, err := fetch(0, syncMaxStocks-len(stocks))
-		if err == nil {
-			stocks = append(stocks, head...)
+	// 到尾回绕：仅补游标之前的标的，避免小于 800 只时同轮重复扫描、重复计数。
+	if cursor > 0 && len(stocks) < syncMaxStocks {
+		head, err := fetch(0, cursor, syncMaxStocks-len(stocks))
+		if err != nil {
+			return nil, err
 		}
+		stocks = append(stocks, head...)
 	}
 
 	log := newSyncLog(MaintenanceSyncBars, market, audit)
@@ -691,15 +713,21 @@ func (s *MarketService) SyncTrackedDailyBarsWithAudit(ctx context.Context, marke
 		case <-ctx.Done():
 			log.Message = truncate("任务取消: "+ctx.Err().Error(), 512)
 			log.DurationMs = time.Since(start).Milliseconds()
-			log.Status = statusOf(log)
+			log.Status = statusOf(log, ctx)
 			s.recordSyncLog(ctx, log)
 			return log, ctx.Err()
 		default:
 		}
-		if _, err := s.GetDailyBars(ctx, st.Market, st.Symbol, barLimit); err != nil {
+		// 同步必须检查实际写入。在线 GetDailyBars 会命中缓存并忽略落库失败，
+		// 不适合作为补采的成功依据。
+		bars, fetchErr := s.mgr.GetDailyBars(ctx, st.Market, st.Symbol, barLimit)
+		if fetchErr == nil {
+			fetchErr = s.persistDailyBars(ctx, st.Market, st.Symbol, bars)
+		}
+		if fetchErr != nil {
 			log.Failed++
 			if firstErr == "" {
-				firstErr = st.Symbol + ": " + err.Error()
+				firstErr = st.Symbol + ": " + fetchErr.Error()
 			}
 		} else {
 			log.Succeeded++
@@ -710,19 +738,21 @@ func (s *MarketService) SyncTrackedDailyBarsWithAudit(ctx context.Context, marke
 
 	log.DurationMs = time.Since(start).Milliseconds()
 	log.Message = truncate(firstErr, 512)
-	log.Status = statusOf(log)
+	log.Status = statusOf(log, ctx)
 	s.recordSyncLog(ctx, log)
-	return log, nil
+	return log, ctx.Err()
 }
 
-func (s *MarketService) syncBarsFetchLimit(market string, dates []string) int {
+func (s *MarketService) syncBarsFetchLimit(ctx context.Context, market string, dates []string) (int, error) {
 	if len(dates) == 0 || common.DB == nil {
-		return 1
+		return 0, errors.New("补采缺少交易日或数据库不可用")
 	}
 	var n int64
-	common.DB.Model(&model.TradingCalendar{}).
+	if err := common.DB.WithContext(ctx).Model(&model.TradingCalendar{}).
 		Where("market = ? AND is_open = ? AND trade_date >= ? AND trade_date <= ?", market, true, dates[0], time.Now().Format("2006-01-02")).
-		Limit(1000).Count(&n)
+		Count(&n).Error; err != nil {
+		return 0, err
+	}
 	limit := int(n) + 5
 	if limit < 30 {
 		limit = 30
@@ -730,12 +760,13 @@ func (s *MarketService) syncBarsFetchLimit(market string, dates []string) int {
 	if limit > 1000 {
 		limit = 1000
 	}
-	return limit
+	return limit, nil
 }
 
 // RunSyncBarsPlan 在执行瞬间重建本地计划并校验 hash，随后只补计划中的缺口日期。
 func (s *MarketService) RunSyncBarsPlan(ctx context.Context, req MaintenanceRequest, audit SyncAudit) (*model.DataSyncLog, error) {
-	prepared, err := s.buildSyncBarsPlan(req)
+	ctx = jobSubmissionContext(ctx)
+	prepared, err := s.prepareMaintenancePlan(MaintenanceSyncBars, req, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -761,13 +792,18 @@ func (s *MarketService) RunSyncBarsPlan(ctx context.Context, req MaintenanceRequ
 		return log, nil
 	}
 
-	fetchLimit := s.syncBarsFetchLimit(prepared.view.Market, prepared.dates)
+	fetchLimit, err := s.syncBarsFetchLimit(ctx, prepared.view.Market, prepared.dates)
+	if err != nil {
+		log.Status, log.Message = "failed", truncate(err.Error(), 512)
+		s.recordSyncLog(ctx, log)
+		return log, err
+	}
 	var firstErr string
 	for _, st := range prepared.stocks {
 		if err := ctx.Err(); err != nil {
 			log.Message = truncate("任务取消: "+err.Error(), 512)
 			log.DurationMs = time.Since(start).Milliseconds()
-			log.Status = statusOf(log)
+			log.Status = statusOf(log, ctx)
 			s.recordSyncLog(ctx, log)
 			return log, err
 		}
@@ -782,7 +818,18 @@ func (s *MarketService) RunSyncBarsPlan(ctx context.Context, req MaintenanceRequ
 			if len(filtered) == 0 {
 				fetchErr = datasource.ErrNoData
 			} else {
-				fetchErr = s.persistDailyBars(ctx, st.Market, st.Symbol, filtered)
+				fetchErr = s.persistDailyBarsChecked(ctx, st.Market, st.Symbol, filtered, bars, false)
+				if fetchErr == nil {
+					expected := 0
+					for _, date := range prepared.dates {
+						if _, missing := prepared.missingKeys[st.Symbol+"@"+date]; missing {
+							expected++
+						}
+					}
+					if len(filtered) < expected {
+						fetchErr = fmt.Errorf("计划缺口 %d 天，仅取得并保存 %d 天，剩余日期待补", expected, len(filtered))
+					}
+				}
 			}
 		}
 		if fetchErr != nil {
@@ -801,7 +848,7 @@ func (s *MarketService) RunSyncBarsPlan(ctx context.Context, req MaintenanceRequ
 		}
 	}
 	log.DurationMs = time.Since(start).Milliseconds()
-	log.Status = statusOf(log)
+	log.Status = statusOf(log, ctx)
 	log.Message = truncate(fmt.Sprintf("计划缺口 %d 个股票交易日；标的成功 %d/%d", prepared.view.MissingCount, log.Succeeded, log.Total)+orStr(func() string {
 		if firstErr == "" {
 			return ""
@@ -809,7 +856,7 @@ func (s *MarketService) RunSyncBarsPlan(ctx context.Context, req MaintenanceRequ
 		return "；首错 " + firstErr
 	}(), ""), 512)
 	s.recordSyncLog(ctx, log)
-	return log, nil
+	return log, ctx.Err()
 }
 
 // BackfillCalendar 回填交易日历：用上证指数日线得到开市日集合，
@@ -824,6 +871,7 @@ func (s *MarketService) BackfillCalendar(ctx context.Context, market string) (*m
 
 // BackfillCalendarWithAudit 保留旧版全回看行为，供无 body 客户端与启动修复使用。
 func (s *MarketService) BackfillCalendarWithAudit(ctx context.Context, market string, audit SyncAudit) (*model.DataSyncLog, error) {
+	ctx = jobSubmissionContext(ctx)
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
@@ -839,16 +887,11 @@ func (s *MarketService) BackfillCalendarWithAudit(ctx context.Context, market st
 		return log, err
 	}
 
-	open := make(map[string]struct{}, len(days))
-	var minDate, maxDate string
-	for _, d := range days {
-		open[d] = struct{}{}
-		if minDate == "" || d < minDate {
-			minDate = d
-		}
-		if d > maxDate {
-			maxDate = d
-		}
+	open, minDate, maxDate, err := calendarSourceWindow(days)
+	if err != nil {
+		log.Status, log.Message = "failed", err.Error()
+		s.recordSyncLog(ctx, log)
+		return log, err
 	}
 	from, err1 := time.ParseInLocation("2006-01-02", minDate, time.Local)
 	to, err2 := time.ParseInLocation("2006-01-02", maxDate, time.Local)
@@ -877,12 +920,17 @@ func (s *MarketService) BackfillCalendarWithAudit(ctx context.Context, market st
 	}
 
 	// 显式 Select 强制写入 is_open，即使历史 DB 列上仍残留 default:true 也不会漏写休市日。
-	if err := common.DB.
+	if err := common.DB.WithContext(ctx).
 		Select("Market", "TradeDate", "IsOpen").
 		Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "market"}, {Name: "trade_date"}},
 			DoUpdates: clause.AssignmentColumns([]string{"is_open"}),
 		}).CreateInBatches(rows, 200).Error; err != nil {
+		// GORM 可能把取消与自动回滚错误拼接，错误链只留下 ErrTxDone。
+		// 请求已结束时保留原始取消/超时原因，供任务与 HTTP 层正确分类。
+		if contextErr := ctx.Err(); contextErr != nil {
+			err = contextErr
+		}
 		log.Status = "failed"
 		log.Message = truncate(err.Error(), 512)
 		log.DurationMs = time.Since(start).Milliseconds()
@@ -903,7 +951,8 @@ func (s *MarketService) BackfillCalendarWithAudit(ctx context.Context, market st
 // RunCalendarPlan 校验 dry-run 计划后，只在有限范围内订正本地日历。上游最近交易日
 // 之后的周末可确定为休市；未来工作日保持 unknown，不伪写 is_open=false。
 func (s *MarketService) RunCalendarPlan(ctx context.Context, req MaintenanceRequest, audit SyncAudit) (*model.DataSyncLog, error) {
-	prepared, err := s.buildCalendarPlan(req)
+	ctx = jobSubmissionContext(ctx)
+	prepared, err := s.prepareMaintenancePlan(MaintenanceBackfillCalendar, req, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -924,18 +973,16 @@ func (s *MarketService) RunCalendarPlan(ctx context.Context, req MaintenanceRequ
 		s.recordSyncLog(ctx, log)
 		return log, err
 	}
-	open := make(map[string]struct{}, len(days))
-	maxSourceDate := ""
-	for _, date := range days {
-		open[date] = struct{}{}
-		if date > maxSourceDate {
-			maxSourceDate = date
-		}
+	open, minSourceDate, maxSourceDate, err := calendarSourceWindow(days)
+	if err != nil {
+		log.Status, log.Message = "failed", err.Error()
+		s.recordSyncLog(ctx, log)
+		return log, err
 	}
 	rows := make([]model.TradingCalendar, 0, len(prepared.dates))
 	unresolved := 0
 	for _, date := range prepared.dates {
-		if date <= maxSourceDate {
+		if date >= minSourceDate && date <= maxSourceDate {
 			_, isOpen := open[date]
 			rows = append(rows, model.TradingCalendar{Market: prepared.view.Market, TradeDate: date, IsOpen: isOpen})
 			continue
@@ -947,10 +994,13 @@ func (s *MarketService) RunCalendarPlan(ctx context.Context, req MaintenanceRequ
 			unresolved++
 		}
 	}
-	if err := common.DB.Select("Market", "TradeDate", "IsOpen").Clauses(clause.OnConflict{
+	if err := common.DB.WithContext(ctx).Select("Market", "TradeDate", "IsOpen").Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "market"}, {Name: "trade_date"}},
 		DoUpdates: clause.AssignmentColumns([]string{"is_open"}),
 	}).CreateInBatches(rows, 200).Error; err != nil && err != gorm.ErrEmptySlice {
+		if contextErr := ctx.Err(); contextErr != nil {
+			err = contextErr
+		}
 		log.Status = "failed"
 		log.Message = truncate(err.Error(), 512)
 		log.DurationMs = time.Since(start).Milliseconds()
@@ -960,8 +1010,8 @@ func (s *MarketService) RunCalendarPlan(ctx context.Context, req MaintenanceRequ
 	log.Total = len(prepared.dates)
 	log.Succeeded = len(rows)
 	log.Failed = unresolved
-	log.Status = statusOf(log)
-	log.Message = truncate(fmt.Sprintf("%s ~ %s：订正 %d 天，未来未知工作日保留 %d 天", prepared.view.From, prepared.view.To, len(rows), unresolved), 512)
+	log.Status = statusOf(log, ctx)
+	log.Message = truncate(fmt.Sprintf("%s ~ %s：订正 %d 天，上游窗口外未知工作日保留 %d 天", prepared.view.From, prepared.view.To, len(rows), unresolved), 512)
 	log.DurationMs = time.Since(start).Milliseconds()
 	s.recordSyncLog(ctx, log)
 	return log, nil
@@ -970,6 +1020,7 @@ func (s *MarketService) RunCalendarPlan(ctx context.Context, req MaintenanceRequ
 // SnapshotMarket 拉取当前涨跌家数并落库为一条市场情绪快照，形成历史序列。
 // 与上一条完全相同（同交易日且各家数未变，典型如收盘后）则跳过，避免非交易时段堆积重复行。
 func (s *MarketService) SnapshotMarket(ctx context.Context, market string) (*model.MarketSnapshot, error) {
+	ctx = jobSubmissionContext(ctx)
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
@@ -988,10 +1039,14 @@ func (s *MarketService) SnapshotMarket(ctx context.Context, market string) (*mod
 		Source:    b.Source,
 		DataTime:  b.DataTime,
 	}
-	if last, err := s.LatestSnapshot(market); err == nil && last != nil && sameBreadth(last, snap) {
+	last, err := s.LatestSnapshot(market, ctx)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	if last != nil && sameBreadth(last, snap) {
 		return last, nil // 数据未变，复用上一条
 	}
-	if err := common.DB.Create(snap).Error; err != nil {
+	if err := common.DB.WithContext(ctx).Create(snap).Error; err != nil {
 		return nil, err
 	}
 	return snap, nil
@@ -1034,12 +1089,12 @@ func sameBreadth(a, b *model.MarketSnapshot) bool {
 }
 
 // LatestSnapshot 返回某市场最近一条情绪快照（无则 nil）。
-func (s *MarketService) LatestSnapshot(market string) (*model.MarketSnapshot, error) {
+func (s *MarketService) LatestSnapshot(market string, contexts ...context.Context) (*model.MarketSnapshot, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
 	var snap model.MarketSnapshot
-	err := common.DB.Where("market = ?", market).Order("data_time DESC").First(&snap).Error
+	err := common.DB.WithContext(jobSubmissionContext(contexts...)).Where("market = ?", market).Order("data_time DESC, id DESC").First(&snap).Error
 	if err != nil {
 		return nil, err
 	}
@@ -1047,7 +1102,7 @@ func (s *MarketService) LatestSnapshot(market string) (*model.MarketSnapshot, er
 }
 
 // RecentSyncLogs 返回最近的数据同步任务日志（供管理员排查数据缺口）。
-func (s *MarketService) RecentSyncLogs(limit int) ([]model.DataSyncLog, error) {
+func (s *MarketService) RecentSyncLogs(limit int, contexts ...context.Context) ([]model.DataSyncLog, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
@@ -1055,7 +1110,7 @@ func (s *MarketService) RecentSyncLogs(limit int) ([]model.DataSyncLog, error) {
 		limit = 50
 	}
 	var logs []model.DataSyncLog
-	err := common.DB.Order("created_at DESC").Limit(limit).Find(&logs).Error
+	err := common.DB.WithContext(jobSubmissionContext(contexts...)).Order("created_at DESC, id DESC").Limit(limit).Find(&logs).Error
 	return logs, err
 }
 
@@ -1075,7 +1130,13 @@ func (s *MarketService) recordSyncLog(ctx context.Context, log *model.DataSyncLo
 }
 
 // statusOf 依据成功/失败计数判定同步状态。
-func statusOf(log *model.DataSyncLog) string {
+func statusOf(log *model.DataSyncLog, contexts ...context.Context) string {
+	if jobSubmissionContext(contexts...).Err() != nil {
+		if log.Succeeded > 0 {
+			return "partial"
+		}
+		return "failed"
+	}
 	switch {
 	case log.Total == 0:
 		return "success"

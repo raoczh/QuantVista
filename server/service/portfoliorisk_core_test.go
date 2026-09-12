@@ -193,15 +193,18 @@ func TestHistoricalRiskDoesNotUseCurrentHoldings(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, snap := range []model.PortfolioSnapshot{
-		{UserID: 408, AccountID: account.ID, Kind: model.PortfolioKindPaper, TradeDate: "2026-01-02", Cash: 10000},
-		{UserID: 408, AccountID: account.ID, Kind: model.PortfolioKindPaper, TradeDate: "2026-01-05", Cash: 10100},
+		{UserID: 408, AccountID: account.ID, Kind: model.PortfolioKindPaper, TradeDate: "2026-01-05", Cash: 10000},
+		{UserID: 408, AccountID: account.ID, Kind: model.PortfolioKindPaper, TradeDate: "2026-01-06", Cash: 10100},
 	} {
 		if err := common.DB.Create(&snap).Error; err != nil {
 			t.Fatal(err)
 		}
+		if err := common.DB.Create(&model.TradingCalendar{Market: "cn", TradeDate: snap.TradeDate, IsOpen: true}).Error; err != nil {
+			t.Fatal(err)
+		}
 	}
 	risk := NewPortfolioRiskService(&MarketService{}, NewPositionService(&MarketService{}))
-	out, err := risk.Risk(t.Context(), 408, account.ID, NewPortfolioRiskParameters(30, 252, 0, "", "2026-01-05"))
+	out, err := risk.Risk(t.Context(), 408, account.ID, NewPortfolioRiskParameters(30, 252, 0, "", "2026-01-06"))
 	if err != nil {
 		t.Fatal(err)
 	}

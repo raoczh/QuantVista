@@ -11,6 +11,7 @@ import SectionCard from '@/components/SectionCard.vue'
 
 const props = defineProps<{
   task: TaskCenterItem | null
+  resultID?: number | null
   loading?: boolean
   actionLoading?: boolean
   error?: string
@@ -46,8 +47,11 @@ const missingFacts = computed(() => {
     <n-alert v-if="error" type="warning" :bordered="false" class="panel-alert">{{ error }}，已有页面数据仍保留。</n-alert>
     <n-spin :show="!!loading">
       <div v-if="!task" class="not-started">
-        <n-tag size="small" :bordered="false">未开始</n-tag>
-        <span>只有点击生成或分析按钮才会创建 AI 任务。</span>
+        <n-tag size="small" :bordered="false">{{ loading ? '读取中' : error ? '未能读取' : resultID ? '暂无任务状态' : '未开始' }}</n-tag>
+        <span v-if="loading">正在读取任务状态。</span>
+        <span v-else-if="error">可点击刷新状态重试。</span>
+        <span v-else-if="resultID">这条历史结果暂无任务状态记录，仍可查看已保存的结果。</span>
+        <span v-else>只有点击生成或分析按钮才会创建 AI 任务。</span>
       </div>
       <div v-else class="task-content">
         <div class="task-head">

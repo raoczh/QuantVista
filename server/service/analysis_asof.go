@@ -11,6 +11,8 @@ import (
 	"quantvista/datasource"
 	"quantvista/model"
 	"quantvista/setting"
+
+	"gorm.io/gorm"
 )
 
 // M2 回溯诊断：AI 个股分析加 as_of 参数——日线/指标截断到该日组装 prompt（无未来
@@ -40,11 +42,18 @@ func asOfDate(s string) (string, error) {
 }
 
 // cnBarsUpTo 读单只 A 股 daily_bars 中 trade_date <= asOf 的序列（升序，尾部 limit 根）。
-func cnBarsUpTo(symbol, asOf string, limit int) []datasource.Bar {
+func cnBarsUpTo(ctx context.Context, symbol, asOf string, limit int) ([]datasource.Bar, error) {
+	return cnBarsUpToDB(common.DB.WithContext(ctx), symbol, asOf, limit)
+}
+
+func cnBarsUpToDB(db *gorm.DB, symbol, asOf string, limit int) ([]datasource.Bar, error) {
 	var rows []model.DailyBar
-	if err := common.DB.Where("market = ? AND symbol = ? AND trade_date <= ?", "cn", symbol, asOf).
+	if err := db.Where("market = ? AND symbol = ? AND trade_date <= ?", "cn", symbol, asOf).
 		Order("trade_date DESC").Limit(limit).Find(&rows).Error; err != nil {
-		return nil
+		return nil, err
+	}
+	if err := validateLocalAdjustedBars("cn", rows); err != nil {
+		return nil, err
 	}
 	out := make([]datasource.Bar, len(rows))
 	for i, r := range rows {
@@ -53,7 +62,24 @@ func cnBarsUpTo(symbol, asOf string, limit int) []datasource.Bar {
 			Volume: r.Volume, Amount: r.Amount, TurnoverRate: r.TurnoverRate, Source: r.Source,
 		}
 	}
-	return out
+	return out, nil
+}
+
+// 后验收益的基准根与后续窗口必须共享价格快照，避免两次查询跨过前复权重锚。
+func cnBarsAfterBaseline(ctx context.Context, symbol, asOf string, limit int) (base []datasource.Bar, after []model.DailyBar, err error) {
+	err = readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		base, err = cnBarsUpToDB(tx, symbol, asOf, 1)
+		if err != nil || len(base) == 0 || base[0].Close <= 0 {
+			return err
+		}
+		if err := tx.Where("market = ? AND symbol = ? AND trade_date > ?", "cn", symbol, asOf).
+			Order("trade_date").Limit(limit).Find(&after).Error; err != nil {
+			return err
+		}
+		return validateLocalAdjustedBars("cn", after)
+	})
+	return
 }
 
 // cnStockName 标的展示名：宇宙字典优先，stocks 表兜底。
@@ -72,8 +98,8 @@ func cnStockName(symbol string) string {
 }
 
 // buildStockContextAsOf 个股模块的回溯分流入口（buildContext 调用）。
-func (s *AnalysisService) buildStockContextAsOf(req AnalyzeRequest) (*analysisContext, error) {
-	label, snap, err := buildStockSnapshotAsOf(req.Symbol, req.Market, req.AsOf)
+func (s *AnalysisService) buildStockContextAsOf(ctx context.Context, req AnalyzeRequest) (*analysisContext, error) {
+	label, snap, err := buildStockSnapshotAsOf(ctx, req.Symbol, req.Market, req.AsOf)
 	if err != nil {
 		return nil, err
 	}
@@ -81,9 +107,9 @@ func (s *AnalysisService) buildStockContextAsOf(req AnalyzeRequest) (*analysisCo
 }
 
 // buildStockSnapshotAsOf 组装「截至 as_of」的个股历史快照：仅含日线衍生数据
-//（行情由末根 bar 合成、technicals/quant_score/recent_bars 对截断序列复算），
+// （行情由末根 bar 合成、technicals/quant_score/recent_bars 对截断序列复算），
 // 估值/新闻/公告/财务/实时盘面在快照中显式声明不可得。仅支持 A 股（全市场日线地基）。
-func buildStockSnapshotAsOf(symbol, mkt, asOf string) (string, map[string]any, error) {
+func buildStockSnapshotAsOf(ctx context.Context, symbol, mkt, asOf string) (string, map[string]any, error) {
 	symbol, mkt, err := normalizeSymbolMarket(symbol, mkt)
 	if err != nil {
 		return "", nil, err
@@ -97,7 +123,10 @@ func buildStockSnapshotAsOf(symbol, mkt, asOf string) (string, map[string]any, e
 	if common.DB == nil {
 		return "", nil, errors.New("数据库不可用")
 	}
-	bars := cnBarsUpTo(symbol, asOf, asOfBarLimit)
+	bars, err := cnBarsUpTo(ctx, symbol, asOf, asOfBarLimit)
+	if err != nil {
+		return "", nil, err
+	}
 	if len(bars) == 0 {
 		return "", nil, errors.New("该标的在回溯日期前没有本地日线数据（可能未初始化全市场历史或日期过早）")
 	}
@@ -113,17 +142,17 @@ func buildStockSnapshotAsOf(symbol, mkt, asOf string) (string, map[string]any, e
 	}
 
 	quote := map[string]any{
-		"price":      round2(last.Close),
-		"open":       round2(last.Open),
-		"high":       round2(last.High),
-		"low":        round2(last.Low),
+		"price":      round4(last.Close),
+		"open":       round4(last.Open),
+		"high":       round4(last.High),
+		"low":        round4(last.Low),
 		"amount":     round2(last.Amount),
 		"trade_date": last.TradeDate,
 		"source":     "daily_bars",
 	}
 	if len(bars) >= 2 && bars[len(bars)-2].Close > 0 {
 		prev := bars[len(bars)-2].Close
-		quote["prev_close"] = round2(prev)
+		quote["prev_close"] = round4(prev)
 		quote["change_pct"] = round2((last.Close/prev - 1) * 100)
 	}
 
@@ -193,18 +222,18 @@ type HindsightTouch struct {
 
 // HindsightView 分析记录的事后核验：as_of（或创建日）之后的真实走势。
 type HindsightView struct {
-	RecordID  int64  `json:"record_id"`
-	Symbol    string `json:"symbol"`
-	Name      string `json:"name"`
-	AsOf      string `json:"as_of"`      // 基准日（回溯分析=as_of；实时分析=创建日）
-	BaseDate  string `json:"base_date"`  // 实际基准根日期（≤as_of 最近交易日）
+	RecordID  int64   `json:"record_id"`
+	Symbol    string  `json:"symbol"`
+	Name      string  `json:"name"`
+	AsOf      string  `json:"as_of"`      // 基准日（回溯分析=as_of；实时分析=创建日）
+	BaseDate  string  `json:"base_date"`  // 实际基准根日期（≤as_of 最近交易日）
 	BasePrice float64 `json:"base_price"` // 基准根收盘
-	Rating    string `json:"rating"`
+	Rating    string  `json:"rating"`
 
-	ElapsedBars int                       `json:"elapsed_bars"` // 基准日后已有的日线根数
-	Returns     map[string]*HindsightNode `json:"returns"`      // d5/d10/d20/d60（未到期为 null）
-	MaxGainPct     float64 `json:"max_gain_pct"`     // 窗口内最高价相对基准
-	MaxDrawdownPct float64 `json:"max_drawdown_pct"` // 窗口内最低价相对基准（正数）
+	ElapsedBars    int                       `json:"elapsed_bars"`     // 基准日后已有的日线根数
+	Returns        map[string]*HindsightNode `json:"returns"`          // d5/d10/d20/d60（未到期为 null）
+	MaxGainPct     float64                   `json:"max_gain_pct"`     // 窗口内最高价相对基准
+	MaxDrawdownPct float64                   `json:"max_drawdown_pct"` // 窗口内最低价相对基准（正数）
 
 	BenchReturnPct *float64 `json:"bench_return_pct,omitempty"` // 同窗基准收益（末点=min(60根,现有)）
 	AlphaPct       *float64 `json:"alpha_pct,omitempty"`
@@ -238,17 +267,15 @@ func (s *AnalysisService) Hindsight(ctx context.Context, userID, recordID int64,
 		asOf = rec.CreatedAt.In(time.Local).Format("2006-01-02")
 	}
 
-	base := cnBarsUpTo(rec.Symbol, asOf, 1)
+	base, rows, err := cnBarsAfterBaseline(ctx, rec.Symbol, asOf, hindsightWindow+20)
+	if err != nil {
+		return nil, err
+	}
 	if len(base) == 0 || base[0].Close <= 0 {
 		return nil, errors.New("该标的在基准日期前没有本地日线数据")
 	}
 	basePrice := base[0].Close
 
-	var rows []model.DailyBar
-	if err := common.DB.Where("market = ? AND symbol = ? AND trade_date > ?", "cn", rec.Symbol, asOf).
-		Order("trade_date").Limit(hindsightWindow + 20).Find(&rows).Error; err != nil {
-		return nil, err
-	}
 	after := make([]datasource.Bar, len(rows))
 	for i, r := range rows {
 		after[i] = datasource.Bar{TradeDate: r.TradeDate, Open: r.Open, High: r.High, Low: r.Low, Close: r.Close}
@@ -256,7 +283,7 @@ func (s *AnalysisService) Hindsight(ctx context.Context, userID, recordID int64,
 
 	v := &HindsightView{
 		RecordID: rec.ID, Symbol: rec.Symbol, Name: rec.Target,
-		AsOf: asOf, BaseDate: base[0].TradeDate, BasePrice: round2(basePrice),
+		AsOf: asOf, BaseDate: base[0].TradeDate, BasePrice: round4(basePrice),
 		Rating: rec.Rating, ElapsedBars: len(after),
 		Returns: map[string]*HindsightNode{"d5": nil, "d10": nil, "d20": nil, "d60": nil},
 	}
@@ -334,10 +361,10 @@ func (s *AnalysisService) Hindsight(ctx context.Context, userID, recordID int64,
 	if d20 := v.Returns["d20"]; d20 != nil {
 		switch rec.Rating {
 		case model.AnalysisRatingBullish:
-			hit := d20.ReturnPct > 0
+			hit := after[20-1].Close > basePrice
 			v.RatingHit = &hit
 		case model.AnalysisRatingBearish:
-			hit := d20.ReturnPct < 0
+			hit := after[20-1].Close < basePrice
 			v.RatingHit = &hit
 		}
 	}

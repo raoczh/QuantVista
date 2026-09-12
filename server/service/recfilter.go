@@ -1,12 +1,16 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"quantvista/common"
 	"quantvista/model"
+
+	"gorm.io/gorm"
 )
 
 // 推荐筛选器（阶段②用户硬过滤）：股价区间 / 流通市值 / 换手率 / 追高保护 / 涨停不可买。
@@ -17,14 +21,14 @@ import (
 // RecFilters 用户可配置的候选筛选条件。零值字段 = 不过滤。
 // 请求未携带时回退用户偏好（UserPreference.RecFiltersJSON），偏好也无则按类型给保护性默认。
 type RecFilters struct {
-	PriceMin      float64 `json:"price_min"`        // 股价下限（元）
-	PriceMax      float64 `json:"price_max"`        // 股价上限（元）——资金有限时的核心筛选
-	FloatCapMinYi float64 `json:"float_cap_min_yi"` // 流通市值下限（亿元）
-	FloatCapMaxYi float64 `json:"float_cap_max_yi"` // 流通市值上限（亿元）——排除超大盘「大票」
-	TurnoverMin   float64 `json:"turnover_min"`     // 换手率下限（%）
-	TurnoverMax   float64 `json:"turnover_max"`     // 换手率上限（%）；系统另有两级硬规则：>30% 一律排除、20~30% 高位排除
-	MaxGain5dPct  float64 `json:"max_gain_5d_pct"`  // 近 5 日累计涨幅上限（%，追高保护；0=不限）
-	ExcludeLimitUp bool   `json:"exclude_limit_up"` // 排除当日已封涨停（涨停买不进）
+	PriceMin       float64 `json:"price_min"`        // 股价下限（元）
+	PriceMax       float64 `json:"price_max"`        // 股价上限（元）——资金有限时的核心筛选
+	FloatCapMinYi  float64 `json:"float_cap_min_yi"` // 流通市值下限（亿元）
+	FloatCapMaxYi  float64 `json:"float_cap_max_yi"` // 流通市值上限（亿元）——排除超大盘「大票」
+	TurnoverMin    float64 `json:"turnover_min"`     // 换手率下限（%）
+	TurnoverMax    float64 `json:"turnover_max"`     // 换手率上限（%）；系统另有两级硬规则：>30% 一律排除、20~30% 高位排除
+	MaxGain5dPct   float64 `json:"max_gain_5d_pct"`  // 近 5 日累计涨幅上限（%，追高保护；0=不限）
+	ExcludeLimitUp bool    `json:"exclude_limit_up"` // 排除当日已封涨停（涨停买不进）
 	// ExcludeGemStar 排除创业板(30)/科创板(68)，仅推荐主板普通个股（20cm 波动大、
 	// 科创板有权限门槛）。北交所(4/8/92)在基础准入已排除，不归这个开关管。
 	ExcludeGemStar bool `json:"exclude_gem_star"`
@@ -71,24 +75,27 @@ func sanitizeRecFilters(f RecFilters) RecFilters {
 	return f
 }
 
-// loadUserRecFilters 读取用户偏好里的默认筛选；缺失/解析失败回退类型默认。
-func loadUserRecFilters(userID int64, recType string) RecFilters {
+// 只有未配置时使用类型默认；读取或解析失败不能放宽用户的硬约束。
+func loadUserRecFilters(userID int64, recType string, contexts ...context.Context) (RecFilters, error) {
 	def := defaultRecFilters(recType)
 	if common.DB == nil {
-		return def
+		return def, errors.New("数据库不可用")
 	}
 	var pref model.UserPreference
-	if err := common.DB.Select("rec_filters_json").Where("user_id = ?", userID).First(&pref).Error; err != nil {
-		return def
+	if err := common.DB.WithContext(jobSubmissionContext(contexts...)).Select("rec_filters_json").Where("user_id = ?", userID).First(&pref).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return def, nil
+		}
+		return def, err
 	}
 	if strings.TrimSpace(pref.RecFiltersJSON) == "" {
-		return def
+		return def, nil
 	}
-	var f RecFilters
-	if json.Unmarshal([]byte(pref.RecFiltersJSON), &f) != nil {
-		return def
+	var f *RecFilters
+	if json.Unmarshal([]byte(pref.RecFiltersJSON), &f) != nil || f == nil {
+		return def, errors.New("默认筛选数据无效，请在设置中重新保存")
 	}
-	return sanitizeRecFilters(f)
+	return sanitizeRecFilters(*f), nil
 }
 
 // Describe 生成人类可读的条件清单（前端回显 + 组合进批次标题）。空切片=无附加条件。
@@ -193,7 +200,7 @@ func applyStaticFilters(c candidate, f RecFilters) string {
 
 // applyQuoteFilters 阶段②：对候选执行用户筛选（仅依赖行情/估值快照的条件），
 // 返回排除原因；空串=通过。近 5 日涨幅条件依赖日线，在阶段③评分后判（applyGainFilter）。
-// 估值字段缺失（=0）时对应条件跳过不判（不惩罚数据缺口，保持透明由前端标注）。
+// 用户明确设定的市值/换手约束必须有可核验数据；没有设置约束时不额外要求这些字段。
 // qf3：调用时机在 freshenPool 之后——价格/涨停判断建立在刷新后的当前有效行情上。
 func applyQuoteFilters(c candidate, f RecFilters) string {
 	if reason := applyStaticFilters(c, f); reason != "" {
@@ -205,6 +212,9 @@ func applyQuoteFilters(c candidate, f RecFilters) string {
 	if f.PriceMax > 0 && c.Price > f.PriceMax {
 		return fmt.Sprintf("股价 %.2f 超出上限 %s（资金约束）", c.Price, trimFloat(f.PriceMax))
 	}
+	if (f.FloatCapMinYi > 0 || f.FloatCapMaxYi > 0) && !(c.FloatCap > 0) {
+		return "流通市值数据缺失，无法核验当前市值筛选"
+	}
 	if c.FloatCap > 0 {
 		capYi := c.FloatCap / 1e8
 		if f.FloatCapMinYi > 0 && capYi < f.FloatCapMinYi {
@@ -213,6 +223,9 @@ func applyQuoteFilters(c candidate, f RecFilters) string {
 		if f.FloatCapMaxYi > 0 && capYi > f.FloatCapMaxYi {
 			return fmt.Sprintf("流通市值 %.0f 亿超出上限 %s 亿", capYi, trimFloat(f.FloatCapMaxYi))
 		}
+	}
+	if (f.TurnoverMin > 0 || f.TurnoverMax > 0) && !(c.TurnoverRate > 0) {
+		return "换手率为零或不可用，无法核验当前换手筛选"
 	}
 	if c.TurnoverRate > 0 {
 		if f.TurnoverMin > 0 && c.TurnoverRate < f.TurnoverMin {

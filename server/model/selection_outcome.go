@@ -5,12 +5,13 @@ import "time"
 const (
 	// SelectionOutcomeVersion 是统一 fixed-hold 结果口径版本。执行语义变化必须递增，
 	// 旧版本结果保留，不原地改写。
-	SelectionOutcomeVersion = "so1"
+	// so2 将整手入场费用计入拨款限制。
+	SelectionOutcomeVersion = "so2"
 	// SelectionOutcomeSchemaVersion 是持久化字段契约版本，与计算口径版本分开演进。
 	SelectionOutcomeSchemaVersion = "selection_outcome.v1"
 )
 
-// SelectionOutcomeHorizons 是 selection 评估固定持有期（交易日）。不包含 l2 的
+// SelectionOutcomeHorizons 是 selection 评估固定持有期（交易日）。不包含推荐的
 // 1 日计划标签，也不读取推荐止盈止损。
 var SelectionOutcomeHorizons = []int{5, 10, 20, 60}
 

@@ -1,4 +1,4 @@
-import type { RecommendationItem, RecStatus, RecTracking } from '@/api/recommendation'
+import type { PoolCandidate, RecReject, RecommendationItem, RecStatus, RecTracking } from '@/api/recommendation'
 import type { TaskStatus } from '@/api/taskCenter'
 
 export type RecommendationDecisionState = 'buy_research' | 'watch' | 'no_action' | 'insufficient' | 'expired'
@@ -25,6 +25,19 @@ export function confidenceExplanation(value: number, system?: string): string {
   if (system === 'low' || value < 45) return '把握较低，需要补数据或等待更多信号'
   if (system === 'high' && value >= 75) return '证据较完整，但仍需自行核对风险'
   return '有一定依据，仍可能因行情变化而失效'
+}
+
+// 旧快照省略零分，但仍记录已计算的排名；没有排名时保留“未提供”的语义。
+export function rankedScore(score?: number, rank?: number): number | undefined {
+  return score ?? (rank != null && rank > 0 ? 0 : undefined)
+}
+
+export function omittedCandidates(raw?: string): number {
+  if (!raw) return 0
+  try {
+    const value = JSON.parse(raw)?.pool_omitted
+    return Number.isSafeInteger(value) && value > 0 ? value : 0
+  } catch { return 0 }
 }
 
 /**
@@ -79,7 +92,9 @@ export interface PositionEntryAction {
 
 export function positionEntryAction(item: RecommendationItem): PositionEntryAction {
   const plan = item.detail?.execution_plan
-  if (plan?.status === 'ready') {
+  const expired = !!item.status && ['take_profit', 'stop_loss', 'expired'].includes(item.status.outcome)
+  const stale = plan?.data_status === 'stale' || plan?.data_status === 'unknown'
+  if (plan?.status === 'ready' && !expired && !stale && item.action !== 'watch') {
     return {
       ready: true,
       label: '按推荐记录建仓',
@@ -91,10 +106,46 @@ export function positionEntryAction(item: RecommendationItem): PositionEntryActi
     ready: false,
     label: '我已买入，登记到这条推荐',
     prefillQuantity: 0,
-    reasons: plan?.unavailable_reasons?.length
+    reasons: expired ? ['推荐已结算或失效，请按实际成交登记，旧计划数量不再作为当前参考']
+      : stale ? ['原计划数据已过期或时点未知，请按实际成交登记']
+      : plan?.unavailable_reasons?.length
       ? plan.unavailable_reasons
       : ['系统未给出可执行计划，此处仅登记你的实际买入事实，不代表买入建议'],
   }
+}
+
+function snapshotArray<T>(raw: string | undefined, valid: (value: unknown) => value is T): { items: T[]; invalid: boolean } {
+  if (!raw) return { items: [], invalid: false }
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return { items: [], invalid: true }
+    const items = parsed.filter(valid)
+    return { items, invalid: items.length !== parsed.length }
+  } catch { return { items: [], invalid: true } }
+}
+const isObject = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value)
+const strings = (value: unknown) => value === undefined || (Array.isArray(value) && value.every(item => typeof item === 'string'))
+const optionalNumber = (value: unknown) => value == null || (typeof value === 'number' && Number.isFinite(value))
+const optionalString = (value: unknown) => value === undefined || typeof value === 'string'
+
+/** 历史 JSON 快照逐项核验，损坏行不参与展示或统计，调用方明确披露缺失。 */
+export function parseCandidateSnapshot(raw?: string) {
+  return snapshotArray<PoolCandidate>(raw, (value): value is PoolCandidate => {
+    if (!isObject(value) || typeof value.symbol !== 'string' || !value.symbol.trim() ||
+      !optionalString(value.name) || !optionalString(value.market) || !optionalString(value.source) ||
+      !optionalString(value.excluded) || !strings(value.sources) || !strings(value.bonus) ||
+      typeof value.change_pct !== 'number' || !Number.isFinite(value.change_pct)) return false
+    if (['price', 'score', 'rank'].some(key => !optionalNumber(value[key]))) return false
+    const hit = value.strategy_hit
+    if (hit != null && (!isObject(hit) || !Number.isInteger(hit.total) || !Number.isInteger(hit.hit) ||
+      typeof hit.full !== 'boolean' || !strings(hit.matched) || !strings(hit.missed))) return false
+    return true
+  })
+}
+
+export function parseRejectedSnapshot(raw?: string) {
+  return snapshotArray<RecReject>(raw, (value): value is RecReject => isObject(value) &&
+    typeof value.symbol === 'string' && !!value.symbol.trim() && optionalString(value.name) && typeof value.reason === 'string')
 }
 
 export function businessStatusLabel(status: RecStatus): string {

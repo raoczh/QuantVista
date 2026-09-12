@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"sort"
 	"strings"
@@ -8,6 +9,8 @@ import (
 
 	"quantvista/common"
 	"quantvista/model"
+
+	"gorm.io/gorm"
 )
 
 const candidateAuditReportMaxRuns = 30
@@ -139,7 +142,7 @@ type CandidateAuditAdminReport struct {
 	Notes          []string                  `json:"notes"`
 }
 
-func loadCandidateAuditFacts(userID int64, recType string, maxRuns int) ([]model.CandidateAuditRun, []model.CandidateAuditItem, error) {
+func loadCandidateAuditFacts(userID int64, recType string, maxRuns int, contexts ...context.Context) ([]model.CandidateAuditRun, []model.CandidateAuditItem, error) {
 	if common.DB == nil {
 		return nil, nil, errors.New("数据库不可用")
 	}
@@ -147,38 +150,44 @@ func loadCandidateAuditFacts(userID int64, recType string, maxRuns int) ([]model
 		maxRuns = candidateAuditReportMaxRuns
 	}
 	var runs []model.CandidateAuditRun
-	if err := common.DB.Where("owner_type = ? AND audit_version = ? AND parameter_hash = ? AND status IN ?",
-		model.JobOwnerSystem, CandidateAuditVersion, candidateAuditParameterHash(),
-		[]string{model.CandidateAuditStatusSuccess, model.CandidateAuditStatusPartial}).
-		Order("outcome_date DESC, id DESC").Limit(maxRuns).Find(&runs).Error; err != nil {
-		return nil, nil, err
-	}
-	if len(runs) == 0 {
-		return runs, []model.CandidateAuditItem{}, nil
-	}
-	runIDs := make([]int64, 0, len(runs))
-	for _, run := range runs {
-		runIDs = append(runIDs, run.ID)
-	}
-	q := common.DB.Where("run_id IN ?", runIDs)
-	if userID > 0 {
-		q = q.Where("user_id = ?", userID)
-	}
-	if recType != "" {
-		q = q.Where("rec_type = ?", recType)
-	}
-	var items []model.CandidateAuditItem
-	if err := q.Order("outcome_date DESC, batch_id DESC, opportunity_rank, symbol").Find(&items).Error; err != nil {
+	items := []model.CandidateAuditItem{}
+	err := readSnapshotTx(jobSubmissionContext(contexts...), func(tx *gorm.DB) error {
+		if err := tx.Where("owner_type = ? AND audit_version = ? AND parameter_hash = ? AND status IN ? AND outcome_date <= ?",
+			model.JobOwnerSystem, CandidateAuditVersion, candidateAuditParameterHash(),
+			[]string{model.CandidateAuditStatusSuccess, model.CandidateAuditStatusPartial}, time.Now().Format("2006-01-02")).
+			Order("outcome_date DESC, id DESC").Limit(maxRuns).Find(&runs).Error; err != nil {
+			return err
+		}
+		if len(runs) == 0 {
+			return nil
+		}
+		runIDs := make([]int64, 0, len(runs))
+		for _, run := range runs {
+			runIDs = append(runIDs, run.ID)
+		}
+		q := tx.Where("run_id IN ?", runIDs)
+		if userID > 0 {
+			q = q.Where("user_id = ?", userID)
+		}
+		if recType != "" {
+			q = q.Where("rec_type = ?", recType)
+		}
+		if err := q.Order("outcome_date DESC, batch_id DESC, opportunity_rank, symbol").Find(&items).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, nil, err
 	}
 	return runs, items, nil
 }
 
-func LoadCandidateAuditUserReport(userID int64, recType string, maxRuns int) (*CandidateAuditUserReport, error) {
+func LoadCandidateAuditUserReport(userID int64, recType string, maxRuns int, contexts ...context.Context) (*CandidateAuditUserReport, error) {
 	if userID <= 0 {
 		return nil, errors.New("用户身份无效")
 	}
-	runs, items, err := loadCandidateAuditFacts(userID, recType, maxRuns)
+	runs, items, err := loadCandidateAuditFacts(userID, recType, maxRuns, contexts...)
 	if err != nil {
 		return nil, err
 	}
@@ -199,8 +208,8 @@ func LoadCandidateAuditUserReport(userID int64, recType string, maxRuns int) (*C
 	return rep, nil
 }
 
-func LoadCandidateAuditAdminReport(maxRuns int) (*CandidateAuditAdminReport, error) {
-	runs, items, err := loadCandidateAuditFacts(0, "", maxRuns)
+func LoadCandidateAuditAdminReport(maxRuns int, contexts ...context.Context) (*CandidateAuditAdminReport, error) {
+	runs, items, err := loadCandidateAuditFacts(0, "", maxRuns, contexts...)
 	if err != nil {
 		return nil, err
 	}

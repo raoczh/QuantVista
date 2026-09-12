@@ -294,7 +294,7 @@ func evalSellReviewExDiv(rows []model.CorporateAction, today string) *sellReview
 	var best *model.CorporateAction
 	for i := range rows {
 		r := rows[i]
-		if r.ExDate == "" || !r.HasAdjustment() {
+		if r.ExDate == "" || !r.HasAdjustment() || (r.Progress != "" && r.Progress != model.CorpActionProgressImplemented) {
 			continue
 		}
 		ed, perr := time.ParseInLocation("2006-01-02", r.ExDate, time.Local)
@@ -338,16 +338,30 @@ func daysAheadText(days int) string {
 //
 // **fail-closed**：无当前有效行情时不写现价与浮盈亏，如实声明「行情不可用」——
 // 绝不用旧价算一个浮盈亏摆在用户面前（那比不显示更糟）。
-func composeSellReviewDetail(base string, p model.Position, price float64, quoteOK bool) (string, float64) {
+func composeSellReviewDetail(base string, p model.Position, price float64, quoteOK bool, basisIssues ...string) (string, float64) {
 	cost := p.BuyPrice
-	if !quoteOK || price <= 0 || cost <= 0 {
-		return truncateRunes(fmt.Sprintf("%s。我的持仓：成本 %.2f 元 × %g 股（当前行情不可用，浮动盈亏未知）",
-			base, cost, p.Quantity), 500), 0
+	unit := strings.ToUpper(strings.TrimSpace(p.Currency))
+	if unit == "" {
+		unit = defaultCurrencyFor(p.Market)
+	}
+	if unit == "CNY" {
+		unit = "元"
+	}
+	issue := positionCurrencyIssue(p, defaultCurrencyFor(p.Market))
+	if issue == "" && len(basisIssues) > 0 {
+		issue = basisIssues[0]
+	}
+	if !quoteOK || price <= 0 || cost <= 0 || issue != "" {
+		if issue == "" {
+			issue = "当前行情不可用"
+		}
+		return truncateRunes(fmt.Sprintf("%s。我的持仓：成本 %.2f %s × %g 股（%s，浮动盈亏未知）",
+			base, cost, unit, p.Quantity, issue), 500), 0
 	}
 	pnlPct := costPctOf(cost, price)
 	amount := round2((price - cost) * p.Quantity)
-	return truncateRunes(fmt.Sprintf("%s。我的持仓：成本 %.2f 元 × %g 股，现价 %.2f，浮动%s%.2f%%（%.2f 元）",
-		base, cost, p.Quantity, price, pnlWord(pnlPct), absFloat(pnlPct), amount), 500), pnlPct
+	return truncateRunes(fmt.Sprintf("%s。我的持仓：成本 %.2f %s × %g 股，现价 %.2f，浮动%s%.2f%%（%.2f %s）",
+		base, cost, unit, p.Quantity, price, pnlWord(pnlPct), absFloat(pnlPct), amount, unit), 500), pnlPct
 }
 
 func absFloat(v float64) float64 {
@@ -361,25 +375,33 @@ func absFloat(v float64) float64 {
 
 // upsertSellReview 落一条卖出复核（幂等）。事务内先锁并重验关联持仓仍为本人
 // holding，再执行 **OnConflict{DoNothing}**：这样扫描读到 holding 后与用户平仓并发时，
-// 不会在平仓事务终结完旧信号后又插入一条新的 open。锁顺序固定为 position → review，
-// 与平仓、删除和恢复 open 一致。已处理/忽略的唯一键行也绝不能被拉回 open。
+// 不会在平仓事务终结完旧信号后又插入一条新的 open。锁顺序固定为 account → position → review，
+// 与归档、平仓、删除和恢复 open 一致。已处理/忽略的唯一键行也绝不能被拉回 open。
 // 返回是否为本轮新建；持仓已平仓或删除视为正常跳过。
-func upsertSellReview(row *model.SellReview) (bool, error) {
+func upsertSellReview(row *model.SellReview, observed ...model.Position) (bool, error) {
+	return upsertSellReviewContext(context.Background(), row, observed...)
+}
+
+func upsertSellReviewContext(ctx context.Context, row *model.SellReview, observed ...model.Position) (bool, error) {
 	if common.DB == nil || row == nil {
 		return false, errors.New("数据库不可用")
 	}
-	created := false
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
-		var p model.Position
-		q := tx.Where("id = ? AND user_id = ? AND status = ?",
-			row.PositionID, row.UserID, model.PositionStatusHolding)
-		if tx.Dialector.Name() != "sqlite" {
-			q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+	var p model.Position
+	if len(observed) > 0 {
+		p = observed[0]
+	} else if err := common.DB.WithContext(ctx).Where("id = ? AND user_id = ? AND status = ?",
+		row.PositionID, row.UserID, model.PositionStatusHolding).First(&p).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
 		}
-		if err := q.First(&p).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return nil
-			}
+		return false, err
+	}
+	if p.ID != row.PositionID || p.UserID != row.UserID {
+		return false, errors.New("卖出复核持仓不一致")
+	}
+	created := false
+	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := verifyPositionRiskBasesTx(tx, row.UserID, []model.Position{p}); err != nil {
 			return err
 		}
 		res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(row)
@@ -389,7 +411,10 @@ func upsertSellReview(row *model.SellReview) (bool, error) {
 		created = res.RowsAffected > 0
 		return nil
 	})
-	return created, err
+	if errors.Is(err, errPositionRiskChanged) {
+		return false, nil
+	}
+	return err == nil && created, err
 }
 
 // finalizePositionSellSignalsTx 在持仓平仓/删除的同一事务内终结仍活动的卖出信号。
@@ -417,19 +442,20 @@ func finalizePositionSellSignalsTx(tx *gorm.DB, userID, positionID int64, delete
 
 // ListSellReviews 列出用户的卖出复核（status 空=open；"all"=全部）。仅本人。
 func ListSellReviews(userID int64, status string) ([]model.SellReview, error) {
+	return ListSellReviewsContext(context.Background(), userID, status)
+}
+
+func ListSellReviewsContext(ctx context.Context, userID int64, status string) ([]model.SellReview, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
-	q := common.DB.Model(&model.SellReview{}).Where("sell_reviews.user_id = ?", userID)
+	db := common.DB.WithContext(ctx)
+	q := db.Model(&model.SellReview{}).Where("sell_reviews.user_id = ?", userID)
 	switch status {
 	case "", model.SellReviewStatusOpen:
 		q = q.Where("sell_reviews.status = ?", model.SellReviewStatusOpen).
-			Where(`EXISTS (
-				SELECT 1 FROM positions
-				WHERE positions.id = sell_reviews.position_id
-				  AND positions.user_id = sell_reviews.user_id
-				  AND positions.status = ?
-			)`, model.PositionStatusHolding)
+			Where("EXISTS (?)", db.Model(&model.Position{}).Select("1").Scopes(withActivePositionAccount).
+				Where("positions.id = sell_reviews.position_id AND positions.user_id = sell_reviews.user_id AND positions.status = ?", model.PositionStatusHolding))
 	case "all":
 	case model.SellReviewStatusResolved, model.SellReviewStatusDismissed:
 		q = q.Where("sell_reviews.status = ?", status)
@@ -448,7 +474,18 @@ func ListSellReviews(userID int64, status string) ([]model.SellReview, error) {
 
 // SetSellReviewStatus 标记复核已处理/忽略（也允许恢复 open，仅本人）。
 func SetSellReviewStatus(userID, id int64, status string) (*model.SellReview, error) {
+	return SetSellReviewStatusContext(context.Background(), userID, id, status)
+}
+
+func SetSellReviewStatusContext(ctx context.Context, userID, id int64, status string) (*model.SellReview, error) {
 	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
+	}
+	return setSellReviewStatusDB(common.DB.WithContext(ctx), userID, id, status)
+}
+
+func setSellReviewStatusDB(db *gorm.DB, userID, id int64, status string) (*model.SellReview, error) {
+	if db == nil {
 		return nil, errors.New("数据库不可用")
 	}
 	switch status {
@@ -457,27 +494,49 @@ func SetSellReviewStatus(userID, id int64, status string) (*model.SellReview, er
 		return nil, errors.New("非法状态")
 	}
 	var row model.SellReview
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("id = ? AND user_id = ?", id, userID).First(&row).Error; err != nil {
-			return errors.New("卖出复核不存在")
+	if err := db.Where("id = ? AND user_id = ?", id, userID).First(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("卖出复核不存在")
+		}
+		return nil, err
+	}
+	var p model.Position
+	if status == model.SellReviewStatusOpen {
+		if err := db.Where("id = ? AND user_id = ? AND status = ?", row.PositionID, userID, model.PositionStatusHolding).First(&p).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, errors.New("关联持仓已平仓或不存在，不能恢复为待复核")
+			}
+			return nil, err
+		}
+	}
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if status == model.SellReviewStatusOpen {
+			if err := verifyPositionRiskBasesTx(tx, userID, []model.Position{p}); err != nil {
+				if errors.Is(err, errPositionRiskChanged) {
+					return errors.New("关联持仓已平仓、归档或发生变化，不能恢复为待复核")
+				}
+				return err
+			}
+		}
+		// account → position → review；状态写入和回执共享事务，删除后不能返回虚假成功。
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ?", id, userID).First(&row).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("卖出复核不存在")
+			}
+			return err
 		}
 		if status == model.SellReviewStatusOpen {
-			var p model.Position
-			q := tx.Where("id = ? AND user_id = ?", row.PositionID, userID)
-			if tx.Dialector.Name() != "sqlite" {
-				q = q.Clauses(clause.Locking{Strength: "UPDATE"})
-			}
-			if err := q.First(&p).Error; err != nil || p.Status != model.PositionStatusHolding {
-				return errors.New("关联持仓已平仓或不存在，不能恢复为待复核")
-			}
 			row.ResolvedAt = nil
 		} else {
 			now := time.Now()
 			row.ResolvedAt = &now
 		}
 		row.Status = status
-		return tx.Model(&model.SellReview{}).Where("id = ? AND user_id = ?", id, userID).
-			Updates(map[string]any{"status": row.Status, "resolved_at": row.ResolvedAt}).Error
+		if err := tx.Model(&model.SellReview{}).Where("id = ? AND user_id = ?", id, userID).
+			Updates(map[string]any{"status": row.Status, "resolved_at": row.ResolvedAt}).Error; err != nil {
+			return err
+		}
+		return tx.Where("id = ? AND user_id = ?", id, userID).First(&row).Error
 	})
 	if err != nil {
 		return nil, err
@@ -493,7 +552,7 @@ func sellReviewUserIDs(ctx context.Context) ([]int64, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
-	if err := common.DB.WithContext(ctx).Model(&model.Position{}).
+	if err := common.DB.WithContext(ctx).Model(&model.Position{}).Scopes(withActivePositionAccount).
 		Where("status = ? AND market = ?", model.PositionStatusHolding, "cn").
 		Distinct().Pluck("user_id", &ids).Error; err != nil {
 		return nil, fmt.Errorf("读取候选用户失败: %w", err)
@@ -523,78 +582,104 @@ func (s *SellReviewService) evaluateSellReviewsForUser(ctx context.Context, user
 		return 0, errors.New("数据库不可用")
 	}
 	var positions []model.Position
-	if err := common.DB.WithContext(ctx).Where("user_id = ? AND status = ? AND market = ?",
-		userID, model.PositionStatusHolding, "cn").Order("id ASC").Find(&positions).Error; err != nil {
-		return 0, fmt.Errorf("读取持仓失败: %w", err)
+	var refs []QuoteRef
+	var liftBySym map[string][]model.RestrictedRelease
+	var exdivBySym map[string][]model.CorporateAction
+	var fcBySym map[string]*model.EarningsForecast
+	var lhbBySym map[string][]model.LhbEntry
+	var maBySym map[string]*sellReviewHit
+	var unconfirmed map[int64]bool
+	// 在一个只读快照中读取事件与持仓依据，网络行情不占用数据库事务。
+	err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		if err := tx.Scopes(withActivePositionAccount).Where("user_id = ? AND status = ? AND market = ?",
+			userID, model.PositionStatusHolding, "cn").Order("id ASC").Find(&positions).Error; err != nil {
+			return fmt.Errorf("读取持仓失败: %w", err)
+		}
+		if len(positions) == 0 {
+			return nil
+		}
+		seen := map[string]bool{}
+		var syms []string
+		refs = make([]QuoteRef, 0, len(positions))
+		for _, p := range positions {
+			if seen[p.Symbol] {
+				continue
+			}
+			seen[p.Symbol] = true
+			syms = append(syms, p.Symbol)
+			refs = append(refs, QuoteRef{Market: p.Market, Symbol: p.Symbol})
+		}
+
+		// 五类数据一次性批量查（symbol IN），绝不逐 symbol 循环查。
+		var lifts []model.RestrictedRelease
+		if err := tx.Where("symbol IN ? AND market = ? AND free_date BETWEEN ? AND ?",
+			syms, "cn", today, mustAddDays(today, sellReviewLiftAheadDays)).
+			Order("free_date, id").Find(&lifts).Error; err != nil {
+			return fmt.Errorf("读取解禁数据失败: %w", err)
+		}
+		var exdivs []model.CorporateAction
+		if err := tx.Where("symbol IN ? AND market = ? AND ex_date BETWEEN ? AND ?",
+			syms, "cn", today, mustAddDays(today, sellReviewExDivAheadDays)).
+			Order("ex_date, id").Find(&exdivs).Error; err != nil {
+			return fmt.Errorf("读取除权除息数据失败: %w", err)
+		}
+		var fcs []model.EarningsForecast
+		if err := tx.Where("symbol IN ? AND market = ? AND notice_date BETWEEN ? AND ?", syms, "cn", since, today).
+			Order("notice_date DESC, id DESC").Find(&fcs).Error; err != nil {
+			return fmt.Errorf("读取业绩预告数据失败: %w", err)
+		}
+		var lhbs []model.LhbEntry
+		if err := tx.Where("symbol IN ? AND market = ? AND trade_date BETWEEN ? AND ?", syms, "cn", since, today).
+			Order("trade_date, id").Find(&lhbs).Error; err != nil {
+			return fmt.Errorf("读取龙虎榜数据失败: %w", err)
+		}
+
+		liftBySym = map[string][]model.RestrictedRelease{}
+		for _, r := range lifts {
+			liftBySym[r.Symbol] = append(liftBySym[r.Symbol], r)
+		}
+		exdivBySym = map[string][]model.CorporateAction{}
+		for _, r := range exdivs {
+			exdivBySym[r.Symbol] = append(exdivBySym[r.Symbol], r)
+		}
+		fcBySym = map[string]*model.EarningsForecast{} // 每 symbol 最新一份（已按 notice_date 降序）
+		for i := range fcs {
+			if _, ok := fcBySym[fcs[i].Symbol]; !ok {
+				fcBySym[fcs[i].Symbol] = &fcs[i]
+			}
+		}
+		lhbBySym = map[string][]model.LhbEntry{}
+		for _, e := range lhbs {
+			lhbBySym[e.Symbol] = append(lhbBySym[e.Symbol], e)
+		}
+		maBySym = map[string]*sellReviewHit{}
+		for _, sym := range syms {
+			bars, err := recentLocalBarsDB(tx, "cn", sym, sellReviewBarLimit, today)
+			if err != nil {
+				return fmt.Errorf("读取 %s 日线失败: %w", sym, err)
+			}
+			if h := evalSellReviewMaBreak(bars, since, today); h != nil {
+				maBySym[sym] = h
+			}
+		}
+
+		positionIDs := make([]int64, 0, len(positions))
+		for _, p := range positions {
+			positionIDs = append(positionIDs, p.ID)
+		}
+		var err error
+		unconfirmed, err = positionsWithUnconfirmedShareActionDB(tx, userID, positionIDs, today)
+		if err != nil {
+			return fmt.Errorf("核对持仓送转状态失败: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
 	}
 	if len(positions) == 0 {
 		return 0, nil
 	}
-	seen := map[string]bool{}
-	var syms []string
-	refs := make([]QuoteRef, 0, len(positions))
-	for _, p := range positions {
-		if seen[p.Symbol] {
-			continue
-		}
-		seen[p.Symbol] = true
-		syms = append(syms, p.Symbol)
-		refs = append(refs, QuoteRef{Market: p.Market, Symbol: p.Symbol})
-	}
-
-	// 五类数据一次性批量查（symbol IN），绝不逐 symbol 循环查。
-	var lifts []model.RestrictedRelease
-	if err := common.DB.WithContext(ctx).Where("symbol IN ? AND market = ? AND free_date BETWEEN ? AND ?",
-		syms, "cn", today, mustAddDays(today, sellReviewLiftAheadDays)).
-		Order("free_date, id").Find(&lifts).Error; err != nil {
-		return 0, fmt.Errorf("读取解禁数据失败: %w", err)
-	}
-	var exdivs []model.CorporateAction
-	if err := common.DB.WithContext(ctx).Where("symbol IN ? AND market = ? AND ex_date BETWEEN ? AND ?",
-		syms, "cn", today, mustAddDays(today, sellReviewExDivAheadDays)).
-		Order("ex_date, id").Find(&exdivs).Error; err != nil {
-		return 0, fmt.Errorf("读取除权除息数据失败: %w", err)
-	}
-	var fcs []model.EarningsForecast
-	if err := common.DB.WithContext(ctx).Where("symbol IN ? AND notice_date >= ?", syms, since).
-		Order("notice_date DESC, id DESC").Find(&fcs).Error; err != nil {
-		return 0, fmt.Errorf("读取业绩预告数据失败: %w", err)
-	}
-	var lhbs []model.LhbEntry
-	if err := common.DB.WithContext(ctx).Where("symbol IN ? AND trade_date >= ?", syms, since).
-		Order("trade_date, id").Find(&lhbs).Error; err != nil {
-		return 0, fmt.Errorf("读取龙虎榜数据失败: %w", err)
-	}
-
-	liftBySym := map[string][]model.RestrictedRelease{}
-	for _, r := range lifts {
-		liftBySym[r.Symbol] = append(liftBySym[r.Symbol], r)
-	}
-	exdivBySym := map[string][]model.CorporateAction{}
-	for _, r := range exdivs {
-		exdivBySym[r.Symbol] = append(exdivBySym[r.Symbol], r)
-	}
-	fcBySym := map[string]*model.EarningsForecast{} // 每 symbol 最新一份（已按 notice_date 降序）
-	for i := range fcs {
-		if _, ok := fcBySym[fcs[i].Symbol]; !ok {
-			fcBySym[fcs[i].Symbol] = &fcs[i]
-		}
-	}
-	lhbBySym := map[string][]model.LhbEntry{}
-	for _, e := range lhbs {
-		lhbBySym[e.Symbol] = append(lhbBySym[e.Symbol], e)
-	}
-	maBySym := map[string]*sellReviewHit{}
-	for _, sym := range syms {
-		bars, err := recentLocalBars(ctx, "cn", sym, sellReviewBarLimit)
-		if err != nil {
-			return 0, fmt.Errorf("读取 %s 日线失败: %w", sym, err)
-		}
-		if h := evalSellReviewMaBreak(bars, since, today); h != nil {
-			maBySym[sym] = h
-		}
-	}
-
 	// 现价（best-effort，只影响 Detail 的账面段）。market 未注入时按「行情不可用」处理——
 	// 利空事件本身与行情无关，缺行情只是让描述少一段，不该阻断待办生成。
 	var quotes map[string]FreshQuoteResult
@@ -605,6 +690,9 @@ func (s *SellReviewService) evaluateSellReviewsForUser(ctx context.Context, user
 	created := 0
 	var writeErrs []error
 	for _, p := range positions {
+		if err := ctx.Err(); err != nil {
+			return created, errors.Join(append(writeErrs, err)...)
+		}
 		var hits []sellReviewHit
 		if h := evalSellReviewLift(liftBySym[p.Symbol], today); h != nil {
 			hits = append(hits, *h)
@@ -629,8 +717,15 @@ func (s *SellReviewService) evaluateSellReviewsForUser(ctx context.Context, user
 			fq.Quote.Price > 0 && fq.Fresh.Status == freshStatusFresh {
 			price, quoteOK = fq.Quote.Price, true
 		}
+		basisIssue := positionCurrencyIssue(p, defaultCurrencyFor(p.Market))
+		if unconfirmed[p.ID] {
+			basisIssue = "送转尚未处理，持仓成本与数量口径待确认"
+		}
+		if basisIssue != "" {
+			price, quoteOK = 0, false
+		}
 		for _, h := range hits {
-			detail, pnlPct := composeSellReviewDetail(h.Detail, p, price, quoteOK)
+			detail, pnlPct := composeSellReviewDetail(h.Detail, p, price, quoteOK, basisIssue)
 			row := &model.SellReview{
 				UserID: userID, PositionID: p.ID,
 				Symbol: p.Symbol, Market: p.Market, Name: orSymbol(p.Name, p.Symbol),
@@ -640,7 +735,7 @@ func (s *SellReviewService) evaluateSellReviewsForUser(ctx context.Context, user
 				ProfitPct: pnlPct, QuoteOK: quoteOK,
 				Status: model.SellReviewStatusOpen,
 			}
-			isNew, err := upsertSellReview(row)
+			isNew, err := upsertSellReviewContext(ctx, row, p)
 			if err != nil {
 				common.SysWarn("卖出复核落库失败 user=%d pos=%d trigger=%s: %v",
 					userID, p.ID, h.Trigger, err)
@@ -669,17 +764,34 @@ func (s *SellReviewService) evaluateSellReviewsForUser(ctx context.Context, user
 // recentLocalBars 读本地日线尾部 limit 根（升序）。**零上游请求**——
 // 全市场日线 16:10 已同步，跌破均线判定不该再去打行情源。
 // 无数据返回空切片；读取失败显式上浮，不能与“尚无日线”混为一谈。
-func recentLocalBars(ctx context.Context, market, symbol string, limit int) ([]model.DailyBar, error) {
+func recentLocalBars(ctx context.Context, market, symbol string, limit int, throughDates ...string) ([]model.DailyBar, error) {
 	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
+	}
+	return recentLocalBarsDB(common.DB.WithContext(ctx), market, symbol, limit, throughDates...)
+}
+
+func recentLocalBarsDB(db *gorm.DB, market, symbol string, limit int, throughDates ...string) ([]model.DailyBar, error) {
+	if db == nil {
 		return nil, errors.New("数据库不可用")
 	}
 	if symbol == "" || limit <= 0 {
 		return nil, errors.New("日线查询参数非法")
 	}
+	through := time.Now().Format("2006-01-02")
+	if len(throughDates) > 0 {
+		through = throughDates[0]
+	}
+	if _, err := time.ParseInLocation("2006-01-02", through, time.Local); err != nil {
+		return nil, errors.New("日线截止日期非法")
+	}
 	var rows []model.DailyBar
-	if err := common.DB.WithContext(ctx).
-		Where("symbol = ? AND market = ?", symbol, market).
+	if err := db.
+		Where("symbol = ? AND market = ? AND trade_date <= ?", symbol, market, through).
 		Order("trade_date DESC").Limit(limit).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	if err := validateLocalAdjustedBars(market, rows); err != nil {
 		return nil, err
 	}
 	// 反转成升序（评估函数约定最后一根是最新交易日）。
@@ -710,13 +822,13 @@ func (s *SellReviewService) RunSellReviewRound(ctx context.Context) int {
 			return total
 		}
 		n, err := s.evaluateSellReviewsForUser(ctx, uid, today, since)
+		total += n
 		if err != nil {
 			common.SysWarn("卖出复核评估未完成 user=%d: %v", uid, err)
 			continue
 		}
 		if n > 0 {
 			common.SysLog("用户 %d 新增卖出复核 %d 条", uid, n)
-			total += n
 		}
 	}
 	return total

@@ -201,22 +201,22 @@ type SelectionChallengerCoverage struct {
 }
 
 type SelectionScoreBlindProtocolStatus struct {
-	HorizonDays            int     `json:"horizon_days"`
-	WindowGroup            string  `json:"window_group"`
-	EffectiveBatches       int     `json:"effective_batches"`
-	MinEffectiveBatches    int     `json:"min_effective_batches"`
-	ChampionCoveragePct    float64 `json:"champion_coverage_pct"`
-	ScoreBlindCoveragePct  float64 `json:"score_blind_coverage_pct"`
-	CoverageDropPct        float64 `json:"coverage_drop_pct"`
-	MaxCoverageDropPct     float64 `json:"max_coverage_drop_pct"`
-	SevereLossRatePct      float64 `json:"severe_loss_rate_pct"`
-	MaxSevereLossRatePct   float64 `json:"max_severe_loss_rate_pct"`
-	MultipleTestingMethod  string  `json:"multiple_testing_method"`
-	MultipleTestingFamily  int     `json:"multiple_testing_family"`
-	MultipleTestingApplied bool    `json:"multiple_testing_applied"`
-	Ready                  bool    `json:"ready"`
-	GuardrailsPassed       bool    `json:"guardrails_passed"`
-	Note                   string  `json:"note"`
+	HorizonDays            int      `json:"horizon_days"`
+	WindowGroup            string   `json:"window_group"`
+	EffectiveBatches       int      `json:"effective_batches"`
+	MinEffectiveBatches    int      `json:"min_effective_batches"`
+	ChampionCoveragePct    float64  `json:"champion_coverage_pct"`
+	ScoreBlindCoveragePct  float64  `json:"score_blind_coverage_pct"`
+	CoverageDropPct        float64  `json:"coverage_drop_pct"`
+	MaxCoverageDropPct     float64  `json:"max_coverage_drop_pct"`
+	SevereLossRatePct      *float64 `json:"severe_loss_rate_pct"`
+	MaxSevereLossRatePct   float64  `json:"max_severe_loss_rate_pct"`
+	MultipleTestingMethod  string   `json:"multiple_testing_method"`
+	MultipleTestingFamily  int      `json:"multiple_testing_family"`
+	MultipleTestingApplied bool     `json:"multiple_testing_applied"`
+	Ready                  bool     `json:"ready"`
+	GuardrailsPassed       bool     `json:"guardrails_passed"`
+	Note                   string   `json:"note"`
 }
 
 type SelectionChallengerEval struct {
@@ -274,7 +274,7 @@ func CachedSelectionEvalReport() *SelectionEvalReport {
 	return selectionEvalCache
 }
 
-// RunSelectionEval 推进 so1 fixed-hold outcome 并重建配对报表。路径只调用执行模拟、
+// RunSelectionEval 推进当前版本 fixed-hold outcome 并重建配对报表。路径只调用执行模拟、
 // 本地数据查询和统计函数，不经过任何 chatCompletion/LLM 服务。
 func RunSelectionEval(ctx context.Context, market *MarketService) (*SelectionEvalReport, error) {
 	if common.DB == nil {
@@ -473,10 +473,10 @@ func buildSelectionEvalReport(batches []selectionBatchFacts, now time.Time) (*Se
 		}
 	}
 	rep.Notes = []string{
-		"so1 是独立 fixed-hold 测量事实：next_open、统一费税、T+1/可成交规则、固定 5/10/20/60 交易日，不读取 TP/SL；l2 计划标签未被改写",
+		fmt.Sprintf("%s 是独立 fixed-hold 测量事实：next_open、统一费税、T+1/可成交规则、固定 5/10/20/60 交易日，不读取 TP/SL；%s 计划标签未被改写", model.SelectionOutcomeVersion, labelVersion),
 		fmt.Sprintf("主 selection 指标只纳入 facts_recorded=true、排名/输入顺序完整（观测版本 %s）、success、AI picks>0 且两组结果全部成熟非 forced 的批次；degraded、旧行、pending/forced/no_data/skipped 分列", rep.RankingVersion),
 		"组级收益按标的汇总；所有比较差先在每批内计算，再以批次为重采样单位做固定 seed paired bootstrap，避免把同批多只股票当独立样本",
-		"prompt 影子指标仅纳入 valid+ep1 且两份逐标的 JSON 完整的 run；score-blind 协议覆盖率纳入通过 sb1 seed/order/精确输入 hash 校验的全部成功、空选、失败与越池终态，失败/越池只进分母不进收益指标；两类按实验类型与 experiment_id 独立分组，matched-K 不补造标的",
+		fmt.Sprintf("prompt 影子指标仅纳入 valid+%s 且两份逐标的 JSON 完整的 run；score-blind 协议覆盖率纳入通过 %s seed/order/精确输入 hash 校验的全部成功、空选、失败与越池终态，失败/越池只进分母不进收益指标；两类按实验类型与 experiment_id 独立分组，matched-K 不补造标的", llmExperimentPickSchemaVersion, scoreBlindInputSchemaVersion),
 		fmt.Sprintf("策略/regime/provider·model/prompt 分层至少 %d 个可比批次才评估，否则明确标记不确定", selectionSliceMinBatches),
 		"本报表计算路径不调用 LLM，不改推荐、prompt、权重、门控或模型路由",
 	}
@@ -790,7 +790,7 @@ func buildSelectionSection(recType string, horizon int, batches []selectionBatch
 	sec.Notes = []string{
 		"Selection：AI 取真实 recommendations；N 为该批有效 AI picks 数；Quant 仅从同批已审计机会集按 score_rank 取前 N",
 		"Action / Veto：buy、watch、未选分别统计 fixed-hold 结果，不与 selection 配对结论合成一个胜率",
-		"Plan：只在同一 AI picks 交集上比较 l2 计划结算与 so1 fixed-hold，属于辅助面板",
+		fmt.Sprintf("Plan：只在同一 AI picks 交集上比较 %s 计划结算与 %s fixed-hold，属于辅助面板", labelVersion, model.SelectionOutcomeVersion),
 	}
 	return sec
 }
@@ -1142,13 +1142,13 @@ func buildSelectionPlanPanel(recType string, horizon int, batches []selectionBat
 		panel.Coverage.CoveragePct = round2(float64(panel.Coverage.ComparableBatches) /
 			float64(panel.Coverage.CandidateBatches) * 100)
 	}
-	panel.FixedHold = makeSelectionMetric("ai_fixed_hold", "同一 AI picks · so1 fixed-hold", selected, fixedObs)
-	panel.PlanL2 = makeSelectionMetric("ai_plan_l2", "同一 AI picks · l2 计划结算", selected, planObs)
-	panel.Pair = makeSelectionPair("plan_l2_minus_fixed", "l2 计划 - so1 fixed-hold",
+	panel.FixedHold = makeSelectionMetric("ai_fixed_hold", "同一 AI picks · "+model.SelectionOutcomeVersion+" fixed-hold", selected, fixedObs)
+	panel.PlanL2 = makeSelectionMetric("ai_plan_l2", "同一 AI picks · "+labelVersion+" 计划结算", selected, planObs)
+	panel.Pair = makeSelectionPair("plan_l2_minus_fixed", labelVersion+" 计划 - "+model.SelectionOutcomeVersion+" fixed-hold",
 		"ai_plan_l2", "ai_fixed_hold", diffs, recType+":"+intKey(horizon)+":plan")
 	panel.Notes = []string{
-		"仅比较同一批、同一 AI picks、同一 horizon 且 l2/so1 都成熟非 forced 的交集；缺标签不补算",
-		"l2 可按 AI TP/SL 提前退出，so1 固定持有且不读 TP/SL；本面板只衡量计划执行差异，不代表 selection 增量",
+		fmt.Sprintf("仅比较同一批、同一 AI picks、同一 horizon 且 %s/%s 都成熟非 forced 的交集；缺标签不补算", labelVersion, model.SelectionOutcomeVersion),
+		fmt.Sprintf("%s 可按 AI TP/SL 提前退出，%s 固定持有且不读 TP/SL；本面板只衡量计划执行差异，不代表 selection 增量", labelVersion, model.SelectionOutcomeVersion),
 	}
 	return panel
 }
@@ -1339,14 +1339,22 @@ func buildSelectionChallengerEvals(recType string, horizon int,
 		if ev.ExperimentType == model.LLMExperimentTypeScoreBlind && ev.Protocol != nil {
 			championCoverage, scoreBlindCoverage := 0.0, 0.0
 			if ev.Coverage.Runs > 0 {
-				championCoverage = round2(float64(championEligible) / float64(ev.Coverage.Runs) * 100)
-				scoreBlindCoverage = round2(float64(ev.Coverage.NativeEligible) / float64(ev.Coverage.Runs) * 100)
+				championCoverage = float64(championEligible) / float64(ev.Coverage.Runs) * 100
+				scoreBlindCoverage = float64(ev.Coverage.NativeEligible) / float64(ev.Coverage.Runs) * 100
 			}
-			coverageDrop := round2(championCoverage - scoreBlindCoverage)
+			coverageDrop := championCoverage - scoreBlindCoverage
 			if coverageDrop < 0 {
 				coverageDrop = 0
 			}
-			severeLossRate := selectionEvalMetricForGroup(ev.Groups, "challenger_native").SevereLossPct
+			// 护栏使用原始比例，不能让展示用的两位小数改变协议边界。
+			// 原生 K 没有成熟观测时，亏损率未知，不能用零值放行。
+			var severeLossRate float64
+			var displayedSevereLossRate *float64
+			if len(nativeObs) > 0 {
+				severeLossRate = aggregateBatch(nativeObs).Severe
+				displayed := round2(severeLossRate)
+				displayedSevereLossRate = &displayed
+			}
 			windowGroup := "long"
 			if recType == model.RecTypeShortTerm {
 				windowGroup = "short"
@@ -1355,24 +1363,27 @@ func buildSelectionChallengerEvals(recType string, horizon int,
 				HorizonDays: horizon, WindowGroup: windowGroup,
 				EffectiveBatches:    protocolEffectiveBatches,
 				MinEffectiveBatches: ev.Protocol.MinEffectiveBatches,
-				ChampionCoveragePct: championCoverage, ScoreBlindCoveragePct: scoreBlindCoverage,
-				CoverageDropPct: coverageDrop, MaxCoverageDropPct: ev.Protocol.MaxCoverageDropPct,
-				SevereLossRatePct: severeLossRate, MaxSevereLossRatePct: ev.Protocol.MaxSevereLossRatePct,
+				ChampionCoveragePct: round2(championCoverage), ScoreBlindCoveragePct: round2(scoreBlindCoverage),
+				CoverageDropPct: round2(coverageDrop), MaxCoverageDropPct: ev.Protocol.MaxCoverageDropPct,
+				SevereLossRatePct: displayedSevereLossRate, MaxSevereLossRatePct: ev.Protocol.MaxSevereLossRatePct,
 				MultipleTestingMethod: ev.Protocol.MultipleTestingMethod, MultipleTestingFamily: 4,
 				MultipleTestingApplied: false,
 			}
 			status.Ready = status.EffectiveBatches >= status.MinEffectiveBatches
-			status.GuardrailsPassed = status.Ready &&
-				status.CoverageDropPct <= status.MaxCoverageDropPct &&
-				status.SevereLossRatePct <= status.MaxSevereLossRatePct
-			if status.Ready {
+			const thresholdEpsilon = 1e-9 // 仅容忍浮点尾差，远小于展示精度。
+			status.GuardrailsPassed = status.Ready && status.SevereLossRatePct != nil &&
+				coverageDrop <= status.MaxCoverageDropPct+thresholdEpsilon &&
+				severeLossRate <= status.MaxSevereLossRatePct+thresholdEpsilon
+			if status.Ready && status.SevereLossRatePct == nil {
+				status.Note = "已达到 matched-K 最小有效批次，但原生 K 尚无成熟亏损观测，数值护栏待评估，不作实验结论"
+			} else if status.Ready {
 				status.Note = "已达到预注册最小有效批次；覆盖率与严重亏损率按锁定阈值判定。多重检验方法已预注册，但当前报表不生成 p 值，不作显著性结论"
 			} else {
 				status.Note = "尚未达到预注册最小有效批次，不作实验结论。多重检验方法已预注册，但当前报表不生成 p 值，不作显著性结论"
 			}
 			ev.ProtocolStatus = status
 			ev.Notes = append(ev.Notes,
-				"score-blind 为纯影子输入实验；协议状态只消费 so1 固化事实，不触发 LLM，也不自动晋级或改写 l2",
+				fmt.Sprintf("score-blind 为纯影子输入实验；协议状态只消费 %s 固化事实，不触发 LLM，也不自动晋级或改写 %s", model.SelectionOutcomeVersion, labelVersion),
 				"覆盖率门槛按有效批次占该实验有效 run 的比例比较；最小有效批次数按 challenger 与 champion 的 matched-K 成熟交集计算")
 		}
 		out = append(out, ev)

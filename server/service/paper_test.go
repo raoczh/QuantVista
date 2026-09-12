@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"quantvista/common"
@@ -32,6 +33,56 @@ func TestTradeFee(t *testing.T) {
 	_, tax = tradeFee("us", model.PaperSideSell, "AAPL", 100000)
 	if tax != 0 {
 		t.Fatalf("美股卖出不应有印花税，得到 %v", tax)
+	}
+}
+
+func TestPaperTradeQuantityUsesStoredPrecision(t *testing.T) {
+	setupTestDB(t)
+	svc := &PaperService{market: &MarketService{}}
+	for _, quantity := range []float64{0.00001, math.NaN(), math.Inf(1)} {
+		if _, err := svc.Trade(context.Background(), 905, TradeInput{Symbol: "600000", Market: "cn", Side: "buy", Price: 1000, Quantity: quantity}); err == nil {
+			t.Errorf("不能落入数量列精度的数量应拒绝：%v", quantity)
+		}
+	}
+	trade, err := svc.Trade(context.Background(), 906, TradeInput{Symbol: "600001", Market: "cn", Side: "buy", Price: 100, Quantity: 1.234567})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trade.Quantity != 1.2346 || trade.Amount != 123.46 {
+		t.Fatalf("成交金额必须基于最终保存数量计算：%+v", trade)
+	}
+	var holding model.PaperHolding
+	if err := common.DB.Where("user_id = ?", 906).First(&holding).Error; err != nil {
+		t.Fatal(err)
+	}
+	if holding.Quantity != trade.Quantity {
+		t.Fatalf("持仓数量与流水不一致：%v/%v", holding.Quantity, trade.Quantity)
+	}
+}
+
+func TestArchivedPaperOverviewRemainsReadable(t *testing.T) {
+	setupTestDB(t)
+	accounts := NewPortfolioAccountService()
+	if _, err := accounts.Create(907, PortfolioAccountInput{Name: "默认模拟", Kind: "paper"}); err != nil {
+		t.Fatal(err)
+	}
+	account, err := accounts.Create(907, PortfolioAccountInput{Name: "历史模拟", Kind: "paper"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := accounts.Archive(907, account.ID); err != nil {
+		t.Fatal(err)
+	}
+	svc := &PaperService{market: &MarketService{}}
+	view, err := svc.OverviewByAccount(context.Background(), 907, account.ID)
+	if err != nil || view.Account.AccountID != account.ID {
+		t.Fatalf("归档账户仍应可读取既有资产：view=%+v err=%v", view, err)
+	}
+	if _, err := svc.TradeByAccount(context.Background(), 907, account.ID, TradeInput{Symbol: "600000", Market: "cn", Side: "buy", Price: 10, Quantity: 100}); err == nil {
+		t.Fatal("归档账户不得交易")
+	}
+	if _, err := svc.ResetByAccount(907, account.ID, 100000); err == nil {
+		t.Fatal("归档账户不得重置")
 	}
 }
 

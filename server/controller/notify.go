@@ -50,12 +50,12 @@ func (nc *NotifyController) Update(c *gin.Context) {
 	if !ok {
 		return
 	}
-	var in service.NotifyChannelInput
+	var in service.NotifyChannelUpdateInput
 	if err := c.ShouldBindJSON(&in); err != nil {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	v, err := nc.svc.Update(currentUserID(c), id, in)
+	v, err := nc.svc.UpdateFields(currentUserID(c), id, in)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return

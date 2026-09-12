@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -24,12 +23,20 @@ import (
 type FinanceService struct {
 	em *datasource.EastMoneyAdapter
 
-	annMu    sync.Mutex
-	annFetch map[string]time.Time // 详情页按需补拉的冷却表 symbol -> 上次尝试时刻
+	annMu       sync.Mutex
+	annAttempts map[string]*announcementAttempt
+}
+
+var fetchAnnouncementFeed = datasource.GetEMAnnouncements
+
+type announcementAttempt struct {
+	at   time.Time
+	done chan struct{}
+	err  error // 在 close(done) 前写入；等待者收到 done 后读取。
 }
 
 func NewFinanceService() *FinanceService {
-	return &FinanceService{em: datasource.NewEastMoneyAdapter(), annFetch: map[string]time.Time{}}
+	return &FinanceService{em: datasource.NewEastMoneyAdapter(), annAttempts: map[string]*announcementAttempt{}}
 }
 
 const (
@@ -45,7 +52,6 @@ const (
 	finMaxPages       = 40        // 单类单期页数护栏（全市场预约披露约 12 页）
 	annPageSize       = 30        // 每股公告单轮拉取条数
 	annFetchCooldown  = time.Hour // 详情页按需补拉冷却
-	annStaleDays      = 7         // P1 公告水位：最新公告老于该天数时允许按需补拉（旧记录不永久阻止更新）
 	annSymbolsMax     = 80        // 每日公告采集的标的上限（自选∪持仓）
 	forecastFreshDays = 7         // earn_fcst：预告发布后多少自然日内算「新预告」
 )
@@ -307,15 +313,22 @@ func (s *FinanceService) CollectAnnouncements(ctx context.Context) (inserted int
 	}
 	var syms []string
 	// 已平仓持仓排除（不再采其公告）；稳定排序保证 LIMIT 截断可复现。
-	common.DB.Raw(`SELECT DISTINCT symbol FROM (
+	if err := common.DB.WithContext(ctx).Raw(`SELECT DISTINCT symbol FROM (
 		SELECT symbol FROM watchlist_items
 		UNION SELECT symbol FROM positions WHERE status = 'holding'
-	) t ORDER BY symbol LIMIT ?`, annSymbolsMax).Scan(&syms)
+	) t ORDER BY symbol LIMIT ?`, annSymbolsMax).Scan(&syms).Error; err != nil {
+		common.SysWarn("公告采集读取关注集合失败: %v", err)
+		return 0
+	}
 	for _, sym := range syms {
 		if !isSixDigits(sym) {
 			continue
 		}
-		inserted += s.fetchAnnouncements(ctx, sym)
+		n, err := s.fetchAnnouncements(ctx, sym)
+		inserted += n
+		if err != nil {
+			common.SysDebug("公告采集跳过 %s: %v", sym, err)
+		}
 		select {
 		case <-ctx.Done():
 			return inserted
@@ -326,13 +339,13 @@ func (s *FinanceService) CollectAnnouncements(ctx context.Context) (inserted int
 }
 
 // fetchAnnouncements 拉单只公告落库，返回新插入条数。
-func (s *FinanceService) fetchAnnouncements(ctx context.Context, symbol string) int {
-	items, err := datasource.GetEMAnnouncements(ctx, symbol, annPageSize)
+func (s *FinanceService) fetchAnnouncements(ctx context.Context, symbol string) (int, error) {
+	items, err := fetchAnnouncementFeed(ctx, symbol, annPageSize)
 	if err != nil {
-		if !errors.Is(err, datasource.ErrNoData) {
-			common.SysDebug("公告采集跳过 %s: %v", symbol, err)
+		if errors.Is(err, datasource.ErrNoData) {
+			return 0, nil
 		}
-		return 0
+		return 0, err
 	}
 	inserted := 0
 	for _, it := range items {
@@ -341,17 +354,19 @@ func (s *FinanceService) fetchAnnouncements(ctx context.Context, symbol string) 
 			Title: truncateRunes(it.Title, 500), NoticeType: truncateRunes(it.NoticeType, 60),
 			NoticeDate: it.NoticeDate.Format("2006-01-02"), URL: it.URL,
 		}
-		res := common.DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&rec)
-		if res.Error == nil && res.RowsAffected > 0 {
+		res := common.DB.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&rec)
+		if res.Error != nil {
+			return inserted, res.Error
+		}
+		if res.RowsAffected > 0 {
 			inserted++
 		}
 	}
-	return inserted
+	return inserted, nil
 }
 
-// ListAnnouncements 个股公告查询（详情页「公告」块）。库中该股无记录、或最新公告已老于
-// annStaleDays（P1：有旧记录不能永久阻止更新——一年前的旧公告会让该股公告面永远停更）
-// 时按需实时补拉一次（冷却 1h，防详情页被刷打上游），采集范围外的股也能看到公告。
+// ListAnnouncements 个股公告查询。每小时至多补拉一次，不以已有公告的发布日期
+// 作为缓存新鲜度；昨日已有公告并不能证明今日没有新公告。
 func (s *FinanceService) ListAnnouncements(ctx context.Context, symbol string, limit int) ([]model.Announcement, error) {
 	symbol = strings.TrimSpace(symbol)
 	if !isSixDigits(symbol) {
@@ -360,38 +375,53 @@ func (s *FinanceService) ListAnnouncements(ctx context.Context, symbol string, l
 	if limit <= 0 || limit > 50 {
 		limit = 20
 	}
-	var cnt int64
-	common.DB.Model(&model.Announcement{}).Where("symbol = ?", symbol).Count(&cnt)
-	needFetch := cnt == 0
-	if !needFetch {
-		var latest sql.NullString
-		common.DB.Model(&model.Announcement{}).Where("symbol = ?", symbol).
-			Select("MAX(notice_date)").Scan(&latest)
-		if latest.Valid && latest.String != "" &&
-			latest.String < time.Now().AddDate(0, 0, -annStaleDays).Format("2006-01-02") {
-			needFetch = true
-		}
+	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
 	}
-	if needFetch && s.annFetchAllowed(symbol) {
-		fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		s.fetchAnnouncements(fctx, symbol)
-		cancel()
-	}
-	var rows []model.Announcement
-	err := common.DB.Where("symbol = ?", symbol).
+	refreshErr := s.refreshAnnouncements(ctx, symbol)
+	rows := []model.Announcement{}
+	err := common.DB.WithContext(ctx).Where("symbol = ?", symbol).
 		Order("notice_date DESC, id DESC").Limit(limit).Find(&rows).Error
-	return rows, err
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 && refreshErr != nil {
+		return nil, fmt.Errorf("公告读取失败: %w", refreshErr)
+	}
+	return rows, nil
 }
 
-// annFetchAllowed 冷却检查：同一 symbol 1h 内只允许一次按需补拉。
-func (s *FinanceService) annFetchAllowed(symbol string) bool {
+// 合并同标的在途刷新，并在冷却期保留失败原因，避免首个读者还没落库，后来的
+// 读者就把空缓存当成没有公告。数据库中已有的历史公告仍可按其日期查看。
+func (s *FinanceService) refreshAnnouncements(ctx context.Context, symbol string) error {
 	s.annMu.Lock()
-	defer s.annMu.Unlock()
-	if t, ok := s.annFetch[symbol]; ok && time.Since(t) < annFetchCooldown {
-		return false
+	if s.annAttempts == nil {
+		s.annAttempts = map[string]*announcementAttempt{}
 	}
-	s.annFetch[symbol] = time.Now()
-	return true
+	if attempt := s.annAttempts[symbol]; attempt != nil && time.Since(attempt.at) < annFetchCooldown {
+		s.annMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-attempt.done:
+			return attempt.err
+		}
+	}
+	attempt := &announcementAttempt{at: time.Now(), done: make(chan struct{})}
+	s.annAttempts[symbol] = attempt
+	s.annMu.Unlock()
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	_, attempt.err = s.fetchAnnouncements(fctx, symbol)
+	cancel()
+	if ctx.Err() != nil {
+		s.annMu.Lock()
+		if s.annAttempts[symbol] == attempt {
+			delete(s.annAttempts, symbol)
+		}
+		s.annMu.Unlock()
+	}
+	close(attempt.done)
+	return attempt.err
 }
 
 // latestAnnouncementBriefs 某标的最近 limit 条公告（标题+类型+日期），供个股分析/问答
@@ -481,23 +511,25 @@ func LatestForecast(symbol string) *model.EarningsForecast {
 }
 
 // TomorrowDisclosures 自选∪持仓中次日预约披露的标的文案（日报「明日披露名单」）。
-func TomorrowDisclosures(userID int64, tomorrow string) []string {
+func TomorrowDisclosures(userID int64, tomorrow string) ([]string, error) {
 	if common.DB == nil {
-		return nil
+		return nil, fmt.Errorf("数据库不可用")
 	}
 	var syms []string
 	// 已平仓持仓排除：明日披露名单直接面向用户，不该出现已清仓标的。
-	common.DB.Raw(`SELECT DISTINCT symbol FROM (
+	if err := common.DB.Raw(`SELECT DISTINCT symbol FROM (
 		SELECT symbol FROM watchlist_items WHERE user_id = ?
 		UNION SELECT symbol FROM positions WHERE user_id = ? AND status = 'holding'
-	) t`, userID, userID).Scan(&syms)
+	) t`, userID, userID).Scan(&syms).Error; err != nil {
+		return nil, err
+	}
 	if len(syms) == 0 {
-		return nil
+		return nil, nil
 	}
 	var rows []model.DisclosureSchedule
 	if err := common.DB.Where("symbol IN ? AND appoint_date = ? AND is_published = ?", syms, tomorrow, false).
 		Order("symbol ASC").Limit(30).Find(&rows).Error; err != nil {
-		return nil
+		return nil, err
 	}
 	out := make([]string, 0, len(rows))
 	for _, r := range rows {
@@ -507,7 +539,7 @@ func TomorrowDisclosures(userID int64, tomorrow string) []string {
 		}
 		out = append(out, fmt.Sprintf("%s(%s) 明日预约披露 %s", name, r.Symbol, r.ReportTypeName))
 	}
-	return out
+	return out, nil
 }
 
 // --- 后台任务 ---

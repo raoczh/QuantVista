@@ -128,6 +128,8 @@ function openDetail() {
 }
 .identity-meta {
   display: inline-flex;
+  flex-shrink: 0;
+  white-space: nowrap;
   align-items: center;
   gap: 7px;
   margin-top: 2px;

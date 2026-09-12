@@ -31,20 +31,7 @@ var (
 
 // dcThrottle 全局令牌桶（最简实现：串行化 + 最小间隔）。ctx 取消时提前返回。
 func dcThrottle(ctx context.Context) error {
-	dcMu.Lock()
-	wait := dcMinInterval - time.Since(dcLast)
-	if wait > 0 {
-		dcMu.Unlock()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(wait):
-		}
-		dcMu.Lock()
-	}
-	dcLast = time.Now()
-	dcMu.Unlock()
-	return nil
+	return waitSourceInterval(ctx, &dcMu, &dcLast, dcMinInterval)
 }
 
 // DataCenterQuery 一次报表查询的参数。Filter 语法形如 (REPORT_DATE='2026-06-30')(NOTICE_DATE>='2026-07-01')。

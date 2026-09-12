@@ -213,11 +213,14 @@ func responsesStreamStatusReject(contractEnabled bool, eventType, status, incomp
 // （Analysis.vue/Qa.vue 两处同款）——本类型只附加 code，不改动既有文案；前端迁移到按 code
 // 判断后才可考虑调整文案措辞。
 type RefusalError struct {
-	Code string
-	Msg  string
+	Code  string
+	Msg   string
+	cause error
 }
 
 func (e *RefusalError) Error() string { return e.Msg }
+
+func (e *RefusalError) Unwrap() error { return e.cause }
 
 // RefusalCode 供 common.ApiError 的接口探测（common 包不 import service，走鸭子类型）。
 func (e *RefusalError) RefusalCode() string { return e.Code }
@@ -281,14 +284,14 @@ func classifyLLMError(err error) error {
 	}
 	msg := err.Error()
 	lower := strings.ToLower(msg)
+	code := RefusalLLMCallFailed
 	if strings.Contains(lower, "content_filter") || strings.Contains(msg, "安全策略拦截") {
-		return refusalErr(RefusalLLMContentFiltered, msg)
-	}
-	if strings.Contains(lower, "eof_without_marker") || strings.Contains(msg, "未收到终止") ||
+		code = RefusalLLMContentFiltered
+	} else if strings.Contains(lower, "eof_without_marker") || strings.Contains(msg, "未收到终止") ||
 		strings.Contains(msg, "缺失完成状态") || strings.Contains(msg, "完成状态不受信任") ||
 		strings.Contains(msg, "响应未完成") || strings.Contains(msg, "返回空内容") ||
 		strings.Contains(msg, "响应中断") || strings.Contains(lower, "finish_reason") {
-		return refusalErr(RefusalLLMResponseIncomplete, msg)
+		code = RefusalLLMResponseIncomplete
 	}
-	return refusalErr(RefusalLLMCallFailed, msg)
+	return &RefusalError{Code: code, Msg: msg, cause: err}
 }

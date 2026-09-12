@@ -1,28 +1,36 @@
 <script setup lang="ts">
-import { computed, h, onMounted, ref } from 'vue'
-import { NButton, NDataTable, NSpin, NTag, useMessage, type DataTableColumns } from 'naive-ui'
+import { computed, h, onMounted, onUnmounted, ref } from 'vue'
+import { NAlert, NButton, NDataTable, NSpin, NTag, type DataTableColumns } from 'naive-ui'
 import { getFactorIC, type FactorICReport, type FactorICStat } from '@/api/admin'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import { useUi } from '@/composables/useUi'
+import { getSessionEpoch } from '@/api/token'
 
-const message = useMessage()
 const { upColor, downColor } = useUi()
 
 const report = ref<FactorICReport | null>(null)
 const loading = ref(false)
+const loadError = ref('')
+const pageSession = getSessionEpoch()
+let disposed = false
+const pageActive = () => !disposed && getSessionEpoch() === pageSession
 
 async function load(refresh: boolean) {
+  if (!pageActive() || loading.value) return
   loading.value = true
+  loadError.value = ''
   try {
-    report.value = await getFactorIC(refresh)
+    const result = await getFactorIC(refresh)
+    if (pageActive()) report.value = result
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) loadError.value = e instanceof Error ? e.message : 'IC 报表读取失败'
   } finally {
     loading.value = false
   }
 }
 onMounted(() => void load(false))
+onUnmounted(() => { disposed = true })
 
 function icColor(v: number): string | undefined {
   if (v > 0.02) return upColor.value
@@ -34,7 +42,7 @@ function icCell(row: FactorICStat, hz: string) {
   const a = row.horizons[hz]
   if (!a) return h('span', { style: 'opacity:0.4' }, '—')
   return h('span', { class: 'qv-tnum', style: `color:${icColor(a.mean_ic) || 'inherit'}` }, [
-    `${a.mean_ic.toFixed(4)} / ${a.icir.toFixed(2)} / ${a.win_rate_pct.toFixed(0)}%`,
+    `${a.mean_ic.toFixed(4)} / ${a.icir == null ? '—' : a.icir.toFixed(2)} / ${a.win_rate_pct.toFixed(0)}%`,
   ])
 }
 
@@ -69,6 +77,7 @@ const columns = computed<DataTableColumns<FactorICStat>>(() => [
         </div>
       </template>
       <n-spin :show="loading">
+        <n-alert v-if="loadError" type="error" :bordered="false">{{ loadError }}</n-alert>
         <n-data-table
           v-if="report?.stats?.length"
           :columns="columns"
@@ -77,7 +86,7 @@ const columns = computed<DataTableColumns<FactorICStat>>(() => [
           size="small"
           :scroll-x="820"
         />
-        <div v-else-if="!loading" class="ic-empty">暂无数据：需全市场日线就绪后点「重新计算」。</div>
+        <div v-else-if="!loading && !loadError" class="ic-empty">暂无数据：需全市场日线就绪后点「重新计算」。</div>
         <div v-if="report" class="ic-notes">
           <div v-for="(n, i) in report.notes" :key="i">{{ n }}</div>
           <div v-if="report.st_skipped || report.adjust_suspect">

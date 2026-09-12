@@ -3,6 +3,7 @@ import { isNavigationFailure, useRouter, type RouteLocationRaw } from 'vue-route
 import { useMessage } from 'naive-ui'
 import { listWatchlists, addItem } from '@/api/watchlist'
 import { useAuthStore } from '@/stores/auth'
+import { getSessionEpoch } from '@/api/token'
 import { recordRecentStock } from '@/composables/useRecentStocks'
 
 export interface StockRef {
@@ -155,9 +156,12 @@ export function useStockActions(onNavigate?: () => void) {
   /** 加入第一个自选分组（自用默认习惯，免选组打断） */
   async function addToWatchlist(s: StockRef) {
     const userID = auth.user?.id || 0
+    if (!userID || adding.value) return false
+    const epoch = getSessionEpoch()
     adding.value = true
     try {
       const groups = await listWatchlists()
+      if (epoch !== getSessionEpoch() || auth.user?.id !== userID) throw new Error('登录状态已变化，请重新执行操作')
       if (!groups.length) {
         message.warning('还没有自选分组，请先到自选页创建一个')
         return false

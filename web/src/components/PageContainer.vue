@@ -4,7 +4,7 @@ defineProps<{ title?: string; subtitle?: string }>()
 
 <template>
   <div class="page">
-    <header v-if="title || subtitle || $slots.actions" class="page-head qv-anim-in">
+    <header v-if="title || subtitle || $slots.title || $slots.actions" class="page-head qv-anim-in">
       <div class="page-head-text">
         <h1 v-if="title || $slots.title" class="page-title"><slot name="title">{{ title }}</slot></h1>
         <p v-if="subtitle" class="page-sub">{{ subtitle }}</p>

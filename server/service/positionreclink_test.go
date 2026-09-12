@@ -267,7 +267,10 @@ func TestUnlinkedHoldingsSoftMatch(t *testing.T) {
 		{ID: recC.ID, Symbol: "600036", Market: "cn"},
 	}
 	linked := map[int64]RecPositionLink{recB.ID: {PositionID: posB.ID}}
-	out := unlinkedHoldingsFor(userID, items, linked)
+	out, err := unlinkedHoldingsFor(common.DB, userID, items, linked)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if got, ok := out[recA.ID]; !ok || got.PositionID != posA.ID {
 		t.Fatalf("无血缘的同标的持仓应被软匹配: %+v", out)
@@ -333,7 +336,10 @@ func TestPositionRecLinksForBatch(t *testing.T) {
 
 	var rows []model.Position
 	common.DB.Where("user_id = ?", userID).Find(&rows)
-	out := positionRecLinksFor(userID, rows)
+	out, err := positionRecLinksFor(common.DB, userID, rows)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	link, ok := out[linkedPos.ID]
 	if !ok {

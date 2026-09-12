@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"quantvista/model"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // 本文件统管「持仓 ↔ 推荐」血缘的两侧读写：
@@ -48,19 +50,28 @@ type RecLinkCandidate struct {
 
 // LinkRecommendation 事后补/改/解除持仓的推荐血缘。recID=0 表示解除关联。
 //
-// 校验比建仓路径的 resolveRecommendationLink 更严：除归属外**还要求标的一致**——
-// 建仓时血缘由推荐卡片带入，标的天然对得上；事后补关联是人工选择，选错标的会直接
-// 污染「AI 推荐 vs 实际买入」的对比事实。
+// 与建仓路径一样核对归属和标的，人工选择错误时返回明确原因。
 func (s *PositionService) LinkRecommendation(userID, positionID, recID int64) (*model.Position, error) {
+	return s.LinkRecommendationContext(context.Background(), userID, positionID, recID)
+}
+
+func (s *PositionService) LinkRecommendationContext(ctx context.Context, userID, positionID, recID int64) (*model.Position, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
+	if recID < 0 {
+		return nil, errors.New("推荐编号不能为负")
+	}
+	accountID, err := positionAccountIDContext(ctx, userID, positionID)
+	if err != nil {
+		return nil, err
+	}
 	var out model.Position
 	var oldRecID int64
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
+	err = common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var p model.Position
-		if err := lockedPosition(tx, userID, positionID, &p); err != nil {
-			return errors.New("持仓不存在")
+		if err := lockedWritablePosition(tx, userID, positionID, accountID, &p); err != nil {
+			return err
 		}
 		oldRecID = p.RecommendationID
 		if recID > 0 {
@@ -81,72 +92,65 @@ func (s *PositionService) LinkRecommendation(userID, positionID, recID int64) (*
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, ctx.Err())
 	}
 	// 追踪状态里的用户执行事实必须在这里同步维护，**不能指望后台刷新**：
 	// refreshBatches 对 take_profit/stop_loss/expired 终态行直接 continue（终态冻结，
 	// 见 tracking.go frozenTerminal），已结算推荐的 actual_* 永远等不到刷新补上。
-	// 先清旧血缘（改指/解除都需要），再回填新血缘。
+	// 新旧两侧都按仍然关联的最早持仓重算，解除其中一笔不能清掉其他持仓的事实。
 	if oldRecID > 0 && oldRecID != recID {
-		clearActualExecutionFact(userID, oldRecID)
+		syncActualExecutionFact(userID, oldRecID)
 	}
 	if recID > 0 {
-		syncActualExecutionFact(userID, recID, &out)
+		syncActualExecutionFact(userID, recID)
 	}
 	return &out, nil
 }
 
-// syncActualExecutionFact 按血缘回填/清零追踪状态的用户执行事实（actual_buy_price /
-// actual_return_pct）。pos=nil 时按 recID 清零；recID<=0 时按 pos 原血缘清零。
-//
-// 只动这两列，不碰任何模拟口径字段（return_pct/outcome/…）——用户执行事实与模拟
-// 口径并列不混算是 S0-4 的既定口径。终点价复用已落库的 CurrentPrice，不发起上游请求。
-func syncActualExecutionFact(userID, recID int64, pos *model.Position) {
-	if common.DB == nil {
-		return
-	}
-	if pos == nil || recID <= 0 || pos.BuyPrice <= 0 {
-		return
-	}
-	var st model.RecommendationStatus
-	if err := common.DB.Where("recommendation_id = ? AND user_id = ?", recID, userID).
-		First(&st).Error; err != nil {
-		// 尚无追踪状态行（还没评估过）——无需回填：该条目不是终态，
-		// 下一轮 refreshBatches 会正常带上血缘计算。
-		return
-	}
-	updates := map[string]any{"actual_buy_price": pos.BuyPrice, "updated_at": time.Now()}
-	if endPrice := actualReturnEndPrice(*pos, st.CurrentPrice); endPrice > 0 {
-		updates["actual_return_pct"] = round2((endPrice - pos.BuyPrice) / pos.BuyPrice * 100)
-	} else {
-		updates["actual_return_pct"] = nil
-	}
-	if err := common.DB.Model(&model.RecommendationStatus{}).
-		Where("id = ? AND user_id = ?", st.ID, userID).Updates(updates).Error; err != nil {
-		common.SysWarn("补关联回填执行事实失败 rec=%d pos=%d: %v", recID, pos.ID, err)
-	}
-}
-
-// clearActualExecutionFact 解除血缘时清零执行事实（否则旧的实际买入价会挂在推荐上，
-// 看起来像「仍有持仓」）。
-func clearActualExecutionFact(userID, recID int64) {
+// syncActualExecutionFact 在主账本提交后更新派生执行事实，只改 actual_*。
+// 独立事务先锁追踪行，再首次读取已提交持仓，避免跨账户并发关联按旧快照互相覆盖。
+// 与推荐详情统一取 ID 最小的仍关联持仓；后台刷新也调用本函数以补偿临时写库失败。
+func syncActualExecutionFact(userID, recID int64, contexts ...context.Context) error {
 	if common.DB == nil || recID <= 0 {
-		return
+		return nil
 	}
-	if err := common.DB.Model(&model.RecommendationStatus{}).
-		Where("recommendation_id = ? AND user_id = ?", recID, userID).
-		Updates(map[string]any{
-			"actual_buy_price":  0,
-			"actual_return_pct": nil,
-			"updated_at":        time.Now(),
-		}).Error; err != nil {
-		common.SysWarn("解除血缘清零执行事实失败 rec=%d: %v", recID, err)
+	if err := common.DB.WithContext(jobSubmissionContext(contexts...)).Transaction(func(tx *gorm.DB) error {
+		var st model.RecommendationStatus
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("recommendation_id = ? AND user_id = ?", recID, userID).First(&st).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil // 尚未评估的推荐由首次追踪建立状态。
+			}
+			return err
+		}
+		var pos model.Position
+		err := tx.Where("user_id = ? AND recommendation_id = ? AND symbol = ? AND market = ?", userID, recID, st.Symbol, st.Market).
+			Order("id ASC").First(&pos).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		updates := map[string]any{"actual_buy_price": 0, "actual_return_pct": nil, "updated_at": time.Now()}
+		if err == nil && pos.BuyPrice > 0 {
+			updates["actual_buy_price"] = pos.BuyPrice
+			if endPrice := actualReturnEndPrice(pos, st.CurrentPrice); endPrice > 0 {
+				updates["actual_return_pct"] = round2((endPrice - pos.BuyPrice) / pos.BuyPrice * 100)
+			}
+		}
+		return tx.Model(&model.RecommendationStatus{}).Where("id = ? AND user_id = ?", st.ID, userID).Updates(updates).Error
+	}); err != nil {
+		common.SysWarn("同步推荐执行事实失败 rec=%d: %v", recID, err)
+		return err
 	}
+	return nil
 }
 
 // RecommendationLinkCandidates 某标的近 trackWindowDays 天内可关联的推荐条目。
 // 与追踪口径一致只取 success/degraded 批次（processing/failed 无可信条目）。
 func (s *RecommendationService) RecommendationLinkCandidates(userID int64, symbol, market string) ([]RecLinkCandidate, error) {
+	return s.RecommendationLinkCandidatesContext(context.Background(), userID, symbol, market)
+}
+
+func (s *RecommendationService) RecommendationLinkCandidatesContext(ctx context.Context, userID int64, symbol, market string) ([]RecLinkCandidate, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
@@ -154,9 +158,22 @@ func (s *RecommendationService) RecommendationLinkCandidates(userID int64, symbo
 	if err != nil {
 		return nil, err
 	}
+	var out []RecLinkCandidate
+	err = readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		out, err = s.recommendationLinkCandidatesTx(tx, userID, sym, mkt)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *RecommendationService) recommendationLinkCandidatesTx(tx *gorm.DB, userID int64, sym, mkt string) ([]RecLinkCandidate, error) {
 	cutoff := time.Now().AddDate(0, 0, -trackWindowDays)
 	var recs []model.Recommendation
-	if err := common.DB.Where("user_id = ? AND symbol = ? AND market = ? AND created_at >= ?",
+	if err := tx.Where("user_id = ? AND symbol = ? AND market = ? AND created_at >= ?",
 		userID, sym, mkt, cutoff).Order("id DESC").Find(&recs).Error; err != nil {
 		return nil, err
 	}
@@ -171,17 +188,21 @@ func (s *RecommendationService) RecommendationLinkCandidates(userID int64, symbo
 	}
 	// 批次类型 + status 过滤（一次查完，避免逐条查批次）。
 	var batches []model.RecommendationBatch
-	common.DB.Select("id", "type", "status").
+	if err := tx.Select("id", "type", "status").
 		Where("id IN ? AND user_id = ? AND status IN ?", batchIDs, userID,
-			[]string{model.RecStatusSuccess, model.RecStatusDegraded}).Find(&batches)
+			[]string{model.RecStatusSuccess, model.RecStatusDegraded}).Find(&batches).Error; err != nil {
+		return nil, err
+	}
 	batchType := make(map[int64]string, len(batches))
 	for _, b := range batches {
 		batchType[b.ID] = b.Type
 	}
 	// 已被关联的持仓（标注「已占用」，不禁止改指）。
 	var linked []model.Position
-	common.DB.Select("id", "recommendation_id").
-		Where("user_id = ? AND recommendation_id IN ?", userID, recIDs).Order("id").Find(&linked)
+	if err := tx.Select("id", "recommendation_id").
+		Where("user_id = ? AND recommendation_id IN ?", userID, recIDs).Order("id").Find(&linked).Error; err != nil {
+		return nil, err
+	}
 	linkedBy := make(map[int64]int64, len(linked))
 	for _, p := range linked {
 		if _, ok := linkedBy[p.RecommendationID]; !ok {
@@ -211,10 +232,10 @@ func (s *RecommendationService) RecommendationLinkCandidates(userID int64, symbo
 
 // positionRecLinksFor 批量取持仓的来源推荐摘要，按 position_id 索引（列表富化用）。
 // 一次查推荐 + 一次查批次类型，不做 N+1。
-func positionRecLinksFor(userID int64, positions []model.Position) map[int64]*PositionRecLink {
+func positionRecLinksFor(db *gorm.DB, userID int64, positions []model.Position) (map[int64]*PositionRecLink, error) {
 	out := map[int64]*PositionRecLink{}
-	if common.DB == nil {
-		return out
+	if db == nil {
+		return nil, errors.New("数据库不可用")
 	}
 	recIDs := make([]int64, 0, len(positions))
 	for _, p := range positions {
@@ -223,13 +244,12 @@ func positionRecLinksFor(userID int64, positions []model.Position) map[int64]*Po
 		}
 	}
 	if len(recIDs) == 0 {
-		return out
+		return out, nil
 	}
 	var recs []model.Recommendation
-	if err := common.DB.Select("id", "batch_id", "action", "ref_price", "created_at").
+	if err := db.Select("id", "batch_id", "action", "ref_price", "created_at").
 		Where("id IN ? AND user_id = ?", recIDs, userID).Find(&recs).Error; err != nil {
-		common.SysWarn("读取持仓血缘推荐失败: %v", err)
-		return out
+		return nil, err
 	}
 	byRec := make(map[int64]model.Recommendation, len(recs))
 	batchIDs := make([]int64, 0, len(recs))
@@ -240,7 +260,9 @@ func positionRecLinksFor(userID int64, positions []model.Position) map[int64]*Po
 	batchType := map[int64]string{}
 	if len(batchIDs) > 0 {
 		var batches []model.RecommendationBatch
-		common.DB.Select("id", "type").Where("id IN ? AND user_id = ?", batchIDs, userID).Find(&batches)
+		if err := db.Select("id", "type").Where("id IN ? AND user_id = ?", batchIDs, userID).Find(&batches).Error; err != nil {
+			return nil, err
+		}
 		for _, b := range batches {
 			batchType[b.ID] = b.Type
 		}
@@ -259,7 +281,7 @@ func positionRecLinksFor(userID int64, positions []model.Position) map[int64]*Po
 			CreatedAt:        r.CreatedAt,
 		}
 	}
-	return out
+	return out, nil
 }
 
 // unlinkedHoldingsFor 为「无血缘」的推荐条目找同标的在持仓中的记录（疑似买了但没登记）。
@@ -270,10 +292,10 @@ func positionRecLinksFor(userID int64, positions []model.Position) map[int64]*Po
 //
 // positions 表只装真实持仓（模拟盘走 PaperAccount/PaperTrade，另一套表），无需按账户
 // kind 过滤；跨真实账户不收窄，与 assembleView 的 posLinks 保持同一 user 级口径。
-func unlinkedHoldingsFor(userID int64, items []model.Recommendation, linked map[int64]RecPositionLink) map[int64]RecPositionLink {
+func unlinkedHoldingsFor(db *gorm.DB, userID int64, items []model.Recommendation, linked map[int64]RecPositionLink) (map[int64]RecPositionLink, error) {
 	out := map[int64]RecPositionLink{}
-	if common.DB == nil || len(items) == 0 {
-		return out
+	if len(items) == 0 {
+		return out, nil
 	}
 	symbols := make([]string, 0, len(items))
 	seen := map[string]bool{}
@@ -287,13 +309,13 @@ func unlinkedHoldingsFor(userID int64, items []model.Recommendation, linked map[
 		}
 	}
 	if len(symbols) == 0 {
-		return out
+		return out, nil
 	}
 	var rows []model.Position
-	if err := common.DB.Where("user_id = ? AND status = ? AND symbol IN ?",
-		userID, model.PositionStatusHolding, symbols).Order("id").Find(&rows).Error; err != nil {
-		common.SysWarn("软匹配未登记持仓失败: %v", err)
-		return out
+	if err := db.Scopes(withActivePositionAccount).Where("user_id = ? AND status = ? AND symbol IN ?",
+		userID, model.PositionStatusHolding, symbols).
+		Where("(recommendation_id = ? OR recommendation_id IS NULL)", 0).Order("id").Find(&rows).Error; err != nil {
+		return nil, err
 	}
 	// 同标的多笔持仓取最早一笔，与血缘视图口径一致。
 	byKey := map[string]model.Position{}
@@ -316,5 +338,5 @@ func unlinkedHoldingsFor(userID int64, items []model.Recommendation, linked map[
 			Quantity: p.Quantity, Status: p.Status,
 		}
 	}
-	return out
+	return out, nil
 }

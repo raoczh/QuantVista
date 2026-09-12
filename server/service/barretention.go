@@ -3,11 +3,15 @@ package service
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
 	"quantvista/common"
 	"quantvista/model"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // daily_bars 保留期清理。此前没有任何按日期的删除路径：每日 clist 增量约 5500 行、
@@ -75,22 +79,47 @@ func dailyBarMarkets() ([]string, error) {
 func cleanupDailyBarsForMarket(market, cutoff string) (int64, error) {
 	var deleted int64
 	for i := 0; i < barRetentionMaxBatches; i++ {
-		var ids []int64
-		if err := common.DB.Model(&model.DailyBar{}).
-			Where("market = ? AND trade_date < ?", market, cutoff).
-			Limit(barRetentionBatchRows).
-			Pluck("id", &ids).Error; err != nil {
+		var selected int
+		var batchDeleted int64
+		err := common.DB.Transaction(func(tx *gorm.DB) error {
+			var rows []model.DailyBar
+			if err := tx.Select("id", "symbol", "trade_date", "source").Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("market = ? AND trade_date < ?", market, cutoff).
+				Order("id").Limit(barRetentionBatchRows).Find(&rows).Error; err != nil {
+				return err
+			}
+			selected = len(rows)
+			if selected == 0 {
+				return nil
+			}
+			ids := make([]int64, 0, selected)
+			badDates := map[string]string{}
+			for _, row := range rows {
+				ids = append(ids, row.ID)
+				if market == "cn" && row.Source == "sina" && (badDates[row.Symbol] == "" || row.TradeDate < badDates[row.Symbol]) {
+					badDates[row.Symbol] = row.TradeDate
+				}
+			}
+			// 不可让删除原始来源后，旧因子/退出结果重新通过“无混源日线”判断。
+			symbols := make([]string, 0, len(badDates))
+			for symbol := range badDates {
+				symbols = append(symbols, symbol)
+			}
+			sort.Strings(symbols)
+			for _, symbol := range symbols {
+				if err := markUnadjustedDerivedSinceTx(tx, market, symbol, badDates[symbol]); err != nil {
+					return err
+				}
+			}
+			res := tx.Where("id IN ?", ids).Delete(&model.DailyBar{})
+			batchDeleted = res.RowsAffected
+			return res.Error
+		})
+		if err != nil {
 			return deleted, err
 		}
-		if len(ids) == 0 {
-			return deleted, nil // 本市场已删净
-		}
-		res := common.DB.Where("id IN ?", ids).Delete(&model.DailyBar{})
-		if res.Error != nil {
-			return deleted, res.Error
-		}
-		deleted += res.RowsAffected
-		if len(ids) < barRetentionBatchRows {
+		deleted += batchDeleted
+		if selected < barRetentionBatchRows {
 			return deleted, nil
 		}
 	}

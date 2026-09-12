@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -57,7 +58,21 @@ func defaultPortfolioName(kind string) string {
 
 // EnsureDefaultPortfolioAccount 首次访问和迁移共用的幂等默认账户入口。
 func EnsureDefaultPortfolioAccount(userID int64, kind string) (*model.PortfolioAccount, error) {
+	return ensureDefaultPortfolioAccountDB(common.DB, userID, kind)
+}
+
+func EnsureDefaultPortfolioAccountContext(ctx context.Context, userID int64, kind string) (*model.PortfolioAccount, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
+	}
+	return ensureDefaultPortfolioAccountDB(common.DB.WithContext(ctx), userID, kind)
+}
+
+func ensureDefaultPortfolioAccountDB(db *gorm.DB, userID int64, kind string) (*model.PortfolioAccount, error) {
+	if db == nil {
 		return nil, errors.New("数据库不可用")
 	}
 	if userID <= 0 {
@@ -66,29 +81,27 @@ func EnsureDefaultPortfolioAccount(userID int64, kind string) (*model.PortfolioA
 	if err := validatePortfolioKind(kind); err != nil {
 		return nil, err
 	}
+	// 首次探测放在事务外，不能在等待默认唯一键之前固定“账户尚不存在”的读视图。
+	var existing model.PortfolioAccount
+	lookupErr := db.Where("user_id = ? AND kind = ? AND is_default = ? AND status = ?", userID, kind, true, model.PortfolioStatusActive).First(&existing).Error
+	if lookupErr != nil && !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+		return nil, lookupErr
+	}
 	var out model.PortfolioAccount
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
-		var row model.PortfolioAccount
-		err := tx.Where("user_id = ? AND kind = ? AND is_default = ? AND status = ?", userID, kind, true, model.PortfolioStatusActive).First(&row).Error
-		if err == nil {
-			out = row
-			return ensurePaperCashAccount(tx, row)
-		}
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return err
-		}
-		row = model.PortfolioAccount{UserID: userID, Name: defaultPortfolioName(kind), Kind: kind,
-			Currency: "CNY", Status: model.PortfolioStatusActive, IsDefault: true}
-		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error; err != nil {
-			return err
-		}
-		if row.ID == 0 {
-			if err := tx.Where("user_id = ? AND kind = ? AND is_default = ? AND status = ?", userID, kind, true, model.PortfolioStatusActive).First(&row).Error; err != nil {
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+			row := model.PortfolioAccount{UserID: userID, Name: defaultPortfolioName(kind), Kind: kind,
+				Currency: "CNY", Status: model.PortfolioStatusActive, IsDefault: true}
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error; err != nil {
 				return err
 			}
 		}
-		out = row
-		return ensurePaperCashAccount(tx, row)
+		// 无论插入是否命中并发冲突，都通过当前读获取真正的默认账户及其属性。
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("user_id = ? AND kind = ? AND is_default = ? AND status = ?",
+			userID, kind, true, model.PortfolioStatusActive).First(&out).Error; err != nil {
+			return err
+		}
+		return ensurePaperCashAccount(tx, out)
 	})
 	return &out, err
 }
@@ -97,12 +110,24 @@ func ensurePaperCashAccount(tx *gorm.DB, account model.PortfolioAccount) error {
 	if account.Kind != model.PortfolioKindPaper {
 		return nil
 	}
-	var legacy model.PaperAccount
-	if err := tx.Where("user_id = ? AND (account_id = 0 OR account_id IS NULL)", account.UserID).First(&legacy).Error; err == nil {
-		return tx.Model(&model.PaperAccount{}).Where("id = ? AND user_id = ? AND (account_id = 0 OR account_id IS NULL)", legacy.ID, account.UserID).
-			Update("account_id", account.ID).Error
+	var existing model.PaperAccount
+	if err := tx.Where("user_id = ? AND account_id = ?", account.UserID, account.ID).First(&existing).Error; err == nil {
+		return nil
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
+	}
+	// 升级前的唯一模拟余额只归入默认账户；另建账户不能顺便接收旧资金。
+	if account.IsDefault {
+		var legacy model.PaperAccount
+		if err := tx.Where("user_id = ? AND (account_id = 0 OR account_id IS NULL)", account.UserID).First(&legacy).Error; err == nil {
+			res := tx.Model(&model.PaperAccount{}).Where("id = ? AND user_id = ? AND (account_id = 0 OR account_id IS NULL)", legacy.ID, account.UserID).
+				Update("account_id", account.ID)
+			if res.Error != nil || res.RowsAffected > 0 {
+				return res.Error
+			}
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
 	}
 	row := model.PaperAccount{UserID: account.UserID, AccountID: account.ID,
 		InitialCash: model.PaperDefaultCash, Cash: model.PaperDefaultCash}
@@ -110,10 +135,18 @@ func ensurePaperCashAccount(tx *gorm.DB, account model.PortfolioAccount) error {
 }
 
 func PortfolioAccountByID(userID, accountID int64, kind string) (*model.PortfolioAccount, error) {
+	return portfolioAccountByIDDB(common.DB, userID, accountID, kind)
+}
+
+func PortfolioAccountByIDContext(ctx context.Context, userID, accountID int64, kind string) (*model.PortfolioAccount, error) {
+	return portfolioAccountByIDDB(common.DB.WithContext(ctx), userID, accountID, kind)
+}
+
+func portfolioAccountByIDDB(db *gorm.DB, userID, accountID int64, kind string) (*model.PortfolioAccount, error) {
 	if userID <= 0 || accountID <= 0 {
 		return nil, gorm.ErrRecordNotFound
 	}
-	q := common.DB.Where("id = ? AND user_id = ?", accountID, userID)
+	q := db.Where("id = ? AND user_id = ?", accountID, userID)
 	if kind != "" {
 		q = q.Where("kind = ?", kind)
 	}
@@ -128,7 +161,11 @@ func PortfolioAccountByID(userID, accountID int64, kind string) (*model.Portfoli
 }
 
 func ActivePortfolioAccountByID(userID, accountID int64, kind string) (*model.PortfolioAccount, error) {
-	row, err := PortfolioAccountByID(userID, accountID, kind)
+	return activePortfolioAccountByIDDB(common.DB, userID, accountID, kind)
+}
+
+func activePortfolioAccountByIDDB(db *gorm.DB, userID, accountID int64, kind string) (*model.PortfolioAccount, error) {
+	row, err := portfolioAccountByIDDB(db, userID, accountID, kind)
 	if err != nil {
 		return nil, err
 	}
@@ -136,6 +173,24 @@ func ActivePortfolioAccountByID(userID, accountID int64, kind string) (*model.Po
 		return nil, errors.New("组合已归档，仅允许读取历史数据")
 	}
 	return row, nil
+}
+
+// lockActivePortfolioAccount 必须在写业务事实的同一事务内调用。外层校验之后可能
+// 还要等待行情等外部请求，期间账户可能被归档或删除；行锁与账户生命周期操作
+// 串行化，防止生成已删除账户的持仓或向归档账户继续入账。
+func lockActivePortfolioAccount(tx *gorm.DB, userID, accountID int64, kind string) error {
+	var account model.PortfolioAccount
+	q := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ?", accountID, userID)
+	if kind != "" {
+		q = q.Where("kind = ?", kind)
+	}
+	if err := q.First(&account).Error; err != nil {
+		return err
+	}
+	if account.Status != model.PortfolioStatusActive {
+		return errors.New("组合已归档，仅允许读取历史数据")
+	}
+	return nil
 }
 
 func ValidatePositionAccount(userID, accountID, positionID int64) error {
@@ -150,24 +205,45 @@ func ValidateWritablePositionAccount(userID, accountID, positionID int64) error 
 }
 
 func ResolvePortfolioAccount(userID, accountID int64, kind string) (*model.PortfolioAccount, error) {
+	return resolvePortfolioAccountDB(common.DB, userID, accountID, kind)
+}
+
+func ResolvePortfolioAccountContext(ctx context.Context, userID, accountID int64, kind string) (*model.PortfolioAccount, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
+	}
+	return resolvePortfolioAccountDB(common.DB.WithContext(ctx), userID, accountID, kind)
+}
+
+func resolvePortfolioAccountDB(db *gorm.DB, userID, accountID int64, kind string) (*model.PortfolioAccount, error) {
 	if accountID < 0 {
 		return nil, gorm.ErrRecordNotFound
 	}
 	if accountID > 0 {
-		return PortfolioAccountByID(userID, accountID, kind)
+		return portfolioAccountByIDDB(db, userID, accountID, kind)
 	}
-	account, err := EnsureDefaultPortfolioAccount(userID, kind)
+	account, err := ensureDefaultPortfolioAccountDB(db, userID, kind)
 	if err != nil {
 		return nil, err
 	}
-	if err := attachLegacyPortfolioRows(userID, *account); err != nil {
+	if err := attachLegacyPortfolioRowsDB(db, userID, *account); err != nil {
 		return nil, err
 	}
 	return account, nil
 }
 
 func attachLegacyPortfolioRows(userID int64, account model.PortfolioAccount) error {
-	return common.DB.Transaction(func(tx *gorm.DB) error {
+	return attachLegacyPortfolioRowsDB(common.DB, userID, account)
+}
+
+func attachLegacyPortfolioRowsDB(db *gorm.DB, userID int64, account model.PortfolioAccount) error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := lockActivePortfolioAccount(tx, userID, account.ID, account.Kind); err != nil {
+			return err
+		}
 		updates := []struct {
 			model any
 			where string
@@ -222,19 +298,27 @@ func attachLegacyPortfolioRows(userID int64, account model.PortfolioAccount) err
 }
 
 func (s *PortfolioAccountService) List(userID int64) ([]model.PortfolioAccount, error) {
-	if _, err := EnsureDefaultPortfolioAccount(userID, model.PortfolioKindReal); err != nil {
+	return s.ListContext(context.Background(), userID)
+}
+
+func (s *PortfolioAccountService) ListContext(ctx context.Context, userID int64) ([]model.PortfolioAccount, error) {
+	if _, err := EnsureDefaultPortfolioAccountContext(ctx, userID, model.PortfolioKindReal); err != nil {
 		return nil, err
 	}
-	if _, err := EnsureDefaultPortfolioAccount(userID, model.PortfolioKindPaper); err != nil {
+	if _, err := EnsureDefaultPortfolioAccountContext(ctx, userID, model.PortfolioKindPaper); err != nil {
 		return nil, err
 	}
 	var rows []model.PortfolioAccount
-	err := common.DB.Where("user_id = ?", userID).
+	err := common.DB.WithContext(ctx).Where("user_id = ?", userID).
 		Order("status ASC, kind ASC, is_default DESC, id ASC").Find(&rows).Error
 	return rows, err
 }
 
 func (s *PortfolioAccountService) Create(userID int64, in PortfolioAccountInput) (*model.PortfolioAccount, error) {
+	return s.CreateContext(context.Background(), userID, in)
+}
+
+func (s *PortfolioAccountService) CreateContext(ctx context.Context, userID int64, in PortfolioAccountInput) (*model.PortfolioAccount, error) {
 	name, err := cleanPortfolioName(in.Name)
 	if err != nil {
 		return nil, err
@@ -252,7 +336,7 @@ func (s *PortfolioAccountService) Create(userID int64, in PortfolioAccountInput)
 	}
 	row := model.PortfolioAccount{UserID: userID, Name: name, Kind: kind, Currency: currency,
 		Status: model.PortfolioStatusActive}
-	err = common.DB.Transaction(func(tx *gorm.DB) error {
+	err = common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var count int64
 		if err := tx.Model(&model.PortfolioAccount{}).Where("user_id = ? AND kind = ? AND status = ?", userID, kind, model.PortfolioStatusActive).Count(&count).Error; err != nil {
 			return err
@@ -267,27 +351,35 @@ func (s *PortfolioAccountService) Create(userID int64, in PortfolioAccountInput)
 }
 
 func (s *PortfolioAccountService) Update(userID, accountID int64, in PortfolioAccountUpdate) (*model.PortfolioAccount, error) {
+	return s.UpdateContext(context.Background(), userID, accountID, in)
+}
+
+func (s *PortfolioAccountService) UpdateContext(ctx context.Context, userID, accountID int64, in PortfolioAccountUpdate) (*model.PortfolioAccount, error) {
 	name, err := cleanPortfolioName(in.Name)
 	if err != nil {
 		return nil, err
 	}
-	row, err := PortfolioAccountByID(userID, accountID, "")
-	if err != nil {
-		return nil, err
-	}
-	if row.Status == model.PortfolioStatusArchived {
-		return nil, errors.New("已归档组合不能改名")
-	}
-	if err := common.DB.Model(&model.PortfolioAccount{}).Where("id = ? AND user_id = ?", accountID, userID).Update("name", name).Error; err != nil {
-		return nil, err
-	}
-	row.Name = name
-	return row, nil
+	var row model.PortfolioAccount
+	err = common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ?", accountID, userID).First(&row).Error; err != nil {
+			return err
+		}
+		if row.Status == model.PortfolioStatusArchived {
+			return errors.New("已归档组合不能改名")
+		}
+		row.Name = name
+		return tx.Model(&row).Update("name", name).Error
+	})
+	return &row, err
 }
 
 func (s *PortfolioAccountService) SetDefault(userID, accountID int64) (*model.PortfolioAccount, error) {
+	return s.SetDefaultContext(context.Background(), userID, accountID)
+}
+
+func (s *PortfolioAccountService) SetDefaultContext(ctx context.Context, userID, accountID int64) (*model.PortfolioAccount, error) {
 	var out model.PortfolioAccount
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
+	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var target model.PortfolioAccount
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ? AND status = ?", accountID, userID, model.PortfolioStatusActive).First(&target).Error; err != nil {
 			return err
@@ -323,27 +415,38 @@ func portfolioAccountFactCounts(tx *gorm.DB, userID, accountID int64) (map[strin
 }
 
 func (s *PortfolioAccountService) Archive(userID, accountID int64) (*model.PortfolioAccount, error) {
-	row, err := PortfolioAccountByID(userID, accountID, "")
-	if err != nil {
-		return nil, err
-	}
-	if row.Status == model.PortfolioStatusArchived {
-		return row, nil
-	}
-	if row.IsDefault {
-		return nil, errors.New("默认账户不能归档，请先切换同类型默认账户")
-	}
-	now := time.Now()
-	err = common.DB.Model(&model.PortfolioAccount{}).Where("id = ? AND user_id = ?", accountID, userID).
-		Updates(map[string]any{"status": model.PortfolioStatusArchived, "archived_at": now, "is_default": false, "default_key": nil}).Error
-	if err == nil {
-		row.Status, row.ArchivedAt, row.IsDefault = model.PortfolioStatusArchived, &now, false
-	}
-	return row, err
+	return s.ArchiveContext(context.Background(), userID, accountID)
+}
+
+func (s *PortfolioAccountService) ArchiveContext(ctx context.Context, userID, accountID int64) (*model.PortfolioAccount, error) {
+	var row model.PortfolioAccount
+	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ?", accountID, userID).First(&row).Error; err != nil {
+			return err
+		}
+		if row.Status == model.PortfolioStatusArchived {
+			return nil
+		}
+		if row.IsDefault {
+			return errors.New("默认账户不能归档，请先切换同类型默认账户")
+		}
+		now := time.Now()
+		if err := tx.Model(&model.PortfolioAccount{}).Where("id = ? AND user_id = ?", accountID, userID).
+			Updates(map[string]any{"status": model.PortfolioStatusArchived, "archived_at": now, "is_default": false, "default_key": nil}).Error; err != nil {
+			return err
+		}
+		row.Status, row.ArchivedAt, row.IsDefault, row.DefaultKey = model.PortfolioStatusArchived, &now, false, nil
+		return nil
+	})
+	return &row, err
 }
 
 func (s *PortfolioAccountService) Delete(userID, accountID int64) error {
-	return common.DB.Transaction(func(tx *gorm.DB) error {
+	return s.DeleteContext(context.Background(), userID, accountID)
+}
+
+func (s *PortfolioAccountService) DeleteContext(ctx context.Context, userID, accountID int64) error {
+	return common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var row model.PortfolioAccount
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ?", accountID, userID).First(&row).Error; err != nil {
 			return err
@@ -408,50 +511,58 @@ func validateCashFlowInput(in CashFlowInput) (CashFlowInput, error) {
 }
 
 func ListPortfolioCashFlows(userID, accountID int64) ([]model.PortfolioCashFlow, error) {
-	if _, err := PortfolioAccountByID(userID, accountID, model.PortfolioKindReal); err != nil {
+	return ListPortfolioCashFlowsContext(context.Background(), userID, accountID)
+}
+
+func ListPortfolioCashFlowsContext(ctx context.Context, userID, accountID int64) ([]model.PortfolioCashFlow, error) {
+	if _, err := PortfolioAccountByIDContext(ctx, userID, accountID, model.PortfolioKindReal); err != nil {
 		return nil, err
 	}
 	var rows []model.PortfolioCashFlow
-	err := common.DB.Where("user_id = ? AND account_id = ?", userID, accountID).
+	err := common.DB.WithContext(ctx).Where("user_id = ? AND account_id = ?", userID, accountID).
 		Order("trade_date DESC, id DESC").Find(&rows).Error
 	return rows, err
 }
 
 func CreatePortfolioCashFlow(userID, accountID int64, raw CashFlowInput) (*model.PortfolioCashFlow, error) {
-	if _, err := ActivePortfolioAccountByID(userID, accountID, model.PortfolioKindReal); err != nil {
-		return nil, err
-	}
+	return CreatePortfolioCashFlowContext(context.Background(), userID, accountID, raw)
+}
+
+func CreatePortfolioCashFlowContext(ctx context.Context, userID, accountID int64, raw CashFlowInput) (*model.PortfolioCashFlow, error) {
 	in, err := validateCashFlowInput(raw)
 	if err != nil {
 		return nil, err
 	}
-	var existing model.PortfolioCashFlow
-	err = common.DB.Where("user_id = ? AND account_id = ? AND idempotency_key = ?", userID, accountID, in.IdempotencyKey).First(&existing).Error
-	if err == nil {
-		if existing.Type != in.Type || existing.Amount != in.Amount || existing.TradeDate != in.TradeDate || existing.Note != in.Note {
-			return nil, errors.New("idempotency_key 已用于不同现金流")
-		}
-		return &existing, nil
-	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, err
-	}
 	row := model.PortfolioCashFlow{UserID: userID, AccountID: accountID, Type: in.Type, Amount: in.Amount,
 		TradeDate: in.TradeDate, Note: in.Note, IdempotencyKey: in.IdempotencyKey}
-	if err := common.DB.Create(&row).Error; err != nil {
-		if findErr := common.DB.Where("user_id = ? AND account_id = ? AND idempotency_key = ?", userID, accountID, in.IdempotencyKey).First(&existing).Error; findErr == nil {
-			if existing.Type != in.Type || existing.Amount != in.Amount || existing.TradeDate != in.TradeDate || existing.Note != in.Note {
-				return nil, errors.New("idempotency_key 已用于不同现金流")
-			}
-			return &existing, nil
+	err = common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockActivePortfolioAccount(tx, userID, accountID, model.PortfolioKindReal); err != nil {
+			return err
 		}
-		return nil, err
-	}
-	return &row, nil
+		var existing model.PortfolioCashFlow
+		err := tx.Where("user_id = ? AND account_id = ? AND idempotency_key = ?", userID, accountID, in.IdempotencyKey).First(&existing).Error
+		if err == nil {
+			if existing.Type != in.Type || existing.Amount != in.Amount || existing.TradeDate != in.TradeDate || existing.Note != in.Note {
+				return errors.New("idempotency_key 已用于不同现金流")
+			}
+			row = existing
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		return tx.Create(&row).Error
+	})
+	return &row, err
 }
 
 func ReversePortfolioCashFlow(userID, accountID, cashFlowID int64, idempotencyKey, note string) (*model.PortfolioCashFlow, error) {
-	if _, err := ActivePortfolioAccountByID(userID, accountID, model.PortfolioKindReal); err != nil {
+	return ReversePortfolioCashFlowContext(context.Background(), userID, accountID, cashFlowID, idempotencyKey, note)
+}
+
+func ReversePortfolioCashFlowContext(ctx context.Context, userID, accountID, cashFlowID int64, idempotencyKey, note string) (*model.PortfolioCashFlow, error) {
+	db := common.DB.WithContext(ctx)
+	if _, err := activePortfolioAccountByIDDB(db, userID, accountID, model.PortfolioKindReal); err != nil {
 		return nil, err
 	}
 	idempotencyKey, note = strings.TrimSpace(idempotencyKey), strings.TrimSpace(note)
@@ -462,7 +573,10 @@ func ReversePortfolioCashFlow(userID, accountID, cashFlowID int64, idempotencyKe
 		return nil, errors.New("备注不能超过 255 个字符")
 	}
 	var out model.PortfolioCashFlow
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := lockActivePortfolioAccount(tx, userID, accountID, model.PortfolioKindReal); err != nil {
+			return err
+		}
 		var source model.PortfolioCashFlow
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND user_id = ? AND account_id = ?", cashFlowID, userID, accountID).First(&source).Error; err != nil {
 			return err

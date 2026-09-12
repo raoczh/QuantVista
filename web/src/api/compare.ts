@@ -10,15 +10,15 @@ export interface CompareRow {
   price: number
   change_pct: number
   amount: number
-  ma5: number
-  ma10: number
-  ma20: number
-  period_high: number
-  period_low: number
-  change_pct_5d: number
-  change_pct_20d: number
-  above_ma20: boolean
-  score: number
+  ma5: number | null
+  ma10: number | null
+  ma20: number | null
+  period_high: number | null
+  period_low: number | null
+  change_pct_5d: number | null
+  change_pct_20d: number | null
+  above_ma20: boolean | null
+  score: number | null
   score_label: string
   valuation_ok: boolean
   is_fund?: boolean // ETF/场内基金（无个股估值指标）
@@ -31,6 +31,8 @@ export interface CompareRow {
   error: string
   quote_as_of?: string // 行情数据源时刻
   freshness_status?: string // fresh | stale | unknown（非 fresh 行不参与对比结论与 AI 点评）
+  bars_as_of?: string
+  technical_note?: string
 }
 
 export interface CompareResult {

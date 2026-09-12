@@ -232,15 +232,20 @@ func TestDailyReport_ListGetIsolation(t *testing.T) {
 	}
 }
 
-// TestChargeAction 手动动作计次辅助：只加 action_used。
-func TestChargeAction(t *testing.T) {
+// 预留与结算动作次数不应伪造 token 或请求数审计。
+func TestManualQuotaReservationDoesNotChangeTokenAudit(t *testing.T) {
 	setupTestDB(t)
 	if _, err := getUserQuota(9); err != nil {
 		t.Fatalf("建配额行失败: %v", err)
 	}
-	chargeAction(9)
+	ctx, finish, err := beginManualQuotaAction(t.Context(), 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noteManualQuotaResponse(ctx, &chatResult{Content: "完成的动作"})
+	finish()
 	q, _ := getUserQuota(9)
 	if q.ActionUsed != 1 || q.TokenUsed != 0 || q.RequestCount != 0 {
-		t.Fatalf("chargeAction 只应加次数: %+v", q)
+		t.Fatalf("动作预留只应计次数: %+v", q)
 	}
 }

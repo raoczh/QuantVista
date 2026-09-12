@@ -110,7 +110,7 @@ func (mc *MarketController) GetQuote(c *gin.Context) {
 	}
 	q, _, err := mc.svc.GetFreshQuote(c.Request.Context(), market, symbol)
 	if err != nil {
-		common.ApiErrorMsg(c, "获取行情失败: "+err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "获取行情失败: 请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, struct {
@@ -124,7 +124,7 @@ func (mc *MarketController) GetQuote(c *gin.Context) {
 func (mc *MarketController) GetMinuteLine(c *gin.Context) {
 	line, err := mc.intraday.MinuteLine(c.Request.Context(), c.Param("market"), c.Param("symbol"))
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "市场操作失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, line)
@@ -146,7 +146,7 @@ func (mc *MarketController) GetDailyBars(c *gin.Context) {
 	}
 	bars, err := mc.svc.GetDailyBars(c.Request.Context(), market, symbol, limit)
 	if err != nil {
-		common.ApiErrorMsg(c, "获取日线失败: "+err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "获取日线失败: 请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, bars)
@@ -162,7 +162,7 @@ func (mc *MarketController) GetScore(c *gin.Context) {
 	}
 	v, err := mc.score.Score(c.Request.Context(), market, symbol)
 	if err != nil {
-		common.ApiErrorMsg(c, "评分失败: "+err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "评分失败: 请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, v)
@@ -178,7 +178,7 @@ func (mc *MarketController) GetValuation(c *gin.Context) {
 	}
 	v, err := mc.svc.GetValuation(c.Request.Context(), market, symbol)
 	if err != nil {
-		common.ApiErrorMsg(c, "获取估值失败: "+err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "获取估值失败: 请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, v)
@@ -201,7 +201,7 @@ func (mc *MarketController) GetIndicators(c *gin.Context) {
 	}
 	view, err := mc.indicator.Series(c.Request.Context(), market, symbol, limit)
 	if err != nil {
-		common.ApiErrorMsg(c, "获取指标失败: "+err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "获取指标失败: 请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, view)
@@ -218,7 +218,7 @@ func (mc *MarketController) GetChips(c *gin.Context) {
 	}
 	view, err := mc.chip.Distribution(c.Request.Context(), market, symbol)
 	if err != nil {
-		common.ApiErrorMsg(c, "获取筹码分布失败: "+err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "获取筹码分布失败: 请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, view)
@@ -231,23 +231,23 @@ func (mc *MarketController) GetChips(c *gin.Context) {
 func (mc *MarketController) SyncBars(c *gin.Context) {
 	req, hasBody, err := maintenanceRequest(c)
 	if err != nil {
-		common.ApiErrorMsg(c, "补采参数无效: "+err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "补采参数无效: 请稍后重试"))
 		return
 	}
 	audit := service.AdminSyncAudit(currentUserID(c), req, !hasBody)
 	if hasBody && req.DryRun {
-		plan, err := mc.svc.PlanMaintenance(service.MaintenanceSyncBars, req)
+		plan, err := mc.svc.PlanMaintenance(service.MaintenanceSyncBars, req, c.Request.Context())
 		if err != nil {
-			common.ApiErrorMsg(c, "生成日线补采计划失败: "+err.Error())
+			common.ApiErrorMsg(c, publicWorkflowError(err, "生成日线补采计划失败: 请稍后重试"))
 			return
 		}
 		common.ApiSuccess(c, gin.H{"dry_run": true, "plan": plan})
 		return
 	}
 	if hasBody {
-		if err := mc.svc.ValidateMaintenancePlan(service.MaintenanceSyncBars, req); err != nil {
-			mc.svc.RecordMaintenanceFailure(service.MaintenanceSyncBars, req.Market, audit, err)
-			common.ApiErrorMsg(c, err.Error())
+		if err := mc.svc.ValidateMaintenancePlan(service.MaintenanceSyncBars, req, c.Request.Context()); err != nil {
+			mc.svc.RecordMaintenanceFailure(service.MaintenanceSyncBars, req.Market, audit, err, c.Request.Context())
+			common.ApiErrorMsg(c, publicWorkflowError(err, "市场操作失败，请稍后重试"))
 			return
 		}
 	}
@@ -255,9 +255,9 @@ func (mc *MarketController) SyncBars(c *gin.Context) {
 	job, started, err := service.StartSystemDataSyncJob(service.JobKindSyncDailyBars, &actor, service.DataSyncJobRequest{
 		Version: 1, Market: req.Market, Maintenance: req, HasMaintenance: hasBody, BarLimit: 120,
 		TriggerSource: audit.TriggerSource, ParameterSummary: audit.ParameterSummary,
-	})
+	}, c.Request.Context())
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorMsg(c, publicWorkflowError(err, "市场操作失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, gin.H{"started": started, "task": service.MaintenanceSyncBars, "market": req.Market, "plan_hash": req.PlanHash, "job_run_id": job.ID})
@@ -267,23 +267,23 @@ func (mc *MarketController) SyncBars(c *gin.Context) {
 func (mc *MarketController) BackfillCalendar(c *gin.Context) {
 	req, hasBody, err := maintenanceRequest(c)
 	if err != nil {
-		common.ApiErrorMsg(c, "补采参数无效: "+err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "补采参数无效: 请稍后重试"))
 		return
 	}
 	audit := service.AdminSyncAudit(currentUserID(c), req, !hasBody)
 	if hasBody && req.DryRun {
-		plan, err := mc.svc.PlanMaintenance(service.MaintenanceBackfillCalendar, req)
+		plan, err := mc.svc.PlanMaintenance(service.MaintenanceBackfillCalendar, req, c.Request.Context())
 		if err != nil {
-			common.ApiErrorMsg(c, "生成日历回填计划失败: "+err.Error())
+			common.ApiErrorMsg(c, publicWorkflowError(err, "生成日历回填计划失败: 请稍后重试"))
 			return
 		}
 		common.ApiSuccess(c, gin.H{"dry_run": true, "plan": plan})
 		return
 	}
 	if hasBody {
-		if err := mc.svc.ValidateMaintenancePlan(service.MaintenanceBackfillCalendar, req); err != nil {
-			mc.svc.RecordMaintenanceFailure(service.MaintenanceBackfillCalendar, req.Market, audit, err)
-			common.ApiErrorMsg(c, err.Error())
+		if err := mc.svc.ValidateMaintenancePlan(service.MaintenanceBackfillCalendar, req, c.Request.Context()); err != nil {
+			mc.svc.RecordMaintenanceFailure(service.MaintenanceBackfillCalendar, req.Market, audit, err, c.Request.Context())
+			common.ApiErrorMsg(c, publicWorkflowError(err, "市场操作失败，请稍后重试"))
 			return
 		}
 	}
@@ -291,9 +291,9 @@ func (mc *MarketController) BackfillCalendar(c *gin.Context) {
 	job, started, err := service.StartSystemDataSyncJob(service.JobKindBackfillCalendar, &actor, service.DataSyncJobRequest{
 		Version: 1, Market: req.Market, Maintenance: req, HasMaintenance: hasBody,
 		TriggerSource: audit.TriggerSource, ParameterSummary: audit.ParameterSummary,
-	})
+	}, c.Request.Context())
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorMsg(c, publicWorkflowError(err, "市场操作失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, gin.H{"dry_run": false, "started": started, "task": service.MaintenanceBackfillCalendar,
@@ -306,9 +306,9 @@ func (mc *MarketController) Snapshot(c *gin.Context) {
 	actor := currentUserID(c)
 	job, started, err := service.StartSystemDataSyncJob(service.JobKindSnapshotMarket, &actor, service.DataSyncJobRequest{
 		Version: 1, Market: market, TriggerSource: "admin", ParameterSummary: "manual_snapshot=true",
-	})
+	}, c.Request.Context())
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorMsg(c, publicWorkflowError(err, "市场操作失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, gin.H{"started": started, "task": service.JobKindSnapshotMarket, "market": market, "job_run_id": job.ID})
@@ -322,9 +322,9 @@ func (mc *MarketController) SyncLogs(c *gin.Context) {
 			limit = n
 		}
 	}
-	logs, err := mc.svc.RecentSyncLogs(limit)
+	logs, err := mc.svc.RecentSyncLogs(limit, c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, "查询同步日志失败: "+err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "查询同步日志失败: 请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, logs)
@@ -397,14 +397,14 @@ func bindDataSourceUncool(c *gin.Context) (service.DataSourceUncoolRequest, erro
 func (mc *MarketController) ProbeDataSource(c *gin.Context) {
 	req, err := bindDataSourceProbe(c)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "市场操作失败，请稍后重试"))
 		return
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 	result, err := mc.svc.ProbeDataSource(ctx, currentUserID(c), req)
 	if err != nil {
-		common.ApiErrorMsg(c, "数据源探测失败: "+err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "数据源探测失败: 请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, result)
@@ -414,12 +414,12 @@ func (mc *MarketController) ProbeDataSource(c *gin.Context) {
 func (mc *MarketController) UncoolDataSource(c *gin.Context) {
 	req, err := bindDataSourceUncool(c)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "市场操作失败，请稍后重试"))
 		return
 	}
 	result, err := mc.svc.UncoolDataSource(c.Request.Context(), currentUserID(c), req)
 	if err != nil {
-		common.ApiErrorMsg(c, "解除冷却失败: "+err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "解除冷却失败: 请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, result)
@@ -435,7 +435,12 @@ func (mc *MarketController) DataHealth(c *gin.Context) {
 			days = parsed
 		}
 	}
-	common.ApiSuccess(c, service.BuildDataHealthReportForDays(days))
+	report, err := service.BuildDataHealthReportForDaysContext(c.Request.Context(), days)
+	if err != nil {
+		common.ApiErrorMsg(c, publicWorkflowError(err, "数据健康报告读取失败，请稍后重试"))
+		return
+	}
+	common.ApiSuccess(c, report)
 }
 
 // --- 管理员：全市场日线（M1） ---
@@ -445,23 +450,23 @@ func (mc *MarketController) DataHealth(c *gin.Context) {
 func (mc *MarketController) WideSync(c *gin.Context) {
 	req, hasBody, err := maintenanceRequest(c)
 	if err != nil {
-		common.ApiErrorMsg(c, "补采参数无效: "+err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "补采参数无效: 请稍后重试"))
 		return
 	}
 	audit := service.AdminSyncAudit(currentUserID(c), req, !hasBody)
 	if hasBody && req.DryRun {
-		plan, err := mc.svc.PlanMaintenance(service.MaintenanceWideSync, req)
+		plan, err := mc.svc.PlanMaintenance(service.MaintenanceWideSync, req, c.Request.Context())
 		if err != nil {
-			common.ApiErrorMsg(c, "生成全市场同步计划失败: "+err.Error())
+			common.ApiErrorMsg(c, publicWorkflowError(err, "生成全市场同步计划失败: 请稍后重试"))
 			return
 		}
 		common.ApiSuccess(c, gin.H{"dry_run": true, "plan": plan})
 		return
 	}
 	if hasBody {
-		if err := mc.svc.ValidateMaintenancePlan(service.MaintenanceWideSync, req); err != nil {
-			mc.svc.RecordMaintenanceFailure(service.MaintenanceWideSync, req.Market, audit, err)
-			common.ApiErrorMsg(c, err.Error())
+		if err := mc.svc.ValidateMaintenancePlan(service.MaintenanceWideSync, req, c.Request.Context()); err != nil {
+			mc.svc.RecordMaintenanceFailure(service.MaintenanceWideSync, req.Market, audit, err, c.Request.Context())
+			common.ApiErrorMsg(c, publicWorkflowError(err, "市场操作失败，请稍后重试"))
 			return
 		}
 	}
@@ -469,9 +474,9 @@ func (mc *MarketController) WideSync(c *gin.Context) {
 	job, started, err := service.StartSystemDataSyncJob(service.JobKindSyncMarketWide, &actor, service.DataSyncJobRequest{
 		Version: 1, Market: req.Market, Maintenance: req, HasMaintenance: hasBody,
 		TriggerSource: audit.TriggerSource, ParameterSummary: audit.ParameterSummary,
-	})
+	}, c.Request.Context())
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorMsg(c, publicWorkflowError(err, "市场操作失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, gin.H{"started": started, "task": service.MaintenanceWideSync, "plan_hash": req.PlanHash, "job_run_id": job.ID})
@@ -483,9 +488,9 @@ func (mc *MarketController) WideInitStart(c *gin.Context) {
 	actor := currentUserID(c)
 	job, started, err := service.StartSystemDataSyncJob(service.JobKindInitMarketHistory, &actor, service.DataSyncJobRequest{
 		Version: 1, Market: "cn", TriggerSource: "admin", ParameterSummary: "resume=true", Reason: "管理端续跑",
-	})
+	}, c.Request.Context())
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorMsg(c, publicWorkflowError(err, "市场操作失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, gin.H{"started": started, "task": service.JobKindInitMarketHistory, "job_run_id": job.ID})
@@ -494,13 +499,13 @@ func (mc *MarketController) WideInitStart(c *gin.Context) {
 // WideInitPause POST /api/admin/market/wide-init/pause
 // 暂停历史初始化（进度在表内，再次启动即从断点续跑）。
 func (mc *MarketController) WideInitPause(c *gin.Context) {
-	job, err := service.CancelActiveSystemJob(currentUserID(c), service.JobKindInitMarketHistory)
+	job, err := service.CancelActiveSystemJob(currentUserID(c), service.JobKindInitMarketHistory, c.Request.Context())
 	if errors.Is(err, service.ErrJobNotFound) {
 		common.ApiSuccess(c, gin.H{"paused": false})
 		return
 	}
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorMsg(c, publicWorkflowError(err, "市场操作失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, gin.H{"paused": true, "job_run_id": job.ID})
@@ -509,9 +514,9 @@ func (mc *MarketController) WideInitPause(c *gin.Context) {
 // WideStatus GET /api/admin/market/wide-status
 // 全市场覆盖状态：宇宙内 pending/done/failed 计数、任务运行标志、最近增量/初始化日志。
 func (mc *MarketController) WideStatus(c *gin.Context) {
-	v, err := mc.svc.MarketWideStatus()
+	v, err := mc.svc.MarketWideStatus(c.Request.Context())
 	if err != nil {
-		common.ApiErrorMsg(c, "查询全市场状态失败: "+err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "查询全市场状态失败: 请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, v)
@@ -529,7 +534,7 @@ func (mc *MarketController) FactorIC(c *gin.Context) {
 	}
 	rep, err := service.RunFactorIC(c.Request.Context(), mc.svc)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "市场操作失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, rep)
@@ -548,7 +553,7 @@ func (mc *MarketController) WalkForward(c *gin.Context) {
 	}
 	rep, err := service.RunWalkForward(c.Request.Context(), mc.svc)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "市场操作失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, rep)

@@ -1,19 +1,21 @@
 <script setup lang="ts">
-import { NButton, NEmpty, NTable, NTag } from 'naive-ui'
+import { NAlert, NButton, NEmpty, NSpin, NTable, NTag } from 'naive-ui'
 import SectionCard from '@/components/SectionCard.vue'
 import { taskStatusLabel } from '@/api/taskCenter'
 import type { ScanResult, StrategyRun } from '@/api/screener'
 
-defineProps<{ items: StrategyRun<ScanResult>[] }>()
-const emit = defineEmits<{ open: [item: StrategyRun<ScanResult>] }>()
+defineProps<{ items: StrategyRun<ScanResult>[]; loading: boolean; error: string }>()
+const emit = defineEmits<{ open: [item: StrategyRun<ScanResult>]; retry: [] }>()
 const shortHash = (value?: string) => value ? value.slice(0, 12) : '-'
 </script>
 
 <template>
   <SectionCard title="历史扫描" class="block">
-    <p class="history-note">历史任务、策略版本和审计快照独立保存，不会覆盖上方当前扫描结果。</p>
-    <n-empty v-if="!items.length" description="暂无持久扫描结果" />
-    <div v-else class="qv-scroll-x">
+    <p class="history-note">历史任务及策略版本独立保存。点击“查看快照”可在上方切换展示该次结果。</p>
+    <n-alert v-if="error" type="error" :bordered="false">历史读取失败：{{ error }} <n-button size="small" @click="emit('retry')">重试</n-button></n-alert>
+    <n-spin v-if="loading" size="small" />
+    <n-empty v-else-if="!error && !items.length" description="暂无持久扫描结果" />
+    <div v-if="items.length" class="qv-scroll-x">
       <n-table size="small" :single-line="false">
         <thead><tr><th>策略</th><th>版本</th><th>状态</th><th>数据截止时间</th><th>完成时间</th><th>操作</th></tr></thead>
         <tbody><tr v-for="item in items" :key="item.id">

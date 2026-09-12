@@ -214,13 +214,18 @@ func TestTodoUsesUnifiedPositionExitFactAndKeepsHandledState(t *testing.T) {
 	common.DB.Exec("DELETE FROM todo_inbox_states WHERE user_id = ?", 906)
 	today := time.Now().In(time.Local).Format("2006-01-02")
 	p := seedHoldingWithPeak(t, 906, "600906", "统一评估股", 10, 100, 12, today)
+	account, err := ResolvePortfolioAccount(p.UserID, 0, model.PortfolioKindReal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.AccountID = account.ID // 模拟已归属真实账户后生成的当前评估。
 	common.DB.Create(&model.AlertEvent{RuleID: 9061, UserID: 906, PositionID: p.ID, Symbol: p.Symbol, Market: "cn", Kind: model.AlertKindCostDrawdown, Message: "底层成本回撤", TradeDate: today, TriggeredAt: time.Now(), Status: model.AlertEventUnread})
 	common.DB.Create(&model.SellReview{UserID: 906, PositionID: p.ID, Symbol: p.Symbol, Market: "cn", Name: p.Name, Trigger: model.SellReviewLift, TradeDate: today, Severity: model.SellReviewSeverityHigh, Title: "底层解禁事实", Detail: "底层事实", Status: model.SellReviewStatusOpen})
 	assessment := &model.PositionExitAssessment{UserID: 906, PositionID: p.ID, Symbol: p.Symbol, Market: "cn", Name: p.Name,
 		TradeDate: today, Session: model.PositionExitSessionIntraday, EvaluatedAt: time.Now(), Level: model.PositionExitLevelReview,
 		PrimarySignal: model.AlertKindCostDrawdown, PrimaryReason: "成本回撤达到用户阈值", NextAction: "今天完成复核",
 		DataStatus: model.PositionExitDataReady, ShouldTodo: true, Version: model.PositionExitAssessmentVersion,
-		FactHash: "todo-review-fact", EventKey: "todo-review-event"}
+		PositionStateHash: positionRiskBasisHash(*p), FactHash: "todo-review-fact", EventKey: "todo-review-event"}
 	if err := common.DB.Create(assessment).Error; err != nil {
 		t.Fatal(err)
 	}

@@ -42,6 +42,8 @@ type strategyTemplate struct {
 	// Period/Risk 选股类策略的适用周期与风险等级（前端分组展示；推荐内置策略留空）。
 	Period string `json:"period,omitempty"`
 	Risk   string `json:"risk,omitempty"`
+	// 自建策略目录携带不可变版本，提交、排队、扫描和历史展示共用此身份。
+	StrategyRevisionID int64 `json:"strategy_revision_id,omitempty"`
 
 	guide string // 注入 prompt 的选股导向（不外泄给前端）
 	// baseKey 量化加分/榜单来源沿用的基础推荐策略 key（内置推荐策略 = 自身 Key；
@@ -55,9 +57,10 @@ type strategyTemplate struct {
 
 // recScreenBinding 选股类推荐策略到选股引擎的绑定（ScanRequest 四选一）。
 type recScreenBinding struct {
-	builtinKey  string
-	templateKey string
-	strategyID  int64
+	builtinKey         string
+	templateKey        string
+	strategyID         int64
+	strategyRevisionID int64
 }
 
 func (t *strategyTemplate) scanRequest(limit int) ScanRequest {
@@ -68,6 +71,7 @@ func (t *strategyTemplate) scanRequest(limit int) ScanRequest {
 	req.StrategyKey = t.screen.builtinKey
 	req.TemplateKey = t.screen.templateKey
 	req.StrategyID = t.screen.strategyID
+	req.StrategyRevisionID = t.screen.strategyRevisionID
 	return req
 }
 
@@ -234,10 +238,11 @@ func customScreenStrategyTemplate(recType string, id int64, rev model.ScreenerSt
 		Key: recStrategyCustomPrefix + strconv.FormatInt(id, 10), Name: rev.Name,
 		Desc: screenStrategyDesc(rev.Period, rev.Risk, rev.Desc), Group: "custom",
 		Period: rev.Period, Risk: rev.Risk,
-		guide:   screenStrategyGuide(rev.Name, rev.Desc, conditions),
-		baseKey: screenBaseKey(recType, rev.Period, ""),
-		screen:  &recScreenBinding{strategyID: id},
-		tree:    tree,
+		StrategyRevisionID: rev.ID,
+		guide:              screenStrategyGuide(rev.Name, rev.Desc, conditions),
+		baseKey:            screenBaseKey(recType, rev.Period, ""),
+		screen:             &recScreenBinding{strategyID: id, strategyRevisionID: rev.ID},
+		tree:               tree,
 	}
 }
 
@@ -279,7 +284,8 @@ func loadCustomScreenStrategies(userID int64, onlyID int64, includeArchived bool
 
 // publicStrategy 去掉内部字段的下拉视图。
 func publicStrategy(s strategyTemplate) strategyTemplate {
-	return strategyTemplate{Key: s.Key, Name: s.Name, Desc: s.Desc, Group: s.Group, Period: s.Period, Risk: s.Risk}
+	return strategyTemplate{Key: s.Key, Name: s.Name, Desc: s.Desc, Group: s.Group, Period: s.Period, Risk: s.Risk,
+		StrategyRevisionID: s.StrategyRevisionID}
 }
 
 // StrategiesFor 返回某类型的内置推荐策略（供单测与无用户上下文的调用）。
@@ -296,6 +302,10 @@ func StrategiesFor(recType string) []strategyTemplate {
 // （内置选股策略、新手模板、当前用户未归档自建策略）。选股类策略按适用周期与
 // 推荐类型的贴合度排序（短线：short→swing→mid；长线相反），同周期保持选股页展示序。
 func StrategiesForUser(userID int64, recType string) ([]strategyTemplate, error) {
+	recType = strings.ToLower(strings.TrimSpace(recType))
+	if recType != model.RecTypeShortTerm && recType != model.RecTypeLongTerm {
+		return nil, errors.New("推荐类型须为 short_term 或 long_term")
+	}
 	out := make([]strategyTemplate, 0, 32)
 	for _, s := range recBuiltinStrategies(recType) {
 		out = append(out, publicStrategy(s))
@@ -316,7 +326,10 @@ func StrategiesForUser(userID int64, recType string) ([]strategyTemplate, error)
 		if !ok || rev.StrategyID != r.ID {
 			continue
 		}
-		screens = append(screens, publicStrategy(customScreenStrategyTemplate(recType, r.ID, rev)))
+		t := customScreenStrategyTemplate(recType, r.ID, rev)
+		if t.tree != nil {
+			screens = append(screens, publicStrategy(t))
+		}
 	}
 	periodOrder := map[string]int{"short": 0, "swing": 1, "mid": 2}
 	if recType != model.RecTypeShortTerm {
@@ -346,7 +359,7 @@ func strategyByKey(recType, key string) (*strategyTemplate, error) {
 		}
 	}
 	if strings.HasPrefix(key, recStrategyScreenPrefix) || strings.HasPrefix(key, recStrategyTemplatePrefix) {
-		return resolveScreenStrategy(0, recType, key)
+		return resolveScreenStrategy(0, recType, key, 0)
 	}
 	return nil, fmt.Errorf("策略 %s 与推荐类型不匹配，请重新选择", key)
 }
@@ -354,14 +367,22 @@ func strategyByKey(recType, key string) (*strategyTemplate, error) {
 // resolveRecStrategy 解析推荐请求中的策略 key（内置推荐策略或选股类策略）。
 // 用户自建策略按 userID 隔离；已归档策略仍可解析（历史批次重试/回显），前端下拉不再列出。
 func resolveRecStrategy(userID int64, recType, key string) (*strategyTemplate, error) {
+	return resolveRecStrategyRevision(userID, recType, key, 0)
+}
+
+// revisionID=0 仅在首次提交时取当前版本；持久化作业始终传入解析后的版本。
+func resolveRecStrategyRevision(userID int64, recType, key string, revisionID int64) (*strategyTemplate, error) {
 	key = strings.TrimSpace(key)
+	if revisionID < 0 || (revisionID > 0 && !strings.HasPrefix(key, recStrategyCustomPrefix)) {
+		return nil, errors.New("策略版本必须属于指定的自建选股策略")
+	}
 	if strings.HasPrefix(key, recStrategyScreenPrefix) || strings.HasPrefix(key, recStrategyTemplatePrefix) {
-		return resolveScreenStrategy(userID, recType, key)
+		return resolveScreenStrategy(userID, recType, key, revisionID)
 	}
 	return strategyByKey(recType, key)
 }
 
-func resolveScreenStrategy(userID int64, recType, key string) (*strategyTemplate, error) {
+func resolveScreenStrategy(userID int64, recType, key string, revisionID int64) (*strategyTemplate, error) {
 	switch {
 	case strings.HasPrefix(key, recStrategyCustomPrefix):
 		id, err := strconv.ParseInt(strings.TrimPrefix(key, recStrategyCustomPrefix), 10, 64)
@@ -371,18 +392,27 @@ func resolveScreenStrategy(userID int64, recType, key string) (*strategyTemplate
 		if userID <= 0 {
 			return nil, errors.New("自建选股策略需要登录用户上下文")
 		}
-		rows, revBy, err := loadCustomScreenStrategies(userID, id, true)
-		if err != nil {
-			return nil, err
+		if common.DB == nil {
+			return nil, errors.New("数据库不可用")
 		}
-		if len(rows) == 0 {
+		var strategy model.ScreenerStrategy
+		if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&strategy).Error; err != nil {
 			return nil, errors.New("自建选股策略不存在或不属于当前用户，请重新选择策略")
 		}
-		rev, ok := revBy[rows[0].CurrentRevisionID]
-		if !ok || rev.StrategyID != rows[0].ID {
+		if revisionID == 0 {
+			revisionID = strategy.CurrentRevisionID
+		}
+		if revisionID <= 0 {
 			return nil, errors.New("自建选股策略尚无可执行版本，请先在选股页保存")
 		}
-		t := customScreenStrategyTemplate(recType, rows[0].ID, rev)
+		var rev model.ScreenerStrategyRevision
+		if err := common.DB.Where("id = ? AND user_id = ? AND strategy_id = ?", revisionID, userID, id).First(&rev).Error; err != nil {
+			return nil, errors.New("策略版本不存在或不属于指定策略")
+		}
+		t := customScreenStrategyTemplate(recType, id, rev)
+		if t.tree == nil {
+			return nil, errors.New("自建选股策略条件无效，请先在选股页修复")
+		}
 		return &t, nil
 	case strings.HasPrefix(key, recStrategyScreenPrefix):
 		b, ok := builtinScreenByKey(strings.TrimPrefix(key, recStrategyScreenPrefix))
@@ -413,7 +443,7 @@ func strategySignalPoolLimitFor(strat *strategyTemplate) int {
 // ---------- 选股类策略的量化规则：条件命中度评估与加分 ----------
 
 // StrategyHit 选股类推荐策略对单只候选的条件命中评估（随候选池快照落库、喂给 LLM、
-// 前端可展开）。因子行用与选股引擎完全相同的 computeWideRow 由候选的 210 根日线
+// 前端可展开）。因子行用与选股引擎完全相同的 computeWideRow 由候选的 250 根日线
 // 计算（收盘口径、同一求值函数），保证「推荐里的策略命中」与选股页扫描一致。
 // any 组算作一个条件单元（满足其一即命中）。
 type StrategyHit struct {

@@ -12,17 +12,22 @@ defineProps<{
   history: RecommendationBatch[]
   currentID?: number
   historyLoading: boolean
+  historyError: string
+  deleting: Set<number>
   reviews: TodoItem[]
   reviewsLoading: boolean
   reviewsError: string
   reviewAcking: number | null
   performance: PerformanceStats | null
+  performanceLoading: boolean
+  performanceError: string
 }>()
 const emit = defineEmits<{
   (event: 'open', item: RecommendationBatch): void
   (event: 'remove', item: RecommendationBatch): void
   (event: 'refresh-history'): void
   (event: 'refresh-reviews'): void
+  (event: 'refresh-performance'): void
   (event: 'ack-review', item: TodoItem): void
   (event: 'audit', mode: 'attribution' | 'shadow' | 'recall'): void
 }>()
@@ -39,30 +44,31 @@ function statusType(value: string) {
   <div class="history-stack">
     <SectionCard title="推荐历史">
       <template #extra><n-button size="tiny" quaternary :loading="historyLoading" @click="emit('refresh-history')">刷新</n-button></template>
+      <n-alert v-if="historyError" type="error" :bordered="false" class="reviews-alert">{{ historyError }}；可点击刷新重试。</n-alert>
       <n-spin :show="historyLoading && !history.length">
-        <n-empty v-if="!history.length" description="暂无推荐记录" size="small" />
+        <n-empty v-if="!history.length && !historyLoading && !historyError" description="暂无推荐记录" size="small" />
         <div v-else class="history-list">
-          <button v-for="item in history" :key="item.id" type="button" class="history-row" :class="{ active: currentID === item.id }" @click="emit('open', item)">
-            <span class="history-main">
+          <div v-for="item in history" :key="item.id" class="history-row" :class="{ active: currentID === item.id }">
+            <button type="button" class="history-main" :aria-current="currentID === item.id ? 'true' : undefined" :disabled="deleting.has(item.id)" @click="emit('open', item)">
               <span class="history-title">{{ item.title || (item.type === 'short_term' ? '短线推荐' : '长线推荐') }}</span>
               <span class="history-meta">{{ time(item.created_at) }} · 数据截止见结果卡 · 量化版本 {{ item.strategy_version || '未知' }}</span>
-            </span>
+            </button>
             <span class="history-side">
               <n-tag size="tiny" :type="statusType(item.status)" :bordered="false">{{ businessStatusLabel(item.status) }}</n-tag>
               <n-popconfirm v-if="item.status !== 'processing'" @positive-click="emit('remove', item)">
-                <template #trigger><n-button size="tiny" quaternary type="error" @click.stop>删除记录</n-button></template>
+                <template #trigger><n-button size="tiny" quaternary type="error" :loading="deleting.has(item.id)" :disabled="deleting.has(item.id)" @click.stop>删除记录</n-button></template>
                 删除只影响这条本人历史记录；不会改写其他历史推荐或追踪事实。
               </n-popconfirm>
             </span>
-          </button>
+          </div>
         </div>
       </n-spin>
     </SectionCard>
 
     <SectionCard title="追踪与待复盘">
       <template #extra><n-button size="tiny" quaternary :loading="reviewsLoading" @click="emit('refresh-reviews')">刷新</n-button></template>
-      <n-alert v-if="reviewsError" :type="reviews.length ? 'warning' : 'error'" :bordered="false" class="reviews-alert">{{ reviewsError }}，已有追踪数据仍保留。</n-alert>
-      <n-empty v-if="!reviews.length && !reviewsLoading" description="没有需要处理的推荐复盘" size="small" />
+      <n-alert v-if="reviewsError" :type="reviews.length ? 'warning' : 'error'" :bordered="false" class="reviews-alert">{{ reviewsError }}<template v-if="reviews.length">，已有追踪数据仍保留</template>；可点击刷新重试。</n-alert>
+      <n-empty v-if="!reviews.length && !reviewsLoading && !reviewsError" description="没有需要处理的推荐复盘" size="small" />
       <div v-else class="review-list">
         <div v-for="item in reviews" :key="item.ref_id" class="review-row">
           <div>
@@ -74,16 +80,18 @@ function statusType(value: string) {
       </div>
     </SectionCard>
 
-    <SectionCard v-if="performance" title="收益表现">
-      <div class="performance-grid">
+    <SectionCard v-if="performance || performanceLoading || performanceError" title="收益表现">
+      <template #extra><n-button size="tiny" :loading="performanceLoading" @click="emit('refresh-performance')">{{ performanceError ? '重试' : '刷新' }}</n-button></template>
+      <n-alert v-if="performanceError" type="error" :bordered="false" class="reviews-alert">{{ performanceError }}</n-alert>
+      <div v-if="performance" class="performance-grid">
         <div><span>成熟买入样本</span><b class="qv-tnum">{{ performance.buy_matured }}</b></div>
         <div><span>成熟买入胜率</span><b class="qv-tnum">{{ performance.buy_matured ? `${performance.buy_win_rate.toFixed(1)}%` : '未成熟' }}</b></div>
         <div><span>平均收益</span><b class="qv-tnum" :style="{ color: pctColor(performance.buy_avg_return_pct) }">{{ performance.buy_matured ? `${performance.buy_avg_return_pct > 0 ? '+' : ''}${performance.buy_avg_return_pct.toFixed(2)}%` : '—' }}</b></div>
         <div><span><TermHelp term="alpha" /></span><b class="qv-tnum" :style="{ color: pctColor(performance.buy_avg_alpha_pct) }">{{ performance.buy_bench_sample ? `${performance.buy_avg_alpha_pct > 0 ? '+' : ''}${performance.buy_avg_alpha_pct.toFixed(2)}%` : '—' }}</b></div>
-        <div><span>平均最大回撤</span><b class="qv-tnum" :style="{ color: downColor }">{{ performance.buy_matured ? `-${performance.avg_max_drawdown_pct.toFixed(2)}%` : '—' }}</b></div>
+        <div><span>平均最大回撤</span><b class="qv-tnum" :style="{ color: downColor }">{{ performance.buy_matured && performance.buy_avg_max_drawdown_pct != null ? `-${performance.buy_avg_max_drawdown_pct.toFixed(2)}%` : '—' }}</b></div>
         <div><span>尚未成熟</span><b class="qv-tnum">{{ performance.buy_active }}</b></div>
       </div>
-      <p class="performance-note">未到结算时间、数据不足和量化降级批次不会被包装成“准确”或“失败”。历史推荐事实只读，追踪只追加状态和解释。</p>
+      <p class="performance-note">收益按推荐参考价计算，未扣交易费税；回撤与收益均使用成熟买入样本。未到结算时间、数据不足和量化降级批次不会被包装成“准确”或“失败”。历史推荐事实只读，追踪只追加状态和解释。</p>
       <n-collapse>
         <n-collapse-item title="专业评估与召回审计" name="audit">
           <div class="audit-actions">
@@ -99,10 +107,6 @@ function statusType(value: string) {
 
 <style scoped>
 .history-stack { display: grid; gap: 14px; }
-/* 追踪读取失败提示与下方列表/空态之间留白：.review-list 是无 gap 的 grid，
- * 只靠首行 .review-row 的 padding 顶着，太贴 */
-.reviews-alert { margin-bottom: 12px; }
-/* 复盘读取失败提示与下方列表之间留白（列表行只有 padding，没有上边距） */
 .reviews-alert { margin-bottom: 10px; }
 .history-list,
 .review-list { display: grid; }
@@ -120,10 +124,10 @@ function statusType(value: string) {
   color: inherit;
   font: inherit;
   text-align: left;
-  cursor: pointer;
 }
 .history-row.active { box-shadow: inset 3px 0 v-bind('vars.primaryColor'); padding-left: 10px; }
-.history-main { display: grid; min-width: 0; gap: 3px; }
+.history-main { display: grid; min-width: 0; flex: 1 1 auto; gap: 3px; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.history-main:focus-visible { outline: 2px solid v-bind('vars.primaryColor'); outline-offset: 3px; }
 .history-title { font-weight: 600; overflow-wrap: anywhere; }
 .history-meta { font-size: 11px; opacity: .6; overflow-wrap: anywhere; }
 .history-side { display: flex; flex: 0 0 auto; align-items: center; gap: 4px; flex-wrap: wrap; }

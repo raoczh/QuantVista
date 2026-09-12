@@ -126,13 +126,17 @@ export interface PositionRiskItem {
   near_stop_loss: boolean
   short_term_review: boolean
   analysis_stale: boolean
+  exit_assessment?: Pick<PositionExitAssessment, 'level' | 'data_status'>
 }
 
 export function positionRiskPriority(item: PositionRiskItem): number {
-  if (item.below_stop_loss) return 0
-  if (item.near_stop_loss) return 1
-  if (item.short_term_review) return 2
+  const assessment = item.exit_assessment
+  if (item.below_stop_loss || assessment?.level === 'urgent') return 0
+  if (item.near_stop_loss || assessment?.level === 'review') return 1
+  if (item.short_term_review || assessment?.level === 'watch') return 2
   if (item.analysis_stale) return 3
+  // 缺少评估或数据不完整同样需要关注，不能被过滤成“无风险”。
+  if (!assessment || assessment.data_status !== 'ready' || assessment.level === 'unknown') return 4
   return Number.POSITIVE_INFINITY
 }
 
@@ -158,3 +162,4 @@ export function rankPinnedWatchChanges<T extends WatchChangeItem>(items: readonl
       return changeDiff || a.id - b.id
     })
 }
+import type { PositionExitAssessment } from '@/api/position'

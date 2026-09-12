@@ -31,7 +31,7 @@ import (
 
 const (
 	// positionAdvicePromptVersion 建议 prompt 版本（改措辞/枚举语义必须递增，审计按它归因）。
-	positionAdvicePromptVersion = "pa3"
+	positionAdvicePromptVersion = "pa4"
 	// positionAdviceJobTimeout 后台任务总预算。
 	positionAdviceJobTimeout = 5 * time.Minute
 	// positionAdviceMaxPositions 单次最多分析的持仓笔数（控上下文预算）。超出按
@@ -101,6 +101,7 @@ func stampPositionAdviceResult(res *PositionAdviceResult, now time.Time) {
 // PositionAdviceRequest 入参。
 type PositionAdviceRequest struct {
 	LLMConfigID int64 `json:"llm_config_id"`
+	AccountID   int64 `json:"account_id,omitempty"`
 	// Symbol 可选：只分析某一只（空=全部持仓）。
 	Symbol string `json:"symbol"`
 	// PositionID 可选：精确分析一笔持仓；与 user_id、symbol 同时核验。
@@ -155,25 +156,47 @@ const positionAdviceSystemPrompt = `你是一名持仓风控顾问。用户已�
 4. **禁止使用你记忆中关于这些公司的信息**，不得虚构财务、新闻、公告、股东行为。数据没给的就说没有依据。
 5. invalidation 写「什么情况下这个结论不再成立」（具体价位 / 事件 / 时间窗口），不要写空泛的「市场变化时」。
 6. 这是研究参考，不构成投资建议；不要给出加仓建议——本任务只回答持有 / 减仓 / 清仓。
+7. data_gaps 明确列出本次未能读取的信号。缺口不表示没有风险，不得据此宣称不存在提醒或待复核事件。
 
 只输出 JSON：{"advices":[{"position_id":123,"symbol":"...","verdict":"hold|trim|exit","reason":"...","invalidation":"..."}]}。
 position_id 与 symbol 必须逐字复制对应输入行；同一 symbol 可能有多笔不同成本的持仓，必须按 position_id 分别覆盖，
 不要合并或省略。不要任何解释或代码块标记。`
 
 // AdviseAsync 建后台任务（HTTP 秒回）。校验在同步段完成，模型调用在独立 context 上跑。
-func (s *PositionAdviceService) AdviseAsync(userID int64, allowPrivate bool, req PositionAdviceRequest) (*LLMTaskView, error) {
+func (s *PositionAdviceService) AdviseAsync(userID int64, allowPrivate bool, req PositionAdviceRequest, contexts ...context.Context) (*LLMTaskView, error) {
+	ctx := jobSubmissionContext(contexts...)
 	if s.position == nil || s.llm == nil {
 		return nil, errors.New("持仓建议服务不可用")
 	}
 	req.Symbol = strings.TrimSpace(req.Symbol)
-	if err := validatePositionAdviceRequest(userID, req); err != nil {
+	account, err := ResolvePortfolioAccountContext(ctx, userID, req.AccountID, model.PortfolioKindReal)
+	if err != nil {
+		return nil, err
+	}
+	req.AccountID = account.ID // 提交时固定组合，排队期间默认账户变更不能改变分析对象。
+	if err := validatePositionAdviceRequestContext(ctx, userID, req); err != nil {
 		return nil, err
 	}
 	s.registerDurableJobHandler()
-	return StartDurableLLMTask(userID, JobKindPositionAdvice, req, allowPrivate)
+	return StartDurableLLMTask(userID, JobKindPositionAdvice, req, allowPrivate, ctx)
 }
 
 func validatePositionAdviceRequest(userID int64, req PositionAdviceRequest) error {
+	return validatePositionAdviceRequestContext(context.Background(), userID, req)
+}
+
+func validatePositionAdviceRequestContext(ctx context.Context, userID int64, req PositionAdviceRequest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if req.AccountID < 0 || req.PositionID < 0 {
+		return errors.New("组合或持仓 ID 无效")
+	}
+	if req.AccountID > 0 {
+		if _, err := activePortfolioAccountByIDDB(common.DB.WithContext(ctx), userID, req.AccountID, model.PortfolioKindReal); err != nil {
+			return err
+		}
+	}
 	if req.PositionID <= 0 {
 		return nil
 	}
@@ -181,7 +204,7 @@ func validatePositionAdviceRequest(userID int64, req PositionAdviceRequest) erro
 		return errors.New("精确持仓复核必须同时提供 symbol")
 	}
 	var p model.Position
-	err := common.DB.Where("id = ? AND user_id = ? AND status = ?", req.PositionID, userID, model.PositionStatusHolding).First(&p).Error
+	err := common.DB.WithContext(ctx).Where("id = ? AND user_id = ? AND status = ?", req.PositionID, userID, model.PositionStatusHolding).First(&p).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return errors.New("未找到属于当前用户的 holding 持仓")
 	}
@@ -190,6 +213,9 @@ func validatePositionAdviceRequest(userID int64, req PositionAdviceRequest) erro
 	}
 	if p.Symbol != req.Symbol {
 		return errors.New("position_id 与 symbol 不匹配")
+	}
+	if req.AccountID > 0 && p.AccountID != req.AccountID {
+		return errors.New("该持仓不属于所选组合")
 	}
 	return nil
 }
@@ -238,15 +264,21 @@ type positionAdviceRow struct {
 	Signals        []string                    `json:"signals,omitempty"` // D14/D15 命中的提醒
 	Events         []string                    `json:"events,omitempty"`  // D16 待复核的利空事件
 	ExitAssessment *PositionExitAssessmentView `json:"exit_assessment,omitempty"`
+	DataGaps       []string                    `json:"data_gaps,omitempty"`
 }
 
 // Advise 生成逐笔卖出建议（后台任务体；也可被测试直接调用）。
 func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowPrivate bool, req PositionAdviceRequest) (*PositionAdviceResult, error) {
 	req.Symbol = strings.TrimSpace(req.Symbol)
-	if err := validatePositionAdviceRequest(userID, req); err != nil {
+	account, err := ResolvePortfolioAccountContext(ctx, userID, req.AccountID, model.PortfolioKindReal)
+	if err != nil {
 		return nil, err
 	}
-	views, err := s.position.List(ctx, userID, model.PositionStatusHolding)
+	req.AccountID = account.ID
+	if err := validatePositionAdviceRequestContext(ctx, userID, req); err != nil {
+		return nil, err
+	}
+	views, err := s.position.ListByAccount(ctx, userID, req.AccountID, model.PositionStatusHolding)
 	if err != nil {
 		return nil, err
 	}
@@ -259,12 +291,12 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 	// 与 Overview 的 pricedCost 同思路：分子分母不能一个含旧价一个不含。
 	var pricedValue float64
 	for _, v := range views {
-		if v.QuoteOK {
+		if v.QuoteOK && positionCurrencyIssue(v.Position, "CNY") == "" {
 			pricedValue += v.MarketValue
 		}
 	}
 
-	matched := 0
+	matched, unpriced := 0, 0
 	adviceIDs := make([]int64, 0, len(views))
 	for _, v := range views {
 		adviceIDs = append(adviceIDs, v.ID)
@@ -283,9 +315,15 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 			continue
 		}
 		matched++
+		if reason := positionCurrencyIssue(v.Position, "CNY"); reason != "" {
+			res.Skipped++
+			res.Notes = append(res.Notes, fmt.Sprintf("%s 币种口径不可用于本次 A 股持仓建议，已跳过：%s", orSymbol(v.Name, v.Symbol), reason))
+			continue
+		}
 		if !v.QuoteOK {
 			// fail-closed：没有当前有效行情就不给这一笔出结论（旧价上的割/守/补有害）。
 			res.Skipped++
+			unpriced++
 			continue
 		}
 		if pendingAdjust[v.ID] {
@@ -320,11 +358,12 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 		}
 		// 匹配到的持仓全都没有当前有效行情：整体拒答（机读码供前端分支）。
 		return nil, refusalErrf(RefusalFreshQuotesInsufficient,
-			"%d 笔持仓均无当前有效行情（可能停牌或数据源故障），无法基于旧价给出卖出建议", res.Skipped)
+			"%d 笔匹配持仓的行情或账本口径不完整，暂不能给出卖出建议。%s", res.Skipped, strings.Join(res.Notes, "；"))
 	}
 	// 按「浮亏最深」排序后截断：真要决策的是亏得最多的那些，不是列表里排在前面的。
 	sortAdviceRowsByUrgency(rows)
 	if len(rows) > positionAdviceMaxPositions {
+		res.Skipped += len(rows) - positionAdviceMaxPositions
 		res.Notes = append(res.Notes, fmt.Sprintf(
 			"持仓 %d 笔超过单次分析上限 %d，已按浮亏由深到浅取前 %d 笔，其余本次未分析",
 			len(rows), positionAdviceMaxPositions, positionAdviceMaxPositions))
@@ -333,22 +372,28 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 
 	// D14/D15 命中信号 + D16 待复核事件（**按持仓行归并**，不是按标的——
 	// 同一标的的两笔仓位成本不同，命中的信号也不同）。
-	attachAdviceSignals(userID, rows)
+	signalNotes, err := attachAdviceSignals(userID, rows, ctx)
+	if err != nil {
+		return nil, err
+	}
+	res.Notes = append(res.Notes, signalNotes...)
 
 	res.Analyzed = len(rows)
-	if res.Skipped > 0 {
+	if unpriced > 0 {
 		res.Notes = append(res.Notes, fmt.Sprintf(
-			"%d 笔持仓因无当前有效行情未参与分析（不用旧价出结论）", res.Skipped))
+			"%d 笔持仓因行情或估值口径不完整未参与分析", unpriced))
 	}
 
-	cfg, apiKey, err := s.llm.ResolveForUse(userID, req.LLMConfigID)
+	cfg, apiKey, err := s.llm.ResolveForUse(userID, req.LLMConfigID, ctx)
 	if err != nil {
 		return nil, refusalErr(RefusalLLMUnavailable, "AI 建议不可用："+err.Error())
 	}
 	allowPrivate = llmAllowPrivate(allowPrivate, cfg)
-	if err := checkQuota(userID); err != nil {
+	ctx, finishQuota, err := beginManualQuotaAction(ctx, userID)
+	if err != nil {
 		return nil, err
 	}
+	defer finishQuota()
 
 	inputJSON, err := json.Marshal(rows)
 	if err != nil {
@@ -377,15 +422,15 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 		result, cerr := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			ReasoningEffort: cfg.ReasoningEffort,
-			Temperature: cfg.Temperature, MaxTokens: requestMax,
+			Temperature:     cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
 		})
 		run.record(result, cerr)
 		if result != nil && result.Usage.TotalTokens > 0 {
-			// 一次建议 = 一次手动动作（repair 轮不重复计次，与既有模块同纪律）。
-			consumeQuota(userID, result.Usage.TotalTokens, attempt == 0)
+			// 各轮只追加 token 审计；整次建议共享调用前预留的额度。
+			consumeQuota(userID, result.Usage.TotalTokens)
 		}
 		if cerr != nil {
 			if attempt < repairLimit && isTokenLimitFinishState(run.FinishState) {
@@ -530,10 +575,14 @@ func sortAdviceRowsByUrgency(rows []positionAdviceRow) {
 
 // attachAdviceSignals 给每一笔持仓挂上 D14/D15 命中的提醒与 D16 待复核事件。
 // **按 position_id 归并**——同一标的的两笔仓位成本不同，触发的信号本就不同。
-// 读取失败只是「本次没有信号段」，不阻断建议生成（信号是加分项不是前置条件）。
-func attachAdviceSignals(userID int64, rows []positionAdviceRow) {
-	if common.DB == nil || len(rows) == 0 {
-		return
+// 可选信号缺失时允许继续研究，但模型输入和结果都必须明确披露，不能当作没有风险。
+func attachAdviceSignals(userID int64, rows []positionAdviceRow, contexts ...context.Context) ([]string, error) {
+	ctx := jobSubmissionContext(contexts...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
 	}
 	posIDs := make([]int64, 0, len(rows))
 	idx := make(map[int64]int, len(rows))
@@ -542,29 +591,41 @@ func attachAdviceSignals(userID int64, rows []positionAdviceRow) {
 		idx[r.PositionID] = i
 	}
 	today := time.Now().In(time.Local).Format("2006-01-02")
-	// D14/D15：今日未读的持仓类提醒命中（带 position_id）。
 	var events []model.AlertEvent
-	if err := common.DB.Where("user_id = ? AND position_id IN ? AND trade_date = ? AND status = ?",
-		userID, posIDs, today, model.AlertEventUnread).Find(&events).Error; err == nil {
-		for _, e := range events {
-			if i, ok := idx[e.PositionID]; ok {
-				rows[i].Signals = append(rows[i].Signals, e.Message)
-			}
-		}
-	} else {
-		common.SysWarn("持仓建议读取提醒信号失败 user=%d: %v", userID, err)
-	}
-	// D16：未处理的卖出复核。
 	var reviews []model.SellReview
-	if err := common.DB.Where("user_id = ? AND position_id IN ? AND status = ?",
-		userID, posIDs, model.SellReviewStatusOpen).Order("trade_date DESC").Find(&reviews).Error; err == nil {
-		for _, r := range reviews {
-			if i, ok := idx[r.PositionID]; ok {
-				rows[i].Events = append(rows[i].Events,
-					fmt.Sprintf("[%s] %s：%s", r.TradeDate, r.Title, r.Detail))
-			}
-		}
+	var err error
+	if common.DB == nil {
+		err = errors.New("数据库不可用")
 	} else {
-		common.SysWarn("持仓建议读取卖出复核失败 user=%d: %v", userID, err)
+		err = readSnapshotTx(ctx, func(tx *gorm.DB) error {
+			if err := tx.Where("user_id = ? AND position_id IN ? AND trade_date = ? AND status = ?", userID, posIDs, today, model.AlertEventUnread).
+				Order("id").Find(&events).Error; err != nil {
+				return err
+			}
+			return tx.Where("user_id = ? AND position_id IN ? AND status = ?", userID, posIDs, model.SellReviewStatusOpen).
+				Order("trade_date DESC, id DESC").Find(&reviews).Error
+		})
 	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		common.SysWarn("持仓建议读取信号失败 user=%d: %v", userID, err)
+		note := "提醒及卖出复核信号读取失败，本次建议未使用这些信息；不能据此判断没有相关风险"
+		for i := range rows {
+			rows[i].DataGaps = append(rows[i].DataGaps, note)
+		}
+		return []string{note}, nil
+	}
+	for _, e := range events {
+		if i, ok := idx[e.PositionID]; ok {
+			rows[i].Signals = append(rows[i].Signals, e.Message)
+		}
+	}
+	for _, r := range reviews {
+		if i, ok := idx[r.PositionID]; ok {
+			rows[i].Events = append(rows[i].Events, fmt.Sprintf("[%s] %s：%s", r.TradeDate, r.Title, r.Detail))
+		}
+	}
+	return nil, nil
 }

@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, h, onMounted, ref } from 'vue'
-import { NButton, NDataTable, NSpin, NTag, useMessage, type DataTableColumns } from 'naive-ui'
+import { computed, h, onBeforeUnmount, onMounted, ref } from 'vue'
+import { NAlert, NButton, NDataTable, NSpin, NTag, type DataTableColumns } from 'naive-ui'
 import {
   getLLMCalibration,
   type LLMCalibrationReport,
@@ -13,19 +13,27 @@ import {
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import { useUi } from '@/composables/useUi'
+import { getSessionEpoch } from '@/api/token'
 
-const message = useMessage()
 const { upColor, downColor } = useUi()
 
 const report = ref<LLMCalibrationReport | null>(null)
 const loading = ref(false)
+const loadError = ref('')
+const pageSession = getSessionEpoch()
+let disposed = false
+const pageActive = () => !disposed && getSessionEpoch() === pageSession
+onBeforeUnmount(() => { disposed = true })
 
 async function load(refresh: boolean) {
+  if (!pageActive() || loading.value) return
   loading.value = true
+  loadError.value = ''
   try {
-    report.value = await getLLMCalibration(refresh)
+    const next = await getLLMCalibration(refresh)
+    if (pageActive()) report.value = next
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) loadError.value = e instanceof Error ? e.message : '校准报表读取失败'
   } finally {
     loading.value = false
   }
@@ -121,7 +129,7 @@ function prLine(rep: RecCalibReport): string {
 <template>
   <PageContainer
     title="LLM 校准报表"
-    subtitle="P1-7 校准与后验标签：程序合成置信度分档命中率 + 模型口头置信度 Brier/ECE/可靠性曲线（纯测量零门控；口头置信度不当真实概率，本表是其校准性证据）"
+    subtitle="对照置信度与实际结果，查看分档命中率、Brier/ECE 和可靠性曲线；模型的口头置信度需要通过真实样本检验"
   >
     <div class="calib-wrap">
       <SectionCard title="推荐置信度 × 后验标签">
@@ -130,10 +138,11 @@ function prLine(rep: RecCalibReport): string {
             <span v-if="report" class="calib-meta">
               标签口径 {{ report.label_version }} · {{ report.generated_at }} · 耗时 {{ report.elapsed_ms }}ms
             </span>
-            <n-button size="small" :loading="loading" @click="load(true)">重新计算</n-button>
+            <n-button size="small" :loading="loading" :disabled="loading" @click="load(true)">重新计算</n-button>
           </div>
         </template>
         <n-spin :show="loading">
+          <n-alert v-if="loadError" type="error" :show-icon="false">{{ loadError }}</n-alert>
           <div v-if="report">
             <div v-for="rec in report.recommendation" :key="rec.type" class="calib-block">
               <div class="calib-head">
@@ -171,7 +180,7 @@ function prLine(rep: RecCalibReport): string {
               </div>
             </div>
           </div>
-          <div v-else-if="!loading" class="calib-empty">暂无数据：点「重新计算」生成（需已积累成熟标签）。</div>
+          <div v-else-if="!loading && !loadError" class="calib-empty">暂无数据：点「重新计算」生成（需已积累成熟标签）。</div>
         </n-spin>
       </SectionCard>
 
@@ -187,7 +196,7 @@ function prLine(rep: RecCalibReport): string {
             <div class="calib-cov">
               回看 {{ report.analysis.scanned }} 条个股标准分析 · 可判定 {{ report.analysis.judged }} ·
               中性不判 {{ report.analysis.neutral_skipped }} · 未满 20 交易日 {{ report.analysis.immature_skipped }} ·
-              无本地日线 {{ report.analysis.no_data_skipped }} · 旧记录无程序置信度 {{ report.analysis.no_sys_conf }} · 同标的同日去重 {{ report.analysis.dup_skipped }}
+                无本地日线 {{ report.analysis.no_data_skipped }} · 旧记录无程序置信度 {{ report.analysis.no_sys_conf }} · 同标的同交易基准日去重 {{ report.analysis.dup_skipped }}
             </div>
             <template v-if="report.analysis.sys_tiers?.length">
               <div class="calib-sub">程序合成置信度分档（方向命中口径）</div>

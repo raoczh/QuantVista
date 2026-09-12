@@ -25,6 +25,8 @@ type RecommendationBatch struct {
 	Type     string `gorm:"size:16;index:idx_rb_user" json:"type"` // short_term / long_term
 	Market   string `gorm:"size:8" json:"market"`
 	Strategy string `gorm:"size:64" json:"strategy"` // 策略模板 key（内置推荐策略 / screen:<key> / tpl:<key> / screen:u<id>）
+	// 自建选股策略的不可变版本；0 表示内置策略或升级前未固定版本的历史批次。
+	StrategyRevisionID int64 `gorm:"not null;default:0" json:"strategy_revision_id,omitempty"`
 	// Title 生成时由筛选条件组合固化（如「短线·动量突破·≤30元·3只」）。
 	// 历史列表直接展示，不再依赖前端用「当前所选类型的策略列表」动态查名
 	//（旧做法导致跨类型批次显示原始 key 如 "value"，且随类型切换变化）。
@@ -97,7 +99,7 @@ type Recommendation struct {
 	RefDate  string  `gorm:"size:10" json:"ref_date"`
 	RefClose float64 `gorm:"type:decimal(20,4)" json:"ref_close"`
 
-	DetailJSON string `gorm:"type:text" json:"detail_json,omitempty"` // 结构化明细 JSON
+	DetailJSON string `gorm:"type:mediumtext" json:"detail_json,omitempty"` // 完整结构化明细，长篇合法模型说明不受 TEXT 的 64KB 上限截断
 
 	SortOrder int       `json:"sort_order"`
 	CreatedAt time.Time `json:"created_at"`

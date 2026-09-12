@@ -87,7 +87,7 @@ go run ./cmd/vapidgen
 
 ## 4. 数据库自动迁移（重点）
 
-后端在监听端口前执行 GORM `AutoMigrate`：**每次启动检查表结构，自动建表、加列、加索引，并执行当前 GORM 支持的兼容性列变更**。迁移失败会直接终止启动，不会带着半兼容 schema 对外服务。
+后端在监听端口前执行 GORM `AutoMigrate`：**每次启动检查表结构，自动建表、加列、加索引，并执行当前 GORM 支持的兼容性列变更**。表结构和账户、身份、策略归属迁移失败会终止启动；提示词历史基线与代次锚的补齐失败目前会告警、留待下次启动重试，须同时检查这些告警，不能只凭健康检查判断全部补齐。
 
 **能自动做的：**
 
@@ -125,42 +125,36 @@ go run ./cmd/vapidgen
 
 ## 7. 数据备份与恢复
 
-个人自用部署，数据全在 MySQL 单库 `quantvista`；容器与镜像可随时重建，**只有数据库需要备份**。
+业务数据保存在 MySQL 单库 `quantvista`；应备份完整数据库，并另外安全保管对应的 `ENCRYPTION_KEY` 和部署配置。镜像可以重建，数据库和加密主密钥丢失不能靠重建容器恢复。启用 ntfy 时，其独立用户库的备份边界见 8.1。
 
 ### 7.1 表的两类：必须备份 vs 可重建
 
 **用户数据表（必须备份——丢了无法找回）：**
 
 - 账号与配置：`users`、`user_preferences`、`user_quotas`、`refresh_tokens`（可不备，重新登录即可）、`options`（系统设置，GitHub secret 为密文）、`llm_configs`（API Key 为密文，恢复后需同一 `ENCRYPTION_KEY` 才能解密）、`prompt_templates`、`notify_channels`（target 为密文，同上）、`browser_notification_preferences`、`browser_notification_devices`、`web_push_subscriptions`（endpoint/p256dh/auth 为密文）、`browser_notification_events`、`browser_notification_deliveries`
-- 研究与交易记录：`watchlists`、`watchlist_items`、`positions`、`thesis_cards`、`research_notes`、`screener_strategies`（自定义选股策略）
+- 研究与交易记录：`watchlists`、`watchlist_items`、`watchlist_batches`、`watchlist_batch_items`、`portfolio_accounts`、`positions`、`position_trades`、`portfolio_cash_flows`、`portfolio_snapshots`、`target_allocation_revisions`、`thesis_cards`、`research_notes`、`screener_strategies` 及其不可变版本 `screener_strategy_revisions`
+- 导入与调整审计：`import_batches`、`import_rows`、`import_row_claims`、`import_effects`、`position_corp_adjusts`、`paper_corp_adjusts`；缺失会破坏去重、回滚及权益确认依据
+- 任务与版本归因：`job_runs`、`job_steps`、`job_events`、`research_artifacts`、`strategy_run_results`、`todo_inbox_states`、`onboarding_progresses`、`prompt_template_revisions`、`prompt_champion_states`，以及模型实验、路由和发布审计记录
 - AI 产出：`analysis_records`、`recommendation_batches`、`recommendations`、`recommendation_statuses`、`ai_conversations`、`ai_conversation_messages`、`daily_reports`
 - 提醒与任务通知：`alert_rules`、`alert_events`、`job_failure_notifications`
 - 模拟盘：`paper_accounts`、`paper_holdings`、`paper_trades`
 
-**行情缓存表（可不备份——均能从数据源重建）：**
+**行情与派生表（部分可重建，但不能据此假定历史都能恢复）：**
 
 - `stocks`、`stock_quotes`、`daily_bars`（个股查询/批量同步自动回填）
-- `trading_calendar`（管理端「回填交易日历」一键重建）
+- `trading_calendars`（管理端「回填交易日历」一键重建）
 - `market_snapshots`、`data_sync_logs`、`stock_scores`（后台任务自动再生）
-- N/F/M/P3 批次的采集与派生表：新闻与情绪（`news_items`/`stock_sentiments` 等）、财报/财务（`earnings_*`/`finance_*`）、全市场宽表与状态（`factor_tables`/`market_sync_states`）、龙虎榜/涨停池/人气/资金流/盘中因子（`lhb_*`/`zt_*`/`popularity_*`/`fund_flows`/`intraday_factor_dailies`）、机构观点（`report_ratings`/`org_surveys`，P3a 按需拉取缓存）、板块估值聚合（`board_valuation_dailies`，P3b 每日聚合）——均由每日 job 或按需拉取重建；注意涨停池/盘中因子上游**不可回溯**，重建只能从当天起积累，历史断档是诚实缺失
+- 采集与派生表包括新闻与情绪、财报/财务、同步状态、龙虎榜/涨停池/人气/资金流/盘中因子、机构观点和板块估值。上游可回溯范围各不相同；盘中因子、历史股票宇宙和因子快照等时间点事实不能用当前数据完整重建。推荐标签、退出结果等历史评估依据也应保留，不能因为属于派生结果就默认排除。
 - `llm_call_logs`（LLM 调用审计，90 天滚动自清理；如需长期留存审计证据则纳入备份）
 
 ### 7.2 备份命令
 
 ```bash
-# 全库备份（最简单，推荐；行情缓存表体积有限，一起备份省心）
+# 全库一致性备份，避免遗漏新增账户、流水、版本与审计表
 docker exec mysql mysqldump -uquantvista -p'密码' --single-transaction quantvista | gzip > qv-$(date +%F).sql.gz
-
-# 只备用户数据表（体积敏感时）
-docker exec mysql mysqldump -uquantvista -p'密码' --single-transaction quantvista \
-  users user_preferences user_quotas options llm_configs prompt_templates notify_channels \
-  browser_notification_preferences browser_notification_devices web_push_subscriptions \
-  browser_notification_events browser_notification_deliveries \
-  watchlists watchlist_items positions thesis_cards research_notes screener_strategies \
-  analysis_records recommendation_batches recommendations recommendation_statuses \
-  ai_conversations ai_conversation_messages daily_reports alert_rules alert_events job_failure_notifications \
-  paper_accounts paper_holdings paper_trades | gzip > qv-user-$(date +%F).sql.gz
 ```
+
+上面的表分类用于说明数据性质，不是可直接复制的完整备份白名单。若必须排除大表，应按当前 `model.AllModels()` 及实际恢复需求逐项核对，并在隔离库验证恢复后账户、流水、版本和审计关联完整；不能沿用旧版有限表名清单。示例中的密码是占位说明，实际备份应使用运维环境已有的安全凭证注入方式。
 
 宝塔用户也可直接用面板的「数据库 → 备份」定时任务（等效全库 dump）。
 
@@ -170,7 +164,7 @@ docker exec mysql mysqldump -uquantvista -p'密码' --single-transaction quantvi
 gunzip < qv-2026-07-03.sql.gz | docker exec -i mysql mysql -uquantvista -p'密码' quantvista
 ```
 
-恢复后启动应用，`AutoMigrate` 会补齐缺的表/列（只备了用户数据表时，行情缓存表自动重建）。
+先在隔离环境恢复并核对完整性，再按部署流程使用备份。恢复后启动应用时，`AutoMigrate` 会补齐结构；它不能补回漏备的交易流水、账户关联、不可变版本或历史快照。
 
 **两个密钥必须与备份时一致，否则密文字段作废：**
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,8 +33,9 @@ const (
 	compareJobTimeout = 5 * time.Minute
 	// comparePromptVersion 对比 AI 点评的内联提示词版本（P0-2 修复批新设）：aiComment 的
 	// system/user 提示词为固定内联文本，改措辞须递增本版本——审计与 trace 关联凭它归因。
+	// c4: 缺失技术指标不填零，独立标注日线截至日期并保留单价精度。
 	// c3: 移除点评字数和段落形式限制；c2: 强化 180 字、不分段不列清单的输出纪律；c1: 初版。
-	comparePromptVersion     = "c3"
+	comparePromptVersion     = "c4"
 	comparePromptInstruction = "请对下列股票做横向对比点评。指出相对强弱、趋势与均线位置差异、估值水位差异（如有 PE/PB 数据）、谁更值得关注及其理由。要求：只依据给出的数据，关键判断引用具体数值（如「A 综合分 78 高于 B 的 52」）；系统会程序化核对你引用的数字，与数据不符的会被标记展示给用户，故不得编造或凭印象填数；禁止使用你记忆中关于这些公司的信息，不得虚构财务明细/新闻；这是研究参考，不构成投资建议，同时给出风险提示。\n\n数据（score 为本站五维技术评分 0-100，仅供参考锚点）：\n"
 )
 
@@ -41,35 +43,37 @@ const (
 // true（stale/unknown 的最近已知价仍填 Price 供表格展示，但带 FreshnessStatus/
 // QuoteAsOf/Error 标注，且不参与评分与 AI 点评）。
 type CompareRow struct {
-	Symbol       string  `json:"symbol"`
-	Market       string  `json:"market"`
-	Name         string  `json:"name"`
-	QuoteOK      bool    `json:"quote_ok"`
-	Price        float64 `json:"price"`
-	ChangePct    float64 `json:"change_pct"`
-	Amount       float64 `json:"amount"`
-	MA5          float64 `json:"ma5"`
-	MA10         float64 `json:"ma10"`
-	MA20         float64 `json:"ma20"`
-	PeriodHigh   float64 `json:"period_high"`
-	PeriodLow    float64 `json:"period_low"`
-	ChangePct5d  float64 `json:"change_pct_5d"`
-	ChangePct20d float64 `json:"change_pct_20d"`
-	AbovMA20     bool    `json:"above_ma20"` // 现价是否站上 MA20
-	Score        float64 `json:"score"`      // 综合评分 0-100
-	ScoreLabel   string  `json:"score_label"`
-	ValuationOK  bool    `json:"valuation_ok"`  // 估值快照是否可得且时效有效（腾讯免费源 best-effort）
-	IsFund       bool    `json:"is_fund"`       // ETF/场内基金（无个股估值指标，估值段跳过）
-	PETTM        float64 `json:"pe_ttm"`        // 市盈率 TTM（负值=亏损）
-	PB           float64 `json:"pb"`            // 市净率
-	TotalCap     float64 `json:"total_cap"`     // 总市值（元）
-	TurnoverRate float64 `json:"turnover_rate"` // 换手率 %
-	VolumeRatio  float64 `json:"volume_ratio"`  // 量比
-	IsST         bool    `json:"is_st"`
-	Error        string  `json:"error"`
+	Symbol       string   `json:"symbol"`
+	Market       string   `json:"market"`
+	Name         string   `json:"name"`
+	QuoteOK      bool     `json:"quote_ok"`
+	Price        float64  `json:"price"`
+	ChangePct    float64  `json:"change_pct"`
+	Amount       float64  `json:"amount"`
+	MA5          *float64 `json:"ma5"`
+	MA10         *float64 `json:"ma10"`
+	MA20         *float64 `json:"ma20"`
+	PeriodHigh   *float64 `json:"period_high"`
+	PeriodLow    *float64 `json:"period_low"`
+	ChangePct5d  *float64 `json:"change_pct_5d"`
+	ChangePct20d *float64 `json:"change_pct_20d"`
+	AbovMA20     *bool    `json:"above_ma20"` // nil 表示 MA20 不可用。
+	Score        *float64 `json:"score"`      // nil 表示历史不足或不可用。
+	ScoreLabel   string   `json:"score_label"`
+	ValuationOK  bool     `json:"valuation_ok"`  // 估值快照是否可得且时效有效（腾讯免费源 best-effort）
+	IsFund       bool     `json:"is_fund"`       // ETF/场内基金（无个股估值指标，估值段跳过）
+	PETTM        float64  `json:"pe_ttm"`        // 市盈率 TTM（负值=亏损）
+	PB           float64  `json:"pb"`            // 市净率
+	TotalCap     float64  `json:"total_cap"`     // 总市值（元）
+	TurnoverRate float64  `json:"turnover_rate"` // 换手率 %
+	VolumeRatio  float64  `json:"volume_ratio"`  // 量比
+	IsST         bool     `json:"is_st"`
+	Error        string   `json:"error"`
 
 	QuoteAsOf       string `json:"quote_as_of,omitempty"`      // 行情数据源时刻
 	FreshnessStatus string `json:"freshness_status,omitempty"` // fresh | stale | unknown
+	BarsAsOf        string `json:"bars_as_of,omitempty"`
+	TechnicalNote   string `json:"technical_note,omitempty"`
 }
 
 // CompareRequest 对比入参。
@@ -240,7 +244,7 @@ func (s *CompareService) buildRow(ctx context.Context, market, symbol string) Co
 	if !q.DataTime.IsZero() {
 		row.QuoteAsOf = q.DataTime.In(time.Local).Format("2006-01-02 15:04")
 	}
-	row.Price = round2(q.Price)
+	row.Price = q.Price
 	row.ChangePct = round2(q.ChangePct)
 	row.Amount = round2(q.Amount)
 	if fi.Status != freshStatusFresh {
@@ -271,38 +275,53 @@ func (s *CompareService) buildRow(ctx context.Context, market, symbol string) Co
 	}
 
 	bars, berr := s.market.GetDailyBars(ctx, market, symbol, 60)
-	if berr == nil && len(bars) > 0 {
-		closes := make([]float64, len(bars))
-		for i, b := range bars {
-			closes[i] = b.Close
+	if berr != nil || len(bars) == 0 {
+		row.TechnicalNote = "日线数据暂不可用，技术指标与评分缺失"
+		return row
+	}
+	row.BarsAsOf = bars[len(bars)-1].TradeDate
+	if issue := technicalBarsIssue(ctx, market, q.DataTime, fi, bars); issue != "" {
+		row.TechnicalNote = issue
+		return row
+	}
+	closes := make([]float64, len(bars))
+	for i, b := range bars {
+		closes[i] = b.Close
+	}
+	// 展示与均线位置比较均使用原始精度，避免 ETF 第三位价格改变判断。
+	for n, dest := range map[int]**float64{5: &row.MA5, 10: &row.MA10, 20: &row.MA20} {
+		if average, ok := movingAverage(closes, n); ok {
+			*dest = &average
 		}
-		if v, ok := movingAverage(closes, 5); ok {
-			row.MA5 = v
+	}
+	hi, lo := bars[0].High, bars[0].Low
+	for _, b := range bars {
+		if b.High > hi {
+			hi = b.High
 		}
-		if v, ok := movingAverage(closes, 10); ok {
-			row.MA10 = v
+		if b.Low < lo && b.Low > 0 {
+			lo = b.Low
 		}
-		if v, ok := movingAverage(closes, 20); ok {
-			row.MA20 = v
-		}
-		hi, lo := bars[0].High, bars[0].Low
-		for _, b := range bars {
-			if b.High > hi {
-				hi = b.High
-			}
-			if b.Low < lo && b.Low > 0 {
-				lo = b.Low
-			}
-		}
-		row.PeriodHigh = round2(hi)
-		row.PeriodLow = round2(lo)
-		row.ChangePct5d = changeOverN(closes, 5)
-		row.ChangePct20d = changeOverN(closes, 20)
-		row.AbovMA20 = row.MA20 > 0 && row.Price >= row.MA20
-		// 综合评分（复用评分引擎，行情+技术指标口径一致）。
+	}
+	row.PeriodHigh = &hi
+	row.PeriodLow = &lo
+	if len(closes) > 5 {
+		row.ChangePct5d = fptr(changeOverN(closes, 5))
+	}
+	if len(closes) > 20 {
+		row.ChangePct20d = fptr(changeOverN(closes, 20))
+	}
+	if row.MA20 != nil {
+		above := row.Price >= *row.MA20
+		row.AbovMA20 = &above
+	}
+	// 综合评分（复用评分引擎，行情+技术指标口径一致）。
+	if len(bars) >= 21 {
 		sc := computeScore(q.Price, bars)
-		row.Score = sc.Total
+		row.Score = &sc.Total
 		row.ScoreLabel = sc.Label
+	} else {
+		row.TechnicalNote = fmt.Sprintf("仅有 %d 根日线，不足窗口的指标与综合评分不可用", len(bars))
 	}
 	return row
 }
@@ -342,12 +361,13 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 		return "", "有效行情不足，无法生成 AI 点评", RefusalFreshQuotesInsufficient, nil, ""
 	}
 
-	cfg, apiKey, err := s.llm.ResolveForUse(userID, llmConfigID)
+	cfg, apiKey, err := s.llm.ResolveForUse(userID, llmConfigID, ctx)
 	if err != nil {
 		return "", "AI 点评不可用：" + err.Error(), RefusalLLMUnavailable, nil, ""
 	}
 	allowPrivate = llmAllowPrivate(allowPrivate, cfg) // 回退到管理员配置时按配置所有者放行内网
-	if err := checkQuota(userID); err != nil {
+	ctx, finishQuota, err := beginManualQuotaAction(ctx, userID)
+	if err != nil {
 		if code := RefusalCodeOf(err); code != "" {
 			if code == RefusalQuotaExhausted {
 				return "", "AI 次数配额已用尽，仅展示指标对比", code, nil, ""
@@ -356,6 +376,7 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 		}
 		return "", "AI 点评不可用：配额信息读取失败", RefusalQuotaUnavailable, nil, ""
 	}
+	defer finishQuota()
 
 	// P0-2：对比无业务落库行，trace 随响应回传（管理端审计按 trace_id 可查本次调用）。
 	// prompt 版本接 comparePromptVersion（内联提示词的稳定显式版本，改措辞须递增）。
@@ -369,7 +390,7 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 	res, err := chatCompletion(ctx, chatParams{
 		BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 		ReasoningEffort: cfg.ReasoningEffort,
-		Temperature: cfg.Temperature, MaxTokens: moduleTokenCap("compare", cfg.MaxTokens),
+		Temperature:     cfg.Temperature, MaxTokens: moduleTokenCap("compare", cfg.MaxTokens),
 		Messages: messages,
 		JSONMode: false, AllowPrivate: allowPrivate,
 		Meta: run.chatMeta(userID, cfg, 1),
@@ -383,7 +404,7 @@ func (s *CompareService) aiComment(ctx context.Context, userID int64, allowPriva
 		return "", "AI 点评生成失败：" + err.Error(), code, nil, run.TraceID
 	}
 	if res.Usage.TotalTokens > 0 {
-		consumeQuota(userID, res.Usage.TotalTokens, true)
+		consumeQuota(userID, res.Usage.TotalTokens)
 	}
 	return strings.TrimSpace(res.Content), "", "", cfg, run.TraceID
 }
@@ -405,14 +426,31 @@ func aboveText(above bool) string {
 // ETF/场内基金行不带估值段并显式标注，防止模型臆测估值。
 func compareRowLine(r CompareRow) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "- %s(%s)：现价%.2f 涨跌%.2f%% 近5日%.2f%% 近20日%.2f%% MA20=%.2f %s，区间[%.2f,%.2f]",
-		nameOr(r), r.Symbol, r.Price, r.ChangePct, r.ChangePct5d, r.ChangePct20d, r.MA20,
-		aboveText(r.AbovMA20), r.PeriodLow, r.PeriodHigh)
+	fmt.Fprintf(&b, "- %s(%s)：现价%s 涨跌%.2f%%", nameOr(r), r.Symbol,
+		strconv.FormatFloat(r.Price, 'f', -1, 64), r.ChangePct)
+	if r.ChangePct5d != nil {
+		fmt.Fprintf(&b, " 近5日%.2f%%", *r.ChangePct5d)
+	}
+	if r.ChangePct20d != nil {
+		fmt.Fprintf(&b, " 近20日%.2f%%", *r.ChangePct20d)
+	}
+	if r.MA20 != nil && r.AbovMA20 != nil {
+		fmt.Fprintf(&b, " MA20=%.4f %s", *r.MA20, aboveText(*r.AbovMA20))
+	}
+	if r.PeriodLow != nil && r.PeriodHigh != nil {
+		fmt.Fprintf(&b, "，区间[%.4f,%.4f]", *r.PeriodLow, *r.PeriodHigh)
+	}
+	if r.BarsAsOf != "" {
+		fmt.Fprintf(&b, "（日线截至 %s）", r.BarsAsOf)
+	}
+	if r.TechnicalNote != "" {
+		fmt.Fprintf(&b, "；%s，不得将缺失指标视为零值或臆测趋势", r.TechnicalNote)
+	}
 	if r.QuoteAsOf != "" {
 		fmt.Fprintf(&b, "（行情时点 %s）", r.QuoteAsOf)
 	}
-	if r.Score > 0 {
-		fmt.Fprintf(&b, "，综合分%.0f(%s)", r.Score, r.ScoreLabel)
+	if r.Score != nil {
+		fmt.Fprintf(&b, "，综合分%.0f(%s)", *r.Score, r.ScoreLabel)
 	}
 	if r.ValuationOK {
 		fmt.Fprintf(&b, "，PE-TTM=%.2f PB=%.2f 总市值%.0f亿 换手%.2f%%", r.PETTM, r.PB, r.TotalCap/1e8, r.TurnoverRate)

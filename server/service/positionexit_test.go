@@ -54,6 +54,9 @@ func TestPositionExitAssessmentMatrixAndIdempotency(t *testing.T) {
 	svc := NewPositionExitAssessmentService(nil)
 	input := positionExitInput{position: base, quote: freshExitQuote(now, 8, 8.2, 7.8), barRows: bars, now: now, session: model.PositionExitSessionIntraday}
 	input.position.PlanStopLoss = 8.5
+	if err := common.DB.Model(&base).Update("plan_stop_loss", input.position.PlanStopLoss).Error; err != nil {
+		t.Fatal(err)
+	}
 	got := evaluatePositionExit(input, defaultPositionExitParams)
 	if got.Level != model.PositionExitLevelUrgent || got.PrimarySignal != "plan_stop" {
 		t.Fatalf("计划止损必须 urgent: level=%s primary=%s reason=%s", got.Level, got.PrimarySignal, got.PrimaryReason)
@@ -186,7 +189,7 @@ func TestPositionExitAllModelsMigrateNoHoldingAndCloseRace(t *testing.T) {
 	}
 	row := evaluatePositionExit(positionExitInput{position: p, quote: freshExitQuote(now, 10, 10.1, 9.9), barRows: exitTestBars(now, 10, 10.5, 9.5, 70), now: now, session: model.PositionExitSessionIntraday}, defaultPositionExitParams)
 	common.DB.Model(&model.Position{}).Where("id = ?", p.ID).Update("status", model.PositionStatusClosed)
-	inserted, _, err := persistPositionExitAssessment(context.Background(), row)
+	inserted, _, err := persistPositionExitAssessment(context.Background(), &row)
 	if err != nil || inserted {
 		t.Fatalf("扫描中平仓不得落孤儿事实: inserted=%v err=%v", inserted, err)
 	}
@@ -201,7 +204,7 @@ func TestPositionExitAllModelsMigrateNoHoldingAndCloseRace(t *testing.T) {
 	}
 	leaked := row
 	leaked.UserID, leaked.PositionID, leaked.Symbol = 903, other.ID, other.Symbol
-	if inserted, _, err := persistPositionExitAssessment(context.Background(), leaked); err != nil || inserted {
+	if inserted, _, err := persistPositionExitAssessment(context.Background(), &leaked); err != nil || inserted {
 		t.Fatalf("落库前用户归属复核必须阻止跨用户事实: inserted=%v err=%v", inserted, err)
 	}
 }
@@ -300,16 +303,16 @@ func TestPositionExitConsumesAlertEventAndPersistsMeaningfulTransitions(t *testi
 	if first.Level != model.PositionExitLevelReview || first.PrimarySignal != model.AlertKindCostDrawdown {
 		t.Fatalf("已落库 AlertEvent 在规则暂停后仍必须参与统一风险: level=%s primary=%s", first.Level, first.PrimarySignal)
 	}
-	if inserted, notify, err := persistPositionExitAssessment(context.Background(), first); err != nil || !inserted || !notify {
+	if inserted, notify, err := persistPositionExitAssessment(context.Background(), &first); err != nil || !inserted || !notify {
 		t.Fatalf("首次评估应落库并允许通知: inserted=%v notify=%v err=%v", inserted, notify, err)
 	}
 	closeSnapshot := first
 	closeSnapshot.Session = model.PositionExitSessionClose
 	closeSnapshot.EvaluatedAt = now.Add(2 * time.Hour)
-	if inserted, notify, err := persistPositionExitAssessment(context.Background(), closeSnapshot); err != nil || !inserted || notify {
+	if inserted, notify, err := persistPositionExitAssessment(context.Background(), &closeSnapshot); err != nil || !inserted || notify {
 		t.Fatalf("盘后收盘快照即使事实相同也应追加，但同级同主因不得重复通知: inserted=%v notify=%v err=%v", inserted, notify, err)
 	}
-	if inserted, _, err := persistPositionExitAssessment(context.Background(), closeSnapshot); err != nil || inserted {
+	if inserted, _, err := persistPositionExitAssessment(context.Background(), &closeSnapshot); err != nil || inserted {
 		t.Fatalf("相同盘后槽位必须幂等: inserted=%v err=%v", inserted, err)
 	}
 
@@ -319,7 +322,7 @@ func TestPositionExitConsumesAlertEventAndPersistsMeaningfulTransitions(t *testi
 	changedPrimary.PrimarySignal = "atr14_break"
 	changedPrimary.PrimaryReason = "跌破 ATR14 保护线"
 	changedPrimary.FactHash = "changed-primary-fact"
-	if inserted, notify, err := persistPositionExitAssessment(context.Background(), changedPrimary); err != nil || !inserted || !notify {
+	if inserted, notify, err := persistPositionExitAssessment(context.Background(), &changedPrimary); err != nil || !inserted || !notify {
 		t.Fatalf("同级主因变化必须追加并允许重新通知: inserted=%v notify=%v err=%v", inserted, notify, err)
 	}
 	recovered := changedPrimary
@@ -327,7 +330,7 @@ func TestPositionExitConsumesAlertEventAndPersistsMeaningfulTransitions(t *testi
 	recovered.Level, recovered.PrimarySignal = model.PositionExitLevelNormal, "normal"
 	recovered.PrimaryReason, recovered.FactHash = "当前没有新触发的卖出风险事实", "recovered-normal-fact"
 	recovered.ShouldTodo = false
-	if inserted, _, err := persistPositionExitAssessment(context.Background(), recovered); err != nil || !inserted {
+	if inserted, _, err := persistPositionExitAssessment(context.Background(), &recovered); err != nil || !inserted {
 		t.Fatalf("风险恢复为 normal 必须追加: inserted=%v err=%v", inserted, err)
 	}
 }
@@ -350,14 +353,14 @@ func TestPositionExitNotificationDedupAndUpgrade(t *testing.T) {
 	row := model.PositionExitAssessment{ID: 9901, UserID: userID, PositionID: 9091, Symbol: "600909", Market: "cn", Name: "通知持仓",
 		TradeDate: "2026-08-10", Level: model.PositionExitLevelWatch, PrimaryReason: "仅观察", NextAction: "继续观察",
 		QuoteAsOf: "2026-08-10 14:55", BarsAsOf: "2026-08-09", FactHash: "review-fact"}
-	svc.notifyAssessment(context.Background(), row)
+	svc.notifyAssessment(context.Background(), row, 0)
 	if got := notifier.calls.Load(); got != 0 {
 		t.Fatalf("watch 不得推送，got %d", got)
 	}
 	row.Level, row.PrimaryReason = model.PositionExitLevelReview, "需要复核"
-	svc.notifyAssessment(context.Background(), row)
+	svc.notifyAssessment(context.Background(), row, 0)
 	row.PrimaryReason = "同日另一条 review 事实"
-	svc.notifyAssessment(context.Background(), row)
+	svc.notifyAssessment(context.Background(), row, 0)
 	if got := notifier.calls.Load(); got != 1 {
 		t.Fatalf("review 同日应按统一 GuardEvent 去重一次，got %d", got)
 	}
@@ -380,7 +383,7 @@ func TestPositionExitNotificationDedupAndUpgrade(t *testing.T) {
 	}
 	row.Level, row.PrimaryReason = model.PositionExitLevelUrgent, "风险升级"
 	row.ID, row.FactHash = 9902, "urgent-fact"
-	svc.notifyAssessment(context.Background(), row)
+	svc.notifyAssessment(context.Background(), row, 0)
 	if got := notifier.calls.Load(); got != 2 {
 		t.Fatalf("review 升 urgent 应允许再次提醒，got %d", got)
 	}
@@ -391,7 +394,7 @@ func TestPositionExitNotificationDedupAndUpgrade(t *testing.T) {
 	row.PositionID = 9092
 	row.ID, row.FactHash = 9903, "review-other-position"
 	row.Level, row.PrimaryReason = model.PositionExitLevelReview, "同标的另一笔成本持仓"
-	svc.notifyAssessment(context.Background(), row)
+	svc.notifyAssessment(context.Background(), row, 0)
 	if got := notifier.calls.Load(); got != 3 {
 		t.Fatalf("同标的不同 position_id 必须分别提醒，got %d", got)
 	}

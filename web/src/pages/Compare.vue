@@ -15,6 +15,7 @@ import { compareStocks, type CompareResult } from '@/api/compare'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { getLLMTask, isLLMTask, listLLMTasks, type LLMTask } from '@/api/llmTask'
 import { isPollCancelled, pollUntil } from '@/lib/poll'
+import { formatPrice } from '@/lib/formatPrice'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
 import PageContainer from '@/components/PageContainer.vue'
@@ -59,12 +60,9 @@ function applyStockActionQuery() {
     .filter(Boolean)
     .slice(0, 6)
   if (!syms.length) return
-  while (inputs.value.length < Math.max(2, syms.length)) inputs.value.push({ symbol: '', market: 'cn', name: '' })
-  syms.forEach((s, i) => {
-    inputs.value[i].symbol = s
-    if (i === 0 && route.query.name) inputs.value[i].name = String(route.query.name)
-    if (i === 0 && route.query.market) inputs.value[i].market = String(route.query.market)
-  })
+  inputs.value = syms.map((symbol, i) => ({ symbol, market: i === 0 && route.query.market ? String(route.query.market) : 'cn',
+    name: i === 0 && route.query.name ? String(route.query.name) : '' }))
+  while (inputs.value.length < 2) inputs.value.push({ symbol: '', market: 'cn', name: '' })
   const query = { ...route.query }
   for (const key of ['symbols', 'symbol', 'market', 'name', '_stock_action']) delete query[key]
   void router.replace({ name: 'compare', query })
@@ -95,6 +93,21 @@ const result = ref<CompareResult | null>(null)
 const running = ref(false)
 const activeTask = ref<LLMTask<CompareResult> | null>(null)
 const taskError = ref('')
+let viewEpoch = 0
+let disposed = false
+let pollAbort: AbortController | null = null
+const currentView = (epoch: number) => !disposed && epoch === viewEpoch
+function invalidateView() {
+  viewEpoch++
+  pollAbort?.abort()
+  pollAbort = null
+  running.value = false
+  return viewEpoch
+}
+onBeforeUnmount(() => {
+  disposed = true
+  invalidateView()
+})
 
 function applyCompareResult(value: CompareResult) {
   result.value = value
@@ -103,6 +116,7 @@ function applyCompareResult(value: CompareResult) {
 }
 
 async function run() {
+  if (running.value || disposed) return
   const symbols = inputs.value.map((r) => ({ symbol: r.symbol.trim(), market: r.market })).filter((r) => r.symbol)
   if (symbols.length < 2) {
     message.warning('请至少搜索并选择两只股票')
@@ -111,32 +125,34 @@ async function run() {
   if (withAI.value && !llmConfigs.value.length) {
     message.warning('未配置 LLM，将仅做指标对比')
   }
+  const epoch = invalidateView()
   running.value = true
+  result.value = null
+  activeTask.value = null
   taskError.value = ''
   try {
     const response = await compareStocks({ symbols, with_ai: withAI.value, llm_config_id: llmId.value })
+    if (!currentView(epoch)) return
     if (isLLMTask<CompareResult>(response)) {
       activeTask.value = response
       message.info('任务已创建，正在后台生成 AI 点评（刷新或关闭页面不影响任务）')
-      await trackCompareTask(response)
+      await trackCompareTask(response, null, epoch)
     } else {
       activeTask.value = null
       applyCompareResult(response)
     }
   } catch (e) {
-    if (!isPollCancelled(e)) {
+    if (currentView(epoch) && !isPollCancelled(e)) {
       taskError.value = (e as Error).message
       message.error(taskError.value)
     }
   } finally {
-    running.value = false
+    if (currentView(epoch)) running.value = false
   }
 }
 
-let pollAbort: AbortController | null = null
-onBeforeUnmount(() => pollAbort?.abort())
-
-async function trackCompareTask(initial: LLMTask<CompareResult>, expectedRouteTaskID: number | null = null) {
+async function trackCompareTask(initial: LLMTask<CompareResult>, expectedRouteTaskID: number | null = null, epoch = viewEpoch) {
+  if (!currentView(epoch)) return
   pollAbort?.abort()
   const controller = new AbortController()
   pollAbort = controller
@@ -149,7 +165,7 @@ async function trackCompareTask(initial: LLMTask<CompareResult>, expectedRouteTa
             signal: controller.signal,
           })
         : initial
-    if (expectedRouteTaskID !== null && routeTaskID() !== expectedRouteTaskID) return
+    if (!currentView(epoch) || controller.signal.aborted || (expectedRouteTaskID !== null && routeTaskID() !== expectedRouteTaskID)) return
     activeTask.value = task
     if (task.status === 'failed') {
       const detail = task.error || '横向对比任务执行失败'
@@ -159,11 +175,11 @@ async function trackCompareTask(initial: LLMTask<CompareResult>, expectedRouteTa
     applyCompareResult(task.result)
   } catch (e) {
     if (isPollCancelled(e)) return
-    if (expectedRouteTaskID !== null && routeTaskID() !== expectedRouteTaskID) return
+    if (!currentView(epoch) || controller.signal.aborted || (expectedRouteTaskID !== null && routeTaskID() !== expectedRouteTaskID)) return
     taskError.value = (e as Error).message
     message.error(taskError.value)
   } finally {
-    if (pollAbort === controller) {
+    if (currentView(epoch) && pollAbort === controller) {
       pollAbort = null
       running.value = false
     }
@@ -171,18 +187,19 @@ async function trackCompareTask(initial: LLMTask<CompareResult>, expectedRouteTa
 }
 
 async function restoreCompareTask() {
-  if (routeTaskID()) return
+  if (routeTaskID() || running.value || disposed) return
+  const epoch = viewEpoch
   const tasks = await listLLMTasks<CompareResult>({ kind: 'compare', limit: 1 }).catch(() => [])
-  if (routeTaskID()) return
+  if (!currentView(epoch) || routeTaskID()) return
   const summary = tasks[0]
   if (!summary) return
   if (summary.status === 'processing') {
     activeTask.value = summary
-    void trackCompareTask(summary)
+    void trackCompareTask(summary, null, epoch)
     return
   }
   const task = await getLLMTask<CompareResult>(summary.id).catch(() => summary)
-  if (routeTaskID()) return
+  if (!currentView(epoch) || routeTaskID()) return
   activeTask.value = task
   if (task.status === 'success' && task.result) {
     result.value = task.result
@@ -197,44 +214,41 @@ function routeTaskID(): number | null {
   return Number.isInteger(id) && id > 0 ? id : null
 }
 
-let restoredRouteTaskID: number | null = null
-let restoringRouteTaskID: number | null = null
 async function restoreRouteTask(): Promise<boolean> {
   const id = routeTaskID()
-  if (!id) {
-    restoredRouteTaskID = null
-    if (restoringRouteTaskID !== null) pollAbort?.abort()
-    return false
-  }
-  if (restoredRouteTaskID === id || restoringRouteTaskID === id) return true
-
-  restoringRouteTaskID = id
-  pollAbort?.abort()
+  if (!id || disposed) return false
+  const epoch = viewEpoch
+  running.value = true
   result.value = null
   activeTask.value = null
   taskError.value = ''
   try {
     const task = await getLLMTask<CompareResult>(id)
-    if (routeTaskID() !== id) return true
-    restoredRouteTaskID = id
+    if (!currentView(epoch) || routeTaskID() !== id) return true
     if (task.kind !== 'compare') {
       taskError.value = '该任务不是横向对比任务，无法在此页面打开'
       message.error(taskError.value)
       return true
     }
-    await trackCompareTask(task, id)
+    await trackCompareTask(task, id, epoch)
   } catch (e) {
-    if (routeTaskID() === id) {
+    if (currentView(epoch) && routeTaskID() === id) {
       taskError.value = (e as Error).message || '横向对比任务状态读取失败'
       message.error(taskError.value)
     }
   } finally {
-    if (restoringRouteTaskID === id) restoringRouteTaskID = null
+    if (currentView(epoch) && !pollAbort) running.value = false
   }
   return true
 }
 
-watch(() => route.query.task_id, () => void restoreRouteTask())
+watch(() => route.query.task_id, () => {
+  invalidateView()
+  result.value = null
+  activeTask.value = null
+  taskError.value = ''
+  void restoreRouteTask()
+}, { flush: 'sync' })
 
 onMounted(async () => {
   if (await restoreRouteTask()) return
@@ -244,7 +258,10 @@ onMounted(async () => {
 // ---------- 展示辅助 ----------
 const rows = computed(() => result.value?.rows.filter((r) => r.quote_ok && r.freshness_status !== 'stale' && r.freshness_status !== 'unknown') || [])
 const failed = computed(() => result.value?.rows.filter((r) => !r.quote_ok || r.freshness_status === 'stale' || r.freshness_status === 'unknown') || [])
-const comparisonAsOf = computed(() => rows.value.map((row) => row.quote_as_of).filter(Boolean).sort().at(-1) || '未知')
+const comparisonAsOf = computed(() => {
+  const dates = rows.value.map((row) => row.quote_as_of).filter(Boolean).sort()
+  return dates.length === 0 ? '未知' : dates[0] === dates.at(-1) ? dates[0] : `${dates[0]} 至 ${dates.at(-1)}`
+})
 
 function fmt(n: number) {
   return n === 0 ? '—' : n.toFixed(2)
@@ -258,7 +275,8 @@ function fmtPE(n: number) {
 function fmtCap(n: number) {
   return n <= 0 ? '—' : (n / 1e8).toFixed(0) + ' 亿'
 }
-function pctText(n: number) {
+function pctText(n: number | null) {
+  if (n == null) return '—'
   return (n > 0 ? '+' : '') + n.toFixed(2) + '%'
 }
 // 每个指标里的最优值（用于高亮）：涨跌类取最大。
@@ -266,8 +284,9 @@ function bestIndex(key: 'change_pct' | 'change_pct_5d' | 'change_pct_20d') {
   let idx = -1
   let best = -Infinity
   rows.value.forEach((r, i) => {
-    if (r[key] > best) {
-      best = r[key]
+    const value = r[key]
+    if (value != null && value > best) {
+      best = value
       idx = i
     }
   })
@@ -278,7 +297,7 @@ const bestScoreIndex = computed(() => {
   let idx = -1
   let best = -Infinity
   rows.value.forEach((r, i) => {
-    if (r.score > best) {
+    if (r.score != null && r.score > best) {
       best = r.score
       idx = i
     }
@@ -320,11 +339,12 @@ function aiRefusalText(code: string) {
               :model-value="row.symbol ? row : null"
               :placeholder="`搜索第 ${i + 1} 只股票`"
               class="compare-picker"
+              :disabled="running"
               @update:model-value="setCompareStock(i, $event)"
             />
-            <n-button v-if="inputs.length > 2" size="small" quaternary type="error" @click="removeRow(i)">移除</n-button>
+            <n-button v-if="inputs.length > 2" size="small" quaternary type="error" :disabled="running" @click="removeRow(i)">移除</n-button>
           </div>
-          <n-button v-if="inputs.length < 6" size="small" dashed @click="addRow">＋ 增加一只（最多 6）</n-button>
+          <n-button v-if="inputs.length < 6" size="small" dashed :disabled="running" @click="addRow">＋ 增加一只（最多 6）</n-button>
         </div>
         <div class="opts">
           <div class="opt">
@@ -350,7 +370,7 @@ function aiRefusalText(code: string) {
       <SectionCard v-if="result" title="对比结果">
         <n-spin :show="running">
           <p class="result-status">
-            参与比较 {{ rows.length }} 只 · 数据截止时间 {{ comparisonAsOf }} · stale/unknown/失败标的不会进入正常排名。
+            参与比较 {{ rows.length }} 只 · 行情时间 {{ comparisonAsOf }} · 过期或时效未知的行情不参与排名，缺失指标显示“—”。
             <TermHelp term="ma" />
           </p>
           <n-empty v-if="!rows.length" description="没有取到有效行情" />
@@ -375,13 +395,16 @@ function aiRefusalText(code: string) {
                     :key="r.symbol"
                     :style="{ background: i === bestScoreIndex ? withAlpha(upColor, 0.12) : '' }"
                   >
-                    <span class="score-val">{{ r.score.toFixed(0) }}</span>
-                    <n-tag size="tiny" :bordered="false" round :color="scoreTagColor(r.score)">{{ r.score_label }}</n-tag>
+                    <template v-if="r.score != null">
+                      <span class="score-val">{{ r.score.toFixed(0) }}</span>
+                      <n-tag size="tiny" :bordered="false" round :color="scoreTagColor(r.score)">{{ r.score_label }}</n-tag>
+                    </template>
+                    <template v-else>—</template>
                   </td>
                 </tr>
                 <tr>
                   <td class="metric-col">现价</td>
-                  <td v-for="r in rows" :key="r.symbol">{{ fmt(r.price) }}</td>
+                  <td v-for="r in rows" :key="r.symbol">{{ formatPrice(r.price) }}</td>
                 </tr>
                 <tr>
                   <td class="metric-col">当日涨跌</td>
@@ -398,7 +421,7 @@ function aiRefusalText(code: string) {
                   <td
                     v-for="(r, i) in rows"
                     :key="r.symbol"
-                    :style="{ color: pctColor(r.change_pct_5d), background: i === bestIndex('change_pct_5d') ? withAlpha(upColor, 0.1) : '' }"
+                    :style="{ color: pctColor(r.change_pct_5d ?? 0), background: i === bestIndex('change_pct_5d') ? withAlpha(upColor, 0.1) : '' }"
                   >
                     {{ pctText(r.change_pct_5d) }}
                   </td>
@@ -408,26 +431,31 @@ function aiRefusalText(code: string) {
                   <td
                     v-for="(r, i) in rows"
                     :key="r.symbol"
-                    :style="{ color: pctColor(r.change_pct_20d), background: i === bestIndex('change_pct_20d') ? withAlpha(upColor, 0.1) : '' }"
+                    :style="{ color: pctColor(r.change_pct_20d ?? 0), background: i === bestIndex('change_pct_20d') ? withAlpha(upColor, 0.1) : '' }"
                   >
                     {{ pctText(r.change_pct_20d) }}
                   </td>
                 </tr>
                 <tr>
                   <td class="metric-col"><TermHelp term="ma" /> MA5 / 10 / 20</td>
-                  <td v-for="r in rows" :key="r.symbol">{{ fmt(r.ma5) }} / {{ fmt(r.ma10) }} / {{ fmt(r.ma20) }}</td>
+                  <td v-for="r in rows" :key="r.symbol">{{ formatPrice(r.ma5) }} / {{ formatPrice(r.ma10) }} / {{ formatPrice(r.ma20) }}</td>
                 </tr>
                 <tr>
                   <td class="metric-col">均线位置</td>
                   <td v-for="r in rows" :key="r.symbol">
-                    <n-tag size="tiny" :bordered="false" round :type="r.above_ma20 ? 'error' : 'success'">{{
+                    <n-tag v-if="r.above_ma20 != null" size="tiny" :bordered="false" round :type="r.above_ma20 ? 'error' : 'success'">{{
                       r.above_ma20 ? '站上 MA20' : 'MA20 下方'
                     }}</n-tag>
+                    <template v-else>—</template>
                   </td>
                 </tr>
                 <tr>
                   <td class="metric-col">区间高 / 低</td>
-                  <td v-for="r in rows" :key="r.symbol">{{ fmt(r.period_high) }} / {{ fmt(r.period_low) }}</td>
+                  <td v-for="r in rows" :key="r.symbol">{{ formatPrice(r.period_high) }} / {{ formatPrice(r.period_low) }}</td>
+                </tr>
+                <tr>
+                  <td class="metric-col">日线截至</td>
+                  <td v-for="r in rows" :key="r.symbol">{{ r.bars_as_of || '—' }}</td>
                 </tr>
                 <tr>
                   <td class="metric-col">PE-TTM / PB</td>
@@ -453,6 +481,10 @@ function aiRefusalText(code: string) {
                 </tr>
               </tbody>
             </table>
+          </div>
+
+          <div v-for="r in rows.filter(row => row.technical_note)" :key="`${r.market}:${r.symbol}`" class="failed">
+            {{ r.name || r.symbol }}：{{ r.technical_note }}
           </div>
 
           <div v-if="failed.length" class="failed">

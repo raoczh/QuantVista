@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"quantvista/common"
+	"quantvista/model"
 )
 
 // 本文件覆盖 2026-08-20 配置面板批的修复项（列宽/空白归一化/探测密钥三态）。
@@ -90,6 +91,9 @@ func TestLLMConfigCRUDTrimsWhitespace(t *testing.T) {
 	in.BaseURL = "  https://api.example.com/  "
 	in.Model = "  deepseek-chat\n"
 	in.ReasoningEffort = "  high  "
+	if err := common.DB.Create(&model.User{ID: 202, Username: "llm-trim"}).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	created, err := svc.Create(202, in)
 	if err != nil {
@@ -147,6 +151,9 @@ func TestTestByInputReusesStoredKey(t *testing.T) {
 	in := validLLMConfigInput()
 	in.APIKey = "sk-stored-secret"
 	in.BaseURL = srv.URL
+	if err := common.DB.Create(&model.User{ID: 303, Username: "llm-probe"}).Error; err != nil {
+		t.Fatal(err)
+	}
 	created, err := svc.Create(303, in)
 	if err != nil {
 		t.Fatalf("创建配置失败: %v", err)
@@ -185,7 +192,7 @@ func TestTestByInputReusesStoredKey(t *testing.T) {
 }
 
 // TestFetchModelsTruncatesAtLimit 超过 llmModelsFetchLimit 时截断并如实上报 truncated
-//（前端文案「已截断至前 500 个」依赖这个口径）。排序/密钥三态/空列表/HTML 归因见
+// （前端文案「已截断至前 500 个」依赖这个口径）。排序/密钥三态/空列表/HTML 归因见
 // llm_reasoning_effort_test.go 的 TestFetchModels，此处只补它未覆盖的截断边界。
 func TestFetchModelsTruncatesAtLimit(t *testing.T) {
 	total := llmModelsFetchLimit + 20

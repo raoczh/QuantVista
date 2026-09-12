@@ -32,6 +32,7 @@ import { getLLMTask, listLLMTasks, type LLMTask } from '@/api/llmTask'
 import type { EvidenceCheck, RiskFlag } from '@/api/trust'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { getApiErrorCode } from '@/api/client'
+import { getSessionEpoch } from '@/api/token'
 import { useUi } from '@/composables/useUi'
 import { useLlmLabel } from '@/composables/useLlmLabel'
 import { useDisplayMode } from '@/composables/useDisplayMode'
@@ -59,6 +60,11 @@ const symbol = ref('')
 const market = ref('cn')
 const selectedStock = ref<StockRef | null>(null)
 function updateSelectedStock(stock: StockRef | null) {
+  if (!pageActive()) return
+  invalidateView()
+  assignSelectedStock(stock)
+}
+function assignSelectedStock(stock: StockRef | null) {
   selectedStock.value = stock
   symbol.value = stock?.symbol || ''
   if (stock) market.value = stock.market
@@ -76,7 +82,33 @@ const fromAnalysisName = ref('')
 // ---------- 后台任务 ----------
 const pendingQuestion = ref('')
 let pollAbort: AbortController | null = null
-onBeforeUnmount(() => pollAbort?.abort())
+const pageSession = getSessionEpoch()
+let disposed = false
+let viewEpoch = 0
+let historyEpoch = 0
+let snapshotEpoch = 0
+const openingConvID = ref<number | null>(null)
+const pageActive = () => !disposed && getSessionEpoch() === pageSession
+const currentView = (epoch: number) => pageActive() && epoch === viewEpoch
+function invalidateView() {
+  viewEpoch++
+  snapshotEpoch++
+  pollAbort?.abort()
+  pollAbort = null
+  asking.value = false
+  activeTaskId.value = null
+  pendingQuestion.value = ''
+  openingConvID.value = null
+  taskError.value = ''
+  taskErrorCode.value = ''
+  snapshotShow.value = false
+  snapshotText.value = ''
+  return viewEpoch
+}
+onBeforeUnmount(() => {
+  disposed = true
+  invalidateView()
+})
 
 // ---------- LLM ----------
 const llmConfigs = ref<LLMConfig[]>([])
@@ -86,11 +118,13 @@ const llmOptions = computed(() =>
 )
 async function loadLLM() {
   try {
-    llmConfigs.value = await listLLMConfigs()
+    const configs = await listLLMConfigs()
+    if (!pageActive()) return
+    llmConfigs.value = configs
     const def = llmConfigs.value.find((c) => c.is_default) || llmConfigs.value[0]
-    if (def) llmId.value = def.id
+    if (def && llmId.value === undefined) llmId.value = def.id
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   }
 }
 
@@ -103,10 +137,10 @@ async function scrollToBottom() {
 // 不得被误当成「已确认历史解释模式」。
 async function send(allowStale?: boolean | Event) {
   const staleOk = allowStale === true
-  if (asking.value) return // 回车/连击防抖：后台任务执行中不重复提交
+  if (!pageActive() || asking.value || openingConvID.value !== null) return
   const q = question.value.trim()
   if (!q) return
-  if (!current.value && !symbol.value.trim()) {
+  if (!current.value && !fromAnalysisId.value && !symbol.value.trim()) {
     message.warning('请先搜索并选择要提问的股票')
     return
   }
@@ -124,7 +158,8 @@ async function send(allowStale?: boolean | Event) {
   await submitQaTask(payload, startConvId)
 }
 
-function showTaskFailure(messageText: string, code = '', payload?: QaAskRequest, startConvId?: number) {
+function showTaskFailure(messageText: string, code = '', payload?: QaAskRequest, startConvId?: number, epoch = viewEpoch) {
+  if (!currentView(epoch)) return
   const msg = messageText || '问答任务失败'
   taskError.value = msg
   taskErrorCode.value = code
@@ -136,7 +171,8 @@ function showTaskFailure(messageText: string, code = '', payload?: QaAskRequest,
       positiveText: '按历史数据解释提问',
       negativeText: '取消',
       onPositiveClick: () => {
-        void submitQaTask({ ...payload, allow_stale: true }, startConvId)
+        if (!currentView(epoch) || question.value.trim() !== payload.question.trim()) return
+        void submitQaTask({ ...payload, allow_stale: true }, startConvId, epoch)
       },
     })
     return
@@ -149,13 +185,16 @@ async function trackQaTask(
   payload?: QaAskRequest,
   startConvId?: number,
   forceOpenResult = false,
-  expectedRouteEpoch?: number,
+  epoch = viewEpoch,
 ) {
+  if (!currentView(epoch)) return
   pollAbort?.abort()
   const controller = new AbortController()
   pollAbort = controller
   activeTaskId.value = initial.id
   asking.value = true
+  const valid = () => currentView(epoch) && pollAbort === controller && !controller.signal.aborted &&
+    (!forceOpenResult || routeTaskID() === initial.id)
   try {
     const task =
       initial.status === 'processing'
@@ -165,22 +204,14 @@ async function trackQaTask(
             { signal: controller.signal, timeoutMs: 11 * 60 * 1000 },
           )
         : initial
-    if (
-      forceOpenResult &&
-      (routeTaskID() !== initial.id || (expectedRouteEpoch !== undefined && routeTaskEpoch !== expectedRouteEpoch))
-    )
-      return
+    if (!valid()) return
     if (task.status === 'failed') {
-      showTaskFailure(task.error || '问答任务失败', task.error_code || '', payload, startConvId)
+      showTaskFailure(task.error || '问答任务失败', task.error_code || '', payload, startConvId, epoch)
       return
     }
     if (!task.result?.conversation_id) throw new Error('问答任务已完成，但未返回会话编号')
     const view = await getConversation(task.result.conversation_id)
-    if (
-      forceOpenResult &&
-      (routeTaskID() !== initial.id || (expectedRouteEpoch !== undefined && routeTaskEpoch !== expectedRouteEpoch))
-    )
-      return
+    if (!valid()) return
 
     // 任务期间若用户切换了会话，只刷新历史，不用旧任务结果覆盖当前界面。
     if (forceOpenResult || current.value?.id === startConvId) {
@@ -190,19 +221,15 @@ async function trackQaTask(
       fromAnalysisName.value = ''
       await scrollToBottom()
     }
+    if (!valid()) return
     taskError.value = ''
     taskErrorCode.value = ''
     message.success(forceOpenResult ? '已打开任务结果' : '回答已生成')
   } catch (e) {
-    if (isPollCancelled(e)) return
-    if (
-      forceOpenResult &&
-      (routeTaskID() !== initial.id || (expectedRouteEpoch !== undefined && routeTaskEpoch !== expectedRouteEpoch))
-    )
-      return
-    showTaskFailure((e as Error).message || '问答任务状态读取失败', getApiErrorCode(e) || '', payload, startConvId)
+    if (isPollCancelled(e) || !valid()) return
+    showTaskFailure((e as Error).message || '问答任务状态读取失败', getApiErrorCode(e) || '', payload, startConvId, epoch)
   } finally {
-    if (pollAbort === controller) {
+    if (currentView(epoch) && pollAbort === controller) {
       pollAbort = null
       activeTaskId.value = null
       asking.value = false
@@ -212,31 +239,39 @@ async function trackQaTask(
   }
 }
 
-async function submitQaTask(payload: QaAskRequest, startConvId?: number) {
-  if (asking.value) return
+async function submitQaTask(payload: QaAskRequest, startConvId?: number, expectedEpoch = viewEpoch) {
+  if (asking.value || !currentView(expectedEpoch)) return
+  const epoch = invalidateView()
   asking.value = true
   pendingQuestion.value = payload.question
   taskError.value = ''
   taskErrorCode.value = ''
   await scrollToBottom()
+  if (!currentView(epoch)) return
   try {
     const task = await askQa(payload)
+    if (!currentView(epoch)) return
     message.info('任务已创建，正在后台生成回答（刷新或关闭页面不影响任务）')
-    await loadHistory()
-    await trackQaTask(task, payload, startConvId)
+    void loadHistory()
+    await trackQaTask(task, payload, startConvId, false, epoch)
   } catch (e) {
-    showTaskFailure((e as Error).message || '问答任务提交失败', getApiErrorCode(e) || '', payload, startConvId)
-    asking.value = false
-    pendingQuestion.value = ''
+    if (currentView(epoch)) {
+      showTaskFailure((e as Error).message || '问答任务提交失败', getApiErrorCode(e) || '', payload, startConvId, epoch)
+      asking.value = false
+      pendingQuestion.value = ''
+    }
   } finally {
-    await loadHistory()
+    if (pageActive()) await loadHistory()
   }
 }
 
 function newChat() {
+  if (!pageActive()) return
   releaseRouteTask()
+  invalidateView()
   current.value = null
-  symbol.value = ''
+  assignSelectedStock(null)
+  market.value = 'cn'
   question.value = ''
   taskError.value = ''
   taskErrorCode.value = ''
@@ -248,11 +283,8 @@ function newChat() {
 function newChatFromCurrent() {
   const c = current.value
   if (!c) return
-  const sym = c.symbol
-  const mkt = c.market || 'cn'
   newChat()
-  symbol.value = sym
-  market.value = mkt
+  assignSelectedStock({ symbol: c.symbol, market: c.market || 'cn', name: c.name })
 }
 
 // ---------- 风险闸门标签（S1）----------
@@ -282,118 +314,132 @@ function riskTagLabel(f: RiskFlag): string {
 // ---------- 历史 ----------
 const history = ref<QaConversation[]>([])
 const historyLoading = ref(false)
+const historyError = ref('')
 async function loadHistory() {
+  if (!pageActive()) return
+  const epoch = ++historyEpoch
   historyLoading.value = true
   try {
-    history.value = await listConversations(30)
+    const rows = await listConversations(30)
+    if (!pageActive() || epoch !== historyEpoch) return
+    history.value = rows
+    historyError.value = ''
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive() && epoch === historyEpoch) historyError.value = (e as Error).message
   } finally {
-    historyLoading.value = false
+    if (pageActive() && epoch === historyEpoch) historyLoading.value = false
   }
 }
 
 async function recoverProcessingTask() {
+  if (!pageActive() || asking.value || routeTaskID()) return
+  const epoch = viewEpoch
   try {
     const tasks = await listLLMTasks<QaTaskResult>({ kind: 'qa', status: 'processing', limit: 1 })
+    if (!currentView(epoch) || asking.value || routeTaskID()) return
     const task = tasks[0]
     if (!task) return
     message.info('已恢复正在后台执行的问答任务')
-    void trackQaTask(task, undefined, current.value?.id)
+    void trackQaTask(task, undefined, current.value?.id, false, epoch)
   } catch (e) {
-    message.error((e as Error).message)
+    if (currentView(epoch)) message.error((e as Error).message)
   }
 }
 
 function routeTaskID(): number | null {
   const raw = Array.isArray(route.query.task_id) ? route.query.task_id[0] : route.query.task_id
   const id = Number(raw)
-  return Number.isInteger(id) && id > 0 ? id : null
+  return Number.isSafeInteger(id) && id > 0 ? id : null
 }
 
 let restoredRouteTaskID: number | null = null
-let restoringRouteTaskID: number | null = null
-let restoringRouteTaskEpoch = -1
 let routeTaskTrackingID: number | null = null
-let routeTaskEpoch = 0
 
 function releaseRouteTask() {
-  if (!routeTaskID()) return
-  routeTaskEpoch++
   restoredRouteTaskID = null
   routeTaskTrackingID = null
-  pollAbort?.abort()
+  if (!routeTaskID()) return
   const query = { ...route.query }
   delete query.task_id
   void router.replace({ name: 'qa', query })
 }
 
 async function restoreRouteTask(): Promise<boolean> {
+  if (!pageActive()) return false
   const id = routeTaskID()
   if (!id) {
     restoredRouteTaskID = null
     if (routeTaskTrackingID !== null) {
-      pollAbort?.abort()
+      invalidateView()
       routeTaskTrackingID = null
     }
     return false
   }
-  if (
-    restoredRouteTaskID === id ||
-    (restoringRouteTaskID === id && restoringRouteTaskEpoch === routeTaskEpoch)
-  )
-    return true
+  if (restoredRouteTaskID === id) return true
 
-  const epoch = routeTaskEpoch
-  restoringRouteTaskID = id
-  restoringRouteTaskEpoch = epoch
-  pollAbort?.abort()
+  const epoch = invalidateView()
+  restoredRouteTaskID = id
+  routeTaskTrackingID = id
+  asking.value = true
   current.value = null
   taskError.value = ''
   taskErrorCode.value = ''
   try {
     const task = await getLLMTask<QaTaskResult>(id)
-    if (routeTaskID() !== id || routeTaskEpoch !== epoch) return true
-    restoredRouteTaskID = id
+    if (!currentView(epoch) || routeTaskID() !== id) return true
     if (task.kind !== 'qa') {
       showTaskFailure('该任务不是个股问答任务，无法在此页面打开')
       return true
     }
-    routeTaskTrackingID = id
     await trackQaTask(task, undefined, undefined, true, epoch)
   } catch (e) {
-    if (routeTaskID() === id && routeTaskEpoch === epoch) {
+    if (currentView(epoch) && routeTaskID() === id) {
       showTaskFailure((e as Error).message || '问答任务状态读取失败', getApiErrorCode(e) || '')
     }
   } finally {
-    if (restoringRouteTaskID === id && restoringRouteTaskEpoch === epoch) {
-      restoringRouteTaskID = null
-      restoringRouteTaskEpoch = -1
+    if (currentView(epoch)) {
+      if (!pollAbort) asking.value = false
+      if (routeTaskTrackingID === id) routeTaskTrackingID = null
     }
-    if (routeTaskTrackingID === id) routeTaskTrackingID = null
   }
   return true
 }
 
 async function openConv(c: QaConversation) {
+  if (!pageActive()) return
   releaseRouteTask()
+  const epoch = invalidateView()
+  openingConvID.value = c.id
   try {
-    current.value = await getConversation(c.id)
+    const view = await getConversation(c.id)
+    if (!currentView(epoch)) return
+    current.value = view
+    question.value = ''
+    fromAnalysisId.value = null
+    fromAnalysisName.value = ''
     taskError.value = ''
     taskErrorCode.value = ''
     await scrollToBottom()
   } catch (e) {
-    message.error((e as Error).message)
+    if (currentView(epoch)) message.error((e as Error).message)
+  } finally {
+    if (currentView(epoch)) openingConvID.value = null
   }
 }
+const deletingConvIDs = ref(new Set<number>())
 async function removeConv(c: QaConversation) {
+  if (!pageActive() || asking.value || deletingConvIDs.value.has(c.id)) return
+  deletingConvIDs.value.add(c.id)
   try {
     await deleteConversation(c.id)
-    if (current.value?.id === c.id) newChat()
+    if (!pageActive()) return
+    if (current.value?.id === c.id || openingConvID.value === c.id) newChat()
     await loadHistory()
-    message.success('已删除')
+    if (pageActive()) message.success('已删除')
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
+  } finally {
+    deletingConvIDs.value.delete(c.id)
   }
 }
 
@@ -451,9 +497,13 @@ function ctxDetail(c: QaContextLayers): string {
 const snapshotShow = ref(false)
 const snapshotText = ref('')
 async function openSnapshot() {
-  if (!current.value) return
+  if (!current.value || !pageActive()) return
+  const epoch = viewEpoch
+  const request = ++snapshotEpoch
+  const id = current.value.id
   try {
-    const res = await getQaSnapshot(current.value.id)
+    const res = await getQaSnapshot(id)
+    if (!currentView(epoch) || request !== snapshotEpoch || current.value?.id !== id) return
     try {
       snapshotText.value = JSON.stringify(JSON.parse(res.data_snapshot), null, 2)
     } catch {
@@ -461,7 +511,7 @@ async function openSnapshot() {
     }
     snapshotShow.value = true
   } catch (e) {
-    message.error((e as Error).message)
+    if (currentView(epoch) && request === snapshotEpoch) message.error((e as Error).message)
   }
 }
 
@@ -469,18 +519,20 @@ async function openSnapshot() {
 // 用 watch 而非仅在 onMounted 读取——已停留在 /qa 时再次深链（query 变化）也能生效。
 function clearStockRouteQuery() {
   const query = { ...route.query }
-  for (const key of ['from_analysis', 'symbol', 'market', 'name', '_stock_action']) delete query[key]
+  for (const key of ['from_analysis', 'symbol', 'market', 'name', '_stock_action', 'task_id']) delete query[key]
   void router.replace({ name: 'qa', query })
 }
 
 function applyStockRouteQuery() {
+  if (!pageActive() || (!route.query.from_analysis && !route.query.symbol)) return false
+  newChat()
   if (route.query.from_analysis) {
     const id = Number(route.query.from_analysis)
-    if (Number.isFinite(id) && id > 0) {
+    if (Number.isSafeInteger(id) && id > 0) {
       fromAnalysisId.value = id
       fromAnalysisName.value = String(route.query.name || '')
     }
-    updateSelectedStock(route.query.symbol ? {
+    assignSelectedStock(route.query.symbol ? {
       symbol: String(route.query.symbol),
       market: String(route.query.market || 'cn'),
       name: String(route.query.name || ''),
@@ -488,26 +540,26 @@ function applyStockRouteQuery() {
     current.value = null // 深链进入新会话上下文
     clearStockRouteQuery()
   } else if (route.query.symbol) {
-    symbol.value = String(route.query.symbol)
-    market.value = String(route.query.market || 'cn')
+    assignSelectedStock({ symbol: String(route.query.symbol), market: String(route.query.market || 'cn'), name: String(route.query.name || '') })
     current.value = null
     clearStockRouteQuery()
   }
+  return true
 }
 
 function applyRouteQuery() {
-  applyStockRouteQuery()
-  void restoreRouteTask()
+  if (!applyStockRouteQuery()) void restoreRouteTask()
 }
 
 watch(() => route.query, applyRouteQuery)
 
 onMounted(async () => {
-  const hasExplicitTask = routeTaskID() !== null
-  applyStockRouteQuery()
+  const hasStock = applyStockRouteQuery()
+  const epoch = viewEpoch
   await Promise.all([loadLLM(), loadHistory()])
-  if (hasExplicitTask) await restoreRouteTask()
-  else await recoverProcessingTask()
+  if (!currentView(epoch)) return
+  if (routeTaskID()) await restoreRouteTask()
+  else if (!hasStock) await recoverProcessingTask()
 })
 </script>
 
@@ -522,7 +574,8 @@ onMounted(async () => {
             <n-button size="tiny" type="primary" ghost @click="newChat">＋ 新会话</n-button>
           </template>
           <n-spin :show="historyLoading && !history.length">
-            <n-empty v-if="!history.length" description="暂无会话" size="small" />
+            <n-alert v-if="historyError" type="error" :bordered="false">{{ historyError }}</n-alert>
+            <n-empty v-else-if="!history.length && !historyLoading" description="暂无会话" size="small" />
             <div v-else class="convs">
               <div
                 v-for="c in history"
@@ -538,7 +591,7 @@ onMounted(async () => {
                 </div>
                 <n-popconfirm :disabled="asking" @positive-click="removeConv(c)">
                   <template #trigger>
-                    <n-button size="tiny" quaternary type="error" :disabled="asking" @click.stop>删</n-button>
+                    <n-button size="tiny" quaternary type="error" :disabled="asking" :loading="deletingConvIDs.has(c.id)" @click.stop>删</n-button>
                   </template>
                   删除该会话？
                 </n-popconfirm>
@@ -554,7 +607,7 @@ onMounted(async () => {
           <template v-if="current" #extra>
             <div class="extra-row">
               <n-button size="tiny" quaternary @click="newChatFromCurrent">按最新数据新建会话</n-button>
-              <n-button size="tiny" quaternary @click="openSnapshot">数据快照</n-button>
+              <n-button size="tiny" quaternary :disabled="openingConvID !== null" @click="openSnapshot">数据快照</n-button>
               <span class="chat-meta">{{ llmLabel(current) || current.model }} · {{ label('AI 用量', 'Token') }} {{ current.total_tokens }}</span>
             </div>
           </template>
@@ -686,10 +739,10 @@ onMounted(async () => {
               :autosize="{ minRows: 1, maxRows: 4 }"
               placeholder="就这只股票提问，如「现在的均线排列如何？回撤风险大吗？」"
               maxlength="500"
-              :disabled="asking"
+              :disabled="asking || openingConvID !== null"
               @keydown.enter.exact.prevent="send"
             />
-            <n-button type="primary" :loading="asking" @click="send">发送</n-button>
+            <n-button type="primary" :loading="asking" :disabled="openingConvID !== null" @click="send">发送</n-button>
           </div>
           <div class="composer-hint">仅依据行情/技术指标与已采集的新闻公告快照回答，不构成投资建议。Enter 发送。</div>
         </SectionCard>

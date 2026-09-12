@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { onUnmounted, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { NForm, NFormItem, NInput, NButton, NAlert, useMessage } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
 import AuthShell from '@/components/AuthShell.vue'
 import { authErrorText } from '@/lib/authError'
 
 const router = useRouter()
+const route = useRoute()
 const message = useMessage()
 const auth = useAuthStore()
 
@@ -14,18 +15,23 @@ const username = ref('')
 const password = ref('')
 const confirm = ref('')
 const loading = ref(false)
+let active = true
+onUnmounted(() => { active = false })
+const isCurrent = () => active && route.name === 'setup'
 
 async function submit() {
+  if (loading.value || !isCurrent()) return
   if (username.value.trim().length < 3) return message.error('用户名至少 3 个字符')
   if (password.value.length < 8) return message.error('密码至少 8 个字符')
   if (password.value !== confirm.value) return message.error('两次输入的密码不一致')
   loading.value = true
   try {
-    await auth.createAdmin(username.value.trim(), password.value)
+    await auth.createAdmin(username.value.trim(), password.value, isCurrent)
+    if (!isCurrent()) return
     message.success('管理员账号已创建，欢迎使用 QuantVista')
     router.replace('/')
   } catch (e) {
-    message.error(authErrorText(e, '初始化失败，请检查输入后重试'))
+    if (isCurrent()) message.error(authErrorText(e, '初始化失败，请检查输入后重试'))
   } finally {
     loading.value = false
   }

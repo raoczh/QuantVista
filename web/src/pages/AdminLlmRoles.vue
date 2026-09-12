@@ -1,27 +1,36 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
-import { NCollapse, NCollapseItem, NSpin, NTag, useMessage } from 'naive-ui'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { NAlert, NButton, NCollapse, NCollapseItem, NSpin, NTag } from 'naive-ui'
 import { getLLMRoles, type LLMRoleAsset } from '@/api/admin'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import { getSessionEpoch } from '@/api/token'
 
-const message = useMessage()
 const roles = ref<LLMRoleAsset[]>([])
 const disciplines = ref<string[]>([])
 const loading = ref(false)
+const loadError = ref('')
+const pageSession = getSessionEpoch()
+let disposed = false
+const pageActive = () => !disposed && getSessionEpoch() === pageSession
+onBeforeUnmount(() => { disposed = true })
 
-onMounted(async () => {
+async function load() {
+  if (!pageActive() || loading.value) return
   loading.value = true
+  loadError.value = ''
   try {
     const res = await getLLMRoles()
+    if (!pageActive()) return
     roles.value = res.roles
     disciplines.value = res.disciplines
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) loadError.value = e instanceof Error ? e.message : '角色表读取失败'
   } finally {
     loading.value = false
   }
-})
+}
+onMounted(() => void load())
 </script>
 
 <template>
@@ -30,6 +39,7 @@ onMounted(async () => {
     subtitle="P1-8 系统内建角色的机读登记（只读声明表，与代码测试锁定一致）：版本锚 / schema / 触发条件 / 输入白名单 / 必答要求 / 禁止动作 / 预算 / 反例坐标"
   >
     <div class="roles-wrap">
+      <n-alert v-if="loadError" type="error" :bordered="false">{{ loadError }} <n-button size="small" text @click="load">重试</n-button></n-alert>
       <SectionCard title="全局纪律（跨角色恒真）">
         <n-spin :show="loading">
           <ul class="roles-disc">
@@ -79,7 +89,7 @@ onMounted(async () => {
               </div>
             </n-collapse-item>
           </n-collapse>
-          <div v-else-if="!loading" class="roles-empty">加载中或无数据。</div>
+          <div v-else-if="!loading && !loadError" class="roles-empty">暂无角色数据。</div>
         </n-spin>
       </SectionCard>
     </div>

@@ -7,6 +7,8 @@ import (
 
 	"quantvista/common"
 	"quantvista/model"
+
+	"gorm.io/gorm"
 )
 
 // C10 股息率（第六十二批）。
@@ -85,12 +87,16 @@ func pickLatestDividendYield(actions []model.CorporateAction, now time.Time) *Di
 // 数据库读取失败必须显式返回 error：因子快照是首写胜且同日不可覆盖，若把读取失败
 // 降级为空 map，会把当天全市场的 div_yield 永久冻结为缺失。
 func DividendYieldsFor(symbols []string, now time.Time) (map[string]float64, error) {
+	return dividendYieldsForDB(common.DB, symbols, now)
+}
+
+func dividendYieldsForDB(db *gorm.DB, symbols []string, now time.Time) (map[string]float64, error) {
 	out := map[string]float64{}
-	if common.DB == nil {
+	if db == nil {
 		return nil, errors.New("数据库不可用")
 	}
 	cutoff := now.AddDate(0, 0, -dividendYieldMaxAgeDays).Format("2006-01-02")
-	q := common.DB.Model(&model.CorporateAction{}).
+	q := db.Model(&model.CorporateAction{}).
 		Select("symbol", "report_date", "ex_date", "dividend_yield").
 		Where("market = ? AND dividend_yield > ? AND report_date >= ?", "cn", 0, cutoff)
 	if len(symbols) > 0 {

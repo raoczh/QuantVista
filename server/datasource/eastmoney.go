@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -43,16 +44,19 @@ func emNum(raw json.RawMessage) (float64, bool) {
 	if len(raw) == 0 {
 		return 0, false
 	}
-	var f float64
+	var f *float64
 	if err := json.Unmarshal(raw, &f); err == nil {
-		return f, true
+		if f == nil {
+			return 0, false
+		}
+		return *f, true
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
 		if s == "" || s == "-" {
 			return 0, false
 		}
-		if v, err := strconv.ParseFloat(s, 64); err == nil {
+		if v, err := strconv.ParseFloat(s, 64); err == nil && !math.IsNaN(v) && !math.IsInf(v, 0) {
 			return v, true
 		}
 	}
@@ -90,7 +94,7 @@ func (e *EastMoneyAdapter) GetQuote(ctx context.Context, market, symbol string) 
 
 	d := parsed.Data
 	price, ok := emNum(d["f43"])
-	if !ok {
+	if !ok || price <= 0 {
 		return nil, ErrNoData // 现价拿不到视为无有效行情（停牌/非交易标的）
 	}
 	name := ""

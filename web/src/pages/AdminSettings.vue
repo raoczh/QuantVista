@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import {
   NSpace,
   NForm,
@@ -43,6 +43,7 @@ import {
   deleteLLMRoute,
   resetLLMRoute,
   type SystemSettings,
+  type SystemSettingsUpdate,
   type SyncLog,
   type DataSourceCapability,
   type DataHealthReport,
@@ -56,6 +57,7 @@ import {
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import type { AuthUser } from '@/api/auth'
 import { useAuthStore } from '@/stores/auth'
+import { getSessionEpoch } from '@/api/token'
 import { useIsMobile } from '@/composables/useIsMobile'
 import { useUi, withAlpha } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
@@ -66,8 +68,14 @@ const message = useMessage()
 const { isMobile } = useIsMobile()
 const { vars } = useUi()
 const auth = useAuthStore()
+const pageSession = getSessionEpoch()
+let disposed = false
+const pageActive = () => !disposed && getSessionEpoch() === pageSession
+onBeforeUnmount(() => { disposed = true })
 
 const settings = ref<SystemSettings | null>(null)
+const settingsLoading = ref(false)
+const settingsError = ref('')
 const savingReg = ref(false)
 const savingGithub = ref(false)
 
@@ -75,8 +83,13 @@ const savingGithub = ref(false)
 const gh = reactive({ client_id: '', client_secret: '', enabled: false })
 
 async function load() {
+  if (!pageActive() || settingsLoading.value) return
+  settingsLoading.value = true
   try {
-    settings.value = await getSystemSettings()
+    const value = await getSystemSettings()
+    if (!pageActive()) return
+    settings.value = value
+    settingsError.value = ''
     gh.client_id = settings.value.github_client_id
     gh.enabled = settings.value.github_oauth_enabled
     gh.client_secret = ''
@@ -95,7 +108,38 @@ async function load() {
     modelRoutingEnabled.value = settings.value.llm_model_routing
     siteBaseURL.value = settings.value.site_base_url
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) settingsError.value = (e as Error).message
+  } finally {
+    settingsLoading.value = false
+  }
+}
+
+async function persistSystemSettings(patch: SystemSettingsUpdate) {
+  const updated = await updateSystemSettings(patch)
+  if (!pageActive() || !settings.value) return
+  // 接口返回整份设置，但本请求只能更新自己提交的字段，避免较早响应回退其他开关。
+  const changed: Partial<SystemSettings> = {}
+  for (const key of Object.keys(patch)) {
+    if (key === 'github_client_secret') changed.has_github_secret = updated.has_github_secret
+    else if (Object.prototype.hasOwnProperty.call(updated, key)) Object.assign(changed, { [key]: updated[key as keyof SystemSettings] })
+  }
+  settings.value = { ...settings.value, ...changed }
+  return updated
+}
+
+type BooleanSetting = { [K in keyof SystemSettings]: SystemSettings[K] extends boolean ? K : never }[keyof SystemSettings]
+async function saveBooleanSetting(key: BooleanSetting, value: boolean, pending: { value: boolean }, enabled: { value: boolean }, notice: string) {
+  if (!pageActive() || !settings.value || pending.value) return
+  pending.value = true
+  try {
+    const updated = await persistSystemSettings({ [key]: value })
+    if (!updated) return
+    enabled.value = updated[key]
+    message.success(notice)
+  } catch (e) {
+    if (pageActive()) message.error((e as Error).message)
+  } finally {
+    pending.value = false
   }
 }
 
@@ -103,13 +147,16 @@ async function load() {
 const savingSite = ref(false)
 const siteBaseURL = ref('')
 async function saveSite() {
+  if (!pageActive() || !settings.value || savingSite.value) return
+  const submitted = siteBaseURL.value
   savingSite.value = true
   try {
-    settings.value = await updateSystemSettings({ site_base_url: siteBaseURL.value.trim() })
-    siteBaseURL.value = settings.value.site_base_url
+    const updated = await persistSystemSettings({ site_base_url: submitted.trim() })
+    if (!updated) return
+    if (siteBaseURL.value === submitted) siteBaseURL.value = updated.site_base_url
     message.success('站点地址已保存')
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   } finally {
     savingSite.value = false
   }
@@ -131,24 +178,29 @@ const fbOptions = computed(() => {
   return opts
 })
 async function loadMyConfigs() {
+  if (!pageActive()) return
   try {
-    myConfigs.value = await listLLMConfigs()
+    const configs = await listLLMConfigs()
+    if (pageActive()) myConfigs.value = configs
   } catch {
     /* 列表拉不到时仍可保存"自动" */
   }
 }
 async function saveFallback() {
+  if (!pageActive() || !settings.value || savingFb.value) return
+  const submitted = { ...fb }
   savingFb.value = true
   try {
-    settings.value = await updateSystemSettings({
-      llm_fallback_enabled: fb.enabled,
-      llm_fallback_config_id: fb.config_id || 0,
+    const updated = await persistSystemSettings({
+      llm_fallback_enabled: submitted.enabled,
+      llm_fallback_config_id: submitted.config_id || 0,
     })
-    fb.enabled = settings.value.llm_fallback_enabled
-    fb.config_id = settings.value.llm_fallback_config_id
+    if (!updated) return
+    if (fb.enabled === submitted.enabled) fb.enabled = updated.llm_fallback_enabled
+    if (fb.config_id === submitted.config_id) fb.config_id = updated.llm_fallback_config_id
     message.success('LLM 回退设置已保存')
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   } finally {
     savingFb.value = false
   }
@@ -158,158 +210,72 @@ async function saveFallback() {
 const savingAc = ref(false)
 const acEnabled = ref(true)
 async function toggleAccuracy(v: boolean) {
-  savingAc.value = true
-  try {
-    settings.value = await updateSystemSettings({ llm_accuracy_contract: v })
-    acEnabled.value = settings.value.llm_accuracy_contract
-    message.success('已保存，下一次 AI 调用生效')
-  } catch (e) {
-    message.error((e as Error).message)
-    await load()
-  } finally {
-    savingAc.value = false
-  }
+  await saveBooleanSetting('llm_accuracy_contract', v, savingAc, acEnabled, '已保存，下一次 AI 调用生效')
 }
 
 /* P0-3 字段路径证据链（ev4）：快照结构化数据缺口注入 + 证据链 evidence_id/source 标注 */
 const savingEv = ref(false)
 const evRefsEnabled = ref(true)
 async function toggleEvidenceRefs(v: boolean) {
-  savingEv.value = true
-  try {
-    settings.value = await updateSystemSettings({ llm_evidence_refs: v })
-    evRefsEnabled.value = settings.value.llm_evidence_refs
-    message.success('已保存，下一次 AI 调用生效')
-  } catch (e) {
-    message.error((e as Error).message)
-    await load()
-  } finally {
-    savingEv.value = false
-  }
+  await saveBooleanSetting('llm_evidence_refs', v, savingEv, evRefsEnabled, '已保存，下一次 AI 调用生效')
 }
 
 /* P0-4 跨模块语义校验：rating/action/计划价/风险闸门跨字段一致性（仅新增规则的回滚开关） */
 const savingSv = ref(false)
 const semanticEnabled = ref(true)
 async function toggleSemanticValidator(v: boolean) {
-  savingSv.value = true
-  try {
-    settings.value = await updateSystemSettings({ llm_semantic_validator: v })
-    semanticEnabled.value = settings.value.llm_semantic_validator
-    message.success('已保存，下一次 AI 调用生效')
-  } catch (e) {
-    message.error((e as Error).message)
-    await load()
-  } finally {
-    savingSv.value = false
-  }
+  await saveBooleanSetting('llm_semantic_validator', v, savingSv, semanticEnabled, '已保存，下一次 AI 调用生效')
 }
 
 /* P0-5 能力矩阵声明化路由：已声明/观察到不支持 json_object 的模型直接按纯文本请求 */
 const savingCapRoute = ref(false)
 const capRoutingEnabled = ref(true)
 async function toggleCapabilityRouting(v: boolean) {
-  savingCapRoute.value = true
-  try {
-    settings.value = await updateSystemSettings({ llm_capability_routing: v })
-    capRoutingEnabled.value = settings.value.llm_capability_routing
-    message.success('已保存，下一次 AI 调用生效')
-  } catch (e) {
-    message.error((e as Error).message)
-    await load()
-  } finally {
-    savingCapRoute.value = false
-  }
+  await saveBooleanSetting('llm_capability_routing', v, savingCapRoute, capRoutingEnabled, '已保存，下一次 AI 调用生效')
 }
 
 /* P1-3 条件式辩论：低置信/证据冲突/风险临界的个股分析追加 bull/bear/judge 独立复核 */
 const savingDebate = ref(false)
 const debateEnabled = ref(true)
 async function toggleDebate(v: boolean) {
-  savingDebate.value = true
-  try {
-    settings.value = await updateSystemSettings({ llm_conditional_debate: v })
-    debateEnabled.value = settings.value.llm_conditional_debate
-    message.success('已保存，下一次 AI 调用生效')
-  } catch (e) {
-    message.error((e as Error).message)
-    await load()
-  } finally {
-    savingDebate.value = false
-  }
+  await saveBooleanSetting('llm_conditional_debate', v, savingDebate, debateEnabled, '已保存，下一次 AI 调用生效')
 }
 
 /* P1-5 反思记忆影子层：成熟推荐教训生成 + 推荐生成时影子检索（不注入不改写） */
 const savingReflection = ref(false)
 const reflectionEnabled = ref(true)
 async function toggleReflection(v: boolean) {
-  savingReflection.value = true
-  try {
-    settings.value = await updateSystemSettings({ llm_reflection_shadow: v })
-    reflectionEnabled.value = settings.value.llm_reflection_shadow
-    message.success('已保存，下一轮任务生效')
-  } catch (e) {
-    message.error((e as Error).message)
-    await load()
-  } finally {
-    savingReflection.value = false
-  }
+  await saveBooleanSetting('llm_reflection_shadow', v, savingReflection, reflectionEnabled, '已保存，下一轮任务生效')
 }
 
 /* P2-1/S3-6C 统一影子实验：prompt 与 score-blind 互斥，每批最多一次额外调用（缺省关）。 */
 const savingChallenger = ref(false)
 const challengerEnabled = ref(false)
 async function toggleChallenger(v: boolean) {
-  savingChallenger.value = true
-  try {
-    settings.value = await updateSystemSettings({ llm_challenger: v })
-    challengerEnabled.value = settings.value.llm_challenger
-    message.success('已保存，下一次推荐生成生效')
-  } catch (e) {
-    message.error((e as Error).message)
-    await load()
-  } finally {
-    savingChallenger.value = false
-  }
+  await saveBooleanSetting('llm_challenger', v, savingChallenger, challengerEnabled, '已保存，下一次推荐生成生效')
 }
 
 /* P2-3 多层上下文：QA 被裁剪历史的分层注入 + 反思影子检索分层（纯程序化零额外调用） */
 const savingLayeredCtx = ref(false)
 const layeredCtxEnabled = ref(true)
 async function toggleLayeredContext(v: boolean) {
-  savingLayeredCtx.value = true
-  try {
-    settings.value = await updateSystemSettings({ llm_layered_context: v })
-    layeredCtxEnabled.value = settings.value.llm_layered_context
-    message.success('已保存，下一次 AI 调用生效')
-  } catch (e) {
-    message.error((e as Error).message)
-    await load()
-  } finally {
-    savingLayeredCtx.value = false
-  }
+  await saveBooleanSetting('llm_layered_context', v, savingLayeredCtx, layeredCtxEnabled, '已保存，下一次 AI 调用生效')
 }
 
 /* P2-4 模型路由：按模块把 AI 调用改走指定配置（缺省关；自动回退须显式恢复） */
 const savingModelRouting = ref(false)
 const modelRoutingEnabled = ref(false)
 async function toggleModelRouting(v: boolean) {
-  savingModelRouting.value = true
-  try {
-    settings.value = await updateSystemSettings({ llm_model_routing: v })
-    modelRoutingEnabled.value = settings.value.llm_model_routing
-    message.success('已保存，下一次 AI 调用生效')
-  } catch (e) {
-    message.error((e as Error).message)
-    await load()
-  } finally {
-    savingModelRouting.value = false
-  }
+  await saveBooleanSetting('llm_model_routing', v, savingModelRouting, modelRoutingEnabled, '已保存，下一次 AI 调用生效')
 }
 
 const routes = ref<LLMRouteView[]>([])
 const routeModules = ref<LLMRouteModuleOption[]>([])
 const routeSaving = ref(false)
+const routeActionID = ref<number | null>(null)
+const routesBusy = computed(() => routeSaving.value || routeActionID.value !== null)
+const routesError = ref('')
+let routeReadEpoch = 0
 // module/config_id 用 null 而非 ''/0 表示「未选择」：n-select 默认 fallbackOption 会把
 // 非 null 的值兜成 String(value) 当作已选项（'' → 空白、0 → 字面「0」），placeholder 反而不显示。
 const routeForm = reactive({ module: null as string | null, config_id: null as number | null, enabled: true, note: '', max_cost_ratio: 0 })
@@ -320,20 +286,30 @@ const routeConfigOptions = computed(() =>
   myConfigs.value.map((c) => ({ label: `${c.name}（${c.model}）`, value: c.id })),
 )
 async function loadRoutes() {
+  if (!pageActive()) return
+  const epoch = ++routeReadEpoch
   try {
     const res = await listLLMRoutes()
+    if (!pageActive() || epoch !== routeReadEpoch) return
     routes.value = res.routes
     routeModules.value = res.modules
+    routesError.value = ''
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive() && epoch === routeReadEpoch) routesError.value = (e as Error).message
   }
 }
+function clearRouteForm() {
+  Object.assign(routeForm, { module: null, config_id: null, note: '', max_cost_ratio: 0, enabled: true })
+}
 async function saveRoute() {
+  if (!pageActive() || routesBusy.value) return
   if (!routeForm.module || !routeForm.config_id) {
     message.warning('请选择模块与目标配置')
     return
   }
   routeSaving.value = true
+  routeReadEpoch++
+  const draft = JSON.stringify(routeForm)
   try {
     await upsertLLMRoute({
       module: routeForm.module,
@@ -342,20 +318,18 @@ async function saveRoute() {
       note: routeForm.note,
       max_cost_ratio: routeForm.max_cost_ratio || 0,
     })
+    if (!pageActive()) return
     message.success('路由已保存（自动回退状态已清除）')
-    routeForm.module = null
-    routeForm.config_id = null
-    routeForm.note = ''
-    routeForm.max_cost_ratio = 0
-    routeForm.enabled = true
+    if (JSON.stringify(routeForm) === draft) clearRouteForm()
     await loadRoutes()
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   } finally {
     routeSaving.value = false
   }
 }
 function editRoute(r: LLMRouteView) {
+  if (!pageActive() || routesBusy.value) return
   routeForm.module = r.module
   routeForm.config_id = r.config_id
   routeForm.enabled = r.enabled
@@ -363,30 +337,43 @@ function editRoute(r: LLMRouteView) {
   routeForm.max_cost_ratio = r.max_cost_ratio || 0
 }
 async function removeRoute(r: LLMRouteView) {
+  if (!pageActive() || routesBusy.value) return
+  routeActionID.value = r.id
+  routeReadEpoch++
   try {
     await deleteLLMRoute(r.id)
+    if (!pageActive()) return
+    if (routeForm.module === r.module) clearRouteForm()
     message.success('路由已删除，恢复默认配置链路')
     await loadRoutes()
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
+  } finally {
+    routeActionID.value = null
   }
 }
 async function recoverRoute(r: LLMRouteView) {
+  if (!pageActive() || routesBusy.value) return
+  routeActionID.value = r.id
+  routeReadEpoch++
   try {
     await resetLLMRoute(r.id)
+    if (!pageActive()) return
     message.success('已恢复该路由（自动回退状态清除）')
     await loadRoutes()
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
+  } finally {
+    routeActionID.value = null
   }
 }
 function routeHealthText(r: LLMRouteView): string {
   const h = r.health
   const parts: string[] = []
   if (h.routed.total > 0) {
-    parts.push(`近24h ${h.routed.total} 次（失败 ${h.routed.errors}）`)
+    parts.push(`本次启用后近24h ${h.routed.total} 次（失败 ${h.routed.errors}）`)
   } else {
-    parts.push('近24h 无调用')
+    parts.push('本次启用后近24h 无调用')
   }
   if (h.cost_ratio > 0) parts.push(`成本比 ${h.cost_ratio}`)
   if (h.calib_brier != null && h.calib_best_peer != null)
@@ -398,49 +385,57 @@ function routeHealthText(r: LLMRouteView): string {
 const savingNews = ref(false)
 const news = reactive({ interval: 5, auto_llm: true })
 async function saveNews() {
+  if (!pageActive() || !settings.value || savingNews.value) return
+  const submitted = { ...news }
   savingNews.value = true
   try {
-    settings.value = await updateSystemSettings({
-      news_collect_interval_min: news.interval || 5,
-      news_auto_llm: news.auto_llm,
+    const updated = await persistSystemSettings({
+      news_collect_interval_min: submitted.interval || 5,
+      news_auto_llm: submitted.auto_llm,
     })
-    news.interval = settings.value.news_collect_interval_min
-    news.auto_llm = settings.value.news_auto_llm
+    if (!updated) return
+    if (news.interval === submitted.interval) news.interval = updated.news_collect_interval_min
+    if (news.auto_llm === submitted.auto_llm) news.auto_llm = updated.news_auto_llm
     message.success('新闻采集设置已保存，间隔在下一轮采集生效')
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   } finally {
     savingNews.value = false
   }
 }
 
 async function toggleRegistration(v: boolean) {
+  if (!pageActive() || !settings.value || savingReg.value) return
   savingReg.value = true
   try {
-    settings.value = await updateSystemSettings({ registration_open: v })
+    if (!await persistSystemSettings({ registration_open: v })) return
     await auth.fetchSetupStatus()
-    message.success('已保存')
+    if (pageActive()) message.success('已保存')
   } catch (e) {
-    message.error((e as Error).message)
-    await load()
+    if (pageActive()) message.error((e as Error).message)
   } finally {
     savingReg.value = false
   }
 }
 
 async function saveGithub() {
+  if (!pageActive() || !settings.value || savingGithub.value) return
+  const submitted = { ...gh }
   savingGithub.value = true
   try {
-    settings.value = await updateSystemSettings({
-      github_client_id: gh.client_id,
-      github_client_secret: gh.client_secret || undefined,
-      github_oauth_enabled: gh.enabled,
+    const updated = await persistSystemSettings({
+      github_client_id: submitted.client_id,
+      github_client_secret: submitted.client_secret || undefined,
+      github_oauth_enabled: submitted.enabled,
     })
-    gh.client_secret = ''
+    if (!updated) return
+    if (gh.client_secret === submitted.client_secret) gh.client_secret = ''
+    if (gh.client_id === submitted.client_id) gh.client_id = updated.github_client_id
+    if (gh.enabled === submitted.enabled) gh.enabled = updated.github_oauth_enabled
     await auth.fetchSetupStatus()
-    message.success('GitHub 设置已保存')
+    if (pageActive()) message.success('GitHub 设置已保存')
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   } finally {
     savingGithub.value = false
   }
@@ -448,21 +443,32 @@ async function saveGithub() {
 
 /* 用户管理 */
 const users = ref<AuthUser[]>([])
+const reads = { users: 0, logs: 0, health: 0, capabilities: 0 }
+const userStatusSaving = ref(new Set<number>())
 async function loadUsers() {
+  if (!pageActive()) return
+  const sequence = ++reads.users
   try {
-    users.value = await listUsers()
+    const rows = await listUsers()
+    if (pageActive() && sequence === reads.users) users.value = rows
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive() && sequence === reads.users) message.error((e as Error).message)
   }
 }
 async function toggleStatus(u: AuthUser) {
+  if (!pageActive() || userStatusSaving.value.has(u.id)) return
+  userStatusSaving.value.add(u.id)
+  reads.users++
   const next = u.status === 'enabled' ? 'disabled' : 'enabled'
   try {
     await setUserStatus(u.id, next)
+    if (!pageActive()) return
     message.success(next === 'disabled' ? '已禁用（并强制登出）' : '已启用')
     await loadUsers()
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
+  } finally {
+    userStatusSaving.value.delete(u.id)
   }
 }
 
@@ -474,32 +480,40 @@ const quotaUser = ref<AuthUser | null>(null)
 const quotaLoading = ref(false)
 const quotaSaving = ref(false)
 const quotaForm = reactive({ action_limit: 0, action_used: 0, token_used: 0, request_count: 0, reset_used: false })
+let quotaSequence = 0
 async function openQuota(u: AuthUser) {
+  if (!pageActive() || quotaSaving.value) return
+  const sequence = ++quotaSequence
   quotaUser.value = u
-  quotaForm.reset_used = false
+  Object.assign(quotaForm, { action_limit: 0, action_used: 0, token_used: 0, request_count: 0, reset_used: false })
   quotaModal.value = true
   quotaLoading.value = true
   try {
     const q = await getUserQuota(u.id)
+    if (!pageActive() || sequence !== quotaSequence || !quotaModal.value || quotaUser.value?.id !== u.id) return
     quotaForm.action_limit = q.action_limit
     quotaForm.action_used = q.action_used
     quotaForm.token_used = q.token_used
     quotaForm.request_count = q.request_count
   } catch (e) {
+    if (!pageActive() || sequence !== quotaSequence || !quotaModal.value) return
     message.error((e as Error).message)
     quotaModal.value = false
   } finally {
-    quotaLoading.value = false
+    if (sequence === quotaSequence) quotaLoading.value = false
   }
 }
 async function saveQuota() {
-  if (!quotaUser.value) return
+  if (!pageActive() || !quotaUser.value || quotaLoading.value || quotaSaving.value || !quotaModal.value) return
+  const sequence = quotaSequence
+  const userID = quotaUser.value.id
   quotaSaving.value = true
   try {
-    const q = await updateUserQuota(quotaUser.value.id, {
+    const q = await updateUserQuota(userID, {
       action_limit: quotaForm.action_limit || 0,
       reset_used: quotaForm.reset_used,
     })
+    if (!pageActive() || sequence !== quotaSequence || quotaUser.value?.id !== userID) return
     quotaForm.action_used = q.action_used
     quotaForm.token_used = q.token_used
     quotaForm.request_count = q.request_count
@@ -507,9 +521,9 @@ async function saveQuota() {
     message.success('配额已更新')
     quotaModal.value = false
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   } finally {
-    quotaSaving.value = false
+    if (sequence === quotaSequence) quotaSaving.value = false
   }
 }
 
@@ -517,13 +531,16 @@ async function saveQuota() {
 const logs = ref<SyncLog[]>([])
 const logsLoading = ref(false)
 async function loadLogs() {
+  if (!pageActive()) return
+  const sequence = ++reads.logs
   logsLoading.value = true
   try {
-    logs.value = await listSyncLogs(50)
+    const rows = await listSyncLogs(50)
+    if (pageActive() && sequence === reads.logs) logs.value = rows
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive() && sequence === reads.logs) message.error((e as Error).message)
   } finally {
-    logsLoading.value = false
+    if (sequence === reads.logs) logsLoading.value = false
   }
 }
 function logStatusType(s: string) {
@@ -548,15 +565,19 @@ const health = ref<DataHealthReport | null>(null)
 const healthLoading = ref(false)
 const healthWindowDays = ref(45)
 async function loadHealth() {
+  if (!pageActive()) return
+  const sequence = ++reads.health
   healthLoading.value = true
   try {
-    health.value = await getDataHealth(healthWindowDays.value)
+    const result = await getDataHealth(healthWindowDays.value)
+    if (!pageActive() || sequence !== reads.health) return
+    health.value = result
     if (!maintenanceRange.from && health.value.window_start) maintenanceRange.from = health.value.window_start
     if (!maintenanceRange.to && health.value.window_end) maintenanceRange.to = health.value.window_end
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive() && sequence === reads.health) message.error((e as Error).message)
   } finally {
-    healthLoading.value = false
+    if (sequence === reads.health) healthLoading.value = false
   }
 }
 const healthStatusMeta: Record<string, { label: string; type: 'success' | 'error' | 'warning' | 'default' }> = {
@@ -614,13 +635,16 @@ const uncoolTarget = ref<DataSourceCapability | null>(null)
 const uncoolReason = ref('')
 const uncoolSubmitting = ref(false)
 async function loadCapabilities() {
+  if (!pageActive()) return
+  const sequence = ++reads.capabilities
   capabilityLoading.value = true
   try {
-    capabilities.value = (await getDataSources()).health
+    const result = await getDataSources()
+    if (pageActive() && sequence === reads.capabilities) capabilities.value = result.health
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive() && sequence === reads.capabilities) message.error((e as Error).message)
   } finally {
-    capabilityLoading.value = false
+    if (sequence === reads.capabilities) capabilityLoading.value = false
   }
 }
 const capabilityProviderOptions = computed(() =>
@@ -661,15 +685,16 @@ async function refreshCapabilityOps() {
 
 async function probeCapability(cap: DataSourceCapability) {
   const key = capabilityKey(cap)
-  if (capabilityActionKey.value || !cap.registered || !cap.supported) return
+  if (!pageActive() || capabilityActionKey.value || !cap.registered || !cap.supported) return
   capabilityActionKey.value = key
   try {
     const op = await probeDataSource(capabilityTuple(cap))
+    if (!pageActive()) return
     if (op.result.outcome === 'success') message.success(`已探测 ${cap.source} · ${cap.capability}`)
     else if (op.result.outcome === 'empty') message.warning(`探测完成：${cap.source} · ${cap.capability} 返回空响应`)
     else message.error(`探测失败：${op.result.code}`)
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   } finally {
     // 上游 error 同样会形成健康观测和审计；无论结局都局部刷新矩阵与日志。
     await refreshCapabilityOps()
@@ -678,13 +703,14 @@ async function probeCapability(cap: DataSourceCapability) {
 }
 
 function openUncool(cap: DataSourceCapability) {
-  if (capabilityActionKey.value || cap.cooldown_left_sec <= 0) return
+  if (!pageActive() || capabilityActionKey.value || cap.cooldown_left_sec <= 0) return
   uncoolTarget.value = cap
   uncoolReason.value = ''
   uncoolOpen.value = true
 }
 
 async function submitUncool() {
+  if (!pageActive() || !uncoolOpen.value) return
   const cap = uncoolTarget.value
   const reason = uncoolReason.value.trim()
   if (!cap || uncoolSubmitting.value || !reason) {
@@ -695,10 +721,11 @@ async function submitUncool() {
   capabilityActionKey.value = capabilityKey(cap)
   try {
     const op = await uncoolDataSource({ ...capabilityTuple(cap), reason })
+    if (!pageActive()) return
     message.success(op.cleared ? '已解除指定能力冷却' : '该能力当前没有冷却')
     uncoolOpen.value = false
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   } finally {
     await refreshCapabilityOps()
     uncoolSubmitting.value = false
@@ -736,23 +763,30 @@ async function callMaintenance(kind: MaintenanceKind, payload: MaintenanceReques
 }
 
 async function previewMaintenance(kind: MaintenanceKind) {
-  if (dryRunLoading.value || executingPlan.value) return
+  if (!pageActive() || rerunning.value || dryRunLoading.value || executingPlan.value) return
   if (kind !== 'wide' && (!maintenanceRange.from || !maintenanceRange.to)) {
     message.warning('请选择补采起止日期')
     return
   }
   rerunning.value = kind
   dryRunLoading.value = true
+  dryRunOpen.value = false
+  maintenancePlan.value = null
+  const from = maintenanceRange.from
+  const to = maintenanceRange.to
   try {
     const result = await callMaintenance(kind, maintenancePayload(kind, true))
+    if (!pageActive() || (kind !== 'wide' && (maintenanceRange.from !== from || maintenanceRange.to !== to))) return
     if (!('plan' in result) || !result.plan) throw new Error('dry-run 未返回计划')
     maintenanceKind.value = kind
     maintenancePlan.value = result.plan
-    maintenanceRange.from = result.plan.from
-    maintenanceRange.to = result.plan.to
+    if (kind !== 'wide') {
+      maintenanceRange.from = result.plan.from
+      maintenanceRange.to = result.plan.to
+    }
     dryRunOpen.value = true
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   } finally {
     rerunning.value = ''
     dryRunLoading.value = false
@@ -761,7 +795,7 @@ async function previewMaintenance(kind: MaintenanceKind) {
 
 async function executeMaintenancePlan() {
   const plan = maintenancePlan.value
-  if (!plan || executingPlan.value) return
+  if (!pageActive() || !dryRunOpen.value || !plan || dryRunLoading.value || executingPlan.value) return
   executingPlan.value = true
   try {
     const result = await callMaintenance(maintenanceKind.value, {
@@ -771,6 +805,7 @@ async function executeMaintenancePlan() {
       dry_run: false,
       plan_hash: plan.plan_hash,
     })
+    if (!pageActive()) return
     if (!('started' in result)) throw new Error('执行请求未返回任务状态')
     message.success(
       result.started === false
@@ -780,7 +815,7 @@ async function executeMaintenancePlan() {
     dryRunOpen.value = false
     await Promise.all([loadLogs(), loadHealth(), loadCapabilities()])
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
     dryRunOpen.value = false
   } finally {
     executingPlan.value = false
@@ -788,16 +823,18 @@ async function executeMaintenancePlan() {
 }
 const rerunning = ref('')
 async function rerun(key: string, fn: () => Promise<SystemJobStartResponse>) {
+  if (!pageActive() || rerunning.value || dryRunLoading.value || executingPlan.value) return
   rerunning.value = key
   try {
     const result = await fn()
+    if (!pageActive()) return
     message.success(
       result.started
         ? `已进入任务队列（#${result.job_run_id}）`
         : `已有同类任务运行中（#${result.job_run_id}）`,
     )
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   } finally {
     rerunning.value = ''
   }
@@ -817,6 +854,9 @@ onMounted(() => {
 <template>
   <PageContainer title="管理后台" subtitle="系统设置与用户管理">
     <div class="admin-stack">
+      <n-alert v-if="settingsError" type="error" :bordered="false">
+        {{ settingsError }} <n-button size="small" :loading="settingsLoading" @click="load">重试读取设置</n-button>
+      </n-alert>
       <!-- 注册开关 -->
       <SectionCard title="注册策略" :hoverable="false">
         <n-space align="center">
@@ -824,6 +864,7 @@ onMounted(() => {
           <n-switch
             :value="settings?.registration_open ?? false"
             :loading="savingReg"
+            :disabled="!settings"
             @update:value="toggleRegistration"
           />
           <span style="opacity: 0.6">关闭时，仅已存在的账号可登录，新 GitHub 用户无法注册。</span>
@@ -832,7 +873,7 @@ onMounted(() => {
 
       <!-- 新闻采集 -->
       <SectionCard title="新闻采集" :hoverable="false">
-        <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 560px" :show-feedback="false">
+        <n-form :disabled="!settings" :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 560px" :show-feedback="false">
           <n-form-item label="采集间隔">
             <n-input-number v-model:value="news.interval" :min="1" :max="120" :step="1" style="width: 140px">
               <template #suffix>分钟</template>
@@ -851,7 +892,7 @@ onMounted(() => {
 
       <!-- LLM 回退 -->
       <SectionCard title="LLM 回退" :hoverable="false">
-        <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 620px" :show-feedback="false">
+        <n-form :disabled="!settings" :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 620px" :show-feedback="false">
           <n-form-item label="允许回退">
             <n-switch v-model:value="fb.enabled" />
             <span style="opacity: 0.6; margin-left: 12px; font-size: 12px">
@@ -919,7 +960,7 @@ onMounted(() => {
             <span>推荐影子实验采样：</span>
             <n-switch :value="challengerEnabled" :loading="savingChallenger" @update:value="toggleChallenger" />
             <span style="opacity: 0.6; font-size: 12px">
-              开启（P2-1/S3-6C，缺省关）：存在 running 的 prompt challenger 或 score-blind 输入实验时，仅对实验创建者本人每批推荐追加一次影子调用；两类实验互斥、合计最多一次。纯影子、不影响推荐：成功、失败、空 picks、越池结果均只落实验与审计事实，不改业务 picks、action、confidence、候选池、推荐批次状态或 l2 标签。
+              开启（P2-1/S3-6C，缺省关）：存在 running 的 prompt challenger 或 score-blind 输入实验时，仅对实验创建者本人每批推荐追加一次影子调用；两类实验互斥、合计最多一次。纯影子、不影响推荐：成功、失败、空 picks、越池结果均只落实验与审计事实，不改业务 picks、action、confidence、候选池、推荐批次状态或既有标签。
             </span>
           </n-space>
           <n-space align="center">
@@ -970,10 +1011,10 @@ onMounted(() => {
               <td style="font-size: 12px; opacity: 0.8">{{ routeHealthText(r) }}</td>
               <td>
                 <n-space size="small">
-                  <n-button size="tiny" @click="editRoute(r)">编辑</n-button>
-                  <n-button v-if="r.auto_fallback_at" size="tiny" type="warning" @click="recoverRoute(r)">恢复</n-button>
-                  <n-popconfirm @positive-click="removeRoute(r)">
-                    <template #trigger><n-button size="tiny" type="error">删除</n-button></template>
+                  <n-button size="tiny" :disabled="routesBusy" @click="editRoute(r)">编辑</n-button>
+                  <n-button v-if="r.auto_fallback_at" size="tiny" type="warning" :disabled="routesBusy" @click="recoverRoute(r)">恢复</n-button>
+                  <n-popconfirm :disabled="routesBusy" @positive-click="removeRoute(r)">
+                    <template #trigger><n-button size="tiny" type="error" :disabled="routesBusy">删除</n-button></template>
                     删除后该模块恢复默认配置链路？
                   </n-popconfirm>
                 </n-space>
@@ -981,8 +1022,9 @@ onMounted(() => {
             </tr>
           </tbody>
         </n-table>
-        <n-empty v-else description="暂无路由：全部模块走默认配置链路" style="margin: 12px 0" />
-        <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 560px; margin-top: 12px" :show-feedback="false">
+        <n-empty v-else-if="!routesError" description="暂无路由：全部模块走默认配置链路" style="margin: 12px 0" />
+        <n-alert v-if="routesError" type="error" :bordered="false">{{ routesError }}</n-alert>
+        <n-form :disabled="routesBusy" :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 560px; margin-top: 12px" :show-feedback="false">
           <n-form-item label="模块">
             <n-select v-model:value="routeForm.module" :options="routeModuleOptions" placeholder="选择业务模块" filterable />
           </n-form-item>
@@ -1008,7 +1050,7 @@ onMounted(() => {
         <n-alert type="info" :show-icon="false" :bordered="false" class="note">
           在 GitHub OAuth App 中将「Authorization callback URL」设置为：<strong>{{ callbackHint }}</strong>
         </n-alert>
-        <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 560px">
+        <n-form :disabled="!settings" :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 560px">
           <n-form-item label="Client ID">
             <n-input v-model:value="gh.client_id" placeholder="GitHub OAuth App Client ID" />
           </n-form-item>
@@ -1029,7 +1071,7 @@ onMounted(() => {
 
       <!-- 站点地址（推送通知点击跳转） -->
       <SectionCard title="站点地址" :hoverable="false">
-        <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 560px" :show-feedback="false">
+        <n-form :disabled="!settings" :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 120" style="max-width: 560px" :show-feedback="false">
           <n-form-item label="站点基础 URL">
             <n-input v-model:value="siteBaseURL" placeholder="https://app.example.com（本站对外访问地址）" />
           </n-form-item>
@@ -1069,7 +1111,7 @@ onMounted(() => {
                   <n-button size="tiny" quaternary @click="openQuota(u)">配额</n-button>
                   <n-popconfirm v-if="u.id !== auth.user?.id" @positive-click="toggleStatus(u)">
                     <template #trigger>
-                      <n-button size="tiny" :type="u.status === 'enabled' ? 'error' : 'primary'">
+                      <n-button size="tiny" :loading="userStatusSaving.has(u.id)" :type="u.status === 'enabled' ? 'error' : 'primary'">
                         {{ u.status === 'enabled' ? '禁用' : '启用' }}
                       </n-button>
                     </template>
@@ -1381,6 +1423,8 @@ onMounted(() => {
       preset="card"
       :title="`${maintenanceLabels[maintenanceKind]} · dry-run`"
       :mask-closable="!dryRunLoading && !executingPlan"
+      :closable="!executingPlan"
+      :close-on-esc="!executingPlan"
       style="max-width: 620px"
     >
       <template v-if="maintenancePlan">
@@ -1404,7 +1448,7 @@ onMounted(() => {
       <template #footer>
         <div class="modal-actions">
           <n-button :disabled="executingPlan" @click="dryRunOpen = false">取消</n-button>
-          <n-button type="primary" :loading="executingPlan" @click="executeMaintenancePlan">确认执行</n-button>
+          <n-button type="primary" :loading="executingPlan" :disabled="dryRunLoading || !maintenancePlan" @click="executeMaintenancePlan">确认执行</n-button>
         </div>
       </template>
     </n-modal>
@@ -1445,8 +1489,8 @@ onMounted(() => {
     </n-modal>
 
     <!-- 用户配额编辑 -->
-    <n-modal v-model:show="quotaModal" preset="card" :title="`AI 配额 · ${quotaUser?.display_name || quotaUser?.username || ''}`" style="max-width: 460px">
-      <n-form :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 110" :show-feedback="false">
+    <n-modal v-model:show="quotaModal" preset="card" :mask-closable="!quotaSaving" :closable="!quotaSaving" :close-on-esc="!quotaSaving" :title="`AI 配额 · ${quotaUser?.display_name || quotaUser?.username || ''}`" style="max-width: 460px">
+      <n-form :disabled="quotaLoading || quotaSaving" :label-placement="isMobile ? 'top' : 'left'" :label-width="isMobile ? undefined : 110" :show-feedback="false">
         <n-form-item label="已用次数">
           <span class="qv-tnum">{{ quotaForm.action_used }}</span>
           <span style="opacity: 0.5; margin-left: 8px"
@@ -1467,7 +1511,7 @@ onMounted(() => {
       </n-form>
       <template #footer>
         <div class="modal-actions">
-          <n-button @click="quotaModal = false">取消</n-button>
+          <n-button :disabled="quotaSaving" @click="quotaModal = false">取消</n-button>
           <n-button type="primary" :loading="quotaSaving || quotaLoading" @click="saveQuota">保存</n-button>
         </div>
       </template>

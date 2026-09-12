@@ -1,5 +1,5 @@
-import axios, { type AxiosInstance } from 'axios'
-import { getAccessToken, getRefreshToken, setTokens, clearTokens } from './token'
+import axios, { type AxiosInstance, type InternalAxiosRequestConfig } from 'axios'
+import { getAccessToken, getRefreshToken, rotateTokens, clearTokens, getSessionEpoch } from './token'
 
 // 后端统一响应包络：{ success, message, data }
 export interface ApiEnvelope<T> {
@@ -56,7 +56,13 @@ export const AI_TIMEOUT = 300000
 export const HEAVY_TIMEOUT = 120000
 
 // 请求拦截：自动附带 access token。
+type SessionRequestConfig = InternalAxiosRequestConfig & { _retried?: boolean; _sessionEpoch?: number }
+const sessionChangedError = () => new ApiRequestError('登录状态已变化，请重新执行操作', 'auth_session_changed')
+
 http.interceptors.request.use((config) => {
+  const original = config as SessionRequestConfig
+  if (original._sessionEpoch !== undefined && original._sessionEpoch !== getSessionEpoch()) throw sessionChangedError()
+  original._sessionEpoch = getSessionEpoch()
   const token = getAccessToken()
   if (token) {
     config.headers.Authorization = `Bearer ${token}`
@@ -65,48 +71,93 @@ http.interceptors.request.use((config) => {
 })
 
 // 单飞刷新：并发 401 只触发一次 refresh。
-let refreshing: Promise<boolean> | null = null
+let refreshing: { epoch: number; promise: Promise<boolean> } | null = null
+const REFRESH_TIMEOUT = 20000
 
-async function tryRefresh(): Promise<boolean> {
-  const refresh = getRefreshToken()
-  if (!refresh) return false
+function waitForPeerRefresh(epoch: number, refresh: string): Promise<boolean> {
+  if (typeof window === 'undefined') return Promise.resolve(false)
+  // 不支持 Web Locks 的旧浏览器/HTTP 页面仍可能同时消费旧令牌。
+  // 401 可能先于成功标签的响应到达；给另一页完整的请求超时窗口发布新凭证。
+  return new Promise((resolve) => {
+    const finish = (ok: boolean) => {
+      clearTimeout(timer)
+      window.removeEventListener('storage', check)
+      resolve(ok)
+    }
+    const check = () => {
+      if (epoch !== getSessionEpoch()) finish(false)
+      else if (refresh !== getRefreshToken()) finish(!!(getAccessToken() && getRefreshToken()))
+    }
+    const timer = setTimeout(() => finish(false), REFRESH_TIMEOUT)
+    window.addEventListener('storage', check)
+    check()
+  })
+}
+
+async function performRefresh(epoch: number, refresh: string, crossTabLocked: boolean): Promise<boolean> {
+  if (epoch !== getSessionEpoch()) return false
+  if (refresh !== getRefreshToken()) return !!(getAccessToken() && getRefreshToken())
   try {
-    const resp = await axios.post('/api/auth/refresh', { refresh_token: refresh })
+    const resp = await axios.post('/api/auth/refresh', { refresh_token: refresh }, { timeout: REFRESH_TIMEOUT })
+    if (epoch !== getSessionEpoch()) return false
+    // 另一标签已完成本会话的刷新；迟到响应不能覆盖它的新凭证。
+    if (refresh !== getRefreshToken()) return !!(getAccessToken() && getRefreshToken())
     const body = resp.data as ApiEnvelope<{ access_token: string; refresh_token: string }>
     if (body?.success) {
-      setTokens(body.data.access_token, body.data.refresh_token)
-      return true
+      return rotateTokens(refresh, body.data.access_token, body.data.refresh_token)
     }
-  } catch {
-    /* 落到下方返回 false */
+  } catch (error) {
+    if (epoch !== getSessionEpoch()) return false
+    // 同一刷新令牌只能使用一次。另一标签抢先轮换后的 401 不代表会话失效。
+    if (refresh !== getRefreshToken()) return !!(getAccessToken() && getRefreshToken())
+    if (axios.isAxiosError(error) && error.response?.status === 401) {
+      return crossTabLocked ? false : waitForPeerRefresh(epoch, refresh)
+    }
+    // 网络、限流、数据库等暂时故障保留凭证，由调用方显示错误并允许重试。
+    throw error
   }
   return false
 }
 
+async function tryRefresh(epoch: number): Promise<boolean> {
+  const refresh = getRefreshToken()
+  if (!refresh) return false
+  if (typeof navigator !== 'undefined' && navigator.locks) {
+    // 锁覆盖请求和新凭证发布。等待者拿锁后先检查共享令牌，复用已完成的轮换。
+    return navigator.locks.request('qv-auth-refresh', () => performRefresh(epoch, refresh, true))
+  }
+  return performRefresh(epoch, refresh, false)
+}
+
 // refreshAccessToken 供 axios 之外的调用方（如流式 fetch）复用同一单飞刷新。
 export function refreshAccessToken(): Promise<boolean> {
-  if (!refreshing) {
-    refreshing = tryRefresh().finally(() => {
-      refreshing = null
-    })
-  }
-  return refreshing
+  const epoch = getSessionEpoch()
+  if (refreshing?.epoch === epoch) return refreshing.promise
+  const promise = tryRefresh(epoch).finally(() => {
+    if (refreshing?.promise === promise) refreshing = null
+  })
+  refreshing = { epoch, promise }
+  return promise
 }
 
 // 响应拦截：401 时尝试刷新一次并重放原请求；刷新失败则清票并跳登录。
 http.interceptors.response.use(
-  (resp) => resp,
+  (resp) => {
+    if ((resp.config as SessionRequestConfig)._sessionEpoch !== getSessionEpoch()) throw sessionChangedError()
+    return resp
+  },
   async (error) => {
-    const original = error.config
+    const original = error.config as SessionRequestConfig | undefined
     const status = error.response?.status
+    if (original?._sessionEpoch !== undefined && original._sessionEpoch !== getSessionEpoch()) throw sessionChangedError()
     if (status === 401 && original && !original._retried) {
       original._retried = true
-      if (!refreshing) {
-        refreshing = tryRefresh().finally(() => {
-          refreshing = null
-        })
+      const currentToken = getAccessToken()
+      if (currentToken && original.headers.Authorization !== `Bearer ${currentToken}`) {
+        return http.request(original)
       }
-      const ok = await refreshing
+      const ok = await refreshAccessToken()
+      if (original._sessionEpoch !== getSessionEpoch()) throw sessionChangedError()
       if (ok) {
         original.headers = original.headers || {}
         original.headers.Authorization = `Bearer ${getAccessToken()}`
@@ -126,9 +177,11 @@ http.interceptors.response.use(
 
 // 统一拆包：success=false 时抛出带 message 的错误，组件只处理 data。
 export async function request<T>(config: Parameters<AxiosInstance['request']>[0]): Promise<T> {
+  // 在调用时固定会话，axios 的请求拦截器会异步执行，不能到那里才选择身份。
+  const sessionConfig = { ...config, _sessionEpoch: getSessionEpoch() }
   let resp
   try {
-    resp = await http.request<ApiEnvelope<T>>(config)
+    resp = await http.request<ApiEnvelope<T>>(sessionConfig)
   } catch (e) {
     if (axios.isAxiosError(e)) {
       if (e.code === 'ECONNABORTED') {

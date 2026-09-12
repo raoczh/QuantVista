@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import ts from 'typescript'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const read = (relativePath) => fs.readFileSync(path.join(root, relativePath), 'utf8')
@@ -88,7 +89,18 @@ assert.match(positions, /name="all" tab="全部持仓"/, '持仓页必须保留�
 assert.match(positions, /name="review" tab="交易与复盘"/, '持仓页必须保留交易复盘任务')
 assert.match(positions, /name="risk" tab="组合风险"/, '持仓页必须保留组合风险任务')
 assert.match(positions, /getPositionExitAssessment/, '持仓通知深链必须读取具体 assessment_id')
-assert.match(positions, /position:\$\{positionID\}:assessment:\$\{assessmentID\}/, '同一持仓切换评估时去重键必须包含 assessment_id')
+const stockActionSource = positions.match(/function stockActionKey\(\) \{[\s\S]*?\n\}/)?.[0]
+assert.ok(stockActionSource, '持仓动作需要生成请求归属键')
+const stockActionCode = ts.transpileModule(stockActionSource, {
+  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+}).outputText
+const actionKey = new Function('route', 'pageActive', `${stockActionCode}\nreturn stockActionKey()`)
+const keyFor = (query, active = true) => actionKey({ query }, () => active)
+const initialKey = keyFor({ account_id: '1', position_id: '11', assessment_id: '101' })
+assert.ok(initialKey, '有效通知深链应产生动作键')
+assert.notEqual(initialKey, keyFor({ account_id: '1', position_id: '11', assessment_id: '102' }), '同一持仓切换评估时必须重新定位')
+assert.notEqual(initialKey, keyFor({ account_id: '2', position_id: '11', assessment_id: '101' }), '切换账户必须重新核验深链所属范围')
+assert.equal(keyFor({ position_id: '11', assessment_id: '101' }, false), '', '离开原页面后不得消费新的持仓动作')
 assert.match(decisionCenter, /紧急处理[\s\S]*需要复核/, '决策中心必须显示 urgent 和 review 汇总')
 assert.match(decisionCenter, /AI 复核不会自动卖出，也不会修改程序风险等级/, 'AI 复核必须声明不会改写程序事实或自动交易')
 assert.match(decisionCenter, /<details class="evidence-details">/, '专业指标和原始证据必须折叠展示')

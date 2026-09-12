@@ -28,7 +28,7 @@ func (ac *AnalysisController) Create(c *gin.Context) {
 	}
 	// allowPrivate：仅管理员可让分析调用触达内网自建模型（与 LLM 测试连接一致，防 SSRF）。
 	allowPrivate := currentRole(c) == model.RoleAdmin
-	v, err := ac.svc.AnalyzeAsync(currentUserID(c), allowPrivate, req)
+	v, err := ac.svc.AnalyzeAsyncContext(c.Request.Context(), currentUserID(c), allowPrivate, req)
 	if err != nil {
 		common.ApiError(c, err) // 机读拒答码（stale_quote 等）随包络 code 字段透出
 		return
@@ -89,8 +89,14 @@ func (ac *AnalysisController) Hindsight(c *gin.Context) {
 	if !ok {
 		return
 	}
-	target, _ := strconv.ParseFloat(c.Query("target_price"), 64)
-	stop, _ := strconv.ParseFloat(c.Query("stop_price"), 64)
+	target, ok := optionalNonnegativeFloat(c, "target_price")
+	if !ok {
+		return
+	}
+	stop, ok := optionalNonnegativeFloat(c, "stop_price")
+	if !ok {
+		return
+	}
 	v, err := ac.svc.Hindsight(c.Request.Context(), currentUserID(c), id, target, stop)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())

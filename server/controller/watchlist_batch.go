@@ -25,7 +25,7 @@ func (bc *WatchlistBatchController) Create(c *gin.Context) {
 		common.ApiErrorMsg(c, "请求格式错误")
 		return
 	}
-	view, err := service.CreateWatchlistBatch(currentUserID(c), resultID, req)
+	view, err := service.CreateWatchlistBatch(currentUserID(c), resultID, req, c.Request.Context())
 	if err != nil {
 		common.ApiErrorMsg(c, publicWorkflowError(err, "批量操作失败，请刷新后重试"))
 		return
@@ -34,7 +34,7 @@ func (bc *WatchlistBatchController) Create(c *gin.Context) {
 }
 
 func (bc *WatchlistBatchController) Get(c *gin.Context) {
-	view, err := service.GetWatchlistBatch(currentUserID(c), strings.TrimSpace(c.Param("id")))
+	view, err := service.GetWatchlistBatch(currentUserID(c), strings.TrimSpace(c.Param("id")), c.Request.Context())
 	if err != nil {
 		common.ApiErrorMsg(c, publicWorkflowError(err, "批量操作失败，请刷新后重试"))
 		return
@@ -43,7 +43,7 @@ func (bc *WatchlistBatchController) Get(c *gin.Context) {
 }
 
 func (bc *WatchlistBatchController) Undo(c *gin.Context) {
-	view, err := service.UndoWatchlistBatch(currentUserID(c), strings.TrimSpace(c.Param("id")))
+	view, err := service.UndoWatchlistBatch(currentUserID(c), strings.TrimSpace(c.Param("id")), c.Request.Context())
 	if err != nil {
 		common.ApiErrorMsg(c, publicWorkflowError(err, "批量操作失败，请刷新后重试"))
 		return

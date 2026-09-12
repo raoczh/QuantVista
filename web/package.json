@@ -8,7 +8,7 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "type-check": "vue-tsc --noEmit",
-    "test": "node scripts/test-stock-coverage.mjs && node scripts/test-retail-experience.mjs && node scripts/test-ai-workspaces.mjs && node scripts/test-final-experience.mjs"
+    "test": "node scripts/test-stock-coverage.mjs && node scripts/test-retail-experience.mjs && node scripts/test-ai-workspaces.mjs && node scripts/test-final-experience.mjs && node scripts/test-auth-session.mjs && node scripts/test-native-shell.mjs && node scripts/test-business-task.mjs && node scripts/test-browser-notifications.mjs && node scripts/test-visible-task-polling.mjs && node scripts/test-list-page-state.mjs && node scripts/test-home-workspace.mjs"
   },
   "dependencies": {
     "@capacitor/app": "^8.1.0",
@@ -16,8 +16,8 @@
     "@capacitor/core": "^8.4.2",
     "@capacitor/preferences": "^8.0.1",
     "axios": "^1.7.7",
-    "dompurify": "^3.4.11",
-    "echarts": "^5.5.1",
+    "dompurify": "^3.4.15",
+    "echarts": "^6.1.0",
     "marked": "^18.0.5",
     "naive-ui": "^2.40.1",
     "pinia": "^2.2.4",
@@ -26,9 +26,9 @@
   },
   "devDependencies": {
     "@types/node": "^20.16.11",
-    "@vitejs/plugin-vue": "^5.1.4",
+    "@vitejs/plugin-vue": "^5.2.4",
     "typescript": "^5.6.3",
-    "vite": "^5.4.10",
+    "vite": "^6.4.3",
     "vue-tsc": "^2.1.8"
   }
 }

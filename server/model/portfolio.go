@@ -7,12 +7,14 @@ import "time"
 
 // Watchlist 自选股分组。
 type Watchlist struct {
-	ID        int64     `gorm:"primaryKey" json:"id"`
-	UserID    int64     `gorm:"index" json:"user_id"`
-	Name      string    `gorm:"size:64" json:"name"`
-	SortOrder int       `gorm:"default:0" json:"sort_order"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID        int64  `gorm:"primaryKey" json:"id"`
+	UserID    int64  `gorm:"index" json:"user_id"`
+	Name      string `gorm:"size:64" json:"name"`
+	SortOrder int    `gorm:"default:0" json:"sort_order"`
+	// 仅自动创建的初始分组填写 user_id，用唯一键避免并发首次访问重复创建；旧组保持 NULL。
+	InitialGroupKey *int64    `gorm:"uniqueIndex" json:"-"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // 机会池漏斗阶段：自选条目的研究进度（空 = 未标注，兼容旧数据）。
@@ -137,6 +139,8 @@ type Position struct {
 	PeakDate       string  `gorm:"size:10" json:"peak_date"`
 	PeakFrom       string  `gorm:"size:10" json:"peak_from"`
 	PeakBackfilled bool    `gorm:"default:false" json:"peak_backfilled"`
+	// 原峰值保留供审计；确认曾使用混源日线后，不再作为回撤或 ATR 的有效输入。
+	PeakDataQuality string `gorm:"size:32" json:"peak_data_quality,omitempty"`
 
 	// 来源推荐血缘（一键建仓时写入；0=手动建仓无来源）。供「AI 推荐 vs 实际买入」对比。
 	RecommendationID int64 `gorm:"index" json:"recommendation_id"`

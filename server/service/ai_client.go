@@ -123,6 +123,17 @@ func readLLMResponseBody(r io.Reader, contractEnabled bool) ([]byte, error) {
 	return raw, nil
 }
 
+// 单行 Scanner 上限不能约束多条 SSE 的累计正文、思考与待闭合标签缓冲。
+func takeStreamOutputBytes(used *int, sizes ...int) error {
+	for _, size := range sizes {
+		if size > aiResponseBodyLimit-*used {
+			return refusalErr(RefusalLLMResponseIncomplete, "LLM 流式输出超过 1MB 上限，已拒收不完整内容")
+		}
+		*used += size
+	}
+	return nil
+}
+
 // chatMessage 一条对话消息。
 type chatMessage struct {
 	Role    string `json:"role"`
@@ -350,14 +361,14 @@ func capModuleTokens(userMax, moduleCap int) int {
 // 若服务端因不支持该字段返回 4xx，则去掉 response_format 重试一次（fallback，靠 prompt 约束 JSON）。
 // EndpointType=responses 时分流到 /v1/responses 适配（ai_client_responses.go），返回语义一致。
 func chatCompletion(ctx context.Context, p chatParams) (res *chatResult, err error) {
-	return chatCompletionPrepared(ctx, prepareChatCompletion(p))
+	return chatCompletionPrepared(ctx, prepareChatCompletion(p, ctx))
 }
 
 // prepareChatCompletion 固化一次调用在真正发网前的中央变换。需要持久化精确输入的
 // score-blind 影子路径会先调用本函数、落不可变快照，再把同一个 p 交给
 // chatCompletionPrepared；普通调用仍只经 chatCompletion 入口执行一次。
-func prepareChatCompletion(p chatParams) chatParams {
-	p = applyModelRouting(p) // P2-4 模块级模型路由：先换目标，后续契约/能力路由作用于最终目标
+func prepareChatCompletion(p chatParams, contexts ...context.Context) chatParams {
+	p = applyModelRouting(p, contexts...) // P2-4 模块级模型路由：先换目标，后续契约/能力路由作用于最终目标
 	return prepareChatCompletionAfterRouting(p)
 }
 
@@ -421,6 +432,7 @@ func chatCompletionPrepared(ctx context.Context, p chatParams) (res *chatResult,
 	started := time.Now()
 	streamed := true // 默认先走流式；回落非流式时置 false——审计必须记录实际请求形态而非入口意图
 	defer func() {
+		noteManualQuotaResponse(ctx, res)
 		err = classifyLLMError(err)
 		writeLLMCallLog(p, streamed, res, err, time.Since(started))
 	}()
@@ -982,9 +994,10 @@ func estimateUsage(messages []chatMessage, content string) chatUsage {
 // 建立连接前的错误分类与非流式一致。上游忽略 stream 参数返回整包 JSON 时按非流式解析兼容。
 // EndpointType=responses 时分流到 /v1/responses 适配。
 func chatCompletionStream(ctx context.Context, p chatParams, onDelta func(string)) (res *chatResult, err error) {
-	p = prepareChatCompletion(p)
+	p = prepareChatCompletion(p, ctx)
 	started := time.Now()
 	defer func() {
+		noteManualQuotaResponse(ctx, res)
 		err = classifyLLMError(err)
 		writeLLMCallLog(p, true, res, err, time.Since(started))
 	}()
@@ -1149,6 +1162,7 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 	var sb strings.Builder
 	var reasoningBuilder strings.Builder
 	thinkFilter := thinkStreamFilter{}
+	outputBytes := 0
 	var usage chatUsage
 	var firstChunkMs int64
 	finishReason := "" // 最后一个非空 finish_reason（stop/length/content_filter/…）
@@ -1221,6 +1235,7 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 		}
 		var chunk struct {
 			Choices *[]struct {
+				Index *int `json:"index"`
 				Delta struct {
 					Content          string `json:"content"`
 					ReasoningContent string `json:"reasoning_content"`
@@ -1254,12 +1269,28 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 			continue
 		}
 		for _, c := range *chunk.Choices {
+			if c.Index != nil && *c.Index != 0 {
+				continue // 与整包响应一致，只消费第一条候选回答。
+			}
+			if len(*chunk.Choices) > 1 && c.Index == nil {
+				if rerr := streamProtocolReject(contractEnabled, "Chat 多候选事件缺少 index"); rerr != nil {
+					return partialResult(), rerr
+				}
+			}
 			if contractEnabled && strings.TrimSpace(c.Delta.Refusal) != "" {
 				return partialResult(), refusalErr(RefusalLLMContentFiltered, "模型拒绝生成该内容："+c.Delta.Refusal)
 			}
 			deltaReasoning := c.Delta.ReasoningContent
 			if deltaReasoning == "" {
 				deltaReasoning = c.Delta.Reasoning
+			}
+			if done && (c.Delta.Content != "" || deltaReasoning != "") {
+				if rerr := streamProtocolReject(contractEnabled, "Chat 完成状态之后仍收到正文"); rerr != nil {
+					return partialResult(), rerr
+				}
+			}
+			if err := takeStreamOutputBytes(&outputBytes, len(deltaReasoning), len(c.Delta.Content)); err != nil {
+				return partialResult(), err
 			}
 			if deltaReasoning != "" {
 				reasoningBuilder.WriteString(deltaReasoning)
@@ -1272,7 +1303,12 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 					onDelta(visible)
 				}
 			}
-			if c.FinishReason != nil && *c.FinishReason != "" {
+			if c.FinishReason != nil && strings.TrimSpace(*c.FinishReason) != "" {
+				if finishReason != "" && !strings.EqualFold(strings.TrimSpace(finishReason), strings.TrimSpace(*c.FinishReason)) {
+					if rerr := streamProtocolReject(contractEnabled, "Chat 收到相互冲突的完成状态"); rerr != nil {
+						return partialResult(), rerr
+					}
+				}
 				finishReason = *c.FinishReason
 				done = true
 				armPostFinishDeadline()
@@ -1298,6 +1334,9 @@ func chatCompletionStreamInner(ctx context.Context, p chatParams, onDelta func(s
 	visibleTail, reasoningTail := thinkFilter.Flush()
 	sb.WriteString(visibleTail)
 	reasoningBuilder.WriteString(reasoningTail)
+	if onDelta != nil && visibleTail != "" {
+		onDelta(visibleTail)
+	}
 	content := sb.String()
 	if strings.TrimSpace(content) == "" {
 		return partialResult(), errors.New("LLM 返回空内容")

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"quantvista/common"
 	"quantvista/model"
@@ -19,7 +21,7 @@ func NewNoteService(market *MarketService) *NoteService {
 }
 
 var validNoteKind = map[string]bool{
-	"": true, // 不分类
+	"":                     true, // 不分类
 	model.NoteKindDecision: true,
 	model.NoteKindReview:   true,
 	model.NoteKindIdea:     true,
@@ -36,11 +38,18 @@ type NoteInput struct {
 }
 
 func (s *NoteService) normalize(ctx context.Context, in *NoteInput) (symbol, market, name string, err error) {
+	in.Title, in.Content = strings.TrimSpace(in.Title), strings.TrimSpace(in.Content)
 	if !validNoteKind[in.Kind] {
 		return "", "", "", errors.New("无效的笔记类别")
 	}
 	if strings.TrimSpace(in.Content) == "" && strings.TrimSpace(in.Title) == "" {
 		return "", "", "", errors.New("标题与内容不能同时为空")
+	}
+	if utf8.RuneCountInString(in.Title) > 128 {
+		return "", "", "", errors.New("标题最多 128 个字符")
+	}
+	if len(in.Content) > 65535 {
+		return "", "", "", errors.New("正文过长，请拆分为多篇笔记")
 	}
 	if strings.TrimSpace(in.Symbol) == "" {
 		return "", "", "", nil // 通用笔记不绑定标的
@@ -50,8 +59,10 @@ func (s *NoteService) normalize(ctx context.Context, in *NoteInput) (symbol, mar
 		return "", "", "", err
 	}
 	// 取名 best-effort：数据源临时不可用不阻断记笔记。
-	if q, qerr := s.market.GetQuote(ctx, market, symbol); qerr == nil {
-		name = q.Name
+	if s.market != nil {
+		if q, qerr := s.market.GetQuote(ctx, market, symbol); qerr == nil && q != nil {
+			name = q.Name
+		}
 	}
 	return symbol, market, name, nil
 }
@@ -66,7 +77,7 @@ func (s *NoteService) Create(ctx context.Context, userID int64, in NoteInput) (*
 		UserID: userID, Symbol: symbol, Market: market, Name: name,
 		Kind: in.Kind, Title: strings.TrimSpace(in.Title), Content: strings.TrimSpace(in.Content),
 	}
-	if err := common.DB.Create(&note).Error; err != nil {
+	if err := common.DB.WithContext(ctx).Create(&note).Error; err != nil {
 		return nil, err
 	}
 	return &note, nil
@@ -75,12 +86,15 @@ func (s *NoteService) Create(ctx context.Context, userID int64, in NoteInput) (*
 // Update 编辑笔记（标的绑定也可改）。
 func (s *NoteService) Update(ctx context.Context, userID, id int64, in NoteInput) (*model.ResearchNote, error) {
 	var note model.ResearchNote
-	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&note).Error; err != nil {
+	if err := common.DB.WithContext(ctx).Where("id = ? AND user_id = ?", id, userID).First(&note).Error; err != nil {
 		return nil, errors.New("笔记不存在")
 	}
 	symbol, market, name, err := s.normalize(ctx, &in)
 	if err != nil {
 		return nil, err
+	}
+	if note.Symbol != symbol || note.Market != market {
+		note.Name = ""
 	}
 	note.Symbol, note.Market = symbol, market
 	if name != "" {
@@ -91,8 +105,18 @@ func (s *NoteService) Update(ctx context.Context, userID, id int64, in NoteInput
 	note.Kind = in.Kind
 	note.Title = strings.TrimSpace(in.Title)
 	note.Content = strings.TrimSpace(in.Content)
-	if err := common.DB.Save(&note).Error; err != nil {
-		return nil, err
+	previousUpdate := note.UpdatedAt
+	note.UpdatedAt = time.Now()
+	// 保存前可能正在等待取名；只更新仍处于原版本的行，不能用 Save 复活已删除记录。
+	res := common.DB.WithContext(ctx).Model(&model.ResearchNote{}).
+		Where("id = ? AND user_id = ? AND updated_at = ?", id, userID, previousUpdate).
+		Updates(map[string]any{"symbol": note.Symbol, "market": note.Market, "name": note.Name,
+			"kind": note.Kind, "title": note.Title, "content": note.Content, "updated_at": note.UpdatedAt})
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	if res.RowsAffected == 0 {
+		return nil, errors.New("笔记已更新或删除，请刷新后重试")
 	}
 	return &note, nil
 }

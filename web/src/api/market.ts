@@ -145,6 +145,7 @@ export interface StockScore {
   label: string
   bar_count: number
   data_limited: boolean
+  bars_as_of?: string
 }
 
 // T1 指标序列（与 K 线按日期对齐；null=该位置无值，如 BOLL 前 19 根）。
@@ -186,23 +187,24 @@ export interface ChipDist extends ChipDay {
   data_limited: boolean
 }
 
-export function getOverview(market = 'cn') {
-  return request<Overview>({ url: `/markets/${market}/overview`, method: 'get' })
+export function getOverview(market = 'cn', signal?: AbortSignal) {
+  return request<Overview>({ url: `/markets/${market}/overview`, method: 'get', signal })
 }
 
 export function getStatus() {
   return request<StatusInfo>({ url: '/status', method: 'get' })
 }
 
-export function getQuote(market: string, symbol: string) {
-  return request<Quote>({ url: `/markets/${market}/stocks/${symbol}/quote`, method: 'get' })
+export function getQuote(market: string, symbol: string, signal?: AbortSignal) {
+  return request<Quote>({ url: `/markets/${market}/stocks/${symbol}/quote`, method: 'get', signal })
 }
 
-export function getDailyBars(market: string, symbol: string, limit = 120) {
+export function getDailyBars(market: string, symbol: string, limit = 120, signal?: AbortSignal) {
   return request<Bar[]>({
     url: `/markets/${market}/stocks/${symbol}/bars`,
     method: 'get',
     params: { limit },
+    signal,
   })
 }
 
@@ -278,6 +280,7 @@ export interface MoodTrendPoint {
   broken_rate: number
   max_streak: number
   yzt_avg_chg: number
+  yzt_count: number
   yzt_up_ratio: number
 }
 
@@ -363,8 +366,8 @@ export function getMarketPopularity(market = 'cn', date = '', signal?: AbortSign
   })
 }
 
-export function getValuation(market: string, symbol: string) {
-  return request<Valuation>({ url: `/markets/${market}/stocks/${symbol}/valuation`, method: 'get' })
+export function getValuation(market: string, symbol: string, signal?: AbortSignal) {
+  return request<Valuation>({ url: `/markets/${market}/stocks/${symbol}/valuation`, method: 'get', signal })
 }
 
 export function getScore(market: string, symbol: string) {
@@ -403,6 +406,7 @@ export interface StockFundFlow {
   streak_days: number // 正=连续净流入天数，负=连续净流出
   fresh: boolean
   last_date?: string
+  note?: string
 }
 
 export function getStockFundFlow(market: string, symbol: string, days = 90) {

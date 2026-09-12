@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"quantvista/common"
 	"quantvista/model"
@@ -306,41 +307,58 @@ func jointSegStats(segment string, days []string, list []calibSample) *JointEval
 
 // jointLockedAuditLoad 读取审计记录（无记录返回零值非错误）。
 func jointLockedAuditLoad() (*JointLockedAudit, error) {
+	return jointLockedAuditLoadDB(common.DB)
+}
+
+func jointLockedAuditLoadDB(db *gorm.DB) (*JointLockedAudit, error) {
 	var row model.Option
-	err := common.DB.Where("`key` = ?", jointLockedReadsKey).First(&row).Error
+	err := db.Where("`key` = ?", jointLockedReadsKey).First(&row).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return &JointLockedAudit{}, nil
 		}
 		return nil, err
 	}
-	var a JointLockedAudit
-	if json.Unmarshal([]byte(row.Value), &a) != nil {
-		// 值损坏按零值重新开始计（审计尽力而为，不阻断报表）。
-		return &JointLockedAudit{}, nil
+	var a *JointLockedAudit
+	if err := json.Unmarshal([]byte(row.Value), &a); err != nil {
+		return nil, fmt.Errorf("锁定段审计记录损坏: %w", err)
 	}
-	return &a, nil
+	if a == nil || a.Count < 0 || len(a.Log) > a.Count || (a.Count > 0 && a.LastAt == "") {
+		return nil, errors.New("锁定段审计记录不完整")
+	}
+	return a, nil
 }
 
-// jointLockedAuditBump 登记一次锁定段读取（计数+时刻；持久化失败不阻断报表但记日志）。
-func jointLockedAuditBump(now time.Time) *JointLockedAudit {
-	a, err := jointLockedAuditLoad()
-	if err != nil {
-		common.SysWarn("联合评估锁定段审计读取失败: %v", err)
-		a = &JointLockedAudit{}
-	}
-	a.Count++
-	a.LastAt = now.In(time.Local).Format("2006-01-02 15:04:05")
-	a.Log = append(a.Log, a.LastAt)
-	if len(a.Log) > jointLockedLogMax {
-		a.Log = a.Log[len(a.Log)-jointLockedLogMax:]
-	}
-	if b, err := json.Marshal(a); err == nil {
-		if err := model.UpsertOption(jointLockedReadsKey, string(b)); err != nil {
-			common.SysWarn("联合评估锁定段审计写入失败: %v", err)
+// jointLockedAuditBump 持锁累计读取次数；登记失败时不得交付锁定段结果。
+func jointLockedAuditBump(now time.Time) (*JointLockedAudit, error) {
+	var a *JointLockedAudit
+	err := common.DB.Transaction(func(tx *gorm.DB) error {
+		// 首次读取创建计数槽；已有槽只加锁，不覆盖历史值。
+		if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "key"}}, DoNothing: true}).
+			Create(&model.Option{Key: jointLockedReadsKey, Value: `{"count":0,"last_at":""}`}).Error; err != nil {
+			return err
 		}
+		var err error
+		a, err = jointLockedAuditLoadDB(tx.Clauses(clause.Locking{Strength: "UPDATE"}))
+		if err != nil {
+			return err
+		}
+		a.Count++
+		a.LastAt = now.In(time.Local).Format("2006-01-02 15:04:05")
+		a.Log = append(a.Log, a.LastAt)
+		if len(a.Log) > jointLockedLogMax {
+			a.Log = a.Log[len(a.Log)-jointLockedLogMax:]
+		}
+		b, err := json.Marshal(a)
+		if err != nil {
+			return err
+		}
+		return tx.Model(&model.Option{}).Where("`key` = ?", jointLockedReadsKey).Update("value", string(b)).Error
+	})
+	if err != nil {
+		return nil, err
 	}
-	return a
+	return a, nil
 }
 
 // ---------- 报表组装 ----------
@@ -548,16 +566,27 @@ func RunJointEval(includeLocked bool) (*JointEvalReport, error) {
 		rep.Sections = append(rep.Sections, sec)
 	}
 	if includeLocked && hasLockedData {
-		rep.LockedAudit = jointLockedAuditBump(time.Now())
+		var err error
+		rep.LockedAudit, err = jointLockedAuditBump(time.Now())
+		if err != nil {
+			return nil, fmt.Errorf("登记锁定段读取审计失败: %w", err)
+		}
+		// 普通视图中的读取次数也已变化，下次读取须取得最新审计。
+		jointCacheMu.Lock()
+		jointCache = nil
+		jointCacheMu.Unlock()
 	} else {
 		a, err := jointLockedAuditLoad()
-		if err == nil && a.Count > 0 {
+		if err != nil {
+			return nil, fmt.Errorf("读取锁定段审计失败: %w", err)
+		}
+		if a.Count > 0 {
 			rep.LockedAudit = a
 		}
 	}
 	rep.ElapsedMs = time.Since(start).Milliseconds()
 	rep.Notes = append(rep.Notes,
-		"P2-5 纯测量报表：零门控零 LLM 调用，不改写任何线上行为；样本口径与校准报表同源（l2/next_open/成熟非强平非降级非孤儿）",
+		fmt.Sprintf("纯测量报表：零门控零 LLM 调用；样本口径与校准报表同源（%s/next_open/成熟非强平非降级非孤儿）", labelVersion),
 		fmt.Sprintf("锁定测试集纪律（§9.1/§9.3）：锁定段默认只显示范围与样本数；显式请求才计算指标且每次读取登记审计（已读 %d 次可见）——调参迭代只看开发段，锁定段留给发布前验收", func() int {
 			if rep.LockedAudit != nil {
 				return rep.LockedAudit.Count

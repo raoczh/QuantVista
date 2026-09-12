@@ -664,7 +664,7 @@ func TestPendingShareAdjustDoesNotExpireFromTradeGate(t *testing.T) {
 	setupTestDB(t)
 	cleanCorpTables(t)
 	now := time.Now().In(time.Local)
-	exDate := now.AddDate(0, 0, -(corpAdjustLookbackDays + 1)).Format("2006-01-02")
+	exDate := now.AddDate(0, 0, -31).Format("2006-01-02")
 	p, _ := seedAdjustCase(t, 1, exDate, 0, 10, 0)
 	if n, err := GenerateCorpAdjusts(1, exDate); err != nil || n != 1 {
 		t.Fatalf("生成历史待处理送转失败: n=%d err=%v", n, err)

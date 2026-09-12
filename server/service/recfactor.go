@@ -91,16 +91,16 @@ func computeCandFactors(price float64, bars []datasource.Bar) *candFactors {
 	}
 	f := &candFactors{BarCount: n}
 	if v, ok := movingAverage(closes, 5); ok {
-		f.MA5 = round2(v)
+		f.MA5 = v
 	}
 	if v, ok := movingAverage(closes, 10); ok {
-		f.MA10 = round2(v)
+		f.MA10 = v
 	}
 	if v, ok := movingAverage(closes, 20); ok {
-		f.MA20 = round2(v)
+		f.MA20 = v
 	}
 	if v, ok := movingAverage(closes, 60); ok {
-		f.MA60 = round2(v)
+		f.MA60 = v
 	}
 	f.Chg5d = changeOverN(closes, 5)
 	f.Chg20d = changeOverN(closes, 20)

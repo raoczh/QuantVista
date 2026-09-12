@@ -88,7 +88,7 @@ func TestGoldenNewsAlignment(t *testing.T) {
 			t.Errorf("%s: want %s got %s", c.name, c.want, got)
 		}
 	}
-	if newsWindowVersion != "nw2" {
+	if newsWindowVersion != "nw3" {
 		t.Fatalf("对齐算法版本漂移须同步测试: %s", newsWindowVersion)
 	}
 }
@@ -109,7 +109,7 @@ func TestGoldenNewsWindowMeta(t *testing.T) {
 	if m.SourceCoverage["P1"] != 2 || m.SourceCoverage["P3"] != 1 || len(m.SourceCoverage) != 2 {
 		t.Fatalf("来源覆盖计数错误: %+v", m.SourceCoverage)
 	}
-	if m.SourceAlignment != newsAlignAligned || m.Version != "nw2" {
+	if m.SourceAlignment != newsAlignAligned || m.Version != "nw3" {
 		t.Fatalf("对齐/版本错误: %+v", m)
 	}
 	if m.TotalInWindow != 3 || m.InjectedCount != 3 || m.SourceQueryStatus != "ok" {
@@ -412,8 +412,8 @@ func TestGoldenNewsWindowFullStats(t *testing.T) {
 	if meta.SourceAlignment != newsAlignSingleSource {
 		t.Fatalf("同一媒体多条同向应 single_source: %s", meta.SourceAlignment)
 	}
-	if meta.Version != "nw2" {
-		t.Fatalf("版本应 nw2: %s", meta.Version)
+	if meta.Version != "nw3" {
+		t.Fatalf("版本应 nw3: %s", meta.Version)
 	}
 }
 

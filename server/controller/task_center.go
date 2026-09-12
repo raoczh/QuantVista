@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"quantvista/common"
+	"quantvista/middleware"
 	"quantvista/model"
 	"quantvista/service"
 
@@ -20,10 +22,10 @@ type taskCenterLister interface {
 }
 
 type taskCenterJobs interface {
-	GetJob(userID, id int64) (*service.JobRunView, error)
-	CancelJob(userID, id int64) (*service.JobRunView, error)
-	RetryJob(userID, id int64) (*service.JobRunView, error)
-	Events(userID, afterID, limit int64) ([]service.JobEventView, error)
+	GetJob(userID, id int64, contexts ...context.Context) (*service.JobRunView, error)
+	CancelJob(userID, id int64, contexts ...context.Context) (*service.JobRunView, error)
+	RetryJob(userID, id int64, contexts ...context.Context) (*service.JobRunView, error)
+	Events(userID, afterID, limit int64, contexts ...context.Context) ([]service.JobEventView, error)
 }
 
 type taskCenterMetrics interface {
@@ -61,7 +63,7 @@ func (tc *TaskCenterController) Metrics(c *gin.Context) {
 	}
 	metrics, err := tc.metrics.Metrics(currentUserID(c))
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorMsg(c, publicWorkflowError(err, "任务操作失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, metrics)
@@ -107,9 +109,9 @@ func (tc *TaskCenterController) Get(c *gin.Context) {
 		common.ApiErrorMsg(c, "作业服务不可用")
 		return
 	}
-	view, err := tc.jobs.GetJob(currentUserID(c), id)
+	view, err := tc.jobs.GetJob(currentUserID(c), id, c.Request.Context())
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorMsg(c, publicWorkflowError(err, "任务操作失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, view)
@@ -125,9 +127,9 @@ func (tc *TaskCenterController) Cancel(c *gin.Context) {
 		common.ApiErrorMsg(c, "作业服务不可用")
 		return
 	}
-	view, err := tc.jobs.CancelJob(currentUserID(c), id)
+	view, err := tc.jobs.CancelJob(currentUserID(c), id, c.Request.Context())
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorMsg(c, publicWorkflowError(err, "任务操作失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, view)
@@ -143,9 +145,9 @@ func (tc *TaskCenterController) Retry(c *gin.Context) {
 		common.ApiErrorMsg(c, "作业服务不可用")
 		return
 	}
-	view, err := tc.jobs.RetryJob(currentUserID(c), id)
+	view, err := tc.jobs.RetryJob(currentUserID(c), id, c.Request.Context())
 	if err != nil {
-		common.ApiError(c, err)
+		common.ApiErrorMsg(c, publicWorkflowError(err, "任务操作失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, view)
@@ -185,7 +187,12 @@ func (tc *TaskCenterController) Events(c *gin.Context) {
 	defer heartbeat.Stop()
 
 	writeEvents := func() error {
-		events, err := tc.jobs.Events(currentUserID(c), afterID, 100)
+		// SSE 可持续数小时，不能只依赖建立连接时的鉴权。失效后结束响应，
+		// 客户端重连会按普通 401 流程刷新令牌或要求重新登录。
+		if status, message := middleware.ValidateJWTSession(c); status != 0 {
+			return fmt.Errorf("事件流会话无效: %s", message)
+		}
+		events, err := tc.jobs.Events(currentUserID(c), afterID, 100, c.Request.Context())
 		if err != nil {
 			return err
 		}

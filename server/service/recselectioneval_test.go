@@ -569,7 +569,7 @@ func TestSelectionEvalScoreBlindProtocolIsolatedAndNoLLMOrL2Mutation(t *testing.
 	if status.HorizonDays != 5 || status.WindowGroup != "short" || status.EffectiveBatches != 1 ||
 		status.MinEffectiveBatches != 1 || status.ChampionCoveragePct != 100 ||
 		status.ScoreBlindCoveragePct != 33.33 || status.CoverageDropPct != 66.67 ||
-		status.SevereLossRatePct != 100 || status.MaxSevereLossRatePct != 20 ||
+		status.SevereLossRatePct == nil || *status.SevereLossRatePct != 100 || status.MaxSevereLossRatePct != 20 ||
 		status.MultipleTestingMethod != "holm_bonferroni" || status.MultipleTestingFamily != 4 ||
 		status.MultipleTestingApplied || !status.Ready || status.GuardrailsPassed {
 		t.Fatalf("score-blind 预注册协议状态计算不符: %+v", status)
@@ -657,7 +657,7 @@ func TestSelectionEvalScoreBlindProtocolEffectiveBatchesDoNotRequireQuantOutcome
 	}
 }
 
-func TestRunSelectionEvalSO1SettlementIdempotentAndNoLLM(t *testing.T) {
+func TestRunSelectionEvalSettlementIdempotentAndNoLLM(t *testing.T) {
 	setupSelectionEvalTestDB(t)
 	created := time.Date(2025, 1, 2, 15, 30, 0, 0, time.Local)
 	fixture := seedSelectionEvalBatch(t, 301, model.RecTypeShortTerm, model.RecStatusSuccess, true,
@@ -719,7 +719,8 @@ func TestRunSelectionEvalSO1SettlementIdempotentAndNoLLM(t *testing.T) {
 		first.ExitDate != "2025-01-10" || first.ExitPrice != 11.5 {
 		t.Fatalf("真实 so1 入出场语义不符: %+v", first)
 	}
-	if first.GrossReturnPct != 15 || first.NetReturnPct != 14.89 ||
+	// 含费用预算买 1900 股，入场 19005；出场 21850，佣金 5.46、印花税 10.93。
+	if first.GrossReturnPct != 15 || first.NetReturnPct != 14.88 ||
 		first.MfePct != 16 || first.MaePct != -2 {
 		t.Fatalf("真实 so1 gross/net/MFE/MAE 不符: %+v", first)
 	}

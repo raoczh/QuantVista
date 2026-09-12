@@ -1,10 +1,10 @@
 package service
 
 import (
-	"strings"
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -166,6 +166,7 @@ func wideGenBars(dates []string, close float64) []datasource.Bar {
 // cleanWideTables 清场（内存库 cache=shared 测试间共享）。
 func cleanWideTables(t *testing.T) {
 	t.Helper()
+	waitForTestFactorRebuilds(t)
 	for _, m := range []any{&model.DailyBar{}, &model.MarketSyncState{}, &model.TradingCalendar{}, &model.DataSyncLog{}} {
 		if err := common.DB.Where("1 = 1").Delete(m).Error; err != nil {
 			t.Fatalf("清场失败: %v", err)
@@ -293,9 +294,13 @@ func TestSyncMarketWideRebaseSuspect(t *testing.T) {
 		t.Fatalf("重锚后 bar 数 = %d, want 250", n)
 	}
 	var stale int64
-	common.DB.Model(&model.DailyBar{}).Where("symbol = ? AND close > ?", "600001", 10.01).Count(&stale)
+	common.DB.Model(&model.DailyBar{}).Where("symbol = ? AND trade_date < ? AND close > ?", "600001", tradeDate, 10.01).Count(&stale)
 	if stale != 0 {
 		t.Fatalf("残留旧基准 %d 根（断层未清）", stale)
+	}
+	var todayBar model.DailyBar
+	if err := common.DB.Where("symbol = ? AND trade_date = ?", "600001", tradeDate).First(&todayBar).Error; err != nil || todayBar.Close != 10.5 {
+		t.Fatalf("重锚后当日 bar 应使用最新快照价：%+v err=%v", todayBar, err)
 	}
 	if st := stateOf(t, "600001"); st.AdjustEpoch == "" || st.InitStatus != "done" {
 		t.Fatalf("重锚后 state 不符: %+v", st)
@@ -335,7 +340,7 @@ func TestPersistDailyBarsDetectRebase(t *testing.T) {
 		t.Fatalf("残留旧基准 %d 根", stale)
 	}
 
-	// 反例：新浪源（不复权）不触发检测——旧行为窗口 upsert（承认的混源边界）。
+	// 反例：新浪源（不复权）不得重锚或覆盖共用的前复权序列。
 	cleanWideTables(t)
 	for _, b := range wideGenBars(allDates[:120], 20.0) {
 		common.DB.Create(&model.DailyBar{Symbol: "600003", Market: "cn", TradeDate: b.TradeDate,
@@ -345,7 +350,9 @@ func TestPersistDailyBarsDetectRebase(t *testing.T) {
 	for i := range sinaBars {
 		sinaBars[i].Source = "sina"
 	}
-	svc.persistDailyBars(context.Background(), "cn", "600003", sinaBars)
+	if err := svc.persistDailyBars(context.Background(), "cn", "600003", sinaBars); err == nil {
+		t.Fatal("不复权窗口应拒绝写入")
+	}
 	if n := barCount(t, "600003"); n != 120 {
 		t.Fatalf("sina 源不应触发重锚, bar 数 = %d, want 120", n)
 	}
@@ -354,16 +361,21 @@ func TestPersistDailyBarsDetectRebase(t *testing.T) {
 	if head.Close != 20.0 {
 		t.Fatalf("sina 源不应重写头部: %+v", head)
 	}
+	var tail model.DailyBar
+	common.DB.Where("symbol = ? AND trade_date = ?", "600003", allDates[119]).First(&tail)
+	if tail.Close != 20.0 || tail.Source != "eastmoney" {
+		t.Fatalf("sina 源不应覆盖尾部: %+v", tail)
+	}
 }
 
-func TestPersistDailyBarsRebaseFailFallback(t *testing.T) {
+func TestPersistDailyBarsRebaseFailurePreservesHistory(t *testing.T) {
 	setupTestDB(t)
 	cleanWideTables(t)
 	end := time.Date(2026, 7, 7, 0, 0, 0, 0, time.Local)
 	allDates := wideGenDates(200, end)
 
 	// 预埋旧基准 + states 行（done）；重拉挂掉 → 检测命中但重锚失败 →
-	// 退回旧行为写本窗，并把 states 踢回 pending 交给初始化任务自愈。
+	// 整段历史保持原样，并把 states 踢回 pending 等待完整重试，不能制造基准断层。
 	for _, b := range wideGenBars(allDates, 20.0) {
 		common.DB.Create(&model.DailyBar{Symbol: "600004", Market: "cn", TradeDate: b.TradeDate,
 			Open: b.Open, High: b.High, Low: b.Low, Close: b.Close, Volume: b.Volume, Source: "eastmoney"})
@@ -376,12 +388,14 @@ func TestPersistDailyBarsRebaseFailFallback(t *testing.T) {
 	for i := range fresh {
 		fresh[i].Source = "eastmoney"
 	}
-	svc.persistDailyBars(context.Background(), "cn", "600004", fresh)
-	// 本窗已写（尾部新基准），头部残留旧基准（断层），但 states 已标 pending。
+	if err := svc.persistDailyBars(context.Background(), "cn", "600004", fresh); err == nil {
+		t.Fatal("全量重锚失败必须向写入调用方报告失败")
+	}
+	// 尾部和头部均保持旧基准，状态标 pending 后由完整历史替换。
 	var tail model.DailyBar
 	common.DB.Where("symbol = ? AND trade_date = ?", "600004", allDates[199]).First(&tail)
-	if tail.Close != 10.0 {
-		t.Fatalf("重锚失败应退回写本窗: %+v", tail)
+	if tail.Close != 20.0 {
+		t.Fatalf("重锚失败不能局部覆盖本窗: %+v", tail)
 	}
 	if st := stateOf(t, "600004"); st.InitStatus != "pending" {
 		t.Fatalf("重锚失败应踢回 pending 自愈: %+v", st)
@@ -423,6 +437,9 @@ func TestInitMarketWideHistoryResumeAndFail(t *testing.T) {
 	}
 
 	// 续跑（无取消）：剩余全部 done，已 done 的不再重拉。
+	// 先等本次部分进度触发的因子读取结束，避免共享内存 SQLite 的表锁竞争
+	// 把“取消后续跑”用例随机变成另一类并发写入失败用例。
+	waitForTestFactorRebuilds(t)
 	fake.onBars = nil
 	before := fake.barsCalls["600011"]
 	log, err := svc.initMarketWideHistory(context.Background())

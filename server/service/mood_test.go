@@ -690,7 +690,7 @@ func TestSyncLhbAtomicReplace(t *testing.T) {
 		}
 	})
 
-	t.Run("历史日仍无机构结果可最终确认为空榜", func(t *testing.T) {
+	t.Run("历史日未就绪不能推翻已有机构证据", func(t *testing.T) {
 		seedOld(t)
 		svc := NewMoodService()
 		svc.now = func() time.Time {
@@ -703,14 +703,10 @@ func TestSyncLhbAtomicReplace(t *testing.T) {
 			return nil, datasource.ErrLhbNotReady
 		}
 		n, err := svc.SyncLhb(context.Background(), tradeDate)
-		if err != nil || n != 1 {
-			t.Fatalf("历史日可把持续无结果收口为空榜, n=%d err=%v", n, err)
+		if !errors.Is(err, datasource.ErrLhbNotReady) || n != 0 {
+			t.Fatalf("已有机构证据与未就绪响应矛盾时必须重试, n=%d err=%v", n, err)
 		}
-		var orgCount int64
-		common.DB.Model(&model.LhbOrgDaily{}).Where("trade_date = ?", tradeDate).Count(&orgCount)
-		if orgCount != 0 {
-			t.Fatalf("历史空榜应清掉旧机构数据, got %d", orgCount)
-		}
+		assertOld(t)
 	})
 }
 

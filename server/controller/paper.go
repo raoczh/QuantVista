@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"errors"
+	"io"
 	"strconv"
 
 	"quantvista/common"
@@ -80,13 +82,16 @@ func (pc *PaperController) Reset(c *gin.Context) {
 	var body struct {
 		InitialCash float64 `json:"initial_cash"`
 	}
-	_ = c.ShouldBindJSON(&body)
+	if err := c.ShouldBindJSON(&body); err != nil && !errors.Is(err, io.EOF) {
+		common.ApiErrorMsg(c, "请求格式错误，模拟账户未重置")
+		return
+	}
 	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindPaper)
 	if err != nil {
 		common.ApiErrorMsg(c, "组合不存在")
 		return
 	}
-	acc, err := pc.svc.ResetByAccount(currentUserID(c), account.ID, body.InitialCash)
+	acc, err := pc.svc.ResetByAccountContext(c.Request.Context(), currentUserID(c), account.ID, body.InitialCash)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return
@@ -102,14 +107,14 @@ func (pc *PaperController) Curve(c *gin.Context) {
 			days = n
 		}
 	}
-	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindPaper)
+	account, err := service.ResolvePortfolioAccountContext(c.Request.Context(), currentUserID(c), optionalAccountID(c), model.PortfolioKindPaper)
 	if err != nil {
 		common.ApiErrorMsg(c, "组合不存在")
 		return
 	}
-	out, err := service.PortfolioCurveByAccount(currentUserID(c), account.ID, model.SnapshotKindPaper, days)
+	out, err := service.PortfolioCurveByAccountContext(c.Request.Context(), currentUserID(c), account.ID, model.SnapshotKindPaper, days)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "资产曲线读取失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, out)

@@ -21,6 +21,7 @@ export interface Strategy {
   group?: 'rec' | 'screen' | 'template' | 'custom'
   period?: 'short' | 'swing' | 'mid'
   risk?: 'low' | 'mid' | 'high'
+  strategy_revision_id?: number
 }
 
 // 候选筛选条件（阶段②用户硬过滤；0 = 不限）。
@@ -54,6 +55,7 @@ export interface RecommendRequest {
   type: RecType
   market?: string
   strategy?: string
+  strategy_revision_id?: number
   llm_config_id?: number
   count?: number
   filters?: RecFilters // 不传 = 用偏好默认
@@ -319,6 +321,8 @@ export interface RecommendationItem {
   detail: RecDetail | null
   status: RecTracking | null
   position: RecPositionLink | null
+  // 当前活动真实账户中仍持有的一笔；position 保留历史最早一笔及其收益口径。
+  holding_position?: RecPositionLink | null
   // 同标的在持仓中、但未关联到本条推荐的记录（软匹配，仅在 position 为 null 时可能有值）。
   // 手动录入的持仓 recommendation_id=0，靠血缘查不出来，只能按代码提示用户补关联。
   unlinked_position?: RecPositionLink | null
@@ -354,6 +358,7 @@ export interface PerformanceStats {
   buy_matured: number
   buy_win_rate: number
   buy_avg_return_pct: number
+  buy_avg_max_drawdown_pct?: number
   buy_median_pct: number
   buy_avg_alpha_pct: number
   buy_bench_sample: number
@@ -400,6 +405,7 @@ export interface RecommendationBatch {
   type: RecType
   market: string
   strategy: string
+  strategy_revision_id?: number
   title?: string // 生成时由筛选条件组合固化（旧记录为空，前端回退策略名）
   status: RecStatus
   error: string
@@ -501,16 +507,17 @@ export function generateRecommendations(req: RecommendRequest) {
   return request<RecommendationView>({ url: '/recommendations', method: 'post', data: req })
 }
 
-export function listRecommendations(type?: string, limit = 30) {
+export function listRecommendations(type?: string, limit = 30, signal?: AbortSignal) {
   return request<RecommendationBatch[]>({
     url: '/recommendations',
     method: 'get',
     params: { type, limit },
+    signal,
   })
 }
 
-export function getRecommendation(id: number) {
-  return request<RecommendationView>({ url: `/recommendations/${id}`, method: 'get' })
+export function getRecommendation(id: number, signal?: AbortSignal) {
+  return request<RecommendationView>({ url: `/recommendations/${id}`, method: 'get', signal })
 }
 
 export function deleteRecommendation(id: number) {
@@ -576,6 +583,7 @@ export interface ShadowReport {
   horizon_days: number
   picked_buy: number
   picked_buy_matured: number
+  forced_excluded: number
   groups: ShadowGateGroup[] | null
   notes: string[]
 }

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/glebarez/sqlite"
+	mysqlconfig "github.com/go-sql-driver/mysql"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -58,13 +59,10 @@ func InitDB() error {
 	case strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://"):
 		return fmt.Errorf("PostgreSQL 暂未启用（仅 GORM 兼容），请使用 MySQL 或 SQLite")
 	default:
-		// MySQL：确保带 parseTime，否则 time.Time 字段扫描失败。
-		if !strings.Contains(dsn, "parseTime") {
-			if strings.Contains(dsn, "?") {
-				dsn += "&parseTime=true"
-			} else {
-				dsn += "?parseTime=true"
-			}
+		// 结构化解析选项，密码/库名含 parseTime 不能冒充已开启日期解析。
+		dsn, err = mysqlDSNWithTime(dsn)
+		if err != nil {
+			return fmt.Errorf("MySQL 连接配置无效: %w", err)
 		}
 		SysLog("使用 MySQL 作为主数据库")
 		db, err = gorm.Open(mysql.Open(dsn), gormCfg)
@@ -84,4 +82,13 @@ func InitDB() error {
 
 	DB = db
 	return nil
+}
+
+func mysqlDSNWithTime(dsn string) (string, error) {
+	config, err := mysqlconfig.ParseDSN(dsn)
+	if err != nil {
+		return "", err
+	}
+	config.ParseTime = true // GORM 的 time.Time 列需要此选项，不能接受显式 false。
+	return config.FormatDSN(), nil
 }

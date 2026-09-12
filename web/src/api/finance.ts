@@ -42,6 +42,7 @@ export interface FinanceStatementItem {
 export interface StockFinance {
   indicators: FinanceIndicatorItem[]
   statements: FinanceStatementItem[]
+  note?: string
 }
 
 export function getStockFinance(market: string, symbol: string) {

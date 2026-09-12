@@ -26,9 +26,9 @@ func labelBarsFixture() []datasource.Bar {
 
 // TestSimulateLabelHold_Fixed 固定持有期：毛/净收益与 MFE/MAE 手工验算。
 // 持有 3 交易日 = 卖出根 = 买入根(bars[1])+3 = bars[4]，收盘 11.3。
-// entry=10.00×2000 股：buyAmount=20000、佣金 5（万2.5 最低5）、cost=20005；
-// 出场 bars[4] close=11.3：sellAmount=22600、佣金 5.65+印花税 11.3（万5），
-// net=(22583.05-20005)/20005=12.89%；gross=13%；MFE=(11.5-10)/10=15%、MAE=(9.8-10)/10=-2%。
+// 预算 20000 含费用，entry=10.00×1900 股、佣金 5、cost=19005；
+// 出场 bars[4] close=11.3：sellAmount=21470、佣金 5.37+印花税 10.74，
+// net=(21453.89-19005)/19005=12.89%；gross=13%；MFE=15%、MAE=-2%。
 func TestSimulateLabelHold_Fixed(t *testing.T) {
 	out := simulateLabelHold(labelBarsFixture(), 0, "600000", "某某股份", 3, 20000, 0, 0, "", "", "")
 	if out.Status != btTraded {
@@ -815,7 +815,7 @@ func TestLabelAgeAnchorByEntryMode(t *testing.T) {
 		EntryDate: today, ActualBuyPrice: 10, SignalDate: oldSignal,
 		MaturityStatus: model.LabelPending, LabelVersion: labelVersion,
 	}
-	if changed := advanceOneLabel(fresh, mkBars(-100, 101, 10), "甲", nil, nil, today); changed {
+	if changed, err := advanceOneLabel(context.Background(), fresh, mkBars(-100, 101, 10), "甲", nil, nil, today); err != nil || changed {
 		t.Fatalf("今天新建仓的 actual 标签不得提前成熟: %+v", fresh)
 	}
 	if fresh.MaturityStatus != model.LabelPending || fresh.Forced {
@@ -829,7 +829,7 @@ func TestLabelAgeAnchorByEntryMode(t *testing.T) {
 		EntryDate: staleEntry, ActualBuyPrice: 10, SignalDate: oldSignal,
 		MaturityStatus: model.LabelPending, LabelVersion: labelVersion,
 	}
-	if changed := advanceOneLabel(stale, mkBars(-100, 3, 10), "甲", nil, nil, today); !changed {
+	if changed, err := advanceOneLabel(context.Background(), stale, mkBars(-100, 3, 10), "甲", nil, nil, today); err != nil || !changed {
 		t.Fatal("建仓日已超窗且个股停更应终结（强平或 no_data），不得永久滞留 pending")
 	}
 	if stale.MaturityStatus != model.LabelMatured || !stale.Forced {
@@ -841,7 +841,7 @@ func TestLabelAgeAnchorByEntryMode(t *testing.T) {
 		Symbol: "600100", HorizonDays: 5, EntryMode: model.EntryModeNextOpen,
 		SignalDate: oldSignal, MaturityStatus: model.LabelPending, LabelVersion: labelVersion,
 	}
-	if changed := advanceOneLabel(nextOpen, mkBars(-100, 3, 10), "甲", nil, nil, today); !changed {
+	if changed, err := advanceOneLabel(context.Background(), nextOpen, mkBars(-100, 3, 10), "甲", nil, nil, today); err != nil || !changed {
 		t.Fatal("next_open 信号日超窗应终结")
 	}
 	if nextOpen.MaturityStatus != model.LabelMatured || !nextOpen.Forced {
@@ -961,12 +961,12 @@ func TestLabelBarriersPickedVsShadow(t *testing.T) {
 	if err := common.DB.Create(&rec).Error; err != nil {
 		t.Fatalf("创建推荐失败: %v", err)
 	}
-	tp, sl := labelBarriers(&model.RecommendationLabel{RecommendationID: rec.ID})
-	if tp != 11.2 || sl != 9.4 {
+	tp, sl, err := labelBarriers(context.Background(), &model.RecommendationLabel{RecommendationID: rec.ID})
+	if err != nil || tp != 11.2 || sl != 9.4 {
 		t.Fatalf("正式推荐应读取计划障碍: tp=%v sl=%v", tp, sl)
 	}
-	shadowTP, shadowSL := labelBarriers(&model.RecommendationLabel{CandidateEventID: 99})
-	if shadowTP != 0 || shadowSL != 0 {
+	shadowTP, shadowSL, err := labelBarriers(context.Background(), &model.RecommendationLabel{CandidateEventID: 99})
+	if err != nil || shadowTP != 0 || shadowSL != 0 {
 		t.Fatalf("影子候选不得伪造计划障碍: tp=%v sl=%v", shadowTP, shadowSL)
 	}
 }
@@ -1177,7 +1177,9 @@ func TestBackfillActualLabelsResetsSettlement(t *testing.T) {
 	}
 	common.DB.Create(&seed)
 
-	backfillActualLabels()
+	if err := backfillActualLabels(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 
 	var rows []model.RecommendationLabel
 	if err := common.DB.Where("recommendation_id = ? AND entry_mode = ?", rec.ID, model.EntryModeActual).

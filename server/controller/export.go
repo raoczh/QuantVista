@@ -25,16 +25,16 @@ func (ec *ExportController) Export(c *gin.Context) {
 	kind := c.Param("kind")
 	accountID := int64(0)
 	if kind == "positions" {
-		account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+		account, err := service.ResolvePortfolioAccountContext(c.Request.Context(), currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
 		if err != nil {
 			common.ApiErrorMsg(c, "组合不存在")
 			return
 		}
 		accountID = account.ID
 	}
-	data, filename, err := ec.svc.ExportByAccount(currentUserID(c), accountID, kind)
+	data, filename, err := ec.svc.ExportByAccountContext(c.Request.Context(), currentUserID(c), accountID, kind)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "导出失败，请稍后重试"))
 		return
 	}
 	c.Header("Content-Disposition", `attachment; filename="`+filename+`"`)
@@ -62,14 +62,14 @@ func (ec *ExportController) ImportPositions(c *gin.Context) {
 		return
 	}
 	defer f.Close()
-	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+	account, err := service.ResolvePortfolioAccountContext(c.Request.Context(), currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
 	if err != nil {
 		common.ApiErrorMsg(c, "组合不存在")
 		return
 	}
-	res, err := ec.svc.ImportPositionsByAccount(currentUserID(c), account.ID, f)
+	res, err := ec.svc.ImportPositionsByAccountContext(c.Request.Context(), currentUserID(c), account.ID, f)
 	if err != nil {
-		common.ApiErrorMsg(c, err.Error())
+		common.ApiErrorMsg(c, publicWorkflowError(err, "导入失败，请稍后重试"))
 		return
 	}
 	common.ApiSuccess(c, res)

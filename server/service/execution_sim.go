@@ -1,7 +1,9 @@
 package service
 
 import (
+	"context"
 	"math"
+	"time"
 
 	"quantvista/common"
 	"quantvista/datasource"
@@ -20,7 +22,8 @@ import (
 //  5. 费率与模拟盘 tradeFee 同源（佣金万 2.5 最低 5 元 + 卖出印花税万 5）。
 //
 // 另含固定持有期 + 止盈/止损障碍的标签结算（simulateLabelHold）：障碍按当日
-// high/low 判盘中触达、T+1（买入日不判障碍）、同日双触保守取止损、障碍价成交。
+// high/low 判盘中触达、T+1（买入日不判障碍）；开盘跳过障碍按开盘成交，
+// 其余同日双触保守取止损并按障碍价成交。
 
 // holdOutcome 单标的单持有期的模拟结局。
 type holdOutcome struct {
@@ -73,7 +76,7 @@ func isOneWordLimitDown(b, prev datasource.Bar, limitPct float64) bool {
 // 与「数据未同步到」（当晚结算的新标签必然落在这里），交给调用方等待：复牌/次日
 // 数据落库后，bars[i+1] 与 nextDate 的比对自然给出 skip_suspend 或正常成交。
 func simEntry(bars []datasource.Bar, i int, symbol, name string, perCap float64, nextDate string) (buyIdx int, qty, cost float64, skip string) {
-	if i+1 >= len(bars) {
+	if i < 0 || i+1 >= len(bars) || validateAdjustedBars("cn", bars) != nil {
 		return 0, 0, 0, btPending // 信号日后暂无数据（数据未到/停牌中，等下一轮）
 	}
 	sig, buy := bars[i], bars[i+1]
@@ -89,7 +92,8 @@ func simEntry(bars []datasource.Bar, i int, symbol, name string, perCap float64,
 		return 0, 0, 0, btSkipLimitUp
 	}
 	// 五件套④：整百股取整，钱不够一手放弃。
-	qty = math.Floor(perCap/(buy.Open*100)) * 100
+	initial := int(math.Floor(perCap/(buy.Open*100))) * 100
+	qty = float64(affordableBoardLotQuantity("cn", symbol, buy.Open, perCap, initial))
 	if qty < 100 {
 		return 0, 0, 0, btSkipCash
 	}
@@ -212,7 +216,7 @@ type labelOutcome struct {
 // simulateLabelHold 标签结算：信号日下标 i 次日开盘买入，卖出根 = 买入根 + horizon
 // （买入根之后第 horizon 个交易日收盘卖出，horizon=1 即买入次日卖出，满足 A 股 T+1）；
 // takeProfit/stopLoss > 0 时启用三重障碍——自买入次日（T+1）起按当日 high/low 判盘中
-// 触达，先触者出场、同日双触保守取止损、成交按障碍价（不取更优的 high/low）。
+// 触达；开盘越过障碍时先按开盘成交，其余同日双触保守取止损、按障碍价成交。
 // 止损出场日若一字跌停按五件套③顺延。horizon 未走完且数据未覆盖返回 pending。
 // sellDate 语义同 simulateHold：市场日轴上的到期卖出日（个股停牌不拉长持有跨度，
 // 到期日停牌顺延复牌卖出）；marketLastDate 为市场轴末日（非空时个股末根 < sellDate
@@ -268,10 +272,19 @@ func simulateLabelHold(bars []datasource.Bar, i int, symbol, name string, horizo
 			if !hitSL && !hitTP {
 				continue
 			}
-			if hitSL { // 同日双触保守取止损
+			switch {
+			case stopLoss > 0 && b.Open > 0 && b.Open <= stopLoss:
+				// 跳空后障碍价可能全天不可成交，必须承受真实的开盘缺口。
+				out.HitStopLoss = true
+				exitIdx, exitPrice = k, b.Open
+			case takeProfit > 0 && b.Open > 0 && b.Open >= takeProfit:
+				// 开盘已先触止盈，不能再用稍后的日内低点假定先止损。
+				out.HitTakeProfit = true
+				exitIdx, exitPrice = k, b.Open
+			case hitSL: // 无开盘触发时，同日双触保守取止损
 				out.HitStopLoss = true
 				exitIdx, exitPrice = k, stopLoss
-			} else {
+			default:
 				out.HitTakeProfit = true
 				exitIdx, exitPrice = k, takeProfit
 			}
@@ -399,6 +412,9 @@ func excursionToExit(bars []datasource.Bar, from, exitIdx int, entry, exitPrice 
 // adjustSuspect 复权自洽校验：相邻收盘涨跌超越板块涨停幅 ×1.5（前复权序列不应出现
 // 的断层）判可疑。跳过头部 btAdjustSanityHeadSkip 根（新股上市初期无涨跌幅限制）。
 func adjustSuspect(bars []datasource.Bar, symbol, name string) bool {
+	if validateAdjustedBars("cn", bars) != nil {
+		return true
+	}
 	tol := limitUpPctFor(symbol, name) * 1.5
 	start := btAdjustSanityHeadSkip + 1
 	if start < 1 {
@@ -417,11 +433,14 @@ func adjustSuspect(bars []datasource.Bar, symbol, name string) bool {
 }
 
 // cnDailyBarsAsc 读单只 A 股的 daily_bars 全序列（升序；全市场地基每股约 250 根）。
-func cnDailyBarsAsc(symbol string) []datasource.Bar {
+func cnDailyBarsAsc(ctx context.Context, symbol string) ([]datasource.Bar, error) {
 	var rows []model.DailyBar
-	if err := common.DB.Where("market = ? AND symbol = ?", "cn", symbol).
+	if err := common.DB.WithContext(ctx).Where("market = ? AND symbol = ? AND trade_date <= ?", "cn", symbol, time.Now().In(time.Local).Format("2006-01-02")).
 		Order("trade_date").Find(&rows).Error; err != nil {
-		return nil
+		return nil, err
+	}
+	if err := validateLocalAdjustedBars("cn", rows); err != nil {
+		return nil, err
 	}
 	out := make([]datasource.Bar, 0, len(rows))
 	for _, r := range rows {
@@ -430,5 +449,5 @@ func cnDailyBarsAsc(symbol string) []datasource.Bar {
 			Volume: r.Volume, Amount: r.Amount, TurnoverRate: r.TurnoverRate, Source: r.Source,
 		})
 	}
-	return out
+	return out, nil
 }

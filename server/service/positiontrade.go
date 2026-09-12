@@ -1,8 +1,10 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -27,6 +29,34 @@ import (
 
 // positionQtyEps 数量比较容差（浮点数量；A 股最小 1 股，1e-6 足够严）。
 const positionQtyEps = 1e-6
+
+// normalizePositionNumber 先按 decimal(20,4) 的保存精度归一，再参与账本计算。
+func normalizePositionNumber(value *float64, name string, positive bool) error {
+	if math.IsNaN(*value) || math.IsInf(*value, 0) || *value < 0 || *value >= 1e16 {
+		return fmt.Errorf("%s无效或超出可保存范围", name)
+	}
+	*value = round4(*value)
+	if positive && *value <= 0 {
+		return fmt.Errorf("%s必须大于 0，精度最多为 4 位小数", name)
+	}
+	return nil
+}
+
+func normalizePositionTradeValues(price, quantity, fee, tax *float64) error {
+	for _, field := range []struct {
+		value    *float64
+		name     string
+		positive bool
+	}{{price, "成交价", true}, {quantity, "数量", true}, {fee, "费用", false}, {tax, "税费", false}} {
+		if err := normalizePositionNumber(field.value, field.name, field.positive); err != nil {
+			return err
+		}
+	}
+	if *price**quantity+*fee+*tax >= 1e16 {
+		return errors.New("成交金额超出可保存范围")
+	}
+	return nil
+}
 
 // positionLedger 持仓账本的可计算态（与 Position 的成本口径逐字段对应，抽出成纯函数
 // 便于手工验算：加权成本重算、部分卖出结转、卖超拒绝全部在此收口）。
@@ -57,6 +87,22 @@ func (l positionLedger) applyTo(p *model.Position) {
 	p.RealizedPnl, p.TotalBuyCost = l.RealizedPnl, l.TotalBuyCost
 	p.TotalSellNet, p.TotalBuyQty = l.TotalSellNet, l.TotalBuyQty
 	p.RemainingCost = l.RemainingCost
+}
+
+func validatePositionLedger(l positionLedger) error {
+	for _, field := range []struct {
+		name  string
+		value float64
+	}{
+		{"持仓均价", l.AvgCost}, {"持仓数量", l.Quantity}, {"买入费用", l.BuyFee}, {"买入税费", l.BuyTax},
+		{"累计已实现盈亏", l.RealizedPnl}, {"累计买入成本", l.TotalBuyCost}, {"累计卖出净额", l.TotalSellNet},
+		{"累计买入数量", l.TotalBuyQty}, {"剩余成本", l.RemainingCost},
+	} {
+		if math.IsNaN(field.value) || math.IsInf(field.value, 0) || math.Abs(field.value) >= 1e16 {
+			return fmt.Errorf("%s超出可保存范围", field.name)
+		}
+	}
+	return nil
 }
 
 // currentCost 返回当前仓位的金额权威。旧数据尚无 RemainingCost 时回退原口径，
@@ -91,6 +137,7 @@ func inferredRemainingCost(db *gorm.DB, p model.Position) (float64, error) {
 // 加权成本 = (原成本×原数量 + 本次价×本次数量) / 新数量——与 computeView 的
 // `Cost = BuyPrice*Quantity + BuyFee + BuyTax` 口径自洽（费税单独累加不摊进单价）。
 func ledgerBuy(l positionLedger, price, qty, fee, tax float64) (positionLedger, error) {
+	original := l
 	if price <= 0 {
 		return l, errors.New("买入价格必须大于 0")
 	}
@@ -109,6 +156,9 @@ func ledgerBuy(l positionLedger, price, qty, fee, tax float64) (positionLedger, 
 	l.TotalBuyCost = round4(l.TotalBuyCost + price*qty + fee + tax)
 	l.TotalBuyQty = round4(l.TotalBuyQty + qty)
 	l.RemainingCost = round4(currentCost + price*qty + fee + tax)
+	if err := validatePositionLedger(l); err != nil {
+		return original, err
+	}
 	return l, nil
 }
 
@@ -117,6 +167,7 @@ func ledgerBuy(l positionLedger, price, qty, fee, tax float64) (positionLedger, 
 // 卖超（数量大于当前持仓）一律拒绝——账本不允许出现负持仓。
 // 返回本笔结转的已实现盈亏。
 func ledgerSell(l positionLedger, price, qty, fee, tax float64) (positionLedger, float64, error) {
+	original := l
 	if price <= 0 {
 		return l, 0, errors.New("卖出价格必须大于 0")
 	}
@@ -145,6 +196,9 @@ func ledgerSell(l positionLedger, price, qty, fee, tax float64) (positionLedger,
 	}
 	netProceeds := price*qty - fee - tax
 	realized := round4(netProceeds - costPart)
+	if math.IsNaN(realized) || math.IsInf(realized, 0) || math.Abs(realized) >= 1e16 {
+		return original, 0, errors.New("本笔已实现盈亏超出可保存范围")
+	}
 
 	l.RealizedPnl = round4(l.RealizedPnl + realized)
 	l.TotalSellNet = round4(l.TotalSellNet + netProceeds)
@@ -158,6 +212,9 @@ func ledgerSell(l positionLedger, price, qty, fee, tax float64) (positionLedger,
 	}
 	// 加权成本不因卖出改变（卖出结转的是盈亏，不是成本）。清仓后保留最后的加权成本
 	// 供复盘展示（Quantity=0 时它不参与任何金额计算）。
+	if err := validatePositionLedger(l); err != nil {
+		return original, 0, err
+	}
 	return l, realized, nil
 }
 
@@ -192,6 +249,43 @@ func lockedPosition(tx *gorm.DB, userID, id int64, p *model.Position) error {
 		q = q.Clauses(clause.Locking{Strength: "UPDATE"})
 	}
 	return q.First(p).Error
+}
+
+// positionAccountID 必须在写事务开始前定位账户。MySQL 的普通查询会建立
+// REPEATABLE READ 快照，不能在等待账户锁之前将旧账本固定进事务读视图。
+func positionAccountID(userID, id int64) (int64, error) {
+	return positionAccountIDContext(context.Background(), userID, id)
+}
+
+func positionAccountIDContext(ctx context.Context, userID, id int64) (int64, error) {
+	if common.DB == nil {
+		return 0, errors.New("数据库不可用")
+	}
+	var scope struct{ AccountID int64 }
+	if err := common.DB.WithContext(ctx).Model(&model.Position{}).Select("account_id").Where("id = ? AND user_id = ?", id, userID).Take(&scope).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return 0, errors.New("持仓不存在")
+		}
+		return 0, errors.Join(err, ctx.Err())
+	}
+	return scope.AccountID, nil
+}
+
+// lockedWritablePosition 统一先锁账户再锁持仓，并复验事务外定位的账户。
+// 与公司行动/导入保持相同锁顺序。account_id=0 仅兼容尚未挂接的旧记录。
+func lockedWritablePosition(tx *gorm.DB, userID, id, accountID int64, p *model.Position) error {
+	if accountID > 0 {
+		if err := lockActivePortfolioAccount(tx, userID, accountID, model.PortfolioKindReal); err != nil {
+			return err
+		}
+	}
+	if err := lockedPosition(tx, userID, id, p); err != nil {
+		return err
+	}
+	if p.AccountID != accountID {
+		return errors.New("持仓账户发生变化，请刷新后重试")
+	}
+	return nil
 }
 
 func positionInAccount(userID, accountID, positionID int64) error {
@@ -297,30 +391,37 @@ func ensurePositionTradesTx(tx *gorm.DB, p *model.Position) error {
 // 也不阻断列表返回（补建只是账本自洽的补丁，不是查询的前置条件）。
 // 返回是否确有写入（调用方据此决定要不要重读，正常请求这里全命中、零写入零重读）。
 func backfillPositionLedgers(userID int64, positions []model.Position) bool {
+	return backfillPositionLedgersContext(context.Background(), userID, positions)
+}
+
+func backfillPositionLedgersContext(ctx context.Context, userID int64, positions []model.Position) bool {
 	if common.DB == nil || len(positions) == 0 {
 		return false
 	}
-	ids := make([]int64, 0, len(positions))
+	candidates := make([]model.Position, 0, len(positions))
 	for _, p := range positions {
 		if p.TotalBuyCost <= 0 ||
 			(p.Status == model.PositionStatusHolding && p.Quantity > positionQtyEps && p.RemainingCost <= 0) {
-			ids = append(ids, p.ID)
+			candidates = append(candidates, p)
 		}
 	}
-	if len(ids) == 0 {
+	if len(candidates) == 0 {
 		return false
 	}
 	wrote := false
-	for _, id := range ids {
-		err := common.DB.Transaction(func(tx *gorm.DB) error {
+	for _, candidate := range candidates {
+		if ctx.Err() != nil {
+			break
+		}
+		err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			var p model.Position
-			if err := lockedPosition(tx, userID, id, &p); err != nil {
+			if err := lockedWritablePosition(tx, userID, candidate.ID, candidate.AccountID, &p); err != nil {
 				return err
 			}
 			return ensurePositionTradesTx(tx, &p)
 		})
 		if err != nil {
-			common.SysWarn("持仓 %d 补建流水失败: %v", id, err)
+			common.SysWarn("持仓 %d 补建流水失败: %v", candidate.ID, err)
 			continue
 		}
 		wrote = true
@@ -337,26 +438,26 @@ func ensurePositionLedgersStrict(userID int64, positions []model.Position) (bool
 	if len(positions) == 0 {
 		return false, nil
 	}
-	ids := make([]int64, 0, len(positions))
+	candidates := make([]model.Position, 0, len(positions))
 	for _, p := range positions {
 		// 汇总口径已经完整的 legacy closed 记录可能没有足够字段重建明细
 		// （例如 Quantity/SellPrice 已归零），但它的 RealizedPnl/TotalBuyCost
 		// 仍可直接用于快照；只有汇总本身缺失时才要求严格补建。
 		if p.TotalBuyCost <= 0 ||
 			(p.Status == model.PositionStatusHolding && p.Quantity > positionQtyEps && p.RemainingCost <= 0) {
-			ids = append(ids, p.ID)
+			candidates = append(candidates, p)
 		}
 	}
 	wrote := false
-	for _, id := range ids {
+	for _, candidate := range candidates {
 		if err := common.DB.Transaction(func(tx *gorm.DB) error {
 			var p model.Position
-			if err := lockedPosition(tx, userID, id, &p); err != nil {
+			if err := lockedWritablePosition(tx, userID, candidate.ID, candidate.AccountID, &p); err != nil {
 				return err
 			}
 			return ensurePositionTradesTx(tx, &p)
 		}); err != nil {
-			return wrote, fmt.Errorf("持仓 %d 补建流水失败: %w", id, err)
+			return wrote, fmt.Errorf("持仓 %d 补建流水失败: %w", candidate.ID, err)
 		}
 		wrote = true
 	}
@@ -366,18 +467,25 @@ func ensurePositionLedgersStrict(userID int64, positions []model.Position) (bool
 // ListTrades 列出某持仓的流水明细（仅本人；按时间正序）。读取前惰性补建，
 // 保证「老持仓点开流水也看得到等价首笔买入」。
 func (s *PositionService) ListTrades(userID, positionID int64) ([]model.PositionTrade, error) {
+	return s.ListTradesContext(context.Background(), userID, positionID)
+}
+
+func (s *PositionService) ListTradesContext(ctx context.Context, userID, positionID int64) ([]model.PositionTrade, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
 	var p model.Position
-	if err := common.DB.Where("id = ? AND user_id = ?", positionID, userID).First(&p).Error; err != nil {
-		return nil, errors.New("持仓不存在")
+	if err := common.DB.WithContext(ctx).Where("id = ? AND user_id = ?", positionID, userID).First(&p).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("持仓不存在")
+		}
+		return nil, err
 	}
 	if p.TotalBuyCost <= 0 ||
 		(p.Status == model.PositionStatusHolding && p.Quantity > positionQtyEps && p.RemainingCost <= 0) {
-		if err := common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			var locked model.Position
-			if err := lockedPosition(tx, userID, positionID, &locked); err != nil {
+			if err := lockedWritablePosition(tx, userID, positionID, p.AccountID, &locked); err != nil {
 				return err
 			}
 			return ensurePositionTradesTx(tx, &locked)
@@ -386,7 +494,7 @@ func (s *PositionService) ListTrades(userID, positionID int64) ([]model.Position
 		}
 	}
 	var rows []model.PositionTrade
-	if err := common.DB.Where("position_id = ? AND user_id = ?", positionID, userID).
+	if err := common.DB.WithContext(ctx).Where("position_id = ? AND user_id = ?", positionID, userID).
 		Order("trade_date ASC, id ASC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -399,6 +507,10 @@ func (s *PositionService) ListTrades(userID, positionID int64) ([]model.Position
 // AddTrade 加仓 / 减仓。全流程在单事务内：行锁读持仓 → 惰性补流水 → 账本重算 →
 // 落流水 → 回写汇总。减到 0 自动置 closed 并写入复盘字段（沿用既有 Close 的维度）。
 func (s *PositionService) AddTrade(userID, positionID int64, in PositionTradeInput) (*model.Position, error) {
+	return s.AddTradeContext(context.Background(), userID, positionID, in)
+}
+
+func (s *PositionService) AddTradeContext(ctx context.Context, userID, positionID int64, in PositionTradeInput) (*model.Position, error) {
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
@@ -424,14 +536,21 @@ func (s *PositionService) AddTrade(userID, positionID int64, in PositionTradeInp
 		}
 	}
 
+	accountID, err := positionAccountIDContext(ctx, userID, positionID)
+	if err != nil {
+		return nil, err
+	}
 	var out model.Position
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
+	err = common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var p model.Position
-		if err := lockedPosition(tx, userID, positionID, &p); err != nil {
-			return errors.New("持仓不存在")
+		if err := lockedWritablePosition(tx, userID, positionID, accountID, &p); err != nil {
+			return err
 		}
 		if p.Status == model.PositionStatusClosed {
 			return errors.New("该持仓已平仓，不能再加减仓")
+		}
+		if reason := positionCurrencyIssue(p, defaultCurrencyFor(p.Market)); reason != "" {
+			return errors.New(reason)
 		}
 		// 先把旧持仓补成有流水的账本，再叠加本次操作——否则新流水会挂在一本空账上。
 		if err := ensurePositionTradesTx(tx, &p); err != nil {
@@ -442,6 +561,9 @@ func (s *PositionService) AddTrade(userID, positionID int64, in PositionTradeInp
 		}
 		if side == model.PositionTradeSell && in.closeAll {
 			in.Quantity = p.Quantity
+		}
+		if err := normalizePositionTradeValues(&in.Price, &in.Quantity, &in.Fee, &in.Tax); err != nil {
+			return err
 		}
 		var lastTrade model.PositionTrade
 		if err := tx.Where("position_id = ? AND user_id = ?", p.ID, userID).
@@ -522,6 +644,9 @@ func (s *PositionService) AddTrade(userID, positionID int64, in PositionTradeInp
 		if err := tx.Save(&p).Error; err != nil {
 			return err
 		}
+		if err := invalidatePortfolioSnapshotsTx(tx, userID, p.AccountID, in.TradeDate); err != nil {
+			return err
+		}
 		if p.Status == model.PositionStatusClosed {
 			if err := finalizePositionSellSignalsTx(tx, userID, p.ID, false); err != nil {
 				return err
@@ -531,7 +656,8 @@ func (s *PositionService) AddTrade(userID, positionID int64, in PositionTradeInp
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, ctx.Err())
 	}
+	syncActualExecutionFact(userID, out.RecommendationID)
 	return &out, nil
 }

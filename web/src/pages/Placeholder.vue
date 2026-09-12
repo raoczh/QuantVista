@@ -13,9 +13,9 @@ const title = computed(() => (route.meta.title as string) || '页面')
   <PageContainer>
     <div class="placeholder">
       <n-result
-        status="info"
+        status="404"
         :title="title"
-        description="该模块尚未实现，将随实施路线图阶段推进逐步上线（见 docs/ROADMAP.md）。"
+        description="页面不存在，地址可能已更改。可以返回首页继续查看。"
       >
         <template #footer>
           <n-button @click="router.push('/')">返回市场首页</n-button>

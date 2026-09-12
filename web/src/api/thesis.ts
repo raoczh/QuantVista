@@ -34,7 +34,11 @@ export interface ThesisCheckItem {
   quote_ok: boolean
   price: number
   change_pct: number
-  change_pct_20d: number
+  change_pct_20d: number | null
+  bars_as_of?: string
+  quote_as_of?: string
+  freshness_status?: string
+  last_price?: number
   review_due: boolean
   signals: string[]
 }
@@ -59,6 +63,6 @@ export function deleteThesisCard(id: number) {
   return request({ url: `/thesis-cards/${id}`, method: 'delete' })
 }
 
-export function checkupThesisCards() {
-  return request<ThesisCheckItem[]>({ url: '/thesis-cards/checkup', method: 'get' })
+export function checkupThesisCards(signal?: AbortSignal) {
+  return request<ThesisCheckItem[]>({ url: '/thesis-cards/checkup', method: 'get', signal })
 }

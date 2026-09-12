@@ -249,9 +249,9 @@ func TestJointEvalEndToEnd(t *testing.T) {
 	if err := common.DB.Where("`key` = ?", jointLockedReadsKey).First(&opt).Error; err != nil || !strings.Contains(opt.Value, `"count":2`) {
 		t.Fatalf("审计应持久化到 options: %+v err=%v", opt, err)
 	}
-	// 缓存只存常规视图：CachedJointEvalReport 不含锁定段指标。
-	if c := CachedJointEvalReport(); c == nil || c.IncludeLocked {
-		t.Fatalf("缓存应为常规视图: %+v", c)
+	// 锁定段不落缓存；审计次数已变化，旧常规缓存须失效或更新。
+	if c := CachedJointEvalReport(); c != nil && (c.IncludeLocked || c.LockedAudit == nil || c.LockedAudit.Count != 2) {
+		t.Fatalf("缓存不能含锁定段或旧审计次数: %+v", c)
 	}
 	// 常规视图重算后审计计数可见（提醒「已读过 N 次」）。
 	rep4, _ := RunJointEval(false)

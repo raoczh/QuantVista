@@ -191,7 +191,10 @@ func advanceSelectionOutcomes(ctx context.Context, market *MarketService, batche
 		return stats, errors.New("数据库不可用")
 	}
 	today := now.In(time.Local).Format("2006-01-02")
-	axis, benchClose, _ := NewBacktestService(market).marketAxis(ctx, today)
+	axis, benchClose, _, err := NewBacktestService(market).marketAxis(ctx, today)
+	if err != nil {
+		return stats, err
+	}
 	marketLast := ""
 	if len(axis) > 0 {
 		marketLast = axis[len(axis)-1]
@@ -206,6 +209,7 @@ func advanceSelectionOutcomes(ctx context.Context, market *MarketService, batche
 		existingByKey[selectionOutcomeKey(row.BatchID, row.Symbol, row.HorizonDays)] = row
 	}
 	barsBySymbol := map[string][]datasource.Bar{}
+	unadjustedSymbols := map[string]bool{}
 	for _, bf := range batches {
 		if ctx.Err() != nil {
 			return stats, ctx.Err()
@@ -214,9 +218,20 @@ func advanceSelectionOutcomes(ctx context.Context, market *MarketService, batche
 			continue
 		}
 		for _, ev := range bf.Opportunity {
+			if unadjustedSymbols[ev.Symbol] {
+				continue
+			}
 			bars, ok := barsBySymbol[ev.Symbol]
 			if !ok {
-				bars = cnDailyBarsAsc(ev.Symbol)
+				var err error
+				bars, err = cnDailyBarsAsc(ctx, ev.Symbol)
+				if err != nil {
+					if errors.Is(err, errUnadjustedBars) {
+						unadjustedSymbols[ev.Symbol] = true
+						continue
+					}
+					return stats, err
+				}
 				barsBySymbol[ev.Symbol] = bars
 			}
 			for _, horizon := range model.SelectionOutcomeHorizons {
@@ -248,6 +263,9 @@ func advanceSelectionOutcomes(ctx context.Context, market *MarketService, batche
 				existingByKey[key] = row
 			}
 		}
+	}
+	if len(unadjustedSymbols) > 0 {
+		return stats, errUnadjustedBars
 	}
 	return stats, nil
 }

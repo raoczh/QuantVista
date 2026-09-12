@@ -109,6 +109,9 @@ func emRateLimited(ctx context.Context, err error, status int) bool {
 // get 东财 push2 族请求统一入口：降级改写 + 备用域重试 + 熔断快速失败。
 // 非 push2 族 URL 直连（datacenter/公告等有各自的限流治理）。
 func (e *EastMoneyAdapter) get(ctx context.Context, rawURL string, headers map[string]string) ([]byte, int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
 	u, perr := url.Parse(rawURL)
 	if perr != nil {
 		return nil, 0, perr
@@ -125,6 +128,9 @@ func (e *EastMoneyAdapter) get(ctx context.Context, rawURL string, headers map[s
 		rawURL = u.String()
 	}
 	body, status, err := e.fetch(ctx, rawURL, headers)
+	if canceled := ctx.Err(); canceled != nil {
+		return body, status, canceled
+	}
 	if !emRateLimited(ctx, err, status) {
 		e.br.success(family)
 		return body, status, err
@@ -133,6 +139,9 @@ func (e *EastMoneyAdapter) get(ctx context.Context, rawURL string, headers map[s
 	if hasBackup && !e.br.isDegraded(family) {
 		u.Host = emBackupHost
 		b2, s2, e2 := e.fetch(ctx, u.String(), headers)
+		if canceled := ctx.Err(); canceled != nil {
+			return b2, s2, canceled
+		}
 		if !emRateLimited(ctx, e2, s2) {
 			e.br.degrade(family)
 			return b2, s2, e2

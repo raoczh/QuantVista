@@ -2,6 +2,8 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -152,24 +154,24 @@ func sameMainline(a, b reportEvent) bool {
 }
 
 // buildTodayEvents 当日事件流水线（DB 读 + 纯规则）。date 为 2006-01-02。
-func buildTodayEvents(date string) []reportEvent {
+func buildTodayEvents(date string) ([]reportEvent, error) {
 	return buildTodayEventsAt(date, time.Now())
 }
 
-func buildTodayEventsAt(date string, now time.Time) []reportEvent {
+func buildTodayEventsAt(date string, now time.Time) ([]reportEvent, error) {
 	if common.DB == nil {
-		return nil
+		return nil, errors.New("数据库不可用")
 	}
 	dayStart, err := time.ParseInLocation("2006-01-02", date, time.Local)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	dayEnd := dayStart.Add(24 * time.Hour)
 	if now.Before(dayEnd) {
 		dayEnd = now
 	}
 	if !dayEnd.After(dayStart) {
-		return nil
+		return nil, nil
 	}
 	var rows []model.News
 	if err := common.DB.
@@ -177,9 +179,9 @@ func buildTodayEventsAt(date string, now time.Time) []reportEvent {
 		Where("category IN ? AND publish_time >= ? AND publish_time < ?",
 			[]string{"telegraph", "flash"}, dayStart, dayEnd).
 		Order("publish_time DESC").Limit(300).Find(&rows).Error; err != nil {
-		return nil
+		return nil, err
 	}
-	return selectReportEvents(rows)
+	return selectReportEvents(rows), nil
 }
 
 // selectReportEvents 4 步硬规则（纯函数，可测）：降噪 → 打分 → 同主线合并 → Top N。
@@ -226,13 +228,7 @@ func selectReportEvents(rows []model.News) []reportEvent {
 	}
 
 	// ④按分排序截断 Top N（稳定：同分保持时间序）。
-	for i := 0; i < len(merged); i++ {
-		for j := i + 1; j < len(merged); j++ {
-			if merged[j].Score > merged[i].Score {
-				merged[i], merged[j] = merged[j], merged[i]
-			}
-		}
-	}
+	sort.SliceStable(merged, func(i, j int) bool { return merged[i].Score > merged[j].Score })
 	if len(merged) > eventTopN {
 		merged = merged[:eventTopN]
 	}

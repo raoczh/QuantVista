@@ -43,6 +43,10 @@ type emAnnResp struct {
 
 // GetEMAnnouncements 拉取单只 A 股的最新公告一页（按时间倒序）。
 func GetEMAnnouncements(ctx context.Context, symbol string, pageSize int) ([]EMAnnouncement, error) {
+	symbol = strings.TrimSpace(symbol)
+	if !isSixDigitSymbol(symbol) {
+		return nil, ErrSymbolInvalid
+	}
 	if pageSize <= 0 || pageSize > 100 {
 		pageSize = 30
 	}
@@ -70,7 +74,7 @@ func GetEMAnnouncements(ctx context.Context, symbol string, pageSize int) ([]EMA
 		}
 		nd, perr := time.ParseInLocation("2006-01-02 15:04:05", r.NoticeDate, loc)
 		if perr != nil {
-			nd = time.Now()
+			continue // 日期未知不能伪造为今天，否则旧公告会参与当日事件判断。
 		}
 		a := EMAnnouncement{
 			ArtCode:    r.ArtCode,

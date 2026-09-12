@@ -2,8 +2,9 @@
 deploy/.env
 deploy/docker-compose.yml
 *.env
-!*.env.example
 .env
+.env.*
+!*.env.example
 
 # ===== Go 后端 =====
 server/quantvista
@@ -12,6 +13,8 @@ server/data/
 server/logs/
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 
 # ===== 前端 =====
 web/node_modules/

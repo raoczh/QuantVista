@@ -176,13 +176,12 @@ func TestQaBuildMessagesLayeredFlagOff(t *testing.T) {
 	if strings.Contains(turnOff, "【历史会话分层上下文】") {
 		t.Fatalf("flag 关不得含分层段: %q", turnOff)
 	}
-	// 逐字节等价锁定：flag 关时本轮 user 段就是纯问题（与 q13 一致）；flag 开时
-	// 去掉分层段与分界头后与之相同。
-	if turnOff != "新问题" {
-		t.Fatalf("flag 关本轮 user 段应为纯问题: %q", turnOff)
+	// 分层开关不影响行情未知的限制；末尾问题保持一致。
+	if !strings.HasSuffix(turnOff, "【本轮问题】新问题") || !strings.Contains(turnOff, "历史数据解释") {
+		t.Fatalf("flag 关仍须保留时效声明与本轮问题: %q", turnOff)
 	}
 	if i := strings.LastIndex(turnOn, "【本轮问题】"); i < 0 ||
-		turnOn[i+len("【本轮问题】"):] != turnOff {
+		turnOn[i+len("【本轮问题】"):] != "新问题" {
 		t.Fatalf("flag 开去掉前置段后应与 flag 关一致: %q", turnOn)
 	}
 	if len(msgsOn) != len(msgsOff) || len(msgsOff) != 1+qaHistoryLimit+1 {

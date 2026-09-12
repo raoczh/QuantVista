@@ -262,7 +262,10 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 	if err != nil {
 		return nil, err
 	}
-	axis, benchClose, benchNote := s.marketAxis(ctx, freshDate)
+	axis, benchClose, benchNote, err := s.marketAxis(ctx, freshDate)
+	if err != nil {
+		return nil, err
+	}
 	if len(axis) < maxHold+3 {
 		return nil, errors.New("交易日轴数据不足（基准指数与交易日历均不可用或过短），无法回测")
 	}
@@ -290,7 +293,13 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 	// #8① ST as-of（防幸存者偏差）：优先宇宙快照（S0-3）按信号日判定——后来才变 ST 的
 	// 股票不得在其健康期历史信号日被剔除；快照未覆盖的信号日回退当前名称并 Notes 声明。
 	// 与 walkforward.go 同款（每信号日一次快照查询，非逐股，共 len(signalDates) 次）。
-	stByDate := universeSTByDates(signalDates)
+	stByDate := map[string]map[string]bool{}
+	if !req.IncludeST {
+		stByDate, err = universeSTByDates(ctx, signalDates)
+		if err != nil {
+			return nil, err
+		}
+	}
 	stFallback := len(stByDate) < len(signalDates)
 
 	withChip := treeUsesChipFactor(tree)
@@ -305,7 +314,7 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 	// (symbol, market, trade_date)，market 挡在中间，等值条件在中列时 MySQL 无法用它
 	// 满足排序。线上 EXPLAIN 实测正是走 idx_bar_market_date + Using filesort 排 27 万行，
 	// 单次 4~9 秒，为此才补了 idx_market_symbol_date。
-	rows, err := common.DB.Model(&model.DailyBar{}).
+	rows, err := common.DB.WithContext(ctx).Model(&model.DailyBar{}).
 		Select(dailyBarScanCols).
 		Where("market = ?", "cn").
 		Order("symbol, trade_date").Rows()
@@ -383,7 +392,7 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 					}
 					cand := btCandidate{
 						Symbol: j.symbol, Name: meta.Name, SignalDate: d,
-						AmountYi: round2(j.bars[i].Amount / 1e8),
+						AmountYi: j.bars[i].Amount / 1e8,
 						Holds:    make(map[int]holdOutcome, len(holds)),
 					}
 					for _, h := range holds {
@@ -421,10 +430,10 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 			scanErr = ctx.Err()
 			break
 		}
-		var sym, td string
+		var sym, td, source string
 		var open, high, low, closeP, amount, turnover float64
 		var volume int64
-		if err := rows.Scan(&sym, &td, &open, &high, &low, &closeP, &volume, &amount, &turnover); err != nil {
+		if err := rows.Scan(&sym, &td, &open, &high, &low, &closeP, &volume, &amount, &turnover, &source); err != nil {
 			scanErr = err
 			break
 		}
@@ -435,7 +444,7 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 		}
 		cur = append(cur, datasource.Bar{
 			TradeDate: td, Open: open, High: high, Low: low, Close: closeP,
-			Volume: volume, Amount: amount, TurnoverRate: turnover,
+			Volume: volume, Amount: amount, TurnoverRate: turnover, Source: source,
 		})
 	}
 	if scanErr == nil {
@@ -490,8 +499,14 @@ func (s *BacktestService) Run(ctx context.Context, userID int64, req BacktestReq
 
 // marketAxis 市场交易日轴 + 基准收盘 map。优先上证基准日线（指数不停牌，天然完整
 // 日历 + 基准价一石二鸟）；基准不可得时回退 trading_calendar（此时无 alpha）。
-func (s *BacktestService) marketAxis(ctx context.Context, freshDate string) (axis []string, benchClose map[string]float64, note string) {
+func (s *BacktestService) marketAxis(ctx context.Context, freshDate string) (axis []string, benchClose map[string]float64, note string, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, "", err
+	}
 	bench := s.fetchBench(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, nil, "", err
+	}
 	benchClose = make(map[string]float64, len(bench))
 	for _, b := range bench {
 		if b.TradeDate <= freshDate && b.Close > 0 {
@@ -501,17 +516,20 @@ func (s *BacktestService) marketAxis(ctx context.Context, freshDate string) (axi
 	}
 	sort.Strings(axis)
 	if len(axis) > 0 {
-		return axis, benchClose, ""
+		return axis, benchClose, "", nil
 	}
 	// 回退：交易日历（alpha 缺失如实声明）。
 	var dates []string
-	common.DB.Model(&model.TradingCalendar{}).
+	if err := common.DB.WithContext(ctx).Model(&model.TradingCalendar{}).
 		Where("market = ? AND is_open = ? AND trade_date <= ?", "cn", true, freshDate).
-		Order("trade_date").Pluck("trade_date", &dates)
+		Order("trade_date").Pluck("trade_date", &dates).Error; err != nil {
+		// 读取失败不是日历为空，不能触发按个股 K 线数推进的兼容结算。
+		return nil, nil, "", fmt.Errorf("读取交易日历失败: %w", err)
+	}
 	if len(dates) > wideBarLimit {
 		dates = dates[len(dates)-wideBarLimit:]
 	}
-	return dates, benchClose, "基准指数数据不可得，本次回测无基准对比（alpha 缺失）"
+	return dates, benchClose, "基准指数数据不可得，本次回测无基准对比（alpha 缺失）", nil
 }
 
 func (s *BacktestService) fetchBench(ctx context.Context) []datasource.Bar {
@@ -584,7 +602,12 @@ func (s *BacktestService) aggregate(tree *CondNode, name string, cands []btCandi
 	for _, d := range signalDates {
 		list := byDay[d]
 		dayMatched[d] = len(list)
-		sort.Slice(list, func(a, b int) bool { return list[a].AmountYi > list[b].AmountYi })
+		sort.Slice(list, func(a, b int) bool {
+			if list[a].AmountYi != list[b].AmountYi {
+				return list[a].AmountYi > list[b].AmountYi
+			}
+			return list[a].Symbol < list[b].Symbol
+		})
 		if len(list) > topPerDay {
 			list = list[:topPerDay]
 		}
@@ -826,7 +849,7 @@ func alphaBucketLabel(i int) string {
 	case 0:
 		return "<-10%"
 	case len(alphaBucketEdges):
-		return ">+10%"
+		return "≥+10%"
 	default:
 		lo, hi := alphaBucketEdges[i-1], alphaBucketEdges[i]
 		return fmt.Sprintf("%+.0f%%~%+.0f%%", lo, hi)
@@ -845,6 +868,12 @@ func alphaBucketIndex(a float64) int {
 // BatchBacktest 把历史推荐批次的 picks 当「策略」跑同一套持有期引擎，输出 alpha 分布。
 // 与前向追踪（tracking.go）互补：追踪看「到今天为止」，回验看「固定持有期的既成事实」。
 func (s *BacktestService) BatchBacktest(ctx context.Context, userID int64, req BatchBacktestRequest) (*BatchBacktestResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if req.BatchID < 0 {
+		return nil, errors.New("推荐批次编号无效")
+	}
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
@@ -855,7 +884,7 @@ func (s *BacktestService) BatchBacktest(ctx context.Context, userID int64, req B
 	perCap = math.Min(math.Max(perCap, btMinPerCap), btMaxPerCap)
 
 	var batches []model.RecommendationBatch
-	q := common.DB.Where("user_id = ? AND status = ?", userID, model.RecStatusSuccess)
+	q := common.DB.WithContext(ctx).Where("user_id = ? AND status = ?", userID, model.RecStatusSuccess)
 	if req.BatchID > 0 {
 		q = q.Where("id = ?", req.BatchID)
 	} else {
@@ -867,17 +896,40 @@ func (s *BacktestService) BatchBacktest(ctx context.Context, userID int64, req B
 	if len(batches) == 0 {
 		return nil, errors.New("没有可回验的推荐批次")
 	}
+	excludedMarkets := 0
+	eligible := batches[:0]
+	for _, batch := range batches {
+		market := strings.ToLower(strings.TrimSpace(batch.Market))
+		if market != "" && market != "cn" {
+			if req.BatchID > 0 {
+				return nil, errors.New("推荐批次回验目前只支持 A 股，该批次市场暂不支持")
+			}
+			excludedMarkets++
+			continue
+		}
+		eligible = append(eligible, batch)
+	}
+	batches = eligible
+	if len(batches) == 0 {
+		return nil, errors.New("没有可回验的 A 股推荐批次")
+	}
 
 	holds := []int{5, 10, 20}
 	// 市场日轴 + 基准收盘（基准优先、回退日历）：轴供「推荐日次日停牌判 skip_suspend」
 	// 与「到期日按市场交易日定位」（个股中途停牌不拉长持有跨度），与标签结算同口径。
-	axis, benchClose, _ := s.marketAxis(ctx, time.Now().Format("2006-01-02"))
+	axis, benchClose, _, err := s.marketAxis(ctx, time.Now().Format("2006-01-02"))
+	if err != nil {
+		return nil, err
+	}
 	marketLast := ""
 	if len(axis) > 0 {
 		marketLast = axis[len(axis)-1] // 市场轴末日：区分个股退市/长停与真未成熟
 	}
 
 	res := &BatchBacktestResult{Batches: len(batches)}
+	if excludedMarkets > 0 {
+		res.Notes = append(res.Notes, fmt.Sprintf("本次仅回验 A 股，已排除 %d 个非 A 股推荐批次", excludedMarkets))
+	}
 	type acc struct {
 		trades, pending, skipped, noData, alphaSample int
 		forced                                        int
@@ -892,19 +944,26 @@ func (s *BacktestService) BatchBacktest(ctx context.Context, userID int64, req B
 
 	for _, b := range batches {
 		var recs []model.Recommendation
-		if err := common.DB.Where("batch_id = ? AND user_id = ?", b.ID, b.UserID).
+		if err := common.DB.WithContext(ctx).Where("batch_id = ? AND user_id = ?", b.ID, b.UserID).
 			Order("sort_order").Find(&recs).Error; err != nil {
-			continue
+			return nil, err
 		}
 		recDate := b.CreatedAt.In(time.Local).Format("2006-01-02")
 		for _, rec := range recs {
+			market := strings.ToLower(strings.TrimSpace(rec.Market))
+			if market != "" && market != "cn" {
+				return nil, fmt.Errorf("批次 #%d 包含非 A 股条目，请核对批次市场后再回验", b.ID)
+			}
 			res.Picks++
 			row := BatchPickRow{
 				BatchID: b.ID, BatchTitle: b.Title, Type: b.Type,
 				Symbol: rec.Symbol, Name: rec.Name, Action: rec.Action,
 				Holds: map[string]BatchHoldCell{},
 			}
-			bars := cnDailyBarsAsc(rec.Symbol)
+			bars, err := cnDailyBarsAsc(ctx, rec.Symbol)
+			if err != nil {
+				return nil, err
+			}
 			// 信号根：推荐日当日（盘中/收盘后生成都算当日信号）或其前最近一根。
 			i := -1
 			for k := len(bars) - 1; k >= 0; k-- {
@@ -988,6 +1047,9 @@ func (s *BacktestService) BatchBacktest(ctx context.Context, userID int64, req B
 		"pending=持有期尚未走完；skipped=一字板买不进/停牌/拨款不足一手",
 		"forced=顺延到末根或退市/长停按末根收盘强平，真实中卖不出、收益偏保守，单列剔除不进胜率/均值/alpha",
 	)
+	if len(res.Rows) < res.Picks {
+		res.Notes = append(res.Notes, fmt.Sprintf("明细仅展示前 %d 条，统计包含全部 %d 条推荐", len(res.Rows), res.Picks))
+	}
 	if len(benchClose) == 0 {
 		res.Notes = append(res.Notes, "基准指数数据不可得，本次回验无 alpha")
 	}

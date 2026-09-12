@@ -45,14 +45,14 @@ func TestMobileStateConsumedOnce(t *testing.T) {
 func TestMobileExchangeReplay(t *testing.T) {
 	setupTestDB(t)
 	svc := NewAuthService()
-	user := &model.User{Username: "mob_replay", Role: model.RoleUser, Status: model.StatusEnabled}
+	user := &model.User{Username: "mob_replay", GithubID: "123", Role: model.RoleUser, Status: model.StatusEnabled}
 	if err := common.DB.Create(user).Error; err != nil {
 		t.Fatalf("建用户失败: %v", err)
 	}
 
 	verifier := strings.Repeat("a", 64)
 	authCode := "test-auth-code-replay"
-	rec, _ := json.Marshal(mobileCodeRecord{UserID: user.ID, Challenge: pkceChallengeS256(verifier)})
+	rec, _ := json.Marshal(mobileCodeRecord{UserID: user.ID, Challenge: pkceChallengeS256(verifier), TokenVersion: user.TokenVersion, GithubID: user.GithubID})
 	storeOnce("mcode:"+authCode, string(rec), mobileAuthCodeTTL)
 
 	pair, err := svc.MobileGitHubExchange(authCode, verifier, "ua-test")
@@ -78,14 +78,14 @@ func TestMobileExchangeReplay(t *testing.T) {
 func TestMobileExchangeWrongVerifier(t *testing.T) {
 	setupTestDB(t)
 	svc := NewAuthService()
-	user := &model.User{Username: "mob_pkce", Role: model.RoleUser, Status: model.StatusEnabled}
+	user := &model.User{Username: "mob_pkce", GithubID: "456", Role: model.RoleUser, Status: model.StatusEnabled}
 	if err := common.DB.Create(user).Error; err != nil {
 		t.Fatalf("建用户失败: %v", err)
 	}
 
 	verifier := strings.Repeat("b", 43)
 	authCode := "test-auth-code-pkce"
-	rec, _ := json.Marshal(mobileCodeRecord{UserID: user.ID, Challenge: pkceChallengeS256(verifier)})
+	rec, _ := json.Marshal(mobileCodeRecord{UserID: user.ID, Challenge: pkceChallengeS256(verifier), TokenVersion: user.TokenVersion, GithubID: user.GithubID})
 	storeOnce("mcode:"+authCode, string(rec), mobileAuthCodeTTL)
 
 	if _, err := svc.MobileGitHubExchange(authCode, strings.Repeat("c", 43), "ua-test"); err == nil {
@@ -116,5 +116,33 @@ func TestTTLStoreExpiryAndAtomicity(t *testing.T) {
 	}
 	if _, ok := s.consume("k2"); ok {
 		t.Fatalf("同一条目二次消费应失败")
+	}
+}
+
+func TestMobileExchangeRejectsChangedAuthState(t *testing.T) {
+	setupTestDB(t)
+	for index, field := range []string{"token_version", "github_id"} {
+		t.Run(field, func(t *testing.T) {
+			user := model.User{Username: "mobile-state-" + field, GithubID: "github-" + field, Password: "set",
+				Role: model.RoleUser, Status: model.StatusEnabled}
+			if err := common.DB.Create(&user).Error; err != nil {
+				t.Fatal(err)
+			}
+			verifier := strings.Repeat("r", 43)
+			raw, _ := json.Marshal(map[string]any{"user_id": user.ID, "challenge": pkceChallengeS256(verifier),
+				"token_version": user.TokenVersion, "github_id": user.GithubID})
+			code := "review-mobile-state-" + field
+			storeOnce("mcode:"+code, string(raw), mobileAuthCodeTTL)
+			var value any = nil
+			if index == 0 {
+				value = user.TokenVersion + 1
+			}
+			if err := common.DB.Model(&user).UpdateColumn(field, value).Error; err != nil {
+				t.Fatal(err)
+			}
+			if _, err := NewAuthService().MobileGitHubExchange(code, verifier, "review"); err == nil {
+				t.Fatal("短码不能跨越改密或 GitHub 解绑继续签发新会话")
+			}
+		})
 	}
 }

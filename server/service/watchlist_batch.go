@@ -1,12 +1,12 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"quantvista/common"
@@ -18,7 +18,7 @@ import (
 
 const watchlistBatchMaxItems = 100
 
-var watchlistBatchMu sync.Mutex
+var watchlistBatchMu jobCreateLock
 
 type WatchlistBatchRequest struct {
 	GroupID int64    `json:"group_id"`
@@ -101,25 +101,28 @@ func watchlistBatchRequestHash(resultID, groupID int64, symbols []string) string
 	return hashBytes(b)
 }
 
-func loadSuccessfulScanResult(userID, resultID int64) (*ScanResult, error) {
-	view, err := GetStrategyRun(userID, JobKindScreenerScan, resultID)
+func loadSuccessfulScanResult(userID, resultID int64, contexts ...context.Context) (*ScanResult, error) {
+	view, err := GetStrategyRun(userID, JobKindScreenerScan, resultID, contexts...)
 	if err != nil {
-		return nil, errors.New("扫描结果不存在")
+		return nil, err
 	}
 	if view.Status != model.JobStatusSuccess || len(view.Result) == 0 {
 		return nil, errors.New("扫描结果尚未成功完成")
 	}
-	var result ScanResult
-	if err := json.Unmarshal(view.Result, &result); err != nil {
+	var result *ScanResult
+	if err := json.Unmarshal(view.Result, &result); err != nil || result == nil {
 		return nil, errors.New("扫描结果无法读取")
 	}
-	return &result, nil
+	return result, nil
 }
 
 func loadWatchlistBatch(tx *gorm.DB, userID int64, batchID string) (*WatchlistBatchView, error) {
 	var batch model.WatchlistBatch
 	if err := tx.Where("id = ? AND user_id = ?", batchID, userID).First(&batch).Error; err != nil {
-		return nil, errors.New("批量操作记录不存在")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errors.New("批量操作记录不存在")
+		}
+		return nil, err
 	}
 	var items []model.WatchlistBatchItem
 	if err := tx.Where("batch_id = ? AND user_id = ?", batch.ID, userID).Order("id").Find(&items).Error; err != nil {
@@ -131,16 +134,26 @@ func loadWatchlistBatch(tx *gorm.DB, userID int64, batchID string) (*WatchlistBa
 	return &WatchlistBatchView{WatchlistBatch: batch, Items: items}, nil
 }
 
-func GetWatchlistBatch(userID int64, batchID string) (*WatchlistBatchView, error) {
+func GetWatchlistBatch(userID int64, batchID string, contexts ...context.Context) (*WatchlistBatchView, error) {
 	if common.DB == nil || userID <= 0 || strings.TrimSpace(batchID) == "" {
 		return nil, errors.New("批量操作记录不存在")
 	}
-	return loadWatchlistBatch(common.DB, userID, strings.TrimSpace(batchID))
+	var view *WatchlistBatchView
+	err := readSnapshotTx(watchlistRequestContext(contexts...), func(tx *gorm.DB) error {
+		var err error
+		view, err = loadWatchlistBatch(tx, userID, strings.TrimSpace(batchID))
+		return err
+	})
+	return view, err
 }
 
 // CreateWatchlistBatch 把当前用户某次成功扫描的选中结果加入本人分组。全部业务写入
 // 与逐项审计在一个事务内完成；不在结果中的代码作为逐项失败保存，不信任前端名称。
-func CreateWatchlistBatch(userID, resultID int64, req WatchlistBatchRequest) (*WatchlistBatchView, error) {
+func CreateWatchlistBatch(userID, resultID int64, req WatchlistBatchRequest, contexts ...context.Context) (*WatchlistBatchView, error) {
+	ctx := watchlistRequestContext(contexts...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if common.DB == nil || userID <= 0 || resultID <= 0 {
 		return nil, errors.New("扫描结果不存在")
 	}
@@ -151,7 +164,7 @@ func CreateWatchlistBatch(userID, resultID int64, req WatchlistBatchRequest) (*W
 	if err != nil {
 		return nil, err
 	}
-	scan, err := loadSuccessfulScanResult(userID, resultID)
+	scan, err := loadSuccessfulScanResult(userID, resultID, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +174,9 @@ func CreateWatchlistBatch(userID, resultID int64, req WatchlistBatchRequest) (*W
 	}
 	requestHash := watchlistBatchRequestHash(resultID, req.GroupID, symbols)
 
-	watchlistBatchMu.Lock()
+	if err := watchlistBatchMu.Lock(ctx); err != nil {
+		return nil, err
+	}
 	defer watchlistBatchMu.Unlock()
 
 	batchID, err := newImportID()
@@ -173,10 +188,9 @@ func CreateWatchlistBatch(userID, resultID int64, req WatchlistBatchRequest) (*W
 		RequestHash: requestHash, Status: model.WatchlistBatchApplied, Requested: len(symbols),
 	}
 	var view *WatchlistBatchView
-	err = common.DB.Transaction(func(tx *gorm.DB) error {
-		var group model.Watchlist
-		if err := tx.Where("id = ? AND user_id = ?", req.GroupID, userID).First(&group).Error; err != nil {
-			return errors.New("自选分组不存在")
+	err = common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := lockedWatchlistGroup(tx, userID, req.GroupID); err != nil {
+			return err
 		}
 		created := tx.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "user_id"}, {Name: "request_hash"}},
@@ -290,22 +304,31 @@ func CreateWatchlistBatch(userID, resultID int64, req WatchlistBatchRequest) (*W
 
 // UndoWatchlistBatch 只删除本批实际创建且此后未发生任何更新的条目。已有项和失败项
 // 永不受影响；任何缺失、移动、备注或阶段修改都转为逐项冲突并保留业务数据。
-func UndoWatchlistBatch(userID int64, batchID string) (*WatchlistBatchView, error) {
+func UndoWatchlistBatch(userID int64, batchID string, contexts ...context.Context) (*WatchlistBatchView, error) {
+	ctx := watchlistRequestContext(contexts...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if common.DB == nil || userID <= 0 || strings.TrimSpace(batchID) == "" {
 		return nil, errors.New("批量操作记录不存在")
 	}
-	watchlistBatchMu.Lock()
+	if err := watchlistBatchMu.Lock(ctx); err != nil {
+		return nil, err
+	}
 	defer watchlistBatchMu.Unlock()
 
 	var view *WatchlistBatchView
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
+	err := common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var lockedBatch model.WatchlistBatch
 		query := tx.Where("id = ? AND user_id = ?", strings.TrimSpace(batchID), userID)
 		if !common.UsingSQLite {
 			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
 		}
 		if err := query.First(&lockedBatch).Error; err != nil {
-			return errors.New("批量操作记录不存在")
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("批量操作记录不存在")
+			}
+			return err
 		}
 		current, err := loadWatchlistBatch(tx, userID, strings.TrimSpace(batchID))
 		if err != nil {
@@ -335,6 +358,9 @@ func UndoWatchlistBatch(userID int64, batchID string) (*WatchlistBatchView, erro
 				query = query.Clauses(clause.Locking{Strength: "UPDATE"})
 			}
 			err := query.First(&item).Error
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
 			if err != nil {
 				fact.Status = model.WatchlistBatchItemConflict
 				fact.ErrorCode = "item_missing"

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -169,7 +170,7 @@ func verifyEvidenceLabeled(sections []evidenceSection, vals []labeledValue) *evi
 				continue
 			}
 			it := &evidenceItem{
-				Raw: tok, Value: round2(scaled), Unit: unitNorm, Direction: dir,
+				Raw: tok, Value: finiteOrZero(scaled), Unit: unitNorm, Direction: dir,
 				Module: sec.Module, Count: 1,
 				Sentence: sentenceAround(text, loc[0], loc[1]),
 			}
@@ -250,8 +251,8 @@ func matchLabeled(it *evidenceItem, cands []float64, dir string, vals []labeledV
 	fill := func(v labeledValue, tol float64) {
 		it.Matched = true
 		it.Path = v.Path
-		it.SnapValue = round2(v.Value)
-		it.Tolerance = round2(tol)
+		it.SnapValue = finiteOrZero(v.Value)
+		it.Tolerance = finiteOrZero(tol)
 		it.AsOf = v.AsOf
 		it.Source = v.Source
 		it.Origin = v.Origin
@@ -299,7 +300,7 @@ func matchLabeled(it *evidenceItem, cands []float64, dir string, vals []labeledV
 	if oppo != nil {
 		it.Reason = "direction_mismatch"
 		it.Path = oppo.Path
-		it.SnapValue = round2(oppo.Value)
+		it.SnapValue = finiteOrZero(oppo.Value)
 	} else {
 		it.Reason = "not_found"
 	}
@@ -438,7 +439,13 @@ func snapshotLabeledValues(snapshot any, hints *snapshotHints, exclude ...string
 	walk = func(node any, path string) {
 		switch t := node.(type) {
 		case map[string]any:
-			for k, v := range t {
+			// 匹配保留首个合格字段，因此遍历顺序必须稳定，才能重现冻结快照的证据出处。
+			keys := make([]string, 0, len(t))
+			for k := range t {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
 				if skip[k] {
 					continue
 				}
@@ -446,7 +453,7 @@ func snapshotLabeledValues(snapshot any, hints *snapshotHints, exclude ...string
 				if path != "" {
 					child = path + "." + k
 				}
-				walk(v, child)
+				walk(t[k], child)
 			}
 		case []any:
 			for i, v := range t {
@@ -514,15 +521,31 @@ func textLabeledValues(label, origin string, texts []string) []labeledValue {
 // 对落库旧快照同样成立；quote/valuation 的 source 从快照自身元数据读取。
 func stockFieldHints(snap map[string]any) *snapshotHints {
 	h := &snapshotHints{asOf: map[string]string{}, source: map[string]string{}}
-	if s, ok := snap["quote_as_of"].(string); ok && s != "" {
-		h.asOf["quote."] = s
+	quote, _ := snap["quote"].(map[string]any)
+	quoteAsOf, _ := snap["quote_as_of"].(string)
+	if quoteAsOf == "" {
+		quoteAsOf, _ = quote["data_time"].(string)
 	}
-	if s, ok := snap["bars_as_of"].(string); ok && s != "" {
-		h.asOf["technicals."] = s
-		h.asOf["quant_score."] = s
+	if quoteAsOf == "" {
+		quoteAsOf, _ = quote["trade_date"].(string)
 	}
-	if s, ok := snap["quote_source"].(string); ok && s != "" {
-		h.source["quote."] = s
+	if quoteAsOf != "" {
+		h.asOf["quote."] = quoteAsOf
+	}
+	barsAsOf, _ := snap["bars_as_of"].(string)
+	if asOf, _ := snap["as_of"].(string); barsAsOf == "" && asOf != "" {
+		barsAsOf, _ = quote["trade_date"].(string)
+	}
+	if barsAsOf != "" {
+		h.asOf["technicals."] = barsAsOf
+		h.asOf["quant_score."] = barsAsOf
+	}
+	quoteSource, _ := snap["quote_source"].(string)
+	if quoteSource == "" {
+		quoteSource, _ = quote["source"].(string)
+	}
+	if quoteSource != "" {
+		h.source["quote."] = quoteSource
 	}
 	if val, ok := snap["valuation"].(map[string]any); ok {
 		if s, ok := val["source"].(string); ok && s != "" {

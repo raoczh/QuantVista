@@ -14,10 +14,11 @@ import (
 func buildSnapshotFixtureTable() *FactorTable {
 	t := &FactorTable{
 		TradeDate: "2026-07-15", BuiltAt: time.Now(),
-		Symbols:   []string{"600001", "600002"},
-		Names:     []string{"甲股份", "乙股份"},
-		LastDates: []string{"2026-07-15", "2026-07-10"}, // 乙停牌（stale）
-		cols:      make(map[string][]float64, len(factorDefs)),
+		Symbols:       []string{"600001", "600002"},
+		Names:         []string{"甲股份", "乙股份"},
+		LastDates:     []string{"2026-07-15", "2026-07-10"}, // 乙停牌（stale）
+		cols:          make(map[string][]float64, len(factorDefs)),
+		snapshotReady: map[string]bool{"600001": true, "600002": true},
 	}
 	for _, d := range factorDefs {
 		col := make([]float64, 2)
@@ -94,6 +95,7 @@ func TestSnapshotFactorTable(t *testing.T) {
 	ft3.Symbols = append(ft3.Symbols, "600003")
 	ft3.Names = append(ft3.Names, "丙股份")
 	ft3.LastDates = append(ft3.LastDates, "2026-07-15")
+	ft3.snapshotReady["600003"] = true
 	for _, d := range factorDefs {
 		ft3.cols[d.Key] = append(ft3.cols[d.Key], math.NaN())
 	}
@@ -145,10 +147,11 @@ func TestSnapshotInitDoneFilter(t *testing.T) {
 
 	ft := &FactorTable{
 		TradeDate: "2026-07-20", BuiltAt: time.Now(),
-		Symbols:   []string{"600501", "600502"},
-		Names:     []string{"甲", "乙"},
-		LastDates: []string{"2026-07-20", "2026-07-20"},
-		cols:      make(map[string][]float64, len(factorDefs)),
+		Symbols:       []string{"600501", "600502"},
+		Names:         []string{"甲", "乙"},
+		LastDates:     []string{"2026-07-20", "2026-07-20"},
+		cols:          make(map[string][]float64, len(factorDefs)),
+		snapshotReady: map[string]bool{"600501": true},
 	}
 	for _, d := range factorDefs {
 		ft.cols[d.Key] = []float64{math.NaN(), math.NaN()}
@@ -171,7 +174,8 @@ func TestSnapshotInitDoneFilter(t *testing.T) {
 	// 已有的 600501 仍不可覆盖。
 	common.DB.Model(&model.MarketSyncState{}).
 		Where("symbol = ?", "600502").Update("init_status", "done")
-	ft.cols["close"][0] = 99.9 // 已有行的新值：不得覆盖
+	ft.cols["close"][0] = 99.9        // 已有行的新值：不得覆盖
+	ft.snapshotReady["600502"] = true // 模拟初始化完成后重新构建的新表。
 	if n, err := SnapshotFactorTable(ft); err != nil || n != 1 {
 		t.Fatalf("done 后应补上缺失的 1 行: n=%d err=%v", n, err)
 	}

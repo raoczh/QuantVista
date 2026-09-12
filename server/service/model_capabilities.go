@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -49,8 +50,7 @@ const (
 	// capTemperature temperature 参数。
 	capTemperature llmCapability = "temperature"
 	// capReasoningEffort 思考档位参数（chat: reasoning_effort / responses: reasoning.effort）。
-	// unsupported 涵盖两种上游拒绝：参数本身不认，或所配档位不在其取值集合内——两者
-	// 的补救动作相同（去参回到网关默认档位），故合用一个维度，归因差异靠系统日志区分。
+	// unsupported 只适用于被测试的具体档位；拒绝 max 不能证明 low 也不可用。
 	capReasoningEffort llmCapability = "reasoning_effort"
 	// capMaxTokens 记录 Chat 端旧字段 max_tokens 是否被拒。unsupported 表示应改用
 	// 等价的 max_completion_tokens，而不是省略输出预算。target 含 endpoint，Responses
@@ -124,7 +124,12 @@ func llmCapabilityTarget(configID int64, provider, baseURL, modelName, endpointT
 	if ep == "" {
 		ep = model.LLMEndpointChat
 	}
-	base := strings.ToLower(strings.TrimRight(strings.TrimSpace(baseURL), "/"))
+	base := normalizeBaseURL(baseURL)
+	if u, err := url.Parse(base); err == nil {
+		// 主机名不区分大小写，路径和查询参数区分大小写。
+		u.Scheme, u.Host = strings.ToLower(u.Scheme), strings.ToLower(u.Host)
+		base = u.String()
+	}
 	prov := strings.ToLower(strings.TrimSpace(provider))
 	return fmt.Sprintf("cfg:%d|%s|%s|%s|%s", configID, prov, base, modelName, ep)
 }
@@ -132,6 +137,10 @@ func llmCapabilityTarget(configID int64, provider, baseURL, modelName, endpointT
 // capabilityTargetOf 从一次调用参数派生观察 key。
 func capabilityTargetOf(p chatParams) string {
 	return llmCapabilityTarget(p.Meta.ConfigID, p.Meta.Provider, p.BaseURL, p.Model, p.EndpointType)
+}
+
+func reasoningCapabilityTarget(target, effort string) string {
+	return target + "|effort:" + strings.TrimSpace(effort)
 }
 
 // observeLLMCapability 写入一条运行时观察。状态变化时打系统日志（错误路由可观察）；
@@ -172,7 +181,7 @@ func resetLLMCapabilityStore() {
 // （观察来自该目标的真实响应，比按 provider 名的静态假设可信）。json_object 之外，
 // temperature/reasoning_effort/max_tokens/prompt_cache_key 参数能力同样由观察覆盖。
 // 其中 max_tokens 的 unsupported 在 Chat 端表示改用 max_completion_tokens，模块预算始终保留。
-func capabilitiesFor(provider string, target string) llmModelCapabilities {
+func capabilitiesFor(provider string, target string, reasoningEffort ...string) llmModelCapabilities {
 	caps, ok := builtinProviderCapabilities[strings.ToLower(strings.TrimSpace(provider))]
 	if !ok {
 		caps = defaultProviderCapabilities
@@ -183,8 +192,10 @@ func capabilitiesFor(provider string, target string) llmModelCapabilities {
 	if obs, ok := lookupLLMCapability(target, capTemperature); ok {
 		caps.Temperature = obs.State
 	}
-	if obs, ok := lookupLLMCapability(target, capReasoningEffort); ok {
-		caps.ReasoningEffort = obs.State
+	if len(reasoningEffort) > 0 {
+		if obs, ok := lookupLLMCapability(reasoningCapabilityTarget(target, reasoningEffort[0]), capReasoningEffort); ok {
+			caps.ReasoningEffort = obs.State
+		}
 	}
 	if obs, ok := lookupLLMCapability(target, capMaxTokens); ok {
 		caps.MaxTokens = obs.State
@@ -208,7 +219,7 @@ func applyCapabilityRouting(p chatParams) chatParams {
 	if !setting.LLMCapabilityRouting() {
 		return p
 	}
-	caps := capabilitiesFor(p.Meta.Provider, capabilityTargetOf(p))
+	caps := capabilitiesFor(p.Meta.Provider, capabilityTargetOf(p), p.ReasoningEffort)
 	if p.JSONMode && caps.JSONObject == capUnsupported {
 		p.JSONMode = false
 		p.markJSONModeDropped()
@@ -254,7 +265,7 @@ func (p chatParams) observeMaxTokensUnsupported(reason string) {
 // observeReasoningEffortUnsupported 思考档位能力观察提交（去参重试成功后调用）。
 // 只在去参重试成功后调用：4xx 文案里的字样只是猜测，重试成功才证明失败确实源于该参数。
 func (p chatParams) observeReasoningEffortUnsupported(reason string) {
-	observeLLMCapability(capabilityTargetOf(p), capReasoningEffort, capUnsupported, reason)
+	observeLLMCapability(reasoningCapabilityTarget(capabilityTargetOf(p), p.ReasoningEffort), capReasoningEffort, capUnsupported, reason)
 }
 
 // observePromptCacheKeyUnsupported 缓存亲和参数能力观察提交（去参重试成功后调用）。

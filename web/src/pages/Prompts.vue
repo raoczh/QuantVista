@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onBeforeUnmount, onMounted, computed } from 'vue'
 import {
+  NAlert,
   NButton,
   NInput,
   NSwitch,
@@ -21,6 +22,7 @@ import {
 import { useUi } from '@/composables/useUi'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import { getSessionEpoch } from '@/api/token'
 
 const message = useMessage()
 const { vars } = useUi()
@@ -29,72 +31,107 @@ const styleVars = computed(() => ({ '--qv-divider': vars.value.dividerColor }))
 const modules = ref<PromptModuleInfo[]>([])
 const templates = ref<PromptTemplate[]>([])
 const loading = ref(false)
+const loadError = ref('')
+const saving = ref('')
+const savingAction = ref<'save' | 'reset'>('save')
+const pageSession = getSessionEpoch()
+let disposed = false
+const pageActive = () => !disposed && getSessionEpoch() === pageSession
+onBeforeUnmount(() => { disposed = true })
 
 // 每模块的本地编辑态。
-const drafts = ref<Record<string, { content: string; enabled: boolean; id: number | null }>>({})
+type PromptDraft = { content: string; enabled: boolean; id: number | null }
+const drafts = ref<Record<string, PromptDraft>>({})
 
-// 按模块合并刷新：保存/恢复某模块后重新拉取模板，但只把「刚操作的模块」重置为
-// 服务器值，其余模块保留用户尚未保存的本地编辑（避免全量重建冲掉别处草稿）。
-function syncDrafts(resetModule?: string) {
+// 手动刷新只更新尚未编辑的字段；已有草稿与读取期间的新输入都保留。
+function syncDrafts(previousTemplates: PromptTemplate[]) {
   const prev = drafts.value
-  const map: Record<string, { content: string; enabled: boolean; id: number | null }> = {}
+  const map: Record<string, PromptDraft> = {}
   for (const m of modules.value) {
     const existing = prev[m.module]
-    if (existing && m.module !== resetModule) {
-      map[m.module] = existing // 保留未保存的本地编辑
-      continue
-    }
+    const baseline = previousTemplates.find((t) => t.module === m.module)
     const tpl = templates.value.find((t) => t.module === m.module)
-    map[m.module] = { content: tpl?.content ?? '', enabled: tpl?.enabled ?? false, id: tpl?.id ?? null }
+    map[m.module] = {
+      content: existing && existing.content !== (baseline?.content ?? '') ? existing.content : tpl?.content ?? '',
+      enabled: existing && existing.enabled !== (baseline?.enabled ?? false) ? existing.enabled : tpl?.enabled ?? false,
+      id: tpl?.id ?? null,
+    }
   }
   drafts.value = map
 }
 
-async function load(resetModule?: string) {
+async function load() {
+  if (!pageActive() || loading.value || saving.value) return
   loading.value = true
+  loadError.value = ''
   try {
-    ;[modules.value, templates.value] = await Promise.all([listPromptModules(), listPromptTemplates()])
-    syncDrafts(resetModule)
+    const [nextModules, nextTemplates] = await Promise.all([listPromptModules(), listPromptTemplates()])
+    if (!pageActive()) return
+    const previousTemplates = templates.value
+    modules.value = nextModules
+    templates.value = nextTemplates
+    syncDrafts(previousTemplates)
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) loadError.value = e instanceof Error ? e.message : '提示词读取失败'
   } finally {
     loading.value = false
   }
 }
 
-const saving = ref('')
+// 写入响应已含完整模板。按提交快照回填，保留用户在等待期间继续编辑的字段。
+function acceptTemplate(module: string, template: PromptTemplate | null, submitted: PromptDraft) {
+  templates.value = templates.value.filter((t) => t.module !== module)
+  if (template) templates.value.push(template)
+  const draft = drafts.value[module]
+  draft.id = template?.id ?? null
+  if (draft.content === submitted.content) draft.content = template?.content ?? ''
+  if (draft.enabled === submitted.enabled) draft.enabled = template?.enabled ?? false
+}
+
 async function save(m: PromptModuleInfo) {
+  if (!pageActive() || loading.value || saving.value) return
   const d = drafts.value[m.module]
-  if (!d.content.trim()) {
-    message.warning('模板内容不能为空（如需恢复默认请点「删除」）')
+  if (!d?.content.trim()) {
+    message.warning('模板内容不能为空（如需恢复默认请点「恢复默认」）')
     return
   }
+  const submitted = { ...d }
   saving.value = m.module
+  savingAction.value = 'save'
   try {
-    const res = await upsertPromptTemplate({ module: m.module, content: d.content, enabled: d.enabled })
-    await load(m.module)
+    const res = await upsertPromptTemplate({ module: m.module, content: submitted.content, enabled: submitted.enabled })
+    if (!pageActive()) return
+    acceptTemplate(m.module, res.template, submitted)
     message.success('已保存')
     // P0-6：占位符/内容 lint 诊断（不阻断保存，逐条提示）。
     for (const w of res.warnings ?? []) message.warning(w, { duration: 6000 })
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
   } finally {
     saving.value = ''
   }
 }
 async function reset(m: PromptModuleInfo) {
+  if (!pageActive() || loading.value || saving.value) return
   const d = drafts.value[m.module]
+  if (!d) return
   if (!d.id) {
     d.content = ''
     d.enabled = false
     return
   }
+  const submitted = { ...d }
+  saving.value = m.module
+  savingAction.value = 'reset'
   try {
     await deletePromptTemplate(d.id)
-    await load(m.module)
+    if (!pageActive()) return
+    acceptTemplate(m.module, null, submitted)
     message.success('已恢复默认')
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) message.error((e as Error).message)
+  } finally {
+    saving.value = ''
   }
 }
 function useDefault(m: PromptModuleInfo) {
@@ -106,7 +143,13 @@ function tplOf(module: string) {
   return templates.value.find((t) => t.module === module)
 }
 
-onMounted(load)
+function isDirty(module: string) {
+  const draft = drafts.value[module]
+  const template = tplOf(module)
+  return draft && (draft.content !== (template?.content ?? '') || draft.enabled !== (template?.enabled ?? false))
+}
+
+onMounted(() => void load())
 </script>
 
 <template>
@@ -114,7 +157,7 @@ onMounted(load)
     <div class="prompts" :style="styleVars">
       <SectionCard title="按模块自定义">
         <template #extra>
-          <n-button size="tiny" quaternary :loading="loading" @click="load()">刷新</n-button>
+          <n-button size="tiny" quaternary :loading="loading" :disabled="!!saving" @click="load()">刷新</n-button>
         </template>
         <p class="tip">
           每个模块可写一段自定义任务指引（关注角度/语气/排序偏好），「启用」后该模块的 AI
@@ -127,6 +170,7 @@ onMounted(load)
           每次内容变化都会保存不可变快照并生成内容指纹（版本号 -custom.指纹 可在调用审计中归因到当时的模板原文）。
           留空并保存无效，如需恢复默认请点「恢复默认」。
         </p>
+        <n-alert v-if="loadError" type="error" :bordered="false">{{ loadError }}</n-alert>
         <n-spin :show="loading && !modules.length">
           <n-collapse>
             <n-collapse-item v-for="m in modules" :key="m.module" :name="m.module">
@@ -134,14 +178,15 @@ onMounted(load)
                 <div class="mod-head">
                   <span class="mod-label">{{ m.label }}</span>
                   <n-tag
-                    v-if="drafts[m.module]?.id"
+                    v-if="tplOf(m.module)"
                     size="tiny"
                     round
                     :bordered="false"
-                    :type="drafts[m.module]?.enabled ? 'success' : 'default'"
-                    >{{ drafts[m.module]?.enabled ? '自定义生效' : '自定义未启用' }}</n-tag
+                    :type="tplOf(m.module)?.enabled ? 'success' : 'default'"
+                    >{{ tplOf(m.module)?.enabled ? '自定义生效' : '自定义未启用' }}</n-tag
                   >
                   <n-tag v-else size="tiny" round :bordered="false">默认</n-tag>
+                  <n-tag v-if="isDirty(m.module)" size="tiny" round :bordered="false" type="warning">未保存修改</n-tag>
                   <n-tag
                     v-if="tplOf(m.module)?.content_hash"
                     size="tiny"
@@ -184,8 +229,8 @@ onMounted(load)
                     <n-switch v-model:value="drafts[m.module].enabled" />
                   </div>
                   <div class="mod-btns">
-                    <n-button size="small" quaternary @click="reset(m)">恢复默认</n-button>
-                    <n-button size="small" type="primary" :loading="saving === m.module" @click="save(m)">保存</n-button>
+                    <n-button size="small" quaternary :disabled="loading || !!saving" :loading="saving === m.module && savingAction === 'reset'" @click="reset(m)">恢复默认</n-button>
+                    <n-button size="small" type="primary" :disabled="loading || !!saving" :loading="saving === m.module && savingAction === 'save'" @click="save(m)">保存</n-button>
                   </div>
                 </div>
               </div>

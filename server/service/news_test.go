@@ -89,7 +89,7 @@ func TestDedupeCacheCap(t *testing.T) {
 	s := NewNewsService()
 	now := time.Now()
 	for i := 0; i < newsSeenCap; i++ {
-		s.seen[string(rune('a'+i%26))+string(rune(i))] = struct{}{}
+		s.seen[string(rune('a'+i%26))+string(rune(i))] = now
 	}
 	if s.dedupeCheck("cls", "x", "缓存超限后仍能正常登记新条目", now) {
 		t.Error("新条目不应判重")
@@ -114,8 +114,8 @@ func TestNewsInsertFailNoRegister(t *testing.T) {
 	}
 	n := &model.News{Title: "标题甲事件", Source: "cls", SourceID: "1",
 		ContentHash: newsContentHash("标题甲事件", "x"), PublishTime: now, CollectTime: now}
-	if !insertNews(n) {
-		t.Fatal("首次入库应成功")
+	if created, err := insertNews(t.Context(), n); !created || err != nil {
+		t.Fatalf("首次入库应成功: %v", err)
 	}
 	s.dedupeRegister("cls", "1", "标题甲事件", now)
 	if !s.dedupeSeen("cls", "1", "标题甲事件") {
@@ -136,8 +136,8 @@ func TestNewsInsertFailNoRegister(t *testing.T) {
 	}
 	n2 := &model.News{Title: "标题乙事件", Source: "cls", SourceID: "2",
 		ContentHash: newsContentHash("标题乙事件", "y"), PublishTime: now, CollectTime: now}
-	if insertNews(n2) {
-		t.Fatal("表已删，入库应失败返回 false")
+	if created, err := insertNews(t.Context(), n2); created || err == nil {
+		t.Fatalf("表已删，入库应返回错误: %v", err)
 	}
 	// 关键断言：写库失败未登记去重，同条目仍判为「未见过」，下轮重采不丢。
 	if s.dedupeSeen("cls", "2", "标题乙事件") {

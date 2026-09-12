@@ -12,11 +12,18 @@ import (
 	"quantvista/oauth"
 	"quantvista/setting"
 
+	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // RefreshTokenTTL 刷新令牌有效期。
 const RefreshTokenTTL = 30 * 24 * time.Hour
+
+var (
+	ErrRefreshTokenInvalid = errors.New("登录状态已失效，请重新登录")
+	ErrAuthAccountInactive = errors.New("账号不存在或已被禁用")
+)
 
 // TokenPair 登录/换发成功返回的令牌对与用户信息。
 type TokenPair struct {
@@ -79,6 +86,7 @@ func (s *AuthService) CreateAdmin(username, password, ua string) (*TokenPair, er
 		Role:        model.RoleAdmin,
 		Status:      model.StatusEnabled,
 	}
+	var pair *TokenPair
 	// 事务 + options["initialized"] 主键唯一做并发闸：并发首启只会有一个成功。
 	err = common.DB.Transaction(func(tx *gorm.DB) error {
 		var n int64
@@ -89,7 +97,10 @@ func (s *AuthService) CreateAdmin(username, password, ua string) (*TokenPair, er
 			return errors.New("系统已初始化，禁止重复创建管理员")
 		}
 		if err := tx.Create(&model.Option{Key: "initialized", Value: "true"}).Error; err != nil {
-			return errors.New("系统已初始化，禁止重复创建管理员")
+			if isDuplicateRecordError(err) {
+				return errInitialized
+			}
+			return err
 		}
 		if err := tx.Create(user).Error; err != nil {
 			return err
@@ -100,12 +111,15 @@ func (s *AuthService) CreateAdmin(username, password, ua string) (*TokenPair, er
 		if err := tx.Create(&model.UserQuota{UserID: user.ID}).Error; err != nil {
 			return err
 		}
-		return nil
+		// 首启成功同时代表已登录；会话签发失败时不能留下阻止原操作重试的初始化闸。
+		var issueErr error
+		pair, issueErr = s.issueForTx(tx, user, ua)
+		return issueErr
 	})
 	if err != nil {
 		return nil, err
 	}
-	return s.issueFor(user, ua)
+	return pair, nil
 }
 
 // LoginByPassword 用户名 + 密码登录。
@@ -162,6 +176,9 @@ func (s *AuthService) LoginByGitHub(ctx context.Context, code, state, redirectUR
 // 首用户 admin 闸/开放注册规则建号。Web 流（LoginByGitHub）与移动流
 // （MobileGitHubCallback）共用，改注册/绑定规则只改这里。
 func (s *AuthService) userForGitHub(gu *oauth.GitHubUser) (*model.User, error) {
+	if gu == nil || strings.TrimSpace(gu.GithubID) == "" {
+		return nil, errors.New("GitHub 身份无效")
+	}
 	// 已绑定的 GitHub 用户：直接登录。
 	var user model.User
 	err := common.DB.Where("github_id = ?", gu.GithubID).First(&user).Error
@@ -185,9 +202,13 @@ func (s *AuthService) userForGitHub(gu *oauth.GitHubUser) (*model.User, error) {
 		// 说明本库中无该 GitHub 账号的绑定关系（换了 GitHub 账号 / 换了环境库）。
 		return nil, errors.New("该 GitHub 账号未绑定任何已有用户，且当前未开放注册；若你绑定过，请确认授权的是同一个 GitHub 账号")
 	}
+	username, err := s.uniqueUsername(gu.Username, gu.GithubID)
+	if err != nil {
+		return nil, err
+	}
 	newUser := &model.User{
 		GithubID:    gu.GithubID,
-		Username:    s.uniqueUsername(gu.Username, gu.GithubID),
+		Username:    username,
 		DisplayName: gu.DisplayName,
 		Email:       gu.Email,
 		AvatarURL:   gu.AvatarURL,
@@ -203,11 +224,24 @@ func (s *AuthService) userForGitHub(gu *oauth.GitHubUser) (*model.User, error) {
 		newUser.Role = model.RoleAdmin
 		err = common.DB.Transaction(func(tx *gorm.DB) error {
 			if err := tx.Create(&model.Option{Key: "initialized", Value: "true"}).Error; err != nil {
-				return errInitialized
+				if isDuplicateRecordError(err) {
+					return errInitialized
+				}
+				return err
 			}
 			return tx.Create(newUser).Error
 		})
 		if errors.Is(err, errInitialized) {
+			// 同一 GitHub 身份可能已由并发首次登录建立，先重读唯一绑定。
+			var existing model.User
+			if lookupErr := common.DB.Where("github_id = ?", gu.GithubID).First(&existing).Error; lookupErr == nil {
+				if existing.Status != model.StatusEnabled {
+					return nil, ErrAuthAccountInactive
+				}
+				return &existing, nil
+			} else if !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+				return nil, lookupErr
+			}
 			// 竞争失败：系统已被并发请求初始化，按普通注册路径重试。
 			if !setting.RegistrationOpen() {
 				return nil, errors.New("当前未开放注册")
@@ -215,11 +249,19 @@ func (s *AuthService) userForGitHub(gu *oauth.GitHubUser) (*model.User, error) {
 			newUser.Role = model.RoleUser
 			err = common.DB.Create(newUser).Error
 		}
-		if err != nil {
+	} else {
+		err = common.DB.Create(newUser).Error
+	}
+	if err != nil {
+		// 两个回调可同时看到未注册；唯一索引的竞争失败者复用已提交的账号。
+		var existing model.User
+		if lookupErr := common.DB.Where("github_id = ?", gu.GithubID).First(&existing).Error; lookupErr != nil {
 			return nil, err
 		}
-	} else if err := common.DB.Create(newUser).Error; err != nil {
-		return nil, err
+		if existing.Status != model.StatusEnabled {
+			return nil, ErrAuthAccountInactive
+		}
+		return &existing, nil
 	}
 	s.ensurePrefAndQuota(newUser.ID)
 	return newUser, nil
@@ -227,6 +269,21 @@ func (s *AuthService) userForGitHub(gu *oauth.GitHubUser) (*model.User, error) {
 
 // errInitialized 首用户闸竞争失败（系统已被并发请求初始化）。
 var errInitialized = errors.New("系统已初始化")
+
+func isDuplicateRecordError(err error) bool {
+	if errors.Is(err, gorm.ErrDuplicatedKey) {
+		return true
+	}
+	var mysqlError *mysql.MySQLError
+	if errors.As(err, &mysqlError) {
+		return mysqlError.Number == 1062
+	}
+	var sqliteError interface{ Code() int }
+	if errors.As(err, &sqliteError) {
+		return sqliteError.Code() == 1555 || sqliteError.Code() == 2067 // 主键/唯一索引冲突
+	}
+	return false
+}
 
 // BindGitHub 已登录用户绑定 GitHub：校验 state、换 token、取 GitHub 用户，
 // 该 GitHub 账号未被其他用户占用时写入当前用户（解决"密码登录的管理员再用
@@ -243,88 +300,104 @@ func (s *AuthService) BindGitHub(ctx context.Context, userID int64, code, state,
 	if err != nil {
 		return nil, err
 	}
-	var user model.User
-	if err := common.DB.First(&user, userID).Error; err != nil {
-		return nil, errors.New("用户不存在")
-	}
-	if user.GithubID == gu.GithubID {
-		user.Password = ""
-		return &user, nil // 幂等：重复绑定同一 GitHub 直接成功
-	}
 	var n int64
-	common.DB.Model(&model.User{}).Where("github_id = ? AND id <> ?", gu.GithubID, userID).Count(&n)
+	if err := common.DB.WithContext(ctx).Model(&model.User{}).Where("github_id = ? AND id <> ?", gu.GithubID, userID).Count(&n).Error; err != nil {
+		return nil, err
+	}
 	if n > 0 {
 		return nil, errors.New("该 GitHub 账号已绑定其他用户，请先在对方账号解绑")
 	}
-	updates := map[string]any{"github_id": gu.GithubID}
-	// 空缺信息用 GitHub 资料补齐，不覆盖已有值。
-	if user.AvatarURL == "" && gu.AvatarURL != "" {
-		updates["avatar_url"] = gu.AvatarURL
-	}
-	if user.Email == "" && gu.Email != "" {
-		updates["email"] = gu.Email
-	}
-	if err := common.DB.Model(&user).Updates(updates).Error; err != nil {
-		return nil, err
-	}
-	if err := common.DB.First(&user, userID).Error; err != nil {
+	var user *model.User
+	err = common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		user, err = lockEnabledAuthUser(tx, userID)
+		if err != nil {
+			return err
+		}
+		if user.GithubID == gu.GithubID {
+			return nil
+		}
+		updates := map[string]any{"github_id": gu.GithubID}
+		// 空缺信息用 GitHub 资料补齐，不覆盖锁定后读到的当前资料。
+		if user.AvatarURL == "" && gu.AvatarURL != "" {
+			updates["avatar_url"] = gu.AvatarURL
+		}
+		if user.Email == "" && gu.Email != "" {
+			updates["email"] = gu.Email
+		}
+		// 上面的 Count 只提供友好提示，数据库唯一索引才是并发绑定的最终约束。
+		return tx.Model(user).Updates(updates).Error
+	})
+	if err != nil {
 		return nil, err
 	}
 	user.Password = ""
-	return &user, nil
+	return user, nil
 }
 
 // UnbindGitHub 解绑 GitHub。未设密码的纯 OAuth 账号拒绝解绑（会失去唯一登录方式）。
 func (s *AuthService) UnbindGitHub(userID int64) (*model.User, error) {
-	var user model.User
-	if err := common.DB.First(&user, userID).Error; err != nil {
-		return nil, errors.New("用户不存在")
-	}
-	if user.GithubID == "" {
-		return nil, errors.New("当前未绑定 GitHub")
-	}
-	if user.Password == "" {
-		return nil, errors.New("该账号未设置密码，解绑 GitHub 将无法登录；请先设置密码")
-	}
-	if err := common.DB.Model(&user).Update("github_id", "").Error; err != nil {
+	var user *model.User
+	err := common.DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		user, err = lockEnabledAuthUser(tx, userID)
+		if err != nil {
+			return err
+		}
+		if user.GithubID == "" {
+			return errors.New("当前未绑定 GitHub")
+		}
+		if user.Password == "" {
+			return errors.New("该账号未设置密码，解绑 GitHub 将无法登录；请先设置密码")
+		}
+		return tx.Model(user).Update("github_id", nil).Error
+	})
+	if err != nil {
 		return nil, err
 	}
 	user.GithubID = ""
 	user.Password = ""
-	return &user, nil
+	return user, nil
 }
 
 // Refresh 用 refresh token 换发新令牌（轮换：吊销旧的、签发新的）。
 func (s *AuthService) Refresh(rawRefresh, ua string) (*TokenPair, error) {
 	if rawRefresh == "" {
-		return nil, errors.New("缺少 refresh token")
+		return nil, ErrRefreshTokenInvalid
 	}
 	var rt model.RefreshToken
 	if err := common.DB.Where("token_hash = ?", common.SHA256Hex(rawRefresh)).First(&rt).Error; err != nil {
-		return nil, errors.New("refresh token 无效")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrRefreshTokenInvalid
+		}
+		return nil, err
 	}
 	if rt.Revoked || time.Now().After(rt.ExpiresAt) {
-		return nil, errors.New("refresh token 已失效，请重新登录")
+		return nil, ErrRefreshTokenInvalid
 	}
-	var user model.User
-	if err := common.DB.First(&user, rt.UserID).Error; err != nil {
-		return nil, errors.New("用户不存在")
+	var pair *TokenPair
+	err := common.DB.Transaction(func(tx *gorm.DB) error {
+		// 与改密/禁用共用用户行锁；旧令牌吊销与替换令牌创建必须同时提交。
+		user, err := lockEnabledAuthUser(tx, rt.UserID)
+		if err != nil {
+			return err
+		}
+		res := tx.Model(&model.RefreshToken{}).
+			Where("id = ? AND revoked = ? AND expires_at > ?", rt.ID, false, time.Now()).
+			Update("revoked", true)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected != 1 {
+			return ErrRefreshTokenInvalid
+		}
+		pair, err = s.issueForTx(tx, user, ua)
+		return err
+	})
+	if err != nil {
+		return nil, err
 	}
-	if user.Status != model.StatusEnabled {
-		return nil, errors.New("账号已被禁用")
-	}
-	// 轮换吊销旧令牌：条件更新 + RowsAffected 校验，保证并发重放同一 refresh token
-	// 时只有一次换发成功（先查后改的 TOCTOU 窗口内，第二个请求在这里会失败）。
-	res := common.DB.Model(&model.RefreshToken{}).
-		Where("id = ? AND revoked = ?", rt.ID, false).
-		Update("revoked", true)
-	if res.Error != nil {
-		return nil, res.Error
-	}
-	if res.RowsAffected != 1 {
-		return nil, errors.New("refresh token 已失效，请重新登录")
-	}
-	return s.issueFor(&user, ua)
+	return pair, nil
 }
 
 // Logout 吊销单个 refresh token。
@@ -373,6 +446,44 @@ func StartRefreshTokenJanitor() {
 
 // issueFor 为用户签发 access + refresh，并更新最后登录时间。
 func (s *AuthService) issueFor(user *model.User, ua string) (*TokenPair, error) {
+	var pair *TokenPair
+	err := common.DB.Transaction(func(tx *gorm.DB) error {
+		current, err := lockEnabledAuthUser(tx, user.ID)
+		if err != nil {
+			return err
+		}
+		if current.TokenVersion != user.TokenVersion || current.GithubID != user.GithubID {
+			return errors.New("登录状态已变更，请重新登录")
+		}
+		pair, err = s.issueForTx(tx, current, ua)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return pair, nil
+}
+
+func lockEnabledAuthUser(tx *gorm.DB, userID int64) (*model.User, error) {
+	query := tx
+	if tx.Dialector.Name() == "mysql" {
+		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	var user model.User
+	if err := query.First(&user, userID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrAuthAccountInactive
+		}
+		return nil, err
+	}
+	if user.Status != model.StatusEnabled {
+		return nil, ErrAuthAccountInactive
+	}
+	return &user, nil
+}
+
+// issueForTx 仅在用户行已经锁定、认证版本已核验的事务内签发。
+func (s *AuthService) issueForTx(tx *gorm.DB, user *model.User, ua string) (*TokenPair, error) {
 	access, exp, err := common.IssueAccessToken(user.ID, user.Role, user.TokenVersion)
 	if err != nil {
 		return nil, err
@@ -382,12 +493,14 @@ func (s *AuthService) issueFor(user *model.User, ua string) (*TokenPair, error) 
 		UserID:    user.ID,
 		TokenHash: common.SHA256Hex(raw),
 		ExpiresAt: time.Now().Add(RefreshTokenTTL),
-		UserAgent: truncate(ua, 256),
+		UserAgent: truncateRunes(ua, 256),
 	}
-	if err := common.DB.Create(rt).Error; err != nil {
+	if err := tx.Create(rt).Error; err != nil {
 		return nil, err
 	}
-	common.DB.Model(user).Update("last_login_at", time.Now())
+	if err := tx.Model(user).Update("last_login_at", time.Now()).Error; err != nil {
+		return nil, err
+	}
 	user.Password = "" // 绝不外泄
 	return &TokenPair{AccessToken: access, RefreshToken: raw, ExpiresAt: exp.Unix(), User: user}, nil
 }
@@ -399,7 +512,7 @@ func (s *AuthService) ensurePrefAndQuota(userID int64) {
 }
 
 // uniqueUsername 在用户名冲突或为空时追加后缀保证唯一。
-func (s *AuthService) uniqueUsername(preferred, githubID string) string {
+func (s *AuthService) uniqueUsername(preferred, githubID string) (string, error) {
 	base := strings.TrimSpace(preferred)
 	if base == "" {
 		base = "gh_" + githubID
@@ -407,9 +520,11 @@ func (s *AuthService) uniqueUsername(preferred, githubID string) string {
 	candidate := base
 	for i := 1; ; i++ {
 		var n int64
-		common.DB.Model(&model.User{}).Where("username = ?", candidate).Count(&n)
+		if err := common.DB.Model(&model.User{}).Where("username = ?", candidate).Count(&n).Error; err != nil {
+			return "", err
+		}
 		if n == 0 {
-			return candidate
+			return candidate, nil
 		}
 		candidate = base + "_" + githubID[:min(4, len(githubID))]
 		if i > 1 {

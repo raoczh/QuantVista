@@ -36,7 +36,7 @@ const (
 )
 
 var discoveryChannels = []string{"trend_breakout", "pullback_repair", "value_dividend", "strategy_signal"}
-var discoveryRunMu sync.Mutex
+var discoveryRunMu jobCreateLock
 var discoveryScheduleMu sync.Mutex
 var discoverySchedulePending = map[string]bool{}
 
@@ -62,11 +62,12 @@ type DiscoverySignal struct {
 }
 
 type discoveryChannelSpec struct {
-	name     string
-	required []string
-	match    func(*FactorTable, int) bool
-	score    func(*FactorTable, int) float64
-	facts    func(*FactorTable, int) map[string]any
+	name          string
+	required      []string
+	scoreRequired []string
+	match         func(*FactorTable, int) bool
+	score         func(*FactorTable, int) float64
+	facts         func(*FactorTable, int) map[string]any
 }
 
 func discoveryParameterHash() string {
@@ -87,8 +88,9 @@ func finiteFactor(t *FactorTable, key string, i int) (float64, bool) {
 func discoverySpecs() []discoveryChannelSpec {
 	return []discoveryChannelSpec{
 		{
-			name:     "trend_breakout",
-			required: []string{"close", "ma20", "bull_align", "high_20d", "chg_20d", "vol_boost", "bias_20"},
+			name:          "trend_breakout",
+			scoreRequired: []string{"chg_20d", "vol_boost", "bias_20"},
+			required:      []string{"close", "ma20", "bull_align", "high_20d", "chg_20d", "vol_boost", "bias_20"},
 			match: func(t *FactorTable, i int) bool {
 				close, cOK := finiteFactor(t, "close", i)
 				ma20, mOK := finiteFactor(t, "ma20", i)
@@ -108,8 +110,9 @@ func discoverySpecs() []discoveryChannelSpec {
 			},
 		},
 		{
-			name:     "pullback_repair",
-			required: []string{"chg_20d", "chg_5d", "above_ma20", "vol_5v20"},
+			name:          "pullback_repair",
+			scoreRequired: []string{"chg_20d", "chg_5d", "vol_5v20"},
+			required:      []string{"chg_20d", "chg_5d", "above_ma20", "vol_5v20"},
 			match: func(t *FactorTable, i int) bool {
 				chg20, a := finiteFactor(t, "chg_20d", i)
 				chg5, b := finiteFactor(t, "chg_5d", i)
@@ -128,8 +131,9 @@ func discoverySpecs() []discoveryChannelSpec {
 			},
 		},
 		{
-			name:     "value_dividend",
-			required: []string{"div_yield", "pos_60", "volatility_20", "close"},
+			name:          "value_dividend",
+			scoreRequired: []string{"div_yield", "pos_60", "volatility_20"},
+			required:      []string{"div_yield", "pos_60", "volatility_20", "close"},
 			match: func(t *FactorTable, i int) bool {
 				y, yOK := finiteFactor(t, "div_yield", i)
 				pos, pOK := finiteFactor(t, "pos_60", i)
@@ -149,8 +153,9 @@ func discoverySpecs() []discoveryChannelSpec {
 			},
 		},
 		{
-			name:     "strategy_signal",
-			required: []string{"high_20d", "vol_boost", "chg_pct", "amount_yi", "chg_20d", "above_ma20", "chg_5d", "vol_5v20", "pos_60", "chip_profit", "chip_bars", "chg_60d", "volatility_20", "above_ma60", "bull_align"},
+			name:          "strategy_signal",
+			scoreRequired: []string{"amount_yi", "chg_20d"},
+			required:      []string{"high_20d", "vol_boost", "chg_pct", "amount_yi", "chg_20d", "above_ma20", "chg_5d", "vol_5v20", "pos_60", "chip_profit", "chip_bars", "chg_60d", "volatility_20", "above_ma60", "bull_align"},
 			match: func(t *FactorTable, i int) bool {
 				return len(matchedDiscoveryStrategies(t, i)) > 0
 			},
@@ -203,6 +208,22 @@ func discoveryChannelDataIssue(t *FactorTable, spec discoveryChannelSpec) string
 			return "因子无可用值 " + key
 		}
 	}
+	for i := range t.Symbols {
+		if t.Fresh(i) && spec.match(t, i) {
+			if issue := discoveryScoreIssue(t, spec, i); issue != "" {
+				return issue
+			}
+		}
+	}
+	return ""
+}
+
+func discoveryScoreIssue(t *FactorTable, spec discoveryChannelSpec, i int) string {
+	for _, key := range spec.scoreRequired {
+		if _, ok := finiteFactor(t, key, i); !ok {
+			return "候选评分缺少因子 " + key
+		}
+	}
 	return ""
 }
 
@@ -251,7 +272,7 @@ func BuildDiscoverySignals(t *FactorTable, topN int) map[string][]DiscoverySigna
 			continue
 		}
 		for _, spec := range specs {
-			if !spec.match(t, i) {
+			if !spec.match(t, i) || discoveryScoreIssue(t, spec, i) != "" {
 				continue
 			}
 			factors := map[string]float64{}
@@ -325,15 +346,18 @@ func discoveryFailedCount(t *FactorTable) int {
 	return n
 }
 
-func discoveryDates(tradeDate string) []string {
-	dates := recentOpenDates("cn", tradeDate, 6)
+func discoveryDatesDB(db *gorm.DB, tradeDate string) ([]string, error) {
+	dates, err := recentOpenDatesDB(db, "cn", tradeDate, 6)
+	if err != nil {
+		return nil, err
+	}
 	if len(dates) == 0 || dates[len(dates)-1] != tradeDate {
 		dates = append(dates, tradeDate)
 	}
 	if len(dates) > 6 {
 		dates = dates[len(dates)-6:]
 	}
-	return dates
+	return dates, nil
 }
 
 type discoveryHistoryState struct {
@@ -346,10 +370,10 @@ type discoveryHistoryState struct {
 
 // loadDiscoveryHistory 一次读取本次信号涉及的历史行，避免按候选逐条查询。
 // 连续天数沿用上一交易日的已固化值，因此不会被近 5 日窗口截断。
-func loadDiscoveryHistory(tradeDate, parameterHash string, signals map[string][]DiscoverySignal) map[string]discoveryHistoryState {
+func loadDiscoveryHistoryDB(db *gorm.DB, tradeDate, parameterHash string, signals map[string][]DiscoverySignal) (map[string]discoveryHistoryState, error) {
 	out := map[string]discoveryHistoryState{}
-	if common.DB == nil {
-		return out
+	if db == nil {
+		return nil, errors.New("数据库不可用")
 	}
 	keys := make([]string, 0)
 	seen := map[string]bool{}
@@ -365,7 +389,7 @@ func loadDiscoveryHistory(tradeDate, parameterHash string, signals map[string][]
 		}
 	}
 	if len(keys) == 0 {
-		return out
+		return out, nil
 	}
 	channels := make([]string, 0, len(signals))
 	for channel := range signals {
@@ -384,12 +408,13 @@ func loadDiscoveryHistory(tradeDate, parameterHash string, signals map[string][]
 		windowStart = t.AddDate(0, 0, -90).Format("2006-01-02")
 	}
 	var rows []model.CandidateDiscoveryItem
-	query := common.DB.Joins("JOIN candidate_discovery_runs AS history_run ON history_run.id = candidate_discovery_items.run_id").Where("candidate_discovery_items.market = ? AND candidate_discovery_items.discovery_version = ? AND candidate_discovery_items.trade_date < ? AND candidate_discovery_items.trade_date >= ? AND candidate_discovery_items.channel IN ? AND candidate_discovery_items.symbol IN ?", "cn", DiscoveryVersion, tradeDate, windowStart, channels, symbols)
+	query := db.Joins("JOIN candidate_discovery_runs AS history_run ON history_run.id = candidate_discovery_items.run_id").Where("candidate_discovery_items.market = ? AND candidate_discovery_items.discovery_version = ? AND candidate_discovery_items.trade_date < ? AND candidate_discovery_items.trade_date >= ? AND candidate_discovery_items.channel IN ? AND candidate_discovery_items.symbol IN ?", "cn", DiscoveryVersion, tradeDate, windowStart, channels, symbols)
 	if parameterHash != "" {
 		query = query.Where("history_run.factor_version = ? AND history_run.parameter_hash = ?", factorSnapshotVersion, parameterHash)
 	}
+	query = query.Where("history_run.owner_type = ? AND history_run.status IN ? AND candidate_discovery_items.data_status IN ?", model.JobOwnerSystem, []string{DiscoveryRunStatusOK, DiscoveryRunStatusPart}, []string{DiscoveryItemReady, DiscoveryItemPartial})
 	if err := query.Order("candidate_discovery_items.trade_date DESC, candidate_discovery_items.id DESC").Find(&rows).Error; err != nil {
-		return out
+		return nil, err
 	}
 	latest := map[string]bool{}
 	for _, row := range rows {
@@ -404,19 +429,24 @@ func loadDiscoveryHistory(tradeDate, parameterHash string, signals map[string][]
 		}
 		out[key] = discoveryHistoryState{FirstDate: first, PrevDate: row.TradeDate, PrevConsecutive: row.ConsecutiveDays, PrevRank: row.Rank, PrevScore: row.Score}
 	}
-	return out
+	return out, nil
 }
 
 // ExecuteDailyDiscovery 在单个全局互斥段内创建/重试同日运行。expectedResultID 是
 // JobRun 已绑定的 CandidateDiscoveryRun.ID，只用于防止任务快照串到别的结果事实。
 func ExecuteDailyDiscovery(ctx context.Context, expectedResultID int64, market, tradeDate, parameterHash string) (*model.CandidateDiscoveryRun, error) {
-	discoveryRunMu.Lock()
+	if err := discoveryRunMu.Lock(ctx); err != nil {
+		return nil, err
+	}
 	defer discoveryRunMu.Unlock()
 	if common.DB == nil {
 		return nil, errors.New("数据库不可用")
 	}
 	if market == "" {
 		market = "cn"
+	}
+	if market != "cn" {
+		return nil, errors.New("全市场发现仅支持 A 股")
 	}
 	t := CurrentFactorTable()
 	if t == nil || (tradeDate != "" && t.TradeDate < tradeDate) {
@@ -445,34 +475,59 @@ func ExecuteDailyDiscovery(ctx context.Context, expectedResultID int64, market, 
 	now := time.Now()
 	var run model.CandidateDiscoveryRun
 	created := false
-	err := common.DB.Where("market = ? AND trade_date = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ?", market, tradeDate, DiscoveryVersion, factorSnapshotVersion, parameterHash).First(&run).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		run = model.CandidateDiscoveryRun{OwnerType: model.JobOwnerSystem, Market: market, TradeDate: tradeDate, AsOf: now, DiscoveryVersion: DiscoveryVersion, FactorVersion: factorSnapshotVersion, ParameterHash: parameterHash, Status: DiscoveryRunStatusProc, StartedAt: now}
-		if err := common.DB.Create(&run).Error; err != nil {
-			return nil, err
+	err := withJobResultTransaction(ctx, func(tx *gorm.DB) error {
+		readErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("market = ? AND trade_date = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ?", market, tradeDate, DiscoveryVersion, factorSnapshotVersion, parameterHash).First(&run).Error
+		if errors.Is(readErr, gorm.ErrRecordNotFound) {
+			if expectedResultID > 0 {
+				return fmt.Errorf("发现作业结果引用错配: expected=%d actual=missing", expectedResultID)
+			}
+			run = model.CandidateDiscoveryRun{OwnerType: model.JobOwnerSystem, Market: market, TradeDate: tradeDate, AsOf: now, DiscoveryVersion: DiscoveryVersion, FactorVersion: factorSnapshotVersion, ParameterHash: parameterHash, Status: DiscoveryRunStatusProc, StartedAt: now}
+			if err := tx.Create(&run).Error; err != nil {
+				return err
+			}
+			created = true
+		} else if readErr != nil {
+			return readErr
 		}
-		created = true
-	} else if err != nil {
+		// 结果引用错配必须在复用或重置事实之前拒绝：错配时旧运行的 items 不能先被清掉。
+		if expectedResultID > 0 && run.ID != expectedResultID {
+			return fmt.Errorf("发现作业结果引用错配: expected=%d actual=%d", expectedResultID, run.ID)
+		}
+		if !created && run.Status == DiscoveryRunStatusOK && run.FinishedAt != nil {
+			return nil
+		}
+		if !created {
+			run.Status, run.Error, run.PartialReason, run.AsOf, run.StartedAt, run.FinishedAt = DiscoveryRunStatusProc, "", "", now, now, nil
+			if err := tx.Model(&run).Updates(map[string]any{"status": run.Status, "error": "", "partial_reason": "", "as_of": now, "started_at": now, "finished_at": nil}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("run_id = ?", run.ID).Delete(&model.CandidateDiscoveryItem{}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
-	}
-	// 结果引用错配必须在复用或重置事实之前拒绝：错配时旧运行的 items 不能先被清掉。
-	if expectedResultID > 0 && run.ID != expectedResultID {
-		return nil, fmt.Errorf("发现作业结果引用错配: expected=%d actual=%d", expectedResultID, run.ID)
 	}
 	if !created && run.Status == DiscoveryRunStatusOK && run.FinishedAt != nil {
 		return &run, nil
 	}
-	if !created {
-		run.Status, run.Error, run.PartialReason, run.AsOf, run.StartedAt, run.FinishedAt = DiscoveryRunStatusProc, "", "", now, now, nil
-		if err := common.DB.Model(&run).Updates(map[string]any{"status": run.Status, "error": "", "partial_reason": "", "as_of": now, "started_at": now, "finished_at": nil}).Error; err != nil {
-			return nil, err
-		}
-		if err := common.DB.Where("run_id = ?", run.ID).Delete(&model.CandidateDiscoveryItem{}).Error; err != nil {
-			return nil, err
-		}
-	}
 	signals := BuildDiscoverySignals(t, discoveryTopN)
-	history := loadDiscoveryHistory(tradeDate, parameterHash, signals)
+	var history map[string]discoveryHistoryState
+	var openDates []string
+	if err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		history, err = loadDiscoveryHistoryDB(tx, tradeDate, parameterHash, signals)
+		if err != nil {
+			return err
+		}
+		openDates, err = discoveryDatesDB(tx, tradeDate)
+		return err
+	}); err != nil {
+		markDiscoveryFailed(run.ID, err)
+		return nil, err
+	}
 	items := make([]model.CandidateDiscoveryItem, 0, len(discoveryChannels)*discoveryTopN)
 	eligible := 0
 	channelIssues := make([]string, 0, len(discoveryChannels))
@@ -493,7 +548,6 @@ func ExecuteDailyDiscovery(ctx context.Context, expectedResultID int64, market, 
 			}
 			consecutive := 1
 			if state.PrevDate != "" {
-				openDates := discoveryDates(tradeDate)
 				if len(openDates) >= 2 && state.PrevDate == openDates[len(openDates)-2] {
 					consecutive = state.PrevConsecutive + 1
 				}
@@ -524,29 +578,48 @@ func ExecuteDailyDiscovery(ctx context.Context, expectedResultID int64, market, 
 	}
 	finished := time.Now()
 	if err := ctx.Err(); err != nil {
-		common.DB.Model(&model.CandidateDiscoveryRun{}).Where("id = ?", run.ID).Updates(map[string]any{"status": DiscoveryRunStatusFail, "error": truncate(err.Error(), 512), "finished_at": finished})
+		markDiscoveryFailed(run.ID, err)
 		return nil, err
 	}
-	err = common.DB.Transaction(func(tx *gorm.DB) error {
+	err = withJobResultTransaction(ctx, func(tx *gorm.DB) error {
 		if len(items) > 0 {
 			if err := tx.CreateInBatches(items, 500).Error; err != nil {
 				return err
 			}
 		}
 		sourceVersions, _ := json.Marshal(map[string]any{"factor_snapshot": factorSnapshotVersion, "factor_trade_date": t.TradeDate, "discovery": DiscoveryVersion, "channels": discoveryChannels})
-		return tx.Model(&model.CandidateDiscoveryRun{}).Where("id = ?", run.ID).Updates(map[string]any{"status": status, "universe_count": t.Len(), "scanned_count": scanned, "eligible_count": eligible, "success_count": len(items), "failed_count": failed, "partial_reason": reason, "error": "", "factor_version": factorSnapshotVersion, "source_versions": string(sourceVersions), "finished_at": finished, "updated_at": finished}).Error
+		result := tx.Model(&model.CandidateDiscoveryRun{}).Where("id = ? AND status = ?", run.ID, DiscoveryRunStatusProc).Updates(map[string]any{"status": status, "universe_count": t.Len(), "scanned_count": scanned, "eligible_count": eligible, "success_count": len(items), "failed_count": failed, "partial_reason": reason, "error": "", "factor_version": factorSnapshotVersion, "source_versions": string(sourceVersions), "finished_at": finished, "updated_at": finished})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errors.New("候选发现运行状态已改变")
+		}
+		return tx.First(&run, run.ID).Error
 	})
 	if err != nil {
-		common.DB.Model(&model.CandidateDiscoveryRun{}).Where("id = ?", run.ID).Updates(map[string]any{"status": DiscoveryRunStatusFail, "error": truncate(err.Error(), 512), "finished_at": finished})
+		markDiscoveryFailed(run.ID, err)
 		return nil, err
 	}
-	common.DB.First(&run, run.ID)
 	if run.Status == DiscoveryRunStatusFail {
 		common.SysWarn("全市场候选发现失败 market=%s trade_date=%s run_id=%d reason=%s", market, tradeDate, run.ID, run.PartialReason)
 		return &run, errors.New(run.PartialReason)
 	}
 	common.SysLog("全市场候选发现完成 market=%s trade_date=%s run_id=%d status=%s scanned=%d items=%d failed=%d", market, tradeDate, run.ID, run.Status, run.ScannedCount, run.SuccessCount, run.FailedCount)
 	return &run, nil
+}
+
+func markDiscoveryFailed(runID int64, err error) {
+	if common.DB == nil || err == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if writeErr := common.DB.WithContext(ctx).Model(&model.CandidateDiscoveryRun{}).
+		Where("id = ? AND status = ?", runID, DiscoveryRunStatusProc).
+		Updates(map[string]any{"status": DiscoveryRunStatusFail, "error": sanitizeJobError(err.Error()), "finished_at": time.Now()}).Error; writeErr != nil {
+		common.SysWarn("发现运行失败状态写入失败 run=%d: %v", runID, writeErr)
+	}
 }
 
 func registerDiscoveryBinding() durableJobBinding {
@@ -606,7 +679,7 @@ func registerDiscoveryBinding() durableJobBinding {
 			if run.ResultID == nil {
 				return errors.New("发现作业缺少结果引用")
 			}
-			return tx.Model(&model.CandidateDiscoveryRun{}).Where("id = ?", *run.ResultID).Updates(map[string]any{"status": DiscoveryRunStatusFail, "error": truncate(message, 512), "finished_at": now}).Error
+			return tx.Model(&model.CandidateDiscoveryRun{}).Where("id = ? AND job_run_id = ? AND status = ?", *run.ResultID, run.ID, DiscoveryRunStatusProc).Updates(map[string]any{"status": DiscoveryRunStatusFail, "error": truncate(message, 512), "finished_at": now}).Error
 		},
 	}
 }
@@ -713,7 +786,7 @@ func ScheduleDiscoveryStartupBackfill() {
 }
 
 // LatestDiscoveryStatus 返回全局最新发现运行及其短名单，供管理/推荐状态页使用。
-func LatestDiscoveryStatus(limit int) (*model.CandidateDiscoveryRun, []model.CandidateDiscoveryItem, error) {
+func LatestDiscoveryStatus(limit int, contexts ...context.Context) (*model.CandidateDiscoveryRun, []model.CandidateDiscoveryItem, error) {
 	if common.DB == nil {
 		return nil, nil, errors.New("数据库不可用")
 	}
@@ -721,18 +794,24 @@ func LatestDiscoveryStatus(limit int) (*model.CandidateDiscoveryRun, []model.Can
 		limit = 100
 	}
 	var run model.CandidateDiscoveryRun
-	if err := common.DB.Where("owner_type = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ?", model.JobOwnerSystem, DiscoveryVersion, factorSnapshotVersion, discoveryParameterHash()).Order("trade_date DESC, id DESC").First(&run).Error; err != nil {
-		return nil, nil, err
-	}
-	var items []model.CandidateDiscoveryItem
-	// rank 是 MySQL 8.0.2+ 保留字，须 OrderByColumn 加引号（同 mood.go 先例）。
-	// limit 按**每通道**生效：单一全局 limit 会在满池时只返回字母序靠前的通道，
-	// 把其余通道显示成空池、与 run.success_count 矛盾。
-	perChannel := limit
 	var rows []model.CandidateDiscoveryItem
-	if err := common.DB.Where("run_id = ?", run.ID).Order("channel").
-		Order(clause.OrderByColumn{Column: clause.Column{Name: "rank"}}).
-		Order("symbol").Find(&rows).Error; err != nil {
+	items := []model.CandidateDiscoveryItem{}
+	perChannel := limit
+	err := readSnapshotTx(jobSubmissionContext(contexts...), func(tx *gorm.DB) error {
+		if err := tx.Where("owner_type = ? AND discovery_version = ? AND factor_version = ? AND parameter_hash = ? AND market = ? AND trade_date <= ?", model.JobOwnerSystem, DiscoveryVersion, factorSnapshotVersion, discoveryParameterHash(), "cn", time.Now().Format("2006-01-02")).Order("trade_date DESC, id DESC").First(&run).Error; err != nil {
+			return err
+		}
+		// rank 是 MySQL 8.0.2+ 保留字，须 OrderByColumn 加引号（同 mood.go 先例）。
+		// limit 按**每通道**生效：单一全局 limit 会在满池时只返回字母序靠前的通道，
+		// 把其余通道显示成空池、与 run.success_count 矛盾。
+		if err := tx.Where("run_id = ?", run.ID).Order("channel").
+			Order(clause.OrderByColumn{Column: clause.Column{Name: "rank"}}).
+			Order("symbol").Find(&rows).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, nil, err
 	}
 	counts := map[string]int{}

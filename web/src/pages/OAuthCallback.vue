@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { onUnmounted, ref, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { NSpin, NResult, NButton } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
@@ -20,6 +20,9 @@ const binding = ref(false)
 const mobile = ref<'' | 'browser' | 'app'>('')
 // 深链地址：换短码成功后自动跳转，并常驻兜底按钮（部分浏览器拦自动跳转）。
 const deepLink = ref('')
+let active = true
+let runSequence = 0
+onUnmounted(() => { active = false; runSequence++ })
 
 // GitHub 侧未完成授权（用户取消等）会带 error/error_description 回跳。
 // error_description 是外部可构造的 URL 参数：必须走 authErrorText 做长度上限与敏感词
@@ -33,7 +36,7 @@ function githubSideError(): string {
 
 // mode=mobile：本页运行在系统浏览器（无原生桥、无登录态）。用 code+state 换
 // 一次性短码，经 quantvista:// 深链带回 App——token 绝不落在系统浏览器。
-async function runMobileBrowserLeg() {
+async function runMobileBrowserLeg(isCurrent: () => boolean) {
   const code = route.query.code as string
   const state = route.query.state as string
   if (!code || !state) {
@@ -43,19 +46,20 @@ async function runMobileBrowserLeg() {
   try {
     // redirect_uri 与发起端（auth store mobileRedirectURI）字节一致。
     const { auth_code } = await githubMobileCallback(code, state, `${location.origin}/login/callback?mode=mobile`)
+    if (!isCurrent()) return
     deepLink.value = `quantvista://oauth/callback?code=${encodeURIComponent(auth_code)}`
     location.href = deepLink.value
   } catch (e) {
-    error.value = authErrorText(e, 'GitHub 授权暂不可用，请重新发起登录')
+    if (isCurrent()) error.value = authErrorText(e, 'GitHub 授权暂不可用，请重新发起登录')
   }
 }
 
 // mode=mobile-exchange：本页运行在 App WebView（深链翻译进来），凭短码+verifier
 // 兑换双 token。失败短码即作废，只能回登录页整个重来。
-async function runMobileAppLeg() {
+async function runMobileAppLeg(isCurrent: () => boolean) {
   if (isNativeApp) {
     // 收掉授权用的 Custom Tab（还停留在回调页），失败不阻塞兑换。
-    import('@capacitor/browser').then(({ Browser }) => Browser.close()).catch(() => {})
+    import('@capacitor/browser').then(({ Browser }) => { if (isCurrent()) return Browser.close() }).catch(() => {})
   }
   const authCode = route.query.code as string
   if (!authCode) {
@@ -63,39 +67,44 @@ async function runMobileAppLeg() {
     return
   }
   try {
-    await auth.finishMobileExchange(authCode)
+    await auth.finishMobileExchange(authCode, isCurrent)
+    if (!isCurrent()) return
     const redirect = safeInternalRoute(sessionStorage.getItem('qv_login_redirect'))
     sessionStorage.removeItem('qv_login_redirect')
     router.replace(redirect)
   } catch (e) {
-    error.value = authErrorText(e, 'App 登录交换失败，请重新发起登录')
+    if (isCurrent()) error.value = authErrorText(e, 'App 登录交换失败，请重新发起登录')
   }
 }
-
-onMounted(run)
 
 // 深链可能在本页已挂载时再次进入（如上次失败停在错误页，用户重新授权后
 // nativeShell 翻译的路由与当前同路径不同 query，组件复用、onMounted 不重跑）。
 watch(
   () => route.fullPath,
   () => {
+    runSequence++
     if (route.name !== 'oauth-callback') return
     error.value = ''
     deepLink.value = ''
     mobile.value = ''
+    binding.value = false
     void run()
   },
+  { immediate: true },
 )
 
 async function run() {
+  const sequence = runSequence
+  const fullPath = route.fullPath
+  const isCurrent = () => active && sequence === runSequence && fullPath === route.fullPath
   if (route.query.mode === 'mobile') {
     mobile.value = 'browser'
-    await runMobileBrowserLeg()
+    await runMobileBrowserLeg(isCurrent)
     return
   }
   if (route.query.mode === 'mobile-exchange') {
     mobile.value = 'app'
-    await runMobileAppLeg()
+    await runMobileAppLeg(isCurrent)
     return
   }
   const code = route.query.code as string
@@ -112,16 +121,18 @@ async function run() {
   }
   try {
     if (binding.value) {
-      await auth.finishGithubBind(code, state)
+      await auth.finishGithubBind(code, state, isCurrent)
+      if (!isCurrent()) return
       router.replace('/settings?tab=account')
     } else {
-      await auth.finishGithubLogin(code, state)
+      await auth.finishGithubLogin(code, state, isCurrent)
+      if (!isCurrent()) return
       const redirect = safeInternalRoute(sessionStorage.getItem('qv_login_redirect'))
       sessionStorage.removeItem('qv_login_redirect')
       router.replace(redirect)
     }
   } catch (e) {
-    error.value = authErrorText(e, binding.value ? 'GitHub 绑定失败，请稍后重试' : 'GitHub 登录失败，请重新发起授权')
+    if (isCurrent()) error.value = authErrorText(e, binding.value ? 'GitHub 绑定失败，请稍后重试' : 'GitHub 登录失败，请重新发起授权')
   }
 }
 </script>

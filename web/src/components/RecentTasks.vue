@@ -13,6 +13,7 @@ import {
   type TaskStatus,
 } from '@/api/taskCenter'
 import { isAbortError } from '@/api/client'
+import { getSessionEpoch } from '@/api/token'
 import { useVisibleTaskPolling } from '@/composables/useVisibleTaskPolling'
 import { useUi, withAlpha } from '@/composables/useUi'
 
@@ -25,12 +26,16 @@ const show = ref(false)
 const loading = ref(false)
 const refreshing = ref(false)
 const loadError = ref('')
+const loaded = ref(false)
 let requestController: AbortController | null = null
+let disposed = false
 
 const recent = computed(() => tasks.value.slice(0, 3))
 const hasProcessing = computed(() => activeCount.value > 0)
 const badgeText = computed(() => (activeCount.value > 99 ? '99+' : String(activeCount.value)))
 const processingSummary = computed(() => {
+  if (loadError.value) return '进行中任务数暂不可用'
+  if (!loaded.value) return '正在读取任务状态'
   if (!activeCount.value) return '当前无进行中任务'
   return activeCount.value >= 100 ? '至少 100 项进行中' : `${activeCount.value} 项进行中`
 })
@@ -42,6 +47,8 @@ const styleVars = computed(() => ({
 }))
 
 async function loadRecentTasks() {
+  if (disposed) return
+  const owner = getSessionEpoch()
   requestController?.abort()
   const controller = new AbortController()
   requestController = controller
@@ -56,12 +63,13 @@ async function loadRecentTasks() {
       listTasks({ status: 'running', limit: 100 }, controller.signal),
       listTasks({ status: 'queued', limit: 100 }, controller.signal),
     ])
-    if (requestController === controller) {
+    if (!disposed && requestController === controller && owner === getSessionEpoch()) {
       tasks.value = rows
       activeCount.value = running.length + queued.length
+      loaded.value = true
     }
   } catch (error) {
-    if (!isAbortError(error) && requestController === controller) loadError.value = (error as Error).message
+    if (!isAbortError(error) && !disposed && requestController === controller && owner === getSessionEpoch()) loadError.value = (error as Error).message
   } finally {
     if (requestController === controller) {
       requestController = null
@@ -81,7 +89,11 @@ watch(show, (visible) => {
   if (visible) void refreshNow()
 })
 
-onBeforeUnmount(() => requestController?.abort())
+onBeforeUnmount(() => {
+  disposed = true
+  requestController?.abort()
+  requestController = null
+})
 
 function statusTagType(value: TaskStatus): 'info' | 'success' | 'warning' | 'error' {
   if (value === 'queued' || value === 'running') return 'info'
@@ -116,15 +128,15 @@ function openAll() {
       <button
         type="button"
         class="recent-trigger"
-        :class="{ running: hasProcessing, refreshing }"
-        :aria-label="activeCount ? `最近任务，${processingSummary}` : '最近任务'"
+        :class="{ running: hasProcessing && !loadError, refreshing }"
+        :aria-label="`最近任务，${processingSummary}`"
         title="最近任务"
       >
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
           <circle cx="12" cy="12" r="8" />
           <path d="M12 7v5l3 2" />
         </svg>
-        <span v-if="activeCount" class="running-badge qv-tnum" aria-hidden="true">{{ badgeText }}</span>
+        <span v-if="activeCount && !loadError" class="running-badge qv-tnum" aria-hidden="true">{{ badgeText }}</span>
       </button>
     </template>
 
@@ -145,7 +157,7 @@ function openAll() {
       </div>
 
       <n-spin :show="loading">
-        <n-empty v-if="!recent.length && !loading" size="small" description="还没有任务记录" class="recent-empty" />
+        <n-empty v-if="loaded && !recent.length && !loading && !loadError" size="small" description="还没有任务记录" class="recent-empty" />
         <div v-else class="recent-list">
           <button
             v-for="task in recent"

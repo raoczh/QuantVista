@@ -49,20 +49,20 @@ func (s *DailyReportService) registerDurableJobHandler() {
 			if findErr != nil {
 				return 0, findErr
 			}
+			// auto 与 manual 的请求可各有一个在途作业。即使业务已成功、或正在保留
+			// 旧版本重生成，也须等待原作业收尾，才能接管同一份日报。
+			var owners int64
+			if err := tx.Model(&model.JobRun{}).
+				Where("user_id = ? AND result_type = ? AND result_id = ? AND status IN ?",
+					run.UserID, JobResultDailyReport, report.ID, []string{model.JobStatusQueued, model.JobStatusRunning}).
+				Count(&owners).Error; err != nil {
+				return 0, err
+			}
+			if owners > 0 {
+				return 0, refusalErr(RefusalReportProcessing, "日报已被其他作业接管，请等待原任务结束")
+			}
 			if report.Status == model.ReportStatusProcessing && report.PreviousStatus == "" {
-				// 收养只服务「升级前遗留的无主 processing 行」。auto 与手动的
-				// request_hash 不同，可各建一个在途 JobRun；若该行已被另一在途
-				// 作业绑定，这里收养会让两个 worker 双跑同一份日报。
-				var owners int64
-				if err := tx.Model(&model.JobRun{}).
-					Where("result_type = ? AND result_id = ? AND status IN ?",
-						JobResultDailyReport, report.ID, []string{model.JobStatusQueued, model.JobStatusRunning}).
-					Count(&owners).Error; err != nil {
-					return 0, err
-				}
-				if owners > 0 {
-					return 0, errors.New("日报已被其他作业接管")
-				}
+				// 只收养升级前遗留的无主 processing 行。
 				return report.ID, nil
 			}
 			previous := report.Status
@@ -131,7 +131,7 @@ func (s *DailyReportService) registerDurableJobHandler() {
 			if err := json.Unmarshal(raw, &req); err != nil || req.TradeDate == "" {
 				return DurableJobResult{}, errors.New("日报作业快照无效")
 			}
-			cfg, apiKey, err := s.llm.ResolveForUse(userID, 0)
+			cfg, apiKey, err := s.llm.ResolveForUse(userID, 0, ctx)
 			if err != nil {
 				return DurableJobResult{}, fmt.Errorf("未配置可用的 LLM：%w", err)
 			}

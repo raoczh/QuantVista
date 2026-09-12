@@ -32,10 +32,13 @@ async function load(silent = false) {
     boards.value = data
     loadError.value = ''
     await nextTick()
+    if (mySeq !== loadSeq) return
     renderChart()
   } catch (e) {
     if (mySeq !== loadSeq) return
     boards.value = []
+    chart?.dispose()
+    chart = null
     loadError.value = (e as Error).message
     if (!silent) message.error('板块热度加载失败：' + (e as Error).message)
   } finally {
@@ -85,11 +88,11 @@ function renderChart() {
         if (!b) return ''
         const sign = b.change_pct >= 0 ? '+' : ''
         const col = b.change_pct > 0 ? upColor.value : b.change_pct < 0 ? downColor.value : flatColor.value
-        return `<div style="font-weight:600;margin-bottom:4px">${b.name} <span style="opacity:.6;font-size:12px">${b.code}</span></div>
+        return `<div style="font-weight:600;margin-bottom:4px">${echarts.format.encodeHTML(b.name)} <span style="opacity:.6;font-size:12px">${echarts.format.encodeHTML(b.code)}</span></div>
           <div>涨跌幅：<span style="color:${col};font-weight:600">${sign}${b.change_pct.toFixed(2)}%</span></div>
           <div>成交额：${fmtYi(b.amount)}</div>
           <div>涨/跌家数：<span style="color:${upColor.value}">${b.advances}</span> / <span style="color:${downColor.value}">${b.declines}</span></div>
-          <div>领涨股：${b.leader || '-'}</div>`
+          <div>领涨股：${echarts.format.encodeHTML(b.leader || '-')}</div>`
       },
     },
     series: [
@@ -134,7 +137,13 @@ function renderChart() {
   })
 }
 
-watch(kind, () => load())
+watch(kind, () => {
+  boards.value = []
+  loadError.value = ''
+  chart?.dispose()
+  chart = null
+  load()
+})
 // 必须同时监听 vars：treemap 的格子缝隙色取 vars.bodyColor，3 套浅色主题各不相同
 // （#f3f5fa / #f7f5fb / #faf5f6）。只监听 isDark 时同档换主题不重建，
 // 缝隙会留着上一套主题的底色，在新底色上显出一整片错色网格线。
@@ -159,6 +168,7 @@ onMounted(() => {
   window.addEventListener('resize', onResize)
 })
 onUnmounted(() => {
+  loadSeq++
   window.removeEventListener('resize', onResize)
   chart?.dispose()
   chart = null

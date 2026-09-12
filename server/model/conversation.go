@@ -17,6 +17,7 @@ type AiConversation struct {
 	Name   string `gorm:"size:64" json:"name"`
 	Title  string `gorm:"size:128" json:"title"` // 会话标题（取首个问题）
 
+	// 最近一次成功回答所选配置及实际模型；历次调用仍由消息 RunID 关联审计。
 	LLMConfigID int64  `json:"llm_config_id"`
 	Provider    string `gorm:"size:32" json:"provider"`
 	Model       string `gorm:"size:64" json:"model"`

@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, h, onMounted, ref } from 'vue'
-import { NButton, NDataTable, NPopconfirm, NSpin, NTag, useMessage, type DataTableColumns } from 'naive-ui'
+import { computed, h, onBeforeUnmount, onMounted, ref } from 'vue'
+import { NAlert, NButton, NDataTable, NPopconfirm, NSpin, NTag, useMessage, type DataTableColumns } from 'naive-ui'
 import {
   getJointEval,
   type JointEvalReport,
@@ -11,20 +11,36 @@ import {
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 import { useUi } from '@/composables/useUi'
+import { getSessionEpoch } from '@/api/token'
 
 const message = useMessage()
 const { upColor, downColor } = useUi()
 
 const report = ref<JointEvalReport | null>(null)
 const loading = ref(false)
+const loadError = ref('')
+const pageSession = getSessionEpoch()
+let disposed = false
+const pageActive = () => !disposed && getSessionEpoch() === pageSession
+onBeforeUnmount(() => { disposed = true })
 
 async function load(opts: { refresh?: boolean; includeLocked?: boolean } = {}) {
+  if (!pageActive() || loading.value) return
   loading.value = true
+  loadError.value = ''
   try {
-    report.value = await getJointEval(opts)
-    if (opts.includeLocked) message.warning('已读取锁定测试段并登记审计（调参迭代请只看开发段）')
+    const next = await getJointEval(opts)
+    if (!pageActive()) return
+    report.value = next
+    if (opts.includeLocked) {
+      if (next.sections.some((section) => section.locked)) {
+        message.warning('已读取锁定测试段并登记审计（调参迭代请只看开发段）')
+      } else {
+        message.info('当前没有可读取的锁定测试段')
+      }
+    }
   } catch (e) {
-    message.error((e as Error).message)
+    if (pageActive()) loadError.value = e instanceof Error ? e.message : '联合评估读取失败'
   } finally {
     loading.value = false
   }
@@ -86,7 +102,7 @@ const sliceColumns = computed<DataTableColumns<CalibSliceRow>>(() => [
 <template>
   <PageContainer
     title="组合/回测联合评估"
-    subtitle="P2-5：收益 / Alpha / 最大回撤 / 换手 / 成本 / 覆盖率与校准同屏（纯测量零门控）；按 §9.1 时间切分——开发段随便看，锁定测试段显式请求且每次读取登记审计"
+    subtitle="收益、Alpha、回撤、换手、成本与校准；开发段用于日常研究，锁定测试段用于发布前验收，每次读取都会登记审计"
   >
     <div class="je-wrap">
       <SectionCard title="联合评估">
@@ -98,10 +114,10 @@ const sliceColumns = computed<DataTableColumns<CalibSliceRow>>(() => [
             <n-tag v-if="report?.locked_audit?.count" size="small" type="warning" :bordered="false">
               锁定段已读 {{ report.locked_audit.count }} 次（最近 {{ report.locked_audit.last_at }}）
             </n-tag>
-            <n-button size="small" :loading="loading" @click="load({ refresh: true })">重新计算</n-button>
-            <n-popconfirm @positive-click="load({ includeLocked: true })">
+            <n-button size="small" :loading="loading" :disabled="loading" @click="load({ refresh: true })">重新计算</n-button>
+            <n-popconfirm :disabled="loading" :positive-button-props="{ loading, disabled: loading }" @positive-click="load({ includeLocked: true })">
               <template #trigger>
-                <n-button size="small" type="warning" :loading="loading">读取锁定段</n-button>
+                <n-button size="small" type="warning" :loading="loading" :disabled="loading">读取锁定段</n-button>
               </template>
               锁定测试段留给发布前验收，每次读取都会登记审计（当前已读
               {{ report?.locked_audit?.count || 0 }} 次）。调参迭代只看开发段——确定读取？
@@ -109,6 +125,7 @@ const sliceColumns = computed<DataTableColumns<CalibSliceRow>>(() => [
           </div>
         </template>
         <n-spin :show="loading">
+          <n-alert v-if="loadError" type="error" :show-icon="false">{{ loadError }}</n-alert>
           <div v-if="report">
             <div v-for="sec in report.sections" :key="sec.type" class="je-block">
               <div class="je-head">
@@ -154,7 +171,7 @@ const sliceColumns = computed<DataTableColumns<CalibSliceRow>>(() => [
               <div v-for="(n, i) in report.notes" :key="'g' + i">{{ n }}</div>
             </div>
           </div>
-          <div v-else-if="!loading" class="je-empty">暂无数据：点「重新计算」生成（需已积累成熟标签）。</div>
+          <div v-else-if="!loading && !loadError" class="je-empty">暂无数据：点「重新计算」生成（需已积累成熟标签）。</div>
         </n-spin>
       </SectionCard>
     </div>
