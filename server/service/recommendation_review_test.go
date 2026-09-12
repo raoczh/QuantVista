@@ -47,6 +47,9 @@ func TestRecommendationJobKeepsSubmittedStrategyRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := attachRecommendationJobRuntime(&job, *plan.newProcessingBatch()); err != nil {
+		t.Fatal(err)
+	}
 	restored, err := svc.prepareGenerationWithSnapshot(userID, true, job.Request, job.Manual, job.PreferenceSnapshot)
 	if err != nil {
 		t.Fatal(err)
@@ -123,7 +126,7 @@ func TestRecommendationYearLineMatchesScreener(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := []candidate{{Symbol: "600101", Market: "cn", Name: "年线样本", Price: 10, Amount: 2e8, TurnoverRate: 2}}
+	pool := []candidate{{Symbol: "600101", Market: "cn", Name: "年线样本", Price: 10, Amount: 2e8, TurnoverRate: 2, QuoteAsOf: bars[len(bars)-1].TradeDate + " 15:00"}}
 	svc.scorePool(context.Background(), model.RecTypeShortTerm, strat, pool, RecFilters{}, nil)
 	if hit := pool[0].StrategyHit; hit == nil || !hit.Full {
 		t.Fatalf("同一日线的选股与推荐命中应一致：%+v", hit)

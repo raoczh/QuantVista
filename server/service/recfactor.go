@@ -232,28 +232,26 @@ func stddev(xs []float64) float64 {
 // 与策略意图对齐，加分项只做细化；computeScore 本身不动（个股详情/对比/走查复刻共用）。
 // 选股类推荐策略沿用其映射的基础推荐策略权重。
 func strategyDimWeights(recType, baseKey string) (trend, momentum, position, volume, risk float64) {
-	if recType == model.RecTypeShortTerm {
-		switch baseKey {
-		case "pullback":
-			// 强势回踩：趋势仍要强（前期强势），动量与位置弱化（回调中本就不涨、不在高位），
-			// 风险维加重（回撤/ATR 可控才是健康回踩）。
-			return 0.35, 0.10, 0.05, 0.10, 0.40
-		case "active":
-			// 热点活跃：量能是主信号，动量次之。
-			return 0.20, 0.25, 0.10, 0.35, 0.10
-		default: // momentum
-			return 0.30, 0.30, 0.15, 0.15, 0.10
-		}
-	}
 	switch baseKey {
+	case "balanced":
+		return 0.20, 0.20, 0.20, 0.20, 0.20
+	case "pullback":
+		return 0.35, 0.10, 0.05, 0.10, 0.40
+	case "active":
+		return 0.20, 0.25, 0.10, 0.35, 0.10
+	case "momentum":
+		return 0.30, 0.30, 0.15, 0.15, 0.10
 	case "value":
-		// 价值低估：稳健优先——风险维主导，趋势/动量只作确认，位置几乎不计（低位是特征不是缺陷）。
 		return 0.15, 0.10, 0.05, 0.10, 0.60
 	case "leader":
-		// 龙头优选：确定性与稳定性——趋势 + 风险。
 		return 0.30, 0.15, 0.10, 0.10, 0.35
-	default: // growth
+	case "growth":
 		return 0.35, 0.25, 0.15, 0.10, 0.15
+	default:
+		if recType == model.RecTypeShortTerm {
+			return strategyDimWeights(recType, "momentum")
+		}
+		return strategyDimWeights(recType, "growth")
 	}
 }
 
@@ -363,56 +361,58 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 				add(2, fmt.Sprintf("早盘1小时强势 %.1f%% 且尾盘未回吐", f.MorningChg))
 			}
 		}
-		switch stratKey {
-		case "momentum":
-			if f.High20d {
-				add(6, "收盘创20日新高")
-			}
-			if f.BullAlign {
-				add(5, "MA5>MA10>MA20 多头排列")
-			}
-			if f.VolBoost >= 1.5 && f.VolBoost <= 5 {
-				add(4, fmt.Sprintf("放量健康（%.1f 倍）", f.VolBoost))
-			}
-			// T1：水上金叉是动量策略最经典的确认信号；RSI 强势区不过热再确认。
-			if f.MACDXUp && f.MACDDif > 0 {
-				add(4, "MACD 水上金叉（近3日）")
-			}
-			if f.RSI14 >= 55 && f.RSI14 <= 70 {
-				add(3, fmt.Sprintf("RSI %.0f 强势区未过热", f.RSI14))
-			}
-		case "pullback":
-			if f.Chg20d >= 15 {
-				add(5, fmt.Sprintf("近20日涨 %.1f%% 前期强势", f.Chg20d))
-			}
-			if f.AboveMA20 && f.Chg5d <= 0 && f.Chg5d >= -6 {
-				add(5, fmt.Sprintf("近5日回调 %.1f%% 未破MA20", f.Chg5d))
-			}
-			if f.Vol5v20 > 0 && f.Vol5v20 < 0.9 {
-				add(3, "回调缩量（供给衰竭）")
-			}
-			// T1：RSI 回落至中低位=回调充分未超卖；回踩至布林中轨下方（带内下半区）。
-			if f.RSI14 >= 30 && f.RSI14 <= 45 {
-				add(3, fmt.Sprintf("RSI %.0f 回调充分未超卖", f.RSI14))
-			}
-			if f.BollMid > 0 && f.BollPos >= 10 && f.BollPos <= 50 {
-				add(3, fmt.Sprintf("回踩布林带下半区（带内 %.0f%%）", f.BollPos))
-			}
-		case "active":
-			if c.TurnoverRate >= 5 && c.TurnoverRate <= 15 {
-				add(5, fmt.Sprintf("换手 %.1f%% 活跃区间", c.TurnoverRate))
-			}
-			if f.VolBoost >= 2 {
-				add(4, fmt.Sprintf("显著放量（%.1f 倍）", f.VolBoost))
-			}
-			if c.VolumeRatio >= 1.5 && c.VolumeRatio <= 5 {
-				add(3, fmt.Sprintf("实时量比 %.1f 温和放量", c.VolumeRatio))
-			}
+	}
+	switch stratKey {
+	case "momentum":
+		if f.High20d {
+			add(6, "收盘创20日新高")
 		}
+		if f.BullAlign {
+			add(5, "MA5>MA10>MA20 多头排列")
+		}
+		if f.VolBoost >= 1.5 && f.VolBoost <= 5 {
+			add(4, fmt.Sprintf("放量健康（%.1f 倍）", f.VolBoost))
+		}
+		// T1：水上金叉是动量策略最经典的确认信号；RSI 强势区不过热再确认。
+		if f.MACDXUp && f.MACDDif > 0 {
+			add(4, "MACD 水上金叉（近3日）")
+		}
+		if f.RSI14 >= 55 && f.RSI14 <= 70 {
+			add(3, fmt.Sprintf("RSI %.0f 强势区未过热", f.RSI14))
+		}
+	case "pullback":
+		if f.Chg20d >= 15 {
+			add(5, fmt.Sprintf("近20日涨 %.1f%% 前期强势", f.Chg20d))
+		}
+		if f.AboveMA20 && f.Chg5d <= 0 && f.Chg5d >= -6 {
+			add(5, fmt.Sprintf("近5日回调 %.1f%% 未破MA20", f.Chg5d))
+		}
+		if f.Vol5v20 > 0 && f.Vol5v20 < 0.9 {
+			add(3, "回调缩量（供给衰竭）")
+		}
+		// T1：RSI 回落至中低位=回调充分未超卖；回踩至布林中轨下方（带内下半区）。
+		if f.RSI14 >= 30 && f.RSI14 <= 45 {
+			add(3, fmt.Sprintf("RSI %.0f 回调充分未超卖", f.RSI14))
+		}
+		if f.BollMid > 0 && f.BollPos >= 10 && f.BollPos <= 50 {
+			add(3, fmt.Sprintf("回踩布林带下半区（带内 %.0f%%）", f.BollPos))
+		}
+	case "active":
+		if c.TurnoverRate >= 5 && c.TurnoverRate <= 15 {
+			add(5, fmt.Sprintf("换手 %.1f%% 活跃区间", c.TurnoverRate))
+		}
+		if f.VolBoost >= 2 {
+			add(4, fmt.Sprintf("显著放量（%.1f 倍）", f.VolBoost))
+		}
+		if c.VolumeRatio >= 1.5 && c.VolumeRatio <= 5 {
+			add(3, fmt.Sprintf("实时量比 %.1f 温和放量", c.VolumeRatio))
+		}
+	}
+	if !profileUsesFinance(stratKey) {
 		return delta, notes
 	}
 
-	// 长线：估值与稳定性导向（估值缺失只是不加分，不虚构）。
+	// 财务型评分：估值与稳定性导向（估值缺失只是不加分，不虚构）。
 	// 严格 <0 才判亏损：PETTM==0 是「估值缺失」而非亏损（腾讯估值失败但新浪
 	// 榜单 PB 兜底存在时，旧条件 <=0 && PB>0 会把缺失误标成「PE 为负」假证据）。
 	if c.PETTM < 0 {
@@ -469,7 +469,7 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 		if f.Chg20d > 0 && f.Chg20d <= 25 {
 			add(4, fmt.Sprintf("近20日涨 %.1f%% 趋势健康", f.Chg20d))
 		}
-		if f.Bias20 > 20 {
+		if f.Bias20 > 20 && recType != model.RecTypeShortTerm {
 			add(-6, fmt.Sprintf("MA20乖离 %.1f%% 追高风险", f.Bias20))
 		}
 		// T1：MACD 水上多头=中期趋势的动量确认。
@@ -580,12 +580,27 @@ func candidateLabeledValues(c candidate) []labeledValue {
 	out = append(out, labeledVals("量比", c.VolumeRatio)...)
 	out = append(out, labeledVals("振幅%", c.Amplitude)...)
 	out = append(out, labeledVals("量化分", c.Score)...)
+	if c.RankingScore != nil {
+		out = append(out, labeledVals("排序分", *c.RankingScore)...)
+	}
 	out = append(out, labeledVals("情绪分", c.SentiScore)...)
 	out = append(out, labeledVals("龙虎榜净买(亿)", c.LhbNetYi)...)
 	out = append(out, labeledVals("机构净买(亿)", c.OrgNetYi)...)
 	out = append(out, labeledVals("人气排名", float64(c.PopRank))...)
 	out = append(out, labeledVals("人气前值", float64(c.PopPrev))...)
 	out = append(out, labeledVals("机构买入家数", float64(c.OrgBuys))...)
+	out = append(out, signalQualityLabeledValues(c.SignalQuality)...)
+	if c.Timing != nil {
+		out = append(out, labeledVals("time_facts.signal_close", c.Timing.SignalClose)...)
+		for _, key := range []string{"5", "20", "60"} {
+			if v, ok := c.Timing.CurrentReturns[key]; ok {
+				out = append(out, labeledVals("time_facts.current_returns."+key, v)...)
+			}
+		}
+	}
+	if c.FinalCheck != nil {
+		out = append(out, labeledVals("final_check.price", c.FinalCheck.Price)...)
+	}
 	if c.Factors != nil {
 		f := c.Factors
 		out = append(out, labeledVals("factors.ma5", f.MA5)...)

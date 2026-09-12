@@ -156,8 +156,26 @@ assert.deepEqual(recPresentation.parseCandidateSnapshot(''), { items: [], invali
 assert.equal(recPresentation.parseRejectedSnapshot('[null]').invalid, true)
 assert.equal(recPresentation.rankedScore(undefined, 1), 0, '旧快照遗漏零分时按已计算排名恢复真实零值')
 assert.equal(recPresentation.rankedScore(undefined, undefined), undefined, '未计算排名不能伪造零分')
+const rankingSnapshot = { symbol: '600001', change_pct: 0, score: 0, ranking_score: 0, rank: 1 }
+assert.deepEqual(recPresentation.parseCandidateSnapshot(JSON.stringify([rankingSnapshot])), {
+  items: [rankingSnapshot], invalid: false,
+}, '完整排序分为零时必须保留，不能当成历史缺失')
+assert.deepEqual(recPresentation.parseCandidateSnapshot('[{"symbol":"600001","change_pct":0,"score":100,"ranking_score":1e999}]'), {
+  items: [], invalid: true,
+}, '非有限排序分不得进入候选展示')
+assert.deepEqual(recPresentation.parseCandidateSnapshot('[{"symbol":"600001","change_pct":0,"ranking_score":"118"}]'), {
+  items: [], invalid: true,
+}, '损坏快照中的字符串分值不能冒充有效评分')
 assert.equal(recPresentation.omittedCandidates('{"pool_omitted":90}'), 90)
 assert.equal(recPresentation.omittedCandidates('{"pool_omitted":"90"}'), 0)
+const scoreDetail = { version: 'qr1', profile: 'momentum', valid: true, total: 0, components: [{ key: 'entry', value: 0, status: 'available' }] }
+assert.equal(recPresentation.parseCandidateSnapshot(JSON.stringify([{ ...validCandidate, score_breakdown: scoreDetail }])).invalid, false, '质量分组的零值应正确展示')
+for (const score_breakdown of [{ ...scoreDetail, components: null }, { ...scoreDetail, components: [{ key: 'entry', value: '错误', status: 'available' }] }]) {
+  assert.equal(recPresentation.parseCandidateSnapshot(JSON.stringify([{ ...validCandidate, score_breakdown }])).invalid, true, '损坏评分分组不能导致页面数值格式化异常')
+}
+assert.equal(recPresentation.parseCandidateSnapshot(JSON.stringify([{ ...validCandidate, scoring_comparison: { legacy_version: 'additive_sp1', legacy_score: 0, quality_version: 'qr1', quality_score: 0, learned_score: 0 } }])).invalid, false, '评分对照必须保留真实零值')
+assert.equal(recPresentation.scoringVersionLabel(), '历史未记录', '旧记录不能按当前算法补标签')
+assert.equal(recPresentation.scoringVersionLabel('ridge1'), '学习排序', '学习排序标签不应隐含已经验证收益更好')
 
 const analysisPresentation = loadTypeScript('src/components/analysis/analysisPresentation.ts')
 assert.equal(analysisPresentation.recordStockName({ symbol: '600000', target: '600000', title: '浦发银行' }), '浦发银行')

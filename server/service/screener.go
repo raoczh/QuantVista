@@ -149,11 +149,11 @@ func evalCondRow(t *FactorTable, n *CondNode, i int) bool {
 		return false
 	}
 	col := t.Col(n.Factor)
-	if col == nil {
+	if i < 0 || i >= len(col) {
 		return false
 	}
 	v := col[i]
-	if math.IsNaN(v) {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
 		return false
 	}
 	switch n.Op {
@@ -167,11 +167,11 @@ func evalCondRow(t *FactorTable, n *CondNode, i int) bool {
 	var rhs float64
 	if n.Ref != "" {
 		refCol := t.Col(n.Ref)
-		if refCol == nil {
+		if i >= len(refCol) {
 			return false
 		}
 		rhs = refCol[i]
-		if math.IsNaN(rhs) {
+		if math.IsNaN(rhs) || math.IsInf(rhs, 0) {
 			return false
 		}
 	} else {
@@ -290,7 +290,7 @@ func opText(op string) string {
 
 // fmtFactorVal 按因子类型格式化数值（人话化与前端展示口径一致）。
 func fmtFactorVal(def factorDef, v float64) string {
-	if math.IsNaN(v) {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
 		return "无数据"
 	}
 	switch def.Kind {
@@ -324,28 +324,31 @@ const (
 // ScanRequest 扫描入参：template_key（新手模板）/ strategy_key（内置）/
 // strategy_id（自定义）/ tree（临时试跑）四选一。
 type ScanRequest struct {
-	TemplateKey        string             `json:"template_key"`
-	TemplateVersion    int                `json:"template_version"`
-	TemplateParams     map[string]float64 `json:"template_params,omitempty"`
-	StrategyKey        string             `json:"strategy_key"`
-	StrategyID         int64              `json:"strategy_id"`
-	StrategyRevisionID int64              `json:"strategy_revision_id"`
-	Tree               *CondNode          `json:"tree"`
-	IncludeST          bool               `json:"include_st"`    // 默认排除 ST/退市警示
-	IncludeStale       bool               `json:"include_stale"` // 默认排除末根≠最新交易日的股（停牌/滞后，旧价因子会误导）
-	Limit              int                `json:"limit"`
+	TemplateKey          string                      `json:"template_key"`
+	TemplateVersion      int                         `json:"template_version"`
+	TemplateParams       map[string]float64          `json:"template_params,omitempty"`
+	StrategyKey          string                      `json:"strategy_key"`
+	StrategyID           int64                       `json:"strategy_id"`
+	StrategyRevisionID   int64                       `json:"strategy_revision_id"`
+	Tree                 *CondNode                   `json:"tree"`
+	IncludeST            bool                        `json:"include_st"`    // 默认排除 ST/退市警示
+	IncludeStale         bool                        `json:"include_stale"` // 默认排除末根≠最新交易日的股（停牌/滞后，旧价因子会误导）
+	Limit                int                         `json:"limit"`
+	preselectionProfile  string                      // 仅推荐内部使用，普通选股请求保持原有排序契约
+	frozenRecommendation *recommendationFrozenScreen // 仅作业恢复注入，HTTP 无法提交
 }
 
 // ScanHit 单只命中：行情摘要 + 人话命中原因。
 type ScanHit struct {
-	Symbol       string   `json:"symbol"`
-	Name         string   `json:"name"`
-	Price        float64  `json:"price"` // 宽表收盘价（数据日期见 ScanResult.TradeDate）
-	ChgPct       float64  `json:"chg_pct"`
-	AmountYi     float64  `json:"amount_yi"`
-	TurnoverRate *float64 `json:"turnover_rate,omitempty"`
-	Pos60        *float64 `json:"pos_60,omitempty"`
-	Reasons      []string `json:"reasons"`
+	Symbol       string           `json:"symbol"`
+	Name         string           `json:"name"`
+	Price        float64          `json:"price"` // 宽表收盘价（数据日期见 ScanResult.TradeDate）
+	ChgPct       float64          `json:"chg_pct"`
+	AmountYi     float64          `json:"amount_yi"`
+	TurnoverRate *float64         `json:"turnover_rate,omitempty"`
+	Pos60        *float64         `json:"pos_60,omitempty"`
+	Reasons      []string         `json:"reasons"`
+	Preselection *recPreselection `json:"preselection,omitempty"`
 }
 
 // ScanResult 扫描结果：命中列表 + 全景计数（引擎排除了什么全透明）。
@@ -451,18 +454,26 @@ func (s *ScreenerService) Scan(ctx context.Context, userID int64, req ScanReques
 	}
 	res.Matched = len(matchedIdx)
 
-	// 成交额降序（活跃优先），前 limit 只生成人话原因。
+	// 推荐对全部命中先做策略相关预选；普通选股保持成交额排序。
 	amountCol := t.Col("amount_yi")
-	sort.Slice(matchedIdx, func(a, b int) bool {
-		av, bv := amountCol[matchedIdx[a]], amountCol[matchedIdx[b]]
-		if math.IsNaN(av) {
-			av = -1
-		}
-		if math.IsNaN(bv) {
-			bv = -1
-		}
-		return av > bv
-	})
+	preselected := map[int]*recPreselection{}
+	if req.preselectionProfile != "" {
+		preselected = rankRecommendationScan(t, matchedIdx, req.preselectionProfile, limit)
+	} else {
+		sort.Slice(matchedIdx, func(a, b int) bool {
+			av, bv := amountCol[matchedIdx[a]], amountCol[matchedIdx[b]]
+			if math.IsNaN(av) {
+				av = -1
+			}
+			if math.IsNaN(bv) {
+				bv = -1
+			}
+			if av != bv {
+				return av > bv
+			}
+			return t.Symbols[matchedIdx[a]] < t.Symbols[matchedIdx[b]]
+		})
+	}
 	if len(matchedIdx) > limit {
 		matchedIdx = matchedIdx[:limit]
 		res.Truncated = true
@@ -491,6 +502,7 @@ func (s *ScreenerService) Scan(ctx context.Context, userID int64, req ScanReques
 			AmountYi:     nz(amountCol[i]),
 			TurnoverRate: optional(turnCol[i]),
 			Pos60:        optional(posCol[i]),
+			Preselection: preselected[i],
 		}
 		explainRow(t, tree, i, &hit.Reasons)
 		res.Items = append(res.Items, hit)
@@ -517,6 +529,16 @@ func (s *ScreenerService) resolveStrategy(userID int64, req ScanRequest, context
 	ctx := jobSubmissionContext(contexts...)
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if frozen := req.frozenRecommendation; frozen != nil {
+		if frozen.UserID != userID {
+			return nil, errors.New("冻结推荐策略不属于当前用户")
+		}
+		tree, raw, err := canonicalCondTree(frozen.Tree)
+		if err != nil {
+			return nil, err
+		}
+		return &resolvedScreenerStrategy{Tree: tree, Name: frozen.Name, StrategyID: frozen.StrategyID, RevisionID: frozen.RevisionID, Hash: rankingJSONHash(raw)}, nil
 	}
 	sources := 0
 	if req.TemplateKey != "" {
@@ -678,23 +700,25 @@ type CustomStrategyView struct {
 	Desc              string    `json:"desc"`
 	Period            string    `json:"period"`
 	Risk              string    `json:"risk"`
+	ScoreProfile      string    `json:"score_profile,omitempty"`
 	Tree              *CondNode `json:"tree"`
 	Conditions        []string  `json:"conditions"`
 }
 
 // StrategyRevisionView 历史快照。ID 是 revision 主键，StrategyID 是所属策略。
 type StrategyRevisionView struct {
-	ID          int64     `json:"id"`
-	StrategyID  int64     `json:"strategy_id"`
-	Revision    int       `json:"revision"`
-	ContentHash string    `json:"content_hash"`
-	Name        string    `json:"name"`
-	Desc        string    `json:"desc"`
-	Period      string    `json:"period"`
-	Risk        string    `json:"risk"`
-	Tree        *CondNode `json:"tree"`
-	Conditions  []string  `json:"conditions"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID           int64     `json:"id"`
+	StrategyID   int64     `json:"strategy_id"`
+	Revision     int       `json:"revision"`
+	ContentHash  string    `json:"content_hash"`
+	Name         string    `json:"name"`
+	Desc         string    `json:"desc"`
+	Period       string    `json:"period"`
+	Risk         string    `json:"risk"`
+	ScoreProfile string    `json:"score_profile,omitempty"`
+	Tree         *CondNode `json:"tree"`
+	Conditions   []string  `json:"conditions"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type StrategyHistoryView struct {
@@ -806,6 +830,7 @@ type SaveStrategyRequest struct {
 	Desc           string    `json:"desc"`
 	Period         string    `json:"period"`
 	Risk           string    `json:"risk"`
+	ScoreProfile   *string   `json:"score_profile,omitempty"` // nil=更新时保留，显式值随 revision 固化
 	Tree           *CondNode `json:"tree"`
 }
 
@@ -849,6 +874,13 @@ func (s *ScreenerService) SaveStrategyContext(ctx context.Context, userID int64,
 	if !validScreenRisk(req.Risk) {
 		req.Risk = "mid"
 	}
+	if req.ScoreProfile != nil {
+		profile := strings.ToLower(strings.TrimSpace(*req.ScoreProfile))
+		if !model.ValidStrategyScoreProfile(profile) {
+			return nil, errors.New("请选择有效的策略评分方式")
+		}
+		req.ScoreProfile = &profile
+	}
 	treeJSONRaw, err := json.Marshal(req.Tree)
 	if err != nil {
 		return nil, err
@@ -858,15 +890,23 @@ func (s *ScreenerService) SaveStrategyContext(ctx context.Context, userID int64,
 		return nil, fmt.Errorf("策略条件规范化失败: %w", err)
 	}
 	req.Desc = truncateRunes(req.Desc, 256)
-	hash, err := model.ScreenerStrategyContentHash(req.Name, req.Desc, req.Period, req.Risk, treeJSON)
-	if err != nil {
-		return nil, fmt.Errorf("策略摘要生成失败: %w", err)
+	profileAndHash := func(previous string) (string, string, error) {
+		profile := previous
+		if req.ScoreProfile != nil {
+			profile = *req.ScoreProfile
+		}
+		hash, err := model.ScreenerStrategyContentHash(req.Name, req.Desc, req.Period, req.Risk, treeJSON, profile)
+		return profile, hash, err
 	}
 
 	var out *CustomStrategyView
 	runTransaction := func() error {
 		return common.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			if req.ID == 0 {
+				profile, hash, err := profileAndHash("")
+				if err != nil {
+					return fmt.Errorf("策略摘要生成失败: %w", err)
+				}
 				// MySQL 用当前用户已有策略行的 next-key lock 串行化“计数+创建”，
 				// 防止两个页面同时在 49 条时都越过上限。SQLite 由下方事务重试收敛。
 				var active []model.ScreenerStrategy
@@ -882,14 +922,14 @@ func (s *ScreenerService) SaveStrategyContext(ctx context.Context, userID int64,
 				}
 				strategy := model.ScreenerStrategy{
 					UserID: userID, Name: req.Name, Desc: req.Desc,
-					Period: req.Period, Risk: req.Risk, TreeJSON: treeJSON,
+					Period: req.Period, Risk: req.Risk, ScoreProfile: profile, TreeJSON: treeJSON,
 				}
 				if err := tx.Create(&strategy).Error; err != nil {
 					return err
 				}
 				revision := model.ScreenerStrategyRevision{
 					UserID: userID, StrategyID: strategy.ID, Revision: 1, ContentHash: hash,
-					Name: req.Name, Desc: req.Desc, Period: req.Period, Risk: req.Risk, TreeJSON: treeJSON,
+					Name: req.Name, Desc: req.Desc, Period: req.Period, Risk: req.Risk, ScoreProfile: profile, TreeJSON: treeJSON,
 				}
 				if err := tx.Create(&revision).Error; err != nil {
 					return err
@@ -925,6 +965,10 @@ func (s *ScreenerService) SaveStrategyContext(ctx context.Context, userID int64,
 				}
 				return err
 			}
+			profile, hash, err := profileAndHash(current.ScoreProfile)
+			if err != nil {
+				return fmt.Errorf("策略摘要生成失败: %w", err)
+			}
 			if current.ContentHash == hash {
 				view := customStrategyViewFromRevision(strategy.ID, current.ID, current)
 				out = &view
@@ -933,7 +977,7 @@ func (s *ScreenerService) SaveStrategyContext(ctx context.Context, userID int64,
 
 			revision := model.ScreenerStrategyRevision{
 				UserID: userID, StrategyID: strategy.ID, Revision: current.Revision + 1, ContentHash: hash,
-				Name: req.Name, Desc: req.Desc, Period: req.Period, Risk: req.Risk, TreeJSON: treeJSON,
+				Name: req.Name, Desc: req.Desc, Period: req.Period, Risk: req.Risk, ScoreProfile: profile, TreeJSON: treeJSON,
 			}
 			if err := tx.Create(&revision).Error; err != nil {
 				return err
@@ -947,6 +991,7 @@ func (s *ScreenerService) SaveStrategyContext(ctx context.Context, userID int64,
 					"desc":                revision.Desc,
 					"period":              revision.Period,
 					"risk":                revision.Risk,
+					"score_profile":       revision.ScoreProfile,
 					"tree_json":           revision.TreeJSON,
 				})
 			if res.Error != nil {
@@ -1017,6 +1062,7 @@ func customStrategyViewFromRevision(strategyID, currentRevisionID int64, revisio
 		ID: strategyID, CurrentRevisionID: currentRevisionID,
 		Revision: revision.Revision, ContentHash: revision.ContentHash,
 		Name: revision.Name, Desc: revision.Desc, Period: revision.Period, Risk: revision.Risk,
+		ScoreProfile: revision.ScoreProfile,
 	}
 	if tree := condTreeFromJSON(revision.TreeJSON); tree != nil {
 		view.Tree = tree
@@ -1030,6 +1076,7 @@ func strategyRevisionView(revision model.ScreenerStrategyRevision) StrategyRevis
 		ID: revision.ID, StrategyID: revision.StrategyID, Revision: revision.Revision,
 		ContentHash: revision.ContentHash, Name: revision.Name, Desc: revision.Desc,
 		Period: revision.Period, Risk: revision.Risk, CreatedAt: revision.CreatedAt,
+		ScoreProfile: revision.ScoreProfile,
 	}
 	if tree := condTreeFromJSON(revision.TreeJSON); tree != nil {
 		view.Tree = tree
@@ -1087,7 +1134,7 @@ const strategySignalPoolLimit = 30
 // P1 fail-closed：宽表数据落后应有交易日超过 1 个开市日时放弃本路来源——
 // 旧形态命中的「策略信号」会把过期技术形态当最新供给喂进推荐池。
 func strategySignalHits(ctx context.Context, userID int64, recType string, strat *strategyTemplate, n int) []ScanHit {
-	req := ScanRequest{Limit: n}
+	req := ScanRequest{Limit: n, preselectionProfile: strat.baseKey}
 	key := strat.Key
 	if strat.screen != nil {
 		req = strat.scanRequest(n)

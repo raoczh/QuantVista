@@ -210,8 +210,8 @@ func TestSimulateLabelHold_MarketDelisted(t *testing.T) {
 // 为 watch 后，事件 RawAction 须仍记复核前的 buy（rawActionBySym 快照），PostGateAction
 // 记复核后终值 watch——二者相异才使门控前后对照有意义。
 func TestRecordBatchFactsRawActionPreserved(t *testing.T) {
-	if candidateRankingVersion != "cr2" {
-		t.Fatalf("确定性两阶段预热必须使用 ranking_version=cr2，得到 %q", candidateRankingVersion)
+	if candidateRankingVersion != "cr3" {
+		t.Fatalf("完整排序分必须使用 ranking_version=cr3，得到 %q", candidateRankingVersion)
 	}
 	setupTestDB(t)
 	cleanLabelTables(t)
@@ -225,7 +225,7 @@ func TestRecordBatchFactsRawActionPreserved(t *testing.T) {
 	common.DB.Create(&rec)
 
 	pool := []candidate{{Symbol: "600100", Market: "cn", Name: "甲", Price: 10, Score: 81,
-		Rank: 2, SentToLLM: true, LLMInputOrder: 1}}
+		RankingScore: fptr(81.001234), Rank: 2, SentToLLM: true, LLMInputOrder: 1}}
 	// 复核后 pick.Action=watch（reject 降级）；快照记复核前 buy。
 	picks := []recPick{{Symbol: "600100", Action: model.RecActionWatch}}
 	raw := map[string]string{"600100": model.RecActionBuy}
@@ -244,7 +244,7 @@ func TestRecordBatchFactsRawActionPreserved(t *testing.T) {
 		t.Fatalf("PostGateAction 应为复核后 watch，得到 %s", ev.PostGateAction)
 	}
 	if ev.RawScore != 81 || ev.ScoreRank != 2 || ev.LLMInputOrder != 1 ||
-		ev.RankingVersion != candidateRankingVersion {
+		ev.RankingVersion != candidateRankingVersion || ev.RankingScore == nil || *ev.RankingScore != 81.001234 {
 		t.Fatalf("生成时排名/输入顺序事实未冻结: %+v", ev)
 	}
 }

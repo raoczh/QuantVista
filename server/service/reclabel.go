@@ -35,7 +35,9 @@ const (
 	// cr2：财务/资金流补拉集合由富化前 A 类/PIT 基础分确定，基础分和最终分的并列
 	// 均以 symbol 升序稳定决胜，统一富化后才终评。cr1 的冷缓存预算可能按候选遍历
 	// 顺序消费。历史 cr1/空版本保持原值且不回填；精确配对须按版本分层，空版本不可评估。
-	candidateRankingVersion = "cr2"
+	// cr3：预热与最终排序保留未封顶、六位小数的 ranking_score；展示分口径不变。
+	// cr1/cr2 原事实不回填，不能由其封顶分反推完整排序值。
+	candidateRankingVersion = "cr3"
 	// labelPerCap 标签结算的每标的拨款（与回测默认一致，元）。
 	labelPerCap = float64(btDefaultPerCap)
 	// labelNoDataAfterDays 信号日之后超过该自然日仍无任何日线 → no_data（退市/长停）。
@@ -144,13 +146,31 @@ func recordBatchFacts(batch *model.RecommendationBatch, pool []candidate, items 
 
 	events := make([]model.RecommendationCandidateEvent, 0, len(pool))
 	for _, c := range pool {
+		if c.Rank > 0 {
+			if c.RankingScore == nil {
+				return fmt.Errorf("候选 %s 缺少当前版本的完整排序分", c.Symbol)
+			}
+			value, ok := normalizeRankingScore(*c.RankingScore)
+			if !ok || value != *c.RankingScore || round2(clamp0100(value)) != c.Score {
+				return fmt.Errorf("候选 %s 的排序分与展示分不一致", c.Symbol)
+			}
+		}
+		features, featureHash, err := marshalOptimizationFacts(batch, c)
+		if err != nil {
+			return fmt.Errorf("候选优化事实编码失败: %w", err)
+		}
 		ev := model.RecommendationCandidateEvent{
 			BatchID: batch.ID, UserID: batch.UserID,
 			Symbol: c.Symbol, Market: c.Market, Name: c.Name,
 			RawScore: c.Score, ScoreRank: c.Rank, LLMInputOrder: c.LLMInputOrder,
+			RankingScore:   c.RankingScore,
 			RankingVersion: candidateRankingVersion,
 			Source:         firstSource(c), SourceSet: strings.Join(c.Sources, ","), SentToLLM: c.SentToLLM,
-			RefPrice: c.Price,
+			RefPrice:       c.Price,
+			ScoringVersion: batch.ScoringVersion, FeatureSnapshot: features, FeatureHash: featureHash,
+		}
+		if features != "" {
+			ev.FeatureVersion = recommendationOptimizationFactVersion
 		}
 		switch {
 		case c.SentToLLM:

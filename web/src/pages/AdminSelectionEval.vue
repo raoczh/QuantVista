@@ -19,6 +19,7 @@ import {
 } from '@/api/admin'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
+import RecommendationRankingResearch from '@/components/recommendations/RecommendationRankingResearch.vue'
 import { useUi } from '@/composables/useUi'
 import { getSessionEpoch } from '@/api/token'
 
@@ -338,6 +339,7 @@ const AUDIT_REASON_LABEL: Record<string, string> = {
     subtitle="按固定持有口径进行同批配对；Prompt challenger 与 score-blind 输入实验独立分组，重算零 LLM 调用"
   >
     <div class="se-wrap">
+      <RecommendationRankingResearch />
       <SectionCard title="评估概览">
         <template #extra>
           <div class="se-toolbar">

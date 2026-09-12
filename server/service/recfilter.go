@@ -272,8 +272,16 @@ func applyGainFilter(c candidate, factors *candFactors, f RecFilters) string {
 		return ""
 	}
 	cap := gainCapFor(f.MaxGain5dPct, c.Symbol)
-	if factors.Chg5d > cap {
-		return fmt.Sprintf("近5日涨幅 %.1f%% 超过 %s%%（追高保护）", factors.Chg5d, trimFloat(cap))
+	gain := factors.Chg5d
+	if c.Timing != nil {
+		var ok bool
+		gain, ok = currentReturnAt(c, c.Price, 5)
+		if !ok {
+			return "近5日涨幅数据不足，无法核对追高筛选条件"
+		}
+	}
+	if gain > cap {
+		return fmt.Sprintf("截至现价近5日涨幅 %.1f%% 超过 %s%%（追高保护）", gain, trimFloat(cap))
 	}
 	return ""
 }

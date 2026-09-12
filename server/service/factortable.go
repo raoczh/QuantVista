@@ -137,6 +137,32 @@ var factorDefs = []factorDef{
 	// 估值（C10；宽表**唯一**的非日线派生因子，来自落库的分红方案表 corporate_actions，
 	// 不是实时接口——PE/PB 那类实时单只估值仍无法全市场普查，别据此再加）
 	{"div_yield", "股息率", "估值", fkPct, "最近一期有股息率的分红方案的年度股息率（东财 DIVIDENT_RATIO，非按当前股价实时折算；本地无该股方案数据时为缺失，不是 0）"},
+	// 推荐研究的 PIT 原始观测；随每日快照保存，历史评估无需用今天的日线反推旧特征。
+	{"rq_atr", "信号前ATR", "机会质量", fkPrice, "信号日之前的 ATR(14)，避免突破自身振幅稀释延伸距离"},
+	{"rq_breakout_level", "本段突破参照", "机会质量", fkPrice, "连续创高段开始前的 20 日收盘高点，最多回看 10 日"},
+	{"rq_breakout_dist", "距突破参照ATR", "机会质量", fkRatio, "收盘距本段突破参照的 ATR 倍数"},
+	{"rq_ma20_dist", "距MA20的ATR", "机会质量", fkRatio, "收盘距 MA20 的 ATR 倍数"},
+	{"rq_compression", "整理振幅比", "机会质量", fkRatio, "信号前 5 日/20 日平均真实振幅，比值小于 1 为收敛"},
+	{"rq_volume_contract", "整理量能比", "机会质量", fkRatio, "信号前 5 日/20 日平均成交量"},
+	{"rq_close_location", "收盘承接位置", "机会质量", fkRatio, "收盘在当日高低区间的位置 0~1，一字 K 线缺失"},
+	{"rq_upper_wick", "上影线占比", "机会质量", fkRatio, "上影线占当日高低振幅的比例"},
+	{"rq_range_shock", "振幅冲击倍数", "机会质量", fkRatio, "信号日真实振幅/信号前 ATR"},
+	{"rq_efficiency20", "20日趋势效率", "机会质量", fkRatio, "收盘净位移/累计绝对位移，-1~1"},
+	{"rq_demand5", "5日量价承接", "机会质量", fkRatio, "上涨日成交量减下跌日成交量，再除总量，-1~1"},
+	{"rq_pullback_depth", "回踩深度ATR", "机会质量", fkRatio, "前20日高点至近5日低点的 ATR 倍数"},
+	{"rq_stabilized", "低点与收盘企稳", "机会质量", fkBool, "最新完整日线低点和收盘都不低于上一日"},
+	{"rq_higher_low", "近期低点抬高", "机会质量", fkBool, "近3日最低点不低于之前3日最低点"},
+	{"rq_breakout", "收盘突破确认", "机会质量", fkBool, "最新完整收盘高于之前20日收盘高点"},
+	{"rq_breakout_run", "连续创高天数", "机会质量", fkInt, "连续创20日收盘新高的天数，最多记10日"},
+	{"rq_support", "结构支撑参照", "机会质量", fkPrice, "下方均线、突破参照或近期低点中的最近结构价，不保证支撑有效"},
+	{"rq_support_dist", "距支撑ATR", "机会质量", fkRatio, "收盘至结构支撑参照的 ATR 倍数"},
+	{"rq_resistance", "上方阻力参照", "机会质量", fkPrice, "前20日高点仍在收盘价上方时的阻力参照"},
+	{"rq_resistance_dist", "距阻力ATR", "机会质量", fkRatio, "收盘至上方阻力的 ATR 倍数，创高时缺失"},
+	{"rq_score_trend", "技术趋势维度", "推荐诊断", fkRatio, "推荐共用的趋势基础维度，0~100，不是胜率"},
+	{"rq_score_momentum", "技术动量维度", "推荐诊断", fkRatio, "推荐共用的动量基础维度，0~100"},
+	{"rq_score_position", "技术位置维度", "推荐诊断", fkRatio, "推荐共用的位置基础维度，0~100"},
+	{"rq_score_volume", "技术量能维度", "推荐诊断", fkRatio, "推荐共用的量能基础维度，0~100，未混合事后资金流"},
+	{"rq_score_risk", "技术风险维度", "推荐诊断", fkRatio, "推荐共用的风险基础维度，0~100"},
 	// 其他
 	{"is_st", "ST/风险警示", "其他", fkBool, "名称含 ST 或退市警示"},
 	{"bar_count", "日线根数", "其他", fkInt, "本股参与计算的日线根数"},
@@ -256,10 +282,53 @@ func computeWideRowOpts(symbol string, meta wideStockMeta, bars []datasource.Bar
 
 	// 行情
 	set("close", price)
+	q := computeRecSignalQuality(price, bars)
+	for _, item := range []struct {
+		key   string
+		value *float64
+	}{
+		{"rq_atr", q.ATR}, {"rq_breakout_level", q.BreakoutLevel}, {"rq_breakout_dist", q.BreakoutDistanceATR}, {"rq_ma20_dist", q.MA20DistanceATR},
+		{"rq_compression", q.Compression}, {"rq_volume_contract", q.VolumeContraction}, {"rq_close_location", q.CloseLocation}, {"rq_upper_wick", q.UpperWick},
+		{"rq_range_shock", q.RangeShock}, {"rq_efficiency20", q.Efficiency20}, {"rq_demand5", q.DemandBalance5}, {"rq_pullback_depth", q.PullbackDepthATR},
+		{"rq_support", q.Support}, {"rq_support_dist", q.SupportDistanceATR}, {"rq_resistance", q.Resistance}, {"rq_resistance_dist", q.ResistanceDistanceATR},
+	} {
+		if item.value != nil {
+			set(item.key, *item.value)
+		}
+	}
+	for _, item := range []struct {
+		key   string
+		value *bool
+	}{{"rq_stabilized", q.Stabilized}, {"rq_higher_low", q.HigherLow}, {"rq_breakout", q.BreakoutConfirmed}} {
+		if item.value != nil {
+			setBool(item.key, *item.value)
+		}
+	}
+	if q.BreakoutConfirmed != nil {
+		set("rq_breakout_run", float64(q.BreakoutRun))
+	}
+	scoreBars := bars
+	if len(scoreBars) > factorBarLimit {
+		scoreBars = scoreBars[len(scoreBars)-factorBarLimit:]
+	}
+	sc := computeScore(price, scoreBars)
+	if n >= 60 {
+		set("rq_score_trend", sc.Trend)
+		set("rq_score_position", sc.Position)
+	}
+	if n >= 21 {
+		set("rq_score_momentum", sc.Momentum)
+		set("rq_score_risk", sc.Risk)
+	}
+	if n >= 20 && q.VolumeContraction != nil {
+		set("rq_score_volume", sc.Volume)
+	}
 	set("open", last.Open)
 	set("high", last.High)
 	set("low", last.Low)
-	set("amount_yi", round2(last.Amount/1e8))
+	if last.Amount > 0 {
+		set("amount_yi", round2(last.Amount/1e8))
+	}
 	if last.TurnoverRate > 0 {
 		set("turnover_rate", round2(last.TurnoverRate))
 	}

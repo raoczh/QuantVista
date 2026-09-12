@@ -4,10 +4,36 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"quantvista/common"
+	"quantvista/datasource"
 	"quantvista/model"
 )
+
+func TestExecutionPlanRechecksQuoteAfterAI(t *testing.T) {
+	c := executionTestCandidate()
+	p := executionTestShortPick()
+	snap := executionTestSnapshot("balanced", HorizonShortTerm, 100000)
+	at, _ := time.ParseInLocation("2006-01-02 15:04", "2026-08-07 14:59", time.Local)
+	fq := FreshQuoteResult{Quote: &datasource.Quote{Price: 12, DataTime: at}, Fresh: quoteFreshInfo{Status: freshStatusFresh}}
+	plan := buildExecutionPlanWithQuote(model.RecTypeShortTerm, p, c, snap, false, true, fq, &shortStrategies[0], RecFilters{})
+	if plan.Status != executionWait || !hasExecutionReason(plan, "高于买入区间") || plan.CheckedPrice != 12 || plan.DataAsOf != "2026-08-07 14:59" {
+		t.Fatalf("AI 后价格变化必须影响执行条件: %+v", plan)
+	}
+	if c.Price != 10 || c.QuoteAsOf != "2026-08-07 14:55" {
+		t.Fatal("不得改写模型输入的历史报价")
+	}
+	fq.Fresh.Status = freshStatusStale
+	plan = buildExecutionPlanWithQuote(model.RecTypeShortTerm, p, c, snap, false, true, fq, &shortStrategies[0], RecFilters{})
+	if plan.Status == executionReady || plan.DataStatus != freshStatusStale {
+		t.Fatalf("不能无条件把 AI 前行情写成 fresh: %+v", plan)
+	}
+	plan = buildExecutionPlanWithQuote(model.RecTypeShortTerm, p, c, snap, false, true, FreshQuoteResult{}, &shortStrategies[0], RecFilters{})
+	if plan.Status == executionReady || plan.DataStatus != "unknown" {
+		t.Fatal("取不到最新报价须明确等待")
+	}
+}
 
 func executionTestSnapshot(risk, horizon string, capital float64) recommendationPreferenceSnapshot {
 	return recommendationPreferenceSnapshot{

@@ -6,7 +6,7 @@ import { useUi } from '@/composables/useUi'
 import SectionCard from '@/components/SectionCard.vue'
 import StockIdentity from '@/components/StockIdentity.vue'
 import TermHelp from '@/components/TermHelp.vue'
-import { businessStatusLabel } from './recommendationPresentation'
+import { businessStatusLabel, scoringVersionLabel } from './recommendationPresentation'
 
 defineProps<{
   history: RecommendationBatch[]
@@ -52,6 +52,7 @@ function statusType(value: string) {
             <button type="button" class="history-main" :aria-current="currentID === item.id ? 'true' : undefined" :disabled="deleting.has(item.id)" @click="emit('open', item)">
               <span class="history-title">{{ item.title || (item.type === 'short_term' ? '短线推荐' : '长线推荐') }}</span>
               <span class="history-meta">{{ time(item.created_at) }} · 数据截止见结果卡 · 量化版本 {{ item.strategy_version || '未知' }}</span>
+              <span v-if="item.scoring_version" class="history-meta">{{ scoringVersionLabel(item.scoring_version) }}<template v-if="item.scoring_artifact_id"> · 模型 #{{ item.scoring_artifact_id }}</template></span>
             </button>
             <span class="history-side">
               <n-tag size="tiny" :type="statusType(item.status)" :bordered="false">{{ businessStatusLabel(item.status) }}</n-tag>

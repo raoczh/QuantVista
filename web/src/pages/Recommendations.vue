@@ -24,6 +24,7 @@ import {
   type Strategy,
 } from '@/api/recommendation'
 import { isAbortError } from '@/api/client'
+import { SCORE_PROFILE_LABEL } from '@/api/screener'
 import { getSessionEpoch } from '@/api/token'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
 import { getTodos, type TodoItem } from '@/api/todo'
@@ -222,6 +223,12 @@ let strategiesSequence = 0
 // 策略下拉分组：推荐内置 / 我的策略 / 选股内置 / 新手模板（选股页全部策略均可作推荐策略）。
 const strategyGroupLabels: Record<string, string> = { rec: '推荐策略', custom: '我的选股策略', screen: '内置选股策略', template: '新手模板' }
 const selectedStrategy = computed(() => strategies.value.find((item) => item.key === form.value.strategy) || null)
+const strategyDescription = computed(() => {
+  const strategy = selectedStrategy.value
+  if (!strategy) return ''
+  const profile = strategy.score_profile && SCORE_PROFILE_LABEL[strategy.score_profile]
+  return [strategy.desc, profile ? `评分侧重：${profile}` : ''].filter(Boolean).join(' · ')
+})
 const strategyOptions = computed(() => {
   const groups = new Map<string, Array<{ label: string; value: string; desc?: string }>>()
   for (const item of strategies.value) {
@@ -596,8 +603,8 @@ async function addStopAlert(item: RecommendationItem) {
   finally { stopAlerting.value = { ...stopAlerting.value, [item.id]: false } }
 }
 
-type ResultSection = 'pool' | 'excluded' | 'rejected' | 'raw'
-const resultSectionsQuery = enumListQuery<ResultSection>(['pool', 'excluded', 'rejected', 'raw'], 4)
+type ResultSection = 'pool' | 'excluded' | 'rejected' | 'raw' | 'sources'
+const resultSectionsQuery = enumListQuery<ResultSection>(['pool', 'excluded', 'rejected', 'raw', 'sources'], 5)
 const resultSections = ref<ResultSection[]>(resultSectionsQuery.parse(route.query.sections))
 const auditMode = ref<'' | 'attribution' | 'shadow' | 'recall'>('')
 const recTypeState = computed({ get: () => form.value.type, set: (value: 'short_term' | 'long_term') => { form.value.type = value } })
@@ -701,7 +708,7 @@ onBeforeUnmount(() => {
           :strategy-options="strategyOptions"
           :strategies-loading="strategiesLoading"
           :strategies-error="strategiesError"
-          :strategy-desc="selectedStrategy?.desc || ''"
+          :strategy-desc="strategyDescription"
           :market-options="marketOptions"
           :price-preset-options="pricePresetOptions"
           :cap-preset-options="capPresetOptions"

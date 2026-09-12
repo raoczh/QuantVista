@@ -20,11 +20,18 @@ const (
 // 为「不允许 AI 无依据编造」：候选池(candidate_pool)由真实数据构建并落库，
 // 生成后校验每个标的必须∈候选池；data_snapshot + 版本号保证可复现。
 type RecommendationBatch struct {
-	ID       int64  `gorm:"primaryKey" json:"id"`
-	UserID   int64  `gorm:"index:idx_rb_user" json:"user_id"`
-	Type     string `gorm:"size:16;index:idx_rb_user" json:"type"` // short_term / long_term
-	Market   string `gorm:"size:8" json:"market"`
-	Strategy string `gorm:"size:64" json:"strategy"` // 策略模板 key（内置推荐策略 / screen:<key> / tpl:<key> / screen:u<id>）
+	ID                  int64  `gorm:"primaryKey" json:"id"`
+	UserID              int64  `gorm:"index:idx_rb_user" json:"user_id"`
+	Type                string `gorm:"size:16;index:idx_rb_user" json:"type"` // short_term / long_term
+	Market              string `gorm:"size:8" json:"market"`
+	Strategy            string `gorm:"size:64" json:"strategy"` // 策略模板 key（内置推荐策略 / screen:<key> / tpl:<key> / screen:u<id>）
+	ScoreProfile        string `gorm:"size:16" json:"score_profile,omitempty"`
+	StrategyIntent      string `gorm:"size:24" json:"strategy_intent,omitempty"`
+	ProfileVersion      string `gorm:"size:16" json:"profile_version,omitempty"`
+	ScoringVersion      string `gorm:"size:24" json:"scoring_version,omitempty"`
+	ScoringArtifactID   int64  `json:"scoring_artifact_id,omitempty"`
+	ScoringArtifactHash string `gorm:"size:64" json:"scoring_artifact_hash,omitempty"`
+	RuntimeSnapshot     string `gorm:"type:mediumtext" json:"-"` // 提交时冻结策略定义与评分模型，不在列表展开
 	// 自建选股策略的不可变版本；0 表示内置策略或升级前未固定版本的历史批次。
 	StrategyRevisionID int64 `gorm:"not null;default:0" json:"strategy_revision_id,omitempty"`
 	// Title 生成时由筛选条件组合固化（如「短线·动量突破·≤30元·3只」）。
@@ -36,7 +43,7 @@ type RecommendationBatch struct {
 
 	CandidateCount int    `json:"candidate_count"`                                 // 候选池标的数（未被过滤的）
 	CandidatePool  string `gorm:"type:mediumtext" json:"candidate_pool,omitempty"` // 候选池快照 JSON，含被过滤标的与原因、量化因子与评分（列表查询不返回；mediumtext——全景快照含因子明细，TEXT 64KB 会被大池撑爆）
-	DataSnapshot   string `gorm:"type:text" json:"data_snapshot,omitempty"`        // 喂给模型的数据 JSON（列表查询不返回）
+	DataSnapshot   string `gorm:"type:mediumtext" json:"data_snapshot,omitempty"`  // 喂给模型的数据 JSON（列表查询不返回）
 	RejectedJSON   string `gorm:"type:text" json:"rejected_json,omitempty"`        // 池内落选标的一句话理由 [{symbol,name,reason}]（列表查询不返回）
 	FiltersJSON    string `gorm:"type:text" json:"filters_json,omitempty"`         // 本次生效的筛选条件快照（透明可回显）
 	ReviewJSON     string `gorm:"type:text" json:"review_json,omitempty"`          // AI 复核员结论 JSON（verify 模式；列表查询不返回）

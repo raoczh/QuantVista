@@ -1,6 +1,7 @@
 import { request, HEAVY_TIMEOUT } from './client'
 import type { EvidenceCheck, TrustReview } from './trust'
 import type { CandidateAuditUserReport } from './candidateAudit'
+import type { ScoreProfile } from './screener'
 
 // 信任层类型统一收敛到 trust.ts；此处 re-export 保持既有 import 路径不炸。
 export type { EvidenceCheck } from './trust'
@@ -22,6 +23,8 @@ export interface Strategy {
   period?: 'short' | 'swing' | 'mid'
   risk?: 'low' | 'mid' | 'high'
   strategy_revision_id?: number
+  score_profile?: ScoreProfile
+  intent?: string
 }
 
 // 候选筛选条件（阶段②用户硬过滤；0 = 不限）。
@@ -82,6 +85,7 @@ export interface PoolCandidate {
   sources?: string[]
   excluded?: string
   score?: number
+  ranking_score?: number | null // 完整排序值；历史快照可能缺失，不能从展示分反推
   rank?: number
   bonus?: string[]
   sent_to_llm?: boolean
@@ -104,7 +108,46 @@ export interface PoolCandidate {
   }
   score_dims?: { trend: number; momentum: number; position: number; volume: number; risk: number }
   // 选股类推荐策略的条件命中评估（与选股引擎同因子同求值；内置推荐策略无此字段）
-  strategy_hit?: { total: number; hit: number; full: boolean; matched?: string[]; missed?: string[]; trade_date?: string }
+  strategy_hit?: {
+    total: number; hit: number; full: boolean; matched?: string[]; missed?: string[]; trade_date?: string
+    status?: 'matched' | 'missed' | 'unknown'; missing?: number; unknown?: string[]; values?: Record<string, number>
+    current?: StrategyCurrentCheck
+  }
+  time_facts?: {
+    version: string; signal_date: string; signal_close: number; quote_as_of: string
+    return_anchors?: Record<string, { trade_date: string; close: number }>
+    current_returns?: Record<string, number>
+  }
+  final_check?: { quote_as_of: string; price: number; passed: boolean; reason?: string; strategy?: StrategyCurrentCheck; entry_quality?: RecEntryQuality }
+  signal_quality?: RecSignalQuality
+  entry_quality?: RecEntryQuality
+  score_breakdown?: { version: string; profile: string; valid: boolean; total: number; components: Array<{ key: string; value: number; status: string; notes?: string[] }>; missing?: string[] }
+  scoring_comparison?: { legacy_version: string; legacy_score: number; quality_version: string; quality_score: number; learned_version?: string; learned_score?: number | null; model_hash?: string }
+  preselection?: { version: string; profile: string; trade_date: string; status: string; score?: number; rank?: number; matched?: number; retained?: number; truncated?: number; values?: Record<string, number>; missing?: string[] }
+  scan_budget?: { version: string; source: string; order: number; limit: number }
+  intake_budget?: { version: string; source: string; order: number; limit: number; omitted_source?: number }
+}
+
+export interface RecSignalQuality {
+  version: string; as_of: string; bars: number; missing?: string[]
+  atr?: number; breakout_level?: number; breakout_confirmed?: boolean; breakout_run: number
+  breakout_distance_atr?: number; ma20_distance_atr?: number; compression?: number; volume_contraction?: number
+  close_location?: number; upper_wick?: number; range_shock?: number; efficiency_20?: number; demand_balance_5?: number
+  pullback_depth_atr?: number; stabilized?: boolean; higher_low?: boolean; support?: number; support_distance_atr?: number
+  resistance?: number; resistance_distance_atr?: number
+}
+
+export interface RecEntryQuality {
+  version: string
+  status: 'aligned' | 'extended' | 'waiting_confirmation' | 'insufficient'
+  reasons?: string[]
+}
+
+export interface StrategyCurrentCheck {
+  status: 'matched' | 'missed' | 'unknown'
+  checked: number
+  missed?: string[]
+  unknown?: string[]
 }
 
 // 证据数字核验结果与 AI 复核结论类型统一由 trust.ts 提供（见文件顶部 re-export）。
@@ -133,6 +176,7 @@ export interface RecDetail {
   disclaimer: string
   // 信任层（服务端回填）
   quant_score?: number
+  quant_ranking_score?: number | null
   quant_rank?: number
   pool_size?: number
   lot_cost?: number
@@ -235,6 +279,8 @@ export interface ExecutionPlan {
   max_planned_loss?: number
   unavailable_reasons: string[]
   data_as_of: string
+  checked_price?: number
+  entry_quality?: RecEntryQuality
   data_status: 'fresh' | 'stale' | 'unknown' | string
   budget_basis: 'research_budget'
   version: string
@@ -427,6 +473,12 @@ export interface RecommendationBatch {
   model: string
   prompt_version: string
   strategy_version: string
+  score_profile?: ScoreProfile
+  strategy_intent?: string
+  profile_version?: string
+  scoring_version?: string
+  scoring_artifact_id?: number
+  scoring_artifact_hash?: string
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number

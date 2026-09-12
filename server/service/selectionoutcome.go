@@ -36,7 +36,7 @@ type selectionBatchFacts struct {
 // 后续候选排序升级必须显式扩展这里，并补充新旧版本对拍，不能自动跟随当前版本。
 func selectionRankingVersionSupported(version string) bool {
 	switch version {
-	case "cr1", "cr2":
+	case "cr1", "cr2", "cr3":
 		return true
 	default:
 		return false
@@ -120,6 +120,15 @@ func validateSelectionFacts(events []model.RecommendationCandidateEvent, picks [
 			ev.ScoreRank <= 0 || ev.LLMInputOrder <= 0 || ev.Symbol == "" {
 			return nil, selectionFactRankingOld
 		}
+		if ev.RankingVersion == "cr3" {
+			if ev.RankingScore == nil {
+				return nil, selectionFactRankingOld
+			}
+			value, ok := normalizeRankingScore(*ev.RankingScore)
+			if !ok || value != *ev.RankingScore || round2(clamp0100(value)) != ev.RawScore {
+				return nil, selectionFactRankingOld
+			}
+		}
 		if rankingVersion == "" {
 			rankingVersion = ev.RankingVersion
 		} else if ev.RankingVersion != rankingVersion {
@@ -135,6 +144,17 @@ func validateSelectionFacts(events []model.RecommendationCandidateEvent, picks [
 	}
 	if len(opp) == 0 {
 		return nil, selectionFactEventsMissing
+	}
+	if rankingVersion == "cr3" {
+		byRank := append([]model.RecommendationCandidateEvent(nil), opp...)
+		sort.Slice(byRank, func(i, j int) bool { return byRank[i].ScoreRank < byRank[j].ScoreRank })
+		for i := 1; i < len(byRank); i++ {
+			prev, current := byRank[i-1], byRank[i]
+			if *prev.RankingScore < *current.RankingScore ||
+				(*prev.RankingScore == *current.RankingScore && prev.Symbol > current.Symbol) {
+				return nil, selectionFactRankingOld
+			}
+		}
 	}
 	sort.Slice(opp, func(i, j int) bool {
 		if opp[i].LLMInputOrder == opp[j].LLMInputOrder {

@@ -208,7 +208,7 @@ func TestPreheatRecommendationRoundFreezesSelectionAndFailures(t *testing.T) {
 		rng := rand.New(rand.NewSource(seed))
 		rng.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
 		finBudget, flowBudget := 2, 2
-		got := svc.preheatRecommendationRound(context.Background(), model.RecTypeLongTerm, pool, shuffled, &finBudget, &flowBudget, now)
+		got := svc.preheatRecommendationRound(context.Background(), true, pool, shuffled, &finBudget, &flowBudget, now)
 		if finBudget != 0 || flowBudget != 0 {
 			t.Fatalf("真实请求应各消耗 2 个预算：fin=%d flow=%d", finBudget, flowBudget)
 		}
@@ -259,7 +259,7 @@ func TestPreheatRecommendationRoundBudgetZero(t *testing.T) {
 	pool := []candidate{{Symbol: "600201", Market: "cn"}}
 	bases := []recPreheatCandidate{{Idx: 0, Symbol: "600201", BaseScore: 99}}
 	finBudget, flowBudget := 0, 0
-	got := svc.preheatRecommendationRound(context.Background(), model.RecTypeLongTerm, pool, bases, &finBudget, &flowBudget, time.Now())
+	got := svc.preheatRecommendationRound(context.Background(), true, pool, bases, &finBudget, &flowBudget, time.Now())
 	if finCalls != 0 || flowCalls != 0 {
 		t.Fatalf("预算 0 不得请求上游：fin=%d flow=%d", finCalls, flowCalls)
 	}
@@ -294,7 +294,7 @@ type recPreheatMarketAdapter struct {
 func (a *recPreheatMarketAdapter) Name() string { return "rec-preheat-test" }
 
 func (a *recPreheatMarketAdapter) GetQuote(_ context.Context, market, symbol string) (*datasource.Quote, error) {
-	bars := wfParityBars(chipBarLimit, 3)
+	bars := recPreheatBars(chipBarLimit)
 	return &datasource.Quote{
 		Symbol: symbol, Market: market, Name: "测试" + symbol, Price: bars[len(bars)-1].Close,
 		PrevClose: bars[len(bars)-2].Close, ChangePct: 0.1, Amount: 1e8,
@@ -306,7 +306,24 @@ func (a *recPreheatMarketAdapter) GetDailyBars(_ context.Context, _, symbol stri
 	if a.failDaily[symbol] {
 		return nil, datasource.ErrNoData
 	}
-	return wfParityBars(limit, 3), nil
+	return recPreheatBars(limit), nil
+}
+
+func recPreheatBars(limit int) []datasource.Bar {
+	bars := wfParityBars(wideBarLimit+1, 3)
+	at := recFreshQuoteTime()
+	date := at.Format("2006-01-02")
+	if at.Hour()*60+at.Minute() < 15*60 {
+		date = prevOpenTradeDate(date)
+	}
+	end, _ := time.ParseInLocation("2006-01-02", date, time.Local)
+	for i := range bars {
+		bars[i].TradeDate = end.AddDate(0, 0, i-len(bars)+1).Format("2006-01-02")
+	}
+	if limit > 0 && len(bars) > limit {
+		bars = bars[len(bars)-limit:]
+	}
+	return bars
 }
 
 func recFreshQuoteTime() time.Time {
@@ -322,7 +339,7 @@ func recFreshQuoteTime() time.Time {
 }
 
 func recScorePoolCandidates(n int) []candidate {
-	bars := wfParityBars(chipBarLimit, 3)
+	bars := recPreheatBars(chipBarLimit)
 	price := bars[len(bars)-1].Close
 	pool := make([]candidate, n)
 	for i := 0; i < n; i++ {
@@ -330,6 +347,7 @@ func recScorePoolCandidates(n int) []candidate {
 		pool[i] = candidate{
 			Symbol: symbol, Market: "cn", Name: "测试" + symbol, Price: price,
 			Amount: 1e8, TurnoverRate: 3, Sources: []string{"active"},
+			QuoteAsOf: recFreshQuoteTime().Format("2006-01-02 15:04"),
 		}
 	}
 	return pool

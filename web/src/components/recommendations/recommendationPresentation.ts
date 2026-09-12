@@ -32,6 +32,14 @@ export function rankedScore(score?: number, rank?: number): number | undefined {
   return score ?? (rank != null && rank > 0 ? 0 : undefined)
 }
 
+export function scoringVersionLabel(version?: string): string {
+  return ({ qr1: '质量规则', additive_sp1: '原加法评分对照', ridge1: '学习排序' } as Record<string,string>)[version || ''] || version || '历史未记录'
+}
+
+export function scoreComponentLabel(key: string): string {
+  return ({ technical: '技术基础', setup: '形态质量', entry: '入场质量', risk: '交易风险', fundamentals: '财务质量', context: '信息背景' } as Record<string,string>)[key] || key
+}
+
 export function omittedCandidates(raw?: string): number {
   if (!raw) return 0
   try {
@@ -127,6 +135,24 @@ const isObject = (value: unknown): value is Record<string, unknown> => !!value &
 const strings = (value: unknown) => value === undefined || (Array.isArray(value) && value.every(item => typeof item === 'string'))
 const optionalNumber = (value: unknown) => value == null || (typeof value === 'number' && Number.isFinite(value))
 const optionalString = (value: unknown) => value === undefined || typeof value === 'string'
+const finiteMap = (value: unknown) => value === undefined || (isObject(value) && Object.values(value).every(v => typeof v === 'number' && Number.isFinite(v)))
+const validCurrentCheck = (value: unknown) => value === undefined || (isObject(value) &&
+  ['matched', 'missed', 'unknown'].includes(String(value.status)) && Number.isInteger(value.checked) && strings(value.missed) && strings(value.unknown))
+const validEntryQuality = (value: unknown) => value === undefined || (isObject(value) &&
+  ['aligned', 'extended', 'waiting_confirmation', 'insufficient'].includes(String(value.status)) && strings(value.reasons))
+export function entryQualityLabel(status?: string): string {
+  return ({ aligned: '入场距离合理', extended: '延伸较大，等待', waiting_confirmation: '等待企稳确认', insufficient: '入场依据不足' } as Record<string, string>)[status || ''] || '历史未记录'
+}
+
+export function parseSourceCoverage(raw?: string): Array<{ source: string; observed: number; intake: number; scored: number; ranked: number; sent: number; omitted: number }> {
+  if (!raw) return []
+  try {
+    const rows = JSON.parse(raw)?.source_coverage
+    if (!Array.isArray(rows)) return []
+    return rows.filter(row => isObject(row) && typeof row.source === 'string' &&
+      ['observed', 'intake', 'scored', 'ranked', 'sent', 'omitted'].every(key => typeof row[key] === 'number' && Number.isSafeInteger(row[key]) && row[key] >= 0))
+  } catch { return [] }
+}
 
 /** 历史 JSON 快照逐项核验，损坏行不参与展示或统计，调用方明确披露缺失。 */
 export function parseCandidateSnapshot(raw?: string) {
@@ -135,10 +161,31 @@ export function parseCandidateSnapshot(raw?: string) {
       !optionalString(value.name) || !optionalString(value.market) || !optionalString(value.source) ||
       !optionalString(value.excluded) || !strings(value.sources) || !strings(value.bonus) ||
       typeof value.change_pct !== 'number' || !Number.isFinite(value.change_pct)) return false
-    if (['price', 'score', 'rank'].some(key => !optionalNumber(value[key]))) return false
+    if (['price', 'score', 'ranking_score', 'rank'].some(key => !optionalNumber(value[key]))) return false
     const hit = value.strategy_hit
     if (hit != null && (!isObject(hit) || !Number.isInteger(hit.total) || !Number.isInteger(hit.hit) ||
-      typeof hit.full !== 'boolean' || !strings(hit.matched) || !strings(hit.missed))) return false
+      typeof hit.full !== 'boolean' || !strings(hit.matched) || !strings(hit.missed) || !strings(hit.unknown) ||
+      !finiteMap(hit.values) || !validCurrentCheck(hit.current))) return false
+    const timing = value.time_facts
+    if (timing != null && (!isObject(timing) || typeof timing.signal_date !== 'string' ||
+      !optionalNumber(timing.signal_close) || !finiteMap(timing.current_returns))) return false
+    const final = value.final_check
+    if (final != null && (!isObject(final) || typeof final.passed !== 'boolean' || !optionalNumber(final.price) ||
+      !optionalString(final.quote_as_of) || !optionalString(final.reason) || !validCurrentCheck(final.strategy) || !validEntryQuality(final.entry_quality))) return false
+    if (!validEntryQuality(value.entry_quality)) return false
+    const quality = value.signal_quality
+    if (quality != null && (!isObject(quality) || !strings(quality.missing) ||
+      !['atr', 'breakout_distance_atr', 'ma20_distance_atr', 'compression', 'volume_contraction', 'close_location', 'support', 'support_distance_atr']
+        .every(key => optionalNumber(quality[key])))) return false
+    const breakdown = value.score_breakdown
+    if (breakdown != null && (!isObject(breakdown) || typeof breakdown.version !== 'string' || typeof breakdown.profile !== 'string' ||
+      typeof breakdown.valid !== 'boolean' || typeof breakdown.total !== 'number' || !Number.isFinite(breakdown.total) || !strings(breakdown.missing) ||
+      !Array.isArray(breakdown.components) || !breakdown.components.every(part => isObject(part) && typeof part.key === 'string' &&
+        typeof part.value === 'number' && Number.isFinite(part.value) && typeof part.status === 'string' && strings(part.notes)))) return false
+    const comparison = value.scoring_comparison
+    if (comparison != null && (!isObject(comparison) || typeof comparison.legacy_version !== 'string' || typeof comparison.quality_version !== 'string' ||
+      typeof comparison.legacy_score !== 'number' || !Number.isFinite(comparison.legacy_score) || typeof comparison.quality_score !== 'number' || !Number.isFinite(comparison.quality_score) ||
+      !optionalNumber(comparison.learned_score) || !optionalString(comparison.learned_version) || !optionalString(comparison.model_hash))) return false
     return true
   })
 }

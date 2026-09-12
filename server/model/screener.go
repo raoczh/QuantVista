@@ -28,8 +28,9 @@ type ScreenerStrategy struct {
 	// Period 适用周期：short（短线）/ swing（波段）/ mid（中线）。
 	Period string `gorm:"size:16" json:"period"`
 	// Risk 风险等级：low / mid / high。
-	Risk     string `gorm:"size:8" json:"risk"`
-	TreeJSON string `gorm:"type:text" json:"tree_json"`
+	Risk         string `gorm:"size:8" json:"risk"`
+	ScoreProfile string `gorm:"size:16" json:"score_profile,omitempty"`
+	TreeJSON     string `gorm:"type:text" json:"tree_json"`
 
 	// Name/Desc/Period/Risk/TreeJSON 仅为旧代码和列表查询保留的当前版本投影；执行时
 	// 必须以 CurrentRevisionID 指向的不可变快照为准。
@@ -43,17 +44,18 @@ type ScreenerStrategy struct {
 // (strategy_id, revision) 唯一；历史行只允许创建，正常 GORM 更新和删除均由 hooks 拒绝。
 // 主表归档不会级联删除 revision，确保既有扫描和回测可继续按旧版本复现。
 type ScreenerStrategyRevision struct {
-	ID          int64     `gorm:"primaryKey" json:"id"`
-	UserID      int64     `gorm:"not null;index:idx_ssr_user_strategy;<-:create" json:"user_id"`
-	StrategyID  int64     `gorm:"not null;index:idx_ssr_strategy_revision,unique;index:idx_ssr_user_strategy;<-:create" json:"strategy_id"`
-	Revision    int       `gorm:"not null;index:idx_ssr_strategy_revision,unique;<-:create" json:"revision"`
-	ContentHash string    `gorm:"size:64;not null;<-:create" json:"content_hash"`
-	Name        string    `gorm:"size:64;not null;<-:create" json:"name"`
-	Desc        string    `gorm:"size:256;<-:create" json:"desc"`
-	Period      string    `gorm:"size:16;not null;<-:create" json:"period"`
-	Risk        string    `gorm:"size:8;not null;<-:create" json:"risk"`
-	TreeJSON    string    `gorm:"type:text;not null;<-:create" json:"tree_json"`
-	CreatedAt   time.Time `gorm:"<-:create" json:"created_at"`
+	ID           int64     `gorm:"primaryKey" json:"id"`
+	UserID       int64     `gorm:"not null;index:idx_ssr_user_strategy;<-:create" json:"user_id"`
+	StrategyID   int64     `gorm:"not null;index:idx_ssr_strategy_revision,unique;index:idx_ssr_user_strategy;<-:create" json:"strategy_id"`
+	Revision     int       `gorm:"not null;index:idx_ssr_strategy_revision,unique;<-:create" json:"revision"`
+	ContentHash  string    `gorm:"size:64;not null;<-:create" json:"content_hash"`
+	Name         string    `gorm:"size:64;not null;<-:create" json:"name"`
+	Desc         string    `gorm:"size:256;<-:create" json:"desc"`
+	Period       string    `gorm:"size:16;not null;<-:create" json:"period"`
+	Risk         string    `gorm:"size:8;not null;<-:create" json:"risk"`
+	ScoreProfile string    `gorm:"size:16;<-:create" json:"score_profile,omitempty"`
+	TreeJSON     string    `gorm:"type:text;not null;<-:create" json:"tree_json"`
+	CreatedAt    time.Time `gorm:"<-:create" json:"created_at"`
 }
 
 // ErrImmutableScreenerStrategyRevision 表示调用方尝试改写或删除历史策略快照。
@@ -124,26 +126,47 @@ func normalizeScreenerJSONNumbers(v any) any {
 
 // ScreenerStrategyContentHash 计算规范化完整策略快照的 SHA-256（64 位 hex）。标量按
 // 已落库值参与 hash，TreeJSON 则先结构化规范化，避免用户原始 JSON 的空白和键序造成漂移。
-func ScreenerStrategyContentHash(name, desc, period, risk, treeJSON string) (string, error) {
+func ScreenerStrategyContentHash(name, desc, period, risk, treeJSON string, scoreProfiles ...string) (string, error) {
+	if len(scoreProfiles) > 1 {
+		return "", errors.New("策略只能指定一种评分方式")
+	}
+	profile := ""
+	if len(scoreProfiles) == 1 {
+		profile = scoreProfiles[0]
+		if profile != "" && !ValidStrategyScoreProfile(profile) {
+			return "", errors.New("策略评分方式无效")
+		}
+	}
 	canonicalTree, err := CanonicalScreenerTreeJSON(treeJSON)
 	if err != nil {
 		return "", err
 	}
 	payload, err := json.Marshal(struct {
-		Name   string          `json:"name"`
-		Desc   string          `json:"desc"`
-		Period string          `json:"period"`
-		Risk   string          `json:"risk"`
-		Tree   json.RawMessage `json:"tree"`
+		Name         string          `json:"name"`
+		Desc         string          `json:"desc"`
+		Period       string          `json:"period"`
+		Risk         string          `json:"risk"`
+		Tree         json.RawMessage `json:"tree"`
+		ScoreProfile string          `json:"score_profile,omitempty"`
 	}{
 		Name: name, Desc: desc, Period: period, Risk: risk,
-		Tree: json.RawMessage(canonicalTree),
+		Tree: json.RawMessage(canonicalTree), ScoreProfile: profile,
 	})
 	if err != nil {
 		return "", fmt.Errorf("编码策略完整快照: %w", err)
 	}
 	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// 空值仅代表升级前没有显式指定。新请求使用以下独立于持有周期的评分方式。
+func ValidStrategyScoreProfile(profile string) bool {
+	switch profile {
+	case "balanced", "momentum", "pullback", "active", "value", "growth", "leader":
+		return true
+	default:
+		return false
+	}
 }
 
 // migrateScreenerStrategyRevisions 为升级前的可变策略补建 revision 1，并回填当前指针。
@@ -190,7 +213,7 @@ func migrateScreenerStrategyRevisions(db *gorm.DB) error {
 					return nil
 				}
 				hash, hashErr := ScreenerStrategyContentHash(
-					strategy.Name, strategy.Desc, strategy.Period, strategy.Risk, canonicalTree,
+					strategy.Name, strategy.Desc, strategy.Period, strategy.Risk, canonicalTree, strategy.ScoreProfile,
 				)
 				if hashErr != nil {
 					common.SysWarn("迁移选股策略 revision 跳过坏行 strategy_id=%d: %v", strategy.ID, hashErr)
@@ -199,7 +222,7 @@ func migrateScreenerStrategyRevisions(db *gorm.DB) error {
 				candidate := ScreenerStrategyRevision{
 					UserID: strategy.UserID, StrategyID: strategy.ID, Revision: 1,
 					ContentHash: hash, Name: strategy.Name, Desc: strategy.Desc,
-					Period: strategy.Period, Risk: strategy.Risk, TreeJSON: canonicalTree,
+					Period: strategy.Period, Risk: strategy.Risk, ScoreProfile: strategy.ScoreProfile, TreeJSON: canonicalTree,
 					CreatedAt: strategy.CreatedAt,
 				}
 				if err := tx.Clauses(clause.OnConflict{

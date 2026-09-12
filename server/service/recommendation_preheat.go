@@ -19,7 +19,7 @@ const (
 type recPreheatCandidate struct {
 	Idx        int
 	Symbol     string
-	BaseScore  float64
+	BaseScore  float64 // 未封顶、按落库精度归一的基础排序值
 	NeedsFetch bool
 }
 
@@ -30,6 +30,14 @@ func planRecPreheat(candidates []recPreheatCandidate, budget int, reserve func(r
 		return nil
 	}
 	ordered := append([]recPreheatCandidate(nil), candidates...)
+	valid := ordered[:0]
+	for _, c := range ordered {
+		if score, ok := normalizeRankingScore(c.BaseScore); ok {
+			c.BaseScore = score
+			valid = append(valid, c)
+		}
+	}
+	ordered = valid
 	sort.Slice(ordered, func(i, j int) bool {
 		if ordered[i].BaseScore != ordered[j].BaseScore {
 			return ordered[i].BaseScore > ordered[j].BaseScore
@@ -63,7 +71,7 @@ type recRoundEnrichment struct {
 // 为本轮不可变结果，调用方随后才能写 Factors/Fin 并计算最终分数。
 func (s *RecommendationService) preheatRecommendationRound(
 	ctx context.Context,
-	recType string,
+	includeFinance bool,
 	pool []candidate,
 	bases []recPreheatCandidate,
 	finBudget, flowBudget *int,
@@ -89,7 +97,7 @@ func (s *RecommendationService) preheatRecommendationRound(
 		flowPlan.NeedsFetch = common.DB != nil && flowProbe.Market == "cn" && !flowProbe.Fresh
 		flowPlans = append(flowPlans, flowPlan)
 
-		if recType == model.RecTypeLongTerm {
+		if includeFinance {
 			finProbe := inspectFinanceFactor(base.Symbol, asOf, now)
 			finProbes[base.Idx] = finProbe
 			finPlan := base
@@ -143,7 +151,7 @@ func (s *RecommendationService) preheatRecommendationRound(
 		} else {
 			result.FlowAvailable[base.Idx] = false
 		}
-		if recType == model.RecTypeLongTerm {
+		if includeFinance {
 			fin := resolveFinanceFactor(finProbes[base.Idx], finFetched[base.Idx])
 			result.Finance[base.Idx] = fin
 			result.FinanceAvailable[base.Idx] = fin != nil

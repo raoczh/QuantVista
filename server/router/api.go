@@ -485,6 +485,10 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				admin.GET("/llm-joint-eval", adminCtl.LLMJointEval)
 				// S3-6B 统一 fixed-hold selection outcome + 同批配对评估（只读；refresh=1 重算）
 				admin.GET("/selection-eval", marketCtl.SelectionEval)
+				admin.GET("/ranking-research", marketCtl.RankingResearch)
+				admin.GET("/ranking-policy", marketCtl.RankingPolicyState)
+				admin.POST("/ranking-artifacts", marketCtl.CaptureRankingArtifact)
+				admin.PUT("/ranking-policy", marketCtl.UpdateRankingPolicy)
 				// 卖出评估前向结果台账（pea1 阈值的后验证据；只读、跨用户脱敏聚合）
 				admin.GET("/position-exit-outcomes", marketCtl.PositionExitOutcomes)
 				// P2-1/P2-2 champion/challenger prompt 实验（影子采样；promote=P1-9 质量门；

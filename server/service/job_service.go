@@ -101,12 +101,15 @@ func startDurableBusinessJob(userID int64, kind string, request any, allowPrivat
 }
 
 // 新作业的业务回执在创建事务内读取；复用已有作业时只读其已有引用。
-func startDurableBusinessJobContext(ctx context.Context, userID int64, kind string, request any, allowPrivate bool, receipt func(*gorm.DB, *model.JobRun) error) (*model.JobRun, error) {
+func startDurableBusinessJobContext(ctx context.Context, userID int64, kind string, request any, allowPrivate bool, receipt func(*gorm.DB, *model.JobRun) error, seeds ...*durableJobBinding) (*model.JobRun, error) {
 	ctx = jobSubmissionContext(ctx)
 	if !isBusinessDurableJobKind(kind) {
 		return nil, fmt.Errorf("%w: %s", ErrJobKindUnsupported, kind)
 	}
 	var bindingOverride *durableJobBinding
+	if len(seeds) > 0 {
+		bindingOverride = seeds[0]
+	}
 	var receiptRunID int64
 	if receipt != nil {
 		handler, ok := defaultJobRuntime.handler(kind)
@@ -114,6 +117,9 @@ func startDurableBusinessJobContext(ctx context.Context, userID int64, kind stri
 			return nil, ErrJobKindUnsupported
 		}
 		binding := handler.binding
+		if bindingOverride != nil {
+			binding = *bindingOverride
+		}
 		binding.readSubmission = func(tx *gorm.DB, run *model.JobRun) error {
 			if err := receipt(tx, run); err != nil {
 				return err

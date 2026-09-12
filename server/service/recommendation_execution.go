@@ -16,7 +16,7 @@ import (
 
 const (
 	recommendationPreferenceSnapshotVersion = "pref1"
-	executionPlanVersion                    = "ep2"
+	executionPlanVersion                    = "ep3"
 	riskBudgetVersion                       = "rb1"
 
 	executionReady       = "ready"
@@ -152,18 +152,54 @@ func formatFloat(v float64, precision int) string {
 
 // executionPlan 是面向用户研究执行的程序化适配结果，不是预测，也不代表券商现金。
 type executionPlan struct {
-	Status                string   `json:"status"`
-	PreferenceExplanation []string `json:"preference_explanation"`
-	PlannedCapital        float64  `json:"planned_capital"`
-	PlannedPrice          float64  `json:"planned_price"`
-	Quantity              int      `json:"quantity"`
-	EstimatedCapital      float64  `json:"estimated_capital"`
-	MaxPlannedLoss        *float64 `json:"max_planned_loss,omitempty"`
-	UnavailableReasons    []string `json:"unavailable_reasons"`
-	DataAsOf              string   `json:"data_as_of"`
-	DataStatus            string   `json:"data_status"`
-	BudgetBasis           string   `json:"budget_basis"`
-	Version               string   `json:"version"`
+	Status                string           `json:"status"`
+	PreferenceExplanation []string         `json:"preference_explanation"`
+	PlannedCapital        float64          `json:"planned_capital"`
+	PlannedPrice          float64          `json:"planned_price"`
+	Quantity              int              `json:"quantity"`
+	EstimatedCapital      float64          `json:"estimated_capital"`
+	MaxPlannedLoss        *float64         `json:"max_planned_loss,omitempty"`
+	UnavailableReasons    []string         `json:"unavailable_reasons"`
+	DataAsOf              string           `json:"data_as_of"`
+	CheckedPrice          float64          `json:"checked_price,omitempty"`
+	EntryQuality          *recEntryQuality `json:"entry_quality,omitempty"`
+	DataStatus            string           `json:"data_status"`
+	BudgetBasis           string           `json:"budget_basis"`
+	Version               string           `json:"version"`
+}
+
+// AI 耗时后重新核验执行价格。保留模型输入和原推荐信号，只生成新的程序计划事实。
+func buildExecutionPlanWithQuote(recType string, p recPick, c candidate, snap recommendationPreferenceSnapshot,
+	hasHolding, holdingKnown bool, fq FreshQuoteResult, strat *strategyTemplate, filters RecFilters) *executionPlan {
+	current := c
+	status := "unknown"
+	reason := ""
+	if fq.Quote != nil && finiteRecNumber(fq.Quote.Price) && fq.Quote.Price > 0 && !fq.Quote.DataTime.IsZero() {
+		current.Price = round2(fq.Quote.Price)
+		current.QuoteAsOf = fq.Quote.DataTime.In(time.Local).Format("2006-01-02 15:04")
+		status = fq.Fresh.Status
+		if status == freshStatusFresh {
+			reason = finalQuoteFilterReason(c, fq.Quote, filters)
+			if reason == "" {
+				reason = currentStrategyReason(currentStrategyCheck(strat, c, current.Price))
+			}
+			if strat != nil {
+				current.EntryQuality = entryQualityAtPrice(strat, c, current.Price)
+			}
+			// 不让送模前检查覆盖这一轮更晚的执行核验。
+			current.FinalCheck = nil
+		}
+	}
+	plan := buildExecutionPlan(recType, p, current, snap, hasHolding, holdingKnown, status)
+	plan.CheckedPrice = current.Price
+	plan.EntryQuality = current.EntryQuality
+	if reason != "" {
+		plan.UnavailableReasons = append(plan.UnavailableReasons, reason)
+		if plan.Status == executionReady {
+			plan.Status = executionWait
+		}
+	}
+	return plan
 }
 
 func buildExecutionPlan(recType string, p recPick, c candidate, snap recommendationPreferenceSnapshot,
@@ -223,6 +259,16 @@ func buildExecutionPlan(recType string, p recPick, c candidate, snap recommendat
 	}
 	if plan.DataStatus != "fresh" || c.QuoteAsOf == "" {
 		wait = append(wait, "行情时效为"+plan.DataStatus+"，需刷新为有效行情后再评估")
+	}
+	entryQuality := c.EntryQuality
+	if c.FinalCheck != nil && c.FinalCheck.EntryQuality != nil {
+		entryQuality = c.FinalCheck.EntryQuality
+	}
+	if qualityEntryBlocksExecution(entryQuality) {
+		wait = append(wait, entryQuality.Reasons...)
+		if len(entryQuality.Reasons) == 0 {
+			wait = append(wait, "入场质量尚未确认")
+		}
 	}
 
 	plannedPrice := c.Price

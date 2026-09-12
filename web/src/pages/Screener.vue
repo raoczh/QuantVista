@@ -36,6 +36,8 @@ import {
   PERIOD_LABEL,
   RISK_LABEL,
   RISK_TAG_TYPE,
+  SCORE_PROFILE_LABEL,
+  type ScoreProfile,
   type StrategiesView,
   type BuiltinStrategy,
   type RetailTemplate,
@@ -458,12 +460,14 @@ const ownEditor = () => {
   const sequence = editorSequence
   return () => active() && editorShow.value && sequence === editorSequence
 }
-const editorForm = ref<{ id: number; name: string; desc: string; period: string; risk: string }>({
+const scoreProfileOptions = Object.entries(SCORE_PROFILE_LABEL).map(([value, label]) => ({ value, label }))
+const editorForm = ref<{ id: number; name: string; desc: string; period: string; risk: string; score_profile: ScoreProfile }>({
   id: 0,
   name: '',
   desc: '',
   period: 'swing',
   risk: 'mid',
+  score_profile: 'balanced',
 })
 const editorRows = ref<CondRow[]>([])
 const editorBaseRevisionId = ref<number>()
@@ -582,7 +586,7 @@ function flattenTree(tree: CondNode | null): CondRow[] | null {
 function openCreate() {
   if (!active() || editorSaving.value || archiving.value) return
   ++editorSequence
-  editorForm.value = { id: 0, name: '', desc: '', period: 'swing', risk: 'mid' }
+  editorForm.value = { id: 0, name: '', desc: '', period: 'swing', risk: 'mid', score_profile: 'balanced' }
   editorRows.value = [{ factor: 'chg_pct', op: 'between', value: 1, value2: 6 }]
   editorBaseRevisionId.value = undefined
   editorLoadedRevision.value = undefined
@@ -598,7 +602,7 @@ function openEdit(cs: CustomStrategy) {
   ++editorSequence
   const rows = flattenTree(cs.tree)
   resetAiGen()
-  editorForm.value = { id: cs.id, name: cs.name, desc: cs.desc, period: cs.period || 'swing', risk: cs.risk || 'mid' }
+  editorForm.value = { id: cs.id, name: cs.name, desc: cs.desc, period: cs.period || 'swing', risk: cs.risk || 'mid', score_profile: cs.score_profile || 'balanced' }
   editorBaseRevisionId.value = cs.current_revision_id
   editorLoadedRevision.value = cs.revision
   editorCurrentRevision.value = cs.revision
@@ -695,6 +699,7 @@ function restoreRevision(revision: ScreenerStrategyRevision) {
     desc: revision.desc,
     period: revision.period || 'swing',
     risk: revision.risk || 'mid',
+    score_profile: revision.score_profile || 'balanced',
   }
   editorBaseRevisionId.value = history.current_revision_id
   editorLoadedRevision.value = revision.revision
@@ -1008,6 +1013,7 @@ async function saveEditor() {
       desc: editorForm.value.desc,
       period: editorForm.value.period,
       risk: editorForm.value.risk,
+      score_profile: editorForm.value.score_profile,
       tree: clone(tree),
     })
     if (!current()) return
@@ -1392,6 +1398,7 @@ onMounted(() => { void load(); readResultRoute(); void restoreParseTask() })
                   <div :class="{ changed: historyFieldChanged('desc') }"><dt>说明</dt><dd>{{ historyLeft.desc || '—' }}</dd></div>
                   <div :class="{ changed: historyFieldChanged('period') }">
                     <dt>周期</dt><dd>{{ PERIOD_LABEL[historyLeft.period] || historyLeft.period }}</dd>
+                    <dt>评分侧重</dt><dd>{{ historyLeft.score_profile ? SCORE_PROFILE_LABEL[historyLeft.score_profile] : '历史未指定' }}</dd>
                   </div>
                   <div :class="{ changed: historyFieldChanged('risk') }">
                     <dt>风险</dt><dd>{{ RISK_LABEL[historyLeft.risk] || historyLeft.risk }}</dd>
@@ -1434,6 +1441,7 @@ onMounted(() => { void load(); readResultRoute(); void restoreParseTask() })
                   <div :class="{ changed: historyFieldChanged('desc') }"><dt>说明</dt><dd>{{ historyRight.desc || '—' }}</dd></div>
                   <div :class="{ changed: historyFieldChanged('period') }">
                     <dt>周期</dt><dd>{{ PERIOD_LABEL[historyRight.period] || historyRight.period }}</dd>
+                    <dt>评分侧重</dt><dd>{{ historyRight.score_profile ? SCORE_PROFILE_LABEL[historyRight.score_profile] : '历史未指定' }}</dd>
                   </div>
                   <div :class="{ changed: historyFieldChanged('risk') }">
                     <dt>风险</dt><dd>{{ RISK_LABEL[historyRight.risk] || historyRight.risk }}</dd>
@@ -1512,7 +1520,13 @@ onMounted(() => { void load(); readResultRoute(); void restoreParseTask() })
                 </n-radio-group>
               </n-form-item>
             </n-gi>
+            <n-gi>
+              <n-form-item label="评分侧重">
+                <n-select v-model:value="editorForm.score_profile" :options="scoreProfileOptions" />
+              </n-form-item>
+            </n-gi>
           </n-grid>
+          <p class="rows-hint">条件决定哪些股票符合策略；评分侧重决定推荐时如何排序，独立于持有周期。保存后与策略版本一起固定。历史未指定的策略，本次保存将明确采用所选评分。</p>
         </n-form>
         <!-- AI 白话生成（P3c）：预览确认后才落编辑器，AI 不直接执行扫描 -->
         <div class="ai-gen">

@@ -18,12 +18,13 @@ type recommendationJobRequest struct {
 	Request            RecommendRequest                  `json:"request"`
 	Manual             bool                              `json:"manual"`
 	PreferenceSnapshot *recommendationPreferenceSnapshot `json:"preference_snapshot,omitempty"`
+	RuntimeHash        string                            `json:"runtime_hash"`
 }
 
 func recommendationJobRequestFromPlan(req RecommendRequest, plan *recGenPlan, manual bool) recommendationJobRequest {
 	filters := plan.filters
 	snapshot := plan.preference
-	return recommendationJobRequest{Version: 3, Manual: manual, PreferenceSnapshot: &snapshot, Request: RecommendRequest{
+	return recommendationJobRequest{Version: 4, Manual: manual, PreferenceSnapshot: &snapshot, RuntimeHash: plan.runtime.Hash, Request: RecommendRequest{
 		Type: plan.recType, Market: plan.market, Strategy: plan.strat.Key, Count: plan.count,
 		StrategyRevisionID: plan.strat.StrategyRevisionID,
 		Filters:            &filters, Verify: plan.verify, BearCheck: boolPtr(plan.bear), LLMConfigID: req.LLMConfigID,
@@ -38,6 +39,12 @@ func decodeRecommendationJobRequest(raw json.RawMessage) (recommendationJobReque
 		if wrapped.Version == 0 {
 			wrapped.Version = 1
 		}
+		if wrapped.Version < 4 {
+			return recommendationJobRequest{}, errors.New("旧推荐任务未冻结完整算法版本，请重新生成；已完成的历史结果不变")
+		}
+		if wrapped.Version != 4 || len(wrapped.RuntimeHash) != 64 {
+			return recommendationJobRequest{}, errors.New("推荐作业版本不支持或缺少完整运行快照")
+		}
 		return wrapped, nil
 	}
 	// 兼容升级前可能已经进入队列的纯 RecommendRequest 快照。
@@ -45,11 +52,11 @@ func decodeRecommendationJobRequest(raw json.RawMessage) (recommendationJobReque
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return recommendationJobRequest{}, err
 	}
-	return recommendationJobRequest{Version: 1, Request: req, Manual: true}, nil
+	return recommendationJobRequest{}, errors.New("旧推荐任务未冻结完整算法版本，请重新生成；已完成的历史结果不变")
 }
 
-func (s *RecommendationService) registerDurableJobHandler() {
-	binding := durableJobBinding{
+func (s *RecommendationService) recommendationJobBinding() durableJobBinding {
+	return durableJobBinding{
 		resultType:               JobResultRecommendation,
 		resultCommittedByHandler: true,
 		create: func(tx *gorm.DB, run *model.JobRun, raw json.RawMessage) (int64, error) {
@@ -60,8 +67,23 @@ func (s *RecommendationService) registerDurableJobHandler() {
 			if err != nil {
 				return 0, fmt.Errorf("推荐作业快照无效: %w", err)
 			}
+			// 重试从同用户的原结果事实复制完整计划；JobRun 只保存版本摘要。
+			if run.ParentID == nil {
+				return 0, errors.New("推荐重试缺少原任务计划")
+			}
+			var parent model.JobRun
+			if err := tx.Where("id = ? AND user_id = ? AND kind = ? AND result_type = ?", *run.ParentID, run.UserID, JobKindRecommendation, JobResultRecommendation).First(&parent).Error; err != nil || parent.ResultID == nil {
+				return 0, errors.New("原推荐任务引用不可用")
+			}
+			var previous model.RecommendationBatch
+			if err := tx.Where("id = ? AND user_id = ?", *parent.ResultID, run.UserID).First(&previous).Error; err != nil {
+				return 0, err
+			}
+			if err := attachRecommendationJobRuntime(&jobReq, previous); err != nil {
+				return 0, err
+			}
 			plan, err := s.prepareGenerationWithSnapshot(run.UserID, isAdminUser(run.UserID), jobReq.Request,
-				jobReq.Manual, jobReq.PreferenceSnapshot)
+				jobReq.Manual, jobReq.PreferenceSnapshot, tx.Statement.Context)
 			if err != nil {
 				return 0, err
 			}
@@ -106,6 +128,44 @@ func (s *RecommendationService) registerDurableJobHandler() {
 			return nil
 		},
 	}
+}
+
+func attachRecommendationJobRuntime(job *recommendationJobRequest, batch model.RecommendationBatch) error {
+	var runtime recommendationRuntimeSnapshot
+	if len(batch.RuntimeSnapshot) > 128<<10 || json.Unmarshal([]byte(batch.RuntimeSnapshot), &runtime) != nil || runtime.Hash != job.RuntimeHash || runtime.UserID != batch.UserID || batch.ScoringVersion != runtime.Scoring.Algorithm || batch.ScoringArtifactHash != runtime.Scoring.ArtifactHash {
+		return errors.New("批次与已接受任务的运行快照不一致")
+	}
+	if _, err := thawRecommendationRuntime(&runtime, batch.UserID, job.Request); err != nil {
+		return err
+	}
+	job.Request.runtimeSnapshot = &runtime
+	return nil
+}
+
+func (s *RecommendationService) recommendationSeedBinding(plan *recGenPlan) durableJobBinding {
+	binding := s.recommendationJobBinding()
+	binding.create = func(tx *gorm.DB, run *model.JobRun, raw json.RawMessage) (int64, error) {
+		if err := ensureEnabledJobUser(run.UserID, tx.Statement.Context); err != nil {
+			return 0, err
+		}
+		job, err := decodeRecommendationJobRequest(raw)
+		if err != nil {
+			return 0, err
+		}
+		if run.UserID != plan.userID || job.RuntimeHash != plan.runtime.Hash {
+			return 0, errors.New("提交计划与作业摘要不一致")
+		}
+		batch := plan.newProcessingBatch()
+		if err := tx.Create(batch).Error; err != nil {
+			return 0, err
+		}
+		return batch.ID, nil
+	}
+	return binding
+}
+
+func (s *RecommendationService) registerDurableJobHandler() {
+	binding := s.recommendationJobBinding()
 	registerDurableBusinessJobHandler(JobKindRecommendation, recJobTimeout, binding,
 		func(ctx context.Context, userID int64, allowPrivate bool, raw json.RawMessage) (DurableJobResult, error) {
 			if err := ensureEnabledJobUser(userID); err != nil {
@@ -115,17 +175,19 @@ func (s *RecommendationService) registerDurableJobHandler() {
 			if err != nil {
 				return DurableJobResult{}, fmt.Errorf("推荐作业快照无效: %w", err)
 			}
-			plan, err := s.prepareGenerationWithSnapshot(userID, allowPrivate, jobReq.Request,
-				jobReq.Manual, jobReq.PreferenceSnapshot)
-			if err != nil {
-				return DurableJobResult{}, err
-			}
 			id, ok := currentJobResultID(ctx)
 			if !ok {
 				return DurableJobResult{}, errors.New("推荐作业缺少结果定位")
 			}
 			var batch model.RecommendationBatch
 			if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&batch).Error; err != nil {
+				return DurableJobResult{}, err
+			}
+			if err := attachRecommendationJobRuntime(&jobReq, batch); err != nil {
+				return DurableJobResult{}, err
+			}
+			plan, err := s.prepareGenerationWithSnapshot(userID, allowPrivate, jobReq.Request, jobReq.Manual, jobReq.PreferenceSnapshot, ctx)
+			if err != nil {
 				return DurableJobResult{}, err
 			}
 			batch.LLMConfigID, batch.Provider, batch.Model = plan.cfg.ID, plan.cfg.Provider, plan.cfg.Model

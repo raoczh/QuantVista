@@ -2,10 +2,11 @@
 import { computed, ref, watch } from 'vue'
 import { NAlert, NButton, NEmpty, NSpin, NTag } from 'naive-ui'
 import type { DiscoveryStatusView, PoolCandidate, RecommendationItem, RecommendationView } from '@/api/recommendation'
+import { SCORE_PROFILE_LABEL } from '@/api/screener'
 import SectionCard from '@/components/SectionCard.vue'
 import RecommendationCard from './RecommendationCard.vue'
 import RecommendationCandidateAudit from './RecommendationCandidateAudit.vue'
-import { businessStatusLabel, parseCandidateSnapshot, recommendationDecisionState } from './recommendationPresentation'
+import { businessStatusLabel, parseCandidateSnapshot, recommendationDecisionState, scoringVersionLabel } from './recommendationPresentation'
 
 const props = defineProps<{
   current: RecommendationView | null
@@ -68,6 +69,8 @@ const discoveryLabel = computed(() => ({ success: '完整', partial: '部分可�
           <div>
             <div class="batch-title">{{ current.title || (current.type === 'short_term' ? '短线推荐' : '长线推荐') }}</div>
             <div class="batch-meta">生成 {{ new Date(current.created_at).toLocaleString('zh-CN', { hour12: false }) }} · 量化版本 {{ current.strategy_version || '未知' }} · Prompt {{ current.prompt_version || '未知' }}</div>
+            <div v-if="current.score_profile" class="batch-meta">本批评分侧重：{{ SCORE_PROFILE_LABEL[current.score_profile] || current.score_profile }}</div>
+            <div v-if="current.scoring_version" class="batch-meta">排序方式：{{ scoringVersionLabel(current.scoring_version) }}<template v-if="current.scoring_artifact_id"> · 模型 #{{ current.scoring_artifact_id }}</template> · 分值用于排序，不代表获利概率</div>
           </div>
           <n-tag :type="current.status === 'success' ? 'success' : current.status === 'failed' ? 'error' : current.status === 'degraded' ? 'warning' : 'info'" :bordered="false">
             {{ businessStatusLabel(current.status) }}

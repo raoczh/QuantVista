@@ -3,6 +3,17 @@ import type { LLMTask } from './llmTask'
 
 // M1 条件树选股：因子宽表扫描 + 策略广场 + 自定义策略。
 
+export type ScoreProfile = 'balanced' | 'momentum' | 'pullback' | 'active' | 'value' | 'growth' | 'leader'
+export const SCORE_PROFILE_LABEL: Record<ScoreProfile, string> = {
+  balanced: '均衡技术评分',
+  momentum: '趋势与突破',
+  pullback: '回踩与稳健',
+  active: '量价活跃',
+  value: '估值与盈利质量',
+  growth: '成长与趋势',
+  leader: '质量与稳定性',
+}
+
 /** 因子元数据（自定义编辑器的因子选择与格式化）。 */
 export interface FactorDef {
   key: string
@@ -64,6 +75,7 @@ export interface CustomStrategy {
   desc: string
   period: string
   risk: string
+  score_profile?: ScoreProfile
   tree: CondNode | null
   conditions: string[]
 }
@@ -78,6 +90,7 @@ export interface ScreenerStrategyRevision {
   desc: string
   period: string
   risk: string
+  score_profile?: ScoreProfile
   tree: CondNode | null
   conditions: string[]
   created_at: string
@@ -187,6 +200,7 @@ export interface SaveStrategyRequest {
   desc?: string
   period?: string
   risk?: string
+  score_profile?: ScoreProfile
   tree: CondNode
 }
 

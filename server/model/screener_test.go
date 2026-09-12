@@ -1,6 +1,8 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -11,6 +13,31 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+func TestScreenerScoreProfileHashLegacyCompatibility(t *testing.T) {
+	tree := `{"factor":"close","op":"between","value":1,"value2":5}`
+	// 固定旧版完整 payload，确保加入字段后没有改写既有哈希含义。
+	legacy := `{"name":"n","desc":"d","period":"short","risk":"mid","tree":{"factor":"close","op":"between","value":1,"value2":5}}`
+	sum := sha256.Sum256([]byte(legacy))
+	want := hex.EncodeToString(sum[:])
+	for _, profiles := range [][]string{nil, {""}} {
+		got, err := ScreenerStrategyContentHash("n", "d", "short", "mid", tree, profiles...)
+		if err != nil || got != want {
+			t.Fatalf("旧 hash 漂移: %s %v", got, err)
+		}
+	}
+	a, err := ScreenerStrategyContentHash("n", "d", "short", "mid", tree, "momentum")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := ScreenerStrategyContentHash("n", "d", "short", "mid", tree, "value")
+	if err != nil || a == b || a == want || b == want {
+		t.Fatalf("评分方式必须进入摘要: %s %s %v", a, b, err)
+	}
+	if _, err := ScreenerStrategyContentHash("n", "d", "short", "mid", tree, "unknown"); err == nil {
+		t.Fatal("非法评分应拒绝")
+	}
+}
 
 type legacyScreenerStrategy struct {
 	ID        int64  `gorm:"primaryKey"`

@@ -128,17 +128,22 @@ type RecommendationCandidateEvent struct {
 	Market  string `gorm:"size:8" json:"market"`
 	Name    string `gorm:"size:64" json:"name"`
 
-	CandidateStage string  `gorm:"size:16" json:"candidate_stage"` // filtered/pool_full/scored/llm_list/picked
-	RawScore       float64 `gorm:"type:decimal(12,4)" json:"raw_score"`
+	CandidateStage string   `gorm:"size:16" json:"candidate_stage"`                    // filtered/pool_full/scored/llm_list/picked
+	RawScore       float64  `gorm:"type:decimal(12,4)" json:"raw_score"`               // 历史命名：保存 0-100 展示分，保持旧消费者口径
+	RankingScore   *float64 `gorm:"type:decimal(14,6)" json:"ranking_score,omitempty"` // cr3 起的未封顶排序值，旧行保持 NULL
 	// ScoreRank 是生成时量化稳定排序名次；LLMInputOrder 是终选门后实际输入顺序。
 	// 两者为 0 表示旧行/该阶段无此事实，消费端不得用当前数据反推。
-	ScoreRank      int    `json:"score_rank"`
-	LLMInputOrder  int    `json:"llm_input_order"`
-	RankingVersion string `gorm:"size:16" json:"ranking_version"`
-	RawAction      string `gorm:"size:16" json:"raw_action"`       // LLM 原始动作（picked 条目）
-	WouldBeAction  string `gorm:"size:16" json:"would_be_action"`  // 影子门控若强制执行会改写成的动作
-	PostGateAction string `gorm:"size:16" json:"post_gate_action"` // 实际最终动作（影子期与 raw 相同）
-	GateType       string `gorm:"size:32" json:"gate_type"`        // 主门控（多门控命中时按优先级取最强）
+	ScoreRank       int    `json:"score_rank"`
+	LLMInputOrder   int    `json:"llm_input_order"`
+	RankingVersion  string `gorm:"size:16" json:"ranking_version"`
+	ScoringVersion  string `gorm:"size:24" json:"scoring_version,omitempty"`
+	FeatureVersion  string `gorm:"size:16" json:"feature_version,omitempty"`
+	FeatureHash     string `gorm:"size:64" json:"feature_hash,omitempty"`
+	FeatureSnapshot string `gorm:"type:mediumtext" json:"feature_snapshot,omitempty"`
+	RawAction       string `gorm:"size:16" json:"raw_action"`       // LLM 原始动作（picked 条目）
+	WouldBeAction   string `gorm:"size:16" json:"would_be_action"`  // 影子门控若强制执行会改写成的动作
+	PostGateAction  string `gorm:"size:16" json:"post_gate_action"` // 实际最终动作（影子期与 raw 相同）
+	GateType        string `gorm:"size:32" json:"gate_type"`        // 主门控（多门控命中时按优先级取最强）
 	// GateTypes 全部命中门控（逗号分隔，含主门控）——同一标的同时命中 regime/bear/
 	// quality 时各门控都保有样本，影子对照报表按此分别归组（只看 GateType 会让次要
 	// 门控永久丢失样本，无法分别验证增量效果）。旧行为空=只有 GateType 一个。

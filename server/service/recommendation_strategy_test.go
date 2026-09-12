@@ -82,23 +82,23 @@ func TestStrategiesForUserCatalog(t *testing.T) {
 	if _, err := resolveRecStrategy(8, model.RecTypeShortTerm, "screen:u"+strconv.FormatInt(mine.ID, 10)); err == nil {
 		t.Fatalf("他人不得解析我的自建策略")
 	}
-	if strat.baseKey != "momentum" || !strings.Contains(strat.guide, "我的策略") {
+	if strat.baseKey != "balanced" || !strings.Contains(strat.guide, "我的策略") {
 		t.Fatalf("自建策略基础映射/导向异常: base=%s guide=%s", strat.baseKey, strat.guide)
 	}
 }
 
 // TestResolveRecStrategyBuiltinScreen 内置选股策略/新手模板作为推荐策略：key 解析、
-// 基础推荐策略映射（既有 signal 映射反向优先、否则按周期）、非法 key 报错。
+// 明确的评分配置、非法 key 报错。
 func TestResolveRecStrategyBuiltinScreen(t *testing.T) {
 	cases := []struct{ recType, key, base string }{
 		{model.RecTypeShortTerm, "screen:vol-break-20d", "momentum"},
 		{model.RecTypeShortTerm, "screen:shrink-pullback-ma20", "pullback"},
-		{model.RecTypeShortTerm, "screen:macd-gold-water", "pullback"}, // swing → pullback
-		{model.RecTypeShortTerm, "screen:bull-align-trend", "active"},  // 短线下 mid → active
-		{model.RecTypeLongTerm, "screen:bull-align-trend", "leader"},   // 长线下沿用 leader 映射
-		{model.RecTypeLongTerm, "screen:vol-break-20d", "growth"},      // 长线下 short → growth
-		{model.RecTypeLongTerm, "screen:year-line-stand", "value"},     // 长线下 mid → value
-		{model.RecTypeLongTerm, "tpl:low-price-steady", "value"},
+		{model.RecTypeShortTerm, "screen:macd-gold-water", "momentum"},  // 水上金叉侧重趋势
+		{model.RecTypeShortTerm, "screen:bull-align-trend", "momentum"}, // 多头排列侧重趋势
+		{model.RecTypeLongTerm, "screen:bull-align-trend", "leader"},    // 长线下沿用 leader 映射
+		{model.RecTypeLongTerm, "screen:vol-break-20d", "growth"},       // 长线下 short → growth
+		{model.RecTypeLongTerm, "screen:year-line-stand", "leader"},     // 站稳年线侧重稳定性
+		{model.RecTypeLongTerm, "tpl:low-price-steady", "leader"},
 		{model.RecTypeShortTerm, "tpl:volume-breakout", "momentum"},
 	}
 	for _, c := range cases {

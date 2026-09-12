@@ -15,7 +15,7 @@ import (
 // 推荐策略目录：内置推荐策略（momentum/pullback/active/value/growth/leader）之外，
 // 选股页的全部策略（内置选股策略、新手模板、用户自建策略）同样可作为推荐策略——
 // 用户在推荐工作台选中后，该选股策略的全市场命中成为候选池的主供给（strategy_signal
-// 来源），prompt 以策略白话讲解作为选股导向，量化加分沿用按周期映射的基础推荐策略。
+// 来源），prompt 以策略白话讲解作为选股导向，量化规则使用策略明确声明的评分配置。
 //
 // key 命名空间（落库 recommendation_batches.strategy，≤64 字符）：
 //   - 内置推荐策略：momentum / value …（不变）
@@ -40,15 +40,19 @@ type strategyTemplate struct {
 	// Group 下拉分组：rec（推荐内置）/ screen（选股内置）/ template（新手模板）/ custom（我的策略）。
 	Group string `json:"group,omitempty"`
 	// Period/Risk 选股类策略的适用周期与风险等级（前端分组展示；推荐内置策略留空）。
-	Period string `json:"period,omitempty"`
-	Risk   string `json:"risk,omitempty"`
+	Period       string `json:"period,omitempty"`
+	Risk         string `json:"risk,omitempty"`
+	ScoreProfile string `json:"score_profile,omitempty"`
+	Intent       string `json:"intent,omitempty"`
 	// 自建策略目录携带不可变版本，提交、排队、扫描和历史展示共用此身份。
 	StrategyRevisionID int64 `json:"strategy_revision_id,omitempty"`
 
 	guide string // 注入 prompt 的选股导向（不外泄给前端）
 	// baseKey 量化加分/榜单来源沿用的基础推荐策略 key（内置推荐策略 = 自身 Key；
-	// 选股类策略按周期映射）。
-	baseKey string
+	// 选股类策略使用注册表或不可变 revision 中的配置）。
+	baseKey    string
+	scoring    recScoringRuntime
+	frozenScan *recommendationFrozenScreen
 	// screen 非 nil = 选股类策略：strategy_signal 来源直接扫描该策略；tree 为其
 	// 规范化条件树（候选逐只评估条件命中度，见 evaluateStrategyHit）。
 	screen *recScreenBinding
@@ -64,8 +68,12 @@ type recScreenBinding struct {
 }
 
 func (t *strategyTemplate) scanRequest(limit int) ScanRequest {
-	req := ScanRequest{Limit: limit}
+	req := ScanRequest{Limit: limit, preselectionProfile: t.baseKey}
 	if t.screen == nil {
+		return req
+	}
+	if t.frozenScan != nil {
+		req.frozenRecommendation = t.frozenScan
 		return req
 	}
 	req.StrategyKey = t.screen.builtinKey
@@ -101,33 +109,12 @@ func recBuiltinStrategies(recType string) []strategyTemplate {
 	return longStrategies
 }
 
-// screenBaseKey 选股类策略按（推荐类型, 选股周期）映射到基础推荐策略——决定量化
-// 加分分支（strategyAdjust）与榜单来源组合（strategySources）。已有专属映射的内置
-// 选股策略（recStrategySignalKey 的反向）优先沿用原对应关系。
-func screenBaseKey(recType, period, builtinKey string) string {
-	if builtinKey != "" {
-		for _, base := range recBuiltinStrategies(recType) {
-			if recStrategySignalKey(recType, base.Key) == builtinKey {
-				return base.Key
-			}
-		}
+// screenBaseKey 使用内置策略显式声明的配置；周期仅保留调用兼容，不再猜测评分风格。
+func screenBaseKey(recType, _ string, builtinKey string) string {
+	if profile, ok := builtinRecommendationProfiles[builtinKey]; ok {
+		return profile.scoreProfile(recType)
 	}
-	if recType == model.RecTypeShortTerm {
-		switch period {
-		case "swing":
-			return "pullback"
-		case "mid":
-			return "active"
-		default:
-			return "momentum"
-		}
-	}
-	switch period {
-	case "mid":
-		return "value"
-	default:
-		return "growth"
-	}
+	return "balanced"
 }
 
 // screenStrategyGuide 选股类策略注入 prompt 的导向：白话讲解 + 命中标记说明。
@@ -143,7 +130,7 @@ func screenStrategyGuide(name, desc string, conditions []string) string {
 	if len(conditions) > 0 {
 		b.WriteString("策略条件：" + strings.Join(conditions, "；") + "。")
 	}
-	b.WriteString("名单中 sources 含 strategy_signal 的标的为该策略在最近交易日的全市场命中，应优先在其中精选；其余标的须同样符合上述形态方可入选，不符合者应在 rejected 中说明。")
+	b.WriteString("名单已按所选策略的完整收盘条件与当前价格约束复核；sources 含 strategy_signal 仅说明来自全市场策略扫描，不能代替具体条件证据。发现矛盾、缺口或不合理入场距离时，应在 rejected 或风险说明中明确指出。")
 	return b.String()
 }
 
@@ -193,12 +180,15 @@ func screenStrategyDesc(period, risk, desc string) string {
 // builtinScreenStrategyTemplate 内置选股策略 → 推荐策略模板。
 func builtinScreenStrategyTemplate(recType string, b builtinScreen) strategyTemplate {
 	tree, _, _ := canonicalCondTree(&b.Tree)
+	profile := builtinRecommendationProfiles[b.Key]
+	base := screenBaseKey(recType, b.Period, b.Key)
 	return strategyTemplate{
 		Key: recStrategyScreenPrefix + b.Key, Name: b.Name,
 		Desc: screenStrategyDesc(b.Period, b.Risk, b.Desc), Group: "screen",
 		Period: b.Period, Risk: b.Risk,
+		ScoreProfile: base, Intent: profile.intent,
 		guide:   screenStrategyGuide(b.Name, b.Desc, describeCondTree(tree)),
-		baseKey: screenBaseKey(recType, b.Period, b.Key),
+		baseKey: base,
 		screen:  &recScreenBinding{builtinKey: b.Key},
 		tree:    tree,
 	}
@@ -213,12 +203,15 @@ func retailTemplateStrategyTemplate(recType string, t retailTemplate) strategyTe
 	built := t.build(defaults)
 	tree, _, _ := canonicalCondTree(&built)
 	desc := t.Scenario
+	profile := retailRecommendationProfiles[t.Key]
+	base := profile.scoreProfile(recType)
 	return strategyTemplate{
 		Key: recStrategyTemplatePrefix + t.Key, Name: t.Name,
 		Desc: screenStrategyDesc(t.Period, t.RiskLevel, desc), Group: "template",
 		Period: t.Period, Risk: t.RiskLevel,
+		ScoreProfile: base, Intent: profile.intent,
 		guide:   screenStrategyGuide(t.Name, desc+" 风险提示："+t.Risk, describeCondTree(tree)),
-		baseKey: screenBaseKey(recType, t.Period, ""),
+		baseKey: base,
 		screen:  &recScreenBinding{templateKey: t.Key},
 		tree:    tree,
 	}
@@ -226,6 +219,10 @@ func retailTemplateStrategyTemplate(recType string, t retailTemplate) strategyTe
 
 // customScreenStrategyTemplate 用户自建策略（当前 revision）→ 推荐策略模板。
 func customScreenStrategyTemplate(recType string, id int64, rev model.ScreenerStrategyRevision) strategyTemplate {
+	profile := rev.ScoreProfile
+	if profile == "" {
+		profile = "balanced"
+	}
 	var conditions []string
 	var tree *CondNode
 	if parsed := condTreeFromJSON(rev.TreeJSON); parsed != nil {
@@ -238,9 +235,10 @@ func customScreenStrategyTemplate(recType string, id int64, rev model.ScreenerSt
 		Key: recStrategyCustomPrefix + strconv.FormatInt(id, 10), Name: rev.Name,
 		Desc: screenStrategyDesc(rev.Period, rev.Risk, rev.Desc), Group: "custom",
 		Period: rev.Period, Risk: rev.Risk,
+		ScoreProfile: profile, Intent: profileIntent(profile),
 		StrategyRevisionID: rev.ID,
 		guide:              screenStrategyGuide(rev.Name, rev.Desc, conditions),
-		baseKey:            screenBaseKey(recType, rev.Period, ""),
+		baseKey:            profile,
 		screen:             &recScreenBinding{strategyID: id, strategyRevisionID: rev.ID},
 		tree:               tree,
 	}
@@ -276,6 +274,9 @@ func loadCustomScreenStrategies(userID int64, onlyID int64, includeArchived bool
 			return nil, nil, err
 		}
 		for _, rev := range revs {
+			if rev.ScoreProfile != "" && !model.ValidStrategyScoreProfile(rev.ScoreProfile) {
+				return nil, nil, fmt.Errorf("策略 %d 的评分方式无效，请修复后重试", rev.StrategyID)
+			}
 			revBy[rev.ID] = rev
 		}
 	}
@@ -284,8 +285,16 @@ func loadCustomScreenStrategies(userID int64, onlyID int64, includeArchived bool
 
 // publicStrategy 去掉内部字段的下拉视图。
 func publicStrategy(s strategyTemplate) strategyTemplate {
+	profile := s.ScoreProfile
+	if profile == "" {
+		profile = s.baseKey
+	}
+	intent := s.Intent
+	if intent == "" {
+		intent = profileIntent(profile)
+	}
 	return strategyTemplate{Key: s.Key, Name: s.Name, Desc: s.Desc, Group: s.Group, Period: s.Period, Risk: s.Risk,
-		StrategyRevisionID: s.StrategyRevisionID}
+		ScoreProfile: profile, Intent: intent, StrategyRevisionID: s.StrategyRevisionID}
 }
 
 // StrategiesFor 返回某类型的内置推荐策略（供单测与无用户上下文的调用）。
@@ -409,6 +418,9 @@ func resolveScreenStrategy(userID int64, recType, key string, revisionID int64) 
 		if err := common.DB.Where("id = ? AND user_id = ? AND strategy_id = ?", revisionID, userID, id).First(&rev).Error; err != nil {
 			return nil, errors.New("策略版本不存在或不属于指定策略")
 		}
+		if rev.ScoreProfile != "" && !model.ValidStrategyScoreProfile(rev.ScoreProfile) {
+			return nil, errors.New("策略版本的评分方式无效，请先在选股页修复")
+		}
 		t := customScreenStrategyTemplate(recType, id, rev)
 		if t.tree == nil {
 			return nil, errors.New("自建选股策略条件无效，请先在选股页修复")
@@ -447,12 +459,18 @@ func strategySignalPoolLimitFor(strat *strategyTemplate) int {
 // 计算（收盘口径、同一求值函数），保证「推荐里的策略命中」与选股页扫描一致。
 // any 组算作一个条件单元（满足其一即命中）。
 type StrategyHit struct {
-	Total     int      `json:"total"`                // 条件单元总数
-	Hit       int      `json:"hit"`                  // 命中单元数
-	Full      bool     `json:"full"`                 // 全部命中（= 选股页会扫出该股）
-	Matched   []string `json:"matched,omitempty"`    // 命中条件（人话，含当前值）
-	Missed    []string `json:"missed,omitempty"`     // 未命中条件（人话，含当前值）
-	TradeDate string   `json:"trade_date,omitempty"` // 因子基准交易日（末根日线）
+	Total     int                   `json:"total"`                // 条件单元总数
+	Hit       int                   `json:"hit"`                  // 命中单元数
+	Full      bool                  `json:"full"`                 // 全部命中（= 选股页会扫出该股）
+	Matched   []string              `json:"matched,omitempty"`    // 命中条件（人话，含当前值）
+	Missed    []string              `json:"missed,omitempty"`     // 未命中条件（人话，含当前值）
+	TradeDate string                `json:"trade_date,omitempty"` // 因子基准交易日（末根日线）
+	Status    string                `json:"status,omitempty"`     // matched / missed / unknown
+	Missing   int                   `json:"missing,omitempty"`
+	Unknown   []string              `json:"unknown,omitempty"`
+	Values    map[string]float64    `json:"values,omitempty"` // 所用条件的可用原始因子，缺键即缺失
+	Current   *strategyCurrentCheck `json:"current,omitempty"`
+	row       []float64             // 本次评分冻结因子，仅供终选复核；不以现价改写历史序列
 }
 
 // singleRowFactorTable 把一行因子值包装成单行宽表，复用 evalCondRow/explainRow。
@@ -516,7 +534,12 @@ func evalStrategyHitNode(t *FactorTable, n *CondNode, hit *StrategyHit) bool {
 			hit.Hit++
 			return true
 		}
-		hit.Missed = append(hit.Missed, "满足其一："+strings.Join(describeCondTree(n), " / "))
+		if strategyNodeState(t, n) == strategyUnknown {
+			hit.Missing++
+			hit.Unknown = append(hit.Unknown, "满足其一的数据不足："+strings.Join(describeCondTree(n), " / "))
+		} else {
+			hit.Missed = append(hit.Missed, "满足其一："+strings.Join(describeCondTree(n), " / "))
+		}
 		return false
 	}
 	hit.Total++
@@ -525,7 +548,12 @@ func evalStrategyHitNode(t *FactorTable, n *CondNode, hit *StrategyHit) bool {
 		explainRow(t, n, 0, &hit.Matched)
 		return true
 	}
-	hit.Missed = append(hit.Missed, describeLeafWithValue(t, n))
+	if strategyNodeState(t, n) == strategyUnknown {
+		hit.Missing++
+		hit.Unknown = append(hit.Unknown, describeLeafWithValue(t, n))
+	} else {
+		hit.Missed = append(hit.Missed, describeLeafWithValue(t, n))
+	}
 	return false
 }
 
@@ -537,27 +565,34 @@ func evaluateStrategyHit(strat *strategyTemplate, symbol string, meta wideStockM
 	}
 	vals := computeWideRow(symbol, meta, bars)
 	t := singleRowFactorTable(vals)
-	hit := &StrategyHit{TradeDate: bars[len(bars)-1].TradeDate}
+	hit := &StrategyHit{TradeDate: bars[len(bars)-1].TradeDate, Status: strategyNodeState(t, strat.tree), row: vals, Values: map[string]float64{}}
+	var collect func(*CondNode)
+	collect = func(n *CondNode) {
+		for _, key := range []string{n.Factor, n.Ref} {
+			if j, ok := factorIndex[key]; ok && finiteRecNumber(vals[j]) {
+				hit.Values[key] = vals[j]
+			}
+		}
+		for i := range n.All {
+			collect(&n.All[i])
+		}
+		for i := range n.Any {
+			collect(&n.Any[i])
+		}
+	}
+	collect(strat.tree)
 	hit.Full = evalStrategyHitNode(t, strat.tree, hit)
 	return hit
 }
 
-// screenStrategyBonus 选股类策略的加分：全部命中 +12（该股就是选股页会扫出的标的）；
-// 部分命中按命中比例给 0~6 分（≥半数才给，避免「碰巧满足一条」得分）；命中率 <1/3 扣 4 分
-// （与用户明确指定的形态明显不符，不该靠五维基础分混入名单前列）。逐条说明随候选落库。
+// screenStrategyBonus 只确认完整命中；缺失或部分命中由必要条件硬门排除，不用加分补偿。
 func screenStrategyBonus(h *StrategyHit) (float64, []string) {
 	if h == nil || h.Total == 0 {
 		return 0, nil
 	}
-	ratio := float64(h.Hit) / float64(h.Total)
 	switch {
 	case h.Full:
 		return 12, []string{fmt.Sprintf("策略条件全部命中 %d/%d（+12）", h.Hit, h.Total)}
-	case ratio >= 0.5:
-		d := float64(int(6*ratio + 0.5))
-		return d, []string{fmt.Sprintf("策略条件命中 %d/%d，未命中：%s（+%.0f）", h.Hit, h.Total, strings.Join(h.Missed, "；"), d)}
-	case ratio < 1.0/3:
-		return -4, []string{fmt.Sprintf("策略条件仅命中 %d/%d，与所选形态不符（-4）", h.Hit, h.Total)}
 	}
 	return 0, []string{fmt.Sprintf("策略条件命中 %d/%d，未命中：%s（+0）", h.Hit, h.Total, strings.Join(h.Missed, "；"))}
 }

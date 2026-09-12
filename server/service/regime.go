@@ -36,8 +36,8 @@ var recRegimeEnforce = false
 
 // regimeParams rg1 判定参数（配置化；随 RegimeJSON 落批次快照可回溯）。
 type regimeParams struct {
-	BreadthStrong  float64 `json:"breadth_strong"`  // 涨家占比 ≥ 此值 +1
-	BreadthWeak    float64 `json:"breadth_weak"`    // 涨家占比 ≤ 此值 −1
+	BreadthStrong  float64 `json:"breadth_strong"`   // 涨家占比 ≥ 此值 +1
+	BreadthWeak    float64 `json:"breadth_weak"`     // 涨家占比 ≤ 此值 −1
 	LimitRatioBull float64 `json:"limit_ratio_bull"` // 涨停/跌停家数比 ≥ 此值 +1
 	MainNetWeakYi  float64 `json:"main_net_weak_yi"` // 主力净流出超过此值（亿）−1
 	AmtPctHigh     float64 `json:"amt_pct_high"`     // 成交额 120 日分位 ≥ 此值 +1
@@ -57,11 +57,15 @@ func defaultRegimeParams() regimeParams {
 
 // RegimeResult 三档判定结果（RegimeJSON 落库结构）。
 type RegimeResult struct {
-	Regime  string       `json:"regime"`
-	Score   int          `json:"score"`
-	Signals []string     `json:"signals"` // 依据明细（人话，前端 tooltip 展示）
-	Params  regimeParams `json:"params"`
-	Version string       `json:"version"`
+	Regime        string       `json:"regime"`
+	Score         int          `json:"score"`
+	Signals       []string     `json:"signals"` // 依据明细（人话，前端 tooltip 展示）
+	Params        regimeParams `json:"params"`
+	Version       string       `json:"version"`
+	BenchmarkAsOf string       `json:"benchmark_as_of,omitempty"`
+	BreadthAsOf   string       `json:"breadth_as_of,omitempty"`
+	FundFlowAsOf  string       `json:"fund_flow_as_of,omitempty"`
+	Missing       []string     `json:"missing,omitempty"`
 	// Sizing S1-2 仓位模型参数快照（computePositionPcts 使用的参数，可回溯）。
 	Sizing *positionSizingParams `json:"sizing,omitempty"`
 }
@@ -399,7 +403,7 @@ const sqrt252 = 15.874507866387544
 
 // pairwiseCorr 两条收盘序列的日收益 Pearson 相关（按尾部对齐，样本 <20 返回 0 不判）。
 // 注意：按数组位置对齐仅在两股无停牌错位时成立——生产路径应使用 pairwiseCorrAligned
-//（按交易日交集对齐），本函数保留给无日期序列的调用方与既有测试。
+// （按交易日交集对齐），本函数保留给无日期序列的调用方与既有测试。
 func pairwiseCorr(a, b []float64) float64 {
 	n := len(a)
 	if len(b) < n {

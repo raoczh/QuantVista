@@ -11,6 +11,7 @@ import TrustBadges from '@/components/TrustBadges.vue'
 import TermHelp from '@/components/TermHelp.vue'
 import {
   confidenceExplanation,
+  entryQualityLabel,
   positionEntryAction,
   rankedScore,
   recommendationDecisionState,
@@ -66,6 +67,8 @@ const firstRisk = computed(() => props.item.detail?.risks?.[0] || '风险信息�
 const evidenceShow = ref(false)
 const strategyHit = computed(() => props.candidate?.strategy_hit || null)
 const strategyNotes = computed(() => props.candidate?.bonus || [])
+const entryQuality = computed(() => props.item.detail?.execution_plan?.entry_quality || props.candidate?.final_check?.entry_quality || props.candidate?.entry_quality)
+const signalQuality = computed(() => props.candidate?.signal_quality)
 
 const linking = ref(false)
 /** 把已持有但未登记血缘的持仓补关联到本条推荐。 */
@@ -110,6 +113,7 @@ async function linkExistingPosition() {
           策略条件 {{ strategyHit.hit }}/{{ strategyHit.total }}
         </n-tag>
         <n-tag v-if="item.detail?.degraded_source" size="small" type="warning" :bordered="false">规则降级结果</n-tag>
+        <n-tag v-if="entryQuality" size="small" :type="entryQuality.status === 'aligned' ? 'default' : 'warning'" :bordered="false">{{ entryQualityLabel(entryQuality.status) }}</n-tag>
       </div>
     </header>
 
@@ -248,11 +252,27 @@ async function linkExistingPosition() {
             <ul>
               <li v-for="(line, index) in strategyHit.matched || []" :key="`m${index}`">{{ line }}</li>
               <li v-for="(line, index) in strategyHit.missed || []" :key="`x${index}`" :style="{ color: downColor }">✗ {{ line }}</li>
+              <li v-for="(line, index) in strategyHit.unknown || []" :key="`u${index}`">数据不足：{{ line }}</li>
             </ul>
+            <p v-if="strategyHit.current?.checked">生成时当前价格约束：{{ strategyHit.current.status === 'matched' ? '通过' : strategyHit.current.status === 'unknown' ? '数据不足' : '未通过' }}</p>
+            <p v-if="candidate?.time_facts?.current_returns?.['5'] != null">截至评分快照现价的近 5 日涨幅：{{ candidate.time_facts.current_returns['5'].toFixed(1) }}%；收盘信号截至 {{ candidate.time_facts.signal_date }}。</p>
+            <p v-if="candidate?.final_check">送模前复核：{{ candidate.final_check.quote_as_of }}，{{ candidate.final_check.passed ? '价格约束通过' : candidate.final_check.reason }}</p>
           </section>
           <section v-if="strategyNotes.length">
             <h4>量化加减分明细</h4>
             <ul><li v-for="(line, index) in strategyNotes" :key="index">{{ line }}</li></ul>
+          </section>
+          <section v-if="signalQuality || entryQuality">
+            <h4>入场与信号质量</h4>
+            <p v-if="entryQuality">{{ entryQualityLabel(entryQuality.status) }}<template v-if="entryQuality.reasons?.length">：{{ entryQuality.reasons.join('；') }}</template></p>
+            <ul v-if="signalQuality">
+              <li v-if="signalQuality.ma20_distance_atr != null">现价距 MA20：{{ signalQuality.ma20_distance_atr.toFixed(1) }} 个 ATR</li>
+              <li v-if="signalQuality.breakout_distance_atr != null">现价距突破参照：{{ signalQuality.breakout_distance_atr.toFixed(1) }} 个 ATR</li>
+              <li v-if="signalQuality.compression != null">信号前振幅比：{{ signalQuality.compression.toFixed(2) }}（近 5 日/20 日）</li>
+              <li v-if="signalQuality.support != null">结构支撑参照：{{ signalQuality.support.toFixed(2) }}</li>
+              <li v-for="gap in signalQuality.missing || []" :key="gap">数据不足：{{ gap }}</li>
+            </ul>
+            <small>ATR 是日常波动尺度；结构价用于核对距离，不代表必然支撑、目标价或获利概率。</small>
           </section>
           <section v-if="item.detail.bear">
             <h4>AI 反方观点</h4>
@@ -266,6 +286,7 @@ async function linkExistingPosition() {
           </section>
           <section v-if="item.detail.execution_plan">
             <h4>研究预算适配</h4>
+            <p v-if="item.detail.execution_plan.checked_price != null">执行复核 {{ item.detail.execution_plan.data_as_of }}，参考现价 {{ item.detail.execution_plan.checked_price.toFixed(2) }}。</p>
             <p v-if="item.detail.execution_plan.status === 'ready'">研究预算 {{ item.detail.execution_plan.planned_capital.toFixed(2) }}，参考数量 {{ item.detail.execution_plan.quantity }} 股，估算占用 {{ item.detail.execution_plan.estimated_capital.toFixed(2) }}。</p>
             <p v-else>{{ item.detail.execution_plan.unavailable_reasons?.join('；') || '当前不适合形成数量参考。' }}</p>
             <small>这是研究预算估算，不读取券商现金，也不会自动下单。</small>

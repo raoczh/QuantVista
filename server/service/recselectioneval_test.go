@@ -90,7 +90,8 @@ func seedSelectionEvalBatch(t *testing.T, userID int64, recType, status string, 
 		event := model.RecommendationCandidateEvent{
 			BatchID: batch.ID, UserID: userID, Symbol: candidate.Symbol, Market: "cn",
 			Name: candidate.Symbol, CandidateStage: stage, RawScore: float64(100 - candidate.Rank),
-			ScoreRank: candidate.Rank, LLMInputOrder: candidate.Order,
+			RankingScore: fptr(float64(100 - candidate.Rank)),
+			ScoreRank:    candidate.Rank, LLMInputOrder: candidate.Order,
 			RankingVersion: candidateRankingVersion, SentToLLM: true,
 		}
 		if candidate.Picked {
@@ -218,7 +219,7 @@ func TestValidateSelectionFactsSupportsAuditedRankingVersions(t *testing.T) {
 	}
 	for name, rows := range map[string][]model.RecommendationCandidateEvent{
 		"混合版本": events("cr1", "cr2"),
-		"未知版本": events("cr3", "cr3"),
+		"未知版本": events("cr4", "cr4"),
 	} {
 		if _, issue := validateSelectionFacts(rows, nil); issue != selectionFactRankingOld {
 			t.Fatalf("%s 应拒绝为 ranking old，got %s", name, issue)
