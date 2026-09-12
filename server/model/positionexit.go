@@ -21,7 +21,8 @@ const (
 	// pea2 增加历史复权/峰值质量隔离；已落库的 pea1 事实保持原版本。
 	// pea3 保留均线计算精度，旧版本事实不重写。
 	// pea4 固定 ATR 线侧状态并保留计算精度，核验日线时效及当前持仓依据。
-	PositionExitAssessmentVersion = "pea4"
+	// pea5 增加完整退出规划、只上移保护与独立触发事件身份。
+	PositionExitAssessmentVersion = "pea5"
 )
 
 type PositionExitAssessment struct {
@@ -55,6 +56,11 @@ type PositionExitAssessment struct {
 	ATR14           float64 `gorm:"type:decimal(20,4)" json:"atr14"`
 	ATRLine         float64 `gorm:"type:decimal(20,4)" json:"atr_line"`
 	ATRState        string  `gorm:"size:8" json:"-"` // above/below/unknown；按未舍入保护线判断，独立于首次穿越信号。
+	PlanJSON        string  `gorm:"type:mediumtext" json:"-"`
+	PlanHash        string  `gorm:"size:64" json:"plan_hash,omitempty"`
+	ActionKey       string  `gorm:"size:64;index" json:"action_key,omitempty"`
+	ActionDate      string  `gorm:"size:10" json:"action_date,omitempty"`
+	PlanParentID    *int64  `gorm:"-" json:"-"` // 计算时观察到的上一事实，提交时比较，拒绝并发旧规划。
 
 	SignalsJSON       string `gorm:"type:text" json:"-"`
 	EvidenceJSON      string `gorm:"type:text" json:"-"`
@@ -74,6 +80,22 @@ type PositionExitAssessment struct {
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// PositionExitNotice 是统一卖出事件的投递交接台账，和不可变的评估事实分开。
+// dispatched 表示已交给通知服务；外部通道的送达结果继续由其自身记录。
+type PositionExitNotice struct {
+	ID           int64 `gorm:"primaryKey"`
+	UserID       int64 `gorm:"index:idx_exit_notice_pending,priority:1"`
+	PositionID   int64 `gorm:"index"`
+	AssessmentID int64
+	EventKey     string `gorm:"size:64;uniqueIndex"`
+	Status       string `gorm:"size:16;index:idx_exit_notice_pending,priority:2"`
+	LeaseUntil   *time.Time
+	Attempts     int
+	LastError    string `gorm:"size:255"`
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // PositionExitOutcome 是卖出评估的前向结果台账（问题 1 补强）：pea1 的全部阈值

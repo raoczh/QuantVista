@@ -1,4 +1,5 @@
 import { request, HEAVY_TIMEOUT } from './client'
+import type { ExitPlanSeed } from './position'
 import type { EvidenceCheck, TrustReview } from './trust'
 import type { CandidateAuditUserReport } from './candidateAudit'
 import type { ScoreProfile } from './screener'
@@ -270,6 +271,7 @@ export type ExecutionStatus = 'ready' | 'wait' | 'not_suitable'
 
 // 纯程序执行适配：研究预算估算，不代表券商可用现金，也不改变 AI 原始结论。
 export interface ExecutionPlan {
+  exit_plan?: ExitPlanSeed
   status: ExecutionStatus
   preference_explanation: string[]
   planned_capital: number

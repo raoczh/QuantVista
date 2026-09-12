@@ -177,8 +177,10 @@ type PositionCorpAdjust struct {
 	// PeakBefore/PeakAfter 持仓期最高价（D15）折算前后值。**撤销时按 PeakBefore 原值
 	// 还原而非反算折算公式**——反算会引入舍入漂移，让撤销后的峰值与折算前差几厘。
 	// PeakBefore=0 表示折算时该持仓尚无峰值记录（旧建议），撤销时不动峰值。
-	PeakBefore float64 `gorm:"type:decimal(20,4)" json:"peak_before"`
-	PeakAfter  float64 `gorm:"type:decimal(20,4)" json:"peak_after"`
+	PeakBefore         float64 `gorm:"type:decimal(20,4)" json:"peak_before"`
+	PeakAfter          float64 `gorm:"type:decimal(20,4)" json:"peak_after"`
+	ExitPlanBeforeJSON string  `gorm:"type:mediumtext" json:"-"`
+	ExitPlanAfterJSON  string  `gorm:"type:mediumtext" json:"-"`
 
 	Status string `gorm:"size:16;index" json:"status"` // pending/confirmed/reverted/dismissed
 	// TradeID 确认时写入的 adjust 流水 id（撤销时据此删除；未确认为 0）。

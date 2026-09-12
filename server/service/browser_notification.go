@@ -158,8 +158,12 @@ func browserDefaultSettings() BrowserNotificationSettingsInput {
 }
 
 func (s *BrowserNotificationService) settings(userID int64) (BrowserNotificationSettingsInput, error) {
+	return s.settingsContext(context.Background(), userID)
+}
+
+func (s *BrowserNotificationService) settingsContext(ctx context.Context, userID int64) (BrowserNotificationSettingsInput, error) {
 	var row model.BrowserNotificationPreference
-	err := common.DB.Where("user_id = ?", userID).First(&row).Error
+	err := common.DB.WithContext(ctx).Where("user_id = ?", userID).First(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return browserDefaultSettings(), nil
 	}
@@ -380,7 +384,11 @@ func (s *BrowserNotificationService) RemoveDevice(userID, deviceID int64) error 
 }
 
 func (s *BrowserNotificationService) categoryEnabled(userID int64, category string) (bool, error) {
-	settings, err := s.settings(userID)
+	return s.categoryEnabledContext(context.Background(), userID, category)
+}
+
+func (s *BrowserNotificationService) categoryEnabledContext(ctx context.Context, userID int64, category string) (bool, error) {
+	settings, err := s.settingsContext(ctx, userID)
 	if err != nil {
 		return false, err
 	}
@@ -399,13 +407,19 @@ func (s *BrowserNotificationService) categoryEnabled(userID int64, category stri
 }
 
 func (s *BrowserNotificationService) HasEnabledDestination(userID int64, category string) bool {
-	enabled, err := s.categoryEnabled(userID, category)
+	enabled, err := s.HasEnabledDestinationContext(context.Background(), userID, category)
+	return err == nil && enabled
+}
+
+func (s *BrowserNotificationService) HasEnabledDestinationContext(ctx context.Context, userID int64, category string) (bool, error) {
+	enabled, err := s.categoryEnabledContext(ctx, userID, category)
 	if err != nil || !enabled {
-		return false
+		return false, err
 	}
 	var count int64
-	return common.DB.Model(&model.BrowserNotificationDevice{}).
-		Where("user_id = ? AND enabled = ?", userID, true).Count(&count).Error == nil && count > 0
+	err = common.DB.WithContext(ctx).Model(&model.BrowserNotificationDevice{}).
+		Where("user_id = ? AND enabled = ?", userID, true).Count(&count).Error
+	return count > 0, err
 }
 
 type BrowserNotificationInput struct {
@@ -437,10 +451,11 @@ func sanitizeInternalRoute(raw string) string {
 }
 
 func (s *BrowserNotificationService) CreateAndDispatch(ctx context.Context, userID int64, in BrowserNotificationInput, onlyDeviceHash string) (*model.BrowserNotificationEvent, error) {
-	if !userNotifyEnabledContext(ctx, userID) {
-		return nil, nil
+	enabled, err := readUserNotifyEnabledContext(ctx, userID)
+	if err != nil || !enabled {
+		return nil, err
 	}
-	enabled, err := s.categoryEnabled(userID, in.Category)
+	enabled, err = s.categoryEnabledContext(ctx, userID, in.Category)
 	if err != nil || !enabled {
 		return nil, err
 	}

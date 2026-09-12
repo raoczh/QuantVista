@@ -9,6 +9,8 @@ import { useStockActions } from '@/composables/useStockActions'
 import StockIdentity from '@/components/StockIdentity.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
 import TermHelp from '@/components/TermHelp.vue'
+import ExitPlanPanel from '@/components/positions/ExitPlanPanel.vue'
+import { formatPrice } from '@/lib/formatPrice'
 import {
   confidenceExplanation,
   entryQualityLabel,
@@ -176,6 +178,13 @@ async function linkExistingPosition() {
       <span v-if="item.status.last_eval_date">截至 {{ item.status.last_eval_date }}</span>
     </div>
 
+    <p v-if="item.detail?.execution_plan?.exit_plan && item.detail.execution_plan.exit_plan.data_status !== 'unavailable'" class="exit-plan-summary">
+      退出规划：初始止损 {{ formatPrice(item.detail.execution_plan.exit_plan.stop_price) }} ·
+      第一目标 {{ formatPrice(item.detail.execution_plan.exit_plan.target_price) }} ·
+      延伸目标 {{ formatPrice(item.detail.execution_plan.exit_plan.extended_target) }}。
+      实际建仓后按成交成本重算，依据见下方“查看推荐依据”。
+    </p>
+
     <TrustBadges
       v-if="item.detail"
       :quant-score="rankedScore(item.detail.quant_score, item.detail.quant_rank)"
@@ -208,18 +217,18 @@ async function linkExistingPosition() {
         size="small"
         type="success"
         secondary
-        @click="goPositionFromRecommendation(stock, item.id, entry.prefillQuantity)"
+        @click="goPositionFromRecommendation(stock, item.id, entry.prefillQuantity, type)"
       >{{ entry.label }}</n-button>
       <n-tooltip v-else trigger="hover" placement="top">
         <template #trigger>
-          <n-button size="small" @click="goPositionFromRecommendation(stock, item.id)">{{ entry.label }}</n-button>
+          <n-button size="small" @click="goPositionFromRecommendation(stock, item.id, undefined, type)">{{ entry.label }}</n-button>
         </template>
         <div class="entry-reasons">
           <div>系统未给出可执行的买入计划，此处仅登记你的实际买入事实：</div>
           <div v-for="(reason, i) in entry.reasons" :key="i">· {{ reason }}</div>
         </div>
       </n-tooltip>
-      <n-button v-if="type === 'short_term' && (item.detail?.stop_loss || 0) > 0" size="small" :loading="stopAlerting" :disabled="stopAlerting" @click="emit('stop-alert', item)">设置止损提醒</n-button>
+      <n-button v-if="!isHeld && !item.detail?.execution_plan?.exit_plan && type === 'short_term' && (item.detail?.stop_loss || 0) > 0" size="small" :loading="stopAlerting" :disabled="stopAlerting" @click="emit('stop-alert', item)">设置止损提醒</n-button>
     </footer>
 
     <!-- 依据走弹层而非卡内折叠区：一批推荐有多张卡，卡内已有结论/理由风险/持仓/追踪/
@@ -285,6 +294,7 @@ async function linkExistingPosition() {
             <p v-if="item.detail.quality_gate.senti_missing">新闻情绪缺失，不代表情绪中性。</p>
           </section>
           <section v-if="item.detail.execution_plan">
+            <ExitPlanPanel :seed="item.detail.execution_plan.exit_plan" compact />
             <h4>研究预算适配</h4>
             <p v-if="item.detail.execution_plan.checked_price != null">执行复核 {{ item.detail.execution_plan.data_as_of }}，参考现价 {{ item.detail.execution_plan.checked_price.toFixed(2) }}。</p>
             <p v-if="item.detail.execution_plan.status === 'ready'">研究预算 {{ item.detail.execution_plan.planned_capital.toFixed(2) }}，参考数量 {{ item.detail.execution_plan.quantity }} 股，估算占用 {{ item.detail.execution_plan.estimated_capital.toFixed(2) }}。</p>
@@ -310,6 +320,7 @@ async function linkExistingPosition() {
 </template>
 
 <style scoped>
+.exit-plan-summary { margin: 0; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
 /* 一批推荐含多只股票，原先只靠 1px 细线分隔——卡内内容很高（结论/理由风险/持仓/
  * 追踪/信任徽章/操作条），细线在视觉上完全托不住，读者分不清哪几段属于同一只。
  * 改为有边界的实体卡：整圈描边 + 8px 圆角 + 卡面底色 + 卡间留白，

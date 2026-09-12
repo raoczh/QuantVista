@@ -27,6 +27,9 @@ import {
   listPositions,
   getPortfolioOverview,
   createPosition,
+  previewPositionExitPlan,
+  evaluatePositionExits,
+  type ExitPlanSeed,
   updatePosition,
   closePosition,
   deletePosition,
@@ -78,6 +81,7 @@ import FreshnessTag from '@/components/FreshnessTag.vue'
 import DataImportWizard from '@/components/DataImportWizard.vue'
 import StockIdentity from '@/components/StockIdentity.vue'
 import PositionDecisionCenter from '@/components/positions/PositionDecisionCenter.vue'
+import ExitPlanPanel from '@/components/positions/ExitPlanPanel.vue'
 
 const PortfolioRisk = defineAsyncComponent(() => import('@/pages/PortfolioRisk.vue'))
 
@@ -256,6 +260,59 @@ const form = ref<PositionInput & { id: number | null; account_id?: number }>({
   plan_take_profit: undefined,
 })
 
+const exitPreview = ref<ExitPlanSeed | null>(null)
+const exitPreviewLoading = ref(false)
+const exitPreviewError = ref('')
+const exitAssessmentLoading = ref(false)
+const exitAssessmentError = ref('')
+watch(accountId, () => { exitAssessmentLoading.value = false; exitAssessmentError.value = '' })
+async function refreshExitPlans(showToast = true, reload = true) {
+  if (!pageActive() || exitAssessmentLoading.value || !accountId.value) return
+  const read = beginRead('exit-assess')
+  exitAssessmentLoading.value = true
+  exitAssessmentError.value = ''
+  try {
+    const result = await evaluatePositionExits(accountId.value, read.signal)
+    if (!read.active()) return
+    if (reload) await load()
+    if (read.active() && showToast) message.success(result.created ? '持仓退出评估已更新' : '已重新检查，当前退出规划没有新变化')
+  } catch (error) {
+    if (read.active() && !isAbortError(error)) exitAssessmentError.value = (error as Error).message
+  } finally {
+    if (read.active()) exitAssessmentLoading.value = false
+  }
+}
+const exitPreviewKey = computed(() => {
+  const f = form.value
+  return JSON.stringify([editModal.value, accountId.value, f.id, f.symbol, f.market, f.position_type, f.currency,
+    f.buy_price, f.buy_date, f.quantity, f.buy_fee, f.buy_tax, f.plan_stop_loss, f.plan_take_profit, f.recommendation_id])
+})
+watch(exitPreviewKey, () => {
+  readControllers.get('exit-preview')?.abort()
+  readControllers.delete('exit-preview')
+  exitPreview.value = null
+  exitPreviewError.value = ''
+  exitPreviewLoading.value = false
+}, { flush: 'sync' })
+async function previewExit() {
+  if (!pageActive() || exitPreviewLoading.value || editingClosed.value || !editModal.value) return
+  if (!form.value.symbol || !(Number(form.value.buy_price) > 0) || !(Number(form.value.quantity) > 0)) {
+    message.warning('先填写股票、实际或拟买入价格和数量')
+    return
+  }
+  const read = beginRead('exit-preview'), key = exitPreviewKey.value
+  exitPreviewLoading.value = true
+  exitPreviewError.value = ''
+  try {
+    const result = await previewPositionExitPlan({ ...form.value, position_id: form.value.id || undefined }, read.signal)
+    if (read.active() && key === exitPreviewKey.value) exitPreview.value = result
+  } catch (error) {
+    if (read.active() && key === exitPreviewKey.value && !isAbortError(error)) exitPreviewError.value = (error as Error).message
+  } finally {
+    if (read.active() && key === exitPreviewKey.value) exitPreviewLoading.value = false
+  }
+}
+
 // 买入前检查清单（勾选状态随持仓落库，供卖出复盘对照）。
 const CHECKLIST = [
   '买入理由已想清楚，能写下来（不是「感觉要涨」）',
@@ -305,7 +362,7 @@ const riskCalc = computed(() => {
   return out
 })
 
-function openCreate(prefill?: { symbol?: string; market?: string; name?: string; recId?: number; quantity?: number }) {
+function openCreate(prefill?: { symbol?: string; market?: string; name?: string; recId?: number; quantity?: number; positionType?: string }) {
   if (!pageActive() || submitting.value || linkSaving.value) return
   editing.value = false
   editingClosed.value = false
@@ -315,7 +372,7 @@ function openCreate(prefill?: { symbol?: string; market?: string; name?: string;
     symbol: prefill?.symbol || '',
     market: prefill?.market || 'cn',
     name: prefill?.name || '',
-    position_type: 'short_term',
+    position_type: prefill?.positionType === 'long_term' ? 'long_term' : 'short_term',
     buy_price: undefined,
     buy_date: todayStr(),
     quantity: prefill?.quantity,
@@ -461,6 +518,7 @@ function applyPositionCommit(result?: PositionBase, removedID?: number) {
 }
 
 async function refreshAfterPositionCommit() {
+  await refreshExitPlans(false, false)
   await Promise.all([load(), loadCorpAdjusts(), loadCurve(), ...(mainTab.value === 'review' ? [loadStats()] : [])])
 }
 
@@ -1424,7 +1482,7 @@ function stockActionKey() {
   }
   const symbol = String(route.query.symbol || '').trim()
   if (!symbol && route.query.add !== '1') return ''
-  return String(route.query._stock_action || '') || [symbol, route.query.market || 'cn', route.query.add || '', route.query.quantity || '', route.query.rec_id || ''].join(':')
+  return String(route.query._stock_action || '') || [symbol, route.query.market || 'cn', route.query.add || '', route.query.quantity || '', route.query.rec_id || '', route.query.buy_type || ''].join(':')
 }
 
 function routeSuggestedQuantity(): number | undefined {
@@ -1434,7 +1492,7 @@ function routeSuggestedQuantity(): number | undefined {
 
 function stockRouteRemainder() {
   const query = { ...route.query }
-  for (const key of ['symbol', 'market', 'name', 'add', 'import', 'rec_id', 'quantity', '_stock_action']) delete query[key]
+  for (const key of ['symbol', 'market', 'name', 'add', 'import', 'rec_id', 'quantity', 'buy_type', '_stock_action']) delete query[key]
   return query
 }
 
@@ -1492,6 +1550,7 @@ async function applyStockActionQuery(): Promise<boolean> {
         name: String(route.query.name || ''),
         recId: Number(route.query.rec_id) || 0,
         quantity: routeSuggestedQuantity(),
+        positionType: String(route.query.buy_type || ''),
       })
       await router.replace({ name: 'positions', query: stockRouteRemainder() })
       return true
@@ -1539,6 +1598,7 @@ async function applyStockActionQuery(): Promise<boolean> {
         name: String(route.query.name || ''),
         recId: Number(route.query.rec_id) || 0,
         quantity: routeSuggestedQuantity(),
+        positionType: String(route.query.buy_type || ''),
       })
     } else {
       stockActionError.value = '在当前账户中没有找到这笔持仓，请核对账户或持仓是否已删除。'
@@ -1655,8 +1715,8 @@ onBeforeUnmount(() => {
         </n-gi>
       </n-grid>
 
-      <n-alert v-if="mainTab === 'all' && loadError" type="error" :bordered="false" title="持仓读取失败">
-        {{ loadError }}<template v-if="positions.length">。以下保留最近取得的账本，行情与汇总待刷新。</template>
+      <n-alert v-if="mainTab === 'all' && (loadError || exitAssessmentError)" type="error" :bordered="false" title="持仓读取或评估失败">
+        {{ loadError || exitAssessmentError }}<template v-if="positions.length">。以下保留最近取得的账本，行情与汇总待刷新。</template>
       </n-alert>
       <n-alert v-if="stockActionError" type="warning" :bordered="false">{{ stockActionError }}</n-alert>
 
@@ -1670,16 +1730,17 @@ onBeforeUnmount(() => {
           <PositionDecisionCenter
             :positions="positions"
             :overview="overview"
-            :loading="loading"
-            :error="loadError || focusedAssessmentError"
+            :loading="loading || exitAssessmentLoading"
+            :error="loadError || exitAssessmentError || focusedAssessmentError"
             :focused-position-id="highlightedPositionID"
             :focused-assessment="focusedAssessment"
             :advice="advice"
             :advice-loading="adviceLoading"
             :advice-error="adviceError"
             :advice-target-position-id="adviceTargetPositionID"
-            @refresh="load()"
+            @refresh="refreshExitPlans()"
             @review="runAdvice"
+            @trade="openTrade($event, 'sell')"
           />
         </n-tab-pane>
         <n-tab-pane name="all" tab="全部持仓">
@@ -1900,6 +1961,7 @@ onBeforeUnmount(() => {
                         <div v-else-if="p.status === 'holding'" class="exit-assessment-empty">
                           卖出风险评估尚未生成
                         </div>
+                        <ExitPlanPanel v-if="p.status === 'holding'" :plan="p.exit_assessment?.exit_plan" :seed="p.exit_plan_seed" compact />
                         <div v-if="p.status === 'closed' && p.review_note" class="r-review">
                           复盘：{{ p.review_note }}
                         </div>
@@ -2370,29 +2432,36 @@ onBeforeUnmount(() => {
         <template v-if="!editingClosed">
           <n-grid cols="1 s:2" responsive="screen" :x-gap="12" :y-gap="12">
             <n-gi>
-              <n-form-item label="计划止损价（可选）">
+              <n-form-item label="自定初始止损（可选）">
                 <n-input-number v-model:value="form.plan_stop_loss" :min="0" :precision="4" style="width: 100%" />
               </n-form-item>
             </n-gi>
             <n-gi>
-              <n-form-item label="计划止盈价（可选）">
+              <n-form-item label="自定第一止盈（可选）">
                 <n-input-number v-model:value="form.plan_take_profit" :min="0" :precision="4" style="width: 100%" />
               </n-form-item>
             </n-gi>
           </n-grid>
-          <div v-if="riskCalc" class="risk-calc qv-tnum">
+          <div v-if="riskCalc && !exitPreview" class="risk-calc qv-tnum">
             <span>投入 {{ riskCalc.cost.toFixed(0) }} 元</span>
             <template v-if="riskCalc.maxLoss != null">
               <span :style="{ color: vars.errorColor }">
                 按止损价估算亏 {{ riskCalc.maxLoss.toFixed(0) }} 元（-{{ riskCalc.maxLossPct!.toFixed(1) }}%）
               </span>
             </template>
-            <span v-else class="risk-hint">填写止损价即可估算亏损</span>
+            <span v-else class="risk-hint">可使用下方退出规划计算止损与目标</span>
             <span class="risk-hint">未计卖出费税与滑点，实际亏损可能更高。</span>
             <span v-if="riskCalc.gain != null && riskCalc.maxLoss" >
               盈亏比 {{ (riskCalc.gain / riskCalc.maxLoss).toFixed(1) }}
             </span>
           </div>
+
+          <div class="exit-preview-actions">
+            <n-button :loading="exitPreviewLoading" :disabled="submitting || linkSaving" size="small" @click="previewExit">计算退出规划</n-button>
+            <span class="risk-hint">未自定价位时按策略、波动与支撑阻力计算；保存实际买入后自动跟踪。</span>
+          </div>
+          <n-alert v-if="exitPreviewError" type="error" :bordered="false">{{ exitPreviewError }}</n-alert>
+          <ExitPlanPanel :seed="exitPreview" compact />
 
           <!-- 买入前检查清单 -->
           <div class="checklist">
@@ -2606,6 +2675,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.exit-preview-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-block: 12px; }
 .pos {
   display: flex;
   flex-direction: column;

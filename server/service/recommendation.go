@@ -1028,6 +1028,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		c := poolBySymbol[picks[i].Symbol]
 		picks[i].ExecutionPlan = buildExecutionPlanWithQuote(recType, picks[i], c, plan.preference,
 			holdingSymbols[marketSymbolKey(c.Market, c.Symbol)], holdingErr == nil, executionQuotes[QuoteKey(c.Market, c.Symbol)], strat, filters)
+		attachRecommendationExitPlan(ctx, recType, &picks[i], c, batch.ScoreProfile)
 	}
 	regime.Sizing = &sizingParams
 	batch.RegimeJSON = marshalRegimeJSON(regime)

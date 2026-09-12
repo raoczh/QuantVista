@@ -102,6 +102,10 @@ func todoItemFromSource(today string, item TodoItem, source any) TodoItem {
 		item.SourceID = row.PositionID
 		item.SourceVersion = todoVersion(row.FactHash, row.Level, row.TradeDate, row.Version)
 		item.eventDate = row.TradeDate
+		if row.ActionKey != "" {
+			item.SourceVersion = todoVersion(row.ActionKey, row.Level, row.Version)
+			item.eventDate = row.ActionDate
+		}
 		item.groupCategory = fmt.Sprintf("position_exit:%d", row.PositionID)
 		item.DeepLink = todoPositionDeepLink(row.PositionID, 0)
 		item.CanComplete = row.ShouldTodo

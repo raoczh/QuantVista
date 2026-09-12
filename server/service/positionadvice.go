@@ -31,7 +31,7 @@ import (
 
 const (
 	// positionAdvicePromptVersion 建议 prompt 版本（改措辞/枚举语义必须递增，审计按它归因）。
-	positionAdvicePromptVersion = "pa4"
+	positionAdvicePromptVersion = "pa5"
 	// positionAdviceJobTimeout 后台任务总预算。
 	positionAdviceJobTimeout = 5 * time.Minute
 	// positionAdviceMaxPositions 单次最多分析的持仓笔数（控上下文预算）。超出按
@@ -153,6 +153,8 @@ const positionAdviceSystemPrompt = `你是一名持仓风控顾问。用户已�
 2. 结论必须建立在给出的数据上：触发的提醒信号 signals 与待复核利空事件 events 是最重要的输入，
    命中时必须在理由中点名并说明它对**这笔成本**的含义。
 3. exit_assessment 是程序硬规则已经落库的统一风险事实。你的意见与它并列展示，不能降低、覆盖或改写其中的风险等级。
+   exit_plan 是同一事实中的退出规划摘要：初始止损、当前保护、阶段目标和可卖数量由程序计算。
+   已触发保护或目标时必须解释具体阶段；不得用你的建议改写这些生效价位，不得把 T+1 受限数量或触价当作已经成交。
 4. **禁止使用你记忆中关于这些公司的信息**，不得虚构财务、新闻、公告、股东行为。数据没给的就说没有依据。
 5. invalidation 写「什么情况下这个结论不再成立」（具体价位 / 事件 / 时间窗口），不要写空泛的「市场变化时」。
 6. 这是研究参考，不构成投资建议；不要给出加仓建议——本任务只回答持有 / 减仓 / 清仓。
@@ -264,6 +266,7 @@ type positionAdviceRow struct {
 	Signals        []string                    `json:"signals,omitempty"` // D14/D15 命中的提醒
 	Events         []string                    `json:"events,omitempty"`  // D16 待复核的利空事件
 	ExitAssessment *PositionExitAssessmentView `json:"exit_assessment,omitempty"`
+	ExitPlan       *positionAdviceExitPlan     `json:"exit_plan,omitempty"`
 	DataGaps       []string                    `json:"data_gaps,omitempty"`
 }
 
@@ -349,7 +352,7 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 			row.PeakDrawdownPct = v.Peak.DrawdownPct
 			row.PeakNote = v.Peak.Note
 		}
-		row.ExitAssessment = v.ExitAssessment
+		row.ExitAssessment, row.ExitPlan = positionAdvicePlanning(v)
 		rows = append(rows, row)
 	}
 	if len(rows) == 0 {
@@ -360,12 +363,12 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 		return nil, refusalErrf(RefusalFreshQuotesInsufficient,
 			"%d 笔匹配持仓的行情或账本口径不完整，暂不能给出卖出建议。%s", res.Skipped, strings.Join(res.Notes, "；"))
 	}
-	// 按「浮亏最深」排序后截断：真要决策的是亏得最多的那些，不是列表里排在前面的。
+	// 先处理程序已确认的触发，再看浮亏；盈利保护不能因账面盈利而被挤出复核预算。
 	sortAdviceRowsByUrgency(rows)
 	if len(rows) > positionAdviceMaxPositions {
 		res.Skipped += len(rows) - positionAdviceMaxPositions
 		res.Notes = append(res.Notes, fmt.Sprintf(
-			"持仓 %d 笔超过单次分析上限 %d，已按浮亏由深到浅取前 %d 笔，其余本次未分析",
+			"持仓 %d 笔超过单次分析上限 %d，已按程序风险等级及浮亏优先取前 %d 笔，其余本次未分析",
 			len(rows), positionAdviceMaxPositions, positionAdviceMaxPositions))
 		rows = rows[:positionAdviceMaxPositions]
 	}
@@ -563,6 +566,15 @@ func verifyPositionAdvice(advices []PositionAdvice, rows []positionAdviceRow) *e
 func sortAdviceRowsByUrgency(rows []positionAdviceRow) {
 	sort.SliceStable(rows, func(i, j int) bool {
 		a, b := rows[i], rows[j]
+		rank := func(row positionAdviceRow) int {
+			if row.ExitAssessment != nil {
+				return positionExitRank(row.ExitAssessment.Level)
+			}
+			return 0
+		}
+		if rank(a) != rank(b) {
+			return rank(a) > rank(b)
+		}
 		if a.PnlPct != b.PnlPct {
 			return a.PnlPct < b.PnlPct
 		}

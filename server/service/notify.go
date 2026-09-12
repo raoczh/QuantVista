@@ -174,11 +174,20 @@ func userNotifyEnabled(userID int64) bool {
 }
 
 func userNotifyEnabledContext(ctx context.Context, userID int64) bool {
+	enabled, err := readUserNotifyEnabledContext(ctx, userID)
+	return err == nil && enabled
+}
+
+// 需要可靠交接的调用方须区分用户关闭与读取失败，后者仍应保留重试机会。
+func readUserNotifyEnabledContext(ctx context.Context, userID int64) (bool, error) {
 	var pref model.UserPreference
 	if err := common.DB.WithContext(ctx).Where("user_id = ?", userID).First(&pref).Error; err != nil {
-		return false
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		return false, err
 	}
-	return pref.EnableNotify
+	return pref.EnableNotify, nil
 }
 
 // 配置数量和启用状态在用户锁下变更，避免并发创建、重新启用绕过数量上限。
@@ -387,6 +396,35 @@ func (s *NotifyService) SendMsgDetached(ctx context.Context, userID int64, msg N
 		defer cancel()
 		s.sendExternalContext(deliveryCtx, userID, msg)
 	}()
+}
+
+// SendDurableMsgContext 用于有独立事件交接台账的持仓提醒。浏览器事件入库失败向上
+// 返回，供下一轮重试；外部通道继续按既有 best-effort 语义投递并记录通道结果。
+func (s *NotifyService) SendDurableMsgContext(ctx context.Context, userID int64, msg NotifyMessage) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	browser := s.browser
+	if browser == nil {
+		browser = NewBrowserNotificationService()
+	}
+	for _, event := range msg.BrowserEvents {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := browser.CreateAndDispatch(ctx, userID, event, ""); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	go func() {
+		deliveryCtx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+		defer cancel()
+		s.sendExternalContext(deliveryCtx, userID, msg)
+	}()
+	return nil
 }
 
 func (s *NotifyService) declareBrowserEvents(ctx context.Context, userID int64, msg NotifyMessage) {

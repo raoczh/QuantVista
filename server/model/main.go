@@ -120,6 +120,7 @@ func AllModels() []any {
 		&PaperCorpAdjust{},
 		&SellReview{},
 		&PositionExitAssessment{},
+		&PositionExitNotice{},
 		&PositionExitOutcome{},
 		&CandidateDiscoveryRun{},
 		&CandidateDiscoveryItem{},

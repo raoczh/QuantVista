@@ -272,6 +272,8 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 				positions.GET("/stats", positionCtl.Stats)       // B6 个人交易复盘统计
 				positions.GET("/curve", positionCtl.Curve)       // B7 资产曲线
 				positions.POST("", positionCtl.Create)
+				positions.POST("/exit-plan-preview", middleware.RateLimit(30, time.Minute), positionCtl.PreviewExitPlan)
+				positions.POST("/evaluate-exit", middleware.RateLimit(15, time.Minute), positionCtl.RefreshExitPlans)
 				positions.POST("/import", middleware.RateLimit(10, time.Minute), exportCtl.ImportPositions)
 				positions.PUT("/:id", positionCtl.Update)
 				positions.PUT("/:id/recommendation-link", positionCtl.LinkRecommendation) // 事后补/改/解除推荐血缘

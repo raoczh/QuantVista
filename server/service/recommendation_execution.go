@@ -16,7 +16,7 @@ import (
 
 const (
 	recommendationPreferenceSnapshotVersion = "pref1"
-	executionPlanVersion                    = "ep3"
+	executionPlanVersion                    = "ep4"
 	riskBudgetVersion                       = "rb1"
 
 	executionReady       = "ready"
@@ -163,6 +163,7 @@ type executionPlan struct {
 	DataAsOf              string           `json:"data_as_of"`
 	CheckedPrice          float64          `json:"checked_price,omitempty"`
 	EntryQuality          *recEntryQuality `json:"entry_quality,omitempty"`
+	ExitPlan              *ExitPlanSeed    `json:"exit_plan,omitempty"`
 	DataStatus            string           `json:"data_status"`
 	BudgetBasis           string           `json:"budget_basis"`
 	Version               string           `json:"version"`

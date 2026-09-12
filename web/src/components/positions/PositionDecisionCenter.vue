@@ -27,6 +27,7 @@ import {
 } from '@/composables/usePositionDecisionCenter'
 import StockIdentity from '@/components/StockIdentity.vue'
 import TermHelp from '@/components/TermHelp.vue'
+import ExitPlanPanel from './ExitPlanPanel.vue'
 
 const props = defineProps<{
   positions: Position[]
@@ -44,6 +45,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   refresh: []
   review: [position: Position]
+  trade: [position: Position]
 }>()
 
 const themeVars = useThemeVars()
@@ -201,6 +203,7 @@ function levelType(level: PositionExitAssessment['level']) {
             <span class="field-label">最主要原因</span>
             <p>{{ row.assessment.primary_reason || '当前评估没有提供主因' }}</p>
           </div>
+          <ExitPlanPanel :plan="row.assessment.exit_plan" :seed="row.historical ? undefined : row.position.exit_plan_seed" compact />
           <div class="asof-line">
             最近评估 {{ fmtTime(row.assessment.evaluated_at) }} ·
             <TermHelp term="as_of" />：行情 {{ row.assessment.quote_as_of || '未知' }} · 日线
@@ -223,6 +226,7 @@ function levelType(level: PositionExitAssessment['level']) {
               @click="emit('review', row.position)"
             >AI 复核</n-button>
           </div>
+          <n-button v-if="row.position.status === 'holding'" size="small" type="warning" secondary @click="emit('trade', row.position)">登记实际减仓 / 卖出</n-button>
 
           <details class="evidence-details">
             <summary>查看依据</summary>

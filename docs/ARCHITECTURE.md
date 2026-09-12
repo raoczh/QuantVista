@@ -345,12 +345,26 @@ Go API Server
   下轮扫描拉回 open（同 B8 先例）。`detail` 必须回答「这件事对**我这笔持仓**意味着什么」
   （含我的成本与浮盈亏）；`quote_ok=false` 时 `price/profit_pct` 恒 0 且 detail 如实声明
   行情不可用——绝不用旧价冒充。
+- `position_exit_assessments` 是持仓卖出决策的追加式统一事实。`pea5` 将 `xp1` 初始规划与动态保护保存到
+  `plan_json / plan_hash`；`positions.exit_plan_seed_json` 冻结建仓、加仓或明确编辑计划时的初始依据。
+  完整日线计算 ATR 与确认结构位，初始风险固定，同一依据下保护线只上移；减仓承接保护，加仓重算。
+  计算与提交之间以持仓风险输入及 `PlanParentID` 重验，拒绝并发旧规划覆盖新保护；旧账本等价补齐不使评估失效。
+  前次规划读取失败或校验损坏时保留原评估并报错，不能通过无规划的降级行清空已有保护。
+- `position_exit_notices` 以 `event_key` 唯一记录触发事件，与评估同事务提交。`action_key / action_date` 区分
+  第一目标、延伸目标及保护再触发；持续同一事件不因交易日变化重新推送或恢复 Todo 未读。
+  投递使用租约及退避；浏览器事件入库失败可重试，外部通道仍沿用既有 best-effort 语义。
+  `GuardEvent` 为新退出事件保留日级审计，不再作为其发送门槛；平仓、删除或旧事实失效使未交接事件作废。
+- `POST /api/positions/exit-plan-preview` 只读计算并核验本人持仓或推荐归属；
+  `POST /api/positions/evaluate-exit?account_id=...` 复用用户提醒锁，评估本人指定真实账户，不写交易流水、不调用 LLM。
+  推荐依据、持仓列表、处理中心、Today、个股持仓摘要与 AI 复核消费统一规划；AI 只解释，不能改写生效价位或推定成交。
+  公司行动同步折算规划与既有保护，`exit_plan_before_json / exit_plan_after_json` 保存撤销原值并防止覆盖后来人工修改。
+  使用步骤、参数与验证边界见 [持仓退出规划](POSITION_EXIT_OPTIMIZATION_PLAN.md)。
 - 浏览器通知分为事实、设备和投递三层：`browser_notification_events` 用
   `(user_id, fact_key)` 固化稳定来源类型、来源 ID、分类、等级、站内路由和创建时间；
   `browser_notification_devices` 与 `web_push_subscriptions` 以用户+本地随机设备标识隔离多设备，
   endpoint/p256dh/auth 全部用 `ENCRYPTION_KEY` 加密且 API 不回显；
   `browser_notification_deliveries` 用 `(user_id, device_id, event_id)` 保证同一事实同一设备只投递一次。
-  review 升 urgent 使用包含新评估 ID/等级/事实 hash 的新 fact key，因此允许再次提醒。任一设备失败不影响
+  新持仓退出提醒的 fact key 包含持仓 ID、等级与触发事件身份，允许风险升级及同日新阶段再次提醒。任一设备失败不影响
   其他设备或业务事实，Web Push 返回 404/410 会禁用对应订阅。
 
 **除权除息折算公式（B8，改动前先读；D15 起含峰值）**：

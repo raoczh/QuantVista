@@ -23,6 +23,43 @@ func NewPositionController(svc *service.PositionService) *PositionController {
 	return &PositionController{svc: svc}
 }
 
+// PreviewExitPlan POST /api/positions/exit-plan-preview，只读计算，不创建持仓或提醒。
+func (pc *PositionController) PreviewExitPlan(c *gin.Context) {
+	var in struct {
+		service.PositionInput
+		PositionID int64 `json:"position_id"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		common.ApiErrorMsg(c, "请求格式错误")
+		return
+	}
+	if in.PositionID < 0 {
+		common.ApiErrorMsg(c, "持仓编号无效")
+		return
+	}
+	plan, err := pc.svc.PreviewPositionExitPlan(c.Request.Context(), currentUserID(c), in.PositionInput, in.PositionID)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, plan)
+}
+
+// RefreshExitPlans 明确执行当前账户的持仓退出评估，不调用 AI 或修改交易账本。
+func (pc *PositionController) RefreshExitPlans(c *gin.Context) {
+	account, err := service.ResolvePortfolioAccount(currentUserID(c), optionalAccountID(c), model.PortfolioKindReal)
+	if err != nil {
+		common.ApiErrorMsg(c, "组合不存在")
+		return
+	}
+	created, err := pc.svc.RefreshExitByAccount(c.Request.Context(), currentUserID(c), account.ID)
+	if err != nil {
+		common.ApiErrorMsg(c, err.Error())
+		return
+	}
+	common.ApiSuccess(c, gin.H{"created": created})
+}
+
 // List GET /api/positions?status=holding|closed|all
 func (pc *PositionController) List(c *gin.Context) {
 	status := strings.ToLower(c.DefaultQuery("status", "all"))

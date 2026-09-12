@@ -18,7 +18,7 @@ func seedExitReviewBars(t *testing.T, rows []model.DailyBar) {
 	}
 }
 
-func TestPositionExitRepeatedATRStateAndRecross(t *testing.T) {
+func TestPositionExitRepeatedProtectionStateAndRecross(t *testing.T) {
 	setupTestDB(t)
 	now := time.Date(2026, 8, 11, 14, 0, 0, 0, time.Local)
 	p := seedHoldingWithPeak(t, 12021, "600901", "ATR 连续状态", 8, 100, 11, "2026-07-01")
@@ -41,7 +41,7 @@ func TestPositionExitRepeatedATRStateAndRecross(t *testing.T) {
 	countCrossings := func() int64 {
 		t.Helper()
 		var count int64
-		if err := common.DB.Model(&model.PositionExitAssessment{}).Where("position_id = ? AND primary_signal = ?", p.ID, "atr14_break").Count(&count).Error; err != nil {
+		if err := common.DB.Model(&model.PositionExitNotice{}).Where("position_id = ?", p.ID).Count(&count).Error; err != nil {
 			t.Fatal(err)
 		}
 		return count
@@ -50,7 +50,7 @@ func TestPositionExitRepeatedATRStateAndRecross(t *testing.T) {
 		evaluate(9)
 	}
 	if count := countCrossings(); count != 1 {
-		t.Errorf("持续位于 ATR 线下只能产生一次首次跌破，得到 %d 次", count)
+		t.Errorf("持续位于保护线下只能形成一个通知事件，得到 %d 次", count)
 	}
 	evaluate(10)
 	evaluate(9)

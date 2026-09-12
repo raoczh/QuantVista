@@ -14,13 +14,18 @@ var errPositionRiskChanged = errors.New("评估使用的持仓状态已变化")
 
 // 仅固定参与价格风险判断的持仓输入，备注等无关编辑不废弃有效评估。
 func positionRiskBasisHash(p model.Position) string {
+	// 旧仓读取时会补齐等价账本；只有经济输入变化才应废弃评估。
+	buyQty := p.TotalBuyQty
+	if buyQty <= 0 {
+		buyQty = p.Quantity
+	}
 	return stablePositionExitHash(struct {
-		ID, UserID, AccountID            int64
-		Symbol, Market, Status, Currency string
-		Cost, Quantity, Stop, Take, Peak float64
-		PeakFrom, PeakDate, PeakQuality  string
-	}{p.ID, p.UserID, p.AccountID, p.Symbol, p.Market, p.Status, p.Currency,
-		p.BuyPrice, p.Quantity, p.PlanStopLoss, p.PlanTakeProfit, p.PeakPrice,
+		ID, UserID, AccountID                                        int64
+		Symbol, Market, Status, Currency, PositionType, Seed         string
+		Cost, Quantity, Stop, Take, Peak, RemainingCost, TotalBuyQty float64
+		PeakFrom, PeakDate, PeakQuality                              string
+	}{p.ID, p.UserID, p.AccountID, p.Symbol, p.Market, p.Status, p.Currency, p.PositionType, p.ExitPlanSeedJSON,
+		p.BuyPrice, p.Quantity, p.PlanStopLoss, p.PlanTakeProfit, p.PeakPrice, round4(exitRemainingCost(p)), buyQty,
 		p.PeakFrom, p.PeakDate, p.PeakDataQuality})
 }
 

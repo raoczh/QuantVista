@@ -86,7 +86,9 @@ type Position struct {
 	// 买入前风险计划（建仓时的风险预算，供风险计算器与止损提示）。
 	PlanStopLoss   float64 `gorm:"type:decimal(20,4)" json:"plan_stop_loss"`   // 计划止损价
 	PlanTakeProfit float64 `gorm:"type:decimal(20,4)" json:"plan_take_profit"` // 计划止盈价
-	ChecklistJSON  string  `gorm:"type:text" json:"checklist_json"`            // 买入前检查清单快照（勾选状态）
+	// 初始退出规划由服务端根据当时完整日线生成；动态保护保存在追加式评估中。
+	ExitPlanSeedJSON string `gorm:"type:mediumtext" json:"-"`
+	ChecklistJSON    string `gorm:"type:text" json:"checklist_json"` // 买入前检查清单快照（勾选状态）
 
 	SellPrice  float64 `gorm:"type:decimal(20,4)" json:"sell_price"`
 	SellDate   string  `gorm:"size:10" json:"sell_date"`

@@ -614,6 +614,7 @@ func (s *PositionService) AddTradeContext(ctx context.Context, userID, positionI
 			if err := rebuildPositionPeakOnBuyTx(tx, &p, in.Price, in.TradeDate, today); err != nil {
 				return err
 			}
+			initializePositionExitSeedDB(tx, &p, time.Now(), "add_buy")
 		}
 		if side == model.PositionTradeSell {
 			// 卖出笔同时刷新「最近一次卖出」快照（既有字段语义：最后一笔卖出）。

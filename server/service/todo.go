@@ -215,6 +215,18 @@ func (s *TodoService) buildActive(ctx context.Context, userID int64, scope strin
 		if a.Level == model.PositionExitLevelUrgent {
 			priority, title = 0, "持仓卖出风险紧急"
 		}
+		switch a.PrimarySignal {
+		case "target_first", "target_extended", "plan_take", model.AlertKindCostGain:
+			title = "持仓止盈目标已触达"
+			if a.ExitPlan != nil && (a.PrimarySignal == "target_first" && a.ExitPlan.Initial.EstimatedReward <= 0 ||
+				a.PrimarySignal == "target_extended" && a.ExitPlan.Initial.EstimatedExtendedReward <= 0) {
+				title = "持仓价格规划已触发"
+			}
+		case "profit_protection":
+			title = "持仓盈利保护已触发"
+		case "time_review":
+			title = "持仓退出规划到期复核"
+		}
 		at := a.EvaluatedAt
 		item := todoItemFromSource(res.Date, TodoItem{
 			Kind: TodoKindPositionExit, Scope: TodoScopeLedger, Priority: priority,

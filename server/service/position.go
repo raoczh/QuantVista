@@ -64,6 +64,7 @@ type PositionView struct {
 
 	// 最新统一卖出风险评估事实。仅 holding 持仓返回；等级不冗余到 positions 表。
 	ExitAssessment *PositionExitAssessmentView `json:"exit_assessment,omitempty"`
+	ExitPlanSeed   *ExitPlanSeed               `json:"exit_plan_seed,omitempty"`
 
 	// RecLink 来源推荐摘要（血缘可见性；手动建仓或血缘指向的推荐已删除时为 nil）。
 	// 前端据此展示「来自推荐」徽章——否则 recommendation_id 只是个不可见的数字，
@@ -248,6 +249,9 @@ func (s *PositionService) ListByAccount(ctx context.Context, userID, accountID i
 			price, dayHigh, ok = 0, 0, false
 		}
 		v := computeView(p, price, ok)
+		if seed := decodeExitSeed(p.ExitPlanSeedJSON); seed != nil && seed.BasisHash == exitPlanBasis(p) {
+			v.ExitPlanSeed = seed
+		}
 		// 新鲜度契约块（仅持仓中）：QuoteAsOf/FreshnessStatus/StaleReason 无论 fresh
 		// 与否都填，前端与 AI 快照据此展示「截至时间/过期原因」；stale 的最近已知价
 		// 放 LastPrice（仅展示，不冒充现价）。
@@ -303,6 +307,13 @@ func (s *PositionService) ListByAccount(ctx context.Context, userID, accountID i
 			if assessment, exists := latestAssessments[p.ID]; exists && assessment.PositionStateHash == positionRiskBasisHash(p) {
 				copy := assessment
 				v.ExitAssessment = &copy
+				if copy.ExitPlan != nil {
+					v.ExitPlanSeed = &copy.ExitPlan.Initial
+					if ok && copy.ExitPlan.DataStatus != "unavailable" && copy.ExitPlan.CurrentStop > 0 {
+						v.BelowStopLoss = price <= copy.ExitPlan.CurrentStop
+						v.NearStopLoss = !v.BelowStopLoss && (price-copy.ExitPlan.CurrentStop)/copy.ExitPlan.CurrentStop*100 <= nearStopLossPct
+					}
+				}
 			}
 			if t, exists := lastAnalyzed[p.Symbol]; exists {
 				tt := t
@@ -721,6 +732,7 @@ func (s *PositionService) CreateByAccount(ctx context.Context, userID, accountID
 		if _, err := fillPositionPeakFromLocalBars(tx, p, time.Now().In(time.Local).Format("2006-01-02")); err != nil {
 			return err
 		}
+		initializePositionExitSeedDB(tx, p, time.Now(), "entry")
 		if err := tx.Create(p).Error; err != nil {
 			return err
 		}
@@ -782,6 +794,7 @@ func (s *PositionService) UpdateContext(ctx context.Context, userID, id int64, i
 			return err
 		}
 		peakBasisChanged := in.BuyPrice != p.BuyPrice || in.BuyDate != p.BuyDate
+		previousExitBasis := exitPlanBasis(p)
 		buyFieldsChanged := in.BuyPrice != p.BuyPrice || in.Quantity != p.Quantity ||
 			in.BuyFee != p.BuyFee || in.BuyTax != p.BuyTax || in.BuyDate != p.BuyDate
 		if len(trades) > 1 && buyFieldsChanged {
@@ -839,6 +852,9 @@ func (s *PositionService) UpdateContext(ctx context.Context, userID, id int64, i
 				time.Now().In(time.Local).Format("2006-01-02")); err != nil {
 				return err
 			}
+		}
+		if exitPlanBasis(p) != previousExitBasis {
+			initializePositionExitSeedDB(tx, &p, time.Now(), "plan_edit")
 		}
 		if err := tx.Save(&p).Error; err != nil {
 			return err

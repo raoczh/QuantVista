@@ -935,8 +935,9 @@ func notificationsEnabledFor(ctx context.Context, userID int64, category string)
 	}
 	if cnt == 0 {
 		browser := NewBrowserNotificationService()
-		if !browser.HasEnabledDestination(userID, category) {
-			return false, nil
+		enabled, err := browser.HasEnabledDestinationContext(ctx, userID, category)
+		if err != nil || !enabled {
+			return false, err
 		}
 	}
 	var pref model.UserPreference

@@ -786,6 +786,10 @@ func (s *PositionService) ConfirmCorpAdjustForAccountContext(ctx context.Context
 			return err
 		}
 
+		exitBefore, err := captureExitCorporateBefore(tx, p)
+		if err != nil {
+			return err
+		}
 		p.Quantity = res.QtyAfter
 		p.BuyPrice = res.CostAfter
 		if peakChanged {
@@ -796,6 +800,9 @@ func (s *PositionService) ConfirmCorpAdjustForAccountContext(ctx context.Context
 		// 送转不是「又买了一次」，用户没有再投入一分钱，改动它们会让
 		// 「一共投入多少 / 已平仓收益率」全部失真。
 		p.RealizedPnl = round4(p.RealizedPnl + res.CashDividend)
+		if !positionTradeOnOrAfterAction(trades, action) {
+			applyExitCorporatePrices(&p, exitBefore, &adj)
+		}
 		recID = p.RecommendationID
 		if err := tx.Save(&p).Error; err != nil {
 			return err
@@ -903,6 +910,9 @@ func (s *PositionService) RevertCorpAdjustForAccountContext(ctx context.Context,
 				adj.TradeID, userID, accountID, p.ID).Delete(&model.PositionTrade{}).Error; err != nil {
 				return err
 			}
+		}
+		if err := restoreExitCorporatePrices(&p, adj); err != nil {
+			return err
 		}
 		p.Quantity = adj.QtyBefore
 		p.BuyPrice = adj.CostBefore

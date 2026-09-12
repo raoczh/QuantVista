@@ -437,6 +437,10 @@ func finalizePositionSellSignalsTx(tx *gorm.DB, userID, positionID int64, delete
 		Updates(map[string]any{"status": reviewStatus, "resolved_at": &now}).Error; err != nil {
 		return fmt.Errorf("终结卖出复核失败: %w", err)
 	}
+	if err := tx.Model(&model.PositionExitNotice{}).Where("user_id = ? AND position_id = ? AND status IN ?", userID, positionID, []string{"pending", "sending"}).
+		Updates(map[string]any{"status": "superseded", "lease_until": nil}).Error; err != nil {
+		return fmt.Errorf("终结持仓退出通知失败: %w", err)
+	}
 	return nil
 }
 

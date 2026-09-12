@@ -105,7 +105,7 @@ export function useStockActions(onNavigate?: () => void) {
   function goPosition(s: StockRef, hasPosition?: boolean) {
     return go({ name: 'positions', query: stockQuery(s, hasPosition === false ? { add: '1' } : {}) }, s)
   }
-  function goPositionFromRecommendation(s: StockRef, recommendationID: number, quantity?: number) {
+  function goPositionFromRecommendation(s: StockRef, recommendationID: number, quantity?: number, positionType?: string) {
     if (!Number.isSafeInteger(recommendationID) || recommendationID <= 0) {
       message.error('缺少准确的推荐 ID，无法保留建仓血缘')
       return Promise.resolve(false)
@@ -116,6 +116,7 @@ export function useStockActions(onNavigate?: () => void) {
         query: stockQuery(s, {
           add: '1',
           rec_id: String(recommendationID),
+          ...(positionType === 'short_term' || positionType === 'long_term' ? { buy_type: positionType } : {}),
           ...(quantity && quantity > 0 ? { quantity: String(quantity) } : {}),
         }),
       },

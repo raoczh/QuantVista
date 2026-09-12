@@ -64,6 +64,7 @@ export interface Position {
   // D15 持仓期最高价与回撤（未初始化/已平仓时缺席）
   peak?: PositionPeak
   exit_assessment?: PositionExitAssessment
+  exit_plan_seed?: ExitPlanSeed
   // 来源推荐摘要（血缘可见性）。手动建仓、或血缘指向的推荐已被删除时缺席。
   rec_link?: PositionRecLink
 }
@@ -129,6 +130,68 @@ export interface PositionExitAssessment {
   data_gaps: string[]
   alert_event_ids: number[]
   sell_review_ids: number[]
+  exit_plan?: ExitPlan
+  action_key?: string
+  action_date?: string
+}
+
+export interface ExitPlanSeed {
+  version: string
+  hash: string
+  source: string
+  profile: string
+  position_type: string
+  generated_at: string
+  anchor_date: string
+  bars_as_of: string
+  data_status: 'ready' | 'partial' | 'unavailable'
+  entry_price: number
+  stop_price: number
+  target_price: number
+  extended_target: number
+  initial_risk: number
+  atr14: number
+  support: number
+  resistance: number
+  trail_atr: number
+  breakeven_r: number
+  lock_fraction: number
+  review_days: number
+  quantity: number
+  cost: number
+  estimated_risk: number
+  estimated_reward: number
+  estimated_extended_reward: number
+  net_reward_risk: number
+  slippage_bps: number
+  evidence: string[]
+  data_gaps: string[]
+}
+
+export interface ExitPlan {
+  initial: ExitPlanSeed
+  current_stop: number
+  stop_effective_at: string
+  breakeven_price: number
+  peak_price: number
+  current_atr: number
+  stage: string
+  first_target_at?: string
+  second_target_at?: string
+  first_target_handled: boolean
+  second_target_handled: boolean
+  time_review_at?: string
+  stop_active: boolean
+  stop_episode: number
+  stop_triggered_at?: string
+  observed_quantity: number
+  suggested_quantity: number
+  sellable_quantity?: number
+  estimated_stop_net: number
+  execution_notes: string[]
+  data_status: 'ready' | 'partial' | 'unavailable'
+  data_gaps: string[]
+  evidence: string[]
 }
 
 /**
@@ -259,6 +322,7 @@ export type PositionBase = Omit<
   | 'analysis_stale'
   | 'peak'
   | 'exit_assessment'
+  | 'exit_plan_seed'
   | 'rec_link'
 >
 
@@ -279,6 +343,14 @@ export function getPortfolioOverview(accountId?: number, signal?: AbortSignal) {
 
 export function createPosition(input: PositionInput, accountId?: number) {
   return request<PositionBase>({ url: '/positions', method: 'post', data: input, params: { account_id: accountId } })
+}
+
+export function previewPositionExitPlan(input: PositionInput & { position_id?: number }, signal?: AbortSignal) {
+  return request<ExitPlanSeed>({ url: '/positions/exit-plan-preview', method: 'post', data: input, signal })
+}
+
+export function evaluatePositionExits(accountId: number, signal?: AbortSignal) {
+  return request<{ created: number }>({ url: '/positions/evaluate-exit', method: 'post', params: { account_id: accountId }, signal })
 }
 
 export function updatePosition(id: number, input: PositionInput, accountId?: number) {

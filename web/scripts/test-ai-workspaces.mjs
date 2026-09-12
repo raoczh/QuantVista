@@ -89,7 +89,7 @@ assert.match(recCard, /:disabled="!item\.detail"/, '无结构化明细时依据�
 // 的深链——登记既成事实不该被执行计划闸门挡住，否则偏好未完成/行情 stale 时用户没有任何
 // 带血缘的建仓入口，推荐追踪直接漏账。
 assert.match(recCard, /entry\.ready/, '推荐卡建仓入口必须按执行计划状态分层，而非直接隐藏')
-assert.match(recCard, /goPositionFromRecommendation\(stock, item\.id\)/, '非 ready 分支也必须走带血缘的建仓深链')
+assert.match(recCard, /goPositionFromRecommendation\(stock, item\.id(?:, undefined, type)?\)/, '非 ready 分支也必须走带血缘的建仓深链')
 assert.doesNotMatch(
   recCard,
   /v-else-if="item\.detail\?\.execution_plan\?\.status === 'ready'"/,

@@ -77,8 +77,8 @@ func TestPositionExitAssessmentMatrixAndIdempotency(t *testing.T) {
 	input.position.PlanTakeProfit = 11
 	input.quote = freshExitQuote(now, 12, 12, 12)
 	got = evaluatePositionExit(input, defaultPositionExitParams)
-	if got.Level != model.PositionExitLevelWatch {
-		t.Fatalf("计划止盈单独应 watch，got %s", got.Level)
+	if got.Level != model.PositionExitLevelReview || !got.ShouldTodo {
+		t.Fatalf("计划止盈必须形成可处理的提醒，got %s", got.Level)
 	}
 
 	input.position.PlanTakeProfit = 0
@@ -96,8 +96,8 @@ func TestPositionExitAssessmentMatrixAndIdempotency(t *testing.T) {
 	input.rules = []model.AlertRule{{Kind: model.AlertKindCostGain, Threshold: 10}}
 	input.quote = freshExitQuote(now, 12, 12, 12)
 	got = evaluatePositionExit(input, defaultPositionExitParams)
-	if got.Level != model.PositionExitLevelWatch {
-		t.Fatalf("cost_gain 单独应 watch，got %s", got.Level)
+	if got.Level != model.PositionExitLevelReview || !got.ShouldTodo {
+		t.Fatalf("用户设定的盈利阈值必须形成可处理提醒，got %s", got.Level)
 	}
 
 	input.rules = []model.AlertRule{{Kind: model.AlertKindPeakDrawdown, Threshold: 10}}

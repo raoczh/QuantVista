@@ -49,6 +49,7 @@ type PositionExitSignal struct {
 
 type PositionExitAssessmentView struct {
 	model.PositionExitAssessment
+	ExitPlan      *ExitPlan            `json:"exit_plan,omitempty"`
 	AccountID     int64                `json:"account_id,omitempty"`
 	Signals       []PositionExitSignal `json:"signals"`
 	Evidence      []string             `json:"evidence"`
@@ -94,6 +95,12 @@ type positionExitInput struct {
 	// 无历史时退回前收盘判定。
 	hasPrevAssessment bool
 	prevBelowATR      bool
+	planSeed          *ExitPlanSeed
+	previousPlan      *ExitPlan
+	planParentID      *int64
+	sellableQuantity  *float64
+	executionNotes    []string
+	heldDays          *int
 }
 
 func (s *PositionExitAssessmentService) EvaluateUser(ctx context.Context, userID int64, session string) (int, error) {
@@ -126,7 +133,11 @@ func (s *PositionExitAssessmentService) EvaluateUser(ctx context.Context, userID
 	if s.market != nil {
 		quotes = s.market.FreshQuotesFor(ctx, refs)
 	}
-	return s.EvaluateUserWithSnapshot(ctx, userID, positions, quotes, session, s.now().In(time.Local))
+	now := time.Now()
+	if s.now != nil {
+		now = s.now()
+	}
+	return s.EvaluateUserWithSnapshot(ctx, userID, positions, quotes, session, now.In(time.Local))
 }
 
 // EvaluateUserWithSnapshot 供现有提醒轮/盘后链路复用已经批量取得的持仓与行情。
@@ -177,6 +188,10 @@ func (s *PositionExitAssessmentService) EvaluateUserWithSnapshot(
 		}
 		in := positionExitInput{position: p, quote: quotes[QuoteKey(p.Market, p.Symbol)], now: evaluatedAt, session: session,
 			pendingCorpAdjust: pendingAdjust[p.ID], priceBasisUnknown: pendingAdjustErr != nil, peakUnavailable: peakErr != nil}
+		if in.quote.Quote != nil && in.quote.Quote.DataTime.In(time.Local).Hour() >= 15 &&
+			(in.quote.Quote.DataTime.In(time.Local).Format("2006-01-02") < evaluatedAt.In(time.Local).Format("2006-01-02") || evaluatedAt.In(time.Local).Hour() >= 15) {
+			in.session = model.PositionExitSessionClose
+		}
 		if reason := positionCurrencyIssue(p, defaultCurrencyFor(p.Market)); reason != "" {
 			in.priceBasisUnknown = true
 			in.loadErrs = append(in.loadErrs, reason)
@@ -194,7 +209,7 @@ func (s *PositionExitAssessmentService) EvaluateUserWithSnapshot(
 		for i, j := 0, len(in.barRows)-1; i < j; i, j = i+1, j-1 {
 			in.barRows[i], in.barRows[j] = in.barRows[j], in.barRows[i]
 		}
-		in.barFreshnessIssue = positionExitBarsFreshnessIssue(ctx, in.quote, in.barRows, session, evaluatedAt)
+		in.barFreshnessIssue = positionExitBarsFreshnessIssue(ctx, in.quote, in.barRows, in.session, evaluatedAt)
 		if err := common.DB.WithContext(ctx).Where("user_id = ? AND status = ? AND kind IN ? AND (symbol = '' OR symbol = ?)",
 			userID, model.AlertStatusActive, positionAlertKinds, p.Symbol).Order("id ASC").Find(&in.rules).Error; err != nil {
 			in.loadErrs = append(in.loadErrs, "持仓规则查询失败")
@@ -209,7 +224,8 @@ func (s *PositionExitAssessmentService) EvaluateUserWithSnapshot(
 			in.loadErrs = append(in.loadErrs, "卖出复核查询失败")
 		}
 		var prevRow model.PositionExitAssessment
-		if err := common.DB.WithContext(ctx).Select("atr_state", "atr_line", "quote_price").
+		previousReadable := true
+		if err := common.DB.WithContext(ctx).Select("id", "atr_state", "atr_line", "quote_price", "plan_json", "plan_hash").
 			Where("user_id = ? AND position_id = ?", userID, p.ID).
 			Order("evaluated_at DESC, id DESC").First(&prevRow).Error; err == nil {
 			switch prevRow.ATRState {
@@ -220,35 +236,61 @@ func (s *PositionExitAssessmentService) EvaluateUserWithSnapshot(
 				in.hasPrevAssessment = prevRow.ATRLine > 0 && prevRow.QuotePrice > 0
 				in.prevBelowATR = in.hasPrevAssessment && prevRow.QuotePrice < prevRow.ATRLine
 			}
+			in.previousPlan = decodeExitPlan(prevRow.PlanJSON, prevRow.PlanHash)
+			if prevRow.PlanJSON != "" && in.previousPlan == nil {
+				previousReadable = false
+				in.loadErrs = append(in.loadErrs, "上一份退出规划损坏，不能重建并放宽已经建立的保护")
+			}
 		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 			in.loadErrs = append(in.loadErrs, "上一条评估查询失败")
+			previousReadable = false
 		}
+		if !previousReadable {
+			// 无规划的降级行会成为下一轮的最新事实，永久丢失原保护，不能提交。
+			errs = append(errs, fmt.Errorf("持仓 %d 上一份退出规划不可核验，暂不覆盖已有保护", p.ID))
+			continue
+		}
+		parentID := prevRow.ID
+		in.planParentID = &parentID
+		seedBars, seedGaps := completedPositionExitBars(in.barRows, tradeDate, in.session)
+		if in.barFreshnessIssue != "" {
+			seedGaps = append(seedGaps, in.barFreshnessIssue)
+		}
+		if err := validateLocalAdjustedBars(p.Market, seedBars); err != nil {
+			seedGaps = append(seedGaps, err.Error())
+		}
+		if len(seedGaps) > 0 {
+			seedBars = nil
+		}
+		seed := positionExitSeedFor(common.DB.WithContext(ctx), p, in.previousPlan, seedBars, evaluatedAt, seedGaps)
+		in.planSeed = &seed
+		in.sellableQuantity, in.executionNotes = exitSellableQuantity(common.DB.WithContext(ctx), p, tradeDate)
+		in.heldDays = exitPlanHeldDays(common.DB.WithContext(ctx), p, tradeDate)
+		in.executionNotes = append(in.executionNotes, exitQuoteExecutionNotes(p, in.quote, evaluatedAt)...)
 		row := evaluatePositionExit(in, params)
-		inserted, notifyNeeded, err := persistPositionExitAssessment(ctx, &row)
+		inserted, _, err := persistPositionExitAssessment(ctx, &row)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("持仓 %d 落库失败: %w", p.ID, err))
 			continue
 		}
 		if inserted {
 			created++
-			// 事实每次有意义变化都追加，但通知只在首次、等级升级或主因变化时发：
-			// 逐日重算（open SellReview 逐日换 trade_date、ATR 线下逐日快照）不能
-			// 变成每天一条重复推送。
-			if notifyNeeded {
-				s.notifyAssessment(ctx, row, p.AccountID)
-			}
+			// 新事件已同事务写入交接台账，同一持续风险不会逐日重复通知。
 		}
+	}
+	if err := s.dispatchExitNotices(ctx, userID); err != nil {
+		errs = append(errs, err)
 	}
 	return created, errors.Join(errs...)
 }
 
-func (s *PositionExitAssessmentService) notifyAssessment(ctx context.Context, row model.PositionExitAssessment, accountID int64) {
+func (s *PositionExitAssessmentService) notifyAssessment(ctx context.Context, row model.PositionExitAssessment, accountID int64) error {
 	if s.notify == nil || (row.Level != model.PositionExitLevelReview && row.Level != model.PositionExitLevelUrgent) {
-		return
+		return nil
 	}
 	enabled, err := notificationsEnabledFor(ctx, row.UserID, model.BrowserNotifyCategoryExitRisk)
 	if err != nil || !enabled {
-		return
+		return err
 	}
 	kind := model.GuardKindPosExitReview
 	// ntfy 语义（notify.go）：1=最低、5=最高、0=通道默认(3)。urgent 对齐旧
@@ -278,27 +320,39 @@ func (s *PositionExitAssessmentService) notifyAssessment(ctx context.Context, ro
 		Kind: kind, Price: row.QuotePrice, Message: message,
 		Route: route, Priority: priority,
 	}
-	if !recordGuardEvent(row.UserID, row.TradeDate, hit) {
-		return
+	// GuardEvent 继续保存日级审计；是否发送由独立退出事件台账决定，不能吞掉同日新阶段。
+	guardCreated := recordGuardEvent(row.UserID, row.TradeDate, hit)
+	if row.ActionKey == "" && !guardCreated {
+		return nil
+	} // 升级前的历史通知保留原去重口径。
+	factKey := BrowserFactKey("position_exit_assessment", fmt.Sprint(row.PositionID), row.Level, row.ActionKey)
+	if row.ActionKey == "" {
+		factKey = BrowserFactKey("position_exit_assessment", fmt.Sprint(row.ID), row.Level, row.FactHash)
 	}
 	msg := NotifyMessage{
 		Title: "QuantVista 持仓卖出风险复核", Content: message,
 		Route: hit.Route, Kind: NotifyMsgKindGuard, Priority: priority,
 		BrowserEvents: []BrowserNotificationInput{{
 			SourceType: "position_exit_assessment", SourceID: row.ID,
-			FactKey:  BrowserFactKey("position_exit_assessment", fmt.Sprint(row.ID), row.Level, row.FactHash),
+			FactKey:  factKey,
 			Category: model.BrowserNotifyCategoryExitRisk, Level: row.Level,
 			Title: fmt.Sprintf("%s（%s）· %s", orSymbol(row.Name, row.Symbol), row.Symbol, levelName),
 			Body:  message, Route: hit.Route,
 		}},
 	}
+	if durable, ok := s.notify.(interface {
+		SendDurableMsgContext(context.Context, int64, NotifyMessage) error
+	}); ok {
+		return durable.SendDurableMsgContext(ctx, row.UserID, msg)
+	}
 	if detached, ok := s.notify.(interface {
 		SendMsgDetached(context.Context, int64, NotifyMessage)
 	}); ok {
 		detached.SendMsgDetached(ctx, row.UserID, msg)
-		return
+		return ctx.Err()
 	}
 	s.notify.SendMsgContext(ctx, row.UserID, msg)
+	return ctx.Err()
 }
 
 func effectivePositionExitTradeDate(fq FreshQuoteResult, now time.Time) string {
@@ -365,7 +419,13 @@ func completedPositionExitBars(rows []model.DailyBar, cutoffDate, session string
 	var gaps []string
 	lastDate := ""
 	for _, b := range rows {
-		if b.TradeDate == "" || b.TradeDate < lastDate || b.Open <= 0 || b.High <= 0 || b.Low <= 0 || b.Close <= 0 ||
+		if _, err := time.Parse("2006-01-02", b.TradeDate); err != nil {
+			return nil, []string{"本地日线日期无效"}
+		}
+		if session == model.PositionExitSessionIntraday && b.TradeDate >= cutoffDate || session == model.PositionExitSessionClose && b.TradeDate > cutoffDate {
+			continue
+		}
+		if b.TradeDate <= lastDate || !exitFinite(b.Open) || !exitFinite(b.High) || !exitFinite(b.Low) || !exitFinite(b.Close) || b.Open <= 0 || b.High <= 0 || b.Low <= 0 || b.Close <= 0 ||
 			b.High < math.Max(b.Open, b.Close) || b.Low > math.Min(b.Open, b.Close) || b.Low > b.High {
 			return nil, []string{"本地日线存在无效 OHLC 或日期乱序"}
 		}
@@ -443,10 +503,21 @@ func evaluatePositionExit(in positionExitInput, params positionExitParams) model
 		BuyPrice: p.BuyPrice, PeakPrice: peak, Version: params.Version,
 		PositionStateHash: positionRiskBasisHash(p),
 		ATRState:          "unknown",
+		PlanParentID:      in.planParentID,
 	}
 	paramsJSON, _ := json.Marshal(params)
 	row.ParamsJSON = string(paramsJSON)
 	row.ParamsHash = stablePositionExitHash(params)
+	if in.planSeed != nil {
+		policy := struct {
+			Technical                                       positionExitParams `json:"technical"`
+			ExitVersion, Profile                            string
+			TrailATR, BreakevenR, LockFraction, SlippageBPS float64
+			ReviewDays                                      int
+		}{
+			params, in.planSeed.Version, in.planSeed.Profile, in.planSeed.TrailATR, in.planSeed.BreakevenR, in.planSeed.LockFraction, in.planSeed.SlippageBPS, in.planSeed.ReviewDays}
+		row.ParamsJSON, row.ParamsHash = mustPositionExitJSON(policy), stablePositionExitHash(policy)
+	}
 
 	var gaps []string
 	gaps = append(gaps, in.loadErrs...)
@@ -454,9 +525,11 @@ func evaluatePositionExit(in positionExitInput, params positionExitParams) model
 		gaps = append(gaps, "持仓期峰值复权口径待核验，峰值回撤和 ATR 保护线暂不可用")
 	}
 	q := in.quote.Quote
-	quoteOK := q != nil && q.Price > 0 && !q.DataTime.IsZero() && in.quote.Fresh.Status == freshStatusFresh
+	quoteOK := q != nil && q.Price > 0 && exitFinite(q.Price) && !q.DataTime.IsZero() && in.quote.Fresh.Status == freshStatusFresh
 	if q != nil {
-		row.QuotePrice = q.Price
+		if exitFinite(q.Price) && q.Price > 0 {
+			row.QuotePrice = q.Price
+		}
 		if !q.DataTime.IsZero() {
 			row.QuoteAsOf = q.DataTime.In(time.Local).Format(time.RFC3339)
 		}
@@ -531,11 +604,12 @@ func evaluatePositionExit(in positionExitInput, params positionExitParams) model
 				dayLow = q.Low
 			}
 		}
-		if p.PlanStopLoss > 0 && dayLow <= p.PlanStopLoss {
+		legacyPlan := in.planSeed == nil || in.planSeed.DataStatus == "unavailable" || p.PeakDataQuality == model.FactorQualityUnverifiedAdjustment
+		if legacyPlan && p.PlanStopLoss > 0 && dayLow <= p.PlanStopLoss {
 			signals = append(signals, PositionExitSignal{Key: "plan_stop", Label: "触达计划止损", Detail: fmt.Sprintf("当日最低 %.4f，计划止损 %.4f", dayLow, p.PlanStopLoss), Severity: model.PositionExitLevelUrgent, Value: dayLow, Threshold: p.PlanStopLoss, Crossing: true})
 		}
-		if p.PlanTakeProfit > 0 && dayHigh >= p.PlanTakeProfit {
-			signals = append(signals, PositionExitSignal{Key: "plan_take", Label: "触达计划止盈", Detail: fmt.Sprintf("当日最高 %.4f，计划止盈 %.4f", dayHigh, p.PlanTakeProfit), Severity: model.PositionExitLevelWatch, Value: dayHigh, Threshold: p.PlanTakeProfit, Crossing: true})
+		if legacyPlan && p.PlanTakeProfit > 0 && dayHigh >= p.PlanTakeProfit {
+			signals = append(signals, PositionExitSignal{Key: "plan_take", Label: "触达计划止盈", Detail: fmt.Sprintf("当日最高 %.4f，计划止盈 %.4f", dayHigh, p.PlanTakeProfit), Severity: model.PositionExitLevelReview, Value: dayHigh, Threshold: p.PlanTakeProfit, Crossing: true})
 		}
 		for _, rule := range in.rules {
 			input := positionAlertEval{AvgCost: p.BuyPrice, Price: q.Price, DayHigh: q.High, DayLow: q.Low, Peak: peak, PeakDate: p.PeakDate}
@@ -624,7 +698,7 @@ func evaluatePositionExit(in positionExitInput, params positionExitParams) model
 			signals = append(signals, PositionExitSignal{Key: "ma60_break", Label: "刚跌破 MA60", Detail: fmt.Sprintf("现价 %.4f，MA60 %.4f", currentPrice, row.MA60), Severity: model.PositionExitLevelReview, Value: currentPrice, Threshold: row.MA60, Crossing: true})
 		}
 		row.ATR14, _ = positionExitATR14(bars, params.ATRPeriod)
-		if peak > 0 && row.ATR14 > 0 {
+		if peak > 0 && row.ATR14 > 0 && (in.planSeed == nil || in.planSeed.DataStatus == "unavailable") {
 			row.ATRLine = peak - params.ATRMultiplier*row.ATR14
 			// 保护线随峰值上移：peak 刷新后线可能直接越过前收盘，纯「前收盘在线上→
 			// 现价在线下」判定会在最需要保护的 V 型反转日恒 false 且此后永不触发。
@@ -651,8 +725,38 @@ func evaluatePositionExit(in positionExitInput, params positionExitParams) model
 			row.Trend = "broken"
 		}
 	}
+	var exitPlan *ExitPlan
+	if in.planSeed != nil {
+		planBasisReady := !priceBlocked && p.PeakDataQuality != model.FactorQualityUnverifiedAdjustment
+		planATR, _ := positionExitATR14(bars, params.ATRPeriod)
+		observation := exitPlanObservation{Position: p, Seed: *in.planSeed, Previous: in.previousPlan,
+			TradeDate: tradeDate, Now: now, PriceOK: quoteOK && planBasisReady, TechnicalOK: quoteOK && planBasisReady && len(barGaps) == 0 && len(bars) >= 21,
+			Peak: peak, ATR: planATR, Sellable: in.sellableQuantity, ExecutionNotes: in.executionNotes, HeldDays: in.heldDays}
+		if quoteOK {
+			observation.Price, observation.High, observation.Low = q.Price, q.High, q.Low
+		}
+		if !observation.PriceOK {
+			observation.Gaps = append(observation.Gaps, "行情或价格口径未核验，暂停自动触价与保护价更新")
+		}
+		plan := evolveExitPlan(observation)
+		if !planBasisReady {
+			plan.DataStatus = "unavailable"
+		}
+		if p.PeakDataQuality == model.FactorQualityUnverifiedAdjustment {
+			plan.ProtectionSuspended = true
+			plan.DataGaps = append(plan.DataGaps, "峰值口径未核验，自动保护暂停；独立填写的初始计划仍单独核对")
+		}
+		exitPlan = &plan
+		row.PlanJSON, row.PlanHash = mustPositionExitJSON(plan), stablePositionExitHash(plan)
+		if quoteOK && planBasisReady {
+			signals = append(signals, exitPlanSignals(plan)...)
+		}
+		evidence = append(evidence, plan.Evidence...)
+		gaps = append(gaps, plan.DataGaps...)
+	}
 
-	if quoteOK && (len(signals) > 0 || len(gaps) == 0) {
+	usablePlan := exitPlan != nil && exitPlan.DataStatus != "unavailable" && exitPlan.Initial.DataStatus != "unavailable" && !priceBlocked
+	if quoteOK && (len(signals) > 0 || len(gaps) == 0 || usablePlan) {
 		row.Level, row.PrimarySignal = positionExitLevel(signals, row.Trend)
 		row.DataStatus = model.PositionExitDataReady
 		if len(gaps) > 0 {
@@ -669,6 +773,22 @@ func evaluatePositionExit(in positionExitInput, params positionExitParams) model
 			row.PrimaryReason = "当前没有新触发的卖出风险事实"
 		}
 		row.NextAction = positionExitNextAction(row.Level)
+		if exitPlan != nil && row.ShouldTodo {
+			row.ActionKey, row.ActionDate = exitPlanActionIdentity(*exitPlan, row.PrimarySignal)
+			if row.ActionKey != "" {
+				row.NextAction = fmt.Sprintf("核对持仓退出规划，本阶段建议处理 %g 股（按账本可卖量约束）；实际卖出后登记减仓或平仓。", exitPlan.SuggestedQuantity)
+				if exitPlan.SellableQuantity == nil {
+					row.NextAction = "可卖数量暂时未知，先核对券商持仓与退出规划；触发提醒不代表已成交。"
+				}
+				if len(exitPlan.ExecutionNotes) > 0 {
+					row.NextAction += " " + strings.Join(exitPlan.ExecutionNotes, "；")
+				}
+				row.NextAction = truncateRunes(row.NextAction, 500)
+				if row.PrimarySignal == "time_review" {
+					row.NextAction = "持有期已到复核点，检查原始买入逻辑、目标空间和资金占用，再决定继续持有或调整仓位。"
+				}
+			}
+		}
 	} else {
 		row.PrimarySignal = "data_gap"
 		row.PrimaryReason = strings.Join(uniqueStrings(gaps), "；")
@@ -690,11 +810,11 @@ func evaluatePositionExit(in positionExitInput, params positionExitParams) model
 		factTradeDate = ""
 	}
 	fact := struct {
-		Level, Primary, TradeDate, DataStatus, ParamsHash, PositionState, ATRState string
-		Signals                                                                    []positionExitFactSignal
-		AlertIDs, ReviewIDs                                                        []int64
-		Gaps                                                                       []string
-	}{row.Level, row.PrimarySignal, factTradeDate, row.DataStatus, row.ParamsHash, row.PositionStateHash, row.ATRState, positionExitFactSignals(signals), alertIDs, reviewIDs, uniqueStrings(gaps)}
+		Level, Primary, TradeDate, DataStatus, ParamsHash, PositionState, ATRState, PlanHash string
+		Signals                                                                              []positionExitFactSignal
+		AlertIDs, ReviewIDs                                                                  []int64
+		Gaps                                                                                 []string
+	}{row.Level, row.PrimarySignal, factTradeDate, row.DataStatus, row.ParamsHash, row.PositionStateHash, row.ATRState, row.PlanHash, positionExitFactSignals(signals), alertIDs, reviewIDs, uniqueStrings(gaps)}
 	row.FactHash = stablePositionExitHash(fact)
 	return row
 }
@@ -729,7 +849,7 @@ func positionExitLevel(signals []PositionExitSignal, trend string) (string, stri
 	for _, s := range signals {
 		byKey[s.Key] = s
 	}
-	primaryOrder := []string{"plan_stop", "ma60_break", "atr14_break", model.AlertKindCostDrawdown, model.AlertKindPeakDrawdown, "ma20_break", "plan_take", model.AlertKindCostGain}
+	primaryOrder := []string{"plan_stop", "profit_protection", "adaptive_stop", "ma60_break", "atr14_break", model.AlertKindCostDrawdown, model.AlertKindPeakDrawdown, "target_extended", "target_first", "plan_take", model.AlertKindCostGain, "time_review", "ma20_break"}
 	primary := ""
 	for _, key := range primaryOrder {
 		if _, ok := byKey[key]; ok {
@@ -744,6 +864,11 @@ func positionExitLevel(signals []PositionExitSignal, trend string) (string, stri
 	}
 	if _, ok := byKey["plan_stop"]; ok {
 		return model.PositionExitLevelUrgent, "plan_stop"
+	}
+	for _, key := range []string{"profit_protection", "adaptive_stop"} {
+		if _, ok := byKey[key]; ok {
+			return model.PositionExitLevelUrgent, key
+		}
 	}
 	_, ma60 := byKey["ma60_break"]
 	_, atr := byKey["atr14_break"]
@@ -775,7 +900,10 @@ func positionExitLevel(signals []PositionExitSignal, trend string) (string, stri
 	}
 	_, planTake := byKey["plan_take"]
 	_, costGain := byKey[model.AlertKindCostGain]
-	if (planTake || costGain) && trend == "broken" {
+	_, firstTarget := byKey["target_first"]
+	_, extendedTarget := byKey["target_extended"]
+	_, timeReview := byKey["time_review"]
+	if planTake || costGain || firstTarget || extendedTarget || timeReview {
 		return model.PositionExitLevelReview, primary
 	}
 	if _, ok := byKey["ma20_break"]; ok || planTake || costGain || medReview {
@@ -839,6 +967,9 @@ func persistPositionExitAssessment(ctx context.Context, assessment *model.Positi
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
+		if row.PlanParentID != nil && previous.ID != *row.PlanParentID {
+			return nil
+		}
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			notifyNeeded = true // 首次评估
 		}
@@ -856,6 +987,10 @@ func persistPositionExitAssessment(ctx context.Context, assessment *model.Positi
 			// 等级升级或主因变化才重新提醒；同等级同主因的逐日事实只落库不再推送。
 			notifyNeeded = row.IsUpgrade || previous.PrimarySignal != row.PrimarySignal
 		}
+		assignPositionExitAction(&row, previous)
+		if row.ShouldTodo && row.ActionKey != "" {
+			notifyNeeded = previous.ActionKey != row.ActionKey
+		}
 		row.EventKey = stablePositionExitHash(struct {
 			PositionID                   int64
 			TradeDate, Session, FactHash string
@@ -866,6 +1001,12 @@ func persistPositionExitAssessment(ctx context.Context, assessment *model.Positi
 			return result.Error
 		}
 		inserted = result.RowsAffected == 1
+		if inserted && row.ShouldTodo && row.ActionKey != "" {
+			notice := model.PositionExitNotice{UserID: row.UserID, PositionID: row.PositionID, AssessmentID: row.ID, EventKey: row.ActionKey, Status: "pending"}
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&notice).Error; err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if errors.Is(err, errPositionRiskChanged) {
@@ -966,6 +1107,7 @@ func LatestPositionExitAssessments(ctx context.Context, userID int64, positionID
 
 func decodePositionExitAssessment(row model.PositionExitAssessment) PositionExitAssessmentView {
 	view := PositionExitAssessmentView{PositionExitAssessment: row}
+	view.ExitPlan = decodeExitPlan(row.PlanJSON, row.PlanHash)
 	_ = json.Unmarshal([]byte(row.SignalsJSON), &view.Signals)
 	_ = json.Unmarshal([]byte(row.EvidenceJSON), &view.Evidence)
 	_ = json.Unmarshal([]byte(row.DataGapsJSON), &view.DataGaps)
