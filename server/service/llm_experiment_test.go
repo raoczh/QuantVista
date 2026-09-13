@@ -1037,7 +1037,7 @@ func TestScoreBlindInputProjectionDeterministicAndSetPreserving(t *testing.T) {
 		{Symbol: "600001", Name: "甲", Price: 10, ChangePct: 2.1, Sources: []string{"watchlist"},
 			QuoteAsOf: "2026-08-04 14:55", Score: 88, Rank: 2,
 			Factors:    &candFactors{MA20: 9.5, Chg5d: 3.1, BarCount: 90, MainNet5dYi: 1.2},
-			FlowStatus: "available", Fin: &candFin{Report: "2026一季报", RevenueYoY: 12, NetProfitYoY: 8},
+			FlowStatus: "available", Fin: &candFin{Report: "2026一季报", RevenueYoY: recNumber(12), NetProfitYoY: recNumber(8)},
 			FinStatus: "available"},
 	}
 	seed := int64(20260804)
@@ -1300,7 +1300,7 @@ func TestScoreBlindShadowConcurrentSingleCallAndFrozenInput(t *testing.T) {
 	cands[0].ScoreDims, cands[0].Bonus = &scoreDims{Trend: 20}, []string{"派生加分"}
 	cands[1].QuoteAsOf, cands[1].FlowStatus, cands[1].FinStatus = "2026-08-04 14:55", "available", "available"
 	cands[1].Factors = &candFactors{MA20: 19, Chg5d: -1, BarCount: 90}
-	cands[1].Fin = &candFin{Report: "2026一季报", RevenueYoY: 8, NetProfitYoY: 5}
+	cands[1].Fin = &candFin{Report: "2026一季报", RevenueYoY: recNumber(8), NetProfitYoY: recNumber(5)}
 	strat, _ := strategyByKey(model.RecTypeShortTerm, "")
 	svc := &RecommendationService{}
 	championBefore := append([]recPick(nil), champion...)

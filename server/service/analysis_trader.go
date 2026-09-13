@@ -35,9 +35,10 @@ type tradePlan struct {
 	Invalidators []string `json:"invalidators,omitempty"`
 
 	// --- 服务端回填（非 LLM 输出）---
-	RRRatio    float64         `json:"rr_ratio,omitempty"`         // 盈亏比 =(目标-区间中值)/(区间中值-止损)
-	Position   *positionAdvice `json:"position,omitempty"`         // 量化仓位建议（纯 Go 公式）
-	Discipline []string        `json:"discipline_notes,omitempty"` // 自洽纪律校验说明（降仓等）
+	RRRatio    float64            `json:"rr_ratio,omitempty"`         // 盈亏比 =(目标-区间中值)/(区间中值-止损)
+	Position   *positionAdvice    `json:"position,omitempty"`         // 量化仓位建议（纯 Go 公式）
+	Discipline []string           `json:"discipline_notes,omitempty"` // 自洽纪律校验说明（降仓等）
+	PricePlan  *ResearchPricePlan `json:"price_plan,omitempty"`
 }
 
 // positionAdvice 量化仓位建议：仓位% = 100 × clip(2.5/20日波动率, 0.3, 1.0) × 择时系数，
@@ -93,6 +94,26 @@ func (s *AnalysisService) attachTradePlan(ctx context.Context, userID int64, cfg
 	px := quotePriceFromSnapshot(snapshot)
 	if px <= 0 {
 		result.TradePlan = &tradePlan{NoPlan: true, NoPlanReason: "现价不可得，无法定价位"}
+		return chatUsage{}, nil
+	}
+	if commonPlan, ok := snapshot["price_plan"].(*ResearchPricePlan); ok {
+		plan := &tradePlan{PricePlan: commonPlan}
+		if !researchPlanValid(commonPlan) {
+			plan.NoPlan, plan.NoPlanReason = true, strings.Join(commonPlan.Reasons, "；")
+		} else {
+			plan.BuyLow, plan.BuyHigh, plan.StopPrice, plan.TargetPrice = commonPlan.BuyLow, commonPlan.BuyHigh, commonPlan.Exit.StopPrice, commonPlan.Exit.TargetPrice
+			plan.HorizonDays, plan.RRRatio = FlexInt(commonPlan.HorizonDays), commonPlan.Exit.NetRewardRisk
+			plan.PlanNote = "与推荐追踪共用程序价位；按区间上沿计算扣费后风险收益，实际持仓按实际成本另建保护。"
+			plan.Checklist = append([]string{"核对当前报价仍在计划区间，未满足条件时继续等待", "核对T+1可卖数量、涨跌停及费用，触价不代表已成交"}, commonPlan.Reasons...)
+			plan.Invalidators = normalizeInvalidators(result.KillSwitches)
+			plan.Discipline = append([]string{}, commonPlan.Reasons...)
+			plan.Position = computePositionAdvice(closesFromSnapshot(snapshot), s.marketBreadth(ctx, req.Market))
+			if commonPlan.Status != "ready" {
+				plan.Position.PositionPct = 0
+				plan.Position.Note = "计划仍需等待，不给当前建仓比例"
+			}
+		}
+		result.TradePlan = plan
 		return chatUsage{}, nil
 	}
 
@@ -195,7 +216,7 @@ func parseTradePlan(content string) (*tradePlan, error) {
 	if err := json.Unmarshal([]byte(jsonStr), &raw); err != nil {
 		return nil, fmt.Errorf("JSON 解析失败: %v", err)
 	}
-	for _, k := range []string{"rr_ratio", "position", "discipline_notes"} {
+	for _, k := range []string{"rr_ratio", "position", "discipline_notes", "price_plan"} {
 		delete(raw, k)
 	}
 	cleaned, err := json.Marshal(raw)

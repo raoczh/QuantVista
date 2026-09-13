@@ -1,53 +1,53 @@
 package service
 
-import "quantvista/model"
-
-const recommendationProfileVersion = "sp1"
+const recommendationProfileVersion = "sp2"
 
 type recommendationProfile struct {
-	intent string
-	short  string
-	long   string
+	intent  string
+	profile string
 }
 
 // 每个内置形态明确声明排序侧重，适用周期只用于持有期与结果评估。
 // 增加策略时必须登记；完整性测试检查与策略目录一一对应。
 var builtinRecommendationProfiles = map[string]recommendationProfile{
-	"vol-break-20d":        {"breakout", "momentum", "growth"},
-	"shrink-pullback-ma20": {"pullback", "pullback", "leader"},
-	"mild-vol-start":       {"activity", "active", "growth"},
-	"bottom-vol-yang":      {"reversal", "active", "value"},
-	"yang-through-3ma":     {"breakout", "momentum", "growth"},
-	"limit-up-pullback":    {"pullback", "pullback", "leader"},
-	"strong-consolidation": {"consolidation", "pullback", "leader"},
-	"rsi-strong-zone":      {"trend", "momentum", "growth"},
-	"macd-gold-water":      {"trend", "momentum", "growth"},
-	"macd-gold-under":      {"reversal", "pullback", "value"},
-	"rsi-oversold-up":      {"reversal", "pullback", "value"},
-	"boll-lower-bounce":    {"reversal", "pullback", "value"},
-	"boll-break-up":        {"breakout", "momentum", "growth"},
-	"ma-converge":          {"consolidation", "pullback", "leader"},
-	"new-high-250":         {"breakout", "momentum", "growth"},
-	"bull-align-trend":     {"trend", "momentum", "leader"},
-	"year-line-stand":      {"trend", "pullback", "leader"},
-	"steady-uptrend":       {"trend", "momentum", "growth"},
-	"calm-consolidation":   {"consolidation", "pullback", "leader"},
-	"deep-oversold-chip":   {"reversal", "pullback", "value"},
-	"low-vol-trend":        {"quality", "pullback", "leader"},
+	"vol-break-20d":        {"breakout", "momentum"},
+	"shrink-pullback-ma20": {"pullback", "pullback"},
+	"mild-vol-start":       {"activity", "active"},
+	"bottom-vol-yang":      {"reversal", "active"},
+	"yang-through-3ma":     {"breakout", "momentum"},
+	"limit-up-pullback":    {"pullback", "pullback"},
+	"strong-consolidation": {"consolidation", "pullback"},
+	"rsi-strong-zone":      {"trend", "momentum"},
+	"macd-gold-water":      {"trend", "momentum"},
+	"macd-gold-under":      {"reversal", "pullback"},
+	"rsi-oversold-up":      {"reversal", "pullback"},
+	"boll-lower-bounce":    {"reversal", "pullback"},
+	"boll-break-up":        {"breakout", "momentum"},
+	"ma-converge":          {"consolidation", "pullback"},
+	"new-high-250":         {"breakout", "momentum"},
+	"bull-align-trend":     {"trend", "momentum"},
+	"year-line-stand":      {"trend", "pullback"},
+	"steady-uptrend":       {"trend", "momentum"},
+	"calm-consolidation":   {"consolidation", "pullback"},
+	"deep-oversold-chip":   {"reversal", "pullback"},
+	"low-vol-trend":        {"quality", "pullback"},
+	"ma20-cross-ma60":      {"trend", "momentum"},
+	"breakout-retest":      {"pullback", "pullback"},
+	"boll-squeeze-break":   {"breakout", "momentum"},
+	"donchian-55":          {"breakout", "momentum"},
+	"kdj-low-cross":        {"reversal", "pullback"},
 }
 
 var retailRecommendationProfiles = map[string]recommendationProfile{
-	"low-price-steady": {"quality", "pullback", "leader"},
-	"pullback-watch":   {"pullback", "pullback", "leader"},
-	"volume-breakout":  {"breakout", "momentum", "growth"},
-	"dividend-watch":   {"value", "value", "value"},
+	"low-price-steady": {"quality", "pullback"},
+	"pullback-watch":   {"pullback", "pullback"},
+	"volume-breakout":  {"breakout", "momentum"},
+	"dividend-watch":   {"value", "value"},
 }
 
-func (p recommendationProfile) scoreProfile(recType string) string {
-	if recType == model.RecTypeLongTerm {
-		return p.long
-	}
-	return p.short
+// 技术形态不会因为用户改成长线而变成价值/成长财务策略。周期只改变执行与评估窗口。
+func (p recommendationProfile) scoreProfile(_ string) string {
+	return p.profile
 }
 
 func profileLabel(key string) string {

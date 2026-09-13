@@ -37,8 +37,8 @@ func NewRecommendationService(market *MarketService, watchlist *WatchlistService
 }
 
 const (
-	recPromptVersion   = "p17" // p17: 说明质量事实、策略侧重、入场等待及多算法排序语义；p16: 候选输入增加近5日发现记忆与7日内标题级真实新闻（不扩候选边界/条数/token预算）；p15: 撤销 p14 输出体积限制（用户定夺：不为省 token 限制输出——预算已放开+截断自动扩容 repair，恢复全量落选理由与不限条数）；p14: 控制结构化输出体积（已撤销）；p13: P1-2 长线 pick 新增 invalidation 失效条件字段（短线既有；schema recommendation.v2）
-	recStrategyVersion = "s12" // s12: 全量命中预选、显式策略侧重、质量分组、入场复核与版本化算法；s11: 选股类策略固定250根因子窗口并优先保证所选策略入池/评分名额；s10: 五维基础分按策略意图重加权（strategyDimWeights：回踩/价值降动量与位置权重、升风险权重；活跃升量能权重）+ 选股类推荐策略条件命中度加分（全中 +12/部分按比例/明显不符 -4，与选股引擎同因子同求值）；s9: S1-3 名单去相关（相关性去重+同行业≤2 只，被挤出者记反事实事件）；s8: M3b 盘中因子短线加分项（尾盘放量拉升/跳水/收盘vs VWAP/午后重心上移/早盘强势）；s7: M3a 龙虎榜净买/机构席位/人气跃升/主力连续净流入加分项 + 量能维融合主力资金分；s6: F2 财务加分项（value ROE/growth 双增速/leader 盈利质量 + 业绩恶化通用扣分）；s5: T1 指标加分项 + 筹码超跌 + 五维动量/风险维升级；s4: 消息面情绪因子；s3: 策略-来源映射 + 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
+	recPromptVersion   = "p18" // p17: 说明质量事实、策略侧重、入场等待及多算法排序语义；p16: 候选输入增加近5日发现记忆与7日内标题级真实新闻（不扩候选边界/条数/token预算）；p15: 撤销 p14 输出体积限制（用户定夺：不为省 token 限制输出——预算已放开+截断自动扩容 repair，恢复全量落选理由与不限条数）；p14: 控制结构化输出体积（已撤销）；p13: P1-2 长线 pick 新增 invalidation 失效条件字段（短线既有；schema recommendation.v2）
+	recStrategyVersion = "s13" // s12: 全量命中预选、显式策略侧重、质量分组、入场复核与版本化算法；s11: 选股类策略固定250根因子窗口并优先保证所选策略入池/评分名额；s10: 五维基础分按策略意图重加权（strategyDimWeights：回踩/价值降动量与位置权重、升风险权重；活跃升量能权重）+ 选股类推荐策略条件命中度加分（全中 +12/部分按比例/明显不符 -4，与选股引擎同因子同求值）；s9: S1-3 名单去相关（相关性去重+同行业≤2 只，被挤出者记反事实事件）；s8: M3b 盘中因子短线加分项（尾盘放量拉升/跳水/收盘vs VWAP/午后重心上移/早盘强势）；s7: M3a 龙虎榜净买/机构席位/人气跃升/主力连续净流入加分项 + 量能维融合主力资金分；s6: F2 财务加分项（value ROE/growth 双增速/leader 盈利质量 + 业绩恶化通用扣分）；s5: T1 指标加分项 + 筹码超跌 + 五维动量/风险维升级；s4: 消息面情绪因子；s3: 策略-来源映射 + 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
 	maxScanCandidates  = 48    // 首轮评分名额上限；排除后按冻结预算最多补评一轮
 	maxLLMCandidates   = 10    // 量化排序后进入 LLM 精选的名单上限（控上下文体积与位置偏差）
 	factorBarLimit     = 90    // 五维评分/窗口因子的日线口径（MA60 需 ≥60，留余量）；实际使用 250 根完整日线，技术评分前截尾
@@ -128,6 +128,7 @@ type candidate struct {
 	IntakeBudget      *recScanBudget        `json:"intake_budget,omitempty"`
 	SignalQuality     *recSignalQuality     `json:"signal_quality,omitempty"`
 	EntryQuality      *recEntryQuality      `json:"entry_quality,omitempty"`
+	PricePlan         *ResearchPricePlan    `json:"price_plan,omitempty"`
 	ScoreBreakdown    *recScoreBreakdown    `json:"score_breakdown,omitempty"`
 	ScoringComparison *recScoringComparison `json:"scoring_comparison,omitempty"`
 	FactAsOf          *time.Time            `json:"fact_as_of,omitempty"`
@@ -294,7 +295,9 @@ type recPick struct {
 	Discovery *CandidateDiscoverySummary `json:"discovery,omitempty"`
 	// ExecutionPlan 用户偏好与现有仓位适配后的纯程序研究计划。它不参与模型输入，
 	// 不改写原始 action/confidence；随 DetailJSON 固化，历史详情不按当前偏好回算。
-	ExecutionPlan *executionPlan `json:"execution_plan,omitempty"`
+	ExecutionPlan *executionPlan         `json:"execution_plan,omitempty"`
+	PricePlan     *ResearchPricePlan     `json:"price_plan,omitempty"`
+	PriceProposal *ResearchPriceProposal `json:"model_price_proposal,omitempty"`
 	// RawConfidence 模型原始口头置信度快照（第五十六批②：复核改写前的值——applyReviews
 	// 的 reject 压 25/复核覆盖是 Confidence 唯一改写点，本字段在其之前由服务端快照）。
 	// 指针语义：nil=旧记录无原始值（校准侧单列 raw_missing，不硬造）；非 nil 恒序列化
@@ -970,7 +973,7 @@ func (s *RecommendationService) runGeneration(ctx context.Context, batch *model.
 		picks[i].QuantRankingScore = c.RankingScore
 		picks[i].QuantRank = c.Rank
 		picks[i].PoolSize = kept
-		picks[i].LotCost = round2(c.Price * 100)
+		picks[i].LotCost = round2(c.Price * float64(cnMinimumBuyQuantity(c.Symbol)))
 		picks[i].QuoteAsOf = c.QuoteAsOf // 行情时效硬门核验过的数据源行情时刻
 		picks[i].Discovery = c.Discovery
 		// 计划价与用户筛选阈值并入证据核验值域：模型在 evidence 里复述自己给出的
@@ -1725,6 +1728,7 @@ func normalizePick(p recPick, sym string, c candidate) recPick {
 	if p.Confidence > 100 {
 		p.Confidence = 100
 	}
+	applyResearchPriceToPick(&p, c.PricePlan)
 	// 价格类字段负值归零。
 	for _, f := range []*float64{&p.BuyZoneLow, &p.BuyZoneHigh, &p.TakeProfit, &p.StopLoss, &p.ValuationLow, &p.ValuationHigh} {
 		if *f < 0 {
@@ -1738,7 +1742,7 @@ func normalizePick(p recPick, sym string, c candidate) recPick {
 	if p.ValidDays < 0 {
 		p.ValidDays = 0
 	}
-	if hasShortPlan(p) {
+	if hasShortPlan(p) && p.PricePlan == nil {
 		if p.ValidDays == 0 {
 			p.ValidDays = 5
 		}
@@ -1767,6 +1771,9 @@ func normalizePick(p recPick, sym string, c candidate) recPick {
 	}
 	// P0-4 跨字段纪律（llm_semantic_validator.go，flag 控）：短线 buy 盈亏比 <1.5
 	// 透明降级为 watch（prompt 纪律的程序化，沿上方 shortPlanPricesValid 降级先例）。
+	if p.PricePlan != nil {
+		return p
+	} // 共同计划使用上沿、扣费后1.2R纪律，不混用旧AI中值毛盈亏比。
 	return applyRecPickSemantics(p)
 }
 
@@ -2256,7 +2263,7 @@ func (s *RecommendationService) buildPool(ctx context.Context, userID int64, mar
 	if len(pool) == 0 {
 		return pool, nil, nil
 	}
-	preselectRecommendationPool(pool, strat.baseKey)
+	preselectRecommendationPool(pool, strat.baseKey, publicStrategy(*strat).Intent)
 	priority := "watchlist"
 	if strat.screen != nil {
 		priority = "strategy_signal"
@@ -2324,7 +2331,7 @@ func (s *RecommendationService) buildPool(ctx context.Context, userID int64, mar
 			}
 		}
 	}
-	preselectRecommendationPool(pool, strat.baseKey)
+	preselectRecommendationPool(pool, strat.baseKey, publicStrategy(*strat).Intent)
 	if strat.screen != nil {
 		assignScanQuota(pool, "strategy_signal")
 	} else {
@@ -2663,6 +2670,7 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 				}
 				pool[i].StrategyHit = evaluateStrategyHit(strat, pool[i].Symbol, meta, hitBarsWithQuote(bars, pool[i], pool[i].QuoteAsOf[:10]))
 			}
+			pool[i].PricePlan = buildResearchPricePlan(pool[i], bars, researchPriceContextFor(recType, strat))
 			// S0-4 价格版本 + S1-3 相关性序列：保存尾部收盘与交易日（61 根足够 60 日
 			// 收益相关；日期供停牌错位下的交集对齐）与最近收盘日锚点（防前复权重锚
 			// 的比对基准）。
@@ -3198,6 +3206,7 @@ func (s *RecommendationService) buildRecommendationMessages(recPrompt promptRunt
 		sys.WriteString("\nentry_quality 将趋势与入场位置分开：extended 应解释等待回踩的条件，waiting_confirmation 应指出尚缺的确认，insufficient 应说明数据缺口。量化高分并不等于现在适合买入；允许否决，但需要引用具体字段和失效条件。")
 	}
 	sys.WriteString("\n收盘形态以 time_facts.signal_date 的完整日线为准；time_facts.current_returns 是截至评分快照现价的累计涨幅，两者不得混称同一时点。final_check 记录送模前最新价格约束复核，不代表已经成交。")
+	sys.WriteString("\nprice_plan 为与个股分析共用的程序买卖价，优先于旧价位规则。已有计划时 buy_zone_low/high、take_profit、stop_loss 只能复述它的 buy_low/high、exit.target_price/stop_price；服务端最终以程序值为准。wait/unavailable 必须解释等待或缺失条件，不能抬高目标凑盈亏比。valuation 区间是独立估值观点，不当成买入区间或卖出触发价。共同计划使用买入上沿、扣费后第一目标至少1.2R的入场纪律，不与旧模型中值毛盈亏比混用。科创板新买入至少200股，其他普通A股至少100股。")
 
 	var u strings.Builder
 	if mktCtx != nil {
@@ -3228,7 +3237,7 @@ func (s *RecommendationService) buildRecommendationMessages(recPrompt promptRunt
 		fmt.Fprintf(&u, "硬性要求：只能从名单里选，symbol 必须与名单完全一致，严禁名单外或虚构的标的；名单中符合策略的合格标的充足时应给足 %d 个，确实不足时宁可少选甚至不选（picks 可为空数组），绝不硬凑。你可以不同意量化排序（例如否决 rank 靠前者），但必须用名单中的数据说明理由。\n", count)
 	}
 	u.WriteString("同时请在 rejected 数组中，对名单内未入选的标的给出落选理由，只解释名单内标的。\n\n")
-	fmt.Fprintf(&u, "【%s】（JSON；price 现价、change_pct 当日涨跌%%、amount_yi 成交额亿元、turnover_rate 换手%%、volume_ratio 量比、float_cap_yi 流通市值亿元、pe_ttm 市盈率TTM（负=亏损）、pb 市净率、senti_score 当日新闻聚合情绪分-1~1（senti_news 为条数，字段缺失=当日无相关新闻，不得臆测消息面）；lhb_net_yi 最近一次上龙虎榜的净买额亿元（负=净卖出，lhb_reason 为上榜原因，缺失=近期未上榜）、org_net_yi 机构席位净买额亿元（org_buys 为机构买入次数）、pop_rank 股吧人气榜名次（pop_new=true 新上榜；人气是关注度信号非基本面，高人气也意味着拥挤与情绪退潮风险）；factors：ma5/ma10/ma20/ma60 均线、chg_5d/chg_20d 近5/20日涨跌%%、high_20d 创20日新高、bull_align 多头排列、vol_boost 今日量/5日均量、bias_20 MA20乖离%%、volatility_20 波动率%%、drawdown_20 近20日最大回撤%%、pos_60 60日区间位置、rsi_14 RSI(14,Wilder)、macd_dif/macd_dea/macd_hist MACD(12,26,9)（柱=2×(DIF−DEA)）、macd_gold DIF在DEA上方、macd_cross_up 近3日金叉、boll_up/boll_mid/boll_low 布林带(20,2σ)、boll_pos 布林带内位置%%、atr_14/atr_pct 真实波幅及其占现价%%、chip_profit 获利盘%%（收盘价下方筹码占比）、chip_avg_cost 筹码平均成本（chip_bars 为筹码窗口根数，缺失=未计算，不得臆测筹码面）、main_net_days 主力资金连续净流入天数（负=连续净流出，main_net_5d_yi 为近5日主力净额亿元，缺失=资金流数据暂不可得，不得臆测资金面）、盘中因子（intraday_date 为归属交易日的 T-1 盘中形态，缺失=盘中数据暂不可得，不得臆测盘中走势）：tail30_chg 尾盘30分钟涨幅%%、tail30_vol_pct 尾盘30分钟量占全天%%（均匀线12.5，>20 为尾盘异常放量）、morning_chg 早盘1小时涨幅%%、close_vs_vwap 收盘相对全天均价偏离%%（正=收在均价上方买方主导）、pm_vwap_up=true 下午均价高于上午（日内重心上移）；fin 财务摘要（长线名单）：roe 加权ROE%%、revenue_yoy/net_profit_yoy 营收/净利同比%%、gross_margin/net_margin 毛利率/净利率%%、debt_ratio 资产负债率%%、report 报告期（fin 缺失=财务数据暂不可得，不得臆测）；指标/估值字段缺失表示该数据暂不可得，不得臆测）：\n", listTitle)
+	fmt.Fprintf(&u, "【%s】（JSON；price 现价、change_pct 当日涨跌%%、amount_yi 成交额亿元、turnover_rate 换手%%、volume_ratio 量比、float_cap_yi 流通市值亿元、pe_ttm 市盈率TTM（负=亏损）、pb 市净率、senti_score 当日新闻聚合情绪分-1~1（senti_news 为条数，字段缺失=当日无相关新闻，不得臆测消息面）；lhb_net_yi 最近一次上龙虎榜的净买额亿元（负=净卖出，lhb_reason 为上榜原因，缺失=近期未上榜）、org_net_yi 机构席位净买额亿元（org_buys 为机构买入次数）、pop_rank 股吧人气榜名次（pop_new=true 新上榜；人气是关注度信号非基本面，高人气也意味着拥挤与情绪退潮风险）；factors：ma5/ma10/ma20/ma60 均线、chg_5d/chg_20d 近5/20日涨跌%%、high_20d 创20日新高、bull_align 多头排列、vol_boost 今日量/5日均量、bias_20 MA20乖离%%、volatility_20 波动率%%、drawdown_20 近20日最大回撤%%、pos_60 60日区间位置、rsi_14 RSI(14,Wilder)、macd_dif/macd_dea/macd_hist MACD(12,26,9)（柱=2×(DIF−DEA)）、macd_gold DIF在DEA上方、macd_cross_up 近3日金叉、boll_up/boll_mid/boll_low 布林带(20,2σ)、boll_pos 布林带内位置%%、atr_14/atr_pct 真实波幅及其占现价%%、chip_profit 获利盘%%（收盘价下方筹码占比）、chip_avg_cost 筹码平均成本（chip_bars 为筹码窗口根数，缺失=未计算，不得臆测筹码面）、main_net_days 主力资金连续净流入天数（负=连续净流出，main_net_5d_yi 为近5日主力净额亿元，缺失=资金流数据暂不可得，不得臆测资金面）、盘中因子（intraday_date 为归属交易日的 T-1 盘中形态，缺失=盘中数据暂不可得，不得臆测盘中走势）：tail30_chg 尾盘30分钟涨幅%%、tail30_vol_pct 尾盘30分钟量占全天%%（均匀线12.5，>20 为尾盘异常放量）、morning_chg 早盘1小时涨幅%%、close_vs_vwap 收盘相对全天均价偏离%%（正=收在均价上方买方主导）、pm_vwap_up=true 下午均价高于上午（日内重心上移）；fin 财务摘要：roe 为本报告期累计加权ROE%%；annual_roe 为最近已披露年报ROE%%，annual_report_date/annual_notice_date 标注其报告期与公告日，年度质量只比较年报ROE，不能把季度ROE直接比较年度阈值或简单乘倍数年化；revenue_yoy/net_profit_yoy 为最新报告营收/净利同比%%、gross_margin/net_margin 毛利率/净利率%%、debt_ratio 资产负债率%%、report/report_date/notice_date 标注最新报告；fin 或其字段省略/null=缺失，已提供的数值0=真实零，不得臆测；指标/估值字段缺失表示该数据暂不可得，不得臆测）：\n", listTitle)
 	compact := compactForLLM(recType, llmCands)
 	if scoreBlind {
 		compact = compactScoreBlindForLLM(recType, llmCands)
@@ -3290,7 +3299,7 @@ const shortTermSpec = `本次为【短线推荐】。每个 pick 需包含字段
 交易规则硬约束：当前数据源仅支持 A 股；A 股当日买入不可当日卖出(T+1)，止盈/止损最早次一交易日生效；必须考虑涨跌停限制，涨停可能买不进、跌停可能卖不出；最小交易单位为 100 股一手；有效期和持有周期都按交易日计算，不按自然日。
 价位纪律：要求止盈>买入区间上沿>买入区间下沿>止损，价格贴近现价合理设置；止损建议参考 MA20 附近或现价-5%~-7%（可用名单中 factors.ma20 锚定）；止盈到止损的距离比（盈亏比）至少 1.5，不足时降为 watch 并说明。`
 
-const longTermSpec = `本次为【长线推荐】。名单含实时行情、估值快照（PE-TTM/PB/市值）、技术因子与 fin 财务摘要（最新一期报告的 ROE/营收与净利同比增速/毛利率/净利率/资产负债率，report 字段标注报告期）。fin 字段缺失表示该股财务数据暂不可得，如实说明、不得臆测；fin 只有最新一期，不含多期趋势与三表明细，判断长期成长持续性时应指出这一局限。每个 pick 需包含字段：
+const longTermSpec = `本次为【长线推荐】。名单含实时行情、估值快照（PE-TTM/PB/市值）、技术因子与 fin 财务摘要（最新报告的累计ROE/营收与净利同比/毛利率/净利率/资产负债率，以及最近已披露年报 annual_roe，各有报告期）。年度盈利质量比较使用 annual_roe，季度累计ROE不能直接年化或套用年度阈值。fin 或单字段缺失要如实说明；它不含完整多期趋势与三表明细，不能据此证明长期成长持续性。每个 pick 需包含字段：
 - symbol: 名单中的代码
 - action: "buy"(可考虑逢低布局) 或 "watch"(观察等待)
 - confidence: 0-100 整数

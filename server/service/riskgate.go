@@ -107,7 +107,7 @@ func computeRiskGate(q *datasource.Quote, v *datasource.Valuation) []riskFlag {
 	if st {
 		limitName = "ST" + limitName
 	}
-	if amplitudeKnown && abs(q.ChangePct) >= limitUpPctFor(q.Symbol, limitName)-0.5 && ampl < riskLimitBoardAmpl && ampl >= 0 {
+	if amplitudeKnown && abs(q.ChangePct) >= limitUpPctForDate(q.Symbol, limitName, q.DataTime.In(time.Local).Format("2006-01-02"))-0.5 && ampl < riskLimitBoardAmpl && ampl >= 0 {
 		if q.ChangePct > 0 {
 			flags = append(flags, riskFlag{
 				Level: "warn", Code: "limit_board",

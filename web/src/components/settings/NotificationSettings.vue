@@ -42,6 +42,7 @@ import {
   browserPermission,
   currentBrowserDeviceID,
   ensureNotificationServiceWorker,
+  refreshBrowserNotificationRuntime,
   pushSubscriptionInput,
   rememberBrowserDeviceID,
   urlBase64ToUint8Array,
@@ -395,13 +396,17 @@ async function enableBrowserNotification(force = false) {
     // 注册或订阅失败仍要保留前台通知能力。
     let pushInput: { endpoint?: string; p256dh?: string; auth?: string } = {}
     let pushFallback = config.vapid_configured && !pushSupported
-    if (config.vapid_configured && pushSupported) {
+    if ('serviceWorker' in navigator) {
       try {
         const registration = await ensureNotificationServiceWorker()
         if (!active()) return
+        if (config.vapid_configured && pushSupported) {
         let subscription = await registration.pushManager.getSubscription()
         if (!active()) return
-        if (force && subscription) {
+        const expectedKey = urlBase64ToUint8Array(config.vapid_public_key)
+        const existingKey = subscription?.options.applicationServerKey
+        const differentKey = existingKey && (new Uint8Array(existingKey).length !== expectedKey.length || new Uint8Array(existingKey).some((v, i) => v !== expectedKey[i]))
+        if ((force || differentKey || !currentDevice.value) && subscription) {
           await subscription.unsubscribe()
           if (!active()) return
           subscription = null
@@ -409,10 +414,11 @@ async function enableBrowserNotification(force = false) {
         if (!subscription) {
           subscription = await registration.pushManager.subscribe({
             userVisibleOnly: true,
-            applicationServerKey: urlBase64ToUint8Array(config.vapid_public_key),
+            applicationServerKey: expectedKey,
           })
         }
         pushInput = pushSubscriptionInput(subscription)
+        }
       } catch {
         pushFallback = true
       }
@@ -427,9 +433,13 @@ async function enableBrowserNotification(force = false) {
     if (!active()) return
     currentDeviceID.value = saved.id
     rememberBrowserDeviceID(ownerID, saved.id)
+    refreshBrowserNotificationRuntime()
     await Promise.all([loadBrowserConfig(), loadPreference()])
     if (!active()) return
-    if (pushFallback) message.warning('Web Push 订阅失败，已保留网站打开期间的浏览器通知。')
+    if (pushFallback) {
+      browserError.value = '后台推送未能订阅，目前仅在页面保持运行时接收系统通知；浏览器休眠后可能延迟。请检查网络并重新订阅。'
+      message.warning(browserError.value)
+    }
     else message.success(saved.has_web_push ? '浏览器通知和 Web Push 已开启' : '网站打开期间的浏览器通知已开启')
   } catch (error) {
     if (!active()) return
@@ -463,6 +473,7 @@ async function removeDevice(device: BrowserNotificationDevice) {
       if (!active()) return
       currentDeviceID.value = null
       rememberBrowserDeviceID(ownerID, null)
+      refreshBrowserNotificationRuntime()
     }
     await loadBrowserConfig()
     if (!active()) return
@@ -506,7 +517,7 @@ async function sendBrowserTest() {
   try {
     await testBrowserNotification(browserDeviceKey(ownerID))
     if (!active()) return
-    message.success('测试通知已发送')
+    message.success('测试事件已创建，请确认是否收到系统弹窗；此提示不代表桌面已展示。')
   } catch {
     if (!active()) return
     browserError.value = '测试通知失败，请重新订阅后重试。'
@@ -585,11 +596,14 @@ onMounted(() => {
           <div><span>浏览器支持</span><n-tag size="small" :type="browserSupported ? 'success' : 'default'">{{ browserSupported ? '支持' : '不支持' }}</n-tag></div>
           <div><span>通知权限</span><n-tag size="small" :type="permission === 'granted' ? 'success' : permission === 'denied' ? 'error' : 'warning'">{{ permissionLabel }}</n-tag></div>
           <div><span>Web Push 服务</span><n-tag size="small" :type="browserConfig?.vapid_configured ? 'success' : 'default'">{{ !browserConfig ? (browserLoading ? '读取中' : '未能读取') : browserConfig.vapid_configured ? '已配置' : '未配置' }}</n-tag></div>
-          <div><span>当前设备</span><n-tag size="small" :type="deviceActive ? 'success' : 'default'">{{ !browserConfig ? (browserLoading ? '读取中' : '未能读取') : deviceActive ? (currentDevice?.has_web_push ? '已订阅 Web Push' : '仅前台通知') : '未订阅' }}</n-tag></div>
+          <div><span>后台桌面提醒</span><n-tag size="small" :type="deviceActive && currentDevice?.has_web_push && browserConfig?.vapid_configured ? 'success' : 'warning'">{{ !browserConfig ? (browserLoading ? '读取中' : '未能读取') : deviceActive ? (currentDevice?.has_web_push && browserConfig.vapid_configured ? '已订阅后台推送' : '仅页面运行期间') : '未订阅' }}</n-tag></div>
         </div>
 
         <n-alert type="info" :bordered="false" class="browser-limit">
-          需要 HTTPS 或 localhost。网站打开时可通过 Notification API 和事件轮询提醒；网站关闭后还需要浏览器支持 Web Push 且服务端配置 VAPID。iPhone/iPad 通常需先将网站添加到主屏幕，再从主屏幕打开后授权。
+          提醒通过操作系统通知弹出，切到桌面也可以显示；弹窗位置由系统决定。页面休眠或关闭后需要成功订阅后台推送。请同时允许系统中浏览器的通知，并关闭会屏蔽横幅的“请勿打扰”。iPhone/iPad 通常需先添加到主屏幕。需要 HTTPS 或 localhost。
+        </n-alert>
+        <n-alert v-if="browserConfig && !browserConfig.vapid_configured" type="warning" :bordered="false" class="browser-limit">
+          服务端尚未配置后台推送。当前页面运行时可接收通知，后台休眠时无法保证及时；管理员需按部署文档配置 VAPID 后，在这里重新订阅。
         </n-alert>
         <n-alert v-if="permission === 'denied'" type="warning" :bordered="false" class="browser-limit">
           当前权限已拒绝，页面无法再次弹出权限框。请打开地址栏旁的站点设置，将“通知”改为允许后再点重新订阅。
@@ -622,7 +636,7 @@ onMounted(() => {
             <div class="channel-main">
               <strong>{{ device.name }}</strong>
               <span class="channel-meta">
-                {{ device.has_web_push ? 'Web Push' : '仅网站打开期间' }}
+                {{ device.has_web_push ? '后台推送' : '仅页面运行期间' }}
                 <template v-if="device.last_seen_at"> · 最近活动 {{ new Date(device.last_seen_at).toLocaleString('zh-CN', { hour12: false }) }}</template>
               </span>
               <n-alert v-if="device.last_error_code" type="warning" :bordered="false">上次 Web Push 失败，建议重新订阅。</n-alert>

@@ -28,3 +28,35 @@ assert.equal(resolveCoverageStatus({ observed: true, available: true, error: 'ti
 assert.equal(resolveCoverageStatus({ observed: true, available: true }), 'available')
 
 console.log('stock coverage tests passed')
+
+// 财务接口明确返回 null 后，决策摘要必须保留缺口，不能把未知显示成零或无风险。
+const decisionSource = fs.readFileSync(path.join(here, '../src/components/stock-detail/decisionSummary.ts'), 'utf8')
+const decisionOutput = ts.transpileModule(decisionSource, {
+  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+}).outputText
+const decisionModule = { exports: {} }
+new Function('module', 'exports', 'require', decisionOutput)(decisionModule, decisionModule.exports, (name) => {
+  assert.equal(name, '@/lib/formatPrice')
+  return { formatPrice: (value) => String(value) }
+})
+const decisionBase = {
+  quote: null, position: null, bars: [], valuation: null, score: null, fundflow: null,
+  corpEvents: null, announcements: [], news: [], eventPhase: 'ready', eventPartial: false,
+  fundamentalPhase: 'ready',
+}
+const financeRow = { report_name: '2026中报', report_date: '2026-06-30', roe: null, gross_margin: 0, revenue_yoy: null, net_profit_yoy: null, debt_ratio: null }
+const summarize = (row) => decisionModule.exports.buildDecisionSummary({ ...decisionBase, finance: { indicators: [row], statements: [] } })
+const missingFinance = summarize(financeRow)
+const financeChange = missingFinance.changes.find((item) => item.id === 'finance-change')
+assert.equal(financeChange.tone, 'unknown')
+assert.match(financeChange.value, /营收 缺失.*净利 缺失/)
+assert.match(financeChange.evidence, /ROE 缺失.*毛利率 0.00%/)
+assert.ok(!missingFinance.risks.some((item) => item.id === 'finance-risk'))
+const zeroFinance = summarize({ ...financeRow, revenue_yoy: 0, net_profit_yoy: 0 })
+assert.equal(zeroFinance.changes.find((item) => item.id === 'finance-change').tone, 'neutral')
+for (const row of [{ ...financeRow, net_profit_yoy: -8 }, { ...financeRow, debt_ratio: 80 }]) {
+  const risk = summarize(row).risks.find((item) => item.id === 'finance-risk')
+  assert.ok(risk, '已知恶化字段仍须显示，其他字段缺失不能令摘要崩溃')
+  assert.match(risk.evidence, /缺失/)
+}
+console.log('财务缺失与真实零展示测试通过')

@@ -193,7 +193,7 @@ func researchSnapshotFixture(t *testing.T) (model.FactorSnapshotDaily, model.Sto
 		t.Fatal(err)
 	}
 	at, _ := time.ParseInLocation("2006-01-02 15:04", date+" 16:10", time.Local)
-	return model.FactorSnapshotDaily{Symbol: "600100", Market: "cn", TradeDate: date, LastBarDate: date, FactorVersion: factorSnapshotVersion, FactorsJSON: string(b), CreatedAt: at}, model.StockUniverseDaily{Symbol: "600100", Market: "cn", Name: "样本", TradeDate: date, Close: bars[len(bars)-1].Close, Amount: 1e8, TurnoverRate: 3, CreatedAt: at}
+	return model.FactorSnapshotDaily{Symbol: "600100", Market: "cn", TradeDate: date, LastBarDate: date, FactorVersion: factorSnapshotVersion, DataQuality: "verified_adjustment", FactorsJSON: string(b), CreatedAt: at}, model.StockUniverseDaily{Symbol: "600100", Market: "cn", Name: "样本", TradeDate: date, Close: bars[len(bars)-1].Close, Amount: 1e8, TurnoverRate: 3, CreatedAt: at}
 }
 
 func TestRankingResearchSnapshotPITAndFrozenFeatures(t *testing.T) {
@@ -201,7 +201,7 @@ func TestRankingResearchSnapshotPITAndFrozenFeatures(t *testing.T) {
 	req := RankingResearchRequest{RecType: model.RecTypeShortTerm, Profile: "momentum"}
 	c, ok := snapshotResearchCandidate(row, u, req)
 	if !ok || c.SignalQuality.BreakoutConfirmed == nil || !*c.SignalQuality.BreakoutConfirmed || c.ScoreDims == nil {
-		t.Fatal("fv6 应保存当时的技术维度和突破事实")
+		t.Fatal("已核验的新版本快照应可读取当时的技术维度和突破事实")
 	}
 	original := rankingCandidateFeatures(c)
 	// 输入只能来自快照，今天重新锚定的历史价格不会参与重算。
@@ -214,6 +214,10 @@ func TestRankingResearchSnapshotPITAndFrozenFeatures(t *testing.T) {
 		t.Fatal("冻结特征不应随今日行情漂移")
 	}
 	for _, mutate := range []func(*model.FactorSnapshotDaily, *model.StockUniverseDaily){
+		func(r *model.FactorSnapshotDaily, u *model.StockUniverseDaily) { r.DataQuality = "" },
+		func(r *model.FactorSnapshotDaily, u *model.StockUniverseDaily) {
+			r.DataQuality = model.FactorQualityUnverifiedAdjustment
+		},
 		func(r *model.FactorSnapshotDaily, u *model.StockUniverseDaily) { r.FactorVersion = "fv5" },
 		func(r *model.FactorSnapshotDaily, u *model.StockUniverseDaily) {
 			r.CreatedAt = r.CreatedAt.AddDate(0, 0, 1)

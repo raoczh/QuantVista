@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-const recommendationScoringVersion = "qr1"
+const recommendationScoringVersion = "qr2"
 
 type recScoreComponent struct {
 	Key    string   `json:"key"`
@@ -35,10 +35,22 @@ type recScoringComparison struct {
 }
 
 func qualityBaseScore(recType, profile string, sc ScoreResult, f *candFactors) (float64, []string, bool) {
+	return qualityBaseScoreWithIntent(recType, profile, "", sc, f)
+}
+
+func qualityBaseScoreWithIntent(recType, profile, intent string, sc ScoreResult, f *candFactors) (float64, []string, bool) {
 	if f == nil {
 		return 0, []string{"技术因子"}, false
 	}
 	wt, wm, wp, wv, wr := strategyDimWeights(recType, profile)
+	// 反转池的目标是确认超卖修复，不能在基础分阶段再次偏爱创高追涨。
+	if intent == "reversal" {
+		wt, wm, wp, wv, wr = 0.10, 0.05, 0.20, 0.25, 0.40
+		sc.Position = 100 - sc.Position
+	}
+	if intent == "consolidation" {
+		wt, wm, wp, wv, wr = 0.25, 0.05, 0.10, 0.15, 0.45
+	}
 	var total, weight float64
 	var missing []string
 	for _, d := range []struct {
@@ -69,7 +81,7 @@ func qualityBaseScore(recType, profile string, sc ScoreResult, f *candFactors) (
 // 创高和均线多头等高度相关的“强势证据”。每个组独立限幅，原始观测仍完整保存。
 func scoreQualityCandidate(recType string, strat *strategyTemplate, c candidate, f *candFactors, sc ScoreResult) (*recScoreBreakdown, []string) {
 	b := &recScoreBreakdown{Version: recommendationScoringVersion, Profile: strat.baseKey}
-	base, missing, valid := qualityBaseScore(recType, strat.baseKey, sc, f)
+	base, missing, valid := qualityBaseScoreWithIntent(recType, strat.baseKey, strat.Intent, sc, f)
 	b.Valid, b.Missing = valid, append(b.Missing, missing...)
 	var notes []string
 	add := func(key string, value float64, status string, why ...string) {
@@ -200,9 +212,7 @@ func scoreQualityCandidate(recType string, strat *strategyTemplate, c candidate,
 	}
 	add("risk", bounded(risk, -10, 0), "available", riskNotes...)
 	finance, financeNotes, financeStatus := qualityFinanceScore(strat.baseKey, c)
-	if financeStatus == "missing" {
-		b.Missing = append(b.Missing, "财报摘要")
-	}
+	b.Missing = append(b.Missing, financeMissingFor(strat.baseKey, c.Fin)...)
 	add("fundamentals", finance, financeStatus, financeNotes...)
 	// 机构与新闻同组限幅；资金流已经进入量能维，避免再次按连续流入天数加分。
 	positive, negative := 0.0, 0.0
@@ -238,18 +248,18 @@ func qualityFinanceScore(profile string, c candidate) (float64, []string, string
 		return 0, nil, "missing"
 	}
 	fin := c.Fin
-	for _, v := range []float64{fin.ROE, fin.RevenueYoY, fin.NetProfitYoY} {
-		if !finiteRecNumber(v) {
-			return 0, []string{"财务数值无效"}, "missing"
-		}
+	status := "available"
+	var notes []string
+	if missing := financeMissingFor(profile, fin); len(missing) > 0 {
+		status = "partial"
+		notes = append(notes, "财务证据缺少："+strings.Join(missing, "、"))
 	}
 	score := 0.0
-	var notes []string
 	if c.PETTM < 0 {
 		score -= 6
 		notes = append(notes, "PE 为负，不能将低估值解释为盈利质量")
 	}
-	if fin.NetProfitYoY <= -30 {
+	if fin.has(fin.NetProfitYoY) && *fin.NetProfitYoY <= -30 {
 		score -= 5
 		notes = append(notes, "净利润同比明显下降")
 	}
@@ -266,42 +276,42 @@ func qualityFinanceScore(profile string, c candidate) (float64, []string, string
 		if c.IndustryPeers != nil && c.IndustryPeers.PBPercentile != nil {
 			pbOK = *c.IndustryPeers.PBPercentile <= 50
 		}
-		if peOK && fin.ROE >= 8 {
+		if peOK && fin.hasAnnualROE() && *fin.AnnualROE >= 8 {
 			score += 5
 			notes = append(notes, "估值与盈利能力同时满足价值参照")
 		}
-		if pbOK && fin.ROE >= 10 {
+		if pbOK && fin.hasAnnualROE() && *fin.AnnualROE >= 10 {
 			score += 2
-			notes = append(notes, "净资产定价与 ROE 相互支持")
+			notes = append(notes, "净资产定价与最近年报 ROE 相互支持")
 		}
-		if fin.NetProfitYoY >= 10 {
+		if fin.has(fin.NetProfitYoY) && *fin.NetProfitYoY >= 10 {
 			score += 3
 			notes = append(notes, "净利润保持正增长")
 		}
 	case "growth":
-		if fin.RevenueYoY >= 10 && fin.NetProfitYoY >= 15 {
+		if fin.has(fin.RevenueYoY) && fin.has(fin.NetProfitYoY) && *fin.RevenueYoY >= 10 && *fin.NetProfitYoY >= 15 {
 			score += 8
 			notes = append(notes, "营收与净利润双增长")
 		}
-		if fin.ROE >= 12 {
+		if fin.hasAnnualROE() && *fin.AnnualROE >= 12 {
 			score += 3
-			notes = append(notes, "ROE 支持当前成长质量")
+			notes = append(notes, "最近年报 ROE 支持年度盈利质量")
 		}
-		if fin.RevenueYoY < 0 {
+		if fin.has(fin.RevenueYoY) && *fin.RevenueYoY < 0 {
 			score -= 4
 			notes = append(notes, "营收同比下降，成长依据减弱")
 		}
 	case "leader":
-		if fin.ROE >= 15 && fin.NetProfitYoY >= 0 {
+		if fin.hasAnnualROE() && fin.has(fin.NetProfitYoY) && *fin.AnnualROE >= 15 && *fin.NetProfitYoY >= 0 {
 			score += 7
-			notes = append(notes, "盈利能力较高且净利润未下滑")
+			notes = append(notes, "最近年报 ROE 较高且最新报告净利润同比未下滑")
 		}
 		if c.TotalCap >= 500e8 {
 			score += 1
 			notes = append(notes, "市值规模较大，行业地位仍需另行核实")
 		}
 	}
-	return bounded(score, -12, 12), notes, "available"
+	return bounded(score, -12, 12), notes, status
 }
 
 // 原有加法规则继续可重放。比较只代表同一机会集上的评分消融，不冒充旧完整流水线。

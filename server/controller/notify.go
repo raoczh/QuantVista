@@ -146,7 +146,8 @@ func (nc *NotifyController) RemoveBrowserDevice(c *gin.Context) {
 func (nc *NotifyController) BrowserEvents(c *gin.Context) {
 	afterID, _ := strconv.ParseInt(c.Query("after_id"), 10, 64)
 	limit, _ := strconv.Atoi(c.Query("limit"))
-	rows, err := nc.browser.PendingEvents(currentUserID(c), c.Query("device_key"), afterID, limit)
+	wait, _ := strconv.Atoi(c.Query("wait_seconds"))
+	rows, err := nc.browser.WaitPendingEvents(c.Request.Context(), currentUserID(c), c.Query("device_key"), afterID, limit, wait)
 	if err != nil {
 		common.ApiErrorMsg(c, err.Error())
 		return

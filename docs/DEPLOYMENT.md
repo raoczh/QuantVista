@@ -48,7 +48,7 @@ openssl rand -base64 36   # 再生成一个作 ENCRYPTION_KEY
 
 ### 1.6 浏览器 Web Push（可选）
 
-网站打开或后台标签页时的 Notification API+事件轮询不要求 VAPID；只有网站关闭后的 Web Push 需要。
+页面仍在运行时可通过长轮询接收事件，不要求 VAPID。后台标签页可能被浏览器冻结；页面休眠或关闭后的投递需要有效 Web Push 订阅。要接收切到桌面后的提醒，应配置以下密钥，并在“设置 → 通知设置”确认当前设备显示“已订阅后台推送”。
 在发布前生成一次 P-256 VAPID 密钥对：
 
 ```bash
@@ -59,10 +59,14 @@ go run ./cmd/vapidgen
 把输出的 `VAPID_PUBLIC_KEY`、`VAPID_PRIVATE_KEY` 与联系地址
 `VAPID_SUBJECT=mailto:ops@example.com` 一起写入长期保存的 `deploy/.env`。三项必须一起配置，密钥轮换会让
 已有浏览器订阅全部失效；**禁止容器每次启动临时生成**。缺失、格式错误或公私钥不匹配时应用仍正常启动，
-设置页会显示 Web Push 未配置，前台通知继续可用。
+设置页会显示 Web Push 未配置，仅页面运行期间的通知继续可用。
 
 生产站必须使用 HTTPS，`localhost` 只用于本地开发。反向代理需要正常提供根路径 `/sw.js`，不要给它设置
 长期 immutable 缓存。iPhone/iPad 通常还需先“添加到主屏幕”再授权，具体支持取决于系统与浏览器版本。
+
+事件 API 单次长轮询最长 25 秒，前端请求超时 35 秒；反向代理读取超时应至少为 40 秒。部署后让浏览器完成新 Worker 激活。在线事件与 Push 由同一 Worker 展示并去重；IndexedDB 只保存已展示事件编号和时刻。服务端每 15 秒承接待重试投递，临时错误按 15/30/60/120 秒退避，404/410 会禁用失效订阅，超过 5 分钟的旧行情通知不补弹。
+
+部署验收应覆盖首次授权、在线通知、后台页面、Worker 更新和跨账号切换。测试按钮“事件已创建”及推送服务 HTTP 成功都不等同于操作系统已经显示横幅；系统通知权限、勿扰模式及浏览器后台运行设置仍会影响展示。行情规则的评估周期仍约 2 分钟，不是逐笔行情推送。
 
 ## 2. 配置文件说明
 
@@ -98,6 +102,7 @@ go run ./cmd/vapidgen
 - 本轮 P0-5 会自动给 `alert_events` 增加命中上下文字段，并创建 `job_failure_notifications` 及其 JobRun 唯一键、短窗 group key/merge 索引；不需要额外 SQL 文件。
 - 本轮 P0-4 策略结果阶段会自动创建 `strategy_run_results` 及其 owner/kind/状态/时间索引；有 16KiB 上限的规范化请求映射为 MySQL TEXT，最大 2MiB 的结果正文映射为 LONGTEXT。扫描/回测 handler 在作业恢复前完成注册，部署不需要另建队列或执行 SQL。
 - 本轮 Top50 U13/U18 会自动创建 `todo_inbox_states` 及 `(user_id, source_kind, source_id)` 唯一索引。该表只保存来源版本、已读、稍后和当日静默；提醒/推荐/任务正文不会复制。模型已进入 `model.AllModels()`，Docker 正常重部署会自动完成，不提供也不需要手工 SQL。
+- 价格/策略/通知升级会为 `finance_indicators` 增加 `value_mask`，为 `browser_notification_deliveries` 增加重试时点与租约字段。旧财务缓存不回填猜测的可用性，按正常采集刷新；历史价格计划和已完成结果不重写。规则与特征版本已更新，旧算法的未完成推荐任务会明确要求重新生成，旧学习模型须重新评估后启用。
 
 **不会自动做的（需写迁移代码）：**
 

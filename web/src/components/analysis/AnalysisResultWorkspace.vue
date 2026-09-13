@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import ResearchPricePlanPanel from '@/components/ResearchPricePlanPanel.vue'
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
@@ -333,13 +334,14 @@ function exportResult() {
 
           <n-collapse-item v-if="current.result?.trade_plan" title="交易计划（与持仓卖出决策分开）" name="plan">
             <n-alert v-if="current.result.trade_plan.no_plan" type="warning" :bordered="false">{{ current.result.trade_plan.no_plan_reason || '数据不足，未生成计划' }}</n-alert>
+            <ResearchPricePlanPanel v-else-if="current.result.trade_plan.price_plan" :plan="current.result.trade_plan.price_plan" />
             <div v-else class="plan-grid">
               <div><span>买入区间</span><b>{{ current.result.trade_plan.buy_low }} - {{ current.result.trade_plan.buy_high }}</b></div>
               <div><span>目标价</span><b>{{ current.result.trade_plan.target_price }}</b></div>
               <div><span>止损价</span><b>{{ current.result.trade_plan.stop_price }}</b></div>
               <div><span>持有周期</span><b>{{ current.result.trade_plan.horizon_days }} 交易日</b></div>
               <div><span>盈亏比</span><b>{{ current.result.trade_plan.rr_ratio }}</b></div>
-              <div><span>程序仓位</span><b>{{ current.result.trade_plan.position?.position_pct || '未知' }}%</b></div>
+              <div><span>程序仓位</span><b>{{ current.result.trade_plan.position?.position_pct ?? '未知' }}%</b></div>
             </div>
             <p>{{ current.result.trade_plan.plan_note }}</p>
             <h4>计划失效条件</h4><ul><li v-for="(line, index) in current.result.trade_plan.invalidators || []" :key="index">{{ line }}</li></ul>

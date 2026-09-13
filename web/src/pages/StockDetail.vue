@@ -918,8 +918,8 @@ function renderFinanceChart() {
       { type: 'value', scale: true, splitLine: { show: false }, axisLabel: { formatter: '{value}%', fontSize: 10 } },
     ],
     series: [
-      { type: 'bar', name: '营收(亿)', data: inds.map((r) => Math.round(r.revenue / 1e6) / 100), itemStyle: { color: withAlpha(primary, 0.75) }, barMaxWidth: 22 },
-      { type: 'bar', name: '净利(亿)', data: inds.map((r) => Math.round(r.net_profit / 1e6) / 100), itemStyle: { color: withAlpha(up, 0.75) }, barMaxWidth: 22 },
+      { type: 'bar', name: '营收(亿)', data: inds.map((r) => r.revenue == null ? null : Math.round(r.revenue / 1e6) / 100), itemStyle: { color: withAlpha(primary, 0.75) }, barMaxWidth: 22 },
+      { type: 'bar', name: '净利(亿)', data: inds.map((r) => r.net_profit == null ? null : Math.round(r.net_profit / 1e6) / 100), itemStyle: { color: withAlpha(up, 0.75) }, barMaxWidth: 22 },
       { type: 'line', name: 'ROE%', yAxisIndex: 1, data: inds.map((r) => r.roe), symbolSize: 5, lineStyle: { width: 2, color: warn }, itemStyle: { color: warn } },
       { type: 'line', name: '毛利率%', yAxisIndex: 1, data: inds.map((r) => r.gross_margin), symbolSize: 5, lineStyle: { width: 2, type: 'dashed', color: vars.value.infoColor }, itemStyle: { color: vars.value.infoColor } },
     ],
@@ -930,6 +930,10 @@ const finLatest = computed(() => {
   const inds = finance.value?.indicators
   return inds?.length ? inds[inds.length - 1] : null
 })
+
+function fmtFinance(value: number | null, digits = 2, unit = '') {
+  return value == null || !Number.isFinite(value) ? '缺失' : value.toFixed(digits) + unit
+}
 
 // 主力资金图（M3a）：逐日主力净额柱（红入绿出，亿元）+ 累计净额线（右轴）。
 function renderFundFlowChart() {
@@ -1704,17 +1708,17 @@ function scoreType(total: number) {
           <div v-if="finance && finance.indicators.length" class="fin-wrap">
             <div v-if="finLatest" class="quote-grid fin-grid">
               <div class="qc"><span class="qc-k">报告期</span><span class="qc-v">{{ finLatest.report_name }}</span></div>
-              <div class="qc"><span class="qc-k">EPS</span><span class="qc-v qv-tnum">{{ finLatest.eps.toFixed(2) }}</span></div>
-              <div class="qc"><span class="qc-k">ROE</span><span class="qc-v qv-tnum">{{ finLatest.roe.toFixed(2) }}%</span></div>
-              <div class="qc"><span class="qc-k">营收同比</span><span class="qc-v qv-tnum" :style="{ color: pctColor(finLatest.revenue_yoy) }">{{ finLatest.revenue_yoy.toFixed(1) }}%</span></div>
-              <div class="qc"><span class="qc-k">净利同比</span><span class="qc-v qv-tnum" :style="{ color: pctColor(finLatest.net_profit_yoy) }">{{ finLatest.net_profit_yoy.toFixed(1) }}%</span></div>
-              <div class="qc"><span class="qc-k">毛利率</span><span class="qc-v qv-tnum">{{ finLatest.gross_margin.toFixed(1) }}%</span></div>
-              <div class="qc"><span class="qc-k">净利率</span><span class="qc-v qv-tnum">{{ finLatest.net_margin.toFixed(1) }}%</span></div>
-              <div class="qc"><span class="qc-k">资产负债率</span><span class="qc-v qv-tnum">{{ finLatest.debt_ratio.toFixed(1) }}%</span></div>
-              <div class="qc"><span class="qc-k">每股经营现金流</span><span class="qc-v qv-tnum">{{ finLatest.ocf_ps.toFixed(2) }}</span></div>
+              <div class="qc"><span class="qc-k">EPS</span><span class="qc-v qv-tnum">{{ fmtFinance(finLatest.eps) }}</span></div>
+              <div class="qc"><span class="qc-k">本期累计 ROE</span><span class="qc-v qv-tnum">{{ fmtFinance(finLatest.roe, 2, '%') }}</span></div>
+              <div class="qc"><span class="qc-k">营收同比</span><span class="qc-v qv-tnum" :style="{ color: pctColor(finLatest.revenue_yoy ?? 0) }">{{ fmtFinance(finLatest.revenue_yoy, 1, '%') }}</span></div>
+              <div class="qc"><span class="qc-k">净利同比</span><span class="qc-v qv-tnum" :style="{ color: pctColor(finLatest.net_profit_yoy ?? 0) }">{{ fmtFinance(finLatest.net_profit_yoy, 1, '%') }}</span></div>
+              <div class="qc"><span class="qc-k">毛利率</span><span class="qc-v qv-tnum">{{ fmtFinance(finLatest.gross_margin, 1, '%') }}</span></div>
+              <div class="qc"><span class="qc-k">净利率</span><span class="qc-v qv-tnum">{{ fmtFinance(finLatest.net_margin, 1, '%') }}</span></div>
+              <div class="qc"><span class="qc-k">资产负债率</span><span class="qc-v qv-tnum">{{ fmtFinance(finLatest.debt_ratio, 1, '%') }}</span></div>
+              <div class="qc"><span class="qc-k">每股经营现金流</span><span class="qc-v qv-tnum">{{ fmtFinance(finLatest.ocf_ps) }}</span></div>
             </div>
             <div ref="finEl" class="fin-chart"></div>
-            <div class="src-hint">季报为累计口径且有披露滞后；0 值可能表示上游数据缺失；仅研究参考。</div>
+            <div class="src-hint">季报为累计口径且有披露滞后，ROE 不宜直接跨不同季度比较；缺失单独标注，0 表示已知为零。</div>
           </div>
           <n-alert v-else-if="coverageErrors.finance" type="error" :bordered="false">财务读取失败：{{ coverageErrors.finance }}</n-alert>
           <n-empty v-else description="暂无已确认披露的财务数据（东财 F10，可稍后刷新）" />

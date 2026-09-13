@@ -95,10 +95,10 @@ func TestResolveRecStrategyBuiltinScreen(t *testing.T) {
 		{model.RecTypeShortTerm, "screen:shrink-pullback-ma20", "pullback"},
 		{model.RecTypeShortTerm, "screen:macd-gold-water", "momentum"},  // 水上金叉侧重趋势
 		{model.RecTypeShortTerm, "screen:bull-align-trend", "momentum"}, // 多头排列侧重趋势
-		{model.RecTypeLongTerm, "screen:bull-align-trend", "leader"},    // 长线下沿用 leader 映射
-		{model.RecTypeLongTerm, "screen:vol-break-20d", "growth"},       // 长线下 short → growth
-		{model.RecTypeLongTerm, "screen:year-line-stand", "leader"},     // 站稳年线侧重稳定性
-		{model.RecTypeLongTerm, "tpl:low-price-steady", "leader"},
+		{model.RecTypeLongTerm, "screen:bull-align-trend", "momentum"},  // 周期不改变趋势侧重
+		{model.RecTypeLongTerm, "screen:vol-break-20d", "momentum"},
+		{model.RecTypeLongTerm, "screen:year-line-stand", "pullback"},
+		{model.RecTypeLongTerm, "tpl:low-price-steady", "pullback"},
 		{model.RecTypeShortTerm, "tpl:volume-breakout", "momentum"},
 	}
 	for _, c := range cases {

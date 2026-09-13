@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import { NButton, NDatePicker, NForm, NFormItem, NInput, NSelect, NSwitch, NTag } from 'naive-ui'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { NAlert, NButton, NDatePicker, NForm, NFormItem, NInput, NSelect, NSwitch, NTag } from 'naive-ui'
 import type { AnalyzeRequest, AnalysisModule } from '@/api/analysis'
+import { listStrategies, type RecType, type Strategy } from '@/api/recommendation'
+import { getSessionEpoch } from '@/api/token'
 import type { StockRef } from '@/composables/useStockActions'
 import SectionCard from '@/components/SectionCard.vue'
 import StockIdentity from '@/components/StockIdentity.vue'
@@ -12,6 +14,44 @@ const selectedStock = defineModel<StockRef | null>('selectedStock', { required: 
 const panelMode = defineModel<boolean>('panelMode', { required: true })
 const verifyMode = defineModel<boolean>('verifyMode', { required: true })
 const asOfTs = defineModel<number | null>('asOfTs', { required: true })
+const priceStrategies = ref<Strategy[]>([])
+const priceLoading = ref(false)
+const priceError = ref('')
+let priceSequence = 0
+let disposed = false
+const priceSession = getSessionEpoch()
+onBeforeUnmount(() => { disposed = true; priceSequence++ })
+const priceHorizon = computed(() => form.value.price_horizon || 'short_term')
+const priceStrategy = computed(() => form.value.price_strategy || (priceHorizon.value === 'long_term' ? 'value' : 'momentum'))
+const priceOptions = computed(() => {
+  const options = priceStrategies.value.map(item => ({ label: item.name, value: item.key }))
+  if (!options.some(item => item.value === priceStrategy.value)) options.unshift({ label: `已选策略：${priceStrategy.value}`, value: priceStrategy.value })
+  return options
+})
+async function loadPriceStrategies() {
+  if (form.value.module !== 'stock') return
+  const sequence = ++priceSequence
+  priceLoading.value = true
+  priceError.value = ''
+  try {
+    const result = await listStrategies(priceHorizon.value)
+    if (!disposed && sequence === priceSequence && getSessionEpoch() === priceSession) priceStrategies.value = result
+  } catch {
+    if (!disposed && sequence === priceSequence && getSessionEpoch() === priceSession) priceError.value = '价格策略列表读取失败，可重新加载。'
+  } finally {
+    if (!disposed && sequence === priceSequence) priceLoading.value = false
+  }
+}
+function setPriceHorizon(value: RecType) {
+  form.value.price_horizon = value
+  form.value.price_strategy = value === 'long_term' ? 'value' : 'momentum'
+  form.value.price_strategy_revision_id = undefined
+}
+function setPriceStrategy(value: string) {
+  form.value.price_strategy = value
+  form.value.price_strategy_revision_id = priceStrategies.value.find(item => item.key === value)?.strategy_revision_id
+}
+watch([() => form.value.module, priceHorizon], loadPriceStrategies, { immediate: true })
 
 const props = defineProps<{
   moduleOptions: Array<{ label: string; value: AnalysisModule }>
@@ -75,6 +115,16 @@ function dateDisabled(ts: number) {
         <n-date-picker v-model:value="asOfTs" type="date" clearable :is-date-disabled="dateDisabled" placeholder="留空为当前分析" />
       </n-form-item>
       <p class="field-help">{{ periodExplanation }}</p>
+      <template v-if="needSymbol && !asOf && !panelMode">
+        <n-form-item label="价格计划周期">
+          <n-select :value="priceHorizon" :options="[{ label: '短线', value: 'short_term' }, { label: '长线', value: 'long_term' }]" @update:value="setPriceHorizon" />
+        </n-form-item>
+        <n-form-item label="价格计划策略">
+          <n-select :value="priceStrategy" :options="priceOptions" :loading="priceLoading" filterable @update:value="setPriceStrategy" />
+        </n-form-item>
+        <n-alert v-if="priceError" type="warning" :bordered="false">{{ priceError }} <n-button text @click="loadPriceStrategies">重新加载</n-button></n-alert>
+        <p class="field-help">与推荐追踪共用买卖价算法。对比时请选择相同策略和周期，并核对数据时点；只调整这些选项不会调用 AI。</p>
+      </template>
       <n-form-item v-if="form.module === 'stock' && !asOf" label="多角色观点">
         <n-switch v-model:value="panelMode" />
         <span class="switch-help">技术 / 动量 / 风控 / 反方四个独立视角</span>

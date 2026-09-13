@@ -185,7 +185,8 @@ func TestLabelResumeUsesSignalNameForLimit(t *testing.T) {
 			t.Run(source+map[bool]string{false: "_后来ST", true: "_后来摘帽"}[wasST], func(t *testing.T) {
 				setupTestDB(t)
 				cleanLabelTables(t)
-				date := time.Now().AddDate(0, 0, -10)
+				// 名称冻结用例固定在主板 ST 仍为 5% 的历史区间，不能随运行日期漂移到新规后。
+				date := time.Date(2026, 6, 23, 0, 0, 0, 0, time.Local)
 				oldName, newName := "本地股票", "ST本地"
 				if wasST {
 					oldName, newName = newName, oldName

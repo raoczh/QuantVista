@@ -91,6 +91,7 @@ func main() {
 	router.SetApiRouter(engine, mgr)
 	// 市场维护已统一进入 JobRuntime，必须在 handler 注册与恢复完成后启动调度器。
 	service.StartMarketJobs(mgr)
+	service.StartBrowserNotificationJobs()
 	router.SetWebRouter(engine, webFS)
 
 	addr := ":" + common.Port

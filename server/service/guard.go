@@ -485,7 +485,7 @@ func (s *GuardService) evaluateGuardUser(ctx context.Context, userID int64, cfg 
 		if unconfirmed[p.ID] || positionCurrencyIssue(p, defaultCurrencyFor(p.Market)) != "" {
 			posConfig.StopLoss, posConfig.TakeProfit = false, false
 		}
-		for _, h := range evalPositionGuard(p, posConfig, obs, limitUpPctFor(p.Symbol, orSymbol(q.Name, p.Name))) {
+		for _, h := range evalPositionGuard(p, posConfig, obs, limitUpPctForDate(p.Symbol, orSymbol(q.Name, p.Name), q.DataTime.In(time.Local).Format("2006-01-02"))) {
 			if created, eventID := recordGuardEventWithIDContext(ctx, userID, tradeDate, h, p); created {
 				h.EventID = eventID
 				newHits = append(newHits, h)
@@ -501,7 +501,7 @@ func (s *GuardService) evaluateGuardUser(ctx context.Context, userID int64, cfg 
 			continue
 		}
 		obs := guardObs{Price: q.Price, DayHigh: q.High, DayLow: q.Low, ChangePct: q.ChangePct}
-		if h := evalWatchGuard(it, cfg, obs, limitUpPctFor(it.Symbol, orSymbol(q.Name, it.Name))); h != nil {
+		if h := evalWatchGuard(it, cfg, obs, limitUpPctForDate(it.Symbol, orSymbol(q.Name, it.Name), q.DataTime.In(time.Local).Format("2006-01-02"))); h != nil {
 			if created, eventID := recordGuardEventWithIDContext(ctx, userID, tradeDate, *h); created {
 				h.EventID = eventID
 				newHits = append(newHits, *h)

@@ -115,6 +115,20 @@ var factorDefs = []factorDef{
 	{"vol_5v20", "量能趋势", "量能", fkRatio, "5 日均量 / 20 日均量"},
 	// 指标（T1 口径）
 	{"rsi_14", "RSI(14)", "指标", fkRatio, "Wilder 平滑 RSI"},
+	{"rsi_prior5_min", "此前5日最低RSI", "指标", fkRatio, "不含最新日的前5日 RSI14 最小值；需要完整 RSI 窗口"},
+	{"rsi_rising", "RSI回升", "指标", fkBool, "最新完整日 RSI14 高于上一日"},
+	{"body_pct", "阳线实体涨幅", "形态", fkPct, "(收盘/开盘-1)×100，避免把高开低走误当长阳"},
+	{"boll_lower_reclaim", "布林下轨收复", "形态", fkBool, "触及昨日已知下轨后收在其上，且收盘高于昨日"},
+	{"ma20_cross_ma60", "MA20上穿MA60", "形态", fkBool, "近3日出现 MA20 上穿 MA60，当前仍在其上；至少63根日线"},
+	{"donchian55_break", "55日通道突破", "形态", fkBool, "收盘严格高于此前55日最高价，不含当日；至少56根日线"},
+	{"boll_squeeze_break", "布林收口突破", "形态", fkBool, "昨日带宽处于此前60个完整带宽观测的最低30%，今日收盘突破昨日上轨；至少80根"},
+	{"breakout_retest", "突破平台回踩确认", "形态", fkBool, "2～10日前放量突破前20日高点，之后回踩原平台并企稳，中间未明显失守"},
+	{"breakout_retest_level", "回踩平台价", "形态", fkPrice, "最近2～10日前放量突破的平台价，单独有价不表示回踩已确认"},
+	{"kdj_k", "KDJ K(9,3,3)", "指标", fkRatio, "9日 RSV 的1/3递推，初值50；至少30根"},
+	{"kdj_d", "KDJ D(9,3,3)", "指标", fkRatio, "K 的1/3递推，初值50；至少30根"},
+	{"kdj_j", "KDJ J(9,3,3)", "指标", fkRatio, "3K-2D，允许低于0或高于100"},
+	{"kdj_low_cross", "KDJ低位金叉", "形态", fkBool, "昨日K≤D且两者<30，今日K>D；只认最新完整日"},
+	{"day_limit_ratio", "日涨幅/板块涨停幅度", "涨停", fkRatio, "收盘涨幅除板块常规涨停幅度；不代表已封板，上市初期不适用"},
 	{"macd_dif", "MACD DIF", "指标", fkRatio, "12/26 EMA 差"},
 	{"macd_dea", "MACD DEA", "指标", fkRatio, "DIF 的 9 日 EMA"},
 	{"macd_hist", "MACD柱", "指标", fkRatio, "2×(DIF−DEA)，A 股口径"},
@@ -140,6 +154,7 @@ var factorDefs = []factorDef{
 	// 推荐研究的 PIT 原始观测；随每日快照保存，历史评估无需用今天的日线反推旧特征。
 	{"rq_atr", "信号前ATR", "机会质量", fkPrice, "信号日之前的 ATR(14)，避免突破自身振幅稀释延伸距离"},
 	{"rq_breakout_level", "本段突破参照", "机会质量", fkPrice, "连续创高段开始前的 20 日收盘高点，最多回看 10 日"},
+	{"rq_breakout_atr", "突破起点ATR", "机会质量", fkPrice, "本段连续突破开始前的 ATR，防止上涨后的放大波动稀释延伸距离"},
 	{"rq_breakout_dist", "距突破参照ATR", "机会质量", fkRatio, "收盘距本段突破参照的 ATR 倍数"},
 	{"rq_ma20_dist", "距MA20的ATR", "机会质量", fkRatio, "收盘距 MA20 的 ATR 倍数"},
 	{"rq_compression", "整理振幅比", "机会质量", fkRatio, "信号前 5 日/20 日平均真实振幅，比值小于 1 为收敛"},
@@ -276,6 +291,10 @@ func computeWideRowOpts(symbol string, meta wideStockMeta, bars []datasource.Bar
 	}
 	last := bars[n-1]
 	price := last.Close
+	limitName := meta.Name
+	if meta.ST {
+		limitName = "ST" + limitName
+	}
 	if price <= 0 {
 		return vals
 	}
@@ -287,7 +306,7 @@ func computeWideRowOpts(symbol string, meta wideStockMeta, bars []datasource.Bar
 		key   string
 		value *float64
 	}{
-		{"rq_atr", q.ATR}, {"rq_breakout_level", q.BreakoutLevel}, {"rq_breakout_dist", q.BreakoutDistanceATR}, {"rq_ma20_dist", q.MA20DistanceATR},
+		{"rq_atr", q.ATR}, {"rq_breakout_level", q.BreakoutLevel}, {"rq_breakout_atr", q.BreakoutATR}, {"rq_breakout_dist", q.BreakoutDistanceATR}, {"rq_ma20_dist", q.MA20DistanceATR},
 		{"rq_compression", q.Compression}, {"rq_volume_contract", q.VolumeContraction}, {"rq_close_location", q.CloseLocation}, {"rq_upper_wick", q.UpperWick},
 		{"rq_range_shock", q.RangeShock}, {"rq_efficiency20", q.Efficiency20}, {"rq_demand5", q.DemandBalance5}, {"rq_pullback_depth", q.PullbackDepthATR},
 		{"rq_support", q.Support}, {"rq_support_dist", q.SupportDistanceATR}, {"rq_resistance", q.Resistance}, {"rq_resistance_dist", q.ResistanceDistanceATR},
@@ -334,6 +353,10 @@ func computeWideRowOpts(symbol string, meta wideStockMeta, bars []datasource.Bar
 	}
 	if n >= 2 && closes[n-2] > 0 {
 		set("chg_pct", round2((price/closes[n-2]-1)*100))
+		set("day_limit_ratio", (price/closes[n-2]-1)*100/limitUpPctForDate(symbol, limitName, bars[n-1].TradeDate))
+	}
+	for key, value := range commonSetupFactors(bars) {
+		set(key, value)
 	}
 
 	// 均线族（movingAverage 不满窗返回 !ok → 保持 NaN）
@@ -410,10 +433,10 @@ func computeWideRowOpts(symbol string, meta wideStockMeta, bars []datasource.Bar
 	if len(win60) > 60 {
 		win60 = win60[len(win60)-60:]
 	}
-	if v, ok := rangePos(win60); ok {
+	if v, ok := rangePos(win60); ok && n >= 60 {
 		set("pos_60", v)
 	}
-	if v, ok := rangePos(bars); ok {
+	if v, ok := rangePos(bars); ok && n >= 250 {
 		set("pos_250", v) // bars 已截尾 ≤250
 	}
 	// 创 N 日新高：收盘 ≥ 前 N 根收盘最大值（recfactor High20d 同口径，收盘假突破更少）
@@ -427,7 +450,7 @@ func computeWideRowOpts(symbol string, meta wideStockMeta, bars []datasource.Bar
 				maxPrev = c
 			}
 		}
-		return closes[n-1] >= maxPrev, true
+		return closes[n-1] > maxPrev, true
 	}
 	if v, ok := newHigh(20); ok {
 		setBool("high_20d", v)
@@ -435,14 +458,14 @@ func computeWideRowOpts(symbol string, meta wideStockMeta, bars []datasource.Bar
 	if v, ok := newHigh(60); ok {
 		setBool("high_60d", v)
 	}
-	if n >= 30 { // 年内新高允许不满 250 根（上市即满足语义），但样本太少无意义
+	if n >= 250 { // 不把上市30日新高包装成近一年新高。
 		maxPrev := closes[0]
 		for _, c := range closes[:n-1] {
 			if c > maxPrev {
 				maxPrev = c
 			}
 		}
-		setBool("high_250d", closes[n-1] >= maxPrev)
+		setBool("high_250d", closes[n-1] > maxPrev)
 	}
 
 	// 近 20 日波动率/回撤（recfactor 同口径）
@@ -450,14 +473,14 @@ func computeWideRowOpts(symbol string, meta wideStockMeta, bars []datasource.Bar
 	if len(w20) > 20 {
 		w20 = w20[len(w20)-20:]
 	}
-	if len(w20) >= 2 {
+	if n >= 21 {
 		var rets []float64
-		for i := 1; i < len(w20); i++ {
-			if w20[i-1].Close > 0 {
-				rets = append(rets, (w20[i].Close-w20[i-1].Close)/w20[i-1].Close*100)
-			}
+		for i := n - 20; i < n; i++ {
+			rets = append(rets, (closes[i]/closes[i-1]-1)*100)
 		}
 		set("volatility_20", round2(stddev(rets)))
+	}
+	if n >= 20 {
 		peak := w20[0].High
 		worst := 0.0
 		for _, b := range w20 {
@@ -534,12 +557,12 @@ func computeWideRowOpts(symbol string, meta wideStockMeta, bars []datasource.Bar
 		setBool("macd_cross_up", crossUp)
 	}
 
-	// 涨停（板块阈值 = limitUpPctFor − 0.2：主板 9.8 / 创业科创 19.8 / ST 4.8）
-	limitThreshold := limitUpPctFor(symbol, meta.Name) - 0.2
+	// 逐根使用交易日当时的板块规则，跨政策生效日不能沿用单个最新阈值。
 	isLimitUp := func(i int) (bool, bool) {
 		if i < 1 || closes[i-1] <= 0 {
 			return false, false
 		}
+		limitThreshold := limitUpPctForDate(symbol, limitName, bars[i].TradeDate) - 0.2
 		return (closes[i]/closes[i-1]-1)*100 >= limitThreshold, true
 	}
 	if v, ok := isLimitUp(n - 1); ok {

@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const recommendationPreselectionVersion = "ps1"
+const recommendationPreselectionVersion = "ps2"
 
 // 预选只读取本地收盘因子，负责决定有限的富化预算；不能冒充最终推荐分。
 type recPreselection struct {
@@ -26,7 +26,11 @@ type recPreselection struct {
 
 func bounded(v, lo, hi float64) float64 { return math.Max(lo, math.Min(hi, v)) }
 
-func recommendationWidePreselection(t *FactorTable, i int, profile string) *recPreselection {
+func recommendationWidePreselection(t *FactorTable, i int, profile string, intents ...string) *recPreselection {
+	intent := ""
+	if len(intents) > 0 {
+		intent = intents[0]
+	}
 	out := &recPreselection{Version: recommendationPreselectionVersion, Profile: profile, TradeDate: t.LastDates[i], Status: "ready", Values: map[string]float64{}}
 	get := func(key string) (float64, bool) {
 		col := t.Col(key)
@@ -79,6 +83,14 @@ func recommendationWidePreselection(t *FactorTable, i int, profile string) *recP
 	bias, biasOK := get("bias_20")
 	if atrOK && atr > 0 && biasOK {
 		distance := bias / atr
+		if col := t.Col("rq_ma20_dist"); i < len(col) && finiteRecNumber(col[i]) {
+			distance = col[i]
+		}
+		if profile == "momentum" {
+			if col := t.Col("rq_breakout_dist"); i < len(col) && finiteRecNumber(col[i]) {
+				distance = math.Max(distance, col[i])
+			}
+		}
 		// ATR 归一化使不同波动率股票可比较；不统一压低所有涨幅。
 		entry = bounded(100-math.Abs(distance)*22, 0, 100)
 		if profile == "momentum" || profile == "growth" {
@@ -95,7 +107,23 @@ func recommendationWidePreselection(t *FactorTable, i int, profile string) *recP
 	}
 	// 预选没有 PIT 财务面，value/leader 只按流动性、风险和支撑距离分配研究预算。
 	wt, wm, we, wv, wr := strategyDimWeights("", profile)
-	if profile == "momentum" || profile == "growth" {
+	if intent == "reversal" {
+		wt, wm, we, wv, wr = .10, .05, .35, .10, .40
+		entry = 30
+		if v, ok := get("rq_stabilized"); ok && v == 1 {
+			entry += 40
+		}
+		if v, ok := get("rsi_rising"); ok && v == 1 {
+			entry += 15
+		}
+	}
+	if intent == "consolidation" {
+		wt, wm, we, wv, wr = .25, .05, .15, .10, .45
+		if v, ok := get("vol_5v20"); ok {
+			volume = bounded(100-math.Abs(v-.8)*60, 0, 100)
+		}
+	}
+	if (profile == "momentum" || profile == "growth") && intent != "reversal" && intent != "consolidation" {
 		wm -= 0.10
 		we += 0.10
 	}
@@ -131,10 +159,10 @@ func preselectionBefore(a, b *recPreselection) (bool, bool) {
 	return false, false
 }
 
-func rankRecommendationScan(t *FactorTable, idxs []int, profile string, limit int) map[int]*recPreselection {
+func rankRecommendationScan(t *FactorTable, idxs []int, profile string, limit int, intents ...string) map[int]*recPreselection {
 	facts := make(map[int]*recPreselection, len(idxs))
 	for _, i := range idxs {
-		facts[i] = recommendationWidePreselection(t, i, profile)
+		facts[i] = recommendationWidePreselection(t, i, profile, intents...)
 	}
 	sort.SliceStable(idxs, func(a, b int) bool {
 		if before, decided := preselectionBefore(facts[idxs[a]], facts[idxs[b]]); decided {
@@ -156,7 +184,7 @@ func rankRecommendationScan(t *FactorTable, idxs []int, profile string, limit in
 }
 
 // 使用已经发布的不可变宽表，不在推荐请求里额外触发一次全市场重建。
-func preselectRecommendationPool(pool []candidate, profile string) {
+func preselectRecommendationPool(pool []candidate, profile string, intents ...string) {
 	factorTableMu.RLock()
 	t := factorTableCur
 	factorTableMu.RUnlock()
@@ -186,7 +214,7 @@ func preselectRecommendationPool(pool []candidate, profile string) {
 		if len(asOf) < 16 || date > asOf[:10] || (date == asOf[:10] && asOf[11:] < "15:00") {
 			continue
 		}
-		pool[i].Preselection = recommendationWidePreselection(t, row, profile)
+		pool[i].Preselection = recommendationWidePreselection(t, row, profile, intents...)
 	}
 }
 

@@ -416,9 +416,9 @@ func compareRankingResearch(a, b RankingResearchMetric, horizon int, targets ...
 
 func evaluateRankingResearch(req RankingResearchRequest, d *rankingResearchDataset, contexts ...context.Context) *RankingResearchReport {
 	ctx := jobSubmissionContext(contexts...)
-	rep := &RankingResearchReport{Version: rankingResearchVersion, Request: req, DatasetHash: d.Hash, OutcomeVersion: model.SelectionOutcomeVersion, FeatureVersion: "of1 / fv6 / sq1", Coverage: d.Coverage, GeneratedAt: time.Now(), Notes: []string{
+	rep := &RankingResearchReport{Version: rankingResearchVersion, Request: req, DatasetHash: d.Hash, OutcomeVersion: model.SelectionOutcomeVersion, FeatureVersion: recommendationOptimizationFactVersion + " / " + factorSnapshotVersion + " / " + recommendationSignalVersion, Coverage: d.Coverage, GeneratedAt: time.Now(), Notes: []string{
 		"只读取冻结特征；日线只计算结果，不参与重建历史特征。缺少新字段的旧快照不会伪装完整样本。",
-		"原加法评分、新质量评分与 ridge 基线使用相同机会集、TopK 和 so2 费用执行器。每组先排序再核对结果，未成交不补选下一只。",
+		fmt.Sprintf("原加法评分、新质量评分与 ridge 基线使用相同机会集、TopK 和 %s 费用执行器。每组先排序再核对结果，未成交不补选下一只。", model.SelectionOutcomeVersion),
 		"未成交拨款按现金观察到同一持有期；行情缺失、未成熟和强制退出单列，不当作零收益。均值按信号日期聚合，不把重叠持仓复利成年化收益。",
 		"训练标签必须在下一阶段开始前成熟；验证段仅选择正则参数，测试段不调参。区间采用持有期长度的日期块重采样。",
 		"学习分仅用于排序，不是获利概率。训练目标按固定 ±50% 限制异常值，测试收益保持原值。",

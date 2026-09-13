@@ -58,7 +58,8 @@ export interface DecisionSummaryInput {
   now?: Date
 }
 
-function signedPct(value: number) {
+function signedPct(value: number | null) {
+  if (value == null || !Number.isFinite(value)) return '缺失'
   return `${value > 0 ? '+' : ''}${value.toFixed(2)}%`
 }
 
@@ -66,7 +67,8 @@ function signedAmount(value: number) {
   return `${value > 0 ? '+' : ''}${value.toFixed(2)} 元`
 }
 
-function toneFor(value: number): DecisionTone {
+function toneFor(value: number | null): DecisionTone {
+  if (value == null || !Number.isFinite(value)) return 'unknown'
   if (value > 0) return 'positive'
   if (value < 0) return 'negative'
   return 'neutral'
@@ -267,10 +269,11 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
       title: financeNote ? '最近已知财务变化' : '最新财务变化',
       value: `营收 ${signedPct(latestFinance.revenue_yoy)} · 净利 ${signedPct(latestFinance.net_profit_yoy)}`,
       detail: `${latestFinance.report_name}累计口径，财报披露存在滞后。${financeNote}`,
-      evidence: `ROE ${latestFinance.roe.toFixed(2)}%，毛利率 ${latestFinance.gross_margin.toFixed(2)}%`,
+      evidence: `本期累计 ROE ${signedPct(latestFinance.roe)}，毛利率 ${signedPct(latestFinance.gross_margin)}`,
       source: '东财 F10',
       asOf: latestFinance.report_date,
-      tone: toneFor(Math.min(latestFinance.revenue_yoy, latestFinance.net_profit_yoy)),
+      tone: toneFor(latestFinance.revenue_yoy == null || latestFinance.net_profit_yoy == null
+        ? null : Math.min(latestFinance.revenue_yoy, latestFinance.net_profit_yoy)),
     })
   }
 
@@ -323,15 +326,17 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
     })
   }
 
-  if (latestFinance && (latestFinance.net_profit_yoy < 0 || latestFinance.debt_ratio >= 70)) {
+  const profitDeclining = latestFinance?.net_profit_yoy != null && latestFinance.net_profit_yoy < 0
+  const debtHigh = latestFinance?.debt_ratio != null && latestFinance.debt_ratio >= 70
+  if (latestFinance && (profitDeclining || debtHigh)) {
     risks.push({
       id: 'finance-risk',
-      title: latestFinance.net_profit_yoy < 0 ? '净利润同比下降' : '资产负债率较高',
-      value: latestFinance.net_profit_yoy < 0
+      title: profitDeclining ? '净利润同比下降' : '资产负债率较高',
+      value: profitDeclining
         ? signedPct(latestFinance.net_profit_yoy)
-        : `${latestFinance.debt_ratio.toFixed(2)}%`,
+        : signedPct(latestFinance.debt_ratio),
       detail: '这是按财务字段阈值呈现的关注项，不是对公司价值的结论。',
-      evidence: `净利同比 ${latestFinance.net_profit_yoy.toFixed(2)}%；资产负债率 ${latestFinance.debt_ratio.toFixed(2)}%`,
+      evidence: `净利同比 ${signedPct(latestFinance.net_profit_yoy)}；资产负债率 ${signedPct(latestFinance.debt_ratio)}`,
       source: '东财 F10',
       asOf: latestFinance.report_date,
       tone: 'warning',

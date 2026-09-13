@@ -47,7 +47,7 @@ type WebPushSubscription struct {
 	UserID   int64 `gorm:"index;uniqueIndex:idx_webpush_owner_device,priority:1" json:"user_id"`
 	DeviceID int64 `gorm:"index;uniqueIndex:idx_webpush_owner_device,priority:2" json:"device_id"`
 
-	EndpointHash   string `gorm:"size:64;uniqueIndex:idx_webpush_endpoint" json:"-"`
+	EndpointHash string `gorm:"size:64;uniqueIndex:idx_webpush_endpoint" json:"-"`
 	// 加密后的 endpoint 会比原始 URL 增长约三分之一；原始输入允许到 2000
 	// 字符，2048 在极长但合法的浏览器 endpoint 上不够容纳密文。
 	EndpointCipher string `gorm:"size:4096" json:"-"`
@@ -95,6 +95,11 @@ type BrowserNotificationDelivery struct {
 	ForegroundAckAt *time.Time `json:"foreground_ack_at"`
 	LastErrorCode   string     `gorm:"size:48" json:"last_error_code"`
 	AttemptCount    int        `gorm:"not null;default:0" json:"attempt_count"`
+	// HTTP 成功只代表推送服务接收；页面展示回执单独保留。租约与重试使用 UTC 毫秒，
+	// 避免 MySQL datetime 精度和不同时区导致并发认领失效。
+	NextPushAtMS     int64  `gorm:"not null;default:0;index" json:"-"`
+	PushLeaseUntilMS int64  `gorm:"not null;default:0" json:"-"`
+	PushLeaseToken   string `gorm:"size:64" json:"-"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`

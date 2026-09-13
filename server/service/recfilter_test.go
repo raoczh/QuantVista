@@ -101,7 +101,7 @@ func TestLimitUpHelpers(t *testing.T) {
 		{"600001", "ST某某", 5},
 	}
 	for _, tc := range cases {
-		if got := limitUpPctFor(tc.symbol, tc.name); got != tc.want {
+		if got := limitUpPctForDate(tc.symbol, tc.name, "2026-07-03"); got != tc.want {
 			t.Errorf("%s(%s): 涨停幅应为 %v，得到 %v", tc.symbol, tc.name, tc.want, got)
 		}
 	}

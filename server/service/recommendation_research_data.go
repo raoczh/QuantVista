@@ -20,7 +20,7 @@ import (
 	"gorm.io/gorm"
 )
 
-const rankingResearchVersion = "rr1"
+const rankingResearchVersion = "rr2"
 
 type RankingResearchRequest struct {
 	Source     string `json:"source" form:"source"` // recommendations / snapshots
@@ -120,7 +120,7 @@ type RankingResearchCoverage struct {
 	Sampling        string         `json:"sampling"`
 }
 
-var rankingFeatureNames = []string{"trend", "momentum", "position", "volume", "risk", "ma20_distance_atr", "breakout_distance_atr", "compression", "volume_contraction", "close_location", "efficiency_20", "demand_5", "pe_ttm", "roe", "revenue_growth", "profit_growth"}
+var rankingFeatureNames = []string{"trend", "momentum", "position", "volume", "risk", "ma20_distance_atr", "breakout_distance_atr", "compression", "volume_contraction", "close_location", "efficiency_20", "demand_5", "pe_ttm", "annual_roe", "revenue_growth", "profit_growth"}
 
 type rankingResearchSample struct {
 	Key, Group, Date, Symbol, Industry string
@@ -158,10 +158,12 @@ func rankingCandidateFeatures(c candidate) []float64 {
 		x[12] = math.Log1p(math.Min(c.PETTM, 500))
 	}
 	if c.Fin != nil {
-		// 旧财务摘要的单字段零值无法区分未提供和真实零，学习时保守视作缺失。
-		for i, v := range []float64{c.Fin.ROE, c.Fin.RevenueYoY, c.Fin.NetProfitYoY} {
-			if v != 0 && finiteRecNumber(v) {
-				x[13+i] = bounded(v, -100, 200)
+		if c.Fin.hasAnnualROE() {
+			x[13] = bounded(*c.Fin.AnnualROE, -100, 200)
+		}
+		for i, v := range []*float64{c.Fin.RevenueYoY, c.Fin.NetProfitYoY} {
+			if c.Fin.has(v) {
+				x[14+i] = bounded(*v, -100, 200)
 			}
 		}
 	}
@@ -365,7 +367,7 @@ func appendRecommendationResearchGroup(events []model.RecommendationCandidateEve
 }
 
 func snapshotResearchCandidate(row model.FactorSnapshotDaily, u model.StockUniverseDaily, req RankingResearchRequest) (candidate, bool) {
-	if row.FactorVersion != "fv6" || row.DataQuality != "" || row.LastBarDate != row.TradeDate || row.Market != "cn" || u.Symbol != row.Symbol || u.TradeDate != row.TradeDate || u.IsST || u.Suspended || u.Market != "cn" || isCNFund(row.Symbol) || strings.HasPrefix(row.Symbol, "4") || strings.HasPrefix(row.Symbol, "8") || strings.HasPrefix(row.Symbol, "92") {
+	if row.FactorVersion != factorSnapshotVersion || row.DataQuality != "verified_adjustment" || row.LastBarDate != row.TradeDate || row.Market != "cn" || u.Symbol != row.Symbol || u.TradeDate != row.TradeDate || u.IsST || u.Suspended || u.Market != "cn" || isCNFund(row.Symbol) || strings.HasPrefix(row.Symbol, "4") || strings.HasPrefix(row.Symbol, "8") || strings.HasPrefix(row.Symbol, "92") {
 		return candidate{}, false
 	}
 	closeTime, err := time.ParseInLocation("2006-01-02 15:04", row.TradeDate+" 15:00", time.Local)
@@ -397,6 +399,7 @@ func snapshotResearchCandidate(row model.FactorSnapshotDaily, u model.StockUnive
 		return nil
 	}
 	q := &recSignalQuality{Version: recommendationSignalVersion, AsOf: row.TradeDate, Bars: int(v["bar_count"]), ATR: ptr("rq_atr"), BreakoutLevel: ptr("rq_breakout_level"), BreakoutDistanceATR: ptr("rq_breakout_dist"), MA20DistanceATR: ptr("rq_ma20_dist"), Compression: ptr("rq_compression"), VolumeContraction: ptr("rq_volume_contract"), CloseLocation: ptr("rq_close_location"), UpperWick: ptr("rq_upper_wick"), RangeShock: ptr("rq_range_shock"), Efficiency20: ptr("rq_efficiency20"), DemandBalance5: ptr("rq_demand5"), PullbackDepthATR: ptr("rq_pullback_depth"), Stabilized: flag("rq_stabilized"), HigherLow: flag("rq_higher_low"), BreakoutConfirmed: flag("rq_breakout"), BreakoutRun: int(v["rq_breakout_run"]), Support: ptr("rq_support"), SupportDistanceATR: ptr("rq_support_dist"), Resistance: ptr("rq_resistance"), ResistanceDistanceATR: ptr("rq_resistance_dist")}
+	q.BreakoutATR = ptr("rq_breakout_atr")
 	f := &candFactors{BarCount: int(v["bar_count"]), MA5: v["ma5"], MA10: v["ma10"], MA20: v["ma20"], MA60: v["ma60"], Chg5d: v["chg_5d"], Chg20d: v["chg_20d"], High20d: v["high_20d"] == 1, BullAlign: v["bull_align"] == 1, AboveMA20: v["above_ma20"] == 1, VolBoost: v["vol_boost"], Vol5v20: v["vol_5v20"], Volatility20: v["volatility_20"], Drawdown20: v["drawdown_20"], Bias20: v["bias_20"], Pos60: v["pos_60"], RSI14: v["rsi_14"], MACDDif: v["macd_dif"], MACDGold: v["macd_gold"] == 1, MACDXUp: v["macd_cross_up"] == 1, BollMid: v["boll_mid"], BollPos: v["boll_pos"], ChipProfit: v["chip_profit"], ChipBars: int(v["chip_bars"])}
 	c := candidate{Symbol: row.Symbol, Market: "cn", Name: u.Name, Price: v["close"], Amount: u.Amount, TurnoverRate: u.TurnoverRate, PETTM: u.PETTM, PB: u.PB, Industry: u.Industry, QuoteAsOf: row.TradeDate + " 15:00", FactAsOf: &row.CreatedAt, Factors: f, SignalQuality: q, ScoreDims: &scoreDims{Trend: v["rq_score_trend"], Momentum: v["rq_score_momentum"], Position: v["rq_score_position"], Volume: v["rq_score_volume"], Risk: v["rq_score_risk"]}}
 	if u.CreatedAt.After(row.CreatedAt) {
@@ -569,7 +572,7 @@ func fillRankingResearchOutcomes(ctx context.Context, tx *gorm.DB, req RankingRe
 			}
 		}
 	}
-	// 已形成的统一 so2 结果可补足已过日线保留期的批次；不读带止盈止损的计划标签。
+	// 已形成的当前版本 fixed-hold 结果可补足已过日线保留期的批次；不读计划标签。
 	stored := map[string]model.RecommendationSelectionOutcome{}
 	if len(batchSet) > 0 && tx.Migrator().HasTable(&model.RecommendationSelectionOutcome{}) {
 		ids := make([]int64, 0, len(batchSet))

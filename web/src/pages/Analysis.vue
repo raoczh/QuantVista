@@ -170,6 +170,11 @@ function analysisPayload(allowStale = false): AnalyzeRequest | null {
   if (module === 'stock' && panelMode.value && !asOf.value) payload.mode = 'panel'
   else if (verifyMode.value) payload.verify = true
   if (module === 'stock' && !payload.mode && asOf.value) payload.as_of = asOf.value
+  if (module === 'stock' && !payload.mode && !payload.as_of) {
+    payload.price_horizon = form.value.price_horizon || 'short_term'
+    payload.price_strategy = form.value.price_strategy || (payload.price_horizon === 'long_term' ? 'value' : 'momentum')
+    payload.price_strategy_revision_id = form.value.price_strategy_revision_id
+  }
   if (allowStale) payload.allow_stale = true
   return payload
 }
@@ -344,6 +349,10 @@ function openTaskAudit() {
 }
 
 function applyStockActionQuery() {
+  if (route.query.price_horizon === 'short_term' || route.query.price_horizon === 'long_term') form.value.price_horizon = route.query.price_horizon
+  if (typeof route.query.price_strategy === 'string') form.value.price_strategy = route.query.price_strategy
+  const priceRevision = Number(route.query.price_strategy_revision_id)
+  form.value.price_strategy_revision_id = Number.isSafeInteger(priceRevision) && priceRevision > 0 ? priceRevision : undefined
   if (moduleOptions.some(option => option.value === route.query.module)) form.value.module = route.query.module as AnalysisModule
   if (route.query.symbol) {
     updateSelectedStock({

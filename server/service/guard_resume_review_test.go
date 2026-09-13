@@ -182,11 +182,11 @@ type guardNameReviewAdapter struct{ reviewQuoteHookAdapter }
 
 func (a guardNameReviewAdapter) GetQuote(ctx context.Context, market, symbol string) (*datasource.Quote, error) {
 	q, err := a.reviewQuoteHookAdapter.GetQuote(ctx, market, symbol)
-	q.Name, q.ChangePct = "ST当日名称", 4.9
+	q.Name, q.ChangePct = "ST当日名称", 9.9
 	return q, err
 }
 
-func TestGuardUsesCurrentQuoteNameForSTLimit(t *testing.T) {
+func TestGuardUsesCurrentSTLimit(t *testing.T) {
 	setupTestDB(t)
 	now := time.Now()
 	today := now.Format("2006-01-02")
@@ -202,7 +202,7 @@ func TestGuardUsesCurrentQuoteNameForSTLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n != 2 || len(rows) != 2 {
-		t.Fatalf("现名为ST时，4.9%%应触发持仓及自选涨停事件：n=%d rows=%+v", n, rows)
+		t.Fatalf("主板ST按现行10%%规则，9.9%%应触发持仓及自选涨停事件：n=%d rows=%+v", n, rows)
 	}
 	for _, row := range rows {
 		if !strings.Contains(row.Message, "涨停") {

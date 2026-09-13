@@ -392,8 +392,9 @@ func sentenceAround(text string, start, end int) string {
 // snapshotHints 快照字段元数据提示（路径前缀 → 值；"" 通配全部，最长前缀胜出）：
 // asOf=该字段的数据时间、source=该字段的数据源标识（ev4 起）。两维互相独立，任一可空。
 type snapshotHints struct {
-	asOf   map[string]string
-	source map[string]string
+	asOf              map[string]string
+	source            map[string]string
+	knownZeroPrefixes []string // 只有明确区分缺失与零的新数据契约才能声明
 }
 
 // snapshotLabeledValues 从快照结构（map/struct，经 JSON 归一化）递归收集带路径的数值。
@@ -434,6 +435,16 @@ func snapshotLabeledValues(snapshot any, hints *snapshotHints, exclude ...string
 		}
 		return hintFor(hints.source, path)
 	}
+	zeroKnown := func(path string) bool {
+		if hints != nil {
+			for _, prefix := range hints.knownZeroPrefixes {
+				if strings.HasPrefix(path, prefix) {
+					return true
+				}
+			}
+		}
+		return false
+	}
 	var vals []labeledValue
 	var walk func(node any, path string)
 	walk = func(node any, path string) {
@@ -467,7 +478,7 @@ func snapshotLabeledValues(snapshot any, hints *snapshotHints, exclude ...string
 				walk(v, seg)
 			}
 		case float64:
-			if t != 0 {
+			if t != 0 || zeroKnown(path) {
 				vals = append(vals, labeledValue{Path: path, Value: t, AsOf: asOfFor(path), Source: sourceFor(path)})
 				if math.Abs(t) >= 1e8 {
 					vals = append(vals, labeledValue{Path: path + "(亿)", Value: t / 1e8, Unit: "亿", AsOf: asOfFor(path), Source: sourceFor(path), Derived: true})
@@ -561,6 +572,9 @@ func stockFieldHints(snap map[string]any) *snapshotHints {
 	}
 	if _, ok := snap["finance"]; ok {
 		h.source["finance."] = "eastmoney_f10"
+		if fin, ok := snap["finance"].(map[string]any); ok && fin["version"] == financeFactorVersion {
+			h.knownZeroPrefixes = []string{"finance.latest.", "finance.trend[", "finance.annual."}
+		}
 	}
 	if _, ok := snap["org_view"]; ok {
 		h.source["org_view."] = "eastmoney_datacenter"

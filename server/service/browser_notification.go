@@ -125,7 +125,7 @@ func (s webPushSender) Send(ctx context.Context, payload []byte, sub browserPush
 	}, &webpush.Options{
 		HTTPClient: s.client, Subscriber: s.config.Subject,
 		VAPIDPublicKey: s.config.PublicKey, VAPIDPrivateKey: s.config.PrivateKey,
-		TTL: webPushTTL,
+		TTL: webPushTTL, Urgency: webpush.UrgencyHigh,
 	})
 	if err != nil {
 		return 0, err
@@ -495,6 +495,7 @@ func (s *BrowserNotificationService) CreateAndDispatch(ctx context.Context, user
 	if err != nil || !created {
 		return &event, err
 	}
+	wakeBrowserNotifications(userID)
 	if s.asyncDelivery {
 		go func() {
 			pushCtx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
@@ -511,8 +512,6 @@ func (s *BrowserNotificationService) dispatchWebPush(ctx context.Context, event 
 	if s.sender == nil {
 		return
 	}
-	payload, _ := json.Marshal(map[string]any{"event_id": event.ID, "user_id": event.UserID, "title": event.Title, "body": event.Body,
-		"route": event.Route, "level": event.Level, "category": event.Category})
 	for _, device := range devices {
 		if ctx.Err() != nil || !userNotifyEnabledContext(ctx, event.UserID) {
 			return
@@ -524,8 +523,14 @@ func (s *BrowserNotificationService) dispatchWebPush(ctx context.Context, event 
 		if err := common.DB.WithContext(ctx).Where("user_id = ? AND device_id = ? AND enabled = ?", event.UserID, device.ID, true).First(&sub).Error; err != nil {
 			continue
 		}
+		delivery, lease, err := s.claimPushDelivery(ctx, event, device)
+		if err != nil || delivery == nil {
+			continue
+		}
+		payload, _ := json.Marshal(map[string]any{"event_id": event.ID, "delivery_id": delivery.ID, "user_id": event.UserID,
+			"title": event.Title, "body": event.Body, "route": event.Route, "level": event.Level, "category": event.Category,
+			"created_at": event.CreatedAt})
 		plain := browserPushPlainSubscription{}
-		var err error
 		if plain.Endpoint, err = common.Decrypt(sub.EndpointCipher); err == nil {
 			plain.P256dh, err = common.Decrypt(sub.P256dhCipher)
 		}
@@ -534,10 +539,12 @@ func (s *BrowserNotificationService) dispatchWebPush(ctx context.Context, event 
 		}
 		status := 0
 		if err == nil {
-			status, err = s.sender.Send(ctx, payload, plain)
+			pushCtx, cancel := context.WithTimeout(ctx, notifyTimeout)
+			status, err = s.sender.Send(pushCtx, payload, plain)
+			cancel()
 		}
 		now := s.now()
-		deliveryUpdates := map[string]any{"push_attempted_at": &now, "attempt_count": gorm.Expr("attempt_count + 1")}
+		deliveryUpdates := map[string]any{"push_lease_token": "", "push_lease_until_ms": 0, "next_push_at_ms": 0}
 		subUpdates := map[string]any{}
 		if err == nil {
 			deliveryUpdates["status"] = model.BrowserDeliveryDelivered
@@ -553,13 +560,16 @@ func (s *BrowserNotificationService) dispatchWebPush(ctx context.Context, event 
 			}
 			deliveryUpdates["status"] = model.BrowserDeliveryFailed
 			deliveryUpdates["last_error_code"] = code
+			if code != "subscription_expired" {
+				deliveryUpdates["next_push_at_ms"] = now.Add(browserPushRetryDelay(delivery.AttemptCount)).UnixMilli()
+			}
 			subUpdates["last_failure_at"] = &now
 			subUpdates["last_error_code"] = code
 		}
 		auditCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := common.DB.WithContext(auditCtx).Transaction(func(tx *gorm.DB) error {
 			if err := tx.Model(&model.BrowserNotificationDelivery{}).
-				Where("user_id = ? AND device_id = ? AND event_id = ?", event.UserID, device.ID, event.ID).Updates(deliveryUpdates).Error; err != nil {
+				Where("id = ? AND user_id = ? AND push_lease_token = ? AND foreground_ack_at IS NULL", delivery.ID, event.UserID, lease).Updates(deliveryUpdates).Error; err != nil {
 				return err
 			}
 			var current model.BrowserNotificationDevice
@@ -584,6 +594,10 @@ func (s *BrowserNotificationService) dispatchWebPush(ctx context.Context, event 
 }
 
 func (s *BrowserNotificationService) PendingEvents(userID int64, deviceKey string, afterID int64, limit int) ([]BrowserEventView, error) {
+	return s.pendingEventsContext(context.Background(), userID, deviceKey, afterID, limit)
+}
+
+func (s *BrowserNotificationService) pendingEventsContext(ctx context.Context, userID int64, deviceKey string, afterID int64, limit int) ([]BrowserEventView, error) {
 	deviceHash, err := browserDeviceKeyHash(deviceKey)
 	if err != nil {
 		return nil, err
@@ -591,10 +605,10 @@ func (s *BrowserNotificationService) PendingEvents(userID int64, deviceKey strin
 	if limit <= 0 || limit > maxBrowserEventPageSize {
 		limit = 20
 	}
-	if !userNotifyEnabled(userID) {
-		return []BrowserEventView{}, nil
+	if enabled, err := readUserNotifyEnabledContext(ctx, userID); err != nil || !enabled {
+		return []BrowserEventView{}, err
 	}
-	settings, err := s.settings(userID)
+	settings, err := s.settingsContext(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -609,22 +623,23 @@ func (s *BrowserNotificationService) PendingEvents(userID int64, deviceKey strin
 		}
 	}
 	var device model.BrowserNotificationDevice
-	if err := common.DB.Where("user_id = ? AND device_key_hash = ? AND enabled = ?", userID, deviceHash, true).First(&device).Error; err != nil {
+	if err := common.DB.WithContext(ctx).Where("user_id = ? AND device_key_hash = ? AND enabled = ?", userID, deviceHash, true).First(&device).Error; err != nil {
 		return nil, errors.New("浏览器通知设备不存在")
 	}
 	now := s.now()
-	common.DB.Model(&device).Update("last_seen_at", &now)
+	common.DB.WithContext(ctx).Model(&device).Where("last_seen_at IS NULL OR last_seen_at < ?", now.Add(-time.Minute)).Update("last_seen_at", &now)
 	type row struct {
 		DeliveryID int64 `gorm:"column:delivery_id"`
 		model.BrowserNotificationEvent
 	}
 	var rows []row
-	err = common.DB.Table("browser_notification_deliveries AS d").
+	err = common.DB.WithContext(ctx).Table("browser_notification_deliveries AS d").
 		Select("d.id AS delivery_id, e.*").
 		Joins("JOIN browser_notification_events AS e ON e.id = d.event_id AND e.user_id = d.user_id").
 		Where("d.user_id = ? AND d.device_id = ? AND d.foreground_ack_at IS NULL AND d.status IN ? AND e.id > ?",
 			userID, device.ID, []string{model.BrowserDeliveryPending, model.BrowserDeliveryFailed}, afterID).
 		Where("e.category IN ?", categories).
+		Where("e.created_at >= ?", now.Add(-time.Duration(webPushTTL)*time.Second)).
 		Order("e.id ASC").Limit(limit).Scan(&rows).Error
 	if err != nil {
 		return nil, err
@@ -648,7 +663,8 @@ func (s *BrowserNotificationService) Ack(userID, deliveryID int64, deviceKey str
 	now := s.now()
 	res := common.DB.Model(&model.BrowserNotificationDelivery{}).
 		Where("id = ? AND user_id = ? AND device_id = ?", deliveryID, userID, device.ID).
-		Updates(map[string]any{"foreground_ack_at": &now, "status": model.BrowserDeliveryDelivered})
+		Updates(map[string]any{"foreground_ack_at": &now, "status": model.BrowserDeliveryDelivered,
+			"push_lease_token": "", "push_lease_until_ms": 0, "next_push_at_ms": 0})
 	if res.Error != nil {
 		return res.Error
 	}

@@ -172,7 +172,7 @@ func TestFinanceFactorFor(t *testing.T) {
 
 	budget := 1
 	fin := financeFactorFor(context.Background(), "600519", &budget)
-	if fin == nil || fin.ROE != 34.2 || fin.Report != "2025年报" {
+	if fin == nil || fin.ROE == nil || *fin.ROE != 34.2 || fin.Report != "2025年报" {
 		t.Fatalf("fin=%+v", fin)
 	}
 	if budget != 0 {
@@ -370,7 +370,7 @@ func TestFinanceFactorForExcludesFutureDisclosure(t *testing.T) {
 	if calls != 0 || budget != 1 {
 		t.Fatalf("未来披露不得触发刷新：calls=%d budget=%d", calls, budget)
 	}
-	if fin == nil || fin.Report != "2025年报" || fin.ROE != 34.2 {
+	if fin == nil || fin.Report != "2025年报" || fin.ROE == nil || *fin.ROE != 34.2 {
 		t.Fatalf("未来 NoticeDate 行不得进入推荐，fin=%+v", fin)
 	}
 }
@@ -423,7 +423,7 @@ func TestFinanceFactorForRequiresProofForEmptyNoticeDate(t *testing.T) {
 
 	budget := 0
 	fin := financeFactorFor(context.Background(), "600519", &budget)
-	if fin == nil || fin.Report != "2025年报" || fin.ROE != 34.2 {
+	if fin == nil || fin.Report != "2025年报" || fin.ROE == nil || *fin.ROE != 34.2 {
 		t.Fatalf("无披露证据的空公告日报表不得压过已知可用旧报告，fin=%+v", fin)
 	}
 
@@ -432,7 +432,7 @@ func TestFinanceFactorForRequiresProofForEmptyNoticeDate(t *testing.T) {
 		ActualDate: today.AddDate(0, 0, -1).Format("2006-01-02"),
 	})
 	fin = financeFactorFor(context.Background(), "600519", &budget)
-	if fin == nil || fin.Report != "未知公告日一季报" || fin.ROE != 99 {
+	if fin == nil || fin.Report != "未知公告日一季报" || fin.ROE == nil || *fin.ROE != 99 {
 		t.Fatalf("披露日历已证明发布时应允许空公告日行，fin=%+v", fin)
 	}
 }
@@ -443,7 +443,7 @@ func TestStrategyAdjustFinance(t *testing.T) {
 	base := candidate{Symbol: "600519", Market: "cn", Price: 100}
 
 	c := base
-	c.Fin = &candFin{Report: "2025年报", ROE: 34.2, NetProfitYoY: 15.38, RevenueYoY: 15.66}
+	c.Fin = &candFin{Report: "2025年报", ROE: recNumber(34.2), NetProfitYoY: recNumber(15.38), RevenueYoY: recNumber(15.66)}
 	delta, notes := strategyAdjust(model.RecTypeLongTerm, "value", c, f)
 	if delta != 5+3 || !strings.Contains(strings.Join(notes, ";"), "ROE 34.2%") {
 		t.Errorf("value 财务加分: delta=%v notes=%v", delta, notes)
@@ -454,7 +454,7 @@ func TestStrategyAdjustFinance(t *testing.T) {
 		t.Errorf("growth 财务加分 delta=%v", dg)
 	}
 
-	c.Fin = &candFin{Report: "2025年报", ROE: 5, NetProfitYoY: -45, RevenueYoY: -10}
+	c.Fin = &candFin{Report: "2025年报", ROE: recNumber(5), NetProfitYoY: recNumber(-45), RevenueYoY: recNumber(-10)}
 	dv, nv := strategyAdjust(model.RecTypeLongTerm, "value", c, f)
 	if dv != -5 || !strings.Contains(strings.Join(nv, ";"), "业绩恶化") {
 		t.Errorf("业绩恶化应扣 5: delta=%v notes=%v", dv, nv)
@@ -499,7 +499,7 @@ func TestUpsertExpressRowsIdempotent(t *testing.T) {
 
 // candidateLabeledValues 必须含 fin 数字（值域同步铁律）。
 func TestCandidateValueSetFin(t *testing.T) {
-	c := candidate{Price: 100, Fin: &candFin{ROE: 34.2, RevenueYoY: 15.66, NetProfitYoY: 15.38, GrossMargin: 91.9}}
+	c := candidate{Price: 100, Fin: &candFin{ROE: recNumber(34.2), RevenueYoY: recNumber(15.66), NetProfitYoY: recNumber(15.38), GrossMargin: recNumber(91.9)}}
 	vals := candidateLabeledValues(c)
 	for _, want := range []float64{34.2, 15.66, 15.38, 91.9} {
 		if !labeledHas(vals, want) {

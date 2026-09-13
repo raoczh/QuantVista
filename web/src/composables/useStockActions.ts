@@ -73,7 +73,7 @@ export function useStockActions(onNavigate?: () => void) {
   function goAnalysis(s: StockRef) {
     return go({ name: 'analysis', query: stockQuery(s, { module: 'stock' }) }, s)
   }
-  function goRecommendationReview(s: StockRef, recommendationID: number, context = '') {
+  function goRecommendationReview(s: StockRef, recommendationID: number, context = '', pricing?: { horizon: string; strategy_key: string; strategy_revision_id?: number }) {
     return go(
       {
         name: 'analysis',
@@ -81,6 +81,7 @@ export function useStockActions(onNavigate?: () => void) {
           module: 'stock',
           recommendation_id: String(recommendationID),
           review_context: 'recommendation',
+          ...(pricing ? { price_horizon: pricing.horizon, price_strategy: pricing.strategy_key, price_strategy_revision_id: String(pricing.strategy_revision_id || 0) } : {}),
           ...(context.trim() ? { recommendation_context: context.trim().slice(0, 320) } : {}),
         }),
       },

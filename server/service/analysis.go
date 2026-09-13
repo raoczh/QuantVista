@@ -53,8 +53,8 @@ func NewAnalysisService(market *MarketService, watchlist *WatchlistService, posi
 
 // 版本号：数据快照 + 这两个版本号共同保证「凭版本号复现」。改 prompt/策略时递增。
 const (
-	analysisPromptVersion   = "p21" // p21: 前缀缓存分工——固定的数据时点/输出收束两段从 user 段前移进 system（指代随位置修正）、自定义模板中含占位符的块留在 user 段（system 不再随标的变化）；p20: P1-2 交易计划失效条件 invalidators（tradePlanSystem 要求输出计划作废信号，schema trade_plan.v2）+ 结论级 claims 服务端推导（ev5，非 prompt 变化）；p19: 移除输出字段字数/条数限制，保留 JSON schema 与分析语义；p18: 输出瘦身（结构化数组条数/单条字数、panel 共识与分歧字数上限）；p17: 历史解释模式程序化硬约束（enforceStaleModeResult：summary 强制「截至 X 的历史数据解释」前缀、suggestions 剔除当前买卖行动词；panel 模式非 fresh 直接拒绝不接受 allow_stale）；p16: 行情时效 fail-closed——持仓割/守/补三选一仅限有当前有效行情的仓（stale/失败仓禁三选一）、个股 stale 禁当前评级（改历史解释模式或数据不足）、快照逐项 freshness 元数据；p15: 个股快照行情新鲜度元数据（captured_at/quote_as_of/quote_source/bars_as_of/market_state/freshness_status），stale 必须声明行情截至时间、非交易时段按收盘口径；p14: P3b 板块模块 board_valuation（中位 PE/PB+横截面/时序分位+积累天数）与 board_flow（板块主力资金）两段进 sector guidance；p13: P3a 机构观点 org_view 段（评级分布/评级变动/目标价偏离/调研密度）进个股 guidance + trade_plan 机构目标价对照锚；p12: M3c 交易员阶段（个股标准分析追加交易计划二次调用+量化仓位公式，计划价位与仓位数字进核验值域）；p11: M3a 市场模块情绪温度计 mood 段（连板分布/炸板率/昨涨停溢价）；p10: M2 回溯诊断 as_of 模式（截断快照+回溯声明段）；p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁用先验记忆；p3: 反方观点/失效条件/数据盲区
-	analysisStrategyVersion = "s1"
+	analysisPromptVersion   = "p22" // p21: 前缀缓存分工——固定的数据时点/输出收束两段从 user 段前移进 system（指代随位置修正）、自定义模板中含占位符的块留在 user 段（system 不再随标的变化）；p20: P1-2 交易计划失效条件 invalidators（tradePlanSystem 要求输出计划作废信号，schema trade_plan.v2）+ 结论级 claims 服务端推导（ev5，非 prompt 变化）；p19: 移除输出字段字数/条数限制，保留 JSON schema 与分析语义；p18: 输出瘦身（结构化数组条数/单条字数、panel 共识与分歧字数上限）；p17: 历史解释模式程序化硬约束（enforceStaleModeResult：summary 强制「截至 X 的历史数据解释」前缀、suggestions 剔除当前买卖行动词；panel 模式非 fresh 直接拒绝不接受 allow_stale）；p16: 行情时效 fail-closed——持仓割/守/补三选一仅限有当前有效行情的仓（stale/失败仓禁三选一）、个股 stale 禁当前评级（改历史解释模式或数据不足）、快照逐项 freshness 元数据；p15: 个股快照行情新鲜度元数据（captured_at/quote_as_of/quote_source/bars_as_of/market_state/freshness_status），stale 必须声明行情截至时间、非交易时段按收盘口径；p14: P3b 板块模块 board_valuation（中位 PE/PB+横截面/时序分位+积累天数）与 board_flow（板块主力资金）两段进 sector guidance；p13: P3a 机构观点 org_view 段（评级分布/评级变动/目标价偏离/调研密度）进个股 guidance + trade_plan 机构目标价对照锚；p12: M3c 交易员阶段（个股标准分析追加交易计划二次调用+量化仓位公式，计划价位与仓位数字进核验值域）；p11: M3a 市场模块情绪温度计 mood 段（连板分布/炸板率/昨涨停溢价）；p10: M2 回溯诊断 as_of 模式（截断快照+回溯声明段）；p9: F2 finance 财务段（F10 最新期+趋势+三表关键科目）进个股 guidance；p8: risk_gate 风险闸门段 + 持仓资金上下文与割/守/补三选一；p7: announcements 公告段；p6: news 舆情段；p5: 证据数字程序化核验威慑条款；p4: 五维量化评分锚点+强制引用数值/禁用先验记忆；p3: 反方观点/失效条件/数据盲区
+	analysisStrategyVersion = "s2"
 	analysisJobTimeout      = 10 * time.Minute
 	// 兼容包内既有异步测试；实际 stale 口径由 taskProcessingStaleAfter 唯一定义。
 	analysisProcessingStale = taskProcessingStaleAfter
@@ -84,7 +84,10 @@ type AnalyzeRequest struct {
 	// AllowStale 行情过期时的显式降级选择（仅 stock 模块）：默认 false——全源拿不到
 	// fresh 行情时「当前分析/当前评级」直接拒绝（数据不足，fail-closed）；用户显式
 	// 置 true 才按「截至行情时刻的历史数据解释」模式生成（禁当前行动建议）。
-	AllowStale bool `json:"allow_stale"`
+	AllowStale              bool   `json:"allow_stale"`
+	PriceHorizon            string `json:"price_horizon,omitempty"`
+	PriceStrategy           string `json:"price_strategy,omitempty"`
+	PriceStrategyRevisionID int64  `json:"price_strategy_revision_id,omitempty"`
 }
 
 // AnalysisResult 结构化分析结果（要求 LLM 严格按此 schema 输出 JSON）。
@@ -251,6 +254,13 @@ func (s *AnalysisService) prepareAnalysis(userID int64, allowPrivate bool, req A
 		req.Market = normalizeMarketOnly(req.Market)
 	}
 	req.Target = strings.TrimSpace(req.Target)
+	if req.Module == model.AnalysisModuleStock && req.Market == "cn" && req.AsOf == "" {
+		pricing, err := analysisPriceContext(userID, req)
+		if err != nil {
+			return nil, err
+		}
+		req.PriceHorizon, req.PriceStrategy, req.PriceStrategyRevisionID = pricing.Context.Horizon, pricing.Context.StrategyKey, pricing.Context.StrategyRevisionID
+	}
 
 	// LLM 配置（含解密密钥）。
 	cfg, apiKey, err := s.llm.ResolveForUse(userID, req.LLMConfigID, ctx)
@@ -1275,7 +1285,7 @@ var moduleGuidance = map[string]string{
 - 消息面（若快照含 news 块）：news.items 是该股最近相关新闻的标题与情绪标签（利好/利空/中性为程序化预判），结合技术面判断消息驱动的持续性；权重纪律：公告>政策>报道>传闻，旧闻与已充分定价的消息不加分；引用新闻只能复述给出的标题，不得展开臆测正文细节。若 news 标注「暂无直接相关新闻」，请依据 market_signals（涨跌五档/量能三档/换手率）判断，并在措辞中明示消息面数据缺失。
 - 公告（若快照含 announcements 块）：announcements.items 是该股最近的交易所公告（标题/类型/日期），证据权重高于新闻报道；关注业绩类、股权变动类、重大合同类公告对结论的影响；引用公告只能复述给出的标题与类型，不得臆测公告正文细节；无 announcements 块表示暂未采集到该股公告，不代表没有公告。
 - 风险闸门（快照 risk_gate 块，程序化前置判定，必须遵守）：flags 中 level=block 的条目（ST/退市风险警示）为硬约束——rating 不得为 bullish、不得给出任何买入倾向的表述，并把该风险放在 risks 首条；level=warn（一字板/流动性不足）必须在 risks 中原样提示并约束相关结论（一字板不得按可正常成交分析）；level=info（小市值）在风险中带一句提示。risk_gate.note 声明了未接入的数据维度（质押/解禁等），涉及时照实说「未接入数据，请自行核查」，严禁装作已核查。
-- 财务面（若快照含 finance 块）：finance.latest 是最新一期 F10 主要财务指标（EPS/ROE/营收与净利同比/毛利率/净利率/资产负债率，report 标注报告期），finance.trend 为近几期概要（最早在前），statement_latest（若有）为最新一期三表关键科目（货币资金/存货/总资产/经营现金流净额等，单位亿元）；结合估值水位判断基本面质量与业绩趋势（如高 ROE+低 PE、增速拐点、现金流与净利的背离）；财务为季报口径有滞后性，不代表当下经营；引用只能用给出的数字，值为 0 可能表示上游缺失，不得据此下「归零」结论。无 finance 块表示财务数据暂不可得，如实说明。
+- 财务面（若快照含 finance 块）：finance.latest 是最新一期 F10 主要财务指标（EPS/ROE/营收与净利同比/毛利率/净利率/资产负债率，report 标注报告期），finance.trend 为近几期概要（最早在前），statement_latest（若有）为最新一期三表关键科目（货币资金/存货/总资产/经营现金流净额等，单位亿元）；结合估值水位判断基本面质量与业绩趋势（如高 ROE+低 PE、增速拐点、现金流与净利的背离）；财务为季报口径有滞后性，不代表当下经营；引用只能用给出的数字，finance.version=ff1 时 latest/trend/annual 的 null 或省略表示缺失，数值0表示已知为零；旧快照及 statement_latest 的0值仍可能是缺失。roe 为报告期累计值，年度质量比较使用已披露年报 annual.roe，不得将季度ROE简单年化。无 finance 块表示财务数据暂不可得，如实说明。
 - 机构观点（若快照含 org_view 块）：rating_dist 是近 90/180 天卖方研报评级分布，rating_changes_90d 与 latest_rating_change 是评级变动，target_price 是机构目标价统计（median_vs_price_pct 为中位目标价相对现价的偏离%），survey 是机构调研密度。解读纪律：卖方评级普遍乐观（九成为买入/增持），「多少家买入」本身几乎无信息量，不得以买入家数论证看多；真正有信息量的是评级下调（卖方极少下调，出现即强信号）、目标价中位数与现价的偏离方向、调研批次的环比变化（关注度升温/降温）。目标价样本 count 很小时（1~2 份）须说明代表性有限。无 org_view 块表示该股暂无研报覆盖或数据不可得，不代表机构不看好，如实说明。
 重要限制：财务仅为 F10 摘要与三表关键科目，不含全表明细、机构持仓与个股资金流。news 块的覆盖面有限（快讯与个股新闻采集），没有新闻不代表没有消息。若结论依赖未提供的数据，必须说明「数据缺失、无法判断」，绝不虚构。freshness_status=stale 或快照带 freshness_note 时，涉及价格/涨跌必须先声明「行情仅更新至 quote_as_of」，不得以实时口径表述；market_state 非 trading（休市/午间/盘前）时按最近交易日收盘（或阶段）口径措辞。rating 以技术面为主、财务/估值水位与消息面为辅给出。
 历史解释模式（若快照含 stale_mode=historical_explanation，最高优先级硬约束）：行情已过期且用户已确认按历史数据解释——本次输出**不是当前盘面判断**：summary 必须以「截至 <quote_as_of> 的历史数据解释：」开头；rating/confidence 仅表示对截至该时刻数据的解读，不得表述为当前评级；suggestions 中**禁止任何当前买入/卖出/加减仓行动建议**，只允许「待行情恢复后再评估」类表述与研究方向；全程不得使用「当前/现在/实时」指代已过期的行情数据。
@@ -1345,6 +1355,7 @@ const analysisOutputSpec = `输出要求：
 // 「以上数据」指 user 段内位于其上方的快照，前移后其上方已无数据，改指「本次提供的【数据】」，
 // 「系统要求的」改「上述」（schema 就在本段上方），语义不变。
 const analysisFixedTail = `数据时间：以快照内 data_as_of 为采集时刻、各字段 data_time/trade_date（如有）为准；非交易时段采集的数据反映最近一个交易日，不代表实时状态，分析措辞须体现这一点。
+price_plan 是个股分析与推荐追踪共用的程序买卖价事实：只能解释其区间、目标、止损、等待条件及数据时点，不得另造一套生效价格。ready 仅代表生成时满足价格条件，不代表自动买入；wait/unavailable 必须说明尚缺条件。估值观点与风险规划目标分别表述，实际持仓退出使用持仓自身保护计划。
 
 请严格按上述 JSON schema 输出，只依据本次提供的【数据】分析。`
 

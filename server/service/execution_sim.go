@@ -86,7 +86,7 @@ func simEntry(bars []datasource.Bar, i int, symbol, name string, perCap float64,
 	if nextDate != "" && buy.TradeDate != nextDate {
 		return 0, 0, 0, btSkipSuspend // 次日停牌（个股缺市场次日的 bar）
 	}
-	limitPct := limitUpPctFor(symbol, name)
+	limitPct := limitUpPctForDate(symbol, name, buy.TradeDate)
 	// 五件套②：开盘涨幅 ≥ 涨停阈值−0.5 判一字板买不进。
 	if (buy.Open/sig.Close-1)*100 >= limitPct-0.5 {
 		return 0, 0, 0, btSkipLimitUp
@@ -141,7 +141,6 @@ func simulateHold(bars []datasource.Bar, i int, symbol, name string, holdN int, 
 		return holdOutcome{Status: skip}
 	}
 	buy := bars[buyIdx]
-	limitPct := limitUpPctFor(symbol, name)
 	out := holdOutcome{Status: btTraded, BuyDate: buy.TradeDate, BuyPrice: buy.Open}
 
 	// 卖出目标：卖出根 = 买入根 + holdN（买入根之后第 holdN 个交易日收盘卖出）。
@@ -171,7 +170,7 @@ func simulateHold(bars []datasource.Bar, i int, symbol, name string, holdN int, 
 		}
 	}
 	// 五件套③：一字跌停卖不出，顺延重试。
-	for j < len(bars) && isOneWordLimitDown(bars[j], bars[j-1], limitPct) {
+	for j < len(bars) && isOneWordLimitDownForStock(bars[j], bars[j-1], symbol, name) {
 		out.Deferred++
 		j++
 	}
@@ -228,7 +227,6 @@ func simulateLabelHold(bars []datasource.Bar, i int, symbol, name string, horizo
 	}
 	buy := bars[buyIdx]
 	buyPrice := buy.Open
-	limitPct := limitUpPctFor(symbol, name)
 	out := labelOutcome{Status: btTraded, BuyDate: buy.TradeDate, BuyPrice: buyPrice}
 
 	// 到期卖出根定位（endOK=false 表示数据未覆盖到期日，障碍扫描到末根后 pending）。
@@ -305,7 +303,7 @@ func simulateLabelHold(bars []datasource.Bar, i int, symbol, name string, horizo
 			out.Forced = true // 个股退市/长停，末根收盘强平
 		}
 		j := end
-		for j < len(bars) && isOneWordLimitDown(bars[j], bars[j-1], limitPct) {
+		for j < len(bars) && isOneWordLimitDownForStock(bars[j], bars[j-1], symbol, name) {
 			out.Deferred++
 			j++
 		}
@@ -314,10 +312,10 @@ func simulateLabelHold(bars []datasource.Bar, i int, symbol, name string, horizo
 			out.Forced = true
 		}
 		exitIdx, exitPrice = j, bars[j].Close
-	} else if out.HitStopLoss && isOneWordLimitDown(bars[exitIdx], bars[exitIdx-1], limitPct) {
+	} else if out.HitStopLoss && isOneWordLimitDownForStock(bars[exitIdx], bars[exitIdx-1], symbol, name) {
 		// 止损触发日本身一字跌停（卖不出）：顺延到下一可交易日按收盘卖出。
 		j := exitIdx
-		for j < len(bars) && isOneWordLimitDown(bars[j], bars[j-1], limitPct) {
+		for j < len(bars) && isOneWordLimitDownForStock(bars[j], bars[j-1], symbol, name) {
 			out.Deferred++
 			j++
 		}
@@ -415,7 +413,6 @@ func adjustSuspect(bars []datasource.Bar, symbol, name string) bool {
 	if validateAdjustedBars("cn", bars) != nil {
 		return true
 	}
-	tol := limitUpPctFor(symbol, name) * 1.5
 	start := btAdjustSanityHeadSkip + 1
 	if start < 1 {
 		start = 1
@@ -425,11 +422,15 @@ func adjustSuspect(bars []datasource.Bar, symbol, name string) bool {
 		if prev <= 0 || bars[i].Close <= 0 {
 			continue
 		}
-		if math.Abs((bars[i].Close/prev-1)*100) > tol {
+		if math.Abs((bars[i].Close/prev-1)*100) > limitUpPctForDate(symbol, name, bars[i].TradeDate)*1.5 {
 			return true
 		}
 	}
 	return false
+}
+
+func isOneWordLimitDownForStock(b, prev datasource.Bar, symbol, name string) bool {
+	return isOneWordLimitDown(b, prev, limitUpPctForDate(symbol, name, b.TradeDate))
 }
 
 // cnDailyBarsAsc 读单只 A 股的 daily_bars 全序列（升序；全市场地基每股约 250 根）。

@@ -11,7 +11,7 @@ import (
 	"quantvista/model"
 )
 
-const recommendationOptimizationFactVersion = "of1"
+const recommendationOptimizationFactVersion = "of2"
 
 type recOptimizationFacts struct {
 	Version        string    `json:"version"`

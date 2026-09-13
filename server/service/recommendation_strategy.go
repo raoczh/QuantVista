@@ -68,7 +68,7 @@ type recScreenBinding struct {
 }
 
 func (t *strategyTemplate) scanRequest(limit int) ScanRequest {
-	req := ScanRequest{Limit: limit, preselectionProfile: t.baseKey}
+	req := ScanRequest{Limit: limit, preselectionProfile: t.baseKey, preselectionIntent: publicStrategy(*t).Intent}
 	if t.screen == nil {
 		return req
 	}
@@ -97,8 +97,8 @@ var longStrategies = []strategyTemplate{
 		guide: "优先选择商业模式稳健、估值相对合理或偏低的标的，弱化短期涨幅；以中长期持有视角评估。"},
 	{Key: "growth", Name: "成长趋势", Desc: "关注景气与成长持续性", Group: "rec", baseKey: "growth",
 		guide: "优先选择处于景气赛道、成长趋势明确、中长期逻辑清晰的标的；说明关键的成长驱动与验证指标。"},
-	{Key: "leader", Name: "龙头优选", Desc: "行业龙头与确定性", Group: "rec", baseKey: "leader",
-		guide: "优先选择行业地位领先、确定性较高的龙头标的；强调竞争壁垒与长期跟踪要点。"},
+	{Key: "leader", Name: "龙头优选", Desc: "盈利质量与规模参照，行业地位另行核查", Group: "rec", baseKey: "leader",
+		guide: "优先核查年度盈利能力与近期业绩稳定性；规模只作为参照，不能凭市值或 ROE 断言行业龙头。竞争壁垒和行业地位需要独立证据，缺失时明确说明。"},
 }
 
 // recBuiltinStrategies 某推荐类型的内置推荐策略。

@@ -3,11 +3,12 @@ package service
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"quantvista/datasource"
 )
 
-const recommendationSignalVersion = "sq1"
+const recommendationSignalVersion = "sq2"
 
 // 所有形态只取已完成日线；只有 Distance 字段引用当前报价，明确保持两种时点。
 // 指针表示可用性，零值可以是一个真实观测，不能用 omitempty 将它隐藏成未知。
@@ -17,6 +18,7 @@ type recSignalQuality struct {
 	Bars                  int      `json:"bars"`
 	ATR                   *float64 `json:"atr,omitempty"` // 信号日之前的 ATR，突破大阳线不扩大自身参照尺度
 	BreakoutLevel         *float64 `json:"breakout_level,omitempty"`
+	BreakoutATR           *float64 `json:"breakout_atr,omitempty"` // 连续突破开始前的波动尺度，不能用上涨后的扩大波动稀释追高距离
 	BreakoutConfirmed     *bool    `json:"breakout_confirmed,omitempty"`
 	BreakoutRun           int      `json:"breakout_run"` // 连续创 20 日新高数，最多回看 10 日
 	BreakoutDistanceATR   *float64 `json:"breakout_distance_atr,omitempty"`
@@ -55,7 +57,7 @@ func signalQualityLabeledValues(q *recSignalQuality) []labeledValue {
 		key   string
 		value *float64
 	}{
-		{"atr", q.ATR}, {"breakout_level", q.BreakoutLevel}, {"breakout_distance_atr", q.BreakoutDistanceATR},
+		{"atr", q.ATR}, {"breakout_level", q.BreakoutLevel}, {"breakout_atr", q.BreakoutATR}, {"breakout_distance_atr", q.BreakoutDistanceATR},
 		{"ma20_distance_atr", q.MA20DistanceATR}, {"compression", q.Compression}, {"volume_contraction", q.VolumeContraction},
 		{"close_location", q.CloseLocation}, {"upper_wick", q.UpperWick}, {"range_shock", q.RangeShock},
 		{"efficiency_20", q.Efficiency20}, {"demand_balance_5", q.DemandBalance5}, {"pullback_depth_atr", q.PullbackDepthATR},
@@ -116,6 +118,7 @@ func computeRecSignalQuality(price float64, bars []datasource.Bar) *recSignalQua
 		return hi
 	}
 	level := priorMax(n - 1)
+	breakoutStart := n - 1
 	q.BreakoutConfirmed = boolPtr(last.Close > level)
 	// 连续创新高时锚定这段突破的起点，避免每天重设到昨天高点掩盖延伸。
 	for i := n - 1; i >= 20 && n-i <= 10; i-- {
@@ -124,9 +127,15 @@ func computeRecSignalQuality(price float64, bars []datasource.Bar) *recSignalQua
 		}
 		q.BreakoutRun++
 		level = priorMax(i)
+		breakoutStart = i
 	}
 	q.BreakoutLevel = recNumber(level)
-	q.BreakoutDistanceATR = recNumber((price - level) / atr)
+	breakoutATR := atrSeries(bars[:breakoutStart], 14)[breakoutStart-1]
+	if !finiteRecNumber(breakoutATR) || breakoutATR <= 0 {
+		breakoutATR = atr
+	}
+	q.BreakoutATR = recNumber(breakoutATR)
+	q.BreakoutDistanceATR = recNumber((price - level) / breakoutATR)
 	var tr5, tr20, v5, v20 float64
 	for i := n - 21; i < n-1; i++ {
 		b := bars[i]
@@ -218,7 +227,7 @@ type recEntryQuality struct {
 }
 
 func entryQualityFor(profile, intent string, c candidate, q *recSignalQuality) *recEntryQuality {
-	out := &recEntryQuality{Version: "eq1", Status: "aligned"}
+	out := &recEntryQuality{Version: "eq2", Status: "aligned"}
 	if q == nil || q.ATR == nil || q.MA20DistanceATR == nil {
 		out.Status = "insufficient"
 		out.Reasons = []string{"缺少足够日线或波动尺度，无法核对入场距离"}
@@ -254,11 +263,11 @@ func entryQualityFor(profile, intent string, c candidate, q *recSignalQuality) *
 		}
 		out.Reasons = append(out.Reasons, "最近完整日线振幅扩大但收盘靠近低位，量价确认不足")
 	}
-	if profileUsesFinance(profile) && c.Fin == nil {
+	if missing := financeMissingFor(profile, c.Fin); len(missing) > 0 {
 		if out.Status == "aligned" {
 			out.Status = "insufficient"
 		}
-		out.Reasons = append(out.Reasons, "所选评分需要财务证据，目前未取得有效财报摘要")
+		out.Reasons = append(out.Reasons, "所选评分需要财务证据，目前缺少："+strings.Join(missing, "、"))
 	}
 	return out
 }
@@ -269,10 +278,17 @@ func entryQualityAtPrice(strat *strategyTemplate, c candidate, price float64) *r
 	}
 	q := *c.SignalQuality
 	shift := (price - c.Price) / *q.ATR
-	for _, p := range []**float64{&q.MA20DistanceATR, &q.BreakoutDistanceATR, &q.SupportDistanceATR} {
+	for _, p := range []**float64{&q.MA20DistanceATR, &q.SupportDistanceATR} {
 		if *p != nil {
 			*p = recNumber(**p + shift)
 		}
+	}
+	if q.BreakoutDistanceATR != nil {
+		denominator := *q.ATR
+		if q.BreakoutATR != nil && *q.BreakoutATR > 0 {
+			denominator = *q.BreakoutATR
+		}
+		q.BreakoutDistanceATR = recNumber(*q.BreakoutDistanceATR + (price-c.Price)/denominator)
 	}
 	if q.ResistanceDistanceATR != nil {
 		q.ResistanceDistanceATR = recNumber(*q.ResistanceDistanceATR - shift)

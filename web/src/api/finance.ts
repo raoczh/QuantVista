@@ -7,19 +7,19 @@ export interface FinanceIndicatorItem {
   report_date: string // YYYY-MM-DD
   report_name: string // 「2026一季报」
   notice_date: string
-  eps: number
-  bps: number
-  ocf_ps: number
-  revenue: number // 元
-  revenue_yoy: number // %
-  net_profit: number // 元
-  net_profit_yoy: number
-  deduct_profit: number
-  deduct_profit_yoy: number
-  roe: number
-  gross_margin: number
-  net_margin: number
-  debt_ratio: number
+  eps: number | null
+  bps: number | null
+  ocf_ps: number | null
+  revenue: number | null // 元；null 为缺失，0 为已知为零
+  revenue_yoy: number | null // %
+  net_profit: number | null // 元
+  net_profit_yoy: number | null
+  deduct_profit: number | null
+  deduct_profit_yoy: number | null
+  roe: number | null // 本报告期累计加权 ROE
+  gross_margin: number | null
+  net_margin: number | null
+  debt_ratio: number | null
 }
 
 export interface FinanceStatementItem {

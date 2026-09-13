@@ -1,5 +1,6 @@
 import { request } from './client'
 import type { EvidenceCheck, TrustReview, SysConfidence, RiskFlag } from './trust'
+import type { ResearchPricePlan } from './pricePlan'
 
 export type AnalysisModule = 'market' | 'sector' | 'stock' | 'watchlist' | 'position'
 export type AnalysisStatus = 'processing' | 'success' | 'degraded' | 'failed'
@@ -16,6 +17,9 @@ export interface AnalyzeRequest {
   verify?: boolean // AI 复核（独立复核员逐项挑刺；panel/降级不复核）
   as_of?: string // M2 回溯诊断日期（YYYY-MM-DD，仅个股标准模式）：截断日线组装 prompt 无未来泄露
   allow_stale?: boolean // 行情过期时的显式降级：按「截至行情时刻的历史数据解释」模式生成（默认拒绝）
+  price_horizon?: 'short_term' | 'long_term'
+  price_strategy?: string
+  price_strategy_revision_id?: number
 }
 
 // 结构化分析结果。
@@ -52,6 +56,7 @@ export interface PositionAdvice {
 
 // 交易计划（二次 LLM + 服务端纪律校验）。
 export interface TradePlan {
+  price_plan?: ResearchPricePlan
   no_plan?: boolean
   no_plan_reason?: string
   buy_low?: number

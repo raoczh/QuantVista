@@ -110,7 +110,8 @@ export function listBrowserNotificationEvents(deviceKey: string, afterID = 0, si
   return request<BrowserNotificationEvent[]>({
     url: '/browser-notifications/events',
     method: 'get',
-    params: { device_key: deviceKey, after_id: afterID, limit: 20 },
+    params: { device_key: deviceKey, after_id: afterID, limit: 20, wait_seconds: 25 },
+    timeout: 35_000,
     signal,
   })
 }

@@ -39,7 +39,11 @@ func (s *AnalysisService) buildContext(ctx context.Context, userID int64, req An
 		if req.AsOf != "" {
 			ac, err = s.buildStockContextAsOf(ctx, req)
 		} else {
-			ac, err = s.buildStockContext(ctx, req.Market, req.Symbol)
+			pricing, pricingErr := analysisPriceContext(userID, req)
+			if pricingErr != nil {
+				return nil, pricingErr
+			}
+			ac, err = s.buildStockContext(ctx, req.Market, req.Symbol, pricing)
 		}
 	case model.AnalysisModuleMarket:
 		ac, err = s.buildMarketContext(ctx, req.Market)
@@ -63,8 +67,8 @@ func (s *AnalysisService) buildContext(ctx context.Context, userID int64, req An
 
 // --- 个股 ---
 
-func (s *AnalysisService) buildStockContext(ctx context.Context, market, symbol string) (*analysisContext, error) {
-	name, snap, err := buildStockSnapshot(ctx, s.market, symbol, market)
+func (s *AnalysisService) buildStockContext(ctx context.Context, market, symbol string, pricing ...researchPriceBuildContext) (*analysisContext, error) {
+	name, snap, err := buildStockSnapshot(ctx, s.market, symbol, market, pricing...)
 	if err != nil {
 		return nil, err
 	}
@@ -73,7 +77,7 @@ func (s *AnalysisService) buildStockContext(ctx context.Context, market, symbol 
 
 // buildStockSnapshot 采集单只个股的数据快照（行情 + 技术指标 + 近 30 根日线明细）。
 // 供个股分析与个股 AI 问答共用，保证两处口径一致。返回 展示名、快照、错误。
-func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt string) (string, map[string]any, error) {
+func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt string, pricing ...researchPriceBuildContext) (string, map[string]any, error) {
 	symbol, mkt, err := normalizeSymbolMarket(symbol, mkt)
 	if err != nil {
 		return "", nil, err
@@ -180,7 +184,40 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 	// 日线：取近 60 根算技术指标，注入近 30 根明细；顺手算五维量化评分
 	// （与个股详情页/对比/推荐同一 computeScore 口径），给 LLM 一个确定性的量化锚点，
 	// 降低「模型在一坨数字里自由发挥」的空间。
-	bars, berr := market.GetDailyBars(ctx, mkt, symbol, 60)
+	barLimit := 120
+	priceContext := researchPriceBuildContext{Context: researchPriceContextFor(model.RecTypeShortTerm, &shortStrategies[0]), Strategy: &shortStrategies[0]}
+	if len(pricing) > 0 {
+		priceContext = pricing[0]
+	}
+	if priceContext.Strategy != nil && priceContext.Strategy.screen != nil {
+		barLimit = wideBarLimit
+	}
+	bars, berr := market.GetDailyBars(ctx, mkt, symbol, barLimit)
+	if mkt == "cn" {
+		c := candidate{Symbol: symbol, Market: mkt, Name: q.Name, Price: q.Price, ChangePct: q.ChangePct, QuoteAsOf: q.DataTime.In(time.Local).Format("2006-01-02 15:04")}
+		completed, issue := recommendationCompletedBars(bars, c)
+		if issue == "" {
+			bars = completed // 个股技术快照也不能把盘中半根日线与完整日线混用。
+			if priceContext.Strategy != nil && priceContext.Strategy.screen != nil {
+				meta := wideStockMeta{Name: q.Name, ST: isSTName(q.Name)}
+				if yields, err := DividendYieldsFor([]string{symbol}, now); err == nil {
+					if y, ok := yields[symbol]; ok {
+						meta.DivYield, meta.DivYieldOK = y, true
+					}
+				}
+				c.StrategyHit = evaluateStrategyHit(priceContext.Strategy, symbol, meta, hitBarsWithQuote(bars, c, c.QuoteAsOf[:10]))
+			}
+		} else {
+			bars = nil
+			berr = errors.New(issue)
+		}
+		plan := buildResearchPricePlan(c, bars, priceContext.Context)
+		if fresh.Status != freshStatusFresh {
+			plan.Status, plan.BuyLow, plan.BuyHigh, plan.Exit = "unavailable", 0, 0, nil
+			plan.Reasons = append(plan.Reasons, "报价不是当前有效口径，不生成可执行价位")
+		}
+		snap["price_plan"] = plan
+	}
 	if berr == nil && len(bars) > 0 {
 		snap["technicals"] = computeTechnicals(bars)
 		snap["recent_bars"] = compactBars(bars, 30)
@@ -191,7 +228,11 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 			fresh.MarketState != marketStateTrading && barsAsOf < fresh.ExpectedDate {
 			snap["bars_note"] = fmt.Sprintf("日线仅更新至 %s（期望 %s），技术指标可能滞后", barsAsOf, fresh.ExpectedDate)
 		}
-		sc := computeScore(q.Price, bars)
+		scoreBars := bars
+		if len(scoreBars) > factorBarLimit {
+			scoreBars = scoreBars[len(scoreBars)-factorBarLimit:]
+		}
+		sc := computeScore(q.Price, scoreBars)
 		snap["quant_score"] = map[string]any{
 			"total": sc.Total, "label": sc.Label,
 			"trend": sc.Trend, "momentum": sc.Momentum, "position": sc.Position,

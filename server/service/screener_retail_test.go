@@ -44,13 +44,13 @@ func TestRetailTemplatesExposeDeterministicConditions(t *testing.T) {
 }
 
 func TestRetailTemplateParameterBoundsAndFrozenJob(t *testing.T) {
-	if _, _, err := resolveRetailTemplate("low-price-steady", 1, map[string]float64{"max_price": 101}); err == nil {
+	if _, _, err := resolveRetailTemplate("low-price-steady", retailTemplateVersion, map[string]float64{"max_price": 101}); err == nil {
 		t.Fatal("expected upper-bound error")
 	}
-	if _, _, err := resolveRetailTemplate("low-price-steady", 2, nil); err == nil {
+	if _, _, err := resolveRetailTemplate("low-price-steady", retailTemplateVersion+1, nil); err == nil {
 		t.Fatal("expected version error")
 	}
-	if _, _, err := resolveRetailTemplate("low-price-steady", 1, map[string]float64{"unknown": 1}); err == nil {
+	if _, _, err := resolveRetailTemplate("low-price-steady", retailTemplateVersion, map[string]float64{"unknown": 1}); err == nil {
 		t.Fatal("expected unknown-param error")
 	}
 	if _, err := NewScreenerService().resolveStrategy(1, ScanRequest{
@@ -60,13 +60,13 @@ func TestRetailTemplateParameterBoundsAndFrozenJob(t *testing.T) {
 	}
 
 	seed, _, err := NewScreenerService().prepareScanJob(1, ScanRequest{
-		TemplateKey: "low-price-steady", TemplateVersion: 1,
+		TemplateKey: "low-price-steady", TemplateVersion: retailTemplateVersion,
 		TemplateParams: map[string]float64{"max_price": 20}, Limit: 20,
 	})
 	if err != nil {
 		t.Fatalf("prepareScanJob: %v", err)
 	}
-	if seed.StrategyKey != "retail:low-price-steady:v1" || seed.StrategyHash == "" {
+	if seed.StrategyKey != "retail:low-price-steady:v2" || seed.StrategyHash == "" {
 		t.Fatalf("unexpected seed: %+v", seed)
 	}
 	var normalized ScanRequest

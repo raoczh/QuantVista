@@ -20,7 +20,7 @@ const running = ref(false)
 const saving = ref(false)
 const policyLoading = ref(false)
 const updating = ref(false)
-const algorithm = ref<RankingAlgorithm>('qr1')
+const algorithm = ref<RankingAlgorithm>('qr2')
 const artifactID = ref<number | null>(null)
 const session = getSessionEpoch()
 const controller = new AbortController()
@@ -30,10 +30,13 @@ onBeforeUnmount(() => { disposed = true; controller.abort() })
 const busy = computed(() => running.value || saving.value || updating.value)
 const policyKey = computed(() => `${form.rec_type}:${form.profile}`)
 const policy = computed(() => state.value?.policies.find(item => item.key === policyKey.value))
-const actualAlgorithm = computed(() => policy.value?.algorithm || state.value?.default_algorithm || 'qr1')
+const actualAlgorithm = computed(() => {
+  const value = policy.value?.algorithm || state.value?.default_algorithm || 'qr2'
+  return value === 'qr1' ? 'qr2' : value
+})
 const profileOptions = Object.entries(SCORE_PROFILE_LABEL).map(([value, label]) => ({ value, label }))
 const horizonOptions = computed(() => (form.rec_type === 'short_term' ? [5, 10] : [20, 60]).map(value => ({ value, label: `${value} 日` })))
-const algorithmOptions = Object.entries(RANKING_ALGORITHM_LABEL).map(([value, label]) => ({ value, label }))
+const algorithmOptions = Object.entries(RANKING_ALGORITHM_LABEL).filter(([value]) => value !== 'qr1').map(([value, label]) => ({ value, label }))
 const artifactOptions = computed(() => (state.value?.artifacts || []).filter(item => item.rec_type === form.rec_type && item.profile === form.profile).map(item => ({
   value: item.id, label: `#${item.id} · ${item.horizon} 日 · ${item.target === 'alpha' ? '超额' : '扣费'} · 截至 ${item.as_of}${item.eligible ? '' : ' · 仅研究'}`, disabled: !item.eligible,
 })))

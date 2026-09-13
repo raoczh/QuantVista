@@ -148,6 +148,11 @@ func loadRecScoringRuntime(ctx context.Context, db *gorm.DB, recType, profile st
 		return r, errors.New("评分政策与策略配置不一致")
 	}
 	r.Algorithm = policy.Algorithm
+	// 旧规则选择随发布升级为当前规则，批次仍冻结实际版本；不改写已有政策行
+	// 或历史输出。学习模型必须重新通过当前特征版本的检验，不能自动迁移权重。
+	if r.Algorithm == "qr1" {
+		r.Algorithm = recommendationScoringVersion
+	}
 	if r.Algorithm == rankingRidgeVersion {
 		var row model.RankingModelArtifact
 		if err := db.WithContext(ctx).Where("id = ?", policy.ArtifactID).First(&row).Error; err != nil {

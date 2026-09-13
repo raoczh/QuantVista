@@ -6,7 +6,8 @@ const (
 	// SelectionOutcomeVersion 是统一 fixed-hold 结果口径版本。执行语义变化必须递增，
 	// 旧版本结果保留，不原地改写。
 	// so2 将整手入场费用计入拨款限制。
-	SelectionOutcomeVersion = "so2"
+	// so3 按每个交易日应用沪深主板风险警示涨跌幅规则；科创板买入至少 200 股。
+	SelectionOutcomeVersion = "so3"
 	// SelectionOutcomeSchemaVersion 是持久化字段契约版本，与计算口径版本分开演进。
 	SelectionOutcomeSchemaVersion = "selection_outcome.v1"
 )

@@ -202,12 +202,17 @@ func (r DcRow) String(key string) string {
 }
 
 func (r DcRow) Float(key string) float64 {
+	v, _ := r.FloatOK(key)
+	return v
+}
+
+// FloatOK 同时返回可用性，财务等场景必须区分真实零、null 和非法数值。
+func (r DcRow) FloatOK(key string) (float64, bool) {
 	raw, ok := r[key]
 	if !ok {
-		return 0
+		return 0, false
 	}
-	v, _ := emNum(raw)
-	return v
+	return emNum(raw)
 }
 
 // Date 取日期字段的前 10 位（"2026-06-30 00:00:00" -> "2026-06-30"）。

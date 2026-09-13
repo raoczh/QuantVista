@@ -75,7 +75,7 @@ func TestIndustryPeersUseFrozenComparableCohort(t *testing.T) {
 	if pool[5].IndustryPeers.PEPercentile == nil || *pool[5].IndustryPeers.PEPercentile < 80 {
 		t.Fatal("绝对 PE 不高也可能在同行内偏贵")
 	}
-	fin := &candFin{Report: "年报", ROE: 12, NetProfitYoY: 15}
+	fin := &candFin{Report: "年报", AnnualReportDate: "2025-12-31", AnnualROE: recNumber(12), NetProfitYoY: recNumber(15)}
 	pool[0].Fin, pool[5].Fin = fin, fin
 	low, _, _ := qualityFinanceScore("value", pool[0])
 	high, _, _ := qualityFinanceScore("value", pool[5])

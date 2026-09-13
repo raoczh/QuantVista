@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"quantvista/common"
 	"quantvista/model"
@@ -144,17 +145,27 @@ func trimFloat(v float64) string {
 	return strings.TrimRight(s, ".")
 }
 
-// limitUpPctFor A 股按代码/名称判涨停幅度（%）：主板 10、创业板/科创板 20、北交所 30、ST 5。
+// limitUpPctFor 仅供当前行情缺少实际涨跌停价时近似判断；历史计算必须传交易日期。
 func limitUpPctFor(symbol, name string) float64 {
-	up := strings.ToUpper(name)
-	if strings.Contains(up, "ST") {
-		return 5
-	}
+	return limitUpPctForDate(symbol, name, time.Now().In(time.Local).Format("2006-01-02"))
+}
+
+// 沪深交易规则（2026年修订）自 2026-07-06 起将主板风险警示股从 5% 调整为 10%。
+// 不把现行规则套到历史；无有效日期时保留旧的保守阈值。特殊无涨跌幅限制日另由业务过滤。
+func limitUpPctForDate(symbol, name, date string) float64 {
 	switch {
 	case strings.HasPrefix(symbol, "30"), strings.HasPrefix(symbol, "68"):
 		return 20
 	case strings.HasPrefix(symbol, "8"), strings.HasPrefix(symbol, "4"), strings.HasPrefix(symbol, "92"):
 		return 30
+	}
+	if strings.Contains(strings.ToUpper(name), "ST") {
+		if len(date) >= 10 && (strings.HasPrefix(symbol, "0") || strings.HasPrefix(symbol, "60")) {
+			if _, err := time.Parse("2006-01-02", date[:10]); err == nil && date[:10] >= "2026-07-06" {
+				return 10
+			}
+		}
+		return 5 // 创业/科创风险警示始终优先使用所属板块规则。
 	}
 	return 10
 }
@@ -180,6 +191,9 @@ func isAtLimitUp(c candidate) bool {
 		return c.Price >= c.LimitUp-0.005
 	}
 	lim := limitUpPctFor(c.Symbol, c.Name)
+	if c.QuoteAsOf != "" {
+		lim = limitUpPctForDate(c.Symbol, c.Name, c.QuoteAsOf)
+	}
 	return c.ChangePct >= lim-0.3
 }
 

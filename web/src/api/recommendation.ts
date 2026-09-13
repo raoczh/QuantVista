@@ -1,5 +1,6 @@
 import { request, HEAVY_TIMEOUT } from './client'
 import type { ExitPlanSeed } from './position'
+import type { ResearchPricePlan } from './pricePlan'
 import type { EvidenceCheck, TrustReview } from './trust'
 import type { CandidateAuditUserReport } from './candidateAudit'
 import type { ScoreProfile } from './screener'
@@ -155,6 +156,8 @@ export interface StrategyCurrentCheck {
 
 // 单条推荐的结构化明细（短线/长线字段并存）。
 export interface RecDetail {
+  price_plan?: ResearchPricePlan
+  model_price_proposal?: { buy_low: number; buy_high: number; target_price: number; stop_price: number }
   symbol: string
   action: RecAction
   confidence: number

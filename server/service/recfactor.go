@@ -118,7 +118,7 @@ func computeCandFactors(price float64, bars []datasource.Bar) *candFactors {
 				maxPrev = c
 			}
 		}
-		f.High20d = closes[n-1] >= maxPrev
+		f.High20d = closes[n-1] > maxPrev
 	}
 
 	// 量能：今日量 / 前 5 日均量（剔除今日，日线口径的量比近似）；5 日均量 / 20 日均量。
@@ -152,12 +152,10 @@ func computeCandFactors(price float64, bars []datasource.Bar) *candFactors {
 		w = n
 	}
 	win := bars[n-w:]
-	if len(win) >= 2 {
+	if n >= 21 {
 		var rets []float64
-		for i := 1; i < len(win); i++ {
-			if win[i-1].Close > 0 {
-				rets = append(rets, (win[i].Close-win[i-1].Close)/win[i-1].Close*100)
-			}
+		for i := n - 20; i < n; i++ {
+			rets = append(rets, (closes[i]/closes[i-1]-1)*100)
 		}
 		f.Volatility20 = round2(stddev(rets))
 	}
@@ -420,8 +418,8 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 	}
 	// F2 财务因子（有数据才动分，缺失不惩罚——c.Fin=nil 表示无缓存且预算耗尽）。
 	// 业绩恶化是长线通用扣分；ROE/增速加分随策略在下方分派。
-	if fin := c.Fin; fin != nil && fin.NetProfitYoY <= -30 {
-		add(-5, fmt.Sprintf("净利同比 %.1f%% 业绩恶化（%s）", fin.NetProfitYoY, fin.Report))
+	if fin := c.Fin; fin != nil && fin.has(fin.NetProfitYoY) && *fin.NetProfitYoY <= -30 {
+		add(-5, fmt.Sprintf("净利同比 %.1f%% 业绩恶化（%s）", *fin.NetProfitYoY, fin.Report))
 	}
 	switch stratKey {
 	case "value":
@@ -450,13 +448,13 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 		// F2：低估值 + 高 ROE 是价值策略的黄金组合；净利正增长确认盈利质量。
 		if fin := c.Fin; fin != nil {
 			switch {
-			case fin.ROE >= 12:
-				add(5, fmt.Sprintf("ROE %.1f%% 优秀（%s）", fin.ROE, fin.Report))
-			case fin.ROE >= 8:
-				add(3, fmt.Sprintf("ROE %.1f%% 良好（%s）", fin.ROE, fin.Report))
+			case fin.has(fin.ROE) && *fin.ROE >= 12:
+				add(5, fmt.Sprintf("ROE %.1f%% 优秀（%s）", *fin.ROE, fin.Report))
+			case fin.has(fin.ROE) && *fin.ROE >= 8:
+				add(3, fmt.Sprintf("ROE %.1f%% 良好（%s）", *fin.ROE, fin.Report))
 			}
-			if fin.NetProfitYoY >= 10 {
-				add(3, fmt.Sprintf("净利同比 +%.1f%%", fin.NetProfitYoY))
+			if fin.has(fin.NetProfitYoY) && *fin.NetProfitYoY >= 10 {
+				add(3, fmt.Sprintf("净利同比 +%.1f%%", *fin.NetProfitYoY))
 			}
 		}
 	case "growth":
@@ -479,21 +477,21 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 		// F2：营收/净利双增速是成长策略的核心证据（高增速给更高档加分）。
 		if fin := c.Fin; fin != nil {
 			switch {
-			case fin.RevenueYoY >= 20:
-				add(5, fmt.Sprintf("营收同比 +%.1f%% 高增长（%s）", fin.RevenueYoY, fin.Report))
-			case fin.RevenueYoY >= 10:
-				add(3, fmt.Sprintf("营收同比 +%.1f%%（%s）", fin.RevenueYoY, fin.Report))
+			case fin.has(fin.RevenueYoY) && *fin.RevenueYoY >= 20:
+				add(5, fmt.Sprintf("营收同比 +%.1f%% 高增长（%s）", *fin.RevenueYoY, fin.Report))
+			case fin.has(fin.RevenueYoY) && *fin.RevenueYoY >= 10:
+				add(3, fmt.Sprintf("营收同比 +%.1f%%（%s）", *fin.RevenueYoY, fin.Report))
 			}
 			switch {
-			case fin.NetProfitYoY >= 30:
-				add(5, fmt.Sprintf("净利同比 +%.1f%% 高增长", fin.NetProfitYoY))
-			case fin.NetProfitYoY >= 15:
-				add(3, fmt.Sprintf("净利同比 +%.1f%%", fin.NetProfitYoY))
+			case fin.has(fin.NetProfitYoY) && *fin.NetProfitYoY >= 30:
+				add(5, fmt.Sprintf("净利同比 +%.1f%% 高增长", *fin.NetProfitYoY))
+			case fin.has(fin.NetProfitYoY) && *fin.NetProfitYoY >= 15:
+				add(3, fmt.Sprintf("净利同比 +%.1f%%", *fin.NetProfitYoY))
 			}
 		}
 	case "leader":
 		if c.TotalCap >= 500e8 {
-			add(5, fmt.Sprintf("总市值 %.0f 亿龙头体量", c.TotalCap/1e8))
+			add(5, fmt.Sprintf("总市值 %.0f 亿，规模较大", c.TotalCap/1e8))
 		}
 		if f.MA60 > 0 && c.Price > f.MA60 {
 			add(4, "站上 MA60")
@@ -506,11 +504,11 @@ func strategyAdjust(recType, stratKey string, c candidate, f *candFactors) (floa
 		}
 		// F2：龙头看盈利质量与业绩稳健。
 		if fin := c.Fin; fin != nil {
-			if fin.ROE >= 15 {
-				add(4, fmt.Sprintf("ROE %.1f%% 盈利质量高（%s）", fin.ROE, fin.Report))
+			if fin.has(fin.ROE) && *fin.ROE >= 15 {
+				add(4, fmt.Sprintf("ROE %.1f%% 盈利质量高（%s）", *fin.ROE, fin.Report))
 			}
-			if fin.NetProfitYoY >= 10 {
-				add(2, fmt.Sprintf("净利同比 +%.1f%%", fin.NetProfitYoY))
+			if fin.has(fin.NetProfitYoY) && *fin.NetProfitYoY >= 10 {
+				add(2, fmt.Sprintf("净利同比 +%.1f%%", *fin.NetProfitYoY))
 			}
 		}
 	}
@@ -642,12 +640,20 @@ func candidateLabeledValues(c candidate) []labeledValue {
 		out = append(out, labeledVals("score.risk", c.ScoreDims.Risk)...)
 	}
 	if c.Fin != nil {
-		out = append(out, labeledVals("fin.roe", c.Fin.ROE)...)
-		out = append(out, labeledVals("fin.revenue_yoy", c.Fin.RevenueYoY)...)
-		out = append(out, labeledVals("fin.net_profit_yoy", c.Fin.NetProfitYoY)...)
-		out = append(out, labeledVals("fin.gross_margin", c.Fin.GrossMargin)...)
-		out = append(out, labeledVals("fin.net_margin", c.Fin.NetMargin)...)
-		out = append(out, labeledVals("fin.debt_ratio", c.Fin.DebtRatio)...)
+		for _, v := range []struct {
+			path  string
+			value *float64
+		}{
+			{"fin.roe", c.Fin.ROE}, {"fin.revenue_yoy", c.Fin.RevenueYoY}, {"fin.net_profit_yoy", c.Fin.NetProfitYoY},
+			{"fin.gross_margin", c.Fin.GrossMargin}, {"fin.net_margin", c.Fin.NetMargin}, {"fin.debt_ratio", c.Fin.DebtRatio},
+		} {
+			if c.Fin.has(v.value) {
+				out = append(out, labeledValue{Path: v.path, Value: *v.value})
+			}
+		}
+		if c.Fin.hasAnnualROE() {
+			out = append(out, labeledValue{Path: "fin.annual_roe", Value: *c.Fin.AnnualROE})
+		}
 	}
 	return out
 }

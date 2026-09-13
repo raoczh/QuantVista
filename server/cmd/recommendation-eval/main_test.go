@@ -52,7 +52,7 @@ func TestCLIRequiresExistingExplicitReadOnlyInput(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
 		t.Fatal(err)
 	}
-	if report.Version != "rr1" || report.PromotionReady || report.Reason == "" {
+	if report.Version != "rr2" || report.PromotionReady || report.Reason == "" {
 		t.Fatal("空数据必须显示样本不足")
 	}
 	after, err := os.ReadFile(path)

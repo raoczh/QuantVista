@@ -10,6 +10,7 @@ import StockIdentity from '@/components/StockIdentity.vue'
 import TrustBadges from '@/components/TrustBadges.vue'
 import TermHelp from '@/components/TermHelp.vue'
 import ExitPlanPanel from '@/components/positions/ExitPlanPanel.vue'
+import ResearchPricePlanPanel from '@/components/ResearchPricePlanPanel.vue'
 import { formatPrice } from '@/lib/formatPrice'
 import {
   confidenceExplanation,
@@ -178,7 +179,8 @@ async function linkExistingPosition() {
       <span v-if="item.status.last_eval_date">截至 {{ item.status.last_eval_date }}</span>
     </div>
 
-    <p v-if="item.detail?.execution_plan?.exit_plan && item.detail.execution_plan.exit_plan.data_status !== 'unavailable'" class="exit-plan-summary">
+    <ResearchPricePlanPanel v-if="item.detail?.price_plan" :plan="item.detail.price_plan" compact />
+    <p v-else-if="item.detail?.execution_plan?.exit_plan && item.detail.execution_plan.exit_plan.data_status !== 'unavailable'" class="exit-plan-summary">
       退出规划：初始止损 {{ formatPrice(item.detail.execution_plan.exit_plan.stop_price) }} ·
       第一目标 {{ formatPrice(item.detail.execution_plan.exit_plan.target_price) }} ·
       延伸目标 {{ formatPrice(item.detail.execution_plan.exit_plan.extended_target) }}。
@@ -198,7 +200,7 @@ async function linkExistingPosition() {
     />
 
     <footer class="actions">
-      <n-button size="small" type="primary" secondary @click="goRecommendationReview(stock, item.id, `${item.summary}；主要理由：${firstReason}；主要风险：${firstRisk}`)">AI 复核当前推荐</n-button>
+      <n-button size="small" type="primary" secondary @click="goRecommendationReview(stock, item.id, `${item.summary}；主要理由：${firstReason}；主要风险：${firstRisk}`, item.detail?.price_plan?.context)">AI 复核当前推荐</n-button>
       <n-button
         size="small"
         :disabled="!item.detail"
@@ -294,7 +296,8 @@ async function linkExistingPosition() {
             <p v-if="item.detail.quality_gate.senti_missing">新闻情绪缺失，不代表情绪中性。</p>
           </section>
           <section v-if="item.detail.execution_plan">
-            <ExitPlanPanel :seed="item.detail.execution_plan.exit_plan" compact />
+            <ResearchPricePlanPanel v-if="item.detail.price_plan" :plan="item.detail.price_plan" />
+            <ExitPlanPanel v-else :seed="item.detail.execution_plan.exit_plan" compact />
             <h4>研究预算适配</h4>
             <p v-if="item.detail.execution_plan.checked_price != null">执行复核 {{ item.detail.execution_plan.data_as_of }}，参考现价 {{ item.detail.execution_plan.checked_price.toFixed(2) }}。</p>
             <p v-if="item.detail.execution_plan.status === 'ready'">研究预算 {{ item.detail.execution_plan.planned_capital.toFixed(2) }}，参考数量 {{ item.detail.execution_plan.quantity }} 股，估算占用 {{ item.detail.execution_plan.estimated_capital.toFixed(2) }}。</p>
@@ -309,8 +312,9 @@ async function linkExistingPosition() {
           <section>
             <h4>有效条件</h4>
             <p>{{ item.detail.invalidation || '未提供明确失效条件，应按数据不足处理。' }}</p>
-            <p v-if="type === 'short_term'">买入区间 {{ item.detail.buy_zone_low }} - {{ item.detail.buy_zone_high }}；止盈 {{ item.detail.take_profit }}；止损 {{ item.detail.stop_loss }}；有效 {{ item.detail.valid_days || '未知' }} 个交易日。</p>
-            <p v-else>估值区间 {{ item.detail.valuation_low }} - {{ item.detail.valuation_high }}；复盘周期 {{ item.detail.review_cycle || '未知' }}。</p>
+            <p v-if="item.detail.model_price_proposal">AI 原始价位提案（未生效）：区间 {{ item.detail.model_price_proposal.buy_low }} - {{ item.detail.model_price_proposal.buy_high }}；目标 {{ item.detail.model_price_proposal.target_price }}；止损 {{ item.detail.model_price_proposal.stop_price }}。执行与追踪使用上方程序计划。</p>
+            <p v-else-if="type === 'short_term' && !item.detail.price_plan">历史 AI 区间 {{ item.detail.buy_zone_low }} - {{ item.detail.buy_zone_high }}；止盈 {{ item.detail.take_profit }}；止损 {{ item.detail.stop_loss }}；有效 {{ item.detail.valid_days || '未知' }} 个交易日，保留生成时口径。</p>
+            <p v-if="type === 'long_term'">AI 估值研究区间 {{ item.detail.valuation_low }} - {{ item.detail.valuation_high }}；复盘周期 {{ item.detail.review_cycle || '未知' }}。估值区间不作为买入挂单区间或卖出触发价。</p>
           </section>
         </div>
         <p class="disclaimer">{{ item.detail.disclaimer }}</p>

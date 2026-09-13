@@ -2,9 +2,9 @@ import { HEAVY_TIMEOUT, request } from './client'
 import type { ScoreProfile } from './screener'
 import type { RecType } from './recommendation'
 
-export type RankingAlgorithm = 'qr1' | 'additive_sp1' | 'ridge1'
+export type RankingAlgorithm = 'qr1' | 'qr2' | 'additive_sp1' | 'ridge1'
 export const RANKING_ALGORITHM_LABEL: Record<RankingAlgorithm, string> = {
-  qr1: '质量规则', additive_sp1: '原加法评分对照', ridge1: '学习排序',
+  qr1: '历史质量规则（新任务使用qr2）', qr2: '质量规则', additive_sp1: '原加法评分对照', ridge1: '学习排序',
 }
 export interface RankingResearchRequest {
   source: 'recommendations' | 'snapshots'

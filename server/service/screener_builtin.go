@@ -2,7 +2,7 @@ package service
 
 import "quantvista/model"
 
-// M1 内置选股策略（约 20 个白话策略）：只用因子宽表已有因子（factorDefs），
+// 内置选股策略（26 个）：只用因子宽表已注册因子（factorDefs），
 // 白话讲解 + 适用周期 + 风险等级。参考 StockNova builtin 思路按现有因子重写，
 // 阈值沿用项目内已有共识（量比 1.5~5 温和放量、换手 3~15 活跃、RSI 凹形逻辑等）。
 //
@@ -45,25 +45,28 @@ var builtinScreens = []builtinScreen{
 	{
 		Key:    "vol-break-20d",
 		Name:   "放量创20日新高",
-		Desc:   "收盘价刷新近 20 日高点且成交量温和放大（1.5~5 倍），突破有量能确认。当日涨幅限制在 9% 内，排除已涨停买不进的。追突破需设好止损，假突破回落要果断离场。",
+		Desc:   "收盘严格超过此前 20 日收盘高点，放量 1.5~5 倍且收在当日较高位置。日涨幅低于所属板块常规涨停幅度的 90%，排除封板信号；突破仍可能失败，执行前另核对延伸距离。",
 		Period: "short",
 		Risk:   "high",
 		Tree: allOf(
 			leafTrue("high_20d"),
 			leafBetween("vol_boost", 1.5, 5),
-			leafV("chg_pct", "<", 9),
+			leafV("day_limit_ratio", "<", 0.9),
+			leafFalse("limit_up_today"),
+			leafV("rq_close_location", ">=", 0.65),
 			leafV("amount_yi", ">=", 2),
 		),
 	},
 	{
 		Key:    "shrink-pullback-ma20",
 		Name:   "强势股缩量回踩MA20",
-		Desc:   "近 20 日涨过 10% 的强势股，近几日缩量回调但没跌破 20 日均线——主升浪中的技术性回踩，缩量说明抛压不重。若放量跌破 MA20 则形态破坏。",
+		Desc:   "近 20 日涨幅至少 10%，近 5 日缩量回落，收盘位于 MA20 上方 1.2 ATR 以内。观察趋势内回踩，量缩不能单独证明抛压减轻；还需确认企稳及支撑是否有效。",
 		Period: "short",
 		Risk:   "mid",
 		Tree: allOf(
 			leafV("chg_20d", ">=", 10),
 			leafTrue("above_ma20"),
+			leafBetween("rq_ma20_dist", 0, 1.2),
 			leafBetween("chg_5d", -8, 0),
 			leafV("vol_5v20", "<", 0.9),
 		),
@@ -71,7 +74,7 @@ var builtinScreens = []builtinScreen{
 	{
 		Key:    "mild-vol-start",
 		Name:   "低位温和放量",
-		Desc:   "股价处 60 日区间下半场，当日温和放量（1.5~3 倍）小幅上涨 1~6%——可能是资金试探性建仓的启动迹象。位置低风险相对可控，但也可能只是一日游，看后续量能是否持续。",
+		Desc:   "股价处于 60 日区间下半部，当日放量 1.5~3 倍、上涨 1~6%，观察低位量价变化。低位置不代表低风险，也不能证明资金建仓；需核查下跌原因和后续承接。",
 		Period: "short",
 		Risk:   "mid",
 		Tree: allOf(
@@ -84,12 +87,14 @@ var builtinScreens = []builtinScreen{
 	{
 		Key:    "bottom-vol-yang",
 		Name:   "底部放量长阳",
-		Desc:   "60 日区间底部 30% 位置，当日放量（2 倍以上）拉出 5% 以上长阳——超跌后的强反弹信号，常见于利空出尽或资金抄底。底部第一根长阳后常有回踩，不急于全仓。",
+		Desc:   "60 日区间底部 30% 位置，放量超过 2 倍、涨幅超过 5% 且阳线实体超过 3%。这是低位反弹形态，不能仅凭量价推断利空出尽或资金建仓，仍需核查下跌原因。",
 		Period: "short",
 		Risk:   "high",
 		Tree: allOf(
 			leafV("pos_60", "<", 30),
 			leafV("chg_pct", ">", 5),
+			leafV("body_pct", ">", 3),
+			leafFalse("limit_up_today"),
 			leafV("vol_boost", ">", 2),
 			leafV("amount_yi", ">=", 1),
 		),
@@ -97,7 +102,7 @@ var builtinScreens = []builtinScreen{
 	{
 		Key:    "yang-through-3ma",
 		Name:   "一阳穿三线",
-		Desc:   "开盘在 5/10/20 日均线下方，收盘一根阳线全部收复——短期均线的集中突破，多头一次性夺回主动权。要求涨幅 >2% 保证是实体阳线。次日若不回落确认，动能较强。",
+		Desc:   "开盘低于 5/10/20 日均线，收盘高于三条均线，且相对昨收涨幅超过 2%。这是短期均线集中收复形态，日涨幅与阳线实体涨幅并不相同；后续仍需确认是否守住突破位置。",
 		Period: "short",
 		Risk:   "high",
 		Tree: allOf(
@@ -113,7 +118,7 @@ var builtinScreens = []builtinScreen{
 	{
 		Key:    "limit-up-pullback",
 		Name:   "涨停后温和回调",
-		Desc:   "近 5 日有过涨停的活跃股，今日温和回调 0.5~6% 且守住 10 日线——涨停打开空间后的洗盘形态。妖股逻辑，波动极大，只适合能盯盘的短线玩家，严格止损。",
+		Desc:   "近 5 日出现过涨停，最新完整日回落 0.5~6% 且收盘守住 MA10。观察强波动后的回调，不能据此判断是洗盘还是出货；A 股 T+1 和跳空也可能使计划止损无法按价成交。",
 		Period: "short",
 		Risk:   "high",
 		Tree: allOf(
@@ -126,19 +131,21 @@ var builtinScreens = []builtinScreen{
 	{
 		Key:    "strong-consolidation",
 		Name:   "强势整理蓄势",
-		Desc:   "近 20 日涨超 15% 的强势股，近 5 日横盘整理（-5%~2%）且未破 20 日线——强势股的中继形态，整理后常有第二波。若整理时间过长或放量下跌则动能衰竭。",
+		Desc:   "近 20 日涨超 15%、近 5 日涨跌在 -5%~2%，守住 MA20，且整理振幅收敛、量能没有明显放大。低净涨幅不等于横盘，需同时排除宽幅震荡；整理方向仍待确认。",
 		Period: "short",
 		Risk:   "mid",
 		Tree: allOf(
 			leafV("chg_20d", ">", 15),
 			leafBetween("chg_5d", -5, 2),
+			leafV("rq_compression", "<=", 0.9),
+			leafV("vol_5v20", "<=", 1.2),
 			leafTrue("above_ma20"),
 		),
 	},
 	{
 		Key:    "rsi-strong-zone",
 		Name:   "RSI强势区未过热",
-		Desc:   "RSI(14) 处 55~70 强势区间且均线多头排列——趋势健康、动能充足但还没到超买（≥70 追高风险陡增）。顺势而为的标准姿势，跌破 20 日线离场。",
+		Desc:   "RSI(14) 位于 55~70、均线多头排列且当日涨幅低于 7%，观察趋势动能。70 是常用观察阈值，不能单凭它推断回调概率；入场距离和退出价位另由风险计划核对。",
 		Period: "short",
 		Risk:   "mid",
 		Tree: allOf(
@@ -151,52 +158,57 @@ var builtinScreens = []builtinScreen{
 	{
 		Key:    "macd-gold-water",
 		Name:   "MACD水上金叉",
-		Desc:   "DIF 在零轴上方金叉 DEA（近 3 日内）——多头趋势中的二次启动信号，比零轴下金叉可靠得多，是 MACD 最经典的买点形态。配合放量确认更佳。",
+		Desc:   "近 3 日 DIF 上穿 DEA，当前 DIF 仍高于 DEA 且在零轴上方。过滤金叉后已重新死叉的形态；这是趋势确认线索，不代表已经验证的胜率优势。",
 		Period: "swing",
 		Risk:   "mid",
 		Tree: allOf(
 			leafTrue("macd_cross_up"),
+			leafTrue("macd_gold"),
 			leafV("macd_dif", ">", 0),
 		),
 	},
 	{
 		Key:    "macd-gold-under",
 		Name:   "MACD水下金叉（超跌反弹）",
-		Desc:   "DIF 在零轴下方金叉 DEA 且股价处 60 日区间下 40%——超跌后的反弹尝试信号。零轴下金叉失败率不低，只做反弹不做反转，目标位不宜贪。",
+		Desc:   "近 3 日 DIF 在零轴下方上穿 DEA，当前仍保持金叉且股价处于 60 日区间下方 40%。观察弱势中的动能修复，金叉不能单独证明趋势反转，仍需确认价格企稳。",
 		Period: "swing",
 		Risk:   "high",
 		Tree: allOf(
 			leafTrue("macd_cross_up"),
 			leafV("macd_dif", "<", 0),
+			leafTrue("macd_gold"),
 			leafV("pos_60", "<", 40),
 		),
 	},
 	{
 		Key:    "rsi-oversold-up",
 		Name:   "RSI超卖回升",
-		Desc:   "RSI(14) 从超卖区回升至 30~45 且当日收红——恐慌抛售衰竭后的修复启动。左侧偏右的买点，比在 RSI<30 时硬接刀子安全，但仍需确认下跌主因是否消除。",
+		Desc:   "此前 5 日 RSI(14) 曾低于 30，最新 RSI 回升至 30~45 且收盘上涨。观察超卖后的修复，不能据此证明抛售衰竭；下跌主因和价格企稳仍需核查。",
 		Period: "swing",
 		Risk:   "mid",
 		Tree: allOf(
 			leafBetween("rsi_14", 30, 45),
+			leafV("rsi_prior5_min", "<", 30),
+			leafTrue("rsi_rising"),
 			leafV("chg_pct", ">", 0),
 		),
 	},
 	{
 		Key:    "boll-lower-bounce",
 		Name:   "布林下轨反弹",
-		Desc:   "股价触及布林带下轨附近（带内位置 0~25%）后收红——统计意义上的超卖修复。震荡市胜率较高，单边下跌市会沿下轨阴跌（「骑轨」），需结合大盘环境。",
+		Desc:   "触及昨日已知布林下轨后收复，当前带内位置 0~25% 且收盘上涨。只处于带内低位不算反弹；单边下跌仍可能继续走低，需结合完整日线企稳和市场环境。",
 		Period: "swing",
 		Risk:   "mid",
 		Tree: allOf(
 			leafBetween("boll_pos", 0, 25),
+			leafTrue("boll_lower_reclaim"),
 			leafV("chg_pct", ">", 0.5),
 		),
 	},
 	{
 		Key:    "boll-break-up",
 		Name:   "放量突破布林上轨",
-		Desc:   "收盘突破布林上轨且放量 1.5 倍以上——波动率扩张的强势信号，常是主升浪起点。但上轨外无法长留，要么快速拉升要么回带内，节奏快，适合激进风格。",
+		Desc:   "收盘位于布林上轨之外，成交量为前 5 日均量的 1.5~6 倍。观察向上的波动扩张；价格可能延续也可能回落，需同时核查突破延伸、承接和近端阻力。",
 		Period: "swing",
 		Risk:   "high",
 		Tree: allOf(
@@ -207,7 +219,7 @@ var builtinScreens = []builtinScreen{
 	{
 		Key:    "ma-converge",
 		Name:   "均线粘合待变盘",
-		Desc:   "5/10/20 日均线彼此偏差 <2% 且波动率收敛——多空充分换手后的平衡态，变盘窗口临近。方向未定：向上放量突破跟进，向下破位回避。这是「等信号」的池子而非买入清单。",
+		Desc:   "5/10/20 日均线之间的价差占比小于 2%，近 20 日波动率低于 3%。观察均线靠拢，不能证明充分换手或预测突破时间；方向未定，需要后续价格与量能确认。",
 		Period: "swing",
 		Risk:   "mid",
 		Tree: allOf(
@@ -219,7 +231,7 @@ var builtinScreens = []builtinScreen{
 	{
 		Key:    "new-high-250",
 		Name:   "创年内新高",
-		Desc:   "收盘创近一年新高且量能温和放大——上方无套牢盘，「新高之上皆坦途」的动量逻辑。A 股新高股的延续性两极分化，需甄别是业绩驱动还是纯情绪炒作。",
+		Desc:   "至少 250 根完整日线，最新收盘严格创该窗口新高且温和放量。上市几十日的新高不算年内新高；窗口内没有更高收盘并不代表市场不存在套牢盘。",
 		Period: "swing",
 		Risk:   "mid",
 		Tree: allOf(
@@ -231,7 +243,7 @@ var builtinScreens = []builtinScreen{
 	{
 		Key:    "bull-align-trend",
 		Name:   "均线多头排列",
-		Desc:   "MA5>MA10>MA20 且站上 60 日线——教科书式的多头趋势结构，各周期持仓者全部获利、抛压小。趋势跟踪的基本盘，均线拐头前持有，适合不盯盘的波段/中线仓。",
+		Desc:   "MA5>MA10>MA20 且站上 MA60，观察中期趋势延续。均线反映历史均价，不能推断所有持仓者获利；需核对均线乖离、波动和后续破位风险。",
 		Period: "mid",
 		Risk:   "mid",
 		Tree: allOf(
@@ -243,11 +255,12 @@ var builtinScreens = []builtinScreen{
 	{
 		Key:    "year-line-stand",
 		Name:   "年线上方企稳",
-		Desc:   "股价站在年线（250 日均线）附近 -3%~10% 区间且波动温和——牛熊分界线上的蓄势区。年线是长线资金的成本锚，其上企稳说明中期趋势由弱转强。",
+		Desc:   "股价在 MA250 上方 0~10%、守住 MA20 且最新日线低点与收盘企稳，波动温和。年线反映历史均价，不能单独证明牛熊转换；需至少250根完整日线。",
 		Period: "mid",
 		Risk:   "low",
 		Tree: allOf(
-			leafBetween("bias_250", -3, 10),
+			leafBetween("bias_250", 0, 10),
+			leafTrue("rq_stabilized"),
 			leafTrue("above_ma20"),
 			leafV("volatility_20", "<", 3.5),
 		),
@@ -255,7 +268,7 @@ var builtinScreens = []builtinScreen{
 	{
 		Key:    "steady-uptrend",
 		Name:   "稳步上行趋势",
-		Desc:   "近 60 日涨 10~40%、波动率低于 3%、站稳 20/60 日线——不急不躁的慢牛形态，常见于基本面扎实的机构票。涨幅上限 40% 排除已经涨疯的，回撤风险相对小。",
+		Desc:   "近 60 日涨幅为 10~40%、近 20 日波动率低于 3%，收盘位于 MA20 和 MA60 上方。观察较平稳的历史上行趋势，不能据形态推断机构持仓、公司质量或未来回撤。",
 		Period: "mid",
 		Risk:   "low",
 		Tree: allOf(
@@ -268,7 +281,7 @@ var builtinScreens = []builtinScreen{
 	{
 		Key:    "calm-consolidation",
 		Name:   "缩量横盘蓄势",
-		Desc:   "波动率 <2.5%、量能萎缩、60 日区间中部横盘且守住 60 日线——无人问津的安静票，浮筹清洗充分。适合左侧埋伏等催化，缺点是不知道要横多久。",
+		Desc:   "近 20 日波动率低于 2.5%、近 5 日均量低于 20 日均量的 90%，股价处于 60 日区间中部且站上 MA60。观察缩量整理；量缩不能证明浮筹清洗完毕，也不能预测整理方向和时长。",
 		Period: "mid",
 		Risk:   "low",
 		Tree: allOf(
@@ -280,8 +293,8 @@ var builtinScreens = []builtinScreen{
 	},
 	{
 		Key:    "deep-oversold-chip",
-		Name:   "超跌抛压枯竭（获利盘<10%）",
-		Desc:   "获利盘不足 10%（几乎全员套牢）且股价处 60 日区间底部——想卖的早就卖了，抛压趋于枯竭的左侧关注区。要求筹码窗口完整（210 日）排除次新股失真。左侧策略需耐心与分批。",
+		Name:   "超跌低获利筹码观察",
+		Desc:   "估算获利筹码不足 10%、股价处 60 日区间底部，且筹码窗口至少 210 日。筹码来自换手衰减估计，不能证明真实持仓或抛压枯竭；未企稳时仅作左侧观察。",
 		Period: "mid",
 		Risk:   "high",
 		Tree: allOf(
@@ -293,7 +306,7 @@ var builtinScreens = []builtinScreen{
 	{
 		Key:    "low-vol-trend",
 		Name:   "低波动趋势股",
-		Desc:   "日均波幅（ATR 占比）<2.5% 且均线多头、近 20 日为正收益——波动小、趋势稳的「安稳票」，拿得住是这类票最大的优势，适合底仓配置。",
+		Desc:   "ATR 占现价低于 2.5%、均线多头排列且近 20 日涨幅为正。观察低波动上行形态；历史波动较小不保证未来稳定，仍需检查流动性、入场距离和事件风险。",
 		Period: "mid",
 		Risk:   "low",
 		Tree: allOf(
@@ -301,6 +314,31 @@ var builtinScreens = []builtinScreen{
 			leafTrue("bull_align"),
 			leafV("chg_20d", ">", 0),
 		),
+	},
+	{
+		Key: "ma20-cross-ma60", Name: "20/60日均线金叉", Period: "mid", Risk: "mid",
+		Desc: "近 3 日 MA20 上穿 MA60，当前仍保持金叉且股价站上两条均线。至少 63 根完整日线，关注中期趋势转换；均线滞后，仍需核对延伸距离。",
+		Tree: allOf(leafTrue("ma20_cross_ma60"), leafTrue("above_ma20"), leafTrue("above_ma60"), leafV("amount_yi", ">=", 1)),
+	},
+	{
+		Key: "breakout-retest", Name: "放量突破后回踩确认", Period: "swing", Risk: "mid",
+		Desc: "2～10 日前放量突破前 20 日最高价，随后回踩原平台 0.5 ATR 范围，收盘守住且低点企稳。排除突破前的普通回落和中间已失守的平台；至少 31 根日线。",
+		Tree: allOf(leafTrue("breakout_retest"), leafV("vol_boost", "<=", 1.5), leafV("amount_yi", ">=", 1)),
+	},
+	{
+		Key: "boll-squeeze-break", Name: "布林收口后放量突破", Period: "swing", Risk: "high",
+		Desc: "昨日布林带宽处于前 60 个完整观测的最低 30%，最新收盘突破昨日上轨且放量 1.5~4 倍。先收口再突破，至少 80 根日线；不能将波动扩张等同于持续上涨。",
+		Tree: allOf(leafTrue("boll_squeeze_break"), leafBetween("vol_boost", 1.5, 4), leafV("rq_close_location", ">=", 0.65), leafFalse("limit_up_today"), leafV("amount_yi", ">=", 2)),
+	},
+	{
+		Key: "donchian-55", Name: "55日价格通道突破", Period: "mid", Risk: "high",
+		Desc: "收盘严格突破此前 55 个完整交易日最高价，配合温和放量和较强收盘位置。这是常见中期趋势跟踪信号；只检查入场形态，退出由统一风险规划管理。",
+		Tree: allOf(leafTrue("donchian55_break"), leafBetween("vol_boost", 1.2, 4), leafV("rq_close_location", ">=", 0.6), leafFalse("limit_up_today"), leafV("amount_yi", ">=", 2)),
+	},
+	{
+		Key: "kdj-low-cross", Name: "KDJ低位金叉修复", Period: "short", Risk: "high",
+		Desc: "KDJ(9,3,3) 昨日 K、D 均低于 30，最新完整日 K 上穿 D 且收盘上涨，价格处于 60 日区间下半部。需要至少 60 根日线；震荡指标在单边下跌中可能反复失效，需继续确认企稳。",
+		Tree: allOf(leafTrue("kdj_low_cross"), leafV("chg_pct", ">", 0), leafV("pos_60", "<", 50), leafV("amount_yi", ">=", 1)),
 	},
 }
 

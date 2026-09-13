@@ -16,7 +16,7 @@ import (
 
 const (
 	recommendationPreferenceSnapshotVersion = "pref1"
-	executionPlanVersion                    = "ep4"
+	executionPlanVersion                    = "ep5"
 	riskBudgetVersion                       = "rb1"
 
 	executionReady       = "ready"
@@ -273,31 +273,49 @@ func buildExecutionPlan(recType string, p recPick, c candidate, snap recommendat
 	}
 
 	plannedPrice := c.Price
-	switch recType {
-	case model.RecTypeShortTerm:
-		if !shortPlanPricesValid(p, c.Price) {
-			notSuitable = append(notSuitable, "买入区间、止盈与止损的价位关系无效")
+	if p.PricePlan != nil {
+		if !researchPlanValid(p.PricePlan) {
+			notSuitable = append(notSuitable, "统一研究价位不可用，不能用模型提案或估值区间代替")
 		} else {
-			plannedPrice = p.BuyZoneHigh // 按区间上沿估算，确保整手金额不超过研究预算。
-			if c.Price < p.BuyZoneLow {
-				wait = append(wait, "当前价格尚未进入买入区间")
-			} else if c.Price > p.BuyZoneHigh {
-				wait = append(wait, "当前价格已高于买入区间，按计划不追价")
+			plannedPrice = p.PricePlan.BuyHigh
+			if c.Price < p.PricePlan.BuyLow {
+				wait = append(wait, "当前价格尚未进入程序买入区间")
+			}
+			if c.Price > p.PricePlan.BuyHigh {
+				wait = append(wait, "当前价格已高于程序买入上沿，等待回落")
+			}
+			wait = append(wait, p.PricePlan.SetupReasons...)
+			if p.PricePlan.Exit.NetRewardRisk < 1.2 {
+				wait = append(wait, "按上沿买入扣费后的第一目标不足1.2R")
 			}
 		}
-	case model.RecTypeLongTerm:
-		switch {
-		case p.ValuationLow == 0 && p.ValuationHigh == 0:
-			wait = append(wait, "长期估值区间缺失，暂不能标记为可执行")
-		case p.ValuationLow <= 0 || p.ValuationHigh <= p.ValuationLow:
-			notSuitable = append(notSuitable, "长期估值区间关系无效")
-		case c.Price < p.ValuationLow:
-			wait = append(wait, "当前价格低于研究估值区间，需先核验下跌原因")
-		case c.Price > p.ValuationHigh:
-			wait = append(wait, "当前价格高于研究估值区间，等待估值回落")
+	} else {
+		switch recType {
+		case model.RecTypeShortTerm:
+			if !shortPlanPricesValid(p, c.Price) {
+				notSuitable = append(notSuitable, "买入区间、止盈与止损的价位关系无效")
+			} else {
+				plannedPrice = p.BuyZoneHigh // 按区间上沿估算，确保整手金额不超过研究预算。
+				if c.Price < p.BuyZoneLow {
+					wait = append(wait, "当前价格尚未进入买入区间")
+				} else if c.Price > p.BuyZoneHigh {
+					wait = append(wait, "当前价格已高于买入区间，按计划不追价")
+				}
+			}
+		case model.RecTypeLongTerm:
+			switch {
+			case p.ValuationLow == 0 && p.ValuationHigh == 0:
+				wait = append(wait, "长期估值区间缺失，暂不能标记为可执行")
+			case p.ValuationLow <= 0 || p.ValuationHigh <= p.ValuationLow:
+				notSuitable = append(notSuitable, "长期估值区间关系无效")
+			case c.Price < p.ValuationLow:
+				wait = append(wait, "当前价格低于研究估值区间，需先核验下跌原因")
+			case c.Price > p.ValuationHigh:
+				wait = append(wait, "当前价格高于研究估值区间，等待估值回落")
+			}
+		default:
+			notSuitable = append(notSuitable, "推荐周期类型无效")
 		}
-	default:
-		notSuitable = append(notSuitable, "推荐周期类型无效")
 	}
 
 	if p.Action == model.RecActionBuy {
@@ -316,7 +334,7 @@ func buildExecutionPlan(recType string, p recPick, c candidate, snap recommendat
 				plan.PlannedPrice = round2(plannedPrice)
 				plan.Quantity = affordableBoardLotQuantity(c.Market, p.Symbol, plannedPrice, plan.PlannedCapital, lots*100)
 				if plan.Quantity <= 0 {
-					notSuitable = append(notSuitable, "计划资金计入买入费用后不足一手（100股）")
+					notSuitable = append(notSuitable, "计划资金计入费用后不足最小买入数量（"+strconv.Itoa(cnMinimumBuyQuantity(c.Symbol))+"股）")
 				} else {
 					buyAmount := float64(plan.Quantity) * plannedPrice
 					buyFee, buyTax := tradeFee(c.Market, model.PaperSideBuy, p.Symbol, buyAmount)
@@ -348,7 +366,11 @@ func buildExecutionPlan(recType string, p recPick, c candidate, snap recommendat
 }
 
 func affordableBoardLotQuantity(market, symbol string, price, budget float64, initial int) int {
-	for quantity := initial; quantity >= 100; quantity -= 100 {
+	minimum := 100
+	if market == "cn" {
+		minimum = cnMinimumBuyQuantity(symbol)
+	}
+	for quantity := initial; quantity >= minimum; quantity -= 100 {
 		amount := float64(quantity) * price
 		fee, tax := tradeFee(market, model.PaperSideBuy, symbol, amount)
 		if round2(amount+fee+tax) <= budget {

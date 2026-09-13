@@ -324,17 +324,18 @@ const (
 // ScanRequest 扫描入参：template_key（新手模板）/ strategy_key（内置）/
 // strategy_id（自定义）/ tree（临时试跑）四选一。
 type ScanRequest struct {
-	TemplateKey          string                      `json:"template_key"`
-	TemplateVersion      int                         `json:"template_version"`
-	TemplateParams       map[string]float64          `json:"template_params,omitempty"`
-	StrategyKey          string                      `json:"strategy_key"`
-	StrategyID           int64                       `json:"strategy_id"`
-	StrategyRevisionID   int64                       `json:"strategy_revision_id"`
-	Tree                 *CondNode                   `json:"tree"`
-	IncludeST            bool                        `json:"include_st"`    // 默认排除 ST/退市警示
-	IncludeStale         bool                        `json:"include_stale"` // 默认排除末根≠最新交易日的股（停牌/滞后，旧价因子会误导）
-	Limit                int                         `json:"limit"`
-	preselectionProfile  string                      // 仅推荐内部使用，普通选股请求保持原有排序契约
+	TemplateKey          string             `json:"template_key"`
+	TemplateVersion      int                `json:"template_version"`
+	TemplateParams       map[string]float64 `json:"template_params,omitempty"`
+	StrategyKey          string             `json:"strategy_key"`
+	StrategyID           int64              `json:"strategy_id"`
+	StrategyRevisionID   int64              `json:"strategy_revision_id"`
+	Tree                 *CondNode          `json:"tree"`
+	IncludeST            bool               `json:"include_st"`    // 默认排除 ST/退市警示
+	IncludeStale         bool               `json:"include_stale"` // 默认排除末根≠最新交易日的股（停牌/滞后，旧价因子会误导）
+	Limit                int                `json:"limit"`
+	preselectionProfile  string             // 仅推荐内部使用，普通选股请求保持原有排序契约
+	preselectionIntent   string
 	frozenRecommendation *recommendationFrozenScreen // 仅作业恢复注入，HTTP 无法提交
 }
 
@@ -458,7 +459,7 @@ func (s *ScreenerService) Scan(ctx context.Context, userID int64, req ScanReques
 	amountCol := t.Col("amount_yi")
 	preselected := map[int]*recPreselection{}
 	if req.preselectionProfile != "" {
-		preselected = rankRecommendationScan(t, matchedIdx, req.preselectionProfile, limit)
+		preselected = rankRecommendationScan(t, matchedIdx, req.preselectionProfile, limit, req.preselectionIntent)
 	} else {
 		sort.Slice(matchedIdx, func(a, b int) bool {
 			av, bv := amountCol[matchedIdx[a]], amountCol[matchedIdx[b]]

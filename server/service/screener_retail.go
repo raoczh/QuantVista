@@ -7,7 +7,7 @@ import (
 	"sort"
 )
 
-const retailTemplateVersion = 1
+const retailTemplateVersion = 2
 
 type RetailTemplateParam struct {
 	Key     string  `json:"key"`
@@ -61,7 +61,7 @@ var retailTemplates = []retailTemplate{
 			Params: []RetailTemplateParam{{Key: "min_prior_gain", Label: "此前最小涨幅", Default: 10, Min: 3, Max: 30, Step: 1, Unit: "%"}, {Key: "max_pullback", Label: "近 5 日最大回调", Default: 8, Min: 1, Max: 15, Step: 1, Unit: "%"}},
 		},
 		build: func(p map[string]float64) CondNode {
-			return allOf(leafV("chg_20d", ">=", p["min_prior_gain"]), leafBetween("chg_5d", -p["max_pullback"], 0), leafTrue("above_ma20"), leafV("vol_5v20", "<", 1))
+			return allOf(leafV("chg_20d", ">=", p["min_prior_gain"]), leafBetween("chg_5d", -p["max_pullback"], 0), leafTrue("above_ma20"), leafBetween("rq_ma20_dist", 0, 1.2), leafV("vol_5v20", "<", 1))
 		},
 	},
 	{
@@ -74,7 +74,7 @@ var retailTemplates = []retailTemplate{
 			Params: []RetailTemplateParam{{Key: "min_volume", Label: "最小放量倍数", Default: 1.5, Min: 1.1, Max: 4, Step: 0.1, Unit: "倍"}, {Key: "max_day_gain", Label: "当日最大涨幅", Default: 8, Min: 3, Max: 9.5, Step: 0.5, Unit: "%"}},
 		},
 		build: func(p map[string]float64) CondNode {
-			return allOf(leafTrue("high_20d"), leafBetween("vol_boost", p["min_volume"], 5), leafV("chg_pct", "<=", p["max_day_gain"]), leafV("amount_yi", ">=", 2))
+			return allOf(leafTrue("high_20d"), leafBetween("vol_boost", p["min_volume"], 5), leafV("chg_pct", "<=", p["max_day_gain"]), leafFalse("limit_up_today"), leafV("amount_yi", ">=", 2))
 		},
 	},
 	{

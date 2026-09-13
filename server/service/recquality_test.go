@@ -15,8 +15,8 @@ func qgFullCandidate() candidate {
 	return candidate{
 		Symbol: "600100", Market: "cn", Name: "甲", Price: 10, Amount: 5e8,
 		SentiNews: 3, SentiScore: 0.2,
-		Factors: &candFactors{BarCount: 90, Chg5d: 2},
-		Fin:     &candFin{ROE: 12},
+		Factors:     &candFactors{BarCount: 90, Chg5d: 2},
+		Fin:         &candFin{ROE: recNumber(12)},
 		lastBarDate: "2026-06-10",
 	}
 }
@@ -83,9 +83,9 @@ func TestComputeQualityGate(t *testing.T) {
 
 	t.Run("多项命中取最小 cap 且缺失面全记", func(t *testing.T) {
 		c := qgFullCandidate()
-		c.Fin = nil                  // 长线 40
-		c.Amount = 0                 // 50
-		c.Factors.BarCount = 30      // 60
+		c.Fin = nil             // 长线 40
+		c.Amount = 0            // 50
+		c.Factors.BarCount = 30 // 60
 		got := computeQualityGate(model.RecTypeLongTerm, c, today, nil)
 		if got == nil || got.WouldBeConfidenceCap != qgCapLongNoFin {
 			t.Fatalf("多项命中应取最小 cap %d: %+v", qgCapLongNoFin, got)
@@ -162,8 +162,8 @@ func TestApplyQualityGateShadow(t *testing.T) {
 	pool := map[string]candidate{"600100": full, "600200": noFin, "600300": lowConf}
 
 	picks := []recPick{
-		{Symbol: "600100", Action: model.RecActionBuy, Confidence: 80},  // 齐全：无明细无事件
-		{Symbol: "600200", Action: model.RecActionBuy, Confidence: 80},  // cap 40 < 80：明细+事件
+		{Symbol: "600100", Action: model.RecActionBuy, Confidence: 80},   // 齐全：无明细无事件
+		{Symbol: "600200", Action: model.RecActionBuy, Confidence: 80},   // cap 40 < 80：明细+事件
 		{Symbol: "600300", Action: model.RecActionWatch, Confidence: 30}, // cap 40 ≥ 30：明细、无事件
 	}
 	gates := applyQualityGateShadow(model.RecTypeLongTerm, picks, pool)

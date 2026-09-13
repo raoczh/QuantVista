@@ -170,6 +170,30 @@ func (s *PositionService) PreviewPositionExitPlan(ctx context.Context, userID in
 }
 
 func attachRecommendationExitPlan(ctx context.Context, recType string, pick *recPick, c candidate, profile string) {
+	if pick.ExecutionPlan != nil && pick.PricePlan != nil {
+		if !researchPlanValid(pick.PricePlan) {
+			return
+		}
+		seed := *pick.PricePlan.Exit
+		seed.Evidence = append(append([]string{}, seed.Evidence...), "买卖价沿用送模前冻结的共同规划；AI耗时后的新报价只复核执行条件，不重定目标")
+		if pick.ExecutionPlan.Quantity > 0 {
+			seed.Quantity = float64(pick.ExecutionPlan.Quantity)
+			fee, tax := tradeFee(c.Market, model.PaperSideBuy, c.Symbol, seed.EntryPrice*seed.Quantity)
+			seed.Cost = round4(seed.EntryPrice*seed.Quantity + fee + tax)
+			p := model.Position{Symbol: c.Symbol, Market: c.Market}
+			seed.EstimatedRisk = round4(seed.Cost - exitNetProceeds(p, seed.StopPrice, seed.Quantity, seed.SlippageBPS))
+			seed.EstimatedReward = round4(exitNetProceeds(p, seed.TargetPrice, seed.Quantity, seed.SlippageBPS) - seed.Cost)
+			seed.EstimatedExtendedReward = round4(exitNetProceeds(p, seed.ExtendedTarget, seed.Quantity, seed.SlippageBPS) - seed.Cost)
+			if seed.EstimatedRisk > 0 {
+				seed.NetRewardRisk = round4(seed.EstimatedReward / seed.EstimatedRisk)
+			}
+			risk := seed.EstimatedRisk
+			pick.ExecutionPlan.MaxPlannedLoss = &risk
+		}
+		sealExitSeed(&seed)
+		pick.ExecutionPlan.ExitPlan = &seed
+		return
+	}
 	if pick.ExecutionPlan == nil || common.DB == nil {
 		return
 	}
@@ -236,11 +260,10 @@ func exitQuoteExecutionNotes(p model.Position, q FreshQuoteResult, now time.Time
 		notes = append(notes, "行情没有有效成交量，需核对停牌及实际可成交性")
 	}
 	if quote.PrevClose > 0 {
-		limit := limitUpPctFor(p.Symbol, p.Name)
-		if boardLimit := limitUpPctFor(p.Symbol, ""); boardLimit >= 20 {
-			limit = boardLimit
-		}
-		if quote.Price <= exitFloor(quote.PrevClose*(1-limit/100), exitPriceTick(p.Symbol))+exitPriceTick(p.Symbol)/2 {
+		limit := limitUpPctForDate(p.Symbol, p.Name, quote.DataTime.In(time.Local).Format("2006-01-02"))
+		tick := exitPriceTick(p.Symbol)
+		limitPrice := math.Round(quote.PrevClose*(1-limit/100)/tick) * tick
+		if quote.Price <= limitPrice+tick/2 {
 			notes = append(notes, "现价处于跌停附近，触发保护也可能无法及时成交，不能按保护价估计实际成交")
 		}
 	}

@@ -27,10 +27,11 @@ import (
 // 评估一切门控/复核/候选来源的地基（错失机会率、gated vs ungated 配对、risk-coverage）。
 
 const (
-	// labelVersion 执行结算语义版本。l3：开盘跳空按开盘价触发障碍，整手预算包含费用。
+	// labelVersion 执行结算语义版本。l4：逐交易日应用风险警示规则与科创板买入数量。
+	// l3：开盘跳空按开盘价触发障碍，整手预算包含费用。
 	// 沿用 l2 的 T+1、市场日轴和退出价守卫。旧 pending 按新口径结算后升级；
 	// 旧终态保持原值，消费方按版本过滤，避免混合不同执行语义。
-	labelVersion = "l3"
+	labelVersion = "l4"
 	// candidateRankingVersion 记录候选量化名次与实际 LLM 输入顺序的事实口径。
 	// cr2：财务/资金流补拉集合由富化前 A 类/PIT 基础分确定，基础分和最终分的并列
 	// 均以 symbol 升序稳定决胜，统一富化后才终评。cr1 的冷缓存预算可能按候选遍历

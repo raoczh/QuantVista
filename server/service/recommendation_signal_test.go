@@ -110,8 +110,8 @@ func TestQualityFinanceDoesNotRewardCheapLossOrMissingData(t *testing.T) {
 	if missing != 0 || state != "missing" {
 		t.Fatal("缺财报时低 PE/PB 不能自行证明价值")
 	}
-	good := candidate{PETTM: 12, PB: 1.2, Fin: &candFin{Report: "年报", ROE: 12, RevenueYoY: 10, NetProfitYoY: 15}}
-	loss := candidate{PETTM: -3, PB: 0.3, Fin: &candFin{Report: "年报", ROE: -4, RevenueYoY: -10, NetProfitYoY: -50}}
+	good := candidate{PETTM: 12, PB: 1.2, Fin: &candFin{Report: "年报", AnnualReportDate: "2025-12-31", AnnualROE: recNumber(12), RevenueYoY: recNumber(10), NetProfitYoY: recNumber(15)}}
+	loss := candidate{PETTM: -3, PB: 0.3, Fin: &candFin{Report: "年报", AnnualReportDate: "2025-12-31", AnnualROE: recNumber(-4), RevenueYoY: recNumber(-10), NetProfitYoY: recNumber(-50)}}
 	for _, profile := range []string{"value", "growth", "leader"} {
 		a, _, _ := qualityFinanceScore(profile, good)
 		b, _, _ := qualityFinanceScore(profile, loss)
