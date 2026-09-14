@@ -16,7 +16,7 @@ import (
 
 const (
 	recommendationPreferenceSnapshotVersion = "pref1"
-	executionPlanVersion                    = "ep5"
+	executionPlanVersion                    = "ep6"
 	riskBudgetVersion                       = "rb1"
 
 	executionReady       = "ready"

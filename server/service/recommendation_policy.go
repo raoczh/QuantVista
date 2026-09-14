@@ -85,6 +85,9 @@ func readRankingArtifact(row model.RankingModelArtifact) (*rankingArtifactPayloa
 	if p.Version != "ra1" || p.Report == nil || p.Report.Version != rankingResearchVersion || p.Report.Request.RecType != row.RecType || p.Report.Request.Profile != row.Profile || p.Report.Request.Horizon != row.Horizon || p.Report.Request.Target != row.Target || p.Report.Request.AsOf != row.AsOf || p.Report.DatasetHash != row.DatasetHash || p.Report.PromotionReady != row.Eligible {
 		return nil, errors.New("模型工件与评估依据不一致")
 	}
+	if p.Report.FeatureVersion != rankingResearchFeatureVersion {
+		return nil, errors.New("学习模型特征版本已变化，请使用当前事实重新评估，不能混用旧权重")
+	}
 	if err := validateRankingRidge(p.Model); err != nil {
 		return nil, err
 	}
@@ -150,7 +153,7 @@ func loadRecScoringRuntime(ctx context.Context, db *gorm.DB, recType, profile st
 	r.Algorithm = policy.Algorithm
 	// 旧规则选择随发布升级为当前规则，批次仍冻结实际版本；不改写已有政策行
 	// 或历史输出。学习模型必须重新通过当前特征版本的检验，不能自动迁移权重。
-	if r.Algorithm == "qr1" {
+	if r.Algorithm == "qr1" || r.Algorithm == "qr2" {
 		r.Algorithm = recommendationScoringVersion
 	}
 	if r.Algorithm == rankingRidgeVersion {

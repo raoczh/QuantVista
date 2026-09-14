@@ -10,7 +10,7 @@ import (
 	"quantvista/model"
 )
 
-const researchPricePlanVersion = "rp1"
+const researchPricePlanVersion = "rp2"
 
 type ResearchPriceContext struct {
 	StrategyKey        string `json:"strategy_key"`
@@ -197,6 +197,12 @@ func buildResearchPricePlan(c candidate, bars []datasource.Bar, pc ResearchPrice
 		anchor = *q.BreakoutLevel
 		confirmed := q.BreakoutConfirmed != nil && *q.BreakoutConfirmed
 		switch key {
+		case "nr7-breakout":
+			setup := commonSetupFactors(completed)
+			if level := setup["nr7_level"]; level > 0 {
+				anchor = level
+			}
+			confirmed = setup["nr7_break"] == 1
 		case "boll-break-up", "boll-squeeze-break":
 			up, _, _ := bollSeries(closes, 20, 2)
 			anchor = up[len(up)-2]

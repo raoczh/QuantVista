@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-const recommendationScoringVersion = "qr2"
+const recommendationScoringVersion = "qr3"
 
 type recScoreComponent struct {
 	Key    string   `json:"key"`
@@ -255,7 +255,12 @@ func qualityFinanceScore(profile string, c candidate) (float64, []string, string
 		notes = append(notes, "财务证据缺少："+strings.Join(missing, "、"))
 	}
 	score := 0.0
-	if c.PETTM < 0 {
+	positiveEarnings := fin.hasPositiveEarnings()
+	notes = append(notes, financeEvidenceNote(fin))
+	if fin.has(fin.NetProfit) && *fin.NetProfit < 0 {
+		score -= 6
+		notes = append(notes, "最新报告归母净利润为负，不给予盈利质量加分")
+	} else if c.PETTM < 0 {
 		score -= 6
 		notes = append(notes, "PE 为负，不能将低估值解释为盈利质量")
 	}
@@ -276,24 +281,24 @@ func qualityFinanceScore(profile string, c candidate) (float64, []string, string
 		if c.IndustryPeers != nil && c.IndustryPeers.PBPercentile != nil {
 			pbOK = *c.IndustryPeers.PBPercentile <= 50
 		}
-		if peOK && fin.hasAnnualROE() && *fin.AnnualROE >= 8 {
+		if positiveEarnings && peOK && fin.hasAnnualROE() && *fin.AnnualROE >= 8 {
 			score += 5
 			notes = append(notes, "估值与盈利能力同时满足价值参照")
 		}
-		if pbOK && fin.hasAnnualROE() && *fin.AnnualROE >= 10 {
+		if positiveEarnings && pbOK && fin.hasAnnualROE() && *fin.AnnualROE >= 10 {
 			score += 2
 			notes = append(notes, "净资产定价与最近年报 ROE 相互支持")
 		}
-		if fin.has(fin.NetProfitYoY) && *fin.NetProfitYoY >= 10 {
+		if fin.hasPositiveBaseGrowth() && *fin.NetProfitYoY >= 10 {
 			score += 3
-			notes = append(notes, "净利润保持正增长")
+			notes = append(notes, "归母净利润在上年同期正盈利基期上增长")
 		}
 	case "growth":
-		if fin.has(fin.RevenueYoY) && fin.has(fin.NetProfitYoY) && *fin.RevenueYoY >= 10 && *fin.NetProfitYoY >= 15 {
+		if fin.hasPositiveBaseGrowth() && fin.has(fin.RevenueYoY) && *fin.RevenueYoY >= 10 && *fin.NetProfitYoY >= 15 {
 			score += 8
-			notes = append(notes, "营收与净利润双增长")
+			notes = append(notes, "营收与归母净利润双增长，且扣非盈利与上年同期正盈利基期已核对")
 		}
-		if fin.hasAnnualROE() && *fin.AnnualROE >= 12 {
+		if positiveEarnings && fin.hasAnnualROE() && *fin.AnnualROE >= 12 {
 			score += 3
 			notes = append(notes, "最近年报 ROE 支持年度盈利质量")
 		}
@@ -302,7 +307,7 @@ func qualityFinanceScore(profile string, c candidate) (float64, []string, string
 			notes = append(notes, "营收同比下降，成长依据减弱")
 		}
 	case "leader":
-		if fin.hasAnnualROE() && fin.has(fin.NetProfitYoY) && *fin.AnnualROE >= 15 && *fin.NetProfitYoY >= 0 {
+		if positiveEarnings && fin.hasAnnualROE() && fin.has(fin.NetProfitYoY) && *fin.AnnualROE >= 15 && *fin.NetProfitYoY >= 0 {
 			score += 7
 			notes = append(notes, "最近年报 ROE 较高且最新报告净利润同比未下滑")
 		}

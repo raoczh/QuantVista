@@ -60,3 +60,14 @@ for (const row of [{ ...financeRow, net_profit_yoy: -8 }, { ...financeRow, debt_
   assert.match(risk.evidence, /缺失/)
 }
 console.log('财务缺失与真实零展示测试通过')
+
+for (const row of [
+  { ...financeRow, revenue_yoy: 20, net_profit_yoy: 50, net_profit: -1000, deduct_profit: -1200 },
+  { ...financeRow, revenue_yoy: 20, net_profit_yoy: 50, net_profit: 1000, deduct_profit: 0 },
+]) {
+  const summary = summarize(row)
+  assert.equal(summary.changes.find((item) => item.id === 'finance-change').tone, 'warning')
+  assert.match(summary.risks.find((item) => item.id === 'finance-risk').title, /净利润不为正/)
+  assert.match(summary.changes.find((item) => item.id === 'finance-change').detail, /亏损收窄或扭亏/)
+}
+console.log('亏损收窄与扣非未盈利不能显示成盈利成长')

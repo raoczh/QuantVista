@@ -27,7 +27,8 @@ import (
 // fv5：无成交额保持未知，避免上游未提供时被解释成真实零成交额。
 // fv6：冻结机会质量与原始技术维度；历史评估直接读取当时观测，不事后重算特征。
 // fv7：完整窗口/20个收益、严格新高及顺序形态，冻结突破起点 ATR；历史行不重写。
-const factorSnapshotVersion = "fv7"
+// fv8：增加 DMI/ADX、RSI2、NR7 与长期趋势模板；旧快照缺键仍为未知。
+const factorSnapshotVersion = "fv8"
 
 // SnapshotFactorTable 把宽表 t 固化落库。已有行不可变（重建/重跑不覆盖——daily_bars
 // 前复权重锚会整股重写，覆盖=把重写后的值伪装成当时快照，PIT 泄漏）；同一 trade_date

@@ -10,7 +10,7 @@ import (
 // 时间序列形态必须验证前后关系。只读取传入的完整日线；缺少整个所需窗口时
 // 不返回该因子，宽表保留 NaN，不能以 false 或中性数值代替未知。
 func commonSetupFactors(bars []datasource.Bar) map[string]float64 {
-	out := map[string]float64{}
+	out := extendedSetupFactors(bars)
 	n := len(bars)
 	if n == 0 {
 		return out

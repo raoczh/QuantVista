@@ -19,7 +19,7 @@ func rankingArtifactFixture(t *testing.T, eligible bool) model.RankingModelArtif
 	if err != nil {
 		t.Fatal(err)
 	}
-	rep := &RankingResearchReport{Version: rankingResearchVersion, Request: RankingResearchRequest{Source: "recommendations", RecType: model.RecTypeShortTerm, Profile: "momentum", Horizon: 10, Target: "net", AsOf: "2026-01-01"}, DatasetHash: strings.Repeat("a", 64), Evaluated: true, PromotionReady: eligible}
+	rep := &RankingResearchReport{Version: rankingResearchVersion, FeatureVersion: rankingResearchFeatureVersion, Request: RankingResearchRequest{Source: "recommendations", RecType: model.RecTypeShortTerm, Profile: "momentum", Horizon: 10, Target: "net", AsOf: "2026-01-01"}, DatasetHash: strings.Repeat("a", 64), Evaluated: true, PromotionReady: eligible}
 	if !eligible {
 		rep.PromotionReasons = []string{"合成 fixture：仅供代码验证，缺少真实验证证据"}
 	}
@@ -28,6 +28,49 @@ func rankingArtifactFixture(t *testing.T, eligible bool) model.RankingModelArtif
 		t.Fatal(err)
 	}
 	return model.RankingModelArtifact{RecType: rep.Request.RecType, Profile: rep.Request.Profile, Horizon: rep.Request.Horizon, Target: rep.Request.Target, Version: rankingRidgeVersion, DatasetHash: rep.DatasetHash, ArtifactHash: rankingJSONHash(data), Eligible: eligible, AsOf: rep.Request.AsOf, Payload: string(data), CreatedBy: 1}
+}
+
+func TestRankingPolicyUpgradeDoesNotRewriteHistory(t *testing.T) {
+	for _, previous := range []string{"qr1", "qr2"} {
+		t.Run(previous, func(t *testing.T) {
+			setupTestDB(t)
+			policy := model.RankingScoringPolicy{Key: "short_term:momentum", RecType: model.RecTypeShortTerm, Profile: "momentum", Algorithm: previous}
+			if err := common.DB.Create(&policy).Error; err != nil {
+				t.Fatal(err)
+			}
+			runtime, err := loadRecScoringRuntime(t.Context(), common.DB, model.RecTypeShortTerm, "momentum")
+			if err != nil || runtime.Algorithm != recommendationScoringVersion {
+				t.Fatalf("新任务应使用当前规则：%+v %v", runtime, err)
+			}
+			var stored model.RankingScoringPolicy
+			if err := common.DB.Where("`key` = ?", policy.Key).First(&stored).Error; err != nil || stored.Algorithm != previous {
+				t.Fatal("读取新任务配置不能改写旧政策记录")
+			}
+			if validateRecScoringRuntime(recScoringRuntime{Algorithm: previous}) == nil {
+				t.Fatal("已冻结旧任务的版本不能伪装成当前实现")
+			}
+		})
+	}
+}
+
+func TestRankingArtifactRejectsDifferentFeatureDefinition(t *testing.T) {
+	row := rankingArtifactFixture(t, true)
+	if _, err := readRankingArtifact(row); err != nil {
+		t.Fatal(err)
+	}
+	var payload rankingArtifactPayload
+	if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+		t.Fatal(err)
+	}
+	payload.Report.FeatureVersion = "of2 / fv7 / sq2"
+	b, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row.Payload, row.ArtifactHash = string(b), rankingJSONHash(b)
+	if _, err := readRankingArtifact(row); err == nil || !strings.Contains(err.Error(), "特征版本") {
+		t.Fatalf("即使摘要自洽，也不能装载另一套特征上的权重：%v", err)
+	}
 }
 
 func TestRankingPolicyExplicitActivationRollbackAndCAS(t *testing.T) {

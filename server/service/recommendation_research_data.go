@@ -20,7 +20,9 @@ import (
 	"gorm.io/gorm"
 )
 
-const rankingResearchVersion = "rr2"
+const rankingResearchVersion = "rr3"
+
+const rankingResearchFeatureVersion = recommendationOptimizationFactVersion + " / " + factorSnapshotVersion + " / " + recommendationSignalVersion
 
 type RankingResearchRequest struct {
 	Source     string `json:"source" form:"source"` // recommendations / snapshots

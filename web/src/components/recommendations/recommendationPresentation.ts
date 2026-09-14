@@ -33,7 +33,7 @@ export function rankedScore(score?: number, rank?: number): number | undefined {
 }
 
 export function scoringVersionLabel(version?: string): string {
-  return ({ qr1: '历史质量规则', qr2: '质量规则', additive_sp1: '原加法评分对照', ridge1: '学习排序' } as Record<string,string>)[version || ''] || version || '历史未记录'
+  return ({ qr1: '历史质量规则', qr2: '历史质量规则', qr3: '质量规则', additive_sp1: '原加法评分对照', ridge1: '学习排序' } as Record<string,string>)[version || ''] || version || '历史未记录'
 }
 
 export function scoreComponentLabel(key: string): string {

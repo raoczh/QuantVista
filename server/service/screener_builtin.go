@@ -2,7 +2,7 @@ package service
 
 import "quantvista/model"
 
-// 内置选股策略（26 个）：只用因子宽表已注册因子（factorDefs），
+// 内置选股策略（30 个）：只用因子宽表已注册因子（factorDefs），
 // 白话讲解 + 适用周期 + 风险等级。参考 StockNova builtin 思路按现有因子重写，
 // 阈值沿用项目内已有共识（量比 1.5~5 温和放量、换手 3~15 活跃、RSI 凹形逻辑等）。
 //
@@ -339,6 +339,26 @@ var builtinScreens = []builtinScreen{
 		Key: "kdj-low-cross", Name: "KDJ低位金叉修复", Period: "short", Risk: "high",
 		Desc: "KDJ(9,3,3) 昨日 K、D 均低于 30，最新完整日 K 上穿 D 且收盘上涨，价格处于 60 日区间下半部。需要至少 60 根日线；震荡指标在单边下跌中可能反复失效，需继续确认企稳。",
 		Tree: allOf(leafTrue("kdj_low_cross"), leafV("chg_pct", ">", 0), leafV("pos_60", "<", 50), leafV("amount_yi", ">=", 1)),
+	},
+	{
+		Key: "dmi-trend-confirm", Name: "DMI多头趋势确认", Period: "swing", Risk: "mid",
+		Desc: "近 3 日 +DI 上穿 -DI 并保持，ADX(14) 至少 20 且回升，股价站上 MA60。使用 Wilder 平滑并至少预热 150 根日线；ADX 只表示趋势强度，必须同时核对方向与入场距离。",
+		Tree: allOf(leafTrue("dmi_bull_cross"), leafRef("dmi_pdi14", ">", "dmi_mdi14"), leafV("adx_14", ">=", 20), leafTrue("adx_rising"), leafTrue("above_ma60"), leafBetween("rq_ma20_dist", 0, 2), leafV("amount_yi", ">=", 1)),
+	},
+	{
+		Key: "nr7-breakout", Name: "NR7窄幅整理突破", Period: "short", Risk: "high",
+		Desc: "昨日振幅为最近 7 日严格最小，今日放量收盘突破昨日高点，且站上 MA20/MA60。排除无成交和一字线形成的假收敛；窄幅突破可能失败，涨停信号不入选，突破参照仍用昨日高点。",
+		Tree: allOf(leafTrue("nr7_break"), leafTrue("above_ma20"), leafTrue("above_ma60"), leafBetween("vol_boost", 1.2, 3), leafV("rq_close_location", ">=", .65), leafFalse("limit_up_today"), leafV("amount_yi", ">=", 1)),
+	},
+	{
+		Key: "rsi2-trend-reclaim", Name: "长期趋势内RSI2回调修复", Period: "short", Risk: "mid",
+		Desc: "股价位于上行 MA200 上方、MA5 下方，昨日 RSI(2) 低于 10，今日回到 10~50 且低点与收盘企稳。至少 220 根完整日线，观察长期趋势中的短期超卖修复；单边下跌中的超卖不符合本策略。",
+		Tree: allOf(leafTrue("ma200_rising"), leafRef("close", ">", "ma200"), leafRef("close", "<", "ma5"), leafTrue("rsi2_reclaim"), leafBetween("rsi_2", 10, 50), leafV("amount_yi", ">=", 1)),
+	},
+	{
+		Key: "long-trend-template", Name: "50/150/200日趋势模板", Period: "mid", Risk: "mid",
+		Desc: "收盘>MA50>MA150>MA200，MA200 高于 20 日前，收盘比 250 日低点高至少 30%、距离高点不超过 25%，且距 MA20 不超过 2 ATR。参考常见长期趋势模板的价格条件；不包含相对强度排名或盈利成长验证。",
+		Tree: allOf(leafTrue("long_trend_template"), leafBetween("rq_ma20_dist", 0, 2), leafV("amount_yi", ">=", 1)),
 	},
 }
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"sort"
 	"strings"
 
 	"quantvista/datasource"
@@ -599,6 +600,20 @@ func candidateLabeledValues(c candidate) []labeledValue {
 	if c.FinalCheck != nil {
 		out = append(out, labeledVals("final_check.price", c.FinalCheck.Price)...)
 	}
+	if c.StrategyHit != nil {
+		keys := make([]string, 0, len(c.StrategyHit.Values))
+		for key := range c.StrategyHit.Values {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys) // 冻结相同因子时，证据编号不受 map 遍历顺序影响。
+		for _, key := range keys {
+			value := c.StrategyHit.Values[key]
+			if _, known := factorByKey(key); known && finiteRecNumber(value) {
+				// 条件值已由完整宽表求值，0 可以是真实的 false/指标零，不等于未知。
+				out = append(out, labeledValue{Path: "strategy_hit.values." + key, Value: value})
+			}
+		}
+	}
 	if c.Factors != nil {
 		f := c.Factors
 		out = append(out, labeledVals("factors.ma5", f.MA5)...)
@@ -645,6 +660,8 @@ func candidateLabeledValues(c candidate) []labeledValue {
 			value *float64
 		}{
 			{"fin.roe", c.Fin.ROE}, {"fin.revenue_yoy", c.Fin.RevenueYoY}, {"fin.net_profit_yoy", c.Fin.NetProfitYoY},
+			{"fin.net_profit", c.Fin.NetProfit}, {"fin.deduct_profit", c.Fin.DeductProfit},
+			{"fin.deduct_profit_yoy", c.Fin.DeductProfitYoY}, {"fin.ocf_ps", c.Fin.OCFPS},
 			{"fin.gross_margin", c.Fin.GrossMargin}, {"fin.net_margin", c.Fin.NetMargin}, {"fin.debt_ratio", c.Fin.DebtRatio},
 		} {
 			if c.Fin.has(v.value) {
@@ -653,6 +670,9 @@ func candidateLabeledValues(c candidate) []labeledValue {
 		}
 		if c.Fin.hasAnnualROE() {
 			out = append(out, labeledValue{Path: "fin.annual_roe", Value: *c.Fin.AnnualROE})
+		}
+		if c.Fin.hasComparableProfit() {
+			out = append(out, labeledValue{Path: "fin.prior_net_profit", Value: *c.Fin.PriorNetProfit})
 		}
 	}
 	return out

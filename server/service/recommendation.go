@@ -37,8 +37,8 @@ func NewRecommendationService(market *MarketService, watchlist *WatchlistService
 }
 
 const (
-	recPromptVersion   = "p18" // p17: 说明质量事实、策略侧重、入场等待及多算法排序语义；p16: 候选输入增加近5日发现记忆与7日内标题级真实新闻（不扩候选边界/条数/token预算）；p15: 撤销 p14 输出体积限制（用户定夺：不为省 token 限制输出——预算已放开+截断自动扩容 repair，恢复全量落选理由与不限条数）；p14: 控制结构化输出体积（已撤销）；p13: P1-2 长线 pick 新增 invalidation 失效条件字段（短线既有；schema recommendation.v2）
-	recStrategyVersion = "s13" // s12: 全量命中预选、显式策略侧重、质量分组、入场复核与版本化算法；s11: 选股类策略固定250根因子窗口并优先保证所选策略入池/评分名额；s10: 五维基础分按策略意图重加权（strategyDimWeights：回踩/价值降动量与位置权重、升风险权重；活跃升量能权重）+ 选股类推荐策略条件命中度加分（全中 +12/部分按比例/明显不符 -4，与选股引擎同因子同求值）；s9: S1-3 名单去相关（相关性去重+同行业≤2 只，被挤出者记反事实事件）；s8: M3b 盘中因子短线加分项（尾盘放量拉升/跳水/收盘vs VWAP/午后重心上移/早盘强势）；s7: M3a 龙虎榜净买/机构席位/人气跃升/主力连续净流入加分项 + 量能维融合主力资金分；s6: F2 财务加分项（value ROE/growth 双增速/leader 盈利质量 + 业绩恶化通用扣分）；s5: T1 指标加分项 + 筹码超跌 + 五维动量/风险维升级；s4: 消息面情绪因子；s3: 策略-来源映射 + 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
+	recPromptVersion   = "p19" // p17: 说明质量事实、策略侧重、入场等待及多算法排序语义；p16: 候选输入增加近5日发现记忆与7日内标题级真实新闻（不扩候选边界/条数/token预算）；p15: 撤销 p14 输出体积限制（用户定夺：不为省 token 限制输出——预算已放开+截断自动扩容 repair，恢复全量落选理由与不限条数）；p14: 控制结构化输出体积（已撤销）；p13: P1-2 长线 pick 新增 invalidation 失效条件字段（短线既有；schema recommendation.v2）
+	recStrategyVersion = "s14" // s12: 全量命中预选、显式策略侧重、质量分组、入场复核与版本化算法；s11: 选股类策略固定250根因子窗口并优先保证所选策略入池/评分名额；s10: 五维基础分按策略意图重加权（strategyDimWeights：回踩/价值降动量与位置权重、升风险权重；活跃升量能权重）+ 选股类推荐策略条件命中度加分（全中 +12/部分按比例/明显不符 -4，与选股引擎同因子同求值）；s9: S1-3 名单去相关（相关性去重+同行业≤2 只，被挤出者记反事实事件）；s8: M3b 盘中因子短线加分项（尾盘放量拉升/跳水/收盘vs VWAP/午后重心上移/早盘强势）；s7: M3a 龙虎榜净买/机构席位/人气跃升/主力连续净流入加分项 + 量能维融合主力资金分；s6: F2 财务加分项（value ROE/growth 双增速/leader 盈利质量 + 业绩恶化通用扣分）；s5: T1 指标加分项 + 筹码超跌 + 五维动量/风险维升级；s4: 消息面情绪因子；s3: 策略-来源映射 + 换手分位化；s2: 本地量化评分；s1: 纯 prompt 导向
 	maxScanCandidates  = 48    // 首轮评分名额上限；排除后按冻结预算最多补评一轮
 	maxLLMCandidates   = 10    // 量化排序后进入 LLM 精选的名单上限（控上下文体积与位置偏差）
 	factorBarLimit     = 90    // 五维评分/窗口因子的日线口径（MA60 需 ≥60，留余量）；实际使用 250 根完整日线，技术评分前截尾
@@ -3201,6 +3201,14 @@ func (s *RecommendationService) buildRecommendationMessages(recPrompt promptRunt
 		sys.WriteString(longTermSpec)
 	}
 	sys.WriteString("\n\n【本次策略】" + strat.Name + "：" + strat.guide)
+	sys.WriteString("\n" + researchReasoningDiscipline + "\n" + earningsPromptDiscipline)
+	for _, c := range llmCands {
+		if c.PricePlan == nil {
+			sys.WriteString("\n" + legacyRecommendationPriceDiscipline)
+			break
+		}
+	}
+	sys.WriteString("\nfin.net_profit/deduct_profit/prior_net_profit 的单位为元，ocf_ps 为元/股；prior_report_date 是上年同一报告季。earnings 的分类先于对同比增速的解释，不能用较高 ROE 或正同比掩盖当期亏损。")
 	sys.WriteString("\n研究侧重：" + profileLabel(strat.baseKey) + "。signal_quality 为完整日线计算的形态质量事实：atr 是信号日之前的波动参照；breakout_distance_atr/ma20_distance_atr 是现价相对突破起点/均线的距离；compression 与 volume_contraction 是信号前 5 日相对 20 日的振幅/量能比；support 仅是结构参照，不代表必然支撑。缺失字段不得补造。")
 	if !scoreBlind {
 		sys.WriteString("\nentry_quality 将趋势与入场位置分开：extended 应解释等待回踩的条件，waiting_confirmation 应指出尚缺的确认，insufficient 应说明数据缺口。量化高分并不等于现在适合买入；允许否决，但需要引用具体字段和失效条件。")
@@ -3219,7 +3227,7 @@ func (s *RecommendationService) buildRecommendationMessages(recPrompt promptRunt
 	if desc := filters.Describe(); len(desc) > 0 {
 		u.WriteString("【用户约束】" + strings.Join(desc, "；") + "。名单已按这些条件过滤。")
 		if filters.PriceMax > 0 {
-			fmt.Fprintf(&u, " 用户资金有限（A股一手=100股，一手成本=价格×100），价位越贴近其预算越实用。")
+			u.WriteString(" 用户有价格预算约束，须按标的所属板块的最低买入数量核对成本：科创板至少200股，其他普通A股至少100股；低股价本身不是便宜或低风险的证据。")
 		}
 		u.WriteString("\n\n")
 	}
@@ -3296,21 +3304,21 @@ const shortTermSpec = `本次为【短线推荐】。每个 pick 需包含字段
 - valid_days: 该短线机会的有效天数（交易日，通常 3-10）
 - invalidation: 失效条件（如"跌破止损价或放量破位"）
 - disclaimer: 风险与免责提示
-交易规则硬约束：当前数据源仅支持 A 股；A 股当日买入不可当日卖出(T+1)，止盈/止损最早次一交易日生效；必须考虑涨跌停限制，涨停可能买不进、跌停可能卖不出；最小交易单位为 100 股一手；有效期和持有周期都按交易日计算，不按自然日。
-价位纪律：要求止盈>买入区间上沿>买入区间下沿>止损，价格贴近现价合理设置；止损建议参考 MA20 附近或现价-5%~-7%（可用名单中 factors.ma20 锚定）；止盈到止损的距离比（盈亏比）至少 1.5，不足时降为 watch 并说明。`
+交易规则硬约束：当前数据源仅支持 A 股；A 股当日买入不可当日卖出(T+1)，止盈/止损最早次一交易日生效；必须考虑涨跌停限制，涨停可能买不进、跌停可能卖不出。科创板新买入至少200股，其他普通A股至少100股；有效期和持有周期都按交易日计算，不按自然日。
+价位纪律：price_plan 存在时仅复述其中的买入区间、第一目标与保护价，不重新按固定涨跌百分比推算。wait/unavailable 必须 watch 并说明所缺条件；不存在的价格字段填0，不能用估值区间替代交易计划。`
 
 const longTermSpec = `本次为【长线推荐】。名单含实时行情、估值快照（PE-TTM/PB/市值）、技术因子与 fin 财务摘要（最新报告的累计ROE/营收与净利同比/毛利率/净利率/资产负债率，以及最近已披露年报 annual_roe，各有报告期）。年度盈利质量比较使用 annual_roe，季度累计ROE不能直接年化或套用年度阈值。fin 或单字段缺失要如实说明；它不含完整多期趋势与三表明细，不能据此证明长期成长持续性。每个 pick 需包含字段：
 - symbol: 名单中的代码
 - action: "buy"(可考虑逢低布局) 或 "watch"(观察等待)
 - confidence: 0-100 整数
-- reason: 字符串数组，长期看好/关注的理由
+- reason: 字符串数组，按本次策略说明关注理由；技术策略仍按趋势或回踩判断，不能因为持有周期较长就改为财务选股
 - risks: 字符串数组，主要风险
 - evidence: 字符串数组，数据依据（引用名单中的具体字段与数值，含 PE/PB/市值与 fin 中的 ROE/增速等财务依据）
-- thesis: 基本面/投资逻辑（只能基于名单给出的估值水位与 fin 财务摘要，不得虚构行业对比或未提供的财务明细）
-- valuation_low / valuation_high: 合理估值区间（若估值数据缺失无法给出可填 0 并在 thesis 说明）
-- key_metrics: 字符串数组，需持续跟踪的关键指标（如营收增速、毛利率、市占率）
+- thesis: 与本次策略一致的研究逻辑（财务策略核对盈利质量；技术策略核对趋势和失效条件，不得虚构行业对比或未提供的财务明细）
+- valuation_low / valuation_high: 独立估值观点；缺少估值模型或可比依据时填0并说明，不能把程序止盈目标当成合理估值
+- key_metrics: 字符串数组，直接影响本次策略假设的已有指标；技术策略跟踪均线/支撑，财务策略跟踪披露业绩，缺失指标标为待核查
 - invalidation: 失效条件——出现什么可观察信号说明本条投资逻辑已不成立（如"净利同比连续两期转负""跌破长期趋势线且缩量无承接"）；只能基于名单给出的数据维度表述
-- review_cycle: 复盘周期（如"每季度财报后"）
+- review_cycle: 与所选策略一致的复盘时点（如完整日线更新后、新财报披露后）；价格保护触发独立于复盘周期
 - disclaimer: 风险与免责提示`
 
 func hasShortPlan(p recPick) bool {

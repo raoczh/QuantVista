@@ -147,6 +147,7 @@ func TestFinanceScoreUsesAnnualROEAndBlocksIncompleteEvidence(t *testing.T) {
 	c := candidate{PETTM: 12, PB: 1.2, Fin: &candFin{
 		Version: financeFactorVersion, ReportDate: "2026-03-31", ROE: recNumber(4),
 		AnnualReportDate: "2025-12-31", AnnualROE: recNumber(16), RevenueYoY: recNumber(15), NetProfitYoY: recNumber(0),
+		NetProfit: recNumber(100), DeductProfit: recNumber(80),
 	}}
 	if score, _, status := qualityFinanceScore("leader", c); score != 7 || status != "available" {
 		t.Fatalf("一季报低累计 ROE 不能覆盖已披露年度质量：%v %s", score, status)

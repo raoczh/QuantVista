@@ -1,6 +1,6 @@
 package service
 
-const recommendationProfileVersion = "sp2"
+const recommendationProfileVersion = "sp3"
 
 type recommendationProfile struct {
 	intent  string
@@ -36,6 +36,10 @@ var builtinRecommendationProfiles = map[string]recommendationProfile{
 	"boll-squeeze-break":   {"breakout", "momentum"},
 	"donchian-55":          {"breakout", "momentum"},
 	"kdj-low-cross":        {"reversal", "pullback"},
+	"dmi-trend-confirm":    {"trend", "momentum"},
+	"nr7-breakout":         {"breakout", "momentum"},
+	"rsi2-trend-reclaim":   {"pullback", "pullback"},
+	"long-trend-template":  {"trend", "momentum"},
 }
 
 var retailRecommendationProfiles = map[string]recommendationProfile{

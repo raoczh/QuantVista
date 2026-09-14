@@ -6,7 +6,7 @@ import { SCORE_PROFILE_LABEL } from '@/api/screener'
 import { getSessionEpoch } from '@/api/token'
 import { isAbortError } from '@/api/client'
 import {
-  captureRankingArtifact, getRankingPolicyState, RANKING_ALGORITHM_LABEL, runRankingResearch, updateRankingPolicy,
+  captureRankingArtifact, CURRENT_RANKING_ALGORITHM, getRankingPolicyState, RANKING_ALGORITHM_LABEL, runRankingResearch, updateRankingPolicy,
   type RankingAlgorithm, type RankingPolicyState, type RankingResearchMetric, type RankingResearchReport, type RankingResearchRequest,
 } from '@/api/rankingResearch'
 
@@ -20,7 +20,7 @@ const running = ref(false)
 const saving = ref(false)
 const policyLoading = ref(false)
 const updating = ref(false)
-const algorithm = ref<RankingAlgorithm>('qr2')
+const algorithm = ref<RankingAlgorithm>(CURRENT_RANKING_ALGORITHM)
 const artifactID = ref<number | null>(null)
 const session = getSessionEpoch()
 const controller = new AbortController()
@@ -31,12 +31,12 @@ const busy = computed(() => running.value || saving.value || updating.value)
 const policyKey = computed(() => `${form.rec_type}:${form.profile}`)
 const policy = computed(() => state.value?.policies.find(item => item.key === policyKey.value))
 const actualAlgorithm = computed(() => {
-  const value = policy.value?.algorithm || state.value?.default_algorithm || 'qr2'
-  return value === 'qr1' ? 'qr2' : value
+  const value = policy.value?.algorithm || state.value?.default_algorithm || CURRENT_RANKING_ALGORITHM
+  return value === 'qr1' || value === 'qr2' ? CURRENT_RANKING_ALGORITHM : value
 })
 const profileOptions = Object.entries(SCORE_PROFILE_LABEL).map(([value, label]) => ({ value, label }))
 const horizonOptions = computed(() => (form.rec_type === 'short_term' ? [5, 10] : [20, 60]).map(value => ({ value, label: `${value} 日` })))
-const algorithmOptions = Object.entries(RANKING_ALGORITHM_LABEL).filter(([value]) => value !== 'qr1').map(([value, label]) => ({ value, label }))
+const algorithmOptions = Object.entries(RANKING_ALGORITHM_LABEL).filter(([value]) => value !== 'qr1' && value !== 'qr2').map(([value, label]) => ({ value, label }))
 const artifactOptions = computed(() => (state.value?.artifacts || []).filter(item => item.rec_type === form.rec_type && item.profile === form.profile).map(item => ({
   value: item.id, label: `#${item.id} · ${item.horizon} 日 · ${item.target === 'alpha' ? '超额' : '扣费'} · 截至 ${item.as_of}${item.eligible ? '' : ' · 仅研究'}`, disabled: !item.eligible,
 })))

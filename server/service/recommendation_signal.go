@@ -227,7 +227,7 @@ type recEntryQuality struct {
 }
 
 func entryQualityFor(profile, intent string, c candidate, q *recSignalQuality) *recEntryQuality {
-	out := &recEntryQuality{Version: "eq2", Status: "aligned"}
+	out := &recEntryQuality{Version: "eq3", Status: "aligned"}
 	if q == nil || q.ATR == nil || q.MA20DistanceATR == nil {
 		out.Status = "insufficient"
 		out.Reasons = []string{"缺少足够日线或波动尺度，无法核对入场距离"}
@@ -268,6 +268,12 @@ func entryQualityFor(profile, intent string, c candidate, q *recSignalQuality) *
 			out.Status = "insufficient"
 		}
 		out.Reasons = append(out.Reasons, "所选评分需要财务证据，目前缺少："+strings.Join(missing, "、"))
+	}
+	if issues := financeEntryIssues(profile, c.Fin); len(issues) > 0 {
+		if out.Status == "aligned" {
+			out.Status = "waiting_confirmation"
+		}
+		out.Reasons = append(out.Reasons, issues...)
 	}
 	return out
 }

@@ -30,7 +30,7 @@ const (
 	// screenerParsePromptVersion 解析 prompt 版本（独立于分析 p*/推荐 s* 序列）。
 	// 因子字典由 factorDefs 程序生成，**因子清单变了 prompt 就变了**，须一并递增版本，
 	// 否则同一版本号下的历史解析记录无法复现（当时的字典里根本没有这些因子）。
-	screenerParsePromptVersion = "sp4" // sp4: 因子字典新增 div_yield 与 10 个 K 线形态因子（C10/C12）；sp3: 移除 explain/unmatched 字数与紧凑输出限制；sp2: 输出瘦身
+	screenerParsePromptVersion = "sp5" // sp5：字典补齐 DMI/ADX、RSI2、NR7 与长期趋势模板。
 	parseStrategyTextMax       = 300   // 白话输入长度上限（rune）
 	screenerParseJobTimeout    = 5 * time.Minute
 )

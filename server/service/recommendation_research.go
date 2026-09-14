@@ -416,7 +416,7 @@ func compareRankingResearch(a, b RankingResearchMetric, horizon int, targets ...
 
 func evaluateRankingResearch(req RankingResearchRequest, d *rankingResearchDataset, contexts ...context.Context) *RankingResearchReport {
 	ctx := jobSubmissionContext(contexts...)
-	rep := &RankingResearchReport{Version: rankingResearchVersion, Request: req, DatasetHash: d.Hash, OutcomeVersion: model.SelectionOutcomeVersion, FeatureVersion: recommendationOptimizationFactVersion + " / " + factorSnapshotVersion + " / " + recommendationSignalVersion, Coverage: d.Coverage, GeneratedAt: time.Now(), Notes: []string{
+	rep := &RankingResearchReport{Version: rankingResearchVersion, Request: req, DatasetHash: d.Hash, OutcomeVersion: model.SelectionOutcomeVersion, FeatureVersion: rankingResearchFeatureVersion, Coverage: d.Coverage, GeneratedAt: time.Now(), Notes: []string{
 		"只读取冻结特征；日线只计算结果，不参与重建历史特征。缺少新字段的旧快照不会伪装完整样本。",
 		fmt.Sprintf("原加法评分、新质量评分与 ridge 基线使用相同机会集、TopK 和 %s 费用执行器。每组先排序再核对结果，未成交不补选下一只。", model.SelectionOutcomeVersion),
 		"未成交拨款按现金观察到同一持有期；行情缺失、未成熟和强制退出单列，不当作零收益。均值按信号日期聚合，不把重叠持仓复利成年化收益。",

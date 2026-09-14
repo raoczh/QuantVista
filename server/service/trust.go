@@ -572,8 +572,11 @@ func stockFieldHints(snap map[string]any) *snapshotHints {
 	}
 	if _, ok := snap["finance"]; ok {
 		h.source["finance."] = "eastmoney_f10"
-		if fin, ok := snap["finance"].(map[string]any); ok && fin["version"] == financeFactorVersion {
+		if fin, ok := snap["finance"].(map[string]any); ok && (fin["version"] == financeFactorVersion || fin["version"] == "ff1") {
 			h.knownZeroPrefixes = []string{"finance.latest.", "finance.trend[", "finance.annual."}
+			if fin["version"] == financeFactorVersion {
+				h.knownZeroPrefixes = append(h.knownZeroPrefixes, "finance.comparable.")
+			}
 		}
 	}
 	if _, ok := snap["org_view"]; ok {

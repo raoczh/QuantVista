@@ -120,6 +120,7 @@ func seedRecFreshFinance(t *testing.T, symbol string, now time.Time) {
 	if err := common.DB.Create(&model.FinanceIndicator{
 		Symbol: symbol, Market: "cn", ReportDate: "2025-12-31", ReportName: "2025年报",
 		NoticeDate: now.AddDate(0, 0, -30).Format("2006-01-02"), ROE: 12, RevenueYoY: 8, NetProfitYoY: 9,
+		NetProfit: 100, DeductProfit: 80,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -317,8 +318,14 @@ func recPreheatBars(limit int) []datasource.Bar {
 		date = prevOpenTradeDate(date)
 	}
 	end, _ := time.ParseInLocation("2006-01-02", date, time.Local)
-	for i := range bars {
-		bars[i].TradeDate = end.AddDate(0, 0, i-len(bars)+1).Format("2006-01-02")
+	// 模拟行情也必须排除周末。适配器会从日线补充交易日历；盘后若伪造了
+	// 周日K线，周五资金流就会被错误判旧，使本用例随运行时刻变化。
+	for i := len(bars) - 1; i >= 0; i-- {
+		for end.Weekday() == time.Saturday || end.Weekday() == time.Sunday {
+			end = end.AddDate(0, 0, -1)
+		}
+		bars[i].TradeDate = end.Format("2006-01-02")
+		end = end.AddDate(0, 0, -1)
 	}
 	if limit > 0 && len(bars) > limit {
 		bars = bars[len(bars)-limit:]

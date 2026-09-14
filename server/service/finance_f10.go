@@ -342,6 +342,8 @@ func financeBrief(ctx context.Context, symbol string) map[string]any {
 			"revenue_yi":        financeBriefValue(latest, model.FinanceFieldRevenue, latest.Revenue, 1e8),
 			"revenue_yoy":       financeBriefValue(latest, model.FinanceFieldRevenueYoY, latest.RevenueYoY, 1),
 			"net_profit_yi":     financeBriefValue(latest, model.FinanceFieldNetProfit, latest.NetProfit, 1e8),
+			"net_profit":        financeBriefValue(latest, model.FinanceFieldNetProfit, latest.NetProfit, 1),
+			"deduct_profit":     financeBriefValue(latest, model.FinanceFieldDeductProfit, latest.DeductProfit, 1),
 			"net_profit_yoy":    financeBriefValue(latest, model.FinanceFieldNetProfitYoY, latest.NetProfitYoY, 1),
 			"deduct_profit_yoy": financeBriefValue(latest, model.FinanceFieldDeductProfitYoY, latest.DeductProfitYoY, 1),
 			"roe":               financeBriefValue(latest, model.FinanceFieldROE, latest.ROE, 1),
@@ -349,9 +351,17 @@ func financeBrief(ctx context.Context, symbol string) map[string]any {
 			"net_margin":        financeBriefValue(latest, model.FinanceFieldNetMargin, latest.NetMargin, 1),
 			"debt_ratio":        financeBriefValue(latest, model.FinanceFieldDebtRatio, latest.DebtRatio, 1),
 		},
-		"note": "F10 主要指标 latest/trend/annual 使用可空数值（金额亿元、比率%；null/省略表示缺失，数值0表示已知为零）。roe 是本报告期累计ROE，不能把季度值与年度阈值直接比较；年度质量参照见 annual。trend 最早在前，同期可比后再判断变化；statement_latest 沿用旧三表缓存，其0值不能证明归零",
+		"note": "F10 主要指标 latest/trend/annual 使用可空数值（带_yi的金额为亿元，net_profit/deduct_profit/comparable.net_profit为元，比率为%；null/省略表示缺失，数值0表示已知为零）。roe 是本报告期累计ROE，不能把季度值与年度阈值直接比较；年度质量参照见 annual。earnings按归母/扣非及上年同期金额分类，不从同比倒推利润。trend 最早在前，同期可比后再判断变化；statement_latest 沿用旧三表缓存，其0值不能证明归零",
 	}
 	annual := latestAnnualFinanceIndicator(inds)
+	comparable := comparableFinanceIndicator(inds, latest.ReportDate)
+	brief["earnings"] = earningsEvidenceFor(financeIndicatorToFactor(&latest, annual, comparable))
+	if comparable != nil {
+		brief["comparable"] = map[string]any{
+			"report_date": comparable.ReportDate, "notice_date": comparable.NoticeDate,
+			"net_profit": financeBriefValue(*comparable, model.FinanceFieldNetProfit, comparable.NetProfit, 1),
+		}
+	}
 	if financeIndicatorRowFreshAt(annual, now) && publishedAnnualFinanceAfter(symbol, annual, asOf) == "" {
 		brief["annual"] = map[string]any{
 			"report_date": annual.ReportDate, "notice_date": annual.NoticeDate,
@@ -398,28 +408,36 @@ func financeBriefValue(row model.FinanceIndicator, field uint32, value, divisor 
 	return round2(value / divisor)
 }
 
-const financeFactorVersion = "ff1"
+const financeFactorVersion = "ff2"
 
 // candFin 同比使用最新已披露报告；年度质量使用最近已披露年报的加权 ROE。
-// nil 是缺失，ff1 的非 nil 零值是确实披露的 0；旧摘要零值仍保持未知。
+// nil 是缺失，ff1/ff2 的非 nil 零值是确实披露的 0；旧摘要零值仍保持未知。
 type candFin struct {
-	Version          string   `json:"version,omitempty"`
-	Report           string   `json:"report"`
-	ReportDate       string   `json:"report_date,omitempty"`
-	NoticeDate       string   `json:"notice_date,omitempty"`
-	ROE              *float64 `json:"roe,omitempty"` // 本报告期累计加权 ROE，不作年化阈值比较
-	RevenueYoY       *float64 `json:"revenue_yoy,omitempty"`
-	NetProfitYoY     *float64 `json:"net_profit_yoy,omitempty"`
-	GrossMargin      *float64 `json:"gross_margin,omitempty"`
-	NetMargin        *float64 `json:"net_margin,omitempty"`
-	DebtRatio        *float64 `json:"debt_ratio,omitempty"`
-	AnnualROE        *float64 `json:"annual_roe,omitempty"`
-	AnnualReportDate string   `json:"annual_report_date,omitempty"`
-	AnnualNoticeDate string   `json:"annual_notice_date,omitempty"`
+	Version          string            `json:"version,omitempty"`
+	Report           string            `json:"report"`
+	ReportDate       string            `json:"report_date,omitempty"`
+	NoticeDate       string            `json:"notice_date,omitempty"`
+	ROE              *float64          `json:"roe,omitempty"` // 本报告期累计加权 ROE，不作年化阈值比较
+	RevenueYoY       *float64          `json:"revenue_yoy,omitempty"`
+	NetProfitYoY     *float64          `json:"net_profit_yoy,omitempty"`
+	NetProfit        *float64          `json:"net_profit,omitempty"` // 元，保留金额正负，避免按亿元展示舍入成零
+	DeductProfit     *float64          `json:"deduct_profit,omitempty"`
+	DeductProfitYoY  *float64          `json:"deduct_profit_yoy,omitempty"`
+	OCFPS            *float64          `json:"ocf_ps,omitempty"`
+	PriorNetProfit   *float64          `json:"prior_net_profit,omitempty"`
+	PriorReportDate  string            `json:"prior_report_date,omitempty"`
+	PriorNoticeDate  string            `json:"prior_notice_date,omitempty"`
+	Earnings         *earningsEvidence `json:"earnings,omitempty"`
+	GrossMargin      *float64          `json:"gross_margin,omitempty"`
+	NetMargin        *float64          `json:"net_margin,omitempty"`
+	DebtRatio        *float64          `json:"debt_ratio,omitempty"`
+	AnnualROE        *float64          `json:"annual_roe,omitempty"`
+	AnnualReportDate string            `json:"annual_report_date,omitempty"`
+	AnnualNoticeDate string            `json:"annual_notice_date,omitempty"`
 }
 
 func (f *candFin) has(value *float64) bool {
-	return f != nil && value != nil && finiteRecNumber(*value) && (f.Version == financeFactorVersion || *value != 0)
+	return f != nil && value != nil && finiteRecNumber(*value) && (f.Version == financeFactorVersion || f.Version == "ff1" || *value != 0)
 }
 
 func (f *candFin) hasAnnualROE() bool {
@@ -443,6 +461,15 @@ func financeMissingFor(profile string, f *candFin) []string {
 	if profile == "growth" && !f.has(f.RevenueYoY) {
 		missing = append(missing, "最新报告营收同比")
 	}
+	if !f.has(f.NetProfit) {
+		missing = append(missing, "最新报告归母净利润金额")
+	}
+	if !f.has(f.DeductProfit) {
+		missing = append(missing, "最新报告扣非净利润金额")
+	}
+	if profile == "growth" && !f.hasComparableProfit() {
+		missing = append(missing, "上年同期归母净利润金额")
+	}
 	return missing
 }
 
@@ -450,15 +477,16 @@ func financeMissingFor(profile string, f *candFin) []string {
 // RequiredReport 非空表示披露日历已证明缓存落后一季；Fresh 表示探测时缓存仍在 TTL 内。
 // 任一 stale 状态刷新未成功都必须 fail-closed。
 type financeFactorProbe struct {
-	Symbol         string
-	AsOf           string
-	Cached         *model.FinanceIndicator
-	CachedAnnual   *model.FinanceIndicator
-	RequiredReport string
-	RequiredAnnual string
-	Fresh          bool
-	AnnualFresh    bool
-	RefreshNeeded  bool
+	Symbol           string
+	AsOf             string
+	Cached           *model.FinanceIndicator
+	CachedAnnual     *model.FinanceIndicator
+	CachedComparable *model.FinanceIndicator
+	RequiredReport   string
+	RequiredAnnual   string
+	Fresh            bool
+	AnnualFresh      bool
+	RefreshNeeded    bool
 }
 
 // financeIndicatorRowFreshAt 必须检查真正被 point-in-time 选择的那一行，不能用
@@ -479,6 +507,7 @@ func inspectFinanceFactor(symbol, asOf string, now time.Time) financeFactorProbe
 	if err == nil && len(rows) > 0 {
 		p.Cached = &rows[0]
 		p.CachedAnnual = latestAnnualFinanceIndicator(rows)
+		p.CachedComparable = comparableFinanceIndicator(rows, p.Cached.ReportDate)
 	}
 	if p.Cached != nil {
 		p.RequiredReport = publishedFinanceReportAfter(symbol, p.Cached.ReportDate, asOf)
@@ -523,7 +552,7 @@ func financeValue(r *model.FinanceIndicator, field uint32, value float64) *float
 	return recNumber(round2(value))
 }
 
-func financeIndicatorToFactor(r, annual *model.FinanceIndicator) *candFin {
+func financeIndicatorToFactor(r, annual *model.FinanceIndicator, comparables ...*model.FinanceIndicator) *candFin {
 	if r == nil {
 		return nil
 	}
@@ -531,13 +560,23 @@ func financeIndicatorToFactor(r, annual *model.FinanceIndicator) *candFin {
 		Version: financeFactorVersion, Report: r.ReportName, ReportDate: r.ReportDate, NoticeDate: r.NoticeDate,
 		ROE:        financeValue(r, model.FinanceFieldROE, r.ROE),
 		RevenueYoY: financeValue(r, model.FinanceFieldRevenueYoY, r.RevenueYoY), NetProfitYoY: financeValue(r, model.FinanceFieldNetProfitYoY, r.NetProfitYoY),
-		GrossMargin: financeValue(r, model.FinanceFieldGrossMargin, r.GrossMargin),
-		NetMargin:   financeValue(r, model.FinanceFieldNetMargin, r.NetMargin), DebtRatio: financeValue(r, model.FinanceFieldDebtRatio, r.DebtRatio),
+		NetProfit:       financeValue(r, model.FinanceFieldNetProfit, r.NetProfit),
+		DeductProfit:    financeValue(r, model.FinanceFieldDeductProfit, r.DeductProfit),
+		DeductProfitYoY: financeValue(r, model.FinanceFieldDeductProfitYoY, r.DeductProfitYoY),
+		OCFPS:           financeValue(r, model.FinanceFieldOCFPS, r.OCFPS),
+		GrossMargin:     financeValue(r, model.FinanceFieldGrossMargin, r.GrossMargin),
+		NetMargin:       financeValue(r, model.FinanceFieldNetMargin, r.NetMargin), DebtRatio: financeValue(r, model.FinanceFieldDebtRatio, r.DebtRatio),
 	}
 	if annual != nil {
 		f.AnnualROE = financeValue(annual, model.FinanceFieldROE, annual.ROE)
 		f.AnnualReportDate, f.AnnualNoticeDate = annual.ReportDate, annual.NoticeDate
 	}
+	if len(comparables) > 0 && comparables[0] != nil && comparables[0].ReportDate == comparableFinanceReportDate(r.ReportDate) {
+		prior := comparables[0]
+		f.PriorNetProfit = financeValue(prior, model.FinanceFieldNetProfit, prior.NetProfit)
+		f.PriorReportDate, f.PriorNoticeDate = prior.ReportDate, prior.NoticeDate
+	}
+	f.Earnings = earningsEvidenceFor(f)
 	return f
 }
 
@@ -546,6 +585,7 @@ func financeIndicatorToFactor(r, annual *model.FinanceIndicator) *candFin {
 func resolveFinanceFactor(p financeFactorProbe, fetched bool) *candFin {
 	latest := p.Cached
 	annual := p.CachedAnnual
+	comparable := p.CachedComparable
 	fresh := p.Fresh
 	annualFresh := p.AnnualFresh
 	if fetched {
@@ -554,6 +594,7 @@ func resolveFinanceFactor(p financeFactorProbe, fetched bool) *candFin {
 			return nil
 		}
 		latest, annual = &rows[0], latestAnnualFinanceIndicator(rows)
+		comparable = comparableFinanceIndicator(rows, latest.ReportDate)
 		fresh = financeIndicatorRowFreshAt(latest, time.Now())
 		annualFresh = financeIndicatorRowFreshAt(annual, time.Now())
 	}
@@ -563,7 +604,7 @@ func resolveFinanceFactor(p financeFactorProbe, fetched bool) *candFin {
 	if !annualFresh || (p.RequiredAnnual != "" && (annual == nil || annual.ReportDate < p.RequiredAnnual)) {
 		annual = nil
 	}
-	return financeIndicatorToFactor(latest, annual)
+	return financeIndicatorToFactor(latest, annual, comparable)
 }
 
 // financeFactorFor 读取某股截至当前时点可用的最新一期财务摘要供推荐评分/LLM 名单。

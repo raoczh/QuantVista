@@ -67,6 +67,13 @@ function signedAmount(value: number) {
   return `${value > 0 ? '+' : ''}${value.toFixed(2)} 元`
 }
 
+function financeAmount(value: number | null | undefined) {
+  if (value == null || !Number.isFinite(value)) return '缺失'
+  if (Math.abs(value) >= 100_000_000) return `${(value / 100_000_000).toFixed(2)} 亿元`
+  if (Math.abs(value) >= 10_000) return `${(value / 10_000).toFixed(2)} 万元`
+  return `${value.toFixed(2)} 元`
+}
+
 function toneFor(value: number | null): DecisionTone {
   if (value == null || !Number.isFinite(value)) return 'unknown'
   if (value > 0) return 'positive'
@@ -262,17 +269,19 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
   }
 
   const latestFinance = input.finance?.indicators.at(-1)
+  const profitNotPositive = latestFinance?.net_profit != null && latestFinance.net_profit <= 0
+  const coreNotPositive = latestFinance?.deduct_profit != null && latestFinance.deduct_profit <= 0
   const financeNote = input.finance?.note || (input.fundamentalPhase === 'error' ? '本次基本面读取未完成，请核对原始报告' : '')
   if (latestFinance) {
     changes.push({
       id: 'finance-change',
       title: financeNote ? '最近已知财务变化' : '最新财务变化',
       value: `营收 ${signedPct(latestFinance.revenue_yoy)} · 净利 ${signedPct(latestFinance.net_profit_yoy)}`,
-      detail: `${latestFinance.report_name}累计口径，财报披露存在滞后。${financeNote}`,
+      detail: `${latestFinance.report_name}累计口径，归母净利润 ${financeAmount(latestFinance.net_profit)}、扣非净利润 ${financeAmount(latestFinance.deduct_profit)}。同比为正也可能只是亏损收窄或扭亏，单期不代表持续成长。${financeNote}`,
       evidence: `本期累计 ROE ${signedPct(latestFinance.roe)}，毛利率 ${signedPct(latestFinance.gross_margin)}`,
       source: '东财 F10',
       asOf: latestFinance.report_date,
-      tone: toneFor(latestFinance.revenue_yoy == null || latestFinance.net_profit_yoy == null
+      tone: profitNotPositive || coreNotPositive ? 'warning' : toneFor(latestFinance.revenue_yoy == null || latestFinance.net_profit_yoy == null
         ? null : Math.min(latestFinance.revenue_yoy, latestFinance.net_profit_yoy)),
     })
   }
@@ -328,15 +337,15 @@ export function buildDecisionSummary(input: DecisionSummaryInput): DecisionSumma
 
   const profitDeclining = latestFinance?.net_profit_yoy != null && latestFinance.net_profit_yoy < 0
   const debtHigh = latestFinance?.debt_ratio != null && latestFinance.debt_ratio >= 70
-  if (latestFinance && (profitDeclining || debtHigh)) {
+  if (latestFinance && (profitNotPositive || coreNotPositive || profitDeclining || debtHigh)) {
     risks.push({
       id: 'finance-risk',
-      title: profitDeclining ? '净利润同比下降' : '资产负债率较高',
-      value: profitDeclining
+      title: profitNotPositive ? '当期归母净利润不为正' : coreNotPositive ? '扣非净利润不为正' : profitDeclining ? '净利润同比下降' : '资产负债率较高',
+      value: profitNotPositive ? financeAmount(latestFinance.net_profit) : coreNotPositive ? financeAmount(latestFinance.deduct_profit) : profitDeclining
         ? signedPct(latestFinance.net_profit_yoy)
         : signedPct(latestFinance.debt_ratio),
-      detail: '这是按财务字段阈值呈现的关注项，不是对公司价值的结论。',
-      evidence: `净利同比 ${signedPct(latestFinance.net_profit_yoy)}；资产负债率 ${signedPct(latestFinance.debt_ratio)}`,
+      detail: profitNotPositive || coreNotPositive ? '正的净利润同比不能抵消当期亏损或扣非未盈利，需结合上年同期金额与披露报告核对。' : '这是按财务字段阈值呈现的关注项，不是对公司价值的结论。',
+      evidence: `归母净利润 ${financeAmount(latestFinance.net_profit)}；扣非净利润 ${financeAmount(latestFinance.deduct_profit)}；净利同比 ${signedPct(latestFinance.net_profit_yoy)}；资产负债率 ${signedPct(latestFinance.debt_ratio)}`,
       source: '东财 F10',
       asOf: latestFinance.report_date,
       tone: 'warning',
