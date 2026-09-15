@@ -348,12 +348,19 @@ function exportResult() {
           </n-collapse-item>
 
           <n-collapse-item v-if="current.result?.debate?.triggered" title="多空辩论（并列观点，不改写主结论）" name="debate">
-            <n-alert v-if="current.result.debate.degraded_reason" type="warning" :bordered="false">辩论部分失败：{{ current.result.debate.degraded_reason }}。主分析结果仍保留。</n-alert>
+            <n-alert v-if="current.result.debate.degraded_reason" type="warning" :bordered="false">{{ current.result.debate.degraded_reason === 'evidence_unavailable' ? '缺少可引用的快照证据，本次未发起多空复核。' : '多空复核未完整完成，请结合主分析与原始数据判断。' }}</n-alert>
             <div class="debate-grid">
               <section><h4>看多方</h4><p v-for="claim in current.result.debate.bull || []" :key="claim.id"><b>{{ claim.id }}</b> {{ claim.text }}<small v-if="claim.evidence_ids?.length">证据 {{ claim.evidence_ids.join('、') }}</small></p></section>
               <section><h4>看空方</h4><p v-for="claim in current.result.debate.bear || []" :key="claim.id"><b>{{ claim.id }}</b> {{ claim.text }}<small v-if="claim.evidence_ids?.length">证据 {{ claim.evidence_ids.join('、') }}</small></p></section>
             </div>
             <p v-if="current.result.debate.judge"><b>独立裁决：</b>{{ ratingLabel(current.result.debate.judge.verdict) }} · {{ current.result.debate.judge.confidence_reason }}</p>
+            <details v-if="current.result.debate.evidence_index?.length" class="debate-evidence">
+              <summary>核对复核使用的证据（{{ current.result.debate.evidence_index.length }} 项）</summary>
+              <p>来源于生成时的冻结快照，包含主分析未引用的事实；数字存在不代表结论已获证实。</p>
+              <div v-for="item in current.result.debate.evidence_index" :key="item.evidence_id" class="metric-row">
+                <b>{{ item.evidence_id }}</b><span>{{ item.path }}</span><span>{{ item.value }} {{ item.unit }}</span><span>{{ item.as_of || '时间未提供' }} · {{ item.source || '来源未提供' }}</span>
+              </div>
+            </details>
           </n-collapse-item>
 
           <n-collapse-item title="证据与专业指标" name="metrics">

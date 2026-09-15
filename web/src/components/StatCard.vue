@@ -23,7 +23,7 @@ const styleVars = computed(() => ({
 <template>
   <div class="stat-card" :style="styleVars">
     <div class="stat-label">{{ label }}</div>
-    <div class="stat-value qv-figure" :style="{ color: valueColor }">{{ value }}</div>
+    <div class="stat-value qv-figure" :title="String(value)" :style="{ color: valueColor }">{{ value }}</div>
     <div class="stat-foot">
       <ChangeTag v-if="changePct !== undefined" :value="changePct" size="small" />
       <span v-if="sub" class="stat-sub">{{ sub }}</span>
@@ -33,19 +33,21 @@ const styleVars = computed(() => ({
 
 <style scoped>
 .stat-card {
-  padding: 16px;
-  border-radius: 8px;
+  padding: 19px 20px;
+  min-width: 0;
+  border-radius: var(--qv-radius-card);
   border: 1px solid var(--stat-border);
   background: var(--stat-bg);
 }
 .stat-label {
   font-size: 13px;
-  opacity: 0.7;
+  color: var(--qv-text-muted);
   margin-bottom: 8px;
 }
 .stat-value {
-  font-size: 26px;
-  font-weight: 700;
+  font-size: 28px;
+  font-weight: 650;
+  letter-spacing: -0.035em;
   line-height: 1.1;
   /* 大额金额（7 位数含千分位）在移动端 2 列网格下会超出卡宽，截断优于溢出压邻卡 */
   white-space: nowrap;
@@ -61,7 +63,7 @@ const styleVars = computed(() => ({
 }
 .stat-sub {
   font-size: 12px;
-  opacity: 0.6;
+  color: var(--qv-text-muted);
 }
 
 @media (max-width: 768px) {

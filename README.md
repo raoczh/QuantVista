@@ -26,12 +26,13 @@ QuantVista 将市场数据、研究结论和后续跟踪放在同一工作流中
 | 通知与后台任务 | Server酱、Webhook、ntfy、浏览器通知与 Web Push；后台作业进度、取消、重试、重启恢复与结果跳转 |
 | 管理与评估 | 用户权限与配额、GitHub 登录、LLM 调用审计、数据源健康、因子 IC、滚动验证、概率校准与影子实验 |
 
-界面提供简明与专业显示模式、多套明暗主题和响应式布局。Android 壳支持返回键、站内深链与离线恢复，构建和签名方式见 [移动端说明](mobile/README.md)。
+界面提供简明与专业显示模式、六套明暗主题和响应式布局。桌面按工作流组织侧栏，平板使用抽屉导航，手机保留底部常用入口。推荐与分析的本次结果、历史复盘分开呈现，视图保留在链接中，成功任务的运行记录可按需展开。Android 壳支持返回键、站内深链与离线恢复，构建和签名方式见 [移动端说明](mobile/README.md)。
 
 ### 研究结果如何追溯
 
 - **数据快照与版本**：研究任务记录输入快照、来源、时间与策略或提示词版本，历史结果保留当时依据。
 - **程序化校验**：对模型引用的证据、候选范围、数值与交易计划关系进行校验，展示数据缺口和降级状态。
+- **独立事实复核**：多空复核直接从冻结快照整理证据，保留主分析未引用的财务反证、来源与报告期；模型计划价不作为事实依据，没有可引用事实时明确停止复核。
 - **明确失效条件**：结论附带风险、未知项与跟踪条件；数据缺失或请求失败时，根据业务场景返回量化观察或拒绝生成。
 - **区分评估口径**：模型模拟表现与用户实际成交分别统计，回测考虑交易日历、涨跌停、停牌、费税等约束。
 
@@ -175,7 +176,10 @@ MySQL 专项回归默认跳过，仅在 `QV_REVIEW_MYSQL=1` 时启用，并固�
 ```bash
 npm test
 npm run type-check
+npm run test:ui
 ```
+
+浏览器回归使用 Playwright，自动启动本地 Vite，并拦截全部业务 API 使用合成数据，不需要启动后端或配置模型。覆盖全站路由、桌面/平板/手机、明暗布局以及研究、持仓和通知的关键交互。Windows 默认使用已安装的 Edge，可通过 `QV_BROWSER_CHANNEL` 指定其他已安装的浏览器；其他平台首次运行前执行 `npx playwright install chromium`。详细范围见 [研究与界面复核](docs/RESEARCH_INTERFACE_REVIEW.md)。
 
 仓库的 [PowerShell 验证脚本](scripts/verify.ps1) 也支持从根目录统一检查：
 
@@ -217,6 +221,7 @@ QuantVista/
 │   └── web/dist/     # 前端构建输出
 ├── web/
 │   ├── src/          # 页面、组件、API、状态与交互逻辑
+│   ├── e2e/          # 合成数据驱动的浏览器回归
 │   └── scripts/      # 前端回归检查
 ├── mobile/           # Capacitor Android 工程
 ├── deploy/           # 部署配置示例
@@ -239,6 +244,7 @@ QuantVista/
 | [推荐排序与评估](docs/RECOMMENDATION_RANKING.md) | 策略预选、质量规则、只读研究、模型启用与回退 |
 | [价格、策略与通知复核](docs/PRICE_STRATEGY_NOTIFICATION_REVIEW.md) | 双模块共同价位、策略与财务口径、A 股规则和后台提醒的验收范围 |
 | [业务算法与提示词审查](docs/TOP50_BUSINESS_ALGORITHM_REVIEW.md) | 50 个历史样本与 3 个补充项目的源码对照、盈利质量、30 个内置策略及验证边界 |
+| [研究与界面复核](docs/RESEARCH_INTERFACE_REVIEW.md) | 10 个专项项目、独立复核证据、通知隔离、全站工作区与浏览器验收 |
 | [推荐优化验收清单](docs/RECOMMENDATION_OPTIMIZATION_PLAN.md) | 本轮 O01～O21 的实现范围、验证与效果证据边界 |
 | [候选发现与持仓卖出方案](docs/RECOMMENDATION_DISCOVERY_AND_EXIT_PLAN.md) | 候选召回、每日复盘与持仓风险工作流 |
 | [持仓退出规划](docs/POSITION_EXIT_OPTIMIZATION_PLAN.md) | 买入前预览、初始止损、分阶段目标、盈利保护、通知与验收记录 |

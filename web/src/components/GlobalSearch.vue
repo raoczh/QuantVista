@@ -239,7 +239,7 @@ onUnmounted(() => {
     transform-origin="center"
     @update:show="emit('update:show', $event)"
   >
-    <div ref="panelRef" class="gs-panel" :style="panelVars">
+    <div ref="panelRef" class="gs-panel" :style="panelVars" role="dialog" aria-modal="true" aria-label="搜索股票">
       <div class="gs-input-row">
         <svg class="gs-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
           <circle cx="11" cy="11" r="7" />

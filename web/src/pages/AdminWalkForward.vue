@@ -129,8 +129,8 @@ function specLine(sec: WFSectionReport): string {
 
 <template>
   <PageContainer
-    title="Walk-Forward 基线"
-    subtitle="按历史时点重放评分与策略，滚动划分训练、验证和测试区间，观察各阶段的收益与风险"
+    title="滚动验证"
+    subtitle="依时间顺序划分训练、验证和测试区间，观察策略在不同阶段的表现。"
   >
     <div class="wf-stack">
       <SectionCard title="评估概览">

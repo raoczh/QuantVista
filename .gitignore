@@ -20,6 +20,8 @@ server/logs/
 web/node_modules/
 web/dist/
 web/.vite/
+web/.playwright-results/
+web/playwright-report/
 node_modules/
 
 # ===== 构建产物 / 缓存 =====

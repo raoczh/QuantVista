@@ -1,8 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, onBeforeUnmount, ref, watch, watchEffect, h } from 'vue'
+import { computed, onMounted, onBeforeUnmount, ref, watch, h } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
-  NMenu,
   NDropdown,
   NButton,
   NIcon,
@@ -12,11 +11,13 @@ import {
   NDrawerContent,
   useThemeVars,
   useMessage,
-  type MenuOption,
   type DropdownOption,
 } from 'naive-ui'
 import { RouterLink, RouterView } from 'vue-router'
 import { storeToRefs } from 'pinia'
+import { workspaceLocation } from '@/navigation/workspace'
+import WorkspaceNavigation from '@/components/WorkspaceNavigation.vue'
+import WorkspaceIcon from '@/components/WorkspaceIcon.vue'
 import { useAppStore } from '@/stores/app'
 import { useThemeStore } from '@/stores/theme'
 import { useAuthStore } from '@/stores/auth'
@@ -51,7 +52,7 @@ const browserNotifications = useBrowserNotificationRuntime(() => user.value?.id 
 const vars = useThemeVars()
 const { isDark, primaryAlpha } = useUi()
 
-// ---------- 导航：高频一级直达，市场/研究与低频项归组，设置/管理后台只留用户菜单 ----------
+// ---------- 导航：按日常工作流归组；桌面侧栏、移动抽屉共用目录 ----------
 const todoCount = ref(0)
 const todoIncomplete = ref(false)
 let disposed = false
@@ -92,78 +93,12 @@ watch(
   },
 )
 
-function navLink(to: string, text: string) {
-  return () => h(RouterLink, { to }, { default: () => text })
+const pageLocation = computed(() => workspaceLocation(String(route.name || '')))
+const activeKey = computed(() => pageLocation.value.activeKey)
+const routeLabel = computed(() => String(pageLocation.value.item?.label || route.meta.title || '工作台'))
+function focusMain() {
+  document.getElementById('main-content')?.focus()
 }
-
-const menuOptions = computed<MenuOption[]>(() => [
-  { label: navLink('/', '首页'), key: 'home' },
-  {
-    label: () =>
-      h(RouterLink, { to: '/today', class: 'nav-today' }, {
-        default: () => [
-          '今日',
-          todoBadgeText.value
-            ? h(
-                'span',
-                {
-                  class: ['nav-badge', 'qv-tnum', { 'nav-badge-incomplete': todoIncomplete.value }],
-                  title: todoIncomplete.value ? '待办清单读取不完整' : undefined,
-                },
-                todoBadgeText.value,
-              )
-            : null,
-        ],
-      }),
-    key: 'today',
-  },
-  { label: navLink('/watchlist', '自选'), key: 'watchlist' },
-  { label: navLink('/screener', '选股'), key: 'screener' },
-  { label: navLink('/positions', '持仓'), key: 'positions' },
-  {
-    label: '市场',
-    key: 'market-group',
-    children: [
-      { label: navLink('/mood', '盘面情绪'), key: 'mood' },
-      { label: navLink('/news', '快讯'), key: 'news' },
-      { label: navLink('/heatmap', '行业热力图'), key: 'heatmap' },
-      { label: navLink('/etf', '指数ETF'), key: 'etf' },
-    ],
-  },
-  {
-    label: '研究',
-    key: 'research-group',
-    children: [
-      { label: navLink('/recommendations', '推荐追踪'), key: 'recommendations' },
-      { label: navLink('/analysis', 'AI 分析'), key: 'analysis' },
-      { label: navLink('/daily-report', '收盘日报'), key: 'daily-report' },
-      { label: navLink('/qa', '个股问答'), key: 'qa' },
-      { label: navLink('/compare', '横向对比'), key: 'compare' },
-      { label: navLink('/tasks', '任务中心'), key: 'tasks' },
-    ],
-  },
-  {
-    label: '更多',
-    key: 'more-group',
-    children: [
-      { label: navLink('/backtest', '回测时光机'), key: 'backtest' },
-      { label: navLink('/thesis', '投资逻辑卡'), key: 'thesis' },
-      { label: navLink('/notes', '投资笔记'), key: 'notes' },
-      { label: navLink('/paper', '模拟交易'), key: 'paper' },
-      { label: navLink('/alerts', '条件提醒'), key: 'alerts' },
-      { label: navLink('/prompt-templates', '提示词模板'), key: 'prompts' },
-    ],
-  },
-])
-
-const routeMenuKey: Record<string, string> = {
-  'board-detail': 'heatmap',
-  'portfolio-risk': 'positions',
-}
-const activeKey = computed(() => {
-  const name = String(route.name || '')
-  return routeMenuKey[name] || name || 'home'
-})
 
 // ---------- 主题 ----------
 const themeOptions = computed<DropdownOption[]>(() =>
@@ -225,7 +160,7 @@ async function onSelectUser(key: string) {
 // ---------- 后端连接状态 ----------
 const health = computed(() => {
   if (error.value || !status.value)
-    return { color: vars.value.errorColor, text: '后端不可达' }
+    return { color: vars.value.errorColor, text: '服务暂不可用' }
   if (!status.value.db) return { color: vars.value.warningColor, text: '数据库离线' }
   return { color: vars.value.successColor, text: '运行正常' }
 })
@@ -239,10 +174,6 @@ const showSearch = ref(false)
 // ---------- 移动端抽屉导航 ----------
 // ≤768px 时顶部水平菜单放不下，收进左侧抽屉（汉堡按钮唤起）。
 const showNav = ref(false)
-function closeDrawerOnLinkClick(event: MouseEvent) {
-  const target = event.target
-  if (target instanceof Element && target.closest('a')) showNav.value = false
-}
 // 抽屉内点击菜单项（RouterLink）完成导航后自动收起。
 watch(
   () => route.fullPath,
@@ -271,23 +202,11 @@ async function refreshMarketTitle() {
 }
 useAutoRefresh(refreshMarketTitle, 60_000)
 
-// ---------- 主题变量下发 ----------
-// 注入到 :root，global.css（::selection）与弹层内容也能取到。
-// --qv-border / --qv-hover 曾是「幽灵变量」：多个后台页 var(--qv-border, rgba(128,128,128,.2))
-// 只有读取、全站零声明，永远回落到硬编码 fallback，看着像主题感知实则 6 套主题同色。
-// 在这里统一注入后，那些读取点即刻跟随主题。
-watchEffect(() => {
-  const el = document.documentElement
-  el.style.setProperty('--qv-primary', vars.value.primaryColor)
-  el.style.setProperty('--qv-primary-selection', withAlpha(vars.value.primaryColor, 0.22))
-  el.style.setProperty('--qv-border', vars.value.dividerColor)
-  el.style.setProperty('--qv-hover', isDark.value ? 'rgba(255, 255, 255, 0.07)' : 'rgba(128, 128, 128, 0.1)')
-})
-
 // 外壳专用变量全部源自主题，兼容 6 套主题。
 const shellVars = computed(() => ({
-  '--qv-header-bg': withAlpha(vars.value.cardColor, 0.72),
+  '--qv-header-bg': withAlpha(vars.value.cardColor, 0.95),
   '--qv-header-border': vars.value.dividerColor,
+  '--qv-sidebar-bg': vars.value.cardColor,
   '--qv-menu-active': primaryAlpha(0.13),
   '--qv-menu-active-text': vars.value.primaryColor,
   '--qv-menu-hover': isDark.value ? 'rgba(255, 255, 255, 0.07)' : 'rgba(128, 128, 128, 0.1)',
@@ -317,120 +236,81 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="app-shell" :style="shellVars">
-    <header class="app-header">
-      <button class="nav-burger" type="button" aria-label="打开导航菜单" @click="showNav = true">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-          <path d="M4 7h16M4 12h16M4 17h16" />
-        </svg>
-      </button>
-      <RouterLink to="/" class="logo-link">
-        <BrandLogo :size="30" />
+    <a class="skip-link" href="#main-content" @click.prevent="focusMain">跳转到主要内容</a>
+    <aside class="app-sidebar" aria-label="工作区">
+      <RouterLink to="/" class="sidebar-brand" aria-label="QuantVista 今日概览">
+        <BrandLogo :size="32" />
+        <span class="sidebar-caption">研究 · 决策 · 复盘</span>
       </RouterLink>
-      <div class="app-menu-wrap">
-        <n-menu mode="horizontal" responsive :options="menuOptions" :value="activeKey" class="app-menu" />
+      <div class="sidebar-navigation">
+        <WorkspaceNavigation :active-key="activeKey" :admin="isAdmin" :todo-badge="todoBadgeText" :todo-incomplete="todoIncomplete" id-prefix="desktop-nav" />
       </div>
-      <div class="header-right">
-        <!-- 全局股票搜索入口（Ctrl+K） -->
-        <button
-          class="search-trigger"
-          type="button"
-          aria-label="搜股票"
-          title="搜股票 (Ctrl+K)"
-          @click="showSearch = true"
-        >
-          <svg class="st-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="11" cy="11" r="7" />
-            <path d="m20 20-3.5-3.5" stroke-linecap="round" />
-          </svg>
-          <span class="st-text">搜股票</span>
-          <span class="st-kbd">Ctrl K</span>
+      <div class="sidebar-footer">
+        <RouterLink to="/settings" class="settings-link" :aria-current="route.name === 'settings' ? 'page' : undefined">
+          <WorkspaceIcon name="settings" />个人设置
+        </RouterLink>
+        <span class="sidebar-status"><span class="health-dot" :style="{ background: health.color }" />{{ health.text }}</span>
+      </div>
+    </aside>
+
+    <div class="app-content">
+      <header class="app-header">
+        <button class="nav-burger" type="button" aria-label="打开导航菜单" :aria-expanded="showNav" @click="showNav = true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
         </button>
-
-        <AIQuickActions variant="toolbar" />
-
-        <RecentTasks />
-
-        <!-- 后端状态：圆点 + 悬浮详情 -->
-        <n-popover trigger="hover" placement="bottom">
-          <template #trigger>
-            <div class="health-dot-wrap">
-              <span class="health-dot" :style="{ background: health.color }" />
-            </div>
-          </template>
-          <div class="health-detail">
-            <div class="health-row">
-              <span class="health-label">状态</span>
-              <span :style="{ color: health.color, fontWeight: 600 }">{{ health.text }}</span>
-            </div>
-            <div class="health-row">
-              <span class="health-label">数据库</span>
-              <span>{{ status?.db ? '已连接' : '离线' }}</span>
-            </div>
-            <div class="health-row">
-              <span class="health-label">Redis</span>
-              <span>{{ status?.redis ? '已连接' : '未启用' }}</span>
-            </div>
-            <div v-if="status?.version" class="health-row">
-              <span class="health-label">版本</span>
-              <span class="qv-mono">v{{ status.version }}</span>
-            </div>
-          </div>
-        </n-popover>
-
-        <n-dropdown trigger="click" :options="themeOptions" :value="currentKey" @select="onSelectTheme">
-          <n-button quaternary size="small">
-            <template #icon>
-              <n-icon>
-                <span :style="`display:inline-block;width:14px;height:14px;border-radius:4px;background:${preset.primary}`" />
-              </n-icon>
-            </template>
-            <span class="theme-label">{{ preset.label }}</span>
-          </n-button>
-        </n-dropdown>
-
-        <n-dropdown v-if="isLoggedIn" trigger="click" :options="userOptions" @select="onSelectUser">
-          <button class="user-chip" type="button" :aria-label="`${displayName || '用户'}菜单`">
-            <n-avatar round :size="26" :style="{ background: vars.primaryColor, color: '#fff' }">
-              {{ avatarText }}
-            </n-avatar>
-            <span class="user-name">{{ displayName }}</span>
+        <RouterLink to="/" class="header-brand" aria-label="QuantVista 今日概览"><BrandLogo :size="26" /></RouterLink>
+        <div class="header-location" aria-label="当前位置">
+          <span class="location-group">{{ pageLocation.group }}</span>
+          <span class="location-divider" aria-hidden="true">/</span>
+          <span class="location-current">{{ routeLabel }}</span>
+        </div>
+        <div class="header-right">
+          <button class="search-trigger" type="button" aria-label="搜股票" title="搜股票 (Ctrl+K)" @click="showSearch = true">
+            <svg class="st-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" stroke-linecap="round" /></svg>
+            <span class="st-text">搜索股票</span><kbd class="st-kbd">Ctrl K</kbd>
           </button>
-        </n-dropdown>
-      </div>
-    </header>
+          <AIQuickActions variant="toolbar" class="header-ai-actions" />
+          <RecentTasks />
+          <n-popover trigger="click" placement="bottom">
+            <template #trigger><button class="health-dot-wrap" type="button" :aria-label="`连接状态：${health.text}`"><span class="health-dot" :style="{ background: health.color }" /></button></template>
+            <div class="health-detail">
+              <div class="health-row"><span class="health-label">状态</span><span :style="{ color: health.color, fontWeight: 600 }">{{ health.text }}</span></div>
+              <div class="health-row"><span class="health-label">数据库</span><span>{{ status?.db ? '已连接' : '离线' }}</span></div>
+              <div class="health-row"><span class="health-label">Redis</span><span>{{ status?.redis ? '已连接' : '未启用' }}</span></div>
+              <div v-if="status?.version" class="health-row"><span class="health-label">版本</span><span class="qv-mono">v{{ status.version }}</span></div>
+            </div>
+          </n-popover>
+          <n-dropdown trigger="click" :options="themeOptions" :value="currentKey" @select="onSelectTheme">
+            <n-button quaternary size="small" :aria-label="`切换外观，当前${preset.label}`">
+              <template #icon><n-icon><span :style="`display:inline-block;width:14px;height:14px;border-radius:50%;background:${preset.primary}`" /></n-icon></template>
+              <span class="theme-label">外观</span>
+            </n-button>
+          </n-dropdown>
+          <n-dropdown v-if="isLoggedIn" trigger="click" :options="userOptions" @select="onSelectUser">
+            <button class="user-chip" type="button" :aria-label="`${displayName || '用户'}菜单`">
+              <n-avatar round :size="28" :style="{ background: vars.primaryColor, color: '#fff' }">{{ avatarText }}</n-avatar>
+              <span class="user-name">{{ displayName }}</span>
+            </button>
+          </n-dropdown>
+        </div>
+      </header>
 
-    <main class="app-main">
-      <RouterView v-slot="{ Component }">
-        <Transition name="page" mode="out-in" appear>
-          <component :is="Component" />
-        </Transition>
-      </RouterView>
-    </main>
+      <main id="main-content" class="app-main" tabindex="-1" :aria-label="routeLabel">
+        <RouterView v-slot="{ Component }">
+          <Transition name="page" mode="out-in"><component :is="Component" /></Transition>
+        </RouterView>
+      </main>
+    </div>
 
-    <MobileBottomNav
-      :search-active="showSearch"
-      :todo-badge="todoBadgeText"
-      :todo-incomplete="todoIncomplete"
-      @open-search="showSearch = true"
-    />
-
+    <MobileBottomNav :search-active="showSearch" :todo-badge="todoBadgeText" :todo-incomplete="todoIncomplete" @open-search="showSearch = true" />
     <GlobalSearch v-model:show="showSearch" />
     <OnboardingGuide v-if="isLoggedIn" />
-
-    <!-- 移动端抽屉导航：与顶部菜单同一份 options，分组默认展开 -->
-    <n-drawer v-model:show="showNav" placement="left" width="min(82vw, 300px)">
-      <n-drawer-content :body-content-style="{ padding: '10px 6px' }">
-        <template #header>
-          <BrandLogo :size="26" />
-        </template>
-        <div class="drawer-menu-wrap" :style="shellVars" @click="closeDrawerOnLinkClick">
-          <n-menu
-            mode="vertical"
-            :options="menuOptions"
-            :value="activeKey"
-            :default-expanded-keys="['market-group', 'research-group', 'more-group']"
-            :indent="24"
-          />
+    <n-drawer v-model:show="showNav" placement="left" width="min(88vw, 320px)">
+      <n-drawer-content closable :body-content-style="{ padding: '8px 0' }">
+        <template #header><BrandLogo :size="28" /></template>
+        <div :style="shellVars">
+          <WorkspaceNavigation :active-key="activeKey" :admin="isAdmin" :todo-badge="todoBadgeText" :todo-incomplete="todoIncomplete" id-prefix="mobile-nav" @navigate="showNav = false" />
+          <RouterLink to="/settings" class="settings-link drawer-settings" @click="showNav = false"><WorkspaceIcon name="settings" />个人设置</RouterLink>
         </div>
       </n-drawer-content>
     </n-drawer>
@@ -438,277 +318,55 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.app-shell {
-  min-height: 100vh;
-}
-
-/* sticky 毛玻璃顶栏 */
-.app-header {
-  position: sticky;
-  top: 0;
-  z-index: 100;
-  display: flex;
-  align-items: center;
-  gap: 20px;
-  padding: 0 24px;
-  height: 60px;
-  background: var(--qv-header-bg);
-  backdrop-filter: blur(16px) saturate(1.5);
-  -webkit-backdrop-filter: blur(16px) saturate(1.5);
-  border-bottom: 1px solid var(--qv-header-border);
-}
-.logo-link {
-  text-decoration: none;
-  flex-shrink: 0;
-}
-.app-menu-wrap {
-  flex: 1;
-  min-width: 0;
-}
-.app-menu-wrap :deep(.app-menu) {
-  width: 100%;
-}
-
-/* 菜单保持紧凑矩形层级，激活态只做克制强调。 */
-.app-menu-wrap :deep(.n-menu-item-content) {
-  padding: 0 14px !important;
-  border-radius: 4px;
-  transition: background-color 0.18s ease;
-}
-.app-menu-wrap :deep(.n-menu-item-content:hover) {
-  background: var(--qv-menu-hover);
-}
-.app-menu-wrap :deep(.n-menu-item-content--selected),
-.app-menu-wrap :deep(.n-menu-item-content--child-active) {
-  background: var(--qv-menu-active);
-}
-.app-menu-wrap :deep(.n-menu-item-content--selected .n-menu-item-content-header),
-.app-menu-wrap :deep(.n-menu-item-content--child-active .n-menu-item-content-header) {
-  font-weight: 600;
-}
-.app-menu-wrap :deep(.nav-today),
-.drawer-menu-wrap :deep(.nav-today) {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.app-menu-wrap :deep(.nav-badge),
-.drawer-menu-wrap :deep(.nav-badge) {
-  min-width: 16px;
-  height: 16px;
-  padding: 0 4px;
-  border-radius: 999px;
-  background: var(--qv-badge-bg);
-  color: #fff;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 16px;
-  text-align: center;
-}
-.app-menu-wrap :deep(.nav-badge-incomplete),
-.drawer-menu-wrap :deep(.nav-badge-incomplete) {
-  background: var(--qv-badge-incomplete-bg);
-}
-
-.header-right {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-/* 速查入口：伪输入框样式 */
-.search-trigger {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  height: 30px;
-  padding: 0 6px 0 10px;
-  border-radius: 6px;
-  border: 1px solid var(--qv-header-border);
-  background: rgba(128, 128, 128, 0.07);
-  color: inherit;
-  font: inherit;
-  font-size: 12px;
-  opacity: 0.85;
-  cursor: pointer;
-  transition:
-    border-color 0.18s ease,
-    opacity 0.18s ease;
-}
-.search-trigger:hover {
-  border-color: var(--qv-menu-active-text);
-  opacity: 1;
-}
-.st-icon {
-  width: 14px;
-  height: 14px;
-  opacity: 0.7;
-}
-.st-text {
-  opacity: 0.75;
-}
-.st-kbd {
-  font-size: 10px;
-  padding: 1px 5px;
-  border-radius: 4px;
-  border: 1px solid var(--qv-header-border);
-  opacity: 0.6;
-}
-
-.health-dot-wrap {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  cursor: default;
-}
-.health-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  box-shadow: 0 0 0 3px rgba(128, 128, 128, 0.12);
-}
-.health-detail {
-  min-width: 168px;
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-.health-row {
-  display: flex;
-  justify-content: space-between;
-  gap: 24px;
-  font-size: 13px;
-}
-.health-label {
-  opacity: 0.6;
-}
-.user-chip {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 3px 10px 3px 3px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  cursor: pointer;
-  transition: background 0.15s ease;
-}
-.user-chip:hover {
-  background: rgba(128, 128, 128, 0.1);
-}
-.user-chip:focus-visible {
-  outline: 2px solid var(--qv-menu-active-text);
-  outline-offset: 2px;
-}
-.user-name {
-  font-size: 13px;
-  font-weight: 500;
-  /* 长昵称（如第三方登录带来的长 display_name）不得把顶栏操作区顶出视口 */
-  max-width: 120px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.app-main {
-  position: relative;
-  z-index: 1;
-  padding: 26px 28px 56px;
-}
-
-/* 页面切换过渡：轻快的淡入上移 */
-.page-enter-active {
-  transition:
-    opacity 0.18s ease,
-    transform 0.18s ease;
-}
-.page-leave-active {
-  transition: opacity 0.12s ease;
-}
-.page-enter-from {
-  opacity: 0;
-  transform: translateY(8px);
-}
-.page-leave-to {
-  opacity: 0;
-}
-
-/* ---------- 移动端（≤768px）：菜单收进抽屉，顶栏只留图标 ---------- */
-.nav-burger {
-  display: none;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  width: 34px;
-  height: 34px;
-  padding: 0;
-  border: none;
-  border-radius: 8px;
-  background: transparent;
-  color: inherit;
-  cursor: pointer;
-  transition: background-color 0.15s ease;
-}
-.nav-burger svg {
-  width: 20px;
-  height: 20px;
-}
-.nav-burger:hover,
-.nav-burger:active {
-  background: var(--qv-menu-hover);
-}
-
+.app-shell { min-height: 100vh; }
+.app-sidebar { position: fixed; inset: 0 auto 0 0; z-index: 101; display: flex; flex-direction: column; width: var(--qv-sidebar-width); box-sizing: border-box; background: var(--qv-sidebar-bg); border-right: 1px solid var(--qv-header-border); }
+.sidebar-brand { display: grid; gap: 9px; flex-shrink: 0; padding: 25px 23px 21px; text-decoration: none; }
+.sidebar-caption { font-size: 10px; color: var(--qv-text-muted); letter-spacing: .17em; padding-left: 1px; }
+.sidebar-navigation { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.sidebar-footer { display: grid; flex-shrink: 0; gap: 12px; margin: 0 16px; padding: 12px 0 18px; border-top: 1px solid var(--qv-header-border); }
+.settings-link { display: flex; gap: 10px; align-items: center; padding: 7px 10px; border-radius: 8px; color: var(--qv-text-secondary); font-size: 13px; text-decoration: none; }
+.settings-link svg { width: 18px; height: 18px; }
+.settings-link:hover, .settings-link[aria-current="page"] { background: var(--qv-menu-active); color: var(--qv-menu-active-text); }
+.sidebar-status { display: flex; align-items: center; gap: 8px; padding: 0 11px; font-size: 11px; color: var(--qv-text-muted); }
+.app-content { min-width: 0; margin-left: var(--qv-sidebar-width); }
+.app-header { position: sticky; top: 0; z-index: 100; display: flex; align-items: center; gap: 18px; padding: 0 28px; height: var(--qv-header-height); box-sizing: border-box; background: var(--qv-header-bg); border-bottom: 1px solid var(--qv-header-border); backdrop-filter: blur(12px); }
+.header-location { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; font-size: 12px; white-space: nowrap; }
+.location-group, .location-divider { color: var(--qv-text-muted); }
+.location-current { color: var(--qv-text-secondary); font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
+.header-brand { display: none; text-decoration: none; flex-shrink: 0; }
+.header-right { flex-shrink: 0; display: flex; align-items: center; gap: 10px; }
+.search-trigger { display: inline-flex; align-items: center; gap: 9px; height: 34px; min-width: 180px; padding: 0 9px 0 11px; border-radius: 8px; border: 1px solid var(--qv-header-border); background: var(--qv-background); color: var(--qv-text-secondary); font: inherit; font-size: 12px; cursor: pointer; }
+.search-trigger:hover { border-color: var(--qv-menu-active-text); }
+.st-icon { width: 17px; height: 17px; flex-shrink: 0; }
+.st-kbd { margin-left: auto; font: inherit; font-size: 10px; color: var(--qv-text-muted); border: 1px solid var(--qv-header-border); border-radius: 4px; padding: 1px 4px; }
+.health-dot-wrap { display: flex; align-items: center; justify-content: center; width: 28px; height: 32px; border: 0; border-radius: 6px; background: transparent; cursor: pointer; }
+.health-dot { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; }
+.health-detail { min-width: 168px; display: grid; gap: 8px; }
+.health-row { display: flex; justify-content: space-between; gap: 24px; font-size: 13px; }
+.health-label { color: var(--qv-text-muted); }
+.user-chip { display: flex; align-items: center; gap: 8px; padding: 3px 6px; border: 0; border-radius: 8px; background: transparent; color: inherit; font: inherit; cursor: pointer; }
+.user-chip:hover, .health-dot-wrap:hover { background: var(--qv-hover); }
+.user-name { max-width: 88px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.app-main { position: relative; min-width: 0; padding: 28px 28px 56px; }
+.app-main:focus { outline: none; }
+.skip-link { position: fixed; top: 8px; left: 12px; z-index: 10000; padding: 10px 16px; border-radius: 8px; background: var(--qv-surface); color: var(--qv-primary); transform: translateY(-150%); }
+.skip-link:focus { transform: translateY(0); }
+.nav-burger { display: none; width: 36px; height: 36px; flex-shrink: 0; padding: 7px; border: 0; border-radius: 8px; background: transparent; color: inherit; cursor: pointer; }
+.nav-burger:hover { background: var(--qv-hover); }
+.nav-burger svg { width: 22px; height: 22px; }
+.drawer-settings { margin: 4px 12px 16px; min-height: 34px; }
+.page-enter-active { transition: opacity .16s ease; }
+.page-leave-active { transition: opacity .1s ease; }
+.page-enter-from, .page-leave-to { opacity: 0; }
+@media (max-width: 1370px) { .st-kbd, .user-name { display: none; } .search-trigger { min-width: 140px; } .header-ai-actions { display: none; } }
+@media (max-width: 1150px) { .app-sidebar { display: none; } .app-content { margin-left: 0; } .nav-burger { display: flex; } .header-brand { display: inline-flex; } .app-header { gap: 14px; padding: 0 22px; } .location-group, .location-divider { display: none; } }
 @media (max-width: 768px) {
-  .app-header {
-    padding: 0 10px;
-    gap: 8px;
-  }
-  .nav-burger {
-    display: inline-flex;
-  }
-  .app-menu-wrap {
-    display: none;
-  }
-  /* logo 靠左，右侧操作组自然靠右 */
-  .logo-link {
-    margin-right: auto;
-  }
-  .header-right {
-    gap: 4px;
-  }
-  /* 搜索由固定底栏承载，避免 320px 顶栏出现重复入口和拥挤。 */
-  .search-trigger {
-    display: none;
-  }
-  .header-right > :deep(.variant-toolbar) {
-    display: none;
-  }
-  /* 主题按钮只留色块，用户菜单只留头像 */
-  .theme-label {
-    display: none;
-  }
-  .user-name {
-    display: none;
-  }
-  .user-chip {
-    padding: 3px;
-  }
-  .app-main {
-    padding: 16px 12px calc(72px + env(safe-area-inset-bottom, 0px));
-  }
-}
-@media (max-width: 359px) {
-  .app-header {
-    padding: 0 6px;
-    gap: 4px;
-  }
-  .header-right {
-    gap: 0;
-  }
+  .app-header { height: calc(var(--qv-header-height) + env(safe-area-inset-top, 0px)); padding: env(safe-area-inset-top, 0px) 12px 0; gap: 8px; }
+  .header-brand, .theme-label, .st-text, .health-dot-wrap { display: none; }
+  .header-location { font-size: 13px; }
+  .header-right { gap: 5px; }
+  .search-trigger { width: 34px; height: 36px; min-width: 0; justify-content: center; border: 0; background: transparent; padding: 0; }
+  .user-chip { padding: 2px; }
+  .app-main { padding: 20px 14px calc(92px + env(safe-area-inset-bottom, 0px)); }
 }
 </style>

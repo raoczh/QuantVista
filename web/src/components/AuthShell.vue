@@ -5,16 +5,20 @@ import { storeToRefs } from 'pinia'
 import { useThemeStore } from '@/stores/theme'
 import { useUi } from '@/composables/useUi'
 import BrandLogo from '@/components/BrandLogo.vue'
+import WorkspaceIcon from '@/components/WorkspaceIcon.vue'
 
-withDefaults(defineProps<{ subtitle?: string }>(), { subtitle: 'AI 股票研究平台' })
+withDefaults(defineProps<{ subtitle?: string; description?: string }>(), {
+  subtitle: 'AI 股票研究平台', description: '连接你的研究、关注与持仓。',
+})
 
 const themeStore = useThemeStore()
 const { currentKey, preset } = storeToRefs(themeStore)
 const { vars, primaryAlpha } = useUi()
 
-// 主题感知的柔光渐变背景：顶部一抹主色光晕 + 主题 body 底色。
 const bgStyle = computed(() => ({
-  background: `radial-gradient(1100px 560px at 50% -12%, ${primaryAlpha(0.2)}, transparent 70%), ${vars.value.bodyColor}`,
+  '--auth-accent': primaryAlpha(.07),
+  '--auth-border': vars.value.dividerColor,
+  background: vars.value.bodyColor,
 }))
 
 const themeOptions = computed(() =>
@@ -47,15 +51,29 @@ function onSelectTheme(key: string) {
       </n-dropdown>
     </div>
 
-    <div class="auth-body">
-      <div class="auth-brand">
-        <BrandLogo :size="44" />
-        <p class="auth-subtitle">{{ subtitle }}</p>
-      </div>
-      <n-card class="auth-card">
-        <slot />
-      </n-card>
-    </div>
+    <main class="auth-body">
+      <section class="auth-intro" aria-label="关于 QuantVista">
+        <BrandLogo :size="36" />
+        <div class="auth-story">
+          <p class="auth-eyebrow">你的个人投研工作台</p>
+          <h2>让每一次判断，<br />都有依据。</h2>
+          <p class="auth-description">从发现机会到持仓复盘，把数据、研究和行动放在一起。</p>
+          <ol class="auth-steps">
+            <li><WorkspaceIcon name="compass" /><div><strong>发现候选</strong><span>从市场和策略中整理关注名单</span></div></li>
+            <li><WorkspaceIcon name="layers" /><div><strong>核对证据</strong><span>结合 AI 分析，分清事实与待验证的判断</span></div></li>
+            <li><WorkspaceIcon name="history" /><div><strong>持续复盘</strong><span>跟踪持仓风险，记录每次决策的后续表现</span></div></li>
+          </ol>
+        </div>
+        <p class="auth-footnote">研究参考 · 独立判断 · 风险自担</p>
+      </section>
+      <section class="auth-form-area">
+        <div class="auth-brand"><BrandLogo :size="34" /></div>
+        <n-card class="auth-card">
+          <div class="auth-form-heading"><h1>{{ subtitle }}</h1><p v-if="description">{{ description }}</p></div>
+          <slot />
+        </n-card>
+      </section>
+    </main>
   </div>
 </template>
 
@@ -67,7 +85,7 @@ function onSelectTheme(key: string) {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 64px 24px 24px;
+  padding: 72px 32px 48px;
 }
 .auth-topbar {
   position: absolute;
@@ -76,24 +94,42 @@ function onSelectTheme(key: string) {
 }
 .auth-body {
   width: 100%;
-  max-width: 400px;
-  display: flex;
-  flex-direction: column;
+  max-width: 1060px;
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(340px, .9fr);
+  align-items: center;
+  gap: 80px;
 }
 .auth-brand {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 22px;
+  display: none;
 }
-.auth-subtitle {
-  margin: 0;
-  font-size: 13px;
-  opacity: 0.6;
-}
+.auth-intro { min-width: 0; }
+.auth-story { margin-top: 62px; }
+.auth-eyebrow { margin: 0 0 14px; font-size: 12px; color: var(--qv-primary); font-weight: 600; letter-spacing: .1em; }
+.auth-story h2 { margin: 0; font-size: clamp(32px, 3.1vw, 43px); line-height: 1.4; font-weight: 650; letter-spacing: -.04em; }
+.auth-description { margin: 20px 0 28px; max-width: 32em; color: var(--qv-text-secondary); font-size: 14px; line-height: 1.9; }
+.auth-steps { display: grid; gap: 21px; list-style: none; padding: 0; margin: 30px 0; }
+.auth-steps li { display: flex; gap: 14px; align-items: center; }
+.auth-steps svg { width: 38px; height: 38px; flex: 0 0 38px; padding: 10px; border-radius: 10px; background: var(--auth-accent); color: var(--qv-primary); }
+.auth-steps strong { display: block; font-size: 13px; font-weight: 600; }
+.auth-steps span, .auth-footnote { font-size: 12px; color: var(--qv-text-muted); }
+.auth-footnote { margin: 46px 0 0; }
+.auth-form-area { min-width: 0; }
 .auth-card {
-  border-radius: 8px;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.12);
+  border-radius: 16px;
+  border-color: var(--auth-border);
+  padding: 12px;
+  box-shadow: 0 12px 42px rgba(0, 0, 0, .035);
+}
+.auth-form-heading { margin-bottom: 26px; }
+.auth-form-heading h1 { margin: 0; font-size: 22px; font-weight: 600; }
+.auth-form-heading p { margin: 8px 0 0; color: var(--qv-text-muted); font-size: 13px; }
+@media (max-width: 900px) { .auth-body { gap: 36px; } .auth-story { margin-top: 40px; } }
+@media (max-width: 700px) {
+  .auth-shell { padding: 84px 20px 32px; align-items: flex-start; }
+  .auth-body { display: block; max-width: 420px; }
+  .auth-intro { display: none; }
+  .auth-brand { display: flex; justify-content: center; margin: 12px 0 30px; }
+  .auth-card { padding: 4px; }
 }
 </style>

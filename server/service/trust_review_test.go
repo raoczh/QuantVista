@@ -13,7 +13,7 @@ func TestEvidenceReviewKeepsQuotedPricePrecision(t *testing.T) {
 	if check.Items[0].Value != 4.037 || check.Items[0].SnapValue != 4.037 {
 		t.Errorf("核验明细不能把实际引用和佐证价位改成两位：%+v", check.Items[0])
 	}
-	refs, _ := buildDebateEvidenceIndex(check)
+	refs, _ := buildDebateEvidenceIndex(map[string]any{"quote": map[string]any{"price": 4.037}}, check)
 	if len(refs) != 1 || refs[0].Value != 4.037 {
 		t.Errorf("后续辩论收到的证据索引应与冻结报价一致：%+v", refs)
 	}

@@ -8,6 +8,7 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "type-check": "vue-tsc --noEmit",
+    "test:ui": "playwright test",
     "test": "node scripts/test-stock-coverage.mjs && node scripts/test-retail-experience.mjs && node scripts/test-ai-workspaces.mjs && node scripts/test-final-experience.mjs && node scripts/test-auth-session.mjs && node scripts/test-native-shell.mjs && node scripts/test-business-task.mjs && node scripts/test-browser-notifications.mjs && node scripts/test-visible-task-polling.mjs && node scripts/test-list-page-state.mjs && node scripts/test-home-workspace.mjs"
   },
   "dependencies": {
@@ -25,6 +26,7 @@
     "vue-router": "^4.4.5"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@types/node": "^20.16.11",
     "@vitejs/plugin-vue": "^5.2.4",
     "typescript": "^5.6.3",

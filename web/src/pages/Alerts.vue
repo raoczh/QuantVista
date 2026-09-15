@@ -547,8 +547,8 @@ onBeforeUnmount(() => {
 
 <template>
   <PageContainer
-    title="提醒中心"
-    subtitle="管理提醒条件，处理每次命中的事实记录"
+    title="条件提醒"
+    subtitle="设置观察条件，核对触发记录并跟进需要处理的事项。"
   >
     <template #actions>
       <n-button size="small" type="primary" @click="createRule">新建提醒</n-button>

@@ -353,7 +353,7 @@ onMounted(() => void load(routeReportID()))
 </script>
 
 <template>
-  <PageContainer title="收盘日报" subtitle="交易日 15:35 后自动生成：今日复盘 + 明日选股推荐（可在设置-偏好开启）">
+  <PageContainer title="收盘日报" subtitle="复盘今天的市场与持仓，整理下一交易日需要关注的事项。">
     <template #actions>
       <div class="toolbar">
         <n-select

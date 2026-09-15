@@ -632,7 +632,7 @@ async function doExport(kind: ExportKind) {
 </script>
 
 <template>
-  <PageContainer title="设置" subtitle="模型 · 偏好 · 通知 · 账号安全">
+  <PageContainer title="设置" subtitle="管理模型连接、投资偏好、通知与账号安全。">
     <n-tabs v-model:value="activeTab" type="line" animated>
     <!-- LLM 配置 -->
     <n-tab-pane name="llm" tab="LLM 配置">

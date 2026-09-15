@@ -128,8 +128,8 @@ function prLine(rep: RecCalibReport): string {
 
 <template>
   <PageContainer
-    title="LLM 校准报表"
-    subtitle="对照置信度与实际结果，查看分档命中率、Brier/ECE 和可靠性曲线；模型的口头置信度需要通过真实样本检验"
+    title="置信度校准"
+    subtitle="对照模型置信度与实际结果，检查可靠性、误差及样本覆盖。"
   >
     <div class="calib-wrap">
       <SectionCard title="推荐置信度 × 后验标签">

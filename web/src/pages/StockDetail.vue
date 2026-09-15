@@ -1398,7 +1398,7 @@ function scoreType(total: number) {
 </script>
 
 <template>
-  <PageContainer :title="quote?.name || '名称待补全'" subtitle="决策摘要 · 分区研究 · 原始证据">
+  <PageContainer :title="quote?.name || '名称待补全'" subtitle="核对行情、风险和研究结论，沿着证据继续了解这只股票。">
     <template #title>
       <StockIdentity :symbol="symbol" :market="market" :name="quote?.name" />
     </template>

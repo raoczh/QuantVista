@@ -280,7 +280,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <PageContainer title="LLM 调用记录" subtitle="全用户 AI 调用审计明细，保留 90 天">
+  <PageContainer title="模型调用记录" subtitle="核对模型调用、耗时、用量和失败原因，记录保留 90 天。">
     <SectionCard :hoverable="false">
       <div class="filters">
         <n-select v-model:value="filters.user_id" :options="userOptions" filterable class="filter-item" @update:value="onFilterChange" />

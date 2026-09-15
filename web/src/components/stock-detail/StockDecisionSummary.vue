@@ -44,6 +44,15 @@ const allEvidence = computed(() => [
   props.summary.recentEvent,
 ])
 
+// 简明首屏解释状态，原始证据与专业模式仍保留程序字段，便于核对。
+function displayFact(value: string) {
+  const names: Record<string, string> = {
+    unknown: '暂时无法判断', partial: '部分可用', stale: '已过期', ready: '数据完整',
+    PositionExitAssessment: '持仓风险评估',
+  }
+  return label(value.replace(/\b(unknown|partial|stale|ready|PositionExitAssessment)\b/g, key => names[key]), value)
+}
+
 function itemColor(item: DecisionItem) {
   if (item.tone === 'positive') return pctColor(1)
   if (item.tone === 'negative') return pctColor(-1)
@@ -143,11 +152,11 @@ function money(value: number) {
         <div v-if="summary.changes.length" class="decision-list">
           <article v-for="item in summary.changes" :key="item.id" class="decision-item">
             <div class="decision-heading">
-              <strong>{{ item.title }}</strong>
-              <span class="decision-value qv-tnum" :style="{ color: itemColor(item) }">{{ item.value }}</span>
+              <strong>{{ displayFact(item.title) }}</strong>
+              <span class="decision-value qv-tnum" :style="{ color: itemColor(item) }">{{ displayFact(item.value) }}</span>
             </div>
-            <p>{{ item.detail }}</p>
-            <div class="evidence-meta">来源 {{ item.source }} · {{ asOfText() }} {{ item.asOf }}</div>
+            <p>{{ displayFact(item.detail) }}</p>
+            <div class="evidence-meta">来源 {{ displayFact(item.source) }} · {{ asOfText() }} {{ displayFact(item.asOf) }}</div>
           </article>
         </div>
         <n-empty v-else :description="`主要变化${unknownText()}：尚无可核验数据`" size="small" />
@@ -158,11 +167,11 @@ function money(value: number) {
         <div v-if="summary.risks.length" class="decision-list">
           <article v-for="item in summary.risks" :key="item.id" class="decision-item">
             <div class="decision-heading">
-              <strong>{{ item.title }}</strong>
-              <span class="decision-value qv-tnum" :style="{ color: itemColor(item) }">{{ item.value }}</span>
+              <strong>{{ displayFact(item.title) }}</strong>
+              <span class="decision-value qv-tnum" :style="{ color: item.tone === 'negative' ? vars.errorColor : itemColor(item) }">{{ displayFact(item.value) }}</span>
             </div>
-            <p>{{ item.detail }}</p>
-            <div class="evidence-meta">来源 {{ item.source }} · {{ asOfText() }} {{ item.asOf }}</div>
+            <p>{{ displayFact(item.detail) }}</p>
+            <div class="evidence-meta">来源 {{ displayFact(item.source) }} · {{ asOfText() }} {{ displayFact(item.asOf) }}</div>
           </article>
         </div>
         <n-empty v-else description="未命中可核验规则风险；不代表没有风险" size="small" />
@@ -172,14 +181,14 @@ function money(value: number) {
         <div class="section-label" id="event-title">最近事件</div>
         <article class="decision-item">
           <div class="decision-heading">
-            <strong>{{ summary.recentEvent.title }}</strong>
+            <strong>{{ displayFact(summary.recentEvent.title) }}</strong>
             <span class="decision-value qv-tnum" :style="{ color: itemColor(summary.recentEvent) }">
-              {{ summary.recentEvent.value }}
+              {{ displayFact(summary.recentEvent.value) }}
             </span>
           </div>
-          <p>{{ summary.recentEvent.detail }}</p>
+          <p>{{ displayFact(summary.recentEvent.detail) }}</p>
           <div class="evidence-meta">
-            来源 {{ summary.recentEvent.source }} · {{ asOfText() }} {{ summary.recentEvent.asOf }}
+            来源 {{ displayFact(summary.recentEvent.source) }} · {{ asOfText() }} {{ displayFact(summary.recentEvent.asOf) }}
           </div>
         </article>
       </section>
@@ -312,7 +321,7 @@ function money(value: number) {
   font-size: 11px;
 }
 .position-facts {
-  flex: 1;
+  flex: 1 1 560px;
 }
 .decision-grid {
   display: grid;
@@ -423,6 +432,7 @@ function money(value: number) {
     flex-direction: column;
     gap: 14px;
   }
+  .position-facts { flex: auto; }
   .decision-grid {
     grid-template-columns: 1fr;
   }

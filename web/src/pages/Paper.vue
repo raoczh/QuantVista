@@ -343,7 +343,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <PageContainer title="模拟交易" subtitle="虚拟账户 · 按当前有效行情成交与估值 · 练手不担风险">
+  <PageContainer title="模拟交易" subtitle="使用独立的模拟账户记录买卖，观察成本、收益与风险。">
     <template #actions>
       <n-button size="small" quaternary :disabled="trading || resetting || !overview" @click="resetModal = true">重置账户</n-button>
       <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>

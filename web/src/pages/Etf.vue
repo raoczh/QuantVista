@@ -159,7 +159,7 @@ onBeforeUnmount(() => { disposed = true; loadSeq++ })
 </script>
 
 <template>
-  <PageContainer title="指数 ETF" subtitle="精选宽基/行业/跨境 ETF · 一键模拟买卖 · 行情带时效标注">
+  <PageContainer title="指数 ETF" subtitle="观察宽基、行业与跨境 ETF，核对行情后可进行模拟交易。">
     <template #actions>
       <n-button size="small" quaternary :loading="loading" @click="load()">刷新</n-button>
     </template>

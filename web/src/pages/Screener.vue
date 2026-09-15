@@ -1135,7 +1135,7 @@ onMounted(() => { void load(); readResultRoute(); void restoreParseTask() })
 <template>
   <PageContainer
     title="策略选股"
-    subtitle="基于全市场日线因子宽表的条件选股：内置白话策略一键扫描，命中原因逐条可解释"
+    subtitle="按策略寻找候选，逐条核对命中条件与数据时效。"
   >
     <div class="screener" :style="styleVars">
       <!-- 宽表状态条 -->

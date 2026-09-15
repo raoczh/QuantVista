@@ -176,7 +176,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <PageContainer title="行业热力图" subtitle="A 股 · 面积为成交额，颜色为涨跌幅，点击进入板块详情">
+  <PageContainer title="行业热力图" subtitle="面积表示成交额，颜色表示涨跌幅；选择板块继续查看。">
     <template #actions>
       <n-radio-group v-model:value="kind" size="small">
         <n-radio-button value="industry">行业板块</n-radio-button>

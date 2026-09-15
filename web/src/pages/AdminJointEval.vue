@@ -101,8 +101,8 @@ const sliceColumns = computed<DataTableColumns<CalibSliceRow>>(() => [
 
 <template>
   <PageContainer
-    title="组合/回测联合评估"
-    subtitle="收益、Alpha、回撤、换手、成本与校准；开发段用于日常研究，锁定测试段用于发布前验收，每次读取都会登记审计"
+    title="联合评估"
+    subtitle="联合比较收益、回撤、换手和成本；开发区间与锁定测试区间分开使用。"
   >
     <div class="je-wrap">
       <SectionCard title="联合评估">

@@ -472,7 +472,7 @@ async function submitCreate() {
 <template>
   <PageContainer
     title="推荐影子实验"
-    subtitle="Prompt challenger 与 S3-6C score-blind 输入实验统一调度；每批最多一次额外调用，影子输出不改业务推荐"
+    subtitle="比较提示词与输入方式的影响；实验结果独立记录，不改变正式推荐。"
   >
     <div class="exp-wrap">
       <SectionCard title="实验列表">

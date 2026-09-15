@@ -682,7 +682,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <PageContainer title="自选股" subtitle="分组管理 · 重点关注 · 行情带时效标注">
+  <PageContainer title="自选股" subtitle="整理关注名单，比较行情变化，继续研究值得跟踪的机会。">
     <template #actions>
       <n-tag size="small" round :bordered="false">{{ totalCount }} 只</n-tag>
       <n-button size="small" secondary @click="openCreateGroup">新建分组</n-button>

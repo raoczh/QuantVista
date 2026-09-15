@@ -27,6 +27,7 @@ import {
   useRouteQueryState,
 } from '@/composables/useListPageState'
 import PageContainer from '@/components/PageContainer.vue'
+import ResearchWorkspace from '@/components/ResearchWorkspace.vue'
 import DisplayModeSwitch from '@/components/DisplayModeSwitch.vue'
 import AiTaskStatusPanel from '@/components/ai/AiTaskStatusPanel.vue'
 import AnalysisHistory from '@/components/analysis/AnalysisHistory.vue'
@@ -37,6 +38,8 @@ const message = useMessage()
 const dialog = useDialog()
 const route = useRoute()
 const router = useRouter()
+const workspaceViewQuery = enumQuery<'current' | 'history'>('current', ['current', 'history'])
+const workspaceView = ref(workspaceViewQuery.parse(route.query.workspace))
 const sessionEpoch = getSessionEpoch()
 const pageIsCurrent = () => !disposed && sessionEpoch === getSessionEpoch()
 
@@ -105,7 +108,7 @@ type HistoryModule = 'all' | AnalysisModule
 const historyModuleQuery = enumQuery<HistoryModule>('all', ['all', 'stock', 'market', 'sector', 'watchlist', 'position'])
 const historyModule = ref<HistoryModule>(historyModuleQuery.parse(route.query.history_module))
 const historyFilterOptions = [{ label: '全部范围', value: 'all' }, ...moduleOptions]
-useRouteQueryState(route, router, [queryRef('history_module', historyModule, historyModuleQuery)])
+useRouteQueryState(route, router, [queryRef('history_module', historyModule, historyModuleQuery), queryRef('workspace', workspaceView, workspaceViewQuery)])
 const { restoreScroll } = useListPageScroll(route, 'analysis')
 
 async function loadHistory() {
@@ -282,6 +285,7 @@ async function openRecord(item: AnalysisRecord) {
     const value = await getAnalysis(item.id)
     if (sequence !== routeSequence || !pageIsCurrent()) return
     current.value = value
+    workspaceView.value = 'current'
     await replaceRouteQuery(route, router, { record_id: item.id })
     if (sequence === routeSequence && pageIsCurrent() && value.status === 'processing') void track(item.id)
   } catch (reason) {
@@ -393,11 +397,13 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <PageContainer title="AI 分析工作台" subtitle="明确发起、先看结论、再核证据，历史与回溯分开">
+  <PageContainer title="AI 研究" subtitle="选择研究对象，查看结论、证据和需要继续核实的问题。">
     <template #actions><DisplayModeSwitch /></template>
-    <div class="workspace">
-      <div class="main-column">
+    <ResearchWorkspace v-model:view="workspaceView" :has-result="!!current" :busy="running" :status-visible="!!task || running || !!taskError" :status-collapsible="task?.status === 'success' && current?.status === 'success' && !running && !taskError">
+      <template #result>
         <AnalysisResultWorkspace :current="current" :loading="running" :can-explain-history="!!historicalRequest" @explain-history="explainCurrentHistory" />
+      </template>
+      <template #history>
         <AnalysisHistory
           :history="history"
           :current-i-d="current?.id"
@@ -411,8 +417,8 @@ onBeforeUnmount(() => {
           @remove="removeRecord"
           @refresh="loadHistory"
         />
-      </div>
-      <aside class="side-column">
+      </template>
+      <template #controls>
         <AnalysisLauncher
           v-model:form="form"
           v-model:selected-stock="selectedStock"
@@ -429,6 +435,8 @@ onBeforeUnmount(() => {
           @stock-change="updateSelectedStock"
           @analyze="runAnalysis"
         />
+      </template>
+      <template #status>
         <AiTaskStatusPanel
           :task="task"
           :result-i-d="currentID"
@@ -440,23 +448,7 @@ onBeforeUnmount(() => {
           @retry="retryCurrentTask"
           @audit="openTaskAudit"
         />
-      </aside>
-    </div>
+      </template>
+    </ResearchWorkspace>
   </PageContainer>
 </template>
-
-<style scoped>
-.workspace {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(320px, 380px);
-  align-items: start;
-  gap: 16px;
-}
-.main-column,
-.side-column { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; gap: 16px; }
-.side-column { position: sticky; top: 76px; }
-@media (max-width: 1050px) {
-  .workspace { grid-template-columns: 1fr; }
-  .side-column { position: static; grid-row: 1; }
-}
-</style>

@@ -98,6 +98,7 @@ export interface DebateResult {
   triggered: boolean
   trigger_reasons: string[] // low_confidence / contradictory_claims / risk_gate_borderline
   rounds: number
+  evidence_index?: Array<{ evidence_id: string; path: string; value: number; unit?: string; as_of?: string; source?: string }>
   bull?: DebateClaim[]
   bear?: DebateClaim[]
   challenges?: DebateChallenge[]

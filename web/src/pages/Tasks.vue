@@ -347,7 +347,7 @@ function openTask(task: TaskCenterItem) {
 </script>
 
 <template>
-  <PageContainer title="任务中心" subtitle="统一作业事实与兼容业务任务">
+  <PageContainer title="任务中心" subtitle="查看任务进度与结果，处理失败、重试和取消。">
     <template #actions>
       <n-button size="small" :loading="refreshing" @click="refreshNow">刷新</n-button>
     </template>

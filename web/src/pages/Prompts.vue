@@ -153,7 +153,7 @@ onMounted(() => void load())
 </script>
 
 <template>
-  <PageContainer title="提示词模板" subtitle="自定义各分析模块的系统提示 · 启用后覆盖默认分析维度指引">
+  <PageContainer title="提示词模板" subtitle="调整研究任务的关注重点；系统的证据核验与风险约束始终生效。">
     <div class="prompts" :style="styleVars">
       <SectionCard title="按模块自定义">
         <template #extra>

@@ -58,17 +58,16 @@ async function github() {
 </script>
 
 <template>
-  <AuthShell>
-    <h2 class="auth-title">欢迎回来</h2>
-    <p class="auth-hint">登录以继续你的研究</p>
+  <AuthShell subtitle="欢迎回来" description="登录以继续你的研究。">
     <n-form>
       <n-form-item label="用户名">
-        <n-input v-model:value="username" placeholder="用户名" />
+        <n-input v-model:value="username" placeholder="用户名" :input-props="{ 'aria-label': '用户名', autocomplete: 'username' }" />
       </n-form-item>
       <n-form-item label="密码">
         <n-input
           v-model:value="password"
           type="password"
+          :input-props="{ 'aria-label': '密码', autocomplete: 'current-password' }"
           show-password-on="click"
           @keyup.enter="submit"
         />
@@ -93,16 +92,3 @@ async function github() {
     </template>
   </AuthShell>
 </template>
-
-<style scoped>
-.auth-title {
-  margin: 0 0 4px;
-  font-size: 20px;
-  font-weight: 700;
-}
-.auth-hint {
-  margin: 0 0 20px;
-  font-size: 13px;
-  opacity: 0.6;
-}
-</style>

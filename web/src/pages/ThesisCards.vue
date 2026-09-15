@@ -301,7 +301,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <PageContainer title="投资逻辑卡" subtitle="核心逻辑 · 关键证据 · 失效条件 · 定期复盘——先想清楚，再谈买卖">
+  <PageContainer title="投资逻辑卡" subtitle="记录投资假设、支持证据和失效条件，定期回看判断是否成立。">
     <div class="thesis" :style="styleVars">
       <SectionCard title="逻辑卡">
         <template #extra>

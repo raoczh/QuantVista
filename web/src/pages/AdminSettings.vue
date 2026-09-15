@@ -852,7 +852,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <PageContainer title="管理后台" subtitle="系统设置与用户管理">
+  <PageContainer title="系统管理" subtitle="管理用户、系统配置与运行状态。">
     <div class="admin-stack">
       <n-alert v-if="settingsError" type="error" :bordered="false">
         {{ settingsError }} <n-button size="small" :loading="settingsLoading" @click="load">重试读取设置</n-button>

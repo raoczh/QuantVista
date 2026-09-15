@@ -359,7 +359,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <PageContainer title="今日收件箱" subtitle="需处理 · 仅知晓 · 已完成">
+  <PageContainer title="待办收件箱" subtitle="集中查看持仓风险、条件提醒和研究复盘，逐项跟进处理。">
     <template #actions>
       <n-button size="small" quaternary :loading="loading" @click="load">刷新</n-button>
     </template>

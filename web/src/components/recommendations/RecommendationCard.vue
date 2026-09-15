@@ -134,7 +134,7 @@ async function linkExistingPosition() {
 
     <div class="reason-risk">
       <div><span>推荐理由</span><p>{{ firstReason }}</p></div>
-      <div><span>主要风险</span><p :style="{ color: downColor }">{{ firstRisk }}</p></div>
+      <div :style="{ borderLeftColor: vars.warningColor }"><span>主要风险</span><p>{{ firstRisk }}</p></div>
     </div>
 
     <div class="data-line">

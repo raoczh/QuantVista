@@ -132,6 +132,10 @@ func TestHasSharedEvidence(t *testing.T) {
 }
 
 // debateTestResult 构造一份触发辩论的主分析结果（低置信 + 证据白名单两项）。
+func debateTestSnapshot() map[string]any {
+	return map[string]any{"quote": map[string]any{"price": 10.5, "change_pct": -3.2}}
+}
+
 func debateTestResult() *AnalysisResult {
 	return &AnalysisResult{
 		Rating: model.AnalysisRatingNeutral, Summary: "主分析总结",
@@ -139,8 +143,8 @@ func debateTestResult() *AnalysisResult {
 		EvidenceCheck: &evidenceCheck{
 			Version: "ev5",
 			Items: []evidenceItem{
-				{Matched: true, EvidenceID: "ev-001", Path: "现价", SnapValue: 10.5},
-				{Matched: true, EvidenceID: "ev-002", Path: "涨跌幅%", SnapValue: -3.2},
+				{Matched: true, EvidenceID: "ev-001", Path: "quote.price", SnapValue: 10.5},
+				{Matched: true, EvidenceID: "ev-002", Path: "quote.change_pct", SnapValue: -3.2},
 			},
 			Claims: []llmClaim{{ClaimID: "cl-01", Section: "总结", Text: "主分析总结", Status: claimUnresolved}},
 		},
@@ -204,7 +208,7 @@ func TestDebateEndToEnd(t *testing.T) {
 	ratingBefore, summaryBefore := result.Rating, result.Summary
 
 	usage, runs := svc.attachDebate(context.Background(), 7, cfg, "sk", true,
-		map[string]any{}, result, "t1", "r-main")
+		debateTestSnapshot(), result, "t1", "r-main")
 
 	if got := strings.Join(calls, ","); got != "bull,bear,judge" {
 		t.Fatalf("无共享证据应恰 3 次调用（无 rebuttal）: %s", got)
@@ -298,7 +302,7 @@ func TestDebateRebuttalRound(t *testing.T) {
 	cfg := &model.LLMConfig{BaseURL: srv.URL, Model: "m", MaxTokens: 8000}
 	result := debateTestResult()
 
-	_, runs := svc.attachDebate(context.Background(), 7, cfg, "sk", true, map[string]any{}, result, "t1", "r-main")
+	_, runs := svc.attachDebate(context.Background(), 7, cfg, "sk", true, debateTestSnapshot(), result, "t1", "r-main")
 
 	if got := strings.Join(calls, ","); got != "bull,bear,rebuttal,judge" {
 		t.Fatalf("共享证据应触发反驳轮（4 次调用）: %s", got)
@@ -340,6 +344,7 @@ func TestDebateOppositeVerdictLowersConfidence(t *testing.T) {
 	result.Rating = model.AnalysisRatingBullish // 主评级偏多 vs judge 偏空
 	result.SysConfidence = "medium"             // 触发靠 warn 风险而非低置信
 	snap := snapWithFlags("warn")
+	snap["quote"] = debateTestSnapshot()["quote"]
 
 	svc.attachDebate(context.Background(), 7, cfg, "sk", true, snap, result, "t1", "r-main")
 
@@ -369,7 +374,7 @@ func TestDebateBullFailedDegrades(t *testing.T) {
 	result := debateTestResult()
 	ratingBefore := result.Rating
 
-	usage, runs := svc.attachDebate(context.Background(), 7, cfg, "sk", true, map[string]any{}, result, "t1", "r-main")
+	usage, runs := svc.attachDebate(context.Background(), 7, cfg, "sk", true, debateTestSnapshot(), result, "t1", "r-main")
 
 	// bull 首轮+1 次 repair = 2 次调用后放弃。
 	if got := strings.Join(calls, ","); got != "bull,bull" {
@@ -414,6 +419,7 @@ func TestDebateJudgeBlockGuard(t *testing.T) {
 	cfg := &model.LLMConfig{BaseURL: srv.URL, Model: "m", MaxTokens: 8000}
 	result := debateTestResult()
 	snap := snapWithFlags("block")
+	snap["quote"] = debateTestSnapshot()["quote"]
 
 	deb, _, runs := svc.runDebate(context.Background(), 7, cfg, "sk", true, snap, result,
 		[]string{debateTriggerLowConfidence}, "t1", "r-main")
@@ -491,7 +497,7 @@ func TestDebateRebuttalFailureNotFakeTwoRounds(t *testing.T) {
 	svc := &AnalysisService{}
 	cfg := &model.LLMConfig{BaseURL: srv.URL, Model: "m", MaxTokens: 8000}
 	result := debateTestResult()
-	_, runs := svc.attachDebate(context.Background(), 7, cfg, "sk", true, map[string]any{}, result, "t1", "r-main")
+	_, runs := svc.attachDebate(context.Background(), 7, cfg, "sk", true, debateTestSnapshot(), result, "t1", "r-main")
 
 	deb := result.Debate
 	if deb == nil || deb.DegradedReason != "" || deb.Judge == nil {
@@ -530,11 +536,11 @@ func TestDebateJudgeEmptyReferenceRejected(t *testing.T) {
 	result := &AnalysisResult{Rating: model.AnalysisRatingBullish, Summary: "s",
 		SysConfidence: "low", SysConfidenceWhy: "核验吻合率低",
 		EvidenceCheck: &evidenceCheck{Version: "ev5", Items: []evidenceItem{
-			{Matched: true, EvidenceID: "ev-001", Path: "现价", SnapValue: 10.5},
-			{Matched: true, EvidenceID: "ev-002", Path: "涨跌幅%", SnapValue: -3.2},
+			{Matched: true, EvidenceID: "ev-001", Path: "quote.price", SnapValue: 10.5},
+			{Matched: true, EvidenceID: "ev-002", Path: "quote.change_pct", SnapValue: -3.2},
 		}},
 	}
-	svc.attachDebate(context.Background(), 7, cfg, "sk", true, map[string]any{}, result, "t1", "r-main")
+	svc.attachDebate(context.Background(), 7, cfg, "sk", true, debateTestSnapshot(), result, "t1", "r-main")
 
 	deb := result.Debate
 	if deb == nil || deb.DegradedReason != "judge_invalid" || deb.Judge != nil {

@@ -311,7 +311,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <PageContainer title="盘面情绪" subtitle="涨停生态、资金席位与市场人气">
+  <PageContainer title="盘面情绪" subtitle="从市场宽度、涨停梯队和资金动向判断盘面状态。">
     <template #actions>
       <n-button size="small" secondary :loading="loading" @click="load">刷新</n-button>
     </template>

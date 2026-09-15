@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -390,6 +391,7 @@ func configDeviceID(t *testing.T, svc *BrowserNotificationService, userID int64)
 }
 
 type fakeNotifyChannelSender struct {
+	mu    sync.Mutex
 	calls []string
 	err   error
 }
@@ -413,6 +415,8 @@ func (f *blockingNotifyChannelSender) Send(ctx context.Context, _, _ string, _ N
 }
 
 func (f *fakeNotifyChannelSender) Send(_ context.Context, kind, target string, msg NotifyMessage) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, fmt.Sprintf("%s|%s|%s", kind, target, msg.Title))
 	return f.err
 }

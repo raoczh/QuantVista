@@ -5,6 +5,7 @@ import { NConfigProvider, NMessageProvider, NDialogProvider, NGlobalStyle, zhCN,
 import { storeToRefs } from 'pinia'
 import { useThemeStore } from '@/stores/theme'
 import AppShell from '@/components/AppShell.vue'
+import ThemeTokens from '@/components/ThemeTokens.vue'
 import { onExternalSessionChange } from '@/api/token'
 
 // 根组件只负责主题下发与裸布局分流；外壳逻辑在 AppShell（必须位于
@@ -25,6 +26,7 @@ onUnmounted(stopSessionListener)
 <template>
   <n-config-provider :theme="naiveTheme" :theme-overrides="themeOverrides" :locale="zhCN" :date-locale="dateZhCN">
     <n-global-style />
+    <ThemeTokens />
     <n-message-provider>
       <n-dialog-provider>
         <RouterView v-if="isBare" />

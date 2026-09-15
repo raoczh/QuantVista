@@ -47,7 +47,7 @@ const discoveryLabel = computed(() => ({ success: '完整', partial: '部分可�
 </script>
 
 <template>
-  <SectionCard title="今日推荐">
+  <SectionCard title="推荐结果">
     <template #extra>
       <n-button v-if="current?.items.length" size="tiny" quaternary :loading="tracking" @click="emit('refresh-tracking')">刷新追踪</n-button>
     </template>
@@ -68,7 +68,7 @@ const discoveryLabel = computed(() => ({ success: '完整', partial: '部分可�
         <header class="batch-head">
           <div>
             <div class="batch-title">{{ current.title || (current.type === 'short_term' ? '短线推荐' : '长线推荐') }}</div>
-            <div class="batch-meta">生成 {{ new Date(current.created_at).toLocaleString('zh-CN', { hour12: false }) }} · 量化版本 {{ current.strategy_version || '未知' }} · Prompt {{ current.prompt_version || '未知' }}</div>
+            <div class="batch-meta">生成于 {{ new Date(current.created_at).toLocaleString('zh-CN', { hour12: false }) }}</div>
             <div v-if="current.score_profile" class="batch-meta">本批评分侧重：{{ SCORE_PROFILE_LABEL[current.score_profile] || current.score_profile }}</div>
             <div v-if="current.scoring_version" class="batch-meta">排序方式：{{ scoringVersionLabel(current.scoring_version) }}<template v-if="current.scoring_artifact_id"> · 模型 #{{ current.scoring_artifact_id }}</template> · 分值用于排序，不代表获利概率</div>
           </div>

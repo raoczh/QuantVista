@@ -44,6 +44,7 @@ import {
 import { useBusinessTask } from '@/composables/useBusinessTask'
 import { useResultPolling } from '@/composables/useResultPolling'
 import PageContainer from '@/components/PageContainer.vue'
+import ResearchWorkspace from '@/components/ResearchWorkspace.vue'
 import DisplayModeSwitch from '@/components/DisplayModeSwitch.vue'
 import InvestmentPreferenceGuide from '@/components/InvestmentPreferenceGuide.vue'
 import AiTaskStatusPanel from '@/components/ai/AiTaskStatusPanel.vue'
@@ -55,6 +56,8 @@ import RecommendationResultsWorkspace from '@/components/recommendations/Recomme
 const message = useMessage()
 const route = useRoute()
 const router = useRouter()
+const workspaceViewQuery = enumQuery<'current' | 'history'>('current', ['current', 'history'])
+const workspaceView = ref(workspaceViewQuery.parse(route.query.workspace))
 const pageSession = getSessionEpoch()
 const pageRouteName = route.name
 let disposed = false
@@ -454,6 +457,7 @@ async function loadBatch(id: number, updateRoute: boolean) {
 }
 watch(() => route.query.batch_id, () => { if (active()) void openRouteBatch() })
 async function openBatch(item: RecommendationBatch) {
+  workspaceView.value = 'current'
   await loadBatch(item.id, true)
 }
 async function retryResult() {
@@ -616,6 +620,7 @@ function filterState<K extends keyof RecFilters>(key: K) {
   return computed<RecFilters[K]>({ get: () => filters.value[key], set: (value) => { filters.value = { ...filters.value, [key]: value } } })
 }
 useRouteQueryState(route, router, [
+  queryRef('workspace', workspaceView, workspaceViewQuery),
   queryRef('rec_type', recTypeState, recTypeQuery),
   queryRef('strategy', strategyState, strategyQuery),
   queryRef('count', countState, countQuery),
@@ -657,10 +662,10 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <PageContainer title="AI 推荐工作台" subtitle="今天能研究什么、任务为什么这样运行、历史结果后来怎样">
+  <PageContainer title="推荐追踪" subtitle="核对候选、入场条件与风险，跟踪每次推荐的后续表现。">
     <template #actions><DisplayModeSwitch /></template>
-    <div class="workspace">
-      <div class="main-column">
+    <ResearchWorkspace v-model:view="workspaceView" :has-result="!!current" :busy="running" :status-visible="!!task || running || !!taskError" :status-collapsible="task?.status === 'success' && current?.status === 'success' && !running && !taskError">
+      <template #result>
         <RecommendationResultsWorkspace
           v-model:sections="resultSections"
           :current="current"
@@ -674,6 +679,8 @@ onBeforeUnmount(() => {
           @linked="reloadAfterLink"
           @retry="retryResult"
         />
+      </template>
+      <template #history>
         <RecommendationHistoryTracking
           :history="history"
           :current-i-d="current?.id"
@@ -695,8 +702,8 @@ onBeforeUnmount(() => {
           @ack-review="ackReview"
           @audit="auditMode = $event"
         />
-      </div>
-      <aside class="side-column">
+      </template>
+      <template #controls>
         <RecommendationGenerator
           v-model:form="form"
           v-model:filters="filters"
@@ -727,6 +734,8 @@ onBeforeUnmount(() => {
           @preferences="() => { if (!savingFilters && active()) showInvestmentGuide = true }"
           @onboarding="router.push({ query: { ...route.query, onboarding: '1' } })"
         />
+      </template>
+      <template #status>
         <AiTaskStatusPanel
           :task="task"
           :result-i-d="currentID"
@@ -738,35 +747,9 @@ onBeforeUnmount(() => {
           @retry="retryCurrentTask"
           @audit="openTaskAudit"
         />
-      </aside>
-    </div>
+      </template>
+    </ResearchWorkspace>
     <RecommendationResearchAudit v-model="auditMode" :type="form.type" />
     <InvestmentPreferenceGuide v-model="showInvestmentGuide" :preference="pref" @updated="applyGuidePreference" />
   </PageContainer>
 </template>
-
-<style scoped>
-.workspace {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(320px, 380px);
-  align-items: start;
-  gap: 16px;
-}
-.main-column,
-.side-column {
-  display: grid;
-  min-width: 0;
-  gap: 16px;
-}
-.side-column {
-  position: sticky;
-  top: 76px;
-}
-@media (max-width: 1050px) {
-  .workspace { grid-template-columns: 1fr; }
-  .side-column { position: static; grid-row: 1; }
-}
-@media (max-height: 700px) {
-  .side-column { position: static; }
-}
-</style>

@@ -705,7 +705,7 @@ onMounted(() => {
                 <strong>{{ channel.name }}</strong>
                 <n-tag size="small" :type="channel.enabled ? 'success' : 'default'" :bordered="false">{{ channel.enabled ? '已启用' : '已停用' }}</n-tag>
               </div>
-              <span v-if="channel.last_sent_at" class="channel-meta">最近发送：{{ new Date(channel.last_sent_at).toLocaleString('zh-CN', { hour12: false }) }}</span>
+              <span v-if="channel.last_sent_at" class="channel-meta">{{ channel.last_error ? '最近尝试' : '最近发送' }}：{{ new Date(channel.last_sent_at).toLocaleString('zh-CN', { hour12: false }) }}</span>
               <n-alert v-if="channel.last_error" type="error" :bordered="false" class="channel-error">
                 上次推送失败。请测试通道；如仍失败，编辑并更新地址或密钥。
               </n-alert>

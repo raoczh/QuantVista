@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -459,12 +460,32 @@ func (s *NotifyService) sendExternalContext(ctx context.Context, userID int64, m
 	if err := common.DB.WithContext(ctx).Where("user_id = ? AND enabled = ?", userID, true).Find(&rows).Error; err != nil {
 		return
 	}
+	// 每个合法账户最多 10 个通道；独立并发避免第一个慢通道耗尽其他通道的预算。
+	// 网络请求共用调用方预算，也不自动重发交付状态未知的消息。
+	jobs := make(chan model.NotifyChannel)
+	var workers sync.WaitGroup
+	for i := 0; i < min(len(rows), maxChannelsPerUser); i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for ch := range jobs {
+				if ctx.Err() == nil {
+					_ = s.sendToContext(ctx, ch, msg)
+				}
+			}
+		}()
+	}
 	for _, ch := range rows {
-		if ctx.Err() != nil {
+		select {
+		case jobs <- ch:
+		case <-ctx.Done():
+			close(jobs)
+			workers.Wait()
 			return
 		}
-		_ = s.sendToContext(ctx, ch, msg)
 	}
+	close(jobs)
+	workers.Wait()
 }
 
 // Send 纯文本推送（SendMsg 的薄包装，兼容旧调用方）。
@@ -522,6 +543,10 @@ func (s *NotifyService) sendToContext(ctx context.Context, ch model.NotifyChanne
 }
 
 func (s *NotifyService) recordResultContext(ctx context.Context, ch model.NotifyChannel, err error) {
+	// HTTP 超时后仍用独立短预算记录本次失败，避免通道界面继续显示旧的成功状态。
+	// 这里只回写结果，不在取消后继续发送；配置身份条件仍阻止旧请求污染新地址。
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
 	now := time.Now()
 	upd := map[string]any{"last_sent_at": &now}
 	if err != nil {

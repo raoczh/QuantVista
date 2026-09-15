@@ -784,8 +784,9 @@ function onResize() {
 </script>
 
 <template>
-  <PageContainer title="我的今日" subtitle="A 股个人工作台 · 与我有关优先，市场全景在第二层">
+  <PageContainer title="今日概览" subtitle="关注持仓风险、待办和自选变化，开始今天的研究。">
     <template #actions>
+      <AIQuickActions variant="toolbar" />
       <n-tag
         size="small"
         round
@@ -805,16 +806,13 @@ function onResize() {
         </div>
         <n-button size="small" type="primary" @click="router.push({ query: { onboarding: '1' } })">打开首次使用引导</n-button>
       </n-alert>
-      <SectionCard title="AI 快捷操作" :hoverable="false" class="ai-workspace-entry">
-        <AIQuickActions />
-      </SectionCard>
       <SectionCard title="与我有关" :hoverable="false" class="personal-workspace">
         <div class="mode-toolbar">
           <div class="mode-current">
             <strong>{{ modeFocusText }}</strong>
             <span>
               上海 {{ autoSession.clock.date }} {{ autoSession.clock.time }} · 市场状态
-              {{ marketStateLabel(autoSession.marketState) }} · 来源 行情新鲜度契约 · 数据采集时间
+              {{ marketStateLabel(autoSession.marketState) }} · 更新于
               {{ quoteError ? unknownText() : quote?.freshness?.captured_at || unknownText() }}
             </span>
           </div>
@@ -939,7 +937,7 @@ function onResize() {
                 <template v-if="holdingPositions.length">
                   <div class="position-strip">
                     <div>
-                      <span>浮动盈亏</span>
+                      <span>{{ minePos.priced < minePos.n ? '已定价持仓盈亏' : '浮动盈亏' }}</span>
                       <strong class="qv-figure" :style="minePos.priced ? { color: pctColor(minePos.pnl) } : undefined">
                         {{ minePos.priced ? fmtSigned(minePos.pnl) : unknownText() }}
                       </strong>
@@ -954,7 +952,7 @@ function onResize() {
                       <strong class="qv-tnum">{{ quoteGapPositions.length }}</strong>
                     </div>
                   </div>
-                  <div class="source-line">来源 持仓账本 + 有效行情 · {{ asOfText() }} {{ positionAsOf }}</div>
+                  <div class="source-line">来源 持仓账本 + 有效行情 · {{ asOfText() }} {{ positionAsOf }}<template v-if="minePos.priced < minePos.n"> · 盈亏仅包含有效定价持仓，未包含行情缺口。</template></div>
 
                   <div v-if="positionRisks.length" class="work-list compact-list">
                     <button
@@ -1297,7 +1295,7 @@ function onResize() {
       <!-- 个股速查 -->
       <SectionCard title="个股速查">
         <template #extra>
-          <span class="hint">东财 → 腾讯 → 新浪 三源自动切换 · 仅 A 股已打通</span>
+          <span class="hint">查看个股行情与关键指标</span>
         </template>
         <div class="quote-search">
           <n-input

@@ -189,7 +189,7 @@ const feedVars = computed(() => ({
 </script>
 
 <template>
-  <PageContainer title="市场快讯" subtitle="财联社电报 · 东财 7×24 快讯 · 个股新闻，盘中自动更新">
+  <PageContainer title="市场快讯" subtitle="浏览市场与个股快讯，按来源、发布时间和关联标的筛选。">
     <template #actions>
       <n-button size="small" secondary :loading="loading" :disabled="loadingMore" @click="refresh()">刷新</n-button>
     </template>

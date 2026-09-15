@@ -336,7 +336,7 @@ const AUDIT_REASON_LABEL: Record<string, string> = {
 <template>
   <PageContainer
     title="选股配对评估"
-    subtitle="按固定持有口径进行同批配对；Prompt challenger 与 score-blind 输入实验独立分组，重算零 LLM 调用"
+    subtitle="在相同候选和持有周期下比较选股表现，分别查看各类实验结果。"
   >
     <div class="se-wrap">
       <RecommendationRankingResearch />

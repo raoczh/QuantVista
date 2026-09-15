@@ -554,7 +554,7 @@ func TestGoldenDebateBearEmptyChallengesRepair(t *testing.T) {
 	result := debateTestResult()
 	ratingBefore, sysBefore := result.Rating, result.SysConfidence
 
-	deb, _, _ := svc.runDebate(context.Background(), 7, cfg, "sk", true, map[string]any{}, result,
+	deb, _, _ := svc.runDebate(context.Background(), 7, cfg, "sk", true, debateTestSnapshot(), result,
 		[]string{debateTriggerLowConfidence}, "t1", "r-main")
 	if bearRounds != 2 {
 		t.Fatalf("bear 失职应 repair 一次共 2 调: %d", bearRounds)

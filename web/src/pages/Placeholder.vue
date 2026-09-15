@@ -10,15 +10,14 @@ const title = computed(() => (route.meta.title as string) || '页面')
 </script>
 
 <template>
-  <PageContainer>
+  <PageContainer :title="title">
     <div class="placeholder">
       <n-result
         status="404"
-        :title="title"
         description="页面不存在，地址可能已更改。可以返回首页继续查看。"
       >
         <template #footer>
-          <n-button @click="router.push('/')">返回市场首页</n-button>
+          <n-button type="primary" @click="router.push('/')">返回今日概览</n-button>
         </template>
       </n-result>
     </div>

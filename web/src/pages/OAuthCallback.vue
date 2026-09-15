@@ -138,7 +138,7 @@ async function run() {
 </script>
 
 <template>
-  <AuthShell>
+  <AuthShell :subtitle="binding ? '完成账号绑定' : '完成登录'" description="正在核对 GitHub 授权结果。">
     <!-- 移动流·系统浏览器侧：换短码成功即深链回 App，常驻兜底按钮 -->
     <template v-if="mobile === 'browser' && !error">
       <n-spin v-if="!deepLink" description="正在完成 GitHub 登录 ..." class="oauth-spin" />

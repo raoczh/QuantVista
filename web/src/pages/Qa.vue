@@ -564,7 +564,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <PageContainer title="个股 AI 问答" subtitle="固定一份数据快照多轮追问 · 仅依据行情与技术指标 · 研究参考">
+  <PageContainer title="个股问答" subtitle="围绕同一份行情与研究快照追问，回答保留数据时间和证据边界。">
     <div class="qa" :style="styleVars">
       <!-- 左：历史会话 -->
       <div class="col-side">

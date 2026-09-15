@@ -65,7 +65,7 @@ const columns = computed<DataTableColumns<FactorICStat>>(() => [
 </script>
 
 <template>
-  <PageContainer title="因子 IC 排行" subtitle="S3-4 RankIC 验证：A 类因子按历史日线 as-of 重建 × 未来 5/10/20 日收益的 Spearman 秩相关（只读报表，不做删改判定）">
+  <PageContainer title="因子有效性" subtitle="按历史时点检验因子与后续收益的关系，结合样本量和周期解读。">
     <SectionCard title="RankIC 排行（按 |10日 IC 均值| 降序）">
       <template #extra>
         <div class="ic-toolbar">

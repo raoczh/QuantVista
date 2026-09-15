@@ -39,19 +39,19 @@ async function submit() {
 </script>
 
 <template>
-  <AuthShell subtitle="首次启动 · 初始化系统">
-    <h2 class="auth-title">创建管理员</h2>
+  <AuthShell subtitle="创建管理员" description="首次启动，完成系统初始化。">
     <n-alert type="info" :show-icon="false" :bordered="false" class="setup-note">
       这是系统首次启动。第一个账号即系统拥有者，后续可在后台开启 GitHub 登录与注册。
     </n-alert>
     <n-form>
       <n-form-item label="管理员用户名">
-        <n-input v-model:value="username" placeholder="至少 3 个字符" />
+        <n-input v-model:value="username" placeholder="至少 3 个字符" :input-props="{ 'aria-label': '管理员用户名', autocomplete: 'username' }" />
       </n-form-item>
       <n-form-item label="密码">
         <n-input
           v-model:value="password"
           type="password"
+          :input-props="{ 'aria-label': '密码', autocomplete: 'new-password' }"
           show-password-on="click"
           placeholder="至少 8 个字符"
         />
@@ -60,6 +60,7 @@ async function submit() {
         <n-input
           v-model:value="confirm"
           type="password"
+          :input-props="{ 'aria-label': '确认密码', autocomplete: 'new-password' }"
           show-password-on="click"
           @keyup.enter="submit"
         />
@@ -70,11 +71,6 @@ async function submit() {
 </template>
 
 <style scoped>
-.auth-title {
-  margin: 0 0 12px;
-  font-size: 20px;
-  font-weight: 700;
-}
 .setup-note {
   margin-bottom: 16px;
   border-radius: 8px;

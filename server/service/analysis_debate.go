@@ -38,10 +38,11 @@ import (
 // flag `llm_conditional_debate`（缺省开）：关闭只回退触发判定，主分析链路不受影响。
 
 // debateVersion 辩论编排版本（触发条件/轮次策略/prompt 措辞变更时递增）。
+// db3：从冻结快照建立独立事实池，保留主分析遗漏的反证；无事实时不调用模型，证据索引随结果保存。
 // db2（审查修复批）：程序收口三条——claim 必须引用合法 evidence_id（零引用剥除）、bear
 // challenges 非空、judge 三列表互斥且至少一个有效引用；rebuttal 失败回退 Rounds=1 并记
 // rebuttal_degraded；prompt 措辞同步。db1：初版条件式编排。
-const debateVersion = "db2"
+const debateVersion = "db3"
 
 // 辩论轮次与规模上限。
 const (
@@ -113,8 +114,9 @@ type debateResult struct {
 	DegradedReason string            `json:"degraded_reason,omitempty"`
 	// RebuttalDegraded 反驳轮失败标记（审查修复批）：rebuttal 是 best-effort，失败不
 	// 降级整体（judge 照常裁决），但必须如实记录且 Rounds 回退 1——不许伪装成完整两轮。
-	RebuttalDegraded bool   `json:"rebuttal_degraded,omitempty"`
-	Version          string `json:"version"`
+	RebuttalDegraded bool                `json:"rebuttal_degraded,omitempty"`
+	Version          string              `json:"version"`
+	EvidenceIndex    []debateEvidenceRef `json:"evidence_index,omitempty"`
 }
 
 // debateTriggerReasons 程序判定触发条件（纯函数可测）。返回空=不触发（高置信默认单路）。
@@ -182,32 +184,13 @@ type debateEvidenceRef struct {
 	Unit       string  `json:"unit,omitempty"`
 	AsOf       string  `json:"as_of,omitempty"`
 	Origin     string  `json:"origin,omitempty"` // 空=快照佐证 | plan=模型计划价 | user/context=复述来源
-}
-
-// buildDebateEvidenceIndex 从核验结果提取证据索引与白名单（程序产出，模型只能引用不能新增）。
-func buildDebateEvidenceIndex(ev *evidenceCheck) ([]debateEvidenceRef, map[string]bool) {
-	if ev == nil {
-		return nil, nil
-	}
-	refs := make([]debateEvidenceRef, 0, len(ev.Items))
-	allow := make(map[string]bool, len(ev.Items))
-	for _, it := range ev.Items {
-		if !it.Matched || it.EvidenceID == "" {
-			continue
-		}
-		refs = append(refs, debateEvidenceRef{
-			EvidenceID: it.EvidenceID, Path: it.Path, Value: it.SnapValue,
-			Unit: it.Unit, AsOf: it.AsOf, Origin: it.Origin,
-		})
-		allow[it.EvidenceID] = true
-		if len(refs) >= debateEvidenceMax {
-			break
-		}
-	}
-	return refs, allow
+	Source     string  `json:"source,omitempty"`
 }
 
 // --- 角色 prompt（蓝图 C 中文化落地；数据段由程序构造，模型只能引用 EVIDENCE_INDEX） ---
+
+const debateResearchDiscipline = researchReasoningDiscipline + "\n" + earningsPromptDiscipline + `
+复核证据来自程序对完整冻结快照的独立整理，并不局限于主分析引用过的数字。主动检查主分析遗漏的反证；主分析摘要只是待复核的观点，不是新增事实。各角色共享同一份数据，角色数量不等于独立来源数量；引用一个真实数字也不等于它支持整条结论。程序价位和用户设定不能用来证明公司盈利、合理估值或未来收益。`
 
 const debateBullSystem = `你是独立的看多研究员（bull），只建立当前数据快照下最强的看多论证。你与主分析师、看空研究员相互独立。
 规则：
@@ -252,7 +235,7 @@ func (s *AnalysisService) debateCallOne(ctx context.Context, userID int64, run *
 		res, err := chatCompletion(ctx, chatParams{
 			BaseURL: cfg.BaseURL, APIKey: apiKey, Model: cfg.Model, EndpointType: cfg.EndpointType,
 			ReasoningEffort: cfg.ReasoningEffort,
-			Temperature: cfg.Temperature, MaxTokens: requestMax,
+			Temperature:     cfg.Temperature, MaxTokens: requestMax,
 			Messages: convo, JSONMode: true, AllowPrivate: allowPrivate,
 			Repair: attempt > 0, // repair 轮：契约开启时温度固定 0（llm_contract.go）
 			Meta:   run.chatMeta(userID, cfg, attempt+1),
@@ -298,10 +281,12 @@ func normalizeDebateClaims(in []debateClaim, prefix string, allow map[string]boo
 			continue
 		}
 		var evs []string
+		seenEvidence := make(map[string]bool)
 		for _, id := range c.EvidenceIDs {
 			id = strings.TrimSpace(id)
-			if allow[id] {
+			if allow[id] && !seenEvidence[id] {
 				evs = append(evs, id)
+				seenEvidence[id] = true
 			}
 		}
 		if len(evs) == 0 {
@@ -417,7 +402,12 @@ func (s *AnalysisService) runDebate(ctx context.Context, userID int64, cfg *mode
 	}
 
 	snapJSON, _ := json.Marshal(snapshot)
-	refs, allow := buildDebateEvidenceIndex(result.EvidenceCheck)
+	refs, allow := buildDebateEvidenceIndex(snapshot, result.EvidenceCheck)
+	deb.EvidenceIndex = refs
+	if len(refs) == 0 {
+		deb.DegradedReason = "evidence_unavailable"
+		return deb, usage, runs
+	}
 	refsJSON, _ := json.Marshal(refs)
 	// 主分析摘要（双方的对手盘上下文）：评级/总结/反方观点/claims 状态。
 	briefJSON, _ := json.Marshal(map[string]any{
@@ -436,7 +426,7 @@ func (s *AnalysisService) runDebate(ctx context.Context, userID int64, cfg *mode
 	var bullClaims []debateClaim
 	bullUsage, err := s.debateCallOne(ctx, userID, bullRun, cfg, apiKey, allowPrivate,
 		[]chatMessage{
-			{Role: "system", Content: debateBullSystem},
+			{Role: "system", Content: debateBullSystem + "\n" + debateResearchDiscipline},
 			{Role: "user", Content: sharedData},
 		},
 		func(content string) error {
@@ -469,7 +459,7 @@ func (s *AnalysisService) runDebate(ctx context.Context, userID int64, cfg *mode
 	var challenges []debateChallenge
 	bearUsage, err := s.debateCallOne(ctx, userID, bearRun, cfg, apiKey, allowPrivate,
 		[]chatMessage{
-			{Role: "system", Content: debateBearSystem},
+			{Role: "system", Content: debateBearSystem + "\n" + debateResearchDiscipline},
 			{Role: "user", Content: sharedData + "\n\n【看多论点】（BULL_CLAIMS，逐条审视）：\n" + string(bullJSON)},
 		},
 		func(content string) error {
@@ -513,7 +503,7 @@ func (s *AnalysisService) runDebate(ctx context.Context, userID int64, cfg *mode
 		runs = append(runs, rbRun)
 		rbUsage, rbErr := s.debateCallOne(ctx, userID, rbRun, cfg, apiKey, allowPrivate,
 			[]chatMessage{
-				{Role: "system", Content: debateRebuttalSystem},
+				{Role: "system", Content: debateRebuttalSystem + "\n" + debateResearchDiscipline},
 				{Role: "user", Content: "【你上一轮的看多论点】：\n" + string(bullJSON) +
 					"\n\n【看空论点】（BEAR_CLAIMS，反驳对象）：\n" + string(bearJSON) +
 					"\n\n【证据索引】：\n" + string(refsJSON)},
@@ -559,7 +549,7 @@ func (s *AnalysisService) runDebate(ctx context.Context, userID int64, cfg *mode
 	var judge *debateJudge
 	judgeUsage, err := s.debateCallOne(ctx, userID, judgeRun, cfg, apiKey, allowPrivate,
 		[]chatMessage{
-			{Role: "system", Content: debateJudgeSystem},
+			{Role: "system", Content: debateJudgeSystem + "\n" + debateResearchDiscipline},
 			{Role: "user", Content: sharedData + "\n\n【辩论记录】（双方论点与交锋）：\n" + string(debJSON)},
 		},
 		func(content string) error {

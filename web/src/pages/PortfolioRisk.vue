@@ -719,15 +719,14 @@ function contributionStock(key: string) {
 </script>
 
 <template>
-  <PageContainer class="risk-page" :class="{ 'is-embedded': embedded }">
-    <div class="workspace-head">
-      <div>
-        <h1>组合风险</h1>
-        <p v-if="currentAccount">
-          {{ currentAccount.kind === 'real' ? '真实账户' : '模拟账户' }} ·
-          {{ currentAccount.currency }} · 截至 {{ overview?.as_of || '-' }}
-        </p>
-      </div>
+  <PageContainer
+    class="risk-page"
+    :class="{ 'is-embedded': embedded }"
+    title="组合风险"
+    :heading-level="embedded ? 2 : 1"
+    :subtitle="currentAccount ? `${currentAccount.kind === 'real' ? '真实账户' : '模拟账户'} · ${currentAccount.currency} · 截至 ${overview?.as_of || '未知'}，核对集中度、回撤和数据覆盖。` : '选择账户，核对集中度、回撤和数据覆盖。'"
+  >
+    <template #actions>
       <div class="head-actions">
         <n-select
           v-model:value="accountId"
@@ -784,7 +783,7 @@ function contributionStock(key: string) {
           仅空账户可以删除；已有持仓、流水或历史快照的账户请归档。
         </n-popconfirm>
       </div>
-    </div>
+    </template>
     <n-alert v-if="accountsError" type="error" title="账户读取失败" style="margin-bottom: 16px">
       {{ accountsError }} <n-button text type="primary" @click="loadAccounts">重试</n-button>
     </n-alert>
@@ -1396,30 +1395,6 @@ function contributionStock(key: string) {
 :global(.portfolio-flow-dialog.n-card > .n-card__footer) {
   flex-shrink: 0;
 }
-.workspace-head {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  align-items: flex-start;
-  flex-wrap: wrap;
-  margin-bottom: 16px;
-}
-.workspace-head > div:first-child {
-  min-width: 0;
-}
-/* 字号与 PageContainer 的 .page-title 对齐（24px/700），别在这里另起一套 */
-.workspace-head h1 {
-  font-size: 24px;
-  font-weight: 700;
-  line-height: 1.25;
-  margin: 0;
-}
-.workspace-head p {
-  margin: 6px 0 0;
-  color: var(--n-text-color-3);
-  font-size: 13px;
-  overflow-wrap: anywhere;
-}
 .head-actions,
 .parameter-bar,
 .stress-controls,
@@ -1567,9 +1542,6 @@ function contributionStock(key: string) {
   }
 }
 @media (max-width: 480px) {
-  .workspace-head h1 {
-    font-size: 22px;
-  }
   .head-actions > * {
     flex: 1 1 calc(50% - 10px);
   }

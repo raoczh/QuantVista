@@ -35,8 +35,8 @@ onMounted(() => void load())
 
 <template>
   <PageContainer
-    title="LLM 角色资产 registry"
-    subtitle="P1-8 系统内建角色的机读登记（只读声明表，与代码测试锁定一致）：版本锚 / schema / 触发条件 / 输入白名单 / 必答要求 / 禁止动作 / 预算 / 反例坐标"
+    title="研究角色"
+    subtitle="核对内置研究角色的职责、输入范围、输出要求与调用预算。"
   >
     <div class="roles-wrap">
       <n-alert v-if="loadError" type="error" :bordered="false">{{ loadError }} <n-button size="small" text @click="load">重试</n-button></n-alert>

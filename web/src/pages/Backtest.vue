@@ -620,8 +620,8 @@ onBeforeUnmount(dispose)
 
 <template>
   <PageContainer
-    title="回测时光机"
-    subtitle="策略与 AI 推荐的历史可验证：次日开盘买入 · A 股真实约束 · 上证基准对照"
+    title="历史回测"
+    subtitle="按历史时点检验策略与推荐，比较扣费收益、风险和市场基准。"
     :style="styleVars"
   >
     <n-radio-group v-model:value="tab" size="small" style="margin-bottom: 16px">

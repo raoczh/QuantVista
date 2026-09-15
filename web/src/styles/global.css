@@ -8,9 +8,11 @@
     Consolas, 'Roboto Mono', monospace;
 
   --qv-content-max: 1440px;
-  --qv-radius-card: 8px;
+  --qv-radius-card: 12px;
   --qv-radius-sm: 8px;
-  --qv-gap: 16px;
+  --qv-gap: 20px;
+  --qv-sidebar-width: 232px;
+  --qv-header-height: 64px;
 }
 
 html,
@@ -26,6 +28,46 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
+  line-height: 1.6;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+button,
+a,
+input,
+select,
+textarea {
+  -webkit-tap-highlight-color: transparent;
+}
+
+:where(button, a, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--qv-primary, currentColor);
+  outline-offset: 3px;
+}
+
+img,
+svg {
+  max-width: 100%;
+}
+
+/* 有主次的页内工具条；筛选与按钮在窄屏自然换行。 */
+.qv-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-width: 0;
+}
+
+.qv-stack {
+  display: grid;
+  min-width: 0;
+  gap: var(--qv-gap);
 }
 
 /* iOS 横竖屏切换时禁止自动放大字号 */
@@ -67,7 +109,7 @@ html {
 }
 
 .qv-transition {
-  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
 }
 
 /* 主题切换时背景平滑过渡（body 背景由 n-global-style 联动主题） */
@@ -113,4 +155,13 @@ body {
 }
 *::-webkit-scrollbar-track {
   background: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

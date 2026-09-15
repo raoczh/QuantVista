@@ -1662,7 +1662,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <PageContainer title="持仓卖出决策中心" :subtitle="`${overview?.account_name ? overview.account_name + ' · ' : ''}先处理风险，再管理账本与复盘`">
+  <PageContainer title="持仓管理" :subtitle="`${overview?.account_name ? overview.account_name + ' · ' : ''}先处理风险，再核对持仓、交易与复盘`">
     <template v-if="mainTab !== 'risk'" #actions>
       <n-button size="small" type="primary" @click="openCreate()">+ 新建持仓</n-button>
       <n-button size="small" quaternary @click="openImport">导入</n-button>

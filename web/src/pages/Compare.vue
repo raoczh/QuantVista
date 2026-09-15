@@ -330,7 +330,7 @@ function aiRefusalText(code: string) {
 </script>
 
 <template>
-  <PageContainer title="个股横向对比" subtitle="多股并排 · 综合评分 + 行情与技术指标 · 可选 AI 一句话点评">
+  <PageContainer title="横向对比" subtitle="在同一视图比较行情与技术指标，核对差异后再作判断。">
     <div class="cmp" :style="styleVars">
       <SectionCard title="选择标的">
         <div class="inputs">

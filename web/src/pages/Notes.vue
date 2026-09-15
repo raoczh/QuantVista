@@ -213,7 +213,7 @@ onUnmounted(() => { disposed = true; loadSeq++ })
 </script>
 
 <template>
-  <PageContainer title="投资笔记" subtitle="决策日志 · 复盘 · 想法 · 事件——留下「当时为什么这么想」">
+  <PageContainer title="投资笔记" subtitle="留下决策理由、观察和复盘记录，让后续判断有迹可循。">
     <div class="notes" :style="styleVars">
       <SectionCard title="笔记时间线">
         <template #extra>
