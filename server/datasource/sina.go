@@ -64,12 +64,12 @@ func (s *SinaAdapter) GetQuote(ctx context.Context, market, symbol string) (*Quo
 		if i >= len(fields) {
 			return 0
 		}
-		f, _ := strconv.ParseFloat(strings.TrimSpace(fields[i]), 64)
+		f, _ := parseSinaFiniteNumber(fields[i])
 		return f
 	}
 
 	price := atof(3)
-	if price == 0 {
+	if price <= 0 {
 		return nil, ErrNoData
 	}
 	prevClose := atof(2)
@@ -81,7 +81,7 @@ func (s *SinaAdapter) GetQuote(ctx context.Context, market, symbol string) (*Quo
 	// 字段 30/31 为日期/时间（北京时间）。解析失败保持零值（timestamp_unknown）：
 	// 回填当前时间会把旧价伪装成实时价，零值由新鲜度判定恒判 stale。
 	var dataTime time.Time
-	if t, err := time.ParseInLocation("2006-01-02 15:04:05", fields[30]+" "+fields[31], time.Local); err == nil {
+	if t, err := time.ParseInLocation("2006-01-02 15:04:05", fields[30]+" "+fields[31], ChinaMarketLocation()); err == nil {
 		dataTime = t
 	}
 
@@ -144,10 +144,10 @@ func (s *SinaAdapter) GetIndices(ctx context.Context, market string) ([]Index, e
 		if !ok || len(f) < 6 {
 			continue
 		}
-		atof := func(idx int) float64 { v, _ := strconv.ParseFloat(strings.TrimSpace(f[idx]), 64); return v }
+		atof := func(idx int) float64 { v, _ := parseSinaFiniteNumber(f[idx]); return v }
 		price := atof(3)
 		prevClose := atof(2)
-		if price == 0 {
+		if price <= 0 {
 			continue
 		}
 		pct := 0.0
@@ -160,7 +160,7 @@ func (s *SinaAdapter) GetIndices(ctx context.Context, market string) ([]Index, e
 		var dataTime time.Time
 		if len(f) >= 32 {
 			if t, err := time.ParseInLocation("2006-01-02 15:04:05",
-				strings.TrimSpace(f[30])+" "+strings.TrimSpace(f[31]), time.Local); err == nil {
+				strings.TrimSpace(f[30])+" "+strings.TrimSpace(f[31]), ChinaMarketLocation()); err == nil {
 				dataTime = t
 			}
 		}
@@ -240,8 +240,8 @@ func (s *SinaAdapter) GetStockRanking(ctx context.Context, market, sort string, 
 	return out, nil
 }
 
-// 返回按日期升序的日线。注意：该接口无复权参数（口径与东财 fqt=1 前复权不一定
-// 一致），仅作东财日线失败时的兜底；不提供成交额，Amount 置 0（落库时不覆盖已有值）。
+// 返回不复权日线，仅保留适配器的原始数据能力。Manager 明确排除此接口，
+// 不让它作为前复权股票分析或共享历史表的备用来源。
 func (s *SinaAdapter) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]Bar, error) {
 	if market != "cn" {
 		return nil, ErrNotSupported
@@ -292,7 +292,7 @@ func (s *SinaAdapter) GetDailyBars(ctx context.Context, market, symbol string, l
 			Low:       atof(r.Low),
 			Close:     atof(r.Close),
 			Volume:    int64(atof(r.Volume) / 100), // 新浪返回股，统一为手（与东财口径一致）
-			Amount:    0, // 该接口不提供成交额
+			Amount:    0,                           // 该接口不提供成交额
 		})
 	}
 	return bars, nil
@@ -345,6 +345,7 @@ func (s *SinaAdapter) GetBenchmarkBars(ctx context.Context, market string, limit
 	}
 	return "上证指数", bars, nil
 }
+
 // 返回按日期升序的 YYYY-MM-DD 列表。
 func (s *SinaAdapter) GetTradingDays(ctx context.Context, market string, limit int) ([]string, error) {
 	if market != "cn" {

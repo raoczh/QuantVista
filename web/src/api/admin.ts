@@ -120,6 +120,7 @@ export interface DataSourceCapability {
   qps_policy: string
   cache_ttl_sec: number
   cache_semantics: string
+  probe_disabled?: boolean
   registered: boolean
   supported: boolean
   observation: CapabilityObservation

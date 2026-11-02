@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // clist 快照一页的真实响应样本（2026-07-08 实测裁剪）：
@@ -36,7 +37,7 @@ func TestParseClistSpotArray(t *testing.T) {
 	r0 := rows[0]
 	if r0.Symbol != "000001" || r0.Name != "平安银行" || r0.Price != 10.47 ||
 		r0.PrevClose != 10.5 || r0.Volume != 805221 || r0.TurnoverRate != 0.41 ||
-		r0.DataTime != 1783409697 {
+		r0.DataTime != 1783409697 || r0.Source != "eastmoney" {
 		t.Fatalf("row0 字段不符: %+v", r0)
 	}
 	if r0.Open != 10.46 || r0.High != 10.51 || r0.Low != 10.35 || r0.ChangePct != -0.29 {
@@ -118,35 +119,29 @@ func TestGetCNSpotSnapshotPaging(t *testing.T) {
 	}
 }
 
-func TestGetCNSpotSnapshotPageRetry(t *testing.T) {
-	// 第 2 页首次网络失败，页级重试成功，整轮仍成功。
-	failedOnce := false
+func TestGetCNSpotSnapshotDoesNotRetryPermanentPageFailure(t *testing.T) {
+	// HTTP 400 is not transient. Do not multiply the shared HTTP retry budget.
+	calls := 0
 	e := NewEastMoneyAdapter()
 	e.fetch = func(ctx context.Context, rawURL string, headers map[string]string) ([]byte, int, error) {
+		calls++
 		switch pn := pnOf(rawURL); pn {
 		case 1:
 			return []byte(spotPageJSON(150, 0, 100)), 200, nil
 		case 2:
-			if !failedOnce {
-				failedOnce = true
-				return nil, 0, errors.New("EOF")
-			}
-			return []byte(spotPageJSON(150, 100, 50)), 200, nil
+			return nil, 400, nil
 		default:
 			return []byte(`{"data":{"total":150,"diff":[]}}`), 200, nil
 		}
 	}
 	rows, err := e.GetCNSpotSnapshot(context.Background())
-	if err != nil {
-		t.Fatalf("snapshot: %v", err)
-	}
-	if len(rows) != 150 {
-		t.Fatalf("rows = %d, want 150", len(rows))
+	if !errors.Is(err, ErrUpstream) || len(rows) != 0 || calls != 2 {
+		t.Fatalf("permanent error was retried or published as a partial snapshot: rows=%d calls=%d err=%v", len(rows), calls, err)
 	}
 }
 
 func TestGetCNSpotSnapshotIncomplete(t *testing.T) {
-	// 页 2 起返回空页：100/250 < 90%，半截快照必须整轮拒绝（防静默缺口）。
+	// 页 2 起返回空页，半截快照必须整轮拒绝（防静默缺口）。
 	e := NewEastMoneyAdapter()
 	e.fetch = func(ctx context.Context, rawURL string, headers map[string]string) ([]byte, int, error) {
 		if pnOf(rawURL) == 1 {
@@ -156,5 +151,76 @@ func TestGetCNSpotSnapshotIncomplete(t *testing.T) {
 	}
 	if _, err := e.GetCNSpotSnapshot(context.Background()); err == nil {
 		t.Fatal("半截快照应报错")
+	}
+}
+
+func TestGetCNSpotSnapshotRejectsAlmostCompleteAndDuplicatePages(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		total      int
+		secondPage string
+	}{
+		{"ninety_five_percent", 200, spotPageJSON(200, 100, 90)},
+		{"duplicate_page", 200, spotPageJSON(200, 0, 100)},
+		{"overlapping_page", 200, spotPageJSON(200, 99, 100)},
+		{"count_changes", 200, spotPageJSON(199, 100, 99)},
+		{"count_disappears", 200, spotPageJSON(0, 100, 100)},
+		{"too_many_rows", 150, spotPageJSON(150, 100, 51)},
+	} {
+		t.Run(testCase.name, func(test *testing.T) {
+			adapter := NewEastMoneyAdapter()
+			adapter.fetch = func(_ context.Context, endpoint string, _ map[string]string) ([]byte, int, error) {
+				if pnOf(endpoint) == 1 {
+					return []byte(spotPageJSON(testCase.total, 0, 100)), 200, nil
+				}
+				return []byte(testCase.secondPage), 200, nil
+			}
+			rows, err := adapter.GetCNSpotSnapshot(context.Background())
+			if !errors.Is(err, ErrUpstream) || rows != nil {
+				test.Fatalf("incomplete universe must fail atomically: rows=%d err=%v", len(rows), err)
+			}
+		})
+	}
+}
+
+func TestGetCNSpotSnapshotCancelPageWait(test *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	adapter := NewEastMoneyAdapter()
+	calls := 0
+	adapter.fetch = func(context.Context, string, map[string]string) ([]byte, int, error) {
+		calls++
+		time.AfterFunc(20*time.Millisecond, cancel)
+		return []byte(spotPageJSON(101, 0, 100)), 200, nil
+	}
+	rows, err := adapter.GetCNSpotSnapshot(ctx)
+	if !errors.Is(err, context.Canceled) || rows != nil || calls != 1 {
+		test.Fatalf("cancellation must stop pagination: calls=%d rows=%d err=%v", calls, len(rows), err)
+	}
+}
+
+func TestGetCNSpotSnapshotRejectsUnsafePageLimit(t *testing.T) {
+	adapter := NewEastMoneyAdapter()
+	calls := 0
+	adapter.fetch = func(context.Context, string, map[string]string) ([]byte, int, error) {
+		calls++
+		return []byte(spotPageJSON(clistPageSize*clistMaxPages+1, 0, 100)), 200, nil
+	}
+	if rows, err := adapter.GetCNSpotSnapshot(context.Background()); !errors.Is(err, ErrUpstream) || rows != nil || calls != 1 {
+		t.Fatalf("over-limit count must not continue paging: calls=%d err=%v", calls, err)
+	}
+}
+
+func TestParseClistSpotRejectsMalformedIdentityAndPageShape(t *testing.T) {
+	for _, fixture := range []string{
+		`{"data":{"total":1,"diff":[{"f12":""}]}}`,
+		`{"data":{"total":1,"diff":[{"f12":"60000x"}]}}`,
+		`{"data":{"total":1,"diff":{"bad":{"f12":"600000"}}}}`,
+		`{"data":{"total":1,"diff":{"01":{"f12":"600000"}}}}`,
+		`{"data":{"total":1,"diff":"truncated"}}`,
+	} {
+		if _, _, err := parseClistSpot([]byte(fixture)); !errors.Is(err, ErrUpstream) {
+			t.Errorf("malformed raw rows must not be silently discarded: %s: %v", fixture, err)
+		}
 	}
 }

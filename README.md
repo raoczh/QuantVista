@@ -107,6 +107,19 @@ npm run dev
 3. 需要 AI 功能时，在设置中添加兼容 OpenAI 的 API 地址、模型和 API Key，并测试连接；支持 Chat Completions 与 Responses 两类端点。
 4. 数据同步和研究生成进度可在任务中心查看。行情、账本和规则选股等功能可以独立于 AI 使用。
 
+### 免费数据源与故障恢复
+
+行情与资讯默认使用免费公开接口，不要求购买积分或填写行情 Token：
+
+- 实时报价支持东财、腾讯、新浪自动切换；前复权日线支持东财与腾讯，在线分析和后台历史补采共用回退链。
+- 指数、历史交易日、榜单、估值按各来源的实际能力互补；5 分钟线增加新浪备用，公告增加巨潮官方披露查询，快讯增加新浪来源。
+- 热点行情使用有容量上限的进程内缓存，并合并同标的请求，**不配置 Redis 也有效**。请求带限速、有限重试与冷却，避免连续失败时反复冲击免费接口。
+- 管理后台的“数据源能力矩阵”可分别探测日线、行情、分钟线和公告；全市场快照必须通过同步任务执行，普通探测按钮不会扫描全市场。
+
+免费接口没有可用性保证，服务器网络和上游限流仍可能导致缺失。财务三表、板块、资金流等仍有东财单源部分；1 分钟分时仍依赖腾讯，不用 5 分钟数据冒充。旧行情保留源时间，不会因重新请求就变成实时数据。
+
+接口清单、开源项目依据、数据口径和验证边界见 [免费数据源稳定性说明](docs/DATA_SOURCE_RELIABILITY.md)；部署后的检查顺序见 [部署排障](docs/DEPLOYMENT.md#9-数据源升级与排障)。
+
 ### Docker 运行
 
 从仓库根目录构建当前源码：
@@ -143,7 +156,7 @@ docker run -d --name quantvista --restart unless-stopped -p 3000:3000 --env-file
 | `TRUSTED_PROXIES` | 可信反向代理 IP 或 CIDR，默认不信任代理头 |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | GitHub OAuth 首次配置种子，之后以管理后台保存的配置为准 |
 | `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` / `VAPID_SUBJECT` | Web Push 配置，用于页面休眠或关闭后的后台投递；未配置时仅在页面继续运行期间接收 |
-| `TUSHARE_TOKEN` | 可选 Tushare 数据源凭证 |
+| `TUSHARE_TOKEN` | 历史预留变量；当前未实现 Tushare 适配器，填写不会启用备用源 |
 | `DEFAULT_MARKET` | 默认 `cn`，当前主要支持 A 股 |
 | `DEBUG` | 调试日志开关，默认 `false` |
 
@@ -236,6 +249,7 @@ QuantVista/
 | [部署说明](docs/DEPLOYMENT.md) | MySQL、Docker Compose、反向代理、迁移与备份 |
 | [技术架构](docs/ARCHITECTURE.md) | 服务分层、数据流、界面约定与 AI 调用设计 |
 | [数据源说明](docs/DATA_SOURCES.md) | 数据源能力、覆盖范围与降级策略 |
+| [免费数据源稳定性](docs/DATA_SOURCE_RELIABILITY.md) | 本轮免费接口补充、开源依据、请求保护与验证边界 |
 | [移动端说明](mobile/README.md) | Android 构建、签名、深链与通知 |
 | [项目规划与验收边界](docs/ROADMAP.md) | 业务规划、未完成项与线上验收清单 |
 | [代码审查报告](docs/CODE_REVIEW.md) | 全量审查范围、修复与验证记录 |

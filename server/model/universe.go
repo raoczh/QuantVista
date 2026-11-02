@@ -17,17 +17,18 @@ type StockUniverseDaily struct {
 	Market    string `gorm:"size:8" json:"market"`
 	Name      string `gorm:"size:64" json:"name"` // 当日名称（ST 戴帽/摘帽、更名历史由逐日快照天然留痕）
 
-	IsST      bool `json:"is_st"`      // 当日名称含 ST/退（isSTName 口径）
-	Suspended bool `json:"suspended"`  // 当日停牌（快照价格/成交量无效）
+	IsST      bool `json:"is_st"`     // 当日名称含 ST/退（isSTName 口径）
+	Suspended bool `json:"suspended"` // 当日停牌（快照价格/成交量无效）
 
 	Close        float64 `gorm:"type:decimal(20,4)" json:"close"`
 	PrevClose    float64 `gorm:"type:decimal(20,4)" json:"prev_close"`
-	Amount       float64 `json:"amount"`        // 成交额（元）
+	Amount       float64 `json:"amount"` // 成交额（元）
 	TurnoverRate float64 `gorm:"type:decimal(12,4)" json:"turnover_rate"`
-	PE           float64 `gorm:"type:decimal(12,4)" json:"pe"`     // 市盈率（动）；亏损为负、缺失/停牌为 0
+	PE           float64 `gorm:"type:decimal(12,4)" json:"pe"` // 市盈率（动）；亏损为负、缺失/停牌为 0
 	PETTM        float64 `gorm:"type:decimal(12,4)" json:"pe_ttm"`
 	PB           float64 `gorm:"type:decimal(12,4)" json:"pb"`
 	Industry     string  `gorm:"size:32" json:"industry"` // 东财行业板块名（f100；退市壳票为空）
+	Source       string  `gorm:"size:24" json:"source,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
 }

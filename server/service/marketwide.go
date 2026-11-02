@@ -129,8 +129,8 @@ func spotTradeDate(rows []datasource.SpotRow) (string, error) {
 	if maxTS <= 0 {
 		return "", errors.New("快照缺少行情时间戳（f124 口径漂移？）")
 	}
-	date := time.Unix(maxTS, 0).Format("2006-01-02")
-	if date > time.Now().Format("2006-01-02") {
+	date := time.Unix(maxTS, 0).In(datasource.ChinaMarketLocation()).Format("2006-01-02")
+	if date > time.Now().In(datasource.ChinaMarketLocation()).Format("2006-01-02") {
 		return "", errors.New("全市场快照日期晚于今天，拒绝写入日线与历史宇宙")
 	}
 	return date, nil
@@ -215,14 +215,16 @@ func (s *MarketService) rebaseWithoutOverlap(ctx context.Context, db *gorm.DB, m
 	return true, nil
 }
 
-// rebaseStock 全量重锚：fresh 不足全量时重拉东财 250 根（强制东财——mgr 路由的新浪
-// 兜底不复权，会把基准锚坏），事务内整股删+插，记 adjust_epoch。
-// 缓存说明：GetDailyBars 的 10 分钟缓存可能短暂残留旧基准序列（键带 limit 无法精确清），
-// TTL 到期自愈；除权日在线路径拉到的本就是上游新基准，误差窗口有限。
+// rebaseStock replaces a whole compatible adjusted series, preserving its real
+// price source. Background rebases invalidate cached windows after committing.
 func (s *MarketService) rebaseStock(ctx context.Context, market, symbol string, fresh []datasource.Bar) error {
-	return withDailyBarWriteTx(ctx, market, []string{symbol}, func(tx *gorm.DB) error {
+	err := withDailyBarWriteTx(ctx, market, []string{symbol}, func(tx *gorm.DB) error {
 		return s.rebaseStockTx(ctx, tx, market, symbol, fresh)
 	})
+	if err == nil {
+		s.responseCache().ForgetPrefix("bars:qfq-v2:" + market + ":" + symbol + ":")
+	}
+	return err
 }
 
 func (s *MarketService) rebaseStockTx(ctx context.Context, tx *gorm.DB, market, symbol string, fresh []datasource.Bar) error {
@@ -240,17 +242,36 @@ func (s *MarketService) rebaseStockTx(ctx context.Context, tx *gorm.DB, market, 
 	if err := validateAdjustedBars(market, fresh); err != nil {
 		return err
 	}
+	// Amount and turnover are actual trading facts, not adjusted prices. A
+	// backup without those fields must not erase known values for the same day.
+	var existingRows []model.DailyBar
+	if err := tx.Select("trade_date", "amount", "turnover_rate").
+		Where("market = ? AND symbol = ?", market, symbol).Find(&existingRows).Error; err != nil {
+		return err
+	}
+	previousFacts := make(map[string]model.DailyBar, len(existingRows))
+	for _, previous := range existingRows {
+		previousFacts[previous.TradeDate] = previous
+	}
 
 	rows := make([]model.DailyBar, 0, len(fresh))
 	for _, b := range fresh {
 		if b.TradeDate == "" {
 			continue
 		}
+		if previous, exists := previousFacts[b.TradeDate]; exists {
+			if b.Amount == 0 {
+				b.Amount = previous.Amount
+			}
+			if b.TurnoverRate == 0 {
+				b.TurnoverRate = previous.TurnoverRate
+			}
+		}
 		rows = append(rows, model.DailyBar{
 			Symbol: symbol, Market: market, TradeDate: b.TradeDate,
 			Open: b.Open, High: b.High, Low: b.Low, Close: b.Close,
 			Volume: b.Volume, Amount: b.Amount, TurnoverRate: b.TurnoverRate,
-			Source: "eastmoney",
+			Source: sourceOrUnknown(b.Source),
 		})
 	}
 	if len(rows) == 0 {
@@ -278,8 +299,7 @@ func (s *MarketService) rebaseStockTx(ctx context.Context, tx *gorm.DB, market, 
 	return s.touchStateAfterRebase(tx, market, symbol, len(rows), last.TradeDate)
 }
 
-// wideDailyBars 东财直连拉日线并补 Source（直连不经 manager，Source 不会被自动填充；
-// persistDailyBars 的除权检测依赖 Source=="eastmoney" 判定复权口径）。
+// wideDailyBars uses the same adjusted-only fallback as online analysis.
 func (s *MarketService) wideDailyBars(ctx context.Context, market, symbol string, limit int) ([]datasource.Bar, error) {
 	bars, err := s.wide.GetDailyBars(ctx, market, symbol, limit)
 	if err != nil {
@@ -288,10 +308,25 @@ func (s *MarketService) wideDailyBars(ctx context.Context, market, symbol string
 	if len(bars) == 0 {
 		return nil, datasource.ErrNoData
 	}
-	for i := range bars {
-		bars[i].Source = "eastmoney"
+	for index := range bars {
+		if bars[index].Source == "" {
+			bars[index].Source = sourceOrUnknown("")
+			if provider, named := s.wide.(interface{ Name() string }); named {
+				bars[index].Source = provider.Name()
+			}
+		}
+	}
+	if err := validateAdjustedBars(market, bars); err != nil {
+		return nil, err
 	}
 	return bars, nil
+}
+
+func sourceOrUnknown(source string) string {
+	if source == "" {
+		return "unknown"
+	}
+	return source
 }
 
 // touchStateAfterRebase 重锚成功后更新宇宙状态（无 states 行的标的如 ETF 静默跳过——
@@ -344,6 +379,13 @@ func (s *MarketService) SyncMarketWide(ctx context.Context) (*model.DataSyncLog,
 	if err != nil {
 		return fail(fmt.Errorf("全市场快照失败: %w", err))
 	}
+	for index := range rows {
+		if rows[index].Source == "" {
+			if provider, named := s.wide.(interface{ Name() string }); named {
+				rows[index].Source = provider.Name()
+			}
+		}
+	}
 	tradeDate, err := spotTradeDate(rows)
 	if err != nil {
 		return fail(err)
@@ -366,7 +408,7 @@ func (s *MarketService) SyncMarketWide(ctx context.Context) (*model.DataSyncLog,
 	// 1. 当日 bar：有效成交行（停牌 Price=0/Volume=0 不落当日 bar）。
 	accepted := make([]datasource.SpotRow, 0, len(rows))
 	for _, r := range rows {
-		if blocked[r.Symbol] || r.DataTime <= 0 || time.Unix(r.DataTime, 0).Format("2006-01-02") != tradeDate {
+		if blocked[r.Symbol] || r.DataTime <= 0 || time.Unix(r.DataTime, 0).In(datasource.ChinaMarketLocation()).Format("2006-01-02") != tradeDate {
 			continue
 		}
 		if r.Price <= 0 || r.Volume <= 0 {
@@ -565,21 +607,42 @@ func (s *MarketService) upsertUniverseDaily(rows []datasource.SpotRow, tradeDate
 			Close:     r.Price, PrevClose: r.PrevClose,
 			Amount: r.Amount, TurnoverRate: r.TurnoverRate,
 			PE: r.PE, PETTM: r.PETTM, PB: r.PB, Industry: r.Industry,
+			Source: sourceOrUnknown(r.Source),
 		})
 	}
-	err := common.DB.WithContext(jobSubmissionContext(contexts...)).Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "trade_date"}, {Name: "symbol"}},
-		DoUpdates: clause.AssignmentColumns([]string{
-			// PETTM 的 GORM 蛇形化列名是 pettm（连续大写视为一词，F1 YoY→yo_y 同款坑）；
-			// 写 pe_ttm 会让整条 upsert SQL 无效——快照整批落库失败而非单列失败。
-			"name", "is_st", "suspended", "close", "prev_close",
-			"amount", "turnover_rate", "pe", "pettm", "pb", "industry",
-		}),
-	}).CreateInBatches(snap, 500).Error
-	if err != nil && err != gorm.ErrEmptySlice {
-		return err
+	// Missing fields from the backup must not erase same-day facts. Split by
+	// provider contract, not by value: zero can itself be a genuine observation.
+	primaryRows := make([]model.StockUniverseDaily, 0, len(snap))
+	backupRows := make([]model.StockUniverseDaily, 0, len(snap))
+	for _, row := range snap {
+		if row.Source == "sina_spot" {
+			backupRows = append(backupRows, row)
+		} else {
+			primaryRows = append(primaryRows, row)
+		}
 	}
-	return nil
+	return common.DB.WithContext(jobSubmissionContext(contexts...)).Transaction(func(transaction *gorm.DB) error {
+		for _, group := range []struct {
+			rows              []model.StockUniverseDaily
+			hasIndustryAndTTM bool
+		}{{primaryRows, true}, {backupRows, false}} {
+			if len(group.rows) == 0 {
+				continue
+			}
+			columns := []string{"name", "is_st", "suspended", "close", "prev_close", "amount", "turnover_rate", "pe", "pb", "source"}
+			if group.hasIndustryAndTTM {
+				// GORM maps PETTM to pettm, not pe_ttm.
+				columns = append(columns, "pettm", "industry")
+			}
+			if err := transaction.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "trade_date"}, {Name: "symbol"}},
+				DoUpdates: clause.AssignmentColumns(columns),
+			}).CreateInBatches(group.rows, 500).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // ---------- 历史初始化（断点续传/暂停恢复） ----------

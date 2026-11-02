@@ -275,6 +275,36 @@ func probeCall(ctx context.Context, a Adapter, spec CapabilitySpec) error {
 			err = ErrNoData
 		}
 		return err
+	case "min5":
+		provider, supported := a.(Min5Provider)
+		if !supported {
+			return ErrNotSupported
+		}
+		bars, err := provider.GetMin5Bars(ctx, market, probeSampleSymbol, 1)
+		if err == nil && len(bars) == 0 {
+			err = ErrNoData
+		}
+		return err
+	case "min1":
+		provider, supported := a.(Min1Provider)
+		if !supported {
+			return ErrNotSupported
+		}
+		bars, _, err := provider.GetMin1Bars(ctx, market, probeSampleSymbol, 1)
+		if err == nil && len(bars) == 0 {
+			err = ErrNoData
+		}
+		return err
+	case "announcements":
+		provider, supported := a.(AnnouncementProvider)
+		if !supported {
+			return ErrNotSupported
+		}
+		announcements, err := provider.GetAnnouncements(ctx, market, probeSampleSymbol, 1)
+		if err == nil && len(announcements) == 0 {
+			err = ErrNoData
+		}
+		return err
 	default:
 		return ErrProbeNotAllowed
 	}
@@ -312,6 +342,10 @@ func (m *Manager) Probe(ctx context.Context, source, capability, market string) 
 	spec, ok := registeredCapability(source, capability, market)
 	if !ok {
 		result.Outcome, result.Code = ProbeError, "NOT_REGISTERED"
+		return result, ErrProbeNotAllowed
+	}
+	if spec.ProbeDisabled {
+		result.Outcome, result.Code = ProbeError, "USE_SYNC_JOB"
 		return result, ErrProbeNotAllowed
 	}
 	a := m.probeAdapter(source)

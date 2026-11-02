@@ -160,6 +160,11 @@ func TestEmHostFamily(t *testing.T) {
 		{"push2delay.eastmoney.com", "push2", true},
 		{"12.push2his.eastmoney.com", "push2his", false},
 		{"push2ex.eastmoney.com", "push2ex", false},
+		{"33.PUSH2.EASTMONEY.COM:443", "push2", true},
+		{"push2.eastmoney.com.", "push2", true},
+		{"push2.eastmoney.com.invalid", "", false},
+		{"notpush2.eastmoney.com", "", false},
+		{"push2.localhost", "", false},
 		{"datacenter-web.eastmoney.com", "", false},
 		{"np-anotice-stock.eastmoney.com", "", false},
 	}

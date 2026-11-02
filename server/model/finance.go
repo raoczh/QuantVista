@@ -82,6 +82,7 @@ type Announcement struct {
 	NoticeType string `gorm:"size:64" json:"notice_type"`
 	NoticeDate string `gorm:"size:10;index" json:"notice_date"`
 	URL        string `gorm:"size:256" json:"url"`
+	Source     string `gorm:"size:24" json:"source,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
 }

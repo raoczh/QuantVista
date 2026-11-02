@@ -15,9 +15,9 @@ import (
 
 // A 股连续竞价时段边界（本地时区，分钟数）。
 const (
-	sessionPreAuctionMin = 9*60 + 15 // 09:15 开盘集合竞价开始
-	sessionQuoteReadyMin = 9*60 + 25 // 09:25 集合竞价出价，视为当日行情已可得
-	sessionOpenMin       = 9*60 + 30 // 09:30 连续竞价开始
+	sessionPreAuctionMin = 9*60 + 15  // 09:15 开盘集合竞价开始
+	sessionQuoteReadyMin = 9*60 + 25  // 09:25 集合竞价出价，视为当日行情已可得
+	sessionOpenMin       = 9*60 + 30  // 09:30 连续竞价开始
 	sessionAmBreakMin    = 11*60 + 30 // 11:30 午间休市
 	sessionPmOpenMin     = 13 * 60    // 13:00 下午开盘
 	sessionCloseMin      = 15 * 60    // 15:00 收盘
@@ -99,6 +99,10 @@ func quoteFreshness(dataTime, now time.Time, state, expected string) quoteFreshI
 	if dataTime.IsZero() {
 		return info
 	}
+	dataTime = dataTime.In(now.Location())
+	if dataTime.After(now.Add(time.Minute)) {
+		return info // A future source clock is not evidence of a fresh market price.
+	}
 	d := dataTime.Format("2006-01-02")
 	today := now.Format("2006-01-02")
 	dateOK := d == expected || (state == marketStatePreOpen && d == today)
@@ -147,7 +151,7 @@ func stockFreshnessNote(fi quoteFreshInfo, dataTime time.Time) (note, sessionNot
 		dt = dataTime.Format("2006-01-02 15:04")
 	}
 	if fi.Status == freshStatusStale {
-		note = fmt.Sprintf("行情仅更新至 %s（期望交易日 %s），已尝试全部可用数据源（含冷却源有界探测）仍未取到更新数据，可能停牌、休市或数据源延迟，不代表实时盘面", dt, fi.ExpectedDate)
+		note = fmt.Sprintf("行情仅更新至 %s（期望交易日 %s），在本次数据源请求预算及缓存窗口内未取得符合时效的数据，可能停牌、休市或数据源延迟，不代表实时盘面", dt, fi.ExpectedDate)
 		return note, ""
 	}
 	if fi.MarketState != marketStateTrading {

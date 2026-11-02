@@ -20,7 +20,7 @@ import (
 )
 
 // M3b 盘中因子：腾讯 5 分钟线盘后全市场同步 + 五件盘中因子聚合落库。
-//   - 数据源单一（腾讯 mkline 免鉴权），失败即诚实缺失该股该日，无备用源；
+//   - 腾讯 mkline 为主，新浪真实 5 分钟线为备用；不伪造缺失的分钟数据；
 //   - 上游可回溯约 18 个交易日（实测 800 根），错过 job 的日子按游标补跑
 //     （上限 intradayBackfillMaxDays），更早历史不追；
 //   - 只落物化因子不存原始 bar（见 model/intraday.go 头注释的取舍声明）；
@@ -38,9 +38,8 @@ const (
 	intradayJobHour   = 17         // 常态定时 17:05
 	intradayJobMin    = 5
 
-	// intradayWorkers/intradayThrottle 同步并发与单 worker 节流：
-	// 5150 只 ÷ 8 worker × (80ms + 网络 RTT) ≈ 2~4 分钟/轮。
-	intradayWorkers  = 8
+	// Physical HTTP requests are rate-limited across workers and online readers.
+	intradayWorkers  = 4
 	intradayThrottle = 80 * time.Millisecond
 
 	// intradayMinBars 当日完整性门槛：<46 根（完整 48）说明当日数据残缺
@@ -68,8 +67,8 @@ type IntradayService struct {
 }
 
 func NewIntradayService() *IntradayService {
-	ta := datasource.NewTencentAdapter()
-	return &IntradayService{fetchMin5: ta.GetMin5Bars, fetchMin1: ta.GetMin1Bars}
+	manager := datasource.DefaultManager()
+	return &IntradayService{fetchMin5: manager.GetMin5Bars, fetchMin1: manager.GetMin1Bars}
 }
 
 // ---------- 纯函数（单测锚点） ----------
@@ -202,7 +201,7 @@ func min5CountForDays(n int) int {
 // ---------- 盘后同步 ----------
 
 // SyncIntradayFactors 全市场同步 dates（升序交易日列表）的盘中因子：
-// 宇宙=market_sync_states cn 全体，每股一次请求覆盖全部目标日，8 worker 并发。
+// 宇宙=market_sync_states cn 全体，每股一次请求覆盖全部目标日，共享限速下 4 worker 并发。
 // 返回落库总行数。连续源类失败达阈值中止（返回已完成部分与错误）。
 func (s *IntradayService) SyncIntradayFactors(ctx context.Context, dates []string) (int, error) {
 	ctx = jobSubmissionContext(ctx)
@@ -261,7 +260,7 @@ func (s *IntradayService) SyncIntradayFactors(ctx context.Context, dates []strin
 			if ctx.Err() != nil || aborted.Load() {
 				continue // 排空通道
 			}
-			fctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			fctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			bars, err := s.fetchMin5(fctx, "cn", sym, count)
 			cancel()
 			switch {
@@ -310,7 +309,7 @@ func (s *IntradayService) SyncIntradayFactors(ctx context.Context, dates []strin
 	wg.Wait()
 
 	if aborted.Load() {
-		return 0, fmt.Errorf("腾讯 5 分钟线连续 %d 只失败，疑似限流，本轮中止（未落库）", intradayAbortStreak)
+		return 0, fmt.Errorf("5 分钟线主备源连续 %d 只失败，疑似限流，本轮中止（未落库）", intradayAbortStreak)
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -418,7 +417,7 @@ func IntradayAccumulatedDays() int64 {
 func StartIntradayJobs() *IntradayService {
 	svc := NewIntradayService()
 	run := func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 		defer cancel()
 		target := moodTargetDate(time.Now(), intradayCutoffMin)
 		cursor, err := model.LoadOption(ctx, optIntradayDay)

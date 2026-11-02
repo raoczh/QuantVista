@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
-	"time"
 )
 
 // F2 财务数据源：
@@ -188,7 +187,10 @@ func emStatementDates(ctx context.Context, code string) ([]string, string, error
 		var parsed struct {
 			Data []json.RawMessage `json:"data"`
 		}
-		if json.Unmarshal(body, &parsed) != nil || len(parsed.Data) == 0 {
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return nil, "", fmt.Errorf("%w: financial dates: %w", ErrUpstream, err)
+		}
+		if len(parsed.Data) == 0 {
 			continue // companyType 不匹配：返回无 data 对象，试下一个
 		}
 		rows, err := rawToDcRows(parsed.Data)
@@ -229,36 +231,29 @@ func emStatementPage(ctx context.Context, kind, code, companyType string, dates 
 	return rawToDcRows(parsed.Data)
 }
 
-// finGet 财务接口统一取数：包级令牌桶（与 datacenter 网关共享 dcThrottle，QPS≤2）+
-// 瞬时错误（网络/5xx）重试退避，与 DataCenterIter.Next 同款纪律。
+// finGet 与 datacenter 共享逐次节流及单层 HTTP 重试，保留调用方取消原因。
 func finGet(ctx context.Context, u string) ([]byte, error) {
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt) * dcRetryBackoff):
-			}
-		}
-		if err := dcThrottle(ctx); err != nil {
-			return nil, err
-		}
-		b, status, err := doGet(ctx, u, map[string]string{"Referer": "https://emweb.securities.eastmoney.com/"})
-		if err != nil {
-			lastErr = fmt.Errorf("%w: %v", ErrUpstream, err)
-			continue
-		}
-		if status >= 500 {
-			lastErr = fmt.Errorf("%w: http %d", ErrUpstream, status)
-			continue
-		}
-		if status != 200 {
-			return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
-		}
-		return b, nil
+	body, status, err := doGetWithPolicy(ctx, u, map[string]string{"Referer": "https://emweb.securities.eastmoney.com/"},
+		httpRequestPolicy{beforeAttempt: dcThrottle, retryBackoff: dcRetryBackoff})
+	if err != nil {
+		return nil, err
 	}
-	return nil, lastErr
+	if status != 200 {
+		return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
+	}
+	var envelope struct {
+		Code json.RawMessage `json:"code"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, fmt.Errorf("%w: financial response: %w", ErrUpstream, err)
+	}
+	if code, ok := responseInteger(envelope.Code); ok && code != 0 {
+		if code == dcNoDataCode {
+			return nil, ErrNoData
+		}
+		return nil, &upstreamBusinessError{field: "code"}
+	}
+	return body, nil
 }
 
 // rawToDcRows 原始行批量转 DcRow；空集返回 ErrNoData。

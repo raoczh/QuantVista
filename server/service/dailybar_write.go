@@ -104,7 +104,7 @@ func persistWideBarBatch(ctx context.Context, spots []datasource.SpotRow, tradeD
 			}
 			bars = append(bars, model.DailyBar{Market: "cn", Symbol: spot.Symbol, TradeDate: tradeDate,
 				Open: spot.Open, High: spot.High, Low: spot.Low, Close: spot.Price,
-				Volume: spot.Volume, Amount: spot.Amount, TurnoverRate: spot.TurnoverRate, Source: "eastmoney"})
+				Volume: spot.Volume, Amount: spot.Amount, TurnoverRate: spot.TurnoverRate, Source: sourceOrUnknown(spot.Source)})
 			accepted = append(accepted, spot.Symbol)
 		}
 		if len(blocked) > 0 {

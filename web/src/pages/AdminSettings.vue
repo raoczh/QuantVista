@@ -685,7 +685,7 @@ async function refreshCapabilityOps() {
 
 async function probeCapability(cap: DataSourceCapability) {
   const key = capabilityKey(cap)
-  if (!pageActive() || capabilityActionKey.value || !cap.registered || !cap.supported) return
+  if (!pageActive() || capabilityActionKey.value || !cap.registered || !cap.supported || cap.probe_disabled) return
   capabilityActionKey.value = key
   try {
     const op = await probeDataSource(capabilityTuple(cap))
@@ -1176,6 +1176,7 @@ onMounted(() => {
               <td>
                 <n-space vertical size="small">
                   <n-popconfirm
+                    v-if="!cap.probe_disabled"
                     :positive-text="'探测'"
                     :negative-text="'取消'"
                     :disabled="!!capabilityActionKey"
@@ -1191,6 +1192,7 @@ onMounted(() => {
                     </template>
                     仅请求一个样本并记录健康观测，确认继续？
                   </n-popconfirm>
+                  <span v-else class="ops-sub">请使用全市场同步任务</span>
                   <n-button
                     size="tiny"
                     tertiary
@@ -1219,6 +1221,7 @@ onMounted(() => {
             <div class="ops-sub">{{ cap.recovery_advice }}</div>
             <div class="capability-actions">
               <n-popconfirm
+                v-if="!cap.probe_disabled"
                 :positive-text="'探测'"
                 :negative-text="'取消'"
                 :disabled="!!capabilityActionKey"
@@ -1234,6 +1237,7 @@ onMounted(() => {
                 </template>
                 仅请求一个样本并记录健康观测，确认继续？
               </n-popconfirm>
+              <span v-else class="ops-sub">请使用全市场同步任务</span>
               <n-button
                 size="tiny"
                 tertiary

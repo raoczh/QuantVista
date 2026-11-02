@@ -23,6 +23,7 @@ const sourceOptions = [
   { label: '全部来源', value: '' },
   { label: '财联社电报', value: 'cls' },
   { label: '东方财富', value: 'eastmoney' },
+  { label: '新浪快讯', value: 'sina' },
 ]
 const source = ref('')
 // 代码筛选：输入中与已生效分离，回车/清空才触发查询，避免打一半就打接口。

@@ -7,7 +7,7 @@ export interface NewsItem {
   title: string
   summary: string
   url: string
-  source: string // cls / eastmoney
+  source: string // cls / eastmoney / sina
   category: string // telegraph / flash / stock
   publish_time: string
   related_symbols: string // JSON 数组字符串，元素为 6 位纯代码
@@ -62,6 +62,7 @@ export function relatedStocks(n: Pick<NewsItem, 'related_stocks' | 'related_symb
 export function newsSourceLabel(n: Pick<NewsItem, 'source' | 'category'>): string {
   if (n.source === 'cls') return '财联社'
   if (n.source === 'eastmoney') return n.category === 'stock' ? '东财·个股' : '东财快讯'
+  if (n.source === 'sina') return '新浪快讯'
   return n.source
 }
 

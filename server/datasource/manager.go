@@ -14,30 +14,49 @@ import (
 // 上层只依赖内部标准结构，单源挂掉可整体切换（见 docs/DATA_SOURCES.md）。
 // S1 起各能力路由入口统一走 routeCap：健康滑窗踢源 + 两层超时预算 + 错误归一日志。
 type Manager struct {
-	adapters  []Adapter // 按优先级排列，[0] 为主源
-	health    *HealthTracker
-	probeMu   sync.Mutex
-	probeBusy map[string]struct{}
-	probeLast map[string]time.Time
+	adapters     []Adapter // 按优先级排列，[0] 为主源
+	health       *HealthTracker
+	totalBudget  time.Duration
+	sourceBudget time.Duration
+	probeMu      sync.Mutex
+	probeBusy    map[string]struct{}
+	probeLast    map[string]time.Time
 }
 
-// 两层超时预算：总预算兜底（调用方自带 deadline 时尊重调用方），单源短预算超时即换源。
+// 两层预算同时生效：调用方的更短 deadline 仍然优先，长 deadline 不会放大在线等待。
 // 单源预算须小于 doGet 的「2 次尝试 × 8s」最坏耗时，否则一个挂死的源会吃光总预算。
 const (
 	mgrTotalBudget  = 15 * time.Second
 	mgrSourceBudget = 6 * time.Second
 )
 
-// DefaultManager 默认编排：东财为主（数据最全），腾讯次之（稳定），新浪兜底（含日线/指数/榜单）。
+var defaultSourceHealth = NewHealthTracker()
+
+// DefaultManager keeps source health shared across online and background consumers.
 func DefaultManager() *Manager {
 	return &Manager{
 		adapters: []Adapter{
 			NewEastMoneyAdapter(),
 			NewTencentAdapter(),
 			NewSinaAdapter(),
+			NewCNInfoAdapter(),
 		},
-		health: NewHealthTracker(),
+		health: defaultSourceHealth,
 	}
+}
+
+func (m *Manager) budgets(capability string) (time.Duration, time.Duration) {
+	totalBudget, sourceBudget := mgrTotalBudget, mgrSourceBudget
+	if capability == "spot_snapshot" {
+		totalBudget, sourceBudget = 8*time.Minute, 4*time.Minute
+	}
+	if m.totalBudget > 0 {
+		totalBudget = m.totalBudget
+	}
+	if m.sourceBudget > 0 {
+		sourceBudget = m.sourceBudget
+	}
+	return totalBudget, sourceBudget
 }
 
 // NewManagerWithAdapters 用指定源顺序构造 Manager（供测试注入假源）。
@@ -65,7 +84,7 @@ func classifyErr(err error) (string, callOutcome) {
 }
 
 // routeCap 能力路由通用骨架：
-//  1. 无 deadline 的调用补总预算，单源再包一层短预算（超预算即换下一源）；
+//  1. 总预算与调用方 deadline 取较短者，单源再包一层短预算（超预算即换源）；
 //  2. 冷却中的源先跳过；若一轮下来全军覆没，再对被跳过的源补跑一轮（宁可试坏源也不无脑报错）；
 //  3. ErrNotSupported 静默跳过（能力缺失非健康问题）；ErrSymbolInvalid 立即终止（换源无意义）；
 //  4. 其余错误归一为 {code, source, latency} 记 DEBUG 日志，并作为滑窗输入。
@@ -73,11 +92,9 @@ func classifyErr(err error) (string, callOutcome) {
 // 单源失败只记 DEBUG（有备源兜底不必刷屏）；全部失败由各入口记一条 WARN。
 func routeCap[T any](m *Manager, ctx context.Context, market, capability string, call func(ctx context.Context, a Adapter) (T, error)) (T, error) {
 	var zero T
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, mgrTotalBudget)
-		defer cancel()
-	}
+	totalBudget, _ := m.budgets(capability)
+	ctx, cancel := context.WithTimeout(ctx, totalBudget)
+	defer cancel()
 
 	var lastErr error
 	trySource := func(a Adapter) (T, bool, error) {
@@ -133,7 +150,8 @@ func routeCap[T any](m *Manager, ctx context.Context, market, capability string,
 // 从 routeCap 内联闭包提取，供 routeCap 与 GetQuoteFresh 复用；行为与原闭包完全一致。
 func attemptSource[T any](m *Manager, ctx context.Context, market, capability string, a Adapter, call func(ctx context.Context, a Adapter) (T, error)) (T, bool, error) {
 	var zero T
-	sctx, cancel := context.WithTimeout(ctx, mgrSourceBudget)
+	_, sourceBudget := m.budgets(capability)
+	sctx, cancel := context.WithTimeout(ctx, sourceBudget)
 	defer cancel()
 	start := time.Now()
 	r, err := call(sctx, a)
@@ -167,14 +185,13 @@ type QuoteAccept func(*Quote) bool
 // 与 routeCap 的差异：成功恒记 outcomeSuccess（数据旧不是源健康问题）。冷却源在健康源
 // 之后**有界探测**（每源至多一次、共享 ctx 总预算）：健康源全 stale 时冷却源可能恰是
 // 唯一有新数据的（如主源限流被冷却、其余源数据停滞），跳过它却对外声称「已尝试全部
-// 数据源」是撒谎；停牌/休市场景确实白试一轮，由 service 层 freshMissTTL 短标记兜住
+// 数据源」是不准确的；停牌/休市场景的重复尝试由 service 层短缓存兜住
 // 重复扫源成本。
 func (m *Manager) GetQuoteFresh(ctx context.Context, market, symbol string, accept QuoteAccept) (*Quote, bool, error) {
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, mgrTotalBudget)
-		defer cancel()
-	}
+	parentContext := ctx
+	totalBudget, _ := m.budgets("quote")
+	ctx, cancel := context.WithTimeout(ctx, totalBudget)
+	defer cancel()
 	call := func(ctx context.Context, a Adapter) (*Quote, error) {
 		q, err := a.GetQuote(ctx, market, symbol)
 		if err == nil && q == nil {
@@ -240,11 +257,14 @@ func (m *Manager) GetQuoteFresh(ctx context.Context, market, symbol string, acce
 			lastErr = err
 		}
 	}
-	if err := ctx.Err(); err != nil {
+	if err := parentContext.Err(); err != nil {
 		return nil, false, err
 	}
 	if best != nil {
 		return best, false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
 	}
 	if lastErr == nil {
 		lastErr = ErrNoData
@@ -267,10 +287,12 @@ func (m *Manager) GetQuote(ctx context.Context, market, symbol string) (*Quote, 
 	return q, err
 }
 
-// GetDailyBars 依次尝试支持日线的源：东财在前（fqt=1 前复权），腾讯不支持日线
-// 返回 ErrNotSupported 被跳过，新浪殿后兜底（无复权参数、无成交额）。
+// GetDailyBars routes only compatible forward-adjusted stock histories.
 func (m *Manager) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]Bar, error) {
 	bars, err := routeCap(m, ctx, market, "daily_bars", func(ctx context.Context, a Adapter) ([]Bar, error) {
+		if provider, declared := a.(AdjustedDailyProvider); market == "cn" && declared && !provider.ProvidesForwardAdjustedDailyBars() {
+			return nil, ErrNotSupported
+		}
 		bs, berr := a.GetDailyBars(ctx, market, symbol, limit)
 		if berr == nil && len(bs) == 0 {
 			berr = ErrNoData

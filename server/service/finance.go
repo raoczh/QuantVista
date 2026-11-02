@@ -27,12 +27,13 @@ type FinanceService struct {
 	annAttempts map[string]*announcementAttempt
 }
 
-var fetchAnnouncementFeed = datasource.GetEMAnnouncements
+var fetchAnnouncementFeed = datasource.GetAnnouncements
 
 type announcementAttempt struct {
-	at   time.Time
-	done chan struct{}
-	err  error // 在 close(done) 前写入；等待者收到 done 后读取。
+	at         time.Time
+	retryAfter time.Time
+	done       chan struct{}
+	err        error // 在 close(done) 前写入；等待者收到 done 后读取。
 }
 
 func NewFinanceService() *FinanceService {
@@ -314,8 +315,8 @@ func (s *FinanceService) CollectAnnouncements(ctx context.Context) (inserted int
 	var syms []string
 	// 已平仓持仓排除（不再采其公告）；稳定排序保证 LIMIT 截断可复现。
 	if err := common.DB.WithContext(ctx).Raw(`SELECT DISTINCT symbol FROM (
-		SELECT symbol FROM watchlist_items
-		UNION SELECT symbol FROM positions WHERE status = 'holding'
+		SELECT symbol FROM watchlist_items WHERE market = 'cn'
+		UNION SELECT symbol FROM positions WHERE market = 'cn' AND status = 'holding'
 	) t ORDER BY symbol LIMIT ?`, annSymbolsMax).Scan(&syms).Error; err != nil {
 		common.SysWarn("公告采集读取关注集合失败: %v", err)
 		return 0
@@ -352,7 +353,7 @@ func (s *FinanceService) fetchAnnouncements(ctx context.Context, symbol string) 
 		rec := model.Announcement{
 			Symbol: it.Symbol, Market: "cn", ArtCode: it.ArtCode, Name: it.Name,
 			Title: truncateRunes(it.Title, 500), NoticeType: truncateRunes(it.NoticeType, 60),
-			NoticeDate: it.NoticeDate.Format("2006-01-02"), URL: it.URL,
+			NoticeDate: it.NoticeDate.Format("2006-01-02"), URL: it.URL, Source: it.Source,
 		}
 		res := common.DB.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&rec)
 		if res.Error != nil {
@@ -398,29 +399,41 @@ func (s *FinanceService) refreshAnnouncements(ctx context.Context, symbol string
 	if s.annAttempts == nil {
 		s.annAttempts = map[string]*announcementAttempt{}
 	}
-	if attempt := s.annAttempts[symbol]; attempt != nil && time.Since(attempt.at) < annFetchCooldown {
-		s.annMu.Unlock()
+	if attempt := s.annAttempts[symbol]; attempt != nil {
+		inProgress := false
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
 		case <-attempt.done:
-			return attempt.err
+		default:
+			inProgress = true
+		}
+		if inProgress || time.Now().Before(attempt.retryAfter) {
+			s.annMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-attempt.done:
+				return attempt.err
+			}
 		}
 	}
 	attempt := &announcementAttempt{at: time.Now(), done: make(chan struct{})}
 	s.annAttempts[symbol] = attempt
 	s.annMu.Unlock()
-	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	fctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	_, attempt.err = s.fetchAnnouncements(fctx, symbol)
 	cancel()
+	s.annMu.Lock()
+	attempt.retryAfter = time.Now().Add(annFetchCooldown)
+	if attempt.err != nil {
+		attempt.retryAfter = time.Now().Add(time.Minute)
+	}
 	if ctx.Err() != nil {
-		s.annMu.Lock()
 		if s.annAttempts[symbol] == attempt {
 			delete(s.annAttempts, symbol)
 		}
-		s.annMu.Unlock()
 	}
 	close(attempt.done)
+	s.annMu.Unlock()
 	return attempt.err
 }
 

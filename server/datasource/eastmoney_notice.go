@@ -20,6 +20,7 @@ type EMAnnouncement struct {
 	Symbol     string
 	Name       string
 	URL        string
+	Source     string
 }
 
 type emAnnResp struct {
@@ -81,6 +82,7 @@ func GetEMAnnouncements(ctx context.Context, symbol string, pageSize int) ([]EMA
 			Title:      strings.TrimSpace(r.Title),
 			NoticeDate: nd,
 			Symbol:     symbol,
+			Source:     "eastmoney",
 			URL:        fmt.Sprintf("https://data.eastmoney.com/notices/detail/%s/%s.html", symbol, r.ArtCode),
 		}
 		if len(r.Columns) > 0 {

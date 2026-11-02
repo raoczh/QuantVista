@@ -3,6 +3,7 @@ package datasource
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -92,39 +93,21 @@ func (it *DataCenterIter) Next(ctx context.Context) ([]json.RawMessage, error) {
 	}
 	u := dcBaseURL + "?" + dcQueryString(it.q, it.page)
 
-	// 瞬时错误重试退避：网络错误/5xx 最多 3 次尝试，间隔 1s/2s 递增。
-	// doGet 自身对网络错误还有一次紧邻重试，这里的退避针对上游短时过载。
-	var body []byte
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt) * dcRetryBackoff):
-			}
+	// 只有 HTTP 层重试；每次真实尝试（包括网络错误重试）都重新经过 dcThrottle。
+	body, status, err := doGetWithPolicy(ctx, u, map[string]string{"Referer": "https://data.eastmoney.com/"},
+		httpRequestPolicy{beforeAttempt: dcThrottle, retryBackoff: dcRetryBackoff})
+	if errors.Is(err, ErrNoData) {
+		it.done = true
+		if it.page == 1 {
+			return nil, ErrNoData
 		}
-		if err := dcThrottle(ctx); err != nil {
-			return nil, err
-		}
-		b, status, err := doGet(ctx, u, map[string]string{"Referer": "https://data.eastmoney.com/"})
-		if err != nil {
-			lastErr = fmt.Errorf("%w: %v", ErrUpstream, err)
-			continue
-		}
-		if status >= 500 {
-			lastErr = fmt.Errorf("%w: http %d", ErrUpstream, status)
-			continue
-		}
-		if status != 200 {
-			return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
-		}
-		body = b
-		lastErr = nil
-		break
+		return nil, nil
 	}
-	if lastErr != nil {
-		return nil, lastErr
+	if err != nil {
+		return nil, err
+	}
+	if status != 200 {
+		return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
 	}
 
 	var parsed dcResp

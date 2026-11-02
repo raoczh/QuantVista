@@ -3,7 +3,9 @@ package datasource
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -12,8 +14,7 @@ import (
 )
 
 // TencentAdapter 腾讯财经 qt.gtimg.cn 实时行情。
-// 独立于东财/新浪的第三源，稳定性好；实现实时快照与估值扩展（行情串 38~53 号
-// 字段自带换手率/PE/振幅/市值/PB/涨跌停价/量比），日线回退到新浪。
+// 实现行情、估值、指数及前复权日线；指数日线使用明确的原始 day 口径。
 type TencentAdapter struct{}
 
 func NewTencentAdapter() *TencentAdapter { return &TencentAdapter{} }
@@ -21,19 +22,38 @@ func NewTencentAdapter() *TencentAdapter { return &TencentAdapter{} }
 func (t *TencentAdapter) Name() string { return "tencent" }
 
 // fetchFields 请求 qt.gtimg.cn 并切出 ~ 分隔的字段数组（GBK 转码）。
-func (t *TencentAdapter) fetchFields(ctx context.Context, market, symbol string) ([]string, error) {
+func (adapter *TencentAdapter) fetchFields(ctx context.Context, market, symbol string) ([]string, error) {
 	if market != "cn" {
 		return nil, ErrNotSupported
 	}
-	code, ok := sinaCNSymbol(symbol) // 腾讯与新浪同为 sh/sz 前缀
-	if !ok {
+	code, valid := sinaCNSymbol(symbol) // 腾讯与新浪同为 sh/sz 前缀
+	if !valid {
 		return nil, ErrSymbolInvalid
 	}
-
-	url := "https://qt.gtimg.cn/q=" + code
-	raw, status, err := doGet(ctx, url, map[string]string{"Referer": "https://gu.qq.com/"})
+	records, err := fetchTencentQuotes(ctx, []string{code})
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
+		return nil, err
+	}
+	fields, exists := records[code]
+	if !exists {
+		return nil, ErrNoData
+	}
+	return fields, nil
+}
+
+// fetchTencentQuotes preserves the exchange-qualified assignment key. A missing
+// or reordered response cannot be attached to a different stock or index.
+func fetchTencentQuotes(ctx context.Context, codes []string) (map[string][]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	requestURL := "https://qt.gtimg.cn/q=" + strings.Join(codes, ",")
+	raw, status, err := doGet(ctx, requestURL, map[string]string{"Referer": "https://gu.qq.com/"})
+	if canceled := ctx.Err(); canceled != nil {
+		return nil, canceled
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: tencent quotes: %w", ErrUpstream, err)
 	}
 	if status != http.StatusOK {
 		return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
@@ -42,115 +62,157 @@ func (t *TencentAdapter) fetchFields(ctx context.Context, market, symbol string)
 	if err != nil {
 		return nil, fmt.Errorf("%w: 转码失败 %v", ErrUpstream, err)
 	}
-	return parseTencentFields(string(decoded))
+	requested := make(map[string]bool, len(codes))
+	for _, code := range codes {
+		requested[code] = true
+	}
+	records := make(map[string][]string, len(codes))
+	for _, assignment := range strings.Split(string(decoded), ";") {
+		variable, value, found := strings.Cut(strings.TrimSpace(assignment), "=")
+		if !found {
+			continue
+		}
+		variable = strings.TrimPrefix(strings.TrimSpace(variable), "var ")
+		code, hasPrefix := strings.CutPrefix(variable, "v_")
+		if !hasPrefix || !requested[code] {
+			continue
+		}
+		fields, parseErr := parseTencentFields(value)
+		if parseErr != nil {
+			continue
+		}
+		if len(code) != 8 || strings.TrimSpace(fields[2]) != code[2:] {
+			return nil, fmt.Errorf("%w: tencent quote identity mismatch", ErrUpstream)
+		}
+		if previous, exists := records[code]; exists && !slices.Equal(previous, fields) {
+			return nil, fmt.Errorf("%w: tencent quote has conflicting duplicates", ErrUpstream)
+		}
+		records[code] = fields
+	}
+	if len(records) == 0 {
+		return nil, ErrNoData
+	}
+	return records, nil
 }
 
 // parseTencentFields 从 v_shXXXXXX="1~名称~代码~..." 中切出字段（独立函数便于 fixture 单测）。
 func parseTencentFields(text string) ([]string, error) {
-	a := strings.Index(text, "\"")
-	b := strings.LastIndex(text, "\"")
-	if a < 0 || b <= a {
+	startQuote := strings.Index(text, "\"")
+	endQuote := strings.LastIndex(text, "\"")
+	if startQuote < 0 || endQuote <= startQuote {
 		return nil, ErrNoData
 	}
-	f := strings.Split(text[a+1:b], "~")
-	if len(f) < 38 {
+	fields := strings.Split(text[startQuote+1:endQuote], "~")
+	if len(fields) < 38 {
 		return nil, ErrNoData // 停牌/非法代码字段不全
 	}
-	return f, nil
+	return fields, nil
 }
 
 // tencentAtof 越界安全的字段转 float。
-func tencentAtof(f []string, i int) float64 {
-	if i >= len(f) {
+func tencentAtof(fields []string, fieldIndex int) float64 {
+	if fieldIndex < 0 || fieldIndex >= len(fields) {
 		return 0
 	}
-	v, _ := strconv.ParseFloat(strings.TrimSpace(f[i]), 64)
-	return v
+	value, err := strconv.ParseFloat(strings.TrimSpace(fields[fieldIndex]), 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0
+	}
+	return value
+}
+
+func tencentScaledField(fields []string, fieldIndex int, scale float64) float64 {
+	value := tencentAtof(fields, fieldIndex) * scale
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0
+	}
+	return value
 }
 
 // tencentDataTime 解析字段 30 的行情时间（yyyyMMddHHmmss）。解析失败返回零值
 // （timestamp_unknown）：回填当前时间会把旧价伪装成实时价，零值由新鲜度判定恒判 stale。
-func tencentDataTime(f []string) time.Time {
-	if len(f) > 30 {
-		if tm, err := time.ParseInLocation("20060102150405", f[30], time.Local); err == nil {
-			return tm
+func tencentDataTime(fields []string) time.Time {
+	if len(fields) > 30 {
+		timestamp := strings.TrimSpace(fields[30])
+		parsed, err := time.ParseInLocation("20060102150405", timestamp, ChinaMarketLocation())
+		if err == nil && len(timestamp) == 14 && parsed.Format("20060102150405") == timestamp {
+			return parsed
 		}
 	}
 	return time.Time{}
 }
 
-func (t *TencentAdapter) GetQuote(ctx context.Context, market, symbol string) (*Quote, error) {
-	f, err := t.fetchFields(ctx, market, symbol)
+func (adapter *TencentAdapter) GetQuote(ctx context.Context, market, symbol string) (*Quote, error) {
+	fields, err := adapter.fetchFields(ctx, market, symbol)
 	if err != nil {
 		return nil, err
 	}
 
-	price := tencentAtof(f, 3)
-	if price == 0 {
+	price := tencentAtof(fields, 3)
+	if price <= 0 {
 		return nil, ErrNoData
 	}
 	// 成交额优先取 "价/量/额"（字段 35）的第三段（单位元），更精确。
 	amount := 0.0
-	if seg := strings.Split(f[35], "/"); len(seg) >= 3 {
-		amount, _ = strconv.ParseFloat(seg[2], 64)
+	if segments := strings.Split(fields[35], "/"); len(segments) >= 3 {
+		amount = math.Max(0, tencentAtof(segments, 2))
+	}
+	volume := tencentAtof(fields, 6)
+	if volume < 0 || volume >= float64(math.MaxInt64) {
+		return nil, fmt.Errorf("%w: tencent quote has invalid volume", ErrUpstream)
 	}
 
 	return &Quote{
 		Symbol:    symbol,
 		Market:    market,
-		Name:      strings.TrimSpace(f[1]),
+		Name:      strings.TrimSpace(fields[1]),
 		Price:     price,
-		ChangePct: tencentAtof(f, 32),
-		Open:      tencentAtof(f, 5),
-		High:      tencentAtof(f, 33),
-		Low:       tencentAtof(f, 34),
-		PrevClose: tencentAtof(f, 4),
-		Volume:    int64(tencentAtof(f, 6)), // 手
+		ChangePct: tencentAtof(fields, 32),
+		Open:      tencentAtof(fields, 5),
+		High:      tencentAtof(fields, 33),
+		Low:       tencentAtof(fields, 34),
+		PrevClose: tencentAtof(fields, 4),
+		Volume:    int64(volume), // 手
 		Amount:    amount,
-		Source:    t.Name(),
-		DataTime:  tencentDataTime(f),
+		Source:    adapter.Name(),
+		DataTime:  tencentDataTime(fields),
 	}, nil
 }
 
 // GetValuation 估值/盘面扩展快照：同一行情串的 38~53 号字段（换手率/PE-TTM/振幅/
 // 流通市值/总市值/PB/涨停价/跌停价/量比/PE 动/PE 静），市值源单位为亿、统一转元。
-func (t *TencentAdapter) GetValuation(ctx context.Context, market, symbol string) (*Valuation, error) {
-	f, err := t.fetchFields(ctx, market, symbol)
+func (adapter *TencentAdapter) GetValuation(ctx context.Context, market, symbol string) (*Valuation, error) {
+	fields, err := adapter.fetchFields(ctx, market, symbol)
 	if err != nil {
 		return nil, err
 	}
-	return parseTencentValuation(f, market, symbol, t.Name())
+	return parseTencentValuation(fields, market, symbol, adapter.Name())
 }
 
 // parseTencentValuation 从字段数组组装估值快照（独立函数便于 fixture 单测）。
-func parseTencentValuation(f []string, market, symbol, source string) (*Valuation, error) {
-	price := tencentAtof(f, 3)
-	if price == 0 {
+func parseTencentValuation(fields []string, market, symbol, source string) (*Valuation, error) {
+	price := tencentAtof(fields, 3)
+	if price <= 0 {
 		return nil, ErrNoData
 	}
-	name := strings.TrimSpace(f[1])
+	name := strings.TrimSpace(fields[1])
 	return &Valuation{
 		Symbol:       symbol,
 		Market:       market,
 		Name:         name,
-		TurnoverRate: tencentAtof(f, 38),
-		PETTM:        tencentAtof(f, 39),
-		Amplitude:    tencentAtof(f, 43),
-		FloatCap:     tencentAtof(f, 44) * 1e8, // 源单位：亿
-		TotalCap:     tencentAtof(f, 45) * 1e8,
-		PB:           tencentAtof(f, 46),
-		LimitUp:      tencentAtof(f, 47),
-		LimitDown:    tencentAtof(f, 48),
-		VolumeRatio:  tencentAtof(f, 49),
-		PEDynamic:    tencentAtof(f, 52),
-		PEStatic:     tencentAtof(f, 53),
+		TurnoverRate: tencentAtof(fields, 38),
+		PETTM:        tencentAtof(fields, 39),
+		Amplitude:    tencentAtof(fields, 43),
+		FloatCap:     tencentScaledField(fields, 44, 1e8), // 源单位：亿
+		TotalCap:     tencentScaledField(fields, 45, 1e8),
+		PB:           tencentAtof(fields, 46),
+		LimitUp:      tencentAtof(fields, 47),
+		LimitDown:    tencentAtof(fields, 48),
+		VolumeRatio:  tencentAtof(fields, 49),
+		PEDynamic:    tencentAtof(fields, 52),
+		PEStatic:     tencentAtof(fields, 53),
 		IsST:         strings.Contains(strings.ToUpper(name), "ST"),
 		Source:       source,
-		DataTime:     tencentDataTime(f),
+		DataTime:     tencentDataTime(fields),
 	}, nil
-}
-
-// GetDailyBars 腾讯日线接口字段不稳，骨架不实现，由 manager 回退到新浪日线。
-func (t *TencentAdapter) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]Bar, error) {
-	return nil, ErrNotSupported
 }

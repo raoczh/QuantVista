@@ -151,6 +151,7 @@ func (e *EastMoneyAdapter) GetDailyBars(ctx context.Context, market, symbol stri
 	if limit <= 0 {
 		limit = 120
 	}
+	limit = min(limit, 1023)
 
 	// klt=101 日线，fqt=1 前复权。fields2 取全 11 列（f51~f61，与 akshare 同口径）：
 	// 日期,开,收,高,低,量,额,振幅,涨跌幅,涨跌额,换手率——换手率（f61）是筹码分布
@@ -172,11 +173,41 @@ func (e *EastMoneyAdapter) GetDailyBars(ctx context.Context, market, symbol stri
 		return nil, fmt.Errorf("%w: 解析失败 %v", ErrUpstream, err)
 	}
 
-	bars := parseEMKlines(parsed.Data.Klines)
-	if len(bars) == 0 {
-		return nil, ErrNoData
+	return parseEMKlinesChecked(parsed.Data.Klines)
+}
+
+// parseEMKlinesChecked rejects truncated or corrupt histories instead of letting
+// a nonempty partial parse prevent fallback to a healthy provider.
+func parseEMKlinesChecked(klines []string) ([]Bar, error) {
+	bars := make([]Bar, 0, len(klines))
+	for rowIndex, line := range klines {
+		fields := strings.Split(line, ",")
+		if len(fields) < 7 {
+			return nil, fmt.Errorf("%w: eastmoney daily row %d is truncated", ErrUpstream, rowIndex+1)
+		}
+		var values [6]float64
+		for fieldIndex := range values {
+			value, err := strconv.ParseFloat(strings.TrimSpace(fields[fieldIndex+1]), 64)
+			if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+				return nil, fmt.Errorf("%w: eastmoney daily row %d has invalid numbers", ErrUpstream, rowIndex+1)
+			}
+			values[fieldIndex] = value
+		}
+		if values[4] < 0 || values[4] >= float64(math.MaxInt64) || math.Trunc(values[4]) != values[4] {
+			return nil, fmt.Errorf("%w: eastmoney daily row %d has invalid volume", ErrUpstream, rowIndex+1)
+		}
+		bar := Bar{TradeDate: fields[0], Open: values[0], Close: values[1], High: values[2], Low: values[3],
+			Volume: int64(values[4]), Amount: values[5], Source: "eastmoney"}
+		if len(fields) >= 11 && fields[10] != "" && fields[10] != "-" {
+			turnover, err := strconv.ParseFloat(fields[10], 64)
+			if err != nil {
+				return nil, fmt.Errorf("%w: eastmoney daily row %d has invalid turnover", ErrUpstream, rowIndex+1)
+			}
+			bar.TurnoverRate = turnover
+		}
+		bars = append(bars, bar)
 	}
-	return bars, nil
+	return ValidateDailyBars(bars)
 }
 
 // parseEMKlines 解析 push2his kline 行序列为 Bar（个股与板块指数同口径，抽出便于复用/单测）。

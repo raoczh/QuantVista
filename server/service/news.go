@@ -32,6 +32,7 @@ type NewsService struct {
 	titles         []titleEntry         // 最近 72h 标题池（相似度比对）
 	fetchCls       func(context.Context, int64, int) ([]datasource.ClsNewsItem, error)
 	fetchEMFast    func(context.Context, string, int) ([]datasource.EMNewsItem, string, error)
+	fetchSinaFast  func(context.Context, int) ([]datasource.EMNewsItem, error)
 	fetchStockNews func(context.Context, string, int) ([]datasource.EMNewsItem, error)
 }
 
@@ -46,15 +47,17 @@ const (
 	newsDiceThreshold = 0.85
 	newsContentMax    = 3000 // 正文截断（字符）
 
-	newsSourceCls = "cls"
-	newsSourceEM  = "eastmoney"
+	newsSourceCls  = "cls"
+	newsSourceEM   = "eastmoney"
+	newsSourceSina = "sina"
 
 	newsCategoryTelegraph = "telegraph"
 	newsCategoryFlash     = "flash"
 	newsCategoryStock     = "stock"
 
-	optNewsCursorCls = "news_cursor_cls"
-	optNewsCursorEM  = "news_cursor_em"
+	optNewsCursorCls  = "news_cursor_cls"
+	optNewsCursorEM   = "news_cursor_em"
+	optNewsCursorSina = "news_cursor_sina"
 )
 
 // newsTTLDays 保留档位（抄 collector.yaml lifecycle 思路为常量）：
@@ -71,6 +74,7 @@ func NewNewsService() *NewsService {
 	return &NewsService{
 		seen:     make(map[string]time.Time),
 		fetchCls: datasource.GetClsTelegraph, fetchEMFast: datasource.GetEMFastNews,
+		fetchSinaFast:  datasource.GetSinaFastNews,
 		fetchStockNews: datasource.GetEMStockNews,
 	}
 }
@@ -287,12 +291,25 @@ func (s *NewsService) collectCls(ctx context.Context) (inserted int) {
 
 // collectEMFast 东财 7×24 快讯一轮（只取第一页，增量靠轮询+去重）。
 func (s *NewsService) collectEMFast(ctx context.Context) (inserted int) {
-	cursor := readNewsCursor(optNewsCursorEM)
 	items, _, err := s.fetchEMFast(ctx, "", 20)
 	if err != nil {
 		common.SysDebug("东财快讯采集跳过: %v", err)
 		return 0
 	}
+	return s.collectFastItems(ctx, items, newsSourceEM, optNewsCursorEM)
+}
+
+func (s *NewsService) collectSinaFast(ctx context.Context) int {
+	items, err := s.fetchSinaFast(ctx, 20)
+	if err != nil {
+		common.SysDebug("新浪快讯采集跳过: %v", err)
+		return 0
+	}
+	return s.collectFastItems(ctx, items, newsSourceSina, optNewsCursorSina)
+}
+
+func (s *NewsService) collectFastItems(ctx context.Context, items []datasource.EMNewsItem, source, cursorKey string) (inserted int) {
+	cursor := readNewsCursor(cursorKey)
 	maxTs := cursor
 	failed := false
 	for _, it := range items {
@@ -300,7 +317,7 @@ func (s *NewsService) collectEMFast(ctx context.Context) (inserted int) {
 		if cursor > 0 && ts < cursor-300 {
 			continue // 重叠窗外：往轮已处理，不参与游标
 		}
-		if s.dedupeSeen(newsSourceEM, it.SourceID, it.Title) {
+		if s.dedupeSeen(source, it.SourceID, it.Title) {
 			if ts > maxTs {
 				maxTs = ts
 			}
@@ -308,7 +325,7 @@ func (s *NewsService) collectEMFast(ctx context.Context) (inserted int) {
 		}
 		n := &model.News{
 			Title: it.Title, Content: it.Summary, Summary: it.Summary,
-			URL: it.URL, Source: newsSourceEM, SourceID: it.SourceID,
+			URL: it.URL, Source: source, SourceID: it.SourceID,
 			Category: newsCategoryFlash, PublishTime: it.PublishTime,
 			CollectTime: time.Now(), RelatedSymbols: marshalSymbols(it.Symbols),
 			SourcePriority: 2, ContentHash: newsContentHash(it.Title, it.Summary),
@@ -318,7 +335,7 @@ func (s *NewsService) collectEMFast(ctx context.Context) (inserted int) {
 			failed = true
 			continue
 		}
-		s.dedupeRegister(newsSourceEM, it.SourceID, it.Title, it.PublishTime)
+		s.dedupeRegister(source, it.SourceID, it.Title, it.PublishTime)
 		if created {
 			inserted++
 		}
@@ -327,7 +344,7 @@ func (s *NewsService) collectEMFast(ctx context.Context) (inserted int) {
 		}
 	}
 	if !failed && maxTs > cursor {
-		writeNewsCursor(optNewsCursorEM, maxTs)
+		writeNewsCursor(cursorKey, maxTs)
 	}
 	return inserted
 }
@@ -581,10 +598,17 @@ func StartNewsJobs() *NewsService {
 		round := func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			n1 := svc.collectCls(ctx)
-			n2 := svc.collectEMFast(ctx)
-			if n1+n2 > 0 {
-				common.SysLog("快讯采集入库: 财联社 %d 东财 %d", n1, n2)
+			// Separate budgets keep one slow provider from starving later feeds.
+			collect := func(collector func(context.Context) int) int {
+				feedContext, cancelFeed := context.WithTimeout(ctx, 8*time.Second)
+				defer cancelFeed()
+				return collector(feedContext)
+			}
+			clsCount := collect(svc.collectCls)
+			emCount := collect(svc.collectEMFast)
+			sinaCount := collect(svc.collectSinaFast)
+			if clsCount+emCount+sinaCount > 0 {
+				common.SysLog("快讯采集入库: 财联社 %d 东财 %d 新浪 %d", clsCount, emCount, sinaCount)
 			}
 			// N2：采集后顺手做一轮情绪增强（分级 LLM/规则，见 newsai.go）。
 			ectx, ecancel := context.WithTimeout(context.Background(), 3*time.Minute)

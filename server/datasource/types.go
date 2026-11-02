@@ -50,6 +50,7 @@ type Min5Bar struct {
 	Low    float64 `json:"low"`
 	Close  float64 `json:"close"`
 	Volume int64   `json:"volume"` // 手
+	Source string  `json:"source,omitempty"`
 }
 
 // SpotRow 全市场行情快照单行（东财 clist，M1 全市场日线的每日增量源）。
@@ -75,6 +76,7 @@ type SpotRow struct {
 	PB       float64 `json:"pb"`     // 市净率（f23）
 	Industry string  `json:"industry"`
 	DataTime int64   `json:"data_time"` // f124 行情时间戳（unix 秒；停牌股为旧值）
+	Source   string  `json:"source,omitempty"`
 }
 
 // Fundamental 基本面摘要（骨架占位，阶段 4/5 扩展）。
@@ -281,4 +283,28 @@ type BenchmarkBarsProvider interface {
 // ValuationProvider 估值/盘面扩展快照能力（腾讯行情自带估值字段）。
 type ValuationProvider interface {
 	GetValuation(ctx context.Context, market, symbol string) (*Valuation, error)
+}
+
+// AdjustedDailyProvider declares the price basis before a historical source is routed.
+// Raw Sina daily candles remain available to direct callers, not to stock analysis.
+type AdjustedDailyProvider interface {
+	ProvidesForwardAdjustedDailyBars() bool
+}
+
+// Min5Provider returns genuine five-minute candles, never resampled one-minute data.
+type Min5Provider interface {
+	GetMin5Bars(ctx context.Context, market, symbol string, count int) ([]Min5Bar, error)
+}
+
+type Min1Provider interface {
+	GetMin1Bars(ctx context.Context, market, symbol string, count int) ([]Min5Bar, float64, error)
+}
+
+// SpotSnapshotProvider returns a complete stock universe with source timestamps.
+type SpotSnapshotProvider interface {
+	GetCNSpotSnapshot(ctx context.Context) ([]SpotRow, error)
+}
+
+type AnnouncementProvider interface {
+	GetAnnouncements(ctx context.Context, market, symbol string, limit int) ([]EMAnnouncement, error)
 }

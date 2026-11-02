@@ -34,24 +34,37 @@ type CapabilitySpec struct {
 	QPSPolicy            string  `json:"qps_policy"`
 	CacheTTLSeconds      int     `json:"cache_ttl_sec"`
 	CacheSemantics       string  `json:"cache_semantics"`
+	ProbeDisabled        bool    `json:"probe_disabled,omitempty"`
 }
 
 // capabilityRegistry 是支持面的唯一事实来源。这里只登记 Manager 实际可路由的能力；
-// adapter 上存在同名方法但恒返 ErrNotSupported（如腾讯日线）不登记。
+// An endpoint that cannot meet the consumer's price-basis contract is not advertised.
 var capabilityRegistry = []CapabilitySpec{
-	{Source: "eastmoney", Capability: "quote", Market: "cn", Frequency: "realtime", ExpectedFreshnessSec: 10, ExpectedFreshness: "盘中约 10 秒", TimeoutMs: 6000, QPSPolicy: "无硬额度；共享 15 秒总预算并依赖短缓存", CacheTTLSeconds: 10, CacheSemantics: "按市场+标的覆盖缓存；stale 候选另有 60 秒短标记"},
+	{Source: "eastmoney", Capability: "quote", Market: "cn", Frequency: "realtime", ExpectedFreshnessSec: 10, ExpectedFreshness: "盘中约 10 秒", TimeoutMs: 6000, QPSPolicy: "共享限速和 15 秒总预算", CacheTTLSeconds: 10, CacheSemantics: "进程内缓存并合并请求；命中仍核验源时间"},
 	{Source: "eastmoney", Capability: "daily_bars", Market: "cn", Frequency: "daily", ExpectedFreshnessSec: 86400, ExpectedFreshness: "交易日收盘后", TimeoutMs: 6000, QPSPolicy: "批任务逐标的至少间隔 300ms", CacheTTLSeconds: 600, CacheSemantics: "按市场+标的+根数缓存非空序列"},
 	{Source: "eastmoney", Capability: "sector", Market: "cn", Frequency: "realtime", ExpectedFreshnessSec: 60, ExpectedFreshness: "盘中约 1 分钟", TimeoutMs: 6000, QPSPolicy: "无硬额度；由市场总览缓存合并请求", CacheTTLSeconds: 15, CacheSemantics: "市场总览聚合缓存"},
 	{Source: "eastmoney", Capability: "breadth", Market: "cn", Frequency: "realtime", ExpectedFreshnessSec: 60, ExpectedFreshness: "盘中约 1 分钟", TimeoutMs: 6000, QPSPolicy: "无硬额度；由市场总览缓存合并请求", CacheTTLSeconds: 15, CacheSemantics: "市场总览聚合缓存"},
 	{Source: "eastmoney", Capability: "fundflow", Market: "cn", Frequency: "daily", ExpectedFreshnessSec: 86400, ExpectedFreshness: "交易日盘后", TimeoutMs: 6000, QPSPolicy: "无硬额度；由市场总览缓存合并请求", CacheTTLSeconds: 15, CacheSemantics: "市场总览聚合缓存"},
-	{Source: "tencent", Capability: "quote", Market: "cn", Frequency: "realtime", ExpectedFreshnessSec: 10, ExpectedFreshness: "盘中约 10 秒", TimeoutMs: 6000, QPSPolicy: "无硬额度；共享 15 秒总预算并依赖短缓存", CacheTTLSeconds: 10, CacheSemantics: "按市场+标的覆盖缓存；stale 候选另有 60 秒短标记"},
+	{Source: "tencent", Capability: "quote", Market: "cn", Frequency: "realtime", ExpectedFreshnessSec: 10, ExpectedFreshness: "盘中约 10 秒", TimeoutMs: 6000, QPSPolicy: "共享限速和 15 秒总预算", CacheTTLSeconds: 10, CacheSemantics: "进程内缓存并合并请求；命中仍核验源时间"},
 	{Source: "tencent", Capability: "valuation", Market: "cn", Frequency: "realtime", ExpectedFreshnessSec: 60, ExpectedFreshness: "盘中约 1 分钟", TimeoutMs: 6000, QPSPolicy: "无硬额度；按需读取", CacheTTLSeconds: 60, CacheSemantics: "按市场+标的覆盖缓存"},
-	{Source: "sina", Capability: "quote", Market: "cn", Frequency: "realtime", ExpectedFreshnessSec: 10, ExpectedFreshness: "盘中约 10 秒", TimeoutMs: 6000, QPSPolicy: "无硬额度；共享 15 秒总预算并依赖短缓存", CacheTTLSeconds: 10, CacheSemantics: "按市场+标的覆盖缓存；stale 候选另有 60 秒短标记"},
-	{Source: "sina", Capability: "daily_bars", Market: "cn", Frequency: "daily", ExpectedFreshnessSec: 86400, ExpectedFreshness: "交易日收盘后", TimeoutMs: 6000, QPSPolicy: "批任务逐标的至少间隔 300ms", CacheTTLSeconds: 600, CacheSemantics: "东财失败后的非复权兜底；非空序列缓存"},
+	{Source: "sina", Capability: "quote", Market: "cn", Frequency: "realtime", ExpectedFreshnessSec: 10, ExpectedFreshness: "盘中约 10 秒", TimeoutMs: 6000, QPSPolicy: "共享限速和 15 秒总预算", CacheTTLSeconds: 10, CacheSemantics: "进程内缓存并合并请求；命中仍核验源时间"},
 	{Source: "sina", Capability: "indices", Market: "cn", Frequency: "realtime", ExpectedFreshnessSec: 15, ExpectedFreshness: "盘中约 15 秒", TimeoutMs: 6000, QPSPolicy: "无硬额度；批量指数单请求", CacheTTLSeconds: 15, CacheSemantics: "市场总览聚合缓存"},
 	{Source: "sina", Capability: "ranking", Market: "cn", Frequency: "realtime", ExpectedFreshnessSec: 60, ExpectedFreshness: "盘中约 1 分钟", TimeoutMs: 6000, QPSPolicy: "无硬额度；按排序条件合并缓存", CacheTTLSeconds: 60, CacheSemantics: "按市场+排序+方向+数量缓存非空榜单"},
 	{Source: "sina", Capability: "trading_days", Market: "cn", Frequency: "daily", ExpectedFreshnessSec: 86400, ExpectedFreshness: "最近收盘交易日", TimeoutMs: 6000, QPSPolicy: "仅日历回填按需调用", CacheSemantics: "不上 Redis；结果直接落本地交易日历"},
 	{Source: "sina", Capability: "benchmark", Market: "cn", Frequency: "daily", ExpectedFreshnessSec: 86400, ExpectedFreshness: "交易日收盘后", TimeoutMs: 6000, QPSPolicy: "跟踪/评估按需调用", CacheSemantics: "不上独立 Redis；消费方使用本地日线结果"},
+	{Source: "tencent", Capability: "daily_bars", Market: "cn", Frequency: "daily", ExpectedFreshnessSec: 86400, ExpectedFreshness: "交易日收盘后；仅前复权 qfqday", TimeoutMs: 6000, QPSPolicy: "共享行情限速；与在线历史共用缓存", CacheTTLSeconds: 600, CacheSemantics: "250 日公共窗口；成交额和换手率缺失不估算"},
+	{Source: "tencent", Capability: "indices", Market: "cn", Frequency: "realtime", ExpectedFreshnessSec: 15, ExpectedFreshness: "盘中约 15 秒", TimeoutMs: 6000, QPSPolicy: "主要指数一次批量请求", CacheTTLSeconds: 15, CacheSemantics: "市场总览进程内缓存；不要求 Redis"},
+	{Source: "tencent", Capability: "trading_days", Market: "cn", Frequency: "daily", ExpectedFreshnessSec: 86400, ExpectedFreshness: "已发生交易日；不推测未来休市", TimeoutMs: 6000, QPSPolicy: "仅日历回填按需读取", CacheSemantics: "实际指数日期落库，历史窗口有上限"},
+	{Source: "tencent", Capability: "benchmark", Market: "cn", Frequency: "daily", ExpectedFreshnessSec: 86400, ExpectedFreshness: "交易日收盘后", TimeoutMs: 6000, QPSPolicy: "跟踪/评估按需读取", CacheSemantics: "上证指数真实历史；不与深市同号股票混用"},
+	{Source: "eastmoney", Capability: "ranking", Market: "cn", Frequency: "realtime", ExpectedFreshnessSec: 60, ExpectedFreshness: "盘中约 1 分钟", TimeoutMs: 6000, QPSPolicy: "与东财快照共享限速", CacheTTLSeconds: 60, CacheSemantics: "排序、方向、数量隔离缓存"},
+	{Source: "eastmoney", Capability: "valuation", Market: "cn", Frequency: "realtime", ExpectedFreshnessSec: 60, ExpectedFreshness: "盘中约 1 分钟", TimeoutMs: 6000, QPSPolicy: "与东财行情共享限速", CacheTTLSeconds: 60, CacheSemantics: "仅提供已核实字段；缺失保留"},
+	{Source: "tencent", Capability: "min1", Market: "cn", Frequency: "intraday", ExpectedFreshnessSec: 60, ExpectedFreshness: "真实 1 分钟线", TimeoutMs: 6000, QPSPolicy: "共享限速；同标的请求合并", CacheTTLSeconds: 60, CacheSemantics: "分时图有界进程缓存；均价仍为估算"},
+	{Source: "tencent", Capability: "min5", Market: "cn", Frequency: "intraday", ExpectedFreshnessSec: 300, ExpectedFreshness: "真实 5 分钟线", TimeoutMs: 6000, QPSPolicy: "盘后任务共享限速", CacheSemantics: "完整交易日聚合后落库；不合成缺根"},
+	{Source: "sina", Capability: "min5", Market: "cn", Frequency: "intraday", ExpectedFreshnessSec: 300, ExpectedFreshness: "真实 5 分钟线备用", TimeoutMs: 6000, QPSPolicy: "新浪请求共享限速", CacheSemantics: "股转换为手；不能冒充 1 分钟数据"},
+	{Source: "eastmoney", Capability: "announcements", Market: "cn", Frequency: "daily", ExpectedFreshnessSec: 3600, ExpectedFreshness: "按需或盘后更新", TimeoutMs: 6000, QPSPolicy: "关注标的采集与按需刷新合并", CacheTTLSeconds: 3600, CacheSemantics: "公告数据库缓存；保留原发布日期和来源"},
+	{Source: "cninfo", Capability: "announcements", Market: "cn", Frequency: "daily", ExpectedFreshnessSec: 3600, ExpectedFreshness: "巨潮公开披露公告", TimeoutMs: 6000, QPSPolicy: "按需查询；免 token；不下载全文", CacheTTLSeconds: 3600, CacheSemantics: "核对证券代码与机构标识；保留官方 PDF 链接"},
+	{Source: "eastmoney", Capability: "spot_snapshot", Market: "cn", Frequency: "daily", ExpectedFreshnessSec: 86400, ExpectedFreshness: "盘后完整沪深 A 股快照", TimeoutMs: 240000, QPSPolicy: "分页串行；共享东财限速", CacheSemantics: "完整性验证后落库；请使用全市场同步任务，不做全量按钮探测", ProbeDisabled: true},
+	{Source: "sina", Capability: "spot_snapshot", Market: "cn", Frequency: "daily", ExpectedFreshnessSec: 86400, ExpectedFreshness: "盘后完整沪深 A 股备用快照", TimeoutMs: 240000, QPSPolicy: "分页与百股报价串行；共享新浪限速", CacheSemantics: "核对首尾计数、唯一代码及逐股时间；请使用全市场同步任务", ProbeDisabled: true},
 }
 
 // CapabilityRegistry 返回注册表副本，避免调用方修改进程内支持声明。
@@ -263,6 +276,9 @@ func recoveryAdvice(st HealthStat) string {
 		return "注册表未声明该组合；历史观测不等于能力受支持，请先补注册与契约测试"
 	}
 	if !st.Observed {
+		if st.ProbeDisabled {
+			return "等待盘后全市场同步任务形成完整性观测；普通探测不会发起全市场扫描"
+		}
 		return "等待正常业务调用形成观测，或由管理员执行一次受控单能力探测"
 	}
 	if st.CooldownLeft > 0 {

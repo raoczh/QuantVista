@@ -111,6 +111,8 @@ type fakeWideSource struct {
 	onBars    func(symbol string, nthCall int) // 副作用钩子（断点续传测试里触发 cancel）
 }
 
+func (f *fakeWideSource) Name() string { return "eastmoney" }
+
 func (f *fakeWideSource) GetCNSpotSnapshot(ctx context.Context) ([]datasource.SpotRow, error) {
 	if f.snapErr != nil {
 		return nil, f.snapErr

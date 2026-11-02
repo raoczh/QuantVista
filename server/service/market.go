@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -18,21 +17,22 @@ import (
 
 // MarketService 行情业务：缓存 → 数据源适配层 → 落库快照。
 type MarketService struct {
-	mgr *datasource.Manager
-	// wide 全市场日线链路（M1）专用源：clist 快照只有东财有；历史初始化/除权重锚的
-	// kline 必须与增量同为东财前复权口径，不走 mgr 路由（防新浪不复权兜底毒化基准）。
-	// 独立实例（自带断路器）：长任务的限流状态不与在线路径互相影响。测试可注入假实现。
+	mgr       *datasource.Manager
+	cacheOnce sync.Once
+	cache     *marketResponseCache
+	// Online reads and historical maintenance share the same adjusted-only routing.
+	// Tests can still inject a separate full-market source.
 	wide wideSource
 }
 
-// wideSource 全市场日线链路依赖的数据源能力子集（东财实现；单测注入假实现）。
+// wideSource 全市场链路依赖的能力子集（生产使用 Manager；测试可注入假源）。
 type wideSource interface {
 	GetCNSpotSnapshot(ctx context.Context) ([]datasource.SpotRow, error)
 	GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]datasource.Bar, error)
 }
 
 func NewMarketService(mgr *datasource.Manager) *MarketService {
-	return &MarketService{mgr: mgr, wide: datasource.NewEastMoneyAdapter()}
+	return &MarketService{mgr: mgr, wide: mgr}
 }
 
 const quoteCacheTTL = 10 * time.Second
@@ -44,38 +44,25 @@ func (s *MarketService) DataSourceHealth() []datasource.HealthStat {
 
 // GetQuote 取实时行情：先查缓存，miss 则走数据源，成功后落库并回种缓存。
 func (s *MarketService) GetQuote(ctx context.Context, market, symbol string) (*datasource.Quote, error) {
-	cacheKey := "quote:" + market + ":" + symbol
-
-	if cached, ok := common.RedisGet(cacheKey); ok {
-		var q datasource.Quote
-		if json.Unmarshal([]byte(cached), &q) == nil {
-			return &q, nil
-		}
+	if market == "cn" {
+		quote, _, err := s.GetFreshQuote(ctx, market, symbol)
+		return quote, err
 	}
-
-	q, err := s.mgr.GetQuote(ctx, market, symbol)
-	if err != nil {
-		return nil, err
-	}
-
-	// 落库：股票基础信息 + 最新行情快照（按 symbol+market 覆盖更新）。
-	s.persist(ctx, q)
-
-	if b, err := json.Marshal(q); err == nil {
-		common.RedisSet(cacheKey, string(b), quoteCacheTTL)
-	}
-	return q, nil
+	return marketCachedJSON(ctx, s.responseCache(), "quote:v2:"+market+":"+symbol, quoteCacheTTL,
+		func(fetchContext context.Context) (*datasource.Quote, error) {
+			quote, err := s.mgr.GetQuote(fetchContext, market, symbol)
+			if err == nil {
+				s.persist(fetchContext, quote)
+			}
+			return quote, err
+		})
 }
 
 const dailyBarsCacheTTL = 10 * time.Minute
 
-// freshMissTTL 全源过期候选的短标记 TTL：停牌股每次新建会话都会判 stale 触发全源遍历，
-// 用此标记在 60s 内复用候选，避免同标的重复扫源打满 15s 预算。
-const freshMissTTL = 60 * time.Second
-
 // GetFreshQuote 取「新鲜行情」：读缓存/上游结果后按交易日历与交易时段校验 DataTime，
 // 交易时段内过期则继续尝试下一数据源（不把旧行情当成功），全部源都过期则返回最新候选并
-// 标注 stale。返回 行情、新鲜度信息、错误。仅个股快照采集（buildStockSnapshot）走此链路。
+// 标注 stale。返回 行情、新鲜度信息、错误。A 股 GetQuote 同样经此链路并共用短缓存。
 // 非 cn 市场无交易日历判定，降级为普通 GetQuote 并标 unknown。
 func (s *MarketService) GetFreshQuote(ctx context.Context, market, symbol string) (*datasource.Quote, quoteFreshInfo, error) {
 	if market != "cn" {
@@ -83,7 +70,7 @@ func (s *MarketService) GetFreshQuote(ctx context.Context, market, symbol string
 		return q, quoteFreshInfo{Status: freshStatusUnknown, MarketState: marketStateClosed}, err
 	}
 
-	now := time.Now().In(time.Local)
+	now := time.Now().In(datasource.ChinaMarketLocation())
 	isTrading := isTradingDayToday(now)
 	state := cnMarketState(now, isTrading)
 	expected := expectedQuoteDate(now, isTrading, prevOpenTradeDate(now.Format("2006-01-02")))
@@ -97,38 +84,18 @@ func (s *MarketService) GetFreshQuote(ctx context.Context, market, symbol string
 		return quoteFreshness(q.DataTime, now, state, expected)
 	}
 
-	cacheKey := "quote:" + market + ":" + symbol
-	if cached, ok := common.RedisGet(cacheKey); ok {
-		var q datasource.Quote
-		if json.Unmarshal([]byte(cached), &q) == nil && accept(&q) {
-			return &q, info(&q), nil
-		}
-	}
-	// 全源过期短标记：命中即复用候选，跳过重复扫源。
-	missKey := "quote:freshmiss:" + market + ":" + symbol
-	if cached, ok := common.RedisGet(missKey); ok {
-		var q datasource.Quote
-		if json.Unmarshal([]byte(cached), &q) == nil {
-			return &q, info(&q), nil
-		}
-	}
-
-	q, fresh, err := s.mgr.GetQuoteFresh(ctx, market, symbol, accept)
+	quote, err := marketCachedJSON(ctx, s.responseCache(), "quote:v2:"+market+":"+symbol, quoteCacheTTL,
+		func(fetchContext context.Context) (*datasource.Quote, error) {
+			candidate, _, fetchErr := s.mgr.GetQuoteFresh(fetchContext, market, symbol, accept)
+			if fetchErr == nil {
+				s.persist(fetchContext, candidate)
+			}
+			return candidate, fetchErr
+		})
 	if err != nil {
-		if errors.Is(err, datasource.ErrSymbolInvalid) {
-			return nil, quoteFreshInfo{Status: freshStatusStale, MarketState: state, ExpectedDate: expected}, err
-		}
-		common.SysWarn("取新鲜行情失败 symbol=%s: %v", symbol, err)
-		return nil, quoteFreshInfo{Status: freshStatusStale, MarketState: state, ExpectedDate: expected}, err
+		return nil, info(nil), err
 	}
-	s.persist(ctx, q)
-	if b, err := json.Marshal(q); err == nil {
-		common.RedisSet(cacheKey, string(b), quoteCacheTTL)
-		if !fresh {
-			common.RedisSet(missKey, string(b), freshMissTTL)
-		}
-	}
-	return q, info(q), nil
+	return quote, info(quote), nil
 }
 
 // QuoteFreshnessOf 对一条已取得的行情按当前时刻做时效判定——提醒/守护/模拟成交/追踪/
@@ -147,7 +114,7 @@ func (s *MarketService) FreshnessJudge(market string) func(dataTime time.Time) q
 			return quoteFreshInfo{Status: freshStatusUnknown, MarketState: marketStateClosed}
 		}
 	}
-	now := time.Now().In(time.Local)
+	now := time.Now().In(datasource.ChinaMarketLocation())
 	isTrading := isTradingDayToday(now)
 	state := cnMarketState(now, isTrading)
 	expected := expectedQuoteDate(now, isTrading, prevOpenTradeDate(now.Format("2006-01-02")))
@@ -208,7 +175,7 @@ type QuoteFreshnessView struct {
 
 // FreshnessView 组装一条行情的新鲜度视图（q 为 nil 时按 stale 组装）。
 func (s *MarketService) FreshnessView(market string, q *datasource.Quote) *QuoteFreshnessView {
-	v := &QuoteFreshnessView{CapturedAt: time.Now().In(time.Local).Format("2006-01-02 15:04:05")}
+	v := &QuoteFreshnessView{CapturedAt: time.Now().In(datasource.ChinaMarketLocation()).Format("2006-01-02 15:04:05")}
 	var dataTime time.Time
 	if q != nil {
 		dataTime = q.DataTime
@@ -219,7 +186,7 @@ func (s *MarketService) FreshnessView(market string, q *datasource.Quote) *Quote
 	v.MarketState = fi.MarketState
 	v.FreshnessStatus = fi.Status
 	if !dataTime.IsZero() {
-		v.SourceDataTime = dataTime.In(time.Local).Format("2006-01-02 15:04:05")
+		v.SourceDataTime = dataTime.In(datasource.ChinaMarketLocation()).Format("2006-01-02 15:04:05")
 	}
 	if fi.Status == freshStatusStale {
 		if note, _ := stockFreshnessNote(fi, dataTime); note != "" {
@@ -232,25 +199,36 @@ func (s *MarketService) FreshnessView(market string, q *datasource.Quote) *Quote
 // GetDailyBars 取日线序列。加 10 分钟缓存：推荐评分/个股分析/对比/评分卡会在短时间内
 // 反复拉同一批标的的日线（收盘后日线不变、盘中仅末根在动），缓存显著降低对免费源的压力。
 func (s *MarketService) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]datasource.Bar, error) {
-	cacheKey := fmt.Sprintf("bars:qfq-v1:%s:%s:%d", market, symbol, limit)
-	if cached, ok := common.RedisGet(cacheKey); ok {
-		var bars []datasource.Bar
-		if json.Unmarshal([]byte(cached), &bars) == nil && len(bars) > 0 && validateAdjustedBars(market, bars) == nil {
-			return bars, nil
-		}
+	if limit <= 0 {
+		limit = 120
 	}
-	bars, err := s.mgr.GetDailyBars(ctx, market, symbol, limit)
+	limit = min(limit, 1023)
+	// Chart, indicators and chips request different tails of the same 250-day history.
+	// One canonical window also supplies enough overlap for adjustment validation.
+	fetchLimit := max(limit, wideBarLimit)
+	cacheKey := fmt.Sprintf("bars:qfq-v2:%s:%s:%d", market, symbol, fetchLimit)
+	bars, err := marketCachedJSON(ctx, s.responseCache(), cacheKey, dailyBarsCacheTTL,
+		func(fetchContext context.Context) ([]datasource.Bar, error) {
+			series, fetchErr := s.mgr.GetDailyBars(fetchContext, market, symbol, fetchLimit)
+			if fetchErr != nil {
+				return nil, fetchErr
+			}
+			if validationErr := validateAdjustedBars(market, series); validationErr != nil {
+				return nil, validationErr
+			}
+			if persistenceErr := s.persistDailyBars(fetchContext, market, symbol, series); persistenceErr != nil {
+				common.SysWarn("日线缓存持久化失败 %s.%s: %v", market, symbol, persistenceErr)
+			}
+			return series, nil
+		})
 	if err != nil {
 		return nil, err
 	}
 	if err := validateAdjustedBars(market, bars); err != nil {
 		return nil, err
 	}
-	// 在线读路径 best-effort 落库：拉取成功即向调用方返回行情，落库失败只告警
-	//（persistDailyBars 内部已 SysWarn），不因缓存回种失败阻断读。
-	_ = s.persistDailyBars(ctx, market, symbol, bars)
-	if b, err := json.Marshal(bars); err == nil {
-		common.RedisSet(cacheKey, string(b), dailyBarsCacheTTL)
+	if len(bars) > limit {
+		bars = bars[len(bars)-limit:]
 	}
 	return bars, nil
 }
@@ -261,20 +239,10 @@ const rankingCacheTTL = 60 * time.Second
 // 供推荐候选池多源建池使用（首页概览走 GetOverview 的 10 条口径，互不影响）。
 func (s *MarketService) GetRanking(ctx context.Context, market, sort string, asc bool, limit int) ([]datasource.StockRank, error) {
 	cacheKey := fmt.Sprintf("ranking:%s:%s:%v:%d", market, sort, asc, limit)
-	if cached, ok := common.RedisGet(cacheKey); ok {
-		var rows []datasource.StockRank
-		if json.Unmarshal([]byte(cached), &rows) == nil && len(rows) > 0 {
-			return rows, nil
-		}
-	}
-	rows, err := s.mgr.GetStockRanking(ctx, market, sort, asc, limit)
-	if err != nil {
-		return nil, err
-	}
-	if b, err := json.Marshal(rows); err == nil {
-		common.RedisSet(cacheKey, string(b), rankingCacheTTL)
-	}
-	return rows, nil
+	return marketCachedJSON(ctx, s.responseCache(), cacheKey, rankingCacheTTL,
+		func(fetchContext context.Context) ([]datasource.StockRank, error) {
+			return s.mgr.GetStockRanking(fetchContext, market, sort, asc, limit)
+		})
 }
 
 const valuationCacheTTL = 60 * time.Second
@@ -283,20 +251,10 @@ const valuationCacheTTL = 60 * time.Second
 // 变化低频，缓存 60s；读时取用不落库。
 func (s *MarketService) GetValuation(ctx context.Context, market, symbol string) (*datasource.Valuation, error) {
 	cacheKey := "valuation:" + market + ":" + symbol
-	if cached, ok := common.RedisGet(cacheKey); ok {
-		var v datasource.Valuation
-		if json.Unmarshal([]byte(cached), &v) == nil {
-			return &v, nil
-		}
-	}
-	v, err := s.mgr.GetValuation(ctx, market, symbol)
-	if err != nil {
-		return nil, err
-	}
-	if b, err := json.Marshal(v); err == nil {
-		common.RedisSet(cacheKey, string(b), valuationCacheTTL)
-	}
-	return v, nil
+	return marketCachedJSON(ctx, s.responseCache(), cacheKey, valuationCacheTTL,
+		func(fetchContext context.Context) (*datasource.Valuation, error) {
+			return s.mgr.GetValuation(fetchContext, market, symbol)
+		})
 }
 
 // ValuationsFor 并发批量取估值（复用单只缓存，best-effort：单只失败缺席不影响其余）。
@@ -396,13 +354,18 @@ const overviewCacheTTL = 15 * time.Second
 // GetOverview 并行拉取首页各块，单块失败降级（前端对应卡片显示"暂不可用"）。
 func (s *MarketService) GetOverview(ctx context.Context, market string) *Overview {
 	cacheKey := "overview:" + market
-	if cached, ok := common.RedisGet(cacheKey); ok {
-		var ov Overview
-		if json.Unmarshal([]byte(cached), &ov) == nil {
-			return &ov
-		}
+	overview, err := marketCachedJSON(ctx, s.responseCache(), cacheKey, overviewCacheTTL,
+		func(fetchContext context.Context) (*Overview, error) {
+			result := s.fetchOverview(fetchContext, market)
+			return result, fetchContext.Err()
+		})
+	if err != nil {
+		return &Overview{Errors: map[string]string{"market": err.Error()}, DataTime: time.Now()}
 	}
+	return overview
+}
 
+func (s *MarketService) fetchOverview(ctx context.Context, market string) *Overview {
 	ov := &Overview{Errors: map[string]string{}, DataTime: time.Now()}
 	var mu sync.Mutex
 	setErr := func(k string, err error) {
@@ -423,7 +386,7 @@ func (s *MarketService) GetOverview(ctx context.Context, market string) *Overvie
 	}()
 	go func() {
 		defer wg.Done()
-		if r, err := s.mgr.GetStockRanking(ctx, market, "changepercent", false, 10); err == nil {
+		if r, err := s.GetRanking(ctx, market, "changepercent", false, 10); err == nil {
 			ov.Gainers = r
 		} else {
 			setErr("gainers", err)
@@ -431,7 +394,7 @@ func (s *MarketService) GetOverview(ctx context.Context, market string) *Overvie
 	}()
 	go func() {
 		defer wg.Done()
-		if r, err := s.mgr.GetStockRanking(ctx, market, "amount", false, 10); err == nil {
+		if r, err := s.GetRanking(ctx, market, "amount", false, 10); err == nil {
 			ov.Actives = r
 		} else {
 			setErr("actives", err)
@@ -462,14 +425,6 @@ func (s *MarketService) GetOverview(ctx context.Context, market string) *Overvie
 		}
 	}()
 	wg.Wait()
-
-	// ctx 已取消（客户端断开/超时）时各块几乎必然带着失败结果返回，
-	// 此时回写会把残缺概览毒化缓存 15s，直接跳过。
-	if ctx.Err() == nil {
-		if b, err := json.Marshal(ov); err == nil {
-			common.RedisSet(cacheKey, string(b), overviewCacheTTL)
-		}
-	}
 	return ov
 }
 
@@ -555,8 +510,8 @@ func (s *MarketService) persistDailyBarsTx(ctx context.Context, db *gorm.DB, mar
 	// M1 除权检测（防"部分窗口重写"漏检）：本次拉取若与 DB 内已有窗口的 close 多点
 	// 比对出现偏差，说明发生了除权/送转（东财前复权序列整体重锚）——此时只 upsert
 	// 本窗会留下"窗口内新基准、窗口外旧基准"的断层。检测命中即全量重锚（250 根删+插）
-	// 后直接返回。仅东财源检测：新浪日线不复权，与前复权基准比对必然偏差，会误判。
-	if market == "cn" && len(reference) > 0 && reference[0].Source == "eastmoney" {
+	// 后直接返回。腾讯备用前复权历史也必须核验，不能借换源绕开重锚。
+	if market == "cn" && len(reference) > 0 && (reference[0].Source == "eastmoney" || reference[0].Source == "tencent") {
 		rebased, err := s.detectAndRebase(ctx, db, market, symbol, reference)
 		if err != nil {
 			return err
@@ -602,9 +557,7 @@ func (s *MarketService) persistDailyBarsTx(ctx context.Context, db *gorm.DB, mar
 	}
 
 	if len(dailyRows) > 0 {
-		// 无成交额的源（新浪日线 Amount 恒 0）作兜底回退时，不得把东财已写入的
-		// 真实 amount 覆盖成 0——本批全为 0 时更新列表不含 amount；换手率（新浪
-		// 日线同样没有）照此办理。
+		// 腾讯前复权日线未提供成交额/换手率，本批全缺失时不覆盖已存真实值。
 		updateCols := []string{"open", "high", "low", "close", "volume", "source"}
 		hasAmount, hasTurnover := false, false
 		for _, r := range dailyRows {
