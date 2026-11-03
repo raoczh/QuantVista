@@ -59,6 +59,32 @@ func TestLiveFreeSources(test *testing.T) {
 	})
 }
 
+func TestLiveBoardFallback(test *testing.T) {
+	if os.Getenv("LIVE_BOARD_FALLBACK") != "1" {
+		test.Skip("set LIVE_BOARD_FALLBACK=1 for bounded board fallback checks")
+	}
+	for _, route := range []struct {
+		name    string
+		manager *Manager
+	}{{"default", DefaultManager()}, {"sina_only", NewManagerWithAdapters(NewSinaAdapter())}} {
+		for _, kind := range []string{"industry", "concept"} {
+			test.Run(route.name+"/"+kind, func(test *testing.T) {
+				manager := route.manager
+				rows, err := manager.GetBoardHeat(test.Context(), kind)
+				if err != nil || len(rows) == 0 {
+					test.Fatalf("board route unavailable: %v", err)
+				}
+				test.Logf("kind=%s source=%s boards=%d source_timestamp=not_provided", kind, rows[0].Source, len(rows))
+				stocks, err := manager.GetBoardConstituents(test.Context(), rows[0].Code, 1)
+				if err != nil || len(stocks) != 1 {
+					test.Fatalf("board constituent unavailable: %v", err)
+				}
+				test.Logf("board=%s symbol=%s quote_time=%s", rows[0].Code, stocks[0].Symbol, stocks[0].DataTime.Format(time.RFC3339))
+			})
+		}
+	}
+}
+
 // A complete snapshot is deliberately separate from the small source probes.
 // It is read-only but needs about two requests per hundred listed securities.
 func TestLiveFreeSnapshot(test *testing.T) {

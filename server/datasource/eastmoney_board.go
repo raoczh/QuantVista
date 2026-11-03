@@ -19,7 +19,7 @@ import (
 const (
 	boardHeatFields   = "f12,f14,f3,f6,f104,f105,f128,f140"
 	boardHeatPageSize = 100
-	boardStockFields  = "f12,f14,f2,f3,f6,f8,f20,f21"
+	boardStockFields  = "f12,f14,f2,f3,f6,f8,f20,f21,f124"
 	boardListMaxPages = 10 // 行业/概念各约 496 个 ≈ 5 页，留余量防上游 total 异常翻页失控
 	boardListPageGap  = 200 * time.Millisecond
 )
@@ -35,13 +35,20 @@ var bkCodeRe = regexp.MustCompile(`^BK\d{4}$`)
 
 // GetBoardHeat 拉取行业/概念板块热度榜（Top100，按成交额降序）。走 e.get（push2 断路器）。
 func (e *EastMoneyAdapter) GetBoardHeat(ctx context.Context, kind string) ([]BoardHeat, error) {
+	return e.GetBoardHeatLimited(ctx, kind, boardHeatPageSize)
+}
+
+func (e *EastMoneyAdapter) GetBoardHeatLimited(ctx context.Context, kind string, limit int) ([]BoardHeat, error) {
 	fs, ok := boardFS[kind]
 	if !ok {
 		return nil, ErrSymbolInvalid
 	}
+	if limit <= 0 || limit > boardHeatPageSize {
+		limit = boardHeatPageSize
+	}
 	url := fmt.Sprintf(
 		"https://%d.push2.eastmoney.com/api/qt/clist/get?pn=1&pz=%d&po=1&np=1&fid=f6&fltt=2&invt=2&ut=%s&fs=%s&fields=%s",
-		emNode(), boardHeatPageSize, clistUT, fs, boardHeatFields,
+		emNode(), limit, clistUT, fs, boardHeatFields,
 	)
 	body, status, err := e.get(ctx, url, map[string]string{"Referer": "https://quote.eastmoney.com/"})
 	if err != nil {
@@ -314,17 +321,18 @@ func parseBoardHeat(body []byte) ([]BoardHeat, error) {
 		}
 		pct, _ := emNum(b.F3)
 		amount, _ := emNum(b.F6)
-		adv, _ := emNum(b.F104)
-		dec, _ := emNum(b.F105)
+		adv, advancesPresent := emNum(b.F104)
+		dec, declinesPresent := emNum(b.F105)
 		rows = append(rows, BoardHeat{
-			Code:       code,
-			Name:       strings.TrimSpace(b.F14),
-			ChangePct:  pct,
-			Amount:     amount,
-			Advances:   int(adv),
-			Declines:   int(dec),
-			Leader:     strings.TrimSpace(b.F128),
-			LeaderCode: strings.TrimSpace(b.F140),
+			Code:            code,
+			Name:            strings.TrimSpace(b.F14),
+			ChangePct:       pct,
+			Amount:          amount,
+			Advances:        int(adv),
+			Declines:        int(dec),
+			CountsAvailable: advancesPresent && declinesPresent,
+			Leader:          strings.TrimSpace(b.F128),
+			LeaderCode:      strings.TrimSpace(b.F140),
 		})
 	}
 	if len(rows) == 0 {
@@ -340,14 +348,15 @@ func parseBoardStocks(body []byte) ([]BoardStock, error) {
 		return nil, err
 	}
 	type emStock struct {
-		F12 string          `json:"f12"`
-		F14 string          `json:"f14"`
-		F2  json.RawMessage `json:"f2"`
-		F3  json.RawMessage `json:"f3"`
-		F6  json.RawMessage `json:"f6"`
-		F8  json.RawMessage `json:"f8"`
-		F20 json.RawMessage `json:"f20"`
-		F21 json.RawMessage `json:"f21"`
+		F12  string          `json:"f12"`
+		F14  string          `json:"f14"`
+		F2   json.RawMessage `json:"f2"`
+		F3   json.RawMessage `json:"f3"`
+		F6   json.RawMessage `json:"f6"`
+		F8   json.RawMessage `json:"f8"`
+		F20  json.RawMessage `json:"f20"`
+		F21  json.RawMessage `json:"f21"`
+		F124 json.RawMessage `json:"f124"`
 	}
 	rows := make([]BoardStock, 0, len(items))
 	for _, it := range items {
@@ -365,6 +374,10 @@ func parseBoardStocks(body []byte) ([]BoardStock, error) {
 		turnover, _ := emNum(s.F8)
 		totalCap, _ := emNum(s.F20)
 		floatCap, _ := emNum(s.F21)
+		var dataTime time.Time
+		if timestamp, present := emNum(s.F124); present && timestamp > 0 {
+			dataTime = time.Unix(int64(timestamp), 0).In(ChinaMarketLocation())
+		}
 		rows = append(rows, BoardStock{
 			Symbol:       sym,
 			Name:         strings.TrimSpace(s.F14),
@@ -374,6 +387,7 @@ func parseBoardStocks(body []byte) ([]BoardStock, error) {
 			TurnoverRate: turnover,
 			TotalCap:     totalCap,
 			FloatCap:     floatCap,
+			DataTime:     dataTime,
 		})
 	}
 	if len(rows) == 0 {

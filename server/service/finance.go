@@ -23,8 +23,9 @@ import (
 type FinanceService struct {
 	em *datasource.EastMoneyAdapter
 
-	annMu       sync.Mutex
-	annAttempts map[string]*announcementAttempt
+	annMu            sync.Mutex
+	annAttempts      map[string]*announcementAttempt
+	announcementFeed func(context.Context, string, int) ([]datasource.EMAnnouncement, error)
 }
 
 var fetchAnnouncementFeed = datasource.GetAnnouncements
@@ -341,7 +342,11 @@ func (s *FinanceService) CollectAnnouncements(ctx context.Context) (inserted int
 
 // fetchAnnouncements 拉单只公告落库，返回新插入条数。
 func (s *FinanceService) fetchAnnouncements(ctx context.Context, symbol string) (int, error) {
-	items, err := fetchAnnouncementFeed(ctx, symbol, annPageSize)
+	fetch := s.announcementFeed
+	if fetch == nil {
+		fetch = fetchAnnouncementFeed
+	}
+	items, err := fetch(ctx, symbol, annPageSize)
 	if err != nil {
 		if errors.Is(err, datasource.ErrNoData) {
 			return 0, nil
@@ -440,26 +445,32 @@ func (s *FinanceService) refreshAnnouncements(ctx context.Context, symbol string
 // latestAnnouncementBriefs 某标的最近 limit 条公告（标题+类型+日期），供个股分析/问答
 // prompt 注入（AI 证据池的文本型合法来源）。best-effort：无 DB / 无公告返回空。
 type announcementBrief struct {
-	Title string `json:"title"`
-	Type  string `json:"type,omitempty"`
-	Date  string `json:"date"`
+	Title  string `json:"title"`
+	Type   string `json:"type,omitempty"`
+	Date   string `json:"date"`
+	Source string `json:"source,omitempty"`
 }
 
 func latestAnnouncementBriefs(symbol string, limit int) []announcementBrief {
+	rows, _ := latestAnnouncementBriefsContext(context.Background(), symbol, limit)
+	return rows
+}
+
+func latestAnnouncementBriefsContext(ctx context.Context, symbol string, limit int) ([]announcementBrief, error) {
 	if common.DB == nil || !isSixDigits(symbol) {
-		return nil
+		return nil, nil
 	}
 	var rows []model.Announcement
-	if err := common.DB.Select("title, notice_type, notice_date").
-		Where("symbol = ?", symbol).
+	if err := common.DB.WithContext(ctx).Select("title, notice_type, notice_date, source").
+		Where("symbol = ? AND market = ? AND notice_date <= ?", symbol, "cn", time.Now().In(datasource.ChinaMarketLocation()).Format(time.DateOnly)).
 		Order("notice_date DESC, id DESC").Limit(limit).Find(&rows).Error; err != nil {
-		return nil
+		return nil, err
 	}
 	out := make([]announcementBrief, 0, len(rows))
 	for _, a := range rows {
-		out = append(out, announcementBrief{Title: a.Title, Type: a.NoticeType, Date: a.NoticeDate})
+		out = append(out, announcementBrief{Title: a.Title, Type: a.NoticeType, Date: a.NoticeDate, Source: a.Source})
 	}
-	return out
+	return out, nil
 }
 
 // announcementTitleTexts 从个股快照的 announcements 块提取标题（信任层：公告标题里的

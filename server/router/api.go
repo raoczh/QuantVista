@@ -23,7 +23,7 @@ func SetApiRouter(r *gin.Engine, mgr *datasource.Manager) {
 	positionSvc := service.NewPositionService(marketSvc)
 	portfolioAccountSvc := service.NewPortfolioAccountService()
 	portfolioRiskSvc := service.NewPortfolioRiskService(marketSvc, positionSvc)
-	boardSvc := service.NewBoardService() // 在 analysisSvc 之前创建（P3b：板块分析注入板块资金流）
+	boardSvc := service.NewBoardService(mgr) // 页面、AI 板块分析与健康探测共用数据源路由。
 	analysisSvc := service.NewAnalysisService(marketSvc, watchlistSvc, positionSvc, llmSvc, boardSvc)
 	recommendationSvc := service.NewRecommendationService(marketSvc, watchlistSvc, llmSvc)
 	trackingSvc := service.NewTrackingService(marketSvc)

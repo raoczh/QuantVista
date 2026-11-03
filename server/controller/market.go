@@ -404,8 +404,12 @@ func (mc *MarketController) ProbeDataSource(c *gin.Context) {
 	defer cancel()
 	result, err := mc.svc.ProbeDataSource(ctx, currentUserID(c), req)
 	if err != nil {
-		common.ApiErrorMsg(c, publicWorkflowError(err, "数据源探测失败: 请稍后重试"))
-		return
+		// 只有独立的 ProbeFailure 表示样本已执行且审计已完成；不能用 errors.As
+		// 放行 errors.Join(probeErr, auditErr)，否则会把审计失败误报为完成。
+		if _, completed := err.(*datasource.ProbeFailure); !completed {
+			common.ApiErrorMsg(c, publicWorkflowError(err, "数据源探测失败: 请稍后重试"))
+			return
+		}
 	}
 	common.ApiSuccess(c, result)
 }
@@ -437,6 +441,9 @@ func (mc *MarketController) DataHealth(c *gin.Context) {
 	}
 	report, err := service.BuildDataHealthReportForDaysContext(c.Request.Context(), days)
 	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			common.SysWarn("数据健康本地报告读取失败 days=%d: %v", days, err)
+		}
 		common.ApiErrorMsg(c, publicWorkflowError(err, "数据健康报告读取失败，请稍后重试"))
 		return
 	}

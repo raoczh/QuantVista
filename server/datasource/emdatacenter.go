@@ -26,13 +26,22 @@ var dcMinInterval = 500 * time.Millisecond
 var dcRetryBackoff = time.Second
 
 var (
-	dcMu   sync.Mutex
-	dcLast time.Time
+	dcMu            sync.Mutex
+	dcLast          time.Time
+	dcCooldownUntil time.Time
 )
 
-// dcThrottle 全局令牌桶（最简实现：串行化 + 最小间隔）。ctx 取消时提前返回。
+// dcThrottle 统一检查请求间隔与跨请求冷却；DC/F10 只经过这一层节流。
 func dcThrottle(ctx context.Context) error {
-	return waitSourceInterval(ctx, &dcMu, &dcLast, dcMinInterval)
+	return waitSourceInterval(ctx, &dcMu, &dcLast, dcMinInterval, &dcCooldownUntil)
+}
+
+func dcDeferUntil(deadline time.Time) {
+	dcMu.Lock()
+	defer dcMu.Unlock()
+	if deadline.After(dcCooldownUntil) {
+		dcCooldownUntil = deadline
+	}
 }
 
 // DataCenterQuery 一次报表查询的参数。Filter 语法形如 (REPORT_DATE='2026-06-30')(NOTICE_DATE>='2026-07-01')。
@@ -95,7 +104,7 @@ func (it *DataCenterIter) Next(ctx context.Context) ([]json.RawMessage, error) {
 
 	// 只有 HTTP 层重试；每次真实尝试（包括网络错误重试）都重新经过 dcThrottle。
 	body, status, err := doGetWithPolicy(ctx, u, map[string]string{"Referer": "https://data.eastmoney.com/"},
-		httpRequestPolicy{beforeAttempt: dcThrottle, retryBackoff: dcRetryBackoff})
+		httpRequestPolicy{beforeAttempt: dcThrottle, onRetryAfter: dcDeferUntil, retryBackoff: dcRetryBackoff})
 	if errors.Is(err, ErrNoData) {
 		it.done = true
 		if it.page == 1 {

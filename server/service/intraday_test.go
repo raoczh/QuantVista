@@ -233,6 +233,9 @@ func TestSyncIntradayFactorsE2E(t *testing.T) {
 	for _, sym := range []string{"000001", "600519", "300750"} {
 		common.DB.Create(&model.MarketSyncState{Symbol: sym, Market: "cn", InitStatus: "done"})
 	}
+	if err := common.DB.Create(&model.StockUniverseDaily{Symbol: "600519", Market: "cn", TradeDate: "2026-07-07", Suspended: true}).Error; err != nil {
+		t.Fatal(err)
+	}
 	mk := func(day string, base float64) []datasource.Min5Bar {
 		return fullDay48(day, func(clock string) float64 {
 			if clock > "1430" {

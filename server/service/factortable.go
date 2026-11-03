@@ -238,6 +238,7 @@ type FactorTable struct {
 	LastDates     []string // 各股末根交易日（= TradeDate 为 fresh）
 	cols          map[string][]float64
 	snapshotReady map[string]bool // 与因子输入共享读视图；构建后完成初始化不能升级旧短史的快照资格。
+	inputRevision uint64
 }
 
 // Len 行数（宇宙内标的数）。
@@ -667,6 +668,9 @@ func buildFactorTable(ctx context.Context) (*FactorTable, error) {
 		return nil, errors.New("数据库不可用")
 	}
 	var table *FactorTable
+	factorTableMu.RLock()
+	revision := factorInputRevision
+	factorTableMu.RUnlock()
 	err := readSnapshotTx(ctx, func(tx *gorm.DB) error {
 		var err error
 		table, err = buildFactorTableSnapshot(ctx, tx)
@@ -675,6 +679,7 @@ func buildFactorTable(ctx context.Context) (*FactorTable, error) {
 	if err != nil {
 		return nil, err
 	}
+	table.inputRevision = revision
 	return table, nil
 }
 
@@ -713,7 +718,7 @@ func buildFactorTableSnapshot(ctx context.Context, db *gorm.DB) (*FactorTable, e
 	// 流式读 + 并行计算。
 	rows, err := db.Model(&model.DailyBar{}).
 		Select(dailyBarScanCols).
-		Where("market = ?", "cn").
+		Where("market = ? AND trade_date <= ?", "cn", tradeDate).
 		Order("symbol, trade_date").Rows()
 	if err != nil {
 		return nil, err
@@ -908,12 +913,21 @@ func wideFreshDate() (string, error) {
 }
 
 func wideFreshDateDB(db *gorm.DB) (string, error) {
+	return wideFreshDateAtDB(db, time.Now())
+}
+
+func wideFreshDateAtDB(db *gorm.DB, now time.Time) (string, error) {
 	if db == nil {
 		return "", errors.New("数据库不可用")
 	}
+	now = now.In(datasource.ChinaMarketLocation())
+	cutoff := now.Format(time.DateOnly)
+	if now.Hour()*60+now.Minute() < sessionCloseMin+5 {
+		cutoff = now.AddDate(0, 0, -1).Format(time.DateOnly)
+	}
 	var d sql.NullString
 	if err := db.Model(&model.MarketSyncState{}).
-		Where("market = ? AND last_bar_date <> ''", "cn").
+		Where("market = ? AND last_bar_date <> '' AND last_bar_date <= ?", "cn", cutoff).
 		Select("MAX(last_bar_date)").Scan(&d).Error; err != nil {
 		return "", err
 	}
@@ -921,7 +935,7 @@ func wideFreshDateDB(db *gorm.DB) (string, error) {
 		return d.String, nil
 	}
 	if err := db.Model(&model.DailyBar{}).
-		Where("market = ?", "cn").
+		Where("market = ? AND trade_date <= ?", "cn", cutoff).
 		Select("MAX(trade_date)").Scan(&d).Error; err != nil {
 		return "", err
 	}
@@ -934,10 +948,11 @@ func wideFreshDateDB(db *gorm.DB) (string, error) {
 // ---------- 缓存管理（全局单例） ----------
 
 var (
-	factorTableMu  sync.RWMutex // 保护 factorTableCur 指针
-	factorTableCur *FactorTable
-	factorBuildMu  sync.Mutex  // 构建互斥：懒加载调用方阻塞等待同一次构建
-	factorBuilding atomic.Bool // 状态展示 + 异步触发防抖
+	factorTableMu       sync.RWMutex // 保护 factorTableCur 指针
+	factorTableCur      *FactorTable
+	factorInputRevision uint64
+	factorBuildMu       sync.Mutex  // 构建互斥：懒加载调用方阻塞等待同一次构建
+	factorBuilding      atomic.Bool // 状态展示 + 异步触发防抖
 	// 异步触发先登记再等待构建锁；正在构建时的新请求合并成下一轮，不能直接丢弃。
 	factorAsyncMu      sync.Mutex
 	factorAsyncRunning bool
@@ -1016,9 +1031,9 @@ func ensureFactorTable(ctx context.Context) (*FactorTable, error) {
 	if err != nil {
 		return nil, err
 	}
-	factorTableMu.Lock()
-	factorTableCur = t
-	factorTableMu.Unlock()
+	if err := publishFactorTable(t); err != nil {
+		return nil, err
+	}
 	common.SysLog("因子宽表构建完成: %s，%d 只，%d 因子，耗时 %dms（DB 读 %dms）",
 		t.TradeDate, t.Len(), len(factorDefs), t.BuildMs, t.ScanMs)
 	return t, nil
@@ -1093,9 +1108,9 @@ func rebuildFactorTableLocked(ctx context.Context, reason string) (*FactorTable,
 	if err != nil {
 		return nil, err
 	}
-	factorTableMu.Lock()
-	factorTableCur = table
-	factorTableMu.Unlock()
+	if err := publishFactorTable(table); err != nil {
+		return nil, err
+	}
 	common.SysLog("因子宽表重建完成（%s）: %s，%d 只，耗时 %dms", reason, table.TradeDate, table.Len(), table.BuildMs)
 	if _, err := snapshotFactorTableDB(common.DB.WithContext(ctx), table); err != nil {
 		common.SysWarn("因子快照落库失败 %s: %v", table.TradeDate, err)

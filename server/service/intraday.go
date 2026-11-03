@@ -242,16 +242,27 @@ func (s *IntradayService) SyncIntradayFactors(ctx context.Context, dates []strin
 	if len(symbols) == 0 {
 		return 0, errors.New("宇宙字典为空（全市场日线尚未初始化）")
 	}
+	var suspensions []struct{ Symbol, TradeDate string }
+	if err := common.DB.WithContext(ctx).Model(&model.StockUniverseDaily{}).
+		Select("symbol", "trade_date").Where("market = ? AND trade_date IN ? AND suspended = ?", "cn", dates, true).
+		Find(&suspensions).Error; err != nil {
+		return 0, fmt.Errorf("读取分钟补采停牌事实失败: %w", err)
+	}
+	suspendedDates := make(map[string]bool, len(suspensions))
+	for _, suspension := range suspensions {
+		suspendedDates[suspension.Symbol+"@"+suspension.TradeDate] = true
+	}
 
 	count := min5CountForDays(len(dates))
 
 	var (
-		mu      sync.Mutex
-		rows    []model.IntradayFactorDaily
-		srcFail atomic.Int64 // 连续源类失败（ErrNoData/ErrSymbolInvalid 不算）
-		failed  atomic.Int64 // 总源故障数；单股失败同样不能推进成功游标。
-		aborted atomic.Bool
-		wg      sync.WaitGroup
+		mu         sync.Mutex
+		rows       []model.IntradayFactorDaily
+		srcFail    atomic.Int64 // 连续源类失败（ErrNoData/ErrSymbolInvalid 不算）
+		failed     atomic.Int64 // 总源故障数；单股失败同样不能推进成功游标。
+		incomplete atomic.Int64 // Nonempty responses can still lack a complete day.
+		aborted    atomic.Bool
+		wg         sync.WaitGroup
 	)
 	jobs := make(chan string)
 	worker := func() {
@@ -268,13 +279,13 @@ func (s *IntradayService) SyncIntradayFactors(ctx context.Context, dates []strin
 				srcFail.Store(0)
 				byDate := splitMin5ByDate(bars)
 				mu.Lock()
-				for d, dayBars := range byDate {
-					if !dateSet[d] {
-						continue
-					}
-					if f, ok := computeIntradayFactors(dayBars); ok {
-						f.Symbol, f.Market, f.TradeDate = sym, "cn", d
-						rows = append(rows, f)
+				for _, tradeDate := range dates {
+					dayBars := byDate[tradeDate]
+					if factors, complete := computeIntradayFactors(dayBars); complete {
+						factors.Symbol, factors.Market, factors.TradeDate = sym, "cn", tradeDate
+						rows = append(rows, factors)
+					} else if !suspendedDates[sym+"@"+tradeDate] {
+						incomplete.Add(1)
 					}
 				}
 				mu.Unlock()
@@ -337,8 +348,8 @@ func (s *IntradayService) SyncIntradayFactors(ctx context.Context, dates []strin
 	for _, row := range rows {
 		covered[row.TradeDate] = true
 	}
-	if failed.Load() > 0 || len(covered) < len(dates) {
-		return len(rows), fmt.Errorf("盘中因子部分完成：有效 %d 行，源故障 %d 只，无有效数据日期 %d 天", len(rows), failed.Load(), len(dates)-len(covered))
+	if failed.Load() > 0 || incomplete.Load() > 0 || len(covered) < len(dates) {
+		return len(rows), fmt.Errorf("盘中因子部分完成：有效 %d 行，源故障 %d 只，缺根/不完整 %d 个股票日，无有效数据日期 %d 天", len(rows), failed.Load(), incomplete.Load(), len(dates)-len(covered))
 	}
 	return len(rows), nil
 }

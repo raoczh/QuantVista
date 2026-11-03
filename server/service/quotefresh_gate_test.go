@@ -380,8 +380,11 @@ func TestTextLabeledValuesUnitInts(t *testing.T) {
 // （详情页与续问的时效声明都吃这个重判，不再只读快照创建时的 freshness_status）。
 func TestQaCurrentFreshness(t *testing.T) {
 	setupTestDB(t)
-	pinCalendarTo(t, prevOpenTradeDate(time.Now().Format("2006-01-02")))
-	svc := &QaService{market: NewMarketService(nil)}
+	now := time.Date(2026, 7, 9, 10, 0, 0, 0, datasource.ChinaMarketLocation())
+	pinCalendarTo(t, now.Format(time.DateOnly))
+	market := NewMarketService(nil)
+	market.quoteNow = func() time.Time { return now }
+	svc := &QaService{market: market}
 	meta := &qaSnapshotMeta{QuoteAsOf: "2026-07-08 15:00:00", FreshnessStatus: "fresh"}
 	st, note := svc.qaCurrentFreshness("cn", meta)
 	if st != freshStatusStale {

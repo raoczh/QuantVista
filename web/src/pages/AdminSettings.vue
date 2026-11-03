@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { RouterLink } from 'vue-router'
 import {
   NSpace,
   NForm,
@@ -55,11 +56,13 @@ import {
   type LLMRouteModuleOption,
 } from '@/api/admin'
 import { listLLMConfigs, type LLMConfig } from '@/api/llm'
+import { getJob, taskStatusLabel, type JobRun } from '@/api/taskCenter'
 import type { AuthUser } from '@/api/auth'
 import { useAuthStore } from '@/stores/auth'
 import { getSessionEpoch } from '@/api/token'
 import { useIsMobile } from '@/composables/useIsMobile'
 import { useUi, withAlpha } from '@/composables/useUi'
+import { useVisibleTaskPolling } from '@/composables/useVisibleTaskPolling'
 import PageContainer from '@/components/PageContainer.vue'
 import SectionCard from '@/components/SectionCard.vue'
 
@@ -530,15 +533,19 @@ async function saveQuota() {
 /* 数据源同步日志（批次 J：现有 sync-logs 端点接入后台页） */
 const logs = ref<SyncLog[]>([])
 const logsLoading = ref(false)
+const logsError = ref('')
 async function loadLogs() {
   if (!pageActive()) return
   const sequence = ++reads.logs
   logsLoading.value = true
   try {
     const rows = await listSyncLogs(50)
-    if (pageActive() && sequence === reads.logs) logs.value = rows
+    if (pageActive() && sequence === reads.logs) {
+      logs.value = rows
+      logsError.value = ''
+    }
   } catch (e) {
-    if (pageActive() && sequence === reads.logs) message.error((e as Error).message)
+    if (pageActive() && sequence === reads.logs) logsError.value = (e as Error).message
   } finally {
     if (sequence === reads.logs) logsLoading.value = false
   }
@@ -549,7 +556,7 @@ function logStatusType(s: string) {
 const taskLabel: Record<string, string> = {
   sync_daily_bars: '日线批量同步',
   backfill_calendar: '交易日历回填',
-  snapshot_market: '市场情绪快照',
+  snapshot_market: '涨跌家数快照',
   sync_market_wide: '全市场增量同步',
   init_market_history: '全市场历史初始化',
   init_market_history_trigger: '历史初始化触发',
@@ -563,6 +570,7 @@ function fmtLogTime(t: string) {
 /* P1 数据健康总览：各数据域 expected/observed 对账 + 补跑入口 */
 const health = ref<DataHealthReport | null>(null)
 const healthLoading = ref(false)
+const healthError = ref('')
 const healthWindowDays = ref(45)
 async function loadHealth() {
   if (!pageActive()) return
@@ -572,10 +580,9 @@ async function loadHealth() {
     const result = await getDataHealth(healthWindowDays.value)
     if (!pageActive() || sequence !== reads.health) return
     health.value = result
-    if (!maintenanceRange.from && health.value.window_start) maintenanceRange.from = health.value.window_start
-    if (!maintenanceRange.to && health.value.window_end) maintenanceRange.to = health.value.window_end
+    healthError.value = ''
   } catch (e) {
-    if (pageActive() && sequence === reads.health) message.error((e as Error).message)
+    if (pageActive() && sequence === reads.health) healthError.value = (e as Error).message
   } finally {
     if (sequence === reads.health) healthLoading.value = false
   }
@@ -626,6 +633,7 @@ function gapDayTitle(day: DataHealthDay) {
 /* P0-3A provider x capability x market 注册矩阵（支持面来自代码注册，不从滑窗反推） */
 const capabilities = ref<DataSourceCapability[]>([])
 const capabilityLoading = ref(false)
+const capabilityError = ref('')
 const capabilityProvider = ref<string | null>(null)
 const capabilityName = ref<string | null>(null)
 const capabilityObservation = ref<string | null>(null)
@@ -640,9 +648,12 @@ async function loadCapabilities() {
   capabilityLoading.value = true
   try {
     const result = await getDataSources()
-    if (pageActive() && sequence === reads.capabilities) capabilities.value = result.health
+    if (pageActive() && sequence === reads.capabilities) {
+      capabilities.value = result.health
+      capabilityError.value = ''
+    }
   } catch (e) {
-    if (pageActive() && sequence === reads.capabilities) message.error((e as Error).message)
+    if (pageActive() && sequence === reads.capabilities) capabilityError.value = (e as Error).message
   } finally {
     if (sequence === reads.capabilities) capabilityLoading.value = false
   }
@@ -764,8 +775,8 @@ async function callMaintenance(kind: MaintenanceKind, payload: MaintenanceReques
 
 async function previewMaintenance(kind: MaintenanceKind) {
   if (!pageActive() || rerunning.value || dryRunLoading.value || executingPlan.value) return
-  if (kind !== 'wide' && (!maintenanceRange.from || !maintenanceRange.to)) {
-    message.warning('请选择补采起止日期')
+  if (kind !== 'wide' && Boolean(maintenanceRange.from) !== Boolean(maintenanceRange.to)) {
+    message.warning('请同时选择补采起止日期，或全部留空使用默认范围')
     return
   }
   rerunning.value = kind
@@ -780,10 +791,6 @@ async function previewMaintenance(kind: MaintenanceKind) {
     if (!('plan' in result) || !result.plan) throw new Error('dry-run 未返回计划')
     maintenanceKind.value = kind
     maintenancePlan.value = result.plan
-    if (kind !== 'wide') {
-      maintenanceRange.from = result.plan.from
-      maintenanceRange.to = result.plan.to
-    }
     dryRunOpen.value = true
   } catch (e) {
     if (pageActive()) message.error((e as Error).message)
@@ -807,6 +814,7 @@ async function executeMaintenancePlan() {
     })
     if (!pageActive()) return
     if (!('started' in result)) throw new Error('执行请求未返回任务状态')
+    trackMaintenanceJob(result.job_run_id)
     message.success(
       result.started === false
         ? `已有同类任务运行中（#${result.job_run_id}）`
@@ -828,6 +836,7 @@ async function rerun(key: string, fn: () => Promise<SystemJobStartResponse>) {
   try {
     const result = await fn()
     if (!pageActive()) return
+    trackMaintenanceJob(result.job_run_id)
     message.success(
       result.started
         ? `已进入任务队列（#${result.job_run_id}）`
@@ -838,6 +847,41 @@ async function rerun(key: string, fn: () => Promise<SystemJobStartResponse>) {
   } finally {
     rerunning.value = ''
   }
+}
+
+const maintenanceJobID = ref<number | null>(null)
+const maintenanceJob = ref<JobRun | null>(null)
+const maintenanceJobError = ref('')
+const maintenanceJobPending = computed(() => maintenanceJobID.value !== null
+  && (!maintenanceJob.value || ['queued', 'running'].includes(maintenanceJob.value.status)))
+
+async function refreshMaintenanceJob() {
+  const requestedID = maintenanceJobID.value
+  if (!requestedID || !pageActive()) return
+  try {
+    const previousStatus = maintenanceJob.value?.status
+    const result = await getJob(requestedID)
+    if (!pageActive() || requestedID !== maintenanceJobID.value) return
+    maintenanceJob.value = result
+    maintenanceJobError.value = ''
+    if (!['queued', 'running'].includes(result.status) && result.status !== previousStatus) {
+      await Promise.all([loadLogs(), loadHealth(), loadCapabilities()])
+    }
+  } catch (error) {
+    if (pageActive() && requestedID === maintenanceJobID.value) maintenanceJobError.value = (error as Error).message
+  }
+}
+
+const maintenancePolling = useVisibleTaskPolling(refreshMaintenanceJob, () => maintenanceJobPending.value, {
+  enabled: () => pageActive() && maintenanceJobID.value !== null,
+  events: false,
+})
+
+function trackMaintenanceJob(jobID: number) {
+  maintenanceJob.value = null
+  maintenanceJobError.value = ''
+  maintenanceJobID.value = jobID
+  void maintenancePolling.refreshNow()
 }
 
 onMounted(() => {
@@ -1130,6 +1174,9 @@ onMounted(() => {
         <template #extra>
           <n-button size="tiny" quaternary :loading="capabilityLoading" @click="loadCapabilities">刷新</n-button>
         </template>
+        <n-alert v-if="capabilityError" type="error" :bordered="false" class="ops-notice">
+          能力状态读取失败：{{ capabilityError }}。这与某个外部数据源探测失败是两回事。
+        </n-alert>
         <div class="ops-filters">
           <n-select v-model:value="capabilityProvider" clearable placeholder="数据源" :options="capabilityProviderOptions" />
           <n-select v-model:value="capabilityName" clearable placeholder="能力" :options="capabilityNameOptions" />
@@ -1255,6 +1302,14 @@ onMounted(() => {
         <template #extra>
           <n-button size="tiny" quaternary :loading="healthLoading" @click="loadHealth">刷新</n-button>
         </template>
+        <n-alert v-if="healthError" type="error" :bordered="false" class="ops-notice">
+          数据健康报告读取失败：{{ healthError }}。{{ health ? '以下保留上次报告，不代表已刷新。' : '尚未取得本地覆盖情况，不应判断为所有数据源断网。' }}
+        </n-alert>
+        <p class="ops-footnote">
+          这里检查本地数据覆盖，外部连通性请看上方能力矩阵。首次恢复建议先回填日历，盘后再全市场同步、历史初始化；任务结束后再核对覆盖。
+          补采日期可全部留空：日历默认核对近 92 个自然日并包含今天，日线默认近 45 个已知交易日。历史初始化续跑并重试此前失败的标的。
+          涨跌家数快照仅采集当前涨跌家数，不是涨停池历史补采，也不会重建历史情绪数据。
+        </p>
         <div class="ops-filters health-filter-row">
           <n-select v-model:value="healthWindowDays" :options="[{ label: '30 个交易日', value: 30 }, { label: '45 个交易日', value: 45 }, { label: '60 个交易日', value: 60 }]" @update:value="loadHealth" />
           <n-select v-model:value="healthStatusFilter" clearable placeholder="健康状态" :options="healthStatusOptions" />
@@ -1273,7 +1328,7 @@ onMounted(() => {
             >日线补采</n-button
           >
           <n-button size="tiny" tertiary :loading="rerunning === 'snap'" @click="rerun('snap', triggerSnapshot)"
-            >情绪快照</n-button
+            >涨跌家数快照</n-button
           >
           <n-button
             size="tiny"
@@ -1290,6 +1345,18 @@ onMounted(() => {
             >回填日历</n-button
           >
         </div>
+        <n-alert
+          v-if="maintenanceJobID"
+          :type="maintenanceJobError || maintenanceJob?.status === 'failed' ? 'error' : maintenanceJob?.status === 'success' ? 'success' : maintenanceJobPending ? 'info' : 'warning'"
+          :bordered="false"
+          class="ops-notice"
+        >
+          维护任务 #{{ maintenanceJobID }}：{{ maintenanceJob ? taskStatusLabel(maintenanceJob.status) : '正在读取执行状态' }}。
+          <span v-if="maintenanceJobPending">已入队不等于补采成功，请等待最终结果。</span>
+          <span v-if="maintenanceJobError">{{ maintenanceJobError }}，请重试查询任务。</span>
+          <span v-else-if="maintenanceJob?.error">{{ maintenanceJob.error }}</span>
+          <RouterLink :to="{ name: 'tasks', query: { job_id: String(maintenanceJobID), include_system: '1' } }" :style="{ color: vars.primaryColor }">查看任务详情</RouterLink>
+        </n-alert>
         <n-empty v-if="!filteredHealthItems.length" description="暂无数据" size="small" style="padding: 20px 0" />
         <div v-else-if="!isMobile" class="health-table-wrap">
         <n-table class="ops-table health-table" :bordered="false" :single-line="false" size="small">
@@ -1378,6 +1445,7 @@ onMounted(() => {
         <template #extra>
           <n-button size="tiny" quaternary :loading="logsLoading" @click="loadLogs">刷新</n-button>
         </template>
+        <n-alert v-if="logsError" type="error" :bordered="false" class="ops-notice">同步日志读取失败：{{ logsError }}</n-alert>
         <n-empty v-if="!logs.length" description="暂无同步记录" size="small" style="padding: 20px 0" />
         <n-table v-else-if="!isMobile" class="ops-table" :bordered="false" :single-line="false" size="small">
           <thead>
@@ -1695,6 +1763,10 @@ onMounted(() => {
   font-size: 11px;
   line-height: 1.5;
   opacity: 0.55;
+}
+.ops-notice {
+  margin: 12px 0;
+  overflow-wrap: anywhere;
 }
 .plan-metrics {
   display: grid;

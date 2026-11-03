@@ -208,6 +208,9 @@ func TestTrackingSuspensionDoesNotExtendValidity(t *testing.T) {
 	setupTestDB(t)
 	seedTrackingReviewCalendar(t, "2026-09-01")
 	batch, rec := seedLinkFixture(t, 8898, "600000", model.RecTypeShortTerm, model.RecStatusSuccess)
+	if err := common.DB.Create(&model.StockUniverseDaily{Market: "cn", Symbol: rec.Symbol, TradeDate: "2026-09-02", Suspended: true}).Error; err != nil {
+		t.Fatal(err)
+	}
 	rec.DetailJSON = `{"valid_days":2,"take_profit":12,"stop_loss":9}`
 	bars := []datasource.Bar{bar("2026-09-03", 10, 10.3, 9.8, 10.2), bar("2026-09-04", 10.2, 12.5, 10, 12.2)}
 	svc := NewTrackingService(NewMarketService(datasource.NewManagerWithAdapters(&trackingReviewAdapter{bars: bars})))

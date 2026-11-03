@@ -39,7 +39,7 @@ var (
 )
 
 func repThrottle(ctx context.Context) error {
-	return waitSourceInterval(ctx, &repMu, &repLast, repMinInterval)
+	return waitSourceInterval(ctx, &repMu, &repLast, repMinInterval, nil)
 }
 
 const (
@@ -94,9 +94,6 @@ func (e *EastMoneyAdapter) GetStockReports(ctx context.Context, symbol string, d
 	var out []ReportRow
 	totalPages := 1
 	for page := 1; page <= totalPages && page <= repMaxPages; page++ {
-		if err := repThrottle(ctx); err != nil {
-			return nil, err
-		}
 		v := url.Values{}
 		v.Set("pageNo", strconv.Itoa(page))
 		v.Set("pageSize", strconv.Itoa(repPageSize))
@@ -104,10 +101,11 @@ func (e *EastMoneyAdapter) GetStockReports(ctx context.Context, symbol string, d
 		v.Set("qType", "0")
 		v.Set("beginTime", begin.Format("2006-01-02"))
 		v.Set("endTime", end.Format("2006-01-02"))
-		body, status, err := doGet(ctx, repBaseURL+"?"+v.Encode(),
-			map[string]string{"Referer": "https://data.eastmoney.com/report/stock.jshtml"})
+		body, status, err := doGetWithPolicy(ctx, repBaseURL+"?"+v.Encode(),
+			map[string]string{"Referer": "https://data.eastmoney.com/report/stock.jshtml"},
+			httpRequestPolicy{beforeAttempt: repThrottle, retryBackoff: httpRetryBackoff})
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
+			return nil, err
 		}
 		if status != 200 {
 			return nil, fmt.Errorf("%w: reportapi http %d", ErrUpstream, status)

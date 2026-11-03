@@ -31,7 +31,7 @@ import (
 
 const (
 	// positionAdvicePromptVersion 建议 prompt 版本（改措辞/枚举语义必须递增，审计按它归因）。
-	positionAdvicePromptVersion = "pa5"
+	positionAdvicePromptVersion = "pa6"
 	// positionAdviceJobTimeout 后台任务总预算。
 	positionAdviceJobTimeout = 5 * time.Minute
 	// positionAdviceMaxPositions 单次最多分析的持仓笔数（控上下文预算）。超出按
@@ -66,6 +66,7 @@ type PositionAdvice struct {
 	PositionType string  `json:"position_type"`
 	Cost         float64 `json:"cost"`
 	Quantity     float64 `json:"quantity"`
+	QuoteAsOf    string  `json:"quote_as_of,omitempty"` // 服务端输入行情的实际来源时点
 	// Verdict 封闭枚举 hold|trim|exit（服务端归一，非法值整条丢弃）。
 	Verdict string `json:"verdict"`
 	// Reason 结论理由（要求引用喂进去的具体数值）。
@@ -159,6 +160,7 @@ const positionAdviceSystemPrompt = `你是一名持仓风控顾问。用户已�
 5. invalidation 写「什么情况下这个结论不再成立」（具体价位 / 事件 / 时间窗口），不要写空泛的「市场变化时」。
 6. 这是研究参考，不构成投资建议；不要给出加仓建议——本任务只回答持有 / 减仓 / 清仓。
 7. data_gaps 明确列出本次未能读取的信号。缺口不表示没有风险，不得据此宣称不存在提醒或待复核事件。
+8. quote_as_of 是每笔持仓行情的实际来源时点，不是建议生成时间；价格与建议只能按该行情时点解读。
 
 只输出 JSON：{"advices":[{"position_id":123,"symbol":"...","verdict":"hold|trim|exit","reason":"...","invalidation":"..."}]}。
 position_id 与 symbol 必须逐字复制对应输入行；同一 symbol 可能有多笔不同成本的持仓，必须按 position_id 分别覆盖，
@@ -247,14 +249,15 @@ type positionAdviceRow struct {
 	PositionID int64   `json:"position_id"` // 逐持仓稳定身份，模型必须原样回传
 	Symbol     string  `json:"symbol"`
 	Name       string  `json:"name"`
-	Type       string  `json:"type"`       // short_term / long_term
-	Cost       float64 `json:"cost"`       // 我的加权成本（元/股）
-	Quantity   float64 `json:"quantity"`   // 持有股数
-	Price      float64 `json:"price"`      // 当前有效现价
-	PnlPct     float64 `json:"pnl_pct"`    // 浮动盈亏 %
-	PnlAmount  float64 `json:"pnl_amount"` // 浮动盈亏金额（元）
-	HeldDays   int     `json:"held_days"`  // 已持有交易日
-	WeightPct  float64 `json:"weight_pct"` // 占我全部已定价持仓市值的比例 %
+	Type       string  `json:"type"`        // short_term / long_term
+	Cost       float64 `json:"cost"`        // 我的加权成本（元/股）
+	Quantity   float64 `json:"quantity"`    // 持有股数
+	Price      float64 `json:"price"`       // 当前有效现价
+	QuoteAsOf  string  `json:"quote_as_of"` // 行情源时间，不以建议生成时间代替
+	PnlPct     float64 `json:"pnl_pct"`     // 浮动盈亏 %
+	PnlAmount  float64 `json:"pnl_amount"`  // 浮动盈亏金额（元）
+	HeldDays   int     `json:"held_days"`   // 已持有交易日
+	WeightPct  float64 `json:"weight_pct"`  // 占我全部已定价持仓市值的比例 %
 
 	BuyReason string `json:"buy_reason,omitempty"` // 我当初为什么买（原始录入）
 
@@ -339,7 +342,8 @@ func (s *PositionAdviceService) Advise(ctx context.Context, userID int64, allowP
 		row := positionAdviceRow{
 			Symbol: v.Symbol, Name: orSymbol(v.Name, v.Symbol), Type: v.PositionType,
 			Cost: round2(v.BuyPrice), Quantity: v.Quantity, Price: round2(v.CurrentPrice),
-			PnlPct: round2(v.ProfitPct), PnlAmount: round2(v.ProfitAmount),
+			QuoteAsOf: v.QuoteAsOf,
+			PnlPct:    round2(v.ProfitPct), PnlAmount: round2(v.ProfitAmount),
 			HeldDays: v.HeldTradeDays, BuyReason: truncateRunes(v.BuyReason, 200),
 			PositionID: v.ID,
 		}
@@ -497,6 +501,7 @@ func filterPositionAdvices(in []PositionAdvice, positions map[int64]positionAdvi
 		a.PositionType = p.Type
 		a.Cost = p.Cost
 		a.Quantity = p.Quantity
+		a.QuoteAsOf = p.QuoteAsOf
 		out = append(out, a)
 	}
 	return out

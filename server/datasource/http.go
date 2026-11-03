@@ -57,15 +57,18 @@ const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 // normalizes them to the canonical host; these are not independent sources.
 var emNodeCounter uint32
 
-// waitSourceInterval 为共享数据源逐次放行请求。等待期间释放锁，唤醒后必须重查
-// 最后放行时刻，否则并发等待者会在同一刻全部通过，形成超出限额的请求突发。
-func waitSourceInterval(ctx context.Context, mu *sync.Mutex, last *time.Time, interval time.Duration) error {
+// waitSourceInterval 为共享数据源逐次放行请求。限速与可选冷却共用同一把锁，
+// 唤醒后重新检查，避免并发等待者同时通过或绕过刚收到的 Retry-After。
+func waitSourceInterval(ctx context.Context, mu *sync.Mutex, last *time.Time, interval time.Duration, notBefore *time.Time) error {
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return observeLocalSourceWait(ctx, err)
 		}
 		mu.Lock()
 		wait := interval - time.Since(*last)
+		if notBefore != nil {
+			wait = max(wait, time.Until(*notBefore))
+		}
 		if wait <= 0 {
 			*last = time.Now()
 			mu.Unlock()
@@ -76,19 +79,66 @@ func waitSourceInterval(ctx context.Context, mu *sync.Mutex, last *time.Time, in
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return ctx.Err()
+			return observeLocalSourceWait(ctx, ctx.Err())
 		case <-timer.C:
 		}
 	}
+}
+
+// sourceRequestActivity 按一次能力调用跟踪真实尝试。它也能穿过旧适配器的
+// 文本错误包装，且不会把翻页/重试中已有 HTTP 尝试的失败误判为纯本地排队。
+type sourceRequestActivity struct {
+	started   atomic.Bool
+	mu        sync.Mutex
+	localWait error
+}
+
+type sourceRequestActivityKey struct{}
+
+func trackSourceRequests(ctx context.Context) (context.Context, *sourceRequestActivity) {
+	activity := &sourceRequestActivity{}
+	return context.WithValue(ctx, sourceRequestActivityKey{}, activity), activity
+}
+
+func (activity *sourceRequestActivity) localWaitFailure(err error) error {
+	if err == nil || activity.started.Load() {
+		return nil
+	}
+	activity.mu.Lock()
+	defer activity.mu.Unlock()
+	return activity.localWait
+}
+
+type localSourceWaitError struct{ cause error }
+
+func (failure *localSourceWaitError) Error() string {
+	return fmt.Sprintf("local source wait: %v", failure.cause)
+}
+
+func (failure *localSourceWaitError) Unwrap() error { return failure.cause }
+
+func observeLocalSourceWait(ctx context.Context, cause error) error {
+	activity, _ := ctx.Value(sourceRequestActivityKey{}).(*sourceRequestActivity)
+	if activity != nil && activity.started.Load() {
+		return cause
+	}
+	failure := &localSourceWaitError{cause: cause}
+	if activity != nil {
+		activity.mu.Lock()
+		activity.localWait = failure
+		activity.mu.Unlock()
+	}
+	return failure
 }
 
 func emNode() int {
 	return int(atomic.AddUint32(&emNodeCounter, 1)%99) + 1
 }
 
-// httpRequestPolicy 只扩展逐次放行和退避，不允许调用方再嵌套重试循环。
+// httpRequestPolicy 只扩展逐次放行、共享冷却和退避，不允许再嵌套重试循环。
 type httpRequestPolicy struct {
 	beforeAttempt func(context.Context) error
+	onRetryAfter  func(time.Time)
 	retryBackoff  time.Duration
 }
 
@@ -110,6 +160,10 @@ func doPostForm(ctx context.Context, rawURL string, values url.Values, headers m
 }
 
 func doHTTPRequest(ctx context.Context, method, rawURL, payload string, headers map[string]string, policy httpRequestPolicy) ([]byte, int, error) {
+	activity, _ := ctx.Value(sourceRequestActivityKey{}).(*sourceRequestActivity)
+	if activity == nil {
+		ctx, activity = trackSourceRequests(ctx)
+	}
 	ctx, cancel := context.WithTimeout(ctx, httpRequestBudget)
 	defer cancel()
 	var body []byte
@@ -141,6 +195,9 @@ func doHTTPRequest(ctx context.Context, method, rawURL, payload string, headers 
 		body, attemptStatus, lastErr = performHTTPAttempt(request, policy, &attempts)
 		if attemptStatus != 0 {
 			status = attemptStatus
+		}
+		if localWait := activity.localWaitFailure(lastErr); localWait != nil {
+			return nil, status, localWait
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, status, err
@@ -210,6 +267,9 @@ func performHTTPAttempt(request *http.Request, policy httpRequestPolicy, attempt
 			}
 		},
 	}))
+	if activity, ok := request.Context().Value(sourceRequestActivityKey{}).(*sourceRequestActivity); ok {
+		activity.started.Store(true)
+	}
 	response, err := httpClient.Do(request)
 	if err != nil {
 		if cause := context.Cause(attemptContext); cause != nil {
@@ -224,8 +284,13 @@ func performHTTPAttempt(request *http.Request, policy httpRequestPolicy, attempt
 		statusErr = &httpStatusError{statusCode: response.StatusCode}
 		if delay, ok := parseHTTPRetryAfter(response.Header.Get("Retry-After"), time.Now()); ok {
 			statusErr.retryAt = time.Now().Add(delay)
-			if limiter != nil && retryableHTTPStatus(response.StatusCode) {
-				limiter.deferUntil(statusErr.retryAt)
+			if retryableHTTPStatus(response.StatusCode) {
+				if limiter != nil {
+					limiter.deferUntil(statusErr.retryAt)
+				}
+				if policy.onRetryAfter != nil {
+					policy.onRetryAfter(statusErr.retryAt)
+				}
 			}
 		}
 	}
@@ -434,7 +499,7 @@ func (limiter *httpSourceLimiter) acquire(ctx context.Context) (func(), error) {
 	select {
 	case limiter.slots <- struct{}{}:
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, observeLocalSourceWait(ctx, ctx.Err())
 	}
 	release := func() { <-limiter.slots }
 	if err := limiter.wait(ctx); err != nil {
@@ -447,7 +512,7 @@ func (limiter *httpSourceLimiter) acquire(ctx context.Context) (func(), error) {
 func (limiter *httpSourceLimiter) wait(ctx context.Context) error {
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return observeLocalSourceWait(ctx, err)
 		}
 		limiter.mu.Lock()
 		delay := time.Until(limiter.nextAllowed)
@@ -458,7 +523,7 @@ func (limiter *httpSourceLimiter) wait(ctx context.Context) error {
 		}
 		limiter.mu.Unlock()
 		if err := waitHTTPDelay(ctx, delay); err != nil {
-			return err
+			return observeLocalSourceWait(ctx, err)
 		}
 	}
 }

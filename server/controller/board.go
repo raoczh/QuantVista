@@ -1,10 +1,12 @@
 package controller
 
 import (
+	"errors"
 	"strconv"
 	"strings"
 
 	"quantvista/common"
+	"quantvista/datasource"
 	"quantvista/service"
 
 	"github.com/gin-gonic/gin"
@@ -32,7 +34,8 @@ func (bc *BoardController) Heatmap(c *gin.Context) {
 	}
 	rows, err := bc.svc.Heatmap(c.Request.Context(), kind)
 	if err != nil {
-		common.ApiErrorMsg(c, "获取板块热度失败: "+err.Error())
+		common.SysWarn("板块热度读取失败 kind=%s: %v", kind, err)
+		common.ApiErrorMsg(c, "板块主备数据源暂不可用，请在系统管理中检查 board_industry / board_concept 能力后重试")
 		return
 	}
 	common.ApiSuccess(c, rows)
@@ -45,8 +48,8 @@ func (bc *BoardController) Detail(c *gin.Context) {
 		return
 	}
 	code := strings.TrimSpace(c.Param("code"))
-	if code == "" {
-		common.ApiErrorMsg(c, "板块代码不能为空")
+	if _, valid := datasource.BoardCodeSource(code); !valid {
+		common.ApiErrorMsg(c, "板块代码无效，请从热力图选择板块")
 		return
 	}
 	common.ApiSuccess(c, bc.svc.Detail(c.Request.Context(), code))
@@ -60,14 +63,19 @@ func (bc *BoardController) FundFlow(c *gin.Context) {
 		return
 	}
 	code := strings.TrimSpace(c.Param("code"))
-	if code == "" {
-		common.ApiErrorMsg(c, "板块代码不能为空")
+	if _, valid := datasource.BoardCodeSource(code); !valid {
+		common.ApiErrorMsg(c, "板块代码无效，请从热力图选择板块")
 		return
 	}
 	days, _ := strconv.Atoi(c.DefaultQuery("days", "90"))
 	view, err := bc.svc.FundFlow(c.Request.Context(), code, days)
 	if err != nil {
-		common.ApiErrorMsg(c, "获取板块资金流失败: "+err.Error())
+		if errors.Is(err, datasource.ErrNotSupported) {
+			common.ApiErrorMsg(c, "当前分类源不提供对应板块资金流，不能用其他分类的资金流代替")
+			return
+		}
+		common.SysWarn("板块资金流读取失败 code=%s: %v", code, err)
+		common.ApiErrorMsg(c, "板块资金流数据源暂不可用，请稍后重试")
 		return
 	}
 	common.ApiSuccess(c, view)

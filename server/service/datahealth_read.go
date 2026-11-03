@@ -13,11 +13,10 @@ import (
 
 // 同一报告只读同一事务；记住首个查询错误，不把读取失败转换成零覆盖。
 type dataHealthReader struct {
-	db              *gorm.DB
-	now             time.Time
-	err             error
-	tradeDates      []string
-	calendarMissing bool
+	db         *gorm.DB
+	now        time.Time
+	err        error
+	tradeDates []string
 }
 
 func (r *dataHealthReader) failed(err error) bool {
@@ -62,14 +61,17 @@ func (r *dataHealthReader) recentOpenDates(market, end string, days int) []strin
 	return dates
 }
 
-func (r *dataHealthReader) isTradingDayToday(now time.Time) bool {
+func (r *dataHealthReader) isTradingDayToday(now time.Time) (open, known bool) {
 	var row model.TradingCalendar
 	err := r.db.Where("market = ? AND trade_date = ?", "cn", now.Format("2006-01-02")).Take(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		r.calendarMissing = true
-		return false
+		weekend := now.Weekday() == time.Saturday || now.Weekday() == time.Sunday
+		return false, weekend
 	}
-	return !r.failed(err) && row.IsOpen
+	if r.failed(err) {
+		return false, false
+	}
+	return row.IsOpen, true
 }
 
 func (r *dataHealthReader) prevOpenTradeDate(before string) string {
@@ -80,21 +82,41 @@ func (r *dataHealthReader) prevOpenTradeDate(before string) string {
 		return ""
 	}
 	if len(dates) > 0 {
+		previous, previousErr := time.ParseInLocation(time.DateOnly, dates[0], time.Local)
+		boundary, boundaryErr := time.ParseInLocation(time.DateOnly, before, time.Local)
+		if previousErr != nil || boundaryErr != nil {
+			return ""
+		}
+		known, err := knownCalendarRange(r.db, "cn", previous.AddDate(0, 0, 1), boundary.AddDate(0, 0, -1))
+		if r.failed(err) || !known {
+			return ""
+		}
 		return dates[0]
 	}
-	r.calendarMissing = true
-	return prevOpenTradeDateDB(nil, before) // 仅估计缺口窗口；新鲜度保持 unknown。
+	return ""
 }
 
 func (r *dataHealthReader) wideExpectedDate(now time.Time) string {
-	if r.isTradingDayToday(now) && now.Hour()*60+now.Minute() >= 16*60+30 {
-		return now.Format("2006-01-02")
+	return r.expectedDateAfter(now, 16*60+30)
+}
+
+// 今日开休市尚未确认，不影响只要求上一完整交易日的历史数据域。
+// 真正需要今日数据时才返回未知，不能把缺行猜成休市或污染其他域。
+func (r *dataHealthReader) expectedDateAfter(now time.Time, readyMinute int) string {
+	if now.Hour()*60+now.Minute() >= readyMinute {
+		open, known := r.isTradingDayToday(now)
+		if !known {
+			return ""
+		}
+		if open {
+			return now.Format("2006-01-02")
+		}
 	}
 	return r.prevOpenTradeDate(now.Format("2006-01-02"))
 }
 
 func (r *dataHealthReader) openDaysBehind(observed, expected string) int {
-	if observed == "" || expected == "" || r.calendarMissing {
+	if observed == "" || expected == "" {
 		return -1
 	}
 	if observed >= expected {

@@ -3,6 +3,7 @@ package datasource
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -216,7 +217,29 @@ func validateEMFetch(body []byte, status int, err error) error {
 	if len(payload) == 0 || payload[0] != '{' {
 		return fmt.Errorf("%w: invalid eastmoney response", ErrUpstream)
 	}
+	if emNullData(body) {
+		return ErrNoData
+	}
 	return nil
+}
+
+// 只识别 push 接口显式 rc=0/data=null，不把其他接口的合法空对象或无 data
+// 响应一概判空。空数据可以交给能力解析器，但不能成为断路器恢复的证据。
+func emNullData(body []byte) bool {
+	var envelope struct {
+		RC   json.RawMessage `json:"rc"`
+		Data json.RawMessage `json:"data"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return false
+	}
+	code, present := responseInteger(envelope.RC)
+	return present && code == 0 && bytes.Equal(bytes.TrimSpace(envelope.Data), []byte("null"))
+}
+
+func emPassNoDataToParser(body []byte, status int, err error, family string) bool {
+	return status == http.StatusOK && errors.Is(err, ErrNoData) && len(body) > 0 &&
+		(family == "push2ex" || emNullData(body))
 }
 
 // get 东财 push2 族请求统一入口：降级改写 + 备用域重试 + 熔断快速失败。
@@ -276,8 +299,8 @@ func (adapter *EastMoneyAdapter) get(ctx context.Context, rawURL string, headers
 		return body, status, nil
 	}
 	outcome = emRequestRejected
-	if errors.Is(err, ErrNoData) && family == "push2ex" && len(body) > 0 {
-		// 旧池解析器自行区分首页空池与尾页结束；继续交给它解析，但绝不记恢复成功。
+	if emPassNoDataToParser(body, status, err, family) {
+		// 保留旧解析器的 ErrNoData/尾页语义，避免旧错误包装将空数据改成 ErrUpstream。
 		return body, status, nil
 	}
 	if !emRateLimited(ctx, err, status) {
@@ -302,6 +325,8 @@ func (adapter *EastMoneyAdapter) get(ctx context.Context, rawURL string, headers
 		err = validateEMFetch(body, status, err)
 		if err == nil {
 			outcome = emBackupSucceeded
+		} else if emPassNoDataToParser(body, status, err, family) {
+			return body, status, nil // 主域已失败，空备用响应不得清除其失败状态。
 		}
 	}
 	return body, status, err

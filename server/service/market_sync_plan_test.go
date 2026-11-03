@@ -33,6 +33,8 @@ func (p *planAdapter) GetDailyBars(_ context.Context, _, symbol string, _ int) (
 
 func setupPlanDB(t *testing.T) {
 	t.Helper()
+	waitForTestFactorRebuilds(t)
+	t.Cleanup(func() { waitForTestFactorRebuilds(t) })
 	dsn := "file:" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()) + "?mode=memory&cache=shared"
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	if err != nil {
@@ -158,18 +160,19 @@ func TestMaintenanceRangeHardLimitsAndCalendarPlan(t *testing.T) {
 
 func TestWidePlanIgnoresRowsOutsideCurrentUniverse(t *testing.T) {
 	setupPlanDB(t)
-	seedHealthCalendar(t, time.Now(), 3)
-	expected := wideExpectedDate(time.Now())
+	now := time.Date(2026, 9, 4, 16, 10, 0, 0, datasource.ChinaMarketLocation())
+	seedHealthCalendar(t, now, 3)
+	expected := now.Format(time.DateOnly)
 	if err := common.DB.Create(&model.MarketSyncState{Symbol: "600001", Market: "cn", Name: "计划内"}).Error; err != nil {
 		t.Fatal(err)
 	}
 	common.DB.Create(&model.DailyBar{Symbol: "600099", Market: "cn", TradeDate: expected, Close: 9})
 	common.DB.Create(&model.StockUniverseDaily{Symbol: "600099", Market: "cn", TradeDate: expected, Suspended: true})
-	svc := NewMarketService(datasource.NewManagerWithAdapters(&planAdapter{}))
-	plan, err := svc.PlanMaintenance(MaintenanceWideSync, MaintenanceRequest{Market: "cn", DryRun: true})
+	prepared, err := buildWidePlanAtDB(common.DB, MaintenanceRequest{Market: "cn", DryRun: true}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
+	plan := prepared.view
 	if plan.TargetCount != 1 || plan.ExpectedCount != 1 || plan.ExistingCount != 0 || plan.SuspendedCount != 0 || plan.MissingCount != 1 {
 		t.Fatalf("宇宙外残留行不得污染计划数量: %+v", plan)
 	}

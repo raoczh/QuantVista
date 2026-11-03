@@ -43,8 +43,9 @@ const (
 )
 
 var (
-	orgSyncMu  sync.Mutex
-	orgSyncTry = map[string]time.Time{} // "rep:600519" / "svy:600519" → 上次尝试时刻
+	orgSyncMu     sync.Mutex
+	orgSyncTry    = map[string]time.Time{} // "rep:600519" / "svy:600519" → 上次尝试时刻
+	orgSyncErrors = map[string]error{}
 )
 
 func orgTryAllowed(key string) bool {
@@ -54,11 +55,28 @@ func orgTryAllowed(key string) bool {
 		return false
 	}
 	orgSyncTry[key] = time.Now()
+	orgSyncErrors[key] = errors.New("机构数据刷新尚未完成，冷却期内不能确认已更新")
 	return true
 }
 
-// ensureReportRatings 研报评级按需同步（best-effort：失败静默，消费方用缓存里有的）。
+func orgLastRefreshError(key string) error {
+	orgSyncMu.Lock()
+	defer orgSyncMu.Unlock()
+	return orgSyncErrors[key]
+}
+
+func recordOrgRefreshError(key string, err error) {
+	orgSyncMu.Lock()
+	defer orgSyncMu.Unlock()
+	orgSyncErrors[key] = err
+}
+
+// ensureReportRatings 研报评级按需同步；失败和冷却期间均保留刷新错误。
 func ensureReportRatings(ctx context.Context, symbol string) error {
+	return NewOrgViewService().refreshReports(ctx, symbol)
+}
+
+func (s *OrgViewService) refreshReports(ctx context.Context, symbol string) (resultErr error) {
 	ctx = jobSubmissionContext(ctx)
 	if err := ctx.Err(); err != nil {
 		return err
@@ -70,13 +88,22 @@ func ensureReportRatings(ctx context.Context, symbol string) error {
 	if err != nil {
 		return err
 	}
-	if fresh || !orgTryAllowed("rep:"+symbol) {
+	if fresh {
 		return nil
 	}
-	rows, err := fetchOrgReports(ctx, symbol, orgFetchDays)
+	key := "rep:" + symbol
+	if !orgTryAllowed(key) {
+		return orgLastRefreshError(key)
+	}
+	defer func() { recordOrgRefreshError(key, resultErr) }()
+	fetch := s.fetchReports
+	if fetch == nil {
+		fetch = fetchOrgReports
+	}
+	rows, err := fetch(ctx, symbol, orgFetchDays)
 	if err != nil {
 		common.SysDebug("研报评级拉取失败 %s: %v", symbol, err)
-		return ctx.Err()
+		return err
 	}
 	today := time.Now().Format("2006-01-02")
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].PublishDate > rows[j].PublishDate })
@@ -112,6 +139,10 @@ func ensureReportRatings(ctx context.Context, symbol string) error {
 
 // ensureOrgSurveys 机构调研按需同步：上游一机构一行明细，落库前按调研日聚合。
 func ensureOrgSurveys(ctx context.Context, symbol string) error {
+	return NewOrgViewService().refreshSurveys(ctx, symbol)
+}
+
+func (s *OrgViewService) refreshSurveys(ctx context.Context, symbol string) (resultErr error) {
 	ctx = jobSubmissionContext(ctx)
 	if err := ctx.Err(); err != nil {
 		return err
@@ -123,13 +154,22 @@ func ensureOrgSurveys(ctx context.Context, symbol string) error {
 	if err != nil {
 		return err
 	}
-	if fresh || !orgTryAllowed("svy:"+symbol) {
+	if fresh {
 		return nil
 	}
-	rows, err := fetchOrgSurveys(ctx, symbol, orgFetchDays)
+	key := "svy:" + symbol
+	if !orgTryAllowed(key) {
+		return orgLastRefreshError(key)
+	}
+	defer func() { recordOrgRefreshError(key, resultErr) }()
+	fetch := s.fetchSurveys
+	if fetch == nil {
+		fetch = fetchOrgSurveys
+	}
+	rows, err := fetch(ctx, symbol, orgFetchDays)
 	if err != nil {
 		common.SysDebug("机构调研拉取失败 %s: %v", symbol, err)
-		return ctx.Err()
+		return err
 	}
 	today := time.Now().Format("2006-01-02")
 	visible := make([]datasource.SurveyRow, 0, len(rows))
@@ -387,12 +427,16 @@ func computeOrgView(reports []model.ReportRating, surveys []model.OrgSurvey, pri
 }
 
 // orgViewBrief 个股 AI 快照的机构观点段（分析/问答共用）。缓存缺失时按需拉取
-// （研报 1~2 请求 + 调研 1 请求，interactive 路径可承受）。无数据返回 nil。
+// （研报 1~2 请求 + 调研 1 请求，interactive 路径可承受）。刷新失败保留缺口声明。
 func orgViewBrief(ctx context.Context, symbol string, price float64) map[string]any {
+	return NewOrgViewService().brief(ctx, symbol, price)
+}
+
+func (s *OrgViewService) brief(ctx context.Context, symbol string, price float64) map[string]any {
 	if common.DB == nil || !isSixDigits(symbol) || isCNFund(symbol) {
 		return nil
 	}
-	view, err := NewOrgViewService().OverviewContext(ctx, "cn", symbol, price)
+	view, err := s.OverviewContext(ctx, "cn", symbol, price)
 	if err != nil {
 		common.SysWarn("机构观点摘要读取失败 symbol=%s: %v", symbol, err)
 		return nil
@@ -438,7 +482,10 @@ func loadOrgRowsAt(ctx context.Context, symbol string, repLimit, svyLimit int, a
 }
 
 // OrgViewService 详情页机构观点块的薄服务壳。
-type OrgViewService struct{}
+type OrgViewService struct {
+	fetchReports func(context.Context, string, int) ([]datasource.ReportRow, error)
+	fetchSurveys func(context.Context, string, int) ([]datasource.SurveyRow, error)
+}
 
 func NewOrgViewService() *OrgViewService { return &OrgViewService{} }
 
@@ -465,10 +512,18 @@ func (s *OrgViewService) OverviewContext(ctx context.Context, market, symbol str
 	if common.DB == nil {
 		return empty, errors.New("数据库不可用")
 	}
-	if err := ensureReportRatings(ctx, symbol); err != nil {
+	refreshErrors := map[string]string{}
+	refreshStatus := map[string]string{"reports": "cache_or_refreshed", "surveys": "cache_or_refreshed"}
+	if err := s.refreshReports(ctx, symbol); err != nil {
+		refreshErrors["reports"], refreshStatus["reports"] = "研报数据刷新未完成", "failed"
+	}
+	if err := ctx.Err(); err != nil {
 		return empty, err
 	}
-	if err := ensureOrgSurveys(ctx, symbol); err != nil {
+	if err := s.refreshSurveys(ctx, symbol); err != nil {
+		refreshErrors["surveys"], refreshStatus["surveys"] = "机构调研刷新未完成", "failed"
+	}
+	if err := ctx.Err(); err != nil {
 		return empty, err
 	}
 	// summary 基于全量窗口（180 天分布不能被明细截断），列表另行截前 30/20。
@@ -478,6 +533,28 @@ func (s *OrgViewService) OverviewContext(ctx context.Context, market, symbol str
 		return empty, err
 	}
 	summary := computeOrgView(reports, surveys, price, asOf)
+	refreshNote := "基于已获取的历史披露样本及缓存，不保证完整覆盖；披露日期不是本次刷新时间"
+	if len(refreshErrors) > 0 {
+		refreshNote = "本次机构数据刷新未全部成功，失败分项仅代表历史库存，无法确认是否有新研报或调研；不得据此声称近期没有机构观点或风险变化"
+		if summary == nil {
+			summary = map[string]any{}
+		}
+	}
+	if summary != nil {
+		summary["source"] = "eastmoney"
+		summary["refresh_status"] = refreshStatus
+		summary["refresh_failed"] = len(refreshErrors) > 0
+		summary["refresh_note"] = refreshNote
+		if len(refreshErrors) > 0 {
+			summary["refresh_errors"] = refreshErrors
+		}
+		if len(reports) > 0 {
+			summary["reports_as_of"] = reports[0].ReportDate
+		}
+		if len(surveys) > 0 {
+			summary["surveys_as_of"] = surveys[0].SurveyDate
+		}
+	}
 	if len(reports) > 30 {
 		reports = reports[:30]
 	}
@@ -491,8 +568,12 @@ func (s *OrgViewService) OverviewContext(ctx context.Context, market, symbol str
 		surveys = []model.OrgSurvey{}
 	}
 	return map[string]any{
-		"summary": summary,
-		"reports": reports,
-		"surveys": surveys,
+		"summary":        summary,
+		"reports":        reports,
+		"surveys":        surveys,
+		"refresh_status": refreshStatus,
+		"refresh_failed": len(refreshErrors) > 0,
+		"refresh_errors": refreshErrors,
+		"refresh_note":   refreshNote,
 	}, nil
 }

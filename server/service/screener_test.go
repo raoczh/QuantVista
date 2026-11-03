@@ -480,7 +480,11 @@ func TestEnsureFactorTableFreshness(t *testing.T) {
 		t.Fatal("新鲜表应直接复用缓存")
 	}
 	// 推进一日（模拟次日增量）：新 bar + states last_bar_date 前进 → 重建。
-	next := "2026-12-31"
+	lastDay, err := time.Parse(time.DateOnly, lastDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := lastDay.AddDate(0, 0, 1).Format(time.DateOnly)
 	common.DB.Create(&model.DailyBar{Symbol: "600100", Market: "cn", TradeDate: next,
 		Open: 12, High: 12.5, Low: 11.9, Close: 12.2, Volume: 30000, Amount: 3.6e7, Source: "eastmoney"})
 	common.DB.Model(&model.MarketSyncState{}).Where("symbol = ?", "600100").

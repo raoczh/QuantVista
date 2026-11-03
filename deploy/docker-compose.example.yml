@@ -26,7 +26,12 @@ services:
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET}
-      TUSHARE_TOKEN: ${TUSHARE_TOKEN}
+      # 历史预留；当前未实现 Tushare 适配器，填写不会启用备用源。
+      TUSHARE_TOKEN: ${TUSHARE_TOKEN:-}
+      # 可选出网代理，留空保持直连；容器访问宿主机代理请用 host.docker.internal。
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,::1,host.docker.internal,quantvista,quantvista-redis,quantvista-ntfy}
       DEFAULT_MARKET: ${DEFAULT_MARKET:-cn}
       TZ: ${TZ:-Asia/Shanghai}
     extra_hosts:

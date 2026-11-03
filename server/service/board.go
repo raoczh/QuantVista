@@ -11,28 +11,11 @@ import (
 )
 
 // BoardService 板块业务：行业/概念热力图 + 板块详情（指数日线 + 成分股）。
-// 板块 clist 三方法只在 EastMoneyAdapter 上（非 Manager 能力路由），持自有实例——
-// 同 MarketService.wide 模式，长任务/在线路径互不影响限流状态。单测可注入假实现。
+// 与市场概览、管理端探测共用能力路由；分类代码保留所属来源，不按名称混接。
 type BoardService struct {
-	src boardSource
-	mu  sync.Mutex
-	// heatCache 按 kind 缓存热力图 60s（板块热度低频变化，热力图会被频繁刷新/切换）。
-	heatCache map[string]boardHeatEntry
-	// flowCache 按板块代码缓存资金流历史（P3b：纯透传不落库，上游自带历史；
-	// 短缓存挡住详情页反复进出——push2his 无备用域，能省一次是一次）。
-	flowCache map[string]boardFlowEntry
-	// fetchMu 缓存未命中时串行化取数（简版 singleflight），防并发首访重复打上游。
-	fetchMu sync.Mutex
-}
-
-type boardHeatEntry struct {
-	rows []datasource.BoardHeat
-	exp  time.Time
-}
-
-type boardFlowEntry struct {
-	bars []datasource.StockFundFlowBar
-	exp  time.Time
+	src       boardSource
+	cacheOnce sync.Once
+	cache     *marketResponseCache
 }
 
 // boardSource 板块链路依赖的数据源能力子集（东财实现；单测注入假实现）。
@@ -43,8 +26,13 @@ type boardSource interface {
 	GetBoardFundFlow(ctx context.Context, code string, limit int) ([]datasource.StockFundFlowBar, error)
 }
 
-func NewBoardService() *BoardService {
-	return &BoardService{src: datasource.NewEastMoneyAdapter(), heatCache: map[string]boardHeatEntry{}, flowCache: map[string]boardFlowEntry{}}
+func NewBoardService(manager *datasource.Manager) *BoardService {
+	return &BoardService{src: manager}
+}
+
+func (s *BoardService) responseCache() *marketResponseCache {
+	s.cacheOnce.Do(func() { s.cache = newMarketResponseCache() })
+	return s.cache
 }
 
 const (
@@ -54,34 +42,12 @@ const (
 )
 
 // Heatmap 取板块热力图（kind=industry/concept），60s 进程内缓存 per kind。
-// 缓存未命中时经 fetchMu 串行化：并发首访/缓存刚过期时只有一个请求真正打上游，
-// 其余排队后二次查缓存直接命中，防瞬时重复请求触发东财限流。
+// 按键合并请求并支持取消；某个板块资金流超时不会阻塞整个热力图。
 func (s *BoardService) Heatmap(ctx context.Context, kind string) ([]datasource.BoardHeat, error) {
-	if rows, ok := s.cachedHeat(kind); ok {
-		return rows, nil
-	}
-	s.fetchMu.Lock()
-	defer s.fetchMu.Unlock()
-	if rows, ok := s.cachedHeat(kind); ok { // 双检：排队期间可能已被首个请求填好
-		return rows, nil
-	}
-	rows, err := s.src.GetBoardHeat(ctx, kind)
-	if err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	s.heatCache[kind] = boardHeatEntry{rows: rows, exp: time.Now().Add(boardHeatCacheTTL)}
-	s.mu.Unlock()
-	return rows, nil
-}
-
-func (s *BoardService) cachedHeat(kind string) ([]datasource.BoardHeat, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if e, ok := s.heatCache[kind]; ok && time.Now().Before(e.exp) {
-		return e.rows, true
-	}
-	return nil, false
+	return marketCachedJSON(ctx, s.responseCache(), "board:heat:"+kind, boardHeatCacheTTL,
+		func(fetchContext context.Context) ([]datasource.BoardHeat, error) {
+			return s.src.GetBoardHeat(fetchContext, kind)
+		})
 }
 
 // BoardDetail 板块详情：指数日线 + 成分股 + 估值（各自可缺，errors 记录哪块失败）。
@@ -90,15 +56,18 @@ type BoardDetail struct {
 	Bars   []datasource.Bar        `json:"bars"`   // 板块指数日线（120 根）
 	Stocks []datasource.BoardStock `json:"stocks"` // 成分股（成交额降序 50 只）
 	// Valuation 板块估值（P3b 聚合表最新行；概念板块无 f100 覆盖自然缺席，前端 v-if 不渲染）。
-	Valuation *BoardValuationView `json:"valuation,omitempty"`
-	Errors    map[string]string   `json:"errors"` // 哪些块取数失败
-	DataTime  time.Time           `json:"data_time"`
+	Valuation  *BoardValuationView `json:"valuation,omitempty"`
+	Errors     map[string]string   `json:"errors"` // 哪些块取数失败
+	DataTime   time.Time           `json:"data_time"`
+	CapturedAt time.Time           `json:"captured_at"`
+	Source     string              `json:"source,omitempty"`
 }
 
 // Detail 并行拉板块指数日线 + 成分股 + 查库估值，单块失败降级（同 GetOverview 的 WaitGroup+setErr 模式）。
 // 成分股里成交额第一名标 is_leader、涨幅第一名标 is_top_gainer。
 func (s *BoardService) Detail(ctx context.Context, code string) *BoardDetail {
-	d := &BoardDetail{Code: code, Errors: map[string]string{}, DataTime: time.Now()}
+	source, _ := datasource.BoardCodeSource(code)
+	d := &BoardDetail{Code: code, Errors: map[string]string{}, CapturedAt: time.Now(), Source: source}
 	var mu sync.Mutex
 	setErr := func(k string, err error) {
 		mu.Lock()
@@ -110,15 +79,26 @@ func (s *BoardService) Detail(ctx context.Context, code string) *BoardDetail {
 	wg.Add(3)
 	go func() {
 		defer wg.Done()
-		if bars, err := s.src.GetBoardKline(ctx, code, 120); err == nil {
+		bars, err := marketCachedJSON(ctx, s.responseCache(), "board:bars:"+code, dailyBarsCacheTTL,
+			func(fetchContext context.Context) ([]datasource.Bar, error) {
+				return s.src.GetBoardKline(fetchContext, code, 120)
+			})
+		if err == nil {
 			d.Bars = bars
 		} else {
+			if errors.Is(err, datasource.ErrNotSupported) {
+				err = errors.New("当前分类源不提供对应板块指数日线，不能用其他分类的指数代替")
+			}
 			setErr("bars", err)
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		if stocks, err := s.src.GetBoardConstituents(ctx, code, 50); err == nil {
+		stocks, err := marketCachedJSON(ctx, s.responseCache(), "board:stocks:"+code, boardHeatCacheTTL,
+			func(fetchContext context.Context) ([]datasource.BoardStock, error) {
+				return s.src.GetBoardConstituents(fetchContext, code, 50)
+			})
+		if err == nil {
 			markBoardStocks(stocks)
 			d.Stocks = stocks
 		} else {
@@ -128,7 +108,7 @@ func (s *BoardService) Detail(ctx context.Context, code string) *BoardDetail {
 	go func() {
 		defer wg.Done()
 		// 查库不打上游：无数据（概念板块/聚合未跑过）不算错误，Valuation 缺席即可。
-		if common.DB == nil {
+		if common.DB == nil || source == "sina" {
 			return
 		}
 		view, _, err := loadBoardValuation(ctx, "", code)
@@ -140,6 +120,11 @@ func (s *BoardService) Detail(ctx context.Context, code string) *BoardDetail {
 		d.Valuation = view
 	}()
 	wg.Wait()
+	for _, stock := range d.Stocks {
+		if stock.DataTime.After(d.DataTime) {
+			d.DataTime = stock.DataTime
+		}
+	}
 	return d
 }
 
@@ -179,27 +164,17 @@ type BoardFundFlowView struct {
 }
 
 // FundFlow 板块资金流历史（纯透传：上游 fflow/daykline 自带全历史，不落库；
-// per-code 短缓存 + fetchMu 串行化，同 Heatmap 模式）。days 控制返回序列长度。
+// 按 code 短缓存与请求合并，同 Heatmap 模式）。days 控制返回序列长度。
 func (s *BoardService) FundFlow(ctx context.Context, code string, days int) (*BoardFundFlowView, error) {
 	if days <= 0 || days > boardFlowBarLimit {
 		days = 90
 	}
-	bars, ok := s.cachedFlow(code)
-	if !ok {
-		s.fetchMu.Lock()
-		bars, ok = s.cachedFlow(code) // 双检：排队期间可能已被首个请求填好
-		if !ok {
-			var err error
-			bars, err = s.src.GetBoardFundFlow(ctx, code, boardFlowBarLimit)
-			if err != nil {
-				s.fetchMu.Unlock()
-				return nil, err
-			}
-			s.mu.Lock()
-			s.flowCache[code] = boardFlowEntry{bars: bars, exp: time.Now().Add(boardFlowCacheTTL)}
-			s.mu.Unlock()
-		}
-		s.fetchMu.Unlock()
+	bars, err := marketCachedJSON(ctx, s.responseCache(), "board:flow:"+code, boardFlowCacheTTL,
+		func(fetchContext context.Context) ([]datasource.StockFundFlowBar, error) {
+			return s.src.GetBoardFundFlow(fetchContext, code, boardFlowBarLimit)
+		})
+	if err != nil {
+		return nil, err
 	}
 	view := &BoardFundFlowView{Code: code, Days: []StockFundFlowDay{}}
 	if len(bars) == 0 {
@@ -222,15 +197,6 @@ func (s *BoardService) FundFlow(ctx context.Context, code string, days int) (*Bo
 		})
 	}
 	return view, nil
-}
-
-func (s *BoardService) cachedFlow(code string) ([]datasource.StockFundFlowBar, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if e, ok := s.flowCache[code]; ok && time.Now().Before(e.exp) {
-		return e.bars, true
-	}
-	return nil, false
 }
 
 // ---------- 板块版汇总纯函数（单测锚点） ----------

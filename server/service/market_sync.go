@@ -238,15 +238,23 @@ func maintenanceOpenDatesDB(db *gorm.DB, req MaintenanceRequest) (string, []stri
 			return "", nil, "", "", errors.New("本地交易日历无开市日，先执行交易日历回填")
 		}
 		from, to = dates[0], dates[len(dates)-1]
-		return market, dates, from, to, nil
+	} else {
+		if err := db.Model(&model.TradingCalendar{}).
+			Where("market = ? AND is_open = ? AND trade_date >= ? AND trade_date <= ?", market, true, from, to).
+			Order("trade_date").Limit(maintenanceMaxOpenDays+1).Pluck("trade_date", &dates).Error; err != nil {
+			return "", nil, "", "", err
+		}
 	}
-	if _, _, err := validateMaintenanceRange(from, to, maintenanceMaxNaturalDays); err != nil {
+	first, last, err := validateMaintenanceRange(from, to, maintenanceMaxNaturalDays)
+	if err != nil {
 		return "", nil, "", "", err
 	}
-	if err := db.Model(&model.TradingCalendar{}).
-		Where("market = ? AND is_open = ? AND trade_date >= ? AND trade_date <= ?", market, true, from, to).
-		Order("trade_date").Limit(maintenanceMaxOpenDays+1).Pluck("trade_date", &dates).Error; err != nil {
+	known, err := knownCalendarRange(db, market, first, last)
+	if err != nil {
 		return "", nil, "", "", err
+	}
+	if !known {
+		return "", nil, "", "", errors.New("补采范围内有尚未确认开休市的工作日，请先回填同一范围的交易日历")
 	}
 	if len(dates) > maintenanceMaxOpenDays {
 		return "", nil, "", "", fmt.Errorf("范围最多 %d 个交易日", maintenanceMaxOpenDays)
@@ -260,7 +268,12 @@ func buildSyncBarsPlanDB(db *gorm.DB, req MaintenanceRequest) (*preparedMaintena
 		return nil, err
 	}
 	var stocks []model.Stock
-	if err := db.Select("id", "symbol", "market").Where("market = ?", market).
+	// 先筛出仍有缺口的股票，再施加 800 只上限；完整的前缀不能让尾部永远轮不到。
+	missingDate := db.Table("trading_calendars AS calendar").Select("1").
+		Where("calendar.market = stocks.market AND calendar.is_open = ? AND calendar.trade_date IN ?", true, dates).
+		Where("NOT EXISTS (SELECT 1 FROM daily_bars AS bars WHERE bars.market = stocks.market AND bars.symbol = stocks.symbol AND bars.trade_date = calendar.trade_date)").
+		Where("NOT EXISTS (SELECT 1 FROM stock_universe_dailies AS universe WHERE universe.market = stocks.market AND universe.symbol = stocks.symbol AND universe.trade_date = calendar.trade_date AND universe.suspended = ?)", true)
+	if err := db.Select("id", "symbol", "market").Where("market = ?", market).Where("EXISTS (?)", missingDate).
 		Order("id").Limit(syncMaxStocks + 1).Find(&stocks).Error; err != nil {
 		return nil, err
 	}
@@ -356,7 +369,7 @@ func buildSyncBarsPlanDB(db *gorm.DB, req MaintenanceRequest) (*preparedMaintena
 		Task: MaintenanceSyncBars, Market: market, From: from, To: to, WindowDays: len(dates),
 		TargetCount: len(targetStocks), ExpectedCount: expectedCount, ExistingCount: existingCount,
 		MissingCount: len(missing), SuspendedCount: len(suspended), EstimatedRequests: len(targetStocks), Capped: capped,
-		DifferenceSummary: fmt.Sprintf("%d 个股票交易日应有，已存在 %d，缺口 %d，已排除停牌 %d；预计请求 %d 只标的", expectedCount, existingCount, len(missing), len(suspended), len(targetStocks)),
+		DifferenceSummary: fmt.Sprintf("本次待修复标的应有 %d 个股票交易日，已存在 %d，缺口 %d，已排除停牌 %d；预计请求 %d 只标的，完整标的自动跳过", expectedCount, existingCount, len(missing), len(suspended), len(targetStocks)),
 		GeneratedAt:       time.Now().Format(time.RFC3339),
 	}
 	if len(targetSymbols) > 12 {
@@ -442,6 +455,10 @@ func buildCalendarPlanDB(db *gorm.DB, req MaintenanceRequest) (*preparedMaintena
 }
 
 func buildWidePlanDB(db *gorm.DB, req MaintenanceRequest) (*preparedMaintenancePlan, error) {
+	return buildWidePlanAtDB(db, req, time.Now())
+}
+
+func buildWidePlanAtDB(db *gorm.DB, req MaintenanceRequest, now time.Time) (*preparedMaintenancePlan, error) {
 	if db == nil {
 		return nil, errors.New("数据库不可用")
 	}
@@ -449,13 +466,9 @@ func buildWidePlanDB(db *gorm.DB, req MaintenanceRequest) (*preparedMaintenanceP
 	if err != nil {
 		return nil, err
 	}
-	reader := &dataHealthReader{db: db, now: time.Now()}
-	expected := reader.wideExpectedDate(reader.now)
-	if reader.err != nil {
-		return nil, reader.err
-	}
-	if reader.calendarMissing {
-		return nil, errors.New("交易日历不完整，无法确定全市场快照补采日期")
+	expected, err := wideSnapshotPlanDate(db, now)
+	if err != nil {
+		return nil, err
 	}
 	from, to := strings.TrimSpace(req.From), strings.TrimSpace(req.To)
 	if (from == "") != (to == "") {
@@ -522,7 +535,7 @@ func buildWidePlanDB(db *gorm.DB, req MaintenanceRequest) (*preparedMaintenanceP
 		Task: MaintenanceWideSync, Market: market, From: from, To: to, WindowDays: 1,
 		TargetCount: len(states), ExpectedCount: len(states) - len(suspended), ExistingCount: len(bars),
 		MissingCount: len(missing), SuspendedCount: len(suspended), EstimatedRequests: 1,
-		DifferenceSummary: fmt.Sprintf("%s 宇宙 %d 只，已有日线 %d，已知停牌 %d，待同步/核对 %d", expected, len(states), len(bars), len(suspended), len(missing)),
+		DifferenceSummary: fmt.Sprintf("目标收盘日 %s，现有宇宙 %d 只，已有日线 %d，已知停牌 %d，待核对 %d；执行时必须由完整上游快照确认目标日期，初次同步将建立宇宙", expected, len(states), len(bars), len(suspended), len(missing)),
 		GeneratedAt:       time.Now().Format(time.RFC3339),
 	}
 	if len(missing) > 12 {
@@ -623,7 +636,22 @@ func applySyncAudit(log *model.DataSyncLog, audit SyncAudit) {
 // SyncMarketWideWithAudit 复用既有全市场同步，不改其采集行为；任务落库后只更新五个
 // 白名单审计字段。这样 controller 可记录管理员，又不让原始 body 进入日志。
 func (s *MarketService) SyncMarketWideWithAudit(ctx context.Context, audit SyncAudit) (*model.DataSyncLog, error) {
-	log, err := s.SyncMarketWide(ctx)
+	ctx = jobSubmissionContext(ctx)
+	if common.DB == nil {
+		return nil, errors.New("数据库不可用")
+	}
+	expectedDate, err := wideSnapshotPlanDate(common.DB.WithContext(ctx), time.Now())
+	if err != nil {
+		return nil, err
+	}
+	if audit.PlanHash != "" {
+		from, to, valid := strings.Cut(audit.RangeSummary, "..")
+		if !valid || from != expectedDate || to != expectedDate {
+			return nil, ErrMaintenancePlanExpired
+		}
+	}
+	audit.RangeSummary = expectedDate + ".." + expectedDate
+	log, err := s.syncMarketWideForDate(ctx, expectedDate)
 	if log == nil {
 		return nil, err
 	}
@@ -706,6 +734,11 @@ func (s *MarketService) SyncTrackedDailyBarsWithAudit(ctx context.Context, marke
 	}
 
 	log := newSyncLog(MaintenanceSyncBars, market, audit)
+	defer func() {
+		if log.Succeeded > 0 {
+			refreshFactorsAfterMaintenance(ctx, "关注股票日线补采完成")
+		}
+	}()
 	log.Total = len(stocks)
 	var firstErr string
 	for _, st := range stocks {
@@ -720,7 +753,8 @@ func (s *MarketService) SyncTrackedDailyBarsWithAudit(ctx context.Context, marke
 		}
 		// 同步必须检查实际写入。在线 GetDailyBars 会命中缓存并忽略落库失败，
 		// 不适合作为补采的成功依据。
-		bars, fetchErr := s.mgr.GetDailyBars(ctx, st.Market, st.Symbol, barLimit)
+		policy := currentDailyBarPolicy(st.Market, time.Now())
+		bars, _, fetchErr := s.mgr.GetDailyBarsFresh(ctx, st.Market, st.Symbol, barLimit, policy.expectedDate)
 		if fetchErr == nil {
 			fetchErr = s.persistDailyBars(ctx, st.Market, st.Symbol, bars)
 		}
@@ -731,6 +765,7 @@ func (s *MarketService) SyncTrackedDailyBarsWithAudit(ctx context.Context, marke
 			}
 		} else {
 			log.Succeeded++
+			s.invalidateDailyBars(st.Market, st.Symbol)
 		}
 		syncCursor.Store(st.ID) // 中途取消也从断点续跑
 		time.Sleep(syncThrottle)
@@ -782,6 +817,12 @@ func (s *MarketService) RunSyncBarsPlan(ctx context.Context, req MaintenanceRequ
 	audit.RangeSummary = prepared.view.From + ".." + prepared.view.To
 	audit.ParameterSummary = fmt.Sprintf("dry_run=false,target_stocks=%d,missing_cells=%d", prepared.view.TargetCount, prepared.view.MissingCount)
 	log := newSyncLog(MaintenanceSyncBars, prepared.view.Market, audit)
+	committedHistory := false
+	defer func() {
+		if committedHistory {
+			refreshFactorsAfterMaintenance(ctx, "范围日线补采已保存历史")
+		}
+	}()
 	log.Total = len(prepared.stocks)
 	start := time.Now()
 	if len(prepared.stocks) == 0 {
@@ -807,7 +848,7 @@ func (s *MarketService) RunSyncBarsPlan(ctx context.Context, req MaintenanceRequ
 			s.recordSyncLog(ctx, log)
 			return log, err
 		}
-		bars, fetchErr := s.mgr.GetDailyBars(ctx, st.Market, st.Symbol, fetchLimit)
+		bars, _, fetchErr := s.mgr.GetDailyBarsFresh(ctx, st.Market, st.Symbol, fetchLimit, prepared.view.To)
 		filtered := make([]datasource.Bar, 0, len(prepared.dates))
 		if fetchErr == nil {
 			for _, bar := range bars {
@@ -820,6 +861,8 @@ func (s *MarketService) RunSyncBarsPlan(ctx context.Context, req MaintenanceRequ
 			} else {
 				fetchErr = s.persistDailyBarsChecked(ctx, st.Market, st.Symbol, filtered, bars, false)
 				if fetchErr == nil {
+					committedHistory = true
+					s.invalidateDailyBars(st.Market, st.Symbol)
 					expected := 0
 					for _, date := range prepared.dates {
 						if _, missing := prepared.missingKeys[st.Symbol+"@"+date]; missing {
@@ -1234,11 +1277,10 @@ func StartMarketJobs(mgr *datasource.Manager) {
 			})
 		}
 		if now := time.Now(); isTradingDayToday(now) && now.Hour()*60+now.Minute() >= 16*60+10 {
-			var n int64
-			common.DB.Model(&model.DataSyncLog{}).
-				Where("task = ? AND status <> ? AND created_at >= ?", "sync_market_wide", "failed",
-					now.Format("2006-01-02")+" 00:00:00").Count(&n)
-			if n == 0 {
+			completed, err := hasCompletedMarketWideSync(common.DB, now.Format(time.DateOnly))
+			if err != nil {
+				common.SysWarn("启动补跑读取全市场同步记录失败: %v", err)
+			} else if !completed {
 				common.SysLog("启动补跑：今日 16:10 全市场日线增量未执行，现在补跑")
 				runWide()
 			}

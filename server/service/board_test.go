@@ -58,7 +58,7 @@ func (f *fakeBoardSource) GetBoardFundFlow(ctx context.Context, code string, lim
 }
 
 func newTestBoardService(src boardSource) *BoardService {
-	return &BoardService{src: src, heatCache: map[string]boardHeatEntry{}, flowCache: map[string]boardFlowEntry{}}
+	return &BoardService{src: src}
 }
 
 func TestBoardHeatmapCache(t *testing.T) {
@@ -79,8 +79,8 @@ func TestBoardHeatmapCache(t *testing.T) {
 	if f.heatCalls != 2 {
 		t.Fatalf("concept 应独立拉取, heatCalls=%d", f.heatCalls)
 	}
-	// 缓存过期后重新拉取。
-	s.heatCache["industry"] = boardHeatEntry{rows: nil, exp: time.Now().Add(-time.Second)}
+	// 缓存失效后重新拉取。
+	s.responseCache().ForgetPrefix("board:heat:industry")
 	if _, err := s.Heatmap(context.Background(), "industry"); err != nil {
 		t.Fatalf("Heatmap: %v", err)
 	}
@@ -99,6 +99,53 @@ func TestBoardHeatmapErrorNotCached(t *testing.T) {
 	_, _ = s.Heatmap(context.Background(), "industry")
 	if f.heatCalls != 2 {
 		t.Fatalf("错误不应缓存, heatCalls=%d", f.heatCalls)
+	}
+}
+
+func TestBoardHeatmapCacheReturnsIndependentRows(test *testing.T) {
+	service := newTestBoardService(&fakeBoardSource{})
+	first, err := service.Heatmap(test.Context(), "industry")
+	if err != nil {
+		test.Fatal(err)
+	}
+	first[0].Name = "mutated"
+	second, err := service.Heatmap(test.Context(), "industry")
+	if err != nil || second[0].Name == "mutated" {
+		test.Fatalf("one reader mutated the shared board cache: %+v %v", second, err)
+	}
+}
+
+type blockingBoardSource struct {
+	fakeBoardSource
+	flowStarted chan struct{}
+}
+
+func (source *blockingBoardSource) GetBoardFundFlow(ctx context.Context, _ string, _ int) ([]datasource.StockFundFlowBar, error) {
+	close(source.flowStarted)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestBoardHeatmapDoesNotWaitForUnrelatedFundFlow(test *testing.T) {
+	source := &blockingBoardSource{flowStarted: make(chan struct{})}
+	service := newTestBoardService(source)
+	flowContext, cancelFlow := context.WithCancel(test.Context())
+	defer cancelFlow()
+	flowFinished := make(chan error, 1)
+	go func() {
+		_, err := service.FundFlow(flowContext, "BK0447", 90)
+		flowFinished <- err
+	}()
+	<-source.flowStarted
+	heatContext, cancelHeat := context.WithTimeout(test.Context(), time.Second)
+	defer cancelHeat()
+	rows, err := service.Heatmap(heatContext, "industry")
+	if err != nil || len(rows) != 1 {
+		test.Fatalf("unrelated slow flow request blocked heatmap: %+v %v", rows, err)
+	}
+	cancelFlow()
+	if err := <-flowFinished; !errors.Is(err, context.Canceled) {
+		test.Fatalf("flow cancellation was not preserved: %v", err)
 	}
 }
 

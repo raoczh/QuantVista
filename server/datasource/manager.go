@@ -153,6 +153,7 @@ func attemptSource[T any](m *Manager, ctx context.Context, market, capability st
 	_, sourceBudget := m.budgets(capability)
 	sctx, cancel := context.WithTimeout(ctx, sourceBudget)
 	defer cancel()
+	sctx, activity := trackSourceRequests(sctx)
 	start := time.Now()
 	r, err := call(sctx, a)
 	latency := time.Since(start).Milliseconds()
@@ -166,6 +167,10 @@ func attemptSource[T any](m *Manager, ctx context.Context, market, capability st
 	}
 	if errors.Is(err, ErrNotSupported) || errors.Is(err, ErrSymbolInvalid) {
 		return zero, false, err // 不记滑窗：非源健康问题
+	}
+	if localWait := activity.localWaitFailure(err); localWait != nil {
+		common.SysDebug("[datasource] code=LOCAL_SOURCE_WAIT source=%s cap=%s latency=%dms", a.Name(), capability, latency)
+		return zero, false, localWait
 	}
 	code, outcome := classifyErr(err)
 	m.health.RecordForMarket(a.Name(), capability, market, outcome, latency)
@@ -289,23 +294,7 @@ func (m *Manager) GetQuote(ctx context.Context, market, symbol string) (*Quote, 
 
 // GetDailyBars routes only compatible forward-adjusted stock histories.
 func (m *Manager) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]Bar, error) {
-	bars, err := routeCap(m, ctx, market, "daily_bars", func(ctx context.Context, a Adapter) ([]Bar, error) {
-		if provider, declared := a.(AdjustedDailyProvider); market == "cn" && declared && !provider.ProvidesForwardAdjustedDailyBars() {
-			return nil, ErrNotSupported
-		}
-		bs, berr := a.GetDailyBars(ctx, market, symbol, limit)
-		if berr == nil && len(bs) == 0 {
-			berr = ErrNoData
-		}
-		if berr == nil {
-			for i := range bs {
-				if bs[i].Source == "" {
-					bs[i].Source = a.Name()
-				}
-			}
-		}
-		return bs, berr
-	})
+	bars, _, err := m.GetDailyBarsFresh(ctx, market, symbol, limit, "")
 	if err != nil && !errors.Is(err, ErrSymbolInvalid) && !errors.Is(err, context.Canceled) {
 		common.SysWarn("所有数据源取日线失败 symbol=%s: %v", symbol, err)
 	}

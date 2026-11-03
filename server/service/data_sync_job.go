@@ -34,8 +34,12 @@ type DataSyncJobRequest struct {
 var (
 	systemScheduleRetryDelay = 5 * time.Second
 	systemScheduleMu         sync.Mutex
-	systemSchedulePending    = map[string]struct{}{}
+	systemSchedulePending    = map[string]*systemScheduleRetry{}
 )
+
+type systemScheduleRetry struct {
+	revision uint64 // Guarded by systemScheduleMu, including submit/exit races.
+}
 
 func RegisterDataSyncJobHandlers(svc *MarketService) {
 	if svc == nil {
@@ -233,7 +237,7 @@ func (s *MarketService) dataSyncJobHandler(ctx context.Context, _ int64, _ bool,
 		log, err = s.RunMarketWideInit(ctx, audit)
 	case JobKindFactorRebuild:
 		start := time.Now()
-		table, buildErr := RebuildFactorTable(ctx, req.Reason)
+		table, buildErr := rebuildFactorTableForJob(ctx, req.Reason)
 		err = buildErr
 		log = newSyncLog(JobKindFactorRebuild, req.Market, audit)
 		log.DurationMs = time.Since(start).Milliseconds()
@@ -303,36 +307,66 @@ func ScheduleSystemDataSyncJob(task string, req DataSyncJobRequest) {
 }
 
 func scheduleSystemDataSyncJob(runtime *jobRuntime, task string, req DataSyncJobRequest) {
-	if _, err := startSystemDataSyncJob(runtime, task, nil, req); err == nil {
-		return
-	} else if !errors.Is(err, ErrJobQueueBusy) {
-		common.SysWarn("系统任务提交失败 task=%s: %v", task, err)
+	needsRetry := func() bool {
+		run, created, err := startSystemDataSyncJobWithStatus(runtime, task, nil, req)
+		if errors.Is(err, ErrJobQueueBusy) {
+			return true
+		}
+		if err != nil {
+			common.SysWarn("系统任务提交失败 task=%s: %v", task, err)
+			return false
+		}
+		// A running rebuild may already have read its input snapshot. Reusing its
+		// ID acknowledges no new data; retain one trailing rebuild after it ends.
+		return task == JobKindFactorRebuild && !created && run.Status == model.JobStatusRunning
+	}
+	if !needsRetry() {
 		return
 	}
 	encoded, _ := json.Marshal(req)
-	key := task + ":" + strconv.FormatUint(uint64(fnv32(encoded)), 16)
+	key := fmt.Sprintf("%p:%s:%s", runtime, task, strconv.FormatUint(uint64(fnv32(encoded)), 16))
+	if task == JobKindFactorRebuild {
+		key = fmt.Sprintf("%p:%s", runtime, task)
+	}
 	systemScheduleMu.Lock()
-	if _, exists := systemSchedulePending[key]; exists {
+	if pending, exists := systemSchedulePending[key]; exists {
+		pending.revision++
 		systemScheduleMu.Unlock()
 		return
 	}
-	systemSchedulePending[key] = struct{}{}
+	pending := &systemScheduleRetry{}
+	systemSchedulePending[key] = pending
 	systemScheduleMu.Unlock()
+	retryDelay := systemScheduleRetryDelay
 	go func() {
 		defer func() {
 			systemScheduleMu.Lock()
-			delete(systemSchedulePending, key)
+			if systemSchedulePending[key] == pending {
+				delete(systemSchedulePending, key)
+			}
 			systemScheduleMu.Unlock()
 		}()
 		for {
-			time.Sleep(systemScheduleRetryDelay)
-			_, retryErr := startSystemDataSyncJob(runtime, task, nil, req)
-			if retryErr == nil {
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-runtime.stop:
+				timer.Stop()
 				return
+			case <-timer.C:
 			}
-			if !errors.Is(retryErr, ErrJobQueueBusy) {
-				common.SysWarn("系统任务背压重试停止 task=%s: %v", task, retryErr)
-				return
+			systemScheduleMu.Lock()
+			revision := pending.revision
+			systemScheduleMu.Unlock()
+			if !needsRetry() {
+				systemScheduleMu.Lock()
+				settled := revision == pending.revision
+				if settled {
+					delete(systemSchedulePending, key)
+				}
+				systemScheduleMu.Unlock()
+				if settled {
+					return
+				}
 			}
 		}
 	}()

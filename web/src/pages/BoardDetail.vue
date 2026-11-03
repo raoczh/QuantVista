@@ -32,11 +32,13 @@ const { isDark, pctColor, upColor, downColor, vars } = useUi()
 
 const code = computed(() => String(route.params.code || ''))
 const boardName = computed(() => String(route.query.name || code.value))
+const usesSinaClassification = computed(() => code.value.startsWith('sina:'))
 
 const detail = ref<BoardDetail | null>(null)
 const fundflow = ref<BoardFundFlow | null>(null)
 const loading = ref(false)
 const loadError = ref('')
+const fundflowError = ref('')
 
 const chartEl = ref<HTMLDivElement | null>(null)
 let chart: echarts.ECharts | null = null
@@ -55,7 +57,11 @@ async function load(silent = false) {
   const mySeq = ++loadSeq
   if (!silent) loading.value = true
   // 板块资金流 best-effort：push2his 限流属常态，失败只留空卡不打断详情页。
-  getBoardFundFlow('cn', code.value, 90)
+  fundflowError.value = ''
+  const flowRequest = usesSinaClassification.value
+    ? Promise.reject(new Error('新浪分类暂不提供对应板块资金流，不使用东财同名板块替代'))
+    : getBoardFundFlow('cn', code.value, 90)
+  flowRequest
     .then((r) => {
       if (mySeq !== loadSeq) return
       fundflow.value = r
@@ -65,9 +71,10 @@ async function load(silent = false) {
         if (mySeq === loadSeq) renderFundFlowChart()
       })
     })
-    .catch(() => {
+    .catch((error: Error) => {
       if (mySeq === loadSeq) {
         fundflow.value = null
+        fundflowError.value = error.message
         ffChart?.dispose()
         ffChart = null
       }
@@ -190,6 +197,12 @@ function fmtYi(n: number): string {
   return n ? (n / 1e8).toFixed(2) + ' 亿' : '-'
 }
 
+function quoteTimeText(value?: string): string {
+  if (!value || value.startsWith('0001-')) return '来源未提供'
+  const timestamp = new Date(value)
+  return Number.isFinite(timestamp.getTime()) ? timestamp.toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' }) : '来源未提供'
+}
+
 const columns = computed<DataTableColumns<BoardStock>>(() => [
   {
     title: '名称',
@@ -227,6 +240,7 @@ const columns = computed<DataTableColumns<BoardStock>>(() => [
     render: (row) => (row.turnover_rate ? row.turnover_rate.toFixed(2) + '%' : '-'),
   },
   { title: '流通市值', key: 'float_cap', align: 'right', render: (row) => fmtYi(row.float_cap) },
+  { title: '报价时间（北京）', key: 'data_time', render: (row) => quoteTimeText(row.data_time) },
 ])
 
 function rowProps(row: BoardStock) {
@@ -283,20 +297,23 @@ onUnmounted(() => {
       <n-alert v-if="loadError" type="error" :bordered="false" title="板块详情读取失败" class="load-alert">
         {{ loadError }}。请重试；数据时间未知，不应据此判断板块强弱。
       </n-alert>
-      <p v-else class="board-status">行情数据截止 {{ detail?.bars?.at(-1)?.trade_date || '未知' }} · 下一步可查看成分股或进入相关个股详情</p>
+      <p v-else class="board-status">指数日线截至 {{ detail?.bars?.at(-1)?.trade_date || '未知' }} · 成分股最新报价 {{ quoteTimeText(detail?.data_time) }} · 可进入个股详情核对</p>
+      <n-alert v-if="usesSinaClassification" type="info" :bordered="false" class="load-alert">
+        当前为新浪分类，成员行情保留各自真实日期。与东财分类不同，板块指数、资金流和聚合估值不交叉拼接。
+      </n-alert>
       <div class="board-grid">
         <SectionCard title="板块指数日线">
           <div v-show="!barsUnavailable" ref="chartEl" class="board-chart"></div>
           <n-empty
             v-if="barsUnavailable"
-            description="板块指数日线依赖东财接口，当前限流暂不可用，稍后重试"
+            :description="detail?.errors.bars || '暂无可用板块指数日线，请稍后重试'"
           />
         </SectionCard>
 
         <!-- 板块主力资金（P3b）：上游透传不落库，push2his 限流时留空 -->
         <SectionCard title="主力资金（近 90 交易日）">
           <template #extra>
-            <span class="src-hint">东财板块资金流 · 主力=超大单+大单</span>
+            <span class="src-hint">{{ usesSinaClassification ? '当前分类源未提供' : '东财板块资金流 · 主力=超大单+大单' }}</span>
           </template>
           <div v-if="fundflow && fundflow.days.length" class="ff-wrap">
             <div class="ff-grid">
@@ -311,7 +328,7 @@ onUnmounted(() => {
               主力净额=超大单+大单口径（东财），资金流向≠板块必然方向；数据截至 {{ fundflow.last_date }}；仅研究参考。
             </div>
           </div>
-          <n-empty v-else description="暂无板块资金流数据（东财源限流时可稍后刷新）" />
+          <n-empty v-else :description="fundflowError || '暂无板块资金流数据'" />
         </SectionCard>
 
         <!-- 板块估值（P3b）：行业板块聚合表；概念板块无 f100 覆盖不渲染 -->
@@ -343,11 +360,11 @@ onUnmounted(() => {
             :row-props="rowProps"
             :bordered="false"
             size="small"
-            :scroll-x="640"
+            :scroll-x="840"
           />
           <n-empty
             v-else
-            description="成分股依赖东财接口，当前限流暂不可用，稍后重试"
+            :description="detail?.errors.stocks || '暂无可用成分股行情，请稍后重试'"
           />
         </SectionCard>
       </div>

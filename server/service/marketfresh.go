@@ -38,19 +38,20 @@ const (
 	marketStatePreOpen   = "pre_open"
 	marketStatePostClose = "post_close"
 	marketStateClosed    = "closed"
+	marketStateUnknown   = "unknown"
 )
 
 // 行情新鲜度状态。
 const (
 	freshStatusFresh   = "fresh"
 	freshStatusStale   = "stale"
-	freshStatusUnknown = "unknown" // 非 cn 市场无日历判定
+	freshStatusUnknown = "unknown" // 日历证据不足，或非 cn 市场无日历判定
 )
 
 // quoteFreshInfo 一次行情新鲜度判定结果。
 type quoteFreshInfo struct {
 	Status       string // fresh | stale | unknown
-	MarketState  string // trading | break | pre_open | post_close | closed
+	MarketState  string // trading | break | pre_open | post_close | closed | unknown
 	ExpectedDate string // 期望的最近有效行情交易日（YYYY-MM-DD）
 }
 
@@ -127,7 +128,9 @@ func quoteFreshness(dataTime, now time.Time, state, expected string) quoteFreshI
 	default:
 		// 盘前竞价期（09:15~09:30）取到今天的行情：竞价出价即当日最新口径。
 		if state == marketStatePreOpen && d == today {
-			info.Status = freshStatusFresh
+			if now.Hour()*60+now.Minute() >= sessionPreAuctionMin && dataTime.Hour()*60+dataTime.Minute() >= sessionPreAuctionMin {
+				info.Status = freshStatusFresh
+			}
 			return info
 		}
 		// 午休应为上午末价（≥11:00）；盘后/休市/盘前昨收应为收盘口径（≥14:30）。
@@ -149,6 +152,9 @@ func stockFreshnessNote(fi quoteFreshInfo, dataTime time.Time) (note, sessionNot
 	dt := "未知时间"
 	if !dataTime.IsZero() {
 		dt = dataTime.Format("2006-01-02 15:04")
+	}
+	if fi.Status == freshStatusUnknown {
+		return fmt.Sprintf("行情源时间为 %s，交易日历不完整或该市场时效口径尚未确认，无法认定为当前有效行情；仅供历史展示，不得用于操作判断", dt), ""
 	}
 	if fi.Status == freshStatusStale {
 		note = fmt.Sprintf("行情仅更新至 %s（期望交易日 %s），在本次数据源请求预算及缓存窗口内未取得符合时效的数据，可能停牌、休市或数据源延迟，不代表实时盘面", dt, fi.ExpectedDate)

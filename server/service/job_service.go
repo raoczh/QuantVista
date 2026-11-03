@@ -283,6 +283,9 @@ func RetryJobRun(userID, id int64, contexts ...context.Context) (*JobRunView, er
 	}
 	var child *model.JobRun
 	if parent.OwnerType == model.JobOwnerSystem {
+		if err := validateMaintenanceJobRetry(parent.Kind, snapshot.Request); err != nil {
+			return nil, err
+		}
 		triggeredBy := userID
 		child, err = defaultJobRuntime.startSystemWithBinding(&triggeredBy, parent.Kind, json.RawMessage(snapshot.Request), &parent.ID, ctx)
 	} else if isBusinessDurableJobKind(parent.Kind) {

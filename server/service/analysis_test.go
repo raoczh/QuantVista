@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"quantvista/common"
 	"quantvista/datasource"
@@ -23,6 +24,14 @@ func (refusalTestAdapter) GetQuote(context.Context, string, string) (*datasource
 
 func (refusalTestAdapter) GetDailyBars(context.Context, string, string, int) ([]datasource.Bar, error) {
 	return nil, datasource.ErrNotSupported
+}
+
+// LLM wiring tests need real-shaped input facts; an entirely empty market is
+// intentionally rejected before making a model call.
+type analysisAvailableMarketTestAdapter struct{ refusalTestAdapter }
+
+func (analysisAvailableMarketTestAdapter) GetIndices(context.Context, string) ([]datasource.Index, error) {
+	return []datasource.Index{{Code: "000001", Name: "Test index", Price: 3000, Source: "fixture", DataTime: time.Now()}}, nil
 }
 
 func TestParseAnalysisResult_Valid(t *testing.T) {
@@ -372,7 +381,7 @@ func TestModuleCallFailurePreservesRefusalCode(t *testing.T) {
 
 	const userID int64 = 74
 	seedReportEnv(t, userID, srv.URL)
-	market := NewMarketService(datasource.NewManagerWithAdapters(refusalTestAdapter{}))
+	market := NewMarketService(datasource.NewManagerWithAdapters(analysisAvailableMarketTestAdapter{}))
 	analysisSvc := NewAnalysisService(market, nil, nil, NewLLMService(), nil)
 	_, err := analysisSvc.Analyze(context.Background(), userID, true, AnalyzeRequest{
 		Module: model.AnalysisModuleMarket,

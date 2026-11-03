@@ -280,13 +280,16 @@ func buildStockSnapshot(ctx context.Context, market *MarketService, symbol, mkt 
 		if fin := financeBrief(ctx, symbol); fin != nil {
 			snap["finance"] = fin
 		}
-		// F1 公告段：最近 5 条公告标题+类型+日期（公告 > 新闻报道的证据权重；
-		// 覆盖面为已采集库存，best-effort；无公告不注入，prompt 已声明覆盖有限）。
-		if anns := latestAnnouncementBriefs(symbol, 5); len(anns) > 0 {
+		// 与在线行情相同的主备源按需更新；历史库存不能证明今天没有新公告。
+		anns, announcementError := market.researchAnnouncementBriefs(ctx, symbol, 5)
+		if len(anns) > 0 {
 			snap["announcements"] = map[string]any{
 				"items": anns,
-				"note":  "该股最近的交易所公告（标题与类型；引用只能复述标题，不得臆测公告正文细节）",
+				"note":  "已取得的最新一页公告中最近 5 条（保留 source/date；引用只能复述标题，不得臆测正文，不保证完整覆盖）",
 			}
+		}
+		if announcementError != nil {
+			snap["announcements_refresh_note"] = "本次公告刷新未成功，已有标题仅代表历史库存，无法确认是否有新公告，不得据此声称没有新风险"
 		}
 		// P3a 机构观点段：研报评级分布/评级变动/目标价偏离/调研密度（缓存优先，
 		// 缺失按需拉一次）。数值叶子经 snapshotLabeledValues 自动进核验值域；无数据不注入。
@@ -509,28 +512,30 @@ func compactBars(bars []datasource.Bar, keep int) []map[string]any {
 func (s *AnalysisService) buildMarketContext(ctx context.Context, market string) (*analysisContext, error) {
 	market = normalizeMarketOnly(market)
 	ov := s.market.GetOverview(ctx, market)
+	if len(ov.Indices)+len(ov.Gainers)+len(ov.Actives)+len(ov.Sectors) == 0 && ov.Breadth == nil && ov.FundFlow == nil {
+		return nil, errors.New("市场数据源均未返回可用数据，已停止 AI 分析，请先恢复行情连接")
+	}
 	snap := map[string]any{
-		"market":    market,
-		"indices":   compactIndices(ov.Indices),
-		"breadth":   ov.Breadth,
-		"fund_flow": ov.FundFlow,
-		"gainers":   compactRanks(ov.Gainers, 6),
-		"actives":   compactRanks(ov.Actives, 6),
-		"sectors":   compactSectors(ov.Sectors, 10),
-		// 聚合块时间语义（P0-5 透明化）：指数/涨跌家数/资金流为聚合接口采集口径，
-		// 各块时间为「采集于」而非上游业务时间——非交易时段为最近有效收盘口径。
+		"market":        market,
+		"indices":       compactIndices(ov.Indices),
+		"breadth":       ov.Breadth,
+		"fund_flow":     ov.FundFlow,
+		"gainers":       compactRanks(ov.Gainers, 6),
+		"actives":       compactRanks(ov.Actives, 6),
+		"sectors":       compactSectors(ov.Sectors, 10),
 		"captured_at":   time.Now().In(time.Local).Format("2006-01-02 15:04:05"),
-		"captured_note": "indices/breadth/fund_flow 为采集时刻口径（captured_at），非逐块上游业务时间；非交易时段为最近交易日收盘口径，表述时不得称实时",
+		"captured_note": "captured_at 仅为本次采集时刻；指数使用各自 source_data_time，涨跌家数/资金流使用 trade_date。榜单及板块缺少统一源时间时保持未知，不能因刚采集就称实时；不同来源的板块分类不直接对比",
 	}
 	// M3a 情绪温度计：涨停池盘后聚合（连板高度分布/炸板率/昨涨停溢价）。
-	// 库中无数据（首日部署/采集失败）自然缺席，guidance 已声明按缺失处理。
+	// 库中无数据同样进入共用缺口清单，不能只依赖提示词解释字段缺席。
 	if market == "cn" {
-		if mood := moodBrief(); mood != nil {
-			snap["mood"] = mood
-		}
+		snap["mood"] = moodBrief()
 	}
 	if len(ov.Errors) > 0 {
 		snap["unavailable"] = ov.Errors // 透传缺失块，供模型知悉数据不全
+	}
+	if !applyResearchMarketFreshness(snap, s.market.freshnessJudge(ctx, market)) {
+		return nil, errors.New("市场数据缺失或时效无法核验，未取得可用于本次研究的数据，已停止 AI 分析")
 	}
 	return &analysisContext{Label: "全市场", Snapshot: fitBudget(snap)}, nil
 }
@@ -545,32 +550,38 @@ func (s *AnalysisService) buildSectorContext(ctx context.Context, market, target
 		label = "板块概览"
 	}
 	snap := map[string]any{
-		"market":  market,
-		"focus":   label,
-		"sectors": compactSectors(ov.Sectors, 20),
-		"indices": compactIndices(ov.Indices),
-		"breadth": ov.Breadth,
-		// 同市场模块：聚合块为采集时刻口径（详见 captured_note）。
+		"market":        market,
+		"focus":         label,
+		"sectors":       compactSectors(ov.Sectors, 20),
+		"indices":       compactIndices(ov.Indices),
+		"breadth":       ov.Breadth,
 		"captured_at":   time.Now().In(time.Local).Format("2006-01-02 15:04:05"),
-		"captured_note": "sectors/indices/breadth 为采集时刻口径（captured_at），非逐块上游业务时间；非交易时段为最近交易日收盘口径，表述时不得称实时",
+		"captured_note": "captured_at 仅为采集时刻；指数保留真实 source_data_time，板块未提供统一源时间，不得据此称实时。板块 code/source 共同标识分类，新浪与东财同名板块不得视为相同成员或指数",
 	}
 	// P3b：focus 名精确匹配到行业板块（估值聚合表 board_name）时注入两段板块级数据。
 	// 概念板块/未匹配自然缺席，guidance 已声明按缺失处理；数值叶子经 snapshotLabeledValues
 	// 自动进核验值域，无需手工登记。
-	if bv, code := boardValuationByName(strings.TrimSpace(target), ctx); bv != nil {
-		snap["board_valuation"] = bv
-		if s.board != nil {
-			// 资金流只取近 10 日 + 汇总（板块级证据足够，控制快照预算）。
-			fctx, cancel := context.WithTimeout(ctx, 6*time.Second)
-			if ff, err := s.board.FundFlow(fctx, code, 10); err == nil && len(ff.Days) > 0 {
-				snap["board_flow"] = ff
+	if sectorEnrichmentMatchesSource(ov.Sectors) {
+		if bv, code := boardValuationByName(strings.TrimSpace(target), ctx); bv != nil {
+			snap["board_valuation"] = bv
+			if s.board != nil {
+				fctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+				if ff, err := s.board.FundFlow(fctx, code, 10); err == nil && len(ff.Days) > 0 {
+					snap["board_flow"] = ff
+				}
+				cancel()
 			}
-			cancel()
 		}
+	} else {
+		snap["sector_enrichment_note"] = "当前板块分类不是东财，未拼接东财同名板块估值或资金流"
+	}
+	if len(ov.Errors) > 0 {
+		snap["unavailable"] = ov.Errors
 	}
 	if len(ov.Sectors) == 0 {
 		return nil, errors.New("板块数据暂不可用（数据源繁忙），请稍后重试")
 	}
+	applyResearchMarketFreshness(snap, s.market.freshnessJudge(ctx, market))
 	return &analysisContext{Label: label, Snapshot: fitBudget(snap)}, nil
 }
 
@@ -790,12 +801,31 @@ func (s *AnalysisService) buildPositionContext(ctx context.Context, userID int64
 
 // --- 压缩辅助 ---
 
+func sectorEnrichmentMatchesSource(sectors []datasource.SectorRank) bool {
+	if len(sectors) == 0 {
+		return false
+	}
+	for _, sector := range sectors {
+		if sector.Source != "eastmoney" {
+			return false
+		}
+	}
+	return true
+}
+
 func compactIndices(idx []datasource.Index) []map[string]any {
 	out := make([]map[string]any, 0, len(idx))
 	for _, i := range idx {
-		out = append(out, map[string]any{
+		row := map[string]any{
 			"name": i.Name, "price": round2(i.Price), "change_pct": round2(i.ChangePct),
-		})
+			"code": i.Code, "source": i.Source,
+		}
+		if i.DataTime.IsZero() {
+			row["source_time_status"] = "unknown"
+		} else {
+			row["source_data_time"] = i.DataTime.In(datasource.ChinaMarketLocation()).Format("2006-01-02 15:04:05")
+		}
+		out = append(out, row)
 	}
 	return out
 }
@@ -808,6 +838,7 @@ func compactRanks(rs []datasource.StockRank, keep int) []map[string]any {
 	for _, r := range rs[:keep] {
 		out = append(out, map[string]any{
 			"name": r.Name, "symbol": r.Symbol, "price": round2(r.Price), "change_pct": round2(r.ChangePct),
+			"source": r.Source, "source_time_status": "unknown",
 		})
 	}
 	return out
@@ -821,6 +852,7 @@ func compactSectors(ss []datasource.SectorRank, keep int) []map[string]any {
 	for _, s := range ss[:keep] {
 		out = append(out, map[string]any{
 			"name": s.Name, "change_pct": round2(s.ChangePct), "leader": s.Leader,
+			"code": s.Code, "source": s.Source, "source_time_status": "unknown",
 		})
 	}
 	return out

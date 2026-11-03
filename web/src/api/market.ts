@@ -445,6 +445,8 @@ export interface BoardHeat {
   amount: number // 成交额（元）
   advances: number
   declines: number
+  counts_available?: boolean
+  member_count?: number
   leader: string
   leader_code: string
   source: string
@@ -473,6 +475,7 @@ export interface BoardStock {
   is_leader: boolean
   is_top_gainer: boolean
   source: string
+  data_time?: string
 }
 
 // P3b 板块估值（行业板块聚合表最新行；分位 -1=算不出，hist_days 为时序分位积累天数）。
@@ -497,6 +500,8 @@ export interface BoardDetail {
   valuation?: BoardValuation
   errors: Record<string, string>
   data_time: string
+  captured_at?: string
+  source?: string
 }
 
 export function getBoardDetail(market: string, code: string) {

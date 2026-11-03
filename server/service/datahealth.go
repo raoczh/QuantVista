@@ -86,9 +86,7 @@ func (r *dataHealthReader) dhMaxDate(modelPtr any, dateCol, where string, args .
 	}
 	var d sql.NullString
 	q := r.db.Model(modelPtr).Select("MAX(" + dateCol + ")")
-	if _, calendar := modelPtr.(*model.TradingCalendar); !calendar {
-		q = q.Where(dateCol+" <= ?", r.now.Format("2006-01-02"))
-	}
+	q = q.Where(dateCol+" <= ?", r.now.Format("2006-01-02"))
 	if where != "" {
 		q = q.Where(where, args...)
 	}
@@ -187,7 +185,9 @@ func (r *dataHealthReader) dhNewsCounts(from, to string, limit int) map[string]i
 		return out
 	}
 	var rows []dhDateCount
-	dateExpr := "DATE(publish_time)"
+	// MySQL parseTime 会把 DATE 结果扫描成带时间的字符串；显式返回字符日期，
+	// 才能与交易日历的 YYYY-MM-DD 键匹配。
+	dateExpr := "DATE_FORMAT(publish_time, '%Y-%m-%d')"
 	if r.db.Dialector.Name() == "sqlite" {
 		// SQLite DATE 会把带时区的本地午夜先换成 UTC，落到前一天；
 		// 与 MySQL DATETIME 一致，按入库时间的日历日期聚合。
@@ -402,11 +402,8 @@ func (r *dataHealthReader) build(now time.Time, requestedDays int) *DataHealthRe
 	}
 	expectedWide := r.wideExpectedDate(now)
 	expectedPrev := r.prevOpenTradeDate(now.Format("2006-01-02"))
-	expectedEvening := expectedPrev
-	if r.isTradingDayToday(now) && now.Hour()*60+now.Minute() >= 17*60+30 {
-		expectedEvening = now.Format("2006-01-02")
-	}
-	tradeDates := r.recentOpenDates("cn", expectedWide, days)
+	expectedEvening := r.expectedDateAfter(now, 17*60+30)
+	tradeDates := r.recentOpenDates("cn", orStr(expectedWide, expectedPrev), days)
 	r.tradeDates = tradeDates
 	if len(tradeDates) > 0 {
 		rep.WindowStart, rep.WindowEnd = tradeDates[0], tradeDates[len(tradeDates)-1]
@@ -420,6 +417,10 @@ func (r *dataHealthReader) build(now time.Time, requestedDays int) *DataHealthRe
 			item.LagOpenDays = r.openDaysBehind(item.ObservedDate, item.ExpectedDate)
 		}
 		item.Status = dhStatus(item.ObservedDate, item.LagOpenDays, item.Tolerance)
+		if item.ExpectedDate == "" {
+			item.Status = "unknown"
+			item.Note = strings.TrimSpace(item.Note + "；交易日历不完整，期望日期尚无法确认，请先回填日历")
+		}
 		if item.Key != "calendar" && item.ObservedDate > now.Format("2006-01-02") {
 			item.Status, item.LagOpenDays = "unknown", -1
 		}
@@ -507,7 +508,7 @@ func (r *dataHealthReader) build(now time.Time, requestedDays int) *DataHealthRe
 	calMax := r.dhMaxDate(&model.TradingCalendar{}, "trade_date", "market = ?", "cn")
 	calFrom, calTo := rep.WindowStart, rep.WindowEnd
 	if calFrom == "" || calTo == "" {
-		calTo = expectedPrev
+		calTo = orStr(expectedPrev, now.Format("2006-01-02"))
 		if parsed, err := time.ParseInLocation("2006-01-02", calTo, time.Local); err == nil {
 			calFrom = parsed.AddDate(0, 0, -(maintenanceMaxNaturalDays - 1)).Format("2006-01-02")
 		}

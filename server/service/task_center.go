@@ -119,6 +119,12 @@ func (s *TaskCenterService) List(userID int64, role string, options TaskCenterLi
 		if err != nil {
 			return nil, fmt.Errorf("查询统一作业失败: %w", err)
 		}
+		if len(rows) == 0 && role == model.RoleAdmin && options.IncludeSystem {
+			rows, err = listSystemJobRunTasks(common.DB, filters, options.IncludeSteps)
+			if err != nil {
+				return nil, fmt.Errorf("查询统一系统作业失败: %w", err)
+			}
+		}
 		return rows, nil
 	}
 
@@ -435,7 +441,7 @@ func listJobRunTasks(db *gorm.DB, userID int64, filters taskCenterFilters, inclu
 		Select("id", "owner_type", "user_id", "triggered_by", "kind", "parent_id", "status", "result_id", "error", "error_code",
 			"trace_id", "provider", "model", "prompt_tokens", "completion_tokens", "total_tokens",
 			"latency_ms", "total", "succeeded", "failed", "cancel_requested", "created_at", "updated_at").
-		Where("user_id = ?", userID)
+		Where("owner_type = ? AND user_id = ?", model.JobOwnerUser, userID)
 	if filters.jobID > 0 {
 		q = q.Where("id = ?", filters.jobID)
 	}
@@ -490,12 +496,21 @@ func listSystemJobRunTasks(db *gorm.DB, filters taskCenterFilters, includeSteps 
 		Select("id", "owner_type", "user_id", "triggered_by", "kind", "parent_id", "status", "result_id", "error", "error_code",
 			"latency_ms", "total", "succeeded", "failed", "cancel_requested", "created_at", "updated_at").
 		Where("owner_type = ? AND user_id IS NULL", model.JobOwnerSystem)
+	if filters.jobID > 0 {
+		q = q.Where("id = ?", filters.jobID)
+	}
 	if filters.kind != "" {
 		q = q.Where("kind = ?", filters.kind)
 	}
-	q = applyTaskStatusFilter(q, filters)
+	if filters.jobID == 0 {
+		q = applyTaskStatusFilter(q, filters)
+	}
 	var runs []model.JobRun
 	if err := q.Order("created_at DESC, id DESC").Limit(filters.limit).Find(&runs).Error; err != nil {
+		return nil, err
+	}
+	retryBlocks, err := listMaintenanceJobRetryBlocks(db, runs)
+	if err != nil {
 		return nil, err
 	}
 	var steps map[int64][]JobStepView
@@ -524,7 +539,7 @@ func listSystemJobRunTasks(db *gorm.DB, filters taskCenterFilters, includeSteps 
 			Error: run.Error, ErrorCode: run.ErrorCode, LatencyMs: run.LatencyMs,
 			Total: run.Total, Succeeded: run.Succeeded, Failed: run.Failed,
 			CanCancel:       (run.Status == model.JobStatusQueued || run.Status == model.JobStatusRunning) && !run.CancelRequested,
-			CanRetry:        run.Status == model.JobStatusFailed && isSystemDurableJobKind(run.Kind),
+			CanRetry:        run.Status == model.JobStatusFailed && isSystemDurableJobKind(run.Kind) && !retryBlocks[run.ID],
 			CancelRequested: run.CancelRequested, Steps: steps[run.ID], CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt,
 		})
 	}

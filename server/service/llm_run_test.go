@@ -127,7 +127,7 @@ func TestLLMRunWiring_AnalysisTraceEndToEnd(t *testing.T) {
 	common.DB.Exec("DELETE FROM analysis_records")
 	t.Cleanup(func() { common.DB.Exec("DELETE FROM analysis_records") })
 
-	market := NewMarketService(datasource.NewManagerWithAdapters(refusalTestAdapter{}))
+	market := NewMarketService(datasource.NewManagerWithAdapters(analysisAvailableMarketTestAdapter{}))
 	analysisSvc := NewAnalysisService(market, nil, nil, NewLLMService(), nil)
 	view, err := analysisSvc.Analyze(context.Background(), userID, true, AnalyzeRequest{
 		Module: model.AnalysisModuleMarket,

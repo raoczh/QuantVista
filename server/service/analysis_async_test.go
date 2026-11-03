@@ -45,7 +45,7 @@ func TestAnalysisAsyncShell(t *testing.T) {
 	common.DB.Exec("DELETE FROM analysis_records")
 	t.Cleanup(func() { common.DB.Exec("DELETE FROM analysis_records") })
 
-	market := NewMarketService(datasource.NewManagerWithAdapters(refusalTestAdapter{}))
+	market := NewMarketService(datasource.NewManagerWithAdapters(analysisAvailableMarketTestAdapter{}))
 	svc := NewAnalysisService(market, nil, nil, NewLLMService(), nil)
 	started := time.Now()
 	v, err := svc.AnalyzeAsync(userID, true, AnalyzeRequest{Module: model.AnalysisModuleMarket, Market: "cn"})

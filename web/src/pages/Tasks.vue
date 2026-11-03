@@ -51,7 +51,11 @@ const metricsError = ref('')
 const source = ref<TaskSource | ''>('')
 const kind = ref('')
 const status = ref<TaskStatus | ''>('')
-const includeSystem = ref(false)
+const systemTasksRequested = computed(() => {
+  const raw = Array.isArray(route.query.include_system) ? route.query.include_system[0] : route.query.include_system
+  return raw === '1'
+})
+const includeSystem = ref(isAdmin.value && systemTasksRequested.value)
 const actionJobID = ref<number | null>(null)
 const actionError = ref('')
 const focusedJobID = computed(() => {
@@ -136,7 +140,7 @@ const statusFilteredTasks = computed(() =>
 )
 const visibleTasks = computed(() =>
   focusedJobID.value
-    ? accessibleTasks.value.filter((task) => task.source === 'job' && task.source_id === focusedJobID.value)
+    ? accessibleTasks.value.filter((task) => task.id === `job:${focusedJobID.value}`)
     : statusFilteredTasks.value,
 )
 const hasProcessing = computed(() =>
@@ -222,6 +226,9 @@ watch(source, () => {
 
 watch(kind, () => void refreshNow())
 watch(focusedJobID, () => void refreshNow())
+watch([systemTasksRequested, isAdmin], ([requested, admin]) => {
+  includeSystem.value = admin && requested
+})
 
 function resetSystemOnlyFilters(): boolean {
   if (source.value === 'data_sync') {
@@ -280,6 +287,14 @@ function traceText(traceID: string) {
 
 function showTaskError(task: TaskCenterItem) {
   return task.status === 'failed' || task.status === 'degraded' || task.status === 'canceled'
+}
+
+function recoveryAdvice(task: TaskCenterItem) {
+  if (task.source === 'data_sync' && task.status === 'failed' && !task.can_retry
+    && ['sync_daily_bars', 'backfill_calendar', 'sync_market_wide'].includes(task.kind)) {
+    return '该补采任务不能直接重跑，请返回管理后台重新预演并确认新计划后执行。'
+  }
+  return taskRecoveryAdvice(task)
 }
 
 function stepStatusText(status: TaskStatus) {
@@ -466,7 +481,7 @@ function openTask(task: TaskCenterItem) {
                     </ol>
                     <div v-if="showTaskError(task) && task.error" class="task-error">{{ task.error }}</div>
                     <code v-if="task.error_code" class="error-code">{{ task.error_code }}</code>
-                    <div class="recovery">{{ taskRecoveryAdvice(task) }}</div>
+                    <div class="recovery">{{ recoveryAdvice(task) }}</div>
                   </td>
                   <td class="time-cell qv-tnum">{{ formatTaskTime(task.created_at) }}</td>
                   <td class="action-cell">
@@ -559,7 +574,7 @@ function openTask(task: TaskCenterItem) {
               </ol>
               <div v-if="showTaskError(task) && task.error" class="task-error mobile-error">{{ task.error }}</div>
               <code v-if="task.error_code" class="error-code">{{ task.error_code }}</code>
-              <p class="recovery mobile-recovery">{{ taskRecoveryAdvice(task) }}</p>
+              <p class="recovery mobile-recovery">{{ recoveryAdvice(task) }}</p>
               <div class="mobile-task-actions">
                 <span v-if="task.raw_status && task.raw_status !== task.status" class="raw-status">
                   原始状态 {{ task.raw_status }}

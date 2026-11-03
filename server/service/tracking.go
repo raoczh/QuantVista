@@ -253,18 +253,21 @@ func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.Re
 	db := common.DB.WithContext(ctx)
 	benchCache := map[string][]datasource.Bar{}
 	benchTried := map[string]bool{}
-	getBench := func(market string) []datasource.Bar {
+	getBench := func(market string) ([]datasource.Bar, error) {
 		if benchTried[market] {
-			return benchCache[market]
+			return benchCache[market], nil
 		}
 		benchTried[market] = true
 		if _, bars, err := s.market.GetBenchmarkBars(ctx, market, benchBarLimit); err == nil {
 			// 缓存前一次性升序排序：4 路并发 goroutine 共享该 slice，benchRange 不得再
 			// 原地 sort——原地排序共享数组是真数据竞争（#27d）。
 			sort.Slice(bars, func(i, j int) bool { return bars[i].TradeDate < bars[j].TradeDate })
+			if err := persistTrackingCalendar(ctx, market, bars); err != nil {
+				return nil, fmt.Errorf("补充追踪交易日历失败: %w", err)
+			}
 			benchCache[market] = bars
 		}
-		return benchCache[market]
+		return benchCache[market], nil
 	}
 
 	count := 0
@@ -313,7 +316,10 @@ func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.Re
 			continue // 全部终态冻结，跳过整批（含基准/持仓查询与上游请求）
 		}
 		recDate := b.CreatedAt.In(time.Local).Format("2006-01-02")
-		bench := getBench(b.Market)
+		bench, err := getBench(b.Market)
+		if err != nil {
+			return count, err
+		}
 		posByRec := map[int64]model.Position{}
 		var prows []model.Position
 		if err := db.Where("user_id = ? AND recommendation_id IN ? AND buy_price > 0", b.UserID, recIDs).
@@ -398,11 +404,6 @@ func (s *TrackingService) evaluateOne(ctx context.Context, batch model.Recommend
 		}
 		detail = *parsed
 	}
-	tradeDates, err := trackingTradeDates(ctx, rec.Market, recDate, time.Now().In(time.Local).Format("2006-01-02"))
-	if err != nil {
-		return nil, err
-	}
-
 	st := &model.RecommendationStatus{
 		RecommendationID: rec.ID,
 		BatchID:          batch.ID,
@@ -415,10 +416,26 @@ func (s *TrackingService) evaluateOne(ctx context.Context, batch model.Recommend
 		ValidDays:        detail.ValidDays,
 	}
 
-	// 推荐日之后的日线（升序）+ 生成时点收盘锚（重锚检测）。
+	now := time.Now().In(datasource.ChinaMarketLocation())
+	asOfDate := now.Format(time.DateOnly)
+	if rec.Market == "cn" {
+		asOfDate = expectedQuoteDate(now, isTradingDayToday(now), prevOpenTradeDate(asOfDate))
+		if asOfDate < recDate {
+			asOfDate = recDate
+		}
+	}
+	tradeDates, err := trackingTradeDates(ctx, rec.Market, recDate, asOfDate)
+	if err != nil {
+		return nil, err
+	}
+	// 先冻结市场日历再取个股日线，不能让错误个股日期改写休市事实后自证有效。
+	// 缺失市场日历由批次已取得的基准日期补齐，不用个股停牌序列推断市场休市。
 	bars, refAnchorClose, err := s.symbolBarsAfter(ctx, rec.Market, rec.Symbol, recDate, rec.RefDate)
 	if err != nil {
 		return nil, err
+	}
+	for len(bars) > 0 && bars[len(bars)-1].TradeDate > asOfDate {
+		bars = bars[:len(bars)-1]
 	}
 	openDates := make(map[string]bool, len(tradeDates))
 	for _, date := range tradeDates {
@@ -453,6 +470,7 @@ func (s *TrackingService) evaluateOne(ctx context.Context, batch model.Recommend
 	// 时刻下限才拦得住），旧价 bar 会驱动止盈止损触达误判。
 	if q, fi, err := s.market.GetFreshQuote(ctx, rec.Market, rec.Symbol); err == nil && q != nil && q.Price > 0 && fi.Status == freshStatusFresh {
 		now := time.Now().In(time.Local)
+		bars = dropSupersededTrackingDay(bars, now, recDate, q.DataTime)
 		if shouldAppendQuoteBar(now, recDate, bars, q.DataTime) {
 			today := now.Format("2006-01-02")
 			high, low := q.High, q.Low
@@ -478,6 +496,9 @@ func (s *TrackingService) evaluateOne(ctx context.Context, batch model.Recommend
 		TradeDates:       tradeDates,
 		ElapsedTradeDays: elapsed,
 	})
+	if err := validateTrackingSettlement(ctx, rec, tradeDates, bars, res, detail.ValidDays); err != nil {
+		return nil, err
+	}
 	benchDate := rec.RefDate
 	if benchDate == "" {
 		benchDate = recDate

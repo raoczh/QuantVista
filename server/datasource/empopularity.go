@@ -1,11 +1,9 @@
 package datasource
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 )
@@ -36,23 +34,15 @@ func GetPopularityTop(ctx context.Context) ([]PopularityRow, error) {
 		"pageSize":   100,
 	}
 	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, popularityURL, bytes.NewReader(body))
+	// 只读榜单查询可安全重放，正文与业务字段保持不变。
+	raw, status, err := doHTTPRequest(ctx, http.MethodPost, popularityURL, string(body),
+		map[string]string{"Content-Type": "application/json"},
+		httpRequestPolicy{retryBackoff: httpRetryBackoff})
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", browserUA)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: http %d", ErrUpstream, resp.StatusCode)
-	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
 	}
 	return parsePopularity(raw)
 }

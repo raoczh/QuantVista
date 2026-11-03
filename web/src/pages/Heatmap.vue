@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { computed, ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { NRadioGroup, NRadioButton, NButton, NSpin, NEmpty, NAlert, useMessage } from 'naive-ui'
 import * as echarts from 'echarts'
@@ -16,6 +16,7 @@ const kind = ref<BoardKind>('industry')
 const boards = ref<BoardHeat[]>([])
 const loading = ref(false)
 const loadError = ref('')
+const usesSinaClassification = computed(() => boards.value.some((board) => board.source === 'sina'))
 
 const chartEl = ref<HTMLDivElement | null>(null)
 let chart: echarts.ECharts | null = null
@@ -91,7 +92,8 @@ function renderChart() {
         return `<div style="font-weight:600;margin-bottom:4px">${echarts.format.encodeHTML(b.name)} <span style="opacity:.6;font-size:12px">${echarts.format.encodeHTML(b.code)}</span></div>
           <div>涨跌幅：<span style="color:${col};font-weight:600">${sign}${b.change_pct.toFixed(2)}%</span></div>
           <div>成交额：${fmtYi(b.amount)}</div>
-          <div>涨/跌家数：<span style="color:${upColor.value}">${b.advances}</span> / <span style="color:${downColor.value}">${b.declines}</span></div>
+          <div>涨/跌家数：${b.counts_available === false ? '来源未提供' : `<span style="color:${upColor.value}">${b.advances}</span> / <span style="color:${downColor.value}">${b.declines}</span>`}</div>
+          <div>来源：${b.source === 'sina' ? '新浪分类' : '东方财富分类'}${b.member_count ? ` · ${b.member_count} 只成员` : ''}</div>
           <div>领涨股：${echarts.format.encodeHTML(b.leader || '-')}</div>`
       },
     },
@@ -192,11 +194,14 @@ onUnmounted(() => {
       <p v-else class="heatmap-status">
         {{ boards.length ? `已载入 ${boards.length} 个板块 · 数据时间由行情源返回，当前接口未提供统一时间` : '等待板块行情' }}；点击色块进入板块详情。
       </p>
+      <n-alert v-if="usesSinaClassification" type="info" :bordered="false" class="load-alert">
+        当前使用新浪备用分类。板块名称、成员和统计口径可能与东财不同，不能直接对比切换前后的数值；未提供的涨跌家数不记为 0，详情不拼接东财指数或资金流。
+      </n-alert>
       <n-spin :show="loading && !boards.length">
         <div v-show="boards.length" ref="chartEl" class="heatmap-chart"></div>
         <n-empty
           v-if="!loading && !boards.length"
-          description="板块热度依赖东财接口，当前限流暂不可用，稍后重试"
+          description="暂无可用板块行情，请检查主备数据源或稍后重试"
         />
       </n-spin>
     </SectionCard>

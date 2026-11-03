@@ -17,12 +17,16 @@ import (
 
 // MarketService 行情业务：缓存 → 数据源适配层 → 落库快照。
 type MarketService struct {
-	mgr       *datasource.Manager
-	cacheOnce sync.Once
-	cache     *marketResponseCache
+	mgr         *datasource.Manager
+	cacheOnce   sync.Once
+	cache       *marketResponseCache
+	financeOnce sync.Once
+	finance     *FinanceService
 	// Online reads and historical maintenance share the same adjusted-only routing.
 	// Tests can still inject a separate full-market source.
 	wide wideSource
+	// Quote validation uses an injectable clock without changing scheduler time.
+	quoteNow func() time.Time
 }
 
 // wideSource 全市场链路依赖的能力子集（生产使用 Manager；测试可注入假源）。
@@ -70,18 +74,15 @@ func (s *MarketService) GetFreshQuote(ctx context.Context, market, symbol string
 		return q, quoteFreshInfo{Status: freshStatusUnknown, MarketState: marketStateClosed}, err
 	}
 
-	now := time.Now().In(datasource.ChinaMarketLocation())
-	isTrading := isTradingDayToday(now)
-	state := cnMarketState(now, isTrading)
-	expected := expectedQuoteDate(now, isTrading, prevOpenTradeDate(now.Format("2006-01-02")))
+	judge := s.freshnessJudge(ctx, market)
 	accept := func(q *datasource.Quote) bool {
-		return quoteFreshness(q.DataTime, now, state, expected).Status == freshStatusFresh
+		return q != nil && judge(q.DataTime).Status == freshStatusFresh
 	}
 	info := func(q *datasource.Quote) quoteFreshInfo {
 		if q == nil {
-			return quoteFreshInfo{Status: freshStatusStale, MarketState: state, ExpectedDate: expected}
+			return judge(time.Time{})
 		}
-		return quoteFreshness(q.DataTime, now, state, expected)
+		return judge(q.DataTime)
 	}
 
 	quote, err := marketCachedJSON(ctx, s.responseCache(), "quote:v2:"+market+":"+symbol, quoteCacheTTL,
@@ -109,18 +110,7 @@ func (s *MarketService) QuoteFreshnessOf(market string, dataTime time.Time) quot
 // ——列表富化（自选/ETF/持仓等展示行统一过期徽标）对每行打 freshness_status 用它，
 // 避免每行重复查交易日历。
 func (s *MarketService) FreshnessJudge(market string) func(dataTime time.Time) quoteFreshInfo {
-	if market != "cn" {
-		return func(time.Time) quoteFreshInfo {
-			return quoteFreshInfo{Status: freshStatusUnknown, MarketState: marketStateClosed}
-		}
-	}
-	now := time.Now().In(datasource.ChinaMarketLocation())
-	isTrading := isTradingDayToday(now)
-	state := cnMarketState(now, isTrading)
-	expected := expectedQuoteDate(now, isTrading, prevOpenTradeDate(now.Format("2006-01-02")))
-	return func(dataTime time.Time) quoteFreshInfo {
-		return quoteFreshness(dataTime, now, state, expected)
-	}
+	return s.freshnessJudge(context.Background(), market)
 }
 
 // FreshQuoteResult 批量新鲜行情的单只结果（Quote 可为 nil=拉取失败）。
@@ -188,7 +178,7 @@ func (s *MarketService) FreshnessView(market string, q *datasource.Quote) *Quote
 	if !dataTime.IsZero() {
 		v.SourceDataTime = dataTime.In(datasource.ChinaMarketLocation()).Format("2006-01-02 15:04:05")
 	}
-	if fi.Status == freshStatusStale {
+	if fi.Status != freshStatusFresh {
 		if note, _ := stockFreshnessNote(fi, dataTime); note != "" {
 			v.StaleReason = note
 		}
@@ -206,10 +196,11 @@ func (s *MarketService) GetDailyBars(ctx context.Context, market, symbol string,
 	// Chart, indicators and chips request different tails of the same 250-day history.
 	// One canonical window also supplies enough overlap for adjustment validation.
 	fetchLimit := max(limit, wideBarLimit)
-	cacheKey := fmt.Sprintf("bars:qfq-v2:%s:%s:%d", market, symbol, fetchLimit)
-	bars, err := marketCachedJSON(ctx, s.responseCache(), cacheKey, dailyBarsCacheTTL,
+	policy := currentDailyBarPolicy(market, time.Now())
+	cacheKey := fmt.Sprintf("bars:qfq-v2:%s:%s:%d:%s", market, symbol, fetchLimit, policy.cacheScope)
+	bars, err := marketCachedJSON(ctx, s.responseCache(), cacheKey, policy.cacheTTL,
 		func(fetchContext context.Context) ([]datasource.Bar, error) {
-			series, fetchErr := s.mgr.GetDailyBars(fetchContext, market, symbol, fetchLimit)
+			series, _, fetchErr := s.mgr.GetDailyBarsFresh(fetchContext, market, symbol, fetchLimit, policy.expectedDate)
 			if fetchErr != nil {
 				return nil, fetchErr
 			}
@@ -501,6 +492,9 @@ func (s *MarketService) persistDailyBarsChecked(ctx context.Context, market, sym
 	})
 	if errors.Is(err, errBarBasisUnverified) && ctx.Err() == nil && !errors.Is(err, errRebaseInProgress) {
 		err = errors.Join(err, s.markStatePending(ctx, market, symbol))
+	}
+	if err == nil && initialized {
+		s.invalidateDailyBars(market, symbol)
 	}
 	return err
 }

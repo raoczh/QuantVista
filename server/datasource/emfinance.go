@@ -231,10 +231,10 @@ func emStatementPage(ctx context.Context, kind, code, companyType string, dates 
 	return rawToDcRows(parsed.Data)
 }
 
-// finGet 与 datacenter 共享逐次节流及单层 HTTP 重试，保留调用方取消原因。
+// finGet 与 datacenter 共享逐次节流、Retry-After 冷却及单层 HTTP 重试。
 func finGet(ctx context.Context, u string) ([]byte, error) {
 	body, status, err := doGetWithPolicy(ctx, u, map[string]string{"Referer": "https://emweb.securities.eastmoney.com/"},
-		httpRequestPolicy{beforeAttempt: dcThrottle, retryBackoff: dcRetryBackoff})
+		httpRequestPolicy{beforeAttempt: dcThrottle, onRetryAfter: dcDeferUntil, retryBackoff: dcRetryBackoff})
 	if err != nil {
 		return nil, err
 	}

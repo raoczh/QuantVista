@@ -10,6 +10,12 @@ func (provider *TencentAdapter) ProvidesForwardAdjustedDailyBars() bool   { retu
 func (provider *SinaAdapter) ProvidesForwardAdjustedDailyBars() bool      { return false }
 
 func (manager *Manager) GetCNSpotSnapshot(ctx context.Context) ([]SpotRow, error) {
+	return manager.GetCNSpotSnapshotChecked(ctx, nil)
+}
+
+// GetCNSpotSnapshotChecked applies the consumer's date/completeness contract
+// before choosing a source, so a nonempty but unusable primary can fall back.
+func (manager *Manager) GetCNSpotSnapshotChecked(ctx context.Context, accept func([]SpotRow) error) ([]SpotRow, error) {
 	return routeCap(manager, ctx, "cn", "spot_snapshot", func(ctx context.Context, adapter Adapter) ([]SpotRow, error) {
 		provider, supported := adapter.(SpotSnapshotProvider)
 		if !supported {
@@ -18,6 +24,9 @@ func (manager *Manager) GetCNSpotSnapshot(ctx context.Context) ([]SpotRow, error
 		rows, err := provider.GetCNSpotSnapshot(ctx)
 		if err == nil && len(rows) == 0 {
 			err = ErrNoData
+		}
+		if err == nil && accept != nil {
+			err = accept(rows)
 		}
 		return rows, err
 	})

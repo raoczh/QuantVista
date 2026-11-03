@@ -756,7 +756,8 @@ func reportDataDeficiencies(snap *reportSnapshot, date string) []string {
 
 func reportStaleMetadata(block map[string]any, note string) map[string]any {
 	out := map[string]any{"stale_for_today": true, "stale_note": note}
-	for _, key := range []string{"name", "code", "source", "trade_date", "data_time", "captured_at"} {
+	for _, key := range []string{"name", "code", "symbol", "source", "trade_date", "data_time", "captured_at",
+		"source_data_time", "source_time_status", "freshness_status", "expected_as_of"} {
 		if value, ok := block[key]; ok {
 			out[key] = value
 		}

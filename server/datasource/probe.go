@@ -205,6 +205,51 @@ func probeCall(ctx context.Context, a Adapter, spec CapabilitySpec) error {
 			err = ErrNoData
 		}
 		return err
+	case "board_industry", "board_concept":
+		provider, supported := a.(BoardHeatProvider)
+		if !supported {
+			return ErrNotSupported
+		}
+		kind := "industry"
+		if spec.Capability == "board_concept" {
+			kind = "concept"
+		}
+		rows, err := provider.GetBoardHeatLimited(ctx, kind, 1)
+		if err == nil && len(rows) == 0 {
+			err = ErrNoData
+		}
+		return err
+	case "board_stocks":
+		provider, supported := a.(BoardConstituentsProvider)
+		if !supported {
+			return ErrNotSupported
+		}
+		code := "BK0447"
+		if spec.Source == "sina" {
+			code = "sina:new_blhy"
+		}
+		rows, err := provider.GetBoardConstituents(ctx, code, 1)
+		if err == nil && len(rows) == 0 {
+			err = ErrNoData
+		}
+		return err
+	case "board_bars", "board_fundflow":
+		provider, supported := a.(BoardHistoryProvider)
+		if !supported {
+			return ErrNotSupported
+		}
+		if spec.Capability == "board_bars" {
+			rows, err := provider.GetBoardKline(ctx, "BK0447", 1)
+			if err == nil && len(rows) == 0 {
+				err = ErrNoData
+			}
+			return err
+		}
+		rows, err := provider.GetBoardFundFlow(ctx, "BK0447", 1)
+		if err == nil && len(rows) == 0 {
+			err = ErrNoData
+		}
+		return err
 	case "breadth":
 		p, ok := a.(BreadthProvider)
 		if !ok {
@@ -320,6 +365,10 @@ func probeCode(err error) (string, ProbeOutcome) {
 	if errors.Is(err, ErrNotSupported) {
 		return "NOT_SUPPORTED", ProbeError
 	}
+	var localWait *localSourceWaitError
+	if errors.As(err, &localWait) {
+		return "LOCAL_SOURCE_WAIT", ProbeError
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "UPSTREAM_TIMEOUT", ProbeError
 	}
@@ -372,15 +421,20 @@ func (m *Manager) Probe(ctx context.Context, source, capability, market string) 
 
 	pctx, cancel := context.WithTimeout(ctx, probeTimeout(spec))
 	defer cancel()
+	pctx, activity := trackSourceRequests(pctx)
 	result.SampleCount = 1
 	started := time.Now()
 	err = probeCall(pctx, a, spec)
-	if contextErr := pctx.Err(); contextErr != nil {
+	localWait := activity.localWaitFailure(err)
+	if localWait != nil {
+		err = localWait
+		result.SampleCount = 0
+	} else if contextErr := pctx.Err(); contextErr != nil {
 		err = contextErr // 适配器包装错误不能丢失探测超时/用户取消的真实原因。
 	}
 	result.LatencyMs = time.Since(started).Milliseconds()
 	result.Code, result.Outcome = probeCode(err)
-	if m.health != nil && ctx.Err() == nil {
+	if m.health != nil && ctx.Err() == nil && localWait == nil {
 		if err == nil {
 			m.health.RecordForMarket(source, capability, market, outcomeSuccess, result.LatencyMs)
 		} else if errors.Is(err, ErrNoData) {
