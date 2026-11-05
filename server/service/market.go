@@ -27,6 +27,7 @@ type MarketService struct {
 	wide wideSource
 	// Quote validation uses an injectable clock without changing scheduler time.
 	quoteNow func() time.Time
+	dailyNow func() time.Time
 }
 
 // wideSource 全市场链路依赖的能力子集（生产使用 Manager；测试可注入假源）。
@@ -193,24 +194,15 @@ func (s *MarketService) GetDailyBars(ctx context.Context, market, symbol string,
 		limit = 120
 	}
 	limit = min(limit, 1023)
-	// Chart, indicators and chips request different tails of the same 250-day history.
-	// One canonical window also supplies enough overlap for adjustment validation.
-	fetchLimit := max(limit, wideBarLimit)
-	policy := currentDailyBarPolicy(market, time.Now())
-	cacheKey := fmt.Sprintf("bars:qfq-v2:%s:%s:%d:%s", market, symbol, fetchLimit, policy.cacheScope)
+	// The extra candle keeps 250 completed sessions available during trading.
+	// Recommendation scoring, charts and tracking share this same request key.
+	fetchLimit := max(limit, wideBarLimit+1)
+	now := s.dailyTime()
+	policy := currentDailyBarPolicy(market, now)
+	cacheKey := fmt.Sprintf("bars:qfq-v2:%s:%s:%d:%s:%d", market, symbol, fetchLimit, policy.cacheScope, dailyBarRevision(market, symbol).Load())
 	bars, err := marketCachedJSON(ctx, s.responseCache(), cacheKey, policy.cacheTTL,
 		func(fetchContext context.Context) ([]datasource.Bar, error) {
-			series, _, fetchErr := s.mgr.GetDailyBarsFresh(fetchContext, market, symbol, fetchLimit, policy.expectedDate)
-			if fetchErr != nil {
-				return nil, fetchErr
-			}
-			if validationErr := validateAdjustedBars(market, series); validationErr != nil {
-				return nil, validationErr
-			}
-			if persistenceErr := s.persistDailyBars(fetchContext, market, symbol, series); persistenceErr != nil {
-				common.SysWarn("日线缓存持久化失败 %s.%s: %v", market, symbol, persistenceErr)
-			}
-			return series, nil
+			return s.refreshDailyHistory(fetchContext, market, symbol, fetchLimit, policy.expectedDate, now)
 		})
 	if err != nil {
 		return nil, err
@@ -421,6 +413,23 @@ func (s *MarketService) fetchOverview(ctx context.Context, market string) *Overv
 
 var errUnadjustedBars = errors.New("日线包含新浪不复权历史，前复权序列需完整重建后才能用于分析")
 
+func dailyHistoryFailureReason(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "日线读取已取消，未参与量化评分"
+	case errors.Is(err, errBarBasisUnverified), errors.Is(err, errUnadjustedBars):
+		return "日线复权基准尚未核验完成，请先补齐完整历史，未参与量化评分"
+	case errors.Is(err, errRebaseInProgress):
+		return "日线正在补采或重建，请完成后重试，未参与量化评分"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "日线取数超时，本地历史暂不能恢复，请检查补采任务，未参与量化评分"
+	case errors.Is(err, datasource.ErrNoData):
+		return "日线数据获取失败：数据源和本地均无可用历史，请先补采，未参与量化评分"
+	default:
+		return "日线读取或校验失败，请检查日线补采与数据源状态，未参与量化评分"
+	}
+}
+
 func validateAdjustedBars(market string, bars []datasource.Bar) error {
 	if market == "cn" {
 		for _, bar := range bars {
@@ -454,6 +463,9 @@ func (s *MarketService) persistDailyBarsWithState(ctx context.Context, market, s
 // 写入计划可以只包含缺口，但复权校验必须保留上游返回的完整窗口作为重叠锚点。
 func (s *MarketService) persistDailyBarsChecked(ctx context.Context, market, symbol string, bars, reference []datasource.Bar, initialized bool) error {
 	if common.DB == nil || len(bars) == 0 {
+		if initialized {
+			return datasource.ErrNoData
+		}
 		return nil
 	}
 	if ctx == nil {
@@ -470,8 +482,28 @@ func (s *MarketService) persistDailyBarsChecked(ctx context.Context, market, sym
 	if err := validateAdjustedBars(market, reference); err != nil {
 		return err
 	}
+	bars = completedDailyBarsAt(market, bars, s.dailyTime())
+	if len(bars) == 0 {
+		if initialized {
+			return fmt.Errorf("%w：尚无已完成日线", errDailyHistoryIncomplete)
+		}
+		return nil
+	}
+	var historyCoverageError error
+	priceBasisChanged := false
+	writeStartedAt := s.dailyTime()
 	err := withDailyBarWriteTx(ctx, market, []string{symbol}, func(tx *gorm.DB) error {
-		if err := s.persistDailyBarsTx(ctx, tx, market, symbol, bars, reference); err != nil {
+		var persistenceError error
+		priceBasisChanged, persistenceError = s.persistDailyBarsTx(ctx, tx, market, symbol, bars, reference)
+		if persistenceError != nil {
+			return persistenceError
+		}
+		if len(completedDailyBarsAt(market, reference, s.dailyTime())) >= wideBarLimit {
+			if err := tx.Model(&model.DailyBarWriteLock{}).Where("market = ? AND symbol = ?", market, symbol).Update("basis_unverified", false).Error; err != nil {
+				return err
+			}
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		var state struct {
@@ -482,36 +514,55 @@ func (s *MarketService) persistDailyBarsChecked(ctx context.Context, market, sym
 			Where("market = ? AND symbol = ?", market, symbol).Scan(&state).Error; err != nil {
 			return err
 		}
-		// 在线读取/有限窗口补采也会推进实际日线，已有宇宙水位必须与之原子更新。
-		// 只有明确完成全历史初始化的调用才能升级 init_status。
+		// Coverage comes from committed rows, not the requested or returned count.
 		updates := map[string]any{"bars_count": state.Count, "last_bar_date": state.Last}
 		if initialized {
-			updates["init_status"], updates["fail_count"], updates["last_error"] = "done", 0, ""
+			historyCoverageError = validateInitializedDailyHistory(tx, market, symbol, state.Count, state.Last, s.dailyTime())
+			if historyCoverageError == nil {
+				updates["init_status"], updates["fail_count"], updates["last_error"] = "done", 0, ""
+			} else {
+				updates["init_status"] = "pending"
+			}
+		} else if state.Count >= wideBarLimit && len(completedDailyBarsAt(market, reference, s.dailyTime())) >= wideBarLimit {
+			// A checked full-window repair can also finish a previously pending
+			// initialization. A small patch must not certify the whole history.
+			if validationError := validateInitializedDailyHistory(tx, market, symbol, state.Count, state.Last, s.dailyTime()); validationError == nil {
+				updates["init_status"], updates["fail_count"], updates["last_error"] = "done", 0, ""
+			}
 		}
 		return tx.Model(&model.MarketSyncState{}).Where("market = ? AND symbol = ?", market, symbol).Updates(updates).Error
 	})
 	if errors.Is(err, errBarBasisUnverified) && ctx.Err() == nil && !errors.Is(err, errRebaseInProgress) {
-		err = errors.Join(err, s.markStatePending(ctx, market, symbol))
+		err = errors.Join(err, s.markStatePending(ctx, market, symbol, writeStartedAt))
 	}
-	if err == nil && initialized {
-		s.invalidateDailyBars(market, symbol)
+	if err == nil {
+		if initialized {
+			s.invalidateDailyBars(market, symbol)
+		} else if priceBasisChanged {
+			// The current online fetch owns an active cache flight. Advancing
+			// its key invalidates other readers without canceling this request.
+			dailyBarRevision(market, symbol).Add(1)
+		}
+	}
+	if err == nil {
+		return historyCoverageError
 	}
 	return err
 }
 
 // 调用方已持有同一标的的事务锁；历史校验与窗口写入必须共用 db。
-func (s *MarketService) persistDailyBarsTx(ctx context.Context, db *gorm.DB, market, symbol string, bars, reference []datasource.Bar) error {
+func (s *MarketService) persistDailyBarsTx(ctx context.Context, db *gorm.DB, market, symbol string, bars, reference []datasource.Bar) (bool, error) {
 	// M1 除权检测（防"部分窗口重写"漏检）：本次拉取若与 DB 内已有窗口的 close 多点
 	// 比对出现偏差，说明发生了除权/送转（东财前复权序列整体重锚）——此时只 upsert
 	// 本窗会留下"窗口内新基准、窗口外旧基准"的断层。检测命中即全量重锚（250 根删+插）
 	// 后直接返回。腾讯备用前复权历史也必须核验，不能借换源绕开重锚。
-	if market == "cn" && len(reference) > 0 && (reference[0].Source == "eastmoney" || reference[0].Source == "tencent") {
+	if market == "cn" && len(reference) > 0 && (reference[0].Source == "eastmoney" || reference[0].Source == "tencent" || reference[0].Source == "sina_qfq") {
 		rebased, err := s.detectAndRebase(ctx, db, market, symbol, reference)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if rebased {
-			return nil
+			return true, nil
 		}
 	}
 
@@ -528,17 +579,20 @@ func (s *MarketService) persistDailyBarsTx(ctx context.Context, db *gorm.DB, mar
 			source = "unknown"
 		}
 		dailyRows = append(dailyRows, model.DailyBar{
-			Symbol:       symbol,
-			Market:       market,
-			TradeDate:    b.TradeDate,
-			Open:         b.Open,
-			High:         b.High,
-			Low:          b.Low,
-			Close:        b.Close,
-			Volume:       b.Volume,
-			Amount:       b.Amount,
-			TurnoverRate: b.TurnoverRate,
-			Source:       source,
+			Symbol:         symbol,
+			Market:         market,
+			TradeDate:      b.TradeDate,
+			Open:           b.Open,
+			High:           b.High,
+			Low:            b.Low,
+			Close:          b.Close,
+			Volume:         b.Volume,
+			Amount:         b.Amount,
+			TurnoverRate:   b.TurnoverRate,
+			Source:         source,
+			AmountSource:   b.AmountSource,
+			TurnoverSource: b.TurnoverSource,
+			UpdatedAt:      s.dailyTime(),
 		})
 		if _, ok := seenTradeDates[b.TradeDate]; !ok {
 			calendarRows = append(calendarRows, model.TradingCalendar{
@@ -551,34 +605,11 @@ func (s *MarketService) persistDailyBarsTx(ctx context.Context, db *gorm.DB, mar
 	}
 
 	if len(dailyRows) > 0 {
-		// 腾讯前复权日线未提供成交额/换手率，本批全缺失时不覆盖已存真实值。
-		updateCols := []string{"open", "high", "low", "close", "volume", "source"}
-		hasAmount, hasTurnover := false, false
-		for _, r := range dailyRows {
-			if r.Amount > 0 {
-				hasAmount = true
-			}
-			if r.TurnoverRate > 0 {
-				hasTurnover = true
-			}
-			if hasAmount && hasTurnover {
-				break
-			}
-		}
-		if hasAmount {
-			updateCols = append(updateCols, "amount")
-		}
-		if hasTurnover {
-			updateCols = append(updateCols, "turnover_rate")
-		}
-		if err := db.Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "trade_date"}},
-			DoUpdates: clause.AssignmentColumns(updateCols),
-		}).CreateInBatches(dailyRows, 200).Error; err != nil && err != gorm.ErrEmptySlice {
+		if err := upsertDailyBarRows(db, dailyRows); err != nil {
 			// 关键失败：daily_bars 落库失败必须上抛，否则历史初始化调用点会误把
 			// 这只标 done、留下永久缺口（宽表/因子/回测都读不到它）。
 			common.SysWarn("落库 daily_bars 失败 %s: %v", symbol, err)
-			return fmt.Errorf("落库 daily_bars 失败 %s: %w", symbol, err)
+			return false, fmt.Errorf("落库 daily_bars 失败 %s: %w", symbol, err)
 		}
 	}
 
@@ -591,7 +622,7 @@ func (s *MarketService) persistDailyBarsTx(ctx context.Context, db *gorm.DB, mar
 			common.SysWarn("落库 trading_calendar 失败 %s: %v", market, err)
 		}
 	}
-	return nil
+	return false, nil
 }
 func (s *MarketService) persist(ctx context.Context, q *datasource.Quote) {
 	if common.DB == nil {

@@ -140,10 +140,11 @@ type candidate struct {
 	// 时相同下标对应不同交易日，位置对齐会失真）；lastBar* 生成时点最近收盘日与
 	// 收盘价（S0-4 价格版本，防前复权重锚——落库进 Recommendation.RefDate/RefClose
 	// 与标签行）。
-	closes       []float64
-	closeDates   []string
-	lastBarDate  string
-	lastBarClose float64
+	closes         []float64
+	closeDates     []string
+	lastBarDate    string
+	lastBarClose   float64
+	dailyDataIssue bool
 }
 
 // sourceLabelCN 候选来源的中文标签（落库英文 key，前端映射展示）。
@@ -1115,7 +1116,15 @@ func (s *RecommendationService) failEmptyShortlist(batch *model.RecommendationBa
 	batch.FiltersJSON = string(filtersJSON)
 	batch.CandidateCount = kept
 	var msg string
-	if hasStale {
+	dailyIssueCount := 0
+	for _, stock := range pool {
+		if stock.dailyDataIssue {
+			dailyIssueCount++
+		}
+	}
+	if dailyIssueCount > 0 {
+		msg = fmt.Sprintf("筛选后没有可推荐标的，其中 %d 只日线获取失败、过旧或历史不足；请先在系统管理执行全市场日线补采并核对覆盖，再重试。放宽股价/市值筛选不能修复日线缺口", dailyIssueCount)
+	} else if hasStale {
 		msg = "候选行情已全部过期（可能停牌、休市异常或数据源故障）：为避免基于旧价推荐，本次不生成，请稍后重试"
 	} else {
 		excluded := len(pool) - kept
@@ -2616,6 +2625,7 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 		sem := make(chan struct{}, 6) // 并发上限：48 只 × 210 根日线约 3~8s，免费源经不起更狠的并发
 		var mu sync.Mutex
 		barsBy := map[int][]datasource.Bar{}
+		dailyErrors := make(map[int]error)
 		for _, i := range idxs {
 			wg.Add(1)
 			sem <- struct{}{}
@@ -2625,6 +2635,9 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 				// 选股策略取 250 根，其余策略取 210 根；筹码与五维评分仍按各自窗口截尾。
 				bars, err := s.market.GetDailyBars(ctx, pool[i].Market, pool[i].Symbol, barLimit+1)
 				if err != nil {
+					mu.Lock()
+					dailyErrors[i] = err
+					mu.Unlock()
 					return
 				}
 				mu.Lock()
@@ -2639,9 +2652,15 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 		computed := make([]int, 0, len(idxs))
 		preheat := make([]recPreheatCandidate, 0, len(idxs))
 		for _, i := range idxs {
+			if dailyError := dailyErrors[i]; dailyError != nil {
+				pool[i].Excluded = dailyHistoryFailureReason(dailyError)
+				pool[i].dailyDataIssue = true
+				continue
+			}
 			bars, reason := recommendationCompletedBars(barsBy[i], pool[i])
 			if reason != "" {
 				pool[i].Excluded = reason
+				pool[i].dailyDataIssue = true
 				continue
 			}
 			if len(bars) > barLimit {
@@ -2734,6 +2753,7 @@ func (s *RecommendationService) scorePool(ctx context.Context, recType string, s
 			// N2 消息面因子：当日聚合情绪分（缓存表命中即读，缺则由当日新闻合成一次）。
 			if _, missing, valid := qualityBaseScore(recType, strat.baseKey, sc, factors); !valid || pool[i].SignalQuality.ATR == nil {
 				pool[i].Excluded = "核心技术数据不足，未参与排序：" + strings.Join(missing, "、")
+				pool[i].dailyDataIssue = true
 				continue
 			}
 			if sc, cnt, ok := stockDailySentiment(pool[i].Symbol, sentiDate); ok {

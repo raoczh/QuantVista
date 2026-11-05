@@ -34,10 +34,11 @@ type Bar struct {
 	Close     float64 `json:"close"`
 	Volume    int64   `json:"volume"` // 成交量，单位：手（各源统一口径，新浪原始为股、解析时 /100）
 	Amount    float64 `json:"amount"`
-	// TurnoverRate 当日换手率 %（筹码分布累积模型的核心输入）。仅东财日线自带（f61），
-	// 新浪兜底恒 0；0=缺失，消费方（chip.go）需按流通股本推断兜底。
-	TurnoverRate float64 `json:"turnover_rate,omitempty"`
-	Source       string  `json:"source"` // 实际命中的数据源
+	// TurnoverRate 当日换手率 %；0=缺失。可独立补齐真实成交事实，不能用复权价估算。
+	TurnoverRate   float64 `json:"turnover_rate,omitempty"`
+	Source         string  `json:"source"` // 实际命中的数据源
+	AmountSource   string  `json:"amount_source,omitempty"`
+	TurnoverSource string  `json:"turnover_source,omitempty"`
 }
 
 // Min5Bar 5 分钟线单根（腾讯 mkline，M3b 盘中因子的数据源）。
@@ -304,7 +305,7 @@ type ValuationProvider interface {
 }
 
 // AdjustedDailyProvider declares the price basis before a historical source is routed.
-// Raw Sina daily candles remain available to direct callers, not to stock analysis.
+// A declaration never permits raw equity prices to masquerade as adjusted bars.
 type AdjustedDailyProvider interface {
 	ProvidesForwardAdjustedDailyBars() bool
 }

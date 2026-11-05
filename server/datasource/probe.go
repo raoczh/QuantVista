@@ -195,6 +195,18 @@ func probeCall(ctx context.Context, a Adapter, spec CapabilitySpec) error {
 			err = ErrNoData
 		}
 		return err
+	case "daily_facts":
+		provider, supported := a.(DailyTradingFactsProvider)
+		if !supported {
+			return ErrNotSupported
+		}
+		observedAt := time.Now().In(ChinaMarketLocation())
+		from, to := observedAt.AddDate(0, 0, -13).Format(time.DateOnly), observedAt.Format(time.DateOnly)
+		facts, err := provider.GetDailyTradingFacts(ctx, market, probeSampleSymbol, from, to)
+		if err == nil {
+			_, err = validateDailyTradingFacts(facts, market, probeSampleSymbol, from, to, observedAt)
+		}
+		return err
 	case "sector":
 		p, ok := a.(SectorProvider)
 		if !ok {

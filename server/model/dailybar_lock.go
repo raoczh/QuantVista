@@ -6,4 +6,6 @@ package model
 type DailyBarWriteLock struct {
 	Market string `gorm:"size:8;primaryKey"`
 	Symbol string `gorm:"size:16;primaryKey"`
+	// Keep known adjustment failures even for stocks/ETFs outside the universe.
+	BasisUnverified bool `gorm:"not null;default:false"`
 }

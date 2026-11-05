@@ -46,3 +46,35 @@ func TestDailyRouteRetainsOldSeriesOnBudgetButNotCallerCancellation(test *testin
 		test.Fatalf("caller cancellation was ignored: %+v %v", rows, err)
 	}
 }
+
+func TestDailyRouteTriesCompleteBackupAfterCurrentShortPrimary(test *testing.T) {
+	const latestDate = "2026-09-04"
+	primary := &probeFakeAdapter{name: "eastmoney", daily: func(context.Context) ([]Bar, error) {
+		return []Bar{{TradeDate: latestDate, Close: 10}}, nil
+	}}
+	backup := &probeFakeAdapter{name: "tencent", daily: func(context.Context) ([]Bar, error) {
+		return []Bar{
+			{TradeDate: "2026-09-02", Close: 8},
+			{TradeDate: "2026-09-03", Close: 9},
+			{TradeDate: latestDate, Close: 10},
+		}, nil
+	}}
+	manager := NewManagerWithAdapters(primary, backup)
+	rows, fresh, err := manager.GetDailyBarsFresh(test.Context(), "cn", "600000", 3, latestDate)
+	if err != nil || !fresh || len(rows) != 3 || rows[0].Source != "tencent" {
+		test.Fatalf("a current date concealed truncated history: rows=%+v fresh=%v err=%v", rows, fresh, err)
+	}
+}
+
+func TestDailyRoutePreservesRealShortHistoryWhenBackupsFail(test *testing.T) {
+	primary := &probeFakeAdapter{name: "eastmoney", daily: func(context.Context) ([]Bar, error) {
+		return []Bar{{TradeDate: "2026-09-04", Close: 10}}, nil
+	}}
+	backup := &probeFakeAdapter{name: "tencent", daily: func(context.Context) ([]Bar, error) {
+		return nil, ErrUpstream
+	}}
+	rows, fresh, err := NewManagerWithAdapters(primary, backup).GetDailyBarsFresh(test.Context(), "cn", "600000", 250, "2026-09-04")
+	if err != nil || !fresh || len(rows) != 1 || rows[0].Source != "eastmoney" {
+		test.Fatalf("genuine short history should retain its actual date and count: %+v %v %v", rows, fresh, err)
+	}
+}

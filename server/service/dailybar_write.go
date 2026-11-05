@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"sync"
+	"time"
 
 	"quantvista/common"
 	"quantvista/datasource"
@@ -16,6 +17,47 @@ import (
 
 // 本进程重入快速返回；数据库行锁仍负责不同进程之间的完整事务隔离。
 var dailyBarWrites sync.Map
+
+// Group by fields actually supplied, rather than allowing one nonzero row to
+// erase the other rows' stored amount/turnover with a backup's missing values.
+func upsertDailyBarRows(database *gorm.DB, rows []model.DailyBar) error {
+	var rowsByAvailableFields [4][]model.DailyBar
+	for _, row := range rows {
+		availableFields := 0
+		if row.Amount > 0 {
+			availableFields |= 1
+			if row.AmountSource == "" {
+				row.AmountSource = sourceOrUnknown(row.Source)
+			}
+		}
+		if row.TurnoverRate > 0 {
+			availableFields |= 2
+			if row.TurnoverSource == "" {
+				row.TurnoverSource = sourceOrUnknown(row.Source)
+			}
+		}
+		rowsByAvailableFields[availableFields] = append(rowsByAvailableFields[availableFields], row)
+	}
+	for availableFields, group := range rowsByAvailableFields {
+		if len(group) == 0 {
+			continue
+		}
+		updateColumns := []string{"open", "high", "low", "close", "volume", "source", "updated_at"}
+		if availableFields&1 != 0 {
+			updateColumns = append(updateColumns, "amount", "amount_source")
+		}
+		if availableFields&2 != 0 {
+			updateColumns = append(updateColumns, "turnover_rate", "turnover_source")
+		}
+		if err := database.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "trade_date"}},
+			DoUpdates: clause.AssignmentColumns(updateColumns),
+		}).CreateInBatches(group, 200).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // withDailyBarWriteTx 在任何普通日线读取前持有标的锁。MySQL 可重复读的读视图
 // 因而在等待锁之后建立，校验与写入不能跨越另一个重锚事务。
@@ -94,6 +136,14 @@ func persistWideBarBatch(ctx context.Context, spots []datasource.SpotRow, tradeD
 		for _, symbol := range mixed {
 			unadjusted[symbol] = true
 		}
+		var unverifiedSymbols []string
+		if err := tx.Model(&model.DailyBarWriteLock{}).Where("market = ? AND symbol IN ? AND basis_unverified = ?", "cn", symbols, true).
+			Pluck("symbol", &unverifiedSymbols).Error; err != nil {
+			return err
+		}
+		for _, symbol := range unverifiedSymbols {
+			unadjusted[symbol] = true
+		}
 		bars := make([]model.DailyBar, 0, len(spots))
 		accepted := make([]string, 0, len(spots))
 		for _, spot := range spots {
@@ -104,22 +154,23 @@ func persistWideBarBatch(ctx context.Context, spots []datasource.SpotRow, tradeD
 			}
 			bars = append(bars, model.DailyBar{Market: "cn", Symbol: spot.Symbol, TradeDate: tradeDate,
 				Open: spot.Open, High: spot.High, Low: spot.Low, Close: spot.Price,
-				Volume: spot.Volume, Amount: spot.Amount, TurnoverRate: spot.TurnoverRate, Source: sourceOrUnknown(spot.Source)})
+				Volume: spot.Volume, Amount: spot.Amount, TurnoverRate: spot.TurnoverRate, Source: sourceOrUnknown(spot.Source), UpdatedAt: time.Now()})
 			accepted = append(accepted, spot.Symbol)
 		}
 		if len(blocked) > 0 {
+			if err := tx.Model(&model.DailyBarWriteLock{}).Where("market = ? AND symbol IN ?", "cn", blocked).
+				Update("basis_unverified", true).Error; err != nil {
+				return err
+			}
 			if err := tx.Model(&model.MarketSyncState{}).Where("market = ? AND symbol IN ?", "cn", blocked).
-				Updates(map[string]any{"init_status": "pending", "fail_count": 0}).Error; err != nil {
+				Updates(map[string]any{"init_status": "pending", "fail_count": 0, "last_error": errBarBasisUnverified.Error()}).Error; err != nil {
 				return err
 			}
 		}
 		if len(bars) == 0 {
 			return nil
 		}
-		if err := tx.Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "symbol"}, {Name: "market"}, {Name: "trade_date"}},
-			DoUpdates: clause.AssignmentColumns([]string{"open", "high", "low", "close", "volume", "amount", "turnover_rate", "source"}),
-		}).CreateInBatches(bars, 500).Error; err != nil {
+		if err := upsertDailyBarRows(tx, bars); err != nil {
 			return err
 		}
 		// 仅为实际已提交的 bar 推进水位，且不能回退另一路同步已写入的更新日期。
@@ -145,6 +196,9 @@ func persistWideBarBatch(ctx context.Context, spots []datasource.SpotRow, tradeD
 	}
 	if err != nil {
 		return 0, nil, err // 本批事务已回滚。
+	}
+	for _, symbol := range symbols {
+		dailyBarRevision("cn", symbol).Add(1)
 	}
 	return written, blocked, nil
 }

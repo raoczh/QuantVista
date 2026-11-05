@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -157,9 +158,28 @@ func (s *MarketService) detectAndRebase(ctx context.Context, db *gorm.DB, market
 		}
 		return true, nil
 	}
+	// Sina's ratio adjustment and the existing cash-adjusted history are not
+	// interchangeable, even where recent closes happen to match. Switch the
+	// entire series, never just the dates selected by a backfill plan.
+	var incompatibleBasis int64
+	basisQuery := db.Model(&model.DailyBar{}).Where("market = ? AND symbol = ?", market, symbol)
+	if len(fresh) > 0 && fresh[0].Source == "sina_qfq" {
+		basisQuery = basisQuery.Where("source <> ?", "sina_qfq")
+	} else {
+		basisQuery = basisQuery.Where("source = ?", "sina_qfq")
+	}
+	if err := basisQuery.Count(&incompatibleBasis).Error; err != nil {
+		return false, err
+	}
+	if incompatibleBasis > 0 {
+		if err := s.rebaseStockTx(ctx, db, market, symbol, fresh); err != nil {
+			return false, fmt.Errorf("%w，切换复权算法必须完整重建历史: %w", errBarBasisUnverified, err)
+		}
+		return true, nil
+	}
 	// 排除"今天"的根：当日 close 盘中持续变化（DB 里可能是早间价、fresh 是此刻价），
 	// 拿它比对会把盘中波动误判成除权。历史日的收盘值只有除权重锚才会变，才是可靠锚点。
-	today := time.Now().Format("2006-01-02")
+	today := s.dailyTime().Format("2006-01-02")
 	dates := make([]string, 0, len(fresh))
 	for _, b := range fresh {
 		if b.TradeDate != "" && b.TradeDate != today {
@@ -206,8 +226,8 @@ func (s *MarketService) rebaseWithoutOverlap(ctx context.Context, db *gorm.DB, m
 	if existing == 0 {
 		return false, nil
 	}
-	if len(fresh) < wideBarLimit*96/100 {
-		return false, errors.New("日线窗口缺少可比较的历史复权锚点，已保留原有序列；请使用完整历史窗口同步")
+	if len(fresh) < wideBarLimit {
+		return false, fmt.Errorf("%w，日线窗口缺少可比较的历史复权锚点，已保留原有序列；请使用完整历史窗口同步", errBarBasisUnverified)
 	}
 	if err := s.rebaseStockTx(ctx, db, market, symbol, fresh); err != nil {
 		return false, fmt.Errorf("%w，无重叠窗口的完整重建失败: %w", errBarBasisUnverified, err)
@@ -222,22 +242,35 @@ func (s *MarketService) rebaseStock(ctx context.Context, market, symbol string, 
 		return s.rebaseStockTx(ctx, tx, market, symbol, fresh)
 	})
 	if err == nil {
-		s.responseCache().ForgetPrefix("bars:qfq-v2:" + market + ":" + symbol + ":")
+		s.invalidateDailyBars(market, symbol)
 	}
 	return err
 }
 
 func (s *MarketService) rebaseStockTx(ctx context.Context, tx *gorm.DB, market, symbol string, fresh []datasource.Bar) error {
-	// fresh 接近全量（≥96%）直接复用，免一次重复拉取（初始化路径命中检测时即此情形）。
-	if len(fresh) < wideBarLimit*96/100 {
+	// A nearly complete window can still destroy a 250-session factor. Reuse
+	// only a full requested window, and validate the replacement before deleting.
+	fresh = completedDailyBarsAt(market, fresh, s.dailyTime())
+	requiredThrough := ""
+	for _, candle := range fresh {
+		if candle.TradeDate > requiredThrough {
+			requiredThrough = candle.TradeDate
+		}
+	}
+	if len(fresh) < wideBarLimit {
 		var err error
-		fresh, err = s.wideDailyBars(ctx, market, symbol, wideBarLimit)
+		refetchStartedAt := s.dailyTime()
+		fresh, err = s.wideDailyBars(ctx, market, symbol, wideBarLimit+1)
 		if err != nil {
 			return fmt.Errorf("重拉 %d 根失败: %w", wideBarLimit, err)
 		}
+		fresh = completedDailyBarsAt(market, fresh, refetchStartedAt)
 	}
 	if len(fresh) == 0 {
 		return errors.New("重拉结果为空")
+	}
+	if fresh[len(fresh)-1].TradeDate < requiredThrough {
+		return fmt.Errorf("重拉历史仅截至 %s，未覆盖本次已取得的 %s，不能用旧重拉结果冒充补采完成", fresh[len(fresh)-1].TradeDate, requiredThrough)
 	}
 	if err := validateAdjustedBars(market, fresh); err != nil {
 		return err
@@ -245,9 +278,13 @@ func (s *MarketService) rebaseStockTx(ctx context.Context, tx *gorm.DB, market, 
 	// Amount and turnover are actual trading facts, not adjusted prices. A
 	// backup without those fields must not erase known values for the same day.
 	var existingRows []model.DailyBar
-	if err := tx.Select("trade_date", "amount", "turnover_rate").
+	if err := tx.Select("trade_date", "amount", "turnover_rate", "amount_source", "turnover_source").
 		Where("market = ? AND symbol = ?", market, symbol).Find(&existingRows).Error; err != nil {
 		return err
+	}
+	minimumReplacement := min(len(existingRows), wideBarLimit)
+	if len(fresh) < minimumReplacement {
+		return fmt.Errorf("完整历史重拉仅返回 %d 根，至少需要保留 %d 根；已保留原有序列", len(fresh), minimumReplacement)
 	}
 	previousFacts := make(map[string]model.DailyBar, len(existingRows))
 	for _, previous := range existingRows {
@@ -259,19 +296,29 @@ func (s *MarketService) rebaseStockTx(ctx context.Context, tx *gorm.DB, market, 
 		if b.TradeDate == "" {
 			continue
 		}
+		if b.Amount > 0 && b.AmountSource == "" {
+			b.AmountSource = sourceOrUnknown(b.Source)
+		}
+		if b.TurnoverRate > 0 && b.TurnoverSource == "" {
+			b.TurnoverSource = sourceOrUnknown(b.Source)
+		}
 		if previous, exists := previousFacts[b.TradeDate]; exists {
 			if b.Amount == 0 {
 				b.Amount = previous.Amount
+				b.AmountSource = previous.AmountSource
 			}
 			if b.TurnoverRate == 0 {
 				b.TurnoverRate = previous.TurnoverRate
+				b.TurnoverSource = previous.TurnoverSource
 			}
 		}
 		rows = append(rows, model.DailyBar{
 			Symbol: symbol, Market: market, TradeDate: b.TradeDate,
 			Open: b.Open, High: b.High, Low: b.Low, Close: b.Close,
 			Volume: b.Volume, Amount: b.Amount, TurnoverRate: b.TurnoverRate,
-			Source: sourceOrUnknown(b.Source),
+			Source:       sourceOrUnknown(b.Source),
+			AmountSource: b.AmountSource, TurnoverSource: b.TurnoverSource,
+			UpdatedAt: s.dailyTime(),
 		})
 	}
 	if len(rows) == 0 {
@@ -296,7 +343,10 @@ func (s *MarketService) rebaseStockTx(ctx context.Context, tx *gorm.DB, market, 
 	if err := tx.CreateInBatches(rows, 200).Error; err != nil {
 		return err
 	}
-	return s.touchStateAfterRebase(tx, market, symbol, len(rows), last.TradeDate)
+	if err := s.touchStateAfterRebase(tx, market, symbol, len(rows), last.TradeDate); err != nil {
+		return err
+	}
+	return tx.Model(&model.DailyBarWriteLock{}).Where("market = ? AND symbol = ?", market, symbol).Update("basis_unverified", false).Error
 }
 
 // wideDailyBars uses the same adjusted-only fallback as online analysis.
@@ -348,19 +398,45 @@ func sourceOrUnknown(source string) string {
 // adjust_epoch 是审计字段，不影响正确性）。
 func (s *MarketService) touchStateAfterRebase(tx *gorm.DB, market, symbol string, barsCount int, lastDate string) error {
 	today := time.Now().Format("2006-01-02")
+	initializationStatus, coverageNote := "done", ""
+	if barsCount < wideBarLimit {
+		if coverageError := validateInitializedDailyHistory(tx, market, symbol, barsCount, lastDate, s.dailyTime()); coverageError != nil {
+			initializationStatus, coverageNote = "pending", truncate(coverageError.Error(), 256)
+		}
+	}
 	return tx.Model(&model.MarketSyncState{}).
 		Where("symbol = ? AND market = ?", symbol, market).
 		Updates(map[string]any{
 			"adjust_epoch": today, "bars_count": barsCount, "last_bar_date": lastDate,
-			"init_status": "done", "fail_count": 0, "last_error": "",
+			"init_status": initializationStatus, "fail_count": 0, "last_error": coverageNote,
 		}).Error
 }
 
 // markStatePending 重锚失败时把标的踢回 pending，让历史初始化任务下轮全量重拉修复断层。
-func (s *MarketService) markStatePending(ctx context.Context, market, symbol string) error {
-	return common.DB.WithContext(ctx).Model(&model.MarketSyncState{}).
-		Where("symbol = ? AND market = ?", symbol, market).
-		Updates(map[string]any{"init_status": "pending", "fail_count": 0}).Error
+func (s *MarketService) markStatePending(ctx context.Context, market, symbol string, attemptedAt ...time.Time) error {
+	err := withDailyBarWriteTx(ctx, market, []string{symbol}, func(database *gorm.DB) error {
+		if len(attemptedAt) > 0 {
+			var newerWrites int64
+			if err := database.Model(&model.DailyBar{}).Where("market = ? AND symbol = ? AND updated_at > ?", market, symbol, attemptedAt[0]).Count(&newerWrites).Error; err != nil {
+				return err
+			}
+			if newerWrites > 0 {
+				return nil // A later checked writer already owns the new state.
+			}
+		}
+		if err := database.Model(&model.DailyBarWriteLock{}).Where("market = ? AND symbol = ?", market, symbol).Update("basis_unverified", true).Error; err != nil {
+			return err
+		}
+		return database.Model(&model.MarketSyncState{}).
+			Where("symbol = ? AND market = ?", symbol, market).
+			Updates(map[string]any{"init_status": "pending", "fail_count": 0, "last_error": errBarBasisUnverified.Error()}).Error
+	})
+	if err == nil {
+		// This can run inside an online cache flight; do not cancel its caller
+		// while recording the failure that the caller still needs to report.
+		dailyBarRevision(market, symbol).Add(1)
+	}
+	return err
 }
 
 // ---------- 每日增量 ----------
@@ -758,6 +834,7 @@ func (s *MarketService) initMarketWideHistory(ctx context.Context) (*model.DataS
 	}
 	start := time.Now()
 	log := &model.DataSyncLog{Task: "init_market_history", Market: "cn"}
+	historyProgress := false
 	fail := func(err error) (*model.DataSyncLog, error) {
 		log.Total = log.Succeeded + log.Failed
 		log.Status, log.Message = "failed", truncate(err.Error(), 512)
@@ -798,6 +875,9 @@ func (s *MarketService) initMarketWideHistory(ctx context.Context) (*model.DataS
 	var srcFails []model.MarketSyncState
 	var srcFailErrs []string
 	recordFail := func(st *model.MarketSyncState, msg string, terminal bool) error {
+		if strings.HasPrefix(st.LastError, errBarBasisUnverified.Error()) && !strings.HasPrefix(msg, errBarBasisUnverified.Error()) {
+			msg = errBarBasisUnverified.Error() + ": " + msg
+		}
 		nextFailCount := st.FailCount + 1
 		if terminal {
 			nextFailCount = wideInitMaxFail
@@ -842,7 +922,9 @@ loop:
 				break loop
 			}
 			lastID = st.ID
-			bars, err := s.wideDailyBars(ctx, "cn", st.Symbol, wideBarLimit)
+			fetchStartedAt := s.dailyTime()
+			bars, err := s.wideDailyBars(ctx, "cn", st.Symbol, wideBarLimit+1)
+			bars = completedDailyBarsAt("cn", bars, fetchStartedAt)
 			if err == nil || errors.Is(err, datasource.ErrNoData) || errors.Is(err, datasource.ErrSymbolInvalid) {
 				lastGoodID = st.ID // 非源类结果：该标的已定案，退避回退不必重取
 			}
@@ -892,6 +974,9 @@ loop:
 				// 落库失败不标 done：否则该股永久缺口（宽表/因子/回测都读不到）。
 				// 保持 pending，走 recordFail 计一次尝试，下一轮 job/手动重试。
 				if perr := s.persistDailyBarsWithState(ctx, "cn", st.Symbol, bars, true); perr != nil { // 历史与完成状态原子提交
+					if errors.Is(perr, errDailyHistoryIncomplete) {
+						historyProgress = true
+					}
 					if ctx.Err() != nil {
 						canceled = true
 						break loop
@@ -926,6 +1011,9 @@ loop:
 
 	log.Total = log.Succeeded + log.Failed
 	log.Status = statusOf(log, ctx)
+	if log.Status == "failed" && historyProgress {
+		log.Status = "partial"
+	}
 	switch {
 	case srcAborted:
 		log.Status = "failed"
@@ -936,11 +1024,14 @@ loop:
 		log.Message = truncate(fmt.Sprintf("已暂停/超时（断点续传）: 本轮处理 %d/%d", log.Total, pendingTotal), 512)
 	default:
 		log.Message = truncate(fmt.Sprintf("本轮处理 %d/%d", log.Total, pendingTotal), 512)
+		if historyProgress {
+			log.Message += "；部分标的仅保存了短历史或旧日期，未标记初始化完成，请补齐后重试"
+		}
 	}
 	log.DurationMs = time.Since(start).Milliseconds()
 	s.recordSyncLog(ctx, log)
 	// 本轮有新建史标的即重建宽表（含暂停中断的部分进度——尽快让选股覆盖它们）。
-	if log.Succeeded > 0 {
+	if log.Succeeded > 0 || historyProgress {
 		refreshFactorsAfterMaintenance(ctx, "历史初始化推进")
 	}
 	if canceled {
@@ -999,12 +1090,9 @@ func (s *MarketService) MarketWideStatus(contexts ...context.Context) (*MarketWi
 			}
 		}
 		reader := &dataHealthReader{db: tx, now: time.Now()}
-		v.LastSync = reader.dhLastLog("sync_market_wide")
+		v.LastSync = reader.dhLastLog("sync_market_wide", "sync_daily_bars")
 		v.LastInit = reader.dhLastLog("init_market_history")
-		v.ObservedDate = reader.dhMaxDate(&model.MarketSyncState{}, "last_bar_date", "market = ? AND last_bar_date <> ''", "cn")
-		if v.ObservedDate == "" && reader.err == nil {
-			v.ObservedDate = reader.dhMaxDate(&model.DailyBar{}, "trade_date", "market = ?", "cn")
-		}
+		v.ObservedDate = reader.dhMaxDate(&model.DailyBar{}, "trade_date", "market = ?", "cn")
 		v.ExpectedDate = reader.wideExpectedDate(reader.now)
 		v.LagOpenDays = reader.openDaysBehind(v.ObservedDate, v.ExpectedDate)
 		return reader.err

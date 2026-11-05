@@ -40,6 +40,7 @@ func DefaultManager() *Manager {
 			NewTencentAdapter(),
 			NewSinaAdapter(),
 			NewCNInfoAdapter(),
+			NewSohuAdapter(),
 		},
 		health: defaultSourceHealth,
 	}

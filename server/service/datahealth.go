@@ -428,17 +428,15 @@ func (r *dataHealthReader) build(now time.Time, requestedDays int) *DataHealthRe
 		rep.Items = append(rep.Items, item)
 	}
 
-	wideObserved := r.dhMaxDate(&model.MarketSyncState{}, "last_bar_date", "market = ? AND last_bar_date <> ''", "cn")
-	if wideObserved == "" && r.err == nil {
-		wideObserved = r.dhMaxDate(&model.DailyBar{}, "trade_date", "market = ?", "cn")
-	}
+	// Sync states are task cursors, not evidence of persisted price coverage.
+	wideObserved := r.dhMaxDate(&model.DailyBar{}, "trade_date", "market = ?", "cn")
 	wideCalendar, wideN, wideD := r.wideGapCalendar(tradeDates)
 	add(DataHealthItem{
 		Key: "marketwide", Name: "全市场日线", ExpectedDate: expectedWide, ObservedDate: wideObserved,
 		RecoveryClass: "backfillable", GapCalendar: wideCalendar,
 		CoverageNumerator: wideN, CoverageDenominator: wideD, CoverageUnit: "股票交易日",
-		LastRun: r.dhLastLog("sync_market_wide", "init_market_history"), RecentFailure: r.dhRecentFailure("sync_market_wide", "init_market_history"),
-		Note: "按 PIT 宇宙扣除已知停牌；PIT 缺失日按当前宇宙估计并明确标 partial",
+		LastRun: r.dhLastLog("sync_market_wide", "init_market_history", MaintenanceSyncBars), RecentFailure: r.dhRecentFailure("sync_market_wide", "init_market_history", MaintenanceSyncBars),
+		Note: "数据日期取实际入库日线，不是任务运行时间或逐股覆盖率；按 PIT 宇宙扣除已知停牌，PIT 缺失日按当前宇宙估计并明确标 partial",
 	})
 
 	// 只取不可变的进程内快照，期望日期仍由本报告的时点与数据库快照决定。

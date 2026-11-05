@@ -553,6 +553,13 @@ async function loadLogs() {
 function logStatusType(s: string) {
   return s === 'success' ? 'success' : s === 'failed' ? 'error' : 'warning'
 }
+function syncLogStatusLabel(status: string) {
+  const labels: Record<string, string> = {
+    success: '成功', partial: '部分完成', failed: '失败',
+    processing: '执行中', running: '执行中', queued: '排队中', canceled: '已取消',
+  }
+  return labels[status] || status
+}
 const taskLabel: Record<string, string> = {
   sync_daily_bars: '日线批量同步',
   backfill_calendar: '交易日历回填',
@@ -747,6 +754,11 @@ async function submitUncool() {
 /* 有 body 的补采先 dry-run；完全无 body 的旧客户端兼容由后端承担。 */
 type MaintenanceKind = 'wide' | 'bars' | 'calendar'
 const maintenanceRange = reactive<{ from: string | null; to: string | null }>({ from: null, to: null })
+const dailyBackfillScope = ref<'marketwide' | 'tracked'>('marketwide')
+const dailyBackfillScopeOptions = [
+  { label: '日线范围：本地已知全市场（含已跟踪）', value: 'marketwide' },
+  { label: '日线范围：仅已跟踪股票', value: 'tracked' },
+]
 const dryRunOpen = ref(false)
 const dryRunLoading = ref(false)
 const executingPlan = ref(false)
@@ -754,12 +766,13 @@ const maintenanceKind = ref<MaintenanceKind>('bars')
 const maintenancePlan = ref<MaintenancePlan | null>(null)
 const maintenanceLabels: Record<MaintenanceKind, string> = {
   wide: '全市场增量同步',
-  bars: '已跟踪日线补采',
+  bars: '日线补采',
   calendar: '交易日历回填',
 }
 
 function maintenancePayload(kind: MaintenanceKind, dryRun: boolean, planHash?: string): MaintenanceRequest {
   const payload: MaintenanceRequest = { market: 'cn', dry_run: dryRun, plan_hash: planHash }
+  if (kind === 'bars') payload.scope = dailyBackfillScope.value
   if (kind !== 'wide' && maintenanceRange.from && maintenanceRange.to) {
     payload.from = maintenanceRange.from
     payload.to = maintenanceRange.to
@@ -785,9 +798,11 @@ async function previewMaintenance(kind: MaintenanceKind) {
   maintenancePlan.value = null
   const from = maintenanceRange.from
   const to = maintenanceRange.to
+  const scope = dailyBackfillScope.value
   try {
     const result = await callMaintenance(kind, maintenancePayload(kind, true))
     if (!pageActive() || (kind !== 'wide' && (maintenanceRange.from !== from || maintenanceRange.to !== to))) return
+    if (kind === 'bars' && dailyBackfillScope.value !== scope) return
     if (!('plan' in result) || !result.plan) throw new Error('dry-run 未返回计划')
     maintenanceKind.value = kind
     maintenancePlan.value = result.plan
@@ -807,6 +822,7 @@ async function executeMaintenancePlan() {
   try {
     const result = await callMaintenance(maintenanceKind.value, {
       market: plan.market,
+      scope: maintenanceKind.value === 'bars' ? plan.scope : undefined,
       from: plan.from,
       to: plan.to,
       dry_run: false,
@@ -1307,13 +1323,18 @@ onMounted(() => {
         </n-alert>
         <p class="ops-footnote">
           这里检查本地数据覆盖，外部连通性请看上方能力矩阵。首次恢复建议先回填日历，盘后再全市场同步、历史初始化；任务结束后再核对覆盖。
-          补采日期可全部留空：日历默认核对近 92 个自然日并包含今天，日线默认近 45 个已知交易日。历史初始化续跑并重试此前失败的标的。
+          补采日期可全部留空：日历默认近 400 个自然日，可一次覆盖研究历史窗口；全市场日线默认近 250 个已确认完成交易日，仅已跟踪默认近 45 日。
+          全市场范围是本地已知宇宙与已跟踪股票的去重集合，不会在预演时扫描上游；最多检查 7000 只，每轮修复至多 800 只有缺口的股票。
+          全市场日线可选最多 250 个交易日 / 400 个自然日，已跟踪可选最多 60 个交易日 / 92 个自然日。日历不足请先回填，或明确选择较短范围；15:05 前不要求今日完成日线。
+          旧版本记录若无法证明采集时已收盘，也会列为待核验并重新补采，不代表原数据被删除。
+          每轮结束后重新预演同一范围，已完整标的会自动跳过；历史初始化只续跑并重试失败标的，不代替逐日缺口修复。
           涨跌家数快照仅采集当前涨跌家数，不是涨停池历史补采，也不会重建历史情绪数据。
         </p>
         <div class="ops-filters health-filter-row">
           <n-select v-model:value="healthWindowDays" :options="[{ label: '30 个交易日', value: 30 }, { label: '45 个交易日', value: 45 }, { label: '60 个交易日', value: 60 }]" @update:value="loadHealth" />
           <n-select v-model:value="healthStatusFilter" clearable placeholder="健康状态" :options="healthStatusOptions" />
           <n-select v-model:value="healthRecoveryFilter" clearable placeholder="恢复分类" :options="healthRecoveryOptions" />
+          <n-select v-model:value="dailyBackfillScope" aria-label="日线补采范围" :options="dailyBackfillScopeOptions" :disabled="dryRunLoading || executingPlan" />
           <n-date-picker v-model:formatted-value="maintenanceRange.from" type="date" value-format="yyyy-MM-dd" clearable placeholder="补采起日" />
           <n-date-picker v-model:formatted-value="maintenanceRange.to" type="date" value-format="yyyy-MM-dd" clearable placeholder="补采止日" />
         </div>
@@ -1364,10 +1385,10 @@ onMounted(() => {
             <tr>
               <th>数据域</th>
               <th>状态 / 恢复</th>
-              <th>水位</th>
+              <th>数据交易日 / 应有日期</th>
               <th>覆盖</th>
               <th>缺口日历</th>
-              <th>最近失败</th>
+              <th>最近任务 / 最近失败</th>
               <th>口径</th>
             </tr>
           </thead>
@@ -1403,6 +1424,8 @@ onMounted(() => {
                 </div>
               </td>
               <td class="ops-wrap">
+                <div v-if="it.last_run" class="ops-sub">任务运行于 {{ fmtLogTime(it.last_run.created_at) }} · {{ syncLogStatusLabel(it.last_run.status) }}</div>
+                <div v-else class="ops-sub">暂无任务运行记录</div>
                 <template v-if="it.recent_failure">
                   <span class="qv-tnum">{{ fmtLogTime(it.recent_failure.created_at) }}</span>
                   <div class="ops-danger">{{ it.recent_failure.message }}</div>
@@ -1423,7 +1446,8 @@ onMounted(() => {
                 <n-tag :type="recoveryMeta[it.recovery_class]?.type || 'default'" size="small" round style="margin-left: 4px">{{ recoveryMeta[it.recovery_class]?.label || it.recovery_class }}</n-tag>
               </span>
             </div>
-            <div class="ops-kv"><span>水位</span><span class="qv-tnum">{{ it.observed_date || '—' }} / {{ it.expected_date || '—' }}</span></div>
+            <div class="ops-kv"><span>数据交易日 / 应有</span><span class="qv-tnum">{{ it.observed_date || '—' }} / {{ it.expected_date || '—' }}</span></div>
+            <div class="ops-kv"><span>最近任务运行</span><span class="qv-tnum">{{ it.last_run ? fmtLogTime(it.last_run.created_at) : '暂无记录' }}<template v-if="it.last_run"> · {{ syncLogStatusLabel(it.last_run.status) }}</template></span></div>
             <div class="ops-kv"><span>覆盖</span><span>{{ it.coverage || '—' }}</span></div>
             <div class="gap-calendar gap-calendar-mobile">
               <n-tooltip v-for="day in it.gap_calendar || []" :key="day.date" trigger="hover" style="max-width: 320px">
@@ -1436,6 +1460,7 @@ onMounted(() => {
           </article>
         </div>
         <div class="ops-footnote">
+          数据交易日是已入库行情的日期，不是任务运行时间；最新日期有一根数据不代表全部股票或历史窗口完整。
           {{ health?.window_start || '—' }} ~ {{ health?.window_end || '—' }} · {{ health?.window_days || 0 }} 个交易日 · 查询硬上限 {{ health?.query_hard_max || 60 }} · 生成于 {{ health?.generated_at || '—' }}
         </div>
       </SectionCard>
@@ -1501,6 +1526,7 @@ onMounted(() => {
     >
       <template v-if="maintenancePlan">
         <div class="plan-metrics">
+          <div v-if="maintenanceKind === 'bars'"><span>标的范围</span><strong>{{ maintenancePlan.scope === 'marketwide' ? '本地已知全市场（含已跟踪）' : '仅已跟踪股票' }} · {{ maintenancePlan.universe_count ?? '—' }} 只</strong></div>
           <div><span>范围</span><strong class="qv-tnum">{{ maintenancePlan.from }} ~ {{ maintenancePlan.to }}</strong></div>
           <div><span>目标</span><strong class="qv-tnum">{{ maintenancePlan.target_count }}</strong></div>
           <div><span>已有</span><strong class="qv-tnum">{{ maintenancePlan.existing_count }}</strong></div>
@@ -1509,7 +1535,7 @@ onMounted(() => {
           <div><span>预计请求</span><strong class="qv-tnum">{{ maintenancePlan.estimated_requests }}</strong></div>
         </div>
         <n-alert v-if="maintenancePlan.capped" type="warning" :show-icon="false" style="margin-top: 12px">
-          计划已触及单次处理硬上限。
+          本轮仅处理最多 800 只有缺口的股票，不代表全市场已补齐。任务结束后，请对同一范围重新预演下一轮。
         </n-alert>
         <div class="plan-summary">{{ maintenancePlan.difference_summary }}</div>
         <div v-if="maintenancePlan.sample_targets?.length" class="plan-targets">

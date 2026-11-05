@@ -578,7 +578,14 @@ async function refreshTracking() {
     current.value = value
     await loadPerformance()
     if (ownsResult(sequence)) message.success('已追加最新追踪状态；历史推荐内容未改写')
-  } catch (reason) { if (ownsResult(sequence)) message.error(errorText(reason)) }
+  } catch (reason) {
+    if (!ownsResult(sequence) || current.value?.id !== id) return
+    message.error(errorText(reason))
+    // Other stocks can commit successfully even when one cannot be settled.
+    // Reload saved results only; do not repeat the upstream tracking action.
+    await reloadAfterLink(id)
+    if (ownsResult(sequence)) await loadPerformance()
+  }
   finally { if (sequence === resultSequence) tracking.value = false }
 }
 const stopAlerting = ref<Record<number, boolean>>({})

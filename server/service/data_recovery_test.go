@@ -142,8 +142,12 @@ func TestMarketWideAdminInitRetriesFailedWithoutRewritingDone(test *testing.T) {
 	if err := common.DB.Create(&states).Error; err != nil {
 		test.Fatal(err)
 	}
-	source := &fakeWideSource{bars: map[string][]datasource.Bar{"600001": {{TradeDate: "2026-09-01", Open: 10, High: 10, Low: 10, Close: 10, Source: "test"}}}}
-	service := &MarketService{wide: source}
+	source := &fakeWideSource{bars: map[string][]datasource.Bar{
+		"600001": wideGenBars(wideGenDates(250, time.Date(2026, 9, 1, 16, 0, 0, 0, time.Local)), 10),
+	}}
+	service := &MarketService{wide: source, dailyNow: func() time.Time {
+		return time.Date(2026, 9, 1, 17, 0, 0, 0, datasource.ChinaMarketLocation())
+	}}
 	log, err := service.RunMarketWideInit(test.Context(), SyncAudit{TriggerSource: "admin"})
 	if err != nil || log.Succeeded != 1 || source.barsCalls["600002"] != 0 || stateOf(test, "600001").InitStatus != "done" {
 		test.Fatalf("manual recovery failed or rewrote a completed stock: %+v %v calls=%v", log, err, source.barsCalls)

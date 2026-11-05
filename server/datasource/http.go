@@ -461,6 +461,7 @@ var (
 	tencentLimiter = newHTTPSourceLimiter(2, 250*time.Millisecond)
 	sinaLimiter    = newHTTPSourceLimiter(2, 500*time.Millisecond)
 	cninfoLimiter  = newHTTPSourceLimiter(1, 500*time.Millisecond)
+	sohuLimiter    = newHTTPSourceLimiter(1, 500*time.Millisecond)
 )
 
 func publicSourceLimiter(host string) *httpSourceLimiter {
@@ -476,6 +477,9 @@ func publicSourceLimiter(host string) *httpSourceLimiter {
 	}
 	if hostInDomain(host, "cninfo.com.cn") {
 		return cninfoLimiter
+	}
+	if hostInDomain(host, "stock.sohu.com") {
+		return sohuLimiter
 	}
 	return nil
 }

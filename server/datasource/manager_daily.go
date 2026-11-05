@@ -6,10 +6,13 @@ import (
 )
 
 // GetDailyBarsFresh tries independent adjusted sources until one covers the
-// requested business date. A nonempty but older primary must not block a newer
-// backup. If every source is old, return the newest whole series with fresh=false
-// so chart/research callers can show its real date without mixing price bases.
+// requested business date and history length. A current but truncated primary
+// must not hide a complete backup. Short IPO histories remain usable when no
+// source can supply more rows; freshness describes the date, not the row count.
 func (manager *Manager) GetDailyBarsFresh(ctx context.Context, market, symbol string, limit int, expectedDate string) ([]Bar, bool, error) {
+	if limit <= 0 {
+		limit = 120
+	}
 	parentContext := ctx
 	totalBudget, _ := manager.budgets("daily_bars")
 	ctx, cancel := context.WithTimeout(ctx, totalBudget)
@@ -51,7 +54,11 @@ func (manager *Manager) GetDailyBarsFresh(ctx context.Context, market, symbol st
 		bars, succeeded, err := attemptSource(manager, ctx, market, "daily_bars", adapter, call)
 		if succeeded {
 			latest := bars[len(bars)-1].TradeDate
-			if expectedDate == "" || latest >= expectedDate {
+			if (expectedDate == "" || latest >= expectedDate) && len(bars) >= limit {
+				bars = manager.EnrichDailyTradingFacts(ctx, market, symbol, bars)
+				if err := parentContext.Err(); err != nil {
+					return nil, false, err
+				}
 				return bars, true, nil
 			}
 			if len(newest) == 0 || latest > newest[len(newest)-1].TradeDate ||
@@ -71,7 +78,11 @@ func (manager *Manager) GetDailyBarsFresh(ctx context.Context, market, symbol st
 		return nil, false, err
 	}
 	if len(newest) > 0 {
-		return newest, false, nil
+		newest = manager.EnrichDailyTradingFacts(ctx, market, symbol, newest)
+		if err := parentContext.Err(); err != nil {
+			return nil, false, err
+		}
+		return newest, expectedDate == "" || newest[len(newest)-1].TradeDate >= expectedDate, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, false, err

@@ -240,6 +240,7 @@ export function getDataHealth(days = 45) {
 
 export interface MaintenanceRequest {
   market?: string
+  scope?: 'tracked' | 'marketwide'
   from?: string
   to?: string
   dry_run?: boolean
@@ -249,6 +250,8 @@ export interface MaintenanceRequest {
 export interface MaintenancePlan {
   task: string
   market: string
+  scope?: 'tracked' | 'marketwide'
+  universe_count?: number
   from: string
   to: string
   window_days: number

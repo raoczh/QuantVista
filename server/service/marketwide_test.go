@@ -407,7 +407,7 @@ func TestPersistDailyBarsRebaseFailurePreservesHistory(t *testing.T) {
 func TestInitMarketWideHistoryResumeAndFail(t *testing.T) {
 	setupTestDB(t)
 	cleanWideTables(t)
-	end := time.Date(2026, 7, 7, 0, 0, 0, 0, time.Local)
+	end := time.Date(2026, 7, 7, 0, 0, 0, 0, datasource.ChinaMarketLocation())
 	dates := wideGenDates(250, end)
 	for _, sym := range []string{"600011", "600012", "600013"} {
 		common.DB.Create(&model.MarketSyncState{Symbol: sym, Market: "cn", Name: sym, InitStatus: "pending"})
@@ -419,7 +419,7 @@ func TestInitMarketWideHistoryResumeAndFail(t *testing.T) {
 			"600013": wideGenBars(dates, 7.0),
 		},
 	}
-	svc := &MarketService{wide: fake}
+	svc := &MarketService{wide: fake, dailyNow: func() time.Time { return end.Add(17 * time.Hour) }}
 
 	// 第 1 只完成后取消 → 断点：1 done / 2 pending。
 	ctx, cancel := context.WithCancel(context.Background())
@@ -529,7 +529,7 @@ func TestInitMarketWideHistorySourceAbort(t *testing.T) {
 func TestInitMarketWideHistoryBackoffRecovers(t *testing.T) {
 	setupTestDB(t)
 	cleanWideTables(t)
-	end := time.Date(2026, 7, 7, 0, 0, 0, 0, time.Local)
+	end := time.Date(2026, 7, 7, 0, 0, 0, 0, datasource.ChinaMarketLocation())
 	dates := wideGenDates(250, end)
 	n := wideInitAbortStreak + 3
 	fake := &fakeWideSource{bars: map[string][]datasource.Bar{}, barsErr: map[string]error{}}
@@ -550,7 +550,7 @@ func TestInitMarketWideHistoryBackoffRecovers(t *testing.T) {
 	oldBackoff := wideInitBackoff
 	wideInitBackoff = 5 * time.Millisecond
 	t.Cleanup(func() { wideInitBackoff = oldBackoff })
-	svc := &MarketService{wide: fake}
+	svc := &MarketService{wide: fake, dailyNow: func() time.Time { return end.Add(17 * time.Hour) }}
 	log, err := svc.initMarketWideHistory(context.Background())
 	if err != nil {
 		t.Fatalf("退避恢复轮不应返回错误: %v", err)
@@ -568,7 +568,7 @@ func TestInitMarketWideHistoryBackoffRecovers(t *testing.T) {
 func TestInitMarketWideHistoryScatteredNetFail(t *testing.T) {
 	setupTestDB(t)
 	cleanWideTables(t)
-	end := time.Date(2026, 7, 7, 0, 0, 0, 0, time.Local)
+	end := time.Date(2026, 7, 7, 0, 0, 0, 0, datasource.ChinaMarketLocation())
 	dates := wideGenDates(250, end)
 	// 成功之间夹杂的零散网络失败：源活着，失败记到标的头上（一次尝试）。
 	for _, sym := range []string{"600021", "600022", "600023"} {
@@ -581,7 +581,7 @@ func TestInitMarketWideHistoryScatteredNetFail(t *testing.T) {
 		},
 		barsErr: map[string]error{"600022": errors.New("connection reset")},
 	}
-	svc := &MarketService{wide: fake}
+	svc := &MarketService{wide: fake, dailyNow: func() time.Time { return end.Add(17 * time.Hour) }}
 	log, err := svc.initMarketWideHistory(context.Background())
 	if err != nil {
 		t.Fatalf("零散失败轮: %v", err)

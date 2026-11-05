@@ -7,7 +7,7 @@ import (
 
 func (provider *EastMoneyAdapter) ProvidesForwardAdjustedDailyBars() bool { return true }
 func (provider *TencentAdapter) ProvidesForwardAdjustedDailyBars() bool   { return true }
-func (provider *SinaAdapter) ProvidesForwardAdjustedDailyBars() bool      { return false }
+func (provider *SinaAdapter) ProvidesForwardAdjustedDailyBars() bool      { return true }
 
 func (manager *Manager) GetCNSpotSnapshot(ctx context.Context) ([]SpotRow, error) {
 	return manager.GetCNSpotSnapshotChecked(ctx, nil)

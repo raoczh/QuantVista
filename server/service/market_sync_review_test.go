@@ -149,10 +149,11 @@ func TestMarketWideReviewRejectsFutureSnapshotDate(t *testing.T) {
 	}
 }
 
-func TestMaintenanceReviewWidePlanRequiresKnownCalendar(t *testing.T) {
+func TestMaintenanceReviewWidePlanRejectsUnconfirmedIntradaySnapshot(t *testing.T) {
 	setupTestDB(t)
-	if plan, err := (&MarketService{}).PlanMaintenance(MaintenanceWideSync, MaintenanceRequest{Market: "cn"}); plan != nil || err == nil {
-		t.Fatalf("不能用星期估计替代补采应有日期: plan=%v err=%v", plan, err)
+	morning := time.Date(2026, 9, 4, 10, 0, 0, 0, datasource.ChinaMarketLocation())
+	if plan, err := buildWidePlanAtDB(common.DB, MaintenanceRequest{Market: "cn"}, morning); plan != nil || err == nil {
+		t.Fatalf("盘中未知日历不能放行完整收盘快照: plan=%v err=%v", plan, err)
 	}
 }
 

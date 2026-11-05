@@ -40,7 +40,7 @@ func setupPlanDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&model.Stock{}, &model.TradingCalendar{}, &model.DailyBar{}, &model.StockUniverseDaily{}, &model.MarketSyncState{}, &model.DataSyncLog{}); err != nil {
+	if err := db.AutoMigrate(&model.Stock{}, &model.TradingCalendar{}, &model.DailyBar{}, &model.DailyBarWriteLock{}, &model.StockUniverseDaily{}, &model.MarketSyncState{}, &model.DataSyncLog{}); err != nil {
 		t.Fatal(err)
 	}
 	common.DB = db

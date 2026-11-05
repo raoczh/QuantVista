@@ -240,64 +240,6 @@ func (s *SinaAdapter) GetStockRanking(ctx context.Context, market, sort string, 
 	return out, nil
 }
 
-// 返回不复权日线，仅保留适配器的原始数据能力。Manager 明确排除此接口，
-// 不让它作为前复权股票分析或共享历史表的备用来源。
-func (s *SinaAdapter) GetDailyBars(ctx context.Context, market, symbol string, limit int) ([]Bar, error) {
-	if market != "cn" {
-		return nil, ErrNotSupported
-	}
-	code, ok := sinaCNSymbol(symbol)
-	if !ok {
-		return nil, ErrSymbolInvalid
-	}
-	if limit <= 0 {
-		limit = 120
-	}
-
-	// scale=240 表示日线（分钟数），ma=no 不返回均线。
-	url := fmt.Sprintf(
-		"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol=%s&scale=240&ma=no&datalen=%d",
-		code, limit,
-	)
-	body, status, err := doGet(ctx, url, map[string]string{"Referer": "https://finance.sina.com.cn"})
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrUpstream, err)
-	}
-	if status != http.StatusOK {
-		return nil, fmt.Errorf("%w: http %d", ErrUpstream, status)
-	}
-
-	var rows []struct {
-		Day    string `json:"day"`
-		Open   string `json:"open"`
-		High   string `json:"high"`
-		Low    string `json:"low"`
-		Close  string `json:"close"`
-		Volume string `json:"volume"`
-	}
-	if err := json.Unmarshal(body, &rows); err != nil {
-		return nil, fmt.Errorf("%w: 解析失败 %v", ErrUpstream, err)
-	}
-	if len(rows) == 0 {
-		return nil, ErrNoData
-	}
-
-	atof := func(s string) float64 { f, _ := strconv.ParseFloat(s, 64); return f }
-	bars := make([]Bar, 0, len(rows))
-	for _, r := range rows {
-		bars = append(bars, Bar{
-			TradeDate: r.Day,
-			Open:      atof(r.Open),
-			High:      atof(r.High),
-			Low:       atof(r.Low),
-			Close:     atof(r.Close),
-			Volume:    int64(atof(r.Volume) / 100), // 新浪返回股，统一为手（与东财口径一致）
-			Amount:    0,                           // 该接口不提供成交额
-		})
-	}
-	return bars, nil
-}
-
 // GetBenchmarkBars 取基准指数日线（cn=上证指数 sh000001），供推荐追踪计算超额收益/alpha。
 // 复用与 GetTradingDays 相同的上证指数 KLine 接口，但保留完整 OHLC；返回按日期升序。
 func (s *SinaAdapter) GetBenchmarkBars(ctx context.Context, market string, limit int) (string, []Bar, error) {

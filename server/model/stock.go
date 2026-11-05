@@ -62,9 +62,13 @@ type DailyBar struct {
 	Amount    float64 `gorm:"type:decimal(24,4)" json:"amount"`
 	// TurnoverRate 当日换手率 %（东财日线 f61 自带；新浪兜底无此字段，0=缺失）。
 	// 供筹码分布离线复算与 M1 因子宽表使用。
-	TurnoverRate float64   `gorm:"type:decimal(10,4)" json:"turnover_rate"`
-	Source       string    `gorm:"size:16" json:"source"`
-	CreatedAt    time.Time `json:"created_at"`
+	TurnoverRate   float64   `gorm:"type:decimal(10,4)" json:"turnover_rate"`
+	Source         string    `gorm:"size:16" json:"source"`
+	AmountSource   string    `gorm:"size:16" json:"amount_source,omitempty"`
+	TurnoverSource string    `gorm:"size:16" json:"turnover_source,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	// UpdatedAt records persistence, not the source's trading date or quote time.
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // DailyBarRetentionDays daily_bars 保留天数（自然日）。

@@ -271,6 +271,8 @@ func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.Re
 	}
 
 	count := 0
+	failedItems := 0
+	var firstItemError error
 	for _, b := range batches {
 		if err := ctx.Err(); err != nil {
 			return count, err
@@ -360,8 +362,17 @@ func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.Re
 		}
 		wg.Wait()
 		for i, st := range results {
+			if err := ctx.Err(); err != nil {
+				return count, err
+			}
 			if errorsByItem[i] != nil {
-				return count, fmt.Errorf("推荐 %s 追踪失败: %w", active[i].Symbol, errorsByItem[i])
+				failedItems++
+				if firstItemError == nil {
+					firstItemError = fmt.Errorf("推荐 %s 追踪失败: %w", active[i].Symbol, errorsByItem[i])
+				}
+				// Missing evidence blocks this item's settlement, not the valid
+				// results already computed for other stocks or later batches.
+				continue
 			}
 			if st == nil {
 				continue
@@ -377,6 +388,9 @@ func (s *TrackingService) refreshBatches(ctx context.Context, batches []model.Re
 				return count, err
 			}
 		}
+	}
+	if firstItemError != nil {
+		return count, fmt.Errorf("已更新 %d 条追踪，%d 条因数据缺失或校验失败暂未更新；首项：%w", count, failedItems, firstItemError)
 	}
 	return count, nil
 }

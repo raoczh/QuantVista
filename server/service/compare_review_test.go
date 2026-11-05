@@ -65,6 +65,11 @@ func TestCompareDoesNotInventTechnicalData(t *testing.T) {
 		old   bool
 	}{{0, false}, {10, false}, {21, false}, {60, true}} {
 		t.Run(fmt.Sprintf("bars_%d_old_%v", sample.count, sample.old), func(t *testing.T) {
+			// Daily consumers now reuse committed history. Each missing/stale
+			// scenario must start without the previous case's fresh local bars.
+			if err := common.DB.Where("market = ? AND symbol IN ?", "cn", []string{"510300", "510500"}).Delete(&model.DailyBar{}).Error; err != nil {
+				t.Fatal(err)
+			}
 			end := quoteTime
 			if sample.old {
 				end = end.AddDate(0, 0, -3)

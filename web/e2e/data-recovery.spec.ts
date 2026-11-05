@@ -13,9 +13,9 @@ test('空库可预演日历回填并从管理页查看失败任务详情', async
           expect(body.from, '空库不能依赖健康报告先返回日期').toBeUndefined()
           expect(body.to).toBeUndefined()
           return { dry_run: true, plan: {
-            task: 'backfill_calendar', market: 'cn', from: '2026-06-16', to: '2026-09-15', window_days: 92,
-            target_count: 92, expected_count: 92, existing_count: 0, missing_count: 92, suspended_count: 0,
-            estimated_requests: 1, capped: false, difference_summary: '核对最近 92 个自然日，包含今天',
+            task: 'backfill_calendar', market: 'cn', from: '2025-08-12', to: '2026-09-15', window_days: 400,
+            target_count: 400, expected_count: 400, existing_count: 0, missing_count: 400, suspended_count: 0,
+            estimated_requests: 1, capped: false, difference_summary: '核对最近 400 个自然日，包含今天',
             plan_hash: planHash, generated_at: demoTime,
           } }
         }
@@ -36,7 +36,7 @@ test('空库可预演日历回填并从管理页查看失败任务详情', async
   await page.goto('/admin', { waitUntil: 'networkidle' })
   expect(api.mutations).toEqual([])
   await page.getByRole('button', { name: '回填日历', exact: true }).click()
-  await expect(page.getByText('核对最近 92 个自然日，包含今天')).toBeVisible()
+  await expect(page.getByText('核对最近 400 个自然日，包含今天')).toBeVisible()
   await page.getByRole('button', { name: '确认执行', exact: true }).click()
   await expect(page.getByText('维护任务 #710')).toBeVisible()
   await expect(page.getByText('日历主备源暂不可用，请检查容器出网')).toBeVisible()
@@ -82,4 +82,55 @@ test('管理报告读取失败不能显示成所有来源断网', async ({ page 
   await page.goto('/admin', { waitUntil: 'networkidle' })
   await expect(page.getByText(/数据健康报告读取失败/)).toBeVisible()
   await expect(page.getByText(/不应判断为所有数据源断网/)).toBeVisible()
+})
+
+test('全市场日线补采保留确认范围并在部分完成后刷新实际日期', async ({ page }, info) => {
+  let repaired = false
+  const planHash = 'b'.repeat(64)
+  const summary = '实际核验保存 799，剩余 1；标的完整成功 799/800'
+  const api = await mockApi(page, {
+    theme: info.project.name.endsWith('dark') ? 'dark-blue' : 'light-blue',
+    responses: {
+      '/admin/data-health': () => ({ generated_at: demoTime, window_days: 45, query_hard_max: 60, items: [{
+        key: 'marketwide', name: '全市场日线', status: 'partial', recovery_class: 'backfillable',
+        observed_date: repaired ? '2026-09-15' : '2026-09-10', expected_date: '2026-09-15',
+        lag_open_days: repaired ? 0 : 3, coverage: repaired ? '199999/200000' : '199200/200000',
+        coverage_denominator: 200000, coverage_unit: '股票交易日', gap_calendar: [],
+        note: '数据交易日不等于采集任务时间，剩余缺口仍需补齐',
+        last_run: repaired ? { id: 711, task: 'sync_daily_bars', status: 'partial', created_at: demoTime } : null,
+      }] }),
+      '/admin/market/sync-bars': (_url: URL, request: { postDataJSON: () => Record<string, unknown> }) => {
+        const body = request.postDataJSON()
+        expect(body.scope).toBe('marketwide')
+        if (body.dry_run) {
+          expect(body.from).toBeUndefined()
+          expect(body.to).toBeUndefined()
+          return { dry_run: true, plan: {
+            task: 'sync_daily_bars', market: 'cn', scope: 'marketwide', universe_count: 5200,
+            from: '2025-09-10', to: '2026-09-15', window_days: 250, target_count: 800,
+            expected_count: 200000, existing_count: 199200, missing_count: 800, suspended_count: 0,
+            estimated_requests: 800, capped: true, plan_hash: planHash, generated_at: demoTime,
+            difference_summary: '全市场 250 个交易日；本轮修复 800 只，后续请重新预演下一轮',
+          } }
+        }
+        expect(body.from).toBe('2025-09-10')
+        expect(body.to).toBe('2026-09-15')
+        expect(body.plan_hash).toBe(planHash)
+        repaired = true
+        return { started: true, task: 'sync_daily_bars', market: 'cn', job_run_id: 711 }
+      },
+      '/tasks/711': { id: 711, kind: 'sync_daily_bars', status: 'degraded', error: summary, cancel_requested: false, created_at: demoTime, updated_at: demoTime },
+    },
+  })
+  await page.goto('/admin', { waitUntil: 'networkidle' })
+  await expect(page.getByText('2026-09-10 / 2026-09-15', { exact: false })).toBeVisible()
+  await page.getByRole('button', { name: '日线补采', exact: true }).click()
+  await expect(page.getByText('全市场 250 个交易日；本轮修复 800 只，后续请重新预演下一轮')).toBeVisible()
+  await page.getByRole('button', { name: '确认执行', exact: true }).click()
+  await expect(page.getByText(summary)).toBeVisible()
+  await expect(page.getByText('2026-09-15 / 2026-09-15', { exact: false })).toBeVisible()
+  await expect(page.getByRole('link', { name: '查看任务详情', exact: true })).toHaveAttribute('href', /job_id=711/)
+  expect(api.mutations).toHaveLength(2)
+  expect([...new Set(api.unknown)]).toEqual([])
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBeLessThanOrEqual(1)
 })
